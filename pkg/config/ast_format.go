@@ -11,7 +11,12 @@ import (
 // annotated with "## 'X' was inherited from group 'Y'" comments, matching
 // Junos "show configuration | display inheritance" output.
 func (t *ConfigTree) FormatInheritance() string {
-	clone := t.Clone()
+	// Strip inactive subtrees BEFORE group expansion so an `inactive:`
+	// apply-groups is not shown as inherited and inactive nodes don't pull in
+	// group content the compiler will never apply — mirrors the
+	// strip-before-expand path the compiler/commit-check use (configstore
+	// schemaValidateExpandedTreeForNode). #2008 H1.
+	clone := t.WithoutInactive().Clone()
 	if err := clone.ExpandGroupsTagged(); err != nil {
 		return t.Format() // fallback to plain format on error
 	}
@@ -22,7 +27,8 @@ func (t *ConfigTree) FormatInheritance() string {
 
 // FormatPathInheritance is like FormatPath but with inheritance annotations.
 func (t *ConfigTree) FormatPathInheritance(path []string) string {
-	clone := t.Clone()
+	// Strip inactive before expansion (see FormatInheritance). #2008 H1.
+	clone := t.WithoutInactive().Clone()
 	if err := clone.ExpandGroupsTagged(); err != nil {
 		return t.FormatPath(path)
 	}
