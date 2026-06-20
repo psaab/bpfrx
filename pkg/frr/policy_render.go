@@ -615,6 +615,76 @@ func (m *Manager) generatePolicyOptions(po *config.PolicyOptionsConfig) string {
 						}
 					case "orlonger":
 						// orlonger = this prefix or any more specific (default le 32/128)
+					case "upto":
+						// upto /N = this prefix or any more specific, but no
+						// longer than /N. FRR renders this as a bare "le N":
+						// the implicit lower bound of a le clause is the
+						// prefix's own mask length, so "le N" matches the
+						// prefix itself plus every more-specific down to /N.
+						// This mirrors the orlonger case (bare "le max"), just
+						// capped at N.
+						//
+						// FRR requires len < le-value (and len < ge-value); a
+						// le/ge value <= the prefix length is REJECTED by FRR's
+						// prefix-list validator ("make sure: len < ge-value <=
+						// le-value") and an invalid line can fail the whole
+						// frr-reload. This arm therefore computes matchStr from
+						// scratch and is careful NEVER to keep an invalid value
+						// — including the inherited default le 32/128, which is
+						// itself invalid when plen == maxLen (Codex #2102 MAJOR
+						// #1, the /32 upto /31 case). The rules:
+						//   - plen >= maxLen  -> exact ("" ): a max-length host
+						//     prefix has no more-specifics, so upto anything ==
+						//     just the prefix itself. (Also dodges the invalid
+						//     "le maxLen" default.)
+						//   - UptoLen == plen -> exact ("" ): only the prefix.
+						//   - plen < UptoLen <= maxLen -> "le N" (normal case).
+						//   - else (UptoLen unset/0, < plen, or > maxLen) ->
+						//     degrade to "le maxLen" (valid here because plen <
+						//     maxLen), the orlonger-equivalent superset. Never
+						//     an invalid line. (#2072)
+						parts := strings.SplitN(rf.Prefix, "/", 2)
+						if len(parts) == 2 {
+							if plen, err := strconv.Atoi(parts[1]); err == nil {
+								maxLen := 32
+								if strings.Contains(rf.Prefix, ":") {
+									maxLen = 128
+								}
+								switch {
+								case rf.UptoLen <= 0:
+									// Unset / unparseable length (0 means unset:
+									// parseRouteFilterLen rejects "/0"). Degrade
+									// to the orlonger-equivalent superset. This
+									// MUST precede the ==plen and plen>=maxLen
+									// arms so a /0 PREFIX with an unset length is
+									// not mis-rendered as exact via the
+									// 0==plen coincidence (Codex #2102 MAJOR #2).
+									if plen >= maxLen {
+										matchStr = "" // no more-specifics possible
+									} else {
+										matchStr = fmt.Sprintf("le %d", maxLen)
+									}
+								case plen >= maxLen:
+									// Max-length host prefix: no more-specifics
+									// exist, so upto anything == the prefix
+									// itself. Exact also dodges the invalid
+									// "le maxLen" (le == plen) line (Codex #2102
+									// MAJOR #1, the /32 upto /31 case).
+									matchStr = ""
+								case rf.UptoLen == plen:
+									matchStr = "" // only the prefix itself
+								case rf.UptoLen > plen && rf.UptoLen <= maxLen:
+									matchStr = fmt.Sprintf("le %d", rf.UptoLen)
+								default:
+									// UptoLen < plen (nonzero) or > maxLen.
+									// Degrade. plen < maxLen here, so "le
+									// maxLen" is FRR-valid. Set it explicitly
+									// rather than relying on the pre-switch
+									// default.
+									matchStr = fmt.Sprintf("le %d", maxLen)
+								}
+							}
+						}
 					}
 					if strings.Contains(rf.Prefix, ":") {
 						fmt.Fprintf(&b, "ipv6 prefix-list %s seq %d permit %s", plName, (i+1)*5, rf.Prefix)

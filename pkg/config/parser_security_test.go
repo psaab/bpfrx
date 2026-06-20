@@ -2178,6 +2178,195 @@ func TestPolicyOptionsSetSyntax(t *testing.T) {
 	}
 }
 
+// firstRouteFilter returns the single route-filter compiled from the
+// given set/brace config under policy-statement "p" term "t1". It fails
+// the test if the shape is not exactly one statement / one term / one
+// route-filter so each #2072 case asserts against a known target.
+func firstRouteFilter(t *testing.T, cfg *Config) *RouteFilter {
+	t.Helper()
+	ps := cfg.PolicyOptions.PolicyStatements["p"]
+	if ps == nil {
+		t.Fatal("missing policy-statement p")
+	}
+	if len(ps.Terms) != 1 {
+		t.Fatalf("expected 1 term, got %d", len(ps.Terms))
+	}
+	if len(ps.Terms[0].RouteFilters) != 1 {
+		t.Fatalf("expected 1 route-filter, got %d", len(ps.Terms[0].RouteFilters))
+	}
+	return ps.Terms[0].RouteFilters[0]
+}
+
+// TestRouteFilterUptoCompile_FlatSet is the #2072 regression for the
+// compiler: "upto /N" via flat set syntax must parse the /N length into
+// RouteFilter.UptoLen (it stayed 0 before the fix, silently dropping the
+// operator's upper bound). Uses ParseSetCommand + SetPath per the
+// project's flat-set testing rule.
+func TestRouteFilterUptoCompile_FlatSet(t *testing.T) {
+	cases := []struct {
+		name      string
+		cmd       string
+		wantUpto  int
+		wantMatch string
+	}{
+		{"v4_upto24", "set policy-options policy-statement p term t1 from route-filter 10.0.0.0/8 upto /24", 24, "upto"},
+		{"v6_upto48", "set policy-options policy-statement p term t1 from route-filter 2001:db8::/32 upto /48", 48, "upto"},
+		{"v4_upto_eq_plen", "set policy-options policy-statement p term t1 from route-filter 10.0.0.0/8 upto /8", 8, "upto"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tree := &ConfigTree{}
+			path, err := ParseSetCommand(tc.cmd)
+			if err != nil {
+				t.Fatalf("ParseSetCommand(%q): %v", tc.cmd, err)
+			}
+			if err := tree.SetPath(path); err != nil {
+				t.Fatalf("SetPath: %v", err)
+			}
+			cfg, err := CompileConfig(tree)
+			if err != nil {
+				t.Fatalf("compile: %v", err)
+			}
+			rf := firstRouteFilter(t, cfg)
+			if rf.MatchType != tc.wantMatch {
+				t.Errorf("MatchType = %q, want %q", rf.MatchType, tc.wantMatch)
+			}
+			if rf.UptoLen != tc.wantUpto {
+				t.Errorf("UptoLen = %d, want %d (the /N length must be parsed, #2072)", rf.UptoLen, tc.wantUpto)
+			}
+		})
+	}
+}
+
+// TestRouteFilterUptoCompile_Brace covers the other AST shape: a brace
+// parse packs "route-filter <prefix> upto /N" into one leaf node, with
+// the length at Keys[3]. The compiler must read it from there too.
+func TestRouteFilterUptoCompile_Brace(t *testing.T) {
+	src := `policy-options {
+  policy-statement p {
+    term t1 {
+      from {
+        route-filter 10.0.0.0/8 upto /24;
+      }
+      then accept;
+    }
+  }
+}`
+	p := NewParser(src)
+	tree, errs := p.Parse()
+	if len(errs) > 0 {
+		t.Fatalf("parse errors: %v", errs)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	rf := firstRouteFilter(t, cfg)
+	if rf.MatchType != "upto" {
+		t.Errorf("MatchType = %q, want upto", rf.MatchType)
+	}
+	if rf.UptoLen != 24 {
+		t.Errorf("UptoLen = %d, want 24 (brace-parse /N must be parsed, #2072)", rf.UptoLen)
+	}
+}
+
+// TestRouteFilterMatchTypes_NonUptoUnchanged asserts the other match
+// types still compile with UptoLen == 0 (the upto length parsing must
+// not bleed into exact/longer/orlonger).
+func TestRouteFilterMatchTypes_NonUptoUnchanged(t *testing.T) {
+	cases := []struct {
+		name  string
+		cmd   string
+		match string
+	}{
+		{"exact", "set policy-options policy-statement p term t1 from route-filter 10.0.0.0/8 exact", "exact"},
+		{"longer", "set policy-options policy-statement p term t1 from route-filter 10.0.0.0/8 longer", "longer"},
+		{"orlonger", "set policy-options policy-statement p term t1 from route-filter 10.0.0.0/8 orlonger", "orlonger"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tree := &ConfigTree{}
+			path, err := ParseSetCommand(tc.cmd)
+			if err != nil {
+				t.Fatalf("ParseSetCommand: %v", err)
+			}
+			if err := tree.SetPath(path); err != nil {
+				t.Fatalf("SetPath: %v", err)
+			}
+			cfg, err := CompileConfig(tree)
+			if err != nil {
+				t.Fatalf("compile: %v", err)
+			}
+			rf := firstRouteFilter(t, cfg)
+			if rf.MatchType != tc.match {
+				t.Errorf("MatchType = %q, want %q", rf.MatchType, tc.match)
+			}
+			if rf.UptoLen != 0 {
+				t.Errorf("UptoLen = %d, want 0 for non-upto match type", rf.UptoLen)
+			}
+		})
+	}
+}
+
+// TestParseRouteFilterLen unit-tests the length token parser directly so
+// the malformed-token rejection (which makes the renderer degrade
+// safely) is locked regardless of the AST plumbing (Codex #2102 gap).
+func TestParseRouteFilterLen(t *testing.T) {
+	cases := []struct {
+		tok    string
+		wantN  int
+		wantOK bool
+	}{
+		{"/24", 24, true},
+		{"24", 24, true},
+		{"/1", 1, true},
+		{"/128", 128, true},
+		// zero rejected: "upto /0" is not a meaningful length and must stay
+		// distinguishable from an unset UptoLen (Codex #2102 MAJOR).
+		{"/0", 0, false},
+		{"/129", 0, false}, // > 128
+		{"/-1", 0, false},  // negative
+		{"/+24", 0, false}, // signed-plus must be rejected (Atoi would accept it)
+		{"/abc", 0, false}, // letters
+		{"/", 0, false},    // empty after slash
+		{"", 0, false},     // empty
+		{"/2a", 0, false},  // trailing letters
+	}
+	for _, tc := range cases {
+		t.Run(tc.tok, func(t *testing.T) {
+			n, ok := parseRouteFilterLen(tc.tok)
+			if ok != tc.wantOK || n != tc.wantN {
+				t.Errorf("parseRouteFilterLen(%q) = (%d,%v), want (%d,%v)", tc.tok, n, ok, tc.wantN, tc.wantOK)
+			}
+		})
+	}
+}
+
+// TestRouteFilterUptoCompile_MalformedLength asserts that an upto with a
+// non-numeric length token compiles with UptoLen 0 (the renderer then
+// degrades to the orlonger default rather than emitting a bad line).
+func TestRouteFilterUptoCompile_MalformedLength(t *testing.T) {
+	tree := &ConfigTree{}
+	path, err := ParseSetCommand("set policy-options policy-statement p term t1 from route-filter 10.0.0.0/8 upto /abc")
+	if err != nil {
+		t.Fatalf("ParseSetCommand: %v", err)
+	}
+	if err := tree.SetPath(path); err != nil {
+		t.Fatalf("SetPath: %v", err)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	rf := firstRouteFilter(t, cfg)
+	if rf.MatchType != "upto" {
+		t.Errorf("MatchType = %q, want upto", rf.MatchType)
+	}
+	if rf.UptoLen != 0 {
+		t.Errorf("UptoLen = %d, want 0 for a malformed length token", rf.UptoLen)
+	}
+}
+
 func TestIKEProposalSetSyntax(t *testing.T) {
 	setCommands := []string{`set security ike proposal ike-aes256 authentication-method pre-shared-keys`, `set security ike proposal ike-aes256 encryption-algorithm aes-256-cbc`, `set security ike proposal ike-aes256 authentication-algorithm sha-256`, `set security ike proposal ike-aes256 dh-group group14`, `set security ike proposal ike-aes256 lifetime-seconds 28800`, `set security ike policy ike-strong mode main`, `set security ike policy ike-strong proposals ike-aes256`, `set security ike gateway remote-gw address 203.0.113.1`, `set security ike gateway remote-gw ike-policy ike-strong`, `set security ike gateway remote-gw external-interface untrust0`}
 	tree := &ConfigTree{}
