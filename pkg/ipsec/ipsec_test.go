@@ -972,11 +972,12 @@ func TestGenerateConfig_NewlineSecretDoesNotInject(t *testing.T) {
 	}
 }
 
-// remoteAddrsValue returns the value rendered for `remote_addrs = ` in
-// the swanctl output, or "" if no such line is present. It lets the
-// #2074 tests assert specifically that a gateway config-object NAME
-// never appears as the remote_addrs value (a substring match on the
-// whole config would falsely flag the connection-name line).
+// remoteAddrsValues returns every value rendered on a `remote_addrs = `
+// line in the swanctl output (one per emitted connection), or an empty
+// slice if there are none. It lets the #2074 tests assert specifically
+// that a gateway config-object NAME never appears as a remote_addrs
+// value (a substring match on the whole config would falsely flag the
+// connection-name line).
 func remoteAddrsValues(cfg string) []string {
 	var out []string
 	for _, line := range strings.Split(cfg, "\n") {
