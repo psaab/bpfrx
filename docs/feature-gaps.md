@@ -200,7 +200,7 @@ xpf implements 11 screen checks (land, syn-flood, ping-death, teardrop, rate-lim
 
 ## 10. Security Flow Enhancements
 
-xpf has TCP session timeouts (established, initial, closing, time-wait), UDP/ICMP timeouts, TCP MSS clamping (IPsec, GRE in/out), allow-dns-reply, allow-embedded-icmp, GRE performance acceleration, and flow traceoptions.
+xpf has TCP session timeouts (established, initial, closing, time-wait), UDP/ICMP timeouts, TCP MSS clamping (IPsec, GRE in/out), allow-dns-reply, allow-embedded-icmp, GRE performance acceleration, and flow traceoptions (packet-filter source-prefix / destination-prefix / `protocol` — M8/#2008).
 
 | Feature | Junos Config Path | Description | Priority | Status |
 |---------|-------------------|-------------|----------|--------|
@@ -424,10 +424,11 @@ xpf manages all interfaces with .link/.network files, supports VLANs, tunnel int
 
 ## 22. System Enhancements
 
-xpf has hostname, domain-name, domain-search, timezone, name-servers, NTP, services (SSH, web-management, DNS), syslog, SNMP, login users/classes (including per-user `authentication encrypted-password` for console login — #1944, see [docs/system-login.md](system-login.md)), root-authentication, archival, internet-options, backup-router, DHCP server (Kea), and ~~DPDK~~ config (DPDK retired #1525, removed in #1527/#1528).
+xpf has hostname, domain-name, domain-search, timezone, name-servers, NTP, services (SSH with root-login and key-exchange/`KexAlgorithms`, web-management, DNS), syslog, SNMP, login users/classes (including per-user `authentication encrypted-password` for console login — #1944, see [docs/system-login.md](system-login.md)), root-authentication, archival, internet-options, backup-router, DHCP server (Kea), and ~~DPDK~~ config (DPDK retired #1525, removed in #1527/#1528).
 
 | Feature | Junos Config Path | Description | Priority | Status |
 |---------|-------------------|-------------|----------|--------|
+| **SSH Key Exchange** | `system services ssh key-exchange ...` | Restrict the SSH key-exchange (KEX) algorithms the firewall offers | Medium | Done (H5/#2008 — repeatable leaf rendered to the sshd `KexAlgorithms` drop-in, `pkg/daemon/daemon_system.go`) |
 | **RADIUS Server Config** | `system radius-server ... port ... secret ...` | RADIUS server definitions for AAA (authentication, authorization, accounting) | Medium | Missing |
 | **TACACS+ Server Config** | `system tacplus-server ... port ... secret ...` | TACACS+ server definitions for per-command authorization | Medium | Missing |
 | **Authentication Order** | `system authentication-order [radius tacplus password]` | Control order of authentication methods for management access | Medium | Missing |

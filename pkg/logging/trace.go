@@ -28,6 +28,7 @@ type traceFilter struct {
 	name   string
 	srcNet netip.Prefix
 	dstNet netip.Prefix
+	proto  string // normalized protocol name (e.g. "TCP"); "" = any
 }
 
 // NewTraceWriter creates a trace writer from flow traceoptions config.
@@ -87,6 +88,9 @@ func NewTraceWriter(opts *config.FlowTraceoptions) (*TraceWriter, error) {
 				continue
 			}
 			f.dstNet = prefix
+		}
+		if pf.Protocol != "" {
+			f.proto = normalizeTraceProto(pf.Protocol)
 		}
 		tw.filters = append(tw.filters, f)
 	}
@@ -171,14 +175,38 @@ func (tw *TraceWriter) matchFilters(rec EventRecord) bool {
 	srcAddr := extractAddr(rec.SrcAddr)
 	dstAddr := extractAddr(rec.DstAddr)
 
+	recProto := normalizeTraceProto(rec.Protocol)
+
 	for _, f := range tw.filters {
 		srcMatch := !f.srcNet.IsValid() || (srcAddr.IsValid() && f.srcNet.Contains(srcAddr))
 		dstMatch := !f.dstNet.IsValid() || (dstAddr.IsValid() && f.dstNet.Contains(dstAddr))
-		if srcMatch && dstMatch {
+		protoMatch := f.proto == "" || f.proto == recProto
+		if srcMatch && dstMatch && protoMatch {
 			return true
 		}
 	}
 	return false
+}
+
+// normalizeTraceProto canonicalizes a protocol identifier so a config filter
+// value (a Junos name like "tcp" or a numeric value like "6") compares equal
+// to the EventRecord.Protocol string (which protoName renders as "TCP",
+// "UDP", "ICMP", "ICMPv6", or a decimal string). Names are upper-cased and
+// known numbers are mapped to their canonical name.
+func normalizeTraceProto(p string) string {
+	up := strings.ToUpper(strings.TrimSpace(p))
+	switch up {
+	case "1", "ICMP":
+		return "ICMP"
+	case "6", "TCP":
+		return "TCP"
+	case "17", "UDP":
+		return "UDP"
+	case "58", "ICMPV6", "ICMP6":
+		return "ICMPv6"
+	default:
+		return up
+	}
 }
 
 // extractAddr parses an IP address from "IP:port" or "[IPv6]:port" format.

@@ -2484,6 +2484,45 @@ func TestFlowTraceoptions(t *testing.T) {
 	}
 }
 
+// TestFlowTraceoptionsPacketFilterProtocol verifies the M8 (#2008)
+// traceoptions packet-filter `protocol` child compiles into the typed
+// TracePacketFilter.Protocol field via the flat-set path (ParseSetCommand +
+// SetPath, per the project testing rule).
+func TestFlowTraceoptionsPacketFilterProtocol(t *testing.T) {
+	tree := &ConfigTree{}
+	for _, cmd := range []string{
+		"set security flow traceoptions file flowtrace.log",
+		"set security flow traceoptions packet-filter f0 source-prefix 10.0.1.0/24",
+		"set security flow traceoptions packet-filter f0 protocol tcp",
+	} {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%q): %v", cmd, err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	to := cfg.Security.Flow.Traceoptions
+	if to == nil || len(to.PacketFilters) != 1 {
+		t.Fatalf("PacketFilters = %v, want 1", to)
+	}
+	pf := to.PacketFilters[0]
+	if pf.Name != "f0" {
+		t.Errorf("Name = %q, want f0", pf.Name)
+	}
+	if pf.SourcePrefix != "10.0.1.0/24" {
+		t.Errorf("SourcePrefix = %q, want 10.0.1.0/24", pf.SourcePrefix)
+	}
+	if pf.Protocol != "tcp" {
+		t.Errorf("Protocol = %q, want tcp", pf.Protocol)
+	}
+}
+
 func TestFormatJSON(t *testing.T) {
 	input := `system {
     host-name fw1;

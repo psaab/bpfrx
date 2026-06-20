@@ -95,6 +95,7 @@ type TracePacketFilter struct {
 	Name              string
 	SourcePrefix      string
 	DestinationPrefix string
+	Protocol          string // protocol name (tcp|udp|icmp|...) or number
 }
 
 // ALGConfig holds ALG (Application Layer Gateway) disable flags.

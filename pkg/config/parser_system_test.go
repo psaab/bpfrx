@@ -1567,3 +1567,44 @@ system {
 		}
 	})
 }
+
+// TestSSHKeyExchangeCompile verifies the H5 (#2008) ssh key-exchange leaf
+// parses + compiles into SSHServiceConfig.KeyExchange, preserving order and
+// supporting multiple repeated values, via the flat-set path (ParseSetCommand
+// + SetPath, per the project testing rule).
+func TestSSHKeyExchangeCompile(t *testing.T) {
+	tree := &ConfigTree{}
+	for _, cmd := range []string{
+		"set system services ssh root-login deny",
+		"set system services ssh key-exchange ecdh-sha2-nistp256",
+		"set system services ssh key-exchange curve25519-sha256",
+	} {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%q): %v", cmd, err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	if cfg.System.Services == nil || cfg.System.Services.SSH == nil {
+		t.Fatal("SSH service config is nil")
+	}
+	ssh := cfg.System.Services.SSH
+	if ssh.RootLogin != "deny" {
+		t.Errorf("RootLogin = %q, want deny", ssh.RootLogin)
+	}
+	want := []string{"ecdh-sha2-nistp256", "curve25519-sha256"}
+	if len(ssh.KeyExchange) != len(want) {
+		t.Fatalf("KeyExchange = %v, want %v", ssh.KeyExchange, want)
+	}
+	for i := range want {
+		if ssh.KeyExchange[i] != want[i] {
+			t.Errorf("KeyExchange[%d] = %q, want %q", i, ssh.KeyExchange[i], want[i])
+		}
+	}
+}

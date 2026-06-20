@@ -886,25 +886,13 @@ func (d *Daemon) applySSHConfig(cfg *config.Config) {
 	}
 
 	ssh := cfg.System.Services.SSH
-	if ssh.RootLogin == "" {
-		return
-	}
 
-	// Map Junos values to sshd_config PermitRootLogin values
-	var permitRoot string
-	switch ssh.RootLogin {
-	case "allow":
-		permitRoot = "yes"
-	case "deny":
-		permitRoot = "no"
-	case "deny-password":
-		permitRoot = "prohibit-password"
-	default:
-		return
+	content := buildSSHDConfig(ssh)
+	if content == "" {
+		return // nothing to manage
 	}
 
 	confPath := "/etc/ssh/sshd_config.d/xpf.conf"
-	content := fmt.Sprintf("# Managed by xpf — do not edit\nPermitRootLogin %s\n", permitRoot)
 
 	current, _ := os.ReadFile(confPath)
 	if string(current) == content {
@@ -927,7 +915,42 @@ func (d *Daemon) applySSHConfig(cfg *config.Config) {
 			"err", err, "output", strings.TrimSpace(string(out)))
 		return
 	}
-	slog.Info("SSH config applied", "permit_root_login", permitRoot)
+	slog.Info("SSH config applied",
+		"root_login", ssh.RootLogin,
+		"key_exchange", strings.Join(ssh.KeyExchange, ","))
+}
+
+// buildSSHDConfig renders the xpf-managed sshd drop-in body from the SSH
+// service config, or "" when there is nothing to manage. Each setting is an
+// independent line: root-login → PermitRootLogin, key-exchange → KexAlgorithms
+// (H5, #2008). sshd validates algorithm spellings at reload, so xpf does not
+// enum-check the key-exchange list.
+func buildSSHDConfig(ssh *config.SSHServiceConfig) string {
+	if ssh == nil {
+		return ""
+	}
+	var lines []string
+	if ssh.RootLogin != "" {
+		var permitRoot string
+		switch ssh.RootLogin {
+		case "allow":
+			permitRoot = "yes"
+		case "deny":
+			permitRoot = "no"
+		case "deny-password":
+			permitRoot = "prohibit-password"
+		}
+		if permitRoot != "" {
+			lines = append(lines, "PermitRootLogin "+permitRoot)
+		}
+	}
+	if len(ssh.KeyExchange) > 0 {
+		lines = append(lines, "KexAlgorithms "+strings.Join(ssh.KeyExchange, ","))
+	}
+	if len(lines) == 0 {
+		return ""
+	}
+	return "# Managed by xpf — do not edit\n" + strings.Join(lines, "\n") + "\n"
 }
 
 // applyRootAuth applies root-authentication config: encrypted-password and SSH keys.
