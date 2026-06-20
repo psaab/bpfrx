@@ -74,6 +74,13 @@ func HexToBase64(hexKey string) (string, error) {
 	if hexKey == "" {
 		return "", nil
 	}
+	// Validate the hex STRING length before decoding so a malformed or
+	// oversized payload (e.g. a buggy/compromised helper status) is rejected
+	// up front instead of decoding an arbitrarily large buffer first. A
+	// WireGuard key is KeyLen bytes = KeyLen*2 lowercase hex chars.
+	if len(hexKey) != KeyLen*2 {
+		return "", fmt.Errorf("wgkey: hex key must be %d hex chars, got %d", KeyLen*2, len(hexKey))
+	}
 	raw, err := hex.DecodeString(hexKey)
 	if err != nil {
 		return "", fmt.Errorf("wgkey: decode hex key: %w", err)

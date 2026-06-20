@@ -3,6 +3,7 @@ package wgkey
 import (
 	"encoding/base64"
 	"encoding/hex"
+	"strings"
 	"testing"
 )
 
@@ -168,5 +169,16 @@ func TestHexToBase64(t *testing.T) {
 	}
 	if _, err := HexToBase64("abcd"); err == nil {
 		t.Fatalf("expected error for short (2-byte) key")
+	}
+	// Oversized input is rejected by the pre-decode length guard WITHOUT
+	// decoding the whole buffer (a malformed/oversized helper payload must not
+	// be hex-decoded first). 4096 hex chars != KeyLen*2.
+	if _, err := HexToBase64(strings.Repeat("ab", 2048)); err == nil {
+		t.Fatalf("expected error for oversized hex input")
+	}
+	// A correct-length but odd case: KeyLen*2 chars that aren't valid hex still
+	// error (length guard passes, hex decode fails).
+	if _, err := HexToBase64(strings.Repeat("zz", KeyLen)); err == nil {
+		t.Fatalf("expected error for full-length non-hex input")
 	}
 }
