@@ -1,4 +1,5 @@
 import json
+import math
 import os
 import pathlib
 import tempfile
@@ -317,6 +318,19 @@ class CoSFixtureParseTests(unittest.TestCase):
         # best-effort has no transmit-rate; ceiling is the 25g shaper.
         self.assertEqual(caps[5200]["cap_bps"], 25_000_000_000)
 
+    def test_classified_but_unscheduled_class_raises(self):
+        # A port classified into a forwarding-class that has no
+        # scheduler-map entry must NOT silently fall through to the
+        # interface-shaper cap (which would mask fixture drift/misparse).
+        broken = (
+            "set class-of-service forwarding-classes queue 2 cls-1g\n"
+            "set class-of-service interfaces reth0 unit 80 shaping-rate 25g\n"
+            "set firewall family inet filter f term 2 from destination-port 5202\n"
+            "set firewall family inet filter f term 2 then forwarding-class cls-1g\n"
+        )
+        with self.assertRaises(orch.CoSFixtureError):
+            orch.parse_cos_class_caps(broken)
+
     def test_real_fixture_grid_matches_canonical_rates(self):
         # Drift guard: the table parsed from the live fixture must agree
         # with the canonical port -> exact-class-rate map. If the fixture
@@ -378,29 +392,50 @@ class SettleThresholdSatisfiableTests(unittest.TestCase):
         )
         self.assertTrue(r["satisfiable"])
 
+    @staticmethod
+    def _largest_satisfiable_shaper(cap_bps: int, min_utilization: float) -> int:
+        # The largest SHAPER_BPS whose ceil(min_utilization * SHAPER_BPS)
+        # is still <= cap_bps — i.e. the TRUE settle-floor boundary under
+        # the guard's ceil semantics. Derived with the same float
+        # arithmetic the guard uses (math.ceil) so the boundary is exact
+        # on this platform rather than a hand-picked constant.
+        lo, hi = cap_bps, cap_bps * 2
+        while lo < hi:
+            mid = (lo + hi + 1) // 2
+            if math.ceil(min_utilization * mid) <= cap_bps:
+                lo = mid
+            else:
+                hi = mid - 1
+        return lo
+
     def test_boundary_floor_equals_cap_is_satisfiable(self):
-        # Floor exactly at the cap must PASS (<=, not <). For the 1g
-        # class, cap 1G == floor when SHAPER_BPS = 1G / 0.7.
-        shaper = 1_000_000_000 // 7 * 10  # floor rounds to <= 1G
+        # True boundary: the largest SHAPER_BPS whose ceil-floor lands
+        # EXACTLY on the 1G cap. floor == cap must PASS (<=, not <).
+        cap = 1_000_000_000
+        shaper = self._largest_satisfiable_shaper(cap, 0.7)
         r = orch.check_settle_threshold_satisfiable(
             5202, shaper, set_text=_COS_SET,
         )
-        self.assertLessEqual(r["floor_bps"], r["cap_bps"])
+        self.assertEqual(r["cap_bps"], cap)
+        self.assertEqual(r["floor_bps"], cap)  # exactly on the boundary
         self.assertTrue(r["satisfiable"])
 
-    def test_just_over_cap_is_unsatisfiable(self):
-        # One bps of shaper above the boundary flips it unsatisfiable,
-        # proving the guard is not a no-op rubber stamp.
-        shaper_ok = 1_000_000_000 // 7 * 10
+    def test_one_bps_over_boundary_is_unsatisfiable(self):
+        # One bps of SHAPER_BPS above the true boundary must flip the
+        # verdict to unsatisfiable, proving the guard is not a no-op
+        # rubber stamp and that the boundary is sharp to a single bps.
+        cap = 1_000_000_000
+        shaper_ok = self._largest_satisfiable_shaper(cap, 0.7)
         r_ok = orch.check_settle_threshold_satisfiable(
             5202, shaper_ok, set_text=_COS_SET,
         )
+        self.assertEqual(r_ok["floor_bps"], cap)
         self.assertTrue(r_ok["satisfiable"])
-        # Bump shaper so floor crosses 1G.
-        shaper_bad = (1_000_000_000 // 7 * 10) + 100_000_000
+        # Exactly +1 bps of shaper pushes the ceil-floor to cap + 1.
         r_bad = orch.check_settle_threshold_satisfiable(
-            5202, shaper_bad, set_text=_COS_SET,
+            5202, shaper_ok + 1, set_text=_COS_SET,
         )
+        self.assertEqual(r_bad["floor_bps"], cap + 1)
         self.assertGreater(r_bad["floor_bps"], r_bad["cap_bps"])
         self.assertFalse(r_bad["satisfiable"])
 

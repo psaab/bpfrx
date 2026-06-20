@@ -21,6 +21,29 @@
   address was added.
 - **File(s)**: pkg/ra/sender.go, _Log.md
 
+## 2026-06-19 — #1365 guard: Copilot review fixes (ceil floor, unscheduled-class error)
+
+- **Timestamp**: 2026-06-19
+- **Action**: Apply 4 Copilot findings on PR #2046. (1) Compute the
+  settle floor with `math.ceil(0.7 * SHAPER_BPS)` instead of `int(...)`
+  so the guard never under-reports the float threshold the real gate
+  uses; a borderline pairing whose threshold sits just above the integer
+  cap is now correctly rejected rather than passed by truncation. (2)
+  Raise `CoSFixtureError` when a classified port's forwarding-class has
+  no scheduler-map entry, instead of silently defaulting to the
+  interface-shaper cap (which masked fixture drift). (3) Rewrote the
+  boundary test to use the LARGEST `SHAPER_BPS` whose ceil-floor lands
+  exactly on the cap (true boundary, computed with the same float
+  arithmetic), asserting `floor_bps == cap`. (4) The over-boundary test
+  now bumps by EXACTLY 1 bps and asserts `floor_bps == cap + 1` →
+  unsatisfiable, proving the boundary is sharp to a single bps (this
+  assertion fails under the old `int()` truncation, so it is
+  non-tautological). Added a unit test for the unscheduled-class error
+  and a doc note on the ceil rounding + hard error.
+- **File(s)**: test/incus/mouse_latency_orchestrate.py,
+  test/incus/mouse_latency_orchestrate_test.py, docs/fairness-regimes.md,
+  _Log.md
+
 ## 2026-06-19 — #1365 mouse-latency env-shape consistency guard
 
 - **Timestamp**: 2026-06-19

@@ -19,6 +19,7 @@ Subcommands:
 
 import argparse
 import json
+import math
 import os
 import re
 import statistics
@@ -174,6 +175,17 @@ def parse_cos_class_caps(set_text: str) -> dict:
     out: dict = {}
     for port, fc in port_to_class.items():
         sched = class_to_sched.get(fc)
+        if sched is None:
+            # A classified port whose forwarding-class has no scheduler-map
+            # entry would silently fall through to the interface-shaper cap
+            # below, masking fixture drift/misparse and yielding a wrong
+            # cap. The guard's whole point is that it cannot drift from the
+            # fixture, so refuse rather than guess.
+            raise CoSFixtureError(
+                f"port {port} class {fc} has no scheduler-map entry "
+                f"(forwarding-class is classified but unscheduled); the "
+                f"CoS fixture cannot resolve its rate cap"
+            )
         exact = bool(sched_exact.get(sched, False))
         if exact:
             cap = sched_rate.get(sched)
@@ -232,7 +244,15 @@ def check_settle_threshold_satisfiable(
             f"ELEPHANT_PORT={elephant_port} is not classified by the CoS "
             f"fixture; known ports: {sorted(caps)}"
         )
-    floor_bps = int(min_utilization * shaper_bps)
+    # The real cwnd-settle gate compares the aggregate against the FLOAT
+    # threshold `mn < min_utilization * shaper_bps`. Round the floor UP
+    # (ceil) so the guard never under-reports it: a borderline pairing
+    # whose true float threshold sits just above the integer cap must be
+    # called unsatisfiable, not "satisfiable" by truncation. The aggregate
+    # is an integer bps count, so the smallest aggregate that can clear a
+    # float threshold T is ceil(T) (the first integer >= T; for integer T
+    # an aggregate of exactly T also clears it since the gate uses `<`).
+    floor_bps = math.ceil(min_utilization * shaper_bps)
     cap_bps = info["cap_bps"]
     satisfiable = floor_bps <= cap_bps
     if satisfiable:

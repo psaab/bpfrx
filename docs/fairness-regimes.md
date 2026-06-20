@@ -676,7 +676,14 @@ table cannot drift from the fixture) and `ABORT`s with an actionable
 message — naming the class, its cap, the computed floor, and a hint to
 either set `SHAPER_BPS` to the class cap or pick a port whose class cap
 is `>= floor` — instead of burning a whole matrix cell on an impossible
-pairing. To exercise a genuinely high-rate class, point at a high-rate
+pairing. A classified port whose forwarding-class has no scheduler-map
+entry is treated as a hard fixture error (not silently defaulted to the
+interface shaper), keeping the table honest. The floor is computed with
+ceiling rounding (`ceil(0.7 * SHAPER_BPS)`) so the guard never
+under-reports it: the real gate compares the aggregate against the float
+threshold `0.7 * SHAPER_BPS`, and a borderline pairing whose threshold
+sits just above the integer cap is correctly rejected rather than passed
+by truncation. To exercise a genuinely high-rate class, point at a high-rate
 port with the matching bps, e.g. `ELEPHANT_PORT=5205 SHAPER_BPS=9000000000`
 (the 9 Gbps `iperf-9g` exact class). The guard is purely static (no
 cluster contact) and is covered by `mouse_latency_orchestrate_test.py`
