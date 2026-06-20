@@ -740,6 +740,31 @@ services {
 		expectedFail: false,
 	},
 	{
+		// #2076: `overrides always-broadcast` must survive BOTH AST shapes
+		// and must NOT be swallowed into the interface list by the inline
+		// flat-set consumer. compileDHCPRelay added `overrides` to the
+		// interface boundary set and parses the override from both Keys and
+		// Children.
+		name: "forwarding-options-dhcp-relay-overrides",
+		hier: `forwarding-options {
+    dhcp-relay {
+        server-group {
+            sg1 {
+                10.1.1.1;
+            }
+        }
+        group lan {
+            active-server-group sg1;
+            interface ge-0/0/0.0;
+            overrides {
+                always-broadcast;
+            }
+        }
+    }
+}`,
+		expectedFail: false,
+	},
+	{
 		name: "protocols-ospf-bgp",
 		hier: `protocols {
     ospf {

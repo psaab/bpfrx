@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/insomniacslk/dhcp/dhcpv4"
+	"github.com/insomniacslk/dhcp/iana"
 
 	"github.com/psaab/xpf/pkg/config"
 )
@@ -45,6 +46,26 @@ type RelayStats struct {
 	Interface        string
 	RequestsRelayed  uint64
 	RepliesForwarded uint64
+
+	// Reply-delivery breakdown (#2076). These distinguish WHY a reply was
+	// broadcast vs L2-unicast so an L2/CAP_NET_RAW/driver/MTU regression is
+	// observable in operations. RepliesBroadcastL2Fallback is the one to
+	// alert on: it means the raw-L2 path failed and the relay had to
+	// degrade to broadcast.
+	RepliesL2Unicast           uint64 // flag-clear reply delivered via raw L2
+	RepliesUnicastCiaddr       uint64 // flag-clear reply UDP-unicast to ciaddr
+	RepliesBroadcastFlag1      uint64 // client set the broadcast flag
+	RepliesBroadcastForced     uint64 // overrides always-broadcast
+	RepliesBroadcastNoTarget   uint64 // no routable target (yiaddr==0,ciaddr==0)
+	RepliesBroadcastL2Fallback uint64 // raw-L2 path failed → degraded
+}
+
+// l2Replier is the raw-L2 unicast seam. *l2Sender implements it in production;
+// tests inject a fake to exercise the dst-decision matrix and fallback without
+// CAP_NET_RAW or real NICs.
+type l2Replier interface {
+	sendReply(dstMAC net.HardwareAddr, srcIP, dstIP net.IP, payload []byte) error
+	Close() error
 }
 
 // interfaceRelay represents a relay goroutine bound to one interface.
@@ -54,6 +75,18 @@ type interfaceRelay struct {
 	done             chan struct{}
 	requestsRelayed  atomic.Uint64
 	repliesForwarded atomic.Uint64
+
+	// alwaysBroadcast forces every reply to broadcast (overrides
+	// always-broadcast). Set once at start; read-only thereafter.
+	alwaysBroadcast bool
+
+	// Reply-delivery counters (#2076).
+	repliesL2Unicast           atomic.Uint64
+	repliesUnicastCiaddr       atomic.Uint64
+	repliesBroadcastFlag1      atomic.Uint64
+	repliesBroadcastForced     atomic.Uint64
+	repliesBroadcastNoTarget   atomic.Uint64
+	repliesBroadcastL2Fallback atomic.Uint64
 }
 
 // packetConnFactory creates a UDP packet connection with the relay's required
@@ -87,7 +120,17 @@ type Manager struct {
 	newConn       packetConnFactory
 	resolveGIAddr ifaceResolver
 	retryInterval time.Duration
+	// newL2 opens the raw-L2 unicast sender for an interface (#2076). It is
+	// a seam so tests can inject a fake or force open failure. The default
+	// returns (nil, err) → fail-soft to the broadcast path; the production
+	// implementation is defaultL2SenderFactory.
+	newL2 l2SenderFactory
 }
+
+// l2SenderFactory opens a raw-L2 reply sender bound to ifaceName. On error the
+// caller records a nil sender and every flag-clear reply takes the broadcast
+// fallback — the relay stays up (fail-soft).
+type l2SenderFactory func(ifaceName string) (l2Replier, error)
 
 // NewManager creates a new DHCP relay Manager.
 func NewManager() *Manager {
@@ -96,7 +139,19 @@ func NewManager() *Manager {
 		newConn:       defaultPacketConnFactory,
 		resolveGIAddr: defaultIfaceResolver,
 		retryInterval: startupRetryInterval,
+		newL2:         defaultL2SenderFactory,
 	}
+}
+
+// defaultL2SenderFactory opens a real AF_PACKET sender. Returning a typed-nil
+// *l2Sender through the l2Replier interface would defeat the `== nil` guard, so
+// on error it returns a nil interface value explicitly.
+func defaultL2SenderFactory(ifaceName string) (l2Replier, error) {
+	s, err := newL2Sender(ifaceName)
+	if err != nil {
+		return nil, err
+	}
+	return s, nil
 }
 
 // defaultPacketConnFactory builds a real UDP packet connection, setting
@@ -196,9 +251,10 @@ func (m *Manager) Apply(ctx context.Context, cfg *config.DHCPRelayConfig) {
 
 			rctx, cancel := context.WithCancel(ctx)
 			ir := &interfaceRelay{
-				ifaceName: ifaceName,
-				cancel:    cancel,
-				done:      make(chan struct{}),
+				ifaceName:       ifaceName,
+				cancel:          cancel,
+				done:            make(chan struct{}),
+				alwaysBroadcast: group.AlwaysBroadcast,
 			}
 			m.relays[ifaceName] = ir
 
@@ -222,9 +278,15 @@ func (m *Manager) Stats() []RelayStats {
 	stats := make([]RelayStats, 0, len(m.relays))
 	for _, ir := range m.relays {
 		stats = append(stats, RelayStats{
-			Interface:        ir.ifaceName,
-			RequestsRelayed:  ir.requestsRelayed.Load(),
-			RepliesForwarded: ir.repliesForwarded.Load(),
+			Interface:                  ir.ifaceName,
+			RequestsRelayed:            ir.requestsRelayed.Load(),
+			RepliesForwarded:           ir.repliesForwarded.Load(),
+			RepliesL2Unicast:           ir.repliesL2Unicast.Load(),
+			RepliesUnicastCiaddr:       ir.repliesUnicastCiaddr.Load(),
+			RepliesBroadcastFlag1:      ir.repliesBroadcastFlag1.Load(),
+			RepliesBroadcastForced:     ir.repliesBroadcastForced.Load(),
+			RepliesBroadcastNoTarget:   ir.repliesBroadcastNoTarget.Load(),
+			RepliesBroadcastL2Fallback: ir.repliesBroadcastL2Fallback.Load(),
 		})
 	}
 	return stats
@@ -296,8 +358,35 @@ func (m *Manager) runRelay(ctx context.Context, cancel context.CancelFunc,
 	}
 	defer serverConn.Close()
 
+	// Open the raw-L2 unicast sender (#2076), fail-soft: a nil sender means
+	// every flag-clear reply takes the broadcast fallback and the relay stays
+	// up (e.g. no CAP_NET_RAW). It is opened AFTER both UDP conns succeed and
+	// BEFORE the cancel watcher. It is TX-only — it is deliberately NOT closed
+	// by the watcher (it never blocks a read); it is closed by the idempotent
+	// l2.Close() in a defer that runs only after wg.Wait() below, so every
+	// sendReply caller has joined first (preserves the #1915 invariants).
+	var l2 l2Replier
+	if ir.alwaysBroadcast {
+		slog.Info("dhcp-relay: overrides always-broadcast set, raw-L2 disabled",
+			"interface", ifaceName)
+	} else {
+		l2, err = m.newL2(ifaceName)
+		if err != nil {
+			slog.Warn("dhcp-relay: raw-L2 sender unavailable, "+
+				"flag-clear replies will broadcast",
+				"interface", ifaceName, "err", err)
+			l2 = nil
+		}
+	}
+	defer func() {
+		if l2 != nil {
+			_ = l2.Close()
+		}
+	}()
+
 	slog.Info("dhcp-relay: listening",
-		"interface", ifaceName, "giaddr", giaddr)
+		"interface", ifaceName, "giaddr", giaddr,
+		"always_broadcast", ir.alwaysBroadcast, "raw_l2", l2 != nil)
 
 	// Both the cancel watcher and the server-response goroutine are tracked by
 	// the WaitGroup so the runner's wg.Wait() is a true join of every spawned
@@ -323,7 +412,7 @@ func (m *Manager) runRelay(ctx context.Context, cancel context.CancelFunc,
 	go func() {
 		defer wg.Done()
 		defer cancel()
-		handleServerResponses(ctx, serverConn, conn, ir)
+		handleServerResponses(ctx, serverConn, conn, ir, l2, giaddr)
 	}()
 
 	// Main read loop in its OWN func scope so its `defer cancel()` fires on
@@ -432,7 +521,21 @@ func (m *Manager) resolveGIAddrWithRetry(ctx context.Context, ifaceName string) 
 
 // handleServerResponses reads DHCP replies from servers on the serverConn
 // and forwards them back to clients on the client-facing conn.
-func handleServerResponses(ctx context.Context, serverConn, clientConn net.PacketConn, ir *interfaceRelay) {
+//
+// Reply delivery honors the RFC 2131 §4.1 broadcast flag (#2076):
+//
+//	overrides always-broadcast        -> broadcast (operator override wins)
+//	broadcast flag set                -> broadcast (existing path)
+//	flag clear, yiaddr real           -> raw-L2 unicast to chaddr+yiaddr
+//	flag clear, yiaddr 0, ciaddr real -> UDP-unicast to ciaddr (client has IP)
+//	flag clear, yiaddr 0, ciaddr 0    -> broadcast (nothing routable)
+//	raw-L2 path fails                 -> broadcast fallback (+ counter)
+//
+// srcIP is the saved interface giaddr (the IPv4 source the server saw in the
+// relayed request); it MUST come from the caller, not from pkt.GatewayIPAddr,
+// which is zeroed below before sending.
+func handleServerResponses(ctx context.Context, serverConn, clientConn net.PacketConn,
+	ir *interfaceRelay, l2 l2Replier, srcIP net.IP) {
 	ifaceName := ir.ifaceName
 	buf := make([]byte, 1500)
 	for {
@@ -474,27 +577,90 @@ func handleServerResponses(ctx context.Context, serverConn, clientConn net.Packe
 		// Strip Option 82 before forwarding to the client.
 		stripOption82(pkt)
 
-		// Clear giaddr since we are the last relay hop.
+		// Clear giaddr since we are the last relay hop. The L2 source IP
+		// comes from the saved giaddr (srcIP), NOT this field.
 		pkt.GatewayIPAddr = net.IPv4zero
 
-		// Determine destination: if the broadcast flag is set, broadcast;
-		// otherwise unicast to the assigned address.
-		var dst *net.UDPAddr
-		if pkt.IsBroadcast() || pkt.YourIPAddr == nil || pkt.YourIPAddr.Equal(net.IPv4zero) {
-			dst = &net.UDPAddr{IP: net.IPv4bcast, Port: clientPort}
-		} else {
-			dst = &net.UDPAddr{IP: pkt.YourIPAddr, Port: clientPort}
-		}
-
 		replyData := pkt.ToBytes()
-		if _, err := clientConn.WriteTo(replyData, dst); err != nil {
-			slog.Warn("dhcp-relay: send to client failed",
-				"interface", ifaceName,
-				"dst", dst, "err", err)
-		} else {
+		if deliverReply(ir, clientConn, l2, srcIP, pkt, replyData) {
 			ir.repliesForwarded.Add(1)
 		}
 	}
+}
+
+// deliverReply applies the #2076 reply-destination matrix and sends the reply.
+// It returns true if the reply was delivered (any path that issued a successful
+// send), false on a hard send failure. It increments the per-reason counters.
+func deliverReply(ir *interfaceRelay, clientConn net.PacketConn, l2 l2Replier,
+	srcIP net.IP, pkt *dhcpv4.DHCPv4, replyData []byte) bool {
+	yiaddr := pkt.YourIPAddr.To4()
+	yiaddrReal := yiaddr != nil && !yiaddr.Equal(net.IPv4zero)
+	ciaddr := pkt.ClientIPAddr.To4()
+	ciaddrReal := ciaddr != nil && !ciaddr.Equal(net.IPv4zero)
+
+	switch {
+	case ir.alwaysBroadcast:
+		ir.repliesBroadcastForced.Add(1)
+		return broadcastReply(ir, clientConn, replyData)
+
+	case pkt.IsBroadcast():
+		ir.repliesBroadcastFlag1.Add(1)
+		return broadcastReply(ir, clientConn, replyData)
+
+	case yiaddrReal:
+		// Flag clear with a real offered address: RFC-correct raw-L2
+		// unicast to chaddr+yiaddr. Fall back to broadcast on any L2
+		// failure or when no raw-L2 sender is available.
+		if l2 != nil && l2Eligible(pkt) {
+			err := l2.sendReply(pkt.ClientHWAddr, srcIP, yiaddr, replyData)
+			if err == nil {
+				ir.repliesL2Unicast.Add(1)
+				return true
+			}
+			slog.Warn("dhcp-relay: raw-L2 unicast failed, broadcasting",
+				"interface", ir.ifaceName,
+				"client_mac", pkt.ClientHWAddr,
+				"yiaddr", yiaddr, "err", err)
+		}
+		ir.repliesBroadcastL2Fallback.Add(1)
+		return broadcastReply(ir, clientConn, replyData)
+
+	case ciaddrReal:
+		// Flag clear, no yiaddr, but the client already owns ciaddr
+		// (DHCPINFORM / REBINDING ACK) — it answers ARP, so a normal UDP
+		// unicast is deliverable.
+		dst := &net.UDPAddr{IP: ciaddr, Port: clientPort}
+		if _, err := clientConn.WriteTo(replyData, dst); err != nil {
+			slog.Warn("dhcp-relay: unicast to ciaddr failed",
+				"interface", ir.ifaceName, "dst", dst, "err", err)
+			return false
+		}
+		ir.repliesUnicastCiaddr.Add(1)
+		return true
+
+	default:
+		// Flag clear, no yiaddr, no ciaddr: nothing routable. Broadcast.
+		ir.repliesBroadcastNoTarget.Add(1)
+		return broadcastReply(ir, clientConn, replyData)
+	}
+}
+
+// broadcastReply sends the reply to 255.255.255.255:68 on the client conn.
+func broadcastReply(ir *interfaceRelay, clientConn net.PacketConn, replyData []byte) bool {
+	dst := &net.UDPAddr{IP: net.IPv4bcast, Port: clientPort}
+	if _, err := clientConn.WriteTo(replyData, dst); err != nil {
+		slog.Warn("dhcp-relay: broadcast to client failed",
+			"interface", ir.ifaceName, "dst", dst, "err", err)
+		return false
+	}
+	return true
+}
+
+// l2Eligible reports whether a reply can be sent via the raw-L2 path: the
+// client must use a 6-byte Ethernet hardware address. Non-Ethernet htype or a
+// non-6-byte chaddr falls back to broadcast (the L2 frame would be malformed).
+func l2Eligible(pkt *dhcpv4.DHCPv4) bool {
+	return pkt.HWType == iana.HWTypeEthernet && len(pkt.ClientHWAddr) == 6
 }
 
 // addOption82 inserts or replaces the Relay Agent Information option (82)

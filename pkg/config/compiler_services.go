@@ -1109,9 +1109,14 @@ func compileDHCPRelay(node *Node, fo *ForwardingOptionsConfig) error {
 				// Multi-value (#1813): consume every following token up
 				// to the next recognized property keyword —
 				// `group lan interface [ a b ];` packs all interfaces
-				// inline.
+				// inline. `overrides` MUST be a boundary keyword
+				// (#2076) so a flat-set
+				// `group g interface ge-0/0/0.0 overrides always-broadcast`
+				// does not swallow `overrides`/`always-broadcast` into
+				// the interface list.
 				for i+1 < len(keys) && keys[i+1] != "interface" &&
-					keys[i+1] != "active-server-group" {
+					keys[i+1] != "active-server-group" &&
+					keys[i+1] != "overrides" {
 					i++
 					g.Interfaces = append(g.Interfaces, keys[i])
 				}
@@ -1119,6 +1124,18 @@ func compileDHCPRelay(node *Node, fo *ForwardingOptionsConfig) error {
 				if i+1 < len(keys) {
 					i++
 					g.ActiveServerGroup = keys[i]
+				}
+			case "overrides":
+				// Inline flat-set spelling (#2076):
+				// `group g overrides always-broadcast`. Consume the
+				// override sub-keywords until the next group property.
+				for i+1 < len(keys) && keys[i+1] != "interface" &&
+					keys[i+1] != "active-server-group" &&
+					keys[i+1] != "overrides" {
+					i++
+					if keys[i] == "always-broadcast" {
+						g.AlwaysBroadcast = true
+					}
 				}
 			}
 		}
@@ -1141,6 +1158,18 @@ func compileDHCPRelay(node *Node, fo *ForwardingOptionsConfig) error {
 				}
 			case "active-server-group":
 				g.ActiveServerGroup = nodeVal(prop)
+			case "overrides":
+				// Block form (#2076): `overrides { always-broadcast; }`.
+				// always-broadcast may also ride in Keys[1:] when the
+				// override block collapses to a single inline value.
+				if prop.FindChild("always-broadcast") != nil {
+					g.AlwaysBroadcast = true
+				}
+				for _, k := range prop.Keys[1:] {
+					if k == "always-broadcast" {
+						g.AlwaysBroadcast = true
+					}
+				}
 			}
 		}
 	}

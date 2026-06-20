@@ -704,6 +704,13 @@ type DHCPRelayGroup struct {
 	Name              string
 	Interfaces        []string
 	ActiveServerGroup string // reference to server group name
+	// AlwaysBroadcast forces every server reply (OFFER/ACK) to be
+	// broadcast to 255.255.255.255:68 even when the client cleared the
+	// broadcast flag, mirroring Junos `dhcp-relay ... overrides
+	// always-broadcast`. When false (the default) the relay honors the
+	// client's broadcast flag and raw-L2-unicasts flag-clear replies to
+	// chaddr+yiaddr (#2076).
+	AlwaysBroadcast bool
 }
 
 // SamplingConfig holds sampling instance definitions.

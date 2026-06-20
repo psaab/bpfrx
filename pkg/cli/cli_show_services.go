@@ -307,6 +307,9 @@ func (c *CLI) showDHCPRelay() error {
 			fmt.Printf("  %s:\n", name)
 			fmt.Printf("    Interfaces: %s\n", strings.Join(g.Interfaces, ", "))
 			fmt.Printf("    Active server group: %s\n", g.ActiveServerGroup)
+			if g.AlwaysBroadcast {
+				fmt.Printf("    Overrides: always-broadcast\n")
+			}
 		}
 	}
 
@@ -318,6 +321,19 @@ func (c *CLI) showDHCPRelay() error {
 			fmt.Printf("  %-16s %-20s %s\n", "Interface", "Requests relayed", "Replies forwarded")
 			for _, s := range stats {
 				fmt.Printf("  %-16s %-20d %d\n", s.Interface, s.RequestsRelayed, s.RepliesForwarded)
+			}
+			// Reply-delivery breakdown (#2076). L2-fallback is the one to
+			// alert on: it means the raw-L2 path failed (CAP_NET_RAW,
+			// driver, or MTU) and the relay degraded to broadcast.
+			fmt.Println("\nReply delivery (#2076):")
+			fmt.Printf("  %-16s %-10s %-10s %-10s %-10s %-10s %s\n",
+				"Interface", "L2-unicast", "ciaddr", "bcast-flag", "bcast-fwd",
+				"no-target", "L2-fallback")
+			for _, s := range stats {
+				fmt.Printf("  %-16s %-10d %-10d %-10d %-10d %-10d %d\n",
+					s.Interface, s.RepliesL2Unicast, s.RepliesUnicastCiaddr,
+					s.RepliesBroadcastFlag1, s.RepliesBroadcastForced,
+					s.RepliesBroadcastNoTarget, s.RepliesBroadcastL2Fallback)
 			}
 		}
 	}
