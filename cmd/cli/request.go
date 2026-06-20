@@ -6,6 +6,7 @@ import (
 
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
+	"github.com/psaab/xpf/pkg/wgkey"
 )
 
 // confirmYes prompts the operator with `prompt`, reads a line via
@@ -314,19 +315,44 @@ func (c *ctl) handleRequestSecurity(args []string) error {
 		printRemoteTreeHelp("request security:", "request", "security")
 		return nil
 	}
-	if args[0] != "ipsec" {
+	switch args[0] {
+	case "ipsec":
+		if len(args) < 3 || args[1] != "sa" || args[2] != "clear" {
+			printRemoteTreeHelp("request security ipsec sa:", "request", "security", "ipsec", "sa")
+			return nil
+		}
+		resp, err := c.client.SystemAction(c.ctx(), &pb.SystemActionRequest{
+			Action: "ipsec-sa-clear",
+		})
+		if err != nil {
+			return fmt.Errorf("%v", err)
+		}
+		fmt.Println(resp.Message)
+		return nil
+	case "wireguard":
+		return c.handleRequestSecurityWireguard(args[1:])
+	default:
 		return fmt.Errorf("unknown request security target: %s", args[0])
 	}
-	if len(args) < 3 || args[1] != "sa" || args[2] != "clear" {
-		printRemoteTreeHelp("request security ipsec sa:", "request", "security", "ipsec", "sa")
+}
+
+// handleRequestSecurityWireguard implements `request security wireguard
+// generate-private-key` (#1434 Increment 1). The key is generated
+// LOCALLY in the CLI (pure-Go X25519) — Junos `request` semantics are
+// print-only, no config mutation, and a key generator must not depend
+// on the daemon being up. No gRPC round-trip; the control socket is
+// contended and there is no reason the key must come from the helper's
+// RNG.
+func (c *ctl) handleRequestSecurityWireguard(args []string) error {
+	if len(args) == 0 || args[0] != "generate-private-key" {
+		printRemoteTreeHelp("request security wireguard:", "request", "security", "wireguard")
 		return nil
 	}
-	resp, err := c.client.SystemAction(c.ctx(), &pb.SystemActionRequest{
-		Action: "ipsec-sa-clear",
-	})
+	kp, err := wgkey.Generate()
 	if err != nil {
-		return fmt.Errorf("%v", err)
+		return fmt.Errorf("generate WireGuard key: %w", err)
 	}
-	fmt.Println(resp.Message)
+	fmt.Printf("Private key: %s\n", kp.PrivateKey)
+	fmt.Printf("Public key:  %s\n", kp.PublicKey)
 	return nil
 }

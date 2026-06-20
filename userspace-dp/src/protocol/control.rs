@@ -471,6 +471,16 @@ pub(crate) struct WgTunnelStatus {
     /// uniformly hex.
     #[serde(rename = "peer_pubkey_hex", default)]
     pub peer_pubkey_hex: String,
+    /// Our LOCAL static public key, 64-char lowercase hex (#1434
+    /// Increment 1). This is the key an operator must hand to the peer
+    /// to configure us — derived once from the local private key at
+    /// engine construction (`WgEngine::local_public_key`). Travels as a
+    /// hex STRING (never a `Vec<u8>`, to avoid the Go↔Rust base64 wire
+    /// trap, MEMORY #1961); operator surfaces re-render it as
+    /// WireGuard-canonical base64. `#[serde(default)]` keeps a pre-#1434
+    /// payload (key absent) decoding to "".
+    #[serde(rename = "local_pubkey_hex", default)]
+    pub local_pubkey_hex: String,
     /// Configured peer endpoint (empty for a responder-only peer).
     /// The control thread's LEARNED endpoint is thread-local and not
     /// surfaced in this revision.

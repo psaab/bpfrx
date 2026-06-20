@@ -25,6 +25,7 @@ func TestProcessStatusWgTunnelsPopulatedDecode(t *testing.T) {
 			"tunnel_endpoint_id": 7,
 			"listen_port": 51820,
 			"peer_pubkey_hex": "` + strings.Repeat("ab", 32) + `",
+			"local_pubkey_hex": "` + strings.Repeat("cd", 32) + `",
 			"peer_endpoint": "192.0.2.10:51820",
 			"session_confirmed": true,
 			"last_handshake_unix_secs": 1770000000,
@@ -87,6 +88,11 @@ func TestProcessStatusWgTunnelsPopulatedDecode(t *testing.T) {
 	}
 	if row.PeerPubkeyHex != strings.Repeat("ab", 32) {
 		t.Fatalf("PeerPubkeyHex = %q", row.PeerPubkeyHex)
+	}
+	// #1434 Increment 1: the local public key must plumb through with a
+	// distinct value (cd-ladder) so a swapped peer/local tag is caught.
+	if row.LocalPubkeyHex != strings.Repeat("cd", 32) {
+		t.Fatalf("LocalPubkeyHex = %q", row.LocalPubkeyHex)
 	}
 	if row.PeerEndpoint != "192.0.2.10:51820" || !row.SessionConfirmed {
 		t.Fatalf("endpoint/confirmed = %q/%v", row.PeerEndpoint, row.SessionConfirmed)

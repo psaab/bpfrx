@@ -35,6 +35,19 @@ type fakeBpfrxClient struct {
 
 	enterConfigureCalls int
 	systemActionCalls   int
+
+	// ShowText recorder (#1434 Increment 1 topic-mapping coverage).
+	showTextCalls  int
+	showTextTopic  string
+	showTextOutput string
+}
+
+func (f *fakeBpfrxClient) ShowText(
+	_ context.Context, in *pb.ShowTextRequest, _ ...grpc.CallOption,
+) (*pb.ShowTextResponse, error) {
+	f.showTextCalls++
+	f.showTextTopic = in.GetTopic()
+	return &pb.ShowTextResponse{Output: f.showTextOutput}, nil
 }
 
 func (f *fakeBpfrxClient) EnterConfigure(

@@ -423,6 +423,9 @@ func (c *ctl) handleShowSecurity(args []string) error {
 		if len(args) >= 2 && args[1] == "detail" {
 			return c.showText("wireguard-detail")
 		}
+		if len(args) >= 2 && args[1] == "public-key" {
+			return c.showText("wireguard-public-key")
+		}
 		return c.showText("wireguard")
 	case "alarms":
 		if len(args) >= 2 && args[1] == "detail" {
