@@ -908,6 +908,12 @@ func validateIPsecPolicyProposalReferencesStrict(cfg *Config) error {
 // dangle. Only a non-empty `stream-name` that misses the stream map is
 // rejected.
 //
+// Note: compileLog only records a stream in Log.Streams when it has a
+// host (a host-less stream is not a real destination and is dropped by
+// the stream loop), so a profile referencing a host-less stream is
+// treated as a dangling reference — consistent with the stream's own
+// "must have a host to exist" semantics.
+//
 // On the tolerant load / peer-sync paths the call site downgrades this
 // to a warning (opts.lenientLogProfileStreamRef) so an already-persisted
 // config (older binaries dropped the stanza entirely) or a peer-synced
