@@ -641,7 +641,19 @@ func (m *Manager) generatePolicyOptions(po *config.PolicyOptionsConfig) string {
 								if strings.Contains(rf.Prefix, ":") {
 									maxLen = 128
 								}
+								// UptoLen is the zero-value (0) both when an
+								// "upto" length was never parsed (degrade case)
+								// and when a /0 prefix legitimately has plen 0.
+								// Require UptoLen > 0 before the exact/le
+								// branches so a /0 prefix with an unset length
+								// degrades to the orlonger default rather than
+								// being silently rendered as exact (Codex #2102
+								// MAJOR #2). A "upto /0" is a degenerate config
+								// (== exact on a default route, better written
+								// as exact); degrading it is FRR-valid.
 								switch {
+								case rf.UptoLen <= 0:
+									// keep the orlonger-equivalent default
 								case rf.UptoLen == plen:
 									matchStr = ""
 								case rf.UptoLen > plen && rf.UptoLen <= maxLen:
