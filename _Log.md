@@ -81,6 +81,158 @@
   scripts/image/xpf-grow-root.service, scripts/image/test-grow-root.sh,
   scripts/image/bake.py, scripts/image/validate.py,
   docs/install-images.md, docs/image-validation.md
+## 2026-06-19 — #2033 Codex round-5: replacement decision atomic under the act-lock
+
+- **Timestamp**: 2026-06-19
+- **Action**: Fixed the last check-then-act in releaseDrain. It computed
+  `startReplacement` (epoch unchanged AND !goodbyeWanted) under the first lock,
+  UNLOCKED (to join/emit), then RE-LOCKED and acted on the STALE boolean — a
+  concurrent Withdraw/Clear in the gap (bump epoch / flip goodbyeWanted) was
+  ignored, re-arming RA after a newer withdraw/clear. Fix: re-evaluate the
+  decision against the LIVE tombstone UNDER the act-lock with fresh state — no
+  cached boolean. Restructured releaseDrain into a short loop: the only unlock
+  is for the blocking standalone emit (after claiming goodbyeClaimed once); the
+  loop re-acquires and re-reads epoch + goodbyeWanted before the
+  replacement decision+act, all under one lock hold. goodbyeWanted is monotonic
+  (false→true) and epoch monotonic, so a "start" observed under the act-lock
+  cannot be invalidated while held; a late Withdraw that flips goodbyeWanted in
+  the emit gap is caught on the re-lock (suppresses replace, emits the owed
+  goodbye). Documented the pre-existing startLocked-under-m.mu blocking cost in
+  the README (not a correctness issue; not introduced here).
+- **File(s)**: pkg/ra/ra.go, pkg/ra/README.md, _Log.md
+
+- **Timestamp**: 2026-06-19
+- **Action**: Added two round-5 regression tests (TestRound5_Withdraw... and
+  TestRound5_Clear...DuringRestartDecision...) that race a superseding
+  Withdraw/Clear against a restart releaseDrain and assert onProvenClose never
+  runs after a supersession is visible at the act moment (epoch advanced /
+  goodbyeWanted flipped). Mutation-verified non-tautological against a
+  gap-widened cached-boolean mutant (the exact pre-fix shape): both FAIL
+  ("replacement started despite supersession"). Also made TestT7c deterministic
+  — it drove Clear with two senders and depended on Clear's nondeterministic
+  per-interface release order (flaky on the pre-round-5 code too); rewrote it to
+  drive releaseDrain directly on a constructed dead-hard tombstone. Kept
+  Race1/Race3/Race2 + restart-timeout + T2a/T2b/T7b/T7d/T1 + ≤1-conn invariant.
+- **File(s)**: pkg/ra/serialize_test.go, _Log.md
+
+## 2026-06-19 — #2033 Codex round-4: unify the changed-config restart through releaseDrain
+
+- **Timestamp**: 2026-06-19
+- **Action**: The round-3 `releaseDrain` discipline was correct, but the
+  changed-config restart kept a DIVERGENT inline copy of the stop-then-act
+  logic that re-introduced two of the exact bugs releaseDrain fixed: on a join
+  TIMEOUT it (MAJOR 1) still read `oldS.goodbyeEmitted` unordered and emitted a
+  standalone, and (MAJOR 2) fell through to `startLocked` while the old conn may
+  be live (2 live conns). Unified: `releaseDrain(name, s, startEpoch,
+  onProvenClose)` is now the SOLE "stop → emit-exactly-once → start-on-proven-
+  close → release" path, used by Withdraw/WithdrawInterfaces/Clear/Apply-removal
+  (onProvenClose=nil) AND the Apply changed-config restart (onProvenClose =
+  startLocked closure). The replacement opens ONLY on the proven-closed
+  (`<-stopped`) arm, under m.mu, tombstone held, and only if epoch unchanged AND
+  no goodbye wanted. On TIMEOUT it emits nothing, starts nothing, LEAVES the
+  tombstone held (so a future Apply defers, never 2 conns), and detaches
+  `reclaimTombstoneWhenStopped` to remove it once the wedged owner exits.
+  Deleted the inline restart block. Audited: no other stop-then-act path remains
+  (the only other `.stopped` join is the reclaim cleanup which never emits/
+  starts; `applyDeferred`'s startLocked runs only AFTER a tombstone is gone =
+  proven closed). `claimWaitTimeout` already a package-var seam.
+- **File(s)**: pkg/ra/ra.go, pkg/ra/README.md, _Log.md
+
+- **Timestamp**: 2026-06-19
+- **Action**: Added two round-4 restart-timeout regression tests to
+  `pkg/ra/serialize_test.go`. `TestRestartTimeoutNoGoodbyeNoReplacement` —
+  changed-config restart whose old sender WEDGES + a racing graceful Withdraw +
+  join timeout → asserts NO standalone goodbye AND no replacement started AND
+  tombstone left held (reclaimed after the owner exits).
+  `TestRestartTimeoutNoReplacementWhenNoGoodbye` — wedged restart timeout, no
+  goodbye wanted → asserts peak live-conn ≤ 1 (replacement never opens while the
+  old conn may be live). Both mutation-verified to FAIL against the old inline-
+  timeout fall-through (MAJOR 1 emits a goodbye; MAJOR 2 reaches peak 2 conns).
+  Updated TestRace2's assertion to the new timeout-leaves-tombstone-held +
+  reclaim-on-exit behavior. Kept Race1/Race3/Race2 + T7c/T2b/T7d/T1/T2a/T7b +
+  ≤1-conn invariant.
+- **File(s)**: pkg/ra/serialize_test.go, _Log.md
+
+## 2026-06-19 — #2033 Codex round-3: structural claim-and-hold for the goodbye
+
+- **Timestamp**: 2026-06-19
+- **Action**: Rebased onto current origin/master (e33b401ef). Replaced the
+  ad-hoc standalone-goodbye decision (which had three check-then-act /
+  happens-before races) with a STRUCTURAL fix: the draining tombstone is now a
+  `drainEntry{sender, cfg, goodbyeWanted, goodbyeClaimed}` (all fields under
+  `m.mu`) that is the single atomic claim-and-hold for the goodbye. Added one
+  `releaseDrain(name, sender)` exit path used by Withdraw (active-sender owner),
+  Clear (`clearLocked`), and Apply removal; the Apply changed-config restart has
+  an inline equivalent. It (1) JOINS the sender and reads `goodbyeEmitted` ONLY
+  on the `<-stopped` arm (race 2: timeout NEVER emits — owner may be live;
+  bounded writes make a timeout pathological), (2) under `m.mu` takes the
+  goodbye EXACTLY ONCE via `goodbyeClaimed` (race 1: concurrent Withdraws just
+  flip `goodbyeWanted`; one owner emits), (3) HOLDS the entry across the whole
+  standalone emit so a concurrent Apply DEFERS — no clobber, ≤1 live conn
+  (race 3: the tombstone is the mutual exclusion, no check-then-act on
+  `m.senders`). Removed `gracefulTarget`/`finishGraceful`/
+  `emitStandaloneGoodbye`; `claimGracefulLocked` now returns only the
+  interfaces THIS Withdraw owns the release for, and flips `goodbyeWanted` on
+  entries owned by a racing Clear/restart. `WithdrawOnce` pre-marks
+  `goodbyeClaimed` (it emits its own goodbye) and holds the entry across its
+  emit. `claimWaitTimeout` is now a package var (test seam). Net contract:
+  EXACTLY ONE goodbye per withdrawn interface, ZERO for a pure replace, never a
+  double, never a clobber.
+- **File(s)**: pkg/ra/ra.go, pkg/ra/README.md, _Log.md
+
+- **Timestamp**: 2026-06-19
+- **Action**: Added three round-3 race regression tests to
+  `pkg/ra/serialize_test.go` (fakeConn gains a `beforeClose` hook; fakeListen
+  tracks every conn per interface). `TestRace1` — concurrent Withdraws on the
+  same dead-hard tombstone → EXACTLY one goodbye (1 conn / goodbyeCount writes).
+  `TestRace3` — a concurrent Apply during the held standalone emit DEFERS (no
+  live sender, ≤1 conn) then proceeds after release. `TestRace2` — the join
+  timeout path emits NO standalone (drives `releaseDrain` with a wedged sender +
+  shortened `claimWaitTimeout`). Each is deterministic (drives `releaseDrain`
+  directly to avoid Clear's nondeterministic per-interface order) and
+  mutation-verified to FAIL against the matching pre-fix defect (no-claim-once →
+  double-send; tombstone-released-before-emit → clobber; emit-on-timeout →
+  goodbye on the wedged path). Kept T7c/T2b/T7d/T1/T2a/T7b + ≤1-conn invariant.
+- **File(s)**: pkg/ra/serialize_test.go, _Log.md
+
+## 2026-06-19 — #2033 Codex re-review: two graceful-goodbye MAJORs (dead sender + restart window)
+
+- **Timestamp**: 2026-06-19
+- **Action**: Rebased fix/2033 onto current origin/master (e33b401ef). Fixed
+  two remaining graceful-goodbye MAJORs. ROOT CAUSE: once a sender has run
+  `finishShutdown` (read modeHard, emitted no goodbye, exited), it is DEAD —
+  `signalStop(modeGraceful)` cannot resurrect it. So `claimGracefulLocked`'s
+  upgrade is a no-op on a dead sender and the goodbye was dropped. Decoupled
+  the goodbye guarantee from the live-sender lifecycle: added
+  `sender.goodbyeEmitted atomic.Bool` set in `finishShutdown` BEFORE
+  `close(stopped)`; the manager checks it after the join and, if a graceful
+  withdrawal was intended but no goodbye went out, emits a STANDALONE goodbye
+  via `sendOneGoodbye` (the WithdrawOnce path). Replaced `joinDraining` with
+  `finishGraceful`; `claimGracefulLocked` now returns `gracefulTarget`s
+  capturing the sender pointer under m.mu (so the post-mortem read does not
+  depend on the draining-map entry surviving the restart loop's delete).
+  MAJOR 2 (Clear-first, sender already finished hard): standalone backstop.
+  NEW MAJOR (graceful Withdraw racing the changed-config restart stop-to-start
+  window): standalone backstop for the withdrawn interface; the restart still
+  aborts on the bumped epoch. Guarantees EXACTLY ONE goodbye per withdrawn
+  interface (owner's if the upgrade landed, else standalone; suppressed if the
+  owner already emitted one or a live sender re-claimed the interface) and
+  ZERO for a pure changed-config replace. Folded #2034's procfs-free
+  `ensureLinkLocal` on rebase.
+- **File(s)**: pkg/ra/sender.go, pkg/ra/ra.go, pkg/ra/README.md, _Log.md
+
+- **Timestamp**: 2026-06-19
+- **Action**: Added three non-tautological regression tests to
+  `pkg/ra/serialize_test.go` (fakeListen now tracks every conn per interface
+  for cross-conn goodbye accounting). `TestT7c` — Clear-first where the
+  sender finishes its hard stop before Withdraw runs (dead-sender upgrade is a
+  no-op) asserts a STANDALONE goodbye is still emitted; `TestT2b` — graceful
+  Withdraw racing the changed-config restart stop-to-start window asserts a
+  goodbye IS emitted and NO replacement starts; `TestT7d` — exactly-one
+  goodbye when the upgrade lands in time (no double goodbye). Mutation-
+  verified: a no-standalone mutant fails T7c+T2b; an always-standalone mutant
+  fails T7d (double goodbye).
+- **File(s)**: pkg/ra/serialize_test.go, _Log.md
 
 ## 2026-06-20 — #1993 FRR clear MAJOR fix: require LIVE forwarding, not just pins
 
@@ -144,6 +296,39 @@
   pkg/config/inactive.go, pkg/config/inactive_test.go,
   pkg/config/README.md, pkg/configstore/store.go,
   pkg/configstore/inactive_test.go, docs/config-schema.md, _Log.md
+
+## 2026-06-20 — #2033 Codex review: fix two manager-level coordination MAJORs
+
+- **Timestamp**: 2026-06-20
+- **Action**: Rebased fix/2033 onto current origin/master (folding #2034's
+  procfs-free `ensureLinkLocal` into the single-owner sender). Fixed two
+  Codex MAJORs in `pkg/ra/ra.go`. MAJOR 1: `Apply`'s changed-config path
+  opened the replacement NDP conn BEFORE stopping the old sender (two live
+  conns → a goodbye-after-normal-RA inversion). Now every remove/replace
+  installs a draining tombstone under `m.mu`, stops the old sender
+  (conn closed) OUTSIDE the lock, and only then opens the replacement
+  (epoch-guarded restart), so at no point are two conns live for one
+  interface. MAJOR 2: `Withdraw`/`WithdrawInterfaces` bumped the epoch then
+  UNLOCKED before claiming, letting a racing `Clear` install a hard
+  tombstone and drop the goodbye. Now the graceful intent
+  (tombstone + `signalStop(modeGraceful)`) is recorded atomically under the
+  same lock; `claimGracefulLocked` also UPGRADES an already-hard-draining
+  sender to graceful (the draining map now stores the `*sender`), and
+  `Withdraw` includes already-draining interfaces. `clearLocked` stores the
+  sender so a racing graceful Withdraw can upgrade it.
+- **File(s)**: pkg/ra/ra.go, pkg/ra/README.md, _Log.md
+
+- **Timestamp**: 2026-06-20
+- **Action**: Added two non-tautological regression tests to
+  `pkg/ra/serialize_test.go` (with `beforeClose`/`beforeWrite` fakeConn
+  hooks): `TestT2a_ChangedConfigApplyNeverTwoLiveConns` (holds the old
+  conn's close open and asserts the live-conn count never exceeds 1 across a
+  changed-config Apply — fails against start-new-before-stop-old) and
+  `TestT7b_ManagerHardFirstThenGracefulStillGoodbye` (parks the owner in its
+  burst, runs Clear-hard then Withdraw-graceful, asserts the goodbye is
+  still emitted — fails against the bump-then-unlock gap). Mutation-verified
+  both fail against the respective pre-fix code.
+- **File(s)**: pkg/ra/serialize_test.go, _Log.md
 
 ## 2026-06-20 — #2034 RA link-local review follow-up (regression test)
 
@@ -284,6 +469,46 @@
   pkg/config/schema_walk.go, pkg/config/ast_format.go,
   pkg/config/inactive_test.go, pkg/config/README.md, docs/config-schema.md,
   docs/feature-gaps.md, _Log.md
+
+## 2026-06-19 — #2033 serialize RA goodbye-withdraw with sender shutdown
+
+- **Timestamp**: 2026-06-19
+- **Action**: Path A single-owner RA refactor. Rewrote `sender.go` so the
+  per-interface `run()` goroutine is the sole writer/closer of the NDP
+  conn: added an `ndpConn` compile-time seam (mdlayher/ndp v1.1.0
+  signatures — `ndp.Message`/`*ipv6.ControlMessage`/`netip.Addr`),
+  `shutdownMode` (hard/graceful) published before a `sync.Once`-guarded
+  `close(stopCh)`, `finishShutdown` as the ONLY goodbye-emit + conn-close
+  site (graceful upgrades hard, owner closes after the goodbye),
+  interruptible startup/re-burst via `burstCh`, bounded writes
+  (`SetWriteDeadline`), `rsReceiver` error backoff, `lastRA` under
+  `lastRAMu` (W4 race fix), and a no-link-toggle `sendGoodbyeStandalone`
+  for `WithdrawOnce`. Rewrote `ra.go` with a draining-tombstone manager
+  (`m.draining` + `epoch`): `Withdraw`/`WithdrawInterfaces`/`Clear` move
+  senders to a tombstone under `m.mu` then join outside the lock; `Apply`
+  defers + epoch-guards interfaces blocked by a tombstone; `WithdrawOnce`
+  claims via the tombstone; `ResendBurst` goes through the owner.
+  Added a `State` field to `SenderInfo` ("active"/"draining"). Updated the
+  grpcapi show-RA text formatter to surface the draining state.
+- **File(s)**: pkg/ra/sender.go, pkg/ra/ra.go,
+  pkg/grpcapi/server_show_interfaces_text.go, _Log.md
+
+- **Timestamp**: 2026-06-19
+- **Action**: Added `pkg/ra/serialize_test.go`: a `fakeConn` recorder/
+  injector behind the `ndpConn` seam plus T1 (forced RS interleave) and
+  T1b ordering proofs of "no lifetime>0 RA after the first goodbye"; a
+  non-tautological negative arm; a `<=1 live conn per interface` tombstone
+  invariant (serial + concurrent Apply/Withdraw/WithdrawOnce/ResendBurst);
+  T3 (WithdrawOnce goodbye-only, no burst, no link toggle), T4a, T5, T6,
+  T7 (graceful-upgrades-hard, both orderings), T9, and a Status-draining
+  test. Mutation-verified: a normal-RA-after-goodbye mutant fails T1/T1b;
+  a missing-tombstone mutant trips the live-conn invariant.
+- **File(s)**: pkg/ra/serialize_test.go, _Log.md
+
+- **Timestamp**: 2026-06-19
+- **Action**: Documented the single-owner + draining-tombstone shutdown
+  contract and the Status "draining" state in the module README.
+- **File(s)**: pkg/ra/README.md, _Log.md
 
 ## 2026-06-19 — #2000 review follow-up on postinst test harness
 

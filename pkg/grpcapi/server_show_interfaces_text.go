@@ -346,9 +346,16 @@ func (s *Server) showIPv6RouterAdvertisement(cfg *config.Config, buf *strings.Bu
 		if len(senders) == 0 {
 			fmt.Fprintln(buf, "Router Advertisements: no active senders")
 		} else {
-			fmt.Fprintf(buf, "Router Advertisement: %d active sender(s)\n\n", len(senders))
+			fmt.Fprintf(buf, "Router Advertisement: %d sender(s)\n\n", len(senders))
 			for _, info := range senders {
 				fmt.Fprintf(buf, "Interface: %s\n", info.Interface)
+				if info.State == "draining" {
+					// A withdrawing router (emitting its lifetime-0 goodbye);
+					// no longer advertising. Report state and move on.
+					fmt.Fprintln(buf, "  State:              draining (withdrawing)")
+					fmt.Fprintln(buf)
+					continue
+				}
 				fmt.Fprintf(buf, "  Source address:     %s\n", info.SrcAddr)
 				fmt.Fprintf(buf, "  Router lifetime:    %ds\n", info.Lifetime)
 				fmt.Fprintf(buf, "  Preference:         %s\n", info.Preference)
