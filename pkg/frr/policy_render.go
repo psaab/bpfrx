@@ -625,15 +625,24 @@ func (m *Manager) generatePolicyOptions(po *config.PolicyOptionsConfig) string {
 						// capped at N.
 						//
 						// FRR requires len < le-value (and len < ge-value); a
-						// le/ge equal to or below the prefix length is REJECTED
-						// by FRR's prefix-list validator
-						// ("make sure: len < ge-value <= le-value") and an
-						// invalid line can fail the whole frr-reload. So:
-						//   - UptoLen == plen -> "" (exact: only the prefix)
-						//   - UptoLen >  plen -> "le N" (the normal case)
-						//   - else (UptoLen < plen, or 0/unset, or > max) ->
-						//     leave the orlonger-equivalent default; degrade-
-						//     safe, never an invalid line. (#2072)
+						// le/ge value <= the prefix length is REJECTED by FRR's
+						// prefix-list validator ("make sure: len < ge-value <=
+						// le-value") and an invalid line can fail the whole
+						// frr-reload. This arm therefore computes matchStr from
+						// scratch and is careful NEVER to keep an invalid value
+						// — including the inherited default le 32/128, which is
+						// itself invalid when plen == maxLen (Codex #2102 MAJOR
+						// #1, the /32 upto /31 case). The rules:
+						//   - plen >= maxLen  -> exact ("" ): a max-length host
+						//     prefix has no more-specifics, so upto anything ==
+						//     just the prefix itself. (Also dodges the invalid
+						//     "le maxLen" default.)
+						//   - UptoLen == plen -> exact ("" ): only the prefix.
+						//   - plen < UptoLen <= maxLen -> "le N" (normal case).
+						//   - else (UptoLen unset/0, < plen, or > maxLen) ->
+						//     degrade to "le maxLen" (valid here because plen <
+						//     maxLen), the orlonger-equivalent superset. Never
+						//     an invalid line. (#2072)
 						parts := strings.SplitN(rf.Prefix, "/", 2)
 						if len(parts) == 2 {
 							if plen, err := strconv.Atoi(parts[1]); err == nil {
@@ -641,23 +650,38 @@ func (m *Manager) generatePolicyOptions(po *config.PolicyOptionsConfig) string {
 								if strings.Contains(rf.Prefix, ":") {
 									maxLen = 128
 								}
-								// UptoLen is the zero-value (0) both when an
-								// "upto" length was never parsed (degrade case)
-								// and when a /0 prefix legitimately has plen 0.
-								// Require UptoLen > 0 before the exact/le
-								// branches so a /0 prefix with an unset length
-								// degrades to the orlonger default rather than
-								// being silently rendered as exact (Codex #2102
-								// MAJOR #2). A "upto /0" is a degenerate config
-								// (== exact on a default route, better written
-								// as exact); degrading it is FRR-valid.
 								switch {
 								case rf.UptoLen <= 0:
-									// keep the orlonger-equivalent default
-								case rf.UptoLen == plen:
+									// Unset / unparseable length (0 means unset:
+									// parseRouteFilterLen rejects "/0"). Degrade
+									// to the orlonger-equivalent superset. This
+									// MUST precede the ==plen and plen>=maxLen
+									// arms so a /0 PREFIX with an unset length is
+									// not mis-rendered as exact via the
+									// 0==plen coincidence (Codex #2102 MAJOR #2).
+									if plen >= maxLen {
+										matchStr = "" // no more-specifics possible
+									} else {
+										matchStr = fmt.Sprintf("le %d", maxLen)
+									}
+								case plen >= maxLen:
+									// Max-length host prefix: no more-specifics
+									// exist, so upto anything == the prefix
+									// itself. Exact also dodges the invalid
+									// "le maxLen" (le == plen) line (Codex #2102
+									// MAJOR #1, the /32 upto /31 case).
 									matchStr = ""
+								case rf.UptoLen == plen:
+									matchStr = "" // only the prefix itself
 								case rf.UptoLen > plen && rf.UptoLen <= maxLen:
 									matchStr = fmt.Sprintf("le %d", rf.UptoLen)
+								default:
+									// UptoLen < plen (nonzero) or > maxLen.
+									// Degrade. plen < maxLen here, so "le
+									// maxLen" is FRR-valid. Set it explicitly
+									// rather than relying on the pre-switch
+									// default.
+									matchStr = fmt.Sprintf("le %d", maxLen)
 								}
 							}
 						}
