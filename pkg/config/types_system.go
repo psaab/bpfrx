@@ -667,6 +667,11 @@ type ForwardingOptionsConfig struct {
 	DHCPRelay       *DHCPRelayConfig
 	FamilyInet6Mode string // "flow-based" or "packet-based" (default "flow-based")
 	PortMirroring   *PortMirroringConfig
+	// AllowDataplaneSleep mirrors `forwarding-options allow-dataplane-sleep`
+	// (#2008 H13 Stage 1). Syntax accepted + typed; the idle-yield runtime
+	// (workers currently busy-poll) is Stage 2 / lab-gated, so this is an
+	// accepted-but-unenforced flag that emits a commit warning.
+	AllowDataplaneSleep bool
 }
 
 // PortMirroringConfig holds port mirroring (SPAN) configuration.

@@ -910,6 +910,11 @@ func compileForwardingOptions(node *Node, fo *ForwardingOptionsConfig) error {
 		}
 	}
 
+	// #2008 H13 Stage 1: presence flag (mirrors security power-mode-disable).
+	if node.FindChild("allow-dataplane-sleep") != nil {
+		fo.AllowDataplaneSleep = true
+	}
+
 	return nil
 }
 

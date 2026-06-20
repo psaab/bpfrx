@@ -22,6 +22,29 @@ temporal `within` windows) and triggers commit-and-apply actions.
 
 `pkg/config`, `pkg/configstore`, `pkg/rpm`.
 
+## attributes-match (regex, #2008 M7)
+
+`attributes-match "<event>.<attribute> matches <pattern>"` filters policy
+triggering on a **regex** match of `<pattern>` against the event attribute,
+matching Junos `matches` semantics. `<pattern>` is an RE2 regular expression.
+
+- Unanchored patterns are substring matches (`Com` matches `Comcast`); anchor
+  with `^...$` for an exact match.
+- Supported attributes today are `test-owner` and `test-name` (the only
+  fields on `rpm.Event`). Other attributes are silently ignored.
+- The pattern is validated at **commit time** (`config.ValidateEventAttributesMatch`
+  via `CompileConfig`): an uncompilable regex is rejected with a precise error
+  rather than being silently dropped at runtime.
+- Compiled regexes are cached at `Apply()` time keyed by pattern string, so the
+  event hot path (`HandleEvent` → `attributesMatch`) never recompiles.
+
+> Behavior note: this was a literal-equality matcher before #2008 M7. The
+> switch to regex is the correct Junos behavior but is **not** behavior-
+> preserving for an existing stored literal containing regex metacharacters
+> (e.g. a literal `.` now matches any character). The parse/validate seam is
+> shared between the compiler and the engine (`config.ParseEventAttributesMatch`)
+> so they cannot drift.
+
 ## Gotchas
 
 - 30 s policy cooldown (`engine.go`). The same policy will not

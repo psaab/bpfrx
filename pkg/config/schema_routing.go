@@ -322,6 +322,12 @@ var schemaProtocols = &schemaNode{desc: "Protocols configuration", children: map
 }}
 
 var schemaForwardingOptions = &schemaNode{desc: "Packet forwarding options", children: map[string]*schemaNode{
+	// #2008 H13 Stage 1: typed presence-flag leaf. Previously this was
+	// accepted only via the no-schema-match fall-through and silently
+	// dropped. Stage 1 gives it a schema (completion + validation) and a
+	// compiler field; the idle-yield dataplane runtime (Stage 2) is
+	// lab-gated and emits an accepted-but-unenforced commit warning.
+	"allow-dataplane-sleep": {desc: "Allow the dataplane to idle (accepted; idle-yield not yet enforced)", children: nil},
 	"family": {desc: "Protocol family forwarding options", compoundKey: true, children: map[string]*schemaNode{
 		"inet6": {desc: "IPv6 forwarding options", children: map[string]*schemaNode{
 			"mode": {desc: "IPv6 forwarding mode (flow-based|packet-based)", args: 1, placeholder: "<mode>", children: nil},

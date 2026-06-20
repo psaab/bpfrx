@@ -1,5 +1,46 @@
 # Action Log
 
+## 2026-06-20 — #2008 Increment-2 (M7 + H13 Stage 1)
+
+- **Timestamp**: 2026-06-20
+- **Action**: M7 — event-options `attributes-match` literal → regex. The
+  matcher (`attributesMatch`) did literal string equality; Junos `matches`
+  is a regex. Switched to RE2 regex (unanchored = substring, like Junos),
+  compiled once at `Apply()` time and cached by pattern string so the event
+  hot path never recompiles. Added commit-time pattern validation
+  (`ValidateEventAttributesMatch` wired into `CompileConfig`) so an
+  uncompilable regex is rejected at commit instead of silently dropped at
+  runtime. Shared the parse seam (`ParseEventAttributesMatch`) between the
+  compiler validator and the engine so they cannot drift. Documented the
+  literal→regex behavior change (correct Junos behavior, not
+  behavior-preserving for stored metacharacter literals). Attribute field
+  set kept at `test-owner`/`test-name` (the only `rpm.Event` fields);
+  field-widening deferred. Tests: config (parse, valid compiles, invalid
+  rejected-at-commit, malformed-not-rejected, direct validator) + eventengine
+  (anchored exact, unanchored substring, metacharacters-as-regex, test-name
+  field, unknown-field-ignored, cached-at-Apply no-recompile, AND semantics).
+- **File(s)**: pkg/eventengine/engine.go, pkg/eventengine/engine_test.go,
+  pkg/eventengine/README.md, pkg/config/event_options_match.go,
+  pkg/config/event_options_match_test.go, pkg/config/compiler.go,
+  docs/feature-gaps.md
+
+- **Timestamp**: 2026-06-20
+- **Action**: H13 Stage 1 — `forwarding-options allow-dataplane-sleep` schema
+  + field + commit warning. The leaf was previously accepted only via the
+  no-schema-match fall-through and silently dropped by
+  `compileForwardingOptions`. Added the typed presence-flag schema leaf
+  (mirroring `power-mode-disable`), the
+  `ForwardingOptionsConfig.AllowDataplaneSleep` field, compiler extraction,
+  and an accepted-but-unenforced commit warning in `ValidateConfig`
+  (mirroring the persist-groups-inheritance / dns-proxy warnings). The
+  idle-yield dataplane runtime (Stage 2) is lab-gated and NOT implemented
+  here. Tests: leaf parses + field set + warning emitted, absent-leaf no
+  warning, schema completion offers the leaf.
+- **File(s)**: pkg/config/schema_routing.go, pkg/config/types_system.go,
+  pkg/config/compiler_services.go, pkg/config/compiler.go,
+  pkg/config/allow_dataplane_sleep_test.go, docs/feature-gaps.md,
+  docs/config-schema.md
+
 ## 2026-06-20 — #2008 Increment-1 quick-wins batch 1
 
 - **Timestamp**: 2026-06-20
