@@ -204,6 +204,45 @@ func TestReconcileV9IPFIXIndependence(t *testing.T) {
 	}
 }
 
+// flowSamplingConfigSrc returns a sampling config that pins a collector
+// source-address. An unassignable source IP makes dialCollectors fail,
+// exercising the NewExporter create-failure path.
+func flowSamplingConfigSrc(collector, source string, rate int) *config.Config {
+	cfg := flowSamplingConfig(collector, rate)
+	cfg.ForwardingOptions.Sampling.Instances["s"].FamilyInet.SourceAddress = source
+	return cfg
+}
+
+// TestReconcileFlowExporterRetriesAfterCreateFailure proves a transient
+// NewExporter failure (here: an unassignable pinned source-address) does
+// NOT hash-gate the exporter into a permanently-dead state — a later
+// commit (even of a working config) retries and starts it.
+func TestReconcileFlowExporterRetriesAfterCreateFailure(t *testing.T) {
+	d := newFlowTestDaemon()
+	t.Cleanup(d.stopFlowExporter)
+
+	// 192.0.2.250 (TEST-NET-1) is not assigned to this host, so binding
+	// it as a UDP source fails with "cannot assign requested address".
+	if !d.reconcileFlowExporters(flowSamplingConfigSrc("127.0.0.1", "192.0.2.250", 100)) {
+		t.Fatal("a create-failing reconcile should still report a change")
+	}
+	if b := d.flowBundle.Load(); b == nil || b.exp != nil {
+		t.Fatal("no exporter should be live after a create failure")
+	}
+	if d.flowHashSet {
+		t.Fatal("the hash must NOT be recorded on a create failure " +
+			"(else an identical retry would be gated into a dead exporter)")
+	}
+
+	// A later commit with a working config must retry and start.
+	if !d.reconcileFlowExporters(flowSamplingConfig("127.0.0.1", 100)) {
+		t.Fatal("a working config after a create failure must start the exporter")
+	}
+	if b := d.flowBundle.Load(); b == nil || b.exp == nil {
+		t.Fatal("exporter must recover on the next working commit")
+	}
+}
+
 // TestApplyConfigLockedReconcilesFlowExporters is the NON-tautological
 // apply-wiring guard: it drives the REAL applyConfigLocked body (not the
 // applyBodyForTest seam) and asserts the flow exporter started. It FAILS

@@ -158,10 +158,15 @@ func (d *Daemon) reconcileV9Exporter(cfg *config.Config) bool {
 	exp, err := flowexport.NewExporter(*ec)
 	if err != nil {
 		slog.Warn("failed to create flow exporter", "err", err)
-		// Leave the (stopped) state published; record the hash so we do
-		// not spin retrying every commit. A config change re-attempts.
+		// Do NOT record the hash on a create failure: NewExporter ->
+		// dialCollectors can fail transiently (a pinned source-address
+		// bind before the source interface is up, transient collector
+		// DNS). Leaving flowHashSet false means the NEXT commit (even an
+		// identical one) retries instead of being hash-gated into a
+		// permanently-dead exporter. NewExporter is cheap, so the retry
+		// is safe; the gate re-arms on the first successful start.
 		d.flowBundle.Store(&exporterBundle{})
-		d.flowHash, d.flowHashSet = h, true
+		d.flowHashSet = false
 		return true
 	}
 
@@ -226,8 +231,11 @@ func (d *Daemon) reconcileIPFIXExporter(cfg *config.Config) bool {
 	exp, err := flowexport.NewIPFIXExporter(*ec)
 	if err != nil {
 		slog.Warn("failed to create IPFIX exporter", "err", err)
+		// Do NOT record the hash on a create failure (see the v9 path):
+		// leaving ipfixHashSet false lets the next commit retry instead
+		// of being gated into a permanently-dead exporter.
 		d.ipfixBundlePtr.Store(&ipfixBundle{})
-		d.ipfixHash, d.ipfixHashSet = h, true
+		d.ipfixHashSet = false
 		return true
 	}
 
