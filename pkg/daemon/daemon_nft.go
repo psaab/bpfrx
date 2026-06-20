@@ -27,7 +27,38 @@ func (d *Daemon) applyLo0Filter(cfg *config.Config) {
 		return
 	}
 
+	nftConf := buildLo0FilterPayload(cfg, filterV4, filterV6)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "nft", "-f", "-")
+	// WaitDelay caps the post-SIGKILL pipe-drain window (#1794).
+	cmd.WaitDelay = 5 * time.Second
+	cmd.Stdin = strings.NewReader(nftConf)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		slog.Warn("failed to apply lo0 filter", "err", err, "output", string(out))
+	} else {
+		slog.Info("lo0 filter applied", "v4", filterV4, "v6", filterV6)
+	}
+}
+
+// buildLo0FilterPayload assembles the exact nft ruleset payload that
+// applyLo0Filter feeds to `nft -f -`. It is split out as a pure function so
+// tests can capture and parse-check the full payload (#2069) without invoking
+// nft or the daemon apply path. Callers pass the already-resolved v4/v6 filter
+// names so the payload reflects exactly what applyLo0Filter would send.
+//
+// The leading three lines are the atomic flush idiom: create the table if it
+// does not yet exist (`table inet xpf_lo0` with no body — idempotent), flush
+// its contents, then redefine it. nft parses an `-f -` payload atomically, so
+// a syntax error on any line rejects the ENTIRE payload. The pre-#2069
+// `flush ruleset inet xpf_lo0` was NOT valid nft — `flush ruleset` takes at
+// most an OPTIONAL family (`flush ruleset [<family>]`), never a table name, so
+// the trailing table token was a parse error that rejected the whole ruleset
+// (incl. the real filter rules) and made the lo0 filter fail OPEN.
+func buildLo0FilterPayload(cfg *config.Config, filterV4, filterV6 string) string {
 	var rules []string
+	rules = append(rules, "table inet xpf_lo0")
+	rules = append(rules, "flush table inet xpf_lo0")
 	rules = append(rules, "table inet xpf_lo0 {")
 	rules = append(rules, "  chain input {")
 	rules = append(rules, "    type filter hook input priority 0; policy accept;")
@@ -56,18 +87,7 @@ func (d *Daemon) applyLo0Filter(cfg *config.Config) {
 	rules = append(rules, "  }")
 	rules = append(rules, "}")
 
-	nftConf := strings.Join(rules, "\n") + "\n"
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "nft", "-f", "-")
-	// WaitDelay caps the post-SIGKILL pipe-drain window (#1794).
-	cmd.WaitDelay = 5 * time.Second
-	cmd.Stdin = strings.NewReader("flush ruleset inet xpf_lo0\n" + nftConf)
-	if out, err := cmd.CombinedOutput(); err != nil {
-		slog.Warn("failed to apply lo0 filter", "err", err, "output", string(out))
-	} else {
-		slog.Info("lo0 filter applied", "v4", filterV4, "v6", filterV6)
-	}
+	return strings.Join(rules, "\n") + "\n"
 }
 
 // nftRuleFromTerm converts a firewall filter term to an nftables rule string.
