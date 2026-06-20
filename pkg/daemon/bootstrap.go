@@ -303,6 +303,56 @@ func (d *Daemon) enterBootstrapMode() {
 		"system is back in bootstrap mode — 'commit confirmed' a corrected config")
 }
 
+// clearFRRForFailClosedBoot is the #1993 cold-boot refinement: on a boot where
+// the previously-committed config no longer COMPILES (the #1960 fail-closed
+// tuple — ActiveConfig()==nil + everCommitted=true → bootClassBootstrap), the
+// last-good `! BEGIN/END BPFRX MANAGED CONFIG` section is STILL on disk in
+// /etc/frr/frr.conf. FRR is an independent systemd service: it starts from that
+// persisted file, forms BGP/OSPF/IS-IS peerings, and re-advertises last-good
+// prefixes for routes this (unarmed, no-dataplane) node cannot forward — a
+// silent transit blackhole. Clearing ONLY the managed section drops those
+// peerings so upstream/peers fail over to the HA partner instead of routing
+// transit into a blackhole.
+//
+// This deliberately runs JUST the FRR-clear step of enterBootstrapMode()'s
+// teardown — NOT the .network/.link removal or the link-cycle. The cold-boot
+// fail-closed path is intentionally freeze-in-last-known-good for MANAGEMENT
+// reachability (#1960): the operator stays connected on the existing mgmt IP.
+// Removing networkd files / link-cycling toward bootstrap fxp0-DHCP here could
+// change the mgmt IP out from under a connected operator, so it is excluded.
+//
+// Reversibility: the first compilable `commit confirmed` (or a cluster
+// SyncApply) re-renders FRR through applyConfigLocked → applyFRRConfig, which
+// re-installs the managed section. So this clear is fully reversible.
+//
+// Scope: gated strictly on compileFailed so a fresh/no-config bootstrap (which
+// has no last-good managed section) and every NORMAL boot are byte-identical to
+// before — a NORMAL boot must NEVER wipe a healthy node's FRR config. The
+// d.frr != nil guard tolerates NoDataplane daemons (FRR is constructed only
+// inside the !NoDataplane manager-init block).
+//
+// A degraded reload (ErrFRRReloadDegraded, e.g. frr-reload.py unavailable) is
+// LOGGED, not fatal: Clear() has already written the empty managed section to
+// disk (so a later FRR restart converges) and the degraded-retry loop
+// re-attempts. Management reachability beats a perfectly-clean FRR reload, so
+// boot must proceed regardless.
+func (d *Daemon) clearFRRForFailClosedBoot(compileFailed bool) {
+	if !compileFailed || d.frr == nil {
+		return
+	}
+	if err := d.frr.Clear(); err != nil {
+		// Includes ErrFRRReloadDegraded — log, do not abort boot.
+		slog.Warn("fail-closed boot: failed to clear FRR managed section; node may still "+
+			"advertise last-good routes to peers until the operator fixes the config and "+
+			"'commit confirmed' (or FRR restarts and re-reads the now-empty managed section)",
+			"err", err)
+		return
+	}
+	slog.Warn("fail-closed boot: cleared FRR managed section so peers fail over to the HA " +
+		"partner instead of blackholing transit to this unarmed node. The first compilable " +
+		"'commit confirmed' re-installs the managed section.")
+}
+
 // lifelineRecord is the persisted management-NIC identity.
 type lifelineRecord struct {
 	PCIAddr string // PCI bus address (e.g. "0000:05:00.0"); primary key

@@ -70,6 +70,26 @@
   test/incus/test_mouse_latency_shell_test.py,
   test/incus/test-mouse-latency.sh, docs/fairness-regimes.md, _Log.md
 
+## 2026-06-19 — #1993 clear FRR managed section on compile-failed cold boot
+
+- **Timestamp**: 2026-06-19
+- **Action**: On a compile-failure cold-boot bootstrap (the #1960
+  fail-closed tuple), the last-good `frr.conf` managed section is still on
+  disk and FRR (an independent service) re-advertises last-good prefixes
+  for routes this unarmed node cannot forward — a transit blackhole.
+  Added `clearFRRForFailClosedBoot(compileFailed)` (reuses the
+  `enterBootstrapMode()` `d.frr.Clear()` primitive, managed-section only)
+  and wired it into the boot path right after `d.frr = frr.New()`, gated
+  on `configCompileFailed`. Preserves freeze-in-last-known-good mgmt (no
+  networkd/.link removal, no link-cycle); does NOT change the
+  daemon-restart freeze. Added a cross-package `pkg/frr` test seam
+  (`NewForTest`, `RecordingExecutor`, `ManagedSectionMarkersForTest`) so
+  the daemon unit tests drive the real Clear() wiring against a temp
+  frr.conf without shelling out. Updated `pkg/daemon/README.md`.
+- **File(s)**: pkg/daemon/bootstrap.go, pkg/daemon/daemon_run.go,
+  pkg/daemon/frr_failclosed_boot_test.go, pkg/frr/testseam.go,
+  pkg/daemon/README.md, _Log.md
+
 ## 2026-06-19 — #2000 review follow-up on postinst test harness
 
 - **Timestamp**: 2026-06-19
