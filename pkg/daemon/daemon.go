@@ -141,6 +141,10 @@ type Daemon struct {
 	// through maybeStartNATPoolAlarm / stopAndDiscardNATPoolAlarm /
 	// natPoolAlarms so the pointer is never read or written unsynchronized.
 	natPoolAlarm atomic.Pointer[natpoolalarm.Monitor]
+	// natPoolAlarmTestTick overrides the monitor's sampler cadence at
+	// construction time (#2114 race tests only). Zero in production (default
+	// 10s). Read once in maybeStartNATPoolAlarm before Start.
+	natPoolAlarmTestTick time.Duration
 	// pendingFIBBump records an UNCONFIRMED FIB-generation bump after a
 	// successful route-overlay publish (#1844, Codex plan r2-1): the
 	// bump_fib_generation control message failed, so the next actuation

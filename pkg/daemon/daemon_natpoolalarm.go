@@ -105,6 +105,12 @@ func (d *Daemon) maybeStartNATPoolAlarm() {
 		return // already started
 	}
 	m := natpoolalarm.New(d.natPoolAlarmSampler(), d.natPoolAlarmEmitter())
+	// Test seam: drive the sampler at a fast tick so the #2114 race tests can
+	// exercise the sampler-vs-d.dp overlap deterministically. Zero in
+	// production (default 10s cadence). Must be applied before Start().
+	if d.natPoolAlarmTestTick > 0 {
+		m.SetTickForTest(d.natPoolAlarmTestTick)
+	}
 	d.natPoolAlarm.Store(m)
 	m.Start()
 }
