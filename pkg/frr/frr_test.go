@@ -2555,6 +2555,39 @@ func TestRouteFilterUptoFRR(t *testing.T) {
 			t.Errorf("/0 upto /24 must render 'le 24', got:\n%s", got)
 		}
 	})
+
+	// Max-length host prefix: a /32 has no more-specifics, so "upto /N"
+	// (any N) is just the prefix itself. The default "le 32" the switch
+	// inherits would be FRR-INVALID (le == prefix-len) — this is the
+	// Codex #2102 MAJOR #1 case. Must render bare exact, never "le 32".
+	t.Run("v4_max_length_upto_below_plen_is_exact", func(t *testing.T) {
+		got := New().generatePolicyOptions(uptoPolicyOptions("192.0.2.1/32", 31))
+		if !strings.Contains(got, "ip prefix-list p-t1 seq 5 permit 192.0.2.1/32\n") {
+			t.Errorf("/32 upto /31 must render bare exact, got:\n%s", got)
+		}
+		if strings.Contains(got, "le 32") {
+			t.Errorf("/32 must NOT emit FRR-invalid 'le 32' (le == prefix-len), got:\n%s", got)
+		}
+	})
+
+	t.Run("v6_max_length_upto_below_plen_is_exact", func(t *testing.T) {
+		got := New().generatePolicyOptions(uptoPolicyOptions("2001:db8::1/128", 127))
+		if !strings.Contains(got, "ipv6 prefix-list p-t1 seq 5 permit 2001:db8::1/128\n") {
+			t.Errorf("/128 upto /127 must render bare exact, got:\n%s", got)
+		}
+		if strings.Contains(got, "le 128") {
+			t.Errorf("/128 must NOT emit FRR-invalid 'le 128', got:\n%s", got)
+		}
+	})
+
+	// upto /N just below the family max on a non-max prefix is still a
+	// valid "le N" (plen < N < maxLen).
+	t.Run("v4_upto_near_max", func(t *testing.T) {
+		got := New().generatePolicyOptions(uptoPolicyOptions("10.0.0.0/8", 31))
+		if !strings.Contains(got, "ip prefix-list p-t1 seq 5 permit 10.0.0.0/8 le 31\n") {
+			t.Errorf("/8 upto /31 must render 'le 31', got:\n%s", got)
+		}
+	})
 }
 
 // TestRouteFilterUpto_MixedFamilyTerm renders a term that mixes a v4

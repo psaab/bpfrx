@@ -2319,8 +2319,11 @@ func TestParseRouteFilterLen(t *testing.T) {
 	}{
 		{"/24", 24, true},
 		{"24", 24, true},
-		{"/0", 0, true},
+		{"/1", 1, true},
 		{"/128", 128, true},
+		// zero rejected: "upto /0" is not a meaningful length and must stay
+		// distinguishable from an unset UptoLen (Codex #2102 MAJOR).
+		{"/0", 0, false},
 		{"/129", 0, false}, // > 128
 		{"/-1", 0, false},  // negative
 		{"/+24", 0, false}, // signed-plus must be rejected (Atoi would accept it)
