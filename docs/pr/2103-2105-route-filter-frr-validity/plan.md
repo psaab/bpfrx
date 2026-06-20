@@ -162,29 +162,40 @@ on FRR semantics. Verified against FRR `lib/plist.c prefix_list_apply_ext`:
 
 The skip mechanism emits ZERO `ip prefix-list <plName>` lines for a
 skipped entry, so a fully-skipped term references a name that is never
-materialized → NULL → DENY → correct match-nothing. But relying on
-NULL-vs-empty is fragile: any future change that materializes a
-zero-entry list flips the term to PERMIT-ALL. v2 therefore takes the
-robust path the v1 Q1 itself offered:
+materialized → NULL → DENY → correct match-nothing.
 
-**Mechanism (v2):**
+> **SHIPPED BEHAVIOR (see "Code-review resolution" below) supersedes the
+> v2 design sketch in this paragraph and the next.** The v2 plan
+> proposed *suppressing* the `match` line when `emitted == 0`. The
+> code review (Copilot #2110) showed that is WRONG: the
+> `route-map <name> permit <seq>` header is emitted unconditionally, so
+> dropping the only `match` clause leaves a bare `permit` with NO match
+> conditions — which FRR treats as match-ALL (permit-everything). The
+> SHIPPED code therefore ALWAYS emits the `match … prefix-list <name>`
+> line for any term that declares a route-filter, while never
+> materializing a count==0 list: an all-skipped term references the
+> UNDEFINED list → NULL → RMAP_NOMATCH (DENY) → fail-closed. This is the
+> same fail-closed-via-undefined-list contract the existing
+> `term.PrefixList` branch already relies on.
+
+**Mechanism (as shipped):**
 1. Per-`rf` loop: a `skipEntry bool` flag, reset each iteration. Set true
    on the #2103 max-length `longer` case AND on the #2105 malformed
-   prefix. `continue` past the prefix-list emit block when set.
+   prefix (the latter via `net.ParseCIDR`). `continue` past the
+   prefix-list emit block when set.
 2. Count entries actually emitted: `emitted++` only when a `permit` line
-   is written. Track the family of the FIRST emitted entry
-   (`firstEmittedV6 bool`) for the `match` line.
-3. After the loop, emit the `match ip/ipv6 address prefix-list <plName>`
-   line **only if `emitted > 0`** — using `firstEmittedV6` (a
-   parseable, non-skipped entry's family), NOT `term.RouteFilters[0]`.
-   When `emitted == 0` the whole term has no usable route-filter, so
-   suppress BOTH the prefix-list entries (already skipped) AND the
-   `match` line. The term then has no route-filter match condition
-   (other `from`/`then` clauses still render); this is deterministic and
-   does not depend on FRR's NULL-vs-empty behavior.
+   is written. Track the family (`matchV6`): the first EMITTED entry is
+   authoritative; if none is emitted, the first PARSEABLE route-filter (a
+   skipped `/32 longer` still names a real family); else IPv4 (the
+   `term.PrefixList` "unknown/empty defaults to IPv4" default).
+3. After the loop, ALWAYS emit the `match ip/ipv6 address prefix-list
+   <plName>` line (the term declares a route-filter). When entries were
+   emitted it references the populated list; when ALL were skipped it
+   references the never-created (undefined) list → NULL → DENY. The
+   `match` line is NEVER suppressed, and a count==0 list is NEVER
+   materialized.
 
-This closes round-1 F1 (no count==0 list ever materialized; no
-`match` line ever references a non-existent list) and F6 (family of the
+This closes round-1 F1 (no count==0 list ever materialized) and F6 (family of the
 `match` line is derived from a parseable emitted entry, fixing the
 mixed-term malformed-v4-index-0 + valid-v6-index-1 case that v1 would
 have mis-rendered as `match ip` for a v6-only list → wrong-namespace
@@ -321,16 +332,17 @@ unexported var.
   `seq 10` stable. (Decision: keep `i`-based seq, do NOT renumber from
   the emitted count — renumbering would change seq of EXISTING entries
   across a config edit, a gratuitous diff; gaps are harmless.)
-- **The `match ip/ipv6 address prefix-list <plName>` line** (v2,
-  CORRECTED — see "Skip mechanism" above): emitted only when
-  `emitted > 0`, with family from the FIRST emitted (parseable,
-  non-skipped) entry's prefix, NOT `term.RouteFilters[0].Prefix`. This
-  fixes the round-1 F6 mixed-term case (malformed v4 at index 0 + valid
-  v6 at index 1 would have emitted `match ip` for a v6-only list). When
-  every entry is skipped the `match` line is suppressed entirely — no
-  reference to a non-existent prefix-list, deterministic match-nothing
-  via "term has no route-filter condition" (the term still renders its
-  other `from`/`then` clauses).
+- **The `match ip/ipv6 address prefix-list <plName>` line** (as shipped —
+  see "Code-review resolution" below): ALWAYS emitted for a term that
+  declares a route-filter, with family from the FIRST emitted entry's
+  prefix, else the first PARSEABLE route-filter, else IPv4 — NOT
+  `term.RouteFilters[0].Prefix`. This fixes the round-1 F6 mixed-term
+  case (malformed v4 at index 0 + valid v6 at index 1 would have emitted
+  `match ip` for a v6-only list). When every entry is skipped the `match`
+  line references the UNDEFINED (never-created) list → FRR NULL →
+  RMAP_NOMATCH (DENY) → fail-closed match-nothing. The `match` line is
+  NOT suppressed: a bare `permit` term with no match clauses is FRR
+  match-ALL (Copilot #2110). A count==0 list is never materialized.
 - **Commit-strict / load-lenient gate:** inherited automatically via
   keyValidator — no new wiring. Must add a `configstore` lenient test
   proving a stored garbage route-filter prefix does NOT fail
@@ -537,10 +549,44 @@ MERGE-NEEDS-MINOR and converged on a single real finding:
 
 Both reviewers independently verified the core logic by execution:
 non-tautological render + reject tests (fail against pre-fix code / with
-the keyValidator unwired), the all-skipped-term invariant (no
-prefix-list lines, no dangling match line, no count==0 list), the #2103
-boundary (/31 → ge 32 le 32; /32 → skip), the unchanged orlonger/exact/
-upto arms, and the full pkg/frr + pkg/config + pkg/configstore suites +
-go vet green.
+the keyValidator unwired), the all-skipped-term invariant (no count==0
+list materialized), the #2103 boundary (/31 → ge 32 le 32; /32 → skip),
+the unchanged orlonger/exact/upto arms, and the full pkg/frr + pkg/config
++ pkg/configstore suites + go vet green. (NOTE: round 1 accepted the
+"suppress the match line for an all-skipped term" design — round 2 below
+corrected that to ALWAYS emit the match line; see the SHIPPED-BEHAVIOR
+callout in the design section.)
 
 Round-1 code-review agentIds: A `af58ce5faa224036e`, B `aa945bdb58265f8ba`.
+
+## Code-review resolution (round 2 — Copilot, on PR #2110)
+
+Copilot's review of the opened PR caught a real semantic regression that
+both round-1 code reviewers and both plan reviewers missed, plus three
+consistency/nit follow-ups:
+
+- **Fail-closed match line (the substantive find).** Suppressing the
+  `match … prefix-list` line for an all-skipped term left a bare
+  `route-map <name> permit <seq>` with NO match clauses — which FRR
+  treats as match-ALL, flipping a `/32 longer` empty-set term to
+  permit-everything. **Fixed:** ALWAYS emit the `match … prefix-list
+  <name>` line for any term that declares a route-filter, while never
+  materializing a count==0 list; an all-skipped term references the
+  undefined list → NULL → RMAP_NOMATCH (DENY) → fail-closed. This
+  mirrors the existing `term.PrefixList` branch (emits a match line for
+  an unknown/empty list). Tests flipped to assert the fail-closed
+  contract (all-skipped / lone-malformed terms emit the match line but NO
+  `ip/ipv6 prefix-list … seq … permit` entry; verified non-tautological
+  against the prior suppress behavior).
+- **Validator error message.** `ValidateRouteFilterArg` discarded
+  `parseCIDRStrict`'s targeted error (e.g. "missing /prefix-length") and
+  returned a generic message; now wraps the underlying error so
+  commit-check failures are actionable, matching the function comment.
+- **Plan + PR-description drift.** Both the plan doc and the PR
+  description still described the suppress-the-match-line behavior;
+  reconciled to document the shipped always-emit-fail-closed behavior
+  (this section + the SHIPPED-BEHAVIOR callout above + the PR body).
+- **Test comment typo.** "valid v4 /64" → "valid v6 /64".
+
+All fixed; pkg/frr + pkg/config + pkg/configstore + full `go test ./...`,
+`go vet`, `gofmt` green.

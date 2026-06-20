@@ -2884,7 +2884,7 @@ func TestRouteFilterMalformedPrefixBelt(t *testing.T) {
 		}
 	})
 
-	// A valid v4 /64 (orlonger) must NOT be belt-skipped — proves the
+	// A valid v6 /64 (orlonger) must NOT be belt-skipped — proves the
 	// belt does not false-skip well-formed prefixes.
 	t.Run("valid_prefix_not_false_skipped", func(t *testing.T) {
 		got := New().generatePolicyOptions(rfPolicyOptions(

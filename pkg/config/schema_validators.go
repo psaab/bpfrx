@@ -368,11 +368,12 @@ func ValidateRouteFilterArg(raw string, _ *Config) error {
 	// and upgrades the common operator mistakes (bare IP, garbage) to
 	// targeted messages, matching the ValidateIPv4CIDR/ValidateIPv6CIDR
 	// convention; the returned IP is discarded because both families are
-	// valid here.
-	if _, err := parseCIDRStrict(tok, "10.0.0.0/24"); err == nil {
-		return nil
+	// valid here. Surface parseCIDRStrict's targeted message (e.g.
+	// "missing /prefix-length") so the commit-check failure is actionable.
+	if _, err := parseCIDRStrict(tok, "10.0.0.0/24"); err != nil {
+		return fmt.Errorf("not a valid route-filter prefix (expected a CIDR, e.g. 10.0.0.0/24 or 2001:db8::/32, or a match-type keyword): %v", err)
 	}
-	return fmt.Errorf("not a valid route-filter prefix (expected a CIDR, e.g. 10.0.0.0/24 or 2001:db8::/32, or a match-type keyword): got %q", raw)
+	return nil
 }
 
 // validateForwardingClassRef is the #1319 PR 3 tree-based
