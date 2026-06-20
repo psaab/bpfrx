@@ -502,6 +502,18 @@ func collectProtocolList(protoNode *Node) []string {
 // per-family max and the prefix length.
 func parseRouteFilterLen(tok string) (int, bool) {
 	tok = strings.TrimPrefix(tok, "/")
+	// Require digits only — strconv.Atoi would also accept signed forms
+	// like "+24" or "-0", which are not valid Junos length tokens (Codex
+	// #2102 MINOR). An empty token (e.g. a bare "/") has no digits and is
+	// rejected here.
+	if tok == "" {
+		return 0, false
+	}
+	for _, c := range tok {
+		if c < '0' || c > '9' {
+			return 0, false
+		}
+	}
 	n, err := strconv.Atoi(tok)
 	if err != nil || n < 0 || n > 128 {
 		return 0, false
