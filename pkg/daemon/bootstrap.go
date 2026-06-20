@@ -313,6 +313,18 @@ func (d *Daemon) exitBootstrapMode(reason string) {
 func (d *Daemon) enterBootstrapMode() {
 	d.bootstrapMode.Store(true)
 
+	// #2114: stop and DISCARD the NAT pool-alarm monitor. It may have been
+	// started on a prior successful bootstrap-exit arm; rolling back to
+	// bootstrap means a later corrected commit can re-enter
+	// runBootstrapExitStartup and, on an arm failure, write d.dp = nil —
+	// which would race the still-running monitor's sampler. Discard (not
+	// just Stop) because natpoolalarm.Monitor is not restartable after
+	// Stop(); the next successful re-arm builds a fresh one via
+	// maybeStartNATPoolAlarm. Placed BEFORE the applyBodyForTest seam return
+	// so the lifecycle is exercised by the rollback unit tests too (it is a
+	// no-op when no monitor is running). Runs under the caller's d.applySem.
+	d.stopAndDiscardNATPoolAlarm()
+
 	// Test seam: when the apply body is stubbed (unit tests), skip the
 	// real filesystem / networkctl / FRR / dataplane teardown — those touch
 	// /etc/systemd/network and run external commands. The flag flip above is

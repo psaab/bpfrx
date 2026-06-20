@@ -67,10 +67,63 @@ func (d *Daemon) natPoolAlarmEmitter() natpoolalarm.Emitter {
 
 // natPoolAlarms returns the active NAT pool-utilization alarms for the
 // `show security alarms` render sites (#2079). Returns nil when the monitor
-// is not running (NoDataplane).
+// is not running (NoDataplane, bootstrap mode, or a torn-down dataplane).
+//
+// #2114: reads the monitor pointer atomically. This runs on gRPC/CLI
+// request goroutines concurrently with the runtime start (bootstrap exit)
+// and stop+discard (bootstrap rollback / shutdown) of the monitor. The
+// atomic Load yields either a valid *Monitor (ActiveAlarms() is itself
+// mutex-guarded inside the monitor) or nil — never a torn pointer.
 func (d *Daemon) natPoolAlarms() []natpoolalarm.ActiveAlarm {
-	if d == nil || d.natPoolAlarm == nil {
+	if d == nil {
 		return nil
 	}
-	return d.natPoolAlarm.ActiveAlarms()
+	m := d.natPoolAlarm.Load()
+	if m == nil {
+		return nil
+	}
+	return m.ActiveAlarms()
+}
+
+// maybeStartNATPoolAlarm constructs and starts the NAT pool-alarm monitor
+// exactly once, gated on a non-NoDataplane, non-bootstrap, dataplane-armed
+// daemon (#2114). It is idempotent: a non-nil stored monitor short-circuits.
+//
+// Called from the normal-boot background-services block (daemon_run.go) and
+// from runBootstrapExitStartup's successful-arm branch. Both call sites run
+// before the control plane serves requests (boot) or under d.applySem
+// (bootstrap exit), so two concurrent constructions cannot interleave; the
+// Load()!=nil short-circuit plus the atomic Store are belt-and-suspenders.
+//
+// The d.dp==nil guard keeps the helper self-contained: bootstrap suppresses
+// the start, and a torn-down/never-armed dataplane has nothing to sample.
+func (d *Daemon) maybeStartNATPoolAlarm() {
+	if d.opts.NoDataplane || d.inBootstrap() || d.dp == nil {
+		return
+	}
+	if d.natPoolAlarm.Load() != nil {
+		return // already started
+	}
+	m := natpoolalarm.New(d.natPoolAlarmSampler(), d.natPoolAlarmEmitter())
+	// Test seam: drive the sampler at a fast tick so the #2114 race tests can
+	// exercise the sampler-vs-d.dp overlap deterministically. Zero in
+	// production (default 10s cadence). Must be applied before Start().
+	if d.natPoolAlarmTestTick > 0 {
+		m.SetTickForTest(d.natPoolAlarmTestTick)
+	}
+	d.natPoolAlarm.Store(m)
+	m.Start()
+}
+
+// stopAndDiscardNATPoolAlarm stops the monitor (Stop joins its goroutine)
+// and CLEARS the pointer so a later re-arm builds a fresh monitor — the
+// natpoolalarm.Monitor is not restartable after Stop() (#2114). Safe when no
+// monitor is running (Swap returns nil). Called from bootstrap rollback
+// (enterBootstrapMode) and shutdown. The atomic Swap(nil) is the single
+// read-and-clear point, so a concurrent natPoolAlarms() reader sees either
+// the old monitor or nil, never a torn pointer.
+func (d *Daemon) stopAndDiscardNATPoolAlarm() {
+	if m := d.natPoolAlarm.Swap(nil); m != nil {
+		m.Stop()
+	}
 }

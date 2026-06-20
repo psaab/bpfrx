@@ -133,20 +133,31 @@ type Daemon struct {
 	// that raises/clears `show security alarms` entries with hysteresis and
 	// emits one structured RT_NAT syslog line per transition. Nil in
 	// NoDataplane mode (no helper to sample).
-	natPoolAlarm *natpoolalarm.Monitor
+	//
+	// #2114: atomic.Pointer because the monitor is now started/stopped at
+	// RUNTIME (bootstrap exit arms it; bootstrap rollback stops+discards
+	// it) concurrently with the `show security alarms` render reader
+	// (natPoolAlarms, wired into the gRPC/CLI callbacks). All access goes
+	// through maybeStartNATPoolAlarm / stopAndDiscardNATPoolAlarm /
+	// natPoolAlarms so the pointer is never read or written unsynchronized.
+	natPoolAlarm atomic.Pointer[natpoolalarm.Monitor]
+	// natPoolAlarmTestTick overrides the monitor's sampler cadence at
+	// construction time (#2114 race tests only). Zero in production (default
+	// 10s). Read once in maybeStartNATPoolAlarm before Start.
+	natPoolAlarmTestTick time.Duration
 	// pendingFIBBump records an UNCONFIRMED FIB-generation bump after a
 	// successful route-overlay publish (#1844, Codex plan r2-1): the
 	// bump_fib_generation control message failed, so the next actuation
 	// must retry the bump even when its publish is a duplicate-skip —
 	// otherwise cached flow routes stay pinned to pre-failover paths.
 	// Mutated only in actuateRouteOverlayLocked under applySem.
-	pendingFIBBump             bool
-	flowExporter               *flowexport.Exporter
-	flowCancel                 context.CancelFunc
-	flowWg                     sync.WaitGroup
-	ipfixExporter              *flowexport.IPFIXExporter
-	ipfixCancel                context.CancelFunc
-	ipfixWg                    sync.WaitGroup
+	pendingFIBBump bool
+	flowExporter   *flowexport.Exporter
+	flowCancel     context.CancelFunc
+	flowWg         sync.WaitGroup
+	ipfixExporter  *flowexport.IPFIXExporter
+	ipfixCancel    context.CancelFunc
+	ipfixWg        sync.WaitGroup
 	// #2075 flowexport reconcile state. The bundle pointers carry the
 	// live (exporter, resolved-config) pair read lock-free by the
 	// once-registered session-close callbacks; reconcile swaps them
@@ -155,16 +166,16 @@ type Daemon struct {
 	// bools distinguish "never reconciled" from "reconciled to the
 	// nil sentinel". The *ReconMu serialize the reconcile swap against
 	// shutdown's stopFlow/IPFIXExporter (both touch the cancel/wg).
-	flowBundle     atomic.Pointer[exporterBundle]
-	flowHash       [32]byte
-	flowHashSet    bool
-	flowCBOnce     sync.Once
-	flowReconMu    sync.Mutex
-	ipfixBundlePtr atomic.Pointer[ipfixBundle]
-	ipfixHash      [32]byte
-	ipfixHashSet   bool
-	ipfixCBOnce    sync.Once
-	ipfixReconMu   sync.Mutex
+	flowBundle                 atomic.Pointer[exporterBundle]
+	flowHash                   [32]byte
+	flowHashSet                bool
+	flowCBOnce                 sync.Once
+	flowReconMu                sync.Mutex
+	ipfixBundlePtr             atomic.Pointer[ipfixBundle]
+	ipfixHash                  [32]byte
+	ipfixHashSet               bool
+	ipfixCBOnce                sync.Once
+	ipfixReconMu               sync.Mutex
 	dhcpRelay                  *dhcprelay.Manager
 	snmpAgent                  *snmp.Agent
 	lldpMgr                    *lldp.Manager

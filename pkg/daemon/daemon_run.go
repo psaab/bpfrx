@@ -37,7 +37,6 @@ import (
 	"github.com/psaab/xpf/pkg/ipsec"
 	"github.com/psaab/xpf/pkg/lldp"
 	"github.com/psaab/xpf/pkg/logging"
-	"github.com/psaab/xpf/pkg/natpoolalarm"
 	"github.com/psaab/xpf/pkg/networkd"
 	"github.com/psaab/xpf/pkg/ra"
 	"github.com/psaab/xpf/pkg/routing"
@@ -877,8 +876,16 @@ func (d *Daemon) Run(ctx context.Context) error {
 		// `show security alarms` entries with hysteresis and emits one
 		// structured RT_NAT syslog line per transition. (The whole block is
 		// gated on a non-NoDataplane dataplane being present.)
-		d.natPoolAlarm = natpoolalarm.New(d.natPoolAlarmSampler(), d.natPoolAlarmEmitter())
-		d.natPoolAlarm.Start()
+		//
+		// #2114: route through maybeStartNATPoolAlarm, which gates on
+		// !inBootstrap() in addition to a constructed dataplane. In bootstrap
+		// mode the dataplane object exists (d.dp != nil) but is not armed, and
+		// the bootstrap-exit path may write d.dp = nil on an arm failure;
+		// launching the sampler here would race that write. The monitor is
+		// instead started in runBootstrapExitStartup once the dataplane is
+		// armed. On a normal (non-bootstrap) boot the gate passes and the
+		// monitor starts here exactly as before.
+		d.maybeStartNATPoolAlarm()
 	}
 
 	// Start cluster heartbeat + sync after event fanout is initialized.
@@ -1507,10 +1514,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 		d.ipmon.Stop()
 	}
 
-	// #2079: stop the NAT pool-utilization-alarm monitor.
-	if d.natPoolAlarm != nil {
-		d.natPoolAlarm.Stop()
-	}
+	// #2079/#2114: stop the NAT pool-utilization-alarm monitor. Routed
+	// through the helper so the atomic pointer is read/cleared the same way
+	// as the runtime start/discard paths.
+	d.stopAndDiscardNATPoolAlarm()
 
 	// Stop the FRR manager (after ipmon, whose actuator is an FRR
 	// writer): cancels the degraded-retry goroutine and kills any
@@ -1699,9 +1706,19 @@ func (d *Daemon) runBootstrapExitStartup(cfg *config.Config) {
 			slog.Warn("bootstrap exit: failed to start dataplane, running in config-only mode",
 				"err", err)
 			d.dp = nil
-		} else if seeder, ok := d.dp.(natSeeder); ok {
-			seeder.SeedNATPortCounters()
-			seeder.SeedSessionIDCounter(nodeID)
+		} else {
+			if seeder, ok := d.dp.(natSeeder); ok {
+				seeder.SeedNATPortCounters()
+				seeder.SeedSessionIDCounter(nodeID)
+			}
+			// #2114: start the NAT pool-alarm monitor now that the dataplane
+			// is armed and d.dp is stable. It was suppressed at boot in
+			// bootstrap mode; exitBootstrapMode already flipped
+			// bootstrapMode=false in applyConfigLocked before calling this,
+			// so maybeStartNATPoolAlarm's !inBootstrap() gate passes. Runs
+			// under the apply caller's d.applySem, so the monitor's first
+			// sampler read cannot overlap a concurrent d.dp write. Idempotent.
+			d.maybeStartNATPoolAlarm()
 		}
 	}
 	slog.Info("bootstrap exit: startup takeover complete; applying first config")

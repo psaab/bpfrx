@@ -177,12 +177,16 @@ never lock an operator out of a remote box it manages.
       window further but is a separable follow-up, not required for the Go fix.
 - **Bootstrap mode** (`d.bootstrapMode` atomic): runs gRPC/REST/CLI normally
   but SUPPRESSES interface takeover ACTIONS — the full rename loop, host
-  tunables, `enableForwarding`, dataplane arm (`dp.Start`), and boot-time
-  `applyConfig`. Managers are still constructed (so the exit reconcile wires
-  every subsystem). A plain first `commit` is REFUSED — the operator must
-  `commit confirmed`. Exit is one-way, on the first non-empty config apply
-  (confirmed commit OR cluster `SyncApply`); `runBootstrapExitStartup` then
-  runs the deferred startup takeover before the reconcile.
+  tunables, `enableForwarding`, dataplane arm (`dp.Start`), the boot-time
+  `applyConfig`, and the #2079 NAT pool-alarm monitor start (#2114: the
+  monitor samples `d.dp`, which is still nil-able on a bootstrap-exit arm
+  failure, so it must not run during the bootstrap window). Managers are
+  still constructed (so the exit reconcile wires every subsystem). A plain
+  first `commit` is REFUSED — the operator must `commit confirmed`. Exit is
+  one-way, on the first non-empty config apply (confirmed commit OR cluster
+  `SyncApply`); `runBootstrapExitStartup` then runs the deferred startup
+  takeover (including starting the NAT pool-alarm monitor on a successful
+  arm) before the reconcile.
 - **PCI-keyed lifeline** (`setupBootstrapLifeline`): in bootstrap mode the
   daemon detects the default-route mgmt NIC (v4 then v6, else refuse +
   console), records its PCI+MAC to `/etc/xpf/lifeline-interface` (keyed by
@@ -195,10 +199,14 @@ never lock an operator out of a remote box it manages.
   always-down / address-stripped, even on an empty/absent/rolled-back config.
   An explicit non-fxp0 leaf narrows fxp0 off the auto-protection.
 - **First-commit rollback** (`enterBootstrapMode`): a timed-out first
-  `commit confirmed` removes the takeover `.network` files (keeping the
-  lifeline + `.link` files), clears the FRR managed section, and detaches the
-  dataplane — instead of applying an empty config — and the store persists
-  the never-committed marker so a restart re-enters bootstrap.
+  `commit confirmed` stops+discards the NAT pool-alarm monitor (#2114 — so
+  no sampler survives to race a later re-arm's `d.dp = nil` write; the
+  monitor is rebuilt fresh on a corrected re-arm because it is not
+  restartable after `Stop`), removes the takeover `.network` files (keeping
+  the lifeline + `.link` files), clears the FRR managed section, and
+  detaches the dataplane — instead of applying an empty config — and the
+  store persists the never-committed marker so a restart re-enters
+  bootstrap.
 
 ## Notable gotchas
 

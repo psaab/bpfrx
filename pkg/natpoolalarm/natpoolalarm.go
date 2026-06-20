@@ -133,6 +133,22 @@ func New(sample Sampler, emit Emitter) *Monitor {
 	}
 }
 
+// SetTickForTest overrides the evaluation cadence. It MUST be called before
+// Start (the running loop captures m.tick once). Intended only for tests that
+// need the sampler to fire rapidly — e.g. the #2114 daemon race regression
+// test, which drives the monitor's d.dp sampler against a concurrent
+// bootstrap-exit d.dp transition under the race detector.
+func (m *Monitor) SetTickForTest(d time.Duration) {
+	if m == nil || d <= 0 {
+		return
+	}
+	m.mu.Lock()
+	if !m.started {
+		m.tick = d
+	}
+	m.mu.Unlock()
+}
+
 // Start launches the evaluation loop. It is a no-op if the monitor is nil or
 // the sampler is nil, and is safe to call at most once.
 func (m *Monitor) Start() {
