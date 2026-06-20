@@ -50,6 +50,11 @@ type Config struct {
 	IPMonStatusFn   func() []ipmon.PolicyStatus      // returns live ip-monitoring policy status (#1827)
 	FeedsFn         func() map[string]feeds.FeedInfo // returns live feed status
 	LLDPNeighborsFn func() []*lldp.Neighbor          // returns live LLDP neighbors
+	// #1387 inc-2: DHCP dynamic-DNS status sources for
+	// `show system services dhcp-server dynamic-dns [detail]`. nil when the
+	// manager is absent (NoDataplane) — the show renders "not running".
+	DDNSStatsFn        func() *dhcpserver.DDNSStats
+	DDNSOwnedRecordsFn func() []dhcpserver.DDNSOwnedRecordView
 	// #846: atomic commit+apply callbacks. The daemon holds its
 	// apply semaphore across configstore.Commit, applyConfig, and
 	// (for gRPC) syncConfigToPeer, so two concurrent committers
@@ -83,6 +88,8 @@ type Server struct {
 	ipmonStatusFn      func() []ipmon.PolicyStatus
 	feedsFn            func() map[string]feeds.FeedInfo
 	lldpNeighborsFn    func() []*lldp.Neighbor
+	ddnsStatsFn        func() *dhcpserver.DDNSStats
+	ddnsOwnedRecordsFn func() []dhcpserver.DDNSOwnedRecordView
 	commitFn           func(ctx context.Context, comment string) (*config.Config, error)
 	commitConfirmedFn  func(ctx context.Context, minutes int) (*config.Config, error)
 	vrrpMgr            *vrrp.Manager
@@ -118,30 +125,32 @@ func (s *Server) userspaceDataplaneControl() (userspaceControlProvider, error) {
 // gRPC is ever exposed on non-loopback addresses.
 func NewServer(addr string, cfg Config) *Server {
 	return &Server{
-		store:             cfg.Store,
-		dp:                cfg.DP,
-		eventBuf:          cfg.EventBuf,
-		gc:                cfg.GC,
-		routing:           cfg.Routing,
-		frr:               cfg.FRR,
-		ipsec:             cfg.IPsec,
-		cluster:           cfg.Cluster,
-		dhcp:              cfg.DHCP,
-		dhcpServer:        cfg.DHCPServer,
-		rpmResultsFn:      cfg.RPMResultsFn,
-		ipmonStatusFn:     cfg.IPMonStatusFn,
-		feedsFn:           cfg.FeedsFn,
-		lldpNeighborsFn:   cfg.LLDPNeighborsFn,
-		commitFn:          cfg.CommitFn,
-		commitConfirmedFn: cfg.CommitConfirmedFn,
-		vrrpMgr:           cfg.VRRPMgr,
-		raMgr:             cfg.RAMgr,
-		fwdSampler:        cfg.FwdSampler,
-		startTime:         time.Now(),
-		addr:              addr,
-		version:           cfg.Version,
-		fabricPeerAddrFn:  cfg.FabricPeerAddrFn,
-		fabricVRFDevice:   cfg.FabricVRFDevice,
+		store:              cfg.Store,
+		dp:                 cfg.DP,
+		eventBuf:           cfg.EventBuf,
+		gc:                 cfg.GC,
+		routing:            cfg.Routing,
+		frr:                cfg.FRR,
+		ipsec:              cfg.IPsec,
+		cluster:            cfg.Cluster,
+		dhcp:               cfg.DHCP,
+		dhcpServer:         cfg.DHCPServer,
+		rpmResultsFn:       cfg.RPMResultsFn,
+		ipmonStatusFn:      cfg.IPMonStatusFn,
+		feedsFn:            cfg.FeedsFn,
+		lldpNeighborsFn:    cfg.LLDPNeighborsFn,
+		ddnsStatsFn:        cfg.DDNSStatsFn,
+		ddnsOwnedRecordsFn: cfg.DDNSOwnedRecordsFn,
+		commitFn:           cfg.CommitFn,
+		commitConfirmedFn:  cfg.CommitConfirmedFn,
+		vrrpMgr:            cfg.VRRPMgr,
+		raMgr:              cfg.RAMgr,
+		fwdSampler:         cfg.FwdSampler,
+		startTime:          time.Now(),
+		addr:               addr,
+		version:            cfg.Version,
+		fabricPeerAddrFn:   cfg.FabricPeerAddrFn,
+		fabricVRFDevice:    cfg.FabricVRFDevice,
 	}
 }
 

@@ -159,7 +159,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientDeviceMap:             true,
 		lenientPolicyMatchAddress:    true,
 		lenientTCPMSSRange:           true,
-		lenientEventAttributesMatch: true,
+		lenientEventAttributesMatch:  true,
 	})
 }
 
@@ -237,7 +237,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientDeviceMap:             true,
 		lenientPolicyMatchAddress:    true,
 		lenientTCPMSSRange:           true,
-		lenientEventAttributesMatch: true,
+		lenientEventAttributesMatch:  true,
 	})
 }
 
@@ -1560,39 +1560,89 @@ func ValidateConfig(cfg *Config) []string {
 	// commit time so the operator sees it before applying.
 	warnings = append(warnings, validateRoutingRuleWindowWarnings(cfg)...)
 
-	// #1387: DHCP dynamic-DNS is parsed and validated in this increment,
-	// but the live DNS-update backend is deferred — nothing is published to
-	// DNS yet. Warn at commit time so an operator who enables DDNS (and
-	// especially one who configures an update-server / TSIG key) is not
-	// surprised that no records appear.
-	warnings = append(warnings, validateDDNSDeferredBackendWarnings(cfg)...)
+	// #1387: DHCP dynamic-DNS live-backend validation. Increment 2 wired the
+	// live RFC 2136 backend, so the increment-1 "no records are published"
+	// deferred-backend warning is retired. The warnings here flag a config
+	// that the now-live path cannot act on (enabled rfc2136 with no
+	// update-server), a still-deferred backend (kea-d2), and the now-consumed
+	// free-form leaves (update-server parseability, TSIG algorithm support).
+	// All are WARN-only (never an error) so a malformed inert value committed
+	// against increment 1 cannot brick a boot (plan §4.5 / §7 Q-C).
+	warnings = append(warnings, validateDDNSBackendWarnings(cfg)...)
 
 	return warnings
 }
 
-// validateDDNSDeferredBackendWarnings emits a commit-time warning when DHCP
-// dynamic-DNS is enabled but no live DNS-update backend is wired (#1387
-// increment 1). The config grammar is accepted and the manager runs in a
-// no-op mode (records are logged-and-skipped), so an operator must be told
-// the feature does not yet publish to DNS. The warning is stronger when an
-// update-server or TSIG key is configured, since those signal an operator
-// expectation of live updates.
-func validateDDNSDeferredBackendWarnings(cfg *Config) []string {
+// validateDDNSBackendWarnings emits WARN-only commit-time messages for the
+// now-live DHCP dynamic-DNS backend (#1387 increment 2). It never returns
+// an error: the typed schema already accepts these leaves, and a stricter
+// HARD reject would brick a boot on a previously-inert malformed value
+// (plan §7 Q-C). The reconciler/backend degrade safely at runtime (an
+// unusable backend resolves to a no-op and counts a no-backend skip).
+func validateDDNSBackendWarnings(cfg *Config) []string {
 	d := cfg.System.DHCPServer.DynamicDNS
 	if d == nil || !d.Enabled {
 		return nil
 	}
-	hasUpdateTarget := d.UpdateServer != "" || d.TSIGKeyName != "" ||
-		d.TSIGAlgorithm != "" || d.TSIGSecret != ""
-	if hasUpdateTarget {
-		return []string{"dhcp dynamic-dns is enabled with an update-server / " +
-			"TSIG configured, but the live DNS-update backend is not yet wired " +
-			"(this increment parses and validates the config only); no records " +
-			"will be published to DNS until a later increment enables the backend"}
+	var warnings []string
+
+	backend := d.Backend
+	if backend == "" {
+		backend = "rfc2136"
 	}
-	return []string{"dhcp dynamic-dns is enabled, but the live DNS-update " +
-		"backend is deferred to a later increment; the configuration is " +
-		"accepted and validated but no records are published to DNS yet"}
+	switch backend {
+	case "rfc2136":
+		if d.UpdateServer == "" {
+			warnings = append(warnings, "dhcp dynamic-dns is enabled with "+
+				"backend rfc2136 but no update-server is configured; no records "+
+				"will be published until an update-server is set")
+		} else if !ddnsUpdateServerParseable(d.UpdateServer) {
+			warnings = append(warnings, fmt.Sprintf("dhcp dynamic-dns "+
+				"update-server %q is not a valid host or host:port; the backend "+
+				"will fail to send updates", d.UpdateServer))
+		}
+		if d.TSIGKeyName != "" && !ddnsTSIGAlgorithmSupported(d.TSIGAlgorithm) {
+			warnings = append(warnings, fmt.Sprintf("dhcp dynamic-dns "+
+				"tsig-algorithm %q is not supported (use hmac-sha1, hmac-sha224, "+
+				"hmac-sha256, hmac-sha384, or hmac-sha512; hmac-md5 is rejected as "+
+				"insecure); the backend will fail to sign updates", d.TSIGAlgorithm))
+		}
+	case "kea-d2":
+		warnings = append(warnings, "dhcp dynamic-dns backend kea-d2 is "+
+			"reserved but not implemented (Kea D2 is not in the image); no "+
+			"records will be published with this backend")
+	}
+	return warnings
+}
+
+// ddnsUpdateServerParseable reports whether an update-server string is a
+// usable host or host:port (mirrors the backend's normalizeUpdateServer).
+func ddnsUpdateServerParseable(s string) bool {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return false
+	}
+	if _, _, err := net.SplitHostPort(s); err == nil {
+		return true
+	}
+	// No port: treat as a bare host (the backend attaches :53). Reject only
+	// when it is obviously not a host (e.g. embedded whitespace).
+	return !strings.ContainsAny(s, " \t")
+}
+
+// ddnsTSIGAlgorithmSupported reports whether a TSIG algorithm string is one
+// the backend can sign with (default hmac-sha256 when unset; hmac-md5
+// rejected). Mirrors ddns_rfc2136.canonicalTSIGAlgorithm without importing
+// the dhcpserver package into pkg/config.
+func ddnsTSIGAlgorithmSupported(algo string) bool {
+	a := strings.ToLower(strings.TrimSpace(algo))
+	a = strings.TrimSuffix(a, ".")
+	switch a {
+	case "", "hmac-sha1", "hmac-sha224", "hmac-sha256", "hmac-sha384", "hmac-sha512":
+		return true
+	default:
+		return false
+	}
 }
 
 // validateRoutingRuleWindowWarnings emits commit-time warnings when a

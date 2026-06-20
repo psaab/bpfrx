@@ -203,6 +203,12 @@ func (c *ctl) handleShow(args []string) error {
 		return c.showText("dhcp-relay")
 
 	case "dhcp-server":
+		if len(args) >= 2 && args[1] == "dynamic-dns" {
+			if len(args) >= 3 && args[2] == "detail" {
+				return c.showText("dhcp-server-dynamic-dns-detail")
+			}
+			return c.showText("dhcp-server-dynamic-dns")
+		}
 		if len(args) >= 2 && args[1] == "detail" {
 			return c.showText("dhcp-server-detail")
 		}

@@ -195,6 +195,75 @@ func (s *Server) showDHCPServerDetail(cfg *config.Config, buf *strings.Builder) 
 	}
 }
 
+// showDHCPDynamicDNS renders the DHCP dynamic-DNS configuration summary +
+// runtime counters, and (in detail mode) the records this node owns
+// (#1387 inc-2). It reads the daemon's always-on DDNS manager via the
+// injected stats/owned-records functions so the gRPC server does not hold
+// the manager pointer directly.
+func (s *Server) showDHCPDynamicDNS(cfg *config.Config, buf *strings.Builder, detail bool) {
+	var ddns *config.DHCPDynamicDNSConfig
+	if cfg != nil {
+		ddns = cfg.System.DHCPServer.DynamicDNS
+	}
+	if ddns == nil {
+		buf.WriteString("DHCP dynamic-DNS: not configured\n")
+		return
+	}
+	buf.WriteString("DHCP Dynamic DNS:\n")
+	fmt.Fprintf(buf, "  Enabled:         %t\n", ddns.Enabled)
+	if ddns.Backend != "" {
+		fmt.Fprintf(buf, "  Backend:         %s\n", ddns.Backend)
+	}
+	if ddns.Domain != "" {
+		fmt.Fprintf(buf, "  Domain:          %s\n", ddns.Domain)
+	}
+	if ddns.UpdateServer != "" {
+		fmt.Fprintf(buf, "  Update server:   %s\n", ddns.UpdateServer)
+	}
+	if ddns.ConflictPolicy != "" {
+		fmt.Fprintf(buf, "  Conflict policy: %s\n", ddns.ConflictPolicy)
+	}
+	if ddns.TSIGKeyName != "" {
+		// Never print the secret — only that a key is configured.
+		fmt.Fprintf(buf, "  TSIG key:        %s (secret redacted)\n", ddns.TSIGKeyName)
+	}
+
+	if s.ddnsStatsFn == nil {
+		buf.WriteString("\n  Runtime counters: unavailable\n")
+		return
+	}
+	st := s.ddnsStatsFn()
+	if st == nil {
+		buf.WriteString("\n  Runtime counters: unavailable (manager not running)\n")
+		return
+	}
+	buf.WriteString("\n  Counters:\n")
+	fmt.Fprintf(buf, "    Upserts:    ok=%d fail=%d\n", st.UpsertOK, st.UpsertFail)
+	fmt.Fprintf(buf, "    Deletes:    ok=%d fail=%d\n", st.DeleteOK, st.DeleteFail)
+	fmt.Fprintf(buf, "    Reconciles: ok=%d fail=%d\n", st.ReconcileOK, st.ReconcileFail)
+	fmt.Fprintf(buf, "    Skipped:    no-name=%d no-backend=%d conflict=%d ptr-notauth=%d\n",
+		st.SkippedNoName, st.SkippedNoBackend, st.SkippedConflict, st.SkippedPTRNotAuth)
+	fmt.Fprintf(buf, "    Owned records: %d\n", st.OwnedRecords)
+	if !st.LastReconcile.IsZero() {
+		fmt.Fprintf(buf, "    Last reconcile: %s (%d leases)\n",
+			st.LastReconcile.Format(time.RFC3339), st.LastReconcileN)
+	}
+
+	if detail && s.ddnsOwnedRecordsFn != nil {
+		recs := s.ddnsOwnedRecordsFn()
+		buf.WriteString("\n  Owned records:\n")
+		if len(recs) == 0 {
+			buf.WriteString("    none\n")
+		} else {
+			fmt.Fprintf(buf, "    %-32s %-6s %-39s %s\n", "FQDN", "Type", "Address", "PTR")
+			for _, r := range recs {
+				fmt.Fprintf(buf, "    %-32s %-6s %-39s %s\n",
+					r.FQDN, r.ForwardType, r.Address, r.PTRName)
+			}
+		}
+	}
+}
+
 // showDHCPRelay renders the configured DHCP relay server-groups and
 // relay-groups.
 func (s *Server) showDHCPRelay(cfg *config.Config, buf *strings.Builder) {

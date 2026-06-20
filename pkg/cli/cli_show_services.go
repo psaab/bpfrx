@@ -8,6 +8,7 @@ import (
 
 	"github.com/psaab/xpf/pkg/appid"
 	"github.com/psaab/xpf/pkg/cmdtree"
+	"github.com/psaab/xpf/pkg/config"
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 	dpformat "github.com/psaab/xpf/pkg/dataplane/userspace/format"
 	"github.com/psaab/xpf/pkg/dhcp"
@@ -424,6 +425,75 @@ func (c *CLI) showDHCPServer(detail bool) error {
 			for _, l := range leases6 {
 				fmt.Printf("  %-40s %-20s %-15s %-12s %s\n",
 					l.Address, l.HWAddress, l.Hostname, l.ValidLife, l.ExpireTime)
+			}
+		}
+	}
+	return nil
+}
+
+// showDHCPDynamicDNS renders the DHCP dynamic-DNS config summary + runtime
+// counters (and, in detail mode, the owned records) for the in-process
+// interactive CLI (#1387 inc-2). Counters come from the daemon-injected
+// hooks; config comes from the active store.
+func (c *CLI) showDHCPDynamicDNS(detail bool) error {
+	cfg := c.store.ActiveConfig()
+	var ddns *config.DHCPDynamicDNSConfig
+	if cfg != nil {
+		ddns = cfg.System.DHCPServer.DynamicDNS
+	}
+	if ddns == nil {
+		fmt.Println("DHCP dynamic-DNS: not configured")
+		return nil
+	}
+	fmt.Println("DHCP Dynamic DNS:")
+	fmt.Printf("  Enabled:         %t\n", ddns.Enabled)
+	if ddns.Backend != "" {
+		fmt.Printf("  Backend:         %s\n", ddns.Backend)
+	}
+	if ddns.Domain != "" {
+		fmt.Printf("  Domain:          %s\n", ddns.Domain)
+	}
+	if ddns.UpdateServer != "" {
+		fmt.Printf("  Update server:   %s\n", ddns.UpdateServer)
+	}
+	if ddns.ConflictPolicy != "" {
+		fmt.Printf("  Conflict policy: %s\n", ddns.ConflictPolicy)
+	}
+	if ddns.TSIGKeyName != "" {
+		fmt.Printf("  TSIG key:        %s (secret redacted)\n", ddns.TSIGKeyName)
+	}
+
+	if c.ddnsStatsFn == nil {
+		fmt.Println("\n  Runtime counters: unavailable")
+		return nil
+	}
+	st := c.ddnsStatsFn()
+	if st == nil {
+		fmt.Println("\n  Runtime counters: unavailable (manager not running)")
+		return nil
+	}
+	fmt.Println("\n  Counters:")
+	fmt.Printf("    Upserts:    ok=%d fail=%d\n", st.UpsertOK, st.UpsertFail)
+	fmt.Printf("    Deletes:    ok=%d fail=%d\n", st.DeleteOK, st.DeleteFail)
+	fmt.Printf("    Reconciles: ok=%d fail=%d\n", st.ReconcileOK, st.ReconcileFail)
+	fmt.Printf("    Skipped:    no-name=%d no-backend=%d conflict=%d ptr-notauth=%d\n",
+		st.SkippedNoName, st.SkippedNoBackend, st.SkippedConflict, st.SkippedPTRNotAuth)
+	fmt.Printf("    Owned records: %d\n", st.OwnedRecords)
+	if !st.LastReconcile.IsZero() {
+		fmt.Printf("    Last reconcile: %s (%d leases)\n",
+			st.LastReconcile.Format(time.RFC3339), st.LastReconcileN)
+	}
+
+	if detail && c.ddnsOwnedRecordsFn != nil {
+		recs := c.ddnsOwnedRecordsFn()
+		fmt.Println("\n  Owned records:")
+		if len(recs) == 0 {
+			fmt.Println("    none")
+		} else {
+			fmt.Printf("    %-32s %-6s %-39s %s\n", "FQDN", "Type", "Address", "PTR")
+			for _, r := range recs {
+				fmt.Printf("    %-32s %-6s %-39s %s\n",
+					r.FQDN, r.ForwardType, r.Address, r.PTRName)
 			}
 		}
 	}

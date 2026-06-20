@@ -202,6 +202,45 @@ func newCollector(srv *Server) *xpfCollector {
 			[]string{"family"}, nil,
 		),
 
+		// #1387 inc-2: DHCP dynamic-DNS counters. Label cardinality is
+		// CLOSED (plan §4.4 m4): result in {ok,fail}; reason in
+		// {no-name,no-backend,conflict,ptr-notauth} — never a raw rcode.
+		dhcpDDNSUpsertsTotal: prometheus.NewDesc(
+			"xpf_dhcp_ddns_upserts_total",
+			"Total DHCP dynamic-DNS forward/reverse record upserts by result.",
+			[]string{"result"}, nil,
+		),
+		dhcpDDNSDeletesTotal: prometheus.NewDesc(
+			"xpf_dhcp_ddns_deletes_total",
+			"Total DHCP dynamic-DNS record deletes by result.",
+			[]string{"result"}, nil,
+		),
+		dhcpDDNSReconcileRunsTotal: prometheus.NewDesc(
+			"xpf_dhcp_ddns_reconcile_runs_total",
+			"Total DHCP dynamic-DNS reconcile passes by result.",
+			[]string{"result"}, nil,
+		),
+		dhcpDDNSSkippedTotal: prometheus.NewDesc(
+			"xpf_dhcp_ddns_skipped_total",
+			"Total DHCP dynamic-DNS records skipped by reason.",
+			[]string{"reason"}, nil,
+		),
+		dhcpDDNSOwnedRecords: prometheus.NewDesc(
+			"xpf_dhcp_ddns_owned_records",
+			"Current number of DHCP dynamic-DNS records this node owns in DNS.",
+			nil, nil,
+		),
+		dhcpDDNSLastReconcileTs: prometheus.NewDesc(
+			"xpf_dhcp_ddns_last_reconcile_timestamp_seconds",
+			"Unix timestamp of the last DHCP dynamic-DNS reconcile pass.",
+			nil, nil,
+		),
+		dhcpDDNSLastReconcileN: prometheus.NewDesc(
+			"xpf_dhcp_ddns_last_reconcile_leases",
+			"Active leases seen on the last DHCP dynamic-DNS reconcile pass.",
+			nil, nil,
+		),
+
 		sysCPUUser: prometheus.NewDesc(
 			"xpf_system_cpu_user_percent",
 			"User CPU utilization percentage.",

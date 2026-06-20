@@ -71,6 +71,15 @@ type xpfCollector struct {
 	// DHCP lease gauge
 	dhcpLeasesActive *prometheus.Desc
 
+	// DHCP dynamic-DNS metrics (#1387 inc-2)
+	dhcpDDNSUpsertsTotal       *prometheus.Desc
+	dhcpDDNSDeletesTotal       *prometheus.Desc
+	dhcpDDNSReconcileRunsTotal *prometheus.Desc
+	dhcpDDNSSkippedTotal       *prometheus.Desc
+	dhcpDDNSOwnedRecords       *prometheus.Desc
+	dhcpDDNSLastReconcileTs    *prometheus.Desc
+	dhcpDDNSLastReconcileN     *prometheus.Desc
+
 	// System metrics
 	sysCPUUser   *prometheus.Desc
 	sysCPUSystem *prometheus.Desc
@@ -324,7 +333,7 @@ type xpfCollector struct {
 	// #1902: decap-refusal gate at pending_neigh admission (frame/meta
 	// pairing defect class — see also #1885/#1873).
 	pendingNeighDecapDropsTotal *prometheus.Desc
-	dynamicNeighborPresent          *prometheus.Desc
+	dynamicNeighborPresent      *prometheus.Desc
 	// #1769: on-demand neighbor-resolver telemetry — the operator-visible
 	// signal for the MissingNeighbor stuck-state.
 	neighborResolverQueueDepth        *prometheus.Desc
@@ -410,6 +419,13 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.userspaceSNATPoolReusesTotal
 	ch <- c.userspaceSNATPoolExhaustionsTotal
 	ch <- c.dhcpLeasesActive
+	ch <- c.dhcpDDNSUpsertsTotal
+	ch <- c.dhcpDDNSDeletesTotal
+	ch <- c.dhcpDDNSReconcileRunsTotal
+	ch <- c.dhcpDDNSSkippedTotal
+	ch <- c.dhcpDDNSOwnedRecords
+	ch <- c.dhcpDDNSLastReconcileTs
+	ch <- c.dhcpDDNSLastReconcileN
 	ch <- c.sysCPUUser
 	ch <- c.sysCPUSystem
 	ch <- c.sysMemTotal
@@ -659,6 +675,7 @@ func (c *xpfCollector) Collect(ch chan<- prometheus.Metric) {
 	c.collectSessionGauges(ch, dp)
 	c.collectNATPoolMetrics(ch, dp)
 	c.collectDHCPMetrics(ch)
+	c.collectDDNSMetrics(ch)
 	c.collectSystemMetrics(ch)
 	c.collectUserspaceStatus(ch, dp)
 }

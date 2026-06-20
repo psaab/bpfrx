@@ -222,23 +222,48 @@ func TestDHCPDDNSSchemaAcceptsValidLeaves(t *testing.T) {
 	}
 }
 
-// TestDHCPDDNSEnabledWarnsBackendDeferred proves the #1387 MINOR-5 commit
-// warning: enabling DDNS (whose live backend is deferred to a later
-// increment) must surface a commit-time warning that nothing is published to
-// DNS yet, and the warning must be stronger when an update-server / TSIG is
-// also configured. An absent or disabled stanza emits no such warning.
-func TestDHCPDDNSEnabledWarnsBackendDeferred(t *testing.T) {
-	hasDeferredWarn := func(ws []string) (string, bool) {
+// TestDHCPDDNSBackendWarnings proves the #1387 inc-2 commit warnings: the
+// increment-1 "backend deferred / no records published" warning is RETIRED
+// (the live RFC 2136 backend is now wired). The warnings here flag a config
+// the now-live path cannot act on, all WARN-only (never an error) so a
+// previously-inert malformed value cannot brick a boot (plan §4.5 / §7 Q-C).
+func TestDHCPDDNSBackendWarnings(t *testing.T) {
+	hasDDNSWarn := func(ws []string, substr string) (string, bool) {
 		for _, w := range ws {
-			if strings.Contains(w, "dhcp dynamic-dns") &&
-				strings.Contains(w, "backend") {
+			if strings.Contains(w, "dhcp dynamic-dns") && strings.Contains(w, substr) {
 				return w, true
 			}
 		}
 		return "", false
 	}
+	anyDeferred := func(ws []string) bool {
+		for _, w := range ws {
+			if strings.Contains(w, "deferred") || strings.Contains(w, "no records are published") {
+				return true
+			}
+		}
+		return false
+	}
 
-	t.Run("enabled bare", func(t *testing.T) {
+	t.Run("retired deferred warning when rfc2136 + update-server set", func(t *testing.T) {
+		cfg, err := CompileConfig(buildTree(t, []string{
+			"set system services dhcp-local-server dynamic-dns enable",
+			"set system services dhcp-local-server dynamic-dns domain corp.example.com",
+			"set system services dhcp-local-server dynamic-dns update-server 192.0.2.53",
+		}))
+		if err != nil {
+			t.Fatalf("CompileConfig: %v", err)
+		}
+		ws := ValidateConfig(cfg)
+		if anyDeferred(ws) {
+			t.Fatalf("the inc-1 deferred-backend warning must be retired in inc-2: %v", ws)
+		}
+		if _, ok := hasDDNSWarn(ws, "no update-server"); ok {
+			t.Fatalf("a configured update-server must not warn about a missing one: %v", ws)
+		}
+	})
+
+	t.Run("enabled rfc2136 with no update-server warns", func(t *testing.T) {
 		cfg, err := CompileConfig(buildTree(t, []string{
 			"set system services dhcp-local-server dynamic-dns enable",
 			"set system services dhcp-local-server dynamic-dns domain corp.example.com",
@@ -246,53 +271,93 @@ func TestDHCPDDNSEnabledWarnsBackendDeferred(t *testing.T) {
 		if err != nil {
 			t.Fatalf("CompileConfig: %v", err)
 		}
-		w, ok := hasDeferredWarn(ValidateConfig(cfg))
-		if !ok {
-			t.Fatal("enabling DDNS did not warn that the backend is deferred")
-		}
-		if strings.Contains(w, "update-server") {
-			t.Fatalf("bare-enable warning wrongly mentions update-server: %q", w)
+		if _, ok := hasDDNSWarn(ValidateConfig(cfg), "no update-server"); !ok {
+			t.Fatal("enabled rfc2136 without an update-server must warn")
 		}
 	})
 
-	t.Run("enabled with update-server warns stronger", func(t *testing.T) {
+	t.Run("kea-d2 still deferred", func(t *testing.T) {
 		cfg, err := CompileConfig(buildTree(t, []string{
 			"set system services dhcp-local-server dynamic-dns enable",
-			"set system services dhcp-local-server dynamic-dns update-server 192.0.2.53",
-			"set system services dhcp-local-server dynamic-dns tsig-key xpf-key",
+			"set system services dhcp-local-server dynamic-dns backend kea-d2",
 		}))
 		if err != nil {
 			t.Fatalf("CompileConfig: %v", err)
 		}
-		w, ok := hasDeferredWarn(ValidateConfig(cfg))
-		if !ok {
-			t.Fatal("enabling DDNS with update-server did not warn")
+		if _, ok := hasDDNSWarn(ValidateConfig(cfg), "kea-d2"); !ok {
+			t.Fatal("kea-d2 backend must warn that it is not implemented")
 		}
-		if !strings.Contains(w, "update-server") {
-			t.Fatalf("update-server warning did not call out the update target: %q", w)
+	})
+
+	t.Run("malformed update-server warns (WARN-only, no error)", func(t *testing.T) {
+		cfg, err := CompileConfig(buildTree(t, []string{
+			"set system services dhcp-local-server dynamic-dns enable",
+			// A quoted value with embedded whitespace is not a usable host.
+			`set system services dhcp-local-server dynamic-dns update-server "bad host"`,
+		}))
+		if err != nil {
+			t.Fatalf("CompileConfig must NOT error on a malformed update-server (Q-C): %v", err)
+		}
+		if _, ok := hasDDNSWarn(ValidateConfig(cfg), "not a valid host"); !ok {
+			t.Fatal("a malformed update-server must warn")
+		}
+	})
+
+	t.Run("bad tsig-algorithm warns", func(t *testing.T) {
+		cfg, err := CompileConfig(buildTree(t, []string{
+			"set system services dhcp-local-server dynamic-dns enable",
+			"set system services dhcp-local-server dynamic-dns update-server 192.0.2.53",
+			"set system services dhcp-local-server dynamic-dns tsig-key k1",
+			"set system services dhcp-local-server dynamic-dns tsig-algorithm hmac-md5",
+		}))
+		if err != nil {
+			t.Fatalf("CompileConfig: %v", err)
+		}
+		if _, ok := hasDDNSWarn(ValidateConfig(cfg), "tsig-algorithm"); !ok {
+			t.Fatal("hmac-md5 (insecure) tsig-algorithm must warn")
+		}
+	})
+
+	t.Run("valid hmac-sha256 default is silent", func(t *testing.T) {
+		cfg, err := CompileConfig(buildTree(t, []string{
+			"set system services dhcp-local-server dynamic-dns enable",
+			"set system services dhcp-local-server dynamic-dns update-server 192.0.2.53",
+			"set system services dhcp-local-server dynamic-dns tsig-key k1",
+		}))
+		if err != nil {
+			t.Fatalf("CompileConfig: %v", err)
+		}
+		ws := ValidateConfig(cfg)
+		if _, ok := hasDDNSWarn(ws, "tsig-algorithm"); ok {
+			t.Fatalf("default hmac-sha256 must not warn: %v", ws)
+		}
+		if _, ok := hasDDNSWarn(ws, "no update-server"); ok {
+			t.Fatalf("a configured update-server must not warn: %v", ws)
 		}
 	})
 
 	t.Run("absent or disabled is silent", func(t *testing.T) {
-		// No stanza at all.
 		cfgAbsent, err := CompileConfig(buildTree(t, []string{
 			"set system services dhcp-local-server group g0 interface ge-0/0/0",
 		}))
 		if err != nil {
 			t.Fatalf("CompileConfig(absent): %v", err)
 		}
-		if _, ok := hasDeferredWarn(ValidateConfig(cfgAbsent)); ok {
-			t.Fatal("absent DDNS must not emit the deferred-backend warning")
+		for _, w := range ValidateConfig(cfgAbsent) {
+			if strings.Contains(w, "dhcp dynamic-dns") {
+				t.Fatalf("absent DDNS must emit no warnings: %q", w)
+			}
 		}
-		// Stanza present but not enabled (only a domain set).
 		cfgDisabled, err := CompileConfig(buildTree(t, []string{
 			"set system services dhcp-local-server dynamic-dns domain corp.example.com",
 		}))
 		if err != nil {
 			t.Fatalf("CompileConfig(disabled): %v", err)
 		}
-		if _, ok := hasDeferredWarn(ValidateConfig(cfgDisabled)); ok {
-			t.Fatal("disabled DDNS must not emit the deferred-backend warning")
+		for _, w := range ValidateConfig(cfgDisabled) {
+			if strings.Contains(w, "dhcp dynamic-dns") {
+				t.Fatalf("disabled DDNS must emit no warnings: %q", w)
+			}
 		}
 	})
 }
