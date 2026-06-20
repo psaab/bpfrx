@@ -46,21 +46,7 @@ func (c *CLI) handlePing(args []string) error {
 		}
 	}
 
-	var cmdArgs []string
-	if vrfName != "" {
-		cmdArgs = append(cmdArgs, "ip", "vrf", "exec", "vrf-"+vrfName, "ping")
-	} else {
-		cmdArgs = append(cmdArgs, "ping")
-	}
-
-	cmdArgs = append(cmdArgs, "-c", count)
-	if source != "" {
-		cmdArgs = append(cmdArgs, "-I", source)
-	}
-	if size != "" {
-		cmdArgs = append(cmdArgs, "-s", size)
-	}
-	cmdArgs = append(cmdArgs, target)
+	cmdArgs := buildPingArgv(target, count, source, size, vrfName)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
@@ -81,6 +67,29 @@ func (c *CLI) handlePing(args []string) error {
 		return nil // cancelled by Ctrl-C or timeout
 	}
 	return err
+}
+
+// buildPingArgv builds the argv for the local CLI ping command. The
+// user-supplied target is placed after a "--" end-of-options separator
+// so a "-"-prefixed target is treated as the destination operand rather
+// than a ping flag (option-confusion hardening, #2084).
+func buildPingArgv(target, count, source, size, vrfName string) []string {
+	var cmdArgs []string
+	if vrfName != "" {
+		cmdArgs = append(cmdArgs, "ip", "vrf", "exec", "vrf-"+vrfName, "ping")
+	} else {
+		cmdArgs = append(cmdArgs, "ping")
+	}
+
+	cmdArgs = append(cmdArgs, "-c", count)
+	if source != "" {
+		cmdArgs = append(cmdArgs, "-I", source)
+	}
+	if size != "" {
+		cmdArgs = append(cmdArgs, "-s", size)
+	}
+	cmdArgs = append(cmdArgs, "--", target)
+	return cmdArgs
 }
 
 func (c *CLI) handleTraceroute(args []string) error {
@@ -104,17 +113,7 @@ func (c *CLI) handleTraceroute(args []string) error {
 		}
 	}
 
-	var cmdArgs []string
-	if vrfName != "" {
-		cmdArgs = append(cmdArgs, "ip", "vrf", "exec", "vrf-"+vrfName, "traceroute")
-	} else {
-		cmdArgs = append(cmdArgs, "traceroute")
-	}
-
-	if source != "" {
-		cmdArgs = append(cmdArgs, "-s", source)
-	}
-	cmdArgs = append(cmdArgs, target)
+	cmdArgs := buildTracerouteArgv(target, source, vrfName)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
@@ -135,6 +134,26 @@ func (c *CLI) handleTraceroute(args []string) error {
 		return nil // cancelled by Ctrl-C or timeout
 	}
 	return err
+}
+
+// buildTracerouteArgv builds the argv for the local CLI traceroute
+// command. The user-supplied target is placed after a "--"
+// end-of-options separator so a "-"-prefixed target is treated as the
+// destination operand rather than a traceroute flag (option-confusion
+// hardening, #2084).
+func buildTracerouteArgv(target, source, vrfName string) []string {
+	var cmdArgs []string
+	if vrfName != "" {
+		cmdArgs = append(cmdArgs, "ip", "vrf", "exec", "vrf-"+vrfName, "traceroute")
+	} else {
+		cmdArgs = append(cmdArgs, "traceroute")
+	}
+
+	if source != "" {
+		cmdArgs = append(cmdArgs, "-s", source)
+	}
+	cmdArgs = append(cmdArgs, "--", target)
+	return cmdArgs
 }
 
 // handleTest dispatches test sub-commands (policy, routing, security-zone).

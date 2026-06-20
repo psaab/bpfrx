@@ -1,5 +1,32 @@
 # Action Log
 
+## 2026-06-20 — #2084 ping/traceroute argv `--` end-of-options separator (option-confusion hardening)
+
+- **Timestamp**: 2026-06-20
+- **Action**: Fixed #2084 (LOW, hardening, loopback-API gated). The
+  ping/traceroute exec sites build an argv slice (no shell — NOT
+  injection) but omitted a `--` end-of-options separator before the
+  user-supplied target, so a `-`-prefixed target was interpreted as a
+  ping/traceroute flag (option-confusion). Extracted the inline argv
+  construction at the six target-append points into pure, unit-testable
+  `buildPingArgv`/`buildTracerouteArgv` helpers (one pair per package)
+  and inserted `"--"` immediately before the target. For the
+  `ip vrf exec vrf-<name>` wrapped variant the `--` lands in the inner
+  command's argv (after `ping`/`traceroute`), which is where it must be.
+  The remote CLI (`cmd/cli/main.go`) builds a protobuf request, not an
+  argv, so it inherits the server-side fix; `pkg/upgrade/kernel_linux.go`
+  pings a daemon-internal gateway (no untrusted input) — both out of
+  scope. Added 12 unit tests (4 per package) asserting `--` is present,
+  immediately precedes the target, is the last-but-one element, comes
+  after all options and after the `ping`/`traceroute` binary, and that a
+  `-`-prefixed target lands as the operand. Updated pkg/api/README.md and
+  pkg/grpcapi/README.md.
+- **File(s)**: pkg/grpcapi/server_diag.go, pkg/api/system.go,
+  pkg/cli/cli_request.go, pkg/grpcapi/server_diag_argv_test.go (new),
+  pkg/api/system_argv_test.go (new), pkg/cli/cli_request_argv_test.go
+  (new), pkg/api/README.md, pkg/grpcapi/README.md,
+  docs/pr/2084-ping-traceroute-separator/plan.md (new)
+
 ## 2026-06-20 — #2070 interface-monitor carrier-state read (HIGH, failover-class)
 
 - **Timestamp**: 2026-06-20
@@ -23,6 +50,7 @@
 - **File(s)**: pkg/routing/monitor.go, pkg/routing/monitor_test.go (new),
   pkg/cluster/monitor.go, pkg/cluster/monitor_test.go,
   pkg/cluster/README.md, pkg/routing/README.md, _Log.md
+
 ## 2026-06-20 — #2069 lo0 input filter never installs (invalid `flush ruleset <table>` nft syntax)
 
 - **Timestamp**: 2026-06-20
@@ -7334,3 +7362,17 @@ top.
 - **Timestamp**: 2026-06-20
 - **Action**: #2078 C2 (warn-and-document; research converged PLAN-KILL on enforcement). Three `security flow tcp-session` presence flags (`no-syn-check`, `no-syn-check-in-tunnel`, `rst-invalidate-session`) plus the #2008 M9 sibling `no-sequence-check` are typed+committed but the userspace AF_XDP dataplane has no TCP state machine and enforces none of them — and an operator who set one was silently misled. Item 1 (advisory): added a commit-time accepted-only warning in pkg/config/compiler.go ValidateConfig (called from compileExpanded; placed right after the allow-dataplane-sleep block, mirroring that exact pattern) that folds all four family knobs into ONE warning (`security flow tcp-session <knobs> configured but accepted-only — the userspace dataplane has no TCP state machine and does not enforce these knobs (config-only parity, #2078)`), gated `if cfg.Security.Flow.TCPSession != nil`. Item 3 (dead code): removed the dead `FlowConfigValue.TCPFlags` packing block in pkg/dataplane/compiler.go:1069-1080 + the now-always-zero `"tcp_flags", fc.TCPFlags` slog field — that packing fed `dp.SetFlowConfig` which on the userspace path is a no-op stub (loader.go userspaceShimCompileDataplane.SetFlowConfig→nil) writing to the retired flow_config_map eBPF map (#1373/#1476); verified NO reader of FlowConfigValue.TCPFlags exists (compiler_filter.go .TCPFlags is a DIFFERENT struct, the firewall-filter term). Kept the struct field for xpf_common.h layout parity, comment updated to mark it retired. Item 2 (docs): corrected docs/feature-gaps.md TCP-session rows (were wrongly "Done" via retired eBPF) to "Config-only (#2078)" with userspace behavior + cross-ref to active-active RST rationale; extended the M9 note; expanded docs/config-schema.md tcp-session paragraph with the advisory + design-rationale + dead-code cross-references. Tests: pkg/config/tcp_session_advisory_test.go (per-knob advisory fires + names that knob; no-syn-check prefix-vs-no-syn-check-in-tunnel false-positive guard; all-four folds into exactly ONE warning naming all four; timeouts-only no-warn; absent no-warn), mutation-verified to FAIL when the advisory is disabled (`if false && len(unenforced)>0`). CONTROL-PLANE only, no dataplane smoke (no runtime behavior change). Validation: GOCACHE=/dev/shm go build ./... clean; go vet ./pkg/dataplane/ clean; go test ./pkg/config/ ./pkg/dataplane/ green; full `go test ./...` 0 failures.
 - **File(s)**: pkg/config/compiler.go, pkg/config/tcp_session_advisory_test.go, pkg/dataplane/compiler.go, pkg/dataplane/maps_flow.go, docs/feature-gaps.md, docs/config-schema.md, _Log.md
+
+## #2073 IPsec PFS silently dropped on dangling proposal ref (PR #2099)
+- **Timestamp**: 2026-06-20
+- **Action**: Two-layer fix — commit-time strict cross-ref validator
+  (validateIPsecPolicyProposalReferencesStrict, lenient on load/peer-sync)
+  + render-path PFS-preserving fallback (aes256-sha256-modp<bits>) in
+  resolveESPSettings. Quad-ish review: 2 hostile plan reviews (folded),
+  2 hostile code reviews (caught + fixed sha256128 BLOCKER), both
+  MERGE-READY. Copilot pending. ECP-group modp<bits> + normal-path
+  sha256128 noted as pre-existing follow-ups.
+- **File(s)**: pkg/config/compiler.go, pkg/ipsec/ike.go,
+  pkg/config/ipsec_proposal_ref_test.go, pkg/ipsec/ipsec_test.go,
+  pkg/config/parser_security_test.go, pkg/ipsec/README.md,
+  docs/pr/2073-ipsec-pfs/plan.md

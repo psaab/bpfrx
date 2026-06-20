@@ -188,6 +188,103 @@ func TestBuildESPProposal_PFSOverride(t *testing.T) {
 	}
 }
 
+// TestResolveESPSettings_DanglingProposalPreservesPFS is the #2073
+// render-path safety net (Layer B): when an IPsec policy resolves and a
+// PFS group is configured but its proposal reference is dangling, the
+// renderer must NOT fall through to bare "default" (which drops PFS).
+// Instead it must carry the configured PFS group on a valid fallback
+// proposal that includes a cipher and integrity alg, using swanctl's
+// canonical keyword spellings.
+func TestResolveESPSettings_DanglingProposalPreservesPFS(t *testing.T) {
+	cfg := &config.IPsecConfig{
+		Policies: map[string]*config.IPsecPolicyDef{
+			"ipsec-pol": {
+				Name:      "ipsec-pol",
+				PFSGroup:  14,
+				Proposals: "does-not-exist",
+			},
+		},
+		// Proposals deliberately omits "does-not-exist" — dangling ref.
+	}
+	vpn := &config.IPsecVPN{IPsecPolicy: "ipsec-pol"}
+
+	got, lifetime := resolveESPSettings(cfg, vpn)
+	// Exact token, not a `modp` substring: a Contains("modp2048") check
+	// would also pass for an invalid no-integrity "aes256-modp2048". The
+	// integrity keyword MUST be the canonical "sha256" — strongSwan's
+	// proposal parser does not recognize the "sha256128" spelling and
+	// would discard the whole proposal.
+	if got != "aes256-sha256-modp2048" {
+		t.Fatalf("resolveESPSettings dropped PFS or emitted an invalid fallback: got %q, want aes256-sha256-modp2048", got)
+	}
+	if got == "default" {
+		t.Fatal("PFS was silently dropped to the strongSwan default")
+	}
+	if lifetime != 0 {
+		t.Errorf("lifetime = %d, want 0 (no resolvable proposal to take a lifetime from)", lifetime)
+	}
+}
+
+// TestResolveESPSettings_DanglingProposalNoPFSStaysDefault verifies that a
+// dangling proposal reference with NO configured PFS still falls to
+// "default" — there is no security control to preserve, so the render
+// behavior is unchanged from before #2073.
+func TestResolveESPSettings_DanglingProposalNoPFSStaysDefault(t *testing.T) {
+	cfg := &config.IPsecConfig{
+		Policies: map[string]*config.IPsecPolicyDef{
+			"ipsec-pol": {
+				Name:      "ipsec-pol",
+				PFSGroup:  0,
+				Proposals: "does-not-exist",
+			},
+		},
+	}
+	vpn := &config.IPsecVPN{IPsecPolicy: "ipsec-pol"}
+
+	got, _ := resolveESPSettings(cfg, vpn)
+	if got != "default" {
+		t.Errorf("resolveESPSettings = %q, want default (no PFS configured)", got)
+	}
+}
+
+// TestResolveESPSettings_NoPolicyStaysDefault is the (D) regression: a VPN
+// with no IPsec policy emits "default" with no error and no PFS.
+func TestResolveESPSettings_NoPolicyStaysDefault(t *testing.T) {
+	cfg := &config.IPsecConfig{}
+	vpn := &config.IPsecVPN{}
+	got, lifetime := resolveESPSettings(cfg, vpn)
+	if got != "default" || lifetime != 0 {
+		t.Errorf("resolveESPSettings = (%q, %d), want (default, 0)", got, lifetime)
+	}
+}
+
+// TestGenerateConfig_DanglingProposalPreservesPFS checks the full render:
+// the emitted swanctl child block must carry the PFS modp group rather
+// than esp_proposals = default, using the canonical sha256 keyword.
+func TestGenerateConfig_DanglingProposalPreservesPFS(t *testing.T) {
+	m := &Manager{configDir: "/tmp", configPath: "/tmp/xpf.conf"}
+	cfg := &config.IPsecConfig{
+		VPNs: map[string]*config.IPsecVPN{
+			"tun1": {
+				Gateway:     "172.16.0.1",
+				IPsecPolicy: "ipsec-pol",
+				LocalID:     "10.0.1.0/24",
+				RemoteID:    "10.0.2.0/24",
+			},
+		},
+		Policies: map[string]*config.IPsecPolicyDef{
+			"ipsec-pol": {Name: "ipsec-pol", PFSGroup: 14, Proposals: "does-not-exist"},
+		},
+	}
+	got := m.generateConfig(cfg)
+	if !strings.Contains(got, "esp_proposals = aes256-sha256-modp2048") {
+		t.Errorf("rendered config dropped PFS or used the default set:\n%s", got)
+	}
+	if strings.Contains(got, "esp_proposals = default") {
+		t.Errorf("PFS silently dropped to esp_proposals = default:\n%s", got)
+	}
+}
+
 func TestParseSAOutput(t *testing.T) {
 	output := `site-a: #1, ESTABLISHED
   local: 10.0.1.1 === 10.0.2.1
@@ -970,4 +1067,203 @@ func TestGenerateConfig_NewlineSecretDoesNotInject(t *testing.T) {
 	if !strings.Contains(got, `secret = "secret include /etc/evil.conf"`) {
 		t.Errorf("sanitized secret missing:\n%s", got)
 	}
+}
+
+// remoteAddrsValues returns every value rendered on a `remote_addrs = `
+// line in the swanctl output (one per emitted connection), or an empty
+// slice if there are none. It lets the #2074 tests assert specifically
+// that a gateway config-object NAME never appears as a remote_addrs
+// value (a substring match on the whole config would falsely flag the
+// connection-name line).
+func remoteAddrsValues(cfg string) []string {
+	var out []string
+	for _, line := range strings.Split(cfg, "\n") {
+		t := strings.TrimSpace(line)
+		if v, ok := strings.CutPrefix(t, "remote_addrs = "); ok {
+			out = append(out, v)
+		}
+	}
+	return out
+}
+
+// TestRenderConfig_GatewayNameNeverLeaks exercises #2074: a bare gateway
+// config-object NAME must never reach swanctl `remote_addrs`. The render
+// belt skips an unrenderable VPN rather than leaking its name; valid
+// shapes (defined+addressed gateway, inline IP/FQDN, empty gateway) are
+// preserved. These sub-cases fail against pre-fix code, which emitted
+// `remote_addrs = <gateway-name>` for the dangling / addressless cases.
+func TestRenderConfig_GatewayNameNeverLeaks(t *testing.T) {
+	m := &Manager{configDir: "/tmp", configPath: "/tmp/xpf.conf"}
+
+	t.Run("resolved gateway with address", func(t *testing.T) {
+		cfg := &config.IPsecConfig{
+			Gateways: map[string]*config.IPsecGateway{
+				"corp-gw": {Name: "corp-gw", Address: "203.0.113.7"},
+			},
+			VPNs: map[string]*config.IPsecVPN{
+				"tun": {Gateway: "corp-gw", PSK: "k"},
+			},
+		}
+		got, err := m.renderConfig(cfg)
+		if err != nil {
+			t.Fatalf("renderConfig() error = %v", err)
+		}
+		vals := remoteAddrsValues(got)
+		if len(vals) != 1 || vals[0] != "203.0.113.7" {
+			t.Fatalf("remote_addrs = %v, want [203.0.113.7]\n%s", vals, got)
+		}
+		for _, v := range vals {
+			if v == "corp-gw" {
+				t.Fatalf("gateway NAME leaked into remote_addrs:\n%s", got)
+			}
+		}
+	})
+
+	t.Run("dangling gateway name is skipped, no leak", func(t *testing.T) {
+		cfg := &config.IPsecConfig{
+			// "typo-gw" is referenced but never defined, and is not a
+			// usable IP / dotted hostname. Benign PSK auth so no other
+			// render error path fires (this isolates the leak path).
+			VPNs: map[string]*config.IPsecVPN{
+				"tun": {Gateway: "typo-gw", PSK: "k"},
+			},
+		}
+		got, err := m.renderConfig(cfg)
+		if err != nil {
+			t.Fatalf("renderConfig() error = %v (skip should not error)", err)
+		}
+		if strings.Contains(got, "typo-gw") {
+			t.Fatalf("dangling gateway NAME leaked into config:\n%s", got)
+		}
+		if vals := remoteAddrsValues(got); len(vals) != 0 {
+			t.Fatalf("expected no remote_addrs, got %v\n%s", vals, got)
+		}
+		if strings.Contains(got, "ike-tun {") {
+			t.Fatalf("skipped VPN should have no secret entry:\n%s", got)
+		}
+	})
+
+	t.Run("addressless gateway is skipped, no leak", func(t *testing.T) {
+		cfg := &config.IPsecConfig{
+			Gateways: map[string]*config.IPsecGateway{
+				// Exists but has neither Address nor DynamicHostname.
+				"bare-gw": {Name: "bare-gw"},
+			},
+			VPNs: map[string]*config.IPsecVPN{
+				"tun": {Gateway: "bare-gw", PSK: "k"},
+			},
+		}
+		got, err := m.renderConfig(cfg)
+		if err != nil {
+			t.Fatalf("renderConfig() error = %v", err)
+		}
+		if strings.Contains(got, "bare-gw") {
+			t.Fatalf("addressless gateway NAME leaked:\n%s", got)
+		}
+		if vals := remoteAddrsValues(got); len(vals) != 0 {
+			t.Fatalf("expected no remote_addrs, got %v\n%s", vals, got)
+		}
+	})
+
+	t.Run("dotless single-label name is skipped", func(t *testing.T) {
+		cfg := &config.IPsecConfig{
+			VPNs: map[string]*config.IPsecVPN{
+				"tun": {Gateway: "vpnpeer", PSK: "k"},
+			},
+		}
+		got, err := m.renderConfig(cfg)
+		if err != nil {
+			t.Fatalf("renderConfig() error = %v", err)
+		}
+		if vals := remoteAddrsValues(got); len(vals) != 0 {
+			t.Fatalf("dotless name should be skipped, got remote_addrs %v\n%s", vals, got)
+		}
+	})
+
+	t.Run("inline literal IP is preserved", func(t *testing.T) {
+		cfg := &config.IPsecConfig{
+			VPNs: map[string]*config.IPsecVPN{
+				"tun": {Gateway: "198.51.100.9", PSK: "k"},
+			},
+		}
+		got, err := m.renderConfig(cfg)
+		if err != nil {
+			t.Fatalf("renderConfig() error = %v", err)
+		}
+		if vals := remoteAddrsValues(got); len(vals) != 1 || vals[0] != "198.51.100.9" {
+			t.Fatalf("remote_addrs = %v, want [198.51.100.9]\n%s", vals, got)
+		}
+	})
+
+	t.Run("inline dotted hostname is preserved", func(t *testing.T) {
+		cfg := &config.IPsecConfig{
+			VPNs: map[string]*config.IPsecVPN{
+				"tun": {Gateway: "peer.example.com", PSK: "k"},
+			},
+		}
+		got, err := m.renderConfig(cfg)
+		if err != nil {
+			t.Fatalf("renderConfig() error = %v", err)
+		}
+		if vals := remoteAddrsValues(got); len(vals) != 1 || vals[0] != "peer.example.com" {
+			t.Fatalf("remote_addrs = %v, want [peer.example.com]\n%s", vals, got)
+		}
+	})
+
+	t.Run("empty gateway emits connection with no remote_addrs", func(t *testing.T) {
+		cfg := &config.IPsecConfig{
+			VPNs: map[string]*config.IPsecVPN{
+				"tun": {Gateway: "", PSK: "k", BindInterface: "st0.0"},
+			},
+		}
+		got, err := m.renderConfig(cfg)
+		if err != nil {
+			t.Fatalf("renderConfig() error = %v", err)
+		}
+		if !strings.Contains(got, "  tun {\n") {
+			t.Fatalf("empty-gateway VPN should still render a connection:\n%s", got)
+		}
+		if vals := remoteAddrsValues(got); len(vals) != 0 {
+			t.Fatalf("empty gateway should emit no remote_addrs, got %v\n%s", vals, got)
+		}
+	})
+
+	// Regression guard for the round-2 cold-boot defect: a healthy VPN
+	// must still render (and keep its remote_addrs) when a sibling VPN is
+	// skipped. Pre-fix / v1-style whole-render-abort would have dropped
+	// the healthy tunnel too.
+	t.Run("one bad VPN does not zero a healthy sibling", func(t *testing.T) {
+		cfg := &config.IPsecConfig{
+			Gateways: map[string]*config.IPsecGateway{
+				"good-gw": {Name: "good-gw", Address: "192.0.2.10"},
+			},
+			VPNs: map[string]*config.IPsecVPN{
+				"good": {Gateway: "good-gw", PSK: "k1"},
+				"bad":  {Gateway: "missing-gw", PSK: "k2"},
+			},
+		}
+		got, err := m.renderConfig(cfg)
+		if err != nil {
+			t.Fatalf("renderConfig() error = %v", err)
+		}
+		if !strings.Contains(got, "  good {\n") {
+			t.Fatalf("healthy VPN was dropped:\n%s", got)
+		}
+		vals := remoteAddrsValues(got)
+		if len(vals) != 1 || vals[0] != "192.0.2.10" {
+			t.Fatalf("healthy remote_addrs = %v, want [192.0.2.10]\n%s", vals, got)
+		}
+		if strings.Contains(got, "missing-gw") {
+			t.Fatalf("bad gateway NAME leaked:\n%s", got)
+		}
+		if strings.Contains(got, "  bad {\n") {
+			t.Fatalf("bad VPN should be skipped:\n%s", got)
+		}
+		if strings.Contains(got, "ike-bad {") {
+			t.Fatalf("skipped VPN should have no secret:\n%s", got)
+		}
+		if !strings.Contains(got, "ike-good {") {
+			t.Fatalf("healthy VPN secret missing:\n%s", got)
+		}
+	})
 }

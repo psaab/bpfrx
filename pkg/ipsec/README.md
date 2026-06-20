@@ -71,3 +71,52 @@ all files stay in `package ipsec`, so the public API is unchanged.
   `xfrmiIfID()`. The same name → same numeric ID across reboots — don't
   rename a bind interface without expecting a reset of the SAs that ride
   it.
+- **IPsec policy → proposal cross-reference (#2073).** An IPsec (Phase 2)
+  policy's `proposals` reference (or, when omitted, a proposal named after
+  the policy) is validated at commit / commit-check by
+  `pkg/config` `validateIPsecPolicyProposalReferencesStrict`. A dangling
+  reference is **hard-rejected** at commit: previously it fell through to
+  `esp_proposals = default` in `resolveESPSettings`, silently substituting
+  the operator's entire Phase-2 proposal set — including any configured
+  `perfect-forward-secrecy` DH group — with the strongSwan default (which
+  carries no required modp term), so PFS was silently disabled. On the
+  tolerant load / peer-sync paths the commit check is downgraded to a
+  warning (an already-persisted or peer-synced config still boots), and
+  `resolveESPSettings` has a render-side safety net: when the policy
+  resolves with a PFS group but the proposal ref dangles, it carries the
+  configured PFS group on a conservative valid fallback proposal
+  (`aes256-sha256-modp<bits>`, built with swanctl's canonical keyword
+  spellings) instead of falling through to `default`,
+  and logs a warning. Note: strongSwan ≥ 6.0.2 changed its `default` ESP
+  set to make PFS *optional* rather than absent, so the silent weakening is
+  a downgrade-to-negotiable-PFS there rather than no-PFS — the fix is the
+  same.
+- **Gateway reference resolution / `remote_addrs` (#2074).** A VPN's
+  `ike gateway <name>` either names a defined `security ike gateway`
+  object (whose `address` or `dynamic hostname` becomes `remote_addrs`)
+  or, in the legacy inline shape, IS the peer endpoint directly (a
+  literal IP or a dotted hostname/FQDN). The invariant is: **a bare
+  gateway config-object NAME never reaches swanctl `remote_addrs`** — a
+  config-object name strongSwan cannot use would DNS-resolve forever and
+  the IKE SA would never come up (a silently-dead tunnel).
+  - **Commit-time rejection** (`validateIPsecGatewayReferencesStrict`,
+    `pkg/config/compiler_ipsec.go`, run from the strict-validator chain
+    in `compileExpanded`): a VPN that references an undefined gateway, or
+    a gateway object committed with neither `address` nor `dynamic
+    hostname`, fails `commit` / `commit check`. On the tolerant load /
+    peer-sync paths the same check is downgraded to a warning
+    (`lenientIPsecGatewayRefs`) so a config persisted by an older binary
+    or synced from a peer still boots.
+  - **Render belt** (`resolveRemoteAddr`, `policy.go`): for any path that
+    reaches render without passing local commit (HA sync / direct
+    construction), an unrenderable VPN is SKIPPED (logged via
+    `slog.Warn`) — its connection and secret are omitted — rather than
+    leaking the name or aborting the whole file. Healthy VPNs always
+    render, so one bad reference never zeroes healthy tunnels.
+  - **Rule-A limitation:** an inline gateway hostname must be dotted
+    (FQDN-like). A bare single-label inline hostname (e.g. `vpnpeer`,
+    even if resolvable via the system resolver) is rejected so a typo'd
+    single-label gateway name is caught. Migration: define a proper
+    gateway — `set security ike gateway <name> address <ip>` (or
+    `dynamic hostname <fqdn>`). The shared accept predicate is
+    `config.IsUsableIPsecEndpoint`.

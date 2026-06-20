@@ -64,6 +64,46 @@ func resolveESPSettings(cfg *config.IPsecConfig, vpn *config.IPsecVPN) (string, 
 			if prop, ok := cfg.Proposals[propRef]; ok {
 				return buildESPProposal(prop, pfsGroup), prop.LifetimeSeconds
 			}
+			// #2073: the IPsec policy resolves but its proposal reference
+			// does not. The commit-time strict validator
+			// (validateIPsecPolicyProposalReferencesStrict) hard-rejects
+			// this for new operator edits, so this branch is only reached
+			// on a tolerant-path boot of an already-persisted or
+			// peer-synced config (where the validator downgraded to a
+			// warning so the node still boots). Do NOT silently drop a
+			// configured perfect-forward-secrecy group by falling through
+			// to bare "default" (which has no modp term): carry the
+			// configured PFS group on a conservative fallback proposal so
+			// PFS is still negotiated. A non-AEAD (CBC) ESP transform
+			// requires an integrity algorithm, so the fallback includes
+			// both a cipher and integrity in addition to the modp term. The
+			// string is built directly with swanctl's canonical keyword
+			// spellings (aes256 / sha256 / modp<bits>) rather than via
+			// buildESPProposal: buildESPProposal's hmac-sha-256-128
+			// normalization emits the non-canonical "sha256128" token,
+			// which strongSwan's proposal parser does not recognize (its
+			// keyword table has only "sha256"/"sha2_256" for
+			// AUTH_HMAC_SHA2_256_128) and would reject the whole proposal.
+			// (The normal-path "sha256128" spelling is a separate
+			// pre-existing concern tracked outside #2073.)
+			//
+			// dhGroupBits maps MODP groups (1/2/5/14/15/16) to their bit
+			// size, so the fallback is a valid modp<bits> token for those.
+			// For the elliptic-curve groups 19/20 it returns 256/384, which
+			// yields modp256/modp384 — a strongSwan-invalid token. That ECP
+			// mis-spelling is a pre-existing, project-wide bug shared by
+			// buildESPProposal / buildIKEProposal on the normal path (they
+			// emit the same modp<bits> for ECP groups); this fallback
+			// inherits it rather than introducing it, and it is tracked as a
+			// separate follow-up outside #2073. MODP PFS groups — the common
+			// case — are preserved correctly.
+			if pfsGroup > 0 {
+				slog.Warn("ipsec policy references undefined proposal; "+
+					"preserving configured PFS group on fallback proposal",
+					"policy", vpn.IPsecPolicy, "proposal", propRef,
+					"pfs_group", pfsGroup)
+				return fmt.Sprintf("aes256-sha256-modp%d", dhGroupBits(pfsGroup)), 0
+			}
 		} else if prop, ok := cfg.Proposals[vpn.IPsecPolicy]; ok {
 			return buildESPProposal(prop, 0), prop.LifetimeSeconds
 		}
