@@ -2807,6 +2807,40 @@ func TestRouteFilterMalformedPrefixBelt(t *testing.T) {
 		}
 	})
 
+	// Bad ADDRESS with an in-range MASK must also be skipped. A mask-only
+	// check (Atoi on the mask) would pass these and emit an FRR-invalid
+	// line; the belt uses net.ParseCIDR (same as the commit validator) so
+	// the whole CIDR is validated, not just the mask.
+	t.Run("bad_octet_in_range_mask_emits_nothing", func(t *testing.T) {
+		for _, bad := range []string{
+			"999.999.999.999/24", // out-of-range v4 octets, valid mask
+			"10.0.0.0.0/8",       // five octets
+			"abcd/16",            // not an address at all
+		} {
+			got := New().generatePolicyOptions(rfPolicyOptions(
+				&config.RouteFilter{Prefix: bad, MatchType: "orlonger"}))
+			if strings.Contains(got, "permit "+bad) {
+				t.Errorf("bad-address prefix %q must emit no permit line, got:\n%s", bad, got)
+			}
+			if strings.Contains(got, "prefix-list p-t1") {
+				t.Errorf("lone bad-address prefix %q must emit no prefix-list/match line, got:\n%s", bad, got)
+			}
+		}
+	})
+
+	// A colon-bearing garbage token (the isV6 heuristic would treat it as
+	// v6) with an in-range mask must NOT slip through as an "ipv6
+	// prefix-list ... permit foo:bar/24" line. net.ParseCIDR rejects it.
+	t.Run("colon_garbage_emits_nothing", func(t *testing.T) {
+		for _, bad := range []string{"foo:bar/24", "1:2:3/30"} {
+			got := New().generatePolicyOptions(rfPolicyOptions(
+				&config.RouteFilter{Prefix: bad, MatchType: "orlonger"}))
+			if strings.Contains(got, "permit "+bad) {
+				t.Errorf("colon-garbage prefix %q must emit no permit line, got:\n%s", bad, got)
+			}
+		}
+	})
+
 	// A valid v6 prefix alongside a malformed v4-ish index-0 prefix:
 	// only the v6 entry is emitted, and the match line follows the
 	// emitted v6 family.

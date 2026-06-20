@@ -18,6 +18,7 @@ package frr
 
 import (
 	"fmt"
+	"net"
 	"sort"
 	"strconv"
 	"strings"
@@ -622,24 +623,20 @@ func (m *Manager) generatePolicyOptions(po *config.PolicyOptionsConfig) string {
 					// prefix belt below.
 					skipEntry := false
 					// #2105 render-side belt-and-suspenders: a malformed
-					// prefix (no "/", or a non-numeric / out-of-range mask)
-					// must never reach an FRR line. The commit-time
-					// keyValidator (schema_routing.go) rejects these, but
-					// the lenient-on-load path (Store.Load / SyncApply,
-					// #1960) can still feed a stored pre-gate garbage prefix
-					// to the renderer. The mask is range-checked against the
-					// PER-FAMILY max (32 for v4, 128 for v6), so a v4 /40 or
-					// /99 — which net.ParseCIDR rejects but a bare Atoi would
-					// pass — is also caught. A valid CIDR always has "/" + a
-					// numeric mask within the family max, so this never skips
-					// a valid v4/v6 prefix.
-					beltMax := 32
-					if isV6 {
-						beltMax = 128
-					}
-					if mp := strings.SplitN(rf.Prefix, "/", 2); len(mp) != 2 {
-						skipEntry = true
-					} else if plen, err := strconv.Atoi(mp[1]); err != nil || plen < 0 || plen > beltMax {
+					// prefix must NEVER reach an FRR line. The commit-time
+					// keyValidator (ValidateRouteFilterArg) rejects these on
+					// the strict path, but the lenient-on-load path
+					// (Store.Load / SyncApply, #1960) can still feed a stored
+					// pre-gate garbage prefix to the renderer. Use the SAME
+					// net.ParseCIDR check as the commit validator so the
+					// belt's coverage matches it exactly: this catches a bad
+					// address (999.999.999.999/24, foo:bar/24), a missing
+					// "/", a non-numeric mask, AND an out-of-family-range mask
+					// (a v4 /40 or /99, a v6 /200) — none of which a bare
+					// mask-only Atoi would catch. A valid CIDR (any v4/v6
+					// prefix the operator could legitimately configure) is
+					// never skipped.
+					if _, _, err := net.ParseCIDR(rf.Prefix); err != nil {
 						skipEntry = true
 					}
 					switch rf.MatchType {
