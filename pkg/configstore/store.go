@@ -527,7 +527,23 @@ func schemaValidateExpandedTreeForNode(tree *config.ConfigTree, nodeID int) erro
 	if tree == nil {
 		return nil
 	}
-	expanded := tree.Clone()
+	// #2008 H1: strip `inactive:` subtrees BEFORE group expansion so the
+	// schema/check path agrees with the compile path (strip -> expand ->
+	// validate; see compileConfigWithOpts in compiler.go). ExpandGroups
+	// (ast_groups.go) collects every `apply-groups` node by name WITHOUT
+	// checking Inactive, so without this an `inactive: apply-groups foo`
+	// would still expand group foo (false-validating inherited content the
+	// compiler will never apply) and an `inactive: apply-groups missing`
+	// would still fail commit-check as an undefined group. Stripping here —
+	// not only inside SchemaValidateWithDefinitions, which runs AFTER
+	// expansion — makes the marker actually deactivate group inheritance.
+	// WithoutInactive is a no-op (no clone) on the all-active path; the
+	// pre-strip tree is still passed as defsSource so a definition living
+	// only in an un-applied peer-node group keeps satisfying shared-section
+	// references (#1319 PR 3), with that defsSource stripped of inactive
+	// nodes inside SchemaValidateWithDefinitions.
+	stripped := tree.WithoutInactive()
+	expanded := stripped.Clone()
 	if nodeID >= 0 {
 		vars := map[string]string{"node": fmt.Sprintf("node%d", nodeID)}
 		if err := expanded.ExpandGroupsWithVars(vars); err != nil {
