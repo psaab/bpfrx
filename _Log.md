@@ -1,5 +1,25 @@
 # Action Log
 
+## 2026-06-20 — #2062 ssh sshd_config.d drop-in lifecycle
+
+- **Timestamp**: 2026-06-20
+- **Action**: #2062 — hardened the xpf-managed sshd drop-in lifecycle in
+  `Daemon.applySSHConfig`. Two pre-existing gaps fixed: (1) removing/emptying
+  the ssh stanza now REMOVES `/etc/ssh/sshd_config.d/xpf.conf` and reloads
+  sshd so it reverts to base-image defaults (was: early-return on nil/empty
+  left the stale drop-in enforcing old PermitRootLogin/KexAlgorithms); (2) a
+  `systemctl reload sshd` failure AFTER a successful write now reverts the
+  drop-in to its prior content (or removes it if there was none) and re-reloads
+  best-effort, so a bad config (e.g. invalid free-form key-exchange) never
+  persists to break the next sshd restart. Introduced an injectable FS+reload
+  seam (package vars `sshdConfPath`/`sshdReadFile`/`sshdWriteFile`/
+  `sshdRemoveFile`/`sshdMkdirAll`/`sshdReloadCmd`, mirroring the pkg/ra
+  `listenFn` seam) so the remove/revert side effects are unit-testable. Added 7
+  recorder-backed tests; the 4 covering the new behavior were verified to FAIL
+  against the pre-fix logic (seam kept, old body) — non-tautological.
+- **File(s)**: pkg/daemon/daemon_system.go, pkg/daemon/daemon_ssh_test.go,
+  docs/feature-gaps.md, _Log.md
+
 ## 2026-06-20 — #1387 Increment-2 (DDNS live RFC 2136 backend + loop + HA gate)
 
 - **Timestamp**: 2026-06-20
