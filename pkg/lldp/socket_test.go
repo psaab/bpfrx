@@ -18,9 +18,17 @@ import (
 // faithfully reproduces the AF_PACKET RX socket's blocking behaviour without
 // CAP_NET_RAW or a real interface. peerFD lets a test feed a frame to recv or
 // just sit idle to keep recv parked. The caller owns peerFD and must close it.
+//
+// SOCK_SEQPACKET (not SOCK_STREAM): the production RX socket is AF_PACKET
+// SOCK_RAW, a message-oriented datagram socket where one frame is one recv.
+// SEQPACKET preserves that one-write-one-read boundary (so a fed LLDP frame is
+// never split across two recv calls), while still being connection-oriented so
+// shutdown(SHUT_RDWR)+close on rxFD unblocks a parked reader exactly as the
+// close-to-unblock design relies on. SOCK_STREAM would not preserve boundaries
+// and could deliver a partial frame to rxLoop.
 func newSocketpairSession(t *testing.T, iface *net.Interface) (sess *ifSession, peerFD int) {
 	t.Helper()
-	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_STREAM, 0)
+	fds, err := unix.Socketpair(unix.AF_UNIX, unix.SOCK_SEQPACKET, 0)
 	if err != nil {
 		t.Fatalf("socketpair: %v", err)
 	}
