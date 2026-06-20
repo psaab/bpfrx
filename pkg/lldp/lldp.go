@@ -357,11 +357,23 @@ func (m *Manager) sendFrame(sess *ifSession, ttl int, sysName, sysDesc string) {
 	}
 }
 
+// rxErrorBackoff is how long rxLoop waits after an unexpected (non-transient,
+// non-shutdown) recv error before retrying. A persistent operational error
+// (e.g. an interface flapped down so recv keeps erroring) must not become a
+// tight busy-spin, but it also must not permanently kill the receiver — nothing
+// restarts rxLoop short of a daemon restart, because LLDP is Apply()'d once at
+// startup (daemon_run.go) and Stop()'d only at shutdown. A var so tests can
+// shrink it; production keeps the 1s default.
+var rxErrorBackoff = 1 * time.Second
+
 // rxLoop receives LLDP frames on the session's interface and updates the
 // neighbor table. The RX socket has no read timeout: recv blocks until a frame
-// arrives or Stop() closes the fd, at which point Recvfrom returns an error and
-// the loop exits. This makes Stop() return promptly instead of waiting out a
-// read timeout.
+// arrives or Stop() closes the fd. On Stop() the closed fd makes recv return an
+// error and, because the context is cancelled, the loop exits promptly without
+// waiting out a read timeout. On an UNEXPECTED recv error while the context is
+// still live (e.g. a transient interface flap), the loop backs off and retries
+// rather than terminating — it survives operational errors for the life of the
+// Apply() generation and exits only on shutdown.
 func (m *Manager) rxLoop(ctx context.Context, sess *ifSession) {
 	iface := sess.iface
 	buf := make([]byte, 1600)
@@ -374,20 +386,33 @@ func (m *Manager) rxLoop(ctx context.Context, sess *ifSession) {
 			// it can be masked); EAGAIN/EWOULDBLOCK is the spurious-wakeup case
 			// (the RX socket is blocking with no SO_RCVTIMEO, so this should not
 			// occur, but retrying is the only safe response if it ever does).
-			// Retry rather than silently terminating the RX loop.
+			// Retry immediately rather than terminating the RX loop.
 			if err == unix.EINTR || err == unix.EAGAIN || err == unix.EWOULDBLOCK {
 				continue
 			}
-			// recv was unblocked. If the context is cancelled, this is the
-			// expected close-to-unblock on Stop(); return. Otherwise it is an
-			// unexpected socket error (e.g. interface gone) — also return, since
-			// the fd is the session's only RX source and there is no timeout to
-			// retry against.
+			// recv was unblocked by something other than a transient error. If
+			// the context is cancelled, this is the expected close-to-unblock on
+			// Stop(): the fd is closed, return immediately.
 			if ctx.Err() != nil {
 				return
 			}
-			slog.Debug("LLDP RX: recv error, stopping", "interface", iface.Name, "err", err)
-			return
+			// Context is still live, so this is an unexpected operational error
+			// (e.g. the interface flapped down — ENETDOWN — or the link is
+			// briefly gone). The old timeout-poll loop survived these by
+			// continuing; the close-to-unblock redesign must NOT regress to
+			// permanently killing discovery, because nothing restarts rxLoop
+			// outside a daemon restart. Back off (so a persistent error does not
+			// become a tight busy-spin) and retry. The backoff is interruptible:
+			// a concurrent Stop() cancels ctx and we return promptly instead of
+			// sleeping out the delay.
+			slog.Debug("LLDP RX: transient recv error, backing off then retrying",
+				"interface", iface.Name, "err", err, "backoff", rxErrorBackoff)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(rxErrorBackoff):
+			}
+			continue
 		}
 		if n < ethHdrLen {
 			continue

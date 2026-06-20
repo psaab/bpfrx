@@ -36,12 +36,20 @@ Standard library + `golang.org/x/sys/unix`. No internal `pkg/*` imports.
   read-timeout tail from shutdown. Ordering is load-bearing:
   cancel → close fds → `wg.Wait()` (never wait before closing).
 - `rxLoop` treats `EINTR`/`EAGAIN`/`EWOULDBLOCK` from `Recvfrom` as
-  transient and retries — a signal forwarded through the Go runtime must
-  not silently terminate neighbor discovery on a long-running daemon. Any
-  other recv error exits the loop: if the context is cancelled it is the
-  expected `Stop()` close-to-unblock; otherwise it is an unrecoverable
-  socket error (e.g. the interface went away) with no timeout to retry
-  against.
+  transient and retries immediately — a signal forwarded through the Go
+  runtime must not silently terminate neighbor discovery on a long-running
+  daemon. On any **other** recv error it distinguishes shutdown from an
+  operational fault: if the context is cancelled it is the expected
+  `Stop()` close-to-unblock and the loop returns; otherwise (the context
+  is still live, e.g. the interface flapped down — `ENETDOWN`) the loop
+  **backs off `rxErrorBackoff` (1s) and retries** rather than exiting.
+  Nothing restarts `rxLoop` short of a daemon restart — LLDP is `Apply()`'d
+  once at startup — so a permanent exit on a transient flap would silently
+  kill neighbor discovery for the life of the process (the pre-`#2040`
+  behavior; the old timeout-poll loop survived flaps by continuing). The
+  backoff is interruptible: a concurrent `Stop()` cancels the context and
+  the loop returns promptly instead of sleeping out the delay, and the
+  closed fd makes any parked `Recvfrom` return so `Stop()` stays bounded.
 - The TX socket is opened once per interface in `newIfSession` and reused
   for every periodic advertisement (was previously opened+closed per
   frame).

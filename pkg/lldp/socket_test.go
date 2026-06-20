@@ -246,6 +246,127 @@ func TestRxLoopRetriesTransientRecvErrors(t *testing.T) {
 	}
 }
 
+// TestRxLoopSurvivesNonTransientRecvError is the regression test for the #2040
+// MAJOR: an UNEXPECTED recv error (not EINTR/EAGAIN, and ctx still live — e.g.
+// ENETDOWN from a flapped interface) must NOT permanently kill the RX loop.
+// Nothing restarts rxLoop short of a daemon restart (LLDP is Apply()'d once at
+// startup), so a pre-fix `return` on such an error silently ends neighbor
+// discovery for the life of the process. The fix backs off and retries.
+//
+// Non-tautological: step 1 returns ENETDOWN with the context live; the real
+// frame is only delivered on step 2. If rxLoop returned on the ENETDOWN (the
+// pre-fix behavior), the loop would exit before step 2 and no neighbor would
+// ever appear, failing the assertion.
+func TestRxLoopSurvivesNonTransientRecvError(t *testing.T) {
+	// Shrink the backoff so the retry happens within the test's poll window
+	// instead of the 1s production default.
+	prevBackoff := rxErrorBackoff
+	rxErrorBackoff = 1 * time.Millisecond
+	t.Cleanup(func() { rxErrorBackoff = prevBackoff })
+
+	frame, err := BuildFrame(net.HardwareAddr{0x02, 0, 0, 0, 0, 1}, "test0", 120, "peer-node", "")
+	if err != nil {
+		t.Fatalf("BuildFrame: %v", err)
+	}
+	if len(frame) <= ethHdrLen {
+		t.Fatalf("frame too short: %d bytes", len(frame))
+	}
+
+	gate := make(chan struct{})
+	var step int32
+	sess := &ifSession{
+		iface: &net.Interface{Name: "test0", Index: 1},
+		recvFn: func(buf []byte) (int, error) {
+			switch atomic.AddInt32(&step, 1) {
+			case 1:
+				// Non-transient operational error with ctx live: the loop must
+				// back off and retry, NOT exit.
+				return 0, unix.ENETDOWN
+			case 2:
+				return copy(buf, frame), nil // the one real frame, post-recovery
+			default:
+				// Park until ctx is cancelled, then report a fatal error so
+				// rxLoop takes the cancel-exit path.
+				<-gate
+				return 0, unix.EBADF
+			}
+		},
+	}
+
+	m := New()
+	ctx, cancel := context.WithCancel(context.Background())
+	loopDone := make(chan struct{})
+	go func() {
+		m.rxLoop(ctx, sess)
+		close(loopDone)
+	}()
+
+	// The neighbor only appears if rxLoop survived the ENETDOWN by backing off
+	// and retrying into step 2.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(m.Neighbors()) > 0 {
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	if got := len(m.Neighbors()); got != 1 {
+		t.Fatalf("rxLoop did not survive a non-transient recv error: want 1 neighbor, got %d "+
+			"(it exited on ENETDOWN instead of backing off and retrying)", got)
+	}
+
+	// Cancellation must still terminate the loop promptly, including when the
+	// loop is parked in recv (not in the backoff).
+	cancel()
+	close(gate)
+	select {
+	case <-loopDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("rxLoop did not exit after ctx cancellation")
+	}
+}
+
+// TestRxLoopBackoffInterruptedByCancel proves the backoff sleep itself is
+// interruptible: if Stop() cancels the context while rxLoop is sleeping out the
+// post-error backoff, the loop returns promptly rather than waiting out the
+// delay. Uses a long backoff so a non-interruptible sleep would blow the
+// deadline.
+func TestRxLoopBackoffInterruptedByCancel(t *testing.T) {
+	prevBackoff := rxErrorBackoff
+	rxErrorBackoff = 30 * time.Second // long enough that a blocking sleep fails the test
+	t.Cleanup(func() { rxErrorBackoff = prevBackoff })
+
+	entered := make(chan struct{})
+	var once sync.Once
+	sess := &ifSession{
+		iface: &net.Interface{Name: "test0", Index: 1},
+		recvFn: func(buf []byte) (int, error) {
+			// Signal once that we have entered recv and are about to return the
+			// non-transient error that drives rxLoop into the backoff select.
+			once.Do(func() { close(entered) })
+			return 0, unix.ENETDOWN
+		},
+	}
+
+	m := New()
+	ctx, cancel := context.WithCancel(context.Background())
+	loopDone := make(chan struct{})
+	go func() {
+		m.rxLoop(ctx, sess)
+		close(loopDone)
+	}()
+
+	<-entered
+	// Give rxLoop a moment to reach the backoff select, then cancel.
+	time.Sleep(10 * time.Millisecond)
+	cancel()
+	select {
+	case <-loopDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("rxLoop did not exit during the backoff after ctx cancellation (backoff not interruptible)")
+	}
+}
+
 // TestApplySkipsInterfaceOnSocketError verifies that a session construction
 // failure (e.g. CAP_NET_RAW missing) is surfaced at Apply time by skipping the
 // interface, and that Stop() afterwards is still a clean no-op.
