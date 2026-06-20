@@ -1,7 +1,8 @@
 # #2071 — IPv6 prefix-list rendered with the IPv4 `match ip address` matcher
 
-**Status:** DRAFT v2 — mixed-list design corrected after round-1 review
-(reviewer A PLAN-NEEDS-MAJOR: dual-emit-in-one-sequence is FRR-broken)
+**Status:** DRAFT v3 — scoped to mirror the route-filter precedent exactly
+after round-2 review (two-sequence machinery collided with co-resident
+route-filters; reverted to a single family-chosen matcher)
 
 ## Issue framing
 
@@ -66,10 +67,10 @@ unconditional emit with a family-aware emit.
 Determine the family by inspecting the referenced prefix-list's entries.
 A prefix-list may hold v4 entries, v6 entries, or both (mixed).
 
-### FRR route-map AND semantics (round-1 correction)
+### FRR route-map AND semantics (round-1 finding — why "both in one sequence" is wrong)
 
-Round-1 reviewer A correctly refuted v1's "emit both matchers in one
-sequence" design. Verified against FRR master source:
+Round-1 reviewer A refuted v1's "emit both matchers in one sequence"
+design. Verified against FRR master source:
 
 - `lib/routemap.c` `route_map_apply_match` combines match clauses within
   a single route-map index with **AND** semantics — the truth table is
@@ -80,69 +81,85 @@ sequence" design. Verified against FRR master source:
   `RMAP_NOMATCH` (never `RMAP_NOOP`) both when the named list is absent in
   that AFI namespace AND when the prefix fails a present list.
 
-The definition render (lines 535-540) splits a mixed Junos list into BOTH
-a populated `ip prefix-list X` and a populated `ipv6 prefix-list X`.
-Therefore, if v1 emitted `match ip address X` and `match ipv6 address X`
-in the SAME route-map sequence, a v4 route would MATCH the v4 clause but
-NOMATCH the (populated) v6 clause → index NOMATCH → the route is
-**silently denied**, and symmetrically for v6 routes. That is strictly
-worse than today (today, mixed-list v4 routes at least work). The
-dual-emit-in-one-sequence design is therefore rejected.
+So two `match ip|ipv6 address prefix-list` clauses must never coexist in
+one route-map index — one of them will always NOMATCH a given route and
+AND the index to a silent deny.
 
-### Corrected design
+### Round-2 finding — why the two-sequence machinery is also wrong here
 
-The two address families must never be AND-ed in one index. Render rule:
+v2 tried to express a mixed list as TWO consecutive route-map sequences
+(a v4 sequence and a v6 sequence) each carrying the full term body.
+Round-2 reviewers A and B both found this collides with a co-resident
+route-filter: a term may carry BOTH `from route-filter` and
+`from prefix-list` (independent Junos `from` clauses; the compiler
+populates `term.RouteFilters` and `term.PrefixList` independently —
+`compiler_routing.go`). The route-filter emits its OWN
+`match ip|ipv6 address prefix-list NAME-TERM` clause whose family is fixed
+from `RouteFilters[0].Prefix`. Duplicating the full term body into both
+split sequences puts a v4 route-filter `match` clause into the v6
+sequence → a v6 route AND-NOMATCHes → the round-1 silent-deny bug,
+relocated. The two-sequence design also re-emits the route-filter's inline
+prefix-list *definition* lines twice. Rejected.
 
-- **Single-family list** (all v4, or all v6 — the common case and the
-  exact #2071 report): emit the one family-correct matcher in the term's
-  single sequence. This is the uncontested, correct fix.
-- **Mixed list:** emit the term as **two consecutive route-map
-  sequences** — an IPv4 sequence carrying `match ip address` and an IPv6
-  sequence carrying `match ipv6 address` — each carrying the term's other
-  match clauses and `then` set-actions. FRR evaluates sequences in order
-  and falls through on NOMATCH, so a v4 route NOMATCHes the v6 sequence
-  and is caught by the v4 sequence (and vice versa). This is the FRR-idiomatic
-  way to express "match if the route is in the v4 list OR the v6 list"
-  for an AF-agnostic Junos term.
-- **Unknown / empty list** (name absent from `po.PrefixLists`, or no
-  entries): default to the IPv4 matcher in the single sequence — the
-  pre-fix rendering, so no regression. (Note: FRR itself NOMATCHes an
-  undefined list regardless of the v4/v6 keyword, so the default is
-  cosmetic for the miss case; v4 is chosen only to preserve byte-identical
-  output for existing v4-only configs that reference a list.)
+### v3 design — mirror the route-filter precedent exactly
 
-Implementation: factor the term body (the route-filter block, the
-prefix-list match line, `match source-protocol`, `match community`,
-`match as-path`, the `then` set-actions, and the trailing `exit`) into a
-helper `func renderPolicyTermBody(b, term, prefixListMatch string)` so
-the only thing that varies between the v4 and v6 sequences is the
-prefix-list match line. The route-map loop then becomes:
+The issue and the parent directive both say to "branch the PrefixList
+render path on address family **exactly like the adjacent route-filter
+path**." The route-filter path (lines 629-633) emits exactly ONE matcher,
+chosen by family, and makes a deliberate homogeneous-family assumption
+(it inspects only `RouteFilters[0].Prefix`). v3 mirrors that precisely:
+
+- Look up `po.PrefixLists[term.PrefixList]`. If ANY entry is IPv6
+  (`strings.Contains(p, ":")`), emit `match ipv6 address prefix-list X`;
+  otherwise emit `match ip address prefix-list X`. Exactly ONE matcher,
+  in the term's single sequence, in the same position as today.
 
 ```go
-v4, v6 := prefixListFamilies(po, term.PrefixList) // (hasV4, hasV6)
-switch {
-case term.PrefixList == "":
-    emit one sequence, prefixListMatch = ""
-case v4 && v6:
-    // mixed: two sequences
-    emit sequence @ seq   with "match ip address prefix-list X"
-    seq += 10
-    emit sequence @ seq   with "match ipv6 address prefix-list X"
-case v6 && !v4:
-    emit one sequence with "match ipv6 address prefix-list X"
-default: // v4-only, or unknown/empty (default v4)
-    emit one sequence with "match ip address prefix-list X"
+if term.PrefixList != "" {
+    matchKW := "ip"
+    if pl := po.PrefixLists[term.PrefixList]; pl != nil {
+        for _, p := range pl.Prefixes {
+            if strings.Contains(p, ":") {
+                matchKW = "ipv6"
+                break
+            }
+        }
+    }
+    fmt.Fprintf(&b, " match %s address prefix-list %s\n", matchKW, term.PrefixList)
 }
-seq += 10
 ```
 
-`prefixListFamilies` classifies each entry with the SAME
-`strings.Contains(p, ":")` test the definition render uses, guaranteeing
-the match clause and the prefix-list namespace can never disagree.
+This is ~8 lines, no helper extraction, no term-body duplication, no
+sequence renumbering, and therefore **no interaction with co-resident
+route-filters, set-actions, or other match clauses** — the change is
+strictly local to the single match line that #2071 reports.
 
-The mixed case is rare but real (Junos `from prefix-list` is
-AF-agnostic and a list may hold both families); handling it correctly
-rather than producing a silent-deny is worth the small helper extraction.
+- **v6 list** (the #2071 report): now correctly emits `match ipv6 address`.
+- **v4-only list:** byte-identical to master (`match ip address`).
+- **unknown / empty list** (name absent from `po.PrefixLists`, or no
+  entries): `pl` is nil or has no entries → loop sets nothing → default
+  `match ip address` — byte-identical to master. (FRR NOMATCHes an
+  undefined list regardless of the keyword, so the default is cosmetic for
+  the miss case; v4 preserves byte-identity for existing configs.)
+- **mixed list** (a genuinely rare config — `from prefix-list` of a list
+  holding both families): picks `ipv6` (any v6 entry wins). This is the
+  SAME homogeneous-family limitation the route-filter path already has, no
+  better and no worse, and it strictly improves the reported failure
+  (a v6 list referenced in a v6 context now matches). A fully correct
+  mixed-list render cannot be expressed in one route-map index (FRR AND)
+  and is out of scope — see Out of scope; the route-filter path shares
+  this limitation and is the cited precedent.
+
+### Why "any v6 entry → ipv6" rather than "first entry's family"
+
+The route-filter precedent keys on `RouteFilters[0].Prefix` (first entry).
+v3 keys on "any v6 entry" so that a list whose first entry happens to be
+v4 but which the operator intends as a v6 filter (e.g. listed v4 then v6)
+still gets the v6 matcher — directly serving the reported bug. For a
+homogeneous list (the overwhelming common case) the two rules are
+identical. The difference only shows for a mixed list, where neither rule
+is fully correct (FRR limitation) and "any v6 wins" is the choice that
+makes the reported v6 case work.
 
 ### Why look up the list instead of carrying family on the term
 
@@ -154,13 +171,10 @@ signature change is needed.
 
 ### Ordering
 
-For a single-family or unknown list the match clause is emitted in the
-same position as the current single line (between the route-filter block
-and the `match source-protocol` lines) — output is byte-identical to
-v1-of-master for v4-only configs. For a mixed list, the v4 sequence is
-emitted at the term's seq, the v6 sequence at seq+10 (deterministic),
-shifting later terms' seq numbers by one step — a cosmetic numbering
-change with no semantic effect (FRR seq numbers only order evaluation).
+The single match clause is emitted in exactly the same position as the
+current single line (between the route-filter block and the
+`match source-protocol` lines). No clause moves; no seq renumbering. For
+v4-only and unknown/empty lists the output is byte-identical to master.
 
 ## Public API preservation
 
@@ -170,24 +184,25 @@ touched. No config schema, AST, or compiler change.
 
 ## Hidden invariants the change must preserve
 
-- **Output ordering / byte-identity for v4-only configs:** a term that
+- **Byte-identity for v4-only and unknown/empty configs:** a term that
   references a v4-only (or unknown/empty) prefix-list renders byte-identically
-  to master — same single `match ip address` line in the same position,
-  same seq numbering. Verified against the two existing tests
-  (`internal`, `trusted-nets`, both v4-only) which must still pass
-  unchanged.
-- **Term body equivalence across split:** the extracted
-  `renderPolicyTermBody` must emit exactly the same clauses (route-filter
-  block, source-protocol/community/as-path matches, all `then`
-  set-actions, trailing `exit`) it does today — only the prefix-list match
-  line is parameterized. A mixed-list split therefore duplicates the full
-  term semantics into both sequences (AND-ed per sequence, OR-ed across
-  the two sequences) — correct for an AF-agnostic term.
+  to master — the same single `match ip address` line in the same
+  position, same seq numbering. The new v4-only render test asserts the
+  exact line directly (the two existing tests `internal`/`trusted-nets`
+  assert only the `redistribute route-map` line, NOT the match line, so
+  they do not by themselves guarantee byte-identity — round-2 reviewer A's
+  MAJOR-2; the new test closes that gap).
+- **Single match line only:** exactly one `match ... address prefix-list`
+  line per `from prefix-list`, in the term's single sequence. No term-body
+  duplication, no second route-map sequence, no seq renumbering — so NO
+  interaction with co-resident route-filters, set-actions, or other match
+  clauses (round-2 MAJOR-1 / F1 eliminated by construction).
 - **No AND of v4 and v6 prefix-list matchers in one index** — the round-1
-  defect. The two matchers only ever appear in separate sequences.
-- **Determinism:** `pl.Prefixes` is iterated only to compute two booleans;
-  iteration order does not affect output. FRR config generation is sorted
-  by policy-statement name upstream.
+  defect; v3 emits only one matcher, so it cannot occur.
+- **Determinism:** `pl.Prefixes` is scanned only to pick one keyword;
+  the `break` on the first v6 entry makes it order-independent for the
+  v4/v6 decision (any v6 entry → ipv6). FRR config generation is sorted by
+  policy-statement name upstream.
 - **No nil deref:** `po` is non-nil at this site (the function
   dereferences `po.PrefixLists`, `po.Communities`, etc. unconditionally
   above). The map index returns nil for a missing key (and indexing even a
@@ -197,10 +212,10 @@ touched. No config schema, AST, or compiler change.
 
 | Class | Level | Notes |
 |---|---|---|
-| Behavioral regression | LOW | v4-only and unknown/empty lists render byte-identically; only v6 (now correct) and mixed (now two-sequence, was broken) change |
-| Lifetime / borrow-checker | N/A | Go, no borrow checker; the helper extraction is pure code motion |
-| Performance regression | NONE | Control-plane render at commit time; one map lookup + slice scan per term |
-| Architectural mismatch (#961 / #946-P2) | NONE | Single-family path mirrors the route-filter family branch; mixed path is the FRR-idiomatic two-sequence OR |
+| Behavioral regression | LOW | v4-only and unknown/empty lists render byte-identically; only v6 lists change (from broken→correct); mixed lists pick ipv6, same homogeneous-family limitation the route-filter precedent already has |
+| Lifetime / borrow-checker | N/A | Go, no borrow checker; no allocation beyond one stack string |
+| Performance regression | NONE | Control-plane render at commit time; one map lookup + early-exit slice scan per term |
+| Architectural mismatch (#961 / #946-P2) | NONE | Mirrors the adjacent route-filter family branch exactly; no new abstraction, no helper extraction |
 
 ## Test plan
 
@@ -211,29 +226,43 @@ cluster deploy, no iperf3. Coverage is a Go unit test in `pkg/frr`.
 2. New render unit tests (white-box `package frr`, matching the existing
    `pkg/frr` test convention):
    - **v4 prefix-list** referenced by `from prefix-list` → output
-     contains `match ip address prefix-list <name>` and does NOT contain
-     `match ipv6 address prefix-list <name>`; ONE route-map sequence.
+     contains the exact line `match ip address prefix-list <name>` and does
+     NOT contain `match ipv6 address prefix-list <name>`. This directly
+     asserts the v4 byte-identity that the existing tests do not (round-2
+     MAJOR-2).
    - **v6 prefix-list** referenced by `from prefix-list` → output
      contains `match ipv6 address prefix-list <name>` and does NOT
-     contain `match ip address prefix-list <name>`; ONE sequence.
-   - **mixed prefix-list** → output contains `match ip address` in one
-     route-map sequence and `match ipv6 address` in a SEPARATE sequence
-     (assert TWO `route-map <name> ...` headers and that the two matchers
-     are NOT in the same sequence body). This asserts the SAFE shape, not
-     "both lines present somewhere" — guarding against the round-1 defect.
+     contain `match ip address prefix-list <name>`.
+   - **mixed prefix-list** → output picks `match ipv6 address` (any v6
+     entry wins) and emits exactly ONE such match line (assert it does NOT
+     contain `match ip address prefix-list <name>` and that there is a
+     single route-map sequence for the term — no second sequence). This
+     locks in the v3 single-matcher behavior and guards against any
+     regression to the rejected v1 dual-emit or v2 two-sequence designs.
+   - **prefix-list co-resident with a v4 route-filter, mixed list** → a
+     term with both a v4 `from route-filter` and a mixed `from prefix-list`
+     renders the route-filter's `match ip address ...-<term>` clause AND
+     the prefix-list's `match ipv6 address prefix-list <name>` clause in
+     the term's single sequence, with the route-filter inline definition
+     emitted exactly once. (This documents the accepted homogeneous-family
+     limitation and confirms no term-body duplication — round-2 F1.)
    - **unknown prefix-list name** (not in `po.PrefixLists`) → falls back
      to `match ip address`, one sequence (no panic, no regression).
-   Each assertion is non-tautological: the v6 case FAILS against pre-fix
-   code (which emits `match ip address`); the mixed case FAILS against
-   both pre-fix code AND the rejected v1 dual-emit-in-one-sequence design.
+   Non-tautology: the v6 and mixed cases FAIL against pre-fix code (which
+   emits `match ip address`).
 3. An **end-to-end flat-set test** honoring the CLAUDE.md rule
-   (`ParseSetCommand` + `tree.SetPath` loop, NOT `NewParser`): feed
+   (`ParseSetCommand` + `tree.SetPath` loop, NOT `NewParser`). The test
+   lives in `package frr` (it calls the unexported `generatePolicyOptions`)
+   and therefore inlines its own `ParseSetCommand`+`SetPath`+`CompileConfig`
+   loop using the exported `config` APIs — it CANNOT reuse the
+   `package config` `buildTree` helper (round-2 F2). Feed
    `set policy-options prefix-list v6nets 2001:db8::/32`,
    `set policy-options policy-statement p term t1 from prefix-list v6nets`,
-   `... then accept`, compile with `CompileConfig`, render via
-   `generatePolicyOptions(&cfg.PolicyOptions)` (note: `PolicyOptions` is a
-   value field, so pass its address), assert `match ipv6 address`. This
-   proves the family propagates compiler→render.
+   `set policy-options policy-statement p term t1 then accept`, compile with
+   `config.CompileConfig`, render via `m.generatePolicyOptions(&cfg.PolicyOptions)`
+   (note: `PolicyOptions` is a value field, so pass its address — round-2
+   B Minor-1), assert `match ipv6 address`. Proves the family propagates
+   compiler→render.
 4. `go test ./pkg/frr/... ./pkg/config/...` green.
 5. Named new test 5x for flake stability.
 6. Full `go test ./...` green (30 Go packages).
@@ -241,58 +270,83 @@ cluster deploy, no iperf3. Coverage is a Go unit test in `pkg/frr`.
 **Docs:** `pkg/frr/README.md` describes `generatePolicyOptions`'
 responsibilities at a high level but does not document per-clause
 match-family rendering, so it stays accurate and needs no change — noted
-here per the CLAUDE.md docs-contract rule.
+here per the CLAUDE.md docs-contract rule (round-2 both reviewers
+confirmed no doc under `docs/` documents render-family behavior either).
 
 ## Out of scope (explicitly)
 
-- The route-filter path's homogeneous-family assumption (it inspects only
-  `RouteFilters[0].Prefix`). That is a pre-existing, separate behavior and
-  not what #2071 reports. Not touched.
+- **Fully-correct mixed-family prefix-list rendering.** A prefix-list
+  holding BOTH v4 and v6 entries, referenced by an AF-agnostic
+  `from prefix-list`, cannot be expressed as a single FRR route-map index
+  (two `match ... address` clauses would AND to a silent deny), and the
+  two-sequence workaround collides with co-resident route-filters (round-2
+  MAJOR-1). v3 picks the v6 matcher for a mixed list (making the reported
+  v6 case work) and accepts the same homogeneous-family limitation the
+  adjacent route-filter path already has. A complete mixed-family fix
+  (e.g. commit-time validation/warning, or a route-map redesign) is a
+  separate, larger effort — file a follow-up if a real mixed-list config
+  appears.
+- The route-filter path's own homogeneous-family assumption (it inspects
+  only `RouteFilters[0].Prefix`). Pre-existing; not what #2071 reports.
+  Not touched.
 - Any change to how prefix-lists are *defined* in FRR (lines 535-540) —
   already family-correct.
 - BGP address-family-aware route-map *attachment* (which `address-family`
   block a route-map is referenced under). Out of scope; the bug is the
   match clause, not the attachment.
 
-## Round-1 review resolution
+## Review resolution log
 
-- **Reviewer A — PLAN-NEEDS-MAJOR (mixed-list dual-emit-in-one-sequence is
-  FRR-broken).** ACCEPTED. Verified against FRR master source
-  (`lib/routemap.c` AND truth-table + no AF pre-filter in the match loop;
-  `bgpd/bgp_routemap.c route_match_address_prefix_list` returns NOMATCH on
-  off-family). v2 replaces dual-emit with the single-family matcher for
-  homogeneous lists and a **two-sequence OR** for mixed lists, and the
-  mixed test now asserts the two matchers are in SEPARATE sequences.
-- **Reviewer B — PLAN-READY w/ 2 minors.** Minor-1 (`&cfg.PolicyOptions`
-  pointer in the end-to-end test) FOLDED into the test plan. Minor-2 (docs
-  note) FOLDED — `pkg/frr/README.md` needs no change, stated explicitly.
-  B's heuristic-consistency verification (the fix's `strings.Contains(":")`
-  is byte-identical to the definition render at line 536, so the match
-  clause and namespace can never disagree) is retained as a load-bearing
-  correctness argument.
+**Round 1:**
+- Reviewer A — PLAN-NEEDS-MAJOR: v1's "emit both matchers in one sequence"
+  is FRR-broken. ACCEPTED, verified against FRR master source.
+- Reviewer B — PLAN-READY w/ 2 minors (`&cfg.PolicyOptions` pointer; docs
+  note). Both folded.
 
-## Open questions for adversarial review (round 2)
+**Round 2 (on the v2 two-sequence design):**
+- Reviewer A — PLAN-NEEDS-MAJOR: (MAJOR-1) the two-sequence split puts a
+  v4 route-filter `match` clause into the v6 sequence for a term carrying
+  BOTH a route-filter and a mixed prefix-list → relocated silent-deny;
+  (MAJOR-2) the byte-identity claim leaned on existing tests that do not
+  assert the `term.PrefixList` match line.
+- Reviewer B — PLAN-NEEDS-MINOR: (F1) the route-filter inline *definition*
+  lines get emitted twice under the split; (F2) the e2e test must live in
+  `package frr` and inline its own ParseSetCommand loop (can't reuse
+  `config.buildTree`); (F5) promote the reject-term OR-correctness to
+  resolved text.
 
-1. **Two-sequence mixed-list emit:** is splitting a mixed-list term into a
-   v4 sequence and a v6 sequence (each carrying the full term body, OR-ed
-   by fall-through) semantically correct for both `permit` and `reject`
-   terms? For a `reject` term, does the off-family sequence falling
-   through (rather than denying) ever change the policy outcome vs. a
-   single AF-agnostic Junos term? Challenge the OR-of-two-sequences model.
-2. **Term-body duplication side-effects:** does emitting the `then`
-   set-actions (next-hop, local-pref, metric, community, origin) twice —
-   once per sequence — cause any double-apply hazard, or is it inert
-   because only one sequence ever matches a given route?
-3. **Lookup-miss default to v4:** still the right no-regression choice
+**v3 resolution — ACCEPTED ALL, by simplification:** rather than keep the
+two-sequence machinery and patch its route-filter interactions, v3 drops
+it entirely and mirrors the route-filter precedent exactly — ONE match
+clause, family chosen by the referenced list (any v6 entry → ipv6). This
+eliminates MAJOR-1, F1, and the F2 helper-extraction complexity by
+construction (no body duplication, no second sequence). MAJOR-2 is closed
+by the new v4-only test that asserts the exact `match ip address` line.
+F2's e2e-test-package guidance is folded into the test plan. The mixed
+case is explicitly scoped to the route-filter-equivalent homogeneous-family
+limitation (Out of scope).
+
+## Open questions for adversarial review (round 3 — on the v3 single-matcher design)
+
+1. **Single-matcher correctness:** for a homogeneous list, is one
+   family-chosen `match ... address prefix-list` the complete and correct
+   fix (it is what the route-filter precedent does)? Any case where one
+   matcher is insufficient for a homogeneous list?
+2. **"Any v6 entry → ipv6" vs route-filter's "first entry":** is keying on
+   any-v6 (rather than first-entry family, as the route-filter path does)
+   a defensible deviation, or should v3 match the precedent's first-entry
+   rule byte-for-byte? (They differ only for mixed lists.)
+3. **Mixed-list scoping:** is accepting the route-filter-equivalent
+   homogeneous-family limitation (mixed → ipv6, document as out-of-scope)
+   the right call, or must #2071 also solve mixed lists? (Claim: a single
+   FRR route-map index cannot express a mixed match without a silent-deny;
+   solving it is a separate larger effort.)
+4. **Lookup-miss default to v4:** still the right no-regression choice
    given FRR NOMATCHes an undefined list regardless of keyword?
-4. **Seq renumbering:** the mixed case shifts later terms' seq numbers by
-   +10. Any concern for config-diff churn or FRR reload behavior? (Claim:
-   seq numbers only order evaluation; cosmetic.)
-5. **Should mixed lists instead be rejected/warned at commit time** rather
-   than rendered as two sequences? (Claim: two-sequence render preserves
-   the operator's intent without a new failure mode; commit-time refusal
-   would break configs that work today for v4.)
-6. **Test adequacy:** does the mixed test assert the SAFE two-sequence
-   shape (not merely "both lines present")? Does it prove non-tautology
-   against BOTH pre-fix code and the rejected v1 design? Is the end-to-end
-   flat-set test redundant or load-bearing?
+5. **Byte-identity:** does the v4-only test assert the exact unchanged line
+   (closing round-2 MAJOR-2), and is the v3 render provably identical to
+   master for all v4-only / unknown / empty configs?
+6. **Test adequacy / non-tautology:** do the v6 and mixed tests FAIL
+   against pre-fix code? Does the co-resident-route-filter test confirm no
+   term-body duplication and a single match clause? Is the end-to-end
+   flat-set test correctly placed in `package frr`?
