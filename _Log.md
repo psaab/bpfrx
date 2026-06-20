@@ -329,6 +329,40 @@
   still emitted — fails against the bump-then-unlock gap). Mutation-verified
   both fail against the respective pre-fix code.
 - **File(s)**: pkg/ra/serialize_test.go, _Log.md
+## 2026-06-19 — #1387 DDNS PR #2043 review: fix four MAJORs + one MINOR
+
+- **Timestamp**: 2026-06-19
+- **Action**: Address Codex's four MAJOR findings + one MINOR on the
+  #1387 DHCP DDNS increment-1 PR. (M1) Enforce zone-suffix containment
+  in `finalizeFQDN`: a client-offered dotted name that is not within the
+  configured domain is relabeled to `<first-label>.<domain>` (no domain
+  -> first label only), so a client can never publish outside the
+  configured zone (escape vectors: foreign TLD, trailing dot, double
+  dot, deep foreign subtree). (M2) Make a nil `DNSUpdater` a logged
+  `nopUpdater` (the increment-1 default — live backend deferred) instead
+  of a nil-pointer panic on first publish/withdraw; a no-op upsert does
+  NOT record phantom ownership, and a new `skippedNoBackend` counter
+  surfaces the no-op activity. (M3) Fix the Kea lease parser so an
+  active row reclaims an address that an earlier inactive/expired row
+  tombstoned (last-row-wins now lets active supersede a prior tombstone
+  and re-enter output order via an `inOrder` set; this also removed a
+  pre-fix duplicate-in-order bug). (M4) Make `Reconcile` fail-safe on a
+  lease-CSV parse error: the failing family is marked untrusted and its
+  destructive diff (deletes) is SKIPPED that cycle so a transient
+  malformed CSV can never mass-delete that family's owned records; the
+  parse error is surfaced to the caller. (m5) Reword the `backend`
+  schema help + type doc to say the value is parsed/validated but the
+  live updater is deferred, and emit a commit-time warning
+  (`validateDDNSDeferredBackendWarnings`) when DDNS is enabled (stronger
+  when an update-server / TSIG is configured). Six new
+  non-tautological tests (each proven to fail/panic against pre-fix
+  code). README + schema/type docs updated.
+- **File(s)**: pkg/dhcpserver/ddns_hostname.go,
+  pkg/dhcpserver/ddns_dns.go, pkg/dhcpserver/ddns.go,
+  pkg/dhcpserver/ddns_leases.go, pkg/dhcpserver/ddns_test.go,
+  pkg/dhcpserver/README.md, pkg/config/compiler.go,
+  pkg/config/schema_system.go, pkg/config/types_system.go,
+  pkg/config/compiler_dhcp_ddns_test.go, _Log.md
 
 ## 2026-06-20 — #2034 RA link-local review follow-up (regression test)
 

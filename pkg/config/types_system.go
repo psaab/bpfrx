@@ -713,9 +713,11 @@ type DHCPDynamicDNSConfig struct {
 	// (default — only replace records this firewall owns per the state
 	// store), skip-existing, or strict-fail.
 	ConflictPolicy string
-	// Backend selects the DNS-update mechanism. Increment 1 implements
-	// only "rfc2136"; "kea-d2" is a reserved enum value for a later
-	// increment (Kea D2 is not in the image — bake.py). Default rfc2136.
+	// Backend selects the DNS-update mechanism. The value is PARSED and
+	// VALIDATED in this increment, but the live updater is DEFERRED to a
+	// later increment — nothing is published to DNS yet regardless of the
+	// backend chosen. "rfc2136" is the default; "kea-d2" is a reserved enum
+	// value for a later increment (Kea D2 is not in the image — bake.py).
 	Backend string
 	// UpdateServer is the RFC 2136 target authoritative DNS, host or
 	// host:port (Path A / rfc2136 backend). Not consumed by the live

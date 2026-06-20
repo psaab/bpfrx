@@ -76,13 +76,28 @@ What increment 1 ships (the fully unit-testable, lab-free slice):
   client-supplied FQDN, and extracts the v6 DUID/IAID identity. SEPARATE
   from the display-only `parseLeaseCSV` (reusing that would publish/retain
   stale records — the exact bug this feature fixes).
+- **Hostname normalization** — `deriveFQDN` / `finalizeFQDN`
+  (`ddns_hostname.go`) ALWAYS contains the published name in the configured
+  zone: the client picks the host part, the firewall picks the domain. A
+  client-offered dotted name (e.g. `host.attacker.tld`, a trailing-dot or
+  double-dot escape) that is not already within the configured domain is
+  relabeled to `<first-label>.<domain>`; a name already inside the zone is
+  kept verbatim. With no configured domain, only the first label is kept. A
+  client can never publish outside the configured zone.
 - **`DNSUpdater` interface** (`ddns_dns.go`) + the pure record/PTR-name
   construction. PTR names are built from the TEXTUAL address (reversed
-  octets / nibbles), NOT the dataplane native-endian `__be32` convention.
+  octets / nibbles), NOT the dataplane native-endian `__be32` convention. A
+  nil updater (the increment-1 default — the live backend is deferred) is
+  substituted with a `nopUpdater`: every upsert/delete is a LOGGED no-op,
+  never a panic, and a no-op upsert does NOT record phantom ownership (so a
+  later real backend still publishes the record).
 - **Reconciler core** — `DDNSManager.reconcileOnceLocked` (`ddns.go`):
   build-desired / diff-owned / add-move-reassign-expire transitions,
   cleaning the old owner before the new one, with bounded retry that never
-  wedges the loop.
+  wedges the loop. FAIL-SAFE: when a lease family's CSV cannot be
+  read/parsed, that family is marked untrusted and its destructive diff is
+  SKIPPED this cycle (a transient malformed CSV can never mass-delete a
+  family's owned records); the parse error is surfaced to the caller.
 - **Ownership state store** — `ddns_state.go`, JSON via
   `fsatomic.WriteFileDurable` (fsync-on-write; slow-path). This is the
   PROTECTION BOUNDARY for never-delete-a-record-xpf-did-not-create:
@@ -95,7 +110,13 @@ What increment 1 ships (the fully unit-testable, lab-free slice):
 DELIBERATELY DEFERRED to later increments (see plan §12):
 
 - The LIVE rfc2136 `DNSUpdater` backend — lab-gated (needs a throwaway
-  authoritative BIND/Knot + TSIG; no such fixture exists in CI yet).
+  authoritative BIND/Knot + TSIG; no such fixture exists in CI yet). The
+  `backend` leaf (and `update-server` / TSIG leaves) are PARSED and
+  VALIDATED in this increment but NOT yet wired to a live updater — nothing
+  is published to DNS. Enabling DDNS emits a commit-time warning
+  (`config.ValidateConfig` → `validateDDNSDeferredBackendWarnings`), stronger
+  when an `update-server` / TSIG is configured, so the operator is not
+  surprised by the absence of records.
 - HA ownership coupling to the per-RG VRRP MASTER/BACKUP gate — must pass
   `make test-failover`. The deterministic owner-id watermark
   (`ownerWatermark`) is laid down now so the state store is

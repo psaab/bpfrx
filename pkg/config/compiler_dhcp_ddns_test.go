@@ -156,6 +156,81 @@ func TestDHCPDDNSSchemaAcceptsValidLeaves(t *testing.T) {
 	}
 }
 
+// TestDHCPDDNSEnabledWarnsBackendDeferred proves the #1387 MINOR-5 commit
+// warning: enabling DDNS (whose live backend is deferred to a later
+// increment) must surface a commit-time warning that nothing is published to
+// DNS yet, and the warning must be stronger when an update-server / TSIG is
+// also configured. An absent or disabled stanza emits no such warning.
+func TestDHCPDDNSEnabledWarnsBackendDeferred(t *testing.T) {
+	hasDeferredWarn := func(ws []string) (string, bool) {
+		for _, w := range ws {
+			if strings.Contains(w, "dhcp dynamic-dns") &&
+				strings.Contains(w, "backend") {
+				return w, true
+			}
+		}
+		return "", false
+	}
+
+	t.Run("enabled bare", func(t *testing.T) {
+		cfg, err := CompileConfig(buildTree(t, []string{
+			"set system services dhcp-local-server dynamic-dns enable",
+			"set system services dhcp-local-server dynamic-dns domain corp.example.com",
+		}))
+		if err != nil {
+			t.Fatalf("CompileConfig: %v", err)
+		}
+		w, ok := hasDeferredWarn(ValidateConfig(cfg))
+		if !ok {
+			t.Fatal("enabling DDNS did not warn that the backend is deferred")
+		}
+		if strings.Contains(w, "update-server") {
+			t.Fatalf("bare-enable warning wrongly mentions update-server: %q", w)
+		}
+	})
+
+	t.Run("enabled with update-server warns stronger", func(t *testing.T) {
+		cfg, err := CompileConfig(buildTree(t, []string{
+			"set system services dhcp-local-server dynamic-dns enable",
+			"set system services dhcp-local-server dynamic-dns update-server 192.0.2.53",
+			"set system services dhcp-local-server dynamic-dns tsig-key xpf-key",
+		}))
+		if err != nil {
+			t.Fatalf("CompileConfig: %v", err)
+		}
+		w, ok := hasDeferredWarn(ValidateConfig(cfg))
+		if !ok {
+			t.Fatal("enabling DDNS with update-server did not warn")
+		}
+		if !strings.Contains(w, "update-server") {
+			t.Fatalf("update-server warning did not call out the update target: %q", w)
+		}
+	})
+
+	t.Run("absent or disabled is silent", func(t *testing.T) {
+		// No stanza at all.
+		cfgAbsent, err := CompileConfig(buildTree(t, []string{
+			"set system services dhcp-local-server group g0 interface ge-0/0/0",
+		}))
+		if err != nil {
+			t.Fatalf("CompileConfig(absent): %v", err)
+		}
+		if _, ok := hasDeferredWarn(ValidateConfig(cfgAbsent)); ok {
+			t.Fatal("absent DDNS must not emit the deferred-backend warning")
+		}
+		// Stanza present but not enabled (only a domain set).
+		cfgDisabled, err := CompileConfig(buildTree(t, []string{
+			"set system services dhcp-local-server dynamic-dns domain corp.example.com",
+		}))
+		if err != nil {
+			t.Fatalf("CompileConfig(disabled): %v", err)
+		}
+		if _, ok := hasDeferredWarn(ValidateConfig(cfgDisabled)); ok {
+			t.Fatal("disabled DDNS must not emit the deferred-backend warning")
+		}
+	})
+}
+
 func TestDHCPDDNSSchemaRejectsBadEnumAndTTL(t *testing.T) {
 	cases := []struct {
 		name string

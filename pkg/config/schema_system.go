@@ -567,10 +567,10 @@ func dhcpDynamicDNSSchema() *schemaNode {
 			children:      nil,
 		},
 		"backend": {
-			desc:          "DNS-update backend (increment 1 implements rfc2136 only)",
+			desc:          "DNS-update backend (parsed/validated; live updater deferred to a later increment)",
 			args:          1,
 			valueType:     ValueEnumOf,
-			valueDesc:     "Update backend (rfc2136 | kea-d2 [reserved])",
+			valueDesc:     "Update backend (rfc2136 | kea-d2 [reserved]) — config-only in this increment",
 			valueExamples: []string{"rfc2136"},
 			validator:     ValidateEnum([]string{"rfc2136", "kea-d2"}),
 			children:      nil,

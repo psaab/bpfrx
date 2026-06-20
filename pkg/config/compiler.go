@@ -1525,7 +1525,39 @@ func ValidateConfig(cfg *Config) []string {
 	// commit time so the operator sees it before applying.
 	warnings = append(warnings, validateRoutingRuleWindowWarnings(cfg)...)
 
+	// #1387: DHCP dynamic-DNS is parsed and validated in this increment,
+	// but the live DNS-update backend is deferred — nothing is published to
+	// DNS yet. Warn at commit time so an operator who enables DDNS (and
+	// especially one who configures an update-server / TSIG key) is not
+	// surprised that no records appear.
+	warnings = append(warnings, validateDDNSDeferredBackendWarnings(cfg)...)
+
 	return warnings
+}
+
+// validateDDNSDeferredBackendWarnings emits a commit-time warning when DHCP
+// dynamic-DNS is enabled but no live DNS-update backend is wired (#1387
+// increment 1). The config grammar is accepted and the manager runs in a
+// no-op mode (records are logged-and-skipped), so an operator must be told
+// the feature does not yet publish to DNS. The warning is stronger when an
+// update-server or TSIG key is configured, since those signal an operator
+// expectation of live updates.
+func validateDDNSDeferredBackendWarnings(cfg *Config) []string {
+	d := cfg.System.DHCPServer.DynamicDNS
+	if d == nil || !d.Enabled {
+		return nil
+	}
+	hasUpdateTarget := d.UpdateServer != "" || d.TSIGKeyName != "" ||
+		d.TSIGAlgorithm != "" || d.TSIGSecret != ""
+	if hasUpdateTarget {
+		return []string{"dhcp dynamic-dns is enabled with an update-server / " +
+			"TSIG configured, but the live DNS-update backend is not yet wired " +
+			"(this increment parses and validates the config only); no records " +
+			"will be published to DNS until a later increment enables the backend"}
+	}
+	return []string{"dhcp dynamic-dns is enabled, but the live DNS-update " +
+		"backend is deferred to a later increment; the configuration is " +
+		"accepted and validated but no records are published to DNS yet"}
 }
 
 // validateRoutingRuleWindowWarnings emits commit-time warnings when a
