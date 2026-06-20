@@ -1,5 +1,24 @@
 # Action Log
 
+## 2026-06-19 — #2022 ipsec effectiveTrafficSelectors nil-deref guard
+
+- **Timestamp**: 2026-06-19
+- **Action**: Fix the latent nil-pointer dereference in
+  `effectiveTrafficSelectors` (`pkg/ipsec/policy.go`). The defensive
+  `vpn == nil` guard short-circuited into a branch that immediately read
+  `vpn.LocalID`/`vpn.RemoteID`, panicking whenever the nil branch was
+  reached. Split the cases: `vpn == nil` now returns `nil` (no children);
+  the non-nil zero-traffic-selector case keeps the single default child
+  built from `LocalID`/`RemoteID`. Behavior-preserving for every reachable
+  path (the sole caller iterates non-nil config VPN map values). Added
+  `TestEffectiveTrafficSelectors_NilVPN` (recover-on-panic → fails, not
+  crashes, against pre-fix code) and `TestEffectiveTrafficSelectors_NoSelectors`
+  (default-child fallback not regressed). Verified the nil test FAILS on the
+  pre-fix file before applying the fix. No doc change: defensive-only fix to
+  an unexported helper with no reachable behavior change; README covers
+  traffic selectors only at the feature level.
+- **File(s)**: pkg/ipsec/policy.go, pkg/ipsec/ipsec_test.go, _Log.md
+
 ## 2026-06-19 — #1387 DDNS PR #2043: Copilot findings (dual-family merge, version, comments)
 
 - **Timestamp**: 2026-06-19

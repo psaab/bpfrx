@@ -876,6 +876,38 @@ func TestGenerateConfig_TrafficSelectors(t *testing.T) {
 	}
 }
 
+// TestEffectiveTrafficSelectors_NilVPN guards the #2022 nil-deref: the
+// vpn==nil branch previously dereferenced vpn.LocalID/vpn.RemoteID and
+// panicked. A nil VPN must yield no children, not a panic. Run with
+// t.Fatalf-on-panic so the test fails (not crashes) against pre-fix code.
+func TestEffectiveTrafficSelectors_NilVPN(t *testing.T) {
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("effectiveTrafficSelectors(nil) panicked: %v", r)
+		}
+	}()
+	got := effectiveTrafficSelectors("tun", nil)
+	if len(got) != 0 {
+		t.Fatalf("nil VPN: want no children, got %d: %+v", len(got), got)
+	}
+}
+
+// TestEffectiveTrafficSelectors_NoSelectors confirms the non-nil VPN with
+// zero traffic selectors still falls back to a single default child built
+// from LocalID/RemoteID — the behavior the broken nil-OR-empty guard used
+// to share. The #2022 fix must not regress this path.
+func TestEffectiveTrafficSelectors_NoSelectors(t *testing.T) {
+	vpn := &config.IPsecVPN{LocalID: "10.0.1.0/24", RemoteID: "10.10.1.0/24"}
+	got := effectiveTrafficSelectors("tun", vpn)
+	if len(got) != 1 {
+		t.Fatalf("want 1 default child, got %d: %+v", len(got), got)
+	}
+	c := got[0]
+	if c.Name != "tun" || c.LocalTS != "10.0.1.0/24" || c.RemoteTS != "10.10.1.0/24" {
+		t.Fatalf("unexpected default child: %+v", c)
+	}
+}
+
 func TestPrepareConfig_ExternalInterfaceLocalAddress(t *testing.T) {
 	cfg := &config.Config{
 		Interfaces: config.InterfacesConfig{

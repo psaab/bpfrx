@@ -207,7 +207,14 @@ func sortedVPNNames(vpns map[string]*config.IPsecVPN) []string {
 }
 
 func effectiveTrafficSelectors(connName string, vpn *config.IPsecVPN) []childSelector {
-	if vpn == nil || len(vpn.TrafficSelectors) == 0 {
+	// A nil VPN has no traffic selectors and no LocalID/RemoteID to fall
+	// back to — return no children rather than dereferencing vpn. The
+	// sole caller iterates non-nil config VPN map values, so this guard
+	// is defensive, but the previous nil branch panicked on vpn.LocalID.
+	if vpn == nil {
+		return nil
+	}
+	if len(vpn.TrafficSelectors) == 0 {
 		return []childSelector{{
 			Name:     connName,
 			LocalTS:  vpn.LocalID,
