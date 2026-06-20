@@ -1,6 +1,10 @@
 # #2074 — renderConfig leaks the gateway NAME into swanctl remote_addrs
 
-**Status:** DRAFT v3 — addresses round-2 hostile review (both reviewers
+**Status:** PLAN-READY (v3) — round-3 hostile review returned PLAN-READY
+from both independent reviewers (the two round-2 PLAN-NEEDS-MAJOR
+blockers verified fixed against source; only minor prose/import-precision
+folded in: validator edits `compileExpanded`, add `log/slog` to
+policy.go). Addresses round-2 hostile review (both reviewers
 PLAN-NEEDS-MAJOR). Round-2 found two source-confirmed blocking defects in
 v2: (1) `Manager.Apply` bails on a render error BEFORE the write, so v2's
 "return (healthyConfig, joinedErr)" discards the healthy config and the
@@ -375,10 +379,14 @@ total ≤253.
 Do NOT place the check inside `compileIPsec` (round-2 R2-2: stanza order
 + lenient-path break). Instead add a validator on the FULLY-COMPILED
 `*Config`, slotted into the existing strict-validator chain in
-`compileConfigWithOpts` / `compileConfigForNodeWithOpts`
-(`compiler.go`), right after `validatePolicyMatchAddressesStrict` /
-`ValidateEventAttributesMatch` — the exact `validateDeviceMapStrict`
-(#1956) / `#2008` template:
+**`compileExpanded`** (`compiler.go:277`, NOT the outer
+`compileConfigWithOpts`/`compileConfigForNodeWithOpts` — both of those
+call `compileExpanded(tree, opts)` with the threaded opts, so editing
+`compileExpanded` makes the validator fire on standalone AND node-aware
+commits and honor the lenient flag on `SyncApply`), right after
+`validateDeviceMapStrict` (`compiler.go:549`) /
+`validatePolicyMatchAddressesStrict` / `ValidateEventAttributesMatch` —
+the exact `validateDeviceMapStrict` (#1956) / `#2008` template:
 
 ```go
 // #2074: an IPsec VPN that references a gateway which is neither a
@@ -460,6 +468,10 @@ commit, and boots a pre-fix/peer-synced config with a warning.
 - New exported `config.IsUsableIPsecEndpoint(string) bool` and new
   unexported `validateIPsecGatewayReferencesStrict` / `isPlausibleHostname`
   — additive.
+- `pkg/ipsec/policy.go` MUST add `"log/slog"` to its import block for the
+  belt's `slog.Warn` (currently imports only fmt/net/sort/strconv/strings
+  + config; `slog` is used elsewhere in the package but each file imports
+  its own). `go build` (test-plan item 1) catches an omission.
 
 ## Hidden invariants the change must preserve
 
