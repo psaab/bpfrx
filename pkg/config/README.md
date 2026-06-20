@@ -80,6 +80,48 @@ nothing internal.
   error-returning siblings of the legacy zero-return parsers — the legacy
   versions keep their "unset = 0" contract for compatibility.
 
+## Node modifiers
+
+- `inactive:` (`#2008` H1) — the Junos deactivate-without-delete marker.
+  An operator deactivates any statement by prefixing it with `inactive:`;
+  the node stays in the tree (it displays in `show configuration`,
+  persists through commit/reboot, syncs to the HA peer, and can be
+  re-enabled later) but is EXCLUDED from compilation/application — the
+  firewall behaves as if the statement were absent. Because `:` is an
+  identifier character, the lexer emits `inactive:` as a single token; the
+  parser (`parser.go`) detects it as a statement's leading key and LIFTS it
+  into `Node.Inactive`, leaving the node's real `Keys` (its identity)
+  intact so every key match, schema walk, and group merge keeps working
+  unchanged. `inactive.go` provides the single centralized strip
+  (`ConfigTree.WithoutInactive`, a no-op clone-free pass when nothing is
+  deactivated) that prunes inactive subtrees BEFORE group expansion and
+  compilation (both `compileConfig*` entry points) and BEFORE the typed-leaf
+  schema walk (`SchemaValidateWithDefinitions`). Stripping first means an
+  `inactive: apply-groups foo` suppresses the inherited config, inactive
+  nodes inside a `groups {}` body are pruned, the pre-expansion tunnel-id
+  collision gate ignores inactive tunnel definitions, and a deactivated leaf
+  with a deliberately-invalid value commits clean (Junos parks WIP). The
+  ~15 compiler files and the schema gate never observe an inactive node, so
+  none of them changed. All five display serializers (text, inheritance,
+  set, JSON, XML) plus the `show | compare` diff re-emit the marker from the
+  flag via the shared `inactivePrefix` / `xmlInactiveAttr` helpers; set form
+  emits a `deactivate <path>` line (Junos `display set` convention) and
+  `nodesEqual` treats a flipped `Inactive` as a difference so a pure
+  activate/deactivate shows in `show | compare`. The flag round-trips
+  through the persisted DB automatically — `Node.Inactive` is JSON-tagged
+  `,omitempty`, so active-node on-disk output is byte-identical to
+  pre-`#2008`. The `deactivate <path>` line that `display set` emits also
+  round-trips through reload: `ParseSetVerb` (`parser.go`) recognizes
+  `deactivate` / `activate` as real verbs and `ConfigTree.DeactivatePath` /
+  `ActivatePath` (`ast_edit.go`) apply them (used by the configstore
+  `LoadSet` / `LoadMerge` replay loops), so an inactive node reloads inactive
+  rather than being skipped (silently reactivated) or parsed as a junk path.
+  Regression coverage: `pkg/config/inactive_test.go`,
+  `pkg/configstore/inactive_test.go`. NOTE: interactive standalone
+  `activate` / `deactivate` config-mode commands (a typed CLI verb that edits
+  the candidate directly, distinct from `load set` replay) remain a separate
+  increment.
+
 ## Callers
 
 Almost everyone. The package has no internal dependencies.

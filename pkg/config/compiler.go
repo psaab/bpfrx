@@ -155,20 +155,30 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 }
 
 func compileConfigWithOpts(tree *ConfigTree, opts compileOpts) (*Config, error) {
+	// #2008 H1: prune `inactive:`-marked subtrees BEFORE every other
+	// pre-expansion gate, group expansion, and compilation. Doing it first
+	// means the tunnel-id collision gate ignores inactive tunnel
+	// definitions, an `inactive: apply-groups foo` suppresses the inherited
+	// config, and inactive nodes inside a `groups {}` body are pruned —
+	// none of the ~15 compiler files or validators ever observe an inactive
+	// node. cloneForExpansion returns a fresh, freely-mutable pruned tree in a
+	// single deep copy (no double-clone on the has-inactive path); the result
+	// never aliases the caller's tree, so the caller retains groups/apply-groups
+	// nodes for `show configuration` and ExpandGroups below mutates only our copy.
+	tree = tree.cloneForExpansion()
+
 	// #1873 R-B: tunnel-endpoint id collision gate. Runs on the
 	// PRE-expansion tree (ExpandGroups removes the groups stanza) so
 	// the check covers the UNION of tunnel names across all groups —
 	// both cluster nodes accept/reject identically. Strict paths
-	// hard-reject; lenient paths warn (see tunnelid.go).
+	// hard-reject; lenient paths warn (see tunnelid.go). Read-only, so it is
+	// safe to run on the soon-to-be-expanded copy.
 	tunnelIDWarnings, tunnelIDErr := validateTunnelEndpointIDCollisionAST(
 		tree, opts.sanitizeFreeTextControlChars)
 	if tunnelIDErr != nil {
 		return nil, tunnelIDErr
 	}
 
-	// Clone the tree before expanding groups — the caller's tree must retain
-	// groups and apply-groups nodes for display (show configuration groups).
-	tree = tree.Clone()
 	usedNodeFallback := false
 
 	// Expand groups before compilation — resolve all apply-groups references.
@@ -222,15 +232,22 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 }
 
 func compileConfigForNodeWithOpts(tree *ConfigTree, nodeID int, opts compileOpts) (*Config, error) {
+	// #2008 H1: prune `inactive:` subtrees first — see compileConfigWithOpts.
+	// Centralizing the strip in this shared node-aware entry guarantees BOTH
+	// cluster nodes compile the identical active set from the same persisted
+	// (Inactive-flag-carrying, JSON-synced) tree, so a deactivated stanza is
+	// dead on both nodes — no split-brain firewall posture. cloneForExpansion
+	// returns a fresh, freely-mutable pruned tree in a single deep copy (never
+	// aliases the caller's tree) so ExpandGroupsWithVars below mutates only our copy.
+	tree = tree.cloneForExpansion()
+
 	// #1873 R-B: union-of-groups tunnel id collision gate — see
-	// compileConfigWithOpts. Pre-expansion on purpose.
+	// compileConfigWithOpts. Pre-expansion on purpose; read-only, safe on the copy.
 	tunnelIDWarnings, tunnelIDErr := validateTunnelEndpointIDCollisionAST(
 		tree, opts.sanitizeFreeTextControlChars)
 	if tunnelIDErr != nil {
 		return nil, tunnelIDErr
 	}
-
-	tree = tree.Clone()
 
 	vars := map[string]string{"node": fmt.Sprintf("node%d", nodeID)}
 	if err := tree.ExpandGroupsWithVars(vars); err != nil {

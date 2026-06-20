@@ -3814,6 +3814,57 @@ func TestApplyGroupsFormatSet(t *testing.T) {
 	}
 }
 
+// TestInactiveApplyGroupsNotInheritedInDisplay covers the #2008 H1 review
+// MINOR: an `inactive: apply-groups g` must NOT pull g's content into the
+// `show | display inheritance` view (FormatInheritance / FormatPathInheritance),
+// matching the compile/commit-check strip-before-expand behavior. Without the
+// fix, the inheritance formatter expanded the raw (inactive-blind) tree and the
+// deactivated group's content still appeared inherited.
+func TestInactiveApplyGroupsNotInheritedInDisplay(t *testing.T) {
+	build := func(deactivate bool) *ConfigTree {
+		tree := &ConfigTree{}
+		for _, cmd := range []string{
+			"set groups common system host-name fw1",
+			"set apply-groups common",
+		} {
+			path, err := ParseSetCommand(cmd)
+			if err != nil {
+				t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+			}
+			if err := tree.SetPath(path); err != nil {
+				t.Fatalf("SetPath(%v): %v", path, err)
+			}
+		}
+		if deactivate {
+			dpath, err := ParseSetCommand("set apply-groups common")
+			if err != nil {
+				t.Fatalf("ParseSetCommand(deactivate path): %v", err)
+			}
+			if err := tree.DeactivatePath(dpath); err != nil {
+				t.Fatalf("DeactivatePath(%v): %v", dpath, err)
+			}
+		}
+		return tree
+	}
+
+	// Anchor: an ACTIVE apply-groups DOES inherit the group's host-name in the
+	// display-inheritance view.
+	active := build(false).FormatInheritance()
+	if !strings.Contains(active, "fw1") {
+		t.Fatalf("active apply-groups should inherit host-name fw1 in display "+
+			"inheritance, got:\n%s", active)
+	}
+
+	// Fix under test: an INACTIVE apply-groups must NOT be expanded, so the
+	// group's host-name must NOT appear inherited. Fails against the pre-fix
+	// inactive-blind formatter.
+	inactive := build(true).FormatInheritance()
+	if strings.Contains(inactive, "fw1") {
+		t.Errorf("inactive apply-groups must not be expanded in display "+
+			"inheritance, but inherited host-name fw1 appeared:\n%s", inactive)
+	}
+}
+
 func TestApplyGroupsWildcard(t *testing.T) {
 	setCommands := []string{"set security policies from-zone trust to-zone untrust policy allow-all match source-address any", "set security policies from-zone trust to-zone untrust policy allow-all match destination-address any", "set security policies from-zone trust to-zone untrust policy allow-all match application any", "set security policies from-zone trust to-zone untrust policy allow-all then permit", "set security policies from-zone dmz to-zone untrust policy dmz-out match source-address any", "set security policies from-zone dmz to-zone untrust policy dmz-out match destination-address any", "set security policies from-zone dmz to-zone untrust policy dmz-out match application any", "set security policies from-zone dmz to-zone untrust policy dmz-out then permit", "set groups default-deny-template security policies from-zone <*> to-zone <*> policy default-deny then log session-init", "set apply-groups default-deny-template"}
 	tree := &ConfigTree{}

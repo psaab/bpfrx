@@ -28,6 +28,40 @@
   pkg/daemon/frr_failclosed_boot_test.go,
   pkg/dataplane/userspace/boot_probe.go,
   pkg/dataplane/userspace/boot_probe_test.go, pkg/daemon/README.md, _Log.md
+## 2026-06-20 — #2008 H1 review follow-up: two MAJOR fixes on PR #2042
+
+- **Timestamp**: 2026-06-20
+- **Action**: Fix two Codex MAJOR findings on the `inactive:` marker work.
+  MAJOR 1: the configstore commit-check / schema gate
+  (`schemaValidateExpandedTreeForNode`) cloned the RAW tree and expanded
+  apply-groups BEFORE stripping inactive — but `ExpandGroups` collects
+  `apply-groups` nodes by name without checking `Inactive`, so an
+  `inactive: apply-groups missing` still failed commit-check as an undefined
+  group and an `inactive: apply-groups g` still schema-validated inherited
+  content the compiler never applies. Now strip with `WithoutInactive()`
+  BEFORE expansion, mirroring the compile path (strip -> expand -> validate
+  holds everywhere a tree is compiled OR schema-validated). MAJOR 2:
+  FormatSet emitted `deactivate <path>` lines but `ParseSetCommand` only
+  knew `set` / `delete`, so `show | display set` did NOT round-trip — a
+  `deactivate` line reloaded as a junk path or was skipped (node reloaded
+  ACTIVE). Added `ParseSetVerb` (verb + path), `ConfigTree.DeactivatePath`
+  / `ActivatePath`, and a shared `applyEditLine` verb switch wired into
+  `LoadSet` and `LoadMerge` (flat + hierarchical-via-FormatSet); `LoadSet`
+  no longer skips `deactivate` / `activate` lines. MINOR 3: reworded the
+  false "strip can only REMOVE nodes so a previously-compiling config cannot
+  become non-compilable" doc/comment — deactivating a REFERENCED definition
+  can surface a (correct, intended) dangling-reference commit error. Added
+  non-tautological regression tests
+  (`TestInactive_FormatSetRoundTripsDeactivate`,
+  `pkg/configstore/inactive_test.go`: active-vs-inactive apply-groups
+  commit-check, display-set round trip), each verified to FAIL when its fix
+  is reverted. Replaced the manual `pol.Inactive = true` flip in
+  `TestInactive_DualASTFlatSet` with the real `deactivate`/`activate` verb
+  apply path.
+- **File(s)**: pkg/config/parser.go, pkg/config/ast_edit.go,
+  pkg/config/inactive.go, pkg/config/inactive_test.go,
+  pkg/config/README.md, pkg/configstore/store.go,
+  pkg/configstore/inactive_test.go, docs/config-schema.md, _Log.md
 
 ## 2026-06-20 — #2034 RA link-local review follow-up (regression test)
 
@@ -132,6 +166,42 @@
 - **File(s)**: pkg/daemon/bootstrap.go, pkg/daemon/daemon_run.go,
   pkg/daemon/frr_failclosed_boot_test.go, pkg/frr/testseam.go,
   pkg/daemon/README.md, _Log.md
+## 2026-06-20 — #2008 H1 review follow-up: lone `inactive:` error position
+
+- **Timestamp**: 2026-06-20
+- **Action**: Address Copilot review feedback in `pkg/config/parser.go`:
+  capture the statement-start token location before `parseKeys()` consumes
+  `inactive:` so a lone-marker parse error is reported at the marker token
+  itself (instead of the following terminator). Added a regression test that
+  pins the marker error location at line 2, column 5 for an indented lone
+  marker input.
+- **File(s)**: pkg/config/parser.go, pkg/config/inactive_test.go, _Log.md
+
+## 2026-06-19 — #2008 H1: Junos `inactive:` statement marker
+
+- **Timestamp**: 2026-06-19
+- **Action**: Implement the #2008 H1 deactivate-without-delete marker
+  (Path A — node flag + centralized strip, increment 1). The lexer treats
+  `:` as an identifier char so `inactive:` lexed as one token and the node
+  was silently dropped from compilation AND every display path. Fix: the
+  parser lifts a leading `inactive:` into a new `Node.Inactive` flag
+  (leaving the node's real Keys intact, so all key matching / schema walk /
+  group merge keep working), a single centralized `WithoutInactive` strip
+  prunes inactive subtrees before group expansion + compile and before the
+  typed-leaf schema gate (so a deactivated invalid leaf commits clean, an
+  `inactive: apply-groups` suppresses inheritance, and the ~15 compiler
+  files stay untouched), and all five display serializers + `show | compare`
+  re-emit the marker from the flag. `Inactive` is JSON `,omitempty` so
+  active-node on-disk output is byte-identical. A lone `inactive:` is now a
+  parse error. Added 17 dual-AST regression tests
+  (`pkg/config/inactive_test.go`), verified non-tautological by neutering
+  both the parser lift and the strip. Updated module + schema + feature-gap
+  docs.
+- **File(s)**: pkg/config/ast.go, pkg/config/parser.go,
+  pkg/config/inactive.go, pkg/config/compiler.go,
+  pkg/config/schema_walk.go, pkg/config/ast_format.go,
+  pkg/config/inactive_test.go, pkg/config/README.md, docs/config-schema.md,
+  docs/feature-gaps.md, _Log.md
 
 ## 2026-06-19 — #2000 review follow-up on postinst test harness
 
@@ -6222,3 +6292,9 @@ top.
 - **Timestamp**: 2026-06-20
 - **Action**: #2035 (#2040 review MAJOR) — rxLoop no longer permanently exits on an unexpected recv error. Codex review of PR #2040 found the close-to-unblock redesign returned the RX goroutine on ANY non-EINTR/EAGAIN/EWOULDBLOCK error while the context was still live (e.g. ENETDOWN on an interface flap); nothing restarts rxLoop short of a daemon restart (LLDP is Apply()'d once at startup), so a transient operational error silently killed neighbor discovery for the life of the process. The old timeout-poll loop survived these by continuing. Fix: on an unexpected error with ctx still live, back off rxErrorBackoff (1s default, a var so tests can shrink it) via an interruptible select{<-ctx.Done(); <-time.After} and retry — survives flaps without a tight busy-spin, and Stop() still returns promptly (ctx-cancel wins the select; the closed fd makes a parked recv return and ctx.Err()!=nil exits). Added mutation-verified TestRxLoopSurvivesNonTransientRecvError (ENETDOWN-then-frame; FAILS if the retry regresses to a bare return) and TestRxLoopBackoffInterruptedByCancel (30s backoff + cancel must exit promptly). Validation: go build/vet clean; go test ./pkg/lldp/... green; new tests 5x non-flaky; mutation check confirmed (flip→FAIL, restore→ok). Docs: README rxLoop contract updated.
 - **File(s)**: pkg/lldp/lldp.go, pkg/lldp/socket_test.go, pkg/lldp/README.md, _Log.md
+- **Timestamp**: 2026-06-20
+- **Action**: #2008 (#2042 review MINOR) — strip inactive before group expansion in the display-inheritance formatters. Codex r2 confirmed both MAJOR fixes (schema strip-before-expand + deactivate/activate set-verb round-trip) but found FormatInheritance()/FormatPathInheritance() still expanded the raw inactive-blind tree, so `show | display inheritance` showed an `inactive: apply-groups` as inherited (contradicts the inactive-inheritance contract; display-only, not commit/dataplane correctness). Fix: both formatters now clone `t.WithoutInactive()` before ExpandGroupsTagged, mirroring the configstore schemaValidateExpandedTreeForNode strip-before-expand path. Added mutation-verified TestInactiveApplyGroupsNotInheritedInDisplay (active apply-groups inherits host-name fw1 = anchor; inactive must NOT — FAILS against the pre-fix inactive-blind formatter). Validation: go build ./pkg/config/... clean; new test passes; mutation check confirmed (revert strip → FAIL); full pkg/config + pkg/configstore suites green.
+- **File(s)**: pkg/config/ast_format.go, pkg/config/parser_ast_test.go, _Log.md
+- **Timestamp**: 2026-06-20
+- **Action**: #2008 (#2042 Copilot perf nit) — collapse the strip+clone double deep-copy on the has-inactive path. Copilot flagged that `tree.WithoutInactive()` already returns a fresh clone when it prunes, so the subsequent unconditional `tree.Clone()` in compileConfigWithOpts/compileConfigForNodeWithOpts (and the `t.WithoutInactive().Clone()` I added in the inheritance formatters) deep-copies twice when a config has inactive nodes. Added `(*ConfigTree).cloneForExpansion()`: exactly ONE deep copy, NEVER aliases the receiver (reuses WithoutInactive's prune-clone on the has-inactive path; Clones only on the all-active path where WithoutInactive returns the receiver). Replaced the WithoutInactive()+Clone() pair at both compiler entry points (the pre-expansion tunnel-id collision gate is read-only, so running it on the soon-to-be-expanded copy is behavior-identical) and both inheritance formatters. Strictly safer (the result is now guaranteed fresh from the top, not a maybe-receiver). Validation: go build ./... clean; go vet ./pkg/config/... ./pkg/configstore/... clean; full pkg/config + pkg/configstore suites green; the inactive display + dual-AST + apply-groups + compile tests all pass (compile-path correctness preserved).
+- **File(s)**: pkg/config/inactive.go, pkg/config/compiler.go, pkg/config/ast_format.go, _Log.md
