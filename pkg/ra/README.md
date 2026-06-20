@@ -23,27 +23,39 @@ after HA failover. To make that **structural**, not flag-defended:
   lifetime-zero goodbye as its FINAL write when the mode is graceful,
   then closes the conn. A normal RA can never follow the goodbye because
   the goodbye is emitted structurally after the loop.
-- **Graceful upgrades hard.** In cluster mode RA `Apply`/`Withdraw`/`Clear`
-  for the same sender are serialized ONLY by the manager mutex (no
-  `applySem`). A graceful withdraw therefore beats a racing hard `Clear`:
-  `signalStop` stores graceful unconditionally and hard only via
-  compare-and-swap from "none" — never a downgrade. Because the owner
-  closes the conn AFTER the goodbye, a racing hard close cannot suppress
-  the goodbye.
-- **Draining tombstone.** `Withdraw`/`WithdrawInterfaces`/`Clear` move the
-  sender to a per-interface DRAINING tombstone under the manager mutex,
-  then join the owner OUTSIDE the lock (so multi-interface demotion does
-  not stall `Status`/`Apply` on the failover hot path). While the
-  tombstone is present the interface is NOT absent: a concurrent `Apply`
-  or `WithdrawOnce` treats it as a claim and defers — it never starts a
-  second NDP connection on the same interface. This guarantees **at most
-  one live NDP conn per interface** at any time (no `ndp.Listen`
-  collision, no goodbye-after-new-burst inversion).
-- **Deferred Apply is epoch-guarded.** A deferred `Apply` waiting for a
-  tombstone to clear captures the manager epoch; if a newer
-  `Withdraw`/`Clear`/`Apply` bumped the epoch in the interim, the deferred
-  start is aborted (it must not re-arm RA on a node that has since
-  transitioned to BACKUP).
+- **Graceful upgrades hard, even mid-drain.** In cluster mode RA
+  `Apply`/`Withdraw`/`Clear` for the same sender are serialized ONLY by the
+  manager mutex (no `applySem`). A graceful withdraw therefore beats a
+  racing hard `Clear`: `signalStop` stores graceful unconditionally and
+  hard only via compare-and-swap from "none" — never a downgrade. The
+  manager records the graceful intent ATOMICALLY: `Withdraw`/
+  `WithdrawInterfaces` install the tombstone AND call
+  `signalStop(modeGraceful)` under the SAME lock that bumps the epoch and
+  snapshots the senders, so a racing `Clear` cannot slip a hard stop into a
+  gap. And if a `Clear` got there first (the sender is already draining
+  hard), a subsequent `Withdraw` finds it in the draining map and UPGRADES
+  it to graceful — the draining map therefore stores the `*sender` (not a
+  bare marker) so the still-running owner can be re-signalled. The
+  draining-map value is `nil` only for a `WithdrawOnce` claim (no owner to
+  upgrade). Because the owner closes the conn AFTER the goodbye, a racing
+  hard close cannot suppress it.
+- **Draining tombstone — one live conn per interface, including replaces.**
+  Every transition that removes OR replaces a sender installs a
+  per-interface DRAINING tombstone under the manager mutex BEFORE releasing
+  it, stops the old sender (closing its conn) OUTSIDE the lock, and only
+  THEN opens any replacement conn. A changed-config `Apply` is a hard
+  replace (no goodbye — the router is not going away) but still goes
+  stop-old → start-new with the tombstone covering the whole window — it
+  never opens the replacement while the old conn is live. While the
+  tombstone is present the interface is NOT absent: a concurrent `Apply` or
+  `WithdrawOnce` treats it as a claim and defers. This guarantees **at most
+  one live NDP conn per interface** at any time (no `ndp.Listen` collision,
+  no goodbye-after-new-burst inversion).
+- **Deferred / restart Apply is epoch-guarded.** An `Apply` start that
+  waits behind a tombstone (a pre-existing drain, or its own changed-config
+  stop) captures the manager epoch; if a newer `Withdraw`/`Clear`/`Apply`
+  bumped the epoch in the interim, the deferred/restart start is aborted
+  (it must not re-arm RA on a node that has since transitioned to BACKUP).
 - **Bounded writes.** Every owner `WriteTo` sets a 1 s write deadline so a
   stuck socket cannot wedge withdrawal; the owner always returns promptly,
   which is what makes owner-performs-the-close safe for both modes.

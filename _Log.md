@@ -145,6 +145,39 @@
   pkg/config/README.md, pkg/configstore/store.go,
   pkg/configstore/inactive_test.go, docs/config-schema.md, _Log.md
 
+## 2026-06-20 — #2033 Codex review: fix two manager-level coordination MAJORs
+
+- **Timestamp**: 2026-06-20
+- **Action**: Rebased fix/2033 onto current origin/master (folding #2034's
+  procfs-free `ensureLinkLocal` into the single-owner sender). Fixed two
+  Codex MAJORs in `pkg/ra/ra.go`. MAJOR 1: `Apply`'s changed-config path
+  opened the replacement NDP conn BEFORE stopping the old sender (two live
+  conns → a goodbye-after-normal-RA inversion). Now every remove/replace
+  installs a draining tombstone under `m.mu`, stops the old sender
+  (conn closed) OUTSIDE the lock, and only then opens the replacement
+  (epoch-guarded restart), so at no point are two conns live for one
+  interface. MAJOR 2: `Withdraw`/`WithdrawInterfaces` bumped the epoch then
+  UNLOCKED before claiming, letting a racing `Clear` install a hard
+  tombstone and drop the goodbye. Now the graceful intent
+  (tombstone + `signalStop(modeGraceful)`) is recorded atomically under the
+  same lock; `claimGracefulLocked` also UPGRADES an already-hard-draining
+  sender to graceful (the draining map now stores the `*sender`), and
+  `Withdraw` includes already-draining interfaces. `clearLocked` stores the
+  sender so a racing graceful Withdraw can upgrade it.
+- **File(s)**: pkg/ra/ra.go, pkg/ra/README.md, _Log.md
+
+- **Timestamp**: 2026-06-20
+- **Action**: Added two non-tautological regression tests to
+  `pkg/ra/serialize_test.go` (with `beforeClose`/`beforeWrite` fakeConn
+  hooks): `TestT2a_ChangedConfigApplyNeverTwoLiveConns` (holds the old
+  conn's close open and asserts the live-conn count never exceeds 1 across a
+  changed-config Apply — fails against start-new-before-stop-old) and
+  `TestT7b_ManagerHardFirstThenGracefulStillGoodbye` (parks the owner in its
+  burst, runs Clear-hard then Withdraw-graceful, asserts the goodbye is
+  still emitted — fails against the bump-then-unlock gap). Mutation-verified
+  both fail against the respective pre-fix code.
+- **File(s)**: pkg/ra/serialize_test.go, _Log.md
+
 ## 2026-06-20 — #2034 RA link-local review follow-up (regression test)
 
 - **Timestamp**: 2026-06-20

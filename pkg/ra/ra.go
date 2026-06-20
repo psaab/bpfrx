@@ -37,11 +37,16 @@ type Manager struct {
 	senders map[string]*sender // active senders, keyed by Linux interface name
 
 	// draining holds interfaces whose senders are tearing down (graceful
-	// withdraw or hard stop). The entry is a tombstone: while present, the
-	// interface is NOT absent — a concurrent Apply/WithdrawOnce must treat it
-	// as a claim and defer rather than start a new sender (#2033 I16). It is
-	// removed once the sender's goroutine has joined.
-	draining map[string]struct{}
+	// withdraw or hard stop) or are otherwise claimed (a WithdrawOnce goodbye,
+	// or an Apply restart between stop-old and start-new). The entry is a
+	// tombstone: while present, the interface is NOT absent — a concurrent
+	// Apply/WithdrawOnce must treat it as a claim and defer rather than start a
+	// new sender (#2033 I16). The value is the draining *sender when one exists
+	// (so a later graceful Withdraw can UPGRADE a still-draining hard stop to
+	// emit a goodbye — #2033 MAJOR 2), or nil for a claim with no live sender
+	// (WithdrawOnce, or after the sender has joined). It is removed once the
+	// sender's goroutine has joined.
+	draining map[string]*sender
 
 	// epoch is bumped on every state-mutating call (Apply, Withdraw,
 	// WithdrawInterfaces, WithdrawOnce, Clear). A deferred Apply captures the
@@ -55,7 +60,7 @@ type Manager struct {
 func New() *Manager {
 	return &Manager{
 		senders:  make(map[string]*sender),
-		draining: make(map[string]struct{}),
+		draining: make(map[string]*sender),
 	}
 }
 
@@ -75,9 +80,18 @@ func (m *Manager) interfaceBusy(name string) bool {
 // Apply diffs the current senders against the desired set and starts/stops/
 // updates as needed. Unchanged configs are left running without RA gap.
 //
-// Interfaces that are currently DRAINING (a graceful withdraw or hard stop is
-// in flight, or a WithdrawOnce goodbye holds a claim) are NOT started in this
-// pass — that would race a second NDP connection against the one tearing down.
+// INVARIANT (#2033 MAJOR 1): at no point are two live NDP conns present for one
+// interface. Every transition that replaces or removes a sender installs a
+// draining tombstone for that interface BEFORE releasing m.mu and stops the old
+// sender (closing its conn) BEFORE any replacement conn is opened. The
+// tombstone covers the whole stop→start window, so a concurrent
+// Apply/Withdraw/WithdrawOnce that sees it defers instead of opening a second
+// conn. A CHANGED config is a hard replace (no goodbye — the router is not
+// going away); a REMOVED config is a hard stop (no goodbye).
+//
+// Interfaces that are ALREADY draining when this Apply runs (a prior
+// withdraw/stop or a WithdrawOnce claim still tearing down) are NOT started in
+// this pass — that would race a second conn against the one tearing down.
 // Instead they are deferred: Apply releases m.mu, waits (bounded) for the
 // tombstone to clear, then re-acquires m.mu and starts them — but ONLY if the
 // manager epoch has not changed in the meantime (a newer Withdraw/Clear would
@@ -99,35 +113,58 @@ func (m *Manager) Apply(configs []*config.RAInterfaceConfig) error {
 		desired[cfg.Interface] = cfg
 	}
 
+	// A pending stop. tomb=true means a tombstone was installed for the
+	// interface and must be cleared after the join (removal) or after the
+	// replacement starts (restart).
+	type stopReq struct {
+		name string
+		s    *sender
+	}
+	var toStop []stopReq
+
 	// Remove senders not in the desired set (hard stop, no goodbye — a config
-	// change must not blackhole hosts).
-	var toStop []*sender
+	// change must not blackhole hosts). Install a tombstone so a concurrent
+	// WithdrawOnce/Apply does not start a sender on the same interface while the
+	// old one is still tearing down.
 	for name, s := range m.senders {
 		if _, ok := desired[name]; !ok {
 			slog.Info("ra: removing sender", "interface", name)
-			toStop = append(toStop, s)
 			delete(m.senders, name)
+			m.draining[name] = s
+			s.signalStop(modeHard)
+			toStop = append(toStop, stopReq{name, s})
 		}
 	}
 
-	// Add or update senders.
+	// Classify desired interfaces: unchanged (left running), changed (hard
+	// replace — tombstone + stop old, defer the start), or already-draining /
+	// new (deferred or started directly).
 	var firstErr error
-	var deferred []*config.RAInterfaceConfig // interfaces blocked by a tombstone
+	var deferred []*config.RAInterfaceConfig // already-draining when we held the lock
+	var toRestart []*config.RAInterfaceConfig // changed config: old stopped, start after join
 	for name, cfg := range desired {
 		existing, ok := m.senders[name]
 		if ok && configEqual(existing.cfg, cfg) {
 			continue // No change — keep running, no RA gap.
 		}
 
-		// Changed config: hard-stop the old sender, then (re)start.
+		// Changed config: hard-replace. Install a tombstone, stop the old
+		// sender, and DEFER the start until the old conn is closed (the
+		// tombstone covers the whole window). Never open the new conn while the
+		// old one is live (#2033 MAJOR 1).
 		if ok {
 			slog.Info("ra: restarting sender", "interface", name)
-			toStop = append(toStop, existing)
 			delete(m.senders, name)
+			m.draining[name] = existing
+			existing.signalStop(modeHard)
+			toStop = append(toStop, stopReq{name, existing})
+			toRestart = append(toRestart, cfg)
+			continue
 		}
 
-		// If a tombstone is present (a prior withdraw/stop or a WithdrawOnce
-		// claim is still tearing down), defer — do not start a second conn.
+		// New interface. If a tombstone is already present (a prior withdraw/
+		// stop or a WithdrawOnce claim is still tearing down), defer — do not
+		// start a second conn.
 		if _, draining := m.draining[name]; draining {
 			deferred = append(deferred, cfg)
 			continue
@@ -141,13 +178,57 @@ func (m *Manager) Apply(configs []*config.RAInterfaceConfig) error {
 	epoch := m.epoch
 	m.mu.Unlock()
 
-	// Hard-stop removed/changed senders OUTSIDE the lock (#2033 I16): a stop
-	// joins the owner (~best-effort) and we must not hold m.mu across it.
-	for _, s := range toStop {
-		s.stop()
+	// Join the stopped (removed + changed) senders OUTSIDE the lock (#2033 I16):
+	// a stop joins the owner and we must not hold m.mu across it. The conn is
+	// closed by the owner in finishShutdown before stop() returns.
+	for _, req := range toStop {
+		<-req.s.stopped
 	}
 
-	// Second pass for interfaces that were draining when we held the lock.
+	// Now every old conn is closed. Clear the REMOVAL tombstones (their
+	// interfaces have no replacement); restart tombstones stay until the
+	// replacement starts.
+	if len(toStop) > 0 {
+		restartSet := make(map[string]struct{}, len(toRestart))
+		for _, cfg := range toRestart {
+			restartSet[cfg.Interface] = struct{}{}
+		}
+		m.mu.Lock()
+		for _, req := range toStop {
+			if _, isRestart := restartSet[req.name]; !isRestart {
+				delete(m.draining, req.name)
+			}
+		}
+		m.mu.Unlock()
+	}
+
+	// Start the replacements for changed configs now that the old conns are
+	// closed. Epoch-guarded: a concurrent Withdraw/Clear that bumped the epoch
+	// wins (it will have already moved/handled the interface), so we abort the
+	// stale restart and clear our tombstone.
+	for _, cfg := range toRestart {
+		m.mu.Lock()
+		if m.epoch != epoch {
+			// Superseded — a newer call owns this interface now. Drop our
+			// restart tombstone only if no newer owner re-installed it; the
+			// newer call manages its own tombstone, so only remove ours if it
+			// is still the placeholder we set and no sender exists.
+			delete(m.draining, cfg.Interface)
+			m.mu.Unlock()
+			slog.Debug("ra: restart superseded by newer epoch, skipping",
+				"interface", cfg.Interface)
+			continue
+		}
+		err := m.startLocked(cfg)
+		delete(m.draining, cfg.Interface)
+		m.mu.Unlock()
+		if err != nil && firstErr == nil {
+			firstErr = err
+		}
+	}
+
+	// Second pass for interfaces that were ALREADY draining when we held the
+	// lock (not our own restart tombstones — those are handled above).
 	if len(deferred) > 0 {
 		if err := m.applyDeferred(deferred, epoch); err != nil && firstErr == nil {
 			firstErr = err
@@ -233,6 +314,13 @@ func (m *Manager) startLocked(cfg *config.RAInterfaceConfig) error {
 	return nil
 }
 
+// drainingSender pairs a draining interface name with its sender for the
+// join-outside-the-lock phase.
+type drainingSender struct {
+	name string
+	s    *sender
+}
+
 // Withdraw sends goodbye RAs (lifetime=0) on all interfaces, then stops all
 // senders. This tells hosts to immediately remove this router as a default
 // gateway. The goodbye is the LAST RA each sender emits (owner-emitted on
@@ -244,8 +332,22 @@ func (m *Manager) Withdraw() error {
 	for name := range m.senders {
 		names = append(names, name)
 	}
+	// Also include interfaces already DRAINING (e.g. a Clear acquired m.mu
+	// first and hard-stopped them). claimGracefulLocked UPGRADES any such
+	// hard-draining sender to graceful so a "withdraw everything" still emits
+	// every goodbye (#2033 MAJOR 2); nil-sender claims (WithdrawOnce) are
+	// no-ops there.
+	for name := range m.draining {
+		names = append(names, name)
+	}
+	// Record the graceful intent ATOMICALLY with the epoch bump and the
+	// snapshot (#2033 MAJOR 2): tombstone + signalStop(modeGraceful) happen
+	// under the SAME m.mu hold, so a racing Clear that acquires m.mu afterward
+	// sees the sender already draining-graceful and cannot drop the goodbye
+	// (signalStop is idempotent + graceful never downgrades to hard).
+	ps := m.claimGracefulLocked(names)
 	m.mu.Unlock()
-	m.withdrawNamesGraceful(names)
+	m.joinDraining(ps)
 	return nil
 }
 
@@ -254,35 +356,48 @@ func (m *Manager) Withdraw() error {
 func (m *Manager) WithdrawInterfaces(names []string) {
 	m.mu.Lock()
 	m.bumpEpoch()
+	ps := m.claimGracefulLocked(names)
 	m.mu.Unlock()
-	m.withdrawNamesGraceful(names)
+	m.joinDraining(ps)
 }
 
-// withdrawNamesGraceful moves each named sender to a draining tombstone under
-// m.mu, releases the lock, then joins each (emitting its goodbye) OUTSIDE the
-// lock (#2033 I16) so multi-interface demotion does not stall Status/Apply on
-// the failover hot path. The tombstone is removed when the join completes.
-func (m *Manager) withdrawNamesGraceful(names []string) {
-	type pending struct {
-		name string
-		s    *sender
-	}
-	var ps []pending
-
-	m.mu.Lock()
+// claimGracefulLocked, under m.mu, moves each named active sender to a graceful
+// draining tombstone and signals it to emit its goodbye on exit. Doing the
+// tombstone install AND signalStop(modeGraceful) under the lock makes the
+// graceful intent atomic (#2033 MAJOR 2) — a later Clear cannot delete the
+// sender and install a hard tombstone in a gap, because by the time the lock is
+// released the sender is already gone from m.senders and already modeGraceful.
+// Callers must hold m.mu. Returns the senders to join outside the lock.
+func (m *Manager) claimGracefulLocked(names []string) []drainingSender {
+	var ps []drainingSender
 	for _, name := range names {
-		s, ok := m.senders[name]
-		if !ok {
+		if s, ok := m.senders[name]; ok {
+			slog.Info("ra: sending goodbye RA", "interface", name)
+			delete(m.senders, name)
+			m.draining[name] = s
+			s.signalStop(modeGraceful)
+			ps = append(ps, drainingSender{name, s})
 			continue
 		}
-		slog.Info("ra: sending goodbye RA", "interface", name)
-		delete(m.senders, name)
-		m.draining[name] = struct{}{}
-		s.signalStop(modeGraceful)
-		ps = append(ps, pending{name, s})
+		// Not active. If a sender is already DRAINING (e.g. a Clear acquired
+		// m.mu first and set a hard tombstone), UPGRADE it to graceful so the
+		// goodbye is still emitted (#2033 MAJOR 2). signalStop is idempotent and
+		// graceful never downgrades; the existing Clear/Apply join will emit the
+		// upgraded goodbye, so we do NOT add it to our own join list (avoid a
+		// double <-stopped on the same sender).
+		if s := m.draining[name]; s != nil {
+			slog.Info("ra: upgrading draining sender to graceful goodbye",
+				"interface", name)
+			s.signalStop(modeGraceful)
+		}
 	}
-	m.mu.Unlock()
+	return ps
+}
 
+// joinDraining joins each draining sender (emitting its goodbye) OUTSIDE m.mu
+// (#2033 I16) so multi-interface demotion does not stall Status/Apply on the
+// failover hot path, then removes each tombstone when its join completes.
+func (m *Manager) joinDraining(ps []drainingSender) {
 	for _, p := range ps {
 		<-p.s.stopped // owner emits the goodbye then closes the conn
 		m.mu.Lock()
@@ -332,8 +447,9 @@ func (m *Manager) WithdrawOnce(configs []*config.RAInterfaceConfig) {
 			continue
 		}
 		// Claim the interface so a concurrent Apply defers instead of starting
-		// a real sender during the goodbye.
-		m.draining[cfg.Interface] = struct{}{}
+		// a real sender during the goodbye. nil sender: the standalone goodbye
+		// is emitted synchronously below, there is no run() loop to upgrade.
+		m.draining[cfg.Interface] = nil
 		toGoodbye = append(toGoodbye, claimed{cfg})
 	}
 	m.mu.Unlock()
@@ -386,7 +502,10 @@ func (m *Manager) clearLocked() error {
 	var ps []pending
 	for name, s := range m.senders {
 		delete(m.senders, name)
-		m.draining[name] = struct{}{}
+		// Store the sender (not nil) so a racing graceful Withdraw can UPGRADE
+		// this hard stop to emit a goodbye (#2033 MAJOR 2). signalStop is
+		// idempotent; graceful never downgrades.
+		m.draining[name] = s
 		s.signalStop(modeHard)
 		ps = append(ps, pending{name, s})
 	}

@@ -49,6 +49,11 @@ type fakeConn struct {
 	// block) does not deadlock against the recording lock, and so concurrent
 	// set-by-test / read-by-owner is race-free.
 	beforeWrite atomic.Pointer[func(lifetime time.Duration)]
+
+	// beforeClose, if non-nil, is invoked at the top of Close so a test can
+	// hold the conn LIVE (block the owner's finishShutdown close) to probe the
+	// stop->start window. Same race-free atomic.Pointer discipline.
+	beforeClose atomic.Pointer[func()]
 }
 
 func newFakeConn() *fakeConn {
@@ -62,6 +67,15 @@ func (f *fakeConn) setBeforeWrite(fn func(lifetime time.Duration)) {
 		return
 	}
 	f.beforeWrite.Store(&fn)
+}
+
+// setBeforeClose installs (or clears, with nil) the Close hook race-free.
+func (f *fakeConn) setBeforeClose(fn func()) {
+	if fn == nil {
+		f.beforeClose.Store(nil)
+		return
+	}
+	f.beforeClose.Store(&fn)
 }
 
 func (f *fakeConn) WriteTo(m ndp.Message, _ *ipv6.ControlMessage, _ netip.Addr) error {
@@ -115,6 +129,9 @@ func (f *fakeConn) injectRS(src netip.Addr) {
 }
 
 func (f *fakeConn) Close() error {
+	if hook := f.beforeClose.Load(); hook != nil {
+		(*hook)()
+	}
 	f.mu.Lock()
 	already := f.closed
 	f.closed = true
@@ -816,4 +833,197 @@ func TestStatusReportsDraining(t *testing.T) {
 			t.Fatalf("draining entry lingered after Withdraw completed: %+v", info)
 		}
 	}
+}
+
+// configChanged returns a testCfg for iface with a DIFFERENT prefix so
+// configEqual reports a change (forcing Apply down the replace path).
+func configChanged(iface string) *config.RAInterfaceConfig {
+	c := testCfg(iface)
+	c.Prefixes = []*config.RAPrefix{
+		{Prefix: "2001:db8:dead::/64", OnLink: true, Autonomous: true},
+	}
+	return c
+}
+
+// TestT2a_ChangedConfigApplyNeverTwoLiveConns is the #2033 MAJOR 1 regression.
+// A changed-config Apply must STOP the old sender (close its conn) BEFORE
+// opening the replacement conn — never two live conns for one interface. The
+// old sender's conn.Close is held open via beforeClose; while it is held, a
+// changed-config Apply runs and we assert the live-conn count never exceeds 1
+// (i.e. the replacement conn is NOT opened until the old one is gone).
+//
+// NON-TAUTOLOGY: against the pre-fix code (startLocked(cfg) opens the new conn
+// BEFORE s.stop() runs) the replacement conn is opened while the old is still
+// live, so liveCount reaches 2 during the hold and this test FAILS.
+func TestT2a_ChangedConfigApplyNeverTwoLiveConns(t *testing.T) {
+	if _, err := net.InterfaceByName("lo"); err != nil {
+		t.Skip("lo interface unavailable")
+	}
+	getConn, liveCount := installFakeListen(t)
+
+	m := New()
+	if err := m.Apply([]*config.RAInterfaceConfig{testCfg("lo")}); err != nil {
+		t.Fatalf("initial Apply: %v", err)
+	}
+	old := waitConn(t, getConn, "lo")
+	waitWrites(t, old, 1) // sender is up and writing
+
+	// Hold the OLD sender's conn.Close open so the old sender stays live.
+	release := make(chan struct{})
+	closing := make(chan struct{})
+	var once sync.Once
+	old.setBeforeClose(func() {
+		once.Do(func() { close(closing) })
+		<-release
+	})
+
+	// Run the changed-config Apply concurrently; it must block stopping the old
+	// sender (its owner is parked in beforeClose) and must NOT open a new conn
+	// while the old is live.
+	applyDone := make(chan error, 1)
+	go func() {
+		applyDone <- m.Apply([]*config.RAInterfaceConfig{configChanged("lo")})
+	}()
+
+	// Wait until the old sender's close is in flight (Apply has reached the
+	// stop/join of the old sender).
+	select {
+	case <-closing:
+	case <-time.After(2 * time.Second):
+		t.Fatal("changed-config Apply never reached the old sender's close")
+	}
+
+	// While the old conn is held live, sample the live-conn count repeatedly.
+	// With the fix it stays 1 (replacement not yet opened); pre-fix it is 2.
+	for i := 0; i < 50; i++ {
+		if lc := liveCount(); lc > 1 {
+			t.Fatalf("two live conns during changed-config Apply (live=%d): "+
+				"replacement opened before the old conn closed (#2033 MAJOR 1)", lc)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+
+	// Release the old close; Apply completes and starts the replacement.
+	close(release)
+	select {
+	case err := <-applyDone:
+		if err != nil {
+			t.Fatalf("changed-config Apply returned: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("changed-config Apply did not complete after releasing the old close")
+	}
+
+	// Exactly one live conn (the replacement) and no lingering tombstone.
+	if lc := liveCount(); lc != 1 {
+		t.Fatalf("after replace: live conns = %d, want 1", lc)
+	}
+	for _, info := range m.Status() {
+		if info.State == "draining" {
+			t.Fatalf("draining tombstone lingered after replace: %+v", info)
+		}
+	}
+	_ = m.Clear()
+}
+
+// TestT7b_ManagerHardFirstThenGracefulStillGoodbye is the #2033 MAJOR 2
+// regression. A Clear (hard) can acquire m.mu first, delete the sender, install
+// a tombstone and signalStop(modeHard). A graceful Withdraw arriving afterward
+// must STILL cause the goodbye to be emitted — claimGracefulLocked UPGRADES the
+// still-draining hard sender to graceful, and signalStop's graceful-upgrades-
+// hard guarantees the owner emits the goodbye in finishShutdown.
+//
+// We force the interleave deterministically by PARKING the owner in its startup
+// burst (beforeWrite), i.e. BEFORE it ever reaches finishShutdown and reads its
+// mode. While parked: Clear signals hard, then Withdraw upgrades to graceful —
+// both Stores land before the owner reads the mode. Releasing the burst lets the
+// owner finish, see draining, and read the upgraded graceful mode → goodbye.
+//
+// NON-TAUTOLOGY: against the pre-fix code (Withdraw bumps epoch + unlocks, then
+// re-locks and sees no active sender → skips; Clear's hard tombstone is never
+// upgraded) NO goodbye is emitted and this test FAILS.
+func TestT7b_ManagerHardFirstThenGracefulStillGoodbye(t *testing.T) {
+	if _, err := net.InterfaceByName("lo"); err != nil {
+		t.Skip("lo interface unavailable")
+	}
+	fl := newFakeListen(t)
+
+	// Park the owner at its FIRST burst write, before it can reach the select
+	// loop or finishShutdown (where the mode is read). Pre-registered so it is
+	// in place before the owner's first write.
+	release := make(chan struct{})
+	parked := make(chan struct{})
+	var once sync.Once
+	fl.preHook("lo", func(lifetime time.Duration) {
+		if lifetime > 0 {
+			once.Do(func() { close(parked); <-release })
+		}
+	})
+
+	m := New()
+	if err := m.Apply([]*config.RAInterfaceConfig{testCfg("lo")}); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	fc := waitConn(t, fl.getConn, "lo")
+
+	<-parked // owner is blocked in its first burst write (mode not read yet)
+
+	// Clear (hard) first: deletes the sender, installs a hard tombstone,
+	// signalStop(modeHard). Its join blocks on the parked owner, so run it in a
+	// goroutine.
+	clearDone := make(chan error, 1)
+	go func() { clearDone <- m.Clear() }()
+
+	// Then a graceful Withdraw for the same interface. With no active sender it
+	// must find the draining (hard) sender and UPGRADE it to graceful. Poll
+	// until the Clear has installed the tombstone (Withdraw's upgrade is a
+	// no-op until then), then issue the Withdraw.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		ts := false
+		for _, info := range m.Status() {
+			if info.Interface == "lo" && info.State == "draining" {
+				ts = true
+			}
+		}
+		if ts {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("Clear never installed the draining tombstone")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	withdrawDone := make(chan error, 1)
+	go func() { withdrawDone <- m.Withdraw() }()
+	// Let the Withdraw acquire m.mu and upgrade the mode before we release.
+	time.Sleep(50 * time.Millisecond)
+
+	// Release the burst; the owner finishes it, sees draining, and reads the
+	// upgraded graceful mode in finishShutdown → emits the goodbye.
+	close(release)
+
+	select {
+	case <-clearDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Clear did not complete")
+	}
+	select {
+	case <-withdrawDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Withdraw did not complete")
+	}
+
+	writes := fc.snapshot()
+	var sawGoodbye bool
+	for _, w := range writes {
+		if w.lifetime == 0 {
+			sawGoodbye = true
+		}
+	}
+	if !sawGoodbye {
+		t.Fatalf("no goodbye emitted: a graceful Withdraw racing a hard Clear "+
+			"must still emit the goodbye (#2033 MAJOR 2); writes=%+v", writes)
+	}
+	assertGoodbyeIsLast(t, writes)
 }
