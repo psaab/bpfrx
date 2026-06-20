@@ -108,3 +108,43 @@ func TestValidateEventAttributesMatch_Direct(t *testing.T) {
 		t.Fatal("invalid pattern accepted by ValidateEventAttributesMatch")
 	}
 }
+
+// #2063 review: the strict commit-time rejection must DOWNGRADE to a warning
+// on the tolerant load path. A config persisted under the pre-#2008
+// literal-equality matcher can hold a non-RE2 attributes-match pattern; an
+// upgrading node must boot through it (CompileConfigLenient) rather than fail
+// to load, mirroring every sibling lenient validator.
+func TestEventAttributesMatch_InvalidPatternLenientDowngrade(t *testing.T) {
+	tree := &ConfigTree{}
+	for _, line := range []string{
+		`set event-options policy p1 events ping_test_failed`,
+		`set event-options policy p1 attributes-match "ping_test_failed.test-owner matches [unterminated"`,
+	} {
+		path, err := ParseSetCommand(line)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", line, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%q): %v", line, err)
+		}
+	}
+	// Strict commit still rejects (guards against the downgrade leaking to commit).
+	if _, err := CompileConfig(tree); err == nil {
+		t.Fatal("strict CompileConfig accepted an invalid pattern; commit must stay strict")
+	}
+	// Tolerant load boots through with a warning.
+	cfg, err := CompileConfigLenient(tree)
+	if err != nil {
+		t.Fatalf("CompileConfigLenient hard-errored on an invalid persisted pattern; want boot-through: %v", err)
+	}
+	found := false
+	for _, w := range cfg.Warnings {
+		if strings.Contains(w, "attributes-match") && strings.Contains(w, "tolerant path") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("lenient load did not emit the attributes-match downgrade warning; got %v", cfg.Warnings)
+	}
+}

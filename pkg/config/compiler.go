@@ -125,6 +125,14 @@ type compileOpts struct {
 	// compile decision and deliberately does NOT live in SchemaValidate
 	// (which only warns on the tolerant paths since #1319 PR 2).
 	lenientPolicyMatchAddress bool
+	// lenientEventAttributesMatch downgrades an uncompilable
+	// event-options attributes-match regex from a hard error to a warning
+	// on the tolerant load path. A config persisted under pre-#2008 xpf
+	// (literal-equality matcher, any string accepted) may hold a pattern
+	// that is not valid RE2; a node upgrading to the regex matcher must
+	// still boot through that already-committed config rather than fail to
+	// load. Commit stays strict (see the validator call site).
+	lenientEventAttributesMatch bool
 }
 
 // CompileConfig converts a parsed ConfigTree AST into a typed Config struct.
@@ -151,6 +159,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientDeviceMap:             true,
 		lenientPolicyMatchAddress:    true,
 		lenientTCPMSSRange:           true,
+		lenientEventAttributesMatch: true,
 	})
 }
 
@@ -228,6 +237,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientDeviceMap:             true,
 		lenientPolicyMatchAddress:    true,
 		lenientTCPMSSRange:           true,
+		lenientEventAttributesMatch: true,
 	})
 }
 
@@ -564,11 +574,18 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 	// #2008 M7: event-options attributes-match patterns are RE2 regexes
 	// (Junos `matches` semantics). Reject an uncompilable pattern at commit
 	// so the operator gets immediate feedback instead of the event engine
-	// silently dropping the constraint at runtime. Strict on every path: a
-	// pattern that does not compile can never have a useful runtime effect,
-	// so there is nothing to be lenient about.
+	// silently dropping the constraint at runtime. On the tolerant LOAD path
+	// (#2063 review), downgrade to a warning: a config persisted under the
+	// pre-#2008 literal-equality matcher could hold a non-RE2 pattern, and an
+	// upgrading node must still boot through it (mirrors every sibling
+	// validator above). Commit stays strict.
 	if err := ValidateEventAttributesMatch(cfg); err != nil {
-		return nil, err
+		if opts.lenientEventAttributesMatch {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("event-options attributes-match (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
 	}
 
 	if warnings := ValidateConfig(cfg); len(warnings) > 0 {
