@@ -962,6 +962,47 @@ func assertReconcilePreservesOwned(t *testing.T, family int, healthyHeader, heal
 	}
 }
 
+// assertReconcilePreservesOwnedRow is like assertReconcilePreservesOwned but
+// writes the mangled cycle-2 file as header-only when mangledRow is empty
+// (the Codex-r4 header-only trigger), avoiding an ambiguous trailing blank
+// line. A non-empty mangledRow is appended as a normal data row.
+func assertReconcilePreservesOwnedRow(t *testing.T, family int, healthyHeader, healthyRow, mangledHeader, mangledRow, ownIdentity, ownAddr string) {
+	t.Helper()
+	up := newFakeUpdater()
+	m := testDDNS(t, up)
+	cfg := &config.DHCPServerConfig{
+		DynamicDNS: &config.DHCPDynamicDNSConfig{
+			Enabled: true, Domain: "example.com", TTLSeconds: 300,
+		},
+	}
+	leasePath := m.leasePath4
+	if family == 6 {
+		leasePath = m.leasePath6
+	}
+	writeCSV(t, leasePath, healthyHeader+"\n"+healthyRow+"\n")
+	if err := m.Reconcile(context.Background(), cfg); err != nil {
+		t.Fatalf("cycle 1 reconcile: %v", err)
+	}
+	if _, ok := m.state.get(ownIdentity, ownAddr); !ok {
+		t.Fatalf("cycle 1 did not record owned record %s|%s; state=%+v", ownIdentity, ownAddr, m.state.records)
+	}
+	up.deletes = nil
+	mangled := mangledHeader + "\n"
+	if mangledRow != "" {
+		mangled += mangledRow + "\n"
+	}
+	writeCSV(t, leasePath, mangled)
+	if err := m.Reconcile(context.Background(), cfg); err == nil {
+		t.Fatal("mangled header must surface a parse error from Reconcile")
+	}
+	if len(up.deletes) != 0 {
+		t.Fatalf("records deleted on a mangled header-only file (record loss): %v", up.deleteNames())
+	}
+	if _, ok := m.state.get(ownIdentity, ownAddr); !ok {
+		t.Fatalf("owned record %s|%s lost on a mangled header-only file", ownIdentity, ownAddr)
+	}
+}
+
 // TestParseActiveLeasesNamingColumnRequired proves Codex-r3 MAJOR-A: if the
 // naming column ("hostname") is missing while address+state remain, the
 // pre-fix parser SUCCEEDS with empty names, Reconcile skips every lease as
@@ -1102,6 +1143,137 @@ func TestLeaseColumnValueLowerCasesLookupName(t *testing.T) {
 			t.Fatalf("leaseColumnValue(%q) = %q, want %q (lookup name not lower-cased)", tc.name, got, tc.want)
 		}
 	}
+}
+
+// TestParseActiveLeasesHeaderOnlyValidatesBeforeEmptyReturn proves the
+// Codex-r4 MAJOR: the required-column validation must run BEFORE the
+// zero-data-row trusted-empty return, so a header-only file (1 record =
+// header, no data rows) with a MANGLED header still ERRORS instead of
+// short-circuiting to a trusted (nil, nil) empty result. Against the pre-fix
+// code the `len(records) < 2` early return fired first, returning trusted
+// empty for a mangled header-only file → Reconcile ran the destructive pass →
+// mass-delete. These sub-cases assert the parser errors and (end to end) no
+// owned record is deleted.
+func TestParseActiveLeasesHeaderOnlyValidatesBeforeEmptyReturn(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+
+	// Direct parser: a header-only file with a mangled header errors.
+	t.Run("v4 header-only missing hostname errors", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "l4.csv")
+		// Header line only (no data rows), missing the required "hostname".
+		writeCSV(t, path, "address,hwaddr,client_id,valid_lifetime,expire,subnet_id,state\n")
+		if _, err := parseActiveLeases4(path, now); err == nil {
+			t.Fatal("header-only file with a mangled header must error (not trusted-empty)")
+		}
+	})
+	t.Run("v4 header-only missing identity errors", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "l4.csv")
+		writeCSV(t, path, "address,valid_lifetime,expire,subnet_id,hostname,state\n")
+		if _, err := parseActiveLeases4(path, now); err == nil {
+			t.Fatal("header-only file missing identity columns must error")
+		}
+	})
+	t.Run("v6 header-only missing identity errors", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "l6.csv")
+		writeCSV(t, path, "address,valid_lifetime,expire,subnet_id,hostname,state\n")
+		if _, err := parseActiveLeases6(path, now); err == nil {
+			t.Fatal("v6 header-only file missing identity columns must error")
+		}
+	})
+
+	// End to end: a header-only mangled file must NOT mass-delete owned
+	// records (the same destructive vector reached through the header-only
+	// trigger). assertReconcilePreservesOwned seeds via a healthy header then
+	// re-runs with the mangled (here: header-only) header.
+	t.Run("v4 header-only mangled does not mass-delete via Reconcile", func(t *testing.T) {
+		assertReconcilePreservesOwnedRow(t, 4,
+			"address,hwaddr,client_id,valid_lifetime,expire,subnet_id,hostname,state",
+			"10.0.0.10,aa,,3600,1900000000,1,host-a,0",
+			"address,hwaddr,client_id,valid_lifetime,expire,subnet_id,state", // header-only, missing hostname
+			"", // no data row
+			"mac:aa", "10.0.0.10")
+	})
+}
+
+// TestParseActiveLeasesHeaderOnlyValidGoodIsTrustedEmpty proves the legitimate
+// case stays correct: a file with a VALID header and ZERO data rows is a
+// trusted zero-lease (nil, nil) — a genuinely-empty Kea, so clearing owned DNS
+// records is correct. End to end, an owned record IS removed when the lease
+// file becomes header-only-valid.
+func TestParseActiveLeasesHeaderOnlyValidGoodIsTrustedEmpty(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	t.Run("v4 valid header-only is trusted empty", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "l4.csv")
+		writeCSV(t, path, "address,hwaddr,client_id,valid_lifetime,expire,subnet_id,hostname,state\n")
+		leases, err := parseActiveLeases4(path, now)
+		if err != nil {
+			t.Fatalf("valid header-only file must be trusted-empty, got error: %v", err)
+		}
+		if len(leases) != 0 {
+			t.Fatalf("valid header-only file should yield 0 leases, got %d", len(leases))
+		}
+	})
+	t.Run("v4 valid header-only clears owned record via Reconcile", func(t *testing.T) {
+		up := newFakeUpdater()
+		m := testDDNS(t, up)
+		cfg := &config.DHCPServerConfig{
+			DynamicDNS: &config.DHCPDynamicDNSConfig{
+				Enabled: true, Domain: "example.com", TTLSeconds: 300,
+			},
+		}
+		// Cycle 1: one active lease -> owned.
+		writeCSV(t, m.leasePath4, "address,hwaddr,client_id,valid_lifetime,expire,subnet_id,hostname,state\n"+
+			"10.0.0.10,aa,,3600,1900000000,1,host-a,0\n")
+		if err := m.Reconcile(context.Background(), cfg); err != nil {
+			t.Fatalf("cycle 1 reconcile: %v", err)
+		}
+		if _, ok := m.state.get("mac:aa", "10.0.0.10"); !ok {
+			t.Fatal("cycle 1 did not record owned record")
+		}
+		// Cycle 2: the lease genuinely drains -> valid header, no data rows.
+		// The owned record must be cleaned (trusted-empty permits deletion).
+		writeCSV(t, m.leasePath4, "address,hwaddr,client_id,valid_lifetime,expire,subnet_id,hostname,state\n")
+		if err := m.Reconcile(context.Background(), cfg); err != nil {
+			t.Fatalf("cycle 2 reconcile: %v", err)
+		}
+		if _, ok := m.state.get("mac:aa", "10.0.0.10"); ok {
+			t.Fatal("valid header-only (genuinely empty) did not clear the owned record")
+		}
+	})
+}
+
+// TestParseActiveLeasesEmptyFileIsUntrusted proves a 0-record EXISTING file
+// (no header at all — anomalous, e.g. mid-write/truncated) fails SAFE: it
+// errors rather than returning a trusted-empty result, so Reconcile does not
+// mass-delete on an unvalidatable file. A genuinely MISSING file stays a
+// trusted-empty (handled by os.IsNotExist, asserted separately).
+func TestParseActiveLeasesEmptyFileIsUntrusted(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+
+	t.Run("zero-byte existing file errors", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "l4.csv")
+		writeCSV(t, path, "") // exists, zero records
+		if _, err := parseActiveLeases4(path, now); err == nil {
+			t.Fatal("a 0-record existing lease file must error (fail-safe untrusted), not trusted-empty")
+		}
+	})
+
+	t.Run("missing file stays trusted-empty", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "does-not-exist.csv")
+		leases, err := parseActiveLeases4(path, now)
+		if err != nil {
+			t.Fatalf("a genuinely missing file must be trusted-empty, got error: %v", err)
+		}
+		if leases != nil {
+			t.Fatalf("missing file should yield nil leases, got %+v", leases)
+		}
+	})
 }
 
 // ---- state store persistence ----

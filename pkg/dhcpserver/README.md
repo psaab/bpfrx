@@ -92,11 +92,18 @@ What increment 1 ships (the fully unit-testable, lab-free slice):
   (absence degrades safely, no record loss): `fqdn_fwd` (defaults to
   host-name semantics), `expire` (no expiry tombstoning — `state` still
   gates active/tombstone; over-retain, not delete), `subnet_id` (pure
-  metadata, not compared by `recordsEqual`). An empty FILE (no data rows)
-  is still a legitimate zero-lease, no-error case; a present-but-mangled
-  header IS an error. The fail direction (over-mark-untrusted for an exotic
-  header → no publish/clean, operator-visible) is SAFE; silent
-  mass-delete/record-loss is not.
+  metadata, not compared by `recordsEqual`). The header is validated BEFORE
+  the zero-data-row early return (Codex r4), so the trusted-empty result —
+  which is what PERMITS `Reconcile` to clear a family's owned records — is
+  returned ONLY when the lease set is provably empty: the file is genuinely
+  MISSING (`os.IsNotExist`, "no leases yet"), OR the header is present AND
+  valid AND there are simply no active data rows (a genuinely-drained Kea).
+  A present-but-mangled header errors WITH OR WITHOUT data rows (so a
+  header-only mangled file cannot short-circuit to trusted-empty), and a
+  0-record EXISTING file (no header at all — anomalous, mid-write/corrupt)
+  fails SAFE as an error rather than trusted-empty. The fail direction
+  (over-mark-untrusted for an exotic/unreadable file → no publish/clean,
+  operator-visible) is SAFE; silent mass-delete/record-loss is not.
 - **Hostname normalization** — `deriveFQDN` / `finalizeFQDN`
   (`ddns_hostname.go`) ALWAYS contains the published name in the configured
   zone: the client picks the host part, the firewall picks the domain. A

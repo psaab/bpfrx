@@ -233,6 +233,36 @@
   verified: a no-standalone mutant fails T7c+T2b; an always-standalone mutant
   fails T7d (double goodbye).
 - **File(s)**: pkg/ra/serialize_test.go, _Log.md
+## 2026-06-19 — #1387 DDNS PR #2043: validate header before empty return (Codex r4)
+
+- **Timestamp**: 2026-06-19
+- **Action**: Fix Codex round-4's one MAJOR: the required-column validation
+  was BYPASSED for header-only / zero-data-row files. parseActiveLeases
+  returned `nil, nil` on `len(records) < 2` BEFORE building the cols map
+  and running the required-column check, so a file with ONLY a header (no
+  data rows) and a MANGLED header (missing hostname/identity) was treated
+  as a TRUSTED zero-lease result → Reconcile ran the destructive pass →
+  mass-delete of the family's owned records. Same destructive class,
+  header-only trigger. Fix: REORDER so a present header is ALWAYS validated
+  before any trusted-empty return. (1) A 0-record EXISTING file (no header
+  — Kea always writes one, so this is mid-write/corrupt) now ERRORS
+  (fail-safe untrusted), not trusted-empty; a genuinely MISSING file keeps
+  its `os.IsNotExist` → nil,nil. (2) Build cols + run required-column
+  validation FIRST; a mangled header errors with or without data rows. (3)
+  Only AFTER the header validates good is a header-with-zero-data-rows
+  returned as a legitimate trusted zero-lease (so a genuinely-drained Kea
+  still clears owned records). Net: trusted-empty (which permits deleting
+  owned records) is returned ONLY when the file is missing, OR the header
+  is present AND valid AND there are no active data rows. Five new
+  non-tautological tests (header-only mangled v4/v6 errors + end-to-end
+  no-mass-delete; valid header-only is trusted-empty + clears owned via
+  Reconcile; 0-byte existing file errors; missing file stays trusted).
+  The mangled/0-byte cases FAIL against pre-fix head b45c80c2; the
+  legitimate cases pass both pre- and post-fix (not over-broad). README
+  updated.
+- **File(s)**: pkg/dhcpserver/ddns_leases.go,
+  pkg/dhcpserver/ddns_test.go, pkg/dhcpserver/README.md, _Log.md
+
 ## 2026-06-19 — #1387 DDNS PR #2043: generalize header validation (Codex r3)
 
 - **Timestamp**: 2026-06-19

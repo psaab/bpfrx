@@ -113,8 +113,31 @@ func parseActiveLeases(path string, family int, now time.Time) ([]ddnsLease, err
 	if err != nil {
 		return nil, fmt.Errorf("parse %s: %w", path, err)
 	}
-	if len(records) < 2 {
-		return nil, nil
+
+	// Fail-safe (#1387 + Codex r4): the trusted-empty result (nil, nil) is
+	// what PERMITS Reconcile to delete a family's owned records, so it must
+	// be returned ONLY when we can prove the lease set is genuinely empty —
+	// never when the header is unrecognizable. Order matters:
+	//
+	//   1. An existing-but-0-record file (no header at all) is anomalous —
+	//      Kea always writes a header line when it creates the memfile, so a
+	//      headerless existing file is a mid-write / truncated / corrupt read.
+	//      We cannot validate columns, so fail SAFE (error → untrusted →
+	//      Reconcile SKIPS the destructive diff), not trusted-empty. (A
+	//      genuinely MISSING file already returned nil,nil above via
+	//      os.IsNotExist — "no leases yet" is a legitimate trusted-empty.)
+	//   2. A present header is ALWAYS validated BEFORE any trusted-empty
+	//      return, so a mangled header (missing required column) errors even
+	//      for a header-only / zero-data-row file. This closes the Codex-r4
+	//      hole where len(records) < 2 short-circuited ahead of validation,
+	//      re-opening the mass-delete via a header-only mangled file.
+	//   3. Only AFTER the header validates as GOOD is a header-with-zero-data
+	//      -rows treated as a legitimate trusted zero-lease (nil, nil): a
+	//      healthy header + no active rows genuinely means "no active
+	//      leases", and clearing owned DNS records is then correct.
+	if len(records) == 0 {
+		return nil, fmt.Errorf("parse %s: Kea %s lease file has no header (anomalous: mid-write or corrupt)",
+			path, familyLabel(family))
 	}
 
 	// Build the header->index map with CASE-INSENSITIVE keys. Kea's real
@@ -130,18 +153,17 @@ func parseActiveLeases(path string, family int, now time.Time) ([]ddnsLease, err
 		return leaseColumnValue(cols, fields, name)
 	}
 
-	// Fail-safe header validation (#1387 MAJOR-4 + Codex r3 MAJOR-A/B): the
+	// Header validation (#1387 MAJOR-4 + Codex r3 MAJOR-A/B + r4): the
 	// reconciler's destructive delete pass treats an EMPTY (or wrongly-keyed)
 	// desired set as ground truth. A mangled header — a required column
 	// missing or renamed — parses with NO error but silently changes whether
 	// leases are published (naming), how they are keyed (identity), or whether
 	// they are active (state), so Reconcile would mass-delete or churn
 	// (delete+re-add, losing the record on a failed re-add) owned records. So
-	// any MISSING required column for this family is a hard parse error;
-	// Reconcile then marks the family untrusted and SKIPS the destructive
-	// diff. An empty FILE (handled above by len(records) < 2) is a legitimate
-	// zero-lease case and is NOT an error; a present-but-mangled header IS.
-	// See requiredLeaseColumns for the per-column destructive-path rationale.
+	// any MISSING required column for this family is a hard parse error —
+	// checked BEFORE the zero-data-row return so a header-only mangled file
+	// also errors; Reconcile then marks the family untrusted and SKIPS the
+	// destructive diff. See requiredLeaseColumns for the per-column rationale.
 	var missing []string
 	for _, req := range requiredLeaseColumns[family] {
 		if _, ok := cols[req]; !ok {
@@ -151,6 +173,13 @@ func parseActiveLeases(path string, family int, now time.Time) ([]ddnsLease, err
 	if len(missing) > 0 {
 		return nil, fmt.Errorf("parse %s: missing required column(s) %v in Kea %s lease header",
 			path, missing, familyLabel(family))
+	}
+
+	// Header is present AND valid. A file with only a header (zero data rows)
+	// is now a LEGITIMATE trusted zero-lease result — return early before the
+	// per-row loop so a genuinely-empty Kea correctly clears owned records.
+	if len(records) < 2 {
+		return nil, nil
 	}
 
 	// Kea appends rows; the LAST row for an address is authoritative (lease
