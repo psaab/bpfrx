@@ -105,12 +105,12 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 								}
 								for _, kc := range authChild.Children {
 									if kc.Name() == "key" {
-										iface.AuthKey = nodeVal(kc)
+										iface.AuthKey = Secret(nodeVal(kc))
 									}
 								}
 							case "simple-password":
 								iface.AuthType = "simple"
-								iface.AuthKey = nodeVal(authChild)
+								iface.AuthKey = Secret(nodeVal(authChild))
 							}
 						}
 					case "bfd-liveness-detection":
@@ -346,7 +346,7 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 							FamilyInet:       familyInet,
 							FamilyInet6:      familyInet6,
 							GroupName:        groupInst.name,
-							AuthPassword:     groupAuthKey,
+							AuthPassword:     Secret(groupAuthKey),
 							BFD:              groupBFD,
 							BFDInterval:      groupBFDInterval,
 							BFDMultiplier:    groupBFDMultiplier,
@@ -374,7 +374,7 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 									}
 								}
 							case "authentication-key":
-								neighbor.AuthPassword = nodeVal(prop)
+								neighbor.AuthPassword = Secret(nodeVal(prop))
 							case "route-reflector-client":
 								neighbor.RouteReflectorClient = true
 							case "default-originate":
@@ -517,7 +517,7 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 				}
 			case "authentication-key":
 				if v := nodeVal(child); v != "" {
-					proto.RIP.AuthKey = v
+					proto.RIP.AuthKey = Secret(v)
 				}
 			case "authentication-type":
 				if v := nodeVal(child); v != "" {
@@ -550,7 +550,7 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 				}
 			case "authentication-key":
 				if v := nodeVal(child); v != "" {
-					proto.ISIS.AuthKey = v
+					proto.ISIS.AuthKey = Secret(v)
 				}
 			case "authentication-type":
 				if v := nodeVal(child); v != "" {
@@ -578,7 +578,7 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 								}
 							}
 						case "authentication-key":
-							iface.AuthKey = nodeVal(prop)
+							iface.AuthKey = Secret(nodeVal(prop))
 						case "authentication-type":
 							iface.AuthType = nodeVal(prop)
 						case "bfd-liveness-detection":

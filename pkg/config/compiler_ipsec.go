@@ -56,11 +56,11 @@ func compileIKE(node *Node, sec *SecurityConfig) error {
 			case "pre-shared-key":
 				// "pre-shared-key ascii-text VALUE" or children
 				if len(p.Keys) >= 3 {
-					pol.PSK = p.Keys[2]
+					pol.PSK = Secret(p.Keys[2])
 				} else {
 					for _, c := range p.Children {
 						if c.Name() == "ascii-text" {
-							pol.PSK = nodeVal(c)
+							pol.PSK = Secret(nodeVal(c))
 						}
 					}
 				}
@@ -355,7 +355,7 @@ func compileIPsec(node *Node, sec *SecurityConfig) error {
 			case "remote-identity":
 				vpn.RemoteID = v
 			case "pre-shared-key":
-				vpn.PSK = v
+				vpn.PSK = Secret(v)
 			case "local-address":
 				vpn.LocalAddr = v
 			}

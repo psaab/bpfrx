@@ -156,7 +156,7 @@ type RIPConfig struct {
 	Interfaces   []string // interfaces participating in RIP
 	Passive      []string // passive interfaces (receive only)
 	Redistribute []string // "connected", "static", "ospf"
-	AuthKey      string   // authentication key/password
+	AuthKey      Secret   // authentication key/password; redacted on marshal (#2053)
 	AuthType     string   // "md5" or "simple"
 }
 
@@ -166,7 +166,7 @@ type ISISConfig struct {
 	Level           string // "level-1", "level-2", "level-1-2" (default "level-2")
 	Interfaces      []*ISISInterface
 	Export          []string // "connected", "static", etc.
-	AuthKey         string   // area-level authentication key
+	AuthKey         Secret   // area-level authentication key; redacted on marshal (#2053)
 	AuthType        string   // "md5" or "simple" (plaintext)
 	WideMetricsOnly bool     // use wide (32-bit) metrics
 	Overload        bool     // set overload bit
@@ -178,7 +178,7 @@ type ISISInterface struct {
 	Level         string // override per-interface
 	Passive       bool
 	Metric        int    // 0 = default
-	AuthKey       string // per-interface authentication key
+	AuthKey       Secret // per-interface authentication key; redacted on marshal (#2053)
 	AuthType      string // "md5" or "simple"
 	BFD           bool   // enable BFD on this interface
 	BFDInterval   int    // BFD minimum-interval in ms (0 = default)
@@ -243,7 +243,7 @@ type OSPFInterface struct {
 	Cost          int    // OSPF cost, 0 = default
 	NetworkType   string // "point-to-point", "broadcast", "" (default)
 	AuthType      string // "md5", "simple", "" (none)
-	AuthKey       string // authentication key/password
+	AuthKey       Secret // authentication key/password; redacted on marshal (#2053)
 	AuthKeyID     int    // key-id for MD5 (1-255)
 	BFD           bool   // enable BFD on this interface
 	BFDInterval   int    // BFD minimum-interval in ms (0 = default)
@@ -278,7 +278,7 @@ type BGPNeighbor struct {
 	FamilyInet           bool     // activate under address-family ipv4 unicast
 	FamilyInet6          bool     // activate under address-family ipv6 unicast
 	GroupName            string   // BGP group name (for display)
-	AuthPassword         string   // TCP MD5 password for BGP session
+	AuthPassword         Secret   // TCP MD5 password for BGP session; redacted on marshal (#2053)
 	BFD                  bool     // enable BFD for this neighbor
 	BFDInterval          int      // BFD minimum interval in ms (0 = default 300)
 	BFDMultiplier        int      // BFD detect-multiplier (0 = default 3)
@@ -328,7 +328,7 @@ type TunnelConfig struct {
 	// full Junos wireguard grammar (S6). The engine keys encap on
 	// WgPeerPubkeyHex, NOT AllowedIPs LPM (cryptokey-routing safety).
 	WgListenPort      uint16   // local UDP listen port for inbound WG
-	WgLocalPrivkeyHex string   // local static X25519 private key (hex, 64 chars)
+	WgLocalPrivkeyHex Secret   // local static X25519 private key (hex, 64 chars); redacted on marshal (#2053)
 	WgPeerPubkeyHex   string   // peer static X25519 public key (hex)
 	WgAllowedIPs      []string // peer AllowedIPs (CIDR); decap inner-src gate only
 	WgEndpoint        string   // optional peer endpoint IP:port (initiator role)

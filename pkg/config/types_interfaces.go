@@ -75,7 +75,7 @@ type VRRPGroup struct {
 	AcceptData         bool
 	AdvertiseInterval  int    // seconds, default 1
 	AuthType           string // "md5" or ""
-	AuthKey            string
+	AuthKey            Secret // VRRP auth key; redacted on JSON/YAML marshal (#2053)
 	TrackInterface     string // lower priority if interface is down
 	TrackPriorityDelta int    // how much to lower priority
 }

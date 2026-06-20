@@ -472,7 +472,7 @@ type IKEPolicy struct {
 	Name      string
 	Mode      string // "main" or "aggressive"
 	Proposals string // IKE proposal reference
-	PSK       string // pre-shared key
+	PSK       Secret // pre-shared key; redacted on JSON/YAML marshal (#2053)
 }
 
 // IPsecProposal defines Phase 2 (ESP) encryption and authentication parameters.
@@ -526,7 +526,7 @@ type IPsecVPN struct {
 	IPsecPolicy      string // IPsec policy reference
 	LocalID          string // local traffic selector (CIDR)
 	RemoteID         string // remote traffic selector (CIDR)
-	PSK              string // pre-shared key (legacy, prefer IKE policy)
+	PSK              Secret // pre-shared key (legacy, prefer IKE policy); redacted on marshal (#2053)
 	LocalAddr        string // local address
 	BindInterface    string // tunnel interface (e.g. "st0.0") — creates xfrmi with if_id
 	DFBit            string // "copy", "set", "clear"

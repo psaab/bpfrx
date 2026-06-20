@@ -197,10 +197,10 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 					if keyID == 0 {
 						keyID = 1
 					}
-					fmt.Fprintf(&b, " ip ospf message-digest-key %d md5 %s\n", keyID, sanitizeFRRValue(iface.AuthKey))
+					fmt.Fprintf(&b, " ip ospf message-digest-key %d md5 %s\n", keyID, sanitizeFRRValue(iface.AuthKey.Reveal()))
 				} else if iface.AuthType == "simple" {
 					b.WriteString(" ip ospf authentication\n")
-					fmt.Fprintf(&b, " ip ospf authentication-key %s\n", sanitizeFRRValue(iface.AuthKey))
+					fmt.Fprintf(&b, " ip ospf authentication-key %s\n", sanitizeFRRValue(iface.AuthKey.Reveal()))
 				}
 				if iface.BFD {
 					if iface.BFDInterval > 0 || iface.BFDMultiplier > 0 {
@@ -292,7 +292,7 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 				fmt.Fprintf(&b, " neighbor %s ebgp-multihop %d\n", n.Address, n.MultihopTTL)
 			}
 			if n.AuthPassword != "" {
-				fmt.Fprintf(&b, " neighbor %s password %s\n", n.Address, sanitizeFRRValue(n.AuthPassword))
+				fmt.Fprintf(&b, " neighbor %s password %s\n", n.Address, sanitizeFRRValue(n.AuthPassword.Reveal()))
 			}
 			if n.BFD {
 				fmt.Fprintf(&b, " neighbor %s bfd\n", n.Address)
@@ -388,7 +388,7 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 				} else {
 					b.WriteString(" ip rip authentication mode text\n")
 				}
-				fmt.Fprintf(&b, " ip rip authentication string %s\n", sanitizeFRRValue(rip.AuthKey))
+				fmt.Fprintf(&b, " ip rip authentication string %s\n", sanitizeFRRValue(rip.AuthKey.Reveal()))
 				b.WriteString("exit\n!\n")
 			}
 		}
@@ -422,11 +422,11 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 		}
 		if isis.AuthKey != "" {
 			if isis.AuthType == "md5" {
-				fmt.Fprintf(&b, " area-password md5 %s\n", sanitizeFRRValue(isis.AuthKey))
-				fmt.Fprintf(&b, " domain-password md5 %s\n", sanitizeFRRValue(isis.AuthKey))
+				fmt.Fprintf(&b, " area-password md5 %s\n", sanitizeFRRValue(isis.AuthKey.Reveal()))
+				fmt.Fprintf(&b, " domain-password md5 %s\n", sanitizeFRRValue(isis.AuthKey.Reveal()))
 			} else {
-				fmt.Fprintf(&b, " area-password clear %s\n", sanitizeFRRValue(isis.AuthKey))
-				fmt.Fprintf(&b, " domain-password clear %s\n", sanitizeFRRValue(isis.AuthKey))
+				fmt.Fprintf(&b, " area-password clear %s\n", sanitizeFRRValue(isis.AuthKey.Reveal()))
+				fmt.Fprintf(&b, " domain-password clear %s\n", sanitizeFRRValue(isis.AuthKey.Reveal()))
 			}
 		}
 		b.WriteString("exit\n!\n")
@@ -441,9 +441,9 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 			}
 			if iface.AuthKey != "" {
 				if iface.AuthType == "md5" {
-					fmt.Fprintf(&b, " isis password md5 %s\n", sanitizeFRRValue(iface.AuthKey))
+					fmt.Fprintf(&b, " isis password md5 %s\n", sanitizeFRRValue(iface.AuthKey.Reveal()))
 				} else {
-					fmt.Fprintf(&b, " isis password clear %s\n", sanitizeFRRValue(iface.AuthKey))
+					fmt.Fprintf(&b, " isis password clear %s\n", sanitizeFRRValue(iface.AuthKey.Reveal()))
 				}
 			}
 			b.WriteString("exit\n!\n")

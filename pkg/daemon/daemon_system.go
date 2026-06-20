@@ -822,7 +822,7 @@ func (d *Daemon) applySystemLogin(cfg *config.Config) {
 //     credential — but only for the exact xpf-provisioned account (marker
 //     UID matches the current UID) and never on a shadow read error.
 func (d *Daemon) reconcileUserPassword(user *config.LoginUser) {
-	desired := user.EncryptedPassword
+	desired := user.EncryptedPassword.Reveal()
 	curUID, uidOK := lookupUID(user.Name)
 	cur, ok := currentShadowHash(user.Name)
 
@@ -950,11 +950,11 @@ func (d *Daemon) applyRootAuth(cfg *config.Config) {
 		// skip+warn so "plaintext never reaches /etc/shadow" holds for root
 		// on every path too, without bricking boot. SSH keys below are
 		// still applied regardless.
-		if err := config.ValidateCryptHash(ra.EncryptedPassword, nil); err != nil {
+		if err := config.ValidateCryptHash(ra.EncryptedPassword.Reveal(), nil); err != nil {
 			slog.Warn("refusing to apply invalid root encrypted-password to /etc/shadow", "err", err)
 		} else {
 			// Use chpasswd -e to set pre-hashed password
-			stdin := strings.NewReader("root:" + ra.EncryptedPassword + "\n")
+			stdin := strings.NewReader("root:" + ra.EncryptedPassword.Reveal() + "\n")
 			if out, err := runCommandStdinTimeout(stdin, "chpasswd", "-e"); err != nil {
 				slog.Warn("failed to set root password", "err", err, "output", string(out))
 			} else {

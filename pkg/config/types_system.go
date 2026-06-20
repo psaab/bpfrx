@@ -1,6 +1,10 @@
 package config
 
-import "fmt"
+import (
+	"encoding/json"
+	"fmt"
+	"sort"
+)
 
 // System and platform-services configuration: system stanza, userspace
 // dataplane, syslog, SNMP, login, REST API auth, RPM, flow-monitoring,
@@ -151,7 +155,7 @@ type SharedUMEMConfig struct {
 
 // RootAuthConfig holds root-authentication settings.
 type RootAuthConfig struct {
-	EncryptedPassword string
+	EncryptedPassword Secret // crypt(3) hash; redacted on JSON/YAML marshal (#2053)
 	SSHKeys           []string
 }
 
@@ -202,13 +206,13 @@ type WebManagementConfig struct {
 // APIAuthConfig holds REST API authentication settings.
 type APIAuthConfig struct {
 	Users   []*APIAuthUser // basic auth users
-	APIKeys []string       // bearer/X-API-Key tokens
+	APIKeys []Secret       // bearer/X-API-Key tokens; redacted on marshal (#2053)
 }
 
 // APIAuthUser defines a basic auth user for the REST API.
 type APIAuthUser struct {
 	Username string
-	Password string
+	Password Secret // redacted on JSON/YAML marshal (#2053)
 }
 
 // SystemSyslogConfig holds traditional Junos system syslog config.
@@ -255,10 +259,113 @@ type SNMPConfig struct {
 	V3Users     map[string]*SNMPv3User
 }
 
+// MarshalJSON redacts the SNMPv1/v2c community strings on the JSON surface
+// (#2053). The community string is the secret AND the Communities map key,
+// so a plain map marshal would leak it as a JSON object key regardless of
+// SNMPCommunity.MarshalJSON (which only redacts the value's Name field). To
+// avoid emitting secret keys, the Communities map is rendered as a sorted
+// slice of (already-redacting) SNMPCommunity values — dropping the
+// secret-equals-the-key. V3Users/TrapGroups keys are usernames/group names
+// (not secrets) and pass through unchanged. The in-memory map (and its
+// lookup-by-community-string in pkg/snmp) is untouched.
+func (s SNMPConfig) MarshalJSON() ([]byte, error) {
+	type snmpAlias struct {
+		Location    string
+		Contact     string
+		Description string
+		Communities []*SNMPCommunity
+		TrapGroups  map[string]*SNMPTrapGroup
+		V3Users     map[string]*SNMPv3User
+	}
+	a := snmpAlias{
+		Location:    s.Location,
+		Contact:     s.Contact,
+		Description: s.Description,
+		TrapGroups:  s.TrapGroups,
+		V3Users:     s.V3Users,
+	}
+	if len(s.Communities) > 0 {
+		names := make([]string, 0, len(s.Communities))
+		for name := range s.Communities {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		a.Communities = make([]*SNMPCommunity, 0, len(names))
+		for _, name := range names {
+			a.Communities = append(a.Communities, s.Communities[name])
+		}
+	}
+	return json.Marshal(a)
+}
+
+// MarshalYAML mirrors MarshalJSON for the gopkg.in/yaml.v3 marshaller,
+// redacting the community-string map keys by rendering Communities as a
+// sorted slice (future-proofing; no config YAML marshaller exists today —
+// #2053).
+func (s SNMPConfig) MarshalYAML() (any, error) {
+	type snmpAlias struct {
+		Location    string
+		Contact     string
+		Description string
+		Communities []*SNMPCommunity
+		TrapGroups  map[string]*SNMPTrapGroup
+		V3Users     map[string]*SNMPv3User
+	}
+	a := snmpAlias{
+		Location:    s.Location,
+		Contact:     s.Contact,
+		Description: s.Description,
+		TrapGroups:  s.TrapGroups,
+		V3Users:     s.V3Users,
+	}
+	if len(s.Communities) > 0 {
+		names := make([]string, 0, len(s.Communities))
+		for name := range s.Communities {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		a.Communities = make([]*SNMPCommunity, 0, len(names))
+		for _, name := range names {
+			a.Communities = append(a.Communities, s.Communities[name])
+		}
+	}
+	return a, nil
+}
+
 // SNMPCommunity defines an SNMP community string.
+//
+// Name is the SNMPv1/v2c community string, which IS the shared secret (it
+// authorizes the request on the wire). It is also the key of the
+// SNMPConfig.Communities map, so it stays a plain string (the map lookup in
+// pkg/snmp/agent.go is by the on-wire community string). Redaction is
+// applied only on the JSON/YAML surface via the targeted MarshalJSON /
+// MarshalYAML below — keeping it a string means the map key, the compiler
+// assignment, and the text `show snmp` / `show configuration` render paths
+// (which print the map key, not this field, and are out of scope for the
+// #2053 marshal leak) are all unchanged.
 type SNMPCommunity struct {
 	Name          string
 	Authorization string // "read-only" or "read-write"
+}
+
+// MarshalJSON redacts the community string (the secret) on the JSON
+// surface, e.g. GET /api/v1/config, while leaving Authorization in the
+// clear. See the type doc for why Name stays a plain string (#2053).
+func (c SNMPCommunity) MarshalJSON() ([]byte, error) {
+	type alias struct {
+		Name          Secret
+		Authorization string
+	}
+	return json.Marshal(alias{Name: Secret(c.Name), Authorization: c.Authorization})
+}
+
+// MarshalYAML mirrors MarshalJSON for the gopkg.in/yaml.v3 marshaller
+// (future-proofing; no config YAML marshaller exists today — #2053).
+func (c SNMPCommunity) MarshalYAML() (any, error) {
+	return struct {
+		Name          Secret
+		Authorization string
+	}{Name: Secret(c.Name), Authorization: c.Authorization}, nil
 }
 
 // SNMPTrapGroup defines an SNMP trap destination group.
@@ -271,9 +378,9 @@ type SNMPTrapGroup struct {
 type SNMPv3User struct {
 	Name         string
 	AuthProtocol string // "md5", "sha", "sha256"
-	AuthPassword string
+	AuthPassword Secret // redacted on JSON/YAML marshal (#2053)
 	PrivProtocol string // "des", "aes128"
-	PrivPassword string
+	PrivPassword Secret // redacted on JSON/YAML marshal (#2053)
 }
 
 // LoginClassPermission defines what a login class can do.
@@ -305,7 +412,7 @@ type LoginUser struct {
 	Name              string
 	UID               int
 	Class             string   // "super-user", "read-only", etc.
-	EncryptedPassword string   // crypt(3) hash; applied via `chpasswd -e` (#1944)
+	EncryptedPassword Secret   // crypt(3) hash; applied via `chpasswd -e` (#1944); redacted on marshal (#2053)
 	SSHKeys           []string // authorized SSH public keys
 }
 
@@ -725,18 +832,15 @@ type DHCPDynamicDNSConfig struct {
 	// increment-2 backend.
 	UpdateServer string
 	// TSIGKeyName / TSIGAlgorithm / TSIGSecret are the TSIG credentials
-	// for authenticated RFC 2136 updates. TSIGSecret is sensitive and is
-	// redacted by String() (so a %v/%s/slog of this struct never leaks the
-	// HMAC key — see String below). It is NOT redacted by JSON/YAML
-	// marshalling: like every other config secret (IKE pre-shared keys,
-	// OSPF auth keys — see freetext.go), the field is stored verbatim in the
-	// compiled config, which must never be serialized onto a user-facing
-	// surface. The only compiled-config marshaller, Store.ExportJSON, is a
-	// debug-only helper with no production callers. Cross-cutting
-	// marshal-time redaction for all config secrets is tracked separately.
+	// for authenticated RFC 2136 updates. TSIGSecret is the sensitive HMAC
+	// key. It is redacted by String() (so a %v/%s/slog of this struct never
+	// leaks the key — see String below) AND, since #2053, by its Secret
+	// type on every JSON/YAML marshal (so the compiled-config dump on
+	// GET /api/v1/config never leaks it either). The reconciler/render paths
+	// read the cleartext via Reveal().
 	TSIGKeyName   string
 	TSIGAlgorithm string
-	TSIGSecret    string
+	TSIGSecret    Secret
 }
 
 // String redacts TSIGSecret so a %v/%s/slog format of a

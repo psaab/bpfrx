@@ -395,7 +395,7 @@ func compileInterfaces(node *Node, ifaces *InterfacesConfig) error {
 									case "authentication-key":
 										if i+1 < len(keys) {
 											i++
-											vg.AuthKey = keys[i]
+											vg.AuthKey = Secret(keys[i])
 										}
 									case "track-interface":
 										if i+1 < len(keys) {
@@ -467,7 +467,7 @@ func compileInterfaces(node *Node, ifaces *InterfacesConfig) error {
 									case "authentication-type":
 										vg.AuthType = nodeVal(prop)
 									case "authentication-key":
-										vg.AuthKey = nodeVal(prop)
+										vg.AuthKey = Secret(nodeVal(prop))
 									case "track-interface":
 										// The interface name lives in Keys[1]
 										// (NOT nodeVal — its Children[0]
@@ -692,7 +692,7 @@ func parseTunnelWireguard(tc *TunnelConfig, wgNode *Node) {
 			}
 		case "private-key":
 			if v := nodeVal(prop); v != "" {
-				tc.WgLocalPrivkeyHex = v
+				tc.WgLocalPrivkeyHex = Secret(v)
 			}
 		case "peer":
 			parseTunnelWireguardPeer(tc, prop)

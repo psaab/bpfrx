@@ -43,7 +43,7 @@ func CollectInstances(cfg *config.Config) []*Instance {
 					AdvertiseInterval: vg.AdvertiseInterval,
 					VirtualAddresses:  vg.VirtualAddresses,
 					AuthType:          vg.AuthType,
-					AuthKey:           vg.AuthKey,
+					AuthKey:           vg.AuthKey.Reveal(),
 					// TrackInterface arrives as a Junos name
 					// (ge-0/0/1); normalize to the Linux name
 					// (ge-0-0-1) so netlink lookups and link-watcher
