@@ -407,8 +407,16 @@ func ensureLinkLocal(iface *net.Interface) error {
 	}
 
 	// No link-local. Synthesize the EUI-64 fe80::/64 from the MAC and add it
-	// with NODAD — the RETH virtual MAC is shared across nodes, so DAD on an
-	// LLA derived from it would DADFAIL against the peer's identical address.
+	// with NODAD — the same primitive the daemon uses for RETH link-locals
+	// (ensureRethLinkLocal / addStableLLToInterface). NODAD is set for
+	// consistency with that apply path and to suppress the DAD / MLDv2 solicit
+	// noise on addr_gen_mode=1 interfaces; it is not required to avoid a
+	// peer collision here, because the EUI-64 derivation folds in the RETH
+	// virtual MAC's node_id byte (RethMAC -> 02:bf:72:CC:RR:NN), so each node
+	// derives a distinct LLA. (The address that *is* shared across nodes is
+	// the daemon's stable fe80::bf:72:CC:RR LLA, which carries no node_id and
+	// is added NODAD for exactly that reason — a different address than this
+	// fallback.)
 	ll := eui64LinkLocal(iface.HardwareAddr)
 	if ll == nil {
 		return fmt.Errorf("ensure link-local: interface %s has no usable MAC", iface.Name)
