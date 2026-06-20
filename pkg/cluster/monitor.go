@@ -485,8 +485,9 @@ func (mon *Monitor) getNlHandle() nlLinkGetter {
 // LinkAttrsUp reports whether an interface is operationally up. It is the
 // shared carrier-state read for the cluster package: the interface-monitor
 // demotion loop (Monitor.pollInterfaceMonitors, RGInterfaceReady), the
-// RETH status display (RethController.FormatStatus), the gRPC reth-status
-// display (pkg/grpcapi), and the daemon no-reth-vrrp VIP-readiness gate
+// RETH status displays (RethController.FormatStatus and the
+// "show chassis cluster interfaces" reth list in both pkg/grpcapi and
+// pkg/cli), and the daemon no-reth-vrrp VIP-readiness gate
 // (pkg/daemon.checkVIPReadinessForConfig, #2090).
 //
 // Carrier health must NOT be decided from the administrative IFF_UP flag
