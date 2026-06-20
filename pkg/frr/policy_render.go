@@ -627,12 +627,19 @@ func (m *Manager) generatePolicyOptions(po *config.PolicyOptionsConfig) string {
 					// keyValidator (schema_routing.go) rejects these, but
 					// the lenient-on-load path (Store.Load / SyncApply,
 					// #1960) can still feed a stored pre-gate garbage prefix
-					// to the renderer. A valid CIDR always has "/" + a
-					// numeric mask in range, so this never skips a valid
-					// v4/v6 prefix.
+					// to the renderer. The mask is range-checked against the
+					// PER-FAMILY max (32 for v4, 128 for v6), so a v4 /40 or
+					// /99 — which net.ParseCIDR rejects but a bare Atoi would
+					// pass — is also caught. A valid CIDR always has "/" + a
+					// numeric mask within the family max, so this never skips
+					// a valid v4/v6 prefix.
+					beltMax := 32
+					if isV6 {
+						beltMax = 128
+					}
 					if mp := strings.SplitN(rf.Prefix, "/", 2); len(mp) != 2 {
 						skipEntry = true
-					} else if plen, err := strconv.Atoi(mp[1]); err != nil || plen < 0 || plen > 128 {
+					} else if plen, err := strconv.Atoi(mp[1]); err != nil || plen < 0 || plen > beltMax {
 						skipEntry = true
 					}
 					switch rf.MatchType {
