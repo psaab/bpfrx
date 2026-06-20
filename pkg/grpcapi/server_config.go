@@ -3,6 +3,7 @@ package grpcapi
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"strings"
 
 	"github.com/psaab/xpf/pkg/config"
@@ -53,6 +54,36 @@ func (s *Server) Set(_ context.Context, req *pb.SetRequest) (*pb.SetResponse, er
 	}
 	if strings.HasPrefix(input, "insert ") {
 		return s.handleInsert(input)
+	}
+	// #2051: the remote CLI rides the Set RPC for activate/deactivate (no
+	// dedicated RPC). Prefix-route the verb to the store wrapper BEFORE the
+	// SetFromInput fall-through — otherwise the generic fall-through builds
+	// the junk path "set deactivate <path>" (a config node named after the
+	// verb) and the node is never marked inactive. The store wrappers strip
+	// the verb and route through applyEditLine (the centralized verb switch).
+	// Match the verb as the first whitespace-delimited token (not just an
+	// exact "deactivate "/"activate " prefix) so a tab separator or extra
+	// spaces still route, and a bare verb with no path returns an error
+	// instead of falling through to SetFromInput and creating a junk
+	// "deactivate"/"activate" node.
+	if fields := strings.Fields(input); len(fields) > 0 &&
+		(fields[0] == "deactivate" || fields[0] == "activate") {
+		verb := fields[0]
+		rest := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(input), verb))
+		if rest == "" {
+			return nil, status.Errorf(codes.InvalidArgument,
+				"%s requires a configuration path", verb)
+		}
+		var err error
+		if verb == "deactivate" {
+			err = s.store.DeactivateFromInput(rest)
+		} else {
+			err = s.store.ActivateFromInput(rest)
+		}
+		if err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "%v", err)
+		}
+		return &pb.SetResponse{}, nil
 	}
 	if err := s.store.SetFromInput(input); err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
@@ -135,8 +166,19 @@ func (s *Server) Load(_ context.Context, req *pb.LoadRequest) (*pb.LoadResponse,
 		if err := s.store.LoadMerge(req.Content); err != nil {
 			return nil, status.Errorf(codes.InvalidArgument, "%v", err)
 		}
+	case "set":
+		// #2052: make `load set` a real service-mode op. LoadSet replays the
+		// flat command lines through applyEditLine, so a body containing
+		// `deactivate <path>` lines (emitted by `show | display set` for
+		// inactive nodes, #2008 H1) round-trips back to an inactive node.
+		// The applied-count is log-only (LoadResponse has no count field).
+		count, err := s.store.LoadSet(req.Content)
+		if err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "%v", err)
+		}
+		slog.Info("load set applied", "commands", count)
 	default:
-		return nil, status.Errorf(codes.InvalidArgument, "unknown load mode: %s (use 'override' or 'merge')", req.Mode)
+		return nil, status.Errorf(codes.InvalidArgument, "unknown load mode: %s (use 'override', 'merge', or 'set')", req.Mode)
 	}
 	return &pb.LoadResponse{}, nil
 }
