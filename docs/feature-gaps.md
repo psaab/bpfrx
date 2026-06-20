@@ -610,3 +610,16 @@ Tier-2 gaps from the `#2008` parity audit researched in
   `test-owner` / `test-name` (the only fields on `rpm.Event`); widening the
   field surface is deferred until more attributes are exposed. See
   `pkg/eventengine/README.md`.
+- **H13 Stage 1 `forwarding-options allow-dataplane-sleep`** — DONE
+  (schema + field + commit warning). The leaf was previously accepted as a
+  no-schema-match fall-through and silently dropped by
+  `compileForwardingOptions`. Stage 1 adds the typed presence-flag schema leaf
+  (`pkg/config/schema_routing.go`), the `ForwardingOptionsConfig.AllowDataplaneSleep`
+  field (`pkg/config/types_system.go`), compiler extraction
+  (`pkg/config/compiler_services.go`), and a commit warning that the knob is
+  accepted but the idle-yield runtime is not yet implemented (the userspace
+  workers busy-poll), mirroring the `persist-groups-inheritance` /
+  `dns-proxy` accepted-but-unenforced warnings. Stage 2 (actual worker
+  idle-yield) is lab-gated and deferred per the research doc — the busy-poll
+  cold-start latency sensitivity (#1782) is the reason it needs explicit
+  validation before enabling.

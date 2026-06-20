@@ -465,6 +465,13 @@ the value sits in a single typed slot:
     from single-value REPLACE to named-container APPEND — benign: a bare
     no-port server compiles `Port==0` and the snapshot builder skips it, and
     real multi-collector configs already take the container path.
+  - `forwarding-options allow-dataplane-sleep` (#2008 H13 Stage 1) — a
+    presence-only flag (no value, `children: nil`). Previously accepted via the
+    no-schema-match fall-through and silently dropped; now a typed leaf that
+    compiles into `ForwardingOptionsConfig.AllowDataplaneSleep` and emits an
+    accepted-but-unenforced commit warning (the userspace workers busy-poll;
+    the idle-yield runtime is Stage 2, lab-gated). Same shape as the
+    `security flow power-mode-disable` presence flag.
 
 - **Compiler AST pre-walk (Tier 3 — the `validateVRRPTrackInterfaceAST`
   precedent):** `security flow tcp-mss {ipsec-vpn|gre-in|gre-out|all-tcp}`

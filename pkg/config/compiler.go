@@ -1291,6 +1291,14 @@ func ValidateConfig(cfg *Config) []string {
 		warnings = append(warnings, "system commit persist-groups-inheritance configured but group inheritance persistence is not implemented")
 	}
 
+	// #2008 H13 Stage 1: the leaf is now typed (schema + field) instead of
+	// being silently dropped, but the idle-yield dataplane runtime is not
+	// implemented — the userspace AF_XDP workers busy-poll. Warn so the
+	// operator knows the knob is accepted but currently has no effect.
+	if cfg.ForwardingOptions.AllowDataplaneSleep {
+		warnings = append(warnings, "forwarding-options allow-dataplane-sleep configured but is accepted-only — the userspace dataplane workers busy-poll and idle-yield is not yet implemented")
+	}
+
 	// #654: warn on `system processes X disable` for a process that
 	// bpfrx does not actually manage. Silently accepting the knob (as
 	// used to happen with e.g. `utmd disable` on vSRX) means the
