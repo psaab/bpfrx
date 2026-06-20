@@ -1096,6 +1096,85 @@ func TestEmitCoSDrainPhaseTelemetry_EmitsNonExactExactBacklogCounter(t *testing.
 	}
 }
 
+// #1359: emitCoSParkReasonTelemetry must surface the four per-queue
+// park-reason counters that were carried on the CoS snapshot but never
+// exported. The four snapshot fields are given DISTINCT values so the
+// assertion fails if any single emit line is dropped or mapped to the
+// wrong descriptor (non-tautological: a removed emit drops its series,
+// and a swapped field/desc mismatches the expected value). The counter
+// typing is asserted explicitly — these are monotonic park totals, not
+// gauges.
+func TestEmitCoSParkReasonTelemetry_DistinctValuesAndCounterType(t *testing.T) {
+	c := &xpfCollector{
+		cosRootTokenStarvationParks: prometheus.NewDesc(
+			"xpf_userspace_cos_root_token_starvation_parks_total",
+			"test desc",
+			[]string{"ifindex", "queue_id"}, nil,
+		),
+		cosQueueTokenStarvationParks: prometheus.NewDesc(
+			"xpf_userspace_cos_queue_token_starvation_parks_total",
+			"test desc",
+			[]string{"ifindex", "queue_id"}, nil,
+		),
+		cosDrainParkRootTokens: prometheus.NewDesc(
+			"xpf_userspace_cos_drain_park_root_tokens_total",
+			"test desc",
+			[]string{"ifindex", "queue_id"}, nil,
+		),
+		cosDrainParkQueueTokens: prometheus.NewDesc(
+			"xpf_userspace_cos_drain_park_queue_tokens_total",
+			"test desc",
+			[]string{"ifindex", "queue_id"}, nil,
+		),
+	}
+	status := dpuserspace.ProcessStatus{
+		CoSInterfaces: []dpuserspace.CoSInterfaceStatus{{
+			Ifindex: 80,
+			Queues: []dpuserspace.CoSQueueStatus{{
+				QueueID:                   3,
+				RootTokenStarvationParks:  111,
+				QueueTokenStarvationParks: 222,
+				DrainParkRootTokens:       333,
+				DrainParkQueueTokens:      444,
+			}},
+		}},
+	}
+
+	ch := make(chan prometheus.Metric)
+	go func() {
+		c.emitCoSParkReasonTelemetry(ch, status)
+		close(ch)
+	}()
+	values := map[*prometheus.Desc]float64{}
+	for m := range ch {
+		var pb dto.Metric
+		if err := m.Write(&pb); err != nil {
+			t.Fatalf("metric.Write: %v", err)
+		}
+		labels := map[string]string{}
+		for _, lp := range pb.GetLabel() {
+			labels[lp.GetName()] = lp.GetValue()
+		}
+		if labels["ifindex"] != "80" || labels["queue_id"] != "3" {
+			t.Fatalf("wrong park-reason labels: %v for %s", labels, m.Desc())
+		}
+		if pb.Counter == nil {
+			t.Fatalf("park-reason metric %s must be a counter: %+v", m.Desc(), &pb)
+		}
+		values[m.Desc()] = pb.Counter.GetValue()
+	}
+
+	want := map[*prometheus.Desc]float64{
+		c.cosRootTokenStarvationParks:  111,
+		c.cosQueueTokenStarvationParks: 222,
+		c.cosDrainParkRootTokens:       333,
+		c.cosDrainParkQueueTokens:      444,
+	}
+	if !reflect.DeepEqual(values, want) {
+		t.Fatalf("park-reason metric values: got %+v, want %+v", values, want)
+	}
+}
+
 // #1830 (g): emitCoSFlowFairOccupancy must surface the bucket-vs-flow
 // occupancy pair for EVERY queue row (no flow-fair gating — a 0 is a
 // real idle signal), with GAUGE typing and (ifindex, queue_id) labels.

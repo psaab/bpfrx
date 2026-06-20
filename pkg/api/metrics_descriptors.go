@@ -343,6 +343,26 @@ func newCollector(srv *Server) *xpfCollector {
 			"Non-exact CoS queue bytes sent while at least one exact queue on the same shaped interface still had backlog; non-zero deltas indicate best-effort/uncapped service competing with exact demand (#1369).",
 			[]string{"ifindex", "queue_id"}, nil,
 		),
+		cosRootTokenStarvationParks: prometheus.NewDesc(
+			"xpf_userspace_cos_root_token_starvation_parks_total",
+			"Times this CoS queue was parked at the shaper because the shared ROOT token bucket was empty. A rising delta on a best-effort/mouse queue while a surplus-sharing borrower drains means the borrower is holding the shared root rate — root-surplus arbitration is the surplus-sharing mouse-latency tail cause, not this queue's own bucket (#1642/#1359).",
+			[]string{"ifindex", "queue_id"}, nil,
+		),
+		cosQueueTokenStarvationParks: prometheus.NewDesc(
+			"xpf_userspace_cos_queue_token_starvation_parks_total",
+			"Times this CoS queue was parked at the shaper because its OWN per-queue token bucket was empty (this queue is rate-capped, distinct from shared-root starvation above) (#1642/#1359).",
+			[]string{"ifindex", "queue_id"}, nil,
+		),
+		cosDrainParkRootTokens: prometheus.NewDesc(
+			"xpf_userspace_cos_drain_park_root_tokens_total",
+			"Drain-loop parks of this CoS queue attributed to insufficient shared ROOT tokens during a batch. Distinct from the shaper-side root_token_starvation_parks: this counts the per-batch drain-loop decision (#760/#1359).",
+			[]string{"ifindex", "queue_id"}, nil,
+		),
+		cosDrainParkQueueTokens: prometheus.NewDesc(
+			"xpf_userspace_cos_drain_park_queue_tokens_total",
+			"Drain-loop parks of this CoS queue attributed to insufficient per-queue tokens during a batch (#760/#1359).",
+			[]string{"ifindex", "queue_id"}, nil,
+		),
 		cosLeaseV8RequestedBytes: prometheus.NewDesc(
 			"xpf_userspace_cos_lease_v8_requested_bytes_total",
 			"Cumulative bytes this worker REQUESTED from this CoS queue's shared v8 lease (every acquire_v8 ask, granted or not). Compare with ..._granted_bytes_total: requested >> granted on a worker = share-bounded asks (mismatch); a worker with near-zero requested while the class undergrants = claim-sampling loss. Step-0 attribution instrument for the honored-realization gap (#1863).",
