@@ -587,7 +587,7 @@ func (*DeleteResponse) Descriptor() ([]byte, []int) {
 
 type LoadRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
-	Mode          string                 `protobuf:"bytes,1,opt,name=mode,proto3" json:"mode,omitempty"`       // "override", "merge", or "replace"
+	Mode          string                 `protobuf:"bytes,1,opt,name=mode,proto3" json:"mode,omitempty"`       // "override", "merge", or "set" (#2052: set replays flat set/delete/deactivate/activate lines)
 	Content       string                 `protobuf:"bytes,2,opt,name=content,proto3" json:"content,omitempty"` // full config text (hierarchical or set format)
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
