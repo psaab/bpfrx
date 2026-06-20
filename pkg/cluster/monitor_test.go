@@ -44,6 +44,20 @@ func (h *mockNlHandle) setLink(name string, up bool) {
 	}
 }
 
+// setLinkCarrierDown models a cable-pulled / peer-down interface: it is
+// administratively up (IFF_UP set) but has lost carrier, so OperState is
+// OperDown. This is the #2070 case — the monitor must report it DOWN and
+// demote the redundancy group. Pre-fix the OR with net.FlagUp reported UP.
+func (h *mockNlHandle) setLinkCarrierDown(name string) {
+	h.links[name] = &mockLink{
+		attrs: netlink.LinkAttrs{
+			Name:      name,
+			OperState: netlink.OperDown,
+			Flags:     net.FlagUp,
+		},
+	}
+}
+
 // setNoDampening configures the monitor for immediate state changes (no dampening).
 func setNoDampening(mon *Monitor) {
 	mon.FailThreshold = 1
@@ -681,6 +695,52 @@ func TestMonitor_LocalStatusesConcurrent(t *testing.T) {
 	}()
 
 	<-done
+}
+
+// TestMonitor_CarrierDownDemotesRG is the #2070 regression for the live
+// cluster carrier-detection loop. An admin-up interface that loses carrier
+// (cable pulled / peer down) must be reported DOWN so the redundancy group
+// is demoted and HA failover fires. Pre-fix, poll() OR'd in net.FlagUp
+// (IFF_UP, the admin flag, which stays set on carrier loss), so the link
+// was reported UP, the weight was never subtracted, and failover was
+// suppressed — the bug this test would catch.
+func TestMonitor_CarrierDownDemotesRG(t *testing.T) {
+	m := NewManager(0, 1)
+	cfg := makeConfig(
+		makeRG(0, false, map[int]int{0: 200},
+			&config.InterfaceMonitor{Interface: "trust0", Weight: 100},
+		),
+	)
+	m.UpdateConfig(cfg)
+	drainEvents(m, 1)
+
+	nlh := newMockNlHandle()
+	nlh.setLink("trust0", true)
+
+	mon := NewMonitor(m, cfg.RedundancyGroups)
+	mon.nlHandle = nlh
+	setNoDampening(mon)
+
+	// Initial poll: carrier up, full weight.
+	mon.poll()
+	if w := m.GroupStates()[0].Weight; w != 255 {
+		t.Fatalf("initial weight = %d, want 255", w)
+	}
+
+	// Pull the cable: admin-up but carrier-down. This MUST demote the RG.
+	nlh.setLinkCarrierDown("trust0")
+	mon.poll()
+	if w := m.GroupStates()[0].Weight; w != 155 {
+		t.Errorf("weight after carrier-down = %d, want 155 "+
+			"(carrier-down link reported UP — #2070)", w)
+	}
+
+	// Restore carrier: RG recovers.
+	nlh.setLink("trust0", true)
+	mon.poll()
+	if w := m.GroupStates()[0].Weight; w != 255 {
+		t.Errorf("weight after carrier recovery = %d, want 255", w)
+	}
 }
 
 // drainEvents is defined in election_test.go

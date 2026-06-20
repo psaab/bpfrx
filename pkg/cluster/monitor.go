@@ -25,8 +25,8 @@ type monitorState struct {
 
 // Dampening defaults.
 const (
-	DefaultMonitorFailThreshold = 3              // consecutive failures before marking down
-	DefaultMonitorPassThreshold = 3              // consecutive successes before marking up
+	DefaultMonitorFailThreshold = 3               // consecutive failures before marking down
+	DefaultMonitorPassThreshold = 3               // consecutive successes before marking up
 	DefaultMonitorHoldDown      = 5 * time.Second // hold-down after state change
 )
 
@@ -264,8 +264,7 @@ func (mon *Monitor) pollInterfaceMonitors(rg *config.RedundancyGroup, statuses [
 			continue
 		}
 
-		up := link.Attrs().OperState == netlink.OperUp ||
-			link.Attrs().Flags&net.FlagUp != 0
+		up := linkAttrsUp(link.Attrs())
 
 		// Track local interface status for heartbeat propagation.
 		statuses = append(statuses, InterfaceMonitorInfo{
@@ -450,8 +449,7 @@ func (mon *Monitor) RGInterfaceReady(rgID int) (bool, []string) {
 				reasons = append(reasons, fmt.Sprintf("interface %s missing", im.Interface))
 				continue
 			}
-			up := link.Attrs().OperState == netlink.OperUp ||
-				link.Attrs().Flags&net.FlagUp != 0
+			up := linkAttrsUp(link.Attrs())
 			if !up {
 				reasons = append(reasons, fmt.Sprintf("interface %s down", im.Interface))
 			}
@@ -482,6 +480,33 @@ func (mon *Monitor) getNlHandle() nlLinkGetter {
 	}
 	mon.cachedNlHandle = h
 	return h
+}
+
+// linkAttrsUp reports whether a monitored interface is operationally up.
+//
+// Interface-monitoring exists to detect carrier loss (cable pulled / peer
+// link down) and demote the redundancy group so HA failover fires. The
+// administrative IFF_UP flag (net.FlagUp) stays set whenever the interface
+// is admin-up — and xpfd admin-ups ALL managed interfaces — so it must NOT
+// be used to decide carrier health: a carrier-down link keeps IFF_UP set
+// while OperState transitions to OperDown/OperLowerLayerDown. Decide from
+// the operational state (IFLA_OPERSTATE):
+//   - OperUp                 -> up.
+//   - OperUnknown            -> fall back to the admin flag (common on
+//     virtual devices that report no carrier state).
+//   - OperDown / lower-layer-down / anything else -> down.
+//
+// This mirrors pkg/vrrp.linkAttrsUp, the canonical link-state read used by
+// VRRP track-interface detection (#2070).
+func linkAttrsUp(attrs *netlink.LinkAttrs) bool {
+	switch attrs.OperState {
+	case netlink.OperUp:
+		return true
+	case netlink.OperUnknown:
+		return attrs.Flags&net.FlagUp != 0
+	default:
+		return false
+	}
 }
 
 type noopNlHandle struct{}

@@ -1,5 +1,29 @@
 # Action Log
 
+## 2026-06-20 — #2070 interface-monitor carrier-state read (HIGH, failover-class)
+
+- **Timestamp**: 2026-06-20
+- **Action**: #2070 — the interface-monitor reported a carrier-down
+  (cable-pulled / peer-down) link as UP, suppressing HA failover. The
+  link-health read was `OperState == OperUp || Flags&IFF_UP != 0`; since
+  xpfd admin-ups every managed interface, the `IFF_UP` term is always
+  true, so the OR collapsed to "administratively up" regardless of
+  carrier — a redundancy group with a dead uplink was never demoted.
+  Fixed by reading the kernel operational state via a new package-local
+  `linkAttrsUp` helper (mirrors `pkg/vrrp.linkAttrsUp`): `OperUp` → up,
+  `OperUnknown` → admin-flag fallback (virtual devices with no carrier
+  state), `OperDown`/`OperLowerLayerDown`/other → down. Replaced all
+  three identical buggy sites: `pkg/routing/monitor.go` (display signal)
+  and `pkg/cluster/monitor.go` (the live 1s poll loop feeding
+  `SetMonitorWeight`, and the readiness check). Added regression tests in
+  both packages that fail pre-fix (carrier-down reported UP / weight not
+  demoted) and pass post-fix, plus admin-down and OperUnknown guard cases.
+  FAILOVER-class: `make test-failover` (cable-pull / link-down failover)
+  is the mandatory merge gate, run by the parent.
+- **File(s)**: pkg/routing/monitor.go, pkg/routing/monitor_test.go (new),
+  pkg/cluster/monitor.go, pkg/cluster/monitor_test.go,
+  pkg/cluster/README.md, pkg/routing/README.md, _Log.md
+
 ## 2026-06-20 — #1387 Increment-2 (DDNS live RFC 2136 backend + loop + HA gate)
 
 - **Timestamp**: 2026-06-20

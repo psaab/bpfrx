@@ -45,8 +45,7 @@ func (mm *monitorManager) Apply(groups []*config.RedundancyGroup) {
 				// Interface doesn't exist — belongs to peer node. Skip.
 				continue
 			}
-			up := link.Attrs().OperState == netlink.OperUp ||
-				link.Attrs().Flags&net.FlagUp != 0
+			up := linkAttrsUp(link.Attrs())
 			statuses = append(statuses, InterfaceMonitorStatus{
 				Interface: mon.Interface,
 				Weight:    mon.Weight,
@@ -62,6 +61,33 @@ func (mm *monitorManager) Apply(groups []*config.RedundancyGroup) {
 		if len(statuses) > 0 {
 			mm.monitorStatus[rg.ID] = statuses
 		}
+	}
+}
+
+// linkAttrsUp reports whether a monitored interface is operationally up.
+//
+// Interface-monitoring exists to detect carrier loss (cable pulled / peer
+// link down) and demote the redundancy group so HA failover fires. The
+// administrative IFF_UP flag (net.FlagUp) stays set whenever the interface
+// is admin-up — and xpfd admin-ups ALL managed interfaces — so it must NOT
+// be used to decide carrier health: a carrier-down link keeps IFF_UP set
+// while OperState transitions to OperDown/OperLowerLayerDown. Decide from
+// the operational state (IFLA_OPERSTATE):
+//   - OperUp                 -> up.
+//   - OperUnknown            -> fall back to the admin flag (common on
+//     virtual devices that report no carrier state).
+//   - OperDown / lower-layer-down / anything else -> down.
+//
+// This mirrors pkg/vrrp.linkAttrsUp, the canonical link-state read used by
+// VRRP track-interface detection (#2070).
+func linkAttrsUp(attrs *netlink.LinkAttrs) bool {
+	switch attrs.OperState {
+	case netlink.OperUp:
+		return true
+	case netlink.OperUnknown:
+		return attrs.Flags&net.FlagUp != 0
+	default:
+		return false
 	}
 }
 
