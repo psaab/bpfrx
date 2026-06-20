@@ -1,10 +1,11 @@
 # #2103 + #2105 — route-filter FRR-validity: `longer` max-len + prefix CIDR validation
 
-Status: v2 — both round-1 hostile reviewers' PLAN-NEEDS-MINOR findings
-folded (FRR empty-vs-NULL prefix-list semantics corrected, all-skipped
-term now suppresses the `match` line, family derived from a parseable
-entry, orlonger/32 recorded as FRR-valid). Ready to implement. See "v2 —
-adversarial plan-review resolution" at the bottom.
+Status: IMPLEMENTED + code-reviewed. Plan v2 folded both round-1 hostile
+PLAN-review findings; the implementation then cleared a round-1 hostile
+CODE review (two independent reviewers, both MERGE-NEEDS-MINOR, converged
+on one real finding — the render belt validated only the mask — now
+fixed via net.ParseCIDR). See "v2 — adversarial plan-review resolution"
+and "Code-review resolution" at the bottom.
 
 These two issues are siblings of #2072 (PR #2102, just merged), both
 found in that PR's hostile code review, and both live in the same render
@@ -504,3 +505,42 @@ source-verified findings. Resolution:
   falsely rejected.
 
 Round-1 reviewer agentIds: A `a406b6cade7888116`, B `a89e7a393bd20ddde`.
+
+## Code-review resolution (round 1)
+
+Two independent hostile Claude code reviewers (read-only scratch
+worktrees) reviewed the implementation diff. Both returned
+MERGE-NEEDS-MINOR and converged on a single real finding:
+
+- **F1 (both, fixed) — render belt validated only the mask.** The #2105
+  render-side belt used `strconv.Atoi` on the mask + a per-family range
+  check, so a prefix with an in-range mask but a garbage ADDRESS
+  (`999.999.999.999/24`, `foo:bar/24`, `10.0.0.0.0/8`, `abcd/16`) slipped
+  through and rendered an FRR-invalid line on the lenient load/HA-sync
+  path. The commit validator already rejected these via `net.ParseCIDR`;
+  the belt now uses the SAME `net.ParseCIDR(rf.Prefix)` so its coverage
+  exactly mirrors the validator. Added bad-address + colon-garbage render
+  tests (verified non-tautological against the prior mask-only belt).
+- **F2 (both, INFO — pre-existing, NOT worsened, out of scope).** A term
+  with BOTH a valid v4 AND a valid v6 entry emits one `match` line
+  (family = first emitted), orphaning the other family. This is identical
+  to master's `RouteFilters[0]`-keyed behavior and matches the existing
+  `term.PrefixList` branch (#2071 homogeneous-family limitation). For the
+  mixed case this PR targets (skipped/malformed entry + a valid entry)
+  the new first-emitted-family logic is strictly BETTER than master.
+  Follow-up issue territory, not a blocker here.
+- **F3 (reviewer B, fixed — doc nit).** The README's "ge/le value is
+  ALWAYS strictly greater than the prefix length" contradicted the
+  orlonger/upto `le == prefix-len` carve-out three clauses earlier;
+  reworded to "ge always strictly greater, le always >= (never strictly
+  less)".
+
+Both reviewers independently verified the core logic by execution:
+non-tautological render + reject tests (fail against pre-fix code / with
+the keyValidator unwired), the all-skipped-term invariant (no
+prefix-list lines, no dangling match line, no count==0 list), the #2103
+boundary (/31 → ge 32 le 32; /32 → skip), the unchanged orlonger/exact/
+upto arms, and the full pkg/frr + pkg/config + pkg/configstore suites +
+go vet green.
+
+Round-1 code-review agentIds: A `af58ce5faa224036e`, B `aa945bdb58265f8ba`.
