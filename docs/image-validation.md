@@ -63,6 +63,7 @@ and all are deleted on exit. Scenarios:
 | **a** no config drive | factory boot; kernel ≥6.18 + `-generic` flavor; `linux-modules-extra` present (checked via the Mellanox driver dir as the sentinel — the broader mlx5/i40e set rides with it); exactly one kernel; `init_on_alloc=0` on the booted cmdline; **in-guest `xpfd verify-dataplane` PASS**; `fxp0` DHCP; sshd listening with `PermitRootLogin prohibit-password` + `PermitEmptyPasswords no`; no stray `/etc/xpf/xpf.conf` or stamp |
 | **b** valid day-0 drive | config validated + installed + committed (hostname applied, CLI shows it); reboot does **not** re-apply (stamp honored). *(The loader installs the config `0600`; the scenario asserts it exists and is non-empty, not the mode.)* |
 | **c** invalid day-0 drive | commit-check REJECT logged, nothing installed, no stamp, factory bootstrap still reachable |
+| **d** resized disk (#1925) | first-boot root auto-grow fills a 20 GiB root disk — root **partition** + ext4 fs both grow past the 8 GiB bake floor, `/etc/xpf/.root-grown` stamped, idempotent across a reboot, ESP still mounted, `verify-dataplane` still PASS; a control instance at the exact bake size proves the grow is a clean no-op (`growpart` NOCHANGE) |
 
 **Pass:** `Validation complete.` with all selected scenarios PASS. Any
 `FAIL:` line blocks the bake.

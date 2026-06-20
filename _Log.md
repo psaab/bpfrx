@@ -1,5 +1,31 @@
 # Action Log
 
+## 2026-06-19 — #1925 Item 1: first-boot root auto-grow (Path A)
+
+- **Timestamp**: 2026-06-19
+- **Action**: Implemented the PLAN-READY Path A — a first-boot-only
+  systemd one-shot that grows the root partition + ext4 filesystem to fill
+  an operator-resized disk, using `growpart` + `resize2fs` (already in the
+  baked image), restoring the cloud-init auto-grow the bake purged. The
+  wrapper resolves the live root device from `findmnt /` (bus-agnostic:
+  vda/sda/nvme), grows ONLY the root partition, treats `growpart` NOCHANGE
+  as success, and is non-fatal on every path. The unit is stamp-gated
+  (`/etc/xpf/.root-grown`), ordered `Before=local-fs.target xpfd.service
+  xpf-day0-config.service`. A/B-safety: root is the physically last
+  partition and the #1930 A/B slots are ESP directories (not partitions),
+  so the grow cannot touch the ESP/`/boot`/BIOS-boot or any partition
+  number. Wired into `bake.py` (copy-in + chmod + enable; seal removes the
+  stamp). Added `validate.py` Scenario D (20 GiB grow + idempotent reboot +
+  bake-size no-op control) and a non-tautological device-resolution
+  self-test (`test-grow-root.sh`, 12/12 pass). Docs in
+  `install-images.md` + `image-validation.md`. bash -n / dash -n /
+  shellcheck clean; py_compile clean. Lab gate (baked-image Scenario-D
+  boot) is the campaign owner's to run.
+- **File(s)**: scripts/image/xpf-grow-root,
+  scripts/image/xpf-grow-root.service, scripts/image/test-grow-root.sh,
+  scripts/image/bake.py, scripts/image/validate.py,
+  docs/install-images.md, docs/image-validation.md
+
 ## 2026-06-20 — #1993 FRR clear MAJOR fix: require LIVE forwarding, not just pins
 
 - **Timestamp**: 2026-06-20
