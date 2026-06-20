@@ -84,10 +84,22 @@ func loadDDNSState(path string) (*ddnsState, error) {
 	}
 	var f ddnsStateFile
 	if err := json.Unmarshal(data, &f); err != nil {
-		// Corrupt store: keep the empty (fresh) store; the boundary is
-		// only weakened to "may leak previously-owned records" (they age
-		// out of DNS by TTL), never to "deletes unowned records".
+		// Corrupt store: keep the empty (fresh) store. The boundary is only
+		// weakened to "may leak previously-owned records" — those records
+		// stay in DNS until something authoritatively removes them (TTL only
+		// controls resolver CACHING, not removal), so the worst case is
+		// stale-but-present records, never "deletes unowned records".
 		return s, fmt.Errorf("parse ddns state %s (resetting to empty): %w", path, err)
+	}
+	// Version validation: an unknown (future / unsupported) non-zero version
+	// means a format we cannot safely decode — its records may carry a
+	// different tuple shape, so trusting them could drive WRONG-tuple
+	// deletes. Treat it like a corrupt store: fail-open to an empty store +
+	// surface the error so the caller warns. Version 0 is tolerated as a
+	// pre-versioning / zero-value store (the field was absent or defaulted).
+	if f.Version != 0 && f.Version != ddnsStateVersion {
+		return s, fmt.Errorf("ddns state %s has unsupported version %d (want %d); resetting to empty",
+			path, f.Version, ddnsStateVersion)
 	}
 	for _, r := range f.Records {
 		s.records[ownedRecordKey(r.Identity, r.Address)] = r

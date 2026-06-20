@@ -69,7 +69,12 @@ What increment 1 ships (the fully unit-testable, lab-free slice):
   `compileDHCPDynamicDNS` (`pkg/config/compiler_services.go`), typed
   schema leaves under `dhcp-local-server`/`dhcpv6-local-server`
   (`pkg/config/schema_system.go`). TSIG secret is redacted in
-  `DHCPDynamicDNSConfig.String()`.
+  `DHCPDynamicDNSConfig.String()`. The block can appear under BOTH
+  families; the typed model carries a single config, and the two blocks are
+  MERGED field-by-field (`mergeDHCPDynamicDNS`) — a field set in either
+  family wins, `enable` latches on — so a partial second-family block never
+  clears the first family's settings (a whole-struct overwrite would
+  silently disable DDNS).
 - **State-aware lease parser** — `parseActiveLeases4/6` (`ddns_leases.go`)
   honors Kea's `state` column (default/declined/expired-reclaimed), the
   `expire` epoch, and the `fqdn_fwd` split between host-name and
@@ -152,7 +157,13 @@ What increment 1 ships (the fully unit-testable, lab-free slice):
   PROTECTION BOUNDARY for never-delete-a-record-xpf-did-not-create:
   `deleteOwnedLocked` re-derives the EXACT (name, type, address) from the
   store and is the sole delete authority. A corrupt store fails OPEN
-  (reset to empty + log), never blocking commit/boot/DHCP serving.
+  (reset to empty + log), never blocking commit/boot/DHCP serving. The
+  stored `version` is validated on load: an unknown (future) non-zero
+  version is treated like a corrupt store (fail-open to empty + warn), so a
+  later format bump cannot be mis-decoded into wrong-tuple deletes. (A
+  fail-open store may LEAK previously-owned records — they stay in DNS until
+  authoritatively removed; record TTL is resolver caching, not removal — but
+  never deletes records xpf did not create.)
 - **Counters** via `DDNSManager.Stats()` (the future `show ... dynamic-dns`
   + Prometheus surface reads this).
 

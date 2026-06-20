@@ -1514,6 +1514,43 @@ func TestStateStoreCorruptResetsEmptyFailOpen(t *testing.T) {
 	}
 }
 
+// TestStateStoreUnsupportedVersionFailsOpen proves the Copilot robustness
+// fix: a state file with an unknown (future) non-zero Version is treated
+// like a corrupt store — fail-open to an EMPTY store + surface an error (so
+// the caller warns), rather than silently decoding records that may carry a
+// different tuple shape into wrong-tuple deletes. No panic. Against the
+// pre-fix loader (which never checked Version) the records load and would be
+// trusted, so this test fails pre-fix.
+func TestStateStoreUnsupportedVersionFailsOpen(t *testing.T) {
+	dir := t.TempDir()
+	statePath := filepath.Join(dir, "state.json")
+	// A syntactically-valid state file from a FUTURE format version, with a
+	// record. The current loader must NOT trust it.
+	writeCSV(t, statePath, `{"version":99,"records":[{"family":4,"identity":"mac:aa","address":"10.0.0.10","fqdn":"h.example.com","forward_type":"A","ptr_name":"10.0.0.10.in-addr.arpa","ttl":300}]}`)
+	s, err := loadDDNSState(statePath)
+	if err == nil {
+		t.Fatal("expected an error for an unsupported state version")
+	}
+	if s == nil {
+		t.Fatal("loadDDNSState returned nil store on unsupported version (must be empty store)")
+	}
+	if len(s.records) != 0 {
+		t.Fatalf("unsupported version must reset to empty (no wrong-tuple records), got %d records", len(s.records))
+	}
+
+	// A version-0 (pre-versioning / zero-value) file is tolerated and its
+	// records load — the field was absent or defaulted, not a future format.
+	v0path := filepath.Join(dir, "state-v0.json")
+	writeCSV(t, v0path, `{"records":[{"family":4,"identity":"mac:bb","address":"10.0.0.20","fqdn":"h2.example.com","forward_type":"A","ptr_name":"20.0.0.10.in-addr.arpa","ttl":300}]}`)
+	s0, err := loadDDNSState(v0path)
+	if err != nil {
+		t.Fatalf("version-0 store must load, got error: %v", err)
+	}
+	if _, ok := s0.get("mac:bb", "10.0.0.20"); !ok {
+		t.Fatal("version-0 store should load its records")
+	}
+}
+
 func equalStr(a, b []string) bool {
 	if len(a) != len(b) {
 		return false

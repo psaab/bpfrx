@@ -1,5 +1,39 @@
 # Action Log
 
+## 2026-06-19 — #1387 DDNS PR #2043: Copilot findings (dual-family merge, version, comments)
+
+- **Timestamp**: 2026-06-19
+- **Action**: Fix Copilot's inline-review findings outside the (now-closed)
+  mass-delete-via-header class. (MAJOR) dynamic-dns block overwrite:
+  compileDHCPLocalServer did `dhcp.DynamicDNS = compileDHCPDynamicDNS(...)`
+  for whichever family it found, so when BOTH dhcp-local-server and
+  dhcpv6-local-server carried a block, the second whole-struct overwrote
+  the first — a PARTIAL second block (e.g. only `domain` under v6) compiled
+  to Enabled=false and cleared the v4 block's enable/server/ttl → DDNS
+  silently disabled. Fix: `mergeDHCPDynamicDNS` merges field-by-field — a
+  field set in either family wins (first-family-wins on a genuine conflict,
+  matching the intra-block first-value rule), presence-only `enable`
+  LATCHES on (a partial block can never flip it false). (ROBUSTNESS)
+  loadDDNSState now validates `ddnsStateFile.Version`: an unknown non-zero
+  version is treated like a corrupt store (fail-open to empty + error/warn)
+  so a future format bump can't be mis-decoded into wrong-tuple deletes;
+  version 0 (pre-versioning / zero-value) still loads. (COMMENTS, no logic
+  change) reworded the stale `addrOwner` tracker comment (reassignment is
+  handled by the owned-state delete pass + blocked maps), the nonexistent
+  `collectDHCPDDNSProps` reference (it is compileDHCPDynamicDNS's internal
+  walker), the corrupt-store "age out by TTL" claim (TTL is caching not
+  removal — records persist until authoritatively removed), and clarified
+  the nopUpdater deleteOwnedLocked comment (correct for inc-1; noted the
+  inc-2 downgrade-orphan caveat). REFUTED Copilot's "Pass 2 upserts when
+  Pass 1 delete failed" — already handled by blockedIdentity/Address/FQDN
+  (left unchanged). Three new non-tautological tests (dual-family merge
+  keeps enable+server+ttl+gains domain; enable-latch either order; state
+  version fail-open + v0 tolerated) — all FAIL against pre-fix. README
+  updated.
+- **File(s)**: pkg/config/compiler_services.go, pkg/dhcpserver/ddns.go,
+  pkg/dhcpserver/ddns_state.go, pkg/config/compiler_dhcp_ddns_test.go,
+  pkg/dhcpserver/ddns_test.go, pkg/dhcpserver/README.md, _Log.md
+
 ## 2026-06-19 — #1387 DDNS PR #2043: per-row conformance check (Codex r6)
 
 - **Timestamp**: 2026-06-19

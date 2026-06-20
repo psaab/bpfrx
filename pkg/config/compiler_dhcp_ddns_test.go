@@ -122,6 +122,72 @@ func TestDHCPDDNSV6BlockCompiles(t *testing.T) {
 	}
 }
 
+// TestDHCPDDNSDualFamilyMergesFieldByField proves the Copilot/Codex MAJOR
+// fix: when BOTH dhcp-local-server AND dhcpv6-local-server carry a
+// dynamic-dns block, the compiler MERGES them field-by-field instead of
+// whole-struct overwrite. A partial second-family block (e.g. only domain
+// under v6) must NOT clear the first family's Enabled/server/ttl. Against
+// the pre-fix `dhcp.DynamicDNS = compileDHCPDynamicDNS(...)` overwrite, the
+// v6 block (Enabled=false, no server, no ttl) replaced the v4 block and
+// DDNS was silently disabled with its settings dropped — so this test
+// fails pre-fix.
+func TestDHCPDDNSDualFamilyMergesFieldByField(t *testing.T) {
+	// v4 compiles first (dst): enable + update-server + ttl. v6 compiles
+	// second (src): only domain. Merge must keep all v4 fields + gain domain.
+	cfg, err := CompileConfig(buildTree(t, []string{
+		"set system services dhcp-local-server dynamic-dns enable",
+		"set system services dhcp-local-server dynamic-dns update-server 192.0.2.53",
+		"set system services dhcp-local-server dynamic-dns ttl 600",
+		"set system services dhcpv6-local-server dynamic-dns domain corp.example.com",
+	}))
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	d := ddnsOf(t, cfg)
+	if d == nil {
+		t.Fatal("dual-family DDNS compiled to nil")
+	}
+	if !d.Enabled {
+		t.Fatal("partial v6 block cleared v4 Enabled (whole-struct overwrite bug)")
+	}
+	if d.UpdateServer != "192.0.2.53" {
+		t.Fatalf("v4 update-server lost on merge: %q", d.UpdateServer)
+	}
+	if d.TTLSeconds != 600 {
+		t.Fatalf("v4 ttl lost on merge: %d", d.TTLSeconds)
+	}
+	if d.Domain != "corp.example.com" {
+		t.Fatalf("v6 domain not merged in: %q", d.Domain)
+	}
+}
+
+// TestDHCPDDNSDualFamilyEnableLatchesEitherOrder proves the Enabled latch is
+// order-robust: enabling DDNS in EITHER family enables it, and a partial
+// block in the other family cannot flip it off — regardless of which family
+// is the partial one.
+func TestDHCPDDNSDualFamilyEnableLatchesEitherOrder(t *testing.T) {
+	// v4 partial (only domain), v6 enables. Latch must hold (v6 is src; the
+	// merge ORs Enabled so dst v4 ends up Enabled too).
+	cfg, err := CompileConfig(buildTree(t, []string{
+		"set system services dhcp-local-server dynamic-dns domain corp.example.com",
+		"set system services dhcpv6-local-server dynamic-dns enable",
+		"set system services dhcpv6-local-server dynamic-dns update-server 2001:db8::53",
+	}))
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	d := ddnsOf(t, cfg)
+	if d == nil || !d.Enabled {
+		t.Fatalf("enable in v6 did not latch when v4 was the partial block: %+v", d)
+	}
+	if d.Domain != "corp.example.com" {
+		t.Fatalf("v4 domain lost: %q", d.Domain)
+	}
+	if d.UpdateServer != "2001:db8::53" {
+		t.Fatalf("v6 update-server not merged: %q", d.UpdateServer)
+	}
+}
+
 func TestDHCPDDNSStringRedactsTSIGSecret(t *testing.T) {
 	d := &DHCPDynamicDNSConfig{
 		Enabled:       true,

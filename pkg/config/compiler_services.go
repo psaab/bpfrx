@@ -125,11 +125,14 @@ func compileDHCPLocalServer(node *Node, dhcp *DHCPServerConfig, isV6 bool) error
 	// pools of the family. It can appear under dhcp-local-server and/or
 	// dhcpv6-local-server; the typed model carries a single
 	// DHCPDynamicDNSConfig (the reconciler walks both families' leases).
-	// Either family's block populates it; a later non-empty block from
-	// the other family overrides (operators normally configure one).
+	// When BOTH families carry a block we MERGE field-by-field rather than
+	// whole-struct overwrite: a partial second block (e.g. only `domain`
+	// under v6) must NOT clear the v4 block's Enabled/server/ttl. A field
+	// set in either block wins; presence-only `enable` latches on (once any
+	// family enables DDNS it stays enabled). See mergeDHCPDynamicDNS.
 	if ddnsNode := node.FindChild("dynamic-dns"); ddnsNode != nil {
 		if ddns := compileDHCPDynamicDNS(ddnsNode); ddns != nil {
-			dhcp.DynamicDNS = ddns
+			dhcp.DynamicDNS = mergeDHCPDynamicDNS(dhcp.DynamicDNS, ddns)
 		}
 	}
 
@@ -185,10 +188,56 @@ func compileDHCPLocalServer(node *Node, dhcp *DHCPServerConfig, isV6 bool) error
 	return nil
 }
 
+// mergeDHCPDynamicDNS merges a freshly-compiled dynamic-dns block (src)
+// into the existing one (dst), field-by-field, so a partial block under the
+// second family does not clobber settings the first family established
+// (#1387). dst may be nil (first family seen). A field set in EITHER block
+// wins: for strings/ttl, a non-zero src value fills an empty dst field (dst
+// keeps its own non-zero value — first-family-wins on a genuine conflict,
+// matching compileDHCPDynamicDNS's first-value-wins intra-block rule). The
+// presence-only Enabled flag LATCHES: once any family enables DDNS it stays
+// enabled (a partial second block can never flip it false). src is non-nil
+// (compileDHCPDynamicDNS returned a real block).
+func mergeDHCPDynamicDNS(dst, src *DHCPDynamicDNSConfig) *DHCPDynamicDNSConfig {
+	if dst == nil {
+		return src
+	}
+	dst.Enabled = dst.Enabled || src.Enabled
+	if dst.Domain == "" {
+		dst.Domain = src.Domain
+	}
+	if dst.HostnameSource == "" {
+		dst.HostnameSource = src.HostnameSource
+	}
+	if dst.ConflictPolicy == "" {
+		dst.ConflictPolicy = src.ConflictPolicy
+	}
+	if dst.Backend == "" {
+		dst.Backend = src.Backend
+	}
+	if dst.UpdateServer == "" {
+		dst.UpdateServer = src.UpdateServer
+	}
+	if dst.TSIGKeyName == "" {
+		dst.TSIGKeyName = src.TSIGKeyName
+	}
+	if dst.TSIGAlgorithm == "" {
+		dst.TSIGAlgorithm = src.TSIGAlgorithm
+	}
+	if dst.TSIGSecret == "" {
+		dst.TSIGSecret = src.TSIGSecret
+	}
+	if dst.TTLSeconds == 0 {
+		dst.TTLSeconds = src.TTLSeconds
+	}
+	return dst
+}
+
 // dhcpDDNSStringProps are the dynamic-dns leaves that carry a string
 // value (everything except the valueless `enable` flag and the integer
-// `ttl`). Used by collectDHCPDDNSProps to recognize a "<leaf> <value>"
-// pair at any depth regardless of the AST shape.
+// `ttl`). Used by compileDHCPDynamicDNS's internal subtree walker to
+// recognize a "<leaf> <value>" pair at any depth regardless of the AST
+// shape.
 var dhcpDDNSStringProps = map[string]bool{
 	"domain":          true,
 	"hostname-source": true,

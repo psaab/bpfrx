@@ -255,8 +255,12 @@ func (m *DDNSManager) reconcileOnceLocked(ctx context.Context, pol ddnsPolicy, l
 		seen bool
 	}
 	want := map[string]*desired{}
-	// addrOwner tracks which identity currently wants a given address, so
-	// a reassignment (new client, same address) cleans the old owner.
+	// Reassignment (a new client taking over an address a different client
+	// held) is cleaned by the owned-state delete pass below, NOT a separate
+	// tracker: the old owner's (identity,address) key is no longer in `want`
+	// (the new client has a different identity), so Pass 1 deletes the old
+	// owned record before Pass 2 adds the new one (delete-before-add on a
+	// shared address; a failed delete blocks the add via the blocked maps).
 	for _, l := range leases {
 		fqdn, err := deriveFQDN(l.HostName, l.ClientFQDN, l.Identity, pol.domain, source)
 		if err != nil {
@@ -429,9 +433,14 @@ func (m *DDNSManager) deleteOwnedLocked(ctx context.Context, owned ownedRecord) 
 	}
 	if isNopUpdater(m.updater) {
 		// No live backend: the delete was a logged no-op. Still drop the
-		// ownership entry so a disabled/withdrawn record does not linger in
-		// the store forever — the store tracks what xpf intends to own, and
-		// without a backend there is nothing in DNS to leak.
+		// ownership entry. For increment 1 this is CORRECT: nopUpdater never
+		// published anything, so there is nothing in DNS to orphan by
+		// forgetting ownership. CAVEAT (increment 2+): if a real backend is
+		// ever wired, publishes records, and is later removed (a downgrade
+		// back to no-backend), dropping ownership here would orphan those
+		// previously-published records in DNS. Handling that downgrade is an
+		// increment-2 concern; there is NO logic change for inc-1, where the
+		// store can only ever hold records nopUpdater "wrote" (i.e. none).
 		m.skippedNoBackend.Add(1)
 		m.state.delete(owned.Identity, owned.Address)
 		return nil
