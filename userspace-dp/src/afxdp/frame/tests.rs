@@ -4224,6 +4224,274 @@ fn segment_forwarded_tcp_frames_keeps_ipv4_snat_inside_native_gre() {
     assert_eq!(total_payload, tcp_payload_len);
 }
 
+// --- #2077: TCP-segmentation TTL/hop-limit gate v4/v6 symmetry ---
+//
+// The TTL==1 drop in the segmentation builders must be gated on
+// NOT-fabric-ingress, matching every other forwarding path
+// (build/ipv4.rs, build/ipv6.rs, frame/mod.rs, rewrite/ipv4.rs,
+// rewrite/ipv6.rs). A fabric-ingress segment (FABRIC_INGRESS_FLAG =
+// 0x80 in meta_flags) was already decremented by the peer chassis at
+// its real ingress; the fabric crossing is an internal cross-chassis
+// redirect, not an IP hop, so neither the decrement NOR the drop
+// applies. Before the fix the IPv4 builder dropped UNCONDITIONALLY on
+// TTL <= 1 while IPv6 was correctly gated — a fabric-ingress oversized
+// IPv4 TCP segment with TTL==1 was wrongly dropped.
+
+/// Build an oversized (multi-MTU) TCP frame for one address family
+/// with a caller-chosen TTL / hop-limit, ready for the segmentation
+/// builders. No NAT rewrite is configured so the test isolates the
+/// TTL gate. `egress mtu` is 1500 and the TCP payload is large enough
+/// to force more than one segment.
+fn build_oversized_tcp_frame_for_ttl_gate(
+    addr_family: i32,
+    ttl: u8,
+) -> (Vec<u8>, UserspaceDpMeta, SessionDecision, ForwardingState) {
+    let src_port = 47308u16;
+    let dst_port = 5201u16;
+    let tcp_payload_len = 8192usize; // >> MTU, forces segmentation
+    let tcp_header_len = 20usize;
+
+    let mut frame = Vec::new();
+    let (ether_type, next_hop, primary_v4, primary_v6) = match addr_family {
+        libc::AF_INET => (
+            0x0800u16,
+            IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+            Some(Ipv4Addr::new(172, 16, 80, 8)),
+            None,
+        ),
+        libc::AF_INET6 => (
+            0x86ddu16,
+            IpAddr::V6("2001:559:8585:80::200".parse().unwrap()),
+            None,
+            Some("2001:559:8585:80::8".parse().unwrap()),
+        ),
+        _ => panic!("unsupported addr_family"),
+    };
+    write_eth_header(
+        &mut frame,
+        [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
+        [0x36, 0xe4, 0x2b, 0xd5, 0x39, 0xe6],
+        0,
+        ether_type,
+    );
+
+    let (l4_offset, l3_header_len) = match addr_family {
+        libc::AF_INET => {
+            let total_len = (20 + tcp_header_len + tcp_payload_len) as u16;
+            frame.extend_from_slice(&[
+                0x45,
+                0x00,
+                (total_len >> 8) as u8,
+                total_len as u8,
+                0xd1,
+                0x43,
+                0x40,
+                0x00,
+                ttl, // TTL field at IP-header offset 8
+                PROTO_TCP,
+                0x00,
+                0x00,
+            ]);
+            frame.extend_from_slice(&Ipv4Addr::new(10, 0, 61, 102).octets());
+            frame.extend_from_slice(&Ipv4Addr::new(172, 16, 80, 200).octets());
+            (34usize, 20usize)
+        }
+        libc::AF_INET6 => {
+            let plen = (tcp_header_len + tcp_payload_len) as u16;
+            frame.extend_from_slice(&[
+                0x60,
+                0x00,
+                0x00,
+                0x00,
+                (plen >> 8) as u8,
+                plen as u8,
+                PROTO_TCP,
+                ttl, // hop-limit field at IP-header offset 7
+            ]);
+            frame
+                .extend_from_slice(&"2001:559:8585:ef00::102".parse::<Ipv6Addr>().unwrap().octets());
+            frame
+                .extend_from_slice(&"2001:559:8585:80::200".parse::<Ipv6Addr>().unwrap().octets());
+            (54usize, 40usize)
+        }
+        _ => unreachable!(),
+    };
+    frame.extend_from_slice(&src_port.to_be_bytes());
+    frame.extend_from_slice(&dst_port.to_be_bytes());
+    frame.extend_from_slice(&[
+        0x52, 0x04, 0xc1, 0xa3, // seq
+        0x73, 0x7f, 0x63, 0x1c, // ack
+        0x50, 0x10, 0x00, 0x3f, // data offset (5)/ACK flag/window
+        0x00, 0x00, 0x00, 0x00, // checksum/urgent
+    ]);
+    frame.extend((0..tcp_payload_len).map(|i| (i & 0xff) as u8));
+    if addr_family == libc::AF_INET {
+        let ip_sum = checksum16(&frame[14..34]);
+        frame[24] = (ip_sum >> 8) as u8;
+        frame[25] = ip_sum as u8;
+        recompute_l4_checksum_ipv4(&mut frame[14..], 20, PROTO_TCP, false).expect("v4 tcp sum");
+    } else {
+        recompute_l4_checksum_ipv6(&mut frame[14..], 40, PROTO_TCP).expect("v6 tcp sum");
+    }
+
+    let meta = UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+        l3_offset: 14,
+        l4_offset: l4_offset as u16,
+        addr_family: addr_family as u8,
+        protocol: PROTO_TCP,
+        flow_src_port: src_port,
+        flow_dst_port: dst_port,
+        ..UserspaceDpMeta::default()
+    };
+    let decision = SessionDecision {
+        resolution: ForwardingResolution {
+            disposition: ForwardingDisposition::ForwardCandidate,
+            local_ifindex: 0,
+            egress_ifindex: 12,
+            tx_ifindex: 11,
+            tunnel_endpoint_id: 0,
+            next_hop: Some(next_hop),
+            neighbor_mac: Some([0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]),
+            src_mac: Some([0x02, 0xbf, 0x72, 0x16, 0x01, 0x00]),
+            tx_vlan_id: 0,
+        },
+        // No NAT — the test isolates the TTL/hop-limit gate.
+        nat: NatDecision::default(),
+    };
+    let mut forwarding = ForwardingState::default();
+    forwarding.egress.insert(
+        12,
+        EgressInterface {
+            bind_ifindex: 11,
+            vlan_id: 0,
+            mtu: 1500,
+            src_mac: [0x02, 0xbf, 0x72, 0x16, 0x01, 0x00],
+            zone_id: TEST_WAN_ZONE_ID,
+            redundancy_group: 1,
+            primary_v4,
+            primary_v6,
+        },
+    );
+    let _ = l3_header_len;
+    (frame, meta, decision, forwarding)
+}
+
+/// Fabric-ingress (meta_flags = FABRIC_INGRESS_FLAG = 0x80) oversized
+/// TCP segment with TTL/hop-limit == 1 must NOT be dropped, for BOTH
+/// address families. Non-tautological: pre-fix the IPv4 arm returns
+/// None (unconditional `packet[8] <= 1` drop) and this test fails for
+/// the v4 case.
+#[test]
+fn segment_forwarded_tcp_frames_keeps_fabric_ingress_low_ttl_both_families() {
+    for (label, af, ttl_off) in [
+        ("v4", libc::AF_INET, 8usize),
+        ("v6", libc::AF_INET6, 7usize),
+    ] {
+        let (frame, mut meta, decision, forwarding) =
+            build_oversized_tcp_frame_for_ttl_gate(af, 1);
+        meta.meta_flags = 0x80; // FABRIC_INGRESS_FLAG — peer already decremented
+
+        let segments = segment_forwarded_tcp_frames_from_frame(
+            &frame,
+            meta,
+            &decision,
+            &forwarding,
+            false, // apply_nat_on_fabric
+            Some((meta.flow_src_port, meta.flow_dst_port)),
+        )
+        .unwrap_or_else(|| {
+            panic!(
+                "[{}] fabric-ingress oversized segment with TTL/hop-limit==1 \
+                 must segment, not drop (the peer already decremented)",
+                label
+            )
+        });
+        assert!(
+            segments.len() > 1,
+            "[{}] expected multiple segments for oversized payload",
+            label
+        );
+        // The TTL/hop-limit must be preserved (NOT decremented) on the
+        // fabric-ingress path. IP header starts at the L2 offset; the
+        // built frames have no VLAN tag so eth_len == 14.
+        for seg in &segments {
+            let post = seg[14 + ttl_off];
+            assert_eq!(
+                post, 1,
+                "[{}] fabric-ingress must preserve TTL/hop-limit (got {})",
+                label, post
+            );
+        }
+    }
+}
+
+/// Non-fabric (meta_flags == 0) oversized TCP segment with TTL/hop-
+/// limit == 1 must STILL be dropped, for BOTH address families. Guards
+/// against an over-broad fix that would also drop the legitimate
+/// TTL-expiry behaviour on the normal forwarding path.
+#[test]
+fn segment_forwarded_tcp_frames_drops_non_fabric_low_ttl_both_families() {
+    for (label, af) in [("v4", libc::AF_INET), ("v6", libc::AF_INET6)] {
+        let (frame, meta, decision, forwarding) =
+            build_oversized_tcp_frame_for_ttl_gate(af, 1);
+        // meta_flags defaults to 0 (NOT fabric-ingress).
+        assert_eq!(meta.meta_flags & 0x80, 0, "[{}] expected non-fabric meta", label);
+
+        let result = segment_forwarded_tcp_frames_from_frame(
+            &frame,
+            meta,
+            &decision,
+            &forwarding,
+            false,
+            Some((meta.flow_src_port, meta.flow_dst_port)),
+        );
+        assert!(
+            result.is_none(),
+            "[{}] non-fabric oversized segment with TTL/hop-limit==1 must be \
+             dropped (TTL expiry)",
+            label
+        );
+    }
+}
+
+/// Sanity twin: a non-fabric oversized segment with a healthy TTL (64)
+/// segments normally AND decrements the TTL/hop-limit by one on every
+/// segment — confirming the gate only blocks the expiry case and the
+/// normal decrement path is intact for BOTH families.
+#[test]
+fn segment_forwarded_tcp_frames_decrements_non_fabric_healthy_ttl_both_families() {
+    for (label, af, ttl_off) in [
+        ("v4", libc::AF_INET, 8usize),
+        ("v6", libc::AF_INET6, 7usize),
+    ] {
+        let (frame, meta, decision, forwarding) =
+            build_oversized_tcp_frame_for_ttl_gate(af, 64);
+
+        let segments = segment_forwarded_tcp_frames_from_frame(
+            &frame,
+            meta,
+            &decision,
+            &forwarding,
+            false,
+            Some((meta.flow_src_port, meta.flow_dst_port)),
+        )
+        .unwrap_or_else(|| panic!("[{}] healthy-TTL oversized segment must segment", label));
+        assert!(segments.len() > 1, "[{}] expected multiple segments", label);
+        for seg in &segments {
+            let post = seg[14 + ttl_off];
+            assert_eq!(
+                post, 63,
+                "[{}] non-fabric forwarding must decrement TTL/hop-limit 64->63 \
+                 (got {})",
+                label, post
+            );
+        }
+    }
+}
+
 #[test]
 fn rewrite_forwarded_frame_in_place_keeps_tcp_checksum_valid_after_vlan_snat() {
     let mut frame = Vec::new();
