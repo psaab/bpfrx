@@ -394,3 +394,40 @@ coverage: `pkg/config/schema_validate_flow_numwidth_test.go` (Tiers 1+2 via
 `CompileConfig`, dual-shape + mixed-shape precedence + strict/lenient), and
 `pkg/dataplane/userspace/flow_numwidth_agreement_test.go` (the directional
 Layer-A agreement property).
+
+## The `inactive:` universal node modifier (#2008 H1)
+
+`inactive:` is the Junos deactivate-without-delete marker and is NOT a
+schema leaf — it is a UNIVERSAL node modifier that can prefix ANY statement
+at ANY position, so it lives OUTSIDE `setSchema` entirely. The parser
+(`parser.go`) recognizes a leading `inactive:` token, lifts it into
+`Node.Inactive`, and leaves the node's real `Keys` intact. Because the
+modifier never appears in the node's identity, the `setSchema` walk, the
+flat-set token grouping, and the value-slot `?` completion are all
+unaffected — they continue to see the node's real keyword.
+
+**Strip-before-validate / strip-before-compile contract.** A deactivated
+statement must be excluded from BOTH the typed-leaf gate and the compiler,
+and Junos accepts a deactivated leaf even when its value would be rejected
+if active (it parks work-in-progress). The single centralized strip,
+`ConfigTree.WithoutInactive` (`pkg/config/inactive.go`), prunes inactive
+subtrees and runs at two coordinated entry points:
+
+1. `SchemaValidateWithDefinitions` (`schema_walk.go`) strips both the tree
+   and the cross-reference `defsSource` BEFORE the typed-leaf walk, so a
+   deactivated typed leaf with a deliberately-invalid value does not fail
+   `commit check`, and a deactivated definition neither satisfies an active
+   reference nor is itself validated.
+2. Both `compileConfig*` entry points (`compiler.go`) strip FIRST — before
+   the pre-expansion tunnel-id collision gate, group expansion, and section
+   compilation — so `inactive: apply-groups foo` suppresses the inherited
+   config, inactive nodes inside `groups {}` bodies are pruned, and the
+   ~15 compiler files never observe an inactive node. Centralizing the
+   strip in the shared node-aware `compileConfigForNodeWithOpts` guarantees
+   BOTH cluster nodes compile the identical active set from the same
+   JSON-synced (`Inactive`-flag-carrying) tree — no split-brain posture.
+
+Strip can only REMOVE nodes from the compiled set, so a config that
+compiled before cannot become non-compilable. `WithoutInactive` is a
+clone-free no-op when nothing is deactivated, so the all-active path is
+unchanged. Regression coverage: `pkg/config/inactive_test.go`.

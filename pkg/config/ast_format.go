@@ -36,9 +36,9 @@ func (t *ConfigTree) FormatPathInheritance(path []string) string {
 	var b strings.Builder
 	for _, n := range matches {
 		if n.IsLeaf {
-			fmt.Fprintf(&b, "%s;\n", n.QuotedKeyPath())
+			fmt.Fprintf(&b, "%s%s;\n", inactivePrefix(n), n.QuotedKeyPath())
 		} else {
-			fmt.Fprintf(&b, "%s {\n", n.QuotedKeyPath())
+			fmt.Fprintf(&b, "%s%s {\n", inactivePrefix(n), n.QuotedKeyPath())
 			formatNodesInheritance(&b, n.Children, 1)
 			fmt.Fprintf(&b, "}\n")
 		}
@@ -61,9 +61,9 @@ func formatNodesInheritance(b *strings.Builder, nodes []*Node, indent int) {
 				prefix, prefix, displayKey, n.InheritedFrom, prefix)
 		}
 		if n.IsLeaf {
-			fmt.Fprintf(b, "%s%s;\n", prefix, n.QuotedKeyPath())
+			fmt.Fprintf(b, "%s%s%s;\n", prefix, inactivePrefix(n), n.QuotedKeyPath())
 		} else {
-			fmt.Fprintf(b, "%s%s {\n", prefix, n.QuotedKeyPath())
+			fmt.Fprintf(b, "%s%s%s {\n", prefix, inactivePrefix(n), n.QuotedKeyPath())
 			formatNodesInheritance(b, n.Children, indent+1)
 			fmt.Fprintf(b, "%s}\n", prefix)
 		}
@@ -75,6 +75,17 @@ func (t *ConfigTree) Format() string {
 	var b strings.Builder
 	formatNodes(&b, t.Children, 0)
 	return b.String()
+}
+
+// inactivePrefix returns the `inactive: ` text-form prefix for a
+// deactivated node (#2008 H1), or "" for an active node. A single shared
+// helper across every text serializer guarantees no display path silently
+// drops the operator's deactivation from `show configuration`.
+func inactivePrefix(n *Node) string {
+	if n != nil && n.Inactive {
+		return inactiveMarker + " "
+	}
+	return ""
 }
 
 // canonicalOrder reorders children so "match"/"from" comes before "then",
@@ -117,9 +128,9 @@ func formatNodes(b *strings.Builder, nodes []*Node, indent int) {
 			fmt.Fprintf(b, "%s/* %s */\n", prefix, n.Annotation)
 		}
 		if n.IsLeaf {
-			fmt.Fprintf(b, "%s%s;\n", prefix, n.QuotedKeyPath())
+			fmt.Fprintf(b, "%s%s%s;\n", prefix, inactivePrefix(n), n.QuotedKeyPath())
 		} else {
-			fmt.Fprintf(b, "%s%s {\n", prefix, n.QuotedKeyPath())
+			fmt.Fprintf(b, "%s%s%s {\n", prefix, inactivePrefix(n), n.QuotedKeyPath())
 			formatNodes(b, n.Children, indent+1)
 			fmt.Fprintf(b, "%s}\n", prefix)
 		}
@@ -141,9 +152,9 @@ func (t *ConfigTree) FormatPath(path []string) string {
 	var b strings.Builder
 	for _, n := range matches {
 		if n.IsLeaf {
-			fmt.Fprintf(&b, "%s;\n", n.QuotedKeyPath())
+			fmt.Fprintf(&b, "%s%s;\n", inactivePrefix(n), n.QuotedKeyPath())
 		} else {
-			fmt.Fprintf(&b, "%s {\n", n.QuotedKeyPath())
+			fmt.Fprintf(&b, "%s%s {\n", inactivePrefix(n), n.QuotedKeyPath())
 			formatNodes(&b, n.Children, 1)
 			fmt.Fprintf(&b, "}\n")
 		}
@@ -185,17 +196,29 @@ func (t *ConfigTree) FormatPathSet(path []string) string {
 		} else {
 			formatSetNodes(&b, n.Children, prefix)
 		}
+		if n.Inactive {
+			fmt.Fprintf(&b, "deactivate %s\n", joinQuotedKeys(prefix))
+		}
 	}
 	return b.String()
 }
 
+// formatSetNodes renders nodes as flat `set` commands. A deactivated node
+// (#2008 H1) is emitted as its normal `set` line(s) followed by a
+// `deactivate <path>` line — matching Junos `show | display set`, which
+// models deactivation as the separate `deactivate` verb rather than an
+// inline token. Loading such output replays the `set` then the
+// `deactivate`, restoring the Inactive flag.
 func formatSetNodes(b *strings.Builder, nodes []*Node, prefix []string) {
 	for _, n := range canonicalOrder(nodes) {
-		path := append(prefix, n.Keys...)
+		path := append(append([]string(nil), prefix...), n.Keys...)
 		if n.IsLeaf {
 			fmt.Fprintf(b, "set %s\n", joinQuotedKeys(path))
 		} else {
 			formatSetNodes(b, n.Children, path)
+		}
+		if n.Inactive {
+			fmt.Fprintf(b, "deactivate %s\n", joinQuotedKeys(path))
 		}
 	}
 }
@@ -271,6 +294,14 @@ func diffNodes(b *strings.Builder, oldNodes, newNodes []*Node, editPath []string
 			allRecursable = false
 			break
 		}
+		// #2008 H1: a pure block-level activate/deactivate (identical
+		// content, flipped Inactive) has NO child diff to recurse into —
+		// it must be shown at this level as a removed/added pair, not
+		// silently dropped by recursing into an unchanged subtree.
+		if e.oldNode.Inactive != e.newNode.Inactive {
+			allRecursable = false
+			break
+		}
 	}
 
 	if allRecursable {
@@ -314,14 +345,18 @@ func diffNodes(b *strings.Builder, oldNodes, newNodes []*Node, editPath []string
 		case nodesEqual(e.oldNode, e.newNode):
 			// Unchanged — show collapsed
 			if e.oldNode.IsLeaf {
-				fmt.Fprintf(b, " %s%s;\n", indent, e.oldNode.QuotedKeyPath())
+				fmt.Fprintf(b, " %s%s%s;\n", indent, inactivePrefix(e.oldNode), e.oldNode.QuotedKeyPath())
 			} else {
-				fmt.Fprintf(b, " %s%s { ... }\n", indent, e.oldNode.QuotedKeyPath())
+				fmt.Fprintf(b, " %s%s%s { ... }\n", indent, inactivePrefix(e.oldNode), e.oldNode.QuotedKeyPath())
 			}
 		default:
 			// Modified
-			if !e.oldNode.IsLeaf && !e.newNode.IsLeaf {
-				// Both are blocks — show [edit] context for sub-container
+			if !e.oldNode.IsLeaf && !e.newNode.IsLeaf &&
+				e.oldNode.Inactive == e.newNode.Inactive {
+				// Both are blocks with the same active/inactive state — show
+				// [edit] context for the sub-container. A pure block-level
+				// activate/deactivate (#2008 H1) falls through to the -/+
+				// pair below so the change is visible.
 				childPath := append(append([]string{}, editPath...), strings.Fields(e.oldNode.KeyPath())...)
 				diffNodes(b, e.oldNode.Children, e.newNode.Children, childPath)
 			} else {
@@ -338,6 +373,12 @@ func nodesEqual(a, b *Node) bool {
 		return false
 	}
 	if a.IsLeaf != b.IsLeaf {
+		return false
+	}
+	// #2008 H1: a pure activate/deactivate (same content, flipped Inactive)
+	// is a real change — Junos shows it in `show | compare`. Treat differing
+	// Inactive as inequality so the diff surfaces it.
+	if a.Inactive != b.Inactive {
 		return false
 	}
 	if a.IsLeaf {
@@ -365,9 +406,9 @@ func nodesEqual(a, b *Node) bool {
 // formatPrefixed writes a node with +/- prefix at the given indent.
 func formatPrefixed(b *strings.Builder, prefix, indent string, n *Node) {
 	if n.IsLeaf {
-		fmt.Fprintf(b, "%s%s%s;\n", prefix, indent, n.QuotedKeyPath())
+		fmt.Fprintf(b, "%s%s%s%s;\n", prefix, indent, inactivePrefix(n), n.QuotedKeyPath())
 	} else {
-		fmt.Fprintf(b, "%s%s%s {\n", prefix, indent, n.QuotedKeyPath())
+		fmt.Fprintf(b, "%s%s%s%s {\n", prefix, indent, inactivePrefix(n), n.QuotedKeyPath())
 		formatPrefixedChildren(b, prefix, indent+"    ", n.Children)
 		fmt.Fprintf(b, "%s%s}\n", prefix, indent)
 	}
@@ -441,7 +482,7 @@ func formatXMLNodes(b *strings.Builder, nodes []*Node, indent int) {
 			formatXMLLeaf(b, n, prefix)
 		} else {
 			tag := xmlTag(n.Keys[0])
-			fmt.Fprintf(b, "%s<%s>\n", prefix, tag)
+			fmt.Fprintf(b, "%s<%s%s>\n", prefix, tag, xmlInactiveAttr(n))
 			// Extra keys become <name> elements.
 			for _, k := range n.Keys[1:] {
 				fmt.Fprintf(b, "%s    <name>%s</name>\n", prefix, xmlEscape(k))
@@ -452,10 +493,20 @@ func formatXMLNodes(b *strings.Builder, nodes []*Node, indent int) {
 	}
 }
 
+// xmlInactiveAttr returns the Junos ` inactive="inactive"` element
+// attribute for a deactivated node (#2008 H1), or "" for an active node.
+func xmlInactiveAttr(n *Node) string {
+	if n != nil && n.Inactive {
+		return ` inactive="inactive"`
+	}
+	return ""
+}
+
 func formatXMLLeaf(b *strings.Builder, n *Node, prefix string) {
+	attr := xmlInactiveAttr(n)
 	if len(n.Keys) == 1 {
 		// Boolean leaf: <keyword/>
-		fmt.Fprintf(b, "%s<%s/>\n", prefix, xmlTag(n.Keys[0]))
+		fmt.Fprintf(b, "%s<%s%s/>\n", prefix, xmlTag(n.Keys[0]), attr)
 		return
 	}
 	// Leaf with value: <keyword>value</keyword>
@@ -463,9 +514,9 @@ func formatXMLLeaf(b *strings.Builder, n *Node, prefix string) {
 	// <keyword><name>val1</name></keyword>
 	tag := xmlTag(n.Keys[0])
 	if len(n.Keys) == 2 {
-		fmt.Fprintf(b, "%s<%s>%s</%s>\n", prefix, tag, xmlEscape(n.Keys[1]), tag)
+		fmt.Fprintf(b, "%s<%s%s>%s</%s>\n", prefix, tag, attr, xmlEscape(n.Keys[1]), tag)
 	} else {
-		fmt.Fprintf(b, "%s<%s>\n", prefix, tag)
+		fmt.Fprintf(b, "%s<%s%s>\n", prefix, tag, attr)
 		for _, k := range n.Keys[1:] {
 			fmt.Fprintf(b, "%s    <name>%s</name>\n", prefix, xmlEscape(k))
 		}
@@ -487,10 +538,18 @@ func xmlEscape(s string) string {
 }
 
 // nodesToJSON converts a list of AST nodes to a nested map structure.
+//
+// A deactivated node (#2008 H1) additionally emits a collision-safe marker
+// entry `"<keypath> @inactive": "inactive"` alongside its normal entry. The
+// `@` sigil is not a valid Junos identifier character (lexer.isIdentChar),
+// so the marker key can never collide with a real configuration key.
 func nodesToJSON(nodes []*Node) map[string]interface{} {
 	result := make(map[string]interface{})
 
 	for _, n := range nodes {
+		if n.Inactive {
+			result[n.KeyPath()+" @inactive"] = "inactive"
+		}
 		if n.IsLeaf {
 			// Leaf node: key is first key, value is remaining keys joined
 			if len(n.Keys) == 1 {

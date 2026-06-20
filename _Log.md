@@ -132,6 +132,31 @@
 - **File(s)**: pkg/daemon/bootstrap.go, pkg/daemon/daemon_run.go,
   pkg/daemon/frr_failclosed_boot_test.go, pkg/frr/testseam.go,
   pkg/daemon/README.md, _Log.md
+## 2026-06-19 — #2008 H1: Junos `inactive:` statement marker
+
+- **Timestamp**: 2026-06-19
+- **Action**: Implement the #2008 H1 deactivate-without-delete marker
+  (Path A — node flag + centralized strip, increment 1). The lexer treats
+  `:` as an identifier char so `inactive:` lexed as one token and the node
+  was silently dropped from compilation AND every display path. Fix: the
+  parser lifts a leading `inactive:` into a new `Node.Inactive` flag
+  (leaving the node's real Keys intact, so all key matching / schema walk /
+  group merge keep working), a single centralized `WithoutInactive` strip
+  prunes inactive subtrees before group expansion + compile and before the
+  typed-leaf schema gate (so a deactivated invalid leaf commits clean, an
+  `inactive: apply-groups` suppresses inheritance, and the ~15 compiler
+  files stay untouched), and all five display serializers + `show | compare`
+  re-emit the marker from the flag. `Inactive` is JSON `,omitempty` so
+  active-node on-disk output is byte-identical. A lone `inactive:` is now a
+  parse error. Added 17 dual-AST regression tests
+  (`pkg/config/inactive_test.go`), verified non-tautological by neutering
+  both the parser lift and the strip. Updated module + schema + feature-gap
+  docs.
+- **File(s)**: pkg/config/ast.go, pkg/config/parser.go,
+  pkg/config/inactive.go, pkg/config/compiler.go,
+  pkg/config/schema_walk.go, pkg/config/ast_format.go,
+  pkg/config/inactive_test.go, pkg/config/README.md, docs/config-schema.md,
+  docs/feature-gaps.md, _Log.md
 
 ## 2026-06-19 — #2000 review follow-up on postinst test harness
 
