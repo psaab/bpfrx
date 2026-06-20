@@ -340,6 +340,9 @@ func TestReconcileDeleteFailureBlocksReplacementUpsert(t *testing.T) {
 	if got := up.upsertNames(); !equalStr(got, []string{"host-b.example.com=10.0.0.10"}) {
 		t.Fatalf("replacement upserts = %v", got)
 	}
+	if _, ok := m.state.get("mac:aa", "10.0.0.10"); ok {
+		t.Fatal("old ownership entry still present after successful retry")
+	}
 }
 
 // TestReconcileNeverDeletesNonOwned proves the cardinal-sin boundary: a
