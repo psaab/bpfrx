@@ -58,7 +58,16 @@ This is the package that drives chassis-cluster failover.
 - Heartbeat 200 ms, threshold 5 (1 s detection).
 - Async GARP: first pair <1 ms; remaining sent at 50 ms intervals in a
   background goroutine. Critical path stays addVIPs → sendAdvert →
-  emitEvent (sync), then `go sendGARP()` (async).
+  emitEvent (sync), then `go sendGARP(false)` (async).
+- GARP suppression gates: `sendGARP(force)` has two gates — a per-epoch
+  dedup (`garpEpoch`/`lastGARPEpoch`, one burst per transition) and a
+  500 ms time dampener (`lastGARPTime`/`garpDampened`, storm control for
+  rapid flaps). `force=true` bypasses ONLY the dampener (the epoch dedup
+  still applies). `becomeMaster` and the periodic path pass `force=false`;
+  `ReconcileVIPs` passes `force=true` because the RETH MAC just changed and
+  the correction GARP must not be swallowed by a routine burst that fired in
+  the prior 500 ms (#2081). The decision lives in the network-free helper
+  `garpSendAllowed`, which is unit-tested directly.
 - Event debounce 500 ms before priority updates.
 - Sync hold: VRRP starts with `preempt=false`; released after bulk
   session sync (or 10 s timeout). `preemptNowCh` triggers instant
