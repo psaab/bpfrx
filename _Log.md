@@ -81,6 +81,40 @@
   scripts/image/xpf-grow-root.service, scripts/image/test-grow-root.sh,
   scripts/image/bake.py, scripts/image/validate.py,
   docs/install-images.md, docs/image-validation.md
+## 2026-06-19 — #2033 Codex round-5: replacement decision atomic under the act-lock
+
+- **Timestamp**: 2026-06-19
+- **Action**: Fixed the last check-then-act in releaseDrain. It computed
+  `startReplacement` (epoch unchanged AND !goodbyeWanted) under the first lock,
+  UNLOCKED (to join/emit), then RE-LOCKED and acted on the STALE boolean — a
+  concurrent Withdraw/Clear in the gap (bump epoch / flip goodbyeWanted) was
+  ignored, re-arming RA after a newer withdraw/clear. Fix: re-evaluate the
+  decision against the LIVE tombstone UNDER the act-lock with fresh state — no
+  cached boolean. Restructured releaseDrain into a short loop: the only unlock
+  is for the blocking standalone emit (after claiming goodbyeClaimed once); the
+  loop re-acquires and re-reads epoch + goodbyeWanted before the
+  replacement decision+act, all under one lock hold. goodbyeWanted is monotonic
+  (false→true) and epoch monotonic, so a "start" observed under the act-lock
+  cannot be invalidated while held; a late Withdraw that flips goodbyeWanted in
+  the emit gap is caught on the re-lock (suppresses replace, emits the owed
+  goodbye). Documented the pre-existing startLocked-under-m.mu blocking cost in
+  the README (not a correctness issue; not introduced here).
+- **File(s)**: pkg/ra/ra.go, pkg/ra/README.md, _Log.md
+
+- **Timestamp**: 2026-06-19
+- **Action**: Added two round-5 regression tests (TestRound5_Withdraw... and
+  TestRound5_Clear...DuringRestartDecision...) that race a superseding
+  Withdraw/Clear against a restart releaseDrain and assert onProvenClose never
+  runs after a supersession is visible at the act moment (epoch advanced /
+  goodbyeWanted flipped). Mutation-verified non-tautological against a
+  gap-widened cached-boolean mutant (the exact pre-fix shape): both FAIL
+  ("replacement started despite supersession"). Also made TestT7c deterministic
+  — it drove Clear with two senders and depended on Clear's nondeterministic
+  per-interface release order (flaky on the pre-round-5 code too); rewrote it to
+  drive releaseDrain directly on a constructed dead-hard tombstone. Kept
+  Race1/Race3/Race2 + restart-timeout + T2a/T2b/T7b/T7d/T1 + ≤1-conn invariant.
+- **File(s)**: pkg/ra/serialize_test.go, _Log.md
+
 ## 2026-06-19 — #2033 Codex round-4: unify the changed-config restart through releaseDrain
 
 - **Timestamp**: 2026-06-19

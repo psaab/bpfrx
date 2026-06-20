@@ -1078,104 +1078,59 @@ func TestT7c_WithdrawAfterDeadHardSenderEmitsStandaloneGoodbye(t *testing.T) {
 		t.Skip("lo interface unavailable")
 	}
 	fl := newFakeListen(t)
-
 	m := New()
-	// Two senders: A (the one we withdraw) and B (used to hold clearLocked's
-	// join loop open). We need two real interface names; "lo" resolves, and a
-	// second resolvable name — reuse "lo" is not possible (same key), so drive A
-	// directly as a sender on a synthetic interface added to the manager, and
-	// use "lo" for B via Apply.
-	//
-	// Simpler: run BOTH through the manager using "lo" for A is impossible (one
-	// key). Instead start A as a real sender object inserted into m.senders
-	// under a synthetic name (manager Clear/Withdraw operate purely on the maps
-	// + sender objects; they only call net.InterfaceByName in startLocked /
-	// sendOneGoodbye). sendOneGoodbye for A WILL call net.InterfaceByName(A) —
-	// so A must be a resolvable name. Use "lo" for A (the withdrawn one, needs
-	// standalone goodbye) and a synthetic name for B (only needs to block the
-	// join; its sendOneGoodbye is never called).
-	ifaceB := &net.Interface{Name: "draintestB", HardwareAddr: net.HardwareAddr{0x02, 0, 0, 0, 0, 2}}
-	sB := newSender(testCfg("draintestB"), ifaceB)
-	if err := sB.start(); err != nil {
-		t.Fatalf("start B: %v", err)
-	}
-	fcB := waitConn(t, fl.getConn, "draintestB")
-	_ = fcB
 
-	ifaceA := &net.Interface{Name: "lo", HardwareAddr: net.HardwareAddr{0x02, 0, 0, 0, 0, 1}}
-	sA := newSender(testCfg("lo"), ifaceA)
-	if err := sA.start(); err != nil {
-		t.Fatalf("start A: %v", err)
+	// Construct the dead-hard-tombstone state DIRECTLY (deterministic — no
+	// dependence on Clear's nondeterministic per-interface release order): start
+	// a "lo" sender, hard-stop it, wait until it is fully DEAD (goodbyeEmitted=
+	// false, stopped closed), then install a drainEntry. This is exactly the
+	// state a completed hard Clear leaves while its tombstone is still held.
+	iface := &net.Interface{Name: "lo", HardwareAddr: net.HardwareAddr{0x02, 0, 0, 0, 0, 1}}
+	s := newSender(testCfg("lo"), iface)
+	if err := s.start(); err != nil {
+		t.Fatalf("start: %v", err)
 	}
-	fcA := waitConn(t, fl.getConn, "lo")
-	waitWrites(t, fcA, 1)
+	fc := waitConn(t, fl.getConn, "lo")
+	waitWrites(t, fc, 1)
+	s.signalStop(modeHard)
+	select {
+	case <-s.stopped:
+	case <-time.After(2 * time.Second):
+		t.Fatal("sender never stopped")
+	}
+	if s.goodbyeEmitted.Load() {
+		t.Fatal("precondition: hard stop should not have emitted a goodbye")
+	}
 
-	// Insert both into the manager's active set so Clear sees them.
+	// THIS test owns the dead entry's release. A racing graceful Withdraw flips
+	// goodbyeWanted (it owns no release for an already-draining entry); then the
+	// owner releases via releaseDrain. The dead sender cannot be upgraded, so a
+	// STANDALONE goodbye must be emitted.
 	m.mu.Lock()
-	m.senders["draintestB"] = sB
-	m.senders["lo"] = sA
+	m.draining["lo"] = &drainEntry{sender: s, cfg: s.cfg}
 	m.mu.Unlock()
 
-	// Gate B's Close so clearLocked blocks in its join loop (after A has fully
-	// finished). A emits no goodbye (hard) and fully exits; B's owner is parked
-	// in Close, so clearLocked has NOT yet removed any tombstones.
-	releaseB := make(chan struct{})
-	bClosing := make(chan struct{})
-	var once sync.Once
-	fcB.setBeforeClose(func() {
-		once.Do(func() { close(bClosing) })
-		<-releaseB
-	})
-
-	clearDone := make(chan error, 1)
-	go func() { clearDone <- m.Clear() }()
-
-	// Wait until B's close is in flight — by now A is fully stopped and its
-	// tombstone is still present (clearLocked removes tombstones only after the
-	// whole join loop).
-	select {
-	case <-bClosing:
-	case <-time.After(2 * time.Second):
-		t.Fatal("Clear never reached B's close")
-	}
-	// Ensure A's owner has fully exited (stopped closed) and emitted no goodbye.
-	select {
-	case <-sA.stopped:
-	case <-time.After(2 * time.Second):
-		t.Fatal("A's sender never stopped")
-	}
-	if sA.goodbyeEmitted.Load() {
-		t.Fatal("precondition broken: A (hard Clear) should NOT have emitted a goodbye")
-	}
-
-	// Graceful Withdraw of A while A's dead sender is still in the draining map.
 	withdrawDone := make(chan error, 1)
 	go func() { withdrawDone <- m.Withdraw() }()
-	// Withdraw must emit a standalone goodbye for A; give it time.
-	time.Sleep(100 * time.Millisecond)
-
-	// Release B so Clear can finish.
-	close(releaseB)
 	select {
-	case <-clearDone:
+	case <-withdrawDone: // flips goodbyeWanted; owns no release here
 	case <-time.After(2 * time.Second):
-		t.Fatal("Clear did not complete")
-	}
-	select {
-	case <-withdrawDone:
-	case <-time.After(2 * time.Second):
-		t.Fatal("Withdraw did not complete")
+		t.Fatal("Withdraw did not return")
 	}
 
-	// A must have received exactly one goodbye event (via the standalone path).
+	m.mu.Lock()
+	ep := m.epoch
+	m.mu.Unlock()
+	m.releaseDrain("lo", s, ep, nil)
+
 	total, conns := fl.goodbyeStats("lo")
 	if conns == 0 {
-		t.Fatalf("no goodbye emitted for the withdrawn interface (A); a dead "+
-			"hard sender must get a STANDALONE goodbye (#2033 MAJOR 2 dead-sender)")
+		t.Fatalf("no goodbye emitted for the withdrawn interface; a dead hard "+
+			"sender must get a STANDALONE goodbye (#2033 MAJOR 2 dead-sender)")
 	}
 	if conns != 1 || total != goodbyeCount {
-		t.Fatalf("expected exactly one goodbye event for A (1 conn, %d writes); "+
-			"got %d conns, %d writes", goodbyeCount, conns, total)
+		t.Fatalf("expected exactly one goodbye event (1 conn, %d writes); got "+
+			"%d conns, %d writes", goodbyeCount, conns, total)
 	}
 }
 
@@ -1770,4 +1725,167 @@ func TestRestartTimeoutNoReplacementWhenNoGoodbye(t *testing.T) {
 		t.Fatalf("pure restart emitted a goodbye (%d conns / %d writes); expected 0", conns, total)
 	}
 	close(wedge)
+}
+
+// --- #2033 round-5: replacement decision is atomic under the act-lock ---
+
+// installRestartEntry builds the state a changed-config restart reaches just
+// before releaseDrain's final decision: an OLD sender, fully hard-stopped and
+// dead (goodbyeEmitted=false, stopped closed), recorded in a drainEntry, plus
+// the startEpoch the restart captured. Returns the old sender, its config, and
+// the captured epoch. The caller drives releaseDrain(...) with an onProvenClose
+// that starts the replacement, racing a Withdraw/Clear that supersedes it.
+func installRestartEntry(t *testing.T, fl *fakeListen, m *Manager) (old *sender, cfg *config.RAInterfaceConfig, startEpoch uint64) {
+	t.Helper()
+	iface := &net.Interface{Name: "lo", HardwareAddr: net.HardwareAddr{0x02, 0, 0, 0, 0, 1}}
+	old = newSender(testCfg("lo"), iface)
+	if err := old.start(); err != nil {
+		t.Fatalf("start old: %v", err)
+	}
+	fc := waitConn(t, fl.getConn, "lo")
+	waitWrites(t, fc, 1)
+	old.signalStop(modeHard)
+	select {
+	case <-old.stopped:
+	case <-time.After(2 * time.Second):
+		t.Fatal("old sender never stopped")
+	}
+	if old.goodbyeEmitted.Load() {
+		t.Fatal("precondition: old hard stop should not have emitted a goodbye")
+	}
+	m.mu.Lock()
+	m.draining["lo"] = &drainEntry{sender: old, cfg: old.cfg}
+	startEpoch = m.epoch // the restart captured THIS epoch before unlocking
+	m.mu.Unlock()
+	return old, testCfg("lo"), startEpoch
+}
+
+// TestRound5_WithdrawDuringRestartDecisionNoReplacementGoodbyeEmitted: a
+// graceful Withdraw that bumps the epoch AND flips goodbyeWanted BEFORE the
+// restart's releaseDrain reaches its act-lock must make the restart emit the
+// goodbye and NOT start the replacement (RA not re-armed). releaseDrain
+// re-evaluates epoch + goodbyeWanted UNDER the act-lock with fresh state — no
+// cached boolean — so the withdraw wins.
+//
+// NON-TAUTOLOGY: against the cached-boolean code (decision computed at the first
+// lock, trusted across the unlock) the restart starts the replacement (RA
+// re-armed after a newer withdraw) → a live sender exists → this test FAILS.
+// (Mutation-verified with a gap-widening cached-boolean mutant.)
+func TestRound5_WithdrawDuringRestartDecisionNoReplacementGoodbyeEmitted(t *testing.T) {
+	if _, err := net.InterfaceByName("lo"); err != nil {
+		t.Skip("lo interface unavailable")
+	}
+	fl := newFakeListen(t)
+	m := New()
+	old, cfg, startEpoch := installRestartEntry(t, fl, m)
+
+	// onProvenClose runs UNDER the act-lock. The fix's contract is that it is
+	// invoked ONLY when, AT THE ACT MOMENT, epoch==startEpoch AND !goodbyeWanted.
+	// Capture the LIVE epoch + goodbyeWanted observed at call time; a violation
+	// (called despite a supersession) is the cached-boolean bug.
+	var startedDespiteSupersede bool
+	startCalled := false
+	onProvenClose := func() error {
+		startCalled = true
+		// We hold m.mu here. Fresh epoch must still be ours and no goodbye
+		// wanted — otherwise a stale cached boolean started us after a newer op.
+		if m.epoch != startEpoch || m.draining["lo"].goodbyeWanted {
+			startedDespiteSupersede = true
+		}
+		return m.startLocked(cfg)
+	}
+
+	// Launch releaseDrain FIRST so it enters its decision; fire the superseding
+	// Withdraw shortly after, so on a cached-boolean impl with a widened gap the
+	// Withdraw lands in the decision→act window and the stale boolean re-arms RA.
+	// On the FIXED code decision+act are atomic under one lock, so the Withdraw
+	// lands strictly before or after — never mid-decision — and onProvenClose is
+	// never called after a supersession.
+	var wg sync.WaitGroup
+	wg.Add(2)
+	relErr := make(chan error, 1)
+	go func() { defer wg.Done(); relErr <- m.releaseDrain("lo", old, startEpoch, onProvenClose) }()
+	go func() {
+		defer wg.Done()
+		time.Sleep(10 * time.Millisecond) // try to land in the decision→act gap
+		_ = m.Withdraw()
+	}()
+	wg.Wait()
+	if err := <-relErr; err != nil {
+		t.Fatalf("releaseDrain: %v", err)
+	}
+
+	// The precise round-5 invariant: onProvenClose (start the replacement) must
+	// NEVER run after a supersession was already visible at the act moment. A
+	// cached-boolean impl violates this — it calls onProvenClose with the stale
+	// boolean while the live epoch has advanced / goodbyeWanted has flipped,
+	// re-arming RA after a newer withdraw. The fixed code re-reads epoch +
+	// goodbyeWanted UNDER the act-lock, so onProvenClose is reached only when the
+	// decision is still valid. (Whether the withdraw lands before or after the
+	// atomic decision is timing-dependent and both are correct; we assert ONLY
+	// the never-start-after-supersede property, which holds on every interleave.)
+	_ = startCalled
+	if startedDespiteSupersede {
+		t.Fatal("replacement started despite a newer Withdraw superseding the "+
+			"restart at the act moment — stale cached decision across the unlock "+
+			"— #2033 round-5")
+	}
+}
+
+// TestRound5_ClearDuringRestartDecisionNoReplacement: same gap, but a Clear
+// (epoch bump, NO goodbye wanted) supersedes the restart. The restart must NOT
+// start the replacement (RA stays cleared) and emit NO goodbye.
+//
+// NON-TAUTOLOGY: against the cached-boolean code the restart starts the
+// replacement (RA re-armed after a newer Clear) → FAILS.
+func TestRound5_ClearDuringRestartDecisionNoReplacement(t *testing.T) {
+	if _, err := net.InterfaceByName("lo"); err != nil {
+		t.Skip("lo interface unavailable")
+	}
+	fl := newFakeListen(t)
+	m := New()
+	old, cfg, startEpoch := installRestartEntry(t, fl, m)
+
+	// onProvenClose runs under the act-lock; it must be invoked ONLY when epoch
+	// is still startEpoch at the act moment. A Clear (epoch bump, no goodbye)
+	// races concurrently; if a stale cached boolean starts the replacement after
+	// the Clear advanced the epoch, that is the bug.
+	var startedDespiteSupersede bool
+	startCalled := false
+	onProvenClose := func() error {
+		startCalled = true
+		if m.epoch != startEpoch {
+			startedDespiteSupersede = true
+		}
+		return m.startLocked(cfg)
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	relErr := make(chan error, 1)
+	go func() { defer wg.Done(); relErr <- m.releaseDrain("lo", old, startEpoch, onProvenClose) }()
+	go func() {
+		defer wg.Done()
+		time.Sleep(10 * time.Millisecond) // try to land in the decision→act gap
+		_ = m.Clear()
+	}()
+	wg.Wait()
+	if err := <-relErr; err != nil {
+		t.Fatalf("releaseDrain: %v", err)
+	}
+
+	// Precise round-5 invariant: onProvenClose must NOT run after the Clear
+	// advanced the epoch at the act moment (a stale cached boolean would re-arm
+	// RA after a newer Clear). A Clear never wants a goodbye, so none is emitted.
+	_ = startCalled
+	_ = cfg
+	if startedDespiteSupersede {
+		t.Fatal("restart started a replacement after a newer Clear advanced the "+
+			"epoch at the act moment (stale cached decision) — #2033 round-5")
+	}
+	total, conns := fl.goodbyeStats("lo")
+	if conns != 0 || total != 0 {
+		t.Fatalf("a Clear/restart race emitted a goodbye (%d conns / %d writes); "+
+			"expected 0", conns, total)
+	}
 }

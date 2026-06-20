@@ -106,9 +106,11 @@ func (m *Manager) interfaceBusy(name string) bool {
 //   - onProvenClose, if non-nil, is the changed-config replacement starter. It
 //     runs ONLY on the proven-closed (<-stopped) arm, while the tombstone is
 //     still HELD (a concurrent Apply defers), and ONLY if no graceful withdraw
-//     superseded the replace (epoch unchanged AND no goodbye wanted). It opens
-//     the replacement conn — guaranteed AFTER the old conn is proven closed
-//     (≤1 live conn). It runs under m.mu and returns any start error.
+//     superseded the replace (epoch unchanged AND no goodbye wanted), evaluated
+//     UNDER the lock that performs the start with FRESH state (no boolean cached
+//     across an unlock — round-5). It opens the replacement conn — guaranteed
+//     AFTER the old conn is proven closed (≤1 live conn). It runs under m.mu and
+//     returns any start error.
 //   - startEpoch is the manager epoch captured by the caller when it claimed the
 //     interface; a changed epoch means a newer Withdraw/Clear/Apply superseded
 //     this op, so the replacement is aborted.
@@ -123,6 +125,15 @@ func (m *Manager) interfaceBusy(name string) bool {
 // removes the tombstone once the wedged owner finally exits. The degraded
 // state is "old sender lingers, no replacement, tombstone held" — never 2
 // conns, never an unordered emit, never a dropped-into-double goodbye.
+//
+// Round-5 atomicity: the goodbye-vs-replace decision is re-evaluated against the
+// LIVE tombstone under the lock at the ACT point — never trusting a boolean
+// computed before the emit unlock. goodbyeWanted is monotonic (false→true only)
+// and epoch is monotonic increasing, so a "replace" decision observed under the
+// act-lock (epoch==startEpoch AND !goodbyeWanted AND same entry) cannot be
+// invalidated while the lock is held; conversely if a racing Withdraw flipped
+// goodbyeWanted in the emit gap, the act-lock re-check sees it, suppresses the
+// replace, AND emits the now-owed goodbye (the withdraw wins).
 func (m *Manager) releaseDrain(name string, s *sender, startEpoch uint64, onProvenClose func() error) error {
 	if s != nil {
 		select {
@@ -137,44 +148,48 @@ func (m *Manager) releaseDrain(name string, s *sender, startEpoch uint64, onProv
 		}
 	}
 
-	// Proven closed (or s==nil). Decide the goodbye claim-once under m.mu.
-	m.mu.Lock()
-	e := m.draining[name]
-	if e == nil {
-		m.mu.Unlock()
-		return nil // defensive; owner holds it
-	}
-	emit := false
-	if e.goodbyeWanted && !e.goodbyeClaimed && s != nil && !s.goodbyeEmitted.Load() {
-		e.goodbyeClaimed = true
-		emit = true
-	}
-	cfg := e.cfg
-	// A replacement starts ONLY if nothing superseded the replace: epoch
-	// unchanged AND no goodbye was wanted (a graceful withdraw overrides a
-	// replace — the route is being withdrawn, not replaced).
-	superseded := m.epoch != startEpoch
-	startReplacement := onProvenClose != nil && !superseded && !e.goodbyeWanted
-	m.mu.Unlock()
-
-	if emit {
-		slog.Info("ra: emitting standalone goodbye (owner exited without one; "+
-			"claim held across emit)", "interface", name)
-		if cfg != nil {
-			m.sendOneGoodbye(cfg) // entry still held → Apply defers, no clobber
+	// Proven closed (or s==nil). The goodbye claim and the replacement decision
+	// are made against FRESH state at the act point. Because goodbyeWanted only
+	// goes false→true and epoch only increases, we may need at most one emit
+	// pass (claim → unlock → blocking emit → re-lock); a late Withdraw that
+	// flips goodbyeWanted during that emit gap is caught on the re-lock, which
+	// re-runs the same claim-and-decide logic before acting on the replacement.
+	for {
+		m.mu.Lock()
+		e := m.draining[name]
+		if e == nil {
+			m.mu.Unlock()
+			return nil // defensive; owner holds it
 		}
-	}
 
-	var startErr error
-	m.mu.Lock()
-	if startReplacement {
-		// Old conn is PROVEN closed and the tombstone is still held → safe to
-		// open the replacement (≤1 live conn) before releasing.
-		startErr = onProvenClose()
+		// Decide goodbye claim-once with FRESH goodbyeWanted/goodbyeClaimed.
+		if e.goodbyeWanted && !e.goodbyeClaimed && s != nil && !s.goodbyeEmitted.Load() {
+			e.goodbyeClaimed = true
+			cfg := e.cfg
+			m.mu.Unlock()
+			slog.Info("ra: emitting standalone goodbye (owner exited without "+
+				"one; claim held across emit)", "interface", name)
+			if cfg != nil {
+				m.sendOneGoodbye(cfg) // entry still held → Apply defers, no clobber
+			}
+			// Re-loop: re-acquire the lock and re-evaluate against fresh state
+			// before deciding the replacement (the emit ran outside the lock).
+			continue
+		}
+
+		// No (further) goodbye owed. Decide the replacement under THIS lock with
+		// FRESH epoch + goodbyeWanted (round-5: no cached boolean). Start ONLY
+		// if epoch is still ours AND no goodbye was wanted (a withdraw overrides
+		// a replace). Neither can change while we hold the lock.
+		var startErr error
+		if onProvenClose != nil && m.epoch == startEpoch && !e.goodbyeWanted {
+			// Old conn PROVEN closed + tombstone still held → ≤1 live conn.
+			startErr = onProvenClose()
+		}
+		delete(m.draining, name)
+		m.mu.Unlock()
+		return startErr
 	}
-	delete(m.draining, name)
-	m.mu.Unlock()
-	return startErr
 }
 
 // reclaimTombstoneWhenStopped detaches a goroutine that waits for a wedged

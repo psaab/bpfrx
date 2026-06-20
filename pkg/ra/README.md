@@ -82,10 +82,27 @@ after HA failover. To make that **structural**, not flag-defended:
   removal and the changed-config **restart**) all route through it. The restart
   passes an `onProvenClose` callback that opens the replacement conn — it runs
   ONLY on the proven-closed (`<-stopped`) arm, under `m.mu`, with the tombstone
-  still held, and only if no graceful withdraw superseded the replace (epoch
-  unchanged AND no goodbye wanted). There is no divergent inline copy of these
-  rules, so the timeout / happens-before / ≤1-conn class cannot reappear in a
-  third path.
+  still held, and only if no graceful withdraw superseded the replace. There is
+  no divergent inline copy of these rules, so the timeout / happens-before /
+  ≤1-conn class cannot reappear in a third path.
+- **Replacement decision is atomic under the act-lock (round-5).** The
+  "start the replacement?" test (epoch still `startEpoch` AND `!goodbyeWanted`)
+  is re-evaluated against the LIVE tombstone under the SAME lock hold that
+  performs the start — never a boolean computed before an unlock and trusted
+  after. `goodbyeWanted` is monotonic (false→true) and `epoch` only increases,
+  so a "start" decision observed under the act-lock cannot be invalidated while
+  the lock is held; a racing `Withdraw`/`Clear` that lands before the act-lock
+  is seen (decision aborts, the withdraw's goodbye is emitted), and one that
+  lands after is harmless (no supersession existed at the act moment). The only
+  unlock inside `releaseDrain` is for the blocking standalone-goodbye send; the
+  loop re-acquires and re-evaluates fresh state before touching the replacement.
+  NOTE: `onProvenClose` calls `startLocked`, which does blocking setup
+  (`InterfaceByName`, link-local add, `ndp.Listen` with retry) UNDER `m.mu` —
+  this can hold the manager mutex for up to ~2s and is pre-existing (plain
+  `Apply` also calls `startLocked` under `m.mu`). It is a known cost, not a
+  correctness issue; the tombstone (held) is what provides mutual exclusion, so
+  moving the start just after the unlock is possible but was left as-is to avoid
+  reintroducing a check-then-act.
 - **Draining tombstone — one live conn per interface, including replaces.**
   Every transition that removes OR replaces a sender installs a
   per-interface DRAINING tombstone under the manager mutex BEFORE releasing
