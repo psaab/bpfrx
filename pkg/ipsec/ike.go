@@ -64,6 +64,34 @@ func resolveESPSettings(cfg *config.IPsecConfig, vpn *config.IPsecVPN) (string, 
 			if prop, ok := cfg.Proposals[propRef]; ok {
 				return buildESPProposal(prop, pfsGroup), prop.LifetimeSeconds
 			}
+			// #2073: the IPsec policy resolves but its proposal reference
+			// does not. The commit-time strict validator
+			// (validateIPsecPolicyProposalReferencesStrict) hard-rejects
+			// this for new operator edits, so this branch is only reached
+			// on a tolerant-path boot of an already-persisted or
+			// peer-synced config (where the validator downgraded to a
+			// warning so the node still boots). Do NOT silently drop a
+			// configured perfect-forward-secrecy group by falling through
+			// to bare "default" (which has no modp term): carry the
+			// configured PFS group on a conservative, valid fallback
+			// proposal so PFS is still negotiated. A non-AEAD (CBC) ESP
+			// transform requires an integrity algorithm, so the fallback
+			// includes both a cipher and integrity in addition to the modp
+			// term. The aes256-cbc / hmac-sha256-128 spelling normalizes to
+			// the same "aes256-sha256128-modp<bits>" token buildESPProposal
+			// emits on the normal path, so no new keyword spelling is
+			// introduced.
+			if pfsGroup > 0 {
+				slog.Warn("ipsec policy references undefined proposal; "+
+					"preserving configured PFS group on fallback proposal",
+					"policy", vpn.IPsecPolicy, "proposal", propRef,
+					"pfs_group", pfsGroup)
+				fallbackProp := &config.IPsecProposal{
+					EncryptionAlg: "aes256-cbc",
+					AuthAlg:       "hmac-sha256-128",
+				}
+				return buildESPProposal(fallbackProp, pfsGroup), 0
+			}
 		} else if prop, ok := cfg.Proposals[vpn.IPsecPolicy]; ok {
 			return buildESPProposal(prop, 0), prop.LifetimeSeconds
 		}
