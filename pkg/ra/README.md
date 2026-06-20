@@ -23,22 +23,36 @@ after HA failover. To make that **structural**, not flag-defended:
   lifetime-zero goodbye as its FINAL write when the mode is graceful,
   then closes the conn. A normal RA can never follow the goodbye because
   the goodbye is emitted structurally after the loop.
-- **Graceful upgrades hard, even mid-drain.** In cluster mode RA
+- **Graceful upgrades hard, with a standalone-goodbye backstop (exactly one
+  goodbye per withdrawn interface).** In cluster mode RA
   `Apply`/`Withdraw`/`Clear` for the same sender are serialized ONLY by the
-  manager mutex (no `applySem`). A graceful withdraw therefore beats a
-  racing hard `Clear`: `signalStop` stores graceful unconditionally and
-  hard only via compare-and-swap from "none" — never a downgrade. The
-  manager records the graceful intent ATOMICALLY: `Withdraw`/
-  `WithdrawInterfaces` install the tombstone AND call
-  `signalStop(modeGraceful)` under the SAME lock that bumps the epoch and
-  snapshots the senders, so a racing `Clear` cannot slip a hard stop into a
-  gap. And if a `Clear` got there first (the sender is already draining
-  hard), a subsequent `Withdraw` finds it in the draining map and UPGRADES
-  it to graceful — the draining map therefore stores the `*sender` (not a
-  bare marker) so the still-running owner can be re-signalled. The
-  draining-map value is `nil` only for a `WithdrawOnce` claim (no owner to
-  upgrade). Because the owner closes the conn AFTER the goodbye, a racing
-  hard close cannot suppress it.
+  manager mutex (no `applySem`). A graceful withdraw beats a racing hard
+  `Clear`: `signalStop` stores graceful unconditionally and hard only via
+  compare-and-swap from "none" — never a downgrade. The manager records the
+  graceful intent ATOMICALLY: `Withdraw`/`WithdrawInterfaces` install the
+  tombstone AND call `signalStop(modeGraceful)` under the SAME lock that
+  bumps the epoch and snapshots, so a racing `Clear` cannot slip a hard stop
+  into a gap. If a `Clear` (or a changed-config restart) got there first, the
+  `Withdraw` finds the sender in the draining map and UPGRADES it to graceful
+  (the draining map stores the `*sender`, nil only for a `WithdrawOnce`
+  claim). BUT an "upgrade" only works while the owner is still alive — once a
+  sender has run `finishShutdown` (read modeHard, emitted no goodbye, exited)
+  it is DEAD and cannot be resurrected. So the withdrawal guarantee is
+  decoupled from the live-sender lifecycle: each `sender` records whether
+  `finishShutdown` actually emitted a goodbye (`goodbyeEmitted`), and after
+  the owner joins, the manager checks that fact. If a goodbye was owed (a
+  graceful withdrawal was intended) but the owner emitted none — it lost the
+  upgrade race, or it was already a stopped Clear / changed-config-restart
+  tombstone — the manager emits a STANDALONE goodbye via the WithdrawOnce
+  mechanism (`sendOneGoodbye`: open conn, 3× lifetime-0 RA, close; no burst,
+  no link toggle). This yields **exactly one goodbye per withdrawn
+  interface**: the owner's if the upgrade landed, otherwise a standalone; the
+  standalone is suppressed if the owner already emitted one
+  (`goodbyeEmitted`) or if a LIVE sender has since re-claimed the interface (a
+  new MASTER `Apply` won it back — do not clobber it with a lifetime-0 RA).
+  A pure changed-config replace (no withdraw) emits ZERO goodbyes (the router
+  is not going away). Because the owner closes the conn AFTER its goodbye, a
+  racing hard close cannot suppress it.
 - **Draining tombstone — one live conn per interface, including replaces.**
   Every transition that removes OR replaces a sender installs a
   per-interface DRAINING tombstone under the manager mutex BEFORE releasing

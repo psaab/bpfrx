@@ -119,6 +119,15 @@ type sender struct {
 	stopped  chan struct{}
 	burstCh  chan struct{} // buffered(1): request a re-burst (ResendBurst)
 
+	// goodbyeEmitted records whether finishShutdown actually emitted the
+	// lifetime-0 goodbye. The manager reads it AFTER the join (<-stopped) to
+	// decide whether it still OWES a standalone goodbye for a graceful
+	// withdrawal that lost the upgrade race (the owner already read modeHard
+	// and exited before the graceful upgrade landed — a dead sender cannot be
+	// resurrected). This makes "exactly one goodbye per withdrawn interface" a
+	// post-mortem fact, not a timing gamble (#2033 MAJOR 2 / restart window).
+	goodbyeEmitted atomic.Bool
+
 	lastRAMu sync.Mutex
 	lastRA   time.Time // rate-limit RS responses; owner writes, Status reads
 }
@@ -331,6 +340,10 @@ func (s *sender) run() {
 func (s *sender) finishShutdown() {
 	if shutdownMode(s.mode.Load()) == modeGraceful {
 		s.sendGoodbyeRA()
+		// Record the fact for the manager's post-join owes-a-goodbye check.
+		// Set AFTER the send and BEFORE close(s.stopped) (the caller's defer),
+		// so a manager that observes <-stopped also observes this store.
+		s.goodbyeEmitted.Store(true)
 	}
 	if s.conn != nil {
 		s.conn.Close()

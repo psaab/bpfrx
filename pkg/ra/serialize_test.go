@@ -191,7 +191,8 @@ func testCfg(iface string) *config.RAInterfaceConfig {
 // fakeListen is the test harness wiring listenFn + ensureLinkLocalFn to fakes.
 type fakeListen struct {
 	mu       sync.Mutex
-	conns    map[string]*fakeConn
+	conns    map[string]*fakeConn   // most-recent conn per interface
+	allConns map[string][]*fakeConn // EVERY conn ever opened per interface
 	prehooks map[string]func(time.Duration) // installed at conn-creation time
 	live     int32
 	liveMu   sync.Mutex
@@ -214,6 +215,7 @@ func newFakeListen(t *testing.T) *fakeListen {
 
 	fl := &fakeListen{
 		conns:    map[string]*fakeConn{},
+		allConns: map[string][]*fakeConn{},
 		prehooks: map[string]func(time.Duration){},
 	}
 
@@ -230,6 +232,7 @@ func newFakeListen(t *testing.T) *fakeListen {
 			fc.setBeforeWrite(h) // attach BEFORE the owner can write
 		}
 		fl.conns[iface.Name] = fc
+		fl.allConns[iface.Name] = append(fl.allConns[iface.Name], fc)
 		fl.mu.Unlock()
 		return fc, netip.MustParseAddr("fe80::1"), nil
 	}
@@ -260,6 +263,32 @@ func (fl *fakeListen) liveCount() int32 {
 	fl.liveMu.Lock()
 	defer fl.liveMu.Unlock()
 	return fl.live
+}
+
+// goodbyeCountFor sums lifetime-0 (goodbye) writes across EVERY conn ever
+// opened for the interface — the owner's conn AND any standalone-goodbye conn
+// the manager opened via sendOneGoodbye. The standalone goodbye emits
+// goodbyeCount (3) lifetime-0 RAs on its own conn; an owner goodbye emits
+// goodbyeCount on the owner's conn. "Exactly one goodbye event" therefore means
+// exactly one conn carries goodbye writes (we assert both the per-conn count
+// and that only a single conn emitted any).
+func (fl *fakeListen) goodbyeStats(name string) (totalGoodbyeWrites, connsWithGoodbye int) {
+	fl.mu.Lock()
+	conns := append([]*fakeConn(nil), fl.allConns[name]...)
+	fl.mu.Unlock()
+	for _, c := range conns {
+		n := 0
+		for _, w := range c.snapshot() {
+			if w.lifetime == 0 {
+				n++
+			}
+		}
+		if n > 0 {
+			connsWithGoodbye++
+			totalGoodbyeWrites += n
+		}
+	}
+	return
 }
 
 // fakeIfaceByName must be set because startLocked calls net.InterfaceByName.
@@ -1026,4 +1055,295 @@ func TestT7b_ManagerHardFirstThenGracefulStillGoodbye(t *testing.T) {
 			"must still emit the goodbye (#2033 MAJOR 2); writes=%+v", writes)
 	}
 	assertGoodbyeIsLast(t, writes)
+}
+
+// TestT7c_WithdrawAfterDeadHardSenderEmitsStandaloneGoodbye is the #2033
+// MAJOR-2 (dead-sender) regression: a graceful Withdraw that targets an
+// interface whose sender has ALREADY finished its hard shutdown (finishShutdown
+// ran, read modeHard, emitted NO goodbye) — but whose draining tombstone is
+// still present — must STILL emit a goodbye. The dead sender cannot be
+// "upgraded"; the manager must emit a STANDALONE goodbye instead.
+//
+// Determinism: Clear two interfaces. Gate interface B's conn.Close so
+// clearLocked blocks in its join loop — clearLocked removes ALL tombstones only
+// AFTER every join, so interface A's sender is fully stopped (goodbyeEmitted
+// false) while A's tombstone is still present. The Withdraw of A then hits the
+// dead-sender path and must emit a standalone goodbye for A.
+//
+// NON-TAUTOLOGY: against the current head (which only signalStop(graceful)-
+// upgrades a draining sender, a no-op on a dead one, and has no standalone
+// owes-a-goodbye fallback) A gets NO goodbye and this test FAILS.
+func TestT7c_WithdrawAfterDeadHardSenderEmitsStandaloneGoodbye(t *testing.T) {
+	if _, err := net.InterfaceByName("lo"); err != nil {
+		t.Skip("lo interface unavailable")
+	}
+	fl := newFakeListen(t)
+
+	m := New()
+	// Two senders: A (the one we withdraw) and B (used to hold clearLocked's
+	// join loop open). We need two real interface names; "lo" resolves, and a
+	// second resolvable name — reuse "lo" is not possible (same key), so drive A
+	// directly as a sender on a synthetic interface added to the manager, and
+	// use "lo" for B via Apply.
+	//
+	// Simpler: run BOTH through the manager using "lo" for A is impossible (one
+	// key). Instead start A as a real sender object inserted into m.senders
+	// under a synthetic name (manager Clear/Withdraw operate purely on the maps
+	// + sender objects; they only call net.InterfaceByName in startLocked /
+	// sendOneGoodbye). sendOneGoodbye for A WILL call net.InterfaceByName(A) —
+	// so A must be a resolvable name. Use "lo" for A (the withdrawn one, needs
+	// standalone goodbye) and a synthetic name for B (only needs to block the
+	// join; its sendOneGoodbye is never called).
+	ifaceB := &net.Interface{Name: "draintestB", HardwareAddr: net.HardwareAddr{0x02, 0, 0, 0, 0, 2}}
+	sB := newSender(testCfg("draintestB"), ifaceB)
+	if err := sB.start(); err != nil {
+		t.Fatalf("start B: %v", err)
+	}
+	fcB := waitConn(t, fl.getConn, "draintestB")
+	_ = fcB
+
+	ifaceA := &net.Interface{Name: "lo", HardwareAddr: net.HardwareAddr{0x02, 0, 0, 0, 0, 1}}
+	sA := newSender(testCfg("lo"), ifaceA)
+	if err := sA.start(); err != nil {
+		t.Fatalf("start A: %v", err)
+	}
+	fcA := waitConn(t, fl.getConn, "lo")
+	waitWrites(t, fcA, 1)
+
+	// Insert both into the manager's active set so Clear sees them.
+	m.mu.Lock()
+	m.senders["draintestB"] = sB
+	m.senders["lo"] = sA
+	m.mu.Unlock()
+
+	// Gate B's Close so clearLocked blocks in its join loop (after A has fully
+	// finished). A emits no goodbye (hard) and fully exits; B's owner is parked
+	// in Close, so clearLocked has NOT yet removed any tombstones.
+	releaseB := make(chan struct{})
+	bClosing := make(chan struct{})
+	var once sync.Once
+	fcB.setBeforeClose(func() {
+		once.Do(func() { close(bClosing) })
+		<-releaseB
+	})
+
+	clearDone := make(chan error, 1)
+	go func() { clearDone <- m.Clear() }()
+
+	// Wait until B's close is in flight — by now A is fully stopped and its
+	// tombstone is still present (clearLocked removes tombstones only after the
+	// whole join loop).
+	select {
+	case <-bClosing:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Clear never reached B's close")
+	}
+	// Ensure A's owner has fully exited (stopped closed) and emitted no goodbye.
+	select {
+	case <-sA.stopped:
+	case <-time.After(2 * time.Second):
+		t.Fatal("A's sender never stopped")
+	}
+	if sA.goodbyeEmitted.Load() {
+		t.Fatal("precondition broken: A (hard Clear) should NOT have emitted a goodbye")
+	}
+
+	// Graceful Withdraw of A while A's dead sender is still in the draining map.
+	withdrawDone := make(chan error, 1)
+	go func() { withdrawDone <- m.Withdraw() }()
+	// Withdraw must emit a standalone goodbye for A; give it time.
+	time.Sleep(100 * time.Millisecond)
+
+	// Release B so Clear can finish.
+	close(releaseB)
+	select {
+	case <-clearDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Clear did not complete")
+	}
+	select {
+	case <-withdrawDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Withdraw did not complete")
+	}
+
+	// A must have received exactly one goodbye event (via the standalone path).
+	total, conns := fl.goodbyeStats("lo")
+	if conns == 0 {
+		t.Fatalf("no goodbye emitted for the withdrawn interface (A); a dead "+
+			"hard sender must get a STANDALONE goodbye (#2033 MAJOR 2 dead-sender)")
+	}
+	if conns != 1 || total != goodbyeCount {
+		t.Fatalf("expected exactly one goodbye event for A (1 conn, %d writes); "+
+			"got %d conns, %d writes", goodbyeCount, conns, total)
+	}
+}
+
+// TestT2b_WithdrawDuringRestartWindowEmitsGoodbye is the #2033 NEW-MAJOR
+// regression: a graceful Withdraw that races the changed-config restart
+// stop-to-start window (old sender hard-stopped, replacement not yet started)
+// must emit a goodbye for the withdrawn interface — the route is being
+// withdrawn, not replaced.
+//
+// Determinism: a changed-config Apply hard-stops the old sender, then BLOCKS
+// opening the replacement conn (gate the replacement listen via a prehook on
+// the NEW conn is not possible — the new conn is the one we want to block
+// BEFORE creation; instead we gate the replacement's FIRST write so the
+// replacement exists but a graceful Withdraw that bumps the epoch first aborts
+// it). To exercise the true stop-to-start window we instead gate the OLD
+// sender's Close so Apply's restart join blocks; while it blocks we issue the
+// Withdraw (which finds the old, stopped-pending sender), then release.
+//
+// NON-TAUTOLOGY: against the current head a Withdraw racing the restart bumps
+// the epoch, the restart aborts, and NO goodbye is emitted for the interface →
+// this test FAILS.
+func TestT2b_WithdrawDuringRestartWindowEmitsGoodbye(t *testing.T) {
+	if _, err := net.InterfaceByName("lo"); err != nil {
+		t.Skip("lo interface unavailable")
+	}
+	fl := newFakeListen(t)
+
+	m := New()
+	if err := m.Apply([]*config.RAInterfaceConfig{testCfg("lo")}); err != nil {
+		t.Fatalf("initial Apply: %v", err)
+	}
+	old := waitConn(t, fl.getConn, "lo")
+	waitWrites(t, old, 1)
+
+	// Gate the OLD sender's Close so the changed-config Apply blocks in its
+	// restart join (old sender stopped-pending, replacement not started — the
+	// stop-to-start window).
+	releaseOld := make(chan struct{})
+	oldClosing := make(chan struct{})
+	var once sync.Once
+	old.setBeforeClose(func() {
+		once.Do(func() { close(oldClosing) })
+		<-releaseOld
+	})
+
+	applyDone := make(chan error, 1)
+	go func() {
+		applyDone <- m.Apply([]*config.RAInterfaceConfig{configChanged("lo")})
+	}()
+
+	select {
+	case <-oldClosing:
+	case <-time.After(2 * time.Second):
+		t.Fatal("changed-config Apply never reached the old sender's close")
+	}
+
+	// In the stop-to-start window, a graceful Withdraw arrives. It must bump the
+	// epoch (aborting the restart) AND guarantee a goodbye for the interface.
+	withdrawDone := make(chan error, 1)
+	go func() { withdrawDone <- m.Withdraw() }()
+	time.Sleep(100 * time.Millisecond)
+
+	// Release the old close so Apply's restart join completes (and then aborts
+	// the start because the epoch changed).
+	close(releaseOld)
+
+	select {
+	case err := <-applyDone:
+		_ = err // may be nil; the restart is aborted, not an error
+	case <-time.After(2 * time.Second):
+		t.Fatal("changed-config Apply did not complete")
+	}
+	select {
+	case <-withdrawDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Withdraw did not complete")
+	}
+
+	// The interface is withdrawn: exactly one goodbye event, and NO live sender
+	// (the restart was aborted).
+	total, conns := fl.goodbyeStats("lo")
+	if conns == 0 {
+		t.Fatalf("no goodbye emitted for the interface withdrawn during the "+
+			"restart window (#2033 NEW MAJOR)")
+	}
+	if conns != 1 || total != goodbyeCount {
+		t.Fatalf("expected exactly one goodbye event (1 conn, %d writes); got "+
+			"%d conns, %d writes", goodbyeCount, conns, total)
+	}
+	m.mu.Lock()
+	_, live := m.senders["lo"]
+	m.mu.Unlock()
+	if live {
+		t.Fatal("a replacement sender was started despite the graceful Withdraw "+
+			"aborting the restart")
+	}
+}
+
+// TestT7d_ExactlyOneGoodbyeWhenUpgradeAndStandaloneCouldRace asserts that even
+// when the graceful upgrade lands in time (owner emits the goodbye) the manager
+// does NOT also emit a standalone goodbye — exactly one goodbye event total.
+// This guards the exactly-once contract from the opposite side of T7c/T2b
+// (which prove AT LEAST one): here we prove NOT MORE THAN one.
+func TestT7d_ExactlyOneGoodbyeWhenUpgradeAndStandaloneCouldRace(t *testing.T) {
+	if _, err := net.InterfaceByName("lo"); err != nil {
+		t.Skip("lo interface unavailable")
+	}
+	fl := newFakeListen(t)
+
+	// Park the owner in its burst so both a Clear (hard) and a Withdraw
+	// (graceful upgrade) land before the owner reads its mode — the upgrade wins
+	// and the owner emits exactly one goodbye; the manager must NOT add a
+	// standalone.
+	release := make(chan struct{})
+	parked := make(chan struct{})
+	var once sync.Once
+	fl.preHook("lo", func(lifetime time.Duration) {
+		if lifetime > 0 {
+			once.Do(func() { close(parked); <-release })
+		}
+	})
+
+	m := New()
+	if err := m.Apply([]*config.RAInterfaceConfig{testCfg("lo")}); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	_ = waitConn(t, fl.getConn, "lo")
+	<-parked
+
+	clearDone := make(chan error, 1)
+	go func() { clearDone <- m.Clear() }()
+	// Wait for Clear to install the tombstone.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		ts := false
+		for _, info := range m.Status() {
+			if info.Interface == "lo" && info.State == "draining" {
+				ts = true
+			}
+		}
+		if ts {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("Clear never installed the tombstone")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	withdrawDone := make(chan error, 1)
+	go func() { withdrawDone <- m.Withdraw() }()
+	time.Sleep(50 * time.Millisecond)
+	close(release)
+
+	select {
+	case <-clearDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Clear did not complete")
+	}
+	select {
+	case <-withdrawDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Withdraw did not complete")
+	}
+
+	total, conns := fl.goodbyeStats("lo")
+	if conns != 1 || total != goodbyeCount {
+		t.Fatalf("expected EXACTLY one goodbye event (1 conn, %d writes); got "+
+			"%d conns, %d writes — a double goodbye (owner + standalone) is a bug",
+			goodbyeCount, conns, total)
+	}
 }

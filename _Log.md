@@ -82,6 +82,45 @@
   scripts/image/bake.py, scripts/image/validate.py,
   docs/install-images.md, docs/image-validation.md
 
+## 2026-06-19 — #2033 Codex re-review: two graceful-goodbye MAJORs (dead sender + restart window)
+
+- **Timestamp**: 2026-06-19
+- **Action**: Rebased fix/2033 onto current origin/master (e33b401ef). Fixed
+  two remaining graceful-goodbye MAJORs. ROOT CAUSE: once a sender has run
+  `finishShutdown` (read modeHard, emitted no goodbye, exited), it is DEAD —
+  `signalStop(modeGraceful)` cannot resurrect it. So `claimGracefulLocked`'s
+  upgrade is a no-op on a dead sender and the goodbye was dropped. Decoupled
+  the goodbye guarantee from the live-sender lifecycle: added
+  `sender.goodbyeEmitted atomic.Bool` set in `finishShutdown` BEFORE
+  `close(stopped)`; the manager checks it after the join and, if a graceful
+  withdrawal was intended but no goodbye went out, emits a STANDALONE goodbye
+  via `sendOneGoodbye` (the WithdrawOnce path). Replaced `joinDraining` with
+  `finishGraceful`; `claimGracefulLocked` now returns `gracefulTarget`s
+  capturing the sender pointer under m.mu (so the post-mortem read does not
+  depend on the draining-map entry surviving the restart loop's delete).
+  MAJOR 2 (Clear-first, sender already finished hard): standalone backstop.
+  NEW MAJOR (graceful Withdraw racing the changed-config restart stop-to-start
+  window): standalone backstop for the withdrawn interface; the restart still
+  aborts on the bumped epoch. Guarantees EXACTLY ONE goodbye per withdrawn
+  interface (owner's if the upgrade landed, else standalone; suppressed if the
+  owner already emitted one or a live sender re-claimed the interface) and
+  ZERO for a pure changed-config replace. Folded #2034's procfs-free
+  `ensureLinkLocal` on rebase.
+- **File(s)**: pkg/ra/sender.go, pkg/ra/ra.go, pkg/ra/README.md, _Log.md
+
+- **Timestamp**: 2026-06-19
+- **Action**: Added three non-tautological regression tests to
+  `pkg/ra/serialize_test.go` (fakeListen now tracks every conn per interface
+  for cross-conn goodbye accounting). `TestT7c` — Clear-first where the
+  sender finishes its hard stop before Withdraw runs (dead-sender upgrade is a
+  no-op) asserts a STANDALONE goodbye is still emitted; `TestT2b` — graceful
+  Withdraw racing the changed-config restart stop-to-start window asserts a
+  goodbye IS emitted and NO replacement starts; `TestT7d` — exactly-one
+  goodbye when the upgrade lands in time (no double goodbye). Mutation-
+  verified: a no-standalone mutant fails T7c+T2b; an always-standalone mutant
+  fails T7d (double goodbye).
+- **File(s)**: pkg/ra/serialize_test.go, _Log.md
+
 ## 2026-06-20 — #1993 FRR clear MAJOR fix: require LIVE forwarding, not just pins
 
 - **Timestamp**: 2026-06-20
