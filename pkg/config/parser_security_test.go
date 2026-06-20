@@ -2308,6 +2308,62 @@ func TestRouteFilterMatchTypes_NonUptoUnchanged(t *testing.T) {
 	}
 }
 
+// TestParseRouteFilterLen unit-tests the length token parser directly so
+// the malformed-token rejection (which makes the renderer degrade
+// safely) is locked regardless of the AST plumbing (Codex #2102 gap).
+func TestParseRouteFilterLen(t *testing.T) {
+	cases := []struct {
+		tok    string
+		wantN  int
+		wantOK bool
+	}{
+		{"/24", 24, true},
+		{"24", 24, true},
+		{"/0", 0, true},
+		{"/128", 128, true},
+		{"/129", 0, false}, // > 128
+		{"/-1", 0, false},  // negative
+		{"/+24", 0, false}, // signed-plus must be rejected (Atoi would accept it)
+		{"/abc", 0, false}, // letters
+		{"/", 0, false},    // empty after slash
+		{"", 0, false},     // empty
+		{"/2a", 0, false},  // trailing letters
+	}
+	for _, tc := range cases {
+		t.Run(tc.tok, func(t *testing.T) {
+			n, ok := parseRouteFilterLen(tc.tok)
+			if ok != tc.wantOK || n != tc.wantN {
+				t.Errorf("parseRouteFilterLen(%q) = (%d,%v), want (%d,%v)", tc.tok, n, ok, tc.wantN, tc.wantOK)
+			}
+		})
+	}
+}
+
+// TestRouteFilterUptoCompile_MalformedLength asserts that an upto with a
+// non-numeric length token compiles with UptoLen 0 (the renderer then
+// degrades to the orlonger default rather than emitting a bad line).
+func TestRouteFilterUptoCompile_MalformedLength(t *testing.T) {
+	tree := &ConfigTree{}
+	path, err := ParseSetCommand("set policy-options policy-statement p term t1 from route-filter 10.0.0.0/8 upto /abc")
+	if err != nil {
+		t.Fatalf("ParseSetCommand: %v", err)
+	}
+	if err := tree.SetPath(path); err != nil {
+		t.Fatalf("SetPath: %v", err)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	rf := firstRouteFilter(t, cfg)
+	if rf.MatchType != "upto" {
+		t.Errorf("MatchType = %q, want upto", rf.MatchType)
+	}
+	if rf.UptoLen != 0 {
+		t.Errorf("UptoLen = %d, want 0 for a malformed length token", rf.UptoLen)
+	}
+}
+
 func TestIKEProposalSetSyntax(t *testing.T) {
 	setCommands := []string{`set security ike proposal ike-aes256 authentication-method pre-shared-keys`, `set security ike proposal ike-aes256 encryption-algorithm aes-256-cbc`, `set security ike proposal ike-aes256 authentication-algorithm sha-256`, `set security ike proposal ike-aes256 dh-group group14`, `set security ike proposal ike-aes256 lifetime-seconds 28800`, `set security ike policy ike-strong mode main`, `set security ike policy ike-strong proposals ike-aes256`, `set security ike gateway remote-gw address 203.0.113.1`, `set security ike gateway remote-gw ike-policy ike-strong`, `set security ike gateway remote-gw external-interface untrust0`}
 	tree := &ConfigTree{}

@@ -2498,6 +2498,104 @@ func TestRouteFilterUptoFRR(t *testing.T) {
 			t.Errorf("degrade path must not emit 'ge', got:\n%s", got)
 		}
 	})
+
+	// upto /N where N < prefix-len (e.g. upto /4 on a /8) is nonsensical
+	// in Junos; we degrade to the orlonger default rather than emit an
+	// FRR-invalid "le 4" (le < prefix-len is rejected). Locks the
+	// sub-prefix-length degrade branch (SMR #2102 coverage gap).
+	t.Run("v4_upto_below_plen_degrades", func(t *testing.T) {
+		got := New().generatePolicyOptions(uptoPolicyOptions("10.0.0.0/8", 4))
+		if !strings.Contains(got, "ip prefix-list p-t1 seq 5 permit 10.0.0.0/8 le 32\n") {
+			t.Errorf("UptoLen 4 (< plen 8) must degrade to default 'le 32', got:\n%s", got)
+		}
+		if strings.Contains(got, "le 4") {
+			t.Errorf("must NOT emit FRR-invalid 'le 4' (le < prefix-len), got:\n%s", got)
+		}
+	})
+
+	// upto /N where N > family max (e.g. /40 on a v4 /8) degrades to the
+	// default le 32 — never an out-of-range "le 40".
+	t.Run("v4_upto_above_maxlen_degrades", func(t *testing.T) {
+		got := New().generatePolicyOptions(uptoPolicyOptions("10.0.0.0/8", 40))
+		if !strings.Contains(got, "ip prefix-list p-t1 seq 5 permit 10.0.0.0/8 le 32\n") {
+			t.Errorf("UptoLen 40 (> v4 max 32) must degrade to 'le 32', got:\n%s", got)
+		}
+		if strings.Contains(got, "le 40") {
+			t.Errorf("must NOT emit out-of-range 'le 40', got:\n%s", got)
+		}
+	})
+
+	// v6 upto /N == prefix-len -> exact (bare prefix), the v6 twin of the
+	// v4 ==plen case (Codex #2102 coverage gap).
+	t.Run("v6_upto_eq_plen_is_exact", func(t *testing.T) {
+		got := New().generatePolicyOptions(uptoPolicyOptions("2001:db8::/32", 32))
+		if !strings.Contains(got, "ipv6 prefix-list p-t1 seq 5 permit 2001:db8::/32\n") {
+			t.Errorf("v6 upto /32 on a /32 must be exact, got:\n%s", got)
+		}
+		if strings.Contains(got, "le ") || strings.Contains(got, "ge ") {
+			t.Errorf("v6 ==plen must emit no le/ge, got:\n%s", got)
+		}
+	})
+
+	// A /0 prefix with UptoLen 0 is the zero-value collision between
+	// "unset length" and "plen 0". It must degrade to the orlonger
+	// default (le 32), NOT silently render exact (Codex #2102 MAJOR #2).
+	t.Run("v4_default_route_unset_upto_degrades_not_exact", func(t *testing.T) {
+		got := New().generatePolicyOptions(uptoPolicyOptions("0.0.0.0/0", 0))
+		if !strings.Contains(got, "ip prefix-list p-t1 seq 5 permit 0.0.0.0/0 le 32\n") {
+			t.Errorf("/0 with unset upto must degrade to 'le 32', not exact, got:\n%s", got)
+		}
+	})
+
+	// A /0 prefix with a real upto /24 still renders le 24 (the unset
+	// guard must not block a legitimately-parsed length).
+	t.Run("v4_default_route_upto24", func(t *testing.T) {
+		got := New().generatePolicyOptions(uptoPolicyOptions("0.0.0.0/0", 24))
+		if !strings.Contains(got, "ip prefix-list p-t1 seq 5 permit 0.0.0.0/0 le 24\n") {
+			t.Errorf("/0 upto /24 must render 'le 24', got:\n%s", got)
+		}
+	})
+}
+
+// TestRouteFilterUpto_MixedFamilyTerm renders a term that mixes a v4
+// "upto" route-filter with a v6 route-filter (SMR #2102 cross-#2071
+// coverage gap). The per-RF prefix-list lines must each be family-
+// correct and FRR-valid: the v4 upto -> "ip ... le 24", the v6 exact ->
+// bare "ipv6 ...". This documents the rendered shape; the single term-
+// level matcher is the pre-existing #2071 homogeneous-family limitation
+// (only RouteFilters[0]'s family is matched), unchanged by the upto fix.
+func TestRouteFilterUpto_MixedFamilyTerm(t *testing.T) {
+	po := &config.PolicyOptionsConfig{
+		PrefixLists: map[string]*config.PrefixList{}, Communities: map[string]*config.CommunityDef{}, ASPaths: map[string]*config.ASPathDef{},
+		PolicyStatements: map[string]*config.PolicyStatement{
+			"p": {Name: "p", Terms: []*config.PolicyTerm{
+				{
+					Name: "t1",
+					RouteFilters: []*config.RouteFilter{
+						{Prefix: "10.0.0.0/8", MatchType: "upto", UptoLen: 24},
+						{Prefix: "2001:db8::/32", MatchType: "exact"},
+					},
+					Action: "accept",
+				},
+			}, DefaultAction: "reject"},
+		},
+	}
+	got := New().generatePolicyOptions(po)
+	// v4 upto renders an FRR-valid bare "le 24" entry.
+	if !strings.Contains(got, "ip prefix-list p-t1 seq 5 permit 10.0.0.0/8 le 24\n") {
+		t.Errorf("v4 upto entry missing/wrong in mixed term:\n%s", got)
+	}
+	// v6 exact renders a bare ipv6 entry (no le/ge).
+	if !strings.Contains(got, "ipv6 prefix-list p-t1 seq 10 permit 2001:db8::/32\n") {
+		t.Errorf("v6 exact entry missing/wrong in mixed term:\n%s", got)
+	}
+	// No FRR-invalid line: neither a "ge" nor the over-matching "le 32".
+	if strings.Contains(got, "ge ") {
+		t.Errorf("mixed term must not emit 'ge', got:\n%s", got)
+	}
+	if strings.Contains(got, "10.0.0.0/8 le 32") {
+		t.Errorf("v4 upto must be capped at /24, not the le 32 default, got:\n%s", got)
+	}
 }
 
 func TestGenerateRoutesBlackhole(t *testing.T) {
