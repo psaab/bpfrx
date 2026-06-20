@@ -19,7 +19,7 @@ func (appCatalogParityDP) SetApplication(proto uint8, port uint16, appID uint32,
 	return nil
 }
 func (appCatalogParityDP) SetAppRange(idx uint32, entry AppRangeEntry) error { return nil }
-func (appCatalogParityDP) DeleteStaleApplications(written map[AppKey]bool)    {}
+func (appCatalogParityDP) DeleteStaleApplications(written map[AppKey]bool)   {}
 
 // TestAppCatalogIDsMatchCompileResultAppNames is the #2008 M5 make-or-break
 // wire-parity check: the app_id values appid.BuildCatalog assigns (and ships to
@@ -82,6 +82,58 @@ func TestAppCatalogIDsMatchCompileResultAppNames(t *testing.T) {
 	got := appid.ResolveSessionName(result.AppNames, cfg, 17, 7777, udpID)
 	if got != "my-udp-app" {
 		t.Fatalf("ResolveSessionName(udpID=%d) = %q, want my-udp-app", udpID, got)
+	}
+}
+
+// TestAppCatalogIDsMatchOnMalformedDestPort is the #2065-review regression: a
+// user application with an UNPARSABLE destination-port must NOT consume an
+// app_id slot, exactly as the compiler's bad-port `continue` skips its
+// loop-tail appID++. Before the fix BuildCatalog bumped appID on a bad port,
+// shifting every subsequent id by one vs CompileResult.AppNames so the
+// Rust-stamped app_id resolved to the wrong name. With a custom app whose
+// SORTED name precedes a good one, the bad app sits at a lower id and the
+// divergence is observable: this test FAILS pre-fix.
+func TestAppCatalogIDsMatchOnMalformedDestPort(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Services.ApplicationIdentification = true
+	cfg.Applications.Applications = map[string]*config.Application{
+		// "aaa-bad" sorts before "zzz-good"; its dest-port is not parseable.
+		"aaa-bad":  {Name: "aaa-bad", Protocol: "tcp", DestinationPort: "not-a-port"},
+		"zzz-good": {Name: "zzz-good", Protocol: "tcp", DestinationPort: "8443"},
+	}
+
+	result := &CompileResult{AppIDs: make(map[string]uint32)}
+	if err := compileApplications(appCatalogParityDP{}, cfg, result); err != nil {
+		t.Fatalf("compileApplications: %v", err)
+	}
+	cat, err := appid.BuildCatalog(cfg)
+	if err != nil {
+		t.Fatalf("BuildCatalog: %v", err)
+	}
+
+	// The id->name maps must be identical despite the malformed app.
+	if len(cat.AppNames) != len(result.AppNames) {
+		t.Fatalf("AppNames size mismatch with a bad-port app: catalog=%d compiler=%d catalog=%v compiler=%v",
+			len(cat.AppNames), len(result.AppNames), cat.AppNames, result.AppNames)
+	}
+	for id, name := range result.AppNames {
+		if got := cat.AppNames[id]; got != name {
+			t.Fatalf("app_id %d: compiler=%q catalog=%q (bad-port id drift breaks show resolution)",
+				id, name, got)
+		}
+	}
+	// zzz-good must resolve through the id the catalog assigned it.
+	var goodID uint16
+	for id, name := range cat.AppNames {
+		if name == "zzz-good" {
+			goodID = id
+		}
+	}
+	if goodID == 0 {
+		t.Fatal("zzz-good not assigned an app_id")
+	}
+	if got := appid.ResolveSessionName(result.AppNames, cfg, 6, 8443, goodID); got != "zzz-good" {
+		t.Fatalf("ResolveSessionName(goodID=%d) = %q, want zzz-good (id drift)", goodID, got)
 	}
 }
 

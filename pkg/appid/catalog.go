@@ -42,12 +42,14 @@ type Catalog struct {
 // BuildCatalog produces the ordered application catalog for a config. The id
 // assignment MUST stay in lock-step with pkg/dataplane.compileApplications:
 // names come from CatalogNames(cfg, ApplicationIdentification), sorted, with
-// app_id assigned sequentially from 1. An application that cannot be resolved,
-// or whose destination-port spec is unparsable, is skipped for catalog-entry
-// emission but STILL consumes its id slot — exactly mirroring compileApplications,
-// where a bad-port application increments appID via `continue` after recording
-// the name in AppNames. This keeps the id<->name correspondence identical
-// across the two builders even in the presence of malformed input.
+// app_id assigned sequentially from 1. The id<->name correspondence is kept
+// byte-identical to pkg/dataplane/compiler.go's AppNames assignment, which is
+// what ResolveSessionName consumes. That compiler records AppNames[appID]=name
+// BEFORE parsing the destination port, then on a bad/unresolvable port simply
+// `continue`s — SKIPPING the loop-tail appID++ — so a malformed application
+// does NOT consume an id slot (the next good application overwrites the same
+// id). This builder mirrors that exactly: record the name, then on a bad port
+// `continue` WITHOUT bumping appID. (Bumping was the #2065-review divergence.)
 func BuildCatalog(cfg *config.Config) (Catalog, error) {
 	cat := Catalog{AppNames: map[uint16]string{}}
 	if cfg == nil {
@@ -78,9 +80,15 @@ func BuildCatalog(cfg *config.Config) (Catalog, error) {
 
 		dstLow, dstHigh, derr := parsePortRange(app.DestinationPort)
 		if derr != nil {
-			// Mirror compileApplications: record the name (id consumed) but
-			// emit no matching entry for an unparsable destination port.
-			appID++
+			// Mirror the compiler EXACTLY (pkg/dataplane/compiler.go): on a
+			// bad destination port it slog.Warns and `continue`s, which SKIPS
+			// the loop-tail appID++. The name was already recorded at this id
+			// above, but the id is NOT consumed — the next good application
+			// overwrites this same id. So do NOT bump appID here; emit no
+			// catalog entry for the unparsable port and fall through to the
+			// next name. (Bumping here is the #2065-review bug: it would shift
+			// every subsequent id by one vs CompileResult.AppNames, so the
+			// Rust-stamped app_id would resolve to the wrong name.)
 			continue
 		}
 
