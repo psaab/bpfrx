@@ -54,6 +54,21 @@ class MouseLatencyShellTests(unittest.TestCase):
         self.assertIn('"status": "INVALID"', SCRIPT)
         self.assertIn('write_invalid_manifest "$reason"', SCRIPT)
 
+    def test_env_consistency_guard_runs_before_rep(self):
+        # #1365: the harness must reject an ELEPHANT_PORT/SHAPER_BPS
+        # pairing whose cwnd-settle floor exceeds the class cap, before
+        # spending a whole matrix cell on an impossible pairing.
+        self.assertIn(
+            'check-env-consistency \\\n    "$ELEPHANT_PORT" "$SHAPER_BPS"',
+            SCRIPT,
+        )
+        self.assertIn("unsatisfiable cwnd-settle pairing", SCRIPT)
+        # Must fire before the rep does any cluster work (mkdir OUT_DIR is
+        # the first post-validation step).
+        guard_idx = SCRIPT.index("check-env-consistency")
+        mkdir_idx = SCRIPT.index('mkdir -p "$OUT_DIR"')
+        self.assertLess(guard_idx, mkdir_idx)
+
     def test_runtime_cos_and_settle_cpu_artifacts_are_cleared_and_captured(self):
         for artifact in (
             '"/cwnd-settle.json \\',

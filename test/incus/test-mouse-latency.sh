@@ -73,6 +73,18 @@ case "$MOUSE_PROBE_CONNECTION_MODE" in
 esac
 [[ "$MOUSE_PROBE_MIN_INTERVAL_MS" =~ ^[0-9]+([.][0-9]+)?$ ]] \
     || { echo "ABORT: MOUSE_PROBE_MIN_INTERVAL_MS='$MOUSE_PROBE_MIN_INTERVAL_MS' must be a non-negative number" >&2; exit 1; }
+# #1365 env-shape consistency guard: the cwnd-settle gate requires the
+# elephant aggregate to reach 0.7 * SHAPER_BPS, but the class implied by
+# ELEPHANT_PORT (per cos-iperf-config.set) can only ever deliver up to
+# its configured cap. If the floor exceeds that cap the gate is
+# arithmetically unsatisfiable — every loaded rep INVALIDates before the
+# mouse probe ever starts (the reported #1365 symptom: port 5202 = 1 Gbps
+# exact class paired with SHAPER_BPS=10G). Fail fast with an actionable
+# message instead of burning a whole matrix cell on an impossible pairing.
+# (Static check; runs offline, no cluster contact.)
+python3 "${SCRIPT_DIR}/mouse_latency_orchestrate.py" check-env-consistency \
+    "$ELEPHANT_PORT" "$SHAPER_BPS" \
+    || { echo "ABORT: ELEPHANT_PORT=$ELEPHANT_PORT / SHAPER_BPS=$SHAPER_BPS is an unsatisfiable cwnd-settle pairing (see above)" >&2; exit 1; }
 SLACK=10
 CWND_SETTLE_OK="unknown"
 CWND_SETTLE_ELAPSED=0

@@ -19,12 +19,246 @@ Subcommands:
 
 import argparse
 import json
+import os
 import re
 import statistics
 import sys
 
 from cluster_status_parse import parse_cluster_status
 from iperf3_sum_parse import parse_sum_bps
+
+# The cwnd-settle gate (build_cwnd_settle_diagnostics) requires the
+# aggregate to reach 0.7 * SHAPER_BPS. Keep this in lockstep with
+# `min_aggregate_utilization` below; the env-consistency guard uses it
+# to decide whether a (ELEPHANT_PORT, SHAPER_BPS) pairing can ever pass.
+_SETTLE_MIN_UTILIZATION = 0.7
+
+# Junos transmit-rate / shaping-rate unit suffixes. Decimal SI
+# (1k = 1000), matching how iperf3 reports bits/sec and how the rest of
+# this harness (fairness-harness.sh) converts the fixture rates.
+_RATE_SUFFIX_MULTIPLIER = {
+    "": 1,
+    "k": 1_000,
+    "m": 1_000_000,
+    "g": 1_000_000_000,
+    "t": 1_000_000_000_000,
+}
+
+# Default location of the canonical CoS fixture relative to this file.
+_DEFAULT_COS_SET = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "cos-iperf-config.set"
+)
+
+
+def _parse_junos_rate(token: str) -> int | None:
+    """Convert a Junos rate token (e.g. '1.0g', '100m', '25g') to bps.
+
+    Returns None for tokens that are not a numeric-rate form (so the
+    caller can skip non-rate scheduler attributes like 'exact').
+    """
+    m = re.fullmatch(r"(\d+(?:\.\d+)?)([kmgt]?)", token.strip().lower())
+    if not m:
+        return None
+    value = float(m.group(1))
+    mult = _RATE_SUFFIX_MULTIPLIER[m.group(2)]
+    return int(value * mult)
+
+
+class CoSFixtureError(ValueError):
+    """Raised when the CoS fixture cannot resolve a port's class cap."""
+
+
+def parse_cos_class_caps(set_text: str) -> dict:
+    """Parse a cos-iperf-config.set fixture into a per-port rate table.
+
+    Returns a dict keyed by destination-port (int) with values:
+        {"forwarding_class": str,
+         "scheduler": str,
+         "cap_bps": int,          # achievable aggregate ceiling
+         "exact": bool}           # True if scheduler is transmit-rate exact
+
+    The ceiling is the scheduler's `transmit-rate` for `exact` classes
+    (the class is hard-capped at that aggregate per
+    docs/cos-traffic-shaping.md), and the interface `shaping-rate` for
+    non-exact classes (best-effort / uncapped), which can only ever burst
+    to the interface shaper. This is the single source of truth the
+    env-consistency guard compares SHAPER_BPS against — it is derived
+    directly from the applied fixture so it cannot drift from it.
+    """
+    # port -> forwarding-class, forwarding-class -> scheduler,
+    # scheduler -> (rate_bps, exact), plus the interface shaping-rate.
+    port_to_class: dict = {}
+    class_to_sched: dict = {}
+    sched_rate: dict = {}
+    sched_exact: dict = {}
+    iface_shaping_bps: int | None = None
+
+    term_class: dict = {}  # term-id -> forwarding-class
+    term_ports: dict = {}  # term-id -> list[int]
+
+    for raw in set_text.splitlines():
+        line = raw.strip()
+        if not line.startswith("set "):
+            continue
+        toks = line.split()
+
+        # set ... filter <name> term <id> from destination-port <port>
+        if "destination-port" in toks and "term" in toks:
+            try:
+                term = toks[toks.index("term") + 1]
+                port = int(toks[toks.index("destination-port") + 1])
+            except (ValueError, IndexError):
+                continue
+            term_ports.setdefault(term, []).append(port)
+            continue
+
+        # set ... filter <name> term <id> then forwarding-class <fc>
+        if "forwarding-class" in toks and "term" in toks and "then" in toks:
+            try:
+                term = toks[toks.index("term") + 1]
+                fc = toks[toks.index("forwarding-class") + 1]
+            except IndexError:
+                continue
+            term_class[term] = fc
+            continue
+
+        # set class-of-service scheduler-maps <map> forwarding-class <fc>
+        #     scheduler <sched>
+        if (
+            "scheduler-maps" in toks
+            and "forwarding-class" in toks
+            and "scheduler" in toks
+        ):
+            try:
+                fc = toks[toks.index("forwarding-class") + 1]
+                sched = toks[toks.index("scheduler") + 1]
+            except IndexError:
+                continue
+            class_to_sched[fc] = sched
+            continue
+
+        # set class-of-service schedulers <sched> transmit-rate <val|exact>
+        if "schedulers" in toks and "transmit-rate" in toks:
+            try:
+                sched = toks[toks.index("schedulers") + 1]
+                val = toks[toks.index("transmit-rate") + 1]
+            except IndexError:
+                continue
+            if val == "exact":
+                sched_exact[sched] = True
+            else:
+                rate = _parse_junos_rate(val)
+                if rate is not None:
+                    sched_rate[sched] = rate
+            continue
+
+        # set class-of-service interfaces <if> unit <u> shaping-rate <val>
+        if "interfaces" in toks and "shaping-rate" in toks:
+            try:
+                val = toks[toks.index("shaping-rate") + 1]
+            except IndexError:
+                continue
+            rate = _parse_junos_rate(val)
+            if rate is not None:
+                iface_shaping_bps = rate
+            continue
+
+    # Stitch term ports -> forwarding-class.
+    for term, ports in term_ports.items():
+        fc = term_class.get(term)
+        if fc is None:
+            continue
+        for port in ports:
+            port_to_class[port] = fc
+
+    out: dict = {}
+    for port, fc in port_to_class.items():
+        sched = class_to_sched.get(fc)
+        exact = bool(sched_exact.get(sched, False))
+        if exact:
+            cap = sched_rate.get(sched)
+            if cap is None:
+                raise CoSFixtureError(
+                    f"port {port} class {fc} scheduler {sched} is "
+                    f"transmit-rate exact but has no numeric transmit-rate"
+                )
+        else:
+            # Non-exact classes (best-effort / uncapped) are bounded only
+            # by the interface shaping-rate.
+            if iface_shaping_bps is None:
+                raise CoSFixtureError(
+                    f"port {port} class {fc} is non-exact but the fixture "
+                    f"defines no interface shaping-rate"
+                )
+            cap = iface_shaping_bps
+        out[port] = {
+            "forwarding_class": fc,
+            "scheduler": sched,
+            "cap_bps": cap,
+            "exact": exact,
+        }
+    return out
+
+
+def check_settle_threshold_satisfiable(
+    elephant_port: int,
+    shaper_bps: int,
+    *,
+    set_text: str | None = None,
+    min_utilization: float = _SETTLE_MIN_UTILIZATION,
+) -> dict:
+    """Decide whether the cwnd-settle gate can ever pass for a pairing.
+
+    The cwnd-settle gate requires the elephant aggregate to reach
+    `min_utilization * shaper_bps`. The class implied by `elephant_port`
+    can only ever deliver up to its configured cap (`cap_bps`). If the
+    floor exceeds that cap, the gate is arithmetically unsatisfiable
+    regardless of dataplane or scheduler health — exactly the #1365
+    misconfiguration (port 5202 = 1 Gbps exact class vs SHAPER_BPS=10G,
+    floor 7 Gbps > 1 Gbps cap).
+
+    Returns a dict with keys:
+        satisfiable (bool), reason (str), forwarding_class, scheduler,
+        cap_bps, floor_bps, shaper_bps, elephant_port.
+    Raises CoSFixtureError if the port is not present in the fixture.
+    """
+    if set_text is None:
+        with open(_DEFAULT_COS_SET) as f:
+            set_text = f.read()
+    caps = parse_cos_class_caps(set_text)
+    info = caps.get(elephant_port)
+    if info is None:
+        raise CoSFixtureError(
+            f"ELEPHANT_PORT={elephant_port} is not classified by the CoS "
+            f"fixture; known ports: {sorted(caps)}"
+        )
+    floor_bps = int(min_utilization * shaper_bps)
+    cap_bps = info["cap_bps"]
+    satisfiable = floor_bps <= cap_bps
+    if satisfiable:
+        reason = (
+            f"settle floor {floor_bps} bps <= class {info['forwarding_class']} "
+            f"cap {cap_bps} bps"
+        )
+    else:
+        reason = (
+            f"settle floor {floor_bps} bps "
+            f"({min_utilization:g} * SHAPER_BPS={shaper_bps}) exceeds class "
+            f"{info['forwarding_class']} cap {cap_bps} bps "
+            f"(scheduler {info['scheduler']}); the cwnd-settle gate can "
+            f"never pass for this ELEPHANT_PORT/SHAPER_BPS pairing"
+        )
+    return {
+        "satisfiable": satisfiable,
+        "reason": reason,
+        "forwarding_class": info["forwarding_class"],
+        "scheduler": info["scheduler"],
+        "cap_bps": cap_bps,
+        "floor_bps": floor_bps,
+        "shaper_bps": shaper_bps,
+        "elephant_port": elephant_port,
+        "min_utilization": min_utilization,
+    }
 
 _IPERF_INTERVAL_RE = re.compile(
     r"^\[\s*(?P<stream_id>SUM|\d+)\]\s+"
@@ -332,6 +566,38 @@ def cmd_check_collapse(args: argparse.Namespace) -> int:
     return 1
 
 
+def cmd_check_env_consistency(args: argparse.Namespace) -> int:
+    """Exit 0 if the ELEPHANT_PORT/SHAPER_BPS pairing can settle; 1 if not.
+
+    #1365: the canonical matrix run paired a 1 Gbps exact class port
+    (5202) with SHAPER_BPS=10G, so the cwnd-settle floor (7 Gbps) could
+    never be met and every loaded rep INVALIDated before reaching the
+    mouse probe. This guard catches that misconfiguration statically,
+    before the rep starts, with an actionable message.
+    """
+    set_text = None
+    if args.set_file:
+        with open(args.set_file) as f:
+            set_text = f.read()
+    try:
+        result = check_settle_threshold_satisfiable(
+            args.elephant_port, args.shaper_bps, set_text=set_text,
+        )
+    except CoSFixtureError as exc:
+        print(f"ABORT: {exc}", file=sys.stderr)
+        return 2
+    if result["satisfiable"]:
+        return 0
+    print(f"ABORT: {result['reason']}", file=sys.stderr)
+    print(
+        f"hint: set SHAPER_BPS to the {result['forwarding_class']} class cap "
+        f"({result['cap_bps']}) or pick an ELEPHANT_PORT whose class cap is "
+        f">= {result['floor_bps']} bps",
+        file=sys.stderr,
+    )
+    return 1
+
+
 def cmd_parse_cluster_state(args: argparse.Namespace) -> int:
     """Read cluster-status text from stdin, emit one line per triple."""
     text = sys.stdin.read()
@@ -410,6 +676,16 @@ def main() -> int:
         help="Skip this many leading [SUM] rows (settle warmup) before scanning.",
     )
     p2.set_defaults(func=cmd_check_collapse)
+
+    p_env = sub.add_parser("check-env-consistency")
+    p_env.add_argument("elephant_port", type=int)
+    p_env.add_argument("shaper_bps", type=int)
+    p_env.add_argument(
+        "--set-file",
+        help="Path to the CoS fixture (default: cos-iperf-config.set "
+        "next to this script).",
+    )
+    p_env.set_defaults(func=cmd_check_env_consistency)
 
     p3 = sub.add_parser("parse-cluster-state")
     p3.add_argument("ts_ms")
