@@ -2,8 +2,6 @@ package cli
 
 import (
 	"encoding/base64"
-	"io"
-	"os"
 	"strings"
 	"testing"
 )
@@ -17,7 +15,7 @@ import (
 func TestHandleRequestSecurityWireguardGenerateKey(t *testing.T) {
 	c := &CLI{}
 
-	out := captureCLIStdout(t, func() {
+	out := captureStdout(t, func() {
 		if err := c.handleRequestSecurity([]string{"wireguard", "generate-private-key"}); err != nil {
 			t.Fatalf("handleRequestSecurity wireguard generate-private-key: %v", err)
 		}
@@ -34,21 +32,6 @@ func TestHandleRequestSecurityWireguardGenerateKey(t *testing.T) {
 	if priv == pub {
 		t.Fatalf("private and public key identical: %q", priv)
 	}
-}
-
-func captureCLIStdout(t *testing.T, fn func()) string {
-	t.Helper()
-	orig := os.Stdout
-	r, w, err := os.Pipe()
-	if err != nil {
-		t.Fatalf("pipe: %v", err)
-	}
-	os.Stdout = w
-	defer func() { os.Stdout = orig }()
-	fn()
-	w.Close()
-	b, _ := io.ReadAll(r)
-	return string(b)
 }
 
 func cliExtractKey(t *testing.T, out, label string) string {
