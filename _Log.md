@@ -1,5 +1,32 @@
 # Action Log
 
+## 2026-06-20 — #2084 ping/traceroute argv `--` end-of-options separator (option-confusion hardening)
+
+- **Timestamp**: 2026-06-20
+- **Action**: Fixed #2084 (LOW, hardening, loopback-API gated). The
+  ping/traceroute exec sites build an argv slice (no shell — NOT
+  injection) but omitted a `--` end-of-options separator before the
+  user-supplied target, so a `-`-prefixed target was interpreted as a
+  ping/traceroute flag (option-confusion). Extracted the inline argv
+  construction at the six target-append points into pure, unit-testable
+  `buildPingArgv`/`buildTracerouteArgv` helpers (one pair per package)
+  and inserted `"--"` immediately before the target. For the
+  `ip vrf exec vrf-<name>` wrapped variant the `--` lands in the inner
+  command's argv (after `ping`/`traceroute`), which is where it must be.
+  The remote CLI (`cmd/cli/main.go`) builds a protobuf request, not an
+  argv, so it inherits the server-side fix; `pkg/upgrade/kernel_linux.go`
+  pings a daemon-internal gateway (no untrusted input) — both out of
+  scope. Added 12 unit tests (4 per package) asserting `--` is present,
+  immediately precedes the target, is the last-but-one element, comes
+  after all options and after the `ping`/`traceroute` binary, and that a
+  `-`-prefixed target lands as the operand. Updated pkg/api/README.md and
+  pkg/grpcapi/README.md.
+- **File(s)**: pkg/grpcapi/server_diag.go, pkg/api/system.go,
+  pkg/cli/cli_request.go, pkg/grpcapi/server_diag_argv_test.go (new),
+  pkg/api/system_argv_test.go (new), pkg/cli/cli_request_argv_test.go
+  (new), pkg/api/README.md, pkg/grpcapi/README.md,
+  docs/pr/2084-ping-traceroute-separator/plan.md (new)
+
 ## 2026-06-20 — #2070 interface-monitor carrier-state read (HIGH, failover-class)
 
 - **Timestamp**: 2026-06-20
@@ -23,6 +50,7 @@
 - **File(s)**: pkg/routing/monitor.go, pkg/routing/monitor_test.go (new),
   pkg/cluster/monitor.go, pkg/cluster/monitor_test.go,
   pkg/cluster/README.md, pkg/routing/README.md, _Log.md
+
 ## 2026-06-20 — #2069 lo0 input filter never installs (invalid `flush ruleset <table>` nft syntax)
 
 - **Timestamp**: 2026-06-20
