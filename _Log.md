@@ -233,6 +233,32 @@
   verified: a no-standalone mutant fails T7c+T2b; an always-standalone mutant
   fails T7d (double goodbye).
 - **File(s)**: pkg/ra/serialize_test.go, _Log.md
+## 2026-06-19 — #1387 DDNS PR #2043: close MAJOR-4 header-validation re-open
+
+- **Timestamp**: 2026-06-19
+- **Action**: Fix the AGY-found residual that re-opened the MAJOR-4
+  mass-delete vector through a different trigger. `parseActiveLeases`
+  built its header->index map from `records[0]` with raw, case-sensitive
+  keys and never validated that the columns it reads exist. A MANGLED Kea
+  memfile header — a required column missing/renamed, or a case
+  difference (`Address` vs `address`) — made `get(fields,"address")`
+  return "" for every row, so the main loop skipped all rows and returned
+  an EMPTY lease set with NO error. Reconcile's MAJOR-4 protection only
+  marks a family untrusted on a parse ERROR, so an empty-but-no-error
+  result was treated as "zero active leases" → the destructive delete
+  pass ran → ALL owned records for that family were mass-deleted. Fix:
+  (1) lower-case the header keys when building `cols` and the get()
+  lookup name (values stay verbatim) for case-insensitive matching;
+  (2) after building `cols`, validate `requiredLeaseColumns` (`address`,
+  `state`) are present and return a non-nil error if any is missing, so
+  Reconcile marks the family untrusted and SKIPS the destructive diff.
+  An empty FILE (`len(records) < 2`) is still a legitimate zero-lease,
+  no-error case; a present-but-mangled header now ERRORS. Two new
+  non-tautological tests (mangled header errors + does-not-mass-delete
+  via Reconcile; mixed-case header parses correctly) — both FAIL against
+  pre-fix head fd79778b8. README updated.
+- **File(s)**: pkg/dhcpserver/ddns_leases.go,
+  pkg/dhcpserver/ddns_test.go, pkg/dhcpserver/README.md, _Log.md
 
 ## 2026-06-20 — #1993 FRR clear MAJOR fix: require LIVE forwarding, not just pins
 

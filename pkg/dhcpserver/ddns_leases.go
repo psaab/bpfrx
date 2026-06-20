@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -21,6 +22,19 @@ const (
 	keaStateDeclined = 1
 	keaStateExpired  = 2 // expired-reclaimed
 )
+
+// requiredLeaseColumns are the Kea memfile header columns the reconciler
+// MUST be able to read to run a SAFE destructive diff. "address" keys
+// every lease; "state" separates an active lease from a declined /
+// expired-reclaimed one. If either is absent (missing or renamed), every
+// row reads empty and the parser would return a silent empty lease set —
+// which the reconciler would treat as "zero active leases" and mass-delete
+// the family's owned records. Their absence is therefore a hard parse
+// error so Reconcile marks the family untrusted instead. Names are matched
+// case-insensitively (see the lower-cased cols map). Other columns the
+// parser reads (expire, hostname, fqdn_fwd, subnet_id, duid/iaid,
+// client_id/hwaddr) are optional across Kea versions and degrade safely.
+var requiredLeaseColumns = []string{"address", "state"}
 
 // ddnsLease is one active lease as the reconciler needs it: a stable
 // owner identity, the address, the offered name(s), the subnet, and the
@@ -69,15 +83,43 @@ func parseActiveLeases(path string, family int, now time.Time) ([]ddnsLease, err
 		return nil, nil
 	}
 
+	// Build the header->index map with CASE-INSENSITIVE keys. Kea's real
+	// memfile headers are lower-case, but normalizing defends against a
+	// mangled header ("Address"/"ADDRESS") silently resolving to no column.
+	// Only the header KEYS and the get() lookup name are lower-cased; field
+	// VALUES (addresses, identities, hostnames) are data and stay verbatim.
 	cols := make(map[string]int)
 	for i, h := range records[0] {
-		cols[h] = i
+		cols[strings.ToLower(strings.TrimSpace(h))] = i
 	}
 	get := func(fields []string, name string) string {
 		if idx, ok := cols[name]; ok && idx >= 0 && idx < len(fields) {
 			return fields[idx]
 		}
 		return ""
+	}
+
+	// Fail-safe header validation (#1387 MAJOR-4 / AGY MINOR-1+2): the
+	// reconciler's destructive delete pass treats an EMPTY lease set as
+	// "this family legitimately has zero active leases". If a required
+	// column is missing or renamed, every row's address/state reads as ""
+	// and the loop skips all rows, producing an empty set with no error —
+	// which would let Reconcile mass-delete every owned record for the
+	// family. So an unrecognizable header MUST error (Reconcile then marks
+	// the family untrusted and SKIPS the destructive diff), never silently
+	// return an empty set. "address" keys every lease; "state" is what
+	// separates an active lease from a declined/expired-reclaimed one, so
+	// without it active and tombstoned rows are indistinguishable. An empty
+	// FILE (handled above by len(records) < 2) is a legitimate zero-lease
+	// case and is NOT an error; a present-but-mangled header IS.
+	var missing []string
+	for _, req := range requiredLeaseColumns {
+		if _, ok := cols[req]; !ok {
+			missing = append(missing, req)
+		}
+	}
+	if len(missing) > 0 {
+		return nil, fmt.Errorf("parse %s: missing required column(s) %v in Kea lease header", path, missing)
 	}
 
 	// Kea appends rows; the LAST row for an address is authoritative (lease

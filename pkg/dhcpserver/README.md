@@ -75,7 +75,16 @@ What increment 1 ships (the fully unit-testable, lab-free slice):
   `expire` epoch, and the `fqdn_fwd` split between host-name and
   client-supplied FQDN, and extracts the v6 DUID/IAID identity. SEPARATE
   from the display-only `parseLeaseCSV` (reusing that would publish/retain
-  stale records — the exact bug this feature fixes).
+  stale records — the exact bug this feature fixes). Header columns are
+  matched CASE-INSENSITIVELY (only the header keys / lookup names are
+  lower-cased; field values are data and stay verbatim). The header is
+  VALIDATED: if a required column (`requiredLeaseColumns` = `address`,
+  `state`) is missing or renamed, the parser returns an ERROR rather than a
+  silent empty lease set — a mangled header would otherwise read every row
+  as empty, look like "zero active leases", and let the reconciler
+  mass-delete the family's owned records (the MAJOR-4 vector reached through
+  the header gap). An empty FILE (no data rows) is still a legitimate
+  zero-lease, no-error case.
 - **Hostname normalization** — `deriveFQDN` / `finalizeFQDN`
   (`ddns_hostname.go`) ALWAYS contains the published name in the configured
   zone: the client picks the host part, the firewall picks the domain. A

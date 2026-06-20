@@ -813,6 +813,114 @@ func TestParseActiveLeasesInactiveThenActiveReclaim(t *testing.T) {
 	})
 }
 
+// TestParseActiveLeasesMangledHeaderErrors proves the AGY MINOR-1 / MAJOR-4
+// re-open fix: a Kea memfile whose header is MANGLED (a required column
+// missing or renamed) must return a parse ERROR — not a silent empty lease
+// set — so the reconciler marks the family untrusted and SKIPS the
+// destructive delete pass. Otherwise every owned record of that family
+// looks expired and is mass-deleted, the exact failure MAJOR-4 prevents,
+// reached through the header-validation gap. The two sub-cases exercise the
+// header-mangle path end to end through Reconcile (owned records preserved)
+// and the direct-parser path (error returned). Against the pre-fix code the
+// parser returns 0 leases with no error, so the owned record is deleted and
+// these assertions fail.
+func TestParseActiveLeasesMangledHeaderErrors(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+
+	t.Run("missing address column errors", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "leases-noaddr.csv")
+		// Header lacks "address"; the body row still carries a value where
+		// address would be. Pre-fix: every addr reads "" -> all rows skipped
+		// -> 0 leases, no error.
+		writeCSV(t, path, `hwaddr,client_id,valid_lifetime,expire,subnet_id,hostname,state
+aa:bb:cc:dd:ee:01,,3600,1900000000,1,host-a,0
+`)
+		if _, err := parseActiveLeases4(path, now); err == nil {
+			t.Fatal("missing 'address' column must produce a parse error")
+		}
+	})
+
+	t.Run("missing state column errors", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "leases-nostate.csv")
+		writeCSV(t, path, `address,hwaddr,client_id,valid_lifetime,expire,subnet_id,hostname
+10.0.0.10,aa:bb:cc:dd:ee:01,,3600,1900000000,1,host-a
+`)
+		if _, err := parseActiveLeases4(path, now); err == nil {
+			t.Fatal("missing 'state' column must produce a parse error")
+		}
+	})
+
+	t.Run("mangled header does not mass-delete via Reconcile", func(t *testing.T) {
+		up := newFakeUpdater()
+		m := testDDNS(t, up)
+		cfg := &config.DHCPServerConfig{
+			DynamicDNS: &config.DHCPDynamicDNSConfig{
+				Enabled:    true,
+				Domain:     "example.com",
+				TTLSeconds: 300,
+			},
+		}
+		// Cycle 1: a valid header -> the v4 lease is published and owned.
+		writeCSV(t, m.leasePath4, `address,hwaddr,client_id,valid_lifetime,expire,subnet_id,hostname,state
+10.0.0.10,aa,,3600,1900000000,1,host-a,0
+`)
+		if err := m.Reconcile(context.Background(), cfg); err != nil {
+			t.Fatalf("cycle 1 reconcile: %v", err)
+		}
+		if _, ok := m.state.get("mac:aa", "10.0.0.10"); !ok {
+			t.Fatal("cycle 1 did not record the owned v4 record")
+		}
+		// Cycle 2: the v4 header is now mangled (no "state" column). The
+		// reconcile must surface an error and NOT delete the owned record.
+		up.deletes = nil
+		writeCSV(t, m.leasePath4, `address,hwaddr,client_id,valid_lifetime,expire,subnet_id,hostname
+10.0.0.10,aa,,3600,1900000000,1,host-a
+`)
+		err := m.Reconcile(context.Background(), cfg)
+		if err == nil {
+			t.Fatal("mangled header must surface a parse error from Reconcile")
+		}
+		for _, d := range up.deletes {
+			if d.Addr.Is4() {
+				t.Fatalf("v4 record deleted on a mangled header: %s", d.FQDN)
+			}
+		}
+		if _, ok := m.state.get("mac:aa", "10.0.0.10"); !ok {
+			t.Fatal("v4 owned record mass-deleted on a mangled header (MAJOR-4 re-opened)")
+		}
+	})
+}
+
+// TestParseActiveLeasesCaseInsensitiveHeader proves AGY MINOR-2: header
+// column names are matched case-insensitively, so a memfile written with
+// mixed-case headers ("Address","State", ...) still resolves its columns
+// and parses leases correctly. Against the pre-fix case-sensitive cols map
+// the columns are not found, every row is skipped, and the parser returns 0
+// leases — so this test fails pre-fix.
+func TestParseActiveLeasesCaseInsensitiveHeader(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "leases-mixedcase.csv")
+	writeCSV(t, path, `Address,HwAddr,Client_ID,Valid_Lifetime,Expire,Subnet_ID,Hostname,State
+10.0.0.10,aa:bb:cc:dd:ee:01,,3600,1900000000,1,host-a,0
+10.0.0.11,aa:bb:cc:dd:ee:02,,3600,1900000000,1,host-b,1
+`)
+	leases, err := parseActiveLeases4(path, time.Unix(1_700_000_000, 0))
+	if err != nil {
+		t.Fatalf("mixed-case header should parse, got error: %v", err)
+	}
+	if len(leases) != 1 {
+		t.Fatalf("want 1 active lease from mixed-case header, got %d: %+v", len(leases), leases)
+	}
+	if leases[0].Address != "10.0.0.10" || leases[0].HostName != "host-a" {
+		t.Fatalf("mixed-case columns resolved wrong: %+v", leases[0])
+	}
+	if leases[0].Identity != "mac:aa:bb:cc:dd:ee:01" {
+		t.Fatalf("identity from mixed-case header = %q", leases[0].Identity)
+	}
+}
+
 // ---- state store persistence ----
 
 func TestStateStorePersistsAndReloads(t *testing.T) {
