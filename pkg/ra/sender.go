@@ -417,13 +417,31 @@ func ensureLinkLocal(iface *net.Interface) error {
 		IPNet: &net.IPNet{IP: ll, Mask: net.CIDRMask(64, 128)},
 		Flags: unix.IFA_F_NODAD,
 	}
-	if err := netlink.AddrAdd(link, addr); err != nil {
-		if errors.Is(err, syscall.EEXIST) {
-			return nil
-		}
+	logAdded, err := classifyAddrAddResult(netlink.AddrAdd(link, addr))
+	if err != nil {
 		return fmt.Errorf("add link-local %s on %s: %w", ll, iface.Name, err)
 	}
-	slog.Info("ra: added link-local for RA sender",
-		"interface", iface.Name, "addr", ll)
+	if logAdded {
+		slog.Info("ra: added link-local for RA sender",
+			"interface", iface.Name, "addr", ll)
+	}
 	return nil
+}
+
+// classifyAddrAddResult interprets the result of netlink.AddrAdd for the RA
+// link-local fallback. ensureLinkLocal already lists existing IPv6 link-locals
+// before attempting the add, but another goroutine or process can still win the
+// race between the list and the add. A nil error is a genuine add (log it). An
+// EEXIST means the address is already present — a silent success: do NOT log
+// "added", since claiming a new address was created makes the RA startup trace
+// inaccurate during debugging. Any other error is a real failure.
+func classifyAddrAddResult(addErr error) (logAdded bool, err error) {
+	switch {
+	case addErr == nil:
+		return true, nil
+	case errors.Is(addErr, syscall.EEXIST):
+		return false, nil
+	default:
+		return false, addErr
+	}
 }

@@ -2,10 +2,13 @@ package ra
 
 import (
 	"bytes"
+	"errors"
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
 	"net"
+	"syscall"
 	"testing"
 )
 
@@ -60,6 +63,66 @@ func TestEUI64LinkLocalBadMAC(t *testing.T) {
 		if got := eui64LinkLocal(mac); got != nil {
 			t.Errorf("eui64LinkLocal(%v) = %s, want nil", mac, got)
 		}
+	}
+}
+
+// TestClassifyAddrAddResult is the regression for the Copilot review on #2034:
+// ensureLinkLocal must not log "added link-local" when netlink.AddrAdd loses the
+// list/add race and returns EEXIST. The decision is extracted into the pure
+// classifyAddrAddResult helper so it is testable off-lab (the surrounding add
+// performs real netlink syscalls). This test fails if the helper reverts to the
+// pre-fix behavior of treating EEXIST as a logged add (logAdded=true) or as an
+// error.
+func TestClassifyAddrAddResult(t *testing.T) {
+	cases := []struct {
+		name        string
+		addErr      error
+		wantLog     bool
+		wantErr     bool
+		wantErrSame error // when non-nil, returned err must wrap/equal this
+	}{
+		{
+			name:    "real-add",
+			addErr:  nil,
+			wantLog: true,
+			wantErr: false,
+		},
+		{
+			name:    "eexist-race",
+			addErr:  syscall.EEXIST,
+			wantLog: false, // must NOT log "added" — the address already existed
+			wantErr: false, // EEXIST is a silent success
+		},
+		{
+			name:    "eexist-wrapped",
+			addErr:  fmt.Errorf("add: %w", syscall.EEXIST),
+			wantLog: false,
+			wantErr: false,
+		},
+		{
+			name:        "other-failure",
+			addErr:      syscall.EPERM,
+			wantLog:     false,
+			wantErr:     true,
+			wantErrSame: syscall.EPERM,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			logAdded, err := classifyAddrAddResult(tc.addErr)
+			if logAdded != tc.wantLog {
+				t.Errorf("classifyAddrAddResult(%v) logAdded = %v, want %v",
+					tc.addErr, logAdded, tc.wantLog)
+			}
+			if (err != nil) != tc.wantErr {
+				t.Errorf("classifyAddrAddResult(%v) err = %v, want err? %v",
+					tc.addErr, err, tc.wantErr)
+			}
+			if tc.wantErrSame != nil && !errors.Is(err, tc.wantErrSame) {
+				t.Errorf("classifyAddrAddResult(%v) err = %v, want errors.Is %v",
+					tc.addErr, err, tc.wantErrSame)
+			}
+		})
 	}
 }
 

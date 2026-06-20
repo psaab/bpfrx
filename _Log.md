@@ -1,5 +1,17 @@
 # Action Log
 
+## 2026-06-20 — #2034 RA link-local review follow-up (regression test)
+
+- **Timestamp**: 2026-06-20
+- **Action**: Extract the `AddrAdd` result decision in `ensureLinkLocal`
+  into the pure `classifyAddrAddResult` helper so the EEXIST-race
+  behavior is unit-testable off-lab, and add `TestClassifyAddrAddResult`
+  (proven non-tautological: a mutant treating EEXIST as a logged add
+  fails the test). The "added link-local" INFO log now fires only on a
+  genuine add; a racing EEXIST is a silent success; other errors still
+  return.
+- **File(s)**: pkg/ra/sender.go, pkg/ra/sender_linklocal_test.go, _Log.md
+
 ## 2026-06-20 — #2034 RA link-local review follow-up
 
 - **Timestamp**: 2026-06-20
