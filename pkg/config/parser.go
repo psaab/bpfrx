@@ -93,7 +93,17 @@ func (p *Parser) parseStatements() []*Node {
 	return nodes
 }
 
+// inactiveMarker is the Junos `inactive:` statement prefix (#2008 H1).
+// Because `:` is an identifier character (lexer.isIdentChar), the lexer
+// tokenizes `inactive:` as a single identifier; the parser detects it as
+// the leading key of a statement and lifts it into Node.Inactive rather
+// than letting it mangle the node's identity (Keys[0]).
+const inactiveMarker = "inactive:"
+
 // parseStatement parses one statement: keys followed by ; or { block }.
+// A leading `inactive:` marker is stripped from the keys and recorded on
+// the returned Node so the statement's real identity (Keys) is unchanged
+// and key matching, schema walks, and group merge keep working unmodified.
 func (p *Parser) parseStatement() *Node {
 	keys := p.parseKeys()
 	if len(keys) == 0 {
@@ -104,6 +114,25 @@ func (p *Parser) parseStatement() *Node {
 				fmt.Sprintf("unexpected %s", tok))
 		}
 		return nil
+	}
+
+	// Detect a leading `inactive:` deactivation marker and lift it off the
+	// keys. A lone `inactive:` with no following statement is a parse error
+	// (Junos requires a statement to deactivate).
+	inactive := false
+	markerLine, markerCol := p.lexer.Peek().Line, p.lexer.Peek().Column
+	if keys[0] == inactiveMarker {
+		inactive = true
+		keys = keys[1:]
+		if len(keys) == 0 {
+			p.addError(markerLine, markerCol,
+				"inactive: marker must be followed by a statement")
+			// Consume a trailing terminator if present so we don't loop.
+			if t := p.lexer.Peek(); t.Type == TokenSemicolon || t.Type == TokenLBrace {
+				p.skipStatementBody()
+			}
+			return nil
+		}
 	}
 
 	line := p.lexer.Peek().Line
@@ -125,6 +154,7 @@ func (p *Parser) parseStatement() *Node {
 		return &Node{
 			Keys:     keys,
 			Children: children,
+			Inactive: inactive,
 			Line:     line,
 			Column:   col,
 		}
@@ -133,20 +163,38 @@ func (p *Parser) parseStatement() *Node {
 		// Leaf: keys ;
 		p.lexer.Next() // consume ;
 		return &Node{
-			Keys:   keys,
-			IsLeaf: true,
-			Line:   line,
-			Column: col,
+			Keys:     keys,
+			IsLeaf:   true,
+			Inactive: inactive,
+			Line:     line,
+			Column:   col,
 		}
 
 	default:
 		// No semicolon or brace -- treat as implicit leaf
 		// (some Junos statements can omit trailing semicolon at EOF)
 		return &Node{
-			Keys:   keys,
-			IsLeaf: true,
-			Line:   line,
-			Column: col,
+			Keys:     keys,
+			IsLeaf:   true,
+			Inactive: inactive,
+			Line:     line,
+			Column:   col,
+		}
+	}
+}
+
+// skipStatementBody consumes a `;` or a balanced `{ ... }` block so error
+// recovery after a malformed `inactive:` marker does not desync the parser.
+func (p *Parser) skipStatementBody() {
+	tok := p.lexer.Peek()
+	switch tok.Type {
+	case TokenSemicolon:
+		p.lexer.Next()
+	case TokenLBrace:
+		p.lexer.Next() // consume {
+		p.parseStatements()
+		if p.lexer.Peek().Type == TokenRBrace {
+			p.lexer.Next() // consume }
 		}
 	}
 }

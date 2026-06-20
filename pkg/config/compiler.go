@@ -155,6 +155,15 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 }
 
 func compileConfigWithOpts(tree *ConfigTree, opts compileOpts) (*Config, error) {
+	// #2008 H1: prune `inactive:`-marked subtrees BEFORE every other
+	// pre-expansion gate, group expansion, and compilation. Doing it first
+	// means the tunnel-id collision gate ignores inactive tunnel
+	// definitions, an `inactive: apply-groups foo` suppresses the inherited
+	// config, and inactive nodes inside a `groups {}` body are pruned —
+	// none of the ~15 compiler files or validators ever observe an inactive
+	// node. WithoutInactive is a no-op (no clone) on the all-active path.
+	tree = tree.WithoutInactive()
+
 	// #1873 R-B: tunnel-endpoint id collision gate. Runs on the
 	// PRE-expansion tree (ExpandGroups removes the groups stanza) so
 	// the check covers the UNION of tunnel names across all groups —
@@ -222,6 +231,13 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 }
 
 func compileConfigForNodeWithOpts(tree *ConfigTree, nodeID int, opts compileOpts) (*Config, error) {
+	// #2008 H1: prune `inactive:` subtrees first — see compileConfigWithOpts.
+	// Centralizing the strip in this shared node-aware entry guarantees BOTH
+	// cluster nodes compile the identical active set from the same persisted
+	// (Inactive-flag-carrying, JSON-synced) tree, so a deactivated stanza is
+	// dead on both nodes — no split-brain firewall posture.
+	tree = tree.WithoutInactive()
+
 	// #1873 R-B: union-of-groups tunnel id collision gate — see
 	// compileConfigWithOpts. Pre-expansion on purpose.
 	tunnelIDWarnings, tunnelIDErr := validateTunnelEndpointIDCollisionAST(

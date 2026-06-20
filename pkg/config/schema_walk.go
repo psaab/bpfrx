@@ -71,6 +71,16 @@ func SchemaValidateWithDefinitions(tree, defsSource *ConfigTree, cfg *Config) er
 	if tree == nil {
 		return nil
 	}
+	// #2008 H1: do not validate `inactive:`-marked nodes. Junos parks
+	// work-in-progress under `inactive:` and accepts a deactivated leaf
+	// even when its value would be rejected if active (the whole point of
+	// deactivate is reversible, inert garbage). Strip before the typed-leaf
+	// walk — and strip the cross-reference definitions source too, so a
+	// deactivated definition does not satisfy an active reference and an
+	// inactive reference is not itself validated. WithoutInactive is a
+	// no-op (no clone) when nothing is deactivated.
+	tree = tree.WithoutInactive()
+	defsSource = defsSource.WithoutInactive()
 	refs := collectSchemaRefs(tree)
 	if defsSource != nil {
 		for name := range collectSchemaRefs(defsSource).forwardingClasses {

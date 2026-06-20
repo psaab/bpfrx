@@ -1,0 +1,92 @@
+package config
+
+// Junos `inactive:` statement support (#2008 H1).
+//
+// An operator deactivates a configuration node without deleting it by
+// prefixing the statement with `inactive:`. The node stays in the
+// configuration database — it displays in `show configuration`, survives
+// commit and reboot, syncs to the HA peer, and can be re-enabled — but it
+// is EXCLUDED from compilation/application: the firewall behaves as if the
+// statement were absent.
+//
+// The parser lifts the `inactive:` marker into Node.Inactive (parser.go)
+// so the node's identity (Keys) is unchanged and every key match, schema
+// walk, and group merge keeps working on the real keys. This file provides
+// the single centralized strip that prunes inactive subtrees before the
+// compiler and the typed-leaf schema gate run, so neither of those layers
+// ever observes an inactive node and none of the ~15 compiler files change.
+//
+// Strip runs on a CLONE before group expansion (see the compile entry
+// points in compiler.go and schemaValidateExpandedTreeForNode in
+// configstore/store.go), so an `inactive: apply-groups foo` correctly
+// suppresses the inherited config and an inactive node inside a `groups {}`
+// body is pruned consistently. Because strip can only REMOVE nodes from the
+// compiled set, a config that compiled before cannot become non-compilable.
+
+// HasInactiveNodes reports whether the tree contains any node (at any
+// depth) marked inactive. Used to skip the strip clone on the common
+// all-active path.
+func (t *ConfigTree) HasInactiveNodes() bool {
+	if t == nil {
+		return false
+	}
+	return nodesHaveInactive(t.Children)
+}
+
+func nodesHaveInactive(nodes []*Node) bool {
+	for _, n := range nodes {
+		if n == nil {
+			continue
+		}
+		if n.Inactive {
+			return true
+		}
+		if nodesHaveInactive(n.Children) {
+			return true
+		}
+	}
+	return false
+}
+
+// WithoutInactive returns a deep copy of the tree with every inactive
+// subtree pruned. When the tree contains no inactive nodes it returns the
+// receiver unchanged (no clone) so the common path allocates nothing extra.
+// The result is safe to mutate (it is a fresh clone whenever a prune
+// happened); callers that further mutate the tree (group expansion) must
+// not rely on aliasing with the receiver — they already Clone() first on
+// the all-active path.
+func (t *ConfigTree) WithoutInactive() *ConfigTree {
+	if t == nil {
+		return nil
+	}
+	if !t.HasInactiveNodes() {
+		return t
+	}
+	return &ConfigTree{Children: stripInactiveNodes(t.Children)}
+}
+
+// stripInactiveNodes returns a deep copy of nodes with inactive subtrees
+// removed. Active container nodes are cloned and recursively pruned.
+func stripInactiveNodes(nodes []*Node) []*Node {
+	if nodes == nil {
+		return nil
+	}
+	result := make([]*Node, 0, len(nodes))
+	for _, n := range nodes {
+		if n == nil || n.Inactive {
+			continue
+		}
+		clone := &Node{
+			Keys:          append([]string(nil), n.Keys...),
+			Children:      stripInactiveNodes(n.Children),
+			IsLeaf:        n.IsLeaf,
+			Annotation:    n.Annotation,
+			InheritedFrom: n.InheritedFrom,
+			Inactive:      false,
+			Line:          n.Line,
+			Column:        n.Column,
+		}
+		result = append(result, clone)
+	}
+	return result
+}

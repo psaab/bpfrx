@@ -30,6 +30,20 @@ type Node struct {
 	// Set during ExpandGroups when tagInherited is true.
 	InheritedFrom string
 
+	// Inactive marks a node deactivated via the Junos `inactive:` statement
+	// marker (#2008 H1). The node is retained verbatim in the tree — it
+	// displays in `show configuration` (with the `inactive:` prefix
+	// re-emitted), persists through commit/reboot, syncs to the HA peer, and
+	// can be re-enabled later — but it is EXCLUDED from compilation and
+	// application: the firewall behaves as if the statement were absent. The
+	// centralized strip (WithoutInactive) prunes inactive subtrees on the
+	// cloned tree before group expansion + compile and before
+	// schema-validation, so the ~15 compiler files and the typed-leaf schema
+	// gate never see inactive nodes. JSON-tagged omitempty so existing
+	// persisted configs and the on-disk format stay byte-identical for
+	// active nodes (an old DB has no Inactive key → false → active).
+	Inactive bool `json:",omitempty"`
+
 	// Line/Column where this node starts (for error reporting).
 	Line   int
 	Column int
@@ -132,6 +146,7 @@ func cloneNodes(nodes []*Node) []*Node {
 			IsLeaf:        n.IsLeaf,
 			Annotation:    n.Annotation,
 			InheritedFrom: n.InheritedFrom,
+			Inactive:      n.Inactive,
 			Line:          n.Line,
 			Column:        n.Column,
 		}
