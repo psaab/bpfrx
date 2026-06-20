@@ -3,6 +3,7 @@ package lldp
 import (
 	"context"
 	"net"
+	"runtime"
 	"sync"
 	"testing"
 	"time"
@@ -44,8 +45,14 @@ func TestSessionRecvUnblocksOnClose(t *testing.T) {
 	}()
 
 	// Wait until the goroutine has signalled it is about to call recv, then
-	// verify it has not returned yet (it should be blocked on the empty socket).
+	// yield the scheduler so the goroutine has a chance to actually enter the
+	// blocking syscall before close() is issued.  This does not provide a
+	// hard guarantee that the goroutine is IN recv — a non-blocking wakeup
+	// (EBADF on an already-closed fd) would also close done promptly — but
+	// the window is negligibly small after Gosched().  The mutation-verified
+	// guarantee lives in TestStopUnblocksParkedRX which uses frame injection.
 	<-started
+	runtime.Gosched()
 	select {
 	case <-done:
 		t.Fatal("recv returned before close() — it should block while no data and fd open")
@@ -128,6 +135,8 @@ func TestStopUnblocksParkedRX(t *testing.T) {
 		}
 	}
 	// Poll until rxLoop has processed the frame (proves recv ran at least once).
+	// There is no subscription API on Manager; polling is the simplest
+	// race-free alternative to a bare sleep.
 	const pollLimit = 500 * time.Millisecond
 	pollDeadline := time.Now().Add(pollLimit)
 	for time.Now().Before(pollDeadline) {
