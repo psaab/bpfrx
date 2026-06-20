@@ -185,6 +185,14 @@ type Manager struct {
 	// session-sync traffic on the control link).
 	peerTimeoutGuardFn func() (suppress bool, reason string)
 
+	// peerHeartbeatFreshFn reports whether a peer heartbeat is currently
+	// within the timeout window (i.e. NOT stale). handlePeerTimeout consults
+	// it AFTER the (possibly slow) guard window so a heartbeat that arrived
+	// during the guard aborts the spurious peer-lost transition. Defaults to
+	// the live receiver-backed check via peerHeartbeatFresh; overridable in
+	// tests to inject a fresh/stale heartbeat without a real socket.
+	peerHeartbeatFreshFn func() bool
+
 	// hbRestartNotifyFn is invoked around RestartHeartbeat's socket
 	// teardown/rebind window (once before teardown, once after each failed
 	// bind retry). The daemon wires it to SessionSync.SendLivenessKeepalive

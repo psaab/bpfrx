@@ -154,3 +154,16 @@ outside the monitor loop:
 - Dual-active overlap is intentional: primary sets `rg_active=true`
   immediately on becoming master; secondary defers `rg_active=false` until
   it sees the VRRP BACKUP event. Brief overlap, never both inactive.
+- `handlePeerTimeout` runs its peer-timeout guard (`peerTimeoutGuardFn`) with
+  `m.mu` released, so the receiver read path can run `handlePeerHeartbeat`
+  during the call for ANY guard duration (a configured slow guard only widens
+  the window). After the guard it re-checks heartbeat STALENESS via
+  `peerHeartbeatFreshLocked`, not just `peerAlive` (#2080): a heartbeat that
+  lands during the guard window keeps `peerAlive` true but is a fresh
+  heartbeat, so the only correct post-guard question is "is the heartbeat
+  fresh again?". `peerHeartbeatFreshLocked`
+  re-reads the receiver's `lastSeen` against the live monotonic clock (test
+  seam: `peerHeartbeatFreshFn`); a fresh heartbeat aborts the peer-lost
+  transition and prevents spurious failover churn. A nil receiver / unset seam
+  reports not-fresh, so the no-receiver call paths behave exactly as before the
+  re-check existed.
