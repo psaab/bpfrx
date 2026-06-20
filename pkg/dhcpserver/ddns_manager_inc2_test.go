@@ -145,12 +145,14 @@ func TestManagerEnabledThenDisabledWithdrawsOnce(t *testing.T) {
 		t.Fatalf("expected 1 owned record after enable")
 	}
 
-	// Disable: a nil DynamicDNS block → withdrawAllLocked deletes the owned
-	// record THROUGH the live backend (the factory still resolves it because
-	// resolve-per-Reconcile runs before the enabled check). The factory keys
-	// off the policy; a disabled policy has backend "" → resolves nop. So a
-	// turn-off via Enabled=false (keeping the backend config) must still
-	// withdraw through the live backend.
+	// Disable via DynamicDNS != nil with Enabled=false (NOT a nil stanza):
+	// the backend config (Backend + UpdateServer) is retained, so the
+	// resolve-per-Reconcile factory still builds the LIVE backend (a disabled
+	// policy that keeps backend "rfc2136" + an update-server resolves the
+	// rfc2136 updater, not the nop). withdrawAllLocked then deletes the owned
+	// record THROUGH that live backend before the !pol.enabled branch returns.
+	// (Whole-stanza removal — DynamicDNS=nil — resolves the nop and is covered
+	// by the stanza-removal withdraw test.)
 	disabled := &config.DHCPServerConfig{DynamicDNS: &config.DHCPDynamicDNSConfig{
 		Enabled:      false,
 		Domain:       "example.com",
@@ -173,10 +175,78 @@ func TestManagerEnabledThenDisabledWithdrawsOnce(t *testing.T) {
 	}
 }
 
+// TestManagerStanzaRemovalWithdrawsThroughLiveBackend covers the
+// whole-stanza removal path (DynamicDNS == nil), distinct from the
+// Enabled=false path above. When the operator deletes the entire DynamicDNS
+// stanza, policyFromConfig(nil) yields backend "" so the resolve-per-Reconcile
+// factory resolves a nopUpdater (no update-server/TSIG left to build the live
+// backend). The manager must NOT swap the live updater (which published the
+// records) for the nop before withdrawing — otherwise withdrawAllLocked runs
+// through the nop, dropping ownership entries while sending NO real DNS delete,
+// orphaning the published records. This test wires a recording fakeUpdater as
+// the live backend, publishes a record, then removes the stanza and asserts
+// the fake RECEIVES the delete (record actually withdrawn) and ownership is
+// cleared. It FAILS pre-fix (the nop swallows the delete: 0 deletes recorded).
+func TestManagerStanzaRemovalWithdrawsThroughLiveBackend(t *testing.T) {
+	dir := t.TempDir()
+	fake := newFakeUpdater()
+	m := newDDNSManagerForTesting(
+		fake,
+		filepath.Join(dir, "state.json"),
+		filepath.Join(dir, "leases4.csv"),
+		filepath.Join(dir, "leases6.csv"),
+		"node0",
+		func() time.Time { return time.Unix(1_700_000_000, 0) },
+	)
+	// Factory mirrors NewProductionDDNSManager: a usable rfc2136 policy yields
+	// the (recording) live backend; anything else (incl. stanza removal where
+	// backend resolves to "") yields the nopUpdater.
+	m.newUpdater = func(pol ddnsPolicy, c *config.DHCPDynamicDNSConfig) (DNSUpdater, error) {
+		if pol.backend != "rfc2136" || c == nil || c.UpdateServer == "" {
+			return nopUpdater{}, nil
+		}
+		return fake, nil
+	}
+
+	writeCSV(t, m.leasePath4, `address,hwaddr,client_id,valid_lifetime,expire,subnet_id,hostname,state
+10.0.1.5,aa,,3600,1900000000,1,laptop,0
+`)
+	writeCSV(t, m.leasePath6, "address,duid,valid_lifetime,expire,subnet_id,iaid,hostname,state\n")
+
+	// Enable + publish via the live (fake) backend.
+	enabled := &config.DHCPServerConfig{DynamicDNS: &config.DHCPDynamicDNSConfig{
+		Enabled: true, Domain: "example.com", TTLSeconds: 300,
+		Backend: "rfc2136", UpdateServer: "192.0.2.53",
+	}}
+	if err := m.Reconcile(context.Background(), enabled); err != nil {
+		t.Fatalf("enable reconcile: %v", err)
+	}
+	if m.Stats().OwnedRecords != 1 {
+		t.Fatalf("expected 1 owned record after enable, got %d", m.Stats().OwnedRecords)
+	}
+	if len(fake.upserts) == 0 {
+		t.Fatalf("live backend recorded no upsert on enable")
+	}
+
+	// Remove the ENTIRE stanza (DynamicDNS == nil). The factory now resolves
+	// the nop, but the live updater must still withdraw the owned record.
+	removed := &config.DHCPServerConfig{DynamicDNS: nil}
+	if err := m.Reconcile(context.Background(), removed); err != nil {
+		t.Fatalf("stanza-removal reconcile: %v", err)
+	}
+	if got := m.Stats().OwnedRecords; got != 0 {
+		t.Errorf("OwnedRecords = %d after stanza removal, want 0 (withdrawn)", got)
+	}
+	if len(fake.deletes) == 0 {
+		t.Fatal("stanza removal did not send a real DNS delete through the live backend " +
+			"(records orphaned) — the nop swallowed the withdraw")
+	}
+}
+
 func TestManagerReconcileFailCountsAndDoesNotWedge(t *testing.T) {
 	srv := newFakeDNSServer(t, nil)
 	// Make the FORWARD zone always SERVFAIL so the upsert errors.
-	srv.rcodeForZone["example.com."] = dns.RcodeServerFailure
+	srv.setRcode("example.com.", dns.RcodeServerFailure)
 	m := prodManagerTo(t, srv)
 	cfg := ddnsCfg(srv.addrUDP)
 	writeCSV(t, m.leasePath4, `address,hwaddr,client_id,valid_lifetime,expire,subnet_id,hostname,state
@@ -199,9 +269,7 @@ func TestManagerReconcileFailCountsAndDoesNotWedge(t *testing.T) {
 		t.Errorf("OwnedRecords = %d, want 0 (failed upsert records no ownership)", st.OwnedRecords)
 	}
 	// The loop is not wedged: a subsequent successful cycle publishes.
-	srv.mu.Lock()
-	delete(srv.rcodeForZone, "example.com.")
-	srv.mu.Unlock()
+	srv.clearRcode("example.com.")
 	if err := m.Reconcile(context.Background(), cfg); err != nil {
 		t.Fatalf("recovery reconcile: %v", err)
 	}
@@ -212,7 +280,7 @@ func TestManagerReconcileFailCountsAndDoesNotWedge(t *testing.T) {
 
 func TestManagerPTRNotAuthCountedNotFailed(t *testing.T) {
 	srv := newFakeDNSServer(t, nil)
-	srv.rcodeForZone["1.0.10.in-addr.arpa."] = dns.RcodeNotAuth
+	srv.setRcode("1.0.10.in-addr.arpa.", dns.RcodeNotAuth)
 	m := prodManagerTo(t, srv)
 	cfg := ddnsCfg(srv.addrUDP)
 	writeCSV(t, m.leasePath4, `address,hwaddr,client_id,valid_lifetime,expire,subnet_id,hostname,state

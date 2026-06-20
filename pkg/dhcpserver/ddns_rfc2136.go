@@ -123,8 +123,17 @@ func normalizeUpdateServer(s string) (string, error) {
 	if _, _, err := net.SplitHostPort(s); err == nil {
 		return s, nil
 	}
-	// No port (or a bare IPv6 literal without brackets): attach :53.
-	return net.JoinHostPort(s, "53"), nil
+	// No port. A bracketed IPv6 literal without a port ("[2001:db8::1]")
+	// would be double-bracketed by JoinHostPort ("[[2001:db8::1]]:53"), so
+	// strip an existing surrounding bracket pair first and let JoinHostPort
+	// re-bracket the bare host exactly once. A bare IPv6 literal without
+	// brackets ("2001:db8::1") and an IPv4/hostname both pass through to
+	// JoinHostPort unchanged.
+	host := s
+	if len(host) >= 2 && host[0] == '[' && host[len(host)-1] == ']' {
+		host = host[1 : len(host)-1]
+	}
+	return net.JoinHostPort(host, "53"), nil
 }
 
 // newRFC2136Updater builds the live backend from a resolved policy plus the
@@ -187,10 +196,18 @@ func (u *rfc2136Updater) resolveForwardZone(fqdn string) string {
 	if z := longestZoneSuffix(fqdn, u.forwardZones); z != "" {
 		return z
 	}
+	// Use the configured Domain only when the name is actually UNDER it. A
+	// name outside the domain (an explicit ClientFQDN in a different zone)
+	// must not be sent to the domain's zone — the server would answer NOTAUTH
+	// (or, worse, accept it into the wrong zone). Derive that name's own
+	// parent zone instead.
 	if u.defaultDomain != "" {
-		return dns.Fqdn(u.defaultDomain)
+		if z := longestZoneSuffix(fqdn, []string{u.defaultDomain}); z != "" {
+			return z
+		}
 	}
-	// No domain configured: fall back to the parent label of the name.
+	// No (matching) domain configured: fall back to the parent label of the
+	// name.
 	return parentZone(dns.Fqdn(fqdn))
 }
 
@@ -430,10 +447,15 @@ func (u *rfc2136Updater) exchange(ctx context.Context, m *dns.Msg) (*dns.Msg, er
 		if tc, ok := u.client.(*dns.Client); ok {
 			tcpClient := *tc
 			tcpClient.Net = "tcp"
+			// Derive the TCP retry context from the CALLER's ctx (not
+			// context.Background()) so a canceled/deadline'd reconcile pass
+			// actually cancels the retry. The per-exchange timeout is still
+			// applied on top, so the retry is bounded even when the caller has
+			// no deadline of its own.
 			if u.timeout > 0 {
-				tctx, cancel := context.WithTimeout(context.Background(), u.timeout)
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithTimeout(ctx, u.timeout)
 				defer cancel()
-				ctx = tctx
 			}
 			resp, _, err = tcpClient.ExchangeContext(ctx, m, u.server)
 			if err != nil {

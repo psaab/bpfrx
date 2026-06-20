@@ -189,15 +189,20 @@ What increment 2 ships (the feasible, CI-testable slice):
   same name is never collateral — the R1 cardinal-sin boundary holds on the
   wire. TSIG (when a key is configured) is signed via `TSIGSecret.Reveal()`
   with a supported HMAC algorithm (sha1/224/256/384/512; hmac-md5 rejected as
-  insecure; default hmac-sha256). UDP-first with TCP retry on truncation, a
-  bounded per-call timeout, and conflict-policy handling (replace-owned =
+  insecure; default hmac-sha256). UDP-first with a TCP retry on truncation
+  that is derived from the CALLER's context (so a canceled/deadline'd reconcile
+  pass cancels the in-flight retry), a bounded per-call timeout, and
+  conflict-policy handling (replace-owned =
   bare add; skip-existing = no-RRset prerequisite, skip on collision;
   strict-fail = error on collision). The backend is STATELESS beyond its
   config — all ownership lives in the unchanged state store.
 - **Zone surface** (plan §11 Q1): the forward zone is the configured
-  `Domain`; the reverse zone is the canonical in-addr.arpa/ip6.arpa derived
-  from the PTR name. A reverse-zone NOTAUTH/REFUSED (a reverse zone we do not
-  own, e.g. delegated to an ISP) is a COUNTED SKIP
+  `Domain` ONLY when the lease's FQDN is actually under it (an out-of-domain
+  `ClientFQDN` derives its own parent zone instead of being misrouted into the
+  domain, which the authoritative server would reject NOTAUTH); the reverse
+  zone is the canonical in-addr.arpa/ip6.arpa derived from the PTR name. A
+  reverse-zone NOTAUTH/REFUSED (a reverse zone we do not own, e.g. delegated to
+  an ISP) is a COUNTED SKIP
   (`skipped_total{reason="ptr-notauth"}`), NOT a blocking error — the forward
   add still succeeds and the lease's reconcile is not failed (plan §11 Q6).
   The zone-resolution helpers take an optional explicit zone list (always
@@ -208,8 +213,17 @@ What increment 2 ships (the feasible, CI-testable slice):
   current policy at the START of each Reconcile, so a commit-time
   backend-config change takes effect on the next cycle with no swap race, and
   the SAME manager serves both the disabled (nopUpdater) and enabled states —
-  an enabled→disabled commit still runs `withdrawAllLocked` through a live
-  backend.
+  an enabled→disabled commit (keeping the backend config) still resolves a
+  live backend and runs `withdrawAllLocked` through it.
+- **Withdraw never goes through the nop while records are owned**: removing the
+  WHOLE `dynamic-dns` stanza leaves no update-server/TSIG to build the live
+  backend from, so the per-Reconcile factory resolves a `nopUpdater`. Reconcile
+  must NOT replace a still-live updater with that nop before withdrawing —
+  doing so would drop the ownership entries while sending NO real DNS delete,
+  orphaning the published records. The guard in `Reconcile` keeps the existing
+  live updater for the withdraw cycle when the newly-resolved updater is a nop
+  AND records are still owned; the swap to nop happens on the next cycle once
+  nothing is owned.
 - **Daemon reconcile loop** (`pkg/daemon/daemon_ddns.go`,
   `runDDNSReconcileLoop`): an ALWAYS-ON guarded background goroutine modeled
   on the neighbor periodic loop. It ticks on a 30s poll AND is nudged for an

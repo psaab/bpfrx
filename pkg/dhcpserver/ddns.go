@@ -264,7 +264,23 @@ func (m *DDNSManager) Reconcile(ctx context.Context, cfg *config.DHCPServerConfi
 			slog.Warn("ddns: cannot build DNS-update backend; staying no-op this cycle", "err", err)
 			up = nopUpdater{}
 		}
-		m.updater = up
+		// Do NOT replace a LIVE updater with a nop while owned records still
+		// need withdrawing. The whole-stanza removal (DynamicDNS=nil) resolves
+		// the factory to a nopUpdater (no update-server/TSIG left to build the
+		// live backend from), and the !pol.enabled branch below would then run
+		// withdrawAllLocked THROUGH the nop — dropping ownership entries while
+		// sending no real DNS delete, orphaning the records this firewall
+		// published. Keep the existing live updater for THIS withdraw cycle so
+		// the backend that published the records also withdraws them; the swap
+		// to nop happens on the next cycle once nothing is owned. (Disable via
+		// Enabled=false while keeping the backend config still resolves a live
+		// updater here, so that path is unaffected.)
+		if isNopUpdater(up) && !isNopUpdater(m.updater) && len(m.state.records) > 0 {
+			slog.Debug("ddns: keeping live updater this cycle to withdraw owned records " +
+				"before swapping to no-op")
+		} else {
+			m.updater = up
+		}
 	}
 
 	if !pol.enabled {

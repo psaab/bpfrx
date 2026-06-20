@@ -49,6 +49,13 @@ type fakeDNSServer struct {
 	conflictPrereq bool
 	conflictZones  map[string]bool
 
+	// truncateUDP, when set, marks every UDP reply Truncated so the client
+	// retries over TCP (used to exercise the TCP-retry path).
+	truncateUDP bool
+	// tcpReplyDelay stalls the TCP reply so the client's read deadline (derived
+	// from the caller ctx, post-fix) bounds the retry before the reply lands.
+	tcpReplyDelay time.Duration
+
 	addrUDP string
 	addrTCP string
 	tsig    map[string]string
@@ -67,7 +74,12 @@ func newFakeDNSServer(t *testing.T, tsig map[string]string) *fakeDNSServer {
 	if err != nil {
 		t.Fatalf("udp listen: %v", err)
 	}
-	l, err := net.Listen("tcp", "127.0.0.1:0")
+	// Bind TCP on the SAME host:port the UDP socket got (UDP and TCP are
+	// independent port namespaces), so a client that retries-over-TCP against
+	// the single configured server address reaches this server's TCP listener
+	// too — mirroring a real DNS server (UDP+TCP on :53). This makes the
+	// truncation→TCP-retry path testable end to end.
+	l, err := net.Listen("tcp", pc.LocalAddr().String())
 	if err != nil {
 		t.Fatalf("tcp listen: %v", err)
 	}
@@ -117,11 +129,24 @@ func (s *fakeDNSServer) handle(w dns.ResponseWriter, r *dns.Msg) {
 	}
 	rec.prereqs = append(rec.prereqs, r.Answer...)
 
+	overTCP := w.RemoteAddr() != nil && strings.HasPrefix(w.RemoteAddr().Network(), "tcp")
+
 	s.mu.Lock()
 	s.updates = append(s.updates, rec)
 	override, hasOverride := s.rcodeForZone[zone]
 	conflict := s.conflictPrereq && (len(s.conflictZones) == 0 || s.conflictZones[zone])
+	truncate := s.truncateUDP && !overTCP
+	tcpDelay := s.tcpReplyDelay
 	s.mu.Unlock()
+	// Mark a UDP reply Truncated to drive the client into the TCP-retry path.
+	if truncate {
+		m.Truncated = true
+	}
+	// Stall the TCP reply so the client's (caller-derived) read deadline can
+	// bound the retry before the reply lands.
+	if overTCP && tcpDelay > 0 {
+		time.Sleep(tcpDelay)
+	}
 
 	// TSIG: when the request is signed and verification FAILED, reject with
 	// NOTAUTH and an unsigned reply so the client surfaces an error (a wrong
@@ -155,6 +180,37 @@ func (s *fakeDNSServer) recorded() []recordedUpdate {
 	out := make([]recordedUpdate, len(s.updates))
 	copy(out, s.updates)
 	return out
+}
+
+// The setters below mutate handler-read fields under s.mu so tests configuring
+// the server cannot race a lingering in-flight handler goroutine (the handler
+// reads every such field under s.mu). All test configuration of the server
+// MUST go through these rather than touching the fields directly.
+
+func (s *fakeDNSServer) setRcode(zone string, rcode int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.rcodeForZone[dns.CanonicalName(zone)] = rcode
+}
+
+func (s *fakeDNSServer) clearRcode(zone string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.rcodeForZone, dns.CanonicalName(zone))
+}
+
+func (s *fakeDNSServer) setConflict(prereq bool, zones map[string]bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.conflictPrereq = prereq
+	s.conflictZones = zones
+}
+
+func (s *fakeDNSServer) setTruncate(truncate bool, tcpDelay time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.truncateUDP = truncate
+	s.tcpReplyDelay = tcpDelay
 }
 
 // testUpdater builds an rfc2136Updater pointed at the fake server, using a
@@ -353,7 +409,7 @@ func TestRFC2136TSIGWrongSecretRejectedNoLeak(t *testing.T) {
 
 func TestRFC2136PTRNotAuthIsCountedSkipNotFatal(t *testing.T) {
 	srv := newFakeDNSServer(t, nil)
-	srv.rcodeForZone["1.0.10.in-addr.arpa."] = dns.RcodeNotAuth
+	srv.setRcode("1.0.10.in-addr.arpa.", dns.RcodeNotAuth)
 	var ptr, conf int
 	u := testUpdater(t, srv, &config.DHCPDynamicDNSConfig{Enabled: true, Domain: "example.com"}, &ptr, &conf)
 
@@ -368,10 +424,9 @@ func TestRFC2136PTRNotAuthIsCountedSkipNotFatal(t *testing.T) {
 
 func TestRFC2136SkipExistingConflictSkips(t *testing.T) {
 	srv := newFakeDNSServer(t, nil)
-	srv.conflictPrereq = true
 	// Scope the collision to the forward zone so the skip count is
 	// deterministic (the reverse zone add succeeds).
-	srv.conflictZones = map[string]bool{"example.com.": true}
+	srv.setConflict(true, map[string]bool{"example.com.": true})
 	var ptr, conf int
 	u := testUpdater(t, srv, &config.DHCPDynamicDNSConfig{
 		Enabled: true, Domain: "example.com", ConflictPolicy: "skip-existing",
@@ -392,7 +447,7 @@ func TestRFC2136SkipExistingConflictSkips(t *testing.T) {
 
 func TestRFC2136StrictFailConflictErrors(t *testing.T) {
 	srv := newFakeDNSServer(t, nil)
-	srv.conflictPrereq = true
+	srv.setConflict(true, nil)
 	var ptr, conf int
 	u := testUpdater(t, srv, &config.DHCPDynamicDNSConfig{
 		Enabled: true, Domain: "example.com", ConflictPolicy: "strict-fail",
@@ -483,6 +538,12 @@ func TestNormalizeUpdateServer(t *testing.T) {
 		{"192.0.2.53:5353", "192.0.2.53:5353", false},
 		{"dns.example.com", "dns.example.com:53", false},
 		{"dns.example.com:53", "dns.example.com:53", false},
+		// IPv6: bare literal gets bracketed exactly once; a bracketed literal
+		// with no port must NOT be double-wrapped ("[[...]]:53"); host:port
+		// forms pass through unchanged.
+		{"2001:db8::1", "[2001:db8::1]:53", false},
+		{"[2001:db8::1]", "[2001:db8::1]:53", false},
+		{"[2001:db8::1]:5353", "[2001:db8::1]:5353", false},
 		{"", "", true},
 	}
 	for _, c := range cases {
@@ -527,5 +588,77 @@ func TestLongestZoneSuffix(t *testing.T) {
 	}
 	if got := longestZoneSuffix("host.other.com", zones); got != "" {
 		t.Errorf("longestZoneSuffix non-match = %q, want empty", got)
+	}
+}
+
+func TestResolveForwardZone(t *testing.T) {
+	// defaultDomain is the configured Domain; the forward zone may only be the
+	// domain when the FQDN is actually UNDER it. An out-of-domain FQDN must
+	// derive its OWN parent zone, not be misrouted into the domain.
+	u := &rfc2136Updater{defaultDomain: "example.com"}
+	cases := []struct {
+		fqdn string
+		want string
+	}{
+		// Under the domain → the domain zone.
+		{"laptop.example.com", "example.com."},
+		{"laptop.example.com.", "example.com."},
+		// The domain name itself → the domain zone.
+		{"example.com", "example.com."},
+		// OUTSIDE the domain → the FQDN's own parent (NOT example.com.).
+		{"host.other.org", "other.org."},
+		{"a.b.other.org", "b.other.org."},
+	}
+	for _, c := range cases {
+		if got := u.resolveForwardZone(c.fqdn); got != c.want {
+			t.Errorf("resolveForwardZone(%q) = %q, want %q", c.fqdn, got, c.want)
+		}
+	}
+
+	// No domain configured at all → always the FQDN's parent.
+	un := &rfc2136Updater{}
+	if got := un.resolveForwardZone("host.example.com"); got != "example.com." {
+		t.Errorf("resolveForwardZone (no domain) = %q, want example.com.", got)
+	}
+}
+
+func TestExchangeTCPRetryHonorsCallerCancellation(t *testing.T) {
+	// The truncation→TCP retry must derive its context from the CALLER's ctx,
+	// so a deadline'd reconcile pass actually bounds the in-flight retry rather
+	// than running it on a fresh context.Background() that ignores the caller's
+	// deadline.
+	//
+	// The fake server truncates the first (UDP) reply to drive the client into
+	// the *dns.Client TCP-retry branch, then STALLS the TCP reply for 2s. The
+	// caller passes a SHORT-deadline ctx (300ms). Post-fix the TCP retry's
+	// read deadline derives from the caller (miekg clamps the read deadline to
+	// ctx.Deadline()), so the retry aborts at ~300ms with an i/o timeout. Pre-
+	// fix the TCP ctx is context.Background()+u.timeout (10s), which ignores
+	// the caller deadline, so the retry waits out the 2s stall and SUCCEEDS
+	// (nil error) — the test fails pre-fix.
+	srv := newFakeDNSServer(t, nil)
+	srv.setTruncate(true, 2*time.Second)
+	var ptr, conf int
+	u := testUpdater(t, srv, &config.DHCPDynamicDNSConfig{Enabled: true, Domain: "example.com"}, &ptr, &conf)
+	// Per-exchange budget large enough that, pre-fix, the stalled TCP reply
+	// lands within u.timeout (so pre-fix returns success, not a timeout — the
+	// caller-deadline difference is the only thing the assertion observes).
+	u.timeout = 10 * time.Second
+	if cl, ok := u.client.(*dns.Client); ok {
+		cl.Timeout = 10 * time.Second
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	err := u.UpsertLease(ctx, recV4("laptop.example.com", "10.0.1.5", 300))
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("TCP retry ignored the caller deadline: returned success after the 2s stall " +
+			"(pre-fix it runs on context.Background()+u.timeout)")
+	}
+	// The caller's 300ms deadline must bound the retry well before the 2s stall.
+	if elapsed > time.Second {
+		t.Errorf("caller deadline was not honored: took %v (stall is 2s) — err=%v", elapsed, err)
 	}
 }
