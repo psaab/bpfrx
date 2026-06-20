@@ -37,9 +37,13 @@ type Engine struct {
 
 	// Compiled attributes-match regexes, keyed by the raw pattern string.
 	// Built once at Apply() time so the hot HandleEvent path never compiles
-	// a regex per event. Patterns are also validated at commit
-	// (config.ValidateConfig), so a bad pattern never reaches here; the
-	// fallback in attributesMatch is defensive only.
+	// a regex per event. Patterns are validated at COMMIT by
+	// config.ValidateEventAttributesMatch (called from CompileConfig), so a
+	// bad pattern normally never reaches here. The one exception is the
+	// tolerant LOAD path (CompileConfigLenient), which downgrades an invalid
+	// persisted pattern to a warning so an upgraded node boots through — so
+	// the skip-on-compile-failure fallback in Apply/attributesMatch is a real
+	// handler for that case, not purely defensive.
 	regexCache map[string]*regexp.Regexp
 }
 
