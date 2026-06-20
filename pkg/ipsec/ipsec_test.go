@@ -193,7 +193,8 @@ func TestBuildESPProposal_PFSOverride(t *testing.T) {
 // PFS group is configured but its proposal reference is dangling, the
 // renderer must NOT fall through to bare "default" (which drops PFS).
 // Instead it must carry the configured PFS group on a valid fallback
-// proposal that includes a cipher and integrity alg.
+// proposal that includes a cipher and integrity alg, using swanctl's
+// canonical keyword spellings.
 func TestResolveESPSettings_DanglingProposalPreservesPFS(t *testing.T) {
 	cfg := &config.IPsecConfig{
 		Policies: map[string]*config.IPsecPolicyDef{
@@ -209,9 +210,12 @@ func TestResolveESPSettings_DanglingProposalPreservesPFS(t *testing.T) {
 
 	got, lifetime := resolveESPSettings(cfg, vpn)
 	// Exact token, not a `modp` substring: a Contains("modp2048") check
-	// would also pass for an invalid no-integrity "aes256-modp2048".
-	if got != "aes256-sha256128-modp2048" {
-		t.Fatalf("resolveESPSettings dropped PFS or emitted an invalid fallback: got %q, want aes256-sha256128-modp2048", got)
+	// would also pass for an invalid no-integrity "aes256-modp2048". The
+	// integrity keyword MUST be the canonical "sha256" — strongSwan's
+	// proposal parser does not recognize the "sha256128" spelling and
+	// would discard the whole proposal.
+	if got != "aes256-sha256-modp2048" {
+		t.Fatalf("resolveESPSettings dropped PFS or emitted an invalid fallback: got %q, want aes256-sha256-modp2048", got)
 	}
 	if got == "default" {
 		t.Fatal("PFS was silently dropped to the strongSwan default")
@@ -256,7 +260,7 @@ func TestResolveESPSettings_NoPolicyStaysDefault(t *testing.T) {
 
 // TestGenerateConfig_DanglingProposalPreservesPFS checks the full render:
 // the emitted swanctl child block must carry the PFS modp group rather
-// than esp_proposals = default.
+// than esp_proposals = default, using the canonical sha256 keyword.
 func TestGenerateConfig_DanglingProposalPreservesPFS(t *testing.T) {
 	m := &Manager{configDir: "/tmp", configPath: "/tmp/xpf.conf"}
 	cfg := &config.IPsecConfig{
@@ -273,7 +277,7 @@ func TestGenerateConfig_DanglingProposalPreservesPFS(t *testing.T) {
 		},
 	}
 	got := m.generateConfig(cfg)
-	if !strings.Contains(got, "esp_proposals = aes256-sha256128-modp2048") {
+	if !strings.Contains(got, "esp_proposals = aes256-sha256-modp2048") {
 		t.Errorf("rendered config dropped PFS or used the default set:\n%s", got)
 	}
 	if strings.Contains(got, "esp_proposals = default") {

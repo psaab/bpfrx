@@ -85,7 +85,8 @@ all files stay in `package ipsec`, so the public API is unchanged.
   `resolveESPSettings` has a render-side safety net: when the policy
   resolves with a PFS group but the proposal ref dangles, it carries the
   configured PFS group on a conservative valid fallback proposal
-  (`aes256-sha256128-modp<bits>`) instead of falling through to `default`,
+  (`aes256-sha256-modp<bits>`, built with swanctl's canonical keyword
+  spellings) instead of falling through to `default`,
   and logs a warning. Note: strongSwan ≥ 6.0.2 changed its `default` ESP
   set to make PFS *optional* rather than absent, so the silent weakening is
   a downgrade-to-negotiable-PFS there rather than no-PFS — the fix is the

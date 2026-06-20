@@ -77,20 +77,21 @@ func resolveESPSettings(cfg *config.IPsecConfig, vpn *config.IPsecVPN) (string, 
 			// proposal so PFS is still negotiated. A non-AEAD (CBC) ESP
 			// transform requires an integrity algorithm, so the fallback
 			// includes both a cipher and integrity in addition to the modp
-			// term. The aes256-cbc / hmac-sha256-128 spelling normalizes to
-			// the same "aes256-sha256128-modp<bits>" token buildESPProposal
-			// emits on the normal path, so no new keyword spelling is
-			// introduced.
+			// term. The string is built directly with swanctl's canonical
+			// keyword spellings (aes256 / sha256 / modp<bits>) rather than
+			// via buildESPProposal: buildESPProposal's hmac-sha-256-128
+			// normalization emits the non-canonical "sha256128" token,
+			// which strongSwan's proposal parser does not recognize (its
+			// keyword table has only "sha256"/"sha2_256" for
+			// AUTH_HMAC_SHA2_256_128) and would reject the whole proposal.
+			// (The normal-path "sha256128" spelling is a separate
+			// pre-existing concern tracked outside #2073.)
 			if pfsGroup > 0 {
 				slog.Warn("ipsec policy references undefined proposal; "+
 					"preserving configured PFS group on fallback proposal",
 					"policy", vpn.IPsecPolicy, "proposal", propRef,
 					"pfs_group", pfsGroup)
-				fallbackProp := &config.IPsecProposal{
-					EncryptionAlg: "aes256-cbc",
-					AuthAlg:       "hmac-sha256-128",
-				}
-				return buildESPProposal(fallbackProp, pfsGroup), 0
+				return fmt.Sprintf("aes256-sha256-modp%d", dhGroupBits(pfsGroup)), 0
 			}
 		} else if prop, ok := cfg.Proposals[vpn.IPsecPolicy]; ok {
 			return buildESPProposal(prop, 0), prop.LifetimeSeconds
