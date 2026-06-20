@@ -441,6 +441,14 @@ func (d *Daemon) Run(ctx context.Context) error {
 		// addressing survive a commit that leaves it out of the config.
 		d.networkd.SetProtectedResolver(d.resolveProtectedInterfaces)
 		d.dhcpServer = dhcpserver.New()
+		// #1387 inc-2: construct the DHCP dynamic-DNS manager UNCONDITIONALLY
+		// (plan §4.2) — even when DDNS is disabled — so the always-on
+		// reconcile loop can withdraw records on an enabled→disabled commit.
+		// The nodeID is a node-stable watermark HINT only (never the
+		// delete-matching key, Inc-1 ddns.go), so an empty seed in standalone
+		// mode is harmless. The live rfc2136 backend is resolved per-Reconcile
+		// from the current policy.
+		d.ddns = dhcpserver.NewProductionDDNSManager(ddnsNodeIDSeed())
 	}
 
 	// Create the RPM manager eagerly so the pointer is stable for the
@@ -1048,6 +1056,19 @@ func (d *Daemon) Run(ctx context.Context) error {
 		}
 	}
 
+	// #1387 inc-2: start the always-on DHCP dynamic-DNS reconcile loop. It
+	// is constructed UNCONDITIONALLY (idle when disabled) so an
+	// enabled→disabled commit can still withdraw published records; the loop
+	// is file-I/O + DNS only (no control-socket contention) and is gated to
+	// the HA-active node (MASTER for >=1 RG; always-open standalone).
+	if !d.opts.NoDataplane && d.ddns != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			d.runDDNSReconcileLoop(ctx)
+		}()
+	}
+
 	// Start VRRP event watcher (manager was created earlier, before applyConfig).
 	// Uses context.Background() — the watcher must outlive daemon ctx cancel
 	// so it can process VRRP BACKUP events during shutdown (rg_active cleanup).
@@ -1149,6 +1170,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 				}
 				return nil
 			},
+			// #1387 inc-2: DHCP dynamic-DNS counters for the
+			// xpf_dhcp_ddns_* metric family. Returns nil when the
+			// manager is absent (NoDataplane), omitting the family.
+			DDNSStatsFn: d.DDNSStats,
 		}
 		// Resolve interface bindings from web-management config
 		if cfg := d.store.ActiveConfig(); cfg != nil && cfg.System.Services != nil &&
@@ -1253,6 +1278,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 				}
 				return nil
 			},
+			// #1387 inc-2: DHCP dynamic-DNS status sources for the
+			// `show ... dhcp-server dynamic-dns` ShowText topics.
+			DDNSStatsFn:        d.DDNSStats,
+			DDNSOwnedRecordsFn: d.OwnedDDNSRecords,
 			// gRPC commits sync to cluster peer atomically inside
 			// the apply lock so the peer can never observe an apply
 			// that hasn't yet been propagated.
@@ -1367,6 +1396,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 			}
 			return nil
 		})
+		// #1387 inc-2: DHCP dynamic-DNS status hooks for the in-process CLI.
+		shell.SetDDNSStatsFn(d.DDNSStats)
+		shell.SetDDNSOwnedRecordsFn(d.OwnedDDNSRecords)
 		shell.SetVRRPManager(d.vrrpMgr)
 		shell.SetFabricPeer(func() []string {
 			var addrs []string

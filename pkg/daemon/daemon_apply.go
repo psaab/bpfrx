@@ -1105,6 +1105,14 @@ func (d *Daemon) applyConfigLocked(cfg *config.Config) error {
 		}
 	}
 
+	// #1387 inc-2: nudge the DDNS reconcile loop so a commit that changes the
+	// dynamic-dns policy (enable/disable, backend, zone, TSIG) takes effect
+	// immediately rather than waiting up to one poll interval. The nudge is a
+	// non-blocking depth-1 send (no control-socket call here — the loop does
+	// file I/O + DNS only), so it never blocks the apply path. A
+	// disabled/removed block drives withdrawAllLocked on the next pass.
+	d.nudgeDDNSReconcile()
+
 	// 7b. Reconcile DHCP clients (#1793): start clients for units that
 	// gained dhcp/dhcpv6 in this commit, stop clients for units that
 	// lost it, restart clients whose options changed. The diff keys on
