@@ -387,35 +387,44 @@ fn tcp_segment_consumed_len(frame: &[u8], parsed: TcpReplySource) -> Option<u32>
         len = len.wrapping_add(1);
     }
     let ip = frame.get(parsed.l3..)?;
-    let (ip_hdr_len, l4_total) = match parsed.addr_family as i32 {
+    // Offset (from frame start) of the end of the IP datagram, derived
+    // from the IP length field. For IPv6, payload_len covers everything
+    // after the 40-byte base header — INCLUDING any extension headers —
+    // so the TCP payload must be measured from the real TCP header start
+    // (frame_l4_offset walks the ext-header chain), not by subtracting a
+    // fixed 40 bytes. Doing the latter over-counts the segment length by
+    // the ext-header span and inflates the RST ack (a no-ACK v6 segment
+    // with ext headers would then carry an unacceptable ack → the client
+    // discards the RST → the reject silently degrades to a drop).
+    let ip_datagram_end = match parsed.addr_family as i32 {
         libc::AF_INET => {
             if ip.len() < 20 {
                 return None;
             }
-            let ihl = ((ip[0] & 0x0f) as usize) * 4;
             let total = u16::from_be_bytes([ip[2], ip[3]]) as usize;
-            (ihl, total.checked_sub(ihl)?)
+            parsed.l3.checked_add(total)?
         }
         libc::AF_INET6 => {
             if ip.len() < 40 {
                 return None;
             }
-            // payload_len already excludes the 40-byte base header; for a
-            // bare TCP (no ext headers) this is the TCP segment length.
             let payload = u16::from_be_bytes([ip[4], ip[5]]) as usize;
-            (40usize, payload)
+            parsed.l3.checked_add(40)?.checked_add(payload)?
         }
         _ => return None,
     };
-    let _ = ip_hdr_len;
-    // TCP data offset (header length) from the inbound segment.
+    // TCP header start (after IPv6 ext headers, if any) and length from
+    // the inbound segment's data-offset field.
     let l4 = frame_l4_offset(frame, parsed.addr_family)?;
     let tcp = frame.get(l4..l4 + TCP_MIN_HEADER_LEN)?;
     let tcp_hdr_len = ((tcp[12] >> 4) as usize) * 4;
     if tcp_hdr_len < TCP_MIN_HEADER_LEN {
         return None;
     }
-    let payload_len = l4_total.saturating_sub(tcp_hdr_len);
+    let tcp_data_start = l4.checked_add(tcp_hdr_len)?;
+    // saturating_sub guards a truncated/malformed length field; a normal
+    // segment has ip_datagram_end >= tcp_data_start.
+    let payload_len = ip_datagram_end.saturating_sub(tcp_data_start);
     Some(len.wrapping_add(payload_len as u32))
 }
 
