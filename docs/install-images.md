@@ -247,8 +247,13 @@ first boot, automatically**:
 
 This restores exactly what the stock cloudimg's cloud-init
 `growpart`/`resizefs` modules did before the bake purged cloud-init —
-a known-good, expected-of-every-cloud-image behavior — using the tools
-already in the image (`cloud-utils-growpart` + `e2fsprogs`).
+a known-good, expected-of-every-cloud-image behavior — using `growpart`
+(from `cloud-guest-utils`) and `resize2fs` (from `e2fsprogs`). The bake
+installs both EXPLICITLY (in `RUNTIME_PACKAGES` and the `xpf-appliance`
+metapackage `Depends`): `growpart` is only in the stock cloudimg via
+cloud-init, so the cloud-init purge + `apt autoremove` would otherwise
+remove it. A bake-time `command -v growpart` assert fails the build if
+the provider is ever missing.
 
 **Why `growpart`/`resize2fs` and not `systemd-repart`:** they can only
 *grow a partition's end into adjacent free space* and *grow* an ext4

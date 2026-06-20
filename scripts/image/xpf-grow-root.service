@@ -3,8 +3,10 @@
 # First-boot-only one-shot: grow the root partition + ext4 filesystem to
 # fill an operator-resized disk, then stamp /etc/xpf/.root-grown so it
 # never runs again. Restores the cloud-init growpart/resizefs behavior
-# the bake purged. Uses growpart + resize2fs (already in the image) — NOT
-# systemd-repart — so it CANNOT create/reformat/shrink/move a partition.
+# the bake purged. Uses growpart + resize2fs (explicitly installed by the bake
+# via cloud-guest-utils + e2fsprogs — the cloud-init purge would otherwise
+# remove the growpart provider) — NOT systemd-repart — so it CANNOT
+# create/reformat/shrink/move a partition.
 #
 # Safety (see the wrapper header + #1925 §6.3): the root partition is the
 # physically LAST partition; growing it into trailing free space cannot

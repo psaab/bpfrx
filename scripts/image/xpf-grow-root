@@ -9,8 +9,12 @@
 # 8 GiB bake (incus -d root,size=40GiB / qemu-img resize / a bigger
 # libvirt volume), then grow the ext4 filesystem to match.
 #
-# Mechanism (Path A): growpart + resize2fs, both already present in the
-# baked Ubuntu image (cloud-utils-growpart + e2fsprogs). They CANNOT
+# Mechanism (Path A): growpart + resize2fs. growpart ships in
+# cloud-guest-utils and resize2fs in e2fsprogs; the bake EXPLICITLY installs
+# both (RUNTIME_PACKAGES + the xpf-appliance metapackage Depends) because the
+# cloud-init purge + apt autoremove would otherwise orphan and remove the
+# growpart provider (it is only present in the stock cloudimg via cloud-init).
+# A bake-time `command -v growpart` assert guards against that regressing. They CANNOT
 # create, reformat, shrink, or move a partition by construction — the
 # lowest data-loss surface, deliberately chosen over systemd-repart
 # (which would add a package and a reformat-capable repart.d surface).
