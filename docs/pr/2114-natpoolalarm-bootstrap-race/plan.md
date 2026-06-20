@@ -1,12 +1,14 @@
 # #2114 — NAT pool-alarm monitor races `d.dp = nil` in bootstrap-exit
 
-**Status:** DRAFT v3 — Codex r2 PLAN-NEEDS-MAJOR addressed. v2's
-runtime-mutated `d.natPoolAlarm` pointer is itself read unsynchronized by
-`natPoolAlarms()` on the gRPC/CLI `show security alarms` render path,
-racing the new start/discard writes. v3 makes the pointer
-`atomic.Pointer[natpoolalarm.Monitor]` and routes ALL access through
-helpers (`maybeStartNATPoolAlarm`, `stopAndDiscardNATPoolAlarm`,
-`natPoolAlarms`, shutdown). Now FOUR edits.
+**Status:** PLAN-READY (v4) — Codex converged: r1 NEEDS-MAJOR
+(rollback→re-arm race) → r2 NEEDS-MAJOR (natPoolAlarm pointer race) →
+r3 NEEDS-MINOR (all minor folded in v4: `d.dp==nil` in the helper
+guard; test assertions use `.Load()`; part-(c) clears bootstrap before
+re-arm). Independent second reviewer (Gemini) is UNAVAILABLE (client
+deprecated); parent should dispatch an independent review. v4 makes the
+pointer `atomic.Pointer[natpoolalarm.Monitor]` and routes ALL access
+through helpers (`maybeStartNATPoolAlarm`, `stopAndDiscardNATPoolAlarm`,
+`natPoolAlarms`, shutdown). FIVE edits (0-4).
 
 ## Issue framing
 
@@ -128,7 +130,13 @@ Helpers (in `daemon_natpoolalarm.go`):
 // background-services block and from runBootstrapExitStartup's success
 // branch.
 func (d *Daemon) maybeStartNATPoolAlarm() {
-    if d.opts.NoDataplane || d.inBootstrap() {
+    // Gate: no dataplane backend, in bootstrap (unarmed dp / pending
+    // d.dp=nil write), or no constructed dp object → do not start. The
+    // d.dp==nil check is added per Codex r3: the plan says
+    // "dataplane-armed", and even though every current caller already
+    // enforces it, making the helper self-contained prevents a future
+    // caller from launching a sampler with no dp.
+    if d.opts.NoDataplane || d.inBootstrap() || d.dp == nil {
         return
     }
     if d.natPoolAlarm.Load() != nil {
@@ -365,10 +373,18 @@ d.stopAndDiscardNATPoolAlarm()
      successful bootstrap-exit arm), call `enterBootstrapMode` (the
      real method, via the `applyBodyForTest` seam so it skips
      fs/FRR/dataplane teardown but still runs the Stop+discard), assert
-     `d.natPoolAlarm == nil`, then concurrently write `d.dp = nil`
-     (the re-arm-failure write) — no sampler survives, so no race.
-   - **(c) re-arm builds fresh:** after the discard, `maybeStartNATPoolAlarm`
-     constructs a new monitor (Swap/Load-guard) and starts it.
+     `d.natPoolAlarm.Load() == nil` (atomic field — NOT `== nil`), then
+     concurrently write `d.dp = nil` (the re-arm-failure write) — no
+     sampler survives, so no race. Note `enterBootstrapMode` also sets
+     `bootstrapMode=true`, so the helper is gated off afterward.
+   - **(c) re-arm builds fresh:** mimic production re-arm ordering —
+     clear bootstrap mode (`d.bootstrapMode.Store(false)`, as
+     `exitBootstrapMode` does before `runBootstrapExitStartup`) BEFORE
+     calling `maybeStartNATPoolAlarm`, then assert
+     `d.natPoolAlarm.Load() != nil` (a FRESH monitor was built). Also
+     assert that calling `maybeStartNATPoolAlarm` while still in
+     bootstrap (after the part-(b) `enterBootstrapMode`) is a no-op
+     (`Load() == nil`).
    - **(d) pointer-publication race (Codex r2):** concurrently hammer
      `natPoolAlarms()` (the `show security alarms` reader) from N
      goroutines while another goroutine repeatedly
