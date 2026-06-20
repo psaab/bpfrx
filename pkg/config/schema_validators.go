@@ -307,6 +307,75 @@ func parseCIDRStrict(raw, example string) (net.IP, error) {
 	return ip, nil
 }
 
+// routeFilterMatchTypes are the match-type keywords accepted in a
+// `from route-filter <prefix> <match-type>` node. The schema node is
+// args:2, so the walker invokes ValidateRouteFilterArg for BOTH identity
+// tokens (the prefix AND the match-type — Keys[1:3]); the validator must
+// therefore accept a match-type keyword as well as a CIDR prefix.
+//
+// exact/longer/orlonger/upto are the rendered match-types (pkg/frr
+// policy_render.go). prefix-length-range and through are ADMITTED but
+// not yet rendered (a separate deferred follow-up). They are admitted
+// rather than rejected because they commit fine today (there was no
+// validator before #2105), so rejecting them would be a grammar
+// regression breaking configs already on the wire; their default render
+// (le 32 / le 128) is FRR-valid even at a max-length prefix.
+var routeFilterMatchTypes = map[string]bool{
+	"exact":               true,
+	"longer":              true,
+	"orlonger":            true,
+	"upto":                true,
+	"prefix-length-range": true,
+	"through":             true,
+}
+
+// ValidateRouteFilterArg is the #2105 commit-check validator for a
+// `policy-options policy-statement <p> term <t> from route-filter
+// <prefix> <match-type>` identity arg token. The node is args:2, so the
+// walker (schema_walk.go) calls this for the prefix token AND the
+// match-type token. The `upto /N` length token lands as a CHILD of the
+// route-filter node, never in Keys[1:3], so it does not reach here.
+//
+// A token is accepted when it is either a match-type keyword OR a
+// syntactically valid CIDR prefix (v4 or v6 — route-filter is
+// family-agnostic). A malformed prefix (no "/", non-numeric mask, or an
+// out-of-range mask) that is neither is REJECTED, so it never reaches
+// the FRR renderer where it would produce an FRR-invalid prefix-list
+// line and could fail the whole managed frr-reload.
+//
+// Strictness is automatic: SchemaValidate is strict on the operator
+// commit / commit-check path and lenient (warn, not fail) on Store.Load
+// / SyncApply (the #1960 lenient-downgrade-on-load doctrine), so a
+// prefix persisted by an older binary never blackouts boot. The renderer
+// carries a belt-and-suspenders skip for any malformed prefix that
+// reaches it via that lenient path.
+//
+// Known limitation: the validator is position-agnostic (the walker does
+// not tell it which slot a token came from), so a match-type keyword in
+// the prefix slot (e.g. `route-filter longer exact`) is accepted. This
+// is strictly better than the pre-#2105 state (any garbage committed)
+// and catches the real malformed-CIDR case; per-position validation
+// would require schema restructuring and is deferred.
+func ValidateRouteFilterArg(raw string, _ *Config) error {
+	tok := strings.TrimSpace(raw)
+	if tok == "" {
+		return fmt.Errorf("missing route-filter prefix (expected CIDR, e.g. 10.0.0.0/24)")
+	}
+	if routeFilterMatchTypes[tok] {
+		return nil
+	}
+	// Family-agnostic CIDR. parseCIDRStrict requires a /prefix-length
+	// and upgrades the common operator mistakes (bare IP, garbage) to
+	// targeted messages, matching the ValidateIPv4CIDR/ValidateIPv6CIDR
+	// convention; the returned IP is discarded because both families are
+	// valid here. Surface parseCIDRStrict's targeted message (e.g.
+	// "missing /prefix-length") so the commit-check failure is actionable.
+	if _, err := parseCIDRStrict(tok, "10.0.0.0/24"); err != nil {
+		return fmt.Errorf("not a valid route-filter prefix (expected a CIDR, e.g. 10.0.0.0/24 or 2001:db8::/32, or a match-type keyword): %v", err)
+	}
+	return nil
+}
+
 // validateForwardingClassRef is the #1319 PR 3 tree-based
 // cross-reference validator for `firewall family inet/inet6 filter
 // <f> term <t> then forwarding-class <name>`. The dataplane resolves

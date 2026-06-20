@@ -18,6 +18,7 @@ package frr
 
 import (
 	"fmt"
+	"net"
 	"sort"
 	"strconv"
 	"strings"
@@ -593,24 +594,103 @@ func (m *Manager) generatePolicyOptions(po *config.PolicyOptionsConfig) string {
 			// Generate an inline prefix-list for route-filters
 			if len(term.RouteFilters) > 0 {
 				plName := name + "-" + term.Name
+				// matchV6 selects the address family of the post-loop
+				// "match ip/ipv6 address prefix-list" line. It is taken
+				// from the first EMITTED entry when there is one, else from
+				// the first route-filter with a parseable family (a
+				// #2103-skipped /32 longer still names a real family), else
+				// defaults to v4 — mirroring the term.PrefixList branch's
+				// "unknown/empty defaults to IPv4". The match line is
+				// ALWAYS emitted (see below).
+				matchV6 := false
+				matchFamilyKnown := false
+				// emitted counts the prefix-list entries actually written.
+				// A #2103-skipped (/32 longer, empty set) or #2105-malformed
+				// entry writes NO "ip prefix-list" line, so the list may end
+				// up with zero entries — and we intentionally never
+				// materialise a count==0 list (FRR treats a count==0
+				// prefix-list as PREFIX_PERMIT / match-ALL). The match line
+				// still references the (then-undefined) list name: in FRR a
+				// "match … prefix-list <name>" against a name with no
+				// "ip prefix-list <name>" lines resolves to NULL →
+				// RMAP_NOMATCH (DENY), so an all-skipped term matches
+				// NOTHING and stays fail-closed. Suppressing the match line
+				// instead would leave a bare "route-map … permit <seq>" with
+				// no match clauses, which FRR treats as match-ALL — flipping
+				// "/32 longer" from the empty set to permit-everything
+				// (Copilot #2110). This mirrors the existing
+				// term.PrefixList branch, which also emits a match line for
+				// an unknown/empty list.
+				emitted := 0
 				for i, rf := range term.RouteFilters {
+					isV6 := strings.Contains(rf.Prefix, ":")
 					matchStr := "le 32"
-					if strings.Contains(rf.Prefix, ":") {
+					if isV6 {
 						matchStr = "le 128"
+					}
+					// skipEntry suppresses this route-filter's prefix-list
+					// line entirely (match-nothing for this entry) rather
+					// than emitting an FRR-invalid line. Set by the #2103
+					// max-length "longer" guard and the #2105 malformed-
+					// prefix belt below.
+					skipEntry := false
+					// #2105 render-side belt-and-suspenders: a malformed
+					// prefix must NEVER reach an FRR line. The commit-time
+					// keyValidator (ValidateRouteFilterArg) rejects these on
+					// the strict path, but the lenient-on-load path
+					// (Store.Load / SyncApply, #1960) can still feed a stored
+					// pre-gate garbage prefix to the renderer. Use the SAME
+					// net.ParseCIDR check as the commit validator so the
+					// belt's coverage matches it exactly: this catches a bad
+					// address (999.999.999.999/24, foo:bar/24), a missing
+					// "/", a non-numeric mask, AND an out-of-family-range mask
+					// (a v4 /40 or /99, a v6 /200) — none of which a bare
+					// mask-only Atoi would catch. A valid CIDR (any v4/v6
+					// prefix the operator could legitimately configure) is
+					// never skipped.
+					if _, _, err := net.ParseCIDR(rf.Prefix); err != nil {
+						skipEntry = true
+					} else if !matchFamilyKnown {
+						// First route-filter with a PARSEABLE prefix sets the
+						// match-line family — even if this entry is later
+						// skipped for being a max-length "longer" (a /32 longer
+						// names a real v4 family). An emitted entry overrides
+						// this below, but for an all-skipped term this is the
+						// best family signal we have. Stays v4 (the default)
+						// only when no entry is parseable.
+						matchV6 = isV6
+						matchFamilyKnown = true
 					}
 					switch rf.MatchType {
 					case "exact":
 						matchStr = ""
 					case "longer":
-						// longer = strictly more specific (not the prefix itself)
+						// longer = strictly more specific (the prefix itself
+						// EXCLUDED). For a max-length prefix (/32 v4, /128
+						// v6) there are no more-specifics, so "longer" is the
+						// EMPTY set — skip the entry rather than emit an
+						// FRR-invalid "ge plen+1 le maxLen" line. For /32
+						// that is "ge 33 le 32": ge 33 fails the FRR YANG
+						// range (0..32) AND ge > le, and a rejected line can
+						// fail the whole frr-reload (frr-reload.py applies
+						// the add-batch via a single vtysh -f and exits
+						// non-zero on any CMD_WARNING_CONFIG_FAILED). Mirrors
+						// the upto plen>=maxLen guard (#2102) and closes
+						// #2103. Boundary: plen+1 > maxLen skips ONLY
+						// plen==maxLen — /31 still emits "ge 32 le 32" (one
+						// legal more-specific).
 						parts := strings.SplitN(rf.Prefix, "/", 2)
 						if len(parts) == 2 {
 							if plen, err := strconv.Atoi(parts[1]); err == nil {
 								maxLen := 32
-								if strings.Contains(rf.Prefix, ":") {
+								if isV6 {
 									maxLen = 128
 								}
-								matchStr = fmt.Sprintf("ge %d le %d", plen+1, maxLen)
+								if plen+1 > maxLen {
+									skipEntry = true
+								} else {
+									matchStr = fmt.Sprintf("ge %d le %d", plen+1, maxLen)
+								}
 							}
 						}
 					case "orlonger":
@@ -686,7 +766,14 @@ func (m *Manager) generatePolicyOptions(po *config.PolicyOptionsConfig) string {
 							}
 						}
 					}
-					if strings.Contains(rf.Prefix, ":") {
+					if skipEntry {
+						// #2103/#2105: emit no prefix-list line for this
+						// entry. Its seq slot (i+1)*5 is simply not used;
+						// gaps in seq are FRR-legal and keep the remaining
+						// entries' seq stable across a config edit.
+						continue
+					}
+					if isV6 {
 						fmt.Fprintf(&b, "ipv6 prefix-list %s seq %d permit %s", plName, (i+1)*5, rf.Prefix)
 					} else {
 						fmt.Fprintf(&b, "ip prefix-list %s seq %d permit %s", plName, (i+1)*5, rf.Prefix)
@@ -695,8 +782,31 @@ func (m *Manager) generatePolicyOptions(po *config.PolicyOptionsConfig) string {
 						fmt.Fprintf(&b, " %s", matchStr)
 					}
 					b.WriteString("\n")
+					if emitted == 0 {
+						// The first EMITTED entry is the most authoritative
+						// family signal; override the parseable-skipped hint.
+						matchV6 = isV6
+						matchFamilyKnown = true
+					}
+					emitted++
 				}
-				if strings.Contains(term.RouteFilters[0].Prefix, ":") {
+				// ALWAYS emit the match line for a term that declares any
+				// route-filter. When entries were emitted it references the
+				// populated prefix-list. When ALL entries were skipped
+				// (every route-filter is a max-length "longer" empty set, or
+				// every prefix is malformed) the list name is never created,
+				// so this references an UNDEFINED prefix-list → FRR resolves
+				// it to NULL → RMAP_NOMATCH (DENY): the term matches NOTHING
+				// and stays fail-closed. Suppressing the match line here
+				// would leave a bare "route-map … permit <seq>" with no match
+				// clauses, which FRR treats as match-ALL — flipping
+				// "/32 longer" from the empty set to permit-everything
+				// (Copilot #2110). This mirrors the term.PrefixList branch,
+				// which likewise emits a match line for an unknown list.
+				// Family: the first emitted entry, else the first parseable
+				// (possibly skipped) route-filter, else v4 (the
+				// term.PrefixList "unknown/empty defaults to IPv4" default).
+				if matchV6 {
 					fmt.Fprintf(&b, " match ipv6 address prefix-list %s\n", plName)
 				} else {
 					fmt.Fprintf(&b, " match ip address prefix-list %s\n", plName)

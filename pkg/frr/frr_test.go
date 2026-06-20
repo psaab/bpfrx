@@ -2631,6 +2631,270 @@ func TestRouteFilterUpto_MixedFamilyTerm(t *testing.T) {
 	}
 }
 
+// rfPolicyOptions builds a one-term policy "p"/"t1" carrying the given
+// route-filters (verbatim — no implicit upto length), for the #2103/#2105
+// render tests. The prefix-list name the renderer derives is "p-t1".
+func rfPolicyOptions(rfs ...*config.RouteFilter) *config.PolicyOptionsConfig {
+	return &config.PolicyOptionsConfig{
+		PrefixLists: map[string]*config.PrefixList{},
+		Communities: map[string]*config.CommunityDef{},
+		ASPaths:     map[string]*config.ASPathDef{},
+		PolicyStatements: map[string]*config.PolicyStatement{
+			"p": {
+				Name: "p",
+				Terms: []*config.PolicyTerm{
+					{Name: "t1", RouteFilters: rfs, Action: "accept"},
+				},
+				DefaultAction: "reject",
+			},
+		},
+	}
+}
+
+// TestRouteFilterLongerFRR covers #2103: the "longer" match-type must
+// skip a max-length prefix (no more-specifics exist → empty set) rather
+// than emit an FRR-invalid "ge plen+1 le maxLen" line, while still
+// rendering the valid "ge plen+1 le maxLen" for every shorter prefix.
+func TestRouteFilterLongerFRR(t *testing.T) {
+	// #2103 core: /32 longer must emit NO "ip prefix-list ... permit"
+	// entry (the empty set), but the term MUST still emit the "match ...
+	// prefix-list" line referencing the (then-undefined) list name. In
+	// FRR a match against an undefined prefix-list → NULL → RMAP_NOMATCH
+	// (DENY), so the term matches nothing and stays fail-closed.
+	// Suppressing the match line would leave a bare "permit <seq>" with no
+	// match clauses, which FRR treats as match-ALL (Copilot #2110). The
+	// list name itself must NEVER be materialised with zero entries — a
+	// count==0 prefix-list is FRR PREFIX_PERMIT (match-ALL).
+	t.Run("v4_max_length_longer_skips_entry_keeps_match", func(t *testing.T) {
+		got := New().generatePolicyOptions(rfPolicyOptions(
+			&config.RouteFilter{Prefix: "10.0.0.0/32", MatchType: "longer"}))
+		if strings.Contains(got, "ge 33") {
+			t.Errorf("/32 longer must NOT emit FRR-invalid 'ge 33', got:\n%s", got)
+		}
+		if strings.Contains(got, "permit 10.0.0.0/32") {
+			t.Errorf("/32 longer must emit NO prefix-list entry, got:\n%s", got)
+		}
+		// The match line MUST be present (fail-closed via undefined list).
+		if !strings.Contains(got, "match ip address prefix-list p-t1\n") {
+			t.Errorf("all-skipped term MUST emit the match line (fail-closed), got:\n%s", got)
+		}
+		// But NO "ip prefix-list p-t1 ... permit" entry materialises the list.
+		if strings.Contains(got, "ip prefix-list p-t1 seq") {
+			t.Errorf("all-skipped term must NOT materialise a prefix-list entry, got:\n%s", got)
+		}
+	})
+
+	t.Run("v6_max_length_longer_skips_entry_keeps_match", func(t *testing.T) {
+		got := New().generatePolicyOptions(rfPolicyOptions(
+			&config.RouteFilter{Prefix: "2001:db8::1/128", MatchType: "longer"}))
+		if strings.Contains(got, "ge 129") {
+			t.Errorf("/128 longer must NOT emit FRR-invalid 'ge 129', got:\n%s", got)
+		}
+		if strings.Contains(got, "permit 2001:db8::1/128") {
+			t.Errorf("/128 longer must emit NO prefix-list entry, got:\n%s", got)
+		}
+		// Family is derived from the parseable (skipped) v6 entry → the
+		// match line must be the v6 matcher, fail-closed.
+		if !strings.Contains(got, "match ipv6 address prefix-list p-t1\n") {
+			t.Errorf("all-skipped v6 term MUST emit the v6 match line, got:\n%s", got)
+		}
+		if strings.Contains(got, "ipv6 prefix-list p-t1 seq") {
+			t.Errorf("all-skipped v6 term must NOT materialise a prefix-list entry, got:\n%s", got)
+		}
+	})
+
+	// Boundary: /31 has exactly one more-specific (/32), so "longer"
+	// renders the FRR-VALID "ge 32 le 32". The fix must NOT over-skip /31.
+	t.Run("v4_slash31_longer_emits_ge32_le32", func(t *testing.T) {
+		got := New().generatePolicyOptions(rfPolicyOptions(
+			&config.RouteFilter{Prefix: "10.0.0.0/31", MatchType: "longer"}))
+		if !strings.Contains(got, "ip prefix-list p-t1 seq 5 permit 10.0.0.0/31 ge 32 le 32\n") {
+			t.Errorf("/31 longer must emit valid 'ge 32 le 32', got:\n%s", got)
+		}
+	})
+
+	t.Run("v6_slash127_longer_emits_ge128_le128", func(t *testing.T) {
+		got := New().generatePolicyOptions(rfPolicyOptions(
+			&config.RouteFilter{Prefix: "2001:db8::/127", MatchType: "longer"}))
+		if !strings.Contains(got, "ipv6 prefix-list p-t1 seq 5 permit 2001:db8::/127 ge 128 le 128\n") {
+			t.Errorf("/127 longer must emit valid 'ge 128 le 128', got:\n%s", got)
+		}
+	})
+
+	// Controls: ordinary prefixes are UNCHANGED by the fix.
+	t.Run("v4_slash24_longer_unchanged", func(t *testing.T) {
+		got := New().generatePolicyOptions(rfPolicyOptions(
+			&config.RouteFilter{Prefix: "10.0.0.0/24", MatchType: "longer"}))
+		if !strings.Contains(got, "ip prefix-list p-t1 seq 5 permit 10.0.0.0/24 ge 25 le 32\n") {
+			t.Errorf("/24 longer must still emit 'ge 25 le 32', got:\n%s", got)
+		}
+	})
+
+	t.Run("v6_slash64_longer_unchanged", func(t *testing.T) {
+		got := New().generatePolicyOptions(rfPolicyOptions(
+			&config.RouteFilter{Prefix: "2001:db8::/64", MatchType: "longer"}))
+		if !strings.Contains(got, "ipv6 prefix-list p-t1 seq 5 permit 2001:db8::/64 ge 65 le 128\n") {
+			t.Errorf("/64 longer must still emit 'ge 65 le 128', got:\n%s", got)
+		}
+	})
+
+	// Mixed term (#2103/#2105 F1/F6): a skipped /32 longer at index 0
+	// followed by a valid /24 longer at index 1. The /24 keeps its
+	// seq 10 (gaps are FRR-legal; remaining entries are NOT renumbered),
+	// and the term still emits a match line.
+	t.Run("mixed_skipped_then_valid_keeps_seq_and_match", func(t *testing.T) {
+		got := New().generatePolicyOptions(rfPolicyOptions(
+			&config.RouteFilter{Prefix: "10.0.0.0/32", MatchType: "longer"},
+			&config.RouteFilter{Prefix: "10.0.0.0/24", MatchType: "longer"}))
+		if strings.Contains(got, "permit 10.0.0.0/32") {
+			t.Errorf("index-0 /32 longer must be skipped, got:\n%s", got)
+		}
+		if !strings.Contains(got, "ip prefix-list p-t1 seq 10 permit 10.0.0.0/24 ge 25 le 32\n") {
+			t.Errorf("index-1 /24 longer must keep seq 10, got:\n%s", got)
+		}
+		if !strings.Contains(got, "match ip address prefix-list p-t1\n") {
+			t.Errorf("mixed term with a surviving entry must emit the match line, got:\n%s", got)
+		}
+	})
+
+	// Mixed family (#2103/#2105 F6): a skipped v4 /32 longer at index 0
+	// followed by a valid v6 entry. The match line family must be derived
+	// from the EMITTED v6 entry — "match ipv6", never "match ip" (which
+	// would reference a v4-namespace list that has zero entries → a
+	// silent wrong-namespace DENY of a legitimate term).
+	t.Run("mixed_family_match_line_follows_emitted_v6", func(t *testing.T) {
+		got := New().generatePolicyOptions(rfPolicyOptions(
+			&config.RouteFilter{Prefix: "10.0.0.0/32", MatchType: "longer"},
+			&config.RouteFilter{Prefix: "2001:db8::/64", MatchType: "orlonger"}))
+		if !strings.Contains(got, "ipv6 prefix-list p-t1 seq 10 permit 2001:db8::/64 le 128\n") {
+			t.Errorf("v6 orlonger entry missing, got:\n%s", got)
+		}
+		if !strings.Contains(got, "match ipv6 address prefix-list p-t1\n") {
+			t.Errorf("match line must be 'match ipv6' (from the emitted v6 entry), got:\n%s", got)
+		}
+		if strings.Contains(got, "match ip address prefix-list p-t1\n") {
+			t.Errorf("must NOT emit 'match ip' for a v6-only emitted list, got:\n%s", got)
+		}
+	})
+}
+
+// TestRouteFilterOrlongerMaxLengthValid is the #2102/#2105 F2 control:
+// "orlonger /32" renders a bare "le 32" (le == prefix-len), which is
+// FRR-VALID (only strictly-less le/ge is rejected). It proves the #2103
+// longer fix did NOT touch orlonger and documents the valid equality.
+func TestRouteFilterOrlongerMaxLengthValid(t *testing.T) {
+	got := New().generatePolicyOptions(rfPolicyOptions(
+		&config.RouteFilter{Prefix: "10.0.0.0/32", MatchType: "orlonger"}))
+	if !strings.Contains(got, "ip prefix-list p-t1 seq 5 permit 10.0.0.0/32 le 32\n") {
+		t.Errorf("orlonger /32 must still emit valid 'le 32', got:\n%s", got)
+	}
+	if !strings.Contains(got, "match ip address prefix-list p-t1\n") {
+		t.Errorf("orlonger /32 term must emit a match line, got:\n%s", got)
+	}
+}
+
+// TestRouteFilterMalformedPrefixBelt covers the #2105 render-side
+// belt-and-suspenders: a malformed prefix (which the commit validator
+// rejects, but the lenient load/HA-sync path can still feed to the
+// renderer) must NEVER produce an FRR prefix-list ENTRY. A lone
+// malformed prefix still emits the match line (fail-closed via an
+// undefined list → NOMATCH → DENY); a valid prefix alongside it
+// survives.
+func TestRouteFilterMalformedPrefixBelt(t *testing.T) {
+	t.Run("lone_no_mask_emits_no_entry", func(t *testing.T) {
+		got := New().generatePolicyOptions(rfPolicyOptions(
+			&config.RouteFilter{Prefix: "10.0.0.0", MatchType: "exact"}))
+		if strings.Contains(got, "permit 10.0.0.0") {
+			t.Errorf("malformed prefix (no mask) must emit no permit line, got:\n%s", got)
+		}
+		if strings.Contains(got, "prefix-list p-t1 seq") {
+			t.Errorf("lone malformed prefix must NOT materialise a prefix-list entry, got:\n%s", got)
+		}
+		if !strings.Contains(got, "address prefix-list p-t1\n") {
+			t.Errorf("lone malformed prefix must still emit the fail-closed match line, got:\n%s", got)
+		}
+	})
+
+	t.Run("lone_bad_mask_emits_no_entry", func(t *testing.T) {
+		got := New().generatePolicyOptions(rfPolicyOptions(
+			&config.RouteFilter{Prefix: "10.0.0.0/99", MatchType: "orlonger"}))
+		if strings.Contains(got, "permit 10.0.0.0/99") {
+			t.Errorf("out-of-range mask must emit no permit line, got:\n%s", got)
+		}
+		if strings.Contains(got, "prefix-list p-t1 seq") {
+			t.Errorf("out-of-range mask must NOT materialise a prefix-list entry, got:\n%s", got)
+		}
+	})
+
+	// Bad ADDRESS with an in-range MASK must also be skipped. A mask-only
+	// check (Atoi on the mask) would pass these and emit an FRR-invalid
+	// line; the belt uses net.ParseCIDR (same as the commit validator) so
+	// the whole CIDR is validated, not just the mask.
+	t.Run("bad_octet_in_range_mask_emits_nothing", func(t *testing.T) {
+		for _, bad := range []string{
+			"999.999.999.999/24", // out-of-range v4 octets, valid mask
+			"10.0.0.0.0/8",       // five octets
+			"abcd/16",            // not an address at all
+		} {
+			got := New().generatePolicyOptions(rfPolicyOptions(
+				&config.RouteFilter{Prefix: bad, MatchType: "orlonger"}))
+			if strings.Contains(got, "permit "+bad) {
+				t.Errorf("bad-address prefix %q must emit no permit line, got:\n%s", bad, got)
+			}
+			// No prefix-list ENTRY materialises (a count==0 list is FRR
+			// match-ALL); but the term still emits the match line so it is
+			// fail-closed (undefined list → NOMATCH → DENY).
+			if strings.Contains(got, "prefix-list p-t1 seq") {
+				t.Errorf("lone bad-address prefix %q must NOT materialise a prefix-list entry, got:\n%s", bad, got)
+			}
+			if !strings.Contains(got, "match ") || !strings.Contains(got, "address prefix-list p-t1\n") {
+				t.Errorf("lone bad-address prefix %q must still emit the fail-closed match line, got:\n%s", bad, got)
+			}
+		}
+	})
+
+	// A colon-bearing garbage token (the isV6 heuristic would treat it as
+	// v6) with an in-range mask must NOT slip through as an "ipv6
+	// prefix-list ... permit foo:bar/24" line. net.ParseCIDR rejects it.
+	t.Run("colon_garbage_emits_nothing", func(t *testing.T) {
+		for _, bad := range []string{"foo:bar/24", "1:2:3/30"} {
+			got := New().generatePolicyOptions(rfPolicyOptions(
+				&config.RouteFilter{Prefix: bad, MatchType: "orlonger"}))
+			if strings.Contains(got, "permit "+bad) {
+				t.Errorf("colon-garbage prefix %q must emit no permit line, got:\n%s", bad, got)
+			}
+		}
+	})
+
+	// A valid v6 prefix alongside a malformed v4-ish index-0 prefix:
+	// only the v6 entry is emitted, and the match line follows the
+	// emitted v6 family.
+	t.Run("malformed_index0_then_valid_v6", func(t *testing.T) {
+		got := New().generatePolicyOptions(rfPolicyOptions(
+			&config.RouteFilter{Prefix: "garbage", MatchType: "exact"},
+			&config.RouteFilter{Prefix: "2001:db8::/64", MatchType: "exact"}))
+		if !strings.Contains(got, "ipv6 prefix-list p-t1 seq 10 permit 2001:db8::/64\n") {
+			t.Errorf("valid v6 entry must survive, got:\n%s", got)
+		}
+		if !strings.Contains(got, "match ipv6 address prefix-list p-t1\n") {
+			t.Errorf("match line must follow the emitted v6 entry, got:\n%s", got)
+		}
+		if strings.Contains(got, "permit garbage") {
+			t.Errorf("malformed index-0 prefix must be skipped, got:\n%s", got)
+		}
+	})
+
+	// A valid v6 /64 (orlonger) must NOT be belt-skipped — proves the
+	// belt does not false-skip well-formed prefixes.
+	t.Run("valid_prefix_not_false_skipped", func(t *testing.T) {
+		got := New().generatePolicyOptions(rfPolicyOptions(
+			&config.RouteFilter{Prefix: "2001:db8::/64", MatchType: "orlonger"}))
+		if !strings.Contains(got, "ipv6 prefix-list p-t1 seq 5 permit 2001:db8::/64 le 128\n") {
+			t.Errorf("valid v6 /64 orlonger must be emitted, got:\n%s", got)
+		}
+	})
+}
+
 func TestGenerateRoutesBlackhole(t *testing.T) {
 	m := New()
 	tmpDir := t.TempDir()
