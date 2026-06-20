@@ -245,6 +245,17 @@ func (er *EventReader) ClearCallbacks() {
 	er.callbackMu.Unlock()
 }
 
+// CallbackCount returns the number of registered callbacks. Used by the
+// daemon flow-exporter reconcile tests to assert the once-registered
+// indirection callback is never leaked across repeated reconciles
+// (#2075).
+func (er *EventReader) CallbackCount() int {
+	er.callbackMu.RLock()
+	n := len(er.callbacks)
+	er.callbackMu.RUnlock()
+	return n
+}
+
 // SetSyslogClients replaces the set of syslog clients (goroutine-safe).
 func (er *EventReader) SetSyslogClients(clients []*SyslogClient) {
 	er.syslogMu.Lock()
