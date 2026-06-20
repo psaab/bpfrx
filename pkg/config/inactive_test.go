@@ -119,23 +119,41 @@ func TestInactive_LoneMarkerIsParseError(t *testing.T) {
 	}
 }
 
+// TestInactive_LoneMarkerErrorPointsAtMarker verifies the lone-marker parse
+// error is reported at the `inactive:` token itself, not at the following
+// terminator (`;`/`{`/EOF). Regression for the position bug where
+// markerLine/markerCol were captured from p.lexer.Peek() AFTER parseKeys()
+// had already consumed the marker (PR #2042 Copilot review). The buggy parser
+// reported columns 5/1/1 -> 12/1.../11; this pins the correct marker columns.
 func TestInactive_LoneMarkerErrorPointsAtMarker(t *testing.T) {
-	_, errs := NewParser("system {\n    inactive: ;\n}").Parse()
-	if len(errs) == 0 {
-		t.Fatal("expected parse error for lone marker, got none")
+	cases := []struct {
+		src      string
+		wantLine int
+		wantCol  int
+	}{
+		// Marker followed by a `;` terminator (4-space indent -> column 5).
+		{"system {\n    inactive: ;\n}", 2, 5},
+		// Lone marker at EOF.
+		{"inactive:", 1, 1},
+		// Marker followed by a `{` block.
+		{"inactive: {\n host-name h;\n}", 1, 1},
 	}
-	found := false
-	for _, e := range errs {
-		if strings.Contains(e.Message, "inactive") {
-			found = true
-			if e.Line != 2 || e.Column != 5 {
-				t.Fatalf("inactive marker error should point at marker token (2:5), got %d:%d (%q)",
-					e.Line, e.Column, e.Message)
+	for _, tc := range cases {
+		_, errs := NewParser(tc.src).Parse()
+		var markerErr *ParseError
+		for i := range errs {
+			if strings.Contains(errs[i].Message, "inactive") {
+				markerErr = &errs[i]
+				break
 			}
 		}
-	}
-	if !found {
-		t.Fatalf("expected inactive-marker error, got %v", errs)
+		if markerErr == nil {
+			t.Fatalf("expected an inactive-marker error for %q, got %v", tc.src, errs)
+		}
+		if markerErr.Line != tc.wantLine || markerErr.Column != tc.wantCol {
+			t.Errorf("marker error position for %q = line %d col %d, want line %d col %d",
+				tc.src, markerErr.Line, markerErr.Column, tc.wantLine, tc.wantCol)
+		}
 	}
 }
 
