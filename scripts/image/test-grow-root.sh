@@ -36,7 +36,12 @@ FAIL=0
 ok()  { echo "  PASS: $*"; PASS=$((PASS + 1)); }
 bad() { echo "  FAIL: $*" >&2; FAIL=$((FAIL + 1)); }
 
-WORK=$(mktemp -d "${TMPDIR:-/tmp}/xpf-grow-root-test.XXXXXX")
+# Fail hard if mktemp fails (e.g. a read-only TMPDIR): an empty WORK would
+# make the mocks/sysfs land under /bin and /sys and corrupt the host.
+WORK=$(mktemp -d "${TMPDIR:-/tmp}/xpf-grow-root-test.XXXXXX") || {
+    echo "FATAL: mktemp -d failed (read-only TMPDIR?)" >&2; exit 1; }
+[ -n "$WORK" ] && [ -d "$WORK" ] || {
+    echo "FATAL: WORK dir not created" >&2; exit 1; }
 cleanup() { rm -rf "$WORK"; }
 trap cleanup EXIT INT TERM
 

@@ -1,5 +1,35 @@
 # Action Log
 
+## 2026-06-19 — #1925 review r2: declare growpart dep + mktemp guard
+
+- **Timestamp**: 2026-06-19
+- **Action**: Fixed a Codex round-2 MAJOR (DOA) + MINOR on PR #2047.
+  MAJOR: growpart was an UNDECLARED runtime dependency. It ships in the
+  base cloudimg only transitively via cloud-init, which the bake purges
+  + autoremoves — so the autoremove orphaned cloud-guest-utils and
+  xpf-grow-root's growpart call would fail on EVERY boot (no stamp,
+  retry, exit 0 → root stays bake-sized forever; feature silently dead).
+  Fix: added `cloud-guest-utils` (provides /usr/bin/growpart on Ubuntu
+  26.04 — verified by inspecting the .deb: dpkg-deb -c ships
+  ./usr/bin/growpart; package exists in Ubuntu questing/26.04, same
+  cloud-utils source) + `e2fsprogs` (belt-and-suspenders for resize2fs)
+  to bake.py RUNTIME_PACKAGES AND to debian/control xpf-appliance
+  Depends (kept in sync per the metapackage contract). Corrected the
+  bake.py comment that wrongly claimed growpart was "already in the
+  image". Added a bake-time HARD-ASSERT (`command -v growpart` +
+  `resize2fs`, FATAL+exit 1) so future package-name drift fails the
+  bake, and a matching presence check at the top of validate.py
+  Scenario D (clear cause vs the downstream "partition still 8GiB"
+  symptom). MINOR: test-grow-root.sh now fails hard if `mktemp -d`
+  fails (read-only TMPDIR) instead of running with empty WORK and
+  writing under /bin and /sys. Validated: bake assertion snippet sh -n
+  / dash -n clean + behaves (FATAL when absent, exit 0 + present-line
+  when shimmed present); mktemp guard fires on a read-only TMPDIR;
+  self-test 35/35; bash -n / dash -n / shellcheck clean; py_compile
+  clean.
+- **File(s)**: scripts/image/bake.py, scripts/image/validate.py,
+  scripts/image/test-grow-root.sh, debian/control
+
 ## 2026-06-19 — #1925 review fix: stamp only on genuine grow success
 
 - **Timestamp**: 2026-06-19

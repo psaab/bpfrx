@@ -309,6 +309,15 @@ class Harness:
         info("D1 grow: launching with a 20GiB root disk (bake is 8GiB)...")
         self.launch("xpf-image-d", root_size="20GiB")
         self.wait_xpfd("xpf-image-d")
+        # growpart + resize2fs MUST survive the cloud-init purge + autoremove
+        # (#1925); a missing tool makes the grow a permanent no-op. Assert
+        # presence first so package-name drift fails here with a clear cause
+        # rather than as the downstream "partition still 8GiB" symptom.
+        if not guest_sh("xpf-image-d", 'command -v growpart >/dev/null'):
+            fail("growpart missing in the image — cloud-guest-utils not installed "
+                 "(#1925 grow would no-op; the cloud-init purge orphaned it)")
+        if not guest_sh("xpf-image-d", 'command -v resize2fs >/dev/null'):
+            fail("resize2fs missing in the image — e2fsprogs not installed (#1925)")
         if not guest_sh("xpf-image-d", 'systemctl is-active --quiet xpf-grow-root'):
             fail("xpf-grow-root.service is not active after first boot")
         if guest("xpf-image-d", "test", "-e", "/etc/xpf/.root-grown",
