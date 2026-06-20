@@ -57,7 +57,7 @@ func TestDialCollectors_SourceAddressResolveError(t *testing.T) {
 	sentinel := errors.New("bad source address")
 	resolve := func(network, addr string) (*net.UDPAddr, error) {
 		if strings.HasPrefix(addr, "192.0.2.250") {
-			return nil, sentinel // simulate a bad configured SourceAddress
+			return nil, sentinel // simulate a misconfigured SourceAddress
 		}
 		return &net.UDPAddr{IP: net.IPv4(192, 0, 2, 1), Port: 2055}, nil
 	}

@@ -35,7 +35,8 @@ var (
 // partial failure mid-loop never leaks the connections opened before it.
 func dialCollectors(collectors []CollectorConfig) (*collectorConns, error) {
 	cc := &collectorConns{}
-	// fail closes every connection opened so far and wraps err. Callers
+	// fail closes every connection opened so far and returns err as-is
+	// (call sites wrap err with collector context). Callers
 	// must return its result without retaining cc, so no descriptor opened
 	// in this loop survives an error return.
 	fail := func(err error) (*collectorConns, error) {
