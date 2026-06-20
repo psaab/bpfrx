@@ -2419,6 +2419,87 @@ func TestRouteFilterExactFRR(t *testing.T) {
 	}
 }
 
+// uptoPolicyOptions builds a one-statement / one-term policy carrying a
+// single "upto" route-filter, for the #2072 render tests.
+func uptoPolicyOptions(prefix string, uptoLen int) *config.PolicyOptionsConfig {
+	return &config.PolicyOptionsConfig{
+		PrefixLists: map[string]*config.PrefixList{},
+		Communities: map[string]*config.CommunityDef{},
+		ASPaths:     map[string]*config.ASPathDef{},
+		PolicyStatements: map[string]*config.PolicyStatement{
+			"p": {
+				Name: "p",
+				Terms: []*config.PolicyTerm{
+					{
+						Name:         "t1",
+						RouteFilters: []*config.RouteFilter{{Prefix: prefix, MatchType: "upto", UptoLen: uptoLen}},
+						Action:       "accept",
+					},
+				},
+				DefaultAction: "reject",
+			},
+		},
+	}
+}
+
+// TestRouteFilterUptoFRR is the #2072 render regression: "upto /N" must
+// emit a bare "le N" (no ge — FRR rejects ge<=prefix-len), NOT the
+// default "le 32"/"le 128" that the pre-fix code produced by falling
+// through the match-type switch.
+func TestRouteFilterUptoFRR(t *testing.T) {
+	t.Run("v4_upto24", func(t *testing.T) {
+		got := New().generatePolicyOptions(uptoPolicyOptions("10.0.0.0/8", 24))
+		if !strings.Contains(got, "ip prefix-list p-t1 seq 5 permit 10.0.0.0/8 le 24\n") {
+			t.Errorf("want bare 'le 24' line, got:\n%s", got)
+		}
+		if strings.Contains(got, "le 32") {
+			t.Errorf("must NOT emit default 'le 32' for upto /24, got:\n%s", got)
+		}
+		if strings.Contains(got, "ge ") {
+			t.Errorf("must NOT emit 'ge' (FRR rejects ge<=prefix-len), got:\n%s", got)
+		}
+	})
+
+	t.Run("v6_upto48", func(t *testing.T) {
+		got := New().generatePolicyOptions(uptoPolicyOptions("2001:db8::/32", 48))
+		if !strings.Contains(got, "ipv6 prefix-list p-t1 seq 5 permit 2001:db8::/32 le 48\n") {
+			t.Errorf("want bare 'le 48' line, got:\n%s", got)
+		}
+		if strings.Contains(got, "le 128") {
+			t.Errorf("must NOT emit default 'le 128' for upto /48, got:\n%s", got)
+		}
+		if strings.Contains(got, "ge ") {
+			t.Errorf("must NOT emit 'ge', got:\n%s", got)
+		}
+	})
+
+	// upto /N where N == prefix length means only the prefix itself
+	// (exact). "le 8" would be rejected by FRR (le == prefix-len), so we
+	// render a bare prefix with no le/ge.
+	t.Run("v4_upto_eq_plen_is_exact", func(t *testing.T) {
+		got := New().generatePolicyOptions(uptoPolicyOptions("10.0.0.0/8", 8))
+		if !strings.Contains(got, "ip prefix-list p-t1 seq 5 permit 10.0.0.0/8\n") {
+			t.Errorf("want bare 'permit 10.0.0.0/8' (exact) line, got:\n%s", got)
+		}
+		if strings.Contains(got, "le ") || strings.Contains(got, "ge ") {
+			t.Errorf("upto /8 on a /8 must be exact (no le/ge), got:\n%s", got)
+		}
+	})
+
+	// Degrade-safe: an upto with no usable length (UptoLen 0) must fall
+	// back to the orlonger-equivalent default and never emit an invalid
+	// FRR line.
+	t.Run("v4_upto_zero_degrades_to_default", func(t *testing.T) {
+		got := New().generatePolicyOptions(uptoPolicyOptions("10.0.0.0/8", 0))
+		if !strings.Contains(got, "ip prefix-list p-t1 seq 5 permit 10.0.0.0/8 le 32\n") {
+			t.Errorf("UptoLen 0 must degrade to default 'le 32', got:\n%s", got)
+		}
+		if strings.Contains(got, "ge ") {
+			t.Errorf("degrade path must not emit 'ge', got:\n%s", got)
+		}
+	})
+}
+
 func TestGenerateRoutesBlackhole(t *testing.T) {
 	m := New()
 	tmpDir := t.TempDir()
