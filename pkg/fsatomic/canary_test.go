@@ -43,8 +43,6 @@ var allowedFunctions = map[string]string{
 	"daemon::setRethIPv6Knobs":          "procfs accept_dad / addr_gen_mode",
 	"daemon::setVLANSubAddrGenMode":     "procfs addr_gen_mode (VLAN sub-iface)",
 	"daemon::setFibMultipathHashPolicy": "procfs fib_multipath_hash_policy",
-	// pkg/ra — IPv6 link-local procfs knobs.
-	"ra::ensureLinkLocal": "procfs addr_gen_mode / accept_dad",
 	// pkg/dataplane — RPS/RFS/XPS + accept_ra sysfs/procfs knobs.
 	"dataplane::CompileResult.tuneInterfaceBuffers": "sysfs RPS/RFS/XPS knobs",
 	"dataplane::ensureVLANSubInterface":             "procfs accept_ra knob",
