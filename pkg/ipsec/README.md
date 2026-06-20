@@ -71,3 +71,32 @@ all files stay in `package ipsec`, so the public API is unchanged.
   `xfrmiIfID()`. The same name → same numeric ID across reboots — don't
   rename a bind interface without expecting a reset of the SAs that ride
   it.
+- **Gateway reference resolution / `remote_addrs` (#2074).** A VPN's
+  `ike gateway <name>` either names a defined `security ike gateway`
+  object (whose `address` or `dynamic hostname` becomes `remote_addrs`)
+  or, in the legacy inline shape, IS the peer endpoint directly (a
+  literal IP or a dotted hostname/FQDN). The invariant is: **a bare
+  gateway config-object NAME never reaches swanctl `remote_addrs`** — a
+  config-object name strongSwan cannot use would DNS-resolve forever and
+  the IKE SA would never come up (a silently-dead tunnel).
+  - **Commit-time rejection** (`validateIPsecGatewayReferencesStrict`,
+    `pkg/config/compiler_ipsec.go`, run from the strict-validator chain
+    in `compileExpanded`): a VPN that references an undefined gateway, or
+    a gateway object committed with neither `address` nor `dynamic
+    hostname`, fails `commit` / `commit check`. On the tolerant load /
+    peer-sync paths the same check is downgraded to a warning
+    (`lenientIPsecGatewayRefs`) so a config persisted by an older binary
+    or synced from a peer still boots.
+  - **Render belt** (`resolveRemoteAddr`, `policy.go`): for any path that
+    reaches render without passing local commit (HA sync / direct
+    construction), an unrenderable VPN is SKIPPED (logged via
+    `slog.Warn`) — its connection and secret are omitted — rather than
+    leaking the name or aborting the whole file. Healthy VPNs always
+    render, so one bad reference never zeroes healthy tunnels.
+  - **Rule-A limitation:** an inline gateway hostname must be dotted
+    (FQDN-like). A bare single-label inline hostname (e.g. `vpnpeer`,
+    even if resolvable via the system resolver) is rejected so a typo'd
+    single-label gateway name is caught. Migration: define a proper
+    gateway — `set security ike gateway <name> address <ip>` (or
+    `dynamic hostname <fqdn>`). The shared accept predicate is
+    `config.IsUsableIPsecEndpoint`.
