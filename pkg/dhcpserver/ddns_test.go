@@ -665,8 +665,8 @@ func TestParseActiveLeases4FiltersStateAndExpiry(t *testing.T) {
 func TestParseActiveLeases4ClientIDPreferred(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "leases4.csv")
-	writeCSV(t, path, `address,hwaddr,client_id,valid_lifetime,expire,subnet_id,state
-10.0.0.10,aa:bb:cc:dd:ee:01,01aabbcc,3600,1900000000,1,0
+	writeCSV(t, path, `address,hwaddr,client_id,valid_lifetime,expire,subnet_id,hostname,state
+10.0.0.10,aa:bb:cc:dd:ee:01,01aabbcc,3600,1900000000,1,host-a,0
 `)
 	leases, err := parseActiveLeases4(path, time.Unix(1_700_000_000, 0))
 	if err != nil {
@@ -918,6 +918,189 @@ func TestParseActiveLeasesCaseInsensitiveHeader(t *testing.T) {
 	}
 	if leases[0].Identity != "mac:aa:bb:cc:dd:ee:01" {
 		t.Fatalf("identity from mixed-case header = %q", leases[0].Identity)
+	}
+}
+
+// reconcileWithLeaseHeaders is a helper: seed an owned record from a healthy
+// lease file, then re-run Reconcile with a (possibly mangled) header and
+// assert the owned record is preserved + the reconcile surfaces an error.
+// Used by the Codex-r3 MAJOR-A (naming) and MAJOR-B (identity) tests.
+func assertReconcilePreservesOwned(t *testing.T, family int, healthyHeader, healthyRow, mangledHeader, mangledRow, ownIdentity, ownAddr string) {
+	t.Helper()
+	up := newFakeUpdater()
+	m := testDDNS(t, up)
+	cfg := &config.DHCPServerConfig{
+		DynamicDNS: &config.DHCPDynamicDNSConfig{
+			Enabled:    true,
+			Domain:     "example.com",
+			TTLSeconds: 300,
+		},
+	}
+	leasePath := m.leasePath4
+	if family == 6 {
+		leasePath = m.leasePath6
+	}
+	// Cycle 1: healthy header -> the lease is published and owned.
+	writeCSV(t, leasePath, healthyHeader+"\n"+healthyRow+"\n")
+	if err := m.Reconcile(context.Background(), cfg); err != nil {
+		t.Fatalf("cycle 1 reconcile: %v", err)
+	}
+	if _, ok := m.state.get(ownIdentity, ownAddr); !ok {
+		t.Fatalf("cycle 1 did not record owned record %s|%s; state=%+v", ownIdentity, ownAddr, m.state.records)
+	}
+	// Cycle 2: mangled header -> must error, must not delete the owned record.
+	up.deletes = nil
+	writeCSV(t, leasePath, mangledHeader+"\n"+mangledRow+"\n")
+	if err := m.Reconcile(context.Background(), cfg); err == nil {
+		t.Fatal("mangled header must surface a parse error from Reconcile")
+	}
+	if len(up.deletes) != 0 {
+		t.Fatalf("records deleted on a mangled header (record loss): %v", up.deleteNames())
+	}
+	if _, ok := m.state.get(ownIdentity, ownAddr); !ok {
+		t.Fatalf("owned record %s|%s lost on a mangled header", ownIdentity, ownAddr)
+	}
+}
+
+// TestParseActiveLeasesNamingColumnRequired proves Codex-r3 MAJOR-A: if the
+// naming column ("hostname") is missing while address+state remain, the
+// pre-fix parser SUCCEEDS with empty names, Reconcile skips every lease as
+// unnamed (empty desired set), and the destructive pass mass-deletes all
+// owned records. The naming column is now REQUIRED, so a header without it
+// errors and Reconcile marks the family untrusted. Against pre-fix code the
+// parser returns named=0 with no error -> the owned record is mass-deleted ->
+// this fails.
+func TestParseActiveLeasesNamingColumnRequired(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	// Direct parser: missing hostname errors (v4 and v6).
+	t.Run("v4 missing hostname errors", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "l4.csv")
+		writeCSV(t, path, `address,hwaddr,client_id,valid_lifetime,expire,subnet_id,state
+10.0.0.10,aa,,3600,1900000000,1,0
+`)
+		if _, err := parseActiveLeases4(path, now); err == nil {
+			t.Fatal("v4 header missing 'hostname' must error")
+		}
+	})
+	t.Run("v6 missing hostname errors", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "l6.csv")
+		writeCSV(t, path, `address,duid,valid_lifetime,expire,subnet_id,iaid,state
+2001:db8::5,00:01,3600,1900000000,1,7,0
+`)
+		if _, err := parseActiveLeases6(path, now); err == nil {
+			t.Fatal("v6 header missing 'hostname' must error")
+		}
+	})
+	// End-to-end: a missing hostname must not mass-delete owned records.
+	t.Run("v4 missing hostname does not mass-delete", func(t *testing.T) {
+		assertReconcilePreservesOwned(t, 4,
+			"address,hwaddr,client_id,valid_lifetime,expire,subnet_id,hostname,state",
+			"10.0.0.10,aa,,3600,1900000000,1,host-a,0",
+			"address,hwaddr,client_id,valid_lifetime,expire,subnet_id,state",
+			"10.0.0.10,aa,,3600,1900000000,1,0",
+			"mac:aa", "10.0.0.10")
+	})
+}
+
+// TestParseActiveLeasesIdentityColumnRequired proves Codex-r3 MAJOR-B: if the
+// per-family identity columns disappear (v4: client_id+hwaddr; v6: duid+iaid)
+// while address/state/hostname remain, the pre-fix parser SUCCEEDS but the
+// identity collapses to the address fallback, so the owned record keyed by the
+// PRIOR real identity no longer matches desired -> delete + re-add churn (and
+// record loss if the re-add upsert fails). The identity columns are now
+// REQUIRED per family, so a header without them errors and Reconcile marks the
+// family untrusted. Against pre-fix code the parser succeeds and the owned
+// record is deleted+rekeyed -> this fails.
+func TestParseActiveLeasesIdentityColumnRequired(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	t.Run("v4 missing client_id+hwaddr errors", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "l4.csv")
+		writeCSV(t, path, `address,valid_lifetime,expire,subnet_id,hostname,state
+10.0.0.10,3600,1900000000,1,host-a,0
+`)
+		if _, err := parseActiveLeases4(path, now); err == nil {
+			t.Fatal("v4 header missing identity columns must error")
+		}
+	})
+	t.Run("v6 missing duid+iaid errors", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, "l6.csv")
+		writeCSV(t, path, `address,valid_lifetime,expire,subnet_id,hostname,state
+2001:db8::5,3600,1900000000,1,host-6,0
+`)
+		if _, err := parseActiveLeases6(path, now); err == nil {
+			t.Fatal("v6 header missing identity columns must error")
+		}
+	})
+	// End-to-end: a v4 header losing its identity columns must not delete the
+	// record keyed by the prior real identity.
+	t.Run("v4 missing identity does not churn owned record", func(t *testing.T) {
+		assertReconcilePreservesOwned(t, 4,
+			"address,hwaddr,client_id,valid_lifetime,expire,subnet_id,hostname,state",
+			"10.0.0.10,aa,,3600,1900000000,1,host-a,0",
+			"address,valid_lifetime,expire,subnet_id,hostname,state",
+			"10.0.0.10,3600,1900000000,1,host-a,0",
+			"mac:aa", "10.0.0.10")
+	})
+	// End-to-end: a v6 header losing its identity columns must not churn.
+	t.Run("v6 missing identity does not churn owned record", func(t *testing.T) {
+		assertReconcilePreservesOwned(t, 6,
+			"address,duid,valid_lifetime,expire,subnet_id,iaid,hostname,state",
+			"2001:db8::5,00:01,3600,1900000000,1,7,host-6,0",
+			"address,valid_lifetime,expire,subnet_id,hostname,state",
+			"2001:db8::5,3600,1900000000,1,host-6,0",
+			"duid:00:01/7", "2001:db8::5")
+	})
+}
+
+// TestParseActiveLeasesOptionalColumnsDegradeSafely proves the columns kept
+// OPTIONAL (fqdn_fwd, expire, subnet_id) do not error and degrade safely: a
+// healthy header without them still parses the lease (named, active). This
+// documents the deliberate boundary — only columns whose absence is
+// destructive are required.
+func TestParseActiveLeasesOptionalColumnsDegradeSafely(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "l4.csv")
+	// No fqdn_fwd, no expire, no subnet_id — all the required columns present.
+	writeCSV(t, path, `address,hwaddr,client_id,hostname,state
+10.0.0.10,aa,,host-a,0
+`)
+	leases, err := parseActiveLeases4(path, time.Unix(1_700_000_000, 0))
+	if err != nil {
+		t.Fatalf("optional columns absent should still parse, got error: %v", err)
+	}
+	if len(leases) != 1 || leases[0].HostName != "host-a" || leases[0].Identity != "mac:aa" {
+		t.Fatalf("optional-absent lease parsed wrong: %+v", leases)
+	}
+}
+
+// TestLeaseColumnValueLowerCasesLookupName proves the Codex-r3 MINOR: the
+// column lookup lower-cases its NAME argument so the case-insensitivity
+// invariant holds at the call site, not merely because every caller passes a
+// lower-case literal. The cols map (built lower-cased) is queried with a
+// MIXED-case lookup name; it must still resolve. Against the pre-fix lookup
+// (cols[name], no lower-casing of name) a mixed-case lookup name misses and
+// returns "" — so this test fails pre-fix. This is the direct guard the
+// documented invariant requires.
+func TestLeaseColumnValueLowerCasesLookupName(t *testing.T) {
+	// cols keys are lower-case (as built from the header). Look them up with
+	// mixed/upper-case names — they must resolve.
+	cols := map[string]int{"address": 0, "client_id": 1, "hostname": 2}
+	fields := []string{"10.0.0.10", "01deadbeef", "host-a"}
+	cases := []struct{ name, want string }{
+		{"Address", "10.0.0.10"},
+		{"ADDRESS", "10.0.0.10"},
+		{"Client_ID", "01deadbeef"},
+		{"HostName", "host-a"},
+		{"absent", ""},
+	}
+	for _, tc := range cases {
+		if got := leaseColumnValue(cols, fields, tc.name); got != tc.want {
+			t.Fatalf("leaseColumnValue(%q) = %q, want %q (lookup name not lower-cased)", tc.name, got, tc.want)
+		}
 	}
 }
 

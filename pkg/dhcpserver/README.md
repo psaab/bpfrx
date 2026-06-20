@@ -76,15 +76,27 @@ What increment 1 ships (the fully unit-testable, lab-free slice):
   client-supplied FQDN, and extracts the v6 DUID/IAID identity. SEPARATE
   from the display-only `parseLeaseCSV` (reusing that would publish/retain
   stale records — the exact bug this feature fixes). Header columns are
-  matched CASE-INSENSITIVELY (only the header keys / lookup names are
-  lower-cased; field values are data and stay verbatim). The header is
-  VALIDATED: if a required column (`requiredLeaseColumns` = `address`,
-  `state`) is missing or renamed, the parser returns an ERROR rather than a
-  silent empty lease set — a mangled header would otherwise read every row
-  as empty, look like "zero active leases", and let the reconciler
-  mass-delete the family's owned records (the MAJOR-4 vector reached through
-  the header gap). An empty FILE (no data rows) is still a legitimate
-  zero-lease, no-error case.
+  matched CASE-INSENSITIVELY (both the header keys AND the lookup name are
+  lower-cased in `leaseColumnValue`; field values are data and stay
+  verbatim). The header is VALIDATED against a FAMILY-SPECIFIC
+  `requiredLeaseColumns` set: any column whose absence would silently change
+  whether a lease is published (naming), how it is keyed for ownership
+  (identity), or whether it is active (state) is REQUIRED, because a mangled
+  header parses with no error and the reconciler then deletes/churns owned
+  records on the basis of an empty or wrongly-keyed desired set. If any
+  required column is missing/renamed the parser returns an ERROR, so
+  `Reconcile` marks the family untrusted and SKIPS the destructive diff —
+  never mass-delete or record-loss on an unrecognizable header. Required:
+  `address`, `state`, `hostname` (both families) + `client_id`,`hwaddr`
+  (v4 identity) / `duid`,`iaid` (v6 identity). Deliberately OPTIONAL
+  (absence degrades safely, no record loss): `fqdn_fwd` (defaults to
+  host-name semantics), `expire` (no expiry tombstoning — `state` still
+  gates active/tombstone; over-retain, not delete), `subnet_id` (pure
+  metadata, not compared by `recordsEqual`). An empty FILE (no data rows)
+  is still a legitimate zero-lease, no-error case; a present-but-mangled
+  header IS an error. The fail direction (over-mark-untrusted for an exotic
+  header → no publish/clean, operator-visible) is SAFE; silent
+  mass-delete/record-loss is not.
 - **Hostname normalization** — `deriveFQDN` / `finalizeFQDN`
   (`ddns_hostname.go`) ALWAYS contains the published name in the configured
   zone: the client picks the host part, the firewall picks the domain. A

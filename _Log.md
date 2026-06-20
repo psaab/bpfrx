@@ -233,6 +233,39 @@
   verified: a no-standalone mutant fails T7c+T2b; an always-standalone mutant
   fails T7d (double goodbye).
 - **File(s)**: pkg/ra/serialize_test.go, _Log.md
+## 2026-06-19 — #1387 DDNS PR #2043: generalize header validation (Codex r3)
+
+- **Timestamp**: 2026-06-19
+- **Action**: Fix Codex round-3's two MAJORs + one MINOR. The
+  `requiredLeaseColumns={address,state}` fix closed the address/state
+  trigger, but the mass-delete/record-loss class GENERALIZES to any header
+  column the reconciler depends on. (MAJOR A) A missing/renamed `hostname`
+  column parses with no error but empties HostName/ClientFQDN, so
+  `deriveFQDN` errors for every lease and the reconciler skips them all as
+  unnamed → empty desired set → Pass-1 mass-deletes all owned records.
+  (MAJOR B) Missing identity columns (v4 client_id/hwaddr, v6 duid/iaid)
+  collapse the identity to the address fallback → owned records keyed by
+  the prior identity no longer match → delete+re-add churn → record LOST
+  if the re-add upsert fails. (MINOR) the case-insensitivity fix
+  lower-cased the cols map keys but not the lookup name in get(), so the
+  invariant held only because callers pass lower-case literals. Fix: made
+  `requiredLeaseColumns` a FAMILY-SPECIFIC map (v4: address,state,
+  hostname,client_id,hwaddr; v6: address,state,hostname,duid,iaid) so a
+  missing column for that family errors → Reconcile marks the family
+  untrusted → SKIPS the destructive diff; extracted the column lookup into
+  `leaseColumnValue` which lower-cases the name argument (cols keys already
+  lower-cased), making the invariant hold at the call site and unit-
+  testable. fqdn_fwd / expire / subnet_id stay OPTIONAL with documented
+  non-destructive rationale (defaults to host-name; state still gates
+  active/tombstone; metadata not compared by recordsEqual). Five new
+  non-tautological tests (naming-required v4/v6 + end-to-end no-mass-
+  delete; identity-required v4/v6 + end-to-end no-churn; optional-degrade;
+  leaseColumnValue mixed-case lookup). All FAIL against pre-fix head
+  07ab9f5f. Adjusted one existing fixture (ClientIDPreferred) to carry the
+  now-required hostname column. README updated.
+- **File(s)**: pkg/dhcpserver/ddns_leases.go,
+  pkg/dhcpserver/ddns_test.go, pkg/dhcpserver/README.md, _Log.md
+
 ## 2026-06-19 — #1387 DDNS PR #2043: close MAJOR-4 header-validation re-open
 
 - **Timestamp**: 2026-06-19

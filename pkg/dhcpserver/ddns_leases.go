@@ -23,18 +23,52 @@ const (
 	keaStateExpired  = 2 // expired-reclaimed
 )
 
-// requiredLeaseColumns are the Kea memfile header columns the reconciler
-// MUST be able to read to run a SAFE destructive diff. "address" keys
-// every lease; "state" separates an active lease from a declined /
-// expired-reclaimed one. If either is absent (missing or renamed), every
-// row reads empty and the parser would return a silent empty lease set —
-// which the reconciler would treat as "zero active leases" and mass-delete
-// the family's owned records. Their absence is therefore a hard parse
-// error so Reconcile marks the family untrusted instead. Names are matched
-// case-insensitively (see the lower-cased cols map). Other columns the
-// parser reads (expire, hostname, fqdn_fwd, subnet_id, duid/iaid,
-// client_id/hwaddr) are optional across Kea versions and degrade safely.
-var requiredLeaseColumns = []string{"address", "state"}
+// requiredLeaseColumns lists, per family, the Kea memfile header columns the
+// reconciler MUST be able to read to compute the desired DNS state and run a
+// SAFE destructive diff. The mass-delete / record-loss class is NOT specific
+// to address/state: ANY column whose absence silently changes whether a lease
+// is published, how it is keyed for ownership, or whether it is active is
+// destructive, because a mangled header parses with no error and the
+// reconciler then deletes owned records on the basis of an empty or
+// wrongly-keyed desired set. So the required set covers every such column; if
+// any is MISSING from the header the parser returns an error and Reconcile
+// marks the family untrusted and SKIPS the destructive diff. The fail
+// direction (over-mark-untrusted for an exotic header → no publish/clean,
+// operator-visible) is SAFE; silent mass-delete / record-loss is not.
+//
+// Required (both families):
+//   - address  — keys every lease AND is the ownership key fallback; absent ⇒
+//     every row reads "" ⇒ empty lease set ⇒ Pass-1 deletes all owned.
+//   - state    — separates an active lease from a declined/expired-reclaimed
+//     one; absent ⇒ active and tombstoned rows are indistinguishable (a
+//     reclaimed/declined address would be published or a publishable one lost).
+//   - hostname — the naming source; absent ⇒ deriveFQDN errors for every lease
+//     ⇒ all leases skipped as unnamed ⇒ empty desired set ⇒ mass-delete
+//     (MAJOR A). An empty hostname VALUE is fine; we require the COLUMN.
+//
+// Required (v4 identity): client_id AND hwaddr — the ownership key derives
+// from client-id||hwaddr; absent ⇒ identity collapses to the address-fallback
+// ⇒ owned records keyed by the prior real identity no longer match desired ⇒
+// delete + re-add churn; if the delete succeeds and the re-add upsert fails
+// the active record is LOST (MAJOR B).
+//
+// Required (v6 identity): duid AND iaid — same record-loss as v4 for the
+// DUID/IAID identity.
+//
+// Deliberately OPTIONAL (absence degrades safely, no record loss):
+//   - fqdn_fwd  — only routes the hostname value into HostName vs ClientFQDN;
+//     absent ⇒ splitLeaseNames defaults to host-name semantics, still named.
+//   - expire    — absent ⇒ no expiry-based tombstoning (state still gates
+//     active-vs-tombstone); over-RETAIN of a stale lease, never a delete.
+//   - subnet_id — pure metadata stored on the owned record; recordsEqual does
+//     NOT compare it, so its absence changes no destructive computation.
+//
+// Names are matched case-insensitively (cols keys + get() lookups are
+// lower-cased).
+var requiredLeaseColumns = map[int][]string{
+	4: {"address", "state", "hostname", "client_id", "hwaddr"},
+	6: {"address", "state", "hostname", "duid", "iaid"},
+}
 
 // ddnsLease is one active lease as the reconciler needs it: a stable
 // owner identity, the address, the offered name(s), the subnet, and the
@@ -93,33 +127,30 @@ func parseActiveLeases(path string, family int, now time.Time) ([]ddnsLease, err
 		cols[strings.ToLower(strings.TrimSpace(h))] = i
 	}
 	get := func(fields []string, name string) string {
-		if idx, ok := cols[name]; ok && idx >= 0 && idx < len(fields) {
-			return fields[idx]
-		}
-		return ""
+		return leaseColumnValue(cols, fields, name)
 	}
 
-	// Fail-safe header validation (#1387 MAJOR-4 / AGY MINOR-1+2): the
-	// reconciler's destructive delete pass treats an EMPTY lease set as
-	// "this family legitimately has zero active leases". If a required
-	// column is missing or renamed, every row's address/state reads as ""
-	// and the loop skips all rows, producing an empty set with no error —
-	// which would let Reconcile mass-delete every owned record for the
-	// family. So an unrecognizable header MUST error (Reconcile then marks
-	// the family untrusted and SKIPS the destructive diff), never silently
-	// return an empty set. "address" keys every lease; "state" is what
-	// separates an active lease from a declined/expired-reclaimed one, so
-	// without it active and tombstoned rows are indistinguishable. An empty
-	// FILE (handled above by len(records) < 2) is a legitimate zero-lease
-	// case and is NOT an error; a present-but-mangled header IS.
+	// Fail-safe header validation (#1387 MAJOR-4 + Codex r3 MAJOR-A/B): the
+	// reconciler's destructive delete pass treats an EMPTY (or wrongly-keyed)
+	// desired set as ground truth. A mangled header — a required column
+	// missing or renamed — parses with NO error but silently changes whether
+	// leases are published (naming), how they are keyed (identity), or whether
+	// they are active (state), so Reconcile would mass-delete or churn
+	// (delete+re-add, losing the record on a failed re-add) owned records. So
+	// any MISSING required column for this family is a hard parse error;
+	// Reconcile then marks the family untrusted and SKIPS the destructive
+	// diff. An empty FILE (handled above by len(records) < 2) is a legitimate
+	// zero-lease case and is NOT an error; a present-but-mangled header IS.
+	// See requiredLeaseColumns for the per-column destructive-path rationale.
 	var missing []string
-	for _, req := range requiredLeaseColumns {
+	for _, req := range requiredLeaseColumns[family] {
 		if _, ok := cols[req]; !ok {
 			missing = append(missing, req)
 		}
 	}
 	if len(missing) > 0 {
-		return nil, fmt.Errorf("parse %s: missing required column(s) %v in Kea lease header", path, missing)
+		return nil, fmt.Errorf("parse %s: missing required column(s) %v in Kea %s lease header",
+			path, missing, familyLabel(family))
 	}
 
 	// Kea appends rows; the LAST row for an address is authoritative (lease
@@ -203,6 +234,27 @@ func parseActiveLeases(path string, family int, now time.Time) ([]ddnsLease, err
 		out = append(out, l)
 	}
 	return out, nil
+}
+
+// leaseColumnValue looks up a field by header name, CASE-INSENSITIVELY. It
+// lower-cases the lookup name so the case-insensitivity invariant holds at the
+// call site (cols keys are already lower-cased when the map is built), not just
+// because callers happen to pass lower-case literals. Field VALUES are never
+// touched — only the header name is normalized. Returns "" when the column is
+// absent or the row is short.
+func leaseColumnValue(cols map[string]int, fields []string, name string) string {
+	if idx, ok := cols[strings.ToLower(name)]; ok && idx >= 0 && idx < len(fields) {
+		return fields[idx]
+	}
+	return ""
+}
+
+// familyLabel renders a family number for error messages.
+func familyLabel(family int) string {
+	if family == 6 {
+		return "v6"
+	}
+	return "v4"
 }
 
 func splitLeaseNames(hostname, fqdnFwd string) (hostName, clientFQDN string) {
