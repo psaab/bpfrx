@@ -442,6 +442,29 @@ ConfigSnapshot {
 }
 ```
 
+**Dynamic-address feed overlay (#2049).** The snapshot's address books carry
+the live `security dynamic-address` feed prefixes, not just the static
+`security address-book`. The daemon joins each `address-name ... profile
+feed-name` binding to the feed manager's current last-good snapshot
+(`feeds.Manager.SnapshotForBindings`) and hands the result into the manager
+via `SetFeedSnapshots` (mirroring the ip-monitoring `SetRouteOverlay`) at the
+top of `applyConfigLocked`. `buildAddressBookTableWithFeeds`
+(`policies.go`) then merges those CIDRs into the named book's content bucket
+*before* ID assignment, so the feed-backed name emits an `AddressBookSnapshot`
+row and `nameToID[name]` is populated — which lets `classifyPolicyAddresses`
+route a referencing policy/NAT token into `source_book_ids` /
+`destination_book_ids` instead of dropping it to a no-match literal. Because
+the overlay lands in the hashed `AddressBooks` rows, a feed refresh (the
+manager's `onUpdate` re-runs `applyConfig` against the *same* typed config)
+shifts `snapshotContentHash` and the duplicate-publish gate republishes; an
+identical refresh produces an identical hash and is correctly skipped. Per the
+#2050 fail-safe, a fetch failure retains the last-good prefixes
+indefinitely by default, so an enforced feed is normally never empty after its
+first fetch; the only empty windows are the bounded startup-before-first-fetch
+case and an explicit operator `hold-interval` drop (an empty book matches
+nothing — fail-closed for an allowlist, the operator-opted fail-open for a
+denylist).
+
 #### Capability Check
 
 The manager evaluates the active config to determine whether the userspace

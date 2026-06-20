@@ -1,5 +1,50 @@
 # Action Log
 
+## 2026-06-20 — #2049 enforce dynamic-address feed prefixes in the userspace dataplane
+
+- **Timestamp**: 2026-06-20
+- **Action**: Close the never-enforced dynamic-address feed gap (#2049,
+  sequenced after #2050/#2056). Feed prefixes were fetched, statused, and
+  shown but never reached the AF_XDP forwarding path: `feeds.GetPrefixes`
+  had no production caller, and the userspace snapshot's address resolution
+  (`buildAddressBookTable`/`classifyPolicyAddresses`) read only
+  `cfg.Security.AddressBook`, so a policy/NAT token naming a feed-backed
+  `address-name` was emitted to the helper as a no-match literal. Fix
+  re-targets the RUNTIME userspace snapshot path (NOT the retired eBPF
+  compiler): (1) `feeds.Manager.SnapshotForBindings` resolves each
+  `AddressBinding` to the deep-copied union of its live feed prefixes — the
+  first production caller of the per-feed snapshot; (2) the userspace
+  `Manager` gains a `feedOverlay` field + `SetFeedSnapshots` setter +
+  `feedSnapshotOverlay()` accessor, mirroring `routeOverlay`/`SetRouteOverlay`;
+  (3) `buildAddressBookTableWithFeeds` merges feed CIDRs into the named book's
+  content bucket before ID assignment so the name emits an
+  `AddressBookSnapshot` row, populates `nameToID`, and
+  `classifyPolicyAddresses` routes the token into
+  `SourceBookIDs`/`DestinationBookIDs`; (4) the daemon
+  (`feedSnapshotsForConfig` + `feedSnapshotSetter`) pushes the overlay into
+  the manager at the top of `applyConfigLocked`, joined against the INCOMING
+  config so a removed binding stops enforcing. The overlay lands in the hashed
+  `AddressBooks`, so a feed `onUpdate` (re-applyConfig against the same typed
+  config) shifts `snapshotContentHash` and the duplicate-publish gate
+  republishes. Empty-feed fail-safe: #2050 retains last-good forever by
+  default, so the only empty windows are startup-before-first-fetch and the
+  explicit operator hold-interval drop (empty book matches nothing —
+  documented). No new drop behavior added. Tests prove enforcement against the
+  published snapshot (v4+v6), the empty case, and that a feed content change
+  reshapes the snapshot + shifts the content hash; the core enforcement test
+  is non-tautological (verified it FAILS when the overlay merge is removed).
+- **File(s)**: `pkg/feeds/feeds.go`,
+  `pkg/feeds/feeds_bindings_test.go` (new),
+  `pkg/dataplane/userspace/manager.go`,
+  `pkg/dataplane/userspace/builder.go`,
+  `pkg/dataplane/userspace/policies.go`,
+  `pkg/dataplane/userspace/feed_enforcement_test.go` (new),
+  `pkg/dataplane/userspace/route_overlay_test.go` (builder arity),
+  `pkg/daemon/daemon_apply.go`,
+  `pkg/daemon/daemon_feeds.go` (new),
+  `docs/feature-gaps.md`,
+  `docs/userspace-dataplane-architecture.md`.
+
 ## 2026-06-19 — #2053 redact all config secrets at JSON/YAML marshal time
 
 - **Timestamp**: 2026-06-19

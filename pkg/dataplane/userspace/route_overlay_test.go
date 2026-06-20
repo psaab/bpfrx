@@ -98,9 +98,9 @@ func TestRouteOverlayWholeEntryReplacement(t *testing.T) {
 // would be a failover-doesn't-happen bug).
 func TestRouteOverlayContentHashDelta(t *testing.T) {
 	cfg := overlayTestConfig()
-	base := buildSnapshotWithSchedulerState(cfg, config.UserspaceConfig{}, 1, 0, nil, nil)
+	base := buildSnapshotWithSchedulerState(cfg, config.UserspaceConfig{}, 1, 0, nil, nil, nil)
 	withOverlay := buildSnapshotWithSchedulerState(cfg, config.UserspaceConfig{}, 1, 0, nil,
-		[]config.RouteOverlayEntry{{Destination: "0.0.0.0/0", NextHop: "172.16.80.1", Policy: "p"}})
+		[]config.RouteOverlayEntry{{Destination: "0.0.0.0/0", NextHop: "172.16.80.1", Policy: "p"}}, nil)
 
 	h1, ok1 := snapshotContentHash(base)
 	h2, ok2 := snapshotContentHash(withOverlay)
@@ -113,7 +113,7 @@ func TestRouteOverlayContentHashDelta(t *testing.T) {
 
 	// Same overlay again ⇒ identical hash (duplicate-publish basis).
 	again := buildSnapshotWithSchedulerState(cfg, config.UserspaceConfig{}, 2, 7, nil,
-		[]config.RouteOverlayEntry{{Destination: "0.0.0.0/0", NextHop: "172.16.80.1", Policy: "p"}})
+		[]config.RouteOverlayEntry{{Destination: "0.0.0.0/0", NextHop: "172.16.80.1", Policy: "p"}}, nil)
 	h3, _ := snapshotContentHash(again)
 	if h2 != h3 {
 		t.Fatal("identical overlay produced different content hash (generation must be excluded)")
@@ -252,7 +252,7 @@ func TestPublishRouteOverlaySnapshot(t *testing.T) {
 	// Full-apply preservation (AGY r2-2): the cached overlay feeds the
 	// full snapshot build, so an operator commit while a policy is
 	// FAILED keeps the injected route.
-	snap := buildSnapshotWithSchedulerState(cfg, config.UserspaceConfig{}, 9, 0, nil, m.routeOverlaySnapshot())
+	snap := buildSnapshotWithSchedulerState(cfg, config.UserspaceConfig{}, 9, 0, nil, m.routeOverlaySnapshot(), m.feedSnapshotOverlay())
 	kept := false
 	for _, r := range snap.Routes {
 		if r.Table == "inet.0" && r.Destination == "0.0.0.0/0" &&
