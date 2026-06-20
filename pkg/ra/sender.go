@@ -417,7 +417,10 @@ func ensureLinkLocal(iface *net.Interface) error {
 		IPNet: &net.IPNet{IP: ll, Mask: net.CIDRMask(64, 128)},
 		Flags: unix.IFA_F_NODAD,
 	}
-	if err := netlink.AddrAdd(link, addr); err != nil && !errors.Is(err, syscall.EEXIST) {
+	if err := netlink.AddrAdd(link, addr); err != nil {
+		if errors.Is(err, syscall.EEXIST) {
+			return nil
+		}
 		return fmt.Errorf("add link-local %s on %s: %w", ll, iface.Name, err)
 	}
 	slog.Info("ra: added link-local for RA sender",

@@ -1,5 +1,14 @@
 # Action Log
 
+## 2026-06-20 — #2034 RA link-local review follow-up
+
+- **Timestamp**: 2026-06-20
+- **Action**: Address Copilot review on `pkg/ra/sender.go` by making
+  the "added link-local" INFO log accurate under `AddrAdd` races: a
+  concurrent `EEXIST` now returns silently instead of claiming a new
+  address was added.
+- **File(s)**: pkg/ra/sender.go, _Log.md
+
 ## 2026-06-19 — #2000 review follow-up on postinst test harness
 
 - **Timestamp**: 2026-06-19
