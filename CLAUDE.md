@@ -286,7 +286,7 @@ in git history; `git log -- bpf/xdp/ bpf/tc/` walks the deleted source.
 - **Fabric forwarding**: the userspace dataplane redirects packets for peer-owned synced sessions over the fabric link — `resolve_fabric_redirect()` / `ingress_is_fabric()` in `userspace-dp/src/afxdp/forwarding/mod.rs` (see `docs/fabric-cross-chassis-fwd.md`) — prevents TCP death on VRRP failback. The pre-#1476 eBPF mechanism (`try_fabric_redirect()` in xdp_zone) is historical
 - **RETH virtual MAC**: per-node `02:bf:72:CC:RR:NN`; `programRethMAC()` does link DOWN→set MAC→link UP
 - **VIP reconciliation**: `ReconcileVIPs()` re-adds VRRP VIPs after `programRethMAC` link DOWN/UP (which removes all kernel addresses)
-- **Sync hold**: VRRP starts with `preempt=false`; released after bulk session sync (or 10s timeout); `preemptNowCh` triggers instant preemption
+- **Sync hold**: VRRP starts with `preempt=false`; released after bulk session sync (or 10s timeout); `preemptNowCh` triggers instant preemption. Sync-hold release preempt is now peer-priority gated (#2082): the non-force `preemptNowCh` shortcut becomes MASTER only on a STRICTLY higher effective priority than the last-observed master (RFC 5798 §6.4.2); `ForceRGMaster` (force=true) and priority-0 takeover (ungated `masterDownTimer` path) bypass the gate — no ~60ms failover regression
 - **Heartbeat**: 200ms interval, threshold 5 (1s detection); bind retry loop for simultaneous boot
 - **Session sync connect**: immediate first attempt, 1s retry (was 5s)
 - **Event debounce**: 500ms for cluster state → VRRP priority updates
