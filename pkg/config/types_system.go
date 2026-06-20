@@ -35,7 +35,13 @@ type SystemConfig struct {
 	Login                    *LoginConfig
 	RootAuthentication       *RootAuthConfig
 	Archival                 *ArchivalConfig
-	MasterPassword           string   // pseudorandom-function value
+	// MasterPassword is a misnomer kept for the Junos token: it holds the
+	// `system master-password pseudorandom-function <fn>` value, i.e. the PRF
+	// ALGORITHM-SELECTOR NAME (e.g. hmac-sha256), NOT key material. The actual
+	// master key is node-local + HKDF-derived and never stored in config (see
+	// compiler_system.go / configstore/crypto.go), so this field is not a
+	// secret and is intentionally a plain string, not config.Secret (#2053).
+	MasterPassword           string   // PRF algorithm-selector name (not a secret)
 	LicenseAutoUpdate        string   // license autoupdate URL
 	DisabledProcesses        []string // processes marked "disable"
 	PersistGroupsInheritance bool     // system commit persist-groups-inheritance (syntax accepted, runtime no-op)
@@ -269,6 +275,9 @@ type SNMPConfig struct {
 // (not secrets) and pass through unchanged. The in-memory map (and its
 // lookup-by-community-string in pkg/snmp) is untouched.
 func (s SNMPConfig) MarshalJSON() ([]byte, error) {
+	// NOTE: the snmpAlias projection below is intentionally duplicated in
+	// MarshalYAML; the two MUST stay in sync. If you add/rename a field here,
+	// mirror it in MarshalYAML or the JSON and YAML redaction surfaces diverge.
 	type snmpAlias struct {
 		Location    string
 		Contact     string
@@ -303,6 +312,8 @@ func (s SNMPConfig) MarshalJSON() ([]byte, error) {
 // sorted slice (future-proofing; no config YAML marshaller exists today —
 // #2053).
 func (s SNMPConfig) MarshalYAML() (any, error) {
+	// Keep this projection in sync with MarshalJSON above (same snmpAlias +
+	// Communities map->sorted-slice redaction).
 	type snmpAlias struct {
 		Location    string
 		Contact     string

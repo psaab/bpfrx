@@ -56,10 +56,11 @@ func (s Secret) String() string {
 	return SecretRedacted
 }
 
-// Reveal returns the real cleartext value. This is the ONLY way to read the
-// secret; render/reconcile paths must call it explicitly. The name is
-// deliberately greppable so an audit can find every cleartext access — do
-// not feed the result into a log line.
+// Reveal returns the real cleartext value. It is the canonical, audited way
+// to read the secret; render/reconcile paths must call it explicitly. (A raw
+// string(s) conversion also yields the cleartext — Secret is a string newtype
+// — but Reveal is deliberately greppable so an audit can find every cleartext
+// access; prefer it, and never feed the result into a log line.)
 func (s Secret) Reveal() string { return string(s) }
 
 // MarshalJSON redacts the secret. An empty Secret marshals to "" so that
