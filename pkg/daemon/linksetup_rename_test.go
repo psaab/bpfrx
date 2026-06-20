@@ -149,7 +149,10 @@ func TestRenameInterfacePersistentUpFailureReturnsActionableError(t *testing.T) 
 	if !errors.Is(err, sentinel) {
 		t.Fatalf("error does not wrap the underlying LinkSetUp error via %%w: %v", err)
 	}
-	for _, want := range []string{oldName, newName, "DOWN", "reconcile"} {
+	// The message must name both interfaces, state the DOWN condition, and be
+	// actionable for BOTH recovery paths: the managed-interface reconcile and
+	// the explicit operator command for the unmanaged case.
+	for _, want := range []string{oldName, newName, "DOWN", "reconcile", "ip link set " + newName + " up"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Fatalf("error message missing %q (not actionable): %v", want, err)
 		}

@@ -356,12 +356,21 @@ UseRoutes=yes`
 //     ifindex — not the name — so the handle remains valid across the rename;
 //     this holds because LinkByName populates a non-zero Index, making
 //     netlink's internal ensureIndex a no-op). On persistent failure return
-//     an actionable error: the interface is left correctly named, and the
-//     next config reconcile (networkd.Apply) brings it up — it is never
-//     stranded under the old name. (The immediate networkctl reload after the
-//     caller's rename loop only brings up links that already have a managed
-//     .network; the first-boot ge-* case is recovered at the first config
-//     apply.)
+//     an actionable error: the interface is left correctly named (never
+//     stranded under the old name).
+//
+// Automatic recovery of the DOWN-but-correctly-named link depends on whether
+// the interface is managed by systemd-networkd. A *managed* interface (a
+// configured ge-*/em0/fxp0/mapped name) has a generated .network and is
+// brought up at the next config reconcile (networkd.Apply) — note the
+// immediate networkctl reload after the caller's rename loop only brings up
+// links that already have a managed .network, so the first-boot ge-* case is
+// recovered at the first config apply, not the immediate reload. An *unmanaged*
+// interface (e.g. a device-map phase-1 squatter parked under xpf-tmp-N with no
+// .network) is NOT brought up automatically — but that DOWN-at-temp-name state
+// is the intended/harmless outcome there. The returned error therefore also
+// points the operator at the explicit `ip link set <newName> up` recovery so
+// the unmanaged case is actionable.
 func renameInterface(oldName, newName string) error {
 	link, err := nlLinkByName(oldName)
 	if err != nil {
@@ -388,9 +397,10 @@ func renameInterface(oldName, newName string) error {
 		if retryErr := nlLinkSetUp(link); retryErr != nil {
 			return fmt.Errorf(
 				"renamed %s -> %s but could not bring it up; interface is "+
-					"correctly named but DOWN — next config reconcile will "+
-					"retry: %w",
-				oldName, newName, retryErr)
+					"correctly named but DOWN — if it is managed the next "+
+					"config reconcile will bring it up, otherwise run "+
+					"`ip link set %s up`: %w",
+				oldName, newName, newName, retryErr)
 		}
 	}
 
