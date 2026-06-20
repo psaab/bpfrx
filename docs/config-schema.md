@@ -536,17 +536,30 @@ Layer-A agreement property).
 
 ### #2079 — NAT pool-utilization-alarm threshold validation
 
-`security nat source pool-utilization-alarm raise-threshold/clear-threshold`
-is a Tier-3 compiler-side validation (`compileNAT`, `pkg/config/compiler_nat.go`,
-next to the deterministic-pool checks): it requires `0 < clear-threshold <
-raise-threshold <= 100`. A bare `pool-utilization-alarm;` compiles to
-raise=0/clear=0 (an always-firing alarm) and inverted/equal thresholds make
-hysteresis meaningless, so all are hard commit errors rather than silently
-accepted no-ops (Junos itself requires raise > clear). Defense-in-depth: the
-runtime monitor (`pkg/natpoolalarm`) also treats `raise-threshold <= 0` as
-"feature disabled". The thresholds are a single GLOBAL pair (no per-pool
-override syntax in the parsed Junos grammar). Regression coverage:
-`pkg/config/compiler_nat_pool_alarm_test.go`. The runtime consumer (#2079) is
+`security nat source pool-utilization-alarm raise-threshold/clear-threshold` is
+a Tier-3 compiler-side validation with the standard **strict-vs-lenient** split
+(same doctrine as #1979 / tcp-mss). `validatePoolUtilizationAlarm`
+(`pkg/config/compiler_nat.go`, invoked from the typed-config phase of
+`compileExpanded` in `compiler.go`) requires `0 < clear-threshold <
+raise-threshold <= 100`:
+
+- **Strict (`commit` / `commit check`):** a bare `pool-utilization-alarm;`
+  (raise=0/clear=0, an always-firing alarm) and inverted/equal thresholds are
+  HARD commit errors (Junos itself requires raise > clear).
+- **Lenient (`Store.Load` / HA peer-sync — `CompileConfigLenient` /
+  `CompileConfigForNodeLenient`, flag `lenientNATPoolAlarmThreshold`):** the
+  violation downgrades to a `cfg.Warnings` entry so a node that committed a
+  legacy/loose alarm config BEFORE this gate existed still BOOTS after upgrade
+  instead of failing closed (#1960 fail-closed-on-compile-failure would
+  otherwise brick the daemon on restart). The runtime monitor treats
+  `raise-threshold <= 0` as "feature disabled", so a leniently-loaded bad config
+  is inert (not always-firing), and the operator's next strict commit rejects it
+  loudly.
+
+The thresholds are a single GLOBAL pair (no per-pool override syntax in the
+parsed Junos grammar). Regression coverage:
+`pkg/config/compiler_nat_pool_alarm_test.go` (strict reject + lenient
+accept-with-warning + valid-no-warning). The runtime consumer (#2079) is
 documented in `docs/deterministic-nat-cgnat.md`.
 
 NOTE: `pool-utilization-alarm` is not yet a typed `setSchema` leaf (no

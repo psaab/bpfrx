@@ -517,6 +517,39 @@ func TestStartStopNoSampler(t *testing.T) {
 	}
 }
 
+// TestStopWithoutStart: Stop must not block when Start was never called.
+func TestStopWithoutStart(t *testing.T) {
+	vb := &viewBox{}
+	m := New(vb.get, nil) // valid sampler, but never Start()ed
+	done := make(chan struct{})
+	go func() { m.Stop(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Stop blocked when Start was never called")
+	}
+}
+
+// TestDoubleStartStop: Start twice + Stop twice must not panic or block.
+func TestDoubleStartStop(t *testing.T) {
+	vb := &viewBox{}
+	m := New(vb.get, nil)
+	m.tick = time.Hour
+	m.Start()
+	m.Start() // second Start is a no-op
+	done := make(chan struct{})
+	go func() {
+		m.Stop()
+		m.Stop() // second Stop is a no-op
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("double Start/Stop blocked or deadlocked")
+	}
+}
+
 // TestStartTriggersEvaluate: Start runs an immediate evaluation so an
 // already-over-threshold pool surfaces without waiting a full tick.
 func TestStartTriggersEvaluate(t *testing.T) {

@@ -113,6 +113,69 @@ func TestAppliedNATViewFIBBumpStaysCoherent(t *testing.T) {
 	}
 }
 
+// TestAppliedNATViewDeferredApplyHolds is the r11 fixed point (Codex r10
+// BLOCKER): a DeferWorkers (RETH-MAC bring-up) apply must NOT record
+// appliedSnapshot, because the helper accepts the new generation
+// (status echoes it) but SKIPS reconcile_status_bindings — its NAT pool
+// counters are still the OLD generation. So in the defer window the view must
+// report HelperCoherent=false (HOLD), not coherent-against-stale-counters.
+// Mutation: capturing on the deferred apply (the r10 bug) makes appliedGen ==
+// statusGen == new and the view wrongly coherent — this test then fails.
+func TestAppliedNATViewDeferredApplyHolds(t *testing.T) {
+	m := New()
+	m.proc = selfProc(t)
+	cfgOld := &config.Config{}
+	// Prior reconciled apply at gen 5.
+	m.generation = 5
+	m.lastSnapshot = &ConfigSnapshot{Config: cfgOld, Generation: 5}
+	m.markAppliedSnapshotLocked() // applied gen = 5
+	m.lastStatus = ProcessStatus{LastSnapshotGeneration: 5}
+
+	// A new apply lands while workers are deferred (RETH-MAC bring-up).
+	cfgNew := &config.Config{}
+	m.deferWorkers = true
+	m.generation = 6
+	m.lastSnapshot = &ConfigSnapshot{Config: cfgNew, Generation: 6, DeferWorkers: true}
+	m.markAppliedSnapshotLocked() // r11: must SKIP capture while deferred
+	// Helper accepted the new gen (snapshot.rs:63) but has NOT reconciled.
+	m.lastStatus = ProcessStatus{LastSnapshotGeneration: 6}
+
+	v := m.AppliedNATView()
+	if !v.Available {
+		t.Fatal("should be available")
+	}
+	if v.HelperCoherent {
+		t.Fatal("deferred (not-reconciled) apply must be HelperCoherent:false (HOLD)")
+	}
+	if v.AppliedGeneration != 5 {
+		t.Fatalf("applied generation must stay at the last RECONCILED gen 5, got %d", v.AppliedGeneration)
+	}
+
+	// After the link-cycle rebind reconcile (deferWorkers cleared, helper
+	// forwarding now at gen 6), the post-rebind capture records gen 6.
+	m.deferWorkers = false
+	m.markAppliedSnapshotLocked() // simulates the NotifyLinkCycle capture
+	v = m.AppliedNATView()
+	if !v.HelperCoherent || v.AppliedGeneration != 6 {
+		t.Fatalf("after reconcile capture, expected coherent at gen 6, got %+v", v)
+	}
+}
+
+// TestAppliedNATViewGenZeroUnavailableNotClear is r11 #3: a helper restart
+// (appliedSnapshot cleared to gen 0) before the first reconciled apply must
+// surface as Available:false (HOLD), NOT a coherent view that the monitor would
+// treat as cfg==nil → clear-all and falsely clear pre-restart alarms.
+func TestAppliedNATViewGenZeroUnavailableNotClear(t *testing.T) {
+	m := New()
+	m.proc = selfProc(t)
+	// Helper running, status reports gen 0, no applied snapshot captured yet.
+	m.lastStatus = ProcessStatus{LastSnapshotGeneration: 0}
+	v := m.AppliedNATView()
+	if v.Available {
+		t.Fatal("gen==0 (no reconciled apply) must be Available:false (HOLD), not a clear signal")
+	}
+}
+
 // TestAppliedNATViewDedup: two status entries for the same pool report
 // identical UsedPorts (shared allocator); the view takes one entry, never sums.
 func TestAppliedNATViewDedup(t *testing.T) {

@@ -1076,6 +1076,15 @@ func (m *Manager) NotifyLinkCycle() {
 		return
 	}
 	_ = m.applyHelperStatusLocked(&status)
+	// #2079 r11: the deferred apply (DeferWorkers) skipped the appliedSnapshot
+	// capture because the helper had not reconciled its forwarding state. The
+	// rebind above reconciles the bindings (and swaps the coordinator
+	// forwarding state to the applied generation), so NOW record the applied
+	// snapshot — its config + generation are coherent with the NAT pool
+	// counters the helper will report. m.deferWorkers is cleared by the daemon
+	// before NotifyLinkCycle, so markAppliedSnapshotLocked's defer-skip does
+	// not suppress this capture.
+	m.markAppliedSnapshotLocked()
 	ready := 0
 	for _, b := range status.Bindings {
 		if b.Ready {

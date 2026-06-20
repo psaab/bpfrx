@@ -495,17 +495,6 @@ func (d *Daemon) Run(ctx context.Context) error {
 	d.ipmon.SetNextHopResolver(d.resolveDHCPNextHop)
 	d.ipmon.Start()
 
-	// #2079: NAT source pool-utilization-alarm monitor. Slow (10s) loop over
-	// the helper's last-applied NAT pool snapshot; raises/clears
-	// `show security alarms` entries with hysteresis and emits one structured
-	// RT_NAT syslog line per transition. Skipped in NoDataplane mode (no
-	// helper to sample). The emitter reads d.eventReader lazily at emit time
-	// (it is wired later in this run path), so it is safe to start now.
-	if !d.opts.NoDataplane {
-		d.natPoolAlarm = natpoolalarm.New(d.natPoolAlarmSampler(), d.natPoolAlarmEmitter())
-		d.natPoolAlarm.Start()
-	}
-
 	// Initialize cluster manager if configured (heartbeat/sync started after applyConfig).
 	if cfg := d.store.ActiveConfig(); cfg != nil && cfg.Chassis.Cluster != nil {
 		cc := cfg.Chassis.Cluster
@@ -879,6 +868,17 @@ func (d *Daemon) Run(ctx context.Context) error {
 				d.runUserspaceEventStream(ctx)
 			}()
 		}
+
+		// #2079: start the NAT source pool-utilization-alarm monitor HERE —
+		// after d.dp and d.eventReader are both fully assigned above — so the
+		// monitor goroutine's sampler (reads d.dp) and emitter (reads
+		// d.eventReader) never race with their initialization. Slow (10s) loop
+		// over the helper's last-applied NAT pool snapshot; raises/clears
+		// `show security alarms` entries with hysteresis and emits one
+		// structured RT_NAT syslog line per transition. (The whole block is
+		// gated on a non-NoDataplane dataplane being present.)
+		d.natPoolAlarm = natpoolalarm.New(d.natPoolAlarmSampler(), d.natPoolAlarmEmitter())
+		d.natPoolAlarm.Start()
 	}
 
 	// Start cluster heartbeat + sync after event fanout is initialized.

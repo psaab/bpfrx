@@ -66,8 +66,29 @@ type AppliedNATView struct {
 // hold m.mu and MUST call this only AFTER a successful full apply_snapshot
 // (or on the status-loop catch-up path where the helper already echoes
 // m.lastSnapshot.Generation), where m.lastSnapshot is the applied snapshot.
+//
+// r11 (Codex r10 BLOCKER — deferred-apply reconcile-skew): the helper sets
+// last_snapshot_generation the instant it ACCEPTS a snapshot
+// (userspace-dp snapshot.rs:63), but a DeferWorkers (RETH-MAC bring-up) apply
+// stores the snapshot and SKIPS reconcile_status_bindings — so the NAT pool
+// counters (read from the coordinator's forwarding state, swapped only on
+// reconcile) are still the OLD generation until the post-NotifyLinkCycle
+// rebind. Capturing the NEW generation here would make AppliedNATView report
+// HelperCoherent=true (status gen == applied gen) while config and counters
+// are mismatched. So we record the applied snapshot ONLY on a RECONCILED
+// apply: skip the capture while workers are deferred (m.deferWorkers) — the
+// post-rebind capture in NotifyLinkCycle records it once the helper has
+// reconciled. m.appliedSnapshot therefore stays at the previous reconciled
+// generation, so coherency correctly evaluates false (HOLD) during the defer
+// window.
 func (m *Manager) markAppliedSnapshotLocked() {
 	if m.lastSnapshot == nil {
+		return
+	}
+	if m.deferWorkers {
+		// Deferred (not-yet-reconciled) apply — do NOT record. The
+		// post-NotifyLinkCycle rebind reconcile captures the applied
+		// snapshot once the helper's forwarding state is the new generation.
 		return
 	}
 	m.appliedSnapshot = appliedSnapshot{
@@ -93,7 +114,17 @@ func (m *Manager) AppliedNATView() AppliedNATView {
 		return AppliedNATView{Available: false}
 	}
 
-	coherent := m.lastStatus.LastSnapshotGeneration == m.appliedSnapshot.Generation
+	// r11: coherency additionally requires workers NOT be deferred. During a
+	// RETH-MAC bring-up defer window the helper has accepted the new snapshot
+	// generation (status echoes it) but has NOT reconciled its forwarding
+	// state — the NAT pool counters are still the old generation. Belt-and-
+	// suspenders alongside the deferred-apply capture skip: even if the daemon
+	// has already cleared m.deferWorkers in the narrow window before the
+	// rebind, the capture-skip keeps m.appliedSnapshot at the previous
+	// reconciled generation, so the equality below is already false. This
+	// guard makes the HOLD explicit for the in-window state.
+	coherent := !m.deferWorkers &&
+		m.lastStatus.LastSnapshotGeneration == m.appliedSnapshot.Generation
 
 	pools := make(map[string]AppliedNATPoolStatus, len(m.lastStatus.SourceNATPools))
 	for _, p := range m.lastStatus.SourceNATPools {

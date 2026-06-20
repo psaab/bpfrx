@@ -111,8 +111,9 @@ type Monitor struct {
 	tick   time.Duration
 	nowFn  func() time.Time
 
-	mu     sync.Mutex
-	active map[string]*alarmState
+	mu      sync.Mutex
+	active  map[string]*alarmState
+	started bool // run() launched (guards Stop against an unstarted monitor)
 
 	stop chan struct{}
 	done chan struct{}
@@ -133,30 +134,41 @@ func New(sample Sampler, emit Emitter) *Monitor {
 	}
 }
 
-// Start launches the evaluation loop. It is a no-op if sample is nil.
+// Start launches the evaluation loop. It is a no-op if the monitor is nil or
+// the sampler is nil, and is safe to call at most once.
 func (m *Monitor) Start() {
 	if m == nil || m.sample == nil {
-		// Nothing to sample — close done so Stop() does not block.
-		if m != nil {
-			close(m.done)
-		}
 		return
 	}
+	m.mu.Lock()
+	if m.started {
+		m.mu.Unlock()
+		return
+	}
+	m.started = true
+	m.mu.Unlock()
 	go m.run()
 }
 
-// Stop terminates the evaluation loop and waits for it to exit.
+// Stop terminates the evaluation loop and waits for it to exit. It is safe to
+// call whether or not Start was ever called (an unstarted monitor's loop never
+// ran, so there is no goroutine to join) and is idempotent.
 func (m *Monitor) Stop() {
 	if m == nil {
 		return
 	}
+	m.mu.Lock()
+	started := m.started
+	m.mu.Unlock()
 	select {
 	case <-m.stop:
 		// already stopped
 	default:
 		close(m.stop)
 	}
-	<-m.done
+	if started {
+		<-m.done // join the run() goroutine
+	}
 }
 
 func (m *Monitor) run() {

@@ -53,9 +53,13 @@ set security nat source pool-utilization-alarm clear-threshold 70
 
 This is a single GLOBAL raise/clear pair (matching Junos `set security nat
 source pool-utilization-alarm` scope); the same thresholds apply to every
-source pool. Commit-time validation requires `0 < clear-threshold <
-raise-threshold <= 100` — a bare `pool-utilization-alarm;` (raise=0/clear=0)
-and inverted/equal thresholds are hard commit errors (`compiler_nat.go`).
+source pool. Validation requires `0 < clear-threshold < raise-threshold <= 100`
+with the standard strict-vs-lenient split (`validatePoolUtilizationAlarm`,
+`compiler_nat.go`): a bare `pool-utilization-alarm;` (raise=0/clear=0) and
+inverted/equal thresholds are hard `commit`/`commit check` errors, but the
+tolerant load / HA peer-sync path downgrades them to a warning so a node that
+committed a legacy config before this gate existed still boots (the runtime
+monitor treats raise<=0 as disabled, so a leniently-loaded bad config is inert).
 
 Runtime behaviour (vSRX-faithful) is driven by a slow (10s) daemon-resident
 monitor (`pkg/natpoolalarm`) over the helper's LAST-APPLIED NAT pool snapshot
@@ -77,11 +81,16 @@ on a transition — never per tick) it:
 An alarm is also cleared when its last referencing source-NAT rule is removed,
 the pool is removed from config, the pool is converted to deterministic, or the
 alarm feature is disabled. The monitor HOLDs (makes no decision, neither raise
-nor clear) when the dataplane view is unavailable (helper down) or mid-apply
-(status generation != applied generation), and for transiently uncomputable
-samples (`AddressCount==0` / `PortHigh<PortLow` / capacity 0). Deterministic
-pools are SKIPPED in this release — `UsedPorts` is not the right numerator for
-block-based allocation; block-based utilization is a follow-up.
+nor clear) when the dataplane view is unavailable (helper down / no reconciled
+apply yet — including just after a helper restart) or mid-apply (status
+generation != applied generation), during a RETH-MAC bring-up `DeferWorkers`
+window (the helper has accepted the new generation but not yet reconciled its
+forwarding state, so the NAT counters are still the old generation — the applied
+snapshot is recorded only after the post-`NotifyLinkCycle` rebind reconcile),
+and for transiently uncomputable samples (`AddressCount==0` / `PortHigh<PortLow`
+/ capacity 0). Deterministic pools are SKIPPED in this release — `UsedPorts` is
+not the right numerator for block-based allocation; block-based utilization is a
+follow-up.
 
 NOTE: the legacy eBPF `nat_port_counters` map (read by `metrics_nat.go` and
 the CLI `show security nat source pool` "Utilization %") is never incremented
