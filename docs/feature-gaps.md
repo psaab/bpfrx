@@ -428,7 +428,7 @@ xpf has hostname, domain-name, domain-search, timezone, name-servers, NTP, servi
 
 | Feature | Junos Config Path | Description | Priority | Status |
 |---------|-------------------|-------------|----------|--------|
-| **SSH Key Exchange** | `system services ssh key-exchange ...` | Restrict the SSH key-exchange (KEX) algorithms the firewall offers | Medium | Done (H5/#2008 — repeatable leaf rendered to the sshd `KexAlgorithms` drop-in, `pkg/daemon/daemon_system.go`) |
+| **SSH Key Exchange** | `system services ssh key-exchange ...` | Restrict the SSH key-exchange (KEX) algorithms the firewall offers | Medium | Done (H5/#2008 — repeatable leaf rendered to the sshd `KexAlgorithms` drop-in, `pkg/daemon/daemon_system.go`; drop-in lifecycle hardened in #2062 — removing/emptying the ssh stanza removes the `/etc/ssh/sshd_config.d/xpf.conf` drop-in and reloads so sshd reverts to base-image defaults, and a reload failure after a write reverts the drop-in to its prior content/removes it so a bad config never breaks the next sshd restart) |
 | **RADIUS Server Config** | `system radius-server ... port ... secret ...` | RADIUS server definitions for AAA (authentication, authorization, accounting) | Medium | Missing |
 | **TACACS+ Server Config** | `system tacplus-server ... port ... secret ...` | TACACS+ server definitions for per-command authorization | Medium | Missing |
 | **Authentication Order** | `system authentication-order [radius tacplus password]` | Control order of authentication methods for management access | Medium | Missing |

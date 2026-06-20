@@ -1876,7 +1876,17 @@ func compileApplications(node *Node, apps *ApplicationsConfig) error {
 		as := &ApplicationSet{Name: inst.name}
 
 		for _, member := range inst.node.Children {
-			if member.Name() == "application" {
+			// An application-set member is either an individual application
+			// reference (`application <name>`) or a nested application-set
+			// reference (`application-set <name>`). Both kinds are stored in
+			// as.Applications; ExpandApplicationSet distinguishes them by
+			// looking each member name up in apps.ApplicationSets and recursing
+			// (max depth 3). Dropping the nested-set arm here silently lost the
+			// child set's applications from the parent, so a policy matching the
+			// parent set under-matched (#2068). This mirrors compileAddressBook,
+			// which handles both `address` and `address-set` members.
+			switch member.Name() {
+			case "application", "application-set":
 				v := nodeVal(member)
 				if v != "" {
 					as.Applications = append(as.Applications, v)

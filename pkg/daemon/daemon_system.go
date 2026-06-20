@@ -878,41 +878,136 @@ func (d *Daemon) reconcileUserPassword(user *config.LoginUser) {
 	}
 }
 
+// sshdConfPath is the xpf-managed sshd drop-in. Overridable in tests so the
+// remove/revert side effects can be exercised against a temp dir.
+var sshdConfPath = "/etc/ssh/sshd_config.d/xpf.conf"
+
+// FS + reload seam (#2062). applySSHConfig owns three real-world side effects
+// — write the drop-in, remove the drop-in, reload sshd — and the
+// config-removal and reload-failure recovery paths can only be tested if those
+// effects are injectable. These package-level vars default to the production
+// implementations and are overridden by a recorder in daemon_ssh_test.go.
+// Mirrors the listenFn/ensureLinkLocalFn seam in pkg/ra.
+var (
+	sshdReadFile   = os.ReadFile
+	sshdWriteFile  = fsatomic.WriteFileAtomic
+	sshdRemoveFile = os.Remove
+	sshdMkdirAll   = os.MkdirAll
+	sshdReloadCmd  = func() ([]byte, error) {
+		return runCommandTimeout("systemctl", "reload", "sshd")
+	}
+)
+
 // applySSHConfig configures sshd from system { services { ssh { ... } } }.
 // Uses a drop-in config file to avoid modifying the main sshd_config.
+//
+// Drop-in lifecycle (#2062): the drop-in is created/updated when there are
+// xpf-managed ssh settings, and REMOVED when there are none — including when
+// the whole ssh stanza is deleted (cfg.System.Services / .SSH == nil) — so
+// clearing the config reverts sshd to the base-image defaults instead of
+// leaving stale PermitRootLogin/KexAlgorithms enforced — an existing drop-in
+// that cannot be read (permission/IO error) is still treated as present so it
+// gets removed. If the reload fails after a write, the drop-in is reverted to
+// its prior content (or removed if there was none, the prior was unreadable,
+// or the restore write itself fails) so a bad config never persists to break
+// the next sshd restart.
 func (d *Daemon) applySSHConfig(cfg *config.Config) {
-	if cfg.System.Services == nil || cfg.System.Services.SSH == nil {
+	var ssh *config.SSHServiceConfig
+	if cfg.System.Services != nil {
+		ssh = cfg.System.Services.SSH
+	}
+
+	// buildSSHDConfig is nil-safe and returns "" when there is nothing to
+	// manage, so an absent ssh stanza and an ssh stanza with no recognised
+	// leaves collapse to the same "no managed settings" case.
+	content := buildSSHDConfig(ssh)
+
+	// Read the prior content once: needed both to skip no-op writes and to
+	// restore the file if a reload fails after we change it.
+	//
+	// Distinguish "absent" from "exists but unreadable": a permission/IO error
+	// reading an existing drop-in is NOT the same as no drop-in. Treating an
+	// unreadable-but-present file as absent would skip removal and leave a
+	// stale drop-in enforcing PermitRootLogin/KexAlgorithms after the config
+	// was cleared. hadDropIn = the file exists (read OK, or failed with
+	// something other than not-exist); priorReadable = we actually have its
+	// content (only then can we restore it on a reload failure).
+	prior, priorErr := sshdReadFile(sshdConfPath)
+	priorReadable := priorErr == nil
+	hadDropIn := priorReadable || !os.IsNotExist(priorErr)
+
+	if content == "" {
+		// No xpf-managed ssh settings. Remove any existing drop-in and reload
+		// so sshd reverts to base-image defaults. No-op when absent.
+		if !hadDropIn {
+			return
+		}
+		if err := sshdRemoveFile(sshdConfPath); err != nil && !os.IsNotExist(err) {
+			slog.Warn("failed to remove sshd config drop-in", "err", err)
+			return
+		}
+		if out, err := sshdReloadCmd(); err != nil {
+			slog.Error("failed to reload sshd after removing drop-in",
+				"err", err, "output", strings.TrimSpace(string(out)))
+			return
+		}
+		slog.Info("SSH config drop-in removed (reverted to defaults)")
 		return
 	}
 
-	ssh := cfg.System.Services.SSH
-
-	content := buildSSHDConfig(ssh)
-	if content == "" {
-		return // nothing to manage
-	}
-
-	confPath := "/etc/ssh/sshd_config.d/xpf.conf"
-
-	current, _ := os.ReadFile(confPath)
-	if string(current) == content {
+	if priorReadable && string(prior) == content {
 		return // no change
 	}
 
-	os.MkdirAll("/etc/ssh/sshd_config.d", 0755)
+	// Best-effort create the drop-in directory before writing. If this fails
+	// the write below will also fail, but the mkdir error is the real cause
+	// (e.g. a read-only /etc) so surface it rather than only the opaque write
+	// error.
+	if err := sshdMkdirAll("/etc/ssh/sshd_config.d", 0755); err != nil {
+		slog.Warn("failed to create sshd config drop-in directory", "err", err)
+	}
 	// AtomicGeneratedConfig (D2): regenerated each apply and reloaded
 	// immediately. A power-cut loss reverts PermitRootLogin to the base
 	// image default (prohibit-password) until the next boot apply — that
 	// FAILS SAFE (more restrictive, never more permissive), so no fsync.
-	if err := fsatomic.WriteFileAtomic(confPath, []byte(content), 0644); err != nil {
+	if err := sshdWriteFile(sshdConfPath, []byte(content), 0644); err != nil {
 		slog.Warn("failed to write sshd config", "err", err)
 		return
 	}
 
-	// Reload sshd to pick up changes
-	if out, err := runCommandTimeout("systemctl", "reload", "sshd"); err != nil {
+	// Reload sshd to pick up changes. On failure the drop-in we just wrote is
+	// syntactically/semantically bad (e.g. an invalid key-exchange algorithm)
+	// and would break the next sshd RESTART, so revert it to the prior state:
+	// restore the previous content, or remove the file if there was none.
+	if out, err := sshdReloadCmd(); err != nil {
 		slog.Error("failed to reload sshd",
 			"err", err, "output", strings.TrimSpace(string(out)))
+		// Revert. Only restore the prior content when we actually read it
+		// (priorReadable); an unreadable-but-present prior is unknown, so
+		// fail safe by removing the drop-in instead of restoring garbage.
+		if priorReadable {
+			if rerr := sshdWriteFile(sshdConfPath, prior, 0644); rerr != nil {
+				// Restoring the prior content failed too. No drop-in is safer
+				// than the known-bad content we just wrote (which would break
+				// the next sshd restart), so fall back to removing the file.
+				slog.Warn("failed to restore prior sshd config after reload failure; removing drop-in", "err", rerr)
+				if rmErr := sshdRemoveFile(sshdConfPath); rmErr != nil && !os.IsNotExist(rmErr) {
+					slog.Warn("failed to remove bad sshd config after failed restore", "err", rmErr)
+				}
+			}
+		} else {
+			if rerr := sshdRemoveFile(sshdConfPath); rerr != nil && !os.IsNotExist(rerr) {
+				slog.Warn("failed to remove bad sshd config after reload failure", "err", rerr)
+			}
+		}
+		// Best-effort reload of the restored content so the running sshd is
+		// not left referencing a drop-in we just rewrote/removed underneath
+		// it. The original reload already failed; a second failure here is
+		// only logged.
+		if out2, err2 := sshdReloadCmd(); err2 != nil {
+			slog.Warn("failed to reload sshd after reverting drop-in",
+				"err", err2, "output", strings.TrimSpace(string(out2)))
+		}
 		return
 	}
 	slog.Info("SSH config applied",
