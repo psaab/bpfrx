@@ -1,5 +1,87 @@
 # Action Log
 
+## 2026-06-19 — #1925 review r2: declare growpart dep + mktemp guard
+
+- **Timestamp**: 2026-06-19
+- **Action**: Fixed a Codex round-2 MAJOR (DOA) + MINOR on PR #2047.
+  MAJOR: growpart was an UNDECLARED runtime dependency. It ships in the
+  base cloudimg only transitively via cloud-init, which the bake purges
+  + autoremoves — so the autoremove orphaned cloud-guest-utils and
+  xpf-grow-root's growpart call would fail on EVERY boot (no stamp,
+  retry, exit 0 → root stays bake-sized forever; feature silently dead).
+  Fix: added `cloud-guest-utils` (provides /usr/bin/growpart on Ubuntu
+  26.04 — verified by inspecting the .deb: dpkg-deb -c ships
+  ./usr/bin/growpart; package exists in Ubuntu questing/26.04, same
+  cloud-utils source) + `e2fsprogs` (belt-and-suspenders for resize2fs)
+  to bake.py RUNTIME_PACKAGES AND to debian/control xpf-appliance
+  Depends (kept in sync per the metapackage contract). Corrected the
+  bake.py comment that wrongly claimed growpart was "already in the
+  image". Added a bake-time HARD-ASSERT (`command -v growpart` +
+  `resize2fs`, FATAL+exit 1) so future package-name drift fails the
+  bake, and a matching presence check at the top of validate.py
+  Scenario D (clear cause vs the downstream "partition still 8GiB"
+  symptom). MINOR: test-grow-root.sh now fails hard if `mktemp -d`
+  fails (read-only TMPDIR) instead of running with empty WORK and
+  writing under /bin and /sys. Validated: bake assertion snippet sh -n
+  / dash -n clean + behaves (FATAL when absent, exit 0 + present-line
+  when shimmed present); mktemp guard fires on a read-only TMPDIR;
+  self-test 35/35; bash -n / dash -n / shellcheck clean; py_compile
+  clean.
+- **File(s)**: scripts/image/bake.py, scripts/image/validate.py,
+  scripts/image/test-grow-root.sh, debian/control
+
+## 2026-06-19 — #1925 review fix: stamp only on genuine grow success
+
+- **Timestamp**: 2026-06-19
+- **Action**: Fixed a Codex MAJOR on PR #2047. The wrapper turned real
+  growpart/resize2fs failures into exit 0 and the unit then stamped
+  `/etc/xpf/.root-grown` unconditionally via ExecStartPost — so a FAILED
+  grow (esp. the dangerous partial: growpart grew the partition but
+  resize2fs failed, leaving the fs at the bake size) was stamped and
+  never retried, stranding the disk space forever. Decoupled "never
+  block boot" from "stamp only on genuine success": the WRAPPER now owns
+  the stamp via a single `finish()` exit path that writes the stamp iff
+  `grow_ok` stayed 1 (NOCHANGE/nothing-to-grow, or partition grew AND
+  resize2fs succeeded) and ALWAYS exits 0. A real growpart failure, the
+  resize2fs-failed partial, or an unresolved root device set `grow_ok=0`
+  → no stamp → ConditionPathExists re-fires → retry; the retry converges
+  (growpart NOCHANGE + resize2fs finishes the fs). Removed the unit's
+  unconditional ExecStartPost touch (and the now-redundant ExecStartPre
+  mkdir — finish() mkdir -p's the stamp dir). Added `XPF_GROW_ROOT_STAMP`
+  test seam. Extended test-grow-root.sh to 35 assertions incl.
+  resize2fs-fails (no stamp, exit 0), growpart-real-failure, and
+  retry-convergence; proven non-tautological — the failure cases fail
+  6/6 against an unconditional-stamp build. bash -n / dash -n /
+  shellcheck clean; self-test 35/35.
+- **File(s)**: scripts/image/xpf-grow-root,
+  scripts/image/xpf-grow-root.service, scripts/image/test-grow-root.sh
+
+## 2026-06-19 — #1925 Item 1: first-boot root auto-grow (Path A)
+
+- **Timestamp**: 2026-06-19
+- **Action**: Implemented the PLAN-READY Path A — a first-boot-only
+  systemd one-shot that grows the root partition + ext4 filesystem to fill
+  an operator-resized disk, using `growpart` + `resize2fs` (already in the
+  baked image), restoring the cloud-init auto-grow the bake purged. The
+  wrapper resolves the live root device from `findmnt /` (bus-agnostic:
+  vda/sda/nvme), grows ONLY the root partition, treats `growpart` NOCHANGE
+  as success, and is non-fatal on every path. The unit is stamp-gated
+  (`/etc/xpf/.root-grown`), ordered `Before=local-fs.target xpfd.service
+  xpf-day0-config.service`. A/B-safety: root is the physically last
+  partition and the #1930 A/B slots are ESP directories (not partitions),
+  so the grow cannot touch the ESP/`/boot`/BIOS-boot or any partition
+  number. Wired into `bake.py` (copy-in + chmod + enable; seal removes the
+  stamp). Added `validate.py` Scenario D (20 GiB grow + idempotent reboot +
+  bake-size no-op control) and a non-tautological device-resolution
+  self-test (`test-grow-root.sh`, 12/12 pass). Docs in
+  `install-images.md` + `image-validation.md`. bash -n / dash -n /
+  shellcheck clean; py_compile clean. Lab gate (baked-image Scenario-D
+  boot) is the campaign owner's to run.
+- **File(s)**: scripts/image/xpf-grow-root,
+  scripts/image/xpf-grow-root.service, scripts/image/test-grow-root.sh,
+  scripts/image/bake.py, scripts/image/validate.py,
+  docs/install-images.md, docs/image-validation.md
+
 ## 2026-06-20 — #1993 FRR clear MAJOR fix: require LIVE forwarding, not just pins
 
 - **Timestamp**: 2026-06-20
@@ -6307,3 +6389,5 @@ top.
 - **Timestamp**: 2026-06-20
 - **Action**: #1434 Increment 1 (PR #2048 Copilot review) — harden wgkey.HexToBase64 against an oversized/malformed payload. Copilot flagged it decoded the full hex string before the length check, so a malformed/oversized helper local_pubkey_hex would be hex-decoded (arbitrary buffer) before rejection. Added a pre-decode length guard: reject len(hexKey) != KeyLen*2 BEFORE hex.DecodeString (post-decode len(raw)!=KeyLen retained as defense-in-depth). Tests: extended TestHexToBase64 with an oversized 4096-char input -> error (exercises the pre-decode guard) and a full-length non-hex input -> error. go test ./pkg/wgkey/... ok; go build ./... clean. Defensive, display-path only; no crypto/keygen change.
 - **File(s)**: pkg/wgkey/wgkey.go, pkg/wgkey/wgkey_test.go, _Log.md
+- **Action**: #1925 (#2047 Codex r3 MINOR) — correct stale growpart-dependency wording in comments/docs. The r2 fix declared cloud-guest-utils explicitly in RUNTIME_PACKAGES + debian/control, but three spots still said the tools were "already in the image" and named the legacy `cloud-utils-growpart` — preserving the exact wrong mental model that caused the r2 DOA MAJOR. Updated scripts/image/xpf-grow-root (header), scripts/image/xpf-grow-root.service (header), and docs/install-images.md to state that growpart (cloud-guest-utils) + resize2fs (e2fsprogs) are EXPLICITLY installed because the cloud-init purge + apt autoremove would otherwise remove the growpart provider, with the bake-time `command -v growpart` assert as the guard. Comment/doc-only; bash -n + shellcheck clean on the wrapper.
+- **File(s)**: scripts/image/xpf-grow-root, scripts/image/xpf-grow-root.service, docs/install-images.md, _Log.md

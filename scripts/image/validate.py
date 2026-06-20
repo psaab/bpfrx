@@ -11,9 +11,13 @@ never the shared loss cluster) and proves the first-boot contract:
      boot (hostname applied); a reboot does NOT re-apply (stamp).
   c  invalid day-0 drive -> commit-check REJECT logged, nothing installed,
      boot survives, factory bootstrap still reachable.
+  d  resized disk (#1925) -> first-boot root auto-grow fills a LARGER root
+     disk (partition + ext4), stamps, is idempotent on reboot, and leaves the
+     ESP/boot substrate intact; a control boot at the bake size is a clean
+     no-op.
 
 Usage:
-  validate.py --qcow2 <img> --metadata <tar.gz> [a|b|c|all]
+  validate.py --qcow2 <img> --metadata <tar.gz> [a|b|c|d|all]
 """
 
 import argparse
@@ -124,10 +128,17 @@ class Harness:
         info(f"importing image into local incus as {ALIAS}")
         incus("image", "import", self.metadata, self.qcow2, "--alias", ALIAS)
 
-    def launch(self, name, iso=None):
+    def launch(self, name, iso=None, root_size=None):
         incus("delete", "-f", name, check=False, capture=True)
         incus("init", ALIAS, name, "--vm", "--network", self.net,
               "-c", "limits.cpu=2", "-c", "limits.memory=2GiB", capture=True)
+        if root_size:
+            # Override the instance's root disk to a size LARGER than the
+            # image (#1925 Scenario D). `device override root` materializes an
+            # instance-local copy of the profile's root device so size= sticks
+            # before the VM ever boots — the operator-resized-disk case.
+            incus("config", "device", "override", name, "root",
+                  f"size={root_size}", capture=True)
         if iso:
             incus("config", "device", "add", name, "day0", "disk",
                   f"source={os.path.realpath(iso)}", capture=True)
@@ -275,6 +286,98 @@ class Harness:
         info("Scenario C PASS (fallback reachable, boot survived)")
         self.drop("xpf-image-c")
 
+    def _root_fs_gib(self, name):
+        """Total size of the root filesystem in GiB (float), via df."""
+        out = guest(name, "sh", "-c",
+                    "df -B1 --output=size / | tail -n1", capture=True).stdout.strip()
+        return int(out) / (1024.0 ** 3)
+
+    def _root_part_gib(self, name):
+        """Total size of the partition backing / in GiB (float), via lsblk
+        on the resolved root source device — proves the PARTITION grew, not
+        just the fs."""
+        src = guest(name, "sh", "-c", "findmnt -no SOURCE /",
+                    capture=True).stdout.strip()
+        out = guest(name, "sh", "-c",
+                    f"lsblk -bno SIZE {src} | head -n1", capture=True).stdout.strip()
+        return int(out) / (1024.0 ** 3)
+
+    def scenario_d(self):
+        info("── Scenario D: first-boot root auto-grow on a resized disk (#1925) ──")
+
+        # ── Grow case: provision a root disk LARGER than the 8 GiB bake. ──
+        info("D1 grow: launching with a 20GiB root disk (bake is 8GiB)...")
+        self.launch("xpf-image-d", root_size="20GiB")
+        self.wait_xpfd("xpf-image-d")
+        # growpart + resize2fs MUST survive the cloud-init purge + autoremove
+        # (#1925); a missing tool makes the grow a permanent no-op. Assert
+        # presence first so package-name drift fails here with a clear cause
+        # rather than as the downstream "partition still 8GiB" symptom.
+        if not guest_sh("xpf-image-d", 'command -v growpart >/dev/null'):
+            fail("growpart missing in the image — cloud-guest-utils not installed "
+                 "(#1925 grow would no-op; the cloud-init purge orphaned it)")
+        if not guest_sh("xpf-image-d", 'command -v resize2fs >/dev/null'):
+            fail("resize2fs missing in the image — e2fsprogs not installed (#1925)")
+        if not guest_sh("xpf-image-d", 'systemctl is-active --quiet xpf-grow-root'):
+            fail("xpf-grow-root.service is not active after first boot")
+        if guest("xpf-image-d", "test", "-e", "/etc/xpf/.root-grown",
+                 check=False).returncode != 0:
+            fail("root-grow stamp /etc/xpf/.root-grown missing after grow")
+        part = self._root_part_gib("xpf-image-d")
+        fs = self._root_fs_gib("xpf-image-d")
+        info(f"D1 grow: root partition {part:.1f}GiB, filesystem {fs:.1f}GiB")
+        # The 20GiB disk minus the small ESP/BIOS/BOOT partitions leaves the
+        # root partition well above the 8GiB bake floor; assert it grew past a
+        # conservative midpoint so a no-grow regression (still ~8GiB) fails.
+        if part < 15.0:
+            fail(f"root partition only {part:.1f}GiB on a 20GiB disk — did not grow")
+        if fs < 15.0:
+            fail(f"root filesystem only {fs:.1f}GiB on a 20GiB disk — resize2fs did not run")
+        # The grow must not have disturbed the dataplane gate.
+        if guest("xpf-image-d", "nice", "-n", "19", "/usr/local/sbin/xpfd",
+                 "verify-dataplane", check=False).returncode != 0:
+            fail("verify-dataplane REJECTED after root grow")
+        # Boot/ESP partitions intact: exactly the root partition grew, the
+        # partition count is unchanged, and the ESP is still mounted.
+        if not guest_sh("xpf-image-d", 'mountpoint -q /boot/efi'):
+            fail("ESP (/boot/efi) not mounted after grow — boot substrate disturbed")
+
+        # ── Idempotency: reboot must NOT re-grow / re-stamp. ──
+        info("D1 idempotency: rebooting — second boot must skip the grow...")
+        incus("restart", "xpf-image-d")
+        self.wait_agent("xpf-image-d")
+        self.wait_xpfd("xpf-image-d")
+        if not guest_sh("xpf-image-d",
+                        'systemctl show -p ConditionResult xpf-grow-root | grep -q '
+                        '"ConditionResult=no"'):
+            fail("second boot did not condition-skip xpf-grow-root (stamp ineffective)")
+        part2 = self._root_part_gib("xpf-image-d")
+        if abs(part2 - part) > 0.1:
+            fail(f"root partition changed across reboot ({part:.1f} -> {part2:.1f}GiB)")
+        info("D1 PASS (grew once, idempotent on reboot, boot substrate intact)")
+        self.drop("xpf-image-d")
+
+        # ── Control (no-op) case: bake-size disk must boot clean, no grow. ──
+        info("D2 control: launching at the exact bake size (no resize)...")
+        self.launch("xpf-image-d2")
+        self.wait_xpfd("xpf-image-d2")
+        # The grow ran (one-shot fired) but was a no-op: growpart NOCHANGE +
+        # resize2fs no-op. The stamp is written either way (clean exit), and
+        # the box boots clean with the dataplane gate green.
+        if guest("xpf-image-d2", "test", "-e", "/etc/xpf/.root-grown",
+                 check=False).returncode != 0:
+            fail("root-grow stamp missing on the control (no-op) boot")
+        if not guest_sh("xpf-image-d2",
+                        'journalctl -u xpf-grow-root -b --no-pager | '
+                        'grep -qiE "NOCHANGE|done"'):
+            fail("control boot: xpf-grow-root did not log a no-op grow")
+        if guest("xpf-image-d2", "nice", "-n", "19", "/usr/local/sbin/xpfd",
+                 "verify-dataplane", check=False).returncode != 0:
+            fail("verify-dataplane REJECTED on the control boot")
+        info("D2 PASS (clean boot, grow was a no-op at bake size)")
+        self.drop("xpf-image-d2")
+        info("Scenario D PASS")
+
 
 def _kver_ge(ver, floor):
     try:
@@ -313,7 +416,8 @@ def main():
     g.add_argument("--no-verify-sig", dest="verify_sig", action="store_const",
                    const=False, help="skip image signature verification (dev)")
     p.set_defaults(verify_sig=True)  # default: verify if a .minisig is present
-    p.add_argument("scenario", nargs="?", default="all", choices=["a", "b", "c", "all"])
+    p.add_argument("scenario", nargs="?", default="all",
+                   choices=["a", "b", "c", "d", "all"])
     a = p.parse_args()
     if not os.path.isfile(a.qcow2):
         fail(f"--qcow2 not found: {a.qcow2}")
@@ -325,7 +429,9 @@ def main():
         h.ensure_network()
         h.import_image()
         scenarios = {"a": [h.scenario_a], "b": [h.scenario_b], "c": [h.scenario_c],
-                     "all": [h.scenario_a, h.scenario_b, h.scenario_c]}[a.scenario]
+                     "d": [h.scenario_d],
+                     "all": [h.scenario_a, h.scenario_b, h.scenario_c,
+                             h.scenario_d]}[a.scenario]
         for s in scenarios:
             s()
         info("Validation complete.")

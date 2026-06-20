@@ -50,7 +50,10 @@ Pipeline (offline — the image is never booted to provision it):
    official Ubuntu *server cloudimg*. Upstream owns partitioning and
    the UEFI/BIOS bootloader.
 3. `virt-resize` the root partition into an 8 GiB work disk
-   (`XPF_IMAGE_DISK_SIZE` overrides).
+   (`XPF_IMAGE_DISK_SIZE` overrides). This is the *floor* size: an
+   operator who provisions a larger root disk gets the extra space
+   automatically via the first-boot root auto-grow (#1925, see
+   "First-boot root auto-grow" below).
 4. `virt-customize` offline: runtime package set (the #1879 plan §5
    dependency matrix; no build toolchain), the cloudimg's reduced
    `linux-virtual` kernel replaced by `linux-generic` (full driver set
@@ -218,6 +221,69 @@ python3 scripts/image/make_config_drive.py [-n 0|1] [-o day0.iso] my-xpf.conf
 
 When an `xpfd` binary is present, the builder runs the same
 commit-check and refuses to build an ISO the appliance would reject.
+
+## First-boot root auto-grow (#1925)
+
+The image ships an 8 GiB root disk (`XPF_IMAGE_DISK_SIZE`). When you
+deploy onto a larger disk — `incus init ... -d root,size=40GiB`,
+`qemu-img resize`, or a bigger libvirt volume — the extra space is
+unallocated GPT free space and `/` cannot use it until the root
+partition + filesystem are grown. The appliance does this **once, on
+first boot, automatically**:
+
+- `scripts/image/xpf-grow-root.service` (oneshot, `RemainAfterExit`,
+  `ConditionPathExists=!/etc/xpf/.root-grown`) runs early — ordered
+  `After=systemd-remount-fs.service` and `Before=local-fs.target
+  xpfd.service xpf-day0-config.service` — so `/var` is full-size before
+  xpf stages its versioned runtime (#1964) or writes the config DB. It
+  stamps `/etc/xpf/.root-grown` on success and never runs again.
+- `scripts/image/xpf-grow-root` resolves the device backing the live
+  root mount from `findmnt /` (bus-agnostic — `vda`/`sda`/`nvme0n1pN`),
+  then `growpart <disk> <partnum>` followed by `resize2fs <rootdev>`.
+  On an exact-bake-size deploy both are no-ops (`growpart` returns
+  `NOCHANGE` when there is no trailing free space; `resize2fs` is a
+  no-op when the fs already fills the partition), and the script never
+  blocks the boot — every failure path is non-fatal.
+
+This restores exactly what the stock cloudimg's cloud-init
+`growpart`/`resizefs` modules did before the bake purged cloud-init —
+a known-good, expected-of-every-cloud-image behavior — using `growpart`
+(from `cloud-guest-utils`) and `resize2fs` (from `e2fsprogs`). The bake
+installs both EXPLICITLY (in `RUNTIME_PACKAGES` and the `xpf-appliance`
+metapackage `Depends`): `growpart` is only in the stock cloudimg via
+cloud-init, so the cloud-init purge + `apt autoremove` would otherwise
+remove it. A bake-time `command -v growpart` assert fails the build if
+the provider is ever missing.
+
+**Why `growpart`/`resize2fs` and not `systemd-repart`:** they can only
+*grow a partition's end into adjacent free space* and *grow* an ext4
+filesystem. They cannot create, reformat, shrink, or move a partition
+by construction — there is no `Format=`/`CopyBlocks=` knob to mis-set.
+That is the smallest possible data-loss surface, deliberately chosen
+over `systemd-repart` (which would also add a runtime package to a
+minimized image).
+
+**Why this is safe for the #1930 A/B kernel channel:** the LANE-1 A/B
+"slots" are **directories inside the single ESP partition**
+(`/boot/efi/EFI/xpf-A`, `xpf-B`) plus the `/etc/grub.d/09_xpf`
+`$cmdpath` selector — they are NOT separate GPT partitions, and kernels
+live in `/boot`. The root partition is the **physically last partition**
+in the canonical Ubuntu cloudimg layout, so growing it into trailing
+free space cannot touch the ESP (and the A/B dirs, selectors, and
+shim/grub it holds), the BIOS-boot or `/boot` partitions, or any
+partition *number* — `growpart` only edits the selected partition's
+end and never renumbers. The grow signs nothing and does not alter the
+ESP, so the Secure Boot posture and the kernel promote/rollback channel
+are untouched. (If a future bake change ever added a trailing partition
+*after* root, this "grow the last partition" assumption would need
+revisiting.)
+
+Validation: `scripts/image/validate.py d` (also part of `all`) boots a
+baked image under local incus with a 20 GiB root disk and asserts the
+root partition + filesystem grew past the 8 GiB floor, the grow is
+idempotent across a reboot, the ESP stays mounted, and `verify-dataplane`
+still passes; a control instance at the exact bake size proves the grow
+is a clean no-op.
 
 ## Credentials / security posture
 

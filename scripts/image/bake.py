@@ -58,6 +58,15 @@ RUNTIME_PACKAGES = [
     "iproute2", "nftables", "ethtool", "tcpdump", "pciutils",
     "iputils-ping", "traceroute", "openssh-server", "openssh-client",
     "systemd-resolved", "rsyslog", "curl", "ca-certificates",
+    # #1925: growpart (cloud-guest-utils) + resize2fs (e2fsprogs) back the
+    # first-boot root auto-grow (xpf-grow-root). growpart is in the base
+    # cloudimg ONLY transitively via cloud-init, which this bake purges and
+    # autoremoves — so it MUST be installed EXPLICITLY here or the
+    # autoremove orphans it and the grow silently no-ops on every boot. On
+    # Ubuntu 26.04 the package providing /usr/bin/growpart is
+    # cloud-guest-utils. e2fsprogs (resize2fs) is a base package, listed
+    # belt-and-suspenders so a future base change can't orphan it either.
+    "cloud-guest-utils", "e2fsprogs",
 ]
 
 SYSCTL_CONF = (
@@ -394,6 +403,34 @@ def virt_customize(work_qcow, xpf_deb):
         "# hypervisor). Its presence enables Path-D1 strict (fail-closed if the\n"
         "# watchdog is unavailable). Absent = Path-D2 (BootNext still closes the\n"
         "# boot-loop; an EARLY-boot hang needs one external reset to recover).\n",
+        # #1925 Item 1: first-boot root auto-grow. Restores the cloud-init
+        # growpart/resizefs behavior the bake purged — grows the root
+        # partition + ext4 fs to fill an operator-resized disk on first boot
+        # only (stamp-gated), then never again. Uses growpart + resize2fs NOT
+        # systemd-repart: they cannot create/reformat/shrink/move a partition,
+        # the smallest data-loss surface. growpart (cloud-guest-utils) is
+        # NOT free in the image — it ships in the base cloudimg only via
+        # cloud-init, which the bake purges + autoremoves. It is therefore
+        # installed EXPLICITLY via RUNTIME_PACKAGES above (so the autoremove
+        # cannot orphan it); resize2fs (e2fsprogs) is base + also listed.
+        # Root is the physically LAST partition, so growing it into trailing
+        # free space never touches the ESP (the #1930 A/B kernel slots live
+        # in ESP dirs, not partitions), /boot, BIOS-boot, or any partition
+        # number. See docs/install-images.md.
+        "--copy-in", f"{HERE}/xpf-grow-root:/usr/local/sbin",
+        "--copy-in", f"{HERE}/xpf-grow-root.service:/usr/lib/systemd/system",
+        "--run-command", "chmod 0755 /usr/local/sbin/xpf-grow-root",
+        "--run-command", "systemctl enable xpf-grow-root.service",
+        # HARD-ASSERT growpart + resize2fs survived the cloud-init purge +
+        # autoremove. If a future base/package-name drift removes growpart,
+        # FAIL THE BAKE here rather than silently ship an image whose
+        # first-boot grow is a permanent no-op (the Codex MAJOR on #2047).
+        "--run-command",
+        'command -v growpart >/dev/null || { echo "FATAL: growpart missing '
+        '(#1925 root auto-grow would no-op; cloud-guest-utils not installed)" >&2; exit 1; }; '
+        'command -v resize2fs >/dev/null || { echo "FATAL: resize2fs missing '
+        '(#1925; e2fsprogs not installed)" >&2; exit 1; }; '
+        'echo "#1925: growpart + resize2fs present ($(command -v growpart), $(command -v resize2fs))"',
         "--write", f"/etc/default/grub.d/99-xpf.cfg:{GRUB_DROPIN}",
         "--run-command", "update-grub",
         "--write", f"/etc/ssh/sshd_config.d/10-xpf-factory.conf:{SSHD_DROPIN}",
@@ -500,7 +537,8 @@ def main():
              "machine-id,ssh-hostkeys,ssh-userdir,logfiles,tmp-files,bash-history,"
              "package-manager-cache,backup-files,passwd-backups,utmp",
              "--run-command", "rm -rf /etc/xpf/.configdb /etc/xpf/xpf.conf "
-             "/etc/xpf/.day0-config-applied /var/lib/systemd/random-seed "
+             "/etc/xpf/.day0-config-applied /etc/xpf/.root-grown "
+             "/var/lib/systemd/random-seed "
              "/var/lib/apt/lists/* 2>/dev/null || true"])
 
         # 6. export
