@@ -1,6 +1,7 @@
 # #2090 — `checkVIPReadinessForConfig` carrier-aware readiness (sibling of #2070)
 
-**Status:** DRAFT v1 — pending adversarial plan review
+**Status:** v2 — both hostile reviewers PLAN-NEEDS-MINOR (no BLOCKER/MAJOR/KILL);
+all minors folded. Ready to implement.
 
 ## Issue framing
 
@@ -41,10 +42,19 @@ node can be judged ready to take over VIPs on an interface whose cable
 is unplugged. This is exactly the #2070 hazard, surfacing in the
 no-reth-vrrp HA mode.
 
-A second, **cosmetic** instance of the same OR lives at
-`pkg/cluster/reth.go:158-159` (`RethController.FormatStatus`,
-display-only — `show chassis cluster`-style RETH status text). Not
-failover-class; fold in opportunistically if clean.
+Two more **cosmetic** instances of the same OR exist (display-only, not
+failover-class):
+
+- `pkg/cluster/reth.go:158-159` (`RethController.FormatStatus`,
+  `show chassis cluster`-style RETH status text).
+- `pkg/grpcapi/server_cluster.go:47-48` (`RethInfo.Status` for the
+  gRPC `show chassis cluster status` reth list — the de-Morgan'd form
+  `OperState != OperUp && Flags&FlagUp == 0 -> "Down"`, same bug class).
+
+Both are folded in this PR (plan reviewer B flagged that folding one
+reth-status display while leaving its exact twin is inconsistent; both
+are trivial reuses of the exported helper since both already import
+`pkg/cluster`).
 
 ## Honest scope/value framing
 
@@ -92,10 +102,31 @@ grows the copy count to four.
 - `pkg/daemon/daemon_ha_vip.go` already imports `pkg/cluster` (line 15).
 - Rename `pkg/cluster.linkAttrsUp` → **`cluster.LinkAttrsUp`** (exported)
   and update its two in-package callers (`monitor.go:267`, `:452`).
-- `pkg/cluster/reth.go:158-159` (the cosmetic site, same package) calls
+- `pkg/cluster/reth.go:158-159` (cosmetic site, same package) calls
   `LinkAttrsUp(link.Attrs())` directly — no import needed.
+- `pkg/grpcapi/server_cluster.go:47-48` (cosmetic site) calls
+  `cluster.LinkAttrsUp(link.Attrs())` — `pkg/grpcapi` already imports
+  `pkg/cluster` (uses `cluster.RethInfo`) and `net` (stays used by
+  `net.ParseIP`/`net.ParseCIDR`/`net.IP`), so zero new imports.
 - `pkg/daemon/daemon_ha_vip.go:80-81` calls
   `cluster.LinkAttrsUp(link.Attrs())`.
+
+**Why `pkg/cluster` is the correct export owner (not `pkg/vrrp`).**
+Both reviewers probed the export target. The dependency direction is
+`vrrp → cluster` (`pkg/vrrp` imports `pkg/cluster` for
+`cluster.SendGratuitousARPBurst`; `pkg/cluster` imports only `config` +
+`dataplane`). So **`pkg/cluster` is the lower layer** and is the right
+home for a shared link-state predicate — exporting from the lowest
+sensible layer maximizes reuse without inverting dependencies or
+risking an import cycle. Exporting from `pkg/vrrp` (the canonical
+*original*) would be worse: it is the higher layer, and the two new
+cosmetic consumers (`pkg/cluster/reth.go`, `pkg/grpcapi`) would then
+need to depend on `vrrp` (and `pkg/cluster` importing `pkg/vrrp` would
+create a cycle). It would also touch the just-merged #2070 `vrrp` file.
+"daemon already imports it" does not discriminate (daemon imports both
+cluster and vrrp); the discriminators are the layering direction + the
+free in-package cosmetic fold + minimal blast radius onto just-merged
+code. `pkg/cluster` wins on all three.
 
 This removes the daemon-site duplication entirely (the daemon reuses an
 exported helper), fixes the cosmetic site by reusing the same helper in
@@ -175,13 +206,38 @@ if LinkAttrsUp(link.Attrs()) {
 (`net` import in reth.go stays — used by `net.HardwareAddr` /
 `net.IP` in the MAC helpers above. Verify with build.)
 
-### Docstring update
+`pkg/grpcapi/server_cluster.go:47-48`, replace:
 
-Update the `checkVIPReadiness` / `checkVIPReadinessForConfig` docstrings
-to state explicitly that readiness now means **operational carrier UP**
-(not admin IFF_UP), mirroring #2070, and update the exported
-`LinkAttrsUp` godoc to note it is the shared carrier-state read for the
-cluster package and the daemon VIP-readiness gate.
+```go
+if err != nil || (link.Attrs().OperState != netlink.OperUp &&
+    link.Attrs().Flags&net.FlagUp == 0) {
+    status = "Down"
+}
+```
+
+with:
+
+```go
+if err != nil || !cluster.LinkAttrsUp(link.Attrs()) {
+    status = "Down"
+}
+```
+
+(`net` import stays — `net.ParseIP`/`net.ParseCIDR`/`net.IP` used
+elsewhere. `cluster` already imported for `cluster.RethInfo`.)
+
+### Docstring + README update
+
+- Update the `checkVIPReadiness` / `checkVIPReadinessForConfig`
+  docstrings to state explicitly that readiness now means **operational
+  carrier UP** (not admin IFF_UP), mirroring #2070.
+- Update the exported `LinkAttrsUp` godoc to note it is the shared
+  carrier-state read for the cluster package, the daemon VIP-readiness
+  gate, and the reth-status display.
+- **`pkg/cluster/README.md:96-103`** names `linkAttrsUp` by name and
+  enumerates its callers (doc-contract per CLAUDE.md). Update it for the
+  exported name `LinkAttrsUp` and the new consumers (daemon
+  VIP-readiness gate, reth-status displays in `reth.go` + `grpcapi`).
 
 ## Public API preservation
 
@@ -198,28 +254,55 @@ cluster package and the daemon VIP-readiness gate.
 
 ## Hidden invariants the change must preserve
 
-1. **OperUnknown fallback.** Virtual devices (the loss cluster's reth
-   members are mlx5 VFs with real carrier; but veth/IPVLAN report
-   OperUnknown) must still be judged up when admin-up. `LinkAttrsUp`
-   preserves this exactly (`OperUnknown → IFF_UP`). The existing test
+1. **OperUnknown fallback — load-bearing for VLAN sub-interfaces, not
+   just exotic virtual devices.** Reviewer A grounded that
+   `vrrp.RethVIPsForRG` (the map this gate iterates) does NOT return the
+   `reth0` device — it resolves to the **physical member** via
+   `RethToPhysical()`+`LinuxIfName`, and for VLAN-tagged reths it returns
+   **VLAN sub-interface names** (`<member>.50`, `<member>.80` —
+   `vrrp/vrrp.go:223-227`). On the loss cluster reth0 IS VLAN-tagged
+   (reth0.50/reth0.80). Linux 802.1Q VLAN devices frequently report
+   `OperUnknown` (no independent carrier; OPERSTATE follows the parent
+   only when LowerLayerDown propagates). So the `OperUnknown → IFF_UP`
+   fallback is genuinely load-bearing for the common case, and
+   `LinkAttrsUp` preserves it exactly. The existing test
    `TestCheckVIPReadiness_InterfaceUpViaFlags` currently uses
    `OperDown + FlagUp` — that case is precisely the bug, so that test
-   MUST flip to expect NOT-ready, and a NEW OperUnknown+FlagUp test
-   must assert ready (to lock the fallback).
+   MUST flip to expect NOT-ready, and a NEW `OperUnknown + FlagUp` test
+   must assert ready (to lock the VLAN-sub-interface fallback).
 2. **No-VIP / wrong-RG short-circuits.** `len(vipMap)==0 → ready`,
    interface-not-found → reason+continue. Unchanged — only the up
    decision inside the loop changes.
 3. **Reason strings.** "vip interface %s down" / "not found" preserved
    for downstream readiness-reason display.
-4. **Cosmetic site semantics.** `FormatStatus` "up"/"down"/"missing"
-   string set unchanged; only which links map to "up" vs "down" for the
-   carrier-down-admin-up edge changes (now correctly "down").
+4. **Cosmetic site semantics.** `FormatStatus` and the grpcapi
+   `RethInfo.Status` string sets ("up"/"down"/"missing" and "Up"/"Down"
+   respectively) are unchanged; only which links map to up vs down for
+   the carrier-down-admin-up edge changes (now correctly down).
 5. **No behavioral change for OperUp links** (the common healthy case):
    both old OR and new helper return up. Only the
    `OperDown/LowerLayerDown + IFF_UP` edge flips.
 6. **Locking.** `RethController.FormatStatus` already holds `rc.mu`;
    `LinkAttrsUp` is a pure function over a passed-in attrs struct —
    no new locking, no netlink call inside the helper.
+7. **The gate is promotion-only — it never demotes a primary, so the
+   absence of dampening on this path is benign.** (Reviewer B
+   investigated the dampening asymmetry as the most likely defect and
+   resolved it as benign.) `checkVIPReadinessForConfig` feeds
+   `takeoverReadinessForRG` → RG readiness → the cluster election. Every
+   readiness-gated transition in `pkg/cluster/election.go` is
+   `electLocalPrimary` guarded by `rg.State != StatePrimary`
+   (election.go:109/118/140/152/163/173). So a carrier flap on a reth
+   member, even though this gate is undampened (re-evaluated every 2s in
+   `reconcileRGStateLoop`, unlike the dampened interface-monitor path),
+   only flips a *secondary*'s promotion-eligibility — it cannot demote
+   an already-primary node, and VIP-add/GARP is driven by `state ==
+   Primary` in `applyDirectVIPOwnership`, not by the readiness boolean.
+   Net effect: no VIP add/remove churn, no GARP storm; the fix correctly
+   prevents *promoting* a node onto a dead-carrier link (the black hole)
+   without any flap side-effect. This change does NOT alter
+   carrier-down-primary handling (a separate, larger design question
+   not in scope and not regressed here).
 
 ## Risk assessment
 
@@ -257,7 +340,9 @@ Gates:
     (the existing `newTestLink` only sets OperUp/OperDown without
     Flags; add explicit-attrs construction where needed, as the
     existing `TestCheckVIPReadiness_InterfaceUpViaFlags` already does).
-- `go test ./pkg/daemon/... ./pkg/cluster/... ./pkg/routing/...` pass.
+- `go test ./pkg/daemon/... ./pkg/cluster/... ./pkg/routing/...
+  ./pkg/grpcapi/...` pass (grpcapi added — third cosmetic site lives
+  there; `reth_test.go:95/108` FormatStatus tests confirm the fold).
 - 5× flake check on the most-affected named daemon test.
 - `go test ./...` (full Go suite, 30+ packages) pass.
 
@@ -289,7 +374,34 @@ unless reviewers insist.
 - Any change to the readiness-reason string format or the
   `takeoverReadinessForRG` composition.
 
-## Open questions for adversarial review (each invitable to PLAN-KILL)
+## Resolved by plan review (round 1 — both reviewers PLAN-NEEDS-MINOR)
+
+Two independent hostile Claude reviewers verified every claim against
+source. No BLOCKER/MAJOR/KILL. Resolutions folded into v2:
+
+- **Export target (OQ1):** `pkg/cluster` is the correct owner — it is
+  the lower layer (`vrrp → cluster`), so exporting there avoids a cycle
+  and minimizes blast radius onto just-merged #2070 code. Justification
+  rewritten to lead with the dependency direction (above).
+- **Dampening asymmetry (the suspected BLOCKER):** RESOLVED benign — the
+  gate is promotion-only and never demotes a primary
+  (election.go:109/118/140/…); invariant #7 added.
+- **Third display sibling:** `grpcapi/server_cluster.go:47-48` found and
+  FOLDED (was inconsistent to fix reth.go's twin but not this one).
+- **VLAN-sub-interface OperUnknown:** the gate queries VLAN sub-interface
+  names (`vrrp/vrrp.go:223-227`), which commonly report OperUnknown — the
+  fallback is load-bearing; invariant #1 strengthened, test added.
+- **README doc-contract:** `pkg/cluster/README.md:96-103` names
+  `linkAttrsUp` — added to scope.
+- **FormatStatus tests:** `reth_test.go:95/108` both run with
+  `nlHandle: nil` → the "unknown" branch, never asserting "up"/"down";
+  cosmetic fold verified safe.
+- **Import hygiene:** verified `net` stays used in all three edited files
+  (daemon_ha_vip.go, reth.go, grpcapi/server_cluster.go).
+- **Non-tautology:** pre-fix OR returns ready for `OperDown+FlagUp`; the
+  new "NOT ready" assertion genuinely fails pre-fix.
+
+## Open questions for adversarial review (round 1, now answered above)
 
 1. **Export vs 4th private copy vs new shared package.** Is exporting
    `cluster.LinkAttrsUp` and having `pkg/daemon` depend on `pkg/cluster`
