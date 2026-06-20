@@ -1,5 +1,31 @@
 # Action Log
 
+## 2026-06-19 — #1925 review fix: stamp only on genuine grow success
+
+- **Timestamp**: 2026-06-19
+- **Action**: Fixed a Codex MAJOR on PR #2047. The wrapper turned real
+  growpart/resize2fs failures into exit 0 and the unit then stamped
+  `/etc/xpf/.root-grown` unconditionally via ExecStartPost — so a FAILED
+  grow (esp. the dangerous partial: growpart grew the partition but
+  resize2fs failed, leaving the fs at the bake size) was stamped and
+  never retried, stranding the disk space forever. Decoupled "never
+  block boot" from "stamp only on genuine success": the WRAPPER now owns
+  the stamp via a single `finish()` exit path that writes the stamp iff
+  `grow_ok` stayed 1 (NOCHANGE/nothing-to-grow, or partition grew AND
+  resize2fs succeeded) and ALWAYS exits 0. A real growpart failure, the
+  resize2fs-failed partial, or an unresolved root device set `grow_ok=0`
+  → no stamp → ConditionPathExists re-fires → retry; the retry converges
+  (growpart NOCHANGE + resize2fs finishes the fs). Removed the unit's
+  unconditional ExecStartPost touch (and the now-redundant ExecStartPre
+  mkdir — finish() mkdir -p's the stamp dir). Added `XPF_GROW_ROOT_STAMP`
+  test seam. Extended test-grow-root.sh to 35 assertions incl.
+  resize2fs-fails (no stamp, exit 0), growpart-real-failure, and
+  retry-convergence; proven non-tautological — the failure cases fail
+  6/6 against an unconditional-stamp build. bash -n / dash -n /
+  shellcheck clean; self-test 35/35.
+- **File(s)**: scripts/image/xpf-grow-root,
+  scripts/image/xpf-grow-root.service, scripts/image/test-grow-root.sh
+
 ## 2026-06-19 — #1925 Item 1: first-boot root auto-grow (Path A)
 
 - **Timestamp**: 2026-06-19

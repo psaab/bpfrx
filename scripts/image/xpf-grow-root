@@ -32,16 +32,37 @@
 # there is no trailing free space, and resize2fs is a no-op when the fs
 # already fills the partition.
 #
-# Idempotent and fail-safe: every step tolerates the "nothing to do"
-# outcome; the unit, not this script, owns the first-boot stamp. The
-# script always exits 0 so a transient probe failure never blocks the
-# boot — the only consequence of a miss is the status-quo (root stays at
-# the bake size), which a later boot's grow would still catch were the
-# stamp not yet written. The unit writes the stamp ONLY on a clean exit.
+# Stamp discipline (THIS wrapper owns the stamp, not the unit):
+#   - SUCCESS  -> touch /etc/xpf/.root-grown : nothing to grow (growpart
+#                 NOCHANGE / already full) OR the partition grew AND
+#                 resize2fs succeeded. Either way the disk is fully used,
+#                 so the grow is done and must not run again.
+#   - FAILURE  -> leave the stamp ABSENT so the unit's
+#                 ConditionPathExists=!/etc/xpf/.root-grown re-fires next
+#                 boot and the grow retries: growpart failed for a real
+#                 reason; OR growpart grew but resize2fs failed (the
+#                 dangerous partial — partition grown, fs still at the bake
+#                 size); OR the root device could not be resolved.
+# The retry converges: after a partial (partition already grown, no stamp),
+# the next boot's growpart returns NOCHANGE (success-for-its-step) and
+# resize2fs then finishes the fs grow, writing the stamp.
+#
+# Boot is NEVER blocked: the wrapper ALWAYS exits 0 (the oneshot never
+# fails the boot regardless of the grow outcome). "Non-fatal to boot" and
+# "stamp only on genuine success" are decoupled — the stamp, not the exit
+# code, gates the retry.
 
 set -u
 
+# The first-boot stamp is overridable for the self-test (test-grow-root.sh)
+# only; in production it is /etc/xpf/.root-grown.
+STAMP="${XPF_GROW_ROOT_STAMP:-/etc/xpf/.root-grown}"
+
+# Track whether the grow genuinely succeeded; the stamp is written exactly
+# once at the end, only when this stays true.
+grow_ok=1
 log() { echo "xpf-grow-root: $*"; }
+fail() { log "$*"; grow_ok=0; }
 
 # sysfs base is overridable for the self-test (test-grow-root.sh) only; in
 # production it is the real /sys/class/block. Everything else (findmnt,
@@ -49,30 +70,51 @@ log() { echo "xpf-grow-root: $*"; }
 # shadows with mocks.
 SYSFS_BLOCK="${XPF_GROW_ROOT_SYSFS:-/sys/class/block}"
 
+# Single exit path: stamp iff the grow genuinely succeeded, then exit 0 so
+# the boot is never blocked.
+finish() {
+	if [ "$grow_ok" -eq 1 ]; then
+		mkdir -p "$(dirname "$STAMP")" 2>/dev/null || true
+		if touch "$STAMP" 2>/dev/null; then
+			log "stamped $STAMP — grow complete, will not run again"
+		else
+			log "WARNING: could not write stamp $STAMP — grow will re-run next boot"
+		fi
+	else
+		log "grow did NOT complete — leaving $STAMP absent so it retries next boot"
+	fi
+	log "done"
+	exit 0
+}
+
 # Resolve the device backing the live root mount WITHOUT assuming a bus.
 # findmnt yields e.g. /dev/sda1, /dev/vda1, /dev/nvme0n1p1. Strip any
 # device-mapper / overlay indirection is out of scope — plain ext4 on
 # GPT is the only supported root layout (#1925 §9).
+# An unresolved root device is a FAILURE (no stamp, retry), NOT a
+# "nothing to grow" success: we could not even determine what to grow, so
+# a later boot (where findmnt/sysfs may behave) must get another chance.
 root_src=$(findmnt -no SOURCE / 2>/dev/null)
 if [ -z "$root_src" ]; then
-	log "could not resolve the root device from findmnt; nothing to grow"
-	exit 0
+	fail "could not resolve the root device from findmnt"
+	finish
 fi
 case "$root_src" in
 /dev/*) ;;
 *)
 	# A non-block-device root (overlay, tmpfs, a LABEL=/UUID= that did
-	# not resolve to /dev/*) is not a growable GPT partition. Skip.
-	log "root source '$root_src' is not a /dev block device; nothing to grow"
-	exit 0
+	# not resolve to /dev/*) is not a growable GPT partition. Treat as
+	# unresolved -> retry (never strand space on a transiently odd mount).
+	fail "root source '$root_src' is not a /dev block device"
+	finish
 	;;
 esac
 
 root_name=$(basename "$root_src")
 part_sysfs="$SYSFS_BLOCK/$root_name/partition"
 if [ ! -r "$part_sysfs" ]; then
-	log "root device '$root_src' is not a partition (no $part_sysfs); nothing to grow"
-	exit 0
+	fail "root device '$root_src' is not a partition (no $part_sysfs)"
+	finish
 fi
 partnum=$(cat "$part_sysfs" 2>/dev/null)
 
@@ -81,16 +123,20 @@ partnum=$(cat "$part_sysfs" 2>/dev/null)
 # nvme0n1p1 -> nvme0n1 vs sda1 -> sda split differs by bus).
 disk=$(lsblk -no PKNAME "$root_src" 2>/dev/null | head -n1)
 if [ -z "$disk" ]; then
-	log "could not resolve the parent disk of '$root_src'; nothing to grow"
-	exit 0
+	fail "could not resolve the parent disk of '$root_src'"
+	finish
 fi
 
 log "root device $root_src (disk /dev/$disk partition $partnum) — attempting grow"
 
-# growpart exits non-zero with "NOCHANGE" on its stderr/stdout when there
-# is no trailing free space (the exact-bake-size deploy). That is success
-# for us. Any other non-zero is logged but still non-fatal — a partition
-# grow we could not perform must not block the boot.
+# growpart exit codes:
+#   0          -> the partition was grown.
+#   non-zero + "NOCHANGE" on stdout/stderr -> nothing to grow (no trailing
+#                 free space — the exact-bake-size deploy, or a previous run
+#                 already grew the partition). Success for THIS step.
+#   any other non-zero -> a REAL growpart failure: no stamp, retry.
+# We still run resize2fs after a NOCHANGE so a prior partial (partition
+# grown last boot, fs not) converges.
 gp_out=$(growpart "/dev/$disk" "$partnum" 2>&1)
 gp_rc=$?
 if [ "$gp_rc" -eq 0 ]; then
@@ -98,18 +144,23 @@ if [ "$gp_rc" -eq 0 ]; then
 elif printf '%s' "$gp_out" | grep -qi 'NOCHANGE'; then
 	log "growpart: already at full size (NOCHANGE) — no trailing free space"
 else
-	log "growpart returned $gp_rc (non-fatal): $gp_out"
+	fail "growpart FAILED (rc=$gp_rc): $gp_out"
+	# A failed partition grow means the fs grow below could only ever be a
+	# no-op (no new space); still run it so a stale partial converges, but
+	# the overall outcome is already a failure (no stamp).
 fi
 
 # resize2fs grows the mounted ext4 online; it is a no-op when the fs
-# already fills the partition. Non-fatal on failure (status-quo).
+# already fills the partition. A FAILURE here is the dangerous partial when
+# growpart just grew the partition — the fs would stay at the bake size. It
+# MUST NOT stamp, so the next boot (growpart NOCHANGE + resize2fs) finishes
+# the grow.
 r2_out=$(resize2fs "$root_src" 2>&1)
 r2_rc=$?
 if [ "$r2_rc" -eq 0 ]; then
 	log "resize2fs: ${r2_out:-ok}"
 else
-	log "resize2fs returned $r2_rc (non-fatal): $r2_out"
+	fail "resize2fs FAILED (rc=$r2_rc): $r2_out"
 fi
 
-log "done"
-exit 0
+finish
