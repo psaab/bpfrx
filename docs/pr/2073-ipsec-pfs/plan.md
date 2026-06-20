@@ -181,6 +181,14 @@ path that BOTH `CompileConfig` and `CompileConfigForNode` reach.
 
 ### 5.2 Layer B — render-path safety net (DEFENSE IN DEPTH)
 
+> NOTE (superseded by §11/Q2 after CODE review): the exact fallback token
+> in the snippets below (`aes256-sha256128-modp<bits>`, "byte-identical to
+> the normal path") was found WRONG during code review — `sha256128` is not
+> a strongSwan keyword. The SHIPPED fallback is `aes256-sha256-modp<bits>`,
+> built directly (not via `buildESPProposal`). See §11/Q2 for the corrected
+> decision and the ECP-group follow-up. The prose below is kept for the
+> review trail.
+
 The render path runs at runtime apply on the active config and must not
 hard-fail a node that already accepted a broken config. So instead of
 erroring, `resolveESPSettings` must **stop silently dropping PFS** in
@@ -376,7 +384,15 @@ Per the task: this is config compile/render; no cluster smoke needed.
   `aes256-sha256128-modpN` (bad keyword) drafts are both wrong and removed.
   FOLLOW-UP: the package-wide `sha256128` spelling on buildESPProposal's
   NORMAL path is a separate pre-existing concern (out of scope for #2073),
-  to be filed as its own issue.
+  to be filed as its own issue. A second pre-existing, project-wide bug was
+  surfaced by the code review: `dhGroupBits` maps the elliptic-curve PFS
+  groups 19/20 to 256/384, so `buildESPProposal`/`buildIKEProposal` AND
+  this fallback emit the strongSwan-invalid `modp256`/`modp384` for ECP
+  groups (should be `ecp256`/`ecp384`). The #2073 fallback inherits the
+  same helper rather than introducing the bug; MODP PFS groups (the common
+  case) are preserved correctly. Both `sha256128` and the ECP `modp<bits>`
+  spelling will be filed together as a swanctl-keyword normalization
+  follow-up.
 - **Q3 — RESOLVED: both lenient entry points.** Set the flag in
   `CompileConfigLenient` AND `CompileConfigForNodeLenient`; the node-aware
   one backs HA peer-sync (`Store.SyncApply`) and standby boot.
