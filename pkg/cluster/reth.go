@@ -155,8 +155,7 @@ func (rc *RethController) FormatStatus() string {
 		if rc.nlHandle != nil && len(m.Members) > 0 {
 			link, err := rc.nlHandle.LinkByName(m.Members[0])
 			if err == nil {
-				if link.Attrs().OperState == netlink.OperUp ||
-					link.Attrs().Flags&net.FlagUp != 0 {
+				if LinkAttrsUp(link.Attrs()) {
 					status = "up"
 				} else {
 					status = "down"
