@@ -89,6 +89,31 @@ const lifelineRecordFile = "/etc/xpf/lifeline-interface"
 // valve).
 const defaultMgmtInterface = "fxp0"
 
+// userspaceShimLinkPinDir carries the pinned XDP links that survive a hitless
+// daemon restart. On a compile-failed restart where those links still exist,
+// the last-known-good dataplane is still attached and forwarding; clearing FRR
+// there would drop peerings despite live forwarding. The #1993 FRR clear is
+// therefore restricted to the unarmed/no-pins case.
+const userspaceShimLinkPinDir = "/sys/fs/bpf/xpf/links"
+
+var failClosedBootHasPinnedXDPLinks = detectFailClosedBootPinnedXDPLinks
+
+func detectFailClosedBootPinnedXDPLinks() (bool, error) {
+	entries, err := os.ReadDir(userspaceShimLinkPinDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), "xdp_") {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // bootClass is the result of the #1922 five-case boot predicate. Each value
 // maps to exactly one of {bootstrap, normal, fail-safe}.
 type bootClass int
@@ -303,16 +328,17 @@ func (d *Daemon) enterBootstrapMode() {
 		"system is back in bootstrap mode — 'commit confirmed' a corrected config")
 }
 
-// clearFRRForFailClosedBoot is the #1993 cold-boot refinement: on a boot where
-// the previously-committed config no longer COMPILES (the #1960 fail-closed
-// tuple — ActiveConfig()==nil + everCommitted=true → bootClassBootstrap), the
-// last-good `! BEGIN/END BPFRX MANAGED CONFIG` section is STILL on disk in
-// /etc/frr/frr.conf. FRR is an independent systemd service: it starts from that
-// persisted file, forms BGP/OSPF/IS-IS peerings, and re-advertises last-good
-// prefixes for routes this (unarmed, no-dataplane) node cannot forward — a
-// silent transit blackhole. Clearing ONLY the managed section drops those
-// peerings so upstream/peers fail over to the HA partner instead of routing
-// transit into a blackhole.
+// clearFRRForFailClosedBoot is the #1993 fail-closed boot refinement: on a
+// boot where the previously-committed config no longer COMPILES (the #1960
+// fail-closed tuple — ActiveConfig()==nil + everCommitted=true →
+// bootClassBootstrap), the last-good `! BEGIN/END BPFRX MANAGED CONFIG`
+// section may still be on disk in /etc/frr/frr.conf. FRR is an independent
+// systemd service: if the node comes up with NO live dataplane attachments, it
+// starts from that persisted file, forms BGP/OSPF/IS-IS peerings, and
+// re-advertises last-good prefixes for routes this unarmed node cannot
+// forward — a silent transit blackhole. Clearing ONLY the managed section
+// drops those peerings so upstream/peers fail over to the HA partner instead
+// of routing transit into a blackhole.
 //
 // This deliberately runs JUST the FRR-clear step of enterBootstrapMode()'s
 // teardown — NOT the .network/.link removal or the link-cycle. The cold-boot
@@ -325,9 +351,11 @@ func (d *Daemon) enterBootstrapMode() {
 // SyncApply) re-renders FRR through applyConfigLocked → applyFRRConfig, which
 // re-installs the managed section. So this clear is fully reversible.
 //
-// Scope: gated strictly on compileFailed so a fresh/no-config bootstrap (which
-// has no last-good managed section) and every NORMAL boot are byte-identical to
-// before — a NORMAL boot must NEVER wipe a healthy node's FRR config. The
+// Scope: gated on compileFailed AND on the absence of pinned XDP links. A
+// fresh/no-config bootstrap (which has no last-good managed section) and every
+// NORMAL boot are byte-identical to before, and a compile-failed daemon
+// RESTART that still has pinned XDP links preserves the last-known-good live
+// forwarding state instead of dropping peerings under active transit. The
 // d.frr != nil guard tolerates NoDataplane daemons (FRR is constructed only
 // inside the !NoDataplane manager-init block).
 //
@@ -340,12 +368,24 @@ func (d *Daemon) clearFRRForFailClosedBoot(compileFailed bool) {
 	if !compileFailed || d.frr == nil {
 		return
 	}
+	pinnedXDPLinks, err := failClosedBootHasPinnedXDPLinks()
+	if err != nil {
+		slog.Warn("fail-closed boot: skipping FRR managed-section clear because the pinned-XDP restart probe failed",
+			"pin_dir", userspaceShimLinkPinDir, "err", err)
+		return
+	}
+	if pinnedXDPLinks {
+		slog.Info("fail-closed boot: preserving FRR managed section because pinned XDP links indicate live dataplane attachments",
+			"pin_dir", userspaceShimLinkPinDir)
+		return
+	}
 	if err := d.frr.Clear(); err != nil {
 		// Includes ErrFRRReloadDegraded — log, do not abort boot.
 		slog.Warn("fail-closed boot: failed to clear FRR managed section; node may still "+
 			"advertise last-good routes to peers until the operator fixes the config and "+
-			"'commit confirmed' (or FRR restarts and re-reads the now-empty managed section)",
-			"err", err)
+			"'commit confirmed'; if the managed section was already stripped on disk, a later "+
+			"FRR restart will still converge",
+			"err", err, "pin_dir", userspaceShimLinkPinDir)
 		return
 	}
 	slog.Warn("fail-closed boot: cleared FRR managed section so peers fail over to the HA " +

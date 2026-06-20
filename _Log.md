@@ -70,6 +70,20 @@
   test/incus/test_mouse_latency_shell_test.py,
   test/incus/test-mouse-latency.sh, docs/fairness-regimes.md, _Log.md
 
+## 2026-06-20 — #1993 review follow-up on FRR clear guard
+
+- **Timestamp**: 2026-06-20
+- **Action**: Addressed review feedback on the compile-failed boot FRR clear.
+  The original `configCompileFailed` gate also fired on daemon restarts,
+  which could drop FRR peerings even when hitless-restart pinned XDP links
+  showed the last-known-good dataplane was still live. Added a pinned-link
+  probe (`/sys/fs/bpf/xpf/links`, `xdp_*`) so the managed-section clear now
+  runs only when the boot is compile-failed AND unarmed. Also hedged the
+  degraded/write-failure warning text and added restart/probe-error
+  regression tests. Updated `pkg/daemon/README.md`.
+- **File(s)**: pkg/daemon/bootstrap.go, pkg/daemon/daemon_run.go,
+  pkg/daemon/frr_failclosed_boot_test.go, pkg/daemon/README.md, _Log.md
+
 ## 2026-06-19 — #1993 clear FRR managed section on compile-failed cold boot
 
 - **Timestamp**: 2026-06-19

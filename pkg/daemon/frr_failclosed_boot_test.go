@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -38,6 +39,13 @@ func readConf(t *testing.T, path string) string {
 	return string(b)
 }
 
+func withFailClosedBootPinnedXDPProbe(t *testing.T, fn func() (bool, error)) {
+	t.Helper()
+	prev := failClosedBootHasPinnedXDPLinks
+	failClosedBootHasPinnedXDPLinks = fn
+	t.Cleanup(func() { failClosedBootHasPinnedXDPLinks = prev })
+}
+
 // TestColdBootCompileFailedClearsFRR proves the #1993 fix: on a compile-failure
 // cold boot (configCompileFailed=true), the daemon strips the last-good
 // xpf-managed section from frr.conf and reloads FRR exactly once, so peers fail
@@ -47,6 +55,7 @@ func readConf(t *testing.T, path string) string {
 // boot path the managed section survives, so this test fails on the unpatched
 // tree.
 func TestColdBootCompileFailedClearsFRR(t *testing.T) {
+	withFailClosedBootPinnedXDPProbe(t, func() (bool, error) { return false, nil })
 	confPath, sentinel := seededFRRConf(t)
 	rec := &frr.RecordingExecutor{} // healthy reload (nil error)
 	d := &Daemon{frr: frr.NewForTest(confPath, rec)}
@@ -91,9 +100,46 @@ func TestColdBootNormalDoesNotClearFRR(t *testing.T) {
 // TestColdBootCompileFailedNilFRRIsSafe guards the NoDataplane / pre-manager
 // path: clearing with a nil d.frr must not panic and must be a no-op.
 func TestColdBootCompileFailedNilFRRIsSafe(t *testing.T) {
+	withFailClosedBootPinnedXDPProbe(t, func() (bool, error) { return false, nil })
 	d := &Daemon{} // d.frr == nil
 	// Must not panic.
 	d.clearFRRForFailClosedBoot(true)
+}
+
+func TestCompileFailedRestartWithPinnedXDPLinksKeepsFRR(t *testing.T) {
+	withFailClosedBootPinnedXDPProbe(t, func() (bool, error) { return true, nil })
+	confPath, sentinel := seededFRRConf(t)
+	rec := &frr.RecordingExecutor{}
+	d := &Daemon{frr: frr.NewForTest(confPath, rec)}
+
+	d.clearFRRForFailClosedBoot(true)
+
+	got := readConf(t, confPath)
+	if !strings.Contains(got, sentinel) {
+		t.Fatalf("pinned XDP links must preserve the managed section on restart; sentinel %q missing:\n%s", sentinel, got)
+	}
+	if rec.ReloadCalls != 0 {
+		t.Fatalf("pinned XDP links must suppress FRR reloads; got %d reloads", rec.ReloadCalls)
+	}
+}
+
+func TestCompileFailedProbeErrorKeepsFRR(t *testing.T) {
+	withFailClosedBootPinnedXDPProbe(t, func() (bool, error) {
+		return false, errors.New("probe failed")
+	})
+	confPath, sentinel := seededFRRConf(t)
+	rec := &frr.RecordingExecutor{}
+	d := &Daemon{frr: frr.NewForTest(confPath, rec)}
+
+	d.clearFRRForFailClosedBoot(true)
+
+	got := readConf(t, confPath)
+	if !strings.Contains(got, sentinel) {
+		t.Fatalf("probe failure must preserve the managed section rather than guess; sentinel %q missing:\n%s", sentinel, got)
+	}
+	if rec.ReloadCalls != 0 {
+		t.Fatalf("probe failure must suppress FRR reloads; got %d reloads", rec.ReloadCalls)
+	}
 }
 
 // TestClearFRRReloadDegradedDoesNotAbortBoot proves a degraded reload
@@ -102,6 +148,7 @@ func TestColdBootCompileFailedNilFRRIsSafe(t *testing.T) {
 // helper returns normally so boot proceeds. The on-disk strip is what lets a
 // later FRR restart converge even when the live reload degraded.
 func TestClearFRRReloadDegradedDoesNotAbortBoot(t *testing.T) {
+	withFailClosedBootPinnedXDPProbe(t, func() (bool, error) { return false, nil })
 	confPath, sentinel := seededFRRConf(t)
 	rec := &frr.RecordingExecutor{ReloadErr: frr.ErrFRRReloadDegraded}
 	d := &Daemon{frr: frr.NewForTest(confPath, rec)}

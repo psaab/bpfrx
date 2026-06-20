@@ -116,29 +116,30 @@ never lock an operator out of a remote box it manages.
     `show | compare rollback N` reach prior good configs, and a
     `commit confirmed` of either promotes a working config. Repairing/removing
     the on-disk DB remains the out-of-band fallback.
-  - **FRR managed section is cleared on a compile-failed cold boot (#1993).**
+  - **FRR managed section is cleared on a compile-failed unarmed boot (#1993).**
     `frr` is an independent service that starts from its persisted `frr.conf`
     (the managed section from the last good `applyConfig`), which freeze-in-last-
-    known-good leaves intact. On a *cold reboot* with a compile-failed config
-    the dataplane is unarmed (no transit) yet FRR would otherwise still form
-    peerings and advertise the last-good prefixes — so peers route transit to
+    known-good leaves intact. On a compile-failed boot where NO pinned XDP links
+    survive (the dataplane is unarmed, so no transit), FRR would otherwise still
+    form peerings and advertise the last-good prefixes — peers route transit to
     this node's physical IPs and it blackholes them rather than failing over to
     the HA partner. To close that cross-daemon gap, the compile-failure boot
     path calls `clearFRRForFailClosedBoot(configCompileFailed)` immediately
-    after the FRR manager is constructed (`d.frr = frr.New()`), which runs
-    `d.frr.Clear()` to strip ONLY the managed section and reload FRR. Dropping
-    those peerings makes upstream/peers fail over to the HA partner instead of
-    blackholing transit. This is the SAME primitive `enterBootstrapMode()` uses,
-    but it deliberately runs *only* the FRR-clear step — NOT the `.network`/
-    `.link` removal or link-cycle — so freeze-in-last-known-good MANAGEMENT
-    reachability (the existing mgmt IP) is preserved. It is gated strictly on
-    `configCompileFailed`, so a normal or fresh-install boot is byte-identical
-    (a normal boot must never wipe a healthy node's FRR config), and it is fully
-    reversible: the first compilable `commit confirmed` (or a cluster
-    `SyncApply`) re-renders FRR via `applyFRRConfig` and re-installs the managed
-    section. A degraded reload (`ErrFRRReloadDegraded`) is logged, not fatal —
-    `Clear()` has already written the empty managed section to disk, so a later
-    FRR restart converges. The VIP/RETH data path already failed over before
+    after the FRR manager is constructed (`d.frr = frr.New()`). The helper first
+    probes `/sys/fs/bpf/xpf/links`: if pinned `xdp_*` links still exist, xpfd is
+    in a hitless-restart shape with the last-known-good dataplane still attached,
+    so FRR is preserved; if no pinned XDP links exist, it runs `d.frr.Clear()` to
+    strip ONLY the managed section and reload FRR. Dropping those peerings makes
+    upstream/peers fail over to the HA partner instead of blackholing transit.
+    This is the SAME primitive `enterBootstrapMode()` uses, but it deliberately
+    runs *only* the FRR-clear step — NOT the `.network`/`.link` removal or
+    link-cycle — so freeze-in-last-known-good MANAGEMENT reachability (the
+    existing mgmt IP) is preserved. Normal/fresh-install boots remain
+    byte-identical, and it is fully reversible: the first compilable
+    `commit confirmed` (or a cluster `SyncApply`) re-renders FRR via
+    `applyFRRConfig` and re-installs the managed section. A degraded reload
+    (`ErrFRRReloadDegraded`) is logged, not fatal — `Clear()` has already
+    written the empty managed section to disk, so a later FRR restart converges. The VIP/RETH data path already failed over before
     this fix because #1960 suppresses this node's VRRP/cluster.
     - **Residual (cross-daemon ordering):** FRR is an independent systemd
       service and may advertise last-good prefixes from its OWN start before

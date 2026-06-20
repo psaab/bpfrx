@@ -420,15 +420,16 @@ func (d *Daemon) Run(ctx context.Context) error {
 			}
 		}
 		d.frr = frr.New()
-		// #1993: on a compile-failure COLD boot the last-good frr.conf managed
-		// section is still on disk and FRR (an independent service) will form
-		// peerings + re-advertise prefixes for routes this unarmed node cannot
-		// forward — a transit blackhole. Clear ONLY the managed section, right
-		// after the manager exists and BEFORE the run loop settles, so peers
-		// fail over to the HA partner. Gated on configCompileFailed so a normal
-		// or fresh-install boot is untouched (a normal boot must NOT wipe a
-		// healthy node's FRR config). Freeze-in-last-known-good for management
-		// (#1960) is preserved: no .network/.link removal, no link-cycle.
+		// #1993: on a compile-failure boot with NO preserved XDP attachments,
+		// the last-good frr.conf managed section is still on disk and FRR (an
+		// independent service) will form peerings + re-advertise prefixes for
+		// routes this unarmed node cannot forward — a transit blackhole. Clear
+		// ONLY the managed section, right after the manager exists and BEFORE
+		// the run loop settles, so peers fail over to the HA partner. The
+		// helper itself further skips hitless-restart cases where pinned XDP
+		// links show the last-known-good dataplane is still live. Freeze-in-
+		// last-known-good for management (#1960) is preserved: no
+		// .network/.link removal, no link-cycle.
 		d.clearFRRForFailClosedBoot(configCompileFailed)
 		d.ipsec = ipsec.New()
 		d.ra = ra.New()
