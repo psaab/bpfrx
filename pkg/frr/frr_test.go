@@ -2656,12 +2656,16 @@ func rfPolicyOptions(rfs ...*config.RouteFilter) *config.PolicyOptionsConfig {
 // than emit an FRR-invalid "ge plen+1 le maxLen" line, while still
 // rendering the valid "ge plen+1 le maxLen" for every shorter prefix.
 func TestRouteFilterLongerFRR(t *testing.T) {
-	// #2103 core: /32 longer must emit NO prefix-list entry and NO
-	// dangling "match ... prefix-list" line (the only RF is skipped, so
-	// the prefix-list is never created — a "match" against a
-	// non-existent list, or worse a materialised empty list which FRR
-	// treats as match-ALL, would be wrong).
-	t.Run("v4_max_length_longer_skips_entry_and_match", func(t *testing.T) {
+	// #2103 core: /32 longer must emit NO "ip prefix-list ... permit"
+	// entry (the empty set), but the term MUST still emit the "match ...
+	// prefix-list" line referencing the (then-undefined) list name. In
+	// FRR a match against an undefined prefix-list → NULL → RMAP_NOMATCH
+	// (DENY), so the term matches nothing and stays fail-closed.
+	// Suppressing the match line would leave a bare "permit <seq>" with no
+	// match clauses, which FRR treats as match-ALL (Copilot #2110). The
+	// list name itself must NEVER be materialised with zero entries — a
+	// count==0 prefix-list is FRR PREFIX_PERMIT (match-ALL).
+	t.Run("v4_max_length_longer_skips_entry_keeps_match", func(t *testing.T) {
 		got := New().generatePolicyOptions(rfPolicyOptions(
 			&config.RouteFilter{Prefix: "10.0.0.0/32", MatchType: "longer"}))
 		if strings.Contains(got, "ge 33") {
@@ -2670,15 +2674,17 @@ func TestRouteFilterLongerFRR(t *testing.T) {
 		if strings.Contains(got, "permit 10.0.0.0/32") {
 			t.Errorf("/32 longer must emit NO prefix-list entry, got:\n%s", got)
 		}
-		if strings.Contains(got, "match ip address prefix-list p-t1") {
-			t.Errorf("all-skipped term must NOT emit a dangling match line, got:\n%s", got)
+		// The match line MUST be present (fail-closed via undefined list).
+		if !strings.Contains(got, "match ip address prefix-list p-t1\n") {
+			t.Errorf("all-skipped term MUST emit the match line (fail-closed), got:\n%s", got)
 		}
-		if strings.Contains(got, "ip prefix-list p-t1") {
-			t.Errorf("all-skipped term must NOT materialise the prefix-list, got:\n%s", got)
+		// But NO "ip prefix-list p-t1 ... permit" entry materialises the list.
+		if strings.Contains(got, "ip prefix-list p-t1 seq") {
+			t.Errorf("all-skipped term must NOT materialise a prefix-list entry, got:\n%s", got)
 		}
 	})
 
-	t.Run("v6_max_length_longer_skips_entry_and_match", func(t *testing.T) {
+	t.Run("v6_max_length_longer_skips_entry_keeps_match", func(t *testing.T) {
 		got := New().generatePolicyOptions(rfPolicyOptions(
 			&config.RouteFilter{Prefix: "2001:db8::1/128", MatchType: "longer"}))
 		if strings.Contains(got, "ge 129") {
@@ -2687,8 +2693,13 @@ func TestRouteFilterLongerFRR(t *testing.T) {
 		if strings.Contains(got, "permit 2001:db8::1/128") {
 			t.Errorf("/128 longer must emit NO prefix-list entry, got:\n%s", got)
 		}
-		if strings.Contains(got, "prefix-list p-t1") {
-			t.Errorf("all-skipped v6 term must emit no prefix-list / match line, got:\n%s", got)
+		// Family is derived from the parseable (skipped) v6 entry → the
+		// match line must be the v6 matcher, fail-closed.
+		if !strings.Contains(got, "match ipv6 address prefix-list p-t1\n") {
+			t.Errorf("all-skipped v6 term MUST emit the v6 match line, got:\n%s", got)
+		}
+		if strings.Contains(got, "ipv6 prefix-list p-t1 seq") {
+			t.Errorf("all-skipped v6 term must NOT materialise a prefix-list entry, got:\n%s", got)
 		}
 	})
 
@@ -2785,25 +2796,33 @@ func TestRouteFilterOrlongerMaxLengthValid(t *testing.T) {
 // TestRouteFilterMalformedPrefixBelt covers the #2105 render-side
 // belt-and-suspenders: a malformed prefix (which the commit validator
 // rejects, but the lenient load/HA-sync path can still feed to the
-// renderer) must NEVER produce an FRR line. A lone malformed prefix
-// also suppresses the match line; a valid prefix alongside it survives.
+// renderer) must NEVER produce an FRR prefix-list ENTRY. A lone
+// malformed prefix still emits the match line (fail-closed via an
+// undefined list → NOMATCH → DENY); a valid prefix alongside it
+// survives.
 func TestRouteFilterMalformedPrefixBelt(t *testing.T) {
-	t.Run("lone_no_mask_emits_nothing", func(t *testing.T) {
+	t.Run("lone_no_mask_emits_no_entry", func(t *testing.T) {
 		got := New().generatePolicyOptions(rfPolicyOptions(
 			&config.RouteFilter{Prefix: "10.0.0.0", MatchType: "exact"}))
 		if strings.Contains(got, "permit 10.0.0.0") {
 			t.Errorf("malformed prefix (no mask) must emit no permit line, got:\n%s", got)
 		}
-		if strings.Contains(got, "prefix-list p-t1") {
-			t.Errorf("lone malformed prefix must emit no prefix-list / match line, got:\n%s", got)
+		if strings.Contains(got, "prefix-list p-t1 seq") {
+			t.Errorf("lone malformed prefix must NOT materialise a prefix-list entry, got:\n%s", got)
+		}
+		if !strings.Contains(got, "address prefix-list p-t1\n") {
+			t.Errorf("lone malformed prefix must still emit the fail-closed match line, got:\n%s", got)
 		}
 	})
 
-	t.Run("lone_bad_mask_emits_nothing", func(t *testing.T) {
+	t.Run("lone_bad_mask_emits_no_entry", func(t *testing.T) {
 		got := New().generatePolicyOptions(rfPolicyOptions(
 			&config.RouteFilter{Prefix: "10.0.0.0/99", MatchType: "orlonger"}))
 		if strings.Contains(got, "permit 10.0.0.0/99") {
 			t.Errorf("out-of-range mask must emit no permit line, got:\n%s", got)
+		}
+		if strings.Contains(got, "prefix-list p-t1 seq") {
+			t.Errorf("out-of-range mask must NOT materialise a prefix-list entry, got:\n%s", got)
 		}
 	})
 
@@ -2822,8 +2841,14 @@ func TestRouteFilterMalformedPrefixBelt(t *testing.T) {
 			if strings.Contains(got, "permit "+bad) {
 				t.Errorf("bad-address prefix %q must emit no permit line, got:\n%s", bad, got)
 			}
-			if strings.Contains(got, "prefix-list p-t1") {
-				t.Errorf("lone bad-address prefix %q must emit no prefix-list/match line, got:\n%s", bad, got)
+			// No prefix-list ENTRY materialises (a count==0 list is FRR
+			// match-ALL); but the term still emits the match line so it is
+			// fail-closed (undefined list → NOMATCH → DENY).
+			if strings.Contains(got, "prefix-list p-t1 seq") {
+				t.Errorf("lone bad-address prefix %q must NOT materialise a prefix-list entry, got:\n%s", bad, got)
+			}
+			if !strings.Contains(got, "match ") || !strings.Contains(got, "address prefix-list p-t1\n") {
+				t.Errorf("lone bad-address prefix %q must still emit the fail-closed match line, got:\n%s", bad, got)
 			}
 		}
 	})

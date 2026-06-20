@@ -594,22 +594,34 @@ func (m *Manager) generatePolicyOptions(po *config.PolicyOptionsConfig) string {
 			// Generate an inline prefix-list for route-filters
 			if len(term.RouteFilters) > 0 {
 				plName := name + "-" + term.Name
+				// matchV6 selects the address family of the post-loop
+				// "match ip/ipv6 address prefix-list" line. It is taken
+				// from the first EMITTED entry when there is one, else from
+				// the first route-filter with a parseable family (a
+				// #2103-skipped /32 longer still names a real family), else
+				// defaults to v4 — mirroring the term.PrefixList branch's
+				// "unknown/empty defaults to IPv4". The match line is
+				// ALWAYS emitted (see below).
+				matchV6 := false
+				matchFamilyKnown := false
 				// emitted counts the prefix-list entries actually written.
-				// firstEmittedV6 records the family of the first written
-				// entry so the post-loop "match ip/ipv6 address
-				// prefix-list" line picks the correct family from a
-				// PARSEABLE, non-skipped prefix (NOT term.RouteFilters[0],
-				// which may be a #2103-skipped /32 or a #2105 malformed
-				// prefix). When emitted == 0 the whole term has no usable
-				// route-filter, so the match line is suppressed entirely
-				// (#2103/#2105): emitting "match ... prefix-list <name>"
-				// against a name with zero "ip prefix-list" lines would
-				// reference a NON-EXISTENT list. We intentionally never
-				// materialise a zero-entry list either — in FRR a
-				// count==0 prefix-list returns PREFIX_PERMIT (match-ALL),
-				// so a stray empty list would silently permit everything.
+				// A #2103-skipped (/32 longer, empty set) or #2105-malformed
+				// entry writes NO "ip prefix-list" line, so the list may end
+				// up with zero entries — and we intentionally never
+				// materialise a count==0 list (FRR treats a count==0
+				// prefix-list as PREFIX_PERMIT / match-ALL). The match line
+				// still references the (then-undefined) list name: in FRR a
+				// "match … prefix-list <name>" against a name with no
+				// "ip prefix-list <name>" lines resolves to NULL →
+				// RMAP_NOMATCH (DENY), so an all-skipped term matches
+				// NOTHING and stays fail-closed. Suppressing the match line
+				// instead would leave a bare "route-map … permit <seq>" with
+				// no match clauses, which FRR treats as match-ALL — flipping
+				// "/32 longer" from the empty set to permit-everything
+				// (Copilot #2110). This mirrors the existing
+				// term.PrefixList branch, which also emits a match line for
+				// an unknown/empty list.
 				emitted := 0
-				firstEmittedV6 := false
 				for i, rf := range term.RouteFilters {
 					isV6 := strings.Contains(rf.Prefix, ":")
 					matchStr := "le 32"
@@ -638,6 +650,16 @@ func (m *Manager) generatePolicyOptions(po *config.PolicyOptionsConfig) string {
 					// never skipped.
 					if _, _, err := net.ParseCIDR(rf.Prefix); err != nil {
 						skipEntry = true
+					} else if !matchFamilyKnown {
+						// First route-filter with a PARSEABLE prefix sets the
+						// match-line family — even if this entry is later
+						// skipped for being a max-length "longer" (a /32 longer
+						// names a real v4 family). An emitted entry overrides
+						// this below, but for an all-skipped term this is the
+						// best family signal we have. Stays v4 (the default)
+						// only when no entry is parseable.
+						matchV6 = isV6
+						matchFamilyKnown = true
 					}
 					switch rf.MatchType {
 					case "exact":
@@ -761,25 +783,33 @@ func (m *Manager) generatePolicyOptions(po *config.PolicyOptionsConfig) string {
 					}
 					b.WriteString("\n")
 					if emitted == 0 {
-						firstEmittedV6 = isV6
+						// The first EMITTED entry is the most authoritative
+						// family signal; override the parseable-skipped hint.
+						matchV6 = isV6
+						matchFamilyKnown = true
 					}
 					emitted++
 				}
-				// Emit the match line ONLY when at least one prefix-list
-				// entry was written. With zero entries the prefix-list name
-				// is never created, so a "match ... prefix-list <name>" line
-				// would reference a non-existent list; suppressing it leaves
-				// the term with no route-filter condition (its other
-				// from/then clauses still render). Family comes from the
-				// first EMITTED (parseable, non-skipped) entry — not
-				// term.RouteFilters[0], which may be a skipped /32 longer or
-				// a malformed prefix of the wrong/garbage family.
-				if emitted > 0 {
-					if firstEmittedV6 {
-						fmt.Fprintf(&b, " match ipv6 address prefix-list %s\n", plName)
-					} else {
-						fmt.Fprintf(&b, " match ip address prefix-list %s\n", plName)
-					}
+				// ALWAYS emit the match line for a term that declares any
+				// route-filter. When entries were emitted it references the
+				// populated prefix-list. When ALL entries were skipped
+				// (every route-filter is a max-length "longer" empty set, or
+				// every prefix is malformed) the list name is never created,
+				// so this references an UNDEFINED prefix-list → FRR resolves
+				// it to NULL → RMAP_NOMATCH (DENY): the term matches NOTHING
+				// and stays fail-closed. Suppressing the match line here
+				// would leave a bare "route-map … permit <seq>" with no match
+				// clauses, which FRR treats as match-ALL — flipping
+				// "/32 longer" from the empty set to permit-everything
+				// (Copilot #2110). This mirrors the term.PrefixList branch,
+				// which likewise emits a match line for an unknown list.
+				// Family: the first emitted entry, else the first parseable
+				// (possibly skipped) route-filter, else v4 (the
+				// term.PrefixList "unknown/empty defaults to IPv4" default).
+				if matchV6 {
+					fmt.Fprintf(&b, " match ipv6 address prefix-list %s\n", plName)
+				} else {
+					fmt.Fprintf(&b, " match ip address prefix-list %s\n", plName)
 				}
 			}
 
