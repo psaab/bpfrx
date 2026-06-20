@@ -1,7 +1,12 @@
 # #2114 — NAT pool-alarm monitor races `d.dp = nil` in bootstrap-exit
 
-**Status:** DRAFT v2 — Codex r1 PLAN-NEEDS-MAJOR addressed (rollback→re-arm
-race; monitor not restartable after Stop). Adds Edit 3 + revised test plan.
+**Status:** DRAFT v3 — Codex r2 PLAN-NEEDS-MAJOR addressed. v2's
+runtime-mutated `d.natPoolAlarm` pointer is itself read unsynchronized by
+`natPoolAlarms()` on the gRPC/CLI `show security alarms` render path,
+racing the new start/discard writes. v3 makes the pointer
+`atomic.Pointer[natpoolalarm.Monitor]` and routes ALL access through
+helpers (`maybeStartNATPoolAlarm`, `stopAndDiscardNATPoolAlarm`,
+`natPoolAlarms`, shutdown). Now FOUR edits.
 
 ## Issue framing
 
@@ -88,32 +93,116 @@ launching a continuous reader during bootstrap, where the
 bootstrap-exit write still happens. Option A restores the invariant
 and exactly mirrors the dataplane-`Start()` gate already at line 642.
 
-### Edit 1 — `daemon_run.go` ~880: gate the boot-time start
+**Second field made shared (v3 — Codex r2):** moving the monitor start
+out of the single-threaded boot window means `d.natPoolAlarm` is now
+WRITTEN at runtime (started at bootstrap exit, stopped+discarded at
+rollback) while gRPC/CLI are already serving. The reader
+`natPoolAlarms()` (`daemon_natpoolalarm.go:71`) is wired into the
+`show security alarms` render path on both gRPC (`daemon_run.go:1282`,
+`NATPoolAlarmsFn`) and CLI (`daemon_run.go:1402`,
+`SetNATPoolAlarmsFn`) — request goroutines that race the new
+start/discard writes. On origin/master this field is written once at
+boot before serving begins, so it is safe today; the fix must NOT
+introduce a new pointer race. v3 therefore changes the field to
+`atomic.Pointer[natpoolalarm.Monitor]` and routes EVERY access
+(start, stop+discard, read, shutdown) through helpers. `sync/atomic`
+is already imported in `daemon.go`; the daemon already uses
+`atomic.Bool` for `bootstrapMode`, so this matches the local style and
+is lock-free.
 
-Wrap the monitor `New/Start` in `if !d.inBootstrap()`:
+### Edit 0 — `daemon.go:136`: make the field atomic + add helpers
 
 ```go
-// #2114: do NOT start the NAT pool-alarm monitor while in bootstrap
-// mode. In bootstrap the dataplane object is constructed (d.dp != nil)
-// but not armed, and the bootstrap-exit path may write d.dp = nil on
-// an arm failure. The monitor's sampler reads d.dp unsynchronized, so
-// launching it here would race that write. It is started instead at
-// the end of runBootstrapExitStartup once the dataplane is armed
-// (mirroring the dataplane Start() gate above). On a normal
-// (non-bootstrap) boot this branch runs as before.
-if !d.inBootstrap() {
-    d.natPoolAlarm = natpoolalarm.New(d.natPoolAlarmSampler(), d.natPoolAlarmEmitter())
-    d.natPoolAlarm.Start()
+// natPoolAlarm holds the #2079 monitor. Made atomic in #2114 because the
+// monitor is now started/stopped at runtime (bootstrap exit / rollback)
+// concurrently with the show-security-alarms render reader.
+natPoolAlarm atomic.Pointer[natpoolalarm.Monitor]
+```
+
+Helpers (in `daemon_natpoolalarm.go`):
+
+```go
+// maybeStartNATPoolAlarm constructs and starts the monitor exactly once,
+// gated on a non-bootstrap, dataplane-armed daemon. Idempotent: a
+// non-nil stored monitor short-circuits. Called from the normal-boot
+// background-services block and from runBootstrapExitStartup's success
+// branch.
+func (d *Daemon) maybeStartNATPoolAlarm() {
+    if d.opts.NoDataplane || d.inBootstrap() {
+        return
+    }
+    if d.natPoolAlarm.Load() != nil {
+        return // already started
+    }
+    m := natpoolalarm.New(d.natPoolAlarmSampler(), d.natPoolAlarmEmitter())
+    d.natPoolAlarm.Store(m)
+    m.Start()
 }
+
+// stopAndDiscardNATPoolAlarm stops the monitor (joins its goroutine) and
+// clears the pointer so a later re-arm builds a fresh one (Monitor is not
+// restartable after Stop). Safe when no monitor is running. Called from
+// rollback (enterBootstrapMode) and shutdown.
+func (d *Daemon) stopAndDiscardNATPoolAlarm() {
+    if m := d.natPoolAlarm.Swap(nil); m != nil {
+        m.Stop()
+    }
+}
+```
+
+and the reader becomes:
+
+```go
+func (d *Daemon) natPoolAlarms() []natpoolalarm.ActiveAlarm {
+    if d == nil {
+        return nil
+    }
+    m := d.natPoolAlarm.Load()
+    if m == nil {
+        return nil
+    }
+    return m.ActiveAlarms()
+}
+```
+
+Note: `maybeStartNATPoolAlarm` itself is only ever called under
+`applySem` (boot path runs before serving; bootstrap-exit runs under the
+apply caller's `applySem`), so two concurrent starts cannot interleave;
+the `Load()!=nil` short-circuit + atomic `Store` are belt-and-suspenders.
+`stopAndDiscardNATPoolAlarm`'s `Swap(nil)` is the single point that
+both reads-and-clears, so a concurrent reader either sees the old
+monitor (valid; `ActiveAlarms()` is itself mutex-guarded inside the
+Monitor) or nil — never a torn pointer.
+
+### Edit 1 — `daemon_run.go` ~880: gate the boot-time start via the helper
+
+Replace the unconditional `New(...).Start()` with the gated helper.
+Because `maybeStartNATPoolAlarm` already checks `!inBootstrap()` and
+`!NoDataplane`, the call is simply:
+
+```go
+// #2114: start the NAT pool-alarm monitor only when NOT in bootstrap
+// mode. maybeStartNATPoolAlarm() gates on !inBootstrap() && !NoDataplane
+// and is idempotent. In bootstrap the dataplane object is constructed
+// (d.dp != nil) but not armed, and the bootstrap-exit path may write
+// d.dp = nil on an arm failure; the monitor's sampler reads d.dp, so
+// launching it here would race that write. It is started instead at the
+// end of runBootstrapExitStartup once the dataplane is armed (mirroring
+// the dataplane Start() gate above). On a normal boot the gate passes
+// and the monitor starts here exactly as before.
+d.maybeStartNATPoolAlarm()
 ```
 
 ### Edit 2 — `runBootstrapExitStartup` (~1701): start on successful arm
 
 In the existing arm block, start the monitor in the success branch
 (after `d.dp.Start()` succeeds, so `d.dp` is confirmed non-nil; this is
-*after* the `d.dp = nil` failure write, so the start is never reached
-on the failure path). This runs under `applySem`, so the monitor's
-first sampler read cannot overlap a concurrent `d.dp` write:
+*after* the `d.dp = nil` failure write, so the start is never reached on
+the failure path). This runs under `applySem`, so the monitor's first
+sampler read cannot overlap a concurrent `d.dp` write. By this point
+`exitBootstrapMode` has already flipped `bootstrapMode=false` (in
+`applyConfigLocked` just before calling `runBootstrapExitStartup`), so
+the helper's `!inBootstrap()` gate passes:
 
 ```go
 if d.dp != nil {
@@ -125,70 +214,68 @@ if d.dp != nil {
             seeder.SeedNATPortCounters()
             seeder.SeedSessionIDCounter(nodeID)
         }
-        // #2114: start the NAT pool-alarm monitor now that the
-        // dataplane is armed and d.dp is stable. Suppressed at boot in
-        // bootstrap mode (see daemon_run.go monitor-start gate). Guard
-        // against an unexpected double-start (idempotent: Start() is a
-        // no-op once started, but we also only construct once).
-        if d.natPoolAlarm == nil {
-            d.natPoolAlarm = natpoolalarm.New(d.natPoolAlarmSampler(), d.natPoolAlarmEmitter())
-            d.natPoolAlarm.Start()
-        }
+        // #2114: start the NAT pool-alarm monitor now that the dataplane
+        // is armed and d.dp is stable. Suppressed at boot in bootstrap
+        // mode; bootstrap is already exited here (exitBootstrapMode ran in
+        // applyConfigLocked), so the helper's gate passes. Idempotent.
+        d.maybeStartNATPoolAlarm()
     }
 }
 ```
 
-### Edit 3 — `enterBootstrapMode` (~bootstrap.go:363): stop + discard the monitor
+### Edit 3 — `enterBootstrapMode` (~bootstrap.go): stop + discard the monitor
 
-**(Added in v2 — Codex r1 PLAN-NEEDS-MAJOR.)** The rollback-to-bootstrap
-path (`enterBootstrapMode`, reached from a first-commit-confirmed
-timeout at `daemon_apply.go:308`) is reached AFTER a successful
-bootstrap-exit arm — so the monitor started by Edit 2 is alive. The
-rollback `Teardown()`s the dataplane but keeps `d.dp` NON-nil and does
-NOT stop the monitor. A subsequent corrected confirmed commit re-enters
+**(Codex r1.)** The rollback-to-bootstrap path (`enterBootstrapMode`,
+reached from a first-commit-confirmed timeout at
+`daemon_apply.go:308`) is reached AFTER a successful bootstrap-exit arm
+— so the monitor started by Edit 2 is alive. The rollback `Teardown()`s
+the dataplane but keeps `d.dp` NON-nil and (before this fix) did NOT
+stop the monitor. A subsequent corrected confirmed commit re-enters
 `runBootstrapExitStartup`; if THAT arm fails it writes `d.dp = nil`
-while the still-running monitor goroutine samples `d.dp` — **the same
-race survives**. Edit 2's `if d.natPoolAlarm == nil` guard does NOT
-help: the field is still non-nil (the old monitor), so no fresh monitor
-is built but the OLD goroutine keeps sampling.
+while the still-running monitor samples `d.dp` — **the same race
+survives**. Also `enterBootstrapMode` re-sets `bootstrapMode=true`, so
+without an explicit discard the stale monitor keeps running against a
+torn-down dp during the bootstrap window.
 
-Fix: in `enterBootstrapMode`, stop AND discard the monitor so it no
-longer samples `d.dp`, and so a later re-arm constructs a FRESH one
-(the existing `Monitor` is NOT restartable after `Stop()`: `started`
-stays true and the `stop` channel is closed, so calling `Start()` again
-is a no-op). Place it in the cleanup sequence (runs under the caller's
-`applySem`, serialized with the `d.dp = nil` writes):
+Fix: stop AND discard via the helper (the existing `Monitor` is NOT
+restartable after `Stop()` — `started` stays true and the `stop`
+channel is closed — so the next successful re-arm must build a FRESH
+one). `enterBootstrapMode` runs under the caller's `applySem`, and the
+helper's `Swap(nil)` atomically clears the pointer so a concurrent
+`show security alarms` reader never sees a torn value. Place it AFTER
+`d.bootstrapMode.Store(true)` but BEFORE the `applyBodyForTest`
+early-return so the existing `bootstrap_rollback_test.go` seam tests
+also exercise the discard (it is a no-op when no monitor is running):
 
 ```go
-// #2114: stop and DISCARD the NAT pool-alarm monitor. It was started
-// on the successful bootstrap-exit arm; rolling back to bootstrap means
-// a later corrected commit may re-enter runBootstrapExitStartup and, on
-// an arm failure, write d.dp = nil — which would race the monitor's
-// sampler if it kept running. Discard (not just Stop) because Monitor is
-// not restartable after Stop(); the next successful re-arm builds a
-// fresh one (Edit 2's nil-guard then fires).
-if d.natPoolAlarm != nil {
-    d.natPoolAlarm.Stop()
-    d.natPoolAlarm = nil
-}
+func (d *Daemon) enterBootstrapMode() {
+    d.bootstrapMode.Store(true)
+
+    // #2114: stop and discard the NAT pool-alarm monitor. It may have
+    // been started on a prior successful bootstrap-exit arm; rolling
+    // back to bootstrap means a later corrected commit can re-enter
+    // runBootstrapExitStartup and, on an arm failure, write d.dp = nil
+    // — which would race the monitor's sampler if it kept running.
+    // Discard (not just Stop) because Monitor is not restartable after
+    // Stop(); the next successful re-arm builds a fresh one.
+    d.stopAndDiscardNATPoolAlarm()
+
+    // Test seam: ...
+    if d.applyBodyForTest != nil {
+        return
+    }
+    ...
 ```
 
-This must run BEFORE the `d.dp.Teardown()` step is not strictly
-required (Teardown does not nil `d.dp`), but placing the Stop early in
-the sequence is cleanest. The `applyBodyForTest` early-return in
-`enterBootstrapMode` means this Stop must be placed AFTER that seam
-return only if we want unit tests with a stubbed body to skip it —
-but stopping a monitor is cheap and side-effect-free, so it can go
-either before or after the seam. Decided in Step 5: place it BEFORE the
-`applyBodyForTest` early-return so the lifecycle is exercised by the
-existing `bootstrap_rollback_test.go` seam tests too (Stop on a
-nil/un-started monitor is a no-op, so it is safe there).
+### Edit 4 — shutdown stop (`daemon_run.go:1512`): route through the helper
 
-Note: `Monitor.Start()` is already idempotent (`started` guard) and
-`Stop()` is safe whether or not `Start` ran, so shutdown
-(`daemon_run.go:1512` `if d.natPoolAlarm != nil { d.natPoolAlarm.Stop() }`)
-remains correct in all cases (never started, started at boot, started
-at bootstrap exit, stopped+discarded at rollback then re-built).
+The shutdown stop becomes the helper too (it both stops and clears,
+which is harmless at shutdown and keeps a single code path):
+
+```go
+// #2079/#2114: stop the NAT pool-utilization-alarm monitor.
+d.stopAndDiscardNATPoolAlarm()
+```
 
 ## Behavior matrix (must hold after the fix)
 
@@ -255,6 +342,7 @@ at bootstrap exit, stopped+discarded at rollback then re-built).
 | Architectural mismatch | LOW | Mirrors the existing dataplane-Start() bootstrap gate exactly; no new abstraction. |
 | Missed start path | LOW (was MED) | RESOLVED: single bootstrap-exit site (daemon_apply.go:378-380); cluster SyncApply shares it. |
 | Rollback→re-arm race | LOW (was the v1 miss) | Edit 3 stops+discards the monitor in enterBootstrapMode; Monitor rebuilt fresh on next arm. Covered by the new -race rollback test. |
+| Monitor-pointer race | LOW (was the v2 miss, Codex r2) | Edit 0 makes d.natPoolAlarm atomic.Pointer + routes all access (start/discard/read/shutdown) through helpers; the show-security-alarms reader can no longer race the runtime start/discard. Covered by the -race pointer-hammer test. |
 
 ## Test plan (this is a DATA RACE — `-race` is the gate)
 
@@ -280,13 +368,21 @@ at bootstrap exit, stopped+discarded at rollback then re-built).
      `d.natPoolAlarm == nil`, then concurrently write `d.dp = nil`
      (the re-arm-failure write) — no sampler survives, so no race.
    - **(c) re-arm builds fresh:** after the discard, `maybeStartNATPoolAlarm`
-     constructs a new monitor (nil-guard) and starts it.
+     constructs a new monitor (Swap/Load-guard) and starts it.
+   - **(d) pointer-publication race (Codex r2):** concurrently hammer
+     `natPoolAlarms()` (the `show security alarms` reader) from N
+     goroutines while another goroutine repeatedly
+     `maybeStartNATPoolAlarm()` → `stopAndDiscardNATPoolAlarm()`. With
+     `d.natPoolAlarm` as `atomic.Pointer`, reads/writes of the pointer
+     are race-free; pre-fix (plain pointer field mutated at runtime)
+     this trips `-race`. This proves Edit 0 (atomic field + helpers).
    - **fail-pre / pass-post guarantee:** part (a) fails under `-race` if
      Edit 1's `!inBootstrap()` gate is reverted (sampler races
-     `d.dp = nil`); part (b) fails under `-race` if Edit 3's
-     Stop+discard is reverted (stale sampler races the re-arm write).
-     Both target the real production gating, so the test is a true
-     regression guard, not a tautology.
+     `d.dp = nil`); part (b) fails if Edit 3's Stop+discard is reverted
+     (stale sampler races the re-arm write); part (d) fails if Edit 0's
+     atomic pointer is reverted to a plain field (reader races
+     start/discard). All target real production gating — true regression
+     guards, not tautologies.
    - To force the race window deterministically: the monitor's
      `tick` field is unexported and the daemon test is in a different
      package, so add a small exported test-support hook on
