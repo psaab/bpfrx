@@ -445,10 +445,19 @@ the value sits in a single typed slot:
     presence flags `no-syn-check`, `no-syn-check-in-tunnel`,
     `rst-invalidate-session`, and `no-sequence-check` (#2008 M9) declared
     presence-only for completion parity. The presence flags compile into
-    `TCPSessionConfig` (NoSynCheck / RstInvalidateSession / NoSequenceCheck)
-    but are typed-config only — the userspace dataplane does not yet read them
-    (it performs no TCP sequence-number window validation, so there is nothing
-    for `no-sequence-check` to skip yet).
+    `TCPSessionConfig` (NoSynCheck / NoSynCheckInTunnel / RstInvalidateSession
+    / NoSequenceCheck) but are typed-config only — the userspace dataplane does
+    not read them. The session table is a pure 5-tuple flow entry with no TCP
+    state machine and no sequence/window tracking, so there is nothing for any
+    of these knobs to enforce or skip. **#2078:** setting any of them emits a
+    single accepted-only commit advisory (`pkg/config/compiler.go`,
+    `security flow tcp-session ... accepted-only`) so an operator is not
+    silently misled; research #2078 converged PLAN-KILL on enforcement.
+    The RST design rationale (suppress RST→CLOSED for ESTABLISHED, keep
+    `rst-invalidate-session` as the opt-in override) is in
+    `docs/active-active-new-connections.md`. The dead legacy `flow_config_map`
+    `TCPFlags` write was removed in #2078 (the map was retired with the eBPF
+    dataplane, #1373/#1476).
   - `security flow udp-session` / `icmp-session` expanded to a container with a
     typed `timeout` (`ValidateInteger(0, MaxDurationSeconds)`).
   - `forwarding-options sampling instance <i> input rate` —

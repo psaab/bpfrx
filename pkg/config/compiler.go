@@ -1449,6 +1449,39 @@ func ValidateConfig(cfg *Config) []string {
 		warnings = append(warnings, "forwarding-options allow-dataplane-sleep configured but is accepted-only — the userspace dataplane workers busy-poll and idle-yield is not yet implemented")
 	}
 
+	// #2078: the `security flow tcp-session` presence flags are typed and
+	// committed but the userspace AF_XDP dataplane enforces none of them
+	// today. no-syn-check / no-syn-check-in-tunnel would gate the
+	// session-create SYN check; rst-invalidate-session would tear a session
+	// down on RST; no-sequence-check (#2008 M9) would skip sequence-window
+	// validation. The dataplane session table is a pure 5-tuple flow entry
+	// with no TCP state machine and no sequence/window tracking, so there is
+	// nothing for any of these knobs to enforce or skip. This is an
+	// intentional, reviewed parity gap (see #2008 M9 and the RST design
+	// rationale in docs/active-active-new-connections.md); research #2078
+	// converged PLAN-KILL on enforcement. Warn so an operator who sets one
+	// of these is not silently misled into believing it has runtime effect.
+	if ts := cfg.Security.Flow.TCPSession; ts != nil {
+		var unenforced []string
+		if ts.NoSynCheck {
+			unenforced = append(unenforced, "no-syn-check")
+		}
+		if ts.NoSynCheckInTunnel {
+			unenforced = append(unenforced, "no-syn-check-in-tunnel")
+		}
+		if ts.RstInvalidateSession {
+			unenforced = append(unenforced, "rst-invalidate-session")
+		}
+		if ts.NoSequenceCheck {
+			unenforced = append(unenforced, "no-sequence-check")
+		}
+		if len(unenforced) > 0 {
+			warnings = append(warnings, fmt.Sprintf(
+				"security flow tcp-session %s configured but accepted-only — the userspace dataplane has no TCP state machine and does not enforce these knobs (config-only parity, #2078)",
+				strings.Join(unenforced, ", ")))
+		}
+	}
+
 	// #654: warn on `system processes X disable` for a process that
 	// bpfrx does not actually manage. Silently accepting the knob (as
 	// used to happen with e.g. `utmd disable` on vSRX) means the
