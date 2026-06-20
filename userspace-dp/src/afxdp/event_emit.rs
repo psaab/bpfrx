@@ -192,10 +192,12 @@ fn policy_action_to_rt_flow(action: PolicyAction) -> u8 {
     match action {
         PolicyAction::Permit => RT_FLOW_ACTION_PERMIT,
         PolicyAction::Deny => RT_FLOW_ACTION_DENY,
-        // Userspace policy reject is currently fail-closed as a terminal
-        // drop. Until policy-deny paths synthesize ICMP/RST rejects, log
-        // deny rather than claiming a reject packet was generated.
-        PolicyAction::Reject => RT_FLOW_ACTION_DENY,
+        // #2089: the policy-deny path now synthesizes a TCP RST / ICMP
+        // unreachable for `reject` (poll_descriptor reject_reply), so the
+        // RT_FLOW action reports reject, matching the wire behavior and
+        // Junos. (Filter reject — filter_action_to_rt_flow below — is
+        // still a silent drop and stays mapped to deny.)
+        PolicyAction::Reject => RT_FLOW_ACTION_REJECT,
     }
 }
 
@@ -332,7 +334,10 @@ mod tests {
     }
 
     #[test]
-    fn policy_deny_event_emit_fails_closed_reject_as_deny() {
+    fn policy_deny_event_emit_reject_maps_to_reject_action() {
+        // #2089: the policy-deny path now synthesizes a TCP RST / ICMP
+        // unreachable for `reject`, so the RT_FLOW action must report
+        // reject (was deny while reject was a silent drop).
         let (handle, rx) = unlimited_handle();
         let flow = test_flow();
 
@@ -354,7 +359,7 @@ mod tests {
             .decode_dataplane_event()
             .expect("policy event payload");
         assert_eq!(event.kind, DataplaneEventKind::PolicyDeny);
-        assert_eq!(event.action, RT_FLOW_ACTION_DENY);
+        assert_eq!(event.action, RT_FLOW_ACTION_REJECT);
         assert_eq!(event.reason, RT_FLOW_CLOSE_REASON_POLICY);
         assert_eq!(handle.dataplane_event_stats().policy_deny.sent, 1);
     }

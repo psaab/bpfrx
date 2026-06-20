@@ -370,6 +370,11 @@ pub(in crate::afxdp) struct BindingLiveState {
     /// #1374: retransmitted SYNs admitted by the single-use validated-client
     /// cache after a valid cookie ACK.
     pub(super) syn_cookie_bypass: AtomicU64,
+    /// #2089: policy-`reject` RST/ICMP-unreachable replies enqueued.
+    pub(super) policy_reject_sent: AtomicU64,
+    /// #2089: policy-`reject` replies suppressed due to TX-frame budget
+    /// exhaustion (the packet is still dropped — fail-closed).
+    pub(super) policy_reject_reply_budget_drops: AtomicU64,
     pub(super) snat_packets: AtomicU64,
     pub(super) dnat_packets: AtomicU64,
     pub(super) slow_path_packets: AtomicU64,
@@ -733,6 +738,8 @@ impl BindingLiveState {
             syn_cookie_ack_valid: AtomicU64::new(0),
             syn_cookie_ack_invalid: AtomicU64::new(0),
             syn_cookie_bypass: AtomicU64::new(0),
+            policy_reject_sent: AtomicU64::new(0),
+            policy_reject_reply_budget_drops: AtomicU64::new(0),
             snat_packets: AtomicU64::new(0),
             dnat_packets: AtomicU64::new(0),
             slow_path_packets: AtomicU64::new(0),
