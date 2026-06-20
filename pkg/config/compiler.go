@@ -186,6 +186,20 @@ type compileOpts struct {
 	// silently never fire) is rejected. Same doctrine as
 	// lenientIPsecPolicyProposalRef.
 	lenientLogProfileStreamRef bool
+
+	// lenientUnsupportedInterfaceStanzas (#2008 H9/H10) downgrades the
+	// interface silent-drop gate (validateUnsupportedInterfaceStanzasAST:
+	// `interface [unit] mac` static-MAC override, `family inet|inet6
+	// policer arp` per-unit ARP policer) from a hard error to a warning on
+	// the tolerant load / peer-sync paths. Both stanzas parse-accept and
+	// silently drop on every binary up to this gate, so an
+	// already-persisted or peer-synced config may carry them; an upgrading
+	// / receiving node must still boot through it (warn) rather than
+	// fail-closed-on-load (#1960 class). Commit / commit-check stay strict
+	// — a new operator edit that the dataplane cannot honour is rejected
+	// instead of silently ignored. Same doctrine as
+	// lenientVRRPTrackDuplicates / lenientLogProfileStreamRef.
+	lenientUnsupportedInterfaceStanzas bool
 }
 
 // CompileConfig converts a parsed ConfigTree AST into a typed Config struct.
@@ -207,16 +221,17 @@ func CompileConfig(tree *ConfigTree) (*Config, error) {
 // #1830 (e) — the dataplane no longer caps equal-flow at 32 workers.)
 func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 	return compileConfigWithOpts(tree, compileOpts{
-		sanitizeFreeTextControlChars:  true,
-		lenientVRRPTrackDuplicates:    true,
-		lenientDeviceMap:              true,
-		lenientPolicyMatchAddress:     true,
-		lenientTCPMSSRange:            true,
-		lenientEventAttributesMatch:   true,
-		lenientIPsecPolicyProposalRef: true,
-		lenientIPsecGatewayRefs:       true,
-		lenientLogProfileStreamRef:    true,
-		lenientNATPoolAlarmThreshold:  true,
+		sanitizeFreeTextControlChars:       true,
+		lenientVRRPTrackDuplicates:         true,
+		lenientDeviceMap:                   true,
+		lenientPolicyMatchAddress:          true,
+		lenientTCPMSSRange:                 true,
+		lenientEventAttributesMatch:        true,
+		lenientIPsecPolicyProposalRef:      true,
+		lenientIPsecGatewayRefs:            true,
+		lenientLogProfileStreamRef:         true,
+		lenientNATPoolAlarmThreshold:       true,
+		lenientUnsupportedInterfaceStanzas: true,
 	})
 }
 
@@ -289,16 +304,17 @@ func CompileConfigForNode(tree *ConfigTree, nodeID int) (*Config, error) {
 // the candidate-commit path — see CompileConfigLenient.
 func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) {
 	return compileConfigForNodeWithOpts(tree, nodeID, compileOpts{
-		sanitizeFreeTextControlChars:  true,
-		lenientVRRPTrackDuplicates:    true,
-		lenientDeviceMap:              true,
-		lenientPolicyMatchAddress:     true,
-		lenientTCPMSSRange:            true,
-		lenientEventAttributesMatch:   true,
-		lenientIPsecPolicyProposalRef: true,
-		lenientIPsecGatewayRefs:       true,
-		lenientLogProfileStreamRef:    true,
-		lenientNATPoolAlarmThreshold:  true,
+		sanitizeFreeTextControlChars:       true,
+		lenientVRRPTrackDuplicates:         true,
+		lenientDeviceMap:                   true,
+		lenientPolicyMatchAddress:          true,
+		lenientTCPMSSRange:                 true,
+		lenientEventAttributesMatch:        true,
+		lenientIPsecPolicyProposalRef:      true,
+		lenientIPsecGatewayRefs:            true,
+		lenientLogProfileStreamRef:         true,
+		lenientNATPoolAlarmThreshold:       true,
+		lenientUnsupportedInterfaceStanzas: true,
 	})
 }
 
@@ -380,6 +396,20 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		return nil, err
 	}
 
+	// #2008 H9/H10 interface silent-drop gate. Runs on the group-expanded,
+	// inactive-pruned tree (apply-groups-inherited stanzas covered;
+	// `inactive:` stanzas already stripped upstream) and BEFORE section
+	// compilation. Strict (commit / commit-check): a static `mac` override
+	// or a `family inet|inet6 policer arp` — neither of which the dataplane
+	// can honour — hard-rejects. Lenient (load / peer-sync): warn so an
+	// already-persisted or peer-synced config that an older binary silently
+	// accepted still boots (#1960 fail-closed-on-load class).
+	unsupportedIfaceWarnings, err := validateUnsupportedInterfaceStanzasAST(
+		tree.Children, opts.lenientUnsupportedInterfaceStanzas)
+	if err != nil {
+		return nil, err
+	}
+
 	cfg := &Config{
 		Security: SecurityConfig{
 			Zones:  make(map[string]*ZoneConfig),
@@ -404,6 +434,7 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 	cfg.Warnings = append(cfg.Warnings, ctrlCharWarnings...)
 	cfg.Warnings = append(cfg.Warnings, trackWarnings...)
 	cfg.Warnings = append(cfg.Warnings, mssWarnings...)
+	cfg.Warnings = append(cfg.Warnings, unsupportedIfaceWarnings...)
 
 	for _, node := range tree.Children {
 		switch node.Name() {
