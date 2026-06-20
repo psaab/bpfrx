@@ -21,7 +21,7 @@ type FlowConfigValue struct {
 	ALGFlags          uint8  // bit 0: DNS disable, bit 1: FTP disable, bit 2: SIP disable, bit 3: TFTP disable
 	Lo0FilterV4       uint16 // filter ID for lo0 inet input (0xFFFF=none)
 	Lo0FilterV6       uint16 // filter ID for lo0 inet6 input (0xFFFF=none)
-	TCPFlags          uint8  // bit 0: no-syn-check, bit 1: rst-invalidate-session
+	TCPFlags          uint8  // retired (#2078): tcp-session knobs are config-only on the userspace dataplane; field kept for xpf_common.h layout parity, no longer populated
 	AppFlags          uint8  // bit 0: AppID enabled, bit 1: pre-ID session-init log, bit 2: pre-ID session-close log
 }
 

@@ -1066,18 +1066,17 @@ func compileFlowConfig(dp DataPlane, cfg *config.Config, result *CompileResult) 
 		fc.ALGFlags |= 0x08
 	}
 
-	// TCP session flags
-	if flow.TCPSession != nil {
-		if flow.TCPSession.NoSynCheck {
-			fc.TCPFlags |= 0x01
-		}
-		if flow.TCPSession.RstInvalidateSession {
-			fc.TCPFlags |= 0x02
-		}
-		if flow.TCPSession.NoSynCheckInTunnel {
-			fc.TCPFlags |= 0x04
-		}
-	}
+	// #2078: the `security flow tcp-session` presence flags (no-syn-check /
+	// rst-invalidate-session / no-syn-check-in-tunnel) used to be packed into
+	// FlowConfigValue.TCPFlags here and written to the legacy flow_config_map
+	// eBPF map. That map and its reader were retired with the eBPF dataplane
+	// (#1373/#1476); on the userspace path SetFlowConfig is a no-op stub
+	// (pkg/dataplane/loader.go userspaceShimCompileDataplane.SetFlowConfig).
+	// The packing was therefore a dead write to a retired map. The knobs are
+	// accepted-but-not-enforced on the userspace dataplane (config-only
+	// parity); the operator is warned at commit time (pkg/config/compiler.go,
+	// #2078). The TCPFlags field is retained on FlowConfigValue to keep the
+	// struct mirroring xpf_common.h, but it is no longer populated.
 
 	if cfg.Services.ApplicationIdentification {
 		fc.AppFlags |= 0x01
@@ -1113,7 +1112,6 @@ func compileFlowConfig(dp DataPlane, cfg *config.Config, result *CompileResult) 
 		"tcp_mss_gre_out", fc.TCPMSSGreOut,
 		"allow_dns_reply", fc.AllowDNSReply,
 		"allow_embedded_icmp", fc.AllowEmbeddedICMP,
-		"tcp_flags", fc.TCPFlags,
 		"app_flags", fc.AppFlags,
 		"lo0_filter_v4", fc.Lo0FilterV4,
 		"lo0_filter_v6", fc.Lo0FilterV6)
