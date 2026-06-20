@@ -231,10 +231,27 @@ func TestZeroPrefixRetainsLastGood(t *testing.T) {
 	}
 }
 
+// TestResolveHoldInterval pins the #2050 default-mapping decision: unset (0)
+// and negative map to retainForever (never auto-drop); only an explicit
+// positive value yields a timed drop window.
+func TestResolveHoldInterval(t *testing.T) {
+	if got := resolveHoldInterval(0); got != retainForever {
+		t.Errorf("resolveHoldInterval(0) = %v, want retainForever (never drop)", got)
+	}
+	if got := resolveHoldInterval(-5); got != retainForever {
+		t.Errorf("resolveHoldInterval(-5) = %v, want retainForever", got)
+	}
+	if got := resolveHoldInterval(7200); got != 2*time.Hour {
+		t.Errorf("resolveHoldInterval(7200) = %v, want 2h", got)
+	}
+}
+
 // --- HoldInterval retain-then-drop ---
 
-// TestHoldIntervalRetainThenDrop targets behavior 5: retain last-good within
-// HoldInterval, then drop to empty (fail-closed) after it elapses.
+// TestHoldIntervalRetainThenDrop targets the EXPLICIT opt-in drop: with a
+// positive hold-interval configured, retain last-good within the window, then
+// drop to empty (fail-closed) after it elapses. This is no longer the default
+// (see TestUnsetHoldIntervalRetainsForever) — it requires hold-interval > 0.
 func TestHoldIntervalRetainThenDrop(t *testing.T) {
 	var calls atomic.Int32
 	m := New(func() { calls.Add(1) })
@@ -295,8 +312,90 @@ func TestHoldIntervalRetainThenDrop(t *testing.T) {
 	if got := m.GetPrefixes("f"); len(got) != 0 {
 		t.Fatalf("snapshot not dropped after hold elapsed: got %v", got)
 	}
+	if got := m.GetPrefixes("f"); got == nil {
+		t.Error("GetPrefixes returned nil after drop; want non-nil empty slice (Copilot #3)")
+	}
 	if calls.Load() != 2 {
 		t.Fatalf("expected onUpdate on drop-to-empty: calls = %d, want 2", calls.Load())
+	}
+	// Copilot #2: after the drop there is no retained snapshot, so StaleSince
+	// must be cleared to match its docstring, and Hash must surface "".
+	info := m.AllFeeds()["f"]
+	if !info.StaleSince.IsZero() {
+		t.Errorf("StaleSince not cleared after drop-to-empty: %v", info.StaleSince)
+	}
+	if info.Hash != "" {
+		t.Errorf("Hash not cleared after drop-to-empty: %q (want \"\")", info.Hash)
+	}
+}
+
+// TestUnsetHoldIntervalRetainsForever is the core #2050 operator-decision test:
+// with hold-interval UNSET (retainForever / 0), repeated failures over an
+// arbitrarily long span NEVER drop the last-good snapshot to empty. A stale
+// DENYLIST that fail-OPENs is the rejected behaviour. This test would FAIL
+// under the old default (resolveHoldInterval(0) -> 2h), which dropped to empty
+// after the window elapsed.
+func TestUnsetHoldIntervalRetainsForever(t *testing.T) {
+	var calls atomic.Int32
+	m := New(func() { calls.Add(1) })
+
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	var nowMu sync.Mutex
+	cur := base
+	m.now = func() time.Time {
+		nowMu.Lock()
+		defer nowMu.Unlock()
+		return cur
+	}
+	advance := func(d time.Duration) {
+		nowMu.Lock()
+		cur = cur.Add(d)
+		nowMu.Unlock()
+	}
+
+	srv := &bodyServer{}
+	srv.set("203.0.113.0/24\n", http.StatusOK)
+	ts := httptest.NewServer(srv.handler())
+	defer ts.Close()
+
+	// hold-interval UNSET == resolveHoldInterval(0) == retainForever.
+	fs := m.newFeed("f", ts.URL, resolveHoldInterval(0))
+	if fs.holdInterval != retainForever {
+		t.Fatalf("unset hold-interval did not resolve to retainForever: %v", fs.holdInterval)
+	}
+	ctx := context.Background()
+
+	m.fetchFeed(ctx, fs) // good snapshot at base
+	if calls.Load() != 1 {
+		t.Fatalf("install calls = %d, want 1", calls.Load())
+	}
+
+	srv.set("nope", http.StatusBadGateway) // start failing forever
+
+	// First failure: enters stale, retains.
+	m.fetchFeed(ctx, fs)
+	staleAt := m.AllFeeds()["f"].StaleSince
+	if staleAt.IsZero() {
+		t.Fatal("staleSince not set on first failure")
+	}
+
+	// Hammer failures across a span far longer than the old 2h default. Under
+	// retain-forever, the snapshot is NEVER dropped and onUpdate never fires.
+	for i := 0; i < 50; i++ {
+		advance(24 * time.Hour) // total well past any plausible hold window
+		m.fetchFeed(ctx, fs)
+		if got := m.GetPrefixes("f"); len(got) != 1 || got[0] != "203.0.113.0/24" {
+			t.Fatalf("retain-forever dropped snapshot at iter %d: got %v", i, got)
+		}
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("onUpdate fired during retain-forever (drop happened): calls = %d, want 1", calls.Load())
+	}
+	// StaleSince must remain pinned at the first-failure time across all ticks
+	// (set once on entry to stale, never re-stamped) and stay non-zero while a
+	// snapshot is retained as stale.
+	if got := m.AllFeeds()["f"].StaleSince; !got.Equal(staleAt) {
+		t.Errorf("StaleSince moved during retain: was %v now %v", staleAt, got)
 	}
 }
 
@@ -315,11 +414,21 @@ func TestStartupNoSnapshotFailClosed(t *testing.T) {
 	if got := m.GetPrefixes("f"); len(got) != 0 {
 		t.Fatalf("startup-before-first-fetch not fail-closed: got %v", got)
 	}
+	// Copilot #3: a known feed with no snapshot returns a non-nil empty slice
+	// so the JSON encoder emits [] rather than null.
+	if got := m.GetPrefixes("f"); got == nil {
+		t.Error("GetPrefixes returned nil for a known feed with no snapshot; want non-nil empty slice")
+	}
 	if fs.hasSnapshot {
 		t.Error("hasSnapshot true with no successful fetch")
 	}
 	if fs.lastError == "" {
 		t.Error("expected lastError recorded on startup failure")
+	}
+	// Copilot #1: with no snapshot installed, Hash must be "" — not 64 zero-hex
+	// chars from the zero [32]byte.
+	if info := m.AllFeeds()["f"]; info.Hash != "" {
+		t.Errorf("Hash = %q with no snapshot; want \"\" (Copilot #1)", info.Hash)
 	}
 }
 

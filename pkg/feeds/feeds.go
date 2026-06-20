@@ -18,10 +18,13 @@ import (
 	"github.com/psaab/xpf/pkg/config"
 )
 
-// defaultHoldInterval is the retain-last-good window applied when a feed
-// server does not configure hold-interval (0). Matches the Junos default and
-// config.FeedServer.HoldInterval's documented "0 = default 7200" semantics.
-const defaultHoldInterval = 2 * time.Hour
+// retainForever is the sentinel holdInterval meaning "never auto-drop the
+// last-good snapshot to empty on persistent failure". This is the DEFAULT
+// (operator decision, #2050): a stale DENYLIST that fail-OPENs to empty is
+// worse than a stale-but-enforced set, so an unset/zero hold-interval retains
+// the last-good snapshot INDEFINITELY. The drop-after-N-seconds behaviour is
+// now strictly opt-in via an explicit positive hold-interval.
+const retainForever time.Duration = 0
 
 // maxLineBytes is the per-line scanner token cap. The default bufio.Scanner cap
 // is 64 KB; a single overlong line silently truncates the whole set with the
@@ -41,9 +44,13 @@ type Manager struct {
 }
 
 type feedState struct {
-	name         string        // feed-name or server name
-	url          string        // fully resolved URL
-	holdInterval time.Duration // retain-last-good window on fetch failure
+	name string // feed-name or server name
+	url  string // fully resolved URL
+	// holdInterval is the retain-last-good window on persistent fetch failure.
+	// retainForever (0) — the default — means NEVER auto-drop the last-good
+	// snapshot to empty; only an explicit positive value arms the
+	// drop-after-N-seconds opt-in.
+	holdInterval time.Duration
 
 	// Active enforced snapshot (canonicalized, deduped, sorted).
 	prefixes    []string
@@ -85,11 +92,15 @@ func resolveBaseURL(fsCfg *config.FeedServer) string {
 	return ""
 }
 
-// resolveHoldInterval maps the configured hold-interval (seconds, 0 = default)
-// to a duration. A negative value is treated as the default.
+// resolveHoldInterval maps the configured hold-interval (seconds) to a
+// duration. An UNSET (zero) or negative value means retainForever — the
+// last-good snapshot is kept indefinitely on persistent failure, never
+// auto-dropped to empty (#2050 operator decision: never fail-OPEN a stale
+// denylist). Only an explicit positive value arms the drop-after-N-seconds
+// opt-in.
 func resolveHoldInterval(seconds int) time.Duration {
 	if seconds <= 0 {
-		return defaultHoldInterval
+		return retainForever
 	}
 	return time.Duration(seconds) * time.Second
 }
@@ -117,6 +128,12 @@ func (m *Manager) Apply(ctx context.Context, daCfg *config.DynamicAddressConfig)
 			interval = time.Hour
 		}
 		hold := resolveHoldInterval(fsCfg.HoldInterval)
+		// Human-readable hold for the start log: retainForever (the default)
+		// would otherwise log as "0s".
+		holdStr := "forever"
+		if hold > 0 {
+			holdStr = hold.String()
+		}
 
 		if len(fsCfg.FeedEntries) > 0 {
 			// Multiple named feeds with per-feed paths
@@ -140,7 +157,7 @@ func (m *Manager) Apply(ctx context.Context, daCfg *config.DynamicAddressConfig)
 				go m.refreshLoop(feedCtx, fs, interval)
 				slog.Info("dynamic address feed started",
 					"name", fe.Name, "server", fsCfg.Name, "url", feedURL,
-					"interval", interval, "hold", hold)
+					"interval", interval, "hold", holdStr)
 			}
 		} else {
 			// Single feed (backward compat): keyed by FeedName or server name
@@ -158,7 +175,7 @@ func (m *Manager) Apply(ctx context.Context, daCfg *config.DynamicAddressConfig)
 			m.feeds[key] = fs
 			go m.refreshLoop(feedCtx, fs, interval)
 			slog.Info("dynamic address feed started",
-				"name", key, "url", baseURL, "interval", interval, "hold", hold)
+				"name", key, "url", baseURL, "interval", interval, "hold", holdStr)
 		}
 	}
 	m.mu.Unlock()
@@ -177,13 +194,23 @@ func (m *Manager) StopAll() {
 }
 
 // GetPrefixes returns the current enforced prefixes for a named feed.
-// Returns the last-good snapshot while it is still being retained, and nil
-// once the hold window has elapsed (fail-closed) or before the first fetch.
+//
+// While a last-good snapshot is installed it is returned (retained
+// indefinitely by default on persistent failure; see holdInterval). Before
+// the first successful fetch — and after an explicit hold-interval drop —
+// there is no snapshot and a non-nil empty slice is returned (fail-closed),
+// so callers and JSON encoders see [] rather than null. An unknown feed name
+// returns nil.
 func (m *Manager) GetPrefixes(name string) []string {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
 	if fs, ok := m.feeds[name]; ok {
-		return append([]string(nil), fs.prefixes...)
+		// Always return a non-nil slice for a known feed so a feed with no
+		// installed snapshot marshals as [] (empty), not null. Copying with a
+		// zero-cap make keeps the empty case non-nil.
+		out := make([]string, len(fs.prefixes))
+		copy(out, fs.prefixes)
+		return out
 	}
 	return nil
 }
@@ -194,6 +221,14 @@ func (m *Manager) AllFeeds() map[string]FeedInfo {
 	defer m.mu.RUnlock()
 	result := make(map[string]FeedInfo, len(m.feeds))
 	for name, fs := range m.feeds {
+		// Copilot #1: surface "" (not 64 zero-hex chars) when no snapshot is
+		// installed (before first fetch, or after an explicit hold-interval
+		// drop). The zero [32]byte would otherwise format as all-zero hex and
+		// masquerade as a real digest.
+		hash := ""
+		if fs.hasSnapshot {
+			hash = fmt.Sprintf("%x", fs.hash)
+		}
 		result[name] = FeedInfo{
 			URL:         fs.url,
 			Prefixes:    len(fs.prefixes),
@@ -201,7 +236,7 @@ func (m *Manager) AllFeeds() map[string]FeedInfo {
 			LastSuccess: fs.lastSuccess,
 			LastError:   fs.lastError,
 			StaleSince:  fs.staleSince,
-			Hash:        fmt.Sprintf("%x", fs.hash),
+			Hash:        hash,
 		}
 	}
 	return result
@@ -216,8 +251,13 @@ type FeedInfo struct {
 	// Additive status fields (#2050).
 	LastSuccess time.Time // last fully-successful fetch
 	LastError   string    // most recent fetch/parse error, "" if last fetch was good
-	StaleSince  time.Time // when the current snapshot started being retained as stale
-	Hash        string    // hex sha256 of the canonical prefix set ("" if none)
+	// StaleSince is set when a RETAINED last-good snapshot started being
+	// served as stale (first failure after a good fetch) and is zero when no
+	// snapshot is being retained as stale — i.e. zero before the first good
+	// fetch, while the current fetch is fresh, and after an explicit
+	// hold-interval drop cleared the retained snapshot.
+	StaleSince time.Time
+	Hash       string // hex sha256 of the canonical prefix set ("" if none)
 }
 
 func (m *Manager) refreshLoop(ctx context.Context, fs *feedState, interval time.Duration) {
@@ -247,8 +287,9 @@ type fetchResult struct {
 // fetchFeed performs a single GET, parses + canonicalizes the body, and applies
 // it to the feed state. A fetch is considered SUCCESSFUL only if the transport
 // read completes without error AND the parsed set is non-empty. On any failure
-// the last-good snapshot is RETAINED until HoldInterval elapses, then dropped
-// to empty (fail-closed). lastFetch/lastSuccess are stamped only on success.
+// the last-good snapshot is RETAINED — indefinitely by default, or until an
+// explicit positive hold-interval elapses (the opt-in drop-to-empty).
+// lastFetch/lastSuccess are stamped only on success.
 func (m *Manager) fetchFeed(ctx context.Context, fs *feedState) {
 	res, err := m.readFeed(ctx, fs)
 	if err != nil {
@@ -385,38 +426,65 @@ func (m *Manager) installSnapshot(fs *feedState, res fetchResult) {
 // recordFailure handles a failed fetch under the retain-last-good policy:
 //   - records LastError (does NOT stamp lastFetch/lastSuccess),
 //   - if a good snapshot is being retained, sets StaleSince on the first
-//     failure and keeps the snapshot until HoldInterval elapses,
-//   - once HoldInterval has elapsed (measured from StaleSince), drops the
-//     snapshot to empty (fail-closed) and fires onUpdate so enforcement sees
-//     the now-empty set.
+//     failure (the feed ENTERING stale) and keeps the snapshot,
+//   - by DEFAULT (holdInterval == retainForever) the snapshot is retained
+//     INDEFINITELY — never auto-dropped to empty, because a stale-but-enforced
+//     denylist beats a fail-OPEN empty one (#2050 operator decision),
+//   - ONLY when an explicit positive hold-interval is configured AND it has
+//     elapsed (measured from StaleSince) is the snapshot dropped to empty
+//     (fail-closed) with an onUpdate so enforcement sees the now-empty set;
+//     StaleSince is then cleared (no snapshot is retained as stale anymore,
+//     Copilot #2).
+//
+// A one-time slog.Warn fires when the feed first ENTERS the stale state, not
+// on every failing tick, so a persistently-down feed does not flood the log.
 func (m *Manager) recordFailure(fs *feedState, ferr error) {
 	m.mu.Lock()
 	now := m.now()
 	fs.lastError = ferr.Error()
 
+	enteredStale := false
 	dropped := false
 	if fs.hasSnapshot && len(fs.prefixes) > 0 {
 		if fs.staleSince.IsZero() {
 			fs.staleSince = now
+			enteredStale = true
 		}
-		if now.Sub(fs.staleSince) >= fs.holdInterval {
-			// Hold window elapsed with no good fetch: drop to empty.
+		// retainForever (the default) never drops; only an explicit positive
+		// hold-interval arms the timed drop-to-empty.
+		if fs.holdInterval > 0 && now.Sub(fs.staleSince) >= fs.holdInterval {
 			fs.prefixes = nil
 			fs.hash = [32]byte{}
 			fs.hasSnapshot = false
+			// Copilot #2: no snapshot is retained as stale anymore — clear
+			// StaleSince so FeedInfo.StaleSince matches its docstring.
+			fs.staleSince = time.Time{}
 			dropped = true
 		}
 	}
 	m.mu.Unlock()
 
-	if dropped {
+	switch {
+	case dropped:
 		slog.Warn("dynamic-address: hold interval elapsed, dropping stale feed to empty",
 			"name", fs.name, "err", ferr, "hold", fs.holdInterval)
 		if m.onUpdate != nil {
 			m.onUpdate()
 		}
-	} else {
-		slog.Warn("dynamic-address: fetch failed, retaining last-good",
+	case enteredStale:
+		// One-time loud warning on entry to the stale state. Subsequent
+		// failing ticks are logged at Debug to avoid flooding the journal for
+		// a persistently-down feed.
+		slog.Warn("dynamic-address: feed entered STALE — fetch failed, retaining last-good snapshot",
+			"name", fs.name, "err", ferr, "retain",
+			func() string {
+				if fs.holdInterval > 0 {
+					return fs.holdInterval.String()
+				}
+				return "forever"
+			}())
+	default:
+		slog.Debug("dynamic-address: fetch failed, retaining last-good",
 			"name", fs.name, "err", ferr)
 	}
 }
