@@ -71,6 +71,26 @@ all files stay in `package ipsec`, so the public API is unchanged.
   `xfrmiIfID()`. The same name → same numeric ID across reboots — don't
   rename a bind interface without expecting a reset of the SAs that ride
   it.
+- **IPsec policy → proposal cross-reference (#2073).** An IPsec (Phase 2)
+  policy's `proposals` reference (or, when omitted, a proposal named after
+  the policy) is validated at commit / commit-check by
+  `pkg/config` `validateIPsecPolicyProposalReferencesStrict`. A dangling
+  reference is **hard-rejected** at commit: previously it fell through to
+  `esp_proposals = default` in `resolveESPSettings`, silently substituting
+  the operator's entire Phase-2 proposal set — including any configured
+  `perfect-forward-secrecy` DH group — with the strongSwan default (which
+  carries no required modp term), so PFS was silently disabled. On the
+  tolerant load / peer-sync paths the commit check is downgraded to a
+  warning (an already-persisted or peer-synced config still boots), and
+  `resolveESPSettings` has a render-side safety net: when the policy
+  resolves with a PFS group but the proposal ref dangles, it carries the
+  configured PFS group on a conservative valid fallback proposal
+  (`aes256-sha256-modp<bits>`, built with swanctl's canonical keyword
+  spellings) instead of falling through to `default`,
+  and logs a warning. Note: strongSwan ≥ 6.0.2 changed its `default` ESP
+  set to make PFS *optional* rather than absent, so the silent weakening is
+  a downgrade-to-negotiable-PFS there rather than no-PFS — the fix is the
+  same.
 - **Gateway reference resolution / `remote_addrs` (#2074).** A VPN's
   `ike gateway <name>` either names a defined `security ike gateway`
   object (whose `address` or `dynamic hostname` becomes `remote_addrs`)

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -133,6 +134,17 @@ type compileOpts struct {
 	// still boot through that already-committed config rather than fail to
 	// load. Commit stays strict (see the validator call site).
 	lenientEventAttributesMatch bool
+	// lenientIPsecPolicyProposalRef (#2073) downgrades the IPsec policy
+	// proposal cross-reference check from a hard error to a warning on the
+	// tolerant load / peer-sync paths. A dangling `proposals` reference (or
+	// a PFS policy with no resolvable proposal) silently drops the
+	// configured perfect-forward-secrecy group to the strongSwan default at
+	// render time; commit/commit-check hard-reject it so a new operator edit
+	// fails loudly, but an already-persisted or peer-synced config carrying
+	// this latent misconfiguration must still boot (the render-path safety
+	// net in pkg/ipsec resolveESPSettings preserves the PFS group on that
+	// boot). Same doctrine as lenientPolicyMatchAddress.
+	lenientIPsecPolicyProposalRef bool
 
 	// lenientIPsecGatewayRefs (#2074) downgrades the IPsec VPN -> IKE
 	// gateway cross-reference check from a hard error to a warning on the
@@ -167,13 +179,14 @@ func CompileConfig(tree *ConfigTree) (*Config, error) {
 // #1830 (e) — the dataplane no longer caps equal-flow at 32 workers.)
 func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 	return compileConfigWithOpts(tree, compileOpts{
-		sanitizeFreeTextControlChars: true,
-		lenientVRRPTrackDuplicates:   true,
-		lenientDeviceMap:             true,
-		lenientPolicyMatchAddress:    true,
-		lenientTCPMSSRange:           true,
-		lenientEventAttributesMatch:  true,
-		lenientIPsecGatewayRefs:      true,
+		sanitizeFreeTextControlChars:  true,
+		lenientVRRPTrackDuplicates:    true,
+		lenientDeviceMap:              true,
+		lenientPolicyMatchAddress:     true,
+		lenientTCPMSSRange:            true,
+		lenientEventAttributesMatch:   true,
+		lenientIPsecPolicyProposalRef: true,
+		lenientIPsecGatewayRefs:       true,
 	})
 }
 
@@ -246,13 +259,14 @@ func CompileConfigForNode(tree *ConfigTree, nodeID int) (*Config, error) {
 // the candidate-commit path — see CompileConfigLenient.
 func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) {
 	return compileConfigForNodeWithOpts(tree, nodeID, compileOpts{
-		sanitizeFreeTextControlChars: true,
-		lenientVRRPTrackDuplicates:   true,
-		lenientDeviceMap:             true,
-		lenientPolicyMatchAddress:    true,
-		lenientTCPMSSRange:           true,
-		lenientEventAttributesMatch:  true,
-		lenientIPsecGatewayRefs:      true,
+		sanitizeFreeTextControlChars:  true,
+		lenientVRRPTrackDuplicates:    true,
+		lenientDeviceMap:              true,
+		lenientPolicyMatchAddress:     true,
+		lenientTCPMSSRange:            true,
+		lenientEventAttributesMatch:   true,
+		lenientIPsecPolicyProposalRef: true,
+		lenientIPsecGatewayRefs:       true,
 	})
 }
 
@@ -586,6 +600,22 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		}
 	}
 
+	// #2073 IPsec policy proposal cross-reference gate. Strict on commit /
+	// commit-check (hard-reject a dangling ipsec policy -> proposal
+	// reference that would silently drop the configured perfect-forward-
+	// secrecy group to the strongSwan default); lenient on load / peer-sync
+	// (warn so an already-persisted or peer-synced config still boots — the
+	// render-path safety net in pkg/ipsec preserves the PFS group on that
+	// boot). Runs alongside the other tolerant-downgradable cross-ref gates.
+	if err := validateIPsecPolicyProposalReferencesStrict(cfg); err != nil {
+		if opts.lenientIPsecPolicyProposalRef {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("ipsec policy proposal reference (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
 	// #2008 M7: event-options attributes-match patterns are RE2 regexes
 	// (Junos `matches` semantics). Reject an uncompilable pattern at commit
 	// so the operator gets immediate feedback instead of the event engine
@@ -753,6 +783,75 @@ func validatePolicySchedulerReferencesStrict(cfg *Config) error {
 		if err := check("global", pol); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// validateIPsecPolicyProposalReferencesStrict hard-rejects an IPsec
+// (Phase 2) policy whose `proposals` reference does not resolve to a
+// defined IPsec proposal (#2073). resolveESPSettings (pkg/ipsec/ike.go)
+// resolves the policy's proposal ref, or falls back to the policy name
+// when no `proposals` leaf is given. When that reference dangles, the
+// renderer would otherwise fall through to `esp_proposals = default`,
+// silently substituting the operator's entire Phase-2 proposal set —
+// including any configured perfect-forward-secrecy DH group — with the
+// strongSwan default (which carries no required modp term). That is the
+// same silent-crypto-weakening class ValidateDHGroup closes for DH-group
+// leaves; this validator closes it for the policy→proposal cross-
+// reference.
+//
+// Rejected unconditionally (not only when PFSGroup > 0): a dangling
+// reference substitutes the whole proposal, not just PFS. Mirrors
+// validatePolicySchedulerReferencesStrict, which rejects any undefined
+// scheduler reference.
+//
+// On the tolerant load / peer-sync paths the call site downgrades this
+// to a warning (opts.lenientIPsecPolicyProposalRef) so an already-
+// persisted or peer-synced config still boots; the render-path safety
+// net in resolveESPSettings preserves the configured PFS group on that
+// boot rather than dropping it.
+func validateIPsecPolicyProposalReferencesStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	policies := cfg.Security.IPsec.Policies
+	proposals := cfg.Security.IPsec.Proposals
+	// Policies is a map (unordered); sort keys so the first-error
+	// commit-check message is deterministic across runs.
+	names := make([]string, 0, len(policies))
+	for name := range policies {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		pol := policies[name]
+		if pol == nil {
+			continue
+		}
+		propRef := pol.Proposals
+		explicitRef := propRef != ""
+		if !explicitRef {
+			// Mirror resolveESPSettings' policy-name fallback: a policy
+			// with no `proposals` leaf resolves against a proposal named
+			// after the policy itself.
+			propRef = pol.Name
+		}
+		if _, ok := proposals[propRef]; ok {
+			continue
+		}
+		if explicitRef {
+			return fmt.Errorf("ipsec policy %q references undefined ipsec proposal %q "+
+				"(the configured proposal set, including any perfect-forward-secrecy "+
+				"group, would be silently dropped to the strongSwan default)",
+				pol.Name, propRef)
+		}
+		// No explicit `proposals` leaf was given, so do not blame a
+		// phantom proposal named after the policy — describe the actual
+		// gap instead.
+		return fmt.Errorf("ipsec policy %q has no resolvable ipsec proposal "+
+			"(no `proposals` reference and no proposal named %q); the configured "+
+			"perfect-forward-secrecy group would be silently dropped — define a "+
+			"proposal or reference one", pol.Name, pol.Name)
 	}
 	return nil
 }

@@ -188,6 +188,103 @@ func TestBuildESPProposal_PFSOverride(t *testing.T) {
 	}
 }
 
+// TestResolveESPSettings_DanglingProposalPreservesPFS is the #2073
+// render-path safety net (Layer B): when an IPsec policy resolves and a
+// PFS group is configured but its proposal reference is dangling, the
+// renderer must NOT fall through to bare "default" (which drops PFS).
+// Instead it must carry the configured PFS group on a valid fallback
+// proposal that includes a cipher and integrity alg, using swanctl's
+// canonical keyword spellings.
+func TestResolveESPSettings_DanglingProposalPreservesPFS(t *testing.T) {
+	cfg := &config.IPsecConfig{
+		Policies: map[string]*config.IPsecPolicyDef{
+			"ipsec-pol": {
+				Name:      "ipsec-pol",
+				PFSGroup:  14,
+				Proposals: "does-not-exist",
+			},
+		},
+		// Proposals deliberately omits "does-not-exist" — dangling ref.
+	}
+	vpn := &config.IPsecVPN{IPsecPolicy: "ipsec-pol"}
+
+	got, lifetime := resolveESPSettings(cfg, vpn)
+	// Exact token, not a `modp` substring: a Contains("modp2048") check
+	// would also pass for an invalid no-integrity "aes256-modp2048". The
+	// integrity keyword MUST be the canonical "sha256" — strongSwan's
+	// proposal parser does not recognize the "sha256128" spelling and
+	// would discard the whole proposal.
+	if got != "aes256-sha256-modp2048" {
+		t.Fatalf("resolveESPSettings dropped PFS or emitted an invalid fallback: got %q, want aes256-sha256-modp2048", got)
+	}
+	if got == "default" {
+		t.Fatal("PFS was silently dropped to the strongSwan default")
+	}
+	if lifetime != 0 {
+		t.Errorf("lifetime = %d, want 0 (no resolvable proposal to take a lifetime from)", lifetime)
+	}
+}
+
+// TestResolveESPSettings_DanglingProposalNoPFSStaysDefault verifies that a
+// dangling proposal reference with NO configured PFS still falls to
+// "default" — there is no security control to preserve, so the render
+// behavior is unchanged from before #2073.
+func TestResolveESPSettings_DanglingProposalNoPFSStaysDefault(t *testing.T) {
+	cfg := &config.IPsecConfig{
+		Policies: map[string]*config.IPsecPolicyDef{
+			"ipsec-pol": {
+				Name:      "ipsec-pol",
+				PFSGroup:  0,
+				Proposals: "does-not-exist",
+			},
+		},
+	}
+	vpn := &config.IPsecVPN{IPsecPolicy: "ipsec-pol"}
+
+	got, _ := resolveESPSettings(cfg, vpn)
+	if got != "default" {
+		t.Errorf("resolveESPSettings = %q, want default (no PFS configured)", got)
+	}
+}
+
+// TestResolveESPSettings_NoPolicyStaysDefault is the (D) regression: a VPN
+// with no IPsec policy emits "default" with no error and no PFS.
+func TestResolveESPSettings_NoPolicyStaysDefault(t *testing.T) {
+	cfg := &config.IPsecConfig{}
+	vpn := &config.IPsecVPN{}
+	got, lifetime := resolveESPSettings(cfg, vpn)
+	if got != "default" || lifetime != 0 {
+		t.Errorf("resolveESPSettings = (%q, %d), want (default, 0)", got, lifetime)
+	}
+}
+
+// TestGenerateConfig_DanglingProposalPreservesPFS checks the full render:
+// the emitted swanctl child block must carry the PFS modp group rather
+// than esp_proposals = default, using the canonical sha256 keyword.
+func TestGenerateConfig_DanglingProposalPreservesPFS(t *testing.T) {
+	m := &Manager{configDir: "/tmp", configPath: "/tmp/xpf.conf"}
+	cfg := &config.IPsecConfig{
+		VPNs: map[string]*config.IPsecVPN{
+			"tun1": {
+				Gateway:     "172.16.0.1",
+				IPsecPolicy: "ipsec-pol",
+				LocalID:     "10.0.1.0/24",
+				RemoteID:    "10.0.2.0/24",
+			},
+		},
+		Policies: map[string]*config.IPsecPolicyDef{
+			"ipsec-pol": {Name: "ipsec-pol", PFSGroup: 14, Proposals: "does-not-exist"},
+		},
+	}
+	got := m.generateConfig(cfg)
+	if !strings.Contains(got, "esp_proposals = aes256-sha256-modp2048") {
+		t.Errorf("rendered config dropped PFS or used the default set:\n%s", got)
+	}
+	if strings.Contains(got, "esp_proposals = default") {
+		t.Errorf("PFS silently dropped to esp_proposals = default:\n%s", got)
+	}
+}
+
 func TestParseSAOutput(t *testing.T) {
 	output := `site-a: #1, ESTABLISHED
   local: 10.0.1.1 === 10.0.2.1
