@@ -867,8 +867,13 @@ struct flow_config {
 	                          bit 2: SIP disable, bit 3: TFTP disable */
 	__u16 lo0_filter_v4;   /* filter ID for lo0 inet input (0xFFFF=none) */
 	__u16 lo0_filter_v6;   /* filter ID for lo0 inet6 input (0xFFFF=none) */
-	__u8  tcp_flags;       /* bit 0: no-syn-check, bit 1: rst-invalidate,
-	                          bit 2: no-syn-check-in-tunnel */
+	__u8  tcp_flags;       /* retired (#2078): bit 0: no-syn-check,
+	                          bit 1: rst-invalidate, bit 2:
+	                          no-syn-check-in-tunnel. The tcp-session knobs
+	                          are config-only on the userspace dataplane; this
+	                          field is no longer populated (the legacy
+	                          flow_config_map was retired with the eBPF
+	                          dataplane, #1373/#1476). Kept for layout parity. */
 	__u8  app_flags;       /* bit 0: AppID enabled,
 	                          bit 1: pre-ID log session-init,
 	                          bit 2: pre-ID log session-close */
