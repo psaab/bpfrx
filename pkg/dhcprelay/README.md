@@ -19,7 +19,91 @@ to the interface name.
 
 ## Dependencies
 
-`pkg/config` only.
+`pkg/config`, `github.com/insomniacslk/dhcp`, and `golang.org/x/sys/unix`
+(the last for the AF_PACKET raw-L2 reply socket — see "Reply delivery
+model" below). No dependency on other `pkg/*` packages.
+
+## Reply delivery model (#2076)
+
+Server replies (OFFER/ACK) are delivered to clients honoring the RFC 2131
+§4.1 broadcast flag:
+
+| Condition | Delivery |
+|-----------|----------|
+| `overrides always-broadcast` set | broadcast `255.255.255.255:68` (operator override wins) |
+| broadcast flag **set** | broadcast `255.255.255.255:68` |
+| flag **clear**, real `yiaddr` | **raw-L2 unicast** to `chaddr` + `yiaddr` |
+| flag **clear**, `yiaddr==0`, real `ciaddr` | UDP-unicast to `ciaddr` (client already owns the IP) |
+| flag **clear**, no `yiaddr`/`ciaddr` | broadcast (nothing routable) |
+| raw-L2 path unavailable/fails | broadcast fallback (always works) |
+
+**Why raw L2 (`l2send_linux.go`).** A client in SELECTING/REQUESTING that
+clears the broadcast flag has **not yet configured** the offered address,
+so it will not answer ARP for `yiaddr`. A normal UDP `WriteTo(yiaddr)`
+forces the kernel to ARP-resolve `yiaddr`, the ARP goes unanswered, and the
+reply is silently dropped — the client never acquires a lease. The relay
+therefore builds a full Ethernet+IPv4+UDP frame addressed to the client's
+`chaddr` and sends it on an `AF_PACKET`/`SOCK_RAW` socket (the
+`pkg/cluster/garp.go` hand-roll pattern). The IPv4 source is the **saved
+giaddr** (the same address the server saw in the relayed request); the IPv4
+header checksum is computed and the UDP checksum is 0 (legal for IPv4 per
+RFC 768).
+
+- **`CAP_NET_RAW` dependency.** The AF_PACKET socket needs `CAP_NET_RAW`,
+  already held by the root daemon (same as `pkg/vrrp`, `pkg/lldp`,
+  `pkg/cluster/garp.go`). If the socket cannot be opened (e.g. a future
+  hardened unit without the cap), the relay logs once and falls back to
+  broadcast — it **never regresses to undeliverable**.
+- **Guards → broadcast fallback.** Non-Ethernet `htype`, a non-6-byte
+  `chaddr`, an over-MTU reply (`20 + 8 + len(payload) > iface.MTU` — the raw
+  path cannot fragment), or any `Sendto` error fall back to broadcast.
+- **Per-send interface re-resolution.** The ifindex + source MAC are
+  re-resolved from `net.InterfaceByName` on every send (`garp.go`
+  precedent), so a link flap / dynamic recreate / VRRP `programRethMAC` MAC
+  change does not leave a stale ifindex or source MAC. VLAN sub-interface
+  egress uses the same netdev index the listener is bound to (the kernel
+  applies the `.N` 802.1Q tag).
+- **Counters.** `Stats()` exposes a per-reason breakdown
+  (`RepliesL2Unicast`, `RepliesUnicastCiaddr`, `RepliesBroadcastFlag1`,
+  `RepliesBroadcastForced`, `RepliesBroadcastNoTarget`,
+  `RepliesBroadcastL2Fallback`). **`RepliesBroadcastL2Fallback` is the one
+  to alert on** — it means the raw-L2 path failed (CAP_NET_RAW, driver, or
+  MTU) and the relay degraded to broadcast. `show ... dhcp-relay` prints
+  this breakdown.
+
+### `overrides always-broadcast` config
+
+```
+set forwarding-options dhcp-relay group <g> overrides always-broadcast
+```
+
+Mirrors the Junos knob: forces every reply to broadcast even for
+flag-clear clients (the raw-L2 socket is not opened at all when set). This
+is the operator escape hatch for environments where the L2 path is
+undesirable. Both the block form (`overrides { always-broadcast; }`) and
+the flat-set form compile to `DHCPRelayGroup.AlwaysBroadcast`; the flat-set
+inline-interface consumer treats `overrides` as a property boundary so it
+is not swallowed into the interface list (#2076 / dual-AST harness case
+`forwarding-options-dhcp-relay-overrides`).
+
+### IPv6 / DHCPv6 parity
+
+There is **no DHCPv6 relay agent** in the codebase, and DHCPv6 (RFC 8415)
+does not have this bug class: it has no BOOTP broadcast flag — clients use a
+link-local source and the relay replies to that link-local unicast (or
+`ff02::1:2`), so there is no "reply to an unconfigured global address via
+ND" failure mode. This fix is strictly DHCPv4.
+
+### HA / VRRP-Backup duplicate delivery
+
+Before #2076, a relay running on a VRRP **Backup** node sent a duplicate
+flag-clear reply that was harmlessly lost on ARP failure. Now that the
+flag-clear path actually delivers (raw L2 to `chaddr`), a flag-clear client
+may receive duplicate OFFER/ACK from both nodes. DHCP clients dedupe on
+`xid` + `chaddr`, so this is tolerable; a single node never double-delivers
+(L2 success and broadcast are mutually exclusive per reply). Suppressing
+relay forwarding on a VRRP-Backup node remains a deferred follow-up (see
+below). Changes touching this path must pass `make test-failover`.
 
 ## Socket / lifecycle model (#1915)
 
@@ -75,4 +159,6 @@ to the interface name.
   would relay duplicate requests. DHCP tolerates this (servers dedupe on
   xid + chaddr; clients dedupe offers), so it is an acceptable interim;
   suppressing forwarding on Backup is a deferred follow-up gated on
-  `make test-failover`.
+  `make test-failover`. Note (#2076): the Backup's duplicate *reply* to a
+  flag-clear client now actually delivers (raw L2) instead of being lost on
+  ARP failure — see "HA / VRRP-Backup duplicate delivery" above.

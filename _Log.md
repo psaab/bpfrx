@@ -7483,3 +7483,34 @@ top.
   pkg/config/ipsec_proposal_ref_test.go, pkg/ipsec/ipsec_test.go,
   pkg/config/parser_security_test.go, pkg/ipsec/README.md,
   docs/pr/2073-ipsec-pfs/plan.md
+
+## 2026-06-20 — #2076 DHCP relay raw-L2 unicast for broadcast-flag=0 clients
+
+- **Timestamp**: 2026-06-20
+- **Action**: Implement Option (d) — RFC-2131 raw AF_PACKET L2 unicast of
+  OFFER/ACK to chaddr+yiaddr by default for broadcast-flag-clear clients,
+  opt-in `overrides always-broadcast`, automatic broadcast fallback.
+- **File(s)**:
+  - `pkg/dhcprelay/l2send_linux.go` (new) — AF_PACKET TX sender, per-byte
+    frame builder (IPv4 csum computed, UDP csum=0), MTU/htype guards,
+    per-send iface re-resolution, idempotent Close (sync.Once).
+  - `pkg/dhcprelay/relay.go` — reply-destination matrix (deliverReply),
+    per-reason counters, l2Replier seam + factory, fail-soft L2 open closed
+    after wg.Wait() (#1915-preserving).
+  - `pkg/dhcprelay/delivery_test.go`, `l2send_test.go`, `relay_test.go` —
+    matrix oracle, exhaustive per-byte frame tests, guards, fallback,
+    no-double-deliver, saved-giaddr source, lifecycle.
+  - `pkg/config/types_system.go` — DHCPRelayGroup.AlwaysBroadcast.
+  - `pkg/config/compiler_services.go` — `overrides` boundary keyword +
+    block/inline parse (Codex#2 swallow blocker).
+  - `pkg/config/schema_routing.go` — `overrides { always-broadcast }`.
+  - `pkg/config/compiler_dhcp_relay_overrides_test.go` (new),
+    `dual_ast_differential_test.go` — flat-set swallow regression +
+    round-trip.
+  - `pkg/cli/cli_show_services.go` — reply-delivery breakdown + override
+    display.
+  - `pkg/dhcprelay/README.md` — reply-delivery model, CAP_NET_RAW, counters,
+    IPv6/HA parity notes.
+- **Validation**: `go test ./pkg/dhcprelay/ -race` 25/25 pass; config + cli +
+  daemon green; `go build ./...` clean. Live flag0 wire-capture +
+  test-failover pending parent-run (lab-gated).

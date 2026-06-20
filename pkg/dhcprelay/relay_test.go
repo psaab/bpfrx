@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/insomniacslk/dhcp/dhcpv4"
+	"golang.org/x/sys/unix"
 
 	"github.com/psaab/xpf/pkg/config"
 )
@@ -224,6 +225,11 @@ func testManager(factory packetConnFactory) *Manager {
 		return net.IPv4(10, 0, 0, 254), nil
 	}
 	m.retryInterval = time.Millisecond
+	// Default to a no-op fake L2 sender so lifecycle tests do not depend on
+	// CAP_NET_RAW or a real NIC (#2076). Individual tests override m.newL2.
+	m.newL2 = func(ifaceName string) (l2Replier, error) {
+		return &fakeL2{}, nil
+	}
 	return m
 }
 
@@ -530,4 +536,131 @@ func TestRunRelay_ClosedNoSpin(t *testing.T) {
 	}
 
 	m.Stop()
+}
+
+// --- #2076 lifecycle / fail-soft tests ---
+
+// countingL2Factory returns an l2SenderFactory that records open attempts and
+// returns the supplied sender (or error).
+func countingL2Factory(s l2Replier, err error) (l2SenderFactory, func() int) {
+	var mu sync.Mutex
+	var opens int
+	f := func(ifaceName string) (l2Replier, error) {
+		mu.Lock()
+		opens++
+		mu.Unlock()
+		if err != nil {
+			return nil, err
+		}
+		return s, nil
+	}
+	getter := func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return opens
+	}
+	return f, getter
+}
+
+// TestRunRelay_L2OpenFailure_RelayStaysUp proves that an L2 open failure (e.g.
+// no CAP_NET_RAW) is fail-soft: the relay still creates its UDP sockets and
+// Stop returns. runRelay must NOT return early on L2 open error (#2076 §7.3).
+func TestRunRelay_L2OpenFailure_RelayStaysUp(t *testing.T) {
+	client := newFakeConn()
+	server := newFakeConn()
+	factory, getCalls := recordingFactory(client, server)
+	m := testManager(factory)
+	l2f, getOpens := countingL2Factory(nil, errors.New("EPERM: no CAP_NET_RAW"))
+	m.newL2 = l2f
+
+	m.Apply(context.Background(), singleInterfaceConfig())
+	calls := waitCalls(t, getCalls, 2, 2*time.Second)
+	if len(calls) < 2 {
+		t.Fatalf("relay died on L2 open failure: only %d UDP conns", len(calls))
+	}
+	if getOpens() == 0 {
+		t.Errorf("expected at least one L2 open attempt")
+	}
+
+	done := make(chan struct{})
+	go func() { m.Stop(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Stop() did not return after L2 open failure")
+	}
+}
+
+// TestRunRelay_AlwaysBroadcast_SkipsL2Open proves that when overrides
+// always-broadcast is set, the relay never opens the L2 socket (#2076 §7.1:
+// override wins before the L2 path is even considered).
+func TestRunRelay_AlwaysBroadcast_SkipsL2Open(t *testing.T) {
+	client := newFakeConn()
+	server := newFakeConn()
+	factory, getCalls := recordingFactory(client, server)
+	m := testManager(factory)
+	l2f, getOpens := countingL2Factory(&fakeL2{}, nil)
+	m.newL2 = l2f
+
+	cfg := singleInterfaceConfig()
+	cfg.Groups["g"].AlwaysBroadcast = true
+	m.Apply(context.Background(), cfg)
+	waitCalls(t, getCalls, 2, 2*time.Second)
+
+	// Give runRelay a beat to reach (and skip) the L2 open.
+	time.Sleep(50 * time.Millisecond)
+	if getOpens() != 0 {
+		t.Errorf("always-broadcast must NOT open the L2 socket, got %d opens", getOpens())
+	}
+	m.Stop()
+}
+
+// TestRunRelay_L2Closed_AfterStop proves the L2 sender is closed (exactly once)
+// when the relay stops — closure happens after wg.Wait() (#2076 §7.3).
+func TestRunRelay_L2Closed_AfterStop(t *testing.T) {
+	client := newFakeConn()
+	server := newFakeConn()
+	factory, getCalls := recordingFactory(client, server)
+	m := testManager(factory)
+	fl2 := &fakeL2{}
+	l2f, _ := countingL2Factory(fl2, nil)
+	m.newL2 = l2f
+
+	m.Apply(context.Background(), singleInterfaceConfig())
+	waitCalls(t, getCalls, 2, 2*time.Second)
+	m.Stop()
+
+	fl2.mu.Lock()
+	cc := fl2.closeCount
+	fl2.mu.Unlock()
+	if cc != 1 {
+		t.Errorf("L2 sender Close count = %d, want exactly 1", cc)
+	}
+}
+
+// TestL2Sender_CloseIdempotent proves the real *l2Sender Close is idempotent
+// (sync.Once). It uses a sentinel fd; the second Close must be a no-op even
+// though the fd was already closed.
+func TestL2Sender_CloseIdempotent(t *testing.T) {
+	// A nil *l2Sender Close must be safe.
+	var nilSender *l2Sender
+	if err := nilSender.Close(); err != nil {
+		t.Errorf("nil l2Sender.Close() = %v, want nil", err)
+	}
+
+	// Use a real, closeable fd (a pipe read end) to prove Close idempotency
+	// without a NIC. The first Close closes it; the second must be a no-op
+	// (sync.Once), NOT a double-close EBADF.
+	var p [2]int
+	if err := unix.Pipe(p[:]); err != nil {
+		t.Skipf("pipe unavailable: %v", err)
+	}
+	_ = unix.Close(p[1]) // close the unused write end
+	s := &l2Sender{fd: p[0], ifaceName: "test"}
+	if err := s.Close(); err != nil {
+		t.Errorf("first Close = %v, want nil", err)
+	}
+	if err := s.Close(); err != nil {
+		t.Errorf("second Close = %v, want nil (idempotent)", err)
+	}
 }

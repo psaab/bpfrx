@@ -378,6 +378,9 @@ var schemaForwardingOptions = &schemaNode{desc: "Packet forwarding options", chi
 		"group": {desc: "DHCP relay group", args: 1, placeholder: "<name>", children: map[string]*schemaNode{
 			"active-server-group": {desc: "Active server group", args: 1, placeholder: "<server-group>", children: nil},
 			"interface":           {desc: "Interface to relay on", args: 1, multi: true, placeholder: "<interface>", children: nil},
+			"overrides": {desc: "Relay overrides", children: map[string]*schemaNode{
+				"always-broadcast": {desc: "Always broadcast replies to clients", children: nil},
+			}},
 		}},
 	}},
 }}
