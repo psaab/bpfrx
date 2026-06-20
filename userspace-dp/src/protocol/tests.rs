@@ -1458,6 +1458,7 @@ fn process_status_wg_tunnels_roundtrip_and_compat() {
         tunnel_endpoint_id: 7,
         listen_port: 51820,
         peer_pubkey_hex: "ab".repeat(32),
+        local_pubkey_hex: "cd".repeat(32),
         peer_endpoint: "192.0.2.10:51820".to_string(),
         session_confirmed: true,
         last_handshake_unix_secs: 1_770_000_000,
@@ -1519,6 +1520,7 @@ fn process_status_wg_tunnels_roundtrip_and_compat() {
     assert_eq!(wire_row["tunnel_endpoint_id"], 7);
     assert_eq!(wire_row["listen_port"], 51820);
     assert_eq!(wire_row["peer_pubkey_hex"], "ab".repeat(32));
+    assert_eq!(wire_row["local_pubkey_hex"], "cd".repeat(32));
     assert_eq!(wire_row["peer_endpoint"], "192.0.2.10:51820");
     assert_eq!(wire_row["session_confirmed"], true);
     assert_eq!(wire_row["last_handshake_unix_secs"], 1_770_000_000u64);
@@ -1533,6 +1535,7 @@ fn process_status_wg_tunnels_roundtrip_and_compat() {
     assert_eq!(back.wg_tunnels.len(), 1);
     let b = &back.wg_tunnels[0];
     assert_eq!(b.tunnel, "wg0");
+    assert_eq!(b.local_pubkey_hex, "cd".repeat(32));
     assert_eq!(b.hs_initiations_created, 1);
     assert_eq!(b.decap_drops_buffer, 25);
     assert_eq!(b.tun_rx_drops_no_endpoint, 35);

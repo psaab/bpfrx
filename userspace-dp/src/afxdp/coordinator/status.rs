@@ -709,6 +709,13 @@ impl super::Coordinator {
                 tunnel_endpoint_id: id,
                 listen_port: endpoint.wg_listen_port,
                 peer_pubkey_hex: crate::afxdp::wg::encode_wg_key_hex(&endpoint.wg_peer_pubkey),
+                // #1434 Increment 1: surface our local static public key
+                // (the key an operator hands to the peer). Sourced from
+                // the engine, not the snapshot — the snapshot redacts the
+                // local PRIVATE key (`skip_serializing`), so the public
+                // key derived at engine construction is the only place to
+                // read it. Hex string on the wire (MEMORY #1961).
+                local_pubkey_hex: crate::afxdp::wg::encode_wg_key_hex(&engine.local_public_key()),
                 peer_endpoint: endpoint
                     .wg_endpoint
                     .map(|ep| ep.to_string())

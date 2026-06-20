@@ -783,6 +783,16 @@ type WgTunnelStatus struct {
 	// hex (same rendering as the config-side wg_peer_pubkey_hex; note
 	// `wg show` renders base64 — xpf surfaces are uniformly hex).
 	PeerPubkeyHex string `json:"peer_pubkey_hex,omitempty"`
+	// LocalPubkeyHex is OUR local static public key, 64-char lowercase
+	// hex (#1434 Increment 1) — the key an operator hands to the peer.
+	// Derived once by the helper from the local private key at engine
+	// construction; the snapshot redacts the private key, so this is the
+	// only surface for it. Travels as a hex STRING (not []byte, to dodge
+	// the Go↔Rust base64 wire trap, MEMORY #1961); `show security
+	// wireguard public-key` re-renders it as WireGuard-canonical base64.
+	// omitempty keeps a pre-#1434 helper payload (field absent) decoding
+	// to "".
+	LocalPubkeyHex string `json:"local_pubkey_hex,omitempty"`
 	// PeerEndpoint is the CONFIGURED endpoint (empty for a
 	// responder-only peer; the learned endpoint is not surfaced yet).
 	PeerEndpoint     string `json:"peer_endpoint,omitempty"`
