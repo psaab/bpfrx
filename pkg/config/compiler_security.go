@@ -569,6 +569,36 @@ func compileLog(node *Node, sec *SecurityConfig) error {
 			sec.Log.Streams[stream.Name] = stream
 		}
 	}
+
+	// H7 (#2008): `security log profile <name>` log-routing objects. Each
+	// names a target stream (`stream-name`), may be marked the default
+	// (`default-profile`), and may carry per-category field config. Reads
+	// via namedInstances + nodeVal so both hierarchical and flat-set AST
+	// shapes work (same as the stream loop). The stream-name cross-
+	// reference is enforced after full compile in
+	// validateLogProfileStreamReferencesStrict — schema_walk per-leaf
+	// validators cannot see sibling stream nodes. `category` is accepted
+	// for parse/validation parity; per-category field-extra-name selection
+	// is not yet used to alter the emitted structured data (out of scope).
+	for _, inst := range namedInstances(node.FindChildren("profile")) {
+		p := &LogProfile{Name: inst.name}
+		for _, prop := range inst.node.Children {
+			switch prop.Name() {
+			case "stream-name":
+				p.StreamName = nodeVal(prop)
+			case "default-profile":
+				p.DefaultProfile = true
+			case "category":
+				// Accepted for parity; field-extra-name emission is out of
+				// scope for this increment (xpf already emits per-stream
+				// structured data).
+			}
+		}
+		if sec.Log.Profiles == nil {
+			sec.Log.Profiles = make(map[string]*LogProfile)
+		}
+		sec.Log.Profiles[p.Name] = p
+	}
 	return nil
 }
 

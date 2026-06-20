@@ -109,25 +109,7 @@ func (s *Server) pingHandler(w http.ResponseWriter, r *http.Request) {
 		count = 100
 	}
 
-	args := []string{"-c", fmt.Sprintf("%d", count)}
-	if req.Source != "" {
-		args = append(args, "-I", req.Source)
-	}
-	if req.Size > 0 {
-		args = append(args, "-s", fmt.Sprintf("%d", req.Size))
-	}
-	args = append(args, req.Target)
-
-	var cmd []string
-	if req.RoutingInstance != "" {
-		vrfDev := req.RoutingInstance
-		if !strings.HasPrefix(vrfDev, "vrf-") {
-			vrfDev = "vrf-" + vrfDev
-		}
-		cmd = append(cmd, "ip", "vrf", "exec", vrfDev)
-	}
-	cmd = append(cmd, "ping")
-	cmd = append(cmd, args...)
+	cmd := buildPingArgv(req, count)
 
 	// Request-sized budget (#1819): count × 1s + slack, 30s floor,
 	// 150s ceiling — see pingExecTimeout in exec_timeout.go.
@@ -156,22 +138,7 @@ func (s *Server) tracerouteHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	args := []string{}
-	if req.Source != "" {
-		args = append(args, "-s", req.Source)
-	}
-	args = append(args, req.Target)
-
-	var cmd []string
-	if req.RoutingInstance != "" {
-		vrfDev := req.RoutingInstance
-		if !strings.HasPrefix(vrfDev, "vrf-") {
-			vrfDev = "vrf-" + vrfDev
-		}
-		cmd = append(cmd, "ip", "vrf", "exec", vrfDev)
-	}
-	cmd = append(cmd, "traceroute")
-	cmd = append(cmd, args...)
+	cmd := buildTracerouteArgv(req)
 
 	// Shared diag budget (#1819): same 60s as the gRPC Traceroute path
 	// — see diagTracerouteTimeout in exec_timeout.go.
@@ -187,6 +154,59 @@ func (s *Server) tracerouteHandler(w http.ResponseWriter, r *http.Request) {
 		output += "\n" + err.Error()
 	}
 	writeOK(w, TextResponse{Output: output})
+}
+
+// buildPingArgv builds the argv for the REST ping handler. The
+// user-supplied target is placed after a "--" end-of-options separator
+// so a "-"-prefixed target is treated as the destination operand rather
+// than a ping flag (option-confusion hardening, #2084). count is the
+// already-clamped probe count.
+func buildPingArgv(req PingRequest, count int) []string {
+	args := []string{"-c", fmt.Sprintf("%d", count)}
+	if req.Source != "" {
+		args = append(args, "-I", req.Source)
+	}
+	if req.Size > 0 {
+		args = append(args, "-s", fmt.Sprintf("%d", req.Size))
+	}
+	args = append(args, "--", req.Target)
+
+	var cmd []string
+	if req.RoutingInstance != "" {
+		vrfDev := req.RoutingInstance
+		if !strings.HasPrefix(vrfDev, "vrf-") {
+			vrfDev = "vrf-" + vrfDev
+		}
+		cmd = append(cmd, "ip", "vrf", "exec", vrfDev)
+	}
+	cmd = append(cmd, "ping")
+	cmd = append(cmd, args...)
+	return cmd
+}
+
+// buildTracerouteArgv builds the argv for the REST traceroute handler.
+// The user-supplied target is placed after a "--" end-of-options
+// separator so a "-"-prefixed target is treated as the destination
+// operand rather than a traceroute flag (option-confusion hardening,
+// #2084).
+func buildTracerouteArgv(req TracerouteRequest) []string {
+	args := []string{}
+	if req.Source != "" {
+		args = append(args, "-s", req.Source)
+	}
+	args = append(args, "--", req.Target)
+
+	var cmd []string
+	if req.RoutingInstance != "" {
+		vrfDev := req.RoutingInstance
+		if !strings.HasPrefix(vrfDev, "vrf-") {
+			vrfDev = "vrf-" + vrfDev
+		}
+		cmd = append(cmd, "ip", "vrf", "exec", vrfDev)
+	}
+	cmd = append(cmd, "traceroute")
+	cmd = append(cmd, args...)
+	return cmd
 }
 
 func (s *Server) systemBuffersHandler(w http.ResponseWriter, _ *http.Request) {

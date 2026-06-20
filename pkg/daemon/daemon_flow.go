@@ -11,7 +11,6 @@ import (
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/dataplane"
 	"github.com/psaab/xpf/pkg/dhcp"
-	"github.com/psaab/xpf/pkg/flowexport"
 	"github.com/psaab/xpf/pkg/frr"
 	"github.com/psaab/xpf/pkg/logging"
 	"github.com/vishvananda/netlink"
@@ -137,62 +136,16 @@ func logFinalStats(ready dataplaneReadyProbe, telemetry dataplane.Telemetry) {
 	slog.Info("final statistics", attrs...)
 }
 
-// startFlowExporter starts the NetFlow v9 exporter if configured.
-func (d *Daemon) startFlowExporter(ctx context.Context, cfg *config.Config, er *logging.EventReader) {
-	ec := flowexport.BuildExportConfig(&cfg.Services, &cfg.ForwardingOptions)
-	if ec == nil {
-		return
-	}
-
-	// Build per-zone sampling direction flags using deterministic zone IDs
-	// (same sorted assignment as dataplane compiler).
-	zoneIDs := buildZoneIDs(cfg)
-	ec.SamplingZones = flowexport.BuildSamplingZones(cfg, zoneIDs)
-
-	exp, err := flowexport.NewExporter(*ec)
-	if err != nil {
-		slog.Warn("failed to create flow exporter", "err", err)
-		return
-	}
-
-	flowCtx, cancel := context.WithCancel(ctx)
-	d.flowExporter = exp
-	d.flowCancel = cancel
-
-	// Register callback for session close events
-	er.AddCallback(func(rec logging.EventRecord, raw []byte) {
-		if rec.Type != "SESSION_CLOSE" {
-			return
-		}
-		// Check sampling direction: skip if zone has no sampling enabled
-		if !ec.ShouldExport(rec.InZone, rec.OutZone) {
-			return
-		}
-		sd := flowexport.SessionCloseData{
-			SrcPort:  parseSrcPort(rec.SrcAddr),
-			DstPort:  parseSrcPort(rec.DstAddr),
-			Protocol: parseProtocol(rec.Protocol),
-		}
-		sd.SrcIP, sd.DstIP, sd.IsIPv6 = parseAddrPair(rec.SrcAddr, rec.DstAddr)
-		exp.ExportSessionClose(rec, sd)
-	})
-
-	d.flowWg.Add(1)
-	go func() {
-		defer d.flowWg.Done()
-		exp.Run(flowCtx)
-	}()
-
-	slog.Info("NetFlow v9 exporter started",
-		"collectors", len(ec.Collectors),
-		"active_timeout", ec.FlowActiveTimeout,
-		"inactive_timeout", ec.FlowInactiveTimeout,
-		"sampling_zones", len(ec.SamplingZones),
-		"sampling_rate", ec.SamplingRate)
-}
-
-// stopFlowExporter stops the running flow exporter.
+// stopFlowExporter stops the running NetFlow v9 exporter (shutdown).
+//
+// #2075: the exporter is now (re)started by reconcileFlowExporters, not
+// startFlowExporter. This stop is called only at shutdown. It takes
+// flowReconMu so it cannot race a concurrent reconcile swap, and it is
+// nil-safe / idempotent (a reconcile that already stopped the exporter
+// leaves flowCancel/flowExporter nil; context.CancelFunc is idempotent).
 func (d *Daemon) stopFlowExporter() {
+	d.flowReconMu.Lock()
+	defer d.flowReconMu.Unlock()
 	if d.flowCancel != nil {
 		d.flowCancel()
 	}
@@ -201,60 +154,14 @@ func (d *Daemon) stopFlowExporter() {
 		d.flowExporter.Close()
 		d.flowExporter = nil
 	}
+	d.flowCancel = nil
+	d.flowBundle.Store(&exporterBundle{})
 }
 
-// startIPFIXExporter starts the IPFIX (NetFlow v10) exporter if configured.
-func (d *Daemon) startIPFIXExporter(ctx context.Context, cfg *config.Config, er *logging.EventReader) {
-	ec := flowexport.BuildIPFIXExportConfig(&cfg.Services, &cfg.ForwardingOptions)
-	if ec == nil {
-		return
-	}
-
-	zoneIDs := buildZoneIDs(cfg)
-	ec.SamplingZones = flowexport.BuildSamplingZones(cfg, zoneIDs)
-
-	exp, err := flowexport.NewIPFIXExporter(*ec)
-	if err != nil {
-		slog.Warn("failed to create IPFIX exporter", "err", err)
-		return
-	}
-
-	ipfixCtx, cancel := context.WithCancel(ctx)
-	d.ipfixExporter = exp
-	d.ipfixCancel = cancel
-
-	er.AddCallback(func(rec logging.EventRecord, raw []byte) {
-		if rec.Type != "SESSION_CLOSE" {
-			return
-		}
-		if !ec.ShouldExport(rec.InZone, rec.OutZone) {
-			return
-		}
-		sd := flowexport.SessionCloseData{
-			SrcPort:  parseSrcPort(rec.SrcAddr),
-			DstPort:  parseSrcPort(rec.DstAddr),
-			Protocol: parseProtocol(rec.Protocol),
-		}
-		sd.SrcIP, sd.DstIP, sd.IsIPv6 = parseAddrPair(rec.SrcAddr, rec.DstAddr)
-		exp.ExportSessionClose(rec, sd)
-	})
-
-	d.ipfixWg.Add(1)
-	go func() {
-		defer d.ipfixWg.Done()
-		exp.Run(ipfixCtx)
-	}()
-
-	slog.Info("IPFIX exporter started",
-		"collectors", len(ec.Collectors),
-		"active_timeout", ec.FlowActiveTimeout,
-		"inactive_timeout", ec.FlowInactiveTimeout,
-		"sampling_zones", len(ec.SamplingZones),
-		"sampling_rate", ec.SamplingRate)
-}
-
-// stopIPFIXExporter stops the running IPFIX exporter.
+// stopIPFIXExporter stops the running IPFIX exporter (shutdown).
 func (d *Daemon) stopIPFIXExporter() {
+	d.ipfixReconMu.Lock()
+	defer d.ipfixReconMu.Unlock()
 	if d.ipfixCancel != nil {
 		d.ipfixCancel()
 	}
@@ -263,6 +170,8 @@ func (d *Daemon) stopIPFIXExporter() {
 		d.ipfixExporter.Close()
 		d.ipfixExporter = nil
 	}
+	d.ipfixCancel = nil
+	d.ipfixBundlePtr.Store(&ipfixBundle{})
 }
 
 // parseAddrPair parses "ip:port" or "[ip]:port" into net.IPs and IPv6 flag.

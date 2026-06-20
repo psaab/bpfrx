@@ -205,10 +205,10 @@ xpf has TCP session timeouts (established, initial, closing, time-wait), UDP/ICM
 | Feature | Junos Config Path | Description | Priority | Status |
 |---------|-------------------|-------------|----------|--------|
 | **SYN Flood Protection Mode** | `security flow syn-flood-protection-mode syn-cookie` | Global SYN flood protection mode: syn-cookie (stateless) or syn-proxy (stateful). Different from per-screen syn-flood thresholds. | Medium | Legacy eBPF done (`8cbf31a`) with BPF helpers, validated_clients LRU, and 4 counters. Userspace SYN-cookie runtime is wired for #1374 with bounded SYN-ACK/RST replies and status counters; final #1477 source-removal evidence still needs to include the SYN-cookie HA/flood artifacts for the exact deletion candidate. `syn-proxy` mode is not implemented. |
-| **TCP Strict SYN Check** | `security flow tcp-session strict-syn-check` | Require SYN as first packet for TCP session creation (drop mid-stream pickup) | Medium | **Done** (`2114333`) — default behavior (SYN required), configurable via no-syn-check / no-syn-check-in-tunnel. |
-| **TCP No-SYN-Check** | `security flow tcp-session no-syn-check` | Allow mid-stream TCP session pickup (useful after failover or asymmetric routing) | Medium | **Done** (`2114333`) — BPF flow_config tcp_flags bit, creates ESTABLISHED state for non-SYN first packet. eBPF (DPDK retired #1525). |
-| **TCP No-SYN-Check in Tunnel** | `security flow tcp-session no-syn-check-in-tunnel` | Allow mid-stream pickup specifically for tunneled traffic (IPsec, GRE) | Low | **Done** (`2114333`) — per-interface IFACE_FLAG_TUNNEL in iface_zone_value, propagated via META_FLAG_TUNNEL in xdp_zone. |
-| **TCP RST Invalidate Session** | `security flow tcp-session rst-invalidate-session` | Immediately invalidate session on TCP RST instead of waiting for timeout | Medium | **Done** (`2114333`) — sets timeout=0/last_seen=0 on RST so next GC sweep deletes immediately. eBPF (DPDK retired #1525). |
+| **TCP Strict SYN Check** | `security flow tcp-session strict-syn-check` | Require SYN as first packet for TCP session creation (drop mid-stream pickup) | Medium | **Config-only (#2078)** — the legacy eBPF SYN gate (`2114333`) was retired with the eBPF dataplane (#1373/#1476). The userspace AF_XDP dataplane has no TCP state machine and does not enforce syn-check; the related `no-syn-check` knob is parsed and committed but inert. Commit emits an accepted-only advisory. |
+| **TCP No-SYN-Check** | `security flow tcp-session no-syn-check` | Allow mid-stream TCP session pickup (useful after failover or asymmetric routing) | Medium | **Config-only (#2078)** — the legacy BPF `flow_config` `tcp_flags` bit (`2114333`) was retired with the eBPF dataplane (#1373/#1476). The userspace dataplane does not enforce syn-check, so this opt-out is inert. Accepted-but-not-enforced; commit emits an advisory. Intentional parity gap (see #2008 M9). |
+| **TCP No-SYN-Check in Tunnel** | `security flow tcp-session no-syn-check-in-tunnel` | Allow mid-stream pickup specifically for tunneled traffic (IPsec, GRE) | Low | **Config-only (#2078)** — the legacy per-interface `IFACE_FLAG_TUNNEL`/`META_FLAG_TUNNEL` path (`2114333`) was eBPF; retired with the dataplane (#1373/#1476). No tunnel-decap session-create signal exists on the userspace path, so the knob is inert. Accepted-but-not-enforced; commit emits an advisory. |
+| **TCP RST Invalidate Session** | `security flow tcp-session rst-invalidate-session` | Immediately invalidate session on TCP RST instead of waiting for timeout | Medium | **Config-only (#2078)** — the legacy eBPF teardown (`2114333`, timeout=0/last_seen=0 on RST) was retired with the dataplane (#1373/#1476). The userspace dataplane shortens the session to a 30s closing timeout on RST/FIN but does not invalidate immediately and does not honor this opt-in. Accepted-but-not-enforced; commit emits an advisory. Design rationale: `docs/active-active-new-connections.md` (suppress RST→CLOSED, keep this as the opt-in override). |
 | **Force IP Reassembly** | `security flow force-ip-reassembly` | Force reassembly of all IP fragments before processing (protects against fragment-based evasion) | Medium | Missing |
 | **Route Change Timeout** | `security flow route-change-timeout N` | Session timeout (6-1800s) applied when route changes to nonexistent route. Prevents sessions hanging on dead routes. | Low | Missing |
 | **Aggressive Session Aging** | `security flow aging early-ageout N; high-watermark N; low-watermark N` | Accelerate session timeout when session table exceeds watermark threshold | Medium | **Done** (`2114333`) — Go-side GC watermark hysteresis, early-ageout overrides per-session timeout. |
@@ -261,6 +261,7 @@ xpf has security logging with mode (stream/event), format, streams with host/por
 | **Per-Policy Logging** | `security policies ... then log session-init session-close` | xpf has this but may not fully support all log fields (app-name, nat-*, nested-app, etc.) | Medium | Done (all key fields: policy-name, app, ingress-iface, client/server split, close-reason, session-id) |
 | **Log Event Mode** | `security log mode event` | Route security logs through eventd (control plane) for on-box processing, slower but allows local processing | Low | Done (event mode writes to local file) |
 | **Session Aggregation Logs** | `security log ... report` | Aggregate session logs for top-N reporting (top talkers, top applications) | Low | Done (session aggregation reporting implemented) |
+| **Log Profile** | `security log profile <name> { stream-name; default-profile; category ... }` | Named log-routing profile targeting a stream, with a default-profile designation (#2008 H7) | Low | Done (compiled to `LogConfig.Profiles`; `stream-name` cross-referenced at commit. Per-stream routing is already a Junos superset, so no dispatch change; `category field-extra-name` accepted but not yet used to alter emitted SD) |
 
 ---
 
@@ -579,7 +580,13 @@ drift) closed in `fix/2008-quickwins-batch1`:
   Like those siblings it is typed-config only: the userspace AF_XDP dataplane
   performs no TCP sequence-number window validation today, so there is nothing
   to skip. The field gives commit-time validation + completion and is the seam
-  a future sequence-checking dataplane would read.
+  a future sequence-checking dataplane would read. As of #2078 the whole
+  `tcp-session` presence-flag family (`no-syn-check`,
+  `no-syn-check-in-tunnel`, `rst-invalidate-session`, `no-sequence-check`)
+  emits a single accepted-only commit advisory so an operator is not silently
+  misled into believing any of these knobs has runtime effect; research #2078
+  converged PLAN-KILL on enforcement (the dataplane has no TCP state machine,
+  proportionality favours warn-and-document for these LOW, rarely-used knobs).
 - **H6 residual — `system login user <name> class` enum validation** — DONE.
   RBAC was already enforced (`pkg/cli/permissions.go`); the remaining hole was
   that the `class` leaf accepted any string at commit and `config-viewer` was

@@ -493,6 +493,40 @@ func collectProtocolList(protoNode *Node) []string {
 	return protocols
 }
 
+// parseRouteFilterLen parses a Junos route-filter length token of the
+// form "/24" (the leading slash is how Junos writes "upto /24") or a
+// bare "24". It returns (n, true) only for a well-formed length in the
+// valid range 1..128; a malformed or out-of-range token yields
+// (0, false) so the caller leaves UptoLen at 0 and the renderer
+// degrades safely (#2072). Upper bound is 128 (IPv6 max); the renderer
+// separately clamps against the per-family max and the prefix length.
+//
+// Zero is REJECTED on purpose (Codex #2102 MAJOR): "upto /0" is not a
+// meaningful length, and UptoLen is a plain int with no presence bit, so
+// accepting 0 would make an explicit "upto /0" indistinguishable from an
+// unset UptoLen. Keeping 0 strictly as "unset" lets the renderer treat
+// UptoLen==0 unambiguously as the degrade case.
+func parseRouteFilterLen(tok string) (int, bool) {
+	tok = strings.TrimPrefix(tok, "/")
+	// Require digits only — strconv.Atoi would also accept signed forms
+	// like "+24" or "-0", which are not valid Junos length tokens (Codex
+	// #2102 MINOR). An empty token (e.g. a bare "/") has no digits and is
+	// rejected here.
+	if tok == "" {
+		return 0, false
+	}
+	for _, c := range tok {
+		if c < '0' || c > '9' {
+			return 0, false
+		}
+	}
+	n, err := strconv.Atoi(tok)
+	if err != nil || n < 1 || n > 128 {
+		return 0, false
+	}
+	return n, true
+}
+
 // parsePolicyTermChildren handles hierarchical form of policy term
 // where "from" and "then" are child nodes.
 func parsePolicyTermChildren(term *PolicyTerm, children []*Node) {
@@ -522,6 +556,25 @@ func parsePolicyTermChildren(term *PolicyTerm, children []*Node) {
 						rf := &RouteFilter{
 							Prefix:    fc.Keys[1],
 							MatchType: fc.Keys[2],
+						}
+						// "upto" carries a trailing "/N" length token. It
+						// reaches the compiler in two shapes (#2072):
+						//   - brace parse: a single leaf, length at Keys[3];
+						//   - flat-set SetPath: a container node with the
+						//     length as its first child key
+						//     (Children[0].Keys[0]). On a single-line flat set
+						//     the child also folds trailing clause tokens, so
+						//     read only its first key.
+						if rf.MatchType == "upto" {
+							if len(fc.Keys) >= 4 {
+								if n, ok := parseRouteFilterLen(fc.Keys[3]); ok {
+									rf.UptoLen = n
+								}
+							} else if len(fc.Children) > 0 && len(fc.Children[0].Keys) > 0 {
+								if n, ok := parseRouteFilterLen(fc.Children[0].Keys[0]); ok {
+									rf.UptoLen = n
+								}
+							}
 						}
 						term.RouteFilters = append(term.RouteFilters, rf)
 					}
@@ -625,8 +678,21 @@ func parsePolicyTermInlineKeys(term *PolicyTerm, keys []string) {
 					Prefix:    keys[i+1],
 					MatchType: keys[i+2],
 				}
+				// "upto" carries a trailing "/N" length token at keys[i+3].
+				// Consume it only when present so the next clause keyword is
+				// not misread as a value. (#2072 — belt-and-suspenders: the
+				// inline path is not reached for route-filter under the
+				// current schema, which always nests "from" as a child node,
+				// but keep it correct in case dispatch ever changes.)
+				consumed := 2
+				if rf.MatchType == "upto" && i+3 < len(keys) {
+					if n, ok := parseRouteFilterLen(keys[i+3]); ok {
+						rf.UptoLen = n
+						consumed = 3
+					}
+				}
 				term.RouteFilters = append(term.RouteFilters, rf)
-				i += 2
+				i += consumed
 			}
 		case "next-hop":
 			if i+1 < len(keys) {

@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -133,6 +134,43 @@ type compileOpts struct {
 	// still boot through that already-committed config rather than fail to
 	// load. Commit stays strict (see the validator call site).
 	lenientEventAttributesMatch bool
+	// lenientIPsecPolicyProposalRef (#2073) downgrades the IPsec policy
+	// proposal cross-reference check from a hard error to a warning on the
+	// tolerant load / peer-sync paths. A dangling `proposals` reference (or
+	// a PFS policy with no resolvable proposal) silently drops the
+	// configured perfect-forward-secrecy group to the strongSwan default at
+	// render time; commit/commit-check hard-reject it so a new operator edit
+	// fails loudly, but an already-persisted or peer-synced config carrying
+	// this latent misconfiguration must still boot (the render-path safety
+	// net in pkg/ipsec resolveESPSettings preserves the PFS group on that
+	// boot). Same doctrine as lenientPolicyMatchAddress.
+	lenientIPsecPolicyProposalRef bool
+
+	// lenientIPsecGatewayRefs (#2074) downgrades the IPsec VPN -> IKE
+	// gateway cross-reference check from a hard error to a warning on the
+	// tolerant load / peer-sync paths (CompileConfigLenient /
+	// CompileConfigForNodeLenient). A config persisted by an older binary,
+	// or synced from a peer, may carry a VPN that references an undefined
+	// or addressless gateway; an upgrading / receiving node must still
+	// boot through it (warn) rather than fail-closed-on-load (#1960
+	// class). Commit / commit-check stay strict — a new operator edit that
+	// would render `remote_addrs = <gateway-name>` (a silently-dead
+	// tunnel) is rejected. Same doctrine as lenientDeviceMap /
+	// lenientPolicyMatchAddress.
+	lenientIPsecGatewayRefs bool
+
+	// lenientLogProfileStreamRef (#2008 H7) downgrades the
+	// `security log profile <name> stream-name <stream>` cross-reference
+	// from a hard error to a warning on the tolerant load / peer-sync
+	// paths. A config persisted by an older binary (which silently dropped
+	// the whole profile stanza), or synced from a peer, may carry a profile
+	// naming a stream that is not configured; an upgrading / receiving node
+	// must still boot through it (warn) rather than fail-closed-on-load
+	// (#1960 class). Commit / commit-check stay strict — a new operator
+	// edit that names a non-existent stream (a typo whose log routing would
+	// silently never fire) is rejected. Same doctrine as
+	// lenientIPsecPolicyProposalRef.
+	lenientLogProfileStreamRef bool
 }
 
 // CompileConfig converts a parsed ConfigTree AST into a typed Config struct.
@@ -154,12 +192,15 @@ func CompileConfig(tree *ConfigTree) (*Config, error) {
 // #1830 (e) — the dataplane no longer caps equal-flow at 32 workers.)
 func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 	return compileConfigWithOpts(tree, compileOpts{
-		sanitizeFreeTextControlChars: true,
-		lenientVRRPTrackDuplicates:   true,
-		lenientDeviceMap:             true,
-		lenientPolicyMatchAddress:    true,
-		lenientTCPMSSRange:           true,
-		lenientEventAttributesMatch:  true,
+		sanitizeFreeTextControlChars:  true,
+		lenientVRRPTrackDuplicates:    true,
+		lenientDeviceMap:              true,
+		lenientPolicyMatchAddress:     true,
+		lenientTCPMSSRange:            true,
+		lenientEventAttributesMatch:   true,
+		lenientIPsecPolicyProposalRef: true,
+		lenientIPsecGatewayRefs:       true,
+		lenientLogProfileStreamRef:    true,
 	})
 }
 
@@ -232,12 +273,15 @@ func CompileConfigForNode(tree *ConfigTree, nodeID int) (*Config, error) {
 // the candidate-commit path — see CompileConfigLenient.
 func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) {
 	return compileConfigForNodeWithOpts(tree, nodeID, compileOpts{
-		sanitizeFreeTextControlChars: true,
-		lenientVRRPTrackDuplicates:   true,
-		lenientDeviceMap:             true,
-		lenientPolicyMatchAddress:    true,
-		lenientTCPMSSRange:           true,
-		lenientEventAttributesMatch:  true,
+		sanitizeFreeTextControlChars:  true,
+		lenientVRRPTrackDuplicates:    true,
+		lenientDeviceMap:              true,
+		lenientPolicyMatchAddress:     true,
+		lenientTCPMSSRange:            true,
+		lenientEventAttributesMatch:   true,
+		lenientIPsecPolicyProposalRef: true,
+		lenientIPsecGatewayRefs:       true,
+		lenientLogProfileStreamRef:    true,
 	})
 }
 
@@ -571,6 +615,22 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		}
 	}
 
+	// #2073 IPsec policy proposal cross-reference gate. Strict on commit /
+	// commit-check (hard-reject a dangling ipsec policy -> proposal
+	// reference that would silently drop the configured perfect-forward-
+	// secrecy group to the strongSwan default); lenient on load / peer-sync
+	// (warn so an already-persisted or peer-synced config still boots — the
+	// render-path safety net in pkg/ipsec preserves the PFS group on that
+	// boot). Runs alongside the other tolerant-downgradable cross-ref gates.
+	if err := validateIPsecPolicyProposalReferencesStrict(cfg); err != nil {
+		if opts.lenientIPsecPolicyProposalRef {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("ipsec policy proposal reference (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
 	// #2008 M7: event-options attributes-match patterns are RE2 regexes
 	// (Junos `matches` semantics). Reject an uncompilable pattern at commit
 	// so the operator gets immediate feedback instead of the event engine
@@ -583,6 +643,46 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		if opts.lenientEventAttributesMatch {
 			cfg.Warnings = append(cfg.Warnings,
 				fmt.Sprintf("event-options attributes-match (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
+	// #2074 IPsec VPN -> IKE gateway cross-reference. A VPN that
+	// references a gateway which is neither a defined gateway object nor a
+	// usable inline IP/hostname would render `remote_addrs = <gateway-name>`
+	// — a config-object name strongSwan cannot use, a silently-dead tunnel.
+	// Strict on commit / commit-check (hard reject so the operator gets a
+	// diagnostic); lenient on load / peer-sync (warn so a pre-fix or
+	// peer-synced config still boots — #1960 fail-closed-on-load class).
+	// Runs on the fully-compiled *Config so both ike{} and ipsec{} gateway
+	// definitions are present regardless of stanza authoring order. Mirrors
+	// validateDeviceMapStrict / the policy match-address gate above.
+	if err := validateIPsecGatewayReferencesStrict(cfg); err != nil {
+		if opts.lenientIPsecGatewayRefs {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("ipsec gateway reference (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
+	// #2008 H7 security log profile -> stream cross-reference. A
+	// `security log profile <name> stream-name <stream>` that names a
+	// stream which is not configured would route to nowhere — the operator
+	// authored a log profile whose target silently never receives events.
+	// Before H7 the whole profile stanza was dropped silently; now it is
+	// compiled and the reference is checked. Strict on commit / commit-
+	// check (hard reject so the typo is operator-visible); lenient on load
+	// / peer-sync (warn so a config persisted by an older binary that
+	// dropped the stanza, or a peer-synced config, still boots — #1960
+	// fail-closed-on-load class). Runs on the fully-compiled *Config so the
+	// stream map is fully populated regardless of authoring order. Mirrors
+	// validateIPsecPolicyProposalReferencesStrict.
+	if err := validateLogProfileStreamReferencesStrict(cfg); err != nil {
+		if opts.lenientLogProfileStreamRef {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("security log profile stream reference (downgraded to warning on tolerant path): %v", err))
 		} else {
 			return nil, err
 		}
@@ -719,6 +819,132 @@ func validatePolicySchedulerReferencesStrict(cfg *Config) error {
 		if err := check("global", pol); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// validateIPsecPolicyProposalReferencesStrict hard-rejects an IPsec
+// (Phase 2) policy whose `proposals` reference does not resolve to a
+// defined IPsec proposal (#2073). resolveESPSettings (pkg/ipsec/ike.go)
+// resolves the policy's proposal ref, or falls back to the policy name
+// when no `proposals` leaf is given. When that reference dangles, the
+// renderer would otherwise fall through to `esp_proposals = default`,
+// silently substituting the operator's entire Phase-2 proposal set —
+// including any configured perfect-forward-secrecy DH group — with the
+// strongSwan default (which carries no required modp term). That is the
+// same silent-crypto-weakening class ValidateDHGroup closes for DH-group
+// leaves; this validator closes it for the policy→proposal cross-
+// reference.
+//
+// Rejected unconditionally (not only when PFSGroup > 0): a dangling
+// reference substitutes the whole proposal, not just PFS. Mirrors
+// validatePolicySchedulerReferencesStrict, which rejects any undefined
+// scheduler reference.
+//
+// On the tolerant load / peer-sync paths the call site downgrades this
+// to a warning (opts.lenientIPsecPolicyProposalRef) so an already-
+// persisted or peer-synced config still boots; the render-path safety
+// net in resolveESPSettings preserves the configured PFS group on that
+// boot rather than dropping it.
+func validateIPsecPolicyProposalReferencesStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	policies := cfg.Security.IPsec.Policies
+	proposals := cfg.Security.IPsec.Proposals
+	// Policies is a map (unordered); sort keys so the first-error
+	// commit-check message is deterministic across runs.
+	names := make([]string, 0, len(policies))
+	for name := range policies {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		pol := policies[name]
+		if pol == nil {
+			continue
+		}
+		propRef := pol.Proposals
+		explicitRef := propRef != ""
+		if !explicitRef {
+			// Mirror resolveESPSettings' policy-name fallback: a policy
+			// with no `proposals` leaf resolves against a proposal named
+			// after the policy itself.
+			propRef = pol.Name
+		}
+		if _, ok := proposals[propRef]; ok {
+			continue
+		}
+		if explicitRef {
+			return fmt.Errorf("ipsec policy %q references undefined ipsec proposal %q "+
+				"(the configured proposal set, including any perfect-forward-secrecy "+
+				"group, would be silently dropped to the strongSwan default)",
+				pol.Name, propRef)
+		}
+		// No explicit `proposals` leaf was given, so do not blame a
+		// phantom proposal named after the policy — describe the actual
+		// gap instead.
+		return fmt.Errorf("ipsec policy %q has no resolvable ipsec proposal "+
+			"(no `proposals` reference and no proposal named %q); the configured "+
+			"perfect-forward-secrecy group would be silently dropped — define a "+
+			"proposal or reference one", pol.Name, pol.Name)
+	}
+	return nil
+}
+
+// validateLogProfileStreamReferencesStrict hard-rejects a
+// `security log profile <name>` whose `stream-name` reference does not
+// resolve to a configured `security log stream` (#2008 H7). xpf routes
+// log events per stream (a Junos superset — every matching stream
+// receives the event), so a profile's `stream-name` designates the
+// stream that carries its events. A profile naming a stream that is not
+// configured routes to nowhere: the operator authored a log profile
+// whose target silently never fires. Before H7 the whole profile stanza
+// was dropped before compile, so the typo was invisible; now the
+// reference is validated.
+//
+// A profile with no `stream-name` is accepted: Junos permits a profile
+// that relies on the global routing inheritance, and there is nothing to
+// dangle. Only a non-empty `stream-name` that misses the stream map is
+// rejected.
+//
+// Note: compileLog only records a stream in Log.Streams when it has a
+// host (a host-less stream is not a real destination and is dropped by
+// the stream loop), so a profile referencing a host-less stream is
+// treated as a dangling reference — consistent with the stream's own
+// "must have a host to exist" semantics.
+//
+// On the tolerant load / peer-sync paths the call site downgrades this
+// to a warning (opts.lenientLogProfileStreamRef) so an already-persisted
+// config (older binaries dropped the stanza entirely) or a peer-synced
+// config still boots. Mirrors validateIPsecPolicyProposalReferencesStrict.
+func validateLogProfileStreamReferencesStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	profiles := cfg.Security.Log.Profiles
+	if len(profiles) == 0 {
+		return nil
+	}
+	streams := cfg.Security.Log.Streams
+	// Profiles is a map (unordered); sort keys so the first-error
+	// commit-check message is deterministic across runs.
+	names := make([]string, 0, len(profiles))
+	for name := range profiles {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		p := profiles[name]
+		if p == nil || p.StreamName == "" {
+			continue
+		}
+		if _, ok := streams[p.StreamName]; ok {
+			continue
+		}
+		return fmt.Errorf("security log profile %q references undefined "+
+			"log stream %q (the profile would route to nowhere — define "+
+			"the stream or fix the stream-name)", p.Name, p.StreamName)
 	}
 	return nil
 }
@@ -1316,6 +1542,39 @@ func ValidateConfig(cfg *Config) []string {
 		warnings = append(warnings, "forwarding-options allow-dataplane-sleep configured but is accepted-only — the userspace dataplane workers busy-poll and idle-yield is not yet implemented")
 	}
 
+	// #2078: the `security flow tcp-session` presence flags are typed and
+	// committed but the userspace AF_XDP dataplane enforces none of them
+	// today. no-syn-check / no-syn-check-in-tunnel would gate the
+	// session-create SYN check; rst-invalidate-session would tear a session
+	// down on RST; no-sequence-check (#2008 M9) would skip sequence-window
+	// validation. The dataplane session table is a pure 5-tuple flow entry
+	// with no TCP state machine and no sequence/window tracking, so there is
+	// nothing for any of these knobs to enforce or skip. This is an
+	// intentional, reviewed parity gap (see #2008 M9 and the RST design
+	// rationale in docs/active-active-new-connections.md); research #2078
+	// converged PLAN-KILL on enforcement. Warn so an operator who sets one
+	// of these is not silently misled into believing it has runtime effect.
+	if ts := cfg.Security.Flow.TCPSession; ts != nil {
+		var unenforced []string
+		if ts.NoSynCheck {
+			unenforced = append(unenforced, "no-syn-check")
+		}
+		if ts.NoSynCheckInTunnel {
+			unenforced = append(unenforced, "no-syn-check-in-tunnel")
+		}
+		if ts.RstInvalidateSession {
+			unenforced = append(unenforced, "rst-invalidate-session")
+		}
+		if ts.NoSequenceCheck {
+			unenforced = append(unenforced, "no-sequence-check")
+		}
+		if len(unenforced) > 0 {
+			warnings = append(warnings, fmt.Sprintf(
+				"security flow tcp-session %s configured but accepted-only — the userspace dataplane has no TCP state machine and does not enforce these knobs (config-only parity, #2078)",
+				strings.Join(unenforced, ", ")))
+		}
+	}
+
 	// #654: warn on `system processes X disable` for a process that
 	// bpfrx does not actually manage. Silently accepting the knob (as
 	// used to happen with e.g. `utmd disable` on vSRX) means the
@@ -1876,7 +2135,17 @@ func compileApplications(node *Node, apps *ApplicationsConfig) error {
 		as := &ApplicationSet{Name: inst.name}
 
 		for _, member := range inst.node.Children {
-			if member.Name() == "application" {
+			// An application-set member is either an individual application
+			// reference (`application <name>`) or a nested application-set
+			// reference (`application-set <name>`). Both kinds are stored in
+			// as.Applications; ExpandApplicationSet distinguishes them by
+			// looking each member name up in apps.ApplicationSets and recursing
+			// (max depth 3). Dropping the nested-set arm here silently lost the
+			// child set's applications from the parent, so a policy matching the
+			// parent set under-matched (#2068). This mirrors compileAddressBook,
+			// which handles both `address` and `address-set` members.
+			switch member.Name() {
+			case "application", "application-set":
 				v := nodeVal(member)
 				if v != "" {
 					as.Applications = append(as.Applications, v)

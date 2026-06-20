@@ -25,8 +25,8 @@ type monitorState struct {
 
 // Dampening defaults.
 const (
-	DefaultMonitorFailThreshold = 3              // consecutive failures before marking down
-	DefaultMonitorPassThreshold = 3              // consecutive successes before marking up
+	DefaultMonitorFailThreshold = 3               // consecutive failures before marking down
+	DefaultMonitorPassThreshold = 3               // consecutive successes before marking up
 	DefaultMonitorHoldDown      = 5 * time.Second // hold-down after state change
 )
 
@@ -264,8 +264,7 @@ func (mon *Monitor) pollInterfaceMonitors(rg *config.RedundancyGroup, statuses [
 			continue
 		}
 
-		up := link.Attrs().OperState == netlink.OperUp ||
-			link.Attrs().Flags&net.FlagUp != 0
+		up := LinkAttrsUp(link.Attrs())
 
 		// Track local interface status for heartbeat propagation.
 		statuses = append(statuses, InterfaceMonitorInfo{
@@ -450,8 +449,7 @@ func (mon *Monitor) RGInterfaceReady(rgID int) (bool, []string) {
 				reasons = append(reasons, fmt.Sprintf("interface %s missing", im.Interface))
 				continue
 			}
-			up := link.Attrs().OperState == netlink.OperUp ||
-				link.Attrs().Flags&net.FlagUp != 0
+			up := LinkAttrsUp(link.Attrs())
 			if !up {
 				reasons = append(reasons, fmt.Sprintf("interface %s down", im.Interface))
 			}
@@ -482,6 +480,39 @@ func (mon *Monitor) getNlHandle() nlLinkGetter {
 	}
 	mon.cachedNlHandle = h
 	return h
+}
+
+// LinkAttrsUp reports whether an interface is operationally up. It is the
+// shared carrier-state read for the cluster package: the interface-monitor
+// demotion loop (Monitor.pollInterfaceMonitors, RGInterfaceReady), the
+// RETH status displays (RethController.FormatStatus and the
+// "show chassis cluster interfaces" reth list in both pkg/grpcapi and
+// pkg/cli), and the daemon no-reth-vrrp VIP-readiness gate
+// (pkg/daemon.checkVIPReadinessForConfig, #2090).
+//
+// Carrier health must NOT be decided from the administrative IFF_UP flag
+// (net.FlagUp): xpfd admin-ups ALL managed interfaces, so IFF_UP stays set
+// whenever the interface is admin-up — including when the cable is pulled.
+// A carrier-down link keeps IFF_UP set while OperState transitions to
+// OperDown/OperLowerLayerDown. Decide from the operational state
+// (IFLA_OPERSTATE):
+//   - OperUp                 -> up.
+//   - OperUnknown            -> fall back to the admin flag (common on
+//     virtual devices and 802.1Q VLAN sub-interfaces that report no
+//     independent carrier state).
+//   - OperDown / lower-layer-down / anything else -> down.
+//
+// This mirrors pkg/vrrp.linkAttrsUp, the canonical link-state read used by
+// VRRP track-interface detection (#2070).
+func LinkAttrsUp(attrs *netlink.LinkAttrs) bool {
+	switch attrs.OperState {
+	case netlink.OperUp:
+		return true
+	case netlink.OperUnknown:
+		return attrs.Flags&net.FlagUp != 0
+	default:
+		return false
+	}
 }
 
 type noopNlHandle struct{}

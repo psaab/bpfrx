@@ -324,6 +324,29 @@ reserved for whole-dataplane selection where a rewrite shim
     fails at commit; `allow-duplicates` is an explicit presence-only flag.
   Pure schema hardening — no runtime behavior change. Regression coverage:
   `pkg/config/schema_validate_2008_test.go`.
+- **#2008 H7 (security log profile):** declared the `security log
+  profile <name>` stanza — `stream-name` (`ValueHintStreamName`
+  completion), `default-profile` (presence flag), and
+  `category session field-extra-name`. Before H7 the whole stanza parsed
+  but was silently dropped (no schema child, no compiler case), so a real
+  imported config such as `vsrx-ha.conf`'s `profile default-syslog {
+  stream-name syslog-container; default-profile; }` committed with no
+  validation and no effect. It now compiles to typed `LogConfig.Profiles`
+  (`LogProfile{Name, StreamName, DefaultProfile}`) and the compiler
+  cross-references `stream-name` against the configured streams
+  (`validateLogProfileStreamReferencesStrict`): a profile naming an
+  undefined stream is rejected at commit / commit-check (strict) and
+  downgraded to a warning on the tolerant load / peer-sync paths
+  (`lenientLogProfileStreamRef`, mirroring the IPsec proposal/gateway
+  cross-ref gates and the #1960 fail-closed-on-load doctrine). **No
+  runtime/dataplane change:** xpf per-stream routing is already a Junos
+  superset (every stream whose category/severity filter matches receives
+  the event), so a profile's `stream-name` designates the stream that
+  carries its events; the `default-profile` flag records the operator's
+  default designation and `category field-extra-name` is accepted for
+  parity but not yet used to alter the emitted structured-data field set.
+  Regression coverage: `pkg/config/log_profile_test.go` +
+  `pkg/config/log_profile_schema_test.go`.
 - **#1387 (DHCP dynamic-DNS, increment 1):** added an opt-in
   `dynamic-dns` subtree under BOTH `services dhcp-local-server` and
   `services dhcpv6-local-server` (a single shared `config.DHCPDynamicDNSConfig`
@@ -445,10 +468,19 @@ the value sits in a single typed slot:
     presence flags `no-syn-check`, `no-syn-check-in-tunnel`,
     `rst-invalidate-session`, and `no-sequence-check` (#2008 M9) declared
     presence-only for completion parity. The presence flags compile into
-    `TCPSessionConfig` (NoSynCheck / RstInvalidateSession / NoSequenceCheck)
-    but are typed-config only — the userspace dataplane does not yet read them
-    (it performs no TCP sequence-number window validation, so there is nothing
-    for `no-sequence-check` to skip yet).
+    `TCPSessionConfig` (NoSynCheck / NoSynCheckInTunnel / RstInvalidateSession
+    / NoSequenceCheck) but are typed-config only — the userspace dataplane does
+    not read them. The session table is a pure 5-tuple flow entry with no TCP
+    state machine and no sequence/window tracking, so there is nothing for any
+    of these knobs to enforce or skip. **#2078:** setting any of them emits a
+    single accepted-only commit advisory (`pkg/config/compiler.go`,
+    `security flow tcp-session ... accepted-only`) so an operator is not
+    silently misled; research #2078 converged PLAN-KILL on enforcement.
+    The RST design rationale (suppress RST→CLOSED for ESTABLISHED, keep
+    `rst-invalidate-session` as the opt-in override) is in
+    `docs/active-active-new-connections.md`. The dead legacy `flow_config_map`
+    `TCPFlags` write was removed in #2078 (the map was retired with the eBPF
+    dataplane, #1373/#1476).
   - `security flow udp-session` / `icmp-session` expanded to a container with a
     typed `timeout` (`ValidateInteger(0, MaxDurationSeconds)`).
   - `forwarding-options sampling instance <i> input rate` —

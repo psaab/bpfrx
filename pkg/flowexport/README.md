@@ -3,8 +3,8 @@
 NetFlow v9 and IPFIX (NetFlow v10) exporters. Both ship session-close
 events to remote collectors with per-zone direction filters and 1-in-N
 session sampling. Wired off `pkg/logging.EventReader` SESSION_CLOSE
-events in `pkg/daemon/daemon_flow.go`, not the conntrack GC delete
-callback. No per-packet sampling path.
+events in `pkg/daemon/daemon_flowexport.go`, not the conntrack GC
+delete callback. No per-packet sampling path.
 
 ## File layout
 
@@ -53,10 +53,28 @@ Shared:
 
 ## Callers
 
-`pkg/daemon/daemon_flow.go::startFlowExporter` calls
-`Exporter.ExportSessionClose()` for NetFlow v9; `startIPFIXExporter`
-calls `IPFIXExporter.ExportSessionClose()` for IPFIX. Both run from
-the `logging.EventReader` SESSION_CLOSE callback.
+`pkg/daemon/daemon_flowexport.go::reconcileFlowExporters` owns the
+exporter lifecycle (#2075). It runs at boot (after the EventReader
+exists) AND on every config commit from `applyConfigLocked`, and is
+config-hash-gated per family so an unrelated commit never bounces a
+healthy exporter (preserving its template-refresh cadence and 1-in-N
+sampling counter). A commit that changes `forwarding-options sampling`
+/ `services flow-monitoring` — or that ADDS / REMOVES flow export
+entirely — therefore takes effect immediately, without a daemon
+restart (before #2075 the exporters were started only at boot and
+stopped only at shutdown).
+
+Because the `EventReader` callback list is append-only (clear-all only,
+no per-callback removal), the reconcile registers ONE stable
+indirection callback per family exactly once
+(`flowCBOnce`/`ipfixCBOnce`) that reads the live `(exporter, config)`
+pair lock-free from an `atomic.Pointer` bundle; reconcile swaps the
+bundle atomically. The callback calls `Exporter.ExportSessionClose()`
+(NetFlow v9) / `IPFIXExporter.ExportSessionClose()` (IPFIX) from the
+`logging.EventReader` SESSION_CLOSE event. The daemon-held
+`*ExportConfig` is the sole 1-in-N counter owner (the exporter never
+reads `sampleCounter`), so it is held by pointer in the bundle.
+`stopFlowExporter`/`stopIPFIXExporter` drain the exporter at shutdown.
 
 ## Dependencies
 

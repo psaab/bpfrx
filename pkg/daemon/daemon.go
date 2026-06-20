@@ -140,6 +140,24 @@ type Daemon struct {
 	ipfixExporter              *flowexport.IPFIXExporter
 	ipfixCancel                context.CancelFunc
 	ipfixWg                    sync.WaitGroup
+	// #2075 flowexport reconcile state. The bundle pointers carry the
+	// live (exporter, resolved-config) pair read lock-free by the
+	// once-registered session-close callbacks; reconcile swaps them
+	// atomically. The per-family hashes gate the reconcile so an
+	// unrelated commit never bounces a healthy exporter; the *HashSet
+	// bools distinguish "never reconciled" from "reconciled to the
+	// nil sentinel". The *ReconMu serialize the reconcile swap against
+	// shutdown's stopFlow/IPFIXExporter (both touch the cancel/wg).
+	flowBundle     atomic.Pointer[exporterBundle]
+	flowHash       [32]byte
+	flowHashSet    bool
+	flowCBOnce     sync.Once
+	flowReconMu    sync.Mutex
+	ipfixBundlePtr atomic.Pointer[ipfixBundle]
+	ipfixHash      [32]byte
+	ipfixHashSet   bool
+	ipfixCBOnce    sync.Once
+	ipfixReconMu   sync.Mutex
 	dhcpRelay                  *dhcprelay.Manager
 	snmpAgent                  *snmp.Agent
 	lldpMgr                    *lldp.Manager

@@ -1197,6 +1197,17 @@ func (d *Daemon) applyConfigLocked(cfg *config.Config) error {
 	// 16. Update flow traceoptions (trace file + filters)
 	d.updateFlowTrace(cfg)
 
+	// 16b. Reconcile the NetFlow v9 / IPFIX exporters (#2075). Before
+	// this, the exporters were only started at boot and stopped at
+	// shutdown, so forwarding-options sampling / flow-monitoring config
+	// changes were ignored until a daemon restart (and flow export
+	// added in a later commit never started). Hash-gated per family so
+	// an unrelated commit never bounces a healthy exporter. Placed
+	// below the dataplane-apply abort (consistent with reconcileRPM /
+	// applySyslogConfig): an aborting commit defers the exporter change
+	// to the next clean commit.
+	d.reconcileFlowExporters(cfg)
+
 	// 17. Update event-options policies (RPM-driven failover)
 	if d.eventEngine != nil {
 		d.eventEngine.Apply(cfg.EventOptions)

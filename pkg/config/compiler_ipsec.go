@@ -1,6 +1,9 @@
 package config
 
 import (
+	"fmt"
+	"net"
+	"sort"
 	"strconv"
 	"strings"
 )
@@ -379,4 +382,134 @@ func compileIPsec(node *Node, sec *SecurityConfig) error {
 	}
 
 	return nil
+}
+
+// validateIPsecGatewayReferencesStrict (#2074) rejects an IPsec VPN that
+// references an IKE gateway which is neither a defined gateway object
+// (carrying an address or dynamic hostname) nor a usable inline
+// IP/hostname. Without this check, renderConfig would emit
+// `remote_addrs = <gateway-name>` — a config-object name strongSwan
+// cannot use — producing a silently-dead tunnel with no diagnostic.
+//
+// It runs on the fully-compiled *Config (the strict-validator chain in
+// compileExpanded), so both `ike { gateway }` and `ipsec { gateway }`
+// definitions are present in sec.IPsec.Gateways regardless of which
+// stanza was authored first. The caller downgrades this to a warning on
+// the tolerant load / peer-sync paths (lenientIPsecGatewayRefs) so a
+// config persisted by an older binary, or synced from a peer, still
+// boots; commit / commit-check stay strict.
+//
+// VPN names are sorted so a multi-VPN config reports a deterministic
+// first failure.
+func validateIPsecGatewayReferencesStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	ipsec := &cfg.Security.IPsec
+	if len(ipsec.VPNs) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(ipsec.VPNs))
+	for name := range ipsec.VPNs {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		vpn := ipsec.VPNs[name]
+		if vpn == nil || vpn.Gateway == "" {
+			// A VPN may legitimately omit the remote endpoint (the
+			// generated connection simply has no remote_addrs line).
+			continue
+		}
+		if gw, ok := ipsec.Gateways[vpn.Gateway]; ok {
+			if gw.Address == "" && gw.DynamicHostname == "" {
+				return fmt.Errorf("security ipsec vpn %s: ike gateway %q "+
+					"has no address or dynamic hostname; the tunnel would "+
+					"never establish", name, vpn.Gateway)
+			}
+			continue // resolves to a defined, addressed gateway
+		}
+		if IsUsableIPsecEndpoint(vpn.Gateway) {
+			continue // legacy inline literal IP / dotted hostname
+		}
+		return fmt.Errorf("security ipsec vpn %s: ike gateway %q is not "+
+			"defined and is not a valid address or hostname", name, vpn.Gateway)
+	}
+	return nil
+}
+
+// IsUsableIPsecEndpoint reports whether s is something strongSwan can
+// place in a swanctl `remote_addrs` directly: a literal IP address, or a
+// plausible dotted DNS hostname / FQDN. It deliberately REJECTS a bare
+// config-object name with no hostname structure (e.g. a typo'd gateway
+// reference such as `gw-to-hq`), so such a name is caught at commit
+// rather than DNS-probed forever at runtime (#2074).
+//
+// It lives in pkg/config so that both the commit-time validator
+// (validateIPsecGatewayReferencesStrict, pkg/config) and the swanctl
+// render belt (pkg/ipsec, which imports pkg/config) share one predicate
+// with no import cycle.
+func IsUsableIPsecEndpoint(s string) bool {
+	if s == "" {
+		return false
+	}
+	if net.ParseIP(s) != nil {
+		return true
+	}
+	return isPlausibleHostname(s)
+}
+
+// isPlausibleHostname reports whether s looks like a multi-label DNS
+// hostname / FQDN: it must contain at least one dot (Rule A — this is
+// what distinguishes an operator-supplied peer hostname from a typo'd
+// single-label gateway object name), and every dot-separated label must
+// be a syntactically valid host label (1-63 chars, alphanumeric with
+// internal hyphens, no leading/trailing hyphen). Total length is capped
+// at 253. No regexp — a manual byte scan keeps it allocation-free.
+//
+// The single-label-hostname limitation (a bare `vpnpeer` resolvable via
+// the system resolver is rejected) is intentional and documented: define
+// a proper `security ike gateway <name> { address <ip>; }` (or
+// `dynamic { hostname <fqdn>; }`) instead.
+func isPlausibleHostname(s string) bool {
+	if len(s) == 0 || len(s) > 253 {
+		return false
+	}
+	if !strings.Contains(s, ".") {
+		return false
+	}
+	labelLen := 0
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		switch {
+		case c == '.':
+			if labelLen == 0 {
+				return false // empty label (leading dot or "..")
+			}
+			if s[i-1] == '-' {
+				return false // label ends with hyphen
+			}
+			labelLen = 0
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+			labelLen++
+		case c == '-':
+			if labelLen == 0 {
+				return false // label begins with hyphen
+			}
+			labelLen++
+		default:
+			return false // illegal character for a hostname
+		}
+		if labelLen > 63 {
+			return false
+		}
+	}
+	// Trailing label must be non-empty and not end with a hyphen.
+	if labelLen == 0 {
+		return false // trailing dot => empty last label
+	}
+	if s[len(s)-1] == '-' {
+		return false
+	}
+	return true
 }

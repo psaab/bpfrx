@@ -44,6 +44,135 @@
   userspace-dp/tests/fixtures/protocol_wire_v1.json,
   pkg/dataplane/userspace/protocol.go
 
+## 2026-06-20 — #2084 ping/traceroute argv `--` end-of-options separator (option-confusion hardening)
+
+- **Timestamp**: 2026-06-20
+- **Action**: Fixed #2084 (LOW, hardening, loopback-API gated). The
+  ping/traceroute exec sites build an argv slice (no shell — NOT
+  injection) but omitted a `--` end-of-options separator before the
+  user-supplied target, so a `-`-prefixed target was interpreted as a
+  ping/traceroute flag (option-confusion). Extracted the inline argv
+  construction at the six target-append points into pure, unit-testable
+  `buildPingArgv`/`buildTracerouteArgv` helpers (one pair per package)
+  and inserted `"--"` immediately before the target. For the
+  `ip vrf exec vrf-<name>` wrapped variant the `--` lands in the inner
+  command's argv (after `ping`/`traceroute`), which is where it must be.
+  The remote CLI (`cmd/cli/main.go`) builds a protobuf request, not an
+  argv, so it inherits the server-side fix; `pkg/upgrade/kernel_linux.go`
+  pings a daemon-internal gateway (no untrusted input) — both out of
+  scope. Added 12 unit tests (4 per package) asserting `--` is present,
+  immediately precedes the target, is the last-but-one element, comes
+  after all options and after the `ping`/`traceroute` binary, and that a
+  `-`-prefixed target lands as the operand. Updated pkg/api/README.md and
+  pkg/grpcapi/README.md.
+- **File(s)**: pkg/grpcapi/server_diag.go, pkg/api/system.go,
+  pkg/cli/cli_request.go, pkg/grpcapi/server_diag_argv_test.go (new),
+  pkg/api/system_argv_test.go (new), pkg/cli/cli_request_argv_test.go
+  (new), pkg/api/README.md, pkg/grpcapi/README.md,
+  docs/pr/2084-ping-traceroute-separator/plan.md (new)
+
+## 2026-06-20 — #2075 NetFlow v9 / IPFIX exporters never reconciled on commit
+
+- **Timestamp**: 2026-06-20
+- **Action**: Fixed #2075 (MEDIUM, audit-found, stored-but-never-enforced
+  observability config). The NetFlow v9 / IPFIX exporters
+  (`pkg/flowexport`) were started only at daemon boot and stopped only at
+  shutdown; the apply path (`daemon_apply.go`) had zero flowexport
+  references, so any commit changing `forwarding-options sampling`
+  (collector, source-address, 1-in-N rate, sampled zones) or a
+  `services flow-monitoring` export-extension was silently ignored until a
+  daemon restart — and flow export ADDED in a later commit never started.
+  Added `reconcileFlowExporters` (new `pkg/daemon/daemon_flowexport.go`),
+  called from `applyConfigLocked` (step 16b) and from the post-EventReader
+  boot block (replacing the old boot-only `startFlowExporter`/
+  `startIPFIXExporter`, which were deleted). Config-hash-gated PER FAMILY
+  so an unrelated commit never bounces a healthy exporter (preserving its
+  template-refresh cadence + 1-in-N sampling counter). The EventReader
+  callback list is append-only (clear-all only, no per-callback removal),
+  so a naive stop/start would leak a closure per commit; instead a single
+  stable indirection callback per family is registered exactly once
+  (`flowCBOnce`/`ipfixCBOnce`) and reads the live `(exporter, config)`
+  pair lock-free from an `atomic.Pointer` bundle that reconcile swaps
+  atomically. The daemon-held `*ExportConfig` is the sole 1-in-N counter
+  owner (the exporter never reads `sampleCounter`), so it is held by
+  pointer in the bundle.
+- **File(s)**: `pkg/daemon/daemon_flowexport.go` (new),
+  `pkg/daemon/daemon_flow.go` (deleted start funcs, hardened stop funcs),
+  `pkg/daemon/daemon.go` (bundle/hash/once/mutex fields),
+  `pkg/daemon/daemon_run.go` (boot call sites),
+  `pkg/daemon/daemon_apply.go` (step 16b),
+  `pkg/logging/ringbuf.go` (`CallbackCount` test accessor),
+  `pkg/daemon/daemon_flowexport_reconcile_test.go` (new, 8 tests incl. a
+  non-tautological apply-wiring guard that drives the REAL
+  `applyConfigLocked` and fails iff the reconcile call is removed —
+  mutation-verified, plus a create-failure retry test),
+  `pkg/flowexport/README.md` (lifecycle),
+  `docs/pr/2075-flowexport-reconcile/plan.md` (plan + folded plan reviews).
+  A hostile-code-review MINOR was folded: a transient `NewExporter`
+  failure now leaves the per-family hash UNSET so the next commit retries
+  (no permanently-dead exporter), instead of recording the hash.
+- **Validation**: full Go suite green; `pkg/daemon`/`pkg/logging`/
+  `pkg/flowexport` pass; new tests 5/5 flake-clean and `-race` clean;
+  mutation check confirms the apply-wiring test fails when the call is
+  deleted; `go vet` shows no NEW copylocks beyond the pre-existing
+  `NewExporter(*ec)` (count unchanged 2→2). Control-plane fix — no
+  dataplane smoke (no forwarding path touched).
+
+## 2026-06-20 — #2070 interface-monitor carrier-state read (HIGH, failover-class)
+
+- **Timestamp**: 2026-06-20
+- **Action**: #2070 — the interface-monitor reported a carrier-down
+  (cable-pulled / peer-down) link as UP, suppressing HA failover. The
+  link-health read was `OperState == OperUp || Flags&IFF_UP != 0`; since
+  xpfd admin-ups every managed interface, the `IFF_UP` term is always
+  true, so the OR collapsed to "administratively up" regardless of
+  carrier — a redundancy group with a dead uplink was never demoted.
+  Fixed by reading the kernel operational state via a new package-local
+  `linkAttrsUp` helper (mirrors `pkg/vrrp.linkAttrsUp`): `OperUp` → up,
+  `OperUnknown` → admin-flag fallback (virtual devices with no carrier
+  state), `OperDown`/`OperLowerLayerDown`/other → down. Replaced all
+  three identical buggy sites: `pkg/routing/monitor.go` (display signal)
+  and `pkg/cluster/monitor.go` (the live 1s poll loop feeding
+  `SetMonitorWeight`, and the readiness check). Added regression tests in
+  both packages that fail pre-fix (carrier-down reported UP / weight not
+  demoted) and pass post-fix, plus admin-down and OperUnknown guard cases.
+  FAILOVER-class: `make test-failover` (cable-pull / link-down failover)
+  is the mandatory merge gate, run by the parent.
+- **File(s)**: pkg/routing/monitor.go, pkg/routing/monitor_test.go (new),
+  pkg/cluster/monitor.go, pkg/cluster/monitor_test.go,
+  pkg/cluster/README.md, pkg/routing/README.md, _Log.md
+
+## 2026-06-20 — #2069 lo0 input filter never installs (invalid `flush ruleset <table>` nft syntax)
+
+- **Timestamp**: 2026-06-20
+- **Action**: Fixed #2069 (HIGH, audit-found, fail-open control-plane
+  filter). `applyLo0Filter` fed `nft -f -` a payload starting
+  `flush ruleset inet xpf_lo0\n`. nft's `flush ruleset` takes at most an
+  OPTIONAL family (`flush ruleset [<family>]`), never a table name — the
+  trailing `xpf_lo0` token is a parse error. nft parses `-f -` atomically,
+  so the line-1 syntax error rejected the ENTIRE payload incl. the real
+  filter rules; only a `slog.Warn` fired and the configured
+  `interfaces lo0 unit 0 family inet[6] filter input <name>` silently never
+  installed (host-bound traffic the operator meant to drop reached the local
+  stack). Replaced the invalid line with the correct atomic reset idiom:
+  `table inet xpf_lo0` (create-if-absent, no body — idempotent) +
+  `flush table inet xpf_lo0` + the redefined table block, all in one
+  payload. Extracted payload assembly into a pure `buildLo0FilterPayload`
+  seam so the payload is parse-checkable without the daemon apply path.
+  Verified against real nft 1.1.6: the bad line errors at parse
+  (`syntax error ... xpf_lo0`); the new idiom parses cleanly (only the
+  post-parse `Operation not permitted` netlink failure remains, expected
+  without CAP_NET_ADMIN).
+- **Tests**: Added `TestLo0FilterPayloadFlushIdiom` (string-level: forbids
+  `flush ruleset`, requires the create-if-absent + `flush table` idiom in
+  order, requires the real rule body) and `TestLo0FilterPayloadNftParses`
+  (runs `nft -c -f -` on the real payload when nft is on PATH; a syntax
+  error fails the test, a netlink/permission error is a pass, missing nft
+  skips). Both FAIL against the pre-fix `flush ruleset inet xpf_lo0` payload
+  (confirmed by injecting the old idiom). `nft -c` actually ran and parsed
+  the fixed payload. Full `go test ./pkg/daemon/` green.
+- **File(s)**: pkg/daemon/daemon_nft.go, pkg/daemon/lo0_filter_test.go,
+  pkg/daemon/README.md, _Log.md
 ## 2026-06-20 — #2062 ssh sshd_config.d drop-in lifecycle
 
 - **Timestamp**: 2026-06-20
@@ -7318,3 +7447,23 @@ top.
 - **Timestamp**: 2026-06-20
 - **Action**: #1387 Inc-2 DDNS (PR #2066 Copilot review) — fixed 5 reported bugs, COMPANION-FREE, each with a test that FAILS pre-fix. (1) STANZA-REMOVAL ORPHANS RECORDS (most important): removing the whole `dynamic-dns` stanza (DynamicDNS=nil) made policyFromConfig resolve backend="" so the per-Reconcile factory returned a nopUpdater; Reconcile swapped m.updater to that nop BEFORE the !pol.enabled withdrawAllLocked, so the withdraw ran through the nop — ownership entries dropped but NO real DNS delete sent (orphaned records). Fix (pkg/dhcpserver/ddns.go Reconcile): when the newly-resolved updater is a nop AND the existing m.updater is live AND records are still owned (len(m.state.records)>0), keep the live updater for this withdraw cycle; swap to nop only on the next cycle once nothing is owned. Disable-via-flag (Enabled=false keeping Backend+UpdateServer) still resolves a LIVE updater, so that already-working path is unaffected — verified by the retained TestManagerEnabledThenDisabledWithdrawsOnce. (2) normalizeUpdateServer (ddns_rfc2136.go) double-bracketed a bracketed IPv6 literal without a port ("[2001:db8::1]" -> "[[2001:db8::1]]:53"): now strips an existing surrounding bracket pair before JoinHostPort. (3) resolveForwardZone (ddns_rfc2136.go) returned dns.Fqdn(defaultDomain) for ANY fqdn when Domain was set, misrouting an out-of-domain ClientFQDN into the domain zone: now uses defaultDomain only when fqdn is a suffix-match under it (via longestZoneSuffix), else derives parentZone(fqdn). (4) TCP-retry-on-truncation (exchange(), ddns_rfc2136.go) replaced the caller ctx with context.Background(), so a canceled/deadline'd reconcile pass could not cancel the retry: now derives the TCP retry ctx from the caller ctx (per-exchange timeout still applied on top). (5) Imprecise test comment (ddns_manager_inc2_test.go) said "a nil DynamicDNS block" for a disable that is actually DynamicDNS!=nil with Enabled=false — corrected. Tests added (all mutation-verified to FAIL pre-fix): TestManagerStanzaRemovalWithdrawsThroughLiveBackend (fakeUpdater RECEIVES the deletes + ownership cleared; pre-fix 0 deletes), TestNormalizeUpdateServer extended with bracketed/bare IPv6 + host:port, TestResolveForwardZone (under-domain -> domain zone; out-of-domain -> own parent), TestExchangeTCPRetryHonorsCallerCancellation (300ms caller deadline bounds the 2s-stalled TCP retry post-fix at ~300ms; pre-fix runs on Background+u.timeout and waits ~2s). Also fixed a PRE-EXISTING (HEAD) test-harness data race in the in-process fake DNS server: test bodies wrote srv.rcodeForZone/conflictPrereq/conflictZones unlocked while the handler reads them under srv.mu — added locked setRcode/clearRcode/setConflict/setTruncate helpers and routed all call sites through them; `go test -race ./pkg/dhcpserver/` is now clean (was failing pre-change). Docs: updated pkg/dhcpserver/README.md (stanza-removal withdraw-through-live-backend guard, forward-zone suffix-match, caller-ctx TCP retry). Validation: GOCACHE=/dev/shm/cache go build ./... clean; go vet ./pkg/dhcpserver/ clean (pkg/daemon ExportConfig lock-by-value warnings are PRE-EXISTING in unmodified daemon_flow.go); go test ./pkg/dhcpserver/ ./pkg/daemon/ -count=1 green; go test -race ./pkg/dhcpserver/ green. COMPANION-FREE per directive; NOT merged.
 - **File(s)**: pkg/dhcpserver/ddns.go, pkg/dhcpserver/ddns_rfc2136.go, pkg/dhcpserver/ddns_manager_inc2_test.go, pkg/dhcpserver/ddns_rfc2136_test.go, pkg/dhcpserver/README.md, _Log.md
+- **Timestamp**: 2026-06-20
+- **Action**: #2068 nested application-set members silently dropped (HIGH, audit-found, COMPANION-FREE). compileApplications' (pkg/config/compiler.go ~1875) member loop read ONLY children named "application", so a nested `application-set <child>` member was never appended to the parent set — even though the schema accepts the nested form (schema_security.go:457, children:nil) and ExpandApplicationSet (predefined.go ~184) already recurses into nested sets (max depth 3). Result: a security policy matching the parent under-matched — applications defined only in the child set produced NO app-match rule and traffic was never matched. Fix: added an `application-set` arm to the member switch (mirroring compileAddressBook's `address`/`address-set` dual handling); the referenced child-set name is appended to the parent's Applications slice (whose comment already documents it as "references to Application or ApplicationSet names"), and ExpandApplicationSet resolves it via the existing recursion. nodeVal handles both AST shapes so flat-set and hierarchical both populate it. No new commit-time check added: ExpandApplicationSet already errors on unknown members (at dataplane compile, consistent with predefined sets) and the existing depth-3 guard bounds cyclic/over-deep nests (proven by test). Tests (mutation-verified FAIL pre-fix): pkg/config TestNestedApplicationSet{FlatSet,Hierarchical,Deep,Cycle} (flat-set via ParseSetCommand+SetPath per CLAUDE.md, plus hierarchical, 3-level deep, and a cycle hitting the depth bound); pkg/dataplane/userspace TestNestedApplicationSetPolicyMatch drives flat-set config through config.CompileConfig (NOT a hand-built struct — that would bypass the buggy compiler and be tautological) then asserts buildPolicySnapshots emits an app-match term for app2's tcp/443 (reachable only via the nested child set). Pre-fix: parent.Applications==[app1], expand drops app2, the policy emits only the tcp/80 term. Validation: GOCACHE=/dev/shm/cache go build ./... clean; go vet ./pkg/config/ clean; go test ./pkg/config/ ./pkg/dataplane/... -count=1 all green. Doc: docs/services-application-identification.md application-set bullet now documents nested-member support + the #2068 fix.
+- **File(s)**: pkg/config/compiler.go, pkg/config/application_set_nested_test.go, pkg/dataplane/userspace/nested_app_set_policy_test.go, docs/services-application-identification.md, _Log.md
+- **Timestamp**: 2026-06-20
+- **Action**: #2078 C2 (warn-and-document; research converged PLAN-KILL on enforcement). Three `security flow tcp-session` presence flags (`no-syn-check`, `no-syn-check-in-tunnel`, `rst-invalidate-session`) plus the #2008 M9 sibling `no-sequence-check` are typed+committed but the userspace AF_XDP dataplane has no TCP state machine and enforces none of them — and an operator who set one was silently misled. Item 1 (advisory): added a commit-time accepted-only warning in pkg/config/compiler.go ValidateConfig (called from compileExpanded; placed right after the allow-dataplane-sleep block, mirroring that exact pattern) that folds all four family knobs into ONE warning (`security flow tcp-session <knobs> configured but accepted-only — the userspace dataplane has no TCP state machine and does not enforce these knobs (config-only parity, #2078)`), gated `if cfg.Security.Flow.TCPSession != nil`. Item 3 (dead code): removed the dead `FlowConfigValue.TCPFlags` packing block in pkg/dataplane/compiler.go:1069-1080 + the now-always-zero `"tcp_flags", fc.TCPFlags` slog field — that packing fed `dp.SetFlowConfig` which on the userspace path is a no-op stub (loader.go userspaceShimCompileDataplane.SetFlowConfig→nil) writing to the retired flow_config_map eBPF map (#1373/#1476); verified NO reader of FlowConfigValue.TCPFlags exists (compiler_filter.go .TCPFlags is a DIFFERENT struct, the firewall-filter term). Kept the struct field for xpf_common.h layout parity, comment updated to mark it retired. Item 2 (docs): corrected docs/feature-gaps.md TCP-session rows (were wrongly "Done" via retired eBPF) to "Config-only (#2078)" with userspace behavior + cross-ref to active-active RST rationale; extended the M9 note; expanded docs/config-schema.md tcp-session paragraph with the advisory + design-rationale + dead-code cross-references. Tests: pkg/config/tcp_session_advisory_test.go (per-knob advisory fires + names that knob; no-syn-check prefix-vs-no-syn-check-in-tunnel false-positive guard; all-four folds into exactly ONE warning naming all four; timeouts-only no-warn; absent no-warn), mutation-verified to FAIL when the advisory is disabled (`if false && len(unenforced)>0`). CONTROL-PLANE only, no dataplane smoke (no runtime behavior change). Validation: GOCACHE=/dev/shm go build ./... clean; go vet ./pkg/dataplane/ clean; go test ./pkg/config/ ./pkg/dataplane/ green; full `go test ./...` 0 failures.
+- **File(s)**: pkg/config/compiler.go, pkg/config/tcp_session_advisory_test.go, pkg/dataplane/compiler.go, pkg/dataplane/maps_flow.go, docs/feature-gaps.md, docs/config-schema.md, _Log.md
+
+## #2073 IPsec PFS silently dropped on dangling proposal ref (PR #2099)
+- **Timestamp**: 2026-06-20
+- **Action**: Two-layer fix — commit-time strict cross-ref validator
+  (validateIPsecPolicyProposalReferencesStrict, lenient on load/peer-sync)
+  + render-path PFS-preserving fallback (aes256-sha256-modp<bits>) in
+  resolveESPSettings. Quad-ish review: 2 hostile plan reviews (folded),
+  2 hostile code reviews (caught + fixed sha256128 BLOCKER), both
+  MERGE-READY. Copilot pending. ECP-group modp<bits> + normal-path
+  sha256128 noted as pre-existing follow-ups.
+- **File(s)**: pkg/config/compiler.go, pkg/ipsec/ike.go,
+  pkg/config/ipsec_proposal_ref_test.go, pkg/ipsec/ipsec_test.go,
+  pkg/config/parser_security_test.go, pkg/ipsec/README.md,
+  docs/pr/2073-ipsec-pfs/plan.md

@@ -79,8 +79,16 @@ What increment 1 ships (the fully unit-testable, lab-free slice):
   honors Kea's `state` column (default/declined/expired-reclaimed), the
   `expire` epoch, and the `fqdn_fwd` split between host-name and
   client-supplied FQDN, and extracts the v6 DUID/IAID identity. SEPARATE
-  from the display-only `parseLeaseCSV` (reusing that would publish/retain
-  stale records — the exact bug this feature fixes). Header columns are
+  from the display-only `parseLeaseCSV` — NOT because the display parser
+  is unfiltered (since #2085 it also filters non-active state + expired
+  rows and dedups per address), but because the two have opposite
+  failure postures: the DDNS parser is **destructive** (its empty result
+  authorizes deleting owned DNS records), so it must hard-error on a
+  mangled / duplicate-column / ragged header; the display parser is
+  **non-destructive and lenient** — an exotic or short row must degrade
+  to showing what it can, never blank the whole `show`. Merging them
+  would force one posture onto the other (re-opening the #1387
+  mass-delete, or blanking the display on one bad row). Header columns are
   matched CASE-INSENSITIVELY (both the header keys AND the lookup name are
   lower-cased in `leaseColumnValue`; field values are data and stay
   verbatim). A header maps to columns UNAMBIGUOUSLY: a DUPLICATE column name
@@ -319,7 +327,18 @@ adds `github.com/miekg/dns` (DNS UPDATE construction + TSIG signing).
   `/var/lib/kea/kea-leases4.csv` and `kea-leases6.csv`. No control
   channel / socket call. Missing files yield an empty list, not an
   error. Parsing uses `encoding/csv` (#1778) so quoted fields with
-  embedded commas don't shift columns.
+  embedded commas don't shift columns. Kea's memfile is **append-only**
+  between lease-file-cleanup (LFC) compactions — every renewal,
+  re-allocation, release, decline, and expiry-reclaim is a new row — so
+  `parseLeaseCSV` (#2085) collapses the append log to one row per
+  address (the last/newest row wins), drops non-active rows
+  (`state != 0` — declined / expired-reclaimed, which can still carry a
+  future `expire`, so state is filtered before expire) and lapsed rows
+  (`expire <= now`), and emits in first-appearance order. The clock is
+  injected (`parseLeaseCSV(path, now)`) for deterministic tests. The
+  filter is lenient: an absent or unparseable `state` / `expire` column
+  degrades to "treat the row as active", preserving the pre-#2085
+  behaviour for older Kea or exotic headers.
 - Per-subnet interface binding (#1778): Kea allows at most ONE
   interface per subnet. Single-interface groups bind explicitly;
   multi-interface groups omit the binding so Kea uses address-based

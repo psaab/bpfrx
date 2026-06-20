@@ -833,14 +833,14 @@ func (d *Daemon) Run(ctx context.Context) error {
 				d.applySyslogConfig(er, cfg)
 			}
 
-			// Start NetFlow exporter if configured
+			// Start NetFlow v9 + IPFIX exporters if configured (#2075).
+			// This post-EventReader block is load-bearing: the earlier
+			// boot applyConfig ran before d.eventReader existed, so the
+			// apply-path reconcileFlowExporters no-op'd. This call is
+			// what first starts the exporters at boot; later commits go
+			// through the apply path.
 			if cfg := d.store.ActiveConfig(); cfg != nil {
-				d.startFlowExporter(ctx, cfg, er)
-			}
-
-			// Start IPFIX exporter if configured
-			if cfg := d.store.ActiveConfig(); cfg != nil {
-				d.startIPFIXExporter(ctx, cfg, er)
+				d.reconcileFlowExporters(cfg)
 			}
 
 			// Set up flow traceoptions if configured
@@ -854,8 +854,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 				d.eventReader = er
 				if cfg := d.store.ActiveConfig(); cfg != nil {
 					d.applySyslogConfig(er, cfg)
-					d.startFlowExporter(ctx, cfg, er)
-					d.startIPFIXExporter(ctx, cfg, er)
+					d.reconcileFlowExporters(cfg)
 					d.applyFlowTrace(cfg, er)
 				}
 			}

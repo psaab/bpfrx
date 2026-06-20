@@ -88,3 +88,7 @@ contract.
   the HTTP path), both capped at the 150s `diagExecCeiling`; the same
   formulas live in `pkg/api/exec_timeout.go` for the REST siblings, and
   `streamDiagCmd` kills the child promptly when a stream send fails.
+  The argv builders (`buildPingArgv`/`buildTracerouteArgv`) place the
+  user-supplied target after a `--` end-of-options separator so a
+  `-`-prefixed target is an operand, not a flag (option-confusion
+  hardening, #2084).

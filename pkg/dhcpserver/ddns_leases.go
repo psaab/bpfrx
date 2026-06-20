@@ -10,11 +10,17 @@ import (
 )
 
 // ddns_leases.go: a STATE-AWARE Kea memfile lease parser for the #1387
-// DDNS reconciler (plan §5 invariant 3). The existing parseLeaseCSV is
-// display-only — it has no active/expired filtering, no Kea `state`
-// column, and no v6 DUID/IAID identity. Reusing it for DDNS would publish
-// or retain stale records, the exact bug this feature is about. This
-// parser is separate and intentionally does NOT replace the display one.
+// DDNS reconciler (plan §5 invariant 3). It stays SEPARATE from the
+// display-only parseLeaseCSV not because that parser is unfiltered —
+// since #2085 it also filters non-active state + expired rows and dedups
+// per address — but because the two have opposite failure postures: this
+// DDNS parser is DESTRUCTIVE (its empty result authorizes deleting owned
+// DNS records), so it hard-errors on a mangled / duplicate-column /
+// ragged header, validates the required columns, and carries the v6
+// DUID/IAID identity the reconciler keys ownership on; the display parser
+// is NON-DESTRUCTIVE and LENIENT (a bad row degrades, never blanks the
+// `show`). Merging them would force one posture onto the other, so this
+// parser intentionally does NOT replace the display one.
 
 // Kea lease state column values (memfile CSV `state`).
 const (

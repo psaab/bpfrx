@@ -133,6 +133,29 @@ type LogConfig struct {
 	SourceInterface string // interface for source address
 	Streams         map[string]*SyslogStream
 	Report          bool // enable session aggregation reporting (security log report)
+	// Profiles holds Junos `security log profile <name>` objects (#2008
+	// H7). Before this was added the whole `profile` stanza parsed but was
+	// silently discarded (no schema child, no compiler case) — a config
+	// such as `vsrx-ha.conf`'s `profile default-syslog { stream-name ...;
+	// default-profile; }` committed with no effect and no validation. It
+	// is now compiled and cross-referenced against Streams at commit.
+	Profiles map[string]*LogProfile
+}
+
+// LogProfile is a Junos `security log profile <name>` object: a named log
+// routing profile that targets a configured stream and may be marked the
+// default profile (#2008 H7). xpf's per-stream routing is a Junos superset
+// — every stream whose category/severity filter matches receives the
+// event — so a profile's StreamName names the stream that carries its
+// events and DefaultProfile records the operator's default designation.
+// No dispatch change is required: the runtime already routes by stream.
+// The compiler cross-references StreamName against LogConfig.Streams so a
+// profile naming a non-existent stream is rejected at commit rather than
+// silently dropped (see validateLogProfileStreamReferencesStrict).
+type LogProfile struct {
+	Name           string
+	StreamName     string // references LogConfig.Streams[StreamName] when set
+	DefaultProfile bool   // `default-profile;` — operator's default designation
 }
 
 // SyslogTransport defines the transport protocol for a syslog stream.

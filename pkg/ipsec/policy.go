@@ -2,6 +2,7 @@ package ipsec
 
 import (
 	"fmt"
+	"log/slog"
 	"net"
 	"sort"
 	"strconv"
@@ -28,27 +29,34 @@ func (m *Manager) renderConfig(ipsecCfg *config.IPsecConfig) (string, error) {
 
 	b.WriteString("# xpf managed config - do not edit\n\n")
 
+	// skipped records VPNs whose gateway reference is not renderable
+	// (#2074) so the secrets loop below emits no orphan ike-<name> secret
+	// for a connection that was never written.
+	skipped := make(map[string]bool)
+
 	// Connections
 	b.WriteString("connections {\n")
 	for _, name := range sortedVPNNames(ipsecCfg.VPNs) {
 		vpn := ipsecCfg.VPNs[name]
-		fmt.Fprintf(&b, "  %s {\n", sanitizeSwanctlValue(name))
 
-		// Resolve gateway reference
-		remoteAddr := vpn.Gateway
-		localAddr := vpn.LocalAddr
-		var gw *config.IPsecGateway
-		if g, ok := ipsecCfg.Gateways[vpn.Gateway]; ok {
-			gw = g
-			if gw.Address != "" {
-				remoteAddr = gw.Address
-			} else if gw.DynamicHostname != "" {
-				remoteAddr = gw.DynamicHostname
-			}
-			if gw.LocalAddress != "" && localAddr == "" {
-				localAddr = gw.LocalAddress
-			}
+		// Resolve the remote gateway endpoint. remote_addrs must be a
+		// real IP / hostname strongSwan can use — never a bare gateway
+		// config-object name (#2074). The hard diagnostic for a bad
+		// reference is the commit-time validator
+		// (validateIPsecGatewayReferencesStrict); this render belt is the
+		// by-construction backstop for any path that reaches render
+		// without passing local commit (HA peer-sync, direct
+		// IPsecConfig construction, a config persisted before the fix).
+		remoteAddr, localAddr, gw, ok := resolveRemoteAddr(ipsecCfg, vpn)
+		if !ok {
+			skipped[name] = true
+			slog.Warn("skipping IPsec VPN: ike gateway not renderable "+
+				"(undefined or addressless) — fix the gateway reference",
+				"vpn", name, "gateway", vpn.Gateway)
+			continue
 		}
+
+		fmt.Fprintf(&b, "  %s {\n", sanitizeSwanctlValue(name))
 		authMethod, ikeProposals, ikeLifetime, aggressive, err := resolveIKESettings(ipsecCfg, gw)
 		if err != nil {
 			return "", fmt.Errorf("vpn %s: %w", name, err)
@@ -172,6 +180,11 @@ func (m *Manager) renderConfig(ipsecCfg *config.IPsecConfig) (string, error) {
 	// Secrets — resolve PSK from IKE policy chain
 	b.WriteString("secrets {\n")
 	for _, name := range sortedVPNNames(ipsecCfg.VPNs) {
+		if skipped[name] {
+			// No connection was written for this VPN (#2074) — emit no
+			// orphan ike-<name> secret.
+			continue
+		}
 		vpn := ipsecCfg.VPNs[name]
 		secret := vpn.PSK.Reveal()
 		// Resolve PSK from IKE policy chain: VPN -> gateway -> IKE policy -> PSK
@@ -195,6 +208,59 @@ func (m *Manager) renderConfig(ipsecCfg *config.IPsecConfig) (string, error) {
 	b.WriteString("}\n")
 
 	return b.String(), nil
+}
+
+// resolveRemoteAddr resolves the swanctl remote_addrs value (a real IP /
+// dotted hostname) for a VPN, plus the effective local address and the
+// resolved gateway. ok=false means there is nothing usable to render —
+// the caller MUST skip the connection so a bare gateway config-object
+// NAME never leaks into remote_addrs (#2074):
+//
+//   - defined gateway with an address / dynamic hostname -> remote = that
+//   - defined gateway with neither (addressless)         -> ok=false
+//   - no gateway object, vpn.Gateway is a usable IP/host -> remote = it
+//   - no gateway object, vpn.Gateway empty               -> ok=true,
+//     remote="" (connection emitted with no remote_addrs line, as before)
+//   - no gateway object, vpn.Gateway a dangling/dotless name -> ok=false
+//
+// This mirrors the commit-time validator validateIPsecGatewayReferencesStrict
+// exactly, using the same config.IsUsableIPsecEndpoint predicate.
+func resolveRemoteAddr(ipsecCfg *config.IPsecConfig, vpn *config.IPsecVPN) (
+	remoteAddr, localAddr string, gw *config.IPsecGateway, ok bool) {
+
+	localAddr = vpn.LocalAddr
+	if g, found := ipsecCfg.Gateways[vpn.Gateway]; found {
+		gw = g
+		switch {
+		case gw.Address != "":
+			remoteAddr = gw.Address
+		case gw.DynamicHostname != "":
+			remoteAddr = gw.DynamicHostname
+		default:
+			// Gateway exists but has nothing routable. Do NOT fall back
+			// to the object name. (Forecloses a future responder-only /
+			// %any peer that legitimately omits remote_addrs — no such
+			// concept exists in the parser today; revisit if added.)
+			return "", localAddr, gw, false
+		}
+		if gw.LocalAddress != "" && localAddr == "" {
+			localAddr = gw.LocalAddress
+		}
+		return remoteAddr, localAddr, gw, true
+	}
+	if vpn.Gateway == "" {
+		// Legitimately omitted remote endpoint — emit the connection with
+		// no remote_addrs line (unchanged behavior).
+		return "", localAddr, nil, true
+	}
+	if config.IsUsableIPsecEndpoint(vpn.Gateway) {
+		// Legacy inline shape: the VPN names the peer endpoint directly
+		// as a literal IP or dotted hostname, with no Gateways entry.
+		return vpn.Gateway, localAddr, nil, true
+	}
+	// Dangling / dotless single-label name — not a known gateway and not
+	// a usable IP/hostname. Rendering it would leak the name.
+	return "", localAddr, nil, false
 }
 
 func sortedVPNNames(vpns map[string]*config.IPsecVPN) []string {
