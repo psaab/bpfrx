@@ -1,11 +1,57 @@
 # #2074 — renderConfig leaks the gateway NAME into swanctl remote_addrs
 
-**Status:** DRAFT v2 — addresses round-1 hostile review (reviewer A
-PLAN-NEEDS-MINOR, reviewer B PLAN-NEEDS-MAJOR). Both converged on the
-whole-render-abort blast-radius defect; B escalated on altitude
-(warn-only does not make `commit` fail). v2 adopts a **two-layer fix**:
-a commit-time cross-reference validator (primary, loud at `commit`) plus
-a **skip-and-continue** render-side belt (never zeroes healthy tunnels).
+**Status:** DRAFT v3 — addresses round-2 hostile review (both reviewers
+PLAN-NEEDS-MAJOR). Round-2 found two source-confirmed blocking defects in
+v2: (1) `Manager.Apply` bails on a render error BEFORE the write, so v2's
+"return (healthyConfig, joinedErr)" discards the healthy config and the
+skip-and-continue belt is inert; (2) v2 placed the commit validator
+inside `compileIPsec` with a hard `return`, which (a) depends on
+`ike`-before-`ipsec` stanza order (false — `compileSecurity` iterates in
+document order) and (b) runs on the LENIENT load/peer-sync path too,
+breaking boot of a pre-fix/peer-synced dangling-gateway config
+(fail-closed-on-load, the #1960 regression class).
+
+v3's corrected two-layer design:
+- **Layer 1** is a strict-accumulator validator
+  `validateIPsecGatewayReferencesStrict(cfg)` operating on the
+  FULLY-COMPILED `*Config` (both `ike{}` and `ipsec{}` gateways
+  populated, stanza-order-independent), with a `lenientIPsecGatewayRefs`
+  downgrade — EXACTLY the `validateDeviceMapStrict` (#1956) /
+  `validatePolicyMatchAddressesStrict` (#2008) template. Strict on
+  commit/commit-check; warns on load/peer-sync.
+- **Layer 2** is the MINIMAL render belt (reviewer B point 5): on a leak
+  case `renderConfig` **skips that VPN's connection block, `slog.Warn`s,
+  and continues** — it does NOT add a new error return, so the unchanged
+  `Apply` writes the healthy config. No `Apply` rewrite, no `errors.Join`,
+  no skip-set-for-error needed. By construction a bare NAME never reaches
+  `remote_addrs`, and healthy tunnels are never zeroed.
+
+## Round-2 review resolution (what changed in v3)
+
+- **R2-1 (both, blocking): Apply discards healthy config on render
+  error.** `manager.go:67-70` does `if err != nil { return err }` before
+  `WriteFileAtomic`. v3 sidesteps this entirely: the render belt no
+  longer RETURNS an error for the gateway-leak cases — it skips the bad
+  VPN, `slog.Warn`s, and continues. `renderConfig`'s error return is
+  reserved for its existing reasons (auth method, PSK decode) only. So
+  `Apply` is UNCHANGED, always writes the healthy config, and never
+  zeroes healthy tunnels. (We considered "write-then-warn in Apply" but
+  the skip-and-log render belt is simpler and needs no signature/Apply
+  churn.)
+- **R2-2 (both, blocking): Layer-1 ordering + lenient-path break.** v3
+  moves the validator OUT of `compileIPsec` to a strict-accumulator-style
+  pass on the fully-compiled `*Config` (after `compileSecurity`
+  returns, where `cfg.Security.IPsec.Gateways` holds BOTH `ike{}` and
+  `ipsec{}` gateways regardless of authoring order), and gates it with
+  `opts.lenientIPsecGatewayRefs` so the lenient load/peer-sync paths
+  (`CompileConfigLenient`, `CompileConfigForNodeLenient`) WARN instead of
+  failing to boot. Mirrors `validateDeviceMapStrict` (#1956) exactly.
+- **R2-3: secrets-loop skip** — with the minimal belt, the connections
+  loop builds a `skipped map[string]bool`; the secrets loop consults it
+  so a skipped connection emits no orphan secret. Concrete, not prose.
+- **R2-4: errors import** — no longer needed (no `errors.Join` in the
+  minimal belt). Dropped.
+- **R2-5: Layer-2 complexity** — adopted reviewer B's minimal belt.
 
 ## Round-1 review resolution (what changed in v2)
 
@@ -180,19 +226,28 @@ specifically about the gateway-NAME leak, which is exactly the bug.
 
 ## Concrete design
 
-### Layer 2 — render (`pkg/ipsec/policy.go`), skip-and-continue
+### Layer 2 — render belt (`pkg/ipsec/policy.go`), minimal skip-and-log
 
-A shared resolver returns either a usable remote address or an error.
-The per-VPN loop, on a resolver error, records the error, `continue`s
-(skips that connection block), and renders the rest. After the loop,
-`renderConfig` returns the rendered config and the joined error.
+A resolver classifies the gateway. On a leak case (4/5/6) it returns
+`ok=false`; the connections loop SKIPS that VPN, records it in a
+`skipped` set, `slog.Warn`s, and continues. `renderConfig` returns NO
+new error (its existing error return — auth method, PSK decode — is
+untouched), so the unchanged `Apply` writes the healthy config.
 
 ```go
-func resolveRemoteAddr(ipsecCfg *config.IPsecConfig, vpn *config.IPsecVPN,
-    name string) (remoteAddr, localAddr string, gw *config.IPsecGateway, err error) {
+// resolveRemoteAddr returns the swanctl remote_addrs value (a real
+// IP / dotted hostname) for a VPN, plus the resolved local addr and
+// gateway. ok=false means there is nothing usable to render — the
+// caller MUST skip the connection so a bare gateway config-object NAME
+// never leaks into remote_addrs (#2074). The hard diagnostic is the
+// commit-time validator (Layer 1); this is the by-construction belt for
+// any path that reaches render without passing local commit (HA sync /
+// direct construction / a config committed before this fix).
+func resolveRemoteAddr(ipsecCfg *config.IPsecConfig, vpn *config.IPsecVPN) (
+    remoteAddr, localAddr string, gw *config.IPsecGateway, ok bool) {
 
     localAddr = vpn.LocalAddr
-    if g, ok := ipsecCfg.Gateways[vpn.Gateway]; ok {
+    if g, found := ipsecCfg.Gateways[vpn.Gateway]; found {
         gw = g
         switch {
         case gw.Address != "":
@@ -200,85 +255,84 @@ func resolveRemoteAddr(ipsecCfg *config.IPsecConfig, vpn *config.IPsecVPN,
         case gw.DynamicHostname != "":
             remoteAddr = gw.DynamicHostname
         default:
-            // Case 5: gateway exists but has neither an address nor a
-            // dynamic hostname — nothing routable. Do NOT fall back to
-            // the object name. (Forecloses a future responder-only /
-            // %any peer that legitimately omits remote_addrs; revisit
-            // this branch if/when that is added — no such concept
-            // exists in the parser today.)
-            return "", localAddr, gw, fmt.Errorf(
-                "ike gateway %q has no address or dynamic-hostname",
-                vpn.Gateway)
+            // Case 5: gateway exists but addressless. (Forecloses a
+            // future responder-only / %any peer that legitimately omits
+            // remote_addrs; no such concept in the parser today —
+            // revisit if added.)
+            return "", localAddr, gw, false
         }
         if gw.LocalAddress != "" && localAddr == "" {
             localAddr = gw.LocalAddress
         }
-        return remoteAddr, localAddr, gw, nil
+        return remoteAddr, localAddr, gw, true
     }
-    if isUsableRemoteEndpoint(vpn.Gateway) {
-        // Case 3: legacy inline shape — peer endpoint named directly as
-        // a literal IP or (dotted) hostname, no Gateways entry.
-        return vpn.Gateway, localAddr, nil, nil
+    if config.IsUsableIPsecEndpoint(vpn.Gateway) {
+        return vpn.Gateway, localAddr, nil, true // Case 3: inline IP/FQDN
     }
-    if vpn.Gateway != "" {
-        // Case 4/6: dangling reference / dotless single-label name that
-        // is neither a known gateway nor a usable IP/hostname. Emitting
-        // it as remote_addrs would leak the name.
-        return "", localAddr, nil, fmt.Errorf(
-            "ike gateway %q is not defined and is not a valid address "+
-                "or hostname", vpn.Gateway)
+    if vpn.Gateway == "" {
+        // Empty gateway: emit the connection with NO remote_addrs line
+        // (unchanged behavior — some configs legitimately omit it).
+        return "", localAddr, nil, true
     }
-    // vpn.Gateway == "" with no map entry => remoteAddr "" => the
-    // existing `if remoteAddr != ""` emit guard skips the line.
-    return "", localAddr, nil, nil
+    // Case 4/6: dangling / dotless name — not renderable.
+    return "", localAddr, nil, false
 }
 ```
 
-Loop integration (replacing current lines 37-51), skip-and-continue:
+Connections loop (replacing current lines 33-51 head):
 
 ```go
-var renderErrs []error
+skipped := make(map[string]bool)
 for _, name := range sortedVPNNames(ipsecCfg.VPNs) {
     vpn := ipsecCfg.VPNs[name]
-    remoteAddr, localAddr, gw, rerr := resolveRemoteAddr(ipsecCfg, vpn, name)
-    if rerr != nil {
-        // Skip ONLY this VPN's connection block; keep rendering the
-        // rest so one typo never zeroes healthy tunnels (#2074 R1).
-        renderErrs = append(renderErrs, fmt.Errorf("vpn %s: %w", name, rerr))
+    remoteAddr, localAddr, gw, ok := resolveRemoteAddr(ipsecCfg, vpn)
+    if !ok {
+        skipped[name] = true
+        slog.Warn("skipping IPsec VPN: gateway not renderable "+
+            "(undefined or addressless) — fix the ike gateway reference",
+            "vpn", name, "gateway", vpn.Gateway)
         continue
     }
     fmt.Fprintf(&b, "  %s {\n", sanitizeSwanctlValue(name))
     ... // unchanged emit body, using remoteAddr/localAddr/gw
 }
-...
-// after building secrets:
-return b.String(), errors.Join(renderErrs...)
 ```
 
-`errors.Join(nil...)` is `nil`, so the no-error path is unchanged.
-The secrets loop also skips a VPN whose render errored (it would be
-harmless to emit secrets for a skipped connection, but skipping keeps
-the output minimal and avoids a dangling `ike-<name>` secret).
-
-`isUsableRemoteEndpoint` — a small, local, allocation-light predicate:
+Secrets loop consults `skipped` (real code is a separate loop):
 
 ```go
-// isUsableRemoteEndpoint reports whether s is something strongSwan can
+for _, name := range sortedVPNNames(ipsecCfg.VPNs) {
+    if skipped[name] {
+        continue // no connection => no orphan ike-<name> secret
+    }
+    ... // unchanged secret emission
+}
+```
+
+`renderConfig`'s signature and existing error returns are UNCHANGED;
+no `errors.Join`, no new error path, no `Apply` change. The no-skip path
+is byte-identical to today (empty `skipped`, every `ok==true`).
+
+`IsUsableIPsecEndpoint` — exported from `pkg/config` (so the SAME
+predicate backs Layer 1 and Layer 2 with no import cycle), a small
+allocation-light predicate:
+
+```go
+// IsUsableIPsecEndpoint reports whether s is something strongSwan can
 // place in remote_addrs directly: a literal IP address, or a plausible
-// DNS hostname / FQDN. It deliberately REJECTS bare config-object
-// names that contain none of the structure of a hostname (so a typo'd
-// gateway reference is caught rather than DNS-probed forever). It is
-// intentionally conservative on the accept side for IPs and permissive
-// for hostnames, because a real hostname is operator-supplied and we
-// must not break legitimate inline FQDN gateways.
-func isUsableRemoteEndpoint(s string) bool {
+// dotted DNS hostname / FQDN. It deliberately REJECTS bare config-object
+// names with no hostname structure (so a typo'd gateway reference is
+// caught, not DNS-probed forever). Lives in pkg/config so both the
+// commit validator (pkg/config) and the render belt (pkg/ipsec, which
+// imports config) share one SSOT — no import cycle.
+func IsUsableIPsecEndpoint(s string) bool {
     if s == "" {
         return false
     }
     if net.ParseIP(s) != nil {
         return true
     }
-    return isPlausibleHostname(s)
+    return isPlausibleHostname(s) // Rule A: requires a dot
 }
 ```
 
@@ -311,116 +365,140 @@ literal IP for the inline shape, so Rule A breaks none of them. With the
 commit validator (Layer 1) as the hard gate using the SAME predicate,
 the single-label-inline-hostname limitation is a *documented commit-check
 behavior* with a clear migration (`set security ike gateway <name>
-address <ip>`), not a silent render regression. `isPlausibleHostname` is
-a manual byte scan (no regexp): non-empty, contains a `.`, every label
-1-63 alnum + internal hyphen, total ≤253.
+address <ip>`), not a silent render regression. `isPlausibleHostname`
+(unexported, in `pkg/config`) is a manual byte scan (no regexp):
+non-empty, contains a `.`, every label 1-63 alnum + internal hyphen,
+total ≤253.
 
-### Layer 1 — commit validator (`pkg/config/compiler_ipsec.go`)
+### Layer 1 — commit validator (strict-accumulator, `pkg/config`)
 
-At the end of `compileIPsec` (after the VPN loop, current line 378 —
-both `ike{gateway}` and `ipsec{gateway}` sections are populated by then;
-`compileIKE` runs first), add:
+Do NOT place the check inside `compileIPsec` (round-2 R2-2: stanza order
++ lenient-path break). Instead add a validator on the FULLY-COMPILED
+`*Config`, slotted into the existing strict-validator chain in
+`compileConfigWithOpts` / `compileConfigForNodeWithOpts`
+(`compiler.go`), right after `validatePolicyMatchAddressesStrict` /
+`ValidateEventAttributesMatch` — the exact `validateDeviceMapStrict`
+(#1956) / `#2008` template:
 
 ```go
-// #2074: a VPN that references a gateway which is neither a defined
-// gateway object nor a usable inline IP/hostname would render
+// #2074: an IPsec VPN that references a gateway which is neither a
+// defined gateway object nor a usable inline IP/hostname would render
 // `remote_addrs = <gateway-name>` — a config-object name strongSwan
-// can't use, producing a silently-dead tunnel. Reject it at commit so
-// the operator gets a diagnostic instead of a dead tunnel.
-for _, vpn := range sec.IPsec.VPNs {
-    if vpn.Gateway == "" {
-        continue
+// cannot use, a silently-dead tunnel. Strict on commit/commit-check;
+// lenient on load/peer-sync so a pre-fix or peer-synced config that
+// carries such a VPN still BOOTS (warn, don't fail-closed-on-load —
+// #1960 class). Runs on the fully-compiled *Config so both ike{} and
+// ipsec{} gateways are populated regardless of stanza order.
+if err := validateIPsecGatewayReferencesStrict(cfg); err != nil {
+    if opts.lenientIPsecGatewayRefs {
+        cfg.Warnings = append(cfg.Warnings,
+            fmt.Sprintf("ipsec gateway reference (downgraded to warning "+
+                "on tolerant path): %v", err))
+    } else {
+        return nil, err
     }
-    if _, ok := sec.IPsec.Gateways[vpn.Gateway]; ok {
-        continue // resolves to a defined gateway object
-    }
-    if isUsableRemoteEndpoint(vpn.Gateway) {
-        continue // legacy inline literal IP / dotted hostname
-    }
-    return fmt.Errorf("vpn %s: ike gateway %q is not defined and is "+
-        "not a valid address or hostname", vpn.Name, vpn.Gateway)
 }
 ```
 
-The predicate `isUsableRemoteEndpoint` lives in `pkg/ipsec` but the
-validator runs in `pkg/config`, and **`pkg/config` must not import
-`pkg/ipsec`** (ipsec already imports config — an import cycle). So the
-predicate is defined in `pkg/config` (e.g. `isUsableIPsecEndpoint` in
-`compiler_ipsec.go`) and `pkg/ipsec` either re-implements the identical
-two-line predicate locally or calls the exported `config` helper. Plan
-choice: define `config.IsUsableIPsecEndpoint` (exported) once in
-`pkg/config` and have `pkg/ipsec` call it — single source of truth, no
-cycle (ipsec→config is the existing, allowed direction). This is the one
-implementation detail to get right; flagged for review.
+```go
+func validateIPsecGatewayReferencesStrict(cfg *Config) error {
+    ipsec := &cfg.Security.IPsec
+    names := make([]string, 0, len(ipsec.VPNs)) // sort for deterministic error
+    for name := range ipsec.VPNs {
+        names = append(names, name)
+    }
+    sort.Strings(names)
+    for _, name := range names {
+        vpn := ipsec.VPNs[name]
+        if vpn.Gateway == "" {
+            continue // legitimately omitted remote endpoint
+        }
+        if gw, ok := ipsec.Gateways[vpn.Gateway]; ok {
+            if gw.Address == "" && gw.DynamicHostname == "" {
+                return fmt.Errorf("security ipsec vpn %s: ike gateway %q "+
+                    "has no address or dynamic hostname", name, vpn.Gateway)
+            }
+            continue // resolves to a defined, addressed gateway
+        }
+        if IsUsableIPsecEndpoint(vpn.Gateway) {
+            continue // legacy inline literal IP / dotted hostname
+        }
+        return fmt.Errorf("security ipsec vpn %s: ike gateway %q is not "+
+            "defined and is not a valid address or hostname",
+            name, vpn.Gateway)
+    }
+    return nil
+}
+```
 
-Iteration order: the validator iterates a map, so error ORDER is
-non-deterministic across multiple bad VPNs. For a deterministic error
-(stable tests / operator experience), sort VPN names first
-(`sortedVPNNames`-style) and return the first failure. Plan: sort, then
-validate.
-
-Does the addressless-gateway case (case 5) belong in Layer 1 too? Yes:
-extend the validator to also reject a VPN whose referenced gateway
-object exists but has neither `Address` nor `DynamicHostname`. Same
-loop, after the `ok` check: `if gw.Address=="" && gw.DynamicHostname==""
-{ return err }`. This makes BOTH leak cases (4 and 5) un-committable.
+`opts.lenientIPsecGatewayRefs` is added to `compileOpts` and set
+`true` in BOTH `CompileConfigLenient` and `CompileConfigForNodeLenient`
+(alongside `lenientDeviceMap` etc.). Commit / commit-check
+(`CompileConfig` / `CompileConfigForNode`) leave it `false` → hard
+reject. This rejects BOTH leak cases (4 dangling, 5 addressless) at
+commit, and boots a pre-fix/peer-synced config with a warning.
 
 ## Public API preservation
 
-- `renderConfig(*config.IPsecConfig) (string, error)` — signature
-  unchanged. Semantics: now returns the rendered config for the HEALTHY
-  VPNs plus a joined error naming any skipped VPNs (was: a single fatal
-  error aborting the whole file — the R1 defect).
-- `generateConfig(*config.IPsecConfig) string` — signature unchanged.
-  It discards the error. With skip-and-continue it now returns the
-  healthy-VPN config (NOT `""`) even when one VPN is malformed — strictly
-  better than v1's `""`. Callers are TEST-ONLY (`ipsec_test.go`); no
-  production caller. Verified by grep.
-- `Manager.Apply` — for a fully-valid config: unchanged. For a config
-  with one bad VPN reaching render (only possible via a path that
-  bypasses the commit validator, e.g. HA sync / direct construction):
-  it writes the healthy-VPN config AND returns the joined error, which
-  both call sites warn. Healthy tunnels stay up; the bad one is omitted
-  with a logged reason. No cold-boot zero-tunnels regression.
-- New exported `config.IsUsableIPsecEndpoint(string) bool` — additive,
-  no existing symbol changed.
+- `renderConfig(*config.IPsecConfig) (string, error)` — signature AND
+  error semantics UNCHANGED. It returns the rendered config for the
+  HEALTHY VPNs; a leak-case VPN is silently skipped (with a `slog.Warn`),
+  NOT turned into a returned error. The error return remains reserved for
+  its existing causes (auth method, PSK decode). This is the key R2-1
+  fix: because `renderConfig` does not error on the leak case, the
+  unchanged `Apply` writes the healthy config (it never reaches its
+  `if err != nil { return err }` guard for the leak case).
+- `generateConfig(*config.IPsecConfig) string` — unchanged; returns the
+  healthy-VPN config. Callers are TEST-ONLY (`ipsec_test.go`); verified.
+- `Manager.Apply` — UNCHANGED (no edit). Fully-valid config: identical.
+  A bad VPN reaching render (only via a path that bypassed local commit:
+  HA sync / direct construction / pre-fix config): the connection is
+  omitted, a warning is logged, the healthy config is written and
+  reloaded. No cold-boot zero-tunnels regression.
+- `compileOpts` — additive `lenientIPsecGatewayRefs bool` field; set in
+  the two lenient entry points. No existing field changed.
+- New exported `config.IsUsableIPsecEndpoint(string) bool` and new
+  unexported `validateIPsecGatewayReferencesStrict` / `isPlausibleHostname`
+  — additive.
 
 ## Hidden invariants the change must preserve
 
-1. **`gw` is consumed downstream** (lines 52, 57, 60-64, 78-91,
+1. **`gw` is consumed downstream** (policy.go 52, 57, 60-64, 78-91,
    103-116). For case 3 (inline literal) `gw` stays `nil` as today.
    For cases 1/2 `gw` is set as today and the connection is rendered.
-   For cases 4/5/6 the VPN is SKIPPED before any downstream use of `gw`
-   (the `continue`), so no downstream `gw` access happens for a skipped
-   VPN — correct.
-2. **`localAddr` fallback from `gw.LocalAddress`** only happens in the
+   For cases 4/5/6 the VPN is SKIPPED (the `continue`) before any
+   downstream use of `gw` — no downstream `gw` access for a skipped VPN.
+2. **`localAddr` fallback from `gw.LocalAddress`** only in the
    resolved-gateway branch (cases 1/2) — preserved inside the resolver.
 3. **Empty-gateway VPNs** (`vpn.Gateway == ""`, no map entry) still
-   render with NO `remote_addrs` line and NO error — the resolver
-   returns `("","",nil,nil)`, the connection IS emitted, and the
-   existing `if remoteAddr != ""` emit guard skips only the line.
+   render WITH the connection block and NO `remote_addrs` line and NO
+   error — the resolver returns `("",localAddr,nil,true)`, so the
+   connection IS emitted and the existing `if remoteAddr != ""` emit
+   guard skips only the line. (Verify: this exact shape exists in
+   `ipsec_test.go` — VPNs with no gateway, e.g. cert/TS-only configs.)
 4. **No new hot-path allocations** — render + compile run only on config
-   apply / commit (cold path). The predicate is allocation-light (no
-   regexp; manual byte scan). `errors.Join` allocates only when there
-   ARE errors.
+   apply / commit (cold path). Predicate is allocation-light (no regexp;
+   manual byte scan). `skipped` map allocates one small map per render.
 5. **Exact guarantee (corrected from v1's overstated claim):** a bare
    gateway config-object NAME never reaches `remote_addrs`. The CONTENT
    of a *defined* gateway's `Address` / `DynamicHostname` (cases 1/2) is
-   passed through raw and is NOT re-validated — that is unchanged,
-   trusted to the parser/schema, and explicitly out of scope.
-   `sanitizeSwanctlValue` is still not applied to `remote_addrs`
-   (unchanged); an IP/dotted-hostname has no control chars and the
-   predicate rejects anything that is neither.
+   passed through raw and is NOT re-validated — unchanged, trusted to the
+   parser/schema, out of scope. `sanitizeSwanctlValue` is still not
+   applied to `remote_addrs` (unchanged).
+6. **Lenient compile MUST still boot** a config carrying a leak-case VPN
+   (pre-fix persisted / peer-synced) — `lenientIPsecGatewayRefs` warns,
+   does not fail. This is the R2-2 fix (avoids #1960 fail-closed-on-load).
 
 ## Risk assessment
 
 | Class | Level | Notes |
 |-------|-------|-------|
-| Behavioral regression | LOW | Cases 1-3,7,8 bit-identical; only the already-broken leak cases (4/5/6) change. generateConfig now returns MORE (healthy config) not less. |
-| Import cycle | LOW | Predicate lives in `pkg/config` (exported), called from `pkg/ipsec` (ipsec→config is the existing allowed direction). Explicitly verified at build. |
-| Cold-boot / first-apply | RESOLVED | Skip-and-continue means a bad VPN never zeroes healthy tunnels — the R1 defect is fixed. |
+| Behavioral regression | LOW | Cases 1-3,7,8 bit-identical; only the already-broken leak cases (4/5/6) change. renderConfig error semantics unchanged. |
+| Import cycle | LOW | Predicate in `pkg/config` (exported), called from `pkg/ipsec` (ipsec→config is the existing allowed direction). Verified at build. |
+| Cold-boot / first-apply zero-tunnels | RESOLVED | renderConfig does NOT error on the leak case → Apply writes the healthy config. The R2-1 defect is fixed by construction. |
+| Lenient load fail-closed (#1960 class) | RESOLVED | `lenientIPsecGatewayRefs` downgrades to a warning on load/peer-sync. The R2-2 defect is fixed. |
+| Stanza-order false-reject | RESOLVED | Validator runs on the fully-compiled `*Config`, not inside `compileIPsec` — order-independent. |
 | Performance regression | NONE | Cold config-apply / commit path only. |
-| Architectural mismatch | LOW | Commit-validator is the right altitude (loud at `commit`); render guard is defense-in-depth. |
 
 ## Test plan (control-plane — NO dataplane smoke)
 
@@ -429,44 +507,51 @@ impact, so the iperf3 / CoS / failover smoke matrix does NOT apply.
 Coverage is focused, NON-TAUTOLOGICAL unit tests that FAIL pre-fix:
 
 1. `go build ./...` clean (verifies no import cycle).
-2. `pkg/ipsec` render tests — new `TestRenderConfig_GatewayNameNeverLeaks`:
-   - resolved gw with Address → `remote_addrs = <IP>`, and assert the
-     output does NOT contain the gateway object name on a `remote_addrs`
-     line.
-   - dangling/typo name (no map entry, not IP/host) → `renderConfig`
-     returns non-nil error AND the returned string contains NO
-     `remote_addrs = <name>` line. Fixture uses benign PSK auth (no
-     bogus auth-method) so `resolveIKESettings`/`normalizePSK` cannot
-     error first — guarantees the assertion targets the leak path, not a
-     pre-existing error (R4).
-   - addressless gw (exists, no Address/DynamicHostname) → non-nil
-     error, no leak.
-   - dotless single-label name (case 6) → non-nil error, no leak.
-   - legacy inline literal IP (case 3) → no error, `remote_addrs = <IP>`
+2. `pkg/ipsec` render tests — new `TestRenderConfig_GatewayNameNeverLeaks`
+   (render belt; renderConfig does NOT error on the leak case — it skips):
+   - resolved gw with Address → `remote_addrs = <IP>` present, and the
+     gateway object NAME does NOT appear on any `remote_addrs` line.
+   - dangling/typo name (no map entry, not IP/host) → the output
+     contains NO `remote_addrs = <name>` line AND no connection block
+     for that VPN (skipped). Fixture uses benign PSK auth so an
+     unrelated error path is not what's under test (R4). Pre-fix: this
+     fails because unpatched code emits `remote_addrs = <name>`.
+   - addressless gw (exists, no Address/DynamicHostname) → skipped, no
+     leak. Pre-fix: fails (emits `remote_addrs = <name>`).
+   - dotless single-label name (case 6) → skipped, no leak. Pre-fix
+     fails.
+   - legacy inline literal IP (case 3) → `remote_addrs = <IP>` present
      (over-rejection guard).
-   - dotted inline hostname (case 3 FQDN) → no error,
-     `remote_addrs = peer.example.com`.
-   - empty gateway → no error, no `remote_addrs` line, connection still
-     emitted.
-   - **multi-VPN skip-and-continue (R1 regression guard):** one healthy
-     VPN + one dangling VPN → assert the HEALTHY VPN's `remote_addrs`
-     IS present in the output AND a non-nil error is returned AND the
-     dangling name does NOT appear in `remote_addrs`. On unpatched code
-     v1-style would have aborted the whole file → this proves the
-     skip-and-continue behavior.
-   - Pre-fix proof: every error-asserting sub-case fails on unpatched
-     code (which returns nil error + leaked name).
-3. `pkg/config` compile tests — new `TestCompileIPsec_DanglingGatewayRejected`:
-   - VPN referencing an undefined gateway name → `Compile`/`compileIPsec`
-     returns a non-nil error (commit fails). Fails pre-fix.
-   - VPN referencing a gateway object with no address → error.
-   - VPN with inline literal IP gateway (no object) → NO error (case 3;
+   - dotted inline hostname (case 3 FQDN) → `remote_addrs =
+     peer.example.com` present.
+   - empty gateway → connection emitted, NO `remote_addrs` line.
+   - **multi-VPN skip-and-keep (R2-1 regression guard):** one healthy
+     VPN + one dangling VPN → the HEALTHY VPN's connection AND its
+     `remote_addrs` ARE present in the output; the dangling name does
+     NOT appear anywhere in `remote_addrs`; the dangling VPN has no
+     `ike-<name>` secret. This proves the healthy config is never zeroed.
+3. `pkg/config` compile tests — new
+   `TestValidateIPsecGatewayReferences`:
+   - **commit (strict) rejects:** `CompileConfig` of a tree with a VPN
+     referencing an undefined gateway → non-nil error. Fails pre-fix.
+   - strict rejects a VPN referencing an addressless gateway object.
+   - strict ACCEPTS a VPN with an inline literal IP gateway (case 3;
      mirrors `parser_security_test.go` `vpn site-a gateway 10.1.0.1`).
-   - VPN referencing a defined gateway with an address → NO error.
+   - strict ACCEPTS a VPN referencing a defined gateway with an address.
+   - **stanza-order independence (R2-2):** a tree where the `ipsec`
+     stanza is authored BEFORE the `ike` stanza, with the VPN's gateway
+     defined under `ike { gateway ... address ... }` → `CompileConfig`
+     returns NO error (proves the validator runs on the fully-compiled
+     config, not order-dependently). Fails the v2 design.
+   - **lenient load warns, does not fail (R2-2 / #1960):**
+     `CompileConfigLenient` of a tree with a dangling-gateway VPN →
+     NO error returned AND a warning recorded in `cfg.Warnings`. Proves
+     a pre-fix/peer-synced config still boots.
 4. Full `go test ./pkg/ipsec/... ./pkg/config/...` green (existing 25+
-   render tests + all parser/compiler tests must still pass — proves
-   cases 1-3,7,8 preserved and no committed-config regression).
-5. `go test ./...` green (or the affected packages + their importers).
+   render tests + all parser/compiler tests still pass — proves cases
+   1-3,7,8 preserved and no committed-config regression).
+5. `go test ./...` green (or the affected packages + their importers,
+   incl. `pkg/configstore` which uses the lenient compile entry points).
 
 ## Documentation deliverable (project docs-contract)
 
@@ -485,37 +570,43 @@ Coverage is focused, NON-TAUTOLOGICAL unit tests that FAIL pre-fix:
 
 - Validating `gw.Address` / `gw.DynamicHostname` *content* (trusted to
   the existing parser/schema for those leaves).
-- Schema-layer (`schema_walk.go`) validation — the commit gate lives in
-  the compiler (`compileIPsec`), which is sufficient and is where the
-  cross-reference data is already assembled.
+- Schema-layer (`schema_walk.go`) validation — the commit gate lives as
+  a strict-accumulator validator on the compiled `*Config`
+  (`validateIPsecGatewayReferencesStrict`), which is sufficient and is
+  where the cross-reference data is fully assembled (both `ike{}` and
+  `ipsec{}` gateways).
 - Any change to the inline-literal-IP gateway shape beyond the guard.
 - Responder-only / `%any` peer support (no such concept exists today;
-  the case-5 branch carries a comment to revisit if it is added).
+  the case-5 path carries a comment to revisit if it is added).
 
-## Open questions for adversarial review (v2)
+## Open questions for adversarial review (v3)
 
-1. **Predicate location / import cycle** — defining
-   `config.IsUsableIPsecEndpoint` and calling it from `pkg/ipsec` keeps
-   one SSOT and respects ipsec→config. Confirm no cycle and that this is
-   the cleanest placement (vs duplicating the 2-line predicate).
-2. **Commit-validator placement** — end of `compileIPsec` (after the VPN
-   loop). Confirm both `ike{gateway}` and `ipsec{gateway}` sections are
-   fully populated at that point (compileIKE runs before compileIPsec per
-   `compiler_security.go:39-44`; both write `sec.IPsec.Gateways`). Any
-   ordering hazard?
-3. **Does committing the validator break ANY existing test config?**
-   Reviewers should independently grep `parser_*_test.go` /
-   `compiler_*_test.go` for VPN gateway references and confirm all
-   resolve to a defined gateway or an inline IP (I found
-   `10.1.0.1`/`10.2.0.1`/`remote-gw` — all pass).
-4. **Skip-and-continue secrets** — when a VPN is skipped in the
-   connections loop, its `secrets{}` entry should also be skipped.
-   Confirm the secrets loop is gated by the same skip set (the plan skips
-   it). Any case where a secret is still needed for a skipped conn? (No
-   — no connection, no SA.)
-5. **`errors.Join` import + nil semantics** — `errors.Join()` with no
-   args / all-nil returns nil. Confirm the no-error path is byte-identical
-   (existing tests using `generateConfig`/`renderConfig` see nil error).
-6. **Is rejecting case 5 at commit ever wrong?** Confirmed no
-   responder-only/`%any` concept exists in the parser today; the branch
-   is commented to revisit. Reviewers: re-verify by grep.
+1. **Predicate location / import cycle** — `config.IsUsableIPsecEndpoint`
+   in `pkg/config`, called from `pkg/ipsec`. Confirm no cycle (config
+   must NOT import ipsec) and that one SSOT predicate for both layers is
+   the right call.
+2. **Validator placement** — strict-accumulator-style on the compiled
+   `*Config`, gated by `opts.lenientIPsecGatewayRefs`, mirroring
+   `validateDeviceMapStrict`. Confirm `cfg.Security.IPsec.Gateways` holds
+   BOTH `ike{}` and `ipsec{}` gateways at that point regardless of stanza
+   order, and that the lenient flag is set in BOTH `CompileConfigLenient`
+   and `CompileConfigForNodeLenient`.
+3. **Apply is genuinely unchanged AND writes healthy config** —
+   `renderConfig` does NOT return a new error for the leak case (it
+   skips+warns), so `Apply`'s `if err != nil { return err }` is never
+   tripped by the leak. Confirm this actually means the healthy config
+   reaches `WriteFileAtomic` + reload (the R2-1 fix), with no Apply edit.
+4. **Lenient load really boots** — confirm `CompileConfigLenient` /
+   `CompileConfigForNodeLenient` return nil error (warning only) for a
+   dangling-gateway VPN, so an upgraded/peer-synced node boots (#1960
+   class). Which callers use these? (`pkg/configstore`, HA `SyncApply`.)
+5. **Secrets-loop skip** — the connections loop builds `skipped
+   map[string]bool`; the secrets loop consults it. Confirm no orphan
+   `ike-<name>` secret for a skipped connection, and that no healthy VPN
+   is wrongly skipped.
+6. **Existing test configs** — independently grep `parser_*_test.go` /
+   `compiler_*_test.go` for VPN gateway references; confirm all resolve
+   to a defined+addressed gateway or an inline IP (so neither layer
+   regresses a committed config).
+7. **Is rejecting case 5 ever wrong?** No responder-only/`%any` concept
+   in the parser today; re-verify by grep.
