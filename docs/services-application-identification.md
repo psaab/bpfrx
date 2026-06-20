@@ -99,7 +99,13 @@ runtime effect is the L3/L4 catalog classification above
   for port-based matching; a session matching it is stamped
   with this application's `app_id`.
 - `applications application-set` — expands into individual
-  applications at compile time.
+  applications at compile time. Members may be either
+  `application <name>` references or nested
+  `application-set <name>` references; `ExpandApplicationSet`
+  recurses into nested sets (max depth 3) so a policy matching a
+  parent set also matches applications defined only in a nested
+  child set. (Before #2068 the compiler silently dropped nested
+  `application-set` members, so such a policy under-matched.)
 
 These config paths are accepted with NO runtime effect today
 (parse-only):
