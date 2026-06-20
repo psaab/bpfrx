@@ -81,6 +81,44 @@
   scripts/image/xpf-grow-root.service, scripts/image/test-grow-root.sh,
   scripts/image/bake.py, scripts/image/validate.py,
   docs/install-images.md, docs/image-validation.md
+## 2026-06-19 — #2033 Codex round-4: unify the changed-config restart through releaseDrain
+
+- **Timestamp**: 2026-06-19
+- **Action**: The round-3 `releaseDrain` discipline was correct, but the
+  changed-config restart kept a DIVERGENT inline copy of the stop-then-act
+  logic that re-introduced two of the exact bugs releaseDrain fixed: on a join
+  TIMEOUT it (MAJOR 1) still read `oldS.goodbyeEmitted` unordered and emitted a
+  standalone, and (MAJOR 2) fell through to `startLocked` while the old conn may
+  be live (2 live conns). Unified: `releaseDrain(name, s, startEpoch,
+  onProvenClose)` is now the SOLE "stop → emit-exactly-once → start-on-proven-
+  close → release" path, used by Withdraw/WithdrawInterfaces/Clear/Apply-removal
+  (onProvenClose=nil) AND the Apply changed-config restart (onProvenClose =
+  startLocked closure). The replacement opens ONLY on the proven-closed
+  (`<-stopped`) arm, under m.mu, tombstone held, and only if epoch unchanged AND
+  no goodbye wanted. On TIMEOUT it emits nothing, starts nothing, LEAVES the
+  tombstone held (so a future Apply defers, never 2 conns), and detaches
+  `reclaimTombstoneWhenStopped` to remove it once the wedged owner exits.
+  Deleted the inline restart block. Audited: no other stop-then-act path remains
+  (the only other `.stopped` join is the reclaim cleanup which never emits/
+  starts; `applyDeferred`'s startLocked runs only AFTER a tombstone is gone =
+  proven closed). `claimWaitTimeout` already a package-var seam.
+- **File(s)**: pkg/ra/ra.go, pkg/ra/README.md, _Log.md
+
+- **Timestamp**: 2026-06-19
+- **Action**: Added two round-4 restart-timeout regression tests to
+  `pkg/ra/serialize_test.go`. `TestRestartTimeoutNoGoodbyeNoReplacement` —
+  changed-config restart whose old sender WEDGES + a racing graceful Withdraw +
+  join timeout → asserts NO standalone goodbye AND no replacement started AND
+  tombstone left held (reclaimed after the owner exits).
+  `TestRestartTimeoutNoReplacementWhenNoGoodbye` — wedged restart timeout, no
+  goodbye wanted → asserts peak live-conn ≤ 1 (replacement never opens while the
+  old conn may be live). Both mutation-verified to FAIL against the old inline-
+  timeout fall-through (MAJOR 1 emits a goodbye; MAJOR 2 reaches peak 2 conns).
+  Updated TestRace2's assertion to the new timeout-leaves-tombstone-held +
+  reclaim-on-exit behavior. Kept Race1/Race3/Race2 + T7c/T2b/T7d/T1/T2a/T7b +
+  ≤1-conn invariant.
+- **File(s)**: pkg/ra/serialize_test.go, _Log.md
+
 ## 2026-06-19 — #2033 Codex round-3: structural claim-and-hold for the goodbye
 
 - **Timestamp**: 2026-06-19

@@ -1401,7 +1401,10 @@ func TestRace1_ConcurrentWithdrawsExactlyOneGoodbye(t *testing.T) {
 	wg.Wait() // both Withdraws have flipped goodbyeWanted (they own no release)
 
 	// The single owner releases the entry: claim-once -> exactly one standalone.
-	m.releaseDrain("lo", s)
+	m.mu.Lock()
+	ep := m.epoch
+	m.mu.Unlock()
+	m.releaseDrain("lo", s, ep, nil)
 
 	total, conns := fl.goodbyeStats("lo")
 	if conns != 1 || total != goodbyeCount {
@@ -1462,12 +1465,13 @@ func TestRace3_ApplyDuringStandaloneEmitDefersNoClobber(t *testing.T) {
 	}
 	m.mu.Lock()
 	m.draining["lo"] = &drainEntry{sender: s, cfg: s.cfg, goodbyeWanted: true}
+	ep := m.epoch
 	m.mu.Unlock()
 
 	// Release the held tombstone via releaseDrain (the sole owner). It must emit
 	// the standalone WHILE holding the entry — the gated write blocks it there.
 	relDone := make(chan struct{})
-	go func() { m.releaseDrain("lo", s); close(relDone) }()
+	go func() { m.releaseDrain("lo", s, ep, nil); close(relDone) }()
 
 	select {
 	case <-standaloneBlocking:
@@ -1555,6 +1559,7 @@ func TestRace2_TimeoutDoesNotEmitWhileOwnerCouldBeLive(t *testing.T) {
 	delete(m.senders, "lo")
 	m.draining["lo"] = &drainEntry{sender: s, cfg: s.cfg, goodbyeWanted: true}
 	s.signalStop(modeHard)
+	ep := m.epoch
 	m.mu.Unlock()
 
 	orig := claimWaitTimeout
@@ -1562,7 +1567,7 @@ func TestRace2_TimeoutDoesNotEmitWhileOwnerCouldBeLive(t *testing.T) {
 	defer func() { claimWaitTimeout = orig }()
 
 	done := make(chan struct{})
-	go func() { m.releaseDrain("lo", s); close(done) }()
+	go func() { m.releaseDrain("lo", s, ep, nil); close(done) }()
 	select {
 	case <-done:
 	case <-time.After(3 * time.Second):
@@ -1576,12 +1581,193 @@ func TestRace2_TimeoutDoesNotEmitWhileOwnerCouldBeLive(t *testing.T) {
 			"be live) — got %d conns / %d writes; expected 0 (#2033 race 2)",
 			conns, total)
 	}
-	// Tombstone removed (entry released) despite no emit.
+	// Tombstone is LEFT HELD after a timeout (the owner may still hold a live
+	// conn — a future Apply must defer, never open a 2nd conn). A detached
+	// reclaimer removes it only once the wedged owner finally exits.
 	m.mu.Lock()
 	_, stillDraining := m.draining["lo"]
 	m.mu.Unlock()
-	if stillDraining {
-		t.Fatal("releaseDrain left the tombstone after the timeout")
+	if !stillDraining {
+		t.Fatal("releaseDrain removed the tombstone after a timeout; it must be "+
+			"LEFT HELD (owner may still hold a live conn) — #2033 round-4")
 	}
-	close(wedge) // unwedge the parked owner so the goroutine can exit
+
+	// Now let the wedged owner exit; the reclaimer must remove the tombstone.
+	close(wedge)
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		m.mu.Lock()
+		_, ok := m.draining["lo"]
+		m.mu.Unlock()
+		if !ok {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("reclaimer did not remove the tombstone after the owner exited")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+}
+
+// --- #2033 round-4: changed-config restart shares releaseDrain's discipline ---
+
+// TestRestartTimeoutNoGoodbyeNoReplacement (round-4 MAJOR 1+2): a changed-config
+// Apply whose OLD sender WEDGES (never closes stopped) must, on the join
+// timeout, NOT emit a standalone goodbye (even with a racing graceful Withdraw
+// that flipped goodbyeWanted — the read would be unordered, owner may be live)
+// AND must NOT start the replacement (the old conn may be live → would break
+// ≤1-conn). The tombstone is LEFT HELD.
+//
+// NON-TAUTOLOGY: against head 5d7ef206 the inline restart read oldS.goodbyeEmitted
+// after the timeout and emitted a standalone (MAJOR 1) — so a goodbye would
+// appear here → FAILS.
+func TestRestartTimeoutNoGoodbyeNoReplacement(t *testing.T) {
+	if _, err := net.InterfaceByName("lo"); err != nil {
+		t.Skip("lo interface unavailable")
+	}
+	fl := newFakeListen(t)
+	m := New()
+	if err := m.Apply([]*config.RAInterfaceConfig{testCfg("lo")}); err != nil {
+		t.Fatalf("initial Apply: %v", err)
+	}
+	old := waitConn(t, fl.getConn, "lo")
+	waitWrites(t, old, 1)
+
+	// WEDGE the old sender: its conn.Close blocks forever, so its `stopped`
+	// never closes and the restart join will TIME OUT.
+	wedge := make(chan struct{})
+	old.setBeforeClose(func() { <-wedge })
+
+	orig := claimWaitTimeout
+	claimWaitTimeout = 150 * time.Millisecond
+	defer func() { claimWaitTimeout = orig }()
+
+	// Changed-config Apply (restart) runs concurrently; it will hard-stop the
+	// old sender and block joining it (wedged) until the short timeout.
+	applyDone := make(chan error, 1)
+	go func() {
+		applyDone <- m.Apply([]*config.RAInterfaceConfig{configChanged("lo")})
+	}()
+
+	// Race a graceful Withdraw in to flip goodbyeWanted on the restart entry.
+	// Poll until the restart tombstone exists, then Withdraw.
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		m.mu.Lock()
+		_, draining := m.draining["lo"]
+		m.mu.Unlock()
+		if draining {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("restart never installed the tombstone")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	_ = m.Withdraw() // flips goodbyeWanted on the (wedged) restart entry
+
+	// Apply returns after the join timeout.
+	select {
+	case <-applyDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("changed-config Apply did not return after the join timeout")
+	}
+
+	// No standalone goodbye on the timeout path (owner could be live).
+	total, conns := fl.goodbyeStats("lo")
+	if conns != 0 || total != 0 {
+		t.Fatalf("restart timeout emitted a goodbye (%d conns / %d writes); "+
+			"the timeout path must NOT read goodbyeEmitted/emit — #2033 round-4 MAJOR 1",
+			conns, total)
+	}
+	// No replacement started while the old conn may be live; ≤1 live conn.
+	m.mu.Lock()
+	_, live := m.senders["lo"]
+	m.mu.Unlock()
+	if live {
+		t.Fatal("restart timeout started a replacement sender while the old conn "+
+			"may be live — #2033 round-4 MAJOR 2 (≤1-conn)")
+	}
+	if lc := fl.liveCount(); lc > 1 {
+		t.Fatalf(">1 live conn after restart timeout (%d) — #2033 round-4 MAJOR 2", lc)
+	}
+	// Tombstone is left held; reclaimed once the wedged owner exits.
+	m.mu.Lock()
+	_, stillDraining := m.draining["lo"]
+	m.mu.Unlock()
+	if !stillDraining {
+		t.Fatal("restart timeout removed the tombstone; it must be LEFT HELD")
+	}
+	close(wedge) // let the owner exit so the reclaimer + test can finish
+}
+
+// TestRestartTimeoutNoReplacementWhenNoGoodbye (round-4 MAJOR 2): the same
+// wedged-old-sender restart timeout, but with NO racing Withdraw (no goodbye
+// wanted). startLocked must still NOT run while the old conn may be live — the
+// replacement opens ONLY on the proven-closed arm. ≤1 live conn always.
+//
+// NON-TAUTOLOGY: against head 5d7ef206 the inline restart fell through to
+// startLocked(cfg) after the timeout (MAJOR 2) → a replacement conn opened while
+// the old one was still live → >1 live conn → FAILS.
+func TestRestartTimeoutNoReplacementWhenNoGoodbye(t *testing.T) {
+	if _, err := net.InterfaceByName("lo"); err != nil {
+		t.Skip("lo interface unavailable")
+	}
+	fl := newFakeListen(t)
+	m := New()
+	if err := m.Apply([]*config.RAInterfaceConfig{testCfg("lo")}); err != nil {
+		t.Fatalf("initial Apply: %v", err)
+	}
+	old := waitConn(t, fl.getConn, "lo")
+	waitWrites(t, old, 1)
+
+	wedge := make(chan struct{})
+	old.setBeforeClose(func() { <-wedge })
+
+	orig := claimWaitTimeout
+	claimWaitTimeout = 150 * time.Millisecond
+	defer func() { claimWaitTimeout = orig }()
+
+	// Sample the live-conn count throughout to catch a transient 2-conn window.
+	var peak int32
+	stopSampling := make(chan struct{})
+	sampleDone := make(chan struct{})
+	go func() {
+		defer close(sampleDone)
+		for {
+			select {
+			case <-stopSampling:
+				return
+			default:
+			}
+			if lc := fl.liveCount(); lc > peak {
+				peak = lc
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}()
+
+	err := m.Apply([]*config.RAInterfaceConfig{configChanged("lo")})
+	_ = err // restart aborts on timeout; not necessarily an error
+
+	close(stopSampling)
+	<-sampleDone
+
+	if peak > 1 {
+		t.Fatalf("peak live conns = %d during a wedged restart timeout; the "+
+			"replacement must open ONLY after the old conn is proven closed "+
+			"(≤1-conn) — #2033 round-4 MAJOR 2", peak)
+	}
+	m.mu.Lock()
+	_, live := m.senders["lo"]
+	m.mu.Unlock()
+	if live {
+		t.Fatal("restart timeout started a replacement while the old conn may be live")
+	}
+	// No goodbye for a pure (no-withdraw) restart.
+	total, conns := fl.goodbyeStats("lo")
+	if conns != 0 || total != 0 {
+		t.Fatalf("pure restart emitted a goodbye (%d conns / %d writes); expected 0", conns, total)
+	}
+	close(wedge)
 }

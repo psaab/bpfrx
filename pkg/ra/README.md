@@ -59,16 +59,33 @@ after HA failover. To make that **structural**, not flag-defended:
       the standalone never clobbers a re-claimed master and ≤1 live conn holds.
       The tombstone IS the mutual exclusion; there is no separate check-then-act
       on `m.senders`.
-    - **Timeout never emits (closes the happens-before break):** `releaseDrain`
-      reads `goodbyeEmitted` ONLY after a successful `<-stopped`. If the join
-      times out (`claimWaitTimeout` — pathological, since owner writes are
-      bounded by `SetWriteDeadline`), it logs and does NOT emit a standalone
-      (the owner may still be live; the read would be unordered). We accept a
-      theoretical dropped goodbye on a wedged owner over a double-send/clobber.
+    - **Timeout never emits AND never starts a replacement (closes the
+      happens-before break AND the ≤1-conn break on the restart path):**
+      `releaseDrain` reads `goodbyeEmitted` ONLY after a successful `<-stopped`.
+      If the join times out (`claimWaitTimeout` — pathological, since owner
+      writes are bounded by `SetWriteDeadline`), it does NOT emit a standalone
+      (the read would be unordered; the owner may be live) AND does NOT start
+      the changed-config replacement (the old conn may still be live → would
+      break ≤1-conn). It LEAVES the tombstone held — so any future
+      `Apply`/reconcile defers, never opening a second conn — and detaches a
+      reclaimer that removes the tombstone once the wedged owner finally exits.
+      The safe degraded state is "old sender lingers, no replacement, tombstone
+      held," never two conns and never an unordered emit.
   Net: EXACTLY ONE goodbye per withdrawn interface — the owner's if the
   upgrade landed, otherwise one standalone — and ZERO for a pure changed-config
   replace. Because the owner closes the conn AFTER its goodbye, a racing hard
   close cannot suppress it.
+- **Single stop-then-act path (round-4 unification).** `releaseDrain` is the
+  SOLE owner of "stop the old sender (join-or-timeout) → optionally emit
+  exactly-once → optionally start a replacement on PROVEN-close → release
+  tombstone." `Withdraw`, `WithdrawInterfaces`, `Clear` and `Apply` (both the
+  removal and the changed-config **restart**) all route through it. The restart
+  passes an `onProvenClose` callback that opens the replacement conn — it runs
+  ONLY on the proven-closed (`<-stopped`) arm, under `m.mu`, with the tombstone
+  still held, and only if no graceful withdraw superseded the replace (epoch
+  unchanged AND no goodbye wanted). There is no divergent inline copy of these
+  rules, so the timeout / happens-before / ≤1-conn class cannot reappear in a
+  third path.
 - **Draining tombstone — one live conn per interface, including replaces.**
   Every transition that removes OR replaces a sender installs a
   per-interface DRAINING tombstone under the manager mutex BEFORE releasing

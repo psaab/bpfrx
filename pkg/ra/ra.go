@@ -94,51 +94,67 @@ func (m *Manager) interfaceBusy(name string) bool {
 	return ok
 }
 
-// releaseDrain is the SINGLE exit path for a draining sender (#2033 structural
-// fix). The caller is the sole owner of name's drainEntry and has just stopped
-// the sender. releaseDrain joins the sender (ordered read of goodbyeEmitted),
-// then under m.mu decides — claim-once — whether a standalone goodbye is owed;
-// if so it marks the entry claimed, HOLDS it, emits the standalone OUTSIDE the
-// lock (so a concurrent Apply keeps deferring for the whole emit — no clobber),
-// then removes the entry. If no goodbye is owed it removes the entry directly.
+// releaseDrain is the SINGLE exit path for a draining sender, used by Withdraw,
+// Clear, Apply removal AND Apply's changed-config restart (#2033 structural fix;
+// round-4 unification). The caller is the sole owner of name's drainEntry and
+// has just signalled the sender to stop. releaseDrain owns the whole
+// "stop the old sender (join-or-timeout) → optionally emit exactly-once →
+// optionally start a replacement on PROVEN-close → release tombstone" sequence,
+// so no divergent inline copy of these rules can drift (closes round-4 MAJOR
+// 1 + 2). Must be called WITHOUT m.mu held.
 //
-// Timeout discipline (closes race 2): goodbyeEmitted is read ONLY after a
-// successful <-stopped. If the join times out (the owner is wedged despite the
-// bounded SetWriteDeadline — something is badly wrong), releaseDrain does NOT
-// emit a standalone (it cannot safely read goodbyeEmitted, and the owner may
-// still be live); it logs and removes the entry. We accept a theoretical
-// dropped goodbye on a pathological hang over a double-send/clobber.
+//   - onProvenClose, if non-nil, is the changed-config replacement starter. It
+//     runs ONLY on the proven-closed (<-stopped) arm, while the tombstone is
+//     still HELD (a concurrent Apply defers), and ONLY if no graceful withdraw
+//     superseded the replace (epoch unchanged AND no goodbye wanted). It opens
+//     the replacement conn — guaranteed AFTER the old conn is proven closed
+//     (≤1 live conn). It runs under m.mu and returns any start error.
+//   - startEpoch is the manager epoch captured by the caller when it claimed the
+//     interface; a changed epoch means a newer Withdraw/Clear/Apply superseded
+//     this op, so the replacement is aborted.
 //
-// Must be called WITHOUT m.mu held. s may be nil only for a pure standalone
-// claim that never had a sender (handled by emitStandaloneClaimed directly).
-func (m *Manager) releaseDrain(name string, s *sender) {
-	joined := false
+// Timeout discipline (closes race 2 AND round-4 MAJOR 1/2): goodbyeEmitted is
+// read ONLY after a successful <-stopped. On a join TIMEOUT (owner wedged
+// despite bounded SetWriteDeadline) releaseDrain does NOT read goodbyeEmitted,
+// does NOT emit a standalone, and does NOT start the replacement — the old conn
+// may still be live, so opening a replacement would break ≤1-conn and an emit
+// would be unordered. It LEAVES the tombstone in place (so any future
+// Apply/reconcile defers — never 2 conns) and starts a detached reclaimer that
+// removes the tombstone once the wedged owner finally exits. The degraded
+// state is "old sender lingers, no replacement, tombstone held" — never 2
+// conns, never an unordered emit, never a dropped-into-double goodbye.
+func (m *Manager) releaseDrain(name string, s *sender, startEpoch uint64, onProvenClose func() error) error {
 	if s != nil {
 		select {
 		case <-s.stopped:
-			joined = true
+			// proven closed — fall through to the ordered decision below.
 		case <-time.After(claimWaitTimeout):
 			slog.Warn("ra: timed out joining draining sender; not emitting a "+
-				"standalone goodbye (owner may still be live)", "interface", name)
+				"standalone goodbye and not starting a replacement (owner may "+
+				"still hold a live conn); leaving tombstone held", "interface", name)
+			m.reclaimTombstoneWhenStopped(name, s)
+			return nil
 		}
 	}
 
+	// Proven closed (or s==nil). Decide the goodbye claim-once under m.mu.
 	m.mu.Lock()
 	e := m.draining[name]
 	if e == nil {
-		// Should not happen (owner holds it), but be defensive.
 		m.mu.Unlock()
-		return
+		return nil // defensive; owner holds it
 	}
 	emit := false
-	if joined && e.goodbyeWanted && !e.goodbyeClaimed && s != nil &&
-		!s.goodbyeEmitted.Load() {
-		// The owner emitted no goodbye but one was wanted: claim it ONCE and
-		// keep the entry held across the emit below.
+	if e.goodbyeWanted && !e.goodbyeClaimed && s != nil && !s.goodbyeEmitted.Load() {
 		e.goodbyeClaimed = true
 		emit = true
 	}
 	cfg := e.cfg
+	// A replacement starts ONLY if nothing superseded the replace: epoch
+	// unchanged AND no goodbye was wanted (a graceful withdraw overrides a
+	// replace — the route is being withdrawn, not replaced).
+	superseded := m.epoch != startEpoch
+	startReplacement := onProvenClose != nil && !superseded && !e.goodbyeWanted
 	m.mu.Unlock()
 
 	if emit {
@@ -149,9 +165,36 @@ func (m *Manager) releaseDrain(name string, s *sender) {
 		}
 	}
 
+	var startErr error
 	m.mu.Lock()
+	if startReplacement {
+		// Old conn is PROVEN closed and the tombstone is still held → safe to
+		// open the replacement (≤1 live conn) before releasing.
+		startErr = onProvenClose()
+	}
 	delete(m.draining, name)
 	m.mu.Unlock()
+	return startErr
+}
+
+// reclaimTombstoneWhenStopped detaches a goroutine that waits for a wedged
+// owner to finally exit, then removes its tombstone under m.mu. This self-heals
+// the degraded "tombstone held forever after a join timeout" state without ever
+// opening a second conn while the old one may be live. No goodbye and no
+// replacement are emitted/started here — the timeout already declined both.
+func (m *Manager) reclaimTombstoneWhenStopped(name string, s *sender) {
+	go func() {
+		<-s.stopped
+		m.mu.Lock()
+		// Only remove if it is still the SAME entry we left (a newer call may
+		// have replaced it; that newer owner manages its own lifecycle).
+		if e := m.draining[name]; e != nil && e.sender == s {
+			delete(m.draining, name)
+			slog.Info("ra: reclaimed tombstone after wedged owner finally exited",
+				"interface", name)
+		}
+		m.mu.Unlock()
+	}()
 }
 
 // Apply diffs the current senders against the desired set and starts/stops/
@@ -255,85 +298,31 @@ func (m *Manager) Apply(configs []*config.RAInterfaceConfig) error {
 	epoch := m.epoch
 	m.mu.Unlock()
 
-	restartSet := make(map[string]struct{}, len(toRestart))
+	restartSet := make(map[string]*config.RAInterfaceConfig, len(toRestart))
 	for _, cfg := range toRestart {
-		restartSet[cfg.Interface] = struct{}{}
+		restartSet[cfg.Interface] = cfg
 	}
 
-	// REMOVAL tombstones (no replacement): release each via releaseDrain, which
-	// joins the sender and — if a racing graceful Withdraw flipped goodbyeWanted
-	// — emits a standalone goodbye while holding the entry, then removes it.
+	// All stopped (removal AND changed-config restart) senders go through the
+	// SAME releaseDrain discipline (round-4 unification): join-or-timeout →
+	// exactly-once goodbye if owed → for a restart, start the replacement ONLY
+	// on the proven-closed arm while the tombstone is held (≤1 live conn) and
+	// only if a graceful withdraw did not supersede the replace. A removal
+	// passes onProvenClose=nil (no replacement).
 	for _, req := range toStop {
-		if _, isRestart := restartSet[req.name]; isRestart {
-			continue // restart entries are handled below (keep them held)
-		}
-		m.releaseDrain(req.name, req.s)
-	}
-
-	// RESTART tombstones (changed config): join the old sender, then either
-	// start the replacement (pure replace, no goodbye) or — if a graceful
-	// Withdraw superseded us (epoch changed AND goodbyeWanted) — emit a
-	// standalone goodbye via the release path and do NOT start a replacement.
-	for _, cfg := range toRestart {
-		name := cfg.Interface
-		// Find the old sender we stopped for this restart.
-		var oldS *sender
-		for _, req := range toStop {
-			if req.name == name {
-				oldS = req.s
-				break
-			}
-		}
-		// Join the old sender first (ordered; conn closed) before deciding.
-		if oldS != nil {
-			select {
-			case <-oldS.stopped:
-			case <-time.After(claimWaitTimeout):
-				slog.Warn("ra: timed out joining old sender for restart",
-					"interface", name)
-			}
-		}
-
-		m.mu.Lock()
-		e := m.draining[name]
-		superseded := m.epoch != epoch
-		wantGoodbye := e != nil && e.goodbyeWanted
-		if superseded || wantGoodbye {
-			// A newer call (graceful Withdraw / Clear) owns this interface's
-			// fate; do NOT start the replacement. If a goodbye is wanted and the
-			// old sender emitted none, claim it ONCE and hold the entry across
-			// the emit.
-			emit := false
-			if e != nil && e.goodbyeWanted && !e.goodbyeClaimed &&
-				oldS != nil && !oldS.goodbyeEmitted.Load() {
-				e.goodbyeClaimed = true
-				emit = true
-			}
-			var cfgEmit *config.RAInterfaceConfig
-			if e != nil {
-				cfgEmit = e.cfg
-			}
-			m.mu.Unlock()
-			if emit {
-				slog.Info("ra: restart superseded by withdraw; emitting "+
-					"standalone goodbye (claim held)", "interface", name)
-				if cfgEmit != nil {
-					m.sendOneGoodbye(cfgEmit)
+		name := req.name
+		var onProvenClose func() error
+		if cfg, isRestart := restartSet[name]; isRestart {
+			cfg := cfg // capture
+			onProvenClose = func() error {
+				// Runs under m.mu, tombstone held, old conn proven closed.
+				if err := m.startLocked(cfg); err != nil {
+					return err
 				}
-			} else {
-				slog.Debug("ra: restart superseded, no goodbye owed",
-					"interface", name)
+				return nil
 			}
-			m.mu.Lock()
-			delete(m.draining, name)
-			m.mu.Unlock()
-			continue
 		}
-		// Pure replace: start the new sender, drop the tombstone.
-		err := m.startLocked(cfg)
-		delete(m.draining, name)
-		m.mu.Unlock()
-		if err != nil && firstErr == nil {
+		if err := m.releaseDrain(name, req.s, epoch, onProvenClose); err != nil && firstErr == nil {
 			firstErr = err
 		}
 	}
@@ -453,9 +442,11 @@ func (m *Manager) Withdraw() error {
 		names = append(names, name)
 	}
 	owned := m.claimGracefulLocked(names)
+	epoch := m.epoch
 	m.mu.Unlock()
 	for _, o := range owned {
-		m.releaseDrain(o.name, o.s)
+		// nil onProvenClose: a withdraw never starts a replacement.
+		m.releaseDrain(o.name, o.s, epoch, nil)
 	}
 	return nil
 }
@@ -466,9 +457,10 @@ func (m *Manager) WithdrawInterfaces(names []string) {
 	m.mu.Lock()
 	m.bumpEpoch()
 	owned := m.claimGracefulLocked(names)
+	epoch := m.epoch
 	m.mu.Unlock()
 	for _, o := range owned {
-		m.releaseDrain(o.name, o.s)
+		m.releaseDrain(o.name, o.s, epoch, nil)
 	}
 }
 
@@ -632,14 +624,16 @@ func (m *Manager) clearLocked() error {
 		s.signalStop(modeHard)
 		ps = append(ps, pending{name, s})
 	}
+	epoch := m.epoch
 
 	// Join + release each OUTSIDE the lock so Clear of many interfaces does not
 	// stall other callers; re-acquire before returning (caller expects m.mu
 	// held). releaseDrain handles the claim-once + held-across-emit standalone
-	// goodbye if a racing Withdraw wanted one.
+	// goodbye if a racing Withdraw wanted one. nil onProvenClose: Clear never
+	// starts a replacement.
 	m.mu.Unlock()
 	for _, p := range ps {
-		m.releaseDrain(p.name, p.s)
+		m.releaseDrain(p.name, p.s, epoch, nil)
 	}
 	m.mu.Lock()
 	return nil
