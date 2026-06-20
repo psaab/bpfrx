@@ -535,6 +535,19 @@
   pkg/dhcpserver/ddns_state.go, pkg/dhcpserver/ddns_test.go,
   pkg/dhcpserver/README.md, docs/config-schema.md, _Log.md
 
+## 2026-06-20 — #1387 DDNS review follow-up
+
+- **Timestamp**: 2026-06-20
+- **Action**: Address Copilot review on the DDNS increment-1 core. Make the
+  reconciler preserve the documented clean-old-owner-before-new ordering by
+  suppressing replacement upserts when the old owned delete fails, so the
+  next reconcile retries cleanup first. Teach the state-aware Kea lease
+  parser to use `fqdn_fwd` to distinguish the host-name option from a
+  client-supplied FQDN, and extend the DDNS unit tests to cover both
+  behaviors.
+- **File(s)**: pkg/dhcpserver/ddns.go, pkg/dhcpserver/ddns_leases.go,
+  pkg/dhcpserver/ddns_test.go, pkg/dhcpserver/README.md, _Log.md
+
 ## 2026-06-19 — #2000 review follow-up on postinst test harness
 
 - **Timestamp**: 2026-06-19

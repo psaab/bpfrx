@@ -206,6 +206,9 @@ func (m *DDNSManager) Reconcile(ctx context.Context, cfg *config.DHCPServerConfi
 // leases + a fakeUpdater.
 func (m *DDNSManager) reconcileOnceLocked(ctx context.Context, pol ddnsPolicy, leases []ddnsLease) error {
 	source := hostnameSourceFor(&pol)
+	blockedIdentity := map[string]struct{}{}
+	blockedAddress := map[string]struct{}{}
+	blockedFQDN := map[string]struct{}{}
 
 	// desired[key] = the record we want owned for that identity+address.
 	type desired struct {
@@ -272,6 +275,9 @@ func (m *DDNSManager) reconcileOnceLocked(ctx context.Context, pol ddnsPolicy, l
 		// EXACT owned tuple — never anything not in the store.
 		if err := m.deleteOwnedLocked(ctx, owned); err != nil {
 			noteErr(err)
+			blockedIdentity[owned.Identity] = struct{}{}
+			blockedAddress[owned.Address] = struct{}{}
+			blockedFQDN[owned.FQDN] = struct{}{}
 			// leave it in the store so a later reconcile retries the
 			// delete (bounded by the loop cadence; never wedges).
 			continue
@@ -282,6 +288,15 @@ func (m *DDNSManager) reconcileOnceLocked(ctx context.Context, pol ddnsPolicy, l
 	// in its current exact form.
 	for _, d := range want {
 		if d.seen {
+			continue
+		}
+		if _, blocked := blockedIdentity[d.ow.Identity]; blocked {
+			continue
+		}
+		if _, blocked := blockedAddress[d.ow.Address]; blocked {
+			continue
+		}
+		if _, blocked := blockedFQDN[d.ow.FQDN]; blocked {
 			continue
 		}
 		if err := m.upsertLocked(ctx, d.rec, d.ow); err != nil {

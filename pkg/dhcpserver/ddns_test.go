@@ -299,6 +299,49 @@ func TestReconcileAddressReassignedToNewClient(t *testing.T) {
 	}
 }
 
+func TestReconcileDeleteFailureBlocksReplacementUpsert(t *testing.T) {
+	up := newFakeUpdater()
+	m := testDDNS(t, up)
+	pol := enabledPolicy()
+	if err := runReconcile(t, m, pol, []ddnsLease{leaseV4("10.0.0.10", "mac:aa", "host-a")}); err != nil {
+		t.Fatal(err)
+	}
+
+	up.upserts = nil
+	up.deletes = nil
+	up.failDel["host-a.example.com"] = true
+	err := runReconcile(t, m, pol, []ddnsLease{leaseV4("10.0.0.10", "mac:bb", "host-b")})
+	if err == nil {
+		t.Fatal("expected delete failure")
+	}
+	if n := len(up.upserts); n != 0 {
+		t.Fatalf("replacement upserted despite failed cleanup: %v", up.upsertNames())
+	}
+	if n := len(up.deletes); n != 0 {
+		t.Fatalf("unexpected successful delete despite injected failure: %v", up.deleteNames())
+	}
+	if m.deleteFail.Load() != 1 {
+		t.Fatalf("deleteFail = %d, want 1", m.deleteFail.Load())
+	}
+	if _, ok := m.state.get("mac:aa", "10.0.0.10"); !ok {
+		t.Fatal("old ownership entry dropped after failed delete")
+	}
+
+	delete(up.failDel, "host-a.example.com")
+	if err := runReconcile(t, m, pol, []ddnsLease{leaseV4("10.0.0.10", "mac:bb", "host-b")}); err != nil {
+		t.Fatalf("retry reconcile: %v", err)
+	}
+	if got := up.deleteNames(); !equalStr(got, []string{"host-a.example.com=10.0.0.10"}) {
+		t.Fatalf("retry cleanup delete calls = %v", got)
+	}
+	if m.deleteOK.Load() != 1 {
+		t.Fatalf("deleteOK = %d, want 1", m.deleteOK.Load())
+	}
+	if got := up.upsertNames(); !equalStr(got, []string{"host-b.example.com=10.0.0.10"}) {
+		t.Fatalf("replacement upserts = %v", got)
+	}
+}
+
 // TestReconcileNeverDeletesNonOwned proves the cardinal-sin boundary: a
 // record that was never recorded as owned is never deleted, even when a
 // lease for that address/name disappears between reconciles. We seed the
@@ -416,10 +459,10 @@ func TestParseActiveLeases4FiltersStateAndExpiry(t *testing.T) {
 	// expire epoch far in the future for active rows; a past epoch for the
 	// stale row. now = 1_700_000_000.
 	writeCSV(t, path, `address,hwaddr,client_id,valid_lifetime,expire,subnet_id,fqdn_fwd,fqdn_rev,hostname,state
-10.0.0.10,aa:bb:cc:dd:ee:01,,3600,1900000000,1,1,1,host-a,0
-10.0.0.11,aa:bb:cc:dd:ee:02,,3600,1900000000,1,1,1,host-b,1
-10.0.0.12,aa:bb:cc:dd:ee:03,,3600,1900000000,1,1,1,host-c,2
-10.0.0.13,aa:bb:cc:dd:ee:04,,3600,1600000000,1,1,1,host-d,0
+10.0.0.10,aa:bb:cc:dd:ee:01,,3600,1900000000,1,0,1,host-a,0
+10.0.0.11,aa:bb:cc:dd:ee:02,,3600,1900000000,1,0,1,host-b,1
+10.0.0.12,aa:bb:cc:dd:ee:03,,3600,1900000000,1,0,1,host-c,2
+10.0.0.13,aa:bb:cc:dd:ee:04,,3600,1600000000,1,0,1,host-d,0
 `)
 	now := time.Unix(1_700_000_000, 0)
 	leases, err := parseActiveLeases4(path, now)
@@ -449,6 +492,28 @@ func TestParseActiveLeases4ClientIDPreferred(t *testing.T) {
 	}
 	if len(leases) != 1 || leases[0].Identity != "cid:01aabbcc" {
 		t.Fatalf("client-id not preferred: %+v", leases)
+	}
+}
+
+func TestParseActiveLeases4FQDNForwardFlagSplitsNameSource(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "leases4.csv")
+	writeCSV(t, path, `address,hwaddr,client_id,valid_lifetime,expire,subnet_id,fqdn_fwd,hostname,state
+10.0.0.10,aa:bb:cc:dd:ee:01,,3600,1900000000,1,0,host-a,0
+10.0.0.11,aa:bb:cc:dd:ee:02,,3600,1900000000,1,1,client.example.com,0
+`)
+	leases, err := parseActiveLeases4(path, time.Unix(1_700_000_000, 0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(leases) != 2 {
+		t.Fatalf("want 2 active leases, got %d: %+v", len(leases), leases)
+	}
+	if leases[0].HostName != "host-a" || leases[0].ClientFQDN != "" {
+		t.Fatalf("hostname row parsed wrong: %+v", leases[0])
+	}
+	if leases[1].HostName != "" || leases[1].ClientFQDN != "client.example.com" {
+		t.Fatalf("fqdn row parsed wrong: %+v", leases[1])
 	}
 }
 

@@ -120,12 +120,13 @@ func parseActiveLeases(path string, family int, now time.Time) ([]ddnsLease, err
 			continue
 		}
 
+		hostName, clientFQDN := splitLeaseNames(get(fields, "hostname"), get(fields, "fqdn_fwd"))
 		l := ddnsLease{
 			Family:     family,
 			Address:    addr,
 			SubnetID:   get(fields, "subnet_id"),
-			HostName:   get(fields, "hostname"),
-			ClientFQDN: get(fields, "hostname"), // memfile carries one name; fqdn_fwd flags whether the client supplied it
+			HostName:   hostName,
+			ClientFQDN: clientFQDN,
 			Expire:     expire,
 		}
 		if family == 6 {
@@ -148,6 +149,16 @@ func parseActiveLeases(path string, family int, now time.Time) ([]ddnsLease, err
 		out = append(out, l)
 	}
 	return out, nil
+}
+
+func splitLeaseNames(hostname, fqdnFwd string) (hostName, clientFQDN string) {
+	if hostname == "" {
+		return "", ""
+	}
+	if v, err := strconv.Atoi(fqdnFwd); err == nil && v != 0 {
+		return "", hostname
+	}
+	return hostname, ""
 }
 
 // identity4 returns the stable v4 owner identity: client-id when present

@@ -71,9 +71,10 @@ What increment 1 ships (the fully unit-testable, lab-free slice):
   (`pkg/config/schema_system.go`). TSIG secret is redacted in
   `DHCPDynamicDNSConfig.String()`.
 - **State-aware lease parser** — `parseActiveLeases4/6` (`ddns_leases.go`)
-  honors Kea's `state` column (default/declined/expired-reclaimed) and the
-  `expire` epoch, and extracts the v6 DUID/IAID identity. SEPARATE from
-  the display-only `parseLeaseCSV` (reusing that would publish/retain
+  honors Kea's `state` column (default/declined/expired-reclaimed), the
+  `expire` epoch, and the `fqdn_fwd` split between host-name and
+  client-supplied FQDN, and extracts the v6 DUID/IAID identity. SEPARATE
+  from the display-only `parseLeaseCSV` (reusing that would publish/retain
   stale records — the exact bug this feature fixes).
 - **`DNSUpdater` interface** (`ddns_dns.go`) + the pure record/PTR-name
   construction. PTR names are built from the TEXTUAL address (reversed
