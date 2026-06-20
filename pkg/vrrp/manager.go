@@ -369,7 +369,12 @@ func (m *Manager) ReconcileVIPs() {
 			// (link DOWN/UP) which changes the MAC — GARP is critical here.
 			vi.garpEpoch.Add(1)
 			if !vi.suppressGARP.Load() {
-				vi.sendGARP()
+				// force=true: bypass the 500ms time dampener. The epoch bump
+				// above defeats the epoch-dedup, but the dampener would STILL
+				// suppress this burst if any routine GARP was emitted in the
+				// prior 500ms — leaving peers with a stale ARP entry for the
+				// just-changed RETH virtual MAC until it ages out (#2081).
+				vi.sendGARP(true)
 			}
 		}
 	}

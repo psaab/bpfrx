@@ -113,7 +113,11 @@ See the deploy backing table in
 - **VRRP advertisement**: RETH instances default 30ms; `AdvertiseInterval`
   is milliseconds internally, centiseconds on wire per RFC 5798.
 - **Async GARP**: `becomeMaster()` runs GARP in a goroutine; critical
-  path is addVIPs → sendAdvert → emitEvent (sync), then `go sendGARP()`.
+  path is addVIPs → sendAdvert → emitEvent (sync), then
+  `go sendGARP(false)`. `sendGARP(force)` has two gates — per-epoch dedup
+  and a 500ms time dampener; `force=true` (used by `ReconcileVIPs` after a
+  MAC change) bypasses ONLY the dampener so the post-MAC-change GARP is not
+  swallowed by a routine burst from the prior 500ms (#2081).
 - **Fabric forwarding**: the userspace dataplane redirects packets for
   peer-owned synced sessions over the fabric link
   (`resolve_fabric_redirect()` / `ingress_is_fabric()` in

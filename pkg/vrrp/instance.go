@@ -104,9 +104,9 @@ type vrrpInstance struct {
 
 	// GARP suppression for strict-vip-ownership mode.
 	suppressGARP  atomic.Bool   // when true, becomeMaster() skips GARP/NA
-	garpEpoch     atomic.Uint64 // incremented on each becomeMaster() transition
+	garpEpoch     atomic.Uint64 // incremented on each becomeMaster()/ReconcileVIPs transition
 	lastGARPEpoch atomic.Uint64 // epoch of last completed sendGARP()
-	lastGARPTime  atomic.Int64  // Unix nanos of last GARP send (dampening; see garpDampened)
+	lastGARPTime  atomic.Int64  // Unix nanos of last GARP send (dampens routine GARP only; forced sends bypass — see garpSendAllowed)
 
 	// onEventDrop is called when an event is dropped due to a full eventCh.
 	// Set by the manager to trigger immediate reconciliation.
@@ -910,7 +910,10 @@ func (vi *vrrpInstance) becomeMaster() {
 	vi.emitEvent()
 	vi.garpEpoch.Add(1)
 	if !vi.suppressGARP.Load() {
-		go vi.sendGARP()
+		// Non-forced: a routine MASTER transition is rate-limited by the
+		// 500ms dampener (the epoch dedup still guarantees one burst per
+		// transition). Post-MAC-change reconcile uses the forced path.
+		go vi.sendGARP(false)
 	} else {
 		slog.Info("vrrp: GARP suppressed (strict-vip-ownership)",
 			"key", vi.key())
@@ -1201,6 +1204,49 @@ func garpDampened(lastNanos, nowNanos int64) bool {
 	return elapsed >= 0 && elapsed < minGARPInterval
 }
 
+// garpSendAllowed reports whether sendGARP should proceed to emit a burst,
+// given the current epoch state and whether the caller requested a forced
+// send. It centralises the two suppression gates so the decision can be
+// unit-tested without performing real network I/O:
+//
+//   - Epoch dedup: skip if a GARP for the current garpEpoch was already
+//     completed (lastGARPEpoch == garpEpoch, epoch > 0). This applies to
+//     BOTH forced and non-forced sends — a forced caller is expected to bump
+//     garpEpoch first (see ReconcileVIPs/becomeMaster), so the dedup only
+//     suppresses a genuine duplicate for the same transition, never the
+//     intended forced send.
+//   - Time dampener: skip if the previous burst was < minGARPInterval ago
+//     (garpDampened). This applies to the NORMAL (force == false) path only,
+//     to rate-limit routine/periodic GARP during rapid VRRP flaps. A forced
+//     send BYPASSES the dampener: ReconcileVIPs runs after programRethMAC
+//     changed the RETH virtual MAC, so peers hold a stale ARP entry and the
+//     post-MAC-change GARP is critical even if a routine GARP happened to be
+//     emitted within the last 500ms — otherwise traffic blackholes until the
+//     stale ARP ages out (#2081).
+func (vi *vrrpInstance) garpSendAllowed(force bool, nowNanos int64) bool {
+	epoch := vi.garpEpoch.Load()
+	if vi.lastGARPEpoch.Load() == epoch && epoch > 0 {
+		slog.Debug("vrrp: GARP already sent for this epoch",
+			"key", vi.key(), "epoch", epoch)
+		return false
+	}
+	if force {
+		// Forced sends (post-MAC-change reconcile via ReconcileVIPs) bypass
+		// the time dampener — the dampener exists only to rate-limit routine
+		// GARP and must never suppress a MAC-change correction (#2081). Note
+		// the becomeMaster path (including manual takeover via ForceRGMaster)
+		// is intentionally NOT forced: it does not change the MAC, so it stays
+		// subject to the dampener.
+		return true
+	}
+	if last := vi.lastGARPTime.Load(); garpDampened(last, nowNanos) {
+		slog.Debug("vrrp: GARP dampened (too soon)",
+			"key", vi.key(), "elapsed", time.Duration(nowNanos-last))
+		return false
+	}
+	return true
+}
+
 // sendGARP sends gratuitous ARP (IPv4) and unsolicited NA (IPv6) for all VIPs.
 // Uses burst mode: one immediate pair then background follow-ups at 50ms intervals.
 // After each IPv4 GARP burst, also sends a standard ARP probe to the subnet's
@@ -1208,20 +1254,13 @@ func garpDampened(lastNanos, nowNanos int64) bool {
 // their ARP cache when they receive a standard ARP Request with the VIP as
 // the source address.
 //
+// force bypasses the 500ms time dampener (but not the per-epoch dedup) so a
+// post-MAC-change reconcile GARP is always emitted; see garpSendAllowed.
+//
 // This method may be called in a goroutine from becomeMaster().
-func (vi *vrrpInstance) sendGARP() {
+func (vi *vrrpInstance) sendGARP(force bool) {
 	epoch := vi.garpEpoch.Load()
-	if vi.lastGARPEpoch.Load() == epoch && epoch > 0 {
-		slog.Debug("vrrp: GARP already sent for this epoch",
-			"key", vi.key(), "epoch", epoch)
-		return
-	}
-	// Dampening: minimum 500ms between GARP bursts to avoid storms
-	// during rapid VRRP flaps.
-	now := time.Now().UnixNano()
-	if last := vi.lastGARPTime.Load(); garpDampened(last, now) {
-		slog.Debug("vrrp: GARP dampened (too soon)",
-			"key", vi.key(), "elapsed", time.Duration(now-last))
+	if !vi.garpSendAllowed(force, time.Now().UnixNano()) {
 		return
 	}
 	count := vi.cfg.GARPCount
