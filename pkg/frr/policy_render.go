@@ -634,7 +634,32 @@ func (m *Manager) generatePolicyOptions(po *config.PolicyOptionsConfig) string {
 			}
 
 			if term.PrefixList != "" {
-				fmt.Fprintf(&b, " match ip address prefix-list %s\n", term.PrefixList)
+				// Choose the address-family matcher from the referenced
+				// prefix-list's entries, mirroring the route-filter path
+				// above (lines ~619-633). FRR keeps `ip` and `ipv6`
+				// prefix-lists in independent namespaces; emitting the
+				// IPv4 `match ip address` for an IPv6 list makes the
+				// filter a silent no-op in an IPv6 routing-policy context
+				// (OSPFv3 export, BGP inet6) — issue #2071. Two matchers
+				// must NOT both appear in one route-map index: FRR ANDs
+				// match clauses (MATCH + NOMATCH = NOMATCH), so an
+				// off-family clause against the populated sibling-namespace
+				// list would deny the route. Emit exactly one matcher;
+				// any IPv6 entry selects the IPv6 matcher. A mixed
+				// (v4+v6) list therefore renders the IPv6 matcher — the
+				// same homogeneous-family limitation the route-filter path
+				// already has. Unknown/empty lists default to IPv4,
+				// byte-identical to the pre-fix render.
+				matchKW := "ip"
+				if pl := po.PrefixLists[term.PrefixList]; pl != nil {
+					for _, p := range pl.Prefixes {
+						if strings.Contains(p, ":") {
+							matchKW = "ipv6"
+							break
+						}
+					}
+				}
+				fmt.Fprintf(&b, " match %s address prefix-list %s\n", matchKW, term.PrefixList)
 			}
 
 			// Junos "from protocol [ bgp ospf static ]" matches ANY listed
