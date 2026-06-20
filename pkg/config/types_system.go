@@ -196,7 +196,8 @@ type SystemServicesConfig struct {
 
 // SSHServiceConfig holds SSH service settings.
 type SSHServiceConfig struct {
-	RootLogin string // "allow", "deny", "deny-password"
+	RootLogin   string   // "allow", "deny", "deny-password"
+	KeyExchange []string // sshd KexAlgorithms (key-exchange methods)
 }
 
 // WebManagementConfig holds web management settings.

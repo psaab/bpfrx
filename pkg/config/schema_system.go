@@ -287,6 +287,17 @@ var schemaSystem = &schemaNode{desc: "System configuration", children: map[strin
 				validator:     ValidateEnum([]string{"allow", "deny", "deny-password"}),
 				children:      nil,
 			},
+			// H5 (#2008): repeatable key-exchange method → sshd
+			// KexAlgorithms (pkg/daemon/daemon_system.go applySSHConfig).
+			// Junos takes a free-form algorithm-name list; sshd validates
+			// the spellings at reload, so no enum here.
+			"key-exchange": {
+				desc:        "SSH key-exchange method (KexAlgorithms)",
+				args:        1,
+				multi:       true,
+				placeholder: "<key-exchange-method>",
+				children:    nil,
+			},
 		}},
 		"netconf": {desc: "NETCONF service", children: map[string]*schemaNode{
 			"ssh": {desc: "NETCONF over SSH", children: nil},
