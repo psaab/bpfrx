@@ -1,6 +1,7 @@
 package ra
 
 import (
+	"errors"
 	"net"
 	"net/netip"
 	"sync"
@@ -54,6 +55,12 @@ type fakeConn struct {
 	// hold the conn LIVE (block the owner's finishShutdown close) to probe the
 	// stop->start window. Same race-free atomic.Pointer discipline.
 	beforeClose atomic.Pointer[func()]
+
+	// writeErr, if set, makes WriteTo return it WITHOUT recording the write —
+	// simulating a send failure (e.g. interface down mid-withdraw) so a test
+	// can prove finishShutdown leaves goodbyeEmitted=false on a failed graceful
+	// goodbye, arming the manager's release-time backstop. Guarded by f.mu.
+	writeErr error
 }
 
 func newFakeConn() *fakeConn {
@@ -87,10 +94,23 @@ func (f *fakeConn) WriteTo(m ndp.Message, _ *ipv6.ControlMessage, _ netip.Addr) 
 		(*hook)(ra.RouterLifetime)
 	}
 	f.mu.Lock()
+	if f.writeErr != nil {
+		err := f.writeErr
+		f.mu.Unlock()
+		return err
+	}
 	f.seq++
 	f.writes = append(f.writes, writeRec{lifetime: ra.RouterLifetime, seq: f.seq})
 	f.mu.Unlock()
 	return nil
+}
+
+// setWriteErr makes every subsequent WriteTo fail (returning err, recording
+// nothing) until cleared with nil.
+func (f *fakeConn) setWriteErr(err error) {
+	f.mu.Lock()
+	f.writeErr = err
+	f.mu.Unlock()
 }
 
 func (f *fakeConn) ReadFrom() (ndp.Message, *ipv6.ControlMessage, netip.Addr, error) {
@@ -516,7 +536,15 @@ type sentinelFatal struct{}
 // assertGoodbyeIsLastOn is assertGoodbyeIsLast against a minimal fatal-er so it
 // can be exercised by the negative arm. It recovers the sentinel panic.
 func assertGoodbyeIsLastOn(ft *fakeT, writes []writeRec) {
-	defer func() { _ = recover() }()
+	// Recover ONLY our own Fatalf sentinel; re-raise anything else so a real
+	// bug in this helper (e.g. a nil deref) is not silently swallowed.
+	defer func() {
+		if r := recover(); r != nil {
+			if _, ok := r.(sentinelFatal); !ok {
+				panic(r)
+			}
+		}
+	}()
 	firstGoodbye := -1
 	for _, w := range writes {
 		if w.lifetime == 0 {
@@ -533,6 +561,50 @@ func assertGoodbyeIsLastOn(ft *fakeT, writes []writeRec) {
 			ft.Fatalf("normal after goodbye")
 			return
 		}
+	}
+}
+
+// TestFinishShutdownGoodbyeSendOutcome proves finishShutdown records
+// goodbyeEmitted EXACTLY when the goodbye actually went out: true on a clean
+// send, false on a write failure. The false case is what arms the manager's
+// release-time backstop (ra.go releaseDrain: !goodbyeEmitted -> standalone
+// goodbye on a fresh conn). NON-TAUTOLOGY: against the pre-fix head
+// (goodbyeEmitted set unconditionally after the send) the failure arm of this
+// test reports goodbyeEmitted=true and fails — i.e. it pins the #2033
+// sender.go:347 fix, not merely the current behavior.
+func TestFinishShutdownGoodbyeSendOutcome(t *testing.T) {
+	iface := &net.Interface{Name: "tgb", HardwareAddr: net.HardwareAddr{0x02, 0, 0, 0, 0, 1}}
+
+	// Failed goodbye send -> emitted stays false so the backstop retries.
+	sFail := newSender(testCfg("tgbfail"), iface)
+	fcFail := newFakeConn()
+	fcFail.setWriteErr(errors.New("simulated goodbye send failure"))
+	sFail.conn = fcFail
+	sFail.mode.Store(int32(modeGraceful))
+	sFail.finishShutdown()
+	if sFail.goodbyeEmitted.Load() {
+		t.Fatal("goodbyeEmitted must stay FALSE when the goodbye send failed " +
+			"(the manager backstop must retry on a fresh conn)")
+	}
+
+	// Successful goodbye send -> emitted true so the backstop suppresses.
+	sOK := newSender(testCfg("tgbok"), iface)
+	fcOK := newFakeConn()
+	sOK.conn = fcOK
+	sOK.mode.Store(int32(modeGraceful))
+	sOK.finishShutdown()
+	if !sOK.goodbyeEmitted.Load() {
+		t.Fatal("goodbyeEmitted must be TRUE after a successful goodbye send")
+	}
+	// Sanity: the success path actually emitted goodbyeCount lifetime-0 writes.
+	n := 0
+	for _, w := range fcOK.snapshot() {
+		if w.lifetime == 0 {
+			n++
+		}
+	}
+	if n != goodbyeCount {
+		t.Fatalf("expected %d goodbye writes on success, got %d", goodbyeCount, n)
 	}
 }
 

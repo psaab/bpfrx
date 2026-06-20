@@ -327,6 +327,14 @@ func (s *sender) run() {
 			case <-t.C:
 			}
 			s.sendRA()
+			// Re-pace the unsolicited schedule off this solicited RA (RFC 4861
+			// §6.2.6). This Reset is not preceded by a drain of advTimer.C, so
+			// in the rare interleave where advTimer fired while this RS was being
+			// handled and select picked the RS arm, the next loop iteration may
+			// read a stale fire and emit one early unsolicited RA. That is a
+			// benign, idempotent extra RA (never a goodbye-ordering violation),
+			// so the drain dance is intentionally omitted in this single-owner
+			// loop.
 			advTimer.Reset(s.randomAdvInterval())
 		}
 	}
@@ -339,11 +347,19 @@ func (s *sender) run() {
 // the goodbye, which also unblocks the detached rsReceiver's ReadFrom (I10).
 func (s *sender) finishShutdown() {
 	if shutdownMode(s.mode.Load()) == modeGraceful {
-		s.sendGoodbyeRA()
-		// Record the fact for the manager's post-join owes-a-goodbye check.
+		// Record the fact for the manager's post-join owes-a-goodbye check, but
+		// ONLY if the goodbye actually went out. On a write failure (interface
+		// down mid-withdraw) leave goodbyeEmitted=false so the manager's
+		// release-time backstop (ra.go: !goodbyeEmitted) retries the goodbye on
+		// a FRESH conn (sendOneGoodbye -> newSender) — the owner's conn is
+		// closed just below and cannot be retried here. Goodbyes are idempotent
+		// (repeated lifetime=0) and the backstop emits only goodbyes, so the
+		// retry cannot violate the goodbye-is-last ordering invariant.
 		// Set AFTER the send and BEFORE close(s.stopped) (the caller's defer),
 		// so a manager that observes <-stopped also observes this store.
-		s.goodbyeEmitted.Store(true)
+		if s.sendGoodbyeRA() {
+			s.goodbyeEmitted.Store(true)
+		}
 	}
 	if s.conn != nil {
 		s.conn.Close()
@@ -454,8 +470,13 @@ func (s *sender) sendRA() {
 }
 
 // sendGoodbyeRA sends goodbye RAs (lifetime=0) multiple times for reliability.
-// Owner-only — emitted as the final write in finishShutdown.
-func (s *sender) sendGoodbyeRA() {
+// Owner-only — emitted as the final write in finishShutdown. It returns true
+// only when the full sequence was written without error; a write failure
+// returns false so finishShutdown leaves goodbyeEmitted=false and the manager's
+// release-time backstop retries the goodbye on a fresh conn. (The standalone
+// backstop path, sendGoodbyeStandalone, ignores the bool — it is itself the
+// retry, so there is no further fallback to arm.)
+func (s *sender) sendGoodbyeRA() bool {
 	ra := s.buildRA()
 	ra.RouterLifetime = 0
 	allNodes := netip.MustParseAddr("ff02::1")
@@ -465,13 +486,14 @@ func (s *sender) sendGoodbyeRA() {
 		if err := s.conn.WriteTo(ra, nil, allNodes); err != nil {
 			slog.Warn("ra: failed to send goodbye RA",
 				"interface", s.cfg.Interface, "err", err)
-			return
+			return false
 		}
 		if i < goodbyeCount-1 {
 			time.Sleep(goodbyeDelay)
 		}
 	}
 	slog.Info("ra: goodbye RA sent (lifetime=0)", "interface", s.cfg.Interface)
+	return true
 }
 
 // buildRA constructs a Router Advertisement from the config.
