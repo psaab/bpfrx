@@ -44,8 +44,7 @@ func (s *Server) buildInterfacesInput() cluster.InterfacesInput {
 			if phys, ok := rethMap[name]; ok {
 				linuxName := config.LinuxIfName(phys)
 				link, err := netlink.LinkByName(linuxName)
-				if err != nil || (link.Attrs().OperState != netlink.OperUp &&
-					link.Attrs().Flags&net.FlagUp == 0) {
+				if err != nil || !cluster.LinkAttrsUp(link.Attrs()) {
 					status = "Down"
 				}
 			}
