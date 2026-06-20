@@ -86,6 +86,93 @@ type Manager struct {
 	neighbors map[string]*Neighbor // key: "ifname/chassisID/portID"
 	cancel    context.CancelFunc
 	wg        sync.WaitGroup
+	// sessions are the per-interface RX/TX sockets for the current Apply
+	// generation. Stop() closes each one to unblock the parked RX Recvfrom
+	// immediately, so shutdown does not wait out a read timeout. Guarded by mu.
+	sessions []*ifSession
+}
+
+// ifSession owns the RX and TX AF_PACKET sockets for one interface for the life
+// of an Apply() generation. close() shuts down and closes rxFD, which makes a
+// parked unix.Recvfrom in the RX goroutine return immediately, so Stop() does
+// not block waiting out a read timeout. This mirrors the close-to-unblock
+// pattern VRRP uses for its receiver (pkg/vrrp/instance.go stop()).
+type ifSession struct {
+	iface     *net.Interface
+	rxFD      int // AF_PACKET bound to ifindex, ETH_P_LLDP
+	txFD      int // AF_PACKET for periodic Sendto, opened once and reused
+	closeOnce sync.Once
+}
+
+// newIfSessionFn is the construction seam for ifSession. Tests override it to
+// inject a socketpair(2)-backed session so the Stop-unblocks-recv contract can
+// be exercised without CAP_NET_RAW or a real interface.
+var newIfSessionFn = newIfSession
+
+// newIfSession opens and binds the RX socket and opens the TX socket for one
+// interface. Both fds live for the Apply generation and are released by close().
+func newIfSession(iface *net.Interface) (*ifSession, error) {
+	rxFD, err := unix.Socket(unix.AF_PACKET, unix.SOCK_RAW, int(htons(etherTypeLLDP)))
+	if err != nil {
+		return nil, fmt.Errorf("lldp: rx socket: %w", err)
+	}
+	if err := unix.Bind(rxFD, &unix.SockaddrLinklayer{
+		Protocol: htons(etherTypeLLDP),
+		Ifindex:  iface.Index,
+	}); err != nil {
+		unix.Close(rxFD)
+		return nil, fmt.Errorf("lldp: rx bind: %w", err)
+	}
+	// No SO_RCVTIMEO: recv blocks indefinitely and is unblocked by closing the
+	// fd in close(), not by a polling timeout.
+
+	txFD, err := unix.Socket(unix.AF_PACKET, unix.SOCK_RAW, int(htons(unix.ETH_P_ALL)))
+	if err != nil {
+		unix.Close(rxFD)
+		return nil, fmt.Errorf("lldp: tx socket: %w", err)
+	}
+
+	return &ifSession{iface: iface, rxFD: rxFD, txFD: txFD}, nil
+}
+
+// recv reads one frame from the RX socket. It blocks until a frame arrives or
+// the fd is closed by close().
+func (s *ifSession) recv(buf []byte) (int, error) {
+	n, _, err := unix.Recvfrom(s.rxFD, buf, 0)
+	return n, err
+}
+
+// send transmits an LLDP frame to the multicast destination on the bound
+// interface over the reused TX socket.
+func (s *ifSession) send(frame []byte) error {
+	addr := &unix.SockaddrLinklayer{
+		Protocol: htons(etherTypeLLDP),
+		Ifindex:  s.iface.Index,
+		Halen:    6,
+	}
+	copy(addr.Addr[:6], LLDPMulticast)
+	return unix.Sendto(s.txFD, frame, 0, addr)
+}
+
+// close releases both sockets. It is idempotent (closeOnce) so a double-close
+// from a racing Stop cannot panic or double-free.
+//
+// shutdown(SHUT_RDWR) precedes close on rxFD on purpose: closing an fd that
+// another goroutine is actively blocked reading on is NOT a reliable wakeup —
+// the fd number is freed but the in-flight Recvfrom can stay parked. shutdown
+// reliably wakes a blocked reader. On a connectionless AF_PACKET socket shutdown
+// returns ENOTCONN (harmless, ignored) and the subsequent close is what tears
+// down the RX queue and unblocks recv (the pattern VRRP relies on); on a
+// connection-oriented socket (the socketpair used in tests) shutdown is the
+// authoritative wakeup. Doing both is correct for either socket family.
+func (s *ifSession) close() {
+	s.closeOnce.Do(func() {
+		_ = unix.Shutdown(s.rxFD, unix.SHUT_RDWR)
+		unix.Close(s.rxFD)
+		if s.txFD != s.rxFD {
+			unix.Close(s.txFD)
+		}
+	})
 }
 
 // New creates a new LLDP manager.
@@ -130,19 +217,32 @@ func (m *Manager) Apply(ctx context.Context, cfg *LLDPConfig) {
 			continue
 		}
 
+		// Open the RX+TX sockets once for this interface. A CAP_NET_RAW or bind
+		// failure now surfaces here (logged, interface skipped) instead of
+		// silently per-frame.
+		sess, err := newIfSessionFn(iface)
+		if err != nil {
+			slog.Warn("LLDP: socket setup failed, skipping interface",
+				"interface", lldpIf.Name, "err", err)
+			continue
+		}
+		m.mu.Lock()
+		m.sessions = append(m.sessions, sess)
+		m.mu.Unlock()
+
 		// Start TX goroutine.
 		m.wg.Add(1)
-		go func(iface *net.Interface) {
+		go func(sess *ifSession) {
 			defer m.wg.Done()
-			m.txLoop(lldpCtx, iface, interval, holdMult, sysName, cfg.SystemDesc)
-		}(iface)
+			m.txLoop(lldpCtx, sess, interval, holdMult, sysName, cfg.SystemDesc)
+		}(sess)
 
 		// Start RX goroutine.
 		m.wg.Add(1)
-		go func(iface *net.Interface) {
+		go func(sess *ifSession) {
 			defer m.wg.Done()
-			m.rxLoop(lldpCtx, iface)
-		}(iface)
+			m.rxLoop(lldpCtx, sess)
+		}(sess)
 
 		slog.Info("LLDP started", "interface", lldpIf.Name, "interval", interval)
 	}
@@ -156,12 +256,35 @@ func (m *Manager) Apply(ctx context.Context, cfg *LLDPConfig) {
 }
 
 // Stop halts all LLDP goroutines and clears the neighbor table.
+//
+// Ordering is load-bearing: cancel the context (stops the timer-driven TX and
+// expiry loops), then close every session's sockets (unblocks any RX goroutine
+// parked in recv immediately), then wg.Wait(). Closing the fds BEFORE the wait
+// is what makes Stop bounded — waiting first would re-introduce the read-timeout
+// stall. The close-under-read race is benign: a recv on a just-closed fd returns
+// an error and the RX loop treats any post-cancel error as "shutdown, return".
 func (m *Manager) Stop() {
+	m.mu.Lock()
+	sessions := m.sessions
+	m.sessions = nil
+	m.mu.Unlock()
+
 	if m.cancel != nil {
 		m.cancel()
+		// Close sockets to unblock any blocking Recvfrom in rxLoop.
+		for _, s := range sessions {
+			s.close()
+		}
 		m.wg.Wait()
 		m.cancel = nil
+	} else {
+		// Defensive: close any sessions even if cancel was never set (no
+		// goroutines should be running, but never leak an fd).
+		for _, s := range sessions {
+			s.close()
+		}
 	}
+
 	m.mu.Lock()
 	m.neighbors = make(map[string]*Neighbor)
 	m.mu.Unlock()
@@ -187,28 +310,31 @@ func (m *Manager) Neighbors() []*Neighbor {
 	return out
 }
 
-// txLoop periodically sends LLDP frames on the given interface.
-func (m *Manager) txLoop(ctx context.Context, iface *net.Interface, interval time.Duration, holdMult int, sysName, sysDesc string) {
+// txLoop periodically sends LLDP frames on the session's interface, reusing the
+// session's TX socket for every advertisement.
+func (m *Manager) txLoop(ctx context.Context, sess *ifSession, interval time.Duration, holdMult int, sysName, sysDesc string) {
 	ttl := int(interval.Seconds()) * holdMult
 
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 
 	// Send first frame immediately.
-	m.sendFrame(iface, ttl, sysName, sysDesc)
+	m.sendFrame(sess, ttl, sysName, sysDesc)
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			m.sendFrame(iface, ttl, sysName, sysDesc)
+			m.sendFrame(sess, ttl, sysName, sysDesc)
 		}
 	}
 }
 
-// sendFrame builds and sends a single LLDP frame on the interface.
-func (m *Manager) sendFrame(iface *net.Interface, ttl int, sysName, sysDesc string) {
+// sendFrame builds and sends a single LLDP frame over the session's reused TX
+// socket.
+func (m *Manager) sendFrame(sess *ifSession, ttl int, sysName, sysDesc string) {
+	iface := sess.iface
 	frame, err := BuildFrame(iface.HardwareAddr, iface.Name, ttl, sysName, sysDesc)
 	if err != nil {
 		// Fail closed: skip this advertisement rather than send a malformed
@@ -217,59 +343,32 @@ func (m *Manager) sendFrame(iface *net.Interface, ttl int, sysName, sysDesc stri
 		return
 	}
 
-	fd, err := unix.Socket(unix.AF_PACKET, unix.SOCK_RAW, int(htons(unix.ETH_P_ALL)))
-	if err != nil {
-		slog.Debug("LLDP TX: socket error", "interface", iface.Name, "err", err)
-		return
-	}
-	defer unix.Close(fd)
-
-	addr := &unix.SockaddrLinklayer{
-		Protocol: htons(etherTypeLLDP),
-		Ifindex:  iface.Index,
-		Halen:    6,
-	}
-	copy(addr.Addr[:6], LLDPMulticast)
-
-	if err := unix.Sendto(fd, frame, 0, addr); err != nil {
+	if err := sess.send(frame); err != nil {
 		slog.Debug("LLDP TX: send error", "interface", iface.Name, "err", err)
 	}
 }
 
-// rxLoop receives LLDP frames on the given interface and updates the neighbor table.
-func (m *Manager) rxLoop(ctx context.Context, iface *net.Interface) {
-	fd, err := unix.Socket(unix.AF_PACKET, unix.SOCK_RAW, int(htons(etherTypeLLDP)))
-	if err != nil {
-		slog.Warn("LLDP RX: socket error", "interface", iface.Name, "err", err)
-		return
-	}
-	defer unix.Close(fd)
-
-	// Bind to specific interface.
-	if err := unix.Bind(fd, &unix.SockaddrLinklayer{
-		Protocol: htons(etherTypeLLDP),
-		Ifindex:  iface.Index,
-	}); err != nil {
-		slog.Warn("LLDP RX: bind error", "interface", iface.Name, "err", err)
-		return
-	}
-
-	// Set a read timeout so we check for ctx cancellation periodically.
-	tv := unix.Timeval{Sec: 2}
-	unix.SetsockoptTimeval(fd, unix.SOL_SOCKET, unix.SO_RCVTIMEO, &tv)
-
+// rxLoop receives LLDP frames on the session's interface and updates the
+// neighbor table. The RX socket has no read timeout: recv blocks until a frame
+// arrives or Stop() closes the fd, at which point Recvfrom returns an error and
+// the loop exits. This makes Stop() return promptly instead of waiting out a
+// read timeout.
+func (m *Manager) rxLoop(ctx context.Context, sess *ifSession) {
+	iface := sess.iface
 	buf := make([]byte, 1600)
 	for {
-		select {
-		case <-ctx.Done():
-			return
-		default:
-		}
-
-		n, _, err := unix.Recvfrom(fd, buf, 0)
+		n, err := sess.recv(buf)
 		if err != nil {
-			// Timeout — just loop and check ctx.
-			continue
+			// recv was unblocked. If the context is cancelled, this is the
+			// expected close-to-unblock on Stop(); return. Otherwise it is an
+			// unexpected socket error (e.g. interface gone) — also return, since
+			// the fd is the session's only RX source and there is no timeout to
+			// retry against.
+			if ctx.Err() != nil {
+				return
+			}
+			slog.Debug("LLDP RX: recv error, stopping", "interface", iface.Name, "err", err)
+			return
 		}
 		if n < ethHdrLen {
 			continue
