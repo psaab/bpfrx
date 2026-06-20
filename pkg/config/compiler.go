@@ -145,6 +145,19 @@ type compileOpts struct {
 	// net in pkg/ipsec resolveESPSettings preserves the PFS group on that
 	// boot). Same doctrine as lenientPolicyMatchAddress.
 	lenientIPsecPolicyProposalRef bool
+
+	// lenientIPsecGatewayRefs (#2074) downgrades the IPsec VPN -> IKE
+	// gateway cross-reference check from a hard error to a warning on the
+	// tolerant load / peer-sync paths (CompileConfigLenient /
+	// CompileConfigForNodeLenient). A config persisted by an older binary,
+	// or synced from a peer, may carry a VPN that references an undefined
+	// or addressless gateway; an upgrading / receiving node must still
+	// boot through it (warn) rather than fail-closed-on-load (#1960
+	// class). Commit / commit-check stay strict — a new operator edit that
+	// would render `remote_addrs = <gateway-name>` (a silently-dead
+	// tunnel) is rejected. Same doctrine as lenientDeviceMap /
+	// lenientPolicyMatchAddress.
+	lenientIPsecGatewayRefs bool
 }
 
 // CompileConfig converts a parsed ConfigTree AST into a typed Config struct.
@@ -173,6 +186,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientTCPMSSRange:            true,
 		lenientEventAttributesMatch:   true,
 		lenientIPsecPolicyProposalRef: true,
+		lenientIPsecGatewayRefs:       true,
 	})
 }
 
@@ -252,6 +266,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientTCPMSSRange:            true,
 		lenientEventAttributesMatch:   true,
 		lenientIPsecPolicyProposalRef: true,
+		lenientIPsecGatewayRefs:       true,
 	})
 }
 
@@ -613,6 +628,25 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		if opts.lenientEventAttributesMatch {
 			cfg.Warnings = append(cfg.Warnings,
 				fmt.Sprintf("event-options attributes-match (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
+	// #2074 IPsec VPN -> IKE gateway cross-reference. A VPN that
+	// references a gateway which is neither a defined gateway object nor a
+	// usable inline IP/hostname would render `remote_addrs = <gateway-name>`
+	// — a config-object name strongSwan cannot use, a silently-dead tunnel.
+	// Strict on commit / commit-check (hard reject so the operator gets a
+	// diagnostic); lenient on load / peer-sync (warn so a pre-fix or
+	// peer-synced config still boots — #1960 fail-closed-on-load class).
+	// Runs on the fully-compiled *Config so both ike{} and ipsec{} gateway
+	// definitions are present regardless of stanza authoring order. Mirrors
+	// validateDeviceMapStrict / the policy match-address gate above.
+	if err := validateIPsecGatewayReferencesStrict(cfg); err != nil {
+		if opts.lenientIPsecGatewayRefs {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("ipsec gateway reference (downgraded to warning on tolerant path): %v", err))
 		} else {
 			return nil, err
 		}

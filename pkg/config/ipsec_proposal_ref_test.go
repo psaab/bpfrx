@@ -74,6 +74,7 @@ func TestIPsecPolicyNoProposalLeafRejected(t *testing.T) {
 // policy whose proposal reference resolves must compile cleanly.
 func TestIPsecPolicyResolvableProposalAccepted(t *testing.T) {
 	tree := buildTreeFromSet(t, []string{
+		"set security ike gateway gw1 address 192.0.2.1",
 		"set security ipsec proposal esp-p2 protocol esp",
 		"set security ipsec proposal esp-p2 encryption-algorithm aes-256-cbc",
 		"set security ipsec proposal esp-p2 authentication-algorithm hmac-sha-256-128",
@@ -104,6 +105,7 @@ func TestIPsecPolicyResolvableProposalAccepted(t *testing.T) {
 // resolves) and must NOT trip the validator.
 func TestIPsecPolicyNameEqualsProposalAccepted(t *testing.T) {
 	tree := buildTreeFromSet(t, []string{
+		"set security ike gateway gw1 address 192.0.2.1",
 		"set security ipsec proposal ipsec-pol protocol esp",
 		"set security ipsec proposal ipsec-pol encryption-algorithm aes-256-cbc",
 		"set security ipsec proposal ipsec-pol authentication-algorithm hmac-sha-256-128",
@@ -121,6 +123,7 @@ func TestIPsecPolicyNameEqualsProposalAccepted(t *testing.T) {
 // weakened.
 func TestIPsecNoPolicyAccepted(t *testing.T) {
 	tree := buildTreeFromSet(t, []string{
+		"set security ike gateway gw1 address 192.0.2.1",
 		"set security ipsec vpn tun1 ike gateway gw1",
 	})
 	if _, err := CompileConfig(tree); err != nil {

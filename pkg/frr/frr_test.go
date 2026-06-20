@@ -2662,3 +2662,162 @@ func TestGenerateProtocols_NewlineFreeTextDoesNotInject(t *testing.T) {
 		t.Errorf("sanitized password missing:\n%s", got)
 	}
 }
+
+// --- #2071: from prefix-list match clause must honor the prefix-list's
+// address family. generatePolicyOptions previously emitted "match ip
+// address prefix-list" unconditionally, so an IPv6 prefix-list referenced
+// by `from prefix-list` was a silent no-op in an IPv6 routing-policy
+// context (OSPFv3 export, BGP inet6). The render now mirrors the
+// route-filter path and emits exactly one family-correct matcher.
+
+func policyOptionsWithPrefixListTerm(plName string, prefixes []string, withRouteFilter bool) *config.PolicyOptionsConfig {
+	term := &config.PolicyTerm{
+		Name:       "t1",
+		PrefixList: plName,
+		Action:     "accept",
+	}
+	if withRouteFilter {
+		// v4 route-filter co-resident with the prefix-list in the SAME
+		// term — exercises the no-term-body-duplication invariant.
+		term.RouteFilters = []*config.RouteFilter{
+			{Prefix: "192.168.50.0/24", MatchType: "exact"},
+		}
+	}
+	po := &config.PolicyOptionsConfig{
+		PrefixLists: map[string]*config.PrefixList{},
+		PolicyStatements: map[string]*config.PolicyStatement{
+			"p": {
+				Name:  "p",
+				Terms: []*config.PolicyTerm{term},
+			},
+		},
+	}
+	if prefixes != nil {
+		po.PrefixLists[plName] = &config.PrefixList{Name: plName, Prefixes: prefixes}
+	}
+	return po
+}
+
+func TestPrefixListMatch_IPv4(t *testing.T) {
+	m := New()
+	po := policyOptionsWithPrefixListTerm("v4list", []string{"10.0.0.0/8", "172.16.0.0/12"}, false)
+	got := m.generatePolicyOptions(po)
+	// Byte-identical to pre-fix render: the exact IPv4 match line.
+	if !strings.Contains(got, " match ip address prefix-list v4list\n") {
+		t.Errorf("v4 prefix-list: missing exact `match ip address prefix-list v4list` in:\n%s", got)
+	}
+	if strings.Contains(got, "match ipv6 address prefix-list v4list") {
+		t.Errorf("v4 prefix-list: must NOT emit the IPv6 matcher in:\n%s", got)
+	}
+}
+
+func TestPrefixListMatch_IPv6(t *testing.T) {
+	m := New()
+	po := policyOptionsWithPrefixListTerm("v6list", []string{"2001:db8::/32", "2001:559:8585::/48"}, false)
+	got := m.generatePolicyOptions(po)
+	// This assertion FAILS against pre-fix code (which emitted `match ip
+	// address`): non-tautological.
+	if !strings.Contains(got, " match ipv6 address prefix-list v6list\n") {
+		t.Errorf("v6 prefix-list: missing `match ipv6 address prefix-list v6list` in:\n%s", got)
+	}
+	if strings.Contains(got, "match ip address prefix-list v6list") {
+		t.Errorf("v6 prefix-list: must NOT emit the IPv4 matcher in:\n%s", got)
+	}
+}
+
+func TestPrefixListMatch_Mixed_PicksIPv6_SingleSequence(t *testing.T) {
+	m := New()
+	// Mixed list: a single FRR route-map index cannot match both families
+	// (FRR ANDs match clauses), so exactly one matcher is emitted and any
+	// IPv6 entry selects the IPv6 matcher.
+	po := policyOptionsWithPrefixListTerm("mixed", []string{"10.0.0.0/8", "2001:db8::/32"}, false)
+	got := m.generatePolicyOptions(po)
+	if !strings.Contains(got, " match ipv6 address prefix-list mixed\n") {
+		t.Errorf("mixed prefix-list: missing `match ipv6 address prefix-list mixed` in:\n%s", got)
+	}
+	if strings.Contains(got, "match ip address prefix-list mixed") {
+		t.Errorf("mixed prefix-list: must NOT also emit the IPv4 matcher (would AND to a silent deny) in:\n%s", got)
+	}
+	// Exactly one route-map sequence for the term — guards against the
+	// rejected two-sequence design.
+	if n := strings.Count(got, "route-map p permit 10"); n != 1 {
+		t.Errorf("mixed prefix-list: want exactly 1 `route-map p permit 10` sequence, got %d in:\n%s", n, got)
+	}
+	if strings.Contains(got, "route-map p permit 20") {
+		t.Errorf("mixed prefix-list: must NOT emit a second route-map sequence for the term in:\n%s", got)
+	}
+}
+
+func TestPrefixListMatch_CoResidentRouteFilter_NoDuplication(t *testing.T) {
+	m := New()
+	// Term with BOTH a v4 route-filter and a mixed prefix-list. The
+	// route-filter keeps its own (v4) matcher; the prefix-list adds exactly
+	// one IPv6 matcher; both live in the term's single sequence; the
+	// route-filter inline definition is emitted once and there is no
+	// second route-map sequence (no term-body duplication).
+	po := policyOptionsWithPrefixListTerm("mixed", []string{"10.0.0.0/8", "2001:db8::/32"}, true)
+	got := m.generatePolicyOptions(po)
+	if !strings.Contains(got, " match ip address prefix-list p-t1\n") {
+		t.Errorf("co-resident: route-filter v4 matcher missing in:\n%s", got)
+	}
+	if !strings.Contains(got, " match ipv6 address prefix-list mixed\n") {
+		t.Errorf("co-resident: prefix-list IPv6 matcher missing in:\n%s", got)
+	}
+	if n := strings.Count(got, "route-map p permit 10"); n != 1 {
+		t.Errorf("co-resident: want exactly 1 route-map sequence, got %d in:\n%s", n, got)
+	}
+	if n := strings.Count(got, "ip prefix-list p-t1 seq 5 permit 192.168.50.0/24"); n != 1 {
+		t.Errorf("co-resident: route-filter inline definition must appear exactly once, got %d in:\n%s", n, got)
+	}
+}
+
+func TestPrefixListMatch_UnknownName_DefaultsIPv4(t *testing.T) {
+	m := New()
+	// Term references a prefix-list that is not defined (nil prefixes).
+	// Falls back to the IPv4 matcher — byte-identical to pre-fix render,
+	// no panic.
+	po := policyOptionsWithPrefixListTerm("ghost", nil, false)
+	got := m.generatePolicyOptions(po)
+	if !strings.Contains(got, " match ip address prefix-list ghost\n") {
+		t.Errorf("unknown prefix-list: must default to `match ip address prefix-list ghost` in:\n%s", got)
+	}
+	if strings.Contains(got, "match ipv6 address prefix-list ghost") {
+		t.Errorf("unknown prefix-list: must NOT emit the IPv6 matcher in:\n%s", got)
+	}
+}
+
+// TestPrefixListMatch_EndToEnd_FlatSet drives the full flat-set ->
+// compile -> render path, honoring the CLAUDE.md rule to use
+// ParseSetCommand + tree.SetPath (NOT NewParser). It lives in package frr
+// (generatePolicyOptions is unexported) and inlines its own compile loop
+// (config.buildTree is a package-config test helper, unreachable here).
+func TestPrefixListMatch_EndToEnd_FlatSet(t *testing.T) {
+	cmds := []string{
+		"set policy-options prefix-list v6nets 2001:db8::/32",
+		"set policy-options policy-statement p term t1 from prefix-list v6nets",
+		"set policy-options policy-statement p term t1 then accept",
+	}
+	tree := &config.ConfigTree{}
+	for _, cmd := range cmds {
+		path, err := config.ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%q): %v", cmd, err)
+		}
+	}
+	cfg, err := config.CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	m := New()
+	// PolicyOptions is a value field — pass its address.
+	got := m.generatePolicyOptions(&cfg.PolicyOptions)
+	if !strings.Contains(got, " match ipv6 address prefix-list v6nets\n") {
+		t.Errorf("end-to-end: v6 prefix-list compiled+rendered must emit the IPv6 matcher, got:\n%s", got)
+	}
+	if strings.Contains(got, "match ip address prefix-list v6nets") {
+		t.Errorf("end-to-end: must NOT emit the IPv4 matcher for a v6 list, got:\n%s", got)
+	}
+}

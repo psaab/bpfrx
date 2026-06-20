@@ -84,6 +84,26 @@ The primary consumer of the `Manager.Events()` channel is
 publish, etc.). `pkg/cluster/reth.go::HandleStateChange` is a
 state-handler method, not the event-channel consumer.
 
+## Interface-monitor link-state detection
+
+`Monitor` (`monitor.go`) is the live carrier-detection loop: a 1-second
+ticker polls each configured `interface-monitor`, dampens transitions,
+and calls `SetMonitorWeight` so a redundancy group is demoted when a
+monitored uplink goes down. The whole point of interface-monitoring is to
+catch carrier loss (cable pulled / peer link down) and fail over.
+
+Link health is therefore decided from the kernel **operational** state
+(`IFLA_OPERSTATE`) via `linkAttrsUp`, **not** the administrative `IFF_UP`
+flag. xpfd admin-ups every managed interface, so `IFF_UP` is the normal
+steady state and stays set even after carrier loss — using it (or OR-ing
+it in) would report a cable-pulled link as UP and suppress failover
+(#2070). The rule is: `OperUp` → up; `OperUnknown` → fall back to the
+admin flag (virtual devices that report no carrier state); `OperDown` /
+`OperLowerLayerDown` / anything else → down. This mirrors
+`pkg/vrrp.linkAttrsUp`, the canonical link-state read used by VRRP
+track-interface detection. `pkg/routing/monitor.go` (the display-side
+`InterfaceMonitorStatus` path) uses the identical helper.
+
 ## Callers
 
 `pkg/daemon`, `pkg/cli`, `pkg/grpcapi`, `pkg/vrrp`.

@@ -251,6 +251,12 @@ func TestApplyGenerateFailureFailsApply(t *testing.T) {
 	}
 }
 
+// leaseTestNow is a fixed reference time BEFORE the 2024-02 expire
+// epochs used by the legacy fixtures (1707868800 / 1707955200), so the
+// expire filter added in #2085 keeps those (state=0) rows live and the
+// pre-existing assertions still hold. New #2085 tests use their own now.
+var leaseTestNow = time.Unix(1707800000, 0) // 2024-02-13 03:33:20 UTC
+
 func TestParseLeaseCSV(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "kea-leases4.csv")
@@ -262,7 +268,7 @@ func TestParseLeaseCSV(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	leases, err := parseLeaseCSV(path)
+	leases, err := parseLeaseCSV(path, leaseTestNow)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -289,7 +295,7 @@ func TestParseLeaseCSV(t *testing.T) {
 }
 
 func TestParseLeaseCSV_NoFile(t *testing.T) {
-	leases, err := parseLeaseCSV("/nonexistent/path")
+	leases, err := parseLeaseCSV("/nonexistent/path", leaseTestNow)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -305,7 +311,7 @@ func TestParseLeaseCSV_Empty(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	leases, err := parseLeaseCSV(path)
+	leases, err := parseLeaseCSV(path, leaseTestNow)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -326,7 +332,7 @@ func TestParseLeaseCSV_QuotedHostname(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	leases, err := parseLeaseCSV(path)
+	leases, err := parseLeaseCSV(path, leaseTestNow)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -338,6 +344,168 @@ func TestParseLeaseCSV_QuotedHostname(t *testing.T) {
 	}
 	if leases[0].SubnetID != "1" {
 		t.Errorf("subnet_id shifted: got %q", leases[0].SubnetID)
+	}
+}
+
+// indexLeasesByAddr collapses a lease slice to an address→Lease map so
+// the #2085 tests can assert per-address presence and field values; the
+// expected lease count is asserted separately via len(leases).
+func indexLeasesByAddr(leases []Lease) map[string]Lease {
+	m := make(map[string]Lease, len(leases))
+	for _, l := range leases {
+		m[l.Address] = l
+	}
+	return m
+}
+
+// TestParseLeaseCSV_ExpiredAndDuplicate pins the core of #2085: Kea's
+// memfile is append-only, so the SAME address appears multiple times
+// (renewals) and lapsed leases linger until LFC. The display parser
+// must collapse to one row per address (newest wins) and drop expired
+// rows. Non-tautological: against the pre-#2085 parser this fixture
+// returns FOUR rows (the duplicate twice + the expired one + the live
+// one); the fix returns TWO (deduped live + the other live).
+func TestParseLeaseCSV_ExpiredAndDuplicate(t *testing.T) {
+	now := time.Unix(1707900000, 0) // 2024-02-14 06:40:00 UTC
+	past := now.Unix() - 3600       // expired an hour ago
+	future := now.Unix() + 3600     // valid for another hour
+	dir := t.TempDir()
+	path := filepath.Join(dir, "kea-leases4.csv")
+	// Append order is chronological: the second 10.0.1.50 row (client1b,
+	// newer expire) supersedes the first. 10.0.1.99 is expired. 10.0.1.60
+	// is a normal single live lease.
+	csv := fmt.Sprintf(`address,hwaddr,client_id,valid_lifetime,expire,subnet_id,fqdn_fwd,fqdn_rev,hostname,state,user_context,pool_id
+10.0.1.50,aa:bb:cc:dd:ee:01,,86400,%d,1,0,0,client1a,0,,0
+10.0.1.99,aa:bb:cc:dd:ee:99,,86400,%d,1,0,0,stale,0,,0
+10.0.1.50,aa:bb:cc:dd:ee:01,,86400,%d,1,0,0,client1b,0,,0
+10.0.1.60,aa:bb:cc:dd:ee:60,,86400,%d,1,0,0,client2,0,,0
+`, future, past, future, future)
+	if err := os.WriteFile(path, []byte(csv), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	leases, err := parseLeaseCSV(path, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(leases) != 2 {
+		t.Fatalf("got %d leases, want 2 (deduped + non-expired); pre-#2085 returned 4", len(leases))
+	}
+	byAddr := indexLeasesByAddr(leases)
+	dup, ok := byAddr["10.0.1.50"]
+	if !ok {
+		t.Fatalf("deduped address 10.0.1.50 missing; got %+v", leases)
+	}
+	if dup.Hostname != "client1b" {
+		t.Errorf("dedup must keep the NEWEST row: hostname got %q, want client1b", dup.Hostname)
+	}
+	if _, ok := byAddr["10.0.1.99"]; ok {
+		t.Errorf("expired lease 10.0.1.99 must be dropped; got %+v", leases)
+	}
+	if _, ok := byAddr["10.0.1.60"]; !ok {
+		t.Errorf("live lease 10.0.1.60 must be present; got %+v", leases)
+	}
+	// Order is stable (first-appearance): 10.0.1.50 before 10.0.1.60.
+	if leases[0].Address != "10.0.1.50" || leases[1].Address != "10.0.1.60" {
+		t.Errorf("display order not stable first-appearance: %q, %q", leases[0].Address, leases[1].Address)
+	}
+}
+
+// TestParseLeaseCSV_StateFiltered pins the second half of #2085: a
+// released (state=2 expired-reclaimed) or declined (state=1) Kea lease
+// is written with a non-default state but often a FUTURE expire epoch,
+// so an expire-only filter would still show it as live. The display
+// must drop non-default-state rows too, BEFORE the expire check. A
+// later active (state=0) append must still reclaim the address.
+// Non-tautological against an expire-only half-fix (which would emit the
+// declined and reclaimed rows because their expire is in the future).
+func TestParseLeaseCSV_StateFiltered(t *testing.T) {
+	now := time.Unix(1707900000, 0)
+	future := now.Unix() + 3600
+	dir := t.TempDir()
+	path := filepath.Join(dir, "kea-leases4.csv")
+	// 10.0.1.10 declined (state=1, future expire) — must be hidden.
+	// 10.0.1.11 expired-reclaimed (state=2, future expire) — must be hidden.
+	// 10.0.1.12 reclaimed (state=2) then re-allocated live (state=0) —
+	//   the later live append must reclaim the address.
+	// 10.0.1.13 plain active — present.
+	csv := fmt.Sprintf(`address,hwaddr,client_id,valid_lifetime,expire,subnet_id,fqdn_fwd,fqdn_rev,hostname,state,user_context,pool_id
+10.0.1.10,aa:bb:cc:dd:ee:10,,86400,%d,1,0,0,declined,1,,0
+10.0.1.11,aa:bb:cc:dd:ee:11,,86400,%d,1,0,0,reclaimed,2,,0
+10.0.1.12,aa:bb:cc:dd:ee:12,,86400,%d,1,0,0,old,2,,0
+10.0.1.12,aa:bb:cc:dd:ee:12,,86400,%d,1,0,0,reallocated,0,,0
+10.0.1.13,aa:bb:cc:dd:ee:13,,86400,%d,1,0,0,active,0,,0
+`, future, future, future, future, future)
+	if err := os.WriteFile(path, []byte(csv), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	leases, err := parseLeaseCSV(path, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	byAddr := indexLeasesByAddr(leases)
+	if _, ok := byAddr["10.0.1.10"]; ok {
+		t.Errorf("declined lease (state=1, future expire) must be dropped; got %+v", leases)
+	}
+	if _, ok := byAddr["10.0.1.11"]; ok {
+		t.Errorf("expired-reclaimed lease (state=2, future expire) must be dropped; got %+v", leases)
+	}
+	reclaimed, ok := byAddr["10.0.1.12"]
+	if !ok {
+		t.Errorf("re-allocated address 10.0.1.12 must be shown live; got %+v", leases)
+	} else if reclaimed.Hostname != "reallocated" {
+		t.Errorf("reclaim must keep the live row: hostname got %q, want reallocated", reclaimed.Hostname)
+	}
+	if _, ok := byAddr["10.0.1.13"]; !ok {
+		t.Errorf("plain active lease 10.0.1.13 must be present; got %+v", leases)
+	}
+	if len(leases) != 2 {
+		t.Fatalf("got %d leases, want 2 (reallocated + active); pre-fix/expire-only returns more", len(leases))
+	}
+}
+
+// TestParseLeaseCSV_Lenient pins the display path's leniency: absent or
+// unparseable state/expire columns must NOT hide a lease, and a header
+// missing the state column entirely must degrade to today's behaviour
+// (all addressed rows shown), never abort the show. This is what keeps
+// the fix safe for older Kea / exotic headers.
+func TestParseLeaseCSV_Lenient(t *testing.T) {
+	now := time.Unix(1707900000, 0)
+	dir := t.TempDir()
+
+	// Garbage state + blank/garbage expire ⇒ rows kept.
+	path := filepath.Join(dir, "garbage.csv")
+	csv := `address,hwaddr,expire,state,hostname
+10.0.2.10,aa:bb:cc:dd:ee:10,notanumber,xyz,a
+10.0.2.11,aa:bb:cc:dd:ee:11,,,b
+`
+	if err := os.WriteFile(path, []byte(csv), 0644); err != nil {
+		t.Fatal(err)
+	}
+	leases, err := parseLeaseCSV(path, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(leases) != 2 {
+		t.Errorf("lenient: garbage/blank state+expire must keep rows; got %d, want 2 (%+v)", len(leases), leases)
+	}
+
+	// Header with NO state and NO expire column ⇒ all addressed rows shown.
+	path2 := filepath.Join(dir, "nostate.csv")
+	csv2 := `address,hwaddr,hostname
+10.0.3.10,aa:bb:cc:dd:ee:10,a
+10.0.3.11,aa:bb:cc:dd:ee:11,b
+`
+	if err := os.WriteFile(path2, []byte(csv2), 0644); err != nil {
+		t.Fatal(err)
+	}
+	leases2, err := parseLeaseCSV(path2, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(leases2) != 2 {
+		t.Errorf("lenient: missing state/expire columns must keep rows; got %d, want 2 (%+v)", len(leases2), leases2)
 	}
 }
 
