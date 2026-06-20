@@ -218,6 +218,20 @@ never lock an operator out of a remote box it manages.
   runtime HA controller under one daemon-owned deadline. Controller
   implementations may have their own RPC deadlines, but daemon shutdown does
   not wait past the outer deadline for those calls to return.
+- lo0 input filters (`interfaces lo0 unit 0 family inet[6] filter input
+  <name>`) lock down host-bound/control-plane traffic via an nftables table
+  `inet xpf_lo0`. `daemon_nft.go:applyLo0Filter` builds the table with
+  `buildLo0FilterPayload` and feeds it to `nft -f -`. nft parses an `-f -`
+  payload **atomically** — a syntax error on any line rejects the ENTIRE
+  payload (the filter then fails OPEN, logging only a `slog.Warn`). The
+  payload MUST therefore reset the prior table with the valid atomic idiom:
+  `table inet xpf_lo0` (create-if-absent, no body — idempotent) +
+  `flush table inet xpf_lo0` + the redefined table. Do NOT use
+  `flush ruleset inet xpf_lo0`: `flush ruleset` takes at most an OPTIONAL
+  family (`flush ruleset [<family>]`), never a table name — appending one is
+  an nft parse error that silently dropped the whole filter (#2069).
+  `TestLo0FilterPayloadNftParses` parse-checks the real payload with
+  `nft -c -f -` when nft is on PATH.
 
 ## RPM + ip-monitoring wiring (#1827)
 

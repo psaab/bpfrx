@@ -1,5 +1,36 @@
 # Action Log
 
+## 2026-06-20 — #2069 lo0 input filter never installs (invalid `flush ruleset <table>` nft syntax)
+
+- **Timestamp**: 2026-06-20
+- **Action**: Fixed #2069 (HIGH, audit-found, fail-open control-plane
+  filter). `applyLo0Filter` fed `nft -f -` a payload starting
+  `flush ruleset inet xpf_lo0\n`. nft's `flush ruleset` takes at most an
+  OPTIONAL family (`flush ruleset [<family>]`), never a table name — the
+  trailing `xpf_lo0` token is a parse error. nft parses `-f -` atomically,
+  so the line-1 syntax error rejected the ENTIRE payload incl. the real
+  filter rules; only a `slog.Warn` fired and the configured
+  `interfaces lo0 unit 0 family inet[6] filter input <name>` silently never
+  installed (host-bound traffic the operator meant to drop reached the local
+  stack). Replaced the invalid line with the correct atomic reset idiom:
+  `table inet xpf_lo0` (create-if-absent, no body — idempotent) +
+  `flush table inet xpf_lo0` + the redefined table block, all in one
+  payload. Extracted payload assembly into a pure `buildLo0FilterPayload`
+  seam so the payload is parse-checkable without the daemon apply path.
+  Verified against real nft 1.1.6: the bad line errors at parse
+  (`syntax error ... xpf_lo0`); the new idiom parses cleanly (only the
+  post-parse `Operation not permitted` netlink failure remains, expected
+  without CAP_NET_ADMIN).
+- **Tests**: Added `TestLo0FilterPayloadFlushIdiom` (string-level: forbids
+  `flush ruleset`, requires the create-if-absent + `flush table` idiom in
+  order, requires the real rule body) and `TestLo0FilterPayloadNftParses`
+  (runs `nft -c -f -` on the real payload when nft is on PATH; a syntax
+  error fails the test, a netlink/permission error is a pass, missing nft
+  skips). Both FAIL against the pre-fix `flush ruleset inet xpf_lo0` payload
+  (confirmed by injecting the old idiom). `nft -c` actually ran and parsed
+  the fixed payload. Full `go test ./pkg/daemon/` green.
+- **File(s)**: pkg/daemon/daemon_nft.go, pkg/daemon/lo0_filter_test.go,
+  pkg/daemon/README.md, _Log.md
 ## 2026-06-20 — #2062 ssh sshd_config.d drop-in lifecycle
 
 - **Timestamp**: 2026-06-20
