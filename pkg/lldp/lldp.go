@@ -102,6 +102,12 @@ type ifSession struct {
 	rxFD      int // AF_PACKET bound to ifindex, ETH_P_LLDP
 	txFD      int // AF_PACKET for periodic Sendto, opened once and reused
 	closeOnce sync.Once
+
+	// recvFn, when non-nil, replaces the real unix.Recvfrom-based recv. It is
+	// the test seam for exercising rxLoop's transient-error handling (EINTR /
+	// EAGAIN retry vs fatal exit) deterministically, without a real socket or
+	// signal delivery. Production leaves it nil.
+	recvFn func(buf []byte) (int, error)
 }
 
 // newIfSessionFn is the construction seam for ifSession. Tests override it to
@@ -138,6 +144,9 @@ func newIfSession(iface *net.Interface) (*ifSession, error) {
 // recv reads one frame from the RX socket. It blocks until a frame arrives or
 // the fd is closed by close().
 func (s *ifSession) recv(buf []byte) (int, error) {
+	if s.recvFn != nil {
+		return s.recvFn(buf)
+	}
 	n, _, err := unix.Recvfrom(s.rxFD, buf, 0)
 	return n, err
 }
@@ -359,10 +368,14 @@ func (m *Manager) rxLoop(ctx context.Context, sess *ifSession) {
 	for {
 		n, err := sess.recv(buf)
 		if err != nil {
-			// EINTR can be delivered to a goroutine in rare cases (e.g. from a
-			// signal forwarded through the Go runtime before it can be masked).
-			// Retry rather than silently terminating neighbor discovery.
-			if err == unix.EINTR {
+			// Transient, non-fatal recv errors must not kill neighbor
+			// discovery on a long-running daemon. EINTR can be delivered to a
+			// goroutine (e.g. a signal forwarded through the Go runtime before
+			// it can be masked); EAGAIN/EWOULDBLOCK is the spurious-wakeup case
+			// (the RX socket is blocking with no SO_RCVTIMEO, so this should not
+			// occur, but retrying is the only safe response if it ever does).
+			// Retry rather than silently terminating the RX loop.
+			if err == unix.EINTR || err == unix.EAGAIN || err == unix.EWOULDBLOCK {
 				continue
 			}
 			// recv was unblocked. If the context is cancelled, this is the

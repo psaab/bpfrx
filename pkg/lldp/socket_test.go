@@ -5,6 +5,7 @@ import (
 	"net"
 	"runtime"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -168,6 +169,81 @@ func TestStopUnblocksParkedRX(t *testing.T) {
 
 	// Stop cleared sessions; a second Stop must remain a safe no-op.
 	m.Stop()
+}
+
+// TestRxLoopRetriesTransientRecvErrors is the regression test for the rxLoop
+// transient-error fix (#2035 review). On a long-running daemon, unix.Recvfrom
+// can return EINTR (signal forwarded through the Go runtime) or, defensively,
+// EAGAIN. The pre-fix rxLoop returned on the first non-cancel error, silently
+// killing neighbor discovery until the next Apply(). The fix retries EINTR and
+// EAGAIN/EWOULDBLOCK and keeps the loop alive.
+//
+// This drives rxLoop directly through the recvFn seam: it returns EINTR, then
+// EAGAIN, then exactly one valid LLDP frame, then blocks until ctx is cancelled.
+// Without the retry the loop exits before the frame is delivered and no neighbor
+// is learned; with the retry the neighbor appears. The loop must then exit
+// cleanly when ctx is cancelled (proving cancellation still wins).
+func TestRxLoopRetriesTransientRecvErrors(t *testing.T) {
+	frame, err := BuildFrame(net.HardwareAddr{0x02, 0, 0, 0, 0, 1}, "test0", 120, "peer-node", "")
+	if err != nil {
+		t.Fatalf("BuildFrame: %v", err)
+	}
+	// BuildFrame already includes the Ethernet header; rxLoop skips ethHdrLen
+	// bytes before parsing TLVs, so confirm the frame is longer than the header.
+	if len(frame) <= ethHdrLen {
+		t.Fatalf("frame too short: %d bytes", len(frame))
+	}
+
+	gate := make(chan struct{})
+	var step int32
+	sess := &ifSession{
+		iface: &net.Interface{Name: "test0", Index: 1},
+		recvFn: func(buf []byte) (int, error) {
+			switch atomic.AddInt32(&step, 1) {
+			case 1:
+				return 0, unix.EINTR // must be retried, not fatal
+			case 2:
+				return 0, unix.EAGAIN // must be retried, not fatal
+			case 3:
+				return copy(buf, frame), nil // the one real frame
+			default:
+				// Park until ctx is cancelled, then report a fatal error so
+				// rxLoop takes the cancel-exit path.
+				<-gate
+				return 0, unix.EBADF
+			}
+		},
+	}
+
+	m := New()
+	ctx, cancel := context.WithCancel(context.Background())
+	loopDone := make(chan struct{})
+	go func() {
+		m.rxLoop(ctx, sess)
+		close(loopDone)
+	}()
+
+	// The neighbor only appears if rxLoop survived the EINTR + EAGAIN returns.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(m.Neighbors()) > 0 {
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	if got := len(m.Neighbors()); got != 1 {
+		t.Fatalf("rxLoop did not survive transient recv errors: want 1 neighbor, got %d "+
+			"(it exited on EINTR/EAGAIN instead of retrying)", got)
+	}
+
+	// Cancellation must still terminate the loop promptly.
+	cancel()
+	close(gate)
+	select {
+	case <-loopDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("rxLoop did not exit after ctx cancellation")
+	}
 }
 
 // TestApplySkipsInterfaceOnSocketError verifies that a session construction

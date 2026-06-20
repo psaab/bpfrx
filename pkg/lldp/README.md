@@ -35,6 +35,13 @@ Standard library + `golang.org/x/sys/unix`. No internal `pkg/*` imports.
   unblocks the parked `Recvfrom` immediately. This removed a 0–2s
   read-timeout tail from shutdown. Ordering is load-bearing:
   cancel → close fds → `wg.Wait()` (never wait before closing).
+- `rxLoop` treats `EINTR`/`EAGAIN`/`EWOULDBLOCK` from `Recvfrom` as
+  transient and retries — a signal forwarded through the Go runtime must
+  not silently terminate neighbor discovery on a long-running daemon. Any
+  other recv error exits the loop: if the context is cancelled it is the
+  expected `Stop()` close-to-unblock; otherwise it is an unrecoverable
+  socket error (e.g. the interface went away) with no timeout to retry
+  against.
 - The TX socket is opened once per interface in `newIfSession` and reused
   for every periodic advertisement (was previously opened+closed per
   frame).
