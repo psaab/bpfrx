@@ -524,3 +524,41 @@ the type byte is safe). Findings disposed:
 primitives, per-site insertion) is confirmed sound by both reviewers
 and pinned to the project's own prior-art wire behavior. v2 is ready for
 implementation.
+
+## 12. Smoke status (loss userspace cluster, head c23b16ebe)
+
+**Permit fast path — no regression (confirmed).** Post-deploy sustained
+iperf3 through the cluster: 8.59 Gbit/s, 0 retransmits (v4 port 5201);
+both nodes active, roles stable.
+
+**Reject event/log/match — confirmed.** With a `then reject` policy
+installed, sessions are tagged `Policy name: reject-test`, the
+`Policy deny` counter increments, and the firewall event log emits
+`action=reject` (the RT_FLOW_ACTION_REJECT mapping works end-to-end).
+
+**Reject reply delivery — INCONCLUSIVE on this HA cluster (deferred to a
+standalone DUT-isolated VM).** Repeated TCP/UDP probes through the
+reject policy produced client-side timeouts with no captured reply.
+Three lab-specific factors blocked a definitive result:
+1. AF_XDP zero-copy TX on the mlx5 VF dataplane is invisible to kernel
+   tcpdump, so the firewall side cannot observe a host-generated reply.
+2. `policy_reject_sent` / `policy_reject_reply_budget_drops` are not
+   surfaced via any CLI/HTTP/Prometheus (same as the sibling
+   `syn_cookie_*` counters), so the build/enqueue/budget state can't be
+   read from an operator surface.
+3. Temporary stderr instrumentation showed `enqueue_policy_reject_reply`
+   was not reached for the cluster's reject flows even though the deny
+   counter moved and sessions were tagged `reject-test` — i.e. on this
+   reth/VF + `ip_forward=1` HA path the reject decision appears to take
+   a session-creating route that does not pass the two instrumented
+   new-flow policy-deny sites (sites A/B). The unit tests prove the
+   builders + enqueue are correct in isolation; the open question is
+   which dataplane path the cluster's traffic actually takes.
+
+Recommended follow-up: validate live on a **standalone DUT-isolated VM**
+(`xpf-fwd`, virtio copy-mode AF_XDP = tcpdump-visible, `ip_forward`
+disableable) — the environment where #2089 was originally found — and,
+if the session-creating reject path is confirmed, wire the reject reply
+there too (a third call site beyond A/B). Surfacing the
+`policy_reject_*` counters via `show security flow statistics` would
+also make this directly observable.
