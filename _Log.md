@@ -1,5 +1,16 @@
 # Action Log
 
+## 2026-06-20 — #2089 policy reject action: TCP RST / ICMP unreachable
+
+- **Timestamp**: 2026-06-20
+- **Action**: Plan v1 — security-policy `then reject` currently a silent
+  drop. Add dataplane synthesis of TCP RST (TCP) and ICMP/ICMPv6
+  destination-unreachable admin-prohibited (other protos) at the
+  policy-deny sites in poll_descriptor, reusing the existing
+  SYN-cookie TCP reply builder (frame/tcp.rs) and ICMP error builder
+  (afxdp/icmp.rs) + the host-frame TX enqueue path (cookie_reply.rs).
+- **File(s)**: docs/pr/2089-reject-action/plan.md (new), _Log.md
+
 ## 2026-06-20 — #2062 ssh sshd_config.d drop-in lifecycle
 
 - **Timestamp**: 2026-06-20
