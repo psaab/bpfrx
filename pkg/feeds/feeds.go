@@ -215,6 +215,62 @@ func (m *Manager) GetPrefixes(name string) []string {
 	return nil
 }
 
+// SnapshotForBindings resolves each dynamic-address binding to the union of
+// its feed-backed prefixes, returning a deep copy keyed by address-name. This
+// is the ENFORCEMENT accessor (#2049): the daemon hands the result into the
+// userspace dataplane manager, which overlays the prefixes into the address
+// book the AF_XDP helper enforces. It is the first production caller of the
+// per-feed prefix snapshot — before #2049 the fetched prefixes were
+// status-only and never reached the forwarding path.
+//
+// Resolution semantics:
+//   - A binding's FeedNames are unioned (a binding may aggregate several
+//     feeds). Prefixes are deduped across feeds and returned sorted.
+//   - A feed with no installed snapshot (before first fetch, or after an
+//     explicit hold-interval drop) contributes nothing; if NONE of a
+//     binding's feeds have prefixes the entry maps to a non-nil empty slice,
+//     so the caller can tell "bound but empty" (fail-closed: matches nothing)
+//     from "not a feed binding" (absent from the map).
+//   - An unknown feed-name (binding references a feed that was never started)
+//     contributes nothing — it is treated the same as an empty feed.
+//
+// Reading the live last-good snapshot here means a persistent fetch failure
+// keeps enforcing the retained prefixes (the #2050 fail-safe), and the
+// startup window before the first fetch enforces an empty set — both are the
+// caller's responsibility to surface; this accessor only joins the data.
+func (m *Manager) SnapshotForBindings(daCfg *config.DynamicAddressConfig) map[string][]string {
+	if daCfg == nil || len(daCfg.AddressBindings) == 0 {
+		return nil
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make(map[string][]string, len(daCfg.AddressBindings))
+	for name, binding := range daCfg.AddressBindings {
+		if binding == nil {
+			continue
+		}
+		// Dedup across the binding's feeds; deep-copy from the live state.
+		seen := make(map[string]struct{})
+		merged := make([]string, 0)
+		for _, feedName := range binding.FeedNames {
+			fs, ok := m.feeds[feedName]
+			if !ok {
+				continue
+			}
+			for _, p := range fs.prefixes {
+				if _, dup := seen[p]; dup {
+					continue
+				}
+				seen[p] = struct{}{}
+				merged = append(merged, p)
+			}
+		}
+		sort.Strings(merged)
+		out[name] = merged
+	}
+	return out
+}
+
 // AllFeeds returns a snapshot of all feed states for display.
 func (m *Manager) AllFeeds() map[string]FeedInfo {
 	m.mu.RLock()

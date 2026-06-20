@@ -674,6 +674,18 @@ func (d *Daemon) applyConfigLocked(cfg *config.Config) error {
 		setter.SetRouteOverlay(commitOverlay)
 	}
 
+	// 1.96. Refresh the dataplane's dynamic-address feed overlay from the
+	// feed manager BEFORE the full snapshot build (#2049). The feed manager
+	// fetches threat-feed/allowlist prefixes and its onUpdate callback
+	// re-enters applyConfig against the SAME *config.Config; without this
+	// hand-off the address book the helper enforces would never see the
+	// feed prefixes (the never-enforced gap #2049 closes). The overlay is
+	// joined against the INCOMING config's bindings so a commit that removes
+	// a binding stops enforcing its feed. Mirrors SetRouteOverlay above.
+	if setter, ok := d.dp.(feedSnapshotSetter); ok {
+		setter.SetFeedSnapshots(d.feedSnapshotsForConfig(cfg))
+	}
+
 	// 2. Apply dataplane config through the runtime config sink.
 	var applyResult *dataplane.ApplyResult
 	if d.dp != nil {

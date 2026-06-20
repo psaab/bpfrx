@@ -1,5 +1,49 @@
 # Action Log
 
+## 2026-06-20 — #2049 enforce dynamic-address feed prefixes in the userspace dataplane
+
+- **Timestamp**: 2026-06-20
+- **Action**: Close the never-enforced dynamic-address feed gap (#2049,
+  sequenced after #2050/#2056). Feed prefixes were fetched, statused, and
+  shown but never reached the AF_XDP forwarding path: `feeds.GetPrefixes`
+  had no production caller, and the userspace snapshot's address resolution
+  (`buildAddressBookTable`/`classifyPolicyAddresses`) read only
+  `cfg.Security.AddressBook`, so a policy/NAT token naming a feed-backed
+  `address-name` was emitted to the helper as a no-match literal. Fix
+  re-targets the RUNTIME userspace snapshot path (NOT the retired eBPF
+  compiler): (1) `feeds.Manager.SnapshotForBindings` resolves each
+  `AddressBinding` to the deep-copied union of its live feed prefixes — the
+  first production caller of the per-feed snapshot; (2) the userspace
+  `Manager` gains a `feedOverlay` field + `SetFeedSnapshots` setter +
+  `feedSnapshotOverlay()` accessor, mirroring `routeOverlay`/`SetRouteOverlay`;
+  (3) `buildAddressBookTableWithFeeds` merges feed CIDRs into the named book's
+  content bucket before ID assignment so the name emits an
+  `AddressBookSnapshot` row, populates `nameToID`, and
+  `classifyPolicyAddresses` routes the token into
+  `SourceBookIDs`/`DestinationBookIDs`; (4) the daemon
+  (`feedSnapshotsForConfig` + `feedSnapshotSetter`) pushes the overlay into
+  the manager at the top of `applyConfigLocked`, joined against the INCOMING
+  config so a removed binding stops enforcing. The overlay lands in the hashed
+  `AddressBooks`, so a feed `onUpdate` (re-applyConfig against the same typed
+  config) shifts `snapshotContentHash` and the duplicate-publish gate
+  republishes. Empty-feed fail-safe: #2050 retains last-good forever by
+  default, so the only empty windows are startup-before-first-fetch and the
+  explicit operator hold-interval drop (empty book matches nothing —
+  documented). No new drop behavior added. Tests prove enforcement against the
+  published snapshot (v4+v6), the empty case, and that a feed content change
+  reshapes the snapshot + shifts the content hash; the core enforcement test
+  is non-tautological (verified it FAILS when the overlay merge is removed).
+- **File(s)**: `pkg/feeds/feeds.go`,
+  `pkg/feeds/feeds_bindings_test.go` (new),
+  `pkg/dataplane/userspace/manager.go`,
+  `pkg/dataplane/userspace/builder.go`,
+  `pkg/dataplane/userspace/policies.go`,
+  `pkg/dataplane/userspace/feed_enforcement_test.go` (new),
+  `pkg/dataplane/userspace/route_overlay_test.go` (builder arity),
+  `pkg/daemon/daemon_apply.go`,
+  `pkg/daemon/daemon_feeds.go` (new),
+  `docs/feature-gaps.md`,
+  `docs/userspace-dataplane-architecture.md`.
 ## 2026-06-20 — #2051 + #2052 config-mode edit/load surface parity (one PR)
 
 - **Timestamp**: 2026-06-20
@@ -6975,3 +7019,6 @@ top.
 - **Timestamp**: 2026-06-19
 - **Action**: #2050 feeds refresh-correctness + retain-last-good (the safety precondition for #2049). Rewrote the pkg/feeds fetch path to be fail-safe. (1) parseFeed now checks scanner.Err() after the scan loop; an overlong line (raised per-line cap maxLineBytes=1 MiB -> bufio.ErrTooLong) or a mid-stream read error fails the whole fetch instead of silently truncating. (2) Prefixes are canonicalized (masked CIDR / bare IP -> /32,/128), deduped, sorted, and SHA-256 hashed; the onUpdate recompile callback fires on CONTENT change (hash differs), not on count change — a same-count swap (192.0.2.0/24 -> 198.51.100.0/24) now fires; a reordered identical set does not. (3) A fetch is "successful" only on a clean read with a non-empty set; lastFetch/lastSuccess are stamped and the active snapshot replaced only then. (4) recordFailure implements retain-last-good: on failure it records lastError without stamping success, keeps the last-good snapshot from staleSince until the per-feed hold-interval (config hold-interval, default 7200s via resolveHoldInterval) elapses, then drops to empty (fail-closed, Junos-match) and fires onUpdate. (5) A zero-prefix HTTP-200 body is treated as suspect (retain last-good) so a hijacked/misconfigured endpoint cannot fail-open an enforced denylist. (6) Startup before the first good fetch is fail-closed (no snapshot, GetPrefixes empty). FeedInfo gains additive status fields (LastSuccess, LastError, StaleSince, Hash) — legacy URL/Prefixes/LastFetch preserved so show paths + the grpcapi golden test are unaffected. Net-new pkg/feeds/feeds_test.go (9 tests; bug-targeting ones mutation-verified: count-based detection, dropped scanner.Err, and stamp+replace-on-error each make the relevant test FAIL, restored code passes). Scope: pkg/feeds only — the #2049 enforcement join is a separate later PR. Validation: GOCACHE=/dev/shm/cache go build ./pkg/feeds/ ./... clean; go vet ./pkg/feeds/ clean; go test ./pkg/feeds/ -count=1 green; pkg/grpcapi golden tests green.
 - **File(s)**: pkg/feeds/feeds.go, pkg/feeds/feeds_test.go, pkg/feeds/README.md, _Log.md
+- **Timestamp**: 2026-06-20
+- **Action**: #2049 (PR #2058 Copilot review) — fix TWO confirmed showstopper/correctness bugs that made feed enforcement a no-op on the real runtime path. BUG 1 (showstopper): the daemon's feedSnapshotSetter hand-off asserts on the runtime dataplane, which on the default path is *LegacyDataPlaneAdapter (dpuserspace.Boot -> NewLegacyDataPlaneAdapter). The adapter forwarded SetRouteOverlay but had NO SetFeedSnapshots, so the type assertion in daemon_apply.go returned ok==false, SetFeedSnapshots was never called, m.feedOverlay stayed empty, and enforcement never reached the helper (the prior #2049 tests passed only because they called the Manager directly, bypassing the adapter). Fix: added LegacyDataPlaneAdapter.SetFeedSnapshots forwarding the overlay to the Manager, mirroring SetRouteOverlay's nil/err guard exactly. BUG 2: Manager.UpdatePolicyScheduleState (the CoS scheduler-only republish) rebuilt next.Policies/AddressBooks with a nil overlay (buildPolicySnapshotsWithSchedulerState + buildAddressBookTable), so a scheduler-state change republished a snapshot that DROPPED feed enforcement until the next full apply. Fix: read the cached overlay under the already-held m.mu via cloneFeedOverlay(m.feedOverlay) (NOT feedSnapshotOverlay(), which re-locks m.mu and would deadlock) and pass it to buildPolicySnapshotsWithSchedulerStateAndFeeds + buildAddressBookTableWithFeeds. Tests (the gap that let both bugs through — drive the ADAPTER + scheduler paths, not just the Manager): TestLegacyAdapterForwardsFeedSnapshots drives adapter.SetFeedSnapshots and asserts Manager.feedOverlay was set + a subsequent build enforces the book row/ID (FAILS pre-fix: undefined method -> build failure); TestSchedulerRepublishRetainsFeedEnforcement stands up a fake control socket, calls UpdatePolicyScheduleState with a stored overlay, captures the published apply_snapshot, and asserts the feed-backed book row + book-reference (SourceBookIDs not SourceLiterals) survived (FAILS pre-fix: "scheduler republish DROPPED the feed-backed book row; AddressBooks=[]"). Both failures verified by reverting each fix in isolation. Existing #2049 tests retained. Validation: GOCACHE=/dev/shm/cache go build ./... clean; go vet ./pkg/dataplane/userspace/ clean (the pkg/daemon ExportConfig lock-by-value warnings in daemon_flow.go are PRE-EXISTING, unmodified by this change); go test ./pkg/dataplane/userspace/ ./pkg/feeds/ ./pkg/daemon/ -count=1 all green. COMPANION-FREE per directive.
+- **File(s)**: pkg/dataplane/userspace/legacy_dataplane.go, pkg/dataplane/userspace/manager.go, pkg/dataplane/userspace/feed_enforcement_test.go, _Log.md

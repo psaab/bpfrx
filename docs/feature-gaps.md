@@ -131,11 +131,17 @@ SSL proxy is supported on vSRX 3.0 and enables inspection of encrypted traffic f
 
 ## 6. Advanced Threat Prevention (ATP)
 
-ATP Cloud integration provides cloud-based threat analysis. xpf has dynamic address feeds which partially overlap with SecIntel.
+ATP Cloud integration provides cloud-based threat analysis. xpf has dynamic
+address feeds which partially overlap with SecIntel. As of #2049 these feeds
+are ENFORCED: a policy/NAT rule referencing a feed-backed `address-name` now
+has the live feed prefixes overlaid into the userspace dataplane's address
+book (the `apply_snapshot` the AF_XDP helper enforces), and a feed refresh
+republishes the snapshot. Previously the prefixes were fetched and shown but
+never reached the forwarding path.
 
 | Feature | Junos Config Path | Description | Priority | Status |
 |---------|-------------------|-------------|----------|--------|
-| **SecIntel Threat Feeds** | `services security-intelligence profile ...` | Cloud-curated threat intelligence feeds: C&C servers, attacker IPs, malicious URLs, infected hosts. Applied via security policy. | Medium | Partial (xpf has dynamic address feeds but not SecIntel-format integration) |
+| **SecIntel Threat Feeds** | `services security-intelligence profile ...` | Cloud-curated threat intelligence feeds: C&C servers, attacker IPs, malicious URLs, infected hosts. Applied via security policy. | Medium | Partial (xpf dynamic address feeds are fetched, refreshed, and now ENFORCED via policy/NAT address-name bindings (#2049); SecIntel-format profile integration is still missing) |
 | **Malware Sandboxing** | `services advanced-anti-malware policy ...` | Cloud-based sandbox analysis of unknown files (ATP Cloud). File submission, verdict caching. | Low | Missing |
 | **Encrypted Traffic Insights** | `services ssl ... encrypted-traffic-insights ...` | Detect malware in encrypted traffic without decryption using TLS metadata analysis (JA3 fingerprints, certificate characteristics) | Low | Missing |
 | **GeoIP Filtering** | `security intelligence ... geoip ...` | Block/allow traffic by geographic location of source/destination IP | Medium | Missing |
