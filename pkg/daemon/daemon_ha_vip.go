@@ -18,8 +18,9 @@ import (
 )
 
 // checkVIPReadiness verifies that RETH interfaces for the given RG exist and
-// are operationally UP, so that VIPs can actually be added. Used in
-// private-rg-election mode where there are no VRRP instances to gate readiness.
+// have operational carrier (IFLA_OPERSTATE up, not merely admin IFF_UP), so
+// that VIPs can actually be added. Used in no-reth-vrrp / private-rg-election
+// mode where there are no VRRP instances to gate readiness.
 func (d *Daemon) checkVIPReadiness(rgID int) (bool, []string) {
 	cfg := d.store.ActiveConfig()
 	if cfg == nil {
@@ -64,7 +65,19 @@ func (d *Daemon) takeoverReadinessForRG(rgID int, ifReady bool, ifReasons []stri
 }
 
 // checkVIPReadinessForConfig verifies that RETH interfaces for the given RG
-// exist and are operationally UP. Pure function for testability.
+// exist and have operational carrier. Pure function for testability.
+//
+// Carrier state is read via cluster.LinkAttrsUp (IFLA_OPERSTATE, with the
+// IFF_UP admin-flag fallback only on OperUnknown), NOT the bare admin flag.
+// xpfd admin-ups every managed interface, so IFF_UP stays set even after a
+// cable pull — OR-ing it in (the pre-#2090 behavior) would judge a
+// carrier-down VIP interface ready and let a node take over VIPs on a dead
+// link (a black hole). This is the no-reth-vrrp sibling of #2070.
+//
+// vrrp.RethVIPsForRG keys this map by the resolved physical member /
+// VLAN sub-interface name, which on VLAN-tagged reths commonly reports
+// OperUnknown — hence the OperUnknown admin-flag fallback inside
+// cluster.LinkAttrsUp is load-bearing here.
 func checkVIPReadinessForConfig(cfg *config.Config, rgID int, linkByName func(string) (netlink.Link, error)) (bool, []string) {
 	vipMap := vrrp.RethVIPsForRG(cfg, rgID)
 	if len(vipMap) == 0 {
@@ -77,9 +90,7 @@ func checkVIPReadinessForConfig(cfg *config.Config, rgID int, linkByName func(st
 			reasons = append(reasons, fmt.Sprintf("vip interface %s not found", ifName))
 			continue
 		}
-		up := link.Attrs().OperState == netlink.OperUp ||
-			link.Attrs().Flags&net.FlagUp != 0
-		if !up {
+		if !cluster.LinkAttrsUp(link.Attrs()) {
 			reasons = append(reasons, fmt.Sprintf("vip interface %s down", ifName))
 		}
 	}

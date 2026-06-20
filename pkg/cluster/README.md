@@ -93,16 +93,30 @@ monitored uplink goes down. The whole point of interface-monitoring is to
 catch carrier loss (cable pulled / peer link down) and fail over.
 
 Link health is therefore decided from the kernel **operational** state
-(`IFLA_OPERSTATE`) via `linkAttrsUp`, **not** the administrative `IFF_UP`
-flag. xpfd admin-ups every managed interface, so `IFF_UP` is the normal
-steady state and stays set even after carrier loss — using it (or OR-ing
-it in) would report a cable-pulled link as UP and suppress failover
-(#2070). The rule is: `OperUp` → up; `OperUnknown` → fall back to the
-admin flag (virtual devices that report no carrier state); `OperDown` /
+(`IFLA_OPERSTATE`) via the exported `LinkAttrsUp`, **not** the
+administrative `IFF_UP` flag. xpfd admin-ups every managed interface, so
+`IFF_UP` is the normal steady state and stays set even after carrier loss
+— using it (or OR-ing it in) would report a cable-pulled link as UP and
+suppress failover (#2070). The rule is: `OperUp` → up; `OperUnknown` →
+fall back to the admin flag (virtual devices and 802.1Q VLAN
+sub-interfaces that report no independent carrier state); `OperDown` /
 `OperLowerLayerDown` / anything else → down. This mirrors
 `pkg/vrrp.linkAttrsUp`, the canonical link-state read used by VRRP
 track-interface detection. `pkg/routing/monitor.go` (the display-side
-`InterfaceMonitorStatus` path) uses the identical helper.
+`InterfaceMonitorStatus` path) carries its own identical copy.
+
+`LinkAttrsUp` is exported because the same carrier-aware read is needed
+outside the monitor loop:
+
+- `RethController.FormatStatus` (`reth.go`) and the reth-status displays
+  for `show chassis cluster interfaces` — both the gRPC/remote-CLI path
+  (`pkg/grpcapi`) and the local interactive CLI path (`pkg/cli`) — so a
+  cable-pulled-but-admin-up RETH member shows `down`/`Down`, not
+  `up`/`Up`, and the two display paths stay in agreement.
+- The daemon no-reth-vrrp / private-rg-election VIP-readiness gate
+  (`pkg/daemon.checkVIPReadinessForConfig`, #2090) — so a node is not
+  judged ready to take over VIPs on an interface whose carrier is down
+  (the #2070 hazard, surfacing on the VIP-takeover path).
 
 ## Callers
 

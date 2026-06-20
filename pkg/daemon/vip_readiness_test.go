@@ -185,8 +185,10 @@ func TestCheckVIPReadiness_WrongRG(t *testing.T) {
 	}
 }
 
-func TestCheckVIPReadiness_InterfaceUpViaFlags(t *testing.T) {
-	cfg := &config.Config{
+// rethVIPConfig returns a minimal RG-0 config whose only VIP interface
+// resolves (via RethToPhysical + LinuxIfName) to "ge-0-0-0".
+func rethVIPConfig() *config.Config {
+	return &config.Config{
 		Interfaces: config.InterfacesConfig{
 			Interfaces: map[string]*config.InterfaceConfig{
 				"reth0": {
@@ -203,21 +205,92 @@ func TestCheckVIPReadiness_InterfaceUpViaFlags(t *testing.T) {
 			},
 		},
 	}
+}
 
-	// Interface with OperDown but FlagUp set — should count as up.
-	links := map[string]*testLink{
-		"ge-0-0-0": {
-			attrs: netlink.LinkAttrs{
-				Name:      "ge-0-0-0",
-				OperState: netlink.OperDown,
-				Flags:     net.FlagUp,
-			},
+// TestCheckVIPReadiness_CarrierAware locks #2090: readiness is decided
+// from the operational carrier state (IFLA_OPERSTATE via
+// cluster.LinkAttrsUp), NOT the administrative IFF_UP flag. xpfd admin-ups
+// every managed interface, so IFF_UP stays set after a cable pull — the
+// pre-#2090 disjunction (OperUp || IFF_UP) wrongly judged a carrier-down
+// VIP interface ready. The "admin-up carrier-down -> NOT ready" case below
+// is non-tautological: the pre-fix code returns ready for OperDown+FlagUp,
+// so this test fails against pre-fix code.
+func TestCheckVIPReadiness_CarrierAware(t *testing.T) {
+	tests := []struct {
+		name      string
+		operState netlink.LinkOperState
+		flags     net.Flags
+		wantReady bool
+	}{
+		{
+			// Cable pulled: admin-up (IFF_UP set) but no carrier. The
+			// pre-#2090 bug reported this as ready (black-hole takeover).
+			name:      "admin-up carrier-down -> NOT ready",
+			operState: netlink.OperDown,
+			flags:     net.FlagUp,
+			wantReady: false,
+		},
+		{
+			// Peer link down: kernel reports lower-layer-down, IFF_UP
+			// still set.
+			name:      "admin-up lower-layer-down -> NOT ready",
+			operState: netlink.OperLowerLayerDown,
+			flags:     net.FlagUp,
+			wantReady: false,
+		},
+		{
+			name:      "admin-up carrier-up -> ready",
+			operState: netlink.OperUp,
+			flags:     net.FlagUp,
+			wantReady: true,
+		},
+		{
+			// Admin-down: IFF_UP clear, must be not ready.
+			name:      "admin-down -> NOT ready",
+			operState: netlink.OperDown,
+			flags:     0,
+			wantReady: false,
+		},
+		{
+			// VLAN sub-interface / virtual device with no independent
+			// carrier reporting: OperUnknown falls back to the admin flag
+			// (matches cluster.LinkAttrsUp / pkg/vrrp.linkAttrsUp). This is
+			// load-bearing — RethVIPsForRG keys on VLAN sub-interface names
+			// which commonly report OperUnknown.
+			name:      "operunknown admin-up -> ready",
+			operState: netlink.OperUnknown,
+			flags:     net.FlagUp,
+			wantReady: true,
+		},
+		{
+			name:      "operunknown admin-down -> NOT ready",
+			operState: netlink.OperUnknown,
+			flags:     0,
+			wantReady: false,
 		},
 	}
 
-	ready, reasons := checkVIPReadinessForConfig(cfg, 0, mockLinkByName(links))
-	if !ready {
-		t.Errorf("should be ready with FlagUp, got reasons: %v", reasons)
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			links := map[string]*testLink{
+				"ge-0-0-0": {attrs: netlink.LinkAttrs{
+					Name:      "ge-0-0-0",
+					OperState: tc.operState,
+					Flags:     tc.flags,
+				}},
+			}
+			ready, reasons := checkVIPReadinessForConfig(rethVIPConfig(), 0, mockLinkByName(links))
+			if ready != tc.wantReady {
+				t.Errorf("ready = %v, want %v (reasons: %v)", ready, tc.wantReady, reasons)
+			}
+			if !tc.wantReady {
+				if len(reasons) != 1 || !strings.Contains(reasons[0], "down") {
+					t.Errorf("expected one 'down' reason, got: %v", reasons)
+				}
+			} else if len(reasons) != 0 {
+				t.Errorf("expected no reasons when ready, got: %v", reasons)
+			}
+		})
 	}
 }
 
