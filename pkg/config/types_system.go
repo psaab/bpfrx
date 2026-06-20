@@ -725,8 +725,15 @@ type DHCPDynamicDNSConfig struct {
 	// increment-2 backend.
 	UpdateServer string
 	// TSIGKeyName / TSIGAlgorithm / TSIGSecret are the TSIG credentials
-	// for authenticated RFC 2136 updates. TSIGSecret is sensitive: it is
-	// redacted in String()/marshal echoes and must never be logged.
+	// for authenticated RFC 2136 updates. TSIGSecret is sensitive and is
+	// redacted by String() (so a %v/%s/slog of this struct never leaks the
+	// HMAC key — see String below). It is NOT redacted by JSON/YAML
+	// marshalling: like every other config secret (IKE pre-shared keys,
+	// OSPF auth keys — see freetext.go), the field is stored verbatim in the
+	// compiled config, which must never be serialized onto a user-facing
+	// surface. The only compiled-config marshaller, Store.ExportJSON, is a
+	// debug-only helper with no production callers. Cross-cutting
+	// marshal-time redaction for all config secrets is tracked separately.
 	TSIGKeyName   string
 	TSIGAlgorithm string
 	TSIGSecret    string
