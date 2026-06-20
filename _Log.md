@@ -285,6 +285,46 @@
   pkg/config/inactive_test.go, pkg/config/README.md, docs/config-schema.md,
   docs/feature-gaps.md, _Log.md
 
+## 2026-06-19 — #2033 serialize RA goodbye-withdraw with sender shutdown
+
+- **Timestamp**: 2026-06-19
+- **Action**: Path A single-owner RA refactor. Rewrote `sender.go` so the
+  per-interface `run()` goroutine is the sole writer/closer of the NDP
+  conn: added an `ndpConn` compile-time seam (mdlayher/ndp v1.1.0
+  signatures — `ndp.Message`/`*ipv6.ControlMessage`/`netip.Addr`),
+  `shutdownMode` (hard/graceful) published before a `sync.Once`-guarded
+  `close(stopCh)`, `finishShutdown` as the ONLY goodbye-emit + conn-close
+  site (graceful upgrades hard, owner closes after the goodbye),
+  interruptible startup/re-burst via `burstCh`, bounded writes
+  (`SetWriteDeadline`), `rsReceiver` error backoff, `lastRA` under
+  `lastRAMu` (W4 race fix), and a no-link-toggle `sendGoodbyeStandalone`
+  for `WithdrawOnce`. Rewrote `ra.go` with a draining-tombstone manager
+  (`m.draining` + `epoch`): `Withdraw`/`WithdrawInterfaces`/`Clear` move
+  senders to a tombstone under `m.mu` then join outside the lock; `Apply`
+  defers + epoch-guards interfaces blocked by a tombstone; `WithdrawOnce`
+  claims via the tombstone; `ResendBurst` goes through the owner.
+  Added a `State` field to `SenderInfo` ("active"/"draining"). Updated the
+  grpcapi show-RA text formatter to surface the draining state.
+- **File(s)**: pkg/ra/sender.go, pkg/ra/ra.go,
+  pkg/grpcapi/server_show_interfaces_text.go, _Log.md
+
+- **Timestamp**: 2026-06-19
+- **Action**: Added `pkg/ra/serialize_test.go`: a `fakeConn` recorder/
+  injector behind the `ndpConn` seam plus T1 (forced RS interleave) and
+  T1b ordering proofs of "no lifetime>0 RA after the first goodbye"; a
+  non-tautological negative arm; a `<=1 live conn per interface` tombstone
+  invariant (serial + concurrent Apply/Withdraw/WithdrawOnce/ResendBurst);
+  T3 (WithdrawOnce goodbye-only, no burst, no link toggle), T4a, T5, T6,
+  T7 (graceful-upgrades-hard, both orderings), T9, and a Status-draining
+  test. Mutation-verified: a normal-RA-after-goodbye mutant fails T1/T1b;
+  a missing-tombstone mutant trips the live-conn invariant.
+- **File(s)**: pkg/ra/serialize_test.go, _Log.md
+
+- **Timestamp**: 2026-06-19
+- **Action**: Documented the single-owner + draining-tombstone shutdown
+  contract and the Status "draining" state in the module README.
+- **File(s)**: pkg/ra/README.md, _Log.md
+
 ## 2026-06-19 — #2000 review follow-up on postinst test harness
 
 - **Timestamp**: 2026-06-19
