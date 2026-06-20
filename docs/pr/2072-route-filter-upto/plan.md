@@ -1,6 +1,8 @@
 # #2072 — route-filter `upto /N` match-type silently ignored
 
-Status: DRAFT v1 — pending adversarial plan review
+Status: v2 — both round-1 reviewers' PLAN-NEEDS-MAJOR findings folded
+(FRR idiom fixed to bare `le N`); ready to implement. See "v2 —
+adversarial plan-review resolution" at the bottom.
 
 ## Issue framing
 
@@ -66,12 +68,27 @@ shapes, confirmed empirically:
   `Keys=["/24"]`. Length token is `fc.Children[0].Keys[0]`.
 
 Both shapes are dispatched through `parsePolicyTermChildren` (the term
-node has children in both cases). A third, fully-flat shape
-(`parsePolicyTermInlineKeys`, where the whole `from route-filter ...`
-run is packed into one node's `Keys`) reads the length at `keys[i+3]`.
+node has children in both cases, because `from` is always a child
+node). The `parsePolicyTermInlineKeys` path is, for route-filter,
+effectively dead code under the current schema (a `term` with a `from`
+clause always produces a `from` child, never inline `from` keys), but
+we patch it as belt-and-suspenders so it cannot silently drop the
+length if dispatch ever changes; it reads the length at `keys[i+3]`.
 
-The `/N` token is a `/`-prefixed length (e.g. `/24`); parse it by
-stripping the leading `/` and `strconv.Atoi` on the remainder.
+Flat-set single-line caveat (does NOT affect the length read): if the
+ENTIRE term is written on one `set` line
+(`... route-filter 10.0.0.0/8 upto /24 then accept`), SetPath folds the
+trailing clause tokens into the route-filter child leaf
+(`Children[0].Keys=["/24","then","accept"]`) and `then accept` is lost
+— a pre-existing flat-set limitation, not introduced here. The length
+is still `Children[0].Keys[0]="/24"`, so the `upto` fix reads it
+correctly. Real configs use one `set` line per clause (multi-line),
+where the child is exactly `["/24"]`.
+
+The `/N` token is one lexer token, a `/`-prefixed length (e.g. `/24`) —
+empirically confirmed whole in both AST shapes (the lexer treats `/` as
+an identifier char). Parse it by stripping the leading `/` and
+`strconv.Atoi` on the remainder.
 
 ## Concrete design
 
@@ -139,17 +156,26 @@ case "route-filter":
 ### Renderer (`pkg/frr/policy_render.go`)
 
 Add an `upto` case to the existing `switch rf.MatchType`. Junos `upto
-/N` = the prefix itself plus all more-specifics with length ≤ N. FRR
-idiom: `<prefix> ge <prefix-len> le N`. Mirror the existing `longer`
-case's family-aware max derivation; clamp/validate against `UptoLen`:
+/N` = the prefix itself plus all more-specifics with length ≤ N. The
+correct, FRR-safe idiom is **bare `le N`** (NO `ge`), mirroring the
+existing `orlonger` case (which is bare `le max`) but capped at N:
 
 ```go
 case "upto":
     // upto /N = this prefix or any more specific, but no longer than
-    // /N. FRR: "ge <prefix-len> le N". If UptoLen is unset/invalid,
-    // fall back to the prior orlonger-equivalent default (le 32/128)
-    // so a malformed config degrades to the pre-fix behavior rather
-    // than producing an invalid prefix-list line.
+    // /N. FRR renders this as a bare "le N" — the implicit lower bound
+    // of a le clause is the prefix's own mask length, so "le N" matches
+    // the prefix itself plus every more-specific down to /N. This
+    // mirrors the orlonger case (bare "le max"), just capped at N.
+    //
+    // FRR requires len < le-value (and len < ge-value); a le/ge equal
+    // to or below the prefix length is REJECTED by FRR's prefix-list
+    // validator ("make sure: len < ge-value <= le-value") and an
+    // invalid line can fail the whole frr-reload. So:
+    //   - UptoLen > plen      -> "le N"   (the normal case)
+    //   - UptoLen == plen     -> ""       (exact: only the prefix itself)
+    //   - UptoLen < plen / 0  -> leave the default (orlonger-equivalent),
+    //                            degrade-safe; never emit an invalid line.
     parts := strings.SplitN(rf.Prefix, "/", 2)
     if len(parts) == 2 {
         if plen, err := strconv.Atoi(parts[1]); err == nil {
@@ -157,17 +183,26 @@ case "upto":
             if strings.Contains(rf.Prefix, ":") {
                 maxLen = 128
             }
-            if rf.UptoLen >= plen && rf.UptoLen <= maxLen {
-                matchStr = fmt.Sprintf("ge %d le %d", plen, rf.UptoLen)
+            switch {
+            case rf.UptoLen == plen:
+                matchStr = "" // upto /plen on a /plen == exact match
+            case rf.UptoLen > plen && rf.UptoLen <= maxLen:
+                matchStr = fmt.Sprintf("le %d", rf.UptoLen)
             }
         }
     }
 ```
 
-`ge <prefix-len>` is the FRR default lower bound for a `le` clause, so
-`ge 8 le 24` on `10.0.0.0/8` is semantically `8 <= len <= 24` — exactly
-Junos `upto /24`. Emitting `ge <prefix-len>` explicitly mirrors the
-`longer` case style and is unambiguous.
+`le N` (no `ge`) on `10.0.0.0/8 upto /24` renders
+`permit 10.0.0.0/8 le 24`, semantically `8 <= len <= 24` — exactly
+Junos `upto /24`. The existing `longer` case proves the codebase
+already follows the `len < value` rule (it uses `ge plen+1`, strictly
+greater). An earlier draft of this plan emitted `ge plen le N`; that is
+wrong — FRR rejects `ge == plen` ("len < ge-value" is required; pfSense
+FRR docs, FRR `filter.html`, VyOS T3133, FRR issue #9355). Bare `le N`
+is the canonical FRR form for Junos `upto` (FRR docs worked example:
+`permit 10.0.0.0/8 le 24` matches the /8 plus all more-specifics up to
+/24).
 
 ## Public API preservation
 
@@ -186,8 +221,10 @@ Junos `upto /24`. Emitting `ge <prefix-len>` explicitly mirrors the
   keyword + single-matcher selection logic is not modified.
 - **Degrade-safe.** If `UptoLen` is 0/invalid (e.g. a config that
   somehow stored `upto` with no length), the renderer falls back to the
-  prior default `matchStr` — no invalid `ge X le Y` with Y<X is ever
-  emitted (which FRR would reject and could fail the whole reload).
+  prior default `matchStr` — and never emits a `le`/`ge` value ≤ the
+  prefix length, which FRR rejects ("len < ge-value <= le-value") and
+  which could fail the whole frr-reload. This is why the render guard is
+  `UptoLen > plen` (strict) and `UptoLen == plen` renders as bare exact.
 - **Inline-key index advance.** `parsePolicyTermInlineKeys` must
   advance `i` by exactly the number of tokens consumed (2 normally, 3
   when an `upto` length is consumed) so the next clause keyword is not
@@ -204,7 +241,7 @@ Junos `upto /24`. Emitting `ge <prefix-len>` explicitly mirrors the
 | Lifetime / borrow (Go) | N/A | Go, no borrow checker; no goroutines/shared state |
 | Performance regression | NONE | config-compile + text render only, not hot path |
 | Architectural mismatch | LOW | extends an existing switch + an existing field; no new abstraction |
-| FRR-idiom wrong | MED | the one real risk — `ge plen le N` semantics must equal Junos `upto`; covered by render tests asserting exact output |
+| FRR-idiom wrong | RESOLVED | v1 draft `ge plen le N` was wrong (FRR rejects `ge == plen`); fixed to bare `le N` + `==plen→exact`, confirmed against FRR docs/VyOS T3133/FRR #9355 by both plan reviewers; covered by render tests asserting `le N`, no `ge`, no `le 32`/`le 128` |
 
 ## Test plan
 
@@ -220,9 +257,13 @@ All Go (no smoke — zero dataplane code touched, control-plane only):
     `UptoLen == 0`.
 - `pkg/frr` render tests (NEW), non-tautological (fail pre-fix):
   - `upto /24` on `10.0.0.0/8` → contains
-    `ip prefix-list ... permit 10.0.0.0/8 ge 8 le 24` and NOT `le 32`.
+    `ip prefix-list ... permit 10.0.0.0/8 le 24`, and contains NO `ge `
+    and NO `le 32`.
   - v6 `upto /48` on `2001:db8::/32` →
-    `ipv6 prefix-list ... permit 2001:db8::/32 ge 32 le 48`, not `le 128`.
+    `ipv6 prefix-list ... permit 2001:db8::/32 le 48`, no `ge `, no
+    `le 128`.
+  - Edge `upto /8` on `10.0.0.0/8` (UptoLen == plen) → bare
+    `permit 10.0.0.0/8` (exact, no `le`/`ge`).
   - Degrade: `upto` with `UptoLen == 0` falls back to default le 32 (no
     invalid line).
   - Regression: `exact`/`longer`/`orlonger` byte-identical to current.
@@ -241,6 +282,13 @@ All Go (no smoke — zero dataplane code touched, control-plane only):
   folded here. This plan touches ONLY `upto`.
 - Config-schema completion for the `upto /N` value slot (the schema
   already accepts the tokens; this is a render/compile correctness fix).
+- **Commit-time rejection of invalid `upto`** (missing length, or
+  `UptoLen <= prefix-len`). Junos rejects these at commit; this plan
+  degrades them safely at render (default / exact, never an invalid FRR
+  line) but does not add a typed-leaf commit validator. That is a
+  separate hardening — FILE A FOLLOW-UP issue for a `setSchema` /
+  `SchemaValidate` typed-leaf check. Both plan reviewers agreed the
+  degrade-then-follow-up split is acceptable for this correctness PR.
 
 ## Open questions for adversarial review
 
@@ -270,3 +318,36 @@ All Go (no smoke — zero dataplane code touched, control-plane only):
 6. **Inline-path `i` advance.** Confirm the variable `consumed`
    increment is correct and cannot skip or double-read a following
    clause keyword (e.g. `... upto /24 then accept`).
+
+## v2 — adversarial plan-review resolution
+
+Round 1: Codex = PLAN-NEEDS-MAJOR, hostile Claude reviewer (Gemini
+companion was down) = PLAN-NEEDS-MAJOR. Both converged on the same root
+cause. Resolutions folded into v2 above:
+
+- **Q1 FRR idiom (BLOCKER, both reviewers): FIXED.** The v1 `ge plen
+  le N` form is wrong — FRR requires `len < ge-value` and rejects
+  `ge == plen`, which would be the common case and could fail the
+  managed frr-reload. v2 renders bare `le N` (mirrors `orlonger`), with
+  the guard `UptoLen > plen`. Confirmed correct against FRR `filter.html`,
+  pfSense FRR docs, VyOS T3133, FRR issue #9355.
+- **Q5 / `==plen` edge (BLOCKER, Claude): FIXED.** `upto /8` on a /8
+  renders bare `permit <prefix>` (exact), not `le 8` (which FRR also
+  rejects, `le == len`).
+- **Q2 `/` tokenization (Codex MAJOR): REFUTED empirically.** `/24` is a
+  single lexer token in both AST shapes (verified by throwaway probe);
+  no off-by-one. Brace `Keys[3]="/24"`, flat-set child `Keys[0]="/24"`.
+- **Q2 flat-set shape description (Claude): CLARIFIED.** Single-line
+  set folds trailing clause tokens into the child leaf; multi-line (real
+  configs) gives child exactly `["/24"]`. Length read is correct either
+  way. Inline path is dead code for route-filter — patched as
+  belt-and-suspenders, framing softened.
+- **Q3/Q6 inline index advance: CONFIRMED correct** by both (dead code
+  regardless).
+- **Q4 degrade vs commit-reject: degrade-safe + follow-up.** Both
+  reviewers accepted silent degrade (now never an invalid FRR line) for
+  this correctness PR, with a follow-up issue for commit-time typed-leaf
+  validation. Recorded in Out of scope.
+
+Status: PLAN v2 — both reviewers' MAJOR findings folded; ready to
+implement.
