@@ -34,11 +34,15 @@ applies a *retain-last-good* policy rather than installing a partial/empty set:
   usable prefixes is treated as a failure (retain last-good), so a hijacked or
   misconfigured endpoint serving an empty file cannot silently fail-open an
   enforced denylist.
-- **`hold-interval` (retain-last-good window).** On a fetch failure the
-  last-good snapshot is retained from `StaleSince` until `hold-interval`
-  (config `hold-interval`, default 7200 s) elapses, then dropped to empty
-  (fail-closed, matching Junos) with an `onUpdate` so enforcement sees the
-  now-empty set.
+- **`hold-interval` is the opt-in timed drop (default: retain forever).**
+  On a fetch failure the last-good snapshot is retained from `StaleSince`.
+  By default (`hold-interval` unset) it is retained **indefinitely** — it is
+  never auto-dropped to empty — so a stale denylist cannot silently
+  fail-open. This is the operator-chosen posture and deliberately diverges
+  from Junos hold-interval-then-drop. Only when `hold-interval` is explicitly
+  configured > 0 does the snapshot drop to empty after that interval elapses
+  (clearing `StaleSince`/`Hash`), firing an `onUpdate` so enforcement sees
+  the now-empty set — an explicit operator opt-in to fail-open-on-stale.
 - **startup is fail-closed.** Before the first successful fetch there is no
   snapshot; `GetPrefixes` returns empty. A policy referencing a feed-backed
   address resolves to nothing until the first good fetch (bounded to seconds).
