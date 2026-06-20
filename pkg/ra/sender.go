@@ -7,11 +7,14 @@ import (
 	"math/rand/v2"
 	"net"
 	"net/netip"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/mdlayher/ndp"
 	"github.com/vishvananda/netlink"
+	"golang.org/x/net/ipv6"
 	"golang.org/x/sys/unix"
 
 	"github.com/psaab/xpf/pkg/config"
@@ -39,27 +42,94 @@ const (
 	startupBurstDelay = 100 * time.Millisecond
 
 	// Default prefix lifetimes per RFC 4861.
-	defaultValidLifetime    = 2592000 // 30 days
+	defaultValidLifetime     = 2592000 // 30 days
 	defaultPreferredLifetime = 604800  // 7 days
+
+	// writeDeadline bounds every owner WriteTo so a stuck socket cannot wedge
+	// withdrawal (#2033 I18 / Codex r3 MODERATE #4). Because the owner always
+	// returns promptly, owner-performs-the-close (I17) is safe for both modes.
+	writeDeadline = 1 * time.Second
+
+	// rsReadDeadline bounds each rsReceiver ReadFrom so it can observe stopCh.
+	rsReadDeadline = 1 * time.Second
+	// rsErrBackoff is applied after a persistent (non-deadline) read error so
+	// rsReceiver cannot hot-loop at 100% CPU if the interface dies while stopCh
+	// is still open (#2033 I10 / AGY r4 MINOR #4).
+	rsErrBackoff = 200 * time.Millisecond
 )
 
+// shutdownMode is the arbitrated teardown intent for a sender. It is set
+// (atomically) BEFORE stopCh is closed, so any owner wakeup that observes the
+// closed channel also observes the mode. graceful UPGRADES hard (never the
+// reverse) — see signalStop (#2033 I13/I17).
+type shutdownMode int32
+
+const (
+	modeNone     shutdownMode = iota // running
+	modeHard                         // stop without a goodbye (Clear / Apply-remove)
+	modeGraceful                     // emit the lifetime-0 goodbye as the final write
+)
+
+// ndpConn is the minimal subset of *ndp.Conn that sender uses. It exists as a
+// compile-time seam so tests can substitute a recorder/injector (fakeConn)
+// without a live NDP socket. The signatures MUST match mdlayher/ndp v1.1.0
+// exactly: ndp.Message + *ipv6.ControlMessage + netip.Addr on WriteTo/ReadFrom,
+// *ipv6.ICMPFilter on SetICMPFilter, netip.Addr group on JoinGroup. Do not
+// widen this interface beyond what sender needs.
+type ndpConn interface {
+	WriteTo(m ndp.Message, cm *ipv6.ControlMessage, dst netip.Addr) error
+	ReadFrom() (ndp.Message, *ipv6.ControlMessage, netip.Addr, error)
+	Close() error
+	SetReadDeadline(t time.Time) error
+	SetWriteDeadline(t time.Time) error
+	JoinGroup(group netip.Addr) error
+	SetICMPFilter(f *ipv6.ICMPFilter) error
+}
+
+// listenFn opens an ndpConn for the interface. Overridable in tests; defaults
+// to the real mdlayher/ndp Listen.
+var listenFn = func(iface *net.Interface, addr ndp.Addr) (ndpConn, netip.Addr, error) {
+	return ndp.Listen(iface, addr)
+}
+
+// ensureLinkLocalFn lets tests stub the link-local setup (a pure netlink
+// AddrAdd after #2034) so the goodbye-only WithdrawOnce path can be asserted to
+// SKIP it entirely (#2033 I12 — it must not even attempt to add a link-local on
+// a demoting interface). Defaults to the real implementation.
+var ensureLinkLocalFn = ensureLinkLocal
+
 // sender is a per-interface RA sender goroutine.
+//
+// Single-owner contract (#2033, Path A): run() is the SOLE writer/closer of the
+// NDP connection — startup burst, periodic RAs, RS-triggered RAs AND the
+// goodbye all flow through it. No other goroutine calls conn.WriteTo or
+// conn.Close. Shutdown is signalled via signalStop (sets mode, closes stopCh
+// once); the owner reads mode after waking and, on modeGraceful, emits the
+// lifetime-0 goodbye as its FINAL action in finishShutdown — guaranteeing no
+// lifetime>0 RA follows the goodbye on the wire.
 type sender struct {
 	cfg     *config.RAInterfaceConfig
 	iface   *net.Interface
-	conn    *ndp.Conn
+	conn    ndpConn
 	srcAddr netip.Addr
-	stopCh  chan struct{}
-	stopped chan struct{}
-	lastRA  time.Time // rate-limit RS responses
+
+	mode     atomic.Int32 // shutdownMode; set BEFORE close(stopCh)
+	stopOnce sync.Once    // guards close(stopCh)
+	stopCh   chan struct{}
+	stopped  chan struct{}
+	burstCh  chan struct{} // buffered(1): request a re-burst (ResendBurst)
+
+	lastRAMu sync.Mutex
+	lastRA   time.Time // rate-limit RS responses; owner writes, Status reads
 }
 
 func newSender(cfg *config.RAInterfaceConfig, iface *net.Interface) *sender {
 	return &sender{
-		cfg:    cfg,
-		iface:  iface,
-		stopCh: make(chan struct{}),
+		cfg:     cfg,
+		iface:   iface,
+		stopCh:  make(chan struct{}),
 		stopped: make(chan struct{}),
+		burstCh: make(chan struct{}, 1),
 	}
 }
 
@@ -67,31 +137,11 @@ func newSender(cfg *config.RAInterfaceConfig, iface *net.Interface) *sender {
 // Ensures a link-local address exists (RETH interfaces suppress auto
 // link-local via addr_gen_mode=1, so we add one explicitly with NODAD).
 func (s *sender) start() error {
-	if err := ensureLinkLocal(s.iface); err != nil {
+	if err := ensureLinkLocalFn(s.iface); err != nil {
 		slog.Warn("ra: failed to ensure link-local", "interface", s.iface.Name, "err", err)
 	}
 
-	// Determine NDP bind address: use explicitly configured link-local if set,
-	// otherwise default to any link-local on the interface.
-	var bindAddr ndp.Addr = ndp.LinkLocal
-	if s.cfg.SourceLinkLocal != "" {
-		bindAddr = ndp.Addr(s.cfg.SourceLinkLocal)
-	}
-
-	var conn *ndp.Conn
-	var srcAddr netip.Addr
-	var err error
-	for attempt := 0; attempt < 10; attempt++ {
-		conn, srcAddr, err = ndp.Listen(s.iface, bindAddr)
-		if err == nil {
-			break
-		}
-		// Re-read interface (link-local may appear after addr add).
-		time.Sleep(200 * time.Millisecond)
-		if iface, e := net.InterfaceByName(s.iface.Name); e == nil {
-			s.iface = iface
-		}
-	}
+	conn, srcAddr, err := s.listen()
 	if err != nil {
 		return err
 	}
@@ -117,34 +167,131 @@ func (s *sender) start() error {
 	return nil
 }
 
-// stop signals the sender goroutine to exit and waits.
-func (s *sender) stop() {
-	close(s.stopCh)
-	if s.conn != nil {
-		s.conn.Close()
+// sendGoodbyeStandalone is the WithdrawOnce goodbye-only entry point. It opens
+// a connection, emits the lifetime-0 goodbye, and closes — WITHOUT launching
+// run() and WITHOUT the startup burst (so it never re-advertises the router it
+// is withdrawing — fixes S1). Per #2033 I12 it MUST NOT toggle the link: if no
+// usable link-local exists, ndp.Listen fails and the goodbye is skipped
+// best-effort rather than cycling a demoting interface (which may be mid-RETH-
+// MAC-cycle). Returns an error only when the conn could not be opened so the
+// caller can log; a goodbye is otherwise emitted and the conn closed here.
+func (s *sender) sendGoodbyeStandalone() error {
+	conn, srcAddr, err := s.listen()
+	if err != nil {
+		return err
 	}
-	<-s.stopped
+	s.conn = conn
+	s.srcAddr = srcAddr
+	defer s.conn.Close()
+	s.sendGoodbyeRA()
+	return nil
 }
 
-// run is the main sender loop.
+// listen opens the NDP connection with the configured bind address, retrying
+// while the link-local address settles after ensureLinkLocal.
+func (s *sender) listen() (ndpConn, netip.Addr, error) {
+	var bindAddr ndp.Addr = ndp.LinkLocal
+	if s.cfg.SourceLinkLocal != "" {
+		bindAddr = ndp.Addr(s.cfg.SourceLinkLocal)
+	}
+
+	var conn ndpConn
+	var srcAddr netip.Addr
+	var err error
+	for attempt := 0; attempt < 10; attempt++ {
+		conn, srcAddr, err = listenFn(s.iface, bindAddr)
+		if err == nil {
+			return conn, srcAddr, nil
+		}
+		// Re-read interface (link-local may appear after addr add).
+		time.Sleep(200 * time.Millisecond)
+		if iface, e := net.InterfaceByName(s.iface.Name); e == nil {
+			s.iface = iface
+		}
+	}
+	return nil, netip.Addr{}, err
+}
+
+// signalStop publishes the teardown intent then closes stopCh exactly once.
+//
+// The mode store happens-before the close (which in turn happens-before the
+// owner's wakeup on the closed channel — Go memory model), so the owner that
+// observes the closed stopCh also observes the mode.
+//
+// GRACEFUL UPGRADES HARD (#2033 I13/I17): in cluster mode a demotion Withdraw
+// (VRRP-event goroutine, no applySem) can race a config-apply Clear for the
+// same sender — pkg/ra's m.mu is the ONLY serialization. First-writer-wins
+// would let a benign Clear drop the demotion goodbye (the exact bug). So a
+// graceful request wins over a hard one: graceful is stored unconditionally,
+// hard only if nothing was set yet. NEVER downgrade graceful->hard. Because
+// the owner performs conn.Close AFTER emitting the goodbye (finishShutdown,
+// I17), a racing hard close can never kill the upgraded goodbye. The only
+// residual is the sub-microsecond window where the owner already read modeHard
+// before the upgrade store — accepted as best-effort (the new primary's RA is
+// the real recovery).
+func (s *sender) signalStop(m shutdownMode) {
+	if m == modeGraceful {
+		s.mode.Store(int32(modeGraceful))
+	} else {
+		s.mode.CompareAndSwap(int32(modeNone), int32(modeHard))
+	}
+	s.stopOnce.Do(func() { close(s.stopCh) })
+}
+
+// stop tears the sender down WITHOUT a goodbye (Clear / Apply-remove). The
+// owner closes the conn in finishShutdown.
+func (s *sender) stop() { s.signalStop(modeHard); <-s.stopped }
+
+// withdrawAndStop tears the sender down emitting the lifetime-0 goodbye as the
+// final write (graceful demotion).
+func (s *sender) withdrawAndStop() { s.signalStop(modeGraceful); <-s.stopped }
+
+// requestBurst asks the owner to re-emit the startup burst (after a RETH MAC
+// link cycle killed the socket). Non-blocking: if a burst is already queued or
+// the sender is draining, the request is dropped.
+func (s *sender) requestBurst() {
+	if s.draining() {
+		return
+	}
+	select {
+	case s.burstCh <- struct{}{}:
+	default:
+	}
+}
+
+// draining reports whether a shutdown has been signalled. It is a best-effort
+// early-out for the burst/RS paths; the correctness mechanism is that the
+// goodbye is owner-emitted on exit (so any in-flight normal RA necessarily
+// PRECEDES it).
+func (s *sender) draining() bool { return s.mode.Load() != int32(modeNone) }
+
+// run is the single-owner sender loop. It is the ONLY goroutine that writes or
+// closes the connection.
 func (s *sender) run() {
 	defer close(s.stopped)
 
-	// Send an initial burst so hosts do not wait for the periodic timer to
-	// relearn a default router after xpfd restarts or HA role changes.
-	s.sendStartupBurst()
+	// Interruptible startup burst so a withdraw during startup cannot leave a
+	// normal RA after the goodbye.
+	s.burstInterruptible()
+	if s.draining() {
+		s.finishShutdown()
+		return
+	}
 
 	advTimer := time.NewTimer(s.randomAdvInterval())
 	defer advTimer.Stop()
 
-	// Receiver goroutine forwards RS events.
 	rsCh := make(chan netip.Addr, 8)
 	go s.rsReceiver(rsCh)
 
 	for {
 		select {
 		case <-s.stopCh:
+			s.finishShutdown()
 			return
+
+		case <-s.burstCh:
+			s.burstInterruptible()
 
 		case <-advTimer.C:
 			s.sendRA()
@@ -152,50 +299,97 @@ func (s *sender) run() {
 
 		case _, ok := <-rsCh:
 			if !ok {
+				// rsReceiver only closes rsCh after observing stopCh (I14),
+				// so this implies shutdown is already in progress.
+				s.finishShutdown()
 				return
 			}
 			// Rate-limit multicast RA responses per RFC 4861 §6.2.6.
-			if time.Since(s.lastRA) < minRAMulticastDelay {
+			if time.Since(s.getLastRA()) < minRAMulticastDelay {
 				continue
 			}
-			// Random delay before responding.
-			delay := time.Duration(rand.IntN(int(maxRSDelay)))
-			time.Sleep(delay)
-			// Re-check after delay.
+			// Random delay before responding, interruptible by shutdown.
+			t := time.NewTimer(time.Duration(rand.IntN(int(maxRSDelay))))
 			select {
 			case <-s.stopCh:
+				t.Stop()
+				s.finishShutdown()
 				return
-			default:
+			case <-t.C:
 			}
 			s.sendRA()
-			// Reset periodic timer after RS-triggered RA.
 			advTimer.Reset(s.randomAdvInterval())
 		}
 	}
 }
 
-func (s *sender) sendStartupBurst() {
+// finishShutdown is the ONLY place the goodbye is emitted AND the ONLY place
+// the conn is closed (#2033 I17). It runs on the owner after the loop is gone,
+// so no normal RA can follow the goodbye. The mode is re-read here, honoring a
+// graceful upgrade that landed before the owner woke. The conn is closed AFTER
+// the goodbye, which also unblocks the detached rsReceiver's ReadFrom (I10).
+func (s *sender) finishShutdown() {
+	if shutdownMode(s.mode.Load()) == modeGraceful {
+		s.sendGoodbyeRA()
+	}
+	if s.conn != nil {
+		s.conn.Close()
+	}
+}
+
+// burstInterruptible emits the startup burst (startupBurstCount normal RAs),
+// checking draining()/stopCh between sends so a concurrent withdraw stops the
+// burst immediately. A legitimate start emits all RAs (I3); a draining sender
+// short-circuits (I11/I15).
+func (s *sender) burstInterruptible() {
 	for i := 0; i < startupBurstCount; i++ {
+		if s.draining() {
+			return
+		}
 		s.sendRA()
 		if i < startupBurstCount-1 {
-			time.Sleep(startupBurstDelay)
+			t := time.NewTimer(startupBurstDelay)
+			select {
+			case <-s.stopCh:
+				t.Stop()
+				return
+			case <-t.C:
+			}
 		}
 	}
 }
 
-// rsReceiver reads Router Solicitations and forwards them to the channel.
+// rsReceiver reads Router Solicitations and forwards them to the channel. It is
+// a detached goroutine bounded by the owner's conn.Close (I10): the owner exits
+// on stopCh regardless of rsCh state, then closes the conn, which unblocks this
+// ReadFrom within one deadline at worst. It backs off on a persistent
+// non-deadline read error so it cannot hot-loop if the interface dies while
+// stopCh is still open (I10 / AGY r4 MINOR #4). It returns (closing rsCh) ONLY
+// after observing stopCh (I14), so the owner's "rsCh closed" branch always
+// implies shutdown is already in progress.
 func (s *sender) rsReceiver(ch chan<- netip.Addr) {
 	defer close(ch)
 	for {
-		s.conn.SetReadDeadline(time.Now().Add(1 * time.Second))
+		s.conn.SetReadDeadline(time.Now().Add(rsReadDeadline))
 		msg, _, src, err := s.conn.ReadFrom()
 		if err != nil {
 			select {
 			case <-s.stopCh:
 				return
 			default:
-				continue
 			}
+			// Not shutting down: a deadline timeout is the expected poll
+			// signal; any other persistent error must not hot-loop.
+			if !isTimeout(err) {
+				t := time.NewTimer(rsErrBackoff)
+				select {
+				case <-s.stopCh:
+					t.Stop()
+					return
+				case <-t.C:
+				}
+			}
+			continue
 		}
 
 		if _, ok := msg.(*ndp.RouterSolicitation); !ok {
@@ -209,26 +403,52 @@ func (s *sender) rsReceiver(ch chan<- netip.Addr) {
 	}
 }
 
-// sendRA sends a Router Advertisement to all-nodes multicast (ff02::1).
+// isTimeout reports whether err is an i/o deadline timeout (the expected
+// rsReceiver poll signal) rather than a genuine socket error.
+func isTimeout(err error) bool {
+	type timeout interface{ Timeout() bool }
+	te, ok := err.(timeout)
+	return ok && te.Timeout()
+}
+
+// getLastRA returns the last-RA timestamp under lastRAMu.
+func (s *sender) getLastRA() time.Time {
+	s.lastRAMu.Lock()
+	defer s.lastRAMu.Unlock()
+	return s.lastRA
+}
+
+// setLastRA records the last-RA timestamp under lastRAMu.
+func (s *sender) setLastRA(t time.Time) {
+	s.lastRAMu.Lock()
+	s.lastRA = t
+	s.lastRAMu.Unlock()
+}
+
+// sendRA sends a normal Router Advertisement to all-nodes multicast (ff02::1).
+// Owner-only.
 func (s *sender) sendRA() {
 	ra := s.buildRA()
 	allNodes := netip.MustParseAddr("ff02::1")
+	s.conn.SetWriteDeadline(time.Now().Add(writeDeadline))
 	if err := s.conn.WriteTo(ra, nil, allNodes); err != nil {
 		slog.Warn("ra: failed to send RA",
 			"interface", s.cfg.Interface, "err", err)
 		return
 	}
-	s.lastRA = time.Now()
+	s.setLastRA(time.Now())
 	slog.Debug("ra: sent RA", "interface", s.cfg.Interface)
 }
 
 // sendGoodbyeRA sends goodbye RAs (lifetime=0) multiple times for reliability.
+// Owner-only — emitted as the final write in finishShutdown.
 func (s *sender) sendGoodbyeRA() {
 	ra := s.buildRA()
 	ra.RouterLifetime = 0
 	allNodes := netip.MustParseAddr("ff02::1")
 
 	for i := 0; i < goodbyeCount; i++ {
+		s.conn.SetWriteDeadline(time.Now().Add(writeDeadline))
 		if err := s.conn.WriteTo(ra, nil, allNodes); err != nil {
 			slog.Warn("ra: failed to send goodbye RA",
 				"interface", s.cfg.Interface, "err", err)
