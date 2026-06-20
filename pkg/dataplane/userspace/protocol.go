@@ -1457,6 +1457,10 @@ type BindingStatus struct {
 	SYNCookieAckValid              uint64 `json:"syn_cookie_ack_valid,omitempty"`
 	SYNCookieAckInvalid            uint64 `json:"syn_cookie_ack_invalid,omitempty"`
 	SYNCookieBypass                uint64 `json:"syn_cookie_bypass,omitempty"`
+	// #2089: policy `reject` action — RST/ICMP-unreachable replies sent,
+	// and replies suppressed due to TX-frame budget exhaustion.
+	PolicyRejectSent               uint64 `json:"policy_reject_sent,omitempty"`
+	PolicyRejectReplyBudgetDrops   uint64 `json:"policy_reject_reply_budget_drops,omitempty"`
 	SNATPackets                    uint64 `json:"snat_packets,omitempty"`
 	DNATPackets                    uint64 `json:"dnat_packets,omitempty"`
 	SlowPathPackets                uint64 `json:"slow_path_packets,omitempty"`

@@ -111,6 +111,8 @@
     "outstanding_tx": 0,
     "pending_tx_local_overflow_drops": 0,
     "policy_denied_packets": 0,
+    "policy_reject_reply_budget_drops": 0,
+    "policy_reject_sent": 0,
     "post_drain_backup_bytes": 0,
     "post_drain_backup_cos_drop_bytes": 0,
     "post_drain_backup_cos_drops": 0,

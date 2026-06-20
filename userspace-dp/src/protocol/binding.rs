@@ -429,6 +429,10 @@ pub(crate) struct BindingStatus {
     pub syn_cookie_ack_invalid: u64,
     #[serde(rename = "syn_cookie_bypass", default)]
     pub syn_cookie_bypass: u64,
+    #[serde(rename = "policy_reject_sent", default)]
+    pub policy_reject_sent: u64,
+    #[serde(rename = "policy_reject_reply_budget_drops", default)]
+    pub policy_reject_reply_budget_drops: u64,
     #[serde(rename = "snat_packets", default)]
     pub snat_packets: u64,
     #[serde(rename = "dnat_packets", default)]

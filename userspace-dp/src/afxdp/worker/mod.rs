@@ -1260,6 +1260,10 @@ pub(crate) struct BindingLiveSnapshot {
     pub(crate) syn_cookie_ack_valid: u64,
     pub(crate) syn_cookie_ack_invalid: u64,
     pub(crate) syn_cookie_bypass: u64,
+    /// #2089: policy-`reject` RST/ICMP-unreachable replies enqueued.
+    pub(crate) policy_reject_sent: u64,
+    /// #2089: policy-`reject` replies suppressed by TX-frame budget.
+    pub(crate) policy_reject_reply_budget_drops: u64,
     pub(crate) snat_packets: u64,
     pub(crate) dnat_packets: u64,
     pub(crate) slow_path_packets: u64,

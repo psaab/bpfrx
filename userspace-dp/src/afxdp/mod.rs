@@ -154,7 +154,8 @@ use self::gre::{encapsulate_native_gre_frame, try_native_gre_decap_from_frame};
 use self::icmp::{FABRIC_INGRESS_FLAG, build_local_time_exceeded_request, is_icmp_error};
 #[cfg(test)]
 use self::icmp::{
-    build_local_time_exceeded_v4, build_local_time_exceeded_v6, packet_ttl_would_expire,
+    build_local_time_exceeded_v4, build_local_time_exceeded_v6, build_reject_icmp_unreachable,
+    packet_ttl_would_expire, reject_icmp_reply_suppressed,
 };
 #[cfg(test)]
 use self::icmp_embed::{
@@ -429,6 +430,12 @@ pub(in crate::afxdp) struct BatchCounters {
     syn_cookie_ack_valid: u64,
     syn_cookie_ack_invalid: u64,
     syn_cookie_bypass: u64,
+    // #2089: policy `reject` reply synthesis. policy_reject_sent counts
+    // RST/ICMP-unreachable replies enqueued; policy_reject_reply_budget_drops
+    // counts replies suppressed because the TX-frame budget was exhausted
+    // (the packet is still dropped — fail-closed).
+    policy_reject_sent: u64,
+    policy_reject_reply_budget_drops: u64,
     policy_denied_packets: u64,
     route_miss_packets: u64,
     neighbor_miss_packets: u64,
@@ -547,6 +554,16 @@ impl BatchCounters {
             live.syn_cookie_bypass
                 .fetch_add(self.syn_cookie_bypass, Ordering::Relaxed);
             self.syn_cookie_bypass = 0;
+        }
+        if self.policy_reject_sent != 0 {
+            live.policy_reject_sent
+                .fetch_add(self.policy_reject_sent, Ordering::Relaxed);
+            self.policy_reject_sent = 0;
+        }
+        if self.policy_reject_reply_budget_drops != 0 {
+            live.policy_reject_reply_budget_drops
+                .fetch_add(self.policy_reject_reply_budget_drops, Ordering::Relaxed);
+            self.policy_reject_reply_budget_drops = 0;
         }
         if self.policy_denied_packets != 0 {
             live.policy_denied_packets

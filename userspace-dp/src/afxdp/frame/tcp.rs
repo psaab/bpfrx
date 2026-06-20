@@ -330,6 +330,104 @@ pub(in crate::afxdp) fn build_syn_cookie_syn_ack_frame(
     )
 }
 
+/// Build a TCP RST reply rejecting a transit segment (#2089 policy
+/// `reject` action). Mirrors the retired eBPF `send_tcp_rst_v{4,6}`
+/// behavior and RFC 9293 §3.5.2 / RFC 793 §3.4 "Reset Generation":
+///
+///   - Never reply to an inbound RST (`frame` already carries RST) — a
+///     RST about a RST would storm.
+///   - If the inbound segment has **no ACK** (e.g. a bare SYN), the RST
+///     carries `seq = 0`, `ack = inbound_seq + seg_len`, flags `RST|ACK`.
+///     `seg_len` counts the SYN and FIN control bits (1 each) plus any
+///     TCP payload bytes (IP total length minus L3 and TCP header
+///     lengths). For a bare SYN this is `ack = inbound_seq + 1`.
+///   - If the inbound segment has an ACK, the RST carries
+///     `seq = inbound_ack`, **no ACK flag**, flags `RST` only. This is
+///     deliberately different from `build_syn_cookie_ack_rst_frame`,
+///     whose `RST|ACK` form is the validated-cookie special case.
+///
+/// The L2/L3/L4 assembly (identity swap, checksums, window-0-on-RST) is
+/// shared with the SYN-cookie path via `build_syn_cookie_tcp_reply_v{4,6}`.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(in crate::afxdp) fn build_reject_rst_frame(frame: &[u8]) -> Option<Vec<u8>> {
+    let parsed = parse_tcp_reply_source(frame)?;
+    // Never RST-storm: do not reply to an inbound RST.
+    if (parsed.flags & TCP_FLAG_RST) != 0 {
+        return None;
+    }
+    let (seq, ack, flags) = if (parsed.flags & TCP_FLAG_ACK) == 0 {
+        // No ACK in the inbound segment: RST carries seq 0 and
+        // acknowledges the consumed sequence space (SYN/FIN + payload).
+        let seg_len = tcp_segment_consumed_len(frame, parsed)?;
+        (
+            0u32,
+            parsed.seq.wrapping_add(seg_len),
+            TCP_FLAG_RST | TCP_FLAG_ACK,
+        )
+    } else {
+        // Inbound carries an ACK: RST takes its sequence from that ACK
+        // and omits the ACK flag (canonical RFC reset to a closed port).
+        (parsed.ack, 0u32, TCP_FLAG_RST)
+    };
+    build_syn_cookie_tcp_reply(frame, parsed, TCP_MIN_HEADER_LEN, seq, ack, flags, 0)
+}
+
+/// Sequence space consumed by an inbound TCP segment: 1 for each of the
+/// SYN and FIN control bits, plus the TCP payload byte count derived
+/// from the IP total/payload length minus the L3 and TCP header lengths.
+/// Used to compute the RST `ack` for a no-ACK inbound segment.
+#[cfg_attr(not(test), allow(dead_code))]
+fn tcp_segment_consumed_len(frame: &[u8], parsed: TcpReplySource) -> Option<u32> {
+    let mut len: u32 = 0;
+    if (parsed.flags & TCP_FLAG_SYN) != 0 {
+        len = len.wrapping_add(1);
+    }
+    // FIN consumes one sequence number too (FIN = 0x01).
+    if (parsed.flags & 0x01) != 0 {
+        len = len.wrapping_add(1);
+    }
+    let ip = frame.get(parsed.l3..)?;
+    // Offset (from frame start) of the end of the IP datagram, derived
+    // from the IP length field. For IPv6, payload_len covers everything
+    // after the 40-byte base header — INCLUDING any extension headers —
+    // so the TCP payload must be measured from the real TCP header start
+    // (frame_l4_offset walks the ext-header chain), not by subtracting a
+    // fixed 40 bytes. Doing the latter over-counts the segment length by
+    // the ext-header span and inflates the RST ack (a no-ACK v6 segment
+    // with ext headers would then carry an unacceptable ack → the client
+    // discards the RST → the reject silently degrades to a drop).
+    let ip_datagram_end = match parsed.addr_family as i32 {
+        libc::AF_INET => {
+            if ip.len() < 20 {
+                return None;
+            }
+            let total = u16::from_be_bytes([ip[2], ip[3]]) as usize;
+            parsed.l3.checked_add(total)?
+        }
+        libc::AF_INET6 => {
+            if ip.len() < 40 {
+                return None;
+            }
+            let payload = u16::from_be_bytes([ip[4], ip[5]]) as usize;
+            parsed.l3.checked_add(40)?.checked_add(payload)?
+        }
+        _ => return None,
+    };
+    // TCP header start (after IPv6 ext headers, if any) and length from
+    // the inbound segment's data-offset field.
+    let l4 = frame_l4_offset(frame, parsed.addr_family)?;
+    let tcp = frame.get(l4..l4 + TCP_MIN_HEADER_LEN)?;
+    let tcp_hdr_len = ((tcp[12] >> 4) as usize) * 4;
+    if tcp_hdr_len < TCP_MIN_HEADER_LEN {
+        return None;
+    }
+    let tcp_data_start = l4.checked_add(tcp_hdr_len)?;
+    // saturating_sub guards a truncated/malformed length field; a normal
+    // segment has ip_datagram_end >= tcp_data_start.
+    let payload_len = ip_datagram_end.saturating_sub(tcp_data_start);
+    Some(len.wrapping_add(payload_len as u32))
+}
+
 /// Build the RST reply for a validated SYN-cookie ACK.
 ///
 /// The current userspace contract mirrors the eBPF behavior: a valid cookie ACK

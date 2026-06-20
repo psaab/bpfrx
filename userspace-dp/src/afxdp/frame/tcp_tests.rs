@@ -573,3 +573,178 @@ fn clamp_tcp_mss_frame_clamps_full_ethernet_frame_v6() {
     assert_eq!(u16::from_be_bytes([tcp[22], tcp[23]]), 1200);
     assert_eq!(checksum_tcp_v6(src, dst, tcp), 0xFFFF);
 }
+
+// ---------- #2089 build_reject_rst_frame ----------
+
+const TCP_FLAG_RST: u8 = 0x04;
+const ETH_MIN_FRAME_LEN: usize = 60;
+
+/// Full v4 TCP frame with explicit MACs, seq/ack, and flags.
+fn reject_v4_tcp_frame(flags: u8, seq: u32, ack: u32) -> Vec<u8> {
+    let mut eth = eth_header(0x0800);
+    eth[0..6].copy_from_slice(&[0x02, 0, 0, 0, 0, 0xdd]); // dst (firewall)
+    eth[6..12].copy_from_slice(&[0x02, 0, 0, 0, 0, 0xcc]); // src (client)
+    let ip = ipv4_header(40, 6);
+    let mut tcp = tcp_header_skeleton(flags, 5);
+    tcp[4..8].copy_from_slice(&seq.to_be_bytes());
+    tcp[8..12].copy_from_slice(&ack.to_be_bytes());
+    let mut frame = Vec::with_capacity(54);
+    frame.extend_from_slice(&eth);
+    frame.extend_from_slice(&ip);
+    frame.extend_from_slice(&tcp);
+    frame
+}
+
+/// Full v6 TCP frame with explicit MACs, seq/ack, and flags.
+fn reject_v6_tcp_frame(flags: u8, seq: u32, ack: u32) -> Vec<u8> {
+    let mut eth = eth_header(0x86dd);
+    eth[0..6].copy_from_slice(&[0x02, 0, 0, 0, 0, 0xdd]);
+    eth[6..12].copy_from_slice(&[0x02, 0, 0, 0, 0, 0xcc]);
+    let ip = ipv6_header(20, 6);
+    let mut tcp = tcp_header_skeleton(flags, 5);
+    tcp[4..8].copy_from_slice(&seq.to_be_bytes());
+    tcp[8..12].copy_from_slice(&ack.to_be_bytes());
+    let mut frame = Vec::with_capacity(74);
+    frame.extend_from_slice(&eth);
+    frame.extend_from_slice(&ip);
+    frame.extend_from_slice(&tcp);
+    frame
+}
+
+#[test]
+fn reject_rst_v4_for_syn_acks_seq_plus_one_with_macs_and_ips_swapped() {
+    let frame = reject_v4_tcp_frame(TCP_FLAG_SYN, 0x1111_2222, 0);
+    let out = build_reject_rst_frame(&frame).expect("RST for SYN");
+    // Ethernet padded to 60 bytes.
+    assert_eq!(out.len(), ETH_MIN_FRAME_LEN);
+    // MAC swap: reply dst = inbound src (client), reply src = inbound dst.
+    assert_eq!(&out[0..6], &[0x02, 0, 0, 0, 0, 0xcc]);
+    assert_eq!(&out[6..12], &[0x02, 0, 0, 0, 0, 0xdd]);
+    // IP swap: reply src = inbound dst (10.0.0.2), reply dst = inbound src.
+    assert_eq!(&out[ETH_HDR_LEN + 12..ETH_HDR_LEN + 16], &[10, 0, 0, 2]);
+    assert_eq!(&out[ETH_HDR_LEN + 16..ETH_HDR_LEN + 20], &[10, 0, 0, 1]);
+    let tcp = &out[ETH_HDR_LEN + IPV4_HDR_LEN..ETH_HDR_LEN + IPV4_HDR_LEN + 20];
+    // Ports swapped.
+    assert_eq!(u16::from_be_bytes([tcp[0], tcp[1]]), 80);
+    assert_eq!(u16::from_be_bytes([tcp[2], tcp[3]]), 12345);
+    // No-ACK inbound: seq=0, ack=inbound_seq+1, flags RST|ACK.
+    assert_eq!(u32::from_be_bytes([tcp[4], tcp[5], tcp[6], tcp[7]]), 0);
+    assert_eq!(
+        u32::from_be_bytes([tcp[8], tcp[9], tcp[10], tcp[11]]),
+        0x1111_2223
+    );
+    assert_eq!(tcp[13], TCP_FLAG_RST | TCP_FLAG_ACK);
+    // RST window forced to 0.
+    assert_eq!(u16::from_be_bytes([tcp[14], tcp[15]]), 0);
+    // Checksum valid (independent recompute folds to 0xFFFF).
+    assert_eq!(checksum_tcp_v4([10, 0, 0, 2], [10, 0, 0, 1], tcp), 0xFFFF);
+}
+
+#[test]
+fn reject_rst_v4_for_ack_uses_inbound_ack_no_ack_flag() {
+    // ACK-bearing inbound (no SYN): RST seq=inbound_ack, flags RST only.
+    let frame = reject_v4_tcp_frame(TCP_FLAG_ACK, 0x5555_0000, 0x9999_8888);
+    let out = build_reject_rst_frame(&frame).expect("RST for ACK");
+    let tcp = &out[ETH_HDR_LEN + IPV4_HDR_LEN..ETH_HDR_LEN + IPV4_HDR_LEN + 20];
+    assert_eq!(
+        u32::from_be_bytes([tcp[4], tcp[5], tcp[6], tcp[7]]),
+        0x9999_8888
+    );
+    assert_eq!(tcp[13], TCP_FLAG_RST);
+    assert_eq!(tcp[13] & TCP_FLAG_ACK, 0, "ACK flag must be clear");
+    assert_eq!(checksum_tcp_v4([10, 0, 0, 2], [10, 0, 0, 1], tcp), 0xFFFF);
+}
+
+#[test]
+fn reject_rst_v6_for_syn_acks_seq_plus_one() {
+    let frame = reject_v6_tcp_frame(TCP_FLAG_SYN, 7, 0);
+    let out = build_reject_rst_frame(&frame).expect("v6 RST for SYN");
+    // MAC swap.
+    assert_eq!(&out[0..6], &[0x02, 0, 0, 0, 0, 0xcc]);
+    let mut src = [0u8; 16];
+    src.copy_from_slice(&out[ETH_HDR_LEN + 8..ETH_HDR_LEN + 24]);
+    let mut dst = [0u8; 16];
+    dst.copy_from_slice(&out[ETH_HDR_LEN + 24..ETH_HDR_LEN + 40]);
+    let tcp = &out[ETH_HDR_LEN + IPV6_HDR_LEN..ETH_HDR_LEN + IPV6_HDR_LEN + 20];
+    assert_eq!(u32::from_be_bytes([tcp[4], tcp[5], tcp[6], tcp[7]]), 0);
+    assert_eq!(u32::from_be_bytes([tcp[8], tcp[9], tcp[10], tcp[11]]), 8);
+    assert_eq!(tcp[13], TCP_FLAG_RST | TCP_FLAG_ACK);
+    assert_eq!(checksum_tcp_v6(src, dst, tcp), 0xFFFF);
+}
+
+#[test]
+fn reject_rst_never_answers_inbound_rst() {
+    let frame = reject_v4_tcp_frame(TCP_FLAG_RST, 1, 0);
+    assert!(
+        build_reject_rst_frame(&frame).is_none(),
+        "must not RST a RST"
+    );
+}
+
+/// Full v6 TCP frame with ONE Destination-Options extension header
+/// (8 bytes) between the IPv6 base header and the TCP header. Exercises
+/// the ext-header-aware seg_len path so a no-ACK RST acks exactly the
+/// SYN (seq+1), not seq+1+ext_bytes.
+fn reject_v6_tcp_frame_with_ext(flags: u8, seq: u32) -> Vec<u8> {
+    let mut eth = eth_header(0x86dd);
+    eth[0..6].copy_from_slice(&[0x02, 0, 0, 0, 0, 0xdd]);
+    eth[6..12].copy_from_slice(&[0x02, 0, 0, 0, 0, 0xcc]);
+    let mut ip = ipv6_header(8 + 20, 60); // next-header = Dest-Options (60)
+    // payload_len covers ext header (8) + TCP (20).
+    ip[4..6].copy_from_slice(&((8 + 20) as u16).to_be_bytes());
+    let mut ext = [0u8; 8]; // Dest-Options: next-header=TCP(6), hdr-ext-len=0
+    ext[0] = 6;
+    ext[1] = 0;
+    let mut tcp = tcp_header_skeleton(flags, 5);
+    tcp[4..8].copy_from_slice(&seq.to_be_bytes());
+    tcp[8..12].copy_from_slice(&0u32.to_be_bytes());
+    let mut frame = Vec::with_capacity(14 + 40 + 8 + 20);
+    frame.extend_from_slice(&eth);
+    frame.extend_from_slice(&ip);
+    frame.extend_from_slice(&ext);
+    frame.extend_from_slice(&tcp);
+    frame
+}
+
+#[test]
+fn reject_rst_v6_ext_header_syn_acks_seq_plus_one_not_plus_ext() {
+    // Regression guard: a no-ACK v6 SYN carrying an extension header must
+    // get ack = seq + 1 (the SYN consumes one seq number), NOT
+    // seq + 1 + ext_header_bytes. The latter is an unacceptable ack a
+    // SYN-SENT client would discard, degrading the reject to a drop.
+    let frame = reject_v6_tcp_frame_with_ext(TCP_FLAG_SYN, 100);
+    let out = build_reject_rst_frame(&frame).expect("v6 ext-header RST for SYN");
+    // Reply has no ext header (minimal 40+20); TCP at fixed offset.
+    let tcp = &out[ETH_HDR_LEN + IPV6_HDR_LEN..ETH_HDR_LEN + IPV6_HDR_LEN + 20];
+    assert_eq!(tcp[13], TCP_FLAG_RST | TCP_FLAG_ACK);
+    assert_eq!(
+        u32::from_be_bytes([tcp[8], tcp[9], tcp[10], tcp[11]]),
+        101,
+        "ack must be seq+1, not inflated by the 8-byte ext header"
+    );
+}
+
+#[test]
+fn reject_rst_v4_syn_with_data_acks_seq_plus_one_plus_payload() {
+    // A no-ACK segment carrying payload (rare for a SYN, but exercises
+    // the seg_len payload math): ack = seq + 1(SYN) + payload_len.
+    let mut eth = eth_header(0x0800);
+    eth[0..6].copy_from_slice(&[0x02, 0, 0, 0, 0, 0xdd]);
+    eth[6..12].copy_from_slice(&[0x02, 0, 0, 0, 0, 0xcc]);
+    // total_len = 20 (IP) + 20 (TCP) + 4 (payload) = 44.
+    let ip = ipv4_header(44, 6);
+    let mut tcp = tcp_header_skeleton(TCP_FLAG_SYN, 5);
+    tcp[4..8].copy_from_slice(&1000u32.to_be_bytes());
+    let mut frame = Vec::new();
+    frame.extend_from_slice(&eth);
+    frame.extend_from_slice(&ip);
+    frame.extend_from_slice(&tcp);
+    frame.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef]); // 4 payload bytes
+    let out = build_reject_rst_frame(&frame).expect("RST for SYN+data");
+    let tcp_out = &out[ETH_HDR_LEN + IPV4_HDR_LEN..ETH_HDR_LEN + IPV4_HDR_LEN + 20];
+    assert_eq!(
+        u32::from_be_bytes([tcp_out[8], tcp_out[9], tcp_out[10], tcp_out[11]]),
+        1000 + 1 + 4,
+        "ack = seq + SYN(1) + 4 payload bytes"
+    );
+}

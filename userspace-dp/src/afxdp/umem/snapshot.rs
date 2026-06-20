@@ -92,6 +92,10 @@ impl BindingLiveState {
             syn_cookie_ack_valid: self.syn_cookie_ack_valid.load(Ordering::Relaxed),
             syn_cookie_ack_invalid: self.syn_cookie_ack_invalid.load(Ordering::Relaxed),
             syn_cookie_bypass: self.syn_cookie_bypass.load(Ordering::Relaxed),
+            policy_reject_sent: self.policy_reject_sent.load(Ordering::Relaxed),
+            policy_reject_reply_budget_drops: self
+                .policy_reject_reply_budget_drops
+                .load(Ordering::Relaxed),
             snat_packets: self.snat_packets.load(Ordering::Relaxed),
             dnat_packets: self.dnat_packets.load(Ordering::Relaxed),
             slow_path_packets: self.slow_path_packets.load(Ordering::Relaxed),
