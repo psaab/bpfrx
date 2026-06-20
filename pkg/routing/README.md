@@ -31,7 +31,7 @@ which makes each domain unit-testable with a fake (see `rules_test.go`'s
 | `probe_pin.go` | `probePinManager` | RPM probe next-hop pin reconciler (#1827): fwmark rules in band 50-99 + pinned host routes in reserved tables 7000-7049 (`probePinOps`, stateless). `Apply` returns per-test install failures (keyed by TestKey) and rolls back the fwmark rule when the pinned route fails (best-effort — a failed rollback is swept by the next band clear; the pin reports failed either way); callers thread the failed map into `pkg/rpm` so affected tests hold state instead of probing unpinned (#1895) |
 | `bond.go` | `bondManager` | bond device lifecycle; own `mu` |
 | `reth.go` | `rethManager` | stale `reth*` bond cleanup |
-| `monitor.go` | `monitorManager` | interface-monitor HA signal; own `mu` |
+| `monitor.go` | `monitorManager` | interface-monitor HA signal; own `mu`. Link health via `linkAttrsUp` reads kernel **operstate** (`OperUp` → up; `OperUnknown` → admin-flag fallback; `OperDown`/lower-layer-down → down), **not** `IFF_UP` — admin-up-but-carrier-down (cable pulled) must report DOWN so HA fails over (#2070). Mirrors `pkg/vrrp.linkAttrsUp` and `pkg/cluster/monitor.go` |
 
 The tunnel domain depends on the VRF domain (`tunnelManager.vrfBinder`)
 to bind tunnel interfaces to a routing-instance VRF;
