@@ -394,6 +394,20 @@ def virt_customize(work_qcow, xpf_deb):
         "# hypervisor). Its presence enables Path-D1 strict (fail-closed if the\n"
         "# watchdog is unavailable). Absent = Path-D2 (BootNext still closes the\n"
         "# boot-loop; an EARLY-boot hang needs one external reset to recover).\n",
+        # #1925 Item 1: first-boot root auto-grow. Restores the cloud-init
+        # growpart/resizefs behavior the bake purged — grows the root
+        # partition + ext4 fs to fill an operator-resized disk on first boot
+        # only (stamp-gated), then never again. Uses growpart + resize2fs
+        # (already in the image; cloud-utils-growpart + e2fsprogs) NOT
+        # systemd-repart: they cannot create/reformat/shrink/move a partition,
+        # the smallest data-loss surface. Root is the physically LAST
+        # partition, so growing it into trailing free space never touches the
+        # ESP (the #1930 A/B kernel slots live in ESP dirs, not partitions),
+        # /boot, BIOS-boot, or any partition number. See docs/install-images.md.
+        "--copy-in", f"{HERE}/xpf-grow-root:/usr/local/sbin",
+        "--copy-in", f"{HERE}/xpf-grow-root.service:/usr/lib/systemd/system",
+        "--run-command", "chmod 0755 /usr/local/sbin/xpf-grow-root",
+        "--run-command", "systemctl enable xpf-grow-root.service",
         "--write", f"/etc/default/grub.d/99-xpf.cfg:{GRUB_DROPIN}",
         "--run-command", "update-grub",
         "--write", f"/etc/ssh/sshd_config.d/10-xpf-factory.conf:{SSHD_DROPIN}",
@@ -500,7 +514,8 @@ def main():
              "machine-id,ssh-hostkeys,ssh-userdir,logfiles,tmp-files,bash-history,"
              "package-manager-cache,backup-files,passwd-backups,utmp",
              "--run-command", "rm -rf /etc/xpf/.configdb /etc/xpf/xpf.conf "
-             "/etc/xpf/.day0-config-applied /var/lib/systemd/random-seed "
+             "/etc/xpf/.day0-config-applied /etc/xpf/.root-grown "
+             "/var/lib/systemd/random-seed "
              "/var/lib/apt/lists/* 2>/dev/null || true"])
 
         # 6. export
