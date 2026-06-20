@@ -359,6 +359,102 @@ func deletePath(current *[]*Node, path []string, schema *schemaNode, i int) erro
 	return fmt.Errorf("path not found: container %q does not exist", strings.Join(nodeKeys, " "))
 }
 
+// DeactivatePath marks the node at the given path inactive (#2008 H1),
+// implementing the Junos `deactivate <path>` verb. The node keeps its
+// identity and children — it is excluded from compilation/application until
+// re-activated, exactly like an `inactive:` marker in hierarchical text.
+// Navigation reuses the same schema-driven traversal as SetPath/DeletePath
+// so the path tokenization matches `show | display set` output (which emits
+// `deactivate <path>` for every inactive node), making that output
+// round-trippable. The target node must already exist — `display set`
+// always emits the node's `set` line(s) before its `deactivate` line, so on
+// reload the node is present by the time this runs.
+func (t *ConfigTree) DeactivatePath(path []string) error {
+	if len(path) == 0 {
+		return fmt.Errorf("empty path")
+	}
+	return setInactiveAtPath(&t.Children, path, setSchema, 0, true)
+}
+
+// ActivatePath clears the inactive marker on the node at the given path
+// (#2008 H1), implementing the Junos `activate <path>` verb. The target
+// node must already exist.
+func (t *ConfigTree) ActivatePath(path []string) error {
+	if len(path) == 0 {
+		return fmt.Errorf("empty path")
+	}
+	return setInactiveAtPath(&t.Children, path, setSchema, 0, false)
+}
+
+// setInactiveAtPath navigates to the node identified by path (using the
+// same schema-driven traversal as deletePath) and sets its Inactive flag to
+// the requested value. It does NOT create missing nodes — deactivate /
+// activate toggle an existing statement.
+func setInactiveAtPath(current *[]*Node, path []string, schema *schemaNode, i int, inactive bool) error {
+	if i >= len(path) {
+		return fmt.Errorf("path not found")
+	}
+
+	keyword := path[i]
+
+	var childSchema *schemaNode
+	if schema != nil {
+		if s, ok := schema.children[keyword]; ok {
+			childSchema = s
+		} else if schema.wildcard != nil {
+			childSchema = schema.wildcard
+		}
+	}
+
+	if childSchema == nil {
+		// No schema match: remaining tokens form leaf keys.
+		return markMatchingNodeInactive(current, path[i:], inactive)
+	}
+
+	nodeKeyCount := 1 + childSchema.args
+	if i+nodeKeyCount > len(path) {
+		return markMatchingNodeInactive(current, path[i:], inactive)
+	}
+
+	nodeKeys := path[i : i+nodeKeyCount]
+	i += nodeKeyCount
+
+	// Compound key: consume child token as part of key.
+	if childSchema.compoundKey && i < len(path) {
+		if sub, ok := childSchema.children[path[i]]; ok {
+			nodeKeys = append(append([]string(nil), nodeKeys...), path[i])
+			i++
+			childSchema = sub
+		}
+	}
+
+	if i >= len(path) {
+		// No more tokens: this node itself is the target.
+		return markMatchingNodeInactive(current, nodeKeys, inactive)
+	}
+
+	// More tokens remain: find matching container and descend.
+	for _, n := range *current {
+		if !n.IsLeaf && keysEqual(n.Keys, nodeKeys) {
+			return setInactiveAtPath(&n.Children, path, childSchema, i, inactive)
+		}
+	}
+
+	return fmt.Errorf("path not found: container %q does not exist", strings.Join(nodeKeys, " "))
+}
+
+// markMatchingNodeInactive sets the Inactive flag on the first node whose
+// keys match targetKeys (prefix matching, mirroring removeMatchingNode).
+func markMatchingNodeInactive(nodes *[]*Node, targetKeys []string, inactive bool) error {
+	for _, n := range *nodes {
+		if keysMatch(n.Keys, targetKeys) {
+			n.Inactive = inactive
+			return nil
+		}
+	}
+	return fmt.Errorf("path not found: no node matching %q", strings.Join(targetKeys, " "))
+}
+
 // removeMatchingNode removes the first node whose keys match targetKeys
 // (using prefix matching) from the nodes slice.
 func removeMatchingNode(nodes *[]*Node, targetKeys []string) error {

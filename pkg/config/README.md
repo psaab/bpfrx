@@ -110,9 +110,17 @@ nothing internal.
   activate/deactivate shows in `show | compare`. The flag round-trips
   through the persisted DB automatically — `Node.Inactive` is JSON-tagged
   `,omitempty`, so active-node on-disk output is byte-identical to
-  pre-`#2008`. Regression coverage: `pkg/config/inactive_test.go`. NOTE:
-  the `activate` / `deactivate` CLI verbs are a separate increment — today
-  the flag is reached by loading config text containing `inactive:`.
+  pre-`#2008`. The `deactivate <path>` line that `display set` emits also
+  round-trips through reload: `ParseSetVerb` (`parser.go`) recognizes
+  `deactivate` / `activate` as real verbs and `ConfigTree.DeactivatePath` /
+  `ActivatePath` (`ast_edit.go`) apply them (used by the configstore
+  `LoadSet` / `LoadMerge` replay loops), so an inactive node reloads inactive
+  rather than being skipped (silently reactivated) or parsed as a junk path.
+  Regression coverage: `pkg/config/inactive_test.go`,
+  `pkg/configstore/inactive_test.go`. NOTE: interactive standalone
+  `activate` / `deactivate` config-mode commands (a typed CLI verb that edits
+  the candidate directly, distinct from `load set` replay) remain a separate
+  increment.
 
 ## Callers
 

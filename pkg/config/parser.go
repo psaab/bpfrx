@@ -33,23 +33,56 @@ func (p *Parser) Parse() (*ConfigTree, []ParseError) {
 	return tree, p.errors
 }
 
-// ParseSet parses a single "set" command and returns the path components.
-// Input: "set security zones security-zone trust interfaces eth0"
-// Returns: ["security", "zones", "security-zone", "trust", "interfaces", "eth0"]
+// Config-edit verbs recognized at the start of a flat command line
+// (ParseSetVerb). `set`/`delete` are the historical verbs; `deactivate`/
+// `activate` (#2008 H1) toggle Node.Inactive so that `show | display set`
+// output — which emits a `deactivate <path>` line for every inactive node
+// (ast_format.go) — round-trips back to an inactive node on reload. A line
+// with no recognized verb is treated as a bare path (verb "set").
+const (
+	verbSet        = "set"
+	verbDelete     = "delete"
+	verbDeactivate = "deactivate"
+	verbActivate   = "activate"
+)
+
+// ParseSetCommand parses a single flat command and returns the path
+// components, discarding the verb. Input: "set security zones
+// security-zone trust interfaces eth0" returns ["security", "zones",
+// "security-zone", "trust", "interfaces", "eth0"]. It accepts a `set`,
+// `delete`, `deactivate`, or `activate` prefix (or no prefix). Callers that
+// must apply the correct edit for a `deactivate`/`activate` line MUST use
+// ParseSetVerb instead — ParseSetCommand collapses every verb to its path,
+// so feeding it a `deactivate ...` line and then calling SetPath would
+// re-add the node as ACTIVE.
 func ParseSetCommand(input string) ([]string, error) {
+	_, path, err := ParseSetVerb(input)
+	return path, err
+}
+
+// ParseSetVerb parses a single flat command into its verb and path. The
+// verb is one of "set", "delete", "deactivate", or "activate"; a line with
+// no recognized leading verb is reported as "set" with the whole line as
+// the path (preserving the historical ParseSetCommand behavior where an
+// unprefixed line is a bare path). #2008 H1: the `deactivate`/`activate`
+// verbs make `show | display set` output round-trippable — the replay
+// callers (configstore LoadSet / LoadMerge) switch on the returned verb to
+// flip Node.Inactive instead of re-adding an active node.
+func ParseSetVerb(input string) (verb string, path []string, err error) {
 	lexer := NewLexer(input)
 
-	// Consume "set" keyword if present
 	tok := lexer.Next()
 	if tok.Type != TokenIdentifier {
-		return nil, fmt.Errorf("expected identifier, got %s", tok.Type)
+		return "", nil, fmt.Errorf("expected identifier, got %s", tok.Type)
 	}
 
-	var path []string
-	if tok.Value == "set" || tok.Value == "delete" {
-		// "set" or "delete" prefix -- read the rest as path
-	} else {
-		// No prefix -- first token is part of the path
+	switch tok.Value {
+	case verbSet, verbDelete, verbDeactivate, verbActivate:
+		verb = tok.Value
+	default:
+		// No recognized prefix -- the first token is part of the path and
+		// the verb defaults to set (a bare path).
+		verb = verbSet
 		path = append(path, tok.Value)
 	}
 
@@ -61,15 +94,15 @@ func ParseSetCommand(input string) ([]string, error) {
 		if tok.Type == TokenIdentifier || tok.Type == TokenString {
 			path = append(path, tok.Value)
 		} else {
-			return nil, fmt.Errorf("unexpected token %s at line %d, column %d",
+			return "", nil, fmt.Errorf("unexpected token %s at line %d, column %d",
 				tok.Type, tok.Line, tok.Column)
 		}
 	}
 
 	if len(path) == 0 {
-		return nil, fmt.Errorf("empty path")
+		return "", nil, fmt.Errorf("empty path")
 	}
-	return path, nil
+	return verb, path, nil
 }
 
 // parseStatements parses zero or more statements until EOF or '}'.

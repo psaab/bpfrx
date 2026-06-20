@@ -1,6 +1,7 @@
 package configstore
 
 import (
+	"strings"
 	"testing"
 )
 
@@ -80,5 +81,114 @@ inactive: apply-groups missinggroup;
 		if _, err := CheckText(conf, nodeID); err != nil {
 			t.Fatalf("node %d: inactive: apply-groups missing must pass, got: %v", nodeID, err)
 		}
+	}
+}
+
+// --- MAJOR 2: `show | display set` round-trips deactivate through the
+// store. LoadSet / LoadMerge must apply a `deactivate <path>` line by
+// marking the node inactive (not skip it, not parse a junk path), so an
+// inactive node survives a serialize -> reload cycle instead of coming back
+// active.
+
+func enterCfg(t *testing.T, s *Store) {
+	t.Helper()
+	if err := s.EnterConfigure(); err != nil {
+		t.Fatalf("EnterConfigure: %v", err)
+	}
+}
+
+// LoadSet of display-set output containing a `deactivate` line must restore
+// the inactive node. Non-tautological: if LoadSet skipped the deactivate
+// line (the pre-fix behavior) the node would reload active and the round-
+// tripped display-set would lack the deactivate line.
+func TestLoadSetRoundTripsDeactivate(t *testing.T) {
+	s := newTestStore(t)
+	enterCfg(t, s)
+
+	displaySet := strings.Join([]string{
+		"set system host-name keep",
+		"set system name-server 9.9.9.9",
+		"deactivate system name-server 9.9.9.9",
+	}, "\n")
+
+	if _, err := s.LoadSet(displaySet); err != nil {
+		t.Fatalf("LoadSet: %v", err)
+	}
+
+	out := s.ShowCandidateSet()
+	if !strings.Contains(out, "deactivate system name-server 9.9.9.9") {
+		t.Fatalf("LoadSet did not preserve the deactivate marker; ShowCandidateSet:\n%s", out)
+	}
+	// And no junk node literally named "deactivate" leaked in.
+	if strings.Contains(out, "set deactivate ") {
+		t.Fatalf("deactivate line parsed as a junk set path:\n%s", out)
+	}
+	// The active sibling survived.
+	if !strings.Contains(out, "set system host-name keep") {
+		t.Fatalf("active host-name lost on LoadSet:\n%s", out)
+	}
+}
+
+// LoadMerge of hierarchical text with an `inactive:` block must serialize
+// (FormatSet) to a deactivate line and merge back as inactive — the
+// hierarchical -> FormatSet -> ParseSetVerb replay path inside LoadMerge.
+func TestLoadMergeHierarchicalPreservesInactive(t *testing.T) {
+	s := newTestStore(t)
+	enterCfg(t, s)
+
+	hier := `system {
+    host-name keep;
+    inactive: name-server 9.9.9.9;
+}`
+	if err := s.LoadMerge(hier); err != nil {
+		t.Fatalf("LoadMerge: %v", err)
+	}
+
+	out := s.ShowCandidateSet()
+	if !strings.Contains(out, "deactivate system name-server 9.9.9.9") {
+		t.Fatalf("LoadMerge dropped the inactive marker; ShowCandidateSet:\n%s", out)
+	}
+}
+
+// Full store-level display-set round trip: author inactive config, emit
+// display-set, reload it into a fresh store via LoadSet, and re-emit. The
+// deactivate line must be byte-stable across the cycle.
+func TestDisplaySetRoundTripStable(t *testing.T) {
+	s1 := newTestStore(t)
+	enterCfg(t, s1)
+	if err := s1.LoadMerge(`system {
+    host-name keep;
+    inactive: name-server 9.9.9.9;
+}
+security {
+    policies {
+        from-zone trust to-zone untrust {
+            inactive: policy parked { then { deny; } }
+            policy live { match { source-address any; destination-address any; application any; } then { permit; } }
+        }
+    }
+}`); err != nil {
+		t.Fatalf("seed LoadMerge: %v", err)
+	}
+
+	first := s1.ShowCandidateSet()
+
+	s2 := newTestStore(t)
+	enterCfg(t, s2)
+	if _, err := s2.LoadSet(first); err != nil {
+		t.Fatalf("reload LoadSet: %v", err)
+	}
+	second := s2.ShowCandidateSet()
+
+	for _, want := range []string{
+		"deactivate system name-server 9.9.9.9",
+		"deactivate security policies from-zone trust to-zone untrust policy parked",
+	} {
+		if !strings.Contains(second, want) {
+			t.Fatalf("reloaded display-set lost %q:\n%s", want, second)
+		}
+	}
+	if first != second {
+		t.Fatalf("display-set not stable across reload:\n--- first ---\n%s\n--- second ---\n%s", first, second)
 	}
 }

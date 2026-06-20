@@ -979,12 +979,16 @@ func (s *Store) LoadMerge(content string) error {
 		return fmt.Errorf("not in configuration mode")
 	}
 
-	// Detect format: if content has "set " lines, process as set commands
+	// Detect format: if content has set/delete/deactivate/activate lines,
+	// process as flat command lines.
 	lines := strings.Split(content, "\n")
 	isSetFormat := false
 	for _, line := range lines {
 		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "set ") || strings.HasPrefix(trimmed, "delete ") {
+		if strings.HasPrefix(trimmed, "set ") ||
+			strings.HasPrefix(trimmed, "delete ") ||
+			strings.HasPrefix(trimmed, "deactivate ") ||
+			strings.HasPrefix(trimmed, "activate ") {
 			isSetFormat = true
 			break
 		}
@@ -996,22 +1000,8 @@ func (s *Store) LoadMerge(content string) error {
 			if trimmed == "" || strings.HasPrefix(trimmed, "#") {
 				continue
 			}
-			if strings.HasPrefix(trimmed, "set ") {
-				path, err := config.ParseSetCommand(trimmed)
-				if err != nil {
-					return fmt.Errorf("line %q: %w", trimmed, err)
-				}
-				if err := s.candidate.SetPath(path); err != nil {
-					return fmt.Errorf("line %q: %w", trimmed, err)
-				}
-			} else if strings.HasPrefix(trimmed, "delete ") {
-				path, err := config.ParseSetCommand(trimmed)
-				if err != nil {
-					return fmt.Errorf("line %q: %w", trimmed, err)
-				}
-				if err := s.candidate.DeletePath(path); err != nil {
-					return fmt.Errorf("line %q: %w", trimmed, err)
-				}
+			if err := applyEditLine(s.candidate, trimmed); err != nil {
+				return fmt.Errorf("line %q: %w", trimmed, err)
 			}
 		}
 	} else {
@@ -1020,18 +1010,18 @@ func (s *Store) LoadMerge(content string) error {
 		if len(errs) > 0 {
 			return fmt.Errorf("parse error: %v", errs[0])
 		}
-		// Convert hierarchical to set commands and apply each one
+		// Convert hierarchical to flat commands and apply each one. FormatSet
+		// emits a `deactivate <path>` line after every inactive node's `set`
+		// line(s), so the hierarchical -> flat -> tree round trip must honor
+		// the deactivate verb (#2008 H1) to preserve Inactive — applying it as
+		// a plain set would silently re-activate the node.
 		setLines := strings.Split(tree.FormatSet(), "\n")
 		for _, line := range setLines {
 			trimmed := strings.TrimSpace(line)
 			if trimmed == "" {
 				continue
 			}
-			path, err := config.ParseSetCommand(trimmed)
-			if err != nil {
-				continue
-			}
-			if err := s.candidate.SetPath(path); err != nil {
+			if err := applyEditLine(s.candidate, trimmed); err != nil {
 				return fmt.Errorf("merge: %w", err)
 			}
 		}
@@ -1041,8 +1031,36 @@ func (s *Store) LoadMerge(content string) error {
 	return nil
 }
 
-// LoadSet applies multiple set commands to the candidate config.
-// Each line starting with "set " is parsed and applied.
+// applyEditLine parses a single flat command line and applies the correct
+// edit to tree based on its verb (#2008 H1): set, delete, deactivate, or
+// activate. Centralizing the verb switch keeps every flat-line replay path
+// (LoadMerge flat + hierarchical-via-FormatSet, LoadSet) in agreement, so
+// `show | display set` output — which emits `deactivate <path>` for inactive
+// nodes — round-trips back to an inactive node instead of being skipped (and
+// reloaded active) or parsed as a junk path literally starting "deactivate".
+func applyEditLine(tree *config.ConfigTree, line string) error {
+	verb, path, err := config.ParseSetVerb(line)
+	if err != nil {
+		return err
+	}
+	switch verb {
+	case "delete":
+		return tree.DeletePath(path)
+	case "deactivate":
+		return tree.DeactivatePath(path)
+	case "activate":
+		return tree.ActivatePath(path)
+	default: // "set" (or a bare, unprefixed path)
+		return tree.SetPath(path)
+	}
+}
+
+// LoadSet applies multiple flat command lines to the candidate config.
+// Each line starting with a recognized verb — set, delete, deactivate, or
+// activate (#2008 H1) — is parsed and applied; other lines (e.g. comments)
+// are skipped. The deactivate/activate verbs make `show | display set`
+// output round-trippable: previously a `deactivate <path>` line was skipped
+// here, so an inactive node reloaded ACTIVE.
 func (s *Store) LoadSet(content string) (int, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1055,14 +1073,13 @@ func (s *Store) LoadSet(content string) (int, error) {
 		if line == "" || strings.HasPrefix(line, "#") {
 			continue
 		}
-		if !strings.HasPrefix(line, "set ") {
+		if !strings.HasPrefix(line, "set ") &&
+			!strings.HasPrefix(line, "delete ") &&
+			!strings.HasPrefix(line, "deactivate ") &&
+			!strings.HasPrefix(line, "activate ") {
 			continue
 		}
-		path, err := config.ParseSetCommand(line)
-		if err != nil {
-			return count, fmt.Errorf("line %q: %w", line, err)
-		}
-		if err := s.candidate.SetPath(path); err != nil {
+		if err := applyEditLine(s.candidate, line); err != nil {
 			return count, fmt.Errorf("line %q: %w", line, err)
 		}
 		count++

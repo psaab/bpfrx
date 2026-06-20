@@ -446,6 +446,33 @@ func TestInactive_UpgradeEquivalence(t *testing.T) {
 
 // --- Dual-AST: flat-set path round-trips the deactivate -----------------
 
+// applyFlatLine drives the real flat-command apply path used by the
+// configstore replay loops (ParseSetVerb + the verb-specific edit method),
+// without depending on configstore. Keeping the verb switch here exercises
+// the same DeactivatePath / ActivatePath / DeletePath / SetPath dispatch
+// that LoadSet and LoadMerge use, so the round-trip test below cannot pass
+// unless ParseSetVerb and the edit methods actually agree with FormatSet.
+func applyFlatLine(t *testing.T, tree *ConfigTree, line string) {
+	t.Helper()
+	verb, path, err := ParseSetVerb(line)
+	if err != nil {
+		t.Fatalf("ParseSetVerb(%q): %v", line, err)
+	}
+	switch verb {
+	case "delete":
+		err = tree.DeletePath(path)
+	case "deactivate":
+		err = tree.DeactivatePath(path)
+	case "activate":
+		err = tree.ActivatePath(path)
+	default:
+		err = tree.SetPath(path)
+	}
+	if err != nil {
+		t.Fatalf("apply %q (%s): %v", line, verb, err)
+	}
+}
+
 func TestInactive_DualASTFlatSet(t *testing.T) {
 	// Build the active tree via the flat-set authoring path (CLAUDE.md:
 	// ALWAYS ParseSetCommand+SetPath for flat-set, never NewParser).
@@ -461,14 +488,20 @@ func TestInactive_DualASTFlatSet(t *testing.T) {
 			t.Fatalf("SetPath(%q): %v", cmd, err)
 		}
 	}
-	// Deactivate the policy node (the deactivate verb flips the flag on the
-	// node the set path created). Locate and mark it.
+	// Deactivate via the REAL deactivate verb (not a manual flag flip), so
+	// the test fails if ParseSetVerb / DeactivatePath do not navigate the
+	// path the same way SetPath created it.
+	applyFlatLine(t, tree,
+		"deactivate security policies from-zone trust to-zone untrust policy p1")
+
 	pol := tree.FindChild("security").FindChild("policies").
 		FindChild("from-zone").FindChild("policy")
 	if pol == nil {
 		t.Fatalf("flat-set did not create the policy node: %+v", tree.Children)
 	}
-	pol.Inactive = true
+	if !pol.Inactive {
+		t.Fatal("deactivate verb did not mark the policy node inactive")
+	}
 
 	// Compile excludes it.
 	cfg, err := CompileConfig(tree)
@@ -483,6 +516,93 @@ func TestInactive_DualASTFlatSet(t *testing.T) {
 	out := tree.FormatSet()
 	if !strings.Contains(out, "deactivate security policies from-zone trust to-zone untrust policy p1") {
 		t.Fatalf("flat-set deactivate line missing:\n%s", out)
+	}
+
+	// activate verb clears the flag again.
+	applyFlatLine(t, tree,
+		"activate security policies from-zone trust to-zone untrust policy p1")
+	if pol.Inactive {
+		t.Fatal("activate verb did not clear the inactive flag")
+	}
+}
+
+// TestInactive_FormatSetRoundTripsDeactivate is the core MAJOR-2 regression:
+// FormatSet emits a `deactivate <path>` line for an inactive node, and
+// replaying that output through ParseSetVerb + the edit methods must restore
+// the node as INACTIVE — not as an active node and not as a junk path that
+// literally begins "deactivate". It is non-tautological by construction:
+//   - if FormatSet emitted no deactivate line, the replayed tree would be
+//     fully active and the inactive assertion fails;
+//   - if ParseSetVerb did not recognize `deactivate`, the line would parse
+//     as the path ["deactivate", ...] and DeactivatePath / SetPath would
+//     either error or create a junk node, failing the assertions;
+//   - if the replay applied the deactivate line as a plain set, the node
+//     would reload ACTIVE and the inactive assertion fails.
+func TestInactive_FormatSetRoundTripsDeactivate(t *testing.T) {
+	// Author an active + a deactivated leaf, plus a deactivated block.
+	src := mustParse(t, `system {
+    host-name keep;
+    inactive: name-server 9.9.9.9;
+}
+security {
+    policies {
+        from-zone trust to-zone untrust {
+            inactive: policy parked { then { deny; } }
+            policy live { match { source-address any; destination-address any; application any; } then { permit; } }
+        }
+    }
+}`)
+
+	// Serialize to flat display-set form, then replay it into a fresh tree.
+	flat := src.FormatSet()
+	if !strings.Contains(flat, "deactivate system name-server 9.9.9.9") {
+		t.Fatalf("FormatSet missing deactivate for the leaf:\n%s", flat)
+	}
+	if !strings.Contains(flat, "deactivate security policies from-zone trust to-zone untrust policy parked") {
+		t.Fatalf("FormatSet missing deactivate for the block:\n%s", flat)
+	}
+
+	replay := &ConfigTree{}
+	for _, line := range strings.Split(flat, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		applyFlatLine(t, replay, line)
+	}
+
+	// The deactivated leaf must come back INACTIVE, not active and not junk.
+	ns := replay.FindChild("system").FindChild("name-server")
+	if ns == nil {
+		t.Fatalf("name-server lost on replay; children: %+v", replay.Children)
+	}
+	if !ns.Inactive {
+		t.Fatal("deactivated name-server reloaded ACTIVE — display-set is not round-trippable")
+	}
+	// And no junk node literally named "deactivate" leaked into the tree.
+	if dj := replay.FindChild("deactivate"); dj != nil {
+		t.Fatalf("a junk 'deactivate' node leaked into the replayed tree: %+v", dj)
+	}
+
+	// The deactivated policy block round-trips too, and stays excluded from
+	// compilation while the active sibling survives.
+	cfg, err := CompileConfig(replay)
+	if err != nil {
+		t.Fatalf("compile replayed tree: %v", err)
+	}
+	names := policyNames(cfg)
+	if contains(names, "parked") {
+		t.Fatalf("deactivated policy reloaded active and compiled: %v", names)
+	}
+	if !contains(names, "live") {
+		t.Fatalf("active policy lost on replay: %v", names)
+	}
+
+	// Re-serializing the replayed tree reproduces the deactivate lines —
+	// proving a full round trip, not a one-way decode.
+	if again := replay.FormatSet(); !strings.Contains(again,
+		"deactivate system name-server 9.9.9.9") {
+		t.Fatalf("second FormatSet dropped the deactivate marker:\n%s", again)
 	}
 }
 
