@@ -1,6 +1,7 @@
 # #2073 — IPsec PFS group silently dropped when proposal ref missing
 
-**Status:** DRAFT v1 — pending adversarial plan review
+**Status:** v2 — revised after two hostile plan reviews (R1 PLAN-NEEDS-MAJOR,
+R2 PLAN-NEEDS-MINOR; convergent findings folded below)
 
 ## 1. Issue framing
 
@@ -105,38 +106,56 @@ func validateIPsecPolicyProposalReferencesStrict(cfg *Config) error {
         return nil
     }
     ipsec := cfg.Security.IPsec
-    for _, name := range sortedKeys(ipsec.Policies) { // deterministic order
+    // cfg.Security.IPsec.Policies is a map (unordered); sort keys so the
+    // first-error commit-check message is deterministic across runs.
+    // (R1/R2 F2: there is no sortedKeys helper in pkg/config — inline the
+    // established sort.Strings idiom.)
+    names := make([]string, 0, len(ipsec.Policies))
+    for name := range ipsec.Policies {
+        names = append(names, name)
+    }
+    sort.Strings(names)
+    for _, name := range names {
         pol := ipsec.Policies[name]
         if pol == nil {
             continue
         }
         propRef := pol.Proposals
-        if propRef == "" {
+        explicitRef := propRef != ""
+        if !explicitRef {
             propRef = pol.Name // mirror resolveESPSettings' policy-name fallback
         }
         if _, ok := ipsec.Proposals[propRef]; ok {
             continue
         }
-        // Only fail when the dangling ref would actually drop a
-        // configured security control or produce an unusable proposal.
-        return fmt.Errorf("ipsec policy %q references undefined ipsec "+
-            "proposal %q (configured perfect-forward-secrecy group "+
-            "would be silently dropped)", pol.Name, propRef)
+        // R1 MAJOR: branch the message on whether the operator actually
+        // typed a `proposals` leaf. A policy that configures PFS but no
+        // explicit proposal must NOT be blamed for referencing a phantom
+        // proposal named after the policy.
+        if explicitRef {
+            return fmt.Errorf("ipsec policy %q references undefined ipsec "+
+                "proposal %q (the configured proposal set -- including any "+
+                "perfect-forward-secrecy group -- would be silently dropped "+
+                "to the strongSwan default)", pol.Name, propRef)
+        }
+        return fmt.Errorf("ipsec policy %q has no resolvable ipsec proposal "+
+            "(no `proposals` reference and no proposal named %q); the "+
+            "configured perfect-forward-secrecy group would be silently "+
+            "dropped -- define a proposal or reference one", pol.Name, pol.Name)
     }
     return nil
 }
 ```
 
-Decision point for review: **always reject a dangling ref, or only when
-`pol.PFSGroup > 0`?**
-
-- Rejecting **always** is the safer, more consistent choice: a dangling
-  proposal ref means the operator's intended cipher/auth/DH set is
-  silently replaced by strongSwan's `default` set — that is a silent
-  substitution of the *entire* Phase-2 proposal, not just PFS. The
-  scheduler/match-address precedents reject the dangling ref
-  unconditionally. **Plan picks: reject always**, with the error message
-  noting the PFS-drop consequence when PFS is set. (Open question Q1.)
+Decision (Q1, both reviewers): **always reject a dangling ref**, regardless
+of `PFSGroup`. A dangling proposal ref silently substitutes the operator's
+*entire* Phase-2 proposal (cipher/auth/DH) with strongSwan's `default`
+set -- the same silent-substitution class `ValidateDHGroup` already closes,
+not just PFS. Both reviewers confirmed there is no legitimate Junos idiom of
+a PFS policy with a dangling proposal ref. `validatePolicySchedulerReferencesStrict`
+rejects unconditionally; this mirrors it. R1's MAJOR finding (a policy with
+PFS but no explicit `proposals` leaf must not be blamed for a phantom
+proposal) is folded via the dual-message branch above.
 
 Wire it into the strict accumulator group (`compiler.go` ~line 524,
 alongside `validatePolicySchedulerReferencesStrict`) so `commit check`
@@ -144,14 +163,21 @@ surfaces it with the other independent cross-ref families. It reads only
 `cfg.Security.IPsec` (independent of the other accumulator members), so
 it belongs in the independent set.
 
-**Lenient downgrade:** add a `lenientIPsecPolicyProposalRef` flag to
-`compileOpts`, set in `CompileConfigLenient` (and the node-aware lenient
-sibling if one exists for cluster paths). On the tolerant path, downgrade
-to a `cfg.Warnings` entry instead of a hard error — so an
-already-persisted / peer-synced config that carries this latent
-misconfiguration still boots (consistent with `lenientPolicyMatchAddress`
-/ `lenientDeviceMap`). The render-path safety net (Layer B) ensures PFS is
-still not silently dropped on that boot.
+**Lenient downgrade (Q3, both reviewers — REQUIRED in BOTH entry points):**
+add a `lenientIPsecPolicyProposalRef` flag to `compileOpts`, set in **both**
+`CompileConfigLenient` AND `CompileConfigForNodeLenient`. The node-aware
+sibling is load-bearing: HA peer-sync ingress (`Store.SyncApply`) and
+standby boot route through `CompileConfigForNodeLenient` — if the flag were
+only in `CompileConfigLenient`, a peer-synced config carrying this latent
+misconfiguration would hard-reject the entire HA config sync at the standby
+(exactly the failure class the `lenient*` doctrine exists to prevent;
+`lenientPolicyMatchAddress`/`lenientDeviceMap` are set in both siblings,
+`compiler.go:159-162` and `:237-240`). On the tolerant path, downgrade to a
+`cfg.Warnings` entry instead of a hard error so an already-persisted /
+peer-synced config still boots. The render-path safety net (Layer B) ensures
+PFS is still not silently dropped on that boot. The validator lives in the
+strict accumulator inside the shared `compileExpanded`/`compileConfig...WithOpts`
+path that BOTH `CompileConfig` and `CompileConfigForNode` reach.
 
 ### 5.2 Layer B — render-path safety net (DEFENSE IN DEPTH)
 
@@ -162,21 +188,33 @@ scenario (B): if the IPsec policy is found and `pfsGroup > 0` but the
 proposal ref does not resolve, fall back to a proposal string that
 **preserves the configured modp group** rather than bare `"default"`.
 
-strongSwan accepts an `esp_proposals` line that lists multiple comma-
-separated proposals; a proposal token may carry just a DH group only if
-it also carries cipher/integrity, so we cannot emit a bare `modpNNNN`.
-The faithful fallback is to keep strongSwan's `default` cipher/auth set
-**and** append the operator's PFS group so PFS is not lost:
+The fallback must be a **single, valid swanctl ESP proposal** that carries
+the PFS modp group. A non-AEAD (CBC) ESP transform with no integrity
+algorithm is invalid for strongSwan (both reviewers confirmed: strongSwan
+rejects a CBC proposal that lacks an integrity alg), so the fallback MUST
+include both a cipher and an integrity alg in addition to the modp term.
 
-```
-esp_proposals = default-modpNNNN
+**Pinned fallback (Q2 resolved):** seed the fallback proposal with the SAME
+algorithm spellings the codebase already emits on the normal path, so the
+fallback is byte-identical to a standard `aes256 / sha256 / dh<group>`
+proposal and introduces no new keyword spelling:
+
+```go
+fallbackProp := &config.IPsecProposal{
+    EncryptionAlg: "aes256-cbc",
+    AuthAlg:       "hmac-sha256-128",
+}
+return buildESPProposal(fallbackProp, pfsGroup), 0
 ```
 
-Wait — `default` is a keyword set, not a single proposal; `default-modpN`
-is not valid swanctl syntax. The correct, swanctl-valid fallback is to
-emit an explicit conservative proposal that carries the PFS group, e.g.
-`aes256-sha256-modpNNNN` (the same shape `buildESPProposal` would have
-produced for a default proposal), so the child SA still negotiates PFS.
+`buildESPProposal(fallbackProp, 14)` normalizes to `aes256-sha256128-modp2048`
+— exactly the token the existing tests pin for a normal aes256/sha256/dh14
+proposal (`ipsec_test.go:157,187`). This deliberately matches the codebase's
+established output (`sha256128`) rather than emitting a divergent `sha256`
+spelling. (R2 N3 notes `sha256128` vs `sha256` is a separate, pre-existing
+keyword-spelling question across the whole package — out of scope for #2073;
+matching the existing token keeps this fix consistent and avoids introducing
+a second spelling.)
 
 ```go
 func resolveESPSettings(cfg *config.IPsecConfig, vpn *config.IPsecVPN) (string, int) {
@@ -192,16 +230,22 @@ func resolveESPSettings(cfg *config.IPsecConfig, vpn *config.IPsecVPN) (string, 
             if prop, ok := cfg.Proposals[propRef]; ok {
                 return buildESPProposal(prop, pfsGroup), prop.LifetimeSeconds
             }
-            // (B): proposal ref dangling. Commit-check (Layer A)
-            // rejects this for new edits; this branch is only reached on
-            // a tolerant-path boot of an already-persisted/peer-synced
-            // config. Do NOT silently drop a configured PFS group —
-            // carry it on a conservative fallback proposal and warn.
+            // (B): proposal ref dangling. Commit-check (Layer A) rejects
+            // this for new edits; this branch is only reached on a
+            // tolerant-path boot of an already-persisted / peer-synced
+            // config (Layer A downgraded to a warning). Do NOT silently
+            // drop a configured PFS group -- carry it on a conservative,
+            // valid fallback proposal and warn.
             if pfsGroup > 0 {
                 slog.Warn("ipsec policy references undefined proposal; "+
                     "preserving configured PFS group on fallback proposal",
-                    "policy", vpn.IPsecPolicy, "proposal", propRef, "pfs_group", pfsGroup)
-                return buildESPProposal(&config.IPsecProposal{}, pfsGroup), 0
+                    "policy", vpn.IPsecPolicy, "proposal", propRef,
+                    "pfs_group", pfsGroup)
+                fallbackProp := &config.IPsecProposal{
+                    EncryptionAlg: "aes256-cbc",
+                    AuthAlg:       "hmac-sha256-128",
+                }
+                return buildESPProposal(fallbackProp, pfsGroup), 0
             }
         } else if prop, ok := cfg.Proposals[vpn.IPsecPolicy]; ok {
             return buildESPProposal(prop, 0), prop.LifetimeSeconds
@@ -211,17 +255,11 @@ func resolveESPSettings(cfg *config.IPsecConfig, vpn *config.IPsecVPN) (string, 
 }
 ```
 
-`buildESPProposal(&IPsecProposal{}, pfsGroup)` yields
-`aes256-modpNNNN` (empty EncryptionAlg defaults to `aes256`, empty
-AuthAlg is omitted, pfsGroup adds the modp term) — a valid swanctl
-proposal that preserves PFS. This is strictly safer than today's bare
-`default` (which has no PFS). Open question Q2: is `aes256-modpN`
-(no integrity) an acceptable fallback, or should we add a default
-integrity (`aes256-sha256-modpN`)? GCM-less AES-CBC without an integrity
-alg is not a valid ESP transform for strongSwan — **the fallback must
-include an integrity alg.** Plan picks: seed the fallback proposal with
-`AuthAlg: "hmac-sha-256"` so `buildESPProposal` emits
-`aes256-sha256-modpNNNN`. (Confirm in review.)
+The fallback fires ONLY when an IPsec policy is found AND `pfsGroup > 0` AND
+the proposal ref dangles — scenarios (A)/(C)/(D) are byte-identical to today.
+A dangling-ref policy with `pfsGroup == 0` still falls to `default` on the
+render path (Layer A already rejected/warned it; there is no PFS control to
+preserve, so the render behavior is unchanged from today and not worsened).
 
 ## 6. Public API preservation
 
@@ -256,7 +294,7 @@ include an integrity alg.** Plan picks: seed the fallback proposal with
 |---|---|---|
 | Behavioral regression (over-reject) | LOW-MED | Validator could reject a previously-committing config that relied on the dangling-ref→default fallback. Mitigated by the lenient downgrade on tolerant paths; new edits *should* fail (that's the fix). Q1/Q3. |
 | Render-path correctness | LOW | Layer B only changes scenario (B); (A)/(C)/(D) byte-identical. Covered by render unit tests. |
-| swanctl-syntax validity of fallback | MED | Must emit a valid ESP proposal (cipher+integrity+modp). Q2 pins `aes256-sha256-modpN`. |
+| swanctl-syntax validity of fallback | LOW | Resolved: fallback emits `aes256-sha256128-modp<bits>` (cipher+integrity+modp), byte-identical to the codebase's normal proposal token. Both reviewers confirmed CBC-without-integrity is invalid; this carries integrity. |
 | Architectural mismatch | LOW | Directly mirrors the existing `*Strict` cross-ref + `lenient*` doctrine; not a new pattern. |
 
 ## 9. Test plan (control-plane only — NO dataplane smoke)
@@ -265,18 +303,30 @@ Per the task: this is config compile/render; no cluster smoke needed.
 
 - `go build ./...` clean.
 - `pkg/ipsec` unit tests:
-  - **(B) commit-check / render**: IPsec policy with PFS + dangling
-    proposal ref → render preserves the modp group (NOT `default`); assert
-    `esp_proposals` contains `modp<bits>`.
+  - **(B) render**: IPsec policy with PFS + dangling proposal ref → render
+    preserves the modp group (NOT `default`); assert the EXACT fallback
+    `esp_proposals = aes256-sha256128-modp2048` (not just a `modp` substring
+    — a `Contains("modp2048")` assertion would pass for an invalid
+    no-integrity `aes256-modp2048` too, per R2 N1).
+  - **(B) render, PFSGroup==0**: dangling ref with no PFS → still
+    `esp_proposals = default` (unchanged from today; nothing to preserve).
   - **(A) regression**: policy + resolvable proposal + PFS → unchanged
     `aes256-sha256128-modp2048`.
   - **(C) regression**: `TestGenerateConfig_WithProposal` stays green.
   - **(D) regression**: VPN with no policy → `esp_proposals = default`.
 - `pkg/config` unit tests:
   - `validateIPsecPolicyProposalReferencesStrict` rejects (B) via
-    `CompileConfig` / commit-check with a clear cross-reference message.
-  - `CompileConfigLenient` downgrades (B) to a warning (boots through).
-  - (A)/(C)/(D) compile clean (no false reject).
+    `CompileConfig` / commit-check with a clear cross-reference message
+    (explicit-ref message variant).
+  - The `proposals`-leaf-omitted variant (policy with PFS, no `proposals`
+    leaf) rejects with the SECOND message variant (does not blame a phantom
+    proposal named after the policy — R1 MAJOR).
+  - `CompileConfigLenient` AND `CompileConfigForNodeLenient` both downgrade
+    (B) to a `cfg.Warnings` entry (boots through) — assert the warning is
+    present and no error returned.
+  - (A)/(C)/(D) compile clean (no false reject); explicitly assert
+    `TestGenerateConfig_WithProposal`-shaped config (policy-name ==
+    proposal-name, no `Policies` entry) does NOT trip the validator.
   - Flat-set syntax path (`ParseSetCommand` + `tree.SetPath`) for the
     commit-check test, per the project's set-syntax testing rule.
 - Full Go suite: `go test ./...` green.
@@ -292,32 +342,50 @@ Per the task: this is config compile/render; no cluster smoke needed.
   *security-control drop* is ESP/PFS-specific. A symmetric IKE validator
   is a reasonable follow-up but is not this issue. (Open question Q4 —
   reviewers may argue it belongs here.)
-- Validating that an IPsec policy is actually referenced by some VPN
-  (orphan-policy detection) — different class.
+- Note (R2 N2): the strict validator iterates ALL `Policies`, so it also
+  rejects a dangling-ref policy that no VPN references (a dead-config typo).
+  This is intentional and matches the scheduler/match-address precedents
+  (which validate the whole map/slice, not just referenced entries) — it is
+  NOT orphan-policy detection (that would flag a *resolvable* policy unused
+  by any VPN, a different class which stays out of scope).
+- Note (R2 N1, version drift): strongSwan >= 6.0.2 changed the `default`
+  ESP set to include all KE methods plus `none`, making PFS *optional*
+  rather than absent. The bug still holds (operator configured a *specific*
+  group; `default` makes it optional/negotiable-down to none), so the fix is
+  unchanged. Documented in the docs update, not a code concern.
 
-## 11. Open questions for adversarial review
+## 11. Resolved decisions (from the two hostile plan reviews)
 
-- **Q1.** Reject a dangling proposal ref **always**, or only when
-  `PFSGroup > 0`? Plan: always (consistent with scheduler/match-address
-  precedents; a dangling ref silently substitutes the whole proposal set,
-  not just PFS). Argue for PFS-only if the always-reject is judged to
-  break legitimate "policy with no explicit proposal, relying on default"
-  configs.
-- **Q2.** Is `aes256-sha256-modpN` the right render-path fallback, or
-  should the fallback mirror strongSwan's exact `default` cipher list
-  with the modp appended? Is emitting any opinionated cipher in the
-  fallback worse than the bare-`default`-plus-warning status quo?
-- **Q3.** Does the lenient downgrade belong on the cluster/node-aware
-  lenient path too (`CompileConfigForNodeLenient` / `SyncApply`), or is
-  the standalone `CompileConfigLenient` sufficient? (Mirror whatever
-  `lenientPolicyMatchAddress` does.)
-- **Q4.** Should the symmetric IKE-side dangling-proposal validation be
-  in-scope here, or is ESP/PFS genuinely the only silent
-  *security-control* drop?
-- **Q5.** Is the two-layer design (commit-reject + render-safety-net)
-  over-engineered? Would commit-validation alone (Layer A) suffice, given
-  that tolerant paths warn? (Counter: a peer-synced or pre-existing
-  config reaching `Apply` would still silently drop PFS without Layer B.)
-- **Q6.** Scenario (C) — should the policy-name==proposal-name idiom also
-  carry PFS? Today it can't (no policy struct → no PFSGroup). Is that a
-  latent second bug or intended Junos semantics?
+- **Q1 — RESOLVED: reject always.** A dangling proposal ref silently
+  substitutes the entire Phase-2 proposal set, not just PFS; mirrors
+  `validatePolicySchedulerReferencesStrict`. Both reviewers agreed; no
+  legitimate config relies on the dangling-ref→default fallback. R1's
+  caveat (a PFS-policy with no explicit `proposals` leaf must not be blamed
+  for a phantom proposal) is handled by the dual-message branch in §5.1.
+- **Q2 — RESOLVED: `aes256-sha256128-modp<bits>`.** Non-AEAD ESP requires
+  an integrity alg (both reviewers); the fallback seeds
+  `EncryptionAlg: aes256-cbc, AuthAlg: hmac-sha256-128` so the emitted
+  token is byte-identical to the codebase's normal proposal output and
+  introduces no new keyword spelling. The earlier `aes256-modpN`
+  (no-integrity) draft was wrong and is removed.
+- **Q3 — RESOLVED: both lenient entry points.** Set the flag in
+  `CompileConfigLenient` AND `CompileConfigForNodeLenient`; the node-aware
+  one backs HA peer-sync (`Store.SyncApply`) and standby boot.
+- **Q4 — RESOLVED: IKE out of scope, follow-up filed.** IKE DH lives inside
+  the IKE proposal (no separate IKE-policy PFS leaf), so an empty IKE
+  `proposals` line drops the whole proposal to strongSwan's IKE default
+  (which always negotiates DH) — no *separately-configured* control silently
+  survives-minus-PFS. The symmetric IKE dangling-ref validation is a
+  reasonable ~10-line follow-up; will file an issue, not block #2073.
+- **Q5 — RESOLVED: keep both layers.** Layer B is the only thing that
+  preserves PFS on a tolerant/peer-synced boot where Layer A only warned —
+  the lenient warning does not change the rendered crypto. Both reviewers
+  traced `SyncApply/Load → CompileConfigForNodeLenient → ActiveConfig →
+  ipsec.Apply → renderConfig → resolveESPSettings` and confirmed Layer-A-only
+  leaves the peer-sync hole open.
+- **Q6 — RESOLVED: not a bug.** Scenario (C) (policy-name == proposal-name)
+  only fires when there is NO `IPsecPolicyDef` struct, in which case there
+  is no `PFSGroup` to carry. When PFS is configured, the policy struct
+  always exists (`compiler_ipsec.go:222-241` always creates it), so the
+  config routes through scenario (A), where PFS is applied correctly. No
+  silent drop in (C).
