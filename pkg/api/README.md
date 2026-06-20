@@ -90,5 +90,9 @@ under the daemon's errgroup. Nothing else imports this package.
   budgets are request-sized (#1819) via `pingExecTimeout` (count × 1s +
   15s slack, 30s floor) and `diagTracerouteTimeout` (60s), capped at the
   150s `diagExecCeiling` and mirrored in `pkg/grpcapi/exec_timeout.go`.
+  The argv builders (`buildPingArgv`/`buildTracerouteArgv`) place the
+  user-supplied target after a `--` end-of-options separator so a
+  `-`-prefixed target is an operand, not a flag (option-confusion
+  hardening, #2084).
   Do not add raw `exec.Command` calls in handlers: a wedged binary pins
   the handler goroutine and its HTTP connection.
