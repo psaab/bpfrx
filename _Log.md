@@ -132,6 +132,17 @@
 - **File(s)**: pkg/daemon/bootstrap.go, pkg/daemon/daemon_run.go,
   pkg/daemon/frr_failclosed_boot_test.go, pkg/frr/testseam.go,
   pkg/daemon/README.md, _Log.md
+## 2026-06-20 — #2008 H1 review follow-up: lone `inactive:` error position
+
+- **Timestamp**: 2026-06-20
+- **Action**: Address Copilot review feedback in `pkg/config/parser.go`:
+  capture the statement-start token location before `parseKeys()` consumes
+  `inactive:` so a lone-marker parse error is reported at the marker token
+  itself (instead of the following terminator). Added a regression test that
+  pins the marker error location at line 2, column 5 for an indented lone
+  marker input.
+- **File(s)**: pkg/config/parser.go, pkg/config/inactive_test.go, _Log.md
+
 ## 2026-06-19 — #2008 H1: Junos `inactive:` statement marker
 
 - **Timestamp**: 2026-06-19

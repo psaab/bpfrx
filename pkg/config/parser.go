@@ -105,6 +105,7 @@ const inactiveMarker = "inactive:"
 // the returned Node so the statement's real identity (Keys) is unchanged
 // and key matching, schema walks, and group merge keep working unmodified.
 func (p *Parser) parseStatement() *Node {
+	statementStart := p.lexer.Peek()
 	keys := p.parseKeys()
 	if len(keys) == 0 {
 		// Recovery: skip unexpected token
@@ -120,7 +121,7 @@ func (p *Parser) parseStatement() *Node {
 	// keys. A lone `inactive:` with no following statement is a parse error
 	// (Junos requires a statement to deactivate).
 	inactive := false
-	markerLine, markerCol := p.lexer.Peek().Line, p.lexer.Peek().Column
+	markerLine, markerCol := statementStart.Line, statementStart.Column
 	if keys[0] == inactiveMarker {
 		inactive = true
 		keys = keys[1:]

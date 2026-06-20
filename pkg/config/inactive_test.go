@@ -119,6 +119,26 @@ func TestInactive_LoneMarkerIsParseError(t *testing.T) {
 	}
 }
 
+func TestInactive_LoneMarkerErrorPointsAtMarker(t *testing.T) {
+	_, errs := NewParser("system {\n    inactive: ;\n}").Parse()
+	if len(errs) == 0 {
+		t.Fatal("expected parse error for lone marker, got none")
+	}
+	found := false
+	for _, e := range errs {
+		if strings.Contains(e.Message, "inactive") {
+			found = true
+			if e.Line != 2 || e.Column != 5 {
+				t.Fatalf("inactive marker error should point at marker token (2:5), got %d:%d (%q)",
+					e.Line, e.Column, e.Message)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("expected inactive-marker error, got %v", errs)
+	}
+}
+
 // --- Round-trip through every serializer -------------------------------
 
 func TestInactive_TextRoundTrip(t *testing.T) {
