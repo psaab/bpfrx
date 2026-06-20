@@ -593,24 +593,78 @@ func (m *Manager) generatePolicyOptions(po *config.PolicyOptionsConfig) string {
 			// Generate an inline prefix-list for route-filters
 			if len(term.RouteFilters) > 0 {
 				plName := name + "-" + term.Name
+				// emitted counts the prefix-list entries actually written.
+				// firstEmittedV6 records the family of the first written
+				// entry so the post-loop "match ip/ipv6 address
+				// prefix-list" line picks the correct family from a
+				// PARSEABLE, non-skipped prefix (NOT term.RouteFilters[0],
+				// which may be a #2103-skipped /32 or a #2105 malformed
+				// prefix). When emitted == 0 the whole term has no usable
+				// route-filter, so the match line is suppressed entirely
+				// (#2103/#2105): emitting "match ... prefix-list <name>"
+				// against a name with zero "ip prefix-list" lines would
+				// reference a NON-EXISTENT list. We intentionally never
+				// materialise a zero-entry list either — in FRR a
+				// count==0 prefix-list returns PREFIX_PERMIT (match-ALL),
+				// so a stray empty list would silently permit everything.
+				emitted := 0
+				firstEmittedV6 := false
 				for i, rf := range term.RouteFilters {
+					isV6 := strings.Contains(rf.Prefix, ":")
 					matchStr := "le 32"
-					if strings.Contains(rf.Prefix, ":") {
+					if isV6 {
 						matchStr = "le 128"
+					}
+					// skipEntry suppresses this route-filter's prefix-list
+					// line entirely (match-nothing for this entry) rather
+					// than emitting an FRR-invalid line. Set by the #2103
+					// max-length "longer" guard and the #2105 malformed-
+					// prefix belt below.
+					skipEntry := false
+					// #2105 render-side belt-and-suspenders: a malformed
+					// prefix (no "/", or a non-numeric / out-of-range mask)
+					// must never reach an FRR line. The commit-time
+					// keyValidator (schema_routing.go) rejects these, but
+					// the lenient-on-load path (Store.Load / SyncApply,
+					// #1960) can still feed a stored pre-gate garbage prefix
+					// to the renderer. A valid CIDR always has "/" + a
+					// numeric mask in range, so this never skips a valid
+					// v4/v6 prefix.
+					if mp := strings.SplitN(rf.Prefix, "/", 2); len(mp) != 2 {
+						skipEntry = true
+					} else if plen, err := strconv.Atoi(mp[1]); err != nil || plen < 0 || plen > 128 {
+						skipEntry = true
 					}
 					switch rf.MatchType {
 					case "exact":
 						matchStr = ""
 					case "longer":
-						// longer = strictly more specific (not the prefix itself)
+						// longer = strictly more specific (the prefix itself
+						// EXCLUDED). For a max-length prefix (/32 v4, /128
+						// v6) there are no more-specifics, so "longer" is the
+						// EMPTY set — skip the entry rather than emit an
+						// FRR-invalid "ge plen+1 le maxLen" line. For /32
+						// that is "ge 33 le 32": ge 33 fails the FRR YANG
+						// range (0..32) AND ge > le, and a rejected line can
+						// fail the whole frr-reload (frr-reload.py applies
+						// the add-batch via a single vtysh -f and exits
+						// non-zero on any CMD_WARNING_CONFIG_FAILED). Mirrors
+						// the upto plen>=maxLen guard (#2102) and closes
+						// #2103. Boundary: plen+1 > maxLen skips ONLY
+						// plen==maxLen — /31 still emits "ge 32 le 32" (one
+						// legal more-specific).
 						parts := strings.SplitN(rf.Prefix, "/", 2)
 						if len(parts) == 2 {
 							if plen, err := strconv.Atoi(parts[1]); err == nil {
 								maxLen := 32
-								if strings.Contains(rf.Prefix, ":") {
+								if isV6 {
 									maxLen = 128
 								}
-								matchStr = fmt.Sprintf("ge %d le %d", plen+1, maxLen)
+								if plen+1 > maxLen {
+									skipEntry = true
+								} else {
+									matchStr = fmt.Sprintf("ge %d le %d", plen+1, maxLen)
+								}
 							}
 						}
 					case "orlonger":
@@ -686,7 +740,14 @@ func (m *Manager) generatePolicyOptions(po *config.PolicyOptionsConfig) string {
 							}
 						}
 					}
-					if strings.Contains(rf.Prefix, ":") {
+					if skipEntry {
+						// #2103/#2105: emit no prefix-list line for this
+						// entry. Its seq slot (i+1)*5 is simply not used;
+						// gaps in seq are FRR-legal and keep the remaining
+						// entries' seq stable across a config edit.
+						continue
+					}
+					if isV6 {
 						fmt.Fprintf(&b, "ipv6 prefix-list %s seq %d permit %s", plName, (i+1)*5, rf.Prefix)
 					} else {
 						fmt.Fprintf(&b, "ip prefix-list %s seq %d permit %s", plName, (i+1)*5, rf.Prefix)
@@ -695,11 +756,26 @@ func (m *Manager) generatePolicyOptions(po *config.PolicyOptionsConfig) string {
 						fmt.Fprintf(&b, " %s", matchStr)
 					}
 					b.WriteString("\n")
+					if emitted == 0 {
+						firstEmittedV6 = isV6
+					}
+					emitted++
 				}
-				if strings.Contains(term.RouteFilters[0].Prefix, ":") {
-					fmt.Fprintf(&b, " match ipv6 address prefix-list %s\n", plName)
-				} else {
-					fmt.Fprintf(&b, " match ip address prefix-list %s\n", plName)
+				// Emit the match line ONLY when at least one prefix-list
+				// entry was written. With zero entries the prefix-list name
+				// is never created, so a "match ... prefix-list <name>" line
+				// would reference a non-existent list; suppressing it leaves
+				// the term with no route-filter condition (its other
+				// from/then clauses still render). Family comes from the
+				// first EMITTED (parseable, non-skipped) entry — not
+				// term.RouteFilters[0], which may be a skipped /32 longer or
+				// a malformed prefix of the wrong/garbage family.
+				if emitted > 0 {
+					if firstEmittedV6 {
+						fmt.Fprintf(&b, " match ipv6 address prefix-list %s\n", plName)
+					} else {
+						fmt.Fprintf(&b, " match ip address prefix-list %s\n", plName)
+					}
 				}
 			}
 
