@@ -106,7 +106,7 @@ func runReconcile(t *testing.T, m *DDNSManager, pol ddnsPolicy, leases []ddnsLea
 	t.Helper()
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.reconcileOnceLocked(context.Background(), pol, leases)
+	return m.reconcileOnceLocked(context.Background(), pol, leases, nil)
 }
 
 // ---- hostname normalization ----
@@ -562,6 +562,67 @@ func TestNilUpdaterIsNopNotPanic(t *testing.T) {
 	}
 	if _, ok := m.state.get("mac:bb", "10.0.0.20"); ok {
 		t.Fatal("withdraw did not drop the owned entry under no-backend mode")
+	}
+}
+
+// TestReconcileParseErrorSuppressesFamilyDeletes proves the #1387 MAJOR-4
+// fail-safe: when a family's lease CSV cannot be parsed, that family's lease
+// set is unreliable, so the reconciler must NOT delete its owned records (a
+// transient malformed CSV would otherwise mass-delete every valid record of
+// that family). The v6 family, whose CSV is fine, is unaffected. Against the
+// pre-fix Reconcile (which logged the parse error then reconciled with the
+// nil/partial set) the owned v4 record looks expired and is deleted, so this
+// test fails pre-fix.
+func TestReconcileParseErrorSuppressesFamilyDeletes(t *testing.T) {
+	up := newFakeUpdater()
+	m := testDDNS(t, up)
+
+	cfg := &config.DHCPServerConfig{
+		DynamicDNS: &config.DHCPDynamicDNSConfig{
+			Enabled:    true,
+			Domain:     "example.com",
+			TTLSeconds: 300,
+		},
+	}
+
+	// Cycle 1: a valid v4 lease and a valid v6 lease -> both published+owned.
+	writeCSV(t, m.leasePath4, `address,hwaddr,client_id,valid_lifetime,expire,subnet_id,hostname,state
+10.0.0.10,aa,,3600,1900000000,1,host-a,0
+`)
+	writeCSV(t, m.leasePath6, `address,duid,valid_lifetime,expire,subnet_id,iaid,hostname,state
+2001:db8::5,00:01,3600,1900000000,1,7,host-6,0
+`)
+	if err := m.Reconcile(context.Background(), cfg); err != nil {
+		t.Fatalf("cycle 1 reconcile: %v", err)
+	}
+	if n := len(m.state.records); n != 2 {
+		t.Fatalf("cycle 1 owned records = %d, want 2", n)
+	}
+
+	// Cycle 2: corrupt the v4 CSV (bare quote => csv parse error); leave the
+	// v6 CSV valid. The v4 owned record must be PRESERVED (no delete); the
+	// reconcile must surface the parse error.
+	up.deletes = nil
+	writeCSV(t, m.leasePath4, `address,hwaddr,client_id,valid_lifetime,expire,subnet_id,hostname,state
+10.0.0.10,aa,,3600,1900000000,1,bad"name,0
+`)
+	err := m.Reconcile(context.Background(), cfg)
+	if err == nil {
+		t.Fatal("expected the v4 parse error to be surfaced")
+	}
+	// No v4 deletes at all this cycle.
+	for _, d := range up.deletes {
+		if d.Addr.Is4() {
+			t.Fatalf("v4 record deleted despite unreadable lease CSV: %s", d.FQDN)
+		}
+	}
+	// The v4 owned record is still in the store.
+	if _, ok := m.state.get("mac:aa", "10.0.0.10"); !ok {
+		t.Fatal("v4 owned record dropped after a v4 parse error (mass-delete bug)")
+	}
+	// The healthy v6 owned record is also still present (active in its CSV).
+	if _, ok := m.state.get("duid:00:01/7", "2001:db8::5"); !ok {
+		t.Fatal("healthy v6 owned record lost while v4 was untrusted")
 	}
 }
 

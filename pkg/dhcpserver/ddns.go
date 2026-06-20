@@ -201,14 +201,34 @@ func (m *DDNSManager) Reconcile(ctx context.Context, cfg *config.DHCPServerConfi
 	now := m.now()
 	leases4, err4 := parseActiveLeases4(m.leasePath4, now)
 	if err4 != nil {
-		slog.Warn("ddns: parse v4 leases failed", "err", err4)
+		slog.Warn("ddns: parse v4 leases failed; suppressing v4 deletes this cycle", "err", err4)
 	}
 	leases6, err6 := parseActiveLeases6(m.leasePath6, now)
 	if err6 != nil {
-		slog.Warn("ddns: parse v6 leases failed", "err", err6)
+		slog.Warn("ddns: parse v6 leases failed; suppressing v6 deletes this cycle", "err", err6)
 	}
 	leases := append(leases4, leases6...)
-	return m.reconcileOnceLocked(ctx, pol, leases)
+
+	// Fail-safe: when a family's lease CSV cannot be read/parsed, its lease
+	// set is unreliable (nil/partial) and EVERY owned record of that family
+	// would look expired -> eligible for deletion. We must never delete owned
+	// records on the basis of an unreadable source of truth, so mark that
+	// family as untrusted and the reconciler skips its destructive diff this
+	// cycle. The error is surfaced to the caller so the loop logs/counts it.
+	untrusted := map[int]bool{}
+	if err4 != nil {
+		untrusted[4] = true
+	}
+	if err6 != nil {
+		untrusted[6] = true
+	}
+	if err := m.reconcileOnceLocked(ctx, pol, leases, untrusted); err != nil {
+		return err
+	}
+	if err4 != nil {
+		return err4
+	}
+	return err6
 }
 
 // reconcileOnceLocked is the pure reconcile algorithm (plan §4.5): build
@@ -217,7 +237,12 @@ func (m *DDNSManager) Reconcile(ctx context.Context, cfg *config.DHCPServerConfi
 // against owned state so the never-delete-non-owned boundary holds. Caller
 // holds m.mu. Exposed (unexported) so tests drive it with synthetic
 // leases + a fakeUpdater.
-func (m *DDNSManager) reconcileOnceLocked(ctx context.Context, pol ddnsPolicy, leases []ddnsLease) error {
+// untrusted maps a lease family (4 or 6) to true when that family's lease
+// CSV could not be read/parsed this cycle. The reconciler skips the
+// destructive diff (deletes) for an untrusted family so a transient
+// malformed lease file can never mass-delete that family's owned records.
+// A nil map means all families are trusted.
+func (m *DDNSManager) reconcileOnceLocked(ctx context.Context, pol ddnsPolicy, leases []ddnsLease, untrusted map[int]bool) error {
 	source := hostnameSourceFor(&pol)
 	blockedIdentity := map[string]struct{}{}
 	blockedAddress := map[string]struct{}{}
@@ -281,6 +306,17 @@ func (m *DDNSManager) reconcileOnceLocked(ctx context.Context, pol ddnsPolicy, l
 		d, stillWanted := want[key]
 		if stillWanted && recordsEqual(owned, d.ow) {
 			d.seen = true // unchanged; no add needed below
+			continue
+		}
+		// Fail-safe (#1387 MAJOR-4): if this owned record's family had an
+		// unreadable/partial lease CSV this cycle, its "expired" appearance
+		// is untrustworthy — skip the delete entirely. Mark the record as
+		// seen so the add pass does not re-publish it either; leave the
+		// ownership entry intact for a later, trustworthy reconcile.
+		if untrusted[owned.Family] {
+			if stillWanted {
+				d.seen = true
+			}
 			continue
 		}
 		// Owned but not wanted (expired/released) OR wanted differently
