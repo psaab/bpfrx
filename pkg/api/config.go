@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"strings"
 
@@ -69,6 +70,47 @@ func (s *Server) configDeleteHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := s.store.DeleteFromInput(req.Input); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeOK(w, map[string]string{"status": "ok"})
+}
+
+// configDeactivateHandler marks a candidate node inactive (#2051), the REST
+// equivalent of the interactive `deactivate <path>` verb. The request body's
+// Input is the bare path (no verb), mirroring configSetHandler. It routes
+// through DeactivateFromInput so the verb logic stays in the store's
+// applyEditLine switch and the path is never mangled into a junk "set" node.
+func (s *Server) configDeactivateHandler(w http.ResponseWriter, r *http.Request) {
+	var req ConfigSetRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	if req.Input == "" {
+		writeError(w, http.StatusBadRequest, "input required")
+		return
+	}
+	if err := s.store.DeactivateFromInput(req.Input); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeOK(w, map[string]string{"status": "ok"})
+}
+
+// configActivateHandler clears the inactive marker on a candidate node
+// (#2051), the REST equivalent of the interactive `activate <path>` verb.
+func (s *Server) configActivateHandler(w http.ResponseWriter, r *http.Request) {
+	var req ConfigSetRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+	if req.Input == "" {
+		writeError(w, http.StatusBadRequest, "input required")
+		return
+	}
+	if err := s.store.ActivateFromInput(req.Input); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
@@ -236,8 +278,19 @@ func (s *Server) configLoadHandler(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
+	case "set":
+		// #2052: make `load set` a real service-mode op (REST). LoadSet
+		// replays flat lines through applyEditLine so a body with
+		// `deactivate <path>` lines round-trips to inactive nodes (#2008 H1).
+		// Applied-count is log-only to keep the response shape stable.
+		count, err := s.store.LoadSet(req.Content)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		slog.Info("load set applied", "commands", count)
 	default:
-		writeError(w, http.StatusBadRequest, fmt.Sprintf("unknown load mode: %s (use 'override' or 'merge')", req.Mode))
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("unknown load mode: %s (use 'override', 'merge', or 'set')", req.Mode))
 		return
 	}
 	writeOK(w, map[string]string{"status": "ok"})

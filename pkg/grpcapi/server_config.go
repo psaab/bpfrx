@@ -3,6 +3,7 @@ package grpcapi
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"strings"
 
 	"github.com/psaab/xpf/pkg/config"
@@ -53,6 +54,24 @@ func (s *Server) Set(_ context.Context, req *pb.SetRequest) (*pb.SetResponse, er
 	}
 	if strings.HasPrefix(input, "insert ") {
 		return s.handleInsert(input)
+	}
+	// #2051: the remote CLI rides the Set RPC for activate/deactivate (no
+	// dedicated RPC). Prefix-route the verb to the store wrapper BEFORE the
+	// SetFromInput fall-through — otherwise the generic fall-through builds
+	// the junk path "set deactivate <path>" (a config node named after the
+	// verb) and the node is never marked inactive. The store wrappers strip
+	// the verb and route through applyEditLine (the centralized verb switch).
+	if rest, ok := strings.CutPrefix(input, "deactivate "); ok {
+		if err := s.store.DeactivateFromInput(rest); err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "%v", err)
+		}
+		return &pb.SetResponse{}, nil
+	}
+	if rest, ok := strings.CutPrefix(input, "activate "); ok {
+		if err := s.store.ActivateFromInput(rest); err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "%v", err)
+		}
+		return &pb.SetResponse{}, nil
 	}
 	if err := s.store.SetFromInput(input); err != nil {
 		return nil, status.Errorf(codes.InvalidArgument, "%v", err)
@@ -135,8 +154,19 @@ func (s *Server) Load(_ context.Context, req *pb.LoadRequest) (*pb.LoadResponse,
 		if err := s.store.LoadMerge(req.Content); err != nil {
 			return nil, status.Errorf(codes.InvalidArgument, "%v", err)
 		}
+	case "set":
+		// #2052: make `load set` a real service-mode op. LoadSet replays the
+		// flat command lines through applyEditLine, so a body containing
+		// `deactivate <path>` lines (emitted by `show | display set` for
+		// inactive nodes, #2008 H1) round-trips back to an inactive node.
+		// The applied-count is log-only (LoadResponse has no count field).
+		count, err := s.store.LoadSet(req.Content)
+		if err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "%v", err)
+		}
+		slog.Info("load set applied", "commands", count)
 	default:
-		return nil, status.Errorf(codes.InvalidArgument, "unknown load mode: %s (use 'override' or 'merge')", req.Mode)
+		return nil, status.Errorf(codes.InvalidArgument, "unknown load mode: %s (use 'override', 'merge', or 'set')", req.Mode)
 	}
 	return &pb.LoadResponse{}, nil
 }

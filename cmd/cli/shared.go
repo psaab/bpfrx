@@ -353,6 +353,23 @@ func (c *ctl) dispatchConfig(line string) error {
 		}
 		return nil
 
+	case "deactivate", "activate":
+		// #2051: activate/deactivate ride the Set RPC with the verb kept as
+		// the input prefix. The gRPC Set handler prefix-routes "deactivate "/
+		// "activate " to Deactivate/ActivateFromInput; sending the bare path
+		// (or using the Delete RPC) would mangle it into a junk "set" path.
+		if len(parts) < 2 {
+			return fmt.Errorf("%s: missing path", parts[0])
+		}
+		fullPath := append(append([]string{}, c.editPath...), parts[1:]...)
+		_, err := c.client.Set(c.ctx(), &pb.SetRequest{
+			Input: parts[0] + " " + strings.Join(fullPath, " "),
+		})
+		if err != nil {
+			return fmt.Errorf("%v", err)
+		}
+		return nil
+
 	case "copy", "rename":
 		toIdx := -1
 		for i, p := range parts {
