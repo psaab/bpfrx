@@ -1,6 +1,8 @@
 # #2083 — renameInterface leaves an interface renamed-but-DOWN when the final LinkSetUp fails
 
-**Status:** DRAFT v1 — pending adversarial plan review
+**Status:** v2 — revised after round-1 adversarial plan review (both
+reviewers converged: the v1 rename-back design was WRONG). v2 simplifies
+to "bring up under the new name + actionable error".
 
 ## Issue framing
 
@@ -13,8 +15,8 @@ The first two steps already roll back partially:
 - `LinkSetName` failure brings the link back up before returning
   (`_ = netlink.LinkSetUp(link)`).
 
-But the **final** `LinkSetUp` failure (line 339) returns the error
-*without any rollback*:
+But the **final** `LinkSetUp` failure (line ~339) returns the error
+*without any recovery*:
 
 ```go
 if err := netlink.LinkSetUp(link); err != nil {
@@ -23,57 +25,90 @@ if err := netlink.LinkSetUp(link); err != nil {
 ```
 
 At that point the interface has already been **renamed** to `newName`
-and is administratively **DOWN**. The caller
-(`enumerateAndRenameInterfaces`, also `device_map.go` and
-`bootstrap.go`) logs the error and continues. The interface is left
-stranded: it carries the new name (so the `.link` file matches and the
-next reconcile sees "name already correct" → no re-rename), yet it is
-DOWN, so no traffic flows and the next reconcile never brings it up.
+and is administratively **DOWN**. The interface is left stranded DOWN.
 
-Audit severity: **LOW** (rare netlink-failure path). This is a
-robustness fix, not a hot path.
+Audit severity: **LOW** (rare netlink-failure path). Robustness fix.
+
+## Round-1 plan review outcome (why v2 differs from v1)
+
+Two independent hostile reviewers reviewed v1 (which proposed *renaming
+the interface back to `oldName`* on failure). Both rejected that design:
+
+- **Reviewer A: PLAN-NEEDS-MAJOR (near KILL).** The rename-back
+  **re-creates the collision** that `device_map.go` phase-1 exists to
+  break. Phase 1 temp-renames a NIC that squats on a wanted final name
+  to `xpf-tmp-N` to free that name; if rename-back fires, the NIC goes
+  back onto the wanted name and phase-2's rename of the *intended*
+  occupant hits **EEXIST** — strictly worse than today (today leaves the
+  squatter DOWN at the temp name, collision half-broken, and phase-2
+  succeeds). v1 also mis-cited the lifeline caller (it is
+  `bootstrap.go:776`, not `:507`).
+- **Reviewer B: PLAN-NEEDS-MINOR.** The v1 "false symmetry" argument is
+  the root error: a `LinkSetName` failure means the rename *did not
+  happen* (so rolling back the down is correct), but a `LinkSetUp`
+  failure means the rename **already succeeded** — so the correct
+  recovery is to **finish the job (bring it up under `newName`)**, not
+  undo it. Bringing it up under `newName` is correct for *all five*
+  callers, removes the device-map regression, and removes the only
+  wrong-link/EEXIST window. This is also what "keep it SIMPLE" asks for.
+
+Both reviewers independently arrived at the same corrected design. v2
+adopts it.
+
+### v1's load-bearing claim was false
+
+v1 argued: "if you `LinkSetUp` under `newName`, the next reconcile sees
+`nic.name == target` and never retries the rename." Reviewer B verified
+against the real loop and showed this is *the desired terminal state*:
+the rename **did** succeed; the interface is up under the correct name;
+there is nothing left to retry. The rename did not need re-doing — only
+the bring-up flickered, and re-issuing the bring-up resolves it
+completely. (Confirmed: `enumerateAndRenameInterfaces` compares
+`assignName(...)` to the **live** kernel name from `enumeratePCINICs`
+reading `/sys/class/net`; once up under `newName == target`, the NIC is
+correctly skipped next pass.)
 
 ## Honest scope/value framing
 
-The win is small and bounded: it closes a rare failure window where a
-transient `LinkSetUp` netlink error would otherwise strand an interface
-renamed-but-down until the next daemon restart that happens to re-trip
-the rename (which it won't, because the name already matches). The fix
-makes the failure **self-healing on the next reconcile** and makes the
-error message actionable.
+The win is small and bounded: it closes a rare window where a transient
+`LinkSetUp` netlink error leaves an interface renamed-but-DOWN. The fix
+makes the interface end up **UP under its correct new name** even when
+the first bring-up fails transiently, and makes the error message
+actionable for field debugging. If reviewers still conclude the gain is
+too small, PLAN-KILL is acceptable — but the current code's stranded-DOWN
+end state is a clear (if rare) defect, and the v2 fix is ~6 lines plus a
+test.
 
-If reviewers conclude the fix is too small or the risk of the rollback
-path outweighs the stranding window, PLAN-KILL is an acceptable verdict
-— but note the current code has an obvious asymmetry (the `LinkSetName`
-failure rolls back, the `LinkSetUp` failure does not), so at minimum the
-symmetry argument favors a fix.
+## Callers (corrected; all best-effort log-and-continue)
 
-## What's already shipped / relevant context
+| Site | Context |
+|---|---|
+| `linksetup.go:81` | positional rename to vSRX name (`ge-0-0-N`, `fxp0`, ...) |
+| `device_map.go:198` | phase-1 temp-rename to break a stale-udev collision |
+| `device_map.go:245` | phase-2 rename mapped NIC to final logical name |
+| `device_map.go:264` | phase-3 restore stranded NIC to a predictable name |
+| `device_map.go:564` | identity-resolution restore (`err == nil` guard) |
+| `bootstrap.go:776` | lifeline rename of mgmt NIC to `fxp0` |
 
-- `renameInterface` is called from three sites, all best-effort
-  (log-and-continue): `linksetup.go:81`, `device_map.go:198/245/264/564`,
-  `bootstrap.go:507`.
-- No site currently *acts* on the specific error — they all log it. So
-  the fix's externally-visible contract is unchanged for callers; the
-  improvement is in the interface's on-the-wire state after the failure
-  and in log/error clarity.
-- The package already uses a clean injectable-seam idiom for the RSS
-  executor (`rssExecutor` interface, `realRSSExecutor{}`) and for the
-  command runner (`runCommandTimeout`). There is **no** existing seam for
-  the bare `netlink.*` link calls in this file — `renameInterface`
-  references the package-level functions directly, which is why it has no
-  unit test today.
+Every site treats the return as advisory (`slog.Warn` then continue). No
+site uses `errors.Is`. So the v2 fix changes no caller and only improves
+the interface's on-the-wire end state and the error string. Crucially,
+v2's "bring up under newName" is safe at **every** one of these sites
+(the v1 rename-back was not — it broke `:198` and `:264`).
 
-## Concrete design
+## Concrete design (v2)
 
-### 1. Introduce package-level function seams for the netlink link ops
+### 1. Introduce package-level netlink seams for the link ops
 
-Add unexported package vars in `linksetup.go` that default to the real
-netlink functions, so tests can inject failures:
+Matches the package's established idiom (`deriveKernelNameFn`,
+`linkDir`, `lifelineRecordFileForTest`, and the `rssExecutor` interface).
+There is a reusable `testLink`/`mockLinkByName` scaffold in
+`vip_readiness_test.go` the test will reuse.
 
 ```go
 // netlink link operations, injectable for tests. Default to the real
-// vishvananda/netlink package functions.
+// vishvananda/netlink package functions. Tests swap these (with
+// t.Cleanup restore); tests that touch them MUST NOT call t.Parallel().
 var (
     nlLinkByName  = netlink.LinkByName
     nlLinkSetDown = netlink.LinkSetDown
@@ -82,195 +117,187 @@ var (
 )
 ```
 
-Rewrite the body of `renameInterface` to call the seam vars instead of
-`netlink.*` directly. `device_map.go:556` (`netlink.LinkByName`) is a
-*separate* call outside `renameInterface` and is left untouched (out of
-scope; not part of the rename dance).
+`renameInterface` calls the seam vars instead of `netlink.*`. The
+existing `LinkSetName`-failure rollback `_ = netlink.LinkSetUp(link)`
+becomes `_ = nlLinkSetUp(link)` (no behavior change). `LinkByName` in
+`device_map.go:556` is a separate call outside the rename dance and is
+left untouched (out of scope).
 
-This is the minimal seam needed; it changes no behavior on the real
-path (the vars are initialized to the exact same functions).
+### 2. On final LinkSetUp failure: retry the bring-up under newName, return an actionable error
 
-### 2. Roll back on final LinkSetUp failure
-
-Replace the final block:
+The rename already succeeded; the link is DOWN under `newName`. Re-issue
+the bring-up once more on the same cached handle (set operations act by
+**ifindex**, which is stable across the rename — verified against
+`vishvananda/netlink@v1.3.1`: `LinkSetUp`/`LinkSetName` operate on
+`base.Index`, so the stale `.Attrs().Name` is irrelevant). If the retry
+also fails, return a precise error so the operator/next-reconcile can
+act:
 
 ```go
 if err := nlLinkSetUp(link); err != nil {
-    // The interface is now renamed to newName but DOWN. Best-effort
-    // recovery: rename it back to oldName and bring it up so it is not
-    // stranded renamed-but-down. The next reconcile will retry the
-    // rename cleanly. We must re-resolve the link by its NEW name
-    // because the cached `link` object's name is stale after
-    // LinkSetName.
-    upErr := err
-    if relink, relErr := nlLinkByName(newName); relErr == nil {
-        if nameErr := nlLinkSetName(relink, oldName); nameErr == nil {
-            _ = nlLinkSetUp(relink)
-            return fmt.Errorf(
-                "link up %s after rename %s -> %s failed; "+
-                    "rolled interface back to %s: %w",
-                newName, oldName, newName, oldName, upErr)
-        } else {
-            // Could not rename back. Try at least to bring the link up
-            // under its new name so it is not left DOWN.
-            _ = nlLinkSetUp(relink)
-            return fmt.Errorf(
-                "link up %s after rename %s -> %s failed, and rollback "+
-                    "rename %s -> %s also failed (%v); interface remains "+
-                    "named %s — re-run reconcile/restart to retry: %w",
-                newName, oldName, newName, newName, oldName, nameErr,
-                newName, upErr)
-        }
+    // The rename to newName already succeeded; the link is DOWN under
+    // newName. Do NOT undo the rename — that would re-create collisions
+    // the device-map phase-1 path deliberately broke. Retry the bring-up
+    // once on the same handle (set ops act by ifindex, stable across the
+    // rename). If it still fails, surface an actionable error: the
+    // interface is correctly named, and the next networkctl reload /
+    // reconcile will bring it up.
+    if retryErr := nlLinkSetUp(link); retryErr != nil {
+        return fmt.Errorf(
+            "renamed %s -> %s but could not bring it up "+
+                "(interface is correctly named but DOWN; "+
+                "next reconcile/networkctl reload will retry): %w",
+            oldName, newName, retryErr)
     }
-    // Could not re-resolve the renamed link to attempt rollback; bring
-    // up by the cached handle as a last resort.
-    _ = nlLinkSetUp(link)
-    return fmt.Errorf(
-        "link up %s after rename %s -> %s failed; could not re-resolve "+
-            "to roll back: %w", newName, oldName, newName, upErr)
+    return nil
 }
+return nil
 ```
 
-**Why rename-back instead of just LinkSetUp-under-new-name?** If we only
-bring it up under `newName`, the `.link` file written *before* the
-rename (in the caller) matches `newName`, so the next reconcile sees the
-name as already-correct and never retries — the interface would stay up
-but the *rename attempt is silently considered done*. The desired
-behavior per the issue is "recoverable on the next reconcile": renaming
-back to `oldName` means the next reconcile's `nic.name != target` check
-fires again and re-attempts the full down→rename→up sequence cleanly.
+Rationale for a single immediate retry: the first `LinkSetUp` may fail on
+a transient netlink condition; one cheap retry on the rare error path
+costs nothing and often recovers. We do NOT loop (no oscillation risk),
+and on persistent failure we return — the daemon's `networkctlReload`
+runs right after every caller loop (`linksetup.go:99`,
+`device_map.go`, `bootstrap.go:783`) and systemd-networkd will bring a
+configured link up; the next reconcile is the durable backstop. The
+interface is left **correctly named** in all cases (UP if the retry
+worked, DOWN-but-correctly-named otherwise — recoverable by networkd,
+never stranded under the old name or a temp name).
 
-If the rollback rename *also* fails (double-fault), we fall back to
-bringing the link up under whatever name it currently has so it is at
-least not left DOWN, and we surface a precise compound error.
+> Single-retry is a deliberate "keep it simple" choice; if reviewers
+> consider even one retry gold-plating, the fallback is to drop the retry
+> and return the wrapped error directly (the interface is still correctly
+> named and networkd/next-reconcile recovers it). Flagged in open
+> questions.
 
-### 3. Keep the existing partial-rollback paths using the seam
+### 3. No rename-back, no double-fault branch
 
-The existing `LinkSetName`-failure rollback (`_ = netlink.LinkSetUp(link)`)
-becomes `_ = nlLinkSetUp(link)` for consistency. No behavior change.
+v1's three-branch compound-error handling and rename-back are removed
+entirely. This is correct for all five callers and eliminates the only
+realistic wrong-link/EEXIST window (which v1's re-resolution introduced).
 
 ## Public API preservation
 
-- `renameInterface(oldName, newName string) error` — signature
-  unchanged.
-- All three call sites unchanged (they already log-and-continue on
-  error; the error string is now richer but they only `slog.Warn` it).
-- No new exported symbols. The seam vars are unexported.
+- `renameInterface(oldName, newName string) error` — signature unchanged.
+- All six call sites unchanged (log-and-continue). Richer error string.
+- No new exported symbols. Seam vars are unexported.
 
 ## Hidden invariants the change must preserve
 
-1. **Stale link handle after LinkSetName.** The cached `link` object's
-   `Attrs().Name` is `oldName`; after a successful `LinkSetName` it no
-   longer reflects reality. The rollback path re-resolves by `newName`
-   via `nlLinkByName` before attempting to rename back — it does NOT
-   reuse the stale handle for the rename-back. (It only uses the stale
-   handle as the very-last-resort `LinkSetUp` when re-resolution itself
-   fails.)
-2. **Best-effort caller contract.** Every caller treats the return as
-   advisory (log-and-continue). The fix must not start *returning early
-   in a way that skips remaining interfaces* — it doesn't; `renameInterface`
-   is leaf-level and the caller loop is unchanged.
-3. **Idempotent reconcile.** After rollback to `oldName`, the next
-   `enumerateAndRenameInterfaces` pass must re-attempt the rename. The
-   `.link` file (written by the caller before the rename) already names
-   `newName`, and `recoverOriginalName` reads it — so the rename retry
-   stays correct. Verified: the caller writes the `.link` first, then
-   renames; on retry the OriginalName recovery still works.
-4. **No new allocations on the hot path.** N/A — this is startup/reconcile
-   control plane, not packet path.
-5. **No partial-state on the double-fault.** If rename-back fails we do
-   not loop or panic; we bring up under the current name and return a
-   compound error. The interface is up (not DOWN) even in the worst case.
+1. **ifindex stability.** Set ops act by ifindex; the cached `link`
+   handle stays valid for the retry `LinkSetUp` despite the stale name.
+   (Verified against netlink v1.3.1.)
+2. **Best-effort caller contract.** `renameInterface` is leaf-level; the
+   caller loops are unchanged; no early-return skips remaining NICs.
+3. **No collision re-creation.** Because v2 never renames back, the
+   device-map phase-1 collision-break invariant (`device_map.go:186-221`)
+   is preserved — the failed NIC stays under `newName`/`tmpName`, never
+   bounced back onto a freed name.
+4. **No temp-name persistence.** v2 never restores an `xpf-tmp-*` name
+   (the device-map phase-3 hazard a rename-back would have hit).
+5. **Idempotent reconcile.** If the interface ends up DOWN-but-correctly-
+   named, the next `networkctlReload`/reconcile brings it up; no rename
+   retry needed (the rename already succeeded).
+6. **Control plane only.** No hot-path allocation concerns.
 
 ## Risk assessment
 
 | Class | Level | Notes |
 |---|---|---|
-| Behavioral regression | LOW | Real path unchanged (seam vars = real funcs). New code only runs on the rare final-LinkSetUp-failure branch, which previously did nothing useful. |
-| Lifetime / handle staleness | LOW-MED | Mitigated by re-resolving via `nlLinkByName(newName)` rather than reusing the stale cached handle for the rename-back. Reviewers should confirm this is correct. |
-| Performance regression | NONE | Control plane, rare error path. |
-| Architectural mismatch | LOW | Seam idiom matches the existing `rssExecutor` pattern in the same package. No new architecture. |
+| Behavioral regression | LOW | Real path unchanged (seam vars = real funcs). New code runs only on the rare final-LinkSetUp-failure branch, which previously stranded the link DOWN. v2 is safe for all five callers (v1 was not). |
+| Lifetime / handle staleness | LOW | Retry reuses the cached handle; set ops are by ifindex (stable). No re-resolution, no wrong-link window. |
+| Performance regression | NONE | Control plane, rare error path; at most one extra `LinkSetUp` syscall on failure. |
+| Architectural mismatch | LOW | Seam idiom matches `device_map.go`'s function-var seams and `vip_readiness_test.go`'s `mockLinkByName`. |
 
 ## Test plan
 
-New unit test file `pkg/daemon/linksetup_rename_test.go`:
+New file `pkg/daemon/linksetup_rename_test.go`. Reuses the `testLink` /
+`mockLinkByName` scaffold from `vip_readiness_test.go`. Each test swaps
+the four seam vars and restores via `t.Cleanup`. **None call
+`t.Parallel()`** (package-global seam state).
 
-1. **TestRenameInterfaceRollsBackOnLinkSetUpFailure** — inject seams so
-   `LinkByName` returns a stub link, `LinkSetDown`/`LinkSetName` succeed,
-   the FIRST `LinkSetUp` (the post-rename one) fails. Assert:
-   - `renameInterface` returns a non-nil error mentioning both names and
-     "rolled" / "roll back".
-   - The rollback rename-back to `oldName` was issued (record calls in a
-     recorder).
-   - A final `LinkSetUp` was issued after the rename-back (interface not
-     left DOWN).
-   - **Non-tautological:** the test fails if the rollback rename-back or
-     the recovery LinkSetUp is removed from the implementation (assert
-     the exact call sequence, not just the error string).
-2. **TestRenameInterfaceDoubleFaultBringsUpUnderCurrentName** — final
-   LinkSetUp fails AND the rollback rename-back also fails. Assert: error
-   is the compound message; a LinkSetUp was still issued so the interface
-   is not left DOWN.
-3. **TestRenameInterfaceSuccessPathUnchanged** — all ops succeed; assert
-   the call order is down→name→up and no rollback calls fire (guards
-   against the rollback path leaking into the happy path).
-4. **TestRenameInterfaceLinkSetNameFailureStillRollsBackUp** — regression
-   guard on the pre-existing `LinkSetName`-failure path (it must still
-   issue a LinkSetUp on the original handle).
+The seam is recorded via a small in-test recorder capturing the ordered
+sequence of `(op, name)` tuples so assertions are on the exact call
+sequence, not just the error string (non-tautological).
 
-Seam restoration: each test saves and restores the four package vars via
-`t.Cleanup` to avoid cross-test contamination.
+1. **TestRenameInterfaceBringsUpUnderNewNameAfterTransientUpFailure** —
+   `LinkByName` → stub; `LinkSetDown` ok; `LinkSetName(newName)` ok;
+   first `LinkSetUp` fails, second `LinkSetUp` succeeds. Assert:
+   - returns `nil`.
+   - recorded sequence is `down → setname(newName) → up(fail) → up(ok)`.
+   - **NO `setname(oldName)`** ever issued (guards against rename-back
+     leaking back in). *Non-tautological:* deleting the retry makes this
+     return a non-nil error → test fails.
+2. **TestRenameInterfacePersistentUpFailureReturnsActionableError** —
+   both `LinkSetUp` calls fail. Assert:
+   - returns non-nil error mentioning both `oldName` and `newName` and
+     the word "DOWN" / "reconcile".
+   - error wraps the underlying `LinkSetUp` error via `%w`
+     (`errors.Is(err, sentinelUpErr)` is true).
+   - recorded sequence shows the rename to `newName` happened and **no
+     rename-back** to `oldName`. *Non-tautological:* if the impl renamed
+     back, the recorded sequence assertion fails.
+3. **TestRenameInterfaceSuccessPathUnchanged** — all ops succeed on the
+   first try. Assert: returns `nil`; sequence is exactly
+   `down → setname(newName) → up`; no retry, no rename-back.
+4. **TestRenameInterfaceLinkSetNameFailureStillRollsBackUp** —
+   regression guard on the pre-existing `LinkSetName`-failure path:
+   `LinkSetName(newName)` fails; assert a `LinkSetUp` is issued on the
+   original handle and the error mentions the rename failure. (Confirms
+   v2 didn't disturb the existing partial rollback.)
+5. **TestRenameInterfaceLinkSetDownFailureReturnsEarly** — `LinkSetDown`
+   fails; assert no `LinkSetName`/`LinkSetUp` issued, error returned.
+   (Cheap completeness guard.)
 
 Gates:
 - `go build ./...` clean
-- `go test ./pkg/daemon/...` pass (named tests 5×)
 - `go vet ./pkg/daemon/...`
+- `go test ./pkg/daemon/...` (named tests 5× for flake)
 - Full Go suite `go test ./...`
 
-**No smoke** — this is a control-plane-only change with no dataplane
-impact, per the engineering instruction. The HA/cluster smoke matrix
-does not exercise `renameInterface`'s error branch.
+**No smoke** — control-plane-only change, no dataplane impact, per the
+engineering instruction. The HA/cluster smoke matrix does not exercise
+this error branch.
 
 ## Docs
 
-CLAUDE.md's "Interface Management (networkd)" section documents the
-`.link` rename behavior. The rollback-on-failure is an internal
-robustness detail of `renameInterface`, not an operator-visible contract
-change, so no operator doc update is strictly required. I will add a
-one-line note to the function's doc comment describing the rollback
-behavior (the in-code contract). If reviewers want a CLAUDE.md/networkd
-doc line, I will add it — flagged as an open question below.
+The rollback-on-failure is an internal robustness detail of
+`renameInterface`. I will update the function's doc comment to describe
+the bring-up-under-newName recovery (the in-code contract). CLAUDE.md's
+"Interface Management (networkd)" section documents `.link` rename
+behavior at the operator level; the failure-recovery detail is not an
+operator-visible contract change, so no operator-doc edit is required.
+(Stated here per the docs-as-contract rule.)
 
 ## Out of scope
 
-- The `netlink.LinkByName` at `device_map.go:556` (not part of the
-  rename dance).
-- Retrying the rename automatically inside `renameInterface` (the issue
-  says keep it simple; the next reconcile is the retry mechanism).
+- `netlink.LinkByName` at `device_map.go:556` (not part of the rename
+  dance).
+- Looping/backoff retries inside `renameInterface` (networkd + next
+  reconcile is the durable retry).
 - Any change to caller error-handling (they remain log-and-continue).
 
-## Open questions for adversarial review
+## Open questions for adversarial review (v2)
 
-1. **Rollback target choice.** Is renaming back to `oldName` the right
-   recovery, or should we leave it at `newName` and just bring it up?
-   (Plan argues rename-back is required for next-reconcile retry; is
-   that reasoning sound, or does it risk an oscillation if the rename
-   itself is what keeps failing?)
-2. **Oscillation risk.** If `LinkSetUp` fails persistently (e.g. a
-   hardware fault), every reconcile will down→rename→fail→rename-back.
-   Is that churn acceptable for a rare path, or should we add a guard?
-3. **Stale-handle correctness.** Is re-resolving via
-   `nlLinkByName(newName)` before the rename-back correct, and is the
-   last-resort `LinkSetUp(link)` on the stale handle safe (the handle
-   still references the same ifindex even if the name is stale)?
-4. **Double-fault behavior.** On rename-back failure we bring up under
-   the current (new) name. Is "up-but-name-stuck" a better or worse end
-   state than "down-but-recoverable"? (Plan picks "up" so traffic can
-   flow; the name is wrong but the `.link` matches it.)
-5. **Test seam vs. real netlink.** Is the four-var function seam the
-   right test approach, or is there a preferred interface-based seam in
-   this codebase that I should mirror instead?
-6. **Should the error be returned at all,** given all callers only log
-   it? (Yes — keeping the error lets a future caller act on it, and the
-   richer message aids field debugging; but confirm no caller should now
-   *abort* on it.)
+1. **Single retry vs no retry.** v2 does one immediate `LinkSetUp`
+   retry on failure. Is that worthwhile, or is even one retry
+   gold-plating a rare path (just return the wrapped error)? Either is
+   defensible; which does the project prefer?
+2. **Is "DOWN-but-correctly-named, recovered by networkd" actually
+   guaranteed?** networkd brings up configured links on reload — but is
+   there a case (e.g. an interface with `ActivationPolicy=always-down`
+   or no `.network`) where networkd would NOT bring it up, leaving it
+   DOWN after all? For the rename callers the `.link`/`.network` is
+   written before the rename, so it should be configured — confirm.
+3. **ifindex-stability assumption.** v2 reuses the cached handle for the
+   retry on the premise that set ops act by ifindex. Confirm against the
+   pinned netlink version that no set op re-resolves by name internally.
+4. **Error wrapping.** Single `%w` chain wrapping the `LinkSetUp` error.
+   Confirm no caller needs to distinguish this from other errors (all
+   currently log-and-continue — verified).
+5. **Test non-tautology.** Do the recorder-sequence assertions fail if
+   (a) the retry is deleted and (b) a rename-back is (re)introduced?
+   Both should fail — confirm the assertions are tight enough.
+6. **Anything still over- or under-engineered** relative to "keep it
+   simple"?
