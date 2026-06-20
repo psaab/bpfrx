@@ -161,10 +161,23 @@ type Manager struct {
 	lastBindingsAutoRebind  time.Time
 	publishedSnapshot       uint64
 	publishedPlanKey        string
-	sessionMirrorFailed     bool
-	sessionMirrorErr        string
-	deferWorkers            bool // skip worker spawn until NotifyLinkCycle
-	xskBoundNotified        bool // OnXSKBound fired at most once
+	// appliedSnapshot is the config + generation the helper has
+	// ACTUALLY applied via a successful full apply_snapshot — the
+	// generation the helper echoes back as
+	// status.LastSnapshotGeneration (userspace-dp snapshot.rs sets
+	// last_snapshot_generation only on a full apply). It is captured
+	// ONLY at the apply_snapshot publish/catch-up sites via
+	// markAppliedSnapshotLocked, NOT on FIB-bump / neighbor-regen /
+	// content-dedup-skip paths (which advance publishedSnapshot or
+	// lastSnapshot.Generation without the helper accepting a new
+	// snapshot generation). It is the generation-coherent source for
+	// the #2079 NAT pool-utilization-alarm monitor: AppliedNATView
+	// pairs this Config with the same-generation pool counters.
+	appliedSnapshot     appliedSnapshot
+	sessionMirrorFailed bool
+	sessionMirrorErr    string
+	deferWorkers        bool // skip worker spawn until NotifyLinkCycle
+	xskBoundNotified    bool // OnXSKBound fired at most once
 
 	lookupUserspaceCtrlForFailClosedHook userspaceCtrlLookupHook
 
@@ -698,6 +711,9 @@ func (m *Manager) Compile(cfg *config.Config) (*dataplane.CompileResult, error) 
 	m.rebuildMonitoredIfindexes()
 	m.publishedSnapshot = snap.Generation
 	m.publishedPlanKey = newPlanKey
+	// #2079: this full apply_snapshot succeeded — record the applied
+	// (config, generation) for the NAT pool-utilization-alarm monitor.
+	m.markAppliedSnapshotLocked()
 	if h, ok := snapshotContentHash(snap); ok {
 		m.lastSnapshotHash = h
 	}
@@ -804,6 +820,8 @@ func (m *Manager) UpdatePolicyScheduleState(cfg *config.Config, activeState map[
 	m.rebuildMonitoredIfindexes()
 	m.publishedSnapshot = next.Generation
 	m.publishedPlanKey = snapshotBindingPlanKey(&next)
+	// #2079: full apply_snapshot succeeded — record the applied snapshot.
+	m.markAppliedSnapshotLocked()
 	if h, ok := snapshotContentHash(&next); ok {
 		m.lastSnapshotHash = h
 	}
@@ -957,6 +975,8 @@ func (m *Manager) PublishRouteOverlaySnapshot(cfg *config.Config, overlay []conf
 	m.rebuildMonitoredIfindexes()
 	m.publishedSnapshot = next.Generation
 	m.publishedPlanKey = snapshotBindingPlanKey(&next)
+	// #2079: full apply_snapshot succeeded — record the applied snapshot.
+	m.markAppliedSnapshotLocked()
 	if h, ok := snapshotContentHash(&next); ok {
 		m.lastSnapshotHash = h
 	}

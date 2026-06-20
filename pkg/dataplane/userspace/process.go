@@ -288,6 +288,10 @@ func (m *Manager) syncSnapshotLocked() error {
 		hash, hashOK := snapshotContentHash(m.lastSnapshot)
 		m.publishedSnapshot = m.lastSnapshot.Generation
 		m.publishedPlanKey = planKey
+		// #2079: the helper already reports this generation as applied
+		// (status.LastSnapshotGeneration >= m.lastSnapshot.Generation
+		// gated this branch), so it IS the applied snapshot.
+		m.markAppliedSnapshotLocked()
 		if hashOK {
 			m.lastSnapshotHash = hash
 		}
@@ -361,6 +365,8 @@ func (m *Manager) syncSnapshotLocked() error {
 	m.rebuildMonitoredIfindexes()
 	m.publishedSnapshot = m.lastSnapshot.Generation
 	m.publishedPlanKey = planKey
+	// #2079: deferred full apply_snapshot succeeded — record applied.
+	m.markAppliedSnapshotLocked()
 	if hashOK {
 		m.lastSnapshotHash = hash
 	}
@@ -573,6 +579,10 @@ func (m *Manager) stopLocked() {
 	m.lastBindingsAutoRebind = time.Time{}
 	m.publishedSnapshot = 0
 	m.publishedPlanKey = ""
+	// #2079: forget the applied snapshot when the helper stops so a
+	// restarted helper does not expose a stale applied config before its
+	// first apply lands (AppliedNATView also guards on m.proc == nil).
+	m.appliedSnapshot = appliedSnapshot{}
 	m.sessionMirrorFailed = false
 	m.sessionMirrorErr = ""
 }

@@ -534,6 +534,25 @@ coverage: `pkg/config/schema_validate_flow_numwidth_test.go` (Tiers 1+2 via
 `pkg/dataplane/userspace/flow_numwidth_agreement_test.go` (the directional
 Layer-A agreement property).
 
+### #2079 — NAT pool-utilization-alarm threshold validation
+
+`security nat source pool-utilization-alarm raise-threshold/clear-threshold`
+is a Tier-3 compiler-side validation (`compileNAT`, `pkg/config/compiler_nat.go`,
+next to the deterministic-pool checks): it requires `0 < clear-threshold <
+raise-threshold <= 100`. A bare `pool-utilization-alarm;` compiles to
+raise=0/clear=0 (an always-firing alarm) and inverted/equal thresholds make
+hysteresis meaningless, so all are hard commit errors rather than silently
+accepted no-ops (Junos itself requires raise > clear). Defense-in-depth: the
+runtime monitor (`pkg/natpoolalarm`) also treats `raise-threshold <= 0` as
+"feature disabled". The thresholds are a single GLOBAL pair (no per-pool
+override syntax in the parsed Junos grammar). Regression coverage:
+`pkg/config/compiler_nat_pool_alarm_test.go`. The runtime consumer (#2079) is
+documented in `docs/deterministic-nat-cgnat.md`.
+
+NOTE: `pool-utilization-alarm` is not yet a typed `setSchema` leaf (no
+config-mode value-slot completion); the validation is compiler-side only. Adding
+schema completion is a separate, optional UX follow-up.
+
 ## The `inactive:` universal node modifier (#2008 H1)
 
 `inactive:` is the Junos deactivate-without-delete marker and is NOT a

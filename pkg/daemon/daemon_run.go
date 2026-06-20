@@ -37,6 +37,7 @@ import (
 	"github.com/psaab/xpf/pkg/ipsec"
 	"github.com/psaab/xpf/pkg/lldp"
 	"github.com/psaab/xpf/pkg/logging"
+	"github.com/psaab/xpf/pkg/natpoolalarm"
 	"github.com/psaab/xpf/pkg/networkd"
 	"github.com/psaab/xpf/pkg/ra"
 	"github.com/psaab/xpf/pkg/routing"
@@ -493,6 +494,17 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// goroutine-creation happens-before edge also publishes d.dhcp.
 	d.ipmon.SetNextHopResolver(d.resolveDHCPNextHop)
 	d.ipmon.Start()
+
+	// #2079: NAT source pool-utilization-alarm monitor. Slow (10s) loop over
+	// the helper's last-applied NAT pool snapshot; raises/clears
+	// `show security alarms` entries with hysteresis and emits one structured
+	// RT_NAT syslog line per transition. Skipped in NoDataplane mode (no
+	// helper to sample). The emitter reads d.eventReader lazily at emit time
+	// (it is wired later in this run path), so it is safe to start now.
+	if !d.opts.NoDataplane {
+		d.natPoolAlarm = natpoolalarm.New(d.natPoolAlarmSampler(), d.natPoolAlarmEmitter())
+		d.natPoolAlarm.Start()
+	}
 
 	// Initialize cluster manager if configured (heartbeat/sync started after applyConfig).
 	if cfg := d.store.ActiveConfig(); cfg != nil && cfg.Chassis.Cluster != nil {
@@ -1265,6 +1277,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 				}
 				return nil
 			},
+			// #2079: active NAT pool-utilization alarms for
+			// `show security alarms`.
+			NATPoolAlarmsFn: d.natPoolAlarms,
 			FeedsFn: func() map[string]feeds.FeedInfo {
 				if d.feeds != nil {
 					return d.feeds.AllFeeds()
@@ -1383,6 +1398,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 			}
 			return nil
 		})
+		// #2079: active NAT pool-utilization alarms for `show security alarms`.
+		shell.SetNATPoolAlarmsFn(d.natPoolAlarms)
 		shell.SetFeedsFn(func() map[string]feeds.FeedInfo {
 			if d.feeds != nil {
 				return d.feeds.AllFeeds()
@@ -1488,6 +1505,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// arrive during teardown).
 	if d.ipmon != nil {
 		d.ipmon.Stop()
+	}
+
+	// #2079: stop the NAT pool-utilization-alarm monitor.
+	if d.natPoolAlarm != nil {
+		d.natPoolAlarm.Stop()
 	}
 
 	// Stop the FRR manager (after ipmon, whose actuator is an FRR

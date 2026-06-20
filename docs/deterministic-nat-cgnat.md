@@ -44,12 +44,50 @@ after the configured prefix:
 
 Only `/32` and `/64` prefix lengths are supported for IPv6 host addresses.
 
-### Pool Utilization Alarm
+### Pool Utilization Alarm (#2079)
 
 ```
 set security nat source pool-utilization-alarm raise-threshold 80
 set security nat source pool-utilization-alarm clear-threshold 70
 ```
+
+This is a single GLOBAL raise/clear pair (matching Junos `set security nat
+source pool-utilization-alarm` scope); the same thresholds apply to every
+source pool. Commit-time validation requires `0 < clear-threshold <
+raise-threshold <= 100` — a bare `pool-utilization-alarm;` (raise=0/clear=0)
+and inverted/equal thresholds are hard commit errors (`compiler_nat.go`).
+
+Runtime behaviour (vSRX-faithful) is driven by a slow (10s) daemon-resident
+monitor (`pkg/natpoolalarm`) over the helper's LAST-APPLIED NAT pool snapshot
+(`dp.AppliedNATView()` — config + same-generation pool counters; no Rust /
+wire change, no extra control-socket traffic — it reuses the cached 1 Hz
+status poll). For each rule-referenced, non-deterministic source pool the
+monitor computes port utilization
+`UsedPorts * 100 / (AddressCount * (PortHigh - PortLow + 1))` and applies
+hysteresis: it RAISES when utilization `>= raise-threshold` and CLEARS when it
+drops `< clear-threshold` (strict). On each raise/clear transition (and only
+on a transition — never per tick) it:
+
+- updates `show security alarms` (Class NAT, Severity Minor), visible at both
+  the gRPC and local-CLI render sites; and
+- emits one structured `RT_NAT NAT_POOL_UTILIZATION_ALARM_RAISED` /
+  `..._CLEARED` syslog line through the configured syslog streams / local
+  writers.
+
+An alarm is also cleared when its last referencing source-NAT rule is removed,
+the pool is removed from config, the pool is converted to deterministic, or the
+alarm feature is disabled. The monitor HOLDs (makes no decision, neither raise
+nor clear) when the dataplane view is unavailable (helper down) or mid-apply
+(status generation != applied generation), and for transiently uncomputable
+samples (`AddressCount==0` / `PortHigh<PortLow` / capacity 0). Deterministic
+pools are SKIPPED in this release — `UsedPorts` is not the right numerator for
+block-based allocation; block-based utilization is a follow-up.
+
+NOTE: the legacy eBPF `nat_port_counters` map (read by `metrics_nat.go` and
+the CLI `show security nat source pool` "Utilization %") is never incremented
+post eBPF-retirement and reports a random seed value in userspace mode — the
+alarm deliberately uses the allocator snapshot (`SourceNATPoolStatus.UsedPorts`),
+not that dead path. Fixing those two legacy surfaces is tracked separately.
 
 ## Algorithm
 

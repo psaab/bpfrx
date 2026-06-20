@@ -422,6 +422,21 @@ func compileNATSource(node *Node, sec *SecurityConfig) error {
 		}
 	}
 
+	// #2079: validate pool-utilization-alarm thresholds. Junos requires
+	// raise > clear; a bare `pool-utilization-alarm;` compiles to
+	// raise=0/clear=0 (an always-firing alarm) and inverted/equal
+	// thresholds make hysteresis meaningless. Reject at commit rather than
+	// silently accepting a harmful no-op (the runtime monitor also treats
+	// raise<=0 as disabled, defense-in-depth).
+	if a := sec.NAT.PoolUtilizationAlarm; a != nil {
+		if a.RaiseThreshold <= 0 || a.RaiseThreshold > 100 {
+			return fmt.Errorf("pool-utilization-alarm: raise-threshold must be in 1..100, got %d", a.RaiseThreshold)
+		}
+		if a.ClearThreshold <= 0 || a.ClearThreshold >= a.RaiseThreshold {
+			return fmt.Errorf("pool-utilization-alarm: clear-threshold must be in 1..raise-threshold-1 (0 < clear < raise), got clear=%d raise=%d", a.ClearThreshold, a.RaiseThreshold)
+		}
+	}
+
 	// Parse source NAT rule-sets
 	for _, rsInst := range namedInstances(node.FindChildren("rule-set")) {
 		// Parse from/to zones (bracket lists produce multiple keys)

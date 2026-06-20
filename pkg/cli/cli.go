@@ -27,6 +27,7 @@ import (
 	"github.com/psaab/xpf/pkg/ipsec"
 	"github.com/psaab/xpf/pkg/lldp"
 	"github.com/psaab/xpf/pkg/logging"
+	"github.com/psaab/xpf/pkg/natpoolalarm"
 	"github.com/psaab/xpf/pkg/routing"
 	"github.com/psaab/xpf/pkg/rpm"
 	"github.com/psaab/xpf/pkg/vrrp"
@@ -47,6 +48,7 @@ type CLI struct {
 	cluster            *cluster.Manager
 	rpmResultsFn       func() []*rpm.ProbeResult
 	ipmonStatusFn      func() []ipmon.PolicyStatus
+	natPoolAlarmsFn    func() []natpoolalarm.ActiveAlarm
 	feedsFn            func() map[string]feeds.FeedInfo
 	lldpNeighborsFn    func() []*lldp.Neighbor
 	ddnsStatsFn        func() *dhcpserver.DDNSStats
@@ -152,6 +154,12 @@ func (c *CLI) SetRPMResultsFn(fn func() []*rpm.ProbeResult) {
 // policy status (#1827).
 func (c *CLI) SetIPMonStatusFn(fn func() []ipmon.PolicyStatus) {
 	c.ipmonStatusFn = fn
+}
+
+// SetNATPoolAlarmsFn sets a callback for retrieving the active NAT
+// pool-utilization alarms surfaced by `show security alarms` (#2079).
+func (c *CLI) SetNATPoolAlarmsFn(fn func() []natpoolalarm.ActiveAlarm) {
+	c.natPoolAlarmsFn = fn
 }
 
 // SetFeedsFn sets a callback for retrieving live dynamic address feed status.

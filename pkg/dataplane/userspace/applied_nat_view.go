@@ -1,0 +1,124 @@
+package userspace
+
+import "github.com/psaab/xpf/pkg/config"
+
+// appliedSnapshot records the config + generation the helper has
+// ACTUALLY applied via a successful full apply_snapshot. It is the
+// generation the helper echoes back as status.LastSnapshotGeneration.
+//
+// #2079: the NAT pool-utilization-alarm monitor must evaluate a single
+// generation-coherent (config, counters) pair. Neither m.publishedSnapshot
+// (too LOOSE — it advances on content-dedup no-op publishes and on the
+// neighbor-regen update_neighbors path, which the helper records only as
+// last_fib_generation, not last_snapshot_generation) nor
+// m.lastSnapshot.Generation (too STRICT — BumpFIBGeneration /
+// RegenerateNeighborSnapshot bump it WITHOUT a full apply, so it
+// permanently exceeds the helper's last_snapshot_generation and would gate
+// the alarm off forever) is correct. appliedSnapshot is the provable fixed
+// point between them: it is set ONLY where a full apply_snapshot has been
+// accepted by the helper (markAppliedSnapshotLocked at the publish/catch-up
+// sites), so its Config and its Generation are both the helper's currently
+// applied generation by construction.
+type appliedSnapshot struct {
+	Config     *config.Config
+	Generation uint64
+}
+
+// AppliedNATPoolStatus is one source-NAT pool's deduplicated live
+// utilization sample, taken from the helper's last-applied generation. It
+// is a config-package-free projection of SourceNATPoolStatus so that
+// downstream consumers (pkg/natpoolalarm) need not depend on this package's
+// wire types.
+type AppliedNATPoolStatus struct {
+	PoolName     string
+	AddressCount int
+	PortLow      uint16
+	PortHigh     uint16
+	UsedPorts    uint64
+}
+
+// AppliedNATView is a single generation-coherent snapshot for the NAT
+// pool-utilization-alarm monitor (#2079). Config and Pools both belong to
+// the helper's LAST-APPLIED generation. The monitor reads only cached
+// in-memory state through this accessor — no control-socket I/O.
+type AppliedNATView struct {
+	// Config is the helper's currently applied configuration (may be nil
+	// before the first apply lands). Source of truth for pool kind
+	// (deterministic vs not) and rule references.
+	Config *config.Config
+	// Pools is deduplicated by pool name from the last 1 Hz status poll
+	// (rules sharing a pool share one Arc<PortAllocatorShared> and report
+	// identical UsedPorts, so one entry per pool is taken — never summed).
+	Pools map[string]AppliedNATPoolStatus
+	// AppliedGeneration is the generation the helper has applied.
+	AppliedGeneration uint64
+	// HelperCoherent is true when the cached status generation equals the
+	// applied generation — i.e. the cached pool counters belong to the same
+	// generation as Config. False during an in-flight apply window.
+	HelperCoherent bool
+	// Available is false when the dataplane helper is not running or no
+	// apply has happened yet; the monitor HOLDs (makes no decision) then.
+	Available bool
+}
+
+// markAppliedSnapshotLocked captures the just-applied snapshot's config and
+// generation as the helper-applied source for AppliedNATView. Caller MUST
+// hold m.mu and MUST call this only AFTER a successful full apply_snapshot
+// (or on the status-loop catch-up path where the helper already echoes
+// m.lastSnapshot.Generation), where m.lastSnapshot is the applied snapshot.
+func (m *Manager) markAppliedSnapshotLocked() {
+	if m.lastSnapshot == nil {
+		return
+	}
+	m.appliedSnapshot = appliedSnapshot{
+		Config:     m.lastSnapshot.Config,
+		Generation: m.lastSnapshot.Generation,
+	}
+}
+
+// AppliedNATView returns the generation-coherent NAT view for the #2079
+// pool-utilization-alarm monitor: the helper's last-applied config paired
+// with the deduplicated pool counters from the same applied generation. It
+// reads only cached in-memory state under m.mu (no control-socket I/O).
+func (m *Manager) AppliedNATView() AppliedNATView {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	// Helper must be running for any of the cached state to be meaningful.
+	if m.proc == nil || m.proc.Process == nil {
+		return AppliedNATView{Available: false}
+	}
+	if m.appliedSnapshot.Generation == 0 || m.appliedSnapshot.Config == nil {
+		// No full apply has landed yet — nothing applied to evaluate.
+		return AppliedNATView{Available: false}
+	}
+
+	coherent := m.lastStatus.LastSnapshotGeneration == m.appliedSnapshot.Generation
+
+	pools := make(map[string]AppliedNATPoolStatus, len(m.lastStatus.SourceNATPools))
+	for _, p := range m.lastStatus.SourceNATPools {
+		if p.PoolName == "" {
+			continue
+		}
+		// Dedup by pool name: rules sharing a pool report identical
+		// UsedPorts (shared Arc), so keep one entry; never sum.
+		if _, seen := pools[p.PoolName]; seen {
+			continue
+		}
+		pools[p.PoolName] = AppliedNATPoolStatus{
+			PoolName:     p.PoolName,
+			AddressCount: p.AddressCount,
+			PortLow:      p.PortLow,
+			PortHigh:     p.PortHigh,
+			UsedPorts:    p.UsedPorts,
+		}
+	}
+
+	return AppliedNATView{
+		Config:            m.appliedSnapshot.Config,
+		Pools:             pools,
+		AppliedGeneration: m.appliedSnapshot.Generation,
+		HelperCoherent:    coherent,
+		Available:         true,
+	}
+}
