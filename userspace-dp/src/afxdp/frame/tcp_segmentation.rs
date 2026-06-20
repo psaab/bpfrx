@@ -186,7 +186,19 @@ pub(in crate::afxdp) fn segment_forwarded_tcp_frames_from_frame(
                     packet
                         .get_mut(2..4)?
                         .copy_from_slice(&(total_ip_len as u16).to_be_bytes());
-                    if packet[8] <= 1 {
+                    // #2077: gate the TTL==1 drop on NOT-fabric-ingress,
+                    // matching the IPv6 hop-limit gate below and the
+                    // canonical build/rewrite paths (build/ipv4.rs,
+                    // frame/mod.rs, rewrite/ipv4.rs). A fabric-ingress
+                    // segment (FABRIC_INGRESS_FLAG = 0x80) was already
+                    // decremented by the peer chassis at its real
+                    // ingress; the fabric crossing is an internal
+                    // cross-chassis redirect, not an IP hop, so the
+                    // decrement below is suppressed and the drop must be
+                    // too — otherwise a legitimately-low-TTL fabric
+                    // segment is wrongly dropped here (v4 was the lone
+                    // asymmetric site).
+                    if (meta.meta_flags & 0x80) == 0 && packet[8] <= 1 {
                         return None;
                     }
                     if apply_nat {
