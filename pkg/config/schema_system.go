@@ -311,11 +311,13 @@ var schemaSystem = &schemaNode{desc: "System configuration", children: map[strin
 			"group": {desc: "DHCP group", args: 1, placeholder: "<group-name>", children: map[string]*schemaNode{
 				"pool": {desc: "Address pool", args: 1, placeholder: "<pool-name>", children: nil},
 			}},
+			"dynamic-dns": dhcpDynamicDNSSchema(),
 		}},
 		"dhcpv6-local-server": {desc: "DHCPv6 local server", children: map[string]*schemaNode{
 			"group": {desc: "DHCPv6 group", args: 1, placeholder: "<group-name>", children: map[string]*schemaNode{
 				"pool": {desc: "Address pool", args: 1, placeholder: "<pool-name>", children: nil},
 			}},
+			"dynamic-dns": dhcpDynamicDNSSchema(),
 		}},
 	}},
 }}
@@ -519,6 +521,86 @@ var schemaServices = &schemaNode{desc: "Services configuration", children: map[s
 	}},
 	"application-identification": {desc: "Enable application identification against the predefined application catalog (port/protocol matching; no L7 DPI)", children: nil},
 }}
+
+// dhcpDynamicDNSSchema returns the typed-leaf schema for the #1387
+// DHCP dynamic-DNS block, shared by dhcp-local-server and
+// dhcpv6-local-server. Returned as a fresh tree per call so the two
+// parents do not share a mutable map. The enums + ttl carry validators
+// (the compiler/runtime consume them); the free-form credential and
+// target fields (domain, update-server, tsig-*) stay untyped so a valid
+// hostname / base64 secret is not rejected at commit — the live backend
+// that constrains them lands in increment 2.
+func dhcpDynamicDNSSchema() *schemaNode {
+	return &schemaNode{desc: "Dynamic DNS updates for DHCP leases (#1387)", children: map[string]*schemaNode{
+		"enable": {desc: "Enable dynamic DNS record publishing", children: nil},
+		"domain": {
+			desc:        "Default DNS domain appended to non-FQDN client names",
+			args:        1,
+			placeholder: "<domain>",
+			children:    nil,
+		},
+		"ttl": {
+			desc:          "TTL (seconds) for published A/AAAA/PTR records (default 300)",
+			args:          1,
+			valueType:     ValueInteger,
+			valueDesc:     "Record TTL in seconds (>= 1; default 300 when unset)",
+			valueExamples: []string{"300", "3600"},
+			validator:     ValidateIntegerMin(1),
+			children:      nil,
+		},
+		"hostname-source": {
+			desc:          "How the published label is derived from the lease",
+			args:          1,
+			valueType:     ValueEnumOf,
+			valueDesc:     "Label source (client-hostname | fqdn | mac-fallback)",
+			valueExamples: []string{"client-hostname", "fqdn", "mac-fallback"},
+			validator:     ValidateEnum([]string{"client-hostname", "fqdn", "mac-fallback"}),
+			children:      nil,
+		},
+		"conflict-policy": {
+			desc:          "Behaviour on a colliding existing record",
+			args:          1,
+			valueType:     ValueEnumOf,
+			valueDesc:     "Conflict policy (replace-owned | skip-existing | strict-fail)",
+			valueExamples: []string{"replace-owned", "skip-existing", "strict-fail"},
+			validator:     ValidateEnum([]string{"replace-owned", "skip-existing", "strict-fail"}),
+			children:      nil,
+		},
+		"backend": {
+			desc:          "DNS-update backend (increment 1 implements rfc2136 only)",
+			args:          1,
+			valueType:     ValueEnumOf,
+			valueDesc:     "Update backend (rfc2136 | kea-d2 [reserved])",
+			valueExamples: []string{"rfc2136"},
+			validator:     ValidateEnum([]string{"rfc2136", "kea-d2"}),
+			children:      nil,
+		},
+		"update-server": {
+			desc:        "Authoritative DNS target for RFC 2136 updates (host[:port])",
+			args:        1,
+			placeholder: "<host[:port]>",
+			children:    nil,
+		},
+		"tsig-key": {
+			desc:        "TSIG key name for authenticated updates",
+			args:        1,
+			placeholder: "<key-name>",
+			children:    nil,
+		},
+		"tsig-algorithm": {
+			desc:        "TSIG algorithm (e.g. hmac-sha256)",
+			args:        1,
+			placeholder: "<algorithm>",
+			children:    nil,
+		},
+		"tsig-secret": {
+			desc:        "TSIG shared secret (sensitive; redacted in show output)",
+			args:        1,
+			placeholder: "<secret>",
+			children:    nil,
+		},
+	}}
+}
 
 var schemaSNMP = &schemaNode{desc: "SNMP configuration", children: map[string]*schemaNode{
 	"community": {desc: "SNMP community", args: 1, placeholder: "<community-name>", children: map[string]*schemaNode{

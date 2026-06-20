@@ -1,5 +1,7 @@
 package config
 
+import "fmt"
+
 // System and platform-services configuration: system stanza, userspace
 // dataplane, syslog, SNMP, login, REST API auth, RPM, flow-monitoring,
 // forwarding-options, firewall filters/policers, and DHCP server/relay.
@@ -672,6 +674,81 @@ type PrefixListRef struct {
 type DHCPServerConfig struct {
 	DHCPLocalServer   *DHCPLocalServerConfig
 	DHCPv6LocalServer *DHCPLocalServerConfig
+	// DynamicDNS is the opt-in DHCP DDNS policy (#1387 increment 1).
+	// nil == disabled == today's behaviour byte-for-byte; the dataplane
+	// (Kea render, daemon wiring) ignores a nil block entirely.
+	DynamicDNS *DHCPDynamicDNSConfig
+}
+
+// DHCPDynamicDNSConfig is the opt-in dynamic-DNS policy for the DHCP
+// server (#1387). When DHCP clients take a lease, the firewall can
+// publish forward (A/AAAA) and reverse (PTR) records into an external
+// authoritative DNS server, and remove them again when the lease ends
+// (expire / release / decline / reclaim / reassign).
+//
+// This is the FIRST increment per docs/research/1387-dhcp-ddns/plan.md
+// (recommended Path C — pluggable backend, RFC 2136 first). Increment 1
+// ships the config model, the state-aware lease parser, the DNSUpdater
+// interface + reconciler core (fake-updater unit-tested), and the
+// never-delete-non-owned state store. The LIVE rfc2136 backend, the HA
+// ownership coupling, and the Kea D2 backend are deferred to later
+// lab-gated / test-failover-gated increments. An absent block (nil) is
+// the default and changes nothing.
+type DHCPDynamicDNSConfig struct {
+	// Enabled turns the reconciler on. A block that parses but never
+	// sets enable is still disabled — the operator opts in explicitly.
+	Enabled bool
+	// Domain is the default DNS suffix appended to a client name that is
+	// not already a FQDN (e.g. "corp.example.com").
+	Domain string
+	// TTLSeconds is the TTL applied to published records (default 300
+	// when zero, applied at render time, not here).
+	TTLSeconds int
+	// HostnameSource selects how the published label is derived from the
+	// lease: client-hostname (DHCP host-name option, default), fqdn (the
+	// client-supplied FQDN option), or mac-fallback (synthesize
+	// dhcp-<sanitized-id> when no name is offered).
+	HostnameSource string
+	// ConflictPolicy governs an existing record collision: replace-owned
+	// (default — only replace records this firewall owns per the state
+	// store), skip-existing, or strict-fail.
+	ConflictPolicy string
+	// Backend selects the DNS-update mechanism. Increment 1 implements
+	// only "rfc2136"; "kea-d2" is a reserved enum value for a later
+	// increment (Kea D2 is not in the image — bake.py). Default rfc2136.
+	Backend string
+	// UpdateServer is the RFC 2136 target authoritative DNS, host or
+	// host:port (Path A / rfc2136 backend). Not consumed by the live
+	// path in increment 1 (no live emission yet); carried for the
+	// increment-2 backend.
+	UpdateServer string
+	// TSIGKeyName / TSIGAlgorithm / TSIGSecret are the TSIG credentials
+	// for authenticated RFC 2136 updates. TSIGSecret is sensitive: it is
+	// redacted in String()/marshal echoes and must never be logged.
+	TSIGKeyName   string
+	TSIGAlgorithm string
+	TSIGSecret    string
+}
+
+// String redacts TSIGSecret so a %v/%s/slog format of a
+// DHCPDynamicDNSConfig never leaks the shared HMAC key (logging hygiene,
+// mirrors WireguardPeer in types_routing.go). The reconciler and render
+// paths read the field directly; only formatted/logged copies are
+// redacted.
+func (d *DHCPDynamicDNSConfig) String() string {
+	if d == nil {
+		return "<nil>"
+	}
+	secret := ""
+	if d.TSIGSecret != "" {
+		secret = "<redacted>"
+	}
+	return fmt.Sprintf("DHCPDynamicDNS{enabled=%t domain=%q ttl=%d "+
+		"hostname-source=%q conflict-policy=%q backend=%q update-server=%q "+
+		"tsig-key=%q tsig-alg=%q tsig-secret=%q}",
+		d.Enabled, d.Domain, d.TTLSeconds, d.HostnameSource,
+		d.ConflictPolicy, d.Backend, d.UpdateServer,
+		d.TSIGKeyName, d.TSIGAlgorithm, secret)
 }
 
 // DHCPLocalServerConfig holds per-group DHCP server settings.
