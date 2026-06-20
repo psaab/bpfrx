@@ -261,6 +261,7 @@ xpf has security logging with mode (stream/event), format, streams with host/por
 | **Per-Policy Logging** | `security policies ... then log session-init session-close` | xpf has this but may not fully support all log fields (app-name, nat-*, nested-app, etc.) | Medium | Done (all key fields: policy-name, app, ingress-iface, client/server split, close-reason, session-id) |
 | **Log Event Mode** | `security log mode event` | Route security logs through eventd (control plane) for on-box processing, slower but allows local processing | Low | Done (event mode writes to local file) |
 | **Session Aggregation Logs** | `security log ... report` | Aggregate session logs for top-N reporting (top talkers, top applications) | Low | Done (session aggregation reporting implemented) |
+| **Log Profile** | `security log profile <name> { stream-name; default-profile; category ... }` | Named log-routing profile targeting a stream, with a default-profile designation (#2008 H7) | Low | Done (compiled to `LogConfig.Profiles`; `stream-name` cross-referenced at commit. Per-stream routing is already a Junos superset, so no dispatch change; `category field-extra-name` accepted but not yet used to alter emitted SD) |
 
 ---
 

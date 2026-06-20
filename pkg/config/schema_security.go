@@ -212,6 +212,26 @@ var schemaSecurity = &schemaNode{desc: "Security configuration", children: map[s
 				"tls-profile": {desc: "TLS profile name (for protocol tls)", args: 1, placeholder: "<tls-profile-name>", children: nil},
 			}},
 		}},
+		// H7 (#2008): `security log profile <name>` is a Junos log-routing
+		// object — it targets a configured `stream` (`stream-name`), may be
+		// the default profile (`default-profile`), and may carry per-category
+		// field configuration. The whole stanza previously parsed but was
+		// silently discarded (no schema child, no compiler case), so a real
+		// imported config such as vsrx-ha.conf's `profile default-syslog`
+		// committed with no validation and no effect. Declaring it restores
+		// commit-time validation + `?` completion; the compiler cross-
+		// references `stream-name` against the configured streams
+		// (validateLogProfileStreamReferencesStrict). xpf per-stream routing
+		// is already a Junos superset, so no runtime/dispatch change is made.
+		"profile": {desc: "Security log profile (stream-routing object)", args: 1, placeholder: "<profile-name>", children: map[string]*schemaNode{
+			"stream-name":     {desc: "Stream this profile routes to", args: 1, valueHint: ValueHintStreamName, placeholder: "<stream-name>", children: nil},
+			"default-profile": {desc: "Designate this profile as the default", children: nil},
+			"category": {desc: "Per-category field configuration", children: map[string]*schemaNode{
+				"session": {desc: "Session category field configuration", children: map[string]*schemaNode{
+					"field-extra-name": {desc: "Extra field to include in session records", args: 1, placeholder: "<field>", children: nil},
+				}},
+			}},
+		}},
 	}},
 	"flow": {desc: "Flow and session settings", children: map[string]*schemaNode{
 		"aging": {desc: "Aggressive session aging thresholds", children: nil},

@@ -158,6 +158,19 @@ type compileOpts struct {
 	// tunnel) is rejected. Same doctrine as lenientDeviceMap /
 	// lenientPolicyMatchAddress.
 	lenientIPsecGatewayRefs bool
+
+	// lenientLogProfileStreamRef (#2008 H7) downgrades the
+	// `security log profile <name> stream-name <stream>` cross-reference
+	// from a hard error to a warning on the tolerant load / peer-sync
+	// paths. A config persisted by an older binary (which silently dropped
+	// the whole profile stanza), or synced from a peer, may carry a profile
+	// naming a stream that is not configured; an upgrading / receiving node
+	// must still boot through it (warn) rather than fail-closed-on-load
+	// (#1960 class). Commit / commit-check stay strict — a new operator
+	// edit that names a non-existent stream (a typo whose log routing would
+	// silently never fire) is rejected. Same doctrine as
+	// lenientIPsecPolicyProposalRef.
+	lenientLogProfileStreamRef bool
 }
 
 // CompileConfig converts a parsed ConfigTree AST into a typed Config struct.
@@ -187,6 +200,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientEventAttributesMatch:   true,
 		lenientIPsecPolicyProposalRef: true,
 		lenientIPsecGatewayRefs:       true,
+		lenientLogProfileStreamRef:    true,
 	})
 }
 
@@ -267,6 +281,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientEventAttributesMatch:   true,
 		lenientIPsecPolicyProposalRef: true,
 		lenientIPsecGatewayRefs:       true,
+		lenientLogProfileStreamRef:    true,
 	})
 }
 
@@ -652,6 +667,27 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		}
 	}
 
+	// #2008 H7 security log profile -> stream cross-reference. A
+	// `security log profile <name> stream-name <stream>` that names a
+	// stream which is not configured would route to nowhere — the operator
+	// authored a log profile whose target silently never receives events.
+	// Before H7 the whole profile stanza was dropped silently; now it is
+	// compiled and the reference is checked. Strict on commit / commit-
+	// check (hard reject so the typo is operator-visible); lenient on load
+	// / peer-sync (warn so a config persisted by an older binary that
+	// dropped the stanza, or a peer-synced config, still boots — #1960
+	// fail-closed-on-load class). Runs on the fully-compiled *Config so the
+	// stream map is fully populated regardless of authoring order. Mirrors
+	// validateIPsecPolicyProposalReferencesStrict.
+	if err := validateLogProfileStreamReferencesStrict(cfg); err != nil {
+		if opts.lenientLogProfileStreamRef {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("security log profile stream reference (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
 	if warnings := ValidateConfig(cfg); len(warnings) > 0 {
 		for _, w := range warnings {
 			cfg.Warnings = append(cfg.Warnings, w)
@@ -852,6 +888,63 @@ func validateIPsecPolicyProposalReferencesStrict(cfg *Config) error {
 			"(no `proposals` reference and no proposal named %q); the configured "+
 			"perfect-forward-secrecy group would be silently dropped — define a "+
 			"proposal or reference one", pol.Name, pol.Name)
+	}
+	return nil
+}
+
+// validateLogProfileStreamReferencesStrict hard-rejects a
+// `security log profile <name>` whose `stream-name` reference does not
+// resolve to a configured `security log stream` (#2008 H7). xpf routes
+// log events per stream (a Junos superset — every matching stream
+// receives the event), so a profile's `stream-name` designates the
+// stream that carries its events. A profile naming a stream that is not
+// configured routes to nowhere: the operator authored a log profile
+// whose target silently never fires. Before H7 the whole profile stanza
+// was dropped before compile, so the typo was invisible; now the
+// reference is validated.
+//
+// A profile with no `stream-name` is accepted: Junos permits a profile
+// that relies on the global routing inheritance, and there is nothing to
+// dangle. Only a non-empty `stream-name` that misses the stream map is
+// rejected.
+//
+// Note: compileLog only records a stream in Log.Streams when it has a
+// host (a host-less stream is not a real destination and is dropped by
+// the stream loop), so a profile referencing a host-less stream is
+// treated as a dangling reference — consistent with the stream's own
+// "must have a host to exist" semantics.
+//
+// On the tolerant load / peer-sync paths the call site downgrades this
+// to a warning (opts.lenientLogProfileStreamRef) so an already-persisted
+// config (older binaries dropped the stanza entirely) or a peer-synced
+// config still boots. Mirrors validateIPsecPolicyProposalReferencesStrict.
+func validateLogProfileStreamReferencesStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	profiles := cfg.Security.Log.Profiles
+	if len(profiles) == 0 {
+		return nil
+	}
+	streams := cfg.Security.Log.Streams
+	// Profiles is a map (unordered); sort keys so the first-error
+	// commit-check message is deterministic across runs.
+	names := make([]string, 0, len(profiles))
+	for name := range profiles {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		p := profiles[name]
+		if p == nil || p.StreamName == "" {
+			continue
+		}
+		if _, ok := streams[p.StreamName]; ok {
+			continue
+		}
+		return fmt.Errorf("security log profile %q references undefined "+
+			"log stream %q (the profile would route to nowhere — define "+
+			"the stream or fix the stream-name)", p.Name, p.StreamName)
 	}
 	return nil
 }
