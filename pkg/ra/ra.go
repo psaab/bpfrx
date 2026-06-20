@@ -27,26 +27,43 @@ import (
 const claimWaitPoll = 5 * time.Millisecond
 
 // claimWaitTimeout bounds how long a deferred Apply waits for a draining
-// tombstone to clear before giving up on that interface (the standalone
-// goodbye / graceful join is ~100 ms, so this is generous).
-const claimWaitTimeout = 5 * time.Second
+// tombstone to clear, and how long releaseDrain waits to join a sender before
+// giving up (the standalone goodbye / graceful join is ~100 ms, so this is
+// generous). A package var so the timeout-arm test can shorten it.
+var claimWaitTimeout = 5 * time.Second
+
+// drainEntry is the single atomic claim-and-hold for a draining interface
+// (#2033, structural fix for the three standalone-goodbye races). Its presence
+// in m.draining is a tombstone: while it exists the interface is NOT absent, so
+// a concurrent Apply/WithdrawOnce/Withdraw treats it as a claim and defers
+// instead of opening a second NDP conn. ALL fields are read/written ONLY under
+// m.mu. The entry is owned (created and eventually removed) by exactly ONE
+// goroutine — the one that joins its sender (or the WithdrawOnce/standalone
+// claimant). That single owner is the SOLE emitter of any standalone goodbye,
+// and it HOLDS the entry across the whole emit, so:
+//   - the owner is the only one that can take the goodbye (no double-send),
+//   - the entry blocks any concurrent Apply for the entire emit (no clobber of
+//     a re-claimed live sender, ≤1 live conn preserved),
+//   - the goodbye decision reads sender.goodbyeEmitted only AFTER <-stopped
+//     (happens-before), never on the timeout path.
+type drainEntry struct {
+	sender        *sender                   // draining sender; nil for a standalone-only claim
+	cfg           *config.RAInterfaceConfig // config for a standalone goodbye, if owed
+	goodbyeWanted bool                      // a graceful Withdraw targeted this interface
+	goodbyeClaimed bool                     // the owner has taken responsibility to emit it
+}
 
 // Manager manages per-interface RA sender goroutines.
 type Manager struct {
 	mu      sync.Mutex
 	senders map[string]*sender // active senders, keyed by Linux interface name
 
-	// draining holds interfaces whose senders are tearing down (graceful
-	// withdraw or hard stop) or are otherwise claimed (a WithdrawOnce goodbye,
-	// or an Apply restart between stop-old and start-new). The entry is a
-	// tombstone: while present, the interface is NOT absent — a concurrent
-	// Apply/WithdrawOnce must treat it as a claim and defer rather than start a
-	// new sender (#2033 I16). The value is the draining *sender when one exists
-	// (so a later graceful Withdraw can UPGRADE a still-draining hard stop to
-	// emit a goodbye — #2033 MAJOR 2), or nil for a claim with no live sender
-	// (WithdrawOnce, or after the sender has joined). It is removed once the
-	// sender's goroutine has joined.
-	draining map[string]*sender
+	// draining holds the per-interface claim-and-hold tombstones (see
+	// drainEntry). While an entry is present the interface is claimed; a
+	// concurrent Apply/WithdrawOnce/Withdraw must defer rather than start a new
+	// sender (#2033 I16). The owner removes it (under m.mu) only AFTER any
+	// standalone goodbye it claimed has fully completed.
+	draining map[string]*drainEntry
 
 	// epoch is bumped on every state-mutating call (Apply, Withdraw,
 	// WithdrawInterfaces, WithdrawOnce, Clear). A deferred Apply captures the
@@ -60,7 +77,7 @@ type Manager struct {
 func New() *Manager {
 	return &Manager{
 		senders:  make(map[string]*sender),
-		draining: make(map[string]*sender),
+		draining: make(map[string]*drainEntry),
 	}
 }
 
@@ -75,6 +92,66 @@ func (m *Manager) interfaceBusy(name string) bool {
 	}
 	_, ok := m.draining[name]
 	return ok
+}
+
+// releaseDrain is the SINGLE exit path for a draining sender (#2033 structural
+// fix). The caller is the sole owner of name's drainEntry and has just stopped
+// the sender. releaseDrain joins the sender (ordered read of goodbyeEmitted),
+// then under m.mu decides — claim-once — whether a standalone goodbye is owed;
+// if so it marks the entry claimed, HOLDS it, emits the standalone OUTSIDE the
+// lock (so a concurrent Apply keeps deferring for the whole emit — no clobber),
+// then removes the entry. If no goodbye is owed it removes the entry directly.
+//
+// Timeout discipline (closes race 2): goodbyeEmitted is read ONLY after a
+// successful <-stopped. If the join times out (the owner is wedged despite the
+// bounded SetWriteDeadline — something is badly wrong), releaseDrain does NOT
+// emit a standalone (it cannot safely read goodbyeEmitted, and the owner may
+// still be live); it logs and removes the entry. We accept a theoretical
+// dropped goodbye on a pathological hang over a double-send/clobber.
+//
+// Must be called WITHOUT m.mu held. s may be nil only for a pure standalone
+// claim that never had a sender (handled by emitStandaloneClaimed directly).
+func (m *Manager) releaseDrain(name string, s *sender) {
+	joined := false
+	if s != nil {
+		select {
+		case <-s.stopped:
+			joined = true
+		case <-time.After(claimWaitTimeout):
+			slog.Warn("ra: timed out joining draining sender; not emitting a "+
+				"standalone goodbye (owner may still be live)", "interface", name)
+		}
+	}
+
+	m.mu.Lock()
+	e := m.draining[name]
+	if e == nil {
+		// Should not happen (owner holds it), but be defensive.
+		m.mu.Unlock()
+		return
+	}
+	emit := false
+	if joined && e.goodbyeWanted && !e.goodbyeClaimed && s != nil &&
+		!s.goodbyeEmitted.Load() {
+		// The owner emitted no goodbye but one was wanted: claim it ONCE and
+		// keep the entry held across the emit below.
+		e.goodbyeClaimed = true
+		emit = true
+	}
+	cfg := e.cfg
+	m.mu.Unlock()
+
+	if emit {
+		slog.Info("ra: emitting standalone goodbye (owner exited without one; "+
+			"claim held across emit)", "interface", name)
+		if cfg != nil {
+			m.sendOneGoodbye(cfg) // entry still held → Apply defers, no clobber
+		}
+	}
+
+	m.mu.Lock()
+	delete(m.draining, name)
+	m.mu.Unlock()
 }
 
 // Apply diffs the current senders against the desired set and starts/stops/
@@ -123,14 +200,14 @@ func (m *Manager) Apply(configs []*config.RAInterfaceConfig) error {
 	var toStop []stopReq
 
 	// Remove senders not in the desired set (hard stop, no goodbye — a config
-	// change must not blackhole hosts). Install a tombstone so a concurrent
-	// WithdrawOnce/Apply does not start a sender on the same interface while the
-	// old one is still tearing down.
+	// change must not blackhole hosts). Install a drainEntry so a concurrent
+	// WithdrawOnce/Apply defers, and a racing graceful Withdraw can flip
+	// goodbyeWanted on it (the release path then emits the standalone).
 	for name, s := range m.senders {
 		if _, ok := desired[name]; !ok {
 			slog.Info("ra: removing sender", "interface", name)
 			delete(m.senders, name)
-			m.draining[name] = s
+			m.draining[name] = &drainEntry{sender: s, cfg: s.cfg}
 			s.signalStop(modeHard)
 			toStop = append(toStop, stopReq{name, s})
 		}
@@ -155,7 +232,7 @@ func (m *Manager) Apply(configs []*config.RAInterfaceConfig) error {
 		if ok {
 			slog.Info("ra: restarting sender", "interface", name)
 			delete(m.senders, name)
-			m.draining[name] = existing
+			m.draining[name] = &drainEntry{sender: existing, cfg: existing.cfg}
 			existing.signalStop(modeHard)
 			toStop = append(toStop, stopReq{name, existing})
 			toRestart = append(toRestart, cfg)
@@ -178,49 +255,83 @@ func (m *Manager) Apply(configs []*config.RAInterfaceConfig) error {
 	epoch := m.epoch
 	m.mu.Unlock()
 
-	// Join the stopped (removed + changed) senders OUTSIDE the lock (#2033 I16):
-	// a stop joins the owner and we must not hold m.mu across it. The conn is
-	// closed by the owner in finishShutdown before stop() returns.
-	for _, req := range toStop {
-		<-req.s.stopped
+	restartSet := make(map[string]struct{}, len(toRestart))
+	for _, cfg := range toRestart {
+		restartSet[cfg.Interface] = struct{}{}
 	}
 
-	// Now every old conn is closed. Clear the REMOVAL tombstones (their
-	// interfaces have no replacement); restart tombstones stay until the
-	// replacement starts.
-	if len(toStop) > 0 {
-		restartSet := make(map[string]struct{}, len(toRestart))
-		for _, cfg := range toRestart {
-			restartSet[cfg.Interface] = struct{}{}
+	// REMOVAL tombstones (no replacement): release each via releaseDrain, which
+	// joins the sender and — if a racing graceful Withdraw flipped goodbyeWanted
+	// — emits a standalone goodbye while holding the entry, then removes it.
+	for _, req := range toStop {
+		if _, isRestart := restartSet[req.name]; isRestart {
+			continue // restart entries are handled below (keep them held)
 		}
-		m.mu.Lock()
+		m.releaseDrain(req.name, req.s)
+	}
+
+	// RESTART tombstones (changed config): join the old sender, then either
+	// start the replacement (pure replace, no goodbye) or — if a graceful
+	// Withdraw superseded us (epoch changed AND goodbyeWanted) — emit a
+	// standalone goodbye via the release path and do NOT start a replacement.
+	for _, cfg := range toRestart {
+		name := cfg.Interface
+		// Find the old sender we stopped for this restart.
+		var oldS *sender
 		for _, req := range toStop {
-			if _, isRestart := restartSet[req.name]; !isRestart {
-				delete(m.draining, req.name)
+			if req.name == name {
+				oldS = req.s
+				break
 			}
 		}
-		m.mu.Unlock()
-	}
+		// Join the old sender first (ordered; conn closed) before deciding.
+		if oldS != nil {
+			select {
+			case <-oldS.stopped:
+			case <-time.After(claimWaitTimeout):
+				slog.Warn("ra: timed out joining old sender for restart",
+					"interface", name)
+			}
+		}
 
-	// Start the replacements for changed configs now that the old conns are
-	// closed. Epoch-guarded: a concurrent Withdraw/Clear that bumped the epoch
-	// wins (it will have already moved/handled the interface), so we abort the
-	// stale restart and clear our tombstone.
-	for _, cfg := range toRestart {
 		m.mu.Lock()
-		if m.epoch != epoch {
-			// Superseded — a newer call owns this interface now. Drop our
-			// restart tombstone only if no newer owner re-installed it; the
-			// newer call manages its own tombstone, so only remove ours if it
-			// is still the placeholder we set and no sender exists.
-			delete(m.draining, cfg.Interface)
+		e := m.draining[name]
+		superseded := m.epoch != epoch
+		wantGoodbye := e != nil && e.goodbyeWanted
+		if superseded || wantGoodbye {
+			// A newer call (graceful Withdraw / Clear) owns this interface's
+			// fate; do NOT start the replacement. If a goodbye is wanted and the
+			// old sender emitted none, claim it ONCE and hold the entry across
+			// the emit.
+			emit := false
+			if e != nil && e.goodbyeWanted && !e.goodbyeClaimed &&
+				oldS != nil && !oldS.goodbyeEmitted.Load() {
+				e.goodbyeClaimed = true
+				emit = true
+			}
+			var cfgEmit *config.RAInterfaceConfig
+			if e != nil {
+				cfgEmit = e.cfg
+			}
 			m.mu.Unlock()
-			slog.Debug("ra: restart superseded by newer epoch, skipping",
-				"interface", cfg.Interface)
+			if emit {
+				slog.Info("ra: restart superseded by withdraw; emitting "+
+					"standalone goodbye (claim held)", "interface", name)
+				if cfgEmit != nil {
+					m.sendOneGoodbye(cfgEmit)
+				}
+			} else {
+				slog.Debug("ra: restart superseded, no goodbye owed",
+					"interface", name)
+			}
+			m.mu.Lock()
+			delete(m.draining, name)
+			m.mu.Unlock()
 			continue
 		}
+		// Pure replace: start the new sender, drop the tombstone.
 		err := m.startLocked(cfg)
-		delete(m.draining, cfg.Interface)
+		delete(m.draining, name)
 		m.mu.Unlock()
 		if err != nil && firstErr == nil {
 			firstErr = err
@@ -314,20 +425,13 @@ func (m *Manager) startLocked(cfg *config.RAInterfaceConfig) error {
 	return nil
 }
 
-// gracefulTarget is one interface a graceful Withdraw is tearing down. After
-// the owning goroutine joins its sender, the manager checks whether a goodbye
-// actually went out; if not, it OWES a standalone goodbye (the owner lost the
-// upgrade race or the sender was already a stopped restart tombstone). Fields:
-//   - owned: true if THIS Withdraw owns the join (active-sender case).
-//   - observe: the sender to read goodbyeEmitted from after it has stopped
-//     (always captured under m.mu at claim time, so it never depends on the
-//     draining-map entry surviving — closes the restart-window delete race).
-//   - cfg: config to build the standalone goodbye from if owed.
-type gracefulTarget struct {
-	name    string
-	owned   bool
-	observe *sender
-	cfg     *config.RAInterfaceConfig
+// ownedDrain is an interface whose draining sender THIS graceful Withdraw owns
+// the join+release for (the active-sender case). The single owner runs
+// releaseDrain, which is the sole emitter of any standalone goodbye and holds
+// the entry across the emit.
+type ownedDrain struct {
+	name string
+	s    *sender
 }
 
 // Withdraw sends goodbye RAs (lifetime=0) on all interfaces, then stops all
@@ -343,15 +447,16 @@ func (m *Manager) Withdraw() error {
 	}
 	// Also include interfaces already DRAINING (e.g. a Clear acquired m.mu
 	// first and hard-stopped them, or a changed-config restart is mid stop->
-	// start). claimGracefulLocked upgrades a still-running owner, and the
-	// post-join owes-a-goodbye check emits a standalone goodbye if the owner
-	// was already dead (#2033 MAJOR 2 / restart window).
+	// start). claimGracefulLocked flips goodbyeWanted on those entries; their
+	// existing owner's release path emits the standalone if owed.
 	for name := range m.draining {
 		names = append(names, name)
 	}
-	ts := m.claimGracefulLocked(names)
+	owned := m.claimGracefulLocked(names)
 	m.mu.Unlock()
-	m.finishGraceful(ts)
+	for _, o := range owned {
+		m.releaseDrain(o.name, o.s)
+	}
 	return nil
 }
 
@@ -360,121 +465,70 @@ func (m *Manager) Withdraw() error {
 func (m *Manager) WithdrawInterfaces(names []string) {
 	m.mu.Lock()
 	m.bumpEpoch()
-	ts := m.claimGracefulLocked(names)
+	owned := m.claimGracefulLocked(names)
 	m.mu.Unlock()
-	m.finishGraceful(ts)
+	for _, o := range owned {
+		m.releaseDrain(o.name, o.s)
+	}
 }
 
-// claimGracefulLocked, under m.mu, records the graceful withdrawal intent for
-// each named interface and returns the targets to finish outside the lock.
-//
-// Doing the tombstone install AND signalStop(modeGraceful) under the lock makes
-// the graceful intent atomic (#2033 MAJOR 2): a later Clear cannot delete the
-// sender and install a hard tombstone in a gap. Three cases per interface:
-//   - active sender: move to a graceful tombstone, signalStop(graceful), join
-//     it ourselves; the owner emits the goodbye on exit.
-//   - draining sender (non-nil): a Clear/restart already owns it. UPGRADE it to
-//     graceful (best-effort — works only if the owner has not yet read its
-//     mode). We do NOT join it (its owner does), but we still record cfg so the
-//     post-mortem check can emit a standalone goodbye if the upgrade lost the
-//     race (the owner already exited hard — a dead sender cannot be upgraded).
-//   - nil draining claim (a WithdrawOnce goodbye in flight): the interface is
-//     already getting exactly one goodbye; do nothing (no double goodbye).
+// claimGracefulLocked records the graceful withdrawal intent for each named
+// interface UNDER m.mu, and returns only the interfaces THIS Withdraw owns the
+// join+release for. Per interface (atomic under m.mu — #2033 MAJOR 2):
+//   - active sender: move it to a NEW drainEntry{goodbyeWanted:true},
+//     signalStop(graceful), and OWN the release (returned in ownedDrain). The
+//     owner emits the goodbye on exit; releaseDrain's standalone backstop
+//     covers the lost-upgrade case.
+//   - already draining (Clear/restart/WithdrawOnce owns it): just flip
+//     goodbyeWanted=true on the existing entry and upgrade the live sender (if
+//     any) via signalStop(graceful). We do NOT own its release; the existing
+//     owner's release path (releaseDrain / Apply restart) emits the standalone
+//     if owed — claim-once via goodbyeClaimed guarantees no double-send even if
+//     several Withdraws flip the same entry.
 // Callers must hold m.mu.
-func (m *Manager) claimGracefulLocked(names []string) []gracefulTarget {
-	var ts []gracefulTarget
+func (m *Manager) claimGracefulLocked(names []string) []ownedDrain {
+	var owned []ownedDrain
 	seen := make(map[string]struct{}, len(names))
 	for _, name := range names {
 		if _, dup := seen[name]; dup {
-			continue // dedup: each interface yields at most one target / goodbye
+			continue // dedup within this call
 		}
 		seen[name] = struct{}{}
 		if s, ok := m.senders[name]; ok {
 			slog.Info("ra: sending goodbye RA", "interface", name)
 			delete(m.senders, name)
-			m.draining[name] = s
+			m.draining[name] = &drainEntry{sender: s, cfg: s.cfg, goodbyeWanted: true}
 			s.signalStop(modeGraceful)
-			ts = append(ts, gracefulTarget{name: name, owned: true, observe: s, cfg: s.cfg})
+			owned = append(owned, ownedDrain{name: name, s: s})
 			continue
 		}
-		if s := m.draining[name]; s != nil {
-			// A Clear or a changed-config restart already owns this sender's
-			// join. Upgrade it (effective only if the owner has not read its
-			// mode yet). Capture the sender pointer NOW (under m.mu) so the
-			// post-mortem owes-a-goodbye check reads goodbyeEmitted directly and
-			// does NOT depend on the draining-map entry surviving (the restart
-			// loop may delete it) — owned=false so we do not double-join.
-			slog.Info("ra: upgrading draining sender to graceful goodbye",
-				"interface", name)
-			s.signalStop(modeGraceful)
-			ts = append(ts, gracefulTarget{name: name, owned: false, observe: s, cfg: s.cfg})
+		if e := m.draining[name]; e != nil {
+			// Another caller (Clear / changed-config restart / WithdrawOnce)
+			// owns this entry's release. Flip goodbyeWanted so that owner emits
+			// the standalone if owed, and upgrade the still-running sender (if
+			// any) so it may emit the goodbye itself. We do NOT take the release.
+			e.goodbyeWanted = true
+			if e.cfg == nil {
+				e.cfg = m.cfgForName(name)
+			}
+			if e.sender != nil {
+				slog.Info("ra: upgrading draining sender to graceful goodbye",
+					"interface", name)
+				e.sender.signalStop(modeGraceful)
+			}
 			continue
 		}
-		// nil draining claim == a WithdrawOnce standalone goodbye is already in
-		// flight for this interface; it will emit exactly one goodbye. Skip.
+		// No sender and no tombstone: nothing to withdraw (already fully gone).
 	}
-	return ts
+	return owned
 }
 
-// finishGraceful, OUTSIDE m.mu (#2033 I16 — do not stall Status/Apply on the
-// failover hot path), waits for each target's sender to stop, then guarantees
-// EXACTLY ONE goodbye per interface: if the owner did not emit one (it lost the
-// graceful upgrade race, or the sender was already a stopped restart/Clear
-// tombstone), the manager emits a standalone goodbye via the WithdrawOnce
-// mechanism. The owned tombstone is cleared as each interface completes.
-func (m *Manager) finishGraceful(ts []gracefulTarget) {
-	for _, t := range ts {
-		// Wait for the sender to finish (whoever owns the join). stopped closes
-		// exactly once; multiple readers are safe. goodbyeEmitted is stored by
-		// finishShutdown BEFORE close(stopped), so this read is ordered.
-		select {
-		case <-t.observe.stopped:
-		case <-time.After(claimWaitTimeout):
-			slog.Warn("ra: timed out waiting for sender to drain",
-				"interface", t.name)
-		}
-		owed := !t.observe.goodbyeEmitted.Load()
-
-		if owed {
-			slog.Info("ra: emitting standalone goodbye (owner exited without "+
-				"one — lost the upgrade race or was a hard restart/clear stop)",
-				"interface", t.name)
-			m.emitStandaloneGoodbye(t.name, t.cfg)
-		}
-
-		if t.owned {
-			// Clear OUR tombstone (active-sender case). The upgrade case is
-			// owned by the racing Clear/restart, which clears its own.
-			m.mu.Lock()
-			delete(m.draining, t.name)
-			m.mu.Unlock()
-		}
-	}
-}
-
-// emitStandaloneGoodbye emits a single standalone goodbye (no burst, no link
-// toggle) for an interface whose owner exited without one. It is a NO-OP only if
-// a LIVE sender exists for the interface (a newer MASTER Apply won it back — do
-// not clobber it with a lifetime-0 RA). It deliberately does NOT skip on a
-// present draining tombstone: the tombstone that brought us here is a HARD stop
-// (Clear / changed-config restart) whose owner will NOT emit a goodbye, and a
-// WithdrawOnce nil-claim is never routed here (claimGracefulLocked skips those).
-// It does not install its own tombstone — the goodbye is brief (~goodbyeCount ×
-// goodbyeDelay) and a concurrent Apply that starts a real sender during it is
-// the legitimate new-MASTER case (its own owner emits its RAs correctly). m.mu
-// must NOT be held.
-func (m *Manager) emitStandaloneGoodbye(name string, cfg *config.RAInterfaceConfig) {
-	if cfg == nil {
-		return
-	}
-	m.mu.Lock()
-	_, live := m.senders[name]
-	m.mu.Unlock()
-	if live {
-		return
-	}
-	m.sendOneGoodbye(cfg)
-}
+// cfgForName returns a config to build a standalone goodbye from for name, when
+// an existing drainEntry was a nil-cfg claim (e.g. a WithdrawOnce entry). Best
+// effort: a WithdrawOnce entry carries no cfg, so a graceful Withdraw that
+// races it cannot synthesize one — return nil and rely on the WithdrawOnce's
+// own goodbye (it emits exactly one). Callers hold m.mu.
+func (m *Manager) cfgForName(string) *config.RAInterfaceConfig { return nil }
 
 // ResendBurst tells all running senders to re-send their startup burst. Used
 // after RETH MAC link cycles that kill the NDP socket — the sender restarts but
@@ -506,28 +560,26 @@ func (m *Manager) ResendBurst() {
 func (m *Manager) WithdrawOnce(configs []*config.RAInterfaceConfig) {
 	m.mu.Lock()
 	m.bumpEpoch()
-	type claimed struct {
-		cfg *config.RAInterfaceConfig
-	}
-	var toGoodbye []claimed
+	var toGoodbye []*config.RAInterfaceConfig
 	for _, cfg := range configs {
 		if m.interfaceBusy(cfg.Interface) {
 			slog.Debug("ra: WithdrawOnce: interface busy, skipping",
 				"interface", cfg.Interface)
 			continue
 		}
-		// Claim the interface so a concurrent Apply defers instead of starting
-		// a real sender during the goodbye. nil sender: the standalone goodbye
-		// is emitted synchronously below, there is no run() loop to upgrade.
-		m.draining[cfg.Interface] = nil
-		toGoodbye = append(toGoodbye, claimed{cfg})
+		// Claim the interface (sender:nil — no run() loop) and pre-mark the
+		// goodbye as CLAIMED: WithdrawOnce emits exactly one goodbye below, so a
+		// racing graceful Withdraw that flips goodbyeWanted must NOT also emit.
+		// The entry is HELD across the emit so a concurrent Apply defers.
+		m.draining[cfg.Interface] = &drainEntry{cfg: cfg, goodbyeClaimed: true}
+		toGoodbye = append(toGoodbye, cfg)
 	}
 	m.mu.Unlock()
 
-	for _, c := range toGoodbye {
-		m.sendOneGoodbye(c.cfg)
+	for _, cfg := range toGoodbye {
+		m.sendOneGoodbye(cfg)
 		m.mu.Lock()
-		delete(m.draining, c.cfg.Interface)
+		delete(m.draining, cfg.Interface)
 		m.mu.Unlock()
 	}
 }
@@ -558,9 +610,11 @@ func (m *Manager) Clear() error {
 }
 
 // clearLocked hard-stops all active senders without a goodbye. Callers must
-// hold m.mu; it moves senders to draining tombstones, releases the lock to
-// join, then re-acquires — so it returns with m.mu held (matching its
-// callers). No goodbye is emitted (modeHard).
+// hold m.mu; it moves senders to drainEntry tombstones, releases the lock to
+// join+release each, then re-acquires — so it returns with m.mu held (matching
+// its callers). No goodbye is emitted for a pure Clear (modeHard); but if a
+// racing graceful Withdraw flipped goodbyeWanted on an entry, clearLocked's
+// release path emits the standalone goodbye (claim-once, held across the emit).
 func (m *Manager) clearLocked() error {
 	if len(m.senders) == 0 {
 		return nil
@@ -572,24 +626,22 @@ func (m *Manager) clearLocked() error {
 	var ps []pending
 	for name, s := range m.senders {
 		delete(m.senders, name)
-		// Store the sender (not nil) so a racing graceful Withdraw can UPGRADE
-		// this hard stop to emit a goodbye (#2033 MAJOR 2). signalStop is
-		// idempotent; graceful never downgrades.
-		m.draining[name] = s
+		// drainEntry with the sender so a racing graceful Withdraw can flip
+		// goodbyeWanted + upgrade the live sender (#2033 MAJOR 2).
+		m.draining[name] = &drainEntry{sender: s, cfg: s.cfg}
 		s.signalStop(modeHard)
 		ps = append(ps, pending{name, s})
 	}
 
-	// Join outside the lock so Clear of many interfaces does not stall other
-	// callers; re-acquire before returning (caller expects m.mu held).
+	// Join + release each OUTSIDE the lock so Clear of many interfaces does not
+	// stall other callers; re-acquire before returning (caller expects m.mu
+	// held). releaseDrain handles the claim-once + held-across-emit standalone
+	// goodbye if a racing Withdraw wanted one.
 	m.mu.Unlock()
 	for _, p := range ps {
-		<-p.s.stopped
+		m.releaseDrain(p.name, p.s)
 	}
 	m.mu.Lock()
-	for _, p := range ps {
-		delete(m.draining, p.name)
-	}
 	return nil
 }
 

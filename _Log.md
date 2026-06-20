@@ -81,6 +81,47 @@
   scripts/image/xpf-grow-root.service, scripts/image/test-grow-root.sh,
   scripts/image/bake.py, scripts/image/validate.py,
   docs/install-images.md, docs/image-validation.md
+## 2026-06-19 — #2033 Codex round-3: structural claim-and-hold for the goodbye
+
+- **Timestamp**: 2026-06-19
+- **Action**: Rebased onto current origin/master (e33b401ef). Replaced the
+  ad-hoc standalone-goodbye decision (which had three check-then-act /
+  happens-before races) with a STRUCTURAL fix: the draining tombstone is now a
+  `drainEntry{sender, cfg, goodbyeWanted, goodbyeClaimed}` (all fields under
+  `m.mu`) that is the single atomic claim-and-hold for the goodbye. Added one
+  `releaseDrain(name, sender)` exit path used by Withdraw (active-sender owner),
+  Clear (`clearLocked`), and Apply removal; the Apply changed-config restart has
+  an inline equivalent. It (1) JOINS the sender and reads `goodbyeEmitted` ONLY
+  on the `<-stopped` arm (race 2: timeout NEVER emits — owner may be live;
+  bounded writes make a timeout pathological), (2) under `m.mu` takes the
+  goodbye EXACTLY ONCE via `goodbyeClaimed` (race 1: concurrent Withdraws just
+  flip `goodbyeWanted`; one owner emits), (3) HOLDS the entry across the whole
+  standalone emit so a concurrent Apply DEFERS — no clobber, ≤1 live conn
+  (race 3: the tombstone is the mutual exclusion, no check-then-act on
+  `m.senders`). Removed `gracefulTarget`/`finishGraceful`/
+  `emitStandaloneGoodbye`; `claimGracefulLocked` now returns only the
+  interfaces THIS Withdraw owns the release for, and flips `goodbyeWanted` on
+  entries owned by a racing Clear/restart. `WithdrawOnce` pre-marks
+  `goodbyeClaimed` (it emits its own goodbye) and holds the entry across its
+  emit. `claimWaitTimeout` is now a package var (test seam). Net contract:
+  EXACTLY ONE goodbye per withdrawn interface, ZERO for a pure replace, never a
+  double, never a clobber.
+- **File(s)**: pkg/ra/ra.go, pkg/ra/README.md, _Log.md
+
+- **Timestamp**: 2026-06-19
+- **Action**: Added three round-3 race regression tests to
+  `pkg/ra/serialize_test.go` (fakeConn gains a `beforeClose` hook; fakeListen
+  tracks every conn per interface). `TestRace1` — concurrent Withdraws on the
+  same dead-hard tombstone → EXACTLY one goodbye (1 conn / goodbyeCount writes).
+  `TestRace3` — a concurrent Apply during the held standalone emit DEFERS (no
+  live sender, ≤1 conn) then proceeds after release. `TestRace2` — the join
+  timeout path emits NO standalone (drives `releaseDrain` with a wedged sender +
+  shortened `claimWaitTimeout`). Each is deterministic (drives `releaseDrain`
+  directly to avoid Clear's nondeterministic per-interface order) and
+  mutation-verified to FAIL against the matching pre-fix defect (no-claim-once →
+  double-send; tombstone-released-before-emit → clobber; emit-on-timeout →
+  goodbye on the wedged path). Kept T7c/T2b/T7d/T1/T2a/T7b + ≤1-conn invariant.
+- **File(s)**: pkg/ra/serialize_test.go, _Log.md
 
 ## 2026-06-19 — #2033 Codex re-review: two graceful-goodbye MAJORs (dead sender + restart window)
 

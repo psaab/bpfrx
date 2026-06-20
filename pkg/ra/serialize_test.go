@@ -1347,3 +1347,241 @@ func TestT7d_ExactlyOneGoodbyeWhenUpgradeAndStandaloneCouldRace(t *testing.T) {
 			goodbyeCount, conns, total)
 	}
 }
+
+// --- #2033 round-3: structural claim-and-hold race tests ---
+
+// TestRace1_ConcurrentWithdrawsExactlyOneGoodbye: two concurrent Withdraws
+// racing the SAME dead-hard tombstone must yield EXACTLY ONE goodbye (1 conn /
+// goodbyeCount writes), not two. Two concurrent graceful Withdraws on the SAME
+// interface serialize on m.mu in claimGracefulLocked: exactly one moves the
+// active sender to a drainEntry and OWNS the release (sole emitter); the other
+// finds the entry and only flips goodbyeWanted. claim-once via the single owner
+// + goodbyeClaimed guarantees one goodbye even when both observe the dead sender
+// (we hold the sender's conn.Close so it finishes its HARD-then-upgraded stop
+// while both Withdraws are in flight, exercising the standalone backstop).
+//
+// NON-TAUTOLOGY: against head 141eefb5 each Withdraw appended an owned=false
+// gracefulTarget and emitStandaloneGoodbye had no claim-once, so both opened a
+// standalone conn → 2 conns / 6 writes → this test FAILS.
+func TestRace1_ConcurrentWithdrawsExactlyOneGoodbye(t *testing.T) {
+	if _, err := net.InterfaceByName("lo"); err != nil {
+		t.Skip("lo interface unavailable")
+	}
+	fl := newFakeListen(t)
+	m := New()
+
+	// Construct a held dead-hard tombstone for "lo" DIRECTLY (deterministic):
+	// start, hard-stop, wait fully dead, install drainEntry — but do NOT set
+	// goodbyeWanted yet; the racing Withdraws will set it.
+	iface := &net.Interface{Name: "lo", HardwareAddr: net.HardwareAddr{0x02, 0, 0, 0, 0, 1}}
+	s := newSender(testCfg("lo"), iface)
+	if err := s.start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	fc := waitConn(t, fl.getConn, "lo")
+	waitWrites(t, fc, 1)
+	s.signalStop(modeHard)
+	select {
+	case <-s.stopped:
+	case <-time.After(2 * time.Second):
+		t.Fatal("sender never stopped")
+	}
+
+	// THIS test owns the entry's release (mimicking the Clear/restart owner).
+	// Two concurrent Withdraws flip goodbyeWanted; then the owner releases once.
+	m.mu.Lock()
+	m.draining["lo"] = &drainEntry{sender: s, cfg: s.cfg}
+	m.mu.Unlock()
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	for i := 0; i < 2; i++ {
+		go func() { defer wg.Done(); _ = m.Withdraw() }()
+	}
+	wg.Wait() // both Withdraws have flipped goodbyeWanted (they own no release)
+
+	// The single owner releases the entry: claim-once -> exactly one standalone.
+	m.releaseDrain("lo", s)
+
+	total, conns := fl.goodbyeStats("lo")
+	if conns != 1 || total != goodbyeCount {
+		t.Fatalf("expected EXACTLY one goodbye (1 conn, %d writes); got %d conns, "+
+			"%d writes — concurrent Withdraws double-sent (#2033 race 1)",
+			goodbyeCount, conns, total)
+	}
+}
+
+// TestRace3_ApplyDuringStandaloneEmitDefersNoClobber: while a standalone
+// goodbye is mid-emit (its conn blocked in WriteTo), a concurrent Apply for the
+// same interface must DEFER (the held drainEntry blocks it) — it must NOT start
+// a live sender during the emit (no clobber, ≤1 live conn). After the standalone
+// finishes, the Apply proceeds.
+//
+// NON-TAUTOLOGY: against head 141eefb5 emitStandaloneGoodbye held NO tombstone
+// across the emit (check-then-act on m.senders), so the Apply could start a
+// live sender during the emit → ≥2 live conns during the window → FAILS.
+func TestRace3_ApplyDuringStandaloneEmitDefersNoClobber(t *testing.T) {
+	if _, err := net.InterfaceByName("lo"); err != nil {
+		t.Skip("lo interface unavailable")
+	}
+	fl := newFakeListen(t)
+	m := New()
+
+	// Gate the STANDALONE goodbye conn's first (lifetime-0) write so we can hold
+	// the emit open. The standalone conn is opened by sendOneGoodbye; gate on
+	// lifetime==0 (only the goodbye writes lifetime 0).
+	standaloneBlocking := make(chan struct{})
+	releaseStandalone := make(chan struct{})
+	var sOnce sync.Once
+	fl.preHook("lo", func(lifetime time.Duration) {
+		if lifetime == 0 {
+			sOnce.Do(func() { close(standaloneBlocking); <-releaseStandalone })
+		}
+	})
+
+	// Construct the held dead-hard-tombstone state DIRECTLY (deterministic — no
+	// dependence on Clear's per-interface release order): start a "lo" sender,
+	// hard-stop it, wait until it is fully dead (goodbyeEmitted=false), install a
+	// drainEntry{goodbyeWanted:true}. This is exactly the state a Clear-first +
+	// graceful-Withdraw race produces.
+	iface := &net.Interface{Name: "lo", HardwareAddr: net.HardwareAddr{0x02, 0, 0, 0, 0, 1}}
+	s := newSender(testCfg("lo"), iface)
+	if err := s.start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	fc := waitConn(t, fl.getConn, "lo")
+	waitWrites(t, fc, 1)
+	s.signalStop(modeHard)
+	select {
+	case <-s.stopped:
+	case <-time.After(2 * time.Second):
+		t.Fatal("sender never stopped")
+	}
+	if s.goodbyeEmitted.Load() {
+		t.Fatal("precondition: hard stop should not have emitted a goodbye")
+	}
+	m.mu.Lock()
+	m.draining["lo"] = &drainEntry{sender: s, cfg: s.cfg, goodbyeWanted: true}
+	m.mu.Unlock()
+
+	// Release the held tombstone via releaseDrain (the sole owner). It must emit
+	// the standalone WHILE holding the entry — the gated write blocks it there.
+	relDone := make(chan struct{})
+	go func() { m.releaseDrain("lo", s); close(relDone) }()
+
+	select {
+	case <-standaloneBlocking:
+	case <-time.After(2 * time.Second):
+		t.Fatal("standalone goodbye never reached its write gate")
+	}
+
+	// Concurrent Apply for "lo" must DEFER (held tombstone) — no live sender,
+	// ≤1 live conn — for the whole emit window.
+	applyDone := make(chan error, 1)
+	go func() { applyDone <- m.Apply([]*config.RAInterfaceConfig{testCfg("lo")}) }()
+	for i := 0; i < 40; i++ {
+		m.mu.Lock()
+		_, live := m.senders["lo"]
+		m.mu.Unlock()
+		if live {
+			t.Fatal("Apply started a live sender DURING the standalone emit "+
+				"(clobber; tombstone did not block it) — #2033 race 3")
+		}
+		if lc := fl.liveCount(); lc > 1 {
+			t.Fatalf(">1 live conn during the standalone emit (%d) — #2033 race 3", lc)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+
+	// Release the standalone; releaseDrain finishes (removes the tombstone);
+	// the deferred Apply then proceeds and starts a live sender.
+	close(releaseStandalone)
+	select {
+	case <-relDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("releaseDrain did not complete")
+	}
+	select {
+	case <-applyDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("deferred Apply did not complete after the emit released")
+	}
+
+	total, conns := fl.goodbyeStats("lo")
+	if conns != 1 || total != goodbyeCount {
+		t.Fatalf("expected exactly one goodbye (1 conn, %d writes); got %d/%d",
+			goodbyeCount, conns, total)
+	}
+	m.mu.Lock()
+	_, live := m.senders["lo"]
+	m.mu.Unlock()
+	if !live {
+		t.Fatal("deferred Apply did not start a live sender after the emit")
+	}
+	_ = m.Clear()
+}
+
+// TestRace2_TimeoutDoesNotEmitWhileOwnerCouldBeLive: if releaseDrain cannot
+// join the sender within claimWaitTimeout (owner wedged), it must NOT read
+// goodbyeEmitted (unordered) and must NOT emit a standalone — the owner may
+// still be live. Drive releaseDrain directly with a wedged sender +
+// goodbyeWanted and a shortened timeout; assert zero goodbyes.
+//
+// NON-TAUTOLOGY: against head 141eefb5 finishGraceful fell through after the
+// timeout and read goodbyeEmitted anyway, then emitted a standalone → a goodbye
+// would appear here → FAILS.
+func TestRace2_TimeoutDoesNotEmitWhileOwnerCouldBeLive(t *testing.T) {
+	if _, err := net.InterfaceByName("lo"); err != nil {
+		t.Skip("lo interface unavailable")
+	}
+	fl := newFakeListen(t)
+	m := New()
+
+	// A wedged sender whose stopped never closes: gate its conn.Close so the
+	// owner parks in finishShutdown before `defer close(stopped)` runs.
+	iface := &net.Interface{Name: "lo", HardwareAddr: net.HardwareAddr{0x02, 0, 0, 0, 0, 1}}
+	s := newSender(testCfg("lo"), iface)
+	if err := s.start(); err != nil {
+		t.Fatalf("start: %v", err)
+	}
+	fc := waitConn(t, fl.getConn, "lo")
+	waitWrites(t, fc, 1)
+	wedge := make(chan struct{})
+	fc.setBeforeClose(func() { <-wedge }) // owner parks here forever
+
+	// Hard-stop it and install a drainEntry with goodbyeWanted (as a racing
+	// graceful Withdraw would have), then release with a SHORT timeout.
+	m.mu.Lock()
+	delete(m.senders, "lo")
+	m.draining["lo"] = &drainEntry{sender: s, cfg: s.cfg, goodbyeWanted: true}
+	s.signalStop(modeHard)
+	m.mu.Unlock()
+
+	orig := claimWaitTimeout
+	claimWaitTimeout = 150 * time.Millisecond
+	defer func() { claimWaitTimeout = orig }()
+
+	done := make(chan struct{})
+	go func() { m.releaseDrain("lo", s); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("releaseDrain did not return after the join timeout")
+	}
+
+	// No standalone goodbye must have been emitted on the timeout path.
+	total, conns := fl.goodbyeStats("lo")
+	if conns != 0 || total != 0 {
+		t.Fatalf("releaseDrain emitted a goodbye on the TIMEOUT path (owner could "+
+			"be live) — got %d conns / %d writes; expected 0 (#2033 race 2)",
+			conns, total)
+	}
+	// Tombstone removed (entry released) despite no emit.
+	m.mu.Lock()
+	_, stillDraining := m.draining["lo"]
+	m.mu.Unlock()
+	if stillDraining {
+		t.Fatal("releaseDrain left the tombstone after the timeout")
+	}
+	close(wedge) // unwedge the parked owner so the goroutine can exit
+}
