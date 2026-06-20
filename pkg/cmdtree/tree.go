@@ -1020,10 +1020,12 @@ var ConfigSetDataplaneKnobs = map[string]*Node{
 
 // ConfigTopLevel defines tab completion for config mode top-level commands.
 var ConfigTopLevel = map[string]*Node{
-	"annotate": {Desc: "Annotate the configuration statement"},
-	"copy":     {Desc: "Copy a configuration statement"},
-	"insert":   {Desc: "Insert a new ordered configuration statement"},
-	"rename":   {Desc: "Rename a configuration statement"},
+	"activate":   {Desc: "Remove the inactive tag from a statement"},
+	"annotate":   {Desc: "Annotate the configuration statement"},
+	"copy":       {Desc: "Copy a configuration statement"},
+	"deactivate": {Desc: "Add the inactive tag to a statement"},
+	"insert":     {Desc: "Insert a new ordered configuration statement"},
+	"rename":     {Desc: "Rename a configuration statement"},
 	"set": {Desc: "Set a configuration parameter", Children: map[string]*Node{
 		"system": {Desc: "System configuration", Children: map[string]*Node{
 			// Codex M3: surface the #785/#801 dataplane knobs so `?`
