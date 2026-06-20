@@ -1,6 +1,10 @@
 # #2103 + #2105 — route-filter FRR-validity: `longer` max-len + prefix CIDR validation
 
-Status: DRAFT v1 — pending adversarial plan review
+Status: v2 — both round-1 hostile reviewers' PLAN-NEEDS-MINOR findings
+folded (FRR empty-vs-NULL prefix-list semantics corrected, all-skipped
+term now suppresses the `match` line, family derived from a parseable
+entry, orlonger/32 recorded as FRR-valid). Ready to implement. See "v2 —
+adversarial plan-review resolution" at the bottom.
 
 These two issues are siblings of #2072 (PR #2102, just merged), both
 found in that PR's hostile code review, and both live in the same render
@@ -113,8 +117,10 @@ case "longer":
     // For a max-length prefix (/32 v4, /128 v6) there are NO
     // more-specifics, so "longer" is the EMPTY set — emit no
     // prefix-list entry rather than an FRR-invalid "ge plen+1 le max"
-    // line (ge > le and ge > maxlen, which FRR rejects and which can
-    // fail the whole frr-reload). Mirrors the upto plen>=maxLen guard
+    // line. FRR rejects ge 33 (YANG range 0..32) AND ge>le; a rejected
+    // line can fail the whole frr-reload (tools/frr-reload.py applies
+    // the add-batch via a single vtysh -f and exits non-zero on any
+    // CMD_WARNING_CONFIG_FAILED). Mirrors the upto plen>=maxLen guard
     // (#2072) and closes #2103.
     parts := strings.SplitN(rf.Prefix, "/", 2)
     if len(parts) == 2 {
@@ -133,25 +139,55 @@ case "longer":
     }
 ```
 
-"Skip the entry" needs a mechanism. Two options (open question Q1):
+Boundary check (verified, both reviewers): `plen+1 > maxLen` skips ONLY
+`plen == maxLen`. `/31 → 32 > 32` false → emits `ge 32 le 32` (one
+more-specific, FRR-valid, `mask(31) <= ge(32) <= le(32)`). `/32 →
+33 > 32` true → skip. `/127 v6 → ge 128 le 128` (valid); `/128 v6 → skip`.
+Does NOT over-skip /31.
 
-- **Option A (continue):** set a `skipEntry := false` flag at the top of
-  the per-`rf` loop body; on the max-length `longer` case set it true and
-  `continue` past the prefix-list emit block. Clean, but the
-  `match ip/ipv6 address prefix-list <plName>` line is emitted ONCE after
-  the loop using `term.RouteFilters[0].Prefix` for family selection —
-  skipping individual entries does NOT remove that match line. If ALL
-  route-filters in the term are skipped, the term emits a
-  `match ... prefix-list <plName>` referencing an EMPTY prefix-list,
-  which in FRR is a valid (match-nothing) construct, NOT a reload
-  failure. So `continue` is safe.
-- **Option B (sentinel matchStr):** introduce a sentinel that suppresses
-  the whole line. More invasive.
+### Skip mechanism + the post-loop `match` line — CORRECTED in v2
 
-Plan picks **Option A** (`continue` on a per-entry skip flag) — it is
-the minimal change and FRR-safe even when every entry is skipped (empty
-prefix-list = match-nothing, which is the correct semantics for "longer
-than /32").
+Round-1 reviewers (both, F1, load-bearing) caught that the v1 rationale
+"all entries skipped → empty prefix-list = match-nothing" is BACKWARDS
+on FRR semantics. Verified against FRR `lib/plist.c prefix_list_apply_ext`:
+
+- A **count==0 *materialized* prefix-list** (the name exists, has zero
+  entries) returns **`PREFIX_PERMIT` (match-EVERYTHING)**.
+- A **non-existent (NULL) prefix-list** (the name was never created by an
+  `ip prefix-list <name>` line) → `prefix_list_lookup` returns NULL, and
+  the route-map match handlers
+  (`route_match_address_prefix_list`/zebra) short-circuit to
+  `RMAP_NOMATCH` (DENY).
+
+The skip mechanism emits ZERO `ip prefix-list <plName>` lines for a
+skipped entry, so a fully-skipped term references a name that is never
+materialized → NULL → DENY → correct match-nothing. But relying on
+NULL-vs-empty is fragile: any future change that materializes a
+zero-entry list flips the term to PERMIT-ALL. v2 therefore takes the
+robust path the v1 Q1 itself offered:
+
+**Mechanism (v2):**
+1. Per-`rf` loop: a `skipEntry bool` flag, reset each iteration. Set true
+   on the #2103 max-length `longer` case AND on the #2105 malformed
+   prefix. `continue` past the prefix-list emit block when set.
+2. Count entries actually emitted: `emitted++` only when a `permit` line
+   is written. Track the family of the FIRST emitted entry
+   (`firstEmittedV6 bool`) for the `match` line.
+3. After the loop, emit the `match ip/ipv6 address prefix-list <plName>`
+   line **only if `emitted > 0`** — using `firstEmittedV6` (a
+   parseable, non-skipped entry's family), NOT `term.RouteFilters[0]`.
+   When `emitted == 0` the whole term has no usable route-filter, so
+   suppress BOTH the prefix-list entries (already skipped) AND the
+   `match` line. The term then has no route-filter match condition
+   (other `from`/`then` clauses still render); this is deterministic and
+   does not depend on FRR's NULL-vs-empty behavior.
+
+This closes round-1 F1 (no count==0 list ever materialized; no
+`match` line ever references a non-existent list) and F6 (family of the
+`match` line is derived from a parseable emitted entry, fixing the
+mixed-term malformed-v4-index-0 + valid-v6-index-1 case that v1 would
+have mis-rendered as `match ip` for a v6-only list → wrong-namespace
+DENY of a legitimate term).
 
 ### #2105 — route-filter prefix CIDR validator (compile-time)
 
@@ -188,9 +224,14 @@ position-agnostic — the walker does not tell it which slot it is in:
 // CIDR (the prefix slot) OR a match-type keyword (the match-type slot).
 var routeFilterMatchTypes = map[string]bool{
     "exact": true, "longer": true, "orlonger": true, "upto": true,
-    // "prefix-length-range" and "through" are accepted as keywords so a
-    // future render of them is not blocked at commit; they are still
-    // unrendered (deferred, see #2103 note) but the grammar admits them.
+    // "prefix-length-range" and "through" are ADMITTED as keywords (v2,
+    // resolving Q4). They are unrendered (default le 32/128 — a separate
+    // deferred follow-up, see Out of Scope), but they COMMIT FINE TODAY
+    // (no validator exists), so rejecting them would be a grammar
+    // regression breaking configs already on the wire. Their current
+    // default render le 32/le 128 is FRR-VALID even at /32 (le==plen is
+    // accepted by FRR; only strictly-less is rejected — see v2 F2), so
+    // admitting them introduces no reload failure.
     "prefix-length-range": true, "through": true,
 }
 
@@ -214,12 +255,25 @@ func ValidateRouteFilterArg(raw string, _ *Config) error {
     if routeFilterMatchTypes[tok] {
         return nil
     }
-    if _, _, err := net.ParseCIDR(tok); err == nil {
+    // Family-agnostic CIDR (v4 or v6). parseCIDRStrict requires a
+    // /prefix-length and upgrades the common mistakes (bare IP →
+    // "missing /prefix-length", garbage → targeted message), matching
+    // the ValidateIPv4CIDR/ValidateIPv6CIDR convention. Ignore the
+    // returned IP — route-filter accepts both families.
+    if _, err := parseCIDRStrict(tok, "10.0.0.0/24"); err == nil {
         return nil
     }
     return fmt.Errorf("not a valid route-filter prefix (expected CIDR e.g. 10.0.0.0/24 or 2001:db8::/32): %q", raw)
 }
 ```
+
+Note: `parseCIDRStrict` returns `(net.IP, error)`; we discard the IP.
+`net.ParseCIDR` (which it wraps) accepts `/0`, `/32`, v6, and host-bits-
+set forms, and rejects `10.0.0.0` (no mask), `/99`, `/ab`, and the
+keywords — verified against the live parser. (If `parseCIDRStrict`'s
+required-prefix message is judged too interface-flavored for
+route-filter, fall back to bare `net.ParseCIDR` — functionally
+equivalent for acceptance; this is a cosmetic choice.)
 
 Known limitation (open question Q2): a token that is a bare match-type
 keyword in the *prefix* slot (e.g. `route-filter longer exact`) would
@@ -232,36 +286,50 @@ the prefix slot is the alternative (Q2 invites it).
 
 ### #2105 — render-side belt-and-suspenders (defense in depth)
 
-Even with the commit validator, the lenient-on-load path can let a
-stored garbage prefix through to the renderer (a pre-gate config). Add a
-render-side skip so the renderer NEVER emits a garbage FRR line: in the
+Even with the commit validator, the lenient-on-load path (Store.Load /
+SyncApply, #1960) can let a stored garbage prefix through to the
+renderer (a pre-gate config, or an HA sync from an un-upgraded peer). Add
+a render-side skip so the renderer NEVER emits a garbage FRR line: in the
 per-`rf` loop, if the prefix has no `/` or its mask does not
-`strconv.Atoi`, set `skipEntry = true` (reuse the #2103 skip mechanism)
-so no `permit <garbage> ...` line is produced. This is the same skip
-flag #2103 introduces — one mechanism, two callers.
+`strconv.Atoi` (i.e. `SplitN(prefix,"/",2)` len != 2 OR the mask is not
+a number in range), set `skipEntry = true` (the SAME flag #2103 uses) so
+no `permit <garbage> ...` line is produced and `emitted` is not bumped.
+One mechanism, two callers. A valid CIDR always has `/` + numeric mask,
+so this never false-skips a valid v4 or v6 prefix (locked by a test).
 
 ## Public API preservation
 
 No exported signatures change. `generatePolicyOptions` keeps its
-signature. New: package-level `ValidateRouteFilterArg` (exported to match
-the existing `ValidateIPv4CIDR`/`ValidateIPv6CIDR` convention; could be
-unexported — Q3). `routeFilterMatchTypes` is a new unexported var.
+signature. New: package-level `ValidateRouteFilterArg`, EXPORTED to match
+the existing `ValidateIPv4CIDR`/`ValidateIPv6CIDR` convention (v2,
+resolving Q3 — the existing validators are exported even when consumed
+in-package). It reuses the existing `parseCIDRStrict` helper internally
+for operator-friendly messages (bare-IP → "missing /prefix-length"),
+matching the project convention (v2 F7), but is family-agnostic
+(route-filter accepts both v4 and v6). `routeFilterMatchTypes` is a new
+unexported var.
 
 ## Hidden invariants the change must preserve
 
 - **Render side-effect ordering:** the `seq` numbering of prefix-list
-  entries. With Option A `continue`, a skipped entry's `seq` slot
-  `(i+1)*5` is simply not emitted — gaps in seq are FRR-legal and do not
-  reorder remaining entries. Verify a test that mixes a skipped /32
-  `longer` with a normal entry keeps the normal entry's seq stable.
-- **The `match ip/ipv6 address prefix-list <plName>` line** is emitted
-  from `term.RouteFilters[0].Prefix` family detection — unchanged. If
-  entry 0 is the skipped one, the family is still read from its prefix
-  string (still parseable for family — a /32 longer skip still has a
-  valid v4 prefix string). For a *malformed* prefix at index 0 (#2105),
-  family detection falls back to `strings.Contains(":")` which is
-  garbage-tolerant (defaults to v4) — acceptable, the prefix-list is
-  empty/match-nothing anyway.
+  entries. A skipped entry's `seq` slot `(i+1)*5` is simply not emitted —
+  the loop still iterates with `i`, so remaining entries keep their
+  original `(i+1)*5` seq. Gaps in seq are FRR-legal and do not reorder
+  remaining entries. Verify a test that mixes a skipped /32 `longer`
+  (i=0) with a normal /24 `longer` (i=1) keeps the /24 entry's
+  `seq 10` stable. (Decision: keep `i`-based seq, do NOT renumber from
+  the emitted count — renumbering would change seq of EXISTING entries
+  across a config edit, a gratuitous diff; gaps are harmless.)
+- **The `match ip/ipv6 address prefix-list <plName>` line** (v2,
+  CORRECTED — see "Skip mechanism" above): emitted only when
+  `emitted > 0`, with family from the FIRST emitted (parseable,
+  non-skipped) entry's prefix, NOT `term.RouteFilters[0].Prefix`. This
+  fixes the round-1 F6 mixed-term case (malformed v4 at index 0 + valid
+  v6 at index 1 would have emitted `match ip` for a v6-only list). When
+  every entry is skipped the `match` line is suppressed entirely — no
+  reference to a non-existent prefix-list, deterministic match-nothing
+  via "term has no route-filter condition" (the term still renders its
+  other `from`/`then` clauses).
 - **Commit-strict / load-lenient gate:** inherited automatically via
   keyValidator — no new wiring. Must add a `configstore` lenient test
   proving a stored garbage route-filter prefix does NOT fail
@@ -285,18 +353,39 @@ unexported — Q3). `routeFilterMatchTypes` is a new unexported var.
 
 CONTROL-PLANE ONLY — no dataplane smoke (per task scope). Coverage:
 
-- `pkg/frr` render tests (extend `frr_test.go`):
+- `pkg/frr` render tests (extend `frr_test.go`; direct
+  `config.RouteFilter` struct construction — the render tests do not need
+  an AST, matching `TestRouteFilterExactFRR`):
   - `/32 longer` → NO `ge 33 le 32` line emitted (and no `permit
-    .../32 ge` at all); term still well-formed.
+    .../32 ge` at all).
   - `/128 longer` → NO `ge 129 le 128` line.
+  - `/31 longer` (boundary control) → still emits `ge 32 le 32` (proves
+    no over-skip of the one legal more-specific).
   - `/24 longer` (control) → still emits `ge 25 le 32` (no regression).
   - `/64 longer` v6 (control) → still emits `ge 65 le 128`.
-  - Mixed term: a skipped /32 longer alongside a normal /24 longer keeps
-    the /24's seq + the `match ... prefix-list` line.
-  - Render-side belt: a malformed prefix (e.g. `10.0.0.0` no mask) →
-    NO `permit 10.0.0.0 le 32` garbage line emitted.
+  - `orlonger /32` (control, v2 F2) → still emits bare `le 32`
+    (le==plen is FRR-valid; proves the fix did not touch orlonger and
+    documents the valid equality case).
+  - **All-skipped term (v2 F1):** a term whose ONLY route-filter is a
+    `/32 longer` → NO `ip prefix-list <plName>` line AND NO
+    `match ... prefix-list <plName>` line emitted (locks the
+    no-count==0-list / no-dangling-match invariant; without this a
+    regression that materializes an empty list → PERMIT-ALL would slip
+    past the "no ge 33" assertions).
+  - **Mixed term (v2 F1/F6):** a skipped `/32 longer` (index 0) +
+    a normal `/24 longer` (index 1) → the /24 entry IS emitted with
+    `seq 10` (stable), the `match ... prefix-list` line IS present.
+  - **Mixed family (v2 F6):** malformed v4-ish prefix at index 0
+    (skipped by the belt) + valid `2001:db8::/64 longer` at index 1 →
+    the `match` line is `match ipv6 address prefix-list` (NOT `match ip`),
+    proving family derives from the emitted v6 entry, not index 0.
+  - Render-side belt (v2 #2105): a malformed prefix (e.g. `10.0.0.0`
+    no mask) → NO `permit 10.0.0.0 le 32` garbage line emitted.
+  - A valid v6 `/64 orlonger` is NOT belt-skipped (proves the belt does
+    not false-skip valid prefixes).
   - **Non-tautological:** each new render assertion must FAIL against
-    pre-fix `policy_render.go` (the current `ge 33 le 32` / garbage line).
+    pre-fix `policy_render.go` (the current `ge 33 le 32` / garbage line /
+    unconditional match line).
 - `pkg/config` compile/validate tests (dual-AST, `ParseSetCommand` +
   `SetPath`):
   - Malformed prefix (`route-filter 10.0.0.0 exact`, no mask) REJECTED
@@ -318,36 +407,41 @@ CONTROL-PLANE ONLY — no dataplane smoke (per task scope). Coverage:
 
 - `prefix-length-range` and `through` RENDER (still default `le 32`) —
   the other #2072 follow-up; they need new struct fields. This plan only
-  ADMITS their keywords in the validator so a future render is not
-  blocked at commit, and audits them per #2103's note, but does NOT
-  render them. (If admitting the keyword is judged out of scope, drop
-  them from `routeFilterMatchTypes` — Q4.)
+  ADMITS their keywords in the validator (v2 Q4 resolution) so the
+  existing commit behavior is preserved, but does NOT render them. Their
+  default `le 32`/`le 128` render is FRR-valid even at /32 (le==plen
+  accepted — v2 F2), so admitting them adds no reload risk. Audited per
+  #2103's note; render deferred.
+- The `orlonger`/`upto`/`exact` arms — UNCHANGED. `orlonger /32 → le 32`
+  is FRR-valid (le==plen accepted; v2 F2 refuted the suspected sibling
+  bug), so no fix needed there.
+- Fixing the misleading `<=`-vs-`<` wording in the existing #2072 `upto`
+  comment (v2 F2): OPTIONAL one-line comment cleanup; will fold it if
+  trivially adjacent, else leave a note — the `upto` code itself is
+  correct (it never emits `le==plen`, mapping `UptoLen==plen`→exact).
 - Any dataplane / userspace-dp change.
 - Schema restructuring to make the route-filter node validate only the
-  prefix slot (Q2 alternative — heavier, deferred unless reviewers
-  demand it).
+  prefix slot (Q2 — heavier; the position-agnostic validator is the
+  accepted v2 design, documented as a known limitation).
 
-## Open questions for adversarial review
+## Open questions for adversarial review (ALL RESOLVED in v2)
 
-1. **Q1 — skip mechanism.** Option A (`continue` on a per-entry skip
-   flag) vs Option B (sentinel matchStr). Is `continue` correct given the
-   single post-loop `match ... prefix-list` line? Confirm an all-skipped
-   term yields an empty (match-nothing) prefix-list that FRR accepts, NOT
-   a reload failure. Is there a case where the `match` line should ALSO
-   be suppressed when every entry is skipped?
-2. **Q2 — position-agnostic validator.** Accepting match-type keywords in
-   the prefix slot means `route-filter longer exact` passes. Is this an
-   acceptable known limitation (the issue flags it), or must the schema
-   be restructured so only the prefix is CIDR-validated? Does any other
-   args:2 node in the schema already solve this?
-3. **Q3 — exported vs unexported validator.** `ValidateRouteFilterArg`
-   exported (matches `ValidateIPv4CIDR`) or unexported (only used in this
-   package)? The existing CIDR validators are exported but consumed
-   cross-package — is route-filter's?
-4. **Q4 — admit `prefix-length-range`/`through` keywords now?** Admitting
-   them in the validator (so a future render is not commit-blocked) vs
-   rejecting them until they render. Which is less surprising to an
-   operator who configures `through` today?
+1. **Q1 — skip mechanism. RESOLVED.** Both reviewers (F1) corrected the
+   v1 "empty list = match-nothing" rationale (FRR count==0 list =
+   PERMIT-ALL; only a NULL/non-existent list = DENY). v2 suppresses the
+   `match` line entirely when `emitted == 0` and never materializes a
+   count==0 list — deterministic, not dependent on FRR NULL-vs-empty.
+2. **Q2 — position-agnostic validator. RESOLVED (accepted limitation).**
+   No other args:2 node solves per-position validation (`as-path` is the
+   only other args:2 node, no keyValidator). The position-agnostic design
+   is strictly better than today and catches the real malformed-CIDR
+   target; documented as a known gap. Schema restructuring deferred.
+3. **Q3 — exported validator. RESOLVED: exported** (matches the existing
+   exported-validator convention).
+4. **Q4 — admit `prefix-length-range`/`through`. RESOLVED: admit.**
+   They commit fine today (no validator), so rejecting would be a grammar
+   regression; their default `le 32`/`le 128` render is FRR-valid even at
+   /32 (v2 F2).
 5. **Q5 — `upto` length token (RESOLVED by AST dump).** Verified: the
    `upto /N` length token lands as a CHILD of the route-filter node, NOT
    in `Keys[1:3]`, so it never reaches the keyValidator. The validator
@@ -360,8 +454,53 @@ CONTROL-PLANE ONLY — no dataplane smoke (per task scope). Coverage:
    compiler_routing.go — if a brace parse yields
    `Keys=[route-filter, P, upto, /28]`, then `Keys[1:3]` still excludes
    index 3, so still safe; confirm `argEnd=3` never reaches index 3.)
-6. **Q6 — family detection on malformed index-0 prefix.** When the FIRST
-   route-filter has a malformed prefix (#2105 render belt), the
-   `match ip/ipv6 address prefix-list` family is chosen by
-   `strings.Contains(prefix, ":")` on garbage. Is defaulting to v4
-   acceptable, or should the family be derived from a parseable entry?
+6. **Q6 — family detection on malformed index-0 prefix. RESOLVED
+   (F6): derive from a parseable emitted entry.** v1 read
+   `term.RouteFilters[0].Prefix`; a mixed term (malformed v4 index-0 +
+   valid v6 index-1) would emit `match ip` for a v6-only list →
+   wrong-namespace DENY of a legitimate term. v2 tracks the family of the
+   FIRST emitted entry and uses that for the `match` line.
+
+## v2 — adversarial plan-review resolution
+
+Two independent hostile Claude plan reviewers (read-only scratch
+worktrees) both returned **PLAN-NEEDS-MINOR**, with convergent,
+source-verified findings. Resolution:
+
+- **F1 (both reviewers, load-bearing) — FRR empty-vs-NULL prefix-list
+  semantics.** v1 claimed "all entries skipped → empty prefix-list =
+  match-nothing." This is BACKWARDS: FRR `lib/plist.c` returns
+  `PREFIX_PERMIT` (match-ALL) for a materialized count==0 list; only a
+  non-existent (NULL) list yields DENY. **Resolved:** v2 suppresses the
+  `match` line when `emitted == 0` and never emits a count==0 list, so
+  correctness no longer depends on FRR's fragile NULL-vs-empty behavior.
+  Added an all-skipped-term test asserting NO `ip prefix-list` AND NO
+  `match` line.
+- **F6/Q6 (reviewer B) — family detection.** Resolved: derive the
+  `match` line family from the first emitted (parseable) entry, with a
+  mixed-family test.
+- **F2 (reviewer B) — orlonger/32 sibling bug REFUTED.** `le == plen` is
+  FRR-valid (only strictly-less is rejected by
+  `lib/filter_nb.c prefix_list_length_validate`), so `orlonger /32 →
+  le 32` is fine; no fix needed. The existing #2072 `upto` comment
+  overstates the rule (`<=` should be `<`) but is harmless (the `upto`
+  code never emits `le==plen`). Recorded; optional one-line comment
+  cleanup folded if trivially adjacent. Added an `orlonger /32` control
+  test.
+- **F3/F4/F5 (both) — citations + stakes.** Confirmed `ge 33` fails the
+  YANG range `0..32` (primary) AND `ge>le`; `frr-reload.py` fails the
+  WHOLE reload on a bad add line (single `vtysh -f`, no per-line skip for
+  adds). Folded into the code comments and the framing.
+- **F7 (reviewer B) — validator convention.** Resolved: reuse
+  `parseCIDRStrict` for operator-friendly messages, family-agnostic.
+- **Q3 (both) — exported.** Resolved: export `ValidateRouteFilterArg`.
+- **Q4 (split: A reject-until-rendered, B admit) — resolved: ADMIT.**
+  Rejecting `prefix-length-range`/`through` would regress the grammar
+  (they commit fine today); their default render is FRR-valid.
+- **Q5 (both) — CONFIRMED safe.** The `upto /N` length token is never in
+  `Keys[1:3]` in any AST shape (`argEnd = 1 + args = 3`; the slice
+  excludes index 3 even in the brace shape that packs `/28` at index 3).
+  `route-filter 24 exact` is correctly rejected; `upto /28` is not
+  falsely rejected.
+
+Round-1 reviewer agentIds: A `a406b6cade7888116`, B `a89e7a393bd20ddde`.
