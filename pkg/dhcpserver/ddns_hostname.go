@@ -75,23 +75,81 @@ func deriveFQDN(hostName, clientFQDN, identity, domain, source string) (string, 
 	return finalizeFQDN(name, domain)
 }
 
-// finalizeFQDN turns an offered name into a validated FQDN: if it already
-// contains a dot it is treated as fully qualified (each label sanitized);
-// otherwise the configured domain is appended.
+// finalizeFQDN turns an offered name into a validated FQDN that is ALWAYS
+// contained in the configured zone (plan §4.3 + the never-publish-outside-
+// the-zone boundary). The client supplies the name; the firewall — not the
+// client — decides the zone, so a dotted name can never let a client escape
+// the configured domain:
+//
+//   - No domain configured: only the FIRST label of the offered name is
+//     kept (a dotted name has no zone to be contained in, so we refuse to
+//     publish the client-supplied suffix). The result is a bare label.
+//   - Domain configured, dotted name already within the zone (its sanitized
+//     form ends in ".<domain>" or equals the domain's host part): keep it
+//     as-is (e.g. host.sub.example.com under example.com).
+//   - Domain configured, dotted name OUTSIDE the zone (foreign TLD, trailing
+//     dot escapes, double-dot, etc.): take only the FIRST sanitized label of
+//     the offered name and re-append the configured domain, so the published
+//     name is forced back inside the zone (relabel, never reject — a usable
+//     name is still derived).
 func finalizeFQDN(name, domain string) (string, error) {
 	name = strings.TrimSuffix(strings.TrimSpace(name), ".")
+
+	// No configured zone: never honor a client-supplied dotted suffix.
+	// Reduce to the first non-empty sanitized label.
+	if domain == "" {
+		lbl := firstSanitizedLabel(name)
+		if lbl == "" {
+			return "", fmt.Errorf("ddns: hostname %q sanitizes to empty label", name)
+		}
+		return joinLabelDomain(lbl, "")
+	}
+
 	if strings.Contains(name, ".") {
+		// Sanitize the full dotted name, then enforce zone containment. A
+		// name that does not land inside the configured domain is relabeled
+		// to <first-label>.<domain> rather than published outside the zone.
 		fqdn := sanitizeFQDN(name)
-		if fqdn == "" {
+		if fqdn != "" && fqdnWithinDomain(fqdn, domain) {
+			return fqdn, nil
+		}
+		lbl := firstSanitizedLabel(name)
+		if lbl == "" {
 			return "", fmt.Errorf("ddns: name %q sanitizes to empty", name)
 		}
-		return fqdn, nil
+		return joinLabelDomain(lbl, domain)
 	}
+
 	lbl := sanitizeLabel(name)
 	if lbl == "" {
 		return "", fmt.Errorf("ddns: hostname %q sanitizes to empty label", name)
 	}
 	return joinLabelDomain(lbl, domain)
+}
+
+// fqdnWithinDomain reports whether the already-sanitized name is contained
+// in the (already-sanitized) configured domain: either it equals the domain
+// exactly (the zone apex) or it is a subdomain of it (ends in ".<domain>").
+// Both inputs are lower-case sanitized LDH forms, so a plain suffix compare
+// on label boundaries is sufficient and safe.
+func fqdnWithinDomain(name, domain string) bool {
+	if name == domain {
+		return true
+	}
+	return strings.HasSuffix(name, "."+domain)
+}
+
+// firstSanitizedLabel returns the first label of a (possibly dotted) name
+// that sanitizes to a non-empty LDH label, or "" if none do. This is the
+// "take only the first label" zone-containment fallback: the client picks
+// the host part, the firewall picks the zone.
+func firstSanitizedLabel(name string) string {
+	for _, p := range strings.Split(name, ".") {
+		if s := sanitizeLabel(p); s != "" {
+			return s
+		}
+	}
+	return ""
 }
 
 // joinLabelDomain appends domain to a single label (when domain is set),

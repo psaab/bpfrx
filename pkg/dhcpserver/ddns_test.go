@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -123,7 +124,8 @@ func TestDeriveFQDN(t *testing.T) {
 		{"already fqdn passes through", "host.sub.example.com", "", "mac:aa", "example.com", "client-hostname", "host.sub.example.com", false},
 		{"illegal chars stripped", "my_host!*", "", "mac:aa", "example.com", "client-hostname", "myhost.example.com", false},
 		{"no name no domain errors", "", "", "mac:aa", "example.com", "client-hostname", "", true},
-		{"fqdn source prefers client fqdn", "ignored", "real.example.org", "mac:aa", "example.com", "fqdn", "real.example.org", false},
+		{"fqdn source prefers client fqdn (relabeled into zone)", "ignored", "real.example.org", "mac:aa", "example.com", "fqdn", "real.example.com", false},
+		{"fqdn within zone kept", "ignored", "real.dept.example.com", "mac:aa", "example.com", "fqdn", "real.dept.example.com", false},
 		{"mac-fallback synthesizes", "", "", "mac:aabbccddeeff", "example.com", "mac-fallback", "dhcp-macaabbccddeeff.example.com", false},
 		{"bare label no domain", "host", "", "mac:aa", "", "client-hostname", "host", false},
 	}
@@ -143,6 +145,62 @@ func TestDeriveFQDN(t *testing.T) {
 				t.Fatalf("deriveFQDN = %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+// TestDeriveFQDNEnforcesZoneContainment proves a client can never publish a
+// name OUTSIDE the configured domain (the #1387 MAJOR-1 escape boundary).
+// Every escape vector — a dotted name in a foreign TLD, a trailing dot, a
+// double-dot, a deeper foreign subtree — must yield a name contained in the
+// configured zone. Non-tautological: against the pre-fix finalizeFQDN (which
+// returned sanitizeFQDN(name) for any dotted name) every one of these cases
+// publishes outside example.com and the containment assertion fails.
+func TestDeriveFQDNEnforcesZoneContainment(t *testing.T) {
+	const domain = "corp.example.com"
+	// Each input is a client-controlled name that tries to escape the zone.
+	escapeInputs := []struct {
+		name   string
+		offer  string // the client-controlled name fed to the active source
+		want   string // expected published FQDN (must be within domain)
+		source string
+	}{
+		{"foreign tld", "host.attacker.tld", "host.corp.example.com", "client-hostname"},
+		{"sibling public domain", "evil.example.net", "evil.corp.example.com", "client-hostname"},
+		{"trailing dot foreign", "evil.example.net.", "evil.corp.example.com", "client-hostname"},
+		{"double dot", "a..evil.net", "a.corp.example.com", "client-hostname"},
+		{"deep foreign subtree", "a.b.c.attacker.tld", "a.corp.example.com", "client-hostname"},
+		{"fqdn source foreign", "evil.attacker.tld", "evil.corp.example.com", "fqdn"},
+	}
+	for _, tc := range escapeInputs {
+		t.Run(tc.name, func(t *testing.T) {
+			// Route the client-controlled name through whichever source is
+			// active: the client-FQDN option for source=fqdn, the host-name
+			// option otherwise.
+			host, clientFQDN := tc.offer, ""
+			if tc.source == "fqdn" {
+				host, clientFQDN = "ignored", tc.offer
+			}
+			got, err := deriveFQDN(host, clientFQDN, "mac:aa", domain, tc.source)
+			if err != nil {
+				t.Fatalf("deriveFQDN error: %v", err)
+			}
+			// The cardinal assertion: the result is contained in the zone.
+			if got != domain && !strings.HasSuffix(got, "."+domain) {
+				t.Fatalf("name %q ESCAPED zone %q (derived from %q)", got, domain, tc.offer)
+			}
+			if tc.want != "" && got != tc.want {
+				t.Fatalf("deriveFQDN = %q, want %q", got, tc.want)
+			}
+		})
+	}
+
+	// A within-zone dotted name is preserved verbatim (no needless relabel).
+	got, err := deriveFQDN("host.dept.corp.example.com", "", "mac:aa", domain, "client-hostname")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != "host.dept.corp.example.com" {
+		t.Fatalf("within-zone name relabeled: %q", got)
 	}
 }
 
