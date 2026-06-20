@@ -46,6 +46,17 @@ func withFailClosedBootPinnedXDPProbe(t *testing.T, fn func() (bool, error)) {
 	t.Cleanup(func() { failClosedBootHasPinnedXDPLinks = prev })
 }
 
+// withFailClosedBootArmedProbe overrides the authoritative live-forwarding
+// probe (control-socket Enabled && ForwardingArmed). The default probe dials a
+// real unix socket that does not exist in the test sandbox, so every test that
+// reaches stage 2 MUST set this seam to make the decision deterministic.
+func withFailClosedBootArmedProbe(t *testing.T, fn func() (bool, error)) {
+	t.Helper()
+	prev := failClosedBootForwardingArmed
+	failClosedBootForwardingArmed = fn
+	t.Cleanup(func() { failClosedBootForwardingArmed = prev })
+}
+
 // TestColdBootCompileFailedClearsFRR proves the #1993 fix: on a compile-failure
 // cold boot (configCompileFailed=true), the daemon strips the last-good
 // xpf-managed section from frr.conf and reloads FRR exactly once, so peers fail
@@ -106,8 +117,13 @@ func TestColdBootCompileFailedNilFRRIsSafe(t *testing.T) {
 	d.clearFRRForFailClosedBoot(true)
 }
 
-func TestCompileFailedRestartWithPinnedXDPLinksKeepsFRR(t *testing.T) {
+// TestCompileFailedRestartWithLiveForwardingKeepsFRR is the genuine
+// crash-survivor case: pins are present AND the helper control socket reports
+// forwarding is live (Enabled && ForwardingArmed). Only then is the managed
+// section preserved across the restart.
+func TestCompileFailedRestartWithLiveForwardingKeepsFRR(t *testing.T) {
 	withFailClosedBootPinnedXDPProbe(t, func() (bool, error) { return true, nil })
+	withFailClosedBootArmedProbe(t, func() (bool, error) { return true, nil })
 	confPath, sentinel := seededFRRConf(t)
 	rec := &frr.RecordingExecutor{}
 	d := &Daemon{frr: frr.NewForTest(confPath, rec)}
@@ -116,16 +132,55 @@ func TestCompileFailedRestartWithPinnedXDPLinksKeepsFRR(t *testing.T) {
 
 	got := readConf(t, confPath)
 	if !strings.Contains(got, sentinel) {
-		t.Fatalf("pinned XDP links must preserve the managed section on restart; sentinel %q missing:\n%s", sentinel, got)
+		t.Fatalf("live forwarding must preserve the managed section on restart; sentinel %q missing:\n%s", sentinel, got)
 	}
 	if rec.ReloadCalls != 0 {
-		t.Fatalf("pinned XDP links must suppress FRR reloads; got %d reloads", rec.ReloadCalls)
+		t.Fatalf("live forwarding must suppress FRR reloads; got %d reloads", rec.ReloadCalls)
 	}
 }
 
-func TestCompileFailedProbeErrorKeepsFRR(t *testing.T) {
-	withFailClosedBootPinnedXDPProbe(t, func() (bool, error) {
-		return false, errors.New("probe failed")
+// TestCompileFailedRestartPinsPresentButNotArmedClearsFRR is the EXACT
+// #1993-review gap the pin-only guard missed: on a GRACEFUL hitless shutdown the
+// pinned XDP links are intentionally preserved while forwarding is STOPPED. A
+// pin-only guard reads "pins exist" and wrongly PRESERVES FRR, recreating the
+// blackhole. The armed probe (helper reachable but ForwardingArmed=false) is
+// the authoritative signal: pins present + NOT armed MUST CLEAR.
+//
+// Non-tautological against the pin-only code: the pre-fix
+// clearFRRForFailClosedBoot returns early on pinnedXDPLinks==true WITHOUT
+// consulting any forwarding signal, so it would PRESERVE here and this test
+// would FAIL. It only passes once the armed probe gates the preserve decision.
+func TestCompileFailedRestartPinsPresentButNotArmedClearsFRR(t *testing.T) {
+	withFailClosedBootPinnedXDPProbe(t, func() (bool, error) { return true, nil })
+	withFailClosedBootArmedProbe(t, func() (bool, error) { return false, nil }) // helper up, not forwarding
+	confPath, sentinel := seededFRRConf(t)
+	rec := &frr.RecordingExecutor{}
+	d := &Daemon{frr: frr.NewForTest(confPath, rec)}
+
+	d.clearFRRForFailClosedBoot(true)
+
+	got := readConf(t, confPath)
+	if strings.Contains(got, sentinel) {
+		t.Fatalf("pins present but forwarding NOT armed must CLEAR the managed section "+
+			"(graceful-stop false positive); frr.conf still has %q:\n%s", sentinel, got)
+	}
+	begin, _ := frr.ManagedSectionMarkersForTest()
+	if strings.Contains(got, begin) {
+		t.Fatalf("managed begin marker must be gone after clear; frr.conf:\n%s", got)
+	}
+	if rec.ReloadCalls != 1 {
+		t.Fatalf("expected exactly one FRR reload, got %d", rec.ReloadCalls)
+	}
+}
+
+// TestCompileFailedRestartPinsPresentArmedProbeUnreachableClearsFRR covers a
+// crash-or-graceful case where the pins survive but the control socket is gone
+// (probe error: socket missing / connect-refused / timeout). Fail toward
+// clearing: an unknown helper means no live forwarding, so peers must fail over.
+func TestCompileFailedRestartPinsPresentArmedProbeUnreachableClearsFRR(t *testing.T) {
+	withFailClosedBootPinnedXDPProbe(t, func() (bool, error) { return true, nil })
+	withFailClosedBootArmedProbe(t, func() (bool, error) {
+		return false, errors.New("dial unix control.sock: connect: no such file or directory")
 	})
 	confPath, sentinel := seededFRRConf(t)
 	rec := &frr.RecordingExecutor{}
@@ -134,11 +189,35 @@ func TestCompileFailedProbeErrorKeepsFRR(t *testing.T) {
 	d.clearFRRForFailClosedBoot(true)
 
 	got := readConf(t, confPath)
+	if strings.Contains(got, sentinel) {
+		t.Fatalf("an unreachable armed probe must CLEAR (fail toward fail-over), not preserve; frr.conf still has %q:\n%s", sentinel, got)
+	}
+	if rec.ReloadCalls != 1 {
+		t.Fatalf("expected exactly one FRR reload, got %d", rec.ReloadCalls)
+	}
+}
+
+// TestCompileFailedPinProbeErrorFallsThroughToArmedProbe verifies a pin
+// pre-filter error does NOT short-circuit to preserve (the old behavior). It is
+// conservatively treated as "pins may exist" and the authoritative armed probe
+// decides: armed → preserve.
+func TestCompileFailedPinProbeErrorFallsThroughToArmedProbe(t *testing.T) {
+	withFailClosedBootPinnedXDPProbe(t, func() (bool, error) {
+		return false, errors.New("pin readdir failed")
+	})
+	withFailClosedBootArmedProbe(t, func() (bool, error) { return true, nil }) // forwarding live
+	confPath, sentinel := seededFRRConf(t)
+	rec := &frr.RecordingExecutor{}
+	d := &Daemon{frr: frr.NewForTest(confPath, rec)}
+
+	d.clearFRRForFailClosedBoot(true)
+
+	got := readConf(t, confPath)
 	if !strings.Contains(got, sentinel) {
-		t.Fatalf("probe failure must preserve the managed section rather than guess; sentinel %q missing:\n%s", sentinel, got)
+		t.Fatalf("pin-probe error + live forwarding must preserve via the armed probe; sentinel %q missing:\n%s", sentinel, got)
 	}
 	if rec.ReloadCalls != 0 {
-		t.Fatalf("probe failure must suppress FRR reloads; got %d reloads", rec.ReloadCalls)
+		t.Fatalf("pin-probe error + live forwarding must suppress FRR reloads; got %d reloads", rec.ReloadCalls)
 	}
 }
 

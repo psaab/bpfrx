@@ -1,5 +1,34 @@
 # Action Log
 
+## 2026-06-20 — #1993 FRR clear MAJOR fix: require LIVE forwarding, not just pins
+
+- **Timestamp**: 2026-06-20
+- **Action**: Fixed the PR #2041 MAJOR review finding. The pin-only restart
+  guard preserved FRR whenever `xdp_*` pins existed, but pins only prove a
+  link is ATTACHED, not that forwarding is LIVE — a graceful hitless shutdown
+  preserves the pins while `Close()` stops forwarding, so the pin-only guard
+  recreated the blackhole on a graceful restart. Added a control-socket armed
+  probe as the authoritative restart-preserve signal: a lightweight one-shot
+  `status` query against any PRE-EXISTING helper, preserving FRR only when it
+  reports `Enabled && ForwardingArmed`. New `pkg/dataplane/userspace`
+  `ProbeForwardingArmed` + `DefaultControlSocketPath` (reuse
+  `deriveUserspaceConfig` for the path). Reworked
+  `clearFRRForFailClosedBoot` into a two-stage decision behind the pure,
+  testable `failClosedBootShouldClearFRR`: pins absent → CLEAR (cheap
+  pre-filter, skip the probe); pins present (or pin-probe error) → consult
+  the armed probe; preserve only when armed, else CLEAR (fail toward
+  fail-over on socket-missing / refused / timeout / not-armed / error).
+  Added `failClosedBootForwardingArmed` package-var seam. Tests:
+  pins-present-but-NOT-armed → CLEAR (the exact gap; proven to FAIL against
+  pin-only code), pins-present+armed → PRESERVE, armed-probe-unreachable →
+  CLEAR, pin-error-falls-through-to-armed, plus 8 probe unit tests
+  (armed/enabled-only/armed-only/!ok/missing/empty + default-path
+  resolution). Updated `pkg/daemon/README.md`.
+- **File(s)**: pkg/daemon/bootstrap.go,
+  pkg/daemon/frr_failclosed_boot_test.go,
+  pkg/dataplane/userspace/boot_probe.go,
+  pkg/dataplane/userspace/boot_probe_test.go, pkg/daemon/README.md, _Log.md
+
 ## 2026-06-20 — #2034 RA link-local review follow-up (regression test)
 
 - **Timestamp**: 2026-06-20

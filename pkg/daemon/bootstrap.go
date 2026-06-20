@@ -14,11 +14,13 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/psaab/xpf/pkg/fsatomic"
 	"github.com/vishvananda/netlink"
 
 	"github.com/psaab/xpf/pkg/configstore"
+	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 )
 
 // loadErrorClass categorizes a Store.Load error for the boot path (#1917 D1
@@ -89,12 +91,23 @@ const lifelineRecordFile = "/etc/xpf/lifeline-interface"
 // valve).
 const defaultMgmtInterface = "fxp0"
 
-// userspaceShimLinkPinDir carries the pinned XDP links that survive a hitless
-// daemon restart. On a compile-failed restart where those links still exist,
-// the last-known-good dataplane is still attached and forwarding; clearing FRR
-// there would drop peerings despite live forwarding. The #1993 FRR clear is
-// therefore restricted to the unarmed/no-pins case.
+// userspaceShimLinkPinDir carries the pinned XDP links that survive a daemon
+// restart. Pins are a CHEAP PRE-FILTER ONLY (#1993 review): their presence
+// proves "an XDP link is attached", NOT "forwarding is live". On a graceful
+// hitless shutdown the pins are intentionally preserved while forwarding is
+// STOPPED (dp.Close → helper Close leaves pinned maps/links for reuse), so a
+// pin-only guard would wrongly preserve FRR on a graceful restart and recreate
+// the blackhole. Absence of pins is still a reliable "definitely not live"
+// signal (a cold reboot clears the bpffs tmpfs), so it short-circuits to CLEAR
+// without the socket probe. The authoritative live-forwarding decision for the
+// pins-present case is failClosedBootForwardingArmed below.
 const userspaceShimLinkPinDir = "/sys/fs/bpf/xpf/links"
+
+// failClosedBootArmedProbeTimeout bounds the early-boot control-socket probe.
+// Short on purpose: a surviving helper answers status in well under a second,
+// and on a cold boot the socket is absent (immediate ENOENT) — boot must not
+// stall waiting on a dead path.
+const failClosedBootArmedProbeTimeout = 2 * time.Second
 
 var failClosedBootHasPinnedXDPLinks = detectFailClosedBootPinnedXDPLinks
 
@@ -112,6 +125,30 @@ func detectFailClosedBootPinnedXDPLinks() (bool, error) {
 		}
 	}
 	return false, nil
+}
+
+// failClosedBootForwardingArmed reports whether a PRE-EXISTING userspace helper
+// is reachable on its control socket AND reports Enabled && ForwardingArmed —
+// i.e. forwarding is genuinely LIVE right now. This is the authoritative
+// restart-preserve signal (#1993 review MAJOR): unlike the pin pre-filter, it
+// distinguishes a daemon CRASH (helper survives, still forwarding) from a
+// graceful hitless STOP (pins remain, forwarding off). A package-var seam so
+// unit tests drive the decision without a real helper.
+//
+// The control socket is resolved exactly as the runtime Manager resolves it
+// (DefaultControlSocketPath → deriveUserspaceConfig). At a compile-failed boot
+// the active config is nil, so this is the default path — which matches a
+// surviving helper from a default-config deployment. A deployment that set a
+// custom control-socket path resolves to the default here (config is
+// uncompilable), the probe finds nothing, and the caller fails toward CLEARING
+// FRR — the safe direction (treat unknown as not-forwarding).
+var failClosedBootForwardingArmed = detectFailClosedBootForwardingArmed
+
+func detectFailClosedBootForwardingArmed() (bool, error) {
+	// Active config is nil on a compile-failed boot; DefaultControlSocketPath
+	// returns the default control-socket path in that case.
+	sock := dpuserspace.DefaultControlSocketPath(nil)
+	return dpuserspace.ProbeForwardingArmed(sock, failClosedBootArmedProbeTimeout)
 }
 
 // bootClass is the result of the #1922 five-case boot predicate. Each value
@@ -351,13 +388,28 @@ func (d *Daemon) enterBootstrapMode() {
 // SyncApply) re-renders FRR through applyConfigLocked → applyFRRConfig, which
 // re-installs the managed section. So this clear is fully reversible.
 //
-// Scope: gated on compileFailed AND on the absence of pinned XDP links. A
-// fresh/no-config bootstrap (which has no last-good managed section) and every
-// NORMAL boot are byte-identical to before, and a compile-failed daemon
-// RESTART that still has pinned XDP links preserves the last-known-good live
-// forwarding state instead of dropping peerings under active transit. The
-// d.frr != nil guard tolerates NoDataplane daemons (FRR is constructed only
-// inside the !NoDataplane manager-init block).
+// Scope: gated on compileFailed AND on LIVE FORWARDING. The restart-preserve
+// decision requires the helper to be genuinely forwarding, not merely
+// "pins exist" (#1993 review MAJOR): on a graceful hitless shutdown the pins
+// are preserved while forwarding is STOPPED, so a pin-only guard would wrongly
+// preserve FRR and recreate the blackhole. The decision is therefore two-stage:
+//
+//  1. Pins are a CHEAP PRE-FILTER. No pins (e.g. a cold reboot cleared the
+//     bpffs tmpfs) ⇒ no surviving dataplane ⇒ CLEAR, and skip the socket probe.
+//     A pin-probe error is conservatively treated as "may have pins" → fall
+//     through to the authoritative socket probe rather than guessing.
+//  2. With pins present, query the helper control socket
+//     (failClosedBootForwardingArmed): PRESERVE FRR only if it reports
+//     Enabled && ForwardingArmed (a genuine crash-survivor still forwarding).
+//     In EVERY other case — socket missing / connect-refused / timeout /
+//     Enabled=false / ForwardingArmed=false / probe error — CLEAR. An
+//     unarmed/unknown helper means no live forwarding, so peers must fail over
+//     (fail toward clearing).
+//
+// A fresh/no-config bootstrap (which has no last-good managed section) and every
+// NORMAL boot are byte-identical to before. The d.frr != nil guard tolerates
+// NoDataplane daemons (FRR is constructed only inside the !NoDataplane
+// manager-init block).
 //
 // A degraded reload (ErrFRRReloadDegraded, e.g. frr-reload.py unavailable) is
 // LOGGED, not fatal: Clear() has already written the empty managed section to
@@ -368,15 +420,7 @@ func (d *Daemon) clearFRRForFailClosedBoot(compileFailed bool) {
 	if !compileFailed || d.frr == nil {
 		return
 	}
-	pinnedXDPLinks, err := failClosedBootHasPinnedXDPLinks()
-	if err != nil {
-		slog.Warn("fail-closed boot: skipping FRR managed-section clear because the pinned-XDP restart probe failed",
-			"pin_dir", userspaceShimLinkPinDir, "err", err)
-		return
-	}
-	if pinnedXDPLinks {
-		slog.Info("fail-closed boot: preserving FRR managed section because pinned XDP links indicate live dataplane attachments",
-			"pin_dir", userspaceShimLinkPinDir)
+	if !d.failClosedBootShouldClearFRR() {
 		return
 	}
 	if err := d.frr.Clear(); err != nil {
@@ -391,6 +435,54 @@ func (d *Daemon) clearFRRForFailClosedBoot(compileFailed bool) {
 	slog.Warn("fail-closed boot: cleared FRR managed section so peers fail over to the HA " +
 		"partner instead of blackholing transit to this unarmed node. The first compilable " +
 		"'commit confirmed' re-installs the managed section.")
+}
+
+// failClosedBootShouldClearFRR is the pure two-stage decision behind
+// clearFRRForFailClosedBoot (extracted so the exact #1993-review gap — pins
+// present but forwarding NOT live — is unit-testable without touching frr.conf).
+// Returns true to CLEAR, false to PRESERVE.
+//
+// Stage 1 (cheap pre-filter): no pinned XDP links ⇒ no surviving dataplane ⇒
+// CLEAR (and skip the control-socket probe). A pin-probe error does NOT itself
+// preserve FRR — it is conservatively treated as "pins may exist" and falls
+// through to the authoritative socket probe (fail toward the live check, not
+// toward a stale guess).
+//
+// Stage 2 (authoritative): with pins present, PRESERVE only if the helper
+// control socket reports forwarding is genuinely live (Enabled &&
+// ForwardingArmed). Every other outcome — unreachable socket, timeout, probe
+// error, or armed=false — CLEARS, because an unarmed/unknown helper is not
+// forwarding and peers must fail over.
+func (d *Daemon) failClosedBootShouldClearFRR() bool {
+	pinnedXDPLinks, pinErr := failClosedBootHasPinnedXDPLinks()
+	if pinErr != nil {
+		slog.Warn("fail-closed boot: pinned-XDP pre-filter probe failed; "+
+			"falling through to the control-socket armed probe",
+			"pin_dir", userspaceShimLinkPinDir, "err", pinErr)
+	} else if !pinnedXDPLinks {
+		slog.Info("fail-closed boot: no pinned XDP links — last-known-good dataplane is "+
+			"gone (e.g. cold reboot); clearing FRR managed section",
+			"pin_dir", userspaceShimLinkPinDir)
+		return true
+	}
+
+	armed, armErr := failClosedBootForwardingArmed()
+	if armErr != nil {
+		// Unreachable socket / timeout / decode error: NOT live forwarding.
+		// Fail toward clearing so peers fail over rather than blackhole.
+		slog.Warn("fail-closed boot: control-socket forwarding-armed probe failed; "+
+			"treating the dataplane as NOT forwarding and clearing FRR managed section",
+			"err", armErr)
+		return true
+	}
+	if armed {
+		slog.Info("fail-closed boot: helper reports forwarding is live (enabled+armed); " +
+			"preserving FRR managed section across the restart")
+		return false
+	}
+	slog.Info("fail-closed boot: helper is reachable but reports forwarding NOT armed; " +
+		"clearing FRR managed section so peers fail over")
+	return true
 }
 
 // lifelineRecord is the persisted management-NIC identity.
