@@ -548,3 +548,16 @@ evidence, not as active eBPF source-removal blockers.
 - Consider using `openconfig/gnmic` or `netopeer2` for NETCONF server
 - Map to existing gRPC RPCs for config get/set
 - YANG models can be generated from existing config types
+
+---
+
+## #2008 vSRX config-parity closures (Increment 1, batch 1)
+
+Quick-win gaps from the `#2008` parity audit (stored-but-unenforced / schema
+drift) closed in `fix/2008-quickwins-batch1`:
+
+- **M4 `security policies policy-stats system-wide`** — DONE. Per-policy hit
+  counter collection (`collectPolicyCounters` in `pkg/api/metrics_counters.go`)
+  is now gated on `cfg.Security.PolicyStatsEnabled`. Previously the flag
+  compiled into typed state but counters were always collected; Junos only
+  maintains per-policy stats when the knob is enabled (default off).

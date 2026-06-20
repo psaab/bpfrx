@@ -107,6 +107,9 @@ func newDescriptorCoverageStore(t *testing.T) *configstore.Store {
 		"set interfaces lo unit 0 family inet",
 		"set security zones security-zone trust interfaces lo.0",
 		"set security zones security-zone untrust",
+		// Enable policy-stats so collectPolicyCounters emits per-policy hit
+		// counters (gated on this knob since #2008 M4).
+		"set security policy-stats system-wide enable",
 		// Zone-pair policy with count, plus a global policy with count.
 		"set security policies from-zone trust to-zone untrust policy allow match source-address any",
 		"set security policies from-zone trust to-zone untrust policy allow match destination-address any",

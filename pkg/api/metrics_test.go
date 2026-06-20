@@ -485,6 +485,9 @@ security {
         security-zone trust;
         security-zone untrust;
     }
+    policy-stats {
+        system-wide enable;
+    }
     policies {
         from-zone trust to-zone dmz {
             policy plain-allow {
@@ -575,6 +578,47 @@ func TestCollectPolicyCountersExposesSparseAndGlobalPolicyIDs(t *testing.T) {
 		"to_zone":     "*",
 		"policy_name": "global-scheduled",
 	}, 31)
+}
+
+// TestCollectPolicyCountersGatedOnPolicyStats verifies the #2008 M4 gate: when
+// `security policies policy-stats system-wide enable` is absent (the Junos
+// default), collectPolicyCounters must emit no per-policy hit counters even
+// though the dataplane has nonzero values, matching Junos which does not
+// maintain those counters unless the knob is on.
+func TestCollectPolicyCountersGatedOnPolicyStats(t *testing.T) {
+	store := newSchedulerCounterAPIStore(t) // no policy-stats enabled
+	if store.ActiveConfig().Security.PolicyStatsEnabled {
+		t.Fatal("test precondition: policy-stats must be disabled in this store")
+	}
+	scheduledID := scheduledCounterPolicyID(t, store)
+	c := &xpfCollector{
+		srv: &Server{store: store},
+		policyHitsTotal: prometheus.NewDesc(
+			"xpf_policy_hits_total",
+			"policy hits",
+			[]string{"from_zone", "to_zone", "policy_name"},
+			nil,
+		),
+	}
+	dp := &schedulerCounterAPIDP{
+		Manager: dataplane.New(),
+		counters: map[uint32]dataplane.CounterValue{
+			scheduledID: {Packets: 17, Bytes: 1700},
+		},
+	}
+
+	ch := make(chan prometheus.Metric)
+	go func() {
+		c.collectPolicyCounters(ch, dp)
+		close(ch)
+	}()
+	var got []prometheus.Metric
+	for m := range ch {
+		got = append(got, m)
+	}
+	if len(got) != 0 {
+		t.Fatalf("policy-stats disabled: expected 0 policy counters, got %d", len(got))
+	}
 }
 
 func TestEmitThreeColorPolicerCounters(t *testing.T) {

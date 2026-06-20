@@ -121,6 +121,17 @@ func (c *xpfCollector) collectPolicyCounters(ch chan<- prometheus.Metric, dp api
 		return
 	}
 
+	// Honor `set security policies policy-stats system-wide enable` (#2008
+	// M4). Junos collects per-policy hit counters only when policy-stats is
+	// enabled system-wide; without the knob the firewall does not maintain
+	// them. Mirror that: when PolicyStatsEnabled is false (the default), skip
+	// per-policy counter collection entirely so the stored-but-unenforced
+	// divergence is closed. The aggregate `policy_denies_total` counter is
+	// emitted separately (collectGlobalCounters) and is unaffected.
+	if !cfg.Security.PolicyStatsEnabled {
+		return
+	}
+
 	var policySetID uint32
 	for _, zpp := range cfg.Security.Policies {
 		fromZone := zpp.FromZone

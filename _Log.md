@@ -1,5 +1,20 @@
 # Action Log
 
+## 2026-06-20 — #2008 Increment-1 quick-wins batch 1
+
+- **Timestamp**: 2026-06-20
+- **Action**: M4 — gate per-policy hit-counter collection on the
+  `security policies policy-stats system-wide enable` knob. The compiler
+  already set `cfg.Security.PolicyStatsEnabled`, but
+  `collectPolicyCounters` read the dataplane counters unconditionally. Added
+  an early return when the flag is false (Junos default), closing the
+  stored-but-unenforced divergence. Updated the existing metrics test config
+  to enable policy-stats (so it still exercises counter exposure) and added
+  `TestCollectPolicyCountersGatedOnPolicyStats` asserting zero counters when
+  disabled.
+- **File(s)**: pkg/api/metrics_counters.go, pkg/api/metrics_test.go,
+  docs/feature-gaps.md
+
 ## 2026-06-20 — #2049 enforce dynamic-address feed prefixes in the userspace dataplane
 
 - **Timestamp**: 2026-06-20
