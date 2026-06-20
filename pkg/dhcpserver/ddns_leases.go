@@ -80,15 +80,32 @@ func parseActiveLeases(path string, family int, now time.Time) ([]ddnsLease, err
 		return ""
 	}
 
-	// Kea appends rows; the last row for an address is authoritative
-	// (lease renewal / state change). Keep the last seen row per address.
+	// Kea appends rows; the LAST row for an address is authoritative (lease
+	// renewal / state change). We keep the last seen row per address and
+	// emit in first-appearance order. The map value carries the row's final
+	// disposition: a non-empty Address is an active lease to publish, an
+	// empty (zero) value is a tombstone (the last row was inactive/expired)
+	// and is filtered from the output. CRITICAL (#1387 MAJOR-3): an active
+	// row must be able to RECLAIM an address that an earlier row tombstoned
+	// (declined/expired/reclaimed then re-allocated), so we recompute the
+	// disposition on every row and ensure the address is recorded in `order`
+	// whenever it first appears, tombstone or not. Output order is stable;
+	// the tombstone filter at emit time is what drops still-inactive ones.
 	latest := map[string]ddnsLease{}
 	order := []string{}
+	inOrder := map[string]struct{}{}
+	noteAddr := func(addr string) {
+		if _, ok := inOrder[addr]; !ok {
+			inOrder[addr] = struct{}{}
+			order = append(order, addr)
+		}
+	}
 	for _, fields := range records[1:] {
 		addr := get(fields, "address")
 		if addr == "" {
 			continue
 		}
+		noteAddr(addr)
 
 		// State filter: only "default" (active) rows are publishable;
 		// declined / expired-reclaimed rows must NOT have DNS records.
@@ -96,13 +113,10 @@ func parseActiveLeases(path string, family int, now time.Time) ([]ddnsLease, err
 		// default), matching the display parser's lenient stance.
 		if s := get(fields, "state"); s != "" {
 			if st, e := strconv.Atoi(s); e == nil && st != keaStateDefault {
-				// A non-default state for an address supersedes any
-				// earlier active row for it: drop it from the set.
-				if _, seen := latest[addr]; seen {
-					delete(latest, addr)
-				} else {
-					latest[addr] = ddnsLease{} // tombstone, filtered below
-				}
+				// A non-default state for an address supersedes any earlier
+				// row for it: write a tombstone (the address stays in
+				// `order` so a LATER active row can reclaim it).
+				latest[addr] = ddnsLease{}
 				continue
 			}
 		}
@@ -114,9 +128,10 @@ func parseActiveLeases(path string, family int, now time.Time) ([]ddnsLease, err
 			}
 		}
 		// Expiry filter: a lease whose expire epoch is in the past is
-		// stale regardless of state column lag.
+		// stale regardless of state column lag. Tombstone it (a later
+		// active row with a future expire can still reclaim the address).
 		if expire > 0 && now.Unix() >= expire {
-			delete(latest, addr)
+			latest[addr] = ddnsLease{}
 			continue
 		}
 
@@ -134,9 +149,6 @@ func parseActiveLeases(path string, family int, now time.Time) ([]ddnsLease, err
 		} else {
 			l.Identity = identity4(get(fields, "client_id"), get(fields, "hwaddr"))
 		}
-		if _, seen := latest[addr]; !seen {
-			order = append(order, addr)
-		}
 		latest[addr] = l
 	}
 
@@ -144,7 +156,7 @@ func parseActiveLeases(path string, family int, now time.Time) ([]ddnsLease, err
 	for _, addr := range order {
 		l, ok := latest[addr]
 		if !ok || l.Address == "" {
-			continue // tombstoned by a later inactive/expired row
+			continue // tombstoned by the FINAL inactive/expired row
 		}
 		out = append(out, l)
 	}

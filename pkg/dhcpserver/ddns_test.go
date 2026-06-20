@@ -623,6 +623,75 @@ func TestParseActiveLeasesLastRowWins(t *testing.T) {
 	}
 }
 
+// TestParseActiveLeasesInactiveThenActiveReclaim proves the #1387 MAJOR-3
+// boundary: an inactive (declined/expired-reclaimed) row that PRECEDES a
+// later active row for the SAME address must NOT suppress that active row.
+// Last-row-wins means the final active allocation reclaims the address and
+// it appears in the output. Against the pre-fix parser (which tombstoned the
+// address out of the output order and never re-added it when a later active
+// row arrived) the reclaimed address is silently OMITTED, so this test fails
+// pre-fix.
+func TestParseActiveLeasesInactiveThenActiveReclaim(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Unix(1_700_000_000, 0)
+
+	t.Run("inactive then active", func(t *testing.T) {
+		path := filepath.Join(dir, "leases-ia.csv")
+		// 10.0.0.10: declined (state=1) THEN a fresh active allocation.
+		writeCSV(t, path, `address,hwaddr,client_id,valid_lifetime,expire,subnet_id,hostname,state
+10.0.0.10,aa,,3600,1900000000,1,old-decl,1
+10.0.0.10,bb,,3600,1900000000,1,new-active,0
+`)
+		leases, err := parseActiveLeases4(path, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(leases) != 1 {
+			t.Fatalf("reclaimed active lease omitted: got %d leases %+v", len(leases), leases)
+		}
+		if leases[0].Address != "10.0.0.10" || leases[0].HostName != "new-active" {
+			t.Fatalf("wrong reclaimed lease: %+v", leases[0])
+		}
+	})
+
+	t.Run("active inactive active", func(t *testing.T) {
+		path := filepath.Join(dir, "leases-aia.csv")
+		// 10.0.0.20: active, then expired-reclaimed (state=2), then active
+		// again — the FINAL active row must win.
+		writeCSV(t, path, `address,hwaddr,client_id,valid_lifetime,expire,subnet_id,hostname,state
+10.0.0.20,aa,,3600,1900000000,1,first,0
+10.0.0.20,aa,,3600,1900000000,1,gone,2
+10.0.0.20,cc,,3600,1900000000,1,final,0
+`)
+		leases, err := parseActiveLeases4(path, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(leases) != 1 {
+			t.Fatalf("final active row omitted: got %d leases %+v", len(leases), leases)
+		}
+		if leases[0].HostName != "final" {
+			t.Fatalf("active->inactive->active did not keep final: %+v", leases[0])
+		}
+	})
+
+	t.Run("inactive last row still drops", func(t *testing.T) {
+		path := filepath.Join(dir, "leases-final-inactive.csv")
+		// 10.0.0.30: active then declined — final row inactive => dropped.
+		writeCSV(t, path, `address,hwaddr,client_id,valid_lifetime,expire,subnet_id,hostname,state
+10.0.0.30,aa,,3600,1900000000,1,was-active,0
+10.0.0.30,aa,,3600,1900000000,1,now-declined,1
+`)
+		leases, err := parseActiveLeases4(path, now)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(leases) != 0 {
+			t.Fatalf("address with final inactive row should drop: %+v", leases)
+		}
+	})
+}
+
 // ---- state store persistence ----
 
 func TestStateStorePersistsAndReloads(t *testing.T) {
