@@ -75,6 +75,19 @@ func (s *Server) Ping(req *pb.PingRequest, stream grpc.ServerStreamingServer[pb.
 	if count > 100 {
 		count = 100
 	}
+	cmd := buildPingArgv(req, count)
+
+	return streamDiagCmd(stream.Context(), pingExecTimeout(count), cmd, func(line string) error {
+		return stream.Send(&pb.PingResponse{Output: line})
+	})
+}
+
+// buildPingArgv builds the argv for the gRPC Ping diag. The
+// user-supplied target is placed after a "--" end-of-options separator
+// so a "-"-prefixed target is treated as the destination operand rather
+// than a ping flag (option-confusion hardening, #2084). count is the
+// already-clamped probe count.
+func buildPingArgv(req *pb.PingRequest, count int) []string {
 	args := []string{"-c", fmt.Sprintf("%d", count)}
 	if req.Source != "" {
 		args = append(args, "-I", req.Source)
@@ -82,7 +95,7 @@ func (s *Server) Ping(req *pb.PingRequest, stream grpc.ServerStreamingServer[pb.
 	if req.Size > 0 {
 		args = append(args, "-s", fmt.Sprintf("%d", req.Size))
 	}
-	args = append(args, req.Target)
+	args = append(args, "--", req.Target)
 
 	var cmd []string
 	if req.RoutingInstance != "" {
@@ -94,21 +107,30 @@ func (s *Server) Ping(req *pb.PingRequest, stream grpc.ServerStreamingServer[pb.
 	}
 	cmd = append(cmd, "ping")
 	cmd = append(cmd, args...)
-
-	return streamDiagCmd(stream.Context(), pingExecTimeout(count), cmd, func(line string) error {
-		return stream.Send(&pb.PingResponse{Output: line})
-	})
+	return cmd
 }
 
 func (s *Server) Traceroute(req *pb.TracerouteRequest, stream grpc.ServerStreamingServer[pb.TracerouteResponse]) error {
 	if req.Target == "" {
 		return status.Error(codes.InvalidArgument, "target required")
 	}
+	cmd := buildTracerouteArgv(req)
+
+	return streamDiagCmd(stream.Context(), diagTracerouteTimeout, cmd, func(line string) error {
+		return stream.Send(&pb.TracerouteResponse{Output: line})
+	})
+}
+
+// buildTracerouteArgv builds the argv for the gRPC Traceroute diag. The
+// user-supplied target is placed after a "--" end-of-options separator
+// so a "-"-prefixed target is treated as the destination operand rather
+// than a traceroute flag (option-confusion hardening, #2084).
+func buildTracerouteArgv(req *pb.TracerouteRequest) []string {
 	args := []string{}
 	if req.Source != "" {
 		args = append(args, "-s", req.Source)
 	}
-	args = append(args, req.Target)
+	args = append(args, "--", req.Target)
 
 	var cmd []string
 	if req.RoutingInstance != "" {
@@ -120,10 +142,7 @@ func (s *Server) Traceroute(req *pb.TracerouteRequest, stream grpc.ServerStreami
 	}
 	cmd = append(cmd, "traceroute")
 	cmd = append(cmd, args...)
-
-	return streamDiagCmd(stream.Context(), diagTracerouteTimeout, cmd, func(line string) error {
-		return stream.Send(&pb.TracerouteResponse{Output: line})
-	})
+	return cmd
 }
 
 // streamDiagCmd runs a command and streams each line of combined output
