@@ -578,3 +578,12 @@ drift) closed in `fix/2008-quickwins-batch1`:
   performs no TCP sequence-number window validation today, so there is nothing
   to skip. The field gives commit-time validation + completion and is the seam
   a future sequence-checking dataplane would read.
+- **H6 residual — `system login user <name> class` enum validation** — DONE.
+  RBAC was already enforced (`pkg/cli/permissions.go`); the remaining hole was
+  that the `class` leaf accepted any string at commit and `config-viewer` was
+  missing. Added `ValidateEnum` on the `class` schema leaf
+  (`pkg/config/schema_system.go`) with the allowed set derived from
+  `LoginClassPermissions` (`config.ValidLoginClasses()`), and added a
+  `config-viewer` RBAC entry (PermView) so the schema enum and the runtime RBAC
+  table cannot drift. Mirrors the SNMP `authorization` enum leaf. See
+  `docs/system-login.md`.

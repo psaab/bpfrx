@@ -406,11 +406,33 @@ const (
 )
 
 // LoginClassPermissions maps class names to their allowed permissions.
+//
+// The key set here is the authoritative list of system-defined Junos login
+// classes xpf accepts; ValidLoginClasses (and the schema `class` enum, #2008
+// H6) is derived from it so the commit-time validator and the runtime RBAC
+// table can never drift apart.
 var LoginClassPermissions = map[string][]LoginClassPermission{
-	"super-user":   {PermAll},
-	"operator":     {PermView, PermClear, PermControl},
-	"read-only":    {PermView},
-	"unauthorized": {},
+	"super-user":    {PermAll},
+	"operator":      {PermView, PermClear, PermControl},
+	"read-only":     {PermView},
+	// config-viewer can view (including config display, which routes through
+	// `show`) but cannot enter configure to modify, clear, or operate (#2008
+	// H6). Within the current coarse permission model that is PermView only.
+	"config-viewer": {PermView},
+	"unauthorized":  {},
+}
+
+// ValidLoginClasses is the sorted set of system-defined login class names the
+// `system login user <name> class <class>` leaf accepts at commit (#2008 H6).
+// Derived from LoginClassPermissions so the commit-time enum validator and the
+// runtime RBAC table stay in lockstep.
+func ValidLoginClasses() []string {
+	classes := make([]string, 0, len(LoginClassPermissions))
+	for name := range LoginClassPermissions {
+		classes = append(classes, name)
+	}
+	sort.Strings(classes)
+	return classes
 }
 
 // LoginConfig holds user account definitions.

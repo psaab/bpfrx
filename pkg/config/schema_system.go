@@ -113,8 +113,16 @@ var schemaSystem = &schemaNode{desc: "System configuration", children: map[strin
 	}},
 	"login": {desc: "Login configuration", children: map[string]*schemaNode{
 		"user": {desc: "User name", args: 1, placeholder: "<username>", children: map[string]*schemaNode{
-			"uid":   {desc: "User ID", args: 1, placeholder: "<uid>", children: nil},
-			"class": {desc: "Login class", args: 1, placeholder: "<class>", children: nil},
+			"uid": {desc: "User ID", args: 1, placeholder: "<uid>", children: nil},
+			// #2008 H6: enum-validate the login class at commit (RBAC is
+			// already enforced in pkg/cli/permissions.go; this closes the
+			// commit-accepts-any-string hole). The allowed set is derived from
+			// LoginClassPermissions so the schema enum and the runtime RBAC
+			// table cannot drift. Mirrors the SNMP `authorization` enum leaf.
+			"class": {desc: "Login class", args: 1, placeholder: "<class>",
+				valueType: ValueEnumOf, valueDesc: "System-defined login class (super-user | operator | read-only | config-viewer | unauthorized)",
+				valueExamples: []string{"super-user", "operator", "read-only"},
+				validator:     ValidateEnum(ValidLoginClasses()), children: nil},
 			// #1944: close the schema asymmetry the compiler already
 			// half-implemented — give `authentication` a value-bearing
 			// children map (encrypted-password typed leaf + ssh-* keys).

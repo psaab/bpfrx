@@ -46,6 +46,18 @@
   pkg/config/compiler_tcp_session_seqcheck_test.go,
   pkg/config/schema_validate_flow_numwidth_test.go, docs/config-schema.md,
   docs/feature-gaps.md
+- **Timestamp**: 2026-06-20
+- **Action**: H6 residual — enum-validate the `system login user class` value.
+  RBAC was already enforced; closed the commit-accepts-any-string hole. Added
+  ValidateEnum on the `class` schema leaf (allowed set derived from
+  LoginClassPermissions via new config.ValidLoginClasses()), added a
+  `config-viewer` RBAC entry (PermView) so the schema enum and runtime RBAC
+  table can't drift, mirroring the SNMP authorization enum. Added accept/reject
+  + config-viewer + flat-set tests in schema_validate_2008_test.go and the
+  login-class section to docs/system-login.md.
+- **File(s)**: pkg/config/schema_system.go, pkg/config/types_system.go,
+  pkg/config/schema_validate_2008_test.go, docs/system-login.md,
+  docs/feature-gaps.md
 
 ## 2026-06-20 — #2049 enforce dynamic-address feed prefixes in the userspace dataplane
 
