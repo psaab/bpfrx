@@ -321,6 +321,13 @@ pub(super) fn poll_binding_process_descriptor(
                                 telemetry.dbg.session_create += 1;
                                 // Mirror new session to BPF conntrack map for
                                 // `show security flow session` zone/interface display.
+                                // #2008 M5: resolve the application id from the
+                                // 5-tuple so the conntrack entry carries app_id.
+                                let app_id = worker_ctx.forwarding.app_catalog.lookup(
+                                    flow.forward_key.protocol,
+                                    flow.forward_key.src_port,
+                                    flow.forward_key.dst_port,
+                                );
                                 publish_bpf_conntrack_entry(
                                     conntrack_v4_fd,
                                     conntrack_v6_fd,
@@ -329,6 +336,7 @@ pub(super) fn poll_binding_process_descriptor(
                                     &resolved.metadata,
                                     &worker_ctx.forwarding.zone_name_to_id,
                                     worker_ctx.forwarding.alg_disable_flags,
+                                    app_id,
                                 );
                             }
                             // Log first N session hits from WAN (return path)
@@ -901,6 +909,12 @@ pub(super) fn poll_binding_process_descriptor(
                                 ) {
                                     telemetry.counters.session_creates += 1;
                                     telemetry.dbg.session_create += 1;
+                                    // #2008 M5: stamp the resolved application id.
+                                    let app_id = worker_ctx.forwarding.app_catalog.lookup(
+                                        flow.forward_key.protocol,
+                                        flow.forward_key.src_port,
+                                        flow.forward_key.dst_port,
+                                    );
                                     publish_bpf_conntrack_entry(
                                         conntrack_v4_fd,
                                         conntrack_v6_fd,
@@ -909,6 +923,7 @@ pub(super) fn poll_binding_process_descriptor(
                                         &local_metadata,
                                         &worker_ctx.forwarding.zone_name_to_id,
                                         worker_ctx.forwarding.alg_disable_flags,
+                                        app_id,
                                     );
                                 }
                             }
@@ -2800,6 +2815,12 @@ pub(super) fn poll_binding_process_descriptor(
                                                 .session_publish_errors
                                                 .fetch_add(1, Ordering::Relaxed);
                                         }
+                                        // #2008 M5: stamp the resolved app id.
+                                        let app_id = worker_ctx.forwarding.app_catalog.lookup(
+                                            flow.forward_key.protocol,
+                                            flow.forward_key.src_port,
+                                            flow.forward_key.dst_port,
+                                        );
                                         publish_bpf_conntrack_entry(
                                             conntrack_v4_fd,
                                             conntrack_v6_fd,
@@ -2808,6 +2829,7 @@ pub(super) fn poll_binding_process_descriptor(
                                             &entry.metadata,
                                             &worker_ctx.forwarding.zone_name_to_id,
                                             worker_ctx.forwarding.alg_disable_flags,
+                                            app_id,
                                         );
                                         publish_dnat_table_entry(
                                             &worker_ctx.dnat_fds,

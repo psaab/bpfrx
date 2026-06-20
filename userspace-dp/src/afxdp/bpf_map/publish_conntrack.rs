@@ -103,6 +103,7 @@ pub(super) fn publish_v4_session(
     egress_zone_id: u16,
     now_secs: u64,
     alg_disable_flags: u8,
+    app_id: u16,
 ) {
     let alg_type =
         alg_type_for_session(key.protocol, key.src_port, key.dst_port, alg_disable_flags);
@@ -172,7 +173,7 @@ pub(super) fn publish_v4_session(
         reverse_key: rev_key,
         alg_type,
         log_flags: 0,
-        app_id: 0,
+        app_id,
         fib_ifindex: 0,
         fib_vlan_id: 0,
         fib_dmac: [0; 6],
@@ -208,6 +209,7 @@ pub(super) fn publish_v6_session(
     egress_zone_id: u16,
     now_secs: u64,
     alg_disable_flags: u8,
+    app_id: u16,
 ) {
     let alg_type =
         alg_type_for_session(key.protocol, key.src_port, key.dst_port, alg_disable_flags);
@@ -274,7 +276,7 @@ pub(super) fn publish_v6_session(
         reverse_key: rev_key,
         alg_type,
         log_flags: 0,
-        app_id: 0,
+        app_id,
         fib_ifindex: 0,
         fib_vlan_id: 0,
         fib_dmac: [0; 6],

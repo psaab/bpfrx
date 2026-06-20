@@ -348,6 +348,126 @@ impl CompiledApplications {
     }
 }
 
+/// #2008 M5: the L3/L4 application-identification catalog. Resolves a session's
+/// 5-tuple to the numeric `app_id` the dataplane stamps on the conntrack
+/// session so `show security flow session` reports a real application name. The
+/// `app_id` values are assigned on the Go side (`appid.BuildCatalog`) in
+/// lock-step with `CompileResult.AppNames`, which the show path consumes — so a
+/// stamped id round-trips to the correct name.
+///
+/// This is the read-the-id sibling of [`CompiledApplications`] (which only
+/// answers a boolean "does this 5-tuple match the policy's app set?"). Lookup is
+/// grouped by protocol, with exact single-destination-port entries in an O(1)
+/// map and everything else (ranges, port-0/"protocol-only" entries) in a
+/// per-protocol scan list. On overlap the first matching entry wins, which is
+/// the lowest `app_id` because the Go builder emits entries in sorted-name /
+/// ascending-id order; deterministic and stable across reloads.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct AppCatalog {
+    by_protocol: FxHashMap<u8, AppProtoEntries>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct AppProtoEntries {
+    /// app_id keyed by exact destination port, for single-port entries with no
+    /// source-port constraint (the common case).
+    exact_dst: FxHashMap<u16, u16>,
+    /// Entries needing a scan: a port range, a source-port constraint, or no
+    /// destination-port constraint at all (port-0 protocol-only entries). Kept
+    /// in catalog order so the first (lowest-id) match wins.
+    scan: Vec<AppScanEntry>,
+}
+
+#[derive(Clone, Debug)]
+struct AppScanEntry {
+    app_id: u16,
+    dst_low: u16,
+    dst_high: u16,
+    src_low: u16,
+    src_high: u16,
+}
+
+impl AppCatalog {
+    pub(crate) fn from_snapshot(entries: &[crate::AppCatalogEntry]) -> Self {
+        let mut by_protocol: FxHashMap<u8, AppProtoEntries> = FxHashMap::default();
+        for e in entries {
+            // app_id 0 is the reserved "unknown" sentinel; never index it.
+            if e.app_id == 0 {
+                continue;
+            }
+            let bucket = by_protocol.entry(e.protocol).or_default();
+            let single_dst = e.dst_port_low != 0
+                && e.dst_port_low == e.dst_port_high
+                && e.src_port_low == 0
+                && e.src_port_high == 0;
+            if single_dst {
+                // First writer wins (lowest app_id) — matches the scan-list
+                // "first match wins" rule for overlapping configs.
+                bucket.exact_dst.entry(e.dst_port_low).or_insert(e.app_id);
+            } else {
+                bucket.scan.push(AppScanEntry {
+                    app_id: e.app_id,
+                    dst_low: e.dst_port_low,
+                    dst_high: e.dst_port_high,
+                    src_low: e.src_port_low,
+                    src_high: e.src_port_high,
+                });
+            }
+        }
+        Self { by_protocol }
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.by_protocol.is_empty()
+    }
+
+    /// Resolve the app_id for a session 5-tuple. The well-known service port is
+    /// the destination on a forward session and the source on a reverse-keyed
+    /// session, so both port slots are probed — both directions of one session
+    /// then resolve to the same app_id (required because the publisher installs
+    /// forward + reverse conntrack entries). Returns 0 (unknown) when nothing
+    /// matches; 0 is the existing default the show path treats as "no AppID".
+    #[inline]
+    pub(crate) fn lookup(&self, protocol: u8, src_port: u16, dst_port: u16) -> u16 {
+        let Some(bucket) = self.by_protocol.get(&protocol) else {
+            return 0;
+        };
+        // Exact single-port match on either slot (service port = dst forward,
+        // src reverse). Prefer the lower app_id when both slots hit distinct
+        // apps, for determinism.
+        let dst_hit = bucket.exact_dst.get(&dst_port).copied();
+        let src_hit = bucket.exact_dst.get(&src_port).copied();
+        let exact = match (dst_hit, src_hit) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (Some(a), None) | (None, Some(a)) => Some(a),
+            (None, None) => None,
+        };
+        // Scan entries (ranges / protocol-only). Catalog order = ascending id.
+        let in_range = |low: u16, high: u16, p: u16| -> bool {
+            // (0,0) means "no constraint".
+            (low == 0 && high == 0) || (p >= low && p <= high)
+        };
+        let mut scan_hit: Option<u16> = None;
+        for s in &bucket.scan {
+            // Destination-port constraint may be satisfied by either slot, the
+            // same forward/reverse symmetry the exact path uses.
+            let dst_ok = in_range(s.dst_low, s.dst_high, dst_port)
+                || in_range(s.dst_low, s.dst_high, src_port);
+            let src_ok = in_range(s.src_low, s.src_high, src_port)
+                || in_range(s.src_low, s.src_high, dst_port);
+            if dst_ok && src_ok {
+                scan_hit = Some(s.app_id);
+                break;
+            }
+        }
+        match (exact, scan_hit) {
+            (Some(a), Some(b)) => a.min(b),
+            (Some(a), None) | (None, Some(a)) => a,
+            (None, None) => 0,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct PolicyState {
     pub(crate) default_action: PolicyAction,

@@ -173,6 +173,9 @@ pub(super) fn build_forwarding_state_with_policy_counters_and_previous(
     state.allow_dns_reply = snapshot.flow.allow_dns_reply;
     state.allow_embedded_icmp = snapshot.flow.allow_embedded_icmp;
     state.alg_disable_flags = snapshot.flow.alg_disable_flags;
+    // #2008 M5: compile the application-identification catalog so session
+    // create can stamp app_id from the 5-tuple.
+    state.app_catalog = crate::policy::AppCatalog::from_snapshot(&snapshot.app_catalog);
     // #2008 H14: thread `security flow power-mode-disable` into ForwardingState
     // for config truth/parity (single forwarding path; no behavior switch).
     state.power_mode_disable = snapshot.flow.power_mode_disable;
