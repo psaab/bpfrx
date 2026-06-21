@@ -249,6 +249,29 @@ is disconnected, deletes are journaled in a bounded ring.
 The journal is replayed when the next first-post-disconnect connection comes up,
 before `OnPeerConnected` and before the fresh bulk starts.
 
+Replay goes through the ordered send channel (`queueMessage`), so a delete that
+is delivered stays ordered behind any session frames already queued in `sendCh`
+for the peer. (Note: cold-start bulk sync direct-writes session frames under
+`writeMu` rather than via `sendCh`, so flush-vs-bulk wire order is not strictly
+guaranteed; flush still completes — enqueueing all deletes — before bulk
+starts, and a live session landing after a stale delete is the safe direction.)
+If the send queue is full (or the peer disconnects) mid-replay,
+`flushDeleteJournal` does **not** drop the un-sent deletes: it re-journals the
+un-sent tail at the front of the ring (FIFO-preserving, evicting the oldest on
+overflow) so they replay on the next reconnect flush — the same
+journal-on-failure contract `QueueDeleteV4`/`V6` use for runtime deletes (#2121
+fixed an earlier silent drop here). Genuine loss only occurs at the journal cap
+and is counted in `DeletesDropped`.
+
+Because deletes are key-only on the peer (no generation/session-identity guard
+yet), a re-journaled delete that replays after a same-key replacement session
+has been synced can remove the live replacement. This is a pre-existing
+property of the journal (it also applies to `QueueDeleteV4`'s full-queue and
+disconnect journaling); #2121 widens it to the flush path as a deliberate
+trade-off (bounded retention instead of unrecoverable silent loss). Fully
+closing it requires a wire-protocol generation guard on deletes — a tracked
+follow-up.
+
 ## Userspace Session Integration
 
 ### Event Stream (Primary Path)
