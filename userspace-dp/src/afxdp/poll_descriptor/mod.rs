@@ -811,32 +811,64 @@ pub(super) fn poll_binding_process_descriptor(
                             let is_trust_flow = meta.ingress_ifindex == 5
                                 || from_zone == "lan"
                                 || matches!(flow.src_ip, IpAddr::V4(ip) if ip.octets()[0] == 10);
-                            // #2134: per-IP session-limit enforcement at the
-                            // new-flow decision. This dominates BOTH counted
-                            // install sites below (LocalMiss host-inbound and
-                            // ForwardFlow transit), fires exactly once per new
-                            // flow before its session exists, and reads the
-                            // SessionTable count read-only (so an over-limit /
-                            // rejected IP never gets a phantom map entry —
-                            // #2128). Keys on the pre-NAT original src/dst
-                            // (`flow.src_ip`/`flow.dst_ip`), matching Junos
-                            // per-source-IP semantics and the screen stage's
-                            // own tuple. The check itself runs on every
-                            // miss-path flow that reaches this point, ahead of
-                            // the install-class branching below; the reverse /
-                            // transient-seed installs below are simply
-                            // uncounted at the maintenance sites (the
-                            // counted-class predicate excludes them), so they
-                            // never increment the count and an over-limit
-                            // forward flow is what `new_flow_session_limit_drop`
-                            // rejects here.
-                            if let Some(reason) = new_flow_session_limit_drop(
-                                worker_ctx.forwarding,
-                                sessions,
-                                from_zone,
-                                flow.src_ip,
-                                flow.dst_ip,
-                            ) {
+                            // #2210 + #2209: port-scan / IP-sweep screen
+                            // detection at the new-flow / session-MISS
+                            // decision. Running it HERE (not on the per-packet
+                            // pre-session stage) is what fixes the #2210
+                            // false positives: an established flow's packets
+                            // are session HITS and never reach this point, so
+                            // mid-stream ACKs/data no longer inflate the sweep
+                            // counter. port-scan keeps its TCP-initial-SYN
+                            // gate; IP-sweep counts the new flow on any
+                            // protocol. State is per-`(from_zone_id, src_ip)`
+                            // and bounded (see `screen/scan.rs`). The reason
+                            // is `port-scan` / `ip-sweep`; emit + recycle in
+                            // the shared block below.
+                            let new_flow_screen_reason = screen
+                                .scan_sweep_drop_on_new_flow(
+                                    from_zone,
+                                    from_zone_id,
+                                    &{
+                                        let l3_off =
+                                            if meta.ingress_vlan_present != 0 { 18 } else { 14 };
+                                        extract_screen_info(
+                                            packet_frame,
+                                            meta.addr_family,
+                                            meta.protocol,
+                                            meta.tcp_flags,
+                                            meta.pkt_len,
+                                            flow.src_ip,
+                                            flow.dst_ip,
+                                            flow.forward_key.src_port,
+                                            flow.forward_key.dst_port,
+                                            l3_off,
+                                        )
+                                        .unwrap_or_else(|_| screen_parse_error_info(&meta, flow))
+                                    },
+                                    now_secs,
+                                )
+                                // #2134: per-IP session-limit enforcement at the
+                                // new-flow decision. This dominates BOTH counted
+                                // install sites below (LocalMiss host-inbound and
+                                // ForwardFlow transit), fires exactly once per new
+                                // flow before its session exists, and reads the
+                                // SessionTable count read-only (so an over-limit /
+                                // rejected IP never gets a phantom map entry —
+                                // #2128). Keys on the pre-NAT original src/dst
+                                // (`flow.src_ip`/`flow.dst_ip`), matching Junos
+                                // per-source-IP semantics and the screen stage's
+                                // own tuple. Evaluated only if scan/sweep did not
+                                // already decide a drop.
+                                .or_else(|| {
+                                    new_flow_session_limit_drop(
+                                        worker_ctx.forwarding,
+                                        sessions,
+                                        from_zone,
+                                        flow.src_ip,
+                                        flow.dst_ip,
+                                    )
+                                });
+                            if let Some(reason) = new_flow_screen_reason {
                                 let l3_off = if meta.ingress_vlan_present != 0 { 18 } else { 14 };
                                 // The screen verdict is already decided
                                 // (session-limit `reason`); extract_screen_info

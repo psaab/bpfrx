@@ -319,6 +319,48 @@ scales with queue count.
 
 Decision record: `docs/research/2128-2134-screen-session-limit/plan.md`.
 
+## Scan/sweep detection on the new-flow path (#2210; per-zone + bounded #2209)
+
+Port-scan and IP-sweep follow the SAME structural rule as the per-IP
+session limit above: the scan/sweep MUTATION runs at the NEW-FLOW /
+session-MISS decision in `afxdp/poll_descriptor`
+(`ScreenState::scan_sweep_drop_on_new_flow`), NOT on the per-packet
+pre-session screen stage.
+
+- **#2210 (count-after-lookup).** The pre-#2210 code ran IP-sweep on the
+  per-packet stage, which executes BEFORE the session lookup and on every
+  protocol — so mid-stream established TCP ACKs/data and UDP all counted
+  toward the sweep. A single legitimate high-fan-out client (one host with
+  live connections to many backends) would trip IP-sweep without ever
+  sending a probe, and the original #867 ACK-evasion contract ("an ACK
+  that matches a live session is not a sweep probe") was lost. Moving the
+  mutation to the session-MISS hook means an established flow's packets are
+  session HITS and never reach it, so only a genuinely-new flow counts.
+  Port-scan keeps its TCP-initial-SYN gate; IP-sweep counts the new flow
+  on any protocol (a session-miss ACK to many destinations is the
+  ACK-evasion sweep it is meant to catch).
+
+- **#2209 (per-zone + bounded).** The trackers are keyed by
+  `(zone_id, src_ip)` (was a single global per-`src_ip` instance), so a
+  source scanning zone `wan` no longer bleeds its count into the `dmz`
+  threshold evaluation. The backing maps are bounded on both
+  attacker-driven axes: `MAX_SOURCES_PER_ZONE` distinct sources per zone
+  and `MAX_UNIQUE_PER_SOURCE` unique entries per source, with a budgeted
+  per-tick cleanup (`screen/scan.rs`). On overflow the tracker SKIPS the
+  record (degrades to not-counting that source) and bumps a
+  `skipped_pressure` counter — it never grows without bound and never
+  fail-opens the drop (skipping can only make a drop verdict less likely).
+  This mirrors the #2134/#2177 session-limit skip-on-full discipline.
+
+- **Perf (#2209).** The per-packet `check_packet_with_zone_id` no longer
+  clones the whole `ScreenProfile` per screened packet — it borrows it and
+  copies only the small scalar thresholds it needs. The scan/sweep stage
+  reads the profile by zone name only on the cold session-miss path.
+
+Per-worker scoping applies identically to scan/sweep (each worker owns its
+`ScreenState`), so the effective unique-entry count is multiplied by the
+worker count, exactly as documented for the session limit above.
+
 ## Why a slab + integer handles
 
 Pre-#964 the table was `HashMap<Key, Arc<SessionEntry>>`. Reverse-NAT

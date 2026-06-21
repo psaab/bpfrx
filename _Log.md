@@ -1,5 +1,43 @@
 # Action Log
 
+## 2026-06-21 — #2209 + #2210: screen scan/sweep per-zone + bounded + count-after-lookup
+
+- **Timestamp**: 2026-06-21
+- **Action**: One cohesive PR fixing two HIGH screen scan/sweep
+  correctness bugs in the userspace AF_XDP dataplane.
+  - **#2210 (count-after-lookup)**: moved port-scan + IP-sweep MUTATION off
+    the per-packet pre-session screen stage (`check_packet_with_zone_id`)
+    onto a new NEW-FLOW / session-MISS hook
+    (`ScreenState::scan_sweep_drop_on_new_flow`), invoked from
+    `poll_descriptor` next to the #2134 `new_flow_session_limit_drop`. An
+    established flow's packets are session HITS and never reach the hook, so
+    mid-stream ACKs/data/UDP no longer inflate the sweep counter (restores
+    the #867 ACK-evasion contract). Port-scan keeps its initial-SYN gate;
+    IP-sweep counts any new-flow protocol.
+  - **#2209 (per-zone + bounded + perf)**: re-keyed `PortScanTracker` /
+    `IpSweepTracker` from a single global per-`src_ip` map to
+    `(zone_id, src_ip)` (no cross-zone bleed); bounded both axes
+    (`MAX_SOURCES_PER_ZONE=4096`, `MAX_UNIQUE_PER_SOURCE=1024`) with
+    fail-safe skip-on-full + `skipped_pressure` counter (never fail-open the
+    drop, never unbounded growth) and a budgeted per-tick cleanup
+    (`CLEANUP_BUDGET=256`); replaced the per-packet `ScreenProfile::clone()`
+    on the hot path with a borrow (copy only the scalar thresholds needed
+    for the SYN-cookie `&mut self` calls).
+- **File(s)**: `userspace-dp/src/screen/scan.rs` (rewrite — per-zone +
+  bounded + scan_tests), `userspace-dp/src/screen/mod.rs` (borrow not
+  clone; scan/sweep removed from per-packet path; new
+  `scan_sweep_drop_on_new_flow` + `scan_sweep_skipped_pressure` +
+  `maybe_cleanup_trackers`), `userspace-dp/src/afxdp/poll_descriptor/mod.rs`
+  (wire the new-flow scan/sweep hook into the session-miss decision),
+  `userspace-dp/src/screen/tests.rs` (scan/sweep tests retargeted to the
+  miss hook + 4 fail-on-revert tests), `userspace-dp/src/session/README.md`
+  (count-on-miss + per-zone + bounded semantics).
+- **Validation**: `cargo build --release` clean; `cargo test screen` 104/0;
+  10 new tests pass 5x (no flake); fail-on-revert proven for both issues
+  (re-adding pre-session ip_sweep → established-traffic test FAILS;
+  zone-key→global → 3 per-zone tests FAIL). Live screen/flood smoke on the
+  loss cluster is PENDING-PARENT.
+
 ## 2026-06-21 — #2150 PR-1: Ethernet/IPv6 parser correctness sub-fixes + drift canaries
 
 - **Timestamp**: 2026-06-21
