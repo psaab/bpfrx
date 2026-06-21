@@ -32,19 +32,25 @@
 //!   subsequently-arriving REAL scanner is never tracked — and so never
 //!   detected — until `WINDOW_SECS` expiry, which the attacker can defer
 //!   indefinitely by keeping its 4096 sources fresh. The new-source path now
-//!   makes BOUNDED room instead of skipping: it first reclaims any expired
-//!   window found within a FIXED-SIZE sample of the zone's entries, and if
-//!   none is expired it evicts the stalest (oldest `window_start`) entry in
-//!   the sample. A fresh real scanner is therefore ALWAYS admissible. The
-//!   per-new-flow worst case is O(`EVICT_SCAN_LIMIT`) — a fixed sample, NOT
-//!   an O(sources) min-scan over the whole table (a full scan on every
-//!   new flow under a saturation flood would itself be an O(n)-per-packet
-//!   amplifier). The per-zone source count is tracked in `per_zone_count`
-//!   so the cap test is O(1); the only walk is the bounded eviction sample.
-//!   Each eviction bumps `evicted_pressure`, and a rare logarithmic
-//!   threshold crossing surfaces a `scan-table-pressure` screen event (see
-//!   `take_pressure_event`) so the operator is told the detector is
-//!   saturated — never a per-flow log.
+//!   makes BOUNDED room instead of skipping: it scans a FIXED PREFIX of the
+//!   source table (`iter().take(EVICT_SCAN_LIMIT)` — the budget counts EVERY
+//!   iterated entry, same-zone or not), reclaims the first expired same-zone
+//!   window it finds, and if none is expired evicts the stalest (oldest
+//!   `window_start`) same-zone entry within that prefix. Because this branch
+//!   only runs when the TARGET zone alone holds `>= MAX_SOURCES_PER_ZONE`
+//!   keys, same-zone entries are dense in the table and the prefix reliably
+//!   contains a victim, so a fresh real scanner is admissible. The
+//!   per-new-flow worst case is O(`EVICT_SCAN_LIMIT`), NOT an O(sources)
+//!   min-scan over the whole table (a full scan on every new flow under a
+//!   saturation flood would itself be an O(n)-per-packet amplifier). In the
+//!   pathological many-zones-sparsely-interleaved case where the prefix holds
+//!   no same-zone entry, the path degrades back to skip-on-full
+//!   (`skipped_pressure`) — still bounded, never fail-open. The per-zone
+//!   source count is tracked in `per_zone_count` so the cap test is O(1); the
+//!   only walk is the bounded prefix. Each eviction bumps `evicted_pressure`,
+//!   and a rare logarithmic threshold crossing surfaces a
+//!   `scan-table-pressure` screen event (see `take_pressure_event`) so the
+//!   operator is told the detector is saturated — never a per-flow log.
 //!
 //! - **Budgeted cleanup.** The periodic sweep walks the source table
 //!   (`HashMap::retain`, O(sources)) but removes at most `CLEANUP_BUDGET`
@@ -374,10 +380,17 @@ impl<T: std::hash::Hash + Eq> ScanCore<T> {
     #[inline]
     fn take_pressure_event(&mut self) -> bool {
         if self.evicted_pressure >= self.pressure_event_at {
-            // Advance to the next power-of-two boundary at or above the
-            // current count so repeated calls within the same epoch do not
-            // re-fire. saturating_mul keeps it monotone at u64::MAX.
-            self.pressure_event_at = self.evicted_pressure.saturating_add(1).next_power_of_two();
+            // Advance to the next power-of-two boundary above the current
+            // count so repeated calls within the same epoch do not re-fire.
+            // `checked_next_power_of_two` returns None when no power of two
+            // fits in u64 (count > 2^63); saturate to u64::MAX there so the
+            // gate never panics/wraps and simply stops firing (the alarm has
+            // long since been raised). Cannot regress below the current bar.
+            self.pressure_event_at = self
+                .evicted_pressure
+                .saturating_add(1)
+                .checked_next_power_of_two()
+                .unwrap_or(u64::MAX);
             true
         } else {
             false

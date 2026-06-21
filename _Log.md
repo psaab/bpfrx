@@ -9571,3 +9571,24 @@ top.
   userspace-dp/src/afxdp/poll_descriptor/mod.rs,
   userspace-dp/src/afxdp/event_emit.rs, pkg/dataplane/types.go,
   userspace-dp/src/session/README.md, _Log.md
+
+- **Timestamp**: 2026-06-21
+  **Action**: #2234 — applied Copilot-review fixes + loss-cluster smoke.
+  Fixes: (1) take_pressure_event uses checked_next_power_of_two().unwrap_or
+  (u64::MAX) — next_power_of_two() panics/wraps past 2^63; (2/3) tightened
+  scan.rs + README wording (eviction scans a FIXED PREFIX of the whole
+  source table, not "the zone's entries", with the documented same-zone
+  fallback); (4) added emit_screen_alarm_event (RT_FLOW action PERMIT) so the
+  scan-table-pressure alarm is NOT counted as a drop/deny downstream — was
+  riding emit_screen_drop_event (action DENY). New fail-on-revert test
+  screen_alarm_event_is_permit_not_deny. SMOKE on loss userspace cluster
+  (deploy verify-dataplane gate PASSED both nodes; fw1 was RG0 primary;
+  scan-protect screen profile with ip-sweep+port-scan threshold attached to
+  lan+wan; CoS re-applied): iperf3 -P12 -t20 uncapped port 5211 —
+  v4-push 22.9 / v4-rev 22.7 / v6-push 22.5 / v6-rev 22.2 Gbit/s. Screen
+  drops: 0 total, Packets dropped: 0 — legit multi-flow traffic NOT spuriously
+  flagged by scan/sweep. cargo screen 123/0.
+  **File(s)**: userspace-dp/src/screen/scan.rs,
+  userspace-dp/src/afxdp/event_emit.rs,
+  userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/session/README.md, _Log.md

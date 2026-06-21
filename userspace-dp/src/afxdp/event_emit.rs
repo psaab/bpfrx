@@ -153,6 +153,55 @@ pub(super) fn emit_screen_drop_event(
     let _ = event_stream.try_emit_dataplane_event_at(event, now_ns);
 }
 
+/// Emit a screen ALARM event — a `ScreenDrop`-kind event that did NOT drop
+/// the packet (#2234 scan-table-pressure). It shares the screen event frame
+/// so it surfaces alongside other screen activity, but the RT_FLOW action is
+/// PERMIT (the flow forwards), so downstream stats / syslog / dashboards do
+/// NOT count it as a deny/drop. The `reason` maps to a dedicated `screen_id`
+/// bit; the 5-tuple is the source that forced an eviction.
+#[inline]
+pub(super) fn emit_screen_alarm_event(
+    event_stream: Option<&EventStreamWorkerHandle>,
+    pkt: &ScreenPacketInfo,
+    meta: UserspaceDpMeta,
+    ingress_zone_id: u16,
+    reason: &'static str,
+    now_ns: u64,
+) {
+    let Some(event_stream) = event_stream else {
+        return;
+    };
+    let event = DataplaneEventPayload {
+        kind: DataplaneEventKind::ScreenDrop,
+        addr_family: pkt.addr_family,
+        protocol: pkt.protocol,
+        // PERMIT — this is a saturation alarm, not a drop. The packet still
+        // forwards; reporting DENY here would inflate drop/deny counters.
+        action: RT_FLOW_ACTION_PERMIT,
+        src_ip: pkt.src_ip,
+        dst_ip: pkt.dst_ip,
+        src_port: pkt.src_port,
+        dst_port: pkt.dst_port,
+        nat_src_ip: None,
+        nat_dst_ip: None,
+        nat_src_port: 0,
+        nat_dst_port: 0,
+        ingress_zone_id,
+        egress_zone_id: 0,
+        ingress_ifindex: ingress_ifindex_to_wire(meta.ingress_ifindex),
+        policy_id: 0,
+        rule_id: 0,
+        term_id: 0,
+        reason: 0,
+        owner_rg_id: 0,
+        application_id: 0,
+        filter_id: 0,
+        screen_id: screen_reason_id(reason),
+        timestamp_ns: 0,
+    };
+    let _ = event_stream.try_emit_dataplane_event_at(event, now_ns);
+}
+
 /// Build a minimal `ScreenPacketInfo` describing an L3 header that the
 /// screen extractor could NOT parse (#2146 fail-closed path). The
 /// packet bytes are untrustworthy past L3, so only the fields the
@@ -446,6 +495,49 @@ mod tests {
         assert_eq!(event.src_ip, pkt.src_ip);
         assert_eq!(event.dst_ip, pkt.dst_ip);
         assert_eq!(handle.dataplane_event_stats().screen_drop.sent, 1);
+    }
+
+    #[test]
+    fn screen_alarm_event_is_permit_not_deny() {
+        // #2234 fail-on-revert: the scan-table-pressure ALARM must carry the
+        // PERMIT action so downstream stats / syslog / dashboards do NOT count
+        // it as a drop/deny (the packet still forwards). Reverting the alarm
+        // emitter back to emit_screen_drop_event (action=DENY) breaks this.
+        let (handle, rx) = unlimited_handle();
+        let pkt = ScreenPacketInfo {
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_TCP,
+            tcp_flags: TCP_FLAG_SYN,
+            src_ip: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 77)),
+            dst_ip: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 5)),
+            src_port: 40000,
+            dst_port: 443,
+            tcp_seq: 1,
+            tcp_ack: 0,
+            tcp_mss: 1460,
+            pkt_len: 60,
+            is_fragment: false,
+            is_first_fragment: false,
+            ip_ihl: 5,
+            ip_frag_off: 0,
+            ip_total_len: 60,
+        };
+
+        emit_screen_alarm_event(Some(&handle), &pkt, test_meta(), 2, "scan-table-pressure", 789);
+
+        let event = rx
+            .try_recv()
+            .expect("screen alarm frame")
+            .decode_dataplane_event()
+            .expect("screen alarm payload");
+        assert_eq!(event.kind, DataplaneEventKind::ScreenDrop);
+        assert_eq!(
+            event.action, RT_FLOW_ACTION_PERMIT,
+            "a pressure ALARM must not report a drop/deny action"
+        );
+        assert_eq!(event.screen_id, SCREEN_SCAN_TABLE_PRESSURE);
+        assert_eq!(event.src_ip, pkt.src_ip);
+        assert_eq!(event.dst_ip, pkt.dst_ip);
     }
 
     #[test]

@@ -422,18 +422,22 @@ never fail-opened the *forwarding* path, but it suppressed scan/sweep
 *detection*.
 
 The new-source path now makes BOUNDED room instead of skipping. When a brand-
-new `(zone, src_ip)` arrives at a full zone, the tracker reclaims any expired
-window found within a FIXED-SIZE sample (`EVICT_SCAN_LIMIT = 64` entries) of
-the zone, and if none is expired it evicts the STALEST (oldest `window_start`)
-sampled entry. A fresh real scanner is therefore ALWAYS admissible, so the
+new `(zone, src_ip)` arrives at a full zone, the tracker scans a FIXED PREFIX
+of the source table (`iter().take(EVICT_SCAN_LIMIT)`, `EVICT_SCAN_LIMIT = 64`
+— the budget counts EVERY iterated entry, same-zone or not), reclaims the
+first expired same-zone window it finds, and if none is expired evicts the
+STALEST (oldest `window_start`) same-zone entry within that prefix. This
+branch only runs when the TARGET zone alone holds `>= MAX_SOURCES_PER_ZONE`
+keys, so same-zone entries are dense in the table and the prefix reliably
+contains a victim — a fresh real scanner is therefore admissible and the
 detection-suppression cliff is gone. The per-new-flow worst case is
-O(`EVICT_SCAN_LIMIT`) — a fixed prefix of the table, NOT an O(sources)
-min-scan, which under a saturation flood would itself be an O(n)-per-packet
-amplifier. The per-zone source count is maintained incrementally
-(`per_zone_count`) so the cap test is O(1); the only walk is the bounded
-eviction sample. In the pathological many-zones-sparsely-interleaved case
-where the fixed sample finds no same-zone victim, the path degrades back to
-skip-on-full (`skipped_pressure`) — still bounded, still never fail-open.
+O(`EVICT_SCAN_LIMIT`), NOT an O(sources) min-scan over 4096 entries, which
+under a saturation flood would itself be an O(n)-per-packet amplifier. The
+per-zone source count is maintained incrementally (`per_zone_count`) so the
+cap test is O(1); the only walk is the bounded prefix. In the pathological
+many-zones-sparsely-interleaved case where the prefix holds no same-zone
+victim, the path degrades back to skip-on-full (`skipped_pressure`) — still
+bounded, still never fail-open.
 
 Each eviction bumps `evicted_pressure` (surfaced via
 `ScreenState::scan_sweep_evicted_pressure`), and a rare LOGARITHMIC threshold
