@@ -1,7 +1,18010 @@
 # bpfrx Issue History
 
 Complete record of all issues filed and resolved.
-Total: 500 issues (472 closed, 28 open)
+Total: 1111 issues (1074 closed, 37 open)
+
+---
+
+## #6 — test auth check [CLOSED] (closed 2026-03-01)
+
+auth check
+
+---
+
+## #7 — Interface-mode SNAT can select wrong source IP on snat_egress lookup miss [CLOSED] (closed 2026-03-01)
+
+## Summary
+`source-nat interface` can still emit the wrong source IP when `(fwd_ifindex, egress_vlan_id)` lookup in `snat_egress_ips` misses.
+
+## Why this is a bug
+In interface mode, `nat_pool_alloc_iface_v4()`/`nat_pool_alloc_iface_v6()` are expected to use the egress interface IP.
+If lookup misses, both functions **fall back to generic pool allocation**:
+
+- `bpf/xdp/xdp_policy.c:395-396`
+- `bpf/xdp/xdp_policy.c:483`
+
+That generic pool is populated with all to-zone interface addresses collected by the compiler, not the actual egress interface:
+
+- `pkg/dataplane/compiler.go:1828-1833`
+- `pkg/dataplane/compiler.go:1933-1952`
+
+So a miss can select an IP that belongs to a different interface/VRRP role, which matches observed "wrong SNAT IP from wrong interface" behavior.
+
+## Impact
+- Random/intermittent connection failures depending on selected pool IP.
+- Return traffic can be asymmetric or blackholed during failover and mixed-interface zones.
+
+## Suggested fix
+- In interface mode, treat missing `snat_egress_ips` entry as allocation failure (drop/counter), not pool fallback.
+- Add a dedicated counter/trace for egress-key misses.
+- Keep fallback only for explicit non-interface mode.
+
+
+---
+
+## #8 — IPv4 DNAT-before-fabric helper uses fixed L3/L4 offsets [CLOSED] (closed 2026-03-01)
+
+## Summary
+`apply_dnat_before_fabric_redirect()` IPv4 path uses fixed header offsets instead of parser-provided offsets.
+
+## Why this is a bug
+The IPv4 helper currently does:
+
+- `iph = data + sizeof(struct ethhdr)`
+- `l4 = iph + sizeof(struct iphdr)`
+
+at:
+
+- `bpf/xdp/xdp_zone.c:325`
+- `bpf/xdp/xdp_zone.c:334`
+
+This ignores parsed `meta->l3_offset` / `meta->l4_offset` and ignores variable IPv4 header length (`ihl`).
+
+That can rewrite/checksum the wrong bytes when offsets are not the minimal fixed layout (notably IPv4 options).
+
+## Impact
+- Incorrect DNAT-before-fabric rewrite on IPv4 packets with non-minimal header layout.
+- Can cause bad L4 checksum/port rewrite before fabric redirect, leading to drops on peer node.
+
+## Suggested fix
+- Mirror the IPv6 helper pattern and use `meta->l3_offset` / `meta->l4_offset` with bounds checks.
+- Avoid deriving L4 as `iph + sizeof(struct iphdr)` in this helper.
+
+
+---
+
+## #9 — IPv4 DNAT-before-fabric skips port-only DNAT due dst-IP short-circuit [CLOSED] (closed 2026-03-01)
+
+## Summary
+`apply_dnat_before_fabric_redirect()` IPv4 path returns early when destination IP is unchanged, so port-only DNAT is skipped.
+
+## Why this is a bug
+Current early-return condition:
+
+- `if ((void *)(iph + 1) > _de || iph->daddr == meta->dst_ip.v4) return;`
+- `bpf/xdp/xdp_zone.c:326-328`
+
+Port-only DNAT (same IP, translated destination port) still requires L4 destination port + checksum update before fabric redirect.
+
+The IPv6 helper already documents this exact pitfall and avoids it:
+
+- `bpf/xdp/xdp_zone.c:264-266`
+
+## Impact
+- Port-forward rules that keep destination IP but change destination port can fail during fabric redirect paths.
+- Peer may receive packet with stale destination port and fail session/NAT matching.
+
+## Suggested fix
+- Remove the `iph->daddr == meta->dst_ip.v4` short-circuit.
+- Compute `need_addr` and `need_port` separately; always process port rewrite when needed.
+
+
+---
+
+## #10 — Host-inbound filtering defaults to allow for unknown services [CLOSED] (closed 2026-03-01)
+
+## Summary
+Host-inbound enforcement currently allows unrecognized services by default, even when `host-inbound-traffic` is configured.
+
+## Why this is a bug
+`host_inbound_flag()` returns 0 for unknown protocols/ports with explicit "allowed by default" comments:
+
+- `bpf/headers/bpfrx_helpers.h:915-916`
+- `bpf/headers/bpfrx_helpers.h:966`
+
+`xdp_forward` only denies when `flag != 0` and the bit is not allowed:
+
+- `bpf/xdp/xdp_forward.c:96-101`
+
+So any service not mapped to a `HOST_INBOUND_*` bit bypasses host-inbound deny logic.
+
+## Impact
+- Zone host-inbound policy is not default-deny for unknown services.
+- Unexpected control-plane exposure for protocols/ports without explicit mapping.
+
+## Suggested fix
+- Treat unknown service (`flag == 0`) as deny when `host_inbound_flags` is configured and not `HOST_INBOUND_ALL`.
+- Keep explicit allow-list behavior by expanding `host_inbound_flag()` mappings as needed.
+
+
+---
+
+## #11 — CLI: show security flow session nat-only is advertised but not parsed [CLOSED] (closed 2026-03-01)
+
+## Summary
+`show security flow session nat-only` is advertised in command completion/tree but not recognized by the flow-session filter parser.
+
+## Repro
+1. Run: `show security flow session nat-only`
+2. Compare with: `show security flow session nat`
+
+## Actual
+- `nat-only` token is ignored (no NAT-only filtering applied).
+- Only undocumented `nat` token enables `f.natOnly = true`.
+
+## Expected
+- `nat-only` should set NAT-only filtering (or tree/help should stop advertising it).
+
+## Evidence
+- Command tree advertises `nat-only`: `pkg/cmdtree/tree.go:266` and `pkg/cmdtree/tree.go:498`.
+- Parser only accepts `nat`: `pkg/cli/cli.go:2977`.
+
+
+---
+
+## #12 — CLI: show security policies global does not return global-only view [CLOSED] (closed 2026-03-01)
+
+## Summary
+`show security policies global` is documented and present in command tree, but handler does not implement global-only behavior.
+
+## Repro
+Run: `show security policies global`
+
+## Actual
+- The `global` token is not special-cased in `handleShowSecurity`.
+- Command falls through to default policy rendering and can include zone-pair policies, not just global policies.
+
+## Expected
+- Output should match the documented `Global policies:` section and show only global policies.
+
+## Evidence
+- Reference command and expected structure: `docs/junos-cli-reference.md:299`.
+- `global` exists in tree: `pkg/cmdtree/tree.go:158`.
+- Handler only special-cases `hit-count`, `detail`, `brief`: `pkg/cli/cli.go:1187`, `pkg/cli/cli.go:1191`, `pkg/cli/cli.go:1194`.
+- Default path prints zone-pair policies first, then globals: `pkg/cli/cli.go:1253` and `pkg/cli/cli.go:1296`.
+
+
+---
+
+## #13 — CLI: show security ipsec security-associations detail is ignored [CLOSED] (closed 2026-03-01)
+
+## Summary
+`show security ipsec security-associations detail` is documented, but the current IPsec show handler ignores `detail` and always prints the non-detailed format.
+
+## Repro
+Run: `show security ipsec security-associations detail`
+
+## Actual
+- `showIPsec` checks only `args[0] == "security-associations"` and emits one format.
+- Additional arg `detail` is ignored.
+
+## Expected
+- `detail` should invoke a detailed SA formatter aligned with Junos reference.
+
+## Evidence
+- Reference detail command: `docs/junos-cli-reference.md:590`.
+- Current handler path: `pkg/cli/cli.go:5557` through `pkg/cli/cli.go:5584`.
+
+
+---
+
+## #14 — CLI: show interfaces <name> extensive is not implemented [CLOSED] (closed 2026-03-01)
+
+## Summary
+The reference command `show interfaces <name> extensive` is not supported. Current implementation only supports `show interfaces extensive` (all interfaces) or `show interfaces <name> detail`.
+
+## Repro
+Run: `show interfaces ge0 extensive`
+
+## Actual
+- `showInterfaces` does not route `<name> extensive` to a per-interface extensive renderer.
+- Command is treated as generic interface listing filter path.
+
+## Expected
+- `<name> extensive` should render extensive output for the specified interface.
+
+## Evidence
+- Reference command: `docs/junos-cli-reference.md:793`.
+- Current dispatch supports only top-level `extensive` and `<name> detail`: `pkg/cli/cli.go:5944` and `pkg/cli/cli.go:5953`.
+
+
+---
+
+## #15 — CLI: show route destination modifiers exact/longer/orlonger are unsupported [CLOSED] (closed 2026-03-01)
+
+## Summary
+`show route <destination> exact|longer|orlonger` modifiers from the reference are not parsed/handled.
+
+## Repro
+Run examples:
+- `show route 10.0.0.0/24 exact`
+- `show route 10.0.0.0/16 longer`
+- `show route 10.0.0.0/16 orlonger`
+
+## Actual
+- Route handler only treats a single argument as destination lookup.
+- Additional modifier argument causes fallback to generic `showRoutes()` output.
+
+## Expected
+- Parse and apply `exact`, `longer`, and `orlonger` semantics.
+
+## Evidence
+- Reference modifiers: `docs/junos-cli-reference.md:1107` through `docs/junos-cli-reference.md:1115`.
+- Current parser handles destination only when `len(args)==1`: `pkg/cli/cli.go:5184`.
+- Destination formatter currently has no modifier parameter: `pkg/routing/routing.go:796`.
+
+
+---
+
+## #16 — Routing: show route <prefix> CIDR matching logic is narrower than documented [CLOSED] (closed 2026-03-01)
+
+## Summary
+CIDR destination lookup semantics are incorrect for `show route <prefix>`.
+
+## Repro
+Run: `show route 10.0.0.0/8`
+
+## Actual
+- `FormatRouteDestination` checks `routeNet.Contains(destNet.IP)`.
+- For CIDR input, this matches routes containing the network's first IP only (e.g. `10.0.0.0`), not all routes contained within/equal to `10.0.0.0/8`.
+
+## Expected
+- For CIDR input, include routes where route prefix is within (or equal to) requested prefix, matching reference behavior.
+
+## Evidence
+- Reference behavior: `docs/junos-cli-reference.md:1112`.
+- Current implementation: `pkg/routing/routing.go:800` and `pkg/routing/routing.go:822`.
+
+
+---
+
+## #17 — CLI: top-level show bgp summary alias missing [CLOSED] (closed 2026-03-01)
+
+## Summary
+The reference command is `show bgp summary`, but CLI only supports `show protocols bgp summary`.
+
+## Repro
+Run: `show bgp summary`
+
+## Actual
+- Top-level `show` dispatcher has no `bgp` case.
+- BGP summary exists only under `show protocols`.
+
+## Expected
+- Support `show bgp summary` alias for Junos parity.
+
+## Evidence
+- Reference command: `docs/junos-cli-reference.md:1157`.
+- No top-level `case "bgp"` in `handleShow`: `pkg/cli/cli.go:961` onward.
+- Existing implementation under protocols: `pkg/cli/cli.go:5383` and `pkg/cli/cli.go:5392`.
+
+
+---
+
+## #18 — CLI pipe filters are case-insensitive but Junos reference is case-sensitive [CLOSED] (closed 2026-03-01)
+
+## Summary
+Pipe filters `| match`, `| except`, and `| find` are implemented case-insensitively, but reference behavior is case-sensitive.
+
+## Repro
+Run (example):
+- `show interfaces terse | match DOWN`
+
+## Actual
+- Pattern and each line are lowercased before comparison.
+- This matches regardless of case.
+
+## Expected
+- Case-sensitive matching for `match` and `except` (and consistent behavior for `find`).
+
+## Evidence
+- Reference notes case-sensitive behavior: `docs/junos-cli-reference.md:1221` and `docs/junos-cli-reference.md:1238`.
+- Current implementation lowercases both pattern and line: `pkg/cli/cli.go:616`, `pkg/cli/cli.go:623`, `pkg/cli/cli.go:630`.
+
+
+---
+
+## #19 — CLI: show security flow session summary uses non-Junos output schema [CLOSED] (closed 2026-03-01)
+
+## Summary
+`show security flow session summary` output does not follow the Junos summary schema in the reference.
+
+## Repro
+Run: `show security flow session summary`
+
+## Actual
+- Prints custom sections (`Session summary`, IPv4/IPv6/NAT, by protocol, by zone pair).
+- Always appends `Total sessions: N` line.
+
+## Expected
+- Junos-style counters:
+  - `Unicast-sessions`, `Multicast-sessions`, `Services-offload-sessions`, `Failed-sessions`, etc.
+  - Indented sub-lines for valid/pending/invalidated/other.
+
+## Evidence
+- Reference schema: `docs/junos-cli-reference.md:125` through `docs/junos-cli-reference.md:145`.
+- Current summary formatter: `pkg/cli/cli.go:3343` through `pkg/cli/cli.go:3370`.
+
+
+---
+
+## #20 — CLI: show security flow session format diverges from Junos reference [CLOSED] (closed 2026-03-01)
+
+## Summary
+`show security flow session` output format materially differs from Junos reference.
+
+## Repro
+Run: `show security flow session`
+
+## Actual
+- Header uses `Policy:`/`State:`/`Age:`/`Idle:` fields in custom format.
+- Session ID printed from local counter (`count`) instead of dataplane session ID.
+- Output uses separate `NAT:` lines and omits Junos-style `Out:` line format with `Conn Tag`, `If`, packet/byte fields on In/Out lines.
+
+## Expected
+- Match reference structure:
+  - `Session ID: <id>, Policy name: <name>/<index>, HA State: <...>, Timeout: <...>, Session State: <...>`
+  - `In:` and `Out:` lines with `Conn Tag`, interface, packet/byte counters, trailing comma.
+
+## Evidence
+- Reference format: `docs/junos-cli-reference.md:72` through `docs/junos-cli-reference.md:101`.
+- Current formatter: `pkg/cli/cli.go:3203` through `pkg/cli/cli.go:3226` and `pkg/cli/cli.go:3313` through `pkg/cli/cli.go:3336`.
+
+
+---
+
+## #21 — CLI: show arp no-resolve syntax and output format do not match reference [CLOSED] (closed 2026-03-01)
+
+## Summary
+`show arp no-resolve` command/format diverges from reference: parser ignores `no-resolve`, and output schema is different.
+
+## Repro
+Run: `show arp no-resolve`
+
+## Actual
+- Top-level show handler always calls `showARP()` and does not parse/validate `no-resolve`.
+- Output includes non-reference summary/state columns (`Total entries (...)`, per-interface counts, `State` column).
+
+## Expected
+- Accept/validate `no-resolve` syntax and emit Junos-style ARP table layout.
+
+## Evidence
+- Reference command + expected table: `docs/junos-cli-reference.md:1193`.
+- `handleShow` ARP path ignores args: `pkg/cli/cli.go:1108`.
+- Current ARP formatter behavior: `pkg/cli/cli.go:10044` through `pkg/cli/cli.go:10103`.
+
+
+---
+
+## #22 — CLI: show system processes summary is not implemented (raw ps output only) [CLOSED] (closed 2026-03-01)
+
+## Summary
+`show system processes summary` is documented, but CLI ignores `summary` and always executes raw `ps aux --sort=-rss` output.
+
+## Repro
+Run: `show system processes summary`
+
+## Actual
+- `handleShowSystem` routes any `processes` invocation directly to `showSystemProcesses()`.
+- `showSystemProcesses()` shells out to `ps aux --sort=-rss`.
+
+## Expected
+- Parse `summary` and render Junos-like summary/top output (or return explicit syntax guidance if unsupported).
+
+## Evidence
+- Reference command and expected format: `docs/junos-cli-reference.md:870`.
+- Dispatch ignores sub-args: `pkg/cli/cli.go:7024`.
+- Implementation: `pkg/cli/cli.go:9992`.
+
+
+---
+
+## #23 — CLI: show security policies default output format does not match Junos reference [CLOSED] (closed 2026-03-01)
+
+## Summary
+`show security policies` output format diverges from Junos reference layout.
+
+## Repro
+Run: `show security policies`
+
+## Actual
+- Uses custom `Rule: ... (id: ...)` and `Match: src=%v dst=%v app=%v` lines.
+- Does not emit Junos-style policy metadata line (`Policy: <name>, State: enabled, Index: ...`).
+
+## Expected
+- Emit Junos hierarchy with:
+  - `From zone: X, To zone: Y`
+  - 2-space `Policy:` metadata lines
+  - 4-space field lines (`Source addresses`, `Destination addresses`, `Applications`, etc.)
+
+## Evidence
+- Reference format: `docs/junos-cli-reference.md:176` through `docs/junos-cli-reference.md:220`.
+- Current formatter: `pkg/cli/cli.go:1263` through `pkg/cli/cli.go:1290`.
+
+
+---
+
+## #24 — CLI: show security log output format is not Junos RT_FLOW style [CLOSED] (closed 2026-03-01)
+
+## Summary
+`show security log` output is a custom event line format, not Junos SD-SYSLOG/RT_FLOW style described in the reference.
+
+## Repro
+Run: `show security log`
+
+## Actual
+- Emits internal event-buffer lines like `SESSION_CLOSE` / `SCREEN_DROP` with custom key ordering.
+- Appends `(<n> events shown)` footer.
+
+## Expected
+- Structured Junos-like security log output (RT_FLOW style fields) for parity mode/reference compatibility.
+
+## Evidence
+- Reference expectation (RT_FLOW SD-SYSLOG example): `docs/junos-cli-reference.md:658` through `docs/junos-cli-reference.md:669`.
+- Current formatter: `pkg/cli/cli.go:5814` through `pkg/cli/cli.go:5925`.
+
+
+---
+
+## #25 — CLI: show security zones output format diverges from Junos reference [CLOSED] (closed 2026-03-01)
+
+## Summary
+`show security zones` output format is custom and differs from the Junos reference block format.
+
+## Repro
+Run: `show security zones`
+
+## Actual
+- Zone header is `Zone: <name>`, optional `(id: N)`.
+- Includes custom sections (`Traffic statistics`, `Policy summary`, global address-book list) not in reference output.
+- Does not emit the expected `Security zone: <name>` field ordering.
+
+## Expected
+- Emit Junos-style zone blocks with canonical fields/order:
+  - `Security zone: <name>`
+  - `Zone ID`, `Send reset...`, `Policy configurable`, `Interfaces bound`, `Interfaces`, etc.
+
+## Evidence
+- Reference format: `docs/junos-cli-reference.md:336` through `docs/junos-cli-reference.md:383`.
+- Current formatter: `pkg/cli/cli.go:1622` through `pkg/cli/cli.go:1681` (and additional custom sections through `pkg/cli/cli.go:1804`).
+
+
+---
+
+## #26 — CLI: show security policies hit-count column layout does not match reference [CLOSED] (closed 2026-03-01)
+
+## Summary
+`show security policies hit-count` table format differs from Junos reference columns.
+
+## Repro
+Run: `show security policies hit-count`
+
+## Actual
+- Table columns are `From zone`, `To zone`, `Policy`, `Action`, `Packets`, `Bytes`.
+- Missing Junos `Index`, `Name`, `Policy count` layout and logical-system header.
+
+## Expected
+- Junos-style hit-count table with index and policy-count schema from reference.
+
+## Evidence
+- Reference table: `docs/junos-cli-reference.md:276` through `docs/junos-cli-reference.md:292`.
+- Current formatter header and rows: `pkg/cli/cli.go:1415` and `pkg/cli/cli.go:1446`.
+
+
+---
+
+## #27 — CLI: show security policies detail output diverges from Junos reference schema [CLOSED] (closed 2026-03-01)
+
+## Summary
+`show security policies detail ...` output structure is not aligned with the Junos detail format in the reference.
+
+## Repro
+Run: `show security policies detail from-zone <z1> to-zone <z2>`
+
+## Actual
+- Starts with `Policy: <from> -> <to>, State: enabled` wrapper.
+- Uses a custom nested `Match`/`Then` block format.
+- Omits key Junos fields and ordering from the reference detail output.
+
+## Expected
+- Junos-style detail entries with header:
+  - `Policy: <name>, action-type: ... , State: enabled, Index: ...`
+  - Followed by canonical `Policy Type`, `Sequence number`, zone line, address/application blocks, etc.
+
+## Evidence
+- Reference detail format: `docs/junos-cli-reference.md:230` through `docs/junos-cli-reference.md:270`.
+- Current formatter: `pkg/cli/cli.go:1490` through `pkg/cli/cli.go:1538`.
+
+
+---
+
+## #28 — CLI: show security alg status command/format parity gaps [CLOSED] (closed 2026-03-01)
+
+## Summary
+`show security alg status` parity gaps:
+- Command tree/completion does not expose `status` subkeyword.
+- Output format/content diverges from reference (`ALG Status:` header, capitalized Enabled/Disabled, fuller ALG list).
+
+## Repro
+Run:
+- `show security alg status`
+- `show security alg`
+
+## Actual
+- `alg` is treated as terminal command; extra `status` token is ignored.
+- Output header is `ALG (Application Layer Gateway) status:`.
+- Only a small subset of ALG names is shown, and values are lowercase `enabled/disabled`.
+
+## Expected
+- Support/document `show security alg status` explicitly and match reference table style.
+
+## Evidence
+- Reference command and format: `docs/junos-cli-reference.md:526` through `docs/junos-cli-reference.md:553`.
+- Command tree lacks `status` child under `alg`: `pkg/cmdtree/tree.go:243`.
+- Dispatcher routes `alg` directly: `pkg/cli/cli.go:1371`.
+- Current formatter output: `pkg/cli/cli.go:8577` through `pkg/cli/cli.go:8599`.
+
+
+---
+
+## #29 — Routing: show route summary missing Junos Highwater Mark section [CLOSED] (closed 2026-03-01)
+
+## Summary
+`show route summary` omits the Junos-style Highwater Mark section documented in the reference.
+
+## Repro
+Run: `show route summary`
+
+## Actual
+- Formatter prints `Router ID` and per-table protocol counts only.
+- No Highwater Mark block (RIB/FIB/VRF watermark lines).
+
+## Expected
+- Include Highwater Mark section (or clearly document intentional non-parity mode).
+
+## Evidence
+- Reference summary includes Highwater Mark block: `docs/junos-cli-reference.md:1121` through `docs/junos-cli-reference.md:1130`.
+- Current summary formatter lacks this section: `pkg/routing/routing.go:854` through `pkg/routing/routing.go:872`.
+
+
+---
+
+## #30 — Compiler: policy expansion can overflow MaxRulesPerPolicy and spill into adjacent sets [CLOSED] (closed 2026-03-01)
+
+## Summary
+`compilePolicies` does not enforce `MaxRulesPerPolicy` (256) after application expansion, so large policy/app expansions can write rules past the policy-set boundary.
+
+## Why this is a bug
+- Rule storage is flattened as `idx = policySetID*MaxRulesPerPolicy + ruleIndex`.
+- If `ruleIndex >= 256`, writes spill into the next policy-set slot range.
+- The compiled `PolicySet.NumRules` still advertises the large count, but BPF evaluation loops only to `MAX_RULES_PER_POLICY` per set, creating inconsistent behavior.
+
+## Evidence
+- No cap before setting `NumRules` and writing rule indexes:
+  - `pkg/dataplane/compiler.go:1450`
+  - `pkg/dataplane/compiler.go:1504`
+  - `pkg/dataplane/compiler.go:1572`
+  - `pkg/dataplane/compiler.go:1621`
+- Flattened index math:
+  - `pkg/dataplane/maps.go:41`
+- Max per-set constant:
+  - `pkg/dataplane/types.go:331`
+- BPF loop bound:
+  - `bpf/xdp/xdp_policy.c:1190`
+
+## Repro idea
+1. Create a single zone-pair policy-set where one policy expands to >256 app terms (or many policies whose expanded total >256).
+2. Commit config and inspect `policy_rules` map indexes.
+3. Observe writes into indexes belonging to subsequent policy sets.
+
+## Expected
+Compiler should hard-fail when expanded rules exceed `MaxRulesPerPolicy` (or split deterministically with explicit semantics).
+
+
+---
+
+## #31 — Compiler: NAT rule counter IDs can exceed nat_rule_counters capacity [CLOSED] (closed 2026-03-01)
+
+## Summary
+NAT rule counter IDs are allocated monotonically with no bound check, but the `nat_rule_counters` map has a fixed max of 256 entries.
+
+## Why this is a bug
+- Compiler increments `result.nextNATCounterID` per SNAT rule (including expanded address pairs sharing same ID) without validating capacity.
+- `CounterID` is stored in SNAT rule values and used as lookup key in BPF.
+- Once counter IDs exceed map capacity, lookups fail and counters stop incrementing for those rules.
+
+## Evidence
+- Counter allocation with no cap:
+  - `pkg/dataplane/compiler.go:1700`
+  - `pkg/dataplane/compiler.go:2011`
+- Map capacity constant:
+  - `pkg/dataplane/types.go:415`
+  - `bpf/headers/bpfrx_common.h:150`
+- Runtime counter lookup by key:
+  - `bpf/xdp/xdp_policy.c:1291`
+  - `bpf/xdp/xdp_policy.c:1566`
+
+## Expected
+Compiler should fail once configured NAT rule counters exceed `MAX_NAT_RULE_COUNTERS` (or add deterministic reuse/indexing strategy).
+
+
+---
+
+## #32 — Compiler: NAT64 auto-assigned source pools ignore map-write failures and pool-capacity limits [CLOSED] (closed 2026-03-01)
+
+## Summary
+NAT64 auto-assigned source-pool path does not check map update errors and does not enforce NAT pool ID capacity before incrementing.
+
+## Why this is a bug
+When a NAT64 rule references a source pool that SNAT did not allocate, compiler auto-assigns a new pool ID and writes pool IP/config entries. In this path:
+- `SetNATPoolIPV4`, `SetNATPoolIPV6`, and `SetNATPoolConfig` errors are ignored.
+- `result.NextPoolID` is incremented with no explicit guard against `MAX_NAT_POOLS` (32).
+
+This can yield a successful compile with partially missing pool programming.
+
+## Evidence
+- Auto-assign and increment without bound check:
+  - `pkg/dataplane/compiler.go:2545`
+  - `pkg/dataplane/compiler.go:2546`
+- Ignored map write errors:
+  - `pkg/dataplane/compiler.go:2575`
+  - `pkg/dataplane/compiler.go:2578`
+  - `pkg/dataplane/compiler.go:2584`
+- Pool capacity in dataplane:
+  - `bpf/headers/bpfrx_common.h:148`
+
+## Expected
+- Hard-fail when `NextPoolID` reaches pool capacity.
+- Propagate all map update errors in the NAT64 auto-assignment path.
+
+
+---
+
+## #33 — Compiler: static NAT mixed IPv4/IPv6 rules are not rejected [CLOSED] (closed 2026-03-01)
+
+## Summary
+`compileStaticNAT` accepts mixed-family rules (IPv4<->IPv6) and routes them through the IPv6 path instead of rejecting them.
+
+## Why this is a bug
+Current branch condition is:
+- IPv4 path only when **both** `extIP` and `intIP` are IPv4.
+- Otherwise it falls into IPv6 path.
+
+So a mixed rule like `match 203.0.113.10` + `then 2001:db8::10` is treated as IPv6 static NAT rather than a validation error.
+
+## Evidence
+- Family branch logic:
+  - `pkg/dataplane/compiler.go:2317`
+  - `pkg/dataplane/compiler.go:2329`
+
+## Expected
+Compiler should reject mixed-family static NAT rules explicitly (require v4->v4 or v6->v6).
+
+
+---
+
+## #34 — Compiler: DNAT CIDR inputs lose mask semantics (compiled as single IP) [CLOSED] (closed 2026-03-01)
+
+## Summary
+DNAT compiler accepts CIDR inputs but drops prefix semantics by converting them to a single host key.
+
+## Why this is a bug
+`rule.Match.DestinationAddress` and `pool.Address` are parsed with `net.ParseCIDR`, but only the IP part is used when building DNAT keys/values. Any configured mask/range semantics are ignored.
+
+## Evidence
+- CIDR parse result mask is discarded:
+  - `pkg/dataplane/compiler.go:2112`
+  - `pkg/dataplane/compiler.go:2124`
+- DNAT key uses exact destination IP only:
+  - `pkg/dataplane/compiler.go:2208`
+  - `pkg/dataplane/compiler.go:2210`
+
+## Impact example
+`destination-address 203.0.113.0/24` compiles as exact match for only `203.0.113.0`, not the /24.
+
+## Expected
+Either:
+- reject non-host CIDRs explicitly for DNAT entries, or
+- implement proper prefix/range matching semantics.
+
+
+---
+
+## #35 — Compiler: port-mirroring interface lookup skips LinuxIfName normalization [CLOSED] (closed 2026-03-01)
+
+## Summary
+`compilePortMirroring` resolves interfaces using raw configured names and does not normalize Junos-style names to Linux names.
+
+## Why this is a bug
+Elsewhere in dataplane compilation, interface references are normalized via `config.LinuxIfName(...)`. Port mirroring uses `net.InterfaceByName(inst.Output)` / `net.InterfaceByName(inputIface)` directly, so names like `ge-0/0/0` are likely to fail lookup on Linux (`/` not valid in kernel ifname).
+
+## Evidence
+- Raw lookup without normalization:
+  - `pkg/dataplane/compiler.go:3861`
+  - `pkg/dataplane/compiler.go:3871`
+- Existing normalization helper:
+  - `pkg/config/types.go:8`
+
+## Expected
+Normalize configured interface names with `config.LinuxIfName` before `net.InterfaceByName` in port-mirroring compilation.
+
+
+---
+
+## #36 — Performance: policy evaluation scans rules linearly with per-rule map lookups [CLOSED] (closed 2026-03-01)
+
+## Summary
+XDP policy evaluation performs a linear scan over rules with a map lookup per rule on every new-flow packet.
+
+## Why this hurts performance
+On the hot path (`xdp_policy_prog`), every packet entering policy evaluation:
+1. resolves policy-set,
+2. iterates rules from `0..num_rules`,
+3. does `bpf_map_lookup_elem(&policy_rules, &rule_idx)` per iteration,
+4. runs address/protocol/port/app checks.
+
+This is O(N rules) per packet for the selected zone pair, with map lookup overhead inside the loop.
+
+## Evidence
+- Rule loop and per-rule map lookup:
+  - `bpf/xdp/xdp_policy.c:1186`
+  - `bpf/xdp/xdp_policy.c:1190`
+  - `bpf/xdp/xdp_policy.c:1195`
+- Two-level design currently relies on flat array lookups per rule:
+  - `bpf/headers/bpfrx_maps.h:133`
+
+## Improvement ideas
+- Add protocol/app buckets (compile-time index) to reduce candidate set before full match checks.
+- Add fast-path cache for recent `(zone-pair, proto, dst-port, app-id)` -> rule-id decisions.
+- Consider pre-materialized compact per-policy-set rule slices to minimize per-packet map lookups.
+
+
+---
+
+## #37 — Performance: replace hot-path zone_pair_policies hash lookup with array indexing [CLOSED] (closed 2026-03-01)
+
+## Summary
+`zone_pair_policies` is implemented as a hash map and looked up on every packet, even though zone IDs are bounded and indexable.
+
+## Why this hurts performance
+The policy entry lookup is on the hot path for every packet and currently performs hash lookups for:
+- `(ingress_zone, egress_zone)`
+- optional fallback `(0,0)`
+
+Given bounded zone IDs (`MAX_ZONES`), this can be represented as array indexing to avoid hashing and pointer chasing.
+
+## Evidence
+- Hot-path lookups:
+  - `bpf/xdp/xdp_policy.c:1104`
+  - `bpf/xdp/xdp_policy.c:1108`
+- Current map type is HASH:
+  - `bpf/headers/bpfrx_maps.h:170`
+- Key space is bounded by zones:
+  - `bpf/headers/bpfrx_maps.h:171`
+
+## Improvement ideas
+- Replace `zone_pair_policies` with an ARRAY keyed by flattened index: `from_zone * MAX_ZONES + to_zone`.
+- Reserve index `0` (or explicit sentinel) for global fallback semantics.
+
+
+---
+
+## #38 — Performance: SNAT compile repeats pool parse/map writes for every referencing rule [CLOSED] (closed 2026-03-01)
+
+## Summary
+SNAT compile path reparses and rewrites the same source NAT pool for every rule referencing that pool.
+
+## Why this hurts performance
+In pool mode, even when a pool ID already exists, compiler still:
+- reparses all pool addresses,
+- rebuilds pool config/deterministic fields,
+- rewrites all pool IP slots and pool config map entries.
+
+With many rules sharing a pool, compile cost scales with `rules * pool_size` instead of `pool_size + rules`.
+
+## Evidence
+- Existing-ID branch does not skip pool parse/write work:
+  - `pkg/dataplane/compiler.go:1882`
+  - `pkg/dataplane/compiler.go:1890`
+- Pool IP/config writes executed per rule:
+  - `pkg/dataplane/compiler.go:1951`
+  - `pkg/dataplane/compiler.go:1959`
+  - `pkg/dataplane/compiler.go:1967`
+
+## Improvement ideas
+- Cache compiled pool material by pool name/ID within a compile pass.
+- Only write pool IP/config once per unique pool, then reference pool ID from rules.
+
+
+---
+
+## #39 — Performance: SNAT rule matching does linear hash-probing in XDP hot path [CLOSED] (closed 2026-03-01)
+
+## Summary
+Dynamic SNAT rule selection does linear probing over hash map entries per packet/new flow.
+
+## Why this hurts performance
+For both IPv4 and IPv6 permit paths, SNAT selection iterates `rule_idx` and does hash lookups against `snat_rules` / `snat_rules_v6` until match/break. This multiplies map lookup cost by number of SNAT rules per zone-pair.
+
+## Evidence
+- IPv4 SNAT iteration:
+  - `bpf/xdp/xdp_policy.c:1272`
+  - `bpf/xdp/xdp_policy.c:1275`
+- IPv6 SNAT iteration:
+  - `bpf/xdp/xdp_policy.c:1547`
+  - `bpf/xdp/xdp_policy.c:1550`
+- SNAT maps are HASH keyed by `(from_zone,to_zone,rule_idx)`:
+  - `bpf/headers/bpfrx_maps.h:452`
+  - `bpf/headers/bpfrx_maps.h:476`
+  - `bpf/headers/bpfrx_maps.h:533`
+
+## Improvement ideas
+- Maintain per-zone-pair rule-count/offset and store rules in array-backed layout for O(1) sequential access without hash lookups.
+- Add compile-time prefilter dimensions (e.g., src/dst addr-id buckets) to reduce candidate scans.
+
+
+---
+
+## #40 — Performance: compile interface setup relies on repeated ethtool subprocess calls [CLOSED] (closed 2026-03-01)
+
+## Summary
+Compile path shells out to `ethtool` per interface (`-k` check and potentially `-K` / `-s`), adding process-spawn overhead on every compile.
+
+## Why this hurts performance
+Compilation currently performs external command execution in interface loops. With many interfaces, commit/compile latency includes repeated process startup and text parsing costs.
+
+## Evidence
+- rxvlan state check invokes subprocess:
+  - `pkg/dataplane/compiler.go:3822`
+- per-interface rxvlan off command in compile loop:
+  - `pkg/dataplane/compiler.go:587`
+  - `pkg/dataplane/compiler.go:588`
+- speed/duplex application also shells out:
+  - `pkg/dataplane/compiler.go:3837`
+
+## Improvement ideas
+- Move ethtool state handling to netlink/ethtool API bindings (no subprocess).
+- Cache known-offload/speed state per interface and only apply on actual config deltas.
+
+
+---
+
+## #41 — Performance: compiler does repeated interface/link lookups without per-pass caching [CLOSED] (closed 2026-03-01)
+
+## Summary
+Compiler repeatedly resolves the same interfaces/links/addresses with `net.InterfaceByName` and `netlink.LinkBy*` across multiple loops instead of caching per compile pass.
+
+## Why this hurts performance
+Large interface configs and multi-zone references cause repeated syscall-heavy lookups during a single compile:
+- zone compilation
+- SNAT interface-mode egress collection
+- filter and mirroring assignment paths
+
+## Evidence
+- Repeated lookups in zone compile loop:
+  - `pkg/dataplane/compiler.go:497`
+  - `pkg/dataplane/compiler.go:598`
+  - `pkg/dataplane/compiler.go:676`
+- Additional repeated lookups in SNAT interface-mode path:
+  - `pkg/dataplane/compiler.go:1778`
+  - `pkg/dataplane/compiler.go:1815`
+  - `pkg/dataplane/compiler.go:2886`
+
+## Improvement ideas
+- Build a compile-pass interface cache (name -> ifindex, link attrs, v4/v6 addresses).
+- Reuse cached entries across zone/NAT/filter/mirroring compilation steps.
+
+
+---
+
+## #42 — Performance: application port-range expansion causes O(range) compile/map-write overhead [CLOSED] (closed 2026-03-01)
+
+## Summary
+Application compile path fully expands destination port ranges into per-port map entries, which can explode compile time and map writes for wide ranges.
+
+## Why this hurts performance
+`parsePorts("low-high")` allocates and returns every port in the range, then compiler writes one `SetApplication` entry per port (and per protocol variant).
+
+Large ranges (e.g., `1-65535`) create massive compile-time work and memory churn.
+
+## Evidence
+- Port-range expansion to full slice:
+  - `pkg/dataplane/compiler.go:3057`
+  - `pkg/dataplane/compiler.go:3068`
+- Per-port map writes:
+  - `pkg/dataplane/compiler.go:1265`
+  - `pkg/dataplane/compiler.go:1266`
+
+## Improvement ideas
+- Represent destination port ranges natively (low/high) in app tables/rules instead of enumerating each port.
+- Add guardrails/warnings for very large port-range expansions until range-native path exists.
+
+
+---
+
+## #43 — Performance: firewall filter evaluation does linear per-rule map lookups in both XDP ingress and TC egress [CLOSED] (closed 2026-03-01)
+
+## Summary
+Firewall filter evaluation remains a linear term scan with per-term map lookups, and this logic runs in both ingress and egress datapaths.
+
+## Why this hurts performance
+For each filtered packet, the program iterates terms and does `bpf_map_lookup_elem(&filter_rules, &idx)` for each candidate. This affects:
+- XDP ingress (`evaluate_firewall_filter`),
+- TC egress (`evaluate_firewall_filter_output`),
+- host-bound lo0 filter path (`evaluate_filter_by_id`).
+
+## Evidence
+- Input filter loop:
+  - `bpf/headers/bpfrx_helpers.h:1113`
+  - `bpf/headers/bpfrx_helpers.h:1122`
+- Output filter loop:
+  - `bpf/headers/bpfrx_helpers.h:1327`
+  - `bpf/headers/bpfrx_helpers.h:1336`
+- lo0-by-id loop:
+  - `bpf/headers/bpfrx_helpers.h:1507`
+  - `bpf/headers/bpfrx_helpers.h:1516`
+- Called from hot stages:
+  - `bpf/xdp/xdp_main.c:133`
+  - `bpf/xdp/xdp_cpumap.c:80`
+  - `bpf/tc/tc_forward.c:22`
+
+## Improvement ideas
+- Precompile filter terms into protocol/port buckets to reduce candidates.
+- Add a small fast-path decision cache keyed by `(ifindex,family,proto,ports,dscp)` for repeated traffic patterns.
+- Consider compact contiguous per-filter slices to reduce per-term map lookup overhead.
+
+
+---
+
+## #44 — Performance: avoid duplicate iface_zone_map lookup across xdp_screen -> xdp_zone pipeline [CLOSED] (closed 2026-03-01)
+
+## Summary
+Ingress zone lookup is performed in `xdp_screen` and then repeated again in `xdp_zone` for the same packet.
+
+## Why this hurts performance
+Every packet that traverses the normal pipeline pays at least two hash lookups against `iface_zone_map` before policy/conntrack work starts.
+
+## Evidence
+- First lookup in screen stage:
+  - `bpf/xdp/xdp_screen.c:655`
+  - `bpf/xdp/xdp_screen.c:660`
+  - `bpf/xdp/xdp_screen.c:665`
+- Second lookup in zone stage:
+  - `bpf/xdp/xdp_zone.c:440`
+  - `bpf/xdp/xdp_zone.c:445`
+  - `bpf/xdp/xdp_zone.c:451`
+- Map type is HASH:
+  - `bpf/headers/bpfrx_maps.h:105`
+
+## Improvement ideas
+- Carry resolved ingress zone/iface metadata from screen to zone in `pkt_meta` (or a compact cached struct) and skip the second lookup on the common path.
+- Keep fallback lookup only for special cases (e.g., zone-encoded fabric source MAC handling).
+
+
+---
+
+## #45 — Performance: remove unnecessary atomic RMW on per-CPU global counters in XDP/TC hot paths [CLOSED] (closed 2026-03-01)
+
+## Summary
+`inc_counter()` uses `__sync_fetch_and_add` on `global_counters`, which is a `BPF_MAP_TYPE_PERCPU_ARRAY`.
+
+## Why this hurts performance
+Per-CPU map slots are CPU-local. Using atomic RMW on every counter increment adds unnecessary instruction cost on nearly every packet path (RX/TX drops, host-inbound, NAT64, screen events, etc.).
+
+## Evidence
+- Atomic increment helper:
+  - `bpf/headers/bpfrx_helpers.h:679`
+  - `bpf/headers/bpfrx_helpers.h:683`
+- Backing map is per-CPU:
+  - `bpf/headers/bpfrx_maps.h:283`
+- Widely used on hot paths:
+  - `bpf/xdp/xdp_main.c:176`
+  - `bpf/xdp/xdp_forward.c:226`
+  - `bpf/tc/tc_main.c:71`
+
+## Improvement ideas
+- Replace atomic increments on per-CPU counters with direct increments (`(*ctr)++`) in helper(s).
+- Keep atomics only where values are shared across CPUs (e.g., non-percpu hash entries).
+
+
+---
+
+## #46 — Performance: xdp_zone failover branches perform repeated FIB lookups and duplicate post-FIB work [CLOSED] (closed 2026-03-01)
+
+## Summary
+`xdp_zone` can execute multiple expensive `bpf_fib_lookup` calls for the same packet in fabric-forward/failover branches, with duplicated post-FIB resolution logic.
+
+## Why this hurts performance
+On some failover paths, a packet may do:
+1. initial FIB lookup,
+2. secondary main-table relookup for `META_FLAG_FABRIC_FWD`,
+3. tertiary main-table relookup in unreachable/blackhole branch,
+while repeatedly resolving VLAN parent and egress zone.
+
+This adds extra helper cost on already expensive error/failover paths.
+
+## Evidence
+- Initial FIB lookup:
+  - `bpf/xdp/xdp_zone.c:811`
+- Secondary lookup path:
+  - `bpf/xdp/xdp_zone.c:1001`
+- Tertiary lookup path:
+  - `bpf/xdp/xdp_zone.c:1214`
+- Duplicated post-FIB VLAN/zone resolution blocks:
+  - `bpf/xdp/xdp_zone.c:815`
+  - `bpf/xdp/xdp_zone.c:1004`
+  - `bpf/xdp/xdp_zone.c:1219`
+
+## Improvement ideas
+- Factor a shared helper for “FIB success -> resolve VLAN parent + zone + meta update”.
+- Consolidate fabric-forward relookup decisions so at most one fallback relookup is attempted per packet.
+- Cache `fabric_fwd` info once per packet and reuse across branches.
+
+
+---
+
+## #47 — Performance: tc_forward mirror sampling uses expensive modulo + atomic per packet [CLOSED] (closed 2026-03-01)
+
+## Summary
+TC port mirroring sampling uses modulo on a per-packet counter and atomic increment in the forwarding hot path.
+
+## Why this hurts performance
+When mirroring is enabled with `rate > 1`, every packet hits:
+- map lookup for `mirror_counter`,
+- `__sync_fetch_and_add` on per-CPU counter,
+- `% rate` division check.
+
+Integer division/modulo is relatively expensive in BPF JITed code, and atomic RMW is unnecessary for per-CPU counters.
+
+## Evidence
+- Sampling path and modulo:
+  - `bpf/tc/tc_forward.c:83`
+  - `bpf/tc/tc_forward.c:90`
+- Atomic increment on per-CPU counter:
+  - `bpf/tc/tc_forward.c:89`
+- `mirror_counter` is per-CPU array:
+  - `bpf/headers/bpfrx_maps.h:759`
+
+## Improvement ideas
+- Replace atomic increment with direct increment for per-CPU counter.
+- For sampling, prefer cheaper approaches (`bpf_get_prandom_u32` threshold, or bitmask for power-of-two rates).
+- Cache mirror settings in meta earlier if possible to avoid extra map access in TC forward.
+
+
+---
+
+## #48 — Performance: reduce repeated flow_config_map lookups in XDP/TC conntrack paths [CLOSED] (closed 2026-03-01)
+
+## Summary
+`flow_config_map` (single-entry array) is looked up repeatedly in conntrack/state-update paths instead of once per packet/context.
+
+## Why this hurts performance
+Several hot functions perform multiple lookups to the same `flow_config_map[0]` for RST handling, MSS clamp, and embedded ICMP checks. These are avoidable map lookups on frequent traffic.
+
+## Evidence
+- Repeated lookups in XDP conntrack hit handlers:
+  - `bpf/xdp/xdp_conntrack.c:73`
+  - `bpf/xdp/xdp_conntrack.c:105`
+  - `bpf/xdp/xdp_conntrack.c:207`
+  - `bpf/xdp/xdp_conntrack.c:234`
+- Repeated lookups in zone fast-path CT update:
+  - `bpf/xdp/xdp_zone.c:58`
+  - `bpf/xdp/xdp_zone.c:160`
+- Additional lookups in TC conntrack path:
+  - `bpf/tc/tc_conntrack.c:112`
+  - `bpf/tc/tc_conntrack.c:187`
+
+## Improvement ideas
+- Lookup `flow_config_map[0]` once in stage entry and pass pointer/derived flags into helper paths.
+- Cache frequently used booleans from flow config in `pkt_meta` when entering pipeline.
+
+
+---
+
+## #49 — Performance: NAT64 paths do heavy full-payload checksum scans [CLOSED] (closed 2026-03-01)
+
+## Summary
+NAT64 translation paths perform full L4 checksum scans with long bounded loops (up to 750 words) on packet hot paths.
+
+## Why this hurts performance
+For NAT64 traffic, checksum handling can require scanning much of the payload:
+- Forward 6->4 TCP/UDP checksum recompute loops,
+- Reverse 4->6 finalization for CHECKSUM_PARTIAL before translation.
+
+These loops are significantly heavier than incremental delta updates and can dominate NAT64 packet cost.
+
+## Evidence
+- 6->4 TCP checksum loop:
+  - `bpf/xdp/xdp_nat64.c:293`
+- 6->4 UDP checksum loop:
+  - `bpf/xdp/xdp_nat64.c:329`
+- 4->6 path calls CHECKSUM_PARTIAL finalization:
+  - `bpf/xdp/xdp_nat64.c:522`
+- Finalization helper loop (up to 750 iterations):
+  - `bpf/headers/bpfrx_helpers.h:372`
+
+## Improvement ideas
+- Prefer incremental checksum transformations where feasible instead of full payload summation.
+- Gate full recompute paths more aggressively (only when truly required).
+- Evaluate whether additional metadata can skip redundant checksum work across NAT64 subpaths.
+
+
+---
+
+## #50 — Performance: evaluate DEVMAP array instead of DEVMAP_HASH for XDP redirect hot path [CLOSED] (closed 2026-03-01)
+
+## Summary
+XDP forwarding redirects through `tx_ports` implemented as `BPF_MAP_TYPE_DEVMAP_HASH`, even though interface fanout is bounded and the path is latency-sensitive.
+
+## Why this hurts performance
+`bpf_redirect_map(&tx_ports, ...)` runs on every fast-path forwarded packet. Hash-backed devmap lookups add hashing/pointer-chasing overhead compared to array-backed devmap indexing.
+
+## Evidence
+- Redirect hot path:
+  - `bpf/xdp/xdp_forward.c:264`
+- Current map type:
+  - `bpf/headers/bpfrx_maps.h:307`
+- Interface cardinality appears bounded:
+  - `bpf/headers/bpfrx_common.h:143`
+
+## Improvement ideas
+- Evaluate replacing `BPF_MAP_TYPE_DEVMAP_HASH` with `BPF_MAP_TYPE_DEVMAP` using compact compiler-assigned port indices.
+- Keep an indirection map from ifindex->port-slot if sparse host ifindex values must be supported.
+
+
+---
+
+## #56 — Failover: IPv4 pre-fabric DNAT rewrite is not CHECKSUM_PARTIAL-safe [CLOSED] (closed 2026-03-01)
+
+## Summary
+`apply_dnat_before_fabric_redirect()` in `xdp_zone.c` updates IPv4 L4 checksums with `csum_update_2/4` unconditionally, while the normal NAT path is `CHECKSUM_PARTIAL`-aware.
+
+This creates a failover-specific checksum inconsistency: packets redirected over fabric before `xdp_nat` can carry incorrect TCP/UDP checksums under generic XDP / partial checksum contexts, leading to random connection drops or handshake failures.
+
+## Code References
+- IPv4 pre-fabric rewrite uses unconditional checksum updates:
+  - `bpf/xdp/xdp_zone.c:335-349`
+  - `bpf/xdp/xdp_zone.c:356-371`
+- IPv6 path explicitly guards incremental L4 updates on `!meta->csum_partial`:
+  - `bpf/xdp/xdp_zone.c:272-299`
+- Main NAT rewrite path is checksum-partial-aware for IPv4:
+  - `bpf/headers/bpfrx_nat.h:142-190`
+
+## Why this is risky during failover
+During active/active transitions, `apply_dnat_before_fabric_redirect()` is hit in fast redirect branches before `xdp_nat`. If checksum handling diverges from the regular NAT path, some flows can fail only during RG movement, matching the observed “random” failover-time drops.
+
+## Proposed fix
+- Make IPv4 pre-fabric rewrite mirror `nat_rewrite_v4()` semantics:
+  - Skip L4 incremental port checksum updates when `meta->csum_partial`.
+  - Use partial checksum update helpers for pseudo-header address changes where applicable.
+- Add regression coverage for DNAT + fabric redirect with `CHECKSUM_PARTIAL` packets.
+
+## Acceptance criteria
+- No checksum regressions in DNAT traffic across failover/failback.
+- Existing normal NAT path behavior unchanged.
+
+
+---
+
+## #57 — HA fabric: fib_ifindex selection can remain 0 and break main-table re-FIB [CLOSED] (closed 2026-03-01)
+
+## Summary
+`refreshFabricFwd()` picks `fabric_fwd_info.fib_ifindex` via a heuristic (first UP, non-VRF, non-veth, non-slave link). If no candidate matches, `fib_ifindex` remains `0`.
+
+When `fib_ifindex==0`, BPF re-FIB paths fall back to the fabric ingress ifindex (VRF member), which is exactly the l3mdev/TBID mismatch path that can route transit traffic through the wrong table during failover.
+
+## Code References
+- Heuristic selection and potential `fib_ifindex=0`:
+  - `pkg/daemon/daemon.go:3641-3657`
+  - logged in `pkg/daemon/daemon.go:3668-3671`
+- BPF fallback to ingress if `fib_ifindex` absent:
+  - `bpf/xdp/xdp_zone.c:999-1001`
+  - `bpf/xdp/xdp_zone.c:1170-1175`
+
+## Why this matters
+This reintroduces intermittent wrong-table lookups in exactly the active/active fabric transit path, producing hard-to-reproduce failover drops.
+
+## Proposed fix
+- Fail closed when `fib_ifindex` cannot be resolved (warn loudly + avoid partial programming), OR
+- Add deterministic selection of a known data-plane ifindex from active RG interfaces, not opportunistic `LinkList()` order.
+- Re-resolve aggressively on link/routing changes until non-zero.
+
+## Acceptance criteria
+- `fabric_fwd.fib_ifindex` is always valid in cluster active/active mode.
+- No re-FIB path uses fabric VRF ingress as TBID lookup anchor for main-table transit decisions.
+
+
+---
+
+## #58 — DPDK parity gap: zone-encoded fabric redirect decode is still TODO [CLOSED] (closed 2026-03-01)
+
+## Summary
+`dpdk_worker/zone.c` detects the zone-encoded MAC prefix used by eBPF active/active new-connection forwarding, but does not actually decode/apply it yet (explicit TODO).
+
+This leaves DPDK without parity for the active/active “new connection through split RG” fix path.
+
+## Code References
+- Placeholder block:
+  - `dpdk_worker/zone.c:42-60`
+
+## Impact
+In DPDK mode, new connections during RG split/failover can still fail even though eBPF path is fixed.
+
+## Proposed fix
+- Implement the TODO:
+  - Decode ingress zone from MAC byte 5.
+  - Set `meta->ingress_zone` and `meta->routing_table=254`.
+  - Bypass normal zone lookup for zone-encoded packets.
+- Add active/active split tests in DPDK path matching eBPF coverage.
+
+## Acceptance criteria
+- DPDK active/active behavior matches eBPF for new connection establishment during RG split/failover.
+
+
+---
+
+## #59 — HA fabric: peer MAC resolution is IPv4-only (no NDP path) [CLOSED] (closed 2026-03-01)
+
+## Summary
+`refreshFabricFwd()` resolves the fabric peer MAC only via `NeighList(..., FAMILY_V4)` and logs ARP-specific wait messages.
+
+If the fabric peer is configured with IPv6 (or NDP-only reachability), `fabric_fwd` cannot be populated/refreshed reliably, causing cross-chassis redirect failures during RG transitions.
+
+## Code References
+- IPv4-only neighbor query:
+  - `pkg/daemon/daemon.go:3613-3615`
+- ARP-specific wait log:
+  - `pkg/daemon/daemon.go:3628-3630`
+
+## Impact
+When `fabric_fwd` isn’t updated, active/active failover paths that depend on fabric redirect can intermittently drop packets/new connections until another mechanism recovers.
+
+## Proposed fix
+- Resolve neighbor MAC based on peer address family:
+  - Use `FAMILY_V4` for IPv4 peers.
+  - Use `FAMILY_V6` for IPv6 peers.
+- Update logs to avoid ARP-only wording.
+- Add test coverage for IPv6 fabric peer addresses.
+
+## Acceptance criteria
+- `fabric_fwd` updates correctly for both IPv4 and IPv6 fabric peers.
+- No regression for existing IPv4 deployments.
+
+
+---
+
+## #60 — Failover: sessionless FABRIC_FWD re-FIB failure falls through to XDP_PASS (kernel leak path) [CLOSED] (closed 2026-03-01)
+
+## Summary
+In `xdp_zone` FABRIC_FWD sessionless handling, when main-table re-FIB fails (`rc2 != SUCCESS`), code falls through to `XDP_PASS` and increments host-inbound counters.
+
+This can leak transit packets into the kernel path during active/active transitions, where they may be dropped or mis-handled (including unexpected TCP behavior) instead of being explicitly dropped or retried via controlled fabric logic.
+
+## Code References
+- Sessionless FABRIC_FWD re-FIB:
+  - `bpf/xdp/xdp_zone.c:993-1019`
+- Failure fallback to kernel pass:
+  - `bpf/xdp/xdp_zone.c:1020-1029`
+
+## Why this is risky
+During RG movement windows, transient route state is expected. Punting unresolved fabric-transit packets to kernel broadens behavior surface and can manifest as random connection loss.
+
+## Proposed fix
+- For `META_FLAG_FABRIC_FWD` transit packets, prefer explicit `XDP_DROP` (with counter) on re-FIB failure instead of `XDP_PASS`.
+- Keep `XDP_PASS` only for clearly host-local/control-plane traffic paths.
+- Add dedicated counters to distinguish controlled failover drops from host-inbound traffic.
+
+## Acceptance criteria
+- No FABRIC_FWD transit packet takes ambiguous kernel fallback on failed re-FIB.
+- Failover behavior is deterministic and observable via dedicated counters.
+
+
+---
+
+## #61 — xdp_zone: sessionless FABRIC_FWD NO_NEIGH path falls through to XDP_PASS/host-inbound [CLOSED] (closed 2026-03-01)
+
+## Summary
+In `xdp_zone`, sessionless packets that arrived via plain fabric redirect (`META_FLAG_FABRIC_FWD`) can still leak into the host path when `bpf_fib_lookup()` returns `BPF_FIB_LKUP_RET_NO_NEIGH`.
+
+## Code Path
+- `bpf/xdp/xdp_zone.c:1019-1092`
+- `NO_NEIGH` branch:
+  - `nn_has_session == 0`
+  - `try_fabric_redirect_with_zone()` and `try_fabric_redirect()` both return `-1` on anti-loop for fabric ingress
+  - `sv4/sv6 == NULL`, so session-specific guard drops do not run
+  - falls through to host-inbound accounting + `XDP_PASS`
+
+## Why this is a problem
+For `FABRIC_FWD` transit traffic, this path should not be treated as host-bound local delivery. Passing to kernel can cause the same class of failover damage the recent `FABRIC_FWD_DROP` fix was intended to prevent (RSTs/unpredictable local stack behavior instead of deterministic transit handling).
+
+## Expected behavior
+When `META_FLAG_FABRIC_FWD` is set and the `NO_NEIGH` recovery paths fail for a sessionless packet, do **not** fall through to host-inbound `XDP_PASS`. Drop cleanly (and count separately), or use a dedicated transit retry path.
+
+
+---
+
+## #62 — xdp_zone: UNREACHABLE/BLACKHOLE FABRIC_FWD branch still leaks to host path when main-table re-FIB misses [CLOSED] (closed 2026-03-01)
+
+## Summary
+`xdp_zone` now drops sessionless `FABRIC_FWD` packets on re-FIB failure in the `SUCCESS` path, but the analogous `UNREACHABLE/BLACKHOLE/PROHIBIT` branch still falls through to host-path handling when re-FIB in table 254 fails.
+
+## Code Path
+- `bpf/xdp/xdp_zone.c:1109-1168`
+  - For `rc in {UNREACHABLE, BLACKHOLE, PROHIBIT}` and `!bh_has_session`
+  - On `META_FLAG_FABRIC_FWD`, performs second lookup via `setup_main_table_fib()`
+  - If `rc3 != SUCCESS`, there is no explicit drop/return
+- Fallthrough continues to host-path tail (`bpf/xdp/xdp_zone.c:1270-1274`) and `XDP_PASS`
+
+## Why this is a problem
+This is the same leak class fixed in the `SUCCESS`/sessionless `FABRIC_FWD` path: transit packets can still enter local kernel handling during failover windows, causing non-deterministic drops/RST behavior.
+
+## Expected behavior
+Mirror the hardened behavior used at `bpf/xdp/xdp_zone.c:1000-1016`:
+- If `META_FLAG_FABRIC_FWD` re-FIB in table 254 fails, increment a dedicated drop counter and return `XDP_DROP`.
+- Avoid host-inbound `XDP_PASS` fallthrough for transit `FABRIC_FWD` packets.
+
+
+---
+
+## #63 — cluster refreshFabricFwd: fallback fib_ifindex selection is non-deterministic and may pick wrong routing context [CLOSED] (closed 2026-03-01)
+
+## Summary
+When the fabric interface is a VRF member, `refreshFabricFwd()` falls back to the first UP non-VRF/non-veth/non-slave link from `netlink.LinkList()`. This can pick an arbitrary interface (e.g., management/overlay), not a deterministic dataplane context for main-table re-FIB.
+
+## Code Path
+- `pkg/daemon/daemon.go:3648-3673`
+  - If `link.Attrs().MasterIndex != 0`, set `info.FIBIfindex = 0`
+  - Iterate all links and pick the first candidate
+
+## Why this is a problem
+`FIBIfindex` is used to avoid l3mdev/VRF mismatch in `BPF_FIB_LOOKUP_TBID` main-table re-lookups for fabric transit. Using an arbitrary interface can still trigger wrong policy-routing context and route misses during failover transitions.
+
+Symptoms can present as intermittent/random connection drops when active RG ownership changes.
+
+## Expected behavior
+Choose `fib_ifindex` deterministically from dataplane configuration (or the interface tied to table 254 routing intent), not from first-link iteration order. If no valid dataplane ifindex is available, fail loudly with actionable diagnostics.
+
+
+---
+
+## #64 — DPDK zone-encoded fabric decode returns too early and lacks fabric-ingress validation [CLOSED] (closed 2026-03-01)
+
+## Summary
+The DPDK zone-encoded MAC detection path exits `zone_lookup()` immediately after setting `ingress_zone` and `routing_table`, and it does not verify that the packet actually arrived on the fabric interface.
+
+## Code Path
+- `dpdk_worker/zone.c:42-57`
+  - Detects `02:bf:72:fe:00:ZZ`
+  - Sets `meta->ingress_zone` and `meta->routing_table = 254`
+  - `return;`
+
+## Problems
+1. Early return skips the rest of `zone_lookup()`:
+   - pre-routing DNAT handling
+   - host-bound exception checks
+   - FIB lookup
+   - egress zone resolution
+2. No ingress-if validation:
+   - Any ingress packet with crafted source MAC prefix can force zone decode behavior.
+
+## Expected behavior
+Match XDP semantics:
+- Only treat zone-encoded MAC as valid on fabric ingress.
+- Set decoded zone/routing table, then continue normal pipeline/FIB resolution instead of returning early.
+
+
+---
+
+## #65 — DPDK active/active: zone-encoded fabric validation compares port_id against kernel ifindex [CLOSED] (closed 2026-03-01)
+
+## Summary
+The new DPDK zone-encoded fabric validation can fail to match real fabric packets because it compares different interface identity spaces:
+
+- dataplane ingress value: DPDK `port_id`
+- control-plane populated value: Linux kernel `ifindex`
+
+This can prevent zone-decoded new-connection handling from triggering in DPDK active/active failover paths.
+
+## Evidence
+- `dpdk_worker/parse.c:199`
+  - `meta->ingress_ifindex = pkt->port;` (DPDK port id)
+- `pkg/dataplane/dpdk/dpdk_cgo.go:1169`
+  - `shm.fabric_ifindex = info.Ifindex` (Linux ifindex from netlink)
+- `dpdk_worker/zone.c:60-62`
+  - validation requires `meta->ingress_ifindex == ctx->shm->fabric_ifindex`
+
+Given the above, validation can be false even on real fabric ingress.
+
+## Why this matters
+When this check fails, zone-encoded packets are treated as normal ingress and do not follow the intended active/active new-connection behavior. That can reintroduce policy-zone mismatch or failover drops in DPDK mode.
+
+## Suggested fix
+Store and compare in one identity domain:
+- either populate `fabric_ifindex` as DPDK `port_id`, or
+- introduce/use an explicit ifindex↔port mapping in shared memory and normalize before comparison.
+
+Also add a test that injects a zone-encoded packet on fabric and verifies the decode path is hit.
+
+
+---
+
+## #66 — HA failover race: cluster/VRRP handlers apply rg_active side effects from stale transitions [CLOSED] (closed 2026-03-01)
+
+## Summary
+`watchClusterEvents` and `watchVRRPEvents` both call into `rgStateMachine`, but they apply `rg_active` and blackhole side effects outside the state-machine lock, and transition epochs are not checked before applying. This allows stale transition results to be committed after newer state was already computed by the other goroutine.
+
+## Evidence
+- Two independent goroutines perform state-machine updates + side effects:
+  - `pkg/daemon/daemon.go:3778-3812` (`watchClusterEvents`)
+  - `pkg/daemon/daemon.go:3898-3934` (`watchVRRPEvents`)
+- State machine has an epoch meant for stale-update detection:
+  - comment: `pkg/daemon/rg_state.go:21-22`
+  - transition carries epoch: `pkg/daemon/rg_state.go:144`
+- But handlers do not validate epoch/current state before applying side effects.
+
+## Why this matters
+During failover/failback bursts, cluster and VRRP events can interleave. A stale handler can:
+- write outdated `rg_active`
+- inject/remove blackhole routes for an older state
+
+This can produce transient mismatches (`rg_active` vs routing state), which matches observed "random" connection drops during role movement.
+
+## Suggested fix
+Serialize side-effect application per RG or gate applies by epoch:
+- after `SetCluster`/`SetVRRP`, re-check current epoch (and desired active) before calling `UpdateRGActive`, `injectBlackholeRoutes`, `removeBlackholeRoutes`.
+- alternatively, enqueue transitions to a single per-RG worker that performs side effects in order.
+
+Add a concurrency test that injects interleaved cluster+VRRP transitions and asserts final `rg_active`/blackhole state is consistent without relying on periodic reconcile.
+
+
+---
+
+## #68 — HA mode: disable hitless restart semantics by default [CLOSED] (closed 2026-03-02)
+
+## Problem
+In HA (`chassis cluster`) mode, the daemon currently preserves dataplane state for hitless restart. That behavior is useful for standalone upgrades, but in HA it can keep forwarding active on a node whose control plane is down/hung, which increases split-brain risk during failover.
+
+### Current behavior in code
+- `pkg/daemon/daemon.go` keeps state intentionally on shutdown:
+  - comments and behavior at `pkg/daemon/daemon.go:799-809` preserve routes/addresses/BPF and call `d.dp.Close()` (non-destructive).
+- `pkg/dataplane/loader.go` `Close()` explicitly leaves pinned maps/links active:
+  - `pkg/dataplane/loader.go:340-355`.
+
+In HA mode, this means a failed/ wedged node can keep stale forwarding posture until external recovery happens.
+
+## Proposal
+When HA mode is enabled (`cfg.Chassis.Cluster != nil`):
+1. Disable hitless-restart semantics by default.
+2. On daemon shutdown/failure path, perform fail-closed teardown for dataplane ownership state (at least clear `rg_active`, and preferably full `Teardown()` if safe).
+3. Keep current hitless behavior for non-HA standalone mode.
+4. Add a config flag to explicitly opt back into hitless behavior in HA only if an operator really wants it.
+
+## Why
+In HA, correctness and deterministic failover are more important than preserving local forwarding through daemon restarts.
+
+## Acceptance criteria
+- In HA mode, stopping or crashing `bpfrxd` on a node does **not** leave it forwarding traffic as active owner.
+- Peer failover converges without prolonged dual-active forwarding.
+- Standalone mode still supports hitless restart behavior.
+- Regression test covers HA daemon-stop/crash path and validates no stale forwarding from the stopped node.
+
+
+---
+
+## #69 — SessionSync: stale receive goroutine can tear down the active peer connection [CLOSED] (closed 2026-03-02)
+
+## Problem
+`SessionSync` can drop a healthy, newly-established sync connection when an older receive goroutine exits.
+
+## Code path
+- `acceptLoop()` and `connectLoop()` both replace `s.conn` and start a new `receiveLoop`:
+  - `pkg/cluster/sync.go:500-527`
+  - `pkg/cluster/sync.go:559-583`
+- `receiveLoop()` always defers `handleDisconnect()`:
+  - `pkg/cluster/sync.go:607-610`
+- `handleDisconnect()` unconditionally closes `s.conn` (the current shared pointer), not the specific connection that failed:
+  - `pkg/cluster/sync.go:878-887`
+
+If conn A is replaced by conn B, when conn A's goroutine exits it calls `handleDisconnect()` and closes conn B.
+
+## Impact
+- Sync connection flaps under simultaneous inbound/outbound connect races.
+- Session/config sync interruptions during failover windows.
+- Increased chance of missing state during role transition.
+
+## Proposal
+Make disconnect handling connection-specific:
+1. Pass the current `conn` into `handleDisconnect(conn)`.
+2. Under lock, only clear/close if `s.conn == conn`.
+3. Ignore stale receive-loop exits for already-replaced connections.
+
+## Acceptance criteria
+- Replacing an old connection with a new one does not cause the new one to be closed by stale goroutines.
+- No self-induced disconnect oscillation when both nodes connect around the same time.
+- HA failover tests with forced reconnect churn keep `SessionSync` connected.
+
+
+---
+
+## #70 — SessionSync: BulkSync should honor per-RG ownership (same as sweep) [CLOSED] (closed 2026-03-02)
+
+## Problem
+`BulkSync()` ignores RG ownership filtering and sends all sessions, while incremental sweep correctly filters by `ShouldSyncZone()`.
+
+## Code path
+- Incremental sweep filters by zone->RG ownership:
+  - `pkg/cluster/sync.go:291-307` (`ShouldSyncZone(...)`)
+- `BulkSync()` iterates and sends all v4/v6 sessions with no ownership check:
+  - `pkg/cluster/sync.go:431-485`
+
+In active/active HA, a node can send sessions for RGs where it is not currently primary.
+
+## Impact
+- Non-authoritative/stale sessions can be reinstalled on the peer during reconnect.
+- Session state can drift after failover/failback when a returning node bulk-syncs old entries.
+- Can delay clean recovery of new connections by reviving dead tuples.
+
+## Proposal
+Align `BulkSync()` with sweep semantics:
+1. Send only forward entries (`IsReverse == 0`).
+2. Apply `ShouldSyncZone(val.IngressZone)` filtering in bulk path.
+3. In active/active, each node only bulk-syncs sessions for RGs it currently owns.
+
+## Acceptance criteria
+- During reconnect, a secondary does not push sessions for RGs it does not own.
+- Bulk sync payload matches ownership policy used by incremental sync.
+- Failover/failback does not resurrect stale sessions from the non-owner.
+
+
+---
+
+## #71 — SessionSync: Bulk transfer needs authoritative stale-entry reconciliation [CLOSED] (closed 2026-03-02)
+
+## Problem
+Session bulk sync is additive only; it does not reconcile stale entries that should be removed after disconnect/reconnect.
+
+## Code path
+- `BulkSync()` sends current sessions but no "authoritative snapshot" generation marker beyond start/end framing:
+  - `pkg/cluster/sync.go:431-485`
+- Receiver handles `syncMsgBulkStart/syncMsgBulkEnd` as timing markers only:
+  - `pkg/cluster/sync.go:828-840`
+- Received session timestamps are rebased to local "now":
+  - `pkg/cluster/sync.go:675-677`, `733-737`
+
+If delete messages were missed while disconnected, stale sessions can persist and get refreshed by later bulk sync traffic.
+
+## Impact
+- Dead sessions can survive reconnect much longer than intended.
+- Tuple conflicts can block or delay new connection establishment after failover.
+- Recovery may appear "stuck" even after control-plane reconverges.
+
+## Proposal
+Make bulk sync authoritative per sync epoch:
+1. Add bulk generation/epoch ID.
+2. Mark received entries with generation.
+3. On bulk end, remove local synced entries not seen in the current generation (or clear+reinstall safely).
+4. Scope cleanup by ownership/RG to avoid deleting local-authoritative entries.
+
+## Acceptance criteria
+- After reconnect bulk sync, peer session table matches sender snapshot for synced ownership scope.
+- Sessions deleted while disconnected do not linger indefinitely.
+- Post-failover new flows are not blocked by stale replicated tuples.
+
+
+---
+
+## #72 — HA failover: add peer fencing path on heartbeat timeout [CLOSED] (closed 2026-03-02)
+
+## Problem
+On heartbeat timeout, HA election promotes the local node but does not fence/quarantine the peer. If the peer is control-plane dead but dataplane still forwarding, split-brain forwarding can persist.
+
+## Code path
+- Heartbeat timeout marks peer lost and re-elects locally:
+  - `pkg/cluster/cluster.go:761-791`
+- No peer fencing action is invoked in this path (power off, interface quarantine, explicit dataplane disable on peer).
+
+## Impact
+- Dual-active forwarding risk in crash/hang scenarios.
+- Hard-to-recover flow damage during failover (duplicates/RST/cwnd collapse).
+- HA correctness depends on peer fully dying, which is not always true for partial failures.
+
+## Proposal
+Add optional peer fencing flow for HA mode:
+1. Fencing hook triggered on peer heartbeat timeout (configurable action/backend).
+2. Track fencing state in cluster events/history.
+3. Optionally gate full active ownership until fence acknowledged (policy-dependent).
+4. Expose operational status via CLI/API (`show chassis cluster ...`).
+
+## Acceptance criteria
+- Heartbeat timeout can trigger deterministic fencing workflow.
+- In simulated hung-peer tests, local takeover does not leave prolonged dual-active forwarding.
+- Operators can observe fence attempts/results in runtime status.
+
+
+---
+
+## #73 — HA tests: add hard-crash/hung-node failover coverage [CLOSED] (closed 2026-03-02)
+
+## Problem
+Current HA failover tests exercise clean-ish reboot/manual transitions but not hard crash or hung-kernel scenarios that can leave forwarding ambiguous.
+
+## Code path / test gap
+- `test/incus/test-failover.sh` uses `reboot` to trigger failover:
+  - `test/incus/test-failover.sh:141-143`
+- No coverage for:
+  - kernel panic / forced stop behavior
+  - daemon wedged or stopped while dataplane remains attached
+  - post-crash recovery of both existing and new TCP flows
+
+## Impact
+- Regressions in real crash behavior can pass CI.
+- Reported "iperf never recovers" scenarios are hard to reproduce deterministically.
+
+## Proposal
+Add HA chaos failover tests:
+1. Hard-stop/panic scenario (e.g., forced VM stop or sysrq panic in test env).
+2. Daemon-stop scenario in HA mode (with and without hitless semantics).
+3. Assertions for:
+   - takeover latency
+   - existing stream survival/recovery behavior
+   - new connection establishment during/after takeover
+4. Include multi-cycle runs (not only single transition).
+
+## Acceptance criteria
+- CI test reproduces crash-like failover conditions deterministically.
+- Test reports explicit recovery SLOs (time-to-first-successful-new-connection, sustained throughput recovery).
+- HA regressions in crash path fail fast in test suite.
+
+
+---
+
+## #74 — Investigation: transient 10-30s loss to 172.16.100.247 after deploy restart [CLOSED] (closed 2026-03-02)
+
+## Problem
+After deploy restart in HA environment, traffic from `cluster-lan-host` to `172.16.100.247` can fail for ~10-30 seconds, then recover on its own.
+
+## Symptom
+- `ping 172.16.100.247` from `cluster-lan-host` times out immediately after restart.
+- Outage self-resolves without manual intervention.
+- This points to transient convergence/race rather than permanent misconfiguration.
+
+## Context
+- Likely in ARP/neighbor/FIB convergence path during restart/failover handoff.
+- Related known areas: NO_NEIGH handling, neighbor warmup timing, VRRP transition timing, blackhole/rg_active ordering, fabric_fwd refresh.
+
+## Investigation scope
+1. Capture neighbor table state (`ip neigh`) on both nodes across LAN/WAN/fabric during the outage window.
+2. Capture packets (ARP + ICMP + relevant routed path) on ingress/egress interfaces during the first 30s after restart.
+3. Correlate with:
+   - VRRP state events
+   - cluster state transitions
+   - `rg_active`/blackhole route state
+   - `fabric_fwd` programming/refresh
+4. Verify whether `warmNeighborCache()` includes and successfully primes this exact destination path in restart scenarios.
+
+## Expected outcome
+- Root-cause the transient 10-30s gap.
+- Add deterministic fix and regression test so restart does not cause temporary loss to `172.16.100.247`.
+
+## Docs
+- Investigation note added to `docs/bugs.md` under:
+  - `Transient post-deploy connectivity loss to 172.16.100.247 (OPEN INVESTIGATION)`
+
+
+---
+
+## #75 — HA restart: neighbor prewarm runs before VRRP VIP ownership, causing 10-30s transient WAN loss [CLOSED] (closed 2026-03-02)
+
+## Root cause
+Transient `cluster-lan-host -> 172.16.100.247` loss (~10-30s) after deploy restart is caused by **neighbor prewarm running too early** in HA startup.
+
+### Evidence in code
+1. In HA/VRRP-backed RETH, networkd uses a link-local placeholder address (not the WAN/LAN VIP) until VRRP MASTER adds real VIPs:
+   - `pkg/dataplane/compiler.go:766-768`
+   - `pkg/dataplane/compiler.go:873-876`
+   - `pkg/dataplane/compiler.go:927-930`
+
+2. Initial proactive neighbor resolution runs during `applyConfig()` **before** VRRP instances are updated:
+   - `pkg/daemon/daemon.go:1485-1489` (`d.resolveNeighbors(cfg)`)
+   - VRRP instance update happens later at `pkg/daemon/daemon.go:1526-1533`.
+
+3. Periodic neighbor resolver does not run immediately; first retry is after 15s:
+   - `pkg/daemon/daemon.go:1943-1954` (`time.NewTicker(15 * time.Second)` with no initial call).
+
+### Why this produces ~10-30s self-heal
+- Early `resolveNeighbors()` runs while VRRP VIP ownership/connected routes are not ready for the active RETH path.
+- Neighbor priming may miss WAN next-hop during this window.
+- First successful retry happens on periodic ticks (15s cadence), so user-visible outage falls in ~10-30s band.
+
+## Impact
+- Immediate post-restart internet connectivity from LAN can fail transiently.
+- Behavior is nondeterministic (depends on timing of VRRP MASTER transition vs resolver runs).
+
+## Proposed fix
+1. In cluster mode, defer initial `resolveNeighbors()` until after VRRP state is established (or trigger on VRRP MASTER event).
+2. Make periodic neighbor resolver run once immediately at goroutine start, then every 15s.
+3. Add restart regression test:
+   - Restart daemon(s)
+   - Probe `cluster-lan-host -> 172.16.100.247` continuously
+   - Assert no multi-second warmup gap (or at least bounded below current behavior).
+
+## Related
+- Investigation issue: #74
+
+
+---
+
+## #76 — HA race: SessionSync has unsynchronized concurrent conn writers and short-write hazards [CLOSED] (closed 2026-03-02)
+
+## Problem
+`SessionSync` has multiple concurrent writers to the same TCP connection with no serialization, and write paths do not handle short writes. This can corrupt message framing (`BPSY` header + payload), causing intermittent sync disconnects and state loss during HA churn.
+
+## Code evidence
+- `writeMsg()` performs two separate `conn.Write` calls (header then payload):
+  - `pkg/cluster/sync.go:958-971`
+- `sendLoop()` also writes directly to `conn` (`conn.Write(msg)`) with no shared write lock:
+  - `pkg/cluster/sync.go:586-603`
+- Keepalive writes from receive goroutine via `writeMsg()`:
+  - `pkg/cluster/sync.go:620-629`
+- Other goroutines write directly via `writeMsg()` (`QueueConfig`, `SendFailover`, `QueueIPsecSA`):
+  - `pkg/cluster/sync.go:389-407`, `410-428`, `929-947`
+
+There is no single-writer goroutine or write mutex guarding these paths.
+
+## Why this is a race
+- Two goroutines can interleave writes at message boundaries.
+- Because `writeMsg()` splits header/payload into separate writes, another writer can inject bytes between them.
+- Framing parser (`receiveLoop`) can then see bad magic/length and disconnect.
+
+## Additional correctness gap
+- Write paths ignore short writes (`n < len`) unless an error is returned.
+- `sendLoop` and `writeMsg` should enforce full writes.
+
+## Proposed fix
+1. Serialize all outbound sync traffic through a single writer path (one goroutine or a connection write mutex).
+2. Use `io.WriteFull`/equivalent to guarantee full header+payload writes.
+3. Route keepalive/config/failover/IPsec writes through the same serialized channel.
+4. Add stress test with concurrent queue + keepalive + bulk sync writes.
+
+## Acceptance criteria
+- No frame corruption under concurrent sync traffic.
+- No spurious disconnects due to malformed/partial messages under HA failover stress.
+- Unit/integration tests cover concurrent writer scenarios.
+
+
+---
+
+## #77 — HA race: fixed 10s VRRP sync-hold timeout can release before bulk sync completes [CLOSED] (closed 2026-03-02)
+
+## Problem
+VRRP sync-hold release on startup is driven by a fixed 10s timer, not guaranteed completion of bulk session sync. Under large session tables or slow reconnect, preemption can resume before state is fully installed.
+
+## Code evidence
+- Startup enables sync hold for fresh daemon starts:
+  - `pkg/daemon/daemon.go:3457-3463` (`SetSyncHold(10 * time.Second)`)
+- Hold is released either on bulk sync callback OR timeout:
+  - bulk callback: `pkg/daemon/daemon.go:3465-3468`
+  - timeout release path: `pkg/vrrp/manager.go:90-93`
+
+Timeout path unconditionally calls `ReleaseSyncHold()` even if sync is incomplete.
+
+## Impact
+- Returning high-priority node can preempt early without full session state.
+- Existing flows may reset/drop during takeover despite sync feature being enabled.
+- Behavior is load-dependent (worse with larger session sets).
+
+## Proposed fix
+1. Make sync-hold release condition-driven (bulk sync completion + optional minimum installed-session threshold), not purely timer-driven.
+2. Keep timeout as safety fallback, but transition to degraded mode with explicit warning and optional preempt suppression policy.
+3. Expose sync-hold reason/state in CLI/API to aid diagnosis.
+
+## Acceptance criteria
+- In large-session restart tests, preemption does not occur before bulk sync completion unless operator-configured fallback policy allows it.
+- Early-timer release can no longer silently bypass session-protection intent.
+- Observability clearly shows why sync hold was released.
+
+
+---
+
+## #78 — HA race: reconnect config sync can accept stale secondary config (authority not enforced) [CLOSED] (closed 2026-03-02)
+
+## Problem
+Reconnect config-sync path can push/apply config without validating sender authority (RG0 primary). This allows stale secondary config to be accepted during reconnect races.
+
+## Code evidence
+- On peer reconnect, callback pushes config based on uptime heuristic:
+  - `pkg/daemon/daemon.go:3447-3454`
+- `pushConfigToPeer()` is explicitly unconditional (no primary check):
+  - `pkg/daemon/daemon.go:3310-3328`
+- Receiver applies any incoming config:
+  - `pkg/daemon/daemon.go:3331-3349`
+
+`syncConfigToPeer()` has primary gating, but reconnect path bypasses it by design.
+
+## Impact
+- During reconnect churn, stale node can overwrite peer config.
+- Config source-of-truth can become nondeterministic if nodes diverged.
+- Creates race between role transitions and config propagation.
+
+## Proposed fix
+1. Add authority metadata to config sync messages (sender node ID, RG0 role/epoch).
+2. Accept config only from currently authoritative source (RG0 primary / newest epoch).
+3. Replace reconnect "push from stable node" heuristic with pull/request from current primary.
+4. Add tests for split/reconnect where nodes have divergent config snapshots.
+
+## Acceptance criteria
+- Secondary/stale node cannot overwrite primary config during reconnect.
+- Config convergence is deterministic and role-authoritative.
+- Reconnect tests with divergent configs always converge to primary's config.
+
+
+---
+
+## #79 — HA readiness: fabric_fwd population is passively delayed and race-prone at startup [CLOSED] (closed 2026-03-02)
+
+## Problem
+`fabric_fwd` readiness during startup/failover is passive and delayed: first refresh waits 2s, and peer-MAC resolution only checks existing neighbor cache (no active probe). This can leave cross-chassis redirect unavailable during early HA transitions.
+
+## Code evidence
+- Initial population loop waits before first attempt:
+  - `pkg/daemon/daemon.go:3562-3568`
+- MAC resolution is passive (`NeighList`) and returns false if entry absent:
+  - `pkg/daemon/daemon.go:3618-3637`
+- Periodic drift correction is every 30s:
+  - `pkg/daemon/daemon.go:3577-3585`
+
+No active ARP/NDP solicitation is triggered for fabric peer when missing.
+
+## Impact
+- Early failover windows may lack working fabric redirect metadata.
+- New/existing flows relying on fabric redirect can drop until neighbor entry appears.
+- Recovery timing becomes nondeterministic (depends on incidental neighbor activity).
+
+## Proposed fix
+1. Attempt immediate `refreshFabricFwd()` (no initial 2s delay).
+2. On missing peer neighbor, actively trigger ARP/NDP probe on fabric interface.
+3. Use faster startup retry cadence until first success, then fall back to 30s drift interval.
+4. Add HA startup/failover test that validates fabric redirect readiness time budget.
+
+## Acceptance criteria
+- `fabric_fwd` map is populated quickly and deterministically after startup/failover.
+- Missing neighbor entry no longer waits for incidental traffic.
+- Cross-chassis redirect path is available within defined startup SLA.
+
+
+---
+
+## #80 — HA correctness: periodic neighbor warmup uses stale startup config snapshot [CLOSED] (closed 2026-03-02)
+
+## Problem
+Periodic neighbor prewarm uses a config snapshot captured at daemon startup and does not track later active-config changes.
+
+## Code evidence
+- Periodic runner is started with `cfg := d.store.ActiveConfig()` once:
+  - `pkg/daemon/daemon.go:564-575`
+- Loop reuses that captured `cfg` forever:
+  - `pkg/daemon/daemon.go:1945-1954`
+
+If config changes via commit/sync (NAT pools, static routes, address-book hosts, etc.), periodic prewarm may miss new targets or keep probing removed ones.
+
+## HA impact
+- After config sync/failover churn, NO_NEIGH risk persists for newly introduced forwarding targets.
+- Warmup behavior diverges from actual active config, causing intermittent first-packet drops/resets.
+
+## Proposed fix
+1. On each tick, fetch current `d.store.ActiveConfig()` instead of using a stale pointer.
+2. Optionally trigger immediate prewarm after successful config apply/sync events.
+3. Add tests where config changes after startup and verify periodic warmup covers new targets.
+
+## Acceptance criteria
+- Periodic neighbor warmup always reflects current active config.
+- New NAT/route/address-book targets are warmed without daemon restart.
+- Removed targets are no longer probed indefinitely.
+
+
+---
+
+## #81 — HA startup bug: heartbeat/session-sync retry exhaustion can permanently disable cluster comms [CLOSED] (closed 2026-03-02)
+
+## Problem
+Cluster comms startup uses fixed retry budgets (30 attempts x 2s) for heartbeat and session sync. If retries exhaust during slow interface/VRF bring-up, HA comms never recover until daemon restart.
+
+## Code evidence
+- Heartbeat startup retries then gives up permanently:
+  - `pkg/daemon/daemon.go:3375-3399`
+- Session sync startup retries then gives up permanently:
+  - `pkg/daemon/daemon.go:3407-3425`
+  - `pkg/daemon/daemon.go:3496-3511`
+
+After these goroutines return, there is no long-lived supervisor to retry later.
+
+## HA impact
+- Node can remain in degraded/no-heartbeat state indefinitely after boot races.
+- Failover/ownership decisions may be wrong or delayed because control channels never start.
+- Requires manual daemon restart to recover.
+
+## Proposed fix
+1. Replace fixed retry loops with persistent supervisor loops tied to daemon lifetime.
+2. Add backoff + jitter, but never permanently stop retrying while daemon is running.
+3. Expose health status for heartbeat/session-sync startup state in CLI/API.
+
+## Acceptance criteria
+- Delayed interface/VRF readiness no longer permanently disables HA comms.
+- Heartbeat/session sync eventually come up without manual restart.
+- Status output clearly indicates retrying vs connected states.
+
+
+---
+
+## #82 — HA startup race: initial BulkSync may be skipped before dataplane wiring [CLOSED] (closed 2026-03-02)
+
+## Problem
+Initial bulk session sync can be missed at startup due to a race: `SessionSync.Start()` may connect and attempt `BulkSync()` before dataplane is wired, then never re-run full sync after dataplane becomes ready.
+
+## Code evidence
+- `SessionSync.Start()` launches connect/accept goroutines that call `BulkSync()` on connect:
+  - `pkg/cluster/sync.go:165-199`
+  - `pkg/cluster/sync.go:520-527`
+  - `pkg/cluster/sync.go:579-582`
+- `BulkSync()` returns error when dataplane is nil:
+  - `pkg/cluster/sync.go:432-435`
+- Dataplane is wired only after `Start()` returns in async startup path:
+  - `pkg/daemon/daemon.go:3497-3527`
+
+If early `BulkSync()` fails before `SetDataPlane()`, existing sessions at that moment may never be fully replicated unless a reconnect happens.
+
+## HA impact
+- Returning node may preempt with incomplete replicated state.
+- Existing flows can reset/drop after failover despite sync being "connected".
+- Recovery depends on incidental reconnect timing.
+
+## Proposed fix
+1. Defer first `BulkSync()` until dataplane is ready (or queue a guaranteed post-SetDataPlane bulk sync).
+2. Add explicit one-shot cold-sync trigger immediately after `SetDataPlane()`.
+3. Gate sync-hold release on confirmed successful cold sync, not just connection state.
+
+## Acceptance criteria
+- On startup, exactly one successful cold sync always occurs after dataplane is ready.
+- Existing sessions present before startup are replicated without requiring reconnect.
+- HA failover tests verify cold-sync completeness under startup races.
+
+
+---
+
+## #83 — HA race: session delete sync is not per-RG ownership-safe in active/active [CLOSED] (closed 2026-03-02)
+
+## Problem
+Delete sync path is not scoped by per-RG ownership in active/active mode. Non-owner nodes can enqueue delete messages and peers apply them unconditionally.
+
+## Code evidence
+- GC delete callbacks send deletes when node is primary for *any* RG:
+  - `pkg/daemon/daemon.go:303-313`
+- No per-zone/per-RG ownership check is applied for deletes (unlike session sweep which uses `ShouldSyncZone`).
+- Receiver applies delete messages without ownership validation:
+  - `pkg/cluster/sync.go:774-800`
+  - `pkg/cluster/sync.go:802-826`
+
+## HA impact
+- In active/active churn, a stale/non-owner node can delete sessions on the owner peer.
+- Can cause random flow drops/resets during failover/failback cycles.
+- Behavior is timing-dependent and hard to reproduce deterministically.
+
+## Proposed fix
+1. Carry ownership metadata for delete messages (e.g., ingress zone / RG / owner epoch).
+2. Send deletes only when local node owns the session’s RG.
+3. On receiver, reject deletes from non-authoritative owner for that RG.
+4. Add stress test with active/active failover churn and session deletions.
+
+## Acceptance criteria
+- Non-owner nodes cannot remove owner sessions via sync deletes.
+- Delete sync semantics match per-RG ownership model used by create/session sweep paths.
+- Active/active stress tests show no ownership-violating deletes.
+
+
+---
+
+## #84 — HA race: VRRP event watcher uses background context and outlives shutdown lifecycle [CLOSED] (closed 2026-03-02)
+
+## Problem
+`watchVRRPEvents` is launched with `context.Background()` and is not part of coordinated shutdown. Combined with an event channel that is never closed, this creates goroutine lifecycle leaks and shutdown-order races.
+
+## Code evidence
+- Watcher started with background context:
+  - `pkg/daemon/daemon.go:579`
+- Watcher exits only on `ctx.Done()` or closed event channel:
+  - `pkg/daemon/daemon.go:3873-3939`
+- VRRP manager stop does not close `eventCh`:
+  - `pkg/vrrp/manager.go:59-81` (instances cleared/stopped, manager cancel, but channel remains open)
+
+## HA impact
+- Event watcher can outlive intended daemon lifecycle.
+- During shutdown, VRRP stop events may race with dataplane/cluster teardown handling.
+- Harder to guarantee deterministic fail-closed behavior during process stop.
+
+## Proposed fix
+1. Run `watchVRRPEvents` on daemon `ctx` (not background).
+2. Include watcher in shutdown waitgroup.
+3. Define clear manager/event channel shutdown semantics (close channel or explicit stop signal).
+
+## Acceptance criteria
+- No goroutine leaks for VRRP watcher across start/stop cycles.
+- Shutdown ordering is deterministic and race-free for VRRP->rg_active transitions.
+- Tests validate clean watcher termination.
+
+
+---
+
+## #85 — HA reliability: sync queue overflow drops critical control messages without replay [CLOSED] (closed 2026-03-02)
+
+## Problem
+Session sync send queue overflow drops critical message types (deletes/config/failover/IPsec sync) without replay/ack semantics.
+
+## Code evidence
+- `queueMessage` drops on full channel (`default` case):
+  - `pkg/cluster/sync.go:345-362`
+- Replay mechanism (`syncBackfillNeeded`) only helps sweep-created session adds:
+  - `pkg/cluster/sync.go:283-334`
+- Delete/config/failover/IPsec paths rely on one-shot queue/write and can be lost:
+  - deletes: `pkg/cluster/sync.go:377-387`
+  - config: `pkg/cluster/sync.go:389-407`
+  - failover: `pkg/cluster/sync.go:410-428`
+  - IPsec SA: `pkg/cluster/sync.go:929-947`
+
+## HA impact
+- Lost delete messages leave stale sessions/NAT reverse entries.
+- Lost failover request can stall operator-initiated role move.
+- Lost config/IPsec messages create control-plane drift.
+
+## Proposed fix
+1. Prioritize/partition queues by message class (control vs data).
+2. Add retry/ack semantics for critical control messages.
+3. Add replay strategy for deletes (not only session creates).
+4. Expose queue drop counters by message type.
+
+## Acceptance criteria
+- Queue pressure cannot silently drop critical HA control messages.
+- Delete/config/failover delivery is reliable under stress.
+- Tests inject queue saturation and verify eventual consistency.
+
+
+---
+
+## #86 — HA race: dropped cluster events are not repaired for VRRP control actions [CLOSED] (closed 2026-03-02)
+
+## Problem
+When cluster events are dropped (full event channel), recovery path only reconciles `rg_active`/blackhole state and does **not** replay VRRP control actions (`ResignRG`, priority restore, forced MASTER). This can leave VRRP and cluster state diverged under churn.
+
+## Code evidence
+- Dropped cluster events trigger `onEventDrop` callback:
+  - `pkg/cluster/cluster.go:523-531`
+- Daemon wires this callback to `triggerReconcile()`:
+  - `pkg/daemon/daemon.go:212-214`
+- `reconcileRGState()` only reconciles `rg_active` + blackhole routes:
+  - `pkg/daemon/daemon.go:3974-4071`
+- VRRP control actions exist only in event-driven handler:
+  - `pkg/daemon/daemon.go:3745-3764` (`ResignRG`, `UpdateRGPriority`, `ForceRGMaster`)
+
+If the event carrying a primary/secondary transition is dropped, those VRRP actions are never replayed.
+
+## HA impact
+- Cluster says Secondary while VRRP may remain MASTER (or wrong priority).
+- Active/active ownership can drift and create prolonged forwarding inconsistencies.
+- Reconcile loop reports state "correct" because it observes stale VRRP state as authoritative input.
+
+## Proposed fix
+1. Add periodic VRRP-vs-cluster reconciliation for control actions (not just `rg_active`).
+2. On reconcile pass, enforce expected VRRP posture from authoritative cluster state.
+3. Keep event path fast, but make reconciliation able to repair missed VRRP transitions.
+
+## Acceptance criteria
+- Dropped cluster events no longer leave persistent VRRP role/priority drift.
+- Under forced event-channel saturation, states self-heal without manual intervention.
+- Tests cover dropped transition events and verify eventual convergence.
+
+
+---
+
+## #87 — HA bug: heartbeat/session-sync endpoints are one-shot and not reconfigured on runtime config changes [CLOSED] (closed 2026-03-02)
+
+## Problem
+HA transport endpoints (heartbeat + session sync) are started once at daemon boot and are not reconfigured when cluster control/fabric settings change via config apply/sync.
+
+## Code evidence
+- `startClusterComms()` is called once during daemon startup:
+  - `pkg/daemon/daemon.go:267-270`
+- Heartbeat/session sync startup + endpoint binding occur inside that one-shot path:
+  - heartbeat: `pkg/daemon/daemon.go:3370-3399`
+  - session sync: `pkg/daemon/daemon.go:3402-3530`
+- `StartHeartbeat()`/`sessionSync.Start()` call sites are only in startup path:
+  - `pkg/daemon/daemon.go:3385`, `3497`
+- Runtime config apply updates cluster state/config but does not restart comms endpoints:
+  - `pkg/daemon/daemon.go:1603-1605`
+
+## HA impact
+- Changes to `control-interface`, `peer-address`, `fabric-interface`, or `fabric-peer-address` may not take effect until daemon restart.
+- Nodes can continue using stale sync/heartbeat sockets after commit/config-sync.
+- Creates split behavior between configured and actual HA transport state.
+
+## Proposed fix
+1. Detect HA transport config deltas on apply/sync.
+2. Restart/rebind heartbeat and session-sync endpoints safely when these fields change.
+3. Expose current bound transport endpoints in status output.
+
+## Acceptance criteria
+- HA transport endpoint changes apply without daemon restart.
+- Post-commit runtime state matches active config for heartbeat/sync bindings.
+- Regression tests cover transport endpoint reconfiguration.
+
+
+---
+
+## #88 — HA safety bug: manual failover can self-blackhole when peer is already down [CLOSED] (closed 2026-03-02)
+
+## Problem
+`ManualFailover()` can force local node to `Secondary` with weight 0 even when peer is already down/unreachable, creating a self-inflicted traffic blackhole until manual reset.
+
+## Code evidence
+- `ManualFailover()` unconditionally sets:
+  - `ManualFailover=true`
+  - `Weight=0`
+  - `State=Secondary`
+  - `pkg/cluster/cluster.go:405-423`
+- Single-node election explicitly skips `ManualFailover` groups:
+  - `pkg/cluster/cluster.go:255-257`
+- Default CLI command path invokes `ManualFailover()` directly (without `node <id>` peer-request path):
+  - `pkg/cli/cli.go:11631-11660`
+
+If peer is already dead and operator runs `request chassis cluster failover redundancy-group <N>`, local node can resign with no live peer to take over.
+
+## HA impact
+- Immediate avoidable outage on that RG.
+- Recovery requires explicit operator reset (`request ... failover reset ...`).
+- High-risk operational footgun during incident handling.
+
+## Proposed fix
+1. Guard `ManualFailover()` against `!peerAlive` by default (return error or require explicit `force`).
+2. Improve CLI UX to steer operators toward `node <local>`/`node <peer>` semantics with peer liveness checks.
+3. Emit explicit warning/event when manual failover is requested without a healthy peer.
+
+## Acceptance criteria
+- Manual failover cannot silently blackhole traffic when peer is down.
+- Operator receives clear actionable error/warning.
+- Existing valid manual failover workflows remain functional when peer is alive.
+
+
+---
+
+## #89 — HA race: stale session-sync receive loops can disconnect a newer active connection [CLOSED] (closed 2026-03-02)
+
+## Problem
+`SessionSync` can tear down a newly-established peer connection when an older `receiveLoop` exits.
+
+## Code evidence
+- Each accepted/dialed connection starts its own `receiveLoop` with `defer s.handleDisconnect()`:
+  - `pkg/cluster/sync.go:607-610`
+- Connection handoff overwrites `s.conn` on every new accept/dial:
+  - accept path: `pkg/cluster/sync.go:501-507`
+  - connect path: `pkg/cluster/sync.go:560-566`
+- `handleDisconnect()` closes **whatever is currently in `s.conn`**, not the specific conn that failed:
+  - `pkg/cluster/sync.go:878-886`
+
+Failure sequence:
+1. conn A is active (`receiveLoop(A)` running)
+2. conn B is established and assigned to `s.conn`
+3. `receiveLoop(A)` exits (expected) and calls `handleDisconnect()`
+4. `handleDisconnect()` closes conn B (the new active conn)
+
+## HA impact
+- Session sync connection flaps during normal reconnect/race scenarios.
+- Bulk sync, deletes, and failover control messages can be interrupted/lost.
+- Promotes non-deterministic failover behavior under transport churn.
+
+## Proposed fix
+1. Make disconnect handling connection-specific (`handleDisconnectConn(conn)`), and only clear/close if `conn == s.conn`.
+2. Ensure accept/connect handoff cannot let stale goroutines close the new connection.
+3. Add tests for dual-connection handoff (A→B) ensuring B remains connected when A exits.
+
+## Acceptance criteria
+- Stale `receiveLoop` exit cannot close the currently active connection.
+- Rapid reconnect/dual-connect scenarios converge to one stable connection.
+- Regression test reproduces old failure and passes with fix.
+
+
+---
+
+## #90 — HA protocol bug: session-sync writes are unsynchronized and can corrupt frames [CLOSED] (closed 2026-03-02)
+
+## Problem
+Session sync message writes are not serialized and are not short-write safe, which can corrupt protocol framing under load.
+
+## Code evidence
+- Background data path writes from `sendLoop`:
+  - `pkg/cluster/sync.go:586-603`
+- Control paths write directly to the same `net.Conn` concurrently (`writeMsg`):
+  - config: `pkg/cluster/sync.go:389-408`
+  - failover: `pkg/cluster/sync.go:410-429`
+  - IPsec SA: `pkg/cluster/sync.go:929-947`
+  - bulk sync: `pkg/cluster/sync.go:431-485`
+- `writeMsg` performs two separate writes (header then payload), so interleaving with other writers can splice frames:
+  - `pkg/cluster/sync.go:958-971`
+- `sendLoop` uses `conn.Write(msg)` once and ignores short writes (`n < len(msg)` with nil error):
+  - `pkg/cluster/sync.go:598`
+
+## HA impact
+- Peer can observe malformed headers/magic mismatches and disconnect.
+- Control messages (failover/config) can be corrupted during heavy session replication.
+- Causes intermittent sync instability and failover unpredictability.
+
+## Proposed fix
+1. Enforce a single serialized writer path for all message classes (data + control + bulk).
+2. Implement full-write semantics (`writeFull`) and treat short writes as retry/error.
+3. Add stress tests with concurrent queue traffic + config/failover sends and verify no framing errors.
+
+## Acceptance criteria
+- No concurrent unsynchronized writes to the sync TCP stream.
+- All sends are full-frame writes or explicit errors/retries.
+- Under concurrency stress, receiver never logs bad magic/truncated frame due to writer interleaving.
+
+
+---
+
+## #91 — HA startup race: SESSION_OPEN sync callback can be skipped permanently [CLOSED] (closed 2026-03-02)
+
+## Problem
+Near-real-time `SESSION_OPEN` sync callback registration is racey and may never be installed.
+
+## Code evidence
+- Callback is only added once, conditionally, during event reader setup:
+  - `pkg/daemon/daemon.go:336-379`
+  - guarded by `if d.sessionSync != nil`
+- `d.sessionSync` is created asynchronously later in `startClusterComms()` goroutine:
+  - `pkg/daemon/daemon.go:3405-3431`
+- No later path re-adds the callback after `d.sessionSync` becomes non-nil.
+
+If event-reader init runs before session-sync startup (common when fabric IP/VRF waits), incremental `SESSION_OPEN` replication never gets wired for the process lifetime.
+
+## HA impact
+- Only periodic sweep replication remains; short-lived sessions can be missed.
+- Slower/less complete convergence after failover under bursty traffic.
+- Increased probability of random connection drops during ownership transitions.
+
+## Proposed fix
+1. Register the callback unconditionally and check `d.sessionSync` dynamically inside handler, or
+2. Add callback when `sessionSync` is created (idempotent registration).
+3. Add startup-order test where sessionSync starts late and verify callback still fires.
+
+## Acceptance criteria
+- `SESSION_OPEN` callback is always active regardless of startup ordering.
+- Late sessionSync initialization does not disable incremental session replication.
+- Tests cover both early and late sessionSync startup sequences.
+
+
+---
+
+## #92 — HA election bug: stale peer RG entries persist across heartbeats [CLOSED] (closed 2026-03-02)
+
+## Problem
+Peer RG state from heartbeat is append/update-only; RGs missing from a newer heartbeat are never pruned, leaving stale peer state in elections.
+
+## Code evidence
+- `handlePeerHeartbeat()` updates entries present in packet but does not clear missing RG IDs:
+  - `pkg/cluster/cluster.go:721-728`
+- Election logic distinguishes `peerGroup == nil` as "peer has no RG info" and can promote local primary:
+  - `pkg/cluster/election.go:100-104`
+
+Because stale `peerGroups[rgID]` entries persist, local election can keep using outdated peer weight/state for RGs the peer no longer advertises.
+
+## HA impact
+- Incorrect primary/secondary decisions after RG add/remove/reconfigure.
+- Possible prolonged secondary state when local should promote (or vice versa).
+- Debug output (`show chassis cluster`) can report stale peer RG data.
+
+## Proposed fix
+1. Rebuild/replace `peerGroups` on each heartbeat packet (authoritative snapshot semantics).
+2. Keep explicit timeout-based clear for full peer loss, but also prune per-packet deltas.
+3. Add test: peer heartbeat transitions from RG set `{0,1}` to `{0}` and verify RG1 stale state is removed.
+
+## Acceptance criteria
+- `peerGroups` reflects exactly the latest heartbeat payload.
+- Election behavior for removed RGs matches `peerGroup == nil` path.
+- Regression tests cover RG removal without full peer timeout.
+
+
+---
+
+## #93 — HA drift bug: reconcile loop does not repair RA/DHCP service ownership after dropped VRRP events [CLOSED] (closed 2026-03-02)
+
+## Problem
+Dropped VRRP events can leave per-RG service ownership (RA/DHCP) stale because reconciliation only repairs `rg_active`/blackhole state.
+
+## Code evidence
+- RA/DHCP ownership changes are event-driven only:
+  - on MASTER: `applyRethServicesForRG()` at `pkg/daemon/daemon.go:3915`
+  - on BACKUP: `clearRethServicesForRG()` at `pkg/daemon/daemon.go:3934`
+- Dropped VRRP/cluster events trigger reconcile via `triggerReconcile()` callbacks:
+  - `pkg/daemon/daemon.go:212-214`, `229-231`, `3965-3972`
+- `reconcileRGState()` repairs only rg_state/`rg_active` and blackhole routes:
+  - `pkg/daemon/daemon.go:3974-4071`
+  - no RA/DHCP service reconciliation in this path.
+
+## HA impact
+- Node can have correct forwarding state but wrong control-plane services after event drops.
+- Risks dual-service or missing-service behavior (RA/DHCP) during churn.
+- Produces hard-to-debug split behavior where dataplane and service ownership disagree.
+
+## Proposed fix
+1. Extend reconciliation to assert per-RG service ownership from authoritative VRRP state snapshot.
+2. Make service apply/clear idempotent so reconcile can safely enforce desired state.
+3. Add forced event-drop tests validating eventual RA/DHCP convergence.
+
+## Acceptance criteria
+- Dropped VRRP events cannot leave persistent RA/DHCP ownership drift.
+- Reconcile pass converges both dataplane (`rg_active`) and per-RG services.
+- Tests simulate event channel saturation and verify eventual consistent service state.
+
+
+---
+
+## #94 — HA lifecycle race: cluster watcher/comms use pre-signal context and can outlive shutdown cancel [CLOSED] (closed 2026-03-02)
+
+## Problem
+Some HA goroutines are started with the pre-signal parent context and are not tied to the shutdown context canceled by `stop()`.
+
+## Code evidence
+- HA goroutines started before signal context wrapping:
+  - `go d.watchClusterEvents(ctx)` at `pkg/daemon/daemon.go:219`
+  - `d.startClusterComms(ctx)` at `pkg/daemon/daemon.go:269`
+- Later, `ctx` is replaced with `signal.NotifyContext(...)`:
+  - `pkg/daemon/daemon.go:276-281`
+- Shutdown calls `stop()` (cancels the new child context only):
+  - `pkg/daemon/daemon.go:761-763`
+
+Result: early goroutines use the original parent context and can outlive normal shutdown cancellation semantics.
+
+## HA impact
+- Lifecycle leaks/races during teardown/restart paths.
+- Non-deterministic shutdown ordering for HA control goroutines.
+- Harder to guarantee clean fail-closed behavior under repeated restart/failover testing.
+
+## Proposed fix
+1. Create the signal-aware context before launching HA goroutines.
+2. Ensure all long-lived HA loops use that context (or an explicit daemon-owned cancel context).
+3. Add shutdown tests that assert all HA goroutines exit deterministically.
+
+## Acceptance criteria
+- No HA control goroutine remains running after shutdown.
+- Context cancellation path is single-source and consistent.
+- Restart tests show stable lifecycle without leaked HA loops.
+
+
+---
+
+## #96 — VRRP startup sync-hold race allows preempt-before-sync on node rejoin [CLOSED] (closed 2026-03-02)
+
+## Summary
+When a node restarts and rejoins an HA cluster, VRRP preemption suppression (`sync hold`) can be applied too late or can be unintentionally bypassed. This allows a returning high-priority node to preempt before session state is synchronized, causing transient connection drops during failover/rejoin.
+
+## Observed behavior
+- New daemon startup can still preempt early, despite sync hold intended behavior.
+- Existing VRRP instances can keep or regain `preempt=true` while hold is active.
+- Re-arming sync hold can leave a stale timer active, releasing hold earlier than intended.
+
+## Root causes
+1. Startup ordering race: sync hold is enabled in `startClusterComms()` (async, after initial config apply), but VRRP instances are created earlier in `applyConfig()`.
+2. `SetSyncHold()` only affected instances created later; it did not suppress preempt on already-running instances.
+3. `UpdateInstances()` in-place updates could re-enable `cfg.Preempt` during active hold.
+4. `SetSyncHold()` did not stop/replace an existing hold timer when called again.
+
+## Expected behavior
+- On fresh clustered startup (with fabric sync configured), hold should be active **before** first VRRP instance creation/update.
+- While hold is active, all instances should have effective `preempt=false` (existing + updated + newly created), while preserving configured desired preempt for restore.
+- Re-arming hold should replace the prior timer, not race with it.
+
+## Suggested fix
+- Enable startup sync hold right after VRRP manager init in `Run()`, before first `applyConfig()`/`UpdateInstances()`.
+- Make `SetSyncHold()` suppress preempt immediately on existing instances.
+- In `UpdateInstances()`, keep effective `preempt=false` when hold is active and preserve configured `desiredPreempt`.
+- Stop and replace any prior sync-hold timer when setting hold again.
+
+## Acceptance criteria
+- Regression tests cover:
+  - sync hold applies to existing instances
+  - existing-instance updates do not break hold
+  - timer re-arm replaces old timer and does not early-release hold
+- During restart/rejoin with active peer, returning node does not preempt until bulk sync completion (or hold timeout fallback).
+
+
+---
+
+## #98 — HA neighbor warmup skips interface-qualified static next-hops with Junos interface names [CLOSED] (closed 2026-03-02)
+
+## Summary
+`resolveNeighbors()` skips interface-qualified static next-hops when the configured interface name is in Junos form (`ge-0/0/1`, `reth0.50`) instead of Linux form (`ge-0-0-1`, resolved member VLAN). This breaks proactive ARP/NDP warmup in HA and increases NO_NEIGH drops right after failover.
+
+## Why this matters
+During HA takeover, we rely on proactive neighbor resolution so first packets do not hit `BPF_FIB_LKUP_RET_NO_NEIGH`. If interface-qualified next-hops are skipped, the new active node can still cold-drop traffic for several seconds.
+
+## Root cause
+In [`pkg/daemon/daemon.go`](pkg/daemon/daemon.go), `resolveNeighbors()` does:
+
+- `addByName(nh.Address, nh.Interface)` for static routes ([`pkg/daemon/daemon.go:1913`](pkg/daemon/daemon.go#L1913), [`pkg/daemon/daemon.go:1930`](pkg/daemon/daemon.go#L1930))
+- `netlink.LinkByName(ifName)` directly in `addByName` ([`pkg/daemon/daemon.go:1891-1899`](pkg/daemon/daemon.go#L1891-L1899))
+
+`nh.Interface` is parsed from config in Junos naming, and may also be a RETH logical name. `LinkByName` then fails silently, so the target is never probed.
+
+## Repro
+1. Configure static route with interface-qualified next-hop, e.g. IPv6 link-local:
+   - `set routing-options static route ::/0 next-hop fe80::1 interface reth0.50`
+2. Trigger HA failover/restart.
+3. Observe missing neighbor prewarm for this next-hop and transient NO_NEIGH drops in first traffic window.
+
+## Expected
+`resolveNeighbors()` should normalize/resolve interface names before `LinkByName`:
+- Resolve RETH/logical names to active Linux member interface
+- Apply Junos→Linux name normalization (`config.LinuxIfName`)
+- Handle VLAN subinterfaces consistently
+
+## Acceptance criteria
+- Interface-qualified static route next-hops are successfully probed in HA for both v4/v6 routes.
+- Neighbor warmup logs include those targets after failover.
+- Failover test with interface-qualified next-hop no longer shows first-packet NO_NEIGH loss for that route.
+
+
+---
+
+## #99 — HA sync protocol still vulnerable to short-write frame truncation [CLOSED] (closed 2026-03-02)
+
+## Summary
+Session sync still assumes a single `Write()` sends a full frame. Both `writeMsg()` and `sendLoop` ignore short writes, which can truncate protocol frames under backpressure and desynchronize the stream.
+
+## Why this matters
+HA correctness depends on reliable session/config/failover/fence replication. A short write can send a partial frame header/payload, causing receiver parse errors (`bad magic`, truncated payload) and disconnect/reconnect churn exactly during failover windows.
+
+## Root cause
+- `sendLoop` writes queued messages with one `conn.Write(msg)` and ignores returned byte count:
+  - [`pkg/cluster/sync.go:687`](pkg/cluster/sync.go#L687)
+- `writeMsg` builds framed messages and also does single `conn.Write(buf)` with no full-write loop:
+  - [`pkg/cluster/sync.go:1188-1195`](pkg/cluster/sync.go#L1188-L1195)
+
+This is unsafe for stream sockets: `Write` may return `n < len(buf)` with `err == nil`.
+
+## Expected
+All sync writes must be full-frame writes (or fail):
+- use `io.Copy`/`writeFull` style loops until all bytes are sent
+- treat short write as error if full payload cannot be sent
+- keep serialization via `writeMu`
+
+## Acceptance criteria
+- Add unit tests with a mock `net.Conn` that intentionally short-writes.
+- Session/config/failover/fence writes either send full frames or return error.
+- No truncated frames observed in protocol tests under forced short-write behavior.
+
+
+---
+
+## #100 — HA heartbeat can truncate with large monitor payloads and trigger false peer loss [CLOSED] (closed 2026-03-02)
+
+## Summary
+Heartbeat monitor payloads are variable-length but the receiver uses a fixed 512-byte UDP read buffer. Large monitor sets can truncate heartbeats, causing parse errors and false peer-loss failovers.
+
+## Why this matters
+In larger deployments with many interface-monitor entries, heartbeats can exceed 512 bytes. Truncated datagrams are treated as invalid heartbeats, incrementing errors and potentially driving `peer heartbeat timeout` despite a healthy peer.
+
+## Root cause
+- Hard-coded max heartbeat read size: [`pkg/cluster/heartbeat.go:24`](pkg/cluster/heartbeat.go#L24)
+- Receiver allocates `buf := make([]byte, maxHeartbeatSize)` and reads datagrams into it:
+  - [`pkg/cluster/heartbeat.go:296-307`](pkg/cluster/heartbeat.go#L296-L307)
+- Encoder allows unbounded monitor payload growth (per-monitor name length + count) with no size guard:
+  - [`pkg/cluster/heartbeat.go:83-127`](pkg/cluster/heartbeat.go#L83-L127)
+
+## Expected
+Heartbeat transport should be robust for configured monitor scale:
+- either increase read budget to safe MTU size and enforce bounded encode size
+- or cap/compact monitor section while always preserving RG election-critical fields
+- receiver should not flap peer state due monitor-section truncation
+
+## Acceptance criteria
+- Add test building a heartbeat with large monitor payload (>512 bytes).
+- Receiver continues to process RG state correctly without false timeout.
+- Monitor-section overflow behavior is explicit (bounded, dropped, or segmented) and documented.
+
+
+---
+
+## #101 — HA failover recovery delayed by fixed 10s VRRP posture mismatch timer [CLOSED] (closed 2026-03-02)
+
+## Summary
+VRRP posture reconciliation uses a fixed 10s mismatch delay, which can prolong cluster/VRRP divergence during failover incidents and manifest as 10-12s connectivity disruptions.
+
+## Why this matters
+When cluster state and VRRP state diverge (dropped events, delayed resign, missed MASTER transition), failover correctness waits for the posture fixer. A fixed 10s hold is too long for production failover targets and aligns with observed transient outage windows.
+
+## Root cause
+- Hard-coded posture mismatch delay: [`pkg/daemon/rg_state.go:208`](pkg/daemon/rg_state.go#L208)
+- Reconcile loop applies correction only after this delay:
+  - [`pkg/daemon/daemon.go:4295-4319`](pkg/daemon/daemon.go#L4295-L4319)
+
+Current behavior is conservative to avoid fighting transient startup/sync-hold states, but it also delays real corrective action for sustained mismatches.
+
+## Expected
+Use context-aware posture correction timing:
+- keep longer suppression during explicit sync-hold/startup windows
+- use faster correction for steady-state failover mismatch (e.g. post-timeout/manual failover paths)
+- target sub-second to low-second correction for real mismatch, not 10s+
+
+## Acceptance criteria
+- Add tests for sustained mismatch correction latency in non-sync-hold steady-state.
+- Demonstrate faster correction than 10s in failover scenarios without reintroducing startup flapping.
+- Document posture delay policy (when long vs short delays apply).
+
+
+---
+
+## #102 — HA fail-closed gap: ungraceful daemon failures can leave stale forwarding active [CLOSED] (closed 2026-03-02)
+
+## Summary
+HA fail-closed behavior is currently tied to graceful daemon shutdown. Unclean failures (`SIGKILL`, panic, deadlock) can leave stale dataplane forwarding active until external detection/election catches up.
+
+## Why this matters
+Failover testing includes hard-crash and hung-daemon cases. If userspace dies without running shutdown hooks, local BPF state can continue forwarding with stale ownership, increasing split-brain or blackhole windows.
+
+## Current behavior
+Graceful path clears `rg_active` and tears down dataplane in HA mode:
+- [`pkg/daemon/daemon.go:828-889`](pkg/daemon/daemon.go#L828-L889)
+
+But this path is not executed for ungraceful termination.
+
+## Gap
+No dataplane-side liveness deadline/watchdog enforces fail-closed when control plane stops making progress.
+
+## Expected
+Add an HA liveness mechanism so forwarding ownership fails closed even on ungraceful bpfrxd failure:
+- userspace heartbeat timestamp map checked in XDP/TC fast path, or
+- systemd watchdog/fencing integration that deterministically disables local forwarding state
+
+## Acceptance criteria
+- In HA mode, killing bpfrxd ungracefully (`kill -9`) on primary stops local forwarding ownership within a bounded small window.
+- Peer takeover proceeds without prolonged dual-forwarding behavior.
+- Behavior is covered by automated HA crash/hung-node test assertions.
+
+
+---
+
+## #103 — HA startup: block primary takeover until interfaces/VRRP are ready and hold timer expires [CLOSED] (closed 2026-03-02)
+
+## Summary
+On startup/rejoin, RG election can promote this node to `primary` before local interfaces/VRRP are actually ready. This can activate forwarding early and cause transient loss/blackhole during HA transitions.
+
+## Why this is a bug
+The current flow has no strict readiness gate before takeover:
+
+- Election can promote on peer-loss/no-peer-info with `weight > 0`:
+  - `pkg/cluster/election.go:82-105`
+  - `pkg/cluster/election.go:121-127`
+- Interface monitor skips missing interfaces (treated as "belongs to peer"), so local readiness can be overestimated:
+  - `pkg/cluster/monitor.go:255-260`
+- VRRP instance creation skips missing interfaces instead of failing readiness:
+  - `pkg/vrrp/manager.go:223-227`
+- VRRP posture check returns OK when no VRRP instances exist for RG:
+  - `pkg/daemon/rg_state.go:228-233`
+- Cluster event path can set `rg_active=true` and remove blackholes on primary transition before VRRP/interface readiness is proven:
+  - `pkg/daemon/daemon.go:3988-4005`
+
+Also, `StateSecondaryHold` exists but does not appear to be actively used as a startup/takeover gating state in election transitions.
+
+## Proposed fix
+Implement a strict per-RG readiness gate and enforce a hold timer before takeover:
+
+1. Define readiness contract (must all be true):
+- Required monitored/member interfaces for RG exist and are operationally up.
+- Required VRRP instances for RG are created/running.
+- Optional: fabric/session-sync readiness if configured as required for this RG.
+
+2. Add takeover hold state/timer:
+- Keep RG in `secondary-hold` until readiness is continuously true for `takeover_hold_time`.
+- If readiness drops, reset timer and stay in hold.
+
+3. Block activation while not ready:
+- Do not allow cluster election to transition to effective primary forwarding while in hold.
+- Do not call `UpdateRGActive(..., true)` / blackhole removal until readiness+hold pass.
+
+4. Treat missing local-required interfaces as not-ready (not silently skipped).
+
+5. Surface observability:
+- CLI/status should show RG readiness reasons and remaining hold timer.
+
+*(truncated — 47 lines total)*
+
+
+---
+
+## #104 — HA same-L2: add strict single-owner VIP mode to stop duplicate NA ownership churn [CLOSED] (closed 2026-03-02)
+
+## Summary
+In same-L2 HA deployments, we are seeing repeated IPv6 duplicate-owner warnings during failover windows:
+
+`ICMPv6: NA: 02:bf:72:01:01:01 advertised our address ...`
+
+This points to VIP ownership overlap (or repeated ownership re-advertisement) that is acceptable in some topologies but not in strict shared-L2 environments where only one owner should advertise at a time.
+
+## Relevant code paths
+- Per-node RETH MACs on shared L2: `pkg/cluster/reth.go` (`RethMAC` format `02:bf:72:CC:RR:NN`)
+- Unified activation rule: `pkg/daemon/rg_state.go` (`rg_active = clusterPri || anyVrrpMaster`)
+- Cluster event activation ordering: `pkg/daemon/daemon.go` (`watchClusterEvents`)
+- MASTER NA/GARP emission:
+  - `pkg/vrrp/instance.go` (`becomeMaster` -> `sendGARP`)
+  - `pkg/cluster/garp.go` (`SendGratuitousIPv6Burst`)
+
+## Proposed fix (execution plan)
+1. Add topology/ownership mode knob
+- Add an explicit strict single-owner mode (global or per-RG) for same-L2 deployments.
+- Keep current overlap behavior as default for non-shared-L2 deployments.
+
+2. Strict-mode activation semantics
+- For strict-mode RGs, derive desired forwarding from VRRP ownership only (`anyVrrpMaster`), not `clusterPri || anyVrrpMaster`.
+- Maintain existing behavior for default mode.
+
+3. NA/GARP dedupe and dampening
+- Send NA/GARP once per actual BACKUP->MASTER epoch.
+- Suppress duplicate bursts from reconciliation unless VIP state changed.
+- Add minimum resend interval to prevent burst storms under flap.
+
+4. Observability
+- Add logs/counters for strict-mode gating and NA/GARP suppression decisions.
+
+5. Validation
+- Same-L2 failover/failback test ensuring no sustained duplicate-owner NA events.
+- Repeated transition stress test for connectivity stability.
+- Confirm non-strict mode behavior unchanged.
+
+## Acceptance criteria
+- Strict mode: no sustained duplicate VIP ownership advertisements on shared-L2 during transitions.
+- No persistent connectivity loss under repeated HA transitions.
+
+*(truncated — 45 lines total)*
+
+
+---
+
+## #107 — HA syntax parity: implement vSRX dual-fabric (fab0 + fab1) architecture [CLOSED] (closed 2026-03-03)
+
+## Summary
+
+We need true vSRX HA syntax compatibility for dual fabric interfaces (`fab0` + `fab1`) as seen in `vsrx.conf`.
+
+Today bpfrx can parse interface stanzas for `fab0`/`fab1`, but core HA transport/data-plane still assumes a single fabric endpoint (`fabric-interface`/`fabric-peer-address`), which is not equivalent to vSRX dual-fabric behavior.
+
+Reference doc added:
+- `docs/next-features/vsrx-fabric-fab0-fab1-syntax-compat.md`
+
+## Evidence in current code
+
+- Single fabric in cluster config model:
+  - `pkg/config/types.go` (`FabricInterface`, `FabricPeerAddress`)
+- Chassis compile path reads one fabric transport tuple:
+  - `pkg/config/compiler.go` (`fabric-interface`, `fabric-peer-address`)
+- Runtime HA comms is single-fabric:
+  - `pkg/daemon/daemon.go` (`startClusterComms`, `clusterTransportKey`, `populateFabricFwd` single iface/peer)
+- CLI/Show model is single-fabric:
+  - `pkg/cluster/cluster.go` (`InterfacesInput` has one `FabricInterface`)
+  - `pkg/cli/cli.go` and `pkg/grpcapi/server.go` populate one value
+- eBPF fabric forwarding state is singleton:
+  - `bpf/headers/bpfrx_maps.h` (`fabric_fwd` map `max_entries = 1`)
+- DPDK parity is singleton:
+  - `dpdk_worker/shared_mem.h` (`fabric_port_id` scalar)
+  - `pkg/dataplane/dpdk/dpdk_cgo.go` writes one fabric port
+- Bond mode inconsistency in current fabric handling:
+  - `pkg/dataplane/compiler.go` emits `active-backup`
+  - `pkg/routing/routing.go` creates runtime bond as `802.3ad`
+
+## Required architectural changes
+
+1. Introduce multi-fabric HA transport model
+- Replace single fabric fields with a list/struct model for fabric links.
+- Preserve backward compatibility by mapping legacy single-fabric config into a one-link list.
+
+2. Build a fabric transport manager
+- Manage link health for `fab0` and `fab1`.
+- Select active sync transport and fail over without cluster restart.
+- Expose per-link health/counters.
+
+
+*(truncated — 64 lines total)*
+
+
+---
+
+## #110 — HA private-rg-election: gate RG promotion on session sync readiness [CLOSED] (closed 2026-03-04)
+
+## Problem
+In `private-rg-election` (and `no-reth-vrrp`) mode, RG promotion can occur before session bulk-sync is complete. That creates takeover without full conntrack/NAT state and can drop established sessions during failover.
+
+## Why this happens
+- In reconcile readiness, VRRP readiness is forced to true when `isNoRethVRRP()` is true.
+- `isNoRethVRRP()` returns true for both `NoRethVRRP` and `PrivateRGElection`.
+- Election takeover gate (`SetRGReady` / `takeoverHoldTime`) therefore does not include sync readiness in private mode.
+- Sync completion callback exists (`OnBulkSyncReceived`), but it only releases VRRP hold; private mode has no equivalent gating path.
+
+## Code refs
+- `pkg/daemon/daemon.go:4643`
+- `pkg/daemon/daemon.go:4650`
+- `pkg/daemon/daemon.go:5220`
+- `pkg/cluster/election.go:217`
+- `pkg/daemon/daemon.go:3812`
+
+## Impact
+- New primary may forward with incomplete synced state.
+- Existing TCP flows can reset or blackhole briefly on failover.
+
+## Expected behavior
+In private RG election mode, promotion should be blocked until required sync readiness is met (or explicitly degraded with clear operator signal/timeout reason).
+
+## Acceptance criteria
+1. RG readiness in private mode includes sync readiness state (bulk sync done / sync connected policy).
+2. Promotion is gated until readiness holds for configured takeover hold time.
+3. If degraded-timeout fallback is allowed, reason is visible in status/logs.
+4. Add regression test covering failover before/after bulk sync completion in private mode.
+
+
+---
+
+## #111 — HA mode check mismatch: startup sync-hold logic ignores private-rg-election semantics [CLOSED] (closed 2026-03-04)
+
+## Problem
+Startup sync-hold enablement logic is inconsistent with private election mode:
+- Code enables VRRP sync-hold when `!cc.NoRethVRRP`.
+- But private mode is also treated as no-RETH-VRRP elsewhere via `isNoRethVRRP()` (`NoRethVRRP || PrivateRGElection`).
+
+This creates mode-dependent behavior drift and makes startup sequencing/error handling ambiguous in `private-rg-election`.
+
+## Code refs
+- `pkg/daemon/daemon.go:261`
+- `pkg/daemon/daemon.go:5220`
+
+## Impact
+- Private election mode can take a different startup path than intended.
+- Harder to reason about synchronization guarantees and readiness state.
+- Can mask failover/session continuity bugs due to inconsistent gating semantics.
+
+## Expected behavior
+Mode checks should be consistent for all RETH VRRP-disabled modes (`NoRethVRRP` and `PrivateRGElection`), with explicit sync-gating behavior defined for private mode.
+
+## Acceptance criteria
+1. Replace inconsistent one-off checks with a single source of truth for mode behavior.
+2. Define and document sync-hold/readiness behavior for private mode.
+3. Add unit tests for startup behavior matrix:
+   - default VRRP mode
+   - `no-reth-vrrp`
+   - `private-rg-election`
+
+
+---
+
+## #112 — private-rg-election gap: knob exists but no dedicated fast per-RG private advert protocol yet [CLOSED] (closed 2026-03-04)
+
+## Problem
+`private-rg-election` currently suppresses RETH VRRP, but there is no separate fast per-RG private advertisement/mastership protocol implemented yet.
+
+Current implementation relies on existing heartbeat/election path only.
+
+## Evidence in code
+- Config knob exists: `private-rg-election`.
+  - `pkg/config/ast.go:1478`
+  - `pkg/config/compiler.go:6079`
+- RETH VRRP is disabled for this mode.
+  - `pkg/vrrp/vrrp.go:75`
+- No `rg_advert`/private mastership transport implementation present.
+- Heartbeat remains UDP 4784 path.
+  - `pkg/cluster/heartbeat.go:15`
+  - `pkg/daemon/daemon.go:3675`
+
+## Impact
+- Failover and split-brain resolution are heartbeat-timer bound in private mode.
+- Session continuity during transient control-link disturbances can be worse than expected versus fast VRRP contention resolution.
+
+## Expected behavior
+Either:
+1. Implement the private per-RG advertisement/mastership protocol (control-link unicast), or
+2. Explicitly document that `private-rg-election` is currently a mode alias for direct VIP ownership on heartbeat election only, with current timing/risks.
+
+## Acceptance criteria
+1. Add clear runtime status/CLI indicator for active election mechanism.
+2. If protocol is implemented:
+   - per-RG advertisement sender/receiver on control link
+   - deterministic dual-active resolution based on advertised state/priority/tie-break
+   - tests for transient split and convergence timing
+3. If protocol is not implemented yet:
+   - update docs/config help to avoid misleading expectation.
+
+
+---
+
+## #113 — HA dual-active resolution: add winner-side ownership reaffirm (GARP/NA) [CLOSED] (closed 2026-03-04)
+
+## Problem
+When non-preempt dual-active is resolved by making one node yield, only the yielding node necessarily emits transition side-effects. The winning node can remain primary without an explicit ownership reaffirm (GARP/NA burst), leaving stale upstream ARP/NDP state longer than necessary.
+
+## Code refs
+- Dual-active resolution logic:
+  - `pkg/cluster/election.go:161`
+  - `pkg/cluster/election.go:163`
+- Events are emitted only on local state change:
+  - `pkg/cluster/election.go:239`
+- GARP/NA in direct mode is tied to local primary transition paths:
+  - `pkg/daemon/daemon.go:4379`
+  - `pkg/daemon/daemon.go:4751`
+
+## Impact
+- Possible longer convergence of upstream neighbor caches after split/merge.
+- Transient packet loss or asymmetric forwarding can persist after state converges.
+
+## Expected behavior
+On detected dual-active resolution, ensure the winner can proactively reaffirm ownership (rate-limited GARP/NA/probe), even if winner's state did not change.
+
+## Acceptance criteria
+1. Add a safe trigger path for winner-side ownership reaffirm on dual-active resolution.
+2. Ensure reaffirm is rate-limited to avoid GARP storms.
+3. Add test coverage for dual-active resolve path verifying both:
+   - loser demotes,
+   - winner ownership reaffirm is emitted exactly once (or within configured damping window).
+
+
+---
+
+## #114 — HA: move session/config sync transport to control link (fxp1) [CLOSED] (closed 2026-03-04)
+
+## Problem
+Session/config sync currently runs over the fabric interfaces (`fab0` / optional `fab1`) on port 4785, not over the control link.
+
+In HA operation, this couples critical control-plane state convergence (session sync/config sync failover continuity) to fabric link health and fabric data-plane behavior.
+
+## Current behavior (code refs)
+- Heartbeat/election uses control link (`control-interface` + `peer-address`) on UDP 4784:
+  - `pkg/daemon/daemon.go:3675`
+  - `pkg/cluster/heartbeat.go:15`
+- Session sync uses fabric addresses on 4785:
+  - `pkg/daemon/daemon.go:3733`
+  - `pkg/daemon/daemon.go:3734`
+  - `pkg/daemon/daemon.go:3767`
+  - `pkg/daemon/daemon.go:3769`
+- Docs reflect fabric transport:
+  - `docs/sync-protocol.md:8`
+
+## Requested change
+Move session/config sync transport to the control link (`control-interface`/`peer-address`) so HA control-plane liveness and state convergence share the same dedicated control path.
+
+## Why
+- Reduces dependence on fabric path behavior for control-plane state continuity.
+- Aligns with architecture intent: control traffic on control link, data-plane forwarding on fabric.
+- Simplifies failure-domain reasoning during failover testing.
+
+## Acceptance criteria
+1. Session/config sync can bind/connect over control link addresses (primary mode).
+2. Existing fabric-based mode remains optional or is explicitly deprecated with migration path.
+3. CLI/status exposes active sync transport (control vs fabric).
+4. Test coverage for failover continuity with control-link sync (including link flap/restart cases).
+5. Update docs (`sync-protocol.md`, HA docs) to match behavior.
+
+
+---
+
+## #115 — HA private-rg-election: include VIP ownership in takeover readiness gate [CLOSED] (closed 2026-03-04)
+
+## Problem
+In `private-rg-election` / `no-reth-vrrp` mode, takeover readiness only checks interface monitors and treats VRRP readiness as always true. It does **not** validate that VIP ownership can actually be established (VIP add success / VIP present on interfaces).
+
+A node can be elected primary (`rg_active=true`) while VIP add is failing or delayed, causing traffic to fail after failover.
+
+## Code refs
+- Readiness path:
+  - `pkg/daemon/daemon.go:4643`
+  - `pkg/daemon/daemon.go:4650`
+- Promotion side effects (direct VIP add after election):
+  - `pkg/daemon/daemon.go:4382`
+  - `pkg/daemon/daemon.go:4751`
+- Mode alias:
+  - `pkg/daemon/daemon.go:5220`
+
+## Impact
+- Primary role can be asserted before dataplane entry point (VIP ownership) is actually in place.
+- Long-lived and new flows may blackhole during/after failover.
+
+## Expected behavior
+In private mode, RG readiness should include a VIP ownership preflight/verification signal (or fail/hold until VIPs are present).
+
+## Acceptance criteria
+1. Add private-mode readiness component that verifies required VIPs are installable/present.
+2. Block promotion until VIP readiness is true for hold-time duration.
+3. Surface readiness reason in cluster status when blocked by VIP ownership failure.
+4. Add regression test where VIP add initially fails (interface not ready), then recovers without permanent failover outage.
+
+
+---
+
+## #116 — HA regression: chained hard-reset failover (fw0 crash/rejoin -> fw1 crash) stalls recovery [CLOSED] (closed 2026-03-04)
+
+## Problem
+Current HA coverage does not include a chained hard-reset scenario that mirrors field failures:
+1. fw0 primary, long-running iperf flow active
+2. hard reset fw0 (`echo b > /proc/sysrq-trigger`), failover to fw1
+3. fw0 returns, rejoins/syncs as secondary
+4. hard reset fw1, traffic should fail over back to fw0
+
+Reported behavior: second failover can stall and traffic does not recover.
+
+## Why this matters
+This is a realistic HA sequence for panic/reboot events. Passing one-direction failover is insufficient if reverse failover after rejoin fails.
+
+## Related areas in code
+- Cluster heartbeat/election and timeout promotion:
+  - `pkg/cluster/heartbeat.go`
+  - `pkg/cluster/election.go`
+- Direct VIP ownership paths (private mode):
+  - `pkg/daemon/daemon.go:4379`
+  - `pkg/daemon/daemon.go:4408`
+  - `pkg/daemon/daemon.go:4747`
+- Session sync reconnect/bulk sync:
+  - `pkg/daemon/daemon.go:3812`
+  - `pkg/cluster/sync.go`
+
+## Requested change
+Add automated HA regression test for chained hard-reset failover/failback with long-lived traffic, and gate releases on it.
+
+## Acceptance criteria
+1. Add reproducible test harness/script for chained crash sequence (fw0 crash -> recover -> fw1 crash).
+2. Include traffic continuity assertions for:
+   - established long-lived TCP flow behavior
+   - new connection recovery behavior after second crash
+3. Capture and assert cluster status transitions and sync status during each phase.
+4. Test runs in CI/nightly or documented stress target.
+
+
+---
+
+## #117 — HA session-sync: concurrent bulk writers can interleave epochs and trigger false stale deletes [CLOSED] (closed 2026-03-04)
+
+## Problem
+`SessionSync.BulkSync()` is not serialized as a transaction. It is invoked from both connection paths:
+
+- `acceptLoop()` calls `BulkSync()` (`pkg/cluster/sync.go:673`)
+- `connectLoop()` calls `BulkSync()` (`pkg/cluster/sync.go:742`)
+
+Within `BulkSync()`, each frame write takes and releases `writeMu` per message (`pkg/cluster/sync.go:549-551`, `567-569`, `591-593`, `606-608`).
+
+That means two concurrent `BulkSync()` calls (or `BulkSync()` + `sendLoop`) can interleave frame sequences on the same TCP stream, e.g.:
+
+- `BulkStart(A)`
+- `BulkStart(B)`
+- sessions from A/B interleaved
+- `BulkEnd(A)` / `BulkEnd(B)`
+
+Receiver state is single-global (`bulkInProgress`, `bulkRecvV4`, `bulkRecvV6`) in `handleMessage()` (`pkg/cluster/sync.go:1009-1017`) and stale reconciliation runs on each `BulkEnd` (`pkg/cluster/sync.go:1020-1023`).
+
+## HA impact
+Interleaved bulk epochs can produce non-authoritative `bulkRecv*` sets and trigger false stale deletion during `reconcileStaleSessions()`, causing random flow drops around failover/rejoin.
+
+## Proposal
+1. Enforce one active bulk transfer per connection (transaction lock/state machine).
+2. Add bulk epoch ID in `BulkStart/BulkEnd`; ignore stale/mismatched `BulkEnd`.
+3. Optionally pause incremental send-path frames while bulk is in progress (or sequence them through one ordered stream with explicit epoch boundaries).
+4. Add stress tests that intentionally race `acceptLoop`/`connectLoop` bulk triggers and verify no interleaving-induced stale deletes.
+
+## Acceptance criteria
+- At most one active bulk epoch is processed per connection.
+- Receiver never reconciles stale sessions from mixed/interleaved bulk sets.
+- Reconnect/failover stress test shows stable session continuity.
+
+
+---
+
+## #118 — HA session-sync: stale reconciliation should use BulkStart ownership snapshot [CLOSED] (closed 2026-03-04)
+
+## Problem
+Stale-session reconciliation scopes deletions using *current* ownership at `BulkEnd` time:
+
+- `reconcileStaleSessions()` checks `ShouldSyncZone(val.IngressZone)` while deleting stale entries (`pkg/cluster/sync.go:1113`, `1147`).
+
+`ShouldSyncZone()` depends on live RG primary state (`pkg/cluster/sync.go:318-333`). If RG ownership changes between `BulkStart` and `BulkEnd`, reconciliation scope no longer matches the ownership context that existed when the bulk transfer began.
+
+## HA impact
+During failover/recovery churn, a mid-bulk RG transition can:
+
+- delete sessions that should now be locally authoritative, or
+- skip deleting peer-owned stale sessions.
+
+Both cases can surface as transient random drops or sticky stale state after role transitions.
+
+## Proposal
+1. Snapshot zone/RG ownership context at `syncMsgBulkStart`.
+2. Use that snapshot (not live `ShouldSyncZone`) during `reconcileStaleSessions()`.
+3. If ownership changes materially before `BulkEnd`, abort reconcile for that epoch and require a fresh bulk.
+4. Add unit tests that flip `IsPrimaryForRGFn` results between `BulkStart` and `BulkEnd`.
+
+## Acceptance criteria
+- Reconcile decisions are deterministic for a given bulk epoch.
+- Ownership flips during a bulk do not cause false stale deletes.
+- Tests cover ownership-flip-in-bulk behavior for both v4/v6.
+
+
+---
+
+## #119 — HA session-sync: delete/session deltas are dropped while disconnected with no replay journal [CLOSED] (closed 2026-03-04)
+
+## Problem
+Incremental session updates are best-effort and silently dropped when disconnected:
+
+- `queueMessage()` returns false immediately when `Connected=false` (`pkg/cluster/sync.go:420-423`).
+- `QueueDeleteV4/V6()` and `QueueSessionV4/V6()` do not persist or retry dropped messages (`pkg/cluster/sync.go:440-460`).
+
+`syncSweep()` can replay *new sessions* via Created-time window, but there is no equivalent replay path for missed deletes during disconnect windows.
+
+## HA impact
+If the active node is disconnected from peer sync and sessions age out/delete locally, the standby can retain stale tuples until a later full bulk + reconcile. In crash/failover windows before that reconcile, stale state can interfere with takeover continuity.
+
+## Proposal
+1. Add a bounded delete-journal (or generic delta journal) that survives transient disconnects and flushes on reconnect.
+2. Trigger immediate post-reconnect delta flush before/with bulk sync.
+3. Add metrics for dropped queued updates by message type (`session_v4/v6`, `delete_v4/v6`).
+4. Add tests for disconnect -> deletes happen -> reconnect -> standby converges without waiting for periodic full-cycle cleanup.
+
+## Acceptance criteria
+- Delete events generated while disconnected are eventually delivered or explicitly reconciled on reconnect.
+- No silent permanent loss of delete deltas.
+- Convergence latency after reconnect is bounded and observable.
+
+
+---
+
+## #120 — cluster/session-sync: Stats() copies atomic fields (go vet copylocks failure) [CLOSED] (closed 2026-03-04)
+
+## Problem
+`SessionSync.Stats()` returns `SyncStats` by value:
+
+- `func (s *SessionSync) Stats() SyncStats { return s.stats }` (`pkg/cluster/sync.go:196-198`)
+
+`SyncStats` embeds `sync/atomic` typed fields, which must not be copied after first use.
+
+`go vet` reports:
+
+```
+pkg/cluster/sync.go:197:9: return copies lock value: github.com/psaab/bpfrx/pkg/cluster.SyncStats contains sync/atomic.Uint64 contains sync/atomic.noCopy
+```
+
+## Impact
+This is undefined/unsupported usage of atomic wrappers and can lead to subtle correctness hazards in stats reads, plus persistent vet failures.
+
+## Proposal
+1. Change API to avoid copying atomic fields (e.g. return pointer to internal stats, or return a plain snapshot struct with primitive values).
+2. Update `SyncStatsProvider` and callers (`pkg/cluster/cluster.go`) accordingly.
+3. Add/keep vet in CI for this package to prevent regressions.
+
+## Acceptance criteria
+- `go vet ./pkg/cluster/...` is clean.
+- No code path copies structs containing atomic typed fields.
+- Stats callers still get consistent read-only values.
+
+
+---
+
+## #121 — fabric: clear stale fabric_fwd entry when fab0/fab1 neighbor or link goes invalid [CLOSED] (closed 2026-03-06)
+
+## Problem
+`refreshFabricFwd()` / `refreshFabricFwd1()` return `false` when the fabric link disappears or the peer neighbor entry is missing, but they never write a zeroed `FabricFwdInfo` back to the dataplane.
+
+Because `try_fabric_redirect()` and `try_fabric_redirect_with_zone()` always prefer key `0` (`fab0`) when `ifindex != 0`, a once-valid `fab0` entry can remain armed indefinitely after the path dies. The dataplane keeps redirecting traffic into dead `fab0` instead of falling back to `fab1`.
+
+## Code
+- `pkg/daemon/daemon.go:4183`
+- `pkg/daemon/daemon.go:4312`
+- `bpf/headers/bpfrx_helpers.h:1962`
+- `bpf/headers/bpfrx_helpers.h:2019`
+
+## Impact
+- existing-session fabric redirect can blackhole after a fabric flap
+- new-connection zone-encoded fabric redirect can blackhole the same way
+- dual-fabric fallback is ineffective when stale `fab0` state survives
+
+## Suggested fix
+On any hard failure that invalidates a fabric path (link missing/down, neighbor unresolved, interface removed), explicitly write `FabricFwdInfo{Ifindex:0}` for that key so the dataplane can fall back to the other fabric or stop redirecting.
+
+---
+
+## #122 — fabric: refreshFabricFwd programs dead links because it never checks oper-state [CLOSED] (closed 2026-03-06)
+
+## Problem
+`refreshFabricFwd()` and `refreshFabricFwd1()` only verify that the interface exists and has a MAC address. They do not verify `OperState`, carrier, or administrative up/down state before publishing the path into `fabric_fwd`.
+
+If the kernel still has a stale ARP/NDP entry for the peer, the code can keep publishing a dead fabric interface as redirect-capable. Combined with the hard preference for `fab0`, this creates avoidable blackholes.
+
+## Code
+- `pkg/daemon/daemon.go:4183`
+- `pkg/daemon/daemon.go:4312`
+
+## Impact
+- redirect path may stay pinned to a dead fabric interface
+- dual-fabric failover can be delayed or bypassed entirely
+
+## Suggested fix
+Treat non-UP / no-carrier fabric interfaces as invalid and clear the corresponding `fabric_fwd` entry. Consider rejecting `OperUnknown` too unless there is a strong reason to trust it for these HA links.
+
+---
+
+## #123 — dual-fabric session sync uses one replaceable conn and can flap between fab0/fab1 [CLOSED] (closed 2026-03-06)
+
+## Problem
+`NewDualSessionSync()` exposes two peer addresses, but the runtime still models sync as a single mutable `s.conn` plus a single `Connected` bit. Any inbound or outbound connection on either fabric closes and replaces the current connection.
+
+There is no notion of preferred active path, no stickiness to `fab0`, and no protection against reconnect races where both links are healthy but different goroutines replace each other.
+
+## Code
+- `pkg/cluster/sync.go:645`
+- `pkg/cluster/sync.go:679`
+- `pkg/cluster/sync.go:1179`
+
+## Impact
+- unnecessary disconnect/reconnect churn on dual-fabric clusters
+- repeated bulk syncs after harmless reconnect races
+- HA status cannot tell which physical fabric is actually carrying sync
+
+## Suggested fix
+Track per-fabric connections explicitly and pick an active transport with deterministic preference/failover rules instead of replacing a single global conn opportunistically.
+
+---
+
+## #124 — fabric: no event-driven refresh on link/neigh changes leaves up to 30s redirect blackholes [CLOSED] (closed 2026-03-06)
+
+## Problem
+The fabric forwarding cache is refreshed immediately at startup, then on a 30 second ticker. `RefreshFabricFwd()` is documented for link-state and neighbor changes, but I only found it called from HA failover / VRRP transitions. There is no netlink subscription or neighbor-change trigger for fabric health.
+
+That means a dead `fab0` can remain programmed for up to 30 seconds even if `fab1` is healthy.
+
+## Code
+- `pkg/daemon/daemon.go:4136`
+- `pkg/daemon/daemon.go:4297`
+- `pkg/daemon/daemon.go:4383`
+- callers only in `pkg/daemon/daemon.go:4539`, `:4684`, `:4705`
+
+## Impact
+- transient or sustained fabric failures create long redirect blackholes
+- dual-fabric failover is much slower than necessary
+
+## Suggested fix
+Add netlink-driven refresh for fabric link and neighbor state changes, and use the periodic timer only as a safety net.
+
+---
+
+## #125 — dual-fabric: peer gRPC/monitor path is still single-address and does not fail over to fab1 [CLOSED] (closed 2026-03-06)
+
+## Problem
+The new dual-fabric work only dual-homes session sync. Peer RPC/monitor access is still single-address:
+- daemon stores one `syncPeerAddr`
+- fabric gRPC listener starts only on the primary sync IP
+- peer dialing uses one `FabricPeerAddrFn`
+
+If session sync fails over to `fab1` but `fab0` is down, peer monitor / CLI proxy RPCs can still target dead `fab0`.
+
+## Code
+- `pkg/daemon/daemon.go:3910`
+- `pkg/daemon/daemon.go:3914`
+- `pkg/grpcapi/server.go:71`
+- `pkg/grpcapi/server.go:8493`
+- `pkg/cli/cli.go:143`
+
+## Impact
+- cluster peer queries fail even when dual-fabric sync recovered
+- operator visibility during failover is worse exactly when needed most
+
+## Suggested fix
+Make the peer RPC path dual-address-aware, with listener/dial fallback aligned to the active sync transport or independent failover logic.
+
+---
+
+## #126 — dpdk: fabric redirect support is only partial; no DPDK equivalent of try_fabric_redirect found [CLOSED] (closed 2026-03-06)
+
+## Problem
+The Go dataplane layer now exposes `UpdateFabricFwd()` / `UpdateFabricFwd1()` for DPDK and writes `fabric_port_id` / `fabric1_port_id`. In the DPDK worker, I found those IDs used for validating incoming zone-encoded fabric traffic, but I did not find a DPDK equivalent of the BPF `try_fabric_redirect()` / `try_fabric_redirect_with_zone()` helpers that actually perform cross-chassis redirect.
+
+## Code
+- `pkg/dataplane/dpdk/dpdk_cgo.go:1164`
+- `pkg/dataplane/dpdk/dpdk_cgo.go:1185`
+- `dpdk_worker/zone.c:42`
+- BPF reference behavior: `bpf/headers/bpfrx_helpers.h:1962` and `:2019`
+
+## Impact
+- DPDK HA behavior appears materially behind eBPF for fabric redirect
+- dual-fabric / active-active expectations may be wrong when dataplane=`dpdk`
+
+## Suggested fix
+Either implement real DPDK fabric redirect parity or explicitly mark the feature unsupported in DPDK mode so HA testing does not assume it works.
+
+---
+
+## #127 — fabric IPVLAN: existing fab0/fab1 overlay skips address reconciliation on reapply [CLOSED] (closed 2026-03-06)
+
+## Problem
+`ensureFabricIPVLAN()` returns immediately when the IPVLAN already exists on the correct parent. In that path it only brings the link up and never reconciles addresses.
+
+This means fabric IP changes can leave stale addresses on `fab0`/`fab1` until some later networkd action happens to correct them. Because session sync startup resolves `syncIface` addresses directly from `fab0`/`fab1`, the daemon can observe and use stale fabric addresses during startup/redeploy.
+
+## Code
+- `pkg/daemon/daemon.go:1474`
+- `pkg/daemon/daemon.go:4175`
+- early return without address reconciliation at `pkg/daemon/daemon.go:4188`
+- sync transport resolves overlay address at `pkg/daemon/daemon.go:3920`
+
+## Impact
+- stale fabric IPs can survive reapply
+- sync/gRPC listeners may bind the wrong address after config changes
+- failover testing becomes nondeterministic after repeated deploys
+
+## Suggested fix
+When the IPVLAN already exists on the correct parent, reconcile its address set instead of returning immediately. Also remove stale addresses no longer present in config.
+
+---
+
+## #128 — fabric IPVLAN: stale fab0/fab1 overlays are never cleaned up when config changes [CLOSED] (closed 2026-03-06)
+
+## Problem
+The new fabric overlay path added `CleanupFabricIPVLANs()`, but I did not find any caller. `applyConfig()` creates `fab0`/`fab1` IPVLAN interfaces when `LocalFabricMember` is set, but there is no symmetric cleanup when the config switches away from IPVLAN fabric mode or removes one of the fabric interfaces.
+
+## Code
+- creation in `pkg/daemon/daemon.go:1474`
+- cleanup helper defined in `pkg/daemon/daemon.go:4236`
+- no callers found for `CleanupFabricIPVLANs()`
+
+## Impact
+- stale `fab0`/`fab1` links can survive config changes
+- old fabric IPs and VRF bindings can leak into later HA runs
+- status and troubleshooting become misleading because orphaned overlays still exist
+
+## Suggested fix
+Call cleanup during config transitions and/or reconcile the exact desired overlay set declaratively so removed fabric overlays are deleted automatically.
+
+---
+
+## #129 — fabric IPVLAN: populateFabricFwd probes ARP/NDP on parent while fabric IP lives on overlay [CLOSED] (closed 2026-03-06)
+
+## Problem
+The new overlay design puts the sync IP on `fab0`/`fab1` (IPVLAN child), but `startClusterComms()` now resolves `fabric_fwd` against the physical parent via `resolveFabricParent()`. `probeFabricNeighbor()` and `refreshFabricFwd()` then run `ping -I <parent>` and `netlink.NeighList(parentIfindex, ...)` against the parent device.
+
+That is a risky mismatch: the L3 identity lives on the IPVLAN child, not the parent. If ARP/NDP state is associated with the child interface, active probing and neighbor discovery on the parent will not populate `fabric_fwd` reliably.
+
+## Code
+- sync transport binds overlay address from `fab0`/`fab1`: `pkg/daemon/daemon.go:3920`
+- `fabric_fwd` population switched to parent: `pkg/daemon/daemon.go:4114`
+- parent resolution: `pkg/daemon/daemon.go:4248`
+- neighbor probe on chosen interface: `pkg/daemon/daemon.go:4149`
+- neighbor lookup on chosen interface: `pkg/daemon/daemon.go:4180`
+
+## Impact
+- peer MAC learning can fail or become timing-dependent in IPVLAN fabric mode
+- `fabric_fwd` may never populate even though session sync is up on the overlay
+- active/active and failback redirect paths can blackhole after the fabric redesign
+
+## Suggested fix
+Revisit the overlay/parent split explicitly: either learn neighbors from the overlay interface and translate to the parent for dataplane redirect, or prove that ARP/NDP state is guaranteed to exist on the parent in this topology and add tests for it.
+
+---
+
+## #130 — compiler: vSRX fab0/fab1 auto-detect still collapses to a single runtime fabric interface [CLOSED] (closed 2026-03-06)
+
+## Problem
+The new fabric syntax support resolves `LocalFabricMember` for `fab0`/`fab1`, but auto-detection only fills `Cluster.FabricInterface`. It never auto-populates `Fabric1Interface`, and the parser tests explicitly encode that node0 gets `FabricInterface=fab0` with `Fabric1Interface=""`.
+
+That means a `vsrx.conf`-style config with both `fab0` and `fab1` defined still compiles into a single-fabric runtime unless the operator also uses the custom `fabric1-interface` knob.
+
+## Code
+- auto-detect logic in `pkg/config/compiler.go:140`
+- only `FabricInterface` is populated at `pkg/config/compiler.go:160`
+- parser test codifies single-fabric result at `pkg/config/parser_test.go:15700`
+
+## Impact
+- vSRX-compatible `fab0` + `fab1` syntax is only partially honored
+- dual-fabric runtime paths (`Fabric1Interface`, dual sync transport, secondary `fabric_fwd`) remain disabled in auto-detected configs
+- operators can think both fabrics are active when the runtime is still single-fabric
+
+## Suggested fix
+Either auto-populate both runtime fabric slots from `fab0`/`fab1` syntax, or reject/flag the config loudly so the operator knows the second fabric is not actually active.
+
+---
+
+## #131 — HA session-sync: established flows are never refreshed after SESSION_OPEN [CLOSED] (closed 2026-03-06)
+
+The current HA session-sync path only replicates session state when the flow opens, plus bulk sync on reconnect. Long-running flows can sit on the standby with stale TCP state / timeout / last-seen until failover.
+
+Why this matters:
+- A long-running `iperf3` stream can be created long before an RG move.
+- The standby may still hold the opening snapshot of the session instead of the current state when takeover happens.
+- That is the wrong model for stateful failover; established flows need refresh, not just create-time replication.
+
+Code evidence:
+- Near-real-time sync only fires on `SESSION_OPEN` in `pkg/daemon/daemon.go:425-468`.
+- The periodic sweep only sends sessions whose `Created >= lastSweepTime`, so it replays newly-created sessions, not already-established ones: `pkg/cluster/sync.go:516-550`.
+- Bulk sync is reconnect-driven (`pkg/cluster/sync.go:747-829`), so normal RG moves do not trigger a fresh full transfer.
+- The wire format carries `TCPState`, `LastSeen`, and `Timeout`, but those values are only refreshed when a session is sent at open/bulk time: `pkg/cluster/sync.go:1560-1708`, `pkg/cluster/sync.go:1775-1945`.
+
+Likely impact:
+- Standby can retain pre-established TCP state (for example `SYN_SENT` / `SYN_RECV`) for flows that are actually deep into an `ESTABLISHED` transfer.
+- Standby also misses updated inactivity timestamps and timeout adjustments for already-running flows.
+
+Suggested fix direction:
+- Add incremental update replication for existing sessions, not just create/delete.
+- At minimum, periodically resync active forward sessions based on `LastSeen` or recent packet activity rather than `Created`.
+- Include a test that starts a long-lived TCP flow, waits well past session creation, moves the RG, and verifies the stream survives.
+
+
+---
+
+## #132 — HA rg_active: a redundancy group becomes active when any VRRP instance flips MASTER [CLOSED] (closed 2026-03-06)
+
+`rg_active` is currently group-wide, but the state machine marks the whole RG active as soon as any one RETH VRRP instance in that RG becomes MASTER.
+
+Why this matters:
+- A redundancy group can own multiple RETH interfaces.
+- During failover, one interface can reach MASTER before the others.
+- The daemon then removes blackhole routes and enables `rg_active` for the whole RG even though some member interfaces are still BACKUP.
+- That can expose partially-transitioned ownership and break in-flight traffic during RG moves.
+
+Code evidence:
+- The RG state machine derives desired active state from `anyMasterLocked()`, not all-master, in both normal and strict modes: `pkg/daemon/rg_state.go:199-205`.
+- `watchVRRPEvents()` updates `rg_active` and removes blackholes immediately on the first MASTER event for the RG: `pkg/daemon/daemon.go:5017-5043`.
+- The codebase already distinguishes ALL-master for some per-RG decisions via `AllVRRPMaster()` / `snapshotRethMasterState()`, which shows the difference is intentional elsewhere: `pkg/daemon/daemon.go:4784-4799`.
+
+Likely impact:
+- The dataplane can start treating the RG as locally active before every interface in that RG is actually owned here.
+- Cross-chassis redirect suppression then happens too early for interfaces still transitioning.
+
+Suggested fix direction:
+- Either make RG activation require all relevant VRRP instances to be MASTER before clearing blackholes for that RG,
+- or move from group-wide `rg_active` to interface/subnet ownership so partially transitioned RGs are represented accurately.
+- Add a test with an RG containing multiple RETH interfaces whose MASTER events arrive at different times.
+
+
+---
+
+## #133 — private-rg-election: sync readiness is never reset for a fresh peer rejoin [CLOSED] (closed 2026-03-06)
+
+In private-RG / no-RETH-VRRP mode, `syncReady` is used as the readiness gate for takeover, but it appears to be latched true forever after the first successful bulk sync (or startup timeout).
+
+Why this matters:
+- A node can reconnect to a peer, or a peer can reboot and rejoin, without requiring a fresh bulk sync before takeover is allowed again.
+- That defeats the point of the readiness gate and can let a node become primary on stale session state.
+
+Code evidence:
+- `SetSyncReady()` is the only setter and just flips the global bool: `pkg/cluster/cluster.go:184-193`.
+- Current call sites I found only ever set it to true:
+  - startup timeout fallback in `pkg/daemon/daemon.go:307-308`
+  - bulk-sync completion in `pkg/daemon/daemon.go:4064-4068`
+- I did not find any `SetSyncReady(false)` path on sync disconnect, cluster comms restart, or peer reconnect.
+
+Suggested fix direction:
+- Reset `syncReady=false` whenever the sync transport fully disconnects or cluster comms are restarted.
+- Only release it again after a fresh `BulkEnd` (or an explicit timeout decision for that reconnect cycle).
+- Ideally track readiness per reconnect epoch instead of as a one-way global latch.
+
+
+---
+
+## #134 — cluster: takeover hold timer is edge-triggered and may never promote when the timer expires [CLOSED] (closed 2026-03-06)
+
+The takeover readiness gate checks elapsed hold time during election, but election is only re-run when readiness changes or some unrelated cluster event happens. There is no timer-driven re-evaluation when `ReadySince + takeoverHoldTime` is reached.
+
+Why this matters:
+- An RG can become ready, fail the hold-time check, and then stay secondary indefinitely.
+- Promotion only happens later if some other event happens to kick election again.
+- During planned RG moves this can look like traffic blackholing until an unrelated heartbeat/monitor update arrives.
+
+Code evidence:
+- `SetRGReady()` only triggers re-election when the boolean flips (`wasReady != ready`): `pkg/cluster/cluster.go:220-255`.
+- The actual hold-time gate is checked inside election with `IsReadyForTakeover(m.takeoverHoldTime)`: `pkg/cluster/election.go:213-224`.
+- I do not see any timer or scheduler that re-runs election at hold expiry.
+
+Suggested fix direction:
+- Schedule a per-RG election wakeup for `ReadySince + takeoverHoldTime`.
+- Or run a lightweight periodic election tick while an RG is ready-but-still-held.
+- Add a regression test that sets an RG ready once, waits past the hold time without any other events, and verifies promotion happens automatically.
+
+
+---
+
+## #135 — monitor interface: fab0/fab1 samples the IPVLAN overlay instead of the physical fabric parent [CLOSED] (closed 2026-03-06)
+
+`monitor interface fab0` / `fab1` does not reflect actual wire-level fabric forwarding after the fabric IPVLAN rework.
+
+Why this matters:
+- The HA dataplane forwards cross-chassis traffic on the physical fabric member.
+- `fab0`/`fab1` are now IPVLAN overlays used for IP addressing/session-sync.
+- Operators expect `monitor interface fab0/fab1` to reflect what is actually going across the fabric link.
+- Today it mostly reports overlay/control traffic instead of the physical fabric dataplane.
+
+Code evidence:
+- The daemon creates `fab0`/`fab1` as IPVLAN L2 overlays and states that BPF attaches to the parent: `pkg/daemon/daemon.go:1501-1503`, `pkg/daemon/daemon.go:4219-4222`.
+- The fabric forwarding path explicitly resolves the physical parent because BPF runs there: `pkg/daemon/daemon.go:4155-4159`, `pkg/daemon/daemon.go:4292-4303`.
+- The monitor CLI samples the literal kernel interface name returned from `config.LinuxIfName(cfgName)` with no fabric-parent remap: `pkg/cli/monitor_interface.go:30-45`, `pkg/cli/monitor_interface.go:162-175`.
+- The gRPC monitor backend does the same: `pkg/grpcapi/server.go:8658-8677`.
+
+Impact:
+- `monitor interface fab0/fab1` is not a trustworthy view of actual fabric forwarding load.
+- The output blends overlay/control-plane interface semantics with physical-wire dataplane expectations.
+
+Suggested fix direction:
+- For fabric interfaces, decide on one semantic and implement it consistently:
+  - either map `fab0`/`fab1` monitor requests to the resolved physical parent for wire-level stats,
+  - or explicitly expose separate overlay vs parent monitoring views.
+- Update both CLI and gRPC monitor paths together.
+
+
+---
+
+## #136 — monitor traffic interface fab0/fab1 captures the overlay, not the wire-level fabric path [CLOSED] (closed 2026-03-06)
+
+`monitor traffic interface fab0` / `fab1` currently hands the literal interface name to `tcpdump`, which does not match the post-IPVLAN fabric dataplane model.
+
+Why this matters:
+- After the fabric IPVLAN change, `fab0`/`fab1` are overlays used for fabric IP addressing.
+- Cross-chassis forwarding in XDP uses the physical parent/member interface.
+- Operators using `monitor traffic interface fab0` expect to see the packets actually traversing the fabric link.
+- Today they mainly see overlay/session-sync/control-plane traffic, not all dataplane-forwarded packets.
+
+Code evidence:
+- `monitor traffic` passes the requested interface name directly to `tcpdump`: `pkg/cli/cli.go:10510-10518`.
+- `fab0`/`fab1` are created as IPVLAN overlays: `pkg/daemon/daemon.go:1501-1503`, `pkg/daemon/daemon.go:4219-4222`.
+- Fabric forwarding resolves and uses the parent/member device, not the overlay: `pkg/daemon/daemon.go:4155-4159`, `pkg/daemon/daemon.go:4292-4303`.
+
+Impact:
+- Packet captures on `fab0`/`fab1` can be misleading during HA troubleshooting.
+- An operator may conclude traffic is not using the fabric when it is actually leaving on the parent device.
+
+Suggested fix direction:
+- Decide whether `monitor traffic interface fab0/fab1` should mean overlay capture or wire capture.
+- If the intended semantic is wire-level monitoring, resolve fabric interfaces to their physical parent before invoking `tcpdump`.
+- If both are valuable, add an explicit overlay/parent selector and document the distinction.
+
+
+---
+
+## #137 — fabric redirect: try_fabric_redirect paths never update per-interface TX counters [CLOSED] (closed 2026-03-06)
+
+Fabric-redirected packets increment the global fabric redirect counter, but they do not increment `interface_counters` TX stats for the egress fabric device.
+
+Why this matters:
+- `monitor interface`, `show interfaces`, and any other interface-stat consumers use `ReadInterfaceCounters()` as the authoritative BPF packet/byte counters.
+- Cross-chassis forwarded traffic can therefore be under-reported or appear missing even when the dataplane is actively redirecting packets over the fabric.
+
+Code evidence:
+- Per-interface TX accounting exists via `inc_iface_tx()`: `bpf/headers/bpfrx_helpers.h:782-786`.
+- Normal forward path uses it in `xdp_forward`: `bpf/xdp/xdp_forward.c:171-173`, `bpf/xdp/xdp_forward.c:225-228`.
+- The fabric redirect helpers do not call it; they only bump `GLOBAL_CTR_FABRIC_REDIRECT` before `bpf_redirect_map(...)`: `bpf/headers/bpfrx_helpers.h:1981-1995`, `bpf/headers/bpfrx_helpers.h:2046-2058`.
+- Userspace readers prefer these BPF interface counters for monitor/show output: `pkg/cli/monitor_interface.go:37-44`, `pkg/grpcapi/server.go:8671-8677`, `pkg/dataplane/maps.go:788-804`.
+
+Impact:
+- Even if an operator monitors the correct physical fabric device, the BPF stats path still undercounts redirected traffic.
+- This makes HA/fabric troubleshooting misleading.
+
+Suggested fix direction:
+- Update both `try_fabric_redirect()` and `try_fabric_redirect_with_zone()` to increment per-interface TX counters (and any other relevant egress accounting) for the selected fabric device before redirect.
+- Add a regression test that drives fabric redirect and verifies the interface counter for the chosen fabric link increments.
+
+
+---
+
+## #138 — fabric observability: tcpdump/monitor traffic is not a reliable view of XDP fabric redirects [CLOSED] (closed 2026-03-06)
+
+When active/active HA is split across nodes, cross-chassis forwarding uses the XDP fabric redirect path. Operators naturally reach for `tcpdump` / `monitor traffic`, but that is not a reliable visibility point for these packets.
+
+Why this matters:
+- In the split-RG case, traffic can be crossing the fabric even when `tcpdump` on the named fabric interface shows nothing.
+- This makes HA troubleshooting misleading and encourages chasing forwarding bugs that are really observability bugs.
+
+Code evidence:
+- Cross-chassis forwarding uses `try_fabric_redirect()` / `try_fabric_redirect_with_zone()` and returns `bpf_redirect_map(...)` directly: `bpf/headers/bpfrx_helpers.h:1981-1995`, `bpf/headers/bpfrx_helpers.h:2046-2058`.
+- `monitor traffic` is just a thin wrapper around `tcpdump`: `pkg/cli/cli.go:10480-10528`.
+- Fabric interfaces are now IPVLAN overlays for addressing, while the actual dataplane runs on the physical parent/member: `pkg/daemon/daemon.go:1501-1503`, `pkg/daemon/daemon.go:4155-4159`, `pkg/daemon/daemon.go:4219-4222`.
+- Repo performance docs explicitly describe the fast path as native XDP + `ndo_xdp_xmit` -> `bpf_redirect_map`: `docs/optimizations.md:17-26`.
+
+Inference from the above:
+- The fabric dataplane is using an XDP redirect fast path, while the operational capture tooling relies on packet-socket capture (`tcpdump`).
+- That combination does not provide trustworthy on-box visibility for redirected fabric traffic.
+
+Suggested fix direction:
+- Add an explicit on-box fabric trace/telemetry mechanism for XDP redirects instead of relying on `tcpdump` semantics.
+- At minimum, document that `tcpdump` / `monitor traffic` is not authoritative for XDP fabric redirects.
+- Longer term, add redirect trace events or counters keyed by redirect reason/link.
+
+
+---
+
+## #139 — fabric observability: no per-link redirect counters or trace events for fab0 vs fab1 [CLOSED] (closed 2026-03-06)
+
+The current fabric redirect telemetry is too coarse to debug active/active split-RG behavior. There is only a single global fabric redirect counter, and no per-link trace telling operators whether packets used fab0 or fab1.
+
+Why this matters:
+- When one RETH is primary on node0 and another on node1, operators need to know whether traffic is actually traversing the fabric and which link carried it.
+- Today, even after fixing interface counter accounting, there is still no fabric-specific telemetry that answers "did this go over fab0 or fab1, and why?"
+
+Code evidence:
+- The redirect helpers increment only one global counter, `GLOBAL_CTR_FABRIC_REDIRECT`, for both fab0 and fab1: `bpf/headers/bpfrx_helpers.h:1985`, `bpf/headers/bpfrx_helpers.h:1993`, `bpf/headers/bpfrx_helpers.h:2049`, `bpf/headers/bpfrx_helpers.h:2056`.
+- There is no separate per-link counter or ring-buffer event emitted from the fabric redirect path.
+- The current telemetry therefore cannot distinguish:
+  - fab0 vs fab1 use
+  - plain redirect vs zone-encoded redirect
+  - redirect reason (inactive RG, BLACKHOLE, NO_NEIGH, hairpin mismatch, etc.)
+
+Impact:
+- Active/active HA debugging is harder than it needs to be.
+- Operators end up relying on `tcpdump`, which is already a poor fit for the XDP redirect path.
+
+Suggested fix direction:
+- Add per-link counters for fab0/fab1 redirects.
+- Add reason-specific counters and/or trace events for redirect cause.
+- Expose the result in CLI / gRPC so HA troubleshooting does not depend on packet capture alone.
+
+
+---
+
+## #140 — rpm: hierarchical `target url ...` syntax compiles to the literal string `url` [CLOSED] (closed 2026-03-06)
+
+`vsrx.conf` uses hierarchical RPM URL syntax:
+
+- `vsrx.conf:219` -> `target url http://1.1.1.1;`
+
+Current code does not compile that form correctly:
+
+- `pkg/config/compiler.go` handles RPM targets with `test.Target = nodeVal(prop)`.
+- For a hierarchical `target { url ... }` node, that resolves to the literal string `"url"`.
+
+I verified this locally with the current parser/compiler: a config containing `target url http://1.1.1.1;` compiles to `Target == "url"` with no parse or compile error.
+
+Impact:
+
+- HTTP RPM probes from `vsrx.conf` are pointed at the wrong target.
+- `event-options` failover logic driven by that probe can make decisions from bad probe results.
+- This is silent config drift because the config commits cleanly.
+
+Suggested fix:
+
+- Teach `compileRPM()` to explicitly parse Junos hierarchical target forms such as `target url <url>`.
+- Add a parser/compiler test that mirrors the exact `vsrx.conf` syntax.
+- Reject unsupported target forms instead of silently compiling the wrong value.
+
+
+---
+
+## #141 — rpm: `routing-instance` is parsed but ignored at runtime [CLOSED] (closed 2026-03-06)
+
+`vsrx.conf` sets an RPM routing instance:
+
+- `vsrx.conf:221` -> `routing-instance Comcast-GigabitPro;`
+
+Current code parses this into `RPMTest.RoutingInstance`, but runtime probing never uses it:
+
+- Parsed in `pkg/config/compiler.go`.
+- Stored in `pkg/config/types.go`.
+- `pkg/rpm/rpm.go` uses plain `net.Dialer` / `http.Client` and never binds probes to a VRF, netns, table, or interface selected by `RoutingInstance`.
+
+Impact:
+
+- RPM probes run from the default routing context instead of the configured routing instance.
+- Probe state can diverge from the actual uplink or WAN being monitored.
+- `event-options` failover actions can trigger on the wrong path health.
+
+Suggested fix:
+
+- Resolve `routing-instance` to the effective VRF/routing table before running the probe.
+- Support ICMP, TCP, and HTTP probe types consistently.
+- Add integration tests showing different results across two routing instances.
+
+
+---
+
+## #142 — rpm: `probe-limit` from `vsrx.conf` is silently ignored [CLOSED] (closed 2026-04-14)
+
+`vsrx.conf` contains:
+
+- `vsrx.conf:227` -> `probe-limit 3;`
+
+Current parser/compiler accepts that config with no error, but there is no schema, config field, or runtime behavior for `probe-limit`:
+
+- No `probe-limit` handling in `pkg/config/ast.go` or `pkg/config/compiler.go`.
+- No corresponding field in `pkg/config/types.go`.
+- No runtime limit enforcement in `pkg/rpm/rpm.go`.
+
+I verified locally that a config with `probe-limit 3;` parses and compiles successfully, but the value is dropped entirely.
+
+Impact:
+
+- Operators get a silent no-op for a knob that exists in `vsrx.conf`.
+- That creates config compatibility drift and makes RPM behavior harder to reason about.
+
+Suggested fix:
+
+- Decide the bpfrx semantics for `probe-limit`.
+- Either implement it and expose it in show output, or reject it explicitly instead of silently ignoring it.
+
+
+---
+
+## #143 — dynamic-address: `feed-name { path ... }` and `address-name profile` from `vsrx.conf` are not implemented [CLOSED] (closed 2026-03-06)
+
+`vsrx.conf` uses richer `security dynamic-address` syntax than the current runtime supports:
+
+- `vsrx.conf:1205-1224`
+- Multiple `feed-name ... { path ... }` stanzas under one `feed-server`
+- `address-name ... { profile { feed-name ...; } }` bindings
+
+Current implementation is much narrower:
+
+- `pkg/config/ast.go` models only `feed-server` under `dynamic-address`.
+- `pkg/config/compiler.go` stores a single `FeedServer.FeedName` string and no per-feed `path`.
+- There is no type or compiler path for `address-name` / `profile` bindings.
+
+I verified locally with a vsrx-style example that:
+
+- the config parses and compiles without error,
+- only the last `feed-name` survives (`feed-cloudflare-ipv6` in my check),
+- both `path` values are dropped,
+- `address-name` bindings are dropped entirely.
+
+This matters in the real config because policies later reference `cloudflare-ipv4` / `cloudflare-ipv6` as source addresses:
+
+- `vsrx.conf:7185`
+- `vsrx.conf:10767`
+- `vsrx.conf:12261`
+- `vsrx.conf:13704`
+- `vsrx.conf:16242`
+
+Impact:
+
+- Dynamic-address objects from `vsrx.conf` do not map into policy-matchable address objects the way vSRX expects.
+- Feed path selection is lost.
+- Multi-feed servers collapse incorrectly.
+
+Suggested fix:
+
+- Extend the config model for per-feed `path` and `address-name -> profile -> feed-name` bindings.
+- Materialize dynamic-address names into the address resolution path used by policy compilation.
+- Add parser/compiler tests that mirror the Cloudflare blocks in `vsrx.conf`.
+
+
+---
+
+## #144 — flow-monitoring: `export-extension app-id/flow-dir` from `vsrx.conf` is ignored or only partially honored [CLOSED] (closed 2026-04-14)
+
+`vsrx.conf` configures flow export extensions in both NetFlow v9 and IPFIX templates:
+
+- `vsrx.conf:168-209`
+- `export-extension app-id;`
+- `export-extension flow-dir;`
+
+Current handling is incomplete:
+
+- `pkg/config/compiler.go` captures `export-extension` only for IPFIX templates; the version9 template path ignores it.
+- `pkg/flowexport/netflow9.go` and `pkg/flowexport/ipfix.go` do not consult configured `ExportExtensions` when building templates.
+- `flow direction` is effectively always exported because direction is hard-coded into the templates.
+- `applicationId` is never emitted even when `app-id` is configured.
+
+Impact:
+
+- `vsrx.conf` flow export behavior does not match runtime telemetry.
+- App-ID export is impossible today.
+- The `flow-dir` knob is not actually controlling template contents.
+
+Suggested fix:
+
+- Preserve export-extension settings for both v9 and IPFIX in the compiled config.
+- Make template generation conditional on configured extensions.
+- Either implement `app-id` export end-to-end or reject it explicitly when AppID is unavailable.
+
+
+---
+
+## #145 — services: `application-identification` in `vsrx.conf` is still parse-only [CLOSED] (closed 2026-03-06)
+
+`vsrx.conf` enables application identification:
+
+- `vsrx.conf:214` -> `application-identification;`
+
+Current state:
+
+- Parsed as a boolean in `pkg/config/compiler.go`.
+- Reflected in show output.
+- No L7 identification pipeline exists in dataplane/session handling.
+
+This is already documented in repo docs, but there is no GitHub issue tracking the concrete runtime gap from the active config.
+
+Impact:
+
+- Enabling AppID in `vsrx.conf` has no effect on enforcement or telemetry.
+- Dependent features such as `pre-id-default-policy` and App-ID flow export cannot work correctly.
+
+Suggested fix:
+
+- Track AppID state per session.
+- Add a classifier path and cache.
+- Gate dependent features on actual AppID availability.
+
+
+---
+
+## #146 — security: `pre-id-default-policy` from `vsrx.conf` is parsed but not wired [CLOSED] (closed 2026-03-06)
+
+`vsrx.conf` configures a pre-ID default policy:
+
+- `vsrx.conf:21125-21133`
+
+Current state:
+
+- Parsed into `SecurityConfig.PreIDDefaultPolicy` in `pkg/config/compiler.go`.
+- There is no runtime consumer in dataplane or daemon logic.
+- Repo docs already note that this depends on AppID, but there is no GitHub issue tied to the actual config usage.
+
+Impact:
+
+- The configured pre-identification policy has no effect.
+- Operators may expect pre-ID logging or default handling that never occurs.
+
+Suggested fix:
+
+- Wire pre-ID state into session classification.
+- At minimum, implement the logging-only subset once AppID/pre-ID session state exists.
+- Until then, emit an explicit unsupported warning when configured.
+
+
+---
+
+## #147 — system: license autoupdate url is intentionally syntax-only/no-op [CLOSED] (closed 2026-04-14)
+
+bpfrx should accept this syntax for vSRX configuration compatibility, but it will not implement any runtime licensing behavior.
+
+Context:
+
+- vsrx.conf contains system license autoupdate url ...
+- bpfrx is OSS software and does not have a Juniper-style license subsystem.
+- Keeping the syntax accepted avoids noisy import incompatibility for real vSRX configs.
+
+Resolution:
+
+- Accepted as syntax-only / no-op.
+- No runtime retrieval, renewal, scheduler, or status plumbing is planned.
+- This issue is closed as not planned.
+
+---
+
+## #148 — system: `ntp threshold action` from `vsrx.conf` is parsed but ignored [CLOSED] (closed 2026-03-06)
+
+`vsrx.conf` contains:
+
+- `vsrx.conf:109` -> `threshold 400 action accept;`
+
+Current state:
+
+- Parsed into `SystemConfig.NTPThresholdAction`.
+- `pkg/daemon/daemon.go` applies NTP by writing chrony source lines only.
+- Threshold/action values are never consumed.
+
+Impact:
+
+- The config commits, but the intended time-discipline policy is ignored.
+- In HA systems, silently ignoring clock policy can make debugging failover/session-sync behavior harder.
+
+Suggested fix:
+
+- Map threshold/action into an actual runtime behavior, or emit an explicit unsupported warning.
+- Show the effective state operationally.
+
+
+---
+
+## #149 — security flow: `power-mode-disable` from `vsrx.conf` has no runtime effect [CLOSED] (closed 2026-03-06)
+
+`vsrx.conf` enables:
+
+- `vsrx.conf:1249` under `security flow { power-mode-disable; }`
+
+Current state:
+
+- Parsed into `SecurityConfig.Flow.PowerModeDisable` in `pkg/config/compiler.go`.
+- Displayed in CLI / gRPC show output.
+- No runtime consumer exists in daemon, BPF, or DPDK paths.
+
+Impact:
+
+- Another silent no-op in a real config.
+- Operators may believe a power-management behavior was disabled when nothing changed.
+
+Suggested fix:
+
+- Define bpfrx semantics for this knob and implement them, or reject / warn explicitly.
+
+
+---
+
+## #150 — security: `policy-stats system-wide` from `vsrx.conf` is ignored [CLOSED] (closed 2026-03-06)
+
+`vsrx.conf` enables policy statistics:
+
+- `vsrx.conf:21121-21127` -> `policy-stats { system-wide enable; }`
+
+Current state:
+
+- Parsed into `SecurityConfig.PolicyStatsEnabled` in `pkg/config/compiler.go`.
+- There is no runtime consumer of `PolicyStatsEnabled`.
+- BPF policy counters are incremented unconditionally in `bpf/xdp/xdp_policy.c`.
+
+Impact:
+
+- The config knob does not control actual behavior.
+- bpfrx cannot match vSRX enable/disable semantics for policy stats.
+
+Suggested fix:
+
+- Either wire the flag into counter enablement / reporting behavior, or reject unsupported forms explicitly.
+
+
+---
+
+## #154 — ike/ipsec: gateway external-interface is parsed but ignored for local_addrs and egress selection [CLOSED] (closed 2026-03-07)
+
+## Summary
+`external-interface` is compiled and displayed, but the runtime IPsec generator does not use it for source selection or egress pinning.
+
+## Evidence
+- Parser/compiler stores `ExternalIface`: `pkg/config/compiler.go:4097-4100`, `pkg/config/compiler.go:4242-4245`
+- Config type carries the field: `pkg/config/types.go:1541`
+- swanctl generation only uses `vpn.LocalAddr` / `gateway.LocalAddress`; it never consults `ExternalIface`: `pkg/ipsec/ipsec.go:83-117`
+- CLI / gRPC only display the field: `pkg/cli/cli.go:6224-6225`, `pkg/grpcapi/server.go:6765-6766`
+
+## Why this matters
+Several gateways in `vsrx.conf` specify `external-interface` without `local-address` (for example `ATH-MARTIS`, `ATH-MINN`, `ATH-CLE` around `vsrx.conf:350-369`). Today those tunnels rely on strongSwan/kernel default source selection instead of Junos-style interface binding.
+
+## Expected behavior
+When `external-interface` is configured, bpfrx should either:
+- resolve the current address on that interface and set `local_addrs`, or
+- otherwise program strongSwan/kernel state so the IKE/IPsec connection is pinned to that interface in a deterministic, Junos-compatible way.
+
+## Current behavior
+`external-interface` has no runtime effect.
+
+---
+
+## #155 — ike/ipsec: proposal lifetime-seconds is parsed but never emitted to swanctl [CLOSED] (closed 2026-03-07)
+
+## Summary
+Both IKE and ESP proposal `lifetime-seconds` values are parsed and stored, but the strongSwan config generator never uses them.
+
+## Evidence
+- IKE proposal lifetime is parsed into `IKEProposal.LifetimeSeconds`: `pkg/config/compiler.go:4041-4044`, `pkg/config/types.go:1500-1506`
+- IPsec proposal lifetime is parsed into `IPsecProposal.LifetimeSeconds`: `pkg/config/compiler.go:4187-4190`, `pkg/config/types.go:1517-1524`
+- The generator builds proposal strings but never emits any lifetime/rekey setting: `pkg/ipsec/ipsec.go:159-190`, `pkg/ipsec/ipsec.go:278-359`
+- `vsrx.conf` uses explicit ESP lifetimes, e.g. `lifetime-seconds 3600` at `vsrx.conf:381-393`
+
+## Why this matters
+Tunnels currently run with strongSwan defaults instead of the configured Junos lifetimes, which changes rekey timing and can break interoperability with peers expecting the configured lifetime.
+
+## Expected behavior
+Map Junos `lifetime-seconds` to the appropriate strongSwan connection/child lifetime settings for both IKE and ESP rekey behavior.
+
+## Current behavior
+Configured lifetime values are silently ignored at runtime.
+
+---
+
+## #156 — ike: dead-peer-detection modes all collapse to a hardcoded dpd_delay = 10s [CLOSED] (closed 2026-03-07)
+
+## Summary
+`dead-peer-detection` is parsed, displayed, and stored, but all configured modes currently produce the same runtime behavior: `dpd_delay = 10s`.
+
+## Evidence
+- DPD mode is parsed into `DeadPeerDetect`: `pkg/config/compiler.go:4115-4120`, `pkg/config/compiler.go:4260-4265`, `pkg/config/types.go:1544-1549`
+- Runtime generation only checks for non-empty DPD and writes one line: `pkg/ipsec/ipsec.go:138-140`
+- CLI / gRPC display the configured mode string, which makes it look implemented: `pkg/cli/cli.go:6240-6242`, `pkg/grpcapi/server.go:6780-6782`
+
+## Why this matters
+Junos distinguishes at least `always-send`, `optimized`, and `probe-idle`. Collapsing all of them to a single strongSwan setting loses semantics and makes troubleshooting harder because the control plane reports one thing while the runtime does another.
+
+## Expected behavior
+Map each Junos DPD mode to explicit strongSwan behavior (`dpd_delay`, `dpd_timeout`, `dpd_action`, and/or idle-only behavior as appropriate), or reject unsupported modes clearly.
+
+## Current behavior
+Every non-empty DPD mode becomes the same `dpd_delay = 10s` stanza.
+
+---
+
+## #157 — ike: Junos $9$ pre-shared-key strings are passed verbatim to strongSwan [CLOSED] (closed 2026-03-07)
+
+## Summary
+Obfuscated Junos PSKs (`$9$...`) are parsed as literal strings and written directly into `swanctl` secrets. strongSwan will then use the obfuscated blob as the actual PSK.
+
+## Evidence
+- IKE policy `pre-shared-key` is parsed verbatim into `pol.PSK`: `pkg/config/compiler.go:4060-4069`
+- VPN-level `pre-shared-key` is also stored verbatim: `pkg/config/compiler.go:4332-4333`
+- The generator writes whatever string it has into `secret = "..."`: `pkg/ipsec/ipsec.go:231-244`
+- `vsrx.conf` contains an obfuscated key at `vsrx.conf:321`
+
+## Why this matters
+A config imported from Junos display output can look valid but fail every IKE authentication attempt because bpfrx never de-obfuscates or rejects `$9$` secret material.
+
+## Expected behavior
+Either:
+- support Junos secret decoding for `$9$...` values before writing `swanctl`, or
+- reject/flag obfuscated PSKs at compile/apply time so the operator knows plaintext or another supported secret format is required.
+
+## Current behavior
+Obfuscated PSKs are treated as plaintext secrets.
+
+---
+
+## #158 — ike: authentication-method is parsed but swanctl generation hardcodes auth = psk [CLOSED] (closed 2026-03-07)
+
+## Summary
+The config parser records IKE proposal `authentication-method`, but runtime swanctl generation always emits `auth = psk` for both local and remote peers.
+
+## Evidence
+- IKE proposal stores `AuthMethod`: `pkg/config/types.go:1500-1506`
+- Compiler parses `authentication-method`: `pkg/config/compiler.go:4029-4034`
+- Runtime auth blocks are hardcoded to PSK: `pkg/ipsec/ipsec.go:143-156`
+- There are no IPsec PKI/local-certificate fields in the current runtime config model; this matches the feature-gap doc entry for certificate-based IPsec.
+
+## Why this matters
+This is a semantic mismatch: the parser accepts an auth-method knob, but the dataplane/runtime cannot express anything except PSK. It also blocks certificate-based IKE gateways.
+
+## Expected behavior
+Either:
+- implement auth-method-aware swanctl generation (including certificate-based auth), or
+- reject unsupported methods at compile time instead of silently generating PSK auth.
+
+## Current behavior
+All IKE gateways become PSK-authenticated regardless of configured auth method.
+
+---
+
+## #159 — ipsec: full traffic-selector syntax is still unsupported; only one local_ts/remote_ts pair exists [CLOSED] (closed 2026-03-07)
+
+## Summary
+bpfrx still only models one `local_ts` / `remote_ts` pair per VPN via `local-identity` and `remote-identity`. Junos `traffic-selector` syntax is not represented in the parser or runtime.
+
+## Evidence
+- VPN model only has one `LocalID` and `RemoteID` string: `pkg/config/types.go:1554-1563`
+- Runtime generation only emits one `local_ts` and one `remote_ts`: `pkg/ipsec/ipsec.go:201-208`
+- The feature-gap docs already note this as partial support: `docs/feature-gaps.md:283`
+- I did not find schema/compiler support for `security ipsec vpn ... traffic-selector ...`
+
+## Why this matters
+More complex peers often require multiple proxy-IDs / traffic selectors per tunnel. Today the parser/runtime can only represent the simplest single-selector case.
+
+## Expected behavior
+Add parser/runtime support for Junos `traffic-selector` blocks and map them cleanly to strongSwan child traffic selectors, or reject the syntax clearly.
+
+## Current behavior
+Only the single `local-identity` / `remote-identity` path is available.
+
+---
+
+## #164 — perf/xdp: add per-CPU IPv6 established-flow cache in xdp_zone [CLOSED] (closed 2026-03-07)
+
+## Problem
+Established IPv6 TCP traffic spends too much CPU in `sessions_v6` hash lookup on the XDP hot path.
+
+## Proposal
+Add a small per-CPU exact-flow cache in `xdp_zone` for established IPv6 TCP flows, with bounded batched writeback to the real session map.
+
+## Scope
+- XDP only
+- IPv6 only
+- established TCP only
+- bypass on SYN/FIN/RST, NAT64, ALG, predicted sessions
+
+## Acceptance criteria
+- eBPF programs load successfully
+- long-running IPv6 TCP flows remain correct
+- fewer `htab_map_hash` / `lookup_nulls_elem_raw` samples on IPv6 perf runs
+- no HA/NAT regressions
+
+Design notes are in `docs/next-features/ipv6-session-fast-path.md`.
+
+
+---
+
+## #165 — perf/xdp: add IPv6 no-extension-header fast path to parse_ipv6hdr [CLOSED] (closed 2026-03-07)
+
+## Problem
+The current IPv6 parser always goes through the generic extension-header walker, even for ordinary TCP/UDP traffic without extension headers.
+
+## Proposal
+Add a fast path in `parse_ipv6hdr()` for the common case where the upper-layer protocol is directly in the base IPv6 header, and fall back to the current walker only when extension headers are present.
+
+## Acceptance criteria
+- identical behavior for packets with extension headers
+- cheaper common-case IPv6 parse path
+- no verifier regressions
+
+See `docs/next-features/ipv6-session-fast-path.md`.
+
+
+---
+
+## #166 — perf/dataplane: split hot and cold IPv6 session state [CLOSED] (closed 2026-03-08)
+
+## Problem
+`session_value_v6` mixes hot forwarding fields with counters, reverse keys, timestamps, NAT metadata, and cached FIB state. That increases memory traffic on every lookup.
+
+## Proposal
+Split lookup-time hot fields from colder accounting / GC / logging fields so the established IPv6 fast path pulls less data into cache.
+
+## Acceptance criteria
+- hot lookup structure shrinks materially
+- no session accounting / HA regressions
+- measurable reduction in IPv6 steady-state CPU cost
+
+See `docs/next-features/ipv6-session-fast-path.md`.
+
+
+---
+
+## #167 — perf/observability: expose IPv6 established-flow cache hit and flush counters [CLOSED] (closed 2026-03-07)
+
+## Problem
+If we add an IPv6 established-flow cache, we need visibility into whether it is actually helping or just colliding / falling back.
+
+## Proposal
+Add counters and CLI/monitor visibility for cache hits, flushes, invalidations, and fallbacks.
+
+## Acceptance criteria
+- counters available from the dataplane
+- visible in CLI / gRPC stats
+- usable during perf investigations
+
+See `docs/next-features/ipv6-session-fast-path.md`.
+
+
+---
+
+## #168 — perf/dataplane: compact IPv6 session key to reduce hash-map cost [CLOSED] (closed 2026-03-08)
+
+## Problem
+`session_key_v6` is 40 bytes, which makes `sessions_v6` lookups materially more expensive than IPv4 in the steady-state hot path.
+
+## Proposal
+Design a compact IPv6 session key representation that reduces hash/compare cost without making collisions unsafe.
+
+## Acceptance criteria
+- smaller effective IPv6 lookup key
+- explicit collision-safety story
+- session sync / GC / NAT semantics preserved
+
+See `docs/next-features/ipv6-session-fast-path.md`.
+
+
+---
+
+## #170 — perf/xdp: reduce IPv6 checksum-partial detection cost in xdp_main [CLOSED] (closed 2026-03-07)
+
+## Problem
+After the IPv6 flow-cache and parser improvements, `xdp_main_prog` is still one of the largest remaining IPv6 deltas. A likely remaining contributor is IPv6 `CHECKSUM_PARTIAL` detection in `parse_l4hdr()`, which computes the full IPv6 pseudo-header checksum on every TCP/UDP packet.
+
+## Proposal
+Reduce IPv6 checksum-partial detection cost in `xdp_main` / `parse_l4hdr()` without breaking NAT correctness.
+
+Possible directions:
+- defer detection until a packet actually needs NAT rewrite
+- cache or shortcut the common virtio/native-XDP cases
+- add a narrower fast path for ordinary IPv6 TCP/UDP packets
+
+## Acceptance criteria
+- no NAT checksum regressions
+- lower `xdp_main_prog` self time on IPv6 perf runs
+- verifier-safe implementation
+
+
+---
+
+## #179 — perf/nat: reduce IPv6 nat_rewrite_v6 hot-path cost [CLOSED] (closed 2026-03-08)
+
+## Problem
+Recent perf captures still show `xdp_nat_prog` materially more expensive on IPv6 than IPv4:
+
+- IPv4: `xdp_nat_prog` 2.5%
+- IPv6: `xdp_nat_prog` 4.3%
+- Delta: `+1.8%`
+
+`nat_rewrite_v6()` still pays for:
+- 128-bit address compare/copy work
+- checksum updates over larger pseudo-header state
+- protocol/direction dispatch on every packet
+
+We fixed correctness regressions in the recent IPv6 NAT series, but we have not yet revisited the remaining steady-state cost of the IPv6 rewrite path.
+
+## Scope
+Optimize `nat_rewrite_v6()` for the common SNAT path without changing NAT semantics.
+
+Likely candidates:
+- specialize common TCP/UDP source-NAT and destination-NAT cases more aggressively
+- avoid checksum/address work when fields are already equal on-wire
+- precompute or cache translation-direction-specific data where that can be done safely
+
+## Acceptance
+- perf re-run shows `xdp_nat_prog` CPU share reduced on the IPv6 iperf path
+- IPv6 source NAT and destination NAT lab tests still pass
+- checksum-partial/offload behavior stays correct
+
+
+---
+
+## #180 — perf/xdp: reduce pkt_meta init and parse overhead in xdp_main [CLOSED] (closed 2026-03-08)
+
+## Problem
+Recent perf captures still show `xdp_main_prog` as the single largest IPv6 hot symbol even after the screen-bypass work and the ingress screen-flag precompute:
+
+- IPv4: `xdp_main_prog` 11.6%
+- IPv6: `xdp_main_prog` 16.1%
+- Delta: `+4.5%`
+
+Current master still does per-packet:
+- `pkt_meta_scratch` lookup
+- large `pkt_meta` memset/init
+- separate L3 parse and L4 parse setup
+- ingress-stage bookkeeping before the first tail call
+
+The new ingress `screen_flags` shortcut removes two map lookups, but it does not address the remaining metadata-init and parse cost in the `xdp_main` hot path.
+
+## Scope
+Investigate and reduce the remaining `xdp_main` cost without reintroducing the earlier IPv6 forwarding regressions.
+
+Likely candidates:
+- shrink or stage `pkt_meta` initialization so the hot path does not clear more state than necessary
+- combine common-case IPv4/IPv6 TCP/UDP parse work to reduce redundant bounds/setup work
+- avoid redoing setup that later stages already overwrite
+
+## Acceptance
+- perf re-run shows `xdp_main_prog` CPU share reduced on the IPv6 iperf path
+- no regression in IPv4/IPv6 forwarding, NAT, or HA fabric paths
+- explicit regression coverage for IPv6 forwarding/NAT before merge
+
+
+---
+
+## #185 — HA session-sync: per-zone ownership mapping is not safe for active/active zones spanning multiple RGs [CLOSED] (closed 2026-03-08)
+
+## Problem
+Per-RG session sync is implemented as a `zone_id -> RG_id` mapping, but session ownership is actually decided from a session's `IngressZone` alone. That is not ownership-safe when a zone contains interfaces from multiple redundancy groups.
+
+## Why this matters
+In active/active HA, the same security zone can legitimately contain interfaces that belong to different RGs. In that topology:
+- sessions for RG A and RG B share the same `IngressZone`
+- sync ownership is reduced to a single RG for that entire zone
+- bulk stale reconciliation and incremental sync can send, skip, or delete the wrong sessions on the standby
+
+That is an architectural HA correctness bug, not just an optimization problem.
+
+## Code
+- `pkg/cluster/sync.go:489-501` (`ShouldSyncZone`)
+- `pkg/daemon/daemon.go:2686-2710` (`buildZoneRGMap`)
+- `pkg/dataplane/types.go:30-31` and `:81-82` (`SessionValue{,V6}` store `IngressZone` / `EgressZone`, not owning RG or ingress interface)
+- `pkg/cluster/sync.go:1311-1344` and surrounding bulk reconciliation code
+
+## Current behavior
+`buildZoneRGMap()` assigns a single RG to each zone by taking the first RETH interface found in that zone. `ShouldSyncZone()` then uses that single RG to decide whether the local node owns all sessions for that zone.
+
+## Impact
+- long-lived sessions can be synced to the wrong peer owner
+- bulk stale reconciliation can delete valid sessions for another RG that happens to share the same zone
+- failover behavior depends on zone layout, not actual RG/interface ownership
+
+## Suggested fix
+Move session-sync ownership to a per-interface or per-session RG identity instead of a per-zone approximation. Concretely:
+- carry ingress interface or owning RG in synced session state
+- derive sync ownership from that field, not from `IngressZone`
+- make bulk reconciliation key off the same authoritative owner field
+
+## Notes
+This is likely the highest-signal remaining HA design gap in the active/active path.
+
+
+---
+
+## #186 — HA failover gating: sync readiness is decoupled from fabric redirect readiness [CLOSED] (closed 2026-03-08)
+
+## Problem
+In private-RG mode, takeover readiness is gated by session-sync completion (`syncReady`) and VIP interface readiness, but not by whether the cross-chassis fabric redirect path is actually usable.
+
+## Why this matters
+Current code syncs sessions on the control link by default, while fabric redirect state is populated separately from `fabric_fwd` neighbor/link resolution. A node can therefore become eligible to take over because control-plane sync is healthy even though the actual data-plane escape hatch is stale or down.
+
+## Code
+- `pkg/daemon/daemon.go:4068-4138` (sync transport on control link by default)
+- `pkg/daemon/daemon.go:4203-4213` (`syncReady` lifecycle)
+- `pkg/daemon/daemon.go:4300-4323` (fabric_fwd population / monitor)
+- `pkg/daemon/daemon.go:5394-5425` (readiness gate)
+
+## Impact
+- a node can win election with fresh session state but no working fabric forwarding path
+- failover can stall in exactly the cases where active/active needs fabric redirect to bridge route/VIP asymmetry
+- control-plane health and dataplane failover readiness diverge
+
+## Suggested fix
+Add a fabric-readiness component to takeover gating for modes that rely on cross-chassis redirect. At minimum, require the local node to have a valid fabric path programmed when failover semantics depend on fabric redirect for continuity.
+
+
+---
+
+## #187 — xdp_zone: NO_NEIGH active-active check drops VLAN context and can skip required fabric failover [CLOSED] (closed 2026-03-08)
+
+## Problem
+In the `BPF_FIB_LKUP_RET_NO_NEIGH` path, `xdp_zone` checks whether the egress RG is locally active by calling `check_egress_rg_active(fib.ifindex, 0)`. That drops VLAN context.
+
+## Why this matters
+`iface_zone_map` is keyed by `{physical_ifindex, vlan_id}`. For VLAN-backed RETH traffic, looking up the egress interface with VLAN 0 can miss the actual RG ownership entry and incorrectly treat the interface as standalone/active.
+
+That means the dataplane can skip fabric redirect exactly in the failover case where the peer owns the VLAN-backed RG.
+
+## Code
+- `bpf/xdp/xdp_zone.c:1385-1396`
+- `bpf/headers/bpfrx_helpers.h:2150-2158`
+- `pkg/dataplane/compiler.go:666-698`
+
+## Current behavior
+`check_egress_rg_active()` returns active/standalone when `iface_zone_map` has no entry for `{ifindex, vlan_id}`. In the NO_NEIGH path, the caller passes `vlan_id=0` even though the dataplane's authoritative RG mapping for subinterfaces is stored with the real VLAN ID.
+
+## Impact
+- existing sessions can fall back to local kernel routing instead of cross-chassis redirect
+- failover is especially wrong on VLAN RETH subinterfaces
+- this can present as traffic hanging only for some RGs / VLANs during failover
+
+## Suggested fix
+Preserve VLAN context in the NO_NEIGH RG-active check. If `fib.ifindex` is a VLAN subinterface, translate it the same way other paths do before calling `check_egress_rg_active()`.
+
+
+---
+
+## #188 — HA readiness: RGInterfaceReady treats missing local interfaces as peer-owned and can falsely unblock takeover [CLOSED] (closed 2026-03-08)
+
+## Problem
+The readiness gate still treats `LinkByName` failure in `RGInterfaceReady()` as "belongs to the peer" and skips it.
+
+## Why this matters
+That assumption is only safe when the interface name is truly remote-only (for example `ge-7/...` on node0). It is not safe for:
+- local startup races
+- missing VLAN subinterfaces
+- failed renames / networkd drift
+- local interface config mistakes
+
+In those cases the RG can be marked interface-ready even though the new owner cannot actually receive or own traffic.
+
+## Code
+- `pkg/cluster/monitor.go:419-455`
+
+## Current behavior
+Any interface monitor whose Linux name does not currently resolve is silently ignored instead of contributing a readiness failure reason.
+
+## Impact
+- takeover eligibility can go true before local interfaces actually exist
+- failover can move control-plane ownership while the data-plane side is still unready
+- this is especially risky in private-RG mode where readiness gating is the main safety net
+
+## Suggested fix
+Differentiate "known remote interface" from "expected local interface missing". Missing local interfaces should fail readiness with an explicit reason.
+
+
+---
+
+## #189 — HA readiness: RGVRRPReady reports ready when an RG has no local VRRP instance [CLOSED] (closed 2026-03-08)
+
+## Problem
+`RGVRRPReady()` returns ready for an RG with no local VRRP instance whenever *some other* VRRP instance exists in the manager.
+
+## Why this matters
+That means an RG can pass the VRRP readiness gate even when its own RETH/VRRP ownership machinery failed to start or was never instantiated locally.
+
+## Code
+- `pkg/vrrp/manager.go:355-372`
+
+## Current behavior
+If no instance for `VRID = 100 + rgID` is found, but `len(m.instances) > 0`, the function returns `(true, nil)`.
+
+## Impact
+- cluster election can unblock takeover for the wrong RG
+- `rg_active` can be asserted while the RG's VIP ownership mechanism is absent
+- failover can look superficially successful in cluster state while traffic never moves locally
+
+## Suggested fix
+Make readiness RG-specific. Only return ready when:
+- the RG is intentionally non-RETH / has no VRRP requirement, or
+- at least one matching local instance exists and the daemon has enough state to manage that RG's VIP ownership
+
+
+---
+
+## #191 — HA IPv6 failover: no NDP probe equivalent to IPv4 gateway ARP probe [CLOSED] (closed 2026-03-08)
+
+## Summary
+IPv4 failover has an explicit upstream cache-refresh path after MASTER transition, but IPv6 does not.
+
+Current behavior:
+- IPv4 MASTER transition sends GARP plus an explicit gateway ARP probe in `pkg/vrrp/instance.go` and `pkg/daemon/daemon.go`.
+- IPv6 MASTER transition only sends unsolicited NA (`SendGratuitousIPv6Burst`).
+- `SendNDSolicitation()` exists in `pkg/cluster/garp.go` but is never called.
+
+## Why this matters
+IPv6 neighbor convergence is currently weaker than IPv4 during HA failover:
+- LAN/WAN peers may not refresh neighbor state as aggressively from unsolicited NA alone.
+- There is no IPv6 equivalent of the explicit “poke the gateway/upstream cache” behavior that helped IPv4.
+- This becomes more visible because the current RETH design uses per-node MAC/link-local identity.
+
+## Evidence
+- `pkg/vrrp/instance.go`: IPv4 path calls `SendARPProbe`, IPv6 path only calls `SendGratuitousIPv6Burst`
+- `pkg/daemon/daemon.go`: `directSendGARPs()` sends ARP probe for IPv4, no IPv6 probe
+- `pkg/cluster/garp.go`: `SendNDSolicitation()` helper exists but is unused
+
+## Proposed fix
+Use `SendNDSolicitation()` on MASTER transition / direct RG activation for likely IPv6 next-hops and possibly other known neighbors, mirroring the IPv4 ARP-probe parity.
+
+## Scope
+Low-risk first slice:
+- Wire NDP probe only for the obvious failover path
+- Keep existing unsolicited NA bursts
+- Measure failover improvement before larger router-identity changes
+
+
+---
+
+## #192 — HA IPv6 failover: per-node RETH MAC/link-local identity makes failover weaker than IPv4 [CLOSED] (closed 2026-03-09)
+
+## Summary
+IPv6 HA failover still changes router identity because RETH uses per-node MACs, which means per-node link-local addresses. The code relies on goodbye RA and new RA startup to move the default-router role, but that is fundamentally weaker than IPv4 and does not help on hard crash failover.
+
+## Current behavior
+- `pkg/cluster/reth.go` programs per-node RETH MACs (`RethMAC(clusterID, rgID, nodeID)`)
+- `pkg/ra/sender.go` sends RA from the interface link-local
+- `pkg/ra/ra.go` / `pkg/daemon/daemon.go` send goodbye RA only on graceful withdraw / startup-secondary cleanup
+- on a hard fail, the old primary cannot withdraw its router identity
+- the new primary starts RA later via per-RG service reconciliation, after VIP move
+
+## Why this matters
+IPv4 mostly needs VIP->MAC convergence.
+IPv6 needs both:
+- VIP neighbor convergence
+- default-router identity convergence
+
+With per-node MAC/link-local identities, hosts can retain the dead router's old link-local default route while the new primary advertises a different one.
+
+## Evidence
+- `pkg/cluster/reth.go`
+- `pkg/ra/sender.go`
+- `pkg/ra/ra.go`
+- `pkg/daemon/daemon.go` startupGoodbyeRA comments already document that hosts see both nodes as separate IPv6 routers
+
+## Proposed direction
+Create an explicit IPv6 failover design for parity with IPv4, covering:
+- whether to keep per-node RETH MACs or move to stable active router identity
+- whether inactive RG interfaces must be hidden from L2 before shared identity is possible
+- whether RA startup/withdraw belongs in the failover critical path
+- how to handle hard-fail scenarios where goodbye RA is impossible
+
+This is architectural, not just a small bugfix.
+
+
+---
+
+## #193 — HA IPv6 failover: failed-neighbor cleanup reprobes IPv4 only [CLOSED] (closed 2026-03-08)
+
+## Summary
+`cleanFailedNeighbors()` actively reprobes only IPv4 after deleting `NUD_FAILED` entries. IPv6 just deletes the failed neighbor and waits for later traffic to trigger NDP.
+
+## Current code
+In `pkg/daemon/daemon.go`:
+- `cleanFailedNeighbors()` deletes both IPv4 and IPv6 failed entries
+- but only calls `cluster.SendARPProbe()` for IPv4
+- comment explicitly says IPv6 relies on the `XDP_PASS` path to trigger kernel NDP later
+
+## Why this matters
+This makes IPv6 recovery weaker than IPv4 during HA failover and after churn:
+- a failover/rejoin node can come up with cold or failed IPv6 neighbor state
+- IPv4 gets active reprobe
+- IPv6 stays reactive and can blackhole until a later packet drives NDP
+
+## Proposed fix
+After deleting failed IPv6 neighbors, actively reprobe them using `SendNDSolicitation()` from the correct interface/source address instead of waiting for passive traffic-driven recovery.
+
+## Notes
+This should be separate from the larger IPv6 router-identity problem. It is a narrower parity gap with IPv4 and should be fixable independently.
+
+
+---
+
+## #196 — userspace: SNAT reply traffic black-holed on slow path reinjection [CLOSED] (closed 2026-03-12)
+
+## Problem
+
+When a reverse-NAT reply packet (server → SNAT address) can't be forwarded directly due to a missing neighbor MAC, `maybe_reinject_slow_path` injects the packet into the TUN device **without reversing the NAT**. The kernel sees `dst=firewall's own SNAT IP`, delivers it locally, and the reply never reaches the original client.
+
+### Example flow
+
+1. Forward: client(10.0.61.102) → server(172.16.80.200), SNAT to 172.16.80.8
+2. Reply arrives: server(172.16.80.200) → 172.16.80.8
+3. Reverse session hit, but forwarding resolution for 10.0.61.102 gives `MissingNeighbor`
+4. `maybe_reinject_slow_path` sends raw `{src=172.16.80.200, dst=172.16.80.8}` to TUN
+5. Kernel sees `dst=172.16.80.8` (local address), delivers locally — packet black-holed
+
+### How BPF handles this correctly
+
+The eBPF pipeline sets `META_FLAG_KERNEL_ROUTE` and tail-calls back to conntrack for NAT reversal before `XDP_PASS`. The Rust path has no equivalent.
+
+## Impact
+
+**Critical** — This is the most likely primary cause of iperf flow stalls. TCP retransmits cascade, window collapses, throughput drops to zero.
+
+## Fix
+
+Apply reverse NAT rewrite to packets before TUN injection when the session has NAT state. The session's `nat` field already contains the original (pre-NAT) addresses — use them to rewrite src/dst before injecting into the slow path.
+
+## Files
+
+- `userspace-dp/src/afxdp.rs` — `maybe_reinject_slow_path`, `extract_l3_packet`
+
+## Branch
+
+`userspace-dataplane-rust-wip`
+
+---
+
+## #197 — userspace: silent packet drops when frame build returns None [CLOSED] (closed 2026-03-12)
+
+## Problem
+
+`build_forwarded_frame_into_from_frame` returns `None` for several conditions, and the caller silently drops the frame with only an exception counter increment:
+
+- **Missing neighbor MAC** — `decision.resolution.neighbor_mac?` returns None when ARP/NDP hasn't resolved yet
+- **TTL=1** — `out[ip_start + 8] <= 1` returns None (BPF generates ICMP Time Exceeded; Rust drops silently)
+- **Offset mismatch** — `frame_l3_offset(frame)?` fails on unexpected frame layout
+
+Every `None` propagates to `build_failed = true` which drops the packet with no fallback.
+
+## Impact
+
+**Critical** — For TCP (iperf), every silent drop triggers a retransmission timeout cascade. The BPF pipeline has `NO_NEIGH` → `XDP_PASS` fallback to let the kernel resolve ARP and retry. The Rust path has no equivalent — packets are permanently lost.
+
+## Fix
+
+- On `MissingNeighbor`: fall back to slow-path TUN injection (with NAT applied per #issue-above) or trigger an ARP probe and hold the frame
+- On TTL=1: generate ICMP Time Exceeded or fall back to slow path for kernel to generate it
+- On offset errors: fall back to slow path rather than silent drop
+
+## Files
+
+- `userspace-dp/src/afxdp.rs` — `build_forwarded_frame_into_from_frame` (~line 5958), callers at ~line 2462
+
+## Branch
+
+`userspace-dataplane-rust-wip`
+
+---
+
+## #198 — userspace: O(n) reverse session repair causes latency spikes under load [CLOSED] (closed 2026-03-12)
+
+## Problem
+
+When reply traffic lands on a different worker than the one that created the forward session, the reverse session entry doesn't exist locally. The code falls back to `repair_reverse_session_from_forward` which calls `find_forward_nat_match` — a **linear scan of ALL sessions** in the worker's local table:
+
+```rust
+self.sessions.iter().find_map(|(key, entry)| {
+    if entry.metadata.is_reverse { return None; }
+    if !reply_matches_forward_nat(key, entry.decision.nat, reply_key) { return None; }
+    Some(...)
+})
+```
+
+With up to 131,072 sessions, this is O(n) per packet. Additionally, the fallback check against `shared_sessions: Arc<Mutex<FastMap<...>>>` has global mutex contention under high packet rates.
+
+## Impact
+
+**High** — Adds milliseconds of per-packet latency during the cross-worker race window at connection startup. This causes TCP window stalls and contributes to iperf throughput collapse.
+
+## Fix
+
+Maintain a secondary hash map keyed by the NAT'd reverse tuple (post-NAT src/dst + ports), populated when forward sessions are installed. This makes reverse session repair O(1) instead of O(n). Also consider replacing the global `Mutex` on `shared_sessions` with a lock-free concurrent map or per-worker sharding.
+
+## Files
+
+- `userspace-dp/src/session.rs` — `find_forward_nat_match` (~line 165)
+- `userspace-dp/src/afxdp.rs` — `repair_reverse_session_from_forward` (~line 4155)
+
+## Branch
+
+`userspace-dataplane-rust-wip`
+
+---
+
+## #199 — userspace: port corruption in copy-based forwarding path [CLOSED] (closed 2026-03-29)
+
+## Problem
+
+The forwarding architecture copies RX frames from UMEM into a `Vec<u8>` (`source_frame.to_vec()`), then later builds TX frames from the copy. A race window exists between the NIC overwriting the UMEM frame and the copy, which can capture stale or corrupted data — particularly L4 ports.
+
+**Evidence:** 15+ commits attempted to fix this same class of bug:
+- `77b646a` preserve L4 ports in forwarded TCP frames
+- `42294c3` preserve live TCP ports in forward build path
+- `5960d52` carry live TCP ports into queued TX
+- `c6025c0` snapshot source frames for queued forwarding
+- `95aa658` keep live TCP tuple stable in forward path
+- `cbf90b6` prefer live frame tuple for forward tuples
+- `ffe590b` prefer live frame ports for forward tuples
+- `61e95f7` prefer session tuple over corrupted frame ports
+- `e278521` keep session tuple authoritative in queued forwards
+
+The `enforce_expected_ports` function is a band-aid that overwrites L4 ports with "expected" values, but `authoritative_forward_ports` can itself capture wrong ports if the frame is already corrupted when parsed at `parse_session_flow` time.
+
+## Impact
+
+**High** — Port corruption causes TCP checksum failures (receiver drops silently) or misrouted packets, both leading to iperf stalls.
+
+## Fix
+
+Zero-copy forwarding: instead of copying the frame into a `Vec<u8>`, rewrite it in-place in the UMEM and submit the same UMEM descriptor offset to the TX ring of the egress binding. This eliminates the copy window entirely and removes the allocation overhead.
+
+If zero-copy isn't feasible (cross-binding TX), capture the frame bytes and metadata atomically before releasing the RX descriptor back to the fill ring.
+
+## Files
+
+- `userspace-dp/src/afxdp.rs` — `build_live_forward_request` (~line 2224), `authoritative_forward_ports` (~line 2252), `enforce_expected_ports` (~line 6461)
+
+## Branch
+
+`userspace-dataplane-rust-wip`
+
+---
+
+## #200 — userspace: XDP shim redirects all traffic to userspace (session check unused) [CLOSED] (closed 2026-03-29)
+
+## Problem
+
+The XDP shim (`userspace-xdp/src/lib.rs`) defines `has_live_userspace_session()` which checks the `USERSPACE_SESSIONS` BPF map, and the Rust workers populate this map via `publish_live_session_key`. However, **the function is never called** in the steering decision path.
+
+The current steering logic (~line 409) only checks:
+1. `is_local_destination` → `XDP_PASS`
+2. `is_icmp_to_interface_nat_local` → `XDP_PASS`
+3. Everything else → redirect to AF_XDP userspace
+
+This means ALL non-local traffic gets redirected to the Rust dataplane, including protocols and flows it doesn't support. When the Rust workers are slow (due to O(n) scans, mutex contention), AF_XDP rings overflow. Overflow packets fall back to the legacy BPF pipeline via `fallback_to_main`, creating **two parallel session state machines** for the same flow — causing session confusion, duplicate NAT, and packet corruption.
+
+## Impact
+
+**Medium-High** — Bimodal packet processing (some via Rust, some via BPF) for the same flow creates state divergence. Also unnecessarily loads the Rust dataplane with traffic it can't handle.
+
+## Fix
+
+Add the session check to the steering path so only packets with active userspace sessions get redirected. New connections can still be steered to userspace via an initial policy decision, but unsessioned traffic stays on the BPF fast path.
+
+## Files
+
+- `userspace-xdp/src/lib.rs` — `has_live_userspace_session` (~line 760), steering decision (~line 409)
+
+## Branch
+
+`userspace-dataplane-rust-wip`
+
+---
+
+## #201 — userspace: UMEM frame exhaustion under TX backpressure stalls RX [CLOSED] (closed 2026-03-29)
+
+## Problem
+
+TX frames come from a free list (`binding.free_tx_frames`). When the NIC's TX completion ring drains slowly (HW backpressure, virtio-net batching), the free list empties. The code returns `TxError::Retry`, pushing pending TX requests back to `pending_tx_local`.
+
+However:
+1. The ingress RX path continues receiving packets and building more forward requests
+2. `pending_tx_local` grows **unboundedly**, consuming memory and increasing latency
+3. The fill ring depends on frame recycling from processed RX frames
+4. If fill ring depletes (frames stuck in pending TX queues), the NIC can't deliver new RX packets
+5. **Complete RX stall** — no new packets processed, no progress possible
+
+## Impact
+
+**Medium** — Under sustained load with any TX backpressure, the system enters a deadlock: TX can't complete (no free frames), RX can't proceed (no fill frames), and pending queues grow until OOM or timeout.
+
+## Fix
+
+1. **Bound `pending_tx_local`**: when the queue exceeds a threshold (e.g. 2x ring size), stop consuming from RX to apply natural backpressure through the fill ring
+2. **Separate TX and RX frame pools**: ensure fill ring frames can't be consumed by TX queuing
+3. **Drop oldest pending TX on overflow**: better to lose old packets than stall the entire pipeline
+
+## Files
+
+- `userspace-dp/src/afxdp.rs` — `transmit_batch` (~line 3420), fill ring management in `drain_pending_fill`
+
+## Branch
+
+`userspace-dataplane-rust-wip`
+
+---
+
+## #202 — userspace-dp: port authority design fragility causes policy thrashing [CLOSED] (closed 2026-03-12)
+
+## Summary
+The port authority logic in `afxdp.rs` has undergone 4 policy flips in one day between frame/session/metadata tuple preference (commits show repeated back-and-forth on whether to use frame index, session handle, or metadata tuple as the canonical authority). This fragility suggests the abstraction doesn't cleanly fit the problem.
+
+## Details
+The port authority determines which AF_XDP socket "owns" a frame for TX completion tracking. Repeated changes between:
+- Frame-index based ownership
+- Session-handle based ownership  
+- Metadata tuple (src/dst port + proto) based ownership
+
+Each change fixes one bug but introduces another edge case, suggesting the fundamental model needs rethinking.
+
+## Impact
+Policy thrashing can lead to:
+- TX completion misattribution (wrong socket gets credit)
+- Frame leaks when ownership is ambiguous
+- Subtle iperf stall scenarios when frames get stuck in limbo
+
+## Suggested Fix
+Consider a single canonical ownership model — likely frame-index based since UMEM frames have a 1:1 relationship with ring slots. Session/metadata should be used for routing decisions, not ownership.
+
+## Branch
+`userspace-dataplane-rust-wip`
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## #203 — userspace-dp: UMEM frame leak on TxError::Drop in transmit_prepared_batch [CLOSED] (closed 2026-03-12)
+
+## Summary
+In `afxdp.rs`, when `transmit_prepared_batch` encounters a `TxError::Drop`, the frames in `scratch_prepared_tx` are orphaned — they are removed from the TX preparation list but never returned to the UMEM free pool.
+
+## Details
+The `transmit_prepared_batch` function iterates over `scratch_prepared_tx` items. On `TxError::Drop`, the frame is effectively discarded without being recycled back to UMEM's fill ring or free list. Over time, this leaks UMEM frames.
+
+## Impact
+Under sustained traffic with occasional drops (e.g., policy deny, TTL expiry), the UMEM frame pool slowly depletes. Eventually no frames are available for RX fill ring replenishment, causing the AF_XDP socket to stop receiving packets — manifesting as an iperf stall.
+
+## Suggested Fix
+On `TxError::Drop`, explicitly return the frame index to the UMEM free pool (or fill ring) so it can be reused for future RX.
+
+## Branch
+`userspace-dataplane-rust-wip`
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## #204 — userspace-dp: shared_sessions not cleared on stop() persists stale data [CLOSED] (closed 2026-03-12)
+
+## Summary
+In the userspace dataplane manager, `shared_sessions` and `shared_nat_sessions` are not cleared when `stop()` is called. Stale session data persists across reconcile cycles, potentially causing incorrect forwarding decisions after a config change or failover.
+
+## Details
+When the manager stops workers (e.g., during reconciliation after config commit), it tears down AF_XDP sockets and worker goroutines but leaves the shared session maps populated with entries from the previous cycle. When new workers start, they inherit stale session state that may reference old NAT mappings, defunct interfaces, or removed policies.
+
+## Impact
+- Stale NAT reverse index entries can cause packets to be rewritten with old addresses
+- Sessions referencing removed interfaces cause TX to non-existent sockets
+- After failover, inherited sessions from the old primary may conflict with fresh sessions
+
+## Suggested Fix
+Clear `shared_sessions` and `shared_nat_sessions` in `stop()` before tearing down workers, or reinitialize them fresh in `start()`.
+
+## Branch
+`userspace-dataplane-rust-wip`
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## #205 — userspace-dp: in-place TX path is nearly dead code (same-interface hairpin only) [CLOSED] (closed 2026-03-12)
+
+## Summary
+The in-place TX optimization added in commit 9e380eb is nearly dead code — it only fires for same-interface hairpin scenarios (packet arrives on interface X and needs to be forwarded back out interface X). In practice, this almost never happens for firewall traffic.
+
+## Details
+The in-place TX path avoids a frame copy by rewriting the packet in the original RX frame and submitting it directly to the TX ring of the same socket. However, the condition for this path requires the egress interface to be the same as the ingress interface. For a firewall that routes between zones/interfaces, this is extremely rare.
+
+## Impact
+- Dead code adds complexity and maintenance burden
+- The frame management special case for in-place TX creates additional edge cases in the ownership tracking logic
+- May interact poorly with the port authority fragility (#202)
+
+## Suggested Fix
+Either:
+1. Remove the in-place TX path entirely if profiling shows it never fires
+2. Extend it to work cross-interface by having sockets share UMEM (requires AF_XDP shared UMEM setup)
+
+## Branch
+`userspace-dataplane-rust-wip`
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## #206 — userspace-dp: unused mutable slice in validation path [CLOSED] (closed 2026-03-12)
+
+## Summary
+In the validation path, a mutable slice is allocated but never actually mutated — it's only read. This is a minor lint/correctness issue.
+
+## Details
+A `&mut` borrow is taken on a slice during packet validation, but the slice contents are only inspected (read), never written to. This suggests either:
+1. A planned mutation that was never implemented
+2. An unnecessary `mut` qualifier
+
+## Impact
+Low — this is a code quality issue, not a runtime bug. However, unnecessary `mut` borrows can mask real bugs by allowing unintended mutations in future refactors.
+
+## Suggested Fix
+Change `&mut` to `&` (shared reference) if the slice is only read.
+
+## Branch
+`userspace-dataplane-rust-wip`
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## #253 — Userspace AF_XDP libxdp migration postmortem [CLOSED] (closed 2026-03-31)
+
+## Summary
+
+`master` no longer uses `xdpilone` directly for AF_XDP. It uses a custom Rust FFI + C bridge around `libxdp`.
+
+The migration failed initially because the code treated `libxdp` as a drop-in replacement for `xdpilone`. It is not. The main incompatibilities were ring-state semantics, producer reservation semantics, socket creation behavior, and UMEM ownership.
+
+This issue is the postmortem for that migration and the checklist for any future AF_XDP library swap.
+
+## Current implementation
+
+Relevant files on `master`:
+
+- `userspace-dp/src/xsk_ffi.rs`
+- `userspace-dp/csrc/xsk_bridge.c`
+- `userspace-dp/src/afxdp/bind.rs`
+- `userspace-dp/src/afxdp.rs`
+
+The current path is a custom wrapper over `libxdp`, not a `libxdp-rs` crate.
+
+## What was incompatible with the old `xdpilone` assumptions
+
+### 1. RX availability semantics were different
+
+Problem:
+- The initial wrapper implemented `RingRx::available()` by reading raw producer/consumer pointers.
+- `libxdp` `peek()` logic uses cached ring state (`cached_prod` / `cached_cons`), not the raw-pointer path.
+- That meant `available()` and `receive()` could disagree, and the userspace loop could think RX was empty even while packets were available.
+
+Evidence:
+- fixed by `f76be868` `fix: RingRx::available() must use cached ring state, not raw pointers`
+
+Required lesson:
+- a wrapper must match `libxdp` ring helper semantics exactly, not approximate them from mmap'd pointers.
+
+### 2. Producer reservation semantics were different
+
+Problem:
+- `libxdp` producer reserve is all-or-nothing.
+- The old code assumed `xdpilone`-style partial reservation semantics.
+- That caused fill-ring starvation and TX stuck-at-zero behavior when the full requested batch was not available.
+
+*(truncated — 129 lines total)*
+
+
+---
+
+## #266 — userspace event stream helper parses control frames unsafely on partial Unix-stream reads [CLOSED] (closed 2026-03-29)
+
+## Summary
+The helper-side event-stream control reader in `userspace-dp/src/event_stream.rs` assumes every `read()` returns one or more complete 16-byte control frames. That is not guaranteed on a Unix stream socket. Partial reads currently discard data and can drop `Ack`, `Pause`, `Resume`, or `DrainRequest` frames.
+
+## Why this matters
+Under HA failover load, demotion prep depends on `Pause` / `DrainRequest` / `Ack` working reliably. If the helper misses or truncates a control frame, the daemon can believe the stream is drained or paused while the helper never actually applied that control transition.
+
+## Code
+- [userspace-dp/src/event_stream.rs:544](https://github.com/psaab/bpfrx/blob/master/userspace-dp/src/event_stream.rs#L544) allocates a fixed `read_buf`
+- [userspace-dp/src/event_stream.rs:695](https://github.com/psaab/bpfrx/blob/master/userspace-dp/src/event_stream.rs#L695) does a plain `read()` into that buffer
+- [userspace-dp/src/event_stream.rs:728](https://github.com/psaab/bpfrx/blob/master/userspace-dp/src/event_stream.rs#L728) hands the raw bytes to `process_control_frames(...)`
+- [userspace-dp/src/event_stream.rs:737](https://github.com/psaab/bpfrx/blob/master/userspace-dp/src/event_stream.rs#L737) walks the bytes as if complete frames are already present
+
+If `read()` returns fewer than 16 bytes, or returns a partial frame plus the start of another frame, the parser has no accumulation buffer and drops the incomplete data.
+
+## Expected fix
+Implement a small framed read buffer on the helper side, like the daemon-side reader already does in `pkg/dataplane/userspace/eventstream.go` with `io.ReadFull`. The helper should not parse control frames until a full header and payload are available.
+
+## Failover impact
+This can make HA failover look random under load because pause/drain/ack control transitions become dependent on socket chunking rather than protocol semantics.
+
+---
+
+## #267 — userspace event-stream DrainRequest does not fence a target sequence during demotion prep [CLOSED] (closed 2026-03-29)
+
+## Summary
+The new userspace event-stream drain path does not actually request a sequence fence. The daemon sends `DrainRequest` with `seq=0`, and the helper-side drain handler treats that value as the target boundary. As a result, demotion prep can declare the stream drained without proving that all in-flight events up to a meaningful boundary were flushed.
+
+## Why this matters
+Graceful RG demotion is using this path as part of the handoff barrier before `PrepareRGDemotion(...)`. If the drain request does not fence a real sequence boundary, the final barrier can run after an incomplete stream flush. That leaves room for session updates to miss the new primary during failover under load.
+
+## Code
+Daemon side:
+- [pkg/dataplane/userspace/eventstream.go:116](https://github.com/psaab/bpfrx/blob/master/pkg/dataplane/userspace/eventstream.go#L116) `SendDrainRequest(...)` writes `EventTypeDrainRequest` with `seq=0`
+- [pkg/daemon/daemon.go:4009](https://github.com/psaab/bpfrx/blob/master/pkg/daemon/daemon.go#L4009) demotion prep relies on `SendDrainRequest(...)` before the final peer barrier
+
+Helper side:
+- [userspace-dp/src/event_stream.rs:781](https://github.com/psaab/bpfrx/blob/master/userspace-dp/src/event_stream.rs#L781) treats the control-frame sequence as the drain target
+- [userspace-dp/src/event_stream.rs:796](https://github.com/psaab/bpfrx/blob/master/userspace-dp/src/event_stream.rs#L796) exits as soon as the replay buffer already satisfies `>= target_seq`
+
+Because `target_seq` is currently always `0`, this path is not fencing anything meaningful.
+
+## Expected fix
+Use a real target sequence for demotion drain, for example the daemon requesting a drain through the highest event sequence it has observed or the helper capturing a pause watermark and draining through that watermark before returning `DrainComplete`.
+
+## Failover impact
+This is directly on the graceful failover path and can leave the old owner / new owner handoff incomplete under sustained `iperf3 -P 8` load.
+
+---
+
+## #268 — daemon event-stream ack advances before session event callback finishes [CLOSED] (closed 2026-03-29)
+
+## Summary
+The daemon-side userspace event-stream receiver marks a sequence as received before the event callback finishes, and the background ack loop acknowledges that sequence independently. This makes the replay/ack contract unsound: the helper can trim replay state for events that the daemon has not actually finished applying yet.
+
+## Why this matters
+The local helper->daemon stream is supposed to be the lower-latency path for userspace session replication. If `Ack` means "read from the socket" instead of "fully handed off to session sync", reconnect/replay can lose events under slow callbacks, demotion prep, or daemon-side stalls.
+
+## Code
+- [pkg/dataplane/userspace/eventstream.go:271](https://github.com/psaab/bpfrx/blob/master/pkg/dataplane/userspace/eventstream.go#L271) stores `lastRecvSeq` before invoking `onEvent(...)`
+- [pkg/dataplane/userspace/eventstream.go:315](https://github.com/psaab/bpfrx/blob/master/pkg/dataplane/userspace/eventstream.go#L315) runs a separate periodic ack loop
+- [pkg/dataplane/userspace/eventstream.go:330](https://github.com/psaab/bpfrx/blob/master/pkg/dataplane/userspace/eventstream.go#L330) sends `Ack` based on `lastRecvSeq` rather than on post-callback completion
+
+That means a slow or blocked `onEvent(...)` can still be acked to the helper.
+
+## Expected fix
+Advance the ack watermark only after the event callback has completed and the daemon has accepted responsibility for replaying the event. If the callback path becomes asynchronous, it needs an explicit processed/applied watermark rather than reusing the raw socket receive sequence.
+
+## Failover impact
+This weakens the reliability of the new userspace session event stream exactly where failover is most sensitive: reconnect, replay, and quiescence around RG moves.
+
+---
+
+## #269 — graceful demotion currently drops kernel session-open sync events instead of draining them [CLOSED] (closed 2026-03-29)
+
+## Summary
+During userspace demotion prep, the daemon pauses the sweep producer but does not drain or journal the kernel-side `SESSION_OPEN` event producer. It simply returns early from the event callback while demotion prep is active. New kernel sessions opened in that window are therefore dropped from the near-real-time sync path.
+
+## Why this matters
+Under active failover load, graceful demotion is supposed to stop at a well-defined handoff point. Right now the kernel event producer is not part of that handoff. Events that arrive after demotion prep starts but before the RG move completes are neither synced immediately nor explicitly fenced.
+
+## Code
+- [pkg/daemon/daemon.go:721](https://github.com/psaab/bpfrx/blob/master/pkg/daemon/daemon.go#L721) drops ring-buffer `SESSION_OPEN` events when `userspaceDemotionPrepActive()` is true
+- [pkg/cluster/sync.go:817](https://github.com/psaab/bpfrx/blob/master/pkg/cluster/sync.go#L817) `PauseIncrementalSync(...)` only pauses the sweep producer
+- [pkg/daemon/daemon.go:3998](https://github.com/psaab/bpfrx/blob/master/pkg/daemon/daemon.go#L3998) demotion prep then focuses on userspace export/drain and the peer barrier
+
+This leaves the kernel-side event producer outside the demotion drain contract.
+
+## Expected fix
+Either:
+- explicitly buffer/journal kernel session-open events during demotion prep and flush them before the final barrier, or
+- bring the kernel producer under the same pause/drain protocol as the userspace producer
+
+Relying on the later sweep to recover these opens is too weak for graceful failover handoff.
+
+## Failover impact
+This is a direct gap in the current graceful RG move path and can contribute to established-flow loss when new or refreshed kernel sessions appear during demotion prep.
+
+---
+
+## #270 — session sync still double-produces steady-state kernel updates via ring events and LastSeen sweep [CLOSED] (closed 2026-03-29)
+
+## Summary
+The current session-sync path still has two independent steady-state kernel producers:
+
+1. the near-real-time `SESSION_OPEN` ring-buffer callback
+2. the periodic sweep that republishes sessions whenever `Created` or `LastSeen` crosses the sweep threshold
+
+There is no explicit dedup or precedence between those paths. Under load, this amplifies send-queue pressure and makes quiescence/barrier timing noisier than it needs to be.
+
+## Why this matters
+We are trying to make HA failover deterministic under sustained traffic, but the producer model is still partly event-driven and partly sweep-driven. The sweep is not limited to create/delete or material state changes; it republishes based on `LastSeen`, which is a very coarse trigger for HA survivability.
+
+## Code
+Event producer:
+- [pkg/daemon/daemon.go:715](https://github.com/psaab/bpfrx/blob/master/pkg/daemon/daemon.go#L715) wires `SESSION_OPEN` to immediate `QueueSessionV4/V6(...)`
+
+Sweep producer:
+- [pkg/cluster/sync.go:673](https://github.com/psaab/bpfrx/blob/master/pkg/cluster/sync.go#L673) still defaults to a 1-second active sweep interval
+- [pkg/cluster/sync.go:755](https://github.com/psaab/bpfrx/blob/master/pkg/cluster/sync.go#L755) republishes sessions when `Created >= threshold || LastSeen >= threshold`
+
+There is no explicit coordination saying "ring event owns create, sweep only reconciles missed events."
+
+## Expected fix
+Shift kernel session sync to an event-first model:
+- ring/event path owns fresh create/delete delivery
+- sweep becomes reconciliation/backstop
+- stop using raw `LastSeen` movement as the main steady-state publication trigger
+
+At minimum, document and implement producer precedence so the two paths are not both acting as primary steady-state publishers.
+
+## Failover impact
+This does not look like the only failover bug, but it does increase sync queue pressure and makes `WaitForIdle(...)` / barrier-based handoff harder to reason about under `iperf3 -P 8` traffic.
+
+---
+
+## #271 — show security flow sessions walks and sorts the full session table before printing [CLOSED] (closed 2026-03-29)
+
+## Summary
+`show security flow sessions` is slow from the CLI because the local implementation in `pkg/cli/cli.go` fully walks the IPv4 and IPv6 session maps, materializes every matching forward session into slices, sorts the entire result set by `SessionID`, and then does additional per-session work while formatting.
+
+## Why this is slow
+The current local CLI path does all of this in-process:
+
+- iterate all forward IPv4 sessions
+- iterate all forward IPv6 sessions
+- append all matches into slices
+- sort the full slice(s) by `SessionID`
+- perform a reverse-session lookup for each displayed session to merge counters
+- resolve application names while rendering
+
+That makes latency scale with total session count instead of the amount of output the operator actually needs.
+
+## Code
+Local CLI path:
+- [pkg/cli/cli.go:3325](https://github.com/psaab/bpfrx/blob/master/pkg/cli/cli.go#L3325) collects all IPv4 sessions for later sorting
+- [pkg/cli/cli.go:3367](https://github.com/psaab/bpfrx/blob/master/pkg/cli/cli.go#L3367) sorts all IPv4 entries
+- [pkg/cli/cli.go:3422](https://github.com/psaab/bpfrx/blob/master/pkg/cli/cli.go#L3422) resolves policy/app display during render
+- [pkg/cli/cli.go:3476](https://github.com/psaab/bpfrx/blob/master/pkg/cli/cli.go#L3476) repeats the same pattern for IPv6
+
+The reverse-lookup merge is another multiplier:
+- [pkg/cli/cli.go:3449](https://github.com/psaab/bpfrx/blob/master/pkg/cli/cli.go#L3449) / adjacent local logic performs reverse/NAT formatting after per-session data gathering
+- the same pattern also exists server-side in `GetSessions(...)` for peer fetches
+
+## Expected fix
+Move away from full-table CLI materialization. Reasonable options:
+
+1. server-side paged / streaming session listing
+2. limit-first traversal for non-summary views
+3. avoid full in-memory sort for default output
+4. avoid per-entry reverse lookup unless explicitly requested
+5. make brief/summary the cheap default and reserve expensive enrichment for detailed mode
+
+## Desired outcome
+`show security flow sessions` should return quickly even with large session tables, especially for filtered and non-summary queries.
+
+---
+
+## #272 — show security flow sessions interface filter is currently only a zone filter [CLOSED] (closed 2026-03-29)
+
+## Summary
+`show security flow sessions interface <ifname>` does not actually filter sessions by interface. The CLI resolves the interface to a zone ID and then matches any session whose ingress or egress zone equals that zone. On multi-interface zones, this is both incorrect and unnecessarily expensive.
+
+## Why this is wrong
+Operators expect an interface filter to answer "what sessions are hitting this interface?" Today it answers "what sessions are in the same zone as this interface?" Those are not the same thing.
+
+## Code
+- [pkg/cli/cli.go:3140](https://github.com/psaab/bpfrx/blob/master/pkg/cli/cli.go#L3140) parses `interface` and resolves it to `zoneID`
+- [pkg/cli/cli.go:3178](https://github.com/psaab/bpfrx/blob/master/pkg/cli/cli.go#L3178) matches IPv4 sessions by `IngressZone` / `EgressZone`
+- [pkg/cli/cli.go:3209](https://github.com/psaab/bpfrx/blob/master/pkg/cli/cli.go#L3209) does the same for IPv6
+
+No actual ingress/egress interface comparison happens in the filter path.
+
+## Expected fix
+Add real interface-aware filtering based on the session's resolved ingress and egress interface data. At minimum:
+
+- use the existing `IngressInterface` / `EgressInterface` model in `SessionEntry` consistently
+- support both ingress and egress interface matching
+- stop collapsing interface filters into zone filters
+
+## Performance impact
+This is also a performance issue because a fake interface filter does not prune nearly as much as a true interface filter would. On large zones it still forces the CLI through a wide session-table walk and render path.
+
+
+---
+
+## #273 — show security flow sessions should display interfaces and zones consistently [CLOSED] (closed 2026-03-29)
+
+## Summary
+`show security flow sessions` does not display ingress/egress interfaces and zones consistently across local and peer output, even though the data model already carries both.
+
+## Current gaps
+Local detailed CLI output:
+- prints `If:` on the `In:` / `Out:` lines
+- does **not** print explicit ingress/egress zone names in the detailed session body
+
+Peer detailed output:
+- prints `Zone: <ingress> -> <egress>`
+- does **not** print ingress/egress interfaces, even though `SessionEntry` already contains them
+
+Brief output:
+- prints a single combined zone column
+- does not show interfaces at all
+
+## Code
+Local detailed rendering:
+- [pkg/cli/cli.go:3440](https://github.com/psaab/bpfrx/blob/master/pkg/cli/cli.go#L3440)
+- [pkg/cli/cli.go:3461](https://github.com/psaab/bpfrx/blob/master/pkg/cli/cli.go#L3461)
+
+Peer detailed rendering:
+- [pkg/cli/cli.go:3742](https://github.com/psaab/bpfrx/blob/master/pkg/cli/cli.go#L3742)
+- [pkg/cli/cli.go:3752](https://github.com/psaab/bpfrx/blob/master/pkg/cli/cli.go#L3752)
+
+Available data model fields:
+- [pkg/grpcapi/bpfrxv1/bpfrx.pb.go:2430](https://github.com/psaab/bpfrx/blob/master/pkg/grpcapi/bpfrxv1/bpfrx.pb.go#L2430) `IngressInterface`
+- [pkg/grpcapi/bpfrxv1/bpfrx.pb.go:2431](https://github.com/psaab/bpfrx/blob/master/pkg/grpcapi/bpfrxv1/bpfrx.pb.go#L2431) `EgressInterface`
+- [pkg/grpcapi/bpfrxv1/bpfrx.pb.go:2424](https://github.com/psaab/bpfrx/blob/master/pkg/grpcapi/bpfrxv1/bpfrx.pb.go#L2424) `IngressZoneName`
+- [pkg/grpcapi/bpfrxv1/bpfrx.pb.go:2425](https://github.com/psaab/bpfrx/blob/master/pkg/grpcapi/bpfrxv1/bpfrx.pb.go#L2425) `EgressZoneName`
+
+## Expected fix
+Standardize the session display format so every detailed session entry shows:
+
+- ingress zone
+- egress zone
+- ingress interface
+- egress interface
+
+Do this consistently for:
+
+*(truncated — 48 lines total)*
+
+
+---
+
+## #274 — GetSessions RPC still builds session listings with full-table iteration and per-entry enrichment [CLOSED] (closed 2026-03-29)
+
+## Summary
+The `GetSessions` gRPC path is still expensive enough that moving the CLI to RPC would not, by itself, solve `show security flow sessions` latency. The server still iterates the full session table, performs per-session reverse lookups, assembles an in-memory slice, and sorts it before returning.
+
+## Why this matters
+The local CLI currently does its own full-table walk. That is one problem. But the server-side path used for peer sessions already has the same shape, so the system lacks a cheap authoritative listing path.
+
+## Code
+Server-side session listing:
+- [pkg/grpcapi/server.go:896](https://github.com/psaab/bpfrx/blob/master/pkg/grpcapi/server.go#L896) iterates IPv4 sessions
+- [pkg/grpcapi/server.go:930](https://github.com/psaab/bpfrx/blob/master/pkg/grpcapi/server.go#L930) does reverse-session lookup per included IPv4 session
+- [pkg/grpcapi/server.go:944](https://github.com/psaab/bpfrx/blob/master/pkg/grpcapi/server.go#L944) repeats the same for IPv6
+- [pkg/grpcapi/server.go:989](https://github.com/psaab/bpfrx/blob/master/pkg/grpcapi/server.go#L989) sorts the full assembled result slice
+
+## Additional concern
+`limit` and `offset` are applied while iterating, but the server still walks the full table to compute `Total` and still builds/sorts the returned slice after expensive enrichment. This is not a streaming or cheap-paging design.
+
+## Expected fix
+Add a real server-side session listing strategy for large tables, for example:
+
+- streaming RPC for session rows
+- server-side cursor / page token instead of naive offset
+- optional enrichment flags so reverse lookup / app resolution are not always paid
+- shared local/peer renderer on top of that API so CLI behavior is consistent
+
+## Desired outcome
+We should have one authoritative, scalable session-listing path rather than two different full-table walkers (local CLI and peer gRPC) that both become slow on large session tables.'
+
+
+---
+
+## #275 — GetSessions still relies on full-table iteration and eager enrichment after sort removal [CLOSED] (closed 2026-03-31)
+
+## Summary
+Current `master` fixed the worst part of the original `GetSessions` complaint by removing the full-result sort path, but the underlying RPC is still not a scalable listing API.
+
+The remaining problem is narrower:
+- `GetSessions` still walks the full session table to compute `Total` and apply filters
+- it still does per-entry reverse lookup / counter merge for returned rows
+- it still resolves application names while assembling the response
+- it still returns a materialized slice instead of a true streaming or cursor-based result
+
+## Why this matters
+This is still expensive enough that moving more CLI usage onto `GetSessions` would not make large session listings cheap. We still do not have one authoritative, scalable session-listing path for local and peer use.
+
+## Current code
+- `pkg/grpcapi/server.go:793` `GetSessions(...)`
+- `pkg/grpcapi/server.go:896` and `pkg/grpcapi/server.go:944` iterate IPv4 and IPv6 sessions
+- `pkg/grpcapi/server.go:916` and `pkg/grpcapi/server.go:981` still do per-entry reverse lookup / merge for returned rows
+- `pkg/grpcapi/server.go:918` and `pkg/grpcapi/server.go:983` still resolve application names during response assembly
+
+## What changed already
+The old full-result sort/materialize complaint from #274 is no longer fully accurate after `ecc5b0d3`. That part is fixed. This follow-up is specifically about the remaining full-table iteration and eager enrichment costs.
+
+## Expected fix
+Add a real scalable server-side listing model, for example:
+- streaming RPC for session rows
+- server-side cursor / page token instead of naive offset
+- optional enrichment flags so reverse lookup / app resolution are not always paid
+- shared local/peer renderer on top of that API so CLI behavior is consistent
+
+## Desired outcome
+`GetSessions` should become the cheap authoritative session-listing path, not just a slightly improved full-table walker.
+
+---
+
+## #276 — userspace demotion prep resumes helper event stream before final barrier completes [CLOSED] (closed 2026-03-31)
+
+## Summary
+During graceful userspace RG demotion, the daemon pauses the helper event stream, drains it, and then resumes it immediately before the final peer barrier and `PrepareRGDemotion(...)` complete.
+
+That reopens the helper-side session-delta producer during the exact window that demotion prep is trying to fence.
+
+## Why this matters
+The current demotion contract is supposed to establish a quiesced, ordered handoff point before the old owner is demoted. Resuming the helper event stream before the final barrier means new helper-originated deltas can be emitted after the drain watermark but before the demotion handoff actually completes.
+
+Under HA failover load, that reintroduces a race between:
+- event-stream drain completion
+- new helper deltas
+- final peer barrier
+- helper `PrepareRGDemotion(...)`
+
+## Code
+- `pkg/daemon/daemon.go:4128` starts demotion-prep sync pause
+- `pkg/daemon/daemon.go:4132` begins the event-stream pause/drain path
+- `pkg/daemon/daemon.go:4149` resumes the helper stream immediately after `DrainRequest`
+- `pkg/daemon/daemon.go:4190` only later waits for the final peer barrier
+- `pkg/daemon/daemon.go:4193` only then calls `PrepareRGDemotion(...)`
+
+So the helper event stream is resumed before the final barrier and before the helper-side demotion prepare has actually run.
+
+## Expected fix
+Keep the helper event stream paused until the final barrier succeeds and `PrepareRGDemotion(...)` has completed, or introduce a stronger fenced watermark proving that post-drain helper deltas cannot race ahead of demotion.
+
+## Failover impact
+This weakens the current graceful demotion handoff and can make userspace failover look random under sustained forwarding load even when the new event-stream drain path itself is working.
+
+
+---
+
+## #277 — helper demotion and session-export waits still hardcode a 2s timeout [CLOSED] (closed 2026-03-31)
+
+## Summary
+The Rust helper still hardcodes a 2-second wait for worker acknowledgement in both demotion prepare and owner-RG session export.
+
+The Go daemon-side demotion timeouts were increased to 15s and 30s, but the helper-side waits remain fixed at 2s.
+
+## Why this matters
+Under HA failover load, the worker command path is doing real work:
+- flow-cache invalidation
+- session-key collection
+- reverse-session refresh
+- delta flush
+
+Those operations can legitimately take longer than 2 seconds on a busy system. When that happens, the helper fails first even though the daemon has already been tuned to allow a longer, bounded handoff window.
+
+## Code
+- `userspace-dp/src/afxdp.rs:1179` uses `Duration::from_secs(2)` for `prepare_ha_demotion()`
+- `userspace-dp/src/afxdp.rs:1220` uses `Duration::from_secs(2)` for `export_owner_rg_sessions()`
+- daemon-side callers now allow much longer windows:
+  - `pkg/daemon/daemon.go:4012` manual demotion path uses 15s
+  - `pkg/daemon/daemon.go:3987` general demotion path uses 30s
+
+## Expected fix
+Use a configurable or caller-provided timeout budget that matches the daemon-side demotion budget, or convert the helper-side wait into a progress-aware bounded wait instead of a fixed 2-second deadline.
+
+## Failover impact
+This can still cause demotion/export timeout failures under heavy HA transition load even after the daemon-side timeout tuning landed.
+
+
+---
+
+## #278 — userspace RG transition pre-switch has no rollback when UpdateRGActive fails [CLOSED] (closed 2026-03-31)
+
+## Summary
+`Manager.UpdateRGActive(...)` disables userspace ctrl and swaps the XDP entry program to `xdp_main_prog` before calling `inner.UpdateRGActive(...)`, but it does not roll back that pipeline change if the BPF rg_active update fails.
+
+## Why this matters
+The pre-switch is intentional for failover correctness, but it currently has no rollback path. If `UpdateRGActive(...)` fails, the node can be left in the fallback eBPF pipeline with ctrl disabled even though the RG state transition did not actually commit.
+
+That is a partial transition with no recovery in the error path.
+
+## Code
+- `pkg/dataplane/userspace/manager.go:2665-2684` disables ctrl and swaps to `xdp_main_prog`
+- `pkg/dataplane/userspace/manager.go:2687` calls `m.inner.UpdateRGActive(rgID, active)`
+- `pkg/dataplane/userspace/manager.go:2687-2689` returns the error directly with no rollback of ctrl/XDP entry state
+
+The liveness-state reset and HA sync only happen after the successful `UpdateRGActive(...)` call.
+
+## Expected fix
+Either:
+- stage the pipeline switch only after `UpdateRGActive(...)` succeeds, or
+- add an explicit rollback path that restores ctrl/XDP entry state when the rg_active update fails
+
+## Failover impact
+A transient rg_active update failure can leave the node stuck in the wrong forwarding pipeline during HA transitions, which is exactly the kind of partial state that makes failover look fragile.
+
+
+---
+
+## #279 — ctrl re-enable after RG transition is not gated on transitioned-RG convergence [CLOSED] (closed 2026-03-31)
+
+## Summary
+Ctrl re-enable after an RG transition is currently gated by generic helper readiness and any RX progress, not by an explicit "transitioned RG state has converged" signal.
+
+The code comments say ctrl is held off so the helper can process HA updates and clean stale flow-cache entries for the transitioned RG, but the actual gate only checks:
+- bindings ready
+- neighbor generation > 0
+- aggregate RX progress for any binding
+
+## Why this matters
+Under HA failover, unrelated background RX can satisfy the current liveness probe even if the transitioned RG's synced sessions and flow-cache state have not finished converging. That lets the userspace flow cache come back before the transition-specific helper work is actually complete.
+
+## Code
+- `pkg/dataplane/userspace/manager.go:2700-2714` resets liveness state after RG transition and says ctrl should wait for HA processing to settle
+- `pkg/dataplane/userspace/manager.go:2973-3039` re-enables ctrl based on aggregate RX progress and generic helper readiness
+
+There is no transition-specific acknowledgement or generation proving that:
+- demoted RG state was fully applied
+- activated RG synced sessions were re-resolved
+- transitioned flow-cache entries were fully invalidated/refreshed
+
+## Expected fix
+Add an explicit post-transition convergence signal from the helper/worker path and gate ctrl re-enable on that signal, not just on generic RX liveness.
+
+Examples:
+- per-RG transition generation/ack
+- helper-reported completion of `DemoteOwnerRG` / `RefreshOwnerRGs`
+- a transition-scoped watermark carried back in helper status
+
+## Failover impact
+This leaves a gap where ctrl can resume too early under load, reintroducing stale userspace forwarding decisions during the exact HA transition window the eBPF fallback is meant to cover.
+
+
+---
+
+## #280 — daemon event-stream watermarks survive helper reconnect and stale-drain the next connection [CLOSED] (closed 2026-03-31)
+
+## Summary
+The daemon-side userspace event stream does not reset its receive/applied/ack state when the helper reconnects.
+
+If the helper process restarts and its local event-stream sequence restarts from 1, the daemon still carries forward the old:
+- `lastRecvSeq`
+- `lastAppliedSeq`
+- `lastAckSeq`
+
+## Why this matters
+That stale sequence state directly feeds demotion drain and ack behavior:
+- `SendDrainRequest(...)` uses `lastAppliedSeq` as the drain fence
+- the ack loop compares `lastAppliedSeq` to `lastAckSeq`
+- `readLoop(...)` seeds `prevSeq` from the prior connection's `lastRecvSeq`
+
+After a helper restart, the daemon can therefore:
+- send a stale drain target far above the new helper sequence space
+- suppress or distort ack behavior based on the previous connection
+- treat a new connection as if it were a continuation of the old sequence stream
+
+## Code
+- `pkg/dataplane/userspace/eventstream.go:163-172` accepts a new helper connection without resetting sequence state
+- `pkg/dataplane/userspace/eventstream.go:202` seeds `prevSeq` from `es.lastRecvSeq.Load()`
+- `pkg/dataplane/userspace/eventstream.go:127-131` fences `DrainRequest` to `lastAppliedSeq`
+
+## Expected fix
+Reset daemon-side event-stream watermarks on a fresh helper connection, or explicitly negotiate connection epochs so sequence/drain/ack state cannot bleed across helper restarts.
+
+## Failover impact
+A helper restart during or before HA failover can leave the demotion drain path and replay/ack bookkeeping working against stale sequence numbers, which is exactly the wrong place to be unsound.
+
+
+---
+
+## #281 — HA session refresh paths still scan and clone the full helper session tables [CLOSED] (closed 2026-03-31)
+
+## Summary
+The current HA transition helpers still do full-table session cloning/re-resolution on RG activation and demotion-related refresh paths.
+
+That makes transition work scale with the total session table, not just with the sessions owned by the RG being moved.
+
+## Why this matters
+These functions run on the userspace helper path during ownership changes. Under sustained forwarding load, a full-table scan/clone/re-resolution step directly competes with the packet path and stretches failover convergence latency.
+
+## Code
+Two especially expensive paths:
+
+1. `prewarm_reverse_synced_sessions_for_owner_rgs(...)`
+- `userspace-dp/src/afxdp/session_glue.rs:527-535`
+- clones all synced forward entries from `shared_sessions`
+
+2. `refresh_live_reverse_sessions_for_owner_rgs(...)`
+- `userspace-dp/src/afxdp/session_glue.rs:585-597`
+- clones every local session into `candidates` before filtering/refresolving
+
+The second function's own comment says it refreshes all local sessions when an owner RG activates.
+
+## Expected fix
+Move these paths toward RG-scoped indexing or incremental ownership tracking so activation/demotion refresh work is bounded by the transitioned RG instead of the whole helper session table.
+
+At minimum:
+- avoid cloning the full table up front
+- keep per-owner-RG indexes for synced and local sessions
+- refresh only the sessions whose owner or dependent reverse state can actually change for the transitioned RG
+
+## Failover impact
+This is a direct scaling gap in the current HA transition path and is a plausible contributor to the forwarding stalls still seen during loaded RG moves.
+
+
+---
+
+## #282 — ctrl re-enable stale-session cleanup stops after fixed delete caps [CLOSED] (closed 2026-03-31)
+
+## Summary
+The ctrl re-enable cleanup path flushes stale BPF session state with hard-coded caps:
+- `userspace_sessions` stops after 100000 deletes
+- `sessions` / `sessions_v6` stop after 200000 deletes per map
+
+That means the cleanup can silently leave stale entries behind in larger tables.
+
+## Why this matters
+The code comments are explicit that these stale entries poison the post-transition userspace path:
+- stale `userspace_sessions` entries can bypass the helper and keep traffic on the fallback path
+- stale BPF conntrack entries can interfere with NAT/session state when ctrl is re-enabled
+
+If the flush stops early, the code can report success while still leaving exactly the stale state it is trying to eliminate.
+
+## Code
+- `pkg/dataplane/userspace/manager.go:3058-3073` stops `userspace_sessions` cleanup after 100000 deletions
+- `pkg/dataplane/userspace/manager.go:3082-3097` stops conntrack cleanup after 200000 deletions per map
+
+There is no retry, pagination marker, or follow-up pass. The cleanup simply breaks out.
+
+## Expected fix
+Make the stale-state cleanup complete and observable:
+- continue until the maps are actually empty, or
+- chunk the work across multiple passes with explicit progress tracking and a final completion condition
+
+At minimum, surface whether cleanup hit the cap so operators know stale state may still remain.
+
+## Failover impact
+Large transition windows or busy systems can accumulate more stale entries than these caps allow, leaving post-failover forwarding poisoned even though ctrl has been re-enabled.
+
+
+---
+
+## #283 — pendingRGTransition stays set when syncHAStateLocked fails [CLOSED] (closed 2026-03-31)
+
+## Summary
+`pkg/dataplane/userspace/manager.go` uses a single boolean `pendingRGTransition` to hold ctrl disabled until `syncHAStateLocked()` completes, but it only clears that flag on the success path.
+
+If `syncHAStateLocked()` fails, the flag stays true indefinitely.
+
+## Why this matters
+`applyHelperStatusLocked()` now forces `ctrl.Enabled = 0` whenever `status.Enabled && m.pendingRGTransition`.
+
+That means one failed HA state sync can leave the manager permanently believing an RG transition is still in progress, keeping ctrl disabled on subsequent helper status updates.
+
+## Code
+- `pkg/dataplane/userspace/manager.go:2719` sets `m.pendingRGTransition = true`
+- `pkg/dataplane/userspace/manager.go:2720-2722` returns on `syncHAStateLocked()` error without clearing it
+- `pkg/dataplane/userspace/manager.go:2914-2918` suppresses ctrl enable whenever `pendingRGTransition` is true
+
+## Expected fix
+Clear the transition flag in a `defer`, or move to an explicit per-transition token/generation so the error path cannot leave the manager stuck in perpetual transition mode.
+
+## Failover impact
+A transient HA-sync error can leave forwarding stuck on the fallback pipeline with ctrl held down long after the actual RG transition failed or completed.
+
+
+---
+
+## #284 — single global pendingRGTransition bool is not sufficient for multi-RG HA transitions [CLOSED] (closed 2026-03-31)
+
+## Summary
+`pendingRGTransition` is a single process-wide boolean, not a per-RG or per-transition generation.
+
+That is too weak for overlapping or back-to-back RG transitions.
+
+## Why this matters
+Recent failover changes now rely on `pendingRGTransition` as the gating mechanism that keeps ctrl disabled until HA state convergence. But a single boolean cannot represent:
+- multiple RGs moving in one failover sequence
+- rapid failover/failback cycles
+- one transition finishing while another is still in flight
+
+Any of those can clear or retain the flag at the wrong time.
+
+## Code
+- `pkg/dataplane/userspace/manager.go:67` defines `pendingRGTransition bool`
+- `pkg/dataplane/userspace/manager.go:2719` sets it true for a transition
+- `pkg/dataplane/userspace/manager.go:2723` clears it on success
+- `pkg/dataplane/userspace/manager.go:2914-2918` uses that single boolean to block ctrl re-enable globally
+
+## Expected fix
+Replace the boolean with transition-scoped state, for example:
+- per-RG pending state, or
+- a monotonically increasing transition generation acknowledged by helper status
+
+The ctrl gate should depend on whether the current transition generation has been applied, not on a single global bool.
+
+## Failover impact
+This can re-enable ctrl too early or hold it down too long during multi-RG or rapid failover sequences, which matches the class of fragile forwarding behavior still being reported.
+
+
+---
+
+## #285 — promoting node no longer pre-switches out of userspace before RG activation [CLOSED] (closed 2026-03-31)
+
+## Summary
+The current activation path no longer pre-switches the promoting node to the eBPF pipeline before `rg_active=1`.
+
+Current code only disables ctrl / swaps to `xdp_main_prog` on demotion, not on activation.
+
+## Why this matters
+Standby HA nodes intentionally keep the userspace helper armed so they can handle stale-owner traffic. That means the promoting node can already have live userspace flow-cache state and synced sessions before its RG becomes active.
+
+Without an activation-side pre-switch, the promoting node can still serve packets from stale userspace state before the helper finishes:
+- HA state refresh
+- synced-session re-resolution
+- flow-cache invalidation/refresh for the activated RG
+
+## Code
+- `pkg/dataplane/userspace/manager.go:2653-2673` pre-switches only on `!active`
+- `pkg/dataplane/userspace/manager.go:2674-2679` explicitly says ctrl disable + eBPF swap is only on demotion now
+- standby helpers remain armed by design in `desiredForwardingArmedLocked()` for HA data RGs
+
+## Expected fix
+Add an activation-specific transition guard that prevents the promoting node from serving stale userspace flow-cache decisions before activation convergence completes.
+
+That does not necessarily mean reintroducing the exact old startup behavior; it may need a transition-scoped mechanism separate from generic startup liveness.
+
+## Failover impact
+This leaves the new owner exposed to stale userspace forwarding state during RG activation, which is a plausible remaining cause of forwarding collapse even after the demotion-side pre-switch fixes landed.
+
+
+---
+
+## #286 — HA reverse-session refresh still clones the full local session table before filtering [CLOSED] (closed 2026-03-31)
+
+## Summary
+The recent `#281` follow-up reduced some HA refresh work, but `refresh_live_reverse_sessions_for_owner_rgs(...)` still clones every local session into a candidate vector before filtering by owner RG.
+
+So the path still does full-table scan + clone work during RG activation.
+
+## Why this matters
+The function runs in the userspace helper transition path, under load, while failover convergence is time-sensitive. The current shape still scales with total session table size rather than with the transitioned RG.
+
+## Code
+- `userspace-dp/src/afxdp/session_glue.rs:585-597`
+- the function builds `candidates` by iterating all sessions and cloning `(key, decision, metadata, origin)` for every entry
+- only after that does it filter with owner-RG checks later in the loop
+
+## Expected fix
+Do the RG scoping before cloning, or maintain per-owner-RG indexes so the transition path can walk only the sessions that can actually change for the activated/demoted RG.
+
+## Failover impact
+This still leaves a full-table helper-side transition cost in the hot failover path and undermines the intent of the recent #281 performance fix.
+
+
+---
+
+## #287 — reverse-session prewarm now filters too narrowly by forward session owner RG [CLOSED] (closed 2026-03-31)
+
+## Summary
+`prewarm_reverse_synced_sessions_for_owner_rgs(...)` now filters synced forward sessions by `entry.metadata.owner_rg_id`, but its own logic and comments say reverse-companion refresh can depend on a newly active client-side egress RG, not only on the forward session's existing owner RG.
+
+That means the new filter can skip sessions whose reverse companion should change because a different RG became active.
+
+## Why this matters
+This is exactly the kind of split-RG failback case the comment describes: a reverse companion previously synthesized as `FabricRedirect` can need to flip back to local forwarding when another RG becomes active.
+
+If the forward session's stored `owner_rg_id` is not in the activated set, the new code now skips it entirely.
+
+## Code
+- `userspace-dp/src/afxdp/session_glue.rs:520-526` says reverse companions depend on current HA state of the client-side egress RG, not only the forward session owner RG
+- `userspace-dp/src/afxdp/session_glue.rs:527-535` now filters only on `owner_rg_set.contains(&entry.metadata.owner_rg_id)`
+
+## Expected fix
+The prewarm path needs to key off the RGs that can affect the refreshed reverse resolution, not just the forward session's stored owner RG. If that requires a richer dependency model, the current filter is too aggressive.
+
+## Failover impact
+This can leave reverse companions pinned to stale `FabricRedirect` or remote-owner behavior across split-RG activation/failback, which is directly relevant to the forwarding fragility still being debugged.
+
+
+---
+
+## #288 — userspace pending-neighbor retry ignores non-dynamic neighbor state [CLOSED] (closed 2026-03-31)
+
+## Problem
+The userspace helper's buffered first-packet retry path only rechecks `dynamic_neighbors` and ignores the full forwarding neighbor view.
+
+That means a first-hit `MissingNeighbor` packet can stay stranded even when the kernel already has a usable ARP/NDP entry or the forwarding snapshot contains one, as long as no fresh helper `dynamic_neighbors` update lands for that `(ifindex, ip)`.
+
+## Current code
+- `retry_pending_neigh()` only looks in `dynamic_neighbors`:
+  - `userspace-dp/src/afxdp.rs`
+- normal forwarding resolution uses `lookup_neighbor_entry(...)`, which checks:
+  - `state.neighbors`
+  - then `dynamic_neighbors`
+  - `userspace-dp/src/afxdp/forwarding.rs`
+
+So the retry path is strictly narrower than the normal resolution path.
+
+## Why this matters
+On the HA userspace cluster after a rolling deploy, the active helper reported:
+- `Last resolution: missing_neighbor ... next-hop=172.16.80.200`
+- kernel route and ARP were already present on the router for `172.16.80.200`
+- cluster-host traffic to `172.16.80.200` still failed
+
+This is exactly the kind of case where the first buffered packet can remain stuck because the helper retry path is not consulting the same neighbor sources as the regular resolution path.
+
+## Live evidence
+On March 29, 2026 / March 30, 2026 UTC in `loss-userspace-cluster`:
+- `fw0` kernel had:
+  - `172.16.80.200 dev ge-0-0-2.80 lladdr ... STALE`
+- helper still reported:
+  - `Last resolution: missing_neighbor ... next-hop=172.16.80.200`
+- failover validator aborted before failover because steady-state `.200` reachability was broken after deploy
+
+Artifact:
+- `/tmp/userspace-ha-failover-rg1-20260329-204323`
+
+## Fix direction
+Make `retry_pending_neigh()` use the same neighbor lookup semantics as normal forwarding resolution:
+- use `lookup_neighbor_entry(forwarding, Some(dynamic_neighbors), ifindex, hop)`
+- do not limit retry recovery to the dynamic cache only
+
+## Acceptance
+
+*(truncated — 43 lines total)*
+
+
+---
+
+## #289 — userspace reply-side redirect is missing for post-deploy SNATed direct-host ICMP [CLOSED] (closed 2026-03-31)
+
+## Problem
+After a rolling deploy on the HA userspace cluster, SNATed direct-host ICMP from the LAN can be forwarded out by the userspace dataplane while the reply side never reaches the helper.
+
+This leaves steady-state forwarding broken before failover even starts.
+
+## Live evidence
+On March 29, 2026 / March 30, 2026 UTC in `loss-userspace-cluster`:
+- `cluster-userspace-host -> 172.16.80.200` failed after deploy
+- router-originated `fw0 -> 172.16.80.200` ping succeeded
+- helper counters around a 3-packet host ping showed:
+  - `RX packets: +3`
+  - `Forward candidates: +3`
+  - `TX packets: +3`
+  - host still got `0/3` replies
+
+That means the forward direction is transmitting, but the reply direction is not making it back through the userspace dataplane.
+
+Related artifact:
+- `/tmp/userspace-ha-failover-rg1-20260329-204323`
+
+## Why this points at the reply-side redirect path
+The helper transmitted the requests, so this is not just a forward-route or neighbor-miss failure.
+
+The missing side is reply ingress for traffic addressed back to the interface-NAT / SNAT source address (`172.16.80.8` in this case).
+
+The likely fault domain is one of:
+- reverse live-session key publication in `publish_live_session_entry(...)`
+- reply-side lookup / promotion in `resolve_flow_session_decision(...)`
+- XDP pre-redirect classification for interface-NAT destinations in `userspace-xdp/src/lib.rs`
+- reply-side ICMP key agreement between the helper and `USERSPACE_SESSIONS`
+
+## Code areas to review
+- `userspace-dp/src/afxdp/bpf_map.rs`
+- `userspace-dp/src/afxdp/session_glue.rs`
+- `userspace-xdp/src/lib.rs`
+
+## Acceptance
+- after deploy, `cluster-userspace-host -> 172.16.80.200` succeeds without needing a router-originated warmup ping
+- helper RX counters show both request and reply traffic for that flow
+- the post-deploy failover gate reaches the actual failover phase instead of failing on the steady-state `.200` baseline
+
+*(truncated — 41 lines total)*
+
+
+---
+
+## #290 — ordinary XDP reply path lacks reverse-NAT fallback for interface-NAT destinations [CLOSED] (closed 2026-03-31)
+
+## Problem
+The ordinary non-GRE XDP entry path has no reply-side reverse-NAT fallback when a packet is destined to an interface NAT IP and the `userspace_sessions` lookup misses.
+
+Current flow in `userspace-xdp/src/lib.rs`:
+- `live_userspace_session_action(&parsed)`
+- if that misses:
+  - `is_icmp_to_interface_nat_local(&parsed)` => pass to kernel
+  - `is_local_destination(&parsed) || is_interface_nat_destination(&parsed)` => pass to kernel
+  - otherwise redirect to userspace helper
+
+Unlike the native GRE inner-path classifier, the ordinary IPv4/IPv6 path does **not** do a DNAT/reverse-NAT table lookup before deciding to hand reply traffic for NAT interface addresses to the kernel.
+
+## Why this matters
+This makes forwarded return traffic fragile under any timing or key-shape gap between:
+- helper session creation / reverse-wire key publish to `userspace_sessions`
+- first return packet arrival
+
+If the first reply packet misses `userspace_sessions`, it is treated as local-to-the-box traffic because the destination is the interface NAT IP, and it never reaches the userspace dataplane reply path.
+
+## Live evidence
+On current `master`, active-owner repro on `fw0`:
+- helper logs show forwarded LAN SYN RX and WAN SYN TX:
+  - `bpfrx-wan80-tcp: rx ingress_if=5 vlan=0 src=10.0.61.102:44406 dst=172.16.80.200:5201 flags=0x02`
+  - `bpfrx-wan80-tcp: tx-submit-prepared ... 172.16.80.8:44406 -> 172.16.80.200:5201 TCP [SYN]`
+- helper delta for one failed connect:
+  - `RX packets +4`
+  - `SNAT packets +4`
+  - `TX packets +4`
+  - `DNAT packets +0`
+  - `Slow path local-delivery +0`
+- `userspace_sessions` contains the reverse wire key with redirect action for the flow
+- helper never logs any matching WAN reply RX
+- kernel `TcpOutRsts` on `fw0` stays flat during the failed connect
+
+This is the exact failure shape where reply-side classification needs a second chance before treating interface-NAT traffic as kernel-local.
+
+## Proposed fix
+One of these needs to happen in the ordinary XDP path:
+1. Add a reply-side reverse-NAT / DNAT fallback before `is_interface_nat_destination()` sends the packet to the kernel.
+2. Add a dedicated pending-reply classification map for newly-created interface-NAT sessions so the first return packet is still redirected to userspace.
+
+*(truncated — 47 lines total)*
+
+
+---
+
+## #291 — XDP interface-NAT session misses are not surfaced as a distinct counter or trace path [CLOSED] (closed 2026-03-31)
+
+## Problem
+The XDP entry path has no dedicated trace/counter for the specific case:
+- packet is destined to an interface NAT IP
+- `userspace_sessions` lookup misses
+- packet is handed to the kernel via the generic local-destination path
+
+There is already a constant for this failure mode in `userspace-xdp/src/lib.rs`:
+- `USERSPACE_FALLBACK_REASON_INTERFACE_NAT_NO_SESSION`
+
+But it is not used anywhere in the actual decision tree.
+
+## Why this matters
+This made the current forwarding investigation much harder than it needed to be.
+
+Observed live failure shape on `fw0`:
+- helper clearly receives the forwarded LAN SYN
+- helper clearly emits the SNATed WAN SYN
+- helper never sees a reply RX
+- `DNAT packets` stays `0`
+- kernel `TcpOutRsts` stays flat
+
+From current counters alone, that is almost impossible to distinguish from:
+- no reply on wire
+- reply arriving on wrong node
+- reply being passed to kernel as interface-local
+- reply missing `userspace_sessions` and being silently misclassified
+
+## What is missing
+- a dedicated fallback counter for interface-NAT session misses
+- a dedicated trace stage for that miss path
+- optional per-interface or per-destination visibility so operators can tell which NAT IP is failing
+
+## Proposed fix
+- actually use `USERSPACE_FALLBACK_REASON_INTERFACE_NAT_NO_SESSION`
+- add a distinct trace stage when a packet to an interface NAT IP misses `userspace_sessions`
+- surface that counter in userspace dataplane stats / `monitor interface`
+
+## Acceptance criteria
+- a failed forwarded reply to a NAT interface address produces an explicit counter and trace reason
+- operators can tell the difference between:
+
+*(truncated — 45 lines total)*
+
+
+---
+
+## #292 — userspace helper TX counters do not fully describe prepared fast-path transmit state [CLOSED] (closed 2026-03-31)
+
+## Problem
+Userspace helper TX observability is not good enough to distinguish:
+- packet prepared for AF_XDP transmit
+- descriptor submitted to TX ring
+- packet completed by the kernel/NIC
+- packet sent via direct/copy/in-place rewrite path
+
+During the current forwarding repro on active `fw0`:
+- helper logs show `bpfrx-wan80-tcp: tx-submit-prepared ...`
+- per-connect delta shows `TX packets +4`
+- but aggregate stats still show:
+  - `Direct TX packets: 0`
+  - `Copy-path TX packets: 0`
+  - `In-place TX packets: 0`
+  - `TX completions: 0`
+
+That makes it hard to prove whether a forwarded packet actually made it onto the AF_XDP TX ring and out to the wire, or only advanced through earlier helper-side bookkeeping.
+
+## Why this matters
+This investigation had to fall back to side channels like interface counters and tcpdump because the helper stats do not tell a coherent TX story for prepared fast-path packets.
+
+## Proposed fix
+- expose separate counters for:
+  - prepared packets queued
+  - TX descriptors inserted
+  - TX wakeups issued
+  - TX completions reaped
+- make the existing direct/copy/in-place counters line up with all fast-path transmit paths, including prepared requests
+- surface the per-binding version in `monitor interface`
+
+## Acceptance criteria
+- for one forwarded host connect, helper stats can answer:
+  - how many packets were prepared
+  - how many were inserted into the TX ring
+  - how many completed
+  - which TX mode was used
+- no need to infer transmit state indirectly from interface counters
+
+
+---
+
+## #293 — userspace compiler falls back all interfaces to generic XDP on one attach failure [CLOSED] (closed 2026-03-31)
+
+## Summary
+On the userspace cluster, a single native XDP attach failure on `ifindex=4` causes the compiler to downgrade **all** interfaces to generic XDP (`xdpgeneric`). That global downgrade then changes dataplane behavior far beyond the failing interface.
+
+## Evidence
+- Repeated daemon log on current `master`:
+  - `native XDP not supported, falling back ALL to generic` `ifindex=4` `err="attach XDP to ifindex 4: failed to attach link: create link: invalid argument"`
+- After that fallback, all userspace data interfaces show `xdpgeneric` in the guest:
+  - `ge-7-0-0`
+  - `ge-7-0-1`
+  - `ge-7-0-2`
+- The failing native attach is on `ge-7-0-0` (`virtio` fabric parent), but the downgrade also affects the `mlx5` LAN/WAN ports.
+
+## Why this is a bug
+The current policy is broader than necessary:
+- some interfaces genuinely require generic mode
+- other interfaces may still support native mode
+- global fallback makes helper/bind assumptions brittle and can disable valid fast paths on unrelated interfaces
+
+In this lab, global generic fallback is a key part of the forwarding break because later helper logic still assumes zero-copy is viable on non-virtio NICs.
+
+## Expected behavior
+If native attach fails on one interface, only that interface should fall back to generic unless there is a hard technical reason to require a uniform mode across all interfaces.
+
+## Suggested fix
+- Change XDP attach fallback from global to per-interface.
+- Clear `IfaceFlagNativeXDP` only for interfaces that actually end up generic.
+- Keep the existing tunnel/VLAN special cases, but do not downgrade unrelated physical interfaces.
+
+## Repro context
+- Cluster: `loss-userspace-cluster`
+- Date: 2026-03-30
+- Current `master` repeatedly logs the global fallback on restart.
+
+
+---
+
+## #294 — userspace helper picks zerocopy from driver name instead of actual XDP mode [CLOSED] (closed 2026-03-31)
+
+## Summary
+The userspace helper currently chooses AF_XDP bind flags from the NIC driver name, not from the interface's actual XDP attach mode. In the lab, this allowed `mlx5` interfaces running `xdpgeneric` to bind `zerocopy`, which broke steady-state forwarding to `.200`.
+
+## Evidence
+Current code path:
+- `userspace-dp/src/afxdp/bind.rs`
+- `bind_flag_candidates_for_driver()` prefers zerocopy for non-`virtio_net`
+- `query_bound_xsk_mode()` later trusts `XDP_OPTIONS_ZEROCOPY`
+
+Live repro on 2026-03-30:
+- daemon log repeatedly shows:
+  - `native XDP not supported, falling back ALL to generic` on `ifindex=4`
+- guest interfaces then show `xdpgeneric`:
+  - `ge-7-0-1` (`mlx5_core`)
+  - `ge-7-0-2` (`mlx5_core`)
+- helper still logged successful zerocopy binds on those interfaces:
+  - `libxdp bind(... ) OK ... mode=ZeroCopy flags=0x000c`
+- steady-state host -> `172.16.80.200` forwarding failed
+
+A helper-only workaround that forced copy mode on generic non-virtio interfaces restored:
+- forwarded ping to `172.16.80.200`
+- TCP connect to `172.16.80.200:5201`
+- short `iperf3` connectivity
+
+## Why this is a bug
+Driver capability is not enough. The bind decision must account for the actual XDP attach mode on that interface.
+
+If an interface is in generic/SKB XDP mode, zerocopy should not be selected just because the NIC is `mlx5`.
+
+## Expected behavior
+AF_XDP bind mode selection should use the real interface XDP mode:
+- generic/SKB XDP -> copy/auto only
+- native/driver XDP -> zerocopy may be attempted
+
+## Suggested fix
+- Make helper bind selection mode-aware using actual XDP attach mode, not just driver name.
+- Either:
+  - pass attach mode to the helper in the snapshot/protocol, or
+  - query it directly before binding (for example with `bpf_xdp_query()`/equivalent).
+- Add status/debug output so operators can see both:
+
+*(truncated — 48 lines total)*
+
+
+---
+
+## #297 — manual RG failover still collapses after reverse prewarm with stable ownership and flat session misses [CLOSED] (closed 2026-03-31)
+
+## Summary
+
+Manual `RG1` failover under inherited `iperf3 -P 8` load still collapses even after the latest reverse-session activation prewarm fix removed the earlier large new-owner `session_miss` burst.
+
+## Evidence
+
+Code checkpoint:
+- `c84c35c7` `userspace: prewarm reverse sessions for activated RGs`
+
+Artifacts:
+- `/tmp/userspace-ha-failover-rg1-20260330-174231`
+- `/tmp/manual-oneway-rg1-20260330-174744`
+
+One-way failover summary:
+- `68` intervals
+- `51` zero-throughput intervals
+- peak `20.600 Gbps`
+- tail median `0.000 Gbps`
+
+`iperf3` timeline:
+- pre-failover: steady around `20 Gbps`
+- first bad second: `3.17 Gbps`
+- next second onward: sustained `0.00 bits/sec`
+
+Control-plane state during the bad window:
+- `node0` remains `RG1 secondary`
+- `node1` remains `RG1 primary`
+- no ownership flap during the collapse window
+
+Helper/session evidence:
+- `fw1 Sessions installed` starts at `151`, later `216`
+- `fw0 Session misses` stays flat at `29`
+- `fw1 Session misses` stays flat at `27-28`
+- `Neighbor misses` stay flat
+- `fw1 Slow path local-delivery` only grows slightly (`22 -> 32`)
+
+## Interpretation
+
+The earlier install failure signature is gone. The remaining bug is now more likely in the stale-owner demotion / redirected transport path than in new-owner session installation.
+
+
+*(truncated — 46 lines total)*
+
+
+---
+
+## #298 — demotion cleanup immediately deletes shared USERSPACE_SESSIONS entries but leaves worker-local owner-RG sessions until async worker drain [CLOSED] (closed 2026-03-31)
+
+## Summary
+
+During helper `update_ha_state()` demotion, the immediate `USERSPACE_SESSIONS` cleanup only scans `shared_sessions`. Worker-local owner-RG sessions remain in the session map until `WorkerCommand::DemoteOwnerRG` runs asynchronously on each worker.
+
+## Code
+
+Current code in `userspace-dp/src/afxdp.rs`:
+- on demotion, `update_ha_state()` immediately deletes matching keys only from `shared_sessions`
+- then it enqueues `WorkerCommand::DemoteOwnerRG` to workers
+
+Current worker-side demotion in `userspace-dp/src/afxdp/session_glue.rs`:
+- `DemoteOwnerRG` later invalidates flow caches
+- marks sessions synced / removes them from the BPF session map
+- but only after the async worker command executes
+
+## Why this matters
+
+The code comment explicitly says the immediate cleanup is meant to close the window where demoted traffic still hits `USERSPACE_SESSIONS` and bypasses the eBPF fabric redirect path. That guarantee is incomplete if worker-local owner-RG sessions are still present in the map until later async processing.
+
+## Evidence
+
+This is a code-path gap. The remaining manual failover collapse on March 30, 2026 still happens immediately after the ownership move even after the large new-owner `session_miss` burst was removed.
+
+Artifacts for the surviving failure shape:
+- `/tmp/userspace-ha-failover-rg1-20260330-174231`
+- `/tmp/manual-oneway-rg1-20260330-174744`
+
+## Next steps
+
+1. Measure how many demoted owner-RG `USERSPACE_SESSIONS` entries remain after the immediate shared-session cleanup and before worker `DemoteOwnerRG` completion.
+2. If non-zero, add an explicit immediate worker-local demotion cleanup path or an acked barrier before traffic depends on the eBPF redirect path.
+3. Re-test the one-way `RG1` failover artifact under `iperf3 -P 8`.
+
+
+---
+
+## #302 — Enforce a strict userspace-only forwarding invariant [CLOSED] (closed 2026-04-01)
+
+We need a tracked work item for making `userspace dataplane active` mean that transit forwarding is actually staying on the userspace path rather than silently using eBPF or kernel forwarding.\n\nCurrent gaps called out in the audit:\n- `xdp_userspace_prog` still falls back to `xdp_main_prog` / `XDP_PASS`\n- XSK liveness failure silently swaps the entry program back to eBPF\n- `userspace_sessions` can steer packets to `PASS_TO_KERNEL`\n- stale BPF conntrack / userspace session-map state still interferes with userspace forwarding\n\nThis issue is the umbrella for the strict userspace-only forwarding work.\n\nSee PR #301 and docs/userspace-forwarding-and-failover-gap-audit.md.
+
+---
+
+## #303 — Define explicit runtime modes for userspace_strict, userspace_compat, and ebpf_only [CLOSED] (closed 2026-04-01)
+
+The runtime currently overloads `userspace running` to mean several different things. We need explicit runtime modes so operators and validation can distinguish:\n- strict userspace forwarding\n- compatibility mode with eBPF/kernel fallback\n- eBPF-only mode\n\nRequired work:\n- define the mode model in code and status surfaces\n- make attach / swap / health logic report the active mode explicitly\n- stop implying `userspace` when the entry program or fallback behavior is not strict\n\nSee PR #301 and docs/userspace-forwarding-and-failover-gap-audit.md.\n\nParent: https://github.com/psaab/bpfrx/issues/302
+
+---
+
+## #304 — Disallow transit fallback from xdp_userspace_prog into xdp_main_prog or XDP_PASS in strict mode [CLOSED] (closed 2026-04-01)
+
+In strict userspace mode, transit packets must not silently escape to the eBPF pipeline or the kernel forwarding path.\n\nCurrent code paths still do this through `fallback_to_main()`, `cpumap_or_pass()`, and several early fallback branches in `userspace-xdp/src/lib.rs`.\n\nRequired work:\n- classify which packet classes are true control-plane exceptions\n- ban silent transit fallback in strict mode\n- replace silent fallback with explicit drop + counters where strict behavior is required\n\nSee PR #301 and docs/userspace-forwarding-and-failover-gap-audit.md.\n\nParent: https://github.com/psaab/bpfrx/issues/302
+
+---
+
+## #305 — Remove or narrowly scope PASS_TO_KERNEL session actions for strict userspace mode [CLOSED] (closed 2026-04-01)
+
+The userspace session steering map still encodes `PASS_TO_KERNEL` decisions. That makes the current userspace dataplane a hybrid forwarding system even when userspace is active.\n\nRequired work:\n- audit every producer of `PASS_TO_KERNEL` decisions\n- separate true local/control-plane exceptions from transit forwarding\n- ensure strict userspace mode never uses `PASS_TO_KERNEL` for transit\n\nSee PR #301 and docs/userspace-forwarding-and-failover-gap-audit.md.\n\nParent: https://github.com/psaab/bpfrx/issues/302
+
+---
+
+## #306 — Make XSK liveness failure explicit instead of silently swapping back to xdp_main_prog [CLOSED] (closed 2026-04-01)
+
+Today the userspace manager can mark XSK liveness failed and swap the entry program back to `xdp_main_prog`. That preserves forwarding, but it violates a strict userspace invariant and hides the real dataplane mode.\n\nRequired work:\n- decide strict-mode behavior for XSK liveness failure\n- likely fail readiness / fail closed instead of silently preserving transit via eBPF\n- expose the degraded mode in status and validation\n\nSee PR #301 and docs/userspace-forwarding-and-failover-gap-audit.md.\n\nParent: https://github.com/psaab/bpfrx/issues/302
+
+---
+
+## #307 — Expose per-interface entry program and transit fallback counters in status and validation [CLOSED] (closed 2026-04-01)
+
+We need observability that can prove whether the dataplane is actually running in strict userspace mode.\n\nRequired work:\n- expose the attached XDP entry program per interface\n- expose whether any transit fallback counters have incremented\n- make HA / regression validators fail when strict userspace expectations are violated\n\nSee PR #301 and docs/userspace-forwarding-and-failover-gap-audit.md.\n\nParent: https://github.com/psaab/bpfrx/issues/302
+
+---
+
+## #308 — Reduce HA failover toward a MAC-move-only model [CLOSED] (closed 2026-04-01)
+
+We need an explicit architectural queue for the work required to make failover closer to the ideal model: move MACs, send GARP/NA, and keep forwarding without bespoke demotion/activation repair.\n\nThe audit shows the current system still depends on state and ordering outside the continuous session stream:\n- HA runtime / RG ownership state\n- reverse-session synthesis and refresh\n- flow-cache invalidation\n- neighbor and fabric state\n- demotion prep and barrier ordering\n\nThis umbrella tracks the work needed to either replicate or fence that state so failover does not rely on ad hoc handoff logic.\n\nSee PR #301 and docs/userspace-forwarding-and-failover-gap-audit.md.
+
+---
+
+## #309 — Enumerate forwarding-relevant state that is not carried in continuous session sync [CLOSED] (closed 2026-04-01)
+
+The repo needs a concrete inventory of every forwarding input that is still outside the continuous HA session stream. That inventory should classify each item as:\n- replicated\n- deterministically derived\n- fenced at cutover\n\nThe audit already identifies likely candidates:\n- HA runtime active/demoting state\n- reverse companion state\n- translated alias state\n- neighbor state\n- fabric-link state\n- flow-cache state / invalidation epoch\n- local-delivery and other filtered session classes\n\nSee PR #301 and docs/userspace-forwarding-and-failover-gap-audit.md.\n\nParent: https://github.com/psaab/bpfrx/issues/308
+
+---
+
+## #310 — Make reverse-companion and translated-alias state deterministic at takeover [CLOSED] (closed 2026-04-01)
+
+Failover currently relies on helper-side reverse-session prewarm / refresh and translated alias promotion around RG activation and demotion. That is a direct reason failover is not just MAC movement.\n\nRequired work:\n- define whether reverse companions and translated aliases should be fully replicated or deterministically reconstructed\n- remove reliance on best-effort activation-time repair where possible\n- prove the new owner can answer inherited traffic immediately after cutover\n\nSee PR #301 and docs/userspace-forwarding-and-failover-gap-audit.md.\n\nParent: https://github.com/psaab/bpfrx/issues/308
+
+---
+
+## #311 — Define an install fence for HA cutover instead of relying on continuous sync alone [CLOSED] (closed 2026-04-01)
+
+The current daemon still needs demotion prep, barriers, quiescence checks, bulk acknowledgements, and final peer barriers before graceful failover. That is proof that continuous session sync alone is not a readiness guarantee.\n\nRequired work:\n- define the exact cutover contract (for example: peer has installed all required state through sequence N)\n- make old-owner demotion and MAC movement depend on that fence\n- remove any remaining handoff logic that only exists because readiness is inferred instead of proven\n\nSee PR #301 and docs/userspace-forwarding-and-failover-gap-audit.md.\n\nParent: https://github.com/psaab/bpfrx/issues/308
+
+---
+
+## #312 — Reduce helper-local cache and non-session dependencies at RG transition [CLOSED] (closed 2026-04-01)
+
+Failover still depends on helper-local state outside the session stream, including flow caches, neighbor state, fabric state, and owner-RG transitions.\n\nRequired work:\n- minimize forwarding-critical worker-local cache state that must be repaired at activation/demotion\n- decide which remaining local dependencies must be replicated versus invalidated versus fenced\n- make the failover validators prove these dependencies are either ready or irrelevant at cutover\n\nSee PR #301 and docs/userspace-forwarding-and-failover-gap-audit.md.\n\nParent: https://github.com/psaab/bpfrx/issues/308
+
+---
+
+## #314 — HA cutover still lacks a helper worker-completion acknowledgment [CLOSED] (closed 2026-04-01)
+
+Current `origin/master` still has no end-to-end acknowledgment that the activated helper has finished applying HA transition work before traffic ownership moves.
+
+Code path:
+- `pkg/dataplane/userspace/manager.go:2793-2860` treats `UpdateRGActive(...)` as complete once the helper answers the control request.
+- `userspace-dp/src/main.rs:1497-1508` handles `update_ha_state` synchronously only at the control-plane level.
+- `userspace-dp/src/afxdp.rs:1157-1191` handles activation by:
+  - prewarming reverse synced sessions, then
+  - enqueueing `WorkerCommand::RefreshOwnerRGs(...)` to each worker, and then returning.
+- `userspace-dp/src/afxdp/session_glue.rs:346-430` shows that `RefreshOwnerRGs(...)` is where forward sessions are actually re-resolved locally and republished.
+
+Why this matters:
+- Barriers and continuous sync only prove stream ordering to the peer, not that every worker has finished the local activation work needed for forwarding.
+- MAC move can still race stale worker caches / stale synced session resolution.
+- That is a direct reason failover is not just MAC move plus GARP/NA on current code.
+
+What to change:
+- Add a per-transition sequence and require every worker to ack `RefreshOwnerRGs` / prewarm completion.
+- Only mark the RG cutover-ready after those worker acks are collected.
+
+Acceptance signal:
+- there is a concrete "activated helper is forwarding-ready" acknowledgment, not just a control-request response.
+
+
+---
+
+## #315 — Continuous userspace HA sync still omits local-delivery session state [CLOSED] (closed 2026-04-01)
+
+Current `origin/master` intentionally excludes some userspace session classes from continuous HA sync.
+
+Code path:
+- `pkg/daemon/daemon.go:3578-3588` returns `false` from `shouldSyncUserspaceDelta(...)` for `Disposition == local_delivery`.
+- The same function only syncs stale-owner `FabricRedirect` deltas under a special case.
+
+Why this matters:
+- The claim "sessions are continuously synced so failover should only need MAC move + GARP/NA" is not true for the current userspace dataplane.
+- Helper-local / local-delivery state is still reconstructed locally rather than being part of the steady-state HA stream.
+- Any failover path that depends on interface-NAT or other helper-local delivery semantics still needs more than L2 ownership movement.
+
+What to change:
+- Enumerate exactly which `local_delivery` cases are safe and necessary to sync, or
+- define a deterministic replacement model for them so takeover does not depend on ad-hoc local reconstruction.
+
+Acceptance signal:
+- the failover contract states either "this session class is continuously carried" or "this session class is locally reconstructed in a deterministic, tested way" for every userspace disposition.
+
+
+---
+
+## #316 — Cluster-synced reverse sessions are still not mirrored into the userspace helper [CLOSED] (closed 2026-04-01)
+
+Current `origin/master` still does not mirror cluster-synced reverse sessions into the Rust userspace helper.
+
+Code path:
+- `pkg/cluster/sync.go:1390-1413` creates reverse sessions on the takeover node by calling `SetClusterSyncedSessionV4/V6(...)` for `revVal`.
+- `pkg/dataplane/userspace/manager.go:3837-3906` only mirrors sessions into the helper when `shouldMirrorUserspaceSession(val.IsReverse)` is true.
+- `shouldMirrorUserspaceSession(...)` returns `isReverse == 0`, so reverse sessions are dropped from the helper mirror path.
+- The helper activation path in `userspace-dp/src/afxdp/session_glue.rs:346-349` still claims reverse companions are pre-installed by the Go sync path, but for cluster-synced sessions that is not actually true on the helper side.
+
+Why this matters:
+- Continuous session sync is not enough to make failover a MAC-move-only event if the new owner still has to synthesize or repair reverse companions during activation.
+- Reverse/translated reply handling remains an activation-time helper concern instead of being fully ready before MAC ownership moves.
+
+What to change:
+- Either mirror cluster-synced reverse sessions into the helper explicitly, or
+- define a deterministic, acknowledged helper-side reverse install step that finishes before the new owner is treated as cutover-ready.
+
+Acceptance signal:
+- takeover no longer depends on activation-time reverse synthesis/refresh for already-synced flows.
+
+
+---
+
+## #317 — Userspace session sync still depends on activation-time local egress re-resolution [CLOSED] (closed 2026-04-01)
+
+Current `origin/master` still serializes forwarding state using node-local egress details, then throws the local resolution away on install.
+
+Code path:
+- `pkg/dataplane/userspace/manager.go:3929-4010` builds session-sync requests using `EgressIfindex`, `TXIfindex`, `NeighborMAC`, `SrcMAC`, and `TXVLANID`.
+- `pkg/dataplane/userspace/manager.go:4235-4249` derives those values from local snapshot ifindexes.
+- `pkg/cluster/sync.go:1378-1385` and `pkg/dataplane/userspace/manager.go:3837-3893` immediately zero `FibIfindex`, `FibVlanID`, `FibDmac`, `FibSmac`, and `FibGen` on the receiver because the peer's resolved forwarding state is meaningless locally.
+- `userspace-dp/src/afxdp/session_glue.rs:360-430` then re-resolves forward sessions during `RefreshOwnerRGs`, with an explicit comment that without this SNAT on the new owner is wrong.
+
+Why this matters:
+- The continuously synced session stream is not forwarding-complete.
+- The new owner cannot just keep forwarding after MAC move; it still needs local activation-time re-resolution before the synced session is usable.
+
+What to change:
+- Stop treating numeric ifindex/MAC state as portable session-sync data.
+- Carry a portable egress identity instead (logical interface/tunnel endpoint/next-hop identity), or
+- add an explicit local re-resolution/install-ready step and treat failover readiness as incomplete until that finishes.
+
+Acceptance signal:
+- synced sessions arrive on the new owner in a form that is either directly usable or explicitly tracked as unresolved until local resolution completes.
+
+
+---
+
+## #318 — Redesign HA session sync around a portable canonical session record [CLOSED] (closed 2026-04-02)
+
+Current `origin/master` serializes node-local resolved forwarding data into the HA session stream and then discards it on install.
+
+Code points:
+- `pkg/dataplane/userspace/manager.go:3959-3999` / `4019-4050` build helper sync requests with `EgressIfindex`, `TXIfindex`, `NeighborMAC`, `SrcMAC`, and `TXVLANID`.
+- `pkg/dataplane/userspace/manager.go:3837-3893` zeroes `FibIfindex`, `FibVlanID`, `FibDmac`, `FibSmac`, and `FibGen` on cluster-synced install because the peer's resolved values are not portable.
+- `userspace-dp/src/afxdp/session_glue.rs:339-430` then re-resolves forward sessions locally during `RefreshOwnerRGs` to repair them on activation.
+
+That is a structural sign that the HA session record is carrying the wrong abstraction.
+
+What should replace it:
+- A portable canonical session record that carries only:
+  - flow key
+  - NAT state
+  - ingress/egress zone identity
+  - owner RG / HA metadata
+  - fabric-ingress / tunnel identity where needed
+- No node-local ifindex, MAC, or cached FIB result in the cross-node schema.
+- Local forwarding resolution should be derived immediately on each node from the canonical record and the local forwarding snapshot.
+
+Why this matters:
+- It removes activation-time repair work from failover.
+- It makes the session stream semantically stable across nodes.
+- It reduces the chance of hidden coupling between session sync and local forwarding internals.
+
+Related:
+- #314
+- #316
+- closed #317 captured one symptom of this, but this issue is the schema-level fix.
+
+
+---
+
+## #319 — Continuously materialize standby helper state instead of repairing sessions on RG activation [CLOSED] (closed 2026-04-02)
+
+Current `origin/master` still makes RG activation do large repair work in the helper:
+- `userspace-dp/src/afxdp.rs:1157-1191` prewarms reverse sessions and queues `RefreshOwnerRGs` to every worker.
+- `userspace-dp/src/afxdp/session_glue.rs:332-430` re-resolves forward sessions for the activated RGs because synced sessions are not already forwarding-ready locally.
+
+That means the standby is not continuously materialized into a locally-usable runtime state. It is only partially populated, then repaired when ownership flips.
+
+What should replace it:
+- On sync import, the standby should build and keep the local runtime form of the session continuously, even while RG is inactive.
+- Reverse companions, translated aliases, and local rewrite descriptors should exist before failover.
+- Activation should become a cheap ownership epoch flip plus MAC move/GARP/NA, not a worker-wide table scan.
+
+Expected result:
+- no `RefreshOwnerRGs` full-table repair path on activation
+- no reverse prewarm pass at activation
+- failover becomes much closer to "ownership flip + continue forwarding"
+
+Related:
+- #314
+- #316
+
+
+---
+
+## #320 — Make HA session producers event-first and reduce sweeps/polling to reconciliation [CLOSED] (closed 2026-04-02)
+
+The current producer side is still more complex than it should be:
+- helper event stream exists, but `pkg/daemon/daemon.go:3648-3684` still runs a polling loop and `3793-3833` keeps a polling fallback path
+- kernel sync still relies on timer/sweep semantics and queue-idle heuristics for correctness
+
+For a simpler HA design, the steady-state producer model needs to be event-first and reconciliation-second.
+
+What should change:
+- userspace helper event stream becomes the single steady-state producer for helper-originated session changes
+- kernel session sync becomes event-first for create/delete/material transitions
+- sweep remains only as reconciliation for missed events / reconnect recovery / correctness checks
+
+Why this matters:
+- lower steady-state work
+- fewer transition-time races caused by polling and background queue growth
+- easier cutover contract because the event stream sequence can participate directly in applied-sequence fencing
+
+This is not just a performance issue; it is a major simplification prerequisite for making HA cutover predictable.
+
+
+---
+
+## #321 — Replace HA flow-cache scans and flushes with epoch-based cache validation [CLOSED] (closed 2026-04-02)
+
+Current flow-cache invalidation still depends on explicit scans and flush commands around HA transitions.
+
+Code points:
+- `userspace-dp/src/afxdp/types.rs:119-133` invalidates per-RG by scanning every cache entry.
+- `userspace-dp/src/afxdp.rs:1143-1149` pushes `FlushFlowCaches` on demotion because per-RG invalidation is not sufficient in all cases.
+- `userspace-dp/src/afxdp/session_glue.rs:278-281`, `324-326`, `334-337` repeatedly walk caches for owner-RG invalidation.
+
+That means failover correctness currently depends on imperative cache maintenance rather than cache entries becoming invalid naturally when ownership changes.
+
+What should replace it:
+- introduce per-RG / per-resolution epochs
+- include those epochs in the runtime session record and flow-cache validation key
+- failover bumps epochs; stale cache entries self-miss on next lookup without needing O(n) scans
+
+Expected result:
+- no `FlushFlowCaches` command in the HA transition path
+- no per-RG cache walk at demotion/activation
+- flow cache remains a pure local acceleration layer, not a transition-time state machine participant
+
+
+---
+
+## #322 — Collapse helper HA session state into one canonical store plus derived indexes [CLOSED] (closed 2026-04-02)
+
+Current helper HA state is spread across multiple overlapping stores:
+- `shared_sessions`
+- `shared_nat_sessions`
+- `shared_forward_wire_sessions`
+- worker-local `SessionTable` plus alias indexes
+
+Code points:
+- `userspace-dp/src/afxdp.rs:233` / `276` define and carry the shared maps.
+- `userspace-dp/src/afxdp.rs:1098-1126` has to demotion-clean all three stores separately.
+- `userspace-dp/src/afxdp/session_glue.rs` publishes, refreshes, and deletes through separate alias paths.
+
+This multiplies activation, demotion, delete, and cache-invalidation complexity because HA has to reason about cloned entries instead of one canonical session object with derived indexes.
+
+What should replace it:
+- one canonical synced session store keyed by session identity / session ID
+- alias indexes that point to the canonical record rather than cloned `SyncedSessionEntry` copies
+- a clear split between authoritative record and derived lookup indices
+
+Expected result:
+- demotion does not need to walk multiple shared maps
+- activation does not need separate prewarm/repair logic for parallel stores
+- less risk of alias divergence across forward/reverse/translated representations
+
+
+---
+
+## #323 — Replace HA demotion drain choreography with an applied-sequence cutover fence [CLOSED] (closed 2026-04-02)
+
+Current graceful demotion is expensive because the system does not have a single cutover-ready notion of "peer has applied all forwarding-relevant state".
+
+Code points:
+- `pkg/daemon/daemon.go:4106-4230` performs `WaitForPeerBarriersDrained`, repeated `WaitForIdle` + `WaitForPeerBarrier`, pause/resume of incremental sync, event-stream drain or RPC export/drain fallback, journal flush, then a final barrier.
+- `pkg/cluster/sync.go:1962-2005` `WaitForIdle()` literally waits for the sync queue to stop changing before the barrier can mean anything.
+
+That is a symptom of missing applied-sequence semantics, not just missing tuning.
+
+What should replace it:
+- every canonical session update should carry a monotonically increasing sequence
+- the standby should ack the highest sequence fully imported/materialized locally
+- graceful demotion should fence on that applied sequence rather than on idle heuristics + side drains
+
+Expected result:
+- no repeated idle polling to prove quiescence
+- no export/drain repair pass in the common case
+- demotion becomes: stop emitting new owner updates, fence sequence N, wait for peer applied>=N, then move ownership/MACs
+
+Related:
+- #314
+
+
+---
+
+## #324 — Flow cache on new owner caches sessions without NAT decision after failover [CLOSED] (closed 2026-04-01)
+
+## Symptom
+After RG failover, the new owner matches 267K session hits but applies SNAT to only 22 packets. TCP streams die because outbound traffic uses the original LAN source IP instead of the SNAT'd WAN IP.
+
+## Root cause (suspected)
+The flow cache is populated from the session table lookup, but the NAT decision (`decision.nat.rewrite_src`) is not carried into the flow cache entry. When packets hit the flow cache, they get forwarded without SNAT rewriting.
+
+## Code path
+- `userspace-dp/src/afxdp.rs` — flow cache hit path at ~line 2698 returns `cached_decision` which may lack NAT
+- `userspace-dp/src/afxdp.rs` — session lookup at ~line 2860 returns full `SessionDecision` including NAT
+- `userspace-dp/src/afxdp/types.rs` — `FlowCache` entry stores `FlowCacheEntry` — need to verify it carries NAT
+
+## Evidence
+- `SNAT packets: 22` vs `Session hits: 267686` on new owner after failover
+- Sessions installed: 321, re-resolved with correct egress via owner_rg_id=0 fix
+- Session sync working (81 sent incrementally, bulk sync reliable)
+- Flow cache flushed on activation (FlushFlowCaches + RefreshOwnerRGs)
+
+---
+
+## #325 — Send owner_rg_id from sync sender instead of defaulting to 0 [CLOSED] (closed 2026-04-01)
+
+The sender has snapshot access to resolve owner_rg_id via sessionSyncEgressLocked but returns 0 when FibIfindex<=0. Fix: always compute owner_rg_id at send time. Eliminates activation-time re-resolution of RG ownership for synced sessions.
+
+---
+
+## #326 — Resolve synced sessions with local egress on receipt, not just on activation [CLOSED] (closed 2026-04-01)
+
+UpsertSynced only re-resolves when locally_active is true. Shift resolution to every sync receipt so standby sessions are always forwarding-ready. Eliminates RefreshOwnerRGs re-resolution loop.
+
+---
+
+## #327 — Replace flow cache flush with epoch-based invalidation [CLOSED] (closed 2026-04-01)
+
+Add owner_rg_generation to FlowCacheEntry. On demotion, increment RG generation atomically. Cache entries expire on next access when generation mismatches. Eliminates FlushFlowCaches + invalidate_owner_rg scans.
+
+---
+
+## #328 — Unify synced flag into origin-based collision detection [CLOSED] (closed 2026-04-02)
+
+Replace binary synced:bool with synced_generation:u64. Merge refresh_local, promote_synced, refresh_for_ha_activation into one update function. Eliminates dual-guard complexity.
+
+---
+
+## #329 — Pre-populate BPF userspace_sessions map on sync receipt [CLOSED] (closed 2026-04-02)
+
+Publish synced sessions to BPF map at install time, not just at activation. XDP shim checks rg_active before using entry. Eliminates synchronous BPF map deletion loop on demotion.
+
+---
+
+## #330 — Simplify demotion prep to epoch transition [CLOSED] (closed 2026-04-01)
+
+Replace barrier/quiescence/drain choreography with a simple demoting flag + short lease. Rely on continuous sync for session delivery. Eliminates 150-line handshake.
+
+---
+
+## #332 — Userspace-forwarded packets not counted in BPF zone/policy/NAT counter maps [CLOSED] (closed 2026-04-01)
+
+TC egress counters (zone_counters, policy_counters, filter_counters, nat_rule_counters, global_counters) are only incremented by the eBPF pipeline. Userspace-forwarded packets via XSK TX bypass TC entirely, so ReadZoneCounters/ReadPolicyCounters/ReadGlobalCounter return incomplete values. Fix: write userspace counters to the same BPF maps, or merge counters from both sources.
+
+---
+
+## #333 — IterateSessions reads only eBPF conntrack — userspace sessions invisible to GC/ARP warmup [CLOSED] (closed 2026-04-01)
+
+pkg/dataplane/maps.go IterateSessions only reads the BPF sessions map. Userspace helper sessions are in Rust memory only. This means session GC, ARP warmup target collection, and show session commands miss userspace sessions. Fix: extend IterateSessions to also query the helper's session table via control socket, or write userspace sessions to BPF conntrack (partially done in fab9230c but byte order issue remains).
+
+---
+
+## #334 — BPF conntrack writes during ctrl=0 window conflict with userspace sessions [CLOSED] (closed 2026-04-01)
+
+When ctrl is disabled (XSK liveness probe, link cycle, startup), the eBPF pipeline creates BPF conntrack entries. When ctrl re-enables, these stale entries must be flushed (manager.go:3243-3268) because TC egress reads them and applies conflicting NAT. Fix: disable BPF conntrack writes entirely when userspace mode is configured, or add a generation counter to distinguish userspace vs eBPF sessions.
+
+---
+
+## #335 — BPF conntrack entry byte order mismatch prevents zone display for userspace sessions [CLOSED] (closed 2026-04-01)
+
+fab9230c added publish_bpf_conntrack_entry to write userspace sessions to the BPF sessions map for zone/interface display. However sessions don't appear — likely byte order mismatch between Rust BpfSessionKeyV4 port fields (host order) and the C session_key_t (network order). Fix: verify BpfSessionKeyV4 port byte order matches the C struct exactly. Add a debug log on write failure.
+
+---
+
+## #338 — Graceful demotion barrier no longer fences helper and kernel session producers [CLOSED] (closed 2026-04-02)
+
+## Problem
+`prepareUserspaceRGDemotionWithTimeout()` no longer fences all session producers before cutover. It only waits for queue barriers on the peer session-sync transport, then proceeds to `PrepareRGDemotion()`.
+
+## Why this is a failover gap
+That barrier only proves the peer processed queued sync messages. It does not fence helper event-stream deltas or kernel SESSION_OPEN production outside that queue. During demotion, those producers can still race the cutover window.
+
+## Code
+- `pkg/daemon/daemon.go:4120`
+- `pkg/daemon/daemon.go:4144`
+- `pkg/daemon/daemon.go:4170`
+
+The older pause/drain path is still present in the codebase as primitives, but this demotion flow no longer uses it:
+- `pkg/cluster/sync.go:831` (`PauseIncrementalSync`)
+- `pkg/cluster/sync.go:1950` (`WaitForIdle`)
+- `pkg/dataplane/userspace/eventstream.go:117` (`SendDrainRequest`)
+
+## Consequence
+The new owner can take over after a barrier while the old owner is still producing post-barrier deltas outside the fenced path. That keeps failover more complex than a MAC move and can leave inherited flows inconsistent.
+
+## Expected fix direction
+Reintroduce a real producer fence for graceful demotion:
+- pause incremental producers
+- drain helper event stream to a target sequence
+- flush any kernel demotion journal
+- then use a final cutover fence before `PrepareRGDemotion()`
+
+
+---
+
+## #339 — Graceful demotion can proceed without confirmed peer bulk readiness [CLOSED] (closed 2026-04-02)
+
+## Problem
+Graceful demotion now allows cutover to proceed even when `syncPeerBulkPrimed` is false, as long as a single peer barrier succeeds.
+
+## Why this is a failover gap
+A barrier response proves the peer is alive and draining the queue. It does **not** prove the peer has completed bulk baseline sync for takeover.
+
+## Code
+- `pkg/daemon/daemon.go:4148`
+- `pkg/daemon/daemon.go:4151`
+- `pkg/daemon/daemon.go:4154`
+
+Current behavior logs:
+> peer barrier succeeded without bulk ack — proceeding with demotion
+
+## Consequence
+Demotion can be admitted after reconnect or partial resync before the standby has a confirmed baseline. That creates exactly the kind of “continuously synced, but not actually takeover-ready” window that makes HA brittle.
+
+## Expected fix direction
+Do not treat barrier success as a substitute for outbound bulk-ack readiness. Manual failover admission should require confirmed standby bulk readiness, or explicitly enter a stronger fenced/export path that rebuilds that guarantee.
+
+
+---
+
+## #340 — Daemon acks helper event-stream deltas even when sync-disconnect drops them [CLOSED] (closed 2026-04-02)
+
+## Problem
+The daemon-side userspace event stream acks helper deltas even when `handleEventStreamDelta()` drops them because peer session sync is disconnected.
+
+## Why this is a failover gap
+That means userspace-originated session events can be removed from helper replay state without ever reaching HA peer sync.
+
+## Code
+Event drop path:
+- `pkg/daemon/daemon.go:3766`
+- `pkg/daemon/daemon.go:3775`
+- `pkg/daemon/daemon.go:3779`
+
+Ack path still advances applied seq unconditionally after callback:
+- `pkg/dataplane/userspace/eventstream.go:283`
+- `pkg/dataplane/userspace/eventstream.go:286`
+- `pkg/dataplane/userspace/eventstream.go:301`
+- `pkg/dataplane/userspace/eventstream.go:304`
+
+## Consequence
+A transient session-sync disconnect on the active node can permanently lose helper delta history from the HA stream, even though the helper thinks the daemon consumed it.
+
+## Expected fix direction
+Only advance `lastAppliedSeq` when the callback explicitly accepts/applies the event, or plumb callback errors back into the event-stream reader so dropped events are not acked.
+
+
+---
+
+## #341 — UpdateRGActive hides helper refresh_owner_rgs timeout and failure [CLOSED] (closed 2026-04-02)
+
+## Problem
+`Manager.UpdateRGActive()` can return success even when helper-side `refresh_owner_rgs()` timed out or failed.
+
+## Why this is a failover gap
+Go treats RG activation as complete while the helper may still have incomplete reverse/forward re-resolution work.
+
+## Code
+Go only logs and continues if explicit refresh fails:
+- `pkg/dataplane/userspace/manager.go:2877`
+- `pkg/dataplane/userspace/manager.go:2886`
+- `pkg/dataplane/userspace/manager.go:2887`
+
+Helper refresh waits 2s, but on timeout only prints and returns `()`:
+- `userspace-dp/src/afxdp.rs:1274`
+- `userspace-dp/src/afxdp.rs:1323`
+- `userspace-dp/src/afxdp.rs:1338`
+
+Control handler never propagates a refresh failure:
+- `userspace-dp/src/main.rs:1543`
+- `userspace-dp/src/main.rs:1546`
+
+## Consequence
+Cluster control can move ownership and MACs while the helper refresh path only partially completed or timed out.
+
+## Expected fix direction
+Make helper refresh return an explicit success/failure result to Go, and make `UpdateRGActive()` fail closed when takeover-critical refresh work times out.
+
+
+---
+
+## #342 — RG activation duplicates helper refresh work through update_ha_state and explicit refresh [CLOSED] (closed 2026-04-02)
+
+## Problem
+RG activation currently does duplicate helper refresh work: `update_ha_state()` enqueues `RefreshOwnerRGs`, then Go immediately sends an explicit `refresh_owner_rgs` RPC for the same RG.
+
+## Why this is a failover gap
+This makes activation slower and noisier under load and increases the surface area for races, duplicate scans, and inconsistent worker completion timing.
+
+## Code
+Activation path in helper already enqueues refresh:
+- `userspace-dp/src/afxdp.rs:1195`
+- `userspace-dp/src/afxdp.rs:1230`
+
+Go then explicitly sends another refresh request:
+- `pkg/dataplane/userspace/manager.go:2872`
+- `pkg/dataplane/userspace/manager.go:2880`
+- `pkg/dataplane/userspace/manager.go:2886`
+
+## Consequence
+Cutover work is duplicated during the most latency-sensitive phase of failover.
+
+## Expected fix direction
+Choose one authoritative activation refresh path with a real completion ack. Do not rely on both implicit `update_ha_state()` refresh and explicit RPC refresh.
+
+
+---
+
+## #343 — Demotion kernel journal path is dead in the current graceful demotion flow [CLOSED] (closed 2026-04-02)
+
+## Problem
+The daemon still has a demotion kernel journal and demotion-prep depth, but the current graceful demotion flow no longer enters that journaling state or flushes the journal.
+
+## Why this is a failover gap
+Kernel SESSION_OPEN events during demotion are no longer fenced/replayed through the dedicated path that was meant to protect the handoff window.
+
+## Code
+Journaling path still exists:
+- `pkg/daemon/daemon.go:3931`
+- `pkg/daemon/daemon.go:3935`
+- `pkg/daemon/daemon.go:3942`
+
+Ring-buffer callback still consults `userspaceDemotionPrepActive()` before journaling:
+- `pkg/daemon/daemon.go:751`
+- `pkg/daemon/daemon.go:778`
+
+But `prepareUserspaceRGDemotionWithTimeout()` no longer begins demotion-prep pause / journal mode or flushes the journal:
+- `pkg/daemon/daemon.go:4120`
+- `pkg/daemon/daemon.go:4173`
+
+## Consequence
+The code still carries a demotion journal mechanism, but current failover logic no longer uses it. That is dead protection code and a likely regression in handoff safety.
+
+## Expected fix direction
+Either restore the journaled demotion path as part of a real producer fence, or delete the dead mechanism and replace it with a single explicit cutover-fence design.
+
+
+---
+
+## #344 — HA activation is decoupled from actual userspace dataplane enablement [CLOSED] (closed 2026-04-02)
+
+## Problem
+HA activation success is currently decoupled from userspace dataplane enablement. After `UpdateRGActive()`, manager logic can still keep `ctrl.Enabled=0` for HA readiness delays and may intentionally rely on the eBPF pipeline during the promoted-owner window.
+
+## Why this is a failover gap
+That means cluster ownership change is not equivalent to “the new owner is forwarding in userspace now.” Failover still depends on fallback dataplane behavior instead of a single forwarding plane being ready before cutover.
+
+## Code
+Manager explicitly delays ctrl enable in HA mode and documents that the eBPF pipeline carries traffic during that window:
+- `pkg/dataplane/userspace/manager.go:3088`
+- `pkg/dataplane/userspace/manager.go:3092`
+- `pkg/dataplane/userspace/manager.go:3110`
+- `pkg/dataplane/userspace/manager.go:3223`
+- `pkg/dataplane/userspace/manager.go:3241`
+
+## Consequence
+Failover correctness depends on cross-plane behavior during startup/rebind/activation instead of just moving ownership and forwarding packets from the continuously synced userspace state.
+
+## Expected fix direction
+Define a single takeover-ready condition that includes helper forwarding enablement, and do not treat RG activation as complete until the promoted owner is actually forwarding on the intended dataplane.
+
+
+---
+
+## #345 — HA activation still does RG-wide helper refresh scans despite on-receipt standby materialization [CLOSED] (closed 2026-04-02)
+
+## Problem
+The helper still performs RG-wide reverse/forward refresh scans on activation even though synced forward sessions are already re-resolved with local egress on receipt.
+
+## Why this is a failover gap
+This keeps HA activation expensive and complex. The code is trying to be both “standby is forwarding-ready continuously” and “activation re-resolves a large slice of the session table anyway.”
+
+## Code
+On-receipt standby materialization comment and behavior:
+- `userspace-dp/src/afxdp/session_glue.rs:453`
+- `userspace-dp/src/afxdp/session_glue.rs:461`
+- `userspace-dp/src/afxdp/session_glue.rs:478`
+
+Activation still runs full refresh/prewarm passes:
+- `userspace-dp/src/afxdp.rs:1214`
+- `userspace-dp/src/afxdp.rs:1270`
+- `userspace-dp/src/afxdp/session_glue.rs:333`
+- `userspace-dp/src/afxdp/session_glue.rs:364`
+
+## Consequence
+Failover still depends on activation-time table scans and re-resolution churn instead of just flipping ownership and invalidating cheap caches.
+
+## Expected fix direction
+Pick one model:
+- either continuously maintain forwarding-ready standby state and only invalidate lightweight caches at cutover,
+- or explicitly keep standby state incomplete and treat activation refresh as first-class.
+
+The current hybrid keeps the cost and race surface of both.
+
+
+---
+
+## #346 — Userspace session mirror failures are swallowed during HA session install [CLOSED] (closed 2026-04-02)
+
+## Problem
+Userspace session mirror failures are swallowed in manager session install paths, so cluster sync can report session install success while the helper never received the session.
+
+## Why this is a failover gap
+That leaves the kernel/session-sync side and the helper side divergent. HA code then believes the standby is continuously synced, but the userspace dataplane may still be missing takeover-critical state.
+
+## Code
+Local session mirror errors are ignored:
+- `pkg/dataplane/userspace/manager.go:3943`
+- `pkg/dataplane/userspace/manager.go:3961`
+- `pkg/dataplane/userspace/manager.go:3993`
+- `pkg/dataplane/userspace/manager.go:4011`
+
+Cluster-synced session mirror errors are also ignored:
+- `pkg/dataplane/userspace/manager.go:3980`
+- `pkg/dataplane/userspace/manager.go:3982`
+- `pkg/dataplane/userspace/manager.go:4027`
+- `pkg/dataplane/userspace/manager.go:4029`
+
+The helper RPC path can return an error:
+- `pkg/dataplane/userspace/manager.go:4205`
+- `pkg/dataplane/userspace/manager.go:4211`
+
+But callers intentionally discard it with `_ = ...`.
+
+## Consequence
+`SessionSync` can count a session as installed because `SetClusterSyncedSessionV4/V6` returned `nil`, while the helper mirror silently failed. That undermines standby readiness and makes failover look more synchronized than it really is.
+
+## Expected fix direction
+Treat helper mirror failures as real install failures for takeover-critical paths, or track/install state separately so readiness is based on both kernel and helper materialization instead of the kernel side alone.
+
+
+---
+
+## #347 — Failover still depends on post-transition neighbor warm-up sweeps [CLOSED] (closed 2026-04-02)
+
+## Problem
+Failover still depends on an explicit post-transition neighbor warm sweep because the first packet after takeover can otherwise miss `bpf_fib_lookup()` with `NO_NEIGH`.
+
+## Why this is a failover gap
+If the standby were truly forwarding-ready from continuously synced state, first-packet forwarding should not require a best-effort neighbor-warm pass over the session table.
+
+## Code
+The daemon documents and implements this directly:
+- `pkg/daemon/daemon.go:7661`
+- `pkg/daemon/daemon.go:7664`
+- `pkg/daemon/daemon.go:7676`
+- `pkg/daemon/daemon.go:7713`
+
+The activation path kicks it asynchronously:
+- `pkg/daemon/daemon.go:6794`
+- `pkg/daemon/daemon.go:6957`
+
+## Consequence
+Takeover is still not just a MAC move plus packet forwarding. Correctness of the first packets after failover depends on a background sweep over existing sessions and best-effort kernel ARP/NDP resolution.
+
+## Expected fix direction
+Either maintain neighbor-ready forwarding state continuously on the standby, or make cutover fence on explicit neighbor readiness for the activated RG instead of launching an asynchronous warm-up after ownership flips.
+
+
+---
+
+## #348 — HA transition still depends on asynchronous fabric_fwd refresh [CLOSED] (closed 2026-04-02)
+
+## Problem
+RG transition handlers trigger fabric forwarding map refresh asynchronously, outside the actual cutover fence.
+
+## Why this is a failover gap
+Cross-node redirect correctness still depends on `fabric_fwd` being current, but failover does not wait for a post-transition refresh to complete before traffic moves.
+
+## Code
+Transition handlers launch refresh asynchronously after activation/deactivation work:
+- `pkg/daemon/daemon.go:6808`
+- `pkg/daemon/daemon.go:6966`
+- `pkg/daemon/daemon.go:6995`
+
+The refresh function itself is best-effort and asynchronous with background neighbor probing:
+- `pkg/daemon/daemon.go:6551`
+- `pkg/daemon/daemon.go:6570`
+- `pkg/daemon/daemon.go:6574`
+
+Readiness only checks a coarse global `fabricPopulated` bit:
+- `pkg/daemon/daemon.go:7085`
+- `pkg/daemon/daemon.go:7089`
+- `pkg/daemon/daemon.go:7092`
+
+## Consequence
+HA transition correctness still depends on a background fabric refresh path completing after ownership change instead of the cutover fence proving the redirect fabric state is current.
+
+## Expected fix direction
+Make fabric-forwarding readiness part of the transition fence for the affected path, or continuously maintain valid fabric redirect state so ownership change does not need a best-effort post-transition refresh.
+
+
+---
+
+## #349 — HA watchdog sync is throttled past the helper stale-after threshold [CLOSED] (closed 2026-04-02)
+
+The current userspace HA watchdog cadence is internally inconsistent.
+
+Code:
+- `pkg/dataplane/userspace/manager.go:4792-4798` throttles watchdog-only HA sync to the helper to once every `5*time.Second`
+- `userspace-dp/src/afxdp.rs:187` sets `HA_WATCHDOG_STALE_AFTER_SECS` to `2`
+- helper forwarding logic treats any RG with an older watchdog timestamp as `HAInactive` in:
+  - `userspace-dp/src/afxdp/forwarding.rs:1077-1080`
+  - `userspace-dp/src/afxdp/session_glue.rs:144-147`
+
+Why this is a bug:
+- The manager can intentionally wait 5 seconds before pushing a fresh watchdog timestamp.
+- The helper will treat a watchdog timestamp older than 2 seconds as stale and return `HAInactive`.
+- That means a healthy active RG can age into `HAInactive` on the helper between watchdog refreshes.
+
+Why this matters:
+- This directly undermines the assumption that the helper's HA runtime view is continuously valid.
+- It creates avoidable failover and steady-state forwarding fragility because an otherwise active owner can be treated as inactive purely due to timer skew between Go and Rust.
+
+Expected direction:
+- Make the watchdog publish cadence strictly faster than the helper stale threshold, or
+- stop treating the watchdog as a high-frequency liveness timer in the helper and switch to an explicit epoch/lease model with matching producer semantics.
+
+
+---
+
+## #350 — GetSessions cursor pagination does not support stable include_peer pagination [CLOSED] (closed 2026-04-02)
+
+`GetSessions` cursor pagination still has a correctness gap when `include_peer=true`.
+
+Code:
+- `pkg/grpcapi/server.go:1185-1190` suppresses peer results entirely when `page_token` is present
+- `pkg/grpcapi/server.go:1201-1218` forwards a peer request without `PageToken`
+- local cursor generation/iteration lives in `pkg/grpcapi/server.go:800-975`
+
+Current behavior:
+- first page with `include_peer=true` can include peer sessions
+- later pages with `page_token` never include peer sessions at all
+
+Why this is a bug:
+- The API shape implies one paginated logical result set.
+- Today the first page can be a mixed local+peer view, while subsequent pages silently degrade to local-only.
+- That makes pagination unstable and surprising for callers trying to enumerate all sessions with peer inclusion enabled.
+
+Why this matters:
+- This is especially confusing for large session tables where callers must paginate.
+- It turns `include_peer=true` into a first-page-only hint instead of a real paginated query mode.
+
+Expected direction:
+- define peer pagination as its own cursor space and return a combined token, or
+- explicitly reject `include_peer=true` with cursor pagination until a stable combined cursor model exists.
+
+
+---
+
+## #351 — Userspace mirror delete path leaves preinstalled reverse companions behind [CLOSED] (closed 2026-04-02)
+
+The local Go->helper session mirror path pre-installs reverse companions, but the delete path is forward-only.
+
+Code:
+- `pkg/dataplane/userspace/manager.go:3945-3961` mirrors a forward session and then also mirrors its reverse companion into the helper for `SetSessionV4`
+- `pkg/dataplane/userspace/manager.go:3995-4011` does the same for `SetSessionV6`
+- `pkg/dataplane/userspace/manager.go:4037-4053` deletes only the forward key for `DeleteSession` / `DeleteSessionV6`
+- helper delete handling in `userspace-dp/src/afxdp/session_glue.rs:524-536` deletes only the requested synced key unless a second delete command is explicitly queued
+
+Why this is a bug:
+- For locally mirrored sessions, the helper can end up with both forward and reverse synced entries.
+- On teardown, Go only sends a delete for the forward key.
+- The reverse companion can remain behind in the helper's synced/shared maps and BPF session map state.
+
+Why this matters:
+- Stale reverse companions are exactly the kind of state that makes HA handoff and activation-time refresh logic hard to reason about.
+- This diverges from the cluster-sync path, which now installs forward and reverse entries explicitly and therefore has an obvious two-key delete model.
+
+Expected direction:
+- either mirror reverse companions only in the cluster-sync path and stop synthesizing them in the local manager path, or
+- track/delete the paired reverse companion explicitly when local manager sessions are removed.
+
+
+---
+
+## #352 — Userspace HA transition path still contains raw stderr debug logging [CLOSED] (closed 2026-04-02)
+
+`origin/master` still has raw `eprintln!` logging in the helper HA transition path.
+
+Concrete examples:
+- `userspace-dp/src/afxdp.rs:1112-1121` logs RG state changes directly to stderr
+- `userspace-dp/src/afxdp.rs:1163-1167` logs immediate `USERSPACE_SESSIONS` cleanup counts for demoted RGs
+- additional transition/debug logging remains around activation and fallback paths in `userspace-dp/src/afxdp.rs`
+
+Why this should be cleaned up:
+- these are not test-only logs; they are in live transition code
+- they bypass the logging rules that were added later in the same commit window
+- raw stderr logging in hot or noisy HA paths makes field debugging harder because intentional structured state changes are mixed with leftover debug output
+
+Expected direction:
+- either convert these to the approved structured logging path with clear rate/volume expectations, or
+- remove the logs once the transition behavior is covered by tests and counters.
+
+
+---
+
+## #353 — Remove explicit refresh_owner_rgs RPC — sessions pre-resolved on receipt [CLOSED] (closed 2026-04-02)
+
+UpdateRGActive sends refresh_owner_rgs after update_ha_state, but #326 resolves synced sessions on receipt. The explicit refresh is redundant. Remove lines 2877-2895 in manager.go. Reduces activation by one control socket round trip.
+
+---
+
+## #354 — Skip blackhole route management in userspace mode [CLOSED] (closed 2026-04-02)
+
+Blackhole routes (RTN_BLACKHOLE) are injected/removed on VRRP transitions but the XDP shim + rg_active flag already handles fabric redirect in userspace mode. Skip blackhole syscalls when userspace dataplane is active. Saves 4 route syscalls per failover pair.
+
+---
+
+## #355 — Remove dead code and simplify HA transition bookkeeping [CLOSED] (closed 2026-04-02)
+
+Multiple dead/redundant code paths after HA simplifications: hasAnyInactiveRG (unused), duplicate demotion prep in watchClusterEvents, pendingRGTransitions map (replace with atomic bool), unconditional snapshot sync in statusLoop. Cleanup to reduce cognitive load.
+
+---
+
+## #356 — Throttle statusLoop HA sync for 2s after UpdateRGActive [CLOSED] (closed 2026-04-02)
+
+statusLoop syncs HA state every 1s which races with UpdateRGActive. Skip HA sync in the poll for 2s after an RG transition completes. Reduces duplicate control socket requests during the critical failover window.
+
+---
+
+## #358 — Collapse userspace RG activation into one helper-applied HA generation [CLOSED] (closed 2026-04-02)
+
+## Problem
+Userspace RG activation is still modeled as multiple separate operations instead of one applied HA transition:
+
+- Go marks ownership active and pushes `update_ha_state` in `pkg/dataplane/userspace/manager.go:2789-2862`
+- the helper separately runs `refresh_owner_rgs()` with its own timeout and ack in `userspace-dp/src/afxdp.rs:1261-1337`
+- workers still execute RG-wide reverse and forward refresh scans in `userspace-dp/src/afxdp/session_glue.rs:333-447`
+
+That means activation success depends on more than one state machine and more than one acknowledgment path.
+
+## Why this matters
+Failover should be reducible to one cutover operation that says: the helper has applied HA generation N for RG set X and is forwarding-ready. Today the control plane can believe activation succeeded while helper-side repair work is still separate, delayed, or timed out.
+
+This is part of why failover remains hard to reason about and why activation-time repair paths keep resurfacing.
+
+## Simplification target
+Collapse activation into one helper-applied HA generation:
+
+- one control request from Go that carries the new HA generation / RG ownership set
+- helper applies the state and any required activation work as one transition
+- one success/failure ack back to Go once workers have actually applied it
+- remove the separate `refresh_owner_rgs()` / worker-scan phase from steady-state failover
+
+## Related
+- #314
+- #341
+- #342
+- #344
+- #345
+- #319
+
+
+---
+
+## #359 — Collapse helper demotion from prepare-plus-demote into one acknowledged transition [CLOSED] (closed 2026-04-02)
+
+## Problem
+Userspace demotion is still split across separate transport and helper phases:
+
+- Go performs barrier-based peer checks in `pkg/daemon/daemon.go:4120-4178`
+- the helper then runs `prepare_ha_demotion()` in `userspace-dp/src/afxdp.rs:1340-1365`
+- workers execute `PrepareDemoteOwnerRGs` first, and later a separate `DemoteOwnerRG` in `userspace-dp/src/afxdp/session_glue.rs:279-332`
+
+This means the system has to coordinate at least three different notions of “demotion is safe now”.
+
+## Why this matters
+A failover handoff should not require a prepare phase, a separate demote phase, and independent transport barriers if the replicated state model is correct. The current split is part of the cost and fragility of failover.
+
+## Simplification target
+Collapse helper demotion into one acknowledged transition:
+
+- one demotion command scoped to a cutover generation / applied sequence
+- helper performs the minimal state changes needed for handoff atomically
+- one ack when the helper has reached the handoff-safe point
+- remove the separate `PrepareDemoteOwnerRGs` and `DemoteOwnerRG` phases from normal failover
+
+## Related
+- #323
+- #338
+- #339
+- #340
+
+
+---
+
+## #360 — Replace split active-plus-watchdog HA state with a single applied lease model [CLOSED] (closed 2026-04-02)
+
+## Problem
+Helper HA liveness is still represented by more than one mechanism:
+
+- `active` is pushed through `update_ha_state()` in `userspace-dp/src/afxdp.rs:1074-1108`
+- watchdog freshness is carried separately and checked in the packet path
+- Go refresh cadence and helper stale thresholds are different enough that the helper can transiently treat a healthy RG as inactive
+
+This creates two overlapping concepts of ownership: configured owner and currently-live owner.
+
+## Why this matters
+Failover is simpler if there is a single HA lease / generation model that the helper enforces. Separate `active` and watchdog state makes cutover semantics harder to reason about and creates extra failure modes.
+
+## Simplification target
+Replace split active-plus-watchdog HA state with one applied lease model:
+
+- one lease / generation per RG
+- helper packet path validates the current applied lease directly
+- Go refreshes / renews the same lease model instead of a second watchdog channel
+- remove duplicated semantics between ownership and liveness state
+
+## Related
+- #349
+- #344
+
+
+---
+
+## #363 — Split userspace afxdp coordinator responsibilities out of afxdp.rs [CLOSED] (closed 2026-04-02)
+
+Audit target: origin/master at 06772bf8
+
+`userspace-dp/src/afxdp.rs` is still carrying multiple distinct responsibilities in one file:
+- coordinator lifecycle and reconcile (`Coordinator::reconcile`, `stop_inner`)
+- HA control / apply fencing (`update_ha_state`, `prepare_ha_demotion`, `export_owner_rg_sessions`)
+- worker/binding runtime (`BindingWorker`, `poll_binding`, `worker_loop`)
+- status/debug/reporting (`recent_exceptions`, `ha_groups`, `refresh_bindings`)
+- a large mixed test block starting around `#[cfg(test)] mod tests`
+
+Current size on origin/master: about 8.8k lines. The remaining complexity is not just hot-path forwarding; it is unrelated control/runtime code sharing one compilation unit.
+
+Suggested split:
+1. `afxdp/coordinator.rs` for reconcile/lifecycle
+2. `afxdp/ha.rs` for HA control/apply/export
+3. `afxdp/worker.rs` for `BindingWorker`, `poll_binding`, `worker_loop`
+4. `afxdp/status.rs` for status/reporting helpers
+5. move the large `afxdp.rs` test cluster into focused test modules adjacent to the production modules
+
+Goal: make HA and worker-runtime changes reviewable without reopening the entire dataplane root file.
+
+---
+
+## #364 — Split frame parsing, rewrite, and protocol builders out of afxdp/frame.rs [CLOSED] (closed 2026-04-02)
+
+Audit target: origin/master at 06772bf8
+
+`userspace-dp/src/afxdp/frame.rs` is still a catch-all for multiple unrelated packet concerns:
+- tuple/metadata parsing
+- forwarded frame build / segmentation
+- in-place rewrite and NAT checksum adjustment
+- ICMP/ICMPv6 helper packet construction
+- ARP/NDP neighbor probes
+- checksum primitives
+- a very large test block starting around line 4212
+
+Current size on origin/master: about 8.1k lines. This is no longer one coherent module boundary.
+
+Suggested split:
+1. `afxdp/frame_parse.rs` for tuple/L3/L4 extraction
+2. `afxdp/frame_rewrite.rs` for rewrite + NAT + checksum adjustment
+3. `afxdp/frame_build.rs` for forwarded/injected packet builders
+4. `afxdp/neighbor_probe.rs` for ARP/NDP probe packet construction
+5. protocol-focused test modules instead of the current monolithic test section
+
+Goal: make packet rewrite changes, neighbor-probe changes, and parsing fixes independent review units.
+
+---
+
+## #365 — Break userspace main.rs into snapshot schema, control schema, and server runtime modules [CLOSED] (closed 2026-04-02)
+
+Audit target: origin/master at 06772bf8
+
+`userspace-dp/src/main.rs` is currently mixing three different concerns:
+- snapshot/config schema (`ConfigSnapshot`, interface/route/NAT/filter structs)
+- control/status wire schema (`ControlRequest`, `ProcessStatus`, `HAGroupStatus`, request/response structs)
+- server runtime and control loop (`run`, `handle_stream`, `refresh_status`, queue planning, binding planning)
+
+Current size on origin/master: about 2.8k lines, with most of that being schema and control-loop code rather than dataplane execution. This makes even small API/status changes reopen the whole bootstrap/control server file.
+
+Suggested split:
+1. `snapshot.rs` for config snapshot schema
+2. `control_protocol.rs` for request/response/status structs
+3. `server.rs` for Unix socket control loop and status refresh
+4. leave `main.rs` as thin startup / arg parsing / server bootstrap
+
+Goal: reduce coupling between dataplane snapshot schema changes and the helper control server implementation.
+
+---
+
+## #366 — Split event_stream.rs into wire codec and transport state machine modules [CLOSED] (closed 2026-04-02)
+
+Audit target: origin/master at 06772bf8
+
+`userspace-dp/src/event_stream.rs` still mixes two different responsibilities:
+- binary wire framing/encoding/decoding (`EventFrame`, encode helpers, header/IP/disposition encoding)
+- sender transport lifecycle (connect/reconnect, replay buffer, drain handling, control-frame processing, IO thread)
+
+Current size on origin/master: about 1.3k lines. This file is not enormous, but it is carrying both protocol definition and transport recovery behavior in one module, which makes review harder when changing either.
+
+Suggested split:
+1. `event_stream_codec.rs` for frame layout + encode/decode
+2. `event_stream_transport.rs` for connection/replay/control handling
+3. keep the public facade in `event_stream.rs` thin
+
+Goal: let wire-format changes and reconnect/replay changes evolve independently.
+
+---
+
+## #367 — Break afxdp/types.rs catch-all into cohesive shared type modules [CLOSED] (closed 2026-04-02)
+
+Audit target: origin/master at 06772bf8
+
+`userspace-dp/src/afxdp/types.rs` has become a shared catch-all. It currently combines:
+- flow cache types (`FlowCache*`, `RewriteDescriptor`)
+- packet metadata / validation (`UserspaceDpMeta`, `ValidationState`)
+- forwarding and route model (`ForwardingState`, `EgressInterface`, `FabricLink`, route entries)
+- HA runtime state (`HAForwardingLease`, `HAGroupRuntime`)
+- worker/runtime control types (`WorkerHandle`, `WorkerCommand`, `BindingPlan`)
+- TX request / recycle types
+
+Current size on origin/master: about 1.3k lines. The file is not too large by itself, but it is the dependency hub for multiple unrelated change streams.
+
+Suggested split:
+1. `flow_cache_types.rs`
+2. `forwarding_types.rs`
+3. `ha_types.rs`
+4. `worker_types.rs`
+5. `tx_types.rs`
+
+Goal: reduce unnecessary recompilation/review overlap and make ownership of shared AF_XDP types explicit.
+
+---
+
+## #368 — Split forwarding.rs into snapshot compilation and runtime resolution modules [CLOSED] (closed 2026-04-02)
+
+Audit target: origin/master at 06772bf8
+
+`userspace-dp/src/afxdp/forwarding.rs` is currently serving two different layers:
+- control-plane compilation from `ConfigSnapshot` into `ForwardingState` (`build_forwarding_state`, route/interface parsing, fabric link resolution)
+- runtime forwarding decisions (`resolve_forwarding`, HA enforcement, fabric redirect decisions, route lookups, interface-local resolution, MSS clamping, cache validation)
+
+Current size on origin/master: about 3.8k lines. The compile-time snapshot logic and the packet/session runtime logic are different reasons to change the file, but they are still coupled in one module.
+
+Suggested split:
+1. `forwarding_build.rs` for snapshot->state compilation
+2. `forwarding_lookup.rs` for runtime resolution and route selection
+3. `forwarding_ha.rs` for HA/fabric redirect enforcement
+4. keep protocol-specific MSS helpers separate if they still belong together
+
+Goal: make snapshot schema changes independent from runtime forwarding/HA changes.
+
+---
+
+## #369 — Split session_glue.rs into shared-session replication, reverse synthesis, and queue-cancel modules [CLOSED] (closed 2026-04-02)
+
+Audit target: origin/master at 06772bf8
+
+`userspace-dp/src/afxdp/session_glue.rs` still mixes several separate concerns:
+- shared-session replication and export (`replicate_session_upsert/delete`, `publish_shared_session`, `remove_shared_session`)
+- reverse companion synthesis and reverse prewarm (`build_reverse_session_from_forward_match`, `synthesized_synced_reverse_entry`, `prewarm_reverse_synced_sessions_for_owner_rgs`)
+- HA/session resolution (`resolve_flow_session_decision`, `enforce_session_ha_resolution`)
+- queued-flow cancellation / teardown helpers
+
+Current size on origin/master: about 3.6k lines plus a large in-file test block. This file is acting as the bridge for every session concern, which makes HA work and ordinary session work hard to separate.
+
+Suggested split:
+1. `session_replication.rs`
+2. `session_reverse.rs`
+3. `session_resolution.rs`
+4. `session_cancel.rs`
+5. split the tests along the same boundaries
+
+Goal: let HA/session-sync changes land without reopening reverse-session construction and TX queue cancellation code in the same patch.
+
+---
+
+## #370 — Split daemon.go into config apply, HA/session-sync, and cluster/fabric modules [CLOSED] (closed 2026-04-02)
+
+Audit target: origin/master at 06772bf8
+
+`pkg/daemon/daemon.go` is still the main Go control-plane monolith. It currently mixes:
+- daemon bootstrap and run loop
+- config application / host-service orchestration (DNS, NTP, syslog, SSH, login, flow trace)
+- userspace session-sync and event-stream handling
+- graceful demotion and HA failover prep
+- cluster transport startup and lifecycle
+- fabric state / neighbor probing / fabric forwarding refresh
+- RG state machines, VRRP/cluster watchers, VIP move, GARP/GNA, reth services
+
+Current size on origin/master: about 8.2k lines. These are different reasons to modify the file, and the HA path in particular is hard to reason about because it shares a file with unrelated host-service configuration code.
+
+Suggested split:
+1. `daemon/run.go` for bootstrap and top-level lifecycle
+2. `daemon/config_apply.go` for host/system config application
+3. `daemon/session_sync.go` for userspace event-stream + session-sync integration
+4. `daemon/ha_failover.go` for demotion/failover/RG transition logic
+5. `daemon/fabric.go` for fabric forwarding/refresh/probing
+6. `daemon/reth.go` for VIPs, reth services, GARP/GNA, blackhole routes
+
+Goal: make HA/failover changes reviewable without reopening unrelated system-config logic, and vice versa.
+
+---
+
+## #371 — Split grpcapi/server.go by RPC domain instead of one monolithic server file [CLOSED] (closed 2026-04-02)
+
+Audit target: origin/master at 06772bf8
+
+`pkg/grpcapi/server.go` is currently a 9.7k line catch-all for almost every gRPC method. It mixes:
+- config-mode RPCs (`Set`, `Delete`, `Load`, `Commit`, rollback/history)
+- operational RPCs for sessions, routes, interfaces, NAT, screen, events, system info
+- peer/proxy behavior and pagination logic
+- command completion / schema completion
+- streaming RPCs (ping, traceroute, monitor packet drop, monitor interface)
+- cluster/system actions
+
+This is not one coherent module. Small changes to one RPC family reopen the entire server implementation.
+
+Suggested split:
+1. `server_config.go` for config/edit/commit RPCs
+2. `server_sessions.go` for session and NAT/session-summary RPCs
+3. `server_interfaces.go` for interface/system/route operational RPCs
+4. `server_monitor.go` for streaming monitor/ping/traceroute RPCs
+5. `server_complete.go` for completion/value-provider logic
+6. keep `server.go` for construction/interceptors/shared helpers only
+
+Goal: reduce review blast radius and make RPC ownership explicit by subsystem.
+
+---
+
+## #372 — Split userspace manager.go into helper lifecycle, HA/session sync, and map sync modules [CLOSED] (closed 2026-04-02)
+
+Audit target: origin/master at 06772bf8
+
+`pkg/dataplane/userspace/manager.go` is still carrying multiple distinct control-plane responsibilities:
+- helper process lifecycle and control socket transport
+- snapshot compilation / process bootstrap
+- HA state sync and watchdog updates
+- userspace session mirror/install/delete paths
+- ingress/local-address/interface-NAT BPF map sync
+- proactive neighbor resolution and ctrl enable/disable
+- status loop / counter sync / fallback stats
+
+Current size on origin/master: about 5.4k lines. The HA/session-sync work is especially hard to review because it is mixed with process lifecycle, map programming, and counter/status code.
+
+Suggested split:
+1. `manager_process.go` for helper lifecycle and control RPC plumbing
+2. `manager_snapshot.go` for snapshot compilation/bootstrap sync
+3. `manager_ha.go` for HA state/watchdog/demotion/update paths
+4. `manager_sessions.go` for session mirror/install/delete/export/drain
+5. `manager_maps.go` for ingress/local/NAT map sync
+6. `manager_status.go` for polling/counters/fallback visibility
+
+Goal: isolate HA/session work from general helper-management and dataplane map-programming code.
+
+---
+
+## #373 — Split config/compiler.go by configuration domain instead of one giant compiler file [CLOSED] (closed 2026-04-02)
+
+Audit target: origin/master at 06772bf8
+
+`pkg/config/compiler.go` is still a giant domain compiler file. It currently compiles:
+- security zones, policies, screens, address books
+- interfaces and routing options
+- NAT, NAT64, static NAT, NPTv6
+- protocols (BGP/OSPF/RIP/ISIS/RA), IKE/IPsec
+- firewall filters, system, services, forwarding options, SNMP, policy-options, chassis, event-options, bridge-domains
+
+Current size on origin/master: about 6.7k lines. This is not one bounded compiler concern; it is a directory worth of domain compilers in one file.
+
+Suggested split:
+1. `compiler_security.go`
+2. `compiler_interfaces_routing.go`
+3. `compiler_nat.go`
+4. `compiler_protocols.go`
+5. `compiler_system_services.go`
+6. `compiler_policy_options.go` / `compiler_chassis.go` as needed
+
+Goal: make config-domain changes local and reduce the blast radius of compiler edits.
+
+---
+
+## #374 — Split cluster/sync.go into transport, bulk/barrier, and producer integration modules [CLOSED] (closed 2026-04-02)
+
+Audit target: origin/master at 06772bf8
+
+`pkg/cluster/sync.go` is still one file for almost the entire session-sync subsystem. It currently mixes:
+- transport framing and connection lifecycle
+- send/receive loops and active-fabric connection arbitration
+- sweep scheduling and producer integration
+- queue/journal management for incremental sync
+- barrier / fence / bulk / bulk-ack semantics
+- disconnect handling and stale-session reconciliation
+- sync stats and formatting
+
+Current size on origin/master: about 2.8k lines. The logic is coherent at a package level, but the file is still serving too many internal roles for one compilation unit.
+
+Suggested split:
+1. `sync_transport.go` for connection lifecycle and send/receive loops
+2. `sync_bulk.go` for bulk, bulk-ack, barriers, idle/drain waits
+3. `sync_incremental.go` for queueing, journals, producers, sweeps
+4. `sync_stats.go` for counters/reporting
+
+Goal: let HA transport work, barrier semantics, and producer-policy changes evolve independently.
+
+---
+
+## #375 — Split cli.go into command-family modules instead of a single operational CLI file [CLOSED] (closed 2026-04-02)
+
+Audit target: origin/master at 06772bf8
+
+`pkg/cli/cli.go` is still a 12.6k line command monolith. It mixes:
+- CLI runtime / completion / dispatch
+- config-mode command handling
+- security flow/session views and clear operations
+- NAT, route, protocol, interface, system, chassis, services, firewall, DHCP, SNMP, LLDP, VRRP, test/monitor commands
+
+This file is effectively the entire CLI surface in one compilation unit. Small command-family work reopens the whole operational client.
+
+Suggested split:
+1. `cli_runtime.go` for prompt/dispatch/completion
+2. `cli_config.go` for config-mode commands
+3. `cli_show_security.go`
+4. `cli_show_interfaces.go`
+5. `cli_show_system.go`
+6. `cli_show_routing.go`
+7. `cli_request.go`
+8. `cli_monitor_test.go` for monitor/test handlers
+
+Goal: keep command-family changes isolated and reduce merge friction in the CLI.
+
+---
+
+## #376 — Split api/handlers.go by REST resource family [CLOSED] (closed 2026-04-02)
+
+Audit target: origin/master at 06772bf8
+
+`pkg/api/handlers.go` is a smaller but still mixed control-plane file. It currently combines handlers for:
+- health/status/global stats
+- zones/policies/sessions/session-summary
+- NAT/screen/events/interfaces/routes
+- config/edit endpoints
+- system, DHCP, ping/traceroute, policy matching, system actions
+
+Current size on origin/master: about 2.4k lines. It is essentially the REST equivalent of the gRPC server problem: many operational resource families implemented in one file.
+
+Suggested split:
+1. `handlers_status.go`
+2. `handlers_sessions.go`
+3. `handlers_interfaces_routes.go`
+4. `handlers_config.go`
+5. `handlers_system.go`
+
+Goal: keep REST handler work scoped by resource family instead of reopening one monolithic HTTP handler file.
+
+---
+
+## #377 — Split dataplane/compiler.go into feature compilers and host-interface setup modules [CLOSED] (closed 2026-04-02)
+
+Audit target: origin/master at 06772bf8
+
+`pkg/dataplane/compiler.go` is still a large mixed compiler/runtime-prep file. It currently mixes:
+- top-level dataplane compile orchestration
+- interface/link/VLAN resolution and reconciliation
+- zones/address book/policy/NAT/filter/flow compilation into dataplane structures
+- screen/default policy config
+- interface ethtool tuning, RSS, ring/buffer tuning, mirror setup
+
+Current size on origin/master: about 4.7k lines. The dataplane compilation logic and the host-interface preparation logic are different reasons to change the file, but they are still coupled together.
+
+Suggested split:
+1. `compile_features.go` for zones/policy/NAT/filter/flow compilation
+2. `compile_interfaces.go` for interface/link/VLAN discovery and reconciliation
+3. `compile_tuning.go` for ethtool/RSS/buffer/ring tuning
+4. keep the top-level orchestration in a thin `compiler.go`
+
+Goal: make dataplane feature compilation independent from host-interface setup and tuning changes.
+
+---
+
+## #389 — Index helper HA session state by owner RG to remove failover-time full-table scans [CLOSED] (closed 2026-04-03)
+
+Helper HA apply is still doing O(all sessions) work on failover because shared session state is not indexed by owner RG.
+
+Code evidence:
+- `userspace-dp/src/afxdp/ha.rs:36` walks `shared_sessions` for every demoted RG to delete BPF map keys.
+- `userspace-dp/src/afxdp/ha.rs:49` walks `shared_nat_sessions` for the same reason.
+- `userspace-dp/src/afxdp/ha.rs:60` walks `shared_forward_wire_sessions` for the same reason.
+- `userspace-dp/src/afxdp/session_glue.rs:110` `refresh_live_reverse_sessions_for_owner_rgs()` first collects all session entries and then re-filters by RG after re-resolution.
+
+Why this is a problem:
+- failover cost scales with total shared session count instead of only the changed RGs
+- activation/demotion still needs repair scans, which keeps HA cutover expensive and timing-sensitive under load
+- it also makes it harder to collapse failover down to a single apply fence because the helper must rediscover affected state at transition time
+
+Simpler target:
+- maintain derived indexes keyed by owner RG (and alias type if needed) alongside the canonical shared session store
+- make demotion and activation operate on only the affected RG index entries
+- eliminate whole-table scans from the HA transition path
+
+That should make failover work proportional to the moved RGs instead of the entire replicated session table.
+
+---
+
+## #390 — Replace weight-zero manual failover with an explicit RG transfer protocol [CLOSED] (closed 2026-04-03)
+
+Current manual failover still works by setting `ManualFailover=true`, forcing `Weight=0`, and letting election heuristics make the peer primary.
+
+Code evidence:
+- `pkg/cluster/cluster.go:618` `ManualFailover()` sets `Weight=0` and flips local state to secondary.
+- `pkg/cluster/election.go:41` contains a 2s time-based deadlock escape to clear `ManualFailover` if both sides have effectively resigned.
+- `pkg/cluster/cluster.go:1118` clears `ManualFailover` again on peer loss as another recovery path.
+
+Why this is a problem:
+- failover intent is expressed indirectly through election weight mutation instead of an explicit transfer state machine
+- rapid failover cycles need time guards and peer-loss cleanup to avoid dual-secondary or self-repromotion behavior
+- this makes HA correctness depend on election timing instead of a single acknowledged ownership handoff
+
+Simpler target:
+- introduce an explicit per-RG transfer protocol: `prepare -> peer ready -> ownership commit -> announce`
+- manual failover should nominate the target owner directly instead of driving election through `Weight=0`
+- election should remain for health/peer-loss arbitration, not steady-state manual cutover orchestration
+
+This should reduce the amount of timing-sensitive logic in failover and make cutover easier to reason about.
+
+---
+
+## #391 — Remove NAPI bootstrap from the HA cutover path [CLOSED] (closed 2026-04-02)
+
+`UpdateRGActive()` still starts queue bootstrap work during RG activation instead of requiring the standby dataplane to already be RX-ready before ownership changes.
+
+Code evidence:
+- `pkg/dataplane/userspace/manager_ha.go:281` `UpdateRGActive()` calls `bootstrapNAPIQueuesAsyncLocked("ha-update-active")` whenever an RG becomes active.
+- The bootstrap implementation in `pkg/dataplane/userspace/manager.go` exists to trigger RX/NAPI activity after bind so zero-copy queues begin consuming fill-ring entries.
+
+Why this is a failover complexity problem:
+- activation is still doing startup-style dataplane bring-up work
+- that means cutover correctness depends on asynchronous queue bootstrap timing, not just ownership transfer
+- if standby readiness were truly continuous, failover would not need to trigger NAPI bootstrap at all
+
+Simpler target:
+- prove and maintain RX-liveness continuously on both nodes before they are takeover-ready
+- remove NAPI bootstrap from `UpdateRGActive()`
+- treat lack of queue readiness as a readiness failure before failover, not work that begins during failover
+
+This reduces HA cutover toward the intended model: move ownership, announce, keep forwarding.
+
+---
+
+## #398 — manual failover still times out while requester is in bulk sync receive [CLOSED] (closed 2026-04-03)
+
+## Summary
+Manual failover is still rejected if the requesting node is in active session-sync bulk receive. The new transfer-commit path in #397 works once the cluster is settled, but the pre-failover admission path still blocks on session-sync barrier acknowledgments that are not serviced while the requester is mid-bulk.
+
+## Runtime proof
+Validated on `origin/master` at `310a2399` on `loss-userspace-cluster`.
+
+Initial RG0 failover request from `node0` to make `node0` primary:
+- command returned: `rpc error: code = FailedPrecondition desc = timed out waiting for peer failover ack for redundancy group 0`
+- requester (`fw0`) was still in bulk receive:
+  - `cluster sync: bulk receive progress epoch=4 sessions=64`
+  - `cluster sync: bulk receive progress epoch=4 sessions=128`
+  - `cluster sync: bulk receive progress epoch=4 sessions=192`
+
+Responder (`fw1`) logs show repeated admission retries failing on the peer barrier:
+- `cluster: bulk sync not acked yet, verifying peer readiness via barrier`
+- `cluster: waiting to admit manual failover ... err="session sync not ready before demotion: peer not responding to barrier: timed out waiting for session sync barrier ack seq=..."`
+- final failure:
+  - `cluster: remote failover failed ... err="pre-failover prepare for redundancy group 0: session sync not ready before demotion: peer not responding to barrier: timed out waiting for session sync barrier ack seq=9 ..."`
+
+After bulk receive completed on `fw0`:
+- `cluster sync: bulk transfer complete epoch=4 sessions=197`
+- repeating the same RG0 failover succeeded immediately
+- success path logs on `fw0` were:
+  - `cluster sync: failover ack received ... status=0`
+  - `cluster: primary transition rg=0`
+  - `cluster sync: failover commit sent to peer`
+  - `cluster sync: failover commit ack received ... status=0`
+
+## Why this matters
+#397 removed heartbeat-observed completion from manual failover, but operators can still hit a separate failure mode if they request the move while reconnect bulk sync is still in progress. That leaves manual failover behavior dependent on session-sync bootstrap timing.
+
+## Likely direction
+- make session-sync barriers serviceable during bulk receive, or
+- make manual failover admission fail fast with an explicit `bulk sync in progress` reason instead of a 30-40s barrier timeout loop, or
+- add a dedicated settled/transfer-ready gate distinct from generic session-sync bulk readiness.
+
+
+---
+
+## #400 — surface manual failover transfer readiness separately from takeover readiness [CLOSED] (closed 2026-04-03)
+
+## Summary
+`show chassis cluster status` can report an RG as `Takeover ready: yes` while explicit manual failover is still blocked by unsettled session-sync transfer state.
+
+## Why this matters
+During live validation of `#397`, `node0` showed takeover-ready `yes` for `RG0`, but a manual failover request still failed because the node was in active session-sync bulk receive and could not satisfy the peer-side demotion barrier.
+
+That means the readiness model shown to operators is still weaker than the actual preconditions for explicit RG transfer.
+
+## Code evidence
+- `pkg/cluster/cluster.go` readiness only reflects the current RG readiness pipeline (`Ready`, `ReadySince`, `ReadinessReasons`).
+- `pkg/daemon/daemon_ha.go` manual failover admission has additional session-sync preconditions that are not reflected in RG takeover readiness.
+- `pkg/cli/cli.go` `show chassis cluster status` prints the RG readiness model, not manual-failover transfer readiness.
+
+## Simpler target
+Add an explicit transfer-ready/readiness reason surface for manual failover so the CLI and APIs can say:
+- takeover-ready for election
+- transfer-ready for explicit RG failover
+
+Those should not silently diverge.
+
+
+---
+
+## #403 — Planned failover must not depend on bulk sync — both nodes already have full session state [CLOSED] (closed 2026-04-03)
+
+## Problem
+
+Planned failover (CLI `request chassis cluster failover`) currently fails when bulk sync is in progress because the barrier message gets stuck behind bulk data in the TCP stream. This is fundamentally wrong — planned failover should never need bulk sync because both nodes have been running and syncing sessions in real-time.
+
+The code conflates three distinct cases:
+
+1. **Planned failover** — Both nodes healthy, sessions syncing continuously. Standby already has every session. Should require: one barrier ack (proves peer is current) → flip ownership → done. Must reject if sessions aren't current instead of waiting for bulk.
+
+2. **Unplanned failover** — Primary crashes. Secondary takes over immediately via VRRP timeout regardless of session state. Acceptable to lose some sessions — total outage is worse.
+
+3. **Startup/reconnect** — Node joins cluster (boot, restart, partition recovery). Needs full session table from peer. This is the ONLY case where bulk sync should run.
+
+## Current Behavior
+
+- `prepareUserspaceRGDemotionWithTimeout` sends a barrier, but barrier delivery takes 60-80s when bulk sync is in progress because:
+  - `writeBarrierMessage` writes via `writeMu` which `sendLoop` holds during bulk writes
+  - Barrier ack from the peer goes through `sendCh` competing with outbound messages
+- `syncPeerBulkPrimed` gates failover readiness, but this flag is about startup state, not steady-state sync health
+- Manual failover returns "demotion peer barrier failed: timed out" during the 30-120s bulk sync window after reconnect
+
+## Required Changes
+
+### 1. Separate planned failover readiness from bulk sync state
+
+The planned failover path should check:
+- Is session sync connected? (TCP link up)
+- Has the peer processed all our incremental deltas? (one barrier ack)
+
+It should NOT check:
+- `syncPeerBulkPrimed` (startup concern, not failover concern)
+- Whether bulk transfer is in progress
+- Queue drain state
+
+### 2. Barrier must bypass bulk data in the TCP stream
+
+Barriers are control messages. They must not wait behind bulk session data. Options:
+- (a) Write barriers directly on the TCP connection with `writeMu` + short deadline, bypassing `sendCh` and `sendLoop`
+- (b) Use a separate TCP connection for barriers/control
+- (c) Give barriers priority in `sendCh` (priority channel with barrier lane)
+
+
+*(truncated — 87 lines total)*
+
+
+---
+
+## #408 — Remove 2s worker ApplyHAState ack wait from demotion path [CLOSED] (closed 2026-04-03)
+
+The helper's update_ha_state blocks up to 2 seconds waiting for all workers to ack the ApplyHAState command (ha.rs:162-180). This is unnecessary — the BPF session map is already updated synchronously, and the worker ack only confirms internal cache updates. Flow cache uses epoch-based invalidation that works without the ack. Make this fire-and-forget.
+
+---
+
+## #409 — Eliminate double fib_gen bump during RG transition [CLOSED] (closed 2026-04-03)
+
+Both the daemon (daemon_ha.go:2616) and UpdateRGActive (manager.go:348) bump fib_gen. This invalidates ALL flow caches across ALL RGs twice. Should bump once per transition, and ideally only invalidate the affected RG (already done via rg_epoch).
+
+---
+
+## #410 — Blackhole route injection still runs in userspace mode despite #354 skip [CLOSED] (closed 2026-04-03)
+
+Check if blackhole routes are actually being skipped for userspace mode. The userspaceDataplaneActive() guard was added in #354 but the XDP shim should handle inactive RGs via rg_active map. Verify no blackhole syscalls happen during userspace failover — they add 1-10ms per route.
+
+---
+
+## #411 — Pre-failover prepare retry loop has 45s timeout — should fast-fail for planned failover [CLOSED] (closed 2026-04-03)
+
+ManualFailover in cluster.go:676-704 retries preManualFailoverFn every 500ms for up to 45 seconds. For planned failover where both nodes are healthy, this should succeed on first attempt. If it doesn't, fail immediately with a diagnostic error instead of retrying for 45s. The barrier ack proves readiness — no retry loop needed.
+
+---
+
+## #412 — Sessions deleted from XDP map on demotion should be unnecessary if rg_active is checked [CLOSED] (closed 2026-04-03)
+
+On demotion, ha.rs:40-78 deletes ALL sessions for the demoted RG from the USERSPACE_SESSIONS BPF map. This is O(N) synchronous work. If the XDP shim checked rg_active before using a session entry, deletion would be unnecessary — the shim would see rg_active=0 and fall through to slow path. This was the goal of issue #329 (BPF pre-populate with per-RG gating).
+
+---
+
+## #413 — Synced sessions should already be in new owner's BPF session map before activation [CLOSED] (closed 2026-04-03)
+
+Currently, reverse sessions are written to the BPF USERSPACE_SESSIONS map during prewarm_reverse_synced_sessions (activation time). If UpsertSynced wrote to the BPF map at sync-receipt time (not just activation), the map would already be populated before failover. The XDP shim could start redirecting immediately without waiting for prewarm. Requires rg_active gating in the XDP shim (#329).
+
+---
+
+## #414 — CRITICAL: Demoted sessions fall through gap — userspace DP skips fabric redirect, eBPF never invoked [CLOSED] (closed 2026-04-03)
+
+## The Bug
+
+During HA failover, established TCP streams die because demoted sessions are deleted from the USERSPACE_SESSIONS BPF map but the userspace dataplane **does not fabric-redirect them**. The code has a comment saying the eBPF pipeline will handle fabric redirect, but the eBPF pipeline is never invoked for these packets.
+
+## The Sequence
+
+1. Old owner demotes RG1 → deletes ALL sessions from USERSPACE_SESSIONS map (ha.rs:40-78)
+2. Packet arrives at old owner (ARP/MAC hasn't moved yet, 10-100ms gap)
+3. XDP shim looks up USERSPACE_SESSIONS → **NOT FOUND** (return=0)
+4. XDP shim treats it as a **new flow** → redirects to userspace DP via XSK
+5. Userspace DP resolves forwarding → gets **HAInactive** (egress RG is inactive)
+6. Code at afxdp.rs:3516 has comment: *\"HAInactive fabric redirect is handled by the eBPF pipeline via rg_active checks + try_fabric_redirect()\"*
+7. **But the eBPF pipeline was never invoked** — the packet went to userspace DP
+8. Packet is dropped or sent to kernel slow path
+9. TCP stream sees packet loss → retransmits → window collapses → stream dies
+
+## Why the Comment is Wrong
+
+The comment assumes deleted sessions will hit the eBPF pipeline's \`try_fabric_redirect()\` which checks \`rg_active\` and redirects via fabric. But:
+
+- Sessions were deleted from USERSPACE_SESSIONS (the XDP shim's redirect map)
+- When deleted, the XDP shim sees session=0 → treats as new flow → sends to userspace DP
+- The packet **never reaches the eBPF pipeline**
+- The eBPF pipeline's fabric redirect only works for sessions still in the eBPF conntrack map
+
+## The Fix
+
+**Option A (Quick, recommended):** Make the userspace DP fabric-redirect HAInactive packets directly instead of relying on the eBPF pipeline:
+
+\`\`\`rust
+// In afxdp.rs, after HAInactive detection for existing sessions:
+if resolution.disposition == ForwardingDisposition::HAInactive
+    && !ingress_is_fabric(forwarding, meta.ingress_ifindex)
+{
+    if let Some(redirect) = resolve_fabric_redirect(forwarding) {
+        decision.resolution = redirect;
+    }
+}
+\`\`\`
+
+
+*(truncated — 59 lines total)*
+
+
+---
+
+## #417 — Flow cache entries with owner_rg_id=0 bypass epoch invalidation on demotion [CLOSED] (closed 2026-04-03)
+
+## Problem
+After failback (fw1→fw0), fw1's flow cache still forwards packets locally even though RG1 was demoted. The flow cache has 97M hits but only 3 sessions were demoted per worker.
+
+## Root Cause
+Flow cache entries created from locally-originated sessions have `owner_rg_id=0` because the session's owner RG wasn't resolved when the flow cache entry was built. The epoch-based invalidation checks `entry.rg_epoch != rg_epochs[entry.owner_rg_id]`, but with `owner_rg_id=0` this check is skipped (RG 0 is the control RG, always active).
+
+## Evidence
+- fw1 demoted RG1 with 97M forward candidates but only 3 sessions demoted per worker
+- FIB gen bumped to 4, but flow cache entries with rg_id=0 don't check RG epochs
+- First direction (fw0→fw1) worked because fw0's sessions were synced (with owner_rg_id resolved)
+- Reverse (fw1→fw0) failed because fw1's sessions were locally created (owner_rg_id=0)
+
+## Fix
+When building a flow cache entry from a locally-created session, resolve the owner_rg_id from the egress interface's RG mapping. Or: when fib_gen bumps, invalidate ALL flow cache entries (not just epoch-matched ones).
+
+## Files
+- `userspace-dp/src/afxdp.rs` — flow cache insert path
+- `userspace-dp/src/afxdp/flow_cache.rs` — FlowCacheEntry, lookup validation
+
+---
+
+## #418 — Replace bulk session sync with event stream replay on connect [CLOSED] (closed 2026-04-03)
+
+## Problem
+Bulk session sync (BulkSync in sync_bulk.go) is fundamentally slow:
+1. Iterates BPF session maps in Go
+2. Writes each session via TCP with writeMu contention
+3. Receiver installs each via control socket to Rust helper
+4. Takes 30-120s for ~500 sessions due to control socket contention
+5. Creates transfer readiness gates that block planned failover
+
+## Proposed Fix
+Use the event stream for startup sync. On peer connect:
+1. Active node's Rust helper has all sessions in memory
+2. Helper replays all sessions as event stream Open events
+3. Go daemon receives them via handleEventStreamDelta (same path as real-time)
+4. Go daemon queues them to peer via QueueSessionV4 (same path as incremental)
+5. Peer installs them normally
+
+Benefits:
+- No BPF map iteration (sessions already in Rust memory)
+- No control socket contention (event stream is a separate Unix socket)
+- Same code path for startup and steady-state sync
+- Transfer readiness is just \"event stream connected + last sequence acked\"
+- Bulk sync mechanism can be removed entirely
+
+## Alternative
+If full event stream replay is too complex, batch the control socket requests — send 50-100 sessions per request instead of 1.
+
+---
+
+## #420 — event stream replay bulk export can silently drop sessions under load [CLOSED] (closed 2026-04-03)
+
+The new event-stream replay bootstrap path introduced in #419 replaces Go-side `BulkSync()` with `ExportAllSessionsViaEventStream()` on helper connect.
+
+Problem:
+- `userspace-dp/src/afxdp/ha.rs::export_all_sessions_to_event_stream()` iterates every shared session and calls the event-stream worker handle.
+- The worker handle currently uses `try_send()` on a bounded `sync_channel` with capacity 8192.
+- When the channel is full, frames are silently dropped and only a counter is incremented.
+- The export path does not check for drops, retry, or force a resync.
+
+Why this matters:
+- This path is now the userspace bootstrap path on reconnect.
+- A busy node or a large session table can exceed channel capacity during replay.
+- Dropped bootstrap events mean the peer starts with an incomplete session set, which directly undermines HA takeover correctness.
+
+Acceptance criteria:
+- Bootstrap/replay export must be lossless or must fail loudly and trigger a deterministic fallback.
+- Add coverage proving the export path does not silently lose frames when the event queue is saturated.
+- Keep the normal worker hot path non-blocking if needed; the fix only needs to harden the explicit replay/export path.
+
+
+---
+
+## #421 — monitor interface traffic needs a realtime all-interface pps/bandwidth view [CLOSED] (closed 2026-04-03)
+
+`monitor interface` already samples interface counters, but the current implementation is split across the local CLI and gRPC server and the summary path is still weaker than a `bwm-ng`-style operational view.
+
+Problems:
+- The monitor sampling / rendering logic is duplicated between `pkg/cli/monitor_interface.go` and `pkg/grpcapi/server.go`.
+- Remote `MonitorInterface` streams preformatted text only, which makes extension awkward and leaves the summary view fixed to packet counters.
+- The current all-interface summary is not a good answer to "where is traffic flowing right now?" because it does not present per-interface packet rate and bandwidth together in a single realtime table.
+
+Desired outcome:
+- One shared sampling path for interface monitor snapshots.
+- A realtime all-interface table that shows per-interface RX/TX packet rate and bandwidth in a form similar to `bwm-ng`.
+- Keep fabric-overlay parent resolution correct so the numbers reflect wire traffic, not just overlay IP traffic.
+- Expose the improved summary via both the local CLI and the gRPC-backed remote CLI.
+
+
+---
+
+## #423 — monitor interface traffic should add bwm-ng style interactive views and help [CLOSED] (closed 2026-04-03)
+
+`monitor interface traffic` needs a second step beyond the new all-interface realtime table: it should behave more like `bwm-ng` when running interactively so operators can quickly pivot views without restarting the command.
+
+Problems:
+- The new realtime table is useful, but it still lacks the interactive `bwm-ng` model the operators are using as the reference.
+- There is no in-band help overlay describing the available keys while the monitor is live.
+- There is no single-key cycling for unit/view changes such as bytes, bits, packets, and errors, or for rolling between current-rate and accumulated views.
+- The refresh interval is fixed instead of being adjustable live.
+
+Desired outcome:
+- Add an in-band help panel similar to `bwm-ng` on `h`.
+- Add interactive keybindings to cycle unit/view modes while the monitor is running.
+- Add live refresh-interval adjustment.
+- Keep the local CLI and gRPC-backed remote CLI behavior aligned.
+
+
+---
+
+## #426 — fabric redirect path bandwidth limits existing TCP streams during failover [CLOSED] (closed 2026-04-03)
+
+## Problem
+
+When RG ownership moves between nodes (planned failover), established TCP streams
+that were running at full WAN throughput (~12 Gbps) die because the fabric redirect
+path can only sustain ~2 Gbps (copy-mode XSK on virtio fabric parent).
+
+The TCP congestion window is tuned for 12 Gbps (Cwnd=4.14 MB). After failover,
+traffic routes through the fabric link. The huge burst overwhelms the copy-mode
+XSK binding on the fabric parent interface, causing kernel RX drops (739 out of
+13.6M packets = 0.005%). This triggers TCP congestion collapse (Cwnd → 1.41 KB)
+and the stream never recovers.
+
+## What works
+
+- New connections in split-RG state: 2.09 Gbps sustained for 30+ seconds
+- Ping across fabric: 0% loss
+- Barrier for planned failover: succeeds promptly
+- Session sync: both event stream and bulk markers work
+
+## Root cause
+
+The fabric parent interface (ge-0-0-0 / ge-7-0-0) is a virtio-net interface
+with copy-mode AF_XDP (not zerocopy). Each fabric-redirected packet is memcpy'd
+from kernel to user-space UMEM. At high throughput bursts, the copy can't keep
+up and the kernel drops frames from the RX ring.
+
+## Potential fixes
+
+1. **Increase virtio ring sizes** on fabric parent to absorb bursts
+2. **Zerocopy XSK** on fabric parent (requires hardware support)
+3. **Graceful cwnd reduction**: during failover transition, temporarily set a
+   lower TCP MSS or trigger ECN to signal TCP to reduce its sending rate
+4. **Pacing**: rate-limit fabric redirect output to the sustainable rate
+5. **Slow-path fallback for fabric**: route fabric-redirected packets through
+   the io_uring slow path instead of XSK TX, avoiding the copy-mode bottleneck
+
+## Test reproduction
+
+```bash
+# Deploy and restart
+
+*(truncated — 54 lines total)*
+
+
+---
+
+## #427 — barrier timeout under high-parallelism session sync (-P8) [CLOSED] (closed 2026-04-04)
+
+## Problem
+
+Planned failover via `request chassis cluster failover` times out on the
+pre-demotion barrier when the session sync TCP connection carries heavy
+traffic from the bulk sync retry loop. With `-P8` iperf (generating ~500+
+synced sessions), the barrier ack takes 30+ seconds because session data
+fills the TCP send buffer ahead of the barrier.
+
+The direct-write barrier fix (e0def75d) helps for low session counts but
+doesn't solve the case where hundreds of session messages are already
+queued in the TCP buffer when the barrier is written.
+
+## Root Cause
+
+`writeBarrierMessage` writes the barrier directly via `writeMu`, but the
+TCP send buffer already contains session data from `sendLoop`. The barrier
+bytes are appended AFTER the buffered session data. The peer doesn't see
+the barrier until it reads through all preceding session messages.
+
+The bulk sync retry loop (`startSessionSyncPrimeRetry`) continuously
+pushes sessions through `sendCh` → `sendLoop` → TCP write, keeping the
+buffer full.
+
+## Fix
+
+The `DrainSendQueue` + `syncPrimeRetryGen.Add(1)` in the demotion prep
+path need to also wait briefly for the TCP send buffer to flush before
+writing the barrier. Options:
+
+1. After draining sendCh and stopping the retry loop, call
+   `runtime.Gosched()` + brief sleep to let sendLoop finish its current
+   write and the kernel flush the TCP buffer
+2. Set `TCP_NODELAY` on the sync connection to prevent Nagle buffering
+3. Use a dedicated priority TCP connection for barriers (separate from
+   session data)
+
+## Reproduction
+
+```bash
+iperf3 -c 172.16.80.200 -P 8 -t 60 &
+
+*(truncated — 44 lines total)*
+
+
+---
+
+## #429 — Flow cache can outlive HA forwarding lease expiry [CLOSED] (closed 2026-04-04)
+
+## Summary
+The `3bbcbcd8` flow-cache fast-path removed the per-packet HA validity check on cache hits and now relies on RG epoch invalidation only. That misses the case where an HA forwarding lease simply ages out without an explicit RG epoch bump.
+
+## Why this is a bug
+Cached entries on the hot path can continue forwarding with a stale `ForwardCandidate`/`FabricRedirect` decision after `HAGroupRuntime::is_forwarding_active()` would already return false. That means established cached flows can keep using the local fast path after watchdog lease expiry instead of falling back to `HAInactive` and fabric redirect/slow-path re-resolution.
+
+## Affected code
+- `userspace-dp/src/afxdp.rs` cache-hit path no longer calls `cached_flow_decision_valid()`
+- `userspace-dp/src/afxdp/flow_cache.rs` validates only config/FIB generation plus `owner_rg_epoch`
+- `userspace-dp/src/afxdp/types.rs` still models time-based HA leases via `HAForwardingLease::ActiveUntil`
+
+## Expected
+Flow-cache hits should self-expire once the owning RG lease has lapsed, even if no explicit demotion/activation epoch bump occurred.
+
+## Audit context
+Found while auditing commits added after the April 3, 2026 `master` rebase point (`8386f394..3bbcbcd8`).
+
+---
+
+## #430 — Manual failover barrier no longer preserves session-sync ordering [CLOSED] (closed 2026-04-04)
+
+## Summary
+The barrier changes in `55c46fc4`, `5e757452`, and `03dc4cd3` broke the core ordered-barrier guarantee used by planned userspace failover.
+
+## Why this is a bug
+`WaitForPeerBarrier()` now writes the barrier directly under `writeMu` after pausing the send loop, and `prepareUserspaceRGDemotionWithTimeout()` drains `sendCh` before issuing the barrier. Together, those changes mean the barrier ack can succeed even though earlier queued session deltas were either skipped or discarded.
+
+That defeats the whole meaning of the demotion barrier: peer ack is supposed to prove the standby already processed all earlier session updates before takeover.
+
+## Affected code
+- `pkg/cluster/sync_bulk.go` direct barrier write path
+- `pkg/cluster/sync.go` send-loop pause machinery added to support the direct write
+- `pkg/daemon/daemon_ha.go` demotion prep calls `DrainSendQueue()` before `WaitForPeerBarrier()`
+
+## Expected
+Planned failover barriers must stay in the same FIFO stream as queued session deltas and must never drop queued sync messages to make the barrier arrive faster.
+
+## Audit context
+Found while auditing commits added after the April 3, 2026 `master` rebase point (`8386f394..3bbcbcd8`).
+
+---
+
+## #433 — XDP shim fabric redirect bypass for zero-copy cross-chassis forwarding [CLOSED] (closed 2026-04-05)
+
+## Problem
+
+Fabric redirect in the userspace dataplane routes packets through XSK
+copy-mode on the virtio fabric parent interface, consuming ~20% CPU
+(combined TX + RX on both nodes) for kernel SKB allocation and memcpy.
+
+Current: 4.0 Gbps at -P8 through fabric
+Target: closer to the 23 Gbps direct path
+
+See docs/fabric-performance-optimizations.md for full profile data.
+
+## Proposed Fix
+
+Teach the XDP shim to perform fabric redirect at the XDP level using
+\`bpf_redirect_map\`, bypassing XSK entirely for fabric-destined packets.
+This matches how the eBPF pipeline handles fabric redirect — zero-copy
+XDP-to-XDP redirect with no userspace involvement.
+
+### Implementation
+
+1. Add a \`USERSPACE_FABRIC_REDIRECT\` BPF hash map:
+   \`{5-tuple} → {fabric_ifindex, dst_mac[6], src_mac[6], nat_rewrite}\`
+
+2. Rust helper writes entries when creating/refreshing sessions that
+   resolve to FabricRedirect disposition
+
+3. XDP shim checks the map BEFORE redirecting to XSK:
+   - Match: rewrite MACs + apply NAT + \`bpf_redirect_map(fabric_ifindex)\`
+   - No match: redirect to XSK as normal
+
+4. The shim must handle NAT rewrite in BPF (the eBPF pipeline already
+   has \`apply_nat_ipv4/ipv6\` — can reuse those helpers)
+
+### Benefits
+
+- Eliminates \`__xsk_generic_xmit\` SKB allocation (9.4% CPU on fw0)
+- Eliminates copy-mode XSK RX overhead (11.3% CPU on fw1)
+- Fabric packets stay in kernel XDP path — zero userspace involvement
+- Same behavior as eBPF pipeline's \`try_fabric_redirect\`
+
+
+*(truncated — 51 lines total)*
+
+
+---
+
+## #434 — Cached FabricRedirect flow-cache hits ignore apply_nat_on_fabric [CLOSED] (closed 2026-04-04)
+
+## Summary
+Cached userspace flow-cache hits for `FabricRedirect` sessions do not consistently honor the cached `apply_nat_on_fabric` decision.
+
+## Impact
+When a new session is resolved on the slow path with `apply_nat_on_fabric=false`, later cached hits can still apply NAT:
+- the self-target descriptor fast path rewrites IPs/ports because `apply_rewrite_descriptor()` ignores the cached flag
+- the cross-binding fallback path forces `build_live_forward_request_from_frame(..., true)` instead of using the cached descriptor value
+
+That can rewrite packets differently from the session decision that originally populated the cache, which is both a correctness bug and extra transient NAT work on the fabric path.
+
+## Fix
+- preserve whether a cached descriptor represents a `FabricRedirect`
+- make descriptor rewrites skip NAT deltas when `apply_nat_on_fabric=false`
+- make cached fallback forwarding requests reuse the cached flag instead of forcing NAT on
+- add regression coverage for the descriptor path
+
+
+---
+
+## #436 — Refresh fabric performance plan for strict userspace NAT path [CLOSED] (closed 2026-04-04)
+
+## Summary
+`docs/fabric-performance-optimizations.md` no longer matches the current strict-userspace dataplane.
+
+## Problems
+- it describes steady-state fabric transit as a `PASS_TO_KERNEL` -> eBPF pipeline path, but current code keeps transit session hits on AF_XDP/userspace and reserves `PASS_TO_KERNEL` for local-delivery/control-plane cases
+- it still lists the old barrier pause/drain optimization as completed even though the ordered barrier work replaced that path
+- it does not capture the remaining NAT/performance work that now matters most on the userspace fabric path
+
+## Update the doc to cover
+- the current strict-userspace fabric redirect architecture
+- why `apply_nat_on_fabric` still matters on the transient/cached userspace fabric path
+- next concrete optimizations, including cached fabric NAT decisions, target-binding reuse, and reducing the duplicate HA validation on cache hits
+
+
+---
+
+## #438 — XDP shim drops ICMP echo replies for interface-NAT addresses [CLOSED] (closed 2026-04-04)
+
+## Problem
+
+Locally-originated traffic (e.g., `ping 1.1.1.1` from the firewall itself) fails because the XDP shim doesn't recognize ICMP echo replies destined for interface-NAT addresses as local-delivery packets.
+
+## Root Cause
+
+`is_icmp_to_interface_nat_local()` in `userspace-xdp/src/lib.rs` only checks for ICMP echo request (type 8) and ICMPv6 echo request (type 128). When the firewall pings an external host:
+
+1. The echo request goes out via kernel routing (bypasses XDP)
+2. The echo reply arrives with dst = firewall's interface-NAT IP (e.g., 172.16.50.8)
+3. `is_local_destination()` returns false (interface-NAT IPs are excluded by design — transit replies need userspace NAT reversal)
+4. `is_icmp_to_interface_nat_local()` returns false (only matches type 8, not type 0)
+5. Packet is redirected to XSK instead of being passed to the kernel
+6. The kernel never receives the reply
+
+## Fix
+
+Extend `is_icmp_to_interface_nat_local()` to also match ICMP echo reply (type 0) and ICMPv6 echo reply (type 129). The kernel's own conntrack matches the reply to the locally-originated ping process.
+
+## Testing
+
+- `ping -c 3 1.1.1.1` from primary firewall: was 100% loss, now 0%
+- `ping6 -c 3 2001:4860:4860::8888`: works
+- Transit traffic unaffected
+
+---
+
+## #440 — Slow-path TUN rp_filter reset by networkctl reload breaks local TCP/UDP [CLOSED] (closed 2026-04-04)
+
+## Problem
+
+Locally-originated TCP/UDP traffic from the firewall fails (e.g., DNS queries, HTTP). ICMP works after #438 fix, but all other protocols are broken.
+
+## Root Cause
+
+The Rust helper creates the slow-path TUN (`bpfrx-usp0`) and sets `rp_filter=0` via sysctl. However, the Go daemon later calls `networkctl reload` (when writing `.network` files), which resets all interface sysctls to defaults. The default `rp_filter=2` (loose mode) causes the kernel to drop packets arriving on the TUN whose source reverse route points at a different interface.
+
+Flow: locally-originated TCP SYN goes out via kernel → reply arrives on WAN → XDP shim redirects to XSK → userspace helper resolves LocalDelivery → reinjects via TUN → **kernel drops because rp_filter rejects the packet**.
+
+## Fix
+
+Add `restoreSlowPathRPFilter()` in `pkg/networkd/networkd.go` that re-sets `rp_filter=0` on `bpfrx-usp0` after every `networkctl reload`. Silently no-ops if the TUN doesn't exist (userspace DP not active).
+
+## Testing
+
+- `ping -c 3 1.1.1.1`: 0% loss
+- TCP to 1.1.1.1:80: HTTP response received
+- `sysctl net.ipv4.conf.bpfrx-usp0.rp_filter` = 0 after deploy
+- Transit traffic unaffected
+
+---
+
+## #442 — RST suppression shells out to nft binary instead of using netlink API [CLOSED] (closed 2026-04-04)
+
+The Rust helper's RST suppression uses the `nftables` crate which shells out to the `nft` binary. The VMs don't have `nft` installed, so it fails with:
+
+```
+RST_SUPPRESS: failed to apply nftables rules: unable to execute "nft": No such file or directory
+```
+
+Move RST suppression to the Go daemon using `github.com/google/nftables` which communicates via the kernel netlink API directly — no external binary needed.
+
+---
+
+## #450 — TCP streams die after RG failover — 3/4 iperf3 streams go to 0 bps [CLOSED] (closed 2026-04-05)
+
+## Observed
+
+During hardened failover testing (`userspace-ha-failover-validation.sh`, 3 cycles, -P4), 3 of 4 iperf3 streams consistently die after each RG move. Only 1 stream survives and recovers.
+
+Throughput pattern:
+- Pre-failover (direct path): ~20 Gbps
+- After failover (fabric): ~2.5 Gbps (1 surviving stream via fabric)
+- After failback: ~5 Gbps (streams partially recover)
+- By end of test: ~13 Gbps (fewer live streams)
+
+## Suspected Cause
+
+When RG1 moves from node0 to node1, the kernel on node0 no longer owns the interface-NAT addresses. Incoming TCP data for those connections triggers the kernel's TCP stack to send RST (no matching socket). The RST suppression nftables rules should prevent this, but there may be a race window between the RG demotion and the nftables rules being updated on the old owner.
+
+Additionally, the new owner's kernel may generate RSTs for TCP connections it hasn't seen (the session exists in the userspace helper but not in kernel conntrack).
+
+## Impact
+
+Traffic survives failover (1/4 streams + reachability), but throughput drops significantly from stream death. New connections work fine.
+
+## Artifacts
+
+`/tmp/userspace-ha-failover-rg1-20260404-162505/`
+
+---
+
+## #451 — Neighbor miss spikes >20 after RG failover [CLOSED] (closed 2026-04-05)
+
+## Observed
+
+During failover testing, neighbor misses spike to 25-52 on the new RG owner. The test threshold is 20, causing FAIL.
+
+## Cause
+
+After RG takeover, the new owner needs to resolve ARP/NDP entries for next-hops it hasn't communicated with before. The userspace helper does proactive neighbor resolution, but there's a window where packets arrive before neighbors are resolved.
+
+## Action
+
+Either:
+1. Pre-warm neighbor entries on the standby node before failover (proactive ARP for peer's next-hops)
+2. Increase the test threshold to 60 (the misses are transient and don't affect traffic recovery)
+
+---
+
+## #452 — Rust helper single-threaded event loop blocks session installs behind main socket requests [CLOSED] (closed 2026-04-05)
+
+## Problem
+
+The Rust userspace-dp helper uses a single-threaded event loop that accepts connections from both the main control socket and the session socket (Phase 3). While processing a request from one socket (e.g., a status poll or snapshot publish), the other socket's requests are blocked.
+
+This causes the session sync barrier to take 46+ seconds under load, because session installs from the HA sync receive loop queue behind main socket requests.
+
+## Current Workaround
+
+Manual failover barrier timeout increased to 60 seconds.
+
+## Proposed Fix
+
+Process session socket requests in a separate thread:
+
+\`\`\`rust
+// Spawn a thread for session socket handling
+let session_state = state.clone();
+thread::spawn(move || {
+    for stream in session_listener.incoming() {
+        handle_stream(stream, ...session_state...);
+    }
+});
+\`\`\`
+
+This allows session installs to proceed concurrently with main socket requests (snapshot publishes, status polls).
+
+## Impact
+
+Barrier ack latency would drop from 46s to ~1-5s under load, allowing the timeout to be reduced back to 30s.
+
+---
+
+## #456 — All 4 iperf3 streams die after RG failover (4/4 at 0 bps) [CLOSED] (closed 2026-04-05)
+
+## Observed
+
+During hardened failover testing (10-cycle, -P4), all 4 iperf3 streams show 0 bps after RG1 moves from node0 to node1. Previously (#450) only 3/4 died.
+
+Cycle 1 failover passed all other checks (RG moved, target reachable, external IPv4/IPv6 reachable) but all streams show 0 throughput.
+
+## Context
+
+PR #455 (atomic nftables RST suppression) was merged but may not fully cover the race window. The nftables rules suppress kernel-originated RSTs from interface-NAT addresses, but during the transition the demoting node's kernel stack may still process inbound TCP segments and respond with RSTs before the XDP shim redirects all traffic.
+
+## Relationship to #450
+
+This is a continuation of #450. The atomic nftables batch fix reduced but did not eliminate stream death.
+
+## Artifacts
+`/tmp/userspace-ha-failover-rg1-20260404-202829/`
+
+---
+
+## #457 — Standby node loses userspace readiness after RG failover [CLOSED] (closed 2026-04-05)
+
+## Observed
+
+During hardened failover testing, after RG1 moves to node1, the standby (node0) loses userspace readiness:
+```
+FAIL  cycle 1 failover: standby node0 lost userspace readiness
+```
+
+The standby should remain armed with ready bindings after demoting an RG — it only lost one RG, not all of them (RG0 and RG2 are still on node0).
+
+## Impact
+
+If the standby loses readiness, it cannot take back the RG quickly if needed. This delays failback recovery.
+
+## Artifacts
+`/tmp/userspace-ha-failover-rg1-20260404-202829/`
+
+---
+
+## #458 — Session sync barrier timeout on second failover cycle (sessions_received=0) [CLOSED] (closed 2026-04-05)
+
+## Observed
+
+During hardened failover testing, cycle 1 (failover + failback) succeeds, but cycle 2 failover fails:
+```
+error: demotion peer barrier failed: timed out waiting for session sync barrier ack
+seq=1 sessions_sent=278 sessions_received=0 sessions_installed=0 queue_len=0
+```
+
+\`sessions_received=0\` means the local node hasn't received ANY sessions from the peer since daemon start. Combined with queue_len=0 (the barrier was queued successfully), this suggests the sync TCP connection is alive but the peer isn't sending the barrier ack.
+
+## Suspected Cause
+
+After the first failover+failback cycle, the sync connection may be in a degraded state. The TCP connection exists but the peer's receive loop may have stalled or the connection was replaced but the old barrier waiter wasn't cleaned up.
+
+## Artifacts
+`/tmp/userspace-ha-failover-rg1-20260404-202829/`
+
+---
+
+## #462 — Phase 2 incremental neighbor updates leave stale snapshot neighbors active in userspace helper [CLOSED] (closed 2026-04-05)
+
+## Summary
+The Phase 2 lightweight FIB-bump path switched userspace neighbor refresh from full `apply_snapshot` publishes to `update_neighbors`, but the helper still prefers `forwarding.neighbors` over `dynamic_neighbors` during lookup. As a result, incremental manager neighbor updates do not actually replace or delete the manager-owned neighbors that were seeded by the last snapshot.
+
+## Impact
+- Replaced manager neighbors can keep using the old MAC from the last snapshot.
+- Deleted manager neighbors can stay forwardable until the next full snapshot rebuild.
+- The bug survives the intended `neighbor_replace=true` path because `apply_manager_neighbors()` only touched `dynamic_neighbors`, while `lookup_neighbor_entry()` checks `forwarding.neighbors` first.
+
+## Evidence
+- `pkg/dataplane/userspace/manager.go`: `BumpFIBGeneration()` now sends `update_neighbors` instead of rebuilding and republishing a full snapshot.
+- `userspace-dp/src/main.rs`: `update_neighbors` calls `guard.afxdp.apply_manager_neighbors(replace, &resolved)`.
+- `userspace-dp/src/afxdp.rs`: `apply_manager_neighbors()` only updated `dynamic_neighbors` and `manager_neighbor_keys`.
+- `userspace-dp/src/afxdp/forwarding.rs`: `lookup_neighbor_entry()` returns `state.neighbors` before consulting `dynamic_neighbors`.
+
+## Expected
+Incremental manager neighbor updates should replace and delete the manager-owned entries in the live forwarding view, not just append to the auxiliary dynamic cache.
+
+
+---
+
+## #464 — RequestPeerFailover clears local manual failover before the handoff is admitted [CLOSED] (closed 2026-04-05)
+
+## Summary
+`RequestPeerFailover()` clears a local `ManualFailover` before it checks transfer readiness or successfully sends the peer-failover request.
+
+## Why this is a bug
+If the operator is failing back to a node that is currently held in `secondary-hold`, a rejected or unsent request should leave that explicit transfer-out state intact. Today the function clears `ManualFailover` early, so a failed fail-back attempt mutates local ownership state before the request is admitted.
+
+## Reproduction
+1. Put a local RG into `ManualFailover` / `secondary-hold`.
+2. Call `RequestPeerFailover()` while local transfer readiness is false, or make the peer-failover send fail.
+3. Observe that the call returns an error, but the local RG no longer has `ManualFailover=true`.
+
+## Expected
+Preflight rejection or peer-request send failure should not clear the existing local `ManualFailover` hold. The hold should only be released after the peer has explicitly acknowledged the transfer-out request and the local side is committing takeover.
+
+---
+
+## #465 — sync_test still expects barrierAckSeq to reset after total disconnect [CLOSED] (closed 2026-04-05)
+
+## Summary
+`pkg/cluster/sync_test.go` still expects `handleDisconnect()` to reset `barrierAckSeq` to `0`, but the runtime code now intentionally keeps both `barrierSeq` and `barrierAckSeq` monotonic across reconnects.
+
+## Why this is a bug
+The reconnect fix for barrier sequence reuse relies on monotonic barrier counters. The stale test now fails on `master`, so `go test ./pkg/cluster` is red even though the runtime behavior is correct.
+
+## Expected
+The disconnect test should assert that waiters are cleared while both barrier counters remain monotonic, matching the current runtime behavior and reconnect design.
+
+---
+
+## #466 — Session sync still bulk-primes on reconnect and active-fabric changes [CLOSED] (closed 2026-04-05)
+
+## Summary
+The sync transport still calls `doBulkSync()` on every first connection after disconnect and on every newly active connection.
+
+## Code
+- `pkg/cluster/sync.go:601-629`
+- `pkg/daemon/daemon_ha.go:59-72`
+- `pkg/daemon/daemon_ha.go:94-105`
+- `pkg/daemon/session_sync_readiness_test.go`
+
+## Why this is a bug
+Planned failover should not depend on reconnect-triggered bulk transfer. Ordinary reconnects and preferred-fabric flips should preserve continuous sync state; bulk should only be required when a node is actually starting from scratch.
+
+Today the reconnect path still:
+1. starts bulk sync on reconnect / active-path switch,
+2. clears daemon bulk-primed state on peer disconnect/connect,
+3. drops sync readiness until a new bulk completes or the timeout releases it.
+
+That reintroduces long failover admission delays and makes HA readiness depend on transport churn instead of real session-state freshness.
+
+## Expected
+Reconnect and active-fabric changes should not trigger bulk by default. Bulk should be requested explicitly only by a node that knows it started from scratch.
+
+---
+
+## #467 — Failed userspace demotion prep stops the peer bootstrap retry loop and never restarts it [CLOSED] (closed 2026-04-05)
+
+## Summary
+`prepareUserspaceRGDemotionWithTimeout()` stops the session-sync bulk-prime retry loop before it waits on demotion barriers, but if the barrier wait fails it returns without restarting that retry loop.
+
+## Code
+- `pkg/daemon/daemon_ha.go:146-241`
+- `pkg/daemon/daemon_ha.go:1127-1174`
+
+## Why this is a bug
+If a peer is still waiting for its cold-start bootstrap and a planned demotion/failover attempt fails at the barrier step, the daemon has already advanced `syncPrimeRetryGen` to kill the retry goroutine. Nothing starts it again unless the sync transport disconnects and reconnects.
+
+That can strand the peer in an unprimed state after a failed failover admission attempt.
+
+## Expected
+Stopping the retry loop for barrier latency is fine, but a failed demotion prep must resume the retry loop when the peer is still connected and still waiting for our bootstrap ack.
+
+---
+
+## #472 — Kernel crash in mlx5_core ICOSQ recovery during HA failback [CLOSED] (closed 2026-04-12)
+
+## Observed
+
+VM reboots during RG1 failback (node1 → node0). The kernel crashes in the mlx5_core driver's ICOSQ CQE error recovery path:
+
+```
+ICOSQ 0x9a2: cc (0x22ef) != pc (0x22fe)
+WARNING: drivers/net/ethernet/mellanox/mlx5/core/en/reporter_rx.c:72
+  at mlx5e_rx_reporter_err_icosq_cqe_recover
+```
+
+## Stack trace
+
+```
+mlx5e_rx_reporter_err_icosq_cqe_recover+0x222/0x240 [mlx5_core]
+devlink_health_reporter_recover+0x27/0x70
+devlink_health_report+0x126/0x220
+mlx5e_reporter_icosq_cqe_err+0x8b/0xb0 [mlx5_core]
+```
+
+## Context
+
+- Kernel: 6.19.8+deb14-amd64
+- NIC: Mellanox ConnectX VF (mlx5_core), PCI passthrough to QEMU VM
+- Trigger: RG1 failback while iperf3 -P8 is running
+- The crash occurs when XDP programs are swapped during RG activation/demotion
+- The ICOSQ (internal completion queue) gets out of sync during the XDP program transition
+
+## Impact
+
+VM reboots, all traffic dies. The surviving peer takes over but the rebooted node needs ~30s to rejoin.
+
+## Workaround
+
+This is a kernel/driver bug, not a bpfrx issue. Possible mitigations:
+- Avoid XDP program swaps during failover (keep the same XDP program, change behavior via BPF maps)
+- Pin the VF to a specific RG so it doesn't get reattached during failover
+- Update to a newer kernel with mlx5 ICOSQ fixes
+
+---
+
+## #473 — XSK bindings map cleared after peer crash but helper reports ready [CLOSED] (closed 2026-04-05)
+
+## Observed
+
+After fw0 crashes (mlx5 kernel panic #472) and reboots, fw1 (which takes over all RGs) stops forwarding transit traffic. The XDP shim shows rx_xdp_redirect=0 — no packets being redirected to XSK.
+
+## Root Cause
+
+The `userspace_bindings` BPF map is all zeros (no registered queues), but the helper's internal status reports all queues as Registered=true, Armed=true, Ready=true. The XDP shim has nothing to redirect to, so all packets get XDP_PASS to the kernel stack, which doesn't forward transit traffic.
+
+The discrepancy appears to occur when:
+1. fw0 crashes → fw1 takes over all RGs
+2. The sync connection drops and reconnects
+3. During reconnection handling, the bindings BPF map gets cleared or overwritten
+4. The helper's internal state isn't updated to match
+
+## Reproduction
+
+1. Run iperf3 through the cluster
+2. Crash fw0 (or trigger mlx5 kernel panic)
+3. fw1 takes over all RGs
+4. Transit traffic dies on fw1 despite all RGs being primary
+5. `bpftool map dump pinned /sys/fs/bpf/bpfrx/userspace_bindings` shows all zeros
+6. `ethtool -S ge-7-0-1 | grep rx_xdp_redirect` shows 0
+
+## Workaround
+
+`systemctl restart bpfrxd` on fw1 re-registers the XSK bindings.
+
+## Expected
+
+XSK bindings should survive peer crash/reconnect. The helper should detect the BPF map mismatch and re-register.
+
+---
+
+## #475 — TCP streams never recover after failover+failback: sessions show Pkts:0 [CLOSED] (closed 2026-04-05)
+
+## Observed
+
+After a clean failover (RG1 node0→node1) then failback (RG1 node1→node0), all iperf3 streams go to 0 bps and never recover. The sessions exist on node0 but show Pkts: 0 on both In and Out directions — no packets match the sessions even though the iperf3 client is still trying to send.
+
+## Key Data
+
+- Sessions exist on node0 after failback with correct flow keys
+- All sessions show Pkts: 0, Bytes: 0 (no packets matching)
+- iperf3 client shows cwnd: 2-4MB, retrans: 0 (TCP thinks connection is alive)
+- New connections (ping) work fine — only pre-existing TCP flows are broken
+- Barrier succeeds instantly (no timeout)
+
+## Suspected Root Cause
+
+After failback, node0 has two sources of sessions:
+1. **Local sessions** from before the failover (in flow cache with stale FIB data)
+2. **Synced sessions** from node1 (with zeroed FIB data from `SetClusterSyncedSessionV4`)
+
+The flow cache on node0 may retain stale entries from before the failover that point to the direct egress path. After failback, these entries should be invalidated by the FIB generation bump during RG activation, but if the flow cache check uses a stale FIB generation, the entries survive and packets match the stale entry instead of the refreshed session.
+
+Alternatively, the duplicate sessions (both `10.0.61.102` and `172.16.80.8` source versions exist) may confuse the session lookup.
+
+## Reproduction
+
+1. Start iperf3 -P4 from LAN host
+2. `request chassis cluster failover redundancy-group 1 node 1`
+3. Wait 15s
+4. `request chassis cluster failover redundancy-group 1 node 0`
+5. All streams stay at 0 bps indefinitely
+
+## Not the same as #456
+
+Issue #456 was about streams dying from TCP retransmission timeout (expected). This issue is different: sessions exist with Pkts:0 — the dataplane isn't forwarding ANY packets for these flows, even though the sessions and routes are correct.
+
+---
+
+## #477 — remote monitor interface traffic ignores summary-mode keystrokes [CLOSED] (closed 2026-04-05)
+
+## Problem
+The remote CLI `monitor interface traffic` path renders the server stream, but it does not read local stdin in raw mode. Keys like `c`, `p`, `b`, `d`, `r`, and `q` therefore do nothing even though the screen advertises those controls.
+
+## Why it matters
+Operators cannot switch views or exit cleanly from the remote summary monitor, which breaks the full-screen workflow used to inspect live forwarding behavior.
+
+## Expected
+The remote CLI should support the same summary-mode keys as the local CLI when stdin is an interactive terminal.
+
+---
+
+## #478 — monitor interface traffic summary omits fab/reth aliases [CLOSED] (closed 2026-04-05)
+
+## Problem
+`monitor interface traffic` summary mode enumerates live kernel links directly, so it prints raw physical names and can omit configured aliases like `fab0` and `reth0` when those are the names operators actually use to reason about traffic flow.
+
+## Why it matters
+This makes summary monitoring harder to use during dataplane and HA debugging because the traffic view does not line up with the configured interface model.
+
+## Expected
+Summary mode should prefer configured display aliases when they resolve to the same live physical counter source, without double-counting totals.
+
+---
+
+## #481 — Rapid failover+failback causes barrier disconnect: session sync disconnected during barrier wait [CLOSED] (closed 2026-04-05)
+
+## Observed
+
+When failover and failback are issued back-to-back with no delay (immediate), the first failover's barrier fails with:
+```
+session sync disconnected during barrier wait seq=22
+```
+
+The immediate failback disrupts the sync connection before the first barrier can complete.
+
+## Impact
+
+- The failover doesn't complete cleanly (barrier fails)
+- But the failback succeeds and streams recover (13.3 Gbps)
+- The cluster ends up in the correct state
+
+With 2-second delays between moves, all 6 moves succeed. The issue only occurs with truly immediate back-to-back moves.
+
+## Root Cause
+
+The failback triggers a new HA state transition on the peer (node1), which causes the sync connection to be torn down and reconnected. The barrier from the first failover is still waiting for an ack when the connection drops.
+
+## Expected
+
+Either:
+1. Queue the failback until the failover's barrier completes (serialize RG moves)
+2. Or cancel the failover's barrier gracefully when a conflicting failback arrives
+
+## Reproduction
+
+```bash
+# Immediate back-to-back (no sleep)
+cli -c "request chassis cluster failover redundancy-group 1 node 1"
+cli -c "request chassis cluster failover redundancy-group 1 node 0"
+```
+
+## Workaround
+
+Add a 2-second delay between failover and failback. With 2s delay, both succeed reliably across 20+ cycles.
+
+---
+
+## #485 — TCP stream survives failover but dies on failback — session re-resolution gap [CLOSED] (closed 2026-04-05)
+
+## Observed
+
+With proactive flow cache preflight (#484) and rate-limited iperf3 (-b 2G, below fabric capacity):
+
+- **Failover (node0→node1)**: Stream SURVIVES. Continuous 1.9-2.1 Gbps through fabric. ✅
+- **Failback (node1→node0)**: Stream DIES at t+25s. Goes from 1.74 Gbps → 0. ❌
+
+## Key Progress
+
+The proactive preflight eliminates the forwarding gap during failover. At rates below fabric capacity (3.5 Gbps), streams survive the failover seamlessly.
+
+## Remaining Issue
+
+The failback path (node1→node0) still has a gap where the stream dies. The session on node0 needs to re-resolve from FabricRedirect back to ForwardCandidate (direct forward), but during this transition packets are dropped.
+
+The preflight on node1 marks RG1 as inactive and bumps the epoch. But node1 doesn't have a fabric path to node0 for the return direction — it was the WAN owner, sending directly. After preflight, node1's flow cache says "inactive for WAN" but there's no fabric redirect path FROM node1 TO node0 for the WAN-originated traffic.
+
+## Fix Direction
+
+The failback preflight needs to work differently:
+1. On node1 (demoting): preflight marks RG1 inactive → flow cache flushes
+2. On node0 (activating): needs to be ready to receive direct-path traffic immediately
+3. The gap is between node1's demotion and node0's activation
+
+This may require the activating node to pre-install sessions and neighbors BEFORE the VRRP transition completes.
+
+---
+
+## #490 — userspace HA activation still depends on activation-time session and BPF republish [CLOSED] (closed 2026-04-06)
+
+## Summary
+Latest `origin/master` still makes RG activation repair session state in the helper and republish `USERSPACE_SESSIONS` entries at activation time. That means failover/failback is not just moving ownership/MACs between two already-ready firewalls; it still depends on activation-time session/BPF work completing fast enough.
+
+## Evidence
+- `userspace-dp/src/afxdp/ha.rs:136-162` runs `prewarm_reverse_synced_sessions_for_owner_rgs(...)` and `republish_bpf_session_entries_for_owner_rgs(...)` during RG activation.
+- `userspace-dp/src/afxdp/shared_ops.rs:43-48` documents that reverse prewarm still runs at activation to re-resolve egress using local forwarding state.
+- `userspace-dp/src/afxdp/shared_ops.rs:110-120` documents that forward sessions are pushed to workers and synchronously published to `USERSPACE_SESSIONS` during activation to avoid a window where packets hit session misses.
+- `userspace-dp/src/afxdp/shared_ops.rs:165-174` documents that activation-time republish is needed because entries were deleted during the previous demotion cycle.
+- `userspace-dp/src/afxdp/session_glue.rs:265-319` still refreshes live reverse sessions in `ApplyHAState` on activation/demotion.
+- `pkg/dataplane/userspace/manager_ha.go:381-445` double-bumps FIB generation and rebuilds/pushes a fresh snapshot on every HA transition.
+
+## Why this matters
+If failback to the original node still requires worker session refreshes, BPF republish, and a post-transition snapshot push to restore forwarding, then the standby is not actually forwarding-ready. Any lag in those activation-time repair paths can still produce the observed "goes to zero on failback" behavior.
+
+## Expected behavior
+Both firewalls should already have the sessions, redirect state, and forwarding context needed to carry traffic. Planned failover/failback should reduce to ownership/VIP/MAC movement plus a narrow authority transition, not activation-time session/BPF reconstruction.
+
+## Scope
+Audit the current activation-time republish/prewarm paths and either:
+- remove them by making standby state continuously ready, or
+- explicitly separate true cold-start bootstrap from steady-state HA ownership moves.
+
+
+---
+
+## #491 — failback still depends on activation-time neighbor install and ARP/NDP warmup [CLOSED] (closed 2026-04-06)
+
+## Summary
+Latest `origin/master` still performs neighbor installation and neighbor cache warmup on the activation path so the first packet after failback can forward. That contradicts the target model where both firewalls are always ready and failover/failback should mainly move MAC/VIP ownership.
+
+## Evidence
+- `pkg/daemon/daemon_ha.go:1619-1628` handles `OnPrepareActivation` by calling `preinstallSnapshotNeighbors()`, `resolveNeighborsImmediate(...)`, and `warmNeighborCache()`.
+- `pkg/daemon/daemon_ha.go:2658-2703` does the same work on cluster-primary activation before forcing VRRP master.
+- `pkg/daemon/daemon_ha.go:2869-2878` again pre-installs neighbors and warms the cache when the VRRP path activates an RG.
+- `pkg/dataplane/userspace/manager.go:3413-3415` explicitly says `SnapshotNeighbors()` is used so failback does not drop packets during ARP resolution.
+
+## Why this matters
+The code is explicitly admitting that failback still depends on activation-time neighbor repair. If adjacency readiness is only established while the RG is activating, then a failback can still stall or drop to zero while ARP/NDP state catches up.
+
+## Expected behavior
+Neighbor resolution needed for active forwarding should already be present before ownership flips. Planned failover/failback should not need activation-time neighbor preinstall/warmup on the critical path.
+
+## Scope
+Audit whether neighbor state can be maintained continuously for standby ownership targets, and remove or demote activation-time neighbor warmup from the failover critical path.
+
+
+---
+
+## #492 — userspace demotion-prep producer pause and journal path is never actually activated [CLOSED] (closed 2026-04-06)
+
+## Summary
+The daemon contains a demotion-prep design that is supposed to pause background userspace delta producers and journal kernel session opens during the barrier window, but the control bit for that mode is never turned on in production code.
+
+## Evidence
+- `pkg/daemon/daemon.go:220-239` declares `userspaceDeltaSyncMu`, `userspaceDemotionPrepDepth`, and the demotion journal state, with comments saying demotion prep pauses producers and stages continuity-critical republish.
+- `pkg/daemon/daemon_ha.go:723-725`, `795-797`, `899-900`, and `925-926` all check `userspaceDemotionPrepActive()` and skip delta draining or event handling while demotion prep is active.
+- `pkg/daemon/daemon_ha.go:947-948` defines `userspaceDemotionPrepActive()` as `userspaceDemotionPrepDepth.Load() > 0`.
+- Repository-wide search only finds `userspaceDemotionPrepDepth` written in `pkg/daemon/userspace_sync_test.go:667`; production code only declares it and reads it.
+
+## Why this matters
+The barrier/journal logic appears to assume a protected demotion-prep window, but that window never becomes active in production. So the system still relies on concurrent producers behaving well during demotion prep instead of actually pausing or journaling them as designed.
+
+## Expected behavior
+Either:
+- the demotion-prep mode should be wired up so the barrier path actually gets the producer pause/journal guarantees its comments describe, or
+- the dead mechanism should be removed and the failover design simplified around a smaller, real transition model.
+
+## Scope
+Decide whether this mechanism is necessary. If it is, wire it into the actual demotion-prep lifecycle. If it is not, remove the dead branching and simplify the failover path accordingly.
+
+
+---
+
+## #493 — default rg_active semantics enable forwarding before VIP/MAC ownership moves [CLOSED] (closed 2026-04-06)
+
+## Summary
+The default HA state machine still treats `cluster primary` as sufficient to activate forwarding before VRRP/VIP ownership moves. That is a mismatch with the desired design where both nodes are forwarding-ready but traffic ownership should still be established by the MAC/VIP move.
+
+## Evidence
+- `pkg/daemon/rg_state.go:13-18` documents the default rule as `rg_active = clusterPri || allVrrpMaster`, including the comment "Cluster Primary alone activates".
+- `pkg/daemon/rg_state.go:200-207` implements that same rule.
+- `pkg/daemon/daemon_ha.go:2658-2703` documents and implements activation ordering as: set `rg_active` first, then pre-install neighbors, then trigger VRRP master.
+- `pkg/daemon/daemon_ha.go:2672-2679` calls `d.dp.UpdateRGActive(...)` before any VRRP ownership move.
+- `pkg/daemon/daemon_ha.go:2690-2703` only forces VRRP master after `rg_active` and neighbor prep.
+
+## Why this matters
+This means the dataplane can be considered active based on cluster state before the node has actually taken VIP/MAC ownership. In a same-L2 handoff model, that creates extra state transitions and repair windows that should not exist if failover is really just moving ownership to a standby that is already ready.
+
+## Expected behavior
+Forwarding readiness and forwarding authority should not diverge this early. If the design target is "just move MACs because both FWs are always ready," then the default activation rule should not enable traffic handling on cluster-primary alone.
+
+## Scope
+Revisit whether strict VIP/MAC ownership should be the default for HA activation, or whether the current split authority model should be eliminated/reduced so planned failover is a narrower ownership transition.
+
+
+---
+
+## #499 — HA RG transitions still force full snapshot and double FIB churn [CLOSED] (closed 2026-04-06)
+
+`origin/master` `c666d333` still does global snapshot/FIB work during every RG ownership change instead of limiting HA transitions to ownership/lease movement.
+
+Evidence:
+- [`pkg/dataplane/userspace/manager_ha.go:381`](https://github.com/psaab/bpfrx/blob/c666d3336a3e90b634e2b684d4aefb0467e81de5/pkg/dataplane/userspace/manager_ha.go#L381-L442) bumps FIB generation before `update_ha_state`, then bumps again after it, then rebuilds `m.lastSnapshot` and calls `syncSnapshotLocked()`.
+- [`pkg/dataplane/userspace/manager.go:2547`](https://github.com/psaab/bpfrx/blob/c666d3336a3e90b634e2b684d4aefb0467e81de5/pkg/dataplane/userspace/manager.go#L2547-L2614) still publishes `apply_snapshot` when the content hash changes.
+- [`userspace-dp/src/main.rs:392`](https://github.com/psaab/bpfrx/blob/c666d3336a3e90b634e2b684d4aefb0467e81de5/userspace-dp/src/main.rs#L392-L415) handles same-plan `apply_snapshot` by calling `refresh_runtime_snapshot()`.
+- [`userspace-dp/src/afxdp.rs:1104`](https://github.com/psaab/bpfrx/blob/c666d3336a3e90b634e2b684d4aefb0467e81de5/userspace-dp/src/afxdp.rs#L1104-L1167) rebuilds validation, manager-neighbor keys, and forwarding state from the snapshot.
+
+Why this is a problem:
+- HA failover/failback still serializes on control-socket work that is broader than the ownership change itself.
+- The transition path still looks like “HA changed, so rebuild helper runtime state again” rather than “both firewalls are already forwarding-ready; only authority moved.”
+- This also keeps generation churn and snapshot traffic in the critical path for failback debugging.
+
+Expected direction:
+- `UpdateRGActive()` should be able to publish only HA ownership/lease state (and whatever minimal invalidation is truly required), not rebuild and republish a full config snapshot for every RG handoff.
+
+
+---
+
+## #500 — HA state updates still run worker-wide session refresh scans [CLOSED] (closed 2026-04-06)
+
+The helper still does owner-RG session walks on HA state changes instead of treating shared standby state as already authoritative.
+
+Evidence:
+- [`userspace-dp/src/afxdp/ha.rs:78`](https://github.com/psaab/bpfrx/blob/c666d3336a3e90b634e2b684d4aefb0467e81de5/userspace-dp/src/afxdp/ha.rs#L78-L99) enqueues `ApplyHAState` work for activated and demoted RGs.
+- [`userspace-dp/src/afxdp/session_glue.rs:265`](https://github.com/psaab/bpfrx/blob/c666d3336a3e90b634e2b684d4aefb0467e81de5/userspace-dp/src/afxdp/session_glue.rs#L265-L315) handles `ApplyHAState` by refreshing affected owner RGs and demoting matching sessions in place.
+- [`userspace-dp/src/afxdp/session_glue.rs:451`](https://github.com/psaab/bpfrx/blob/c666d3336a3e90b634e2b684d4aefb0467e81de5/userspace-dp/src/afxdp/session_glue.rs#L451-L545) walks `owner_rg_session_keys()` and re-resolves forwarding per session.
+- [`userspace-dp/src/afxdp/shared_ops.rs:311`](https://github.com/psaab/bpfrx/blob/c666d3336a3e90b634e2b684d4aefb0467e81de5/userspace-dp/src/afxdp/shared_ops.rs#L311-L338) already lets the packet path fall back to shared synced session state after local misses.
+
+Why this is a problem:
+- We still have an HA model where activation/demotion repairs local worker tables during the handoff.
+- That keeps O(number-of-sessions-in-owner-RG) work in the transition path even though a shared standby session layer already exists.
+- It also makes it harder to reason about correctness because the system has both shared authoritative state and per-worker HA repair state.
+
+Expected direction:
+- Reduce `ApplyHAState` toward minimal ownership/lease/cache invalidation and rely more directly on pre-existing shared session state for continuity.
+
+
+---
+
+## #501 — HA demotion still depends on barrier plus preflight fabric-shift path [CLOSED] (closed 2026-04-06)
+
+`origin/master` still needs an explicit transition-time demotion-prep protocol before VRRP/cluster ownership can move.
+
+Evidence:
+- [`pkg/daemon/daemon_ha.go:1138`](https://github.com/psaab/bpfrx/blob/c666d3336a3e90b634e2b684d4aefb0467e81de5/pkg/daemon/daemon_ha.go#L1138-L1215) drains pending barriers, waits for a peer barrier, then calls `preflightDemoteRG()` and sleeps 50ms.
+- [`pkg/daemon/daemon_ha.go:1122`](https://github.com/psaab/bpfrx/blob/c666d3336a3e90b634e2b684d4aefb0467e81de5/pkg/daemon/daemon_ha.go#L1122-L1135) describes the goal as shifting traffic to fabric before demotion.
+- [`pkg/dataplane/userspace/manager_ha.go:338`](https://github.com/psaab/bpfrx/blob/c666d3336a3e90b634e2b684d4aefb0467e81de5/pkg/dataplane/userspace/manager_ha.go#L338-L355) sends a dedicated `preflight_demote_rg` control request.
+- [`userspace-dp/src/afxdp/ha.rs:102`](https://github.com/psaab/bpfrx/blob/c666d3336a3e90b634e2b684d4aefb0467e81de5/userspace-dp/src/afxdp/ha.rs#L102-L129) implements that as a lease flip plus RG epoch bump before the real ownership change.
+
+Why this is a problem:
+- The failover path still assumes the standby is not already sufficient on its own, so it has to prepare a fabric redirect window during demotion.
+- That is exactly the kind of transition-time repair logic we should be removing if both firewalls are meant to be continuously ready to forward.
+- The explicit sleep also means failover correctness still depends on timing rather than a simpler steady-state model.
+
+Expected direction:
+- The demoted node should not need a separate preflight fabric-shift step to keep sessions alive. Ownership movement should be enough because the peer should already have the authoritative forwarding state needed to continue the flow.
+
+
+---
+
+## #502 — No-RETH HA promotion still gates on session-sync readiness [CLOSED] (closed 2026-04-06)
+
+The no-RETH/direct HA path still blocks promotion on cluster session-sync readiness instead of only using sync/bootstrap at true cold start.
+
+Evidence:
+- [`pkg/daemon/daemon_ha.go:2947`](https://github.com/psaab/bpfrx/blob/c666d3336a3e90b634e2b684d4aefb0467e81de5/pkg/daemon/daemon_ha.go#L2947-L2961) sets `vrrpReady = d.cluster.IsSyncReady()` in no-RETH mode and reports `session sync not ready` as a takeover blocker.
+- [`pkg/vrrp/manager.go:88`](https://github.com/psaab/bpfrx/blob/c666d3336a3e90b634e2b684d4aefb0467e81de5/pkg/vrrp/manager.go#L88-L143) still models startup preemption suppression as a sync-hold released by sync completion or timeout.
+
+Why this is a problem:
+- The target model is that bulk/bootstrap is only for starting from scratch.
+- After steady-state operation, failover should not be waiting on an abstract sync-ready flag if both sides already have continuous state and can forward immediately.
+- Keeping this gate in no-RETH mode preserves a parallel, more startup-like failover path even after the RETH/VRRP side is being simplified.
+
+Expected direction:
+- Separate true cold-start bootstrap readiness from steady-state takeover readiness in no-RETH mode, the same way we have been trying to do for planned failover elsewhere.
+
+
+---
+
+## #503 — HA takeover still waits on ReadySince hold timer before promotion [CLOSED] (closed 2026-04-06)
+
+Cluster promotion still requires the destination RG to stay ready for `TakeoverHoldTime` before ownership can move.
+
+Evidence:
+- [`pkg/cluster/cluster.go:60`](https://github.com/psaab/bpfrx/blob/c666d3336a3e90b634e2b684d4aefb0467e81de5/pkg/cluster/cluster.go#L60-L78) stores `ReadySince` and gates `IsReadyForTakeover()` on elapsed hold time.
+- [`pkg/cluster/cluster.go:203`](https://github.com/psaab/bpfrx/blob/c666d3336a3e90b634e2b684d4aefb0467e81de5/pkg/cluster/cluster.go#L203-L205) sets the default hold to 3 seconds.
+- [`pkg/cluster/cluster.go:282`](https://github.com/psaab/bpfrx/blob/c666d3336a3e90b634e2b684d4aefb0467e81de5/pkg/cluster/cluster.go#L282-L345) starts a timer on the not-ready -> ready transition and only re-runs election after the hold expires.
+- [`pkg/cluster/cluster.go:825`](https://github.com/psaab/bpfrx/blob/c666d3336a3e90b634e2b684d4aefb0467e81de5/pkg/cluster/cluster.go#L825-L909) also uses the same hold gate for explicit peer failover requests.
+
+Why this is a problem:
+- If both firewalls are truly kept forwarding-ready at all times, the extra hold timer is no longer a safety proof; it is just an added failover/failback delay.
+- This is especially visible on failback to the original owner, where the node may already have everything it needs but still cannot claim until the timer ages out.
+
+Expected direction:
+- Revisit whether HA readiness should be edge-triggered by actual forwarding state rather than a fixed 3s wall-clock hold once the steady-state always-ready model is in place.
+
+
+---
+
+## #504 — Immediate synced BPF publish still bypasses worker session admission [CLOSED] (closed 2026-04-06)
+
+The current "always-hot standby" path still programs `USERSPACE_SESSIONS` immediately even when the worker-side session table would refuse the same synced entry.
+
+Evidence:
+- [`userspace-dp/src/afxdp/ha.rs:237`](https://github.com/psaab/bpfrx/blob/c666d3336a3e90b634e2b684d4aefb0467e81de5/userspace-dp/src/afxdp/ha.rs#L237-L309) publishes synced entries to shared maps and immediately writes the live BPF session map before worker processing.
+- [`userspace-dp/src/afxdp/session_glue.rs:317`](https://github.com/psaab/bpfrx/blob/c666d3336a3e90b634e2b684d4aefb0467e81de5/userspace-dp/src/afxdp/session_glue.rs#L317-L327) still computes `allow_replace_local = !is_active`, meaning an active node can reject replacing a live local session.
+
+Why this is a problem:
+- XDP redirect state and worker session state can diverge.
+- That keeps the hot-standby design dependent on a special-case shortcut rather than one consistent acceptance rule.
+- It is also hard to reason about failback bugs when redirect programming can get ahead of actual session admission.
+
+Expected direction:
+- Hot standby should not require a separate BPF-map-only fast path that can bypass the worker's own session ownership/admission rules.
+
+
+---
+
+## #511 — Strict VIP ownership still removes blackholes on cluster-primary before VRRP ownership [CLOSED] (closed 2026-04-06)
+
+## Summary
+Current `origin/master` still removes RG blackhole routes on the cluster-primary event even when strict VIP ownership leaves `rg_active=false` until VRRP actually becomes MASTER.
+
+That creates an inactive-but-no-blackhole window during failover/failback, which can send traffic down the wrong path before VIP/MAC ownership has actually moved.
+
+## Evidence
+- `pkg/daemon/daemon_ha.go:2573-2592` handles cluster events by calling `s.SetCluster(isPrimary)` and then unconditionally calling `removeBlackholeRoutes(ev.GroupID)` in the `isPrimary` branch.
+- In strict VIP ownership mode, `rg_active` is derived from `allVrrpMaster`, not `clusterPri`, in `pkg/daemon/rg_state.go:203-209`.
+- So on a cluster-primary event before VRRP MASTER, `CurrentDesired()` can still be `false` while blackholes are already removed.
+
+## Why this matters
+Blackhole routes are the inactive-node safeguard that forces return traffic toward the peer/fabric path instead of trying to forward locally. Removing them before the RG is actually active means the standby can stop behaving like a clean standby before it has VIP/MAC ownership.
+
+That is exactly the kind of transition window that can make failback drop to zero even when both helpers are otherwise hot.
+
+## Expected behavior
+On the cluster-primary path, blackholes should only be removed once the RG's desired state is actually active on this node. In strict VIP ownership mode that means after VRRP ownership has moved, not merely after cluster election.
+
+
+---
+
+## #512 — HA status poll still triggers queue and neighbor bring-up after ownership changes [CLOSED] (closed 2026-04-06)
+
+## Summary
+Current `origin/master` still starts helper queue/bootstrap and neighbor-resolution work after HA ownership changes, which means failover is not yet a pure ownership handoff between two already-ready firewalls.
+
+## Evidence
+- `pkg/dataplane/userspace/manager_ha.go:355-359` still calls `bootstrapNAPIQueuesAsyncLocked("ha-update-active")` and `proactiveNeighborResolveAsyncLocked()` when an RG becomes active.
+- `pkg/dataplane/userspace/manager.go:4139-4140` also calls `bootstrapNAPIQueuesAsyncLocked("ha-active-change")` and `proactiveNeighborResolveAsyncLocked()` from the periodic status poll whenever the helper's HA active signature changes.
+- `pkg/dataplane/userspace/manager.go:4230+` documents that NAPI bootstrap exists to generate RX/NAPI activity so zero-copy XSK queues begin consuming fill-ring entries.
+
+## Why this matters
+If HA ownership changes still kick off queue bring-up and neighbor repair work, then the standby was not actually forwarding-ready before cutover. That keeps failover sensitive to asynchronous bootstrap timing instead of reducing it to VIP/MAC ownership transfer plus narrow authority updates.
+
+## Expected behavior
+Queue RX-liveness and neighbor readiness should already be maintained before takeover-ready is reported. HA transitions should not need `ha-update-active` / `ha-active-change` bootstrap work on the critical path.
+
+## Scope
+Audit the remaining helper-side bootstrap and neighbor-refresh hooks on HA transitions, and either:
+- remove them entirely once readiness is continuously maintained, or
+- move them out of the failover critical path and fail readiness earlier instead of starting work during ownership change.
+
+
+---
+
+## #517 — userspace failover loses synced-session origin on local hits [CLOSED] (closed 2026-04-06)
+
+## Summary
+`lookup_session_across_scopes()` drops the original `SessionOrigin` when a peer-synced session has already been materialized into the local `SessionTable`.
+
+## Problem
+The local-hit path currently rebuilds a `ResolvedSessionLookup` as if every local hit were a fresh forward-flow lookup. That is wrong for peer-synced entries that were already imported or materialized locally during HA.
+
+On the promoted node, later session-glue paths treat those hits as `ForwardFlow` instead of preserving `SyncImport`/peer-synced origin. That changes the promotion logic and can make the active node handle an already-synced flow as if it were a new local flow.
+
+## Why this matters
+During HA failover, the promoted node should preserve the synced-session provenance of an already-present entry. Losing that provenance breaks the intended standby-hot-path behavior and was part of the failover transport-collapse debugging on the loss cluster.
+
+## Expected behavior
+Session lookup should preserve `SessionOrigin` for:
+- direct local hits on peer-synced entries
+- local forward-wire alias hits on peer-synced entries
+- shared-map hits
+
+The later promotion/materialization logic should use that preserved origin instead of inferring origin only from `shared_entry.is_some()`.
+
+
+---
+
+## #518 — cluster sync should not mirror reverse sessions into userspace helper [CLOSED] (closed 2026-04-06)
+
+## Summary
+`SetClusterSyncedSessionV4/V6()` mirrors explicit reverse cluster-synced entries into the userspace helper even though the helper already synthesizes the correct reverse companion from the forward synced entry.
+
+## Problem
+The cluster sync caller sends forward and reverse entries as separate updates. The Go manager currently mirrors both into the Rust helper on the cluster-synced path.
+
+That is harmful for reverse entries. The helper's locally synthesized reverse companion uses local forwarding and HA state. The explicit reverse cluster update still carries the forward session's NAT/FIB metadata and can overwrite the helper's correct reverse companion with stale or wrong values.
+
+## Why this matters
+During HA transitions, the standby/promoted helper should derive reverse forwarding from local state, not replay a peer-derived reverse entry that was serialized for a different dataplane view.
+
+## Expected behavior
+Cluster-synced forward entries should still be mirrored into the helper, but explicit reverse entries should stop at the kernel session map and should not overwrite the helper's local reverse companion state.
+
+
+---
+
+## #520 — RG1-only failover cannot move LAN ownership on the loss userspace cluster [CLOSED] (closed 2026-04-07)
+
+## Summary
+`RG1` failover on the loss userspace HA cluster is not a full path handoff. It only moves the WAN side. The LAN gateway ownership stays on `RG2`, so `RG1`-only failover inherently leaves LAN ingress on `node0` and fabric-forwards to `node1`.
+
+## Config evidence
+In `docs/ha-cluster-userspace.conf`:
+- `reth0` is assigned to `redundancy-group 1`
+- `reth1` with `10.0.61.1/24` is assigned to `redundancy-group 2`
+
+That means moving `RG1` alone cannot move the LAN VIP/MAC identity.
+
+## Live failover evidence
+From `/tmp/userspace-ha-failover-rg1-20260405-234145` during `RG1 node0 -> node1`:
+- old owner LAN RX stayed active: `11,607,881`
+- old owner fabric TX: `18,225,187`
+- new owner fabric RX: `18,342,238`
+- new owner WAN TX: `18,342,488`
+
+During the same handoff, `fw1` still showed `RXPkts 0` on all `ge-7-0-1` bindings, proving the promoted node was not the LAN ingress point for the flow.
+
+## Control experiment
+Moving `RG2` by itself immediately added `10.0.61.1/24` to `ge-7-0-1` on `fw1` and emitted the expected GARP/NA bursts there. So LAN ownership does move cleanly, but only when `RG2` moves.
+
+## Why this matters
+As long as LAN and WAN ownership are split across separate RGs, `RG1`-only failover/failback cannot be reduced to “both firewalls are always ready, just move MACs.” It remains a split-path HA mode that depends on fabric forwarding during the transition.
+
+## Follow-up options
+- couple `RG1` and `RG2` for the loss userspace validation topology
+- move the LAN-facing gateway/VIP into the same RG as the WAN side
+- teach the validator to treat `RG1`-only failover as a split-path test instead of an immediate full-path move
+
+
+---
+
+## #524 — userspace HA activation no longer re-prewarms split-RG synced sessions [CLOSED] (closed 2026-04-07)
+
+## Summary
+Current `origin/master` no longer invokes the helper's activation-time split-RG session prewarm path, even though the runtime still carries that code and tests rely on it.
+
+## Impact
+When an RG becomes active on a standby node, synced sessions already exist in shared state, but their reverse companions and USERSPACE_SESSIONS redirect entries are not recomputed/restored for the newly-active local forwarding topology. In split-RG failover/failback this leaves the promoted node short of immediately-usable reverse/session redirect state and long-lived TCP streams collapse or tail badly after the ownership move.
+
+## Evidence
+- `userspace-dp/src/afxdp/shared_ops.rs` still contains `prewarm_reverse_synced_sessions_for_owner_rgs()` and `republish_bpf_session_entries_for_owner_rgs()` with comments saying they run on RG activation.
+- `userspace-dp/src/afxdp/session_glue.rs` still has split-RG tests for that activation behavior.
+- `userspace-dp/src/afxdp/ha.rs:update_ha_state()` on current master only bumps epochs/logs activation; it never calls either helper.
+- Earlier commit `4a9d9fd2` explicitly wired RG activation to those paths, but that runtime call site is gone on current master.
+
+## Desired fix
+Restore activation-time reverse prewarm and USERSPACE_SESSIONS republish for activated RGs, without bringing back the removed worker-wide HA refresh/apply scan.
+
+
+---
+
+## #525 — userspace HA readiness overstates standby session usability [CLOSED] (closed 2026-04-07)
+
+## Summary
+Current HA readiness and sync accounting can report the standby as ready even when helper-side session mirroring failed.
+
+## Evidence
+- `pkg/dataplane/userspace/manager_ha.go:TakeoverReady()` only checks helper process/enabled state, forwarding armed/supported, mode, and XSK liveness.
+- `SetClusterSyncedSessionV4()` / `SetClusterSyncedSessionV6()` install the BPF session first, then treat helper mirroring as best-effort and swallow `syncSession*Locked()` errors with `"userspace: session mirror failed"` debug logs.
+- `pkg/cluster/sync.go` increments `SessionsInstalled` when those methods return `nil`, so HA barrier/readiness stats can claim sessions were installed even if the helper never accepted the mirror.
+
+## Impact
+A node can satisfy current `TakeoverReady()` and barrier accounting while still lacking immediately-usable helper SessionTable state for some synced flows. That makes "both firewalls are ready immediately" untrue in practice.
+
+## Desired fix
+Make helper session usability part of userspace HA readiness and/or stop counting mirrored sessions as installed when helper mirroring fails.
+
+
+---
+
+## #526 — split-RG userspace fabric transit is lab-limited on loss cluster [CLOSED] (closed 2026-04-07)
+
+## Summary
+On the isolated `loss` userspace cluster, split-RG throughput is strongly limited by the lab topology: cross-chassis traffic uses a `virtio` inter-firewall path because the lab does not have enough 25G NICs to dedicate native fabric links for every path.
+
+## Context
+This makes split ownership (`RG1` on one node, `RG2` on the other) a continuity/correctness test on `loss`, not a trustworthy throughput benchmark for production HA behavior.
+
+## Evidence
+Live tests on 2026-04-06 after deploying the `fix/ha-activation-prewarm` branch:
+
+- split ownership (`RG1=node1`, `RG2=node0`): `iperf3 -c 172.16.80.200 -P 4 -t 20 -J` averaged `2.27 Gbps`, peaked at `2.95 Gbps`, tailed to `0.76 Gbps`, with `6499` retransmits and `2` zero-rate streams
+- direct `RG1 node0 -> node1` failover under load no longer produced zero-rate collapse, but throughput still dropped from about `19 Gbps` to about `3.5 Gbps` immediately after the handoff and stayed there while the path remained split
+- direct ownership on `node0` is much higher (`15.49 Gbps`, `0` retransmits), so the split-RG result is dominated by the lab fabric path
+
+## Impact
+Keep using split-RG on `loss` as a failover continuity and correctness test, but do not treat its throughput as a blocking dataplane performance signal by itself.
+
+## Follow-on
+The remaining production-relevant bugs are tracked separately:
+- #525 userspace HA readiness overstates standby session usability
+- #527 userspace direct forwarding on `node1` underperforms `node0`
+
+
+---
+
+## #527 — userspace HA direct handoff still stacks stale ownership and local manual state on loss cluster [CLOSED] (closed 2026-04-07)
+
+## Summary
+On the `loss` userspace cluster, direct HA handoff was still not behaving like an immediate ownership move between two forwarding-ready firewalls.
+
+Two distinct control-plane bugs were involved:
+- direct VIP ownership could remain on the demoted node after the cluster state already said the RG moved
+- local manual failover stayed parked in `secondary-hold` even after the peer had already become primary, so later failovers/failbacks ran on top of stale operator hold state
+
+## Evidence
+Live testing on 2026-04-06 showed:
+- host LAN neighbor `10.0.61.1` could keep the old MAC after ownership change until direct VIP reconciliation ran
+- after `request chassis cluster failover redundancy-group 1 node 1` and `... group 2 node 1`, the demoted node still showed `secondary-hold Manual yes` instead of settling to ordinary `secondary`
+- repeated failover/failback sequences without `request chassis cluster reset redundancy-group ...` were materially less reliable than the same sequence after a manual reset
+
+## Impact
+Even when both RG1 and RG2 should move together, failover was not a clean "move ownership and keep forwarding" transition. The standby/return path had to recover from stale VIP ownership and stale local manual-failover state.
+
+## Desired fix
+- reconcile direct VIP ownership from actual cluster ownership on every pass, not only edge-triggered RG activity transitions
+- once a local manual transfer-out is confirmed by peer-primary state, settle the demoted node to ordinary `secondary` instead of leaving it parked in `secondary-hold`
+- keep later failovers/failbacks working without manual reset commands in between
+
+## Related
+- `#525` tracks truthful userspace standby readiness
+- `#526` is only the split-RG `virtio` lab limitation and is not the direct-handoff bug
+
+
+---
+
+## #532 — loss userspace HA no longer returns IPv6 TTL-expired probe responses [CLOSED] (closed 2026-04-07)
+
+## Summary
+On April 6, 2026, after deploying `origin/master` `0ac66d53` to the `loss` userspace HA cluster, the steady-state HA validator failed immediately because the deterministic IPv6 TTL-expired probe stopped returning `Time Exceeded`.
+
+## Evidence
+Steady-state validator command:
+
+```bash
+BPFRX_CLUSTER_ENV=test/incus/loss-userspace-cluster.env \
+RUNS=3 DURATION=5 PARALLEL=4 \
+PREFERRED_ACTIVE_NODE=0 \
+PREFERRED_ACTIVE_RGS="1 2" \
+scripts/userspace-ha-validation.sh
+```
+
+Failure:
+
+```text
+ERROR: ipv6 TTL=1 probe did not return time-exceeded: PING 2607:f8b0:4005:814::200e ... 1 packets transmitted, 0 received, 100% packet loss
+```
+
+Manual confirmation from `loss:cluster-userspace-host`:
+
+```bash
+ping6 -c 1 -t 1 2607:f8b0:4005:814::200e
+```
+
+Result:
+
+```text
+1 packets transmitted, 0 received, 100% packet loss
+```
+
+This is not generic IPv6 reachability loss:
+- `ping6 -c 1 2001:559:8585:80::200` still succeeds
+- a paired full-RG IPv6 failover/failback `iperf3 -6 -P4` run still completed with traffic moving end-to-end
+
+## Impact
+- `scripts/userspace-ha-validation.sh` cannot complete on the deployed tree because it fails before the throughput gates
+- the active userspace path is no longer producing the expected ICMPv6 TTL-expired signal for the first hop
+
+
+*(truncated — 43 lines total)*
+
+
+---
+
+## #533 — loss userspace HA validator blocks because standby session-sync idle never drains [CLOSED] (closed 2026-04-07)
+
+## Summary
+On April 6, 2026, the stock userspace HA failover validator on `loss` could not get past its pre-traffic idle gate because the standby firewall kept reporting received session installs while `Session delta drained` stayed at `0`.
+
+## Evidence
+Failover validator command:
+
+```bash
+BPFRX_CLUSTER_ENV=test/incus/loss-userspace-cluster.env \
+IPERF_TARGET=172.16.80.200 \
+TOTAL_CYCLES=3 CYCLE_INTERVAL=10 \
+scripts/userspace-ha-failover-validation.sh --duration 210 --parallel 4
+```
+
+Failure:
+
+```text
+FAIL  pre-traffic: session sync did not become idle before timeout (source_sent=367 target_recv=387 target_delta_drained=0)
+```
+
+Standby (`fw1`) sync/accounting before the pre-traffic timeout:
+
+```text
+Session create received: 266 -> 387
+Sessions installed:      387
+Session delta pending:   2
+Session delta generated: 2
+Session delta drained:   0
+```
+
+Active (`fw0`) side over the same window:
+
+```text
+Session create sent:     246 -> 367
+Session delta pending:   3 -> 4
+Session delta generated: 85 -> 142
+Session delta drained:   82 -> 138
+```
+
+So the active side still drains deltas, but the standby side never advances `Session delta drained` even while session installs continue and the validator waits for idle.
+
+
+*(truncated — 50 lines total)*
+
+
+---
+
+## #534 — paired full-RG userspace HA handoff remains transport-unstable under load on loss [CLOSED] (closed 2026-04-07)
+
+## Summary
+On April 6, 2026, paired full-RG (`RG1` + `RG2`) failover/failback on the `loss` userspace HA cluster still did not behave like a clean ownership move between two forwarding-ready firewalls.
+
+The manual failover commands return quickly and cluster ownership lands where it should, but long-lived TCP quality across the transition is still wildly unstable: retransmits spike, streams hit zero-rate intervals, and identical handoff sequences vary from acceptable to nearly unusable.
+
+## Evidence
+Same deployed build and topology, no failover baseline:
+
+```text
+IPv4 baseline, 15s, -P4: avg 11.57 Gbps, retransmits 23,778, zero intervals 0
+```
+
+Paired full-RG failover/failback runs:
+
+```text
+IPv4 run A, 220s: avg 11.73 Gbps, retransmits 376,266, zero_intervals_total 188, zero_streams_total 3
+IPv4 run B, 55s:  avg 12.90 Gbps, retransmits 56,849,  zero_streams_total 1
+IPv4 run C, 70s:  avg 1.08 Gbps,  retransmits 96,548,  zero_intervals_total 218, zero_streams_total 4
+IPv6 run,   70s:  avg 11.62 Gbps, retransmits 67,739,  zero_streams_total 2
+```
+
+The same paired-RG move sequence therefore ranged from:
+- mostly surviving with heavy retransmits
+- to collapsing for most of the run and only recovering to about `1.7-1.9 Gbps`
+
+The operator-visible failover path itself was not the problem in these runs:
+- `request chassis cluster failover redundancy-group 1 node 1` and `... group 2 node 1` completed in about `0.17s` to `0.25s`
+- the matching failback commands also returned quickly
+- cluster ownership ended in the requested state each time
+
+Additional dataplane evidence from the 220s paired run while traffic quality degraded:
+
+```text
+fw1 Direct TX no-frame fb: 18,636 -> 21,422 before failover, 23,773 after failover, 42,878 after failback
+fw1 Neighbor misses after failover: 34
+fw1 Session misses after failover: 310
+fw0 Policy denied packets after failover: 741
+fw0 Last resolution after failover: ha_inactive ... zones=wan->wan
+```
+
+
+*(truncated — 57 lines total)*
+
+
+---
+
+## #535 — paired data-RG handoff is still sequential and exposes a split-RG loss window on loss [CLOSED] (closed 2026-04-07)
+
+## Summary
+A paired full-data-RG failover/failback on the `loss` userspace cluster is still executed one RG at a time, so every "full" move briefly becomes a split-RG move in the middle.
+
+On this lab, that transient split-RG state is enough to create a measurable packet-loss window on established TCP streams even when the final ownership is correct and both CLI commands return quickly.
+
+## Evidence
+Server-only capture run on April 6, 2026:
+- artifacts: `/tmp/serveronly-ha-20260406-202637`
+- test shape: IPv4 `iperf3 -P4 -t70`, warm for 10s, then `RG1->node1`, `RG2->node1`, later `RG1->node0`, `RG2->node0`
+- metrics: `12.39 Gbps` average, `63,748` retransmits, `15` zero intervals
+
+Command timing from that run:
+- `RG1 -> node1` at `2026-04-06T20:26:50.034568665-07:00`
+- `RG2 -> node1` at `2026-04-06T20:26:51.223239089-07:00`
+- `RG1 -> node0` at `2026-04-06T20:27:16.394654872-07:00`
+- `RG2 -> node0` at `2026-04-06T20:27:17.578615187-07:00`
+
+Packet-level result from the same server capture:
+- stream `39040` had a max gap of `1.491359s`
+- stream `39050` had a max gap of `1.488681s`
+- both of those gaps occurred during the first handoff window, starting after the `RG1` move and ending after the `RG2` move
+- stream `39026` had a max gap of `0.436401s`
+- stream `39044` had a max gap of `0.432250s`
+- both of those gaps occurred during failback, after the `RG1` move and before the `RG2` move
+
+The same 4-tuples resumed after the gap, with no RSTs:
+- no `Flags [R` packets were present for the affected ports in the server capture
+- the server instead saw SACK/duplicate-data behavior and the client retransmitted the same sequence ranges on the same ports after the gap
+
+So the transport hit is not a tuple rewrite bug or a new connection. It is an in-flight packet loss window while the supposedly paired move is temporarily split.
+
+## Impact
+Even if operators intend to move both data RGs together, the current CLI/API semantics still expose the lab's split-RG transit path during the handoff itself.
+
+That means:
+- `#526` still bleeds into "full RG pair" failover testing on `loss`
+- long-lived TCP quality depends on how badly that brief split window hits congestion control and retransmission timers
+- run-to-run variance in `#534` is expected as long as the pair move is not atomic
+
+## Desired fix
+
+*(truncated — 51 lines total)*
+
+
+---
+
+## #536 — full data failover still drops packets during VIP/MAC ownership move [CLOSED] (closed 2026-04-07)
+
+## Summary
+After replacing the old sequential RG1->RG2 / RG2->RG1 handoff with a single batched data-RG transfer, full data failover/failback on `loss` no longer hits the earlier split-RG blackout window. But there is still a shorter packet-loss burst at the exact ownership move, and on a bad run one TCP stream can fall into long retransmission timeout after failback.
+
+## Evidence
+Branch under test: `fix/535-batch-data-rg-failover`
+
+Cleaner batched run with server + WAN capture:
+- artifact: `/tmp/manual-ha-data-capture-20260406-205558`
+- command path:
+  - `request chassis cluster failover data node 1`
+  - `request chassis cluster failover data node 0`
+- both commands returned:
+  - `Manual failover completed for data redundancy groups [1 2] (transfer committed)`
+- cluster state after run restored cleanly to `RG1=node0`, `RG2=node0`
+- iperf summary:
+  - `15.679 Gbps` average
+  - `1,416,012` retransmits
+  - `0` zero-throughput intervals
+  - dips exactly at the handoff windows:
+    - failover timestamp `2026-04-06T20:56:09.135820426-07:00`
+    - failback timestamp `2026-04-06T20:56:34.322286721-07:00`
+    - interval `10-11s`: total `5.18 Gbps`
+    - interval `35-36s`: total `4.20 Gbps`
+
+Bad batched run without capture overhead:
+- artifact: `/tmp/manual-ha-data-stream-20260406-205351`
+- same command path and same successful command output
+- iperf summary:
+  - `15.632 Gbps` average
+  - `601,299` retransmits
+  - `34` zero stream intervals on exactly one stream
+- the bad stream starts failing immediately after failback:
+  - failback timestamp `2026-04-06T20:54:27.255108811-07:00`
+  - interval `35.001-36.000`: all streams dip
+  - interval `36.000-37.001`: socket `9` drops to `0.0 Gbps`
+  - sockets `5/7/11` recover, socket `9` stays at `0.0 Gbps` for the rest of the run
+- there were no aggregate zero intervals and no new connections; this is one stream entering a long RTO tail after the move
+
+Additional capture signal from the good run:
+- no `Flags [R` packets were present in the server capture
+
+*(truncated — 65 lines total)*
+
+
+---
+
+## #540 — session sync can stay disconnected after standby restart on loss [CLOSED] (closed 2026-04-07)
+
+## Summary
+On the loss userspace cluster, restarting the secondary can leave `show chassis cluster status` stuck at `Transfer ready: no (session sync disconnected)` on the standby even though the primary is otherwise healthy.
+
+## Root cause
+Session sync currently treats an established outbound TCP socket as connected until the kernel tears it down. When the passive node restarts, the active node can keep the stale socket long enough that it never redials promptly. Because only one side initiates the session-sync TCP connection, the standby stays disconnected.
+
+A naive silence timeout is not enough by itself because the primary can legitimately see one-way steady-state traffic while the standby is only receiving session updates.
+
+## Reproduction
+1. Deploy current master to `loss-userspace-cluster`.
+2. Restart `bpfrxd` only on `bpfrx-userspace-fw1`.
+3. Observe `show chassis cluster status` on `fw1` report `Transfer ready: no (session sync disconnected)` and no new established `:4785` socket.
+
+## Expected
+After a standby restart, the primary should actively prove reverse-path liveness and reconnect session sync without leaving the standby stuck disconnected.
+
+---
+
+## #545 — refactor: split pkg/config/compiler.go (5878 lines) by config domain [CLOSED] (closed 2026-04-07)
+
+**Priority: P1** — Cleanest split, each stanza compiler is independent. Split into ~8 files by Junos domain. See docs/refactoring-audit.md §3.
+
+---
+
+## #546 — refactor: split pkg/daemon/daemon_ha.go (4194 lines, 125 functions) [CLOSED] (closed 2026-04-07)
+
+**Priority: P1** — Most complex file, clear domain boundaries. Split into sync callbacks, userspace session conversion, fabric IPVLAN, VIP ownership. See docs/refactoring-audit.md §7.
+
+---
+
+## #547 — refactor: split pkg/grpcapi/server.go (8411 lines) by RPC domain [CLOSED] (closed 2026-04-07)
+
+**Priority: P1** — Largest file, server_sessions.go already exists as precedent. Split into ~8 files by RPC domain. See docs/refactoring-audit.md §1.
+
+---
+
+## #548 — refactor: split pkg/cli/cli_show.go (7887 lines) by show domain [CLOSED] (closed 2026-04-12)
+
+**Priority: P2** — Split `pkg/cli/cli_show.go` by show domain, but do it only after `#552` extracts shared CLI dispatch/helpers.
+
+Target files:
+- `cli_show_security.go`
+- `cli_show_nat.go`
+- `cli_show_flow.go`
+- `cli_show_routing.go`
+- `cli_show_interfaces.go`
+- `cli_show_system.go`
+- `cli_show_cluster.go`
+- `cli_show_services.go`
+
+Keep common render/session/filter helpers in shared CLI files. First PR should be move-only with no behavior changes.
+
+
+---
+
+## #549 — refactor: split pkg/daemon/daemon.go (4506 lines) system config functions [CLOSED] (closed 2026-04-13)
+
+**Priority: P2** — Split `pkg/daemon/daemon.go` by subsystem with a move-only first pass.
+
+Target files:
+- `daemon_system.go` for hostname, DNS, NTP, SSH, timezone, syslog, and login
+- `daemon_reth.go`
+- `daemon_neighbor.go`
+- `daemon_flow.go`
+- `daemon_nft.go`
+- `daemon_cluster_bind.go` for cluster bind-address selection helpers
+
+Keep `Run()` and top-level daemon lifecycle wiring in `daemon.go`.
+
+
+---
+
+## #550 — refactor: split pkg/dataplane/userspace/manager.go (4772 lines) [CLOSED] (closed 2026-04-13)
+
+**Priority: P2** — Split `pkg/dataplane/userspace/manager.go` in stages.
+
+Recommended sequence:
+1. Move pure snapshot builders into `snapshot.go`
+2. Move BPF/map synchronization into `maps_sync.go`
+3. Move helper/process lifecycle into `process.go`
+4. Extract `capability.go` only if it stays small and independent
+
+Keep small shared types/helpers and top-level entrypoints in `manager.go`. First PR should be move-only with no dataplane behavior changes.
+
+
+---
+
+## #551 — refactor: split pkg/cluster/sync.go remaining protocol/conn/failover paths [CLOSED] (closed 2026-04-13)
+
+**Priority: P2** — Current master already has `sync_bulk.go` and `failover_batch.go`, so this issue is now the remaining split for `pkg/cluster/sync.go`.
+
+Target files:
+- `sync_protocol.go` for message constants, header, and encode/decode helpers
+- `sync_conn.go` for dial/accept/send/receive/disconnect lifecycle
+- `sync_failover.go` for manual failover request/ack/commit/waiters
+
+Leave bulk sync logic in `sync_bulk.go`. First PR should be move-only and preserve wire behavior exactly.
+
+
+---
+
+## #552 — refactor: split pkg/cli/cli.go (4874 lines) dispatch and handlers [CLOSED] (closed 2026-04-13)
+
+**Priority: P2** — Split `pkg/cli/cli.go` by command-dispatch responsibility before touching `cli_show.go` or `cmd/cli/main.go`.
+
+Target files:
+- `cli_dispatch.go`
+- `cli_request.go`
+- `cli_clear.go`
+- `cli_config.go`
+- `cli_helpers.go`
+
+This issue should land before `#548` and `#554` so shared parsing and completion logic is not duplicated.
+
+
+---
+
+## #553 — refactor: split pkg/config/ast.go into groups/edit/format paths [CLOSED] (closed 2026-04-13)
+
+**Priority: P3** — `pkg/config/ast.go` currently mixes tree types/navigation, group expansion, path editing, and formatting.
+
+Split into:
+- `ast_groups.go` for apply-groups expansion
+- `ast_edit.go` for set/delete/copy/rename/insert path mutation
+- `ast_format.go` for hierarchical/set/JSON/XML/inheritance formatting
+
+Keep core types, navigation helpers, and schema-completion helpers in `ast.go`. First PR should be move-only.
+
+
+---
+
+## #554 — refactor: split cmd/cli/main.go (3623 lines) [CLOSED] (closed 2026-04-13)
+
+**Priority: P3** — Split `cmd/cli/main.go` by remote command family, but do it after `#552` and ideally after `#548` so local and remote command shapes stay aligned.
+
+Target files:
+- `show.go`
+- `request.go`
+- `clear.go`
+- `monitor.go`
+- one small shared transport/helper file as needed
+
+Keep `main()` and top-level wiring in `main.go`.
+
+
+---
+
+## #555 — refactor: split pkg/config/parser_test.go by subsystem [CLOSED] (closed 2026-04-13)
+
+**Priority: P3** — `pkg/config/parser_test.go` is too large for only a 2-way split.
+
+Split by subsystem instead:
+- `parser_ast_test.go`
+- `parser_system_test.go`
+- `parser_security_test.go`
+- `parser_routing_test.go`
+- `parser_services_test.go`
+- `parser_cluster_test.go`
+
+Preserve existing test names where possible to keep blame/history easy to follow.
+
+
+---
+
+## #556 — refactor: reduce userspace-dp/src/afxdp.rs root module [CLOSED] (closed 2026-04-13)
+
+**Priority: P3** — Current master already has many `afxdp/*` submodules. The remaining work is to shrink the root `userspace-dp/src/afxdp.rs`.
+
+Target files:
+- `coordinator.rs` for the large `Coordinator` implementation
+- `worker.rs` for `BindingWorker` and `worker_loop`
+- `tests.rs` (or equivalent) for the in-file `#[cfg(test)] mod tests`
+
+Keep `afxdp.rs` as module wiring, re-exports, and shared top-level constants only. First PR should be move-only with no dataplane behavior changes.
+
+
+---
+
+## #560 — native GRE local tunnel source loop spins on permanent gr-0-0-0 errors [CLOSED] (closed 2026-04-07)
+
+## Summary
+On the loss userspace cluster, the helpers can burn CPU on both firewalls even when the data RGs stay on `fw0`, because the native-GRE local tunnel source loop keeps retrying permanent `gr-0-0-0` file-descriptor failures.
+
+## Live evidence
+Before the fix, `show chassis cluster data-plane interfaces` repeatedly reported hard tunnel errors:
+
+- `fw1`: `read_local_tunnel:File descriptor in bad state (os error 77)`
+- `fw0`: `write_local_tunnel_delivery:Invalid argument (os error 22)`
+
+At the same time, per-thread `top -H` showed the native-GRE helper thread (`bpfrx-n+`) alive on both nodes and consuming CPU.
+
+A controlled standby delta check showed pure IPv4/IPv6 iperf itself was not the main both-node dataplane path:
+
+- standby `fw1` delta during IPv4 iperf: `RX packets +0`, `TX packets +0`
+- standby `fw1` delta during IPv6 iperf: `RX packets +1`, `TX packets +1`
+
+So the reproducible both-firewall CPU issue is the local tunnel source loop, not ordinary HA forwarding.
+
+## Root cause
+`local_tunnel_source_loop()` treats permanent local tunnel I/O failures like retryable transient errors. For `gr-0-0-0`, that leaves the thread sleeping briefly and then retrying forever on errors that will never recover.
+
+## Expected
+A permanent local tunnel FD failure should retire the local tunnel source thread instead of spinning forever.
+
+## Actual
+The helper keeps the thread alive and keeps retrying on permanent `EINVAL` / `EBADF` / `EBADFD` / `ENODEV` / `ENXIO` class failures.
+
+
+---
+
+## #562 — userspace HA sync leaks transient missing-neighbor seed sessions across failover [CLOSED] (closed 2026-04-07)
+
+## Summary
+Transient `MissingNeighborSeed` sessions are still treated like authoritative HA session state. On `loss`, RG1 failover/failback under load can leave some long-lived flows stuck at `0` because the peer learns scratch missing-neighbor sessions instead of only real forward sessions.
+
+## Reproduction
+1. Deploy clean `origin/master` `223d9118` to `loss-userspace-cluster`.
+2. Run:
+   `BPFRX_CLUSTER_ENV=test/incus/loss-userspace-cluster.env IPERF_TARGET=172.16.80.200 TOTAL_CYCLES=3 CYCLE_INTERVAL=10 scripts/userspace-ha-failover-validation.sh --duration 210 --parallel 4`
+3. Observe repeated failback/failover stream collapse and session miss spikes.
+
+Artifact: `/tmp/userspace-ha-failover-rg1-20260407-064553`
+
+## Evidence
+During `cycle1` failback, only two iperf forward flows reappear on the active owner as `shared_promote`, while the dead streams repeatedly re-open on the other firewall as `missing_neighbor_seed`:
+- survivors: `10.0.61.102:60088` and `10.0.61.102:60104`
+- dead streams: `172.16.80.8:60116` and `172.16.80.8:60130`
+
+Examples:
+- `/tmp/userspace-ha-failover-rg1-20260407-064553/cycle1-failback-watch07-fw1-dp-interfaces.txt`
+- `/tmp/userspace-ha-failover-rg1-20260407-064553/cycle1-failback-watch05-fw0-dp-interfaces.txt`
+
+Current master emits open deltas for `MissingNeighborSeed`, accepts them in userspace session sync, and can re-export them during owner-RG export if they later resolve to a forwarding disposition. That lets a transient neighbor-repair scratch entry escape the local box and pollute HA state.
+
+## Expected
+`MissingNeighborSeed` should stay local-only scratch state for neighbor repair. It should not be sent over userspace HA sync and should not be exported as authoritative failover state.
+
+
+---
+
+## #564 — idle standby userspace XSK liveness never settles takeover-ready on a fully bound standby [CLOSED] (closed 2026-04-07)
+
+## Summary
+On the `loss` userspace HA cluster, a fully bound standby can stay stuck at `Takeover ready: no (userspace XSK liveness not proven)` even when it is otherwise healthy. The current idle-probe logic keeps extending the XSK liveness probe forever unless incidental RX arrives.
+
+## Evidence
+- validator blocked before explicit RG failover: `/tmp/userspace-ha-failover-rg1-20260407-072056`
+- cluster status on standby reported `Transfer ready: yes` but `Takeover ready: no (userspace XSK liveness not proven)`
+- after instrumenting the probe path, the standby was fully bound and idle, but the idle-extension loop never converged
+
+## Expected
+A fully bound standby with no active data RGs should be able to prove readiness without waiting for incidental traffic.
+
+## Impact
+Explicit failover can be blocked indefinitely on an otherwise healthy standby, and standby readiness is overstated/understated depending on incidental packet arrival.
+
+---
+
+## #565 — userspace HA demotion leaves worker-local owner-RG sessions active across failover cycles [CLOSED] (closed 2026-04-07)
+
+## Summary
+During repeated userspace HA failover on the `loss` cluster, shared HA state demotes old owner-RG sessions, but each worker's local `SessionTable` keeps those sessions as local entries. On later cycles the stale local entries can be re-exported as fresh deltas and collide with the preserved peer-synced state.
+
+## Evidence
+- live failover artifacts: `/tmp/userspace-ha-failover-rg1-20260407-070350`
+- one stream survives the first handoff but later cycles collapse again even though shared-map demotion ran
+- `SessionTable::demote_owner_rg()` exists but was not used in the worker HA path
+
+## Expected
+When HA demotes one or more owner RGs, every worker should demote matching local sessions before any later export/replay path can see them.
+
+## Impact
+Repeated failover/failback can resurrect stale owner-RG sessions and destabilize long-lived TCP flows.
+
+
+---
+
+## #568 — inactive owner still promotes translated peer-synced forward hits into local sessions [CLOSED] (closed 2026-04-07)
+
+## Summary
+Repeated RG1 failover on the `loss` userspace HA cluster can still kill one long-lived TCP stream even after standby readiness and worker demotion fixes. The remaining failure is a translated forward-session promotion bug on the inactive owner.
+
+## Evidence
+- integrated validation artifact: `/tmp/userspace-ha-failover-rg1-20260407-075136`
+- stream `socket 11` / client port `38416` is the only stream with `53` zero-throughput intervals
+- the old owner keeps a bogus local translated session for that same flow:
+  - `In: 172.16.80.8/38416 --> 172.16.80.200/5201`
+  - reverse port is `0`
+  - session appears as `Session ID: 1` backup/local noise alongside the correct peer-synced `10.0.61.102/38416 -> 172.16.80.200/5201` entry
+- code path: `should_keep_synced_hit_transient()` only suppresses translated synced-hit promotion when ingress is fabric, so a stray non-fabric hit on an inactive owner can still promote translated peer state into a local session
+
+## Expected
+Translated peer-synced forward hits on an inactive owner should stay transient regardless of ingress interface. Seeing a stray packet on the old owner must not create or refresh a local translated forward session.
+
+## Impact
+One stream can be poisoned across later failover cycles even though ownership moves and general readiness are otherwise healthy.
+
+
+---
+
+## #570 — inactive owner still installs new LAN->WAN sessions locally after RG failover [CLOSED] (closed 2026-04-07)
+
+## Summary
+After RG1 failover on the loss userspace cluster, the old owner can still install brand-new `ForwardFlow` LAN->WAN sessions locally and transmit directly out the WAN binding instead of fabric-redirecting those packets to the new owner.
+
+## Evidence
+- Full validator artifact: `/tmp/userspace-ha-failover-rg1-20260407-080630`
+- Cycle 1 failover showed `fw0` old-owner LAN RX delta `2072142`, but only `19` packets reached the new owner over fabric and all 4 iperf streams dropped to `0.00 bits/sec`.
+- `cycle1-failover-fw0-dp-interfaces.txt` shows old-owner direct forwarding continuing on `ge-0-0-2` after `rg1 active=false`.
+- `cycle1-failover-fw0-dp-interfaces.txt` also shows fresh session deltas on the old owner for the 4 iperf flows with `origin=forward_flow`, meaning this is the cold session-install path, not just stale cached state.
+
+## Root cause
+In `userspace-dp/src/afxdp.rs`, the new-flow path branches on `resolution.disposition == ForwardCandidate` before applying HA enforcement and fabric redirect conversion. Session-hit paths already run through `enforce_session_ha_resolution()` plus `redirect_session_via_fabric_if_needed()`, but brand-new flows did not, so the inactive owner could still resolve a WAN path locally and install it.
+
+## Expected behavior
+On a non-fabric ingress packet whose egress owner RG is inactive locally, new flow installation must use the same HA-enforced resolution as session hits: `HAInactive` should convert to zone-encoded `FabricRedirect`, not local WAN forwarding.
+
+
+---
+
+## #572 — HA standby can remain WAN-neighbor cold after startup and drop first redirected packets on failover [CLOSED] (closed 2026-04-07)
+
+## Summary
+After the stale-owner forwarding fixes, the remaining loss on `loss` HA failover is on the promoted node: the first translated WAN packets sometimes arrive over fabric and hit `missing_neighbor` even though the standby already reports takeover-ready.
+
+## Evidence
+- Artifact: `/tmp/userspace-ha-failover-rg1-20260407-082151`
+- Cycle 1 failover on `fw1` shows repeated `missing_neighbor` exceptions for translated flows:
+  - `172.16.80.8:44630 -> 172.16.80.200:5201`
+  - `172.16.80.8:44642 -> 172.16.80.200:5201`
+- In the same run, ownership forwarding was otherwise correct:
+  - old owner `lan-rx=7879032 fabric-tx=11332204`
+  - new owner `fabric-rx=11384709 wan-tx=11385221`
+- `Takeover ready: yes` / `Transfer ready: yes` was already true before the move.
+
+## Root cause
+The manager only runs proactive neighbor resolution during the helper's first 60 seconds of life. After that, HA standby nodes rely on passive kernel/helper neighbor learning. A long-idle standby can therefore remain forwarding-armed and XSK-ready while still lacking the WAN next-hop entry needed for the first redirected packets after failover.
+
+## Expected
+A forwarding-ready HA standby should keep directly-connected next-hop neighbor resolution warm enough that the first redirected WAN packets do not hit `missing_neighbor`.
+
+## Direction
+Keep a throttled standby-only neighbor prewarm running after startup while the node is an armed HA standby with data RGs configured. Do not reintroduce activation-time bootstrap work inside `UpdateRGActive()`.
+
+
+---
+
+## #574 — HA demotion leaves stale USERSPACE_SESSIONS redirect aliases on the old owner [CLOSED] (closed 2026-04-07)
+
+## Summary
+When a userspace HA redundancy group demotes, the worker demotion path downgrades the in-memory session origin but does not clear the corresponding `USERSPACE_SESSIONS` BPF redirect aliases on the stale owner.
+
+## Evidence
+- Full loss-cluster failover run: `/tmp/userspace-ha-failover-rg1-20260407-083617`
+- In `cycle2-failover-post-fw0-dp-interfaces.txt`, the demoted node (`fw0`) still has massive WAN TX on `ge-0-0-2` after `rg1 active=false`.
+- The same artifact shows stale-owner session deltas reopening the iperf tuples as `origin=shared_promote` on LAN ingress after failover.
+- Helper HA state is already correct at that point: `cycle2-failover-fw0-dp-stats.txt` shows `rg1 active=false`, so this is not just a delayed HA-state update.
+
+## Root cause
+`WorkerCommand::DemoteOwnerRGS` returns demoted keys as `cancelled_keys`, but the worker loop only cancels queued flow work for those keys. It does not remove the old node's redirect entries from `USERSPACE_SESSIONS`, so XDP keeps steering packets to the stale owner even though the RG is no longer active there.
+
+## Expected behavior
+Demotion should keep the sessions in the standby table, but it must immediately remove the stale owner's BPF redirect aliases so packets stop being redirected to the old node after handoff.
+
+
+---
+
+## #575 — loss steady-state IPv6 default route falls back to discard via lo [CLOSED] (closed 2026-04-07)
+
+## Summary
+Steady-state external IPv6 on the `loss` userspace cluster is currently broken before failover even starts because the intended IPv6 static default route is not being installed, and the fallback discard route wins instead.
+
+## Evidence
+- Artifact: `/tmp/ipv6-rg1-repro-20260407-090657`
+- `cluster-userspace-host` baseline `ping -6` to the Internet fails 100% before failover.
+- `bpfrx-userspace-fw0` config still contains `route ::/0 { next-hop 2001:559:8585:50::1; }`.
+- `show route` on `fw0` shows the active route as `::/0 *[Static/20] > to discard via lo`.
+- `/etc/frr/frr.conf` on `fw0` contains:
+  - `ipv6 route ::/0 2001:559:8585:50::1 5`
+  - `ipv6 route ::/0 Null0 250`
+
+## Expected
+A configured IPv6 static route with a global next-hop on an on-link subnet should install as the active default route via the correct WAN interface.
+
+## Actual
+FRR is being fed a bare global IPv6 next-hop without an interface, the real route does not install on this topology, and the fallback `Null0` route becomes the active `::/0`.
+
+
+---
+
+## #576 — userspace HA demotion leaves stale BPF redirect aliases on old owner [CLOSED] (closed 2026-04-07)
+
+## Summary
+During live `loss` RG1 failover validation, the old owner could keep forwarding traffic locally after demotion because demoted sessions only cancelled queued TX and did not clear their `USERSPACE_SESSIONS` BPF redirect aliases.
+
+## Evidence
+- Artifact: `/tmp/userspace-ha-failover-rg1-20260407-085805`
+- Before the fix, old-owner traffic could continue hitting local redirect aliases after ownership moved.
+- After the local branch fix, the same validator showed the intended path on failover:
+  - old owner LAN RX with fabric TX
+  - new owner fabric RX with WAN TX
+  - `PASS cycle 1 failover: all 4 streams carrying traffic`
+
+## Expected
+When a session is demoted off a node during HA handoff, any corresponding `USERSPACE_SESSIONS` BPF redirect aliases on the old owner should be removed immediately so packets cannot keep getting redirected to the local XSK path.
+
+## Actual
+Demotion cancelled pending TX but left redirect aliases behind until later churn removed them, so the old owner could continue attracting and processing traffic incorrectly after failover.
+
+
+---
+
+## #579 — userspace-ha-validation can pick standby helper as active firewall [CLOSED] (closed 2026-04-07)
+
+## Summary
+The `userspace-ha-validation.sh` active-node probe can pick a standby helper node as the "active userspace firewall" because it returns the first VM with `Enabled:true`, even if that VM reports all HA groups `active=false`.
+
+## Evidence
+- On `loss`, `fw0` reported:
+  - `Enabled: true`
+  - `Forwarding supported: true`
+  - `HA groups: rg0 active=false; rg1 active=false; rg2 active=false`
+- At the same time, cluster status clearly showed `node1` as primary for RG1 and RG2.
+- The validator still chose `loss:bpfrx-userspace-fw0` as the active userspace firewall and then failed with:
+  - `ERROR: unable to detect WAN test interface for loss:bpfrx-userspace-fw0`
+
+## Expected
+The validator should identify the active userspace firewall by HA ownership first, then confirm that node's userspace runtime is enabled/ready.
+
+## Actual
+The probe scans VMs in fixed order and returns the first one with userspace enabled, which can be a standby helper node.
+
+
+---
+
+## #580 — standby userspace helper can wedge with XSK bindings stuck busy after restart [CLOSED] (closed 2026-04-07)
+
+## Summary
+After the restart/deploy cycle on `loss`, standby `fw0` can get stuck with userspace forwarding armed but no XSK bindings ever becoming ready, which blocks explicit failover back to that node.
+
+## Evidence
+- `show chassis cluster status` on `fw0` stays at:
+  - `Takeover ready: no (userspace XSK liveness not proven)` for RG1/RG2
+- Detailed userspace stats on `fw0` show the helper wedged:
+  - `Forwarding armed: true`
+  - `Bound bindings: 0/18`
+  - `XSK-registered bindings: 0/18`
+  - `Ready queues: 0/6`
+  - `Ready bindings: 0/18`
+- Logs show repeated binding repair and AF_XDP bind failures:
+  - `userspace: bindings watchdog repaired stale BPF map entries`
+  - `xsk_socket__create_shared(...): Device or resource busy — trying copy-mode`
+- Only one `bpfrx-userspace-dp` process is running, so this is not just an orphaned old helper process holding the socket.
+
+## Impact
+- `request chassis cluster failover data node 0` is rejected because RG1 is not ready on `node0`.
+- HA failover/failback testing cannot proceed reliably after restart/deploy because the standby dataplane never finishes rebinding.
+
+## Expected
+A standby helper restart should fully rebind XSKs and become takeover-ready once the helper is armed.
+
+## Actual
+The standby helper remains stuck unbound and keeps repairing stale binding state instead of recovering.
+
+
+---
+
+## #582 — HA readiness can stay false even when standby helper reports all bindings ready [CLOSED] (closed 2026-04-07)
+
+## Summary
+Standby HA readiness can remain false even when the userspace helper reports all queues and bindings ready, so explicit failover is rejected despite the standby dataplane already looking forwarding-ready.
+
+## Evidence
+Before a manual re-arm on `loss:bpfrx-userspace-fw0`, `show chassis cluster data-plane statistics` reported:
+- `Forwarding armed: true`
+- `Bound bindings: 18/18`
+- `XSK-registered bindings: 18/18`
+- `Ready queues: 6/6`
+- `Ready bindings: 18/18`
+
+At the same time, `show chassis cluster status` on the same node still reported:
+- `Takeover ready: no (userspace XSK liveness not proven)` for RG1 and RG2
+
+The explicit handoff was then rejected with:
+- `rpc error: code = FailedPrecondition desc = local redundancy group 1 not ready for explicit failover ... reasons=[userspace XSK liveness not proven]`
+
+## Expected
+If the userspace helper has all bindings and queues ready on the standby node, HA readiness should reflect that and allow explicit failover.
+
+## Actual
+Cluster readiness can stay stuck at `userspace XSK liveness not proven` even after the helper reports a fully ready standby dataplane.
+
+
+---
+
+## #584 — RG handoff leaves stale worker-local sessions on demoted owner [CLOSED] (closed 2026-04-07)
+
+## Summary
+During a real loss-cluster RG1 failover on the deployed integration build, the old owner keeps the existing iperf sessions in its worker SessionTables after RG1 demotion, but WAN ownership has already moved to the peer. Those stale local hits keep resolving as local WAN sessions instead of falling back to the peer-synced/shared fabric-redirect path, so old-owner LAN ingress mostly stops being forwarded across fabric.
+
+## Evidence
+- failover validator artifact: `/tmp/userspace-ha-failover-rg1-20260407-095532`
+- `cycle1-failover-fw0-status.txt`: RG1 demoted on node0 while RG2 stays active
+- `cycle1-failover-fw0-sessions.txt`: existing iperf sessions still present on fw0 after demotion
+- dataplane counters during failover: old-owner LAN RX rises by ~1.6M packets while old-owner fabric TX only rises by 87 packets
+- validator result: `4/4 streams at 0.00 bits/sec`, `session miss delta 168`, `50 zero-throughput intervals`
+
+## Suspected root cause
+The current userspace HA path demotes shared session replicas on RG handoff, but it no longer demotes or purges worker-local SessionTable entries for the demoted owner RG. Local lookups on the old owner therefore keep hitting stale forward sessions with local WAN resolution instead of re-resolving through the shared/synced split-RG fabric path.
+
+## Expected behavior
+When an owner RG demotes, any worker-local sessions owned by that RG must either:
+- be demoted to peer-synced/shared state so subsequent hits resolve through fabric redirect, or
+- be removed so the next packets miss locally and repopulate from the shared HA state.
+
+This needs to preserve paired-handoff fixes while restoring split-RG continuity on loss.
+
+---
+
+## #586 — HA failover validator idle gate requires counters to stop changing entirely [CLOSED] (closed 2026-04-07)
+
+## Summary
+On April 7, 2026, `scripts/userspace-ha-failover-validation.sh` still aborted a real RG1 failover run on `loss` even though session sync was caught up. The standby had received all outstanding session creates and had `Session delta pending: 0`, but the script failed because it requires three cumulative counters to remain identical across consecutive samples.
+
+## Evidence
+Artifact: `/tmp/userspace-ha-failover-rg1-20260407-101026`
+
+Failure:
+```text
+FAIL  pre-failover: session sync did not become idle before timeout (source_sent=60 target_recv=60 target_delta_drained=214)
+```
+
+Captured sync snapshots from that same failure:
+
+Source `pre-failover-source-fw0-sync.txt`
+- `Session create sent: 60`
+- `Session delta pending: 1`
+
+Target `pre-failover-target-fw1-sync.txt`
+- `Session create received: 60`
+- `Session delta pending: 0`
+- `Session delta drained: 214`
+
+At that point the source and target were caught up, and the target had no pending delta work. The validator still failed because `wait_for_session_sync_idle()` only succeeds when `source_sent`, `target_recv`, and `Session delta drained` are all unchanged across consecutive samples.
+
+## Root cause
+The current idle gate is checking for total counter stability rather than actual sync quiescence. Under background churn, the cumulative counters can continue increasing in lockstep while the standby remains fully caught up.
+
+## Expected behavior
+Treat session sync as idle when the standby is caught up, for example when:
+- `source_sent == target_recv`
+- standby `Session delta pending == 0`
+
+The gate should not require cumulative counters like `Session delta drained` to stop changing entirely.
+
+---
+
+## #587 — RG1 failover can drop external IPv4 while promoted owner still resolves WAN neighbors late [CLOSED] (closed 2026-04-07)
+
+## Summary
+During real `loss-userspace-cluster` HA validation, `RG1 node0 -> node1` can keep IPv6 external reachability up while IPv4 external reachability drops completely on the promoted owner.
+
+## Repro
+- deploy the current combined HA validation build to `loss`
+- run:
+  `BPFRX_CLUSTER_ENV=test/incus/loss-userspace-cluster.env TOTAL_CYCLES=1 CYCLE_INTERVAL=10 /tmp/bpfrx-pr586/scripts/userspace-ha-failover-validation.sh --rg 1 --source-node 0 --target-node 1 --duration 60 --parallel 4`
+
+## Evidence
+Artifact: `/tmp/userspace-ha-failover-rg1-20260407-101426`
+
+Failover result:
+- `FAIL cycle1-failover: external IPv4 unreachable (1.1.1.1)`
+- `PASS cycle1-failover: external IPv6 reachable (2606:4700:4700::1111)`
+
+`external-cycle1-failover-ipv4.txt`:
+- `4 packets transmitted, 0 received, 100% packet loss`
+
+Promoted owner (`cycle1-failover-fw1-dp-stats.txt`):
+- `HA groups: rg1 active=true`
+- `Last resolution: missing_neighbor ingress-ifindex=4 egress-ifindex=14 next-hop=172.16.80.200 flow=172.16.80.8:55280->172.16.80.200:5201 zones=lan->wan`
+- `Neighbor misses: 311`
+- `Policy denied packets: 0`
+
+Demoted owner (`cycle1-failover-fw0-dp-stats.txt`):
+- `Policy denied packets: 4`
+- `Neighbor misses: 147`
+
+## Interpretation
+The hard zero-stream collapse is not the current problem in this repro. The promoted owner is active, but IPv4 WAN neighbor readiness is still lagging the ownership move. The current periodic standby maintenance is not enough to guarantee the inherited WAN path is ready at the moment of RG1 promotion.
+
+
+---
+
+## #588 — Session sync can stick half-open after standby heartbeat-ack timeout [CLOSED] (closed 2026-04-07)
+
+## Summary
+Session sync can become asymmetrically disconnected: the standby closes the socket after heartbeat-ack timeout, but the primary keeps an outbound TCP session `ESTAB` with queued data and never forces a reconnect.
+
+## Live evidence
+Current `loss` cluster state:
+- `fw0` reports `Transfer ready: yes`
+- `fw1` reports `Transfer ready: no (session sync disconnected)`
+
+Live TCP state:
+- on `fw0`: `ESTAB 10.99.12.1:40416 -> 10.99.12.2:4785` with `Send-Q 132224`
+- on `fw1`: no TCP socket on `:4785`
+
+`fw1` journal:
+- `cluster sync: heartbeat ack timeout, closing stale connection`
+- `cluster sync: fabric 0 disconnected`
+- `cluster sync: peer disconnected (all fabrics down)`
+- then a reconnect
+- then another disconnect ~240ms later
+
+`fw0` journal at the same time shows no corresponding disconnect, only ongoing `sweep synced sessions` logs.
+
+## Interpretation
+The current heartbeat-ack timeout only tears down the receiver side. The sender side can remain stuck on a half-open socket with queued writes, so the cluster ends up split-brain on sync connectivity and `Transfer ready` becomes asymmetric.
+
+
+---
+
+## #590 — RG1 failover still incurs high session-miss burst and throughput tail collapse after reachability-preserving handoff [CLOSED] (closed 2026-04-07)
+
+## Summary
+After fixing the promoted-owner IPv4 WAN neighbor readiness gap, real `RG1 node0 -> node1` failover on `loss` no longer loses external IPv4 reachability, but it still shows a large session-miss burst and a severe tail-throughput collapse.
+
+## Repro
+Deployed branch: `fix/587-standby-session-neighbor-warmup`
+Validator: patched `/tmp/bpfrx-pr586/scripts/userspace-ha-failover-validation.sh`
+
+Command:
+`BPFRX_CLUSTER_ENV=test/incus/loss-userspace-cluster.env TOTAL_CYCLES=1 CYCLE_INTERVAL=10 /tmp/bpfrx-pr586/scripts/userspace-ha-failover-validation.sh --rg 1 --source-node 0 --target-node 1 --duration 60 --parallel 4`
+
+Artifact: `/tmp/userspace-ha-failover-rg1-20260407-103004`
+
+## What improved
+- `cycle1-failover: external IPv4 reachable (1.1.1.1)`
+- `cycle1-failover-post: external IPv4 reachable (1.1.1.1)`
+- `all 4 streams carrying traffic`
+- `0 zero-throughput intervals`
+- real old-owner fabric forwarding to new-owner WAN path:
+  - `old-owner lan-rx=6656328 fabric-tx=8738852`
+  - `new-owner fabric-rx=8711162 wan-tx=8711164`
+
+## What still fails
+- `session miss delta 144 (source=67 target=77) exceeds 64`
+- `sender throughput 12.212 Gbps`
+- `iperf3 interval collapse detected: tail/peak ratio 0.160 below 0.350`
+- `sender retransmits 13868`
+
+## Interpretation
+The promoted owner is now reachability-correct and keeps the flow alive, so the remaining bug is no longer neighbor convergence or total path loss. The next problem is transport continuity / session-hit quality during the handoff window, visible as a large session-miss burst and a strong post-transition throughput tailoff.
+
+
+---
+
+## #596 — userspace RST suppression install can fail permanently when bpfrx_dp_rst does not exist [CLOSED] (closed 2026-04-07)
+
+On the loss userspace HA lab, old-owner TCP RST suppression can stay disabled permanently after deploy.
+
+Root cause:
+- `InstallRSTSuppression()` always queues `DelTable(inet bpfrx_dp_rst)` before `AddTable(...)`
+- when the table does not already exist, the netlink flush fails with ENOENT
+- the userspace manager caches the failed install attempt as if it succeeded and does not retry until the NAT address set changes
+
+Live evidence:
+- journal spam on both firewalls: `userspace: RST suppression unavailable (nftables error, non-fatal)`
+- error text: `nftables flush: conn.Receive: netlink receive: no such file or directory`
+- old-owner WAN-side TCP RSTs were present during RG1 failover/failback before the fix
+
+Expected:
+- first install should succeed even when the table does not already exist
+- failed installs should retry on a backoff instead of staying stuck forever
+
+
+---
+
+## #597 — explicit RG failback is blocked by heartbeat peerAlive loss even when transfer path is healthy [CLOSED] (closed 2026-04-07)
+
+On the loss userspace HA lab, after RG1 moves to node1, the explicit return transfer back to node0 can fail with `peer not alive — cannot request failover` even though cluster status still reports `Transfer ready: yes`.
+
+Live evidence:
+- `request chassis cluster failover redundancy-group 1 node 0` from either node can fail with `peer not alive — cannot request failover`
+- `show chassis cluster control-plane statistics` became asymmetric after the first move:
+  - node0 heartbeat packets received far below sent
+  - node1 still sees node0 as alive
+- node1 remained primary for RG1 while the return transfer was rejected
+
+Root cause in code:
+- `RequestPeerFailover()` and `RequestPeerFailoverBatch()` hard-require UDP heartbeat `peerAlive`
+- they reject before checking whether the explicit peer-transfer RPC path is still available via session sync / commit callbacks
+- in this asymmetric state, the transfer channel can still be usable even though the heartbeat bit has dropped on one node
+
+Expected:
+- explicit operator failover should rely on the explicit transfer RPC/commit path being available and local transfer readiness being true
+- stale heartbeat loss should not by itself block an otherwise healthy explicit return transfer
+
+
+---
+
+## #598 — standby neighbor warmup fallback resolves reth unit subnets to the base interface instead of the unit interface [CLOSED] (closed 2026-04-07)
+
+Standby neighbor warmup falls back to config subnet matching when kernel route lookup fails, but the fallback currently resolves the base interface name instead of the unit/VLAN interface name.
+
+Example on loss:
+- `reth0.80` should resolve to `ge-7-0-2.80`
+- the fallback path resolved from the base interface instead, which can miss the actual neighbor table used by the active unit
+
+Why this matters:
+- split-RG HA warmup and standby forwarding prep depend on neighbor resolution on the correct unit interface
+- resolving the base interface can silently miss the live VLAN/unit neighbor cache and leave forwarding dependent on slower later retries
+
+Expected:
+- config-subnet fallback should return the concrete Linux unit interface name for the matching subnet, not the parent/base interface
+
+
+---
+
+## #602 — tracking: refactor ordering for remaining large-file splits [CLOSED] (closed 2026-04-13)
+
+## Purpose
+Track the implementation order for the remaining large-file refactor issues so they land with clean seams and minimal review risk.
+
+## Rules
+- First PR for each issue should be move-only with no behavior changes.
+- Prefer shared helper extraction before domain file splits.
+- Keep top-level entrypoints in the original file unless there is a strong reason to move them.
+
+## Recommended Order
+1. [x] #553 `pkg/config/ast.go` into groups/edit/format paths
+2. [x] #555 `pkg/config/parser_test.go` by subsystem
+3. [x] #549 `pkg/daemon/daemon.go` by subsystem
+4. [ ] #551 remaining `pkg/cluster/sync.go` protocol/conn/failover split
+5. [x] #550 `pkg/dataplane/userspace/manager.go` staged split
+6. [x] #552 `pkg/cli/cli.go` shared dispatch/request/clear/config/helpers split
+7. [x] #548 `pkg/cli/cli_show.go` by show domain
+8. [x] #554 `cmd/cli/main.go` by remote command family
+9. [ ] #556 reduce `userspace-dp/src/afxdp.rs` root module
+
+## Dependencies
+- `#552` should land before `#548` and ideally before `#554`.
+- `#551` should only target the remaining `sync.go` responsibilities because `sync_bulk.go` and `failover_batch.go` already exist.
+- `#556` should focus on shrinking the root module, not re-splitting already extracted `afxdp/*` files.
+
+## Notes
+- The earlier audit doc referenced in some issue bodies is no longer present in this checkout. The child issue scopes have been updated to match current `master`.
+
+
+---
+
+## #603 — HA status should surface mixed software versions instead of generic session sync disconnected [CLOSED] (closed 2026-04-08)
+
+## Summary
+
+On the `loss` userspace HA cluster, `show chassis cluster status` can report:
+
+- `Takeover ready: yes`
+- `Transfer ready: no (session sync disconnected)`
+
+when the real cause is that the two nodes are running different bpfrx builds.
+
+## Live reproduction
+
+Observed on April 7, 2026 on `loss`:
+
+- `fw0`: `bpfrx eBPF firewall userspace-forwarding-ok-20260402-bfb00432-298-ga2f53a50-dirty`
+- `fw1`: `bpfrx eBPF firewall userspace-forwarding-ok-20260402-bfb00432-299-gd6a538e1`
+
+In that mixed-build state:
+
+- `fw0` showed `Transfer ready: no (session sync disconnected)`
+- `fw1` still showed `Transfer ready: yes`
+
+After deploying the same clean `origin/master` build to both nodes:
+
+- both nodes reported `userspace-forwarding-ok-20260402-bfb00432-305-g51fc6996`
+- session sync reconnected
+- both nodes returned to `Transfer ready: yes`
+
+So the immediate operator-visible problem was version skew, not a current-master session-sync transport regression.
+
+## Problem
+
+Today HA status does not make software-version mismatch visible. The operator just sees a generic session-sync disconnect reason, which makes this look like a transport/debugging problem instead of a mixed-version deployment problem.
+
+## Desired behavior
+
+- heartbeat should carry local software version metadata
+- cluster manager should retain peer software version metadata
+- `show chassis cluster status` / detailed cluster info should surface local and peer versions
+- userspace transfer readiness should prefer an explicit reason like:
+  - `software version mismatch local=<local> peer=<peer>`
+
+*(truncated — 45 lines total)*
+
+
+---
+
+## #606 — session sync reconnect reapplies identical config and tears down the new sync session [CLOSED] (closed 2026-04-08)
+
+## Summary
+On the `loss` userspace HA cluster, restarting the standby on April 8, 2026 caused the primary to reconnect session sync successfully, immediately push config to the returning peer, and then lose the new sync connection again a few seconds later.
+
+This is not software-version skew. Both nodes were on the same build: `userspace-forwarding-ok-20260402-bfb00432-310-g0e2ef566-dirty`.
+
+## What happens
+- primary reconnects session sync
+- primary pushes config to the returning standby
+- standby receives the config and runs a full sync apply even though the active config already matches
+- that no-op apply still triggers disruptive management VRF / heartbeat restart work
+- the fresh session-sync TCP connection drops shortly after, leaving sync recovery unstable
+
+## Live evidence
+From `fw0` on April 8, 2026:
+- `cluster: session sync peer connected`
+- `cluster: pushing config to reconnected peer`
+- `cluster sync: bulk transfer complete`
+- about 200ms later: `cluster sync: fabric 0 disconnected`
+
+From `fw1` for the same reconnect:
+- `cluster sync: config received from peer`
+- `cluster: accepting config sync from peer`
+- `cluster: restarting heartbeat after VRF rebind`
+- `cluster: config sync applied successfully`
+
+The same pattern repeated across multiple reconnects in the April 7-8, 2026 journals.
+
+## Expected
+If the standby already has the same active config, reconnect config sync should be a no-op and must not trigger a disruptive reapply.
+
+
+---
+
+## #608 — HA: rapid RG movement hits stale-old-owner redirect and helper/fabric handoff bugs [CLOSED] (closed 2026-04-08)
+
+## Observed
+
+Repeated RG1 movement under long-lived userspace traffic exposed several bpfrx-level handoff bugs during HA failover/failback.
+
+These are separate from the known mlx5 kernel crash in #472.
+
+## Repo-level problems found
+
+1. Packets that arrive on the fabric parent NIC can be misclassified as actual fabric-ingress traffic.
+   - On this platform the fabric parent ifindex is also a real dataplane ingress interface.
+   - During failback, stale traffic hitting the old owner on that parent NIC can skip standby fabric redirect and get dropped as `ha_inactive` instead of being bounced to the active peer.
+
+2. Helper activation can leave control forwarding disabled for one extra cycle even after the activation has already been acked.
+   - That produces a transient ctrl-path blackout during RG activation/failback.
+
+3. Transient fabric neighbor lookup misses can clear an already-populated `fabric_fwd` entry.
+   - Under rapid RG movement this can temporarily flap readiness even though the last good fabric forwarding info is still usable.
+
+## Evidence
+
+- Live standby dataplane exceptions on the old owner previously showed `ha_inactive` for active RG1 flows arriving on `ge-*-0-0` / the fabric parent ifindex.
+- The helper/control-path blackout was reproduced in unit tests around `UpdateRGActive(active=true)` and ctrl map cleanup.
+- Fabric forwarding flaps were reproduced when `LinkByName` / neighbor resolution briefly missed but a cached `fabric_fwd` entry already existed.
+
+## Expected
+
+Rapid RG movement should keep the old owner redirecting stale traffic to the active peer, should not unnecessarily drop ctrl forwarding after activation is already acked, and should retain the last valid fabric forwarding state across transient neighbor lookup misses.
+
+## Scope
+
+This issue tracks the bpfrx fixes for those HA handoff bugs. The separate remaining throughput-collapse symptom is tracked independently, and the mlx5 VM panic remains #472.
+
+
+---
+
+## #609 — IPv6 RG1 failover only recovers ~3.9 Gbps of -P12 traffic before node crash [CLOSED] (closed 2026-04-13)
+
+## Observed
+
+On a clean `loss` userspace HA deployment, long-lived IPv6 traffic does not recover cleanly on the first RG1 failover even when both nodes are healthy and session sync is up before the move.
+
+## Repro
+
+1. Start from a healthy cluster where both nodes report `Takeover ready: yes` and `Transfer ready: yes`.
+2. Run:
+
+```bash
+iperf3 -c 2001:559:8585:80::200 -t 45 -P 12
+```
+
+3. Move RG1 from `node0` to `node1` at 10s.
+
+In the captured repro (`/tmp/rg1-failover-Mz4t.log`):
+- `0-10s`: stable around `23.1 Gbits/sec`
+- `10-11s`: `6.71 Gbits/sec`
+- `11-20s`: only `3.81-3.94 Gbits/sec`
+- `21s+`: traffic then falls to zero because the old owner later hits the known mlx5 crash from #472
+
+## Notes
+
+- In the current debug branch, the new owner no longer shows the old `ha_inactive` standby-drop symptom for these flows.
+- So this issue tracks the remaining repo-level failover recovery gap that leaves only a subset of the `-P12` streams alive after the first RG move.
+- The later VM crash is already tracked separately in #472.
+
+## Expected
+
+After RG1 moves to `node1`, all long-lived streams should recover to normal throughput instead of degrading to a low partial-recovery plateau.
+
+
+---
+
+## #611 — HA: old primary reclaims RG on transient peer-heartbeat timeout immediately after committed failover [CLOSED] (closed 2026-04-08)
+
+## Summary
+After the same committed RG1 manual failover on clean `origin/master` (`ac29c8ff`), the old primary (`fw0`) times out the peer heartbeat about 7 seconds later and unilaterally promotes RG1 back to itself.
+
+## Repro
+- Clean master on both nodes: `userspace-forwarding-ok-20260402-bfb00432-316-gac29c8ff`
+- Start reverse traffic:
+  `iperf3 -c 172.16.80.200 -P 12 -t 12 -R`
+- Trigger failover:
+  `request chassis cluster failover redundancy-group 1 node 1`
+
+## Evidence
+`fw0` journal during the same repro:
+- `cluster sync: remote failover request received` rg=1 req_id=1
+- `cluster sync: barrier ack received` seq=1 ...
+- `cluster: manual failover` rg=1
+- `cluster sync: remote failover commit received` rg=1 req_id=1
+- `userspace: RG state updated (helper stays in control)` rg=1 active=false
+- then ~7 seconds later:
+- `cluster: peer heartbeat timeout, marking peer lost`
+- `cluster: primary transition` rg=1
+- `userspace: RG state updated (helper stays in control)` rg=1 active=true
+
+At that point `show chassis cluster status` again reports `node0` primary for RG1 even though the manual transfer had already committed successfully.
+
+## Impact
+The old primary can reclaim the RG during a transient post-transfer heartbeat gap, undoing a successful failover and leaving the dataplane in a split/oscillating state. This lines up with reverse-path flows degrading and then never recovering.
+
+
+---
+
+## #612 — HA: new primary self-demotes after committed manual failover when post-commit session barrier ack arrives late [CLOSED] (closed 2026-04-08)
+
+## Summary
+A committed RG1 manual failover is not sticky on clean `origin/master` (`ac29c8ff`) during reverse-path traffic. The new primary (`fw1`) becomes primary, activates RG1, sends GARP/NA re-announces, then about 9 seconds later demotes itself back to backup because a post-commit demotion barrier waits only 5 seconds for a session-sync ack.
+
+## Repro
+- Clean master on both nodes: `userspace-forwarding-ok-20260402-bfb00432-316-gac29c8ff`
+- Baseline reverse traffic is healthy:
+  `iperf3 -c 172.16.80.200 -P 12 -t 5 -R` -> about `17-18 Gbps`
+- Repro:
+  `iperf3 -c 172.16.80.200 -P 12 -t 12 -R`
+  while issuing
+  `request chassis cluster failover redundancy-group 1 node 1`
+
+## Evidence
+`fw1` journal:
+- `cluster sync: failover ack received` rg=1
+- `cluster: primary transition` rg=1
+- `userspace: RG state updated (helper stays in control)` rg=1 active=true
+- `direct-mode re-announce scheduled` rg=1 reason=cluster-primary bursts=6
+- then later:
+- `cluster sync: queueing barrier` seq=1 sessions_sent=11 ...
+- `reconcile: retrying rg_active apply` rg=1 active=false
+- `userspace: RG state updated (helper stays in control)` rg=1 active=false
+- `userspace: prepare rg demotion failed` err=`demotion peer barrier failed: timed out waiting for session sync barrier ack ...`
+- only after that: `cluster sync: barrier ack received`
+
+The post-commit barrier ack arrives after the demotion path has already reverted the new primary.
+
+## Impact
+Manual failover can succeed at the protocol level and still be reverted locally by the new primary under load. Reverse-path TCP collapses from about `20 Gbps` to `4 Gbps` and never recovers because RG ownership oscillates back out from under the dataplane.
+
+
+---
+
+## #613 — HA: reverse iperf3 -R blackholes for several seconds during committed RG failover/failback [CLOSED] (closed 2026-04-08)
+
+## Summary
+When the cluster is in a split-RG state, reverse traffic around `~4 Gbps` is expected and is not itself a bug. The remaining defect is that during a committed failover/failback sequence, reverse `iperf3 -R` traffic can drop to `0 bits/sec` for several seconds before recovering.
+
+## Repro
+- Start from a healthy userspace HA cluster with both nodes up and `Transfer ready: yes`
+- Run reverse traffic from `loss:cluster-userspace-host`:
+  `iperf3 -c 172.16.80.200 -P 12 -t 600 -R`
+- While traffic is running, move RG2 to `node1`:
+  `request chassis cluster failover redundancy-group 2 node 1`
+- After that committed move completes, move RG2 back to `node0`:
+  `request chassis cluster failover redundancy-group 2 node 0`
+
+## Expected
+- During the split-RG interval, reverse traffic may temporarily settle around `~4 Gbps`
+- The failback should not produce an all-stream blackout
+- Reverse traffic should stay continuous through the return move
+
+## Observed
+From the April 8, 2026 live repro:
+- `0-4s`: healthy, about `20.5-21.1 Gbps`
+- `4-5s`: drops to `7.28 Gbps`
+- `5-9s`: about `3.95-4.14 Gbps` while RGs are split
+- `9-10s`: drops further to `895 Mbits/sec`
+- `10-15s`: full blackout, `0 bits/sec`
+- `16-17s`: partial recovery to `9.81 Gbits/sec`
+- `17-22s`: returns to about `17.8-22.1 Gbits/sec`
+
+## Impact
+The cluster can complete the RG move and eventually recover, but reverse-path traffic is still interrupted for several seconds. That is a real dataplane continuity failure even when the temporary split-RG throughput level is otherwise expected.
+
+## Notes
+- This issue is narrower than the earlier description: the `~4 Gbps` split-RG phase is expected and should not be treated as the bug.
+- This remains separate from the known mlx5 crash path in `#472`; the blackout/recovery repro above can happen without requiring the node to panic.
+
+
+---
+
+## #615 — cluster: clear stale inbound transfer grace on repeated RG direction changes [CLOSED] (closed 2026-04-08)
+
+## Summary
+Rapid alternating explicit RG transfers can leave stale post-commit peer-grace state on the old owner. After the direction flips again, the old owner keeps forcing the peer into `secondary-hold` on heartbeat refresh and can immediately reclaim the redundancy group it just yielded.
+
+## Live repro
+Environment: isolated `loss` userspace HA cluster on clean rebased `origin/master` plus the earlier explicit-transfer fixes.
+
+Repro sequence:
+1. Start reverse traffic: `iperf3 -c 172.16.80.200 -P 12 -t 24 -R`
+2. `fw0`: `request chassis cluster failover redundancy-group 1 node 1`
+3. `fw1`: `request chassis cluster failover redundancy-group 1 node 0`
+4. `fw0`: `request chassis cluster failover redundancy-group 1 node 1`
+5. A few seconds later, `fw1`: `request chassis cluster failover redundancy-group 1 node 0`
+
+Before the fix, step 5 could already report RG1 was primary on `node0` again even though step 4 had just committed ownership to `node1`.
+
+## Root cause
+`FinalizePeerTransferOut()` and `FinalizePeerTransferOutBatch()` parked the old owner in local transfer-commit grace, but they did not clear stale inbound transfer markers from the previous direction:
+- `peerTransferOutOverride`
+- `peerTransferCommitGraceUntil`
+
+That allowed the old owner to keep overwriting the peer heartbeat state to `secondary-hold` after the direction changed, so the next heartbeat could re-elect the old owner.
+
+## Fix
+When finalizing a peer transfer-out, clear the stale inbound transfer markers before holding the old owner in local transfer-commit grace.
+
+## Regression tests
+Add focused cluster tests covering:
+- single-RG direction flip
+- batch direction flip
+
+These tests should fail before the fix by re-promoting the old owner after the next peer heartbeat.
+
+
+---
+
+## #625 — userspace-dp: keep UMEM descriptor bounds at registered length after hugepage rounding [CLOSED] (closed 2026-04-12)
+
+Commit `136b9dbb64754723350a7f338f62fc4af22f965a` added hugepage-backed UMEM allocation by rounding the mmap length up to 2 MB, but it also changed `MmapArea::slice()` and `slice_mut_unchecked()` to validate accesses against the rounded `mapped_len` instead of the original registered UMEM length.
+
+That widens the set of descriptor/frame offsets accepted by userspace parsing and rewrite helpers. A descriptor that points past the registered UMEM region but still lands inside the extra rounded mapping tail is now treated as valid. The mapping exists, so this no longer faults, but it is still semantically outside the UMEM region handed to XSK registration.
+
+Why this matters:
+- invalid or corrupted descriptors can be silently accepted instead of being rejected as out-of-bounds
+- slow-path extraction/reinjection and frame parsing helpers can consume bytes that were never part of the registered UMEM
+- the commit already had to weaken one invalid-descriptor test to use a 4 MB offset instead of a small past-the-end offset, which is a sign the bounds semantics changed unexpectedly
+
+Suggested fix:
+- keep `mapped_len` only for allocation ownership and `munmap`
+- keep descriptor/frame slice bounds checks against the original registered length (`len`)
+- add a regression test proving that accesses beyond the registered length are rejected even when the underlying mmap was rounded up for hugepages
+
+Validation to keep:
+- `cargo test --manifest-path userspace-dp/Cargo.toml mmap_area_rejects_access_beyond_registered_len_even_if_mapping_is_rounded -- --nocapture`
+- `cargo test --manifest-path userspace-dp/Cargo.toml maybe_reinject_slow_path_records_extract_failure_for_invalid_desc -- --nocapture`
+
+---
+
+## #641 — ha deploy: version skew blocks transfer-ready during staggered upgrade [CLOSED] (closed 2026-04-14)
+
+## Problem
+During a staggered userspace HA deploy, the upgraded standby reports:
+- `Takeover ready: yes`
+- `Transfer ready: no (software version mismatch ...)`
+
+That blocks the exact safety gate we want for rolling upgrades: prove the upgraded standby can participate in HA transfer/failover before restarting the old primary.
+
+## Repro
+1. Start with `bpfrx-userspace-fw0/1` healthy on the loss userspace cluster.
+2. Deploy only the current secondary with `test/incus/cluster-setup.sh deploy 0|1`.
+3. Check `show chassis cluster status` on both nodes.
+4. Observe `Transfer ready: no` solely due to software version mismatch between old and new builds.
+
+## Current impact
+- rolling deploy cannot wait for full HA transfer readiness between phases
+- the deploy script's current settle gate is weaker than intended
+- operators must either accept a weaker rollout contract or upgrade the second node without proving full transfer readiness first
+
+## Desired outcome
+Make staggered upgrade semantics explicit and safe. One of these needs to happen:
+- allow compatible adjacent software versions to remain transfer-ready during rolling upgrade, or
+- teach the deploy workflow to use a different correctness gate that proves safe failover under version skew, or
+- narrow the software version compatibility check so non-protocol/UI-only version drift does not block HA transfer
+
+## Notes
+Observed on April 12, 2026 while deploying commit `99a05016` to the loss userspace HA cluster.
+
+
+---
+
+## #645 — Twice NAT: validate combined SNAT+DNAT parity [CLOSED] (closed 2026-04-13)
+
+## Problem
+
+`docs/feature-gaps.md` still treats Twice NAT as only partially supported because bpfrx has separate SNAT and DNAT support but lacks explicit end-to-end validation and a supported parity statement for combined flows.
+
+The repo already has important userspace building blocks in place:
+- `NatDecision::merge()` for combining DNAT + SNAT
+- port-aware reverse session key handling
+- session/HA sync fields for both NAT legs
+- unit coverage for merged NAT decisions
+
+What is still missing is a clear product-level contract and validation for combined flows across supported dataplanes.
+
+## Proposed scope
+
+1. Bless and document the combined NAT evaluation order:
+   - pre-routing DNAT
+   - FIB / policy evaluation on translated destination
+   - post-policy SNAT
+   - session creation preserving both NAT legs and translated ports
+2. Add explicit end-to-end tests for:
+   - DNAT + interface SNAT
+   - DNAT + pool SNAT
+   - port-forwarding DNAT + SNAT port allocation
+   - CLI/session visibility showing both SNAT and DNAT flags
+3. Add HA/session-sync coverage so failover preserves both NAT legs and ports.
+4. Audit dataplane parity and document any remaining differences between eBPF, userspace AF_XDP, and DPDK.
+5. Update the feature-gap documentation once support is validated.
+
+## Acceptance criteria
+
+- Combined SNAT+DNAT flows work end-to-end on supported dataplanes.
+- Return traffic matches the same session and reverses both NAT legs correctly.
+- HA/session sync preserves the translated address/port state across failover.
+- `show security flow session` reports both SNAT and DNAT state for combined flows.
+- `docs/feature-gaps.md` no longer describes Twice NAT as an unproven combination.
+
+---
+
+## #648 — rpm: track remaining vSRX parity gaps after cleanup [CLOSED] (closed 2026-04-18)
+
+## Summary
+After the current RPM tightening pass, bpfrx now has better schema/help coverage, stricter config validation, and clearer operational output for the probe types it already supports.
+
+That still leaves real vSRX parity gaps in the RPM feature family.
+
+## Remaining gaps
+- Native HA `ip-monitoring` style failover integration is still missing. RPM can emit events, but it does not directly drive chassis-cluster failover semantics the way vSRX documents.
+- `icmp-ping` is still a best-effort control-plane reachability probe, not a full ICMP echo implementation. The runtime currently uses an IPv4 raw-socket attempt with UDP fallback rather than explicit ICMP/ICMPv6 echo request handling.
+- Probe coverage is still narrow. bpfrx supports `icmp-ping`, `tcp-ping`, and `http-get`, but not the broader RPM/Junos feature family.
+- Operational visibility is still basic. We expose current status/counters, but not the deeper Junos-style historical/test reporting surface.
+- The support contract still needs explicit parity validation for IPv6, routing-instance behavior, and HA interactions.
+
+## Suggested follow-on work
+1. Implement real ICMP echo / ICMPv6 echo probe semantics.
+2. Define how RPM should integrate with HA `ip-monitoring` style failover policy.
+3. Expand probe/test parity only after the current probe semantics are correct.
+4. Add explicit end-to-end validation for IPv4, IPv6, VRF/routing-instance, and HA behavior.
+
+
+---
+
+## #650 — config: `commit persist-groups-inheritance` from `vsrx.conf` is ignored [CLOSED] (closed 2026-04-14)
+
+`/home/ps/git/codex-bpfrx/vsrx.conf:497` contains:
+
+- `commit persist-groups-inheritance;`
+
+Current state on `master`:
+
+- There are no parser/schema/compiler/runtime hits for `persist-groups-inheritance` in `pkg/`.
+- `docs/junos-config-display-reference.md` mentions the syntax, but the actual config pipeline has no implementation.
+
+Impact:
+
+- Imported vSRX config can carry a real Junos knob that bpfrx silently drops.
+- Operational behavior around rendered inherited config / persistence semantics can drift without any warning.
+
+Expected fix:
+
+- Either implement the intended bpfrx behavior for this commit/display knob, or reject it explicitly during parse/compile/import instead of accepting a silent no-op.
+
+---
+
+## #651 — system: `archive-sites ... password` from `vsrx.conf` is not honored by config archival [CLOSED] (closed 2026-04-18)
+
+`/home/ps/git/codex-bpfrx/vsrx.conf:594-596` contains:
+
+- `archive-sites {`
+- `    "scp://ps@172.16.50.253/n/vault/juniper" password "$9$...";`
+- `}`
+
+Current state on `master`:
+
+- `pkg/config/compiler_system.go` only persists archive site URLs into `ArchivalConfig.ArchiveSites`.
+- There is no password field in `pkg/config/types.go` archival state.
+- `pkg/daemon/daemon_flow.go:archiveConfig()` shells out to `scp` with `-o BatchMode=yes`, so runtime archival is effectively key-only.
+
+Impact:
+
+- The active vSRX config loses authentication semantics when imported.
+- Archival may fail silently unless matching SSH keys already exist.
+
+Expected fix:
+
+- Either support password-backed archival credentials (or an equivalent secret reference model), or reject/warn on inline `archive-sites ... password ...` syntax instead of pretending the imported archival config is complete.
+
+---
+
+## #652 — dns: `system services dns dns-proxy` from `vsrx.conf` is unsupported [CLOSED] (closed 2026-04-14)
+
+`/home/ps/git/codex-bpfrx/vsrx.conf:542-551` contains an inactive but real vSRX `dns-proxy` subtree:
+
+- `inactive: dns-proxy { ... }`
+- includes `default-domain *` and `forwarders { ... }`
+
+Current state on `master`:
+
+- `pkg/config/ast.go` models `system services dns` as a leaf/bool, not a `dns-proxy` subtree.
+- `pkg/config/compiler_system.go` collapses `system services dns` to `SystemServicesConfig.DNSEnabled`.
+- `pkg/daemon/daemon_system.go` maps that to enabling/disabling `systemd-resolved`; there is no firewall DNS proxy/caching/forwarder runtime.
+
+Impact:
+
+- Imported vSRX config cannot express DNS proxy semantics.
+- The config shape suggests richer support than actually exists.
+
+Expected fix:
+
+- Either implement `dns-proxy` forwarding/caching semantics (including forwarders/default-domain handling), or reject the subtree explicitly so operators do not mistake the bare DNS service toggle for vSRX proxy parity.
+
+---
+
+## #653 — system: `services application-identification` from `vsrx.conf` is still only partial vs vSRX [CLOSED] (closed 2026-05-05)
+
+`/home/ps/git/codex-bpfrx/vsrx.conf:716` enables:
+
+- `services application-identification;`
+
+Current state on `master` is better than the old parse-only gap, but still far from vSRX parity:
+
+- `pkg/dataplane/compiler.go` and `pkg/appid/runtime.go` do compile a broader application catalog and preserve dataplane-assigned `app_id` state.
+- Session display/filtering can show known app names and `UNKNOWN` when AppID is enabled.
+- There is still no Junos-style L7 DPI/signature engine, signature package handling, or full AppSecure/AppQoS/APBR/AppFW behavior.
+
+Impact:
+
+- The active config knob looks more complete than it really is.
+- Operators expecting vSRX AppID semantics still do not get real application classification parity.
+
+Expected fix:
+
+- Define the supported AppID contract explicitly in runtime/show output, and continue the implementation toward real L7 classification/signature parity instead of a catalog/session-label subset.
+
+---
+
+## #654 — system: `processes utmd disable` from `vsrx.conf` is parsed but has no runtime effect [CLOSED] (closed 2026-04-18)
+
+`/home/ps/git/codex-bpfrx/vsrx.conf:605-606` contains:
+
+- `processes {`
+- `    utmd disable;`
+- `}`
+
+Current state on `master`:
+
+- `pkg/config/compiler_system.go` records disabled process names in `SystemConfig.DisabledProcesses`.
+- Runtime only appears to consult that list for `snmpd` gating in `pkg/daemon/daemon.go`.
+- There is no UTM/`utmd` subsystem to disable, and no explicit warning that this knob is a no-op.
+
+Impact:
+
+- The imported config contains a real Junos process-disable knob that looks accepted but does nothing.
+- Operators get no signal that the setting is unsupported.
+
+Expected fix:
+
+- Either generalize `system processes ... disable` semantics, or explicitly warn/reject process names that bpfrx does not actually implement/manage.
+
+---
+
+## #660 — dns-proxy: replace systemd-resolved toggle with real firewall DNS proxy runtime [CLOSED] (closed 2026-04-14)
+
+Current state after #659:
+
+- `system services dns;` is only a host-side service toggle wired to `systemd-resolved`
+- `system services dns dns-proxy ...` now imports as syntax-compatible config and emits warnings, but it remains a runtime no-op
+
+That is the right import behavior, but it is not real vSRX DNS proxy support.
+
+Why this needs a dedicated runtime design:
+
+- vSRX `dns-proxy` means the firewall itself answers client DNS queries, forwards upstream, and can cache results
+- `systemd-resolved` is currently being managed as a host resolver service, not as a per-interface/per-VRF firewall DNS proxy
+- real support likely requires stopping or at least fully displacing the current `systemd-resolved` ownership model on the firewall nodes
+
+Likely implementation direction:
+
+- stop treating `system services dns` as just `systemd-resolved on/off`
+- disable `systemd-resolved` stub-resolver behavior on the dataplane node, or remove it entirely from this path
+- run a bpfrx-managed DNS forwarder/proxy daemon instead (for example unbound, CoreDNS, dnsmasq, or a purpose-built bpfrxd helper)
+- bind DNS proxy listeners to the configured service interfaces / routing-instances instead of only the host resolver context
+- implement at least the vSRX config imported from `vsrx.conf`:
+  - `dns-proxy` subtree
+  - `forwarders`
+  - `default-domain`
+- preserve host-side name resolution for the firewall OS separately from client-facing DNS proxy behavior
+
+Open design questions:
+
+- should bpfrx own a dedicated embedded DNS proxy process, or should it render/manage an external daemon config
+- how should VRF / routing-instance aware forwarding be modeled
+- do we want caching immediately, or only forwarding parity in phase 1
+- what ACL / source-interface restrictions should apply to who can query the firewall
+- should host OS resolution use the same upstreams, or stay logically separate
+
+Acceptance target:
+
+- `system services dns dns-proxy ...` compiles with no warning for supported knobs
+- clients can query the firewall on the intended interface and get forwarded replies
+- upstream selection follows configured `forwarders` in the intended routing-instance
+- `systemd-resolved` is no longer the mechanism pretending to provide vSRX DNS proxy parity
+
+
+*(truncated — 43 lines total)*
+
+
+---
+
+## #675 — CoS: scheduler transmit-rate not applied correctly for 10g+ rates [CLOSED] (closed 2026-04-16)
+
+## Problem
+
+When configuring CoS schedulers with different transmit rates, a scheduler configured at `10.0g` shows as `1.00 Gb/s` in the runtime display, suggesting the rate is being compiled or transmitted as `1.0g` instead of `10.0g`.
+
+## Reproduction config
+
+```
+set class-of-service schedulers scheduler-iperf-a transmit-rate 1.0g
+set class-of-service schedulers scheduler-iperf-a transmit-rate exact
+
+set class-of-service schedulers scheduler-iperf-b transmit-rate 10.0g
+set class-of-service schedulers scheduler-iperf-b transmit-rate exact
+
+set class-of-service scheduler-maps bandwidth-limit forwarding-class iperf-a scheduler scheduler-iperf-a
+set class-of-service scheduler-maps bandwidth-limit forwarding-class iperf-b scheduler scheduler-iperf-b
+
+set class-of-service interfaces reth0 unit 80 scheduler-map bandwidth-limit
+set class-of-service interfaces reth0 unit 80 shaping-rate 25g
+```
+
+## Observed behavior
+
+`show class-of-service interface` reports both queues at 1.00 Gb/s:
+
+```
+Queue  Class        Transmit rate
+4      iperf-a      1.00 Gb/s      ← correct
+5      iperf-b      1.00 Gb/s      ← should be 10.00 Gb/s
+```
+
+iperf-b traffic is rate-limited to ~1 Gbps instead of ~10 Gbps.
+
+## Investigation so far
+
+- **Go config compiler is correct**: `parseBandwidthLimit("10.0g")` returns 1,250,000,000 bytes/sec. A standalone test confirms `scheduler-iperf-b.TransmitRateBytes = 1250000000` after compile.
+- **The runtime value is wrong**: The CLI displays `1.00 Gb/s` which corresponds to 125,000,000 bytes/sec (1g), not 1,250,000,000 (10g).
+- **The problem is between Go snapshot and Rust runtime**: Either the JSON snapshot serialization loses the value, the Rust deserialization truncates it, or the snapshot wasn't refreshed after the config change.
+
+## Things to check
+
+
+*(truncated — 55 lines total)*
+
+
+---
+
+## #678 — userspace dataplane: cut remaining hot-path CPU in poll_binding and pending-forward TX [CLOSED] (closed 2026-04-18)
+
+## Summary
+
+The userspace dataplane is back in the `23 Gbps` IPv4 / `22+ Gbps` IPv6 range after the current hot-path cuts, but the remaining CPU profile is still concentrated in a small set of symbols.
+
+Validated live on 2026-04-15 on the `loss` userspace HA cluster with:
+
+```bash
+./scripts/userspace-perf-compare.sh --duration 8 --parallel 12
+```
+
+Representative validated result:
+
+- IPv4: `23.02 Gbps`
+- IPv6: `22.77 Gbps`
+
+## Remaining Hotspots
+
+IPv4:
+
+- `poll_binding`: about `13.4%`
+- `enqueue_pending_forwards`: about `4.3%`
+- `mlx5e_xsk_skb_from_cqe_linear`: about `4.6%`
+
+IPv6:
+
+- `poll_binding`: about `13.3%`
+- `enqueue_pending_forwards`: about `3.7%`
+- `apply_nat_ipv6`: about `3.2%`
+
+## What Was Already Fixed
+
+The current perf-recovery slice already did all of the following:
+
+- prequalified hot-path interface and `lo0` filter lookups
+- bitmap-based protocol and DSCP matching
+- specialized port matchers instead of generic vector scans
+- precomputed ingress logical-interface lookup
+- skipping CoS TX-selection work when it cannot affect the packet
+- reduced pending-forward request layout overhead
+- removed duplicate `expected_ports` / `target_binding_index` recomputation on flow-cache fallback
+
+*(truncated — 62 lines total)*
+
+
+---
+
+## #680 — CoS exact queues: replace single-owner service with shared-worker exact queue execution [CLOSED] (closed 2026-04-16)
+
+## Summary
+
+The no-CoS userspace dataplane is back in the expected throughput band, but the exact CoS queue path is still built around a single-owner execution model that is now the dominant architectural risk.
+
+Current state on the `loss` userspace HA lab:
+
+- no-CoS fast path is back around `23 Gbps` IPv4 / `22+ Gbps` IPv6 on the current perf-recovery branch
+- the mixed prepared/local exact-queue hang is fixed by `a736d010` (`userspace-dp: demote mixed exact cos queues to local`)
+- exact CoS traffic is now stable, but the current architecture still funnels exact queue service through one logical owner / owner TX frame pool
+
+That model is no longer good enough.
+
+It already caused one real correctness regression, and it now constrains the next step on exact-queue performance. The next implementation phase should replace owner-centric exact queue service with a shared-worker exact-queue design that preserves the no-CoS line-rate path.
+
+Related work:
+
+- [#679](https://github.com/psaab/xpf/pull/679)
+- [#678](https://github.com/psaab/xpf/issues/678)
+- [#675](https://github.com/psaab/xpf/issues/675)
+
+## Reproduction
+
+The current lab repro is straightforward.
+
+### Config
+
+```text
+configure
+
+delete class-of-service
+delete firewall family inet filter bandwidth-output
+delete interfaces reth0 unit 80 family inet filter output
+
+set class-of-service forwarding-classes queue 0 best-effort
+set class-of-service forwarding-classes queue 4 iperf-a
+set class-of-service forwarding-classes queue 5 iperf-b
+
+set class-of-service schedulers scheduler-be transmit-rate 100m
+set class-of-service schedulers scheduler-be transmit-rate exact
+
+
+*(truncated — 366 lines total)*
+
+
+---
+
+## #681 — CoS exact enforcement: make queue rate authoritative and derive burst from scheduler rate [CLOSED] (closed 2026-04-16)
+
+## Summary
+
+Exact CoS queue enforcement is still wrong even when classification is correct.
+
+Current repro on the `loss` userspace HA lab:
+
+- `best-effort` is configured on queue `0`
+- `scheduler-be` is `transmit-rate 100m` + `transmit-rate exact`
+- unmatched traffic falls into `best-effort`
+- but unmatched `5203` traffic still sustains far above `100 Mbit/s`
+
+Representative live repro:
+
+```bash
+iperf3 -c 172.16.80.200 -P 2 -t 5 -p 5203
+```
+
+Observed result:
+
+- aggregate sender: about `342 Mbit/s`
+- aggregate receiver: about `330 Mbit/s`
+
+That is not a classification bug. It is a scheduler enforcement bug.
+
+## Why This Is Wrong
+
+With the current config, `5203` should land in `best-effort` and be shaped by the `100m exact` scheduler.
+
+The queue-selection path already does the right thing:
+
+- output filter maps `5201 -> iperf-a`
+- output filter maps `5202 -> iperf-b`
+- everything else falls through to `best-effort`
+- CoS fallback also resolves to the interface `default_queue`, which is explicitly `best-effort`
+
+So the expected behavior is:
+
+- unmatched `5203` traffic -> queue `0` / `best-effort`
+- queue `0` -> `scheduler-be`
+- `scheduler-be` -> `100m exact`
+
+*(truncated — 240 lines total)*
+
+
+---
+
+## #683 — userspace-dp: flatten exact CoS hot path and remove mutex/tree lookups [CLOSED] (closed 2026-04-16)
+
+# Problem
+
+The current exact-CoS execution path still carries control-plane-grade data structures and synchronization into the packet path. That was acceptable for bring-up. It is not acceptable as the steady-state shape for a high-rate dataplane that is supposed to preserve no-CoS line-rate behavior and still execute exact CoS correctly under load.
+
+The review feedback on PR #682 was directionally correct:
+- `SharedCoSQueueLease` / `SharedCoSRootLease` still serialize hot-path lease state behind `std::sync::Mutex`
+- exact queue ownership / live-state lookup still walks `BTreeMap`s
+- `effective_cos_queue_config()` still scans queue vectors in the redirect path
+- `resolve_tx_binding_ifindex()` is still re-derived in hot code instead of being flattened into the published execution state
+
+None of those are correctness bugs by themselves. Together they are the wrong shape for a dataplane fast path.
+
+Relevant code today:
+- `userspace-dp/src/afxdp/types.rs`: `SharedCoSQueueLease`, `SharedCoSRootLease`
+- `userspace-dp/src/afxdp/tx.rs`: `effective_cos_queue_config`, `cos_queue_uses_shared_exact_execution`, `worker_has_local_cos_tx_path`, exact redirect / lease top-up path
+- `userspace-dp/src/afxdp/worker.rs`: `build_worker_cos_owner_live_by_tx_ifindex`
+- `userspace-dp/src/afxdp/coordinator.rs`: shared owner / live / lease map construction
+
+# Why This Matters
+
+If the packet path has to do locking, tuple-key tree lookups, and repeated config-derived resolution, we pay for it every time exact CoS is active:
+- extra coherence traffic on shared cache lines
+- avoidable branchy tree walks on small-but-hot maps
+- repeated egress-to-tx-binding resolution work instead of direct addressing
+- unnecessary dependence on general-purpose container semantics when the state space is tiny and fixed after publish
+
+This is exactly the class of problem that shows up in `perf` as death by a thousand cuts: no single frame looks catastrophic, but the exact queue path stops looking like NIC-adjacent dataplane code and starts looking like ordinary systems code.
+
+# Constraints
+
+This work is hot-path surgery. The replacement must satisfy all of these:
+- preserve CoS correctness first: exact queues must remain exact, root shaping must remain authoritative, and queue / root credit invariants must hold under concurrency
+- preserve the no-CoS fast path: when CoS is not configured, there must be no new overhead on forwarding
+- keep the publish/update model RCU-like: workers read immutable snapshots and only mutate per-worker runtime plus explicitly shared lease state
+- avoid introducing a global scheduler thread or heavyweight cross-worker coordination
+- avoid trading one bottleneck for another by pushing more copy work into the TX path
+
+# Required Design Changes
+
+## 1. Remove `Mutex` From Shared Exact Lease Fast Path
+
+*(truncated — 142 lines total)*
+
+
+---
+
+## #685 — userspace-dp: remove exact CoS batch materialization from drain path [CLOSED] (closed 2026-04-16)
+
+## Problem
+
+`#684` removed the mutex / tree / lookup overhead from the exact-CoS fast path, but the next hard ceiling is now clear in the live profiles: the remaining first-order cost is request-structure churn inside `drain_pending_tx()`, not configuration lookup.
+
+This is the wrong kind of work for a low-latency packet engine. We are still paying CPU to materialize and move queue state between transient containers before the NIC sees descriptors.
+
+That is acceptable for control-plane code. It is not acceptable in a hot exact-CoS TX path that should look more like an HFT packet scheduler: minimal branches, minimal copies, no container rebuilding, and only one ownership transition before descriptor submission.
+
+## Live Evidence
+
+Deployed helper from `#684`:
+- helper SHA: `f121f277716fc4770d12943467404b8d6a2136e9095451896bfc4d42bedb3a24`
+
+Live measurements on `loss` after the latest `#684` update:
+- IPv4 exact `5202`: `9.72 Gbit/s` sender, `9.69 Gbit/s` receiver, `0` retransmits under perf
+- IPv6 exact `5202`: `9.60 Gbit/s` sender, `9.57 Gbit/s` receiver, `26744` retransmits under perf
+- IPv4 best-effort `5203`: `123.9 Mbit/s` sender, `119.2 Mbit/s` receiver
+
+Top symbols on the active firewall under exact-CoS load:
+
+IPv4 exact `5202`
+- `drain_pending_tx 25.84%`
+- `__memmove_evex_unaligned_erms 14.03%`
+- `poll_binding 9.77%`
+- `worker_loop 8.11%`
+
+IPv6 exact `5202`
+- `drain_pending_tx 22.94%`
+- `__memmove_evex_unaligned_erms 18.83%`
+- `poll_binding 9.82%`
+- `worker_loop 5.10%`
+
+The old queue-byte rescan is gone. The lookup/mutex/tree work is gone. The remaining cost is dominated by:
+- shaped drain orchestration in `drain_pending_tx()`
+- `memmove` caused by request/container movement
+- the remaining copy-heavy path between CoS queue state and TX scratch state
+
+## Root Cause
+
+The exact-CoS path still has the wrong internal shape.
+
+*(truncated — 213 lines total)*
+
+
+---
+
+## #688 — userspace-dp: make exact drain zero-move and cut drain_pending_tx tail [CLOSED] (closed 2026-04-16)
+
+## Problem
+
+The lookup/lease flattening work is no longer the main limiter. The exact CoS hot path is back in queue drain and request movement.
+
+Current live perf on the active firewall during exact `5202` runs:
+
+- IPv4
+  - `drain_pending_tx` `27.33%`
+  - `__memmove_evex_unaligned_erms` `13.47%`
+  - `poll_binding` `8.20%`
+- IPv6
+  - `__memmove_evex_unaligned_erms` `16.33%`
+  - `drain_pending_tx` `11.54%`
+  - `poll_binding` `9.32%`
+
+This is the new first-order cost center. The dataplane is still spending too many cycles moving request state around after exact queue selection instead of driving descriptors to the TX ring with minimal state churn.
+
+## Why This Matters
+
+A serious fast path does not keep paying bulk memory movement and container reshaping tax after we already did the hard work of exact queue selection, lease arbitration, and queue ownership. At this point every extra branch and every `memmove` is directly visible at the port.
+
+The current exact path still carries too much software queue management overhead:
+- scratch staging still causes request movement that shows up as `memmove`
+- partial-send rollback still restores more structure than the hardware outcome requires
+- `drain_pending_tx` still does too much work per packet before descriptor publication
+- `poll_binding` remains visible enough that unnecessary drain-side work is making worker loop efficiency worse
+
+## Target
+
+Make exact queue drain effectively zero-move on the common path.
+
+That means:
+- no bulk reshaping of pending exact requests after queue selection
+- no transient batch/container construction for exact service
+- no rollback work except the exact unsent tail that must remain queued
+- descriptor fill and queue accounting stay adjacent, predictable, and cache-friendly
+
+## Required Design Direction
+
+### 1. Replace request movement with index-window drain semantics
+
+*(truncated — 158 lines total)*
+
+
+---
+
+## #689 — userspace-dp: separate or prove guarantee RR semantics for exact vs non-exact CoS service [CLOSED] (closed 2026-04-16)
+
+## Problem
+
+`drain_shaped_tx()` now services guarantee queues in two passes:
+
+1. exact guarantee queue direct path
+2. non-exact guarantee batch path
+
+Both passes currently share the same `root.guarantee_rr` cursor.
+
+That means an exact queue serviced in the first pass advances the cursor seen by the second pass, even though the second pass is selecting from a different effective subset of queues. With a small queue count this is not a throughput problem, but it is a scheduler semantics question and can become a fairness/predictability problem as queue mixes get more complex.
+
+This was surfaced during review of PR #687 and is intentionally deferred because it is not blocking the current exact-drain optimization.
+
+## Why This Matters
+
+A serious traffic scheduler needs service order that is either:
+- explicitly unified across all guarantee queues, or
+- explicitly independent per service class/subset
+
+What it cannot be is accidentally coupled by an implementation detail.
+
+Right now we need to be precise about what we want:
+- if exact and non-exact guarantee queues are meant to share one logical round-robin order, we should prove the two-pass implementation preserves that intent
+- if they are meant to rotate independently, we need separate cursors and tests
+
+For a high-performance scheduler, hidden coupling in the RR cursor is exactly the kind of thing that shows up later as unfair burst service, unexpected starvation windows, or impossible-to-explain jitter.
+
+## Current State
+
+In `userspace-dp/src/afxdp/tx.rs`:
+- `select_exact_cos_guarantee_queue_with_fast_path()` iterates all queues, skips non-exact, and advances `root.guarantee_rr`
+- `select_nonexact_cos_guarantee_batch()` iterates all queues, skips exact, and also advances `root.guarantee_rr`
+
+This is correct in the narrow sense that it does not break queue ordering or accounting. The open question is whether the resulting service order matches intended CoS semantics.
+
+## Required Work
+
+1. Define intended scheduler semantics
+- decide whether exact and non-exact guarantee queues share one RR domain or two
+- document that choice directly in code comments and tests
+
+*(truncated — 72 lines total)*
+
+
+---
+
+## #690 — CoS exact fairness: keep low-rate exact queues on a single owner worker [CLOSED] (closed 2026-04-18)
+
+## Problem
+
+The exact CoS implementation is hitting the configured aggregate rate, but low-rate exact queues are not distributing service fairly across concurrent TCP flows.
+
+Live reproduction on the current loss HA CoS config:
+
+```bash
+iperf3 -c 172.16.80.200 -P 12 -t 15 -p 5201
+```
+
+Observed result on April 16, 2026:
+- aggregate: `971 Mbit/s` sender, `954 Mbit/s` receiver
+- per-flow spread after convergence was still extremely uneven:
+  - hottest flow: `253 Mbit/s`
+  - next hottest: `172 Mbit/s`
+  - coldest flows: `23-28 Mbit/s`
+  - several others clustered around `40-90 Mbit/s`
+- total retransmits: `251`
+
+That is not a scheduler correctness failure in the rate sense, but it is a real service fairness failure.
+
+## Diagnosis
+
+The current exact path shares exact queue service across eligible workers. That is correct for high-rate exact queues where one worker should not be the bottleneck, but it is the wrong shape for low-rate exact queues like:
+- `100m exact`
+- `1g exact`
+
+Those queues do not need multi-worker execution to hit contract. Sharding them anyway creates multiple worker-local FIFO queues racing on the same shared exact lease budget. The byte budget stays correct, but packet ordering becomes worker-arbitrated instead of queue-arbitrated.
+
+That means TCP flow share depends too much on:
+- worker assignment of the flows
+- local queue head composition on each worker
+- which worker acquires shared exact lease credit first
+- when each worker gets to run its local drain loop
+
+For a low-rate exact queue, that is too much scheduling entropy for too little throughput benefit.
+
+## Target
+
+Low-rate exact queues should prefer deterministic single-owner service.
+
+*(truncated — 96 lines total)*
+
+
+---
+
+## #691 — CoS low-rate exact fairness: add per-flow backlog admission to owner-local exact queues [CLOSED] (closed 2026-04-16)
+
+## Problem
+
+Low-rate exact queues are now correctly kept owner-local, but they still behave as a single FIFO with a global byte limit and pure tail-drop admission. Under a backlogged low-rate exact workload, that is enough to enforce the aggregate contract, but it is not enough to produce acceptable multi-flow fairness.
+
+Current repro:
+
+```bash
+iperf3 -c 172.16.80.200 -P 12 -t 600 -p 5201
+```
+
+Representative current behavior on the loss userspace HA lab:
+- aggregate stays near the configured `1.0g` scheduler
+- per-stream sender rates are highly uneven
+- retransmits are high
+- queue `4` (`iperf-a`) sits backlogged and parked near its byte limit
+
+This is a queue-discipline problem, not a raw throughput problem.
+
+## Root Cause
+
+The current owner-local exact path still does all of the following:
+- admits packets into one FIFO `VecDeque`
+- enforces only a single queue byte cap
+- drops only the newly arriving packet once the queue is full
+- allows one flow to accumulate a disproportionate amount of in-queue backlog before service
+
+That combination is enough to create classic drop-tail unfairness:
+- one flow can occupy too much of the exact queue backlog
+- other flows then experience disproportionate tail loss
+- TCP cwnd evolution diverges badly even though aggregate queue rate is still correct
+
+The previous attempt to improve fairness by reordering within the first few queued packets was the wrong lever. It changed dequeue order slightly, but it did not change admission control, backlog ownership, or stationary-full behavior.
+
+## Required Change
+
+For owner-local low-rate exact queues only:
+- keep the current owner-local exact execution model
+- add per-flow backlog accounting on enqueue
+- bound any one flow bucket's queued share as a function of the queue's active flow count and total queue byte limit
+- reject excess backlog from the dominant flow before it can occupy the whole exact queue
+
+*(truncated — 100 lines total)*
+
+
+---
+
+## #693 — userspace-dp: randomize low-rate exact fair-queue hash seed [CLOSED] (closed 2026-04-16)
+
+## Summary
+Low-rate owner-local exact CoS queues now use hashed per-flow round-robin service, but the flow bucket mapping is still deterministic. The current bucket hash is a pure function of the 5-tuple and queue configuration, with no per-instance random seed.
+
+This is acceptable in the lab, but it is the wrong long-term shape for a production-facing fairness scheduler. An external sender that can vary source ports can probe the bucket mapping and concentrate flows into a small number of buckets, degrading fairness on purpose.
+
+## Current State
+The current path in `userspace-dp/src/afxdp/tx.rs`:
+- hashes the 5-tuple into a bucket with `exact_cos_flow_bucket()`
+- masks the result into `COS_FLOW_FAIR_BUCKETS`
+- uses that bucket for both backlog-share admission and dequeue fairness
+
+There is no per-queue or per-runtime random salt.
+
+## Why This Matters
+For a fair queue, deterministic hashing is a correctness weakness under hostile or just unlucky traffic. The queue discipline becomes predictable. That creates two concrete risks:
+- deliberate collision steering by an external source
+- repeatable collision hot spots across restarts and nodes
+
+A scheduler that is meant to provide fairness should not make its collision structure externally stable when we can avoid that at near-zero cost.
+
+## Required Change
+Add a per-queue random hash seed to the low-rate exact fair queue path.
+
+Implementation requirements:
+- add a `flow_hash_seed: u64` or equivalent field to `CoSQueueRuntime`
+- initialize it once when the runtime queue is built
+- source entropy from a proper kernel-backed source, not a timestamp or worker id
+- mix the seed into `exact_cos_flow_bucket()` before any tuple fields
+- preserve existing behavior for queues that do not enable `flow_fair`
+- preserve determinism inside a live runtime instance; do not rotate the seed after queue creation
+
+## Performance Constraints
+This must stay hot-path safe.
+- no locks
+- no heap allocation
+- no per-packet RNG
+- no cryptographic hash in the dequeue path unless the measured cost is proven acceptable
+
+The target shape is one cached `u64` seed load plus the existing integer mix sequence.
+
+
+*(truncated — 52 lines total)*
+
+
+---
+
+## #694 — userspace-dp: replace fair-queue RR VecDeque with fixed circular ring [CLOSED] (closed 2026-04-17)
+
+## Summary
+The new low-rate exact fair queue uses `VecDeque<u8>` for the active-bucket round-robin ring. That is correct, but not the final performance shape.
+
+For a bucket ring whose cardinality is statically bounded by `COS_FLOW_FAIR_BUCKETS`, a heap-backed `VecDeque` is heavier than necessary. The scheduler only needs a fixed-capacity ring of bucket ids with head/tail indices.
+
+## Current State
+`CoSQueueRuntime` currently stores:
+- `flow_rr_buckets: VecDeque<u8>`
+- `flow_bucket_items: [VecDeque<CoSPendingTxItem>; COS_FLOW_FAIR_BUCKETS]`
+
+On each fair dequeue, the code does:
+- `pop_front()` on the RR ring
+- one dequeue from the selected bucket
+- conditional `push_back()` if the bucket remains active
+
+This is O(1), but it still pays `VecDeque` metadata and heap-backed ring mechanics for a problem with a known fixed upper bound.
+
+## Why This Matters
+This queue is on a packet scheduler path. At low-rate exact shaping, fairness correctness comes first, but once the policy is stable the ring itself should be as cheap and cache-resident as possible.
+
+A fixed ring gives us:
+- no heap allocation for the RR ring
+- fewer pointer-chasing loads
+- tighter cache footprint
+- clearer invariants around maximum active buckets
+
+## Required Change
+Replace `flow_rr_buckets: VecDeque<u8>` with a fixed circular structure sized to `COS_FLOW_FAIR_BUCKETS`.
+
+Required implementation properties:
+- no heap allocation for the RR ring
+- `O(1)` push-front / push-back / pop-front equivalents for active buckets
+- explicit head/tail/len accounting
+- correctness preserved when buckets become active, inactive, and reactivated
+- no duplicate active-bucket entries in the ring
+
+A valid target shape is something like:
+- `[u8; COS_FLOW_FAIR_BUCKETS]`
+- `rr_head: u8`
+- `rr_len: u8`
+
+*(truncated — 60 lines total)*
+
+
+---
+
+## #697 — CoS shared-exact threshold: iface_rate/4 term inverts policy at >10g iface [CLOSED] (closed 2026-04-16)
+
+## Problem
+
+`queue_uses_shared_exact_service()` at `userspace-dp/src/afxdp/worker.rs:1494`
+computes the shared-exact threshold as:
+
+```rust
+let shared_threshold = iface
+    .shaping_rate_bytes
+    .saturating_div(4)
+    .max(COS_SHARED_EXACT_MIN_RATE_BYTES);   // MIN = 2.5 Gbps
+```
+
+This scales the shard-eligibility threshold *up* with interface rate, which
+is the wrong direction relative to per-worker execution capacity. A single
+worker's sustained exact-queue throughput is an absolute property of the
+drain loop and the TX ring, not a fraction of the interface shaper. As
+interface rate increases, the `iface_rate/4` term eventually dominates the
+`MIN` floor and starts mis-classifying genuinely high-rate queues as
+single-owner — exactly the shape of the PR #680 throughput collapse that
+motivated shared-worker execution in the first place.
+
+## Concrete behavior across iface rates
+
+| iface shaper | `iface/4` | `max(iface/4, MIN)` | 10g exact queue | 20g exact queue |
+|--------------|-----------|---------------------|-----------------|-----------------|
+| 1g           | 250m      | 2.5g (MIN)          | shared          | shared          |
+| 10g          | 2.5g      | 2.5g (both)         | shared          | shared          |
+| 25g          | 6.25g     | 6.25g (iface/4)     | **single-owner** | shared          |
+| 100g         | 25g       | 25g (iface/4)       | **single-owner** | **single-owner** |
+
+The 25g and 100g rows are the bug. A 10g exact queue on a 25g+ iface gets
+routed to a single owner worker, which cannot sustain 10g exact throughput,
+which regresses us straight back to PR #680's collapse shape.
+
+Currently latent because the loss HA lab runs 10g interfaces where
+`iface/4 == MIN` and the rows coincide. Surfaces the moment anyone stands
+up a cluster on a faster NIC.
+
+## Test shape that pins the bug today
+
+
+*(truncated — 116 lines total)*
+
+
+---
+
+## #698 — CoS shared-exact threshold: validate MIN constant + end-to-end dispatch test [CLOSED] (closed 2026-04-17)
+
+## Problem
+
+The `COS_SHARED_EXACT_MIN_RATE_BYTES` constant at
+`userspace-dp/src/afxdp/worker.rs:1466` is `2_500_000_000 / 8 bytes/s`
+(2.5 Gbps). Its rustdoc calls it an "empirical per-worker sustained exact
+throughput ceiling" and references PR #680, but there is no checked-in
+measurement that actually establishes this number. If anyone rewrites the
+drain path, changes the TX batch size, changes ring sizing, or moves from
+virtio to driver-native XDP, the per-worker ceiling will move and there is
+nothing in the repo that will tell us.
+
+Separately, the policy output (single-owner vs shared) is tested via the
+`queue_uses_shared_exact_service` predicate (PR #696) and indirectly via
+`build_worker_cos_fast_interfaces_flattens_owner_and_lease_state`
+(PR #692's two-queue 25g case). Neither exercises the live 3-queue loss HA
+lab shape (100m / 1g / 10g on a 10g iface) end-to-end through the
+fast-interface assembly. A refactor that silently decouples the predicate
+from dispatch would not fail any existing test.
+
+## Required work
+
+### 1. Single-worker exact capacity micro-benchmark
+
+Add a repeatable measurement that establishes the per-worker ceiling on a
+known system, checked in with the result, so future changes can rerun it
+and compare.
+
+- Drive a single binding's drain path with synthetic `TxRequest`s at
+  increasing offered load, one worker, exact queue, no contention.
+- Sweep offered load 1–10 Gbps; record sustained ACK'd-by-TX-ring rate.
+- Report the knee — the rate at which drained throughput stops tracking
+  offered load.
+- Commit the harness and the measurement methodology, not just the number.
+- The number feeds `COS_SHARED_EXACT_MIN_RATE_BYTES`. Today it is set to
+  2.5 Gbps. If the measurement disagrees, update the constant with a
+  reference to the checked-in methodology.
+
+Scope: the micro-benchmark is not required to run in CI. A `cargo bench`
+or a `scripts/perf/` harness that a human runs is sufficient, as long as
+the methodology is reproducible.
+
+*(truncated — 95 lines total)*
+
+
+---
+
+## #704 — CoS exact 1g (5201): bimodal per-flow fairness collapse at 16+ flows (~13× ratio, 5.7% retrans) [CLOSED] (closed 2026-04-18)
+
+## Problem
+
+Running iperf3 at high parallelism against the 1g exact queue (port 5201) produces a bimodal per-flow performance distribution: a small group of flows behaves like healthy TCP, and a larger group runs in cwnd-collapse territory with ~100× higher retransmit rates. Aggregate hits the contract rate; per-flow fairness does not.
+
+## Repro
+
+Latest master deployed (helper SHA `5203041a3b95b54591696dc80c937eb756f68c18d58c8be9a6c0680fc5fd561f`), loss HA cluster, 1g exact queue on a 10g iface:
+
+```
+iperf3 -c 172.16.80.200 -P 16 -t 30 -p 5201
+```
+
+**Run 1 (30s):**
+- aggregate: 1.085 Gbps sender, 1.080 Gbps receiver (on contract)
+- retrans: **155957** (~5200/sec)
+- per-flow ratio: 13.26× (min 7.1 Mbit, max 94.1 Mbit)
+- per-flow stdev: 21.0 Mbit
+
+**Run 2 (30s):**
+- aggregate: 1.082 Gbps, retrans **171965** (~5732/sec)
+- ratio: 12.7×
+- per-second agg stdev: 20 Mbps (low → shaper smooths total, but per-flow variance is high)
+
+## Observed bimodal pattern
+
+Both runs show the same shape — roughly 5 flows in a "healthy" cluster and 11 in a "collapsed" cluster:
+
+| cluster     | rate range  | retrans/30s  | max_cwnd peak | TCP state        |
+|-------------|-------------|--------------|---------------|------------------|
+| healthy (5) | 76.5–87.4 Mbit | 256–476    | 99–106 KB     | normal autotune  |
+| collapsed (11) | 6.9–94 Mbit | 2338–21391 | 10–44 KB      | RTO/slow-start   |
+
+The 5/11 split is stable across runs. 16 flows, 4 workers (`--workers 4`), one owner worker per queue. That maps cleanly to "4-5 flows RSS-landed on the owner worker (no redirect, no mutex)" versus "11-12 flows RSS-landed on non-owner workers (redirect via `BindingLiveState::enqueue_tx_owned` mutex)". See filed issues on the redirect mutex, SFQ bucket cap, and buffer sizing for the candidate root causes.
+
+## Why the per-flow shape matters
+
+- **Retransmit rate 5.7%** (155k retrans vs. 2.7M packets sent at 1.08 Gbps / 1500 B / 30s). Consumes CPU on both endpoints and the firewall, wastes link capacity, inflates latency tail.
+- **cwnd 10–40 KB on 11 flows** = ~7–27 packets in flight at MSS=1500. TCP fast-retransmit needs ≥3 dupacks; at that cwnd, single-packet drops force RTO instead of fast-recovery. Each RTO drops cwnd to 1 MSS → 200 ms blackhole. Explains the oscillation.
+- **Aggregate hits 1g** only because the healthy flows + occasional good bursts from the collapsed ones average out. The *scheduler* contract is met; the *transport layer* is not getting its end of the bargain.
+
+
+*(truncated — 68 lines total)*
+
+
+---
+
+## #705 — SFQ bucket collision + per-flow admission cap forces colliding flows into cwnd-collapse regime [CLOSED] (closed 2026-04-17)
+
+## Problem
+
+The per-flow admission cap introduced in PR #692 (`cos_queue_flow_share_limit`) divides the exact queue's buffer by `active_flow_buckets`. Under SFQ bucket collision, two flows sharing a bucket get a combined admission slot equal to *one* flow's worth — effectively halving each colliding flow's admission budget. Combined with the small absolute buffer size (~125 KB on the 1g exact queue) and a 16-flow workload, the per-bucket budget drops to ~5–6 packets. That's below TCP's fast-retransmit threshold (3 dupacks), so single-packet drops force RTO → cwnd reset to 1 MSS → the cwnd-collapse oscillation observed in #704.
+
+## Math
+
+- 1g exact queue, buffer = `max(buffer_bytes, COS_MIN_BURST_BYTES)` = 125 KB (for iperf-a config)
+- 16 iperf3 flows distributed over 64 SFQ buckets via hashed 5-tuple
+- Birthday paradox expected collisions: `16 × 15 / (2 × 64) ≈ 1.88` colliding pairs, so typically 2–4 flows share buckets
+- `active_flow_buckets` = 14 (2 collisions out of 16 flows land in 14 buckets)
+- per-bucket cap = `buffer / active_flow_buckets` = 125 KB / 14 ≈ **9 KB** = **6 MSS (1500 B)**
+- For flows that collide, their *effective* per-flow admission cap is *half* the bucket cap = ~3 MSS
+
+## Why this drives cwnd collapse
+
+TCP cubic fast-retransmit fires on 3 dupacks. With 6 packets in flight, a single drop produces at most 2 dupacks before the window is exhausted. That forces an RTO (~200 ms in the cluster) instead of fast-recovery. RTO resets cwnd to 1 MSS. Next round: cwnd ramps from 1, probes past the bucket cap on iteration, single drop, RTO again. That's exactly the observed state on the 11 collapsed flows in #704 — `max_cwnd` 10–40 KB is where cwnd oscillates between "just below bucket cap" and "1 MSS".
+
+Meanwhile the 4-5 flows that happen to land on the owner worker (no redirect mutex) get their packets into the queue without microburst amplification, stay under the per-flow cap, and see normal TCP autotuning up to the receive window ceiling.
+
+## Fix candidates
+
+### Option A: grow bucket count (narrowest slice)
+
+Raise `COS_FLOW_FAIR_BUCKETS` from 64 to 256 or 1024. Birthday-paradox collision rate drops quadratically:
+
+- 64 buckets, 16 flows: ~88% chance ≥1 collision
+- 256 buckets, 16 flows: ~37% chance ≥1 collision
+- 1024 buckets, 16 flows: ~11% chance ≥1 collision
+
+Cost: per-queue `flow_bucket_bytes: [u64; N]` (N × 8 B) and `flow_bucket_items: [VecDeque; N]` (N × 24 B + allocated backing storage). At N=1024: 32 KB per queue before allocation. Per-interface with ~8 queues × 4 workers = 1 MB of fixed overhead. Acceptable on modern systems.
+
+### Option B: separate admission cap from bucket count
+
+The admission cap is there to prevent one flow from hogging the buffer. The SFQ bucket count is there to provide round-robin dequeue fairness. They don't need to share the same denominator. Compute admission cap from a tracked *distinct flow count* (hash-set or approximate-count data structure) rather than `active_flow_buckets`. A colliding pair still gets 2× cap instead of 1× cap.
+
+### Option C: per-flow tracking (largest change)
+
+Replace hashed-bucket SFQ with a flow table keyed on 5-tuple. Each flow gets its own tracking state. Expensive on insert/lookup but eliminates collision entirely. Only worth it if Option A still shows collisions at the scales we care about (> 256 flows/queue, which isn't the current workload).
+
+## Acceptance criteria
+
+*(truncated — 57 lines total)*
+
+
+---
+
+## #706 — Non-owner-worker redirect mutex (enqueue_tx_owned) is a latency jitter source on low-rate exact queues [CLOSED] (closed 2026-04-17)
+
+## Problem
+
+Non-shared-exact queues (e.g. the 1g `iperf-a` queue at port 5201) route all packets to a single owner worker. Workers that RX a packet destined for that queue redirect via `BindingLiveState::enqueue_tx_owned` (in `userspace-dp/src/afxdp/umem.rs`), which acquires a `Mutex<VecDeque<TxRequest>>` to push into the owner's shared inbox. Under any workload with more than a handful of concurrent flows on a redirected worker, this mutex becomes a cross-core contention point that injects scheduling jitter into TCP's sender-arrival timeline.
+
+## Evidence
+
+From #704's 16-flow repro on the current helper (4 workers, 1 owner):
+
+- 5 flows run with healthy cwnd (~100 KB), retrans 256–476 per 30 s
+- 11 flows run with collapsed cwnd (10–44 KB), retrans 2338–21391 per 30 s
+
+The 5/11 split maps cleanly to "RSS-landed on the owner worker → enqueued via `enqueue_local_into_cos` (no mutex)" versus "RSS-landed elsewhere → redirected via `enqueue_tx_owned` (mutex)". Both runs reproduce the split. RSS distribution across 4 workers averages 4 flows/worker; with RSS hash imbalance a 5/11 instead of 4/12 is within normal variation.
+
+## Why a single mutex is the wrong primitive here
+
+The access pattern is MPSC: N producer workers push, 1 owner worker pops. A `Mutex<VecDeque>` serializes all producers against each other *and* against the owner's drain. Specifically:
+
+- Each producer holds the lock long enough to (a) check `pending_tx_len` atomic, (b) optionally drop the head on overflow, (c) `push_back`, (d) store `pending_tx_len`. Uncontended ~25 ns on modern x86; contended pathologies can easily hit 200–500 ns.
+- The owner's `take_pending_tx` short-circuits on `pending_tx_len == 0` without taking the lock, which is the one good property of the current design. But as soon as the inbox is non-empty, owner and all producers serialize.
+- 3 producer workers × ~5 kpps each = 15 kpps acquire-rate on the mutex. Plus owner polling at ~1 kHz. Contended acquires show up in TCP's inter-arrival gap as microsecond-scale stalls. A sender cwnd of 8 packets that expects back-to-back arrivals instead sees a gap → retransmit trigger.
+
+Even without measurable lock contention, the *cache line bounce* of the atomic `pending_tx_len` between 4 CPUs is a measurable tax. Every producer write invalidates the owner's cached line, every owner read invalidates the producers'.
+
+## Fix candidates
+
+### Option A: lock-free MPSC inbox per-binding
+
+Replace `Mutex<VecDeque<TxRequest>>` with an MPSC queue (e.g. `crossbeam::queue::SegQueue` or a hand-rolled bounded ring with per-sender slots). Producers push without coordinating with each other or the consumer. No lock, no serialization.
+
+Cost: `crossbeam` dependency, or ~200 lines of unsafe Rust for a hand-rolled ring. The queue itself is hot-path on every redirected packet.
+
+### Option B: per-sender inbox, owner aggregates
+
+Each non-owner worker has a dedicated inbox to each owner it redirects to. Owner drains all of them in round-robin. Eliminates cross-producer contention entirely (each producer writes only its own inbox). Adds `O(num_non_owner_workers)` inboxes per (ifindex, queue_id) pair, and the owner's drain loop touches more cache lines — but those lines are only touched when producer N has something to send, so cache footprint tracks actual traffic.
+
+### Option C: batched redirects
+
+Buffer outgoing redirects locally on each producer worker and flush in bursts (e.g. every 64 packets or every N µs). Reduces mutex acquire rate at the cost of latency. Safer than A/B as a narrow slice but doesn't eliminate the underlying contention.
+
+### Option D: hash-to-owner at RX
+
+*(truncated — 62 lines total)*
+
+
+---
+
+## #707 — CoS exact queue buffer undersized for multi-flow BDP (1g/16-flow: 1× per-flow BDP, TCP forced into RTO) [CLOSED] (closed 2026-04-17)
+
+## Problem
+
+The 1g exact queue's buffer (125 KB = `buffer-size 125k` in config, floored at `COS_MIN_BURST_BYTES = 96 KB`) is sized for single-flow BDP at the aggregate rate. For multi-flow workloads at high parallelism the per-flow BDP share is too small for TCP to stay out of RTO recovery.
+
+## BDP math
+
+- 1 Gbps target rate, 16 flows
+- Per-flow fair-share bandwidth: 1 Gbps / 16 = 62.5 Mbit/s
+- Cluster RTT: ~1 ms for local forwarding
+- Per-flow BDP = 62.5 Mbit/s × 1 ms = **7.8 KB**
+- 16 × BDP = 125 KB → **buffer == 1 BDP × flow count exactly**
+
+TCP cubic / BBR typically want buffer ≥ 2× BDP for steady-state throughput. At 1× BDP, any microburst overflows. Combined with SFQ bucket-cap dividing admission further (#705), each flow's admissible window is well below its transport-layer BDP.
+
+## Why this amplifies other issues
+
+The buffer undersize alone wouldn't be fatal — with enough slack, the SFQ bucket cap and the redirect jitter would be absorbed. At 1× BDP:
+- Bucket cap = buffer / 14 ≈ 9 KB ≈ 6 MSS → below TCP fast-retransmit threshold
+- Any microburst above 9 KB in one flow bucket → tail-drop
+- Microbursts from redirect mutex jitter (#706) regularly overshoot the cap
+
+Grow the buffer alone and you'd mask the problem but not fix it (bufferbloat would creep in at low flow counts instead). Shrink flow count and you lose the use case.
+
+The honest fix is: **buffer should scale with expected concurrency, not aggregate rate alone.**
+
+## Fix candidates
+
+### Option A: operator-provided buffer, no auto-scaling
+
+Document that 1g-exact-with-16-flows needs `buffer-size 500k` minimum (scale 4×). Ship a warning when `buffer_bytes / transmit_rate_bytes × 10^9` yields a per-MSS queue depth below some threshold (say, 32 MSS).
+
+Narrowest. No runtime change. Documentation-first.
+
+### Option B: dynamic buffer sizing based on observed flow count
+
+Track `active_flow_buckets` (already tracked for admission) and scale effective buffer as `max(buffer_bytes, active_flows × per_flow_min_depth)`. Problem: buffer *size* is allocated on queue construction (for the VecDeque backing). Would need to either pre-allocate generously, or live-grow.
+
+### Option C: separate "admission buffer" from "dequeue buffer"
+
+Current design conflates them. An admission check on a 9 KB bucket cap with a 125 KB physical buffer means the queue is usually 80%+ empty at the dequeue side. Decouple: keep the physical VecDeque backing large (e.g. 2× BDP at peak aggregate rate), but set per-flow admission based on observed RTT × fair-share rate.
+
+*(truncated — 63 lines total)*
+
+
+---
+
+## #708 — No enqueue-side pacing on CoS queues — TCP cwnd bursts overflow admission caps under multi-flow load [CLOSED] (closed 2026-04-17)
+
+## Problem
+
+The CoS shaper paces the **dequeue** side of the queue (root and per-queue token buckets). There is no pacing at the **enqueue** side. TCP senders on the host side of the firewall send at cwnd-rate in bursts — a cwnd worth of packets goes out back-to-back, then the sender waits for acks. Those bursts land in the CoS queue as a burst, not as a paced stream. Under multi-flow concurrency this produces microburst peaks that overflow per-flow admission caps (#705) and the physical buffer (#707) even when the steady-state aggregate is well under rate.
+
+## Why enqueue pacing matters
+
+Token-bucket shapers smooth over *windows*. A queue with `transmit-rate 1g` and `buffer-size 125k` will happily let 125 KB arrive in 1 µs and then release it at 1 Gbps over 1 ms. That's fine for one sender but breaks multi-flow fairness:
+
+- Sender A cwnd burst: 100 KB arrives in < 1 µs
+- Sender B cwnd burst: 100 KB arrives in the same 1 µs window (different NIC queue, different worker)
+- Both are trying to occupy the shared buffer at the same instant
+- One of them tail-drops
+
+With pacing at enqueue time, the bursts would be smoothed to their steady-state arrival rate before hitting the shared buffer, eliminating the microburst collision window.
+
+## Kernel/TCP context
+
+Modern Linux TCP (since 4.x) has optional sender-side pacing (`tcp_pacing_ss_ratio` + fq qdisc). On endpoints that enable it, cwnd bursts are already smoothed. Most cluster workloads do NOT enable fq by default — they use pfifo_fast — so senders burst at cwnd rate.
+
+The firewall has no visibility into endpoint pacing state. It has to defend itself.
+
+## Fix candidates
+
+### Option A: token-bucket pacing on enqueue
+
+Before `cos_queue_push_back` / admission check, run the packet through a token-bucket sized to the flow's fair-share rate. If tokens < packet_size, block the packet (synchronous wait) or defer (async, via timer wheel). Same token-bucket primitive as the existing shaper, applied on the other side.
+
+Problems: can't block in userspace RX path — backpressure would be needed. And "flow's fair-share rate" isn't known a priori; would need estimation or a per-flow token bucket with a quasi-static cap.
+
+### Option B: rate-limited enqueue at the per-bucket level
+
+Each SFQ bucket gets a token bucket sized to `queue_rate / bucket_count`. Packets can be enqueued up to the bucket's token budget; excess packets get dropped or deferred. Approximates per-flow pacing without needing per-flow state.
+
+Cost: one token bucket per SFQ bucket per queue — already have the SFQ bucket array, just add a `u64 tokens` + `u64 last_refill_ns` per bucket.
+
+### Option C: BQL (Byte Queue Limits) equivalent
+
+Linux's BQL limits the amount of in-flight traffic to each hardware TX queue based on observed TX completion rate. An AF_XDP analog would size the CoS buffer admission cap dynamically based on observed drain rate. When drain is slow, admission caps tighten; when drain catches up, caps relax.
+
+### Option D: ECN marking on admission instead of drop
+
+*(truncated — 65 lines total)*
+
+
+---
+
+## #709 — Low-rate exact queue owner worker is a hotspot — RX + redirected-drain + NAT all on one CPU [CLOSED] (closed 2026-04-17)
+
+## Problem
+
+Low-rate exact queues (`shared_exact == false`, i.e. below the 2.5 Gbps per-worker ceiling) route all packets through a single owner worker. That worker handles:
+
+1. Its own share of RX traffic (ingress from its bound NIC queue)
+2. The full CoS enqueue + drain for the queue it owns — including packets redirected from every other worker via `enqueue_tx_owned`
+3. Everything else a worker does: forwarding, NAT, session lookup, conntrack
+
+In the 16-flow 5201 test (#704), 11 flows redirect through the mutex to the owner; 5 flows are owner-local. The owner worker processes 3–4× more packets than any non-owner worker for this queue. At 1 Gbps and 1500 B packets that is ~85 kpps landing on the owner. RSS hash skew can make this worse — a "hot RSS hash" that sends 10+ flows to the same non-owner worker pushes that worker's forwarding path over its budget without the owner realizing.
+
+## Why this is a hotspot even though we said single-owner is fine for low-rate
+
+The #690/#697 rationale for routing low-rate exact queues to a single owner was "single owner per queue is within the 2.5 Gbps per-worker ceiling." That is still true for *this queue's CoS work*. But the owner is still a worker — it also runs RX, forwarding, NAT, session, conntrack for every packet on its bound NIC queue, plus CoS enqueue/drain for every redirected packet from other workers. The owner's per-packet budget is consumed by all of those, not just CoS drain.
+
+At 1 Gbps exact on the owner:
+- Owner's bound NIC queue: 1/4 × 1 Gbps = 250 Mbit redirected-local + 1/4 × 1 Gbps = 250 Mbit direct = 500 Mbit worth of RX work on the owner
+- Plus the 1 Gbps of CoS drain on the owner (drain processes all 16 flows' worth)
+- Total "owner work" is roughly 2× non-owner worker's load
+
+When owner's budget gets tight, CoS drain slips. Slipping drain means packets sit in the owner's inbox longer → observed as jitter by senders.
+
+## Observable effects in #704
+
+- Owner-local flows (5 on the owner worker) are healthy because their enqueue is in-process (`enqueue_local_into_cos`, no cross-thread synchronization)
+- Non-owner flows (11) see redirect mutex contention (#706) *and* wait behind other redirected traffic on the owner's drain
+- Owner worker drain latency is only indirectly observable right now (via TCP retrans counts)
+
+## Fix candidates
+
+### Option A: owner-worker CPU affinity + interrupt isolation
+
+Pin each worker to a dedicated CPU. Set `isolcpus` on those CPUs. Move NIC RSS interrupts to different CPUs. Eliminates OS-scheduler jitter that compounds with the owner hotspot.
+
+Operational, not code. Requires systemd unit update + kernel cmdline tuning. Largest operational win per line of change.
+
+### Option B: off-worker CoS drain (work-stealing)
+
+Have the owner's CoS queue drainable by any worker that has spare budget. The "owner" concept becomes "ownership of ARBITRATION" (one SFQ state, one cursor) rather than "ownership of execution" (all packets drain on one CPU). Requires lock-free concurrent drain — significantly more complex, but eliminates the hotspot entirely.
+
+### Option C: RSS retargeting for specific queues
+
+*(truncated — 69 lines total)*
+
+
+---
+
+## #710 — CoS: add drop-reason + per-queue + per-bucket telemetry to triage exact-queue drops [CLOSED] (closed 2026-04-17)
+
+## Problem
+
+When a CoS queue drops a packet, we have no way to answer "why". The drop could be from:
+
+1. Per-flow admission cap exceeded (`cos_queue_flow_share_limit`)
+2. Queue buffer cap exceeded (`queue.buffer_bytes`)
+3. Root interface token starvation (`root.tokens < head_len`)
+4. Per-queue token starvation (`queue.tokens < head_len`, exact only)
+5. TX ring full on submit (`writer.insert` returned 0)
+6. UMEM frame exhaustion (`free_tx_frames` empty)
+7. Redirect inbox full (`pending_tx` at `max_pending_tx` in `enqueue_tx_owned`, causes head drop)
+8. Completion ring reap lag (no direct drop, but starves free_tx_frames)
+
+Each of these has a different fix. #704's bimodal collapse could be caused by any of (1), (7), or a combination. Without drop-reason counters we can't actually triage.
+
+## Current observability
+
+- `tx_errors` — atomic, incremented on some error paths. Not reason-tagged.
+- `live.tx_packets` / `live.tx_bytes` — success counters
+- `live.set_error(String)` — most recent error reason, overwritten on every error. Useful for live debugging but useless for aggregate counting.
+- TCP retrans count from the endpoint — tells us the net effect but not which layer caused it
+
+No per-queue drop counts. No per-flow drop counts. No per-bucket drop counts. No histogram of queue depth or drain latency.
+
+## What we need
+
+### Minimum viable
+
+- Per-`(ifindex, queue_id)` counters, incremented at each drop site, reason-tagged:
+  - `admission_flow_share_drops`
+  - `admission_buffer_drops`
+  - `root_token_starvation_parks`
+  - `queue_token_starvation_parks`
+  - `tx_ring_full_drops`
+  - `redirect_inbox_overflow_drops` (on the owner side)
+- Exposed via the existing `/stats` gRPC endpoint and the Prometheus collector.
+
+### Useful-but-harder
+
+- Per-flow-bucket drop count histogram. Bucket is already the unit of admission, so this falls out naturally once per-bucket state is touched on the drop path.
+
+*(truncated — 68 lines total)*
+
+
+---
+
+## #711 — SFQ 64 buckets is too small — bucket collision probability dominates at 16+ flows [CLOSED] (closed 2026-04-17)
+
+## Problem
+
+The current low-rate exact SFQ design uses 64 hashed buckets to approximate per-flow fair queuing. The round-robin dequeue advances bucket-by-bucket, and the per-flow admission cap divides the buffer by `active_flow_buckets`. Two flows that hash to the same bucket share that bucket's dequeue slot *and* its admission cap. SFQ's promise is per-flow fairness; at 64 buckets with realistic hash collision rates, we deliver per-BUCKET fairness, which is not quite the same thing.
+
+## Math
+
+Birthday paradox for N flows into B buckets, probability of ≥1 collision:
+
+```
+P_collision(N, B=64) ≈ 1 − exp(−N*(N-1)/(2*B))
+```
+
+| N flows | P(≥1 collision) | expected pairs |
+|---------|-----------------|----------------|
+| 8       | ~40%            | 0.44           |
+| 12      | ~68%            | 1.03           |
+| 16      | ~88%            | 1.88           |
+| 24      | ~99%            | 4.31           |
+| 32      | 99.9%+          | 7.75           |
+
+At 16 flows (the #704 workload), nearly every run has at least one pair colliding, usually ~2 pairs. Each colliding pair gets ½ the service of a non-colliding flow. At 32 flows we routinely have 8 pairs colliding.
+
+## Why this is a scheduler semantics issue, not just a sizing nit
+
+"Per-flow fair" means: on a backlogged queue, each flow gets equal share of the output rate. SFQ bucketing trades this off for constant-time lookup — you look up the bucket by hash, not by tracking distinct flows. If the hash is large enough, collisions are rare and the approximation is good. 64 buckets is fine for ≤8 flows and broken for 16+.
+
+PR #693's per-queue hash seed randomization fixed the *adversarial* case (flows can't deliberately steer into collision), but didn't fix the *probabilistic* case (flows are going to collide by luck whenever N > sqrt(B)).
+
+## Fix candidates
+
+### Option A: grow bucket count
+
+`COS_FLOW_FAIR_BUCKETS: 64 → 1024`. Same math:
+
+| N flows | P(≥1 collision, B=1024) | expected pairs |
+|---------|-------------------------|----------------|
+| 16      | ~11%                    | 0.12           |
+| 32      | ~38%                    | 0.48           |
+| 64      | ~87%                    | 1.97           |
+
+
+*(truncated — 74 lines total)*
+
+
+---
+
+## #712 — Worker threads lack CPU pinning + IRQ isolation — OS scheduler jitter amplifies per-flow variance [CLOSED] (closed 2026-04-18)
+
+## Problem
+
+xpfd workers on the userspace dataplane run as regular CFS-scheduled threads. They share CPUs with:
+
+- NIC hardware interrupts (RSS distributes IRQs across CPUs; can collide with workers)
+- System-wide housekeeping (timers, RCU callbacks, kworkers, ksoftirqd)
+- Other processes (systemd, journald, chronyd, sshd)
+
+At any point an OS scheduler event (migration, preemption, IRQ handler, or RCU grace period) can stall a worker for 10–500 µs. At 1 Gbps × 1500 B, that's 8–420 missed packets of sender-side cwnd advancement. TCP senders see the gap as an implicit loss signal (delayed ACKs) or, worse, as real loss if the CoS queue overflows while the worker is descheduled.
+
+## Evidence this matters
+
+In #704 the owner worker's 1-second interval throughput stdev is 20 Mbps (~2% of aggregate). That's already low — the CoS shaper smooths the average well. But the per-flow jitter stdev is 21 Mbit on a 62 Mbit mean. 33% flow-level variance. Much of that is in the sub-second timescale where the shaper can't average it out.
+
+A worker descheduled for even 200 µs while holding "just drained a batch, about to refill free_tx_frames" leaves a visible gap in the TX ring. The NIC drains the ring and idles; TCP senders see the RTT tick up.
+
+## Fix candidates
+
+### Option A: CPU pinning
+
+- `CPUAffinity=N` on xpfd's systemd unit, with one worker per CPU
+- Choose CPUs that are not also handling NIC IRQs
+- Document the CPU layout per deployment shape
+
+Operational. Zero code. Largest real-world win per unit effort.
+
+### Option B: isolcpus + housekeeping CPU set
+
+- `isolcpus=N-M nohz_full=N-M rcu_nocbs=N-M` on kernel cmdline
+- Moves all housekeeping off worker CPUs
+- Workers run on CPUs that the scheduler will not interrupt for system work
+- Requires deployment-time kernel cmdline changes
+
+### Option C: SCHED_FIFO
+
+- Raise worker threads to `SCHED_FIFO` at real-time priority
+- Guarantees no preemption by CFS-scheduled work
+- Risk: a misbehaving worker can hog the CPU indefinitely. Need watchdog.
+
+### Option D: cgroup v2 cpuset + cpu.max
+
+*(truncated — 80 lines total)*
+
+
+---
+
+## #717 — userspace-dp: add latency-envelope clamp to cos_flow_aware_buffer_limit [CLOSED] (closed 2026-04-18)
+
+## Context
+
+Deferred from #716 review. `cos_flow_aware_buffer_limit()` now scales the aggregate admission cap with `prospective_active × COS_FLOW_FAIR_MIN_SHARE_BYTES`, which correctly unblocks the TCP fast-retransmit floor for small operator buffers. It has **no high-side clamp**, so at the architectural maximum (`COS_FLOW_FAIR_BUCKETS = 1024` active flows) the cap can reach:
+
+```
+1024 × 24 KB ≈ 24 MB
+```
+
+On a 1 Gbps queue that is roughly **190 ms of queue residence time** — far outside the regime where the scheduler is predictable. The reviewer flagged this across #716 discussions; it was explicitly deferred because clamping queueing delay is an operator-visible behaviour choice, not a bug fix. The current rustdoc on `cos_flow_aware_buffer_limit` already flags the concern at the source.
+
+## Proposed shape (per review)
+
+Add a derived max-queue-delay constant and clamp the flow-aware expansion against it:
+
+```rust
+const COS_FLOW_FAIR_MAX_QUEUE_DELAY_NS: u64 = 5_000_000; // 5 ms — tuneable
+
+// Inside cos_flow_aware_buffer_limit(...):
+let delay_cap = ((queue.transmit_rate_bytes as u128)
+    * (COS_FLOW_FAIR_MAX_QUEUE_DELAY_NS as u128)
+    / 1_000_000_000u128) as u64;
+
+base.max(prospective_active.saturating_mul(COS_FLOW_FAIR_MIN_SHARE_BYTES))
+    .min(delay_cap.max(base))
+```
+
+The `.max(base)` on the clamp preserves the operator's explicit `buffer-size` configuration: if the operator wanted a deeper buffer, we honour it and do not clamp below their intent.
+
+## Design questions to settle before landing
+
+1. Is 5 ms the right default? BDP on our 1 Gbps test queue is ~125 KB (~1 ms RTT), so 5 ms = 5× BDP. Generous for bulk TCP, still bounded tail.
+2. Should this be operator-configurable (e.g. `class-of-service max-queue-delay <ms>`) or fixed?
+3. Interaction with #707 (buffer undersizing) — if the operator sets `buffer-size` small but expects `COS_FLOW_FAIR_MIN_SHARE_BYTES` protection, does the delay clamp override them? Current shape honours the operator's `buffer-size` (via the `.max(base)`), but the flow-aware expansion path can still be clamped.
+
+## Acceptance criteria
+
+- Constant (or config knob) documented with the BDP/delay rationale.
+- `cos_flow_aware_buffer_limit` tests cover: small base wins, prospective floor wins, delay cap wins (new).
+- `show class-of-service interface` surfaces the effective cap so operators can see when the clamp is active.
+
+
+*(truncated — 44 lines total)*
+
+
+---
+
+## #718 — userspace-dp: AQM for exact CoS queues — ECN marking and/or CoDel admission to fix bufferbloat-driven cwnd collapse [CLOSED] (closed 2026-04-18)
+
+## Context
+
+Surfaced by #716 live validation. The 16-flow iperf3 workload on the 1 Gbps exact queue (port 5201) still shows:
+
+| Run | Total | Ratio | Retrans/30s | cwnd min/max | Collapsed (<50 KB) |
+|---|---|---|---|---|---|
+| 1 | 1.08 Gbps | 1.72× | 142 k | 8 / 74 KB | 9 / 16 |
+| 2 | 1.16 Gbps | 1.74× | 232 k | 7 / 82 KB | 14 / 16 |
+| 3 | 1.11 Gbps | 1.66× | 208 k | 10 / 90 KB | 12 / 16 |
+
+Rate distribution is flat (ratio ~1.5×) and total is at the queue cap. The remaining pathology is **TCP cwnd collapse from bursty tail-drops on a ~10 ms bufferbloat queue** (scheduler auto-sizes the 1 Gbps queue's buffer to ~1.19 MiB ≈ 9.5 ms × rate). At that buffer depth:
+- Single-packet drops produce enough dupacks for fast-retransmit
+- But drops often come in *bursts* (tail-drop at the end of a microburst), producing 0–2 dupacks → no fast-retransmit → RTO → cwnd = 1 MSS
+
+The larger caps from #716 do not move this metric because the workload is not admission-limited; it's dropping by bufferbloat.
+
+## Fix options (#707 Options D and E, now real work)
+
+### Option A: ECN marking (Option D from #707)
+
+On admission, when `queue.queued_bytes > ecn_threshold` (e.g. 50% of buffer_limit), mark the packet's IP ECN field `ECT → CE` instead of tail-dropping. Linux TCP cubic / BBR with ECN backs off cwnd smoothly instead of halving/RTOing.
+
+- Lowest-risk, smallest behavioural surface change.
+- Requires rewriting the IP header's ECN bits on the TX path and recomputing the IP checksum (incremental).
+- Flows that do not negotiate ECN continue to tail-drop — degrades gracefully.
+
+### Option B: CoDel AQM (Option E from #707)
+
+Track per-packet queue sojourn time. When a packet's time-in-queue > target (5 ms default per RFC 8289), mark/drop as signal. Per-flow variant (FQ-CoDel) handles fairness natively.
+
+- Larger redesign; changes admission semantics from byte-cap to time-in-queue.
+- Best TCP behaviour at scale.
+- Need per-packet timestamp at enqueue time. On our already-HFT-tuned hot path this adds a `monotonic_nanos()` call per enqueue and a compare per dequeue — measurable but tolerable.
+
+### Option C: hybrid
+
+ECN-mark on threshold, tail-drop on hard cap. Matches modern Linux default behaviour (fq_codel + ECN).
+
+## Interaction with the deferred latency-envelope clamp
+
+
+*(truncated — 55 lines total)*
+
+
+---
+
+## #722 — userspace-dp: ECN mark threshold should be per-flow, not aggregate, on flow-fair exact queues [CLOSED] (closed 2026-04-18)
+
+## Context
+
+Surfaced by live validation of #718 on the 16-flow iperf3 / 1 Gbps exact queue workload (master at \`23428734\`, 2026-04-17). ECN CE marking was expected to smooth TCP cwnd dynamics on ECN-negotiated flows; the metric did not move.
+
+### Live observation
+
+Mid-test \`show class-of-service interface\` output:
+\`\`\`
+Queue  Owner  Class      Exact  Transmit rate  Buffer       Queued pkts  Queued bytes
+4      1      iperf-a    yes    1.00 Gb/s      1.19 MiB     255          378.02 KiB
+\`\`\`
+
+- Aggregate queue depth steady at ~378 KB (31% of the 1.19 MiB buffer).
+- ECN threshold (50% of buffer_limit) = ~594 KB.
+- **Queue never crosses the ECN threshold** → \`apply_cos_admission_ecn_policy\` early-returns, no marks, \`admission_ecn_marked\` stays 0.
+
+Meanwhile the 3× iperf3 runs still show 160–280 k retrans / 30 s and 10–15 / 16 flows with cwnd < 50 KB.
+
+## Root cause
+
+Drops on this workload come from the **per-flow fair-share cap** (\`flow_share_exceeded\`), not the aggregate buffer cap (\`buffer_exceeded\`). With:
+- Per-flow cap: \`buffer_limit / 16 flows = 75 KB\` (before share clamp) or \`COS_FLOW_FAIR_MIN_SHARE_BYTES = 24 KB\` (clamped floor).
+- BDP under bufferbloat: 62 Mbps fair-share × ~3 ms queue delay = ~23 KB per flow.
+
+Flow buckets regularly exceed 24 KB (TCP bursts past fair share during recovery), triggering per-flow admission drops. #718's aggregate threshold never fires because the aggregate stays at ~30% utilisation while per-flow buckets are hitting their cap.
+
+## Proposed fix
+
+Add a per-flow ECN mark threshold that fires when a single flow's bucket approaches its share cap, alongside the existing aggregate threshold:
+
+\`\`\`rust
+// In apply_cos_admission_ecn_policy(...):
+let share_cap = cos_queue_flow_share_limit(queue, buffer_limit, flow_bucket);
+let flow_ecn_threshold = share_cap
+    .saturating_mul(COS_ECN_MARK_THRESHOLD_NUM)
+    / COS_ECN_MARK_THRESHOLD_DEN.max(1);
+
+let aggregate_above_threshold = queue.queued_bytes > aggregate_ecn_threshold;
+let flow_above_threshold = queue.flow_bucket_bytes[flow_bucket] > flow_ecn_threshold;
+
+
+*(truncated — 67 lines total)*
+
+
+---
+
+## #725 — #721/#722 ECN code dormant on current test workload — validation pipeline gap [CLOSED] (closed 2026-04-18)
+
+## Summary
+
+After #716, #720, #721, #722 landed, live 16-flow iperf3 on port 5201 (the 1 Gbps exact queue on `loss:xpf-userspace-{fw0,fw1}`) showed no movement in retransmit or cwnd-collapse numbers. Once the admission drop counters were surfaced via #724, the reason became unambiguous. Filing this so the next engineer does not re-discover it.
+
+## Live counters mid-test, queue 4 (iperf-a, 1 Gbps)
+
+```
+Drops: flow_share=1923  buffer=0  ecn_marked=0
+```
+
+Taken ~10 s into a 30 s run. Approximate steady-state:
+
+- `flow_share_drops`: ~190/sec (dominant drop source by orders of magnitude)
+- `buffer_drops`: **0** (aggregate cap never fires — #716/#720 are working as intended, buffer stays at ~31% utilisation)
+- `ecn_marked`: **0** across all runs
+
+## Why `ecn_marked` is zero
+
+Tcpdump on the client shows every packet arriving at the firewall with `tos 0x0` — all NOT-ECT. ECN was never negotiated end-to-end:
+
+- Setting `net.ipv4.tcp_ecn=1` on `cluster-userspace-host` and both firewalls has no effect, because the iperf3 server side (`172.16.80.200`) appears to live on bare metal or a network segment I cannot control.
+- Without ECN negotiation at the TCP handshake, both sides stay NOT-ECT for the life of the connection.
+- `maybe_mark_ecn_ce` correctly early-returns on NOT-ECT packets per RFC 3168 §6.1.1.1 — the firewall must not unilaterally force ECN on flows that did not opt in.
+- Therefore the per-flow and aggregate ECN mark thresholds from #721 / #722 are **structurally correct but dormant**. They would fire on the current workload (flow buckets routinely cross the 50%-of-share-cap threshold) *if* packets were ECT.
+
+## Consequence for TCP
+
+`flow_share_drops` at ~190/sec means each of the 16 flows is losing a packet roughly every 1–2 seconds. Because drops arrive in bursts (tail-drop on microbursts), they do not consistently produce 3 dupacks for fast-retransmit → flows take RTO → cwnd resets to 1 MSS → the 10–15/16 cwnd-collapse pattern we keep seeing.
+
+## Validation pipeline gap
+
+This is the underlying problem:
+1. We iterated on admission-path policy for three PRs (#721, #722, plus #720's adjacent clamp) without ever confirming a single admission mark fired on the test workload.
+2. `show class-of-service interface` did not surface the drop counters until #724, so there was no way to verify live behaviour short of tcpdump.
+3. The only iperf3 target available on this test infra (`172.16.80.200`) does not participate in ECN negotiation, so any ECN-based AQM is untestable end-to-end.
+
+## Paths forward
+
+1. **Control the ECN test endpoint**: run `iperf3 -s` on a VM we already have access to (`loss:cluster-userspace-host` or a sibling VM on the WAN side), ensure `tcp_ecn=1` on both ends, verify ECT bits on the wire, and watch `ecn_marked` bump during load. This validates #721/#722 end-to-end or shows a subtle design bug.
+2. **CoDel-style AQM on the flow-share admission path**: drop or mark packets based on per-flow sojourn time rather than byte cap alone. Works without endpoint ECN cooperation because it acts via drop semantics TCP already understands. Scope: per-packet enqueue timestamp, dequeue-time check, sojourn-time-over-target drop. Larger than #721/#722 but independent of endpoint behaviour.
+
+*(truncated — 56 lines total)*
+
+
+---
+
+## #732 — cos: OwnerProfile line renders per-binding counters repeated under every queue row [CLOSED] (closed 2026-04-19)
+
+## Symptom
+
+The `OwnerProfile:` line added in #731 under each queue in `show class-of-service interface` shows identical `owner_pps` / `peer_pps` values on every queue of the same binding:
+
+```
+Queue 0 best-effort:
+  OwnerProfile: drain_p50=0us drain_p99=8us redirect_p99=0us owner_pps=0 peer_pps=1741381
+Queue 4 iperf-a:
+  OwnerProfile: drain_p50=0us drain_p99=8us redirect_p99=0us owner_pps=0 peer_pps=1741381
+Queue 5 iperf-b:
+  OwnerProfile: drain_p50=0us drain_p99=8us redirect_p99=0us owner_pps=0 peer_pps=1741381
+```
+
+Same for the three histogram-derived percentiles. The repetition is not wrong — the underlying counters genuinely live on `BindingLiveState` (per-binding, not per-queue, per the #709 Option E plan §4 storage decision). But rendering them per-queue makes it look like every queue is reporting the same data, which is confusing for an operator scanning queue-level stats.
+
+## Fix options
+
+**A.** Keep storage per-binding, change rendering: emit a single `OwnerProfile:` block at the interface level (above the Queues table), instead of under each queue row. One-line structural edit in `pkg/dataplane/userspace/cosfmt.go`; keep the storage + wire contract unchanged.
+
+**B.** Split storage: add per-queue `owner_pps` / `peer_pps` counters, increment them at the per-queue enqueue site. Preserves the current per-queue render layout. Costs one extra atomic per enqueue, per-queue histogram storage. Bigger change; only worthwhile if we actually need per-queue attribution for pps.
+
+Option A is probably the right call — the histograms are drain-invocation-level (one per binding, not one per queue), and per-queue pps is recoverable from existing `queued_pkts` delta. Filing for discussion.
+
+## Acceptance
+
+- `show class-of-service interface` no longer repeats the same `OwnerProfile:` numbers across queues of the same binding.
+- Wire contract change is backward-compatible (additive JSON fields).
+- Histograms' Prometheus cardinality stays bounded.
+
+## Refs
+
+- #709 (closed) — where the telemetry came from.
+- #731 — PR that landed the current rendering.
+- `docs/709-owner-hotspot-plan.md` §4 — rationale for per-binding storage.
+
+---
+
+## #735 — cos: #708 pacing with MIN_SHARE_BYTES burst cap doubles retrans — retry with share_cap-sized cap [CLOSED] (closed 2026-04-18)
+
+## Finding from live validation of #734
+
+#734 merged the per-SFQ-bucket pacing gate per the architect plan at `docs/708-enqueue-pacing-plan.md`. Live 16-flow iperf3 on port 5201 after merge:
+
+| Metric | Pre-#708 baseline | Post-#708 | Δ |
+|---|---|---|---|
+| `flow_share_drops` / 30s | 75–156 | **0** | −100% |
+| `ecn_marked` / 30s | 97–101 k | 27 k | −73% |
+| `admission_pacing_drops` / 30s | — | **23 k** | new counter firing heavily |
+| iperf3 retransmits / 30s | 114–136 k | **260 k** | **+100%** |
+| Per-flow rate ratio | 1.24–1.28× | **1.55×** | degraded |
+| cwnd min/max | 7/16 KB | 6/17 KB | unchanged |
+
+The counter fires (not dormant, so the scope is right in principle) but the effect is **net negative on the jitter metrics we actually care about**. flow_share drops went to zero but retransmits doubled and fairness degraded.
+
+## Root cause
+
+The burst cap chosen in the architect plan §5 is `COS_FLOW_FAIR_MIN_SHARE_BYTES = 24 KB` (the fast-retransmit floor). TCP cubic at steady state routinely has cwnd > 24 KB per flow during burst transmission — that's normal operation, not a microburst. Pacing drops those legitimate bursts, and a drop is a harsher signal than a CE mark.
+
+The ordering invariant ("ECN first, pacing second") protects against ECN becoming dead code, but doesn't protect against the marked packet ALSO being dropped by the pacing gate on the next step. Sender sees: the marked packet arrived (CE signal) AND the follow-up packet was lost (drop signal). TCP weights the drop heavier — so the CE signal is effectively discarded, and we land in the drop-recovery regime.
+
+## Proposed retry
+
+Change the burst cap from `COS_FLOW_FAIR_MIN_SHARE_BYTES` to the per-flow `share_cap` returned by `cos_queue_flow_share_limit`. At 16 active flows on the 1 Gbps queue:
+
+- Old cap: 24 KB (min-share floor)
+- New cap: ~76 KB (buffer_limit / 16 clamped)
+
+This lets a flow burst up to its fair share of the *buffer* before pacing kicks in. Pacing still catches egregious microbursts (one flow hogging multiple flow-shares' worth of bytes in a burst), but steady-state cwnd operates freely.
+
+Expected outcome:
+- `admission_pacing_drops` should drop from 23k/30s to ≤1k/30s (only true pathological bursts).
+- Retransmits should return toward the 114–136 k baseline.
+- Rate ratio back to 1.24–1.28×.
+- `flow_share_drops` may climb back slightly — acceptable if retrans + ratio improve.
+
+If the tuned cap STILL regresses retrans, that's evidence pacing is fundamentally the wrong mechanism for this workload and #708 should close as wontfix.
+
+## Process note
+
+
+*(truncated — 48 lines total)*
+
+
+---
+
+## #738 — userspace-dp: pin_current_thread() should pick the Nth allowed CPU, not absolute CPU N [CLOSED] (closed 2026-04-18)
+
+## Problem
+
+\`pin_current_thread(worker_id)\` in \`userspace-dp/src/afxdp/neighbor.rs\`:
+
+\`\`\`rust
+let cpus = thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+let cpu = (worker_id as usize) % cpus.max(1);
+let mut set: libc::cpu_set_t = core::mem::zeroed();
+libc::CPU_ZERO(&mut set);
+libc::CPU_SET(cpu, &mut set);
+let _ = libc::sched_setaffinity(0, core::mem::size_of::<libc::cpu_set_t>(), &set);
+\`\`\`
+
+When the process is launched with systemd \`CPUAffinity=2 3 4 5\`:
+
+- \`available_parallelism()\` correctly returns 4 (honours the inherited mask)
+- \`CPU_SET(worker_id % 4)\` pins to **absolute** CPU 0/1/2/3, not the 0th..3rd CPU of the allowed set
+- \`sched_setaffinity()\` succeeds (not blocked by cgroup cpuset, since \`CPUAffinity=\` is plain task affinity)
+- Each worker lands on an absolute CPU **outside** the unit-level mask
+
+Verified live on the loss userspace lab post-pin (see #712 / PR #737):
+\`\`\`
+xpf-userspace-w cpus_allowed=0
+xpf-userspace-w cpus_allowed=1
+xpf-userspace-w cpus_allowed=2
+xpf-userspace-w cpus_allowed=3
+xpf-slowpath    cpus_allowed=2-5
+xpf-state-write cpus_allowed=2-5
+\`\`\`
+
+This makes systemd \`CPUAffinity=\` a no-op for the hot-path workers — exactly the threads operators most want pinned — while the Go main + auxiliary threads do honour the mask. Measured effect on the loss lab in PR #737: no metric moved.
+
+## Fix shape
+
+Call \`sched_getaffinity()\` on the current thread, enumerate the allowed CPUs, and pick the \`worker_id % count\`'th entry. Something like:
+
+\`\`\`rust
+pub(super) fn pin_current_thread(worker_id: u32) {
+    #[cfg(target_os = "linux")]
+    unsafe {
+
+*(truncated — 78 lines total)*
+
+
+---
+
+## #739 — #712 Option B: kernel cmdline isolcpus/nohz_full/rcu_nocbs for the loss userspace lab [OPEN]
+
+## Context
+
+#712 Option A (systemd \`CPUAffinity=\`) was measured on the 6-core loss userspace lab and was a no-op — primarily because userspace-dp overrides the mask per worker (tracked separately at #738). Even once #738 lands, Option A only keeps workers away from NIC IRQ CPUs at scheduler level; kernel timer ticks, RCU callbacks, and \`kworker\` still run on the worker CPUs and can stall them for 10-500 µs.
+
+Option B from #712 adds the kernel-level isolation:
+
+\`\`\`
+isolcpus=2-5 nohz_full=2-5 rcu_nocbs=2-5
+\`\`\`
+
+This moves the scheduler timer tick, RCU grace-period callbacks, and ksoftirqd off the worker CPUs entirely. Workers get tickless, RCU-cb-free CPUs; the kernel stops periodically interrupting them.
+
+## What this requires
+
+- Grub cmdline edit + reboot on each VM (not a live reload).
+- Any non-xpfd process that needs substantial CPU has to be pinned to CPUs 0-1 by the operator; \`isolcpus=\` does not enforce that, it just tells the scheduler "don't put things here by default". Helpful if combined with cgroup cpuset under Option D.
+
+## Dependencies
+
+- #738 — without the worker-pin fix, \`isolcpus=\` still won't stop workers from landing on CPUs 0/1 where the heaviest mlx5 comp IRQs fire, because userspace-dp pins absolute CPU N. The two issues land together or the measurement is useless.
+
+## Acceptance
+
+- Write a drop-in for \`/etc/default/grub\` on each VM with \`GRUB_CMDLINE_LINUX_DEFAULT+=\` for the three flags, apply via \`update-grub\`, reboot.
+- Re-measure Phase 4 from PR #737: 3 × 30 s × 16-flow iperf3, compute rate ratio / retrans / per-flow CoV mean/max.
+- Target from #712: per-flow CoV ≤ 10%. Decision rule from PR #737 stays: keep if any metric moves ≥ 5-15%, revert + document otherwise.
+- Document in \`docs/712-cpu-pinning-recipe.md\` §"What the recipe does NOT cover" → move isolcpus from "NOT" to "optional when allowed by deployment" with the measurement attached.
+
+## Not in scope for this issue
+
+- Option C (SCHED_FIFO). Still deferred.
+- Option D (cgroup v2 cpuset). Separate follow-up.
+- Option E (busy-poll). Separate.
+- ethtool RSS indirection reshape. Separate issue.
+
+## Refs
+
+- #712 — CPU pinning + IRQ isolation umbrella
+- #738 — worker-pin logic that blocks any pinning-based option today
+- PR #737 — Phase 1 baseline + no-op finding for Option A
+
+---
+
+## #745 — userspace-dp: sum owner-profile telemetry instead of max-merging it [CLOSED] (closed 2026-04-18)
+
+## Problem
+
+`#709` added owner-profile telemetry for low-rate exact CoS queues, but the merged aggregation path folds those fields with per-bucket / per-counter `max` instead of sum.
+
+That is the wrong operator contract once more than one snapshot contributes to the same queue row:
+- per-bucket `max` can manufacture a histogram no worker actually observed
+- `drain_invocations = max(...)` breaks the invariant that `sum(drain_latency_hist) == drain_invocations`
+- queue-level `owner_pps` / `peer_pps` stop being totals and become “largest contributor seen”
+
+In other words, the current aggregation can render internally inconsistent telemetry while looking superficially plausible.
+
+## Why This Matters
+
+For CoS triage, the owner-profile is supposed to answer a concrete question: what did this queue actually do? If the exported histogram is a bucket-wise splice of different workers and the invocation counter is only the larger side, operators cannot trust the profile.
+
+That is worse than missing telemetry. It gives a confident but false picture of the drain path.
+
+## Correct Contract
+
+For queue-level owner-profile export:
+- histogram buckets must be summed across contributors
+- invocation counters must be summed across contributors
+- pps counters must be summed across contributors
+- the exported queue row must preserve `sum(drain_latency_hist) == drain_invocations`
+
+For owner-local exact queues, sum and max are equivalent because only one contributor is non-zero.
+For shared-exact or any future multi-contributor topology, sum is the only coherent aggregate.
+
+## Acceptance Criteria
+
+- worker-local merge path uses saturating sum, not max
+- coordinator cross-worker aggregation uses saturating sum, not max
+- regression tests pin that:
+  - disjoint histogram buckets from multiple contributors are preserved
+  - `drain_invocations`, `drain_noop_invocations`, `owner_pps`, and `peer_pps` sum correctly
+  - `sum(hist) == invocations` after aggregation
+
+## Notes
+
+This is correctness work, not a hot-path throughput optimization. The important part is making operator telemetry truthful under multi-contributor exact queue service.
+
+*(truncated — 41 lines total)*
+
+
+---
+
+## #746 — userspace-dp: isolate owner-profile telemetry state from hot binding cachelines [CLOSED] (closed 2026-04-18)
+
+## Problem
+
+`#709` added owner-profile telemetry atomics to `BindingLiveState`, but the current layout leaves those counters and histograms packed into the shared live-state object without an explicit cacheline isolation contract.
+
+That is acceptable for correctness, but it is not a good long-term shape for a low-latency dataplane:
+- owner and peer workers can touch adjacent owner-profile atomics on the same binding
+- histogram/counter updates can bounce cachelines that also carry unrelated live-state fields
+- telemetry intended to be observational can start injecting measurable noise into the fast path
+
+## Why This Matters
+
+This code is in a shared live-state object on the dataplane hot side. Even if the per-update cost is small, false sharing here is self-inflicted jitter. HFT-style engineering keeps observability from perturbing scheduling behavior unless there is a strong reason not to.
+
+## Desired Shape
+
+- owner-profile telemetry atomics should live on their own cacheline(s)
+- unrelated binding live-state fields should not share those lines
+- the layout contract should be explicit in code, not incidental field ordering
+- if a cheaper publish/snapshot shape exists, prefer that over high-frequency shared atomic churn
+
+## Acceptance Criteria
+
+- field placement is documented and enforced for owner-profile telemetry state
+- no unrelated hot binding state shares those cachelines
+- any refactor preserves current owner-profile semantics and status export
+- perf review confirms we did not add new contention in the owner/peer update path
+
+## Notes
+
+This is a follow-on performance hygiene issue. It should be handled separately from the telemetry aggregation correctness fix.
+
+
+---
+
+## #747 — cos: Glide-style per-flow rate signal for ECN marker threshold on heterogeneous workloads [CLOSED] (closed 2026-05-05)
+
+## Context
+
+Our current ECN CE-marking gate at CoS admission (`apply_cos_admission_ecn_policy` in `userspace-dp/src/afxdp/tx.rs`) uses a **byte-depth** signal per flow bucket:
+
+```rust
+let flow_above_threshold =
+    queue.flow_bucket_bytes[bucket] > share_cap * COS_ECN_MARK_THRESHOLD_NUM / COS_ECN_MARK_THRESHOLD_DEN;
+```
+
+Depth-threshold works on the current lab workload (16 parallel iperf3 elephants) because every flow is trying to saturate. Post-#728 results: rate ratio 1.24–1.28×, ecn_marked ~100k/30s, flow_share_drops < 200/30s.
+
+On **heterogeneous workloads** — bulk flows sharing a queue with mice (DNS, short HTTP, control-plane traffic) — the depth threshold false-positives on mice. A short-lived flow's peak-burst crosses 50% of its `share_cap` for one or two packets, gets CE-marked, backs off unnecessarily. The mouse pays the same ECN cost as the elephant despite contributing a tiny fraction of the queueing pressure.
+
+This is the problem [Glide](https://datatracker.ietf.org/doc/html/draft-ietf-tcpm-accurate-ecn) solves at the sender with its fairness-mode rate estimate:
+
+```
+est_ce_Bps = delivered_ce * pacing_rate / delivered
+```
+
+Elephants hit the 50 MB/s default target because `pacing_rate` is high; mice with identical CE ratio stay below it because `pacing_rate` is low. The absolute-rate signal discriminates mice from elephants where the CE-ratio / depth signal does not.
+
+## Proposed fix: firewall-side rate signal, replacing the depth threshold inside the ECN marker
+
+At the admission gate we don't have `pacing_rate` (sender-endpoint state), but we can compute the firewall's equivalent: observed per-flow bytes-per-second as an EWMA over packet inter-arrival deltas per bucket.
+
+```rust
+// new state on CoSQueueRuntime — same shape as flow_bucket_bytes
+flow_bucket_rate_bytes_ewma: [u64; COS_FLOW_FAIR_BUCKETS],
+flow_bucket_last_arrival_ns: [u64; COS_FLOW_FAIR_BUCKETS],
+
+// per-admission, pre-mark
+let dt = now_ns.saturating_sub(queue.flow_bucket_last_arrival_ns[bucket]);
+if dt > 0 {
+    let inst_rate = item_len.saturating_mul(1_000_000_000) / dt;
+    let ewma = queue.flow_bucket_rate_bytes_ewma[bucket];
+    // 7/8 old + 1/8 new — standard TCP-style EWMA
+    queue.flow_bucket_rate_bytes_ewma[bucket] = (ewma.saturating_mul(7) / 8)
+        .saturating_add(inst_rate / 8);
+}
+queue.flow_bucket_last_arrival_ns[bucket] = now_ns;
+
+*(truncated — 99 lines total)*
+
+
+---
+
+## #751 — userspace-dp: make owner-profile telemetry queue-scoped for exact CoS [CLOSED] (closed 2026-04-19)
+
+## Problem
+
+The owner-profile telemetry added in `#709` is sourced from `BindingLiveState`, which is binding-scoped. Recent fixes now correctly keep shared-exact, non-exact, and ambiguous shapes at zero rather than exporting false per-queue data.
+
+That still leaves one real feature gap: when a binding services more than one owner-local exact queue, we do not yet have queue-scoped owner-profile accounting. The current safe behavior is to suppress the profile entirely for that binding because any queue-row export would be a mixed binding-wide profile.
+
+## Why This Matters
+
+For operator triage, the queue row needs to answer a precise question: what did this queue's exact drain path do? A binding-wide snapshot duplicated across multiple queue rows is not just low fidelity; it is wrong.
+
+Zeroing ambiguous rows is the correct short-term behavior, but it means the telemetry disappears exactly on the more complex multi-queue shapes where it would be useful.
+
+## Desired Shape
+
+- owner-profile accounting should be maintained per exact queue, not per binding
+- drain latency histogram, redirect-acquire histogram, invocation counters, and owner/peer PPS should all be attributable to one queue row without ambiguity
+- shared-exact queue export must still preserve the aggregation invariant `sum(hist) == invocations`
+- status export should no longer need the current "unique queue or zero" guard
+
+## Acceptance Criteria
+
+- exact drain path records owner-profile telemetry against queue-local state
+- worker/coordinator status export surfaces queue-scoped values without binding-level duplication
+- regressions pin:
+  - two owner-local exact queues on one binding produce distinct queue rows
+  - shared-exact aggregation remains coherent across contributors
+  - non-exact queues still export zero owner-profile telemetry
+
+## Notes
+
+This is follow-on correctness/observability work. It should not perturb the exact dataplane hot path more than necessary; if the per-queue accounting shape adds shared-atomic churn, the design is wrong.
+
+
+---
+
+## #752 — userspace-dp: keep CoS owner-profile export zero unless queue attribution is unambiguous [CLOSED] (closed 2026-04-18)
+
+## Problem
+
+The current CoS owner-profile export path snapshots `BindingLiveState` once per binding and then attributes that same profile to every queue row in the binding's CoS runtime.
+
+That violates the wire contract in two concrete ways:
+- non-exact queues can inherit owner-profile data even though the protocol says they must stay zero
+- shared-exact queues can inherit owner-profile data even though the protocol says they must stay zero
+
+It also creates a third ambiguity: if a binding services more than one owner-local exact queue, duplicating the same binding-wide profile into multiple queue rows is not truthful queue-level telemetry.
+
+## Why This Matters
+
+This is operator-facing correctness, not cosmetics. A queue row that claims drain/redirect/pps data must describe that queue, not “whatever this binding happened to do across several queues.”
+
+For shared-exact and non-exact queues the current behavior is simply out of contract. For multi-owner-local exact shapes the current behavior is ambiguous and should be suppressed until we have queue-scoped accounting.
+
+## Correct Near-Term Behavior
+
+- surface owner-profile telemetry only on an exact, owner-local queue row
+- if the binding has more than one owner-local exact queue, suppress the owner-profile on all of them rather than exporting a mixed binding-wide profile
+- keep shared-exact and non-exact queue rows at zero
+
+## Acceptance Criteria
+
+- worker CoS status build only merges owner-profile into one unambiguous owner-local exact queue row
+- shared-exact queue rows export zero owner-profile telemetry
+- non-exact queue rows export zero owner-profile telemetry
+- ambiguous multi-owner-local exact bindings export zero owner-profile telemetry
+- regressions pin each of those cases
+
+## Follow-up
+
+True queue-scoped accounting for multi-owner-local exact bindings is tracked separately in #751.
+
+
+---
+
+## #754 — cos: 1 Gbps exact queue over-throttles to 60% of cap — ECN threshold too aggressive for low-rate queues [CLOSED] (closed 2026-04-19)
+
+## Summary
+
+The 1 Gbps `iperf-a` exact queue (port 5201) is delivering only **~60% of its configured cap** under 16-flow iperf3 load, because the ECN mark threshold fires on virtually every cwnd-growth attempt. The 10 Gbps `iperf-b` queue on the same interface / config shape delivers 96% of its cap.
+
+Root cause: the ECN threshold is a **fixed fraction** of the per-flow `share_cap`, which scales with buffer-per-flow but NOT with the queue's actual drain rate. On low-rate queues the share_cap is small in absolute terms even though it represents a fair share of buffer; the threshold ends up at the same order as TCP cubic's steady-state cwnd and marks continuously.
+
+Uncovered while investigating why 16-flow fairness stayed at 1.48× ratio even on a 300s window (ruling out TCP-cyclic-variance as the cause). The 300s per-flow rate distribution is bimodal (7 flows pinned at 30 Mbps, 9 at 42–46 Mbps), which is the signature of flows finding two equilibrium points under continuous mark pressure, not variance averaging toward a mean.
+
+## Measurement — observed on master `e8e7533a` (post-#750)
+
+### Per-queue delivery on 172.16.80.200:
+
+| Port | Queue | Cap | Single-flow | 16-flow total | % of cap |
+|---|---|---|---|---|---|
+| 5201 | iperf-a | 1 Gbps | **0.14 Gbps** | **0.60 Gbps** | **60%** |
+| 5202 | iperf-b | 10 Gbps | 5.53 Gbps | 9.59 Gbps | 96% |
+
+### Accumulated counters, queue 4 (iperf-a), daemon uptime ~8 minutes:
+
+```
+Drops: flow_share=13,229,225  buffer=0  ecn_marked=16,366,893
+```
+
+### 300 s / 16-flow distribution, queue 4:
+
+```
+bimodal: 7 flows at exactly 30.2 Mbps, 9 flows at 42.3–44.8 Mbps
+ratio max/min = 1.48×
+total = 598 Mbps (vs. 1000 Mbps cap)
+retrans = 571,700 / 300 s
+```
+
+## Root cause
+
+Current threshold in `apply_cos_admission_ecn_policy`:
+
+```rust
+let flow_ecn_threshold =
+    share_cap.saturating_mul(COS_ECN_MARK_THRESHOLD_NUM)
+        / COS_ECN_MARK_THRESHOLD_DEN;   // = share_cap / 5 = 20%
+
+*(truncated — 107 lines total)*
+
+
+---
+
+## #756 — userspace-dp: CoS silently unenforced on VMs with ifindex > BPF map cap [CLOSED] (closed 2026-04-18)
+
+## What happened
+
+`iperf3 -c 172.16.80.200 -P 1 -t 60 -p 5201` through the loss **bpfrx-fw** cluster (reth0.80, CoS `iperf-a` scheduler `transmit-rate 1.0g exact`) exceeds the 1 Gbps cap at line rate. Meanwhile the same test through the loss **xpf-userspace-fw** cluster sits at 954 Mbps (under cap).
+
+## Root cause
+
+The bpfrx-fw VM has accumulated ifindex values into the thousands (`fab0=3651`, `fab1=3652`, `vrf-sfmix=3643`, …). Several BPF maps keyed on ifindex are sized too small:
+
+| Map | Type | max_entries | Declared in |
+|---|---|---|---|
+| `tx_ports` | `BPF_MAP_TYPE_DEVMAP` | `MAX_INTERFACES` (2048) | `bpf/headers/xpf_maps.h:339-344` |
+| `redirect_capable` | `BPF_MAP_TYPE_ARRAY` | `MAX_INTERFACES` (2048) | `bpf/headers/xpf_maps.h:349-354` |
+| `interface_counters` | `BPF_MAP_TYPE_PERCPU_ARRAY` | `MAX_INTERFACES` (2048) | `bpf/headers/xpf_maps.h:307-312` |
+| `mirror_config` | `BPF_MAP_TYPE_ARRAY` | `MAX_INTERFACES` (2048) | `bpf/headers/xpf_maps.h:780-785` |
+| `userspace_ingress_ifaces` | `Array<u8>` (aya) | 1024 | `userspace-xdp/src/lib.rs:269-270` |
+
+Updates with `key >= max_entries` return `E2BIG` (`"update: key too big for map: argument list too long"`). The resulting chain:
+
+1. `compileDataplane` returns `compile zones: add tx port fab0: update: key too big for map`.
+2. Snapshot apply aborts before `ensureProcessLocked`, so the userspace-dp helper is never spawned.
+3. Control socket is never opened. The reconcile loop retries `UpdateRGActive` every 500 ms, each time logging `userspace: RG state updated (helper stays in control)` at INFO and `reconcile: failed to update rg_active ... err="userspace dataplane control socket not configured"` at WARN.
+4. Traffic flows through the eBPF kernel path, which has no CoS admission policer. iperf3 sees no cap.
+
+## Evidence
+
+```
+Apr 18 15:38:14 xpf-fw1 xpfd[3637081]: ... msg="failed to compile dataplane" err="compile zones: add tx port fab0: update: key too big for map: argument list too long"
+Apr 18 15:34:26 bpfrx-fw0 bpfrxd[727]: ... msg="userspace dataplane status sync failed" err="update userspace_ingress_ifaces 2044: update: key too big for map: argument list too long"
+```
+
+```
+$ ip -o link | awk -F: '{print $1}' | sort -n | tail
+3643  vrf-sfmix
+3644  vrf-mgmt
+3650  gr-0-0-0
+3651  fab0
+3652  fab1
+```
+
+On xpf-userspace-fw0 (working cluster) the max ifindex is 630 — under every cap.
+
+*(truncated — 57 lines total)*
+
+
+---
+
+## #757 — daemon: reconcile loop spams INFO+WARN 9x/second when userspace-dp helper is down [CLOSED] (closed 2026-04-18)
+
+## What happened
+
+When the userspace-dp helper is not running (e.g. because snapshot compile failed — see #756), the daemon's reconcile loop emits two lines per RG per 500 ms tick:
+
+```
+level=INFO msg="userspace: RG state updated (helper stays in control)" rg=0 active=true
+level=WARN msg="reconcile: failed to update rg_active" rg=0 active=true err="userspace dataplane control socket not configured"
+```
+
+With 3 RGs and 500 ms cadence, that is 12 log lines per second, ~43K/hour, ~1M/day. Real diagnostics get drowned.
+
+## Why it matters
+
+CLAUDE.md "Logging Rules":
+> **Never** add `slog.Info` inside loops that run per-packet, per-session, or per-poll-tick.
+
+The INFO emit in `pkg/dataplane/userspace/manager_ha.go:395` fires on every retry, not just on state transitions:
+
+```go
+func (m *Manager) UpdateRGActive(rgID int, active bool) error {
+    ...
+    m.haGroups[rgID] = group
+    slog.Info("userspace: RG state updated (helper stays in control)",
+        "rg", rgID, "active", active)
+```
+
+Nothing gates this on a state change, and the reconcile path in `pkg/daemon/daemon_ha.go:581-584` retries every tick whenever `NeedsApply()` is true.
+
+## Fix options
+
+1. Demote the INFO to Debug (engineering-style preferred for per-tick traces).
+2. Only emit INFO when `m.haGroups[rgID].Active != active` (real transition).
+3. Rate-limit via slog level gate or a per-RG transition counter.
+
+Option (2) is the cleanest: the reason to log is "ownership state flipped," not "retry fired."
+
+Similarly, `reconcile: failed to update rg_active` should be rate-limited when the same error recurs — WARN is correct for a real regression, but spamming the same WARN obscures a fix-once action.
+
+## Reproducer
+
+
+*(truncated — 41 lines total)*
+
+
+---
+
+## #758 — daemon: 'failed to compile dataplane' is logged once then silently spun on forever [CLOSED] (closed 2026-04-18)
+
+## What happened
+
+At boot the daemon logs:
+
+```
+level=WARN msg="failed to compile dataplane" err="compile zones: add tx port fab0: update: key too big for map: argument list too long"
+```
+
+That WARN is emitted **once**. There is no retry, no exponential backoff, no health-endpoint degraded state, no crash. The daemon proceeds to run with a dataplane that is incompletely compiled — the userspace-dp helper is never started, there is no CoS enforcement, sessions synced but nothing forwards — and the reconcile loop spins (#757) but doesn't re-attempt the compile.
+
+## Why it matters
+
+An operator watching `show chassis cluster status` sees a healthy primary (node1 priority 100 primary). Prometheus shows xpfd up. But the VM is effectively a passthrough with no CoS, no session tracking, no filter counters. This is a dangerous silent-fail posture.
+
+The user-visible symptom (#756) is `iperf3 -P 1 -t 600 -p 5201 doesn't stay in the 1g cos cap`. Working back to the root cause required reading daemon logs closely — the health surface did not raise any flag.
+
+## Concrete fix
+
+1. **Backoff retry**: if compile fails, retry at 1s/2s/4s/... up to 60s. Many compile failures are transient (race with interface creation during boot).
+2. **Health signal**: while compile has never succeeded since daemon start, return `503` from `/healthz` or a dedicated readiness field. A health probe that flags this earlier would have short-circuited the whole debugging session.
+3. **Loud log on first persistent failure**: after the 5th retry, emit ERROR-level `compile has not succeeded — dataplane is in degraded state` so an operator scanning logs sees it.
+
+## Related
+
+- #756 — the specific compile error this triggered on
+- #757 — reconcile loop flooding that obscures the real error
+
+---
+
+## #760 — userspace-dp CoS admission: single TCP flow exceeds `transmit-rate Xg exact` cap by ~40-60% [CLOSED] (closed 2026-04-19)
+
+## What happened
+
+Running iperf3 against a queue configured \`transmit-rate 1.0g\` \`transmit-rate exact\`:
+
+\`\`\`
+$ iperf3 -c 172.16.80.200 -P 1 -t 30 -p 5201
+Bitrate: 1.42–1.60 Gbit/s (receiver)
+Retr: ~120K–200K per 30s
+\`\`\`
+
+Both sender and receiver report the same goodput (\`receiver\` column), so this isn't retransmit accounting — real throughput really is ~50% above the configured cap.
+
+Measurements taken on loss:xpf-userspace-fw0 (running \`e8e7533a\`, unaffected by the #756 ifindex bug) so the helper is confirmed in the path (\`peer_pps\` growing on the iperf-a queue, ECN marking active).
+
+Live counters during the test:
+\`\`\`
+Queue 4  iperf-a  1.00 Gb/s exact
+  Drops: flow_share=1404  buffer=0  ecn_marked=195237
+  OwnerProfile: peer_pps=16914949  (~846K pps steady state)
+\`\`\`
+
+846K pps × 1500 B ≈ 10.1 Gbit/s of gross packets passing through the worker, and iperf sees 1.5 Gbit/s of goodput — so admission is **partly** engaging (ecn_marked is growing) but is letting through ~50% more than the \`1.0g\` cap.
+
+## Contrast
+
+Earlier in the same session, a *first-boot* 60s test returned exactly 954 Mbit/s with **0 retransmits**. After the cluster warmed up / iperf repeated, the flow drifts to ~1.5 Gbit/s. This suggests the admission-layer rate limiter has a bucket or burst posture that either:
+1. starts empty (cap respected), then accumulates surplus when the flow backs off, letting subsequent bursts exceed 1G without further bucket refill accounting, or
+2. computes \"share_cap\" off a denominator that grows across iterations, inflating the per-flow cap over time.
+
+This is consistent with the first-boot \"perfect cap\" result followed by post-warmup overshoot.
+
+## What to investigate
+
+- \`apply_cos_admission_ecn_policy\` / \`cos_queue_flow_share_limit\` / \`cos_flow_aware_buffer_limit\` token/credit accounting in \`userspace-dp/src/afxdp/tx.rs\` — is the bucket replenishing across idle windows or carrying surplus forward?
+- The \`Next wake\` field on the queue jumped to a 25-billion-ns value (~25s in the future) in one reading. That's indicative of a stale wake-time computation, which would let the dequeue loop service packets outside the configured rate.
+- Whether \`prospective_active_flows\` (shared denominator, #724) is being undercounted here — if \`flows=1\` but the denominator the admission gate uses grows, per-flow cap inflates.
+
+## Reproducer
+
+\`\`\`
+
+*(truncated — 50 lines total)*
+
+
+---
+
+## #761 — userspace-dp: dense-slot design for ifindex-keyed hot-path maps [CLOSED] (closed 2026-05-05)
+
+## Context
+
+PR #759 (fixes #756) converted the ifindex-keyed BPF maps (\`tx_ports\`, \`redirect_capable\`, \`mirror_config\`, \`interface_counters\`, and the aya \`userspace_ingress_ifaces\`) from ARRAY/DEVMAP to HASH/DEVMAP_HASH variants. That change unblocked the userspace-dp helper on long-lived VMs where kernel ifindex grows past \`MAX_INTERFACES\` / 1024, which was the reported CoS-overrun root cause.
+
+The conversion is correct for sparse ifindex, but the hot path now hashes on every packet for \`userspace_ingress_ifaces\` (userspace-XDP ingress gate), \`tx_ports\` (redirect), \`redirect_capable\` (native-XDP check), \`mirror_config\` (mirror check), and \`interface_counters\` (rx/tx counter). Previously those were O(1) array indexes. Whether this costs measurable per-packet latency on our workload is open.
+
+## Proposal
+
+Introduce a **compact slot** indirection:
+- Control plane assigns a dense \`slot_id\` (u16, 0..N-1) to each registered interface.
+- A tiny HASH map \`ifindex_to_slot\` (sparse, key=ifindex) holds the lookup once per flow/session/compile.
+- Hot-path maps stay as ARRAYs keyed by \`slot_id\` — O(1) direct index, cache-friendly, no hashing per packet.
+
+Stages worth scoping:
+1. \`ifindex_to_slot\` HASH + slot allocator in the Go Manager.
+2. Rewrite hot-path maps to be slot-keyed. Callers in BPF look up the slot from ifindex once per path, reuse.
+3. Audit every call site (\`inc_iface_rx/tx\`, \`bpf_redirect_map(&tx_ports,...)\`, \`redirect_capable\` gate, \`mirror_config\`, \`USERSPACE_INGRESS_IFACES\`) and thread \`slot\` through.
+
+## Open questions
+
+- Does this matter for our workload? We should **measure** before committing. Ingress rate on the userspace-dp path hits ~850K pps per queue per owner — a single hash probe is ~5-10 ns, so the added cost is low hundreds of ns/s at rate. Probably not the bottleneck, but let's prove it.
+- The slot allocator has to survive daemon restart and HA failover — slot IDs either persist or the compile-time step re-assigns deterministically.
+- Interaction with PROG_ARRAY pinning and link pin lifecycle.
+
+## What to do first
+
+- Run \`perf stat -e dTLB-load-misses,L1-dcache-load-misses\` with iperf3 forwarding on master vs. a branch that reverts to ARRAY-sized-at-65536 to isolate hash-vs-array cost cleanly. Numbers should guide whether this follow-up is justified.
+
+## References
+
+- #756 root cause
+- #759 fix (HASH conversion)
+- PR #759 review thread r3105688393 (owner raised the \"steady state identical\" concern)
+
+---
+
+## #762 — meta: drive open issues to zero — parallel tracks A–F [CLOSED] (closed 2026-04-19)
+
+## Goal
+
+Close all 13 currently-open issues. Organize the work into tracks where each track touches a distinct code area so branches can proceed in parallel without conflicts.
+
+## Ranking
+
+### P0 — User-visible CoS correctness (Rust admission path)
+- #760 single TCP flow overshoots \`transmit-rate 1g exact\` cap by 40–60%
+- #754 1 G queue under-delivers to 60% of cap under 16-flow; ECN over-marks on low-rate queues
+
+Both live in \`apply_cos_admission_ecn_policy\` / \`share_cap\` logic. Likely share a root cause (threshold keyed off buffer share, not drain rate). Fix together.
+
+### P1 — Daemon reliability (Go, orthogonal to Rust)
+- #757 reconcile loop spams INFO+WARN 9×/sec when helper down — 1-line quick win
+- #758 \`failed to compile dataplane\` logged once then silently spun — backoff-retry + health signal
+
+### P2 — CoS observability polish (Rust + Go display)
+- #751 queue-scoped owner-profile telemetry for multi-queue exact bindings
+- #732 cosmetic: \`OwnerProfile:\` identical values rendered under every queue of a binding
+- #761 dense-slot ifindex indirection (perf speculation — needs measurement first)
+
+### P3 — Lab + vSRX parity (isolated)
+- #739 isolcpus / nohz_full / rcu_nocbs kernel cmdline recipe for loss lab
+- #654 \`processes utmd disable\` parsed, no runtime effect
+- #651 \`archive-sites … password\` not honored
+- #653 \`services application-identification\` partial vs vSRX
+- #648 RPM vSRX-parity tracking (meta, mostly hygiene)
+
+## Parallel tracks
+
+Each track touches a distinct code area, so branches will not conflict:
+
+| Track | Issues | Files touched | Ordering |
+|---|---|---|---|
+| **A — CoS admission** | #760 → #754 → #747 | \`userspace-dp/src/afxdp/tx.rs\` | Sequential within track. Measure after each fix. |
+| **B — CoS observability** | #751 → #732 | \`userspace-dp/src/afxdp/umem.rs\`, \`worker.rs\`, \`pkg/dataplane/userspace/cosfmt.go\` | #732 becomes trivial once #751 lands. |
+| **C — Daemon reliability** | #757, #758 | \`pkg/daemon/daemon_ha.go\`, \`pkg/dataplane/userspace/manager_ha.go\` | Independent. Start with #757 (1-line quick win). |
+| **D — vSRX config parity** | #654, #651, #653 | \`pkg/config/\`, \`pkg/daemon/\` | Each is an independent branch. #653 is the biggest. |
+| **E — Lab / perf measurement** | #739, #761 | \`test/incus/\`, \`bpf/headers/\`, \`pkg/dataplane/\` | #761 needs perf numbers before code work. #739 is a pure doc/systemd recipe. |
+| **F — Hygiene** | #648 | issue only | Meta-tracker; no code. |
+
+*(truncated — 66 lines total)*
+
+
+---
+
+## #767 — userspace-dp: #759 ifindex HASH maps cause full forwarding breakage on mlx5 VF (loss:xpf-userspace-fw) [CLOSED] (closed 2026-04-19)
+
+## What happened
+
+Deployed master (post-#759 — ifindex ARRAY/DEVMAP → HASH/DEVMAP_HASH conversion) to \`loss:xpf-userspace-fw\` cluster, which uses mlx5 SR-IOV VFs for WAN + LAN. Result: forwarding completely stopped.
+
+- Ping from cluster-userspace-host to 172.16.80.200: RTT jumped from 1 ms (pre-deploy) to **279 ms / 346 ms / 33% loss** (post-deploy).
+- \`iperf3 -c 172.16.80.200 -P 1 -t 30 -p 5201\`: **0 Bps for the full 30 s**, 6 retransmits. No data transferred.
+- Rust helper (\`xpf-userspace-dp\`) logged \`DBG SEG_MISS[N]: frame_len=1518 proto=17 egress_if=13 tx_if=6 egress_mtu=Some(1500) target_if=6\` repeatedly — segmentation miss on the egress path. (This debug print predates #759, but it only fires when segmentation returns None on an oversized frame — it's a symptom, not the cause.)
+
+## Rollback
+
+Checked out \`e8e7533a\` (pre-#759 master), rebuilt, redeployed. Forwarding recovered immediately:
+- Ping: 0.4 ms / 0 loss.
+- iperf3 30 s: **1.64 Gbps / 258 K retrans / no stalls** — i.e. the pre-existing #754/#760 overshoot baseline, not a regression.
+
+## Contrast
+
+Same \`e2be9ff1\` (post-#759) build ran fine on \`loss:bpfrx-fw\` cluster (virtio interfaces, ifindex up to 3651). That's where #759's HASH conversion was actually needed and was validated. It's only on mlx5 that forwarding broke.
+
+## Candidate causes to investigate
+
+The difference is hardware/driver, so one of these is likely:
+
+1. **\`BPF_MAP_TYPE_DEVMAP_HASH\` on mlx5 redirect path** — \`bpf_redirect_map(&tx_ports, ifindex, 0)\` should behave identically to \`DEVMAP\`, but mlx5's native XDP redirect implementation may not accept DEVMAP_HASH semantics, silently dropping frames.
+2. **\`BPF_F_NO_PREALLOC\` on \`interface_counters\` (PERCPU_HASH)** — lookup in softirq on mlx5 may behave differently when entries are lazily allocated vs. pre-allocated.
+3. **aya userspace-xdp shim** — \`USERSPACE_INGRESS_IFACES\` is now \`HashMap<u32, u8>\`. On mlx5 native XDP, the hash probe per packet may interact with driver-level RX batching in a way that virtio tolerates but mlx5 doesn't.
+4. **Map sizing** — mlx5 VFs report ifindex ≤ 630 on this box. Pre-#759 ARRAY sizing (2048) was fine. Post-#759 HASH + \`NO_PREALLOC\` may under-allocate on first use.
+
+## Priority
+
+**High.** #759 is already merged on master. Any future deploy to xpf-userspace-fw (or any mlx5 host) will break forwarding. We need either:
+1. A root-cause fix, or
+2. A revert of #759 on master.
+
+Mitigation right now: xpf-userspace-fw is pinned to \`e8e7533a\`. bpfrx-fw still runs post-#759 successfully.
+
+## Repro steps
+
+\`\`\`
+# Build
+git checkout e2be9ff1
+
+*(truncated — 53 lines total)*
+
+
+---
+
+## #774 — perf: userspace DP ceiling at 18 Gbps vs 25+ Gbps target on loss:xpf-userspace-fw [CLOSED] (closed 2026-05-05)
+
+## Observation
+On loss:xpf-userspace-fw0 primary (mlx5 SR-IOV VF pair, kernel 7.0.0-rc7), iperf3 -P 16 to 172.16.80.200 sustains 18.0 Gbps with OR without CoS configured. The per-queue CoS cap for iperf-c (25 Gbps) never parks — park_queue=0, park_root=0 — so the shaper is not the limit.
+
+| Config | iperf3 -P 16 receiver |
+|---|---|
+| CoS on, iperf-c class, 25 Gbps cap | 18.0 Gbps |
+| CoS off (raw forwarding) | 18.0 Gbps |
+
+## Relevant code paths to profile
+1. **Zero-copy native XDP TX** — ge-0-0-2 is bound zero-copy (`mode=ZeroCopy`). `tx_xsk_xmit` in ethtool is the authoritative counter; compare against `binding.tx_bytes` to detect any frame-ring stalls.
+2. **Frame build in `frame_tx.rs`** — the segment / in-place / copy paths allocate `PreparedTxRequest` + metadata per frame. At 1.5M pps this is the dominant allocation site.
+3. **`maybe_wake_tx`** — `sendto(MSG_DONTWAIT)` is issued on every zero-copy batch. If the batch is small (< TX_BATCH_SIZE), we syscall too often. Check `dbg_sendto_calls` rate.
+4. **RX completion reap** — `reap_tx_completions` at the top of `drain_pending_tx`. Scans `in_flight_prepared_recycles` FastMap; at high pps the map could be the bottleneck.
+5. **Flow cache hit rate** — if session lookups miss on the cache, the slow path takes over. `flow_cache_hits` vs `flow_cache_misses` under sustained load.
+
+## Data to collect
+- `perf record -F 99 -a -g -- sleep 30` during an iperf3 -P 16 run, generate flamegraph
+- `/run/xpf/userspace-dp.json` pre/post with focus on `dbg_sendto_calls`, `tx_xsk_full`, `rx_xsk_*`, `flow_cache_*`
+- `ethtool -S ge-0-0-2` delta over the same 30 s window
+- `top -H -p $(pgrep xpf-userspace-dp)` to see which worker threads are CPU-saturated
+
+## Suspected hot spots (to be ranked by flamegraph)
+1. Allocation on frame build (Vec<u8> for copy path; PreparedTxRequest for prepared)
+2. FastMap operations on `in_flight_prepared_recycles`
+3. `sendto` syscall frequency
+4. Atomic contention on cross-worker counters (redirect inbox, shared leases)
+
+## Out of scope (for this issue)
+- CoS shaper changes (closed via #773)
+- BPF side (eBPF firewall; userspace DP is the focus here)
+
+---
+
+## #775 — perf: campaign to land consistent 22+ Gbps on iperf3 -P 12 -t 600 -p 5203 [CLOSED] (closed 2026-05-05)
+
+## Campaign goal
+Consistent ≥22 Gbps on `iperf3 -c 172.16.80.200 -P 12 -t 600 -p 5203` across multiple runs. Variance should be ≤5% run-to-run.
+
+## Workload
+- Target: 25 Gbps iperf-c CoS class
+- Client: loss:cluster-userspace-host, 12 parallel TCP flows to 172.16.80.200:5203
+- Firewall: loss:xpf-userspace-fw0 primary, fw1 secondary
+- CoS config: scheduler-iperf-c transmit-rate 25g exact
+
+## Method
+1. Baseline: 5× iperf3 P=12 t=30 runs, record median + stddev
+2. `perf record -F 99 -a -g --call-graph dwarf` during a representative run
+3. File one issue per hot function ≥2% CPU with concrete diagnosis + fix hypothesis
+4. PR per fix, **adversarial HFT/kernel review via Codex + GitHub Copilot**
+5. Re-baseline after each merge to confirm expected win materialized
+
+## Adversarial review posture
+- Reviewers: HFT / low-latency networking / kernel / OS / device-driver engineers
+- Scrutinize: atomic ordering, cache-line layout, allocation on hot path, TLB pressure, branch prediction, syscall frequency, TCP congestion-control interactions, RX/TX driver semantics, NUMA locality, context switches
+- Reject: PRs that allocate on hot path; PRs that add work without measurement proving net-positive throughput
+
+## Known baseline pre-campaign
+P=12 one-off runs 20.6-22.4 Gbps, 17× stream spread root-caused to NIC RSS + cross-worker MPSC + 10% memcpy tax in #774.
+
+---
+
+## #776 — perf: 12% CPU in memcpy on build_forwarded_frame_into_from_frame (cross-worker copy) [CLOSED] (closed 2026-05-27)
+
+## Profile hot spot
+\`perf record -F 499 -a -g --call-graph dwarf\` during \`iperf3 -P 12 -t 40 -p 5203\` on loss:xpf-userspace-fw0:
+
+\`\`\`
+12.16%  xpf-userspace-w  libc.so.6   __memmove_evex_unaligned_erms
+           ---__memcpy_evex_unaligned_erms (inlined)
+              --11.38%--xpf_userspace_dp::afxdp::frame::build_forwarded_frame_into_from_frame
+\`\`\`
+
+## Location
+\`userspace-dp/src/afxdp/frame.rs:1258 build_forwarded_frame_into_from_frame\`
+Copy-path is invoked from \`frame_tx.rs:enqueue_pending_forwards\` when \`can_rewrite_in_place\` is false:
+\`\`\`rust
+let can_rewrite_in_place = target_binding.umem.allocation_ptr() == ingress_umem_ptr
+    && !is_nat64 && !uses_native_tunnel && owner_matches_target
+    && matches!(request.frame, PendingForwardFrame::Live);
+\`\`\`
+
+\`core::ptr::copy_nonoverlapping(payload.as_ptr(), payload_out.as_mut_ptr(), payload.len())\` copies ~1486 bytes per forwarded packet (everything after Ethernet header). At 1.3M pps that's ~1.9 GB/s per core of memcpy traffic.
+
+## Root cause
+Each worker binding has its OWN UMEM allocation. When RX arrives on worker N's binding but must TX via worker M's binding (different UMEM), we cannot reference the source frame directly from the TX ring — AF_XDP TX requires an offset into the owning worker's UMEM. So we copy.
+
+For iperf3 -P 12 to a single queue owner, NIC RSS distributes flows across multiple RX queues (workers), but CoS queue 5 is serviced by one owner worker → every flow that arrives on a non-owner worker pays the memcpy tax.
+
+## Fix hypotheses (ranked)
+1. **Activate shared-UMEM prototype** (highest reward, highest effort): bindings that share a physical NIC share a single UMEM allocation. \`umem.allocation_ptr() == ingress_umem_ptr\` becomes true for same-NIC cross-worker paths, hitting the in-place rewrite branch. The prototype is referenced in comments at \`frame_tx.rs:405\` (\"same-device shared-UMEM prototype\"); activation needs a config flag + frame-ownership tracking to avoid free-after-use races.
+2. **Per-worker RX queue affinity / RSS tuning** (medium): align NIC RSS to land flows on the worker that owns the CoS queue. Only helps when there's one owner; still lossy for shared_exact queues.
+3. **Reduce memcpy length by header-only rewrite** (low): only copy the mutated header region (~40 B for TCP NAT), leave the TCP payload in place. Requires that the TX ring points at the ingress UMEM for the payload portion, which re-hits the shared-UMEM requirement — no independent path.
+
+## Target measurement
+If fix eliminates the memcpy entirely, baseline should move from 16.9 Gbps median (pre-campaign) to ≥19 Gbps (12.16% CPU headroom × current saturation). If still gated by other hot spots, expect a smaller rise.
+
+## References
+- #775 campaign
+- #774 earlier diagnosis noting the memcpy tax
+
+---
+
+## #777 — perf: 7.8% CPU in poll_binding_process_descriptor (RX hot path) [CLOSED] (closed 2026-05-27)
+
+## Profile hot spot
+7.80% of CPU in \`xpf_userspace_dp::afxdp::poll_binding_process_descriptor\` during the campaign benchmark.
+
+## Location
+\`userspace-dp/src/afxdp.rs\` — search for \`fn poll_binding_process_descriptor\`.
+
+## What it does
+Runs for EVERY RX descriptor pulled off an AF_XDP socket. Validates metadata, consults flow cache, resolves forwarding decision, classifies (filter / NAT / screen), builds TxRequest / PreparedTxRequest, pushes to pending_tx_* or redirect inbox.
+
+At ~1.3M pps / 6 workers × ~220 Kpps each, 7.8% = ~35 ns per descriptor. Needs breakdown to identify sub-hot-spots: metadata validation, flow cache access, forwarding resolution, frame builder selection, etc.
+
+## Fix hypothesis
+Without instrumentation on the sub-steps we can't say. First action: inline perf annotate on this function to find the 2-3 dominant basic blocks, then file per-block issues.
+
+\`\`\`bash
+perf annotate -i /tmp/perf.data --stdio xpf_userspace_dp::afxdp::poll_binding_process_descriptor
+\`\`\`
+
+Candidate optimizations once we know:
+- Flow cache lookup: if it's doing FxHash on 5-tuple, that's cheap; if it's doing something heavier, consider batched lookups.
+- Forwarding resolution: is it re-validating the decision each packet, or using cached?
+- TxRequest allocation: is it allocating Vec<u8>? Should be pulled from a frame pool.
+
+## Target measurement
+TBD after annotate. Best case: eliminate 2-3% by cutting redundant work → +0.5 Gbps.
+
+## References
+- #775 campaign
+
+---
+
+## #778 — perf: 1.40% CPU in kernel mlx5e_xsk_skb_from_cqe_linear — SKB alloc on zero-copy RX [CLOSED] (closed 2026-05-05)
+
+## Profile hot spot
+1.40% of CPU in \`mlx5e_xsk_skb_from_cqe_linear\` (kernel symbol from mlx5e driver) during the campaign benchmark.
+
+\`\`\`
+1.40%  xpf-userspace-w  [kernel.kallsyms]  [k] mlx5e_xsk_skb_from_cqe_linear
+           ---mlx5e_xsk_skb_from_cqe_linear
+              mlx5e_handle_rx_cqe
+              mlx5e_poll_rx_cq
+              mlx5e_napi_poll
+\`\`\`
+
+## Why this is suspicious
+\`mlx5e_xsk_skb_from_cqe_linear\` builds a **socket buffer** from an XSK completion queue entry. This is the fallback path when the RX descriptor cannot be delivered zero-copy to userspace. Pure zero-copy AF_XDP should NOT hit this — the CQE should drive \`mlx5e_xsk_rx_handle_metadata_desc\` or equivalent and complete without SKB alloc.
+
+Hitting this suggests:
+- Some RX descriptors are falling back to the kernel slab path (SKB allocated, then passed through XDP which redirects to the XSK socket)
+- Zero-copy binding is not fully active, or
+- Oversize packets / checksum mismatches trigger the slow path
+
+## Action
+1. Check \`ethtool -S ge-0-0-2 | grep xsk\` for \`rx_xsk_cqes_wait_stop\`, \`rx_xsk_buff_alloc_err\`, \`rx_xsk_oversize_pkts_sw_drop\` — any of these non-zero points at the cause.
+2. Compare binding mode with \`ethtool -S\` counters:  \`xdpgeneric\` vs \`xdp\`. If \`xdpgeneric\` is listed for the RX interface, we're in generic/copy mode.
+3. Check that the AF_XDP socket was bound with \`XDP_USE_NEED_WAKEUP | XDP_ZEROCOPY\` and the kernel confirmed ZC in the bind response.
+
+## Fix hypotheses
+If generic/copy mode: rebind with XDP_ZEROCOPY, verify via \`ethtool\`.
+If fallback per packet: check MTU and buffer sizing.
+
+## Target measurement
+Eliminating this path saves ~1.4% CPU, net +0.3 Gbps. Small but worth having.
+
+## References
+- #775 campaign
+
+---
+
+## #779 — perf: 3.28% CPU in enqueue_pending_forwards (TX dispatch) [CLOSED] (closed 2026-05-27)
+
+## Profile hot spot
+3.28% of CPU in \`xpf_userspace_dp::afxdp::frame_tx::enqueue_pending_forwards\`.
+
+## Location
+\`userspace-dp/src/afxdp/frame_tx.rs\` — top-level dispatch that routes each forwarded frame through one of three paths (segmentation / in-place rewrite / copy). Called per-frame on the RX→TX hand-off.
+
+## What it does
+For each pending forwarded request: (a) lookup target binding, (b) choose segmentation vs in-place vs copy, (c) push into \`target_binding.pending_tx_prepared\` or \`pending_tx_local\` with per-request metadata (expected_ports, flow_key clone, etc.).
+
+## Suspected hot costs
+1. **flow_key.clone()** per request — \`flow_key: Option<SessionKey>\` where SessionKey contains IP addresses. The \`Option::clone()\` on \`Some\` triggers a heap-free SessionKey copy; fine on its own, but per-packet at 1.3M pps it's measurable.
+2. **Branch-heavy dispatch** (segmentation check / in-place check / copy fallback) with several config lookups each.
+3. **target_binding.pending_tx_prepared.push_back(PreparedTxRequest { ... })** — constructs a PreparedTxRequest on stack each time. No heap allocation, but every field copy costs cycles.
+
+## Fix hypotheses
+1. Inline perf annotate to find the dominant basic block.
+2. If flow_key clone is the cost: consider passing \`Arc<SessionKey>\` instead of \`Option<SessionKey>\` clone. One refcount bump vs full struct copy.
+3. Hot-path cache the common \"in-place eligible\" decision so we skip the segmentation check when MTU is already good.
+
+## Target
+Halve this to ~1.5% → +0.3 Gbps.
+
+## References
+- #775 campaign
+
+---
+
+## #780 — perf: 1.96% CPU in ingest_cos_pending_tx_with_provenance (post-#760) [CLOSED] (closed 2026-04-19)
+
+## Profile hot spot
+1.96% of CPU in \`xpf_userspace_dp::afxdp::tx::ingest_cos_pending_tx_with_provenance\`.
+
+## Location
+\`userspace-dp/src/afxdp/tx.rs\` — added by PR #773 as part of the #760 fix. Routes pending_tx_local + redirect inbox items into CoS queues via three fallbacks (redirect-to-owner-worker, redirect-to-owner-binding, local CoS enqueue).
+
+## Cost breakdown
+- Per-request closure dispatch via \`process_pending_queue_in_place\` — a closure per item.
+- Per-request 3 redirect attempts: lookup queue_fast_path, owner worker id, shared_exact status. Each is a FastMap lookup on \`cos_fast_interfaces\`.
+- Owner-pps / peer-pps atomic bumps on first-pass only (cheap, already gated).
+
+## Fix hypotheses
+1. **Skip the redirect-to-owner lookups when we ARE the owner**: \`owner_worker_id == current_worker_id\` is checked last in \`redirect_local_cos_request_to_owner\`. For packets already on the owner worker's binding (most common case on a hot flow with RSS-aligned RX), this is wasted work. Invert the check order.
+2. **Cache the queue_fast_path lookup**: most items in one ingest pass target the same (egress_ifindex, cos_queue_id). Cache the result across the batch.
+3. **Amortise the closure overhead**: batch items into a Vec per destination queue, then call enqueue_cos_item in batch.
+
+## Target
+Halve to ~1.0% → +0.2 Gbps.
+
+## References
+- #775 campaign, #760 / #773 context
+
+---
+
+## #781 — perf: 9.67M rx_xsk_buff_alloc_err + 506M tx_xsk_full — structural pipeline stall [CLOSED] (closed 2026-05-27)
+
+## Structural bottleneck
+This is likely the dominant cause of throughput variance and the retransmit storm (92-170K retrans per 30s iperf3 run) — far bigger than any of the userspace micro-hot-spots filed so far.
+
+## ethtool -S ge-0-0-2 (cumulative since NIC up)
+- \`rx_xsk_buff_alloc_err: 9,673,304\` — **9.67M RX alloc failures**. XSK fill ring is empty when the driver tries to post a descriptor. Packet drops here, falls back to SKB path (hits the 1.4% in issue #778).
+- \`tx_xsk_full: 506,944,355\` — **506M TX ring-full events**. Userspace wants to TX, kernel TX ring rejects because it's already full.
+- \`rx_xsk_packets: 3,280,871\` vs \`rx_xsk_buff_alloc_err: 9,673,304\` — **3× more RX failures than RX successes**.
+- \`rx_xsk_xdp_drop: 5,434,187\` — 5.4M XDP drops.
+- \`rx_xsk_oversize_pkts_sw_drop: 0\` — not the cause.
+
+## Downstream evidence
+All 6 bindings on if6 (ge-0-0-2 = WAN) show:
+- \`debug_free_tx_frames: 0\` — free TX frame pool empty
+- \`tx_packets == tx_completions\` — completions reap cleanly, nothing stuck mid-flight
+- \`debug_pending_tx_prepared: 0\`, \`debug_pending_tx_local: 0\` — no userspace-side buildup
+
+The **kernel-side TX ring** is what's full. 8192 entries × 6 bindings = 49K entries total. At 22 Gbps / 1500 B = 1.83 M pps. Ring drain rate depends on NIC TX pacing — at mlx5 native zero-copy, should easily sustain.
+
+## Hypotheses
+1. **sendto() / TX kick frequency too low**. \`maybe_wake_tx\` at \`tx.rs:5259\` issues \`sendto(MSG_DONTWAIT)\` with rate limiting (\`TX_WAKE_MIN_INTERVAL_NS\`). If the NIC's TX ring is drained faster than we kick, it idles between bursts. If we kick too infrequently, the ring fills.
+   - Check: \`binding.dbg_sendto_calls\` rate. If it's much less than \`tx_packets / batch_size\`, we're under-kicking.
+
+2. **Fill-ring replenishment too slow**. RX frames must be returned to the fill ring so the driver can use them for next RX. If userspace is bottlenecked elsewhere (e.g. the 12% memcpy in #776), the fill-ring-refill rate drops below the RX rate → alloc_err.
+
+3. **Per-worker RX-TX imbalance**. RSS sends flows to different RX queues (different workers). Each worker's TX path has to forward cross-worker, paying the memcpy cost, slowing the RX→TX pipeline.
+
+4. **UMEM frame count too small** for the pipeline depth. \`binding_frame_count_for_driver\` = \`reserved_tx + 2 × ring_entries\` = ~24K frames per binding. At 1.8 M pps and 2 ms pipeline depth (TX ring buffer + completion latency), we need ~3600 frames in flight per binding. 24K should suffice — but if they're all stuck in the TX ring waiting for completion, the fill ring empties.
+
+## Diagnostic next steps
+1. Snapshot \`dbg_sendto_calls\` + \`dbg_sendto_eagain\` deltas during a test run. Compute kick rate vs TX rate.
+2. Measure fill-ring depth: \`debug_pending_fill_frames\` during a burst (JSON snapshot mid-run).
+3. \`perf record -e xsk:xsk_*\` kernel tracepoints if available (requires CAP_SYS_ADMIN).
+4. Try \`ring_entries = 16384\` as a quick probe — if the stall rate drops, ring size is the gate.
+
+## Expected impact
+Eliminating this should close the variance band (current 15.5-19.8 Gbps → stable 22+ Gbps) AND collapse the retransmit rate to near zero. Biggest single win available.
+
+## References
+- #775 campaign
+
+---
+
+## #786 — Research: cross-worker per-flow fair queueing at 100G+ scale (follow-up to #785) [CLOSED] (closed 2026-05-05)
+
+Follow-up tracking issue after the empirical dead-ends recorded in PR #785.
+
+## Problem
+
+On `shared_exact` CoS queues (queue rate ≥ 2.5 Gbps) that are serviced by multiple workers concurrently, per-flow throughput is severely tiered (iperf3 -P 12 @ 25 Gbps: one flow at ~4 Gbps, two at ~2.8, seven at ~1.2, rather than the ~2 Gbps/flow even share the cap permits).
+
+Root cause confirmed in task #98: RSS distributes flows unevenly across workers (pigeonhole at 6 RX queues / 12 flows), and a per-worker SFQ cannot fix flows distributed unevenly *across* workers. PR #785 tried two mitigations, both inadequate:
+
+- Naïve SFQ on shared_exact: 22.3 → 16.3 Gbps, +25k retrans.
+- SFQ + aggregate-only admission: throughput preserved, per-flow CoV 40-51 %.
+- Per-worker rate gate (`queue_rate × local/total`): CoV 4.5 % at 1 ms burst but throughput collapsed to 7.7 Gbps; 10 ms burst recovered throughput but CoV rose to 63 %.
+
+Scope: must scale to **100G / 200G / 400G NICs with dozens of workers and thousands of flows**, not just 25 Gbps.
+
+## Research doc
+
+Full survey and evaluation: `docs/cross-worker-flow-fairness-research.md` in-tree. Covers MQFQ, RSS++, CSFQ/AFD, symmetric Toeplitz RSS, Carousel/Eiffel, AFQ, PIFO/SP-PIFO/AIFO, DPDK QoS/PSPAT, DCTCP/ECN, work stealing, Snap/Aquila. Each ranked against scalability, Rust/AF_XDP cost, fairness CoV, flow churn, and hardware assist.
+
+## Top recommendations (from the doc)
+
+1. **Baseline: symmetric Toeplitz RSS + flat indirection table** (§2.4, ~1 day). ethtool-only. Establishes whether part of the imbalance is a NIC config artefact before we invest in algorithms.
+
+2. **MQFQ-style cross-worker virtual-time gate** (§2.1, 2-3 weeks). Single `Arc<AtomicU64>` for `V_min` per shared_exact queue; each worker dispatches as long as `v_local - V_min ≤ T`; otherwise yields the queue for the batch. Provable fairness bound O(T), proven to scale to millions of ops/s in the original NVMe-over-RDMA paper (Hedayati & Shen, USENIX ATC '19). Matches our architecture point-for-point.
+
+3. **AFD-style approximate fair dropping / ECN marking** (§2.3, 2 weeks). Sharded Count-Min sketch per shared_exact queue; drop/mark probabilistic on excess over fair share. Cheap, flow-churn-friendly, complementary to MQFQ (MQFQ for scheduling, AFD for misbehaving-flow admission).
+
+4. **(Deferred)** RSS++ dynamic indirection rebalance (§2.2, 3-5 weeks) once Phase 2 is proven and only if CoV ≤ 15 % target is not met.
+
+## Proposed next experimental slice
+
+**Slice A — Baseline RSS audit (1 day):**
+- `ethtool -x` on `loss:xpf-userspace-fw` test NIC; verify symmetric Toeplitz key.
+- If not symmetric, install the standard key; flatten indirection table.
+- Re-run fairness test; record deltas.
+
+**Slice B — Minimal MQFQ (5-7 days):**
+- Add `Arc<AtomicU64> v_min` to `CoSQueueRuntime` for each shared_exact queue.
+- Per-worker `v_local` = cumulative virtual-finish-time of dispatched bytes from this queue.
+- Drain-batch gate: if `v_local - v_min > T_bytes`, yield; else dispatch.
+- `v_min` update: once per drain batch, atomic-min CAS.
+
+*(truncated — 65 lines total)*
+
+
+---
+
+## #789 — Restore 21-23 Gbps + CoV ≤ 20 % on shared_exact CoS queues (#785 follow-up) [CLOSED] (closed 2026-05-27)
+
+Tracking issue for the phased plan to restore baseline aggregate throughput (21-23 Gbps) while delivering per-flow fairness (CoV ≤ 20 %). Canonical design document: [`docs/785-perf-fairness-plan.md`](https://github.com/psaab/xpf/blob/docs/785-perf-fairness-plan/docs/785-perf-fairness-plan.md) (PR #788).
+
+## Goals
+
+- **Throughput:** 21-23 Gbps aggregate on `iperf3 -P 12 -t 20 -p 5203` @ 25 Gbps `shared_exact` cap.
+- **Fairness:** per-flow CoV ≤ 20 % across 12 flows in the same test.
+- **Correctness:** no regressions, adversarial Codex + Copilot review on every merge, comprehensive anti-regression tests.
+
+## Execution — phase issues (ordered, blocked in chain)
+
+Each phase has its own issue and MUST be completed before the next kicks off. Exit early at any phase where targets are met; later phases are deferred indefinitely.
+
+- [ ] #790 — **Phase 1: Re-baseline after PR #787** (1 day, measurement only). Blocks: none — kickoff.
+- [ ] #791 — **Phase 2: Symmetric Toeplitz RSS audit** (1 day, zero-code). Blocked by #790.
+- [ ] #792 — **Phase 3: Minimal MQFQ — per-worker virtual-finish-time ordering** (5-7 days). Blocked by #791.
+- [ ] #793 — **Phase 4: Full MQFQ with shared V_min + lag throttle** (2-3 weeks). Blocked by #792.
+- [ ] #794 — **Phase 5: AFD policer for misbehaving flows** (1-2 weeks, optional). Blocked by #793.
+
+### Dependency chain (not parallel)
+
+```
+#790 Phase 1 (baseline)
+   │
+   ▼  (if targets missed)
+#791 Phase 2 (RSS audit)
+   │
+   ▼  (if targets missed)
+#792 Phase 3 (minimal MQFQ)
+   │
+   ▼  (if CoV ≤ 20 % still missed)
+#793 Phase 4 (full MQFQ)
+   │
+   ▼  (if pathological flows remain)
+#794 Phase 5 (AFD)   [optional]
+```
+
+Each phase's exit criteria are in its own issue. **Early exit is the preferred outcome at every gate** — don't pay complexity costs unless the measurement gap forces it.
+
+## Why start with Phase 1 (measurement only)
+
+
+*(truncated — 69 lines total)*
+
+
+---
+
+## #790 — #785 Phase 1 — Re-baseline after PR #787 (measurement only) [CLOSED] (closed 2026-04-20)
+
+Part of #789. Not blocked by anything — kickoff phase.
+
+## Goal
+
+Measure current master's behaviour on `iperf3 -P 12 -t 20 -p 5203` through a 25 Gbps `shared_exact` CoS queue, with a clean config (no duplicate FC↔queue). PR #787 just merged and removed a material rate-source confound from all prior measurements; this phase establishes the actual baseline we need to improve from.
+
+## Why measurement-only is the right kickoff
+
+Every number we've measured for #785 came from a config that silently produced three different rate views of the same queue (`queue.transmit_rate_bytes`, `lease.rate_bytes()`, display). After PR #787 the rate sources are consistent. Baseline may already be at or near the 21-23 Gbps + CoV ≤ 20 % target — if so, the rest of the plan in #789 is unnecessary.
+
+## Work
+
+1. Redeploy current master to the loss userspace cluster:
+   ```
+   BPFRX_CLUSTER_ENV=test/incus/loss-userspace-cluster.env \
+     sg incus-admin -c "test/incus/cluster-setup.sh deploy all"
+   ```
+2. Apply a CoS config with exactly one forwarding-class per queue. Starting point: `test/incus/cos-iperf-config.set` (already 1-FC-per-queue).
+3. Confirm `CompileConfig` accepts (no duplicate-FC error from PR #787's new validation).
+4. Run three back-to-back `iperf3 -c 172.16.80.200 -P 12 -t 20 -p 5203`. Record:
+   - Per-flow rate table (all 12 flows)
+   - Aggregate SUM
+   - Retransmit count per flow
+5. Post-run: `show class-of-service interface reth0` — record `admission_ecn_marked`, `admission_flow_share_drops`, `admission_buffer_drops` counters. Zero retrans must correlate with zero admission drops.
+6. Supplemental runs: `-P 1` (single-flow sanity) and `-P 4` (moderate) for the flow-count-vs-throughput curve.
+
+## Exit criteria
+
+- Measurement table posted as a comment on #789.
+- Retrospective updated (`docs/785-cross-worker-drr-retrospective.md` — new "Phase 1 post-#787" section).
+- **If SUM ≥ 21 Gbps AND per-flow CoV ≤ 20 % on all three P=12 runs: close #789 and this issue. Rest of plan (Phase 2-5) deferred indefinitely.**
+- Otherwise: unblocks Phase 2 (#NNN — to be filled).
+
+## Risk
+
+None. Measurement only.
+
+## Deliverables
+
+- Measurement table.
+
+*(truncated — 47 lines total)*
+
+
+---
+
+## #791 — #785 Phase 2 — Symmetric Toeplitz RSS audit (zero-code) [CLOSED] (closed 2026-04-20)
+
+Part of #789. **Blocked by #790 (Phase 1).** Kick off only if Phase 1 does NOT hit SUM ≥ 21 Gbps AND CoV ≤ 20 % targets.
+
+## Goal
+
+Audit the NIC's RSS Toeplitz key on `mlx0`/`mlx1`. If asymmetric (ConnectX default), deploy a symmetric key so forward and reverse traffic for the same 5-tuple land on the same RX queue. Research doc [`cross-worker-flow-fairness-research.md`](../blob/master/docs/cross-worker-flow-fairness-research.md) §2.2 ranks this as the #1 zero-code baseline step.
+
+## Hypothesis
+
+Default Mellanox Toeplitz key is asymmetric — same 5-tuple hashed forward vs. reverse lands on different RX queues. Any workload exercising reverse-path traffic pigeonholes flows across workers in ways that inflate CoV independently of any scheduler work we do downstream.
+
+## Work
+
+1. Audit current RSS state on both Mellanox PFs (forward + reverse paths go through `mlx0` and `mlx1` depending on traffic direction in the cluster setup):
+   ```
+   ethtool -x mlx0            # indirection table (expect flat: all 6 queues, equal weight)
+   ethtool -n mlx0 rx-flow-hash tcp4   # hash field set (expect `sdfn` — symmetric across src+dst)
+   ethtool -X mlx0 hkey       # Toeplitz key bytes (40 bytes for ConnectX)
+   ```
+2. If key is asymmetric (most common default), deploy McAfee symmetric pattern:
+   ```
+   ethtool -X mlx0 hkey 6d:5a:6d:5a:6d:5a:6d:5a:6d:5a:6d:5a:6d:5a:6d:5a:6d:5a:6d:5a:6d:5a:6d:5a:6d:5a:6d:5a:6d:5a:6d:5a:6d:5a:6d:5a:6d:5a:6d:5a
+   ```
+3. If indirection table is weighted (some queues at 0, others at 2+), reflow evenly:
+   ```
+   ethtool -X mlx0 equal 6
+   ```
+4. Confirm symmetric hash in effect:
+   ```
+   ethtool -N mlx0 rx-flow-hash tcp4 sdfn
+   ```
+5. Persist across reboots (systemd-network link file or `ifup` hook — write a minimal persistence doc).
+6. Re-run Phase 1 iperf3 tests (same config, three runs). Record delta.
+
+## Exit criteria
+
+- Symmetric Toeplitz confirmed in `ethtool -x` output on both PFs.
+- `sdfn` confirmed on TCPv4 / TCPv6 hash fields.
+- Phase 1 measurement table re-run; delta documented.
+- **If SUM ≥ 21 Gbps AND CoV ≤ 20 %: close #789 and this issue.**
+- Otherwise: unblocks Phase 3 (#NNN).
+
+*(truncated — 54 lines total)*
+
+
+---
+
+## #792 — #785 Phase 3 — Minimal MQFQ: per-worker virtual-finish-time ordering [CLOSED] (closed 2026-04-20)
+
+Part of #789. **Blocked by #791 (Phase 2).** Kick off only if Phases 1 & 2 do NOT hit targets.
+
+## Goal
+
+Replace within-worker SFQ DRR round-robin with virtual-finish-time (VFT) ordering. This closes the packet-count-vs-byte-rate gap the retrospective identifies ([`785-cross-worker-drr-retrospective.md`](../blob/master/docs/785-cross-worker-drr-retrospective.md) §4) as the dominant residual CoV driver on iperf3-style steady-state workloads: SFQ DRR starves smaller-cwnd flows because they're waiting for an ACK when DRR polls their bucket.
+
+This is a minimal MQFQ — **local ordering only**, no shared `V_min`, no cross-worker lag throttle. If Phase 3 hits targets, we can stop before paying Phase 4's concurrency cost.
+
+## Design
+
+1. **Add `virtual_finish_ns: u64` per SFQ bucket** in `CoSQueueRuntime`. Location: either on `flow_bucket_items[i]` (fatter but cache-coherent with bucket state) or a parallel `[u64; COS_FLOW_FAIR_BUCKETS]` array. Decide based on cache-layout profile.
+2. **On enqueue** (shared_exact, flow-fair path):
+   ```rust
+   let finish_delta = (bytes as u128 * 8_000_000_000u128)
+                      .saturating_div((fair_share_rate as u128).max(1));
+   bucket.virtual_finish_ns = std::cmp::max(bucket.virtual_finish_ns, now_ns)
+                              .saturating_add(finish_delta as u64);
+   ```
+3. **Drain-side pops the bucket with smallest `virtual_finish_ns`**, not round-robin. Candidate structures:
+   - Small min-heap (16-32 entries, since active buckets rarely exceed 64).
+   - Re-sort the DRR ring on each pop (O(active) per pop, ~2 μs at 12 flows — may be simpler).
+   Benchmark both before picking.
+4. **Shared `SharedCoSQueueLease` rate cap unchanged** — still enforces aggregate.
+5. **Keep slice-2's rate gate OFF** (remain on current master state). MQFQ ordering replaces its role.
+
+## Correctness concerns (pre-empt before implementation)
+
+### Overflow
+At 100 Gbps sustained, `virtual_finish_ns` grows ~12.5 units per byte. Over a multi-day daemon uptime the u64 eventually wraps. Mitigations (pick one):
+- **Periodic normalisation:** when `min_finish_time > 2^60`, subtract `min_finish_time` from all bucket finish times. Triggered per-worker at queue idle or on a slow timer.
+- **u128 throughout:** avoids the issue but doubles the per-bucket memory + increases per-packet arithmetic.
+
+Pick normalisation unless benchmarking shows the subtraction walk over 1024 buckets is too expensive.
+
+### Monotonicity under concurrent enqueue + dequeue
+Buckets are per-worker non-atomic (single-writer per queue per worker). Safe without locking. Invariant to hold: within a single drain batch, the heap must see a coherent view — don't read a bucket's `virtual_finish_ns` twice mid-batch and observe different values.
+
+### Empty-bucket behaviour
+When a bucket drains to 0, reset `virtual_finish_ns = 0`. Without this reset, a flow that went idle and returns would inherit a stale future finish time and jump to the back of the heap, starving.
+
+
+*(truncated — 80 lines total)*
+
+
+---
+
+## #793 — #785 Phase 4 — Full MQFQ with shared V_min + lag throttle [CLOSED] (closed 2026-05-05)
+
+Part of #789. **Blocked by #792 (Phase 3).** Kick off only if Phase 3's local-only MQFQ does NOT hit CoV ≤ 20 %.
+
+## Goal
+
+Layer the cross-worker half of MQFQ (Hedayati & Shen, *Multi-Queue Fair Queueing*, USENIX ATC '19) on top of Phase 3's per-worker virtual-finish-time ordering: shared `V_min` anchor + lag-threshold throttle. This is the architecturally correct answer per [`cross-worker-flow-fairness-research.md`](../blob/master/docs/cross-worker-flow-fairness-research.md) — provable O(T) fairness bound, measured in the paper at 20× scalability over BFQ.
+
+## Hypothesis
+
+If Phase 3 doesn't close the gap, the residual imbalance is genuinely cross-worker — workers with more flows drain faster than the shared-lease FCFS token allocation allows them to be fair. Full MQFQ solves this: workers self-throttle when they get too far ahead of the slowest worker's virtual time.
+
+## Design
+
+1. **Shared `v_min: AtomicU64`** on `SharedCoSQueueLease`. On every dequeue, the draining worker CAS-updates `v_min` to `max(current_v_min, drained_packet_finish_time)`. Monotonic via compare-exchange loop.
+2. **Per-worker `v_local: u64`** tracks this worker's most-recently-drained finish time. Non-atomic (single-writer per worker).
+3. **Lag throttle:** when `v_local - V_min > T`, the worker pauses its drain until `V_min` catches up. `T` is the fairness bound — Hedayati & Shen measure optimal at `T ≈ queue_rate × 10 ms` (i.e. ~30 MB at 25 Gbps). **Tune `T` empirically across `[1, 100]` ms equivalents; document the sweep.**
+4. **Build on slice-2 infrastructure:** `active_flow_count` atomic with idle-only reset from `pr/785-cross-worker-drr` is the signal workers use to re-anchor `v_min` when the queue transitions to/from idle. `shared_lease` Arc cache on `CoSQueueRuntime` is the direct path to `v_min`.
+5. **Decide: retire or keep the per-worker rate gate from slice 2.** MQFQ's throttle is strictly tighter, so the rate gate becomes redundant. But keeping it as a safety net costs only a bool check on the hot path — decide post-measurement.
+
+## Correctness concerns
+
+### V_min monotonicity under concurrent drain
+Every worker CAS-es to `max(current, my_finish)`. Race classes to walk through:
+- Two workers drain simultaneously with different finish times.
+- Worker stalls mid-drain (e.g. blocked on shared lease acquire) — does V_min paused correctly?
+- Queue transitions to idle mid-drain — does `snap_peak_to_current` race with a late V_min update?
+
+Hedayati & Shen's paper proves convergence; we need to pin it for OUR concurrency shape.
+
+### Lag-threshold `T` tuning vs per-packet cost
+- Too-tight (`T < 5 ms × rate`): workers throttle mid-drain-batch, losing TX-ring fullness → throughput regression.
+- Too-loose (`T > 50 ms × rate`): fairness bound widens → CoV regression.
+- Sweep `T ∈ {1, 5, 10, 20, 50, 100}` ms equivalents; measure SUM + CoV at each. Pick the knee.
+
+### CAS contention on V_min
+One CAS per drain (not per packet). Contention is bounded by `worker_count × drain_rate`, not line rate. Paper measures 20× scalability over BFQ because of this. **Profile on OUR workload (6 workers × ~100k drains/sec = ~600k CAS/sec) to confirm.** If contention is material, flag it — research doc §3 discusses fallback to sharded V_min.
+
+## Anti-regression tests (must all pass before merge)
+
+- `v_min_monotonic_under_concurrent_drain` — synthetic multi-worker stress test, assert V_min is monotonic non-decreasing.
+- `throttle_fires_when_lag_exceeds_threshold` — construct a state where `v_local - V_min = T + 1`, assert drain pauses.
+
+*(truncated — 79 lines total)*
+
+
+---
+
+## #794 — #785 Phase 5 — AFD policer for misbehaving flows (optional) [CLOSED] (closed 2026-05-05)
+
+Part of #789. **Blocked by #793 (Phase 4).** Optional — kick off only if Phase 4 hits the fairness target BUT pathological flows (TCP CUBIC burst during loss recovery, UDP floods, misconfigured clients) starve well-behaved flows.
+
+## Goal
+
+Add AFD (Approximate Fair Dropping) per [`cross-worker-flow-fairness-research.md`](../blob/master/docs/cross-worker-flow-fairness-research.md) §3.3. Complementary to MQFQ: MQFQ schedules well-behaved flows fairly; AFD polices misbehaving ones via Count-Min-sketch ECN marking / drop.
+
+## Hypothesis
+
+MQFQ is fair but not defensive. A flow that aggressively over-sends (e.g. CUBIC multiplicatively increasing cwnd during slow-start recovery, or a UDP client at 2× fair share) can crowd well-behaved flows even under MQFQ, because MQFQ orders packets by virtual finish time but doesn't reject them. AFD adds the rejection mechanism while preserving MQFQ's scheduling.
+
+## Design
+
+1. **Per-`shared_exact`-queue Count-Min sketch:** depth 4, width 4096 buckets ≈ 32 KB memory, fits in L2 on modern CPUs. Stored on `SharedCoSQueueLease` (shared across workers) with atomic increments.
+2. **On enqueue** (after the flow-fair gate):
+   - Compute 4 independent hashes of `flow_key`; increment those 4 sketch buckets.
+   - Estimate per-flow bytes as `min(4 bucket values)`.
+   - If estimate > (fair-share threshold × multiplier, e.g. `2×`), ECN-CE-mark the packet; drop if non-ECT.
+3. **Slow-timer decay:** halve all sketch counts on a 500 ms tick. Bounds memory usage (sketch can't grow indefinitely) and lets a recovered flow re-accumulate fair share after its burst subsides.
+4. **Multiplier tuning:** the `2×` threshold is the paper's recommendation; sweep `{1.5, 2, 3, 5}×` to find the knee between tolerance of bursts and protection of well-behaved flows.
+
+## Correctness concerns
+
+### Sketch collisions
+Count-Min is probabilistic — collisions over-count an innocent flow when an innocent flow happens to hash into the same bucket as a misbehaving flow. Bound: false-positive rate ≤ `e / width = 2.7 / 4096 ≈ 0.07%`. Acceptable, but flag in the PR.
+
+### Decay interaction with burst detection
+If the timer fires mid-burst, the sketch halves and the misbehaving flow's estimate drops below threshold before the burst ends. Mitigations:
+- Slower decay (e.g. 1 s) → less responsive to recovery but more reliable detection.
+- Keep the decay at 500 ms but raise the multiplier to `3×` so the threshold is well above noise.
+Decide empirically during `T`-tuning for Phase 5.
+
+### Runtime cost
+4 hash lookups + 4 compare-exchange per enqueue on shared_exact. At ~2 M enqueues/sec on a 25 Gbps queue, that's 8 M atomic ops/sec. Cache-line contention on the sketch is bounded because flows hash to different bucket sets with high probability. Profile before/after.
+
+## Anti-regression tests
+
+- `count_min_sketch_bounds_estimate_below_ratio` — under controlled inputs, estimate error ≤ the `e / width` bound (property-based).
+- `decay_halves_sketch_bounded_memory` — after decay, no bucket count exceeds its pre-decay value / 2.
+- `pathological_flow_does_not_starve_well_behaved` — integration test: one UDP flow at 2× fair share + 11 TCP flows at fair share; TCP flows still CoV ≤ 15 %; UDP flow ECN-marked or dropped at target rate.
+- `well_behaved_flow_not_punished_under_collision` — construct a state where innocent flow shares sketch bucket with misbehaving flow; innocent flow's false-positive rate bounded.
+
+*(truncated — 71 lines total)*
+
+
+---
+
+## #798 — perf: line-rate gap on iperf3 -P 16 -t 60 -p 5201 (both directions) [CLOSED] (closed 2026-05-05)
+
+## Summary
+
+P=16 t=60 iperf3 on port 5201 falls short of line rate on the `loss-userspace` test cluster (mlx5 25 Gbps):
+
+| Direction | SUM Gbps | % of line | Retransmits |
+|-----------|----------|-----------|-------------|
+| Forward   | 21.35    | 85 %      | **933**     |
+| Reverse   | 19.10    | 76 %      | 0           |
+
+Target: ≥ 24 Gbps both directions, ≤ 100 retransmits, no regression vs current fairness work (Phase 3 MQFQ + D3).
+
+## Plan + review record
+
+Full investigation plan (after 5 review rounds + both reviewers PLAN-READY YES): `docs/line-rate-investigation-plan.md`.
+
+## Phase B Step 0 audit summary
+
+22/39 audit items PASS, 11 FAIL, 6 DEFERRED-INSTRUMENTATION. Full table: `docs/line-rate-step0-audit.md`.
+
+Top FAILs being tracked in follow-up issues.
+
+## Fairness non-regression
+
+Phase 3 MQFQ + D3 delivered mean CoV ~38% (was 54.7%). All fixes in this investigation must preserve that.
+
+---
+
+## #799 — perf: 55M rx_steer_missed_packets on ge-0-0-2 at cold (mlx5 flow steering miss) [CLOSED] (closed 2026-04-20)
+
+Related: #798
+
+## Summary
+
+Phase B Step 0 audit observed `rx_steer_missed_packets = 55,731,591` on `ge-0-0-2` on fw0 at cold (no iperf3 running). The mlx5 flow-steering miss counter is growing into the tens-of-millions. Packets matching the miss path never reach a ring.
+
+## Why this matters
+
+Could be the entire cause of the line-rate gap. Before any other fix, we need to understand why mlx5 flow steering is missing, what those packets are, and whether they're part of the iperf3 data path or unrelated management traffic.
+
+## Investigation
+
+- Identify which rules exist (`ethtool -N ge-0-0-2`, `tc filter show dev ge-0-0-2 ingress`)
+- Compare XDP attach state vs flow steering rules
+- Run a controlled iperf3 and see whether `rx_steer_missed_packets` delta correlates with test traffic
+
+## Reference
+
+Audit doc: `docs/line-rate-step0-audit.md`. Plan: `docs/line-rate-investigation-plan.md`.
+
+---
+
+## #800 — perf: workers count should match RX queue count (currently 4 workers / 6 queues per NIC) [CLOSED] (closed 2026-04-21)
+
+Related: #798
+
+## Summary
+
+`xpf-userspace-dp --workers 4` but each of 3 mlx5 NICs has 6 RX queues. Queues 4 and 5 double-bind to workers 0 and 1. IRQ affinity for queues 4/5 lands on CPUs 4/5 (no worker), so every packet on those queues crosses CPU cache lines to reach worker 0/1 on CPU 0/1.
+
+On a 6-vCPU host, `--workers 6` would match the NIC queue count and eliminate the double-binding + IRQ-miss situation.
+
+## Why this matters
+
+Step 0 audit row 0.1: queues 4 and 5 IRQs pin to CPU 4/5 (mlx5 default), but workers 0/1 service them on CPU 0/1. Every packet crosses L2 cache on those queues → measurable cost at line rate.
+
+## Open questions before PR
+
+- Is the right fix bumping workers to 6, OR dropping RSS queue count to 4 (via `ethtool -L`)?
+- Does `--workers 6` play well with the Phase 3 MQFQ + D3 footprint? CoS queue state is per-worker; more workers = more state.
+- What's the impact on the Phase 3 fairness numbers at P=12?
+
+## Reference
+
+Audit doc: `docs/line-rate-step0-audit.md`.
+
+---
+
+## #801 — perf: zero-code sysctl + coalescence tuning for line rate (governor, netdev_budget, adaptive coalescing) [CLOSED] (closed 2026-04-21)
+
+Related: #798
+
+## Summary
+
+Three zero-code audit fails from Phase B Step 0 that are sysctl/ethtool-level fixes:
+
+1. **CPU governor = `schedutil` (host)** — should be `performance` for sustained high-rate networking. DVFS fights ramp-up.
+2. **`net.core.netdev_budget = 300`** — plan-expected ≥ 600. Caps NAPI packets per iteration; ksoftirqd yields early.
+3. **mlx5 adaptive coalescing = on (RX + TX)** on ge-0-0-1 and ge-0-0-2. Adaptive coalescing is designed for bursty workloads; for sustained iperf3 at 25 Gbps, static low coalescence is preferred.
+
+## Fix approach
+
+- Separate PR: make these configurable via xpfd config (new knobs), default-on for userspace-dp interfaces, skip if operator overrode manually.
+- Apply on daemon startup (same phase as D3), with restore-on-disable per the D3 pattern.
+- Must NOT break flag-OFF behavior on non-userspace-dp deploys.
+
+## Reference
+
+Audit: `docs/line-rate-step0-audit.md`. Plan: `docs/line-rate-investigation-plan.md`.
+
+---
+
+## #802 — perf: expose userspace-dp ring-pressure counters in control-socket snapshot (DEFERRED-INSTRUMENTATION) [CLOSED] (closed 2026-04-21)
+
+Related: #798, blocks Phase B Step 1 for #798
+
+## Summary
+
+Phase B Step 0 identified 6 counters that exist in the userspace-dp Rust code but are not serialized into `BindingLiveSnapshot` or exposed via the control socket:
+
+- `rx_fill_ring_empty_descs` (kernel xdp_statistics)
+- `fill_batch_starved` (userspace-dp internal)
+- `completion_reap_max_batch` (userspace-dp internal)
+- `dbg_tx_ring_full` (per-binding)
+- `dbg_sendto_enobufs` (per-binding)
+- `dbg_pending_overflow` (per-binding)
+
+Plan `docs/line-rate-investigation-plan.md` accepts proxies for `fill_batch_starved` and `completion_reap_max_batch` explicitly. The `dbg_*` counters need to be surfaced for Step 1 of the investigation to read them.
+
+## Fix
+
+Add `per_binding: Vec<BindingCounters>` to the existing `flow_steer_snapshot` control-socket response (or a new snapshot request). Each entry carries worker_id, ifindex, queue_id, and the `dbg_*` counters.
+
+## Why priority
+
+Step 1 of the investigation is gated on reading these counters during a 60s iperf3 run. Without instrumentation, Step 1 uses proxies and the investigation may mis-attribute the line-rate gap.
+
+## Out of scope
+
+Does not modify any dataplane code path. Pure read-side plumbing.
+
+## Reference
+
+Audit doc: `docs/line-rate-step0-audit.md` (DEFERRED-INSTRUMENTATION rows).
+
+---
+
+## #805 — perf: D3 RSS indirection doesn't refresh when workers count changes to equal queue count [CLOSED] (closed 2026-04-25)
+
+Related: #798
+
+## Summary
+
+During investigation of #800, observed that when `system dataplane workers` is bumped to equal the NIC queue count (e.g., 4 → 6 on a 6-queue mlx5 interface), the D3 RSS indirection table is not refreshed. The 4-worker indirection layout (queues 0-3 weight 1, queues 4-5 weight 0) stays live even with 6 workers running, so queues 4 and 5 get no RSS traffic despite now being XDP-bound.
+
+## Where
+
+`pkg/daemon/rss_indirection.go` — the reconcile path doesn't detect a workers-count change as a D3 config change.
+
+## Fix
+
+One-liner: include `workers` in the fingerprint that triggers D3 reapply, OR unconditionally recompute the weight vector on every reconcile and diff against the live table.
+
+## Reference
+
+`docs/800-workers-queues-investigation.md` (commit `6e59277c` on branch `pr/800-workers-queues-alignment`, now closed as no-net-improvement).
+
+---
+
+## #806 — line-rate investigation: remaining gaps after PRs #796/#797/#803/#804 [CLOSED] (closed 2026-05-27)
+
+Follow-up to #798.
+
+## Summary
+
+Four merged PRs + five review cycles this session. Stated target (≥24 Gbps both directions on `iperf3 -P 16 -t 60 -p 5201` with ≤100 retransmits, no fairness regression) is NOT met on master today.
+
+Best current master numbers:
+
+| Test                      | Mean SUM  | Mean CoV | Mean retr |
+|---------------------------|-----------|----------|-----------|
+| P=16 t=60 p=5201 FWD      | 22.94     | 0.21 %   | 2683      |
+| P=16 t=60 p=5201 REV      | 20.66     | 1.50 %   | 29736     |
+| P=12 t=20 p=5203 FWD      | 22.80     | 1.20 %   | 792       |
+
+Fairness non-regression held throughout (13 mqfq_* pins still pass, D3 knob still works).
+
+## Live hypotheses not yet falsified
+
+From the plan (`docs/pr/line-rate-investigation/plan.md`):
+- **H-FWD-1** TX ring overrun — evidence counters now available via PR #804, capture not yet done
+- **H-FWD-2** per-worker CPU saturation
+- **H-FWD-3** conntrack miss storm on flow start
+- **H-FWD-5** NAPI budget / coalescence
+- **H-REV-1** firewall TX-side bottleneck on return
+- **H-REV-6** MQFQ small-ACK vs bulk interleaving (jumbo-MSS test not yet run)
+
+## Ordered next steps
+
+1. Phase B Step 1: capture ring-pressure counter deltas during P=16 t=60 (both directions) using newly-merged PR #804 instrumentation.
+2. A/B: `claim-host-tunables=true` (bare-metal path — `performance` governor + `netdev_budget=600`) vs false on matched cluster state.
+3. mpstat + `perf stat --per-thread -p $WORKER_PIDS` + dual-size ping latency probe during each 60s run (p50/p99).
+4. H-REV-6 jumbo-MSS diagnostic for the reverse direction.
+5. Fix #805 (D3 RSS indirection not refreshed on worker-count change).
+
+## Reference docs
+
+Full detail + exit criteria in `docs/pr/line-rate-investigation/remaining-gaps.md`.
+
+Plan + review record + Step 0 audit: `docs/pr/line-rate-investigation/`.
+
+
+*(truncated — 46 lines total)*
+
+
+---
+
+## #812 — perf: per-queue TX-lane submit→completion latency histogram (Step 1 → Step 2 follow-up) [CLOSED] (closed 2026-04-21)
+
+Follow-up to #798. Prereq for #806.
+
+## Summary
+
+Step 1 of the line-rate investigation (executed in PR #810, findings in \`docs/pr/line-rate-investigation/step1-findings.md\`) returned Verdict D dominant on 10/12 cells. Per the plan's §8 decision tree, D-dominant rules out D1'/AFD/TX-tuning as the next lever and instead demands a new instrumentation tier.
+
+Specifically: a **per-queue TX-lane submit→completion latency histogram**, exposed via the control socket, covering:
+
+- Submit time: when `cos_queue_pop_front` hands a packet to the TX ring.
+- Completion time: when the TX completion ring confirms the descriptor.
+- Delta per packet, bucketed into a log-spaced histogram per queue per worker.
+
+Plus a second artifact needed by the Step 1 plan's §8 Z_cos re-calibration gate:
+
+- Capture park-rate samples on healthy with-cos-fwd-shaped cells with the new histogram active, re-derive Z_cos = mean + 2σ from real data, update the Step 1 plan.
+
+## Why this specifically
+
+The D-dominant verdict means current counters don't discriminate among TX-completion dynamics that could produce the remaining CoV. A submit→completion histogram surfaces:
+
+- Head-of-line blocking on specific queues
+- Completion-ring starvation patterns (bursty reap)
+- Shaping-MQFQ interaction (correlation with token refill cadence)
+
+If the re-run Step 1 classifier with the new signal STILL returns D-dominant, we've demonstrated fairness is at the measurement-floor and the remaining 11-25% under-shaping CoV is shaping-quantization noise. Either outcome is a valid stopping point per #806.
+
+## Out of scope
+
+- Any code change that alters the hot path semantically (pure observability).
+- D1'/AFD/TX-ring-tuning work — explicitly ruled out by Step 1.
+- The symmetric-reverse-CoS config question (separate scope).
+
+## Reference
+
+- Plan that will be drafted: \`docs/pr/step1-instrumentation/plan.md\`
+- Step 1 findings: \`docs/pr/line-rate-investigation/step1-findings.md\`
+- Development workflow: \`docs/development-workflow.md\` (PR #811)
+
+---
+
+## #814 — userspace-dp: fab0 ifindex >2048 blocks dataplane compile on fw1 (MAX_INTERFACES too small) [CLOSED] (closed 2026-04-21)
+
+## Symptom
+
+On `loss:xpf-userspace-fw1`, `xpfd` fails to compile the dataplane at startup; the userspace-dp helper is never spawned; any HA failover to fw1 drops forwarding entirely.
+
+```
+Apr 21 14:07:11 xpf-userspace-fw1 xpfd[138494]: level=WARN
+  msg=\"failed to compile dataplane\"
+  err=\"compile zones: add tx port fab0: update: key too big for map: argument list too long\"
+  attempt=1 ever_ok=false
+Apr 21 14:07:12 xpf-userspace-fw1 xpfd[138494]: level=WARN
+  msg=\"cluster: event stream bulk export failed, falling back to BulkSync\"
+  err=\"userspace dataplane helper not running\"
+```
+
+`ever_ok=false` means xpfd never transitions to the state that forks `xpf-userspace-dp`. `/run/xpf/userspace-dp.sock` is absent on fw1. The fw0 primary carries all traffic; failover to fw1 has no forwarding path.
+
+## Root cause
+
+`fab0` on fw1 has ifindex **2561**, exceeding `MAX_INTERFACES = 2048` (bpf/headers/xpf_common.h:143). The `tx_ports` map is `BPF_MAP_TYPE_DEVMAP` with `max_entries = MAX_INTERFACES`, so `bpf_map_update_elem(tx_ports, 2561, ...)` returns `E2BIG` (\"argument list too long\").
+
+```
+$ incus exec loss:xpf-userspace-fw1 -- ip -o link | awk -F: '{print \$1}' | sort -n | tail -4
+2561   fab0
+2565
+2566
+```
+
+This is a direct recurrence of #756. PR #759 originally fixed it by converting the ifindex-keyed maps to HASH variants, but PR #767 had to revert `tx_ports` back to plain `DEVMAP` because `DEVMAP_HASH` broke mlx5 SR-IOV native-XDP forwarding on kernel 7.0.0-rc7+. The comment at bpf/headers/xpf_maps.h:343-371 explicitly documents the escape hatch:
+
+> \"When that becomes a live concern again, the fix is to raise MAX_INTERFACES rather than reintroduce DEVMAP_HASH.\"
+
+It is now a live concern.
+
+## Fix
+
+Raise `MAX_INTERFACES` so ifindex values that drift into the 2000-3000 range on long-lived VMs still fit. Candidate: 65536 (the kernel ifindex cap is 2^31-1 but realistic values stay well under 65K even after years of namespace churn).
+
+All five maps that size on `MAX_INTERFACES` (tx_ports, redirect_capable, mirror_config, interface_counters, and the aya userspace_ingress_ifaces equivalent) should be reviewed for memory-footprint and lookup-pattern impact when raising.
+
+## Impact
+
+*(truncated — 50 lines total)*
+
+
+---
+
+## #816 — Step 1 classifier re-run on master with TX latency histogram (post-#813) [CLOSED] (closed 2026-04-21)
+
+## Context
+
+Phase B Step 1 (see \`docs/pr/line-rate-investigation/step1-findings.md\`) returned **D / D-escalate (dominant)** on 10/12 cells in the prior run. Per step1-plan §8:
+
+> \"If verdict is **D (npbt)** on > 75 % of cells: we exhausted the current hypothesis set. Step 2 is the design doc for a new hypothesis tier — NOT more measurement.\"
+
+The named prerequisite was per-queue TX-lane-level latency histogram instrumentation — **landed in PR #813 (#812)**.
+
+## Goal
+
+Re-run the Step 1 classifier on master with the histogram-enriched signal. Two possible outcomes:
+
+- **D-dominant persists** → current fairness is at the measurement floor. Remaining CoV is shaping-quantization noise. Declare Phase B fairness work done. Close #786, deprioritize #793 until a real signal surfaces.
+- **Non-D-dominant** → the histogram reveals a new hypothesis tier (e.g. buckets 4-7 pattern per #812 §11). Use the verdict to scope #793 (Phase 4 MQFQ with shared V_min + lag throttle) concretely.
+
+Either outcome is a valid stopping point for the #812 line of work.
+
+## Deliverables
+
+1. Fresh 12-cell measurement matrix on \`loss:xpf-userspace-fw0\` using the canonical 4-FC CoS config (scheduler-be 100 M / iperf-a 1 G / iperf-b 10 G / iperf-c 25 G).
+2. Histogram JSON captures (newly available via #813) per cell.
+3. Block-permutation test (Fisher-Pitman) per #812 plan §11.3 on the per-block histogram values.
+4. Verdict doc + evidence dir under \`docs/pr/<N>/\`.
+
+## Prerequisites
+
+- \`loss:xpf-userspace-fw0\` on master (#815 merged).
+- Reverse-direction CoS config fix (#812 §12 item 7) — check whether landed or handle in-scope.
+
+## Out of scope
+
+- Code changes to the histogram itself (#812 §12 deferrals: Prometheus export, per-flow hash, bucket re-width).
+- Phase 4 implementation (#793) — this issue produces the verdict that scopes it, not the work itself.
+
+---
+
+## #817 — Step 1 #816 reproducibility: re-run under pinned scipy 1.13.1 / numpy 1.26.4 (Path B) [CLOSED] (closed 2026-05-05)
+
+## Context
+
+PR #816 (Step 1 classifier re-run) was executed against `loss:xpf-userspace-fw0` on 2026-04-21. The plan (`docs/pr/816-step1-rerun/plan.md` §10 req 4) required HALT on inability to pin SciPy 1.13.1 / NumPy 1.26.4. The capture host has Python 3.13 + PEP-668 blocking pip install; the pinned SciPy 1.13.1 source build fails under Python 3.13. Implementor proceeded under system apt SciPy 1.16.3 / NumPy 2.3.5 and documented the drift.
+
+Codex findings review flagged this as HIGH (process contract violation). We chose **Path A** for #816 — revise findings.md against the H2-D1 verdict with documented scipy-drift deferral — and tracked the strict-contract rerun as this issue.
+
+## Why this might still matter
+
+Most of the #816 conclusions don't depend on scipy version — D1 stat_obs ≈ 0.9 is enormous and won't flip on a minor-version reshuffle. But two narrow concerns survive:
+
+1. \`p5203-rev-with-cos D2 = 0.0465\` is within the Monte-Carlo 95% half-width of α=0.05. A different RNG stream could plausibly push it above the gate. Independent of the methodology critique that D2 is bogus, the strict reproducibility check would settle whether the gate-crossing is RNG-sensitive.
+2. The committed evidence files record \`scipy_version: 1.16.3\` / \`numpy_version: 2.3.5\`. Anyone re-deriving from the evidence under the pinned environment must verify their reproduction matches.
+
+## What this issue does
+
+Re-run \`test/incus/step1-histogram-classify.py\` under the pinned environment specified by \`test/incus/requirements-step1.txt\`. Diff the new \`perm-test-results.json\` byte-for-byte (or by p-value) against the committed ones. File the diff as \`docs/pr/816-step1-rerun/evidence/scipy-pin-validation.md\`.
+
+## Setup
+
+The capture host needs either:
+- Python 3.11 venv via \`pyenv\`, then \`pip install -r test/incus/requirements-step1.txt\`, OR
+- \`apt install python3.11 python3.11-venv\`, OR
+- Pin scipy/numpy to versions that build under Python 3.13 and update the requirements file (drops the strict-pin guarantee but stays reproducible going forward).
+
+## Risk if deferred
+
+- **Low for D1**: the shaped-cell signal is robust to RNG.
+- **Medium for D2**: but D2 is being downgraded to \"not a verdict\" in the Path A revision anyway, so the gate-crossing question is moot for the Phase 4 scoping.
+- **Low for Z_cos**: methodologically unsound regardless of seed.
+- **Higher for the next investigation round**: if Step 2 needs to re-derive thresholds from this evidence, the strict-pin discipline matters more then.
+
+## Acceptance criteria
+
+- \`test/incus/step1-histogram-classify.py\` re-run succeeds under \`scipy 1.13.1 / numpy 1.26.4\`.
+- All p-values within Monte-Carlo 95% CI of the committed values, OR explicit documentation of which cells differ and why.
+- \`perm-test-results.json\` files updated in-place OR a sister directory (e.g. \`evidence-pinned/\`) created and a diff doc landed.
+
+---
+
+## #819 — Step 2 telemetry design doc: discriminate H2 D1 mechanisms (#816 follow-up) [CLOSED] (closed 2026-04-21)
+
+## Context
+
+PR #818 (#816) landed the **H2 D1 verdict**: XSK submit→DMA latency elevated cross-cell on shaped-traffic cells (`stat_obs ≈ 0.9` on p5201-fwd / p5202-fwd). Per `docs/pr/816-step1-rerun/findings.md` §7, five candidate mechanisms were enumerated; the data does not yet distinguish among them. Step 2 must wire telemetry to discriminate before scoping Phase 4 (#793).
+
+## The 5 candidate mechanisms (per #816 §7)
+
+1. **Submit→TX DMA stalls under no-shaper backpressure.** Submit-path queueing internal to AF_XDP. Discriminator: per-worker `xdp_redirect_map` retry-loop counter + AF_XDP sendto kick latency.
+2. **RX-side NAPI budget exhaustion leaking into TX scheduling.** Discriminator: `napi_complete_done` cycle accounting on the RX queue + cross-CPU scheduling delay traces.
+3. **Kernel scheduler descheduling worker between `sendto` and reap.** Discriminator: `sched_switch` events on the worker CPU + voluntary vs involuntary context switch rate.
+4. **Virtualization jitter** (VM on nested hypervisor). Discriminator: `KVM_REQ_*` exit reasons via perf; HALT/IPI frequency.
+5. **iperf3 client-side burstiness.** Discriminator: client-side per-packet send-time histogram + server-side jitter compare.
+
+## Goal
+
+A focused design doc that picks the smallest telemetry probe (or set) that maximally discriminates among these 5 mechanisms, then specifies how to wire and capture it on the userspace cluster.
+
+## Approach options
+
+- **Option A — One probe at a time, ordered by likely informativeness.** Cheapest. Each probe rules in/out one or two mechanisms; iterate until the picture is clear. Probably starts with (3) `sched_switch` (cheap perf-record, no daemon code) because it's the most general and rules out (or in) the kernel-scheduler axis on its own.
+- **Option B — All 5 probes in parallel during one capture window.** More definitive but more setup. Reasonable if the cluster window is precious or if some probes are coupled.
+- **Option C — A composite "meta-probe":** measure end-to-end latency at multiple points along the path (sendto entry, inside AF_XDP, NIC TX completion, RX kernel return) and infer which segment is responsible. Higher engineering cost; produces the cleanest narrative.
+
+## What this issue produces
+
+A design doc at `docs/pr/<this-issue-N>/design.md` covering:
+
+- Mechanism-vs-discriminator matrix (5 mechanisms × N probes; mark each cell "rules in / rules out / informative / silent")
+- Picked option (A / B / C) with rationale
+- Per-probe wiring spec (where in the codebase, what the probe emits, capture cadence)
+- Capture protocol (extension to `step1-capture.sh` or a separate harness)
+- Analysis recipe (what each probe's output looks like, how to read it)
+- Decision tree: which mechanism's signature looks like what, leading to a Phase 4 scope under #793
+
+## Out of scope
+
+- Implementation of any wiring (the design doc names what to wire; the wiring is a separate PR after design is approved)
+- New histogram buckets or per-flow histograms (#812 deferrals stand)
+- bpfrx cluster (forbidden test surface)
+
+## Workflow
+
+*(truncated — 48 lines total)*
+
+
+---
+
+## #821 — Wire step2-sched-switch-capture.sh sister harness for P1 off-CPU duration probe (#819 P1) [CLOSED] (closed 2026-04-22)
+
+## Context
+
+Issue A from the #819 design doc §10 implementation queue. Landed in PR #820 (merged 2026-04-21). The design doc is at \`docs/pr/819-step2-discriminator-design/design.md\`; the plan it follows is at \`docs/pr/819-step2-discriminator-design/plan.md\`.
+
+This issue wires the P1 probe: a \`perf record\` on \`sched_switch\` + \`sched_stat_runtime\` + \`sched_wakeup\` against the xpf-userspace-dp worker TIDs on \`loss:xpf-userspace-fw0\`, reduced to per-block off-CPU duration histograms aligned with the #812 16-bucket layout. The reducer emits correlation against \`T_D1,b\` from the histogram landed in PR #813. Discriminates **M3 (scheduler descheduling the worker)** per plan §4.1 threshold T3.
+
+## Scope (per plan §5.1)
+
+### 1. New sister harness
+\`test/incus/step2-sched-switch-capture.sh\` that, for each load-bearing cell (\`p5201-fwd-with-cos\` and \`p5202-fwd-with-cos\`):
+
+- Invokes \`step1-capture.sh\` to produce the histogram baseline (\`hist-blocks.jsonl\`).
+- Concurrently runs \`perf record -e sched:sched_switch -e sched:sched_stat_runtime -e sched:sched_wakeup -t "\$WORKER_TIDS"\` for 60 s.
+- Writes artifacts to \`docs/pr/819-step2-discriminator-design/evidence/p<port>-fwd-with-cos/sched-switch/\`.
+
+### 2. Python reducer
+\`test/incus/step2-sched-switch-reduce.py\` that:
+
+- Reads \`perf script\` output.
+- Pairs \`sched_switch (prev=TID, state=off)\` with the next \`sched_wakeup\` on the same TID to compute off-CPU duration.
+- Buckets each duration into the same 16 log2 buckets as \`tx_submit_latency_hist\` (\`[1µs, 2µs, 4µs, 8µs, 16µs, 32µs, 64µs, 128µs, 256µs, 512µs, 1ms, 2ms, 4ms, 8ms, 16ms, ≥32ms]\`).
+- Emits \`off-cpu-hist-by-block.jsonl\` with 12 lines:
+  \`{"b": <0..11>, "buckets": [16 u64], "off_cpu_time_3to6": <u64 ns>, "voluntary_3to6": <u64 ns>, "involuntary_3to6": <u64 ns>, "stat_runtime_check": "PASS"|"WARN"}\`
+- Uses sched_stat_runtime only as a sanity cross-check (on-CPU intervals sum to wall-clock minus aggregate off-CPU time; mismatch >1% → WARN).
+- Classifies voluntary (prev_state ∈ {S,D,I}) vs involuntary (prev_state = R).
+
+### 3. Correlation report
+\`test/incus/step2-sched-switch-classify.py\` that:
+
+- Reads \`hist-blocks.jsonl\` + \`off-cpu-hist-by-block.jsonl\`.
+- Computes Spearman ρ(T_D1,b, off_cpu_time_3to6,b) across 12 blocks.
+- Applies T3 decision rules (plan §7.1): M3 IN if ρ ≥ 0.8 AND duty cycle ≥ 1%; M3 OUT if ρ ≤ 0.3 OR duty cycle < 1%; M3 INCONCLUSIVE otherwise.
+- Writes \`correlation-report.md\` with the scatter data, ρ values, and verdict.
+
+### 4. G8 preflight smoke test
+Per plan §5.1 "Privilege preflight":
+
+\`\`\`bash
+# 1. sysctl (guest)
+incus exec loss:xpf-userspace-fw0 -- sysctl kernel.perf_event_paranoid
+
+*(truncated — 72 lines total)*
+
+
+---
+
+## #823 — Run P1 sched_switch captures on load-bearing cells + negative control (#821 follow-up) [CLOSED] (closed 2026-04-22)
+
+## Context
+
+PR #822 (#821) landed the P1 sister harness + reducer + classifier. This issue **runs** the captures on \`loss:xpf-userspace-fw0\` and produces the first M3 IN/OUT verdict per #819 design doc §8.1.
+
+Parent:
+- #819 design doc §5.1 (P1 spec) and §8.1 (decision tree)
+- #821 plan §6 (two load-bearing cells; no matrix re-run) and §6.2 (negative control on a D1-quiet cell)
+- Script landed at \`test/incus/step2-sched-switch-capture.sh\`
+
+## Scope
+
+Three captures on \`loss:xpf-userspace-fw0\`:
+1. **p5201-fwd-with-cos** — load-bearing D1-fire cell (stat_D1 ≈ 0.969 per #816 findings §1.2)
+2. **p5202-fwd-with-cos** — load-bearing D1-fire cell (stat_D1 ≈ 0.885)
+3. **p5203-fwd-no-cos** — negative control (D1-quiet cell; p_D1 = 0.972 per #816). Validates the probe is workload-specific, not a background scheduler pattern.
+
+## Budget
+
+- ~10 min wall-clock per capture (60s iperf3 + setup/teardown + perf script pull + reducer/classifier pipeline)
+- ~30 min total wall-clock
+- Plus ~15 min to write findings
+
+Well under the 120-min ceiling from #821 §3.5.
+
+## Evidence
+
+Written under \`docs/pr/819-step2-discriminator-design/evidence/p<port>-<dir>-<cos>/sched-switch/\` per #821 §4.2:
+- \`perf.data\`, \`perf-script.txt\`
+- \`flow_steer_cold.json\`, \`flow_steer_samples.jsonl\` (copied from step1)
+- \`off-cpu-hist-by-block.jsonl\`, \`correlation-report.md\`, \`correlation-report.meta.json\`, \`correlation-report.diag.json\`
+- \`step1-capture.log\`, \`worker-tids.txt\`
+
+Plus \`docs/pr/819-step2-discriminator-design/step2-p1-findings.md\` with per-cell verdicts + cross-cell aggregate + §8.1 decision.
+
+## Decision tree outcomes (per #819 design doc §8.1)
+
+- **P1 → M3 IN on both load-bearing cells** → Phase 4 scoped as scheduler-jitter mitigation (RT SCHED_FIFO on workers, \`isolcpus=\`, iperf3 client off worker cores). Close #819's step 2 direction.
+- **P1 → M3 OUT on both** → file Issue B (P3 daemon counters) per #819 §10.
+- **P1 → split verdict** → per-cell branching per #821 §6.3.
+- **P1 → INCONCLUSIVE** → re-bin at 1-s blocks (same perf.data, no re-capture) OR file P3 in parallel.
+
+*(truncated — 51 lines total)*
+
+
+---
+
+## #825 — Wire tx_kick_latency_hist + tx_kick_retry_count in xpf-userspace-dp (P3/#819 §5.3, Issue B) [CLOSED] (closed 2026-04-22)
+
+## Context
+
+P1 (sched_switch probe) came back **M3 OUT** on both load-bearing cells in PR #824 (#823). Worker on-CPU ~100% throughout; scheduler descheduling is not the mechanism. Per #819 §8.1 decision tree, proceed to P3 — M1 test via AF_XDP TX-kick latency histogram + retry counter. Findings at \`docs/pr/819-step2-discriminator-design/step2-p1-findings.md\`.
+
+## Scope
+
+Rust daemon wiring per #819 plan §5.3 file-scope change list:
+
+### Hot-path instrumentation
+- **Site:** \`userspace-dp/src/afxdp/tx.rs\` around \`maybe_wake_tx\` (near line 6429). sendto syscall at line 6439.
+- **What to measure:**
+  1. \`tx_kick_retry_count: u64\` — increment on \`sendto\` returning \`EAGAIN\` / \`EWOULDBLOCK\` (around line 6453).
+  2. \`tx_kick_latency_hist: [AtomicU64; 16]\` — timestamp pair around the \`sendto\` call (lines 6438-6447); bucket per same 16-bucket log2 layout as \`tx_submit_latency_hist\`.
+  3. \`tx_kick_latency_count: u64\` — total kicks observed (invariant: \`sum(hist) == count\`).
+  4. \`tx_kick_latency_sum_ns: u64\` — total ns, for mean derivation.
+
+### Owner-snapshot state
+\`userspace-dp/src/afxdp/worker.rs\` — mirror the projection pattern at \`worker.rs:4240-4247\` used by \`tx_submit_latency_hist\`.
+
+### Wire-format additions
+- **Rust side:** \`userspace-dp/src/protocol.rs\` near \`BindingCountersSnapshot\` (lines 1320-1343). Add the four new fields. Respect \`#[derive(Clone, Default, Serialize, Deserialize)]\` + compile-time \`'static + Send\` assertion per #812 HIGH-3 pattern.
+- **Go side:** \`pkg/dataplane/userspace/protocol.go\` near line 697 (\`BindingCountersSnapshot\`) and line 682 (\`BindingStatus\` projection).
+
+### Coordinator copy
+\`userspace-dp/src/afxdp/coordinator.rs\` — mirror the pattern at lines 1428-1440 (where \`tx_submit_latency_hist\` is copied today) and the clear-on-reset path at line 1530.
+
+### Capture script updates
+\`test/incus/step1-capture.sh\` — none required. Existing snapshot loop (polls \`{"type":"status"}\` every 5s) picks up new fields automatically once wire format is bumped.
+
+\`test/incus/step1-histogram-classify.py\` — optional: add a second block-delta reducer for the new histogram so Issue B's follow-up capture reuses the same machinery as Issue A did. Per #821's \`--only-cell\` pattern. Can defer if tight.
+
+### Tests
+- Rust unit tests for the new histogram recording path + wire-format round-trip.
+- Bench stub mirroring #812's overhead test (new hot-path adds a timestamp pair and one fetch_add per kick; budget check per #812 §3.4).
+
+## Plan contract
+
+#819 plan §5.3 + §10 own the spec. This issue implements that spec verbatim:
+
+- No new bucket cuts on the histogram (same 16 log2 layout).
+
+*(truncated — 71 lines total)*
+
+
+---
+
+## #827 — P3 captures + classifier: apply T1 threshold on p5201/p5202-fwd-with-cos (#819 follow-up) [CLOSED] (closed 2026-04-22)
+
+## Context
+
+PR #826 (Issue #825, #819 Issue B) landed the P3 daemon counters:
+`tx_kick_latency_hist`, `tx_kick_latency_count`, `tx_kick_latency_sum_ns`,
+`tx_kick_retry_count` on `BindingStatus`/`BindingCountersSnapshot`.
+The new fields surface in `flow_steer_samples.jsonl` via the existing
+`step1-capture.sh` snapshot loop (validated on deploy: +236K kicks
+during a 17.79 Gbps iperf3 run, 0 retransmits).
+
+#819 §7.2 / §8.1 name P3 as the next probe after #823 landed **M3 OUT
+on both load-bearing cells**. This issue runs the P3 captures and
+applies the T1 threshold to decide mechanism M1 IN/OUT.
+
+## Goal
+
+Emit per-cell verdicts against T1 (§4.1 / §3.2 of #819 design):
+
+- **M1 IN**  — `Δ(retry_count)/block ≥ 1000` during T_D1-elevated
+  blocks AND `mean(kick_latency) ≥ 4 µs`.
+- **M1 OUT** — `Δ(retry_count)/block < 100` on every block AND
+  `mean(kick_latency) < 2 µs` across all blocks.
+- **M1 INCONCLUSIVE** — anything between; route per §Decision tree.
+
+## Deliverables
+
+1. **Classifier script** — new Python tool that reads
+   `flow_steer_samples.jsonl` + `flow_steer_cold.json` + the step1
+   classifier's `hist-blocks.jsonl`, computes per-block deltas
+   (`retry_count_delta`, `kick_latency_mean_ns`), emits
+   `tx-kick-by-block.jsonl` + `correlation-report.md` +
+   `correlation-report.meta.json` per cell. Pattern mirrors
+   `step2-sched-switch-classify.py` (#821).
+2. **Unit tests** for the classifier.
+3. **Capture runs** on `p5201-fwd-with-cos` + `p5202-fwd-with-cos`
+   using the already-post-#825-deployed `loss:xpf-userspace-fw0`.
+4. **Findings doc** at `docs/pr/<this-issue>/findings.md`
+   synthesizing per-cell M1 verdicts and the #819 §7.2 next step
+   (Phase 4 scope if any cell IN, P2 issue if both OUT).
+
+## Scope guards
+
+*(truncated — 64 lines total)*
+
+
+---
+
+## #829 — Cross-worker virtual-time gate for shared_exact CoS queues (#786 Slice B) [CLOSED] (closed 2026-04-22)
+
+## Context
+
+PR #828 (P3 captures) closed M1 INCONCLUSIVE on the `with-cos`
+load-bearing cells, then independent fairness measurement on the
+same captures revealed:
+
+- p5201 (1 Gbps `iperf-a` shared_exact): per-stream 17–85 Mbps
+  (5× spread, CoV 31%, Jain 0.91).
+- p5202 (10 Gbps `iperf-b` shared_exact): per-stream 296–925 Mbps
+  (3.1× spread, CoV 34%, Jain 0.91).
+
+Per-worker kick imbalance on the same run: `wid=1` had 3.10 M
+kicks vs `wid=2` 1.70 M (1.82× spread). #786 Slice A (RSS
+indirection flatten) made p5202 fairness *worse* (CoV 60%, Jain
+0.75), confirming flat RSS exposes per-worker MQFQ unfairness more.
+
+Root cause matches #786 §1: per-binding flow-fair MQFQ
+(`flow_bucket_head_finish_bytes` etc. in `CoSQueueRuntime`) is
+fair within one worker's binding but has no cross-worker
+visibility. On `shared_exact` queues (`SharedCoSQueueLease`,
+multi-worker dispatch via CAS-loop), workers' virtual-finish-time
+clocks drift apart and per-flow shares tier accordingly.
+
+## Goal
+
+Implement #786 Slice B: add a per-`shared_exact`-queue
+`Arc<AtomicU64> v_min` and a per-worker `v_local` virtual-finish-
+time, with a drain-batch yield gate when `v_local - v_min > T_bytes`.
+
+**Success criterion:** on `loss:xpf-userspace-fw0` running
+iperf3 -P 16 against 172.16.80.200 with the canonical full-cos.set:
+- Per-stream CoV ≤ 15% on both `iperf-a` (1 Gbps) and `iperf-b`
+  (10 Gbps) cells (vs. ~31-34% baseline).
+- Aggregate throughput preserved (no regression below 0.95 Gbps on
+  p5201 or 9.5 Gbps on p5202).
+- 0 retransmit-count increase from the `iperf3.json` baseline of
+  the matched cell.
+
+Stretch: CoV ≤ 5% (target needed for fairness on shared queues).
+
+
+*(truncated — 84 lines total)*
+
+
+---
+
+## #831 — Slice C: per-flow AFD credit isolation for shared_exact CoS queues (#786 Slice C) [CLOSED] (closed 2026-04-22)
+
+## Context
+
+PR #830 (#829 Slice B) landed the cross-binding virtual-time gate
+and reduced per-binding spread on `shared_exact` queues. Per-flow
+CoV remained at 40%+ on p5202 despite per-binding fairness being
+achieved, because the 16 iperf3 flows distribute unevenly across
+RSS rings (typical `[10, 4, 2]` or `[5, 5, 4, 2]` flows per
+binding) and the cross-binding gate equalises per-binding
+throughput, which mechanically tiers per-flow throughput by flow
+count per binding.
+
+#786 §Top recommendations §3 identifies AFD (Approximate Fair
+Dropping) as the next complementary piece: per-flow admission
+gate using a sharded Count-Min sketch, drop/mark probabilistic
+on excess over fair share. Complementary to Slice B (scheduling
+fairness) because AFD does admission fairness.
+
+## Goal
+
+Per-stream CoV ≤ 15% on BOTH `iperf-a` (1 Gbps, p5201) AND
+`iperf-b` (10 Gbps, p5202) under iperf3 -P 16 without aggregate
+throughput regression.
+
+## Deliverable
+
+**In `userspace-dp/src/afxdp/`:**
+- Per-shared_exact-lease sharded Count-Min sketch tracking
+  per-flow byte counts. Sharding by worker avoids false sharing
+  (one shard per worker × M-bucket sub-sketches → 4×1024 bytes
+  per shard, shard merged on gate-check).
+- Ingress (or early-drain) gate: if this flow's CMS count
+  exceeds `fair_share × (1 + epsilon)`, probabilistically
+  drop/mark. Fair share = lease rate / N_active_flows (N_active
+  also approximated via CMS).
+- Preserve ECN marking path from #747 so ECN-capable flows
+  mark rather than drop.
+- Integration with #829 gate: AFD runs on admission, gate runs
+  on dispatch selection. Both apply on shared_exact + flow_fair
+  queues.
+
+
+*(truncated — 68 lines total)*
+
+
+---
+
+## #833 — Per-flow ECN marking across shared_exact bindings (#786 Slice C minimal) [CLOSED] (closed 2026-04-22)
+
+## Context
+
+PR #830 (Slice B) + #832 (workers=6) landed per-binding fairness on shared_exact CoS queues. On p5202 with 16 iperf3 streams, RSS typically lands flows as `[5, 5, 4, 2]` across 4 of 6 bindings → 3 per-flow tiers (478, 597, 1195 Mbps) even though per-binding throughput is fair (2.39 Gbps each).
+
+To collapse the per-flow tiers we need cross-binding per-flow accounting so that flows-on-less-busy-bindings don't consume unfair shares. The minimal version: per-flow byte-count atomic array on the lease + ECN marking (not drop) proportional to excess.
+
+## Minimal Slice C
+
+- `SharedCoSQueueLease.per_flow_bytes: Box<[AtomicU64; 1024]>` — indexed by `flow_bucket % 1024`.
+- `SharedCoSQueueLease.per_flow_window_start_ns: AtomicU64` — ns-timestamp of window start.
+- Periodic reset (every `FLOW_WINDOW_NS`, e.g. 2 ms) — whichever worker sees window expired atomically swaps `per_flow_window_start_ns`, zeroes all `per_flow_bytes` slots. 
+- On egress dispatch of flow F, atomic-add `bytes` to `per_flow_bytes[flow_bucket(F) % 1024]`.
+- ECN mark when `per_flow_bytes[bucket] > fair_share_bytes` where `fair_share = lease_rate * window / N_flows_expected`. Simple epsilon-over-share threshold.
+- Preserve ECN path from #747.
+
+## Acceptance
+
+- Per-stream CoV ≤ 20% on p5202 consistently across 3 runs (not just best-case).
+- Aggregate throughput within 5% of #832 baseline (≥ 9.0 Gbps).
+- Retransmit count doesn't balloon (ECN-capable flows mark not drop).
+
+## Non-goals
+
+- Full Count-Min sketch (fixed-array suffices at this scale).
+- Drop-path (start with mark-only).
+- Per-flow virtual-time ordering.
+
+## Related
+- Parent: #786
+- Upstream: #830, #832
+
+---
+
+## #834 — Slice C take 2: cross-binding per-flow MQFQ ordering (not ECN) [CLOSED] (closed 2026-04-22)
+
+## Context
+
+PR #830 (Slice B) + #832 (workers=6) landed per-binding fairness. #833 was a quick 1-line experiment that flipped the 'per-flow ECN only on !shared_exact' guard (disabled since #785's retrospective). Empirical result: **p5202 throughput collapsed 9.57 → 0.37 Gbps** and p5201 CoV rose to 111%. Reverted.
+
+The #785 comment at `userspace-dp/src/afxdp/tx.rs:3859-3865` is now empirically confirmed: per-flow ECN-on-admission double-signals with MQFQ virtual-finish-time ordering on shared_exact, collapsing cwnd twice.
+
+## Real remaining gap
+
+On p5202 with 16 iperf3 streams + workers=6 + Slice B gate:
+- RSS lands streams as `[5, 5, 4, 2]` across 4 of 6 bindings → 3 per-flow tiers `[478, 478, 597, 1195] Mbps`.
+- Per-binding throughput IS fair (each active binding ≈ 2.39 Gbps).
+- Per-flow throughput tiers because each binding splits its share among its N flows.
+
+## Right path (to file plan)
+
+Promote per-flow MQFQ virtual-finish-time state from per-binding (`CoSQueueRuntime.flow_bucket_head_finish_bytes`) to a per-lease shared structure so dispatch ordering across ALL bindings serves flows in global virtual-finish order. This is a modest architectural change but touches hot-path dispatch selection.
+
+Acceptance: p5202 per-stream CoV ≤ 20% consistently across ≥3 runs, no aggregate throughput regression.
+
+## Non-goals
+- Per-flow ECN on shared_exact (proven regressive in #833)
+- AFD Count-Min sketch (deferred; the direct-flow-ordering path is the simpler minimal viable)
+
+## Related
+- Parent #786; upstream #830, #832; negative finding #833
+
+---
+
+## #835 — Slice D: RSS++ dynamic indirection rebalance for flow-count parity across RX rings (#786 Slice D) [CLOSED] (closed 2026-04-22)
+
+## Context
+
+PR #830 (Slice B) + #832 (workers=6) lifted p5201 fairness to CoV 7-28%, Jain 0.93-0.995. p5202 remains bimodal at CoV 19-92% because RSS lands 16 flows unevenly across 6 bindings (`[5, 5, 4, 2]`) — when RSS happens to hash flows evenly ([3,3,3,3,2,2]), fairness is perfect; when the hash is unlucky (concentrated on fewer bindings), per-flow tiers emerge.
+
+Two attempts to fix this at the **scheduler layer** failed and narrowed the design space (both closed; see #786 for status):
+- **#833** — per-flow ECN mark on shared_exact → throughput collapsed.
+- **#834** — per-flow-scaled virtual-time gate → unstable transients + starvation.
+
+This issue pursues the **other axis**: fix the RSS distribution itself rather than fighting against it in the scheduler.
+
+## Approach — RSS++ (Barbette et al., CoNEXT 2019)
+
+Per-ring RX load monitoring → periodic ethtool indirection-table rebalance to move hot hash buckets off overloaded rings. Paper: https://dl.acm.org/doi/10.1145/3359989.3365412.
+
+Minimal viable version:
+
+1. **Per-ring load accumulator** — the daemon samples per-RX-ring packet/byte counters (already available via `ethtool -S`) every `RSS_REBALANCE_NS` (e.g., 1 s).
+2. **Bucket-to-ring map** — the 128/256-slot indirection table is already queryable via `ethtool -x`; maintain an in-memory mirror.
+3. **Rebalance decision** — if max-ring load > `REBALANCE_THRESHOLD` × mean-ring load, migrate the hottest bucket(s) from the hot ring to the coldest ring via `ethtool -X <iface> weight ...` or direct indirection-table write.
+4. **Stability window** — min time between migrations (e.g., 5 s) to prevent oscillation under short bursts.
+5. **Observability** — surface per-ring load stats + rebalance events via the daemon status RPC.
+
+## Acceptance
+
+- p5202 per-stream CoV ≤ 25% consistently across 10 consecutive runs (not just best-case).
+- `iperf3 -P 16` and `iperf3 -P 128` both show per-flow variance ≤ the per-binding variance bound from Slice B.
+- No throughput regression vs #830 + #832 baseline.
+- Rebalance events are rate-limited so steady-state workloads don't churn the indirection table.
+
+## Non-goals
+
+- Cross-NIC or cross-host RSS coordination.
+- Integration with BPF TC-style hash steering (separate surface).
+- Replacing RSS with custom per-flow steering.
+
+## Open design questions
+
+1. Does the mlx5 VF we test on support `ethtool -X weight` or only full indirection-table writes? If full rewrites, rebalance cost is higher and cadence should be longer.
+2. Should rebalance decisions live in the Go xpfd daemon (control plane) or the Rust userspace-dp (data plane)? Probably xpfd — it already owns ethtool config and per-interface policy; the dataplane just surfaces load counters.
+3. How to avoid disrupting in-flight connections — does mlx5 indirection-table rewrite tear down connections or just route new packets? Per the paper, most NICs handle this gracefully, but verify on mlx5 VF.
+
+*(truncated — 49 lines total)*
+
+
+---
+
+## #836 — Slice C: shared per-flow virtual-time array on SharedCoSQueueLease (#786 Slice C v3) [CLOSED] (closed 2026-04-22)
+
+## Context
+
+Two scheduler-layer attempts to fix cross-binding per-flow fairness failed and closed:
+
+- **#833** — per-flow ECN on shared_exact double-signals with MQFQ → throughput collapse.
+- **#834** — per-binding virtual-time divided by `active_flow_buckets` → unstable when flow counts change → flow starvation.
+
+The design space now points to ONE remaining scheduler approach: **move per-flow virtual-time state out of the per-binding `CoSQueueRuntime.flow_bucket_head_finish_bytes` into a shared atomic array on `SharedCoSQueueLease`**, so the MQFQ selection at each worker picks the globally-latest flow, not the latest flow-within-this-binding. With per-flow state shared, the per-binding-vs-per-flow mismatch that tiered p5202 goes away.
+
+## Scope
+
+**In `userspace-dp/src/afxdp/`:**
+
+1. **Shared per-flow virtual-time array on the lease:**
+   - `SharedCoSQueueLease.per_flow_head_finish: Box<[CachePadded<AtomicU64>; COS_FLOW_FAIR_BUCKETS]>` — per-flow head finish time, shared across all bindings on this lease.
+   - `SharedCoSQueueLease.per_flow_tail_finish: Box<[CachePadded<AtomicU64>; COS_FLOW_FAIR_BUCKETS]>` — per-flow tail finish time.
+   - Init to 0. Updated on every enqueue/dequeue by whichever binding dispatched.
+
+2. **Shared hash seed across bindings on the lease** so the bucket indices are cross-binding consistent. Today each binding has its own `flow_hash_seed`; for the shared per-flow array to be meaningful, all bindings on the same lease must share one seed. Store on the lease; existing per-binding seed stays for non-shared queues.
+
+3. **Dispatch selection reads shared state**:
+   - `cos_queue_min_finish_bucket` reads `lease.per_flow_head_finish` instead of `queue.flow_bucket_head_finish_bytes` when the queue has a lease.
+   - Dequeue advances the shared atomic under Acquire/Release.
+   - Enqueue (at egress-path admission) updates the shared tail under AcqRel CAS.
+
+4. **Slice B gate interaction**: the existing `binding_frontiers` virtual-time gate (from #830) still applies as a per-binding progress bound. With shared per-flow state, the gate now bounds how far per-flow virtual time can diverge across bindings — which is the actual fairness condition.
+
+5. **Teardown path**: on `mark_binding_idle`, zero-out the per-flow slots owned by this binding (tricky — needs a binding→flow-bucket ownership map). Alternative: garbage-collect stale per-flow slots based on last-update timestamp.
+
+## Acceptance
+
+- p5202 per-stream CoV ≤ 20% consistently across 10 runs.
+- p5201 CoV ≤ 15% consistently.
+- Aggregate throughput within 5% of #830 + #832 baseline.
+- 0 retransmit-count regression.
+- `make test-failover` passes.
+- Unit tests for: shared-vs-per-binding selection invariant, cross-binding enqueue ordering, flow-slot coherence under concurrent workers, gate + shared-state interaction.
+
+## Risks (pre-registered)
+
+
+*(truncated — 55 lines total)*
+
+
+---
+
+## #837 — Slice C-a: full HOL-finish cross-binding MQFQ with shared vtime + per-bucket state machine [CLOSED] (closed 2026-05-27)
+
+## Context
+
+#836 proposed promoting \`flow_bucket_head_finish_bytes\` + \`flow_bucket_tail_finish_bytes\` from per-binding to per-lease shared atomic arrays, while keeping \`queue_vtime\` per-binding. Codex hostile plan review R1 returned PLAN-READY NO with 7 HIGH + 4 MED architectural issues that cannot be closed without substantially expanding the scope. Full review at \`docs/pr/836-shared-flow-vtime/codex-plan-review.md\`.
+
+## What #836 got wrong
+
+1. **Per-binding \`queue_vtime\` is not globally coherent** — comparing shared heads written from different bindings' local \`queue_vtime\` values is unsound. Shared HOL-finish-time math requires one lease-wide virtual-time axis.
+2. **Head-lift race on concurrent same-bucket enqueue** — two bindings enqueuing on one bucket can overwrite the correct HOL-finish with the wrong value when their \`queue_vtime\`s differ.
+3. **Phase 3 head invariant broken** — plan lifted head only to \`queue_vtime\`, not to \`new_tail\` on the idle transition. Existing \`types.rs:1091-1103\` documents the correct form: \`head = tail = max(tail, queue_vtime) + bytes\`.
+4. **Rollback via fetch_sub is conceptually wrong** — head is HOL-packet-finish, not a byte-served ledger. Peer dequeue between this binding's pop and rollback corrupts the shared head with non-commutative state changes.
+5. **No global-idle detection** — monotonic head-lift catches stale-low but not stale-high. An idle-for-hours bucket returns with a frozen high finish time; next enqueue anchors too far ahead.
+6. **Double-service on same bucket** — two bindings can both pick the globally-minimum-head bucket on one RR pass, violating the Phase 3 equal-depth interleaving invariant.
+
+## What the correct scope needs
+
+1. **Promote \`queue_vtime\` to lease** as \`shared_queue_vtime: AtomicU64\` with atomic-max CAS updates. All bindings on the lease anchor their enqueues against this shared frontier.
+2. **Per-bucket \`active_count\`** (\`[AtomicU16; COS_FLOW_FAIR_BUCKETS]\` or equivalent). Increment on local 0→N enqueue transitions, decrement on local N→0 dequeue transitions. Enables global-idle detection.
+3. **On global 1→0 active_count transition, reset \`shared_head[b] = shared_tail[b] = 0\`** (CAS so only the binding that observes the transition performs the reset, with a fallback if a concurrent enqueue races).
+4. **Per-bucket dequeue claim/epoch** so only one binding services a bucket per RR pass. Claim acquired pre-selection, released post-commit-or-rollback.
+5. **Snapshot-based rollback, not arithmetic reversal.** Pop captures the pre-pop (shared_head, shared_tail) into a local snapshot; rollback CAS-restores only if no concurrent writer has advanced past the snapshot. Matches the existing \`CoSQueuePopSnapshot\` pattern but for shared state.
+6. **Correct head-lift on idle→active transition**: only ONE binding wins the transition (via CAS on active_count 0→1); that binding sets \`head = tail = max(queue_vtime_shared, old_tail) + bytes\`. Losers of the CAS fall through to the normal active-bucket enqueue path (\`tail += bytes\`) against the now-installed head.
+
+## Scope summary
+
+- \`SharedCoSQueueLease\` gains at least 4 new fields: \`shared_flow_hash_seed\`, \`per_flow_head_finish\`, \`per_flow_tail_finish\`, \`shared_queue_vtime\`, \`per_flow_active_count\`.
+- Every Phase 3 enqueue/dequeue/push_front site in \`tx.rs\` needs a shared-path variant. Mechanical but large: ~20 call sites.
+- At least 40 new unit tests including: same-bucket A-pop/B-pop/A-rollback, globally-idle re-entry with stale-high head, two-bindings-select-same-bucket race, late-binding promotion with live shared state, concurrent-enqueue tail CAS loop under \`max(old, qv) + bytes\` discipline.
+
+## Risks
+
+- Very easy to regress throughput if atomic contention dominates. #833 and #834 both regressed on shared_exact changes. The per-bucket state machine adds 2+ atomics per packet dispatch.
+- Many CAS loops under concurrent writers — measurement must cover high-fan-in workloads (\`iperf3 -P 128\`).
+- Invariants are subtle enough that Codex plan review is likely to require 5+ rounds.
+
+## Acceptance
+
+Per #836: p5202 CoV ≤ 25% on ≥8 of 10 runs, p5201 ≤ 15%, no throughput regression, 0 retransmit regression.
+
+## Related
+
+
+*(truncated — 43 lines total)*
+
+
+---
+
+## #838 — Slice C-b: per-flow bytes-served counter with periodic reset (AFD-lite) [CLOSED] (closed 2026-04-25)
+
+## Context
+
+#836 (closed) attempted to share MQFQ HOL-finish-time across bindings via atomic head/tail arrays and hit 7 HIGH architectural problems (see \`docs/pr/836-shared-flow-vtime/codex-plan-review.md\` and sibling #837).
+
+The root issue: **HOL-finish-time is not a commutative quantity**. It's a per-packet timestamp, changes non-additively on every dequeue (head advances to the NEW HOL packet's finish), and rollback requires snapshot state rather than arithmetic reversal. Sharing it across bindings safely requires a per-bucket ownership state machine + shared virtual-time clock + snapshot rollback — a very large surface (tracked in #837).
+
+This issue pursues an alternative that trades **precision for robustness**: share a simpler quantity that IS commutative and idempotent under concurrent writers.
+
+## Approach — AFD-lite (approximate fair dispatch by period counter)
+
+Instead of ordering by HOL-finish-time, **count bytes dispatched per flow per time window across all bindings** and deprioritize flows over their fair share.
+
+### Shared state on \`SharedCoSQueueLease\`
+
+- \`period_start_ns: AtomicU64\` — ns timestamp of current accounting window.
+- \`period_bytes_total: AtomicU64\` — total bytes dispatched this window across all bindings.
+- \`period_bytes_per_flow: Box<[CachePaddedAtomicU64; N]>\` — bytes dispatched per flow hash bucket this window.
+- \`shared_flow_hash_seed: u64\` — locked at lease construction; bindings on the lease use this seed.
+- \`period_window_ns: u64\` — fixed window length (e.g., 2 ms).
+
+### Hot-path operations (all commutative, idempotent under races)
+
+- **Dequeue**: after each packet dispatch, \`fetch_add(bytes, Relaxed)\` on \`period_bytes_per_flow[bucket]\` and \`period_bytes_total\`.
+- **Period reset**: on every dequeue, check \`now - period_start_ns >= period_window_ns\`. If yes, CAS \`period_start_ns\` to \`now\` (only the first thread wins). Winner then zeros all \`period_bytes_per_flow\` slots + \`period_bytes_total\` (relaxed stores; transient skew is bounded by window length).
+- **Selection gating**: before picking bucket \`b\` in \`cos_queue_min_finish_bucket\`, read \`period_bytes_per_flow[b]\` and \`period_bytes_total\`. Compute \`fair_share = period_bytes_total / active_bucket_count\` (counted via iteration or a cached counter). If \`period_bytes_per_flow[b] > fair_share × (1 + epsilon)\`, **skip this bucket in THIS pass** (penalty = one RR cycle). Scan continues; if ALL buckets are over share, pick the one with the smallest excess (fallback to avoid idle).
+
+### Why this is safe under races
+
+- All updates are \`fetch_add\` (commutative). Two bindings racing on the same bucket do not corrupt each other's writes.
+- Period reset uses a single CAS so exactly one thread wins; losers' adds during the transition are at-worst counted in the wrong window by ≤ 1 epoch — bounded by window_ns.
+- Rollback on push_front does a \`fetch_sub\` matching the pop's \`fetch_add\` — unlike the HOL-finish model, byte counts ARE a commutative ledger. \`fetch_sub\` is safe.
+- No per-bucket ownership / claim / epoch needed. No snapshot restore. No shared virtual-time clock.
+
+### Trade-offs vs Slice C-a
+
+Pros:
+- Much smaller surface (4 shared fields, 3 hot-path add/load sites, no state machine).
+- Safely races; no HOL ordering to corrupt.
+- Robust under RSS migration / hash collision — wrong-binding-wrote-the-bucket still sums correctly.
+- Easy to unit test (commutative fetch_add is straightforward).
+
+*(truncated — 65 lines total)*
+
+
+---
+
+## #840 — Slice D v2: RSS rebalance with xpf-userspace-dp per-binding RX stats (replaces ethtool -S signal) [CLOSED] (closed 2026-04-25)
+
+## Context
+
+#835 (closed) implemented the full RSS++ rebalance loop with `ethtool -S <iface>` per-RX-ring packet counters as the load signal. 10 plan-review rounds + 3 code-review rounds settled the design (Codex PLAN-READY YES at R10, MERGE YES at R3). All 33+ unit tests passed.
+
+**Empirical deploy revealed the signal source is dead under our actual deployment**: mlx5 SR-IOV VF + AF_XDP zero-copy bypasses every per-queue ethtool counter (`rx<N>_packets`, `rx<N>_xsk_packets`, `rx<N>_xdp_drop`, even aggregate `rx_packets`). All counters stay frozen at idle values during 9.57 Gbps iperf3 traffic. The rebalance loop ran but its trigger never fired (0 actions across 10 runs).
+
+#835 reverted all 4 code files per §6.5; docs preserved at `docs/pr/835-slice-d-rss/` (`plan.md`, 9 plan-review rounds, code-review rounds, `findings.md`).
+
+## Goal
+
+Re-source the rebalance signal from `xpf-userspace-dp`'s per-binding stats so the algorithm gets data that actually moves under AF_XDP. Re-use ~90% of the Go code from #835.
+
+## Scope
+
+### Rust dataplane (small)
+
+Add per-binding **RX packet count** to `BindingStatus` snapshot (companion to the existing `tx_packets` and `tx_kick_latency_count` per-binding counters from #826). Bindings are 1:1 with RX rings on this hardware, so per-binding RX rate is per-RX-ring rate.
+
+- `userspace-dp/src/afxdp/types.rs`: add `rx_packets: AtomicU64` to whatever struct backs the per-binding snapshot. Increment on every successful RX poll batch (single writer per binding).
+- `userspace-dp/src/afxdp/coordinator.rs`: include the new field in `BindingStatus` aggregation.
+- `userspace-dp/src/protocol.rs`: extend `BindingStatus` wire format with `rx_packets: u64` (with `#[serde(default)]` for backward compat).
+- Mirror in `pkg/dataplane/userspace/protocol.go`.
+- 3-4 unit tests.
+
+### Go daemon (mostly unchanged from #835)
+
+Re-introduce `pkg/daemon/rss_rebalance.go` from #835 commit `740db4abe69cd7277c3d7d45657b76892af6fff5` with these changes:
+
+- Replace `readEthtoolS` with a poll of the userspace-dp control socket → returns `map[binding_idx]uint64` of cumulative RX packets per binding.
+- Map `binding_idx` → ring-index using existing `cos_owner_worker_by_queue` plumbing or a new accessor.
+- Keep all of #835's Codex-hardened algorithm: trigger ratio (1.8), stability (3 samples), cooldown (10s), migrate fraction (0.25), rssWriteMu/Epoch/ConfigGen serialisation, abandon-on-mismatch, first-creation seed, size-mismatch reseed.
+
+### Tests + acceptance
+
+- 33+ unit tests from #835 carry over with stub adjusted for the new signal source.
+- Same 10-run measurement protocol per #835 §6.3.
+- Same PASS gate (CoV ≤ 25% on ≥ 8 of 10 runs on p5202).
+
+## Why this should work
+
+
+*(truncated — 58 lines total)*
+
+
+---
+
+## #841 — CrossBindingLag gate fires without park → worker poll loop spins at 100% CPU, forwarding stops [CLOSED] (closed 2026-04-23)
+
+## Symptom
+
+On the loss userspace cluster under sustained `iperf3 -c
+172.16.80.200 -P 16 -t 600 -p 5203` (25 Gbps shaped), after
+running ~2 hours the firewall's userspace dataplane on the
+primary node reaches **600% CPU** (all 6 workers pegged) and
+**stops forwarding packets**. Reproduces reliably.
+
+## Root cause
+
+`select_exact_cos_guarantee_queue_with_fast_path` in
+`userspace-dp/src/afxdp/tx.rs:1717` has three `continue` branches
+under different gate conditions:
+
+| Gate | Park? | Next select behavior |
+|---|:-:|---|
+| `RootTokenStarvation` | ✅ `park_cos_queue(wake_tick)` | queue becomes `runnable=false`; next select skips it via the line-1730 guard |
+| `QueueTokenStarvation` | ✅ `park_cos_queue(wake_tick)` | same |
+| `CrossBindingLag` (#830) | ❌ plain `continue` | queue stays `runnable=true`; next select re-enters gate, re-fires, `continue`s again |
+
+When the Slice B cross-binding virtual-time gate fires on a queue
+and persists (uneven RSS-to-binding flow distribution, which is
+our normal state on shared_exact queues), the gate fires on every
+selection round, the selector returns None, and the worker's
+outer poll loop immediately re-enters select. All 6 workers
+converge on this no-progress loop → 100% CPU per worker,
+0 packets forwarded.
+
+## Evidence
+
+**CPU** — `top -p $(pgrep xpf-userspace-dp)` showed %CPU = 600.0
+on fw0 while forwarding had stopped. Cumulative CPU: 126 min
+over ~2 h wall time.
+
+**perf** — 8 s / 4752 samples on the stalled process:
+- 54% `worker_loop` (self-time — tight-poll signature)
+- 10% `drain_shaped_tx`
+- 3.5% `poll_binding`
+- 3.4% `arc_swap::HybridStrategy::load`
+- 2.9% `__vdso_clock_gettime`
+
+*(truncated — 73 lines total)*
+
+
+---
+
+## #843 — Post-mortem: re-investigate Slice B before any retry (prerequisites from #841 revert) [CLOSED] (closed 2026-05-27)
+
+## Context
+
+#830 (Slice B cross-binding virtual-time gate) was reverted via PR #842 after causing an outage-class regression (#841): after ~2h of sustained shaped TCP load on port 5203 (\`iperf-c\`, 25 Gbps), the firewall stopped forwarding TCP traffic while ICMP still worked. All 6 workers pegged at 100% CPU, 0 Gbps forwarding. Fresh TCP SYNs timed out.
+
+This issue captures what we learned, what hooks we need before any Slice B retry, and the test-coverage gaps that let this ship without detection.
+
+## Why the revert was necessary
+
+Three failure modes discovered, any one of which is sufficient to block merging:
+
+1. **Gate-fire `continue` without `park_cos_queue`**: sibling branches (\`RootTokenStarvation\`, \`QueueTokenStarvation\`) park the queue with a wake-tick and set \`runnable=false\`. \`CrossBindingLag\` did not. Consequence: worker poll loop re-enters the same gate on every iteration, burning a full core per worker.
+
+2. **\`wake_tick\` scale confusion**: \`park_cos_queue\` expects \`wake_tick\` in timer-wheel ticks (\`COS_TIMER_WHEEL_TICK_NS = 50_000\` = 50 µs/tick). My first fix passed raw nanoseconds → park ~10^13 ticks in the future → queue never un-parks → every gate-fire permanently removes a binding → after enough fires, forwarding stops. Existing tests did not catch this because \`TestCrossBindingLag_park_counter_advances\` only checked the counter, not the wake-tick scale or re-arm semantics.
+
+3. **Design-level feedback loop under sustained load**: even with both bugs fixed (park + correct ticks), the 10-min \`iperf3 -P 16 -p 5203\` reproducer stalled starting at t=30s. Analysis: under 25 Gbps shaped load, all 6 workers hit the gate at similar rates; they park each other in 10 kHz cycles; the dispatch lost per cycle accumulates; TCP congestion control backs off until streams stall. The tunable parameters (T, park duration) don't close this — the design itself doesn't converge under heavy load.
+
+## Prerequisites for any Slice B retry
+
+**Must have before merging any new attempt:**
+
+- [ ] An explicit unit-test that verifies \`park_cos_queue\` is called with \`wake_tick\` in TICK units, not ns. Test should FAIL if someone passes raw ns.
+- [ ] A "spin-test" unit test or integration test that runs the selection loop with the gate force-firing, and asserts: worker's per-tick iteration count stays bounded (e.g., ≤ N loops per real-time ms). This would have caught failure mode #1.
+- [ ] A long-duration integration test (at least 10 min of sustained shaped traffic on the 25 Gbps cap via \`iperf3 -P 16 -p 5203\`) that asserts forwarding stays at ≥ 90% of shaper rate throughout the run. This would have caught all three failure modes. PR merge must block on this.
+- [ ] A convergence model or bounded-oscillation proof for the gate's behavior under N workers all lagging together. The revert's empirical evidence at 25 Gbps suggests the current design cannot reach steady-state fairness without throughput degradation.
+
+**Should have:**
+
+- [ ] A way to observe gate-fire rate and per-binding park frequency in the runtime telemetry (control socket JSON), so ops can detect degradation patterns without perf profiling.
+- [ ] Feature-flag / kill-switch so the gate can be disabled at runtime without a daemon restart — so future regressions can be mitigated in production without waiting for a redeploy.
+- [ ] An automated canary that runs the long-duration test on every PR that touches the CoS scheduler.
+
+## Open design questions
+
+- Is the gate's publish-on-dispatch model self-consistent under cascade failures? (When all bindings are parked, nobody publishes, \`v_min\` stays stale, parks re-fire on wake.)
+- Would a push-based design (peer workers signal "I'm advancing, you're not behind anymore") avoid the polling/park dynamic?
+- Is the right abstraction per-binding virtual time at all? #836 (closed) found HOL-finish state has non-commutative rollback; #834 (closed) found per-flow-scaled gates starve dynamically. #837 (open) is a bigger redesign; #838 (open) is a counter-based alternative that avoids virtual time entirely.
+
+## Immediate follow-ups
+
+- #842 merged → loss cluster back to post-#828+#832 baseline (no cross-binding gate, forwarding stable, per-flow CoV bimodal by RSS luck).
+
+*(truncated — 50 lines total)*
+
+
+---
+
+## #844 — HA: cluster-sync listener orphaned by VRF delete+recreate on startup (kernel 6.19) [CLOSED] (closed 2026-04-23)
+
+## Summary
+
+On `loss:xpf-userspace-fw1` (kernel 6.19), HA session sync never connects after cold start. Chassis cluster output shows `Transfer ready: no (session sync disconnected)` on every RG, but the heartbeat transport is otherwise healthy (peer version visible, priorities correct, no monitor failures).
+
+Root cause is an xpfd startup race: the cluster-sync TCP listener binds (SO_BINDTODEVICE) to `vrf-mgmt` **before** a second `applyConfig` pass deletes and recreates the VRF, leaving the listener pinned to a dead ifindex.
+
+## Evidence
+
+`ss -tlnp '( sport = :4785 )'` on fw1:
+
+```
+LISTEN 0 4096  10.99.12.2%if9:4785   0.0.0.0:*  users:(("xpfd",pid=604,fd=72))
+```
+
+Note `%if9` — ifindex 9 does not exist on fw1 (current vrf-mgmt is ifindex 17, there is no device at 9):
+
+```
+17: vrf-mgmt: <NOARP,MASTER,UP,LOWER_UP> ...
+```
+
+Dial from fw0 vrf-mgmt to fw1:4785 returns `Connection refused` (kernel RST — no listener matches the 4-tuple):
+
+```
+$ ip vrf exec vrf-mgmt bash -c 'exec 3<>/dev/tcp/10.99.12.2/4785' 
+bash: connect: Connection refused
+```
+
+Meanwhile, node1 holds a zombie ESTAB socket from a pre-restart node0 PID:
+
+```
+ESTAB 0 88908  10.99.12.2%if9:4785   10.99.12.1:38360  users:(("xpfd",pid=604,fd=102))
+```
+
+Send-Q is stuck at ~88 KB (peer never ACKs — peer PID is long dead).
+
+## Timeline (journalctl on fw1)
+
+```
+03:42:50.647  VRF created      name=vrf-mgmt table=999
+03:42:56.757  cluster sync: peer connected   (listener was bound to vrf-mgmt here → ifindex 9)
+
+*(truncated — 96 lines total)*
+
+
+---
+
+## #846 — applyConfig is not serialized: concurrent callers interleave across steps [CLOSED] (closed 2026-04-25)
+
+## Problem
+
+\`applyConfig\` in \`pkg/daemon/daemon.go\` runs from multiple unsynchronized entry points:
+
+- HTTP commit handlers (\`pkg/api/handlers.go:1528\`, \`:1686\`)
+- gRPC commit handlers (\`pkg/grpcapi/server_config.go:155\`, \`:178\`)
+- Cluster-sync receive (\`pkg/cluster/sync_conn.go:947\` → \`pkg/daemon/daemon_ha_sync.go:342\`)
+- DHCP callbacks (\`pkg/daemon/daemon.go:801\`, \`:836\`, \`:1142\`)
+- Config-poll goroutine (\`pkg/daemon/daemon.go:2533\`)
+- Dynamic-address feed callbacks
+- Event-options engine (\`pkg/eventengine/engine.go:299\`)
+- In-process CLI commits (\`pkg/cli/cli_config.go:22\`, \`:199\`, \`:225\`, \`:251\`)
+- CLI auto-rollback (\`pkg/cli/cli.go:574\`)
+
+Two concurrent \`applyConfig\` calls can interleave *across* steps — one goroutine runs step 0 (VRF reconcile), pauses before step 1 (tunnels) or step 3 (FRR reload), another goroutine runs its own \`applyConfig\` with a different config, and when the first resumes FRR sees a kernel state that doesn't match the config about to be applied.
+
+## Evidence this is pre-existing
+
+This is not a new bug. The same race exists on \`master\` today. In practice the race window is small (Go usually schedules goroutines to completion without preempting across syscalls) and no user-visible symptom has been attributed to it — but it's real.
+
+## Fix
+
+Add a daemon-level \`applyMu sync.Mutex\` held for the full \`applyConfig\` call. This serializes all entry points end-to-end. The lock cost is negligible because \`applyConfig\` is already low-frequency (config change, DHCP lease change, peer push, etc.).
+
+Alternative: push all \`applyConfig\` calls onto a single goroutine worker with a channel.
+
+## Scope
+
+Not in scope for PR #845 (#844 VRF reconcile). That PR adds \`vrfsMu\` which covers the VRF phase only; this issue is about the broader apply-flow.
+
+## Relates
+
+Identified by Codex during plan review of PR #845. Documented as out-of-scope in \`docs/pr/844-vrf-idempotent/plan.md\`.
+
+---
+
+## #847 — Cross-restart VRF leak: renamed routing instances leave stale vrf-<old-name> [CLOSED] (closed 2026-04-25)
+
+## Problem
+
+When a routing instance is renamed (or deleted from config) while xpfd is stopped, the old \`vrf-<oldname>\` device persists in the kernel across the restart. The new xpfd process has an empty \`m.vrfs\` slice on startup. Its first \`ReconcileVRFs\` call sees the stale VRF, finds it's not in the desired set, and leaves it alone (not in desired = never touch). The VRF leaks until someone runs \`xpfd cleanup\`.
+
+## Evidence this is pre-existing
+
+Same behavior on \`master\`: \`ClearVRFs\` is a no-op when \`m.vrfs\` is empty (first apply after restart), so the rename produces the same leak today. PR #845 (#844) preserves the behavior — doesn't regress, doesn't fix.
+
+## Fix options
+
+### Option A: enumerate-and-adopt on startup
+Before the first \`applyConfig\`, list all \`vrf-*\` devices in the kernel. For each whose logical name (\`vrf-<X>\` → \`X\`) matches a routing-instance name in the configured set OR is \"mgmt\", adopt it into \`m.vrfs\`. Then \`ReconcileVRFs\` will correctly delete any adopted VRF whose name isn't in the currently-desired set.
+
+Risk: would adopt an unrelated \`vrf-*\` device that happens to share a logical name with a configured routing instance — unlikely but possible.
+
+### Option B: persist ownership to disk
+Write out \`m.vrfs\` to a state file on change, read it back on startup. More robust but adds a persistence surface to maintain.
+
+Preference: Option A. The collision risk is tolerable (would only occur if an operator pre-created a vrf matching the exact configured-instance name, which is a specific footgun).
+
+## Scope
+
+Not in scope for PR #845. Adoption of \*current-config\* pre-existing VRFs is already in #845 (fixes the post-restart vrf-mgmt case). This issue is about \*old-config\* VRFs from before a rename.
+
+## Relates
+
+Identified by Codex during plan review of PR #845. Documented as pre-existing in \`docs/pr/844-vrf-idempotent/plan.md\`.
+
+---
+
+## #848 — routing.Manager: tunnels/xfrmis/bonds/reths slices have no mutex protection [CLOSED] (closed 2026-04-25)
+
+## Problem
+
+\`routing.Manager\` has several slice fields tracking managed device names:
+
+\`\`\`go
+type Manager struct {
+    tunnels    []string // currently created tunnel interface names
+    xfrmis     []string // currently created xfrmi interface names
+    bonds      []string // currently created bond interface names
+    reths      []string // currently created RETH interface names
+    ...
+}
+\`\`\`
+
+None of these are protected by a mutex, even though they are mutated from \`applyConfig\` (which runs from multiple unsynchronized entry points — see #846).
+
+PR #845 (#844) added \`vrfsMu\` for the \`vrfs\` slice but left the other four as-is, to keep the PR scope narrow.
+
+## Risk
+
+Low in practice — Go slice mutations from concurrent goroutines are undefined behavior, but \`applyConfig\` is rarely concurrent in practice (see #846 for analysis). No known user-visible symptom has been attributed to these races.
+
+## Fix
+
+Either:
+1. Add per-slice mutexes mirroring the \`vrfsMu\` pattern in #844.
+2. Serialize \`applyConfig\` end-to-end via a daemon-level mutex (#846) — that fixes all of them at once.
+
+Fix #2 is broader and probably the right path.
+
+## Scope
+
+Not in scope for PR #845.
+
+## Relates
+
+Identified by Codex during plan review of PR #845.
+Depends on or subsumed by #846.
+
+---
+
+## #849 — Forwarding broken on loss userspace cluster: LAN → WAN blackhole [CLOSED] (closed 2026-04-23)
+
+## Symptom
+
+On the loss userspace cluster (\`xpf-userspace-fw0/fw1\`, kernel 6.19):
+
+\`\`\`
+$ incus exec loss:cluster-lan-host -- ping -c 3 172.16.80.200
+PING 172.16.80.200 ...
+3 packets transmitted, 0 received, 100% packet loss
+\`\`\`
+
+The host's L2 to the primary firewall works (ping 10.0.89.1 replies). Firewall can ping WAN directly. But LAN→WAN forwarding through the firewall drops every packet.
+
+\`show security flow session\` shows no sessions sourced from 10.0.89.102 — traffic isn't reaching the userspace dataplane.
+
+## Verified not caused by #845
+
+Rolled back to master (before #845) and redeployed — forwarding is still broken. This is pre-existing, independent of the VRF-reconcile fix.
+
+## Environment drift observed
+
+The test env has accumulated several layers of stale state that are likely contributing:
+
+1. **Two \`.network\` files for em0** — systemd-networkd unions both:
+   - \`/etc/systemd/network/10-bpfrx-em0.network\` (Mar 19, old \`bpfrxd\` naming, Address=10.99.12.1/30)
+   - \`/etc/systemd/network/10-xpf-em0.network\` (Apr 23, new xpfd naming, Address=10.99.2.1/30)
+   Result: em0 carries both addresses simultaneously after xpfd applies its config.
+
+2. **Config ↔ kernel addressing mismatch** — \`xpf.conf\` says \`fabric-peer-address 10.99.3.x\`, actual addresses are 10.99.12.x / 10.99.13.x depending on which stale .network file took effect.
+
+3. **Deploy-script naming** — \`test/incus/cluster-setup.sh\` defaults to \`xpf-fw0/xpf-fw1\`; deploying to the userspace cluster requires \`VM0=xpf-userspace-fw0 VM1=xpf-userspace-fw1\` overrides. Easy to deploy to the wrong VMs by accident.
+
+## Fix direction
+
+Quickest: \`cluster-destroy\` + \`cluster-create\` + fresh \`cluster-deploy\` to wipe the .network stale-file pileup.
+
+Longer-term:
+- Deploy script should \`rm /etc/systemd/network/10-bpfrx-*\` on cleanup (the rename from bpfrxd to xpfd left these orphans).
+- Investigate why xpf.conf has \`10.99.3.x\` when addresses are \`10.99.12.x\` — is the test env supposed to use \`10.99.3.x\` and something is overriding, or is the config stale?
+- Userspace-dataplane LAN → WAN forwarding root cause: once the env is clean, re-test and file a tighter bug with perf profile + tcpdump if it still fails.
+
+
+*(truncated — 42 lines total)*
+
+
+---
+
+## #850 — [security][high] allow_dns_reply bypasses all zone-pair policy (XDP + DPDK) [CLOSED] (closed 2026-04-24)
+
+**Severity: HIGH** (from security audit, see `mythos.md`).
+
+## Impact
+Any sessionless UDP packet with source port 53 is forwarded to the FIB-resolved egress **without** reaching `policy_check()` or `xdp_policy`. Zero zone-pair enforcement on both XDP and DPDK dataplanes. No session created, no log emitted.
+
+## Affected code
+- `bpf/xdp/xdp_conntrack.c` — `xdp_conntrack_prog` v4 / v6 paths (sport=53 short-circuit tail-calls `XDP_PROG_FORWARD` even though `meta->fwd_ifindex` is already nonzero from `xdp_zone`'s FIB lookup).
+- `bpf/xdp/xdp_forward.c` — `xdp_forward_prog` takes `forward_transit` via `bpf_redirect_map(&tx_ports, meta->fwd_ifindex, 0)` because ifindex is nonzero.
+- `dpdk_worker/conntrack.c` — `conntrack_lookup` returns `CT_DNS_REPLY`.
+- `dpdk_worker/pipeline.c` — `process_packet` does `if (ct_result == CT_DNS_REPLY) goto forward;` jumping past `policy_check()`.
+- `dpdk_worker/forward.c` — `forward_packet` gates only on `meta->fwd_ifindex == 0`, which is already set by `zone_lookup`.
+
+## Configuration exposure
+Code default is `false`. But **every** shipped example enables it:
+- `docs/ha-cluster*.conf` (all three)
+- `test/incus/xpf-*.conf` (all three)
+- Captured production configs in `docs/pr/`
+
+Any deployment derived from the reference configs has the bypass live.
+
+## Fix sketches
+1. In `xdp_conntrack.c`: set `meta->fwd_ifindex = 0` before the tail-call so `xdp_forward` treats the packet as host-inbound. Or gate the bypass on `meta->fwd_ifindex == 0`.
+2. In `pipeline.c`: gate `CT_DNS_REPLY → goto forward` on `meta->fwd_ifindex == 0`.
+3. Better: restrict the bypass to packets whose destination IP matches a configured **local resolver**, not a blanket `sport == 53`.
+4. Remove `allow-dns-reply;` from shipped reference/test configs, or add a prominent warning.
+
+Source: `mythos.md` (security audit).
+
+---
+
+## #851 — [security][medium] TC egress mis-classifies all VLAN sub-interface traffic on mlx5 (zone miss + screen + output filter) [CLOSED] (closed 2026-04-24)
+
+**Severity: MEDIUM** (from security audit, see `mythos.md`).
+
+## Impact
+`tc_main_prog` derives VLAN id only from an inline 802.1Q header in `skb->data`. On mlx5 with `NETIF_F_HW_VLAN_CTAG_TX`, traffic via a kernel VLAN sub-interface carries the tag in `skb->vlan_tci` (set by `__vlan_hwaccel_put_tag()`), with no inline header at the parent's TCX egress hook.
+
+Result: `vlan_id = 0`, `iface_zone_map[{phys_ifindex, 0}]` returns the **native-VLAN zone** instead of the sub-interface's zone. This silently skips egress zone policy, screen profile, flood counters, and output filters for all VLAN traffic.
+
+## Downstream effects
+- `tc_screen_egress.c` — `screen_profile_id` and `flood_counters` both keyed on wrong `meta->egress_zone`. Per-VLAN flood protection never fires or collapses across VLANs.
+- `tc_forward.c` — `evaluate_firewall_filter_output(meta, skb->ifindex)` evaluates per-sub-interface output filters against the parent ifindex key.
+- `tc_main.c` — consolidated root cause for both the zone miss and the screen bypass sections in the audit.
+
+## Scope
+- Attacks: host-originated and kernel-stack-forwarded (XDP_PASS) egress. XDP `bpf_redirect_map()` fast-path bypasses TCX entirely so it's unaffected.
+- Loader scope: `compiler_iface.go` appends only `physIface.Index` to `pendingTC`; no VLAN sub-ifindex is ever added. So the TCX hook is always on the parent.
+
+## Fix
+In `tc_main_prog`, read `skb->vlan_present` and `skb->vlan_tci` as the **primary** VLAN source, keeping the inline-header branch as a fallback for software-tagged frames.
+
+Source: `mythos.md` (consolidates the zone-miss and screen-ignore sections which share the same root cause).
+
+---
+
+## #852 — [security][medium] tc_conntrack writes persistent sessions for sessionless GRE/ESP without XDP policy evidence [CLOSED] (closed 2026-04-25)
+
+**Severity: MEDIUM** (from security audit, see `mythos.md`).
+
+## Impact
+`tc_conntrack_prog` has a carve-out for any sessionless, kernel-forwarded packet whose L4 protocol is GRE or ESP:
+
+```c
+// bpf/tc/tc_conntrack.c: tc_conntrack_prog
+if (meta->protocol == PROTO_GRE || meta->protocol == PROTO_ESP) {
+    if (meta->addr_family == AF_INET) tc_create_session_v4(meta);
+    else                              tc_create_session_v6(meta);
+    bpf_tail_call(skb, &tc_progs, TC_PROG_FORWARD);
+    return TC_ACT_OK;
+}
+```
+
+Gated only on `ingress_ifindex != 0` and protocol ∈ {GRE, ESP}. Does NOT verify the packet was locally encapsulated or that XDP enforced policy.
+
+`tc_create_session_v4` hardcodes `ingress_zone = 0` (junos-host) and writes both fwd and rev entries into the shared `sessions` map. The **reverse entry** is later consulted by XDP ingress conntrack — hitting the established-session fast path bypasses `xdp_policy` entirely for return traffic. This is persistent whitelisting, not single-packet.
+
+## Related trust-model siblings
+- `allow_embedded_icmp` bypass (gated on `fc->allow_embedded_icmp`, **enabled in all three shipped HA reference configs**) — single-packet, still trusts `ingress_ifindex != 0`.
+- `fabric_fwd` ifindex bypass — same single-packet + same trust assumption.
+- `IFACE_FLAG_TUNNEL` TC bypass (filed as a separate issue) — same pattern.
+
+Attack: a packet arriving on any interface **without** XDP attached (management NIC, veth, loopback, tunnel decap surfacing as a new netdev) and kernel-routed out a TC-covered interface has `ingress_ifindex != 0` but no policy check.
+
+## Fix
+Gate each carve-out on positive evidence of XDP enforcement — e.g. a `META_FLAG_XDP_VALIDATED` bit written by `xdp_forward` before `XDP_PASS`, combined with a check that the ingress ifindex belongs to an XDP-attached interface set.
+
+Source: `mythos.md`.
+
+---
+
+## #853 — [security][medium] TC egress screen drops legitimate TCP fragments as NULL-scan; SYN_FRAG check is dead code [CLOSED] (closed 2026-04-24)
+
+**Severity: MEDIUM** (from security audit, see `mythos.md`).
+
+## Impact
+In `tc_main_prog`, the partial memset zeroes `tcp_flags` and L4 parse is skipped for fragments:
+```c
+__builtin_memset((__u8 *)meta + 32, 0, sizeof(*meta) - 32);
+...
+if (!meta->is_fragment) { if (parse_l4hdr(data, data_end, meta) < 0) return TC_ACT_SHOT; }
+```
+
+`tc_screen_egress_prog` then evaluates TCP with `tf = meta->tcp_flags == 0` for every fragment. With `SCREEN_TCP_NO_FLAG` enabled, **every** TCP fragment matches — including first fragments of legitimate XDP-permitted flows. Screen runs before conntrack, so the established-session match doesn't save them.
+
+Meanwhile `SCREEN_SYN_FRAG` is **dead code**: its predicate `(tf & 0x02) && meta->is_fragment` is mutually exclusive — when `is_fragment` is true, `tf` is zero so SYN bit can never be set.
+
+## Affected
+- `bpf/tc/tc_screen_egress.c` — `tc_screen_egress_prog` TCP flags block.
+- `bpf/tc/tc_main.c` — parse gate upstream of screen.
+
+## Fix
+Guard the entire TCP-flags block in `tc_screen_egress.c` with `&& !meta->is_fragment`, mirroring the L4-parse gate in `tc_main`.
+
+Source: `mythos.md`.
+
+---
+
+## #854 — [bug][medium] tc_forward port-mirror is zeroed by tc_main's partial memset before use [CLOSED] (closed 2026-04-24)
+
+**Severity: MEDIUM** (from security audit, see `mythos.md`).
+
+## Impact
+`tc_forward_prog` reads `meta->mirror_ifindex` to clone packets via `bpf_clone_redirect`. Its own comment says the value is set by `xdp_forward` before `XDP_PASS`. But `tc_main_prog` runs first and wipes everything past offset 32:
+
+```c
+// tc_main.c
+/* Zero from src_port onward — skip src_ip/dst_ip (32 bytes) which the L3 parser always overwrites. */
+__builtin_memset((__u8 *)meta + 32, 0, sizeof(*meta) - 32);
+```
+
+`mirror_ifindex` and `mirror_rate` live at offset ≥ 32. So `tc_forward` always sees `mirror_ifindex == 0`. `bpf_clone_redirect` is never called. **All port-mirrored traffic is silently lost** on the XDP_PASS→TC fallback path.
+
+## Additional issue
+`pkt_meta_scratch` is PERCPU and the XDP RX CPU may differ from the TC TX CPU under XPS/RPS. Even without the memset, cross-CPU handoff via per-CPU scratch is unreliable.
+
+## Fix options
+1. Store `mirror_ifindex`/`mirror_rate` in the first 32 bytes of `struct pkt_meta` (exempt from memset).
+2. Carry mirror metadata via `skb->cb`.
+3. Have `tc_forward` re-derive mirror destination from a dedicated map keyed on `skb->ingress_ifindex`.
+
+Source: `mythos.md`.
+
+---
+
+## #855 — [bug][medium] DPDK fwd_ifindex==0 sentinel collides with DPDK port 0; transit on port 0 freed as host-inbound [CLOSED] (closed 2026-04-24)
+
+**Severity: MEDIUM** (from security audit, see `mythos.md`).
+
+## Impact
+`forward_packet()` in the DPDK worker uses `meta->fwd_ifindex == 0` as the sole discriminator between host-inbound and transit-egress:
+
+```c
+// dpdk_worker/forward.c
+if (meta->fwd_ifindex == 0) {
+    ... /* local-destined */
+    ctr_global_inc(ctx, GLOBAL_CTR_HOST_INBOUND);
+    rte_pktmbuf_free(pkt);
+    return;
+}
+```
+
+`zone_lookup()` writes the raw DPDK port id directly: `meta->fwd_ifindex = nh->port_id;`. DPDK port ids are allocated from 0 by `rte_eth_dev_allocate()`. Any nexthop pointing to the first probed DPDK device (port 0) produces `fwd_ifindex == 0`, which `forward_packet()` interprets as "locally destined" — the mbuf is freed and `GLOBAL_CTR_HOST_INBOUND` increments. **Packet is never transmitted.**
+
+Side effect: the `allow_dns_reply` bypass (filed separately) is accidentally closed for traffic egressing port 0.
+
+## Affected
+- `dpdk_worker/forward.c` — `forward_packet`.
+- `dpdk_worker/zone.c` — `zone_lookup`.
+
+## Fix
+Use a distinct `fib_resolved` flag in packet metadata, OR store `port_id + 1` in the nexthop and subtract 1 at TX. Don't conflate "FIB miss" with "egress on port 0".
+
+Source: `mythos.md`.
+
+---
+
+## #856 — [security][medium] resolve_ingress_xdp_target skips xdp_screen for TCP NULL scans and ACK-only sweeps [CLOSED] (closed 2026-04-24)
+
+**Severity: MEDIUM** (from security audit, see `mythos.md`).
+
+## Impact
+`resolve_ingress_xdp_target()` returns `XDP_PROG_ZONE` (bypassing `xdp_screen`) for any non-fragment TCP packet lacking SYN, FIN, RST, or URG:
+
+```c
+// bpf/headers/xpf_helpers.h
+if (meta->protocol == PROTO_TCP && !meta->is_fragment) {
+    __u8 tf = meta->tcp_flags;
+    if (!(tf & (0x02 /* SYN */ | 0x01 /* FIN */ |
+                0x04 /* RST */ | 0x20 /* URG */)) &&
+        !(screen_flags & SCREEN_LAND_ATTACK) &&
+        !(meta->addr_family == AF_INET && (screen_flags & SCREEN_IP_SOURCE_ROUTE)))
+        return XDP_PROG_ZONE;
+}
+return XDP_PROG_SCREEN;
+```
+
+- **NULL scan** (`flags == 0x00`) satisfies `!(0 & anything)`, so `XDP_PROG_SCREEN` is skipped. `SCREEN_TCP_NO_FLAG` in `xdp_screen.c` becomes unreachable.
+- Also bypasses **`SCREEN_IP_SWEEP`** accounting for ACK-only and NULL packets → ACK-based sweeps evade detection.
+- Bypass is re-enabled only when `SCREEN_LAND_ATTACK` or (IPv4 + `SCREEN_IP_SOURCE_ROUTE`) is configured; neither is required when `TCP_NO_FLAG` is.
+
+## Affected
+- `bpf/headers/xpf_helpers.h` — `resolve_ingress_xdp_target`.
+- `bpf/xdp/xdp_screen.c` — `xdp_screen_prog` (the unreachable `TCP_NO_FLAG` branch).
+
+## Fix
+Add `(tf & 0x10 /* ACK */)` to the predicate (fast path applies only to ACK-set, control-flag-clear packets), and gate on `!(screen_flags & (SCREEN_TCP_NO_FLAG | SCREEN_IP_SWEEP))`.
+
+Source: `mythos.md`.
+
+---
+
+## #857 — [bug][medium] XDP_TX reply paths omit 802.1Q tag; SYN-cookie becomes self-DoS on VLAN sub-interfaces [CLOSED] (closed 2026-04-24)
+
+**Severity: MEDIUM** (from security audit, see `mythos.md`).
+
+## Impact
+`xdp_main_prog` strips 802.1Q tags before the pipeline via `xdp_vlan_tag_pop(ctx)`. Every reply path that returns `XDP_TX` rebuilds an **untagged** Ethernet frame and never calls `xdp_vlan_tag_push()`.
+
+Affected reply builders:
+- `xdp_policy.c::send_tcp_rst_v4`
+- `xdp_screen.c::send_syncookie_synack_v4`
+- `send_tcp_rst_v6`
+- `send_icmp_unreach_v4`, `send_icmp_unreach_v6`
+- `send_syncookie_synack_v6`
+- `validate_syncookie_v4`, `validate_syncookie_v6`
+
+On mlx5 native XDP, `XDP_TX` transmits the raw frame on the physical port. For VLAN sub-interface traffic the reply is sent **untagged** and lands on the native VLAN, never reaching the client. Consequences:
+- REJECT policy silently degrades to DROP on VLAN sub-interfaces.
+- **SYN-cookie flood protection becomes self-DoS**: while `synproxy_active == 1`, every new SYN from a VLAN client gets an untagged SYN-ACK it cannot receive → all new connections from that VLAN stall.
+
+## Fix
+After writing the Ethernet header in each `XDP_TX` reply builder, call `xdp_vlan_tag_push(ctx, meta->ingress_vlan_id)`. Follow the same pattern `xdp_forward` already uses on `XDP_PASS`.
+
+Source: `mythos.md`.
+
+---
+
+## #858 — [bug][medium] NAT port allocator collides on >16-CPU hosts; NAT64 has no reservation retry [CLOSED] (closed 2026-04-24)
+
+**Severity: MEDIUM** (from security audit, see `mythos.md`).
+
+## Impact
+`nat_pool_alloc_v4` (and v6/iface variants) masks CPU id to four bits:
+```c
+__u32 cpu = bpf_get_smp_processor_id() & 0xF;
+__u64 val = ctr->counter++ * 16 + cpu;
+```
+`nat_port_counters` is `BPF_MAP_TYPE_PERCPU_ARRAY` — each CPU's counter starts at 0. On a 32+ core host, CPU 0 and CPU 16 both compute `cpu & 0xF == 0` and produce identical `val` sequences from independent counters — yielding the same `{pool_ip, port}` on first allocation from each.
+
+Regular IPv4/IPv6 SNAT survives this via a `dnat_table` `BPF_NOEXIST` retry loop (3 attempts). The NAT64 path has **no such reservation**, and `nat64_xlate_6to4()` **ignores** the return of its reverse-state insert:
+
+```c
+// xdp_nat64.c
+bpf_map_update_elem(&nat64_state, &rkey, &rval, BPF_NOEXIST);
+/* return value ignored */
+```
+
+When two NAT64 clients on CPUs 0 and 16 get the same `{v4_src, v4_port}`, the second insert fails silently but the packet is still forwarded. Return traffic for the second flow matches the first client's entry and **gets translated to the wrong IPv6 destination** — cross-tenant data delivery.
+
+## Affected
+- `bpf/xdp/xdp_policy.c` — `nat_pool_alloc_v4` and variants.
+- `bpf/xdp/xdp_nat64.c` — `nat64_xlate_6to4`.
+
+## Fix
+Widen CPU stride to at least `nr_cpu_ids` (or seed each CPU's counter with `cpu * port_range / nr_cpus`). Add the same `dnat_table` `BPF_NOEXIST` reservation-and-retry to the NAT64 path. Check the return of `bpf_map_update_elem(&nat64_state, ...)`.
+
+Source: `mythos.md`.
+
+---
+
+## #859 — [security][low] IPv6 SYN-cookie validated_clients key truncated to first 4 bytes — one handshake whitelists a /32 [CLOSED] (closed 2026-04-24)
+
+**Severity: LOW** (from security audit, see `mythos.md`).
+
+## Impact
+`validate_syncookie_v6()` builds `validated_clients` map key using only the first 4 bytes of the IPv6 source address:
+
+```c
+// xdp_screen.c
+struct validated_client_key vk = {
+    .src_ip   = meta->src_ip.v4,  /* first 4 bytes of v6 addr */
+    .dst_ip   = meta->dst_ip.v4,
+    .dst_port = meta->dst_port,
+};
+bpf_map_update_elem(&validated_clients, &vk, &vv, BPF_ANY);
+```
+
+The SYN-path bypass in `xdp_screen_prog` uses the same key shape. For IPv6, `meta->src_ip.v4` aliases bytes 0–3 of the address — the **global routing prefix**. A single successful handshake from any host in a /32 whitelists every host in that /32.
+
+Attack: an attacker controlling one address in the same /32 as a spoofed-source range can complete one cookie handshake and then SYN-flood with spoofed addresses from that /32, bypassing the cookie challenge entirely.
+
+## Fix
+Widen `validated_client_key` to carry a 16-byte source and destination, and update the v6 lookup and insert sites accordingly.
+
+Source: `mythos.md`.
+
+---
+
+## #860 — [bug][low] SCREEN_PING_OF_DEATH is dead code on XDP and TC (pkt_len is __u16) [CLOSED] (closed 2026-04-25)
+
+**Severity: LOW** (from security audit, see `mythos.md`).
+
+## Impact
+Both `xdp_screen_prog` and `tc_screen_egress_prog` contain an unreachable comparison:
+```c
+if (sc->flags & SCREEN_PING_OF_DEATH) {
+    if (meta->protocol == PROTO_ICMP || meta->protocol == PROTO_ICMPV6) {
+        if (meta->pkt_len > 65535)
+            return screen_drop(meta, SCREEN_PING_OF_DEATH);
+    }
+}
+```
+`pkt_len` is `__u16` in `bpf/headers/xpf_common.h`. A `__u16` can never exceed 65535 — the branch is always false. `GLOBAL_CTR_SCREEN_PING_OF_DEATH` never increments.
+
+Additional bug: the IPv6 parser computes `meta->pkt_len = bpf_ntohs(ip6h->payload_len) + 40`, which can wrap `__u16` for payloads > 65495 bytes.
+
+## Affected
+- `bpf/xdp/xdp_screen.c`
+- `bpf/tc/tc_screen_egress.c`
+- `bpf/headers/xpf_common.h` — `struct pkt_meta` field width.
+
+## Fix
+Widen `pkt_len` to `__u32`, OR reimplement as a fragment-reassembly-size check (which is what ping-of-death detection actually requires). Apply identically to both pipelines.
+
+Source: `mythos.md`.
+
+---
+
+## #861 — [bug][low] IPv6 SESSION_OPEN event logs post-NAT addresses as 'original' (session_v6_scratch[1] clobber) [CLOSED] (closed 2026-04-24)
+
+**Severity: LOW** (from security audit, see `mythos.md`).
+
+## Impact
+The IPv6 permit path in `xdp_policy.c` stashes pre-NAT source/destination into `session_v6_scratch[1]` before calling `create_session_v6()`:
+```c
+__u32 _orig_idx = 1;
+struct session_value_v6 *_orig_stash = bpf_map_lookup_elem(&session_v6_scratch, &_orig_idx);
+if (_orig_stash) { __builtin_memcpy(_orig_stash->nat_src_ip, meta->src_ip.v6, 16); ... }
+```
+
+But `create_session_v6()` uses **the same slot** as `rev_val` and overwrites it:
+```c
+__u32 idx1 = 1;
+struct session_value_v6 *rev_val = bpf_map_lookup_elem(&session_v6_scratch, &idx1);
+__builtin_memset(rev_val, 0, sizeof(*rev_val));
+if (nat_src_ip) __builtin_memcpy(rev_val->nat_src_ip, nat_src_ip, 16);
+```
+
+When `emit_event_nat6_orig()` later reads `_orig_stash->nat_src_ip`, it gets the **translated** (post-NAT) address. SESSION_OPEN events for IPv6 NAT sessions log the wrong "original" tuple.
+
+## Affected
+- `bpf/xdp/xdp_policy.c` — IPv6 stash path + `create_session_v6`.
+
+## Fix
+Stash originals into a scratch slot that `create_session_v6` does not use (e.g. a dedicated field in `pkt_meta`), OR emit the event before calling `create_session_v6`.
+
+Source: `mythos.md`.
+
+---
+
+## #862 — [bug][low] NAT64 ICMP checksum loop only covers first 128 bytes; ping -s 200+ gets bad checksum [CLOSED] (closed 2026-04-24)
+
+**Severity: LOW** (from security audit, see `mythos.md`).
+
+## Impact
+`nat64_xlate_6to4()` and `nat64_xlate_4to6()` compute the ICMP/ICMPv6 checksum with a `#pragma unroll` loop limited to 64 iterations:
+```c
+#pragma unroll
+for (int i = 0; i < 64; i++) {
+    if ((void *)(&icmp_w[i] + 1) <= data_end)
+        icmp_csum += icmp_w[i];
+}
+```
+At two bytes per iteration, covers at most 128 bytes. Any ICMP echo request/reply with payload larger than ~120 bytes (e.g. `ping -s 200`) is forwarded with a **bad L4 checksum** after NAT64 translation. On mlx5 native XDP, `XDP_REDIRECT` does not trigger kernel checksum fixup — the bad checksum reaches the wire. Same cap also affects `nat64_icmp_error_4to6()`.
+
+## Affected
+- `bpf/xdp/xdp_nat64.c` — `nat64_xlate_6to4`, `nat64_xlate_4to6`, `nat64_icmp_error_4to6`.
+
+## Fix
+Replace the fixed 64-iteration unrolled loop with a bounded `#pragma unroll 1` loop up to ~750 words (same pattern as `finalize_csum_partial` in `xpf_helpers.h`).
+
+Source: `mythos.md`.
+
+---
+
+## #863 — [security][low] IFACE_FLAG_TUNNEL TC bypass assumes XDP enforced policy; ingress_ifindex != 0 is not proof [CLOSED] (closed 2026-04-25)
+
+**Severity: LOW** (from security audit, see `mythos.md`).
+
+## Impact
+Any packet with `skb->ingress_ifindex != 0` egressing on an interface whose `iface_zone_value` has `IFACE_FLAG_TUNNEL` set is returned `TC_ACT_OK` **before** screen, conntrack, or NAT:
+
+```c
+// bpf/tc/tc_main.c
+if (zone_ptr && (zone_ptr->flags & IFACE_FLAG_TUNNEL) && skb->ingress_ifindex != 0) {
+    return TC_ACT_OK;
+}
+```
+
+No verification via meta flag, session-table hit, or XDP-attached-ifindex check. A packet that entered on an interface **without** XDP attached (loopback, veth, management NIC, tunnel decap surfacing as a new netdev) and is kernel-routed out via a tunnel device traverses egress with no enforcement.
+
+Interacts badly with the VLAN hwaccel zone miss (filed separately): if the wrong (native-VLAN) zone resolved by `tc_main` has `IFACE_FLAG_TUNNEL` set, VLAN sub-interface traffic may inadvertently hit this bypass.
+
+## Affected
+- `bpf/tc/tc_main.c` — tunnel egress bypass.
+
+## Fix
+Gate the bypass on positive evidence — e.g. a `META_FLAG_XDP_VALIDATED` bit written by `xdp_forward` before `XDP_PASS`, checked against a map of XDP-attached ifindexes. Same fix pattern as the sessionless GRE/ESP carve-out (separate issue).
+
+Source: `mythos.md`.
+
+---
+
+## #864 — [bug][low] Native XDP fallback to generic is silent + pinned link preserves stale IFACE_FLAG_NATIVE_XDP [CLOSED] (closed 2026-04-24)
+
+**Severity: LOW** (from security audit, see `mythos.md`).
+
+## Impact
+Two related issues in the XDP attach path:
+
+### (1) Silent demotion
+`compiler.go` logs at `slog.Info` when native XDP attach fails and falls back to `XDPGenericMode`:
+```go
+slog.Info("native XDP not supported, falling back to generic", "ifindex", ifidx, "err", err)
+m.DetachXDP(ifidx)
+failedNativeXDP[ifidx] = true
+```
+Operators running default log level get no indication a transit port is running in skb-mode XDP — which is a significant perf + feature loss.
+
+### (2) Stale IFACE_FLAG_NATIVE_XDP on pinned-link reattach
+`AttachXDP` tries to reuse a pinned link **without checking its attach mode**:
+```go
+// loader.go
+if existing, err := link.LoadPinnedLink(pinFile, nil); err == nil {
+    if err := existing.Update(prog); err == nil {
+        m.xdpLinks[ifindex] = existing
+        return nil  // ← mode not verified
+    }
+    existing.Close(); os.Remove(pinFile)
+}
+```
+If a prior boot fell back to generic and pinned a generic-mode link, next boot's native attach finds the pin, `Update()` succeeds without changing mode, and returns nil. `failedNativeXDP[ifidx]` is never set → `clearNativeXDPFlagsForIfindexes` is never called → `iface_zone_map` retains **`IFACE_FLAG_NATIVE_XDP == 1`** for an interface actually running generic.
+
+Any BPF path that branches on that flag (checksum-offload assumptions, `meta->csum_partial` handling) then operates on stale data.
+
+## Affected
+- `pkg/dataplane/compiler.go` — fallback loop.
+- `pkg/dataplane/loader.go` — `Manager.AttachXDP`.
+
+## Fix
+- After `LoadPinnedLink`, inspect the existing link's attach mode; if different from requested, close + remove the pin before falling through to fresh attach.
+- Raise the fallback log from `slog.Info` to `slog.Warn` or `slog.Error`.
+
+Source: `mythos.md`.
+
+---
+
+## #866 — Real SCREEN_SYN_FRAG detection via first-fragment L4 parse [CLOSED] (closed 2026-05-02)
+
+## Background
+
+`SCREEN_SYN_FRAG` is accepted by config (`pkg/config/compiler_security.go`), surfaced in show commands and gRPC, and documented as implemented. But the check in both `bpf/tc/tc_screen_egress.c` and `bpf/xdp/xdp_screen.c` is dead code:
+
+```c
+if ((sc->flags & SCREEN_SYN_FRAG) &&
+    (tf & 0x02) && meta->is_fragment)
+    return screen_drop(meta, SCREEN_SYN_FRAG);
+```
+
+`tc_main.c` / `xdp_main.c` partial-memsets `meta->tcp_flags = 0` and skips `parse_l4hdr` whenever `is_fragment` is true. So `tf=0` when `is_fragment=1`, and `(tf & 0x02) && is_fragment` is mutually exclusive — the branch can never fire.
+
+PR for #853 + #856 (screen correctness narrow) wraps the block in `!meta->is_fragment` to fix the false NULL-scan drop, which makes the dead branch explicitly unreachable by design. Comment in code references this issue.
+
+## What a real SCREEN_SYN_FRAG detection needs
+
+The user-visible intent is "drop packets that are a SYN-setting TCP packet that is also a fragment" — this is a common fragmentation-based attack pattern.
+
+Implementation requires:
+
+1. Detect the **first fragment** of a fragmented IPv4/IPv6 datagram: `frag_off.offset == 0 && MF == 1`.
+2. On the first fragment, the L4 header (TCP header) IS present inside the fragment payload. Parse it to get `tcp_flags`.
+3. On subsequent fragments (offset > 0), there is no L4 header — those can't be classified as SYN or non-SYN; the policy must be consistent across the datagram.
+
+Design options:
+- **First-fragment L4 parse**: in `parse_iphdr`/`parse_ipv6hdr` when first fragment detected, still call `parse_l4hdr`; flag `meta->tcp_flags_from_first_frag=1`. Screen check fires when `(tf & SYN) && is_fragment`.
+- **Reassembly-based**: track fragment groups (src+dst+id) in a map; classify the flow on first-fragment L4, drop subsequent fragments of SYN-flagged datagrams. Heavier, session-table-like state.
+
+First-fragment parse is the normal Juniper approach and much simpler.
+
+## Files likely touched
+
+- `bpf/headers/xpf_helpers.h` — `parse_iphdr`, `parse_ipv6hdr`, `parse_l4hdr` wiring.
+- `bpf/tc/tc_main.c`, `bpf/xdp/xdp_main.c` — gate L4 parse on first-fragment-too (`!is_fragment || (is_fragment && first_fragment)`).
+- `bpf/tc/tc_screen_egress.c`, `bpf/xdp/xdp_screen.c` — update SYN_FRAG predicate.
+
+Test: craft fragmented SYN (TCP SYN with IP fragment flag set); verify drop + counter bump.
+
+## Related
+
+
+*(truncated — 42 lines total)*
+
+
+---
+
+## #867 — ACK-based IP_SWEEP detection evades the resolve_ingress_xdp_target fast-path [CLOSED] (closed 2026-05-04)
+
+## Background
+
+Security audit #856 noted that ACK-only TCP packets take the `resolve_ingress_xdp_target` fast-path (tail-call directly to `XDP_PROG_ZONE`), bypassing `xdp_screen` and therefore skipping IP_SWEEP accounting in `ip_sweep_track`. An attacker scanning many hosts from a single source using ACK-only probes evades sweep detection.
+
+PR for #853 + #856 fixed the NULL-scan bypass (required ACK bit in the fast-path predicate) but deliberately did **not** add SCREEN_IP_SWEEP to the gate. Codex review flagged that doing so would generate false positives: `ip_sweep_track` is keyed on `(src_ip, ingress_zone)` with no destination IP, so every established ACK packet from a forwarding host would increment the same counter until it crossed the sweep threshold — normal traffic would trigger "sweep detected" and drop.
+
+## What's needed
+
+ACK-sweep detection without breaking established forwarding. Options:
+
+1. **Distinct-dst counter**: change `ip_sweep_track` to track the set (or cardinality estimate) of distinct destination IPs per source. An ACK-only scan hits many dsts in a short window; normal established connections hit few. HLL or count-min sketch keyed on (src, zone) with dst IPs mixed in. Heavier state.
+
+2. **Session-miss gate**: run sweep accounting only when the packet didn't match a conntrack session. Sweep probes by definition don't match a session (no corresponding outbound); legitimate ACK belongs to an established session. Requires moving sweep from `xdp_screen` to after `xdp_conntrack`. Conflicts with the "screen before zone/session" layering but might be the right tradeoff.
+
+3. **Rate-limit instead of sweep**: treat ACK-without-session as a per-source rate-limit, drop or alarm above threshold. Similar to syn-flood but for ACK.
+
+## Related
+
+- PR for #853+#856 landed a narrow fix that addresses NULL-scan bypass; ACK-sweep evasion is explicitly out of that PR's scope.
+- `mythos.md` (security audit source).
+
+---
+
+## #869 — userspace-dp: expose worker busy/idle runtime telemetry [CLOSED] (closed 2026-04-24)
+
+## Problem
+
+At 25 Gbps forwarding on the userspace AF_XDP dataplane, host CPU appears fully consumed. That does not tell us whether the workers are actually processing packets, spinning empty RX rings, blocking in `poll()`/sleep, waiting on TX completions, or losing time to VM scheduling/steal.
+
+We need first-class dataplane telemetry that answers:
+
+- How much worker wall time is spent doing useful packet/ring work?
+- How much time is idle-but-burning-CPU spin?
+- How much time is genuinely blocked/sleeping and therefore available headroom?
+- Are workers CPU-saturated uniformly, or is one worker hot while others have capacity?
+- Is the apparent ceiling CPU, NIC/ring pressure, VM scheduling, or RSS/CoS ownership imbalance?
+
+This is required before making claims about whether the current VM/hardware can exceed 25 Gbps.
+
+## Proposed design
+
+Add low-overhead worker-loop runtime accounting in `userspace-dp`.
+
+### Counters
+
+Expose cumulative per-worker counters:
+
+```text
+worker_wall_ns_total
+worker_active_ns_total
+worker_idle_spin_ns_total
+worker_idle_block_ns_total
+worker_thread_cpu_ns_total
+worker_work_loops_total
+worker_idle_loops_total
+```
+
+Definitions:
+
+- `worker_wall_ns_total`: monotonic wall-clock time accounted by the worker loop.
+- `worker_active_ns_total`: previous loop interval where `did_work == true`.
+- `worker_idle_spin_ns_total`: no useful work, worker remained in the short spin path.
+- `worker_idle_block_ns_total`: no useful work, worker entered `sleep()` or interrupt `poll()`.
+- `worker_thread_cpu_ns_total`: sampled `CLOCK_THREAD_CPUTIME_ID` for the worker thread, published on the existing ~1s cadence.
+- `worker_work_loops_total`: loop iterations that did useful work.
+
+*(truncated — 188 lines total)*
+
+
+---
+
+## #871 — VLAN hwaccel: XDP_TX policy-reject replies also omit 802.1Q tag (stack-budget followup to #857) [CLOSED] (closed 2026-04-25)
+
+## Background
+
+PR #868 (\`pr/851-857-vlan-hwaccel\`) fixed the primary #857 self-DoS concern by pushing the 802.1Q tag on XDP_TX replies in the SYN-cookie builders (\`bpf/xdp/xdp_screen.c\`). The audit also flagged the same bug in 4 explicit-REJECT reply builders in \`bpf/xdp/xdp_policy.c\`:
+
+- \`send_tcp_rst_v4\` (\`xdp_policy.c:711\`)
+- \`send_tcp_rst_v6\` (\`xdp_policy.c:838\`)
+- \`send_icmp_unreach_v4\` (\`xdp_policy.c:957\`)
+- \`send_icmp_unreach_v6\` (\`xdp_policy.c:1068\`)
+
+All four rebuild an untagged Ethernet frame and return XDP_TX. On VLAN sub-interfaces the REJECT reply is sent untagged, lands on the native VLAN, never reaches the client — REJECT silently degrades to DROP.
+
+## Why not in the main PR
+
+Adding \`xdp_vlan_tag_push(ctx, meta->ingress_vlan_id)\` to any of the four REJECT builders pushes BPF verifier combined-stack budget past 512 bytes. The builders already sit at ~500 bytes baseline (large ip/tcp/icmp hdr structs + pseudo-header + csum state). Inlining or even calling a noinline wrapper adds ~20-30 bytes that exceed the limit.
+
+## What's needed
+
+A stack-refactor of the four REJECT builders before the VLAN push can be added. Options:
+
+1. **Move stack locals to per-CPU scratch maps** — similar to \`session_v4_scratch\` usage elsewhere. Rewrite csum accumulation in-place. Maintenance cost.
+2. **Tail-call to a VLAN-push program** — stash the reply packet + return via tail-call. Fresh stack budget. Slightly higher latency on REJECT path (tail-call overhead).
+3. **Pre-push VLAN in \`xdp_policy_prog\` (caller) before invoking REJECT builder** — adjusts all offsets inside REJECT by +4, but the packet's initial state already has data+0 = original eth + VLAN tag stripped. Caller pushes the tag back first, then reject builder operates with VLAN header in place.
+
+Option 3 is most invasive but cleanest. Option 2 is mechanical but adds a tail-call hop. Option 1 requires new scratch maps and careful refactor.
+
+## Impact
+
+Operators using \`reject\` action (vs silent \`deny\`) on policies affecting VLAN sub-interface clients see REJECT silently degrade to DROP. Client retries instead of receiving explicit RST/ICMP — slightly slower recovery, but no silent security hole.
+
+## Related
+
+- PR for #857 (landed partial fix for SYN-cookie paths).
+- \`mythos.md\` (security audit source).
+
+---
+
+## #875 — docs: add end-to-end workflow section to engineering-style.md [CLOSED] (closed 2026-04-24)
+
+## Problem
+
+\`docs/engineering-style.md\` encodes the project's coding and review discipline (hot-path allocation rules, atomics ordering, PR shape, project-specific gotchas like deploy-wipes-CoS) but it does NOT codify the meta-workflow each change follows: issue → plan → hostile review → architecture review → code → code review → unit test → deploy + feature validation → PR → review → merge.
+
+Agents that re-read the doc skip steps because they aren't written down. Recent examples:
+
+- Forwarding/perf validation was done at the end of #869 only because the user asked — not because it was a documented gate.
+- The iterative \"fight with Codex until you agree\" pattern has been used on the last 6 PRs but was never made explicit in the doc.
+- CoS re-apply after deploy is in the \"project-specific reminders\" list but has no link from a concrete step in a validation sequence.
+
+## Proposal
+
+Add a new section \`## Workflow for every change\` immediately after \`## First principles\` and before \`## Hot-path coding discipline\`. Steps:
+
+1. File a GitHub issue first.
+2. Plan — read code, write short plan doc, no code yet.
+3. Hostile-review the plan with Codex (gpt-5.5). Fight until both agree. No \"agreement by exhaustion\".
+4. Hostile-review the architecture the same way if the change touches a boundary.
+5. Write the code.
+6. Unit tests that reproduce the failure mode.
+7. Hostile-review the code with Codex. Same iterate-to-agreement rule.
+8. Deploy + feature validation: forwarding (ping + 23+ Gbit/s iperf3, no regression), CoS (re-apply after deploy, read counters), any touched feature exercised end-to-end, \`make test-failover\` if HA is touched. Say explicitly when a check can't be run.
+9. Open the PR with the full story.
+10. Address Copilot + Codex review comments; reply with disposition on each.
+11. Squash merge.
+
+## Acceptance
+
+- \`docs/engineering-style.md\` has the new section.
+- PRs landing after this change can reference \"step 8\" / \"step 3\" and the reader knows what that means.
+
+---
+
+## #877 — cli: add 'show chassis forwarding' — Junos-style forwarding daemon CPU / heap / buffer / uptime [CLOSED] (closed 2026-04-24)
+
+## Problem
+
+Operators want a single command that summarizes forwarding-daemon health in the same shape Junos/vSRX uses. Today the info is split across:
+
+- \`show system status\` → per-worker Active%/SpinIdle%/BlockIdle%/CPU% (added in #869/#874)
+- \`show system processes\` → daemon process stats
+- \`show class-of-service interface\` → buffer counters
+- \`show chassis cluster\` → node state
+
+None of them reproduce the Junos operator-familiar one-screen view.
+
+## Requested shape
+
+\`\`\`
+ps@xpf> show chassis forwarding
+node0:
+--------------------------------------------------------------------------
+FWDD status:
+  State                                 Online
+  Microkernel CPU utilization         4 percent
+  Real-time threads CPU utilization   0 percent
+  Heap utilization                   72 percent
+  Buffer utilization                 83 percent
+  Uptime:                               5 days, 12 hours, 50 minutes, 35 seconds
+
+node1:
+--------------------------------------------------------------------------
+<same>
+\`\`\`
+
+In cluster mode: one block per node (fw0 / fw1), fetched via the HA status-query path the CLI already uses for other \`show chassis ...\` commands. Standalone mode: single unnamed block.
+
+## Field mapping (xpf → Junos terms)
+
+| Junos field | xpf source |
+|---|---|
+| State | daemon running + dataplane attached (Online / Offline / Failed) |
+| Microkernel CPU utilization | non-worker daemon threads — aggregate process CPU% minus worker CPU% |
+| Real-time threads CPU utilization | sum(worker CPU%) across all AF_XDP workers — from WorkerRuntimeStatus added in #869 |
+| Heap utilization | daemon RSS / cgroup-memory-limit (or /proc/meminfo MemAvailable fallback) |
+
+*(truncated — 56 lines total)*
+
+
+---
+
+## #878 — userspace-dp: expose UMEM / ring utilization for 'show chassis forwarding' Buffer% [CLOSED] (closed 2026-04-25)
+
+## Context
+
+#877 added \`show chassis forwarding\`. On the userspace-dp path, the Buffer utilization row prints \`unknown (see #878)\` because the authoritative pressure signal for AF_XDP is UMEM frame fill and TX-ring pressure, not BPF map occupancy.
+
+## Proposal
+
+Extend per-worker telemetry (builds on #869) with:
+
+- UMEM frames-in-flight / total UMEM frames per binding.
+- TX ring max depth / configured depth.
+- Aggregate max across workers exposed via a new field on \`WorkerRuntimeStatus\` (or a sibling \`BindingBufferStatus\`).
+
+\`pkg/fwdstatus/builder.go\` consumes this via the userspace \`Status()\` path and populates \`ForwardingStatus.BufferPercent\` + \`BufferKnown = true\` when it's available.
+
+## Acceptance
+
+- Buffer utilization row reads \`N percent\` on userspace-dp.
+- Follow-up reference \`#878\` in the formatter can be removed / replaced with the actual value.
+
+---
+
+## #879 — cli: 'show chassis forwarding' — per-node (node0: / node1:) rendering in cluster mode [CLOSED] (closed 2026-04-25)
+
+## Context
+
+#877 shipped the MVP \`show chassis forwarding\` with local-node rendering only. In cluster mode the output appends:
+
+\`\`\`
+Note: peer-node rendering deferred to #879.
+\`\`\`
+
+The Junos-style target is per-node blocks:
+
+\`\`\`
+node0:
+--------------------------------------------------------------------------
+FWDD status:
+  ...
+
+node1:
+--------------------------------------------------------------------------
+FWDD status:
+  ...
+\`\`\`
+
+## Proposal
+
+Reuse the existing peer-query layer that \`show chassis cluster\` uses (\`pkg/cluster/cluster.go::Manager.FormatStatus\` + peer state plumbed from heartbeat/HA sync). Do NOT add a new gRPC method — ask the peer to build and return its \`fwdstatus.ForwardingStatus\` via the existing peer-query mechanism.
+
+Acceptance:
+
+- Cluster-mode output renders both \`node0:\` and \`node1:\` blocks when both nodes are up.
+- Degraded peer (heartbeat stale) renders a marker like \`node1: (peer unreachable)\`.
+- Follow-up reference \`#879\` in the formatter can be removed.
+
+---
+
+## #881 — show chassis forwarding: add 5s / 1m / 5m CPU windows (replace or augment cumulative-since-start) [CLOSED] (closed 2026-04-24)
+
+## Problem
+
+#880 shipped \`show chassis forwarding\` with CPU utilization labeled \`cumulative since start\`. Operators monitoring live load need current CPU, not an average since boot — a daemon that burned 100% for 10 seconds three days ago will show ~0% cumulative and hide present saturation.
+
+Junos \`show chassis forwarding\` reports three windows: 5 seconds, 1 minute, 5 minutes. This is the operator-familiar shape and matches what \`top -n1 | head\`, \`uptime\`, and most Linux tooling show.
+
+## Requested behavior
+
+Two rows in \`show chassis forwarding\` change from
+
+\`\`\`
+Daemon CPU utilization         42 percent (cumulative since start)
+Worker threads CPU utilization 41 percent (cumulative since start)
+\`\`\`
+
+to
+
+\`\`\`
+Daemon CPU utilization         4%  /  3%  /  2%   (5s / 1m / 5m)
+Worker threads CPU utilization 42% / 38% / 35%    (5s / 1m / 5m)
+\`\`\`
+
+If the daemon has been up for less than the given window, that column prints \`-\` (e.g. at uptime=30s the 5m and 1m columns read \`-\`, only 5s has a value).
+
+## Design
+
+- New background sampler goroutine in xpfd: reads \`/proc/self/stat\` (utime, stime) and sums \`WorkerRuntimeStatus.thread_cpu_ns\` across workers at 1s cadence.
+- Stores samples in a ring buffer sized for 5m = 300 entries at 1s cadence.
+- \`fwdstatus.Build\` reads the ring at query time. For each window W, finds the sample at or before (now - W), computes (now_cpu - then_cpu) / W → rate.
+- No blocking sleep in the CLI command — scripted polling stays cheap.
+- Thread safety: sampler writes under a mutex; Build snapshots under the same lock.
+
+## Acceptance
+
+- Two new fields on \`ForwardingStatus\`: \`DaemonCPUWindows [3]float64\`, \`WorkerCPUWindows [3]float64\` (5s / 1m / 5m).
+- \`Format()\` renders the three-window shape; short uptime renders \`-\` for windows wider than uptime.
+- Unit tests: sampler ring fill/rollover, window lookup for exact / approximate / insufficient-history cases, formatter output for all three valid + insufficient-history scenarios.
+- Deploy + validation on \`loss:xpf-userspace-fw0/fw1\`: drive iperf3 at 1-core saturation, verify 5s rate jumps while 5m stays low; stop load, verify 5s decays in seconds while 5m decays over minutes.
+
+## Refs
+
+*(truncated — 42 lines total)*
+
+
+---
+
+## #883 — P0: 25 Gbps iperf3 bypasses userspace-dp entirely — XDP shim reaches XDP_REDIRECT ~0 times despite ready bindings [CLOSED] (closed 2026-04-24)
+
+## Problem
+
+On \`loss:xpf-userspace-fw0\` (cluster primary, userspace-dp "activated"), a 20+ minute iperf3 run at 25 Gbps from \`cluster-userspace-host → 172.16.80.200\` (VLAN 80 on \`reth0.80 → ge-0-0-2.80 → ge-0-0-2\` physical) shows the XDP shim never actually redirecting packets:
+
+\`\`\`
+ethtool -S ge-0-0-2 | grep xdp
+rx_xdp_drop:      49
+rx_xdp_redirect:  1        ← one packet total over 20+ minutes
+rx_xdp_tx_*:      0
+\`\`\`
+
+**Every other packet takes \`XDP_PASS\` into the kernel stack** — bypassing the userspace AF_XDP workers AND the eBPF main pipeline via cpumap. The dataplane claim "userspace-dp active" is effectively false under this workload.
+
+## Evidence gathered
+
+All collected with \`xpfd cleanup\` + restart + the existing production config:
+
+| Diagnostic | Value |
+|---|---|
+| \`xdp_userspace_p\` attached on ge-0-0-0/1/2 (native mode) | prog id 468 ✓ |
+| \`ctrl.enabled\` | 1 ✓ |
+| \`ctrl.metadata_version\` | 4 ✓ |
+| \`ctrl.flags\` | 5 (CPUMAP + TRACE) ✓ |
+| \`ctrl.workers\` | 6, \`queue_count\` 6 ✓ |
+| \`USERSPACE_INGRESS_IFACES\` | {4,5,6,13,14} — ge-0-0-0/1/2 + .50/.80 sub-ifs ✓ |
+| \`USERSPACE_BINDINGS\` for ge-0-0-2 queues 0-5 | all present, flags=0x1 (READY) ✓ |
+| \`USERSPACE_CPUMAP\` | 6 entries (CPUs 0-5) ✓ |
+| \`USERSPACE_SESSIONS\` entries exist | 230 \`show security flow session\` ✓ |
+| \`userspace_fallback_stats\` counters | CTRL_DISABLED=24, EARLY_FILTER=432, **all others = 0** |
+| \`userspace_trace\` entries (231 total) | only VLAN 50 UDP, **zero for VLAN 80 TCP iperf3** |
+| Per-worker \`active_seconds_total\` over 1604s | **0.006 s** — functionally zero |
+| Per-worker \`thread_cpu_seconds_total\` over 1604s | 84.5s (5.3% — purely idle-poll overhead) |
+| Per-worker \`work_loops\` | 316 total over 1604s (~0.2/s) |
+| Host kernel XDP redirect: \`rx_xdp_redirect\` | 1 |
+
+**What this tells us**: the shim IS attached and IS getting some packets (CTRL_DISABLED=24 at startup, EARLY_FILTER=432 from probe traffic). But the iperf3 flow specifically never reaches any traced stage (RECEIVED / BINDING_* / REDIRECT_ERR / NO_SESSION). Either:
+
+- (a) The iperf3 TCP/VLAN-80 traffic doesn't ingress through ge-0-0-2 at all — a NIC/driver/RETH path issue.
+- (b) The traffic enters the shim, classifies REDIRECT via \`live_userspace_session_action\`, but \`bpf_xdp_adjust_meta\` or the XSK redirect itself silently falls through without incrementing \`REDIRECT_ERR\`.
+- (c) \`cpumap_or_pass\` returns XDP_PASS on some path we don't count (e.g., \`USERSPACE_CPUMAP.redirect(cpu, 0)\` returning Err when \`cpu >= 6\` even though ctrl.flags has CPUMAP).
+
+*(truncated — 56 lines total)*
+
+
+---
+
+## #884 — userspace-dp WorkerRuntimeStatus.active_ns undercounts: idle-branch ring-poll CPU credited to IdleBlock [CLOSED] (closed 2026-04-25)
+
+## Problem
+
+In \`userspace-dp/src/afxdp/worker.rs\` the \`wr_state\` accounting attributes each loop iteration's wall delta to the state set by the PREVIOUS iteration. This correctly charges Active time for back-to-back work iterations, but systematically undercounts "work" when the loop alternates idle → work → idle.
+
+**Observed on xpf-userspace-fw0, 1604s wall, non-saturated traffic:**
+
+| Counter | Value |
+|---|---|
+| \`wall_ns\` | 1603.93 s |
+| \`active_ns\` | 0.006 s (0.0004% of wall) |
+| \`idle_block_ns\` | 1554.88 s (97% of wall) |
+| \`idle_spin_ns\` | 0.02 s |
+| \`thread_cpu_ns\` (CLOCK_THREAD_CPUTIME_ID) | 84.5 s (5.3% of wall) |
+| \`work_loops\` | 316 |
+| \`idle_loops\` | 1,380,915 |
+
+\`thread_cpu_ns\` (5.3%) is the CPU actually consumed by the worker thread — the thread was *scheduled* for 5.3% of wall time. The kernel doesn't charge CPU while the thread is blocked in \`thread::sleep(60us)\`, so the 94.7% of wall in IdleBlock is genuinely unscheduled sleep.
+
+But \`active_ns\` is 0.0004% — essentially zero. The \`thread_cpu - active - idle_spin\` = 84.47s of CPU gets attributed to IdleBlock_ns. That's the **CPU-busy ring-poll time in the idle branch** being credited to IdleBlock.
+
+## Root cause
+
+At loop top:
+1. Compute \`delta = now - last_loop_ns\`
+2. Attribute \`delta\` to \`wr_state\` (state set by **previous** iteration)
+3. Do work / go idle
+4. Set \`wr_state\` for next iteration
+
+Typical idle iteration:
+1. delta includes: (60µs sleep time) + (~50-100 µs CPU-busy ring check & attribution & state-set from PREVIOUS idle iter) → attributed to IdleBlock (state was IdleBlock from prev iter)
+2. Ring check: did_work = false
+3. Set state = IdleBlock, sleep 60µs
+
+So **the CPU-busy ring-check work of each idle iteration gets attributed to IdleBlock** rather than a separate "idle-poll-cpu" bucket. That's why \`idle_block_ns\` ≫ actual sleep time.
+
+Active time attribution only captures the narrow "between-loop-tops time where state was Active" — which is just the did_work() call itself plus the state-set and continue. For bursty traffic, almost all real CPU goes to IdleBlock.
+
+## Consequences
+
+- \`active_ns / wall_ns\` is a dead signal for operators — always near zero.
+
+*(truncated — 61 lines total)*
+
+
+---
+
+## #885 — test-env: iperf3 traffic generator bypasses both firewall VMs via SR-IOV HW switching [CLOSED] (closed 2026-04-24)
+
+## Problem
+
+The current iperf3 test path (\`cluster-userspace-host → 172.16.80.200\` per [\`docs/engineering-style.md\`](../docs/engineering-style.md)) **does not traverse either firewall VM**, despite the client's default route being the firewall's gateway IP.
+
+Discovered while investigating #883 (closed as misframed). 14 GB of iperf3 traffic measured at the client's eth0 tx counter; both \`xpf-userspace-fw0\` and \`xpf-userspace-fw1\` show ZERO new bytes on every interface during the same window.
+
+## Root cause
+
+\`cluster-userspace-host\` has eth0 as an SR-IOV VF on the host's mlx1 PF. \`172.16.80.200\` is one hop away on the upstream LAN (\`ttl=63\`, ping <1ms from host). The NIC's hardware VEB switches packets from the VF directly to the wire without traversing the firewall VM's virtio NIC. The client's ARP entry for the gateway points at fw1's MAC, but the actual frames are switched in the NIC.
+
+This means:
+- Every "X Gbit/s through the firewall" claim made in this test env is suspect.
+- CoS / userspace-dp / NAT / policy validation tests that rely on the iperf3 path may be testing nothing.
+- #883's "P0 XDP blackhole" was a false alarm caused by this — workers had no traffic because the firewall had no traffic.
+
+## Acceptance
+
+The test environment's load-generation paths must **demonstrably** push packets through the firewall's data plane. Concretely:
+
+1. Document a method that proves traffic crosses the firewall (e.g., \`incus exec loss:xpf-userspace-fw1 -- bash -c 'cat /sys/class/net/ge-7-0-1/statistics/rx_bytes'\` delta during a load run shows the full transfer size).
+2. Either:
+   - Disable HW VEB on the SR-IOV PF (many mlx5 setups support \`spoofchk on\`/\`vepa\` modes that force VF-to-VF traffic out the wire and back in).
+   - OR change the test setup so client and server live in incus containers/VMs whose only path to each other is through the firewall (e.g., separate bridges, or addresses that are NOT directly reachable on the upstream LAN).
+3. Update \`docs/engineering-style.md\` step 8 to require the byte-counter-delta confirmation as part of the forwarding validation lane.
+
+## Why this matters
+
+Without this fix, every PR that claims a perf number from \`make test-failover\` / \`iperf3 -p 5203\` is potentially measuring host-NIC throughput, not firewall throughput. The userspace-dp activation gate (#704 series, etc.) cannot be honestly validated.
+
+## Related
+
+- #883 (closed) — the misframed P0 that surfaced this.
+- #884 — \`active_ns\` undercounting; lower urgency now that we know workers WERE genuinely idle, but still a real Rust accounting bug to fix.
+
+---
+
+## #897 — RSS rebalance: hysteresis + convergence detection (#840 follow-up) [CLOSED] (closed 2026-04-25)
+
+## Context
+
+#840 was reverted because the RSS rebalance loop **thrashes** in workers==queues topology with long-lived TCP flows. Empirical: CoV 37.7% with rebalance enabled vs 18.5% baseline (#840 PR #896, see `docs/pr/840-slice-d-v2/findings.md`).
+
+Root cause: the algorithm fires every cooldown floor (~10s), migrates weight to "cold" queues, but existing TCP flows don't migrate. Imbalance signal persists. Algorithm fires again. Cycles indefinitely.
+
+## What this issue tracks
+
+Add **hysteresis** and **convergence detection** so the algorithm stops firing when its own actions aren't helping:
+
+1. **Track post-rebalance imbalance metric**: after each rebalance, observe the next sample's max/mean ratio. If it doesn't decrease after K consecutive attempts, freeze further rebalances on this iface for a long backoff window (e.g. 5× cooldown).
+
+2. **Hysteresis on the trigger**: don't re-fire on the same imbalance pattern. If the new max-queue is the same one we just migrated weight TO, that's a sign the algorithm is making things worse; abort.
+
+3. **Adaptive cooldown**: start at the current 10s; double on each "no-improvement" cycle up to a ceiling (e.g. 5 minutes). Reset to floor on a successful improvement OR on Epoch / ConfigGen bump.
+
+## Acceptance
+
+- 600s p5201 16-stream test on workers==queues=6 with hysteresis enabled: CoV ≤ baseline CoV (i.e. don't make it worse). Ideally ≤ baseline within run-to-run noise.
+- Logs show < 5 rebalance fires across the 10-min test (vs ~50 in #840 v1).
+- After convergence detection trips, no rebalance fires for the rest of the run.
+
+## Related
+
+- Parent #786 (cross-binding fairness)
+- #835, #840 (closed) — prior attempts
+- See `docs/pr/840-slice-d-v2/findings.md` for empirical baseline and replication recipe.
+
+---
+
+## #898 — RSS rebalance: scope to workers<queues + non-equal initial weight (#840 follow-up) [CLOSED] (closed 2026-04-25)
+
+## Context
+
+#840 was reverted because the RSS rebalance loop fires harmfully in workers==queues topology where the default round-robin RSS table is **already** equal-weight across all queues. See `docs/pr/840-slice-d-v2/findings.md` for the empirical degradation.
+
+Slice D's value proposition (move hash buckets to zero-weighted queues so they receive traffic) only applies when:
+- The current indirection table has zero-weighted queues, AND
+- workers < queue_count (so #785's `[1]*workers + [0]*(queues-workers)` shape produces zeroes).
+
+In the workers==queues case (our typical deploy), #785's apply path is a no-op (`workers >= queues skip`), the kernel keeps its default round-robin table, and Slice D has nothing useful to do.
+
+## What this issue tracks
+
+Add a **runtime guard** to the rebalance loop's tick body: only fire when both:
+
+1. **workers < queue_count for this iface**, AND
+2. **the current indirection table has at least one zero-weighted queue** (read via `ethtool -x` parse).
+
+If either condition is false, set `permanentSkip = false` (so a config change can re-enable) but skip the tick — no sampling, no thrashing.
+
+This is a topology-aware enable, not a kill switch. The algorithm is correct in workers<queues; it just has no work in workers==queues.
+
+## Acceptance
+
+- Unit test: rebalance is a no-op for workers==queues=6 with default round-robin table.
+- Unit test: rebalance fires correctly for workers=4, queues=6 with `[1,1,1,1,0,0]` table (the original Slice D case).
+- 600s test with workers=6, queues=6: zero rebalance fires logged.
+
+## Related
+
+- Parent #786 (cross-binding fairness)
+- #785 (D3 RSS indirection persistence — provides the zero-weight pattern this guard checks against)
+- #835, #840 (closed) — prior attempts
+- Companion: #897 (hysteresis / convergence detection) — that one prevents thrashing IF the algorithm fires; this one prevents it from firing in topologies where it shouldn't.
+
+---
+
+## #899 — Cross-binding fairness via per-flow XDP_REDIRECT (alternative to RSS table tuning) [CLOSED] (closed 2026-04-25)
+
+## Context
+
+#840 reverted (`docs/pr/840-slice-d-v2/findings.md`). The RSS rebalance approach has a **fundamental limitation**: tuning the NIC's RSS indirection table only affects future hash buckets. Existing long-lived TCP flows stay on whatever queue RSS hashed them to at connect time. So the algorithm can detect imbalance and migrate weights, but the actual in-flight traffic doesn't follow.
+
+#897 (hysteresis) and #898 (topology scope) make the table-tuning approach less harmful, but they don't enable in-flight rebalance.
+
+## What this issue tracks
+
+Investigate **per-flow steering** as an alternative or complement to RSS table tuning. The dataplane sees every packet pre-classification; it can compute a flow hash and choose a target queue based on **current load**, not just the static RSS table.
+
+### Approach sketch
+
+1. **In the userspace dataplane (xpf-userspace-dp)**: maintain a per-binding load metric (RX rate, recent batch counts).
+2. **Flow hash table in BPF**: keyed by 5-tuple, value is the target queue ID. Initially populated by the kernel's RSS hash; the userspace daemon writes overrides.
+3. **XDP_REDIRECT**: the XDP shim consults the flow hash table; if there's an override, redirect to the target queue's AF_XDP socket; otherwise fall back to the kernel's RSS-determined queue.
+4. **Userspace decision**: when the daemon detects cross-binding load skew, it picks the heaviest flows on the hot binding and writes overrides to redirect them to the coldest binding. Existing flows DO migrate.
+
+### Risks / open questions
+
+- TCP reordering risk during flow migration (need to drain the old queue's pending TX before redirect kicks in)
+- BPF map size (per-flow entries) — bound by session table size; probably fine
+- Interaction with conntrack (sessions are queue-affined; redirect changes the queue, but session lookup happens BEFORE redirect — should still work)
+- Failover / HA implications — need to think about flow-table sync on RG transitions
+- Performance: extra map lookup per packet on the XDP fast path
+
+### Acceptance criteria
+
+- Working prototype that demonstrates a single flow being moved between queues mid-stream without dropping packets / TCP reset.
+- 600s p5201 16-stream test: CoV ≤ baseline (currently 18.5%) and ideally substantially lower.
+- No regression on `make test-failover` or aggregate throughput.
+
+## Related
+
+- Parent #786 (cross-binding fairness)
+- #830 (Slice B — per-binding virtual-time gate, complementary)
+- #835, #840 (closed) — RSS table-tuning attempts
+- #897 (hysteresis), #898 (scope) — incremental fixes to the table-tuning approach
+- This issue is a **larger design** that subsumes #897+#898 if pursued — file as research / design exploration.
+
+---
+
+## #900 — 100E100M test harness: characterize SFQ + per-flow fairness under mixed elephant/mouse load [CLOSED] (closed 2026-05-05)
+
+## Context
+
+After #840 (closed) we know that RSS table tuning can't fix cross-binding fairness for long-lived flows. The userspace dataplane already has SFQ flow-fair scheduling per CoS queue (`COS_FLOW_FAIR_BUCKETS=1024`, `userspace-dp/src/afxdp/types.rs:608`), but we have no empirical characterization of how it behaves on the canonical "100 elephants + 100 mice" workload that motivates per-flow fairness work.
+
+Each CoS queue is drained by a single owner worker (verified live: queue 4 owner=1, queue 5 owner=2, queue 6 owner=3). All flows in a class compete for that one worker's drain rate via SFQ + DRR. We need to measure:
+
+1. Whether SFQ delivers acceptable per-flow bandwidth fairness for elephants under load (target: CoV ≤ 15%).
+2. Whether mouse latency tail is preserved when elephants saturate the same class (target: mouse p99 within ≤ 200 µs of unloaded baseline; p99.9 within ≤ 1 ms).
+3. Whether SFQ bucket collisions (200 flows / 1024 buckets, ~17% collision rate by birthday paradox) cause head-of-line blocking that punishes mice.
+
+The answer determines whether we need a new algorithm (AFD, MQFQ, FQ-CoDel) or whether the existing SFQ is sufficient.
+
+## Scope
+
+A `test/incus/test-100e100m.sh` script that:
+
+- Sets up the userspace HA cluster and applies CoS config (uses existing `apply-cos-config.sh`).
+- Runs a baseline phase: mice-only, no elephants. Captures unloaded latency profile.
+- Runs a loaded phase: 100 elephants (iperf3 -P 100, long-lived) + 100 mice (netperf TCP_RR or equivalent) concurrent, both in the same CoS class.
+- Captures JSON output from both tools.
+- Emits a one-screen summary: elephant aggregate Gbps, elephant per-flow CoV, mouse p50/p99/p99.9 latency loaded vs baseline, delta.
+- Idempotent: cleans up between runs.
+
+Out of scope:
+- Designing or implementing a new scheduler. The harness is a measurement tool. Algorithm choice happens in a follow-up issue once we have data.
+
+## Acceptance
+
+- Single-command run: `./test/incus/test-100e100m.sh`
+- Reproducible across runs (within statistical variance documented in the output).
+- Summary clearly identifies whether the existing SFQ infrastructure is adequate or whether mouse latency tail is unacceptably high.
+
+## Workflow
+
+Standard engineering: plan → Codex hostile plan review → implement → run on cluster → PR with baseline results + recommendation. The PR closes this issue and either declares "no algorithm change needed" or files a follow-up issue with the algorithm class to pursue.
+
+## Related
+
+- #840 (closed) — RSS table tuning negative finding, see `docs/pr/840-slice-d-v2/findings.md`
+- #786 — parent (cross-binding fairness)
+
+*(truncated — 42 lines total)*
+
+
+---
+
+## #903 — config: `set system dataplane userspace workers N` not parsed (vs working `dataplane workers N`) [CLOSED] (closed 2026-05-02)
+
+## Bug
+
+While verifying #805 fix, observed that:
+
+- `set system dataplane workers N` → maps correctly to `cfg.System.UserspaceDataplane.Workers` (used by reapplyRSSIndirection at `pkg/daemon/daemon.go:2550`).
+- `set system dataplane userspace workers N` → **does not** map anywhere. The setting is accepted by the parser and shown by `show configuration`, but xpfd never reads it.
+
+## Repro
+
+```
+incus exec loss:xpf-userspace-fw0 -- /usr/local/sbin/cli <<'EOF'
+configure
+set system dataplane userspace workers 4
+commit
+exit
+EOF
+
+# Then watch journalctl during the next reconcile —
+# rss indirection log shows workers=6 (the previous value),
+# not workers=4.
+```
+
+## Root cause
+
+`pkg/config/compiler_system.go:220-226`: the `dataplane` block dispatches to `compileUserspaceDataplane(child, ...)`, where `child` is the entire `dataplane` node. `compileUserspaceDataplane` (at `compiler_system.go:427`) walks the children of that node and matches `workers`, `binary`, etc. — but there is no `case "userspace":` to recurse into the inner `userspace` block. So `set system dataplane userspace workers 4` parses cleanly, gets stored in the AST, but is never dispatched to a setter.
+
+## Fix options
+
+1. Add `case "userspace":` inside `compileUserspaceDataplane` that recurses on the inner block (probably overengineered — the inner `userspace` block makes no sense if we're already in the userspace dataplane compiler).
+2. **Reject** `set system dataplane userspace ...` at parse time as an invalid path, OR
+3. **Document** that the canonical path is `set system dataplane workers N` only, and `set system dataplane userspace workers N` is a no-op.
+
+I'd lean toward option 2 (validation error) so the operator gets immediate feedback, but option 3 (doc-only) is also acceptable.
+
+## Discovered while
+
+Verifying #805 (D3 RSS indirection refresh) on the userspace cluster. The workaround was to use `set system dataplane workers N` directly. Live verification of #805 then succeeded.
+
+## Scope
+
+
+*(truncated — 41 lines total)*
+
+
+---
+
+## #905 — Measurement: mouse-latency tail under elephant load (100E100M unmeasured half) [CLOSED] (closed 2026-05-05)
+
+## Context
+
+Followup from `docs/pr/838-afd-lite/findings.md` (PR #904).
+
+#900 measured the throughput-fairness half of 100E100M and found
+the existing SFQ scheduler acceptable: 0/128 streams collapsed,
+CoV 16.6%, 93% of streams within ±25% of fair share. This closes
+the elephant-side question.
+
+The latency-tail half — mouse RTT impact under heavy elephant load
+— has never been measured. Both prior attempts (hping3 raw-SYN,
+Python TCP-connect against iperf3 server) hit infrastructure
+walls (raw-socket scaling, SYN-cookie defense, iperf3
+single-tenant accept).
+
+The operator has now provisioned a TCP+UDP echo server on
+**172.16.80.200:7** (and **2001:559:8585:80::200:7** for v6),
+which removes the harness blocker. Port 7 is outside the existing
+CoS classifier port range (5201-5204), so echo traffic naturally
+maps to best-effort — exactly the workload we want.
+
+We need this measurement BEFORE any further fairness algorithm
+work, so the algorithm choice is grounded in workload data
+instead of speculation. Three consecutive cross-binding /
+scheduler-state fairness attempts (#836, #840, #838) have stalled
+with no measurement to ground them — see findings doc.
+
+## Goal
+
+Characterize mouse-latency tail under elephant load. Concretely:
+produce a JSON-exportable RTT histogram that the next fairness
+decision can be checked against.
+
+## Deliverables
+
+1. **Test harness** in `test/incus/test-mouse-latency.sh`:
+   - Launches N iperf3 elephant streams against 172.16.80.200 on
+     port 5201 (iperf-a, 1 Gb/s shaped).
+   - Concurrently runs M paced TCP-connect+echo probes against
+     port 7 (best-effort by default; configurable to other CoS
+
+*(truncated — 86 lines total)*
+
+
+---
+
+## #908 — Userspace dataplane: extend XDP_SHARED_UMEM to cross-device forwarding (eliminate the 13% memcpy hot path) [CLOSED] (closed 2026-04-26)
+
+## Background
+
+Profiling the userspace dataplane (xpf-userspace-dp) under iperf3 -P 128 / 25 Gb/s elephant load shows **12.94% of CPU is spent in `__memmove_evex_unaligned_erms`**, almost entirely from `xpf_userspace_dp::afxdp::frame::build_forwarded_frame_into_from_frame` at `userspace-dp/src/afxdp/frame.rs:~1318`. This is a per-packet payload copy from the ingress UMEM to the egress UMEM.
+
+Pull-back of -P 128 throughput on the loss userspace cluster: **7.20 Gb/s** sustained vs ~15 Gb/s at -P 32. Clear CPU bottleneck on the userspace dataplane forwarding path.
+
+## Why the copy exists today
+
+`userspace-dp/src/afxdp/bind.rs:~285` — `shared_umem_group_key_for_device` returns `Some` only when both bindings are on the SAME `mlx5_core` device with the SAME `device_path`. Different physical NICs, or even SR-IOV VFs of the same parent (different device_path), get separate UMEMs. Cross-device forwarding therefore must copy the payload between the two UMEMs.
+
+## What the kernel actually supports
+
+`XDP_SHARED_UMEM` is not gated to same-device. Multiple AF_XDP sockets can share a single UMEM regardless of which `netdev` they bind to:
+
+- Primary socket registers the UMEM via `XDP_UMEM_REG`, sets up Fill / Completion rings.
+- Secondary sockets bind with `XDP_SHARED_UMEM` in `sxdp_flags` and `sxdp_shared_umem_fd = primary_fd`. Each has its own RX/TX rings; all share the primary's Fill/Completion rings.
+- Cross-device sharing IS supported. A frame received on socket A's RX ring can be transmitted by placing the descriptor on socket B's TX ring without copying the payload.
+
+Driver constraints:
+- All sockets must be in `XDP_ZERO_COPY` mode; otherwise the kernel falls back to `XDP_COPY` and the optimization is lost.
+- Userspace must synchronize access to the shared Fill/Completion rings (single-thread or explicit locks).
+
+## Goal
+
+Extend the userspace dataplane so that two bindings on different devices (physical NIC, SR-IOV VF, etc.) can share a single UMEM. When the forwarding path determines that an ingress frame must be sent on a different egress binding, we rewrite headers in place inside the shared UMEM and place the descriptor on the egress TX ring directly — no payload copy.
+
+## Acceptance
+
+- The `__memmove_evex_unaligned_erms` portion of the perf profile under iperf3 -P 128 / iperf-c shaper drops by at least 80% relative to the baseline (the ~13% becomes ≤2.6%).
+- Aggregate sustained throughput at iperf3 -P 128 / iperf-c improves measurably (target ≥ 12 Gb/s, up from 7.2 Gb/s baseline).
+- All existing failover / session-sync / config-sync tests continue to pass.
+- No regression in the iperf-a single-class test (small-packet shaped path).
+
+## Non-goals
+
+- Same-device sharing remains the default; this issue extends it, doesn't replace it.
+- Hairpin / single-binding optimizations are out of scope (we already do these).
+- AF_XDP `XDP_COPY` fallback path is not improved here; if a NIC pair can't both use zero-copy, we fall back to the existing copy path.
+
+## Risks
+
+*(truncated — 52 lines total)*
+
+
+---
+
+## #909 — Userspace DP: poll_binding_process_descriptor prefetches frame head, not metadata header — ~3.5% CPU stall [CLOSED] (closed 2026-04-26)
+
+## Background
+
+Profiling the userspace dataplane under iperf3 -P 128 / 25 Gb/s elephant load (`/var/tmp/905-prof/perf.data`, 2026-04-26):
+
+- `poll_binding_process_descriptor` consumes 10.6% of total CPU (self-time)
+- A SINGLE instruction inside it — `cmpl $0x42505553, -0x60(%rbp,%rcx,1) ; jne ...` — owns **33% of that function's self-time**, i.e. ~3.5% of total CPU on one branch
+
+`0x42505553` = `USERSPACE_META_MAGIC` (`userspace-dp/src/afxdp.rs:145`). The branch is the magic check at the top of `try_parse_metadata` (`userspace-dp/src/afxdp/frame.rs:3104`):
+
+```rust
+let meta = unsafe { *(bytes.as_ptr() as *const UserspaceDpMeta) };
+if meta.magic != USERSPACE_META_MAGIC || meta.version != USERSPACE_META_VERSION {
+    return None;
+}
+```
+
+## Root cause
+
+`UserspaceDpMeta` is 96 bytes (verified by summing field sizes and matching the `cmpw $0x60` length check immediately following the magic check). The metadata sits **before** the frame in UMEM at offset `desc.addr - 96`.
+
+The existing prefetch at `userspace-dp/src/afxdp.rs:670-682` reads from `desc.addr` (the frame head), NOT from `desc.addr - meta_len`:
+
+```rust
+// Prefetch frame data into L1 while processing counters.
+// UMEM frames are cold (last touched by NIC DMA); this hides
+// ~100ns DRAM latency before metadata parse.
+#[cfg(target_arch = "x86_64")]
+if let Some(pf) = unsafe { &*area }.slice(desc.addr as usize, 64.min(desc.len as usize))
+{
+    unsafe {
+        core::arch::x86_64::_mm_prefetch(
+            pf.as_ptr() as *const i8,
+            core::arch::x86_64::_MM_HINT_T0,
+        );
+    }
+}
+```
+
+Comment says "before metadata parse" — intent is correct, but the address is wrong. The CPU brings the frame head into L1, but `try_parse_metadata` reads at `desc.addr - 96` which is on a different cache line. Cold DRAM read every packet.
+
+
+*(truncated — 60 lines total)*
+
+
+---
+
+## #911 — Same-class HOL on shared_exact CoS queues at multi-Gbps shapers (FAIL gate at iperf-b/iperf-c per #905 findings) [CLOSED] (closed 2026-05-27)
+
+## Summary
+
+Mouse-latency tail under elephant load fails the 2.0× gate on shared_exact CoS queues at iperf-b (10 Gb/s) and iperf-c (25 Gb/s). The pass-gate cell at iperf-a (1 Gb/s) passes at 1.10×. Root cause is SFQ bucket collision in the shared_exact MQFQ path.
+
+Full evidence + diagnosis: `docs/pr/905-mouse-latency/findings.md` (PR #907).
+
+## Verdict matrix
+
+| Class | Shaper | Gate ratio | Verdict |
+|---|---:|---:|---|
+| iperf-a | 1 Gb/s | 1.10× | PASS |
+| iperf-b | 10 Gb/s | 34.95× | FAIL |
+| iperf-c | 25 Gb/s | 31.80× | FAIL |
+
+## Root cause
+
+`shared_exact` queues (the high-rate path) bypass the per-flow admission cap by design — see `userspace-dp/src/afxdp/tx.rs:~4076` (`cos_queue_flow_share_limit` returns `buffer_limit` unchanged on `shared_exact`). The bypass was deliberate; the static `COS_FLOW_FAIR_MIN_SHARE_BYTES = 16 × 1500` floor was rate-unaware and tail-dropped TCP at multi-Gbps per-flow rates (retrospective Attempt A: 22.3 → 16.3 Gbps regression on iperf-c).
+
+Without the cap, fairness on shared_exact relies entirely on MQFQ virtual-finish-time ordering at dequeue (`cos_queue_min_finish_bucket`). MQFQ orders **between** buckets but is FIFO **within** a bucket. With `COS_FLOW_FAIR_BUCKETS = 1024` and 8 elephant flows, the per-mouse bucket-collision probability is ~0.78%. When a mouse hashes into a bucket already holding elephant bytes, the mouse sits behind that backlog FIFO.
+
+At iperf-b's 10 Gb/s shape with ~10 ms queue depth, the 1% collision tail produces 100-770 ms p99 — confirmed across all 10 reps at N=8 M=10. p50 stays at ~2.5 ms (idle), confirming the long tail is entirely driven by collision victims.
+
+iperf-c is also FAIL but for a slightly different reason: the firewall caps at ~15 Gb/s (cross-NIC memcpy floor) before the 25 Gb/s shaper engages, so the queue stays shallow. The collision exists but its cost is small. The FAIL there is at higher concurrency (N=128 M=10 → 212 ms p99) where the firewall hot-path stalls compound.
+
+iperf-a passes because the per-flow admission cap IS engaged at low rates — bucket collision still happens, but each flow's per-bucket footprint is bounded ≤ 24 KB so drain time is small.
+
+## Acceptance
+
+The PASS gate from #905 (mouse p99(N=128, M=10) ≤ 2 × idle p99(N=0, M=10)) should hold across iperf-a, iperf-b, and iperf-c same-class measurements.
+
+## Candidate fixes (see findings.md §"Candidate fixes")
+
+A. **Raise SFQ bucket count** — cheapest experiment, directly attacks the diagnosed collision rate.
+
+B. **Rate-aware per-flow admission cap** for shared_exact — proper fix; bring the per-flow cap back with a BDP-scaled threshold.
+
+C. **Hierarchical SFQ within buckets** — within-bucket fairness; reserve.
+
+Recommended sequence: A first, B if A insufficient, C as reserve.
+
+
+*(truncated — 50 lines total)*
+
+
+---
+
+## #912 — Userspace DP: raise COS_FLOW_FAIR_BUCKETS from 1024 → 16384 to cut SFQ collision rate ~16× (cheapest experiment for #911) [CLOSED] (closed 2026-04-26)
+
+## Summary
+
+Implementation of candidate fix (A) in #911. Raise `COS_FLOW_FAIR_BUCKETS` from 1024 to 16384 to reduce bucket-collision probability ~16×, attacking the diagnosed root cause of the iperf-b same-class FAIL (#911).
+
+## Why this is the cheapest experiment
+
+- The diagnosis in #911 / `docs/pr/905-mouse-latency/findings.md` localizes the bad-tail mechanism to bucket collision: ~0.78% per-mouse collision probability at 8 elephants / 1024 buckets, matching the empirical ~1% tail.
+- Raising bucket count is a **constant-time edit**: the SFQ pop path (`cos_queue_min_finish_bucket`) iterates only the active set, not all buckets. Per-queue scratch arrays grow ~16× but stay tiny (1024 → 16384 u64 entries = 8 KB → 128 KB per queue).
+- Per the `cos_queue_prospective_active_flows` and `cos_flow_aware_buffer_limit` math, the buffer limit at high active-flow counts grows to support the larger active set; the latency-envelope clamp (`COS_FLOW_FAIR_MAX_QUEUE_DELAY_NS = 5 ms`) keeps the tail bounded.
+- Low risk: if it doesn't help, revert is one constant.
+
+## Expected outcome
+
+If the bucket-collision diagnosis is correct, raising the bucket count to 16K cuts the per-mouse collision probability from 0.78% to 0.05% at 8 elephants. The 1% p99 tail moves into the noise floor. iperf-b N=8 M=10 mouse p99 should drop from ~323 ms to roughly the idle baseline (~7 ms).
+
+If raising to 16K does NOT meaningfully drop the tail, the diagnosis is incomplete and we move to candidate (B): rate-aware per-flow admission cap.
+
+## Acceptance
+
+- `cargo build --release` clean.
+- `cargo test --release` for the userspace-dp crate: pre-existing errors only; no new test failures.
+- `make test-failover` clean (HA path not exercised by this change).
+- Re-run iperf-b same-class matrix (`ELEPHANT_PORT=5202 MOUSE_CLASS=iperf-b`):
+  - iperf-b N=8 M=10 mouse p99 drops by ≥ 10×.
+  - The 2.0× gate at p99(N=128, M=10) / p99(N=0, M=10) PASSES.
+- Throughput regression check: iperf3 -P 128 / iperf-c steady-state ≥ 15 Gb/s (no regression vs the post-#910 baseline).
+
+## Files touched
+
+- `userspace-dp/src/afxdp/tx.rs` — `COS_FLOW_FAIR_BUCKETS` constant + any sites that key off the old value (audit needed).
+- Per-queue allocation sites for `flow_bucket_bytes`, `flow_bucket_head_finish_bytes`, `flow_bucket_items`, etc.
+
+## Risk
+
+- **Cache footprint**: 16384 × 8 = 128 KB scratch per queue. With ~4 active queues per binding × 6 workers, that's ~3 MB of scratch — well within L2 (1 MB / core) but spilling out of L1 (32 KB). Quantify the L1 spill cost via re-profile after the change.
+- **Active-set scan**: still O(active_buckets), unchanged.
+- **Fixture allocations**: any test that constructs a `CoSQueueRuntime` with the old size needs to be audited.
+
+## References
+
+
+*(truncated — 44 lines total)*
+
+
+---
+
+## #913 — MQFQ virtual-finish-time is aggregate-only — temporal inversion breaks per-flow fairness [CLOSED] (closed 2026-04-27)
+
+## Context
+Surfaced during investigation of the "100E100M" problem (100 elephants vs 100 mice fairness and latency). While #785 Phase 3 landed a "minimal MQFQ" scheduler, live validation shows it fails to protect mouse flows from tail latency when elephants are present.
+
+## Root cause
+The implementation of `queue_vtime` in `userspace-dp/src/afxdp/tx.rs` is fundamentally flawed:
+
+```rust
+// userspace-dp/src/afxdp/tx.rs:4113-4119
+let bytes = cos_item_len(&item);
+queue.queue_vtime = queue.queue_vtime.saturating_add(bytes);
+```
+
+1. **Aggregate Accumulation:** `queue_vtime` is incremented by the bytes of *every* drained packet. In true WFQ/MQFQ, the virtual time should track the "system frontier" (the finish time of the packet currently being served).
+2. **Temporal Inversion:** When 100 elephant flows are backlogged, the 100th flow in a drain batch is anchored to a `vtime` that includes the bytes of the 99 flows before it. This unfairly pushes the later flows into the "future," breaking the byte-rate fairness promise.
+3. **Mice Penalization:** A newly arriving "mouse" flow is anchored to `max(tail, vtime)`. Because `vtime` grows with every byte drained from *any* flow, the mouse is immediately pushed behind the entire backlog of all other flows, suffering massive jitter.
+
+## Proposed fix
+1. Change `queue_vtime` update logic to match Hedayati & Shen (ATC '19): `queue_vtime` should be updated to the `head_finish` time of the bucket that was just popped.
+2. Ensure monotonicity: `queue_vtime = queue_vtime.max(bucket_head_finish)`.
+3. Update `cos_queue_pop_front_inner` to use the finish time of the *packet being served* as the new system time, rather than accumulating bytes.
+
+---
+
+## #914 — shared_exact queues have admission "hole" — per-flow caps disabled on sharded CoS [CLOSED] (closed 2026-05-05)
+
+## Context
+Investigation of "100E100M" shows that one elephant flow can dominate a 25G/100G `shared_exact` queue's buffer, starving others.
+
+## Root cause
+To prevent a 2.5 Gbps / 24 KB per-flow cap from breaking 100G line rate, the admission gates were explicitly downgraded to aggregate-only for `shared_exact` queues in #785:
+
+```rust
+// userspace-dp/src/afxdp/tx.rs:3793
+fn cos_queue_flow_share_limit(...) {
+    if queue.shared_exact {
+        return buffer_limit; // Hole: returns the full aggregate buffer limit
+    }
+    // ...
+}
+```
+
+This means a single flow can occupy 100% of the queue's buffer before tail-drop or ECN marking occurs. This "admission hole" allows a single misbehaving elephant to drive retransmits and cwnd collapse for every other flow in the same CoS class.
+
+## Proposed fix
+1. Re-enable per-flow caps for `shared_exact` queues.
+2. **Rate-Aware Caps:** Instead of the fixed `COS_FLOW_FAIR_MIN_SHARE_BYTES` (24 KB), scale the per-flow cap based on the queue's configured `transmit_rate_bytes` and the current number of active flows.
+3. Ensure the floor is high enough for 100G BDP but low enough to maintain fairness.
+
+---
+
+## #915 — exact CoS queues are non-work-conserving — barred from surplus bandwidth [CLOSED] (closed 2026-05-05)
+
+## Context
+Users expect Junos-style `transmit-rate` behavior where a queue gets a guaranteed rate but can consume surplus bandwidth if the link is idle. Current xpf `exact` queues are hard-capped.
+
+## Root cause
+In `select_cos_surplus_batch`, `exact` queues are explicitly skipped:
+
+```rust
+// userspace-dp/src/afxdp/tx.rs:1887
+if cos_queue_is_empty(queue) || !queue.runnable || queue.exact {
+    continue; // Hard-cap: exact queues never get surplus
+}
+```
+
+This makes shaping non-work-conserving. If an operator shapes a 100G interface to 10G and uses an `exact` 1G queue, that queue will stay at 1G even if the other 9G of shaped bandwidth is unused.
+
+## Proposed fix
+1. Remove the hard `queue.exact` check in `select_cos_surplus_batch`.
+2. Introduce a configuration attribute (e.g., `surplus-sharing`) to control this behavior, or allow it by default if `surplus_weight` is non-zero.
+3. This aligns with work-conserving shaping requirements for the "100E100M" high-utilization scenario.
+
+---
+
+## #916 — deadlock when CoS configured without interface shaping-rate [CLOSED] (closed 2026-05-03)
+
+## Context
+If a user configures CoS classes and queues but forgets to set the interface-level `shaping-rate`, all CoS traffic on that interface drops to zero.
+
+## Root cause
+1. `build_cos_interface_runtime` initializes `root.tokens = 0`.
+2. If no `shaping-rate` is set, the `shared_root_lease` has a rate of 0.
+3. `maybe_top_up_cos_root_lease` never grants tokens.
+4. `estimate_cos_queue_wakeup_tick` calls `cos_refill_ns_until(0, need, 0)` which returns `None`.
+5. The queue is never parked (so it never wakes up) and is never served (because tokens < head_len).
+
+## Proposed fix
+1. If no shaping-rate is configured, the CoS root should operate in "transparent" mode (infinite tokens or rate = line-rate).
+2. Validate `rate_bytes_per_sec > 0` in `cos_refill_ns_until` and return a sensible default or error during config apply.
+
+---
+
+## #917 — MQFQ Phase 4 missing — cross-worker virtual time synchronization (V_min) [CLOSED] (closed 2026-05-05)
+
+## Context
+"100E100M" throughput fairness degrades at 100G+ because flows are not distributed perfectly by RSS. Some workers end up with more flows than others.
+
+## Root cause
+Each worker has an independent `queue_vtime`. If Worker A has 10 elephant flows and Worker B has 1, Worker B's flow will finish its packets and advance its local `vtime` much faster than Worker A's flows. There is no "lag throttle" to slow down Worker B.
+
+## Proposed fix (Phase 4 Plan)
+1. Implement the `V_min` global atomic in `SharedCoSQueueLease`.
+2. Every worker should CAS-update `V_min` on dequeue.
+3. **Lag Throttle:** If a worker's local `vtime` exceeds `V_min + T` (where T is a fairness threshold), the worker must yield/park that queue until other workers catch up.
+4. This is required for CoV < 15% on non-uniform RSS workloads at 100G+.
+
+---
+
+## #918 — Flow Cache is a 'Collision Generator' — 1-Way Direct Mapped Cache destroys fairness [CLOSED] (closed 2026-05-02)
+
+## The 'Amateur' CS101 Mistake
+Your `FlowCache` is implemented as `Vec<Option<FlowCacheEntry>>` and accessed via `hash() % SIZE`. This is a 1-way direct-mapped cache.
+
+## Why it's a Disaster
+Direct-mapped caches were abandoned in hardware decades ago because of **Cache Thrashing**. In the '100E100M' scenario, if an Elephant flow and a Mouse flow happen to hash to the same bucket (which is almost guaranteed by the Birthday Paradox with only 4096 buckets), they will unconditionally evict each other on every single packet. 
+
+This forces BOTH flows to take the slow-path session lookup. The Elephant, having more packets, will effectively permanently evict the Mouse, completely destroying any fairness.
+
+## The Fix
+Implement a **4-way or 8-way Set Associative Cache**. Use a small array of entries per bucket and apply an LRU (Least Recently Used) or Random replacement policy. Alternatively, use a modern lock-free hash map structure (like a sharded `SwissTable`). Never use a 1-way direct-mapped cache for flow state.
+
+---
+
+## #919 — Atomic Refcounting in the Fast Path — SessionMetadata clones Arc<str> [CLOSED] (closed 2026-05-02)
+
+## The 'Safe Rust' Trap
+`SessionMetadata` uses `Arc<str>` for `ingress_zone` and `egress_zone`. 
+
+## Why it's a Disaster
+I see `metadata.clone()` and `ingress_zone.clone()` called throughout the fast path in `afxdp.rs`. Every time you clone an `Arc`, the CPU executes a `LOCK XADD` instruction to atomically increment the refcount. This instruction forces a cache coherency message to all other cores, stalling the pipeline. At 14.8M pps, you are saturating the memory bus with atomic increments just to copy a string pointer.
+
+## The Fix
+**Strings do not belong in the fast path.** You already have a `zone_name_to_id` mapping available in the forwarding state. Replace the `Arc<str>` with a simple `u16` zone ID. If you must use strings for logging, look them up *only* on the slow path or in the control plane. Drop the `Arc` entirely.
+
+---
+
+## #920 — Massive Hard-coded Batch Sizes (256) destroy L1d Cache Locality [CLOSED] (closed 2026-05-02)
+
+## The Problem
+`RX_BATCH_SIZE` and `TX_BATCH_SIZE` are hard-coded to 256. 
+
+## The Reality
+256 packets * 96 bytes of metadata + packet headers = ~30+ KB. Your L1d cache is likely 32KB or 48KB. By processing 256 packets at a time in a monolithic loop, you are blowing out the L1d cache. When the loop reaches the end of the batch and starts over, the first packets have already been evicted to L2, causing cache misses.
+
+## The Fix
+**Dynamic or Tuned Batch Sizes.** DPDK and modern XDP applications typically use batch sizes of 32 or 64 to keep the working set resident in L1. Make the batch size configurable, or at least reduce the constant to 64. A smaller batch size run more frequently yields significantly better instruction and data cache locality.
+
+---
+
+## #921 — Zone Resolution is 'String-Heavy' — Pathological allocations on session miss [CLOSED] (closed 2026-05-02)
+
+## The 'Amateur' Architecture
+Zones are identified by `String` names (e.g., 'trust', 'untrust') throughout the `ForwardingState` and `PolicyState`.
+
+## Why it's a disaster
+On every session miss (new flow), you call `zone_pair_for_flow_with_override`, which performs multiple `HashMap` lookups and returns a `(String, String)` pair. This involves at least two heap allocations. Then, you convert these to `Arc<str>` and clone them into `SessionMetadata`. At high flow-setup rates, your dataplane will spend more time in the allocator than in the policy engine.
+
+## The Fix
+**Integer Zone IDs.** Assign a `u16` ID to every zone during configuration. All fast-path and 'warm-path' (session miss) lookups MUST use these IDs. Replace `ifindex_to_zone: HashMap<i32, String>` with a fixed-size array or a `u16` mapping. Zones should only become strings at the CLI or Logging boundary.
+
+---
+
+## #922 — Policy Evaluation allocates on every miss — ZonePairKey is a memory-churn generator [CLOSED] (closed 2026-05-02)
+
+## The 'Junior' Logic
+Your `evaluate_policy` function starts by creating a `ZonePairKey`, which clones two `String`s. 
+
+## Why it's a disaster
+You've written a comment saying this is 'acceptable because it only runs on session miss'. This is a fundamental misunderstanding of high-performance system design. If you are targeting 100G, the session-setup path is part of your 'warm' path. A burst of 10,000 new connections (e.g., a SYN flood or a new application starting) will trigger 10,000 sets of `String` allocations, potentially stalling the worker thread due to heap contention.
+
+## The Fix
+**Zero-Allocation Lookups.** If you move to Integer Zone IDs (Issue #946), the `ZonePairKey` becomes a simple `u32` (`from_id << 16 | to_id`). Policy lookups then become a single `HashMap` or even a 2D array access. No strings, no clones, no heap, just a few cycles.
+
+---
+
+## #923 — Policy Address Matching is O(N) — Linear prefix scan destroys session setup performance [CLOSED] (closed 2026-05-02)
+
+## The 'Junior' Algorithm
+In `policy.rs`, `nets_match_v4` and `nets_match_v6` use a linear iterator (`.iter().any(...)`) to match IP addresses against a list of prefixes.
+
+## Why it's a disaster
+A real-world security policy often includes large 'address-books' or long lists of source/destination networks. If a rule has 500 prefixes, you are performing up to 500 serial comparisons for EVERY session miss. This makes the firewall vulnerable to 'Setup-Path Denial of Service' where a flood of packets from different IPs can exhaust your CPU budget just by triggering prefix scans.
+
+## The Fix
+**LPM (Longest Prefix Match) or Hash-based matching.** For exact-match addresses, use a `HashSet`. For prefix matching, use a **Trie (Radix Tree)** or a **Compressed Prefix Tree**. Even better, use **SIMD-accelerated parallel range matching** for small sets (up to 16 prefixes), and JIT-compile the decision tree for larger sets. You should never be doing a linear scan in a 100G pipeline.
+
+---
+
+## #924 — Fabric Zone Decoding is 'Double-Sided' String Bottleneck — ID-to-String-to-ID churn [CLOSED] (closed 2026-05-02)
+
+## The 'Junior' Fabric Path
+When a new connection crosses the fabric link, the sender encodes the `zone_id` (`u8`) in the source MAC. The receiver decodes this ID, then immediately calls `forwarding.zone_id_to_name.get(...)` to turn it into a `String`. Later, this `String` is used to look up policies, which often involves turning it BACK into an ID or doing string comparisons.
+
+## Why it's a disaster
+You are taking a perfectly good `u8` ID from the wire and immediately polluting it with heap-allocated strings and `HashMap` lookups. This is the opposite of high-performance engineering. Every conversion is a potential cache miss and a guaranteed instruction-count penalty.
+
+## The Fix
+**Stay in the Integer Domain.** If Issue #946 (Integer Zone IDs) is implemented, the fabric receiver should just use the `u8` (cast to `u16`) as the `ingress_zone_id`. The entire pipeline—from NAT to Policy to Logging—should work with these IDs. Zones should NEVER be strings inside the `worker_loop` or the session-miss path.
+
+---
+
+## #925 — Worker thread supervisor: catch_unwind, respawn, liveness reporting [CLOSED] (closed 2026-05-04)
+
+## Problem
+
+The userspace dataplane spawns worker threads via `thread::Builder::spawn` at `userspace-dp/src/afxdp/coordinator.rs:696` (and `:786`, `:833`) without `catch_unwind` or any supervisor mechanism. Any panic in a worker thread:
+
+- Kills that worker thread silently (no log unless the panic message hits stderr→journald).
+- Leaves all bindings served by that worker without packet processing — subset-of-traffic outage.
+- Has no automatic respawn — daemon must be manually restarted to recover.
+- Has no per-worker liveness reporting that the coordinator can use to detect a dead worker.
+
+Panic vectors include (but are not limited to):
+- `assert!(false)` invariant tripwires (e.g., MQFQ vtime rollback contract violations from #913).
+- UMEM mmap failures on degraded memory state.
+- NIC driver errors.
+- Lock-poisoning or unwrap on `Option::None` from unexpected map states.
+- Future code adding new `assert!` / `unwrap` / `panic!` paths.
+
+## Why this matters
+
+Gemini reviewer flagged this across multiple #913 plan-review rounds:
+> Introducing a new (albeit "believed-unreachable") hard-panic vector into a high-performance dataplane without a corresponding supervisor mechanism is a regression in reliability... The first feature to require the safety net must bear the cost of its initial implementation.
+
+The plan author's response in #913: bundle a MINIMAL supervisor (`catch_unwind` + log + mark-dead) into #913 to address the immediate concern, and track the broader supervisor design here.
+
+## Scope of broader supervisor work
+
+Out of scope for #913, in scope for this issue:
+
+1. **Automatic worker respawn**: re-create worker state and re-bind queues after a panic.
+2. **Per-worker liveness reporting**: heartbeat metric exposed via gRPC/Prometheus so operators can detect a dead worker before it causes user-visible outage.
+3. **Coordinated state recovery**: when a worker dies, redistribute its bindings to surviving workers OR cleanly tear down those bindings.
+4. **Sticky-failure detection**: if a respawned worker panics again immediately, mark the binding/queue as permanently failed rather than infinite-respawn-loop.
+5. **Generalized panic handling for ALL worker spawn sites**: `coordinator.rs:696`, `:786`, `:833` (and any future ones).
+6. **Test coverage**: panic-injection tests proving the supervisor catches, logs, and respawns correctly.
+7. **HA interaction**: when a worker dies on the primary node, does that trigger a chassis-cluster failover? Should it?
+
+## What #913 does cover
+
+- `catch_unwind` wrapping the `worker_loop` call inside the spawn closure.
+- Slog-error log of the panic message + worker_id on catch.
+- Mark the worker as dead in a runtime atomic so the coordinator can observe.
+
+*(truncated — 56 lines total)*
+
+
+---
+
+## #926 — demote_prepared_cos_queue_to_local inflates queue_vtime on success path [CLOSED] (closed 2026-04-27)
+
+## Problem
+
+`demote_prepared_cos_queue_to_local` at `userspace-dp/src/afxdp/tx.rs:5303-5319` drains a flow-fair exact queue with `cos_queue_drain_all` (which does aggregate-bytes \`vtime += bytes\` per pop), then re-enqueues converted Local items via \`cos_queue_push_back\` on the success path.
+
+This is NOT a rollback — no bytes were transmitted, but \`queue_vtime\` got inflated by the entire drained backlog before the converted items are reinserted.
+
+A new local request enqueued immediately after demotion can anchor at the inflated \`queue_vtime\` with a smaller finish time than the demoted backlog, recreating temporal-inversion HOL inversion (same class of bug as #911 / #913).
+
+## Walkthrough
+
+Pre-demote: \`vtime=0\`, bucket A has 4 × 1500B items (head=1500, tail=6000).
+
+After \`cos_queue_drain_all\`:
+- All 4 pops via no-snapshot path → \`vtime = 0 + 4×1500 = 6000\`.
+- Queue empty, all bucket head/tail reset to 0.
+
+After 4 \`cos_queue_push_back\` calls (Local conversions):
+- First: \`A.head = A.tail = max(0, 6000) + 1500 = 7500\`.
+- Second: \`A.tail = max(7500, 6000) + 1500 = 9000\`.
+- Third: \`A.tail = 10500\`.
+- Fourth: \`A.tail = 12000\`. \`A.head\` stays at 7500 (last-popped's finish).
+
+Now a new flow Y arrives with 100 bytes (different bucket):
+- \`Y.head = max(0, 6000) + 100 = 6100\`.
+
+\`Y.head=6100 < A.head=7500\` → **MQFQ pops Y first**, ahead of demoted backlog A. That's HOL inversion of the demoted backlog.
+
+## Why this is preexisting (not introduced by #913)
+
+The aggregate-bytes vtime advance in \`drain_all\` and the re-anchor in \`push_back\` both predate #913. #913 deliberately preserves the aggregate-bytes semantic on the no-snapshot path so that the \`drain_all → restore_front\` failure-rollback path (in this same demote function) remains round-trip neutral (see #913 plan §3.7). The success path was never round-trip neutral and is the bug here.
+
+Codex code review (review-mogzqvpf-xojwmt) of #913 caught this. Filed as a separate issue per scope discipline.
+
+## Recommended fix
+
+Two options:
+
+1. **In-place conversion**: iterate \`flow_bucket_items[bucket]\` for each active bucket; replace each \`CoSPendingTxItem::Prepared\` with its \`CoSPendingTxItem::Local\` equivalent. No drain_all, no push_back, no vtime touch. Items keep their position in the bucket's VecDeque.
+
+2. **Snapshot/restore**: before \`cos_queue_drain_all\`, save \`queue_vtime\`, \`flow_bucket_head_finish_bytes\`, \`flow_bucket_tail_finish_bytes\`, \`flow_bucket_bytes\`, \`active_flow_buckets\`, \`active_flow_buckets_peak\`. After the success-path \`cos_queue_push_back\` loop completes, restore them. Restore is correct because Local items go back into the same buckets as the original Prepared items (same flow_key → same bucket index).
+
+*(truncated — 53 lines total)*
+
+
+---
+
+## #927 — MQFQ drained-bucket restore loses dropped item's virtual service in multi-pop+tail-drop scenarios [CLOSED] (closed 2026-04-27)
+
+## Problem
+
+When the scratch builder pops multiple items from a single bucket and the LAST item drains the bucket then gets dropped, the surviving earlier item's restore via \`cos_queue_push_front\` takes the \`was_empty\` (drained-bucket) snapshot path. That path restores \`head_finish\` directly from \`snap.pre_pop_head_finish\`, losing the dropped item's "virtual service" contribution. A competing active bucket can then have its scheduling inverted with the restored item.
+
+## Walkthrough
+
+Setup: bucket A has [A1=1000B, A2=2000B] (head_A=1000, tail_A=3000). Competing bucket C has [C=2500B] (head_C=2500).
+
+Scratch builder execution:
+1. Pop A1 (snap_1: A.head=1000). head_A advances to 3000.
+2. Pop C (snap_C: C.head=2500). C.head=tail=0 (drained). vtime=2500.
+3. Pop A2 (snap_2: A.head=3000). A.head=0 (drained, A2 was last). vtime=3000.
+4. **Drop A2** (e.g., frame too big).
+
+Orphan-cleanup helper pops snap_2 and clamps remaining snapshots' \`pre_pop_queue_vtime\` to ≥ 3000.
+
+Restore C via \`cos_queue_push_front\`:
+- Bucket C empty → was_empty=true.
+- snap_C matches → \`C.head = snap_C.pre_pop_head_finish = 2500\`.
+- C.tail = 2500. items_C = [C].
+
+Restore A1 via \`cos_queue_push_front\`:
+- Bucket A empty → was_empty=true.
+- snap_1 matches → \`A.head = snap_1.pre_pop_head_finish = 1000\`.
+- A.tail = 3000. items_A = [A1].
+
+**Resulting state**: A.head=1000, C.head=2500. MQFQ pops min head_finish first → A1 pops before C.
+
+But A2's pop (which was committed) advanced the bucket's frontier to 3000. C was correctly scheduled to come BEFORE virtual time 3000. Restoring A1 to head=1000 puts it ahead of C, **inverting their original scheduling order**.
+
+Correct MQFQ frontier semantics: A's restored frontier should be ≥ A2's served_finish (3000), not 1000. Then C (head=2500) would correctly pop before A1.
+
+## Why this is preexisting (not introduced by #913)
+
+The \`was_empty\` snapshot restore at \`tx.rs:cos_queue_push_front\` predates #913 (verified on master). #913 deliberately preserves the existing snapshot-based restore semantic. The arithmetic-based active-bucket path (which #913 documents as correct under "drops consume virtual service") works correctly for SAME-BUCKET multi-pop scenarios where a successor remains, but the drained-bucket case still uses the stale-restore semantic.
+
+Codex code review of #913 (round-10, \`review-moh12hph-w5ztyx\`) flagged this. Filed as a separate issue per scope discipline.
+
+## Recommended fix
+
+
+*(truncated — 70 lines total)*
+
+
+---
+
+## #929 — test harness: same-class iperf-b mouse-latency reproduction (#911 validation gate) [CLOSED] (closed 2026-05-03)
+
+## Problem
+
+\`test/incus/test-mouse-latency.sh\` is hardcoded to elephants on port 5201 (iperf-a class) and mice on port 7 (best-effort class). This is the CROSS-class scenario.
+
+The actual #911 failure (and the gate that #913, #918, #914, #920 must close) is the SAME-class scenario: elephants and mice both in iperf-b. Without a harness that reproduces same-class load, we can't validate any of those fixes against the real bug.
+
+## Scope
+
+1. Make \`ELEPHANT_PORT\` and \`MOUSE_PORT\` overridable via environment in \`test-mouse-latency.sh\`. Defaults stay at 5201/7 for backwards compatibility with the #905 matrix.
+
+2. Add a CoS firewall term to \`test/incus/cos-iperf-config.set\` that classifies a new mouse port (e.g., 5212) as iperf-b. Or: parameterize the term so \`MOUSE_PORT=5212 MOUSE_CLASS=iperf-b\` injects the right \`set firewall family inet filter bandwidth-output term N from destination-port 5212 then forwarding-class iperf-b\` lines.
+
+3. Add an echo server on the new mouse port (or reuse iperf3's). Plan-stage to decide: TCP echo on 5212 needs a userspace echo daemon on the cluster-userspace-host; or extend the existing port-7 echo service to listen on additional ports.
+
+4. Add a same-class matrix wrapper: \`test/incus/test-mouse-latency-same-class.sh <out_root>\` that runs the same 12-cell matrix as \`test-mouse-latency-matrix.sh\` but with iperf-b on both elephants and mice.
+
+5. Update the gate logic to compute the 2.0× ratio from the same-class data.
+
+## Why this blocks #918/#914/#920 validation
+
+The validation cycle for any fairness fix is:
+
+  1. Build + deploy.
+  2. Run mouse-latency matrix.
+  3. Compute p99(N=128, M=10) / p99(N=0, M=10).
+  4. PASS if < 2.0×, FAIL otherwise.
+
+Currently the matrix only runs cross-class. The cross-class case is dominated by other factors (different schedulers, different shapers); it's not where #918/#914/#920 expect to show improvement. Without same-class measurement, we can't tell whether a fix worked.
+
+## Acceptance
+
+- \`MOUSE_PORT\` and \`ELEPHANT_PORT\` env overrides honored by \`test-mouse-latency.sh\`.
+- \`apply-cos-config.sh\` (or a new wrapper) installs the same-class CoS terms when the same-class harness is invoked.
+- A new echo listener on the same-class mouse port verified reachable.
+- Smoke run: \`MOUSE_PORT=5212 MOUSE_CLASS=iperf-b ./test-mouse-latency.sh 0 1 60 out\` produces a valid \`probe.json\`.
+- Documentation in \`docs/pr/911-iperf-b-harness/\` (or similar) covers the cluster-side echo daemon setup if needed.
+
+## Related
+
+- #911 — umbrella for same-class HOL gate.
+
+*(truncated — 43 lines total)*
+
+
+---
+
+## #936 — Cross-worker MQFQ: shared per-flow vtime across workers (V_min sync alternative) [CLOSED] (closed 2026-05-08)
+
+## Problem
+
+The current per-worker MQFQ design (post-#913, post-#917 V_min sync) has a fundamental limitation for **per-flow service equalization** when a shared_exact class is fully saturated: each worker maintains its own `queue_vtime`, and when all workers are CPU-saturated, all `queue_vtime` values advance at the same byte-rate. V_min sync (#917) only throttles when one worker's vtime is genuinely ahead of peers — which doesn't happen in steady-state saturated operation.
+
+Concrete scenario: worker A carries 1 flow on iperf-c (25 Gb/s shared_exact), worker B carries 3 flows. Both pop at line rate (~333 Kpps × 1500 B ≈ 4 Gb/s of vtime advance per second per worker). V_min sees no lag. No throttle fires.
+
+Per-flow service:
+- A's lone flow: 4 Gb/s (full worker share).
+- B's 3 flows: 1.33 Gb/s each (worker share / 3).
+- **Per-flow CoV remains bad** despite V_min sync being active.
+
+This is the residual gap after #917 lands. Per-flow CoV at iperf-b/iperf-c P=12 is currently 42–62 % (post-#917 cluster smoke), well over the #789 ≤ 20 % gate.
+
+## Proposed approach (REFRAMED — throttling, not work-sharing)
+
+Per Gemini hostile review: this design **only equalizes flows by inducing CPU stalls on the fast workers** — workers servicing fewer flows must wait for workers with more flows to advance their per-flow finish-time. It is NOT a work-sharing mechanism (workers cannot transmit each other's UMEM frames; see `docs/userspace-jit-design.md:442-448`).
+
+### Core mechanism
+
+A single per-flow finish-time table shared across all workers servicing the same shared_exact queue. Each flow's `finish_time` is stored once (in shared memory) instead of per-worker. All workers' MQFQ pop decisions consult the same table. When worker A's lone flow has `finish_time = T`, worker A pops the next packet only when its `finish_time + bytes ≤ V_min` of the shared table (i.e., the flow is not ahead of the slowest flow in the system).
+
+Worker A then **stalls** if it has no other runnable flow at lower finish-time. The stall is the equalization mechanism — A's CPU sits idle until B's flows catch up. CPU efficiency drops on degenerate distributions (1 flow on A, 3 on B → A is idle ~75 % of the time once V_min binds).
+
+### Trade-off explicit
+
+- **Wins**: per-flow CoV approaches 0 if the design is correct.
+- **Loses**: aggregate throughput drops to `min_per_flow_rate × N_flows` when stalls bind. The 1+3 example would cap aggregate at ~5.3 Gb/s (4 × 1.33), not 5.33 + 1 × 4 = 9.3 Gb/s — a 43 % aggregate-throughput hit for fairness.
+
+This is a fundamental limit; the user must agree the trade-off is acceptable BEFORE committing build effort. Compare to #937 (cross-binding redirect) which redistributes flows instead of stalling — strictly better aggregate throughput if feasible.
+
+### Data structure options
+
+#### Option A: lock-free per-flow finish atomic
+
+Each flow has an `AtomicU64 finish_time`. Workers CAS-update on enqueue/dequeue. Per-flow memory: 8 B + cache-line padding (64 B) = 64 B/flow. At 1024 buckets × 100 flows/bucket = 102 400 flows × 64 B = 6.4 MB per shared queue. Memory cost is real but bounded.
+
+Cache contention: each flow's atomic is touched only by the worker(s) that hash to its bucket. With per-flow padding, MOESI traffic is bounded by cross-worker bucket overlap (rare in steady state).
+
+#### Option B: hash-shared per-bucket vtime (REJECTED)
+
+
+*(truncated — 69 lines total)*
+
+
+---
+
+## #937 — Re-evaluate #899 cross-binding flow re-steering — RSS-degenerate case path [CLOSED] (closed 2026-05-27)
+
+## Problem
+
+When NIC RSS hashes flows unevenly across worker-bound AF_XDP queues, one or more workers can receive ZERO flows for a class while others are oversubscribed. The diagnostic at `docs/pr/917-mqfq-phase4/diagnostic.md` recorded this empirically: 12 iperf-c flows distributed 0/2/2/2/3/3 across 6 workers — worker 0 sat fully idle for the entire 20s probe.
+
+**Aggregate throughput is capped** at `(N_active / N_total) × shaper_rate` in this regime. With 5/6 workers active at 25 Gbps shaper, that's a 20.8 Gbps ceiling. This is the sole case the issue addresses; the **P=128 ~17 Gb/s observation has been split into a separate issue** because at P=128 RSS distribution is near-uniform and the bottleneck must be something else (see "Out of scope" below).
+
+In-repo design doc `docs/userspace-jit-design.md:442-448` flags cross-binding in-place rewrite as architecturally impossible: a packet ingressed on binding A's UMEM cannot trivially be transmitted via binding B because B's UMEM doesn't own the frame. `bpf_redirect_map` to a different XSK socket requires same-UMEM or copy-out.
+
+## Re-evaluation
+
+The constraint is real but possibly worked around at the **ingress XDP layer, before UMEM ownership is decided**:
+
+### Option 1: XDP_REDIRECT to per-worker dedicated AF_XDP queue at ingress
+
+A small XDP program on the NIC consults a per-flow → queue map and steers flows BEFORE they enter the worker-bound UMEM. Effectively re-doing RSS at the eBPF layer with our own indirection table (per-flow, not per-hash-class). The redirect happens at the kernel XDP boundary, so UMEM ownership is decided AFTER the redirect.
+
+This is feasible on mlx5 with current kernels (driver supports `xdp_redirect` with `XDP_REDIRECT_MAP` and per-queue AF_XDP sockets via `XSKMAP`). Requires:
+
+- An eBPF program loaded at the NIC's XDP attachment point.
+- An `XSKMAP` indexed by per-worker queue ID.
+- A per-flow override table (LPM trie or hash by 5-tuple) populated by a userspace controller.
+- Fallback to RSS-default when the override table has no entry.
+
+### Option 2: Slow-path re-ingest (rejected)
+
+A worker that detects oversubscription pushes flows to a shared RX queue that any worker can drain. Higher overhead (slow-path copy, extra context switch); doesn't avoid the cross-UMEM problem, just re-locates it. **Reject this option** in the feasibility doc — it's strictly worse than option 1.
+
+### Option 3: Multi-binding-per-worker with hash-redirect (rejected)
+
+Each worker binds to multiple AF_XDP queues; an XDP program at ingress consults a per-flow → queue map. Bypasses NIC RSS entirely. Strictly more complex than option 1 with the same delivery mechanism. **Reject this option** in favor of option 1.
+
+## Out of scope (split off)
+
+- **P=128 ~17 Gb/s mystery**: at P=128, RSS distribution is near-uniform across 6 workers (within ±5 %). The observed throughput ceiling at P=128 cannot be explained by RSS imbalance and points to a different bottleneck — likely cross-bucket vtime contention (#936) or per-worker MQFQ scaling. **A separate issue will be filed** to investigate the P=128 ceiling once #936 is scoped; do not assume #937 fixes P=128.
+
+## Acceptance criteria
+
+This is a **feasibility-and-prototype issue**, not a "ship it" issue. Acceptance is measured by what we LEARN, not by a perf gate.
+
+- [ ] **Feasibility document** explaining whether option 1 is implementable on the loss cluster's mlx5 driver — including kernel version, driver capabilities, and per-packet CPU overhead for the XDP redirect.
+
+*(truncated — 63 lines total)*
+
+
+---
+
+## #938 — Investigate dynamic NIC RSS indirection-table tuning for runtime flow rebalancing [CLOSED] (closed 2026-04-28)
+
+## Problem
+
+iperf3 -P N at low N (12, 32) on shared_exact classes shows high per-flow CoV (49–65 %) because NIC RSS hashes the N source ports unevenly across the 6 worker-bound RX queues. The 12-port test in the diagnostic produced a 0/2/2/2/3/3 distribution; one worker sat idle.
+
+Project memory has \`#840 reverted: tuning the NIC RSS indirection table at runtime can't fix cross-binding skew with long-lived flows\`. The reason: RSS hash is computed at packet ingest based on 5-tuple, and changing the indirection table afterward only redirects FUTURE hash buckets — existing TCP flows' source-port hashes still map to the same indirection slot, which now points to a different queue, but the flow's MID-STREAM packets get redirected to a worker that has no session state for them.
+
+## Re-evaluation possibilities
+
+Despite #840's revert, runtime RSS tuning might still help if combined with session-state migration:
+
+1. **Per-flow XDP-side steering**: keep RSS as-is at the NIC, but an ingress XDP program reads a per-flow override table (set by a userspace controller that detects imbalance) and redirects matching packets to a different AF_XDP queue. The override table is keyed on 5-tuple hash; entries are added when a worker reports oversubscription and removed when the flow ends. This is essentially a hot-path \`bpf_redirect_map\` keyed on a per-flow LRU map.
+
+2. **Toeplitz-key rotation with grace period**: rotate the NIC's Toeplitz hash key on a fixed schedule (e.g. every 60s) to redistribute long-lived flows. Existing flows continue to be served on their pre-rotation queue (via session state) while new flows hash via the new key. Trades one-time disruption for ongoing fairness.
+
+3. **Per-binding queue hints in #899-style design**: if #899 (cross-binding redirect) lands, the NIC RSS table becomes less load-bearing — flows can be re-steered post-RSS.
+
+## Acceptance criteria
+
+- [ ] A measurement experiment showing whether option 1 (per-flow XDP-side override) clears the iperf-b P=12 CoV gate.
+- [ ] If yes: integrate with a userspace controller that detects per-worker imbalance and writes overrides.
+- [ ] No regression on session-state correctness (mid-stream packets must reach the worker holding the session, not be dropped or routed to slow path).
+
+## References
+
+- #840 (reverted runtime RSS tuning attempt).
+- #899 (cross-binding redirect — companion).
+- Diagnostic: \`docs/pr/917-mqfq-phase4/diagnostic.md\`.
+
+---
+
+## #940 — #917 Q1: V_min publish on speculative pop leaks uncommitted vtime to peers [CLOSED] (closed 2026-05-02)
+
+## Problem
+
+`cos_queue_pop_front_inner` at `userspace-dp/src/afxdp/tx.rs:4685-4697` publishes `queue.queue_vtime` to the V_min slot on EVERY pop — both the snapshot variant (speculative; rolls back via `cos_queue_push_front`) and the no-snapshot variant (committed inline).
+
+The current in-code comment at line 4685 argues this is benign: "If a rollback later restores queue_vtime, the rollback path republishes the restored value (see `cos_queue_push_front`)." But that argument only covers peers reading AFTER the rollback completes. Peers reading DURING the speculative window observe the inflated value, compute `v_min + lag` against it, and may continue draining traffic that should have been throttled. The peer's wrong service decisions are NOT undone by the rollback.
+
+Hostile-review consensus (Codex + Gemini) escalated this to **P0 correctness**: the V_min algorithm's invariant is "slot vtime ≤ committed-vtime"; the current code violates that invariant for the duration of the speculative window. Cluster smoke (post-#917) didn't manifest the bug because the speculative window is short relative to peer K=8 read cadence, but the correctness story is muddier than plan §3.2 v3 specified ("publish only at commit boundary").
+
+## Fix scope
+
+**Move publish to a precise commit boundary.** The boundary is **NOT** "end of scratch builder" — Gemini's review correctly notes that scratch-builder completion only means the items are queued for submission, not actually transmitted. The right boundary in AF_XDP terms is **after the TX descriptor is committed to the TX ring (producer head bumped) AND the kernel has been kicked via `sendto()` if `needs_wakeup` is set**. Settle (completion-ring drain) is a stronger boundary but is not required — once the TX-ring descriptor is committed, the frame's vtime advance is no longer speculative.
+
+Concrete plan:
+
+1. Remove the publish at `tx.rs:4685-4697` (snapshot variant).
+2. Keep the publish on the rollback path at `tx.rs:4483-4490` so peers see the corrected vtime after a rollback.
+3. Add a publish at the TX-ring commit site for committed Local frames — after the producer head has been advanced and the `sendto()` kick (if needed) has been issued. Concretely: in the post-scratch submit path that pushes the scratch batch onto the TX ring, after the producer-head update, iterate the queues whose vtime advanced this batch and publish their committed `queue_vtime`.
+4. Audit ALL pop paths and enumerate every site that mutates `queue_vtime` to ensure every committed mutation publishes exactly once and no speculative mutation publishes at all:
+   - `cos_queue_pop_front` (snapshot variant) — REMOVE publish, add at TX commit.
+   - `cos_queue_pop_front_no_snapshot` — currently publishes via the same `pop_front_inner` path; this is committed-inline (used by `drain_all` teardown), so the publish stays but verify the call site is post-commit.
+   - `cos_queue_push_front` rollback path — KEEP publish (republishes restored vtime).
+   - `account_cos_queue_flow_dequeue` and any other vtime mutation — verify no implicit publish required.
+
+## Acceptance criteria
+
+- [ ] No publish on speculative pop. Verified by code audit and a unit test that pops with snapshot, asserts the slot is unchanged, then rolls back.
+- [ ] Publish at the TX-ring commit boundary (post producer-head update + `sendto()` kick). Verified by a unit test that constructs a snapshot pop → TX-ring commit sequence and asserts the slot is updated only after the producer head has been advanced.
+- [ ] Micro-benchmark: per-pop CPU cost MUST NOT regress more than 1 % vs current pop_front_inner cost. (V_min publish is on the hot path; moving it must not relocate cost into a tighter inner loop.)
+- [ ] Cluster smoke confirms iperf-b retx still 0 and iperf-c P=12 throughput still ≥ 22 Gb/s.
+- [ ] No new failures across the existing #785 / #913 / #917 test suites.
+
+## Why deviated in PR #939
+
+The plan §3.2 v3 specified commit-only publish; PR #939 landed pop-time publish for performance simplicity (one less branch on the commit path, no need to thread a "frames to publish for" list through the TX completion path). This needs to be reverted to the planned design — performance regression analysis was not done at landing time. If the commit-boundary publish does regress >1 % per the micro-benchmark gate above, file a follow-up issue justifying the tradeoff and document it in the #785 retrospective at `tx.rs:5604-5683`.
+
+## References
+
+- #917 PR #939 commit cfc05beb (Phase 3 publish hooks).
+- Plan: `docs/pr/917-mqfq-phase4/plan.md` §3.2 v3.
+- Codex review (rescue task-moi6t96o): "define commit boundary precisely (actual submit/settle, not end of scratch builder); enumerate all publish paths".
+
+*(truncated — 46 lines total)*
+
+
+---
+
+## #941 — #917 Q2+Q3: V_min unbounded throttle vs stale slot (missing vacate) [CLOSED] (closed 2026-05-02)
+
+## Problem
+
+Two paired correctness issues in the V_min sync from PR #939, both confirmed P0 by independent Codex + Gemini hostile review:
+
+### Bug 1: missing vacate
+
+`PaddedVtimeSlot::vacate()` exists at `userspace-dp/src/afxdp/types.rs:1453-1455` with the correct `Ordering::Release` store of `NOT_PARTICIPATING`, but **is never called anywhere in the codebase**. Verified: `grep -rn '\.vacate()' userspace-dp/src/` returns only the definition, no call sites.
+
+When a worker's last bucket on a shared_exact queue empties, the slot stays at the last published `queue_vtime` — never reset to `NOT_PARTICIPATING`. The worker is "phantom-participating" forever (until it gets new flows on this queue OR the binding tears down).
+
+### Bug 2: unbounded early-break throttle
+
+`cos_queue_v_min_continue` at `tx.rs:5722` returns false when local vtime > peer-min + lag. Caller breaks out of the queue's drain (see `tx.rs:2635` for the wiring). With Bug 1 above, a phantom worker's stale low slot pegs V_min indefinitely; the fast worker throttles every drain pass forever.
+
+Plan §3.6 v3 specified a hard cap of 8 consecutive reparks (≈ 400 µs upper bound on V_min-induced mouse latency). The PR's Phase 4 chose early-break instead of timer-wheel park, which removes the natural escape hatch the plan specified.
+
+In cluster smoke this didn't manifest because workloads kept all workers active. Degenerate case: worker truly idle on this queue while peers are heavy → throttle stalls heavy workers indefinitely.
+
+## Fix scope (split into three work items)
+
+**Per Codex + Gemini:** these are distinct concerns and should land as separate commits within one PR.
+
+### Work item A: bucket-empty vacate
+
+- Hook into `account_cos_queue_flow_dequeue` (`tx.rs:4284`) at the point where the worker's last non-empty bucket transitions to empty on a shared_exact queue. The hook reads `queue.flow_rr_buckets.is_empty()` post-dequeue — when true and `queue.shared_exact`, call `floor.slots[worker_id].vacate()`.
+- **Symmetric first-enqueue publish (NEW work — no existing hook covers this).** The current code only publishes from `cos_queue_pop_front_inner` (tx.rs:4685, post-pop) and `cos_queue_push_front` (tx.rs:4483, rollback). There is NO existing publish on the 0→≥1 enqueue transition. Without one, after a `vacate()` the slot stays at `NOT_PARTICIPATING` until the worker pops a packet — peers see the worker as idle and may starve waiting for it to participate. Add a publish at `account_cos_queue_flow_enqueue` (`tx.rs:4234`) when bucket-count transitions 0→1 on a shared_exact queue: publish the current `queue_vtime` to re-establish participation.
+
+### Work item B: HA-demotion vacate
+
+- On RG demotion (HA failover), the `coordinator.rs` demotion path must only **signal** the affected worker to vacate; the worker then iterates its OWN owned shared_exact queues and calls `vacate()` on its own slots at the next drain-cycle boundary. This matches plan §3.7's same-writer publish/vacate invariant — only the slot's owning worker writes its slot, never the coordinator thread.
+- Mechanism: extend the existing demotion `WorkerCommand` (or add a new variant) so coordinator enqueues a `VacateAllSharedExactSlots` command; worker drains its command queue at drain-cycle start and processes the vacate before the next pop.
+- Verify interaction with `demote_prepared_cos_queue_to_local` (#926): that path is for prepared→local demotion within a worker, not HA demotion. Separate code path.
+
+### Work item C: hard-cap escape hatch
+
+- Track `consecutive_v_min_skips: u32` per `CoSQueueRuntime`.
+- Increment on `cos_queue_v_min_continue` returning false (early-break taken).
+- Reset on successful pop (V_min check passes or NOT_PARTICIPATING means no peer).
+- After 8 consecutive skips, force-continue (drain the queue this batch even if V_min says throttle). Bounds the worst-case stall at 8 × drain-batch-time ≈ 400 µs.
+- Make the 8 a `const` named `V_MIN_CONSECUTIVE_SKIP_HARD_CAP` so it's adjustable without searching the code, but do NOT make it runtime-configurable in the first PR (Codex flagged premature config knobs).
+
+*(truncated — 77 lines total)*
+
+
+---
+
+## #942 — #917 Q6: V_min check missing from Prepared scratch builder [CLOSED] (closed 2026-05-02)
+
+## Problem
+
+Phase 4 of PR #939 wired `cos_queue_v_min_continue` only into `drain_exact_local_items_to_scratch_flow_fair` (the Local-flow path) at `userspace-dp/src/afxdp/tx.rs:2635`. The Prepared scratch builder `drain_exact_prepared_items_to_scratch_flow_fair` at `tx.rs:2805-2901` has NO `v_min_continue` check.
+
+Verified:
+
+```
+$ grep -n "cos_queue_v_min_continue" userspace-dp/src/afxdp/tx.rs
+2635:        if !cos_queue_v_min_continue(queue, v_min_pop_count) {
+5722:fn cos_queue_v_min_continue(queue: &CoSQueueRuntime, pop_count: u32) -> bool {
+```
+
+Only the Local-flow drain path consults V_min. Confirmed both `drain_exact_prepared_items_to_scratch_flow_fair` (flow-fair Prepared variant, tx.rs:2805) and `drain_exact_prepared_fifo_items_to_scratch` (FIFO Prepared variant, tx.rs:2706) bypass the throttle.
+
+`drain_exact_prepared_items_to_scratch_flow_fair` visits shared_exact queues after `promote_cos_queue_flow_fair` (tx.rs:5612), while the FIFO Prepared variant (`drain_exact_prepared_fifo_items_to_scratch`, tx.rs:2706) is unreachable for shared_exact (`debug_assert!(!queue.flow_fair)` at tx.rs:2717 and `flow_fair = queue.exact` at tx.rs:5622-5623; shared_exact implies `exact = true` therefore `flow_fair = true`). For Prepared traffic routed through the flow-fair path (TCP retransmit bursts that take the prepared snapshot rebuild path, BGP/control packets, anything pushed via PreparedTxRequest), V_min sync does not apply today, so the throttle is selectively enforced — fairness invariant violated on the flow-fair Prepared path only.
+
+## Why cluster smoke didn't catch this
+
+The iperf3 -P workload generates predominantly Local-path traffic (fresh TCP segments via the Local enqueue path). The Prepared path is exercised by:
+
+- Retransmits that take the prepared-rebuild path (rare in healthy cwnd state — and #917 V_min sync wiped retx anyway, masking this gap).
+- Control-plane packets (BGP, OSPF) — low rate, doesn't measurably affect CoV.
+- HA-failover replay traffic — not exercised in steady-state smoke.
+
+So the bug is real but the smoke workload has very little Prepared traffic to surface it. A degenerate-case workload (lossy link + heavy retx, or HA-replay storm) would expose the unfairness.
+
+## Fix scope
+
+Mirror the Local-path V_min wiring in both Prepared drain paths.
+
+### Specific edits
+
+In `drain_exact_prepared_items_to_scratch_flow_fair` (tx.rs:2805):
+
+- After `pop_snapshot_stack.clear()` at line 2822, add `let mut v_min_pop_count = 0u32;`.
+- At the top of the `while` loop at line 2826, add:
+  ```rust
+  v_min_pop_count = v_min_pop_count.saturating_add(1);
+  if !cos_queue_v_min_continue(queue, v_min_pop_count) {
+      break;
+
+*(truncated — 66 lines total)*
+
+
+---
+
+## #943 — #917 Q8c: Add v_min_throttles per-binding telemetry counter [CLOSED] (closed 2026-05-02)
+
+## Problem
+
+Phase 4 of PR #939 added the V_min sync read path with throttle action (early-break out of queue drain) but no observability counter. Per plan §3.5 / §6.6, a `v_min_throttles` counter should expose how often the throttle fires, both for diagnosing imbalance regimes and for validating that the throttle isn't firing constantly (LAG_THRESHOLD too tight).
+
+Hostile review (Codex + Gemini) refined the requirement: **two distinct counters** are needed once #941's hard-cap escape hatch lands.
+
+## Fix scope
+
+### Two counters, not one
+
+1. **`v_min_throttles`** — incremented when `cos_queue_v_min_continue` returns false AND the caller takes the early-break path (i.e., V_min throttle actually fired, draining stopped).
+2. **`v_min_throttle_hard_cap_overrides`** — incremented when V_min would have throttled but #941's hard-cap forced the drain to continue. This counter is the only way to validate that the hard-cap is firing as designed and not pegged at maximum (which would indicate a runaway phantom-participating worker or a too-tight LAG_THRESHOLD).
+
+### Per-worker granularity, not per-binding
+
+Per Gemini review: V_min logic operates per-worker. To diagnose fairness issues, operators must see WHICH worker is throttling and which is being throttled. Wiring path:
+
+- Per-worker increment site: `cos_queue_v_min_continue` and the hard-cap path in #941, both inside per-worker drain loops.
+- Per-worker accumulator on `WorkerCoSQueueFastPath` or equivalent per-worker scratch struct.
+- Per-binding flush in `update_binding_debug_state` at `userspace-dp/src/afxdp/umem.rs:2526` aggregates across workers AND publishes per-worker into new `BindingLiveState` fields.
+- Snapshot path: include both aggregate (binding-wide) and per-worker breakdown in `BindingCountersSnapshot` so the gRPC consumer can render per-worker.
+
+### Wiring template
+
+Mirror the existing #918 `flow_cache_collision_evictions` pipeline:
+
+1. Add `v_min_throttles: AtomicU64` and `v_min_throttle_hard_cap_overrides: AtomicU64` to `BindingLiveState` in umem.rs (the struct definition is at `userspace-dp/src/afxdp/umem.rs:1763`; the existing `flow_cache_collision_evictions` field is at umem.rs:1797).
+2. Add per-worker fields (`Vec<AtomicU64>` indexed by worker_id) for per-worker breakdown — OR — accept a single AtomicU64 per binding with separate per-worker scratch counters that flush in via `update_binding_debug_state` (umem.rs:2526). Pick whichever has lower hot-path cost; current `flow_cache_collision_evictions` uses scratch+flush.
+3. Add the counters to `BindingStatus` and `BindingCountersSnapshot` in `userspace-dp/src/protocol.rs`.
+4. Mirror in `pkg/dataplane/userspace/protocol.go` for the Go-side consumer.
+5. Increment `v_min_throttles` in `cos_queue_v_min_continue` (or its caller, after early-break is taken).
+6. Increment `v_min_throttle_hard_cap_overrides` at the hard-cap site introduced by #941.
+
+Per-queue companion `v_min_skip_count` on `CoSQueueDropCounters` is OPTIONAL — useful for per-class diagnosis but not required for the acceptance gate.
+
+## Acceptance criteria
+
+- [ ] Both counters visible via the standard `show services userspace-dp ...` snapshot consumer (gRPC + CLI).
+- [ ] Per-worker breakdown visible in the snapshot.
+- [ ] Cluster smoke: `v_min_throttles` non-zero when V_min sync is active under load (e.g., post-#940/#941 cluster smoke).
+
+*(truncated — 63 lines total)*
+
+
+---
+
+## #944 — Investigate iperf-c P=128 ~17 Gb/s ceiling (split from #937 — non-RSS bottleneck) [CLOSED] (closed 2026-05-05)
+
+## Problem
+
+iperf-c P=128 has been observed at ~17 Gb/s aggregate on the loss cluster userspace dataplane (vs the 22 Gb/s gate). At P=128, NIC RSS distribution across 6 workers is near-uniform (within ±5 %), so this throughput ceiling **cannot be explained by RSS imbalance** (which dominates at P=12).
+
+This was originally folded into #937 as a single observation. Hostile review (Gemini) split it out: the P=12 ceiling is a known RSS issue (#937 addresses it), but the P=128 ceiling has an unidentified root cause and deserves separate investigation.
+
+## Hypotheses to test
+
+1. **Per-worker MQFQ scaling cost**: at 128 flows / 6 workers ≈ 21 flows/worker, the per-worker MQFQ active-bucket scan (`flow_rr_buckets`) costs more cycles per pop. Profile `cos_queue_min_finish_bucket` (`tx.rs:4615`) hot-path cost vs flow count.
+2. **Cross-bucket vtime contention** on shared_exact queues: with more buckets active, the `flow_bucket_*_finish_bytes` arrays see more cache traffic. Measure LLC-load-misses per packet at P=12 vs P=128.
+3. **TX completion ring / outstanding-TX saturation**: at higher pps, the completion-ring drain may bottleneck. Check per-binding `outstanding_tx` / `debug_outstanding_tx` (umem.rs:1892, exposed via the binding snapshot at coordinator.rs:1473-1494). When `outstanding_tx / tx_ring_capacity` approaches 1.0 the producer is stalling on the completion ring. Compare P=12 vs P=128 averages.
+4. **Flow cache thrashing** (#918): 128 flows / 1 binding could exceed the L1d-tuned associative cache capacity. Check `flow_cache_collision_evictions` counter.
+5. **Admission control overhead**: more flows → more per-flow share calculations in `cos_queue_flow_share_limit` (`tx.rs:4125`). Profile.
+
+## Acceptance criteria
+
+This is a **diagnostic-first** issue, not a fix issue.
+
+- [ ] Reproduce the P=128 ~17 Gb/s observation on the loss cluster (verify it's still a thing post-#917 — possible the post-#917 changes already moved this).
+- [ ] Per-pop CPU profile at P=12 vs P=128 across the 5 hypotheses above. Identify which dominates.
+- [ ] Diagnostic doc at `docs/pr/944-p128-ceiling/diagnostic.md` summarizing findings.
+- [ ] Fix proposal as a follow-up issue (or close NEEDS-NO-FIX if measurement says the ceiling is acceptable / already addressed).
+
+## References
+
+- Split out from #937 per Gemini hostile review: "P=12 RSS-degeneracy and P=128 ceiling are different bottlenecks".
+- Post-#917 findings: `docs/pr/917-mqfq-phase4/findings-post-917.md` (P=128 not measured post-#917; that's the first task).
+
+## Priority
+
+**P2** — diagnostic; output is whether to file a fix issue or close as known-limit. Should run after the V_min correctness fixes (#940, #941, #942, #943) land so the measurement isn't confounded by those bugs.
+
+
+---
+
+## #945 — Refactor: Apply Context Object Pattern to eliminate 31-Parameter God Function [CLOSED] (closed 2026-05-03)
+
+## The 'Amateur' Anti-Pattern
+In `userspace-dp/src/afxdp.rs`, the `poll_binding_process_descriptor` function takes an absurd **31 parameters**. From a CPU architecture perspective, this forces the x86_64 compiler to spill 25 arguments to the stack (memory) on every single packet, destroying instruction-per-cycle (IPC) efficiency. From an application design perspective, this is a textbook **God Function** and violates the Single Responsibility Principle (SRP).
+
+## The Design Pattern Fix: Context Object
+You must encapsulate these parameters into cohesive context structures. This reduces the function signature, improves cache locality (if the struct is padded correctly), and makes the function independently testable without mocking 31 variables.
+
+### Implementation Plan
+1. Create a `WorkerContext<'a>` struct that holds read-only, lifetime-bound references to the static/RCU state (`forwarding`, `binding_lookup`, `validation`, etc.).
+2. Create a `PacketContext` struct that holds the mutable, per-packet state (`desc`, `meta`, `scratch_recycle`, parsed headers).
+3. Refactor the signature to: `fn process_packet(worker_ctx: &WorkerContext, pkt_ctx: &mut PacketContext)`.
+4. Group related mutable fields (like `dbg` and `counters`) into a `TelemetryContext`.
+
+---
+
+## #946 — Refactor: Pipeline / Chain of Responsibility Pattern for Vector Packet Processing [CLOSED] (closed 2026-05-05)
+
+## The 'Amateur' Anti-Pattern
+The `worker_loop` processes a single packet entirely from RX -> Parse -> NAT -> Route -> CoS -> TX in a monolithic block. This is scalar processing. From a CPU architecture perspective, the L1-Instruction cache (L1i) thrashes as you load the instructions for parsing, then routing, then CoS, only to start over at parsing for the next packet. This violates the Open/Closed Principle (OCP)—adding a new stage requires modifying the God function.
+
+## The Design Pattern Fix: Pipeline / Chain of Responsibility
+You must refactor to a **Graph-Node Pipeline** (like Cisco VPP or DPDK `rte_graph`). The processing loop should iterate over *batches* of packets per stage, not stages per packet.
+
+### Implementation Plan
+1. Define a `Trait PipelineStage { fn process_batch(&mut self, batch: &mut PacketBatch, ctx: &WorkerContext); }`.
+2. Break the monolithic loop into separate stages: `RxStage`, `ParseStage`, `LookupStage`, `NatStage`, `CosStage`, `TxStage`.
+3. The worker loop becomes:
+   ```rust
+   let mut batch = rx_stage.pull_batch();
+   for stage in &pipeline {
+       stage.process_batch(&mut batch, &ctx);
+   }
+   ```
+4. This ensures that the instructions for `ParseStage` stay hot in the L1i cache for all 64 packets before moving to the next stage, yielding massive IPC gains and perfect branch prediction.
+
+---
+
+## #947 — Refactor: Strategy Pattern for Protocol Parsing (Decouple L2/L3/L4 parsing) [CLOSED] (closed 2026-05-05)
+
+## The 'Amateur' Anti-Pattern
+Around line 890 in `userspace-dp/src/afxdp.rs`, you are doing inline byte-shifting, indexing, and magic number checks to parse ARP, ICMPv6, and TCP flags directly inside the main poll loop. This tightly couples the forwarding orchestration to the binary layout of L2/L3/L4 protocols, violating the Single Responsibility Principle (SRP) and making the code fragile and untestable.
+
+## The Design Pattern Fix: Strategy Pattern
+You need to decouple the *extraction* of protocol metadata from the *handling* of that metadata.
+
+### Implementation Plan
+1. Create a `parser.rs` module.
+2. Define a `Trait ProtocolParser { fn parse(&self, payload: &[u8], meta: &mut ParsedHeaders); }`.
+3. Implement concrete strategies: `ArpParser`, `Ipv4Parser`, `Ipv6Parser`, `GreParser`.
+4. The main loop calls a `parser.parse(raw_frame)` which returns a cleanly structured `ParsedHeaders` struct (with Offsets, EtherType, Protocol, and Flags).
+5. The orchestration loop then switches purely on the `ParsedHeaders` struct, completely isolated from the raw byte offsets. This allows new encapsulation formats (VXLAN, Geneve) to be added without touching the core forwarding logic.
+
+---
+
+## #948 — Refactor: Mediator / Message Broker Pattern to decouple Control Plane from Data Plane [CLOSED] (closed 2026-05-16)
+
+## The 'Amateur' Anti-Pattern
+Your fast-path worker loop takes raw Linux file descriptors like `conntrack_v4_fd: c_int` as arguments. This is a severe architectural bleed. The Rust high-speed dataplane is directly manipulating BPF maps and performing syscalls on the critical path to communicate with the Go manager. This tightly couples the Data Plane (dumb, fast packet moving) to the Control Plane (slow, complex state management).
+
+## The Design Pattern Fix: Mediator / Message Broker
+You must decouple these domains using asynchronous, lock-free message passing. The worker loop should never perform a syscall or interact directly with kernel BPF maps.
+
+### Implementation Plan
+1. Implement a **Lock-Free SPSC (Single-Producer Single-Consumer) Ring Buffer** between each Rust worker and the Go control plane (or a dedicated Rust slow-path orchestrator thread).
+2. The Data Plane (Worker) acts purely as a Producer. When a new session is needed, or a neighbor is missing, it constructs an `Event::NeighborMiss(IP)` or `Event::NewSession(5Tuple)` and pushes it to the ring buffer.
+3. A separate background thread (the Mediator) consumes these events, performs the slow BPF map updates, handles the netlink sockets, and then pushes the resulting state changes back to the workers via the RCU mechanism (Issue #948).
+4. This ensures the worker loop never blocks on a syscall or map update.
+
+---
+
+## #949 — Refactor: Read-Copy-Update (RCU) / Immutable State Pattern for Fast-Path Locks [CLOSED] (closed 2026-05-16)
+
+## The 'Amateur' Anti-Pattern
+You are passing `Arc<Mutex<FastMap<...>>>` directly into the hot path (e.g., `dynamic_neighbors`, `shared_sessions`). From an OS and CPU architecture perspective, this is a catastrophic design failure. A `Mutex` compiles to `LOCK CMPXCHG`. Every worker taking this lock asserts exclusive ownership of the cache line across the QPI/UPI bus (the MESI 'M' state), violently stalling every other core on the socket.
+
+## The Design Pattern Fix: Read-Copy-Update (RCU) / State Pattern
+**Never use locks on the fast path.** You must transition to an RCU-based immutable state pattern or a wait-free concurrency model.
+
+### Implementation Plan
+1. For Configuration and Routing state: The control plane (Go manager / slow path) builds a completely new, immutable routing table instance. It then performs an atomic pointer swap (`ArcSwap` or `crossbeam-epoch`). The workers read the pointer lock-free.
+2. For Shared Sessions / Dynamic Neighbors: Implement a **Sharded Lock-Free Hash Map**. 
+   - Replace the global Mutex with `[Mutex<FastMap<...>>; 64]`.
+   - Shard the lookups by `hash(IP) % 64`.
+   - This ensures that workers rarely contend for the same cache line, effectively eliminating cross-core bus locks while maintaining thread safety.
+
+---
+
+## #956 — Refactor: Deconstruct tx.rs God File into CoS Subsystems (MQFQ, Shaper, Admission) [CLOSED] (closed 2026-04-30)
+
+## The 'Amateur' Architecture
+`userspace-dp/src/afxdp/tx.rs` is an **18,000-line monstrosity**. It attempts to handle everything from cross-worker MPSC redirection, token-bucket shaping, MQFQ virtual-time calculations, ECN admission control, and raw XSK descriptor popping in a single file. 
+
+From an OS/CPU design perspective, dumping all these unrelated concerns into a single translation unit ruins the compiler's ability to reason about lifetimes and inlining, and from a human perspective, it's unmaintainable. 
+
+## The Design Pattern Fix: Cohesive Submodules
+You must break this file into a dedicated `cos/` module. The Class of Service (CoS) subsystem is a pipeline of independent algorithms. 
+
+### Implementation Plan
+Create `userspace-dp/src/afxdp/cos/` with the following explicit boundaries:
+1. **`cos/shaper.rs`**: Owns the Timer Wheel, the `SharedCoSRootLease`, and all `tokens` calculations. This is purely responsible for determining *when* a queue is eligible.
+2. **`cos/mqfq.rs`**: Owns the `V_min` atomics, the bucket arrays, and the `queue_vtime` arithmetic. It strictly answers *which flow* should be popped next from an eligible queue.
+3. **`cos/admission.rs`**: Owns the WRED/ECN logic and flow-share caps. It intercepts incoming packets and returns a binary Admit/Drop/Mark decision.
+4. **`cos/redirect.rs`**: Owns the MPSC inbox logic for `shared_exact` queues (`redirect_prepared_cos_request_to_owner`).
+5. **`cos/drain.rs`**: The orchestrator that calls `admission`, `shaper`, and `mqfq` to build the final `CoSBatch` for XSK transmission.
+
+---
+
+## #957 — Refactor: Modularize afxdp.rs and worker.rs Core Loops (RX/Validation/SlowPath Separation) [CLOSED] (closed 2026-05-02)
+
+## The 'Amateur' Architecture
+`userspace-dp/src/afxdp.rs` and `worker.rs` are huge procedural loops. The core `poll_binding_process_descriptor` function is entangled with ARP probe dispatching, netlink raw socket manipulation, ICMP validation, and UMEM frame lifecycle management. 
+
+From an OS design perspective, mixing raw socket operations (slow path / control plane) with XSK packet processing (fast path / data plane) in the exact same file creates a caching nightmare. The instruction working set for 'handling a new ARP entry' evicts the instruction working set for 'popping a 100G iperf3 batch.'
+
+## The Design Pattern Fix: Fast-Path vs Slow-Path Isolation
+The `afxdp/` module must enforce a strict separation between the XSK data plane loop and the asynchronous/reactive control plane events.
+
+### Implementation Plan
+1. **Extract `afxdp/rx_burst.rs`**: Isolate the logic for touching the `dev.rx.receive()` and `dev.fill.produce()`. This file should strictly return a batch of validated descriptors and nothing else.
+2. **Extract `afxdp/slowpath.rs` (or `neigh.rs`)**: Move `trigger_kernel_arp_probe` and `add_kernel_neighbor` out of the fast path file. These use `libc::socket` and `libc::sendto`. They should run asynchronously or be strictly isolated to prevent polluting the L1-i cache of the worker loop.
+3. **Extract `afxdp/validation.rs`**: Move `try_parse_metadata` and `classify_metadata`. This is pure, testable packet header parsing that has no business sitting next to MPSC channel logic in `afxdp.rs`.
+
+---
+
+## #958 — Refactor: Abstract Cross-Core Redirection (MPSC) into Isolated Submodule [CLOSED] (closed 2026-05-02)
+
+## The 'Amateur' Architecture
+In `tx.rs` and `worker.rs`, you handle `shared_exact` CoS queues using `redirect_prepared_cos_request_to_owner`, pushing descriptors into an MPSC channel (`scratch_cross_binding_tx`).
+
+This logic is mixed directly with standard flow processing and local queue draining. From an OS/NUMA design perspective, moving descriptors across cores is a **L3 Cache Coherency event (MESI Read-For-Ownership)**. Mixing cross-core synchronization logic with hot-path L1-bound packet processing destroys instruction cache locality and makes performance debugging nearly impossible.
+
+## The Design Pattern Fix: Cross-Core Ring Isolation
+You must abstract all cross-core communication into a dedicated, NUMA-aware submodule (`userspace-dp/src/afxdp/cross_core.rs` or similar). The fast path should just call `cross_core::enqueue(owner_id, request)`.
+
+### Implementation Plan
+1. **Extract `afxdp/cross_core.rs`**: Move `redirect_local_cos_request_to_owner`, `redirect_prepared_cos_request_to_owner`, and the MPSC draining loops (`reap_tx_completions` inter-worker logic) here.
+2. **Cache-Aligned Queues**: Ensure that the cross-core queues are padded to 64 bytes (`#[repr(align(64))]`) to prevent false sharing when multiple workers push to the same owner worker.
+3. **Decouple from `tx.rs`**: `tx.rs` should only focus on scheduling packets onto the hardware ring (XSK), not moving packets across the motherboard interconnect.
+
+---
+
+## #959 — Refactor: Deconstruct BindingWorker into Cache-Aligned Substructs [CLOSED] (closed 2026-05-03)
+
+## The 'Amateur' Architecture
+The `BindingWorker` struct in `userspace-dp/src/afxdp/worker.rs` is a massive God Struct. It contains over 30 fields, including OS-level XDP ring handles, MPSC queues, pre-allocated scratch arrays, shaping engine state, and telemetry counters—all jammed into a single flat struct.
+
+From an OS/CPU design perspective, passing `&mut BindingWorker` to a function grants the compiler mutable aliasing over everything. Worse, fields that are never accessed together (like `dbg_fill_failed` and `tx_submit_ns`) are packed next to each other, wasting cache lines and causing spatial locality misses during the hot path.
+
+## The Design Pattern Fix: Component Composition
+You must break `BindingWorker` into cohesive, optionally cache-aligned sub-components.
+
+### Implementation Plan
+1. **`XskRings`**: Encapsulate `device`, `rx`, `tx`, `umem` inside a struct. Add `#[repr(align(64))]` if they are accessed independently across stages.
+2. **`ScratchSpace`**: Move the 9+ `scratch_*` vectors into a `WorkerScratch` struct. Pass this struct only to the stages that need it.
+3. **`CosEngine`**: Move `cos_interfaces`, `cos_fast_interfaces`, `cos_interface_rr`, and `cos_nonempty_interfaces` into a `ShaperEngine` struct. This prevents the shaping logic from accidentally accessing XDP handles directly.
+4. **`Telemetry`**: Group all counters and timers (`last_tx_wake_ns`, `empty_rx_polls`, `dbg_*`) into a `WorkerTelemetry` block to keep them off the critical execution path cache lines.
+
+---
+
+## #960 — Profile-driven audit: which control-plane syscalls actually appear in fast-path perf? [CLOSED] (closed 2026-05-05)
+
+**Follow-up to #948.** Codex investigation (`task-moji255s-8v77n8`) found that the worker fast-path is dominated by AF_XDP wakeups (already heavily gated), and the "control-plane syscalls" the issue is concerned about (BPF map updates, netlink, conntrack writes, dnat updates) all fire per-session/per-neighbor — not per-packet. There's no empirical evidence today that a sweeping mediator/SPSC refactor is justified.
+
+This issue: gather the data first.
+
+## Tasks
+
+1. Run `perf stat` + `perf trace` on the userspace-dp worker thread under sustained 25 Gb/s + heavy session churn (e.g., short-lived TCP via `iperf3 -P 128` with reconnect loop).
+2. Categorize syscall hits per second by source (BPF map fd, netlink fd, conntrack fd, AF_XDP ring fd, etc.).
+3. Identify any specific call site whose syscall rate exceeds, say, 10 K/s — those are candidates for SPSC offload.
+4. Per candidate, decide: is the cost actually material, or is it overshadowed by ring-bottom poll cost?
+
+## Why not just do the SPSC refactor anyway
+
+Investigation comment on #948 covers this. tl;dr: 600-1000 LOC, real correctness risk on session-install ordering, no perf evidence the existing direct-syscall pattern is the bottleneck. Premature.
+
+## Out of scope
+
+- The full mediator/SPSC redesign in #948.
+- Any code change. This issue is data-gathering only.
+
+---
+
+## #961 — Extract PacketContext: explicit per-packet ownership state machine [CLOSED] (closed 2026-05-27)
+
+**Follow-up to #946** and natural successor to #945. Codex investigation (`task-moji2h39-79ig86`) found that AF_XDP frame ownership is encoded across 4 different types (`PendingForwardRequest`, `PendingForwardFrame`, `PreparedTxRequest.recycle`, `PendingNeighPacket`). A "release at last stage" pipeline is too simple given this ownership graph.
+
+The first concrete step toward any future pipeline / VPP-style refactor (#946) — and the natural successor to the #945 Context Object work — is making per-packet ownership explicit.
+
+## Tasks
+
+1. Define a `PacketContext<'a>` type that owns the per-packet state machine across the current inline pipeline:
+   - Frame address + length
+   - Parsed metadata (`UserspaceDpMeta`)
+   - Parsed headers (replaces inline byte access)
+   - Ownership state: `Live` (in RX ring) → `Owned` (post-release, retained for forward) → `Prepared` (TX-ready) → `Recycled` (back to fill ring)
+2. Refactor `poll_binding_process_descriptor` to thread `PacketContext` through the per-descriptor loop instead of raw locals.
+3. NO behavior change. Compile-time-checked ownership transitions only.
+
+## Why this and not the full pipeline
+
+#946 framed itself as a VPP-style graph rewrite. That is a multi-month redesign and was deferred. But the PRECONDITION for any such redesign — having explicit ownership types — is a focused, mechanical refactor with real value standalone (clarity, testability) regardless of whether the larger pipeline ever happens.
+
+## Out of scope
+
+- Stage trait, Stage::process_batch, batched dispatch.
+- Anything in #946 beyond the ownership type itself.
+- Mouse-latency or contention measurement (this is a refactor, not a perf change).
+
+## Acceptance gates
+
+- `cargo test --release` clean.
+- Cluster smoke (P=12 ≥22 Gb/s, P=1 ≥6 Gb/s, iperf-b ≥9.5 Gb/s 0 retx).
+- Codegen diff: stack frame size unchanged or smaller.
+- Codex+Gemini hostile reviews.
+
+---
+
+## #963 — Refactor: Frame Rewriting is a God Function — Missing Builder/State Pattern for Packet Mutability [CLOSED] (closed 2026-05-05)
+
+## The 'Amateur' Architecture
+In `userspace-dp/src/afxdp/frame.rs`, `rewrite_forwarded_frame_in_place` is a massive God Function. It handles L2 (VLAN parsing), L3 (IPv4 vs IPv6 branching, TTL decrements), L4 (port restoration, TCP/UDP checksums), and NAT rewriting all in a single block of highly branchy code. 
+
+From a CPU architecture perspective, evaluating a giant `match meta.addr_family` and checking `if vlan_id > 0` deep inside the rewriting logic forces the CPU to evaluate unpredictable branches. Instruction cache utilization is terrible because the code handles every possible permutation of a packet instead of specializing.
+
+## The Design Pattern Fix: Packet Editor / Builder Pattern
+You must refactor this into a specialized, state-driven `PacketEditor` or `FrameBuilder`.
+
+### Implementation Plan
+1. **Extract Specialized Editors**: Create `Ipv4Editor` and `Ipv6Editor`. The hot path should dispatch to the correct editor *once*, early in the pipeline.
+2. **Remove Inline Branches**: Instead of `eth_len = if vlan_id > 0 { 18 } else { 14 }`, this offset should be resolved *once* during the `ParseStage` (Issue #946) and passed as a fixed cursor.
+3. **Decouple NAT from L2/L3 Rewriting**: The `PacketEditor` should expose methods like `editor.apply_nat(decision)` and `editor.update_macs(src, dst)`. The orchestration logic calls these methods sequentially, rather than executing a monolithic block of byte-shifting.
+4. **Compile-time Specialization**: Use generics or macros to generate specific inlined rewrite paths for common cases (e.g., `rewrite_ipv4_tcp_no_vlan`), completely eliminating runtime branches on the hot path.
+
+---
+
+## #964 — Refactor: SessionTable is a 'Memory Allocator' — Missing Multi-Index Data-Oriented Design [CLOSED] (closed 2026-05-04)
+
+## The 'Amateur' Architecture
+In `userspace-dp/src/session.rs`, `SessionTable` uses 5 separate `FxHashMap`s (`sessions`, `nat_reverse_index`, `forward_wire_index`, `reverse_translated_index`, `owner_rg_sessions`).
+
+From an OS/CPU architecture perspective, every new connection requires inserting keys into up to 5 distinct HashMaps. This triggers multiple heap allocations (for the keys), generates huge pointer-chasing overhead during resolution, and thrashes the CPU caches because the HashMaps scatter memory unpredictably across the heap.
+
+## The Design Pattern Fix: Intrusive Structures / Multi-Index Map (Data-Oriented Design)
+You must refactor this into an **Array-of-Structs (AoS)** or **SlotMap**, replacing 5 full hash maps of keys with a single contiguous block of sessions and integer-based indices.
+
+### Implementation Plan
+1. **Preallocate Session Slab**: Use a `Slab` or an array (`[SessionEntry; MAX_SESSIONS]`) to store the actual state. This guarantees memory locality and zero allocations after initialization.
+2. **Integer Handles**: Every session gets a `u32` ID. Secondary indices (NAT reverse, forward wire) should map `SessionKey -> u32`, not `SessionKey -> SessionKey`.
+3. **Multi-Index Design**: Even better, instead of having multiple generic HashMaps, embed intrusive 'next_node' indices directly into the `SessionEntry` struct for common lookups. This transforms 5 heap allocations into 1 slab allocation.
+4. **Cache Locality**: A `SessionEntry` should fit inside 1-2 cache lines (64-128 bytes) and contain everything needed to make a forwarding decision without secondary pointer-chasing.
+
+---
+
+## #965 — Refactor: O(N) Session Garbage Collection causes 'Stop The World' Latency Spikes [CLOSED] (closed 2026-05-03)
+
+## The 'Amateur' Architecture
+In `userspace-dp/src/afxdp/worker.rs`, the main hot-path loop periodically calls `sessions.expire_stale_entries(loop_now_ns)`. 
+
+Inside `userspace-dp/src/session.rs`, this function performs an **O(N) linear scan** over the entire `FxHashMap` of active sessions to find expired flows. Worse, it collects the expired keys into a dynamically allocated `Vec`, iterates over that `Vec` to remove them, and then pushes them into another `Vec` of expired sessions.
+
+## Why it's a disaster
+If you have 1 million concurrent flows (a reasonable number for 100G), this O(N) sweep will freeze the worker thread for **several milliseconds** every time the GC interval hits. This is the definition of a 'Stop The World' latency spike. During this pause, the XSK RX rings will overflow, packets will be dropped, and hardware queues will stall. The tail latency (p99) of your firewall will be catastrophically bad.
+
+## The Design Pattern Fix: Timer Wheel / Epoch-Based Reclamation
+You cannot perform O(N) scans on a fast-path worker. Garbage Collection must be **O(1) amortized**.
+
+### Implementation Plan
+1. **Intrusive Timer Wheel**: Embed a 'next_timeout' and 'prev_timeout' pointer directly into the `SessionEntry` (AoS design from Issue #964). 
+2. Group sessions into buckets based on their expiration timestamp.
+3. On every loop iteration, the worker simply checks the *current* time bucket. If it's not empty, it pops the head of the linked list. 
+4. This reduces GC overhead from O(N) to O(1) per loop iteration, completely eliminating the 'Stop The World' latency spikes and the heap allocations.
+
+---
+
+## #966 — Refactor: Policy Engine is missing SIMD-Accelerated Packet Classification (Bit-Vector / Tuple Space Search) [CLOSED] (closed 2026-05-05)
+
+## The 'Amateur' Architecture
+Your policy engine evaluates 5-tuples (Src IP, Dst IP, Protocol, Src Port, Dst Port) against a list of rules. Even if you implement a basic Trie (as suggested in Issue #923), doing this one packet at a time is a waste of silicon.
+
+## The CPU Design Reality
+Enterprise firewalls (and DPDK's `rte_acl` library) do not evaluate rules linearly or even with simple scalar tries. They use **Vectorized Packet Classification** (e.g., Tuple Space Search or SIMD Bit-Vector algorithms). 
+When a packet arrives, you extract the 5-tuple. You then use AVX2/AVX-512 to simultaneously compare that 5-tuple against 8 or 16 rule dimensions in parallel. 
+
+## The Fix
+Implement a **SIMD Bit-Vector (BV) classification algorithm**. 
+1. Pre-compile the policy into bit-vectors representing match dimensions (Src IP ranges, Dst IP ranges, Port ranges).
+2. Load the packet's 5-tuple into vector registers.
+3. Use `_mm256_and_si256` to intersect the bit-vectors in a few cycles. The first set bit (via `_tzcnt_u32`) in the resulting vector is your matching rule priority. This gives you deterministic, microsecond-latency policy evaluation even with 10,000 rules.
+
+---
+
+## #967 — Refactor: Header Formatting uses Scalar Byte Copies — Missing SIMD PSHUFB (_mm256_shuffle_epi8) [CLOSED] (closed 2026-05-05)
+
+## The 'Amateur' Architecture
+In `rewrite_forwarded_frame_in_place` (Issue #963), you are copying MAC addresses using `[u8; 6]` assignments, shifting VLAN tags with `copy_within()` or `memmove`, and manually rewriting TTL fields.
+
+## The CPU Bottleneck
+Scalar memory copies and assignments for 14 to 18 byte Ethernet headers generate a large stream of micro-ops. Moving data 1 or 4 bytes at a time starves the Load/Store units.
+
+## The Fix
+Use **SIMD Byte Shuffling (`PSHUFB` / `_mm256_shuffle_epi8`)**.
+1. Load the entire Ethernet + IPv4 header (32 bytes) into a YMM register.
+2. Load the new MAC addresses into another register.
+3. Use a pre-computed Shuffle Mask to simultaneously strip/insert a VLAN tag, overwrite the MAC addresses, decrement the TTL, and align the payload—all in ~3 instructions.
+4. Write the 32-byte block back to the UMEM frame. 
+This transforms dozens of scalar operations and branches into straight-line vector math, completing the rewrite in nanoseconds.
+
+---
+
+## #968 — Refactor: Cryptographic Hash Generation lacks Hardware Intrinsics (AES-NI / SHA-Ext) [CLOSED] (closed 2026-05-05)
+
+## The 'Amateur' Security Engine
+When generating SYN Cookies or hashing flow 5-tuples for RSS / ECMP, your code likely relies on standard Rust hashing (like SipHash or FxHash) executed in software.
+
+## The Reality of 100G DoS
+During a 100G SYN Flood, generating 14.8 million cryptographic cookies per second using software arithmetic will melt your CPU cores. The CPU simply cannot perform that many XOR/ADD rounds in software without dropping legitimate traffic.
+
+## The Fix
+**Hardware-Accelerated Cryptography.**
+1. For SYN cookies and flow hashing, you MUST use the CPU's dedicated crypto instructions.
+2. If your CPU supports AES-NI (`_mm_aesenc_si128`), you can generate a highly secure, collision-resistant 128-bit hash of the 5-tuple in 3-4 cycles.
+3. Alternatively, use Intel SHA Extensions (`_mm_sha1rnds4_epu32`).
+4. Fall back to standard math *only* if the CPU explicitly lacks these flags, but fail loudly in the logs. At 100G, hardware crypto is mandatory, not a 'nice to have'.
+
+---
+
+## #969 — Refactor: FIB / Routing Table Lookups lack AVX2 Gather Instructions [CLOSED] (closed 2026-05-05)
+
+## The 'Amateur' Architecture
+When a new session is evaluated, your code performs a Longest Prefix Match (LPM) lookup in the FIB (Forwarding Information Base) to find the next-hop. Right now, this is a scalar lookup. 
+
+## The Hardware Reality
+If you are evaluating a batch of 64 packets that missed the session table, you are walking the routing trie 64 separate times sequentially. This leads to massive pointer-chasing and data cache misses, destroying pipeline throughput. 
+
+## The Fix
+Implement a **D-bit Trie (DIR-24-8)** for IPv4 routing and use **AVX2/AVX-512 Gather Instructions (`_mm256_i32gather_epi32`)**.
+1. Extract the destination IPs of 8 packets into a YMM register.
+2. Issue a single AVX2 gather instruction to load the first-level trie nodes for all 8 IP addresses simultaneously.
+3. Because the CPU's memory subsystem handles gather instructions by grouping memory requests, you hide the DRAM latency and increase routing lookup throughput by ~6x over scalar code.
+
+---
+
+## #984 — Refactor: Consolidate TX Subsystem into Unified afxdp/tx/ Module [CLOSED] (closed 2026-04-30)
+
+## The 'Amateur' Architecture
+Currently, TX logic is scattered across three disparate files: `afxdp.rs` (TX batching), `tx.rs` (shaping/mqfq), and `frame_tx.rs` (cross-worker redirection). This fragmentation makes it impossible to reason about the TX pipeline as a single cohesive unit.
+
+## The Design Pattern Fix: Hierarchical Submodules
+You must move all TX-related code into a unified `afxdp/tx/` module with internal boundaries that match the hardware pipeline stages.
+
+### Implementation Plan
+1. Create `userspace-dp/src/afxdp/tx/mod.rs`: The entry point for the TX subsystem.
+2. **`tx/rings.rs`**: Lower-level XSK TX ring interactions (replaces raw `writer` calls).
+3. **`tx/dispatch.rs`**: Logic for moving packets from RX to the correct TX binding (replaces `frame_tx.rs`).
+4. **`tx/stats.rs`**: Latency sidecar stamping and telemetry (extracts #812 and #825 logic).
+5. **`tx/scheduler.rs`**: High-level orchestration that calls the Shaper and MQFQ (from Issue #956) to decide what to send.
+
+This consolidation allows for better unit testing of the TX pipeline and ensures that changes to the shaper don't accidentally break the XSK ring submission logic.
+
+---
+
+## #985 — Refactor: Deconstruct Coordinator God Struct into Manager Components [CLOSED] (closed 2026-05-01)
+
+## The 'Amateur' Architecture
+The `Coordinator` struct in `afxdp/coordinator.rs` has **over 45 fields**. It manages everything from BPF file descriptors to worker threads, session exports, and neighbor monitors. This is a classic **God Object** that is impossible to maintain or extend.
+
+## The Design Pattern Fix: Component Decomposition
+You must decompose the `Coordinator` into specialized manager components, each with a single responsibility.
+
+### Implementation Plan
+1. **`WorkerManager`**: Owns worker spawning, supervision, and the MPSC command channels.
+2. **`ConfigManager`**: Owns the RCU snapshots (`ForwardingState`, `ValidationState`) and the BPF map FDs.
+3. **`NeighborManager`**: Owns the netlink monitor thread and the dynamic neighbor RCU state.
+4. **`SessionManager`**: Owns the shared session maps and the session export event stream.
+5. **`StatusAggregator`**: Collects telemetry and exceptions from workers to build the `ProcessStatus` response.
+
+This decomposition allows the `Coordinator` to become a lightweight shell that delegates to these managers, making it significantly easier to unit test the control-plane logic.
+
+---
+
+## #986 — Refactor: Extract Memory Management from umem.rs [CLOSED] (closed 2026-05-01)
+
+## The 'Amateur' Architecture
+`umem.rs` is a 2600-line monolith that mixes low-level OS memory mapping (`mmap`, hugepages) with high-level AF_XDP ring management and frame recycling logic.
+
+## The Design Pattern Fix: Layered Abstraction
+You must separate the raw memory allocation from the higher-level UMEM recycling logic.
+
+### Implementation Plan
+Create `afxdp/umem/` module:
+1. **`umem/mmap.rs`**: Pure OS interaction. Handles `mmap`, `hugepages`, and NUMA-local allocations.
+2. **`umem/layout.rs`**: Defines the UMEM frame layout, headroom, and the `UserspaceDpMeta` header.
+3. **`umem/pool.rs`**: High-level recycler logic (`WorkerUmemPool`). This layer is agnostic of *how* the memory was allocated.
+
+This separation allows us to swap the memory allocator (e.g. for unit testing or DPDK integration) without touching the frame recycling logic.
+
+---
+
+## #987 — Refactor: Decouple Packet Pipeline from Hardware Driver (HAL) [CLOSED] (closed 2026-05-16)
+
+## The 'Amateur' Architecture
+The core dataplane logic is tightly coupled to raw AF_XDP rings (`RingRx`, `RingTx`). This makes it impossible to unit-test the pipeline without a real NIC and a complex UMEM setup.
+
+## The Design Pattern Fix: Hardware Abstraction Layer (HAL)
+You must decouple the `afxdp/` pipeline from the `xsk_ffi` driver using traits.
+
+### Implementation Plan
+1. Define traits:
+   ```rust
+   trait PacketSource { fn receive(&mut self, budget: u32) -> Vec<Packet>; }
+   trait PacketSink { fn transmit(&mut self, packets: Vec<Packet>); }
+   ```
+2. Implement `XskDriver` that satisfies these traits using the current AF_XDP logic.
+3. Implement `MockDriver` for unit testing, allowing us to feed synthetic packets into the pipeline and assert on the results in a pure software environment.
+
+This abstraction is the industry standard for high-performance dataplanes (e.g., DPDK's `rte_eth_dev`). It allows for rapid development and testing without hardware dependencies.
+
+---
+
+## #988 — Refactor: Deconstruct frame.rs into Layered Packet Processing Submodule [CLOSED] (closed 2026-05-01)
+
+## The 'Amateur' Architecture
+`userspace-dp/src/afxdp/frame.rs` is a 7,000+ line 'toolbox' file. It mixes L2 header writing, L3 IP parsing, L4 checksum folding, and high-level NAT orchestration. 
+
+From a CPU architecture perspective, this massive compilation unit prevents fine-grained inlining control and results in a bloated instruction footprint. From a design perspective, it violates the Single Responsibility Principle (SRP) by being the 'junk drawer' for anything that touches a byte buffer.
+
+## The Design Pattern Fix: Layered Module Hierarchy
+You must break `frame.rs` into a cohesive `afxdp/frame/` module with explicit boundaries for each layer of the network stack.
+
+### Implementation Plan
+Create `userspace-dp/src/afxdp/frame/` with the following submodules:
+1. **`frame/eth.rs`**: Pure L2 logic. Ethernet header building, VLAN insertion/stripping, and MAC rewriting.
+2. **`frame/ip.rs`**: Pure L3 logic. IPv4/IPv6 header parsing, TTL/Hop-Limit management, and fragmentation checks.
+3. **`frame/checksum.rs`**: Extract the 1s-complement folding and incremental adjustment logic. This is the primary target for future SIMD optimization (Issue #919).
+4. **`frame/editor.rs`**: Implements the `PacketEditor` pattern (Issue #963) to orchestrate the submodules into a cohesive rewrite pipeline.
+
+This modularization allows for unit-testing the Ethernet builder without needing a full IPv6 stack mock, and vice versa.
+
+---
+
+## #989 — Refactor: Extract L4 Protocol Specializations (TCP/UDP/ICMP/ARP) [CLOSED] (closed 2026-05-02)
+
+## The 'Amateur' Architecture
+Protocol-specific logic for TCP flag inspection, ICMP error NAT reversal, and ARP/NDP learning is currently scattered across `frame.rs` and `afxdp.rs`.
+
+## The Design Pattern Fix: Protocol Strategies
+Each Layer 4 (and L2 control) protocol should have its own dedicated module to isolate its state machine and parsing logic.
+
+### Implementation Plan
+1. **`frame/tcp.rs`**: TCP-specific logic (MSS clamping, flag detection, state tracking).
+2. **`frame/udp.rs`**: UDP-specific checksumming and port handling.
+3. **`frame/icmp.rs`**: ICMP/ICMPv6 error handling, ID repair, and Proxy NDP logic (Issue #938).
+4. **`frame/arp.rs`**: ARP opcode parsing and learning helpers.
+
+By isolating protocol logic, we can apply specialized JIT parsers (Issue #927) much more easily and provide 100% test coverage for edge cases like ICMP-in-ICMP error messages.
+
+---
+
+## #1016 — Refactor: Decouple enqueue_pending_forwards mutation from TX dispatch (post-rename) [CLOSED] (closed 2026-05-26)
+
+## Status: 50% done — rename landed, decoupling deferred
+
+The original issue had two halves:
+
+1. **Rename and Move** `frame_tx.rs` → `tx/dispatch.rs` — **DONE** in #1018.
+2. **Decouple Mutation from Dispatch** — **NOT DONE**. `enqueue_pending_forwards` (now in `tx/dispatch.rs`) is still a 1,000+ line god function that mixes:
+   - Packet mutation (TCP segmentation, in-place L2/L3/L4 rewriting, NAT64 frame building)
+   - TX queue dispatch and cross-worker MPSC routing
+
+## Remaining work
+
+The L1-i cache pollution concern from the original issue is unaddressed because the mutation paths still live inline in dispatch. The file size is healthy (1,513 prod LOC, under the 2,000 threshold), so this is no longer a *size* problem — it's a *cohesion* problem.
+
+### Implementation plan
+
+1. Identify the mutation surface within `enqueue_pending_forwards`:
+   - `segment_forwarded_tcp_frames_into_prepared`
+   - `rewrite_forwarded_frame_in_place`
+   - NAT64 frame construction
+2. Decide on the boundary: either lift the mutation calls into a `ProcessStage` upstream of dispatch (per #946 VPP pipeline pattern) or lift them into a `PacketEditor` (per #963)
+3. `tx/dispatch.rs` then strictly inspects an already-mutated `TxRequest` and routes it to local TX or MPSC
+
+### Coupling notes
+
+This refactor is gated on a design choice between #946 (pipeline staging) and #963 (editor pattern). Both are live tracking issues. Decoupling here without a target architecture would just shuffle code.
+
+## Closed-out work
+
+- File rename: #1018
+- Adjacent infrastructure: #984 (tx.rs decomposition into tx/), #985 (Coordinator decomp)
+
+---
+
+## #1020 — MmapArea::new: harden against zero-length and aligned_len overflow [CLOSED] (closed 2026-05-02)
+
+Followup from PR #1019 (Copilot review).
+
+`MmapArea::new` in `userspace-dp/src/afxdp/umem/mmap.rs` has two unhandled corner cases on the input `len`:
+
+1. **Zero-length:** `mmap(NULL, 0, ...)` falls through to the kernel and returns a less-direct OS error (EINVAL). A caller that asks for 0 bytes wants `io::ErrorKind::InvalidInput`, not the OS message.
+
+2. **Overflow:** `let aligned_len = (len + HUGE_PAGE_SIZE - 1) & !(HUGE_PAGE_SIZE - 1);` wraps if `len > usize::MAX - 2 MB + 1`. The wrapped value is smaller than `len`, so the resulting mmap is *under-allocated* — silent UB.
+
+In current production, UMEM allocations are KB to MB and no caller passes 0, so both are theoretical. They should still be hardened.
+
+## Suggested fix
+
+```rust
+pub(in crate::afxdp) fn new(len: usize) -> io::Result<Self> {
+    if len == 0 {
+        return Err(io::Error::from(io::ErrorKind::InvalidInput));
+    }
+    let aligned_len = len.checked_add(HUGE_PAGE_SIZE - 1)
+        .ok_or_else(|| io::Error::other("umem len would overflow on hugepage alignment"))?
+        & !(HUGE_PAGE_SIZE - 1);
+    // ... rest of impl
+}
+```
+
+Add a unit test for both branches.
+
+Deferred from PR #1019 to keep that PR's 'mechanical move only' scope honest.
+
+---
+
+## #1034 — Refactor: cos/queue_ops.rs is 4,531 prod LOC — biggest remaining monolith [CLOSED] (closed 2026-05-01)
+
+## Symptom
+
+After the Wave 2-9 refactor stream landed (#985 Coordinator, #988 frame.rs, #957 P1 worker.rs all under the 2,000 prod LOC modularity-discipline threshold), `userspace-dp/src/afxdp/cos/queue_ops.rs` is now the largest remaining `.rs` file in the crate at **4,531 production LOC** (4,764 raw, including a sizable test block).
+
+This crosses both the soft (~2,000 prod LOC = refactor cue) and hard (~3,000 prod LOC = next change splits first) thresholds codified in `docs/engineering-style.md`.
+
+## Why this matters
+
+- L1-i cache pressure: a 4,500-LOC compilation unit can't be fine-grained inlined cleanly
+- Single Responsibility violation: queue_ops.rs sits at the intersection of admission, draining, lease coordination, and FIFO management — all in one file
+- Review surface: any future change to a cohesive cluster (e.g. ECN marking) is reviewed against ~4,500 LOC of context
+
+## Proposed approach (not committing to specific phases yet)
+
+Use the same playbook that worked for #985 / #988 / #957:
+
+1. Survey the public API and identify cohesive function clusters
+2. Look for cluster boundaries: admission gating, FIFO ops, lease handoff, drain orchestration, etc.
+3. Extract each cluster into a sibling file under `cos/` (e.g. `cos/queue_admission.rs`, `cos/queue_drain.rs`, etc.)
+4. Per modularity-discipline rule: tests colocate with their production code
+
+## Adjacent files for context
+
+- `cos/queue_service.rs`: 2,999 prod LOC (also over threshold, but more cohesive)
+- `cos/admission.rs`: 500 prod LOC
+- `cos/token_bucket.rs`, `cos/cross_binding.rs`, `cos/tx_completion.rs`, etc. (already split out in earlier waves)
+
+## References
+
+- Modularity discipline: `docs/engineering-style.md` "Modularity discipline"
+- Adjacent refactor issues: #985 (closed), #988 (closed), #957 (P1 done in #1033)
+
+---
+
+## #1035 — Refactor: cos/queue_service.rs (2,999 prod LOC) and types.rs (2,009 prod LOC) over modularity threshold [CLOSED] (closed 2026-05-01)
+
+## Symptom
+
+After the Wave 2-9 refactor stream, two more `.rs` files cross the 2,000 prod LOC modularity-discipline threshold:
+
+| File | Production LOC |
+|---|---|
+| `userspace-dp/src/afxdp/cos/queue_service.rs` | 2,999 |
+| `userspace-dp/src/afxdp/types.rs` | 2,009 |
+
+Both are smaller than the #1034 outlier (cos/queue_ops.rs at 4,531) but still cross the soft refactor cue.
+
+## queue_service.rs
+
+The orchestration layer for worker-side CoS queue servicing. Cohesive but big. Likely candidates to peel off:
+- The drain/scheduler loop bodies (one large fn dominates)
+- Per-binding pump helpers
+- Slow-path fallback paths
+
+## types.rs
+
+This is the project's "shared structs" module — `UserspaceDpMeta`, `SessionFlow`, `SessionKey`, `BindingIdentity`, `CoSInterfaceConfig`, `CoSQueueConfig`, `BindingPlan`, etc. The natural split is by concern:
+- Per-packet metadata (`UserspaceDpMeta`, `SessionFlow`, `SessionKey`)
+- Binding/identity (`BindingIdentity`, `BindingPlan`, `BindingStatus`)
+- CoS config (`CoSState`, `CoSInterfaceConfig`, `CoSQueueConfig`, `CoSDSCPClassifierConfig`, etc.)
+- Forwarding state (`ForwardingState`, `FabricLink`, `HAGroupRuntime`)
+
+Low-risk extraction — these are all data structs without mutating impl blocks. Can be split into `types/{meta,binding,cos,forwarding}.rs`.
+
+## Why these belong together as one issue
+
+Both are "post-Wave-9 cleanup" — neither was on the original refactor docket. Filed together for triage; can split into separate PRs if scope warrants.
+
+## References
+
+- Modularity discipline: `docs/engineering-style.md`
+- Adjacent: #1034 (cos/queue_ops.rs, the bigger queue-side outlier)
+
+---
+
+## #1043 — Refactor: pkg/grpcapi/server_show.go is 5,288 LOC (16 fns) — needs RPC-handler split [CLOSED] (closed 2026-05-03)
+
+## Symptom
+
+`pkg/grpcapi/server_show.go` is 5,288 LOC across 16 fns. By function count, fewer fns than expected for the size — meaning the average fn is ~330 LOC. These are gRPC \`Show*\` RPC handlers that produce status/listing responses.
+
+## Why this matters
+
+- A single Go file at 5,288 LOC is a navigation problem (longest file in pkg/)
+- gRPC handlers conceptually belong to **different domains** (security flow sessions, IPsec, BGP, OSPF, interfaces, routes, cluster, NetFlow, etc.); collapsing them all into one file violates SRP
+- New \`Show*\` RPCs land in here by default rather than next to the domain they query
+
+## Proposed split
+
+Each \`ShowXyz\` handler is a domain. Group by gRPC service surface in \`pkg/grpcapi/show/\`:
+
+- \`show/sessions.go\` — \`ShowSecurityFlowSessions\`, \`ShowSessionsBrief\`, etc.
+- \`show/ipsec.go\` — IKE / IPsec SA / proposal / gateway show
+- \`show/routing.go\` — BGP / OSPF / IS-IS / RIP / static-route / RIB
+- \`show/interfaces.go\` — interface terse / detail / VLAN
+- \`show/cluster.go\` — chassis cluster status / RG / fabric
+- \`show/cos.go\` — CoS interface / queue / scheduler
+- \`show/feeds.go\`, \`show/dhcp.go\`, \`show/flow_export.go\`, etc.
+
+The \`server_show.go\` file becomes a registry that wires the handlers into the gRPC service trait.
+
+## Test plan
+
+- Existing gRPC tests (cluster.test, integration) should keep passing.
+- No behavior change — same handlers, same protobuf surfaces, just relocated.
+
+## Adjacent work
+
+- Companion file \`pkg/grpcapi/server.go\` for non-Show RPCs (configure, commit, etc.) likely has a similar split candidate but is smaller; defer until this lands.
+- The auto-generated \`pkg/grpcapi/xpfv1/xpf.pb.go\` (7,746 LOC) is exempt — it's generated from the .proto.
+
+## References
+
+- Modularity discipline: `docs/engineering-style.md`
+- Adjacent: this is the Go-side analog of the Rust-side #1034 (queue_ops decomposition) and the closed #985 / #988 / #957 / #986.
+
+---
+
+## #1044 — Refactor: pkg/dataplane/compiler.go (3,509 LOC) and pkg/daemon/daemon.go (2,851) and pkg/cli/cli.go (2,661) need decomposition [CLOSED] (closed 2026-05-03)
+
+## Symptom
+
+Three large Go files in pkg/ are at or above the 2,000 LOC threshold the project uses for Rust modularity discipline:
+
+| File | LOC | Functions |
+|---|---|---|
+| pkg/dataplane/compiler.go | 3,509 | 46 |
+| pkg/daemon/daemon.go | 2,851 | 23 |
+| pkg/cli/cli.go | 2,661 | 64 |
+
+## Why these
+
+### pkg/dataplane/compiler.go — config-to-BPF-map compiler
+
+46 fns in 3,509 LOC means the compiler does a lot. Three-phase compilation (Junos AST → typed Go structs → eBPF map entries) is the project's documented pattern; compiler.go currently mixes all three phases. Cluster boundaries:
+- AST → typed structs (parser-side)
+- Typed structs → eBPF map entries (BPF-side)
+- Cross-cutting concerns (interface enumeration, zone resolution, address book expansion)
+
+A clean split would put each phase in its own file under `pkg/dataplane/compile/`.
+
+### pkg/daemon/daemon.go — daemon lifecycle
+
+23 fns / 2,851 LOC. The daemon does too many things in one file:
+- Process lifecycle (signal handling, TTY detection, master-password unlock)
+- Subsystem startup ordering (interface enumeration, FRR, DHCP, IPsec, gRPC server, HTTP REST, etc.)
+- Hitless-restart machinery (PROG_ARRAY pinning, deferred cleanup)
+- Config-reload/commit drivers
+
+A clean split could be:
+- `daemon/main.go` — top-level Run(), signal loop
+- `daemon/startup.go` — subsystem init ordering
+- `daemon/restart.go` — hitless-restart bookkeeping
+- `daemon/config.go` — commit/reload paths
+
+### pkg/cli/cli.go — interactive CLI
+
+64 fns / 2,661 LOC. Junos-style readline + tab completion + pipe filters + history. Could split:
+- `cli/readline.go` — input loop, history, line editing
+- `cli/completion.go` — tab + ? handlers (calls into pkg/cmdtree)
+
+*(truncated — 55 lines total)*
+
+
+---
+
+## #1046 — Refactor: afxdp/frame/mod.rs is 6,435 LOC — test split + builders/ subdir [CLOSED] (closed 2026-05-02)
+
+## Current state
+
+\`userspace-dp/src/afxdp/frame/mod.rs\` is **6,435 raw LOC** (~1,993 production / ~4,442 inline tests). Even with checksum and inspect already extracted, mod.rs remains a kitchen-sink of packet builders, NAT helpers, and an enormous \`#[cfg(test)] mod tests\` block.
+
+Violates the modularity-discipline rule (production LOC ≤ 2,000; raw size manageable for navigation) codified in \`docs/engineering-style.md\`.
+
+## Refactor plan (LOC win, not architectural redesign)
+
+This is the *simple* modularity split — distinct from #963 which proposes a deeper Builder/Editor state-machine. Goal here is just file size / navigation.
+
+1. **Test colocation/split**: relocate the ~4,442 lines of inline tests into \`frame/tests/\` (one file per category: \`nat44_tests.rs\`, \`nat64_tests.rs\`, \`gre_tests.rs\`, \`tcp_segmentation_tests.rs\`, \`icmp_tests.rs\`, \`rewrite_tests.rs\`).
+2. **\`frame/builders/\` submodule**:
+   - \`builders/nat64.rs\` — \`build_nat64_forwarded_frame\` + helpers
+   - \`builders/gre.rs\` — GRE encap/decap builders
+   - \`builders/icmp.rs\` — ICMP-specific build paths
+   - \`builders/tcp_segmentation.rs\` — \`segment_forwarded_tcp_frames*\`
+3. **frame/mod.rs becomes an index** of \`pub use\` re-exports + the tightly-coupled core (build_forwarded_frame, rewrite_forwarded_frame_in_place).
+
+## Acceptance
+
+- frame/mod.rs production LOC ≤ ~600 (orchestration only)
+- All tests still pass via \`cargo test --release -p userspace-dp\`
+- No public API change outside \`crate::afxdp\`
+- Cluster smoke (loss userspace cluster) passes per-CoS iperf3 + RG1 failover
+
+---
+
+## #1047 — Refactor: session.rs is 3,108 LOC — split into session/{key,table,wheel,entry}.rs [CLOSED] (closed 2026-05-02)
+
+## Current state
+
+\`userspace-dp/src/session.rs\` is **3,108 raw LOC** (~1,352 production). Session table, timer wheel, key codec, and entry struct are all colocated.
+
+## Refactor plan
+
+Convert to directory module \`userspace-dp/src/session/\`:
+
+- \`session/key.rs\` — \`SessionKey\`, ipv4/ipv6 codec, hashing/byte ordering helpers
+- \`session/entry.rs\` — \`SessionEntry\` struct, conntrack state, NAT decision storage
+- \`session/table.rs\` — \`SessionTable\` storage, lookup/insert/delete
+- \`session/wheel.rs\` — timer wheel, expiry sweep
+- \`session/mod.rs\` — index of \`pub use\` re-exports + any thin orchestration
+
+## Acceptance
+
+- Each split file ≤ ~1,000 prod LOC
+- mod.rs ≤ ~200 prod LOC
+- No external API change (everything currently \`pub use session::*\`-shaped continues to work)
+- \`cargo test --release\` clean
+- Cluster smoke passes
+
+---
+
+## #1048 — Refactor: main.rs is 2,139 LOC — extract control-plane server/ subsystem [CLOSED] (closed 2026-05-02)
+
+## Current state
+
+\`userspace-dp/src/main.rs\` is **2,139 raw LOC** (~1,281 production). Mixes CLI argument parsing, daemon bootstrap, control-socket request handlers, runtime state, and the main event loop in a single file.
+
+## Refactor plan
+
+Extract the control-plane server into \`userspace-dp/src/server/\`:
+
+- \`server/mod.rs\` — entry point, accepts listener fd, dispatches to handlers
+- \`server/handlers.rs\` — per-RPC handler functions (status poll, HA sync, session install, snapshot sync, forwarding sync)
+- \`server/state.rs\` — daemon-side runtime state (binding registry, helper-socket state, control-socket throttling)
+- \`main.rs\` — thin shell: arg parsing, logger init, calls \`server::run()\`
+
+## Acceptance
+
+- main.rs ≤ ~300 prod LOC
+- Each server/ file ≤ ~1,000 prod LOC
+- \`cargo test --release\` clean
+- \`make test-deploy\` succeeds; control socket still answers status poll, HA sync, session install
+- Cluster smoke passes
+
+---
+
+## #1049 — Refactor: filter.rs is 2,278 LOC — split into filter/{compiler,engine,policer}.rs [CLOSED] (closed 2026-05-02)
+
+## Current state
+
+\`userspace-dp/src/filter.rs\` is **2,278 raw LOC** (~1,414 production). Filter compilation (Junos AST → bytecode), per-packet evaluation, and policer state are all in one file.
+
+## Refactor plan
+
+Convert to directory module \`userspace-dp/src/filter/\`:
+
+- \`filter/compiler.rs\` — Junos firewall-filter AST → typed filter struct → bytecode/lookup tables
+- \`filter/engine.rs\` — per-packet match evaluation, action dispatch (DSCP rewrite, forwarding-class, drop, policer-binding)
+- \`filter/policer.rs\` — token bucket policer state, refill, accept/drop decision
+- \`filter/mod.rs\` — index of \`pub use\` re-exports + the small set of types shared across all three
+
+## Acceptance
+
+- Each split file ≤ ~1,000 prod LOC
+- mod.rs ≤ ~200 prod LOC
+- \`cargo test --release\` clean
+- Filter unit tests (compile / evaluate / policer rate) all still pass
+- Cluster smoke passes
+
+---
+
+## #1054 — Refactor: afxdp.rs is 3,843 prod LOC — extract 2,382-line poll_binding_process_descriptor [CLOSED] (closed 2026-05-02)
+
+## Current state
+
+\`userspace-dp/src/afxdp.rs\` is **3,843 prod LOC** (no inline test block — all production code), well over the 2,000 LOC modularity-discipline threshold codified in \`docs/engineering-style.md\`.
+
+**62% of the file is a single function**: \`poll_binding_process_descriptor\` at line 686, body length 2,382 lines (L686-3067). Top-3 fn sizes:
+
+| Function                                  | Lines |
+|-------------------------------------------|-------|
+| \`poll_binding_process_descriptor\`         | 2,382 |
+| \`poll_binding\`                            |   289 |
+| \`flush_session_deltas\`                    |   165 |
+
+The remaining 18 helpers are <110 lines each.
+
+## Refactor plan
+
+Extract \`poll_binding_process_descriptor\` (and any helpers tightly coupled to it) into a dedicated module — \`afxdp/poll_descriptor.rs\` or \`afxdp/rx_descriptor.rs\`. This is mostly a relocation, not a redesign:
+
+1. New module \`afxdp/poll_descriptor.rs\` — contains the fn body verbatim
+2. Adjust visibility: \`pub(super)\` so afxdp.rs's \`poll_binding\` can still call it
+3. afxdp.rs imports it via \`mod poll_descriptor; use poll_descriptor::poll_binding_process_descriptor;\`
+4. afxdp.rs drops to ~1,400 prod LOC (well under threshold)
+
+\`poll_binding_process_descriptor\` itself is still a monolith but that's a separate, deeper refactor problem (state-machine decomposition — overlaps with #963's Builder/Editor pattern). The first PR is purely about file modularity.
+
+## Acceptance
+
+- afxdp.rs ≤ 1,500 prod LOC
+- poll_descriptor.rs ≤ 2,500 raw LOC (the fn itself + any extracted helpers)
+- \`cargo test --release -p userspace-dp\` clean
+- Cluster smoke (per-CoS iperf3 on loss userspace cluster) passes
+
+---
+
+## #1065 — Bug: ForwardingDisposition::is_cacheable doc/code mismatch on FabricRedirect [CLOSED] (closed 2026-05-02)
+
+## Description
+
+In `afxdp/types/forwarding.rs` (was `afxdp/types/mod.rs` before #1064), `ForwardingDisposition::is_cacheable()` returns `true` for both `ForwardCandidate` and `FabricRedirect`:
+
+```rust
+pub(in crate::afxdp) fn is_cacheable(self) -> bool {
+    matches!(
+        self,
+        ForwardingDisposition::ForwardCandidate | ForwardingDisposition::FabricRedirect
+    )
+}
+```
+
+But the doc comment lists `FabricRedirect` under **Not cacheable** with this rationale:
+
+> `FabricRedirect`: Targets a fabric overlay binding that differs from the normal egress binding. Fabric target selection depends on per-packet queue hashing and binding availability, which the cache entry cannot capture. Also, fabric sessions may flip back to `ForwardCandidate` after failback, making cached fabric entries stale.
+
+Either:
+- The code is wrong — `FabricRedirect` should NOT be cacheable per the doc reasoning. Remove it from the matches!() set.
+- The doc is wrong — `FabricRedirect` IS cacheable. Move it to the "Cacheable" section and replace the rationale.
+
+Pre-existing in master before #1064 (which only relocated this code). Found by Copilot inline review on PR #1064.
+
+## Decision needed
+
+Which is correct? If `FabricRedirect` truly can't capture per-packet queue hashing, it shouldn't cache. If failback semantics are tolerated, it can.
+
+
+---
+
+## #1069 — Bug: redundant reverse_session_key computation in flush_session_deltas Close branch [CLOSED] (closed 2026-05-02)
+
+## Description
+
+In `afxdp/session_delta.rs:181` (was `afxdp.rs:1181` before #1068), the Close branch of the SessionDelta loop computes `reverse_session_key(&delta.key, delta.decision.nat)` twice — once into a local `reverse_key` and again as an inline arg to the second `replicate_session_delete` call.
+
+Pre-existing in master before #1068 (which only relocated this code). Found by Copilot inline review on PR #1068.
+
+## Fix
+
+Reuse the local `reverse_key` for the second call.
+
+
+---
+
+## #1125 — Refactor: BindingWorker is a 'Wide' bottleneck — Refactor via Sub-Struct Composition [CLOSED] (closed 2026-05-03)
+
+## The Problem
+`BindingWorker` has 40+ fields. Passing `&mut BindingWorker` to any function grants mutable access to the entire world, preventing LLVM from performing alias analysis and causing massive stack pressure.
+
+## The Fix
+Decompose into cohesive sub-structs:
+- `XskHardware`: Raw rings and UMEM handles.
+- `ShaperEngine`: Token buckets and timer wheels.
+- `WorkerStats`: All `dbg_*` counters.
+Functions should only take the specific sub-struct they need. This reduces the 'Surface Area' of mutability and allows for better hardware-level optimization.
+
+---
+
+## #1126 — Refactor: Decouple Protocol Snooping (TCP Flags) from the Egress Path [CLOSED] (closed 2026-05-02)
+
+## The Gap
+We are calling `frame_has_tcp_rst` and checking flags inside the main forwarding loop for every packet, regardless of protocol.
+
+## The Reality
+For UDP or ICMP traffic, this is 100% wasted instructions. 
+
+## The Fix
+Move TCP flag detection and window tracking into a dedicated `TcpStateStage`. This stage should be guarded by a single protocol check: `if batch.protocol[i] == TCP { ... }`. Keep the 'Happy Path' for bulk data flows as thin as possible.
+
+---
+
+## #1127 — Refactor: Kill the 31-Parameter God Function with a Vectorized 'PacketBatch' Struct [CLOSED] (closed 2026-05-05)
+
+## The 'Amateur' Architecture
+Our inner loop (`poll_descriptor.rs`) still passes a dozen pointers and integers into a scalar loop. This is 1990s-era C-style programming.
+
+## The CPU Reality
+We are wasting registers and forcing the compiler to spill arguments to the stack. We need **Data-Oriented Vectorization**.
+
+## The Fix
+Implement `struct PacketBatch<const N: usize>`. It must contain contiguous arrays for:
+1. `descriptors: [XdpDesc; N]`
+2. `metadata: [UserspaceDpMeta; N]`
+3. `dispositions: [ForwardingDisposition; N]`
+4. `scratch_offsets: [u64; N]`
+
+The God Function's signature must be reduced to: `fn process_batch(batch: &mut PacketBatch, ctx: &WorkerContext)`. This allows the compiler to use SIMD for 'glue' logic like clearing dispositions and provides a fixed target for the Graph-Node pipeline.
+
+---
+
+## #1128 — Refactor: Extract 'BatchTelemetry' to clear Hot-Path Instruction Noise [CLOSED] (closed 2026-05-02)
+
+## The Problem
+The first 150 lines of `poll_descriptor.rs` are counter increments, oversized-packet logging, and prefetch calls. This is 'housekeeping' noise that evicts actual forwarding logic from the L1-Instruction cache.
+
+## The Fix
+Move all non-forwarding bookkeeping into a `BatchTelemetryStage`. This stage should:
+1. Pull descriptors from the ring.
+2. Issue `_mm_prefetch` for the entire batch headers.
+3. Bulk-increment counters (`rx_packets += batch.len()`).
+4. Keep the main forwarding loop focused PURELY on the packet transformation logic.
+
+---
+
+## #1137 — userspace-dp: SCREEN_SYN_FRAG not implemented in screen.rs (follow-up to #866) [CLOSED] (closed 2026-05-02)
+
+## Discovered while validating #866
+
+PR #1136 fixes the BPF code path for SCREEN_SYN_FRAG. While running a functional positive test on \`loss:xpf-userspace-fw0\` (the userspace-dp cluster), I found the screen profile reaches the BPF \`screen_configs\` map with all flags zero — because the userspace-dp dataplane has its own screen implementation in \`userspace-dp/src/screen.rs\` that does NOT include SCREEN_SYN_FRAG.
+
+\`screen.rs\` currently implements:
+- teardrop (\`screen.rs:339-353\`)
+- icmp-fragment (\`screen.rs:354-360\`)
+
+But not syn-frag, syn-fin, no-flag, fin-no-ack, winnuke, etc. — the full set the BPF \`xdp_screen.c\` covers.
+
+## Why the BPF screens don't reach userspace-dp
+
+The userspace-dp processes packets in Rust via AF_XDP rather than tail-calling BPF screen programs. The BPF screen implementation only fires on the legacy kernel-BPF data path (\`bpfrx-fw0\`), not on the userspace-dp deployment.
+
+## Proposed scope
+
+Port the SYN-centric checks from \`bpf/xdp/xdp_screen.c\` into \`screen.rs\`:
+- SCREEN_SYN_FRAG (this issue's primary motivation)
+- SCREEN_TCP_SYN_FIN
+- SCREEN_TCP_NO_FLAG
+- SCREEN_TCP_FIN_NO_ACK
+- SCREEN_WINNUKE
+- (Others in \`xdp_screen.c\` not yet in screen.rs)
+
+For SYN_FRAG specifically: the parser at \`screen.rs:517\` already extracts \`ip_frag_off\` but treats it as a combined bit. Add \`is_first_fragment\` to \`ScreenInfo\` (\`screen.rs:45\`) using the same `MF=0x2000 && !(offset=0x1FFF)\` predicate as the BPF code. Then implement the SYN-FRAG drop check.
+
+## Files
+
+- \`userspace-dp/src/screen.rs\` — add fields + checks
+- \`userspace-dp/src/screen_tests.rs\` — coverage
+
+## Out of scope for this issue
+
+- Extending the broader screen framework's hot-path overhead model.
+- Porting MQFQ-related screen interactions.
+
+Tracked separately so #866's BPF fix can land cleanly without expanding scope.
+
+---
+
+## #1144 — Refactor: Defer Session Setup for Missing Neighbors to avoid Synchronous Traps [CLOSED] (closed 2026-05-05)
+
+## The 'Junior' Logic
+When a neighbor is missing, `poll_descriptor.rs` immediately evaluates policy and NAT, builds a `SyncedSessionEntry`, and pushes to the shared session maps—all before the packet is even buffered.
+
+## Why it's broken
+We are performing expensive cryptographic session setup and global atomic updates for a packet that is **guaranteed to be delayed** (and likely dropped if it hits the 64-packet buffer limit). 
+
+## The Fix
+**Side-Queue Deferral.** Move the `MissingNeighbor` flow into a side-queue *before* policy/session evaluation. Only perform the expensive session setup and NAT allocation once the neighbor resolves. This keeps the 'Warm Path' focused on packets that can actually be transmitted.
+
+---
+
+## #1145 — Refactor: Implement Packet-Header Scratchpads to eliminate redundant UMEM slicing [CLOSED] (closed 2026-05-03)
+
+## The Problem
+Inside `poll_descriptor.rs`, we call `area.slice()` on the same packet header up to 6 times across different functions (`extract_tcp_flags`, `frame_has_tcp_rst`, `classify_arp`, etc.).
+
+## The Performance Impact
+Every `slice()` call involves bounds checking, pointer arithmetic, and potential cache misses if the UMEM frame is cold. We are redundantely loading the same header into registers repeatedly.
+
+## The Fix
+**Packet Context Shadowing.** The first stage of the pipeline should load the first 128 bytes of every packet in a batch into a per-worker 'Scratch Pad' (cache-hot). All subsequent parsing stages should work on this scratch pad rather than slicing the UMEM directly. This reduces bounds-check overhead and ensures the header is always in L1d.
+
+---
+
+## #1146 — Refactor: Decouple Protocol Parsing from the Forwarding Pipeline [CLOSED] (closed 2026-05-16)
+
+## The 'Amateur' Architecture
+The inner loop in `poll_descriptor.rs` is a procedural monolith that interleaves hardware prefetching, telemetry, ARP parsing, NDP validation, GRE decapsulation, and session lookups for every single packet.
+
+## The CPU Pipeline Impact
+Mixing wildly different code paths (e.g., ARP vs. TCP Session Lookup) for every packet causes constant instruction pipeline flushes and branch mispredictions. We are processing packets one-by-one (Scalar Processing), which is an IPC killer.
+
+## The Fix: Staged Pipeline
+Finalize the transition to a **Staged Pipeline**.
+- **Stage 1:** RX Burst + Telemetry.
+- **Stage 2:** Vectorized Metadata Parse.
+- **Stage 3:** Vectorized Session/Policy Lookup.
+- **Stage 4:** TX Dispatch.
+This ensures that the instructions for each stage stay 'hot' in the L1i cache for the entire batch.
+
+---
+
+## #1152 — show NAT detail commands miss IPv6 sessions and panic on IPv6 persistent-NAT bindings [CLOSED] (closed 2026-05-03)
+
+Three pre-existing correctness bugs in the NAT show paths, surfaced by
+Copilot review on PR #1151 (#1043 Phase 3 — pure relocation):
+
+## 1. SNAT detail under-counts v6 sessions
+`pkg/grpcapi/server_show_nat.go` `showNATSourceRuleDetail` (line 117) —
+the per-rule-set session counter only walks `IterateSessions()`. The
+CLI's other NAT paths (`GetNATPoolStats`, `server_nat.go`) aggregate
+both `IterateSessions` and `IterateSessionsV6`. As soon as a source-NAT
+rule handles IPv6 traffic, `show security nat source rule … detail`
+shows a session count that's silently too low.
+
+## 2. DNAT detail under-counts v6 sessions
+`pkg/grpcapi/server_show_nat.go` `showNATDestRuleDetail` (line 207) —
+same defect for destination NAT.
+
+## 3. Persistent-NAT detail panics on IPv6 bindings
+`pkg/grpcapi/server_show_nat.go` `showPersistentNATDetail` (line 304) —
+unconditionally calls `b.NatIP.As4()`. `compiler_nat.go` registers v6
+pool IPs and `conntrack/gc.go` saves v6 bindings, so as soon as the
+persistent-NAT table contains an IPv6 entry, `show persistent-nat-table
+detail` will panic instead of producing output (and the panic crosses
+the gRPC boundary as a 5xx).
+
+## Fix sketch
+- Add v6 iteration to both detail paths (mirror the existing
+  `IterateSessions` + `IterateSessionsV6` aggregation pattern from
+  `server_nat.go`).
+- For persistent-NAT detail, switch the `natKey` to a netip.Addr-based
+  key (or a sum-type) and walk both v4 and v6 session tables when
+  populating `sessionCounts`.
+
+## Provenance
+These bugs were copied verbatim into `server_show_nat.go` by PR #1151
+under the explicit no-behavior-change rule for the #1043 split. They
+were already present in `pkg/grpcapi/server_show.go` on master
+(verified at master @ fa9eb131). Splitting them out as a follow-up so
+each Phase-N PR stays a pure relocation.
+
+---
+
+## #1163 — Refactor: Recursive String-Based Routing Lookups — 'next_table' resolution is an IPC killer [CLOSED] (closed 2026-05-26)
+
+## The 'Amateur' Architecture
+In `userspace-dp/src/afxdp/forwarding/mod.rs`, the `lookup_forwarding_resolution_v4` function uses **recursion** (`depth + 1`) and **String comparisons** (`if next_table_name == table`) to resolve route leaks between routing instances (VRFs).
+
+## Why it's a disaster
+A high-speed dataplane MUST resolve next-hops in deterministic, O(1) or O(log N) time. By using recursion and string comparisons on the hot path, you are:
+1. **Blowing out the call stack** (risking stack overflows if depth limits aren't strict).
+2. **Thrashing the L1-d cache** with heap-allocated String lookups.
+3. **Stalling the CPU pipeline** with deep branch dependency chains.
+
+## The Design Pattern Fix: Flattened FIB / ID-Based Resolution
+1. **Pre-compute Route Leaks:** The Control Plane (Go) should resolve inter-table routes *before* pushing the FIB to Rust. The dataplane should only see the final, flattened next-hop.
+2. **Integer Table IDs:** If the dataplane must resolve VRFs dynamically, routing tables MUST be identified by `u16` IDs, never `String` names.
+3. **Iterative Resolution:** Replace the recursive function call with a bounded `while` loop to guarantee no stack-frame overhead during route resolution.
+
+---
+
+## #1164 — Refactor: JSON Serialization Tax on Control Plane Sync — Missing Binary Protocol (Protobuf/FlatBuffers) [CLOSED] (closed 2026-05-16)
+
+## The 'Amateur' Architecture
+In `userspace-dp/src/protocol.rs`, the control plane synchronization relies on massive `ConfigSnapshot` and `InterfaceSnapshot` structs heavily laden with `String`s and `Vec`s, annotated with `#[derive(Serialize, Deserialize)]`. This implies you are using JSON or another text-based format over the Unix socket to sync state between Go and Rust.
+
+## Why it's a disaster
+When you have 10,000 routes or a massive firewall filter, serializing and deserializing this payload takes tens to hundreds of milliseconds.
+1. **Memory Churn:** Deserializing JSON into `String`s triggers thousands of heap allocations, putting immense pressure on the Rust memory allocator.
+2. **Stop-The-World Latency:** Processing these massive text payloads stalls the coordinator thread, delaying crucial updates like dynamic neighbor resolution and HA state changes.
+
+## The Design Pattern Fix: Zero-Copy Binary Protocol
+1. **FlatBuffers or Cap'n Proto:** Transition the IPC schema to a zero-copy binary format. The Rust dataplane should be able to memory-map the configuration payload and read it directly without ANY deserialization or allocation overhead.
+2. **Delta Updates:** Stop sending 'Full Snapshots'. The protocol must support granular `RouteAdd`, `RouteDelete`, and `NeighborUpdate` binary messages to ensure O(1) update latency regardless of table size.
+
+---
+
+## #1165 — Refactor: Inline thread_local! and Logging Branches bloat the L1-i Cache [CLOSED] (closed 2026-05-26)
+
+## The 'Amateur' Architecture
+Deep inside the hot-path loops in `userspace-dp/src/afxdp/tx/dispatch.rs` and `poll_descriptor.rs`, there are inline `thread_local!` macro declarations (e.g., `SEG_MISS_LOG`, `HB_LOG_COUNT`) surrounded by `if` statements and complex string formatting (`eprintln!`).
+
+## The CPU Reality
+A `thread_local!` access in Rust is not free. It compiles down to a TLS (Thread Local Storage) lookup, which can involve function calls (`__tls_get_addr`) depending on the linkage model. By putting this *inside* your 14.8M pps forwarding loop, you are adding hidden function calls and branch instructions to the most performance-critical code in the system. Even if gated by cold branches, the instruction footprint pollutes the L1-i cache.
+
+## The Fix: Out-of-Band Telemetry
+1. **Remove inline `thread_local!`:** Thread-local state for telemetry MUST be pre-allocated in the `WorkerStats` struct (Issue #1057) during worker initialization, never lazily initialized inside the loop.
+2. **Outline Logging:** Any string formatting or logging must be moved to an explicitly `#[cold]` and `#[inline(never)]` function. The hot path should only ever write an integer to a pre-allocated array.
+3. **Zero-Branch Hot Path:** Use branchless arithmetic for rate-limiting logs (e.g., bitwise ANDs on packet counters) instead of `if count < 20`.
+
+---
+
+## #1166 — Refactor: Software TCP Segmentation (TSO) is a Monolithic Memory-Copy Trap [CLOSED] (closed 2026-05-05)
+
+## The 'Amateur' Architecture
+In `userspace-dp/src/afxdp/tx/dispatch.rs`, you have a 250-line inline function `segment_forwarded_tcp_frames_into_prepared`. When a packet exceeds the MTU (e.g., due to IPsec/GRE encapsulation), the dataplane manually slices the TCP payload, builds new IP/TCP headers, calculates checksums, and copies the data chunk-by-chunk into new UMEM frames.
+
+## Why it's a disaster
+Software TCP Segmentation Offload (TSO) done byte-by-byte in the middle of a dispatch loop destroys pipeline throughput.
+1. **Cache Thrashing:** You are looping over the payload, pulling it through the L1-d cache just to write it to another UMEM frame.
+2. **Instruction Bloat:** This massive block of logic sits squarely in the middle of the 'Happy Path' dispatch logic, bloating the instruction cache for all traffic, even non-segmented UDP flows.
+
+## The Design Pattern Fix: Hardware TSO or Dedicated SIMD Stage
+1. **Hardware Offload First:** If the underlying NIC supports TSO/GSO via AF_XDP metadata, you MUST use it. Pass the large frame to the NIC and let the hardware ASIC do the segmentation.
+2. **Dedicated Software Stage:** If hardware TSO is unavailable, Software Segmentation MUST be moved out of `dispatch.rs` into a dedicated `afxdp/frame/segmentation.rs` module. It should run as a completely separate pipeline stage (Issue #946) to ensure the heavy memory-copy instructions don't pollute the fast-path instruction cache.
+3. **Vectorized Copies:** Use SIMD (`_mm256_storeu_si256`) to perform the payload chunking, not scalar slices.
+
+---
+
+## #1187 — Refactor: Double-Buffered Telemetry to eliminate Worker-Coordinator cache-line bouncing [CLOSED] (closed 2026-05-16)
+
+## The Problem
+`BindingLiveState` contains dozens of `AtomicU64` counters that are written to by the high-speed worker and read by the coordinator's status-reporting thread.
+
+## The CPU Reality: MESI Thrashing
+When the worker core writes to an atomic and the coordinator core (on a different NUMA node) reads it, the cache line is forced to bounce across the motherboard interconnect. This triggers constant Read-For-Ownership (RFO) messages and stalls the worker's pipeline.
+
+## The Design Pattern Fix: Double-Buffering / Bulk Publication
+1. The worker must write to a **Worker-Local** (private) telemetry block that is padded to 64 bytes to prevent false sharing.
+2. Once per second (or per N batches), the worker performs a bulk copy (or atomic swap) of its local state into the shared `BindingLiveState`.
+3. This decouples the hot-path packet moving from the slow-path status reporting, reducing interconnect overhead by 1,000,000x.
+
+---
+
+## #1188 — Refactor: Group disparate RCU states into a single 'RuntimeSnapshot' to reduce atomic bus traffic [CLOSED] (closed 2026-05-16)
+
+## The 'Amateur' Architecture
+The `BindingWorker` and `worker_loop` currently load up to 8 separate `ArcSwap` pointers on every iteration (Forwarding, Validation, HA State, Fabrics, etc.).
+
+## The CPU Reality
+Each `ArcSwap::load()` involves an atomic pointer load and an `Arc` refcount increment/decrement. At 14.8M pps, performing 8 separate loads per packet translates to hundreds of millions of atomic operations per second, saturating the memory bus interconnect (QPI/UPI) even without explicit locks.
+
+## The Design Pattern Fix: Unified Runtime Context
+1. Group all related RCU-protected states into a single `ImmutableRuntime` struct.
+2. Perform **ONE** `ArcSwap::load()` at the beginning of the worker loop.
+3. Pass a single `&ImmutableRuntime` reference down the entire pipeline.
+This reduces atomic bus traffic by 800% and ensures that every stage of the pipeline sees a perfectly consistent snapshot of the entire system state.
+
+---
+
+## #1189 — Refactor: Deconstruct 'Coordinator' into Domain-Specific Managers [CLOSED] (closed 2026-05-05)
+
+## The 'God Object' Anti-Pattern
+The `Coordinator` struct in `afxdp/coordinator/mod.rs` is a 3,000-line monolith managing everything from BPF map FDs to worker spawning, neighbor monitors, and session sync. It violates the Single Responsibility Principle (SRP) and is untestable.
+
+## The Fix: Component Decomposition
+Break the `Coordinator` into specialized manager objects:
+1. **`WorkerManager`**: Supervision and command dispatch.
+2. **`ConfigManager`**: FIB/Policy RCU snapshots and BPF FDs.
+3. **`NeighborManager`**: Netlink monitoring and prober state.
+4. **`SessionManager`**: Global session maps and HA sync orchestration.
+
+The `Coordinator` becomes a lightweight shell that delegates to these managers, making it possible to unit-test the control-plane logic in isolation.
+
+---
+
+## #1197 — xpfd preinstalls stale neighbor MAC into kernel ARP; breaks forwarding when peer MAC changes (no snapshot refresh) [CLOSED] (closed 2026-05-05)
+
+## Summary
+
+xpfd's daemon-side neighbor preinstall path
+(\`pkg/daemon/daemon_neighbor.go:87-100\`) unconditionally pushes
+the userspace-dp's in-memory neighbor snapshot into the kernel ARP
+table every 15s. When the peer MAC changes (peer reboot, NIC swap,
+peer-side ARP eviction, etc.), the kernel briefly learns the new
+MAC via normal ARP, but xpfd then **overwrites the fresh kernel
+entry with the stale snapshot MAC** on the next preinstall tick.
+
+The userspace-dp data plane uses the snapshot's MAC for forwarding
+decisions (XDP/AF_XDP path), so frames egress to the dead address.
+Forwarding stays broken until xpfd is restarted, which rebuilds the
+snapshot from current kernel ARP.
+
+## Observed (loss userspace cluster, 2026-05-05)
+
+- \`cluster-userspace-host\` → \`172.16.80.200\` failed via fw0 forwarding
+- fw0 itself could ping 172.16.80.200 (kernel slow path uses
+  REACHABLE entry, but the entry was stale)
+- Kernel ARP showed \`172.16.80.200 lladdr 56:4a:e8:1e:a8:32 REACHABLE\`
+- \`ip neigh flush dev ge-0-0-2.80\` + ping → fresh
+  \`52:9a:10:65:d8:7d\`
+- Within ~15 seconds, kernel ARP reverted to \`56:4a:e8:1e:a8:32\`
+- userspace-dp snapshot at \`/run/xpf/userspace-dp.json\`
+  \`snapshot.neighbors\` array still contained the stale MAC
+- xpfd journal showed \`preinstalled kernel neighbor entries from
+  snapshot count=99\` every 15s
+- The \`52:9a:10:65:d8:7d\` MAC is the actual current MAC of the
+  endpoint at 172.16.80.200; \`56:4a:e8:1e:a8:32\` is from a
+  previous boot of that endpoint
+
+## Root cause
+
+\`pkg/daemon/daemon_neighbor.go:87-100\`:
+
+\`\`\`go
+if provider, ok := d.dp.(snapshotNeighborProvider); ok {
+    for _, sn := range provider.SnapshotNeighbors() {
+        entry := netlink.Neigh{
+
+*(truncated — 142 lines total)*
+
+
+---
+
+## #1204 — Refactor: Abandon N-tuple Flow Steering — Fix Intra-Queue Fairness Instead [CLOSED] (closed 2026-05-08)
+
+## The 'Amateur' Architecture
+PR #1203 introduces a 1Hz closed-loop control system that polls workers for active flows and dynamically installs `ethtool` n-tuple filters on the physical NIC to steer flows to specific RX queues.
+
+## Why it's a disaster
+This is a classic 'Band-Aid on a Bullet Wound' architecture. The fundamental problem (the '100E100M' unfairness gap) is caused by a mathematical flaw in the userspace MQFQ scheduler (Issue #913: `queue_vtime` acts as an aggregate byte counter). 
+
+Instead of fixing the math in the scheduler, the architecture attempts to 'route around' the broken scheduler by carefully distributing flows across cores. However, as soon as two heavy flows land on the *same* core (which is mathematically inevitable), the broken scheduler ruins fairness anyway, leaving a 49% CoV.
+
+Furthermore, stateful n-tuple steering on the NIC adds massive fragility:
+1. **Hardware Lock-in:** It ties the dataplane to specific NIC drivers (mlx5_core) that support high-scale flow steering.
+2. **Control Loop Latency:** A 1Hz reconciliation loop is far too slow to react to microbursts or short-lived 'mice' flows.
+3. **Resource Exhaustion:** Stateful NIC rules are finite. Relying on them for basic load balancing will exhaust TCAM resources under SYN floods.
+
+## The Design Pattern Fix: Pure Userspace Fair Queuing
+1. **Close PR #1203.** Do not introduce stateful NIC routing to bypass userspace bugs.
+2. **Fix the Scheduler.** Resolve Issue #913 by making `vtime` a true system frontier.
+3. **Expand Hash Space.** Increase `COS_FLOW_FAIR_BUCKETS` to 4096+ to eliminate birthday-paradox collisions between elephants and mice.
+4. **Trust RSS.** A mathematically sound MQFQ scheduler combined with standard symmetric Toeplitz RSS will easily achieve the <20% CoV target without a single n-tuple rule.
+
+---
+
+## #1205 — Hygiene: doc/code drift CI check for CoS scheduler invariants [CLOSED] (closed 2026-05-06)
+
+## Background
+
+This session burned three plan-review cycles on stale anchors:
+- A draft #936 plan proposed lifting a gate (\`flow_fair = queue.exact && !shared_exact\`) that had already been lifted in #785 Phase 3.
+- A PR #1203 plan cited \`COS_FLOW_FAIR_BUCKETS = 1024\` while the actual constant has been 4096 since #785.
+- An expert mandate at #1204 listed three actions that all already ship.
+
+Codex's standalone CoS findings retrospective (\`/tmp/cos-findings.md\`, also in disposition doc \`docs/pr/789-fairness-disposition/plan.md\`) flags this as a systemic failure mode worth a 50-line drift check.
+
+## Proposal
+
+Add a lightweight Rust unit test (\`tests/cos_doc_drift_test.rs\`) that fails on stale policy references. Initial blocklist (extend over time):
+
+\`\`\`
+COS_FLOW_FAIR_BUCKETS = 1024
+flow_fair = queue.exact && !shared_exact
+shared_exact queues are NOT on the flow-fair path
+single-FIFO-per-worker drain
+\`\`\`
+
+Scan target: \`userspace-dp/src/afxdp/cos/\` plus active \`docs/pr/\` plan files (skip \`docs/pr/*/plan.md\` files marked KILLED or WITHDRAWN — those preserve historical record by design).
+
+Allow whitelisting of intentional historical retrospectives via inline marker like \`// drift-check: historical\`.
+
+## Acceptance
+
+- [ ] Test exists in \`userspace-dp/tests/\` (or wherever cargo workspace tests live).
+- [ ] CI runs the test as part of \`cargo test --release\`.
+- [ ] Documented blocklist with extension instructions in the test file's module doc.
+- [ ] Initial pass: scrub the three stale references in current tree (already partially done in commit \`ffd73f4e\` on \`refactor/936-shared-perflow-vtime\`).
+
+## Priority
+
+**P3** — high value, low effort, prevents future cycles burned on stale anchors. Won't fix any user-facing issue but will save hours of plan-review on every future fairness or scheduler change.
+
+## References
+
+- Codex CoS findings retrospective: in disposition doc \`docs/pr/789-fairness-disposition/plan.md\`
+- This session's #1204 + #936 plan-review cycles where stale anchors led to PLAN-NEEDS-MAJOR / WITHDRAWN.
+
+---
+
+## #1206 — Refactor: split CoSQueueRuntime into hot/cold/flow_fair/v_min/telemetry pieces [CLOSED] (closed 2026-05-16)
+
+## Background
+
+\`CoSQueueRuntime\` currently mixes 8 concerns in one struct (per Codex CoS findings retrospective):
+
+- immutable config
+- token bucket state
+- runnable/parking state
+- queue byte counters
+- flow-fair arrays (~232 KB inline at 4096 buckets)
+- FIFO storage
+- V_min state (vtime_floor Arc, suspended counters, throttles)
+- scratch counters and owner telemetry atomics
+
+The cold 4096-bucket flow-fair arrays sit inline next to hot fields, hurting cache locality. Non-flow-fair queues pay the inline footprint they never use.
+
+## Proposal
+
+Split into:
+
+\`\`\`rust
+struct CoSQueueRuntime {
+    config: CoSQueueConfigRuntime,        // immutable after build
+    hot: CoSQueueHotState,                // runnable, parking, byte counters
+    flow_fair: Option<Box<FlowFairState>>, // boxed so non-fair queues pay nothing
+    v_min: VMinQueueState,                // vtime_floor, throttles, suspension
+    telemetry: CoSQueueTelemetry,         // scratch + owner atomics
+}
+\`\`\`
+
+Use static dispatch at hot-path call sites (no trait objects).
+
+## Acceptance
+
+- [ ] All public methods on \`CoSQueueRuntime\` preserved or migrated to sub-structs with thin pass-throughs.
+- [ ] Non-flow-fair queues no longer carry the 232 KB inline footprint.
+- [ ] All existing tests pass without modification (refactor is structural; behavior preserved).
+- [ ] No regression on iperf-c P=12 t=120 aggregate or CoV vs current master.
+- [ ] cargo build --release clean; cargo test --release 977+ pass.
+- [ ] Pure code motion + struct shape; no behavior change.
+
+
+*(truncated — 53 lines total)*
+
+
+---
+
+## #1207 — Refactor: consolidate queue_service/service.rs around one monomorphized service skeleton [CLOSED] (closed 2026-05-26)
+
+## Background
+
+\`userspace-dp/src/afxdp/cos/queue_service/service.rs\` (631 LOC) has four near-duplicate variants of the same service skeleton:
+
+- \`service_exact_local_queue_direct\` (FIFO + Local)
+- \`service_exact_local_queue_direct_flow_fair\` (MQFQ + Local)
+- \`service_exact_prepared_queue_direct\` (FIFO + Prepared)
+- \`service_exact_prepared_queue_direct_flow_fair\` (MQFQ + Prepared)
+
+All four follow the same skeleton (per Codex CoS findings retrospective):
+
+1. drain to scratch
+2. submit TX descriptors
+3. stamp accepted descriptors
+4. handle \`inserted == 0\`
+5. settle accepted prefix
+6. publish V_min
+7. apply send result
+
+## Proposal
+
+Refactor around one \`service_skeleton<DrainAdapter, SubmitAdapter>(...)\` that takes adapters for the drain and submit stages. Keep separate fast-path types for Local and Prepared (different scratch shape), but stop duplicating the submit/settle/publish shell.
+
+\`\`\`rust
+fn service_exact_queue<A: ServiceAdapter>(
+    binding: &mut BindingWorker,
+    root_ifindex: i32,
+    queue_idx: usize,
+    secondary_budget: u64,
+    now_ns: u64,
+    shared_recycles: &mut Vec<(u32, u64)>,
+    adapter: A,
+) -> bool {
+    // shared submit/settle/publish skeleton
+}
+\`\`\`
+
+The four current entry points become thin dispatchers that select the adapter.
+
+## Acceptance
+
+*(truncated — 60 lines total)*
+
+
+---
+
+## #1208 — Hygiene: refresh refactoring-audit.md to current module heatmap [CLOSED] (closed 2026-05-06)
+
+## Background
+
+\`docs/refactoring-audit.md\` predates many landed splits per Codex CoS findings retrospective. Several files it lists have since been refactored or eliminated, and several large files it doesn't list deserve watching.
+
+## Proposal
+
+Replace the static \`refactoring-audit.md\` with:
+
+1. A short narrative doc (\`docs/refactoring-audit.md\`) that explains the modularity-discipline rule (\`>2K LOC = refactor candidate\`) and links to the generation script.
+2. A generation script (\`scripts/refactoring-audit.sh\`) that produces a current heatmap excluding generated code (\`bpf2go\` output, \`vendor/\`, \`target/\`) and large evidence artifacts (\`docs/pr/*/findings*.md\`, \`docs/pr/*/plan.md\`).
+3. CI runs the script and posts the result as a comment on PRs that introduce a new file >1500 LOC OR push an existing file past 2000.
+
+## Current candidates worth watching
+
+Per Codex retrospective:
+- userspace-dp/src/afxdp/poll_descriptor.rs
+- userspace-dp/src/afxdp/worker/mod.rs
+- userspace-dp/src/afxdp/coordinator/mod.rs
+- userspace-dp/src/afxdp/frame/mod.rs
+- userspace-dp/src/afxdp/forwarding/mod.rs
+- userspace-dp/src/afxdp/cos/queue_service/mod.rs
+- pkg/cluster/cluster.go
+- pkg/api/handlers.go
+- pkg/dataplane/maps.go
+- pkg/routing/routing.go
+
+## Acceptance
+
+- [ ] \`docs/refactoring-audit.md\` rewritten with rule + link to script.
+- [ ] \`scripts/refactoring-audit.sh\` produces deterministic, sorted output (file path + LOC) excluding generated code.
+- [ ] Output committed to \`docs/refactoring-audit-current.txt\` (regenerated periodically).
+- [ ] Optional: CI hint on PRs that cross the 2000 LOC threshold.
+
+## Priority
+
+**P3** — low effort, medium value. Keeps the modularity rule visible and prevents silent drift past 2K LOC.
+
+## References
+
+- Disposition doc: \`docs/pr/789-fairness-disposition/plan.md\` §E
+
+*(truncated — 41 lines total)*
+
+
+---
+
+## #1209 — Refactor: finish double-buffered worker telemetry (#1187 follow-on) [CLOSED] (closed 2026-05-16)
+
+## Background
+
+#1187 partially shipped batched RX/TX disposition counters via \`BatchCounters\`. Hot paths still update shared atomics in \`BindingLiveState\` and the CoS owner-profile structures, causing worker/coordinator cache-line bouncing on every scrape and control-call.
+
+Per Codex CoS findings retrospective:
+
+> Some RX/TX counters are batched, but hot paths still update shared atomics in BindingLiveState and owner profile structures.
+
+## Proposal
+
+Per-worker double-buffered telemetry block:
+
+1. Per-worker local telemetry block, cache-line aligned, written without atomics on the hot path.
+2. Periodic bulk publish (existing \`COS_STATUS_INTERVAL_NS\` 100 ms cadence is the natural anchor) flips the published-snapshot atomic pointer.
+3. Coordinator reads from the published copy only — never from the live worker block.
+4. Keep true multi-writer counters (e.g. shared owner-profile aggregations) separate and padded.
+
+Effect: removes worker-side atomic RMW cost for telemetry that's only consumed at scrape time. NUMA behavior decouples from scrape/control-call timing.
+
+## Acceptance
+
+- [ ] All counters currently in \`BindingLiveState\` audited: which need cross-worker semantics, which are scrape-only.
+- [ ] Scrape-only counters moved to per-worker local block + bulk publish.
+- [ ] Multi-writer counters (e.g. \`no_owner_binding_drops_total\`) stay padded atomics.
+- [ ] No regression on iperf-c P=12 aggregate.
+- [ ] perf stat shows reduced LLC-load-misses on the worker thread under load.
+- [ ] Plan-review (Codex + Gemini Pro 3) — this touches every existing telemetry consumer in \`pkg/dataplane/userspace/\` and \`pkg/api/metrics.go\`.
+
+## Risk
+
+Wide refactor; touches many call sites. Field-by-field migration with tests verifying counter semantics preserved at each step.
+
+## Priority
+
+**P3** — moderate-to-high effort, medium value. Pure perf/maintainability win. Won't move user-facing fairness numbers, but reduces background overhead for any future scheduler work.
+
+## References
+
+- Disposition doc: \`docs/pr/789-fairness-disposition/plan.md\` §F (Codex-suggested follow-on E)
+- #1187 (parent — partial implementation already shipped)
+
+---
+
+## #1210 — Hygiene: scrub stale CoS scheduler comments + old tx.rs line refs in docs/issues [CLOSED] (closed 2026-05-06)
+
+## Background
+
+Per Codex CoS findings retrospective, many doc/comment references in current source and docs are stale after #785 Phase 3 + #913 + #914 + #917 + the \`tx.rs\` → \`cos/\` extraction:
+
+- \`userspace-dp/src/afxdp/types/cos.rs\` still has comments mentioning \`COS_FLOW_FAIR_BUCKETS = 1024\`.
+- The \`shared_exact\` field comment still describes the old policy \`flow_fair = queue.exact && !shared_exact\`, but current promotion is \`flow_fair = queue.exact\`.
+- Comments around \`flow_bucket_bytes\` and old plan docs still risk conflating queue backlog with bytes served.
+- References to old \`tx.rs\` line numbers in issues/docs are stale after the CoS module split.
+
+This is parent of #1205 (drift CI check) — that issue prevents future drift; this one fixes the existing drift.
+
+## Proposal
+
+One-shot scrub:
+
+1. Grep for \`COS_FLOW_FAIR_BUCKETS = 1024\` and update remaining mentions to 4096. (Three already done in \`refactor/936-shared-perflow-vtime\` commit \`ffd73f4e\`; check for more.)
+2. Grep for \`flow_fair = queue.exact && !shared_exact\` and the related "shared_exact stays on FIFO" / "single-FIFO-per-worker drain" phrases. Update each to reflect post-#785 Phase 3 reality.
+3. Search \`docs/\` for \`tx.rs:\` line references; update or replace with module-relative paths.
+
+## Acceptance
+
+- [ ] Zero matches for \`COS_FLOW_FAIR_BUCKETS = 1024\` outside historical retrospectives marked KILLED/WITHDRAWN.
+- [ ] Zero matches for the stale promotion gate phrasing outside historical retrospectives.
+- [ ] Zero matches for \`tx.rs:\` line references in active docs.
+- [ ] Once #1205 ships, this stays clean automatically.
+
+## Priority
+
+**P3** — low effort, low-medium value. Cleans up one-time noise that cost this session multiple plan-review cycles. Pairs naturally with #1205.
+
+## References
+
+- Disposition doc: \`docs/pr/789-fairness-disposition/plan.md\` §"What ships in current tree (verified)"
+- #1205 (drift CI check — long-term prevention)
 
 ---
 
@@ -16825,6 +34828,269 @@ Either keeps the memory bound while restoring detection coverage under a
 saturation flood.
 
 *(truncated — 45 lines total)*
+
+
+---
+
+## #2237 — HIGH: locally-generated ICMP Time Exceeded lacks RFC error-suppression guards (replies to ICMP errors + non-first fragments) [OPEN]
+
+**Severity:** HIGH
+**Category:** correctness / ICMP amplification + error-loop boundary
+**Source:** external Rust-dataplane adversarial review (021)
+
+## Location
+- `userspace-dp/src/afxdp/icmp.rs:20-91` `build_local_time_exceeded_request()` / `build_local_icmp_error_v6()` / `build_local_icmp_error_v4()`
+- gating helper `packet_ttl_would_expire()` at `userspace-dp/src/afxdp/icmp.rs:5-18`
+- call sites: `userspace-dp/src/afxdp/poll_descriptor/mod.rs` (session-hit + session-miss TTL paths)
+
+## Detail
+The locally generated ICMP/ICMPv6 Time Exceeded path fires after only a TTL/hop-limit check. `build_local_time_exceeded_request()` (icmp.rs:31) calls `packet_ttl_would_expire()` — which checks only the fabric-ingress flag and TTL/hop-limit <= 1 — and then immediately builds and enqueues the Time Exceeded frame. There is NO guard for:
+
+- inbound ICMP/ICMPv6 **error** messages (a low-TTL inbound ICMP error generates a fresh ICMP Time Exceeded reply -> error loops / amplification), and
+- **non-first fragments** (a non-first fragment with TTL/hop-limit 1 triggers control-plane error generation though it carries no transport context).
+
+The sibling reject path already enforces the correct contract: `build_reject_icmp_unreachable()` (icmp.rs:331-366) suppresses both non-first fragments (`is_non_first_fragment`, line 343) and inbound ICMP/ICMPv6 errors (`reject_icmp_reply_suppressed`, line 347-352). The Time Exceeded path has neither guard, so the two ICMP-error generators now enforce different RFC-792/RFC-4443 safety contracts.
+
+## Trigger / repro
+1. Configure transit where the firewall is a routed hop.
+2. Send an inbound ICMPv4 type 11 (Time Exceeded) or ICMPv6 type 3 packet with IP TTL/hop-limit == 1 destined through (not to) the firewall.
+3. Observe a locally generated ICMP Time Exceeded reply to an ICMP error (classic error-loop / amplification vector). Repeat with a non-first IPv4/IPv6 fragment (TTL 1) to see Time Exceeded generated for a fragment with no transport header.
+
+## Suggested fix
+Add a shared suppression gate (e.g. `icmp::can_generate_icmp_error_reply(frame, meta)`) covering: non-first IPv4/IPv6 fragments, ICMPv4 error types {3,4,5,11,12}, all ICMPv6 types < 128, invalid L4 offsets. Call it before BOTH `build_reject_icmp_unreachable` and `build_local_time_exceeded_request`. Add tests: TTL-expired TCP still emits Time Exceeded; TTL-expired ICMP error suppressed; TTL-expired non-first fragment suppressed (v4 + v6).
+
+
+---
+
+## #2238 — MEDIUM: locally-generated replies (RST/ICMP-unreachable/Time-Exceeded/SYN-cookie) classified by the TRIGGER tuple, not the generated packet -> output-filter/CoS/DSCP/mirror bypass [OPEN]
+
+**Severity:** MEDIUM (output-policy correctness for locally-originated control packets)
+**Category:** correctness / output filter + CoS + DSCP + mirror bypass
+**Source:** external Rust-dataplane adversarial review (021)
+
+## Location
+- Time Exceeded: `userspace-dp/src/afxdp/icmp.rs:51-58` resolves TX selection with the **original** `meta` + `flow.forward_key`, then stores `cos_tx_selection_resolved: true` (icmp.rs:67-89).
+- Output-filter classifier: `userspace-dp/src/afxdp/tx/cos_classify.rs:290-327` evaluates output filters using `flow_key.src_ip/dst_ip/protocol/ports` + `meta.dscp` (the trigger tuple), turning non-accept terminal actions into `drop`.
+- Reject reply: `userspace-dp/src/afxdp/poll_descriptor/reject_reply.rs:51-60` pushes `TxRequest { expected_protocol: meta.protocol, flow_key: original, cos_queue_id: None, dscp_rewrite: None, mirror_clone: false }`.
+- SYN-cookie reply: `userspace-dp/src/afxdp/poll_descriptor/cookie_reply.rs:75-84` does the same for SYN-ACK / ACK-RST.
+- Enqueue: `userspace-dp/src/afxdp/tx/cos_classify.rs` `enqueue_local_into_cos()` only honors the supplied `req.cos_queue_id`; it does NOT (re)classify the generated bytes.
+
+## Detail
+Locally generated control frames (TCP RST, ICMP/ICMPv6 unreachable, ICMP/ICMPv6 Time Exceeded, SYN-cookie SYN-ACK, ACK-RST) are not classified as **themselves**. The Time Exceeded path evaluates output filters / counters / policers / forwarding-class / DSCP-rewrite against the **triggering** TCP/UDP tuple; the reject and SYN-cookie paths skip generated-packet classification entirely (cos/dscp = None, mirror = false), keying `expected_protocol` to `meta.protocol` of the trigger rather than the emitted frame.
+
+Consequences:
+- An output filter intended to discard locally generated ICMP error traffic never matches (classifier sees the original TCP/UDP tuple).
+- An output filter matching the original transit flow can drop the ICMP error even though the emitted packet is ICMP.
+- Output-filter term counters/logs are charged to the wrong tuple.
+- DSCP rewrite / CoS may be missing on generated control traffic, or wrongly inherited from the trigger.
+- Port-mirror is hard-coded off (`mirror_clone: false`) for all generated replies.
+
+This is distinct from the earlier reject "wire-contract" bug (the wire packet now exists); the gap is that the generated packet is not classified by its own tuple.
+
+## Trigger / repro
+Configure an output firewall filter on the egress interface that discards `protocol icmp` (or matches the reflected ICMP error's src/dst). Drive a TTL-expired transit flow / a policy-reject non-TCP flow / a SYN flood that triggers cookies. Observe the generated ICMP/RST/SYN-ACK is NOT subject to that output filter (classified against the trigger TCP/UDP tuple, or not classified at all).
+
+## Suggested fix
+Introduce a single generated-reply classification contract: parse a `GeneratedReplyMeta` from the built bytes (not copied from the trigger), run output-filter / CoS / DSCP / mirror classification once on the generated tuple before enqueue, and route Time Exceeded, reject replies, SYN-cookie replies (and neighbor replies) through it. Add tests: an output filter matching protocol ICMP drops a generated Time Exceeded; a filter matching the trigger TCP tuple does not.
+
+
+---
+
+## #2239 — HA: DHCP-server leases are not synchronized across the chassis-cluster pair (local memfile only — failover drops/duplicates bindings) [OPEN]
+
+## Problem
+
+In a chassis-cluster HA pair, the Kea-backed DHCP **server** keeps its lease
+state in a node-local `memfile` CSV that is **never replicated to the peer**.
+On failover the newly-promoted node's Kea starts with no knowledge of the
+leases the old master handed out, so it can re-allocate an address that is
+still in active use (duplicate allocation) and clients are forced to
+re-DISCOVER. xpf synchronizes flow sessions and IPsec SAs across the pair but
+does **not** synchronize DHCP-server bindings.
+
+## Code-grounded current state
+
+- **Lease backend is local memfile, never replicated.** Both families write a
+  per-node CSV:
+  - `pkg/dhcpserver/dhcpserver.go:558-561` (`"lease-database": {"type":"memfile","name":"/var/lib/kea/kea-leases4.csv"}`)
+  - `pkg/dhcpserver/dhcpserver.go:638-641` (v6, `kea-leases6.csv`)
+- **No Kea HA hook / lease replication is configured.** The generated Kea
+  config (`generateKea4Config` / `generateKea6Config`,
+  `pkg/dhcpserver/dhcpserver.go:491-648`) emits no `hooks-libraries`, no
+  `lib_ha` / High-Availability hook, and no `lease_cmds`. A repo-wide grep of
+  `pkg/dhcpserver/` for `hooks-librar|lib_ha|lease_cmds|hot-standby|failover`
+  returns nothing.
+- **The cluster sync subsystem has no DHCP/lease channel.** `pkg/cluster/`
+  (`sync.go`, `sync_conn.go`, `sync_bulk.go`, `sync_protocol.go`,
+  `sync_failover.go`) syncs flow sessions and IPsec SAs but contains no
+  DHCP-server lease sync path — a grep of `pkg/cluster/` for `dhcp`/`lease`/
+  `reservation` matches only the substring "release" and one unrelated
+  kernel-upgrade-policy comment (`pkg/cluster/kernel_selfrecover.go:5`).
+- **The HA model stops/starts Kea on VRRP transitions with no state carry.**
+  On MASTER, `restartRethServicesForRG` enqueues a Kea apply for the master
+  RGs (`pkg/daemon/daemon_ha.go:918-929`); on BACKUP,
+  `clearRethServicesForRG` enqueues `ApplyAsync(nil)` — an authoritative stop
+  (`pkg/daemon/daemon_ha.go:967-982`). The promoted node thus boots Kea against
+  its own empty/stale local memfile; nothing transfers the old master's active
+  bindings.
+- The `pkg/dhcpserver` package depends only on `pkg/config`
+  (`pkg/dhcpserver/README.md:60-62`) — it has no cluster awareness.
+
+Net: **xpf does not sync DHCP-server leases across the HA pair today.**
+
+
+*(truncated — 84 lines total)*
+
+
+---
+
+## #2240 — HIGH: NPTv6 invalid-rule validation is fail-open (Go compiler + Rust) and DeleteStaleNPTv6 can tear down a working translation on a typo [OPEN]
+
+**Severity:** HIGH
+**Category:** correctness / fail-open config validation (security appliance)
+**Source:** external Rust-dataplane adversarial review (021)
+
+## Location
+- Go compiler: `pkg/dataplane/compiler_nat.go` `compileNPTv6()` (~line 904+) logs `slog.Warn` and `continue`s for: invalid match prefix, invalid nptv6-prefix, mismatched prefix lengths, unsupported prefix length (not /48 or /64), non-IPv6 prefix. It then unconditionally calls `dp.DeleteStaleNPTv6(written)` at the end of the function.
+- Rust runtime: `userspace-dp/src/nptv6.rs:124-154` `Nptv6State::from_snapshots()` silently `continue`s on invalid internal prefix (line 129), invalid external prefix (line 133), and mismatched prefix lengths (line 137).
+- Test codifies it: `userspace-dp/src/nptv6_tests.rs` `invalid_snapshot_skipped` asserts the invalid rules are skipped and only the valid rule remains.
+
+## Detail
+NPTv6 validation is fail-open on BOTH sides of the Go->Rust boundary. A configured NPTv6 rule that fails validation does not install, but the commit still succeeds (only a warning is logged). For a translation/router appliance this is not benign: a rule that fails to install changes reachability and source/destination identity, and the operator sees an accepted commit.
+
+Worse, because `compileNPTv6` deletes stale NPTv6 entries (`DeleteStaleNPTv6(written)`) after compiling only the **valid** subset, editing a previously valid rule into an invalid one removes the old (working) translation and commits a runtime with no equivalent replacement — a typo silently tears down working NPTv6 behavior instead of preserving the last valid runtime. HA peers can converge on a silent partial NPTv6 state with no hard failure.
+
+This is separate from #2211/#2212 (NAT64 parser fail-closed work) — NPTv6 is RFC-6296 prefix translation, a different rule type and code path.
+
+## Trigger / repro
+1. Commit a valid NPTv6 static rule (`fd00:1::/48` -> `2001:db8:1::/48`); verify translation works.
+2. Edit the rule's internal/external prefix into something invalid (typo, mismatched /48 vs /64, non-IPv6).
+3. Commit again — it succeeds with only a warning. The old translation entry is deleted by `DeleteStaleNPTv6` and the new one never installed: traffic that previously translated now does not. Equivalent on HA standby.
+
+## Suggested fix
+Make NPTv6 validation fail-closed. The Go compiler should return an error (with rule-set + rule name) on any invalid NPTv6 rule rather than warn-and-continue, so the commit is rejected and the previous forwarding state is preserved. Move prefix parse/validate into a shared module with an explicit `Result`; have `Nptv6State::from_snapshots()` take only already-validated snapshots (or return `Result`). Replace `invalid_snapshot_skipped` with fail-closed tests.
+
+
+---
+
+## #2241 — MEDIUM: NPTv6 overlapping /48+/64 prefixes use first-match insertion order (no LPM, no overlap rejection) -> order-dependent translation identity [OPEN]
+
+**Severity:** MEDIUM
+**Category:** correctness / order-dependent translation semantics
+**Source:** external Rust-dataplane adversarial review (021)
+
+## Location
+- `userspace-dp/src/nptv6.rs:159-176` `translate_inbound()` scans `self.inbound` in insertion order and returns on the first external-prefix match.
+- `userspace-dp/src/nptv6.rs:181-197` `translate_outbound()` scans `self.outbound` in insertion order and returns on the first internal-prefix match.
+- No sort-by-prefix-length and no overlap rejection in the Rust parser (`from_snapshots`) or the Go compiler (`compiler_nat.go` `compileNPTv6`).
+
+## Detail
+NPTv6 supports both /48 and /64 rules. The runtime stores inbound/outbound rules in `Vec<Nptv6Rule>` and returns the FIRST match. There is no longest-prefix-match ordering and no overlap detection, so a broad /48 rule configured before a more-specific /64 shadows the /64, and reordering the same rules changes dataplane translation behavior.
+
+Concrete example (both configs syntactically valid today):
+- Rule A: `fd00:1::/48` -> `2001:db8:1::/48`
+- Rule B: `fd00:1:0:1234::/64` -> `2001:db8:ffff:1234::/64`
+
+If A is configured first, outbound traffic from `fd00:1:0:1234::/64` never reaches B. If B is first, the sub-prefix translates differently. There is no "shadowed NPTv6 rule" signal, so misconfiguration is hard to troubleshoot.
+
+## Trigger / repro
+Configure rules A and B above. Send outbound traffic sourced from `fd00:1:0:1234::5`. Observe the translation depends purely on rule insertion order, not on prefix specificity.
+
+## Suggested fix
+Prefer fail-closed overlap rejection (reject A+B overlap at commit) unless ordered NPTv6 semantics are explicitly documented. If ordered behavior is intended, sort by longest prefix before translation and document that LPM wins. Add tests for /48 + nested /64 in both inbound and outbound directions; emit status/debug output of the effective NPTv6 rule order.
+
+
+---
+
+## #2242 — LOW: locally-generated ICMPv6 errors quote only a fixed 48 bytes (below RFC 4443 useful payload) -- omits transport header behind IPv6 extension headers [OPEN]
+
+**Severity:** LOW
+**Category:** router correctness / RFC 4443 diagnostic-payload gap
+**Source:** external Rust-dataplane adversarial review (021)
+
+## Location
+- `userspace-dp/src/afxdp/icmp.rs:225-256` `build_local_icmp_error_v6()` computes `packet_len = (40 + payload_len).min(packet.len())` then `quoted_len = packet_len.min(48)` (icmp.rs:256), emitting the ICMPv6 header plus only the first up-to-48 bytes of the invoking packet (icmp.rs:294).
+- Contrast the v4 builder `build_local_icmp_error_v4()` at icmp.rs:168 which quotes `ihl + 8` (RFC 792 minimum, correct for v4).
+
+## Detail
+RFC 4443 says ICMPv6 error messages SHOULD include as much of the invoking packet as possible without the error exceeding the IPv6 minimum MTU (1280). The current fixed 48-byte quote covers the 40-byte IPv6 base header plus only 8 bytes after it. With common IPv6 extension-header stacks the transport header (and thus ports) starts after byte 48, so the quoted packet may not contain the transport header, weakening PMTUD/traceroute diagnostics and breaking receiver-side error<->socket demux when extension headers are present.
+
+Distinct from #2219 (NAT64 ICMP error type/code translation) — this is about the locally generated ICMPv6 error builder in the userspace router path.
+
+## Trigger / repro
+Drive a TTL/hop-limit-expired transit IPv6 packet that carries one or more extension headers pushing the transport header past byte 48 of the L3 payload. Inspect the generated ICMPv6 Time Exceeded: the quoted invoking packet stops at 48 bytes and omits the transport header.
+
+## Suggested fix
+Quote up to the IPv6 minimum-MTU cap: `min(invoking_packet_len, 1280 - outer_ipv6_len - icmpv6_header_len)`, bounded by TX-frame capacity / configured egress MTU. Add tests with IPv6 extension headers where the transport header starts after byte 48 and assert the generated error includes enough of the invoking packet to identify it. Optionally factor v4/v6 quote sizing into a small helper.
+
+
+---
+
+## #2243 — DHCP server: no static/fixed/reserved binding support (no static-binding syntax, no Kea reservations emitted) [OPEN]
+
+## Problem
+
+The xpf DHCP **server** has no way to assign a fixed/reserved address to a
+specific client (by MAC / client-id / DUID). Junos supports this under
+`system services dhcp-local-server ... static-binding` (and SRX/legacy
+`dhcp ... static-binding host <name> { hardware-address; fixed-address; }`),
+and Kea natively supports per-subnet `reservations`. xpf neither parses the
+config syntax nor emits Kea `reservations`, so operators cannot pin a printer,
+server, or appliance to a stable address from the DHCP server.
+
+## Code-grounded current state
+
+- **No reservation field in the typed model.** `DHCPPool`
+  (`pkg/config/types_system.go:690-699`) carries only `Name`, `RangeLow`,
+  `RangeHigh`, `Subnet`, `Router`, `DNSServers`, `LeaseTime`, `Domain`.
+  `DHCPServerGroup` (`pkg/config/types_system.go:683-687`) has only `Name`,
+  `Interfaces`, `Pools`. There is no host/reservation/fixed-address/
+  hardware-address type anywhere in the DHCP-server config model.
+- **No schema node for static bindings.** The `dhcp-local-server` /
+  `dhcpv6-local-server` schema subtrees expose only
+  `group <name>` → `pool <name>` (`children: nil`)
+  (`pkg/config/schema_system.go:266-275`). There is no `static-binding`,
+  `host`, `reservation`, `hardware-address`, or `fixed-address` leaf — so the
+  syntax is not completable and not commit-validated.
+- **The compiler parses no reservation syntax.** `compileDHCPLocalServer`
+  (`pkg/config/compiler_services.go:114-174`) switches only on `interface`
+  and `pool`, and within a pool only on `address-range`, `subnet`, `router`,
+  `dns-server`, `lease-time`, `domain-name`. There is no `static-binding` /
+  `host` / `hardware-address` / `fixed-address` case.
+- **The Kea generator emits no reservations.** `generateKea4Config` /
+  `generateKea6Config` (`pkg/dhcpserver/dhcpserver.go:491-648`) build each
+  `subnet4`/`subnet6` from `id`/`subnet`/`pools`/`interface`/`option-data`/
+  `valid-lifetime` only. No `reservations` key is ever produced; a grep of
+  `pkg/dhcpserver/` for `reservation|hw-address|fixed-address` returns nothing.
+
+Net: **xpf does not support static/fixed/reserved DHCP-server bindings today**
+— not at the syntax, compile, or Kea-render layer. (This is distinct from DHCP
+*relay* and from the DHCP *client*; it is the server's host-reservation
+capability.)
+
+
+*(truncated — 93 lines total)*
+
+
+---
+
+## #2244 — LOW: publish_dnat_table_entry ignores bpf_map_update_elem return code -- silent reverse-NAT loss for embedded ICMP errors under map pressure [OPEN]
+
+**Severity:** LOW (robustness / observability)
+**Category:** silent syscall-failure / missing error counter
+**Source:** external Rust-dataplane adversarial review (021)
+
+## Location
+- `userspace-dp/src/afxdp/checksum.rs:146-153` `publish_dnat_table_entry()` — the `unsafe { libbpf_sys::bpf_map_update_elem(fd, ...) }` return code is discarded.
+
+## Detail
+`publish_dnat_table_entry()` writes a reverse SNAT entry to the BPF `dnat_table` so the embedded-ICMP NAT path can find the original pre-NAT source for outbound ICMP errors. The `bpf_map_update_elem` syscall result is completely ignored (no binding, no check). Under map-capacity pressure or kernel resource exhaustion the update can fail silently, so reverse-NAT records are omitted and a subsequent inbound ICMP error (Time Exceeded / Packet Too Big for PMTUD, traceroute) cannot be reverse-NAT'd to the original source — the error is dropped or sent to the wrong host, with no operator-visible signal.
+
+## Trigger / repro
+Drive enough concurrent SNAT flows to pressure the `dnat_table` map (or otherwise force `bpf_map_update_elem` to fail). Reverse-NAT for embedded-ICMP errors silently degrades with no counter/log to attribute it.
+
+## Suggested fix
+Capture and check the `bpf_map_update_elem` return value. On error, increment a thread-local counter (e.g. `dnat_map_update_errors`) and emit a rate-limited warning so operators can see map-capacity pressure. Surface the counter in the existing dataplane metrics.
 
 
 ---
