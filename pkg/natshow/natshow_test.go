@@ -251,7 +251,7 @@ func TestRenderSourceRuleDetailLoadedGolden(t *testing.T) {
 	}
 	cr := &dataplane.ApplyResult{
 		ZoneIDs:       map[string]uint16{"trust": 7, "untrust": 8},
-		NATCounterIDs: map[string]uint32{"rs-src/r1": 5},
+		NATCounterIDs: map[string]uint32{dataplane.NATCounterKey(dataplane.NATCounterTypeSource, "rs-src", "r1"): 5},
 	}
 	var b strings.Builder
 	RenderSourceRuleDetail(&b, cfg, dp, func() *dataplane.ApplyResult { return cr })
@@ -283,7 +283,7 @@ func TestRenderDestRuleDetailLoadedGolden(t *testing.T) {
 	}
 	cr := &dataplane.ApplyResult{
 		ZoneIDs:       map[string]uint16{"untrust": 8, "dmz": 9},
-		NATCounterIDs: map[string]uint32{"rs-dst/d1": 6},
+		NATCounterIDs: map[string]uint32{dataplane.NATCounterKey(dataplane.NATCounterTypeDest, "rs-dst", "d1"): 6},
 	}
 	var b strings.Builder
 	RenderDestRuleDetail(&b, cfg, dp, func() *dataplane.ApplyResult { return cr })

@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/dataplane"
 )
 
 func TestBuildSourceNATSnapshotsPerUplinkZones(t *testing.T) {
@@ -58,7 +59,8 @@ func TestBuildSourceNATSnapshotsPerUplinkZones(t *testing.T) {
 
 // TestBuildNATSnapshotsStampCounterID is the #2218 fail-on-revert guard for
 // the snapshot half: the compiler-assigned per-rule NAT counter IDs
-// (CompileResult.NATCounterIDs, keyed "ruleSet/ruleName") must be stamped onto
+// (CompileResult.NATCounterIDs, keyed "natType/ruleSet/ruleName" via
+// dataplane.NATCounterKey) must be stamped onto
 // the SNAT/DNAT/static rule snapshots so the Rust dataplane can attribute a
 // translation hit to the matched rule. Without the CounterID plumbing the
 // snapshots carry CounterID 0 and the hot path can never attribute a hit.
@@ -94,10 +96,12 @@ func TestBuildNATSnapshotsStampCounterID(t *testing.T) {
 		}}},
 	}
 
+	// #2218: counter-ID map keys are type-namespaced (dataplane.NATCounterKey)
+	// so same-named rules across NAT types do not collide.
 	natCounterIDs := map[string]uint16{
-		"srcnat/snat-rule":    5,
-		"dstnat/dnat-rule":    6,
-		"statnat/static-rule": 7,
+		dataplane.NATCounterKey(dataplane.NATCounterTypeSource, "srcnat", "snat-rule"):    5,
+		dataplane.NATCounterKey(dataplane.NATCounterTypeDest, "dstnat", "dnat-rule"):      6,
+		dataplane.NATCounterKey(dataplane.NATCounterTypeStatic, "statnat", "static-rule"): 7,
 	}
 
 	src := buildSourceNATSnapshots(cfg, natCounterIDs)

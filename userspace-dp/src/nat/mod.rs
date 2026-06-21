@@ -184,8 +184,11 @@ impl NatCounterStore {
         }
     }
 
-    /// One status row per stored counter_id (zero or not), matching
-    /// `PolicyState::counter_snapshots` which emits one row per rule.
+    /// One status row per stored counter_id, regardless of whether its
+    /// packet/byte value is zero. Every stored id is non-zero: counter_id 0 is
+    /// the "no per-rule counter" sentinel and is never stored (see
+    /// `rule_counter`), so it never appears as a row. Matches
+    /// `PolicyState::counter_snapshots`, which emits one row per rule.
     pub(crate) fn snapshots(&self) -> Vec<NatRuleCounterStatus> {
         let Ok(counters) = self.counters.lock() else {
             return Vec::new();

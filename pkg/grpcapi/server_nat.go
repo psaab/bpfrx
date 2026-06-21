@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/psaab/xpf/pkg/dataplane"
 	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
 	"github.com/psaab/xpf/pkg/vrrp"
 )
@@ -189,10 +190,12 @@ func (s *Server) GetNATRuleStats(_ context.Context, req *pb.GetNATRuleStatsReque
 	cr := s.loadedApplyResult()
 	telemetry := s.telemetry()
 
-	// Helper to read NAT rule counters
-	readCounter := func(rsName, ruleName string) (uint64, uint64) {
+	// Helper to read NAT rule counters. natType MUST match the type the
+	// compiler stamped (#2218): same-named source/destination/static rules use
+	// distinct counter IDs keyed by dataplane.NATCounterKey.
+	readCounter := func(natType, rsName, ruleName string) (uint64, uint64) {
 		if cr != nil {
-			ruleKey := rsName + "/" + ruleName
+			ruleKey := dataplane.NATCounterKey(natType, rsName, ruleName)
 			if cid, ok := cr.NATCounterIDs[ruleKey]; ok {
 				cnt, err := telemetry.NATRuleCounter(uint32(cid))
 				if err == nil {
@@ -222,7 +225,7 @@ func (s *Server) GetNATRuleStats(_ context.Context, req *pb.GetNATRuleStatsReque
 				if rule.Match.DestinationAddress != "" {
 					dstMatch = rule.Match.DestinationAddress
 				}
-				hitPkts, hitBytes := readCounter(rs.Name, rule.Name)
+				hitPkts, hitBytes := readCounter(dataplane.NATCounterTypeSource, rs.Name, rule.Name)
 				resp.Rules = append(resp.Rules, &pb.NATRuleStats{
 					RuleSet:          rs.Name,
 					RuleName:         rule.Name,
@@ -257,7 +260,7 @@ func (s *Server) GetNATRuleStats(_ context.Context, req *pb.GetNATRuleStatsReque
 					if rule.Match.DestinationPort != 0 {
 						dstMatch += fmt.Sprintf(":%d", rule.Match.DestinationPort)
 					}
-					hitPkts, hitBytes := readCounter(rs.Name, rule.Name)
+					hitPkts, hitBytes := readCounter(dataplane.NATCounterTypeDest, rs.Name, rule.Name)
 					resp.Rules = append(resp.Rules, &pb.NATRuleStats{
 						RuleSet:          rs.Name,
 						RuleName:         rule.Name,

@@ -51,28 +51,50 @@ func resolveSNATMatchAddr(dp DataPlane, cidr string, result *CompileResult) (uin
 	return addrID, nil
 }
 
+// NAT counter-key type prefixes (#2218). The per-rule NAT translation hit
+// counter map is keyed by "natType/rulesetName/ruleName". The type prefix is
+// required because the same (rule-set, rule) name pair can be reused across
+// source-, destination-, and static-NAT (Junos allows independent name spaces
+// per NAT type). Without the prefix those distinct rules collide on a single
+// counter ID and their hit counts merge. Write site (assignNATCounterID) and
+// every read site MUST use NATCounterKey with the matching type.
+const (
+	NATCounterTypeSource = "snat"
+	NATCounterTypeDest   = "dnat"
+	NATCounterTypeStatic = "static"
+)
+
+// NATCounterKey builds the per-rule NAT translation hit counter map key for a
+// NAT rule. natType is one of the NATCounterType* constants. This is the single
+// key formatter shared by the compiler write site and every operator read site
+// (CLI / gRPC / REST / natshow) so the type-namespaced key stays consistent.
+func NATCounterKey(natType, ruleSet, rule string) string {
+	return natType + "/" + ruleSet + "/" + rule
+}
+
 // assignNATCounterID assigns (or reuses) the per-rule translation hit
-// counter ID for a NAT rule keyed by "rulesetName/ruleName". Counter IDs
-// are 1-based (0 means "no counter"); the assignment is shared across all
-// expanded address/port/protocol pairs of the same rule so every hit on
-// that rule attributes to a single counter slot. When the counter space is
-// exhausted the rule falls back to counter 0 (no per-rule attribution) and
+// counter ID for a NAT rule keyed by NATCounterKey(natType, ruleSet, rule).
+// Counter IDs are 1-based (0 means "no counter"); the assignment is shared
+// across all expanded address/port/protocol pairs of the same rule so every
+// hit on that rule attributes to a single counter slot. When the counter space
+// is exhausted the rule falls back to counter 0 (no per-rule attribution) and
 // a warning is logged, mirroring the historical SNAT behavior.
 //
 // This is the single source of truth for NAT rule counter IDs across SNAT,
 // DNAT, and static NAT. The compiler-assigned IDs are surfaced to the Rust
 // userspace dataplane via the config snapshot (so the hot path can attribute
 // a translation hit to the matched rule) and read back by the operator
-// surfaces through Manager.ReadNATRuleCounter (#2218).
-func assignNATCounterID(result *CompileResult, ruleSet, rule string) uint16 {
-	ruleKey := ruleSet + "/" + rule
+// surfaces through Manager.ReadNATRuleCounter (#2218). The natType prefix keeps
+// same-named rules across SNAT/DNAT/static from colliding on one counter ID.
+func assignNATCounterID(result *CompileResult, natType, ruleSet, rule string) uint16 {
+	ruleKey := NATCounterKey(natType, ruleSet, rule)
 	if existing, ok := result.NATCounterIDs[ruleKey]; ok {
 		return existing
 	}
 	counterID := result.nextNATCounterID
 	if counterID >= MaxNATRuleCounters {
 		slog.Warn("NAT rule counter IDs exhausted, reusing counter 0",
-			"rule-set", ruleSet, "rule", rule,
+			"nat-type", natType, "rule-set", ruleSet, "rule", rule,
 			"counter_id", counterID, "max", MaxNATRuleCounters)
 		counterID = 0
 	}
@@ -147,7 +169,7 @@ func compileNAT(dp DataPlane, cfg *config.Config, result *CompileResult) error {
 				}
 
 				zp := zonePairIdx{fromZone, toZone}
-				counterID := assignNATCounterID(result, rs.Name, rule.Name)
+				counterID := assignNATCounterID(result, NATCounterTypeSource, rs.Name, rule.Name)
 
 				for _, srcAddr := range srcAddrs {
 					srcAddrID, err := resolveSNATMatchAddr(dp, srcAddr, result)
@@ -495,7 +517,7 @@ func compileNAT(dp DataPlane, cfg *config.Config, result *CompileResult) error {
 			zp := zonePairIdx{fromZone, toZone}
 
 			// Assign NAT rule counter ID (shared across expanded address pairs)
-			counterID := assignNATCounterID(result, rs.Name, rule.Name)
+			counterID := assignNATCounterID(result, NATCounterTypeSource, rs.Name, rule.Name)
 
 			for _, srcAddr := range srcAddrs {
 				srcAddrID, err := resolveSNATMatchAddr(dp, srcAddr, result)
@@ -588,7 +610,7 @@ func compileNAT(dp DataPlane, cfg *config.Config, result *CompileResult) error {
 				// legacy BPF DNAT table did not carry a counter ID, so DNAT
 				// "Translation hits" never displayed at all; the userspace
 				// dataplane attributes hits via the snapshot-stamped ID.
-				_ = assignNATCounterID(result, rs.Name, rule.Name)
+				_ = assignNATCounterID(result, NATCounterTypeDest, rs.Name, rule.Name)
 
 				// Validate source-address-name if present (config compatibility)
 				if rule.Match.SourceAddressName != "" {
@@ -836,7 +858,7 @@ func compileStaticNAT(dp DataPlane, cfg *config.Config, result *CompileResult) e
 			// Assign the per-rule translation hit counter ID (#2218) so the
 			// userspace dataplane can attribute static-NAT translations to
 			// this rule and `show security nat static rule` reports non-zero.
-			_ = assignNATCounterID(result, rs.Name, rule.Name)
+			_ = assignNATCounterID(result, NATCounterTypeStatic, rs.Name, rule.Name)
 
 			// Insert DNAT entry (external -> internal) and SNAT entry (internal -> external)
 			if extIsV4 && intIsV4 {

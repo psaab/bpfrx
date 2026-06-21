@@ -179,7 +179,7 @@ func (s *Server) natRuleStatsHandler(w http.ResponseWriter, r *http.Request) {
 
 			var hitPkts, hitBytes uint64
 			if cr != nil {
-				ruleKey := rs.Name + "/" + rule.Name
+				ruleKey := dataplane.NATCounterKey(dataplane.NATCounterTypeSource, rs.Name, rule.Name)
 				if cid, ok := cr.NATCounterIDs[ruleKey]; ok {
 					cnt, err := s.dp.ReadNATRuleCounter(uint32(cid))
 					if err == nil {
