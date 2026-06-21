@@ -14,6 +14,28 @@
   yields Value="description" / dropped entry). Documented in docs/bugs.md.
 - **File(s)**: pkg/config/compiler_security.go, pkg/config/types_security.go,
   pkg/config/parser_security_test.go, docs/bugs.md
+## 2026-06-21 — #2208: TX dispatch recycle-on-every-path (UMEM descriptor leak)
+
+- **Timestamp**: 2026-06-21
+- **Action**: Fixed four bare `continue;` statements in
+  `enqueue_pending_forwards` that jumped past the loop finalizer, leaking
+  the ingress UMEM descriptor (never recycled to the fill ring) under TX
+  congestion / oversized-frame edges → per-packet pool drain → worker
+  stall. The two enqueue-failure sites (cp1/cp2) now fall through with
+  `build_failed=true; fallback_to_slow_path=true` so the finalizer both
+  recycles and runs `handle_forward_build_failure` (slow-path reinject);
+  the two oversized sites (cp1/cp2) fall through with `build_failed=true`
+  only (undeliverable — drop-and-recycle, no reinject). Added three
+  dispatch tests (enqueue-failure recycle+reinject, oversized
+  recycle+no-reinject, N-forward conservation) that FAIL against the
+  pre-fix `continue;` (recycle-count == 0 leak); two `#[cfg(test)]`-only
+  fault-injection thread-locals (`FORCE_ENQUEUE_ERR`, `FORCE_OVERSIZED`)
+  drive the otherwise hard-to-reach branches with zero release-build cost.
+  Documented the recycle-on-every-path invariant in `afxdp/README.md`.
+- **File(s)**: userspace-dp/src/afxdp/tx/dispatch/mod.rs,
+  userspace-dp/src/afxdp/tx/dispatch/cos.rs,
+  userspace-dp/src/afxdp/tx/dispatch/dispatch_tests.rs,
+  userspace-dp/src/afxdp/README.md
 
 ## 2026-06-21 — #2150 PR-1: Ethernet/IPv6 parser correctness sub-fixes + drift canaries
 

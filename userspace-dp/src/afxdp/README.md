@@ -42,6 +42,24 @@ sync.
   4 KB (`UMEM_FRAME_SIZE = 4096`); index is `addr >> 12`.
 - `tx/` — TX ring management, batched enqueue, TSO segmentation
   (`tx/tcp_segmentation.rs` after PR #1199), per-binding TX counters.
+  - `tx/dispatch/` — the per-tick forwarding dispatcher
+    (`enqueue_pending_forwards`). **Recycle-on-every-path invariant
+    (#2208):** the ingress descriptor is read directly from ingress
+    UMEM (the RX ring already released it), so `recycle_ingress_frame`
+    — pushing `source_offset` to `pending_fill_frames` → the fill ring
+    — is the SOLE path that returns the frame to circulation. Every
+    per-request exit MUST recycle exactly once: the loop finalizer does
+    this (`if !retained_source_frame`), and `retained_source_frame` is
+    true ONLY on the in-place-rewrite branch (where the descriptor IS
+    the TX frame and is recycled by `PreparedTxRecycle::fill_on_slot`
+    on completion). Exception/build-failure branches must FALL THROUGH
+    to the finalizer, never `continue` past it — a bare `continue`
+    leaks the descriptor (per-packet UMEM-pool drain → worker stall
+    under TX congestion). The two enqueue-failure sites also set
+    `build_failed=true; fallback_to_slow_path=true` so the finalizer's
+    `handle_forward_build_failure` reinjects the frame to the slow path;
+    the two oversized sites set `build_failed=true` only (the frame is
+    undeliverable — drop-and-recycle, no reinject).
 - `cos/` — Class-of-Service scheduler: token-bucket admission, MQFQ
   active-bucket selection, fair-share lease (#1229 Phase 6 v8). See
   `docs/per-5-tuple/state.md` for the architectural ceiling.
