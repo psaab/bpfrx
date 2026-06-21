@@ -3,6 +3,11 @@
 **Status:** v2 — Codex round-1 PLAN-KILL addressed (false "already
 maintained" premise removed; enforcement gap split to a follow-up issue;
 leak fix retained as the correct + complete fix for the filed DoS).
+Codex round-2 PLAN-NEEDS-MINOR addressed: the out-of-scope cap note now
+states the correct key-cardinality bound (distinct live-session IPs /
+session-table capacity, NOT the per-IP limit). Codex round-2 confirmed
+the kill is resolved, the leak fix is correct with no residual read-side
+insert, and the leak test is non-tautological.
 
 ## Round-1 adversarial review outcome
 
@@ -265,9 +270,13 @@ fn session_limit_dst_len(&self) -> usize { self.session_limits.dst_len() }
   surface and HA implications — deliberately NOT bundled with this
   security leak fix.
 - Capping / LRU-bounding the count map beyond evict-on-zero. With the
-  read side effect removed, the map is bounded by the number of IPs with
-  live sessions (which, once enforcement is wired, is itself bounded by
-  the configured limit). No separate cap is needed to close THIS DoS.
+  read side effect removed, the map's key cardinality is bounded by the
+  number of DISTINCT IPs that currently have at least one live session —
+  i.e. by global live-session cardinality / the session-table capacity,
+  NOT by the configured per-IP `limit` (the per-IP limit bounds the COUNT
+  stored per key, not how many distinct keys exist). The attacker can no
+  longer add a key without a live session, which is what closes the DoS;
+  no separate cap is needed.
 - Extending periodic cleanup to sweep `session_limits` — unnecessary
   once the read path no longer inserts.
 - Any change to `port_scan` / `ip_sweep` trackers.
