@@ -311,22 +311,36 @@ impl SessionTable {
     }
 
     /// #2120: re-bucket an entry the expire pass decided to keep alive
-    /// (SELF-HEAL or HOLD) so it is re-examined on a future tick. For a
-    /// SELF-HEAL re-stamp, `last_seen_ns` is now fresh, so the entry
-    /// schedules to its natural full-timeout tick. For a HOLD (no
-    /// re-stamp, expiration already in the past) we schedule one tick
-    /// ahead so the entry is re-examined every interval (re-checking the
-    /// self-heal edge and the stale-synced ceiling) until it is released
-    /// or reaped. Mirrors the Case-4 re-bucket exactly otherwise.
+    /// (SELF-HEAL or HOLD) so it is re-examined on a future tick.
+    ///
+    /// For a SELF-HEAL re-stamp, `last_seen_ns` is now fresh, so the
+    /// entry schedules to its natural full-timeout tick (FAR_FUTURE for
+    /// long timeouts, exactly like Case-4).
+    ///
+    /// For a HOLD (no re-stamp, expiration already at/before `now`) we
+    /// schedule the entry at exactly the CURRENT tick (`now_tick`). The
+    /// drain loop runs `while cursor_tick < now_tick`, so a WheelEntry
+    /// placed at `now_tick` is NOT re-drained during THIS call (the loop
+    /// terminates at `now_tick`); the NEXT expire pass (with an advanced
+    /// `now_ns`) drains it. This is the only safe re-bucket target for a
+    /// still-due entry: the wheel has only WHEEL_BUCKETS physical buckets,
+    /// so scheduling at any tick the cursor has not yet passed
+    /// (`< now_tick`) collides with a bucket the cursor re-visits within
+    /// this call — re-draining (and re-holding) the entry repeatedly under
+    /// a multi-tick jump. Scheduling at `now_tick` re-examines a held
+    /// entry every interval (re-checking the self-heal edge + the ceiling)
+    /// without any in-call re-drain. Self-healed entries (fresh
+    /// `last_seen`) schedule to their natural expiration tick, exactly
+    /// like Case-4 (FAR_FUTURE for long timeouts).
     fn rebucket_alive_entry(&mut self, key: &SessionKey, now_ns: u64) {
-        let next_tick_floor = now_ns.saturating_add(WHEEL_TICK_NS);
         let Some(entry) = self.entry_by_key(key) else {
             return;
         };
         let natural_expiration = entry.last_seen_ns.saturating_add(entry.expires_after_ns);
-        // Held entries have a past expiration; schedule at least one tick
-        // ahead so they are re-examined next interval rather than dropped.
-        let expiration_for_schedule = natural_expiration.max(next_tick_floor);
+        // Held entries (past expiration) clamp to `now_ns` so
+        // `target_tick_for` yields `now_tick` (delta 0). Self-healed
+        // entries keep their future natural expiration.
+        let expiration_for_schedule = natural_expiration.max(now_ns);
         let new_target_tick = target_tick_for(now_ns, expiration_for_schedule);
         let new_bucket = bucket_for_tick(new_target_tick);
         let Some(entry_mut) = self.entry_by_key_mut(key) else {
@@ -392,11 +406,17 @@ impl SessionTable {
             // for owner_rg_id <= 0 is a whole-node-standby (node_active
             // false) — held. So an aged owner_rg_id<=0-on-active-node is
             // observed separately below, not here.
-            let _ = is_reverse;
+            let _ = (is_reverse, last_seen_ns);
+            // Measure the hold duration from when the entry FIRST entered
+            // the held state. On the very first hold observation
+            // `first_held_ns` is still 0 (the HOLD branch below stamps it
+            // to `now_ns`), so the held duration is 0 — a long-idle synced
+            // session that has only just crossed its idle timeout is held,
+            // NOT instantly reaped from its stale `last_seen_ns`.
             let held_since = if first_held_ns != 0 {
                 first_held_ns
             } else {
-                last_seen_ns
+                now_ns
             };
             let held_ns = now_ns.saturating_sub(held_since);
             if held_ns > ha.stale_ceiling_ns(expires_after_ns) {
