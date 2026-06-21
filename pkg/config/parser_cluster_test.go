@@ -229,7 +229,7 @@ func TestChassisClusterExtendedFieldsSet(t *testing.T) {
 }
 
 func TestChassisClusterSyncOptions(t *testing.T) {
-	commands := []string{"set chassis cluster cluster-id 1", "set chassis cluster node 0", "set chassis cluster configuration-synchronize", "set chassis cluster nat-state-synchronization", "set chassis cluster ipsec-session-synchronization"}
+	commands := []string{"set chassis cluster cluster-id 1", "set chassis cluster node 0", "set chassis cluster configuration-synchronize", "set chassis cluster nat-state-synchronization", "set chassis cluster ipsec-session-synchronization", "set chassis cluster dhcp-lease-synchronization"}
 	tree := &ConfigTree{}
 	for _, cmd := range commands {
 		path, err := ParseSetCommand(cmd)
@@ -257,6 +257,9 @@ func TestChassisClusterSyncOptions(t *testing.T) {
 	if !cl.IPsecSASync {
 		t.Error("IPsecSASync should be true")
 	}
+	if !cl.DHCPLeaseSync {
+		t.Error("DHCPLeaseSync should be true")
+	}
 }
 
 func TestChassisClusterSyncOptionsHierarchical(t *testing.T) {
@@ -267,6 +270,7 @@ func TestChassisClusterSyncOptionsHierarchical(t *testing.T) {
         configuration-synchronize;
         nat-state-synchronization;
         ipsec-session-synchronization;
+        dhcp-lease-synchronization;
     }
 }`
 	p := NewParser(input)
@@ -290,6 +294,9 @@ func TestChassisClusterSyncOptionsHierarchical(t *testing.T) {
 	}
 	if !cl.IPsecSASync {
 		t.Error("IPsecSASync should be true")
+	}
+	if !cl.DHCPLeaseSync {
+		t.Error("DHCPLeaseSync should be true")
 	}
 }
 
