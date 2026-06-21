@@ -1163,3 +1163,92 @@ func isKnownProcessName(name string) bool {
 	_, ok := knownManagedProcessNames[name]
 	return ok
 }
+
+// validateRibGroupImportRibReferencesStrict hard-rejects a
+// `routing-options rib-groups <group> import-rib <rib>` entry whose rib
+// name resolves to no real routing table (#2226).
+//
+// A valid import-rib names one of:
+//   - inet.0 / inet6.0 (the main table), OR
+//   - "<instance>.inet.0" / "<instance>.inet6.0" where <instance> is a
+//     defined routing-instance.
+//
+// Any other name — a typo, a non-existent instance, or unparseable
+// garbage — is undefined. ValidateConfig only ever emitted an over-limit
+// WARNING for rib-groups; it never validated that an import-rib names a
+// real rib. The applier's resolveRibTable previously mapped any
+// unresolvable name to a bare table 0 (see pkg/routing/rules.go). Because
+// a routing-instance's source table is always >= 100, an unresolvable
+// import-rib yielded targetTable(0) != sourceTable, which set needsLeak
+// and installed an `ip rule from all lookup <sourceTable> pref 33000` for
+// a rib that does not exist — a silent mis-leak of the source table into
+// the main lookup, with no diagnostic. This gate makes the dangling
+// reference an operator-visible commit error; resolveRibTable's ok=false
+// path is the defense-in-depth backstop for any reference that still
+// reaches apply via the tolerant load / peer-sync path.
+//
+// Rib-group names are iterated in sorted order, and each group's
+// import-rib list is walked in declaration order, so the first-reported
+// error is deterministic (Go map order is randomized). Every defined
+// rib-group is validated (not only ones referenced by an instance's
+// interface-routes rib-group), mirroring Junos, which rejects an
+// undefined rib regardless of whether the group is in use.
+//
+// On the tolerant load / peer-sync paths the call site downgrades this to
+// a warning (opts.lenientRibGroupRefs) so an already-persisted or peer-
+// synced config carrying a dangling import-rib still BOOTS (#1960
+// fail-closed-on-load class); the applier's ok=false guard keeps it inert
+// (the phantom rib is skipped, no rule is installed), exactly matching the
+// post-fix runtime behaviour. Commit / commit-check stay strict. Mirrors
+// validateRoutingExportReferencesStrict.
+func validateRibGroupImportRibReferencesStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	ribGroups := cfg.RoutingOptions.RibGroups
+	if len(ribGroups) == 0 {
+		return nil
+	}
+	definedInstance := make(map[string]bool, len(cfg.RoutingInstances))
+	for _, ri := range cfg.RoutingInstances {
+		if ri != nil && ri.Name != "" {
+			definedInstance[ri.Name] = true
+		}
+	}
+	// resolvable mirrors pkg/routing.resolveRibTable's definedness view:
+	// inet.0 / inet6.0, or "<defined-instance>.inet[6].0".
+	resolvable := func(ribName string) bool {
+		if ribName == "inet.0" || ribName == "inet6.0" {
+			return true
+		}
+		if idx := strings.Index(ribName, ".inet"); idx > 0 {
+			return definedInstance[ribName[:idx]]
+		}
+		return false
+	}
+	names := make([]string, 0, len(ribGroups))
+	for name := range ribGroups {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		rg := ribGroups[name]
+		if rg == nil {
+			continue
+		}
+		for _, ribName := range rg.ImportRibs {
+			if ribName == "" || resolvable(ribName) {
+				continue
+			}
+			return fmt.Errorf(
+				"routing-options rib-groups %q import-rib %q references an "+
+					"undefined rib (name a defined routing-instance as "+
+					"\"<instance>.inet.0\" / \"<instance>.inet6.0\", or use "+
+					"inet.0 / inet6.0 for the main table — an undefined rib "+
+					"would otherwise silently leak this table's routes into "+
+					"the main lookup)",
+				name, ribName)
+		}
+	}
+	return nil
+}

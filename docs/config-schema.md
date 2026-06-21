@@ -714,6 +714,56 @@ lenient-warns; plus three-color-policer + `junos-*` predefined + nested-set +
 implicit-multi-term-not-false-rejected cases). Like the gates above, these are
 compiler-side only — not yet typed `setSchema` leaves.
 
+### #2226 — rib-group `import-rib` undefined-reference validation
+
+`routing-options rib-groups <group> import-rib <rib>` was unvalidated: an
+import-rib naming a rib that resolves to no real routing table (a typo, a
+non-existent routing-instance, or unparseable garbage) compiled cleanly. At apply
+time `resolveRibTable` (`pkg/routing/rules.go`) mapped any unresolvable name to a
+bare table **0**. Because a routing-instance's source table is always `>= 100`,
+the unresolvable name yielded `targetTable(0) != sourceTable`, which set
+`needsLeak` and installed an `ip rule from all lookup <sourceTable> pref 33000`
+for a rib that does not exist — a silent mis-leak of the source table into the
+main lookup, with no diagnostic. (`ValidateConfig` only ever emitted an
+over-limit *warning* for rib-groups; it never checked that an import-rib names a
+real rib.)
+
+Two layers close the gap:
+
+- **Commit-time gate (preferred) — `validateRibGroupImportRibReferencesStrict`**
+  in `pkg/config/compiler_validate_strict.go`, invoked from `compileExpanded`
+  (`compiler.go`) alongside the other strict gates. A valid import-rib names
+  `inet.0` / `inet6.0` (the main table) or `"<instance>.inet.0"` /
+  `"<instance>.inet6.0"` for a defined routing-instance. Any other name is a HARD
+  commit error naming the rib-group and the offending rib. Every defined
+  rib-group is validated (not only ones referenced by an instance's
+  interface-routes rib-group), mirroring Junos, which rejects an undefined rib
+  regardless of whether the group is in use. Rib-groups are iterated in sorted
+  order for a deterministic first-error.
+- **Runtime backstop — `resolveRibTable` now returns `(tableID int, ok bool)`.**
+  The `Apply` `needsLeak` loop treats `ok == false` as "unknown rib": it skips
+  the entry (with a `slog.Warn`) and never sets `needsLeak` from it, so no rule
+  is installed for a phantom rib and nothing is ever installed into table 0 from
+  an unresolved name. This guards any reference that still reaches apply via the
+  tolerant load / peer-sync path.
+
+**Strict (`commit` / `commit check`):** a dangling import-rib is a hard commit
+error. **Lenient (`Store.Load` / HA peer-sync — `CompileConfigLenient` /
+`CompileConfigForNodeLenient`, flag `lenientRibGroupRefs`):** downgraded to a
+`cfg.Warnings` entry so a node that committed a dangling import-rib BEFORE this
+gate existed (or a peer-synced config) still BOOTS (#1960
+fail-closed-on-compile-failure). The runtime backstop keeps a leniently-loaded
+reference inert (the phantom rib is skipped, no rule installed), matching the
+post-fix behaviour, and the operator's next strict commit rejects it loudly.
+
+Regression coverage: `pkg/config/compiler_ribgroup_ref_2226_test.go`
+(undefined-reject in both AST shapes, garbage-token reject, defined-ribs +
+inet6-ribs commit cleanly, lenient-warns) and `pkg/routing/rules_test.go`
+(`TestRibGroupRulesApply_UnknownRibNoLeak` — an all-unknown rib-group installs
+ZERO rules; `TestRibGroupRulesApply_DefinedRibStillLeaks` — a defined rib still
+leaks correctly). Like the gates above, this is compiler-side only — not yet a
+typed `setSchema` leaf.
+
 ## The `inactive:` universal node modifier (#2008 H1)
 
 `inactive:` is the Junos deactivate-without-delete marker and is NOT a
