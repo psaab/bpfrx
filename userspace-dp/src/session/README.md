@@ -100,6 +100,18 @@ demotion-window entry (the demote flip not yet applied) is held too.
 node-level `rg_epochs[0]` activation edge so the self-heal fires for
 those entries.
 
+`seen_rg_epoch` changes ONLY on install/refresh (→ 0) and SELF-HEAL
+(→ current epoch). The HOLD branch does **not** stamp it. This is
+load-bearing: the worker reads the HA map and `rg_epochs` as two separate
+loads, so a HOLD can observe an OLD (inactive) map with a NEW (already
+bumped) epoch. If HOLD stamped that new epoch, the next pass — which sees
+the new ACTIVE map with the same epoch — would find
+`current_epoch == seen_rg_epoch` and SKIP the self-heal, aging the synced
+session. Leaving `seen_rg_epoch` at its install/refresh value guarantees
+the first forwarding pass after any epoch-bumping activation fires the
+self-heal; the self-heal arm then records the epoch, so it does not
+re-fire perpetually.
+
 The **stale-synced ceiling** is
 `min(STALE_SYNCED_CEILING_MULT × expires_after_ns,
 STALE_SYNCED_CEILING_ABS_NS)` (MULT = 3, ABS ≈ 7 days), measured from
