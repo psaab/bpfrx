@@ -8917,3 +8917,15 @@ top.
   pkg/config/compiler_nptv6_test.go (new), userspace-dp/src/nptv6.rs,
   userspace-dp/src/nptv6_tests.rs, userspace-dp/src/policy.rs,
   userspace-dp/src/afxdp/forwarding_build/mod.rs, userspace-dp/src/FEATURES.md
+
+- **Timestamp**: 2026-06-21
+- **Action**: #2240/#2241 PR #2246 review polish — qualify the NPTv6 overlap
+  rejection error with the prior rule's rule-set name (independent review +
+  Copilot MINOR). buildNptv6Snapshots flattens all rule-sets into one
+  first-match list, so an overlap can be cross-rule-set; reused rule names
+  across rule-sets were ambiguous. seenPrefix now carries ruleSetName; error
+  emits `overlaps rule-set %q rule %q`. New TestNPTv6RejectsCrossRuleSetOverlap.
+  Behavior-preserving. Independent review verdict: MERGE-READY (fail-closed
+  correctness + overlap determinism + fail-on-revert all CONFIRMED both sides;
+  no wire regen; 2 pre-existing pkg/dataplane canary failures unrelated).
+- **File(s)**: pkg/config/compiler_nat.go, pkg/config/compiler_nptv6_test.go
