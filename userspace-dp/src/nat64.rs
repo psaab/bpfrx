@@ -1,3 +1,35 @@
+//! NAT64 (RFC 6052 / RFC 7915) stateless IPv4↔IPv6 translation for the
+//! userspace dataplane.
+//!
+//! Two module invariants the rest of the crate relies on:
+//!
+//! * **No per-packet heap allocation on the translate hot path (#2211).** The
+//!   v6↔v4 translators have an allocation-free core
+//!   ([`write_v6_to_v4_into`] / [`write_v4_to_v6_into`]) that writes the
+//!   translated L3 directly into a caller-provided buffer, and the
+//!   pseudo-header L4 checksum is STREAMED (no per-call `Vec`). The frame
+//!   builders ([`build_nat64_v6_to_v4_frame`] / [`build_nat64_v4_to_v6_frame`])
+//!   make exactly ONE output allocation — the `TxRequest.bytes` the TX path
+//!   requires — and translate straight into its tail, eliminating the former
+//!   intermediate L3 `Vec`, the pseudo-header `Vec`s, and the double L4 copy.
+//!   The `translate_v6_to_v4` / `translate_v4_to_v6` `Vec`-returning wrappers
+//!   are `#[cfg(test)]`-only: the differential tests use them to assert the
+//!   `_into` cores are byte-identical to an owned-`Vec` translation. They are
+//!   NOT on the forwarding hot path and are absent from the release build.
+//! * **Fail CLOSED on an unparseable config rule (#2212).**
+//!   [`Nat64State::try_from_snapshots`] rejects the whole snapshot (returning a
+//!   [`crate::policy::SnapshotIntegrityError`]) on an empty/malformed/non-/96
+//!   prefix or a pool address that is neither a bare IPv4 nor a `/32` host —
+//!   one bad pool entry fails the rule rather than being silently filtered. The
+//!   apply preflight then keeps the previous live forwarding state. This is the
+//!   helper-boundary backstop to the Go commit-time gate
+//!   (`pkg/config/compiler_nat.go`, #2173), consistent with the
+//!   #2124/#2142/#2173/#2175 fail-closed family. The pre-fix parser silently
+//!   `continue`d/`filter_map`ped bad input, which could leave a prefix present
+//!   with an emptied pool — `allocate_v4_source` then returns `None` and NAT64
+//!   forward translation silently stops (a fail-open in the retired-eBPF
+//!   enforcement plane).
+
 use crate::NAT64RuleSnapshot;
 use crate::nat::NatDecision;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
@@ -63,27 +95,69 @@ fn parse_pool_v4(s: &str) -> Option<Ipv4Addr> {
 }
 
 impl Nat64State {
-    /// Build from config snapshot NAT64 rules.
-    pub(crate) fn from_snapshots(snaps: &[NAT64RuleSnapshot]) -> Self {
+    /// Build from config snapshot NAT64 rules, failing CLOSED on an
+    /// unparseable rule (#2212).
+    ///
+    /// In a retired-eBPF world (#1373) the userspace helper is the enforcement
+    /// plane. The pre-fix parser silently `continue`d past a bad prefix and
+    /// `filter_map`ped malformed pool entries away, so a mixed-version control
+    /// plane, a serialization bug, or a missed Go validation edge could install
+    /// a NAT64 rule whose prefix is present but whose pool is silently empty —
+    /// `allocate_v4_source` then returns `None` and NAT64 forward translation
+    /// stops with no failure surfaced. The primary gate is the Go commit-time
+    /// validation (`pkg/config/compiler_nat.go`, #2173, host-mask + pool
+    /// representability); this is the helper-boundary backstop, consistent with
+    /// the #2124/#2142/#2173/#2175 fail-closed family.
+    ///
+    /// On any unparseable rule this returns a `SnapshotIntegrityError`; the
+    /// apply preflight (`forwarding_build`/`reconcile`/`refresh`) then keeps the
+    /// previous live forwarding state rather than installing a narrower NAT64
+    /// config. An empty pool that is genuinely UNCONFIGURED (no `pool_addresses`
+    /// on the wire — the legitimate "no source-pool" state the Go side emits)
+    /// is NOT an error: only a pool that was non-empty on the wire but parsed to
+    /// empty (every entry dropped) is rejected — that is the exact silent
+    /// pool-narrowing fail-open this guards against.
+    pub(crate) fn try_from_snapshots(
+        snaps: &[NAT64RuleSnapshot],
+    ) -> Result<Self, crate::policy::SnapshotIntegrityError> {
+        use crate::policy::SnapshotIntegrityError;
         let mut prefixes = Vec::with_capacity(snaps.len());
         // The natv6v4 no-v6-frag-header option is global; the Go side stamps it
         // onto every rule snapshot. Treat the state as enabled if any rule
         // carries the flag (they all carry the same value in practice).
         let no_v6_frag_header = snaps.iter().any(|s| s.no_v6_frag_header);
         for snap in snaps {
+            // Every NAT64 rule on the wire is enabled (the Go side skips
+            // empty-prefix rules in buildNAT64Snapshots), so an empty prefix
+            // here is anomalous: fail closed rather than silently dropping it.
             if snap.prefix.is_empty() {
-                continue;
+                return Err(SnapshotIntegrityError::Nat64UnparseableRule {
+                    rule_name: snap.name.clone(),
+                    field: "prefix (empty)".to_string(),
+                });
             }
             // Parse "64:ff9b::/96" — extract the prefix address and verify /96.
             let parts: Vec<&str> = snap.prefix.split('/').collect();
-            let prefix_len: u8 = match parts.get(1).and_then(|s| s.parse().ok()) {
-                Some(96) => 96,
-                _ => continue, // Only /96 is supported.
-            };
-            let _ = prefix_len; // suppress warning; validated above
+            match parts.get(1).and_then(|s| s.parse::<u8>().ok()) {
+                Some(96) => {}
+                // Only /96 is supported by the translator today; a different
+                // length (or a missing/garbage mask) was silently dropped
+                // pre-fix, leaving the rule absent at the dataplane.
+                _ => {
+                    return Err(SnapshotIntegrityError::Nat64UnparseableRule {
+                        rule_name: snap.name.clone(),
+                        field: format!("prefix {:?} (only /96 is supported)", snap.prefix),
+                    });
+                }
+            }
             let addr: Ipv6Addr = match parts[0].parse() {
                 Ok(a) => a,
-                Err(_) => continue,
+                Err(_) => {
+                    return Err(SnapshotIntegrityError::Nat64UnparseableRule {
+                        rule_name: snap.name.clone(),
+                        field: format!("prefix address {:?}", parts[0]),
+                    });
+                }
             };
             let octets = addr.octets();
             let mut prefix_bytes = [0u8; 12];
@@ -95,24 +169,40 @@ impl Nat64State {
             // before parse so range-form pools are not silently dropped,
             // leaving pool_v4 empty and NAT64 forward translation
             // non-functional. A non-host mask (`/24`) or garbage suffix is
-            // rejected rather than coerced to a host address, so a
-            // misconfigured pool entry is surfaced (dropped) not silently
-            // mistranslated.
-            let pool_v4: Vec<Ipv4Addr> = snap
-                .pool_addresses
-                .iter()
-                .filter_map(|s| parse_pool_v4(s))
-                .collect();
+            // unparseable: fail CLOSED (#2212) — one bad pool entry rejects the
+            // whole rule rather than silently narrowing the pool.
+            let mut pool_v4 = Vec::with_capacity(snap.pool_addresses.len());
+            for s in &snap.pool_addresses {
+                match parse_pool_v4(s) {
+                    Some(addr) => pool_v4.push(addr),
+                    None => {
+                        return Err(SnapshotIntegrityError::Nat64UnparseableRule {
+                            rule_name: snap.name.clone(),
+                            field: format!("source-pool address {:?}", s),
+                        });
+                    }
+                }
+            }
             prefixes.push(Nat64Prefix {
                 prefix_bytes,
                 pool_v4,
                 pool_index: AtomicUsize::new(0),
             });
         }
-        Self {
+        Ok(Self {
             prefixes,
             no_v6_frag_header,
-        }
+        })
+    }
+
+    /// Infallible test/legacy convenience wrapper over [`try_from_snapshots`]
+    /// (#2212). Panics on a snapshot integrity error, which valid test
+    /// snapshots never produce. Production builds the state through
+    /// `try_from_snapshots` so an unparseable rule rejects the snapshot and
+    /// keeps the previous live state.
+    #[cfg(test)]
+    pub(crate) fn from_snapshots(snaps: &[NAT64RuleSnapshot]) -> Self {
+        Self::try_from_snapshots(snaps).expect("test snapshot must not produce a NAT64 integrity error")
     }
 
     /// Returns true if any NAT64 prefixes are configured.
@@ -252,12 +342,47 @@ fn map_frag_id(raw: u32) -> u16 {
 /// rather than colliding on a constant ID.
 ///
 /// Returns the translated IPv4 packet (L3 only, no Ethernet header).
+///
+/// Allocating convenience wrapper over [`write_v6_to_v4_into`]. Hot-path
+/// callers (the frame builders) write straight into a reserved output buffer
+/// with the `_into` core to avoid this per-packet `Vec` (#2211); this wrapper
+/// is `#[cfg(test)]`-only — the differential tests use it to assert the `_into`
+/// core is byte-identical to an owned-`Vec` translation. No production caller
+/// allocates an owned NAT64 packet, so gating it on test keeps the release
+/// build free of a dead-code path.
+#[cfg(test)]
 pub(crate) fn translate_v6_to_v4(
     packet: &[u8],
     snat_v4: Ipv4Addr,
     dst_v4: Ipv4Addr,
     no_v6_frag_header: bool,
 ) -> Option<Vec<u8>> {
+    // Worst case (no shrink relative to input): 20-byte IPv4 header + the IPv6
+    // L4 payload. The IPv6 input is `40 + payload_len`, so `20 + payload_len`
+    // never exceeds the input length; sizing to the input length is a safe
+    // upper bound, then we truncate to the exact written length.
+    let mut out = vec![0u8; packet.len()];
+    let written = write_v6_to_v4_into(&mut out, packet, snat_v4, dst_v4, no_v6_frag_header)?;
+    out.truncate(written);
+    Some(out)
+}
+
+/// Allocation-free IPv6→IPv4 translation: write the translated IPv4 L3 packet
+/// directly into `dst` and return the number of bytes written (#2211).
+///
+/// `dst` must be at least `20 + ipv6_payload_len` bytes; on a too-small buffer
+/// the function returns `None` without writing a partial frame. Behavior is
+/// byte-identical to the previous `Vec`-allocating translator: same header
+/// fields, same DF/Identification policy, same checksums — the only change is
+/// the output destination and the elimination of the intermediate L3 `Vec`
+/// plus the pseudo-header `Vec`.
+pub(crate) fn write_v6_to_v4_into(
+    dst: &mut [u8],
+    packet: &[u8],
+    snat_v4: Ipv4Addr,
+    dst_v4: Ipv4Addr,
+    no_v6_frag_header: bool,
+) -> Option<usize> {
     if packet.len() < 40 {
         return None;
     }
@@ -286,13 +411,13 @@ pub(crate) fn translate_v6_to_v4(
     let new_ttl = hop_limit - 1;
 
     // Total IPv4 packet length: 20 (header) + L4 payload.
-    let ipv4_total_len = 20u16 + l4_payload.len() as u16;
-    let mut out = vec![0u8; ipv4_total_len as usize];
+    let ipv4_total_len = 20usize + l4_payload.len();
+    let out = dst.get_mut(..ipv4_total_len)?;
 
     // Build IPv4 header.
     out[0] = 0x45; // version=4, IHL=5
     out[1] = traffic_class; // DSCP/ECN copied from IPv6 traffic class (RFC 7915 §5)
-    out[2..4].copy_from_slice(&ipv4_total_len.to_be_bytes());
+    out[2..4].copy_from_slice(&(ipv4_total_len as u16).to_be_bytes());
     // DF policy is the option-gated LOCAL choice (not the size-driven RFC 7915
     // 5.1 selection). Either way the flags+frag-offset word (bytes 6-7) and the
     // Identification field (bytes 4-5) must stay mutually consistent:
@@ -313,11 +438,11 @@ pub(crate) fn translate_v6_to_v4(
     out[6..8].copy_from_slice(&frag_word.to_be_bytes()); // flags + frag offset
     out[8] = new_ttl;
     out[9] = ipv4_protocol;
-    // Checksum = 0 (computed below)
+    out[10..12].copy_from_slice(&[0, 0]); // header checksum = 0 (computed below)
     out[12..16].copy_from_slice(&snat_v4.octets());
     out[16..20].copy_from_slice(&dst_v4.octets());
 
-    // Copy L4 payload.
+    // Copy L4 payload directly into the output L4 region (single copy).
     out[20..].copy_from_slice(l4_payload);
 
     // ICMP type/code translation.
@@ -326,14 +451,13 @@ pub(crate) fn translate_v6_to_v4(
     }
 
     // Recompute L4 checksum (pseudo-header changes from IPv6 to IPv4).
-    recompute_l4_checksum_after_nat64_v6_to_v4(&mut out, ipv4_protocol)?;
+    recompute_l4_checksum_after_nat64_v6_to_v4(out, ipv4_protocol)?;
 
     // Compute IPv4 header checksum.
-    out[10..12].copy_from_slice(&[0, 0]);
     let hdr_sum = checksum16(&out[..20]);
     out[10..12].copy_from_slice(&hdr_sum.to_be_bytes());
 
-    Some(out)
+    Some(ipv4_total_len)
 }
 
 /// Translate an IPv4 packet to IPv6 (reverse direction: server→client reply).
@@ -343,11 +467,38 @@ pub(crate) fn translate_v6_to_v4(
 /// + original IPv4 server address (i.e. orig_dst_v6 for the reply src).
 ///
 /// Returns the translated IPv6 packet (L3 only, no Ethernet header).
+///
+/// Allocating convenience wrapper over [`write_v4_to_v6_into`]; see the
+/// `_into` core for the hot-path, allocation-free entry point (#2211).
+/// `#[cfg(test)]`-only (the differential byte-identity tests), like its
+/// v6->v4 twin — no production caller allocates an owned NAT64 packet.
+#[cfg(test)]
 pub(crate) fn translate_v4_to_v6(
     packet: &[u8],
     src_v6: Ipv6Addr,
     dst_v6: Ipv6Addr,
 ) -> Option<Vec<u8>> {
+    // IPv4→IPv6 grows by 20 bytes (the IPv6 header is 40 vs the 20-byte IPv4
+    // header), so the output is at most `packet.len() + 20`. Allocate that
+    // upper bound, then truncate to the exact written length.
+    let mut out = vec![0u8; packet.len().saturating_add(20)];
+    let written = write_v4_to_v6_into(&mut out, packet, src_v6, dst_v6)?;
+    out.truncate(written);
+    Some(out)
+}
+
+/// Allocation-free IPv4→IPv6 translation: write the translated IPv6 L3 packet
+/// directly into `dst` and return the number of bytes written (#2211).
+///
+/// `dst` must be at least `40 + (ipv4_total_len - ihl)` bytes; on a too-small
+/// buffer the function returns `None` without writing a partial frame.
+/// Behavior is byte-identical to the previous `Vec`-allocating translator.
+pub(crate) fn write_v4_to_v6_into(
+    dst: &mut [u8],
+    packet: &[u8],
+    src_v6: Ipv6Addr,
+    dst_v6: Ipv6Addr,
+) -> Option<usize> {
     if packet.len() < 20 {
         return None;
     }
@@ -391,22 +542,26 @@ pub(crate) fn translate_v4_to_v6(
     let new_hop_limit = ttl - 1;
     let ipv6_payload_len = l4_payload.len() as u16;
     let ipv6_total_len = 40 + l4_payload.len();
-    let mut out = vec![0u8; ipv6_total_len];
+    let out = dst.get_mut(..ipv6_total_len)?;
 
     // Build IPv6 header. The 8-bit traffic class straddles bytes 0-1: TC[7:4]
     // in the low nibble of byte 0 (alongside the version=6 nibble) and TC[3:0]
     // in the high nibble of byte 1 (alongside the flow-label high nibble, left
     // at 0). Mirrors apply_dscp_rewrite_to_frame in afxdp/frame/mod.rs:133-134.
+    // The caller's buffer may be reused (a TX UMEM frame), so write every byte
+    // of the IPv6 header explicitly rather than relying on a zero-initialized
+    // destination: zero byte 1's low nibble + bytes 2-3 (the flow label).
     out[0] = 0x60 | (tos >> 4); // version=6 | TC[7:4]
-    out[1] = (out[1] & 0x0f) | ((tos & 0x0f) << 4); // TC[3:0] | flow-label nibble (0)
-    // flow label (bytes 2-3 and low nibble of byte 1) = 0
+    out[1] = (tos & 0x0f) << 4; // TC[3:0] | flow-label high nibble (0)
+    out[2] = 0; // flow label
+    out[3] = 0; // flow label
     out[4..6].copy_from_slice(&ipv6_payload_len.to_be_bytes());
     out[6] = next_header;
     out[7] = new_hop_limit;
     out[8..24].copy_from_slice(&src_v6.octets());
     out[24..40].copy_from_slice(&dst_v6.octets());
 
-    // Copy L4 payload.
+    // Copy L4 payload directly into the output L4 region (single copy).
     out[40..].copy_from_slice(l4_payload);
 
     // ICMP type/code translation.
@@ -415,9 +570,9 @@ pub(crate) fn translate_v4_to_v6(
     }
 
     // Recompute L4 checksum (pseudo-header changes from IPv4 to IPv6).
-    recompute_l4_checksum_after_nat64_v4_to_v6(&mut out, next_header)?;
+    recompute_l4_checksum_after_nat64_v4_to_v6(out, next_header)?;
 
-    Some(out)
+    Some(ipv6_total_len)
 }
 
 /// Translate ICMPv6 type/code to ICMPv4.
@@ -551,25 +706,56 @@ fn checksum16(data: &[u8]) -> u16 {
     !(sum as u16)
 }
 
-fn checksum16_ipv4_pseudo(src: Ipv4Addr, dst: Ipv4Addr, protocol: u8, payload: &[u8]) -> u16 {
-    let mut pseudo = Vec::with_capacity(12 + payload.len());
-    pseudo.extend_from_slice(&src.octets());
-    pseudo.extend_from_slice(&dst.octets());
-    pseudo.push(0);
-    pseudo.push(protocol);
-    pseudo.extend_from_slice(&(payload.len() as u16).to_be_bytes());
-    pseudo.extend_from_slice(payload);
-    checksum16(&pseudo)
+/// Add `bytes` into a running one's-complement 16-bit partial sum. Mirrors
+/// the scalar reference in `afxdp/frame/checksum.rs::checksum16_add_bytes`
+/// so the pseudo-header checksum can be accumulated by streaming the
+/// pseudo-header fields and the L4 payload directly, with NO intermediate
+/// `Vec` allocation per packet (#2211). The fold result is bit-identical to
+/// building a contiguous buffer and running `checksum16` over it because
+/// 16-bit one's-complement addition is associative across the concatenation.
+#[inline]
+fn checksum16_add(mut sum: u32, bytes: &[u8]) -> u32 {
+    let mut chunks = bytes.chunks_exact(2);
+    for chunk in &mut chunks {
+        sum = sum.wrapping_add(u16::from_be_bytes([chunk[0], chunk[1]]) as u32);
+    }
+    if let Some(&last) = chunks.remainder().first() {
+        sum = sum.wrapping_add((last as u32) << 8);
+    }
+    sum
 }
 
+/// Fold a running partial sum into the final one's-complement 16-bit value.
+/// Identical fold to `checksum16`'s tail so streaming and buffer-building
+/// produce the same checksum.
+#[inline]
+fn checksum16_fold(mut sum: u32) -> u16 {
+    while (sum >> 16) != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+/// IPv4 pseudo-header + L4 checksum, streamed (no per-packet `Vec`, #2211).
+fn checksum16_ipv4_pseudo(src: Ipv4Addr, dst: Ipv4Addr, protocol: u8, payload: &[u8]) -> u16 {
+    let mut sum = 0u32;
+    sum = checksum16_add(sum, &src.octets());
+    sum = checksum16_add(sum, &dst.octets());
+    sum = checksum16_add(sum, &[0, protocol]);
+    sum = checksum16_add(sum, &(payload.len() as u16).to_be_bytes());
+    sum = checksum16_add(sum, payload);
+    checksum16_fold(sum)
+}
+
+/// IPv6 pseudo-header + L4 checksum, streamed (no per-packet `Vec`, #2211).
 fn checksum16_ipv6_pseudo(src: Ipv6Addr, dst: Ipv6Addr, next_header: u8, payload: &[u8]) -> u16 {
-    let mut pseudo = Vec::with_capacity(40 + payload.len());
-    pseudo.extend_from_slice(&src.octets());
-    pseudo.extend_from_slice(&dst.octets());
-    pseudo.extend_from_slice(&(payload.len() as u32).to_be_bytes());
-    pseudo.extend_from_slice(&[0, 0, 0, next_header]);
-    pseudo.extend_from_slice(payload);
-    checksum16(&pseudo)
+    let mut sum = 0u32;
+    sum = checksum16_add(sum, &src.octets());
+    sum = checksum16_add(sum, &dst.octets());
+    sum = checksum16_add(sum, &(payload.len() as u32).to_be_bytes());
+    sum = checksum16_add(sum, &[0, 0, 0, next_header]);
+    sum = checksum16_add(sum, payload);
+    checksum16_fold(sum)
 }
 
 // ---------------------------------------------------------------------------
@@ -593,12 +779,18 @@ pub(crate) fn build_nat64_v6_to_v4_frame(
     // Find L3 offset.
     let l3 = frame_l3_offset(frame)?;
     let ipv6_packet = frame.get(l3..)?;
-    let ipv4_packet = translate_v6_to_v4(ipv6_packet, snat_v4, dst_v4, no_v6_frag_header)?;
     let eth_len = if vlan_id > 0 { 18 } else { 14 };
-    let total = eth_len + ipv4_packet.len();
-    let mut out = vec![0u8; total];
+    // Single output allocation (the unavoidable `TxRequest.bytes`): IPv6→IPv4
+    // shrinks the L3 by 20 bytes, so the IPv4 frame can never exceed
+    // `eth_len + ipv6_packet.len()`. Allocate that upper bound, write the
+    // translated IPv4 L3 directly into the tail with the allocation-free
+    // `_into` core (no intermediate L3 `Vec`, no second copy — #2211), then
+    // truncate to the exact length.
+    let mut out = vec![0u8; eth_len + ipv6_packet.len()];
     write_eth_header(&mut out, eth_dst, eth_src, vlan_id, 0x0800)?;
-    out[eth_len..].copy_from_slice(&ipv4_packet);
+    let written =
+        write_v6_to_v4_into(&mut out[eth_len..], ipv6_packet, snat_v4, dst_v4, no_v6_frag_header)?;
+    out.truncate(eth_len + written);
     Some(out)
 }
 
@@ -616,12 +808,17 @@ pub(crate) fn build_nat64_v4_to_v6_frame(
 ) -> Option<Vec<u8>> {
     let l3 = frame_l3_offset(frame)?;
     let ipv4_packet = frame.get(l3..)?;
-    let ipv6_packet = translate_v4_to_v6(ipv4_packet, src_v6, dst_v6)?;
     let eth_len = if vlan_id > 0 { 18 } else { 14 };
-    let total = eth_len + ipv6_packet.len();
-    let mut out = vec![0u8; total];
+    // Single output allocation (the unavoidable `TxRequest.bytes`): IPv4→IPv6
+    // grows the L3 by 20 bytes (40-byte IPv6 header vs 20-byte IPv4 header), so
+    // the IPv6 frame can never exceed `eth_len + ipv4_packet.len() + 20`.
+    // Allocate that upper bound, write the translated IPv6 L3 directly into the
+    // tail with the allocation-free `_into` core (no intermediate L3 `Vec`, no
+    // second copy — #2211), then truncate to the exact length.
+    let mut out = vec![0u8; eth_len + ipv4_packet.len().saturating_add(20)];
     write_eth_header(&mut out, eth_dst, eth_src, vlan_id, 0x86dd)?;
-    out[eth_len..].copy_from_slice(&ipv6_packet);
+    let written = write_v4_to_v6_into(&mut out[eth_len..], ipv4_packet, src_v6, dst_v6)?;
+    out.truncate(eth_len + written);
     Some(out)
 }
 
