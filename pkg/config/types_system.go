@@ -12,29 +12,29 @@ import (
 
 // SystemConfig holds system-level configuration.
 type SystemConfig struct {
-	HostName                 string
-	DomainName               string   // system domain-name (e.g. "example.com")
-	DomainSearch             []string // system domain-search (search domains)
-	TimeZone                 string
-	NameServers              []string // DNS server addresses
-	NTPServers               []string // NTP server addresses
-	NTPThreshold             int      // NTP threshold in seconds (0 = default)
-	NTPThresholdAction       string   // "accept" or "reject"
-	NoRedirects              bool     // disable ICMP redirects
-	BackupRouter             string   // backup default gateway IP
-	BackupRouterDst          string   // backup router destination prefix
-	Lo0FilterInputV4         string   // lo0 unit 0 family inet filter input (host-bound filtering)
-	Lo0FilterInputV6         string   // lo0 unit 0 family inet6 filter input (host-bound filtering)
-	DataplaneType            string   // empty defaults to "userspace"; explicit "ebpf" is legacy; "dpdk" is retired (#1525) and tolerated via rewriteRetiredDataplaneType (pkg/configstore/dataplane_retire.go) at both Store.Load and Store.SyncApply for stored-config rolling upgrade
-	UserspaceDataplane       *UserspaceConfig
-	InternetOptions          *InternetOptionsConfig
-	Services                 *SystemServicesConfig
-	Syslog                   *SystemSyslogConfig
-	DHCPServer               DHCPServerConfig
-	SNMP                     *SNMPConfig
-	Login                    *LoginConfig
-	RootAuthentication       *RootAuthConfig
-	Archival                 *ArchivalConfig
+	HostName           string
+	DomainName         string   // system domain-name (e.g. "example.com")
+	DomainSearch       []string // system domain-search (search domains)
+	TimeZone           string
+	NameServers        []string // DNS server addresses
+	NTPServers         []string // NTP server addresses
+	NTPThreshold       int      // NTP threshold in seconds (0 = default)
+	NTPThresholdAction string   // "accept" or "reject"
+	NoRedirects        bool     // disable ICMP redirects
+	BackupRouter       string   // backup default gateway IP
+	BackupRouterDst    string   // backup router destination prefix
+	Lo0FilterInputV4   string   // lo0 unit 0 family inet filter input (host-bound filtering)
+	Lo0FilterInputV6   string   // lo0 unit 0 family inet6 filter input (host-bound filtering)
+	DataplaneType      string   // empty defaults to "userspace"; explicit "ebpf" is legacy; "dpdk" is retired (#1525) and tolerated via rewriteRetiredDataplaneType (pkg/configstore/dataplane_retire.go) at both Store.Load and Store.SyncApply for stored-config rolling upgrade
+	UserspaceDataplane *UserspaceConfig
+	InternetOptions    *InternetOptionsConfig
+	Services           *SystemServicesConfig
+	Syslog             *SystemSyslogConfig
+	DHCPServer         DHCPServerConfig
+	SNMP               *SNMPConfig
+	Login              *LoginConfig
+	RootAuthentication *RootAuthConfig
+	Archival           *ArchivalConfig
 	// MasterPassword is a misnomer kept for the Junos token: it holds the
 	// `system master-password pseudorandom-function <fn>` value, i.e. the PRF
 	// ALGORITHM-SELECTOR NAME (e.g. hmac-sha256), NOT key material. The actual
@@ -413,9 +413,9 @@ const (
 // H6) is derived from it so the commit-time validator and the runtime RBAC
 // table can never drift apart.
 var LoginClassPermissions = map[string][]LoginClassPermission{
-	"super-user":    {PermAll},
-	"operator":      {PermView, PermClear, PermControl},
-	"read-only":     {PermView},
+	"super-user": {PermAll},
+	"operator":   {PermView, PermClear, PermControl},
+	"read-only":  {PermView},
 	// config-viewer can view (including config display, which routes through
 	// `show`) but cannot enter configure to modify, clear, or operate (#2008
 	// H6). Within the current coarse permission model that is PermView only.
@@ -937,6 +937,65 @@ func (d *DHCPDynamicDNSConfig) String() string {
 // DHCPLocalServerConfig holds per-group DHCP server settings.
 type DHCPLocalServerConfig struct {
 	Groups map[string]*DHCPServerGroup
+	// ExpiredLeases is the opt-in Kea expired-lease reclamation policy
+	// (#1387 stale-lease-cleanup slice / Path S). nil == today's
+	// behaviour byte-for-byte: no `expired-leases-processing` block is
+	// rendered and Kea uses its built-in reclamation defaults. The block
+	// is GLOBAL to the family — Kea has no per-subnet reclamation — so it
+	// sits here on DHCPLocalServerConfig (one per family: dhcp-local-server
+	// for v4, dhcpv6-local-server for v6), not on DHCPPool. v4 and v6 are
+	// tuned independently because Kea renders the block per Dhcp4 / Dhcp6.
+	ExpiredLeases *DHCPExpiredLeasesConfig
+}
+
+// DHCPExpiredLeasesConfig maps to Kea's per-family
+// `expired-leases-processing` block (#1387 stale-lease-cleanup slice).
+// It controls how aggressively Kea REMOVES leases that have ALREADY
+// expired/been released/declined from the memfile — it is ORTHOGONAL to
+// lease-time (DHCPPool.LeaseTime / the hardcoded valid-lifetime), which
+// sets how long a lease stays VALID (invariant H4). Field
+// units/semantics are Kea-native (the operator types Kea numbers); see
+// https://kea.readthedocs.io for the authoritative meaning.
+//
+// Rendering is opt-in: a nil block OR Enabled==false renders NOTHING, so
+// the generated Kea config is byte-identical to today (invariant H1).
+// Each numeric field is emitted only when set, so an operator can flip
+// `enable` on and tune one knob without pinning the rest to a value we
+// invented.
+type DHCPExpiredLeasesConfig struct {
+	// Enabled gates rendering of the whole block. A block that parses but
+	// never sets `enable` still renders nothing (explicit opt-in, mirrors
+	// DHCPDynamicDNSConfig.Enabled).
+	Enabled bool
+	// ReclaimTimerWait is seconds between reclamation cycles
+	// (reclaim-timer-wait-time). 0 == unset -> the key is omitted and Kea
+	// uses its default.
+	ReclaimTimerWait int
+	// FlushReclaimedTimerWait is seconds between flush passes that remove
+	// reclaimed leases past hold-time (flush-reclaimed-timer-wait-time).
+	// 0 == unset -> omitted.
+	FlushReclaimedTimerWait int
+	// HoldReclaimedTime is seconds a reclaimed lease is retained before
+	// physical removal (hold-reclaimed-time). 0 == unset -> omitted. (Kea
+	// keeps a reclaimed lease this long so a renewing client reclaims its
+	// own address.)
+	HoldReclaimedTime int
+	// MaxReclaimLeases caps leases reclaimed per cycle (max-reclaim-leases).
+	// In Kea, 0 means UNLIMITED — a DIFFERENT desired state from "omit the
+	// key and inherit Kea's default" — so the model MUST distinguish a
+	// value of 0 from unset (invariant H2). MaxReclaimLeasesSet is true
+	// exactly when the operator configured `max-leases`; a bare `if x > 0`
+	// render would make `max-leases 0` (unlimited) un-expressible.
+	MaxReclaimLeases    int
+	MaxReclaimLeasesSet bool
+	// MaxReclaimTime caps milliseconds spent reclaiming per cycle
+	// (max-reclaim-time). 0 means UNLIMITED in Kea, so it uses the same
+	// set/unset discipline as MaxReclaimLeases (invariant H2).
+	MaxReclaimTime    int
+	MaxReclaimTimeSet bool
+	// UnwarnedReclaimCycles is consecutive cycles hitting the cap before
+	// Kea warns (unwarned-reclaim-cycles). 0 == unset -> omitted.
+	UnwarnedReclaimCycles int
 }
 
 // DHCPServerGroup defines a DHCP server group.

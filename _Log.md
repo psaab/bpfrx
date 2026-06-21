@@ -9479,6 +9479,35 @@ top.
   pkg/routing/README.md, _Log.md
 
 - **Timestamp**: 2026-06-21
+  **Action**: #1387 Path S — Kea expired-leases-processing (stale-lease
+  cleanup) config. Opt-in per-family reclamation subtree under
+  `dhcp-local-server` / `dhcpv6-local-server`. Config model
+  `DHCPExpiredLeasesConfig` on the per-family `DHCPLocalServerConfig`
+  (GLOBAL per Dhcp4/Dhcp6, never per-pool — trap 1). The two cap knobs
+  (max-leases/max-time) carry a `*Set` bool so `0` (= unlimited in Kea)
+  renders distinctly from unset (trap 2). Schema floor split: the three
+  timers use ValidateIntegerMin(1) (a 0 some Kea versions reject would
+  brick the fail-closed restart), the cap knobs + unwarned-cycles use
+  Min(0) (trap 3). Compile (`compileDHCPExpiredLeases`, dual-AST walker
+  mirroring compileDHCPDynamicDNS) lands inside the shared compileExpanded
+  core, so it is present on BOTH the strict commit and the tolerant
+  load/peer-sync compile sites (trap 4); the typed-leaf schema gate
+  hard-rejects on commit but warns on Load/SyncApply (boot/HA safety).
+  Render `keaExpiredLeasesMap` returns nil for nil/disabled (UNCONDITIONAL
+  omit -> byte-identical to pre-#1387, H1); enabled-no-knobs renders {}.
+  Tests: dhcpserver golden render (v4/v6 all-knobs, disabled/absent omit,
+  max-leases 0 vs unset, one-knob-omits-rest, enabled-no-knobs-{}, per-
+  family independence); config dual-AST compile equality + per-family +
+  absent-default + H2 set/unset + schema completion + commit-check floor
+  split + lenient compile; configstore stored/peer-sync tolerance. All
+  build+vet+test green; new tests 5x no flake. Kea binaries not present
+  locally so `kea-dhcp4 -t` config-test is deploy-deferred. DDNS half of
+  #1387 already shipped (#2043/#2066); kea-d2 backend PLAN-KILLed.
+  **File(s)**: pkg/config/types_system.go, pkg/config/schema_system.go,
+  pkg/config/compiler_services.go, pkg/dhcpserver/dhcpserver.go,
+  pkg/dhcpserver/README.md, pkg/config/dhcp_expired_leases_test.go,
+  pkg/dhcpserver/expired_leases_test.go,
+  pkg/configstore/typed_leaf_lenient_test.go, _Log.md
   **Action**: #2270 — fail closed when an IKE (Phase 1) policy chain cannot
   resolve, instead of silently emitting a proposal-less swanctl connection
   that strongSwan negotiates with its compiled-in default crypto set (a
