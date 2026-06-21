@@ -4,16 +4,16 @@
 // The Store type is split across several same-package files for
 // readability (#2158 code-motion, no behavior change):
 //   - store.go         — Store struct, New, node/cluster accessors, the
-//                         compile/schema-validate pipeline, SyncApply
+//     compile/schema-validate pipeline, SyncApply
 //   - store_persist.go — Load/Save, writeActive*, journal helpers, the
-//                         #1799 degrade-and-retry persist machinery,
-//                         config archival, and rescue config
+//     #1799 degrade-and-retry persist machinery,
+//     config archival, and rescue config
 //   - store_lock.go    — config-mode enter/exit locking + edit-path nav
 //   - store_command.go — candidate edit verbs (set/delete/copy/...) and
-//                         the flat-line replay (LoadSet/LoadMerge/...)
+//     the flat-line replay (LoadSet/LoadMerge/...)
 //   - store_commit.go  — commit / commit-confirmed / rollback, the
-//                         confirm-timer machinery, and rollback-history
-//                         file persistence
+//     confirm-timer machinery, and rollback-history
+//     file persistence
 //   - store_format.go  — the Show* render family + read-only accessors
 package configstore
 
