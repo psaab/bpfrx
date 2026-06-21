@@ -1,5 +1,27 @@
 # Action Log
 
+## 2026-06-21 — #2187 validate NAT-rule app references at commit
+
+- **Timestamp**: 2026-06-21
+- **Action**: Fixed #2187 (follow-up to #2142/#2185) — the strict
+  commit-time application-spec validation walk
+  (`applicationsToValidateStrict`) was policy-only, so a malformed user
+  app referenced ONLY by a source/destination-NAT rule's `match
+  application` escaped both the #2142 commit gate and the #2124 runtime
+  gate (`appPortsFromSpec` returns nil → NAT term silently never/over-
+  matches). Extended the walk to collect NAT-rule references via the
+  existing `addRef` closure (single app + application-set, inheriting the
+  #2185 F1 dangling-member fallback); strict-commit / lenient-load wiring
+  is unchanged (single call site). Static NAT not walked (no `match
+  application` on `StaticNATRule`). Added compiler-package tests
+  (source + destination reject / valid / via-set / unreferenced-warn /
+  lenient-warn) that FAIL on the pre-fix tree; updated the appid
+  drift-guard comment. go test ./pkg/config/... ./pkg/appid/... +
+  ./pkg/dataplane/userspace/... green; go vet clean.
+- **File(s)**: pkg/config/compiler.go,
+  pkg/config/compiler_nat_application_specs_test.go,
+  pkg/appid/runtime_test.go, docs/services-application-identification.md
+
 ## 2026-06-21 — #2186 docs: screen session-limit cap is per-worker (× num_workers)
 
 - **Timestamp**: 2026-06-21
