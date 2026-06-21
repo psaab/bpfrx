@@ -287,11 +287,15 @@ func validateNATHostMaskStrict(cfg *Config, lenient bool) ([]string, error) {
 //
 // Strict (commit / commit-check): hard-reject. Lenient (load / peer-sync, #1960
 // / #1979 doctrine): return the messages as warnings so a config committed
-// before this gate existed (or peer-synced) still boots — the Rust helper's
-// own #2240/#2241 backstop (`Nptv6State::try_from_snapshots`) rejects the
-// snapshot at apply, so the apply preflight keeps the previous live forwarding
-// state and a leniently-loaded bad config never installs a torn-down or
-// nondeterministic NPTv6 runtime.
+// before this gate existed (or peer-synced) still boots. The "previous state is
+// kept" impact note in the lenient warning is scoped to the userspace
+// apply/preflight, not asserted as a general validator guarantee: the Rust
+// helper's own #2240/#2241 backstop (`Nptv6State::try_from_snapshots`) rejects
+// the whole snapshot at apply, so the apply preflight keeps the previous live
+// forwarding state and a leniently-loaded bad config never installs a
+// torn-down or nondeterministic NPTv6 runtime. The validator itself only
+// classifies the rule as invalid; it is the helper preflight that preserves
+// the prior forwarding state.
 func validateNPTv6Strict(cfg *Config, lenient bool) ([]string, error) {
 	if cfg == nil {
 		return nil, nil
@@ -300,7 +304,9 @@ func validateNPTv6Strict(cfg *Config, lenient bool) ([]string, error) {
 	emit := func(msg string) error {
 		if lenient {
 			warnings = append(warnings,
-				msg+" (ignored: NPTv6 snapshot rejected by dataplane, previous state kept, until corrected)")
+				msg+" (this NPTv6 rule is invalid; on a userspace-dataplane apply/preflight"+
+					" the helper rejects the whole NPTv6 snapshot and the previous state is kept,"+
+					" so the rule will not take effect until corrected)")
 			return nil
 		}
 		return fmt.Errorf("%s", msg)

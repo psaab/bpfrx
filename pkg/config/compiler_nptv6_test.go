@@ -272,10 +272,16 @@ func TestNPTv6LenientLoadAccepts(t *testing.T) {
 		if !hasWarningContaining(cfg.Warnings, "nptv6") {
 			t.Fatalf("case %d: lenient load must emit an nptv6 warning, warnings=%v", i, cfg.Warnings)
 		}
-		// The lenient warning must carry the "rejected by dataplane, previous
-		// state kept" impact note so the operator knows it is inert, not applied.
-		if !hasWarningContaining(cfg.Warnings, "previous state kept") {
-			t.Fatalf("case %d: lenient warning must state the dataplane keeps the previous state, warnings=%v", i, cfg.Warnings)
+		// The lenient warning must carry the impact note so the operator knows
+		// the rule is inert (not applied). The note is scoped to the userspace
+		// apply/preflight — it must say the previous state is kept AND tie that
+		// claim to the helper apply/preflight, not state it as a general
+		// validator guarantee (#2247 item 1).
+		if !hasWarningContaining(cfg.Warnings, "the previous state is kept") {
+			t.Fatalf("case %d: lenient warning must state the previous state is kept, warnings=%v", i, cfg.Warnings)
+		}
+		if !hasWarningContaining(cfg.Warnings, "apply/preflight") {
+			t.Fatalf("case %d: lenient warning must scope the impact note to the userspace apply/preflight, warnings=%v", i, cfg.Warnings)
 		}
 	}
 }
