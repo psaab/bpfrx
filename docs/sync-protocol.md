@@ -139,11 +139,15 @@ trailing `Generation uint64` (LE):
 
 **Semantics (sender, `pkg/cluster`):** a single process-wide strictly-monotonic
 counter (seeded from `CLOCK_MONOTONIC` nanos) stamps every install send
-(`QueueSession*`, sweep, bulk) and is recorded per wire key. A delete echoes the
-exact generation last stamped for that key and evicts the record, so the
-delete's generation is always same-domain as the entry the receiver stored.
-Generations are only ever compared per-`(sender,key)` — never across keys — so a
-single sender-local counter suffices.
+(`QueueSession*`, sweep, bulk) and is recorded per wire key. A delete draws a
+**fresh, strictly-greater** generation from the same counter (`takeDeleteGenV4/V6`
+→ `nextInstallGen`) rather than echoing the install's stamp, and evicts the
+sender record. A delete therefore always out-ranks the install it cancels — the
+property that lets the receiver order a reordered delete/install pair (see #2221
+below). A key never installed in this boot (no stamp recorded) yields `gen == 0`
+(legacy unconditional delete). Generations are only ever compared
+per-`(sender,key)` — never across keys — so a single sender-local counter
+suffices.
 
 **Semantics (receiver, `pkg/cluster`):** `SessionSync` keeps the authoritative
 per-key stored generation in its own map (the BPF C conntrack struct stays
@@ -154,11 +158,15 @@ generation-free). The apply layer:
   with both non-zero → refuse (`DeletesStaleIgnored++`), short-circuiting BOTH
   the BPF map delete and the helper. Equality applies (the delete of the very
   session installed); `gen == 0` on either side falls back to today's
-  unconditional delete (rolling-upgrade safe).
+  unconditional delete (rolling-upgrade safe). On an applied **non-zero** delete
+  the stored generation is **upgraded to the delete generation as a TOMBSTONE**
+  (not evicted), so a reordered older install of the cancelled session is refused
+  by the install guard (#2221). A `gen == 0` delete evicts (no tombstone).
 - **Install guard** (`installClusterSynced*`): refuse to overwrite a stored
-  entry with a strictly-older-generation install (`InstallsStaleIgnored++`) so
-  the per-key stored generation never regresses (closes the delayed-stale-install
-  variant).
+  entry (live OR a delete tombstone) with a strictly-older-generation install
+  (`incoming < stored` → `InstallsStaleIgnored++`) so the per-key stored
+  generation never regresses (closes the delayed-stale-install variant AND the
+  reordered-install-after-delete residual).
 
 The userspace helper mirrors the same field on its in-memory
 `SyncedSessionEntry` (via `SessionSyncRequest.generation`) and enforces the
@@ -171,9 +179,12 @@ any pair where either end lacks a generation.
 
 Both the sender echo maps (`genSentV4/V6`) and the receiver stored-generation
 maps (`recvGenV4/V6`) are bounded by `genGuardMapCap` (200000) so a churning
-workload cannot grow them without limit. Entries are normally evicted on the
-matching delete; the cap is the safety valve for keys whose delete never
-arrives (e.g. a dropped close delta).
+workload cannot grow them without limit. Sender entries are evicted on the
+matching delete. Receiver entries are evicted on a `gen == 0` (legacy) delete
+but a non-zero delete **records a tombstone in place** (#2221, see below); the
+cap (via `putGenBounded`) plus the bulk-barrier `resetRecvGen` keep the
+receiver map bounded under steady churn, and the cap is also the safety valve
+for keys whose delete never arrives (e.g. a dropped close delta).
 
 On overflow the map is **never cleared**. A map at cap updates an EXISTING key
 in place (its stored generation is never dropped) and **skip-records** a NEW
@@ -218,6 +229,47 @@ key are ever applied concurrently, so the per-key stored generation cannot be
 interleaved between the guard read and the record write. Holding `recvGenMu`
 across the dataplane `Put` would serialize unrelated keys under dataplane I/O
 for no benefit the single-active-fabric invariant doesn't already provide.
+
+### Same-generation install/delete reorder (#2221, residual of #2170)
+
+The #2170 guard assumes per-key generations are strictly monotonic so a stale
+(older-generation) delete is refused. The **residual** hazard is WITHIN a single
+generation domain: the gen-stamp and the `sendCh` enqueue are not atomic, and two
+producer goroutines mutate the same key — the 1s sweep re-stamps a LIVE session
+to generation `N` and queues an install carrying `N`, while the userspace
+delta-drain takes the close and (pre-fix) echoed that same `N` on the delete. The
+delete can then win the `sendCh` enqueue race and be sent BEFORE the install. The
+receiver applies `delete(N)` then `install(N)`. Because the guards refuse only a
+*strictly-older* operation, an equal-`N` install after an equal-`N` delete was
+re-applied — the standby resurrected a session the master had already closed
+(the stale-RETAIN inverse of #2170, this time triggered by reorder rather than a
+journaled replay).
+
+The fix makes convergence **order-independent (last-writer-wins per key)** with
+two composed changes:
+
+1. **Sender** — a delete draws a FRESH generation strictly greater than the
+   install it cancels (`takeDeleteGenV4/V6` → `nextInstallGen`, see above)
+   instead of echoing it. A delete therefore always out-ranks its install.
+2. **Receiver** — an applied non-zero delete records the delete generation as a
+   **tombstone** in `recvGenV4/V6` (it does not evict). A reordered install of
+   the cancelled session carries the OLDER install generation, so the install
+   guard (`incoming < stored`) refuses it (`InstallsStaleIgnored++`) and the
+   standby stays GONE — matching the master. A genuinely newer incarnation,
+   re-established and re-stamped by a later sweep, carries a strictly-greater
+   generation than the tombstone and still installs.
+
+Both reorder directions, and the in-order close, converge to the master's final
+state: GONE when the master deleted last, PRESENT when a strictly-newer install
+arrived last. The tombstone is bounded by `genGuardMapCap` and cleared by the
+bulk barrier (`resetRecvGen`), which also handles the cross-boot generation
+regression (#2198 F2) so a tombstone never blocks a legitimate cold-start
+re-prime. Regression coverage: `TestSameGenReorderDeleteThenInstallConverges{V4,
+V6}` (drives the real sender enqueue + receiver apply in wire order),
+`TestReorderedInstallRefusedByTombstoneV4`,
+`TestReestablishAfterDeleteAppliesV4`, and
+`TestDeleteGenerationStrictlyGreaterThanInstall{V4,V6}` in
+`pkg/cluster/sync_gen_guard_test.go`.
 
 ## Config Payload (Variable)
 

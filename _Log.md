@@ -9333,3 +9333,22 @@ top.
   standby mem-hold + takeover pre-seed/lease-add seed. test-failover + live
   lease-survives-failover smoke PENDING-PARENT before merge.
   **File(s)**: _Log.md
+
+- **Timestamp**: 2026-06-21
+  **Action**: #2221 (MEDIUM, residual of #2170) — same-generation install/delete
+  REORDER no longer leaves a stale session on the standby. Sender: a delete now
+  draws a FRESH generation strictly greater than the install it cancels
+  (takeDeleteGenV4/V6 -> nextInstallGen) instead of echoing it, so a delete
+  out-ranks its install on the wire. Receiver: an applied non-zero delete records
+  the delete generation as a TOMBSTONE in recvGenV4/V6 (no eviction) so a
+  reordered older install of the cancelled session is refused by the install
+  guard; gen-0 (legacy) delete still evicts. Last-writer-wins per key: standby
+  converges to the master's final state regardless of install/delete arrival
+  order. Composes with the #2170 gen-guard, the #2198 F1 overflow bound, the F2
+  bulk-barrier resetRecvGen, and the bulk reconcile. New regression tests drive
+  the real sender enqueue + receiver apply in wire order (both reorder
+  directions) and prove fail-on-revert. build/vet/test/-race green on
+  pkg/cluster. test-failover REQUIRED before merge (PENDING-PARENT).
+  **File(s)**: pkg/cluster/sync_conn.go, pkg/cluster/sync.go,
+  pkg/cluster/sync_gen_guard_test.go, docs/sync-protocol.md,
+  pkg/cluster/README.md, _Log.md
