@@ -53,7 +53,11 @@ pub(crate) struct FirewallFilterSnapshot {
     pub name: String,
     #[serde(default)]
     pub family: String,
-    #[serde(default)]
+    // #2214: null-tolerant. A filter declared with zero terms makes the Go
+    // builder emit `terms:null` (nil slice, no `,omitempty`); plain `default`
+    // only covers an ABSENT key, so an explicit null would abort the whole
+    // snapshot decode (#1961 no-transit).
+    #[serde(default, deserialize_with = "crate::protocol::null_tolerant_vec")]
     pub terms: Vec<FirewallTermSnapshot>,
 }
 

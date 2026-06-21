@@ -8641,6 +8641,28 @@ top.
   docs/refactoring-audit-current.txt
 
 - **Timestamp**: 2026-06-21
+- **Action**: #2214 — fix Go<->Rust empty-collection null-decode no-transit
+  bug (#1961-class). A NAT64 rule with no resolvable source-pool emitted
+  `pool_addresses:null` and a firewall filter with zero terms emitted
+  `terms:null`; the Rust helper's `Vec<T>` decoder rejects an explicit null
+  ("invalid type: null, expected a sequence"), aborting the WHOLE
+  apply_snapshot decode -> helper EOF -> enabled:false -> NO TRANSIT.
+  BOTH-sided fix: Go builders now initialize the two slices non-nil so they
+  marshal as `[]` (buildNAT64Snapshots, buildFilterTermSnapshots — no
+  `,omitempty`, the empty states are meaningful, WireUint8List convention);
+  Rust adds a generic `null_tolerant_vec` deserializer (protocol/mod.rs)
+  applied to NAT64RuleSnapshot.pool_addresses + FirewallFilterSnapshot.terms
+  for mixed-version safety. Audited protocol.go: ONLY these two slice fields
+  lacked omitempty (no other hazard). Fail-on-revert proven on both sides
+  (Go: 4 tests fail with `"pool_addresses":null`; Rust: 3 tests panic with
+  the exact serde "expected a sequence" error). Go tests + go vet clean;
+  cargo release build clean (145 pre-existing warnings, none on changed
+  files); 68 Rust protocol tests pass.
+- **File(s)**: pkg/dataplane/userspace/nat.go,
+  pkg/dataplane/userspace/filters.go,
+  pkg/dataplane/userspace/protocol_null_collections_2214_test.go,
+  userspace-dp/src/protocol/mod.rs, userspace-dp/src/protocol/nat.rs,
+  userspace-dp/src/protocol/security.rs, userspace-dp/src/protocol/tests.rs
 - **Action**: #2216 — regression-lock the eventengine temporal-window
   prune-on-append + concurrent-multimatch dispatch invariants. Both defects
   the issue describes were already fixed by #2157 (da8e35bc9): evaluateEvent
