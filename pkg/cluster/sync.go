@@ -326,17 +326,21 @@ type SessionSync struct {
 	// so it never regresses below a value a peer may already hold across
 	// this node's restarts within a boot. Every session install (Queue*,
 	// sweep, bulk) draws genCounter.Add(1) and records it in genSentV4/V6
-	// keyed by the wire key. A delete echoes the recorded generation (the
-	// exact g of the install it cancels) and evicts the map entry, so the
-	// delete's generation is always same-domain as the entry the receiver
-	// stored. Generations are only ever compared per-(sender,key), never
-	// across keys, so a single sender-local counter is sufficient and no
-	// cross-node agreement on absolute values is required.
+	// keyed by the wire key. A delete draws a FRESH generation strictly
+	// greater than the install it cancels (takeDeleteGen*, #2221) and evicts
+	// the sender map entry, so the delete always out-ranks its install — the
+	// property that lets the receiver order a reordered delete/install pair.
+	// Generations are only ever compared per-(sender,key), never across keys,
+	// so a single sender-local counter is sufficient and no cross-node
+	// agreement on absolute values is required.
 	//
 	// Receiver side: recvGenV4/V6 is the authoritative per-key stored
-	// generation (the BPF C struct stays generation-free, SMR fix #3). It
-	// is set on install-apply and consulted by both the install guard and
-	// the delete guard, then evicted on delete-apply.
+	// generation (the BPF C struct stays generation-free, SMR fix #3). It is
+	// set on install-apply and consulted by both the install guard and the
+	// delete guard. An applied non-zero delete upgrades the entry to the
+	// delete generation as a TOMBSTONE (#2221) rather than evicting, so a
+	// reordered older install of the cancelled session is refused; a gen-0
+	// (legacy) delete evicts.
 	genCounter atomic.Uint64
 	genSentMu  sync.Mutex
 	genSentV4  map[dataplane.SessionKey]uint64
