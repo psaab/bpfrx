@@ -7725,3 +7725,18 @@ top.
   no dataplane smoke.
   **File(s)**: pkg/dhcpserver/dhcpserver.go, pkg/dhcpserver/dhcpserver_test.go,
   pkg/dhcpserver/README.md, docs/pr/2154-parseleasecsv/plan.md
+
+- **Timestamp**: 2026-06-21
+- **Action**: /research — drove a converged PLAN-READY plan for the
+  event-options robustness cluster (#2139 non-transactional batch, #2140
+  cooldown wiped on reload, #2141 fail-open attributes-match, #2157
+  remediation dropped on held config lock). Mapped pkg/eventengine
+  (engine.go), the configstore candidate/commit API, the ipmon
+  reconcile-not-recreate precedent, and the strict/lenient compile split.
+  All four PLAN-READY (none PLAN-KILL; the "#2140 reload may be by-design"
+  probe was refuted — the self-triggered commit wipes the cooldown on every
+  remediation). Hostile Claude SMR pass folded three refinements
+  (prune-on-append, self-edit re-arm, arm-cooldown-on-commit). No production
+  code touched. Next: /engineer.
+- **File(s)**: docs/research/2139-eventoptions-cluster/plan.md,
+  docs/research/2139-eventoptions-cluster/claude-smr-plan-r1.md
