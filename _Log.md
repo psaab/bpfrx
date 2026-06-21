@@ -7514,3 +7514,22 @@ top.
 - **Validation**: `go test ./pkg/dhcprelay/ -race` 25/25 pass; config + cli +
   daemon green; `go build ./...` clean. Live flag0 wire-capture +
   test-failover pending parent-run (lab-gated).
+
+## #2127 — rtProtoName FRR route-protocol mislabel fix (PR #2135)
+- **Timestamp**: 2026-06-21
+- **Action**: Fix rtProtoName() rtnetlink protocol→name mapping. Add
+  RTPROT_ISIS(187)->isis (was unmapped, displayed literal "187"); keep
+  196->static as FRR private RTPROT_ZSTATIC (local rtprotZStatic const;
+  verified ZEBRA_ROUTE_STATIC->RTPROT_ZSTATIC(196) in FRR zebra2proto);
+  drop RTPROT_ZEBRA(11) (FRR TABLE/NHG, not static — falls through) and
+  RTPROT_BIRD(12) (not emitted by FRR). Express all arms via named
+  unix.RTPROT_* constants. New rtproto_test.go (non-tautological table
+  test + end-to-end protoTag/junosProtoName IS-IS check).
+- **File(s)**: pkg/routing/routes.go, pkg/routing/rtproto_test.go,
+  docs/pr/2127-rtproto-name-mapping/plan.md
+- **Validation**: go build/vet clean; go test ./pkg/routing/ green;
+  5/5 flake on new tests; full go test ./... green. Codex round-1
+  PLAN-NEEDS-MAJOR (caught the 196=RTPROT_ZSTATIC semantics) resolved
+  against FRR source; Codex code review + AGY adversarial both
+  MERGE-READY; Copilot reviewed 3/3 files, no comments. Control-plane
+  display only — no dataplane smoke. PR #2135 MERGEABLE.
