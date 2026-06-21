@@ -24,6 +24,20 @@ sync.
   VID-based test would mis-read the IP header at offset 14 (#2145).
 - `frame/` — packet parsing (L2 / L3 / L4), checksum helpers, TCP MSS
   clamp. `tests.rs` was relocated out of `mod.rs` in #1046 Phase 1.
+  `headers.rs` holds the consolidated outer-header serializers (#1440).
+  The Ethernet writers emit an 802.1Q/802.1ad tag on tag *presence*
+  via `TxVlanTag` (#2149), not `vlan_id > 0`: a tag is serialized when
+  the VID is non-zero OR the PCP/DEI bits are set, so an 802.1p
+  priority-tagged VLAN-0 frame (real tag, VID 0, PCP != 0) keeps its
+  priority instead of collapsing to untagged. The reflected
+  local-origin ICMP error path (`icmp.rs`) carries the inbound TCI
+  (PCP + DEI + VID) and TPID through verbatim, so a priority-tagged or
+  802.1ad-tagged inbound packet is reflected with its tag intact;
+  untagged ingress still falls back to the egress interface's
+  configured VID. The egress *config-driven* builders (forwarding,
+  GRE/WG outer, TSO) still take a bare VID where VID 0 == untagged is
+  the intended semantic (no PCP source on those paths) — `From<u16>`
+  reproduces the legacy bytes exactly.
 - `umem/` — UMEM allocator, fill ring, completion ring. Frames are
   4 KB (`UMEM_FRAME_SIZE = 4096`); index is `addr >> 12`.
 - `tx/` — TX ring management, batched enqueue, TSO segmentation

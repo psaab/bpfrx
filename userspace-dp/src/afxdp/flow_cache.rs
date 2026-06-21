@@ -219,7 +219,9 @@ fn nat_family_matches_addr_family(addr_family: i32, nat: &NatDecision) -> bool {
 impl FlowCacheEntry {
     #[inline]
     pub(super) fn packet_eligible(meta: UserspaceDpMeta) -> bool {
-        (meta.protocol == PROTO_TCP && (meta.tcp_flags & 0x17) == 0x10)
+        // #2151: `is_ack_only` == the prior `(meta.tcp_flags & 0x17) == 0x10`
+        // — only established TCP (pure ACK) and UDP are cacheable.
+        (meta.protocol == PROTO_TCP && crate::tcp_flags::is_ack_only(meta.tcp_flags))
             || meta.protocol == PROTO_UDP
     }
 
