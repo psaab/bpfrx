@@ -3,6 +3,7 @@ package ipsec
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os/exec"
@@ -20,9 +21,31 @@ type dpdSettings struct {
 	Action  string
 }
 
+// errIKEChainUnresolved signals that a gateway names an IKE policy whose
+// reference chain cannot be resolved (the policy is undefined, or the
+// policy's `proposals` reference dangles, AND the legacy direct-proposal
+// fallback also misses). Returning this instead of an empty proposal with
+// a nil error is the fail-closed core of #2270: an empty proposal makes
+// renderConfig omit the `proposals =` line, which silently hands phase-1
+// negotiation to strongSwan's compiled-in default set (a crypto downgrade).
+// renderConfig recognises this sentinel and SKIPS the offending VPN (one
+// bad reference never zeroes a healthy tunnel); the commit-time validator
+// validateIKEPolicyChainReferencesStrict (pkg/config) hard-rejects the
+// dangling reference up front so a new operator edit fails loudly.
+var errIKEChainUnresolved = errors.New(
+	"ike gateway names an ike-policy whose proposal chain does not resolve")
+
 // resolveIKESettings resolves the IKE (Phase 1) auth method, proposal
 // string, lifetime, and aggressive-mode flag from the gateway's IKE policy
 // chain.
+//
+// It distinguishes two superficially similar empty-proposal cases:
+//   - gw is nil or names no ike-policy: the intentional no-policy case —
+//     return an empty proposal with a nil error (strongSwan's default set
+//     is the operator's choice).
+//   - gw names an ike-policy but the chain cannot resolve: return
+//     errIKEChainUnresolved so the caller never silently emits a
+//     proposal-less connection (#2270).
 func resolveIKESettings(cfg *config.IPsecConfig, gw *config.IPsecGateway) (authMethod, proposals string, lifetime int, aggressive bool, err error) {
 	authMethod = "psk"
 	if gw == nil || gw.IKEPolicy == "" {
@@ -46,7 +69,10 @@ func resolveIKESettings(cfg *config.IPsecConfig, gw *config.IPsecGateway) (authM
 		}
 	}
 
-	return authMethod, "", 0, aggressive, nil
+	// gw.IKEPolicy is set but neither the ike-policy -> ike-proposal chain
+	// nor the legacy direct-proposal fallback resolves. Fail closed: do NOT
+	// return an empty proposal with a nil error (#2270).
+	return "", "", 0, aggressive, fmt.Errorf("%w: ike-policy %q", errIKEChainUnresolved, gw.IKEPolicy)
 }
 
 // resolveESPSettings resolves the ESP (Phase 2) proposal string and lifetime

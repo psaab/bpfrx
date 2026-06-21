@@ -1,6 +1,7 @@
 package ipsec
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -56,11 +57,34 @@ func (m *Manager) renderConfig(ipsecCfg *config.IPsecConfig) (string, error) {
 			continue
 		}
 
-		fmt.Fprintf(&b, "  %s {\n", sanitizeSwanctlValue(name))
+		// Resolve the IKE settings BEFORE writing the connection block so a
+		// gateway whose ike-policy chain does not resolve SKIPS this VPN
+		// instead of emitting a proposal-less connection (#2270). An empty
+		// `proposals =` line lets strongSwan fall back to its compiled-in
+		// default phase-1 set — a silent crypto downgrade. The hard
+		// diagnostic for a dangling reference is the commit-time validator
+		// (validateIKEPolicyChainReferencesStrict); this render belt is the
+		// by-construction backstop for any path that reaches render without
+		// passing local commit (HA peer-sync, direct IPsecConfig
+		// construction, a config persisted before the fix). One bad
+		// reference never zeroes a healthy tunnel. A non-chain resolve error
+		// (e.g. an unknown auth-method token from authMethodToSwan) is a
+		// different class and still aborts the whole render.
 		authMethod, ikeProposals, ikeLifetime, aggressive, err := resolveIKESettings(ipsecCfg, gw)
 		if err != nil {
+			if errors.Is(err, errIKEChainUnresolved) {
+				skipped[name] = true
+				slog.Warn("skipping IPsec VPN: ike-policy chain does not "+
+					"resolve — fix the ike-policy / ike-proposal reference "+
+					"(emitting no proposal would silently downgrade phase-1 "+
+					"to strongSwan defaults)",
+					"vpn", name, "ike_policy", gw.IKEPolicy)
+				continue
+			}
 			return "", fmt.Errorf("vpn %s: %w", name, err)
 		}
+
+		fmt.Fprintf(&b, "  %s {\n", sanitizeSwanctlValue(name))
 		espProposals, espLifetime := resolveESPSettings(ipsecCfg, vpn)
 		dpd := deriveDPD(gw, vpn)
 

@@ -9508,3 +9508,38 @@ top.
   pkg/dhcpserver/README.md, pkg/config/dhcp_expired_leases_test.go,
   pkg/dhcpserver/expired_leases_test.go,
   pkg/configstore/typed_leaf_lenient_test.go, _Log.md
+  **Action**: #2270 — fail closed when an IKE (Phase 1) policy chain cannot
+  resolve, instead of silently emitting a proposal-less swanctl connection
+  that strongSwan negotiates with its compiled-in default crypto set (a
+  silent downgrade). resolveIKESettings (pkg/ipsec/ike.go) now distinguishes
+  the intentional no-policy case (gateway with no ike-policy → empty
+  proposal, nil error) from a broken chain (gateway names an ike-policy that
+  is undefined, or whose `proposals` ref dangles, and the legacy direct-
+  proposal fallback also misses) → returns the errIKEChainUnresolved
+  sentinel. renderConfig (policy.go) resolves IKE settings BEFORE writing
+  the connection block and SKIPS the VPN on that sentinel (mirroring the
+  #2074 render belt — one bad reference never zeroes a healthy tunnel; the
+  secrets block already excludes skipped VPNs). Added the commit-time strict
+  validator validateIKEPolicyChainReferencesStrict (compiler_validate_strict
+  .go), wired into compileExpanded right after the #2074 gateway gate;
+  strict on commit/commit-check, lenient (warn, no-brick) on the tolerant
+  load / peer-sync paths via lenientIKEPolicyChainRef (set in
+  CompileConfigLenient + CompileConfigForNodeLenient). Only gateways
+  referenced by a VPN are validated (orphans never render; matches Junos).
+  Tests: config-side reject (dangling policy / dangling proposal), accept
+  (resolvable chain / no-policy / legacy direct-proposal / orphan gateway),
+  lenient downgrade (standalone + node-aware), and a load-bearing fail-on-
+  revert (unwiring the validator makes the dangling tests fail — verified by
+  neutering the call site). ipsec-side: resolveIKESettings sentinel/no-policy
+  behavior + renderConfig skips broken chain while healthy tunnel + no-policy
+  tunnel survive. Mirrors the #2073 ESP fail-closed family. Three pre-
+  existing tests (TestIPsecGatewaySetSyntax, TestGenerateConfig_AggressiveMode
+  /_NotSet, TestGenerateConfig_DynamicHostname) carried latent dangling IKE
+  chains and were made self-consistent (define the referenced ike-policy +
+  proposal) — they assert flags orthogonal to the chain. build+vet green,
+  new tests 5x no flake.
+  **File(s)**: pkg/ipsec/ike.go, pkg/ipsec/policy.go, pkg/ipsec/README.md,
+  pkg/ipsec/ike_chain_failclosed_test.go, pkg/ipsec/ipsec_test.go,
+  pkg/config/compiler.go, pkg/config/compiler_validate_strict.go,
+  pkg/config/ike_policy_chain_ref_test.go, pkg/config/parser_security_test.go,
+  _Log.md
