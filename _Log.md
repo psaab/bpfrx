@@ -8888,3 +8888,44 @@ top.
   All 60 nat64 tests pass.
   **File(s)**: userspace-dp/src/nat64.rs, userspace-dp/src/nat64_tests.rs,
   docs/feature-coverage.md, _Log.md
+
+- **Timestamp**: 2026-06-21
+- **Action**: #2240 (HIGH) + #2241 (MEDIUM) NPTv6 fail-closed family.
+  #2240: compileNPTv6 (pkg/dataplane/compiler_nat.go) warned + `continue`d
+  past any malformed NPTv6 rule then unconditionally called
+  DeleteStaleNPTv6(written) over only the valid subset — so a typo in one
+  rule tore down the previously-working translation entries with no
+  replacement (fail-open; the Rust from_snapshots mirrored the silent skip).
+  #2241: translate_inbound/outbound resolve overlapping /48+/64 prefixes by
+  first-match INSERTION ORDER (no LPM, no overlap rejection) -> order-
+  dependent translation identity. Fix (strict-commit / lenient-load, mirrors
+  #2124/#2142/#2173/#2212): new commit-time gate validateNPTv6Strict
+  (pkg/config/compiler_nat.go) hard-rejects an unparseable / unsupported /
+  mismatched-length / non-IPv6 NPTv6 rule AND any overlapping pair (either
+  direction) at commit/commit-check; lenient path (load/peer-sync) downgrades
+  to a warning so #1960 no-brick holds. Wired via opts.lenientNPTv6 in both
+  lenient factories + the strict call beside validateNATHostMaskStrict.
+  Rust backstop: Nptv6State::try_from_snapshots returns
+  Result<_, SnapshotIntegrityError> (new Nptv6UnparseableRule +
+  Nptv6OverlappingPrefix variants), from_snapshots kept as #[cfg(test)]
+  infallible wrapper; forwarding_build now `?`s it so the apply preflight
+  keeps the previous live state. No wire-shape change (Nptv6RuleSnapshot
+  untouched) -> no protocol_wire_v1.json regen. Fail-on-revert proven both
+  sides (Go: gate disabled -> bad config commits; Rust: try_from_snapshots
+  reverted to fail-open -> 3 new tests fail). 5x flake = 22/22.
+- **File(s)**: pkg/config/compiler_nat.go, pkg/config/compiler.go,
+  pkg/config/compiler_nptv6_test.go (new), userspace-dp/src/nptv6.rs,
+  userspace-dp/src/nptv6_tests.rs, userspace-dp/src/policy.rs,
+  userspace-dp/src/afxdp/forwarding_build/mod.rs, userspace-dp/src/FEATURES.md
+
+- **Timestamp**: 2026-06-21
+- **Action**: #2240/#2241 PR #2246 review polish — qualify the NPTv6 overlap
+  rejection error with the prior rule's rule-set name (independent review +
+  Copilot MINOR). buildNptv6Snapshots flattens all rule-sets into one
+  first-match list, so an overlap can be cross-rule-set; reused rule names
+  across rule-sets were ambiguous. seenPrefix now carries ruleSetName; error
+  emits `overlaps rule-set %q rule %q`. New TestNPTv6RejectsCrossRuleSetOverlap.
+  Behavior-preserving. Independent review verdict: MERGE-READY (fail-closed
+  correctness + overlap determinism + fail-on-revert all CONFIRMED both sides;
+  no wire regen; 2 pre-existing pkg/dataplane canary failures unrelated).
+- **File(s)**: pkg/config/compiler_nat.go, pkg/config/compiler_nptv6_test.go
