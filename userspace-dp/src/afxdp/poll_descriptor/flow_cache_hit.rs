@@ -150,11 +150,13 @@ pub(super) fn stage_flow_cache_hit(
         let cached_dscp_rewrite = policer_action
             .dscp_rewrite
             .or(cached_descriptor.tx_selection.dscp_rewrite);
-        // Amortize session timestamp touch — every 64 cache hits.
-        flow_state.flow_cache_session_touch += 1;
-        if flow_state.flow_cache_session_touch & 63 == 0 {
-            sessions.touch(&flow.forward_key, now_ns);
-        }
+        // #2220: per-session keepalive. Refresh THIS session's
+        // last_seen_ns when it is a quarter of the way to its own
+        // expiry. The prior binding-GLOBAL modulo-64 counter touched
+        // only the flow that happened to land on a global multiple of
+        // 64, so a low-rate flow co-resident with a saturating flow
+        // could be served entirely from the cache and reaped mid-flow.
+        sessions.touch_if_stale(&flow.forward_key, now_ns);
         let mut recycle_now = true;
         if matches!(
             cached_decision.resolution.disposition,

@@ -274,6 +274,52 @@ type compileOpts struct {
 	// constraint, never silently "protocol 0"). Same doctrine as
 	// lenientApplicationSpecs.
 	lenientFilterProtocols bool
+	// lenientNPTv6 (#2240) downgrades the NPTv6 (RFC 6296) validation gate
+	// (validateNPTv6Strict) from a hard compile error to a cfg.Warnings entry.
+	// The strict commit / commit-check path hard-rejects an NPTv6 static-NAT
+	// rule whose `match destination-address` / `then static-nat nptv6-prefix` is
+	// unparseable, not a /48 or /64, has mismatched prefix lengths, or is
+	// non-IPv6. Before this gate such a rule was only WARNED by the dataplane
+	// compiler (compileNPTv6 logged + `continue`d) and then DeleteStaleNPTv6
+	// tore down the working translation entries of the valid subset's
+	// predecessors — a fail-OPEN that silently disabled a working translation on
+	// a typo. The tolerant load / peer-sync paths downgrade to a warning so an
+	// already-persisted or peer-synced config carrying a bad NPTv6 rule still
+	// BOOTS (#1960 no-brick) — the Rust helper's #2240 backstop
+	// (Nptv6State::try_from_snapshots) rejects the snapshot at apply, so the
+	// preflight keeps the previous live state and a leniently-loaded bad config
+	// is inert. Commit stays strict so the operator's next edit fails loudly.
+	// Same doctrine as lenientNATHostMask.
+	lenientNPTv6 bool
+	// lenientFirewallRefs (#2217) downgrades the firewall-filter term
+	// cross-reference gates — `then policer <name>` (Finding A,
+	// validateFirewallPolicerReferencesStrict) and `then routing-instance
+	// <name>` FBF (Finding C, validateFirewallRoutingInstanceReferencesStrict)
+	// — from a hard compile error to a cfg.Warnings entry. Both references were
+	// previously unvalidated: a dangling policer silently never rate-limited
+	// (fail-open) and a dangling FBF routing-instance silently blackholed /
+	// fell through to the default table. The strict commit / commit-check path
+	// hard-rejects so the typo is operator-visible; the tolerant load /
+	// peer-sync paths warn so an already-persisted or peer-synced config still
+	// BOOTS (#1960 fail-closed-on-load class) — the dataplane behaves as it did
+	// before (term unpoliced / steered to a missing table), so a leniently-
+	// loaded config is no worse than before the gate. Same doctrine as
+	// lenientRoutingExportRef.
+	lenientFirewallRefs bool
+	// lenientApplicationSetMembers (#2217 Finding B) downgrades the
+	// application-set member cross-reference gate
+	// (validateApplicationSetMembersStrict) from a hard compile error to a
+	// cfg.Warnings entry. An application-set member referencing neither a
+	// defined application (user / junos-* predefined) nor a defined nested
+	// application-set was previously unvalidated: a policy matching such a set
+	// silently failed to match the intended traffic (the unresolved member
+	// never matches — an effective no-op term, fail-open). The strict commit /
+	// commit-check path hard-rejects; the tolerant load / peer-sync paths warn
+	// so an already-persisted or peer-synced config carrying a dangling member
+	// still BOOTS (#1960) — the dataplane drops the unresolved member
+	// independently, so it is already inert. Same doctrine as
+	// lenientApplicationSpecs.
+	lenientApplicationSetMembers bool
 }
 
 // CompileConfig converts a parsed ConfigTree AST into a typed Config struct.
@@ -310,6 +356,9 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientRoutingExportRef:            true,
 		lenientApplicationSpecs:            true,
 		lenientFilterProtocols:             true,
+		lenientNPTv6:                       true,
+		lenientFirewallRefs:                true,
+		lenientApplicationSetMembers:       true,
 	})
 }
 
@@ -397,6 +446,9 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientRoutingExportRef:            true,
 		lenientApplicationSpecs:            true,
 		lenientFilterProtocols:             true,
+		lenientNPTv6:                       true,
+		lenientFirewallRefs:                true,
+		lenientApplicationSetMembers:       true,
 	})
 }
 
@@ -891,6 +943,60 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		}
 	}
 
+	// #2217 Finding A: firewall-filter `then policer <name>` cross-reference.
+	// A term naming a policer that is not defined under `firewall policer` /
+	// `firewall three-color-policer` compiled cleanly and the rate-limit
+	// silently never applied (fail-open — the term's traffic passed
+	// unpoliced). Strict on commit / commit-check (hard reject so the typo is
+	// operator-visible); lenient on load / peer-sync (warn so an already-
+	// persisted or peer-synced config still boots — #1960). Runs on the
+	// fully-compiled *Config so the policer maps are populated regardless of
+	// authoring order. Mirrors validateRoutingExportReferencesStrict.
+	if err := validateFirewallPolicerReferencesStrict(cfg); err != nil {
+		if opts.lenientFirewallRefs {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("firewall policer reference (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
+	// #2217 Finding C: firewall-filter `then routing-instance <name>` (FBF)
+	// cross-reference. A term naming a routing-instance not defined under
+	// `routing-instances` compiled cleanly and the dataplane steered matched
+	// packets toward a routing table that does not exist — a silent blackhole
+	// / fall-through to the default table. Strict on commit / commit-check;
+	// lenient on load / peer-sync (warn — #1960). Mirrors the policer gate
+	// above.
+	if err := validateFirewallRoutingInstanceReferencesStrict(cfg); err != nil {
+		if opts.lenientFirewallRefs {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("firewall routing-instance reference (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
+	// #2217 Finding B: application-set member cross-reference. An
+	// `applications application-set <set>` member referencing neither a defined
+	// application (user / junos-* predefined) nor a defined nested
+	// application-set compiled cleanly; a policy matching the set silently
+	// failed to match the intended traffic (the unresolved member never
+	// matches — an effective no-op term, fail-open). Strict on commit /
+	// commit-check; lenient on load / peer-sync (warn — #1960; the dataplane
+	// drops the unresolved member independently, so it is already inert).
+	// Reuses ExpandApplicationSet, the same resolver the compiler already uses,
+	// so no new definedness table is introduced. Mirrors
+	// validateApplicationSpecsStrict.
+	if err := validateApplicationSetMembersStrict(cfg); err != nil {
+		if opts.lenientApplicationSetMembers {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("application-set member (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
 	if warnings := ValidateConfig(cfg); len(warnings) > 0 {
 		for _, w := range warnings {
 			cfg.Warnings = append(cfg.Warnings, w)
@@ -917,6 +1023,16 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 	}
 	cfg.Warnings = append(cfg.Warnings, napWarnings...)
 
+	// #2227 MAJOR-1: port-scan / ip-sweep threshold clamp warning. The AF_XDP
+	// dataplane bounds its per-(zone,source) unique-destination set at
+	// MAX_UNIQUE_PER_SOURCE and clamps the effective detection threshold to
+	// maxScanSweepThreshold (= MAX_UNIQUE_PER_SOURCE - 1) so an over-cap
+	// threshold detects at the cap (fail-closed) instead of never (the
+	// pre-fix silent fail-OPEN). A configured threshold above the maximum is
+	// preserved unchanged but warned about here — clamp-warn, never reject, so
+	// existing/peer-synced configs keep booting on both compile paths.
+	cfg.Warnings = append(cfg.Warnings, validateScreenScanSweepThresholds(cfg)...)
+
 	// #2173: static-NAT / NAT64 host-mask gate. #2132 made the Rust
 	// dataplane tolerate the canonical /32-/128 host mask and PR #2167 then
 	// hardened it to REJECT a non-host mask — so a misconfigured non-host
@@ -933,6 +1049,22 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		return nil, err
 	}
 	cfg.Warnings = append(cfg.Warnings, hostMaskWarnings...)
+
+	// #2240: NPTv6 (RFC 6296) validation gate. The dataplane compiler
+	// (compileNPTv6) historically warned + `continue`d past a malformed NPTv6
+	// rule and then deleted stale entries over only the VALID subset, so a typo
+	// in one rule silently tore down a previously-working translation
+	// (fail-open). Strict (commit / commit-check): hard-reject a malformed NPTv6
+	// rule so the operator sees the misconfiguration and the previous forwarding
+	// state is preserved. Lenient (load / peer-sync): warn so a config committed
+	// before this gate existed still boots; the Rust helper independently
+	// rejects the snapshot and keeps the previous live state, so the bad config
+	// is inert.
+	nptv6Warnings, err := validateNPTv6Strict(cfg, opts.lenientNPTv6)
+	if err != nil {
+		return nil, err
+	}
+	cfg.Warnings = append(cfg.Warnings, nptv6Warnings...)
 
 	// #1892: retired DPDK-era `system dataplane` knobs (cores, memory,
 	// socket-mem, rx-mode, ports) parse for stored-config compatibility

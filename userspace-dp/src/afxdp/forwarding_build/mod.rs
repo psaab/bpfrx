@@ -223,7 +223,12 @@ pub(super) fn build_forwarding_state_with_policy_counters_and_previous(
     // live forwarding state rather than installing a silently-narrower NAT64
     // config (the helper-boundary backstop to the Go #2173 commit-time gate).
     state.nat64 = Nat64State::try_from_snapshots(&snapshot.nat64_rules)?;
-    state.nptv6 = Nptv6State::from_snapshots(&snapshot.nptv6_rules);
+    // #2240: fail CLOSED on an unparseable / unsupported / mismatched NPTv6
+    // rule. The preflight in the reconcile/refresh apply paths catches this
+    // Err and keeps the previous live forwarding state rather than installing a
+    // silently-narrower NPTv6 config (the helper-boundary backstop to the Go
+    // commit-time gate).
+    state.nptv6 = Nptv6State::try_from_snapshots(&snapshot.nptv6_rules)?;
     state.screen_profiles = build_screen_profiles(snapshot);
     state.syn_cookie_master_key = parse_syn_cookie_master_key(&snapshot.syn_cookie_master_key);
     state.tcp_mss_all_tcp = snapshot.flow.tcp_mss_all_tcp;

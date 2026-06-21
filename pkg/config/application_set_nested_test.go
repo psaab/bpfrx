@@ -137,7 +137,10 @@ func TestNestedApplicationSetDeep(t *testing.T) {
 
 // TestNestedApplicationSetCycle verifies a self/mutually referential nest is
 // bounded by the existing depth guard (expandAppSet errors past depth 3)
-// rather than recursing forever.
+// rather than recursing forever — and that #2217 Finding B's strict
+// application-set member gate now surfaces that bound at COMMIT (the gate runs
+// ExpandApplicationSet on every authored set, so a cyclic nest is rejected at
+// CompileConfig instead of silently compiling into an unmatchable set).
 func TestNestedApplicationSetCycle(t *testing.T) {
 	tree := &ConfigTree{}
 	for _, cmd := range []string{
@@ -150,9 +153,19 @@ func TestNestedApplicationSetCycle(t *testing.T) {
 			t.Fatalf("SetPath(%q): %v", cmd, err)
 		}
 	}
-	cfg, err := CompileConfig(tree)
+	// Commit now hard-rejects the cyclic nest (#2217 Finding B): the depth
+	// guard fires inside the strict member validator.
+	if _, err := CompileConfig(tree); err == nil {
+		t.Fatal("CompileConfig: expected commit-time rejection of cyclic application-set nest, got nil")
+	} else if !strings.Contains(err.Error(), "nesting too deep") {
+		t.Fatalf("CompileConfig: error = %v, want it to mention the depth bound", err)
+	}
+	// The lenient (tolerant load / peer-sync) path downgrades the same gate to
+	// a warning so an already-persisted cyclic config still boots; the depth
+	// guard still bounds the recursion (no infinite loop).
+	cfg, err := CompileConfigLenient(tree)
 	if err != nil {
-		t.Fatalf("CompileConfig: %v", err)
+		t.Fatalf("CompileConfigLenient: %v", err)
 	}
 	if _, err := ExpandApplicationSet("s1", &cfg.Applications); err == nil {
 		t.Fatal("ExpandApplicationSet(s1): expected depth-bound error on cyclic nest, got nil")

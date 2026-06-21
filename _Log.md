@@ -100,6 +100,68 @@
   userspace-dp/tests/fixtures/protocol_wire_v1.json,
   docs/feature-gaps.md, docs/userspace-dataplane-gaps.md
 
+## 2026-06-21 — #2215: screen parity — ping-of-death port + LAND widen
+
+- **Timestamp**: 2026-06-21
+- **Action**: Fixed two screen parity regressions in the userspace
+  AF_XDP dataplane (the only forwarding path post-#1373/#1476):
+  - **Sub-bug A (ping-of-death dead code)**: `check_ping_of_death`
+    was an ICMP-only `pkt.pkt_len as u32 > 65535` predicate —
+    structurally unsatisfiable because `pkt_len` is a `u16`, so
+    fragment-based ping-of-death went entirely undetected. Ported the
+    authoritative #893 BPF formula: for any IPv4 fragment,
+    `((ip_frag_off & 0x1FFF) << 3) + ip_total_len > 65535 -> drop`
+    (any protocol, fragments only).
+  - **Sub-bug B (LAND too narrow)**: `check_land` required
+    `src_port == dst_port` in addition to `src_ip == dst_ip`, admitting
+    same-IP different-port spoofed frames the BPF screen dropped.
+    Removed the port clause — LAND now fires on `src_ip == dst_ip`
+    alone for IPv4/IPv6, matching the BPF reference
+    (`13fa1009e^:bpf/xdp/xdp_screen.c` ~715-723).
+- **File(s)**: `userspace-dp/src/screen/stateless.rs`,
+  `userspace-dp/src/screen/tests.rs`,
+  `userspace-dp/src/screen/mod.rs`, `userspace-dp/src/FEATURES.md`
+- **Validation**: `cargo build --release` clean; 113 screen tests +
+  9 new/updated land/ping fail-on-revert tests pass; 5x flake clean;
+  reverting either production fix fails the matching new test.
+
+## 2026-06-21 — #2209 + #2210: screen scan/sweep per-zone + bounded + count-after-lookup
+
+- **Timestamp**: 2026-06-21
+- **Action**: One cohesive PR fixing two HIGH screen scan/sweep
+  correctness bugs in the userspace AF_XDP dataplane.
+  - **#2210 (count-after-lookup)**: moved port-scan + IP-sweep MUTATION off
+    the per-packet pre-session screen stage (`check_packet_with_zone_id`)
+    onto a new NEW-FLOW / session-MISS hook
+    (`ScreenState::scan_sweep_drop_on_new_flow`), invoked from
+    `poll_descriptor` next to the #2134 `new_flow_session_limit_drop`. An
+    established flow's packets are session HITS and never reach the hook, so
+    mid-stream ACKs/data/UDP no longer inflate the sweep counter (restores
+    the #867 ACK-evasion contract). Port-scan keeps its initial-SYN gate;
+    IP-sweep counts any new-flow protocol.
+  - **#2209 (per-zone + bounded + perf)**: re-keyed `PortScanTracker` /
+    `IpSweepTracker` from a single global per-`src_ip` map to
+    `(zone_id, src_ip)` (no cross-zone bleed); bounded both axes
+    (`MAX_SOURCES_PER_ZONE=4096`, `MAX_UNIQUE_PER_SOURCE=1024`) with
+    fail-safe skip-on-full + `skipped_pressure` counter (never fail-open the
+    drop, never unbounded growth) and a budgeted per-tick cleanup
+    (`CLEANUP_BUDGET=256`); replaced the per-packet `ScreenProfile::clone()`
+    on the hot path with a borrow (copy only the scalar thresholds needed
+    for the SYN-cookie `&mut self` calls).
+- **File(s)**: `userspace-dp/src/screen/scan.rs` (rewrite — per-zone +
+  bounded + scan_tests), `userspace-dp/src/screen/mod.rs` (borrow not
+  clone; scan/sweep removed from per-packet path; new
+  `scan_sweep_drop_on_new_flow` + `scan_sweep_skipped_pressure` +
+  `maybe_cleanup_trackers`), `userspace-dp/src/afxdp/poll_descriptor/mod.rs`
+  (wire the new-flow scan/sweep hook into the session-miss decision),
+  `userspace-dp/src/screen/tests.rs` (scan/sweep tests retargeted to the
+  miss hook + 4 fail-on-revert tests), `userspace-dp/src/session/README.md`
+  (count-on-miss + per-zone + bounded semantics).
+- **Validation**: `cargo build --release` clean; `cargo test screen` 104/0;
+  10 new tests pass 5x (no flake); fail-on-revert proven for both issues
+  (re-adding pre-session ip_sweep → established-traffic test FAILS;
+  zone-key→global → 3 per-zone tests FAIL). Live screen/flood smoke on the
+  loss cluster is PENDING-PARENT.
 ## 2026-06-21 — #2211 + #2212: NAT64 zero-per-packet-alloc transit + fail-closed config parse
 
 - **Timestamp**: 2026-06-21
@@ -165,6 +227,52 @@
   userspace-dp/src/afxdp/tx/dispatch/cos.rs,
   userspace-dp/src/afxdp/tx/dispatch/dispatch_tests.rs,
   userspace-dp/src/afxdp/README.md
+
+## 2026-06-21 — #2220: flow-cache per-session keepalive (replaces binding-global modulo-64)
+
+- **Timestamp**: 2026-06-21
+- **Action**: Fix HIGH #2220 — a cache-served session could expire while
+  still actively forwarding. The flow-cache fast path
+  (`poll_descriptor/flow_cache_hit.rs`) is the ONLY path that refreshes a
+  forwarded flow's `last_seen_ns`, and it used a binding-GLOBAL
+  modulo-64 counter (`flow_cache_session_touch` on
+  `WorkerFlowCacheState`): the counter incremented across ALL flows on
+  the binding and touched only the flow whose hit happened to land on a
+  global multiple of 64. A low-rate flow co-resident with a saturating
+  flow could be served entirely from the cache for a whole timeout
+  window (UDP 60 s most exposed) without its session ever being touched,
+  then be reaped mid-flow — emitting an HA Close delta to the peer,
+  deleting the live BPF redirect keys, and leaving a stale flow-cache
+  descriptor out-living its session. Replaced the counter with
+  `SessionTable::touch_if_stale`, a per-session time-threshold keepalive
+  that re-stamps a session only once it has gone idle for
+  `expires_after_ns / SESSION_KEEPALIVE_DIVISOR` (a quarter of its own
+  timeout), bounding every cache-served session's age to
+  `(1 + 1/N) × expires_after_ns` independent of co-resident flow rates.
+  Hot-path-cheap (one `key_to_handle` probe + integer compare in steady
+  state; write + throttled `push_to_wheel` only when stale) and
+  allocation-free. Removed the now-unused `flow_cache_session_touch`
+  field from `WorkerFlowCacheState` and its three constructor inits.
+- **Tests**: Added 3 fail-on-revert tests in `session/tests.rs`:
+  `touch_if_stale_throttles_until_quarter_timeout` (throttle semantics),
+  `touch_if_stale_keeps_active_cache_flow_alive` (a cache-served UDP flow
+  survives 10x its timeout while a no-traffic control session expires +
+  emits a Close), and `touch_if_stale_survives_skew_that_starves_global_modulo`
+  (replays the exact #2220 skew — reproduces the old global-modulo logic
+  inline and asserts it reaps the low-rate flow, then asserts the new
+  per-session keepalive keeps it alive). PROVEN fail-on-revert: all 3
+  FAIL when `touch_if_stale` is temporarily reverted to the global
+  modulo-64 behavior; all 3 pass + 5/5 flake-clean against the fix.
+  Full `session` (292) / `flow_cache` / `poll_descriptor` (17) /
+  `keepalive` filters green; release build clean.
+- **File(s)**: userspace-dp/src/afxdp/poll_descriptor/flow_cache_hit.rs,
+  userspace-dp/src/afxdp/worker/flow_cache_state.rs,
+  userspace-dp/src/afxdp/worker/mod.rs,
+  userspace-dp/src/session/mod.rs,
+  userspace-dp/src/session/tests.rs,
+  userspace-dp/src/session/README.md,
+  userspace-dp/src/afxdp/worker/README.md,
+  _Log.md
 
 ## 2026-06-21 — #2150 PR-1: Ethernet/IPv6 parser correctness sub-fixes + drift canaries
 
@@ -8770,6 +8878,31 @@ top.
   docs/refactoring-audit-current.txt
 
 - **Timestamp**: 2026-06-21
+- **Action**: #2227 (#2209/#2210) MERGE-NEEDS-MAJOR fixes. MAJOR-1
+  security fail-open: scan/sweep `check_unique` capped the per-source set
+  at MAX_UNIQUE_PER_SOURCE=1024 then compared `len() > threshold`, so an
+  operator threshold >= 1024 (valid/parseable, e.g. port-scan 5000)
+  could NEVER be crossed -> scanner never dropped (silent fail-OPEN).
+  Fix: clamp the EFFECTIVE comparison threshold to MAX_UNIQUE_PER_SOURCE-1
+  (fail-CLOSED: detect AT THE CAP), count via `threshold_clamped` /
+  `scan_sweep_threshold_clamped`, and add a Go commit-time clamp WARNING
+  (compiler_security.go `maxScanSweepThreshold=1023`, kept in sync with
+  the Rust const; warn+preserve value, never reject). MINOR-3: real
+  negative-Copy guard for ScreenProfile (autoref specialization, fails on
+  revert). MINOR-4: softened "O(total-sources)"/"never fail-opens" docs
+  (retain walks all entries; budget bounds removals; source cap bounds
+  the table). MINOR-5: deduped the double extract_screen_info on the cold
+  new-flow drop path. MINOR-2 (source-table saturation detection-DoS):
+  documented as known limitation + follow-up #2234. Fail-on-revert proven
+  for MAJOR-1 (both tests fail with the un-clamped compare) and MINOR-3
+  (guard fails when ScreenProfile is made Copy). Rust 107 screen tests +
+  4 new (5x flake clean); Go pkg/config green (5x flake clean).
+- **File(s)**: userspace-dp/src/screen/scan.rs,
+  userspace-dp/src/screen/mod.rs, userspace-dp/src/screen/tests.rs,
+  userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/session/README.md,
+  pkg/config/compiler_security.go, pkg/config/compiler.go,
+  pkg/config/parser_security_test.go
 - **Action**: #2214 — fix Go<->Rust empty-collection null-decode no-transit
   bug (#1961-class). A NAT64 rule with no resolvable source-pool emitted
   `pool_addresses:null` and a firewall filter with zero terms emitted
@@ -8860,3 +8993,86 @@ top.
   go test ./pkg/frr/... ./pkg/config/... all green.
 - **File(s)**: pkg/frr/policy_render.go, pkg/frr/frr_test.go,
   pkg/frr/README.md
+
+- **Timestamp**: 2026-06-21
+  **Action**: #2219 — NAT64 ICMP error-message translation (PMTUD +
+  traceroute). Extended the NAT64 ICMP translators (nat64.rs) beyond
+  echo to translate ICMPv6↔ICMPv4 ERROR messages per RFC 7915 §4.2/§5.2:
+  Destination-Unreachable, Time-Exceeded, Parameter-Problem, and
+  Packet-Too-Big↔Fragmentation-Needed with the 20-byte NAT64 MTU
+  adjustment (clamped to the IPv6 minimum link MTU v4→v6). Both the outer
+  ICMP type/code/checksum AND the embedded quoted original packet are
+  translated (embedded addresses NAT64-mapped, lengths/checksums fixed).
+  Reuses the merged #2232 zero-alloc `write_*_into` cores; the embedded
+  packet is translated through a fixed stack scratch buffer
+  (MAX_EMBEDDED_LEN) — no per-packet heap allocation. Pre-fix every error
+  type returned None, aborting the frame build (drop) → PMTUD blackholed,
+  traceroute blank. 13 fail-on-revert byte-level tests added (v6→v4 and
+  v4→v6 of Time-Exceeded, PTB↔Frag-Needed with MTU check, Dest-Unreach),
+  asserting outer + embedded translation with independent checksum oracles.
+  All 60 nat64 tests pass.
+  **File(s)**: userspace-dp/src/nat64.rs, userspace-dp/src/nat64_tests.rs,
+  docs/feature-coverage.md, _Log.md
+
+- **Timestamp**: 2026-06-21
+- **Action**: #2240 (HIGH) + #2241 (MEDIUM) NPTv6 fail-closed family.
+  #2240: compileNPTv6 (pkg/dataplane/compiler_nat.go) warned + `continue`d
+  past any malformed NPTv6 rule then unconditionally called
+  DeleteStaleNPTv6(written) over only the valid subset — so a typo in one
+  rule tore down the previously-working translation entries with no
+  replacement (fail-open; the Rust from_snapshots mirrored the silent skip).
+  #2241: translate_inbound/outbound resolve overlapping /48+/64 prefixes by
+  first-match INSERTION ORDER (no LPM, no overlap rejection) -> order-
+  dependent translation identity. Fix (strict-commit / lenient-load, mirrors
+  #2124/#2142/#2173/#2212): new commit-time gate validateNPTv6Strict
+  (pkg/config/compiler_nat.go) hard-rejects an unparseable / unsupported /
+  mismatched-length / non-IPv6 NPTv6 rule AND any overlapping pair (either
+  direction) at commit/commit-check; lenient path (load/peer-sync) downgrades
+  to a warning so #1960 no-brick holds. Wired via opts.lenientNPTv6 in both
+  lenient factories + the strict call beside validateNATHostMaskStrict.
+  Rust backstop: Nptv6State::try_from_snapshots returns
+  Result<_, SnapshotIntegrityError> (new Nptv6UnparseableRule +
+  Nptv6OverlappingPrefix variants), from_snapshots kept as #[cfg(test)]
+  infallible wrapper; forwarding_build now `?`s it so the apply preflight
+  keeps the previous live state. No wire-shape change (Nptv6RuleSnapshot
+  untouched) -> no protocol_wire_v1.json regen. Fail-on-revert proven both
+  sides (Go: gate disabled -> bad config commits; Rust: try_from_snapshots
+  reverted to fail-open -> 3 new tests fail). 5x flake = 22/22.
+- **File(s)**: pkg/config/compiler_nat.go, pkg/config/compiler.go,
+  pkg/config/compiler_nptv6_test.go (new), userspace-dp/src/nptv6.rs,
+  userspace-dp/src/nptv6_tests.rs, userspace-dp/src/policy.rs,
+  userspace-dp/src/afxdp/forwarding_build/mod.rs, userspace-dp/src/FEATURES.md
+
+- **Timestamp**: 2026-06-21
+- **Action**: #2240/#2241 PR #2246 review polish — qualify the NPTv6 overlap
+  rejection error with the prior rule's rule-set name (independent review +
+  Copilot MINOR). buildNptv6Snapshots flattens all rule-sets into one
+  first-match list, so an overlap can be cross-rule-set; reused rule names
+  across rule-sets were ambiguous. seenPrefix now carries ruleSetName; error
+  emits `overlaps rule-set %q rule %q`. New TestNPTv6RejectsCrossRuleSetOverlap.
+  Behavior-preserving. Independent review verdict: MERGE-READY (fail-closed
+  correctness + overlap determinism + fail-on-revert all CONFIRMED both sides;
+  no wire regen; 2 pre-existing pkg/dataplane canary failures unrelated).
+- **File(s)**: pkg/config/compiler_nat.go, pkg/config/compiler_nptv6_test.go
+
+- **Timestamp**: 2026-06-21
+- **Action**: #2217 — strict commit-time validation for three previously-
+  unvalidated firewall/application cross-references that each silently fail OPEN
+  at the dataplane. (A) firewall filter `then policer <name>` must resolve to a
+  defined `firewall policer` / `three-color-policer`
+  (validateFirewallPolicerReferencesStrict). (B) `applications application-set`
+  members must resolve to a defined application (user / junos-* predefined) or
+  nested set, reusing ExpandApplicationSet (validateApplicationSetMembersStrict;
+  implicit multi-term sets skipped). (C) firewall filter `then routing-instance
+  <name>` (FBF) must name a defined routing-instance
+  (validateFirewallRoutingInstanceReferencesStrict). Strict on commit/commit-
+  check; lenient (warn) on load/peer-sync via lenientFirewallRefs +
+  lenientApplicationSetMembers (#1960 no-brick). Both AST shapes. Fail-on-revert
+  proven (7 reject tests fail when validators neutered). Two pre-existing
+  firewall parse tests + the app-set cycle test updated for the now-stricter
+  compiler (genuine catches: define the steered RI / assert commit-time cycle
+  reject).
+- **File(s)**: pkg/config/compiler_validate_strict.go, pkg/config/compiler.go,
+  pkg/config/compiler_undefined_ref_2217_test.go (new),
+  pkg/config/parser_security_test.go, pkg/config/application_set_nested_test.go,
+  docs/config-schema.md

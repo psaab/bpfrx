@@ -263,6 +263,167 @@ func validateNATHostMaskStrict(cfg *Config, lenient bool) ([]string, error) {
 	return warnings, nil
 }
 
+// validateNPTv6Strict is the #2240/#2241 strict-vs-lenient gate for NPTv6
+// (RFC 6296) static-NAT rules (`then static-nat nptv6-prefix`).
+//
+// #2240 (fail-closed validation): the dataplane compiler
+// (`pkg/dataplane/compiler_nat.go` compileNPTv6) historically logged a warning
+// and `continue`d past any per-rule validation failure (unparseable prefix,
+// mismatched /48-vs-/64 lengths, an unsupported length, a non-IPv6 prefix),
+// then unconditionally called `DeleteStaleNPTv6(written)` over only the VALID
+// subset — so editing one previously-good rule into an invalid one TORE DOWN
+// its working translation entry with no replacement installed, silently
+// disabling a working translation. The Rust helper mirrored the silent skip.
+// In a retired-eBPF world (#1373) the userspace helper is the enforcement
+// plane, so this is a fail-OPEN regression: a typo silently changes
+// reachability and source/destination identity while the commit still reports
+// success. This commit-time gate surfaces the misconfiguration loudly.
+//
+// #2241 (overlap rejection): NPTv6 supports both /48 and /64 rules. The runtime
+// resolves a match by FIRST hit in insertion order with no longest-prefix
+// match, so a broad /48 configured before a nested /64 shadows the /64 and
+// reordering the same rules changes the translation identity. Reject any
+// overlapping pair (in either direction) so resolution is deterministic.
+//
+// Strict (commit / commit-check): hard-reject. Lenient (load / peer-sync, #1960
+// / #1979 doctrine): return the messages as warnings so a config committed
+// before this gate existed (or peer-synced) still boots — the Rust helper's
+// own #2240/#2241 backstop (`Nptv6State::try_from_snapshots`) rejects the
+// snapshot at apply, so the apply preflight keeps the previous live forwarding
+// state and a leniently-loaded bad config never installs a torn-down or
+// nondeterministic NPTv6 runtime.
+func validateNPTv6Strict(cfg *Config, lenient bool) ([]string, error) {
+	if cfg == nil {
+		return nil, nil
+	}
+	var warnings []string
+	emit := func(msg string) error {
+		if lenient {
+			warnings = append(warnings,
+				msg+" (ignored: NPTv6 snapshot rejected by dataplane, previous state kept, until corrected)")
+			return nil
+		}
+		return fmt.Errorf("%s", msg)
+	}
+
+	// Track already-validated prefixes per direction to reject overlaps (#2241).
+	// Outbound matches on the internal prefix; inbound matches on the external
+	// (match) prefix. Each direction is checked independently.
+	type seenPrefix struct {
+		net         *net.IPNet
+		ones        int
+		ruleSetName string
+		ruleName    string
+	}
+	var internalSeen, externalSeen []seenPrefix
+
+	// overlaps reports whether two IPv6 prefixes overlap — i.e. one contains
+	// the other's network address (the shorter prefix is a prefix of the
+	// longer). This covers identical /48-/48, identical /64-/64, and a /48
+	// nesting a /64 (the case that makes first-match resolution order-
+	// dependent).
+	overlaps := func(a, b *net.IPNet) bool {
+		return a.Contains(b.IP) || b.Contains(a.IP)
+	}
+
+	for _, rs := range cfg.Security.NAT.Static {
+		if rs == nil {
+			continue
+		}
+		for _, rule := range rs.Rules {
+			if rule == nil || !rule.IsNPTv6 {
+				continue
+			}
+
+			// External prefix = `match destination-address`.
+			extIP, extNet, errExt := net.ParseCIDR(rule.Match)
+			// Internal prefix = `then static-nat nptv6-prefix`.
+			intIP, intNet, errInt := net.ParseCIDR(rule.Then)
+
+			if errExt != nil {
+				if err := emit(fmt.Sprintf(
+					"security nat static rule-set %q rule %q match destination-address %q is not a valid IPv6 prefix for nptv6-prefix translation",
+					rs.Name, rule.Name, rule.Match)); err != nil {
+					return nil, err
+				}
+				continue
+			}
+			if errInt != nil {
+				if err := emit(fmt.Sprintf(
+					"security nat static rule-set %q rule %q then static-nat nptv6-prefix %q is not a valid IPv6 prefix",
+					rs.Name, rule.Name, rule.Then)); err != nil {
+					return nil, err
+				}
+				continue
+			}
+
+			extOnes, _ := extNet.Mask.Size()
+			intOnes, _ := intNet.Mask.Size()
+
+			if extOnes != intOnes {
+				if err := emit(fmt.Sprintf(
+					"security nat static rule-set %q rule %q nptv6 prefix lengths must match (match %q is /%d, nptv6-prefix %q is /%d)",
+					rs.Name, rule.Name, rule.Match, extOnes, rule.Then, intOnes)); err != nil {
+					return nil, err
+				}
+				continue
+			}
+			if extOnes != 48 && extOnes != 64 {
+				if err := emit(fmt.Sprintf(
+					"security nat static rule-set %q rule %q nptv6 prefix length /%d is unsupported (only /48 and /64 are allowed)",
+					rs.Name, rule.Name, extOnes)); err != nil {
+					return nil, err
+				}
+				continue
+			}
+			if extIP.To4() != nil || intIP.To4() != nil {
+				if err := emit(fmt.Sprintf(
+					"security nat static rule-set %q rule %q nptv6 prefixes must be IPv6 (match %q, nptv6-prefix %q)",
+					rs.Name, rule.Name, rule.Match, rule.Then)); err != nil {
+					return nil, err
+				}
+				continue
+			}
+
+			// #2241: overlap rejection. Check the internal (outbound) and
+			// external (inbound) prefixes independently against prior rules.
+			overlapFound := false
+			for _, prev := range internalSeen {
+				if overlaps(prev.net, intNet) {
+					overlapFound = true
+					if err := emit(fmt.Sprintf(
+						"security nat static rule-set %q rule %q nptv6-prefix %q overlaps rule-set %q rule %q (outbound/internal prefixes overlap; first-match resolution would be order-dependent)",
+						rs.Name, rule.Name, rule.Then, prev.ruleSetName, prev.ruleName)); err != nil {
+						return nil, err
+					}
+					break
+				}
+			}
+			for _, prev := range externalSeen {
+				if overlaps(prev.net, extNet) {
+					overlapFound = true
+					if err := emit(fmt.Sprintf(
+						"security nat static rule-set %q rule %q match destination-address %q overlaps rule-set %q rule %q (inbound/external prefixes overlap; first-match resolution would be order-dependent)",
+						rs.Name, rule.Name, rule.Match, prev.ruleSetName, prev.ruleName)); err != nil {
+						return nil, err
+					}
+					break
+				}
+			}
+			if overlapFound {
+				// Do not register an overlapping rule as a baseline for
+				// subsequent comparisons; the snapshot is already rejected.
+				continue
+			}
+
+			internalSeen = append(internalSeen, seenPrefix{net: intNet, ones: intOnes, ruleSetName: rs.Name, ruleName: rule.Name})
+			externalSeen = append(externalSeen, seenPrefix{net: extNet, ones: extOnes, ruleSetName: rs.Name, ruleName: rule.Name})
+		}
+	}
+
+	return warnings, nil
+}
+
 func compileNAT(node *Node, sec *SecurityConfig) error {
 	// Initialize SourcePools map
 	if sec.NAT.SourcePools == nil {

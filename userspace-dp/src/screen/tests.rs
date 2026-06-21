@@ -140,11 +140,61 @@ fn land_attack_v6() {
 }
 
 #[test]
-fn land_attack_different_ports_passes() {
+fn land_attack_different_ports_drops() {
+    // #2215 fail-on-revert (sub-bug B): the LAND signature is
+    // src_ip == dst_ip ALONE, matching the authoritative BPF screen
+    // (`13fa1009e^:bpf/xdp/xdp_screen.c` ~715-723) — NO port equality.
+    // Pre-#2215 the check additionally required src_port == dst_port,
+    // so this same-IP/different-port frame PASSED. It must now DROP.
     let mut state = make_state("trust", default_profile());
     let src = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1));
-    // Same IP but different ports should pass
     let pkt = tcp_pkt(src, src, 80, 443, TCP_SYN);
+    assert_eq!(
+        state.check_packet("trust", &pkt, 1),
+        ScreenVerdict::Drop("land-attack")
+    );
+}
+
+#[test]
+fn land_attack_v6_different_ports_drops() {
+    // #2215 (sub-bug B): the BPF reference drops src==dst for IPv6 too,
+    // unconditionally. Different ports must still DROP.
+    let mut state = make_state("trust", default_profile());
+    let src = IpAddr::V6("2001:db8::1".parse::<Ipv6Addr>().unwrap());
+    let pkt = tcp_pkt(src, src, 80, 443, TCP_SYN);
+    assert_eq!(
+        state.check_packet("trust", &pkt, 1),
+        ScreenVerdict::Drop("land-attack")
+    );
+}
+
+#[test]
+fn land_attack_udp_different_ports_drops() {
+    // #2215 (sub-bug B): the LAND/anti-spoofing invariant is not
+    // TCP-specific. A UDP frame whose source IP equals its destination
+    // IP (different ports) must DROP. Pre-#2215 it passed.
+    let mut profile = default_profile();
+    // Keep the rate-based screens disabled so only LAND can fire.
+    profile.udp_flood_threshold = 0;
+    let mut state = make_state("trust", profile);
+    let src = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1));
+    let mut pkt = udp_pkt(src, src);
+    pkt.src_port = 5000;
+    pkt.dst_port = 5001;
+    assert_eq!(
+        state.check_packet("trust", &pkt, 1),
+        ScreenVerdict::Drop("land-attack")
+    );
+}
+
+#[test]
+fn land_attack_distinct_ips_passes() {
+    // Control: a normal frame whose source != destination must NOT be
+    // flagged as a LAND attack regardless of ports.
+    let mut state = make_state("trust", default_profile());
+    let src = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1));
+    let dst = IpAddr::V4(Ipv4Addr::new(10, 0, 2, 1));
+    let pkt = tcp_pkt(src, dst, 80, 80, TCP_SYN);
     assert_eq!(state.check_packet("trust", &pkt, 1), ScreenVerdict::Pass);
 }
 
@@ -315,21 +365,125 @@ fn winnuke_disabled_passes() {
 // Ping of Death
 // ================================================================
 
+/// Build an IPv4 fragment with the given fragment-offset (in 8-byte
+/// units, i.e. the raw 13-bit offset field) and IP total length.
+/// `more_fragments` controls the MF bit. Used by the #2215
+/// ping-of-death and teardrop regression tests.
+fn ipv4_fragment(
+    src: IpAddr,
+    dst: IpAddr,
+    protocol: u8,
+    frag_units: u16,
+    more_fragments: bool,
+    ip_total_len: u16,
+) -> ScreenPacketInfo {
+    let mut frag_off = frag_units & 0x1FFF;
+    if more_fragments {
+        frag_off |= 0x2000;
+    }
+    let is_first = more_fragments && (frag_units & 0x1FFF) == 0;
+    ScreenPacketInfo {
+        addr_family: libc::AF_INET as u8,
+        protocol,
+        tcp_flags: 0,
+        src_ip: src,
+        dst_ip: dst,
+        src_port: 0,
+        dst_port: 0,
+        tcp_seq: 0,
+        tcp_ack: 0,
+        tcp_mss: 0,
+        pkt_len: ip_total_len,
+        is_fragment: (frag_off & 0x3FFF) != 0,
+        is_first_fragment: is_first,
+        ip_ihl: 5,
+        ip_frag_off: frag_off,
+        ip_total_len,
+    }
+}
+
 #[test]
-fn ping_of_death_drops() {
+fn ping_of_death_oversized_fragment_drops() {
+    // #2215 fail-on-revert (sub-bug A): the classic ping-of-death is a
+    // fragment whose reassembled contribution exceeds the 65535-byte IP
+    // length limit. The dataplane does not reassemble, so it is detected
+    // per-fragment: offset_bytes = (frag_off & 0x1FFF) << 3; if
+    // offset_bytes + ip_total_len > 65535 -> drop (BPF #893 formula).
+    //
+    // Last fragment at offset 8191 units = 65528 bytes carrying a 60-byte
+    // IP datagram: 65528 + 60 = 65588 > 65535 -> ping-of-death. Pre-#2215
+    // the check was ICMP-only dead code (`pkt_len as u32 > 65535`,
+    // unsatisfiable for a u16) so this PASSED.
     let mut state = make_state("trust", default_profile());
-    // pkt_len stored as u16, so max is 65535; ping-of-death only triggers
-    // for pkt_len > 65535 which can't fit in u16. The BPF code uses
-    // meta->pkt_len which is also u16 but checks > 65535 via u32 promotion.
-    // In practice with u16 pkt_len this check won't trigger, but we still
-    // implement the logic for correctness. With u32 pkt_len it would work.
-    // Test with u16 max — this should pass since 65535 is not > 65535.
+    let pkt = ipv4_fragment(
+        IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1)),
+        IpAddr::V4(Ipv4Addr::new(10, 0, 2, 1)),
+        PROTO_ICMP,
+        8191, // 8191 * 8 = 65528 bytes
+        false,
+        60,
+    );
+    assert_eq!(
+        state.check_packet("trust", &pkt, 1),
+        ScreenVerdict::Drop("ping-of-death")
+    );
+}
+
+#[test]
+fn ping_of_death_oversized_fragment_any_proto_drops() {
+    // #2215 (sub-bug A): the BPF reference fires for ANY IPv4 protocol,
+    // not just ICMP. A UDP fragment that overflows the reassembly limit
+    // must DROP. (Disable the UDP-flood screen so only ping-of-death can
+    // fire.)
+    let mut profile = default_profile();
+    profile.udp_flood_threshold = 0;
+    let mut state = make_state("trust", profile);
+    let pkt = ipv4_fragment(
+        IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1)),
+        IpAddr::V4(Ipv4Addr::new(10, 0, 2, 1)),
+        PROTO_UDP,
+        8190, // 8190 * 8 = 65520 bytes
+        false,
+        100, // 65520 + 100 = 65620 > 65535
+    );
+    assert_eq!(
+        state.check_packet("trust", &pkt, 1),
+        ScreenVerdict::Drop("ping-of-death")
+    );
+}
+
+#[test]
+fn ping_of_death_in_bounds_fragment_passes() {
+    // Control: a fragment whose offset + total length stays within the
+    // 65535-byte limit must NOT be flagged as ping-of-death. Use a UDP
+    // fragment (with the udp-flood screen disabled) so neither the
+    // icmp-fragment nor teardrop screens can mask the ping-of-death
+    // outcome; payload (1500-20=1480) is well above the 8-byte teardrop
+    // floor regardless.
+    let mut profile = default_profile();
+    profile.udp_flood_threshold = 0;
+    let mut state = make_state("trust", profile);
+    let pkt = ipv4_fragment(
+        IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1)),
+        IpAddr::V4(Ipv4Addr::new(10, 0, 2, 1)),
+        PROTO_UDP,
+        100,   // 100 * 8 = 800 bytes
+        false, // not the last fragment is irrelevant; a mid-chain fragment
+        1500,  // 800 + 1500 = 2300 <= 65535
+    );
+    assert_eq!(state.check_packet("trust", &pkt, 1), ScreenVerdict::Pass);
+}
+
+#[test]
+fn ping_of_death_non_fragment_passes() {
+    // Control: a normal (unfragmented) ICMP echo must NOT be flagged —
+    // the check only applies to fragments.
+    let mut state = make_state("trust", default_profile());
     let pkt = icmp_pkt(
         IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1)),
         IpAddr::V4(Ipv4Addr::new(10, 0, 2, 1)),
-        65535,
+        84,
     );
-    // 65535 is not > 65535, so it passes
     assert_eq!(state.check_packet("trust", &pkt, 1), ScreenVerdict::Pass);
 }
 
@@ -2074,6 +2228,15 @@ fn extract_info_from_ipv4_frame() {
 // Port scan detection
 // ================================================================
 
+// NOTE (#2210): scan/sweep detection moved OFF the per-packet
+// `check_packet` pre-session stage and onto the NEW-FLOW / session-MISS
+// hook `scan_sweep_drop_on_new_flow`. These tests drive that hook (the
+// caller in `poll_descriptor` only reaches it on a session miss, which is
+// what gives established flows their immunity). `ZID` is an arbitrary but
+// fixed zone id; the per-zone keying is exercised in
+// `screen::scan::scan_tests` and `scan_sweep_per_zone_no_cross_count`.
+const ZID: u16 = 7;
+
 #[test]
 fn port_scan_detected() {
     let mut profile = ScreenProfile::default();
@@ -2087,8 +2250,8 @@ fn port_scan_detected() {
     for port in [80, 443, 8080] {
         let pkt = tcp_pkt(src, dst, 1234, port, TCP_SYN);
         assert_eq!(
-            state.check_packet("trust", &pkt, 100),
-            ScreenVerdict::Pass,
+            state.scan_sweep_drop_on_new_flow("trust", ZID, &pkt, 100),
+            None,
             "port {} should pass",
             port,
         );
@@ -2097,8 +2260,8 @@ fn port_scan_detected() {
     // 4th unique port triggers port scan
     let pkt = tcp_pkt(src, dst, 1234, 22, TCP_SYN);
     assert_eq!(
-        state.check_packet("trust", &pkt, 100),
-        ScreenVerdict::Drop("port-scan")
+        state.scan_sweep_drop_on_new_flow("trust", ZID, &pkt, 100),
+        Some("port-scan")
     );
 }
 
@@ -2114,19 +2277,28 @@ fn port_scan_resets_on_window_expiry() {
     // Fill up in window at time=100
     let pkt1 = tcp_pkt(src, dst, 1234, 80, TCP_SYN);
     let pkt2 = tcp_pkt(src, dst, 1234, 443, TCP_SYN);
-    assert_eq!(state.check_packet("trust", &pkt1, 100), ScreenVerdict::Pass);
-    assert_eq!(state.check_packet("trust", &pkt2, 100), ScreenVerdict::Pass);
+    assert_eq!(
+        state.scan_sweep_drop_on_new_flow("trust", ZID, &pkt1, 100),
+        None
+    );
+    assert_eq!(
+        state.scan_sweep_drop_on_new_flow("trust", ZID, &pkt2, 100),
+        None
+    );
 
     // 3rd port triggers at time=100
     let pkt3 = tcp_pkt(src, dst, 1234, 22, TCP_SYN);
     assert_eq!(
-        state.check_packet("trust", &pkt3, 100),
-        ScreenVerdict::Drop("port-scan")
+        state.scan_sweep_drop_on_new_flow("trust", ZID, &pkt3, 100),
+        Some("port-scan")
     );
 
     // After window expires (default 10s), should pass again
     let pkt4 = tcp_pkt(src, dst, 1234, 8080, TCP_SYN);
-    assert_eq!(state.check_packet("trust", &pkt4, 111), ScreenVerdict::Pass);
+    assert_eq!(
+        state.scan_sweep_drop_on_new_flow("trust", ZID, &pkt4, 111),
+        None
+    );
 }
 
 #[test]
@@ -2138,10 +2310,16 @@ fn port_scan_only_on_syn() {
     let src = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1));
     let dst = IpAddr::V4(Ipv4Addr::new(10, 0, 2, 1));
 
-    // ACK packets (established traffic) should not trigger port scan
+    // ACK packets (a session-miss ACK still reaches the hook, but
+    // port-scan is SYN-only) should not trigger port scan. (IP-sweep on a
+    // miss ACK is a separate, intended count — threshold is 0 here so it
+    // never fires.)
     for port in [80, 443, 8080, 22] {
         let pkt = tcp_pkt(src, dst, 1234, port, TCP_ACK);
-        assert_eq!(state.check_packet("trust", &pkt, 100), ScreenVerdict::Pass,);
+        assert_eq!(
+            state.scan_sweep_drop_on_new_flow("trust", ZID, &pkt, 100),
+            None
+        );
     }
 }
 
@@ -2161,15 +2339,18 @@ fn ip_sweep_detected() {
     for i in 1..=3u8 {
         let dst = IpAddr::V4(Ipv4Addr::new(10, 0, 2, i));
         let pkt = tcp_pkt(src, dst, 1234, 80, TCP_SYN);
-        assert_eq!(state.check_packet("trust", &pkt, 100), ScreenVerdict::Pass);
+        assert_eq!(
+            state.scan_sweep_drop_on_new_flow("trust", ZID, &pkt, 100),
+            None
+        );
     }
 
     // 4th unique destination triggers IP sweep
     let dst = IpAddr::V4(Ipv4Addr::new(10, 0, 2, 4));
     let pkt = tcp_pkt(src, dst, 1234, 80, TCP_SYN);
     assert_eq!(
-        state.check_packet("trust", &pkt, 100),
-        ScreenVerdict::Drop("ip-sweep")
+        state.scan_sweep_drop_on_new_flow("trust", ZID, &pkt, 100),
+        Some("ip-sweep")
     );
 }
 
@@ -2185,21 +2366,27 @@ fn ip_sweep_resets_on_window_expiry() {
     for i in 1..=2u8 {
         let dst = IpAddr::V4(Ipv4Addr::new(10, 0, 2, i));
         let pkt = tcp_pkt(src, dst, 1234, 80, TCP_SYN);
-        assert_eq!(state.check_packet("trust", &pkt, 100), ScreenVerdict::Pass);
+        assert_eq!(
+            state.scan_sweep_drop_on_new_flow("trust", ZID, &pkt, 100),
+            None
+        );
     }
 
     // 3rd triggers
     let dst3 = IpAddr::V4(Ipv4Addr::new(10, 0, 2, 3));
     let pkt3 = tcp_pkt(src, dst3, 1234, 80, TCP_SYN);
     assert_eq!(
-        state.check_packet("trust", &pkt3, 100),
-        ScreenVerdict::Drop("ip-sweep")
+        state.scan_sweep_drop_on_new_flow("trust", ZID, &pkt3, 100),
+        Some("ip-sweep")
     );
 
     // After window expires (default 10s), passes again
     let dst4 = IpAddr::V4(Ipv4Addr::new(10, 0, 2, 4));
     let pkt4 = tcp_pkt(src, dst4, 1234, 80, TCP_SYN);
-    assert_eq!(state.check_packet("trust", &pkt4, 111), ScreenVerdict::Pass);
+    assert_eq!(
+        state.scan_sweep_drop_on_new_flow("trust", ZID, &pkt4, 111),
+        None
+    );
 }
 
 #[test]
@@ -2214,7 +2401,10 @@ fn ip_sweep_works_with_udp() {
         let dst = IpAddr::V4(Ipv4Addr::new(10, 0, 2, i));
         let mut pkt = udp_pkt(src, dst);
         pkt.dst_ip = dst;
-        assert_eq!(state.check_packet("trust", &pkt, 100), ScreenVerdict::Pass);
+        assert_eq!(
+            state.scan_sweep_drop_on_new_flow("trust", ZID, &pkt, 100),
+            None
+        );
     }
 
     // 3rd triggers
@@ -2222,7 +2412,227 @@ fn ip_sweep_works_with_udp() {
     let mut pkt3 = udp_pkt(src, dst3);
     pkt3.dst_ip = dst3;
     assert_eq!(
-        state.check_packet("trust", &pkt3, 100),
-        ScreenVerdict::Drop("ip-sweep")
+        state.scan_sweep_drop_on_new_flow("trust", ZID, &pkt3, 100),
+        Some("ip-sweep")
+    );
+}
+
+// ================================================================
+// #2210: established (session-hit) traffic must NOT count toward sweep.
+// #2209: per-zone keying + bounded state + no per-packet profile clone.
+// ================================================================
+
+/// #2210 fail-on-revert: the per-packet `check_packet` pre-session stage
+/// must NOT touch the sweep/scan trackers. If the scan/sweep mutation were
+/// (re)added back to `check_packet` (the pre-#2210 bug), this would drop on
+/// the 3rd packet. Established flows are session HITS in production and
+/// never reach the miss hook, so the only way they could inflate the sweep
+/// counter is via `check_packet` — which this asserts they do not.
+#[test]
+fn established_traffic_does_not_count_toward_sweep_via_check_packet() {
+    let mut profile = ScreenProfile::default();
+    profile.ip_sweep_threshold = 2;
+    profile.port_scan_threshold = 2;
+    let mut state = make_state("trust", profile);
+
+    let src = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1));
+    // A high-fan-out established client: ACKs to many destinations on many
+    // ports. None of these are SYNs; in production they would be session
+    // hits. `check_packet` must pass every one — sweep is NOT evaluated
+    // here anymore.
+    for i in 1..=10u8 {
+        let dst = IpAddr::V4(Ipv4Addr::new(10, 0, 2, i));
+        let pkt = tcp_pkt(src, dst, 1234, 1000 + i as u16, TCP_ACK);
+        assert_eq!(
+            state.check_packet("trust", &pkt, 100),
+            ScreenVerdict::Pass,
+            "established ACK to dst .{} must not count toward sweep on the pre-session stage",
+            i
+        );
+    }
+    // And a genuine new-flow sweep still fires on the miss hook.
+    for i in 1..=2u8 {
+        let dst = IpAddr::V4(Ipv4Addr::new(10, 0, 3, i));
+        let pkt = tcp_pkt(src, dst, 1234, 80, TCP_SYN);
+        assert_eq!(
+            state.scan_sweep_drop_on_new_flow("trust", ZID, &pkt, 100),
+            None
+        );
+    }
+    let dst = IpAddr::V4(Ipv4Addr::new(10, 0, 3, 3));
+    let pkt = tcp_pkt(src, dst, 1234, 80, TCP_SYN);
+    assert_eq!(
+        state.scan_sweep_drop_on_new_flow("trust", ZID, &pkt, 100),
+        Some("ip-sweep")
+    );
+}
+
+/// #2209 fail-on-revert: scan/sweep state is per-zone. The SAME source
+/// sweeping zone A must not push zone B over its threshold. A global
+/// tracker (the pre-#2209 bug) would have zone B already at zone A's count.
+#[test]
+fn scan_sweep_per_zone_no_cross_count() {
+    let mut state = ScreenState::new();
+    let mut profiles = FxHashMap::default();
+    let mut a = ScreenProfile::default();
+    a.ip_sweep_threshold = 2;
+    let mut b = ScreenProfile::default();
+    b.ip_sweep_threshold = 2;
+    profiles.insert("zoneA".to_string(), a);
+    profiles.insert("zoneB".to_string(), b);
+    state.update_profiles(profiles);
+
+    let src = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1));
+    // Source sweeps zoneA: two unique dsts (no drop yet).
+    for i in 1..=2u8 {
+        let dst = IpAddr::V4(Ipv4Addr::new(10, 0, 2, i));
+        let pkt = tcp_pkt(src, dst, 1234, 80, TCP_SYN);
+        assert_eq!(
+            state.scan_sweep_drop_on_new_flow("zoneA", 1, &pkt, 100),
+            None
+        );
+    }
+    // Same source in zoneB starts fresh — two unique dsts still pass.
+    for i in 1..=2u8 {
+        let dst = IpAddr::V4(Ipv4Addr::new(10, 0, 9, i));
+        let pkt = tcp_pkt(src, dst, 1234, 80, TCP_SYN);
+        assert_eq!(
+            state.scan_sweep_drop_on_new_flow("zoneB", 2, &pkt, 100),
+            None,
+            "zoneB must not inherit zoneA's sweep history for the same source",
+        );
+    }
+    // zoneB's 3rd unique dst crosses zoneB's own threshold.
+    let dst = IpAddr::V4(Ipv4Addr::new(10, 0, 9, 3));
+    let pkt = tcp_pkt(src, dst, 1234, 80, TCP_SYN);
+    assert_eq!(
+        state.scan_sweep_drop_on_new_flow("zoneB", 2, &pkt, 100),
+        Some("ip-sweep")
+    );
+}
+
+/// #2209 fail-on-revert: a per-packet profile CLONE on the screen hot path
+/// would defeat the perf fix. `ScreenProfile` is not `Copy` and the
+/// production `check_packet_with_zone_id` borrows it. We assert the type is
+/// NOT `Copy` (so an accidental `Clone`-by-value reintroduction is a visible
+/// `.clone()` in review) and exercise the borrow-only path heavily to prove
+/// it compiles and runs without a per-call clone. (A `Copy` profile would
+/// silently hide a per-packet copy; keeping it non-Copy keeps the cost
+/// auditable.)
+#[test]
+fn screen_profile_is_not_copy_so_per_packet_copies_stay_auditable() {
+    // REAL negative-Copy guard (#2227 MINOR-3): autoref specialization.
+    // `IsCopy::is_copy` (the inherent method on the `Witness<T>` wrapper) is
+    // selected ONLY when `T: Copy`; otherwise method resolution autorefs to
+    // the `NotCopy` trait's `is_copy(&self)`. So the returned flag is `true`
+    // iff `ScreenProfile: Copy`. A test (not just a compile gate) lets this
+    // FAIL-ON-REVERT loudly if someone makes `ScreenProfile` `Copy` — which
+    // would silently hide a per-packet copy on the screen hot path.
+    struct Witness<T>(core::marker::PhantomData<T>);
+    trait NotCopy {
+        fn is_copy(&self) -> bool {
+            false
+        }
+    }
+    impl<T> NotCopy for Witness<T> {}
+    impl<T: Copy> Witness<T> {
+        fn is_copy(&self) -> bool {
+            true
+        }
+    }
+    assert!(
+        !Witness::<ScreenProfile>(core::marker::PhantomData).is_copy(),
+        "ScreenProfile must NOT be Copy — a Copy profile silently hides a \
+         per-packet copy on the screen hot path (#2209 perf invariant)"
+    );
+    // Sanity: the witness reports `true` for a genuinely-Copy type, proving
+    // the negative assertion above is discriminating (not vacuously false).
+    assert!(
+        Witness::<u32>(core::marker::PhantomData).is_copy(),
+        "witness must detect a Copy type"
+    );
+
+    // Drive the borrow-only hot path many times; this would not compile if
+    // the body still required a `self.profiles.get(zone).clone()` and we had
+    // removed Clone — and it documents the no-clone invariant.
+    let mut profile = ScreenProfile::default();
+    profile.land = true;
+    let mut state = make_state("trust", profile);
+    let src = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1));
+    let dst = IpAddr::V4(Ipv4Addr::new(10, 0, 2, 1));
+    for _ in 0..1000 {
+        let pkt = tcp_pkt(src, dst, 1234, 80, TCP_SYN);
+        assert_eq!(state.check_packet("trust", &pkt, 100), ScreenVerdict::Pass);
+    }
+}
+
+/// #2209 fail-on-revert (bounded + not-fail-open at the `ScreenState`
+/// level): a spoofed-source flood through the new-flow hook cannot grow the
+/// tracker without bound and never fail-opens the drop.
+#[test]
+fn scan_sweep_state_bounded_and_records_pressure() {
+    let mut profile = ScreenProfile::default();
+    profile.ip_sweep_threshold = 1_000_000; // never trips by detection
+    let mut state = make_state("trust", profile);
+
+    assert_eq!(state.scan_sweep_skipped_pressure(), 0);
+    // Far more distinct sources than the per-zone cap.
+    for i in 0..(super::scan::max_sources_per_zone_for_test() + 200) {
+        let src = IpAddr::V4(Ipv4Addr::from(0x0a00_0000u32 + i as u32));
+        let dst = IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1));
+        let pkt = tcp_pkt(src, dst, 1234, 80, TCP_SYN);
+        // Must never return a drop reason from overflow (no fail-open).
+        assert_eq!(
+            state.scan_sweep_drop_on_new_flow("trust", ZID, &pkt, 100),
+            None
+        );
+    }
+    assert!(
+        state.scan_sweep_skipped_pressure() >= 200,
+        "over-cap sources must record pressure, got {}",
+        state.scan_sweep_skipped_pressure()
+    );
+}
+
+/// #2227 MAJOR-1 fail-on-revert (at the production `ScreenState` hook): an
+/// IP-sweep configured with a threshold ABOVE the per-source unique cap
+/// (3000 — a value `pkg/config` parses and stores unchanged) must STILL fire
+/// detection. Pre-fix the dataplane compared `set.len() > threshold` and
+/// `len()` could never exceed `MAX_UNIQUE_PER_SOURCE` (1024 < 3000), so the
+/// scanner was NEVER dropped (silent fail-OPEN). The fail-closed clamp makes a
+/// saturated set always cross the effective threshold, and the clamp is
+/// recorded for observability.
+#[test]
+fn ip_sweep_above_unique_cap_still_fires_at_screen_state() {
+    let mut profile = ScreenProfile::default();
+    // 3000 mirrors parser_security_test.go's TestScreenCompilation and exceeds
+    // MAX_UNIQUE_PER_SOURCE — the exact case the reviewer reproduced.
+    profile.ip_sweep_threshold = 3000;
+    let mut state = make_state("trust", profile);
+    let cap = super::scan::max_unique_per_source_for_test();
+    assert!(
+        3000 > cap,
+        "test premise: configured threshold (3000) must exceed the cap ({cap})"
+    );
+
+    let src = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1));
+    let mut fired = false;
+    // Sweep more distinct destinations than the cap from the same source.
+    for i in 0..(cap + 50) {
+        let dst = IpAddr::V4(Ipv4Addr::from(0xac10_0000u32 + i as u32)); // 172.16.x.x
+        let pkt = tcp_pkt(src, dst, 1234, 80, TCP_SYN);
+        if state.scan_sweep_drop_on_new_flow("trust", ZID, &pkt, 100) == Some("ip-sweep") {
+            fired = true;
+            break;
+        }
+    }
+    assert!(
+        fired,
+        "ip-sweep threshold 3000 (> cap {cap}) must fire — pre-fix it NEVER fired (fail-open)"
+    );
+    assert!(
+        state.scan_sweep_threshold_clamped() >= 1,
+        "an over-cap threshold must be recorded as clamped, got {}",
+        state.scan_sweep_threshold_clamped()
     );
 }
