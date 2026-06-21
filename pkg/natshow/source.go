@@ -99,7 +99,7 @@ func RenderSourceRuleDetail(w io.Writer, cfg *config.Config, dp Reader, crFn fun
 			}
 
 			if dp != nil && cr != nil {
-				ruleKey := rs.Name + "/" + rule.Name
+				ruleKey := dataplane.NATCounterKey(dataplane.NATCounterTypeSource, rs.Name, rule.Name)
 				if cid, ok := cr.NATCounterIDs[ruleKey]; ok {
 					cnt, err := dp.ReadNATRuleCounter(uint32(cid))
 					if err == nil {

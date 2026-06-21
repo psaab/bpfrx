@@ -350,11 +350,20 @@ func (m *Manager) SetNPTv6Rule(key NPTv6Key, val NPTv6Value) error {
 }
 
 // ReadNATRuleCounter reads the per-CPU NAT rule hit counter and returns
-// the summed packets and bytes across all CPUs.
+// the summed packets and bytes across all CPUs, plus any userspace-reported
+// offset for this counter ID (#2218). The Rust userspace dataplane does not
+// write the nat_rule_counters BPF map; it reports per-rule translation hits
+// over the status channel, which the userspace Manager mirrors here via
+// SetNATRuleCounterOffset so this read path returns the live total.
 func (m *Manager) ReadNATRuleCounter(counterID uint32) (CounterValue, error) {
 	zm, ok := m.maps["nat_rule_counters"]
 	if !ok {
-		return CounterValue{}, fmt.Errorf("nat_rule_counters map not found")
+		// No BPF map (userspace-only runtime): fall back to the userspace
+		// offset so `show security nat ... rule` still reports live hits.
+		m.mu.Lock()
+		offset := m.natRuleCounterOffsets[counterID]
+		m.mu.Unlock()
+		return offset, nil
 	}
 	var perCPU []CounterValue
 	if err := zm.Lookup(counterID, &perCPU); err != nil {
@@ -365,14 +374,47 @@ func (m *Manager) ReadNATRuleCounter(counterID uint32) (CounterValue, error) {
 		total.Packets += v.Packets
 		total.Bytes += v.Bytes
 	}
+	// Merge userspace-reported offsets (stored separately to avoid per-CPU
+	// race with the legacy BPF path, mirroring ReadGlobalCounter).
+	m.mu.Lock()
+	offset := m.natRuleCounterOffsets[counterID]
+	m.mu.Unlock()
+	total.Packets += offset.Packets
+	total.Bytes += offset.Bytes
 	return total, nil
+}
+
+// SetNATRuleCounterOffset records the absolute cumulative per-rule NAT
+// translation hit total reported by the Rust userspace dataplane for the
+// given counter ID (#2218). ReadNATRuleCounter merges this offset on top of
+// the BPF map value. The total is absolute (overwrites), since the helper
+// reports cumulative-since-start totals on every status poll.
+func (m *Manager) SetNATRuleCounterOffset(counterID uint32, val CounterValue) {
+	m.mu.Lock()
+	if m.natRuleCounterOffsets == nil {
+		m.natRuleCounterOffsets = make(map[uint32]CounterValue)
+	}
+	m.natRuleCounterOffsets[counterID] = val
+	m.mu.Unlock()
+}
+
+// ClearNATRuleCounterOffsets zeroes all userspace-reported NAT rule counter
+// offsets (#2218). Called by ClearNATRuleCounters so an operator clear also
+// drops the mirrored helper totals.
+func (m *Manager) ClearNATRuleCounterOffsets() {
+	m.mu.Lock()
+	m.natRuleCounterOffsets = nil
+	m.mu.Unlock()
 }
 
 // ClearNATRuleCounters zeroes all NAT rule counter entries.
 func (m *Manager) ClearNATRuleCounters() error {
+	// Drop userspace-reported offsets first so a clear takes effect even
+	// without a BPF map (userspace-only runtime) (#2218).
+	m.ClearNATRuleCounterOffsets()
 	zm, ok := m.maps["nat_rule_counters"]
 	if !ok {
-		return fmt.Errorf("nat_rule_counters map not found")
+		return nil
 	}
 	numCPUs := ebpf.MustPossibleCPU()
 	zero := make([]CounterValue, numCPUs)

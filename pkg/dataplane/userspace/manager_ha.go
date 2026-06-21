@@ -636,6 +636,22 @@ func (m *Manager) syncBPFCountersLocked(status *ProcessStatus) {
 				"index", d.index, "delta", d.delta, "err", err)
 		}
 	}
+
+	// #2218: mirror the helper's per-rule SNAT/DNAT/static-NAT translation hit
+	// counters into the bpfShim offset map so Manager.ReadNATRuleCounter (and
+	// `show security nat source/destination/static rule`) reports live hits.
+	// The helper reports cumulative totals keyed by the compiler-assigned
+	// counter ID; SetNATRuleCounterOffset stores them absolutely.
+	for i := range status.NATRuleCounters {
+		c := &status.NATRuleCounters[i]
+		if c.CounterID == 0 {
+			continue
+		}
+		m.bpfShim.SetNATRuleCounterOffset(uint32(c.CounterID), dataplane.CounterValue{
+			Packets: c.Packets,
+			Bytes:   c.Bytes,
+		})
+	}
 }
 
 // safeDelta returns cur - prev. On counter reset (prev > cur), returns cur

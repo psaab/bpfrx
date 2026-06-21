@@ -29,8 +29,17 @@ pub(super) fn source_nat_decision_for_flow(
     // static-NAT (address-only) match below is NOT gated — it rewrites
     // the IP on every fragment, which is correct.
     non_first_fragment: bool,
+    // #2218: out-param — the matched SNAT/static-SNAT rule's per-rule hit
+    // counter (None when no rule matched or the rule has no counter). The
+    // caller increments it once per committed translated forward flow.
+    matched_counter: &mut Option<std::sync::Arc<crate::nat::NatRuleCounter>>,
 ) -> Result<NatDecision, SourceNatFailure> {
-    if let Some(decision) = forwarding.static_nat.match_snat(flow.src_ip, from_zone) {
+    *matched_counter = None;
+    if let Some((decision, counter)) = forwarding
+        .static_nat
+        .match_snat_with_counter(flow.src_ip, from_zone)
+    {
+        *matched_counter = counter;
         return Ok(decision);
     }
     match match_source_nat_for_flow_result_at(
@@ -41,10 +50,17 @@ pub(super) fn source_nat_decision_for_flow(
         flow,
         now_ns,
         non_first_fragment,
+        matched_counter,
     ) {
         SourceNatLookup::Matched(decision) => Ok(decision),
-        SourceNatLookup::NoMatch => Ok(NatDecision::default()),
-        SourceNatLookup::Unavailable(failure) => Err(failure),
+        SourceNatLookup::NoMatch => {
+            *matched_counter = None;
+            Ok(NatDecision::default())
+        }
+        SourceNatLookup::Unavailable(failure) => {
+            *matched_counter = None;
+            Err(failure)
+        }
     }
 }
 

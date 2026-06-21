@@ -268,6 +268,8 @@ surfaces move to domain interfaces such as `RuntimeDataPlane`, `SessionStore`,
 | `pkg/cli/cli_show_nat.go` | NAT display still uses legacy NAT/session metadata. |
 | `pkg/cli/cli_show_security.go` | Security display still uses legacy counters and filter types. |
 | `pkg/cli/cli_show_security_dispatch.go` | #1444 — `handleShowSecurity` dispatcher and security helpers relocated from `cli.go`; still uses legacy `MaxRulesPerPolicy` and policy-counter accessors. |
+| `pkg/cli/cli_show_security_log.go` | #2158 — split from `cli_show_security.go`; still reads legacy screen `GlobalCtr*` counter constants. |
+| `pkg/cli/cli_show_security_screen.go` | #2158 — split from `cli_show_security.go`; still reads legacy screen `GlobalCtr*` counter constants. |
 | `pkg/cli/proto.go` | #1444 — shared session/proto helpers (`sessionStateName`, `ntohs`, `protoNameFromNum`, etc.) relocated from `cli.go`; still names `dataplane.SessState*` enum and `ProtoICMPv6` sentinel. |
 | `pkg/cli/session_filter.go` | #1444 — `sessionFilter` type, matcher methods, and peer-RPC fetchers relocated from `cli.go`; still uses legacy session key/value types and `SessFlag*`. |
 | `pkg/cli/runtime.go` | #1517 — `cliRuntime` interface declares the narrow CLI dataplane surface; still depends on root `pkg/dataplane` type names (`SessionKey`, `CounterValue`, etc.) until those types move to a domain package. |
@@ -287,6 +289,7 @@ surfaces move to domain interfaces such as `RuntimeDataPlane`, `SessionStore`,
 | `pkg/daemon/daemon_run.go` | Runtime wiring still uses the legacy `dataplane.ErrDPDKBackendRetired` sentinel and constructs `api`/`grpcapi`/`cli` configs against the daemon-local probes in `runtime_probes.go` (#1519 capstone). |
 | `pkg/daemon/runtime_probes.go` | #1519 daemon-local typed probes (`apiDataPlane`/`grpcDataPlane`/`cliDataPlane`/`dataplaneReadyProbe`/`natSeeder`/`fibSyncStarter`) mirror downstream package-private interfaces; still name root `pkg/dataplane` types (`SessionKey`, `CounterValue`, etc.) until those move to a domain package. |
 | `pkg/grpcapi/apply_result.go` | gRPC apply metadata still adapts legacy apply results. |
+| `pkg/grpcapi/server_nat.go` | #2218 — `GetNATRuleStats` keys NAT translation-hit counters with `dataplane.NATCounterKey` (type-namespaced `ruleset/rule`) so same-named SNAT/DNAT/static rules do not collide; shares the compiler's single key formatter. |
 | `pkg/grpcapi/runtime.go` | #1516 — `grpcRuntime` interface declares the narrow gRPC dataplane surface; still depends on root `pkg/dataplane` type names (`SessionKey`, `CounterValue`, etc.) until those types move to a domain package. |
 | `pkg/grpcapi/server_helpers.go` | gRPC helpers still format legacy dataplane types and bridge runtime accessors. |
 | `pkg/grpcapi/server_sessions.go` | gRPC session RPCs still use legacy session types. |

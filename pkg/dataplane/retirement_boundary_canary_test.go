@@ -48,6 +48,8 @@ var legacyDataplaneImportAllowlist = map[string]string{
 	"pkg/cli/cli_show_nat.go":                  "NAT display still uses legacy NAT/session metadata",
 	"pkg/cli/cli_show_security.go":             "security display still uses legacy counters and filter types",
 	"pkg/cli/cli_show_security_dispatch.go":   "#1444: handleShowSecurity dispatcher relocated from cli.go; still uses legacy MaxRulesPerPolicy + counter accessors",
+	"pkg/cli/cli_show_security_log.go":        "#2158: split from cli_show_security.go; still reads legacy screen GlobalCtr* counter constants",
+	"pkg/cli/cli_show_security_screen.go":     "#2158: split from cli_show_security.go; still reads legacy screen GlobalCtr* counter constants",
 	"pkg/cli/proto.go":                         "#1444: shared session/proto helpers relocated from cli.go; still names dataplane.SessState* enum and ProtoICMPv6 sentinel",
 	"pkg/cli/session_filter.go":                "#1444: session filter type + RPC fetchers relocated from cli.go; still uses legacy session key/value types and SessFlag*",
 	"pkg/cluster/runtime.go":                   "clusterRuntime interface still names dataplane.SessionStore/Telemetry domain types from pkg/dataplane (#1518)",
@@ -66,6 +68,7 @@ var legacyDataplaneImportAllowlist = map[string]string{
 	"pkg/daemon/daemon_run.go":                 "runtime wiring still uses legacy dataplane.ErrDPDKBackendRetired sentinel handling and constructs api/grpcapi/cli configs against the daemon-local probes in runtime_probes.go (#1519 capstone)",
 	"pkg/daemon/runtime_probes.go":             "#1519 daemon-local typed probes (apiDataPlane/grpcDataPlane/cliDataPlane/...) mirror downstream package-private interfaces; still name root dataplane types (SessionKey, CounterValue, etc.) until those move to a domain package",
 	"pkg/grpcapi/apply_result.go":              "gRPC apply metadata still adapts legacy apply results",
+	"pkg/grpcapi/server_nat.go":                "#2218 GetNATRuleStats keys NAT translation-hit counters with dataplane.NATCounterKey (type-namespaced ruleset/rule) so same-named SNAT/DNAT/static rules do not collide; shares the compiler's single key formatter",
 	"pkg/grpcapi/runtime.go":                   "#1516 grpcRuntime interface declares the narrow gRPC dataplane surface; still depends on root pkg/dataplane type names (SessionKey, CounterValue, etc.) until those types move to a domain package",
 	"pkg/grpcapi/server_helpers.go":            "gRPC helpers still format legacy dataplane types and bridge runtime accessors",
 	"pkg/grpcapi/server_sessions.go":           "gRPC session RPCs still use legacy session types",
@@ -505,7 +508,9 @@ func productionLinkCycleLegacyLoaderTargets() []linkCycleLegacyLoaderTarget {
 			},
 		},
 		{
-			path:     filepath.Join(repoRootForBoundaryCanary, "pkg", "dataplane", "userspace", "manager.go"),
+			// #2158 split moved the userspaceLinkController link-cycle methods
+			// from manager.go into controllers.go.
+			path:     filepath.Join(repoRootForBoundaryCanary, "pkg", "dataplane", "userspace", "controllers.go"),
 			receiver: "userspaceLinkController",
 			methods: map[string]bool{
 				"PrepareLinkCycle": false,

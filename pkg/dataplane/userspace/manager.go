@@ -501,7 +501,7 @@ func (m *Manager) Compile(cfg *config.Config) (*dataplane.CompileResult, error) 
 	// #1827: include the cached ip-monitoring route overlay so a full
 	// apply (operator commit) while a policy is FAILED preserves the
 	// injected route instead of reverting traffic to the dead uplink.
-	snap := buildSnapshotWithSchedulerState(cfg, ucfg, m.bumpGeneration(), m.readFIBGeneration(), activeState, m.routeOverlaySnapshot(), m.feedSnapshotOverlay())
+	snap := buildSnapshotWithSchedulerStateAndNATCounters(cfg, ucfg, m.bumpGeneration(), m.readFIBGeneration(), activeState, m.routeOverlaySnapshot(), m.feedSnapshotOverlay(), result.NATCounterIDs)
 	// #1620: stamp the cold-path sample mask onto the snapshot. The
 	// daemon called SetColdPathSampleMask once at startup with the
 	// validated CLI flag value (or nil for "use default"). A nil

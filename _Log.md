@@ -1,5 +1,104 @@
 # Action Log
 
+## 2026-06-21 — #2218: per-rule SNAT/DNAT/static-NAT translation hit counters (Rust dataplane)
+
+- **Timestamp**: 2026-06-21
+- **Action**: Rust userspace-dp side of #2218. Mirrored the policy
+  per-rule hit-counter design for NAT. Added `NatRuleCounter`
+  (`Arc<AtomicU64>` packets+bytes, lock-free `add(len)`) and
+  `NatCounterStore` (`Arc<Mutex<FxHashMap<u16, Arc<NatRuleCounter>>>>`,
+  `rule_counter`/`reconcile_ids`/`clear`/`snapshots`; `counter_id==0`
+  returns None — never allocated) in `nat/mod.rs`. Wire DTOs:
+  `counter_id: u16` (serde `counter_id`, default) on Source/Destination/
+  Static NAT rule snapshots; new `NatRuleCounterStatus` (serde
+  `counter_id`/`packets`/`bytes`) + `ProcessStatus.nat_rule_counters`
+  (serde `nat_rule_counters`, default) mirroring `policy_rule_counters`.
+  Carried `hit_counter: Option<Arc<NatRuleCounter>>` onto `SourceNatRule`,
+  `DnatEntry`, `StaticNatEntry`, resolved from the store at rule-build
+  time. Threaded `&NatCounterStore` through
+  `parse_source_nat_rules_with_previous`, `DnatTable::from_snapshots`,
+  `StaticNatTable::from_snapshots`, and the
+  `build_forwarding_state_with_policy_counters_and_previous` chain.
+  Kept `NatDecision` wire-frozen — DNAT/static `lookup`/`match_dnat`/
+  `match_snat` keep `Option<NatDecision>`; added additive
+  `lookup_with_counter`/`match_{dnat,snat}_with_counter` for the cold
+  path, and an out-param on `match_source_nat_result_for_tuple` /
+  `source_nat_decision_for_flow` so the matched SNAT rule's counter rides
+  out without touching the `SourceNatLookup` enum/derives. Increment is
+  cold-path only (session-miss commit): once per committed translated
+  forward flow at the ForwardCandidate, LocalMiss (DNAT-only), and
+  MissingNeighbor-seed install success points — past every SNAT-rollback
+  door (ICMP-TE bounce, max_sessions refusal, install-partial). The
+  established-flow fast path gains no new work. Coordinator owns
+  `nat_counters`, exposes `nat_rule_counters()`/`clear_nat_counters()`,
+  reconciles active ids on each apply, and `server/helpers.rs` reports
+  them in status; added a `clear_nat_counters` control handler.
+  Tests (fail-on-revert): `nat_counter_store_counts_and_skips_id_zero`
+  and `parsed_nat_rules_share_store_counters` (nat/tests.rs);
+  `txn_source_nat_translation_bumps_rule_counter_once` (afxdp/tests.rs)
+  drives a translated flow through the worker poll path and asserts the
+  coordinator counter advances once (and stays 0 for a refused / an
+  uncounted flow). Proved fail-on-revert: commenting the increment line
+  makes the integration test fail (0 != 1). Release build green; full
+  `cargo test nat` green (330 in-bin, 0 failed). NatDecision derives and
+  HA wire shape unchanged. NOTE: the global `cargo fmt` run reformatted
+  ~168 unrelated files; those were restored to HEAD via `git show`, so
+  the diff is scoped to the 22 #2218 Rust files (all rustfmt-clean) plus
+  the parent's Go files.
+- **File(s)**: userspace-dp/src/nat/mod.rs,
+  userspace-dp/src/nat/source.rs, userspace-dp/src/nat/destination.rs,
+  userspace-dp/src/nat/static_nat.rs, userspace-dp/src/nat/tests.rs,
+  userspace-dp/src/protocol/nat.rs, userspace-dp/src/protocol/control.rs,
+  userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/poll_descriptor/nat_exception.rs,
+  userspace-dp/src/afxdp/forwarding/mod.rs,
+  userspace-dp/src/afxdp/forwarding_build/mod.rs,
+  userspace-dp/src/afxdp/forwarding_build/tests.rs,
+  userspace-dp/src/afxdp/coordinator/mod.rs,
+  userspace-dp/src/afxdp/coordinator/reconcile/mod.rs,
+  userspace-dp/src/afxdp/coordinator/reconcile/snapshot.rs,
+  userspace-dp/src/afxdp/coordinator/snapshot_refresh.rs,
+  userspace-dp/src/afxdp/coordinator/status.rs,
+  userspace-dp/src/afxdp/tests.rs,
+  userspace-dp/src/afxdp/test_fixtures.rs,
+  userspace-dp/src/server/helpers.rs,
+  userspace-dp/src/server/lifecycle.rs,
+  userspace-dp/src/server/handlers/mod.rs
+
+## 2026-06-21 — #2218: per-rule NAT translation hit counters (Go control plane + wire + docs)
+
+- **Timestamp**: 2026-06-21
+- **Action**: Go half of #2218. Compiler: `assignNATCounterID` helper is
+  now the single SSOT for SNAT/DNAT/static NAT rule counter IDs in
+  `compiler_nat.go` (refactored the two inline SNAT sites onto it, ADDED
+  DNAT + static assignment — DNAT/static had no counter ID before, so DNAT
+  "Translation hits" never displayed). Snapshot: added `CounterID uint16`
+  to `SourceNATRuleSnapshot`/`DestinationNATRuleSnapshot`/
+  `StaticNATRuleSnapshot`; `buildSourceNATSnapshots`/`...Destination...`/
+  `...Static...` now take the `NATCounterIDs` map and stamp it;
+  `buildSnapshotWithSchedulerStateAndNATCounters` threads
+  `result.NATCounterIDs` from `ApplyConfig`. Status: added
+  `NATRuleCounterStatus{counter_id,packets,bytes}` and
+  `ProcessStatus.NATRuleCounters`. Read path: `Manager.ReadNATRuleCounter`
+  now merges a Go-side `natRuleCounterOffsets` map (absolute totals,
+  mirroring `userspaceCounterOffsets`/`ReadGlobalCounter`) so the
+  adapter→bpfShim read returns the live helper total even with no BPF map;
+  `SetNATRuleCounterOffset`/`ClearNATRuleCounterOffsets` added,
+  `ClearNATRuleCounters` clears offsets too. Sync: `syncBPFCountersLocked`
+  mirrors `status.NATRuleCounters` into the offset map (skips counter_id 0).
+  Regenerated `protocol_wire_v1.json` (wire_invariant green). Tests
+  (fail-on-revert): `TestSyncBPFCountersMirrorsNATRuleCounters` (counter 0
+  → 7 with mirror, stays 0 without — proven), `TestBuildNATSnapshotsStampCounterID`.
+  Docs: feature-gaps.md counter-flow note + userspace-dataplane-gaps.md NAT
+  rows (per-flow semantic flagged). Rust half done by subagent (entry above).
+- **File(s)**: pkg/dataplane/compiler_nat.go, pkg/dataplane/loader.go,
+  pkg/dataplane/maps_nat.go, pkg/dataplane/userspace/protocol.go,
+  pkg/dataplane/userspace/nat.go, pkg/dataplane/userspace/builder.go,
+  pkg/dataplane/userspace/manager.go, pkg/dataplane/userspace/manager_ha.go,
+  pkg/dataplane/userspace/manager_test.go,
+  pkg/dataplane/userspace/nat_per_uplink_test.go,
+  userspace-dp/tests/fixtures/protocol_wire_v1.json,
+  docs/feature-gaps.md, docs/userspace-dataplane-gaps.md
 ## 2026-06-21 — #2226: rib-group import-rib undefined-reference validation
 
 - **Timestamp**: 2026-06-21
@@ -9046,3 +9145,38 @@ top.
   pkg/config/compiler_undefined_ref_2217_test.go (new),
   pkg/config/parser_security_test.go, pkg/config/application_set_nested_test.go,
   docs/config-schema.md
+
+- **Timestamp**: 2026-06-21
+- **Action**: #2218 PR #2249 review fixes — NAT translation-hit counter
+  durability + counter-ID collision. (MAJOR) operator clear was not durable:
+  the helper-side `clear_nat_counters` IPC was never SENT by Go, so the next
+  1/s `syncBPFCountersLocked` re-mirrored the helper's cumulative total over
+  the cleared offset (`SetNATRuleCounterOffset` overwrites absolutely) and the
+  value snapped back within <=1s. Fix mirrors the policy-counter pattern:
+  added `userspace.Manager.ClearNATRuleCounters` (zeroes the bpfShim offset map
+  AND sends `clear_nat_counters` via `clearHelperNATCountersLocked`), routed
+  the operator clear path through an explicit `LegacyDataPlaneAdapter`
+  delegation (the adapter promotes the bpfShim method by default, bypassing the
+  override), and extended `Manager.ClearAllCounters` to reset the NAT helper
+  store too. (MINOR) counter-ID collision: `assignNATCounterID` keyed by
+  `ruleset/rule` only, so same-named SNAT/DNAT/static rules merged hit counts;
+  added `dataplane.NATCounterKey(natType, ruleset, rule)` (snat/dnat/static
+  prefix) as the single key formatter, threaded through the write site and all
+  read sites (snapshot builder + CLI/gRPC/REST/natshow). (MINOR doc)
+  nat/mod.rs snapshots() doc + userspace-dataplane-gaps.md clear claim + the
+  Rust IPC handler comment corrected. Tests: fail-on-revert clear-durability
+  (helper reports cumulative until it sees the IPC; verified RED on revert) +
+  collision distinct-IDs (verified RED on revert). Also folded pre-existing
+  #2158-bookkeeping master canary drift (cli_show_security_log/screen
+  allowlist+docs; userspaceLinkController link-cycle canary target moved to
+  controllers.go) so the suite is green.
+- **File(s)**: pkg/dataplane/userspace/natcounters.go (new),
+  pkg/dataplane/userspace/legacy_dataplane.go,
+  pkg/dataplane/userspace/policycounters.go, pkg/dataplane/userspace/nat.go,
+  pkg/dataplane/compiler_nat.go, pkg/dataplane/userspace/manager_test.go,
+  pkg/dataplane/compiler_nat_counter_collision_test.go (new),
+  pkg/{api/nat.go,grpcapi/server_nat.go,cli/cli_show_nat.go},
+  pkg/natshow/{source.go,dest.go}, userspace-dp/src/nat/mod.rs,
+  userspace-dp/src/server/handlers/mod.rs,
+  pkg/dataplane/retirement_boundary_canary_test.go,
+  docs/userspace-dataplane-gaps.md, docs/pr/1373-retire-ebpf-dataplane/README.md

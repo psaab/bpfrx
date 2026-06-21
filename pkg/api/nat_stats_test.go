@@ -55,8 +55,8 @@ func TestNATRuleStatsHandlerReadsApplyResultOnce(t *testing.T) {
 		Manager: dataplane.New(),
 		result: &dataplane.ApplyResult{
 			NATCounterIDs: map[string]uint32{
-				"trust-to-untrust/r1": 31,
-				"trust-to-untrust/r2": 32,
+				dataplane.NATCounterKey(dataplane.NATCounterTypeSource, "trust-to-untrust", "r1"): 31,
+				dataplane.NATCounterKey(dataplane.NATCounterTypeSource, "trust-to-untrust", "r2"): 32,
 			},
 		},
 	}

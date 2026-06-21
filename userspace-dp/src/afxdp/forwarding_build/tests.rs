@@ -76,6 +76,7 @@ fn forwarding_state_refresh_preserves_three_color_runtime_state() {
     let refreshed = build_forwarding_state_with_policy_counters_and_previous(
         &snapshot,
         &policy_counters,
+        &crate::nat::NatCounterStore::default(),
         Some(&state),
     )
     .expect("test snapshot must not produce integrity error");
@@ -153,7 +154,7 @@ fn build_cos_state_translates_scheduler_map_entries() {
                     surplus_sharing: false,
                     equal_flow_enforcement: false,
                     equal_flow_target_policy: String::new(),
-                codel_target_ns: 0,
+                    codel_target_ns: 0,
                 },
                 CoSSchedulerSnapshot {
                     name: "ef-sched".into(),
@@ -165,7 +166,7 @@ fn build_cos_state_translates_scheduler_map_entries() {
                     surplus_sharing: false,
                     equal_flow_enforcement: false,
                     equal_flow_target_policy: String::new(),
-                codel_target_ns: 0,
+                    codel_target_ns: 0,
                 },
             ],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {
@@ -237,7 +238,7 @@ fn build_cos_state_resolves_percent_buffer_size_from_interface_burst_pool() {
                 surplus_sharing: false,
                 equal_flow_enforcement: false,
                 equal_flow_target_policy: String::new(),
-            codel_target_ns: 0,
+                codel_target_ns: 0,
             }],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {
                 name: "wan-map".into(),
@@ -293,7 +294,7 @@ fn build_cos_state_prefers_legacy_byte_buffer_when_both_fields_present() {
                 surplus_sharing: false,
                 equal_flow_enforcement: false,
                 equal_flow_target_policy: String::new(),
-            codel_target_ns: 0,
+                codel_target_ns: 0,
             }],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {
                 name: "wan-map".into(),
@@ -358,7 +359,7 @@ fn build_cos_state_propagates_surplus_sharing_from_snapshot() {
                     surplus_sharing: true, // opt-in
                     equal_flow_enforcement: false,
                     equal_flow_target_policy: String::new(),
-                codel_target_ns: 0,
+                    codel_target_ns: 0,
                 },
                 CoSSchedulerSnapshot {
                     name: "iperf-b".into(),
@@ -370,7 +371,7 @@ fn build_cos_state_propagates_surplus_sharing_from_snapshot() {
                     surplus_sharing: false, // explicit hard-cap
                     equal_flow_enforcement: false,
                     equal_flow_target_policy: String::new(),
-                codel_target_ns: 0,
+                    codel_target_ns: 0,
                 },
             ],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {
@@ -576,7 +577,7 @@ fn build_cos_state_derives_exact_queue_default_burst_from_queue_rate() {
                 surplus_sharing: false,
                 equal_flow_enforcement: false,
                 equal_flow_target_policy: String::new(),
-            codel_target_ns: 0,
+                codel_target_ns: 0,
             }],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {
                 name: "wan-map".into(),
@@ -638,7 +639,7 @@ fn build_cos_state_uses_effective_transmit_rate_for_surplus_weight() {
                 surplus_sharing: false,
                 equal_flow_enforcement: false,
                 equal_flow_target_policy: String::new(),
-            codel_target_ns: 0,
+                codel_target_ns: 0,
             }],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {
                 name: "test-map".into(),
@@ -689,7 +690,7 @@ fn build_cos_state_marks_no_rate_scheduler_map_queue_residual_only() {
                 surplus_sharing: false,
                 equal_flow_enforcement: false,
                 equal_flow_target_policy: String::new(),
-            codel_target_ns: 0,
+                codel_target_ns: 0,
             }],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {
                 name: "test-map".into(),
@@ -778,7 +779,7 @@ fn build_cos_state_binds_dscp_classifier_to_usable_interface_queue_ids() {
                     surplus_sharing: false,
                     equal_flow_enforcement: false,
                     equal_flow_target_policy: String::new(),
-                codel_target_ns: 0,
+                    codel_target_ns: 0,
                 },
                 CoSSchedulerSnapshot {
                     name: "voice".into(),
@@ -790,7 +791,7 @@ fn build_cos_state_binds_dscp_classifier_to_usable_interface_queue_ids() {
                     surplus_sharing: false,
                     equal_flow_enforcement: false,
                     equal_flow_target_policy: String::new(),
-                codel_target_ns: 0,
+                    codel_target_ns: 0,
                 },
             ],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {
@@ -1184,7 +1185,7 @@ fn build_cos_state_zero_shaping_rate_queue_inherits_transparent() {
                 surplus_sharing: false,
                 equal_flow_enforcement: false,
                 equal_flow_target_policy: String::new(),
-            codel_target_ns: 0,
+                codel_target_ns: 0,
             }],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {
                 name: "wan-map".into(),
@@ -1243,7 +1244,7 @@ fn build_cos_state_no_rate_exact_surplus_equal_flow_is_residual_only() {
                 surplus_sharing: true,
                 equal_flow_enforcement: true,
                 equal_flow_target_policy: String::new(),
-            codel_target_ns: 0,
+                codel_target_ns: 0,
             }],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {
                 name: "wan-map".into(),
@@ -1949,16 +1950,20 @@ fn pending_neigh_timeout_fast_when_all_retrans_le_250() {
 #[test]
 fn pending_neigh_timeout_fallback_when_iface_retrans_too_high() {
     // Default is 250 (fast) but the v4 per-iface table is 1000ms.
-    let reader = FakeSysctl::all(250)
-        .set("/proc/sys/net/ipv4/neigh/ge-0-0-2/retrans_time_ms", Some(1000));
+    let reader = FakeSysctl::all(250).set(
+        "/proc/sys/net/ipv4/neigh/ge-0-0-2/retrans_time_ms",
+        Some(1000),
+    );
     let got = compute_pending_neigh_timeout_ns(&one_iface_map(), &reader);
     assert_eq!(got, super::super::PENDING_NEIGH_TIMEOUT_NS);
 }
 
 #[test]
 fn pending_neigh_timeout_fallback_when_v6_too_high() {
-    let reader = FakeSysctl::all(250)
-        .set("/proc/sys/net/ipv6/neigh/ge-0-0-2/retrans_time_ms", Some(900));
+    let reader = FakeSysctl::all(250).set(
+        "/proc/sys/net/ipv6/neigh/ge-0-0-2/retrans_time_ms",
+        Some(900),
+    );
     let got = compute_pending_neigh_timeout_ns(&one_iface_map(), &reader);
     assert_eq!(got, super::super::PENDING_NEIGH_TIMEOUT_NS);
 }
@@ -1967,8 +1972,10 @@ fn pending_neigh_timeout_fallback_when_v6_too_high() {
 fn pending_neigh_timeout_fallback_when_default_template_too_high() {
     // Per-iface tables fast, but the `default` template is still 1000ms
     // (an interface created after the snapshot would inherit it).
-    let reader = FakeSysctl::all(250)
-        .set("/proc/sys/net/ipv4/neigh/default/retrans_time_ms", Some(1000));
+    let reader = FakeSysctl::all(250).set(
+        "/proc/sys/net/ipv4/neigh/default/retrans_time_ms",
+        Some(1000),
+    );
     let got = compute_pending_neigh_timeout_ns(&one_iface_map(), &reader);
     assert_eq!(got, super::super::PENDING_NEIGH_TIMEOUT_NS);
 }
@@ -1977,8 +1984,8 @@ fn pending_neigh_timeout_fallback_when_default_template_too_high() {
 fn pending_neigh_timeout_fails_closed_on_read_error() {
     // A read failure (None) on any checked path must fail closed to the
     // 2000ms default rather than optimistically assuming fast.
-    let reader = FakeSysctl::all(250)
-        .set("/proc/sys/net/ipv4/neigh/ge-0-0-2/retrans_time_ms", None);
+    let reader =
+        FakeSysctl::all(250).set("/proc/sys/net/ipv4/neigh/ge-0-0-2/retrans_time_ms", None);
     let got = compute_pending_neigh_timeout_ns(&one_iface_map(), &reader);
     assert_eq!(got, super::super::PENDING_NEIGH_TIMEOUT_NS);
 }
@@ -2039,10 +2046,7 @@ fn wg_endpoint_hydrates_runtime_tunnel_endpoint() {
     assert_eq!(ep.mode, "wireguard");
     assert_eq!(ep.wg_listen_port, 51820);
     assert_eq!(ep.wg_allowed_ips.len(), 1);
-    assert_eq!(
-        ep.wg_endpoint,
-        Some("203.0.113.1:51820".parse().unwrap())
-    );
+    assert_eq!(ep.wg_endpoint, Some("203.0.113.1:51820".parse().unwrap()));
     // Engine instantiated and keyed by endpoint id.
     assert!(state.wg_engines.contains_key(&7), "engine instantiated");
     assert_eq!(state.wg_engines.get(&7).unwrap().listen_port(), 51820);
@@ -2069,6 +2073,7 @@ fn wg_reload_reuses_engine_when_identity_unchanged() {
     let next = build_forwarding_state_with_policy_counters_and_previous(
         &snap,
         &PolicyCounterStore::default(),
+        &crate::nat::NatCounterStore::default(),
         Some(&prev),
     )
     .unwrap();
@@ -2095,6 +2100,7 @@ fn wg_reload_seeds_high_water_on_identity_change() {
     let next = build_forwarding_state_with_policy_counters_and_previous(
         &snap2,
         &PolicyCounterStore::default(),
+        &crate::nat::NatCounterStore::default(),
         Some(&prev),
     )
     .unwrap();
@@ -2183,6 +2189,7 @@ fn wg_engine_survives_unrelated_tunnel_removal() {
     let next = build_forwarding_state_with_policy_counters_and_previous(
         &snap2,
         &PolicyCounterStore::default(),
+        &crate::nat::NatCounterStore::default(),
         Some(&prev),
     )
     .unwrap();
@@ -2240,10 +2247,14 @@ fn reowned_tunnel_id_installs_immediately_with_engine_reuse() {
     let next = build_forwarding_state_with_policy_counters_and_previous(
         &snap_reused,
         &PolicyCounterStore::default(),
+        &crate::nat::NatCounterStore::default(),
         Some(&prev),
     )
     .unwrap();
-    let ep = next.tunnel_endpoints.get(&824).expect("new owner installed");
+    let ep = next
+        .tunnel_endpoints
+        .get(&824)
+        .expect("new owner installed");
     assert_eq!(ep.interface, "gr-9/9/9.0");
     // The unrelated WG endpoint keeps its engine Arc across the apply.
     assert!(next.tunnel_endpoints.contains_key(&7));
@@ -2280,8 +2291,8 @@ fn newly_appearing_tunnel_id_is_purged_after_first_apply() {
 /// rotation, or which forwarding state the worker held at create.
 #[test]
 fn stale_session_never_adopts_reowned_tunnel_id() {
-    use crate::afxdp::session_glue::lookup_forwarding_resolution_for_session;
     use crate::afxdp::ShardedNeighborMap;
+    use crate::afxdp::session_glue::lookup_forwarding_resolution_for_session;
 
     let state = build_forwarding_state(&two_tunnel_snapshot());
     let row_ifindex = state
@@ -2416,7 +2427,10 @@ fn tunnel_remap_purge_ids_from_owners_semantics() {
     );
 
     // Owner change at a surviving id.
-    let owners = vec![(824u16, "gr-old/0/0.0".to_string()), (7u16, "wg0".to_string())];
+    let owners = vec![
+        (824u16, "gr-old/0/0.0".to_string()),
+        (7u16, "wg0".to_string()),
+    ];
     assert_eq!(
         tunnel_remap_purge_ids_from_owners(&owners, &next, true),
         vec![824]

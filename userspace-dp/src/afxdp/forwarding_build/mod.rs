@@ -130,12 +130,39 @@ pub(super) fn try_build_forwarding_state_with_policy_counters(
     snapshot: &ConfigSnapshot,
     policy_counters: &PolicyCounterStore,
 ) -> Result<ForwardingState, crate::policy::SnapshotIntegrityError> {
-    build_forwarding_state_with_policy_counters_and_previous(snapshot, policy_counters, None)
+    // #2218: the policy-only wrappers default the NAT counter store; the
+    // resulting `Arc`s are throwaway (a fresh default store per call), used
+    // by tests and any caller that does not yet own a `NatCounterStore`.
+    build_forwarding_state_with_policy_counters_and_previous(
+        snapshot,
+        policy_counters,
+        &crate::nat::NatCounterStore::default(),
+        None,
+    )
+}
+
+/// #2218: test/build entry point that threads BOTH counter stores so a
+/// test can hold the `NatCounterStore` and read back hit counts after a
+/// flow. Mirrors `build_forwarding_state` (infallible).
+#[cfg(test)]
+pub(super) fn build_forwarding_state_with_counters(
+    snapshot: &ConfigSnapshot,
+    policy_counters: &PolicyCounterStore,
+    nat_counters: &crate::nat::NatCounterStore,
+) -> ForwardingState {
+    build_forwarding_state_with_policy_counters_and_previous(
+        snapshot,
+        policy_counters,
+        nat_counters,
+        None,
+    )
+    .expect("test snapshot must not produce policy integrity error")
 }
 
 pub(super) fn build_forwarding_state_with_policy_counters_and_previous(
     snapshot: &ConfigSnapshot,
     policy_counters: &PolicyCounterStore,
+    nat_counters: &crate::nat::NatCounterStore,
     previous: Option<&ForwardingState>,
 ) -> Result<ForwardingState, crate::policy::SnapshotIntegrityError> {
     let mut state = ForwardingState::default();
@@ -187,9 +214,10 @@ pub(super) fn build_forwarding_state_with_policy_counters_and_previous(
     state.source_nat_rules = parse_source_nat_rules_with_previous(
         &snapshot.source_nat_rules,
         previous.map(|state| state.source_nat_rules.as_slice()),
+        nat_counters,
     );
-    state.static_nat = StaticNatTable::from_snapshots(&snapshot.static_nat_rules);
-    state.dnat_table = DnatTable::from_snapshots(&snapshot.destination_nat_rules);
+    state.static_nat = StaticNatTable::from_snapshots(&snapshot.static_nat_rules, nat_counters);
+    state.dnat_table = DnatTable::from_snapshots(&snapshot.destination_nat_rules, nat_counters);
     // #2212: fail CLOSED on an unparseable NAT64 rule. The preflight in the
     // reconcile/refresh apply paths catches this Err and keeps the previous
     // live forwarding state rather than installing a silently-narrower NAT64
@@ -486,8 +514,7 @@ pub(in crate::afxdp) fn compute_pending_neigh_timeout_ns<R: SysctlReader>(
     // transition into the fallback state (and re-arm on recovery so a
     // revert→fix→revert cycle re-warns once). Process-global because the
     // sysctl state is process-global.
-    static IN_FALLBACK: std::sync::atomic::AtomicBool =
-        std::sync::atomic::AtomicBool::new(false);
+    static IN_FALLBACK: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     let fallback = || -> u64 {
         if !IN_FALLBACK.swap(true, Ordering::Relaxed) {
             eprintln!(

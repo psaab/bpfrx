@@ -101,8 +101,7 @@ impl Coordinator {
                     "xpf-userspace-dp: snapshot integrity error during reconcile preflight: {} — keeping previous workers + forwarding state",
                     err
                 );
-                self.last_reconcile_stage =
-                    format!("snapshot_integrity_error: {}", err);
+                self.last_reconcile_stage = format!("snapshot_integrity_error: {}", err);
                 return;
             }
         }
@@ -110,6 +109,8 @@ impl Coordinator {
         reset::reset_binding_counters(bindings);
         let Some(snapshot) = snapshot else {
             self.policy_counters.reconcile_rules(&[]);
+            // #2218: no snapshot -> no active NAT rules -> drop all counters.
+            self.nat_counters.reconcile_ids(&[]);
             self.last_reconcile_stage = "no_snapshot".to_string();
             return;
         };

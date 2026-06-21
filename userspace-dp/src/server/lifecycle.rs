@@ -154,6 +154,7 @@ pub(crate) fn run() -> Result<(), String> {
             recent_exceptions: Vec::new(),
             cos_interfaces: Vec::new(),
             policy_rule_counters: Vec::new(),
+            nat_rule_counters: Vec::new(),
             filter_term_counters: Vec::new(),
             three_color_policer_counters: Vec::new(),
             source_nat_pools: Vec::new(),

@@ -259,6 +259,32 @@ func (a *LegacyDataPlaneAdapter) SyncFabricState() {
 	m.SyncFabricState()
 }
 
+// ClearNATRuleCounters routes the operator NAT-counter clear through the
+// userspace Manager override (#2218) rather than the embedded bpfShim method.
+// The bpfShim method only zeroes the Go offset map; the Manager override ALSO
+// sends the clear_nat_counters IPC so the helper's cumulative store resets and
+// the cleared value does not snap back on the next status poll. The embedded
+// dataplane.DataPlane (= bpfShim) would otherwise be promoted here, so this
+// explicit method is required for the durable clear.
+func (a *LegacyDataPlaneAdapter) ClearNATRuleCounters() error {
+	m, err := a.managerOrErr()
+	if err != nil {
+		return err
+	}
+	return m.ClearNATRuleCounters()
+}
+
+// ClearAllCounters routes the operator clear-all through the userspace Manager
+// override (#2218) so the helper NAT translation hit store is reset alongside
+// the BPF maps; otherwise the per-rule NAT totals snap back on the next poll.
+func (a *LegacyDataPlaneAdapter) ClearAllCounters() error {
+	m, err := a.managerOrErr()
+	if err != nil {
+		return err
+	}
+	return m.ClearAllCounters()
+}
+
 func (a *LegacyDataPlaneAdapter) UpdateRGActive(rgID int, active bool) error {
 	m, err := a.managerOrErr()
 	if err != nil {

@@ -15,6 +15,17 @@ func buildSnapshot(cfg *config.Config, ucfg config.UserspaceConfig, generation u
 }
 
 func buildSnapshotWithSchedulerState(cfg *config.Config, ucfg config.UserspaceConfig, generation uint64, fibGeneration uint32, activeState map[string]bool, routeOverlay []config.RouteOverlayEntry, feedOverlay map[string][]string) *ConfigSnapshot {
+	return buildSnapshotWithSchedulerStateAndNATCounters(cfg, ucfg, generation, fibGeneration, activeState, routeOverlay, feedOverlay, nil)
+}
+
+// buildSnapshotWithSchedulerStateAndNATCounters builds the config snapshot and
+// stamps the compiler-assigned per-rule NAT translation hit counter IDs (#2218)
+// onto the SNAT/DNAT/static rule snapshots so the userspace dataplane can
+// attribute a translation to the matched rule. natCounterIDs is the
+// CompileResult.NATCounterIDs map ("rulesetName/ruleName" -> counter ID); a nil
+// map leaves every CounterID at 0 ("no counter"), reproducing pre-#2218 wire
+// shape for callers that do not have a compile result (tests, partial syncs).
+func buildSnapshotWithSchedulerStateAndNATCounters(cfg *config.Config, ucfg config.UserspaceConfig, generation uint64, fibGeneration uint32, activeState map[string]bool, routeOverlay []config.RouteOverlayEntry, feedOverlay map[string][]string, natCounterIDs map[string]uint16) *ConfigSnapshot {
 	if cfg == nil {
 		return &ConfigSnapshot{
 			Version:       ProtocolVersion,
@@ -45,9 +56,9 @@ func buildSnapshotWithSchedulerState(cfg *config.Config, ucfg config.UserspaceCo
 		Flow:               buildFlowSnapshot(cfg),
 		DefaultPolicy:      policyActionString(cfg.Security.DefaultPolicy),
 		Policies:           buildPolicySnapshotsWithSchedulerStateAndFeeds(cfg, activeState, feedOverlay),
-		SourceNAT:          buildSourceNATSnapshots(cfg),
-		StaticNAT:          buildStaticNATSnapshots(cfg),
-		DestinationNAT:     buildDestinationNATSnapshots(cfg),
+		SourceNAT:          buildSourceNATSnapshots(cfg, natCounterIDs),
+		StaticNAT:          buildStaticNATSnapshots(cfg, natCounterIDs),
+		DestinationNAT:     buildDestinationNATSnapshots(cfg, natCounterIDs),
 		NAT64:              buildNAT64Snapshots(cfg),
 		Nptv6:              buildNptv6Snapshots(cfg),
 		Screens:            buildScreenSnapshots(cfg),
