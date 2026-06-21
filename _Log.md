@@ -1,5 +1,30 @@
 # Action Log
 
+## 2026-06-21 — #2134 wire screen session-limit enforcement (closes #2128)
+
+- **Timestamp**: 2026-06-21
+- **Action**: Fixed #2134 — `limit-session source-ip-based`/`destination-ip-based`
+  was a no-op (the per-IP count was computed but never incremented in
+  production). Moved the per-IP count into `SessionTable`: incremented at
+  the install choke point + in-place HA promote, decremented at the
+  removal sink + in-place HA demote (counted-class predicate
+  `!is_reverse && !is_peer_synced && !is_seed`, evict-on-zero). Relocated
+  the limit CHECK out of the per-packet screen stage into the new-flow /
+  session-MISS decision in `poll_descriptor` (`new_flow_session_limit_drop`)
+  so an established flow can't self-drop at the boundary; the read is
+  non-mutating, closing the #2128 phantom-zero leak by construction.
+  OFF-gated (zero cost unconfigured) with clear-on-disable. Retired the
+  dead `ScreenState` session-limit tracker + `screen/session_limit.rs`.
+  Added 14 unit tests (enforcement decision, established-flow no-self-drop,
+  evict-on-zero, HA promote/demote, differential invariant,
+  clear-on-disable) that fail if the wiring is reverted.
+- **File(s)**: userspace-dp/src/session/{mod.rs,install.rs,tests.rs,README.md},
+  userspace-dp/src/screen/{mod.rs,tests.rs}, userspace-dp/src/screen/session_limit.rs (deleted),
+  userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/worker/loop_body/{setup.rs,mod.rs},
+  docs/feature-gaps.md, docs/pr/2134-screen-session-limit-enforce/self-review.md
+- **Validation**: cargo build --release clean; cargo test --release green.
+  Live screen/flood smoke on the loss cluster is PENDING-PARENT.
 ## 2026-06-21 — #2173 (PR #2182) fold: v4-mapped-v6 host-mask family divergence
 
 - **2026-06-21** — Folded MINOR review fixes into PR #2182: NAT host-mask family is now classified textually via `natAddrFamily` (colon => IPv6, matching Rust `IpAddr`/`Ipv4Addr`), NOT `net.ParseIP(...).To4()` — `::ffff:203.0.113.5/32` was wrongly accepted at commit but dropped by the dataplane; the NAT64-pool lenient warning now says only the offending pool address is dropped (not the whole rule); added commit-level mapped-v6 tests for both static-NAT and the NAT64 pool. Files: pkg/config/compiler_nat.go, pkg/config/compiler_nat_host_mask_test.go.

@@ -291,6 +291,25 @@ pub(crate) struct SessionTable {
     /// dropped_gone / expired / re_bucketed). Accumulator overhead
     /// is 4-5 increments per popped entry — sub-µs at typical loads.
     last_pop_stats: WheelPopStats,
+    /// #2134: OFF-gate for per-IP session-limit accounting. True iff any
+    /// screen profile configures `limit-session source-ip-based` /
+    /// `destination-ip-based`. When false (the ~99% deployment), every
+    /// counter-maintenance op below short-circuits so install/remove pay
+    /// nothing for an unconfigured feature (#1357 codegen-sensitivity).
+    /// Set by `set_session_limit_active`, driven from the worker's
+    /// forwarding/screen-profile snapshot apply.
+    session_limit_active: bool,
+    /// #2134: per-source-IP count of locally-admitted, forward-direction
+    /// sessions (the counted-class predicate: `!is_reverse &&
+    /// !origin.is_peer_synced() && !origin.is_transient_local_seed()`).
+    /// Incremented at the install choke point + HA promote, decremented at
+    /// the removal sink + HA demote, evicted the moment a count hits 0 so
+    /// the map is bounded by distinct IPs with >=1 live local session
+    /// (#2128 — no phantom-zero entries). Read non-mutating at the
+    /// new-flow check.
+    session_limit_src_counts: FxHashMap<IpAddr, u32>,
+    /// #2134: per-destination-IP mirror of `session_limit_src_counts`.
+    session_limit_dst_counts: FxHashMap<IpAddr, u32>,
 }
 
 impl SessionTable {
@@ -321,6 +340,9 @@ impl SessionTable {
             nat_reverse_key_collisions: 0,
             wheel: SessionWheel::new(),
             last_pop_stats: WheelPopStats::default(),
+            session_limit_active: false,
+            session_limit_src_counts: FxHashMap::default(),
+            session_limit_dst_counts: FxHashMap::default(),
         }
     }
 
@@ -332,6 +354,104 @@ impl SessionTable {
     /// Update the configurable session timeouts.
     pub fn set_timeouts(&mut self, timeouts: SessionTimeouts) {
         self.timeouts = timeouts;
+    }
+
+    /// #2134: drive the per-IP session-limit OFF-gate from the worker's
+    /// applied screen-profile snapshot. `active` is "any zone configures
+    /// `limit-session source-ip-based`/`destination-ip-based`" (mirrors
+    /// `ScreenState::has_advanced_features`'s limit predicate). Called at
+    /// startup and on every runtime forwarding-snapshot rotation, right
+    /// next to `set_timeouts` / `ScreenState::update_profiles`.
+    ///
+    /// Clear-on-disable: when the gate transitions to false, both count
+    /// maps are cleared. Removing `limit-session` at runtime stops the
+    /// decrement paths, so without this the maps would freeze at stale,
+    /// over-counted values and a later re-enable would resume from wrong
+    /// values and spuriously block an under-limit IP. Mirrors the
+    /// `ScreenState::update_profiles` retain discipline. On a re-enable
+    /// the maps start empty and re-populate from new installs;
+    /// pre-existing live sessions are NOT back-counted (benign,
+    /// Junos-approximate — Junos likewise does not retroactively count
+    /// pre-existing flows when a screen option is enabled).
+    pub fn set_session_limit_active(&mut self, active: bool) {
+        if !active {
+            self.session_limit_src_counts.clear();
+            self.session_limit_dst_counts.clear();
+        }
+        self.session_limit_active = active;
+    }
+
+    /// #2134: non-mutating read of the live local-session count for a
+    /// source IP. Used by the new-flow check before a session is created
+    /// so the (limit+1)-th new flow from an over-limit IP is dropped.
+    /// Read-only by construction — an absent IP reads 0 and never inserts
+    /// a phantom entry (#2128).
+    #[inline]
+    pub fn session_limit_src_count(&self, ip: IpAddr) -> u32 {
+        self.session_limit_src_counts.get(&ip).copied().unwrap_or(0)
+    }
+
+    /// #2134: non-mutating read of the live local-session count for a
+    /// destination IP. Mirror of [`session_limit_src_count`].
+    #[inline]
+    pub fn session_limit_dst_count(&self, ip: IpAddr) -> u32 {
+        self.session_limit_dst_counts.get(&ip).copied().unwrap_or(0)
+    }
+
+    /// #2134: increment the per-IP counts for a freshly-counted session.
+    /// Caller MUST have already evaluated the counted-class predicate
+    /// (`!is_reverse && !origin.is_peer_synced() &&
+    /// !origin.is_transient_local_seed()`) — this helper only adds the
+    /// OFF-gate guard so an unconfigured deployment pays a single branch.
+    /// `saturating_add` never wraps (#1357 / overflow policy); the count
+    /// is bounded by `max_sessions`.
+    #[inline]
+    fn session_limit_inc(&mut self, src_ip: IpAddr, dst_ip: IpAddr) {
+        if !self.session_limit_active {
+            return;
+        }
+        let c = self.session_limit_src_counts.entry(src_ip).or_insert(0);
+        *c = c.saturating_add(1);
+        let c = self.session_limit_dst_counts.entry(dst_ip).or_insert(0);
+        *c = c.saturating_add(1);
+    }
+
+    /// #2134: decrement the per-IP counts for a removed counted session
+    /// and evict the map entry the moment its count reaches 0 (#2128 —
+    /// keeps the maps bounded by live counted sessions). Caller MUST have
+    /// evaluated the counted-class predicate; this helper only adds the
+    /// OFF-gate guard. `saturating_sub` never underflows.
+    #[inline]
+    fn session_limit_dec(&mut self, src_ip: IpAddr, dst_ip: IpAddr) {
+        if !self.session_limit_active {
+            return;
+        }
+        if let Some(c) = self.session_limit_src_counts.get_mut(&src_ip) {
+            *c = c.saturating_sub(1);
+            if *c == 0 {
+                self.session_limit_src_counts.remove(&src_ip);
+            }
+        }
+        if let Some(c) = self.session_limit_dst_counts.get_mut(&dst_ip) {
+            *c = c.saturating_sub(1);
+            if *c == 0 {
+                self.session_limit_dst_counts.remove(&dst_ip);
+            }
+        }
+    }
+
+    /// #2134 test helper: live source-IP count-map entry count. Pins the
+    /// #2128 evict-on-zero invariant (the map stays bounded; no phantom
+    /// zero entries survive).
+    #[cfg(test)]
+    pub(crate) fn session_limit_src_map_len(&self) -> usize {
+        self.session_limit_src_counts.len()
+    }
+
+    /// #2134 test helper: live destination-IP count-map entry count.
+    #[cfg(test)]
+    pub(crate) fn session_limit_dst_map_len(&self) -> usize {
+        self.session_limit_dst_counts.len()
     }
 
     pub fn len(&self) -> usize {
@@ -559,6 +679,16 @@ impl SessionTable {
         self.push_to_wheel(key, now_ns);
         // Emit open delta when promoting a peer-synced entry to local
         if was_peer_synced && !origin.is_peer_synced() && !metadata.is_reverse {
+            // #2134: an in-place promote synced→local turns an uncounted
+            // peer-synced session into a counted local one WITHOUT going
+            // through the install choke point, so the per-IP count must
+            // be incremented explicitly here (same counted-class gate as
+            // the Open-delta push). `!is_transient_local_seed()` holds:
+            // a promote target is never a MissingNeighborSeed (those are
+            // never peer-synced). Capture the Copy IPs before `key` is
+            // moved into the delta below.
+            let (sip, dip) = (key.src_ip, key.dst_ip);
+            self.session_limit_inc(sip, dip);
             self.push_delta(SessionDelta {
                 kind: SessionDeltaKind::Open,
                 key: key.clone(),
@@ -773,6 +903,14 @@ impl SessionTable {
         }
         let decision = record.entry.decision;
         let metadata = record.entry.metadata.clone();
+        // #2134: snapshot the counted-class predicate inputs (all Copy)
+        // before the borrow ends so the per-IP count can be decremented
+        // for a removed counted session. This is the sole removal sink —
+        // expire, explicit delete (clear / RST / fabric-cancel /
+        // promote-purge), and take_synced_local all funnel through here,
+        // so the decrement cannot be forgotten by a future delete site.
+        let removed_origin = record.entry.origin;
+        let removed_is_reverse = metadata.is_reverse;
         // Borrow on `record` ends here; subsequent calls take
         // &mut self (cleanup helpers) without conflict.
         let _ = record;
@@ -792,6 +930,17 @@ impl SessionTable {
         );
         // Only AFTER all indices are clean, return slot to slab.
         let record = self.entries.remove(handle as usize);
+        // #2134: decrement the per-IP count for a removed counted
+        // session (success path ONLY — the two early `None` guards above
+        // RESTORE the mapping and do not remove, so they must not
+        // decrement). Same counted-class predicate the install choke
+        // point used to increment.
+        if !removed_is_reverse
+            && !removed_origin.is_peer_synced()
+            && !removed_origin.is_transient_local_seed()
+        {
+            self.session_limit_dec(key.src_ip, key.dst_ip);
+        }
         Some(record.entry)
     }
 

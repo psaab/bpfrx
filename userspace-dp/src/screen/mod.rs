@@ -32,13 +32,11 @@
 //! - `tests`         — relocated screen_tests.rs (loaded via #[path]).
 
 use rustc_hash::FxHashMap;
-use std::net::IpAddr;
 
 mod extract;
 mod packet;
 mod rate;
 mod scan;
-mod session_limit;
 mod stateless;
 mod syncookie;
 
@@ -67,7 +65,6 @@ use packet::{PROTO_ICMP, PROTO_ICMPV6, PROTO_TCP, PROTO_UDP, TCP_ACK, TCP_FIN, T
 use packet::TCP_URG;
 use rate::RateCounter;
 use scan::{IpSweepTracker, PortScanTracker};
-use session_limit::SessionLimitTracker;
 #[cfg(not(test))]
 use syncookie::SynCookieValidatedCache;
 use syncookie::SYN_COOKIE_STANDBY_ACK_VALIDATION_RATE_LIMIT_PER_SEC;
@@ -87,7 +84,6 @@ pub(crate) struct ScreenState {
     #[cfg(test)]
     syn_cookie_full_epoch_override: Option<u64>,
     // Advanced screen trackers (shared across all zones since they track per-IP)
-    session_limits: SessionLimitTracker,
     port_scan: PortScanTracker,
     ip_sweep: IpSweepTracker,
     last_cleanup_secs: u64,
@@ -107,7 +103,6 @@ impl ScreenState {
             syn_cookie_last_full_epoch: 0,
             #[cfg(test)]
             syn_cookie_full_epoch_override: None,
-            session_limits: SessionLimitTracker::default(),
             port_scan: PortScanTracker::default(),
             ip_sweep: IpSweepTracker::default(),
             last_cleanup_secs: 0,
@@ -339,23 +334,17 @@ impl ScreenState {
             }
         }
 
-        // Per-IP session limits: check before session creation
-        if profile.session_limit_src > 0 {
-            if self
-                .session_limits
-                .check_src(pkt.src_ip, profile.session_limit_src)
-            {
-                return ScreenVerdict::Drop("session-limit-src");
-            }
-        }
-        if profile.session_limit_dst > 0 {
-            if self
-                .session_limits
-                .check_dst(pkt.dst_ip, profile.session_limit_dst)
-            {
-                return ScreenVerdict::Drop("session-limit-dst");
-            }
-        }
+        // #2134: per-IP session limits are NOT checked here. The screen
+        // stage runs on EVERY packet of EVERY flow (this code sits
+        // outside the `is_syn` gate that guards `port_scan`), and runs
+        // BEFORE the session lookup — so checking `count >= limit` here
+        // would re-evaluate an established flow's own counted session on
+        // every data packet and self-drop it at the limit boundary. The
+        // session-limit enforcement now lives at the new-flow /
+        // session-MISS decision in `poll_descriptor`, where it fires
+        // exactly once per new flow, before that flow's session exists.
+        // See `session::SessionTable::session_limit_{src,dst}_count` and
+        // the count maintenance at the install/remove sinks.
 
         // Periodic cleanup of tracker state (every 30 seconds)
         if now_secs.saturating_sub(self.last_cleanup_secs) >= 30 {
@@ -453,34 +442,6 @@ impl ScreenState {
             .unwrap_or(0)
     }
 
-    /// Live source-IP session-limit entry count. Lets tests assert the
-    /// tracker map does not leak phantom zero-count entries under
-    /// distinct-IP churn (#2128).
-    #[cfg(test)]
-    fn session_limit_src_len(&self) -> usize {
-        self.session_limits.src_len()
-    }
-
-    /// Live destination-IP session-limit entry count (#2128).
-    #[cfg(test)]
-    fn session_limit_dst_len(&self) -> usize {
-        self.session_limits.dst_len()
-    }
-
-    /// Notify the screen state that a new session was created. This increments
-    /// per-IP session counters for session limiting.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn session_created(&mut self, src_ip: IpAddr, dst_ip: IpAddr) {
-        self.session_limits.session_created(src_ip, dst_ip);
-    }
-
-    /// Notify the screen state that a session has expired. This decrements
-    /// per-IP session counters for session limiting.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn session_expired(&mut self, src_ip: IpAddr, dst_ip: IpAddr) {
-        self.session_limits.session_expired(src_ip, dst_ip);
-    }
-
     /// Returns true if any zone has session limits, port scan, or IP sweep enabled.
     #[allow(dead_code)]
     pub fn has_advanced_features(&self) -> bool {
@@ -490,6 +451,18 @@ impl ScreenState {
                 || p.port_scan_threshold > 0
                 || p.ip_sweep_threshold > 0
         })
+    }
+
+    /// #2134: true iff any zone configures a per-IP session limit
+    /// (`limit-session source-ip-based` / `destination-ip-based`). Drives
+    /// the `SessionTable` session-limit OFF-gate so install/remove pay
+    /// nothing when the feature is unconfigured. Separate from
+    /// `has_advanced_features` (which also covers port-scan / ip-sweep,
+    /// neither of which touches the SessionTable count).
+    pub fn any_session_limit_configured(&self) -> bool {
+        self.profiles
+            .values()
+            .any(|p| p.session_limit_src > 0 || p.session_limit_dst > 0)
     }
 }
 
