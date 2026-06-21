@@ -570,7 +570,52 @@ pub(crate) fn worker_loop(
             }
         }
         heartbeat.store(loop_now_ns, Ordering::Relaxed);
-        let expired_entries = sessions.expire_stale_entries(loop_now_ns);
+        // #2120: build the standby retention context so the wheel HOLDS
+        // peer-synced sessions this node does not forward (restoring the
+        // dead Go-GC `IsLocalPrimary` contract), self-heals them on RG
+        // promotion (edge via rg_epochs), and reaps them at a bounded
+        // ceiling if a primary delete is lost. The HA-forwarding logic
+        // stays here (HAGroupRuntime's lease predicate is afxdp-private);
+        // the session wheel only sees the closures + node_active.
+        let ha_map = ha_runtime.as_ref();
+        let rg_epochs_for_gate = &rg_epochs;
+        // node_active: does this node forward at least one RG right now?
+        // Excludes a standalone node (empty/all-inactive map) from ever
+        // holding (mirrors session_glue's forwards-any pattern).
+        let node_active = ha_map
+            .values()
+            .any(|group| group.is_forwarding_active(loop_now_secs));
+        let forwards_rg = |rg: i32| -> bool {
+            if rg > 0 {
+                ha_map
+                    .get(&rg)
+                    .map(|group| group.is_forwarding_active(loop_now_secs))
+                    .unwrap_or(false)
+            } else {
+                // owner_rg_id <= 0 (fabric / unresolved-owner reverse):
+                // "forwards here" == the node forwards anything.
+                node_active
+            }
+        };
+        let epoch_of = |rg: i32| -> u32 {
+            // Mirror the flow-cache consumer guard: a valid per-RG index
+            // uses rg_epochs[rg]; everything else (rg <= 0 or out of
+            // range) uses the node-level rg_epochs[0] activation edge.
+            let idx = if rg > 0 && (rg as usize) < rg_epochs_for_gate.len() {
+                rg as usize
+            } else {
+                0
+            };
+            rg_epochs_for_gate[idx].load(Ordering::Relaxed)
+        };
+        let ha_ctx = crate::session::ExpireHaContext {
+            node_active,
+            forwards_rg: &forwards_rg,
+            epoch_of: &epoch_of,
+            ceiling_mult: crate::session::STALE_SYNCED_CEILING_MULT,
+            ceiling_abs_ns: crate::session::STALE_SYNCED_CEILING_ABS_NS,
+        };
+        let expired_entries = sessions.expire_stale_entries_ha(loop_now_ns, Some(&ha_ctx));
         let expired = expired_entries.len() as u64;
         for expired_entry in expired_entries {
             release_source_nat_allocation(

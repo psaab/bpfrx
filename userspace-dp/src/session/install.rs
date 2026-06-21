@@ -149,6 +149,20 @@ impl SessionTable {
                 expires_after_ns: session_timeout_ns(protocol, tcp_flags, &self.timeouts),
                 closing: matches!(protocol, PROTO_TCP) && (tcp_flags & (TCP_FIN | TCP_RST)) != 0,
                 wheel_tick: 0,
+                // #2120: a freshly-installed entry has never been HELD and
+                // has not yet observed an RG epoch. 0 is the never-seen-an-
+                // activation default; the first standby HOLD observation in
+                // the expire pass stamps the live epoch (see
+                // session/expire.rs). The install path has no `rg_epochs`
+                // handle, so stamping the live epoch here would mean
+                // threading the array through every install caller — the
+                // expire-pass HOLD stamp gives the same self-heal edge with
+                // a far smaller blast radius. The only difference is a
+                // one-shot, bounded self-heal re-stamp if a synced entry is
+                // imported on an already-active node and then never sees
+                // traffic; it ages on the next pass.
+                seen_rg_epoch: 0,
+                first_held_ns: 0,
             },
         };
         let raw = self.entries.insert(record);
@@ -235,6 +249,15 @@ impl SessionTable {
                 expires_after_ns: session_timeout_ns(protocol, tcp_flags, &self.timeouts),
                 closing: matches!(protocol, PROTO_TCP) && (tcp_flags & (TCP_FIN | TCP_RST)) != 0,
                 wheel_tick: 0,
+                // #2120: a re-imported synced entry leaves the held world
+                // with a fresh `last_seen_ns`, so it carries no carried-over
+                // hold clock. `seen_rg_epoch` resets to the never-seen
+                // default (the next HOLD/SELF-HEAL pass re-stamps the live
+                // epoch). `upsert_synced` first `remove_entry`s any prior
+                // entry, so this is the canonical re-import refresh that the
+                // §6.4 contract clears `first_held_ns` on.
+                seen_rg_epoch: 0,
+                first_held_ns: 0,
             },
         };
         let raw = self.entries.insert(record);

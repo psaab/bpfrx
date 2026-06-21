@@ -26,6 +26,26 @@ const DEFAULT_UDP_SESSION_TIMEOUT_NS: u64 = 60_000_000_000;
 const DEFAULT_ICMP_SESSION_TIMEOUT_NS: u64 = 60_000_000_000;
 const OTHER_SESSION_TIMEOUT_NS: u64 = 30_000_000_000;
 
+/// #2120: stale-synced ceiling multiplier. A peer-synced session HELD
+/// by the standby retention gate is reaped once it has been held longer
+/// than `min(STALE_SYNCED_CEILING_MULT × expires_after_ns,
+/// STALE_SYNCED_CEILING_ABS_NS)`. RELATIVE because configured timeouts
+/// can reach `MaxDurationSeconds`, so a fixed ceiling would reap a live
+/// long-timeout session on the standby before failover. Multiplier ≈ 3
+/// gives the primary several full idle windows to deliver its Close
+/// delta (or the journal/reconnect path to reconcile) before the
+/// standby reaps on its own.
+pub(crate) const STALE_SYNCED_CEILING_MULT: u64 = 3;
+
+/// #2120: stale-synced ceiling absolute cap (≈7 days). Bounds the
+/// pathological long-`inactivity-timeout` config (a 30-day-timeout flow
+/// would otherwise allow a leaked held entry to be pinned for 90 days at
+/// MULT×). 7 days is generously ≥ the largest realistic standby idle
+/// window a legitimate failover could need, so the cap reaps only leaked
+/// standby state, never a live local flow (a held entry is by definition
+/// NOT forwarding on this node). See plan §4.4 / §6.5.
+pub(crate) const STALE_SYNCED_CEILING_ABS_NS: u64 = 7 * 24 * 60 * 60 * 1_000_000_000;
+
 /// Per-call statistics for `expire_stale_entries` pop work, used by
 /// the timer-wheel unit tests to assert K-bounds and entry
 /// classification under specific synthetic workloads. Fields are
@@ -46,6 +66,32 @@ pub(crate) struct WheelPopStats {
     /// Entries that were re-bucketed (long-timeout / not yet
     /// expired).
     pub(crate) re_bucketed: usize,
+    /// #2120: peer-synced (or whole-node-standby `owner_rg_id==0`)
+    /// entries that crossed their idle timeout but were HELD instead of
+    /// expired because this node does not currently forward their RG.
+    /// Restores the dead Go-GC `IsLocalPrimary` retention contract into
+    /// the userspace wheel — without it the standby silently reaps
+    /// long-lived synced sessions and breaks them on failover (#131
+    /// reintroduced by the eBPF→userspace migration).
+    pub(crate) held_standby: usize,
+    /// #2120: HELD entries reaped anyway because they have been held
+    /// past the stale-synced ceiling (`min(MULT × timeout, ABS_CAP)`
+    /// measured from `first_held_ns`). Bounds the lost-primary-delete
+    /// leak — a held entry whose Close delta and journal entry were both
+    /// lost cannot be pinned forever.
+    pub(crate) reaped_stale_synced: usize,
+    /// #2120: HELD entries re-stamped (kept alive with a fresh
+    /// `last_seen_ns`) because this node has STARTED forwarding their RG
+    /// but the entry's recorded epoch predates the activation — the
+    /// edge-triggered self-heal that closes the promotion command-apply
+    /// race (RefreshOwnerRGS may not have landed yet).
+    pub(crate) healed_on_promote: usize,
+    /// #2120: peer-synced `owner_rg_id==0` entries AGED on an
+    /// otherwise-active node (one RG active, the entry belongs to a
+    /// standby RG path). This is the known active/active under-retention
+    /// residual (plan §4.4 / A2#4); counted so it is OBSERVABLE in the
+    /// field rather than a silent drop.
+    pub(crate) aged_owner_rg_zero_active_node: usize,
 }
 
 /// Configurable session timeout values (in nanoseconds).
@@ -131,6 +177,24 @@ struct SessionEntry {
     /// A WheelEntry whose `scheduled_tick != entry.wheel_tick` is a
     /// stale duplicate (lazy-delete discriminator).
     wheel_tick: u64,
+    /// #2120: the RG epoch (`rg_epochs[owner_rg_id]`, or the node-level
+    /// `rg_epochs[0]` for `owner_rg_id <= 0`) observed the last time this
+    /// entry was installed, refreshed, or HELD by the standby retention
+    /// gate. The expire pass compares it against the current epoch to
+    /// detect the edge "this node just started forwarding this RG" and
+    /// fire the self-heal re-stamp exactly once per activation. Stamped
+    /// on install / refresh / hold; NEVER cleared (an epoch of 0 is the
+    /// natural standalone / never-seen-an-activation default).
+    seen_rg_epoch: u32,
+    /// #2120: monotonic timestamp (ns) at which this entry FIRST entered
+    /// the held (non-forwarding standby) state, or 0 when not held. The
+    /// stale-synced ceiling measures the hold duration from here, NOT
+    /// from `last_seen_ns`, so a self-heal re-stamp on a flapping RG
+    /// cannot reset the leak clock. Cleared (→0) ONLY when the entry
+    /// genuinely leaves the held world: real-traffic refresh
+    /// (`update_session`), promotion refresh
+    /// (`refresh_for_ha_transition`), or re-import (`upsert_synced`).
+    first_held_ns: u64,
 }
 
 /// #964 Step 1: slab-resident record. Holds the canonical
@@ -451,6 +515,14 @@ impl SessionTable {
             record.entry.closing =
                 matches!(protocol, PROTO_TCP) && (tcp_flags & (TCP_FIN | TCP_RST)) != 0;
             // wheel_tick deliberately preserved (parity with restore_entry).
+            // #2120: a real-traffic refresh (or a peer→local promote) means
+            // this entry now genuinely lives on this node — it leaves the
+            // held world. Clear the hold clock so the stale-synced ceiling
+            // restarts cleanly if it is ever held again, and reset the
+            // observed epoch to the never-seen default (the next HOLD pass,
+            // if any, re-stamps the live epoch).
+            record.entry.first_held_ns = 0;
+            record.entry.seen_rg_epoch = 0;
         }
         // Always re-assert the secondary ADDS — byte-identical to restore_entry's
         // unconditional index_forward_nat_key. For the no-reindex case this
@@ -599,6 +671,16 @@ impl SessionTable {
             record.entry.metadata = metadata;
             record.entry.install_epoch = epoch;
             record.entry.last_seen_ns = now_ns;
+            // #2120: promotion refresh re-stamps `last_seen_ns` (the entry
+            // now ages from a full timeout on the promoted node), so it
+            // leaves the held world. Clear the hold clock and reset the
+            // observed epoch (§6.4 write-site contract). NOTE: the
+            // edge-triggered self-heal in the expire pass leaves
+            // `first_held_ns` UNTOUCHED — only a genuine departure from the
+            // held state (here, real-traffic refresh, or re-import) clears
+            // it, so a flapping RG cannot reset the leak ceiling.
+            record.entry.first_held_ns = 0;
+            record.entry.seen_rg_epoch = 0;
         }
         self.index_forward_nat_key_parts(key, handle, new_nat, new_is_reverse, new_owner_rg);
         // #965: schedule the refreshed entry for expiration check.
