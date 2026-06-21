@@ -14,8 +14,8 @@ mod wg;
 // paths. The previous in-place definitions in this file were
 // moved verbatim into headers.rs.
 pub(in crate::afxdp) use headers::{
-    eth_header_len, write_eth_header, write_eth_header_slice, write_ipv4_header,
-    write_ipv6_header, write_udp_header,
+    eth_header_len, write_eth_header, write_eth_header_slice, write_eth_header_tagged,
+    write_ipv4_header, write_ipv6_header, write_udp_header, TxVlanTag, TPID_8021AD, TPID_8021Q,
 };
 
 use byte_writes::{
