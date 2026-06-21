@@ -9514,3 +9514,27 @@ top.
   pkg/config/compiler.go, pkg/config/compiler_validate_strict.go,
   pkg/config/ike_policy_chain_ref_test.go, pkg/config/parser_security_test.go,
   _Log.md
+
+- **Timestamp**: 2026-06-21 (#2279)
+  **Action**: IKE-chain validator diagnostics + test-robustness polish (3
+  Copilot follow-up items from merged #2277). (1) Tightened the healthy-tunnel
+  assertion in TestRenderConfig_BrokenChainSkipsVPN_HealthyTunnelSurvives:
+  `proposals = aes256` → `\n    proposals = aes256` (anchored to the 4-space
+  Phase-1 line) so it cannot FALSE-PASS off the child 8-space
+  `esp_proposals = aes256...` line, mirroring the negative guard in
+  TestRenderConfig_NoPolicyGatewayRendersWithoutProposalsLine. Fail-on-revert
+  proven: removing the Phase-1 `proposals =` emission now breaks the test
+  (old bare substring would have false-passed — demonstrated structurally).
+  (2) compiler_validate_strict.go: an ike-policy defined with NO proposals
+  leaf (pol.Proposals == "") now reports "ike-policy <name> ... has no
+  proposals configured" instead of the misleading `undefined ike-proposal ""`.
+  (3) The dangling-ike-policy message no longer asserts a single
+  `security ike gateway` prefix — gateways are authored under either
+  `security ike` or `security ipsec` (both compileIKE/compileIPsec populate
+  the same Gateways map), so the message is stanza-agnostic
+  ("gateway <name> (under `security ike` or `security ipsec`)"). Diagnostics/
+  test-quality only; no security-logic change. build+vet green; pkg/ipsec +
+  pkg/config tests pass; affected tests 5x no flake.
+  **File(s)**: pkg/ipsec/ike_chain_failclosed_test.go,
+  pkg/config/compiler_validate_strict.go,
+  pkg/config/ike_policy_chain_ref_test.go, _Log.md
