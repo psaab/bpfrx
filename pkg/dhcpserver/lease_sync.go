@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"net"
 	"os"
 	"path/filepath"
@@ -292,7 +293,27 @@ func readSyncLeasesViaMemfile(path string, family int, now time.Time) ([]SyncLea
 			duid, iaid := splitV6Identity(a.Identity)
 			l.DUID = duid
 			l.IAID = iaid
-			l.LeaseType = "IA_NA"
+			// #2262: preserve the v6 lease kind from the memfile instead of
+			// hardcoding IA_NA, which mis-seeded an IA_PD (prefix-delegation)
+			// lease as an address lease on the peer. A PRESENT but unparseable
+			// lease_type column flips LeaseTypeOK=false: skip (logged) rather
+			// than mis-type — fail-closed, mirroring the socket path which
+			// reports the kind faithfully.
+			if !a.LeaseTypeOK {
+				slog.Warn("dhcpserver: skipping v6 memfile lease with unparseable lease_type",
+					"address", a.Address, "duid", duid, "iaid", iaid)
+				continue
+			}
+			lt, ok := keaLeaseTypeToString(a.LeaseType)
+			if !ok {
+				slog.Warn("dhcpserver: skipping v6 memfile lease with unknown lease_type",
+					"address", a.Address, "lease_type", a.LeaseType)
+				continue
+			}
+			l.LeaseType = lt
+			if a.LeaseType == keaLeaseTypeIAPD {
+				l.PrefixLen = a.PrefixLen
+			}
 		} else {
 			hw, cid := splitV4Identity(a.Identity)
 			l.HWAddress = hw
@@ -324,6 +345,24 @@ func splitV4Identity(identity string) (hwaddr, clientID string) {
 		return strings.TrimPrefix(identity, "mac:"), ""
 	}
 	return "", ""
+}
+
+// keaLeaseTypeToString maps the numeric Kea memfile lease_type column to the
+// string form the control-socket path reports (and SeedSyncLeases6 consumes):
+// 0 → IA_NA, 1 → IA_TA, 2 → IA_PD. ok is false for any other value so the
+// caller skips a row it cannot faithfully type rather than mis-seeding it
+// (#2262). IA_TA is passed through for parity with the socket path, which
+// reports whatever kind Kea returns.
+func keaLeaseTypeToString(t int) (string, bool) {
+	switch t {
+	case keaLeaseTypeIANA:
+		return "IA_NA", true
+	case keaLeaseTypeIATA:
+		return "IA_TA", true
+	case keaLeaseTypeIAPD:
+		return "IA_PD", true
+	}
+	return "", false
 }
 
 // splitV6Identity inverts identity6 ("duid:DUID/IAID") back into DUID + IAID.
