@@ -8,6 +8,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/psaab/xpf/pkg/appid"
 	"github.com/psaab/xpf/pkg/config"
 )
 
@@ -16,6 +17,15 @@ import (
 func compileFirewallFilters(dp DataPlane, cfg *config.Config, result *CompileResult) error {
 	// Track written keys for populate-before-clear.
 	writtenIfaceFilter := make(map[IfaceFilterKey]bool)
+
+	// Validate every term's `from protocol <name>` token up front so an
+	// unrepresentable protocol fails the commit with a clear error instead of
+	// silently degrading to "match protocol 0" (the pre-#2175 numeric-fallback
+	// surprise). Resolution runs through the centralized appid.ProtocolNumber
+	// SSOT, so any name a security policy accepts a firewall filter accepts too.
+	if err := validateFilterProtocols(cfg); err != nil {
+		return err
+	}
 
 	// Build routing instance name -> table ID map (skip forwarding instances)
 	riTableIDs := make(map[string]uint32)
@@ -359,6 +369,48 @@ func compileFirewallFilters(dp DataPlane, cfg *config.Config, result *CompileRes
 	return nil
 }
 
+// validateFilterProtocols rejects any firewall-filter term whose
+// `from protocol <name>` token cannot be resolved by the centralized
+// appid.ProtocolNumber SSOT (#2175). It walks every inet and inet6 filter so
+// the failure surfaces at commit time with a clear, actionable error rather
+// than degrading silently to "match protocol 0" deep in rule expansion.
+//
+// A bare numeric token (including the deliberate "0" for HOPOPT) resolves
+// through ProtocolNumber's numeric fallback, so explicit numeric protocols
+// keep working; only genuinely unrepresentable tokens are rejected.
+func validateFilterProtocols(cfg *config.Config) error {
+	check := func(family string, filters map[string]*config.FirewallFilter) error {
+		names := make([]string, 0, len(filters))
+		for name := range filters {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			filter := filters[name]
+			if filter == nil {
+				continue
+			}
+			for _, term := range filter.Terms {
+				if term == nil || term.Protocol == "" {
+					continue
+				}
+				if _, ok := appid.ProtocolNumber(term.Protocol); !ok {
+					return fmt.Errorf(
+						"firewall family %s filter %s term %s: unknown protocol %q "+
+							"(use a protocol name such as tcp/udp/icmp/icmpv6/gre/esp/ah/"+
+							"sctp/ospf or a numeric value 0-255)",
+						family, name, term.Name, term.Protocol)
+				}
+			}
+		}
+		return nil
+	}
+	if err := check("inet", cfg.Firewall.FiltersInet); err != nil {
+		return err
+	}
+	return check("inet6", cfg.Firewall.FiltersInet6)
+}
+
 // expandFilterTerm expands a single filter term into one or more BPF filter rules.
 // Terms with multiple source/destination addresses generate the cross product of rules.
 func expandFilterTerm(term *config.FirewallFilterTerm, family uint8, riTableIDs map[string]uint32, prefixLists map[string]*config.PrefixList, policerIDs map[string]uint32) []FilterRule {
@@ -431,22 +483,18 @@ func expandFilterTerm(term *config.FirewallFilterTerm, family uint8, riTableIDs 
 		}
 	}
 
-	// Protocol match
+	// Protocol match — resolve through the centralized appid.ProtocolNumber
+	// SSOT (#2124/#2175) so every protocol representable in a security policy
+	// (tcp/udp/icmp/icmpv6 plus gre/ospf/esp/ah/sctp/vrrp/igmp/pim/... and any
+	// numeric 0..255) resolves identically in a firewall filter match.
+	// compileFirewallFilters validates the token up front, so an
+	// unrepresentable name never reaches here; ok==false is treated
+	// defensively as "no protocol constraint" rather than the old silent
+	// "match protocol 0" surprise.
 	if term.Protocol != "" {
-		base.MatchFlags |= FilterMatchProtocol
-		switch strings.ToLower(term.Protocol) {
-		case "tcp":
-			base.Protocol = 6
-		case "udp":
-			base.Protocol = 17
-		case "icmp":
-			base.Protocol = 1
-		case "icmpv6":
-			base.Protocol = 58
-		default:
-			if v, err := strconv.Atoi(term.Protocol); err == nil {
-				base.Protocol = uint8(v)
-			}
+		if n, ok := appid.ProtocolNumber(term.Protocol); ok {
+			base.MatchFlags |= FilterMatchProtocol
+			base.Protocol = n
 		}
 	}
 

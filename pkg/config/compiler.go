@@ -256,6 +256,27 @@ type compileOpts struct {
 	// SchemaValidate (applications stay opaque there). Same doctrine as
 	// lenientPolicyMatchAddress / lenientNATHostMask.
 	lenientApplicationSpecs bool
+	// lenientFilterProtocols (#2175 review) downgrades the firewall-filter
+	// `from protocol <token>` gate (validateFilterProtocolsStrict) from a
+	// hard compile error to a cfg.Warnings entry. The strict commit /
+	// commit-check path hard-rejects a term whose protocol token is neither
+	// a known protocol name, a junos-* alias, nor a 0..255 number — the same
+	// acceptance set the centralized appid.ProtocolNumber SSOT admits (#2124
+	// / #2175). Before this gate such a token was caught only by the
+	// dataplane compiler (compileFirewallFilters → validateFilterProtocols),
+	// whose error the daemon SWALLOWS (it is not in
+	// requiredProtocolGateSentinels, so compileErrorMustAbortApply == false):
+	// commit returned SUCCESS, the config was promoted, and the term silently
+	// programmed NO protocol match (the pre-#2175 "match protocol 0"
+	// surprise). The dataplane gate stays as defense-in-depth; this commit-
+	// check gate makes the refusal operator-visible. The tolerant load /
+	// peer-sync paths downgrade to a warning so an already-persisted or
+	// peer-synced config carrying a bad token still BOOTS (#1960 no-brick) —
+	// the dataplane independently drops the protocol constraint, so a
+	// leniently-loaded bad term is inert (it matches without a protocol
+	// constraint, never silently "protocol 0"). Same doctrine as
+	// lenientApplicationSpecs.
+	lenientFilterProtocols bool
 }
 
 // CompileConfig converts a parsed ConfigTree AST into a typed Config struct.
@@ -291,6 +312,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientUnsupportedInterfaceStanzas: true,
 		lenientRoutingExportRef:            true,
 		lenientApplicationSpecs:            true,
+		lenientFilterProtocols:             true,
 	})
 }
 
@@ -377,6 +399,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientUnsupportedInterfaceStanzas: true,
 		lenientRoutingExportRef:            true,
 		lenientApplicationSpecs:            true,
+		lenientFilterProtocols:             true,
 	})
 }
 
@@ -740,6 +763,32 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		if opts.lenientApplicationSpecs {
 			cfg.Warnings = append(cfg.Warnings,
 				fmt.Sprintf("application spec (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
+	// #2175 firewall-filter `from protocol <token>` fail-open gate. Strict on
+	// commit / commit-check (hard-reject a term whose protocol token is not
+	// resolvable by the centralized appid.ProtocolNumber SSOT — neither a
+	// known protocol name, a junos-* alias, nor a 0..255 number). Before this
+	// gate such a token was caught only by the dataplane compiler
+	// (compileFirewallFilters → validateFilterProtocols), whose error the
+	// daemon SWALLOWS (not in requiredProtocolGateSentinels, so
+	// compileErrorMustAbortApply == false): commit returned SUCCESS, the
+	// config was promoted, and the term silently programmed NO protocol match
+	// (the pre-#2175 "match protocol 0" surprise). The dataplane gate remains
+	// as defense-in-depth; this gate makes the refusal operator-visible at
+	// commit, consistent with validateApplicationSpecsStrict / the other
+	// fail-open gates. Lenient on load / peer-sync (warn so an already-
+	// persisted or peer-synced config carrying a bad token still boots — #1960
+	// no-brick; the dataplane drops the constraint independently so the term
+	// is inert, never silently "protocol 0"). Runs on the fully-compiled
+	// *Config (firewall filters compiled) so the typed term list is populated.
+	if err := validateFilterProtocolsStrict(cfg); err != nil {
+		if opts.lenientFilterProtocols {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("firewall filter protocol (downgraded to warning on tolerant path): %v", err))
 		} else {
 			return nil, err
 		}
@@ -1541,6 +1590,114 @@ func applicationsToValidateStrict(cfg *Config) map[string]struct{} {
 // unexported validateApplicationSpecsStrict directly.
 func ApplicationsToValidateStrict(cfg *Config) map[string]struct{} {
 	return applicationsToValidateStrict(cfg)
+}
+
+// validateFilterProtocolsStrict hard-rejects any firewall-filter term whose
+// `from protocol <token>` is not resolvable by the centralized protocol SSOT
+// (#2175) — neither a known protocol name, a junos-* alias, nor a 0..255
+// number. It walks every inet and inet6 filter and reports the first offending
+// family / filter / term / token (sorted by filter name, then by the term's
+// position, so the first-reported error is deterministic across runs).
+//
+// Resolution goes through filterProtocolResolvable, which INLINE-mirrors the
+// acceptance set of appid.ProtocolNumber. The compiler cannot call
+// appid.ProtocolNumber directly because pkg/appid imports pkg/config (an import
+// cycle) — the same constraint that forces validateApplicationSpecsStrict to
+// duplicate appid.CatalogNames's policy-reference walk (#2142). A pkg/appid
+// drift-guard test (TestFilterProtocolResolvableMatchesProtocolNumber) asserts
+// the two acceptance sets agree via the exported FilterProtocolResolvable
+// accessor, so a future change to appid.ProtocolNumber cannot let this copy
+// drift silently.
+//
+// The dataplane compiler (compileFirewallFilters → validateFilterProtocols)
+// keeps an identical check as defense-in-depth, but its error is swallowed by
+// the daemon (compileErrorMustAbortApply == false): this commit-check gate is
+// what makes the refusal operator-visible. On the tolerant load / peer-sync
+// path the caller downgrades the returned error to a warning (#1960 no-brick).
+func validateFilterProtocolsStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	check := func(family string, filters map[string]*FirewallFilter) error {
+		names := make([]string, 0, len(filters))
+		for name := range filters {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			filter := filters[name]
+			if filter == nil {
+				continue
+			}
+			for _, term := range filter.Terms {
+				if term == nil || term.Protocol == "" {
+					continue
+				}
+				if !filterProtocolResolvable(term.Protocol) {
+					return fmt.Errorf(
+						"firewall family %s filter %q term %q: unknown protocol %q "+
+							"(use a protocol name such as tcp/udp/icmp/icmpv6/gre/esp/ah/"+
+							"sctp/ospf or a numeric value 0-255)",
+						family, name, term.Name, term.Protocol)
+				}
+			}
+		}
+		return nil
+	}
+	if err := check("inet", cfg.Firewall.FiltersInet); err != nil {
+		return err
+	}
+	return check("inet6", cfg.Firewall.FiltersInet6)
+}
+
+// filterProtocolResolvable reports whether a `from protocol <token>` is
+// representable: it INLINE-mirrors the acceptance set of
+// appid.ProtocolNumber's ok==true result (the #2124/#2175 SSOT). pkg/config
+// cannot import pkg/appid (import cycle: pkg/appid imports pkg/config), so the
+// known-name set is duplicated here and pinned by the pkg/appid drift-guard
+// test TestFilterProtocolResolvableMatchesProtocolNumber via the exported
+// FilterProtocolResolvable accessor.
+//
+// The acceptance set is intentionally TIGHTER than validateProtocol (used by
+// validateApplicationSpecsStrict): validateProtocol blanket-accepts ANY
+// "junos-" prefix, but appid.ProtocolNumber only resolves the specific
+// junos-* aliases below, so an unknown "junos-foobar" must be rejected here to
+// stay consistent with the dataplane SSOT — otherwise commit would pass while
+// the swallowed dataplane gate dropped the constraint.
+func filterProtocolResolvable(token string) bool {
+	switch strings.ToLower(strings.TrimSpace(token)) {
+	case "tcp", "junos-tcp-any",
+		"udp", "junos-udp-any",
+		"icmp", "junos-icmp-all", "junos-ping",
+		"icmpv6", "icmp6", "junos-icmp6-all", "junos-pingv6",
+		"gre", "junos-gre",
+		"ospf", "junos-ospf",
+		"junos-ip-in-ip", "junos-ipip", "ipip",
+		"egp",
+		"igmp",
+		"pim",
+		"ah",
+		"esp",
+		"sctp",
+		"vrrp":
+		return true
+	default:
+		// Numeric protocol number, including the deliberate "0" (HOPOPT).
+		if n, err := strconv.Atoi(strings.TrimSpace(token)); err == nil && n >= 0 && n < 256 {
+			return true
+		}
+		return false
+	}
+}
+
+// FilterProtocolResolvable exposes filterProtocolResolvable for the pkg/appid
+// drift-guard test (TestFilterProtocolResolvableMatchesProtocolNumber), which
+// asserts this acceptance set agrees with appid.ProtocolNumber's ok==true
+// result so the INLINE-duplicated table cannot drift from the SSOT silently. It
+// is a TEST seam, not a runtime coupling — production code uses the unexported
+// filterProtocolResolvable directly.
+func FilterProtocolResolvable(token string) bool {
+	return filterProtocolResolvable(token)
 }
 
 func policyMatchAddressError(scope, polName, field, addr string) error {
