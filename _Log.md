@@ -1,5 +1,27 @@
 # Action Log
 
+## 2026-06-20 — #2153 DHCP relay must relay DHCPINFORM
+
+- **Timestamp**: 2026-06-20
+- **Action**: Fixed #2153 — the relay's client→server gate dropped
+  every BOOTREQUEST that was not DISCOVER/REQUEST, silently discarding
+  DHCPINFORM (RFC 2131 §3.4) so clients lost DNS/domain/NTP options.
+  Extracted the gate into a pure `clientRequestRelayable` predicate and
+  added `MessageTypeInform` to the relayable set. The server→client
+  reply path needed NO change: an INFORM is answered with an ACK (already
+  permitted at relay.go:566), and the #2076 reply matrix already routes
+  an ACK with yiaddr==0 + real ciaddr via the `ciaddrReal` UDP-unicast
+  case (relay.go:628). Added a `clientRequestRelayable` table test and an
+  end-to-end `TestRunRelay_RelaysInform` that drives a live INFORM through
+  the real runRelay loop; both fail pre-fix (non-tautological). Documented
+  relayed message types in the package README.
+- **File(s)**: pkg/dhcprelay/relay.go, pkg/dhcprelay/relay_test.go,
+  pkg/dhcprelay/README.md
+- **Validation**: go test -race ./pkg/dhcprelay/ green; new tests proven
+  to FAIL against the pre-fix gate; 5/5 flake on TestRunRelay_RelaysInform;
+  go vet clean. Control-plane relay change — no loss-cluster smoke
+  required (lab-gated per #2115).
+
 ## 2026-06-20 — #2118 policy hit-count display-gate consistency
 
 - **Timestamp**: 2026-06-20
