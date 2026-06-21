@@ -257,6 +257,8 @@ fn update_ha_state_prewarms_split_rg_reverse_sessions_on_activation() {
         origin: SessionOrigin::SyncImport,
         protocol: PROTO_TCP,
         tcp_flags: 0x10,
+        // #2170 test fixture: no peer install generation.
+        generation: 0,
     };
     publish_shared_session(
         &coordinator.sessions.synced,
@@ -363,6 +365,8 @@ fn update_ha_state_demotion_recovers_from_poisoned_worker_command_mutex() {
         origin: SessionOrigin::ForwardFlow,
         protocol: PROTO_TCP,
         tcp_flags: 0x10,
+        // #2170 test fixture: no peer install generation.
+        generation: 0,
     };
     publish_shared_session(
         &coordinator.sessions.synced,
@@ -452,5 +456,126 @@ fn update_ha_state_demotion_recovers_from_poisoned_worker_command_mutex() {
         coordinator.rg_epochs[1].load(Ordering::Acquire),
         epoch_before + 1,
         "rg_epochs[1] must be bumped by the demotion"
+    );
+}
+
+// --- #2170 install-generation guard (helper-side belt-and-suspenders) -----
+
+fn synced_entry_with_generation(generation: u64) -> SyncedSessionEntry {
+    SyncedSessionEntry {
+        key: test_key(),
+        decision: test_decision(),
+        metadata: test_metadata(),
+        origin: SessionOrigin::SyncImport,
+        protocol: PROTO_TCP,
+        tcp_flags: 0,
+        generation,
+    }
+}
+
+fn synced_generation(coordinator: &Coordinator, key: &SessionKey) -> Option<u64> {
+    coordinator
+        .sessions
+        .synced
+        .lock()
+        .expect("shared sessions")
+        .get(key)
+        .map(|entry| entry.generation)
+}
+
+// A stale-generation upsert (gen=1 after gen=2 is stored) must be refused so
+// the per-key stored generation never regresses (the delayed-stale-install
+// variant, SMR C3). Mirrors the Go install guard.
+#[test]
+fn upsert_synced_session_refuses_stale_generation_install() {
+    let coordinator = Coordinator::new();
+    let key = test_key();
+    let before = coordinator.session_install_stale_ignored_total();
+
+    coordinator.upsert_synced_session(synced_entry_with_generation(2));
+    assert_eq!(synced_generation(&coordinator, &key), Some(2));
+
+    // Delayed stale install (gen=1) — must be refused, stored gen stays 2.
+    coordinator.upsert_synced_session(synced_entry_with_generation(1));
+    assert_eq!(
+        synced_generation(&coordinator, &key),
+        Some(2),
+        "stale-generation install rolled the stored generation back"
+    );
+    assert_eq!(
+        coordinator.session_install_stale_ignored_total(),
+        before + 1,
+        "stale install should be counted"
+    );
+}
+
+// An equal- or newer-generation upsert must apply (equality is NOT refusal).
+#[test]
+fn upsert_synced_session_applies_equal_and_newer_generation() {
+    let coordinator = Coordinator::new();
+    let key = test_key();
+
+    coordinator.upsert_synced_session(synced_entry_with_generation(2));
+    coordinator.upsert_synced_session(synced_entry_with_generation(2)); // equal — applies
+    assert_eq!(synced_generation(&coordinator, &key), Some(2));
+    coordinator.upsert_synced_session(synced_entry_with_generation(5)); // newer — applies
+    assert_eq!(synced_generation(&coordinator, &key), Some(5));
+}
+
+// A gen-0 (legacy/local) install must apply unconditionally — the guard only
+// acts when BOTH the stored and incoming generations are non-zero.
+#[test]
+fn upsert_synced_session_legacy_zero_generation_applies() {
+    let coordinator = Coordinator::new();
+    let key = test_key();
+    coordinator.upsert_synced_session(synced_entry_with_generation(5));
+    coordinator.upsert_synced_session(synced_entry_with_generation(0)); // legacy — applies
+    assert!(
+        synced_generation(&coordinator, &key).is_some(),
+        "a legacy gen-0 install must apply (it overwrites the stored entry)"
+    );
+}
+
+// delete_synced_session_gen refuses a strictly-older-generation delete and
+// applies an equal/newer/zero one (belt-and-suspenders for helper-side
+// generation-aware deletes).
+#[test]
+fn delete_synced_session_gen_refuses_stale_generation() {
+    let coordinator = Coordinator::new();
+    let key = test_key();
+    let before = coordinator.session_delete_stale_ignored_total();
+
+    coordinator.upsert_synced_session(synced_entry_with_generation(2));
+
+    // Stale delete (gen=1) — refused, entry survives.
+    coordinator.delete_synced_session_gen(key.clone(), 1);
+    assert!(
+        synced_generation(&coordinator, &key).is_some(),
+        "stale-generation delete wrongly removed the live entry"
+    );
+    assert_eq!(
+        coordinator.session_delete_stale_ignored_total(),
+        before + 1
+    );
+
+    // Equal-generation delete (gen=2) — applies.
+    coordinator.delete_synced_session_gen(key.clone(), 2);
+    assert!(
+        synced_generation(&coordinator, &key).is_none(),
+        "equal-generation delete should remove the entry"
+    );
+}
+
+// The plain delete_synced_session (delete_gen=0) is unconditional — helper-
+// local purges must always remove the entry regardless of its generation.
+#[test]
+fn delete_synced_session_zero_generation_is_unconditional() {
+    let coordinator = Coordinator::new();
+    let key = test_key();
+    coordinator.upsert_synced_session(synced_entry_with_generation(9));
+    coordinator.delete_synced_session(key.clone());
+    assert!(
+        synced_generation(&coordinator, &key).is_none(),
+        "a gen-0 (unconditional) delete must remove the entry"
     );
 }

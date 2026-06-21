@@ -54,7 +54,7 @@ func TestSyncHeaderEncoding(t *testing.T) {
 		Protocol: 6,
 	}
 
-	msg := encodeDeleteV4(key)
+	msg := encodeDeleteV4(key, 0)
 
 	// Check header
 	if string(msg[0:4]) != "BPSY" {
@@ -64,7 +64,8 @@ func TestSyncHeaderEncoding(t *testing.T) {
 		t.Fatalf("bad type: %d", msg[4])
 	}
 	length := binary.LittleEndian.Uint32(msg[8:12])
-	if length != 16 {
+	// #2170: delete payload is 16-byte 5-tuple + 8-byte trailing generation.
+	if length != 24 {
 		t.Fatalf("bad length: %d", length)
 	}
 
@@ -130,7 +131,7 @@ func TestEncodeDeleteV6(t *testing.T) {
 		Protocol: 6,
 	}
 
-	msg := encodeDeleteV6(key)
+	msg := encodeDeleteV6(key, 0)
 
 	if string(msg[0:4]) != "BPSY" {
 		t.Fatalf("bad magic")
@@ -139,7 +140,8 @@ func TestEncodeDeleteV6(t *testing.T) {
 		t.Fatalf("bad type: %d", msg[4])
 	}
 	length := binary.LittleEndian.Uint32(msg[8:12])
-	if length != 40 {
+	// #2170: delete payload is 40-byte 5-tuple + 8-byte trailing generation.
+	if length != 48 {
 		t.Fatalf("bad length: %d", length)
 	}
 }
@@ -602,7 +604,7 @@ func TestHandleMessageDeleteV4(t *testing.T) {
 	ss := NewSessionSync(":4785", "10.0.0.2:4785", nil)
 	// Without dp, should not crash
 	key := dataplane.SessionKey{Protocol: 6}
-	msg := encodeDeleteV4(key)
+	msg := encodeDeleteV4(key, 0)
 	ss.handleMessage(nil, syncMsgDeleteV4, msg[syncHeaderSize:])
 	if ss.stats.DeletesReceived.Load() != 1 {
 		t.Fatal("should count delete received")
@@ -639,7 +641,7 @@ func TestHandleMessageDeleteV4RemovesCompanions(t *testing.T) {
 	}
 	ss := NewSessionSync(":0", "10.0.0.2:4785", dp)
 
-	msg := encodeDeleteV4(forward)
+	msg := encodeDeleteV4(forward, 0)
 	ss.handleMessage(nil, syncMsgDeleteV4, msg[syncHeaderSize:])
 
 	if ss.stats.DeletesReceived.Load() != 1 {
@@ -679,7 +681,7 @@ func TestHandleMessageDeleteV6RemovesCompanions(t *testing.T) {
 	}
 	ss := NewSessionSync(":0", "10.0.0.2:4785", dp)
 
-	msg := encodeDeleteV6(forward)
+	msg := encodeDeleteV6(forward, 0)
 	ss.handleMessage(nil, syncMsgDeleteV6, msg[syncHeaderSize:])
 
 	if ss.stats.DeletesReceived.Load() != 1 {
@@ -2305,7 +2307,7 @@ func TestDeleteJournalFlushRetainsTailOnFullQueue(t *testing.T) {
 	const n = 5
 	for i := 0; i < n; i++ {
 		ss.deleteJournalMu.Lock()
-		ss.deleteJournal = append(ss.deleteJournal, encodeDeleteV4(deleteKeyN(i)))
+		ss.deleteJournal = append(ss.deleteJournal, encodeDeleteV4(deleteKeyN(i), 0))
 		ss.deleteJournalMu.Unlock()
 	}
 
@@ -2324,7 +2326,7 @@ func TestDeleteJournalFlushRetainsTailOnFullQueue(t *testing.T) {
 	}
 	// FIFO order preserved.
 	for i := 0; i < n; i++ {
-		want := encodeDeleteV4(deleteKeyN(i))
+		want := encodeDeleteV4(deleteKeyN(i), 0)
 		if string(ss.deleteJournal[i]) != string(want) {
 			t.Fatalf("re-journaled delete %d out of order", i)
 		}
@@ -2341,7 +2343,7 @@ func TestDeleteJournalFlushPartialThenRetains(t *testing.T) {
 	const n = 5
 	for i := 0; i < n; i++ {
 		ss.deleteJournalMu.Lock()
-		ss.deleteJournal = append(ss.deleteJournal, encodeDeleteV4(deleteKeyN(i)))
+		ss.deleteJournal = append(ss.deleteJournal, encodeDeleteV4(deleteKeyN(i), 0))
 		ss.deleteJournalMu.Unlock()
 	}
 
@@ -2357,7 +2359,7 @@ func TestDeleteJournalFlushPartialThenRetains(t *testing.T) {
 	}
 	// The two re-journaled deletes are the last two (indices 3,4) in order.
 	for j, i := range []int{3, 4} {
-		want := encodeDeleteV4(deleteKeyN(i))
+		want := encodeDeleteV4(deleteKeyN(i), 0)
 		if string(ss.deleteJournal[j]) != string(want) {
 			t.Fatalf("re-journaled delete %d (orig idx %d) out of order", j, i)
 		}
@@ -2368,7 +2370,7 @@ func TestDeleteJournalFlushPartialThenRetains(t *testing.T) {
 // all three branches: no overflow, overflow within the tail, and tail
 // fully dropped (overflow into the concurrently-journaled deletes).
 func TestRejournalTailFIFOPrependAndOverflow(t *testing.T) {
-	mk := func(n int) []byte { return encodeDeleteV4(deleteKeyN(n)) }
+	mk := func(n int) []byte { return encodeDeleteV4(deleteKeyN(n), 0) }
 	eq := func(t *testing.T, got [][]byte, wantIdx []int) {
 		t.Helper()
 		if len(got) != len(wantIdx) {
@@ -2433,7 +2435,7 @@ func TestDeleteJournalFlushAllFit(t *testing.T) {
 	const n = 4
 	for i := 0; i < n; i++ {
 		ss.deleteJournalMu.Lock()
-		ss.deleteJournal = append(ss.deleteJournal, encodeDeleteV4(deleteKeyN(i)))
+		ss.deleteJournal = append(ss.deleteJournal, encodeDeleteV4(deleteKeyN(i), 0))
 		ss.deleteJournalMu.Unlock()
 	}
 	ss.flushDeleteJournal()
@@ -2463,7 +2465,7 @@ func TestDeleteJournalFlushOrderingWithQueuedSession(t *testing.T) {
 	ss.sendCh <- encodeSessionV4(key, val)
 	// Then flush a same-key delete.
 	ss.deleteJournalMu.Lock()
-	ss.deleteJournal = append(ss.deleteJournal, encodeDeleteV4(key))
+	ss.deleteJournal = append(ss.deleteJournal, encodeDeleteV4(key, 0))
 	ss.deleteJournalMu.Unlock()
 	ss.flushDeleteJournal()
 

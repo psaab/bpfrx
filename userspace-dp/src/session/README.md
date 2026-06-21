@@ -218,6 +218,29 @@ installs — they cannot fail. The future cap arbitration for the sync
 family (row I11) now covers `UpsertLocal` automatically. Decision
 record: `docs/research/1870-local-tunnel-pair/plan.md`.
 
+### HA install-generation guard on SyncedSessionEntry (#2170)
+
+`SyncedSessionEntry` (`afxdp/worker/mod.rs`) carries a `generation: u64`
+mirrored from the Go cluster apply layer via `SessionSyncRequest.generation`.
+Only peer `SyncImport` entries carry a meaningful (non-zero) generation;
+local-origin entries (forward/reverse learn, tunnel decap, promote,
+missing-neighbor seed) leave it 0. The synthesized reverse companion inherits
+the forward entry's generation so a delete refusal is consistent across both
+halves.
+
+`upsert_synced_session` (`afxdp/ha.rs`) refuses a strictly-older-generation
+install (both generations non-zero) so the helper's stored generation never
+regresses (`SESSION_INSTALL_STALE_IGNORED`), mirroring the Go install guard.
+`delete_synced_session_gen(key, delete_gen)` refuses a strictly-older-generation
+delete (`SESSION_DELETE_STALE_IGNORED`); the plain `delete_synced_session(key)`
+wrapper passes `delete_gen = 0` so helper-local purges (tunnel-remap, GC) stay
+unconditional. These helper-side guards are **belt-and-suspenders** — the
+authoritative guard lives in the Go cluster apply layer (`deleteClusterSynced*`),
+which short-circuits both the BPF map delete and the helper. The counters are
+surfaced via `Coordinator::session_install_stale_ignored_total()` /
+`session_delete_stale_ignored_total()`. See `docs/sync-protocol.md` and
+`docs/research/2170-ha-deferred-delete/plan.md`.
+
 ## Per-IP session-limit lifecycle (#2134; #2128 leak-fix preserved)
 
 Junos `set security screen ids-option <name> limit-session

@@ -34,10 +34,10 @@ All multi-byte integers in the wire format are **little-endian**, matching the n
 
 | Type | Name             | Direction        | Payload Size        | Purpose |
 |------|------------------|------------------|---------------------|---------|
-| 1    | SessionV4        | Primary→Secondary | 120 bytes           | Create/update IPv4 session |
-| 2    | SessionV6        | Primary→Secondary | ~196 bytes          | Create/update IPv6 session |
-| 3    | DeleteV4         | Primary→Secondary | 16 bytes            | Delete IPv4 session |
-| 4    | DeleteV6         | Primary→Secondary | 40 bytes            | Delete IPv6 session |
+| 1    | SessionV4        | Primary→Secondary | length-gated        | Create/update IPv4 session |
+| 2    | SessionV6        | Primary→Secondary | length-gated        | Create/update IPv6 session |
+| 3    | DeleteV4         | Primary→Secondary | 16 or 24 bytes      | Delete IPv4 session |
+| 4    | DeleteV6         | Primary→Secondary | 40 or 48 bytes      | Delete IPv6 session |
 | 5    | BulkStart        | Primary→Secondary | 0                   | Marks start of bulk transfer |
 | 6    | BulkEnd          | Primary→Secondary | 0                   | Marks end of bulk transfer |
 | 7    | Heartbeat        | Bidirectional     | 0                   | Keepalive (sent on 30s idle) |
@@ -121,6 +121,51 @@ Offset  Size  Field
 36      1     Protocol      uint8
 37      3     (implicit)    -
 ```
+
+## Install-Generation Guard (#2170)
+
+To stop a deferred/journaled delete from killing a same-5-tuple replacement
+session, every **session** and **delete** message carries a length-gated
+trailing `Generation uint64` (LE):
+
+- **Session V4/V6**: 8 bytes appended after the existing last field (`FibGen`).
+  An old decoder stops after `FibGen` and ignores it (`if off+8 <= len(payload)`
+  block in `decodeSession*Payload`); a new decoder reading an old, shorter
+  payload sees `Generation == 0`.
+- **Delete V4**: 16 → 24 bytes; **Delete V6**: 40 → 48 bytes. The generation is
+  the trailing 8 bytes after the 5-tuple block. The handler's `len(payload) >=
+  16/40` check already tolerates the longer payload; the generation is read
+  only when `len(payload) >= 24/48`.
+
+**Semantics (sender, `pkg/cluster`):** a single process-wide strictly-monotonic
+counter (seeded from `CLOCK_MONOTONIC` nanos) stamps every install send
+(`QueueSession*`, sweep, bulk) and is recorded per wire key. A delete echoes the
+exact generation last stamped for that key and evicts the record, so the
+delete's generation is always same-domain as the entry the receiver stored.
+Generations are only ever compared per-`(sender,key)` — never across keys — so a
+single sender-local counter suffices.
+
+**Semantics (receiver, `pkg/cluster`):** `SessionSync` keeps the authoritative
+per-key stored generation in its own map (the BPF C conntrack struct stays
+generation-free). The apply layer:
+
+- **Delete guard** (`deleteClusterSynced*`): apply a delete only if its
+  generation is **not strictly older** than the stored entry's. `delete < stored`
+  with both non-zero → refuse (`DeletesStaleIgnored++`), short-circuiting BOTH
+  the BPF map delete and the helper. Equality applies (the delete of the very
+  session installed); `gen == 0` on either side falls back to today's
+  unconditional delete (rolling-upgrade safe).
+- **Install guard** (`installClusterSynced*`): refuse to overwrite a stored
+  entry with a strictly-older-generation install (`InstallsStaleIgnored++`) so
+  the per-key stored generation never regresses (closes the delayed-stale-install
+  variant).
+
+The userspace helper mirrors the same field on its in-memory
+`SyncedSessionEntry` (via `SessionSyncRequest.generation`) and enforces the
+same guard in `upsert_synced_session` / `delete_synced_session_gen` as a
+belt-and-suspenders for helper-originated deletes; the Go cluster apply layer is
+authoritative. A mixed-version cluster degrades to exact pre-#2170 behavior for
+any pair where either end lacks a generation.
 
 ## Config Payload (Variable)
 

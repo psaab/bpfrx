@@ -8274,3 +8274,46 @@ top.
 - **File(s)**: test/incus/deploy-lib.sh, test/incus/deploy-lib-selftest.sh,
   test/incus/setup.sh, test/incus/cluster-setup.sh, Makefile, docs/test_env.md,
   CLAUDE.md
+
+- **Timestamp**: 2026-06-21
+  **Action**: #2170 — HA session-sync install-generation guard so a
+  deferred/journaled delete cannot kill a same-5-tuple replacement session.
+  Stamp every session install AND delete with a monotonic per-(sender,key)
+  install generation carried as a length-gated trailing uint64 on the session
+  and delete wire messages (+ Go SessionSyncRequest + Rust SyncedSessionEntry).
+  Sender (pkg/cluster) uses a single boot-seeded monotonic counter and ECHOES
+  the install generation on the matching delete (handles the cross-owner
+  failover edge). Receiver keeps the authoritative per-key stored generation in
+  SessionSync.recvGenV4/V6 (BPF C struct stays generation-free); the apply layer
+  refuses a delete whose generation is strictly older than the stored entry
+  (deleteClusterSynced*, DeletesStaleIgnored) and refuses an install that would
+  regress the stored generation (installClusterSynced*, InstallsStaleIgnored).
+  Equality applies; gen==0 on either side falls back to today's unconditional
+  delete (rolling-upgrade safe). Reverse-companion + fabric-alias share the
+  install's generation. Rust helper mirrors the field and guards
+  upsert_synced_session / delete_synced_session_gen as belt-and-suspenders
+  (authoritative guard is the Go apply layer). New counters
+  SESSION_INSTALL_STALE_IGNORED / SESSION_DELETE_STALE_IGNORED with coordinator
+  accessors. Unit tests (Go + Rust) each FAIL on pre-fix for the §3.4 race,
+  the delayed-stale-install variant, the gen==0 rolling-upgrade fallback,
+  same-second/same-slot monotonicity, failover-domain re-stamp, and wire
+  round-trip / cross-version short-payload decode. go build ./... +
+  go test pkg/cluster/... pkg/conntrack/... pkg/dataplane/... pkg/daemon/...
+  green; cargo build --release + cargo test --release session (288) green;
+  new concurrency test race-clean 5x. test-failover PENDING-PARENT.
+  **File(s)**: pkg/dataplane/types.go, pkg/cluster/sync.go,
+  pkg/cluster/sync_conn.go, pkg/cluster/sync_protocol.go, pkg/cluster/sync_bulk.go,
+  pkg/cluster/sync_test.go, pkg/cluster/sync_gen_guard_test.go,
+  pkg/dataplane/userspace/protocol.go, pkg/dataplane/userspace/manager_ha.go,
+  pkg/dataplane/userspace/manager_test.go, userspace-dp/src/protocol/control.rs,
+  userspace-dp/src/protocol/tests.rs, userspace-dp/src/afxdp/worker/mod.rs,
+  userspace-dp/src/afxdp/ha.rs, userspace-dp/src/afxdp/ha_tests.rs,
+  userspace-dp/src/afxdp/shared_ops.rs, userspace-dp/src/afxdp/tunnel.rs,
+  userspace-dp/src/afxdp/forwarding/mod.rs, userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/session_glue/promote.rs,
+  userspace-dp/src/afxdp/bpf_map/metrics.rs, userspace-dp/src/afxdp/coordinator/status.rs,
+  userspace-dp/src/server/helpers.rs,
+  userspace-dp/src/afxdp/tests.rs, userspace-dp/src/afxdp/forwarding/tests.rs,
+  userspace-dp/src/afxdp/session_glue/tests.rs,
+  docs/sync-protocol.md, pkg/cluster/README.md, userspace-dp/src/session/README.md,
+  docs/research/2170-ha-deferred-delete/plan.md

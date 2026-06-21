@@ -163,6 +163,23 @@ outside the monitor loop:
   `(key,value)` snapshot. Reverse-session, DNAT/DNATv6, and persistent-NAT
   side effects are backend-owned; do not add local map cleanup in
   `pkg/cluster`.
+- **Install-generation delete guard (#2170)**: every session install and every
+  delete carries a per-`(sender,key)` monotonic install generation as a
+  length-gated trailing `uint64` (see `docs/sync-protocol.md`). The sender
+  (`sync_conn.go`/`sync_bulk.go`) stamps installs from a single boot-seeded
+  counter and the matching delete **echoes** the install generation it cancels
+  (so the comparison is always same-domain, even across an ownership change).
+  The receiver keeps the authoritative per-key stored generation in
+  `SessionSync.recvGenV4/V6` (the BPF C struct stays generation-free) and the
+  apply layer refuses a delete whose generation is **strictly older** than the
+  stored entry (`deleteClusterSynced*`, `DeletesStaleIgnored`) and refuses an
+  install that would regress the stored generation (`installClusterSynced*`,
+  `InstallsStaleIgnored`). Equality applies; `gen == 0` on either side falls
+  back to today's unconditional behavior (rolling-upgrade safe). This stops a
+  journaled/deferred delete for a closed flow from killing a same-5-tuple
+  replacement that was re-synced with a newer generation. Do NOT reuse the
+  synthesized `SessionID` for this — it is non-monotonic
+  (`now_seconds<<16|slot`) and collides on same-second/same-slot reuse.
 - Dual-active overlap is intentional: primary sets `rg_active=true`
   immediately on becoming master; secondary defers `rg_active=false` until
   it sees the VRRP BACKUP event. Brief overlap, never both inactive.
