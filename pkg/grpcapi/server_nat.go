@@ -3,12 +3,26 @@ package grpcapi
 import (
 	"context"
 	"fmt"
+	"math"
 	"strings"
 
 	"github.com/psaab/xpf/pkg/dataplane"
 	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
 	"github.com/psaab/xpf/pkg/vrrp"
 )
+
+// clampInt32 saturates a non-negative int64 to the int32 range so a large
+// NAT port-pool size (which is computed in int64) does not wrap negative
+// when stored in an int32 protobuf field (#2282).
+func clampInt32(v int64) int32 {
+	if v > math.MaxInt32 {
+		return math.MaxInt32
+	}
+	if v < math.MinInt32 {
+		return math.MinInt32
+	}
+	return int32(v)
+}
 
 func (s *Server) GetNATSource(_ context.Context, _ *pb.GetNATSourceRequest) (*pb.GetNATSourceResponse, error) {
 	cfg := s.store.ActiveConfig()
@@ -106,33 +120,38 @@ func (s *Server) GetNATPoolStats(_ context.Context, _ *pb.GetNATPoolStatsRequest
 		if portHigh == 0 {
 			portHigh = 65535
 		}
-		totalPorts := int32((portHigh - portLow + 1) * len(pool.Addresses))
-		used := int32(0)
-
+		// Compute the port-pool size in int64: (portHigh-portLow+1) *
+		// len(Addresses) can exceed int32 for a large pool (e.g. a /16
+		// address range over the default 64512-port window is ~4.2e9),
+		// and a bare int32() cast would wrap negative and corrupt the
+		// avail=total-used display. Saturate to int32 max when assigning
+		// the int32 proto fields (#2282).
+		totalPorts64 := int64(portHigh-portLow+1) * int64(len(pool.Addresses))
+		var used64 int64
 		if cr != nil {
 			if id, ok := cr.PoolIDs[name]; ok {
 				cnt, err := telemetry.NATPortCounter(uint32(id))
 				if err == nil {
-					used = int32(cnt)
+					used64 = int64(cnt)
 				}
 			}
 		}
 
-		avail := totalPorts - used
-		if avail < 0 {
-			avail = 0
+		avail64 := totalPorts64 - used64
+		if avail64 < 0 {
+			avail64 = 0
 		}
 		util := "0.0%"
-		if totalPorts > 0 {
-			util = fmt.Sprintf("%.1f%%", float64(used)/float64(totalPorts)*100)
+		if totalPorts64 > 0 {
+			util = fmt.Sprintf("%.1f%%", float64(used64)/float64(totalPorts64)*100)
 		}
 
 		resp.Pools = append(resp.Pools, &pb.NATPoolStats{
 			Name:           name,
 			Address:        strings.Join(pool.Addresses, ","),
-			TotalPorts:     totalPorts,
-			UsedPorts:      used,
-			AvailablePorts: avail,
+			TotalPorts:     clampInt32(totalPorts64),
+			UsedPorts:      clampInt32(used64),
+			AvailablePorts: clampInt32(avail64),
 			Utilization:    util,
 		})
 	}

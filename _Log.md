@@ -9615,3 +9615,19 @@ top.
   userspace-dp/src/afxdp/event_emit.rs,
   userspace-dp/src/afxdp/poll_descriptor/mod.rs,
   userspace-dp/src/session/README.md, _Log.md
+
+- **Timestamp**: 2026-06-21
+  **Action**: #2282 grpcapi input-validation hardening — Complete RPC
+  negative-Pos slice-panic guard + ShowNAT int32 port-pool overflow clamp.
+  Complete now rejects req.Pos < 0 with codes.InvalidArgument before
+  slicing line[:pos] (int(-1)<len passed → line[:-1] panic). GetNATPoolStats
+  computes (portHigh-portLow+1)*len(addresses) in int64 and saturates to
+  int32 via new clampInt32 helper before the int32 proto fields (bare cast
+  wrapped negative for ~40k-address pools). Table tests cover Pos
+  {MinInt32,-1,0,mid,len,len+1,MaxInt32} and an int32-overflowing pool;
+  both are fail-on-revert (reverting the guard panics the test; reverting
+  the clamp makes TotalPorts go negative). 5x no flake; go vet clean.
+  **File(s)**: pkg/grpcapi/server_cluster.go,
+  pkg/grpcapi/server_nat.go,
+  pkg/grpcapi/server_input_validation_test.go,
+  pkg/grpcapi/README.md, _Log.md

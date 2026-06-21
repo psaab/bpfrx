@@ -92,3 +92,14 @@ contract.
   user-supplied target after a `--` end-of-options separator so a
   `-`-prefixed target is an operand, not a flag (option-confusion
   hardening, #2084).
+- Request-supplied numeric fields are signed on the wire and must be
+  range-checked before they index/slice/size anything (#2282). `Complete`
+  rejects a negative `pos` with `InvalidArgument` before slicing
+  `line[:pos]` — without the guard `int(-1) < len(line)` passed and
+  `line[:-1]` panicked the handler goroutine (`pos > len` is already safe
+  because the slice is then skipped). `GetNATPoolStats` computes the
+  port-pool size `(portHigh-portLow+1) * len(addresses)` in int64 and
+  saturates to int32 via `clampInt32` before assigning the int32 proto
+  fields — a bare cast wrapped negative for a large pool (~40k addresses
+  over the default 64512-port window) and corrupted the
+  `avail = total - used` display.
