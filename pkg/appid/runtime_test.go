@@ -50,6 +50,12 @@ func TestCatalogNamesReferencedOnly(t *testing.T) {
 // If a future change to CatalogNames's resolution silently diverges from the
 // compiler copy, this fails — turning a silent commit-gate drift into a test
 // failure. It is a cross-check TEST, not a runtime coupling.
+//
+// Scope note (#2187): the strict walk also collects source/destination-NAT
+// `match application` references, which CatalogNames does not. This fixture
+// carries NO NAT rules, so the two walks still coincide here. Adding a NAT
+// reference to this fixture would (correctly) break the equality — the
+// NAT-reference path is exercised by the compiler-package tests instead.
 func TestStrictValidationSetMatchesCatalogNames(t *testing.T) {
 	cfg := &config.Config{
 		Applications: config.ApplicationsConfig{
