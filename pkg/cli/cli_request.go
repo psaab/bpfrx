@@ -13,6 +13,7 @@ import (
 	"github.com/psaab/xpf/pkg/cluster"
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 	dpformat "github.com/psaab/xpf/pkg/dataplane/userspace/format"
+	"github.com/psaab/xpf/pkg/diagcmd"
 	"github.com/psaab/xpf/pkg/routing"
 	"github.com/psaab/xpf/pkg/wgkey"
 )
@@ -69,27 +70,21 @@ func (c *CLI) handlePing(args []string) error {
 	return err
 }
 
-// buildPingArgv builds the argv for the local CLI ping command. The
-// user-supplied target is placed after a "--" end-of-options separator
-// so a "-"-prefixed target is treated as the destination operand rather
-// than a ping flag (option-confusion hardening, #2084).
+// buildPingArgv builds the argv for the local CLI ping command. It
+// delegates to the shared diagcmd builder so the VRF-device
+// normalization (apply "vrf-" exactly once, #2143) and the "--"
+// end-of-options separator (#2084) match the REST and gRPC surfaces
+// byte-for-byte. Before #2143 this path prepended "vrf-"
+// unconditionally, turning `routing-instance vrf-red` into the
+// non-existent device `vrf-vrf-red`.
 func buildPingArgv(target, count, source, size, vrfName string) []string {
-	var cmdArgs []string
-	if vrfName != "" {
-		cmdArgs = append(cmdArgs, "ip", "vrf", "exec", "vrf-"+vrfName, "ping")
-	} else {
-		cmdArgs = append(cmdArgs, "ping")
-	}
-
-	cmdArgs = append(cmdArgs, "-c", count)
-	if source != "" {
-		cmdArgs = append(cmdArgs, "-I", source)
-	}
-	if size != "" {
-		cmdArgs = append(cmdArgs, "-s", size)
-	}
-	cmdArgs = append(cmdArgs, "--", target)
-	return cmdArgs
+	return diagcmd.PingArgv(diagcmd.PingOptions{
+		Target:          target,
+		Count:           count,
+		Source:          source,
+		Size:            size,
+		RoutingInstance: vrfName,
+	})
 }
 
 func (c *CLI) handleTraceroute(args []string) error {
@@ -137,23 +132,15 @@ func (c *CLI) handleTraceroute(args []string) error {
 }
 
 // buildTracerouteArgv builds the argv for the local CLI traceroute
-// command. The user-supplied target is placed after a "--"
-// end-of-options separator so a "-"-prefixed target is treated as the
-// destination operand rather than a traceroute flag (option-confusion
-// hardening, #2084).
+// command. Like buildPingArgv it delegates to the shared diagcmd builder
+// so VRF normalization (#2143) and the "--" separator (#2084) stay
+// identical across the CLI, REST, and gRPC surfaces.
 func buildTracerouteArgv(target, source, vrfName string) []string {
-	var cmdArgs []string
-	if vrfName != "" {
-		cmdArgs = append(cmdArgs, "ip", "vrf", "exec", "vrf-"+vrfName, "traceroute")
-	} else {
-		cmdArgs = append(cmdArgs, "traceroute")
-	}
-
-	if source != "" {
-		cmdArgs = append(cmdArgs, "-s", source)
-	}
-	cmdArgs = append(cmdArgs, "--", target)
-	return cmdArgs
+	return diagcmd.TracerouteArgv(diagcmd.TracerouteOptions{
+		Target:          target,
+		Source:          source,
+		RoutingInstance: vrfName,
+	})
 }
 
 // handleTest dispatches test sub-commands (policy, routing, security-zone).

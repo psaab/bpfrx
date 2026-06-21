@@ -19,6 +19,7 @@ import (
 	"github.com/psaab/xpf/pkg/config"
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 	dpformat "github.com/psaab/xpf/pkg/dataplane/userspace/format"
+	"github.com/psaab/xpf/pkg/diagcmd"
 	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
 	"github.com/psaab/xpf/pkg/monitoriface"
 	"golang.org/x/sys/unix"
@@ -82,32 +83,23 @@ func (s *Server) Ping(req *pb.PingRequest, stream grpc.ServerStreamingServer[pb.
 	})
 }
 
-// buildPingArgv builds the argv for the gRPC Ping diag. The
-// user-supplied target is placed after a "--" end-of-options separator
-// so a "-"-prefixed target is treated as the destination operand rather
-// than a ping flag (option-confusion hardening, #2084). count is the
-// already-clamped probe count.
+// buildPingArgv builds the argv for the gRPC Ping diag. It delegates to
+// the shared diagcmd builder so the VRF-device normalization (apply
+// "vrf-" exactly once, #2143) and the "--" end-of-options separator
+// (option-confusion hardening, #2084) match the CLI and REST surfaces
+// byte-for-byte. count is the already-clamped probe count.
 func buildPingArgv(req *pb.PingRequest, count int) []string {
-	args := []string{"-c", fmt.Sprintf("%d", count)}
-	if req.Source != "" {
-		args = append(args, "-I", req.Source)
-	}
+	size := ""
 	if req.Size > 0 {
-		args = append(args, "-s", fmt.Sprintf("%d", req.Size))
+		size = fmt.Sprintf("%d", req.Size)
 	}
-	args = append(args, "--", req.Target)
-
-	var cmd []string
-	if req.RoutingInstance != "" {
-		vrfDev := req.RoutingInstance
-		if !strings.HasPrefix(vrfDev, "vrf-") {
-			vrfDev = "vrf-" + vrfDev
-		}
-		cmd = append(cmd, "ip", "vrf", "exec", vrfDev)
-	}
-	cmd = append(cmd, "ping")
-	cmd = append(cmd, args...)
-	return cmd
+	return diagcmd.PingArgv(diagcmd.PingOptions{
+		Target:          req.Target,
+		Count:           fmt.Sprintf("%d", count),
+		Source:          req.Source,
+		Size:            size,
+		RoutingInstance: req.RoutingInstance,
+	})
 }
 
 func (s *Server) Traceroute(req *pb.TracerouteRequest, stream grpc.ServerStreamingServer[pb.TracerouteResponse]) error {
@@ -121,28 +113,16 @@ func (s *Server) Traceroute(req *pb.TracerouteRequest, stream grpc.ServerStreami
 	})
 }
 
-// buildTracerouteArgv builds the argv for the gRPC Traceroute diag. The
-// user-supplied target is placed after a "--" end-of-options separator
-// so a "-"-prefixed target is treated as the destination operand rather
-// than a traceroute flag (option-confusion hardening, #2084).
+// buildTracerouteArgv builds the argv for the gRPC Traceroute diag.
+// Like buildPingArgv it delegates to the shared diagcmd builder so VRF
+// normalization (#2143) and the "--" separator (#2084) stay identical
+// across the CLI, REST, and gRPC surfaces.
 func buildTracerouteArgv(req *pb.TracerouteRequest) []string {
-	args := []string{}
-	if req.Source != "" {
-		args = append(args, "-s", req.Source)
-	}
-	args = append(args, "--", req.Target)
-
-	var cmd []string
-	if req.RoutingInstance != "" {
-		vrfDev := req.RoutingInstance
-		if !strings.HasPrefix(vrfDev, "vrf-") {
-			vrfDev = "vrf-" + vrfDev
-		}
-		cmd = append(cmd, "ip", "vrf", "exec", vrfDev)
-	}
-	cmd = append(cmd, "traceroute")
-	cmd = append(cmd, args...)
-	return cmd
+	return diagcmd.TracerouteArgv(diagcmd.TracerouteOptions{
+		Target:          req.Target,
+		Source:          req.Source,
+		RoutingInstance: req.RoutingInstance,
+	})
 }
 
 // streamDiagCmd runs a command and streams each line of combined output
