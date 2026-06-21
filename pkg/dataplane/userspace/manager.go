@@ -693,6 +693,30 @@ func (m *Manager) Compile(cfg *config.Config) (*dataplane.CompileResult, error) 
 		snap.DeferWorkers = true
 	}
 	var status ProcessStatus
+	// #2124: when THIS config's capabilities forbid forwarding (e.g. a policy
+	// names an application the userspace matcher cannot represent), disarm the
+	// helper BEFORE publishing the snapshot. A current-version helper would
+	// reject the snapshot's `__unsupported__` sentinel via the integrity
+	// preflight, but an OLDER same-protocol-version helper that predates that
+	// preflight would silently drop the sentinel term and could process the
+	// resulting match-any rule with forwarding still armed in the window before
+	// the post-publish syncDesiredForwardingStateLocked() disarm. Disarming
+	// first closes that window for every helper version. We gate on the freshly
+	// computed caps (not m.lastStatus, which still reflects the prior good
+	// config) and only act when the helper currently believes it is armed.
+	if !caps.ForwardingSupported && m.proc != nil && m.proc.Process != nil &&
+		m.lastStatus.ForwardingArmed {
+		var disarmStatus ProcessStatus
+		if derr := m.requestLocked(ControlRequest{
+			Type:       "set_forwarding_state",
+			Forwarding: &ForwardingControlRequest{Armed: false},
+		}, &disarmStatus); derr != nil {
+			return result, fmt.Errorf("disarm userspace forwarding before unsupported-config publish: %w", derr)
+		}
+		if aerr := m.applyHelperStatusLocked(&disarmStatus); aerr != nil {
+			return result, fmt.Errorf("sync helper status after pre-publish disarm: %w", aerr)
+		}
+	}
 	// #1197 v5 (Codex code-review v4 #2): apply_snapshot must
 	// send publishable-only neighbors to match the
 	// update_neighbors path. Otherwise Rust's full-snapshot
