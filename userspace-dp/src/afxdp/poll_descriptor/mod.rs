@@ -120,8 +120,9 @@ fn try_enqueue_resolver(
 ///
 /// This is a read-only query on the per-worker `SessionTable` count
 /// (maintained at the install/remove sinks + HA promote/demote), so it
-/// fixes #2128 by construction: an IP that never installs a session never
-/// gets a map entry. Returns the screen-drop reason if the new flow must
+/// preserves the #2128 leak-fix (closed by #2159) by construction: an IP
+/// that never installs a session never gets a map entry. Returns the
+/// screen-drop reason if the new flow must
 /// be rejected, or `None` to proceed to install. Cold path (session
 /// miss only); the profile lookup short-circuits on the common
 /// no-`limit-session` zone.
@@ -820,9 +821,15 @@ pub(super) fn poll_binding_process_descriptor(
                             // #2128). Keys on the pre-NAT original src/dst
                             // (`flow.src_ip`/`flow.dst_ip`), matching Junos
                             // per-source-IP semantics and the screen stage's
-                            // own tuple. Reverse/seed installs below are
-                            // uncounted and correctly need neither check nor
-                            // count.
+                            // own tuple. The check itself runs on every
+                            // miss-path flow that reaches this point, ahead of
+                            // the install-class branching below; the reverse /
+                            // transient-seed installs below are simply
+                            // uncounted at the maintenance sites (the
+                            // counted-class predicate excludes them), so they
+                            // never increment the count and an over-limit
+                            // forward flow is what `new_flow_session_limit_drop`
+                            // rejects here.
                             if let Some(reason) = new_flow_session_limit_drop(
                                 worker_ctx.forwarding,
                                 sessions,

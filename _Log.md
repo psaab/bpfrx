@@ -1,5 +1,27 @@
 # Action Log
 
+## 2026-06-21 — #2186 docs: screen session-limit cap is per-worker (× num_workers)
+
+- **Timestamp**: 2026-06-21
+- **Action**: DOCS-only (#2186). The #2134 (PR #2177) per-IP screen
+  session-limit enforcement maintains its count in the per-worker
+  `SessionTable`, so with N RX queues/workers and RSS the effective
+  admitted cap is `configured × num_workers`, not a single global cap
+  (live: `limit 2` admitted 12 on the 6-worker loss cluster). Made the
+  per-worker multiplier explicit in the session README "Per-worker
+  scoping" section (formula + worked example + operator sizing note) and
+  in both `docs/feature-gaps.md` session-limiting rows. Swept the two
+  #2177 Copilot wording nits: (a) reworded the `poll_descriptor` ~L823
+  comment — the check runs on every miss-path flow before install-class
+  branching; reverse/seed installs are merely uncounted at the
+  maintenance sites, they are not "exempt from the check"; (b) corrected
+  the "#2128 closes/fixes" attribution in the README header, the
+  `poll_descriptor` doc-comment, and `_Log.md` — #2128 (the phantom-zero
+  leak) was closed by #2159; #2134/#2177 *preserves* that leak-fix by
+  construction (read-only count query). No code logic change.
+- **File(s)**: userspace-dp/src/session/README.md,
+  userspace-dp/src/afxdp/poll_descriptor/mod.rs, docs/feature-gaps.md,
+  _Log.md
 ## 2026-06-21 — #2175 review fold: firewall-filter protocol refuses commit
 
 - **Timestamp**: 2026-06-21
@@ -122,7 +144,7 @@
 - **Action**: Added `validateApplicationSpecsStrict` (strict-vs-lenient gate, `lenientApplicationSpecs` flag) rejecting a malformed `set applications application <name>` destination-port/source-port (non-numeric, out of 1..65535, inverted range) or unknown protocol at commit — but ONLY for apps referenced by a security policy (direct or via application-set) OR when `services application-identification` is enabled. Previously warning-only (`ValidateConfig`): commit succeeded, the app-id compiler skipped the unparsable port (never-match AppID), and a referencing policy failed CLOSED on permit / OPEN on deny. Application-DEFINITION sibling of #2124's policy-app-term fail-closed gate; reuses `validatePortSpec`/`validateProtocol` (no new table). Lenient on load/peer-sync (#1960/#2008 no-brick). New `compiler_application_specs_test.go` (10 tests, 8 fail pre-fix); doc note in `docs/services-application-identification.md`.
 - **File(s)**: pkg/config/compiler.go, pkg/config/compiler_application_specs_test.go, docs/services-application-identification.md
 
-## 2026-06-21 — #2134 wire screen session-limit enforcement (closes #2128)
+## 2026-06-21 — #2134 wire screen session-limit enforcement (#2128 leak-fix preserved; #2128 closed by #2159)
 
 - **Timestamp**: 2026-06-21
 - **Action**: Fixed #2134 — `limit-session source-ip-based`/`destination-ip-based`
@@ -134,7 +156,8 @@
   the limit CHECK out of the per-packet screen stage into the new-flow /
   session-MISS decision in `poll_descriptor` (`new_flow_session_limit_drop`)
   so an established flow can't self-drop at the boundary; the read is
-  non-mutating, closing the #2128 phantom-zero leak by construction.
+  non-mutating, preserving the #2128 phantom-zero leak-fix (closed by
+  #2159) by construction.
   OFF-gated (zero cost unconfigured) with clear-on-disable. Retired the
   dead `ScreenState` session-limit tracker + `screen/session_limit.rs`.
   Added 14 unit tests (enforcement decision, established-flow no-self-drop,
