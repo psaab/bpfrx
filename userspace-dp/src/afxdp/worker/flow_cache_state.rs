@@ -1,12 +1,17 @@
 //! #959 Phase 9 — extracts the per-binding flow-cache state out of
 //! `BindingWorker` into a dedicated `WorkerFlowCacheState` sub-struct.
 //!
-//! Two fields:
+//! One field:
 //! - `flow_cache` — per-worker flow lookup cache (the `FlowCache`
 //!   data structure from `super::*`).
-//! - `flow_cache_session_touch` — count of session touches modulo
-//!   the periodic-refresh threshold; the 64-touch boundary triggers
-//!   a session-table refresh in the descriptor loop.
+//!
+//! #2220 removed the former `flow_cache_session_touch` counter: it was
+//! a binding-GLOBAL modulo-64 sampler that, by design, refreshed only
+//! the flow whose cache hit happened to land on a global multiple of
+//! 64, so a low-rate flow co-resident with a saturating flow could be
+//! reaped while still actively forwarding. The flow-cache fast path now
+//! calls `SessionTable::touch_if_stale`, a per-session time-threshold
+//! keepalive that needs no worker-local counter.
 //!
 //! Pure structural extraction: capacities and access semantics
 //! unchanged from master pre-Phase-9. Field names preserved.
@@ -26,5 +31,4 @@ use super::*;
 /// uses it.
 pub(crate) struct WorkerFlowCacheState {
     pub(crate) flow_cache: FlowCache,
-    pub(crate) flow_cache_session_touch: u64,
 }

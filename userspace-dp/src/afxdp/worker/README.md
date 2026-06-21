@@ -43,7 +43,7 @@ each cluster has a clear ownership boundary.
 | `timers.rs` | `WorkerTimers` (#959 Phase 6) — five fields gating per-binding wake / heartbeat pacing. |
 | `tx_pipeline.rs` | `WorkerTxPipeline` (#959 Phase 7 + Phase 10's `outstanding_tx`) — eight fields holding the TX pipeline buffers. |
 | `bind_meta.rs` | `WorkerBindMeta` (#959 Phase 8) — `bind_time_ns`, `bind_mode` (copy vs ZC), and identity. |
-| `flow_cache_state.rs` | `WorkerFlowCacheState` (#959 Phase 9) — per-worker flow cache + 64-touch refresh boundary. |
+| `flow_cache_state.rs` | `WorkerFlowCacheState` (#959 Phase 9) — per-worker flow cache. (#2220 dropped the binding-global modulo-64 `flow_cache_session_touch` keepalive counter; the cache fast path now calls `SessionTable::touch_if_stale`, a per-session time-threshold keepalive — see `session/README.md` "Flow-cache keepalive".) |
 | `xsk_rings.rs` | `WorkerXskRings` (#959 Phase 11) — the three XSK kernel-ring handles (`device`, `rx`, `tx`). |
 
 ## Where it sits

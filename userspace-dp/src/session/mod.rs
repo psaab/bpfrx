@@ -26,6 +26,17 @@ const DEFAULT_UDP_SESSION_TIMEOUT_NS: u64 = 60_000_000_000;
 const DEFAULT_ICMP_SESSION_TIMEOUT_NS: u64 = 60_000_000_000;
 const OTHER_SESSION_TIMEOUT_NS: u64 = 30_000_000_000;
 
+/// #2220: flow-cache keepalive divisor. A cache-served session is
+/// re-stamped once its idle time reaches `expires_after_ns /
+/// SESSION_KEEPALIVE_DIVISOR` (a quarter of its own timeout), bounding
+/// its worst-case age to `(1 + 1/N) × expires_after_ns` independent of
+/// co-resident flow rates. Four leaves three full refresh windows of
+/// slack before natural expiry — far enough from the edge that ordinary
+/// GC jitter (1 s `SESSION_GC_INTERVAL_NS`) never reaps an active flow,
+/// yet large enough that the steady-state refresh only writes/re-buckets
+/// a few times per timeout window rather than per packet.
+const SESSION_KEEPALIVE_DIVISOR: u64 = 4;
+
 /// #2120: stale-synced ceiling multiplier. A peer-synced session HELD
 /// by the standby retention gate is reaped once it has been held longer
 /// than `min(STALE_SYNCED_CEILING_MULT × expires_after_ns,
@@ -541,6 +552,47 @@ impl SessionTable {
             true
         }) {
             self.push_to_wheel(key, now_ns);
+        }
+    }
+
+    /// #2220: per-session keepalive throttle for the flow-cache fast
+    /// path. Refreshes the matched session's `last_seen_ns` ONLY when it
+    /// has gone idle for at least `expires_after_ns / SESSION_KEEPALIVE_DIVISOR`
+    /// — i.e. it is a quarter of the way to its OWN expiry. This bounds
+    /// every cache-served session's age to `(1 + 1/N) × expires_after_ns`
+    /// regardless of co-resident flow rates, so an actively-forwarding
+    /// cached flow can never be GC'd mid-flow.
+    ///
+    /// Why this replaces the prior binding-global modulo-64 counter: that
+    /// counter incremented across ALL flows on the binding and touched
+    /// only the flow that happened to land on a global multiple of 64.
+    /// A low-rate flow co-resident with a saturating flow could be served
+    /// entirely from the cache for the whole timeout window without its
+    /// session ever being touched, then be reaped while still forwarding
+    /// (HA Close delta to the peer + BPF redirect-key deletion + a stale
+    /// flow-cache descriptor out-living its session). See issue #2220.
+    ///
+    /// HOT PATH: a single `key_to_handle` hash probe (the same probe
+    /// `touch` performs) plus a Copy field read; the `last_seen_ns` write
+    /// and the throttled `push_to_wheel` run only when actually stale, so
+    /// the steady-state per-cache-hit cost is one lookup and an integer
+    /// compare. Allocation-free.
+    #[inline]
+    pub fn touch_if_stale(&mut self, key: &SessionKey, now_ns: u64) {
+        let stale = match self.record_by_key(key) {
+            Some(record) => {
+                let last_seen = record.entry.last_seen_ns;
+                let refresh_after = record
+                    .entry
+                    .expires_after_ns
+                    .max(SESSION_KEEPALIVE_DIVISOR)
+                    / SESSION_KEEPALIVE_DIVISOR;
+                now_ns.saturating_sub(last_seen) >= refresh_after
+            }
+            None => return,
+        };
+        if stale {
+            self.touch(key, now_ns);
         }
     }
 

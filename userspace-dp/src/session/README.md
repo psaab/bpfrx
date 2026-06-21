@@ -67,6 +67,31 @@ sweep walks the wheel bucket for the current tick; stale entries get
 lazy-deleted on the next lookup if they slip past the sweep (e.g.
 because they were re-bucketed mid-sweep).
 
+## Flow-cache keepalive (#2220)
+
+The flow-cache fast path (`afxdp/poll_descriptor/flow_cache_hit.rs`) is
+the ONLY code path that refreshes a forwarded flow's `last_seen_ns` — a
+flow served entirely from the per-worker flow cache never re-runs the
+slow path that would otherwise touch the session. `touch_if_stale` is
+the keepalive it calls on every cache hit: it re-stamps the matched
+session ONLY once that session has gone idle for at least
+`expires_after_ns / SESSION_KEEPALIVE_DIVISOR` (a quarter of its OWN
+timeout). This bounds every cache-served session's worst-case age to
+`(1 + 1/N) × expires_after_ns` regardless of co-resident flow rates, so
+an actively-forwarding cached flow can never be GC'd mid-flow. The
+steady-state per-hit cost is one `key_to_handle` probe plus an integer
+compare (the `last_seen_ns` write + throttled `push_to_wheel` run only
+when actually stale); allocation-free.
+
+This replaced the pre-#2220 binding-GLOBAL modulo-64 counter
+(`flow_cache_session_touch`), which incremented across ALL flows on the
+binding and touched only the flow whose hit happened to land on a global
+multiple of 64. A low-rate flow co-resident with a saturating flow could
+be served from the cache for a whole timeout window without its session
+ever being touched, then be reaped while still forwarding (an HA Close
+delta to the peer + BPF redirect-key deletion + a stale flow-cache
+descriptor out-living its session). UDP (60 s) was the most exposed.
+
 ## Standby retention (#2120)
 
 The Rust wheel now owns HA standby session retention — the contract the
