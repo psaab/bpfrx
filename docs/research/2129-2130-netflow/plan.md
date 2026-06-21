@@ -1,8 +1,11 @@
 # Plan of Action — #2129 + #2130 NetFlow v9 export: exporter gating + Rust dead-code scope
 
-- **Revision:** r2 (folds 3-way hostile review — Claude SMR + 2 hostile Claude
-  plan-reviewers; all three converged PLAN-CHANGES-REQUIRED on r1 over the same
-  blocking finding: the gate fix breaks existing tests; r2 scopes that.)
+- **Revision:** r3 (CONVERGED / PLAN-READY). r1 → all three reviewers
+  PLAN-CHANGES-REQUIRED (same blocking finding: gate fix breaks existing tests).
+  r2 folded the full test enumeration + `#[allow(dead_code)]` + partial-fix
+  framing. r2 review → Claude SMR PLAN-READY, hostile reviewer A
+  PLAN-READY-WITH-NITS (count 9→10), hostile reviewer B PLAN-READY. r3 folds the
+  one accurate r2 nit (the 10th broken test, same single-edit fix). CONVERGED.
 - **Issues:** #2129 (MEDIUM, gating bug), #2130 (LOW, dead Rust code)
 - **Base:** origin/master `325d106838` (issue text says `5fa964c13`; the
   `pkg/flowexport`/`userspace-dp/src` files are **bit-identical** between the
@@ -316,7 +319,10 @@ forward-compat/rolling-upgrade case moot.
   be release-noted. No silent data-path change; export is observability only, so
   no traffic/forwarding risk.
 - **Tests (BLOCKING — convergent r1 finding from all three reviewers): the
-  §5.1 guard BREAKS 9 existing tests that encode the current buggy behavior.**
+  §5.1 guard BREAKS 10 existing tests that encode the current buggy behavior**
+  (r2 review refined the count from 9 → 10; the 10th,
+  `TestReconcileFlowExporterNoCallbackLeak` at :155, is fixed by the SAME single
+  helper edit — see below).
   The test work is NOT purely additive — the guard invalidates the foundational
   helper the entire v9-reconcile suite is built on. In-scope edits, verified
   against source:
@@ -338,9 +344,16 @@ forward-compat/rolling-upgrade case moot.
     also lacks `Version9`), `TestApplyConfigLockedReconcilesFlowExporters`
     (:254). Fix: add `Services.FlowMonitoring.Version9 = &config.NetFlowV9Config{
     Templates: map[string]*config.NetFlowV9Template{"t": {Name: "t"}}}` to
-    `flowSamplingConfig` (and `flowSamplingConfigSrc`) — ONE edit fixes all six.
-    (`TestReconcileFlowExporterNoCallbackLeak` at :155 — re-check after the
-    helper edit; it should follow the helper.)
+    `flowSamplingConfig` — ONE edit fixes all of them (`flowSamplingConfigSrc`
+    and `ipfixSamplingConfig` both wrap the base helper, so editing the base is
+    sufficient; the parenthetical mention of `flowSamplingConfigSrc` is
+    belt-and-suspenders, not a second edit).
+    `TestReconcileFlowExporterNoCallbackLeak` at :155 is the 10th broken test
+    (r2 review): it drives `ipfixSamplingConfig` and asserts `CallbackCount()==2`;
+    without `Version9` the v9 `BuildExportConfig` returns nil so the v9 callback
+    never registers (`flowCBOnce.Do` is only on the non-nil-ec path,
+    daemon_flowexport.go:178) → count is 1 → fail. The SAME base-helper edit
+    fixes it.
   - **New positive/negative cases to ADD:** "sampling + flow-server WITHOUT
     `version9` → nil v9 ExportConfig (no v9 exporter starts)" and "WITH
     `version9` → non-nil"; and a daemon-level case asserting that an

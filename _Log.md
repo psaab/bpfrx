@@ -7524,3 +7524,8 @@ top.
 - **Timestamp**: 2026-06-20
 - **Action**: Folded convergent PLAN-CHANGES-REQUIRED from Claude SMR + 2 hostile Claude reviewers. Blocking fix: enumerated the 9 existing tests the v9 gate breaks (3 BuildExportConfig(nil,..) + 6 via Version9-less flowSamplingConfig helper) as in-scope edits. Added #[allow(dead_code)] on snapshot.flow_export, sharpened partial-fix framing, concrete follow-up commitment, grep gate.
 - **File(s)**: docs/research/2129-2130-netflow/plan.md (r2), claude-smr-plan-r1.md, reviewer-r1-verdicts.md
+
+## 2026-06-20 — #2129+#2130 plan r3 CONVERGED (PLAN-READY)
+- **Timestamp**: 2026-06-20
+- **Action**: r2 review converged: Claude SMR PLAN-READY, hostile A PLAN-READY-WITH-NITS, hostile B PLAN-READY. Folded the one accurate r2 nit (10th broken test TestReconcileFlowExporterNoCallbackLeak, same single helper edit). Research STOPS at PLAN-READY.
+- **File(s)**: docs/research/2129-2130-netflow/plan.md (r3), claude-smr-plan-r2.md, reviewer-r2-verdicts.md
