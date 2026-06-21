@@ -215,6 +215,30 @@ type compileOpts struct {
 	// instead of silently ignored. Same doctrine as
 	// lenientVRRPTrackDuplicates / lenientLogProfileStreamRef.
 	lenientUnsupportedInterfaceStanzas bool
+
+	// lenientApplicationSpecs (#2142) downgrades the application-definition
+	// port/protocol gate (validateApplicationSpecsStrict) from a hard compile
+	// error to a cfg.Warnings entry. The strict commit / commit-check path
+	// hard-rejects a `set applications application <name>` whose
+	// destination-port / source-port is malformed (non-numeric, out of
+	// 1..65535, or an inverted low>high range) or whose protocol token is
+	// neither a known name, a junos-* alias, nor a 0..255 number. Such a spec
+	// was previously only WARNED (ValidateConfig): commit succeeded, the
+	// dataplane app-id compiler skipped the unparsable port (recording the
+	// AppID name first, then `continue`-ing past the bad port — a never-match
+	// AppID), and a policy referencing it failed CLOSED on permit / fell
+	// through OPEN on deny. The tolerant load / peer-sync paths downgrade to a
+	// warning so an already-persisted or peer-synced config carrying a bad app
+	// def still BOOTS (#1960 no-brick) — the dataplane independently skips the
+	// unparsable port, and the runtime #2124 capability gate
+	// (expandUserspacePolicyApplications) fails the snapshot closed
+	// (ForwardingSupported=false) for a referenced app it cannot represent, so
+	// a leniently-loaded bad app is inert rather than silently mis-matching.
+	// Commit stays strict so the operator's next edit fails loudly. This is an
+	// AST/typed-config compile decision and deliberately does NOT live in
+	// SchemaValidate (applications stay opaque there). Same doctrine as
+	// lenientPolicyMatchAddress / lenientNATHostMask.
+	lenientApplicationSpecs bool
 }
 
 // CompileConfig converts a parsed ConfigTree AST into a typed Config struct.
@@ -248,6 +272,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientNATPoolAlarmThreshold:       true,
 		lenientNATHostMask:                 true,
 		lenientUnsupportedInterfaceStanzas: true,
+		lenientApplicationSpecs:            true,
 	})
 }
 
@@ -332,6 +357,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientNATPoolAlarmThreshold:       true,
 		lenientNATHostMask:                 true,
 		lenientUnsupportedInterfaceStanzas: true,
+		lenientApplicationSpecs:            true,
 	})
 }
 
@@ -675,6 +701,26 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		if opts.lenientPolicyMatchAddress {
 			cfg.Warnings = append(cfg.Warnings,
 				fmt.Sprintf("policy match-address (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
+	// #2142 application-definition port/protocol fail-open gate. Strict on
+	// commit / commit-check (hard-reject a `set applications application` whose
+	// destination-port / source-port is malformed or whose protocol is unknown
+	// — such a spec was only warned, then compiled into a never-match AppID a
+	// referenced policy depends on, failing CLOSED on permit / OPEN on deny);
+	// lenient on load / peer-sync (warn so an already-persisted or peer-synced
+	// config carrying a bad app def still boots — the dataplane skips the bad
+	// port and the #2124 runtime capability gate fails closed for a referenced
+	// app it cannot represent). Reuses validatePortSpec / validateProtocol, the
+	// same config-layer validators that produced the warning, so no new
+	// divergent table is introduced.
+	if err := validateApplicationSpecsStrict(cfg); err != nil {
+		if opts.lenientApplicationSpecs {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("application spec (downgraded to warning on tolerant path): %v", err))
 		} else {
 			return nil, err
 		}
@@ -1127,6 +1173,135 @@ func validatePolicyMatchAddressesStrict(cfg *Config) error {
 		}
 	}
 	return nil
+}
+
+// validateApplicationSpecsStrict hard-rejects a user-defined application
+// (`set applications application <name> ...`) whose destination-port /
+// source-port is malformed (non-numeric, out of 1..65535, or an inverted
+// low>high range) or whose protocol token is not a known name, a junos-*
+// alias, or a 0..255 number (#2142) — but ONLY for applications that are
+// actually REFERENCED by a security policy, or for ALL applications when
+// `services application-identification` is enabled (every app then compiles
+// into the app-id catalog). Such a spec is accepted by ValidateConfig as a
+// WARNING only; commit succeeds, the dataplane app-id compiler records the
+// AppID name and then `continue`s past the unparsable port (a never-match
+// AppID), and a policy referencing the application fails CLOSED on a permit
+// rule or falls through OPEN on a deny rule. Failing the spec at commit turns
+// that silent semantic break into an operator-visible error.
+//
+// The referenced-only scope is deliberate (the issue's explicit
+// referenced-vs-unreferenced distinction): an UNREFERENCED, app-id-disabled
+// application definition compiles into nothing the dataplane can match against,
+// so its malformed spec cannot break a live policy decision — it stays a
+// warning so an operator iterating on a not-yet-wired application library is
+// not blocked, and so existing configs that carry an unreferenced app with a
+// port form the policy matcher cannot represent (e.g. a `source-port 0-N`
+// range, which Rust parse_port_spec rejects on low==0) still commit. The moment
+// such an app is referenced by a policy, or app-id is turned on, the gate
+// engages.
+//
+// It reuses validatePortSpec and validateProtocol — the same config-layer
+// validators that produce the warning in ValidateConfig — so no new divergent
+// port/protocol table is introduced (the dataplane's #2124 capability gate is
+// the runtime backstop, and these validators are a superset of what it admits).
+// Iteration is sorted by application name so the first-reported error is
+// deterministic across runs (Go map order is randomized).
+func validateApplicationSpecsStrict(cfg *Config) error {
+	if cfg == nil || len(cfg.Applications.Applications) == 0 {
+		return nil
+	}
+	toCheck := applicationsToValidateStrict(cfg)
+	if len(toCheck) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(toCheck))
+	for name := range toCheck {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		app := cfg.Applications.Applications[name]
+		if app == nil {
+			continue
+		}
+		if err := validatePortSpec(app.DestinationPort); err != nil {
+			return fmt.Errorf("application %q: destination-port: %w", name, err)
+		}
+		if err := validatePortSpec(app.SourcePort); err != nil {
+			return fmt.Errorf("application %q: source-port: %w", name, err)
+		}
+		if app.Protocol != "" {
+			if err := validateProtocol(app.Protocol); err != nil {
+				return fmt.Errorf("application %q: %w", name, err)
+			}
+		}
+	}
+	return nil
+}
+
+// applicationsToValidateStrict returns the set of user-defined application
+// names whose port/protocol spec is validated as a hard COMMIT error rather
+// than a warning. That is every user application referenced (directly, or as a
+// member of a referenced application-set) by a zone-pair or global security
+// policy, plus — when `services application-identification` is enabled — every
+// user application (app-id compiles them all into the catalog). It mirrors the
+// policy-reference walk in appid.CatalogNames; the logic is duplicated here
+// because pkg/appid imports pkg/config (so the compiler cannot call back into
+// appid without an import cycle). Predefined junos-* applications are never
+// returned — they are not in cfg.Applications.Applications and their specs are
+// owned by the predefined table, not the operator.
+func applicationsToValidateStrict(cfg *Config) map[string]struct{} {
+	out := make(map[string]struct{})
+	if cfg == nil {
+		return out
+	}
+	userApps := cfg.Applications.Applications
+	// app-id enabled: the catalog compiles every user application, so validate
+	// them all.
+	if cfg.Services.ApplicationIdentification {
+		for name := range userApps {
+			out[name] = struct{}{}
+		}
+		return out
+	}
+	addRef := func(appName string) {
+		if appName == "" || appName == "any" {
+			return
+		}
+		if _, isSet := cfg.Applications.ApplicationSets[appName]; isSet {
+			expanded, err := ExpandApplicationSet(appName, &cfg.Applications)
+			if err != nil {
+				return
+			}
+			for _, member := range expanded {
+				if _, isUser := userApps[member]; isUser {
+					out[member] = struct{}{}
+				}
+			}
+			return
+		}
+		if _, isUser := userApps[appName]; isUser {
+			out[appName] = struct{}{}
+		}
+	}
+	walk := func(policies []*Policy) {
+		for _, pol := range policies {
+			if pol == nil {
+				continue
+			}
+			for _, appName := range pol.Match.Applications {
+				addRef(appName)
+			}
+		}
+	}
+	for _, zpp := range cfg.Security.Policies {
+		if zpp == nil {
+			continue
+		}
+		walk(zpp.Policies)
+	}
+	walk(cfg.Security.GlobalPolicies)
+	return out
 }
 
 func policyMatchAddressError(scope, polName, field, addr string) error {
