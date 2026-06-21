@@ -8326,3 +8326,22 @@ top.
 - **File(s)**: test/incus/deploy-lib.sh, test/incus/deploy-lib-selftest.sh,
   test/incus/setup.sh, test/incus/cluster-setup.sh, Makefile, docs/test_env.md,
   CLAUDE.md
+
+- **Timestamp**: 2026-06-21
+- **Action**: #2158 P1 Go file-split — split pkg/configstore/store.go (2112
+  LOC, over the ~2000 modularity threshold) into six cohesive same-package
+  files per the converged plan section 5.3. Pure code-motion: no logic
+  change, no exported-API change, byte-identical runtime behavior. store.go
+  keeps the Store struct + New + node/cluster accessors + compile/schema
+  pipeline + SyncApply (419 LOC); store_persist.go (378), store_lock.go
+  (165), store_command.go (324), store_commit.go (580), store_format.go
+  (307). All files now well under threshold. Verified move-only (identical
+  103-func signature set, zero body lines removed, `go doc -all` byte
+  identical), no init-order risk (no package-level var/init in store.go),
+  build + vet + `go test ./pkg/configstore/... ./pkg/daemon/...` all green
+  unchanged from master. Regenerated docs/refactoring-audit-current.txt
+  (store.go drops off the heatmap); make audit-check clean.
+- **File(s)**: pkg/configstore/store.go (trimmed),
+  pkg/configstore/store_persist.go, pkg/configstore/store_lock.go,
+  pkg/configstore/store_command.go, pkg/configstore/store_commit.go,
+  pkg/configstore/store_format.go, docs/refactoring-audit-current.txt
