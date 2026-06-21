@@ -7854,3 +7854,28 @@ top.
   **File(s)**: userspace-dp/src/afxdp/frame/tcp.rs,
   userspace-dp/src/afxdp/frame/tcp_tests.rs,
   userspace-dp/src/afxdp/frame/README.md
+
+- **Timestamp**: 2026-06-21
+  **Action**: #2155 + #2156 VRRP cluster fixes (one PR, two commits).
+  #2155 — AF_PACKET RX IPv6 ext-header tolerance: cBPF IPv6 arm (untagged
+  + 802.1Q) now matches base Next-Header against {112,0,43,60,44}
+  (approach A2 — ordinary IPv6 data stays kernel-dropped on data-bearing
+  RETH VLANs); parseAfPacketIPv6 + its test mirror gain a bounded
+  walkIPv6ExtHeaders (HBH/Routing/Dest-Opts (HdrExtLen+1)*8, AH
+  (PayloadLen+2)*4, Fragment hard-drop, <=8 iter cap, per-step bounds
+  check). 12 new table/safety cases; ext-header acceptance + walk-safety
+  cases FAIL on pre-fix fixed-offset-40. #2156 — UpdateInstances VIP-
+  change restart reordered to build-before-teardown (open the replacement
+  socket BEFORE stopping the old instance; on failure keep the old
+  running, no orphan, no double-run, no phantom in m.instances so
+  RGVRRPReady stays truthful) + a 2s reconcileVRRPInstances re-drive from
+  reconcileRGStateLoop for bounded self-recovery. 4 new lifecycle seams
+  (resolveIface/openInstanceSocket/runInstance/stopInstance). 3 new
+  manager tests; both orphan tests FAIL on pre-fix teardown-first.
+  go build ./... clean at each commit boundary; go test + -race
+  pkg/vrrp + pkg/daemon green; 5x flake green. test-failover is
+  PENDING-PARENT (cluster busy). Plan: docs/research/2155-vrrp-cluster/plan.md.
+  **File(s)**: pkg/vrrp/manager.go, pkg/vrrp/instance.go,
+  pkg/vrrp/vrrp_test.go, pkg/vrrp/update_instances_test.go,
+  pkg/vrrp/README.md, pkg/daemon/daemon_ha.go,
+  docs/research/2155-vrrp-cluster/plan.md
