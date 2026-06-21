@@ -120,21 +120,26 @@ all files stay in `package ipsec`, so the public API is unchanged.
     gateway — `set security ike gateway <name> address <ip>` (or
     `dynamic hostname <fqdn>`). The shared accept predicate is
     `config.IsUsableIPsecEndpoint`.
-- **AES-GCM proposal ICV suffix + IKE PRF (#2125).** strongSwan has no
-  bare `aes<N>gcm` keyword — AEAD ciphers MUST carry an explicit ICV
-  length. `normalizeEncAlg` (`ike.go`) maps the Junos-native GCM names
-  (`aes-128-gcm`/`aes-192-gcm`/`aes-256-gcm`) to the 16-octet-ICV
-  swanctl tokens (`aes128gcm16`/`aes192gcm16`/`aes256gcm16` — Junos
-  AES-GCM uses a 16-octet ICV) before the generic dash-strip, so the
-  proposal builders no longer emit the unparseable `aes256gcm-modp2048`
-  that silently failed the SA at apply while the commit succeeded.
-  Already-suffixed forms (e.g. `aes256gcm128`) pass through unchanged.
-  For AEAD the integrity algorithm is dropped (GCM carries its own ICV)
-  and, for IKE (Phase 1) only, an explicit PRF is appended
-  (`aes256gcm16-prfsha256-modp2048`) because an AEAD proposal has no
-  integrity algorithm for strongSwan to derive a PRF from; the PRF
+- **AES-GCM IKE PRF + ICV-suffix canonicalization (#2125).** The
+  load-bearing fix: a strongSwan IKEv2 AEAD (AES-GCM) proposal MUST
+  name a PRF explicitly — an AEAD cipher carries no integrity algorithm
+  for strongSwan to derive a PRF from — so a GCM IKE (Phase 1) proposal
+  with no PRF is incomplete and the IKE SA fails to negotiate (a
+  silently-dead tunnel while the commit succeeds). The IKE builders now
+  append a PRF for GCM (`aes256gcm16-prfsha256-modp2048`); the PRF
   mirrors the proposal's auth algorithm when set, defaulting to
-  `prfsha256`. ESP children take no PRF.
+  `prfsha256`. ESP children take NO PRF (and no separate integrity alg —
+  GCM carries its own ICV). Separately, `normalizeEncAlg` (`ike.go`)
+  canonicalizes the Junos-native GCM names
+  (`aes-128-gcm`/`aes-192-gcm`/`aes-256-gcm`) to the explicit
+  16-octet-ICV swanctl tokens (`aes128gcm16`/`aes192gcm16`/`aes256gcm16`
+  — Junos AES-GCM uses a 16-octet ICV). This is a clarity/consistency
+  fix, NOT a parse fix: strongSwan also accepts the bare `aes<N>gcm`
+  alias (it maps to `ENCR_AES_GCM_ICV16` in
+  `proposal_keywords_static.txt`), so the previous `aes256gcm-modp2048`
+  ESP render was valid — the canonicalization just makes the ICV
+  explicit in the generated config. Already-suffixed forms (e.g.
+  `aes256gcm128`) pass through unchanged.
 - **swanctl double-quote / backslash escaping (#2126).** Free-text
   values interpolated inside a swanctl double-quoted string — the PSK
   `secret = "..."` and the `id = "..."` / `certs = "..."` lines — are

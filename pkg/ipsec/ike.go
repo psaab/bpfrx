@@ -172,12 +172,17 @@ func hasIKEChain(cfg *config.IPsecConfig, ikePolicyName string) bool {
 }
 
 // normalizeEncAlg maps a Junos encryption-algorithm name to its swanctl
-// token. For AES-GCM it returns the ICV-suffixed token strongSwan
-// requires (a bare "aes256gcm" is NOT a valid swanctl keyword — GCM
-// ciphers must carry an explicit ICV length). Junos AES-GCM uses a
-// 16-octet (128-bit) ICV, so aes-256-gcm -> aes256gcm16. isGCM reports
-// whether the algorithm is AEAD (the caller skips the integrity
-// algorithm for AEAD and, for IKE, appends an explicit PRF instead).
+// token. For AES-GCM it returns the explicit 16-octet-ICV token
+// (aes-256-gcm -> aes256gcm16). This is a canonicalization for clarity,
+// not a parse fix: strongSwan also accepts the bare "aes256gcm" alias
+// (it maps to ENCR_AES_GCM_ICV16 in proposal_keywords_static.txt), so
+// the previous bare render parsed fine — the suffix just makes the ICV
+// length explicit in the generated config, matching the operator's
+// Junos intent (Junos AES-GCM uses a 16-octet ICV). The load-bearing
+// #2125 correctness fix is the explicit IKE PRF the callers add for
+// AEAD, not this spelling. isGCM reports whether the algorithm is AEAD
+// (the caller skips the integrity algorithm for AEAD and, for IKE,
+// appends an explicit PRF instead).
 //
 // Already-suffixed forms (e.g. aes256gcm128 fed directly by config or
 // older tests) pass through the generic dash-strip unchanged so they

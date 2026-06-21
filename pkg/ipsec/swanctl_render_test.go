@@ -7,12 +7,16 @@ import (
 	"github.com/psaab/xpf/pkg/config"
 )
 
-// TestBuildESPProposal_JunosGCMSuffix is the #2125 regression: a
-// Junos-native GCM encryption-algorithm name must render to a swanctl
-// token WITH the 16-octet ICV suffix (aes256gcm16). Pre-fix the
-// normalizer only stripped "-cbc"/"-" and produced the bare,
-// unparseable token "aes256gcm" — so these assertions FAIL on the old
-// code (non-tautological).
+// TestBuildESPProposal_JunosGCMSuffix is the #2125 ESP-render
+// regression: a Junos-native GCM encryption-algorithm name renders to
+// the canonical 16-octet-ICV swanctl token (aes256gcm16). Pre-fix the
+// normalizer only stripped "-cbc"/"-" and produced the bare alias
+// "aes256gcm", so these assertions FAIL on the old code
+// (non-tautological). Note: the bare alias is ALSO valid strongSwan
+// (it maps to ENCR_AES_GCM_ICV16), so this test pins the explicit-ICV
+// spelling for clarity/consistency — it is not guarding against a parse
+// failure. (The parse-affecting #2125 fix is the IKE PRF, covered by
+// TestBuildIKEProposal_JunosGCMSuffixAndPRF below.)
 func TestBuildESPProposal_JunosGCMSuffix(t *testing.T) {
 	tests := []struct {
 		name string
@@ -158,9 +162,10 @@ func TestGenerateConfig_JunosGCM(t *testing.T) {
 	if !strings.Contains(got, "esp_proposals = aes256gcm16-modp2048") {
 		t.Errorf("expected ICV-suffixed GCM esp_proposals, got:\n%s", got)
 	}
-	// The broken bare form must NOT appear.
+	// The bare alias (valid strongSwan, but not the canonical spelling
+	// we now emit) must no longer appear.
 	if strings.Contains(got, "aes256gcm-modp2048") {
-		t.Errorf("rendered the invalid bare aes256gcm token:\n%s", got)
+		t.Errorf("rendered the bare aes256gcm alias instead of the canonical aes256gcm16:\n%s", got)
 	}
 }
 
@@ -241,6 +246,30 @@ func TestGenerateConfig_PSKWithBackslash(t *testing.T) {
 	}
 }
 
+// TestGenerateConfig_PSKTrailingBackslash is the adversarial corner a PSK
+// ending in a single backslash: it must render as a doubled backslash
+// (secret = "pass\\") so the trailing backslash does NOT escape the
+// closing quote. assertBalancedSecretQuotes is the lexer-accurate gate.
+func TestGenerateConfig_PSKTrailingBackslash(t *testing.T) {
+	m := &Manager{configDir: "/tmp", configPath: "/tmp/xpf.conf"}
+	cfg := &config.IPsecConfig{
+		VPNs: map[string]*config.IPsecVPN{
+			"site-a": {
+				LocalAddr:     "10.0.1.1",
+				Gateway:       "10.0.2.1",
+				PSK:           `pass\`,
+				BindInterface: "st0.0",
+			},
+		},
+		Proposals: map[string]*config.IPsecProposal{},
+	}
+	got := m.generateConfig(cfg)
+	if !strings.Contains(got, `secret = "pass\\"`) {
+		t.Errorf("expected trailing backslash doubled, got:\n%s", got)
+	}
+	assertBalancedSecretQuotes(t, got)
+}
+
 // TestGenerateConfig_IdentityWithCommaQuoted is the #2126 regression for
 // the identity lines: a distinguished-name identity with spaces/commas
 // must render quoted so swanctl parses it as a single value rather than
@@ -283,23 +312,33 @@ func assertBalancedSecretQuotes(t *testing.T, cfg string) {
 			continue
 		}
 		val := strings.TrimPrefix(trimmed, "secret = ")
-		if len(val) < 2 || val[0] != '"' || val[len(val)-1] != '"' {
-			t.Errorf("secret value not wrapped in quotes: %q", val)
+		if len(val) < 2 || val[0] != '"' {
+			t.Errorf("secret value not opened with a quote: %q", val)
 			continue
 		}
-		inner := val[1 : len(val)-1]
-		// Walk the inner string mimicking the swanctl lexer: a backslash
-		// escapes the next char; a bare double-quote would terminate the
-		// string early (i.e. unbalanced).
-		for i := 0; i < len(inner); i++ {
-			if inner[i] == '\\' {
+		// Walk from after the opening quote exactly as the swanctl lexer
+		// would: a backslash escapes the next char (so it can never
+		// terminate the string), and the FIRST unescaped double-quote is
+		// the real terminator. The line is balanced only if that
+		// terminator is the last character — catching both an unescaped
+		// interior quote (terminates early) and an odd trailing backslash
+		// run that escapes the would-be closing quote (e.g. `"foo\"`).
+		term := -1
+		for i := 1; i < len(val); i++ {
+			if val[i] == '\\' {
 				i++ // skip the escaped char
 				continue
 			}
-			if inner[i] == '"' {
-				t.Errorf("unescaped interior double-quote in secret: %q", val)
+			if val[i] == '"' {
+				term = i
 				break
 			}
+		}
+		switch {
+		case term == -1:
+			t.Errorf("secret value never closes (escaped/unterminated quote): %q", val)
+		case term != len(val)-1:
+			t.Errorf("secret value terminates before end of line (unescaped interior quote): %q", val)
 		}
 	}
 }
