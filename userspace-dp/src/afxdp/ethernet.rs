@@ -18,4 +18,12 @@ pub(super) const VLAN_TAG_LEN: usize = 4;
 /// EtherType constants.
 pub(super) const ETHERTYPE_ARP: u16 = 0x0806;
 pub(super) const ETHERTYPE_IPV6: u16 = 0x86DD;
+/// 802.1Q VLAN tag protocol identifier.
 pub(super) const ETHERTYPE_VLAN: u16 = 0x8100;
+/// 802.1ad (Q-in-Q / provider-bridging) service VLAN tag protocol
+/// identifier. A single 0x88a8 tag carries the same 4-byte TPID+TCI
+/// layout as 0x8100, so the L3 header sits at the same offset (18). The
+/// canonical L2 contract (see `frame/inspect.rs::frame_l3_offset` and
+/// `cos/ecn.rs::ethernet_l3`) treats both the same; the learning parser
+/// here must agree (#2150).
+pub(super) const ETHERTYPE_VLAN_8021AD: u16 = 0x88A8;
