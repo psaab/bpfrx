@@ -27,11 +27,168 @@ func (s *SessionSync) noteHelperMirrorResult(af string, warned *atomic.Bool, err
 	slog.Debug("cluster sync: repeated synced-session helper mirror failure", "af", af, "err", err)
 }
 
+// genGuardMapCap bounds the sender-side echo maps and the receiver-side
+// stored-generation maps so a churning workload cannot grow them without
+// limit. Both are evicted on delete; the cap is a safety valve for keys whose
+// delete never arrives (e.g. dropped close delta). It matches the delete
+// journal cap order-of-magnitude.
+const genGuardMapCap = 200000
+
+// nextInstallGen returns the next strictly-monotonic install generation.
+func (s *SessionSync) nextInstallGen() uint64 {
+	return s.genCounter.Add(1)
+}
+
+// stampInstallGenV4 assigns a fresh install generation to a v4 session being
+// sent and records it (keyed by wire key) so the matching delete can echo the
+// exact generation of the install it cancels (#2170 SMR fix #1). It mutates
+// val.Generation in place. A re-send (sweep/bulk) of a live key intentionally
+// bumps the generation: the per-key stored generation only ever climbs, so a
+// journaled delete from before the re-send is strictly older and refused.
+func (s *SessionSync) stampInstallGenV4(key dataplane.SessionKey, val *dataplane.SessionValue) {
+	g := s.nextInstallGen()
+	val.Generation = g
+	s.genSentMu.Lock()
+	if s.genSentV4 == nil || len(s.genSentV4) >= genGuardMapCap {
+		s.genSentV4 = make(map[dataplane.SessionKey]uint64)
+	}
+	s.genSentV4[key] = g
+	s.genSentMu.Unlock()
+}
+
+func (s *SessionSync) stampInstallGenV6(key dataplane.SessionKeyV6, val *dataplane.SessionValueV6) {
+	g := s.nextInstallGen()
+	val.Generation = g
+	s.genSentMu.Lock()
+	if s.genSentV6 == nil || len(s.genSentV6) >= genGuardMapCap {
+		s.genSentV6 = make(map[dataplane.SessionKeyV6]uint64)
+	}
+	s.genSentV6[key] = g
+	s.genSentMu.Unlock()
+}
+
+// takeDeleteGenV4 returns the generation last stamped for this wire key and
+// evicts the entry, so a delete carries the exact generation of the install it
+// cancels. A key never installed in this boot returns 0 (legacy fallback →
+// unconditional delete in the apply guard), which is the safe behavior.
+func (s *SessionSync) takeDeleteGenV4(key dataplane.SessionKey) uint64 {
+	s.genSentMu.Lock()
+	defer s.genSentMu.Unlock()
+	g := s.genSentV4[key]
+	delete(s.genSentV4, key)
+	return g
+}
+
+func (s *SessionSync) takeDeleteGenV6(key dataplane.SessionKeyV6) uint64 {
+	s.genSentMu.Lock()
+	defer s.genSentMu.Unlock()
+	g := s.genSentV6[key]
+	delete(s.genSentV6, key)
+	return g
+}
+
+// installGenGuardV4 implements the receiver-side install-side guard (#2170 SMR
+// fix #2): refuse to overwrite a stored entry with a strictly-older-generation
+// install so the per-key stored generation never regresses. Returns the
+// generation to record on a successful apply (the incoming generation, or the
+// preserved stored generation when the incoming one is 0). The bool reports
+// whether the install should proceed.
+func (s *SessionSync) installGenGuardV4(key dataplane.SessionKey, incoming uint64) (record uint64, apply bool) {
+	s.recvGenMu.Lock()
+	defer s.recvGenMu.Unlock()
+	stored, ok := s.recvGenV4[key]
+	if ok && stored != 0 && incoming != 0 && incoming < stored {
+		return 0, false
+	}
+	if incoming == 0 {
+		// Legacy / unknown install: apply but keep the stored generation
+		// (do not roll it back to 0).
+		return stored, true
+	}
+	return incoming, true
+}
+
+func (s *SessionSync) installGenGuardV6(key dataplane.SessionKeyV6, incoming uint64) (record uint64, apply bool) {
+	s.recvGenMu.Lock()
+	defer s.recvGenMu.Unlock()
+	stored, ok := s.recvGenV6[key]
+	if ok && stored != 0 && incoming != 0 && incoming < stored {
+		return 0, false
+	}
+	if incoming == 0 {
+		return stored, true
+	}
+	return incoming, true
+}
+
+// recordInstalledGenV4 stores the per-key generation after a successful
+// install-apply, bounded by genGuardMapCap.
+func (s *SessionSync) recordInstalledGenV4(key dataplane.SessionKey, gen uint64) {
+	if gen == 0 {
+		return
+	}
+	s.recvGenMu.Lock()
+	if s.recvGenV4 == nil || len(s.recvGenV4) >= genGuardMapCap {
+		s.recvGenV4 = make(map[dataplane.SessionKey]uint64)
+	}
+	s.recvGenV4[key] = gen
+	s.recvGenMu.Unlock()
+}
+
+func (s *SessionSync) recordInstalledGenV6(key dataplane.SessionKeyV6, gen uint64) {
+	if gen == 0 {
+		return
+	}
+	s.recvGenMu.Lock()
+	if s.recvGenV6 == nil || len(s.recvGenV6) >= genGuardMapCap {
+		s.recvGenV6 = make(map[dataplane.SessionKeyV6]uint64)
+	}
+	s.recvGenV6[key] = gen
+	s.recvGenMu.Unlock()
+}
+
+// deleteGenGuardV4 implements the receiver-side delete guard (#2170): a delete
+// is refused only when both the stored and delete generations are non-zero and
+// the delete generation is STRICTLY older than the stored entry's. Equality
+// applies (it is the delete of the very session installed); gen==0 on either
+// side falls back to today's unconditional delete (rolling-upgrade safe). On
+// an applied delete the stored generation is evicted. The bool reports whether
+// the delete should proceed.
+func (s *SessionSync) deleteGenGuardV4(key dataplane.SessionKey, deleteGen uint64) bool {
+	s.recvGenMu.Lock()
+	defer s.recvGenMu.Unlock()
+	stored := s.recvGenV4[key]
+	if stored != 0 && deleteGen != 0 && deleteGen < stored {
+		return false
+	}
+	delete(s.recvGenV4, key)
+	return true
+}
+
+func (s *SessionSync) deleteGenGuardV6(key dataplane.SessionKeyV6, deleteGen uint64) bool {
+	s.recvGenMu.Lock()
+	defer s.recvGenMu.Unlock()
+	stored := s.recvGenV6[key]
+	if stored != 0 && deleteGen != 0 && deleteGen < stored {
+		return false
+	}
+	delete(s.recvGenV6, key)
+	return true
+}
+
 func (s *SessionSync) installClusterSyncedV4(key dataplane.SessionKey, val dataplane.SessionValue) {
 	if s.sessions == nil {
 		return
 	}
+	record, apply := s.installGenGuardV4(key, val.Generation)
+	if !apply {
+		s.stats.InstallsStaleIgnored.Add(1)
+		slog.Debug("cluster sync: ignored stale-generation v4 install",
+			"incoming_gen", val.Generation)
+		return
+	}
 	if err := s.sessions.PutClusterSyncedV4(key, val); err == nil {
+		s.recordInstalledGenV4(key, record)
 		s.stats.SessionsInstalled.Add(1)
 		s.noteHelperMirrorResult("v4", &s.sessionMirrorWarnedV4, nil)
 		if val.IsReverse == 0 && s.OnForwardSessionInstalled != nil {
@@ -46,7 +203,15 @@ func (s *SessionSync) installClusterSyncedV6(key dataplane.SessionKeyV6, val dat
 	if s.sessions == nil {
 		return
 	}
+	record, apply := s.installGenGuardV6(key, val.Generation)
+	if !apply {
+		s.stats.InstallsStaleIgnored.Add(1)
+		slog.Debug("cluster sync: ignored stale-generation v6 install",
+			"incoming_gen", val.Generation)
+		return
+	}
 	if err := s.sessions.PutClusterSyncedV6(key, val); err == nil {
+		s.recordInstalledGenV6(key, record)
 		s.stats.SessionsInstalled.Add(1)
 		s.noteHelperMirrorResult("v6", &s.sessionMirrorWarnedV6, nil)
 		if val.IsReverse == 0 && s.OnForwardSessionInstalled != nil {
@@ -57,8 +222,14 @@ func (s *SessionSync) installClusterSyncedV6(key dataplane.SessionKeyV6, val dat
 	}
 }
 
-func (s *SessionSync) deleteClusterSyncedV4(key dataplane.SessionKey) {
+func (s *SessionSync) deleteClusterSyncedV4(key dataplane.SessionKey, deleteGen uint64) {
 	if s.sessions == nil {
+		return
+	}
+	if !s.deleteGenGuardV4(key, deleteGen) {
+		s.stats.DeletesStaleIgnored.Add(1)
+		slog.Debug("cluster sync: ignored stale-generation v4 delete (replacement session survives)",
+			"delete_gen", deleteGen)
 		return
 	}
 	if err := s.sessions.DeleteWithCompanionsV4(key, dataplane.DeleteReasonClusterStale); err != nil {
@@ -67,8 +238,14 @@ func (s *SessionSync) deleteClusterSyncedV4(key dataplane.SessionKey) {
 	}
 }
 
-func (s *SessionSync) deleteClusterSyncedV6(key dataplane.SessionKeyV6) {
+func (s *SessionSync) deleteClusterSyncedV6(key dataplane.SessionKeyV6, deleteGen uint64) {
 	if s.sessions == nil {
+		return
+	}
+	if !s.deleteGenGuardV6(key, deleteGen) {
+		s.stats.DeletesStaleIgnored.Add(1)
+		slog.Debug("cluster sync: ignored stale-generation v6 delete (replacement session survives)",
+			"delete_gen", deleteGen)
 		return
 	}
 	if err := s.sessions.DeleteWithCompanionsV6(key, dataplane.DeleteReasonClusterStale); err != nil {
@@ -401,6 +578,7 @@ func (s *SessionSync) syncSweep() int {
 			return true
 		}
 		if val.Created >= threshold && s.ShouldSyncZone(val.IngressZone) {
+			s.stampInstallGenV4(key, &val)
 			msg := encodeSessionV4(key, val)
 			if s.queueMessage(msg, &s.stats.SessionsSent, "sweep_v4") {
 				count++
@@ -419,6 +597,7 @@ func (s *SessionSync) syncSweep() int {
 			return true
 		}
 		if val.Created >= threshold && s.ShouldSyncZone(val.IngressZone) {
+			s.stampInstallGenV6(key, &val)
 			msg := encodeSessionV6(key, val)
 			if s.queueMessage(msg, &s.stats.SessionsSent, "sweep_v6") {
 				count++
@@ -498,22 +677,30 @@ func (s *SessionSync) queueMessage(msg []byte, sentCounter *atomic.Uint64, sourc
 	}
 }
 
-// QueueSessionV4 queues a v4 session for synchronization to the peer.
+// QueueSessionV4 queues a v4 session for synchronization to the peer. The
+// session is stamped with a fresh #2170 install generation so the matching
+// delete can echo it and the peer can refuse a stale superseded delete.
 func (s *SessionSync) QueueSessionV4(key dataplane.SessionKey, val dataplane.SessionValue) {
+	s.stampInstallGenV4(key, &val)
 	msg := encodeSessionV4(key, val)
 	s.queueMessage(msg, &s.stats.SessionsSent, "session_v4")
 }
 
 // QueueSessionV6 queues a v6 session for synchronization to the peer.
 func (s *SessionSync) QueueSessionV6(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) {
+	s.stampInstallGenV6(key, &val)
 	msg := encodeSessionV6(key, val)
 	s.queueMessage(msg, &s.stats.SessionsSent, "session_v6")
 }
 
 // QueueDeleteV4 queues a v4 session deletion for synchronization. If the peer
-// is disconnected, the delete is journaled for replay on reconnect.
+// is disconnected, the delete is journaled for replay on reconnect. The delete
+// echoes the install generation last stamped for this key (#2170) so a
+// journaled delete that replays after a same-key replacement was re-synced is
+// refused by the peer (its generation is strictly older than the live entry).
 func (s *SessionSync) QueueDeleteV4(key dataplane.SessionKey) {
-	msg := encodeDeleteV4(key)
+	gen := s.takeDeleteGenV4(key)
+	msg := encodeDeleteV4(key, gen)
 	if !s.queueMessage(msg, &s.stats.DeletesSent, "delete_v4") {
 		s.journalDelete(msg)
 	}
@@ -522,7 +709,8 @@ func (s *SessionSync) QueueDeleteV4(key dataplane.SessionKey) {
 // QueueDeleteV6 queues a v6 session deletion for synchronization. If the peer
 // is disconnected, the delete is journaled for replay on reconnect.
 func (s *SessionSync) QueueDeleteV6(key dataplane.SessionKeyV6) {
-	msg := encodeDeleteV6(key)
+	gen := s.takeDeleteGenV6(key)
+	msg := encodeDeleteV6(key, gen)
 	if !s.queueMessage(msg, &s.stats.DeletesSent, "delete_v6") {
 		s.journalDelete(msg)
 	}
@@ -907,7 +1095,13 @@ func (s *SessionSync) handleMessage(conn net.Conn, msgType uint8, payload []byte
 			key.SrcPort = binary.LittleEndian.Uint16(payload[8:10])
 			key.DstPort = binary.LittleEndian.Uint16(payload[10:12])
 			key.Protocol = payload[12]
-			s.deleteClusterSyncedV4(key)
+			// #2170: length-gated trailing install generation (absent on a
+			// legacy peer → 0 → unconditional delete in the apply guard).
+			var gen uint64
+			if len(payload) >= 24 {
+				gen = binary.LittleEndian.Uint64(payload[16:24])
+			}
+			s.deleteClusterSyncedV4(key, gen)
 		}
 	case syncMsgDeleteV6:
 		s.stats.DeletesReceived.Add(1)
@@ -918,7 +1112,12 @@ func (s *SessionSync) handleMessage(conn net.Conn, msgType uint8, payload []byte
 			key.SrcPort = binary.LittleEndian.Uint16(payload[32:34])
 			key.DstPort = binary.LittleEndian.Uint16(payload[34:36])
 			key.Protocol = payload[36]
-			s.deleteClusterSyncedV6(key)
+			// #2170: length-gated trailing install generation.
+			var gen uint64
+			if len(payload) >= 48 {
+				gen = binary.LittleEndian.Uint64(payload[40:48])
+			}
+			s.deleteClusterSyncedV6(key, gen)
 		}
 	case syncMsgBulkStart:
 		var epoch uint64
