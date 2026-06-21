@@ -3206,3 +3206,75 @@ fn expire_fabric_ingress_ages_normally() {
     assert_eq!(expired.len(), 1, "fabric_ingress synced must age");
     assert_eq!(table.last_pop_stats().held_standby, 0);
 }
+
+#[test]
+fn expire_hold_does_not_poison_selfheal_under_epoch_skew() {
+    // REGRESSION (Codex MAJOR): the worker reads the HA map and the
+    // rg_epochs counter separately, so a HOLD can observe an OLD (still
+    // inactive) map together with a NEW (already bumped) epoch -- the
+    // old-map/new-epoch skew. The HOLD must NOT stamp seen_rg_epoch with
+    // that new epoch; if it did, the NEXT pass (which sees the new ACTIVE
+    // map + the same new epoch) would find current_epoch == seen_rg_epoch
+    // and SKIP the self-heal, aging the very synced session this gate
+    // exists to preserve.
+    let mut table = SessionTable::new();
+    let key = key_v4();
+    let then = 1_000_000_000u64;
+    install_synced_tcp(&mut table, &key, 1, then); // seen_rg_epoch = 0
+    // Skewed HOLD pass: node still reports NOT forwarding RG1 (old map),
+    // but epoch_of already returns the bumped value 7 (new epoch).
+    table.last_gc_ns = then;
+    let t1 = then + 302_000_000_000;
+    let expired = run_expire_ha(&mut table, t1, &[], &|_| 7);
+    assert!(expired.is_empty(), "skewed hold must still hold");
+    assert_eq!(table.last_pop_stats().held_standby, 1);
+    // Next pass: the new ACTIVE map is now visible (node forwards RG1) and
+    // the epoch is the same 7. With the fix, seen_rg_epoch is still 0
+    // (HOLD did not stamp it), so current(7) != seen(0) -> SELF-HEAL.
+    // Pre-fix (HOLD stamps seen=7) this would AGE -> failover drop.
+    table.last_gc_ns = t1;
+    let t2 = t1 + 2_000_000_000;
+    let expired = run_expire_ha(&mut table, t2, &[1], &|_| 7);
+    assert!(
+        expired.is_empty(),
+        "self-heal must fire despite the skewed hold having seen epoch 7"
+    );
+    assert_eq!(
+        table.last_pop_stats().healed_on_promote,
+        1,
+        "the skewed-hold session must self-heal, not age"
+    );
+}
+
+#[test]
+fn promotion_refresh_with_nonzero_epoch_ages_after_one_selfheal() {
+    // Companion to promotion_restamps_held_session with a PRODUCTION
+    // non-zero activation epoch (Codex Medium): refresh_for_ha_transition
+    // resets seen_rg_epoch to 0, so an IDLE active-owned session self-heals
+    // exactly ONCE (bounded one-shot extra retention) and then ages -- it
+    // never lives forever and the over-retention is one timeout.
+    let mut table = SessionTable::new();
+    let key = key_v4();
+    let then = 1_000_000_000u64;
+    install_synced_tcp(&mut table, &key, 1, then);
+    // Hold while inactive.
+    table.last_gc_ns = then;
+    let t1 = then + 302_000_000_000;
+    assert!(run_expire_ha(&mut table, t1, &[], &|_| 0).is_empty());
+    // RefreshOwnerRGS lands -> re-stamp, seen_rg_epoch reset to 0.
+    let mut md = metadata();
+    md.owner_rg_id = 1;
+    assert!(table.refresh_for_ha_transition(&key, decision(), md, t1 + 1_000_000));
+    // Active node, production epoch 5. First idle expiry: current(5) !=
+    // seen(0) -> one self-heal (bounded one-shot).
+    table.last_gc_ns = t1 + 1_000_000;
+    let t2 = t1 + 1_000_000 + 302_000_000_000;
+    let expired = run_expire_ha(&mut table, t2, &[1], &|_| 5);
+    assert!(expired.is_empty(), "one bounded self-heal after refresh");
+    assert_eq!(table.last_pop_stats().healed_on_promote, 1);
+    // Second idle expiry: current(5) == seen(5, just stamped) -> AGE.
+    table.last_gc_ns = t2;
+    let t3 = t2 + 302_000_000_000;
+    let expired = run_expire_ha(&mut table, t3, &[1], &|_| 5);
+    assert_eq!(expired.len(), 1, "ages on the next pass -- no perpetual re-stamp");
+}

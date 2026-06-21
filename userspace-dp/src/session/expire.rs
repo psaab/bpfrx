@@ -208,12 +208,29 @@ impl SessionTable {
                                 self.rebucket_alive_entry(&key, now_ns);
                                 continue;
                             }
-                            StandbyGateDecision::Hold { new_epoch } => {
+                            StandbyGateDecision::Hold => {
                                 if let Some(em) = self.entry_by_key_mut(&key) {
                                     if em.first_held_ns == 0 {
                                         em.first_held_ns = now_ns;
                                     }
-                                    em.seen_rg_epoch = new_epoch;
+                                    // #2120 (Codex MAJOR): do NOT stamp
+                                    // seen_rg_epoch here. The worker reads the
+                                    // HA map (loop_body:491) and the rg_epochs
+                                    // counter (epoch_of) separately, so a HOLD
+                                    // can observe an OLD map (forwards_here =
+                                    // false) together with a NEW (already
+                                    // bumped) epoch. Stamping that new epoch
+                                    // would make the NEXT pass — which sees the
+                                    // new ACTIVE map — find current_epoch ==
+                                    // seen_rg_epoch and SKIP the self-heal,
+                                    // aging the very synced session this gate
+                                    // exists to preserve. Leaving seen_rg_epoch
+                                    // at its install/refresh value guarantees
+                                    // the first forwarding pass after ANY
+                                    // activation that bumped the epoch fires the
+                                    // self-heal (current != seen); the self-heal
+                                    // arm then records the epoch so it does not
+                                    // re-fire perpetually.
                                 }
                                 self.last_pop_stats.held_standby += 1;
                                 self.rebucket_alive_entry(&key, now_ns);
@@ -422,9 +439,10 @@ impl SessionTable {
             if held_ns > ha.stale_ceiling_ns(expires_after_ns) {
                 return StandbyGateDecision::ReapStaleSynced;
             }
-            return StandbyGateDecision::Hold {
-                new_epoch: current_epoch,
-            };
+            // NOTE: Hold deliberately carries NO epoch — the caller must
+            // NOT stamp seen_rg_epoch on a hold (see the Hold arm + the
+            // Codex old-map/new-epoch race note there).
+            return StandbyGateDecision::Hold;
         }
 
         // (3) AGE. Distinguish the known active/active owner_rg_id<=0
@@ -445,8 +463,10 @@ enum StandbyGateDecision {
     /// has just started forwarding the RG (promotion self-heal edge).
     SelfHeal { new_epoch: u32 },
     /// Keep alive without re-stamping `last_seen_ns`; this node does not
-    /// forward the session. Arms `first_held_ns` and records `new_epoch`.
-    Hold { new_epoch: u32 },
+    /// forward the session. Arms `first_held_ns`. Deliberately carries NO
+    /// epoch: stamping `seen_rg_epoch` on a hold would poison the
+    /// self-heal edge under the old-map/new-epoch read skew (Codex MAJOR).
+    Hold,
     /// Reap a held entry that crossed the stale-synced ceiling (bounded
     /// lost-primary-delete leak).
     ReapStaleSynced,
