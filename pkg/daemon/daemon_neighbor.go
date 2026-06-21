@@ -344,7 +344,19 @@ func (d *Daemon) cleanFailedNeighbors() int {
 	// traffic to trigger NDP.
 	for _, p := range probes {
 		if p.ip.To4() != nil {
-			cluster.SendARPProbe(p.iface, p.ip)
+			// Neighbor-table reprobe (not a VIP move): use the interface
+			// primary as the ARP sender, preserving the self-resolved
+			// sender SendARPProbe used before #2152.
+			sender, perr := cluster.PrimaryIPv4(p.iface)
+			if perr != nil {
+				slog.Debug("failed-neighbor reprobe: no IPv4 sender",
+					"iface", p.iface, "ip", p.ip, "err", perr)
+				continue
+			}
+			if err := cluster.SendARPProbe(p.iface, sender, p.ip); err != nil {
+				slog.Debug("failed-neighbor reprobe: IPv4 ARP probe failed",
+					"iface", p.iface, "ip", p.ip, "err", err)
+			}
 		} else {
 			if err := cluster.SendNDSolicitationFromInterface(p.iface, p.ip); err != nil {
 				slog.Debug("failed-neighbor reprobe: IPv6 NS failed",
