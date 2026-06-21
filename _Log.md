@@ -7536,6 +7536,6 @@ top.
   - `docs/session-sync-architecture.md` — Delete Journal replay/retention +
     key-only-delete residual exposure note.
   - `docs/pr/2121-flushdeletejournal-requeue/plan.md` — plan v1→v5.1.
-- **Validation**: `go test -race ./pkg/cluster/` green; new tests 5/5 flake;
+- **Validation**: `go test -race ./pkg/cluster/` green; new tests 5/5 pass (flake-free);
   regression tests verified FAIL against pre-fix (silent drop); `go build ./...`
   clean; full `go test ./...` green. Control-plane HA fix — no dataplane smoke.

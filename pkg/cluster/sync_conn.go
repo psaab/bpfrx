@@ -573,8 +573,13 @@ func (s *SessionSync) flushDeleteJournal() {
 		// during the flush) and stop. Stopping keeps the un-sent suffix
 		// contiguous and ordered; they replay on the next reconnect flush.
 		s.rejournalTail(journal[i:])
+		// "unsent_tail" is the count handed to rejournalTail; some of those
+		// may still be evicted there if the journal is over cap — that loss is
+		// counted in DeletesDropped (logged here as the running total), so
+		// this field is the tail size, not a guarantee that all were retained.
 		slog.Warn("cluster sync: delete journal flush could not enqueue (queue full or disconnected), re-journaled un-sent tail for next reconnect",
-			"total", len(journal), "flushed", flushed, "rejournaled", len(journal)-i,
+			"total", len(journal), "flushed", flushed, "unsent_tail", len(journal)-i,
+			"deletes_dropped_total", s.stats.DeletesDropped.Load(),
 			"connected", s.stats.Connected.Load(),
 			"queue_len", len(s.sendCh), "queue_cap", cap(s.sendCh))
 		return
@@ -586,10 +591,13 @@ func (s *SessionSync) flushDeleteJournal() {
 // delete journal so it replays before any deletes that were concurrently
 // journaled (by QueueDeleteV4/V6) while the flush ran, preserving FIFO
 // order. On overflow it drops the OLDEST entries from the front of the
-// merged list — never the newer concurrently-journaled deletes — and
-// counts the dropped entries in DeletesDropped. Acquires deleteJournalMu
-// exactly once. Used by flushDeleteJournal when the send stream is full or
-// disconnected; the retained deletes replay on the next reconnect flush.
+// merged list (the tail is older than the concurrently-journaled deletes,
+// so the tail is evicted first; only if the entire tail is dropped does it
+// also evict the oldest of the concurrent deletes, e.g. when the journal
+// was already at cap), counting the dropped entries in DeletesDropped.
+// Acquires deleteJournalMu exactly once. Used by flushDeleteJournal when
+// the send stream is full or disconnected; the retained deletes replay on
+// the next reconnect flush.
 func (s *SessionSync) rejournalTail(tail [][]byte) {
 	if len(tail) == 0 {
 		return

@@ -250,8 +250,12 @@ The journal is replayed when the next first-post-disconnect connection comes up,
 before `OnPeerConnected` and before the fresh bulk starts.
 
 Replay goes through the ordered send channel (`queueMessage`), so a delete that
-is delivered stays ordered behind any session frames already queued for the
-peer. If the send queue is full (or the peer disconnects) mid-replay,
+is delivered stays ordered behind any session frames already queued in `sendCh`
+for the peer. (Note: cold-start bulk sync direct-writes session frames under
+`writeMu` rather than via `sendCh`, so flush-vs-bulk wire order is not strictly
+guaranteed; flush still completes — enqueueing all deletes — before bulk
+starts, and a live session landing after a stale delete is the safe direction.)
+If the send queue is full (or the peer disconnects) mid-replay,
 `flushDeleteJournal` does **not** drop the un-sent deletes: it re-journals the
 un-sent tail at the front of the ring (FIFO-preserving, evicting the oldest on
 overflow) so they replay on the next reconnect flush — the same
