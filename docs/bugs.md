@@ -190,6 +190,12 @@
 - **Fix (pkg/config/compiler_security.go):** Merge all `address` nodes by name; derive the prefix from `Keys[2]` ONLY when it parses as a CIDR/IP (`looksLikeIPOrCIDR`), otherwise from a bare-leaf child (hierarchical block prefix); route `description` into a new `Address.Description` field so a non-prefix sub-stanza can never clobber `Value`. Handles both AST shapes and either sub-stanza ordering.
 - **Tests:** `TestAddressBookDescriptionPrefix` (dual-AST × ordering table) + `TestAddressBookDescriptionResolvesInPolicy` in `parser_security_test.go`.
 
+### Address-book empty-prefix entry not warn-flagged (#2229, FIXED)
+- **Symptom:** After #2228 an address-book `address <name>` entry with no compilable prefix — either no prefix at all (description-only) or only an as-yet-uncompiled sub-stanza (`dns-name`/`range-address`/`wildcard-address`) — compiles to `Value==""`. This is fail-closed and safe at resolution (`net.ParseCIDR("")` errors → the address matches nothing → policies referencing it deny), so it is NOT a security bug. But `ValidateConfig` only flagged `invalid address` on a NON-empty unparseable `Value`, so a prefix-less entry produced no commit-time warning at all — an operator authoring error (forgetting the prefix) went silent.
+- **Root cause:** The address-book warn loop in `compiler_validate_warn.go` guarded the parse with `if entry.Value != ""`, so the empty case fell straight through with no warning.
+- **Fix (pkg/config/compiler_validate_warn.go):** Emit a non-blocking warning for an `address` entry whose compiled `Value` is empty — `address-book "X": no usable prefix configured; it will match nothing`. This is a WARNING, never a hard reject: an empty-prefix address never forwarded and rejecting it would brick existing configs. `dns-name`/`range-address`/`wildcard-address` remain uncompiled (separate pre-existing gap) and genuinely resolve to nothing today, so the warning is correct to flag them too.
+- **Tests:** `TestAddressBookEmptyValueWarns` (dual-AST: flat-set description-only, hierarchical description-only, flat-set `dns-name` sub-stanza all warn; flat-set + hierarchical valid prefix do NOT warn; commit succeeds in every case) in `parser_security_test.go`.
+
 ### iter.Next(&key, nil) crash
 - cilium/ebpf v0.20 panics when iterating non-empty maps with nil value pointer
 - **Fix:** Always use `var val []byte; iter.Next(&key, &val)`

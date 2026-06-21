@@ -199,12 +199,24 @@ func ValidateConfig(cfg *Config) []string {
 	// Validate address-book entries have valid CIDR or IP formats
 	if ab := cfg.Security.AddressBook; ab != nil {
 		for name, entry := range ab.Addresses {
-			if entry.Value != "" {
-				if _, _, err := net.ParseCIDR(entry.Value); err != nil {
-					if net.ParseIP(entry.Value) == nil {
-						warnings = append(warnings, fmt.Sprintf(
-							"address-book %q: invalid address %q", name, entry.Value))
-					}
+			if entry.Value == "" {
+				// An `address <name>` entry with no compiled prefix —
+				// either no prefix at all, or only an as-yet-uncompiled
+				// sub-stanza (dns-name/range-address/wildcard-address) —
+				// resolves to nothing: net.ParseCIDR("") errors at match
+				// time, so every policy referencing it denies (fail-closed,
+				// #2229). That is safe but silent, so surface the operator
+				// authoring error at commit. This is a WARNING, never a
+				// hard reject: an empty-prefix address never forwarded and
+				// rejecting it would brick existing configs.
+				warnings = append(warnings, fmt.Sprintf(
+					"address-book %q: no usable prefix configured; it will match nothing", name))
+				continue
+			}
+			if _, _, err := net.ParseCIDR(entry.Value); err != nil {
+				if net.ParseIP(entry.Value) == nil {
+					warnings = append(warnings, fmt.Sprintf(
+						"address-book %q: invalid address %q", name, entry.Value))
 				}
 			}
 		}
