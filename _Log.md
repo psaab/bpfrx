@@ -1,5 +1,39 @@
 # Action Log
 
+## 2026-06-21 — #2170 (PR #2198) fold: gen-map overflow, cross-boot regression, atomicity note
+
+- **Timestamp**: 2026-06-21
+- **Action**: Folded the independent review's three findings into the #2170
+  HA session-sync install-generation guard PR.
+  **F1 (MAJOR — reintroduced the #2170 bug under churn):** the generation
+  maps (`genSentV4/V6`, `recvGenV4/V6`) cleared the WHOLE map on reaching
+  `genGuardMapCap` (200000, reachable inside the 10M MaxSessions envelope),
+  dropping every live key's stored generation and disabling the guard
+  cluster-wide for a churn window — a stale delete could then kill a live
+  re-established session. Fix: `putGenBounded[K]` generic helper — NEVER
+  clears; updates an existing key in place, skip-records a new key at cap
+  (degrades to safe gen-0) and bumps the new `GenMapOverflow` counter.
+  **F2 (MINOR — cross-boot stale-RETAIN, inverse of #2170):** `genCounter`
+  seeded from `MonotonicNanos()` resets at OS reboot, so a rebooted peer's
+  cold-start bulk re-prime carries lower generations and the install guard
+  refused it as stale. Fix: receiver resets `recvGenV4/V6` on
+  `syncMsgBulkStart` (`resetRecvGen`) so the authoritative bulk re-prime
+  lands and re-records fresh generations; safe because deletes only act at
+  `BulkEnd`. Seed comment in `initGenState` rewritten to match.
+  **F3 (MINOR):** documented that the check->Put->record apply sequence is
+  not held under one `recvGenMu` acquisition and why it is safe (per-peer
+  receive path is single-threaded over the single active fabric).
+- **File(s)**: pkg/cluster/sync_conn.go, pkg/cluster/sync.go,
+  pkg/cluster/sync_gen_guard_test.go, docs/sync-protocol.md,
+  pkg/cluster/README.md
+- **Validation**: new F1 hazard test (`TestGenMapOverflowKeepsLiveKeyV4`),
+  F1 semantics test (`TestRecordInstalledGenSkipsNewKeyOnFull`), and F2
+  test (`TestPeerRebootBulkRePrimeAcceptedAfterReset`) all FAIL pre-fix
+  (proven by temporarily neutralizing the behavior) and PASS post-fix.
+  `go build ./...` clean; `go test ./pkg/cluster/... ./pkg/conntrack/...`
+  green; `go test -race ./pkg/cluster/... -count=3` clean. Existing tests
+  untouched and green. No wire-format or Rust-helper change.
+
 ## 2026-06-21 — #2146 (PR #2189) fold: close IPv6 ext-header overshoot fail-open
 
 - **Timestamp**: 2026-06-21

@@ -187,7 +187,9 @@ outside the monitor loop:
   (`resetRecvGen` from the `syncMsgBulkStart` handler, #2198 F2) so a rebooted
   peer — whose monotonic-seeded counter legitimately restarts lower — has its
   cold-start bulk re-prime accepted instead of refused as stale (the
-  stale-RETAIN inverse of #2170).
+  stale-RETAIN inverse of #2170). The check→Put→record apply sequence is not
+  held under one `recvGenMu` acquisition; it is safe because the per-peer
+  receive path is single-threaded over the single active fabric (#2198 F3).
 - Dual-active overlap is intentional: primary sets `rg_active=true`
   immediately on becoming master; secondary defers `rg_active=false` until
   it sees the VRRP BACKUP event. Brief overlap, never both inactive.

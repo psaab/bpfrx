@@ -236,6 +236,23 @@ func (s *SessionSync) resetRecvGen() {
 	s.recvGenMu.Unlock()
 }
 
+// Non-atomicity note (#2198 F3): the apply sequence — guard check
+// (installGenGuard*), PutClusterSynced*, recordInstalledGen* / deleteGenGuard*
+// — does NOT hold recvGenMu across the whole sequence; the mutex is taken
+// independently inside each of installGenGuard*/recordInstalledGen*/
+// deleteGenGuard*. This is safe in production because the receiver apply path
+// for a given peer is single-threaded: messages are decoded and dispatched
+// serially within one receiveLoop goroutine over the single ACTIVE fabric
+// connection (activeConnLocked prefers conn0; conn1 is used only when conn0 is
+// down — never both at once for sends, and the peer sends over one stream). So
+// no two installs/deletes for the SAME key are ever applied concurrently, and
+// the per-key stored generation cannot be interleaved between the guard read
+// and the record write. The standby fabric's receiveLoop exists but the active
+// sender never duplicates a key's traffic across both, so cross-goroutine
+// same-key races do not occur. Holding recvGenMu across the dataplane Put would
+// also serialize unrelated keys and block on dataplane I/O under the lock,
+// which is not worth it for a race that the single-active-fabric invariant
+// already precludes.
 func (s *SessionSync) installClusterSyncedV4(key dataplane.SessionKey, val dataplane.SessionValue) {
 	if s.sessions == nil {
 		return

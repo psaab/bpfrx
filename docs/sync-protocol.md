@@ -205,6 +205,20 @@ live set before any such delete; a delete that arrives mid-bulk for a
 not-yet-re-recorded key falls back to gen-0 (unconditional), the legacy-safe
 behavior. No persisted cross-boot high-water mark is required.
 
+### Apply-sequence atomicity (#2198 F3)
+
+The receiver apply sequence — install guard check, dataplane `PutClusterSynced`,
+`recordInstalledGen` (and the delete path's `deleteGenGuard`) — does not hold
+`recvGenMu` across the whole sequence; each helper takes the mutex
+independently. This is safe because the receiver apply path for a given peer is
+single-threaded: messages are decoded and dispatched serially within one
+`receiveLoop` goroutine over the single ACTIVE fabric connection (conn0
+preferred; conn1 only when conn0 is down). No two installs/deletes for the same
+key are ever applied concurrently, so the per-key stored generation cannot be
+interleaved between the guard read and the record write. Holding `recvGenMu`
+across the dataplane `Put` would serialize unrelated keys under dataplane I/O
+for no benefit the single-active-fabric invariant doesn't already provide.
+
 ## Config Payload (Variable)
 
 Raw UTF-8 text of the full Junos-format configuration. Sent as-is after `commitConfig()` on the primary. The secondary's `OnConfigReceived` callback invokes `load override` + commit to apply it.
