@@ -60,6 +60,28 @@ pub(in crate::afxdp) use slow_path::{
 // pre-split sibling-tx/ visibility verbatim.
 pub(in crate::afxdp::tx) use slow_path::{extract_l3_packet, extract_l3_packet_from_frame};
 
+// #2208: test-only fault injection for the oversized-frame control flow.
+// A built copy-path frame larger than `tx_frame_capacity()` (4096) cannot
+// be produced from a single in-UMEM ingress frame in a unit test (the
+// frame itself is capped at one UMEM frame), so this thread-local lets the
+// dispatch tests force the oversized branch to prove it recycles the
+// ingress descriptor (the pre-fix bare `continue;` leaked it). It is
+// `#[cfg(test)]` only and DCEs out of release builds — the hot path keeps
+// the bare `cp_len > tx_frame_capacity()` comparison with zero added cost.
+#[cfg(test)]
+thread_local! {
+    static FORCE_OVERSIZED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[inline(always)]
+fn copy_frame_is_oversized(cp_len: usize) -> bool {
+    #[cfg(test)]
+    if FORCE_OVERSIZED.with(|c| c.get()) {
+        return true;
+    }
+    cp_len > tx_frame_capacity()
+}
+
 #[inline]
 fn recycle_ingress_frame(ingress_binding: &mut BindingWorker, source_offset: u64, now_ns: u64) {
     ingress_binding
@@ -571,7 +593,7 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
                                     }
                                 }
                                 let cp1_len = frame.len();
-                                if cp1_len > tx_frame_capacity() {
+                                if copy_frame_is_oversized(cp1_len) {
                                     record_exception(
                                         recent_exceptions,
                                         ingress_ident,
@@ -581,33 +603,56 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
                                         None,
                                         forwarding,
                                     );
-                                    continue;
-                                }
-                                let req = TxRequest {
-                                    bytes: frame,
-                                    expected_ports,
-                                    expected_addr_family: request.meta.addr_family,
-                                    expected_protocol: request.meta.protocol,
-                                    flow_key: flow_key.take(),
-                                    egress_ifindex: request.decision.resolution.egress_ifindex,
-                                    cos_queue_id: request.cos_queue_id,
-                                    dscp_rewrite: request.dscp_rewrite,
-                                    mirror_clone: false,
-                                    enqueue_ns: 0,
-                                };
-                                if enqueue_local_request_to_target_or_owner(target_binding, req)
-                                    .is_err()
-                                {
+                                    // #2208: an oversized built frame is
+                                    // undeliverable. Fall through to the
+                                    // finalizer so the ingress descriptor is
+                                    // recycled to the fill ring (the bare
+                                    // `continue;` here leaked it). Do NOT set
+                                    // fallback_to_slow_path — reinjecting an
+                                    // already-oversized frame to the kernel
+                                    // slow path is pointless; matching the
+                                    // direct-TX oversized branch above, we
+                                    // drop-and-recycle.
                                     build_failed = true;
-                                    fallback_to_slow_path = true;
-                                    continue;
-                                }
-                                dbg.enqueue_ok += 1;
-                                dbg.enqueue_copy += 1;
-                                target_binding.tx_counters.pending_copy_tx_packets += 1;
-                                dbg.tx_bytes_total += cp1_len as u64;
-                                if (cp1_len as u32) > dbg.tx_max_frame {
-                                    dbg.tx_max_frame = cp1_len as u32;
+                                } else {
+                                    let req = TxRequest {
+                                        bytes: frame,
+                                        expected_ports,
+                                        expected_addr_family: request.meta.addr_family,
+                                        expected_protocol: request.meta.protocol,
+                                        flow_key: flow_key.take(),
+                                        egress_ifindex: request.decision.resolution.egress_ifindex,
+                                        cos_queue_id: request.cos_queue_id,
+                                        dscp_rewrite: request.dscp_rewrite,
+                                        mirror_clone: false,
+                                        enqueue_ns: 0,
+                                    };
+                                    if enqueue_local_request_to_target_or_owner(target_binding, req)
+                                        .is_err()
+                                    {
+                                        // #2208: a full cross-binding CoS-owner
+                                        // queue (TX congestion) returns Err and
+                                        // drops the TxRequest. Set the
+                                        // build-failure flags and FALL THROUGH
+                                        // to the finalizer — the old bare
+                                        // `continue;` skipped both
+                                        // handle_forward_build_failure (no
+                                        // slow-path reinject, contradicting the
+                                        // flags) AND recycle_ingress_frame
+                                        // (leaking the ingress descriptor). The
+                                        // finalizer reinjects from source_frame,
+                                        // so the dropped req is irrelevant.
+                                        build_failed = true;
+                                        fallback_to_slow_path = true;
+                                    } else {
+                                        dbg.enqueue_ok += 1;
+                                        dbg.enqueue_copy += 1;
+                                        target_binding.tx_counters.pending_copy_tx_packets += 1;
+                                        dbg.tx_bytes_total += cp1_len as u64;
+                                        if (cp1_len as u32) > dbg.tx_max_frame {
+                                            dbg.tx_max_frame = cp1_len as u32;
+                                        }
+                                    }
                                 }
                             }
                             None => {
@@ -852,7 +897,7 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
                                     }
                                 }
                                 let cp2_len = frame.len();
-                                if cp2_len > tx_frame_capacity() {
+                                if copy_frame_is_oversized(cp2_len) {
                                     record_exception(
                                         recent_exceptions,
                                         ingress_ident,
@@ -862,33 +907,49 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
                                         None,
                                         forwarding,
                                     );
-                                    continue;
-                                }
-                                let req = TxRequest {
-                                    bytes: frame,
-                                    expected_ports,
-                                    expected_addr_family: request.meta.addr_family,
-                                    expected_protocol: request.meta.protocol,
-                                    flow_key: flow_key.take(),
-                                    egress_ifindex: request.decision.resolution.egress_ifindex,
-                                    cos_queue_id: request.cos_queue_id,
-                                    dscp_rewrite: request.dscp_rewrite,
-                                    mirror_clone: false,
-                                    enqueue_ns: 0,
-                                };
-                                if enqueue_local_request_to_target_or_owner(target_binding, req)
-                                    .is_err()
-                                {
+                                    // #2208: oversized fallback-copy frame —
+                                    // undeliverable. Fall through to the
+                                    // finalizer (recycle the ingress
+                                    // descriptor); the bare `continue;` here
+                                    // leaked it. Drop-and-recycle, no slow-path
+                                    // reinject (the frame is already oversized).
                                     build_failed = true;
-                                    fallback_to_slow_path = true;
-                                    continue;
-                                }
-                                dbg.enqueue_ok += 1;
-                                dbg.enqueue_copy += 1;
-                                target_binding.tx_counters.pending_copy_tx_packets += 1;
-                                dbg.tx_bytes_total += cp2_len as u64;
-                                if (cp2_len as u32) > dbg.tx_max_frame {
-                                    dbg.tx_max_frame = cp2_len as u32;
+                                } else {
+                                    let req = TxRequest {
+                                        bytes: frame,
+                                        expected_ports,
+                                        expected_addr_family: request.meta.addr_family,
+                                        expected_protocol: request.meta.protocol,
+                                        flow_key: flow_key.take(),
+                                        egress_ifindex: request.decision.resolution.egress_ifindex,
+                                        cos_queue_id: request.cos_queue_id,
+                                        dscp_rewrite: request.dscp_rewrite,
+                                        mirror_clone: false,
+                                        enqueue_ns: 0,
+                                    };
+                                    if enqueue_local_request_to_target_or_owner(target_binding, req)
+                                        .is_err()
+                                    {
+                                        // #2208: cross-binding CoS-owner queue
+                                        // full (TX congestion). Set the
+                                        // build-failure flags and FALL THROUGH
+                                        // to the finalizer instead of the old
+                                        // bare `continue;`, which skipped both
+                                        // handle_forward_build_failure (the
+                                        // slow-path reinject the flags request)
+                                        // AND recycle_ingress_frame (leaking the
+                                        // ingress descriptor under congestion).
+                                        build_failed = true;
+                                        fallback_to_slow_path = true;
+                                    } else {
+                                        dbg.enqueue_ok += 1;
+                                        dbg.enqueue_copy += 1;
+                                        target_binding.tx_counters.pending_copy_tx_packets += 1;
+                                        dbg.tx_bytes_total += cp2_len as u64;
+                                        if (cp2_len as u32) > dbg.tx_max_frame {
+                                            dbg.tx_max_frame = cp2_len as u32;
+                                        }
+                                    }
                                 }
                             }
                             None => {
