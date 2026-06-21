@@ -597,46 +597,67 @@ func openAfPacketReceiver(ifIndex int) (int, error) {
 		slog.Debug("vrrp: failed to set promisc", "err", err)
 	}
 
-	// BPF filter: accept VRRP (proto/next-header 112) for IPv4, IPv6,
-	// and 802.1Q-tagged variants. SOCK_RAW includes the Ethernet header.
-	// Protocol/next-header offsets:
+	// BPF filter: accept VRRP for IPv4, IPv6, and 802.1Q-tagged variants.
+	// SOCK_RAW includes the Ethernet header. Protocol/next-header offsets:
 	//   IPv4 untagged:  ethertype 0x0800 @12, proto @23 (14+9)
 	//   IPv6 untagged:  ethertype 0x86DD @12, next-hdr @20 (14+6)
 	//   IPv4 802.1Q:    ethertype 0x8100 @12, real 0x0800 @16, proto @27 (18+9)
 	//   IPv6 802.1Q:    ethertype 0x8100 @12, real 0x86DD @16, next-hdr @24 (18+6)
 	//
+	// IPv4 matches base proto == 112 (the IPv4 arm already re-validates IHL +
+	// TTL in Go, so it tolerates IPv4 options). IPv6 must additionally admit
+	// VRRP adverts that carry one or more IPv6 extension headers (#2155): the
+	// base Next-Header of such a frame is the FIRST ext-header's type, not 112.
+	// A fixed-offset cBPF cannot walk an ext-header chain, so the IPv6 arm
+	// instead matches the base Next-Header against the small set
+	//   {112 VRRP, 0 Hop-by-Hop, 43 Routing, 60 Dest-Opts, 44 Fragment}
+	// (approach A2). Any conformant VRRP advert — bare or chained — starts with
+	// one of these, while ordinary IPv6 TCP/UDP/ICMPv6/ND stays kernel-dropped
+	// on a data-bearing RETH VLAN (e.g. reth0.80). The authoritative ext-header
+	// walk + proto-112 + hop-limit-255 + VRID validation happens in Go
+	// (parseAfPacketIPv6); the cBPF is only an in-kernel volume reducer.
+	//
 	// Jump offsets (Jt/Jf) are relative to the NEXT instruction.
 	filter := []unix.SockFilter{
 		{Code: 0x28, K: 12},                    //  0: ldh [12] — ethertype
 		{Code: 0x15, Jt: 7, Jf: 0, K: 0x0800},  //  1: jeq 0x0800 → 9 (check_ipv4)
-		{Code: 0x15, Jt: 10, Jf: 0, K: 0x86DD}, //  2: jeq 0x86DD → 13 (check_ipv6)
+		{Code: 0x15, Jt: 14, Jf: 0, K: 0x86DD}, //  2: jeq 0x86DD → 17 (check_ipv6)
 		{Code: 0x15, Jt: 1, Jf: 0, K: 0x8100},  //  3: jeq 0x8100 → 5 (check_vlan); else reject
 		{Code: 0x06, K: 0},                     //  4: ret reject
 		// check_vlan:
 		{Code: 0x28, K: 16},                    //  5: ldh [16] — real ethertype
-		{Code: 0x15, Jt: 10, Jf: 0, K: 0x0800}, //  6: jeq 0x0800 → 17 (check_ipv4_vlan)
-		{Code: 0x15, Jt: 13, Jf: 0, K: 0x86DD}, //  7: jeq 0x86DD → 21 (check_ipv6_vlan)
+		{Code: 0x15, Jt: 6, Jf: 0, K: 0x0800},  //  6: jeq 0x0800 → 13 (check_ipv4_vlan)
+		{Code: 0x15, Jt: 17, Jf: 0, K: 0x86DD}, //  7: jeq 0x86DD → 25 (check_ipv6_vlan)
 		{Code: 0x06, K: 0},                     //  8: ret reject
 		// check_ipv4: proto at 14+9=23
 		{Code: 0x30, K: 23},                //  9: ldb [23]
 		{Code: 0x15, Jt: 0, Jf: 1, K: 112}, // 10: jeq 112 → accept; else reject
 		{Code: 0x06, K: 0xFFFFFFFF},        // 11: ret accept
 		{Code: 0x06, K: 0},                 // 12: ret reject
-		// check_ipv6: next-header at 14+6=20
-		{Code: 0x30, K: 20},                // 13: ldb [20]
+		// check_ipv4_vlan: proto at 18+9=27
+		{Code: 0x30, K: 27},                // 13: ldb [27]
 		{Code: 0x15, Jt: 0, Jf: 1, K: 112}, // 14: jeq 112 → accept; else reject
 		{Code: 0x06, K: 0xFFFFFFFF},        // 15: ret accept
 		{Code: 0x06, K: 0},                 // 16: ret reject
-		// check_ipv4_vlan: proto at 18+9=27
-		{Code: 0x30, K: 27},                // 17: ldb [27]
-		{Code: 0x15, Jt: 0, Jf: 1, K: 112}, // 18: jeq 112 → accept; else reject
-		{Code: 0x06, K: 0xFFFFFFFF},        // 19: ret accept
-		{Code: 0x06, K: 0},                 // 20: ret reject
-		// check_ipv6_vlan: next-header at 18+6=24
-		{Code: 0x30, K: 24},                // 21: ldb [24]
-		{Code: 0x15, Jt: 0, Jf: 1, K: 112}, // 22: jeq 112 → accept; else reject
-		{Code: 0x06, K: 0xFFFFFFFF},        // 23: ret accept
-		{Code: 0x06, K: 0},                 // 24: ret reject
+		// check_ipv6: base next-header at 14+6=20. Accept the VRRP/ext-header
+		// set {112,0,43,60,44}; anything else is non-VRRP → reject in-kernel.
+		{Code: 0x30, K: 20},                // 17: ldb [20]
+		{Code: 0x15, Jt: 5, Jf: 0, K: 112}, // 18: jeq 112  → 24 accept
+		{Code: 0x15, Jt: 4, Jf: 0, K: 0},   // 19: jeq 0    → 24 accept (Hop-by-Hop)
+		{Code: 0x15, Jt: 3, Jf: 0, K: 43},  // 20: jeq 43   → 24 accept (Routing)
+		{Code: 0x15, Jt: 2, Jf: 0, K: 60},  // 21: jeq 60   → 24 accept (Dest-Opts)
+		{Code: 0x15, Jt: 1, Jf: 0, K: 44},  // 22: jeq 44   → 24 accept (Fragment)
+		{Code: 0x06, K: 0},                 // 23: ret reject
+		{Code: 0x06, K: 0xFFFFFFFF},        // 24: ret accept
+		// check_ipv6_vlan: base next-header at 18+6=24. Same accept set.
+		{Code: 0x30, K: 24},                // 25: ldb [24]
+		{Code: 0x15, Jt: 5, Jf: 0, K: 112}, // 26: jeq 112  → 32 accept
+		{Code: 0x15, Jt: 4, Jf: 0, K: 0},   // 27: jeq 0    → 32 accept (Hop-by-Hop)
+		{Code: 0x15, Jt: 3, Jf: 0, K: 43},  // 28: jeq 43   → 32 accept (Routing)
+		{Code: 0x15, Jt: 2, Jf: 0, K: 60},  // 29: jeq 60   → 32 accept (Dest-Opts)
+		{Code: 0x15, Jt: 1, Jf: 0, K: 44},  // 30: jeq 44   → 32 accept (Fragment)
+		{Code: 0x06, K: 0},                 // 31: ret reject
+		{Code: 0x06, K: 0xFFFFFFFF},        // 32: ret accept
 	}
 	if err := unix.SetsockoptSockFprog(fd, unix.SOL_SOCKET, unix.SO_ATTACH_FILTER, &unix.SockFprog{
 		Len:    uint16(len(filter)),

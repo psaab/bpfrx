@@ -136,6 +136,51 @@ load/peer-sync compile paths.
   multicast on VLANs).
 - IPv6: separate raw socket; hop limit set to 255 per RFC.
 
+### AF_PACKET cBPF filter + IPv6 extension headers (#2155)
+
+The AF_PACKET receiver attaches a cBPF prefilter
+(`openAfPacketReceiver`, `manager.go`) so the kernel drops non-VRRP
+frames before they reach the per-instance RX goroutine. It handles
+untagged and 802.1Q-tagged IPv4/IPv6:
+
+- IPv4 matches base protocol `== 112`; `parseAfPacketIPv4` then
+  re-walks IHL + re-checks TTL 255 in Go (so IPv4 options are tolerated).
+- IPv6 matches the base **Next-Header** against the set
+  `{112 VRRP, 0 Hop-by-Hop, 43 Routing, 60 Dest-Opts, 44 Fragment}`
+  (approach A2). A chained VRRP advert's base Next-Header is the FIRST
+  ext-header's type, not 112, and a fixed-offset cBPF cannot walk an
+  ext-header chain — so admitting the ext-header types lets any
+  conformant advert through while ordinary IPv6 TCP/UDP/ICMPv6/ND stays
+  kernel-dropped on a data-bearing RETH VLAN (e.g. `reth0.80`). The
+  cBPF is only a volume reducer; authoritative validation is in Go.
+
+`parseAfPacketIPv6` performs a **bounded** IPv6 ext-header walk
+(`walkIPv6ExtHeaders`) to locate the real proto-112 payload offset
+instead of assuming the old fixed 40-byte base header. Conventions and
+explicit drop bounds (deliberate, documented):
+
+- Hop-by-Hop (0) / Routing (43) / Dest-Opts (60): length is
+  `(HdrExtLen+1)*8` (8-byte units). AH (51): `(PayloadLen+2)*4`
+  (4-byte units). Mixing the two unit conventions is the classic walk
+  bug — keep them distinct.
+- Fragment (44) is a **hard drop** — VRRP adverts are never legitimately
+  fragmented and the receiver does no reassembly.
+- The walk is capped at 8 iterations and bounds-checks every step
+  against the captured length, so a truncated or maliciously long chain
+  can neither loop nor read out of bounds — it is simply dropped.
+
+The raw `ip6:112` socket fallback (non-AF_PACKET path) is ext-header-safe
+for the common extension headers because the kernel walks the chain and
+hands `ReadFrom` the upper-layer payload directly. AH and fragmented
+VRRP are out of scope on **both** paths.
+
+**Homogeneous-peer expectation:** xpf's own IPv6 sender emits a bare
+base header (no ext-headers, hop-limit 255) per RFC 5798, which is the
+normal way VRRPv3 IPv6 adverts are sent. The ext-header walk exists only
+to interoperate with an unusual non-xpf VRRP speaker that inserts
+extension headers; deploy homogeneous xpf peers and this path is never
+exercised.
+
 ## Gotchas
 
 - Use the **non-VIP** primary IP as source on advertisements. Sourcing

@@ -771,8 +771,10 @@ func (vi *vrrpInstance) parseAfPacketIPv4(buf []byte, n, ethHeaderLen int) {
 }
 
 // parseAfPacketIPv6 parses an IPv6 VRRP packet from a raw Ethernet frame.
-// IPv6 header: 40 bytes fixed, next-header at offset 6, hop limit at offset 7,
-// source at 8-24, destination at 24-40.
+// IPv6 base header: 40 bytes fixed, next-header at offset 6, hop limit at
+// offset 7, source at 8-24, destination at 24-40. The VRRP payload may be
+// preceded by one or more IPv6 extension headers (#2155); walkIPv6ExtHeaders
+// finds the real payload offset.
 func (vi *vrrpInstance) parseAfPacketIPv6(buf []byte, n, ethHeaderLen int) {
 	const ipv6HeaderLen = 40
 
@@ -797,7 +799,14 @@ func (vi *vrrpInstance) parseAfPacketIPv6(buf []byte, n, ethHeaderLen int) {
 		return
 	}
 
-	payload := ip6[ipv6HeaderLen:ip6Len]
+	// Walk any IPv6 extension-header chain to the proto-112 VRRP payload.
+	// A bare advert (base Next-Header == 112) yields off == ipv6HeaderLen.
+	off, ok := walkIPv6ExtHeaders(ip6, ip6Len)
+	if !ok {
+		return
+	}
+
+	payload := ip6[off:ip6Len]
 	if len(payload) < vrrpHeaderLen {
 		return
 	}
@@ -820,6 +829,82 @@ func (vi *vrrpInstance) parseAfPacketIPv6(buf []byte, n, ethHeaderLen int) {
 	default:
 		vi.warnRXDrop()
 	}
+}
+
+// walkIPv6ExtHeaders walks the IPv6 extension-header chain in ip6 (an IPv6
+// packet starting at its base header, ip6Len bytes long) and returns the
+// offset of the first proto-112 (VRRP) header. The bool is false if the
+// chain does not terminate at VRRP, is truncated, contains a Fragment
+// header, or exceeds the iteration cap — all of which mean "not a parseable
+// VRRP advert; drop". A bare advert (base Next-Header == 112) returns
+// (40, true).
+//
+// Length-unit conventions differ per header and mixing them is the classic
+// walk bug:
+//   - Hop-by-Hop (0), Routing (43), Destination Options (60): the header is
+//     8 + HdrExtLen*8 bytes, i.e. (HdrExtLen+1)*8.
+//   - Authentication Header (51): the header is (PayloadLen+2)*4 bytes
+//     (PayloadLen is in 4-byte units, not counting the first two words).
+//   - Fragment (44): VRRP adverts are never legitimately fragmented and the
+//     receiver does no reassembly, so a Fragment header is a hard drop.
+//
+// The walk is bounded to maxIPv6ExtHeaders iterations and bounds-checks every
+// access against ip6Len, so a malicious or truncated chain can neither loop
+// nor read out of bounds.
+func walkIPv6ExtHeaders(ip6 []byte, ip6Len int) (int, bool) {
+	const (
+		ipv6HeaderLen     = 40
+		maxIPv6ExtHeaders = 8
+		nhVRRP            = 112
+		nhHopByHop        = 0
+		nhRouting         = 43
+		nhFragment        = 44
+		nhDestOpts        = 60
+		nhAH              = 51
+	)
+
+	if ip6Len < ipv6HeaderLen {
+		return 0, false
+	}
+
+	nh := int(ip6[6]) // base Next-Header
+	off := ipv6HeaderLen
+
+	for i := 0; i < maxIPv6ExtHeaders; i++ {
+		if nh == nhVRRP {
+			return off, true
+		}
+
+		// Need at least the 2-byte (NextHeader, length) preamble of the
+		// next extension header to make progress.
+		if off+2 > ip6Len {
+			return 0, false
+		}
+
+		var hdrLen int
+		switch nh {
+		case nhHopByHop, nhRouting, nhDestOpts:
+			hdrLen = (int(ip6[off+1]) + 1) * 8
+		case nhAH:
+			hdrLen = (int(ip6[off+1]) + 2) * 4
+		case nhFragment:
+			// Fragmented VRRP is non-conformant — drop.
+			return 0, false
+		default:
+			// Some other terminal protocol — not VRRP.
+			return 0, false
+		}
+
+		next := int(ip6[off]) // NextHeader of this ext-header
+		off += hdrLen
+		if hdrLen <= 0 || off > ip6Len {
+			return 0, false
+		}
+		nh = next
+	}
+
+	// Chain exceeded the iteration cap without reaching VRRP — drop.
+	return 0, false
 }
 
 // recordMasterAdvert records a peer's last advertised priority for the
