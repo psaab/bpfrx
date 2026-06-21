@@ -13,8 +13,9 @@
 //! calls `SessionTable::touch_if_stale`, a per-session time-threshold
 //! keepalive that needs no worker-local counter.
 //!
-//! Pure structural extraction: capacities and access semantics
-//! unchanged from master pre-Phase-9. Field names preserved.
+//! Originally a pure structural extraction (capacities and access
+//! semantics unchanged from master pre-Phase-9); #2220 then removed the
+//! per-worker global-modulo keepalive counter field, as noted above.
 //!
 //! Filename is `flow_cache_state.rs` because `flow_cache.rs` is
 //! taken by the `FlowCache` data structure itself (in

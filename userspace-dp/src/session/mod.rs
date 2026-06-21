@@ -28,9 +28,12 @@ const OTHER_SESSION_TIMEOUT_NS: u64 = 30_000_000_000;
 
 /// #2220: flow-cache keepalive divisor. A cache-served session is
 /// re-stamped once its idle time reaches `expires_after_ns /
-/// SESSION_KEEPALIVE_DIVISOR` (a quarter of its own timeout), bounding
-/// its worst-case age to `(1 + 1/N) × expires_after_ns` independent of
-/// co-resident flow rates. Four leaves three full refresh windows of
+/// SESSION_KEEPALIVE_DIVISOR` (a quarter of its own timeout). An
+/// actively-forwarding flow is therefore re-stamped each time its idle
+/// time crosses `expires_after_ns / N`, so its age stays ~`T/N` in
+/// steady state and it is NEVER reaped while its inter-packet gaps stay
+/// below the full timeout `T` — independent of co-resident flow rates.
+/// Four leaves three full refresh windows of
 /// slack before natural expiry — far enough from the edge that ordinary
 /// GC jitter (1 s `SESSION_GC_INTERVAL_NS`) never reaps an active flow,
 /// yet large enough that the steady-state refresh only writes/re-buckets
@@ -558,10 +561,11 @@ impl SessionTable {
     /// #2220: per-session keepalive throttle for the flow-cache fast
     /// path. Refreshes the matched session's `last_seen_ns` ONLY when it
     /// has gone idle for at least `expires_after_ns / SESSION_KEEPALIVE_DIVISOR`
-    /// — i.e. it is a quarter of the way to its OWN expiry. This bounds
-    /// every cache-served session's age to `(1 + 1/N) × expires_after_ns`
-    /// regardless of co-resident flow rates, so an actively-forwarding
-    /// cached flow can never be GC'd mid-flow.
+    /// — i.e. it is a quarter of the way to its OWN expiry. An
+    /// actively-forwarding cached flow is thus re-stamped whenever its
+    /// idle time crosses `expires_after_ns / N`, keeping its age ~`T/N`
+    /// in steady state regardless of co-resident flow rates, so it can
+    /// never be GC'd mid-flow (reaped only if a real gap exceeds `T`).
     ///
     /// Why this replaces the prior binding-global modulo-64 counter: that
     /// counter incremented across ALL flows on the binding and touched

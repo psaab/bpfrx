@@ -76,9 +76,10 @@ slow path that would otherwise touch the session. `touch_if_stale` is
 the keepalive it calls on every cache hit: it re-stamps the matched
 session ONLY once that session has gone idle for at least
 `expires_after_ns / SESSION_KEEPALIVE_DIVISOR` (a quarter of its OWN
-timeout). This bounds every cache-served session's worst-case age to
-`(1 + 1/N) × expires_after_ns` regardless of co-resident flow rates, so
-an actively-forwarding cached flow can never be GC'd mid-flow. The
+timeout). An actively-forwarding cached flow is thus re-stamped whenever
+its idle time crosses `expires_after_ns / N`, keeping its age ~`T/N` in
+steady state regardless of co-resident flow rates, so it can never be
+GC'd mid-flow (reaped only if a real inter-packet gap exceeds `T`). The
 steady-state per-hit cost is one `key_to_handle` probe plus an integer
 compare (the `last_seen_ns` write + throttled `push_to_wheel` run only
 when actually stale); allocation-free.
