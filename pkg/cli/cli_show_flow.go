@@ -1148,7 +1148,9 @@ func (c *CLI) showFlowMonitoring() error {
 					}
 					tmplStr := ""
 					if fs.Version9Template != "" {
-						tmplStr = fmt.Sprintf(" (template: %s)", fs.Version9Template)
+						tmplStr = fmt.Sprintf(" (v9 template: %s)", fs.Version9Template)
+					} else if fs.VersionIPFIXTemplate != "" {
+						tmplStr = fmt.Sprintf(" (ipfix template: %s)", fs.VersionIPFIXTemplate)
 					}
 					fmt.Printf("    Collector: %s%s%s\n", fs.Address, portStr, tmplStr)
 				}

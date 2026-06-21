@@ -10,6 +10,55 @@
 - **Action**: Added `validateNATHostMaskStrict` (strict-vs-lenient gate, `lenientNATHostMask` flag) rejecting a non-host (non-/32//128) static-NAT match/prefix or NAT64 source-pool address at commit, mirroring the Rust PR #2167 host-mask gate (NPTv6 + `inet` rules exempt). New `compiler_nat_host_mask_test.go`; doc section in `docs/config-schema.md`; fixed `TestNAT64` fixture to a /32 pool address.
 - **File(s)**: pkg/config/compiler_nat.go, pkg/config/compiler.go, pkg/config/compiler_nat_host_mask_test.go, pkg/config/parser_security_test.go, docs/config-schema.md
 
+## 2026-06-21 — #2139 review #2180: discriminating transactionality test
+
+- **Timestamp**: 2026-06-21
+- **Action**: Test-only fold for PR #2180. The independent review found the
+  headline #2139 transactionality test (TestBatch_PartialFailureRevertsWhole
+  Candidate) was TAUTOLOGICAL: its mid-batch "invalid" command
+  (`set system dataplane-type ebpf`) parses and applies to the candidate
+  fine and fails only at the whole-candidate COMPILE (eBPF-retirement
+  reject), which store.Commit already discards atomically — so the PRE-FIX
+  best-effort path passes it too. Added a DISCRIMINATING test
+  (TestBatch_UnknownCommandMidBatchRevertsWholeCandidate) whose mid-batch
+  command is an UNSUPPORTED prefix (`reboot now`) that classifyPlan rejects
+  BEFORE any candidate mutation — the genuine #2139 partial-commit case.
+  Proof: stubbing the engine back to the pre-fix apply-then-commit path
+  makes the new test fail with host-name="changed-1" / domain-name=
+  "should-not-apply" / Committed=1 (a partial commit, reboot silently
+  skipped); on the real classifyPlan fix the whole batch is rejected
+  (host-name unchanged "base", Committed=0, Rejected>=1) and the test
+  passes. Annotated the retained tautological test as a corner case. No
+  production code changed. go test ./pkg/eventengine/... green;
+  -race -count=3 clean.
+- **File(s)**: pkg/eventengine/engine_integration_test.go
+
+## 2026-06-21 — #2139/#2140/#2141/#2157 event-options robustness cluster
+
+- **Action**: Implemented the converged event-options plan — #2139 transactional batch (validate-then-commit-or-discard on the candidate), #2140 cooldown survives reload (reconcile-not-recreate keyed by name+semantic-revision, arm-on-commit), #2141 strict-reject malformed/unknown attributes-match at commit + fail-closed runtime + SSOT field set, #2157 fail-safe single-worker action queue with ErrConfigLocked backoff retry + drop/retry/commit counters. Files: pkg/eventengine/{engine,engine_test,engine_integration_test,README}.go/md, pkg/config/{event_options_match,event_options_match_test,compiler}.go, pkg/configstore/{envelope,store}.go, pkg/api/{metrics,metrics_descriptors,metrics_system,server}.go, pkg/daemon/daemon_run.go. -race + 5x flake clean.
+## 2026-06-21 — #2147 state_writer fallback path crash-safety
+
+- **Timestamp**: 2026-06-21
+- **Action**: Fixed #2147 — the userspace state_writer's sync fallback
+  (`persist_sync`) wrote the temp file via `fs::write` then renamed with
+  NO file fsync, and neither transport fsync'd the parent directory, so a
+  state snapshot could be lost or torn on power loss. Extracted one shared
+  `finalize_durably` (file fsync → atomic rename → parent-dir fsync) used
+  by BOTH the io_uring transport and the fallback, so neither can drift
+  from the durability contract. Added a `sync_all` test seam (function-
+  pointer hook) and four unit tests, mutation-verified to FAIL if either
+  fsync is deleted from the finalizer.
+- **File(s)**: userspace-dp/src/state_writer.rs,
+  userspace-dp/src/FEATURES.md
+- **Validation**: full userspace-dp test suite green (2094+46+8+16+1, 0
+  failed); new tests 5/5 flake-clean; both fsync-removal mutations fail
+  the tests.
+## 2026-06-21 — #2136 NetFlow per-flow-server export-version binding (no double-export)
+
+- **Timestamp**: 2026-06-21
+- **Action**: Fixed #2136 (deferred #2129 follow-up). A flow-server under BOTH global `version9` and `version-ipfix` was double-exported (one v9 + one IPFIX datagram to the same collector socket, mismatched 1-in-N). Bound each flow-server to exactly one export version (Junos semantics): added `FlowServer.Version`/`VersionIPFIXTemplate` + parse the per-server `version-ipfix`/`version-ipfix-template` selectors; `BuildExportConfig`/`BuildIPFIXExportConfig` now take only the flow-servers resolved to their version via shared `resolveFlowServerVersion`/`collectVersionCollectors`. Semantics for an UNBOUND server with both globals set: IPFIX wins (documented precedence — IETF-standard superset of v9; one stream not two). CLI shows IPFIX template; README/config-schema docs updated. Tests FAIL on pre-fix collect-all (mutation-verified) at both the build-config and live-reconcile/callback layers.
+- **File(s)**: pkg/config/types_system.go, pkg/config/compiler_services.go, pkg/config/schema_routing.go, pkg/config/parser_security_test.go, pkg/flowexport/manager.go, pkg/flowexport/version_binding_test.go, pkg/daemon/daemon_flowexport_reconcile_test.go, pkg/cli/cli_show_flow.go, pkg/cli/cli_show_routing.go, pkg/flowexport/README.md, docs/config-schema.md
+
 ## 2026-06-20 — #2120 PR #2166 Copilot fold (doc nits + SELF-HEAL/HOLD expect hardening)
 
 - **Timestamp**: 2026-06-20

@@ -696,15 +696,21 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		}
 	}
 
-	// #2008 M7: event-options attributes-match patterns are RE2 regexes
-	// (Junos `matches` semantics). Reject an uncompilable pattern at commit
-	// so the operator gets immediate feedback instead of the event engine
-	// silently dropping the constraint at runtime. On the tolerant LOAD path
-	// (#2063 review), downgrade to a warning: a config persisted under the
-	// pre-#2008 literal-equality matcher could hold a non-RE2 pattern, and an
-	// upgrading node must still boot through it (mirrors every sibling
-	// validator above). Commit stays strict.
-	if err := ValidateEventAttributesMatch(cfg); err != nil {
+	// #2008 M7 / #2141: event-options attributes-match patterns are RE2
+	// regexes (Junos `matches` semantics). The strict validator rejects at
+	// commit not only an uncompilable pattern (#2008 M7) but also a malformed
+	// match expression and an unknown <field> name (#2141) — both previously
+	// fail-open: the runtime matcher silently DROPPED the constraint, turning
+	// targeted remediation into broad config mutation while commit succeeded.
+	// Strict-reject gives the operator immediate feedback. On the tolerant
+	// LOAD path (#2063 review), downgrade to a warning: a config persisted
+	// under the pre-#2008 literal-equality matcher could hold a non-RE2
+	// pattern or a now-rejected malformed/unknown line, and an upgrading node
+	// must still boot through it (mirrors every sibling validator above). The
+	// runtime matcher then fails CLOSED on the legacy malformed line (#2141 /
+	// #2124 doctrine) so the suspicious policy does not over-fire. Commit
+	// stays strict.
+	if err := ValidateEventAttributesMatchStrict(cfg); err != nil {
 		if opts.lenientEventAttributesMatch {
 			cfg.Warnings = append(cfg.Warnings,
 				fmt.Sprintf("event-options attributes-match (downgraded to warning on tolerant path): %v", err))

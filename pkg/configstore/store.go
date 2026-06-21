@@ -677,7 +677,10 @@ func (s *Store) EnterConfigureSession(sessionID string) error {
 		if sessionID != "" && s.configHolder == sessionID {
 			return nil
 		}
-		return fmt.Errorf("configuration is locked by another user")
+		// #2157: return the ErrConfigLocked sentinel (wrapping the plain
+		// message) so deferrable callers (the event-options action worker)
+		// can errors.Is it and retry instead of string-matching.
+		return fmt.Errorf("%w", ErrConfigLocked)
 	}
 	s.candidate = s.active.Clone()
 	s.configDir = true
@@ -695,7 +698,7 @@ func (s *Store) EnterConfigureExclusive(holder string) error {
 		return fmt.Errorf("configuration database is not writable (secondary node)")
 	}
 	if s.configDir {
-		return fmt.Errorf("configuration is locked by another user")
+		return fmt.Errorf("%w", ErrConfigLocked)
 	}
 	s.candidate = s.active.Clone()
 	s.configDir = true
