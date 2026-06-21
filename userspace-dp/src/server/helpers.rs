@@ -400,6 +400,8 @@ pub(crate) fn build_synced_session_entry(
             nat64_reverse: None,
         },
         origin: crate::session::SessionOrigin::SyncImport,
+        // #2170: carry the peer's install generation onto the helper entry.
+        generation: req.generation,
     })
 }
 

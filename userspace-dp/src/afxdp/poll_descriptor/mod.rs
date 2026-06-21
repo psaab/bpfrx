@@ -1517,6 +1517,8 @@ pub(super) fn poll_binding_process_descriptor(
                                                 origin: SessionOrigin::ForwardFlow,
                                                 protocol: meta.protocol,
                                                 tcp_flags: meta.tcp_flags,
+                                                // Local forward-flow learn (#2170): no peer gen.
+                                                generation: 0,
                                             };
                                             // #1789: count failed publishes so
                                             // map-at-capacity / stale-fd
@@ -1801,6 +1803,8 @@ pub(super) fn poll_binding_process_descriptor(
                                                 origin: SessionOrigin::ReverseFlow,
                                                 protocol: meta.protocol,
                                                 tcp_flags: meta.tcp_flags,
+                                                // Local reverse-flow learn (#2170): no peer gen.
+                                                generation: 0,
                                             };
                                             publish_shared_session(
                                                 worker_ctx.shared_sessions,
@@ -2943,6 +2947,8 @@ pub(super) fn poll_binding_process_descriptor(
                                             origin: SessionOrigin::MissingNeighborSeed,
                                             protocol: meta.protocol,
                                             tcp_flags: meta.tcp_flags,
+                                            // Local missing-neighbor seed (#2170): no peer gen.
+                                            generation: 0,
                                         };
                                         publish_shared_session(
                                             worker_ctx.shared_sessions,

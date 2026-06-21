@@ -34,10 +34,10 @@ All multi-byte integers in the wire format are **little-endian**, matching the n
 
 | Type | Name             | Direction        | Payload Size        | Purpose |
 |------|------------------|------------------|---------------------|---------|
-| 1    | SessionV4        | Primary→Secondary | 120 bytes           | Create/update IPv4 session |
-| 2    | SessionV6        | Primary→Secondary | ~196 bytes          | Create/update IPv6 session |
-| 3    | DeleteV4         | Primary→Secondary | 16 bytes            | Delete IPv4 session |
-| 4    | DeleteV6         | Primary→Secondary | 40 bytes            | Delete IPv6 session |
+| 1    | SessionV4        | Primary→Secondary | length-gated        | Create/update IPv4 session |
+| 2    | SessionV6        | Primary→Secondary | length-gated        | Create/update IPv6 session |
+| 3    | DeleteV4         | Primary→Secondary | 16 or 24 bytes      | Delete IPv4 session |
+| 4    | DeleteV6         | Primary→Secondary | 40 or 48 bytes      | Delete IPv6 session |
 | 5    | BulkStart        | Primary→Secondary | 0                   | Marks start of bulk transfer |
 | 6    | BulkEnd          | Primary→Secondary | 0                   | Marks end of bulk transfer |
 | 7    | Heartbeat        | Bidirectional     | 0                   | Keepalive (sent on 30s idle) |
@@ -121,6 +121,103 @@ Offset  Size  Field
 36      1     Protocol      uint8
 37      3     (implicit)    -
 ```
+
+## Install-Generation Guard (#2170)
+
+To stop a deferred/journaled delete from killing a same-5-tuple replacement
+session, every **session** and **delete** message carries a length-gated
+trailing `Generation uint64` (LE):
+
+- **Session V4/V6**: 8 bytes appended after the existing last field (`FibGen`).
+  An old decoder stops after `FibGen` and ignores it (`if off+8 <= len(payload)`
+  block in `decodeSession*Payload`); a new decoder reading an old, shorter
+  payload sees `Generation == 0`.
+- **Delete V4**: 16 → 24 bytes; **Delete V6**: 40 → 48 bytes. The generation is
+  the trailing 8 bytes after the 5-tuple block. The handler's `len(payload) >=
+  16/40` check already tolerates the longer payload; the generation is read
+  only when `len(payload) >= 24/48`.
+
+**Semantics (sender, `pkg/cluster`):** a single process-wide strictly-monotonic
+counter (seeded from `CLOCK_MONOTONIC` nanos) stamps every install send
+(`QueueSession*`, sweep, bulk) and is recorded per wire key. A delete echoes the
+exact generation last stamped for that key and evicts the record, so the
+delete's generation is always same-domain as the entry the receiver stored.
+Generations are only ever compared per-`(sender,key)` — never across keys — so a
+single sender-local counter suffices.
+
+**Semantics (receiver, `pkg/cluster`):** `SessionSync` keeps the authoritative
+per-key stored generation in its own map (the BPF C conntrack struct stays
+generation-free). The apply layer:
+
+- **Delete guard** (`deleteClusterSynced*`): apply a delete only if its
+  generation is **not strictly older** than the stored entry's. `delete < stored`
+  with both non-zero → refuse (`DeletesStaleIgnored++`), short-circuiting BOTH
+  the BPF map delete and the helper. Equality applies (the delete of the very
+  session installed); `gen == 0` on either side falls back to today's
+  unconditional delete (rolling-upgrade safe).
+- **Install guard** (`installClusterSynced*`): refuse to overwrite a stored
+  entry with a strictly-older-generation install (`InstallsStaleIgnored++`) so
+  the per-key stored generation never regresses (closes the delayed-stale-install
+  variant).
+
+The userspace helper mirrors the same field on its in-memory
+`SyncedSessionEntry` (via `SessionSyncRequest.generation`) and enforces the
+same guard in `upsert_synced_session` / `delete_synced_session_gen` as a
+belt-and-suspenders for helper-originated deletes; the Go cluster apply layer is
+authoritative. A mixed-version cluster degrades to exact pre-#2170 behavior for
+any pair where either end lacks a generation.
+
+### Generation-map bounds and overflow (#2198 F1)
+
+Both the sender echo maps (`genSentV4/V6`) and the receiver stored-generation
+maps (`recvGenV4/V6`) are bounded by `genGuardMapCap` (200000) so a churning
+workload cannot grow them without limit. Entries are normally evicted on the
+matching delete; the cap is the safety valve for keys whose delete never
+arrives (e.g. a dropped close delta).
+
+On overflow the map is **never cleared**. A map at cap updates an EXISTING key
+in place (its stored generation is never dropped) and **skip-records** a NEW
+key, incrementing `GenMapOverflow`. A skipped key degrades to gen-0
+(unconditional install / unconditional delete), which is safe: gen-0 never
+causes a wrongful delete of a *different* live incarnation — it only forgoes the
+stale-delete protection for that one new key. Clearing the whole map would drop
+the stored generation of every live key, disabling the guard for a churn window
+and re-opening the exact #2170 hazard (a stale delete killing a live
+re-established session).
+
+### Cross-boot generation regression and the bulk re-prime reset (#2198 F2)
+
+The sender `genCounter` is seeded from `CLOCK_MONOTONIC` nanos, which is
+boot-relative and **resets at OS reboot**. After a reboot this node's counter
+can come up LOWER than a generation the peer stored from its previous boot, so a
+post-reboot same-5-tuple re-install would carry a lower generation and the
+peer's install guard would refuse it as stale (a stale-RETAIN — the inverse of
+#2170), and the cold-start bulk re-prime would silently fail to land.
+
+This is handled on the **receiver** side: when a (reconnecting, possibly
+rebooted) peer begins its bulk transfer (`syncMsgBulkStart`), the receiver
+resets its per-key stored generations (`resetRecvGen`). The bulk re-prime — the
+authoritative live set — then lands unconditionally and re-records each key's
+fresh generation, so the install guard accepts it. This is safe against opening
+a stale-delete window: deletes are only acted on after the bulk completes
+(`reconcileStaleSessions` at `BulkEnd`), and the re-prime re-establishes the
+live set before any such delete; a delete that arrives mid-bulk for a
+not-yet-re-recorded key falls back to gen-0 (unconditional), the legacy-safe
+behavior. No persisted cross-boot high-water mark is required.
+
+### Apply-sequence atomicity (#2198 F3)
+
+The receiver apply sequence — install guard check, dataplane `PutClusterSynced`,
+`recordInstalledGen` (and the delete path's `deleteGenGuard`) — does not hold
+`recvGenMu` across the whole sequence; each helper takes the mutex
+independently. This is safe because the receiver apply path for a given peer is
+single-threaded: messages are decoded and dispatched serially within one
+`receiveLoop` goroutine over the single ACTIVE fabric connection (conn0
+preferred; conn1 only when conn0 is down). No two installs/deletes for the same
+key are ever applied concurrently, so the per-key stored generation cannot be
+interleaved between the guard read and the record write. Holding `recvGenMu`
+across the dataplane `Put` would serialize unrelated keys under dataplane I/O
+for no benefit the single-active-fabric invariant doesn't already provide.
 
 ## Config Payload (Variable)
 

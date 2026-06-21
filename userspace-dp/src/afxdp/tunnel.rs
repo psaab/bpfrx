@@ -351,6 +351,8 @@ pub(super) fn build_local_origin_tunnel_tx_request(
         } else {
             0
         },
+        // Locally decapsulated tunnel session: no peer install generation (#2170).
+        generation: 0,
     };
     let reverse_session_entry = synthesized_synced_reverse_entry(
         forwarding,

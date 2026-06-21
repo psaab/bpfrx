@@ -469,6 +469,8 @@ fn resolve_flow_session_decision_promotes_stale_fabric_shared_hit_to_local_owner
         origin: SessionOrigin::SyncImport,
         protocol: PROTO_TCP,
         tcp_flags: 0x18,
+        // #2170 test fixture: no peer install generation.
+        generation: 0,
     };
     publish_shared_session(
         &shared_sessions,
@@ -544,6 +546,8 @@ fn lookup_session_across_scopes_returns_shared_entry() {
         origin: SessionOrigin::SyncImport,
         protocol: PROTO_TCP,
         tcp_flags: 0,
+        // #2170 test fixture: no peer install generation.
+        generation: 0,
     };
     let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
     let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
@@ -617,6 +621,8 @@ fn lookup_session_across_scopes_returns_shared_forward_wire_entry() {
         origin: SessionOrigin::SyncImport,
         protocol: PROTO_TCP,
         tcp_flags: 0,
+        // #2170 test fixture: no peer install generation.
+        generation: 0,
     };
     let translated_key = forward_wire_key(&key, decision.nat);
     let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
@@ -713,6 +719,8 @@ fn lookup_session_across_scopes_prefers_shared_entry_over_fabric_wire_placeholde
         origin: SessionOrigin::SyncImport,
         protocol: PROTO_TCP,
         tcp_flags: 0,
+        // #2170 test fixture: no peer install generation.
+        generation: 0,
     };
     let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
     let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
@@ -765,6 +773,8 @@ fn lookup_forward_nat_across_scopes_returns_shared_nat_entry() {
         origin: SessionOrigin::SyncImport,
         protocol: PROTO_ICMPV6,
         tcp_flags: 0,
+        // #2170 test fixture: no peer install generation.
+        generation: 0,
     };
     let reply_key = reverse_session_key(&key, decision.nat);
     let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
@@ -812,6 +822,8 @@ fn lookup_forward_nat_across_scopes_prefers_shared_entry_over_fabric_wire_placeh
         origin: SessionOrigin::SyncImport,
         protocol: PROTO_TCP,
         tcp_flags: 0,
+        // #2170 test fixture: no peer install generation.
+        generation: 0,
     };
     let reply_key = reverse_session_key(&key, decision.nat);
     let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
@@ -879,6 +891,8 @@ fn lookup_forward_nat_across_scopes_returns_shared_canonical_reverse_entry() {
         origin: SessionOrigin::SyncImport,
         protocol: PROTO_TCP,
         tcp_flags: 0,
+        // #2170 test fixture: no peer install generation.
+        generation: 0,
     };
     let canonical_reply = reverse_canonical_key(&key, decision.nat);
     let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
@@ -917,6 +931,8 @@ fn publish_and_remove_shared_session_tracks_forward_wire_alias() {
         origin: SessionOrigin::SyncImport,
         protocol: PROTO_TCP,
         tcp_flags: 0,
+        // #2170 test fixture: no peer install generation.
+        generation: 0,
     };
     let translated_key = forward_wire_key(&key, decision.nat);
 
@@ -967,6 +983,8 @@ fn publish_and_remove_shared_session_tracks_canonical_reverse_alias() {
         origin: SessionOrigin::SyncImport,
         protocol: PROTO_TCP,
         tcp_flags: 0,
+        // #2170 test fixture: no peer install generation.
+        generation: 0,
     };
     let canonical_reply = reverse_canonical_key(&key, decision.nat);
 
@@ -1013,6 +1031,8 @@ fn publish_and_remove_shared_session_tracks_owner_rg_indexes() {
         origin: SessionOrigin::SyncImport,
         protocol: PROTO_TCP,
         tcp_flags: 0,
+        // #2170 test fixture: no peer install generation.
+        generation: 0,
     };
     let forward_wire = forward_wire_key(&key, decision.nat);
     let reverse_wire = reverse_session_key(&key, decision.nat);
@@ -1105,6 +1125,8 @@ fn publish_shared_session_reindexes_owner_rg_on_replace() {
         origin: SessionOrigin::SyncImport,
         protocol: PROTO_TCP,
         tcp_flags: 0,
+        // #2170 test fixture: no peer install generation.
+        generation: 0,
     };
 
     publish_shared_session(
@@ -1155,6 +1177,8 @@ fn publish_shared_session_heals_missing_owner_rg_index_on_same_owner_update() {
         origin: SessionOrigin::SyncImport,
         protocol: PROTO_TCP,
         tcp_flags: 0,
+        // #2170 test fixture: no peer install generation.
+        generation: 0,
     };
 
     publish_shared_session(
@@ -1209,6 +1233,8 @@ fn resolve_flow_session_decision_uses_canonical_key_for_translated_forward_hit()
         origin: SessionOrigin::SyncImport,
         protocol: PROTO_TCP,
         tcp_flags: 0,
+        // #2170 test fixture: no peer install generation.
+        generation: 0,
     };
     let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
     let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
@@ -1283,6 +1309,8 @@ fn resolve_flow_session_decision_promotes_translated_shared_hit_on_active_fabric
         origin: SessionOrigin::SyncImport,
         protocol: PROTO_TCP,
         tcp_flags: 0x18,
+        // #2170 test fixture: no peer install generation.
+        generation: 0,
     };
     let mut forwarding = test_forwarding_state_with_fabric();
     forwarding.connected_v4.push(ConnectedRouteV4 {
@@ -1465,6 +1493,8 @@ fn resolve_flow_session_decision_keeps_translated_shared_hit_transient_on_inacti
         origin: SessionOrigin::SyncImport,
         protocol: PROTO_TCP,
         tcp_flags: 0x18,
+        // #2170 test fixture: no peer install generation.
+        generation: 0,
     };
     let mut forwarding = test_forwarding_state_with_fabric();
     forwarding.connected_v4.push(ConnectedRouteV4 {
@@ -1546,6 +1576,8 @@ fn resolve_flow_session_decision_keeps_translated_shared_hit_transient_on_inacti
         origin: SessionOrigin::SyncImport,
         protocol: PROTO_TCP,
         tcp_flags: 0x18,
+        // #2170 test fixture: no peer install generation.
+        generation: 0,
     };
     let mut forwarding = test_forwarding_state_with_fabric();
     forwarding.connected_v4.push(ConnectedRouteV4 {
@@ -1713,6 +1745,8 @@ fn apply_worker_commands_replaces_stale_local_session_for_inactive_owner_rg() {
             origin: SessionOrigin::SyncImport,
             protocol: PROTO_TCP,
             tcp_flags: 0x10,
+            // #2170 test fixture: no peer install generation.
+            generation: 0,
         }));
     let mut ha_state = BTreeMap::new();
     ha_state.insert(1, inactive_ha_runtime(0));
@@ -1776,6 +1810,8 @@ fn apply_worker_commands_preserves_local_session_for_active_owner_rg() {
             origin: SessionOrigin::SyncImport,
             protocol: PROTO_TCP,
             tcp_flags: 0x10,
+            // #2170 test fixture: no peer install generation.
+            generation: 0,
         }));
     let mut ha_state = BTreeMap::new();
     ha_state.insert(1, active_ha_runtime(monotonic_nanos() / 1_000_000_000));
@@ -2249,6 +2285,8 @@ fn demote_shared_owner_rgs_preserves_reverse_entries_and_marks_all_synced() {
         origin: SessionOrigin::SyncImport,
         protocol: PROTO_TCP,
         tcp_flags: 0x10,
+        // #2170 test fixture: no peer install generation.
+        generation: 0,
     };
     let reverse = SyncedSessionEntry {
         key: reverse_session_key(&forward.key, forward.decision.nat),
@@ -2260,6 +2298,8 @@ fn demote_shared_owner_rgs_preserves_reverse_entries_and_marks_all_synced() {
         origin: SessionOrigin::SyncImport,
         protocol: PROTO_TCP,
         tcp_flags: 0x10,
+        // #2170 test fixture: no peer install generation.
+        generation: 0,
     };
     publish_shared_session(
         &shared_sessions,
@@ -2325,6 +2365,8 @@ fn demoted_shared_local_forward_session_enters_reverse_prewarm_index() {
         origin: SessionOrigin::ForwardFlow,
         protocol: PROTO_TCP,
         tcp_flags: 0x10,
+        // #2170 test fixture: no peer install generation.
+        generation: 0,
     };
     entry.metadata.owner_rg_id = 1;
 
@@ -2375,6 +2417,8 @@ fn prewarm_reverse_synced_sessions_after_demotion_recomputes_split_owner_reverse
         origin: SessionOrigin::ForwardFlow,
         protocol: PROTO_TCP,
         tcp_flags: 0x10,
+        // #2170 test fixture: no peer install generation.
+        generation: 0,
     };
     entry.metadata.owner_rg_id = 1;
 
@@ -3015,6 +3059,8 @@ fn synthesized_synced_reverse_entry_preserves_fabric_ingress_and_reverse_flag() 
         origin: SessionOrigin::SyncImport,
         protocol: PROTO_TCP,
         tcp_flags: 0x10,
+        // #2170 test fixture: no peer install generation.
+        generation: 0,
     };
 
     let reverse = synthesized_synced_reverse_entry(
@@ -3050,6 +3096,8 @@ fn synthesized_synced_reverse_entry_tracks_local_client_when_owner_rg_active() {
         origin: SessionOrigin::SyncImport,
         protocol: PROTO_TCP,
         tcp_flags: 0x10,
+        // #2170 test fixture: no peer install generation.
+        generation: 0,
     };
     let mut ha_state = BTreeMap::new();
     ha_state.insert(1, active_ha_runtime(1));
@@ -3080,6 +3128,8 @@ fn synthesized_synced_reverse_entry_uses_fabric_redirect_when_client_rg_inactive
         origin: SessionOrigin::SyncImport,
         protocol: PROTO_TCP,
         tcp_flags: 0x10,
+        // #2170 test fixture: no peer install generation.
+        generation: 0,
     };
     let mut ha_state = BTreeMap::new();
     ha_state.insert(1, active_ha_runtime(1));
@@ -3286,6 +3336,8 @@ fn prewarm_reverse_synced_sessions_for_owner_rgs_adds_reverse_companion() {
         origin: SessionOrigin::SyncImport,
         protocol: PROTO_TCP,
         tcp_flags: 0x10,
+        // #2170 test fixture: no peer install generation.
+        generation: 0,
     };
     publish_shared_session(
         &shared_sessions,
@@ -3353,6 +3405,8 @@ fn prewarm_reverse_synced_sessions_for_owner_rgs_restores_shared_promote_forward
         origin: SessionOrigin::SharedPromote,
         protocol: PROTO_TCP,
         tcp_flags: 0x10,
+        // #2170 test fixture: no peer install generation.
+        generation: 0,
     };
     publish_shared_session(
         &shared_sessions,
@@ -3428,6 +3482,8 @@ fn prewarm_reverse_synced_sessions_recomputes_when_reverse_owner_rg_activates() 
         origin: SessionOrigin::SyncImport,
         protocol: PROTO_TCP,
         tcp_flags: 0x10,
+        // #2170 test fixture: no peer install generation.
+        generation: 0,
     };
     entry.metadata.owner_rg_id = 1;
     publish_shared_session(
@@ -3490,6 +3546,8 @@ fn reverse_prewarm_index_tracks_split_reverse_owner_rg_candidate() {
         origin: SessionOrigin::SyncImport,
         protocol: PROTO_TCP,
         tcp_flags: 0x10,
+        // #2170 test fixture: no peer install generation.
+        generation: 0,
     };
     entry.metadata.owner_rg_id = 1;
 
@@ -3587,6 +3645,8 @@ fn republish_bpf_session_entries_covers_all_sessions_in_owner_rg_index() {
         origin: SessionOrigin::SyncImport,
         protocol: PROTO_TCP,
         tcp_flags: 0x10,
+        // #2170 test fixture: no peer install generation.
+        generation: 0,
     };
     // Publish to shared table + sessions index (but NOT reverse_prewarm).
     publish_shared_session(
@@ -3684,6 +3744,8 @@ fn synced_session_hit_recomputes_local_resolution_after_failover() {
             origin: SessionOrigin::SyncImport,
             protocol: PROTO_TCP,
             tcp_flags: 0x10,
+            // #2170 test fixture: no peer install generation.
+            generation: 0,
         },
     );
     let peer_worker_commands = Vec::new();
@@ -3812,6 +3874,8 @@ fn apply_worker_commands_dispatch_order_pin_with_demote_dedup() {
         origin: SessionOrigin::SyncImport,
         protocol: PROTO_TCP,
         tcp_flags: 0x10,
+        // #2170 test fixture: no peer install generation.
+        generation: 0,
     };
 
     // Build a minimal TxRequest for the EnqueueShapedLocal step.
@@ -3957,6 +4021,8 @@ fn test_synced_entry() -> SyncedSessionEntry {
         origin: SessionOrigin::SyncImport,
         protocol: PROTO_TCP,
         tcp_flags: TCP_FLAG_ACK,
+        // #2170 test fixture: no peer install generation.
+        generation: 0,
     }
 }
 
@@ -4083,6 +4149,8 @@ fn w3_forward_entry(src_host: u8, src_port: u16, snat_ip: Ipv4Addr) -> SyncedSes
         origin: SessionOrigin::ForwardFlow,
         protocol: PROTO_TCP,
         tcp_flags: 0x02,
+        // #2170 test fixture: no peer install generation.
+        generation: 0,
     }
 }
 
@@ -4260,6 +4328,8 @@ fn shared_nat_displacement_counter_counts_collisions_not_republishes() {
         origin: SessionOrigin::ForwardFlow,
         protocol: PROTO_TCP,
         tcp_flags: 0x02,
+        // #2170 test fixture: no peer install generation.
+        generation: 0,
     };
     let mut direct = dnat.clone();
     direct.key.dst_ip = backend;
@@ -4398,6 +4468,8 @@ fn local_tunnel_pair() -> (SyncedSessionEntry, SyncedSessionEntry) {
         origin: SessionOrigin::SyncImport,
         protocol: PROTO_TCP,
         tcp_flags: TCP_FLAG_ACK,
+        // #2170 test fixture: no peer install generation.
+        generation: 0,
     };
     let reverse = synthesized_synced_reverse_entry(
         &forwarding,

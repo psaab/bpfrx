@@ -1058,6 +1058,71 @@ func TestShouldMirrorUserspaceSessionSkipsReverseEntries(t *testing.T) {
 	}
 }
 
+// TestBuildSessionSyncRequestForwardsGeneration verifies the #2170 install
+// generation is mirrored from SessionValue.Generation into the Go→Rust
+// SessionSyncRequest for both address families.
+func TestBuildSessionSyncRequestForwardsGeneration(t *testing.T) {
+	m := &Manager{bpfShim: dataplane.New()}
+	keyV4 := dataplane.SessionKey{SrcIP: [4]byte{10, 0, 0, 1}, DstIP: [4]byte{10, 0, 0, 2}, SrcPort: hostToNetwork16(1234), DstPort: hostToNetwork16(80), Protocol: 6}
+	valV4 := &dataplane.SessionValue{IngressZone: 1, EgressZone: 2, Generation: 0xABCDEF}
+	if req := m.buildSessionSyncRequestV4("upsert", keyV4, valV4); req.Generation != 0xABCDEF {
+		t.Fatalf("v4 request Generation = %#x, want %#x", req.Generation, uint64(0xABCDEF))
+	}
+
+	var srcIP, dstIP [16]byte
+	copy(srcIP[:], net.ParseIP("2001:db8::1").To16())
+	copy(dstIP[:], net.ParseIP("2001:db8::2").To16())
+	keyV6 := dataplane.SessionKeyV6{SrcIP: srcIP, DstIP: dstIP, SrcPort: hostToNetwork16(1234), DstPort: hostToNetwork16(80), Protocol: 6}
+	valV6 := &dataplane.SessionValueV6{IngressZone: 1, EgressZone: 2, Generation: 0x123456}
+	if req := m.buildSessionSyncRequestV6("upsert", keyV6, valV6); req.Generation != 0x123456 {
+		t.Fatalf("v6 request Generation = %#x, want %#x", req.Generation, uint64(0x123456))
+	}
+}
+
+// TestSessionSyncRequestGenerationJSONWireType is the #1961-class wire-type
+// guard: the Generation field MUST serialize as an explicit numeric value
+// (NO omitempty), so a 0 round-trips as 0 rather than being dropped. An old
+// helper without the field decodes via serde(default); a new helper sees an
+// explicit number.
+func TestSessionSyncRequestGenerationJSONWireType(t *testing.T) {
+	// Non-zero must serialize and decode losslessly.
+	req := SessionSyncRequest{Operation: "upsert", Generation: 0x1122334455667788}
+	b, err := json.Marshal(req)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if !strings.Contains(string(b), "\"generation\":1234605616436508552") {
+		t.Fatalf("generation not serialized as a number: %s", b)
+	}
+	var back SessionSyncRequest
+	if err := json.Unmarshal(b, &back); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if back.Generation != req.Generation {
+		t.Fatalf("Generation round-trip mismatch: got %#x", back.Generation)
+	}
+
+	// Zero MUST serialize as an explicit 0 (no omitempty drop) so the wire is
+	// unambiguous to a new decoder.
+	zero := SessionSyncRequest{Operation: "delete"}
+	zb, err := json.Marshal(zero)
+	if err != nil {
+		t.Fatalf("marshal zero: %v", err)
+	}
+	if !strings.Contains(string(zb), "\"generation\":0") {
+		t.Fatalf("zero generation must serialize explicitly as 0, got: %s", zb)
+	}
+
+	// A legacy payload with NO generation key decodes to 0.
+	var legacy SessionSyncRequest
+	if err := json.Unmarshal([]byte(`{"operation":"upsert","src_ip":"10.0.0.1"}`), &legacy); err != nil {
+		t.Fatalf("unmarshal legacy: %v", err)
+	}
+	if legacy.Generation != 0 {
+		t.Fatalf("legacy payload Generation = %d, want 0", legacy.Generation)
+	}
+}
+
 func TestSetClusterSyncedSessionV4SkipsReverseHelperMirror(t *testing.T) {
 	if err := rlimit.RemoveMemlock(); err != nil {
 		t.Skipf("RemoveMemlock: %v", err)

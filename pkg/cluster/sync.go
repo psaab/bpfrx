@@ -77,20 +77,40 @@ const syncPeerSilenceTimeout = 30 * time.Second
 
 // SyncStats tracks session synchronization statistics.
 type SyncStats struct {
-	SessionsSent       atomic.Uint64
-	SessionsReceived   atomic.Uint64
-	SessionsInstalled  atomic.Uint64
-	DeletesSent        atomic.Uint64
-	DeletesReceived    atomic.Uint64
-	BulkSyncs          atomic.Uint64
-	ConfigsSent        atomic.Uint64
-	ConfigsReceived    atomic.Uint64
-	IPsecSASent        atomic.Uint64
-	IPsecSAReceived    atomic.Uint64
-	FencesSent         atomic.Uint64
-	FencesReceived     atomic.Uint64
-	Errors             atomic.Uint64
-	DeletesDropped     atomic.Uint64
+	SessionsSent      atomic.Uint64
+	SessionsReceived  atomic.Uint64
+	SessionsInstalled atomic.Uint64
+	DeletesSent       atomic.Uint64
+	DeletesReceived   atomic.Uint64
+	BulkSyncs         atomic.Uint64
+	ConfigsSent       atomic.Uint64
+	ConfigsReceived   atomic.Uint64
+	IPsecSASent       atomic.Uint64
+	IPsecSAReceived   atomic.Uint64
+	FencesSent        atomic.Uint64
+	FencesReceived    atomic.Uint64
+	Errors            atomic.Uint64
+	DeletesDropped    atomic.Uint64
+	// DeletesStaleIgnored counts deletes refused by the #2170 install-
+	// generation guard: a journaled/deferred delete whose generation was
+	// strictly older than the currently-installed same-key entry. A nonzero
+	// value means the guard prevented a stale delete from killing a live
+	// same-5-tuple replacement session.
+	DeletesStaleIgnored atomic.Uint64
+	// InstallsStaleIgnored counts session installs refused because their
+	// generation was strictly older than the currently-stored entry — the
+	// delayed-stale-install variant (#2170 SMR C3). Refusing these keeps
+	// the per-key stored generation monotonic so a later stale delete can
+	// still be matched and refused.
+	InstallsStaleIgnored atomic.Uint64
+	// GenMapOverflow counts how many times a #2170 generation map (sender
+	// echo or receiver stored) was at genGuardMapCap and a NEW key therefore
+	// could not be recorded (#2198 F1). The key degrades to gen-0 (safe,
+	// unconditional) behavior. A nonzero value means a churn workload pushed
+	// a generation map to its cap; the map is never cleared, so existing live
+	// keys retain their stored generation and the guard stays correct for
+	// them.
+	GenMapOverflow     atomic.Uint64
 	Connected          atomic.Bool
 	BulkSyncStartTime  atomic.Int64
 	BulkSyncEndTime    atomic.Int64
@@ -104,29 +124,32 @@ type SyncStats struct {
 // SyncStatsSnapshot is a point-in-time copy of SyncStats with plain
 // non-atomic fields, safe to copy by value and pass across API boundaries.
 type SyncStatsSnapshot struct {
-	SessionsSent       uint64
-	SessionsReceived   uint64
-	SessionsInstalled  uint64
-	DeletesSent        uint64
-	DeletesReceived    uint64
-	BulkSyncs          uint64
-	ConfigsSent        uint64
-	ConfigsReceived    uint64
-	IPsecSASent        uint64
-	IPsecSAReceived    uint64
-	FencesSent         uint64
-	FencesReceived     uint64
-	Errors             uint64
-	DeletesDropped     uint64
-	Connected          bool
-	ActiveFabric       int
-	BulkSyncStartTime  int64
-	BulkSyncEndTime    int64
-	BulkSyncSessions   uint64
-	LastConfigSyncTime int64
-	LastConfigSyncSize uint64
-	LastFenceSeq       uint64
-	LastFenceAckAt     int64
+	SessionsSent         uint64
+	SessionsReceived     uint64
+	SessionsInstalled    uint64
+	DeletesSent          uint64
+	DeletesReceived      uint64
+	BulkSyncs            uint64
+	ConfigsSent          uint64
+	ConfigsReceived      uint64
+	IPsecSASent          uint64
+	IPsecSAReceived      uint64
+	FencesSent           uint64
+	FencesReceived       uint64
+	Errors               uint64
+	DeletesDropped       uint64
+	DeletesStaleIgnored  uint64
+	InstallsStaleIgnored uint64
+	GenMapOverflow       uint64
+	Connected            bool
+	ActiveFabric         int
+	BulkSyncStartTime    int64
+	BulkSyncEndTime      int64
+	BulkSyncSessions     uint64
+	LastConfigSyncTime   int64
+	LastConfigSyncSize   uint64
+	LastFenceSeq         uint64
+	LastFenceAckAt       int64
 }
 
 // TransferReadinessSnapshot captures session-sync state that determines whether
@@ -260,6 +283,32 @@ type SessionSync struct {
 	failoverSeq                atomic.Uint64
 	sessionMirrorWarnedV4      atomic.Bool
 	sessionMirrorWarnedV6      atomic.Bool
+
+	// #2170 HA deferred-delete generation guard.
+	//
+	// Sender side: genCounter is a single process-wide strictly-monotonic
+	// install generation, seeded at construction from CLOCK_MONOTONIC nanos
+	// so it never regresses below a value a peer may already hold across
+	// this node's restarts within a boot. Every session install (Queue*,
+	// sweep, bulk) draws genCounter.Add(1) and records it in genSentV4/V6
+	// keyed by the wire key. A delete echoes the recorded generation (the
+	// exact g of the install it cancels) and evicts the map entry, so the
+	// delete's generation is always same-domain as the entry the receiver
+	// stored. Generations are only ever compared per-(sender,key), never
+	// across keys, so a single sender-local counter is sufficient and no
+	// cross-node agreement on absolute values is required.
+	//
+	// Receiver side: recvGenV4/V6 is the authoritative per-key stored
+	// generation (the BPF C struct stays generation-free, SMR fix #3). It
+	// is set on install-apply and consulted by both the install guard and
+	// the delete guard, then evicted on delete-apply.
+	genCounter atomic.Uint64
+	genSentMu  sync.Mutex
+	genSentV4  map[dataplane.SessionKey]uint64
+	genSentV6  map[dataplane.SessionKeyV6]uint64
+	recvGenMu  sync.Mutex
+	recvGenV4  map[dataplane.SessionKey]uint64
+	recvGenV6  map[dataplane.SessionKeyV6]uint64
 }
 type failoverAck struct {
 	status uint8
@@ -385,8 +434,37 @@ func NewSessionSync(localAddr, peerAddr string, rt clusterRuntime) *SessionSync 
 		failoverBatchWaiters:       make(map[string]failoverWaiter),
 		failoverBatchCommitWaiters: make(map[string]failoverWaiter),
 	}
+	s.initGenState()
 	s.SetRuntime(rt)
 	return s
+}
+
+// initGenState seeds the #2170 install-generation counter from CLOCK_MONOTONIC
+// nanos and initializes the sender/receiver generation maps. Seeding from the
+// boot-relative monotonic clock keeps the counter from regressing below a
+// value the peer may already hold after this node restarts (process restart)
+// WITHIN a single OS boot.
+//
+// CROSS-BOOT (OS reboot) the monotonic clock resets, so this node's counter
+// can come up LOWER than a generation the peer stored from our previous boot.
+// That is handled on the RECEIVER side, not here: when a (reconnecting,
+// possibly rebooted) peer begins its bulk re-prime, the receiver resets its
+// per-key stored generations (resetRecvGen, called from the syncMsgBulkStart
+// handler, #2198 F2). The bulk re-prime — which re-installs every owned
+// session — then lands unconditionally and re-records each key's fresh
+// generation, so the install guard accepts it instead of refusing it as stale
+// (the stale-RETAIN inverse of #2170). A persisted cross-boot high-water mark
+// is therefore unnecessary.
+func (s *SessionSync) initGenState() {
+	seed := uint64(MonotonicNanos())
+	if seed == 0 {
+		seed = 1
+	}
+	s.genCounter.Store(seed)
+	s.genSentV4 = make(map[dataplane.SessionKey]uint64)
+	s.genSentV6 = make(map[dataplane.SessionKeyV6]uint64)
+	s.recvGenV4 = make(map[dataplane.SessionKey]uint64)
+	s.recvGenV6 = make(map[dataplane.SessionKeyV6]uint64)
 }
 
 // NewDualSessionSync creates a session sync manager with dual-fabric transport.
@@ -405,6 +483,7 @@ func NewDualSessionSync(local, peer, local1, peer1 string, rt clusterRuntime) *S
 		failoverBatchWaiters:       make(map[string]failoverWaiter),
 		failoverBatchCommitWaiters: make(map[string]failoverWaiter),
 	}
+	s.initGenState()
 	s.SetRuntime(rt)
 	return s
 }
@@ -474,7 +553,7 @@ func (s *SessionSync) Stats() SyncStatsSnapshot {
 		activeFabric = -1
 	}
 	s.mu.Unlock()
-	return SyncStatsSnapshot{SessionsSent: s.stats.SessionsSent.Load(), SessionsReceived: s.stats.SessionsReceived.Load(), SessionsInstalled: s.stats.SessionsInstalled.Load(), DeletesSent: s.stats.DeletesSent.Load(), DeletesReceived: s.stats.DeletesReceived.Load(), BulkSyncs: s.stats.BulkSyncs.Load(), ConfigsSent: s.stats.ConfigsSent.Load(), ConfigsReceived: s.stats.ConfigsReceived.Load(), IPsecSASent: s.stats.IPsecSASent.Load(), IPsecSAReceived: s.stats.IPsecSAReceived.Load(), FencesSent: s.stats.FencesSent.Load(), FencesReceived: s.stats.FencesReceived.Load(), Errors: s.stats.Errors.Load(), DeletesDropped: s.stats.DeletesDropped.Load(), Connected: s.stats.Connected.Load(), ActiveFabric: activeFabric, BulkSyncStartTime: s.stats.BulkSyncStartTime.Load(), BulkSyncEndTime: s.stats.BulkSyncEndTime.Load(), BulkSyncSessions: s.stats.BulkSyncSessions.Load(), LastConfigSyncTime: s.stats.LastConfigSyncTime.Load(), LastConfigSyncSize: s.stats.LastConfigSyncSize.Load(), LastFenceSeq: s.stats.LastFenceSeq.Load(), LastFenceAckAt: s.stats.LastFenceAckAt.Load()}
+	return SyncStatsSnapshot{SessionsSent: s.stats.SessionsSent.Load(), SessionsReceived: s.stats.SessionsReceived.Load(), SessionsInstalled: s.stats.SessionsInstalled.Load(), DeletesSent: s.stats.DeletesSent.Load(), DeletesReceived: s.stats.DeletesReceived.Load(), BulkSyncs: s.stats.BulkSyncs.Load(), ConfigsSent: s.stats.ConfigsSent.Load(), ConfigsReceived: s.stats.ConfigsReceived.Load(), IPsecSASent: s.stats.IPsecSASent.Load(), IPsecSAReceived: s.stats.IPsecSAReceived.Load(), FencesSent: s.stats.FencesSent.Load(), FencesReceived: s.stats.FencesReceived.Load(), Errors: s.stats.Errors.Load(), DeletesDropped: s.stats.DeletesDropped.Load(), DeletesStaleIgnored: s.stats.DeletesStaleIgnored.Load(), InstallsStaleIgnored: s.stats.InstallsStaleIgnored.Load(), GenMapOverflow: s.stats.GenMapOverflow.Load(), Connected: s.stats.Connected.Load(), ActiveFabric: activeFabric, BulkSyncStartTime: s.stats.BulkSyncStartTime.Load(), BulkSyncEndTime: s.stats.BulkSyncEndTime.Load(), BulkSyncSessions: s.stats.BulkSyncSessions.Load(), LastConfigSyncTime: s.stats.LastConfigSyncTime.Load(), LastConfigSyncSize: s.stats.LastConfigSyncSize.Load(), LastFenceSeq: s.stats.LastFenceSeq.Load(), LastFenceAckAt: s.stats.LastFenceAckAt.Load()}
 }
 
 // IsConnected reports whether a peer sync connection is currently established.

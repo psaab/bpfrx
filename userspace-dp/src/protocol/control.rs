@@ -725,6 +725,14 @@ pub(crate) struct SessionSyncRequest {
     pub fabric_ingress: bool,
     #[serde(rename = "is_reverse", default)]
     pub is_reverse: bool,
+    /// #2170 HA install generation. Mirrors the Go cluster apply layer's
+    /// per-(sender,key) monotonic generation so the helper's in-memory
+    /// SyncedSessionEntry can enforce the same guard (belt-and-suspenders
+    /// for helper-originated deletes and the delayed-stale-install
+    /// variant). `serde(default)` => 0 on an old peer that omits the field,
+    /// which falls back to unconditional behavior (rolling-upgrade safe).
+    #[serde(default)]
+    pub generation: u64,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]

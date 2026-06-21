@@ -126,6 +126,7 @@ func (s *SessionSync) BulkSync() error {
 			skipped++
 			return true
 		}
+		s.stampInstallGenV4(key, &val)
 		msg := encodeSessionV4Payload(key, val)
 		s.writeMu.Lock()
 		err := writeMsg(conn, syncMsgSessionV4, msg)
@@ -165,6 +166,7 @@ func (s *SessionSync) BulkSync() error {
 			skipped++
 			return true
 		}
+		s.stampInstallGenV6(key, &val)
 		msg := encodeSessionV6Payload(key, val)
 		s.writeMu.Lock()
 		err := writeMsg(conn, syncMsgSessionV6, msg)

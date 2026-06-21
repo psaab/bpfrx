@@ -282,6 +282,13 @@ pub(crate) struct SyncedSessionEntry {
     pub(crate) origin: SessionOrigin,
     pub(crate) protocol: u8,
     pub(crate) tcp_flags: u8,
+    /// #2170 HA install generation, mirrored from the Go cluster apply
+    /// layer. 0 means unknown/legacy. The local-origin entries (forwarding
+    /// learn, tunnel, promote, etc.) leave this 0 — only SyncImport entries
+    /// from the peer carry a meaningful generation, and the guards only act
+    /// when BOTH the stored and incoming generations are non-zero, so
+    /// local-origin entries fall back to today's unconditional behavior.
+    pub(crate) generation: u64,
 }
 
 impl BindingWorker {

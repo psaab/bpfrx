@@ -120,6 +120,8 @@ pub(in crate::afxdp::session_glue) fn maybe_promote_synced_session(
             origin: SessionOrigin::SharedPromote,
             protocol,
             tcp_flags,
+            // Local shared-promote: no peer install generation (#2170).
+            generation: 0,
         };
         publish_shared_session(
             shared.sessions,

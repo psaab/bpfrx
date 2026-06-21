@@ -119,6 +119,21 @@ impl super::Coordinator {
         per_binding.saturating_add(SESSION_PUBLISH_ERRORS_SHARED.load(Ordering::Relaxed))
     }
 
+    /// #2170: total stale-generation installs refused by the helper's
+    /// in-memory SyncedSessionEntry guard (the delayed-stale-install
+    /// variant). The authoritative guard is in the Go cluster apply layer;
+    /// this is the helper-side back-stop counter.
+    pub fn session_install_stale_ignored_total(&self) -> u64 {
+        SESSION_INSTALL_STALE_IGNORED.load(Ordering::Relaxed)
+    }
+
+    /// #2170: total stale-generation deletes refused by the helper's
+    /// in-memory SyncedSessionEntry guard (belt-and-suspenders for any
+    /// helper-side generation-aware delete).
+    pub fn session_delete_stale_ignored_total(&self) -> u64 {
+        SESSION_DELETE_STALE_IGNORED.load(Ordering::Relaxed)
+    }
+
     /// #1760 W3': shared-map NAT reverse-key displacement events — a
     /// `publish_shared_session` insert into `shared_nat_sessions`
     /// displaced a DIFFERENT forward session's entry at the same reverse

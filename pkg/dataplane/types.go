@@ -51,6 +51,19 @@ type SessionValue struct {
 	FibDmac    [6]byte
 	FibSmac    [6]byte
 	FibGen     uint16
+
+	// Generation is a per-(sender,key) monotonic install generation used
+	// by the HA session-sync deferred-delete guard (#2170). It is
+	// userspace-sync-only metadata — like the LogFlagUserspace* bits — and
+	// is NOT mirrored into the BPF C conntrack struct. The cluster sync
+	// sender stamps every install with a strictly increasing generation;
+	// the receiver refuses a delete (or a stale install) whose generation
+	// is strictly older than the currently-stored entry's, so a journaled
+	// delete for a closed incarnation cannot kill a same-5-tuple
+	// replacement that was re-synced with a newer generation. A value of 0
+	// means "unknown / legacy peer" and falls back to unconditional
+	// delete (rolling-upgrade safe).
+	Generation uint64
 }
 
 // SessionKeyV6 mirrors the C struct session_key_v6 (5-tuple with 128-bit IPs).
@@ -102,6 +115,10 @@ type SessionValueV6 struct {
 	FibDmac    [6]byte
 	FibSmac    [6]byte
 	FibGen     uint16
+
+	// Generation: see SessionValue.Generation. Userspace-sync-only HA
+	// deferred-delete guard metadata (#2170), not in the BPF C struct.
+	Generation uint64
 }
 
 // ZoneConfig mirrors the C struct zone_config.

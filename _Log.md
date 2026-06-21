@@ -1,5 +1,39 @@
 # Action Log
 
+## 2026-06-21 — #2170 (PR #2198) fold: gen-map overflow, cross-boot regression, atomicity note
+
+- **Timestamp**: 2026-06-21
+- **Action**: Folded the independent review's three findings into the #2170
+  HA session-sync install-generation guard PR.
+  **F1 (MAJOR — reintroduced the #2170 bug under churn):** the generation
+  maps (`genSentV4/V6`, `recvGenV4/V6`) cleared the WHOLE map on reaching
+  `genGuardMapCap` (200000, reachable inside the 10M MaxSessions envelope),
+  dropping every live key's stored generation and disabling the guard
+  cluster-wide for a churn window — a stale delete could then kill a live
+  re-established session. Fix: `putGenBounded[K]` generic helper — NEVER
+  clears; updates an existing key in place, skip-records a new key at cap
+  (degrades to safe gen-0) and bumps the new `GenMapOverflow` counter.
+  **F2 (MINOR — cross-boot stale-RETAIN, inverse of #2170):** `genCounter`
+  seeded from `MonotonicNanos()` resets at OS reboot, so a rebooted peer's
+  cold-start bulk re-prime carries lower generations and the install guard
+  refused it as stale. Fix: receiver resets `recvGenV4/V6` on
+  `syncMsgBulkStart` (`resetRecvGen`) so the authoritative bulk re-prime
+  lands and re-records fresh generations; safe because deletes only act at
+  `BulkEnd`. Seed comment in `initGenState` rewritten to match.
+  **F3 (MINOR):** documented that the check->Put->record apply sequence is
+  not held under one `recvGenMu` acquisition and why it is safe (per-peer
+  receive path is single-threaded over the single active fabric).
+- **File(s)**: pkg/cluster/sync_conn.go, pkg/cluster/sync.go,
+  pkg/cluster/sync_gen_guard_test.go, docs/sync-protocol.md,
+  pkg/cluster/README.md
+- **Validation**: new F1 hazard test (`TestGenMapOverflowKeepsLiveKeyV4`),
+  F1 semantics test (`TestRecordInstalledGenSkipsNewKeyOnFull`), and F2
+  test (`TestPeerRebootBulkRePrimeAcceptedAfterReset`) all FAIL pre-fix
+  (proven by temporarily neutralizing the behavior) and PASS post-fix.
+  `go build ./...` clean; `go test ./pkg/cluster/... ./pkg/conntrack/...`
+  green; `go test -race ./pkg/cluster/... -count=3` clean. Existing tests
+  untouched and green. No wire-format or Rust-helper change.
+
 ## 2026-06-21 — #2158 file-split: split pkg/config/compiler.go (3050 LOC)
 
 - **Timestamp**: 2026-06-21
@@ -8408,6 +8442,47 @@ top.
   CLAUDE.md
 
 - **Timestamp**: 2026-06-21
+  **Action**: #2170 — HA session-sync install-generation guard so a
+  deferred/journaled delete cannot kill a same-5-tuple replacement session.
+  Stamp every session install AND delete with a monotonic per-(sender,key)
+  install generation carried as a length-gated trailing uint64 on the session
+  and delete wire messages (+ Go SessionSyncRequest + Rust SyncedSessionEntry).
+  Sender (pkg/cluster) uses a single boot-seeded monotonic counter and ECHOES
+  the install generation on the matching delete (handles the cross-owner
+  failover edge). Receiver keeps the authoritative per-key stored generation in
+  SessionSync.recvGenV4/V6 (BPF C struct stays generation-free); the apply layer
+  refuses a delete whose generation is strictly older than the stored entry
+  (deleteClusterSynced*, DeletesStaleIgnored) and refuses an install that would
+  regress the stored generation (installClusterSynced*, InstallsStaleIgnored).
+  Equality applies; gen==0 on either side falls back to today's unconditional
+  delete (rolling-upgrade safe). Reverse-companion + fabric-alias share the
+  install's generation. Rust helper mirrors the field and guards
+  upsert_synced_session / delete_synced_session_gen as belt-and-suspenders
+  (authoritative guard is the Go apply layer). New counters
+  SESSION_INSTALL_STALE_IGNORED / SESSION_DELETE_STALE_IGNORED with coordinator
+  accessors. Unit tests (Go + Rust) each FAIL on pre-fix for the §3.4 race,
+  the delayed-stale-install variant, the gen==0 rolling-upgrade fallback,
+  same-second/same-slot monotonicity, failover-domain re-stamp, and wire
+  round-trip / cross-version short-payload decode. go build ./... +
+  go test pkg/cluster/... pkg/conntrack/... pkg/dataplane/... pkg/daemon/...
+  green; cargo build --release + cargo test --release session (288) green;
+  new concurrency test race-clean 5x. test-failover PENDING-PARENT.
+  **File(s)**: pkg/dataplane/types.go, pkg/cluster/sync.go,
+  pkg/cluster/sync_conn.go, pkg/cluster/sync_protocol.go, pkg/cluster/sync_bulk.go,
+  pkg/cluster/sync_test.go, pkg/cluster/sync_gen_guard_test.go,
+  pkg/dataplane/userspace/protocol.go, pkg/dataplane/userspace/manager_ha.go,
+  pkg/dataplane/userspace/manager_test.go, userspace-dp/src/protocol/control.rs,
+  userspace-dp/src/protocol/tests.rs, userspace-dp/src/afxdp/worker/mod.rs,
+  userspace-dp/src/afxdp/ha.rs, userspace-dp/src/afxdp/ha_tests.rs,
+  userspace-dp/src/afxdp/shared_ops.rs, userspace-dp/src/afxdp/tunnel.rs,
+  userspace-dp/src/afxdp/forwarding/mod.rs, userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/session_glue/promote.rs,
+  userspace-dp/src/afxdp/bpf_map/metrics.rs, userspace-dp/src/afxdp/coordinator/status.rs,
+  userspace-dp/src/server/helpers.rs,
+  userspace-dp/src/afxdp/tests.rs, userspace-dp/src/afxdp/forwarding/tests.rs,
+  userspace-dp/src/afxdp/session_glue/tests.rs,
+  docs/sync-protocol.md, pkg/cluster/README.md, userspace-dp/src/session/README.md,
+  docs/research/2170-ha-deferred-delete/plan.md
 - **Action**: #2158 P1 Go file-split — split pkg/configstore/store.go (2112
   LOC, over the ~2000 modularity threshold) into six cohesive same-package
   files per the converged plan section 5.3. Pure code-motion: no logic

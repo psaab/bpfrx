@@ -668,6 +668,9 @@ pub(super) fn synthesized_synced_reverse_entry(
         origin: SessionOrigin::SyncImport,
         protocol: entry.protocol,
         tcp_flags: entry.tcp_flags,
+        // #2170: the reverse companion inherits the forward entry's install
+        // generation so a delete refusal is consistent across both halves.
+        generation: entry.generation,
     })
 }
 
@@ -764,6 +767,8 @@ pub(super) fn install_reverse_session_from_forward_match(
             origin: SessionOrigin::ReverseFlow,
             protocol,
             tcp_flags,
+            // Local reverse-flow learning: no peer install generation (#2170).
+            generation: 0,
         };
         publish_shared_session(
             shared_sessions,

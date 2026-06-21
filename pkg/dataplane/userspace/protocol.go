@@ -1755,6 +1755,16 @@ type SessionSyncRequest struct {
 	NATDstPort       uint16 `json:"nat_dst_port,omitempty"`
 	FabricIngress    bool   `json:"fabric_ingress,omitempty"`
 	IsReverse        bool   `json:"is_reverse,omitempty"`
+	// Generation carries the #2170 HA install generation to the helper so
+	// its in-memory SyncedSessionEntry can mirror the cluster apply layer's
+	// generation guard (belt-and-suspenders for helper-originated deletes
+	// and the delayed-stale-install variant). Plain uint64 with NO
+	// omitempty: a 0 value MUST serialize as 0 (legacy/unknown) so an old
+	// helper without the field still decodes via serde(default), and a new
+	// helper sees an explicit 0 rather than a missing key — the #1961
+	// wire-type discipline (no omitempty ambiguity on a numeric field). The
+	// Rust side declares `#[serde(default)] generation: u64`.
+	Generation uint64 `json:"generation"`
 }
 
 type SessionDeltaInfo struct {
