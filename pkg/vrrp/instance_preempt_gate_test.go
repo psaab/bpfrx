@@ -31,7 +31,7 @@ func newGateTestInstance(t *testing.T, priority int, preempt bool) *vrrpInstance
 		Priority:  priority,
 		Preempt:   preempt,
 	}, &net.Interface{Name: "eth0"}, eventCh, nil)
-	vi.localIP = net.IPv4(10, 0, 0, 1)
+	vi.setLocalIP(net.IPv4(10, 0, 0, 1))
 	vi.suppressGARP.Store(true)
 	vi.setState(StateBackup)
 	return vi

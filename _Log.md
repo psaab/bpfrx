@@ -1,5 +1,36 @@
 # Action Log
 
+## 2026-06-21 — #2258 VRRP localIP/localIPv6 lazy-resolve race (run-loop write vs receiver reads)
+
+- **Timestamp**: 2026-06-21
+- **Action**: Fixed a Go data race on `vrrpInstance.localIP`/`localIPv6`
+  (found during the #2257/#2225 review; pre-existing, distinct from the
+  `lastDropWarn` race). `localIP`/`localIPv6` are resolved once in
+  `openSocket()` before any goroutine starts, but that resolution can come
+  back empty (no IPv4 address yet, or IPv6 DAD still running). In that case
+  `sendPacket()`/`sendPacketIPv6()` perform a one-shot LAZY-RESOLVE WRITE
+  from the run-loop goroutine, while the receiver goroutines
+  (`receiver`/`receiverIPv6`/`parseAfPacketIPv4`/`parseAfPacketIPv6`) read
+  the fields to filter self-sent adverts — an unsynchronized write/read
+  (`go test -race` flags it; fires at most once, only when unresolved at
+  socket-open). Option (a) early-resolve was infeasible because the address
+  genuinely may be unresolvable at socket-open (DAD/no-addr); chose option
+  (b): both fields are now `atomic.Pointer[net.IP]` accessed only via
+  `getLocalIP`/`setLocalIP` and `getLocalIPv6`/`setLocalIPv6` (nil pointer =
+  unresolved). Lazy-resolve semantics preserved (the address still becomes
+  available once resolvable); packet hot path stays lock-free, mirroring
+  the `lastDropWarn` atomic pattern (#2225). Sibling audit: the run-loop
+  tie-break reader in `handleMasterRx` and the `run()` IPv6-receiver gate
+  also route through the accessors (same-goroutine, but consistent). New
+  fail-on-revert `-race` tests drive the lazy-resolve write concurrently
+  with the real `parseAfPacketIPv4`/`parseAfPacketIPv6` reader (CLEAN with
+  the atomic fix, DETECTS the race when reverted to a plain net.IP).
+  make test-failover (HA/VRRP no-regression) PENDING-PARENT — the -race
+  unit test is the primary gate.
+- **File(s)**: pkg/vrrp/instance.go,
+  pkg/vrrp/instance_localip_race_test.go (new), pkg/vrrp/vrrp_test.go,
+  pkg/vrrp/instance_preempt_gate_test.go, pkg/vrrp/README.md
+
 ## 2026-06-21 — #2255 NAT translation-hit counter_id stability
 
 - **Timestamp**: 2026-06-21
