@@ -554,13 +554,74 @@ func (s *SessionSync) flushDeleteJournal() {
 		return
 	}
 	var flushed int
-	// Replay journaled delete messages before normal sync resumes.
-	for _, msg := range journal {
+	// Replay journaled deletes through the ordered send stream. queueMessage
+	// is non-blocking and increments DeletesSent on success; on a full sendCh
+	// (or a peer disconnect) it returns false. Mirror the QueueDeleteV4
+	// contract: re-journal (retain) the un-sent tail instead of dropping it,
+	// so it replays on the next reconnect flush. Previously a full sendCh
+	// here silently dropped the un-sent deletes (the journal was already
+	// nil'd), leaving stale sessions on the peer (#2121).
+	for i, msg := range journal {
 		if s.queueMessage(msg, &s.stats.DeletesSent, "journal_flush") {
 			flushed++
+			continue
 		}
+		// queueMessage returned false — the send queue is full or the peer
+		// disconnected (queueMessage checks Connected first). Either way the
+		// remaining messages would also fail, so re-journal this message and
+		// the rest (FIFO-prepended ahead of any deletes concurrently journaled
+		// during the flush) and stop. Stopping keeps the un-sent suffix
+		// contiguous and ordered; they replay on the next reconnect flush.
+		s.rejournalTail(journal[i:])
+		slog.Warn("cluster sync: delete journal flush could not enqueue (queue full or disconnected), re-journaled un-sent tail for next reconnect",
+			"total", len(journal), "flushed", flushed, "rejournaled", len(journal)-i,
+			"connected", s.stats.Connected.Load(),
+			"queue_len", len(s.sendCh), "queue_cap", cap(s.sendCh))
+		return
 	}
-	slog.Info("cluster sync: flushed delete journal", "total", len(journal), "sent", flushed)
+	slog.Info("cluster sync: flushed delete journal", "total", len(journal), "flushed", flushed)
+}
+
+// rejournalTail re-inserts the un-sent delete tail at the FRONT of the
+// delete journal so it replays before any deletes that were concurrently
+// journaled (by QueueDeleteV4/V6) while the flush ran, preserving FIFO
+// order. On overflow it drops the OLDEST entries from the front of the
+// merged list — never the newer concurrently-journaled deletes — and
+// counts the dropped entries in DeletesDropped. Acquires deleteJournalMu
+// exactly once. Used by flushDeleteJournal when the send stream is full or
+// disconnected; the retained deletes replay on the next reconnect flush.
+func (s *SessionSync) rejournalTail(tail [][]byte) {
+	if len(tail) == 0 {
+		return
+	}
+	s.deleteJournalMu.Lock()
+	defer s.deleteJournalMu.Unlock()
+	capN := s.deleteJournalCap
+	if capN <= 0 {
+		capN = deleteJournalDefaultCap
+	}
+	total := len(tail) + len(s.deleteJournal)
+	if total <= capN {
+		merged := make([][]byte, 0, total)
+		merged = append(merged, tail...)
+		merged = append(merged, s.deleteJournal...)
+		s.deleteJournal = merged
+		return
+	}
+	dropped := total - capN
+	s.stats.DeletesDropped.Add(uint64(dropped))
+	merged := make([][]byte, 0, capN)
+	if dropped < len(tail) {
+		// Drop the oldest prefix of the tail; keep the rest plus all of the
+		// newer concurrently-journaled deletes.
+		merged = append(merged, tail[dropped:]...)
+		merged = append(merged, s.deleteJournal...)
+	} else {
+		// The entire tail is evicted; also drop the oldest prefix of the
+		// concurrently-journaled deletes to fit the cap.
+		merged = append(merged, s.deleteJournal[dropped-len(tail):]...)
+	}
+	s.deleteJournal = merged
 }
 
 // QueueConfig sends the full config text to the peer for configuration synchronization.

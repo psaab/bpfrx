@@ -1406,8 +1406,20 @@ func TestBulkEpochMismatchIgnored(t *testing.T) {
 	ss.IsPrimaryForRGFn = func(rgID int) bool { return false }
 	ss.SetZoneRGMap(map[uint16]int{2: 2})
 
+	// OnBulkSyncReceived fires on a goroutine spawned by handleMessage, so
+	// guard the flag against the test's reads (data race under -race).
+	var calledMu sync.Mutex
 	called := false
-	ss.OnBulkSyncReceived = func() { called = true }
+	wasCalled := func() bool {
+		calledMu.Lock()
+		defer calledMu.Unlock()
+		return called
+	}
+	ss.OnBulkSyncReceived = func() {
+		calledMu.Lock()
+		called = true
+		calledMu.Unlock()
+	}
 
 	// BulkStart with epoch 5
 	var startBuf [8]byte
@@ -1421,7 +1433,7 @@ func TestBulkEpochMismatchIgnored(t *testing.T) {
 
 	// Callback should NOT have been invoked
 	time.Sleep(50 * time.Millisecond)
-	if called {
+	if wasCalled() {
 		t.Fatal("OnBulkSyncReceived should not be called on epoch mismatch")
 	}
 
@@ -1436,7 +1448,7 @@ func TestBulkEpochMismatchIgnored(t *testing.T) {
 	ss.handleMessage(nil, syncMsgBulkEnd, matchBuf[:])
 
 	time.Sleep(50 * time.Millisecond)
-	if !called {
+	if !wasCalled() {
 		t.Fatal("OnBulkSyncReceived should be called on matching epoch")
 	}
 }
@@ -2265,6 +2277,205 @@ func TestSessionQueueDoesNotJournal(t *testing.T) {
 		t.Fatal("session updates should not be journaled")
 	}
 	ss.deleteJournalMu.Unlock()
+}
+
+// deleteKeyN builds a distinct v4 delete key for index n.
+func deleteKeyN(n int) dataplane.SessionKey {
+	return dataplane.SessionKey{
+		SrcIP:    [4]byte{10, 0, 1, byte(n)},
+		Protocol: 6,
+		SrcPort:  uint16(1000 + n),
+		DstPort:  80,
+	}
+}
+
+// TestDeleteJournalFlushRetainsTailOnFullQueue is the #2121 regression: a
+// flush that hits a full send queue must RE-JOURNAL the un-sent deletes
+// instead of silently dropping them. Pre-fix the journal was nil'd and the
+// deletes dropped (len(deleteJournal)==0 here), so this test fails pre-fix.
+func TestDeleteJournalFlushRetainsTailOnFullQueue(t *testing.T) {
+	ss := NewSessionSync(":0", "10.0.0.2:4785", nil)
+	// Reassign a tiny send channel and saturate it so queueMessage's
+	// non-blocking send fails immediately (NewSessionSync hardcodes cap 4096).
+	ss.sendCh = make(chan []byte, 2)
+	ss.sendCh <- []byte{0}
+	ss.sendCh <- []byte{0}
+	ss.stats.Connected.Store(true)
+
+	const n = 5
+	for i := 0; i < n; i++ {
+		ss.deleteJournalMu.Lock()
+		ss.deleteJournal = append(ss.deleteJournal, encodeDeleteV4(deleteKeyN(i)))
+		ss.deleteJournalMu.Unlock()
+	}
+
+	ss.flushDeleteJournal()
+
+	if got := ss.stats.DeletesSent.Load(); got != 0 {
+		t.Fatalf("expected 0 deletes sent on a full queue, got %d", got)
+	}
+	if got := ss.stats.DeletesDropped.Load(); got != 0 {
+		t.Fatalf("expected 0 deletes dropped (n <= cap), got %d", got)
+	}
+	ss.deleteJournalMu.Lock()
+	defer ss.deleteJournalMu.Unlock()
+	if len(ss.deleteJournal) != n {
+		t.Fatalf("expected all %d un-sent deletes re-journaled, got %d", n, len(ss.deleteJournal))
+	}
+	// FIFO order preserved.
+	for i := 0; i < n; i++ {
+		want := encodeDeleteV4(deleteKeyN(i))
+		if string(ss.deleteJournal[i]) != string(want) {
+			t.Fatalf("re-journaled delete %d out of order", i)
+		}
+	}
+}
+
+// TestDeleteJournalFlushPartialThenRetains: when only some deletes fit in
+// the send queue, the rest are re-journaled at the FRONT (FIFO).
+func TestDeleteJournalFlushPartialThenRetains(t *testing.T) {
+	ss := NewSessionSync(":0", "10.0.0.2:4785", nil)
+	ss.sendCh = make(chan []byte, 3) // 3 slots free, all empty
+	ss.stats.Connected.Store(true)
+
+	const n = 5
+	for i := 0; i < n; i++ {
+		ss.deleteJournalMu.Lock()
+		ss.deleteJournal = append(ss.deleteJournal, encodeDeleteV4(deleteKeyN(i)))
+		ss.deleteJournalMu.Unlock()
+	}
+
+	ss.flushDeleteJournal()
+
+	if got := ss.stats.DeletesSent.Load(); got != 3 {
+		t.Fatalf("expected 3 deletes enqueued, got %d", got)
+	}
+	ss.deleteJournalMu.Lock()
+	defer ss.deleteJournalMu.Unlock()
+	if len(ss.deleteJournal) != 2 {
+		t.Fatalf("expected 2 un-sent deletes re-journaled, got %d", len(ss.deleteJournal))
+	}
+	// The two re-journaled deletes are the last two (indices 3,4) in order.
+	for j, i := range []int{3, 4} {
+		want := encodeDeleteV4(deleteKeyN(i))
+		if string(ss.deleteJournal[j]) != string(want) {
+			t.Fatalf("re-journaled delete %d (orig idx %d) out of order", j, i)
+		}
+	}
+}
+
+// TestRejournalTailFIFOPrependAndOverflow unit-tests rejournalTail across
+// all three branches: no overflow, overflow within the tail, and tail
+// fully dropped (overflow into the concurrently-journaled deletes).
+func TestRejournalTailFIFOPrependAndOverflow(t *testing.T) {
+	mk := func(n int) []byte { return encodeDeleteV4(deleteKeyN(n)) }
+	eq := func(t *testing.T, got [][]byte, wantIdx []int) {
+		t.Helper()
+		if len(got) != len(wantIdx) {
+			t.Fatalf("len = %d, want %d", len(got), len(wantIdx))
+		}
+		for i, idx := range wantIdx {
+			if string(got[i]) != string(mk(idx)) {
+				t.Fatalf("entry %d mismatch (want idx %d)", i, idx)
+			}
+		}
+	}
+
+	// Branch 1: no overflow. journal=[1,2] (newer), tail=[3,4,5] (older).
+	// Result: tail prepended -> [3,4,5,1,2].
+	t.Run("no_overflow", func(t *testing.T) {
+		ss := NewSessionSync(":0", "10.0.0.2:4785", nil)
+		ss.deleteJournalCap = 10
+		ss.deleteJournal = [][]byte{mk(1), mk(2)}
+		ss.rejournalTail([][]byte{mk(3), mk(4), mk(5)})
+		eq(t, ss.deleteJournal, []int{3, 4, 5, 1, 2})
+		if d := ss.stats.DeletesDropped.Load(); d != 0 {
+			t.Fatalf("dropped = %d, want 0", d)
+		}
+	})
+
+	// Branch 2: overflow within tail. cap=4, journal=[1,2], tail=[3,4,5].
+	// total=5, dropped=1 (< len(tail)=3) -> drop oldest tail entry (3),
+	// keep [4,5] + [1,2] = [4,5,1,2].
+	t.Run("overflow_within_tail", func(t *testing.T) {
+		ss := NewSessionSync(":0", "10.0.0.2:4785", nil)
+		ss.deleteJournalCap = 4
+		ss.deleteJournal = [][]byte{mk(1), mk(2)}
+		ss.rejournalTail([][]byte{mk(3), mk(4), mk(5)})
+		eq(t, ss.deleteJournal, []int{4, 5, 1, 2})
+		if d := ss.stats.DeletesDropped.Load(); d != 1 {
+			t.Fatalf("dropped = %d, want 1", d)
+		}
+	})
+
+	// Branch 3: tail fully dropped. cap=2, journal=[1,2,3], tail=[4,5,6].
+	// total=6, dropped=4 (>= len(tail)=3) -> drop all tail + oldest 1 of
+	// journal -> keep journal[1:] = [2,3].
+	t.Run("tail_fully_dropped", func(t *testing.T) {
+		ss := NewSessionSync(":0", "10.0.0.2:4785", nil)
+		ss.deleteJournalCap = 2
+		ss.deleteJournal = [][]byte{mk(1), mk(2), mk(3)}
+		ss.rejournalTail([][]byte{mk(4), mk(5), mk(6)})
+		eq(t, ss.deleteJournal, []int{2, 3})
+		if d := ss.stats.DeletesDropped.Load(); d != 4 {
+			t.Fatalf("dropped = %d, want 4", d)
+		}
+	})
+}
+
+// TestDeleteJournalFlushAllFit: with room in the send queue, every
+// journaled delete is enqueued and the journal empties.
+func TestDeleteJournalFlushAllFit(t *testing.T) {
+	ss := NewSessionSync(":0", "10.0.0.2:4785", nil)
+	ss.sendCh = make(chan []byte, 16)
+	ss.stats.Connected.Store(true)
+
+	const n = 4
+	for i := 0; i < n; i++ {
+		ss.deleteJournalMu.Lock()
+		ss.deleteJournal = append(ss.deleteJournal, encodeDeleteV4(deleteKeyN(i)))
+		ss.deleteJournalMu.Unlock()
+	}
+	ss.flushDeleteJournal()
+
+	if got := ss.stats.DeletesSent.Load(); got != n {
+		t.Fatalf("expected %d deletes sent, got %d", n, got)
+	}
+	ss.deleteJournalMu.Lock()
+	defer ss.deleteJournalMu.Unlock()
+	if len(ss.deleteJournal) != 0 {
+		t.Fatalf("journal should be empty after a fully-flushed journal, got %d", len(ss.deleteJournal))
+	}
+}
+
+// TestDeleteJournalFlushOrderingWithQueuedSession proves the flush keeps a
+// delete ordered BEHIND a session frame already queued in sendCh (the
+// single ordered path), so a same-key delete cannot jump ahead of a
+// queued session on the wire.
+func TestDeleteJournalFlushOrderingWithQueuedSession(t *testing.T) {
+	ss := NewSessionSync(":0", "10.0.0.2:4785", nil)
+	ss.sendCh = make(chan []byte, 16)
+	ss.stats.Connected.Store(true)
+
+	key := deleteKeyN(7)
+	val := dataplane.SessionValue{State: 1}
+	// Session frame queued first.
+	ss.sendCh <- encodeSessionV4(key, val)
+	// Then flush a same-key delete.
+	ss.deleteJournalMu.Lock()
+	ss.deleteJournal = append(ss.deleteJournal, encodeDeleteV4(key))
+	ss.deleteJournalMu.Unlock()
+	ss.flushDeleteJournal()
+
+	// Drain in order: session must come out before the delete.
+	first := <-ss.sendCh
+	second := <-ss.sendCh
+	if first[4] != syncMsgSessionV4 {
+		t.Fatalf("expected session frame first, got type %d", first[4])
+	}
+	if second[4] != syncMsgDeleteV4 {
+		t.Fatalf("expected delete frame second, got type %d", second[4])
+	}
 }
 
 func TestWaitForPeerBarrierRequiresConnection(t *testing.T) {
