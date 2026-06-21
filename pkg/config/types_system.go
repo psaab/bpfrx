@@ -956,4 +956,32 @@ type DHCPPool struct {
 	DNSServers []string
 	LeaseTime  int // seconds (0 = default 86400)
 	Domain     string
+	// StaticBindings are fixed (reserved) address assignments scoped to
+	// this pool's subnet (#2243). Each binds a client identity
+	// (hardware-address / MAC) to a fixed-address that the matching client
+	// always receives. They render to Kea per-subnet `reservations`
+	// (hw-address -> ip-address [+ hostname]). Reservations derive entirely
+	// from the committed config, so an HA pair serving identical subnets is
+	// reservation-consistent by construction via the existing cluster
+	// config-sync — no per-lease replication is needed for the static case
+	// (the dynamic-lease HA gap is the separate companion #2239).
+	StaticBindings []*DHCPStaticBinding
+}
+
+// DHCPStaticBinding is a single fixed/reserved DHCP-server host binding
+// (#2243). Junos `dhcp-local-server group <g> pool <p> static-binding <mac>
+// { fixed-address <ip>; host-name <name>; }`. It maps a client hardware
+// address to a fixed address within the enclosing pool's subnet; the
+// optional host-name becomes the Kea reservation hostname.
+type DHCPStaticBinding struct {
+	// MACAddress is the client hardware address (the binding identity key),
+	// e.g. "00:11:22:33:44:55". Rendered as Kea `hw-address`.
+	MACAddress string
+	// FixedAddress is the reserved IP the matching client always receives.
+	// Must fall inside the enclosing pool's Subnet. Rendered as Kea
+	// `ip-address`.
+	FixedAddress string
+	// HostName is the optional reservation hostname (Kea `hostname`). Empty
+	// when not configured.
+	HostName string
 }

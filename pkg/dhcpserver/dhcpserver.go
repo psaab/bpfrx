@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/netip"
 	"os"
 	"os/exec"
@@ -598,6 +599,25 @@ func (m *Manager) warnAmbiguousV4SubnetSelection(srv *config.DHCPLocalServerConf
 	}
 }
 
+// canonicalMAC normalizes a static-binding MAC to Kea's accepted
+// colon-separated lowercase form (aa:bb:cc:dd:ee:ff). ValidateMAC at
+// commit accepts Go's net.ParseMAC inputs, which include the Cisco
+// dotted-triplet form (0011.2233.4455) and uppercase — but Kea's
+// hw-address parser REJECTS the dotted form, so a config that commits
+// clean would otherwise break the entire Kea Dhcp4/6 reconfigure (parse
+// failure -> server down). Render canonically. The MAC was already
+// validated at commit, so a parse error here is not expected; on the
+// off chance it occurs we report it so the caller can skip the entry
+// (consistent with the tolerant-load skip guard) rather than emit a
+// malformed reservation.
+func canonicalMAC(mac string) (string, bool) {
+	hw, err := net.ParseMAC(mac)
+	if err != nil {
+		return "", false
+	}
+	return hw.String(), true
+}
+
 func (m *Manager) generateKea4Config(cfg *config.DHCPServerConfig) error {
 	type keaPool struct {
 		Pool string `json:"pool"`
@@ -606,13 +626,19 @@ func (m *Manager) generateKea4Config(cfg *config.DHCPServerConfig) error {
 		Name string `json:"name"`
 		Data string `json:"data"`
 	}
+	type keaReservation struct {
+		HWAddress string `json:"hw-address"`
+		IPAddress string `json:"ip-address"`
+		Hostname  string `json:"hostname,omitempty"`
+	}
 	type keaSubnet4 struct {
-		ID            int       `json:"id"`
-		Subnet        string    `json:"subnet"`
-		Pools         []keaPool `json:"pools,omitempty"`
-		Interface     string    `json:"interface,omitempty"`
-		OptionData    []keaOpt  `json:"option-data,omitempty"`
-		ValidLifetime int       `json:"valid-lifetime,omitempty"`
+		ID            int              `json:"id"`
+		Subnet        string           `json:"subnet"`
+		Pools         []keaPool        `json:"pools,omitempty"`
+		Interface     string           `json:"interface,omitempty"`
+		OptionData    []keaOpt         `json:"option-data,omitempty"`
+		ValidLifetime int              `json:"valid-lifetime,omitempty"`
+		Reservations  []keaReservation `json:"reservations,omitempty"`
 	}
 
 	m.warnAmbiguousV4SubnetSelection(cfg.DHCPLocalServer)
@@ -650,6 +676,28 @@ func (m *Manager) generateKea4Config(cfg *config.DHCPServerConfig) error {
 			if pool.LeaseTime > 0 {
 				sub.ValidLifetime = pool.LeaseTime
 			}
+			// #2243: per-subnet static (fixed/reserved) host reservations.
+			// Each binds a client hw-address to a fixed ip-address; the
+			// matching client always receives that address. Commit-time
+			// validation (validateDHCPStaticBindingsStrict) has already
+			// rejected a malformed MAC, an out-of-subnet address, or a
+			// duplicate identity/address, so the render is a direct mapping.
+			for _, sb := range pool.StaticBindings {
+				if sb == nil || sb.MACAddress == "" || sb.FixedAddress == "" {
+					continue
+				}
+				hw, ok := canonicalMAC(sb.MACAddress)
+				if !ok {
+					m.warn("skipping DHCP static binding with unparseable MAC",
+						"group", group.Name, "mac", sb.MACAddress)
+					continue
+				}
+				sub.Reservations = append(sub.Reservations, keaReservation{
+					HWAddress: hw,
+					IPAddress: sb.FixedAddress,
+					Hostname:  sb.HostName,
+				})
+			}
 			subnets = append(subnets, sub)
 		}
 	}
@@ -685,13 +733,23 @@ func (m *Manager) generateKea6Config(cfg *config.DHCPServerConfig) error {
 		Name string `json:"name"`
 		Data string `json:"data"`
 	}
+	// Kea DHCPv6 reservations bind an identity (hw-address / duid) to an
+	// ARRAY of addresses (ip-addresses), unlike v4's scalar ip-address.
+	// #2243 reserves by client hardware address with a single fixed
+	// address.
+	type keaReservation6 struct {
+		HWAddress   string   `json:"hw-address"`
+		IPAddresses []string `json:"ip-addresses"`
+		Hostname    string   `json:"hostname,omitempty"`
+	}
 	type keaSubnet6 struct {
-		ID            int       `json:"id"`
-		Subnet        string    `json:"subnet"`
-		Pools         []keaPool `json:"pools,omitempty"`
-		Interface     string    `json:"interface,omitempty"`
-		OptionData    []keaOpt  `json:"option-data,omitempty"`
-		ValidLifetime int       `json:"valid-lifetime,omitempty"`
+		ID            int               `json:"id"`
+		Subnet        string            `json:"subnet"`
+		Pools         []keaPool         `json:"pools,omitempty"`
+		Interface     string            `json:"interface,omitempty"`
+		OptionData    []keaOpt          `json:"option-data,omitempty"`
+		ValidLifetime int               `json:"valid-lifetime,omitempty"`
+		Reservations  []keaReservation6 `json:"reservations,omitempty"`
 	}
 
 	var subnets []keaSubnet6
@@ -730,6 +788,26 @@ func (m *Manager) generateKea6Config(cfg *config.DHCPServerConfig) error {
 			}
 			if pool.LeaseTime > 0 {
 				sub.ValidLifetime = pool.LeaseTime
+			}
+			// #2243: per-subnet static (fixed/reserved) host reservations.
+			// v6 binds hw-address -> ip-addresses array. Commit-time
+			// validation already rejected malformed / out-of-subnet /
+			// duplicate bindings.
+			for _, sb := range pool.StaticBindings {
+				if sb == nil || sb.MACAddress == "" || sb.FixedAddress == "" {
+					continue
+				}
+				hw, ok := canonicalMAC(sb.MACAddress)
+				if !ok {
+					m.warn("skipping DHCPv6 static binding with unparseable MAC",
+						"group", group.Name, "mac", sb.MACAddress)
+					continue
+				}
+				sub.Reservations = append(sub.Reservations, keaReservation6{
+					HWAddress:   hw,
+					IPAddresses: []string{sb.FixedAddress},
+					Hostname:    sb.HostName,
+				})
 			}
 			subnets = append(subnets, sub)
 		}

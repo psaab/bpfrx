@@ -328,13 +328,17 @@ var schemaSystem = &schemaNode{desc: "System configuration", children: map[strin
 		"dns": {desc: "DNS service", children: nil},
 		"dhcp-local-server": {desc: "DHCP local server", children: map[string]*schemaNode{
 			"group": {desc: "DHCP group", args: 1, placeholder: "<group-name>", children: map[string]*schemaNode{
-				"pool": {desc: "Address pool", args: 1, placeholder: "<pool-name>", children: nil},
+				"pool": {desc: "Address pool", args: 1, placeholder: "<pool-name>", children: map[string]*schemaNode{
+					"static-binding": dhcpStaticBindingSchema(),
+				}},
 			}},
 			"dynamic-dns": dhcpDynamicDNSSchema(),
 		}},
 		"dhcpv6-local-server": {desc: "DHCPv6 local server", children: map[string]*schemaNode{
 			"group": {desc: "DHCPv6 group", args: 1, placeholder: "<group-name>", children: map[string]*schemaNode{
-				"pool": {desc: "Address pool", args: 1, placeholder: "<pool-name>", children: nil},
+				"pool": {desc: "Address pool", args: 1, placeholder: "<pool-name>", children: map[string]*schemaNode{
+					"static-binding": dhcpStaticBindingSchema(),
+				}},
 			}},
 			"dynamic-dns": dhcpDynamicDNSSchema(),
 		}},
@@ -619,6 +623,43 @@ func dhcpDynamicDNSSchema() *schemaNode {
 			children:    nil,
 		},
 	}}
+}
+
+// dhcpStaticBindingSchema returns the typed-leaf schema for a #2243
+// DHCP-server static (fixed/reserved) host binding, used under both
+// dhcp-local-server and dhcpv6-local-server `group <g> pool <p>`. The
+// instance key is the client hardware address (MAC), validated by
+// ValidateMAC; fixed-address is a typed IP slot. The address-within-subnet,
+// duplicate-MAC, and duplicate-address checks need the compiled pool
+// (subnet), so they live in validateDHCPStaticBindingsStrict, not here.
+// Returned fresh per call so the two parents do not share a mutable map.
+func dhcpStaticBindingSchema() *schemaNode {
+	return &schemaNode{
+		desc:             "Fixed/reserved address binding for a client MAC (#2243)",
+		args:             1,
+		placeholder:      "<mac-address>",
+		keyValueType:     ValueMAC,
+		keyValueDesc:     "Client hardware (MAC) address (xx:xx:xx:xx:xx:xx)",
+		keyValueExamples: []string{"00:11:22:33:44:55"},
+		keyValidator:     ValidateMAC,
+		children: map[string]*schemaNode{
+			"fixed-address": {
+				desc:          "Reserved IP the matching client always receives (must be inside the pool subnet)",
+				args:          1,
+				valueType:     ValueIPAddress,
+				valueDesc:     "Fixed IP address (v4 or v6) within the enclosing pool subnet",
+				valueExamples: []string{"10.0.1.50", "2001:db8::50"},
+				validator:     ValidateIPAddress,
+				children:      nil,
+			},
+			"host-name": {
+				desc:        "Optional reservation hostname (Kea reservation hostname)",
+				args:        1,
+				placeholder: "<host-name>",
+				children:    nil,
+			},
+		},
+	}
 }
 
 var schemaSNMP = &schemaNode{desc: "SNMP configuration", children: map[string]*schemaNode{
