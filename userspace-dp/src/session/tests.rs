@@ -2659,3 +2659,550 @@ fn upsert_synced_allow_replace_is_infallible_at_cap() {
     assert_eq!(table.len(), 2, "table exceeds max_sessions by design");
     assert_eq!(table.create_drops(), 0, "no install-path drop counted");
 }
+
+// =====================================================================
+// #2120: standby retention gate tests.
+//
+// The STANDBY must NOT age peer-synced sessions for an RG it does not
+// forward (restoring the dead Go-GC IsLocalPrimary contract into the
+// userspace wheel). These tests drive `expire_stale_entries_ha` with an
+// `ExpireHaContext` built from closures so the per-RG forwarding
+// predicate, the rg_epoch reader, and node_active are all controllable.
+//
+// NON-TAUTOLOGY: every HOLD test installs a peer-synced session that the
+// PRE-FIX wheel (and the ha=None path) removes unconditionally; the
+// assertion that it is RETAINED fails against the old behavior.
+// =====================================================================
+
+const TEST_CEIL_MULT: u64 = STALE_SYNCED_CEILING_MULT;
+const TEST_CEIL_ABS_NS: u64 = STALE_SYNCED_CEILING_ABS_NS;
+
+/// Build a context: this node forwards `forwarding_rgs`, node_active is
+/// derived (forwards anything), and every RG reports epoch `epoch`
+/// (including rg_epochs[0] for owner_rg_id<=0).
+fn run_expire_ha(
+    table: &mut SessionTable,
+    now_ns: u64,
+    forwarding_rgs: &[i32],
+    epoch_for_rg: &dyn Fn(i32) -> u32,
+) -> Vec<ExpiredSession> {
+    let node_active = !forwarding_rgs.is_empty();
+    let fwd = |rg: i32| -> bool {
+        if rg > 0 {
+            forwarding_rgs.contains(&rg)
+        } else {
+            node_active
+        }
+    };
+    let ctx = ExpireHaContext {
+        node_active,
+        forwards_rg: &fwd,
+        epoch_of: epoch_for_rg,
+        ceiling_mult: TEST_CEIL_MULT,
+        ceiling_abs_ns: TEST_CEIL_ABS_NS,
+    };
+    table.expire_stale_entries_ha(now_ns, Some(&ctx))
+}
+
+fn install_synced_tcp(table: &mut SessionTable, key: &SessionKey, rg: i32, now_ns: u64) {
+    install_synced_tcp_origin(table, key, rg, now_ns, SessionOrigin::SyncImport);
+}
+
+fn install_synced_tcp_origin(
+    table: &mut SessionTable,
+    key: &SessionKey,
+    rg: i32,
+    now_ns: u64,
+    origin: SessionOrigin,
+) {
+    let mut md = metadata();
+    md.owner_rg_id = rg;
+    assert!(table.install_with_protocol_with_origin(
+        key.clone(),
+        decision(),
+        md,
+        origin,
+        now_ns,
+        PROTO_TCP,
+        0x10,
+    ));
+    let _ = table.drain_deltas(8);
+}
+
+// Advance just past the 300s TCP established timeout, bypassing the GC
+// interval gate the way the existing wheel tests do.
+fn past_tcp_timeout(then: u64) -> u64 {
+    then + 302_000_000_000
+}
+
+#[test]
+fn expire_holds_peer_synced_when_rg_inactive() {
+    let mut table = SessionTable::new();
+    let key = key_v4();
+    let then = 1_000_000_000u64;
+    install_synced_tcp(&mut table, &key, 1, then);
+    table.last_gc_ns = then + 301_000_000_000;
+    // This node forwards NOTHING (pure standby). RG1 inactive.
+    let expired = run_expire_ha(&mut table, past_tcp_timeout(then), &[], &|_| 0);
+    assert!(expired.is_empty(), "standby must NOT expire synced RG1 session");
+    assert!(
+        table.lookup(&key, past_tcp_timeout(then), 0x10).is_some(),
+        "held session must still be present"
+    );
+    let s = table.last_pop_stats();
+    assert_eq!(s.held_standby, 1, "exactly one held entry");
+    assert_eq!(s.expired, 0);
+    assert_eq!(s.reaped_stale_synced, 0);
+}
+
+#[test]
+fn expire_ages_peer_synced_when_rg_active() {
+    let mut table = SessionTable::new();
+    let key = key_v4();
+    let then = 1_000_000_000u64;
+    install_synced_tcp(&mut table, &key, 1, then);
+    table.last_gc_ns = then + 301_000_000_000;
+    // This node FORWARDS RG1 (active owner) and the epoch matches the
+    // stamped one (0 at install) so SELF-HEAL does not fire -> AGE.
+    let expired = run_expire_ha(&mut table, past_tcp_timeout(then), &[1], &|_| 0);
+    assert_eq!(expired.len(), 1, "active owner must age the session");
+    assert!(table.lookup(&key, past_tcp_timeout(then), 0x10).is_none());
+    let s = table.last_pop_stats();
+    assert_eq!(s.expired, 1);
+    assert_eq!(s.held_standby, 0);
+}
+
+#[test]
+fn expire_ages_active_node_owned_session() {
+    // A ForwardFlow (locally-created) session whose RG is active must
+    // expire normally -- guards over-retention.
+    let mut table = SessionTable::new();
+    let key = key_v4();
+    let then = 1_000_000_000u64;
+    let mut md = metadata();
+    md.owner_rg_id = 1;
+    assert!(table.install_with_protocol_with_origin(
+        key.clone(),
+        decision(),
+        md,
+        SessionOrigin::ForwardFlow,
+        then,
+        PROTO_TCP,
+        0x10,
+    ));
+    let _ = table.drain_deltas(8);
+    table.last_gc_ns = then + 301_000_000_000;
+    let expired = run_expire_ha(&mut table, past_tcp_timeout(then), &[1], &|_| 0);
+    assert_eq!(expired.len(), 1, "active-node-owned session must age");
+    let s = table.last_pop_stats();
+    assert_eq!(s.held_standby, 0);
+}
+
+#[test]
+fn expire_holds_all_peer_synced_origins() {
+    // SyncImport, SharedMaterialize, WorkerLocalImport are all
+    // peer-synced -> all HELD on a non-forwarding node.
+    for origin in [
+        SessionOrigin::SyncImport,
+        SessionOrigin::SharedMaterialize,
+        SessionOrigin::WorkerLocalImport,
+    ] {
+        let mut table = SessionTable::new();
+        let key = key_v4();
+        let then = 1_000_000_000u64;
+        install_synced_tcp_origin(&mut table, &key, 1, then, origin);
+        table.last_gc_ns = then + 301_000_000_000;
+        let expired = run_expire_ha(&mut table, past_tcp_timeout(then), &[], &|_| 0);
+        assert!(
+            expired.is_empty(),
+            "origin {:?} must be held on a non-forwarding node",
+            origin
+        );
+        assert_eq!(table.last_pop_stats().held_standby, 1, "origin {:?}", origin);
+    }
+}
+
+#[test]
+fn expire_ages_shared_promote_origin() {
+    // SharedPromote is set only on the active node (is_peer_synced()
+    // false) -> must AGE, not hold (resolves SMR M3).
+    let mut table = SessionTable::new();
+    let key = key_v4();
+    let then = 1_000_000_000u64;
+    install_synced_tcp_origin(&mut table, &key, 1, then, SessionOrigin::SharedPromote);
+    table.last_gc_ns = then + 301_000_000_000;
+    // Node forwards nothing, but the entry is not peer-synced and
+    // node_active is false -> (peer_synced || node_active) false -> AGE.
+    let expired = run_expire_ha(&mut table, past_tcp_timeout(then), &[], &|_| 0);
+    assert_eq!(expired.len(), 1, "SharedPromote must age");
+    assert_eq!(table.last_pop_stats().held_standby, 0);
+}
+
+#[test]
+fn expire_holds_peer_synced_owner_rg_zero_whole_node_standby() {
+    // fabric/reverse synced entry, owner_rg_id==0, node forwards
+    // nothing -> held via the node-level path.
+    let mut table = SessionTable::new();
+    let key = key_v4();
+    let then = 1_000_000_000u64;
+    install_synced_tcp(&mut table, &key, 0, then);
+    table.last_gc_ns = then + 301_000_000_000;
+    let expired = run_expire_ha(&mut table, past_tcp_timeout(then), &[], &|_| 0);
+    assert!(expired.is_empty(), "owner_rg_id==0 whole-node standby must hold");
+    assert_eq!(table.last_pop_stats().held_standby, 1);
+}
+
+#[test]
+fn expire_ages_owner_rg_zero_on_active_node() {
+    // KNOWN residual (plan A2#4): a peer-synced owner_rg_id==0 entry on
+    // a node that IS active for some RG ages -- observable via the
+    // dedicated counter, not a silent drop.
+    let mut table = SessionTable::new();
+    let key = key_v4();
+    let then = 1_000_000_000u64;
+    install_synced_tcp(&mut table, &key, 0, then);
+    table.last_gc_ns = then + 301_000_000_000;
+    // node forwards RG1 (node_active true) but the entry's owner_rg_id==0
+    // maps forwards_here -> node_active -> true; epoch matches (0) so no
+    // self-heal -> AGE, tagged as the residual.
+    let expired = run_expire_ha(&mut table, past_tcp_timeout(then), &[1], &|_| 0);
+    assert_eq!(expired.len(), 1, "owner_rg_id==0 on active node ages");
+    let s = table.last_pop_stats();
+    assert_eq!(
+        s.aged_owner_rg_zero_active_node, 1,
+        "the residual must be counted"
+    );
+    assert_eq!(s.held_standby, 0);
+}
+
+#[test]
+fn expire_standalone_ages_normally() {
+    // Standalone: ha=None path. A ForwardFlow owner_rg_id==0 session
+    // must age exactly like the pre-#2120 wheel.
+    let mut table = SessionTable::new();
+    let key = key_v4();
+    let then = 1_000_000_000u64;
+    let mut md = metadata();
+    md.owner_rg_id = 0;
+    assert!(table.install_with_protocol_with_origin(
+        key.clone(),
+        decision(),
+        md,
+        SessionOrigin::ForwardFlow,
+        then,
+        PROTO_TCP,
+        0x10,
+    ));
+    let _ = table.drain_deltas(8);
+    table.last_gc_ns = then + 301_000_000_000;
+    // ha=None -> standalone behavior.
+    let expired = table.expire_stale_entries(past_tcp_timeout(then));
+    assert_eq!(expired.len(), 1, "standalone ForwardFlow must age");
+}
+
+#[test]
+fn expire_standalone_with_ctx_never_holds() {
+    // Even with a context, a node that forwards NOTHING and a session
+    // that is NOT peer-synced and owner_rg_id<=0 must age
+    // ((peer_synced || node_active) false). Standalone safety.
+    let mut table = SessionTable::new();
+    let key = key_v4();
+    let then = 1_000_000_000u64;
+    let mut md = metadata();
+    md.owner_rg_id = 0;
+    assert!(table.install_with_protocol_with_origin(
+        key.clone(),
+        decision(),
+        md,
+        SessionOrigin::ForwardFlow,
+        then,
+        PROTO_TCP,
+        0x10,
+    ));
+    let _ = table.drain_deltas(8);
+    table.last_gc_ns = then + 301_000_000_000;
+    let expired = run_expire_ha(&mut table, past_tcp_timeout(then), &[], &|_| 0);
+    assert_eq!(expired.len(), 1, "standalone-with-ctx must age");
+    assert_eq!(table.last_pop_stats().held_standby, 0);
+}
+
+#[test]
+fn expire_in_promotion_window_survives() {
+    // Held past deadline while RG inactive, then this node STARTS
+    // forwarding RG1 AND the epoch is bumped (r3 ordering) WITHOUT a
+    // RefreshOwnerRGS landing. SELF-HEAL must re-stamp + survive.
+    let mut table = SessionTable::new();
+    let key = key_v4();
+    let then = 1_000_000_000u64;
+    install_synced_tcp(&mut table, &key, 1, then);
+    // First pass: standby, RG1 inactive -> HOLD (stamps seen_rg_epoch=epoch=0).
+    table.last_gc_ns = then;
+    let t1 = then + 302_000_000_000;
+    let expired = run_expire_ha(&mut table, t1, &[], &|_| 0);
+    assert!(expired.is_empty());
+    assert_eq!(table.last_pop_stats().held_standby, 1);
+    // Second pass: RG1 now active AND epoch bumped to 1 (promotion), but
+    // RefreshOwnerRGS has not re-stamped. SELF-HEAL fires.
+    table.last_gc_ns = t1;
+    let t2 = t1 + 2_000_000_000;
+    let expired = run_expire_ha(&mut table, t2, &[1], &|_| 1);
+    assert!(expired.is_empty(), "self-heal must keep the entry alive");
+    let s = table.last_pop_stats();
+    assert_eq!(s.healed_on_promote, 1, "self-heal must fire once");
+    assert_eq!(s.expired, 0);
+    // Re-stamped: it now ages from a full timeout. After another full
+    // timeout with the SAME epoch it ages (no perpetual re-stamp).
+    table.last_gc_ns = t2;
+    let t3 = t2 + 302_000_000_000;
+    let expired = run_expire_ha(&mut table, t3, &[1], &|_| 1);
+    assert_eq!(expired.len(), 1, "after self-heal it ages normally");
+}
+
+#[test]
+fn expire_no_selfheal_when_epoch_unchanged() {
+    // RG active but the epoch equals seen_rg_epoch (already healed):
+    // the entry AGES (no perpetual re-stamp / over-retention).
+    let mut table = SessionTable::new();
+    let key = key_v4();
+    let then = 1_000_000_000u64;
+    install_synced_tcp(&mut table, &key, 1, then);
+    table.last_gc_ns = then + 301_000_000_000;
+    // epoch == 0 == the install-stamped seen_rg_epoch, RG active.
+    let expired = run_expire_ha(&mut table, past_tcp_timeout(then), &[1], &|_| 0);
+    assert_eq!(expired.len(), 1, "matching epoch + active RG -> age");
+    assert_eq!(table.last_pop_stats().healed_on_promote, 0);
+}
+
+#[test]
+fn expire_owner_rg_zero_survives_promotion() {
+    // Held owner_rg_id==0 entry, then a NODE-LEVEL activation (epoch[0]
+    // bumped). Self-heal must fire via the node epoch.
+    let mut table = SessionTable::new();
+    let key = key_v4();
+    let then = 1_000_000_000u64;
+    install_synced_tcp(&mut table, &key, 0, then);
+    table.last_gc_ns = then;
+    let t1 = then + 302_000_000_000;
+    let expired = run_expire_ha(&mut table, t1, &[], &|_| 0);
+    assert!(expired.is_empty());
+    assert_eq!(table.last_pop_stats().held_standby, 1);
+    // Node-level activation: node forwards RG1 now, node-level epoch
+    // bumped to 1. owner_rg_id==0 -> forwards_here == node_active true,
+    // epoch_of(0)==1 != seen(0) -> SELF-HEAL.
+    table.last_gc_ns = t1;
+    let t2 = t1 + 2_000_000_000;
+    let expired = run_expire_ha(&mut table, t2, &[1], &|_| 1);
+    assert!(expired.is_empty(), "node-level self-heal must keep it alive");
+    assert_eq!(table.last_pop_stats().healed_on_promote, 1);
+}
+
+#[test]
+fn expire_in_demotion_window_holds() {
+    // A ForwardFlow session whose RG just flipped inactive, DemoteOwnerRGS
+    // NOT yet applied -> held via the FORWARDING gate (!forwards_here),
+    // not aged, because the node is still active for another RG.
+    let mut table = SessionTable::new();
+    let key = key_v4();
+    let then = 1_000_000_000u64;
+    let mut md = metadata();
+    md.owner_rg_id = 1; // RG1 -- about to be demoted
+    assert!(table.install_with_protocol_with_origin(
+        key.clone(),
+        decision(),
+        md,
+        SessionOrigin::ForwardFlow, // demote flip not yet applied
+        then,
+        PROTO_TCP,
+        0x10,
+    ));
+    let _ = table.drain_deltas(8);
+    table.last_gc_ns = then + 301_000_000_000;
+    // Node forwards RG2 (node_active true) but NOT RG1 (just demoted).
+    // forwards_here(RG1)=false, node_active=true -> HOLD.
+    let expired = run_expire_ha(&mut table, past_tcp_timeout(then), &[2], &|_| 0);
+    assert!(expired.is_empty(), "demotion-window entry must be held");
+    assert_eq!(table.last_pop_stats().held_standby, 1);
+}
+
+#[test]
+fn expire_reaps_held_past_relative_ceiling() {
+    // A held synced session past the relative ceiling
+    // (MULT x 300s = 900s) is reaped even though the node never forwards
+    // its RG (lost-primary-delete backstop).
+    let mut table = SessionTable::new();
+    let key = key_v4();
+    let then = 1_000_000_000u64;
+    install_synced_tcp(&mut table, &key, 1, then);
+    // First HOLD pass arms first_held_ns at t1.
+    table.last_gc_ns = then;
+    let t1 = then + 302_000_000_000;
+    let expired = run_expire_ha(&mut table, t1, &[], &|_| 0);
+    assert!(expired.is_empty());
+    assert_eq!(table.last_pop_stats().held_standby, 1);
+    // Past the relative ceiling measured from first_held_ns (t1):
+    // ceiling = min(3 x 300s, 7d) = 900s. Advance > 900s past t1.
+    table.last_gc_ns = t1;
+    let t2 = t1 + 901_000_000_000;
+    let expired = run_expire_ha(&mut table, t2, &[], &|_| 0);
+    assert_eq!(expired.len(), 1, "held entry past relative ceiling reaped");
+    let s = table.last_pop_stats();
+    assert_eq!(s.reaped_stale_synced, 1);
+    assert_eq!(s.held_standby, 0);
+}
+
+#[test]
+fn expire_reaps_held_at_abs_cap_for_long_timeout() {
+    // A 30-day TCP timeout session, held, is reaped at the ABS cap
+    // (~7d), NOT at 90 days (MULT x 30d). Bounds the pathological config.
+    // To keep the wheel walk bounded we install at a large `then` and
+    // jump in two bounded legs (~30d then ~7d) -- the wheel is O(elapsed
+    // ticks) but each tick is a near-empty bucket check.
+    let mut table = SessionTable::new();
+    let key = key_v4();
+    let then = 1_000_000_000u64;
+    let thirty_days_secs = 30u64 * 24 * 60 * 60;
+    table.set_timeouts(SessionTimeouts::from_seconds(thirty_days_secs, 0, 0));
+    install_synced_tcp(&mut table, &key, 1, then);
+    table.last_gc_ns = then;
+    // Cross the 30-day timeout so the entry is idle-crossed. First hold
+    // observation arms first_held_ns at t1 with held_ns == 0 -> HELD
+    // (NOT reaped from its stale install-time last_seen).
+    let thirty_days_ns = thirty_days_secs * 1_000_000_000;
+    let t1 = then + thirty_days_ns + 2_000_000_000;
+    let expired = run_expire_ha(&mut table, t1, &[], &|_| 0);
+    assert!(
+        expired.is_empty(),
+        "idle-crossed long session held on first observation, not reaped"
+    );
+    // held_standby may be > 1: this single synthetic 30-day jump makes the
+    // wheel cursor sweep millions of ticks, and a held entry is re-bucketed
+    // to the current tick on each rotation (the same multi-rotation
+    // re-processing the existing long-timeout Case-4 exhibits under a huge
+    // jump). Production advances ~1 tick per call, so this is a test-only
+    // artifact; the load-bearing assertions are "not reaped" + "still
+    // present". first_held_ns is armed on the first observation so the cap
+    // measures from there, not from the stale install-time last_seen.
+    assert!(table.last_pop_stats().held_standby >= 1, "held at least once");
+    assert_eq!(table.last_pop_stats().reaped_stale_synced, 0, "not yet reaped");
+    // NOTE: presence via `table.len()`, NOT `lookup()` -- lookup refreshes
+    // last_seen_ns (it is the packet path) and would defeat the timeout.
+    assert_eq!(table.len(), 1, "long-timeout synced session retained on the standby");
+    // ABS cap is 7 days from first_held_ns (t1). After > 7 days it is
+    // reaped (the relative ceiling would be 90 days).
+    table.last_gc_ns = t1;
+    let seven_days_ns = 7u64 * 24 * 60 * 60 * 1_000_000_000;
+    let t2 = t1 + seven_days_ns + 1_000_000_000;
+    let expired = run_expire_ha(&mut table, t2, &[], &|_| 0);
+    assert_eq!(expired.len(), 1, "reaped at the abs cap, not 90 days");
+    assert!(
+        table.last_pop_stats().reaped_stale_synced >= 1,
+        "reaped at the abs cap"
+    );
+    assert_eq!(table.len(), 0, "gone after reap");
+}
+
+#[test]
+fn expire_flapping_rg_still_reaps() {
+    // A flapping RG (repeated promote-edge self-heals) re-stamps
+    // last_seen on every activation but must NOT reset first_held_ns --
+    // otherwise a dead leaked entry could be pinned forever. We arm
+    // first_held, fire several self-heals (each advancing time + bumping
+    // the epoch), then a final hold pass past the relative ceiling
+    // measured from first_held_ns reaps it despite all the re-stamps.
+    let mut table = SessionTable::new();
+    let key = key_v4();
+    let then = 1_000_000_000u64;
+    install_synced_tcp(&mut table, &key, 1, then);
+    // First hold (RG inactive) arms first_held_ns at t_anchor.
+    table.last_gc_ns = then;
+    let t_anchor = then + 302_000_000_000;
+    let expired = run_expire_ha(&mut table, t_anchor, &[], &|_| 0);
+    assert!(expired.is_empty());
+    assert_eq!(table.last_pop_stats().held_standby, 1);
+    // Flap: self-heal on each activation edge (RG active + a NEW epoch).
+    // Advance past the timeout each iteration so the entry is idle-crossed
+    // and the SELF-HEAL arm fires (re-stamping last_seen but leaving
+    // first_held_ns at t_anchor). After 4 iterations the total elapsed
+    // since t_anchor exceeds the 900s relative ceiling -- yet self-heal
+    // keeps re-stamping because it deliberately ignores the ceiling.
+    let mut t = t_anchor;
+    let mut epoch = 1u32;
+    for _ in 0..4 {
+        table.last_gc_ns = t;
+        t += 302_000_000_000; // past the 300s timeout -> idle-crossed again
+        let e = epoch;
+        let expired = run_expire_ha(&mut table, t, &[1], &move |_| e);
+        assert!(expired.is_empty(), "self-heal keeps the entry alive");
+        assert_eq!(
+            table.last_pop_stats().healed_on_promote,
+            1,
+            "each activation edge self-heals"
+        );
+        epoch += 1;
+    }
+    // We are now well past the 900s relative ceiling measured from
+    // t_anchor, but the entry survived via self-heals. A HOLD pass (RG
+    // inactive) reaps it: held_ns from first_held_ns (t_anchor) >>
+    // ceiling, despite the self-heal re-stamps to last_seen.
+    assert!(t - t_anchor > 900_000_000_000, "past ceiling after self-heals");
+    table.last_gc_ns = t;
+    let t_final = t + 302_000_000_000;
+    let expired = run_expire_ha(&mut table, t_final, &[], &|_| 0);
+    assert_eq!(
+        expired.len(),
+        1,
+        "flapping self-heals must NOT reset the leak ceiling -- reaped"
+    );
+    assert_eq!(table.last_pop_stats().reaped_stale_synced, 1);
+}
+
+#[test]
+fn promotion_restamps_held_session() {
+    // The command-landed complement to expire_in_promotion_window_survives:
+    // hold past deadline, then refresh_for_ha_transition (RefreshOwnerRGS
+    // path) re-stamps last_seen and clears the hold clock.
+    let mut table = SessionTable::new();
+    let key = key_v4();
+    let then = 1_000_000_000u64;
+    install_synced_tcp(&mut table, &key, 1, then);
+    table.last_gc_ns = then;
+    let t1 = then + 302_000_000_000;
+    let expired = run_expire_ha(&mut table, t1, &[], &|_| 0);
+    assert!(expired.is_empty());
+    assert_eq!(table.last_pop_stats().held_standby, 1);
+    // RefreshOwnerRGS landed -> refresh_for_ha_transition re-stamps.
+    let mut md = metadata();
+    md.owner_rg_id = 1;
+    assert!(table.refresh_for_ha_transition(&key, decision(), md, t1 + 1_000_000));
+    // Now ages from a full timeout on the active node.
+    table.last_gc_ns = t1 + 1_000_000;
+    let t2 = t1 + 1_000_000 + 302_000_000_000;
+    let expired = run_expire_ha(&mut table, t2, &[1], &|_| 0);
+    assert_eq!(expired.len(), 1, "after promotion refresh it ages normally");
+}
+
+#[test]
+fn expire_fabric_ingress_ages_normally() {
+    // fabric_ingress synced entries are NOT held (matches the fabric-skip
+    // convention) -- they age even on a non-forwarding node.
+    let mut table = SessionTable::new();
+    let key = key_v4();
+    let then = 1_000_000_000u64;
+    let mut md = metadata();
+    md.owner_rg_id = 1;
+    md.fabric_ingress = true;
+    assert!(table.install_with_protocol_with_origin(
+        key.clone(),
+        decision(),
+        md,
+        SessionOrigin::SyncImport,
+        then,
+        PROTO_TCP,
+        0x10,
+    ));
+    let _ = table.drain_deltas(8);
+    table.last_gc_ns = then + 301_000_000_000;
+    let expired = run_expire_ha(&mut table, past_tcp_timeout(then), &[], &|_| 0);
+    assert_eq!(expired.len(), 1, "fabric_ingress synced must age");
+    assert_eq!(table.last_pop_stats().held_standby, 0);
+}
