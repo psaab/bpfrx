@@ -419,6 +419,14 @@ func grpcResolveAddress(cfg *config.Config, name string) string {
 }
 
 func (s *Server) Complete(_ context.Context, req *pb.CompleteRequest) (*pb.CompleteResponse, error) {
+	// req.Pos is the caller-supplied cursor offset into req.Line. It is an
+	// int32 on the wire, so a crafted negative value would make the
+	// upper-bound guard below pass (int(-1) < len(text)) and slice
+	// text[:-1], panicking the handler goroutine. Reject negatives outright;
+	// Pos > len is already safe because the slice is then skipped.
+	if req.Pos < 0 {
+		return nil, status.Error(codes.InvalidArgument, "invalid position")
+	}
 	text := req.Line
 	if int(req.Pos) < len(text) {
 		text = text[:req.Pos]
