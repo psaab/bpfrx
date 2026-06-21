@@ -149,6 +149,16 @@ impl SessionTable {
                 expires_after_ns: session_timeout_ns(protocol, tcp_flags, &self.timeouts),
                 closing: matches!(protocol, PROTO_TCP) && (tcp_flags & (TCP_FIN | TCP_RST)) != 0,
                 wheel_tick: 0,
+                // #2120: a freshly-installed entry has never been HELD and
+                // has not yet been self-healed. 0 is the never-self-healed
+                // default; the first forwarding pass after any RG activation
+                // that bumped the epoch will see current_epoch != 0 and fire
+                // the self-heal (see session/expire.rs). The HOLD branch
+                // does NOT write seen_rg_epoch, so it stays 0 throughout the
+                // held lifetime — exactly what keeps the self-heal edge
+                // intact under the old-map/new-epoch read skew.
+                seen_rg_epoch: 0,
+                first_held_ns: 0,
             },
         };
         let raw = self.entries.insert(record);
@@ -235,6 +245,16 @@ impl SessionTable {
                 expires_after_ns: session_timeout_ns(protocol, tcp_flags, &self.timeouts),
                 closing: matches!(protocol, PROTO_TCP) && (tcp_flags & (TCP_FIN | TCP_RST)) != 0,
                 wheel_tick: 0,
+                // #2120: a re-imported synced entry leaves the held world
+                // with a fresh `last_seen_ns`, so it carries no carried-over
+                // hold clock. `seen_rg_epoch` resets to the never-self-healed
+                // default (the next SELF-HEAL pass, if this node forwards the
+                // RG, records the live epoch; HOLD never writes it).
+                // `upsert_synced` first `remove_entry`s any prior entry, so
+                // this is the canonical re-import refresh that the §6.4
+                // contract clears `first_held_ns` on.
+                seen_rg_epoch: 0,
+                first_held_ns: 0,
             },
         };
         let raw = self.entries.insert(record);

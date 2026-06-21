@@ -58,3 +58,69 @@ pub(crate) struct SessionUpdate<'a> {
     pub(crate) protocol: u8,
     pub(crate) tcp_flags: u8,
 }
+
+/// #2120: per-call HA context handed to the expire pass so the
+/// timer-wheel GC can HOLD peer-synced sessions this node does not
+/// forward (restoring the dead Go-GC `IsLocalPrimary` retention
+/// contract), self-heal them on RG promotion, and reap them at a
+/// bounded ceiling if a primary delete is lost.
+///
+/// The HA-forwarding logic itself lives on the `afxdp` side (the
+/// `HAGroupRuntime` lease predicate is `pub(in crate::afxdp)` and must
+/// not leak into `crate::session`), so the caller supplies it as
+/// borrowed closures:
+///
+/// - `forwards_rg(rg)` answers "does this node currently FORWARD the
+///   session whose `owner_rg_id == rg`?" — for `rg > 0` it is the
+///   per-RG `is_forwarding_active` predicate; for `rg <= 0` it is the
+///   node-level "forwards any RG" predicate (`node_active`).
+/// - `epoch_of(rg)` reads the RG epoch counter with the
+///   `< MAX_RG_EPOCHS` index guard, falling back to the node-level
+///   `rg_epochs[0]` for any `rg` that is not a valid per-RG index — both
+///   `rg <= 0` AND an out-of-range `rg` map to `rg_epochs[0]` (the
+///   node-level activation edge that lets the self-heal fire for
+///   `owner_rg_id == 0` fabric/reverse entries, and that keeps a
+///   corrupt/out-of-range RG from silently pinning epoch 0). The exact
+///   fallback for out-of-range RG is caller-defined; the worker's
+///   `epoch_of` implements this `rg_epochs[0]` behavior.
+///
+/// `node_active` is hoisted once per expire call (true iff this node
+/// forwards at least one RG, i.e. it is a real, currently-forwarding
+/// cluster node) and is the "are we in a cluster that owns anything"
+/// guard that keeps a STANDALONE node from ever holding.
+pub(crate) struct ExpireHaContext<'a> {
+    /// True iff this node currently forwards at least one RG. Gates the
+    /// HOLD so a standalone / fully-standby-but-non-cluster node never
+    /// retains. Hoisted once per `expire_stale_entries` call.
+    pub(crate) node_active: bool,
+    /// Per-RG forwarding predicate (see struct docs). `rg <= 0` maps to
+    /// `node_active`.
+    pub(crate) forwards_rg: &'a dyn Fn(i32) -> bool,
+    /// RG epoch reader (see struct docs). Any `rg` that is not a valid
+    /// per-RG index (`rg <= 0` OR out of range) maps to the node-level
+    /// `rg_epochs[0]`.
+    pub(crate) epoch_of: &'a dyn Fn(i32) -> u32,
+    /// Stale-synced ceiling multiplier: a held entry is reaped once it
+    /// has been held longer than `min(mult × expires_after_ns, abs_ns)`.
+    pub(crate) ceiling_mult: u64,
+    /// Stale-synced ceiling absolute cap (ns). Bounds the pathological
+    /// long-timeout (`MaxDurationSeconds`) config so a leaked entry
+    /// cannot be pinned for the full configured timeout.
+    pub(crate) ceiling_abs_ns: u64,
+}
+
+impl ExpireHaContext<'_> {
+    /// `min(mult × timeout, abs_cap)` — the maximum time an entry may
+    /// remain HELD before the lost-delete reaper removes it. `mult == 0`
+    /// is treated as "no relative ceiling" (the abs cap still applies)
+    /// so a misconfigured 0 cannot reap held entries immediately.
+    #[inline]
+    pub(crate) fn stale_ceiling_ns(&self, expires_after_ns: u64) -> u64 {
+        let relative = expires_after_ns.saturating_mul(self.ceiling_mult);
+        if relative == 0 {
+            self.ceiling_abs_ns
+        } else {
+            relative.min(self.ceiling_abs_ns)
+        }
+    }
+}

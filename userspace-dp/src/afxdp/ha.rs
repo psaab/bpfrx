@@ -36,6 +36,39 @@ impl super::Coordinator {
                 );
             }
         }
+        // #2120 (MANDATORY): bump rg_epochs for every demoted AND
+        // activated RG, plus the node-level rg_epochs[0] on ANY
+        // activation, BEFORE publishing the new rg_runtime. This makes
+        // the standby-retention self-heal edge airtight: a worker that
+        // observes the active rg_runtime (ArcSwap acquire) is guaranteed
+        // to also observe the bumped epoch (the Release store below is
+        // ordered before the runtime publish), so the expire pass never
+        // sees new-rg + old-epoch (the "AGE a session this node now
+        // forwards" hole). The flow-cache invalidation these bumps also
+        // drive is unaffected by the earlier timing — workers re-stamp on
+        // the next lookup. The node-level rg_epochs[0] edge lets the
+        // self-heal fire for owner_rg_id==0 fabric/reverse entries.
+        //
+        // These bumps replace the previously-after-store demote loop and
+        // the handle_activated_rgs activation loop (removed below) so each
+        // RG is incremented exactly once per transition.
+        for rg_id in &demoted_rgs {
+            let idx = *rg_id as usize;
+            if idx > 0 && idx < MAX_RG_EPOCHS {
+                self.rg_epochs[idx].fetch_add(1, Ordering::Release);
+            }
+        }
+        for rg_id in &activated_rgs {
+            let idx = *rg_id as usize;
+            if idx > 0 && idx < MAX_RG_EPOCHS {
+                self.rg_epochs[idx].fetch_add(1, Ordering::Release);
+            }
+        }
+        if !activated_rgs.is_empty() {
+            // Node-level "started forwarding something" edge so the
+            // standby self-heal can release HELD owner_rg_id==0 entries.
+            self.rg_epochs[0].fetch_add(1, Ordering::Release);
+        }
         self.ha.rg_runtime.store(Arc::new(state));
         if !demoted_rgs.is_empty() {
             for handle in self.workers.handles.values() {
@@ -66,14 +99,9 @@ impl super::Coordinator {
                 self.dynamic_neighbors_ref(),
                 &demoted_rgs,
             );
-            // Bump RG epochs atomically — O(1) invalidation. Workers will
-            // treat flow cache entries with stale epochs as misses.
-            for rg_id in &demoted_rgs {
-                let idx = *rg_id as usize;
-                if idx > 0 && idx < MAX_RG_EPOCHS {
-                    self.rg_epochs[idx].fetch_add(1, Ordering::Release);
-                }
-            }
+            // #2120: the demote rg_epochs bump moved BEFORE rg_runtime.store
+            // above (epoch-before-publish ordering). O(1) flow-cache
+            // invalidation is preserved — only the timing changed.
             // Record cache flush timestamp for observability (#312).
             self.last_cache_flush_at.store(now_secs, Ordering::Relaxed);
         }
@@ -93,14 +121,11 @@ impl super::Coordinator {
         if activated_rgs.is_empty() {
             return;
         }
-        // Bump RG epochs for activated RGs so flow cache entries with
-        // stale HA state are invalidated.
-        for rg_id in activated_rgs {
-            let idx = *rg_id as usize;
-            if idx > 0 && idx < MAX_RG_EPOCHS {
-                self.rg_epochs[idx].fetch_add(1, Ordering::Release);
-            }
-        }
+        // #2120: the activated rg_epochs bump (and the node-level
+        // rg_epochs[0] edge) moved to update_ha_state BEFORE
+        // rg_runtime.store, so it is NOT repeated here — a double
+        // increment would still invalidate correctly but is avoided for
+        // clarity and to keep each transition a single epoch step.
 
         let worker_commands = self
             .workers
