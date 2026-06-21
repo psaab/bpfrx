@@ -9397,3 +9397,21 @@ top.
   **File(s)**: pkg/cluster/sync_conn.go, pkg/cluster/sync.go,
   pkg/cluster/sync_gen_guard_test.go, docs/sync-protocol.md,
   pkg/cluster/README.md, _Log.md
+
+- **Timestamp**: 2026-06-21
+  **Action**: #2253 — replace the loose `.inet` substring match in
+  rib-group import-rib family resolution with an EXACT `.inet.0` /
+  `.inet6.0` suffix match. Added `ribInstanceFromName` (exact-suffix,
+  non-empty instance prefix) mirrored in pkg/routing (runtime applier,
+  `resolveRibTable`) and pkg/config (commit-time gate,
+  `validateRibGroupImportRibReferencesStrict`) so the gate↔runtime
+  consistency #2226 relies on is preserved. Malformed tokens
+  (`<vrf>.inetX.0`, `.inetfoo.0`, `.inet60.0`, `.inet.0.garbage`,
+  empty-prefix `.inet.0`) now reject instead of resolving onto the
+  instance table. Table tests added in both packages (fail-on-revert
+  verified: restoring the substring match breaks them). go build/vet/test
+  green; new tests run 5x clean.
+  **File(s)**: pkg/routing/rules.go, pkg/routing/routing_test.go,
+  pkg/config/compiler_validate_strict.go,
+  pkg/config/compiler_ribgroup_ref_2226_test.go, pkg/routing/README.md,
+  _Log.md
