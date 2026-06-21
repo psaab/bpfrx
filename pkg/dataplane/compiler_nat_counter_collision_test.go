@@ -13,8 +13,7 @@ import "testing"
 // three same-named rules return the SAME id and this test fails.
 func TestAssignNATCounterIDTypeNamespaceNoCollision(t *testing.T) {
 	result := &CompileResult{
-		nextNATCounterID: 1,
-		NATCounterIDs:    make(map[string]uint16),
+		NATCounterIDs: make(map[string]uint32),
 	}
 
 	const ruleSet = "rs1"

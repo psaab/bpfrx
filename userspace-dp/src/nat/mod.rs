@@ -124,7 +124,7 @@ impl NatRuleCounter {
         self.bytes.store(0, Ordering::Relaxed);
     }
 
-    pub(crate) fn snapshot(&self, counter_id: u16) -> NatRuleCounterStatus {
+    pub(crate) fn snapshot(&self, counter_id: u32) -> NatRuleCounterStatus {
         NatRuleCounterStatus {
             counter_id,
             packets: self.packets.load(Ordering::Relaxed),
@@ -133,7 +133,7 @@ impl NatRuleCounter {
     }
 }
 
-type NatCounterRegistry = FxHashMap<u16, Arc<NatRuleCounter>>;
+type NatCounterRegistry = FxHashMap<u32, Arc<NatRuleCounter>>;
 
 /// #2218: registry of per-rule NAT hit counters keyed by the
 /// compiler-assigned `counter_id`. Cheaply cloneable (`Arc`), so the
@@ -141,6 +141,12 @@ type NatCounterRegistry = FxHashMap<u16, Arc<NatRuleCounter>>;
 /// forwarding-state build, exactly mirroring `PolicyCounterStore`.
 /// `counter_id == 0` is the "no per-rule counter" sentinel and is never
 /// stored — `rule_counter(0)` returns `None`.
+///
+/// #2255: the `counter_id` is a STABLE key-derived hash (a function of the
+/// rule's identity, not its config position), so a config reorder/removal can
+/// no longer reuse a numeric id for a different rule. `reconcile_ids` retains
+/// only the ids present in the new snapshot, and a retained id always refers to
+/// the SAME rule it did before — no cross-rule mis-attribution by construction.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct NatCounterStore {
     counters: Arc<Mutex<NatCounterRegistry>>,
@@ -150,7 +156,7 @@ impl NatCounterStore {
     /// Resolve (get-or-insert) the shared counter for `counter_id`. Returns
     /// `None` for the reserved id 0 so a rule without a per-rule counter
     /// carries `hit_counter: None` and the increment site skips it.
-    pub(crate) fn rule_counter(&self, counter_id: u16) -> Option<Arc<NatRuleCounter>> {
+    pub(crate) fn rule_counter(&self, counter_id: u32) -> Option<Arc<NatRuleCounter>> {
         if counter_id == 0 {
             return None;
         }
@@ -166,8 +172,8 @@ impl NatCounterStore {
     /// Retain only counters whose id is in `active_ids`, dropping the
     /// `Arc<NatRuleCounter>` for rules removed by a config change. Mirrors
     /// `PolicyCounterStore::reconcile_rules`.
-    pub(crate) fn reconcile_ids(&self, active_ids: &[u16]) {
-        let active: rustc_hash::FxHashSet<u16> =
+    pub(crate) fn reconcile_ids(&self, active_ids: &[u32]) {
+        let active: rustc_hash::FxHashSet<u32> =
             active_ids.iter().copied().filter(|&id| id != 0).collect();
         if let Ok(mut counters) = self.counters.lock() {
             counters.retain(|id, _| active.contains(id));

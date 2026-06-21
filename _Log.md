@@ -1,5 +1,43 @@
 # Action Log
 
+## 2026-06-21 — #2255 NAT translation-hit counter_id stability
+
+- **Timestamp**: 2026-06-21
+- **Action**: Follow-up to #2249 (#2218). The per-rule NAT translation-hit
+  `counter_id` was assigned SEQUENTIALLY (`nextNATCounterID` reset to 1
+  each compile) while the Rust helper keeps a CUMULATIVE numeric-keyed
+  store (`reconcile_ids` retains, does not reset). A config reorder or
+  removal could reuse a numeric id for a different rule, so the new rule
+  inherited the old rule's cumulative count = cross-rule mis-attribution
+  in `show security nat ... rule` Translation hits. Fix (issue option a):
+  `assignNATCounterID` now DERIVES the id as a 32-bit FNV-1a hash of the
+  type-namespaced `NATCounterKey` (the rule's identity) instead of a
+  position counter, so a rule keeps the same id across reorder/removal and
+  the cumulative store stays correctly attributed by construction. Widened
+  the counter_id chain u16→u32 (compiler map, snapshot fields, Rust store
+  key, status report); the JSON wire is unchanged (a number is
+  width-agnostic) so NO protocol_wire_v1.json regen — `wire_invariant`
+  passes unchanged. `ReadNATRuleCounter` now keys the sparse u32 offset
+  map directly and no longer indexes the legacy 256-entry dense BPF array
+  (which only ever held zeros at runtime; a hash id ≥ 256 would fail that
+  bounded Lookup). Rare in-compile hash collisions resolved
+  deterministically (`#N` re-hash). Fail-on-revert tests: reorder keeps
+  per-rule ids stable (verified RED under a simulated sequential probe);
+  removal keeps the survivor's id; determinism across compiles;
+  uniqueness at the 256-rule cap; exhaustion→0. Rust store test proves a
+  retained id keeps its count and a removed id is dropped (no
+  re-inheritance). Go + Rust build/test green.
+- **File(s)**: pkg/dataplane/compiler.go, pkg/dataplane/compiler_nat.go,
+  pkg/dataplane/maps_nat.go, pkg/dataplane/userspace/{nat.go,builder.go,
+  protocol.go}, userspace-dp/src/protocol/nat.rs,
+  userspace-dp/src/nat/mod.rs,
+  userspace-dp/src/afxdp/coordinator/mod.rs,
+  pkg/dataplane/compiler_nat_counter_stability_test.go (new),
+  pkg/dataplane/compiler_nat_counter_collision_test.go,
+  pkg/dataplane/apply_test.go,
+  pkg/dataplane/userspace/{manager_test.go,nat_per_uplink_test.go},
+  userspace-dp/src/nat/tests.rs, docs/userspace-dataplane-gaps.md
+
 ## 2026-06-21 — #2225 VRRP data race on lastDropWarn (AF_PACKET fallback dual receivers)
 
 - **Timestamp**: 2026-06-21
@@ -24,6 +62,7 @@
 - **Validation**: `go build ./...` OK; `go vet ./pkg/vrrp/...` OK;
   `go test ./pkg/vrrp/...` ok; `go test -race ./pkg/vrrp/...` ok.
   make test-failover no-regression run PENDING-PARENT (VRRP/HA change).
+
 ## 2026-06-21 — #2229 address-book empty-prefix entry warn-flag
 
 - **Timestamp**: 2026-06-21

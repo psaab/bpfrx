@@ -3,6 +3,7 @@ package dataplane
 import (
 	"encoding/binary"
 	"fmt"
+	"hash/fnv"
 	"log/slog"
 	"net"
 	"net/netip"
@@ -72,13 +73,37 @@ func NATCounterKey(natType, ruleSet, rule string) string {
 	return natType + "/" + ruleSet + "/" + rule
 }
 
+// natCounterIDForKey derives the stable per-rule translation hit counter ID
+// for a type-namespaced NAT rule key. The ID is a function of the rule's
+// IDENTITY (the NATCounterKey string), not its compile-time position, so the
+// same rule keeps the same ID across a config reorder or the removal/re-add of
+// an unrelated rule (#2255). It is a 32-bit FNV-1a hash of the key, remapped
+// off the reserved 0 sentinel ("no counter"). The wide 32-bit space makes two
+// distinct keys colliding negligible (~256²/2³² ≈ 8e-6 at the 256-rule cap);
+// assignNATCounterID resolves the rare in-compile collision deterministically.
+func natCounterIDForKey(ruleKey string) uint32 {
+	h := fnv.New32a()
+	// fnv.Write never errors.
+	_, _ = h.Write([]byte(ruleKey))
+	id := h.Sum32()
+	if id == 0 {
+		// 0 is the "no counter" sentinel — remap a (vanishingly rare) zero
+		// hash to a fixed non-zero id so the rule still gets a counter.
+		id = 1
+	}
+	return id
+}
+
 // assignNATCounterID assigns (or reuses) the per-rule translation hit
 // counter ID for a NAT rule keyed by NATCounterKey(natType, ruleSet, rule).
-// Counter IDs are 1-based (0 means "no counter"); the assignment is shared
-// across all expanded address/port/protocol pairs of the same rule so every
-// hit on that rule attributes to a single counter slot. When the counter space
-// is exhausted the rule falls back to counter 0 (no per-rule attribution) and
-// a warning is logged, mirroring the historical SNAT behavior.
+// Counter IDs are non-zero (0 means "no counter") and DERIVED from the rule
+// key by natCounterIDForKey, so they are STABLE across compiles: a rule's ID
+// is a function of its identity, never of its position in the config. This
+// keeps the Rust helper's cumulative numeric-keyed counter store correctly
+// attributed across a config reorder/removal by construction (#2255) — a
+// reused config slot can no longer inherit a different rule's prior count.
+// The assignment is shared across all expanded address/port/protocol pairs of
+// the same rule so every hit on that rule attributes to a single counter.
 //
 // This is the single source of truth for NAT rule counter IDs across SNAT,
 // DNAT, and static NAT. The compiler-assigned IDs are surfaced to the Rust
@@ -86,23 +111,49 @@ func NATCounterKey(natType, ruleSet, rule string) string {
 // a translation hit to the matched rule) and read back by the operator
 // surfaces through Manager.ReadNATRuleCounter (#2218). The natType prefix keeps
 // same-named rules across SNAT/DNAT/static from colliding on one counter ID.
-func assignNATCounterID(result *CompileResult, natType, ruleSet, rule string) uint16 {
+//
+// Collisions: two distinct keys can in principle hash to the same id. That is
+// resolved deterministically (re-hash with a "#N" suffix until free within
+// this compile) so each rule still gets a unique counter; the resolution is a
+// pure function of the colliding keys, so it is reproduced identically on every
+// compile. When the number of distinct counters reaches MaxNATRuleCounters the
+// rule falls back to counter 0 (no per-rule attribution) and a warning is
+// logged, preserving the historical exhaustion contract.
+func assignNATCounterID(result *CompileResult, natType, ruleSet, rule string) uint32 {
 	ruleKey := NATCounterKey(natType, ruleSet, rule)
 	if existing, ok := result.NATCounterIDs[ruleKey]; ok {
 		return existing
 	}
-	counterID := result.nextNATCounterID
-	if counterID >= MaxNATRuleCounters {
+	if len(result.NATCounterIDs) >= MaxNATRuleCounters {
 		slog.Warn("NAT rule counter IDs exhausted, reusing counter 0",
 			"nat-type", natType, "rule-set", ruleSet, "rule", rule,
-			"counter_id", counterID, "max", MaxNATRuleCounters)
-		counterID = 0
+			"count", len(result.NATCounterIDs), "max", MaxNATRuleCounters)
+		result.NATCounterIDs[ruleKey] = 0
+		return 0
+	}
+	// Derive the stable id; resolve the rare distinct-key collision against the
+	// ids already assigned in this compile by deterministic re-hash.
+	counterID := natCounterIDForKey(ruleKey)
+	for attempt := 1; natCounterIDInUse(result, ruleKey, counterID); attempt++ {
+		counterID = natCounterIDForKey(fmt.Sprintf("%s#%d", ruleKey, attempt))
+		if counterID == 0 {
+			counterID = 1
+		}
 	}
 	result.NATCounterIDs[ruleKey] = counterID
-	if counterID != 0 {
-		result.nextNATCounterID++
-	}
 	return counterID
+}
+
+// natCounterIDInUse reports whether counterID is already assigned to a rule key
+// OTHER than ruleKey in this compile. Used by assignNATCounterID to detect a
+// distinct-key hash collision before claiming the id.
+func natCounterIDInUse(result *CompileResult, ruleKey string, counterID uint32) bool {
+	for k, id := range result.NATCounterIDs {
+		if id == counterID && k != ruleKey {
+			return true
+		}
+	}
+	return false
 }
 
 func compileNAT(dp DataPlane, cfg *config.Config, result *CompileResult) error {
@@ -189,7 +240,11 @@ func compileNAT(dp DataPlane, cfg *config.Config, result *CompileResult) error {
 							Mode:      SNATModeOff,
 							SrcAddrID: srcAddrID,
 							DstAddrID: dstAddrID,
-							CounterID: counterID,
+							// Vestigial: the legacy BPF snat_value carries a u16
+							// counter id, but the userspace runtime writes this
+							// struct through a no-op DataPlane and reads hits via
+							// the snapshot's u32 counter id instead (#2255).
+							CounterID: uint16(counterID),
 						}
 						ri := v4RuleIdx[zp]
 						if err := dp.SetSNATRule(fromZone, toZone, ri, val); err != nil {
@@ -204,7 +259,11 @@ func compileNAT(dp DataPlane, cfg *config.Config, result *CompileResult) error {
 							Mode:      SNATModeOff,
 							SrcAddrID: srcAddrID,
 							DstAddrID: dstAddrID,
-							CounterID: counterID,
+							// Vestigial: the legacy BPF snat_value carries a u16
+							// counter id, but the userspace runtime writes this
+							// struct through a no-op DataPlane and reads hits via
+							// the snapshot's u32 counter id instead (#2255).
+							CounterID: uint16(counterID),
 						}
 						ri6 := v6RuleIdx[zp]
 						if err := dp.SetSNATRuleV6(fromZone, toZone, ri6, val6); err != nil {
@@ -538,7 +597,11 @@ func compileNAT(dp DataPlane, cfg *config.Config, result *CompileResult) error {
 							Mode:      curPoolID,
 							SrcAddrID: srcAddrID,
 							DstAddrID: dstAddrID,
-							CounterID: counterID,
+							// Vestigial: the legacy BPF snat_value carries a u16
+							// counter id, but the userspace runtime writes this
+							// struct through a no-op DataPlane and reads hits via
+							// the snapshot's u32 counter id instead (#2255).
+							CounterID: uint16(counterID),
 						}
 						ri := v4RuleIdx[zp]
 						if err := dp.SetSNATRule(fromZone, toZone, ri, val); err != nil {
@@ -562,7 +625,11 @@ func compileNAT(dp DataPlane, cfg *config.Config, result *CompileResult) error {
 							Mode:      curPoolID,
 							SrcAddrID: srcAddrID,
 							DstAddrID: dstAddrID,
-							CounterID: counterID,
+							// Vestigial: the legacy BPF snat_value carries a u16
+							// counter id, but the userspace runtime writes this
+							// struct through a no-op DataPlane and reads hits via
+							// the snapshot's u32 counter id instead (#2255).
+							CounterID: uint16(counterID),
 						}
 						ri := v6RuleIdx[zp]
 						if err := dp.SetSNATRuleV6(fromZone, toZone, ri, val); err != nil {

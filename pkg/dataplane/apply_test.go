@@ -25,7 +25,7 @@ func TestApplyResultFromCompileResultCarriesDisplayMetadata(t *testing.T) {
 		FilterSpans: map[string]FilterCounterSpan{
 			"inet:edge-in": {FilterID: 3, RuleStart: 42, RuleCount: 7},
 		},
-		NATCounterIDs: map[string]uint16{
+		NATCounterIDs: map[string]uint32{
 			"srcnat/rule-a": 9,
 		},
 		PoolIDs: map[string]uint8{
