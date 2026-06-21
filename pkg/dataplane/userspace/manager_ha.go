@@ -549,19 +549,20 @@ func (m *Manager) UpdateHAWatchdog(rgID int, timestamp uint64) error {
 }
 
 type userspaceCounterSnapshot struct {
-	rxPackets        uint64
-	txPackets        uint64
-	forwardPackets   uint64
-	sessionCreates   uint64
-	sessionExpires   uint64
-	policyDenied     uint64
-	screenDrops      uint64
-	synCookieSent    uint64
-	synCookieValid   uint64
-	synCookieInvalid uint64
-	synCookieBypass  uint64
-	snatPackets      uint64
-	dnatPackets      uint64
+	rxPackets         uint64
+	txPackets         uint64
+	forwardPackets    uint64
+	sessionCreates    uint64
+	sessionExpires    uint64
+	policyDenied      uint64
+	screenDrops       uint64
+	synCookieSent     uint64
+	synCookieValid    uint64
+	synCookieInvalid  uint64
+	synCookieBypass   uint64
+	snatPackets       uint64
+	dnatPackets       uint64
+	nat64Translations uint64
 }
 
 // sumBindingCounters aggregates counters across all bindings in a status response.
@@ -582,6 +583,7 @@ func sumBindingCounters(status *ProcessStatus) userspaceCounterSnapshot {
 		s.synCookieBypass += b.SYNCookieBypass
 		s.snatPackets += b.SNATPackets
 		s.dnatPackets += b.DNATPackets
+		s.nat64Translations += b.Nat64Translations
 	}
 	return s
 }
@@ -617,6 +619,12 @@ func (m *Manager) syncBPFCountersLocked(status *ProcessStatus) {
 		{dataplane.GlobalCtrSyncookieValid, safeDelta(cur.synCookieValid, prev.synCookieValid)},
 		{dataplane.GlobalCtrSyncookieInvalid, safeDelta(cur.synCookieInvalid, prev.synCookieInvalid)},
 		{dataplane.GlobalCtrSyncookieBypass, safeDelta(cur.synCookieBypass, prev.synCookieBypass)},
+		// #2161: surface NAT64 translations into the global counter the CLI,
+		// gRPC status, and Prometheus collector already read
+		// (GlobalCtrNAT64Xlate). The Rust helper counts each v6<->v4 xlate
+		// per-binding; this delta-push mirrors the snat/dnat plumbing so
+		// `show security flow statistics` reflects live NAT64 translation.
+		{dataplane.GlobalCtrNAT64Xlate, safeDelta(cur.nat64Translations, prev.nat64Translations)},
 	}
 
 	for _, d := range deltas {
