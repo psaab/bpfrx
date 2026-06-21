@@ -79,7 +79,20 @@ const (
 	kea6Config = "/etc/kea/kea-dhcp6.conf"
 	kea4Svc    = "kea-dhcp4-server"
 	kea6Svc    = "kea-dhcp6-server"
+	// Kea memfile lease databases (per family). Shared by the display
+	// reader, the DDNS reconciler, and the #2239 lease-sync memfile
+	// fallback so the path is defined once.
+	keaLeaseFile4 = "/var/lib/kea/kea-leases4.csv"
+	keaLeaseFile6 = "/var/lib/kea/kea-leases6.csv"
 )
+
+// libDHCPLeaseCmdsPath is the absolute path of the lease_cmds hook library.
+// The #2239 lease-sync read/seed path issues lease{4,6}-get-all and
+// lease{4,6}-add over the control socket; both require this hook loaded in the
+// generated Kea config. It ships in kea-common (live-verified 3.0.3), so no new
+// apt package is needed; if the file is ever absent the read path falls back to
+// the memfile parser.
+const libDHCPLeaseCmdsPath = "/usr/lib/x86_64-linux-gnu/kea/hooks/libdhcp_lease_cmds.so"
 
 // Manager manages Kea DHCP server processes.
 //
@@ -133,6 +146,32 @@ type Manager struct {
 	// asyncWorkerStarts counts worker goroutine launches; tests assert
 	// the sync.Once keeps it at 1 across ApplyAsync bursts.
 	asyncWorkerStarts atomic.Int32
+
+	// #2239 HA DHCP-server lease synchronization (PATH C). When
+	// leaseSyncEnabled is set (cluster + `dhcp-lease-synchronization`
+	// knob), the generated Kea config gains a unix control-socket and the
+	// lease_cmds hook so leases can be read (lease{4,6}-get-all) and seeded
+	// (lease{4,6}-add) without racing the memfile. The flag is set by the
+	// daemon via SetLeaseSyncEnabled before an apply; standalone / knob-off
+	// leaves the config bit-identical to pre-#2239.
+	leaseSyncEnabled atomic.Bool
+
+	// keaDial / ctrlSocket{4,6} / leaseFile{4,6} are test seams for the
+	// lease-sync read/seed path (lease_sync.go). Production leaves them
+	// zero, which selects net.Dial + the package-default paths.
+	keaDial     keaSocketDialer
+	ctrlSocket4 string
+	ctrlSocket6 string
+	leaseFile4  string
+	leaseFile6  string
+}
+
+// SetLeaseSyncEnabled toggles emission of the Kea control-socket + lease_cmds
+// hook in the generated config (#2239). It takes effect on the next apply; the
+// daemon calls it from the config-apply path when the cluster
+// `dhcp-lease-synchronization` knob is set.
+func (m *Manager) SetLeaseSyncEnabled(enabled bool) {
+	m.leaseSyncEnabled.Store(enabled)
 }
 
 // asyncApplyReq is one desired DHCP-server state for the ApplyAsync
@@ -368,12 +407,12 @@ type Lease struct {
 
 // GetLeases4 reads Kea DHCPv4 lease file and returns active leases.
 func (m *Manager) GetLeases4() ([]Lease, error) {
-	return parseLeaseCSV("/var/lib/kea/kea-leases4.csv", time.Now())
+	return parseLeaseCSV(m.leaseFile(4), time.Now())
 }
 
 // GetLeases6 reads Kea DHCPv6 lease file and returns active leases.
 func (m *Manager) GetLeases6() ([]Lease, error) {
-	return parseLeaseCSV("/var/lib/kea/kea-leases6.csv", time.Now())
+	return parseLeaseCSV(m.leaseFile(6), time.Now())
 }
 
 // parseLeaseCSV parses Kea's append-only memfile CSV and returns the
@@ -660,19 +699,19 @@ func (m *Manager) generateKea4Config(cfg *config.DHCPServerConfig) error {
 		ifaces = append(ifaces, group.Interfaces...)
 	}
 
-	keaCfg := map[string]any{
-		"Dhcp4": map[string]any{
-			"interfaces-config": map[string]any{
-				"interfaces": ifaces,
-			},
-			"lease-database": map[string]any{
-				"type": "memfile",
-				"name": "/var/lib/kea/kea-leases4.csv",
-			},
-			"valid-lifetime": 86400,
-			"subnet4":        subnets,
+	dhcp4 := map[string]any{
+		"interfaces-config": map[string]any{
+			"interfaces": ifaces,
 		},
+		"lease-database": map[string]any{
+			"type": "memfile",
+			"name": keaLeaseFile4,
+		},
+		"valid-lifetime": 86400,
+		"subnet4":        subnets,
 	}
+	m.addLeaseSyncStanza(dhcp4, 4)
+	keaCfg := map[string]any{"Dhcp4": dhcp4}
 
 	return m.writeKeaConfig(m.confPath4, keaCfg)
 }
@@ -740,21 +779,42 @@ func (m *Manager) generateKea6Config(cfg *config.DHCPServerConfig) error {
 		ifaces = append(ifaces, group.Interfaces...)
 	}
 
-	keaCfg := map[string]any{
-		"Dhcp6": map[string]any{
-			"interfaces-config": map[string]any{
-				"interfaces": ifaces,
-			},
-			"lease-database": map[string]any{
-				"type": "memfile",
-				"name": "/var/lib/kea/kea-leases6.csv",
-			},
-			"valid-lifetime": 86400,
-			"subnet6":        subnets,
+	dhcp6 := map[string]any{
+		"interfaces-config": map[string]any{
+			"interfaces": ifaces,
 		},
+		"lease-database": map[string]any{
+			"type": "memfile",
+			"name": keaLeaseFile6,
+		},
+		"valid-lifetime": 86400,
+		"subnet6":        subnets,
 	}
+	m.addLeaseSyncStanza(dhcp6, 6)
+	keaCfg := map[string]any{"Dhcp6": dhcp6}
 
 	return m.writeKeaConfig(m.confPath6, keaCfg)
+}
+
+// addLeaseSyncStanza injects the unix control-socket + lease_cmds hook into a
+// generated Kea Dhcp{4,6} object when #2239 lease sync is enabled. When the
+// knob is off (or standalone) it is a no-op, so the rendered config is
+// bit-identical to pre-#2239. The control socket lets the #2239 push/seed path
+// read (lease{4,6}-get-all) and write (lease{4,6}-add) the live lease set
+// without racing the append-only memfile. The hook (libdhcp_lease_cmds.so)
+// ships in kea-common; it is additive and does not change DHCP serving
+// behavior.
+func (m *Manager) addLeaseSyncStanza(dhcp map[string]any, family int) {
+	if !m.leaseSyncEnabled.Load() {
+		return
+	}
+	dhcp["control-socket"] = map[string]any{
+		"socket-type": "unix",
+		"socket-name": m.controlSocket(family),
+	}
+	dhcp["hooks-libraries"] = []map[string]any{
+		{"library": libDHCPLeaseCmdsPath},
+	}
 }
 
 func (m *Manager) writeKeaConfig(path string, keaCfg map[string]any) error {
