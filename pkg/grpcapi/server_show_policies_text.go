@@ -44,6 +44,17 @@ func (s *Server) showPoliciesHitCount(filter string, buf *strings.Builder) {
 			}
 		}
 	}
+	// Honor `set security policy-stats system-wide enable` (#2008 M4 /
+	// #2118): Junos maintains and displays per-policy hit counters only
+	// when policy-stats is enabled system-wide (default off). The
+	// Prometheus collector (metrics_counters.go) already gates on this
+	// knob; gate the text/structured display surfaces identically so all
+	// four surfaces (Prometheus, gRPC text hit-count, gRPC text detail,
+	// structured gRPC GetPolicies, local CLI) report the SAME values.
+	// When the knob is off, the per-rule counter columns read 0 (we skip
+	// the dataplane read) rather than surfacing live counts the operator
+	// did not enable.
+	statsEnabled := cfg.Security.PolicyStatsEnabled
 	fmt.Fprintf(buf, "%-12s %-12s %-24s %-8s %12s %16s\n",
 		"From zone", "To zone", "Policy", "Action", "Packets", "Bytes")
 	fmt.Fprintln(buf, strings.Repeat("-", 88))
@@ -65,7 +76,7 @@ func (s *Server) showPoliciesHitCount(filter string, buf *strings.Builder) {
 			}
 			ruleID := policySetID*dataplane.MaxRulesPerPolicy + uint32(i)
 			var pkts, bytes uint64
-			if s.dp != nil && s.dp.IsLoaded() {
+			if statsEnabled && s.dp != nil && s.dp.IsLoaded() {
 				if counters, err := s.dp.ReadPolicyCounters(ruleID); err == nil {
 					pkts = counters.Packets
 					bytes = counters.Bytes
@@ -105,6 +116,10 @@ func (s *Server) showPoliciesDetail(filter string, buf *strings.Builder) {
 			}
 		}
 	}
+	// Same policy-stats gate as showPoliciesHitCount (#2008 M4 / #2118):
+	// the "Session statistics" block is per-policy hit-count display, so
+	// it must honor the knob for cross-surface consistency.
+	statsEnabled := cfg.Security.PolicyStatsEnabled
 	policySetID := uint32(0)
 	for _, zpp := range cfg.Security.Policies {
 		if (filterFrom != "" && zpp.FromZone != filterFrom) ||
@@ -152,7 +167,7 @@ func (s *Server) showPoliciesDetail(filter string, buf *strings.Builder) {
 			if pol.Count {
 				fmt.Fprintf(buf, "      count\n")
 			}
-			if s.dp != nil && s.dp.IsLoaded() {
+			if statsEnabled && s.dp != nil && s.dp.IsLoaded() {
 				if counters, err := s.dp.ReadPolicyCounters(ruleID); err == nil {
 					fmt.Fprintf(buf, "    Session statistics:\n")
 					fmt.Fprintf(buf, "      %d packets, %d bytes\n", counters.Packets, counters.Bytes)
@@ -202,7 +217,7 @@ func (s *Server) showPoliciesDetail(filter string, buf *strings.Builder) {
 			if pol.Count {
 				fmt.Fprintf(buf, "      count\n")
 			}
-			if s.dp != nil && s.dp.IsLoaded() {
+			if statsEnabled && s.dp != nil && s.dp.IsLoaded() {
 				if counters, err := s.dp.ReadPolicyCounters(ruleID); err == nil {
 					fmt.Fprintf(buf, "    Session statistics:\n")
 					fmt.Fprintf(buf, "      %d packets, %d bytes\n", counters.Packets, counters.Bytes)
