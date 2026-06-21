@@ -23,6 +23,7 @@ import (
 	"github.com/psaab/xpf/pkg/conntrack"
 	"github.com/psaab/xpf/pkg/dhcp"
 	"github.com/psaab/xpf/pkg/dhcpserver"
+	"github.com/psaab/xpf/pkg/eventengine"
 	"github.com/psaab/xpf/pkg/feeds"
 	"github.com/psaab/xpf/pkg/frr"
 	"github.com/psaab/xpf/pkg/fsatomic"
@@ -92,6 +93,10 @@ type Config struct {
 	// the xpf_ipmon_* metrics (#1827). Optional; if nil, the family is
 	// omitted.
 	IPMonStatusFn func() []ipmon.PolicyStatus
+	// EventActionStatsFn surfaces event-options remediation action
+	// counters for the xpf_event_actions_* / xpf_event_action_queue_depth
+	// metrics (#2157). Optional; if nil, the family is omitted.
+	EventActionStatsFn func() eventengine.Stats
 	// RPMPinFailedFn surfaces the count of RPM next-hop probe pins
 	// whose kernel install (fwmark rule + pinned route) is currently
 	// failed — the affected tests hold state instead of probing the
@@ -142,6 +147,7 @@ type Server struct {
 	neighborPhaseAgeFn      func() map[string]float64
 	frrReloadDegradedFn     func() bool
 	ipmonStatusFn           func() []ipmon.PolicyStatus
+	eventActionStatsFn      func() eventengine.Stats
 	rpmPinFailedFn          func() float64
 	feedsFn                 func() map[string]feeds.FeedInfo
 	ddnsStatsFn             func() *dhcpserver.DDNSStats
@@ -167,6 +173,7 @@ func NewServer(cfg Config) *Server {
 		neighborPhaseAgeFn:      cfg.NeighborPhaseAgeFn,
 		frrReloadDegradedFn:     cfg.FRRReloadDegradedFn,
 		ipmonStatusFn:           cfg.IPMonStatusFn,
+		eventActionStatsFn:      cfg.EventActionStatsFn,
 		rpmPinFailedFn:          cfg.RPMPinFailedFn,
 		feedsFn:                 cfg.FeedsFn,
 		ddnsStatsFn:             cfg.DDNSStatsFn,
