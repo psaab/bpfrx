@@ -34,6 +34,35 @@
   userspace-dp/src/policy_tests.rs, docs/feature-gaps.md,
   docs/pr/2118-policy-hit-count/plan.md
 
+## 2026-06-20 — #2124 policy app-term unparseable named protocol fail-open
+
+- **Timestamp**: 2026-06-20
+- **Action**: Fixed a verified security fail-open. A policy `application`
+  term whose named L3 protocol the Rust matcher could not parse
+  (sctp/esp/ah/vrrp/igmp/pim/egp) was silently dropped and a rule whose
+  terms all dropped collapsed to match-any, permitting ALL traffic for
+  the zone pair. Fix (3 layers, per Codex r1/r2/r3 plan review):
+  (1) centralized the named->number table in `appid.ProtocolNumber`
+  (cycle-safe; dataplane/catalog delegate); (2) extended Rust
+  `parse_protocol` for the named IANA set and made an all-unparseable
+  term list raise `SnapshotIntegrityError` (whole-snapshot reject,
+  action-agnostic) instead of match-any; (3) Go capability gate now
+  rejects unrepresentable protocol/port (ForwardingSupported=false) and
+  emits a `__unsupported__` fail-closed sentinel term instead of nil so
+  the published snapshot cannot fail open in the publish-before-disarm
+  window. Rust 8 new tests + Go gate/sentinel/parity tests; full Go
+  suite green; full Rust suite green (two pre-existing concurrency flakes
+  in unrelated worker_queue/wg-engine modules verified flaky on clean
+  master). HOT-PATH/SECURITY: cluster smoke NOT run by the engineer
+  agent; parent runs the /security-matrix directional smoke after merge.
+- **File(s)**: pkg/appid/catalog.go, pkg/appid/protocol_number_2124_test.go,
+  pkg/dataplane/compiler.go, pkg/dataplane/userspace/manager.go,
+  pkg/dataplane/userspace/policies.go,
+  pkg/dataplane/userspace/protocol_failopen_2124_test.go,
+  userspace-dp/src/ip_proto.rs, userspace-dp/src/policy.rs,
+  userspace-dp/src/policy_tests.rs, docs/userspace-dataplane-gaps.md,
+  docs/pr/2124-protocol-failopen/plan.md, _Log.md
+
 ## 2026-06-20 — #2079 nat pool-utilization-alarm lenient-disable runtime parity
 
 - **Timestamp**: 2026-06-20
