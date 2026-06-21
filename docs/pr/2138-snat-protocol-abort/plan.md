@@ -1,6 +1,29 @@
 # #2138 — persistent-SNAT protocol mismatch must abort the commit
 
-**Status:** DRAFT v1 — pending adversarial plan review
+**Status:** v2 — Codex PLAN-NEEDS-MINOR (all minors folded), AGY plan
+review pending (Gemini companion is decommissioned — "no longer
+supported for individuals, migrate to Antigravity"; AGY is the
+migration target and the substitute second reviewer)
+
+## Codex r1 minor findings (folded into v2)
+
+1. **Unused `errors` import.** After `compileErrorMustAbortApply`
+   delegates to `dpuserspace.IsRequiredProtocolGateError`, `errors` is
+   no longer referenced in `daemon_apply.go` (its only use was the
+   `errors.Is` at line 1325). The implementation MUST remove the
+   `"errors"` import or `go build` fails. — Added to the design.
+2. **"Abort commit" wording is imprecise.** `Store.Commit*` /
+   `Store.SyncApply` promote+persist BEFORE `applyConfigLocked` runs
+   (store.go:1169 / store.go:621), and existing comments
+   (daemon_apply.go:349) rely on that ordering. The fix aborts the
+   **apply/commit-RPC result** the operator sees — it does not roll
+   back store promotion. This is the accepted scheduler-gate contract.
+   Wording tightened below + in the new code comments.
+3. **Comments name only the scheduler sentinel.** daemon_apply.go:351
+   and daemon_snmp_reconcile_test.go:74 reference only
+   `ErrPolicySchedulerProtocolIncompatible`. After this change they must
+   read "required userspace protocol gate" (or name both sentinels). —
+   Added to the design.
 
 ## Issue framing
 
@@ -164,6 +187,31 @@ This keeps the existing single call site (daemon_apply.go:695)
 unchanged, preserves the existing function name (referenced in three
 test files + comments), and removes the omission hazard: a new gate is
 covered the moment its sentinel is added to the list beside the gate.
+
+**Remove the now-unused `"errors"` import** from daemon_apply.go (Codex
+r1 #1): the delegation drops the only `errors.Is` use in the file.
+
+### Precise abort semantics (Codex r1 #2)
+
+"Abort" here means **the apply/commit-RPC result returned to the
+operator becomes non-nil**, so the HTTP/gRPC/CLI commit reports failure.
+`Store.Commit` / `Store.CommitConfirmed` / `Store.SyncApply` have ALREADY
+promoted+persisted the compiled config before `applyConfigLocked` runs
+(store.go:1169 / store.go:621), so the abort does NOT unwind store
+promotion — identical to the existing scheduler-gate behavior and the
+contract the daemon_apply.go:349 SNMP-reconcile-ordering comment already
+documents. The operator-visible signal is the failed commit + the
+disarmed helper; the store row is the accepted post-condition for this
+gate class (out of scope to change — see OQ-6).
+
+### Comment generalization (Codex r1 #3)
+
+Update the two comments that name only the scheduler sentinel to name
+the gate CLASS:
+- daemon_apply.go:351 — "...returns early on a required userspace
+  protocol gate error (compileErrorMustAbortApply: policy-scheduler OR
+  persistent-source-NAT protocol incompatibility)".
+- daemon_snmp_reconcile_test.go:74 — same generalization.
 
 ### Why the list lives in `pkg/dataplane/userspace`, not a new package
 
