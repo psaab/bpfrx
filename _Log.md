@@ -17,6 +17,11 @@
 - **Validation**: full userspace-dp test suite green (2094+46+8+16+1, 0
   failed); new tests 5/5 flake-clean; both fsync-removal mutations fail
   the tests.
+## 2026-06-21 — #2136 NetFlow per-flow-server export-version binding (no double-export)
+
+- **Timestamp**: 2026-06-21
+- **Action**: Fixed #2136 (deferred #2129 follow-up). A flow-server under BOTH global `version9` and `version-ipfix` was double-exported (one v9 + one IPFIX datagram to the same collector socket, mismatched 1-in-N). Bound each flow-server to exactly one export version (Junos semantics): added `FlowServer.Version`/`VersionIPFIXTemplate` + parse the per-server `version-ipfix`/`version-ipfix-template` selectors; `BuildExportConfig`/`BuildIPFIXExportConfig` now take only the flow-servers resolved to their version via shared `resolveFlowServerVersion`/`collectVersionCollectors`. Semantics for an UNBOUND server with both globals set: IPFIX wins (documented precedence — IETF-standard superset of v9; one stream not two). CLI shows IPFIX template; README/config-schema docs updated. Tests FAIL on pre-fix collect-all (mutation-verified) at both the build-config and live-reconcile/callback layers.
+- **File(s)**: pkg/config/types_system.go, pkg/config/compiler_services.go, pkg/config/schema_routing.go, pkg/config/parser_security_test.go, pkg/flowexport/manager.go, pkg/flowexport/version_binding_test.go, pkg/daemon/daemon_flowexport_reconcile_test.go, pkg/cli/cli_show_flow.go, pkg/cli/cli_show_routing.go, pkg/flowexport/README.md, docs/config-schema.md
 
 ## 2026-06-20 — #2120 PR #2166 Copilot fold (doc nits + SELF-HEAL/HOLD expect hardening)
 
@@ -7772,3 +7777,19 @@ top.
   no dataplane smoke.
   **File(s)**: pkg/dhcpserver/dhcpserver.go, pkg/dhcpserver/dhcpserver_test.go,
   pkg/dhcpserver/README.md, docs/pr/2154-parseleasecsv/plan.md
+- **Timestamp**: 2026-06-21
+  **Action**: #2148 — route frame/tcp.rs IPv6 inspection helpers through
+  the shared ext-header walker. `frame_has_tcp_rst`,
+  `extract_tcp_flags_and_window`, and `extract_tcp_window` hard-coded IPv6
+  TCP at L3+40, so any IPv6 flow with extension headers (hop-by-hop,
+  routing, fragment, dest-opts) had RST/flags/window read from inside the
+  ext header → false diagnostics. Fix: derive the L4 offset via the
+  existing `packet_rel_l4_offset_and_protocol` (bounded ≤6 iters,
+  allocation-free, fail-safe). 16 new crafted-packet tests (plain v6 +
+  1/2 ext hdrs + fragment + malformed/looping + non-TCP-after-ext); 7
+  FAIL against pre-fix code. IPv4 + plain v6 unchanged. Diagnostics-only
+  callers today (read-only, no per-packet heap). Release build + frame::
+  suite green, 5/5 flake.
+  **File(s)**: userspace-dp/src/afxdp/frame/tcp.rs,
+  userspace-dp/src/afxdp/frame/tcp_tests.rs,
+  userspace-dp/src/afxdp/frame/README.md

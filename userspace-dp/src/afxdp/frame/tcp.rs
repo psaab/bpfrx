@@ -45,6 +45,14 @@ const TCP_MIN_HEADER_LEN: usize = 20;
 const TCP_MSS_OPTION_LEN: usize = 4;
 
 /// Check if a frame contains a TCP RST flag.
+///
+/// #2148: the L4 offset is derived via the shared ext-aware
+/// `packet_rel_l4_offset_and_protocol` walker, NOT a fixed L3+40 for
+/// IPv6. The previous fixed offset read inside an IPv6 extension header
+/// (hop-by-hop / routing / fragment / dest-opts) on flows that carry
+/// one, reporting a false RST verdict to the diagnostics path. The
+/// walker is bounded (≤6 iterations), allocation-free, and fails safe
+/// (returns `false`) on a truncated/malformed chain.
 #[inline(always)]
 pub(in crate::afxdp) fn frame_has_tcp_rst(frame: &[u8]) -> bool {
     let l3 = match frame_l3_offset(frame) {
@@ -55,13 +63,14 @@ pub(in crate::afxdp) fn frame_has_tcp_rst(frame: &[u8]) -> bool {
         Some(ip) if ip.len() >= 20 => ip,
         _ => return false,
     };
-    let (protocol, l4_offset) = match ip[0] >> 4 {
-        4 => {
-            let ihl = ((ip[0] & 0x0f) as usize) * 4;
-            (ip[9], ihl)
-        }
-        6 if ip.len() >= 40 => (ip[6], 40usize),
+    let addr_family = match ip[0] >> 4 {
+        4 => libc::AF_INET as u8,
+        6 => libc::AF_INET6 as u8,
         _ => return false,
+    };
+    let (l4_offset, protocol) = match packet_rel_l4_offset_and_protocol(ip, addr_family) {
+        Some(t) => t,
+        None => return false,
     };
     if protocol != PROTO_TCP {
         return false;
@@ -76,26 +85,22 @@ pub(in crate::afxdp) fn frame_has_tcp_rst(frame: &[u8]) -> bool {
 
 /// Extract TCP flags and window from raw frame, auto-detecting L3 from Ethernet header.
 /// Returns (tcp_flags, tcp_window) or None.
+///
+/// #2148: routes the L4 offset through the ext-aware
+/// `packet_rel_l4_offset_and_protocol` walker rather than a fixed L3+40
+/// for IPv6, so flags/window are read from the real TCP header on flows
+/// that carry IPv6 extension headers. Fails safe (returns `None`) on a
+/// truncated/malformed chain.
 #[inline]
 pub(in crate::afxdp) fn extract_tcp_flags_and_window(frame: &[u8]) -> Option<(u8, u16)> {
     let l3 = frame_l3_offset(frame)?;
     let ip = frame.get(l3..)?;
-    let (protocol, l4_offset) = match ip.first()? >> 4 {
-        4 => {
-            if ip.len() < 20 {
-                return None;
-            }
-            let ihl = ((ip[0] & 0x0f) as usize) * 4;
-            (ip[9], ihl)
-        }
-        6 => {
-            if ip.len() < 40 {
-                return None;
-            }
-            (ip[6], 40usize)
-        }
+    let addr_family = match ip.first()? >> 4 {
+        4 => libc::AF_INET as u8,
+        6 => libc::AF_INET6 as u8,
         _ => return None,
     };
+    let (l4_offset, protocol) = packet_rel_l4_offset_and_protocol(ip, addr_family)?;
     if protocol != PROTO_TCP {
         return None;
     }
@@ -110,6 +115,12 @@ pub(in crate::afxdp) fn extract_tcp_flags_and_window(frame: &[u8]) -> Option<(u8
 
 /// Extract TCP window size from raw frame data.
 /// Returns None if not a TCP frame or if frame is too short.
+///
+/// #2148: derives the L4 offset via the shared ext-aware
+/// `packet_rel_l4_offset_and_protocol` walker instead of a fixed L3+40
+/// for IPv6, so the window is read from the real TCP header even when
+/// the IPv6 packet carries extension headers. Fails safe (returns
+/// `None`) on a truncated/malformed chain.
 #[inline]
 #[allow(dead_code)]
 pub(in crate::afxdp) fn extract_tcp_window(frame: &[u8], addr_family: u8) -> Option<u16> {
@@ -118,22 +129,7 @@ pub(in crate::afxdp) fn extract_tcp_window(frame: &[u8], addr_family: u8) -> Opt
         None => return None,
     };
     let ip = frame.get(l3..)?;
-    let (protocol, l4_offset) = match addr_family as i32 {
-        libc::AF_INET => {
-            if ip.len() < 20 {
-                return None;
-            }
-            let ihl = ((ip[0] & 0x0f) as usize) * 4;
-            (ip[9], ihl)
-        }
-        libc::AF_INET6 => {
-            if ip.len() < 40 {
-                return None;
-            }
-            (ip[6], 40usize)
-        }
-        _ => return None,
-    };
+    let (l4_offset, protocol) = packet_rel_l4_offset_and_protocol(ip, addr_family)?;
     if protocol != PROTO_TCP {
         return None;
     }

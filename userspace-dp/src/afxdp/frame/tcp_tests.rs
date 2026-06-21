@@ -748,3 +748,253 @@ fn reject_rst_v4_syn_with_data_acks_seq_plus_one_plus_payload() {
         "ack = seq + SYN(1) + 4 payload bytes"
     );
 }
+
+// ---------- #2148: IPv6 extension-header L4-offset correctness ----------
+//
+// The three stale helpers (frame_has_tcp_rst,
+// extract_tcp_flags_and_window, extract_tcp_window) previously hard-coded
+// the IPv6 TCP header at L3+40, ignoring extension headers. These tests
+// craft IPv6 frames that carry one or more extension headers before the
+// TCP header. They are written so that the byte sequence sitting at the
+// OLD fixed offset (L3+40, i.e. the first byte of the extension header)
+// is deliberately NOT a valid/RST TCP header — so the pre-fix code
+// produces the wrong answer and these tests FAIL against it. The fix
+// walks the ext-header chain to the true L4 offset.
+
+/// Build an IPv6 extension header block: `[next_header, hdr_ext_len, ...]`
+/// where `hdr_ext_len` is in 8-octet units NOT counting the first 8
+/// octets (RFC 8200 §4.3 for hop-by-hop/dest-opts/routing). `units`
+/// gives the number of additional 8-octet groups (0 → 8-byte header).
+/// The body is filled with a recognizable sentinel (0xEE) so that any
+/// reader landing inside the ext header (the pre-#2148 bug) sees
+/// non-TCP-header bytes.
+fn ipv6_ext_hbh_or_dstopt(next_header: u8, units: u8) -> Vec<u8> {
+    let len = (units as usize + 1) * 8;
+    let mut ext = vec![0xEEu8; len];
+    ext[0] = next_header;
+    ext[1] = units; // hdr_ext_len in 8-octet units beyond the first 8
+    ext
+}
+
+/// Build an IPv6 fragment header (always 8 bytes): next_header, reserved,
+/// fragment-offset+flags (2), identification (4). Offset 0, M=0 → first
+/// (atomic) fragment, which DOES carry the L4 header.
+fn ipv6_fragment_header(next_header: u8) -> [u8; 8] {
+    let mut frag = [0u8; 8];
+    frag[0] = next_header;
+    // bytes 2-3 = frag offset (0) | res | M-flag (0): first fragment.
+    frag[4..8].copy_from_slice(&0xABCDEF01u32.to_be_bytes());
+    frag
+}
+
+/// Assemble an Ethernet+IPv6 frame whose IPv6 next-header chain is the
+/// concatenation of `ext_blocks` (each a raw ext-header byte block whose
+/// first byte already points at the following header) terminating in a
+/// 20-byte TCP header carrying `flags`/`window`. `first_next_header` is
+/// the IPv6 base-header next-header byte (the first ext-header type, or
+/// PROTO_TCP if `ext_blocks` is empty).
+fn build_v6_frame_with_ext_chain(
+    first_next_header: u8,
+    ext_blocks: &[Vec<u8>],
+    flags: u8,
+    window: u16,
+) -> Vec<u8> {
+    let mut tcp = tcp_header_skeleton(flags, 5);
+    tcp[14..16].copy_from_slice(&window.to_be_bytes());
+
+    let ext_total: usize = ext_blocks.iter().map(|b| b.len()).sum();
+    let payload_len = (ext_total + tcp.len()) as u16;
+
+    let mut frame = Vec::new();
+    frame.extend_from_slice(&eth_header(0x86dd));
+    frame.extend_from_slice(&ipv6_header(payload_len, first_next_header));
+    for b in ext_blocks {
+        frame.extend_from_slice(b);
+    }
+    frame.extend_from_slice(&tcp);
+    frame
+}
+
+#[test]
+fn frame_has_tcp_rst_v6_plain_unchanged() {
+    // No ext headers: base IPv6 next-header = TCP (offset 40). RST set.
+    let frame = build_v6_frame_with_ext_chain(PROTO_TCP, &[], 0x04, 65535);
+    assert!(
+        frame_has_tcp_rst(&frame),
+        "plain IPv6 TCP RST still detected (offset-40 path unchanged)"
+    );
+}
+
+#[test]
+fn frame_has_tcp_rst_v6_hop_by_hop() {
+    // 1 hop-by-hop ext header (8 bytes) → TCP at L3+40+8. RST set.
+    // The byte at the OLD offset L3+40 is the ext-header next-header
+    // (PROTO_TCP) followed by hdr_ext_len/sentinel — its "flags" byte at
+    // +13 is the 0xEE sentinel, so the pre-fix code reads RST from the
+    // wrong place. The fix walks to the true offset.
+    let hbh = ipv6_ext_hbh_or_dstopt(PROTO_TCP, 0);
+    let frame = build_v6_frame_with_ext_chain(0 /* HBH */, &[hbh], 0x04, 65535);
+    assert!(
+        frame_has_tcp_rst(&frame),
+        "IPv6 + hop-by-hop: RST must be read at the post-ext-header offset"
+    );
+}
+
+#[test]
+fn frame_has_tcp_rst_v6_hop_by_hop_no_rst() {
+    // Same chain but SYN (no RST). Must report false. The 0xEE sentinel
+    // at the old offset HAS bit 0x04 set (0xEE & 0x04 == 0x04), so the
+    // pre-fix code would FALSELY report RST here — this guards both
+    // directions of the verdict.
+    let hbh = ipv6_ext_hbh_or_dstopt(PROTO_TCP, 0);
+    let frame = build_v6_frame_with_ext_chain(0, &[hbh], TCP_FLAG_SYN, 65535);
+    assert!(
+        !frame_has_tcp_rst(&frame),
+        "IPv6 + hop-by-hop SYN: must NOT false-positive RST from the ext-header sentinel"
+    );
+}
+
+#[test]
+fn frame_has_tcp_rst_v6_two_ext_headers() {
+    // hop-by-hop (next=dest-opts) → dest-opts (next=TCP) → TCP. RST set.
+    let dstopt = ipv6_ext_hbh_or_dstopt(PROTO_TCP, 1); // 16-byte dest-opts
+    let hbh = ipv6_ext_hbh_or_dstopt(60 /* dest-opts */, 0); // 8-byte HBH
+    let frame = build_v6_frame_with_ext_chain(0 /* HBH */, &[hbh, dstopt], 0x04, 65535);
+    assert!(
+        frame_has_tcp_rst(&frame),
+        "IPv6 + 2 ext headers: RST read at the post-chain offset"
+    );
+}
+
+#[test]
+fn frame_has_tcp_rst_v6_fragment_header() {
+    // First fragment (offset 0) carries the TCP header after an 8-byte
+    // fragment ext header. RST set.
+    let frag = ipv6_fragment_header(PROTO_TCP);
+    let frame = build_v6_frame_with_ext_chain(44 /* fragment */, &[frag.to_vec()], 0x04, 65535);
+    assert!(
+        frame_has_tcp_rst(&frame),
+        "IPv6 + fragment header (first fragment): RST read at post-frag offset"
+    );
+}
+
+#[test]
+fn frame_has_tcp_rst_v6_malformed_chain_no_panic() {
+    // A hop-by-hop header that claims a huge length running past the
+    // frame end. Must not panic / read OOB; fail-safe to false.
+    let mut frame = Vec::new();
+    frame.extend_from_slice(&eth_header(0x86dd));
+    frame.extend_from_slice(&ipv6_header(40, 0 /* HBH */));
+    // ext header: next=TCP, hdr_ext_len=200 (8-octet units) → way past end.
+    frame.extend_from_slice(&[PROTO_TCP, 200, 0xEE, 0xEE, 0xEE, 0xEE, 0xEE, 0xEE]);
+    assert!(
+        !frame_has_tcp_rst(&frame),
+        "malformed ext-header length must fail safe (no panic, no OOB)"
+    );
+}
+
+#[test]
+fn frame_has_tcp_rst_v6_looping_chain_bounded() {
+    // A chain of >6 dest-opts headers (exceeds the 6-iteration bound).
+    // The walker must give up safely rather than loop / read OOB.
+    let mut blocks = Vec::new();
+    for _ in 0..8 {
+        blocks.push(ipv6_ext_hbh_or_dstopt(60 /* dest-opts (self-chain) */, 0));
+    }
+    let frame = build_v6_frame_with_ext_chain(60, &blocks, 0x04, 65535);
+    // Whatever the bounded walker decides, it must not panic; with 8
+    // ext headers it exceeds the bound and returns false.
+    assert!(
+        !frame_has_tcp_rst(&frame),
+        "over-long ext-header chain is bounded and fails safe"
+    );
+}
+
+#[test]
+fn extract_tcp_flags_and_window_v6_hop_by_hop() {
+    // SYN+ACK, window 8192, behind one hop-by-hop header.
+    let hbh = ipv6_ext_hbh_or_dstopt(PROTO_TCP, 0);
+    let frame = build_v6_frame_with_ext_chain(0, &[hbh], TCP_FLAG_SYN | TCP_FLAG_ACK, 8192);
+    let (flags, window) =
+        extract_tcp_flags_and_window(&frame).expect("flags/window past ext header");
+    assert_eq!(flags, TCP_FLAG_SYN | TCP_FLAG_ACK);
+    assert_eq!(window, 8192, "window read from the real TCP header");
+}
+
+#[test]
+fn extract_tcp_flags_and_window_v6_two_ext_headers() {
+    let dstopt = ipv6_ext_hbh_or_dstopt(PROTO_TCP, 1);
+    let hbh = ipv6_ext_hbh_or_dstopt(60, 0);
+    let frame = build_v6_frame_with_ext_chain(0, &[hbh, dstopt], TCP_FLAG_ACK, 4096);
+    let (flags, window) = extract_tcp_flags_and_window(&frame).expect("Some");
+    assert_eq!(flags, TCP_FLAG_ACK);
+    assert_eq!(window, 4096);
+}
+
+#[test]
+fn extract_tcp_flags_and_window_v6_plain_unchanged() {
+    let frame = build_v6_frame_with_ext_chain(PROTO_TCP, &[], TCP_FLAG_SYN, 16384);
+    let (flags, window) = extract_tcp_flags_and_window(&frame).expect("Some");
+    assert_eq!(flags, TCP_FLAG_SYN);
+    assert_eq!(window, 16384);
+}
+
+#[test]
+fn extract_tcp_flags_and_window_v6_malformed_no_panic() {
+    let mut frame = Vec::new();
+    frame.extend_from_slice(&eth_header(0x86dd));
+    frame.extend_from_slice(&ipv6_header(40, 0));
+    frame.extend_from_slice(&[PROTO_TCP, 200, 0, 0, 0, 0, 0, 0]); // overlong
+    assert!(extract_tcp_flags_and_window(&frame).is_none());
+}
+
+#[test]
+fn extract_tcp_window_v6_hop_by_hop() {
+    let hbh = ipv6_ext_hbh_or_dstopt(PROTO_TCP, 0);
+    let frame = build_v6_frame_with_ext_chain(0, &[hbh], 0, 2048);
+    assert_eq!(
+        extract_tcp_window(&frame, libc::AF_INET6 as u8),
+        Some(2048),
+        "window read at the post-ext-header TCP offset"
+    );
+}
+
+#[test]
+fn extract_tcp_window_v6_fragment_header() {
+    let frag = ipv6_fragment_header(PROTO_TCP);
+    let frame = build_v6_frame_with_ext_chain(44, &[frag.to_vec()], 0, 1024);
+    assert_eq!(
+        extract_tcp_window(&frame, libc::AF_INET6 as u8),
+        Some(1024)
+    );
+}
+
+#[test]
+fn extract_tcp_window_v6_plain_unchanged() {
+    let frame = build_v6_frame_with_ext_chain(PROTO_TCP, &[], 0, 512);
+    assert_eq!(
+        extract_tcp_window(&frame, libc::AF_INET6 as u8),
+        Some(512)
+    );
+}
+
+#[test]
+fn extract_tcp_window_v6_malformed_no_panic() {
+    let mut frame = Vec::new();
+    frame.extend_from_slice(&eth_header(0x86dd));
+    frame.extend_from_slice(&ipv6_header(40, 0));
+    frame.extend_from_slice(&[PROTO_TCP, 200, 0, 0, 0, 0, 0, 0]);
+    assert_eq!(extract_tcp_window(&frame, libc::AF_INET6 as u8), None);
+}
+
+#[test]
+fn frame_tcp_v6_non_tcp_after_ext_header() {
+    // hop-by-hop → UDP (not TCP). All three helpers must report
+    // "not TCP" (false / None), reading the protocol from the END of
+    // the chain, not the base-header next-header.
+    let hbh = ipv6_ext_hbh_or_dstopt(17 /* UDP */, 0);
+    let frame = build_v6_frame_with_ext_chain(0, &[hbh], 0x04, 65535);
+    assert!(!frame_has_tcp_rst(&frame));
+    assert!(extract_tcp_flags_and_window(&frame).is_none());
+    assert_eq!(extract_tcp_window(&frame, libc::AF_INET6 as u8), None);
+}

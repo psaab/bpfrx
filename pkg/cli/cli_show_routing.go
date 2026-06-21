@@ -1071,6 +1071,9 @@ func (c *CLI) showForwardingOptions() error {
 					if fs.Version9Template != "" {
 						fmt.Printf("      Version 9 template: %s\n", fs.Version9Template)
 					}
+					if fs.VersionIPFIXTemplate != "" {
+						fmt.Printf("      IPFIX template: %s\n", fs.VersionIPFIXTemplate)
+					}
 				}
 				if fam.SourceAddress != "" {
 					fmt.Printf("    Source address: %s\n", fam.SourceAddress)

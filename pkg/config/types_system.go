@@ -735,11 +735,35 @@ type SamplingFamily struct {
 }
 
 // FlowServer defines a flow export collector destination.
+//
+// Version selects the export protocol for THIS collector (Junos binds
+// each flow-server to exactly one export version). It is set by the
+// compiler from whichever per-server selector nests under the
+// flow-server: "version9" (the `version9 { template }` /
+// `version9-template` selector) or "version-ipfix" (the
+// `version-ipfix { template }` selector). It is "" when the operator
+// configured no per-server selector — in that case the live exporter
+// resolves a deterministic version per the documented precedence (see
+// pkg/flowexport BuildExportConfig / BuildIPFIXExportConfig and #2136).
+//
+// Before #2136 the live Go exporter ignored the per-server selector
+// entirely and flattened all flow-servers into BOTH the v9 and the
+// IPFIX collector set, so a flow-server reachable under both global
+// version stanzas received every flow twice (one v9 + one IPFIX
+// datagram to the same socket).
 type FlowServer struct {
-	Address          string
-	Port             int
-	Version9Template string
+	Address              string
+	Port                 int
+	Version              string // "version9" | "version-ipfix" | "" (unbound)
+	Version9Template     string
+	VersionIPFIXTemplate string
 }
+
+// Flow-server per-collector export version selectors (FlowServer.Version).
+const (
+	FlowServerVersion9     = "version9"
+	FlowServerVersionIPFIX = "version-ipfix"
+)
 
 // FirewallConfig holds firewall filter definitions.
 type FirewallConfig struct {

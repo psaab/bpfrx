@@ -1037,14 +1037,32 @@ func compileSamplingFamily(node *Node) *SamplingFamily {
 						}
 					case "version9-template":
 						fs.Version9Template = nodeVal(prop)
+						fs.Version = FlowServerVersion9
 					case "version9":
 						// Hierarchical: version9 { template { <name>; } }
+						fs.Version = FlowServerVersion9
 						if tmplNode := prop.FindChild("template"); tmplNode != nil {
 							// Template name is either nodeVal or first child's name
 							if v := nodeVal(tmplNode); v != "" {
 								fs.Version9Template = v
 							} else if len(tmplNode.Children) > 0 {
 								fs.Version9Template = tmplNode.Children[0].Name()
+							}
+						}
+					case "version-ipfix-template":
+						fs.VersionIPFIXTemplate = nodeVal(prop)
+						fs.Version = FlowServerVersionIPFIX
+					case "version-ipfix":
+						// Hierarchical: version-ipfix { template { <name>; } }
+						// Junos binds each flow-server to exactly one export
+						// version; the per-server version-ipfix selector routes
+						// THIS collector to the IPFIX exporter only (#2136).
+						fs.Version = FlowServerVersionIPFIX
+						if tmplNode := prop.FindChild("template"); tmplNode != nil {
+							if v := nodeVal(tmplNode); v != "" {
+								fs.VersionIPFIXTemplate = v
+							} else if len(tmplNode.Children) > 0 {
+								fs.VersionIPFIXTemplate = tmplNode.Children[0].Name()
 							}
 						}
 					case "source-address":

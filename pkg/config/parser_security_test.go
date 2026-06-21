@@ -921,6 +921,10 @@ forwarding-options {
 	if fs.Version9Template != "v9-tmpl" {
 		t.Errorf("flow-server template: got %q", fs.Version9Template)
 	}
+	if fs.Version != FlowServerVersion9 {
+		t.Errorf("flow-server version binding: got %q, want %q (#2136)",
+			fs.Version, FlowServerVersion9)
+	}
 	if inst.FamilyInet6 == nil {
 		t.Fatal("expected FamilyInet6")
 	}
@@ -983,6 +987,68 @@ forwarding-options {
 	}
 	if fs2.Version9Template != "v9-set" {
 		t.Errorf("set syntax flow-server template: %q", fs2.Version9Template)
+	}
+	if fs2.Version != FlowServerVersion9 {
+		t.Errorf("set syntax flow-server version binding: got %q, want %q (#2136)",
+			fs2.Version, FlowServerVersion9)
+	}
+}
+
+// TestFlowServerVersionIPFIXBinding covers the #2136 per-flow-server
+// version-ipfix selector (both hierarchical `version-ipfix { template }`
+// and the flat `version-ipfix-template` form), which the compiler must
+// parse into FlowServer.Version = version-ipfix + VersionIPFIXTemplate.
+// Before #2136 the compiler discarded any per-server IPFIX selector and
+// only recognised version9, so an IPFIX-bound collector could not be
+// distinguished from a v9-bound one.
+func TestFlowServerVersionIPFIXBinding(t *testing.T) {
+	tree := &ConfigTree{}
+	cmds := []string{
+		"set services flow-monitoring version-ipfix template ix-tmpl flow-active-timeout 60",
+		"set forwarding-options sampling instance ix-inst input rate 100",
+		"set forwarding-options sampling instance ix-inst family inet output flow-server 10.0.0.9 port 4739",
+		"set forwarding-options sampling instance ix-inst family inet output flow-server 10.0.0.9 version-ipfix template ix-tmpl",
+		"set forwarding-options sampling instance ix-inst family inet6 output flow-server 2001:db8::9 port 4739",
+		"set forwarding-options sampling instance ix-inst family inet6 output flow-server 2001:db8::9 version-ipfix-template ix-tmpl",
+	}
+	for _, c := range cmds {
+		path, err := ParseSetCommand(c)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", c, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%q): %v", c, err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	inst := cfg.ForwardingOptions.Sampling.Instances["ix-inst"]
+	if inst == nil || inst.FamilyInet == nil || len(inst.FamilyInet.FlowServers) != 1 {
+		t.Fatalf("expected 1 inet flow-server, got %+v", inst)
+	}
+	// Hierarchical version-ipfix { template ix-tmpl }
+	fs := inst.FamilyInet.FlowServers[0]
+	if fs.Version != FlowServerVersionIPFIX {
+		t.Errorf("inet version binding: got %q, want %q", fs.Version, FlowServerVersionIPFIX)
+	}
+	if fs.VersionIPFIXTemplate != "ix-tmpl" {
+		t.Errorf("inet ipfix template: got %q, want ix-tmpl", fs.VersionIPFIXTemplate)
+	}
+	if fs.Version9Template != "" {
+		t.Errorf("inet must not carry a v9 template, got %q", fs.Version9Template)
+	}
+	// Flat version-ipfix-template
+	if inst.FamilyInet6 == nil || len(inst.FamilyInet6.FlowServers) != 1 {
+		t.Fatalf("expected 1 inet6 flow-server")
+	}
+	fs6 := inst.FamilyInet6.FlowServers[0]
+	if fs6.Version != FlowServerVersionIPFIX {
+		t.Errorf("inet6 version binding: got %q, want %q", fs6.Version, FlowServerVersionIPFIX)
+	}
+	if fs6.VersionIPFIXTemplate != "ix-tmpl" {
+		t.Errorf("inet6 ipfix template: got %q, want ix-tmpl", fs6.VersionIPFIXTemplate)
 	}
 }
 
