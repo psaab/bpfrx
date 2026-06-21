@@ -1,5 +1,11 @@
 # Action Log
 
+## 2026-06-21 — #2136 NetFlow per-flow-server export-version binding (no double-export)
+
+- **Timestamp**: 2026-06-21
+- **Action**: Fixed #2136 (deferred #2129 follow-up). A flow-server under BOTH global `version9` and `version-ipfix` was double-exported (one v9 + one IPFIX datagram to the same collector socket, mismatched 1-in-N). Bound each flow-server to exactly one export version (Junos semantics): added `FlowServer.Version`/`VersionIPFIXTemplate` + parse the per-server `version-ipfix`/`version-ipfix-template` selectors; `BuildExportConfig`/`BuildIPFIXExportConfig` now take only the flow-servers resolved to their version via shared `resolveFlowServerVersion`/`collectVersionCollectors`. Semantics for an UNBOUND server with both globals set: IPFIX wins (documented precedence — IETF-standard superset of v9; one stream not two). CLI shows IPFIX template; README/config-schema docs updated. Tests FAIL on pre-fix collect-all (mutation-verified) at both the build-config and live-reconcile/callback layers.
+- **File(s)**: pkg/config/types_system.go, pkg/config/compiler_services.go, pkg/config/schema_routing.go, pkg/config/parser_security_test.go, pkg/flowexport/manager.go, pkg/flowexport/version_binding_test.go, pkg/daemon/daemon_flowexport_reconcile_test.go, pkg/cli/cli_show_flow.go, pkg/cli/cli_show_routing.go, pkg/flowexport/README.md, docs/config-schema.md
+
 ## 2026-06-20 — #2120 PR #2166 Copilot fold (doc nits + SELF-HEAL/HOLD expect hardening)
 
 - **Timestamp**: 2026-06-20
