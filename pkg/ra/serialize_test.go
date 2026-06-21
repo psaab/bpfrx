@@ -1910,6 +1910,196 @@ func TestRound5_WithdrawDuringRestartDecisionNoReplacementGoodbyeEmitted(t *test
 //
 // NON-TAUTOLOGY: against the cached-boolean code the restart starts the
 // replacement (RA re-armed after a newer Clear) → FAILS.
+// TestWithdrawOnceVsApplySingleOwner is the #2272 regression: WithdrawOnce must
+// hold m.mu across its busy-check AND its tombstone install, so a concurrent
+// Apply() / WithdrawOnce cannot start a competing sender between the two. We
+// hammer Apply, WithdrawOnce, and Withdraw concurrently on ONE interface under
+// -race and assert two invariants that the split-lock bug would break:
+//
+//  1. Single owner: the live NDP-conn count for the interface never exceeds 1.
+//     Two senders (or a sender started during a WithdrawOnce goodbye) trips it.
+//  2. No normal RA after a goodbye on any single conn: a sender that raced the
+//     withdraw would emit a lifetime>0 RA after a lifetime-0 goodbye on the same
+//     conn — the exact #2033 blackhole class the issue calls out.
+//
+// REVERT-PROOF: reverting WithdrawOnce to the pre-#2033 check-then-act shape
+// (lock, check m.senders, UNLOCK, then start a sender + send the goodbye —
+// dropping the lock between the check and the act) lets Apply start a live
+// sender in the gap, so the peak live-conn count reaches 2 and/or a normal RA
+// follows a goodbye on a conn, failing this test. Verified during development.
+func TestWithdrawOnceVsApplySingleOwner(t *testing.T) {
+	if _, err := net.InterfaceByName("lo"); err != nil {
+		t.Skip("lo interface unavailable")
+	}
+	fl := newFakeListen(t)
+	m := New()
+	cfg := []*config.RAInterfaceConfig{testCfg("lo")}
+
+	stop := make(chan struct{})
+	var peak int32
+	var peakMu sync.Mutex
+	recordPeak := func() {
+		lc := fl.liveCount()
+		peakMu.Lock()
+		if lc > peak {
+			peak = lc
+		}
+		peakMu.Unlock()
+	}
+
+	var wg sync.WaitGroup
+	worker := func(fn func()) {
+		defer wg.Done()
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			fn()
+			recordPeak()
+		}
+	}
+	wg.Add(3)
+	go worker(func() { _ = m.Apply(cfg) })
+	go worker(func() { m.WithdrawOnce(cfg) })
+	go worker(func() { _ = m.Withdraw() })
+
+	time.Sleep(400 * time.Millisecond)
+	close(stop)
+	wg.Wait()
+
+	// Drain to a known state.
+	_ = m.Clear()
+
+	peakMu.Lock()
+	p := peak
+	peakMu.Unlock()
+	if p > 1 {
+		t.Fatalf("peak live conns = %d, want <=1 — WithdrawOnce raced a competing "+
+			"sender onto the same interface (#2272 check-and-act race)", p)
+	}
+	if lc := fl.liveCount(); lc != 0 {
+		t.Fatalf("leaked %d live conns after Clear", lc)
+	}
+
+	// Per-conn ordering: no normal RA may follow a goodbye on the SAME conn.
+	// (A WithdrawOnce conn that somehow ran a sender, or a sender started during
+	// the goodbye window, would show a lifetime>0 write after the lifetime-0 one.)
+	fl.mu.Lock()
+	conns := append([]*fakeConn(nil), fl.allConns["lo"]...)
+	fl.mu.Unlock()
+	for ci, c := range conns {
+		writes := c.snapshot()
+		firstGoodbye := -1
+		for _, w := range writes {
+			if w.lifetime == 0 {
+				firstGoodbye = w.seq
+				break
+			}
+		}
+		if firstGoodbye < 0 {
+			continue
+		}
+		for _, w := range writes {
+			if w.lifetime > 0 && w.seq > firstGoodbye {
+				t.Fatalf("conn %d: normal RA (lifetime=%v, seq=%d) emitted AFTER the "+
+					"first goodbye (seq=%d) — single-owner-emit invariant broken (#2272/#2033)",
+					ci, w.lifetime, w.seq, firstGoodbye)
+			}
+		}
+	}
+}
+
+// TestWithdrawOnceHoldsTombstoneDuringGoodbye is the deterministic companion to
+// the stress test above. It drives the PUBLIC WithdrawOnce path and proves that
+// the claim-and-hold tombstone is held across the goodbye emit: while a
+// WithdrawOnce goodbye is mid-write (gated), a concurrent Apply for the same
+// interface must DEFER — it must not start a live sender and the live-conn count
+// must stay <=1 for the whole emit window. After the goodbye completes the
+// deferred Apply proceeds and starts the sender.
+//
+// This is the structural #2272 proof: even though the goodbye runs WITHOUT m.mu,
+// the interface stays "busy" (tombstone present) so the check-and-act atomicity
+// extends across the whole WithdrawOnce operation, not just the install instant.
+func TestWithdrawOnceHoldsTombstoneDuringGoodbye(t *testing.T) {
+	if _, err := net.InterfaceByName("lo"); err != nil {
+		t.Skip("lo interface unavailable")
+	}
+	fl := newFakeListen(t)
+	m := New()
+
+	// Gate the WithdrawOnce goodbye conn's first (lifetime-0) write so we can
+	// hold the emit open. WithdrawOnce opens its conn via sendOneGoodbye and
+	// writes only lifetime-0 RAs, so gate on lifetime==0.
+	gateReached := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	fl.preHook("lo", func(lifetime time.Duration) {
+		if lifetime == 0 {
+			once.Do(func() { close(gateReached); <-release })
+		}
+	})
+
+	woDone := make(chan struct{})
+	go func() {
+		m.WithdrawOnce([]*config.RAInterfaceConfig{testCfg("lo")})
+		close(woDone)
+	}()
+
+	select {
+	case <-gateReached:
+	case <-time.After(2 * time.Second):
+		t.Fatal("WithdrawOnce goodbye never reached its write gate")
+	}
+
+	// A concurrent Apply for "lo" must DEFER (the held tombstone makes the
+	// interface busy) — no live sender, <=1 live conn — for the whole emit.
+	applyDone := make(chan error, 1)
+	go func() { applyDone <- m.Apply([]*config.RAInterfaceConfig{testCfg("lo")}) }()
+	for i := 0; i < 40; i++ {
+		m.mu.Lock()
+		_, live := m.senders["lo"]
+		m.mu.Unlock()
+		if live {
+			t.Fatal("Apply started a live sender DURING the WithdrawOnce goodbye " +
+				"(tombstone did not block it) — #2272 check-and-act race")
+		}
+		if lc := fl.liveCount(); lc > 1 {
+			t.Fatalf(">1 live conn during the WithdrawOnce goodbye (%d) — #2272", lc)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+
+	// Release the goodbye; WithdrawOnce finishes (removes the tombstone); the
+	// deferred Apply then proceeds and starts a live sender.
+	close(release)
+	select {
+	case <-woDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("WithdrawOnce did not complete after the goodbye released")
+	}
+	select {
+	case <-applyDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("deferred Apply did not complete after the emit released")
+	}
+
+	m.mu.Lock()
+	_, live := m.senders["lo"]
+	m.mu.Unlock()
+	if !live {
+		t.Fatal("deferred Apply did not start a live sender after the goodbye")
+	}
+	// Exactly one goodbye event (one conn carried the lifetime-0 writes).
+	total, gconns := fl.goodbyeStats("lo")
+	if gconns != 1 || total != goodbyeCount {
+		t.Fatalf("expected exactly one goodbye (1 conn, %d writes); got %d/%d",
+			goodbyeCount, gconns, total)
+	}
+	_ = m.Clear()
+}
+
 func TestRound5_ClearDuringRestartDecisionNoReplacement(t *testing.T) {
 	if _, err := net.InterfaceByName("lo"); err != nil {
 		t.Skip("lo interface unavailable")
