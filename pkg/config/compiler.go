@@ -215,6 +215,24 @@ type compileOpts struct {
 	// instead of silently ignored. Same doctrine as
 	// lenientVRRPTrackDuplicates / lenientLogProfileStreamRef.
 	lenientUnsupportedInterfaceStanzas bool
+
+	// lenientRoutingExportRef (#2144) downgrades the routing-export
+	// cross-reference gate (validateRoutingExportReferencesStrict) from a
+	// hard compile error to a cfg.Warnings entry. Set ONLY on the tolerant
+	// load / peer-sync paths (CompileConfigLenient /
+	// CompileConfigForNodeLenient): a dynamic-protocol `export`, RIP
+	// `redistribute`, BGP group/neighbor `export`, or `routing-options
+	// forwarding-table export` naming an undefined policy-statement (or a
+	// non-protocol typo) passed commit on every binary up to this gate, so
+	// an already-persisted or peer-synced config may carry it; an upgrading
+	// / receiving node must still BOOT through it (warn) rather than fail
+	// closed (#1960). Commit / commit-check stay strict — a new operator
+	// edit whose export FRR would reject, silently no-op, fail open
+	// (route-map permit-all), or silently disable ECMP is rejected loudly.
+	// The render-path fallbacks keep a leniently-loaded config behaving
+	// exactly as it did before this gate. Same doctrine as
+	// lenientLogProfileStreamRef.
+	lenientRoutingExportRef bool
 }
 
 // CompileConfig converts a parsed ConfigTree AST into a typed Config struct.
@@ -248,6 +266,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientNATPoolAlarmThreshold:       true,
 		lenientNATHostMask:                 true,
 		lenientUnsupportedInterfaceStanzas: true,
+		lenientRoutingExportRef:            true,
 	})
 }
 
@@ -332,6 +351,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientNATPoolAlarmThreshold:       true,
 		lenientNATHostMask:                 true,
 		lenientUnsupportedInterfaceStanzas: true,
+		lenientRoutingExportRef:            true,
 	})
 }
 
@@ -759,6 +779,27 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		}
 	}
 
+	// #2144 routing export cross-reference gate. A dynamic-protocol
+	// `export` (OSPF/OSPFv3/BGP/IS-IS), a RIP `redistribute`, a BGP
+	// group/neighbor `export`, or a `routing-options forwarding-table
+	// export` whose token is neither a known redistribution protocol nor a
+	// defined policy-statement passes commit unnoticed, then at FRR render
+	// time either fails the reload, silently no-ops, fails OPEN as a
+	// permit-all route-map, or silently disables ECMP. Strict on commit /
+	// commit-check (hard reject so the typo is operator-visible); lenient on
+	// load / peer-sync (warn so an already-persisted or peer-synced config
+	// still boots — #1960 fail-closed-on-load class). Runs on the fully-
+	// compiled *Config so the policy-statement map is populated regardless
+	// of authoring order. Mirrors validateLogProfileStreamReferencesStrict.
+	if err := validateRoutingExportReferencesStrict(cfg); err != nil {
+		if opts.lenientRoutingExportRef {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("routing export reference (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
 	if warnings := ValidateConfig(cfg); len(warnings) > 0 {
 		for _, w := range warnings {
 			cfg.Warnings = append(cfg.Warnings, w)
@@ -1047,6 +1088,176 @@ func validateLogProfileStreamReferencesStrict(cfg *Config) error {
 			"log stream %q (the profile would route to nowhere — define "+
 			"the stream or fix the stream-name)", p.Name, p.StreamName)
 	}
+	return nil
+}
+
+// routingRedistProtocolTokens is the set of bare protocol keywords that an
+// OSPF/OSPFv3/BGP/IS-IS `export` (or a RIP `redistribute`) accepts in lieu
+// of a named policy-statement. resolveRedistribute (pkg/frr/policy_render.go)
+// emits a bare `redistribute <token>` for these. It mirrors
+// knownRedistProtocols there, plus Junos's `direct` spelling for FRR's
+// `connected`. Keep the two in sync: a token accepted here but unknown to
+// the renderer would emit a line FRR rejects; a token the renderer accepts
+// but missing here would be wrongly rejected at commit.
+var routingRedistProtocolTokens = map[string]bool{
+	"connected": true, "direct": true, "static": true, "kernel": true,
+	"ospf": true, "bgp": true, "rip": true, "isis": true,
+}
+
+// validateRoutingExportReferencesStrict hard-rejects a dynamic-protocol
+// `export` (OSPF / OSPFv3 / BGP / IS-IS), a RIP `redistribute`, a BGP
+// group/neighbor `export`, or a `routing-options forwarding-table export`
+// whose token resolves to neither a known redistribution protocol nor a
+// defined policy-statement (#2144).
+//
+// Without this gate a typo passes commit and reaches FRR render-time, where
+// it fails OPEN in three distinct ways:
+//
+//   - resolveRedistribute's fallback (policy_render.go) emits
+//     `redistribute <typo>` for any unknown token. FRR either rejects the
+//     line — failing the whole frr-reload (a single vtysh -f add-batch
+//     exits non-zero on any CMD_WARNING_CONFIG_FAILED) — or silently
+//     no-ops, so the intended redistribution never happens.
+//   - a BGP group/neighbor `export` renders `neighbor <addr> route-map
+//     <typo> out`. FRR resolves a route-map name with no definition to
+//     NULL, which it treats as permit-all — the outbound filter the
+//     operator wrote silently advertises EVERYTHING.
+//   - `forwarding-table export <typo>` is read by resolveECMP
+//     (config_render.go), which returns 0 max-paths when the policy is
+//     missing — silently DISABLING the expected ECMP / consistent-hash
+//     load balancing instead of rejecting the config.
+//
+// Protocol-token acceptance differs by site. A redistribute-backed export
+// (OSPF/OSPFv3/BGP/IS-IS export, RIP redistribute) legitimately names a
+// bare protocol (`export static`) OR a policy-statement, matching
+// resolveRedistribute. A BGP group/neighbor export and a forwarding-table
+// export render directly as a route-map / ECMP policy name, so only a
+// defined policy-statement is valid there — a protocol token would be a
+// dangling route-map / missing-policy reference, not a redistribute verb.
+//
+// On the tolerant load / peer-sync paths the call site downgrades this to a
+// warning (opts.lenientRoutingExportRef) so an already-persisted or
+// peer-synced config carrying the typo still boots (#1960
+// fail-closed-on-load class); the render-path fallbacks above keep it inert
+// or fail-open-on-an-already-committed-config exactly as before. Commit /
+// commit-check stay strict. Mirrors validateLogProfileStreamReferencesStrict.
+func validateRoutingExportReferencesStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	defined := func(name string) bool {
+		if cfg.PolicyOptions.PolicyStatements == nil {
+			return false
+		}
+		_, ok := cfg.PolicyOptions.PolicyStatements[name]
+		return ok
+	}
+
+	// checkRedist validates a redistribute-backed export list: each token
+	// must be a known protocol OR a defined policy-statement.
+	checkRedist := func(scope, proto string, exports []string) error {
+		for _, e := range exports {
+			if e == "" || routingRedistProtocolTokens[e] || defined(e) {
+				continue
+			}
+			return fmt.Errorf("%s%s export %q references neither a known "+
+				"redistribution protocol (connected/direct/static/kernel/"+
+				"ospf/bgp/rip/isis) nor a defined policy-statement — the "+
+				"FRR redistribute line would be rejected or silently no-op; "+
+				"define the policy-statement or fix the export name",
+				scope, proto, e)
+		}
+		return nil
+	}
+
+	// checkPolicyRef validates an export list that renders directly as a
+	// route-map / ECMP policy name: only a defined policy-statement is valid.
+	checkPolicyRef := func(detail, name string) error {
+		if name == "" || defined(name) {
+			return nil
+		}
+		return fmt.Errorf("%s references undefined policy-statement %q; %s",
+			detail, name, "define the policy-statement or fix the export name")
+	}
+
+	checkProtocols := func(scope string, ospf *OSPFConfig, ospfv3 *OSPFv3Config, bgp *BGPConfig, rip *RIPConfig, isis *ISISConfig) error {
+		if ospf != nil {
+			if err := checkRedist(scope, "protocols ospf", ospf.Export); err != nil {
+				return err
+			}
+		}
+		if ospfv3 != nil {
+			if err := checkRedist(scope, "protocols ospf3", ospfv3.Export); err != nil {
+				return err
+			}
+		}
+		if rip != nil {
+			if err := checkRedist(scope, "protocols rip", rip.Redistribute); err != nil {
+				return err
+			}
+		}
+		if isis != nil {
+			if err := checkRedist(scope, "protocols isis", isis.Export); err != nil {
+				return err
+			}
+		}
+		if bgp != nil {
+			if err := checkRedist(scope, "protocols bgp", bgp.Export); err != nil {
+				return err
+			}
+			// A BGP group/neighbor export renders `route-map <name> out`,
+			// so it must be a defined policy-statement (no protocol-token
+			// fallback). Sort neighbor addresses for a deterministic
+			// first-error message.
+			neighbors := append([]*BGPNeighbor(nil), bgp.Neighbors...)
+			sort.SliceStable(neighbors, func(i, j int) bool {
+				return neighbors[i].Address < neighbors[j].Address
+			})
+			for _, n := range neighbors {
+				if n == nil {
+					continue
+				}
+				for _, e := range n.Export {
+					detail := fmt.Sprintf("%sprotocols bgp neighbor %s export", scope, n.Address)
+					if n.GroupName != "" {
+						detail = fmt.Sprintf("%sprotocols bgp group %s neighbor %s export", scope, n.GroupName, n.Address)
+					}
+					if err := checkPolicyRef(detail, e); err != nil {
+						return err
+					}
+				}
+			}
+		}
+		return nil
+	}
+
+	// Top-level protocols.
+	if err := checkProtocols("", cfg.Protocols.OSPF, cfg.Protocols.OSPFv3, cfg.Protocols.BGP, cfg.Protocols.RIP, cfg.Protocols.ISIS); err != nil {
+		return err
+	}
+
+	// Per routing-instance protocols.
+	for _, ri := range cfg.RoutingInstances {
+		if ri == nil {
+			continue
+		}
+		scope := fmt.Sprintf("routing-instance %s ", ri.Name)
+		if err := checkProtocols(scope, ri.OSPF, ri.OSPFv3, ri.BGP, ri.RIP, ri.ISIS); err != nil {
+			return err
+		}
+	}
+
+	// forwarding-table export → resolveECMP (config_render.go). Renders
+	// directly as an ECMP policy lookup, so it must be a defined
+	// policy-statement; a missing one silently disables ECMP/consistent-hash.
+	if err := checkPolicyRef(
+		"routing-options forwarding-table export",
+		cfg.RoutingOptions.ForwardingTableExport,
+	); err != nil {
+		return fmt.Errorf("%s (the expected ECMP / consistent-hash "+
+			"load-balancing would be silently disabled)", err)
+	}
+
 	return nil
 }
 
