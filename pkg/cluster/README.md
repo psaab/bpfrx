@@ -84,6 +84,51 @@ The primary consumer of the `Manager.Events()` channel is
 publish, etc.). `pkg/cluster/reth.go::HandleStateChange` is a
 state-handler method, not the event-channel consumer.
 
+## DHCP-server lease sync (#2239)
+
+DHCP-server (Kea) leases ride the SAME session-sync channel and follow the
+IPsec-SA-sync precedent (`QueueIPsecSA` / `peerIPsecSAs` /
+`reinitiateIPsecSAs`), not the Kea native HA hook and not a shared DB. The
+mechanism (PATH C of `docs/research/2239-dhcp-ha-lease-sync/plan.md`):
+
+- **Wire** — two additive message types `syncMsgDHCPLeaseV4 = 25` /
+  `syncMsgDHCPLeaseV6 = 26` carry a full-set push of the active leases the
+  sender serves for a family. `encode/decodeDHCPLeasePayload` (`sync_protocol.go`)
+  frame a 4-byte count + length-prefixed, length-GATED per-lease records
+  (the #2170 trailing-field discipline: a newer peer's extra fields are
+  ignored, a legacy/truncated record zero-fills absent fields, a
+  short stream stops at the last complete record). The types are above the
+  legacy set so a peer that predates the feature hits the `default` receive
+  case and ignores them — no `CurrentHAProtocolVersion` bump (the change is
+  additive AND config-knob-gated, so bumping would falsely block session sync
+  across a mixed-base pair).
+- **Clock invariant** — each lease carries REMAINING LIFETIME, never an
+  absolute wall-clock expiry (the channel only syncs a MONOTONIC offset). The
+  promoting node re-anchors to its LOCAL clock at seed (`expire = now + remaining`),
+  so peer wall-clock skew can never mis-age a synced lease — the structural
+  fix for the <60s hazard the Kea native HA hook inherits.
+- **Send** — `SessionSync.QueueDHCPLeases(family, leases)` (`sync.go`), driven
+  by the RG-MASTER push loop in `pkg/daemon/daemon_dhcp_lease_sync.go`
+  (`syncDHCPLeasesPeriodic`): a 30s full-set heartbeat (so a restarted standby
+  is never empty) + a 2s on-grant change-detect (push only when the set
+  changed, bounding the duplicate-allocation window). Fail-open: a send error
+  is logged + counted, never blocks lease granting.
+- **Hold** — the BACKUP stores the peer's set in `peerDHCPLeases{4,6}` (the
+  `peerIPsecSAs` precedent), accessible via `PeerDHCPLeases{4,6}()`. Its Kea
+  stays STOPPED (`clearRethServicesForRG` is UNCHANGED) — VRRP/RG remains the
+  sole who-serves arbiter.
+- **Seed on takeover** — `pkg/daemon` pre-seeds the held leases into the Kea
+  memfile BEFORE Kea start (fully closes the dup-alloc window) AND
+  `lease{4,6}-add`s them over the Kea control socket after start (idempotent
+  backstop, `RecordDHCPLeasesSeeded`). The Kea read/write side lives in
+  `pkg/dhcpserver/lease_sync.go`.
+- **Observability** — `SyncStats.DHCPLeases{Sent,Received,Seeded}` surfaced in
+  `show chassis cluster statistics` (`status.go`).
+
+Gated end-to-end on `set chassis cluster dhcp-lease-synchronization`
+(`config.ClusterConfig.DHCPLeaseSync`); standalone / knob-off renders the Kea
+config bit-identical to pre-#2239 (no control-socket, no hook).
+
 ## Interface-monitor link-state detection
 
 `Monitor` (`monitor.go`) is the live carrier-detection loop: a 1-second

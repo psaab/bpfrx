@@ -113,6 +113,7 @@ var schemaChassis = &schemaNode{desc: "Chassis configuration", children: map[str
 		"configuration-synchronize":     {desc: "Synchronize committed configuration from primary to secondary", children: nil},
 		"nat-state-synchronization":     {desc: "NAT state synchronization (accepted for Junos compatibility; no runtime effect)", children: nil},
 		"ipsec-session-synchronization": {desc: "Synchronize IPsec SAs to the cluster peer", children: nil},
+		"dhcp-lease-synchronization":    {desc: "Synchronize DHCP-server leases to the cluster peer (held on standby, seeded into Kea on takeover)", children: nil},
 		// Milliseconds, xpf extension (default 30, pkg/vrrp/vrrp.go).
 		// Both bounds are runtime-derived from the VRRPv3 encoding:
 		// the ms value is integer-divided to centiseconds

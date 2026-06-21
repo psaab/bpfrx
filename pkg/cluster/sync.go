@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/psaab/xpf/pkg/dataplane"
+	"github.com/psaab/xpf/pkg/dhcpserver"
 )
 
 // syncMagic identifies cluster session-sync protocol packets.
@@ -59,6 +60,20 @@ const (
 	syncMsgFailoverBatchCommit    = 22
 	syncMsgFailoverBatchCommitAck = 23
 	syncMsgHeartbeatAck           = 24
+	// #2239 HA DHCP-server lease sync (PATH C). A full-set push of the
+	// active lease records this node serves, per family. These are ADDITIVE
+	// and length-gated: a peer that predates the feature hits the default
+	// receive case and ignores them, and the records use the #2170
+	// trailing-field discipline so the schema can grow. Deliberately NO
+	// CurrentHAProtocolVersion / SessionSyncWireVersion bump — the change is
+	// additive AND end-to-end gated on the `dhcp-lease-synchronization` config
+	// knob, so a mixed-base pair (one side new, one old) is safe and must
+	// still be allowed to sync SESSIONS; bumping the wire version would make
+	// the #1930 INC-3 mixed-base gate falsely refuse session sync across the
+	// pair. If a FUTURE change to these messages becomes incompatible, bump
+	// the version then.
+	syncMsgDHCPLeaseV4 = 25
+	syncMsgDHCPLeaseV6 = 26
 )
 
 // syncHeader is the wire header for each sync message.
@@ -87,10 +102,17 @@ type SyncStats struct {
 	ConfigsReceived   atomic.Uint64
 	IPsecSASent       atomic.Uint64
 	IPsecSAReceived   atomic.Uint64
-	FencesSent        atomic.Uint64
-	FencesReceived    atomic.Uint64
-	Errors            atomic.Uint64
-	DeletesDropped    atomic.Uint64
+	// #2239 HA DHCP-server lease sync counters. Sent/Received count
+	// full-set lease push MESSAGES (one per family per push); Seeded counts
+	// leases written into a freshly-started Kea on takeover; errors fold
+	// into the shared Errors counter (fail-open posture).
+	DHCPLeasesSent     atomic.Uint64
+	DHCPLeasesReceived atomic.Uint64
+	DHCPLeasesSeeded   atomic.Uint64
+	FencesSent         atomic.Uint64
+	FencesReceived     atomic.Uint64
+	Errors             atomic.Uint64
+	DeletesDropped     atomic.Uint64
 	// DeletesStaleIgnored counts deletes refused by the #2170 install-
 	// generation guard: a journaled/deferred delete whose generation was
 	// strictly older than the currently-installed same-key entry. A nonzero
@@ -134,6 +156,9 @@ type SyncStatsSnapshot struct {
 	ConfigsReceived      uint64
 	IPsecSASent          uint64
 	IPsecSAReceived      uint64
+	DHCPLeasesSent       uint64
+	DHCPLeasesReceived   uint64
+	DHCPLeasesSeeded     uint64
 	FencesSent           uint64
 	FencesReceived       uint64
 	Errors               uint64
@@ -213,6 +238,10 @@ type SessionSync struct {
 	OnConfigReceived func(configText string)
 	// OnIPsecSAReceived is called when an IPsec SA list arrives from the peer.
 	OnIPsecSAReceived func(connectionNames []string)
+	// OnDHCPLeasesReceived is called when a DHCP-server lease set arrives from
+	// the peer (#2239). family is 4 or 6; the standby holds these so it can
+	// seed Kea on takeover. Fires after the peer*DHCPLeases store is updated.
+	OnDHCPLeasesReceived func(family int, leases []dhcpserver.SyncLease)
 	// OnRemoteFailover is called when the peer requests a transfer-out for one RG.
 	OnRemoteFailover func(rgID int) error
 	// OnRemoteFailoverCommit finalizes the demoted side of an acknowledged handoff.
@@ -239,6 +268,12 @@ type SessionSync struct {
 	OnPeerDisconnected func()
 	peerIPsecSAs       []string
 	peerIPsecSAsMu     sync.Mutex
+	// #2239: the standby holds the peer's most-recent full lease set per
+	// family (the peerIPsecSAs precedent). On takeover the daemon reads these
+	// and seeds the just-started Kea. Replaced wholesale on each full-set push.
+	peerDHCPLeases4  []dhcpserver.SyncLease
+	peerDHCPLeases6  []dhcpserver.SyncLease
+	peerDHCPLeasesMu sync.Mutex
 	// IsPrimaryFn reports whether the local node is primary for the default sync scope.
 	IsPrimaryFn func() bool
 	// IsPrimaryForRGFn reports whether the local node is primary for a given RG.
@@ -553,7 +588,7 @@ func (s *SessionSync) Stats() SyncStatsSnapshot {
 		activeFabric = -1
 	}
 	s.mu.Unlock()
-	return SyncStatsSnapshot{SessionsSent: s.stats.SessionsSent.Load(), SessionsReceived: s.stats.SessionsReceived.Load(), SessionsInstalled: s.stats.SessionsInstalled.Load(), DeletesSent: s.stats.DeletesSent.Load(), DeletesReceived: s.stats.DeletesReceived.Load(), BulkSyncs: s.stats.BulkSyncs.Load(), ConfigsSent: s.stats.ConfigsSent.Load(), ConfigsReceived: s.stats.ConfigsReceived.Load(), IPsecSASent: s.stats.IPsecSASent.Load(), IPsecSAReceived: s.stats.IPsecSAReceived.Load(), FencesSent: s.stats.FencesSent.Load(), FencesReceived: s.stats.FencesReceived.Load(), Errors: s.stats.Errors.Load(), DeletesDropped: s.stats.DeletesDropped.Load(), DeletesStaleIgnored: s.stats.DeletesStaleIgnored.Load(), InstallsStaleIgnored: s.stats.InstallsStaleIgnored.Load(), GenMapOverflow: s.stats.GenMapOverflow.Load(), Connected: s.stats.Connected.Load(), ActiveFabric: activeFabric, BulkSyncStartTime: s.stats.BulkSyncStartTime.Load(), BulkSyncEndTime: s.stats.BulkSyncEndTime.Load(), BulkSyncSessions: s.stats.BulkSyncSessions.Load(), LastConfigSyncTime: s.stats.LastConfigSyncTime.Load(), LastConfigSyncSize: s.stats.LastConfigSyncSize.Load(), LastFenceSeq: s.stats.LastFenceSeq.Load(), LastFenceAckAt: s.stats.LastFenceAckAt.Load()}
+	return SyncStatsSnapshot{SessionsSent: s.stats.SessionsSent.Load(), SessionsReceived: s.stats.SessionsReceived.Load(), SessionsInstalled: s.stats.SessionsInstalled.Load(), DeletesSent: s.stats.DeletesSent.Load(), DeletesReceived: s.stats.DeletesReceived.Load(), BulkSyncs: s.stats.BulkSyncs.Load(), ConfigsSent: s.stats.ConfigsSent.Load(), ConfigsReceived: s.stats.ConfigsReceived.Load(), IPsecSASent: s.stats.IPsecSASent.Load(), IPsecSAReceived: s.stats.IPsecSAReceived.Load(), DHCPLeasesSent: s.stats.DHCPLeasesSent.Load(), DHCPLeasesReceived: s.stats.DHCPLeasesReceived.Load(), DHCPLeasesSeeded: s.stats.DHCPLeasesSeeded.Load(), FencesSent: s.stats.FencesSent.Load(), FencesReceived: s.stats.FencesReceived.Load(), Errors: s.stats.Errors.Load(), DeletesDropped: s.stats.DeletesDropped.Load(), DeletesStaleIgnored: s.stats.DeletesStaleIgnored.Load(), InstallsStaleIgnored: s.stats.InstallsStaleIgnored.Load(), GenMapOverflow: s.stats.GenMapOverflow.Load(), Connected: s.stats.Connected.Load(), ActiveFabric: activeFabric, BulkSyncStartTime: s.stats.BulkSyncStartTime.Load(), BulkSyncEndTime: s.stats.BulkSyncEndTime.Load(), BulkSyncSessions: s.stats.BulkSyncSessions.Load(), LastConfigSyncTime: s.stats.LastConfigSyncTime.Load(), LastConfigSyncSize: s.stats.LastConfigSyncSize.Load(), LastFenceSeq: s.stats.LastFenceSeq.Load(), LastFenceAckAt: s.stats.LastFenceAckAt.Load()}
 }
 
 // IsConnected reports whether a peer sync connection is currently established.
@@ -774,4 +809,77 @@ func (s *SessionSync) QueueIPsecSA(connectionNames []string) {
 	}
 	s.stats.IPsecSASent.Add(1)
 	slog.Debug("cluster sync: IPsec SA list sent", "count", len(connectionNames))
+}
+
+// RecordDHCPLeasesSeeded adds n to the seeded-leases counter (#2239). The
+// daemon calls this after seeding a freshly-started Kea on takeover.
+func (s *SessionSync) RecordDHCPLeasesSeeded(n int) {
+	if n > 0 {
+		s.stats.DHCPLeasesSeeded.Add(uint64(n))
+	}
+}
+
+// PeerDHCPLeases4 returns a copy of the v4 lease set held from the peer (#2239).
+// The standby seeds these into Kea on takeover.
+func (s *SessionSync) PeerDHCPLeases4() []dhcpserver.SyncLease {
+	s.peerDHCPLeasesMu.Lock()
+	defer s.peerDHCPLeasesMu.Unlock()
+	cp := make([]dhcpserver.SyncLease, len(s.peerDHCPLeases4))
+	copy(cp, s.peerDHCPLeases4)
+	return cp
+}
+
+// PeerDHCPLeases6 returns a copy of the v6 lease set held from the peer (#2239).
+func (s *SessionSync) PeerDHCPLeases6() []dhcpserver.SyncLease {
+	s.peerDHCPLeasesMu.Lock()
+	defer s.peerDHCPLeasesMu.Unlock()
+	cp := make([]dhcpserver.SyncLease, len(s.peerDHCPLeases6))
+	copy(cp, s.peerDHCPLeases6)
+	return cp
+}
+
+// SetPeerDHCPLeasesForTesting injects a held peer lease set for a family so
+// cross-package tests (pkg/daemon) can drive the takeover-seed path without a
+// live sync connection. Production fills this via the receive path.
+func (s *SessionSync) SetPeerDHCPLeasesForTesting(family int, leases []dhcpserver.SyncLease) {
+	s.storePeerDHCPLeases(family, leases)
+}
+
+// storePeerDHCPLeases replaces the held lease set for a family (full-set push
+// semantics). Called from the receive path.
+func (s *SessionSync) storePeerDHCPLeases(family int, leases []dhcpserver.SyncLease) {
+	s.peerDHCPLeasesMu.Lock()
+	if family == 6 {
+		s.peerDHCPLeases6 = leases
+	} else {
+		s.peerDHCPLeases4 = leases
+	}
+	s.peerDHCPLeasesMu.Unlock()
+}
+
+// QueueDHCPLeases sends a full-set DHCP-server lease push for one family to the
+// peer over the sync channel (#2239). family must be 4 or 6. Fail-open: a write
+// error is logged + counted and disconnects the conn (the next reconnect
+// re-pushes), it NEVER blocks lease granting on this node. Mirrors QueueIPsecSA.
+func (s *SessionSync) QueueDHCPLeases(family int, leases []dhcpserver.SyncLease) {
+	conn := s.getActiveConn()
+	if conn == nil {
+		return
+	}
+	msgType := byte(syncMsgDHCPLeaseV4)
+	if family == 6 {
+		msgType = syncMsgDHCPLeaseV6
+	}
+	payload := encodeDHCPLeasePayload(leases)
+	s.writeMu.Lock()
+	err := writeMsg(conn, msgType, payload)
+	s.writeMu.Unlock()
+	if err != nil {
+		slog.Warn("cluster sync: DHCP lease send error", "family", family, "err", err)
+		s.stats.Errors.Add(1)
+		s.handleDisconnect(conn)
+		return
+	}
+	s.stats.DHCPLeasesSent.Add(1)
+	slog.Debug("cluster sync: DHCP lease set sent", "family", family, "count", len(leases))
 }

@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/psaab/xpf/pkg/dataplane"
+	"github.com/psaab/xpf/pkg/dhcpserver"
 	"golang.org/x/sys/unix"
 )
 
@@ -535,4 +536,188 @@ func decodeIPsecSAPayload(payload []byte) []string {
 		}
 	}
 	return names
+}
+
+// --- #2239 HA DHCP-server lease sync wire codec ---------------------------
+//
+// A DHCP-lease payload is a full-set push of the active leases this node serves
+// for one family. The framing is a 4-byte lease COUNT followed by COUNT
+// length-prefixed lease records. Each record is itself length-gated so the
+// schema can grow: a decoder reads only the fields the inner length covers,
+// tolerating a longer record from a newer peer (trailing fields ignored) and a
+// shorter record from an older peer (absent fields default to zero) — the same
+// length-gated-trailing-field discipline as #2170 sessions. The lease wire
+// carries REMAINING LIFETIME (not absolute expiry) so the receiver re-anchors
+// to its local clock at seed (the #2239 clock invariant).
+
+// putLeaseString appends a uint16-length-prefixed string.
+func putLeaseString(b []byte, s string) []byte {
+	b = binary.LittleEndian.AppendUint16(b, uint16(len(s)))
+	return append(b, s...)
+}
+
+// getLeaseString reads a uint16-length-prefixed string at off, returning the
+// value, the new offset, and ok. ok is false if the buffer is too short
+// (truncated record — caller stops decoding that record's remaining fields).
+func getLeaseString(buf []byte, off int) (string, int, bool) {
+	if off+2 > len(buf) {
+		return "", off, false
+	}
+	n := int(binary.LittleEndian.Uint16(buf[off:]))
+	off += 2
+	if off+n > len(buf) {
+		return "", off, false
+	}
+	return string(buf[off : off+n]), off + n, true
+}
+
+// encodeOneLease serializes one SyncLease into a self-describing record body
+// (without the outer record-length prefix). Field order is fixed and append-
+// only; decoders read what the record length covers.
+func encodeOneLease(l dhcpserver.SyncLease) []byte {
+	b := make([]byte, 0, 96)
+	b = append(b, byte(l.Family))
+	b = putLeaseString(b, l.Address)
+	b = binary.LittleEndian.AppendUint32(b, uint32(l.SubnetID))
+	b = binary.LittleEndian.AppendUint32(b, uint32(l.ValidLife))
+	b = binary.LittleEndian.AppendUint32(b, uint32(l.Remaining))
+	b = append(b, byte(l.State))
+	// identity + naming (variable). v4: hwaddr, clientid. v6: duid, iaid,
+	// leasetype, prefixlen. Both families carry all slots; the unused ones
+	// are empty/zero so the record layout is family-uniform and append-only.
+	b = putLeaseString(b, l.HWAddress)
+	b = putLeaseString(b, l.ClientID)
+	b = putLeaseString(b, l.DUID)
+	b = binary.LittleEndian.AppendUint32(b, l.IAID)
+	b = putLeaseString(b, l.LeaseType)
+	b = binary.LittleEndian.AppendUint32(b, uint32(l.PrefixLen))
+	b = putLeaseString(b, l.Hostname)
+	var flags byte
+	if l.FQDNFwd {
+		flags |= 0x01
+	}
+	if l.FQDNRev {
+		flags |= 0x02
+	}
+	b = append(b, flags)
+	return b
+}
+
+// decodeOneLease parses a record body produced by encodeOneLease. It is
+// length-gated: each field read checks bounds and stops at the first short
+// read, so a legacy (shorter) record yields zero values for absent trailing
+// fields and a future (longer) record's extra fields are ignored.
+func decodeOneLease(buf []byte) dhcpserver.SyncLease {
+	var l dhcpserver.SyncLease
+	off := 0
+	if off >= len(buf) {
+		return l
+	}
+	l.Family = int(buf[off])
+	off++
+	var ok bool
+	if l.Address, off, ok = getLeaseString(buf, off); !ok {
+		return l
+	}
+	if off+4 > len(buf) {
+		return l
+	}
+	l.SubnetID = int(binary.LittleEndian.Uint32(buf[off:]))
+	off += 4
+	if off+4 > len(buf) {
+		return l
+	}
+	l.ValidLife = int(binary.LittleEndian.Uint32(buf[off:]))
+	off += 4
+	if off+4 > len(buf) {
+		return l
+	}
+	l.Remaining = int(binary.LittleEndian.Uint32(buf[off:]))
+	off += 4
+	if off >= len(buf) {
+		return l
+	}
+	l.State = int(buf[off])
+	off++
+	if l.HWAddress, off, ok = getLeaseString(buf, off); !ok {
+		return l
+	}
+	if l.ClientID, off, ok = getLeaseString(buf, off); !ok {
+		return l
+	}
+	if l.DUID, off, ok = getLeaseString(buf, off); !ok {
+		return l
+	}
+	if off+4 > len(buf) {
+		return l
+	}
+	l.IAID = binary.LittleEndian.Uint32(buf[off:])
+	off += 4
+	if l.LeaseType, off, ok = getLeaseString(buf, off); !ok {
+		return l
+	}
+	if off+4 > len(buf) {
+		return l
+	}
+	l.PrefixLen = int(binary.LittleEndian.Uint32(buf[off:]))
+	off += 4
+	if l.Hostname, off, ok = getLeaseString(buf, off); !ok {
+		return l
+	}
+	if off < len(buf) {
+		flags := buf[off]
+		l.FQDNFwd = flags&0x01 != 0
+		l.FQDNRev = flags&0x02 != 0
+	}
+	return l
+}
+
+// encodeDHCPLeasePayload serializes a full-set lease push: a 4-byte count
+// followed by length-prefixed lease records. An empty set encodes as a 4-byte
+// zero count (a legitimate "I serve no leases" message, distinct from a legacy
+// peer that never sends this type at all).
+func encodeDHCPLeasePayload(leases []dhcpserver.SyncLease) []byte {
+	b := make([]byte, 0, 8+len(leases)*64)
+	b = binary.LittleEndian.AppendUint32(b, uint32(len(leases)))
+	for _, l := range leases {
+		rec := encodeOneLease(l)
+		b = binary.LittleEndian.AppendUint32(b, uint32(len(rec)))
+		b = append(b, rec...)
+	}
+	return b
+}
+
+// decodeDHCPLeasePayload parses a full-set lease push. A truncated payload
+// stops decoding at the last complete record (fail-safe: a partial message
+// yields the leases that fully arrived rather than erroring the whole push).
+func decodeDHCPLeasePayload(payload []byte) []dhcpserver.SyncLease {
+	if len(payload) < 4 {
+		return nil
+	}
+	count := int(binary.LittleEndian.Uint32(payload[:4]))
+	off := 4
+	// Clamp the preallocation to what the payload can physically hold: count
+	// is untrusted on-wire data, and each record consumes at least its 4-byte
+	// length prefix, so there can be at most len(payload)/4 records. Without
+	// this, a corrupt/malicious frame claiming count=0xFFFFFFFF would attempt
+	// a ~hundreds-of-GB make() (SyncLease is ~160 bytes) and panic before the
+	// loop's truncation guard fires. Valid payloads are unaffected (a real
+	// count is always <= len(payload)/4). Clamping count also bounds the loop.
+	if maxRecords := len(payload) / 4; count > maxRecords {
+		count = maxRecords
+	}
+	out := make([]dhcpserver.SyncLease, 0, count)
+	for i := 0; i < count; i++ {
+		if off+4 > len(payload) {
+			break
+		}
+		recLen := int(binary.LittleEndian.Uint32(payload[off:]))
+		off += 4
+		if recLen < 0 || off+recLen > len(payload) {
+			break
+		}
+		out = append(out, decodeOneLease(payload[off:off+recLen]))
+		off += recLen
+	}
+	return out
 }

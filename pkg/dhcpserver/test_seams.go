@@ -36,6 +36,22 @@ func NewManagerForTesting(
 	}
 }
 
+// SetLeaseSyncSeamsForTesting injects the #2239 lease-sync test seams: a
+// fake control-socket dialer (a stub Kea server can implement the lease_cmds
+// wire), per-family control-socket paths, and per-family memfile paths. Any
+// zero argument leaves the production default. Used by lease_sync tests in this
+// package and by cross-package tests (e.g. pkg/daemon).
+func (m *Manager) SetLeaseSyncSeamsForTesting(
+	dial keaSocketDialer,
+	ctrlSocket4, ctrlSocket6, leaseFile4, leaseFile6 string,
+) {
+	m.keaDial = dial
+	m.ctrlSocket4 = ctrlSocket4
+	m.ctrlSocket6 = ctrlSocket6
+	m.leaseFile4 = leaseFile4
+	m.leaseFile6 = leaseFile6
+}
+
 // SetWarnForTesting replaces the manager's warning sink (default
 // slog.Warn) so tests can assert that generate-time configuration
 // warnings — e.g. ambiguous Kea subnet selection (#1835 F1) — fire.

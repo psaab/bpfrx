@@ -1,0 +1,651 @@
+package dhcpserver
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"net"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/psaab/xpf/pkg/fsatomic"
+)
+
+// lease_sync.go: the read/seed half of #2239 HA DHCP-server lease
+// synchronization (PATH C — xpf-managed replication over the existing
+// pkg/cluster session-sync channel, re-instantiating the IPsec-SA-sync
+// pattern). The cluster wire + standby-hold + takeover-orchestration live in
+// pkg/cluster and pkg/daemon; this file owns ONLY the Kea side:
+//
+//   - GetSyncLeases4/6 — read the live, active lease set, preferring the Kea
+//     lease_cmds control socket (lease{4,6}-get-all) and falling back to the
+//     append-only memfile parser (parseActiveLeases4/6) when the socket is not
+//     yet up. Used by the MASTER's periodic + on-grant push.
+//   - SeedSyncLeases4/6 — write held peer leases into a just-started Kea via
+//     lease_cmds (lease{4,6}-add, falling back to lease{4,6}-update on an
+//     "already exists" collision). Used on MASTER takeover (the
+//     reinitiateIPsecSAs precedent).
+//   - WaitControlSocket4/6 — bounded wait for the family's control socket to
+//     accept a connection, so SeedSyncLeases runs after Kea is answering.
+//
+// CRITICAL (CLAUDE.md control-socket rule): these helpers talk ONLY to Kea's
+// OWN unix control socket (and, as a fallback, read the memfile). They NEVER
+// touch the userspace-helper control socket, so they cannot starve session
+// installs or status polls.
+//
+// CLOCK INVARIANT (#2239 §6, the <60s answer): a SyncLease carries the lease's
+// REMAINING LIFETIME, not an absolute wall-clock expiry. The peer's wall clock
+// never enters the promoting node's computation — the absolute Kea `expire`
+// epoch is recomputed at SEED time on the LOCAL clock (now + Remaining). This
+// makes the design immune to peer wall-clock skew (the IPsec hazard PATH A
+// inherits), the cluster channel only carrying a monotonic offset.
+
+// Kea control-socket paths (one per family). The lease_cmds hook is loaded and
+// a unix control-socket pointed here by generateKea{4,6}Config when lease sync
+// is enabled. /run/kea is created by the kea packages (owned by _kea); xpfd
+// runs as root and can connect.
+const (
+	keaControlSocket4 = "/run/kea/kea4-ctrl-socket"
+	keaControlSocket6 = "/run/kea/kea6-ctrl-socket"
+)
+
+// keaControlTimeout bounds a single control-socket exchange (connect + write +
+// read-to-EOF). Kept short: a lease read/seed must never wedge the periodic
+// push loop or the takeover path. The seed path runs async post-start like
+// reinitiateIPsecSAs, so a slow Kea only delays the seed, never the takeover.
+const keaControlTimeout = 5 * time.Second
+
+// SyncLease is ONE active DHCP-server lease in the cluster-portable form
+// replicated to the peer. It is deliberately a flat, family-tagged record (no
+// pointers, copy-by-value) so it can be encoded on the sync wire and held in
+// the standby's process memory exactly like peerIPsecSAs.
+//
+// Remaining is the SECONDS of valid lifetime left at the moment the SENDER read
+// the lease (Expire - now_sender). The receiver re-anchors it to fresh absolute
+// time at seed (now_local + Remaining) — see the clock invariant above.
+type SyncLease struct {
+	Family int // 4 or 6
+
+	Address  string // v4 dotted / v6 colon address (or PD prefix base for IA_PD)
+	SubnetID int    // Kea subnet-id the lease belongs to
+
+	// v4 identity. At least one of HWAddress / ClientID is set.
+	HWAddress string // "aa:bb:cc:dd:ee:ff"
+	ClientID  string // RFC 2131 client identifier, Kea hex form ("01:..")
+
+	// v6 identity (DUID/IAID) + lease kind. Type is "IA_NA" or "IA_PD".
+	DUID      string
+	IAID      uint32
+	LeaseType string // v6: "IA_NA" (address) or "IA_PD" (prefix delegation)
+	PrefixLen int    // v6 IA_PD: delegated prefix length (0 for IA_NA)
+
+	Hostname  string
+	FQDNFwd   bool // client requested forward DNS update
+	FQDNRev   bool // client requested reverse DNS update
+	ValidLife int  // the lease's configured valid-lifetime (seconds)
+	Remaining int  // seconds of lifetime left at read time (clock-skew-safe)
+	State     int  // Kea lease state (0=default/active)
+}
+
+// IdentityKey returns a stable per-lease identity used for dedup/diff on the
+// sender (on-grant change detection) and as the seed idempotency key. It mirrors
+// the DDNS identity functions but is keyed on the address + identity so two
+// renewals of the same binding compare equal except for Remaining.
+func (l SyncLease) IdentityKey() string {
+	if l.Family == 6 {
+		return fmt.Sprintf("6|%s|%s|%d|%s", l.Address, l.DUID, l.IAID, l.LeaseType)
+	}
+	id := l.ClientID
+	if id == "" {
+		id = l.HWAddress
+	}
+	return fmt.Sprintf("4|%s|%s", l.Address, id)
+}
+
+// keaCommand is one Kea control-socket request.
+type keaCommand struct {
+	Command   string `json:"command"`
+	Arguments any    `json:"arguments,omitempty"`
+}
+
+// keaResponse is the generic Kea control-socket response envelope. result==0 is
+// success; result==3 is "empty" (e.g. no leases) which lease{4,6}-get-all
+// returns and which we treat as a successful empty set.
+type keaResponse struct {
+	Result    int             `json:"result"`
+	Text      string          `json:"text"`
+	Arguments json.RawMessage `json:"arguments"`
+}
+
+const (
+	keaResultSuccess  = 0
+	keaResultError    = 1
+	keaResultEmpty    = 3
+	keaResultConflict = 2 // lease already exists (lease-add) etc.
+)
+
+// keaLeaseJSON is the lease shape lease{4,6}-get-all returns and lease{4,6}-add
+// accepts. Kea uses "valid-lft" + "cltt" (client-last-transaction-time epoch);
+// the absolute expiry is cltt+valid-lft. On add we send an absolute "expire".
+type keaLeaseJSON struct {
+	IPAddress string `json:"ip-address"`
+	HWAddress string `json:"hw-address,omitempty"`
+	ClientID  string `json:"client-id,omitempty"`
+	DUID      string `json:"duid,omitempty"`
+	IAID      uint32 `json:"iaid,omitempty"`
+	Type      string `json:"type,omitempty"`       // v6: IA_NA / IA_PD
+	PrefixLen int    `json:"prefix-len,omitempty"` // v6 IA_PD
+	SubnetID  int    `json:"subnet-id,omitempty"`
+	ValidLft  int    `json:"valid-lft,omitempty"`
+	CLTT      int64  `json:"cltt,omitempty"`   // client-last-transaction-time epoch (get)
+	Expire    int64  `json:"expire,omitempty"` // absolute expiry epoch (add)
+	State     int    `json:"state"`
+	Hostname  string `json:"hostname,omitempty"`
+	FQDNFwd   bool   `json:"fqdn-fwd,omitempty"`
+	FQDNRev   bool   `json:"fqdn-rev,omitempty"`
+}
+
+type keaLeaseGetAllArgs struct {
+	Leases []keaLeaseJSON `json:"leases"`
+}
+
+// keaSocketDialer abstracts the unix-socket dial for tests (a stub server can
+// implement the lease_cmds wire). Production uses net.Dial.
+type keaSocketDialer func(ctx context.Context, socketPath string) (net.Conn, error)
+
+func defaultKeaDialer(ctx context.Context, socketPath string) (net.Conn, error) {
+	var d net.Dialer
+	return d.DialContext(ctx, "unix", socketPath)
+}
+
+// keaControl sends one command to the family control socket and decodes the
+// response envelope. Kea answers a single JSON object and closes (or keeps
+// open); we read to the first complete JSON value.
+func keaControl(ctx context.Context, dial keaSocketDialer, socketPath string, cmd keaCommand) (*keaResponse, error) {
+	if dial == nil {
+		dial = defaultKeaDialer
+	}
+	dctx, cancel := context.WithTimeout(ctx, keaControlTimeout)
+	defer cancel()
+	conn, err := dial(dctx, socketPath)
+	if err != nil {
+		return nil, fmt.Errorf("dial kea control socket %s: %w", socketPath, err)
+	}
+	defer conn.Close()
+	if dl, ok := dctx.Deadline(); ok {
+		_ = conn.SetDeadline(dl)
+	}
+	payload, err := json.Marshal(cmd)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := conn.Write(payload); err != nil {
+		return nil, fmt.Errorf("write kea command %s: %w", cmd.Command, err)
+	}
+	// Read the single JSON response. Kea writes one object; decode the first
+	// value from the stream so a kept-open socket does not hang us.
+	dec := json.NewDecoder(conn)
+	var resp keaResponse
+	if err := dec.Decode(&resp); err != nil {
+		return nil, fmt.Errorf("decode kea response for %s: %w", cmd.Command, err)
+	}
+	return &resp, nil
+}
+
+// readSyncLeasesViaSocket reads active leases for a family from the Kea control
+// socket via lease{4,6}-get-all.
+func readSyncLeasesViaSocket(ctx context.Context, dial keaSocketDialer, socketPath string, family int, now time.Time) ([]SyncLease, error) {
+	cmd := keaCommand{Command: fmt.Sprintf("lease%d-get-all", family)}
+	resp, err := keaControl(ctx, dial, socketPath, cmd)
+	if err != nil {
+		return nil, err
+	}
+	if resp.Result == keaResultEmpty {
+		return nil, nil
+	}
+	if resp.Result != keaResultSuccess {
+		return nil, fmt.Errorf("lease%d-get-all: result=%d text=%q", family, resp.Result, resp.Text)
+	}
+	var args keaLeaseGetAllArgs
+	if len(resp.Arguments) > 0 {
+		if err := json.Unmarshal(resp.Arguments, &args); err != nil {
+			return nil, fmt.Errorf("lease%d-get-all decode args: %w", family, err)
+		}
+	}
+	out := make([]SyncLease, 0, len(args.Leases))
+	for _, kl := range args.Leases {
+		l := keaLeaseToSync(kl, family, now)
+		if l.State != keaStateDefault {
+			continue // only active leases are synced
+		}
+		if l.Remaining <= 0 {
+			continue // already expired at read time
+		}
+		out = append(out, l)
+	}
+	return out, nil
+}
+
+// keaLeaseToSync converts a get-all lease record into the clock-skew-safe
+// SyncLease (computing Remaining from cltt+valid-lft on the SENDER clock).
+func keaLeaseToSync(kl keaLeaseJSON, family int, now time.Time) SyncLease {
+	l := SyncLease{
+		Family:    family,
+		Address:   kl.IPAddress,
+		SubnetID:  kl.SubnetID,
+		HWAddress: kl.HWAddress,
+		ClientID:  kl.ClientID,
+		DUID:      kl.DUID,
+		IAID:      kl.IAID,
+		LeaseType: kl.Type,
+		PrefixLen: kl.PrefixLen,
+		Hostname:  kl.Hostname,
+		FQDNFwd:   kl.FQDNFwd,
+		FQDNRev:   kl.FQDNRev,
+		ValidLife: kl.ValidLft,
+		State:     kl.State,
+	}
+	// Remaining = (cltt + valid-lft) - now, computed on the sender's clock.
+	expire := kl.Expire
+	if expire == 0 {
+		expire = kl.CLTT + int64(kl.ValidLft)
+	}
+	rem := expire - now.Unix()
+	if rem < 0 {
+		rem = 0
+	}
+	l.Remaining = int(rem)
+	return l
+}
+
+// readSyncLeasesViaMemfile is the fallback read path: parse the append-only
+// memfile via the destructive-safe parser and convert to SyncLeases. Used when
+// the control socket is not (yet) up. The memfile holds an absolute Expire
+// epoch (Kea writes cltt+valid-lft); Remaining is computed from it on the
+// local clock, same as the socket path.
+func readSyncLeasesViaMemfile(path string, family int, now time.Time) ([]SyncLease, error) {
+	active, err := parseActiveLeases(path, family, now)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]SyncLease, 0, len(active))
+	for _, a := range active {
+		l := SyncLease{
+			Family:   family,
+			Address:  a.Address,
+			Hostname: a.HostName,
+			State:    keaStateDefault,
+		}
+		if a.ClientFQDN != "" {
+			l.Hostname = a.ClientFQDN
+			l.FQDNFwd = true
+		}
+		if a.SubnetID != "" {
+			if sid, e := strconv.Atoi(a.SubnetID); e == nil {
+				l.SubnetID = sid
+			}
+		}
+		if family == 6 {
+			duid, iaid := splitV6Identity(a.Identity)
+			l.DUID = duid
+			l.IAID = iaid
+			l.LeaseType = "IA_NA"
+		} else {
+			hw, cid := splitV4Identity(a.Identity)
+			l.HWAddress = hw
+			l.ClientID = cid
+		}
+		rem := a.Expire - now.Unix()
+		if a.Expire == 0 {
+			// memfile lacked an expire column; treat as full lifetime unknown,
+			// skip (cannot compute a safe remaining).
+			continue
+		}
+		if rem <= 0 {
+			continue
+		}
+		l.Remaining = int(rem)
+		out = append(out, l)
+	}
+	return out, nil
+}
+
+// splitV4Identity inverts identity4 ("cid:.."/"mac:..") back into the Kea
+// fields. The memfile parser collapsed client-id/hwaddr into one keyed string;
+// we recover whichever was present so lease4-add gets a usable identity.
+func splitV4Identity(identity string) (hwaddr, clientID string) {
+	switch {
+	case strings.HasPrefix(identity, "cid:"):
+		return "", strings.TrimPrefix(identity, "cid:")
+	case strings.HasPrefix(identity, "mac:"):
+		return strings.TrimPrefix(identity, "mac:"), ""
+	}
+	return "", ""
+}
+
+// splitV6Identity inverts identity6 ("duid:DUID/IAID") back into DUID + IAID.
+func splitV6Identity(identity string) (duid string, iaid uint32) {
+	s := strings.TrimPrefix(identity, "duid:")
+	if i := strings.LastIndex(s, "/"); i >= 0 {
+		duid = s[:i]
+		if v, err := strconv.ParseUint(s[i+1:], 10, 32); err == nil {
+			iaid = uint32(v)
+		}
+		return duid, iaid
+	}
+	return s, 0
+}
+
+// GetSyncLeases4 returns the active v4 leases this node is serving, preferring
+// the control socket and falling back to the memfile. now is injectable for
+// tests (production passes time.Now()).
+func (m *Manager) GetSyncLeases4(ctx context.Context, now time.Time) ([]SyncLease, error) {
+	return m.getSyncLeases(ctx, 4, now)
+}
+
+// GetSyncLeases6 returns the active v6 leases this node is serving.
+func (m *Manager) GetSyncLeases6(ctx context.Context, now time.Time) ([]SyncLease, error) {
+	return m.getSyncLeases(ctx, 6, now)
+}
+
+func (m *Manager) getSyncLeases(ctx context.Context, family int, now time.Time) ([]SyncLease, error) {
+	socket := m.controlSocket(family)
+	leases, err := readSyncLeasesViaSocket(ctx, m.keaDial, socket, family, now)
+	if err == nil {
+		return leases, nil
+	}
+	// Fallback: read the memfile (socket not up yet, or hook unavailable).
+	memfile := m.leaseFile(family)
+	mem, memErr := readSyncLeasesViaMemfile(memfile, family, now)
+	if memErr != nil {
+		return nil, fmt.Errorf("kea v%d lease read: socket=%v memfile=%v", family, err, memErr)
+	}
+	return mem, nil
+}
+
+// SeedSyncLeases4 writes held peer v4 leases into the just-started Kea via
+// lease4-add (lease4-update on collision). It re-anchors each lease's Remaining
+// to fresh absolute time on the LOCAL clock. Returns the number successfully
+// seeded and a joined error of any failures (fail-open: the caller logs+counts;
+// a seed failure never blocks serving).
+func (m *Manager) SeedSyncLeases4(ctx context.Context, leases []SyncLease, now time.Time) (int, error) {
+	return m.seedSyncLeases(ctx, 4, leases, now)
+}
+
+// SeedSyncLeases6 writes held peer v6 leases into the just-started Kea.
+func (m *Manager) SeedSyncLeases6(ctx context.Context, leases []SyncLease, now time.Time) (int, error) {
+	return m.seedSyncLeases(ctx, 6, leases, now)
+}
+
+func (m *Manager) seedSyncLeases(ctx context.Context, family int, leases []SyncLease, now time.Time) (int, error) {
+	socket := m.controlSocket(family)
+	var seeded int
+	var errs []string
+	for _, l := range leases {
+		if l.Family != family {
+			continue
+		}
+		if err := m.seedOneLease(ctx, socket, family, l, now); err != nil {
+			errs = append(errs, err.Error())
+			continue
+		}
+		seeded++
+	}
+	if len(errs) > 0 {
+		return seeded, fmt.Errorf("seed v%d leases: %d/%d failed: %s",
+			family, len(errs), len(leases), strings.Join(errs, "; "))
+	}
+	return seeded, nil
+}
+
+// seedOneLease issues lease{4,6}-add for one lease; on a "conflict" (already
+// exists) it retries lease{4,6}-update so a lease already in the promoting
+// node's own persisted memfile is harmlessly refreshed (idempotent).
+func (m *Manager) seedOneLease(ctx context.Context, socket string, family int, l SyncLease, now time.Time) error {
+	kl := syncLeaseToKea(l, now)
+	addCmd := keaCommand{Command: fmt.Sprintf("lease%d-add", family), Arguments: kl}
+	resp, err := keaControl(ctx, m.keaDial, socket, addCmd)
+	if err != nil {
+		return err
+	}
+	if resp.Result == keaResultSuccess {
+		return nil
+	}
+	// Conflict / already-exists → update in place (newer of the two wins;
+	// the local persisted lease keeps the in-use binding either way).
+	if resp.Result == keaResultConflict || strings.Contains(strings.ToLower(resp.Text), "exist") {
+		updCmd := keaCommand{Command: fmt.Sprintf("lease%d-update", family), Arguments: kl}
+		uresp, uerr := keaControl(ctx, m.keaDial, socket, updCmd)
+		if uerr != nil {
+			return uerr
+		}
+		if uresp.Result == keaResultSuccess {
+			return nil
+		}
+		return fmt.Errorf("lease%d-update %s: result=%d text=%q", family, l.Address, uresp.Result, uresp.Text)
+	}
+	return fmt.Errorf("lease%d-add %s: result=%d text=%q", family, l.Address, resp.Result, resp.Text)
+}
+
+// syncLeaseToKea re-anchors a SyncLease to fresh absolute time at seed (the
+// clock-skew-immunity step: expire = now_local + Remaining) and renders the Kea
+// lease{4,6}-add argument record. valid-lft is set to Remaining so a renewing
+// client sees the correct remaining time, and the absolute expire matches.
+func syncLeaseToKea(l SyncLease, now time.Time) keaLeaseJSON {
+	rem := l.Remaining
+	if rem < 1 {
+		rem = 1 // Kea rejects a zero/negative lifetime; floor to 1s
+	}
+	kl := keaLeaseJSON{
+		IPAddress: l.Address,
+		SubnetID:  l.SubnetID,
+		ValidLft:  rem,
+		Expire:    now.Unix() + int64(rem),
+		State:     keaStateDefault,
+		Hostname:  l.Hostname,
+		FQDNFwd:   l.FQDNFwd,
+		FQDNRev:   l.FQDNRev,
+	}
+	if l.Family == 6 {
+		kl.DUID = l.DUID
+		kl.IAID = l.IAID
+		kl.Type = l.LeaseType
+		if kl.Type == "" {
+			kl.Type = "IA_NA"
+		}
+		if kl.Type == "IA_PD" {
+			kl.PrefixLen = l.PrefixLen
+		}
+	} else {
+		kl.HWAddress = l.HWAddress
+		kl.ClientID = l.ClientID
+	}
+	return kl
+}
+
+// WaitControlSocket4 blocks until the v4 control socket accepts a connection or
+// the deadline passes. Used post-Kea-start before seeding (Q3 backstop).
+func (m *Manager) WaitControlSocket4(ctx context.Context, within time.Duration) bool {
+	return m.waitControlSocket(ctx, 4, within)
+}
+
+// WaitControlSocket6 blocks until the v6 control socket is ready.
+func (m *Manager) WaitControlSocket6(ctx context.Context, within time.Duration) bool {
+	return m.waitControlSocket(ctx, 6, within)
+}
+
+func (m *Manager) waitControlSocket(ctx context.Context, family int, within time.Duration) bool {
+	socket := m.controlSocket(family)
+	deadline := time.Now().Add(within)
+	dial := m.keaDial
+	if dial == nil {
+		dial = defaultKeaDialer
+	}
+	for {
+		if ctx.Err() != nil {
+			return false
+		}
+		dctx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+		conn, err := dial(dctx, socket)
+		cancel()
+		if err == nil {
+			conn.Close()
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		select {
+		case <-ctx.Done():
+			return false
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+}
+
+// controlSocket returns the family's control-socket path (overridable in tests
+// via m.ctrlSocket4/6).
+func (m *Manager) controlSocket(family int) string {
+	if family == 6 {
+		if m.ctrlSocket6 != "" {
+			return m.ctrlSocket6
+		}
+		return keaControlSocket6
+	}
+	if m.ctrlSocket4 != "" {
+		return m.ctrlSocket4
+	}
+	return keaControlSocket4
+}
+
+// PreSeedMemfile4 writes the held peer v4 leases into the Kea v4 memfile CSV
+// BEFORE Kea is (re)started on takeover (#2239 Q3). A starting Kea loads its
+// memfile at boot, so pre-seeding the in-use bindings means it can NEVER answer
+// a DISCOVER with an in-use address even in the window before the post-start
+// lease-add seed runs — this fully closes the duplicate-allocation window. The
+// Remaining lifetime is re-anchored to fresh absolute time on the LOCAL clock
+// (now + Remaining) so peer wall-clock skew never enters the seeded expiry.
+//
+// The file is written atomically (fsatomic) with Kea's canonical v4 memfile
+// header so Kea parses it cleanly. It OVERWRITES any existing memfile: on
+// takeover the held peer set is the authoritative serving state, and Kea's own
+// LFC will compact going forward.
+func (m *Manager) PreSeedMemfile4(leases []SyncLease, now time.Time) error {
+	return writeMemfile4(m.leaseFile(4), leases, now)
+}
+
+// PreSeedMemfile6 writes the held peer v6 leases into the Kea v6 memfile CSV
+// before Kea start (#2239 Q3). See PreSeedMemfile4.
+func (m *Manager) PreSeedMemfile6(leases []SyncLease, now time.Time) error {
+	return writeMemfile6(m.leaseFile(6), leases, now)
+}
+
+// keaMemfileHeader4 is Kea's canonical DHCPv4 memfile CSV header (Kea 2.x/3.x).
+const keaMemfileHeader4 = "address,hwaddr,client_id,valid_lifetime,expire,subnet_id,fqdn_fwd,fqdn_rev,hostname,state,user_context,pool_id"
+
+// keaMemfileHeader6 is Kea's canonical DHCPv6 memfile CSV header (Kea 2.x/3.x).
+const keaMemfileHeader6 = "address,duid,valid_lifetime,expire,subnet_id,pref_lifetime,lease_type,iaid,prefix_len,fqdn_fwd,fqdn_rev,hostname,hwaddr,state,user_context,hwtype,hwaddr_source,pool_id"
+
+func boolCSV(b bool) string {
+	if b {
+		return "1"
+	}
+	return "0"
+}
+
+func writeMemfile4(path string, leases []SyncLease, now time.Time) error {
+	var b strings.Builder
+	b.WriteString(keaMemfileHeader4)
+	b.WriteByte('\n')
+	for _, l := range leases {
+		if l.Family != 4 {
+			continue
+		}
+		rem := l.Remaining
+		if rem < 1 {
+			rem = 1
+		}
+		expire := now.Unix() + int64(rem)
+		// address,hwaddr,client_id,valid_lifetime,expire,subnet_id,
+		// fqdn_fwd,fqdn_rev,hostname,state,user_context,pool_id
+		fmt.Fprintf(&b, "%s,%s,%s,%d,%d,%d,%s,%s,%s,%d,,0\n",
+			csvField(l.Address), csvField(l.HWAddress), csvField(l.ClientID),
+			rem, expire, l.SubnetID,
+			boolCSV(l.FQDNFwd), boolCSV(l.FQDNRev), csvField(l.Hostname),
+			keaStateDefault)
+	}
+	return writeMemfileAtomic(path, b.String())
+}
+
+func writeMemfile6(path string, leases []SyncLease, now time.Time) error {
+	var b strings.Builder
+	b.WriteString(keaMemfileHeader6)
+	b.WriteByte('\n')
+	for _, l := range leases {
+		if l.Family != 6 {
+			continue
+		}
+		rem := l.Remaining
+		if rem < 1 {
+			rem = 1
+		}
+		expire := now.Unix() + int64(rem)
+		leaseType := 0 // IA_NA
+		if l.LeaseType == "IA_PD" {
+			leaseType = 2 // IA_PD
+		}
+		prefixLen := l.PrefixLen
+		if leaseType == 0 {
+			prefixLen = 128
+		}
+		// address,duid,valid_lifetime,expire,subnet_id,pref_lifetime,
+		// lease_type,iaid,prefix_len,fqdn_fwd,fqdn_rev,hostname,hwaddr,
+		// state,user_context,hwtype,hwaddr_source,pool_id
+		fmt.Fprintf(&b, "%s,%s,%d,%d,%d,%d,%d,%d,%d,%s,%s,%s,,%d,,,,0\n",
+			csvField(l.Address), csvField(l.DUID),
+			rem, expire, l.SubnetID, rem,
+			leaseType, l.IAID, prefixLen,
+			boolCSV(l.FQDNFwd), boolCSV(l.FQDNRev), csvField(l.Hostname),
+			keaStateDefault)
+	}
+	return writeMemfileAtomic(path, b.String())
+}
+
+// writeMemfileAtomic writes the rendered memfile durably so a Kea start cannot
+// read a torn pre-seed. Pre-seed runs on the takeover path (not a hot path) so
+// the fsync cost is acceptable, and durability matters: the pre-seed exists to
+// survive a crash-failover, the worst case being a torn file Kea then rejects.
+func writeMemfileAtomic(path, content string) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0750); err != nil {
+		return fmt.Errorf("create %s: %w", dir, err)
+	}
+	return fsatomic.WriteFileDurable(path, []byte(content), 0640)
+}
+
+// csvField escapes a memfile CSV field. Kea memfile values (addresses,
+// hex-encoded identities, hostnames) do not normally contain commas, but a
+// hostname could; quote-escape per RFC 4180 to stay safe.
+func csvField(s string) string {
+	if strings.ContainsAny(s, ",\"\n") {
+		return "\"" + strings.ReplaceAll(s, "\"", "\"\"") + "\""
+	}
+	return s
+}
+
+// leaseFile returns the family's memfile path (overridable in tests).
+func (m *Manager) leaseFile(family int) string {
+	if family == 6 {
+		if m.leaseFile6 != "" {
+			return m.leaseFile6
+		}
+		return keaLeaseFile6
+	}
+	if m.leaseFile4 != "" {
+		return m.leaseFile4
+	}
+	return keaLeaseFile4
+}

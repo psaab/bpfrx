@@ -594,6 +594,16 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 			d.sessionSync.OnPeerConnected = func() {
 				d.cluster.RecordEvent(cluster.EventFabric, -1, "Peer connected")
 				d.onSessionSyncPeerConnected()
+				// #2239 Q7: a peer that just (re)connected (e.g. a restarted
+				// standby) has an empty in-memory peerDHCPLeases set. Nudge a
+				// full lease re-push so it is not briefly empty until the next
+				// heartbeat tick. The nudge is RG-MASTER gated inside the push
+				// loop (this node pushes only its own owned set), so it is safe
+				// regardless of RG0 config authority — done before the
+				// RG0-only config-push gating below.
+				if cc := d.clusterConfig(); cc != nil && cc.DHCPLeaseSync {
+					d.nudgeDHCPLeaseSync()
+				}
 				if d.cluster == nil || !d.cluster.IsLocalPrimary(0) {
 					slog.Info("cluster: skipping config push (not RG0 primary)")
 					return
@@ -792,6 +802,14 @@ func (d *Daemon) startClusterComms(ctx context.Context) {
 			// Start periodic IPsec SA sync if enabled.
 			if cc.IPsecSASync && d.ipsec != nil {
 				go d.syncIPsecSAPeriodic(commsCtx)
+			}
+
+			// #2239: start the DHCP-server lease-sync push loop if enabled.
+			// The loop is gated on the RG-MASTER node-level gate internally;
+			// on the BACKUP it pushes nothing and the standby holds the peer
+			// set via OnDHCPLeasesReceived.
+			if cc.DHCPLeaseSync && d.dhcpServer != nil {
+				go d.runDHCPLeaseSyncLoop(commsCtx)
 			}
 
 			// Initialize fabric refresh channel for event-driven updates (#124).

@@ -102,6 +102,18 @@ type Daemon struct {
 	// loop) so a hung DNS server can never wedge the loop or starve the
 	// nudge channel.
 	ddnsReconcileInFlight atomic.Bool
+	// #2239 HA DHCP-server lease sync (PATH C). The push loop runs on the
+	// RG-MASTER, reads the active lease set (Kea control socket → memfile
+	// fallback), and replicates it over the cluster sync channel. The standby
+	// holds the peer set in SessionSync.peerDHCPLeases{4,6} and seeds Kea on
+	// takeover. These mirror the ddnsReconcile* fields above. The loop talks
+	// ONLY to Kea's own socket + the cluster channel — never the
+	// userspace-helper control socket (CLAUDE.md rule).
+	dhcpLeaseSyncNowCh    chan struct{} // nudge: grant/commit/MASTER takeover
+	dhcpLeaseSyncInFlight atomic.Bool   // no-freeze skip-if-in-flight guard
+	dhcpLeaseLastSentMu   sync.Mutex
+	dhcpLeaseLastSent4    string // last-pushed v4 set fingerprint (change-detect)
+	dhcpLeaseLastSent6    string // last-pushed v6 set fingerprint (change-detect)
 	feeds                 *feeds.Manager
 	rpm                   *rpm.Manager
 	rpmMu                 sync.Mutex // serializes reconcileRPM callers (#1827)
@@ -480,6 +492,7 @@ func New(opts Options) (*Daemon, error) {
 		blackholeRoutes:            make(map[int][]netlink.Route),
 		reconcileNowCh:             make(chan struct{}, 1),
 		ddnsReconcileNowCh:         make(chan struct{}, 1),
+		dhcpLeaseSyncNowCh:         make(chan struct{}, 1),
 		syncReadyTimeout:           5 * time.Second,
 		linkByNameFn:               netlink.LinkByName,
 		directAnnounceSchedule:     []time.Duration{0, 250 * time.Millisecond, 1 * time.Second, 2 * time.Second, 4 * time.Second, 6 * time.Second},

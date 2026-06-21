@@ -361,11 +361,48 @@ Still deferred (Inc-3+):
   additive follow-up; the zone-resolution helpers already take the optional
   list so the follow-up wires straight in.
 
+## HA lease synchronization (#2239) — `lease_sync.go`
+
+This package owns the KEA side of #2239 cross-chassis DHCP-server lease sync
+(PATH C). The cluster wire + standby-hold + takeover orchestration live in
+`pkg/cluster` + `pkg/daemon`; here:
+
+- `SetLeaseSyncEnabled(bool)` — when set (the daemon flips it from the cluster
+  `dhcp-lease-synchronization` knob before an apply), `generateKea{4,6}Config`
+  injects a unix `control-socket` + the `libdhcp_lease_cmds.so` hook
+  (`addLeaseSyncStanza`). Knob-off / standalone renders bit-identical to
+  pre-#2239 (no socket, no hook). `memfile` stays `persist=true`.
+- `GetSyncLeases{4,6}(ctx, now)` — read the active lease set, preferring the
+  control socket (`lease{4,6}-get-all`) and falling back to the
+  destructive-safe memfile parser (`parseActiveLeases`) when the socket is not
+  up. Each `SyncLease` carries REMAINING LIFETIME (`expire - now` on the
+  reader's clock), never an absolute epoch — the clock-skew-immunity invariant.
+  Expired / non-active leases are dropped at read time.
+- `SeedSyncLeases{4,6}(ctx, leases, now)` — write held peer leases into a
+  just-started Kea via `lease{4,6}-add` (→ `lease{4,6}-update` on collision,
+  idempotent), re-anchoring `expire = now + remaining` on the LOCAL clock.
+  Faithful v6 identity (DUID/IAID/`type`/`prefix-len`, so IA_PD is synced).
+- `PreSeedMemfile{4,6}(leases, now)` — write the held leases into the Kea
+  memfile CSV (canonical header) BEFORE Kea start so it loads the in-use
+  bindings at boot and can never hand an in-use address to a different client
+  even in the pre-`lease-add` window (the duplicate-allocation-window closer).
+  Durable (`fsatomic.WriteFileDurable`).
+- `WaitControlSocket{4,6}(ctx, within)` — bounded readiness wait before the
+  post-start seed.
+
+All of these talk ONLY to KEA's own unix control socket (or the memfile) —
+NEVER the userspace-helper control socket (CLAUDE.md rule), so they cannot
+starve session installs. All seed/read errors are fail-open (logged + counted
+by the daemon; serving is never blocked). Test seams:
+`SetLeaseSyncSeamsForTesting` injects a stub dialer + paths.
+
 ## Callers
 
 `pkg/daemon` (constructs the always-on `DDNSManager`, runs the reconcile
 loop, owns the node-level HA gate, exposes `DDNSStats`/`OwnedDDNSRecords` to
-the API/CLI), `pkg/cli`, `pkg/grpcapi`, `pkg/api`.
+the API/CLI; for #2239 it sets `SetLeaseSyncEnabled`, runs the lease-sync push
+loop, and drives the pre-seed + takeover seed), `pkg/cluster` (#2239 holds the
+peer `SyncLease` set), `pkg/cli`, `pkg/grpcapi`, `pkg/api`.
 
 ## Dependencies
 

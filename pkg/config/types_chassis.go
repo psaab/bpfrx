@@ -106,6 +106,7 @@ type ClusterConfig struct {
 	ControlLinkRecovery   bool   // enable control-link-recovery
 	NATStateSync          bool   // enable NAT state synchronization (session sync with NAT fields)
 	IPsecSASync           bool   // enable IPsec SA synchronization (connection name sync for failover re-initiation)
+	DHCPLeaseSync         bool   // enable DHCP-server lease synchronization (#2239 PATH C: lease state held on standby, seeded into Kea on takeover)
 	RethAdvertiseInterval int    // RETH VRRP advertisement interval in milliseconds, 0=default(30)
 	HitlessRestart        bool   // preserve BPF state on shutdown (default false in HA — fail-closed)
 	PeerFencing           string // peer fencing action on heartbeat timeout: "", "disable-rg"

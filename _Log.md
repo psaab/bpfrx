@@ -9306,3 +9306,30 @@ top.
   userspace-dp/src/server/handlers/mod.rs,
   pkg/dataplane/retirement_boundary_canary_test.go,
   docs/userspace-dataplane-gaps.md, docs/pr/1373-retire-ebpf-dataplane/README.md
+
+- **Timestamp**: 2026-06-21
+  **Action**: #2239 HA DHCP-server lease synchronization (PATH C) — implemented
+  lease replication over the existing pkg/cluster session-sync channel (the
+  IPsec-SA-sync pattern), config knob `dhcp-lease-synchronization`, Kea
+  control-socket lease_cmds read/seed, standby memory-hold (Kea STOPPED on
+  BACKUP), takeover pre-seed (memfile) + lease{4,6}-add seed with
+  remaining-lifetime local-clock re-anchor (clock-skew immune). Unit tests for
+  read/parse, wire round-trip + length-gating, standby-hold + takeover-seed,
+  knob gate, change-detect fingerprint.
+  **File(s)**: pkg/dhcpserver/{lease_sync.go,lease_sync_test.go,dhcpserver.go,
+  test_seams.go,README.md}, pkg/cluster/{sync.go,sync_conn.go,sync_protocol.go,
+  status.go,lease_sync_wire_test.go,README.md}, pkg/config/{types_chassis.go,
+  compiler_system.go,schema_chassis.go,parser_cluster_test.go},
+  pkg/daemon/{daemon.go,daemon_apply.go,daemon_ha.go,daemon_ha_sync.go,
+  daemon_dhcp_lease_sync.go,daemon_dhcp_lease_sync_test.go},
+  docs/{feature-gaps.md,phases.md,research/2239-dhcp-ha-lease-sync/*}
+
+- **Timestamp**: 2026-06-21
+  **Action**: #2239 PATH C shipped as PR #2260 (head 2da12f190) — 6 logical
+  commits (config knob; dhcpserver Kea read/seed + control-socket; cluster sync
+  replication; daemon push-loop + takeover-seed; tests; docs) rebased onto
+  master 815889740 (clean auto-merge of #2243 reservations / #2229 / #2225).
+  build+vet+test green incl -race on lease-sync paths. Kea STOPPED on BACKUP,
+  standby mem-hold + takeover pre-seed/lease-add seed. test-failover + live
+  lease-survives-failover smoke PENDING-PARENT before merge.
+  **File(s)**: _Log.md
