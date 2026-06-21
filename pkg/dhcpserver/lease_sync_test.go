@@ -181,6 +181,114 @@ func TestGetSyncLeases4_MemfileFallback(t *testing.T) {
 	}
 }
 
+// Test (a) v6 fallback (#2262): the memfile-fallback read path must PRESERVE
+// the v6 lease kind (IA_NA vs IA_PD) and the PD prefix length from the Kea v6
+// memfile, not hardcode IA_NA. A memfile holding BOTH an IA_NA and an IA_PD row
+// must round-trip each lease's type (and the PD prefix-len) — mirroring the
+// faithful control-socket path (TestSeedSyncLeases6_IdentityAndPD). Fail-on-
+// revert: re-hardcoding LeaseType="IA_NA" makes the IA_PD assertions fail.
+func TestGetSyncLeases6_MemfileFallback_PreservesType(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	dir := t.TempDir()
+	memfile := filepath.Join(dir, "kea-leases6.csv")
+	expire := strconv.FormatInt(now.Unix()+1800, 10)
+	// Canonical Kea v6 memfile header + one IA_NA (lease_type 0, prefix_len 128)
+	// and one IA_PD (lease_type 2, prefix_len 56) row.
+	//   address,duid,valid_lifetime,expire,subnet_id,pref_lifetime,
+	//   lease_type,iaid,prefix_len,fqdn_fwd,fqdn_rev,hostname,hwaddr,
+	//   state,user_context,hwtype,hwaddr_source,pool_id
+	csv := keaMemfileHeader6 + "\n" +
+		"2001:db8::100,00:01:00:01,3600," + expire + ",1,3600,0,42,128,0,0,host-na,,0,,,,0\n" +
+		"2001:db8:abcd::,00:01:00:02,3600," + expire + ",1,3600,2,7,56,0,0,host-pd,,0,,,,0\n"
+	if err := os.WriteFile(memfile, []byte(csv), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	m := New()
+	// Missing socket → memfile fallback; leaseFile6 = our fixture.
+	m.SetLeaseSyncSeamsForTesting(nil, "", filepath.Join(dir, "missing.sock"), "", memfile)
+
+	leases, err := m.GetSyncLeases6(context.Background(), now)
+	if err != nil {
+		t.Fatalf("GetSyncLeases6 (fallback): %v", err)
+	}
+	if len(leases) != 2 {
+		t.Fatalf("expected 2 leases from v6 memfile, got %d: %+v", len(leases), leases)
+	}
+
+	byAddr := map[string]SyncLease{}
+	for _, l := range leases {
+		byAddr[l.Address] = l
+	}
+
+	na, ok := byAddr["2001:db8::100"]
+	if !ok {
+		t.Fatalf("IA_NA lease missing from fallback result: %+v", leases)
+	}
+	if na.LeaseType != "IA_NA" {
+		t.Errorf("IA_NA lease type = %q, want IA_NA", na.LeaseType)
+	}
+	if na.PrefixLen != 0 {
+		t.Errorf("IA_NA lease PrefixLen = %d, want 0", na.PrefixLen)
+	}
+	if na.DUID != "00:01:00:01" || na.IAID != 42 {
+		t.Errorf("IA_NA identity wrong: DUID=%q IAID=%d", na.DUID, na.IAID)
+	}
+
+	pd, ok := byAddr["2001:db8:abcd::"]
+	if !ok {
+		t.Fatalf("IA_PD lease missing from fallback result: %+v", leases)
+	}
+	// This is the #2262 regression guard: pre-fix the fallback hardcoded
+	// LeaseType="IA_NA" and dropped the prefix length, so a PD lease arrived as
+	// an address lease on the peer.
+	if pd.LeaseType != "IA_PD" {
+		t.Errorf("IA_PD lease mis-typed as %q (want IA_PD) — #2262 regression", pd.LeaseType)
+	}
+	if pd.PrefixLen != 56 {
+		t.Errorf("IA_PD lease PrefixLen = %d, want 56 — #2262 regression", pd.PrefixLen)
+	}
+	if pd.DUID != "00:01:00:02" || pd.IAID != 7 {
+		t.Errorf("IA_PD identity wrong: DUID=%q IAID=%d", pd.DUID, pd.IAID)
+	}
+}
+
+// Test (a) v6 fallback skip-malformed (#2262): a PRESENT-but-unparseable
+// lease_type column must cause the row to be SKIPPED (fail-closed), not
+// defaulted to IA_NA, so a corrupt row can never silently mis-seed an address
+// lease on the peer. A well-formed IA_PD row in the same file still parses.
+func TestGetSyncLeases6_MemfileFallback_SkipMalformedType(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	dir := t.TempDir()
+	memfile := filepath.Join(dir, "kea-leases6.csv")
+	expire := strconv.FormatInt(now.Unix()+1800, 10)
+	// First row: lease_type column is garbage ("PD") → unparseable → skipped.
+	// Second row: a valid IA_PD lease that must still survive.
+	csv := keaMemfileHeader6 + "\n" +
+		"2001:db8::bad,00:01:00:09,3600," + expire + ",1,3600,PD,9,64,0,0,host-bad,,0,,,,0\n" +
+		"2001:db8:cafe::,00:01:00:0a,3600," + expire + ",1,3600,2,10,60,0,0,host-good,,0,,,,0\n"
+	if err := os.WriteFile(memfile, []byte(csv), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	m := New()
+	m.SetLeaseSyncSeamsForTesting(nil, "", filepath.Join(dir, "missing.sock"), "", memfile)
+
+	leases, err := m.GetSyncLeases6(context.Background(), now)
+	if err != nil {
+		t.Fatalf("GetSyncLeases6 (fallback): %v", err)
+	}
+	if len(leases) != 1 {
+		t.Fatalf("expected 1 lease (malformed-type row skipped), got %d: %+v", len(leases), leases)
+	}
+	if leases[0].Address != "2001:db8:cafe::" {
+		t.Errorf("surviving lease = %q, want the valid IA_PD row", leases[0].Address)
+	}
+	if leases[0].LeaseType != "IA_PD" || leases[0].PrefixLen != 60 {
+		t.Errorf("surviving IA_PD lease wrong: %+v", leases[0])
+	}
+}
+
 // Test (b): seed re-anchors Remaining to the LOCAL clock — a skewed peer "now"
 // must NOT influence the seeded expiry (clock-skew immunity).
 func TestSeedSyncLeases4_ClockSkewImmune(t *testing.T) {
