@@ -2576,8 +2576,10 @@ fn scan_sweep_state_bounded_and_records_pressure() {
     let mut state = make_state("trust", profile);
 
     assert_eq!(state.scan_sweep_skipped_pressure(), 0);
+    assert_eq!(state.scan_sweep_evicted_pressure(), 0);
+    let cap = super::scan::max_sources_per_zone_for_test();
     // Far more distinct sources than the per-zone cap.
-    for i in 0..(super::scan::max_sources_per_zone_for_test() + 200) {
+    for i in 0..(cap + 200) {
         let src = IpAddr::V4(Ipv4Addr::from(0x0a00_0000u32 + i as u32));
         let dst = IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1));
         let pkt = tcp_pkt(src, dst, 1234, 80, TCP_SYN);
@@ -2587,11 +2589,103 @@ fn scan_sweep_state_bounded_and_records_pressure() {
             None
         );
     }
+    // #2234: over-cap sources are now ADMITTED by bounded stalest-eviction
+    // (the table stays bounded but a fresh source is no longer silently
+    // dropped on a full table), recorded as eviction pressure — NOT skip
+    // pressure. The single-zone flood never falls back to skip.
     assert!(
-        state.scan_sweep_skipped_pressure() >= 200,
-        "over-cap sources must record pressure, got {}",
-        state.scan_sweep_skipped_pressure()
+        state.scan_sweep_evicted_pressure() >= 200,
+        "over-cap sources must record eviction pressure, got {}",
+        state.scan_sweep_evicted_pressure()
     );
+    assert_eq!(
+        state.scan_sweep_skipped_pressure(),
+        0,
+        "a single-zone source flood must evict, never skip"
+    );
+}
+
+/// #2234 fail-on-revert at the production `ScreenState` new-flow hook: a
+/// genuine port-scanner arriving AFTER a high-cardinality spoofed flood has
+/// saturated the per-zone source table must STILL be tracked and dropped.
+/// Pre-#2234 the new source was skipped on a full table (returns None
+/// forever), so the spoofed flood suppressed detection of the real scanner —
+/// a detection-DoS. Reverting the bounded stalest-eviction breaks this test.
+#[test]
+fn fresh_scanner_detected_after_source_flood_at_screen_state() {
+    let mut profile = ScreenProfile::default();
+    profile.port_scan_threshold = 5; // low: a real scan trips quickly
+    let mut state = make_state("trust", profile);
+    let cap = super::scan::max_sources_per_zone_for_test();
+
+    // Saturate the trust zone with a spoofed-source flood (one SYN each, so
+    // none individually trips the port-scan threshold).
+    let flood_now = 1_000u64;
+    let dst = IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1));
+    for i in 0..cap {
+        let src = IpAddr::V4(Ipv4Addr::from(0x0a00_0000u32 + i as u32));
+        let pkt = tcp_pkt(src, dst, 1234, 80, TCP_SYN);
+        assert_eq!(
+            state.scan_sweep_drop_on_new_flow("trust", ZID, &pkt, flood_now),
+            None
+        );
+    }
+
+    // A real scanner shows up afterward, hitting many ports on one target.
+    let scanner = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 9));
+    let target = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 10));
+    let mut fired = false;
+    for port in 1000u16..1010 {
+        let pkt = tcp_pkt(scanner, target, 1234, port, TCP_SYN);
+        if state.scan_sweep_drop_on_new_flow("trust", ZID, &pkt, flood_now + 1) == Some("port-scan")
+        {
+            fired = true;
+            break;
+        }
+    }
+    assert!(
+        fired,
+        "a real port-scanner arriving after a saturating flood MUST be \
+         detected (pre-#2234 it was skipped on the full table → never \
+         detected)"
+    );
+    assert!(
+        state.scan_sweep_evicted_pressure() >= 1,
+        "tracking the scanner required at least one eviction"
+    );
+}
+
+/// #2234: the `scan-table-pressure` operator alarm transition fires at a
+/// rare logarithmic rate under a sustained source flood — never per flow.
+#[test]
+fn scan_table_pressure_event_fires_rarely_under_flood() {
+    let mut profile = ScreenProfile::default();
+    profile.ip_sweep_threshold = 1_000_000; // never trips by detection
+    let mut state = make_state("trust", profile);
+    let cap = super::scan::max_sources_per_zone_for_test();
+
+    // No evictions yet → no pressure-event transition.
+    assert!(!state.take_scan_table_pressure_event());
+
+    // Saturate, then churn many fresh sources to force sustained eviction.
+    let dst = IpAddr::V4(Ipv4Addr::new(172, 16, 0, 1));
+    let mut events = 0u32;
+    for i in 0..(cap + 2_000) {
+        let src = IpAddr::V4(Ipv4Addr::from(0x0a00_0000u32 + i as u32));
+        let pkt = tcp_pkt(src, dst, 1234, 80, TCP_SYN);
+        let _ = state.scan_sweep_drop_on_new_flow("trust", ZID, &pkt, 100);
+        if state.take_scan_table_pressure_event() {
+            events += 1;
+        }
+    }
+    // ~2000 evictions → log2(2000) ≈ 11 events, far fewer than the flood
+    // size: the alarm is logarithmic, not per-flow.
+    assert!(
+        events >= 1 && events <= 20,
+        "pressure-event must be rare/logarithmic, got {events} over {} flows",
+        cap + 2_000
+    );
+    assert!(state.scan_sweep_evicted_pressure() >= 2_000);
 }
 
 /// #2227 MAJOR-1 fail-on-revert (at the production `ScreenState` hook): an
