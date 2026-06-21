@@ -1,5 +1,35 @@
 # Action Log
 
+## 2026-06-20 — #2118 policy hit-count display-gate consistency
+
+- **Timestamp**: 2026-06-20
+- **Action**: Diagnosed #2118 ("show security policies hit-count reads 0").
+  The increment→snapshot→wire→read→display chain is intact end-to-end and
+  Go-unit-tested (verified by static reading + an independent second-pass
+  agent). The observed all-0 was (a) deny rows correctly 0 — the loss
+  cluster has only explicit permit rules + default-policy deny-all, so
+  blocked traffic rode the implicit default-deny (aggregate counter, not
+  per-rule); (b) the smoke ran with `policy-stats` OFF; and (c) the genuine
+  bug: #2008 M4 gated ONLY the Prometheus collector on
+  `cfg.Security.PolicyStatsEnabled`, leaving the gRPC text/CLI/structured
+  display surfaces reading counters unconditionally — so the four surfaces
+  disagreed. Fix: gate all four surfaces on the same knob (display-only;
+  Rust increment stays always-on, no wire change). Added Go gate tests
+  (gRPC text hit-count + detail, structured GetPolicies, local CLI),
+  a `policies-hit-count` golden topic, and a Rust test proving explicit
+  permit AND explicit deny rules attribute per-rule hits while the implicit
+  default-deny does not. Flagged (not changed) the Junos divergence: xpf
+  preserves per-policy counts across recompile (Junos resets on commit).
+- **File(s)**: pkg/grpcapi/server_show_policies_text.go,
+  pkg/cli/cli_show_security.go, pkg/grpcapi/server_show_zones.go,
+  pkg/grpcapi/server_show_zones_test.go,
+  pkg/grpcapi/server_show_policies_hitcount_gate_test.go,
+  pkg/cli/cli_show_policies_hitcount_gate_test.go,
+  pkg/grpcapi/server_show_golden_test.go,
+  pkg/grpcapi/testdata/server_show_golden.json,
+  userspace-dp/src/policy_tests.rs, docs/feature-gaps.md,
+  docs/pr/2118-policy-hit-count/plan.md
+
 ## 2026-06-20 — #2079 nat pool-utilization-alarm lenient-disable runtime parity
 
 - **Timestamp**: 2026-06-20
