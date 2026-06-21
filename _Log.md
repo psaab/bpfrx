@@ -1,5 +1,33 @@
 # Action Log
 
+## 2026-06-21 — #2243 PR #2254 review fixes: Kea MAC canonicalization + lenient validator gate
+
+- **Timestamp**: 2026-06-21
+- **Action**: Two PR #2254 review MINORs on #2243 DHCP static reservations.
+  (1) MAC canonicalization (correctness): the static-binding MAC was
+  rendered VERBATIM into the Kea `hw-address` field. `ValidateMAC`/
+  `net.ParseMAC` accept the Cisco dotted-triplet form (`0011.2233.4455`)
+  and uppercase, but Kea's hw-address parser REJECTS the dotted form -> a
+  clean-committing config would break the entire Kea Dhcp4/6 reconfigure.
+  Added `canonicalMAC` (`net.ParseMAC().String()` -> `aa:bb:cc:dd:ee:ff`)
+  and normalized at BOTH the v4 and v6 reservation render sites; a binding
+  whose MAC fails to parse at render is skipped with a warning (consistent
+  with the tolerant-load skip guard). (2) Lenient-gate the validator
+  (#1960 no-brick): `validateDHCPStaticBindingsStrict` lived in the
+  always-strict `strictErrs` accumulator with no lenient gate, so the
+  tolerant `CompileConfigLenient`/`CompileConfigForNodeLenient` paths
+  HARD-REJECTED a bad binding (bricking boot) unlike all ~19 sibling
+  validators. Added `lenientDHCPStaticBindings` to compileOpts (true in
+  both lenient entry points) and MOVED the validator out of the
+  accumulator into a post-accumulator lenient-gated block mirroring
+  `validatePolicyMatchAddressesStrict`. Fail-on-revert proven for both new
+  tests (MAC verbatim -> render test fails; validator back in accumulator
+  -> lenient test fails).
+- **File(s)**: pkg/dhcpserver/dhcpserver.go,
+  pkg/dhcpserver/reservations_test.go, pkg/config/compiler.go,
+  pkg/config/dhcp_static_binding_test.go, pkg/dhcpserver/README.md,
+  docs/config-schema.md
+
 ## 2026-06-21 — #2218: per-rule SNAT/DNAT/static-NAT translation hit counters (Rust dataplane)
 
 - **Timestamp**: 2026-06-21

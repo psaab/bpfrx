@@ -321,3 +321,45 @@ func TestDHCPNoStaticBindingNoError(t *testing.T) {
 		t.Errorf("want no static bindings, got %+v", pool.StaticBindings)
 	}
 }
+
+// TestDHCPStaticBindingLenientGate is the FAIL-ON-REVERT proof for the
+// #1960 no-brick consistency fix (#2243 review): a bad static-binding (here
+// out-of-subnet) MUST hard-reject on the strict commit path (CompileConfig)
+// but only DOWNGRADE to a cfg.Warnings entry on the tolerant load / peer-sync
+// paths (CompileConfigLenient / CompileConfigForNodeLenient) — mirroring every
+// sibling fail-open validator. Pre-fix the validator lived in the always-strict
+// strictErrs accumulator with no lenient gate, so the tolerant paths
+// hard-rejected an already-persisted bad binding and BRICKED boot; this test
+// fails on revert (CompileConfigLenient would return a non-nil error).
+func TestDHCPStaticBindingLenientGate(t *testing.T) {
+	makeBadTree := func() *ConfigTree {
+		return buildV4StaticBindingTree(t,
+			"set system services dhcp-local-server group lan pool office static-binding 00:11:22:33:44:55 fixed-address 10.0.2.50",
+		)
+	}
+
+	// Strict commit path: hard-reject.
+	if _, err := CompileConfig(makeBadTree()); err == nil ||
+		!strings.Contains(err.Error(), "outside the pool subnet") {
+		t.Fatalf("CompileConfig: want out-of-subnet hard rejection, got %v", err)
+	}
+
+	// Tolerant load path: warn, no error, no brick.
+	cfg, err := CompileConfigLenient(makeBadTree())
+	if err != nil {
+		t.Fatalf("CompileConfigLenient: want no error (downgrade to warning), got %v", err)
+	}
+	if !hasWarningContaining(cfg.Warnings, "DHCP static binding (downgraded to warning on tolerant path)") {
+		t.Fatalf("CompileConfigLenient: want a DHCP-static-binding downgrade warning, got %+v", cfg.Warnings)
+	}
+
+	// Node-aware tolerant path (Store.SyncApply / peer-interface display):
+	// same downgrade.
+	cfgN, errN := CompileConfigForNodeLenient(makeBadTree(), 0)
+	if errN != nil {
+		t.Fatalf("CompileConfigForNodeLenient: want no error (downgrade to warning), got %v", errN)
+	}
+	if !hasWarningContaining(cfgN.Warnings, "DHCP static binding (downgraded to warning on tolerant path)") {
+		t.Fatalf("CompileConfigForNodeLenient: want a DHCP-static-binding downgrade warning, got %+v", cfgN.Warnings)
+	}
+}

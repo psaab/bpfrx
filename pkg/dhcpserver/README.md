@@ -78,16 +78,32 @@ subtree with an IPv6 `fixed-address`.)
   `host-name`. Compile is the `static-binding` case in
   `compileDHCPLocalServer` (`pkg/config/compiler_services.go`), handling
   both AST shapes via `namedInstances`.
-- **Commit validation:** `validateDHCPStaticBindingsStrict`
-  (`pkg/config/compiler_validate_strict.go`, in the commit-check strict
-  accumulator) rejects a missing/malformed fixed-address, a
-  family-mismatched literal, an address outside the pool subnet (Kea
-  would silently drop it), and a duplicate MAC identity or duplicate
-  fixed-address within the same pool.
+- **Commit validation (strict/lenient split):**
+  `validateDHCPStaticBindingsStrict`
+  (`pkg/config/compiler_validate_strict.go`) rejects a missing/malformed
+  fixed-address, a family-mismatched literal, an address outside the pool
+  subnet (Kea would silently drop it), and a duplicate MAC identity or
+  duplicate fixed-address within the same pool. The strict commit /
+  commit-check path (`CompileConfig`) hard-rejects; the tolerant load /
+  peer-sync paths (`CompileConfigLenient` / `CompileConfigForNodeLenient`,
+  flag `lenientDHCPStaticBindings`) DOWNGRADE the violation to a
+  `cfg.Warnings` entry so an already-persisted or peer-synced config
+  carrying a bad binding still BOOTS (#1960 no-brick) — the validator runs
+  AFTER the strict accumulator (mirroring `validatePolicyMatchAddressesStrict`),
+  not inside it, so it no longer hard-rejects the whole config-load like
+  the original #2243 placement did.
 - **Kea render:** `generateKea4Config`/`generateKea6Config` emit a
   per-subnet `reservations` array — v4 `hw-address` → `ip-address`, v6
-  `hw-address` → `ip-addresses[]`, plus optional `hostname`. A pool with
-  no bindings emits no `reservations` key (`omitempty`), byte-for-byte
+  `hw-address` → `ip-addresses[]`, plus optional `hostname`. The MAC is
+  canonicalized to Kea's accepted colon-lowercase form
+  (`aa:bb:cc:dd:ee:ff`) via `canonicalMAC` (`net.ParseMAC().String()`) at
+  BOTH render sites: `ValidateMAC`/`net.ParseMAC` accept the Cisco
+  dotted-triplet (`0011.2233.4455`) and uppercase, but Kea's hw-address
+  parser REJECTS the dotted form, so a config that commits clean would
+  otherwise break the entire Kea Dhcp4/6 reconfigure. A binding whose MAC
+  fails to parse at render (not expected after commit-time validation) is
+  skipped with a warning rather than emitted malformed. A pool with no
+  bindings emits no `reservations` key (`omitempty`), byte-for-byte
   identical to pre-#2243 output.
 - **HA:** reservations derive entirely from committed config, which the
   cluster config-sync already replicates, so both nodes serve identical
