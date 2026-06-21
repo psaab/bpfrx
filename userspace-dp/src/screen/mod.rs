@@ -10,12 +10,13 @@
 //! scan/sweep or a session limit (#2210 / #2134 ACK-evasion contract).
 //!
 //! Supported checks:
-//! - Land attack (src == dst)
+//! - Land attack (src_ip == dst_ip, any L4 ports — #2215 BPF parity)
 //! - TCP SYN+FIN
 //! - TCP no-flag (null scan)
 //! - TCP FIN without ACK
 //! - WinNuke (URG to port 139)
-//! - Ping of death (oversized ICMP)
+//! - Ping of death (IPv4 fragment whose offset+total-length would
+//!   reassemble past 65535 bytes — #893/#2215 formula, any protocol)
 //! - Teardrop (overlapping fragments)
 //! - ICMP fragment
 //! - IP source route options

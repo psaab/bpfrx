@@ -1,5 +1,30 @@
 # Action Log
 
+## 2026-06-21 — #2215: screen parity — ping-of-death port + LAND widen
+
+- **Timestamp**: 2026-06-21
+- **Action**: Fixed two screen parity regressions in the userspace
+  AF_XDP dataplane (the only forwarding path post-#1373/#1476):
+  - **Sub-bug A (ping-of-death dead code)**: `check_ping_of_death`
+    was an ICMP-only `pkt.pkt_len as u32 > 65535` predicate —
+    structurally unsatisfiable because `pkt_len` is a `u16`, so
+    fragment-based ping-of-death went entirely undetected. Ported the
+    authoritative #893 BPF formula: for any IPv4 fragment,
+    `((ip_frag_off & 0x1FFF) << 3) + ip_total_len > 65535 -> drop`
+    (any protocol, fragments only).
+  - **Sub-bug B (LAND too narrow)**: `check_land` required
+    `src_port == dst_port` in addition to `src_ip == dst_ip`, admitting
+    same-IP different-port spoofed frames the BPF screen dropped.
+    Removed the port clause — LAND now fires on `src_ip == dst_ip`
+    alone for IPv4/IPv6, matching the BPF reference
+    (`13fa1009e^:bpf/xdp/xdp_screen.c` ~715-723).
+- **File(s)**: `userspace-dp/src/screen/stateless.rs`,
+  `userspace-dp/src/screen/tests.rs`,
+  `userspace-dp/src/screen/mod.rs`, `userspace-dp/src/FEATURES.md`
+- **Validation**: `cargo build --release` clean; 113 screen tests +
+  9 new/updated land/ping fail-on-revert tests pass; 5x flake clean;
+  reverting either production fix fails the matching new test.
+
 ## 2026-06-21 — #2209 + #2210: screen scan/sweep per-zone + bounded + count-after-lookup
 
 - **Timestamp**: 2026-06-21

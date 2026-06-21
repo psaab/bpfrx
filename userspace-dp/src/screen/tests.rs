@@ -140,11 +140,61 @@ fn land_attack_v6() {
 }
 
 #[test]
-fn land_attack_different_ports_passes() {
+fn land_attack_different_ports_drops() {
+    // #2215 fail-on-revert (sub-bug B): the LAND signature is
+    // src_ip == dst_ip ALONE, matching the authoritative BPF screen
+    // (`13fa1009e^:bpf/xdp/xdp_screen.c` ~715-723) — NO port equality.
+    // Pre-#2215 the check additionally required src_port == dst_port,
+    // so this same-IP/different-port frame PASSED. It must now DROP.
     let mut state = make_state("trust", default_profile());
     let src = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1));
-    // Same IP but different ports should pass
     let pkt = tcp_pkt(src, src, 80, 443, TCP_SYN);
+    assert_eq!(
+        state.check_packet("trust", &pkt, 1),
+        ScreenVerdict::Drop("land-attack")
+    );
+}
+
+#[test]
+fn land_attack_v6_different_ports_drops() {
+    // #2215 (sub-bug B): the BPF reference drops src==dst for IPv6 too,
+    // unconditionally. Different ports must still DROP.
+    let mut state = make_state("trust", default_profile());
+    let src = IpAddr::V6("2001:db8::1".parse::<Ipv6Addr>().unwrap());
+    let pkt = tcp_pkt(src, src, 80, 443, TCP_SYN);
+    assert_eq!(
+        state.check_packet("trust", &pkt, 1),
+        ScreenVerdict::Drop("land-attack")
+    );
+}
+
+#[test]
+fn land_attack_udp_different_ports_drops() {
+    // #2215 (sub-bug B): the LAND/anti-spoofing invariant is not
+    // TCP-specific. A UDP frame whose source IP equals its destination
+    // IP (different ports) must DROP. Pre-#2215 it passed.
+    let mut profile = default_profile();
+    // Keep the rate-based screens disabled so only LAND can fire.
+    profile.udp_flood_threshold = 0;
+    let mut state = make_state("trust", profile);
+    let src = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1));
+    let mut pkt = udp_pkt(src, src);
+    pkt.src_port = 5000;
+    pkt.dst_port = 5001;
+    assert_eq!(
+        state.check_packet("trust", &pkt, 1),
+        ScreenVerdict::Drop("land-attack")
+    );
+}
+
+#[test]
+fn land_attack_distinct_ips_passes() {
+    // Control: a normal frame whose source != destination must NOT be
+    // flagged as a LAND attack regardless of ports.
+    let mut state = make_state("trust", default_profile());
+    let src = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1));
+    let dst = IpAddr::V4(Ipv4Addr::new(10, 0, 2, 1));
+    let pkt = tcp_pkt(src, dst, 80, 80, TCP_SYN);
     assert_eq!(state.check_packet("trust", &pkt, 1), ScreenVerdict::Pass);
 }
 
@@ -315,21 +365,125 @@ fn winnuke_disabled_passes() {
 // Ping of Death
 // ================================================================
 
+/// Build an IPv4 fragment with the given fragment-offset (in 8-byte
+/// units, i.e. the raw 13-bit offset field) and IP total length.
+/// `more_fragments` controls the MF bit. Used by the #2215
+/// ping-of-death and teardrop regression tests.
+fn ipv4_fragment(
+    src: IpAddr,
+    dst: IpAddr,
+    protocol: u8,
+    frag_units: u16,
+    more_fragments: bool,
+    ip_total_len: u16,
+) -> ScreenPacketInfo {
+    let mut frag_off = frag_units & 0x1FFF;
+    if more_fragments {
+        frag_off |= 0x2000;
+    }
+    let is_first = more_fragments && (frag_units & 0x1FFF) == 0;
+    ScreenPacketInfo {
+        addr_family: libc::AF_INET as u8,
+        protocol,
+        tcp_flags: 0,
+        src_ip: src,
+        dst_ip: dst,
+        src_port: 0,
+        dst_port: 0,
+        tcp_seq: 0,
+        tcp_ack: 0,
+        tcp_mss: 0,
+        pkt_len: ip_total_len,
+        is_fragment: (frag_off & 0x3FFF) != 0,
+        is_first_fragment: is_first,
+        ip_ihl: 5,
+        ip_frag_off: frag_off,
+        ip_total_len,
+    }
+}
+
 #[test]
-fn ping_of_death_drops() {
+fn ping_of_death_oversized_fragment_drops() {
+    // #2215 fail-on-revert (sub-bug A): the classic ping-of-death is a
+    // fragment whose reassembled contribution exceeds the 65535-byte IP
+    // length limit. The dataplane does not reassemble, so it is detected
+    // per-fragment: offset_bytes = (frag_off & 0x1FFF) << 3; if
+    // offset_bytes + ip_total_len > 65535 -> drop (BPF #893 formula).
+    //
+    // Last fragment at offset 8191 units = 65528 bytes carrying a 60-byte
+    // IP datagram: 65528 + 60 = 65588 > 65535 -> ping-of-death. Pre-#2215
+    // the check was ICMP-only dead code (`pkt_len as u32 > 65535`,
+    // unsatisfiable for a u16) so this PASSED.
     let mut state = make_state("trust", default_profile());
-    // pkt_len stored as u16, so max is 65535; ping-of-death only triggers
-    // for pkt_len > 65535 which can't fit in u16. The BPF code uses
-    // meta->pkt_len which is also u16 but checks > 65535 via u32 promotion.
-    // In practice with u16 pkt_len this check won't trigger, but we still
-    // implement the logic for correctness. With u32 pkt_len it would work.
-    // Test with u16 max — this should pass since 65535 is not > 65535.
+    let pkt = ipv4_fragment(
+        IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1)),
+        IpAddr::V4(Ipv4Addr::new(10, 0, 2, 1)),
+        PROTO_ICMP,
+        8191, // 8191 * 8 = 65528 bytes
+        false,
+        60,
+    );
+    assert_eq!(
+        state.check_packet("trust", &pkt, 1),
+        ScreenVerdict::Drop("ping-of-death")
+    );
+}
+
+#[test]
+fn ping_of_death_oversized_fragment_any_proto_drops() {
+    // #2215 (sub-bug A): the BPF reference fires for ANY IPv4 protocol,
+    // not just ICMP. A UDP fragment that overflows the reassembly limit
+    // must DROP. (Disable the UDP-flood screen so only ping-of-death can
+    // fire.)
+    let mut profile = default_profile();
+    profile.udp_flood_threshold = 0;
+    let mut state = make_state("trust", profile);
+    let pkt = ipv4_fragment(
+        IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1)),
+        IpAddr::V4(Ipv4Addr::new(10, 0, 2, 1)),
+        PROTO_UDP,
+        8190, // 8190 * 8 = 65520 bytes
+        false,
+        100, // 65520 + 100 = 65620 > 65535
+    );
+    assert_eq!(
+        state.check_packet("trust", &pkt, 1),
+        ScreenVerdict::Drop("ping-of-death")
+    );
+}
+
+#[test]
+fn ping_of_death_in_bounds_fragment_passes() {
+    // Control: a fragment whose offset + total length stays within the
+    // 65535-byte limit must NOT be flagged as ping-of-death. Use a UDP
+    // fragment (with the udp-flood screen disabled) so neither the
+    // icmp-fragment nor teardrop screens can mask the ping-of-death
+    // outcome; payload (1500-20=1480) is well above the 8-byte teardrop
+    // floor regardless.
+    let mut profile = default_profile();
+    profile.udp_flood_threshold = 0;
+    let mut state = make_state("trust", profile);
+    let pkt = ipv4_fragment(
+        IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1)),
+        IpAddr::V4(Ipv4Addr::new(10, 0, 2, 1)),
+        PROTO_UDP,
+        100,   // 100 * 8 = 800 bytes
+        false, // not the last fragment is irrelevant; a mid-chain fragment
+        1500,  // 800 + 1500 = 2300 <= 65535
+    );
+    assert_eq!(state.check_packet("trust", &pkt, 1), ScreenVerdict::Pass);
+}
+
+#[test]
+fn ping_of_death_non_fragment_passes() {
+    // Control: a normal (unfragmented) ICMP echo must NOT be flagged —
+    // the check only applies to fragments.
+    let mut state = make_state("trust", default_profile());
     let pkt = icmp_pkt(
         IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1)),
         IpAddr::V4(Ipv4Addr::new(10, 0, 2, 1)),
-        65535,
+        84,
     );
-    // 65535 is not > 65535, so it passes
     assert_eq!(state.check_packet("trust", &pkt, 1), ScreenVerdict::Pass);
 }
 
