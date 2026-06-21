@@ -131,7 +131,13 @@ func TestUserspacePortSpecRepresentableMirrorsRust(t *testing.T) {
 			t.Errorf("userspacePortSpecRepresentable(%q) = false, want true", s)
 		}
 	}
-	bad := []string{"0", "65536", "99999", "5-1", "0-10", "abc", "80-", "-80", "80-abc"}
+	// Aliases are CASE-SENSITIVE to mirror Rust parse_port_spec exactly: the
+	// uppercase forms are NOT recognized by Rust (it would drop the term), so
+	// the gate must reject them here too rather than accept-then-mismatch.
+	bad := []string{
+		"0", "65536", "99999", "5-1", "0-10", "abc", "80-", "-80", "80-abc",
+		"HTTP", "Https", "DNS",
+	}
 	for _, s := range bad {
 		if userspacePortSpecRepresentable(s) {
 			t.Errorf("userspacePortSpecRepresentable(%q) = true, want false", s)
