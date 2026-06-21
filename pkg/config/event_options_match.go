@@ -18,6 +18,30 @@ import (
 
 const eventAttributesMatchSep = " matches "
 
+// EventAttributesKnownFields is the single source of truth for the
+// attributes-match field names the runtime matcher can resolve against an
+// rpm.Event. The commit-time strict validator
+// (ValidateEventAttributesMatchStrict) and the runtime matcher
+// (pkg/eventengine attributesMatch switch) both consume this set so they
+// cannot drift on what counts as a known field (#2141). A field reference
+// outside this set is a typo that, left unchecked, would silently broaden
+// the policy (fail-open) — the dangerous direction per the #2124 doctrine.
+//
+// Keep this in sync with the runtime switch in pkg/eventengine; a drift
+// guard test (TestEventAttributesKnownFields_MatchesRuntimeSwitch) asserts
+// the two are identical.
+var EventAttributesKnownFields = map[string]struct{}{
+	"test-owner": {},
+	"test-name":  {},
+}
+
+// EventAttributesFieldKnown reports whether field is a recognized
+// attributes-match field name.
+func EventAttributesFieldKnown(field string) bool {
+	_, ok := EventAttributesKnownFields[field]
+	return ok
+}
+
 // ParseEventAttributesMatch splits a raw attributes-match line of the form
 // "<event>.<field> matches <pattern>" into its field name and regex pattern.
 // It returns ok=false when the line is not a well-formed match expression
@@ -67,6 +91,54 @@ func ValidateEventAttributesMatch(cfg *Config) error {
 			pattern, ok := EventAttributesMatchPattern(attr)
 			if !ok {
 				continue
+			}
+			if _, err := regexp.Compile(pattern); err != nil {
+				return fmt.Errorf(
+					"event-options policy %q attributes-match %q: invalid regex pattern %q: %w",
+					pol.Name, attr, pattern, err)
+			}
+		}
+	}
+	return nil
+}
+
+// ValidateEventAttributesMatchStrict is the COMMIT-path validator for
+// event-options attributes-match lines (#2141). In addition to the
+// invalid-regex check ValidateEventAttributesMatch performs, it rejects:
+//
+//   - a malformed line that does not parse into "<event>.<field> matches
+//     <pattern>" (no " matches " separator, or no "." in the left-hand
+//     field spec). The lenient/runtime code previously skipped such a line,
+//     silently DROPPING the constraint and broadening the policy.
+//   - a <field> name not in EventAttributesKnownFields (a typo such as
+//     "test-ower"). An unknown field can never be satisfied against an
+//     rpm.Event, so the matcher dropped it and broadened the policy.
+//
+// Both are fail-open anti-patterns: a dropped constraint turns targeted
+// remediation into broad config mutation while commit succeeds. Per the
+// #2124 doctrine (and mirroring #2008 M7 / #1960 lenient-load), the strict
+// commit path REJECTS these; the tolerant LOAD/peer-sync path downgrades
+// the same error to a warning (see compiler.go's lenientEventAttributesMatch
+// gate) so an upgrading node still boots through a config persisted by an
+// older binary.
+func ValidateEventAttributesMatchStrict(cfg *Config) error {
+	for _, pol := range cfg.EventOptions {
+		if pol == nil {
+			continue
+		}
+		for _, attr := range pol.AttributesMatch {
+			field, pattern, ok := ParseEventAttributesMatch(attr)
+			if !ok {
+				return fmt.Errorf(
+					"event-options policy %q attributes-match %q: malformed match "+
+						"expression (expected \"<event>.<field> matches <pattern>\")",
+					pol.Name, attr)
+			}
+			if !EventAttributesFieldKnown(field) {
+				return fmt.Errorf(
+					"event-options policy %q attributes-match %q: unknown field %q "+
+						"(known fields: test-owner, test-name)",
+					pol.Name, attr, field)
 			}
 			if _, err := regexp.Compile(pattern); err != nil {
 				return fmt.Errorf(
