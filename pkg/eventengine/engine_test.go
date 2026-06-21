@@ -85,14 +85,54 @@ func TestAttributesMatch_TestNameField(t *testing.T) {
 	}
 }
 
-// An unknown field is ignored (the constraint does not block the match) —
-// preserves the prior default:continue behavior.
-func TestAttributesMatch_UnknownFieldIgnored(t *testing.T) {
+// #2141 FAIL-CLOSED: an unknown field (which can only reach the runtime on a
+// legacy lenient-load path, since strict commit now rejects it) makes the
+// policy NOT fire, rather than being silently dropped and broadening the
+// policy. This is the behavior change vs the old default:continue fail-open.
+func TestAttributesMatch_UnknownFieldFailsClosed(t *testing.T) {
 	pol := policyWithMatch("p", "ping_test_failed",
 		"ping_test_failed.nonexistent matches whatever")
 	e := newTestEngine(t, []*config.EventPolicy{pol})
-	if !e.attributesMatch(pol, rpm.Event{Name: "ping_test_failed", TestOwner: "x"}) {
-		t.Error("unknown attribute field should be ignored, leaving the match true")
+	if e.attributesMatch(pol, rpm.Event{Name: "ping_test_failed", TestOwner: "x"}) {
+		t.Error("unknown attribute field should fail closed (policy does not match)")
+	}
+	if got := e.Stats().AttributesInvalid; got == 0 {
+		t.Error("AttributesInvalid counter should bump on an unknown field")
+	}
+}
+
+// #2141 FAIL-CLOSED: a malformed line (no " matches ") that slipped through a
+// lenient load also fails closed.
+func TestAttributesMatch_MalformedLineFailsClosed(t *testing.T) {
+	pol := policyWithMatch("p", "ping_test_failed", "garbage with no separator")
+	e := newTestEngine(t, []*config.EventPolicy{pol})
+	if e.attributesMatch(pol, rpm.Event{Name: "ping_test_failed", TestOwner: "x"}) {
+		t.Error("malformed attributes-match line should fail closed")
+	}
+}
+
+// SSOT drift guard (#2141): the config-side known-field set and the runtime
+// matcher's switch must stay identical. Every known field must resolve in the
+// matcher (i.e. a policy matching ^anything against that field with the right
+// event value must be able to return true), and an unknown field must fail.
+func TestEventAttributesKnownFields_MatchesRuntimeSwitch(t *testing.T) {
+	// The matcher resolves test-owner and test-name; assert exactly those are
+	// the known fields. If a field is added to the SSOT, this test forces the
+	// matcher switch to be updated in lockstep.
+	want := map[string]bool{"test-owner": true, "test-name": true}
+	if len(config.EventAttributesKnownFields) != len(want) {
+		t.Fatalf("known-field set %v has unexpected size; runtime switch resolves %v",
+			config.EventAttributesKnownFields, want)
+	}
+	for f := range want {
+		if !config.EventAttributesFieldKnown(f) {
+			t.Errorf("field %q is resolved by the matcher but missing from the SSOT", f)
+		}
+	}
+	for f := range config.EventAttributesKnownFields {
+		if !want[f] {
+			t.Errorf("field %q is in the SSOT but the runtime matcher switch does not resolve it", f)
+		}
 	}
 }
 

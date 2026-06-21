@@ -115,6 +115,26 @@ func (c *xpfCollector) collectSystemMetrics(ch chan<- prometheus.Metric) {
 			prometheus.GaugeValue, float64(unresolved))
 	}
 
+	// #2157: event-options remediation action observability. Makes the
+	// previously-silent loss (drop on held config lock) visible.
+	if c.srv.eventActionStatsFn != nil {
+		st := c.srv.eventActionStatsFn()
+		ch <- prometheus.MustNewConstMetric(c.eventActionsCommitted,
+			prometheus.CounterValue, float64(st.Committed))
+		ch <- prometheus.MustNewConstMetric(c.eventActionsRejected,
+			prometheus.CounterValue, float64(st.Rejected))
+		ch <- prometheus.MustNewConstMetric(c.eventActionsRetried,
+			prometheus.CounterValue, float64(st.Retried))
+		ch <- prometheus.MustNewConstMetric(c.eventActionsDropped,
+			prometheus.CounterValue, float64(st.DroppedLockHeld), "lock_held")
+		ch <- prometheus.MustNewConstMetric(c.eventActionsDropped,
+			prometheus.CounterValue, float64(st.DroppedQueueFull), "queue_full")
+		ch <- prometheus.MustNewConstMetric(c.eventAttributesInvalid,
+			prometheus.CounterValue, float64(st.AttributesInvalid))
+		ch <- prometheus.MustNewConstMetric(c.eventActionQueueDepth,
+			prometheus.GaugeValue, float64(st.QueueDepth))
+	}
+
 	// #1895: currently-failed RPM probe-pin installs. Nonzero means
 	// next-hop-pinned tests are holding state (their uplinks are not
 	// being health-checked) until a pin retry succeeds.

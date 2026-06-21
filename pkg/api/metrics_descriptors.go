@@ -304,6 +304,56 @@ func newCollector(srv *Server) *xpfCollector {
 				"health-checked (#1895).",
 			nil, nil,
 		),
+		eventActionsCommitted: prometheus.NewDesc(
+			"xpf_event_actions_committed_total",
+			"Total event-options change-configuration remediation actions "+
+				"that committed successfully (#2157).",
+			nil, nil,
+		),
+		eventActionsRejected: prometheus.NewDesc(
+			"xpf_event_actions_rejected_total",
+			"Total event-options remediation actions rejected as a "+
+				"permanent failure — a malformed/unknown command, a "+
+				"candidate apply error, or a commit-check failure. The "+
+				"batch is transactional (#2139): a rejected action applies "+
+				"NOTHING (the candidate is discarded).",
+			nil, nil,
+		),
+		eventActionsRetried: prometheus.NewDesc(
+			"xpf_event_actions_retried_total",
+			"Total retry attempts for event-options remediation actions "+
+				"deferred because the config lock was held by another "+
+				"session (#2157). The action is retried with bounded "+
+				"backoff rather than dropped.",
+			nil, nil,
+		),
+		eventActionsDropped: prometheus.NewDesc(
+			"xpf_event_actions_dropped_total",
+			"Total event-options remediation actions dropped (NOT applied). "+
+				"reason=lock_held: the config lock stayed held past the "+
+				"retry deadline. reason=queue_full: a newer same-policy "+
+				"action superseded this one, or the bounded action queue "+
+				"was full (#2157). A nonzero value means automated "+
+				"remediation was lost — investigate the lock holder.",
+			[]string{"reason"}, nil,
+		),
+		eventAttributesInvalid: prometheus.NewDesc(
+			"xpf_event_attributes_match_invalid_total",
+			"Total times a malformed or unknown-field attributes-match line "+
+				"was hit at runtime, causing the policy to fail CLOSED (not "+
+				"fire). Strict commit rejects these (#2141); a nonzero value "+
+				"means a config persisted by an older binary booted through a "+
+				"lenient load with a bad line — fix it on the next commit.",
+			nil, nil,
+		),
+		eventActionQueueDepth: prometheus.NewDesc(
+			"xpf_event_action_queue_depth",
+			"Current number of event-options remediation actions queued "+
+				"but not yet applied by the single action worker (#2157). "+
+				"A persistently nonzero depth means actions are backing up "+
+				"behind a held config lock.",
+			nil, nil,
+		),
 		feedSecondsSinceSuccess: prometheus.NewDesc(
 			"xpf_feed_seconds_since_last_success",
 			"Seconds since a dynamic-address feed last fetched successfully. "+

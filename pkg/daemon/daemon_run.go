@@ -1164,6 +1164,14 @@ func (d *Daemon) Run(ctx context.Context) error {
 				}
 				return nil
 			},
+			// #2157: event-options remediation action counters for the
+			// xpf_event_actions_* / xpf_event_action_queue_depth family.
+			EventActionStatsFn: func() eventengine.Stats {
+				if d.eventEngine != nil {
+					return d.eventEngine.Stats()
+				}
+				return eventengine.Stats{}
+			},
 			// #1895: currently-failed RPM probe-pin installs (tests
 			// holding state on ErrProbeSetup instead of probing the
 			// default path).
@@ -1506,6 +1514,12 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// Clean up RPM probes.
 	if d.rpm != nil {
 		d.rpm.StopAll()
+	}
+
+	// Stop the event-options action worker (after RPM so no events arrive
+	// during teardown). Close drains in-flight lock-retry backoffs (#2157).
+	if d.eventEngine != nil {
+		d.eventEngine.Close()
 	}
 
 	// Stop the ip-monitoring engine (after RPM so no transitions
