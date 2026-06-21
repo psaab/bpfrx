@@ -1,7 +1,7 @@
 # bpfrx Pull Request History
 
 Complete record of all pull requests.
-Total: 824 PRs (787 merged)
+Total: 1133 PRs (1090 merged)
 
 ---
 
@@ -27155,7 +27155,7 @@ Plan doc: `docs/pr/1598-cos-uncapped-fix/plan.md`.
 
 ---
 
-## PR #1601 — daemon: harden legacyDP canary against struct-field + selector + ident reintroduction (#1559) [OPEN]
+## PR #1601 — daemon: harden legacyDP canary against struct-field + selector + ident reintroduction (#1559) [MERGED] (merged 2026-05-27)
 
 Branch: `hardening/1559-canary-harden`
 
@@ -27260,7 +27260,7 @@ Three rounds of plan-review with Codex + Antigravity (AGY).
 
 ---
 
-## PR #1603 — #1565: pkg/api: translate Junos config names before net.InterfaceByName [OPEN]
+## PR #1603 — #1565: pkg/api: translate Junos config names before net.InterfaceByName [MERGED] (merged 2026-05-27)
 
 Branch: `fix/1565-iface-name-translate`
 
@@ -27320,7 +27320,7 @@ Reviewer task IDs (in plan-evolution order): `task-mpnhxusx-4yz6hb`, `review-mpn
 
 ---
 
-## PR #1604 — #1431: codify cache-key invariants for future per-packet match fields [OPEN]
+## PR #1604 — #1431: codify cache-key invariants for future per-packet match fields [MERGED] (merged 2026-05-27)
 
 Branch: `refactor/1431-filter-cache-invariants`
 
@@ -27376,6 +27376,15245 @@ Reviewer task ids: `docs/pr/1431-filter-cache-invariants/reviewer-ids.md`
   `PerPacketMatchField` trait + fake-field harness as compile-time
 
 *(truncated — 78 lines total)*
+
+
+---
+
+## PR #1610 — dataplane: wire-protocol address-book dedup (#1606) [MERGED] (merged 2026-05-28)
+
+Branch: `refactor/1606-wire-protocol-address-book`
+
+## Summary
+
+Restructure the JSON snapshot wire surface between Go xpfd and Rust userspace-dp so address-book contents live in a top-level dedup table keyed by content-hash u32 IDs, and policy rules cite books by ID instead of inlining fully-expanded CIDR strings. Foundational prerequisite for the 1M-policy JIT umbrella (#1605) — per-rule prefix-set duplication is now structurally bounded by book_count, not by rule_count.
+
+Closes #1606.
+
+## Wire surface
+
+Additive on JSON protocol version 3 (NOT a version bump; serde defaults + omitempty handle missing fields, so old Go and old Rust binaries can roll forward/back freely):
+
+- `ConfigSnapshot.address_books: Vec<AddressBookSnapshot>` (top-level).
+- `PolicyRuleSnapshot.source_book_ids` / `destination_book_ids` (`Vec<u32>`).
+- `PolicyRuleSnapshot.source_literals` / `destination_literals` (`Vec<String>` for free-form CIDRs operator wrote inline).
+- Legacy `source_addresses` / `destination_addresses` stays as back-compat for old-Rust readers.
+
+## Key design points
+
+**Content-hash interning (Go side, HA-deterministic)**: book names iterated in lex sorted order before any hashing; canonical hash input has explicit V4/V6 family + count framing; buckets sorted by (hash64, canonical_bytes) for deterministic collision recovery; multiple book names with identical content share ONE row + ONE ID (diag name is lex smallest); "any" in book values normalized to (0.0.0.0/0, ::/0) at build time.
+
+**Flat-index runtime (Rust side, Arc-free)**: `PolicyState` owns `Vec<BookEntry>`; rules carry `SmallVec<[u32; 8]>` dense indices. Worker pins `Arc<ForwardingState>` per tick via existing `load_arc_if_changed`. Hot path: `state.books[idx as usize].v4.contains(src)` — zero Arc deref, precomputed `match_any` flags short-circuit the common case.
+
+**New `PrefixSetV4::MatchNone` variant** breaks the legacy `from_prefixes(empty) → MatchAny` convention for v3-shaped rules. New constructor `from_v3_literals` returns `MatchNone` on empty input. Closes Codex-found fail-open paths: book-only rule, family-incomplete book.
+
+**Per-rule v3-shaped predicate**: rule is v3-shaped on a side iff `source_book_ids` OR `source_literals` is non-empty. v3-shaped sides use `from_v3_literals`; non-v3-shaped sides fall through to `source_addresses` via the legacy `from_prefixes`. Eliminates fail-open via empty=MatchAny.
+
+**Fallible snapshot apply**: `parse_policy_state_with_counters` returns `Result<PolicyState, SnapshotIntegrityError>`. Hard-fails on id=0, duplicate book IDs, or unknown rule book references — matches the existing version-mismatch reject pattern. Preflight builds in `Coordinator::refresh_runtime_snapshot` + `reconcile/snapshot.rs::apply` happen BEFORE any side-effect (status mutation, neighbor manager keys, policy counters). On integrity error, the previous snapshot is retained.
+
+## Plan history
+
+Plan iterated v1→v8 across seven hostile review rounds (Codex + AGY + Claude SMR). Convergent issues closed across iterations:
+- HA determinism (sort book names before hashing).
+- Shim contradiction (three-field wire surface: legacy + new book IDs + new free-form literals).
+- Version baseline (stays at 3; NOT a bump).
+- u32 dense indices (was u16 + literal-fallback in v2).
+- Content-only ID semantics (drop name from identity).
+- MatchNone variant (closes empty-PrefixSet fail-open).
+- "any" literal token (forces MatchAny on v3 side via explicit any_v4/any_v6 flags).
+- Hash framing (explicit V4/V6 + count to prevent cross-family collisions).
+- Hard-fail unknown / duplicate / zero book IDs (matches Junos compiler semantics).
+- Bucket-by-canonical-content with (hash64, canonical_bytes) sort tie-break.
+
+Plan + SMR docs live at `docs/pr/1606-wire-protocol-address-book/`.
+
+## Test plan
+
+- [x] Rust: 1453 tests pass (1443 baseline + 10 new). 5/5 flake check on new tests.
+- [x] Go: pkg/dataplane/userspace passes including 5 new tests (stability, HA-determinism across map order, content dedup, "any" normalization, classifier).
+- [x] Full Rust + Go builds clean.
+- [x] Wire fixture (`protocol_wire_v1.json`) regenerated with new additive fields.
+- [ ] Smoke matrix on `loss:xpf-userspace-fw0/1` (CoS-off and CoS-on, v4 + v6, push + reverse, 0-retrans gate).
+
+*(truncated — 59 lines total)*
+
+
+---
+
+## PR #1613 — #1607 step-1: cold-path microbench plan v2-r4 + flooder skeleton (narrowed scope) [MERGED] (merged 2026-05-27)
+
+Branch: `perf/1607-hw-ceiling-microbench`
+
+## Summary
+
+Step-1 of a 3-step sequence to land the cold-path hardware-ceiling
+microbench infrastructure called out by #1607. This narrowed-scope PR
+ships the **plan** and the **flooder Rust CLI skeleton ONLY**. Per
+AGY r4 PLAN-NEEDS-MAJOR axis 4 + AGY code-r1 axis 5 findings:
+
+- **Step-1 (this PR)**: plan v2-r4 + audit doc set + Rust flooder
+  CLI skeleton (CLI surface, arg parsing, bounded/unbounded regime,
+  xorshift PRNG primitive, 6/6 cargo tests).
+- **Step-2 (#1611)**: cold-path flooder runner body (AF_PACKET +
+  sendmmsg + xorshift PRNG; frame assembly; ARP resolution).
+- **Step-3 (#1612)**: `WorkerColdPathCounters` /
+  `WorkerColdPathAtomics` Rust types + `WorkerRuntimeStatus`
+  wire-protocol additions (Rust + Go) + Prometheus emitter +
+  Scale Target measurement table population.
+
+This PR closes #1607 only in the structural-contract sense (plan
++ CLI skeleton scope landed); the runner body half is tracked
+under #1611 and the counter-wiring + empirical-numbers half is
+tracked under #1612.
+
+## Plan-review trajectory (4 rounds, 13 reviewer dispatches)
+
+Branch took 4 rounds of adversarial review to converge. Codex was
+infra-blocked on **all five** plan-review AND code-review dispatches
+(tasks acknowledged but never registered in `/codex:status`); per
+`feedback_codex_infra_must_retry` we retried thrice and then
+accepted 3-of-4 (AGY + Claude SMR + Copilot) for the planning gate.
+
+| Round | Codex | AGY | Claude SMR | Verdict |
+|-------|-------|-----|------------|---------|
+| r1 (v1) | PLAN-KILL `task-mpoiptnt-dmw8n0` | PLAN-KILL `adversarial-review-mpoiqabw-y5s6ga` | PLAN-NEEDS-MAJOR | KILLED |
+| r2 (v2) | infra-loss | PLAN-KILL `adversarial-review-mpoklpnn-a24rwz` (4 axes + 2 hazards) | PLAN-READY-WITH-NIT (retracted) | KILLED |
+| r3 (v2-patched) | infra-loss | PLAN-NEEDS-MAJOR `adversarial-review-mpoky7be-bsku4m` (3 axes + 1 hazard) | PLAN-READY (retracted) | NEEDS-MAJOR |
+| r4 (v2-r3) | infra-loss | PLAN-NEEDS-MAJOR `adversarial-review-mpol9qlh-ivlrgr` (4 axes) | PLAN-READY (retracted) | NEEDS-MAJOR |
+| r5 (v2-r4) | not dispatched | not dispatched | PLAN-READY for narrowed scope | READY |
+| code-r1 (PR #1613) | infra-loss (5th) | CODE-NEEDS-MINOR `adversarial-review-mpomv4o9-bwph0u` | CODE-READY | READY-AFTER-DOC-FIX |
+
+All 5 v1 fatals + 4 r2 fatals + 3 r3 fatals + 4 r4 fatals
+(plus 5 hazards) materially addressed in v2-r4. AGY code-r1
+identified two doc discrepancies (now fixed in this PR). Full
+audit chain in `docs/pr/1607-hw-ceiling-microbench/`.
+
+## What ships in this step-1 PR
+
+### Plan (`docs/pr/1607-hw-ceiling-microbench/plan.md` v2-r4)
+
+- **Measurement strategy**: UDP randomized-source-port flooder
+  default (NOT iperf3). `--cohort=unbounded` default
+
+*(truncated — 138 lines total)*
+
+
+---
+
+## PR #1616 — #1611: cold-path-flooder runner body (AF_PACKET + sendmmsg + QDISC_BYPASS) [MERGED] (merged 2026-05-28)
+
+Branch: `perf/1611-flooder-runner-body`
+
+## Summary
+
+Implements the cold-path-flooder runner body deferred from
+#1607 step-1 per plan v4. The step-1 EX_OSERR (71) STUB tag
+is replaced with a production AF_PACKET SOCK_RAW + sendmmsg
+loop with PACKET_QDISC_BYPASS for sustained high-rate UDP
+floods.
+
+Closes #1611.
+
+## Plan + adversarial review
+
+Plan doc: docs/pr/1611-flooder-runner-body/plan.md (v4)
+
+- Codex r1 (task-mpovfie0-6vc58v): PLAN-KILL with 1 blocking
+  + 2 major findings; v4 addresses all three.
+- Codex r2 (task-mpovx5xk-9qztza): conditional PLAN-READY.
+- Antigravity r1 (adversarial-review-mpovrmah-4b35sc):
+  PLAN-NEEDS-MINOR (5 concrete findings, all inlined in v4).
+- Claude SMR r1 + r2 (docs/pr/1611-flooder-runner-body/claude-smr-plan-r*.md):
+  PLAN-READY at r2.
+
+Key plan-review findings inlined:
+- sendmmsg refill-from-scratch rewrite (off-by-one in v1 fixed).
+- PACKET_QDISC_BYPASS adopted as default (one-line setsockopt;
+  PACKET_TX_RING ruled overkill for a test harness by AGY r1).
+- BLOCKING smoke gate at >=2.5 Mpps (was best-effort in v2).
+- Hot-path error handling: EAGAIN / ENOBUFS silent, no log spam.
+- yield_now() backoff instead of 5ms sleep.
+- IFF_UP check before bind (ioctl SIOCGIFFLAGS).
+- #[repr(align(64))] on frame buffers.
+- src_port_base=1024 default + symmetric overflow guard on
+  src_port_base + src_port_span <= 65536.
+- RFC 6864 §4.2 atomic-datagram IPv4 ID rationale.
+
+## Test plan
+
+- [x] cargo build --release: clean
+- [x] cargo test --release: 21 passed + 1 ignored
+- [x] 5x flake check on src_port_zero_never_emitted_with_default_base: 5/5
+- [x] go test ./...: 30 packages pass
+- [x] Wire-byte invariants compile-time-asserted:
+      `const _: () = assert!(FRAME_V4_TOTAL == 64)`,
+      `IPV4_TOTAL_LEN == 50`, `UDP_LEN == 30`.
+- [x] Golden IPv4 csum vector verified: 0x2180 for the canonical
+      header used in tests.
+- [x] CLI smoke (no privileges): --help, bad iface, missing
+      --dst-mac all return exit 2 with diagnostic stderr.
+- [x] Real-traffic smoke (loss:cluster-userspace-host kernel
+      6.19.10): flooder ran for 10 s targeting 172.16.80.200,
+
+*(truncated — 97 lines total)*
+
+
+---
+
+## PR #1617 — #1615: cold-path-flooder multi-thread (2.96 Mpps gate met) [MERGED] (merged 2026-05-28)
+
+Branch: `perf/1615-flooder-multithread-virtio`
+
+## Summary
+
+Multi-threaded the `test/incus/cold-path-flooder/` binary so it can break the ~870 K pps single-thread ceiling on `loss:cluster-userspace-host` (Incus container with direct SR-IOV mlx5 VF, 11 TX queues). Adds `--threads N` (default 1, hard-cap 64), `--cpu-base K`, `--no-cpu-pin`, and `--allow-oversubscribe` CLI flags. Each worker owns its own AF_PACKET SOCK_RAW fd (RAII via `WorkerFd`), independent xorshift64 RNG seeded with golden-ratio mixing of `(base_seed, thread_id)` plus a zero-state trap fallback, and a `#[repr(align(64))]` `PaddedStats` block to prevent false sharing. CPU pinning runs inside the worker closure (`pthread_setaffinity_np(pthread_self(), ...)`) so main thread affinity is preserved.
+
+Follow-up fixes from review are included in the current PR state: `wire_msgs()` now runs inside `worker_loop` after the move chain settles, warmup traffic is excluded from final `avg_pps` via per-worker baselines, shared run deadlines are computed once in main, and worker panics surfaced by `JoinHandle::join()` are promoted into `first_fatal` so partial runs do not report success.
+
+Container env was misnamed in the issue body as "virtio + IPVLAN" — verified live, it's a direct SR-IOV mlx5 VF; multi-thread breaks the single-CPU softirq+`mlx5e_xmit` ceiling, not virtio queue depth.
+
+## Smoke gate (BLOCKING per plan-v4 §5.2)
+
+| --threads | aggregate pps | ratio | gate |
+|-----------|--------------|-------|------|
+| 1 | ~858 K | 1.000 | regression check vs #1611 baseline |
+| 2 | ~1.65 M | 1.057 | scaling sanity |
+| 4 | **~2.96 M** | **1.609** | **GATE PASS** (≥ 2.5 M, ratio ≤ 2.0) |
+| 8 | ~4.4 M | ~1.5 | headroom |
+
+Unblocks #1612 Scale Target measurement table (and therefore #1609 multi-stage policy DAG v2 plan-review).
+
+## Plan + review trail
+
+Four rounds of plan-review (Codex + AGY + Claude SMR), spanning 14 r1 findings + 7 r2 findings + 9 r3 findings + 4 r4 findings — all resolved in plan v4. Codex sandbox was deterministically infra-blocked across multiple r1 attempts; final r1 ran with embedded files. Post-fix smoke gate remains satisfied with warmup excluded from `avg_pps`.
+
+Files: `docs/pr/1615-flooder-multithread-virtio/{plan,plan-v2,plan-v3,plan-v4,claude-smr-plan-r1..r4,measurements,reviewer-ids}.md`.
+
+## Test plan
+
+- 22 existing cargo tests preserved
+- 17 new cargo tests (worker_seed zero trap, RNG disjointness, validate_threads matrix, PaddedStats layout + no false sharing, per_thread_ratio edge cases, cpu_base modulo, allowed_cpu_set sanity)
+- 39 tests total; 5/5 flake-check stable
+- BLOCKING smoke gate ≥ 2.5 Mpps at threads=4 on `loss:cluster-userspace-host` — observed **2.96 Mpps** post-fix
+- `err_eagain = 0` at all sweep rows
+- `per_thread_ratio ≤ 2.0` at all sweep rows
+
+---
+
+## PR #1618 — #1614 step-1: oversubscription-policy wire surface + commit warning + simul-load smoke harness [MERGED] (merged 2026-05-28)
+
+Branch: `refactor/1614-multi-rss-cos`
+
+## Scope (step-1 of #1614 Axis A)
+
+This PR ships the **configuration plumbing, scaffold, and tooling** for #1614's
+Axis A. The functional per-queue distribution change (the "guarantee-honour"
+behaviour that makes small classes hit their configured rate under
+oversubscription) is **step-2** at [#1625](https://github.com/psaab/xpf/issues/1625).
+
+### What ships in step-1
+
+- **A1 wire surface + scaffold**:
+  `set class-of-service interfaces <iface> unit <u>
+  oversubscription-policy guarantee-rate <fraction>` is parseable end-
+  to-end. Configuration flows from Junos → Go AST → typed config →
+  userspace snapshot → Rust runtime
+  (`CoSInterfaceConfig.oversubscription_policy`,
+  `CoSInterfaceConfig.oversubscription_guarantee_fraction`).
+  The new `select_exact_cos_guarantee_queue_waterfill` selector is
+  wired (Phase-1/Phase-2 two-phase byte-budget scaffold) and gated
+  on `policy == GuaranteeRate AND fraction > 0`. Default
+  `proportional` mode falls through to the legacy selector
+  bit-for-bit unchanged.
+
+  Important: this PR's selector bounds **total Phase-1 byte budget**
+  but does NOT yet enforce **per-queue per-epoch rate caps**. Live
+  smoke at `guarantee-rate 0.7` produces ~equivalent distribution
+  to baseline (~21%/class) because every queue gets visited within
+  the 1.8 MB Phase-1 budget before exhaustion. The per-queue
+  epoch-cap mechanism that produces the documented Junos-style
+  "small classes hit their configured rate first" distribution is
+  **step-2** at #1625. See `docs/pr/1614-multi-rss-cos/smoke-finding.md`
+  for the smoke evidence + root-cause analysis.
+
+- **A2 wire surface only**:
+  `set class-of-service interfaces <iface> unit <u> priority-low-min-share <bps>`
+  parsed + plumbed end-to-end. The per-pass `cap_eff` subtraction
+  in the selector is deferred (no hot-path effect today). Comments
+  on `priority_low_min_share_bytes` /
+  `priority_low_reserved_tokens` / `priority_low_last_refill_ns`
+  are labeled "WIRE SURFACE ONLY in PR #1618".
+
+- **A3 wire surface only**:
+  `set class-of-service schedulers <name> codel-target <ms>`
+  parsed + plumbed end-to-end. The dequeue-time sojourn check is
+  deferred. Comments on `codel_target_ns` are labeled "WIRE SURFACE
+  ONLY in PR #1618".
+
+- **A4 commit warning** (FUNCTIONAL):
+  Operator-visible commit-time warning when sum of exact-class
+  transmit-rates on an interface unit exceeds the unit's
+  shaping-rate. Names the active policy so the operator knows
+
+*(truncated — 133 lines total)*
+
+
+---
+
+## PR #1619 — #1612 step-3 (STAGED scaffolding): cold-path latency histogram primitives [MERGED] (merged 2026-05-28)
+
+Branch: `perf/1612-scale-target-measurement`
+
+## Summary
+
+STAGED-ship of #1612 step-3. This PR ships **scaffolding only** —
+the `cold_path_hist.rs` Rust module that provides TSC sampling, 24-bucket
+power-of-two histogram, splitmix-based zone-pair slot hash, monotonic
+alias detector (`first_key + alias_seen`), and the
+`WorkerColdPathAtomics` per-tick seqlock publish primitive.
+
+**No hot-path impact**: the scaffolding module is wired into
+`userspace-dp/src/afxdp/mod.rs` but referenced nowhere else outside
+its own tests. Smoke regression risk is structurally zero.
+
+**Plan trajectory**: 4 review rounds (Codex r1 NEEDS-MAJOR with 5
+findings; AGY r1 infra-timeout; Codex r2 NEEDS-MAJOR with 3 new
+findings; AGY r3 NEEDS-MAJOR with 3 findings overlapping Codex r3).
+Iterated v1→v2→v3→v3.1→v3.2 absorbing every finding. Cumulative
+findings addressed: 11.
+
+**STAGED form per plan §6**: this PR does NOT ship BindingWorker
+integration, hot-path sample-gate inserts, wire-protocol additions
+(Rust + Go), Prometheus emitter, synthetic-policy-gen.py, the
+harness shell, or the measurement run. Those are deferred to
+**follow-up issues #1620, #1621, #1622**.
+
+**#1609 v2 acceptance criterion REMAINS UNMET** — Scale Target
+Tables A1/A2/B1/B2 in `docs/userspace-jit-design.md` remain TBD
+pending follow-up #1622 closing.
+
+## What ships
+
+- `userspace-dp/src/afxdp/cold_path_hist.rs` (new, ~570 LOC,
+  20 cargo tests passing, 5/5 flake check clean).
+- `userspace-dp/src/afxdp/mod.rs` — wires the new module.
+- `docs/pr/1612-scale-target-measurement/plan.md` v3.2.
+- `docs/pr/1612-scale-target-measurement/claude-smr-plan-r{1,2,3,4}.md`.
+- `docs/pr/1612-scale-target-measurement/reviewer-ids.md`.
+
+## Key design contracts (pinned via const-assertions and tests)
+
+- `POLICY_COLD_PATH_HIST_BUCKETS = 24` (bucket 0 = `[0, 1024)` ns;
+  bucket 23 saturates at 2^32 ns ≈ 4.295 s).
+- `POLICY_COLD_PATH_ZONE_PAIR_SLOTS = 16` (4-bit splitmix mask).
+- `zone_pair_packed_key` is injective over `(u16, u16)` pairs (per
+  Codex r3 finding 1 fix). Tests: `..._is_injective_over_small_box`
+  and `..._distinguishes_adjacent_to_zone_ids`.
+- `calibrate_ns_per_tsc_q32` uses explicit parens around
+  `(elapsed_ns << 32) / elapsed_tsc` to avoid Rust's `<<` < `/`
+  precedence trap (per Codex r3 finding 2 + AGY r3 finding 1).
+- `sample_tsc` brackets `__rdtscp` with `lfence` + `compiler_fence`
+  per Intel SDM §17.17 (per AGY r3 finding 3).
+
+*(truncated — 84 lines total)*
+
+
+---
+
+## PR #1624 — #1609 STAGED Step 1: BookEntry parallel prefix scaffolding [MERGED] (merged 2026-05-28)
+
+Branch: `refactor/1609-multistage-policy-dag`
+
+## Summary
+
+Narrow STAGED Step 1 of #1609. Adds `prefixes_v4: Arc<[PrefixV4]>` + `prefixes_v6: Arc<[PrefixV6]>` parallel fields on `BookEntry`, populated at parse-time from canonical input vectors BEFORE the PrefixSet collapses /0 to MatchAny.
+
+This is the prerequisite scaffolding from plan v3.1 §2.4 P5. The future Multi-Book LPM builder reads these arrays directly instead of walking the trie-compressed PrefixSet. The /0 entry is preserved in the parallel array (PrefixSet collapses it) so the LPM build can route it through the §2.6 books_covering_all_v4 short-circuit instead of populating every level-0 entry.
+
+PrefixSet keeps full hot-path ownership of `contains()`; the parallel arrays are config-apply-time helpers with zero hot-path cost.
+
+Follow-up review nits addressed in this PR:
+- Tightened `Arc`/clone cost commentary in `policy.rs` to accurately describe O(n) clone/copy cost and allocation behavior, including the `impl<T: Clone> From<&[T]> for Arc<[T]>` blanket used by `Arc::from(&[T])`.
+- Reworded the `BookEntry` struct docs to describe semantic (membership) agreement between the parallel arrays and `PrefixSet`, rather than structural equality of stored prefixes.
+- Added three extra unit tests for edge-shape coverage:
+  - dual-family address books (v4 + v6 in one book)
+  - Trie-variant books (`> PREFIX_SET_LINEAR_MAX` prefixes)
+  - books containing `/0` plus additional non-`/0` prefixes, verifying the parallel arrays retain both entries even when `PrefixSet` collapses to `MatchAny`
+
+## Out of scope (deferred to #1623 follow-up + v3.2 plan round)
+
+- Multi-Book LPM v4 + v6 primitives.
+- PseudoBook builder + MatchAny side-channel.
+- Per-book per-phase citation arrays.
+- Stage 2/3/4 hot path + galloping merge.
+- Feature flag `policy_dag_enable`.
+- Junos `cos.policy.lookup` knob + production default-flip.
+
+## Why narrow this aggressively
+
+5 plan-review rounds (v1 r1, v1 r2, v2 r1+reversal, v3 r1, v3.1 r2) surfaced compounding correctness issues. v3.1 r2 added a NEW critical security finding (AGY: Stage 4 master-fallback creates ~15,000× DoS amplification by scanning the entire 1M-rule phase bucket instead of just emitted candidates). Each round closed some findings and exposed new ones, suggesting the design space depth needs more careful upfront work + scope reduction. Path B (narrow to prerequisite scaffolding) ships forward progress without re-litigating the bigger design.
+
+## Empirical-grounding gap (acknowledged)
+
+The ≥10× cold-path speedup at 1M rules claim is NOT verified by this PR. It is gated on:
+1. The remaining #1623 sub-PRs landing (LPM primitive + hot path + feature flag + knob).
+2. #1612 Scale Target measurement populating the 1M-rule cold-path baseline.
+
+Step 1 (this PR) only ships the BookEntry scaffolding. No hot-path change. Master semantics unchanged.
+
+## Test plan
+
+Added/updated unit coverage for parse-time parallel-array behavior:
+- `test_book_entry_carries_canonical_prefix_lists_v4`
+- `test_book_entry_canonical_prefix_lists_v6`
+- `test_book_entry_empty_book_has_empty_parallel_arrays`
+- `test_book_entry_parallel_array_preserves_zero_prefix`
+- `test_book_entry_canonical_prefix_lists_dual_family`
+- `test_book_entry_canonical_prefix_lists_trie_variant`
+- `test_book_entry_zero_plus_non_zero_prefixes_preserved`
+
+Go build remains clean.
+
+
+*(truncated — 53 lines total)*
+
+
+---
+
+## PR #1629 — #1626: activate oversubscription-policy in CoS smoke fixture [MERGED] (merged 2026-05-28)
+
+Branch: `fix/1626-smoke-fixture-guarantee-rate`
+
+## Summary
+
+PR #1618 (#1614 step-1) shipped the Junos wire surface for
+`oversubscription-policy guarantee-rate <fraction>` but the
+`test/incus/cos-iperf-config.set` fixture never set the line that
+opts the unit into guarantee-rate mode. The simul-load smoke harness
+was therefore measuring the default `proportional` distribution the
+whole time. The #1625 PLAN-KILL quad-review surfaced this
+measurement bug.
+
+This PR is the diagnostic fixture+harness fix:
+
+1. **Fixture**: add one line to `test/incus/cos-iperf-config.set`:
+   ```
+   set class-of-service interfaces reth0 unit 80 oversubscription-policy guarantee-rate 0.7
+   ```
+2. **Apply-script assertion**: new Phase-3.5 round-trip check in
+   `test/incus/apply-cos-config.sh` — for any fixture that contains
+   `^set .*oversubscription-policy` lines, the script captures
+   `show configuration class-of-service | display set` and verifies
+   each such line round-trips into the running config. Missing line
+   triggers the existing `rollback 1 | commit` safety net (exit 7).
+   Gated by fixture content (NOT by `--same-class`/`--symmetric`
+   flag).
+
+No runtime code change. The diagnostic value is high.
+
+## Measurement under guarantee-rate 0.7 (push direction)
+
+`show class-of-service interface` confirms `Guarantee: yes` on every
+exact-rate class. Phase-3.5 round-trip assertion PASSED. So the knob
+IS active in the running config.
+
+Aggregate push: **19.78 Gbps** across 11 classes.
+
+| Port | Class | Shape (G) | recv (G) | % of shape |
+|-----:|-------|----------:|---------:|----------:|
+| 5201 | iperf-100m     |   0.1 | 0.019 |  19% |
+| 5202 | iperf-1g       |   1.0 | 0.200 |  20% |
+| 5203 | iperf-3g       |   3.0 | 0.672 |  22% |
+| 5204 | iperf-6g       |   6.0 | 1.364 |  23% |
+| 5205 | iperf-9g       |   9.0 | 2.004 |  22% |
+| 5206 | iperf-12g      |  12.0 | 2.809 |  23% |
+| 5207 | iperf-15g      |  15.0 | 2.747 |  18% |
+| 5208 | iperf-18g      |  18.0 | 3.567 |  20% |
+| 5209 | iperf-21g      |  21.0 | 3.545 |  17% |
+| 5210 | iperf-24g      |  24.0 | 2.854 |  12% |
+| 5211 | iperf-uncapped |   —   | 0.001 |   0% |
+
+## Verdict on the underlying #1614 algorithm
+
+*(truncated — 104 lines total)*
+
+
+---
+
+## PR #1631 — #1620 step-3 follow-up B: BindingWorker integration for cold-path latency histogram [MERGED] (merged 2026-05-28)
+
+Branch: `refactor/1620-binding-worker-hist-integration`
+
+## Summary
+
+Wires the #1619 `cold_path_hist.rs` scaffolding into the live AF_XDP
+worker hot path. Adds a `--cold-path-sample-mask` CLI flag (default
+1-in-256), threads it Go→Rust over the existing `ConfigSnapshot`
+wire, and inserts the two policy-eval sample-record blocks in
+`poll_descriptor/mod.rs`. Workers calibrate TSC↔ns and the wrapper
+fence baseline once at startup, post-affinity-pinning.
+
+`#1620` ships the **data-collection** half. `#1621` will add the
+wire-protocol exposure (`WorkerRuntimeStatus` data fields +
+Prometheus emission) and `#1622` will run the cold-path microbench.
+
+Closes #1620
+
+## Plan + adversarial review
+
+Plan doc: `docs/pr/1620-binding-worker-hist-integration/plan.md` (v4).
+Five reviewer rounds with the project's quad-review discipline
+(Codex + Antigravity + Claude SMR):
+
+- **Round 1** (v1): Codex PLAN-NEEDS-MAJOR (3 HIGH, 3 MED, 3 LOW);
+  AGY PLAN-NEEDS-MAJOR (2 HIGH, 4 MED, 1 LOW); Claude SMR PLAN-NEEDS-
+  MINOR. Three-way consensus on wire-default-skew + q32==0 pollution.
+- **Round 2** (v2): Codex + AGY PLAN-NEEDS-MINOR (both flagged
+  missing `#[repr(C)]` + missing `wrapper_baseline` subtraction).
+- **Round 3** (v3): Codex + AGY PLAN-NEEDS-MINOR (both flagged
+  missing `sample_phase` publish + missing `#[repr(u8)]` on
+  ClockSource + Go CLI `mask=0 && !enable1in1` loophole).
+- **Round 4** (v4): AGY PLAN-READY. Codex PLAN-NEEDS-MINOR (doc
+  consistency only — pre-amendment plan snippets stale).
+- **Round 5** (doc cleanup): Claude SMR PLAN-READY. Codex r4
+  doc findings all addressed in-line.
+
+Reviewer IDs preserved in
+`docs/pr/1620-binding-worker-hist-integration/reviewer-ids.md`.
+
+## Key design contracts
+
+- **Wire field is `Option<u64>` / `*uint64`** so older daemons that
+  omit the field don't accidentally serialize 0 and trigger 1-in-1
+  sampling. Rust receiver `unwrap_or(0xff)`. Per `feedback_wire_protocol_both_sides`.
+- **Two-flag CLI**: `--cold-path-sample-mask` validates power-of-2-
+  minus-1 (and rejects `u64::MAX`); `--enable-cold-path-1-in-1-sampling`
+  required to set mask=0 (256× CPU cost).
+- **q32==0 skip**: when TSC calibration unavailable (ClockGettime
+  workers), record_sample is SKIPPED ENTIRELY so bucket 0 isn't
+  polluted with synthetic zero-delta samples.
+- **Wrapper-baseline subtraction with underflow counter**: per AGY r2
+  Amendment B + AGY r3 AXIS-6, the recorded delta is `raw_ns -
+
+*(truncated — 89 lines total)*
+
+
+---
+
+## PR #1632 — #1623 Path B narrow: PolicyRule parallel-prefix arrays [MERGED] (merged 2026-05-28)
+
+Branch: `refactor/1623-path-b-narrow`
+
+## Summary
+
+Extend `PolicyRule` with four `Option<Arc<[Prefix...]>>` parallel-prefix array fields (`source_prefixes_v4/v6` + `destination_prefixes_v4/v6`) populated at parse-time as the union of literal CIDRs + cited-book prefixes. Mirrors the #1624 BookEntry parallel-prefix scaffolding shape with `Option<Arc<[T]>>` (NPO-collapsed to 16 B) instead of bare `Arc<[T]>` to eliminate empty-Arc allocations at rule cardinality.
+
+This is the AGY r2 #1 simplification line item from #1623 (Multi-Book LPM full design tracking issue) after the v3.x architectural round hit four consecutive PLAN-KILL / PLAN-NEEDS-MAJOR on the full Multi-Book LPM axis. User authorized the narrow path; the full DAG / Stage 2/3/4 / PseudoBook work remains deferred indefinitely pending #1622 empirical numbers.
+
+Part of #1623; full Multi-Book LPM design deferred.
+
+## Scope
+
+- 4 new fields on `PolicyRule` (`Option<Arc<[PrefixV4/V6]>>`, NPO-collapsed to 16 B each)
+- `parse_v3_literal_set_capture` helper (returns captured intermediate Vec alongside PrefixSet)
+- `build_rule_side_arc` generic helper composes literal Vec + cited-book prefixes → `Option<Arc<[T]>>`
+- Parse constructor refactored: drops `..PolicyRule::default()` tail; pre-declares `applications` + `compiled_apps` locals; names every field explicitly (eliminates silent-omission hazard for current AND future field additions)
+- `Default` + `Clone` impls extended
+- 19 new unit tests + compile-time `const _: [(); 16]` size_of guards
+
+## Out of scope
+
+- NO Multi-Book LPM / DAG / Stage 2/3/4 / PseudoBook work
+- NO hot-path consumer of the new fields (`evaluate_policy` is byte-identical)
+- NO wire-protocol changes
+- NO Go-side changes
+- NO sort/dedup of parallel arrays (future LPM builder owns it per `4.3` invariant)
+
+## Plan + adversarial review
+
+Plan doc: `docs/pr/1623-path-b-narrow/plan.md` (v5 @ 725de2e89)
+
+Three rounds of triple-review:
+
+**Round 1** (plan @ c0ff17f71):
+- Codex r1: PLAN-NEEDS-MAJOR (F1-F7) — task-mpplwc8f-vsq2op
+- AGY r1: PLAN-NEEDS-MINOR (F1-F3, F4 passed) — adversarial-review-mpplx0ls-va1otm
+- Claude SMR r1: PLAN-NEEDS-MINOR — claude-smr-plan-r1.md
+
+**Round 2** (plan v3 @ 1c7843294):
+- Codex r2: PLAN-NEEDS-MINOR — task-mppm68vl-lprlgu
+- AGY r2: PLAN-NEEDS-MINOR — adversarial-review-mppm6rca-op1iza
+- Claude SMR r2: PLAN-NEEDS-MAJOR (convergence with Codex r1) — claude-smr-plan-r2.md
+
+**Round 3** (plan v4 @ 279054a59):
+- Codex r3: PLAN-NEEDS-MINOR (factual corrections) — task-mppmiaj9-alxggr (initial task-mppmer2s-l8youg hit Codex infra outage; retried per `feedback_codex_infra_must_retry`)
+- AGY r3: PLAN-READY — adversarial-review-mppmf5wy-w9wwh2
+- Claude SMR r3 → r4: PLAN-READY after v5 mechanical fixes — claude-smr-plan-r{3,4}.md
+
+Key architectural pivots across rounds:
+- `Arc<[T]>` → `Option<Arc<[T]>>` (AGY r1 F1, Codex r1 F3): NPO keeps size at 16 B; eliminates ~96 MB empty-Arc footprint at 1M all-`any` rules
+- Helper composition replaces re-parse drift (Codex r1 F5)
+- Constructor drops `..default()` entirely (AGY r2 D)
+
+*(truncated — 63 lines total)*
+
+
+---
+
+## PR #1633 — #1621 step-3 follow-up C: wire protocol (Rust+Go) + Prometheus emitter for cold-path histogram [MERGED] (merged 2026-05-28)
+
+Branch: `refactor/1621-cold-path-wire-prometheus`
+
+## Summary
+
+Surfaces the #1620 worker-local cold-path latency histogram on the gRPC
+`WorkerRuntimeStatus` and the Prometheus /metrics endpoint so #1622
+microbench can scrape the data. Adds a sibling
+`Arc<WorkerColdPathAtomics>` per worker (independent `cold_window_gen`
+seqlock), per-tick `publish_from_local()` with cross-binding merge,
+10 new wire fields (both sides), and 10 new Prometheus metric
+families (~2622 series per cluster node).
+
+Closes #1621
+
+## Plan + adversarial review
+
+Plan doc: `docs/pr/1621-cold-path-wire-prometheus/plan.md` (v2).
+Two reviewer rounds with the quad-review discipline:
+
+- **Round 1** (v1): Codex PLAN-NEEDS-MAJOR (5 conceptual findings;
+  sandbox-broken; 1 was a Vec-vs-fixed-array misread); AGY
+  PLAN-NEEDS-MINOR (5 amendments, 5 axes clean); Claude SMR
+  PLAN-NEEDS-MINOR (F1-F5).
+- **Round 2** (v2 + code): All five r1 amendments absorbed:
+  - **A** `le` label for PromQL histogram_quantile() compat.
+  - **B** Add `ns_per_tsc_q32` Prometheus gauge.
+  - **C** `snapshot_failed: AtomicU64` + matching Prometheus
+    Counter so operators see publish-contention starvation.
+  - **D** `clock_source` gauge always emitted.
+  - **E** Scalar fields use `skip_serializing_if = u64_is_zero` so
+    the wire-invariant fixture stays byte-identical for uncalibrated
+    workers.
+  - Claude SMR plan-r2.md attests PLAN-READY.
+
+Reviewer IDs in `docs/pr/1621-cold-path-wire-prometheus/reviewer-ids.md`.
+
+## Key design contracts
+
+- **Per-worker cross-binding merge** at the publish tick:
+  saturating_add for buckets / sum_ns / samples / sample_phase /
+  wrapper_underflow; OR alias_seen; first-non-zero first_key with
+  cross-binding alias detection per plan §4.2.
+- **Snapshot starvation observability**: `snapshot_failed: AtomicU64`
+  on WorkerColdPathAtomics, incremented inside `snapshot()` on
+  retry-exhaust before returning None. Surfaced as
+  `xpf_userspace_worker_cold_path_snapshot_failed_total`. Distinguishes
+  "no samples this window" from "transient publish contention."
+- **Always-emitted scalars**: every worker emits `sample_phase`,
+  `wrapper_underflow_count`, `wrapper_ns_baseline`, `ns_per_tsc_q32`,
+  `clock_source` (with `source="unset"` label when uncalibrated),
+  and `snapshot_failed_total`. Per-slot/bucket metrics only emitted
+  when Vec fields populated. Dashboards see every worker regardless
+
+*(truncated — 78 lines total)*
+
+
+---
+
+## PR #1634 — #1630: anchor CoS waterfill pass1 to shaper + time-based refresh [CLOSED] (closed 2026-05-29)
+
+Branch: `fix/1630-cos-scheduler-equalize`
+
+## Summary
+
+Fix the CoS scheduler equalize-bug uncovered by PR #1629's smoke
+fixture activating `oversubscription-policy guarantee-rate 0.7`.
+Under the smoke fixture (shaping-rate 25g, fraction 0.7, 11 simul
+classes summing to 109 Gbps configured rate), the algorithm
+distributed throughput proportionally to configured rate (every
+class ~20% of shape) instead of honoring small classes to their
+full configured rate first as the documented contract requires.
+
+This was the central CoS regression the #1614 umbrella was
+originally about, finally isolated via the #1626 smoke-fixture
+fix landed in #1629.
+
+Closes #1630
+
+## The bugs
+
+### Bug 1 — pass1 refill formula (Hunk A)
+
+`queue_service/mod.rs:787-800` computed pass1 budget as
+`quantum_sum × fraction` where `quantum_sum = Σ (R_i × VISIT_NS)`.
+For any oversubscribed config (`Σ R_i > shaper`), this over-
+provisioned pass1 by 3-5×. Under the smoke fixture:
+- `quantum_sum = 109 Gbps × 200 µs ≈ 2.725 MB`
+- `pass1 = 2.725 MB × 0.7 = 1.91 MB`
+- Root shaper delivers `25 Gbps × 200 µs = 625 KB` per epoch
+- pass1 is **3× larger** than what the shaper can deliver
+
+Consequently, Phase 2 (residual descending RR) never fired and
+the selector degenerated to ascending RR over all classes,
+producing rate-proportional distribution = the default
+proportional mode behaviour.
+
+**Fix**: anchor pass1 to `shaping_rate × VISIT_NS × fraction =
+437.5 KB` (matches documented contract at
+`docs/fairness-regimes.md:848-855` — "Phase 1 honours small-rate
+exact classes ascending by R_i up to `fraction × cap`" where cap
+is shaper-delivered bytes per epoch). Transparent-root
+(`shaping_rate_bytes == 0`) preserves the legacy `quantum_sum`
+formula as fallback.
+
+### Bug 2 — pass1 never refreshes under saturation (Hunk B)
+
+Even with the corrected formula, the legacy refresh condition
+(`pass1 == 0`) never fires under saturation because Phase-2
+selections do NOT decrement pass1. Across a few lease epochs,
+pass1 sinks to a small non-zero value below every quantum and
+small classes stop being honored. The legacy
+`Phase-2-no-selection fall-through` reset at lines 1002-1005
+
+*(truncated — 156 lines total)*
+
+
+---
+
+## PR #1637 — #1635 plan-review (PLAN-READY): cold-path histogram + per-zone-pair slot map redesign [MERGED] (merged 2026-05-29)
+
+Branch: `refactor/1635-cold-path-hist-redesign`
+
+## Summary
+
+Plan-review milestone for #1635: foundation redesign that #1622 PLAN-KILL identified as required for trustworthy Scale Target measurement.
+
+This PR carries **plan + reviewer documents only**. Implementation lands in a follow-up PR.
+
+The plan v3 redesigns the #1619/#1620/#1621 cold-path histogram primitive to fix three structural defects that #1622 surfaced:
+
+1. **Bucket-0 resolution floor** — 24-bucket pow-2 layout reports p50 of 50-150 ns workloads as 512 ns (5x error). Plan v3: 48-bucket log-linear (32 linear buckets at 16-ns stride covering `[0, 512) ns` + 15 pow-2 buckets to `2^24` + 1 saturate). Resolves error to ≤1.67x at any true p50 ≥ 24 ns (the wrapper baseline noise floor).
+
+2. **16-slot splitmix64 collision bias** — birthday paradox at 8 active zone-pairs collides 88.2%, alias_seen excludes both, biases aggregate. Plan v3: 256-slot direct map via 32x32 [u8; 1024] L1d-resident flat table. Eliminates collisions.
+
+3. **Bimodal aggregate corruption** — aggregate-row publication across non-aliased slots is a packet-mix-ratio artifact. Plan v3: per-zone-pair publication only via `from_zone`/`to_zone` Prometheus labels; aggregation is operator's PromQL choice.
+
+Plus per AGY r1 review:
+- Sparse wire serialization (active-slot-only arrays) drops payload from 82 KB to ~5 KB per worker per scrape.
+- Hot-path FastMap lookup replaced with L1d-resident flat table (~3-5 ns vs ~5-10 ns).
+- `alias_seen` renamed `builder_collision` (hard-error invariant, never set under correct builder).
+- Immediate slot reuse with control-plane-driven atomic zero-out on snapshot apply.
+
+## Reviewer convergence
+
+- **AGY r1** (adversarial-review-mppsdq37-vz0w2l): PLAN-NEEDS-MINOR with 6 concrete remediations — all absorbed in v3.
+- **Claude SMR r1**: PLAN-NEEDS-MAJOR with 4 findings (F1 bucket stride, F2 slot overflow, F3 Go silent miscompile, F4 stale slot remap) — all absorbed in v2.
+- **Claude SMR r2**: PLAN-READY conditional with 3 minor concerns (F5 cost math, F6 _v2 naming commit, F7 example/prose inconsistency) — all absorbed in v3.
+- **Claude SMR r3**: PLAN-READY.
+- **Codex r1**: INFRA-BLOCKED across 4 dispatches due to shared-session bug clobbering task IDs. Per `feedback_codex_infra_must_retry` + the Codex-infra-blocked exception, plan gate falls back to 2-of-3 (AGY + Claude SMR). Codex gets a fresh shot at code-review on the implementation PR when sandbox conditions may have cleared.
+
+## Implementation scope (deferred to follow-up PR)
+
+- `userspace-dp/src/afxdp/cold_path_hist.rs` — primitive rewrite (~500 LOC + tests)
+- `userspace-dp/src/afxdp/forwarding_build/mod.rs` — slot map build
+- `userspace-dp/src/afxdp/types/forwarding.rs` — slot map in ForwardingState
+- `userspace-dp/src/afxdp/poll_descriptor/mod.rs` — 2 hot-path call sites (~lines 1380, 2444)
+- `userspace-dp/src/afxdp/coordinator/status.rs` — sparse encoding
+- `userspace-dp/src/afxdp/worker/loop_body/mod.rs` — merge + zero-slot consumption
+- `userspace-dp/src/protocol/binding.rs` — sparse wire fields + `cold_path_layout_version: u32 = 3`
+- `pkg/dataplane/userspace/protocol.go` — Go mirror
+- `pkg/api/metrics_userspace.go` — v3 emitter with version switch
+- `pkg/api/metrics_descriptors.go` — v3 descriptors
+- `userspace-dp/tests/cold_path_accuracy.rs` — verification harness
+
+## Test plan (deferred to implementation PR)
+
+- cargo build + test clean
+- 5/5 flake check on histogram tests
+- Go test suite (incl. v1/v3 emitter compat tests)
+- Smoke Pass A (CoS-off) + Pass B (CoS-on) on loss userspace cluster (v4 + v6 × push + reverse × multi-stream `-P 12`)
+- `make test-failover` (wire-protocol change is HA-visible)
+- Verification harness shows ≤2x per-bucket error at 10-rule (~100 ns) AND 1M-rule (~5000-50000 ns) targets
+
+*(truncated — 60 lines total)*
+
+
+---
+
+## PR #1640 — #1636: fix multi-second cold connect (kernel retrans + proactive warm + faster drop) [MERGED] (merged 2026-05-28)
+
+Branch: `fix/1636-cold-connect-mitigation`
+
+Closes #1636.
+
+Cold iperf3 connect against the loss userspace cluster took **~3.371s**
+(measured), not the ~2ms the design doc claimed. Root cause: userspace
+fires 3 ARP/NDP probes in the first 260ms then stops; the kernel ARP
+retransmit timer runs at the 1000ms default; and `PENDING_NEIGH_TIMEOUT`
+drops the original queued SYN at 2000ms — ~1s before the client's second
+TCP RTO would have retransmitted against a now-warm neighbor.
+
+Implements the converged 3-of-3 PLAN-READY research outcome
+(`docs/pr/1636-cold-connect-mitigation/plan.md`), staged B → C → D.
+
+## Option B — kernel retrans_time_ms (Go control plane)
+The daemon lowers every neighbor table's `retrans_time_ms` to 250ms at
+start (`applyNeighRetransTime`, mirroring `applyNetdevBudget`:
+idempotent, best-effort, capture+restore on stop). **Writing only the
+`default` template does not lower existing interfaces** — the kernel
+seeds a per-interface table from `default` only at creation time — so it
+enumerates every per-interface table under
+`/proc/sys/net/{ipv4,ipv6}/neigh/<iface>/` plus `default`. A
+`/etc/sysctl.d/99-xpf-neighbor.conf` drop-in persists it across reboots.
+
+## Option C — proactive neighbor warm at config-apply (Rust dataplane)
+A long-lived warmer worker (bounded `std::sync::mpsc(4096)`, no new
+dependency) fired from `Coordinator::queue_warm_pass` walks configured
+next-hops (static + dynamic route next-hops, fabric peers) and probes
+each unresolved, not-recently-probed `(egress_ifindex, hop)`. **Per-RG
+HA gating** on both the queue side and the worker side via
+`HAGroupRuntime::is_forwarding_active` — the standby never warms and a
+demote between enqueue and fire is caught. 1s snapshot rate-limit
+(force-bypassed on RG-promote), 5s per-key rate-limit, generation
+collapse, 5min GC. `warm_drops` / `warm_disconnected` surface as
+`xpf_userspace_neighbor_warm_{drops,disconnected}_total` Prometheus
+counters (Rust + Go both-sides). Hooked into the snapshot-refresh tail
+and `handle_activated_rgs` (RG-promote clears the per-key map + forces a
+warm pass).
+
+## Option D — ForwardingState-computed PENDING_NEIGH_TIMEOUT (Rust)
+`compute_pending_neigh_timeout_ns` reads the live kernel sysctls every
+snapshot and returns 800ms only when all dataplane interfaces + the
+`default` template read ≤300ms (the kernel rounds 250→252 on HZ=100, so
+the threshold is above the rounded value, far below the 1000ms default);
+any read failure or higher value fails closed to 2000ms with an operator
+warning. `retry_pending_neigh` reads the per-snapshot value, so a stuck
+SYN drops at 800ms and is re-driven by the client's first TCP RTO.
+
+## Cold-connect timing (loss userspace cluster, 10 runs, post `ip neigh flush all`)
+
+| stage | cold connect | note |
+|-------|--------------|------|
+
+*(truncated — 88 lines total)*
+
+
+---
+
+## PR #1647 — docs: fix three doc-vs-reality drift claims (#1639, #1644, #1645) [MERGED] (merged 2026-05-28)
+
+Branch: `docs/honesty-1639-1644-1645`
+
+Documentation-only PR. Three verified doc-vs-reality drift fixes. No
+source changes; the binary is unaffected, so no smoke matrix.
+
+Each corrected claim is grounded against `origin/master` (`dbfbf680c`)
+or a verified issue measurement. Claude SMR accuracy self-review:
+`docs/pr/doc-honesty-1639-1644-1645/claude-smr-accuracy.md`.
+
+## #1639 — userspace-jit-design.md Phase 6 CoS row overclaim
+
+**Before:** `**DONE** — ... small-class guarantees honoured under 6×
+oversubscription; ~3-7× per-class throughput improvement on
+100m/1g/3g/6g classes`
+
+**After:** `**WIRED / NOT YET MEETING GATE**` — wire surface + commit
+warning shipped (#1618), smoke fixture activates the knob (#1629), but
+the scheduler still equalizes ~20%/class under `guarantee-rate 0.7`
+instead of meeting the small-class ≥95% gate; root cause proven (v8
+epoch-cap clamp discards lagged rate credit, `rotate_epoch_v8.rs`).
+Gain column → `regression open, see #1630/#1614`. Fabricated "~3-7×"
+multiplier removed.
+
+**Source of truth:** #1614 + #1630 OPEN; #1630 body measurement shows
+19/20/22/23% of configured shape for 100m/1g/3g/6g; #1630 converged
+root cause (`/engineer` STOP-and-report) pins the loss on the v8
+rotation clamp `elapsed.min(EPOCH_DURATION)` at `rotate_epoch_v8.rs:218`
+discarding `rate × (lag − EPOCH_DURATION)`. Phase 1 "~2ms" line (owned
+by in-flight #1636) deliberately untouched.
+
+## #1644 — DPDK docs describe retirement as in-progress
+
+`docs/dpdk-dataplane.md` + `docs/dataplane-decision-dpdk-vs-vpp.md`
+"Current State" said source "remains in-tree until Phase 3" and
+commit-rejection "not yet on master".
+
+**Before:** "remains in-tree until Phase 3 of #1525 deletes it ...
+commit-time rejection planned in Phase 1 (#1526; not yet on master)"
+
+**After:** retirement complete — source deleted from master (#1528
+mechanical removal; #1527 boot decoupling), only docs remain;
+commit-rejection live on master (#1526) via `validateDataplaneTypeStrict` (`pkg/config/compiler.go`, returns `ErrDPDKDataplaneRetired`); `compileSystemDataplaneType` only parses the `dpdk` token for legacy-config compat.
+
+**Source of truth:** `git ls-tree -r --name-only origin/master | grep -i
+dpdk` → only `docs/...` paths (no `dpdk_worker/` or
+`pkg/dataplane/dpdk/`); `git show origin/master:pkg/config/compiler.go` shows `validateDataplaneTypeStrict` returning `ErrDPDKDataplaneRetired` for `dataplaneTypeDPDK` (the hard rejection), called from `compileExpanded`. The "[Retired] Historical" sections are preserved as-is.
+
+## #1645 — cold-start-resolution.md overclaims ~2ms
+
+**Before:** four lines presenting cold connect as resolved to ~2ms.
+
+**After:** accuracy banner + each "~2ms" reframed as the intended
+
+*(truncated — 66 lines total)*
+
+
+---
+
+## PR #1650 — #1630 cause-1: bounded rotation credit carry + #1643 seqlock fence [MERGED] (merged 2026-05-29)
+
+Branch: `fix/1630-cause1-credit-carry`
+
+## Summary
+
+The lowest-rate CoS exact classes could not reach their configured shape even SOLO: 100m ~81%, 1g ~84%. A SOLO A/B isolated **two distinct root causes**. This PR ships the **cause-1** fix (the actionable scheduler fix) and documents **cause-2** as a transport-physics floor.
+
+`Closes #1630` — cause-1 carry + #1643 fence fix the classes that can be fixed (100m/1g SOLO 81/84% → **95.0/95.3%**); cause-2 (the K-independent ~6% mid-rate 3g/6g residual) was measured to be ACK-clocked single-flow token-bucket fill physics (improves with parallelism, root never throttles), documented in `fairness-regimes.md`, not a scheduler defect. #1614 (broader 11-class simul umbrella) stays open for separate re-scoping.
+
+`Closes #1643`
+
+## Cause-1: the v8 epoch rotation rate-meter
+
+Rotation is purely lazy — a low-rate class is only rotated when the scheduler next visits its queue, so the lag between two rotations of the same queue routinely exceeds one epoch. The old STEP-6 clamp computed `elapsed = min(lag, EPOCH)` and reset `epoch_start := now`, permanently discarding `rate × (lag − EPOCH)` of grant per lagged rotation.
+
+### Fix: bounded credit carry (`rotate_epoch_v8` STEP 6), three regimes
+Regime boundaries compared on **exact wall-clock nanoseconds** (not floored epoch counts):
+- **Regime 1** (raw ≤ K×EPOCH): grant full lagged credit, drain a bounded carry slice.
+- **Regime 2** (K×EPOCH < raw ≤ STALL×EPOCH): grant the K-epoch ceiling now, bank the residual into a clamped carry deficit drained next visit (no cliff).
+- **Regime 3** (raw > STALL×EPOCH, or start == 0): cold-resume to one epoch, DROP carry.
+
+`K = 8`, `STALL = 256` epochs (≈51 ms, below the ≥500-epoch failback gap). Reservoir clamped at `K × rate × EPOCH`, drain at `(K−1) × rate × EPOCH` → a single rotation can never grant more than `(2K−1) × rate × EPOCH`, preserving the per-class burst bound the old clamp protected. `epoch_carry_bytes` is rotation-private (single-writer in the seqlock ODD section, never in the snapshot payload); a grep test enforces it is never read from acquire/snapshot/status so it cannot re-introduce the #1619 tearing class.
+
+### HA-failover safety
+Leases are REUSED across an HA demote→promote when config matches, so `epoch_start` survives and the first post-promotion rotation sees `lag ≈ demotion_duration`. Regime 3 cold-resumes that to a single-epoch grant and drops stale carry → no multi-epoch failback burst. Validated by `make test-failover` (13/0).
+
+## #1643 (folded in — same seqlock)
+`snapshot_epoch_v8` was missing the `fence(Acquire)` between the payload loads and the `seq_after` re-read, so on a weakly-ordered CPU `seq_after` could be observed before the payload loads retire and the even-equal check could pass against torn cross-epoch data. Downgraded payload loads/stores to Relaxed and added the fence, mirroring the verified-correct `cold_path_hist::snapshot` reference. Audited every reader of the three payload fields: only the fenced snapshot reads them concurrently.
+
+## Composing P2 + P1 (genuine prereqs, confirmed by the SOLO A/B)
+The guarantee selectors clamped each visit's send budget to the rate-scaled quantum (`rate × 200 µs`, below two MTUs for a low-rate class), sending one frame and discarding the sub-frame remainder every visit. Split the per-visit budget: Phase-1 gate keeps the rate-scaled quantum (small-first ordering preserved); send budget is a FRAME-count cap (`cos_guarantee_visit_cap_bytes` = `TX_BATCH_SIZE × frame`). Bank an N-frame burst in the exact-queue bucket (N=8) with the outstanding-credit cap raised in lock-step. Long-run rate is still metered by the v8 per-epoch grant + actual-byte debit, so Gate 4 holds.
+
+## Validation
+- **Unit tests**: `cargo test --bin xpf-userspace-dp` **1543 passed / 0 failed**. 9 new carry tests (recovery, no-cliff, drain, burst-bound, exact-ns regime boundaries, worst-case (2K−1) ceiling, HA reused-lease cold-resume, reader-private grep guard) + 4 updated P2 tests.
+- **Scoped Gate-1 SOLO (v4 push, reproducible)**: 100m **95.0%**, 1g **95.3%** of shape — PASS. (Baseline 81% / 84%.) Four-parallel and v6 land 1-3 pp lower at the cause-2 physics floor — reported for the record, not the pass bar.
+- **`make test-failover`: 13 passed / 0 failed** — unclean fw0 reboot → failover → rejoin → manual failover, iperf3 zero-drop.
+
+## Reviews (4-of-4 addressed)
+- **Claude SMR**: MERGE-READY (`docs/pr/1630-cause1-credit-carry/claude-smr-code-r1.md`).
+- **Codex**: 1 Major + 1 Medium (floored-boundary) → both FIXED (`4a2b998f7`).
+- **AGY**: MERGE-READY across 6 axes, no findings.
+- **Copilot**: same boundary Major (fixed) + plan.md doc nit (fixed `7e6f7115f`).
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #1652 — #1649: document per-flow CoV floor (RSS multinomial) — PLAN-KILL [MERGED] (merged 2026-05-29)
+
+Branch: `docs/1649-floor-curve`
+
+## Summary
+
+Docs-only PR for the #1649 per-flow CoV floor / better-initial-placement PLAN-KILL. The research plan (commit `36fcd1b8`) was PLAN-KILLed by 3 converged reviewers (Codex + Antigravity + Claude SMR): the #937/#840-named hardware-steering prerequisite **exists** on the deployed mlx5 VF, but no static `f(5-tuple)→queue` map beats the multinomial RSS floor for ephemeral-port traffic, and even placement of `N ≤ M` flows requires negative dependence that reduces to a forbidden mid-flight re-steer.
+
+This PR documents the floor so future "this is uneven" observations are a known reference, not a surprise. **No source changes; binary unaffected; no smoke.**
+
+## Changes
+
+### `docs/fairness-regimes.md` — new "Per-flow CoV floor (RSS multinomial)" section
+Inserted after the existing "Structural CoV ceiling — worked examples" (disjoint from PR #1650's CoS-section edits). Covers:
+
+1. **The floor curve** — N flows hashed into M=6 RX queues is a multinomial draw. The occupancy-count CoV curve is monotonically decreasing with `N` (`N=2 → 1.55`, `N=6 → 0.87`, `N=12 → 0.62`, `N=18 → 0.50`, `N=24 → 0.44`); `P(perfect one-per-queue spread at N=6) = 6!/6⁶ ≈ 1.54%`. The live ~17% throughput CoV (the `-P 6 -p 5210` case) is explained as one favorable non-worst-case realization and explicitly distinguished from the 0.87 *occupancy* CoV. Ties to the existing #1217 Cstruct contract.
+2. **Why HW steering does NOT beat it** — mlx5 VF accepts exact-5-tuple + masked-src-port-residue ntuple (cap 1024 = `MLX5E_ETHTOOL_FLOW_SPEC_NUM`, ~1 ms/rule), but any static hash = i.i.d. draws (CoV ≈ RSS); even `N≤M` placement needs occupancy-aware reactive re-steer (forbidden by AF_XDP per-queue UMEM ownership); #1203/#789 measured the reactive form at 49–55%. Monte-Carlo + 2 external reviewers confirmed.
+3. **Operational meaning** — this is primarily a per-flow distribution floor, not a scheduler bug. Aggregate is evaluated against the existing structural cap (Gate 3's `Nₐ / Nᵥ` scaling), rather than assumed universally unaffected. Kept distinct from the #1630 CoS rate-metering residuals (cause-1 low-rate, cause-2 mid-rate ~6%), with an open/future reference to issue #1630 / PR #1650 rather than a dangling in-file section link.
+
+### `CLAUDE.md` — one added bullet under "XDP on SR-IOV Interfaces"
+**Verified before correcting** (the #1647 lesson): the loss userspace cluster's dataplane interfaces are mlx5_core SR-IOV VFs (6 RX queues → 6 workers, native XDP, ntuple-capable), separate from the standalone test VM's i40e PF passthrough. The change is **additive** — the standalone i40e text is left intact because it is accurate for that env. The pre-existing iavf "no native XDP" bullet is not contradicted (iavf = Intel VF driver; mlx5 is a different vendor's VF that does support native XDP here).
+
+## Before / after
+
+- **Before**: fairness-regimes.md had the per-`{aᵢ}` `Cstruct` ceiling but no floor on `{aᵢ}` itself; CLAUDE.md's SR-IOV section only described the standalone i40e env in the XDP bullets.
+- **After**: a canonical floor-curve section bracketing the problem (`{aᵢ}` won't be flat *and* per-flow CoV ≤ Cstruct given a non-flat `{aᵢ}`), plus the loss-cluster mlx5 note.
+
+## Citations / grounding
+Every claim traces to the #1649 research plan at commit `36fcd1b8` (NIC capability findings, multinomial theorem, Monte-Carlo), issue #1649 (3-reviewer kill), PR #1650 / issue #1630 (CoS cause-1/cause-2 split), or reproduced Monte-Carlo anchored to the research's published 0.87 / 1.54% values. Per-claim source-of-truth table: `docs/pr/1649-doc-floor-curve/claude-smr-accuracy.md`.
+
+## Coordination
+PR #1650 (#1630 cause-1) also edits `docs/fairness-regimes.md` but in a disjoint hunk (CoS oversubscription area). Whichever merges second rebases cleanly. The #1630 paragraph now points to issue #1630 / PR #1650 as an open/future reference until that CoS floor section lands in this file.
+
+## Test plan
+Docs-only. No code, no smoke. Light review per the triple-review pure-documentation exception (Copilot + SMR accuracy).
+
+🤖 Generated with <a href="https://claude.com/claude-code">Claude Code</a>
+
+Closes #1649
+
+
+---
+
+## PR #1654 — userspace-dp: add server/ control-plane handler tests (#1653) [MERGED] (merged 2026-05-29)
+
+Branch: `test/1653-server-coverage`
+
+## Summary
+
+Advances the **#1653 test-coverage tier** (§3.1). The `server/`
+control-plane handlers — the Go↔Rust control-socket glue
+(`apply_snapshot`, `set_forwarding_state`, `update_ha_state`,
+`sync_session`, `bump_fib_generation`, `set_binding/queue_state`,
+`inject_packet`, `stop_workers`, helper predicates) — had **zero tests
+of their own**. The only handler coverage lived in `main_tests.rs` and
+exercised apply_snapshot / queue-planner / session-sync. The **#1642
+status-field-parity drift lived in exactly this untested glue**, where
+per-PR review structurally can't catch a missing status field or a
+dropped error arm.
+
+This adds a colocated `server/tests.rs` (**37 tests**) that drives the
+handlers through the real `handle_stream` dispatcher over a socketpair
+— the same path the daemon's accept loop uses — so a test fails if the
+dispatch wiring, an error/success arm, or status-field population
+regresses. These are **not trivial getters**: each asserts behavior at
+the real call site.
+
+## Coverage added
+
+- **dispatcher**: ping/status ok + status attach; unknown-request-type
+  rejection; `suppress_status` omits the status payload
+- **apply_snapshot**: missing-payload rejection; #1606 integrity
+  preflight rejects a reserved-sentinel (id=0) address book WITHOUT
+  mutating `guard.status`/`guard.snapshot` (previous good config
+  survives) — the #1642-class status-parity surface
+- **update_ha_state**: missing-payload rejection; `rg_id` survives
+  request → coordinator → `status.ha_groups` round-trip
+- **set_forwarding_state**: missing-payload rejection; arm-without-support
+  refused AND must not flip `forwarding_armed`; unarm clears the flag
+- **sync_session**: missing-request / unknown-operation / unparseable-IP
+  rejections; valid delete succeeds; valid upsert succeeds; upsert with
+  a malformed `neighbor_mac` is rejected
+- **bump_fib_generation**: missing-snapshot rejection; bump rewrites
+  both `status.last_fib_generation` and the stored snapshot
+- **set_binding_state / set_queue_state**: missing-payload + unknown-slot /
+  unknown-queue rejections; **success arm** flips `armed` on a seeded
+  slot / queue
+- **stop_workers**: tears down per-binding socket fields
+- **inject_packet**: missing-payload rejection
+- **pure helpers**: `forwarding_unsupported_error`, `parse_session_sync_mac`
+  (round-trip + short/long/non-hex/empty), `should_run_afxdp`,
+  `set_bindings_forwarding_armed` (registered-only), `bindings_settled`
+
+## Review
+
+- **Claude SMR: MERGE-READY** (non-vacuity spot-checked; no incorrect assertions)
+- **AGY: MERGE-READY** (read the files, quoted line evidence; its recommended
+
+*(truncated — 79 lines total)*
+
+
+---
+
+## PR #1655 — #1641: trim NAT64 reverse-path L4 payload to IPv4 Total Length (MAJOR) [MERGED] (merged 2026-05-29)
+
+Branch: `fix/1641-nat64-padding`
+
+**MAJOR / data-corruption.** Reverse-path NAT64 packet corruption / L4 checksum failure.
+
+## Problem
+`translate_v4_to_v6` (userspace-dp NAT64 reverse path) read the L4 payload as `packet.get(ihl..)` — every byte from the IPv4 header to the end of the input slice. The caller passes the whole L3-onward frame, which includes any Ethernet padding the NIC/driver appended to satisfy the 60/64-byte minimum frame size.
+
+For any IPv4 reply small enough to be padded (the common case: **TCP ACKs, DNS replies, short HTTP responses**), the trailing padding was copied into the translated IPv6 packet. That inflated the IPv6 `payload_len` and was fed into the recomputed L4 checksum with the wrong pseudo-header length, so the receiving IPv6 host's checksum verification failed and it **dropped the reply**.
+
+The forward path (`translate_v6_to_v4`) already trims correctly via the IPv6 `payload_len` field; the reverse path now mirrors it.
+
+## Fix
+Derive the L4 slice from the IPv4 Total Length field (`packet[2..4]`) and clamp safely — reject `total_len < ihl` or `total_len > packet.len()` before slicing so a malformed/oversized header cannot panic or read out of bounds.
+
+## Tests (fail-before / pass-after verified)
+In `nat64_tests.rs`:
+- `translate_v4_to_v6_trims_ethernet_padding_tcp`: 40B bare ACK padded to a 46B L3 slice → IPv6 `payload_len` 20 (not 26) + verifying TCP checksum.
+- `translate_v4_to_v6_trims_ethernet_padding_udp_dns`: canonical short DNS reply → `payload_len` + UDP checksum.
+- `translate_v4_to_v6_total_len_{larger_than_slice,below_ihl}_returns_none`: malformed Total Length rejected, no panic.
+
+Fail-before confirmed: all four fail on the buggy code (payload_len 26 vs 20). 5/5 flake pass-after. Pure translation logic — unit-provable; no cluster dependency.
+
+Closes #1641
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #1656 — #1642: close Rust->Go control-socket status parity gaps [MERGED] (merged 2026-05-29)
+
+Branch: `fix/1642-status-parity`
+
+Observability-only (no dataplane/HA behavior change). Four status fields the Rust helper serializes over the JSON control socket had no matching (or a wrong-level) Go `json:` tag, so the field-name-keyed wire format silently dropped them on `json.Unmarshal`. `show` output and Prometheus metrics driven from these values stayed at zero.
+
+## Fixes (Go `pkg/dataplane/userspace/protocol.go`)
+1. **HAGroupStatus**: add `forwarding_active`, `lease_state`, `lease_until` (Rust `protocol/binding.rs`). Lease telemetry only — failover decisions still come from BPF maps via `mergeHAStateFromMaps`.
+2. **CoSQueueStatus**: add `root_token_starvation_parks`, `queue_token_starvation_parks`, `tx_ring_full_submit_stalls` (Rust `protocol/cos.rs`). Distinct from the existing `DrainPark*` counters.
+3. **post_drain_backup_cos_drops / _cos_drop_bytes**: moved from Go CoSQueueStatus to Go **BindingStatus** to match the Rust source struct level (`protocol/binding.rs`). `post_drain_backup_bytes` stays on CoSQueueStatus — Rust emits it there. No existing Go consumer referenced the moved fields.
+4. **ProcessStatus**: add flat `event_stream_connected`, `event_stream_seq`, `event_stream_acked` (Rust `protocol/control.rs`). `_sent`/`_dropped` already matched.
+
+## Tests
+- Go `protocol_test.go` `*Parity1642`: decode the exact Rust-shaped JSON literal, assert every field is observed (the real gate — a pure Go round-trip misses fields the struct lacked). Also asserts CoSQueueStatus does not re-introduce the binding-scoped keys.
+- Rust `protocol/tests.rs` `*_1642`: pin the serde wire keys so a Rust rename is caught with the Go decode test failing in tandem.
+
+Wire-protocol both-sides discipline applied. 5/5 flake both suites; wire-invariant default-specimen fixture unchanged (no Rust fields added).
+
+Closes #1642
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #1657 — #1646: harden frr writeManagedSection against torn-write corruption [MERGED] (merged 2026-05-29)
+
+Branch: `fix/1646-frr-torn-write`
+
+Low likelihood, real data-loss: silent loss of FRR routing config (HA/forwarding-relevant).
+
+## Problem
+`writeManagedSection` stripped the xpf-managed block only when **both** `markerBegin` and `markerEnd` were found. A prior torn write (`os.WriteFile` is not atomic — a crash or disk-full mid-write can truncate after the begin marker) leaves an orphaned `markerBegin` with no `markerEnd`. The pre-fix code then skipped the strip and appended a second managed block → two begin markers. The next write's `strings.Index(markerEnd)` matched the new block's end while `content[:start]` cut from the orphaned first begin — **deleting everything in between**, which can include unrelated FRR config the operator or another tool appended.
+
+## Fix (two parts)
+1. **Orphaned-begin handling**: when `markerBegin` is found but `markerEnd` is not, discard from the begin marker to EOF (treat the unterminated managed block as a corrupt tail). Stops the double-begin state from ever forming.
+2. **Atomic write**: new `atomicWriteFile` helper (temp file in same dir, Write + Sync + Chmod, then `rename`). `rename(2)` within a filesystem is atomic, closing the window that produces the orphaned-begin state in the first place.
+
+## Test (fail-before / pass-after verified)
+`TestWriteManagedSection_OrphanedBeginMarker` seeds a torn file (unrelated operator route + orphaned begin + partial body, no end marker), runs two consecutive `writeManagedSection` calls, and asserts exactly one managed block, unrelated operator config preserved, partial torn body discarded. Fail-before confirmed (2 begin markers, partial body retained). 5/5 flake pass-after.
+
+Cluster-free, Go-test gated.
+
+Closes #1646
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #1660 — userspace-dp: dead-host negative neighbor cache fast-fails cold storms (#1651) [MERGED] (merged 2026-05-29)
+
+Branch: `pr/1651-b3-negcache`
+
+## Summary
+
+Path B3 of reopened #1651. The converged 3-way research (Codex+AGY+Claude SMR PLAN-READY) established that live empty-cache cold connects are already 1-9 ms on the supported dataplane; the 800 ms `pending_neigh` drop fires **only** for dead/non-responding hosts. The genuine hazard AGY-r1 rated HIGH is an **availability** one: a dead-host SYN storm saturates the bounded `pending_neigh` queue (`MAX_PENDING_NEIGH=4096`, 800 ms hold each) and, once full, drops LIVE cold connects at the admission gate — starving connects that would otherwise resolve in single-digit ms.
+
+This adds a per-binding, short-TTL dead-host **negative cache** so repeated cold packets to a non-responding dst fast-fail immediately instead of each re-occupying a `pending_neigh` slot for the full timeout:
+
+- **Record:** when a `pending_neigh` entry times out after best-effort ARP/NDP probes without resolving (`neighbor_dispatch.rs` drop site), its `(egress_ifindex, next_hop)` is recorded with the insertion timestamp.
+- **Fast-fail:** at the `MissingNeighbor` handler (`poll_descriptor`), BEFORE the kernel probe / session seed / `pending_neigh` buffer, a negatively-cached, un-expired, still-unresolved dst is recycled immediately (`scratch_recycle` + `continue`) — no queue slot, no probe, no `MissingNeighborSeed` session.
+- **Invalidation (both mandatory paths):**
+  - **RTM_NEWNEIGH** (host recovered): lazy resolved-neighbor-wins. The gate checks `forwarding.neighbors` then `dynamic_neighbors` FIRST (same order as `retry_pending_neigh` / `lookup_neighbor_entry`); on a resolved hit it evicts the negative entry and forwards normally. The shared netlink monitor thread already populates `dynamic_neighbors`, so a recovered host that receives traffic is unsuppressed on its very next packet — no monitor-thread/per-binding coupling needed.
+  - **TTL:** `NEG_NEIGH_TTL_NS = 3 s`, evicted on access. Bounds suppression of a recovered-but-silent host.
+
+Bounded at `MAX_NEG_NEIGH_CACHE=256`; on overflow the `FastMap` is cleared wholesale (best-effort optimization, never a correctness issue; `clear()` retains capacity). The established-flow hot path is untouched; the only added cost is one O(1) lookup on the `MissingNeighbor` cold path. Steady-state (empty cache) behavior is byte-identical. Per-binding placement mirrors `pending_neigh` — touched only by the owning worker thread, no `Arc`/`Mutex`/cross-core sync. Not HA-synced; a failover peer rebuilds it on the first dead-host drop.
+
+## Plan + adversarial plan review
+
+Plan doc: `docs/pr/1651-b3-negcache/plan.md`
+
+- Codex round-1: PLAN-NEEDS-MINOR (4 minors, all folded) — task `task-mpr4kgso-aecjuf`
+- AGY round-1: PLAN-READY — job `adversarial-review-mpr4ku4x-d2899w`
+- Claude SMR round-1: PLAN-READY (one minor, same as Codex #1)
+
+## Test plan
+
+- [x] cargo build --release clean
+- [x] cargo test --release: 1668 pass (the lone `snat_contract_doc_guard` failure is pre-existing on master — `docs/userspace-dataplane-gaps.md` lacks the scanned `fail-closed` token and is not in this diff)
+- [x] 8 new tests: 7 `neg_neigh` unit tests (TTL active/expire edges, overflow clear-vs-refresh, idempotent evict, resolved-wins) + 1 `retry_pending_neigh` integration test (timed-out dst is recorded)
+- [x] `neg_neigh` 5/5 flake check
+- [x] Go suite: all packages pass (with `TMPDIR=/tmp`; `/dev/shm` only fails 2 unrelated tests on unix-socket path length — diff is Rust-only)
+- [x] Deploy on loss userspace cluster (both nodes run B3)
+- [x] **Pass A — CoS disabled** (best-effort fast path)
+  - [x] v4 push 8.52 / rev 8.54 Gbps, 0 retrans @ 172.16.80.200
+  - [x] v6 push 8.24 / rev 8.56 Gbps, 0 retrans @ 2001:559:8585:80::200
+  - [x] v4 `-P12 -R`: 23.0 Gbps, 0 retrans; v6 `-P12 -R`: 22.6-22.7 Gbps, 0 retrans (initial 818-retrans run was transient; 0 on two reruns)
+- [x] **Pass B — CoS enabled** (per-class shaper + classifier): 44 measurements (ports 5201-5211, v4+v6, push+reverse) all 0 retrans; shaped classes hit configured rates (100m/1g/3g/6g/9g/...)
+- [x] **Dead-host-storm proof:** live cold connect under a 143K-SYN storm at 20 unused on-link IPs — 6/6 succeed, all <100 ms (median 0.52 ms, max 3.06 ms). NOTE: on this /24 topology the `pending_neigh` queue cannot be fully saturated (max ~254 distinct on-link hops < 4096 cap), consistent with the research finding that the starvation hazard requires a large distinct-destination fan-out; the mechanism itself is proven by the unit/integration tests. Master comparison: both pass on the /24 (no regression).
+- [x] `make test-failover`: 13/13 correctness assertions pass (iperf3 survived reboot-failover + rejoin + manual failback, 12/12 sessions synced, 22.6 Gbps post-failover). The lone failure is a boot-window timing artifact ("fw0 xpfd did not come back within 60s") — the immediately-following "fw0 rejoined as secondary" check passed; fw0 came back just past the 60s probe.
+
+Closes #1651
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #1664 — userspace-dp: enlarge neigh_monitor netlink rcvbuf to absorb bursts (#1658) [MERGED] (merged 2026-05-29)
+
+Branch: `pr/1658-rcvbuf`
+
+## Summary
+
+- The neighbor-monitor netlink socket (`neigh_monitor_thread` in `userspace-dp/src/afxdp/neighbor.rs`) set only `SO_RCVTIMEO` and left `SO_RCVBUF` at the system default. Under an `RTM_NEWNEIGH`/`DELNEIGH` multicast burst (HA failover, large neighbor churn) the default buffer can overflow: the kernel calls `netlink_overrun()`, sets `sk_err = ENOBUFS`, drops notifications. The steady-state `recv()` loop treats `recv() <= 0` as a bare `continue` with no errno inspection, so the loss is silent and `dynamic_neighbors` can permanently desync (the full reconcile dump is startup-only).
+- Set a **4 MiB** receive buffer at socket-creation time, on the same fd used by `initial_neighbor_dump()` and the steady-state loop, before either runs. `SO_RCVBUFFORCE` first (bypasses `net.core.rmem_max`; `CAP_NET_ADMIN` is held — helper runs as root for AF_XDP/BPF), falling back to plain `SO_RCVBUF`.
+- After the set, `getsockopt()` reads the effective size back and logs it — a plain `SO_RCVBUF` can succeed while silently clamping to `rmem_max`, so the `setsockopt` return alone does not confirm the buffer is active.
+- Tuning failure is logged and tolerated (monitor still works with the default buffer); not fatal.
+
+## Relationship to #1648 (do not collide)
+
+This is the **preventive** half of #1648 section 5.E. The **recovery** half (ENOBUFS errno inspection on `recv()` + socket recreation/resync, gated on Gate-R measurement) stays in #1648 and is **explicitly out of scope** here. This PR touches only `neighbor.rs`; #1648 owns `lib.rs`/`worker`/`maps_sync` and the recv-loop recovery.
+
+## Chosen size / option rationale
+
+- **4 MiB**: holds many thousands of small events (~80-200 B wire, larger skb truesize) — enough to absorb a full large-L2-domain neighbor flush while the thread is stalled up to one 500 ms `SO_RCVTIMEO` tick. Idle cost ~0 (`SO_RCVBUF` is an upper bound on dynamic `sk_buff` allocation).
+- **`SO_RCVBUFFORCE` primary**: keeps the guarantee self-contained rather than depending on the Go-side `tuneSocketBuffers()` `rmem_max` bump (`pkg/dataplane/userspace/process.go:139`), which is a cross-process side effect swallowed on failure. Plain `SO_RCVBUF` fallback covers any de-privileged path.
+
+## Plan + adversarial plan review
+
+Plan doc: `docs/pr/1658-rcvbuf/plan.md`
+
+- Codex round 1: **PLAN-NEEDS-MAJOR** (task `task-mpraz4ey-2t7j92`) — confirmed the ENOBUFS premise is real (cited `netlink_overrun`/`nlmsg_notify`); required an explicit burst target, a runtime `getsockopt` readback (setsockopt return is insufficient), a flake-proof test, and a FORCE-vs-RCVBUF justification. All addressed in plan v2 + this implementation.
+- AGY round 1: **PLAN-READY** (`review-mprazbiq-ikscx2`) — verified single-fd placement after `bind()` and before the dump; corrected the test clamp formula to `min(2*req, rmem_max)`; stack-local promotion nit. Applied.
+- Claude SMR: PLAN-READY — reconciled the FORCE-vs-RCVBUF reviewer split toward FORCE-first with runtime readback for observability.
+
+## Test plan
+
+- [x] `cargo build` clean (also exercises `const _: () = assert!(NEIGH_RCVBUF_BYTES >= 1 MiB)`)
+- [x] `cargo test --release`: all Rust suites green (1602 + 46 + 8 + 16) — see note below
+- [x] New `neigh_monitor_rcvbuf_enlarges_effective_buffer` test: 5/5 flake pass. Creates a `NETLINK_ROUTE` socket, requests a small 256 KiB (below any realistic `rmem_max`, so root-independent), asserts the `getsockopt` readback meets the doubled-then-clamped floor `min(2*req, rmem_max)`.
+- [ ] **Smoke (v4+v6 × push+reverse × CoS off/on): owned by the PARENT** — #1648 owns the loss cluster this cycle; this is a socket-buffer bump (low risk) and the parent runs the no-regression smoke.
+
+### Pre-existing failures (NOT from this PR — verified on pristine `origin/master`)
+
+- `snat_contract_doc_guard::snat_contract_documents_current_fail_closed_runtime` — doc-drift guard wanting "fail-closed" in `docs/userspace-dataplane-gaps.md`. **Reproduced on a clean `origin/master` checkout** (the string is absent on master); my diff does not touch that doc or the SNAT path.
+- `pkg/dataplane/userspace` two `bind: invalid argument` failures — unix-socket `sun_path` length limit in the sandbox `/tmp/claude-1000/...` path; environmental, no Go file touched by this PR.
+
+Closes #1658
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #1665 — #1662: NAT64 copies traffic class (DSCP+ECN) across translation [MERGED] (merged 2026-05-29)
+
+Branch: `pr/1662-nat64-dscp`
+
+## Summary
+
+NAT64 translation in `userspace-dp/src/nat64.rs` zeroed the IP DSCP/ECN field (IPv4 TOS byte / IPv6 traffic class) in **both** directions instead of copying it across the translation. Packets traversing the NAT64 path lost all QoS marking and end-to-end ECN. This copies the full 8-bit traffic class verbatim in both directions.
+
+Closes #1662
+
+## ECN / DSCP policy decision
+
+**Full 8-bit traffic-class copy (DSCP + ECN together)** — the RFC 7915 §4/§5 default for stateless translation (DSCP copied, ECN copied verbatim). This is intentionally distinct from the RFC 6040 *encapsulation* path in `afxdp/wg/dscp.rs` (which clears ECN because it builds a tunnel outer header). NAT64 is one-header-in/one-header-out translation, so verbatim copy is correct and preserves congestion signalling end to end. Bit layout mirrors `apply_dscp_rewrite_to_frame` in `afxdp/frame/mod.rs:133-134`.
+
+## Implementation
+
+- `translate_v6_to_v4`: use the already-reconstructed 8-bit traffic class (was discarded as `_traffic_class` at nat64.rs:149) for the IPv4 TOS byte instead of hard-zeroing. IPv4 header checksum is computed last over `out[..20]`, so it covers the new byte.
+- `translate_v4_to_v6`: read the IPv4 TOS byte and place it into the IPv6 traffic class straddling bytes 0-1, preserving the version nibble and leaving flow label 0.
+- Neither TOS nor TC is in any L4 pseudo-header, so TCP/UDP/ICMP checksums are unaffected. `Nat64ReverseInfo` stores only original IPv6 addresses, so no HA/session-sync state diverges.
+
+## Plan + adversarial review
+
+Plan doc: `docs/pr/1662-nat64-dscp/plan.md`
+
+- Codex plan review: **PLAN-READY** (task-mpraygb5-6rk1v9)
+- AGY adversarial plan review: **PLAN-READY** (adversarial-review-mpraypis-m3213h)
+- Claude SMR plan review: **PLAN-READY**
+
+## Test plan
+
+- [x] cargo build clean
+- [x] 3 new exact-byte tests (`translate_v6_to_v4_copies_traffic_class`, `translate_v4_to_v6_copies_traffic_class`, `nat64_traffic_class_round_trips`) using DSCP 46 EF + ECN ECT(0) = 0xBA — non-zero ECN nibble so a DSCP-only impl would fail
+- [x] **Fail-before / pass-after demonstrated**: reverting the two edits fails all three with the exact assertions; reapplying passes
+- [x] 5/5 flake clean on the three named tests
+- [x] cargo test --release: green except one **pre-existing master failure** unrelated to this change — `snat_contract_documents_current_fail_closed_runtime` fails identically on pristine origin/master because `docs/userspace-dataplane-gaps.md` lacks the `"fail-closed"` string (a SNAT doc-guard, different subsystem; not in this diff)
+- [x] Go suite: green (with a sane TMPDIR; two manager tests fail only when the sandbox `/tmp` socket path exceeds the 108-char `sun_path` limit — environment artifact, unrelated)
+
+## Docs
+
+No dedicated NAT64 DSCP doc exists; behavior is captured in code comments + the plan + this PR. No module doc update required.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #1668 — #1635: cold-path histogram log-linear buckets + direct zone-pair slot map [MERGED] (merged 2026-05-29)
+
+Branch: `refactor/1635-cold-path-hist-redesign`
+
+## Summary
+
+Redesigns the #1619/#1621 cold-path latency histogram foundation so the #1612 Scale Target tables (and the #1622 measurement consumer) can publish trustworthy numbers. Implements the merged PLAN-READY v3 plan (`docs/pr/1635-cold-path-hist-redesign/plan.md`, shipped via #1637). Fixes the three structural defects that PLAN-KILLed #1622, plus follow-up correctness gaps found in review around zone-id coverage, generation-skipping slot reuse, overflow-only status emission, and sparse-v3 wire-test coverage.
+
+## The three #1622 PLAN-KILL findings, fixed
+
+- **F1 bucket-0 resolution floor** → 48-bucket **log-linear** layout: 32 linear 16-ns buckets over `[0,512)` ns + 15 pow-2 buckets over `[512,2^24)` ns + 1 saturate. A true ~100 ns p50 reads within 2× (bucket upper bound 111 ns) instead of the old bucket-0 1023-ns midpoint (&gt;10× error).
+- **F2 16-slot splitmix collision bias** → **direct** `(from_zone_id, to_zone_id) → slot` map (`ColdPathSlotMap`, 255 assignable slots, `u8::MAX` reserved as lookup sentinel) built at config apply from configured policy zone-pairs. The table now covers zone-ids `0..=64` with a 65×65 direct index (`from * 65 + to`); retained pairs keep their slot + histogram, and reused slots are zeroed from the worker's own old→new map diff before reuse.
+- **F3 bimodal aggregate corruption** → **sparse per-zone-pair** wire surface (parallel active-slot arrays + `builder_collision`, renamed from `alias_seen`). Every active pair is a separable distribution; no collision-exclusion artifact.
+
+## Consumer success criteria (evaluated, not just internal correctness)
+
+- **≤2× per-bucket error @ 10/100/1K/10K rule counts** — `bucket_layout_resolves_low_end_within_2x` + `old_pow2_layout_would_fail_low_end_resolution` (fail-before/pass-after vs the retired 24-bucket layout).
+- **20-zone-pair separability, no alias exclusion** — Go `TestEmitWorkerColdPath_V3_TwentyZonePairsSeparable` (20 distinct series) + `..._SparseEmitsOnlyActiveSlots`.
+- **Real per-zone-pair percentiles** — `from_zone`/`to_zone` labels on the v3 families; aggregation is the operator's PromQL choice.
+- **O(1) hot-path, no per-packet alloc** — `lookup_slot` is bound-check + multiply + array index + `!= u8::MAX`; `record_sample` takes the precomputed slot.
+
+## Wire protocol (both sides, per feedback_wire_protocol_both_sides)
+
+- Rust `protocol/binding.rs`: `cold_path_layout_version=3` + `cold_path_active_*` + `cold_path_overflow_active`.
+- Go `protocol.go`: mirrored; legacy dense v1 fields retained **read-only** so a new collector still emits correct v1 metrics against a pre-#1635 Rust daemon (plan §3.2 row "v1 Rust / v3 Go"). Go emitter branches v1 / v3 / unknown-version, and overflow-only payloads now stamp v3 so the sparse overflow gauge is visible even before any samples arrive.
+- Go protocol tests now pin the sparse v3 serde/json field names with a Rust-shaped decode + re-encode round-trip test.
+
+## Implementation deviations (documented in plan §IMPL)
+
+1. Capacity is **255 assignable** (slot 255 = `u8::MAX` sentinel), not literally 256.
+2. `from_zone`/`to_zone` labels carry **zone-ids**, not names (avoids plumbing a zone-name table to the collector; satisfies separability).
+3. §5.5 TSC-injection accuracy harness realized as **deterministic unit tests** proving the same ≤2× criterion.
+
+## Test plan
+
+- [x] cargo build clean; clippy clean on changed files (pre-existing `umem/mmap.rs` lint unrelated)
+- [x] 1610 Rust unit tests pass
+- [x] 39 `cold_path` tests — 5/5 flake clean
+- [x] Go `pkg/api` + `pkg/dataplane/userspace` + `pkg/daemon` pass
+- [ ] Cluster smoke — see PR comment (argued not required; measurement/cold-path code validated by unit tests)
+
+🤖 Generated with <a href="https://claude.com/claude-code">Claude Code</a>
+
+---
+
+## PR #1670 — #1667: restore hyphenated fail-closed token in SNAT gaps doc [MERGED] (merged 2026-05-29)
+
+Branch: `pr/1667-snat-docguard`
+
+## Summary
+
+Fixes the RED doc-guard `snat_contract_documents_current_fail_closed_runtime` on master. `docs/userspace-dataplane-gaps.md` had lost the literal hyphenated token `fail-closed` (a reword in c0a047ea2 changed "now fail-closed at the poll_descriptor.rs source-NAT call sites" to "fail closed at the ..."), while the SNAT runtime stayed genuinely fail-closed. This restores the single hyphen so the doc matches the runtime and the parallel architecture.md / plan-1377 wording.
+
+## Decision: doc-drift, not stale guard
+
+The guard encodes a still-true #1377 contract across runtime + three docs. Verified:
+- Runtime is fail-closed: `source_nat_decision_for_flow` (poll_descriptor/mod.rs:43-66) maps `SourceNatLookup::Unavailable(failure)` for missing/empty/invalid-port/malformed/wrong-family/exhausted pools to `Err(failure)`; all 4 call sites (mod.rs:1481/1511/2559/2588) record the failure, recycle the descriptor, and `continue` — packet dropped before session creation/forwarding.
+- `NoMatch -> Ok(default)` is correct identity behavior for flows with no matching SNAT rule, not fail-open. The doc claim is accurate, not string-stuffed.
+- `architecture.md` (3x) and `plan-1377-snat-pools.md` (5x) already contain `fail-closed`; only gaps.md drifted.
+
+## Plan + adversarial review
+
+Plan doc: docs/pr/1667-snat-docguard/plan.md
+
+- Codex plan review: PLAN-READY (task-mprdwfvq-yq64ra)
+- AGY adversarial plan review: PLAN-READY (adversarial-review-mprdwjhs-i74x88)
+- Claude SMR: PLAN-READY
+
+## Test plan
+
+- [x] `snat_contract_doc_guard` RED -> GREEN
+- [x] 5/5 flake on the guard test
+- [x] full `cargo test --release`: 1605 passed, 0 failed across all binaries
+- [x] full Go suite green (`TMPDIR=/tmp`; pre-existing >108-char $TMPDIR socket-bind artifact avoided)
+
+No code or guard change; doc-only. No dataplane behavior change, so no smoke required.
+
+Closes #1667
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #1671 — #1661 item 8: fix refactoring-audit drift + add make audit-check guard [MERGED] (merged 2026-05-29)
+
+Branch: `pr/1661-audit-drift`
+
+## Summary
+
+Addresses **#1661 item 8** (the audit-drift sub-item only — items 1-7 stay open).
+
+`docs/refactoring-audit-current.txt` had drifted from the tree: it still listed source files deleted in #1476 (`bpf/xdp/xdp_zone.c`, `bpf/xdp/xdp_policy.c`) and #1528 (`pkg/dataplane/dpdk/dpdk_cgo.go`). This PR regenerates the artifact and adds a `make audit-check` drift guard so it cannot silently drift again.
+
+## Root cause of the drift
+
+`scripts/refactoring-audit.sh` runs under `set -euo pipefail`. `audit_bpf()` did `find bpf/xdp bpf/tc -name '*.c' 2>/dev/null`. After #1476 deleted those directories, `find` exits non-zero; `2>/dev/null` silences the stderr message but **not** the exit status, so under `set -e` the script aborted with **exit 1** — *after* having printed correct output to stdout. Anyone regenerating saw the non-zero exit and skipped committing, so the artifact went stale. The script had to be fixed before a guard could be trusted (a guard that shells out to the generator would otherwise fail on the exit code, not on a content diff).
+
+## Changes
+
+- **`scripts/refactoring-audit.sh`** — add `audit_existing_dirs()` helper that echoes only audit roots that still exist; route `audit_rust`/`audit_go`/`audit_bpf` through it. Helper `return 0` so a `dirs=$(...)` assignment doesn't inherit the trailing `[ -d ]` failure under `set -e`. Script now exits 0 and is byte-identical across runs.
+- **`docs/refactoring-audit-current.txt`** — regenerated. Removes the 3 deleted-file refs; reflects current LOC + new candidates.
+- **`Makefile`** — standalone `make audit-check` guard: regenerate to a temp file, `diff` vs committed artifact, fail on difference **or** generator failure. `&&`-chained generator (Make recipes run without `set -e`) + `trap ... EXIT` cleanup. Not wired into `test`/`all` by design.
+- **`docs/refactoring-audit.md`** — document determinism, missing-root tolerance, and the guard.
+
+## Plan + adversarial review
+
+Plan doc: `docs/pr/1661-audit-drift/plan.md` (v2). Round-1 plan review (Codex provisional + AGY verified + Claude SMR) all PLAN-NEEDS-MINOR; findings (recipe must fail on generator failure not just diff; array-guard all three roots; precedence-trap warning) folded into v2 and implemented.
+
+## Test plan
+
+- [x] `bash scripts/refactoring-audit.sh; echo $?` → 0 (was 1)
+- [x] Two runs diff byte-identical (determinism)
+- [x] No `dpdk_cgo`/`xdp_zone`/`xdp_policy` refs remain
+- [x] `shellcheck scripts/refactoring-audit.sh` clean
+- [x] `make audit-check` passes on regenerated artifact, no temp-file leak
+- [x] `make audit-check` fails (exit != 0) on a deliberately-stale artifact
+- [x] `make audit-check` fails on a forced generator failure (proves `&&` chaining)
+- [x] Docs + script + Makefile only — no Go/Rust source touched, so no `go test`/`cargo` required
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #1672 — userspace: gate BPF READY write on binding.Ready && !Dead (#1666) [MERGED] (merged 2026-05-29)
+
+Branch: `pr/1666-ready-gate`
+
+## Summary
+
+Closes #1666.
+
+The `userspace_bindings` BPF-array READY flag — checked by the
+`userspace-xdp` shim to decide whether to steer transit into a slot's
+AF_XDP socket — was written at four sites in `maps_sync.go` on a
+`Registered && Armed` predicate (the two primary sites) or `Registered
+&& Armed && Bound` (the two VLAN-alias sites). `Registered`/`Armed` are
+set in the binding handler and are **not** cleared when a worker thread
+dies, so a panicked or never-registered worker kept its slot advertised
+forwarding-ready and the shim steered transit to a socket nobody drains.
+
+All four sites now gate on `bindingForwardingLive(binding, deadWorkers)`
+= `binding.Registered && binding.Armed && binding.Ready &&
+!deadWorkers[binding.WorkerID]`:
+
+- `binding.Ready` is the helper-derived `registered && bound &&
+  xsk_registered && heartbeat_fresh` (coordinator/refresh_bindings.rs:225).
+  All sub-conditions flip true from worker **bringup** alone (socket
+  create → `set_bound`, XSKMAP register → `set_xsk_registered`,
+  per-poll-tick heartbeat), independent of inbound traffic — so the gate
+  **cannot deadlock** a legitimately-live binding.
+- `Registered && Armed` is retained because `Ready` does **not** imply
+  `Armed` (the Rust derivation omits it; `armed` is a separate
+  control-plane flag) — a Ready-but-disarmed binding must not forward.
+- `!Dead` uses the already-parsed `WorkerRuntimeStatus.Dead` panic signal
+  (#925, set synchronously by the supervisor on `catch_unwind`) to clear
+  a crashed worker's slot in one status-poll cycle (~1s) instead of
+  waiting ~5s for heartbeat staleness to flip `Ready` false.
+
+The clear is **apply-driven**: `applyHelperStatusLocked` rewrites `Flags`
+for every binding each pass. Tightening the watchdog
+(`verifyBindingsMapLocked`) on the same gate stops it from fighting the
+clear by re-asserting READY=1 for a dead slot.
+
+No new fields, no protocol change, no Rust change.
+
+## Why this is a real fix (not redundant)
+
+The XDP shim independently fail-closes transit to a stale-heartbeat slot
+(lib.rs:449 → `drop_degraded_transit` → `XDP_DROP`), but Go programs that
+timeout to **30s** (`HeartbeatTimeoutMS: 30000`), and the bindings
+watchdog actively re-asserts READY=1 for a dead slot the whole time. The
+honest win is reducing dead-worker transit exposure from **~30s
+(watchdog-pinned)** to **~5s** (`Ready`) — or near-instant with `!Dead`.
+
+## Plan + adversarial review
+
+Plan + full deadlock analysis + round-by-round dispositions:
+
+*(truncated — 87 lines total)*
+
+
+---
+
+## PR #1674 — #1673: refresh README + gaps doc after eBPF source-removal closeout [MERGED] (merged 2026-05-29)
+
+Branch: `pr/1673-readme-refresh`
+
+## Summary
+
+Documentation-only refresh. The top-level `README.md` and
+`docs/userspace-dataplane-gaps.md` drifted after the #1373 eBPF
+retirement umbrella closed: they still framed legacy eBPF as a
+selectable, *warned* forwarding backend and presented #1373/#1476
+source-removal as in-flight. Current `master` **hard-rejects** explicit
+eBPF, the `bpf/xdp`/`bpf/tc` source is deleted, and every #1373-family
+issue plus the #1525 DPDK retirement is closed. This PR makes both docs
+describe the verified current reality.
+
+Closes #1673
+
+## Verified drift (each confirmed against current master)
+
+- **Hard-reject, not warn:** `pkg/config/compiler.go:37-40` +
+  `:372-381` (`ErrEBPFDataplaneRetired`, returned by
+  `validateDataplaneTypeStrict`), pinned by
+  `pkg/config/parser_system_test.go:1401-1425`. Runtime:
+  `pkg/dataplane/dataplane.go:44-47` + `:200-206`
+  (`ErrEBPFBackendRetired`). The parser still *accepts* the `ebpf` token
+  (`validDataplaneType`, compiler.go:1126-1133) only so `load
+  merge`/`load override` of an old config parses; `commit check` then
+  hard-fails. If a persisted config still names `ebpf`, the daemon runs
+  config-only (`pkg/daemon/daemon_run.go:309-324`).
+- **`bpf/xdp` + `bpf/tc` deleted:** `find bpf -maxdepth 3 -type f` shows
+  only `bpf/headers/*`.
+- **`make generate`:** `Makefile:18-22` runs only `go generate
+  ./pkg/dataplane/...` (retained Rust AF_XDP shim object, no bpf2go).
+- **All #1373-family + #1525 closed.**
+
+## What changed
+
+README:
+- Banner + Dataplane Architecture: single userspace AF_XDP runtime path;
+  hard-reject contract + parser-token rolling-upgrade nuance +
+  config-only-mode remediation.
+- Dropped the selectable-backends framing and the Legacy-vs-Userspace
+  comparison table; added a Userspace Dataplane Capabilities table and a
+  Historical note (14-program pipeline + 25+ Gbps moved to history with
+  `git log -- bpf/xdp/ bpf/tc/`).
+- Removed stale `xdp_main_prog` / "falling back to legacy eBPF" /
+  "legacy BPF pins remain" / "BPF map occupancy on eBPF" references;
+  fixed Quick Start, Code Layout bpf rows, `pkg/dataplane/` row,
+  Performance, and clang/llvm requirement.
+- Linked remaining hardening to OPEN #1614 / #1608, not closed #1373.
+
+gaps.md:
+- Rewrote Deprecation Context: replaced the now-false "No BPF source ...
+  removed in this phase" sentence and the "accepted with a compile
+
+*(truncated — 104 lines total)*
+
+
+---
+
+## PR #1675 — Regenerate refactoring-audit artifact to fix make audit-check on master [MERGED] (merged 2026-05-29)
+
+Branch: `fix/audit-artifact-regen-post-1671`
+
+## Summary
+
+#1671 added the `make audit-check` drift guard but merged with a **stale artifact**: a force-push of the rebased+regenerated branch silently failed (no upstream refspec), so the squash-merge captured the pre-#1635/#1666 LOC. `make audit-check` is consequently RED on master.
+
+This regenerates `docs/refactoring-audit-current.txt` against current master so committed == fresh:
+- `poll_descriptor/mod.rs` 2957 → 2983 (#1635 histogram redesign)
+- `cold_path_hist.rs` new WATCH entry 1745 (#1635)
+- `maps_sync.go` 1559 → 1617 (#1666 READY-gate)
+
+`make audit-check` now passes (verified deterministic, run twice). Mechanical regeneration of a generated artifact — validated by the deterministic guard it restores.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #1676 — userspace-dp: remove dead parallel-prefix scaffolding (#1638) [MERGED] (merged 2026-05-30)
+
+Branch: `pr/1638-rm-scaffold`
+
+## Summary
+
+PRs #1624 (`#1609 STAGED Step 1`) and #1632 (`#1623 Path B narrow`) added
+parallel-prefix scaffolding to `userspace-dp/src/policy.rs` to feed a future
+Multi-Book-LPM / JIT-DAG consumer (#1605 / #1609 / #1623). **All three consumer
+issues are now CLOSED / plan-killed**, so the scaffolding is dead and
+structurally re-introduces the per-rule prefix duplication that #1606
+eliminated. This PR removes it, restoring the #1606 `book_count`-bounded dedup
+state.
+
+Removed (in-memory derived state only):
+- `BookEntry.prefixes_v4/v6` (`Arc<[Prefix]>` per book)
+- `PolicyRule.{source,destination}_prefixes_v{4,6}` (`Option<Arc<[Prefix]>>` per rule)
+- `build_rule_side_arc` helper
+- `parse_v3_literal_set_capture` → reverted to non-capturing `parse_v3_literal_set`
+
+Net **-1027 LOC**.
+
+## Wire protocol: UNCHANGED
+
+`AddressBookSnapshot.prefixes_v4/v6` (Rust `protocol/security.rs` + Go
+`protocol.go`) is the **live #1606 address-book content** field — parsed into
+`BookEntry.v4/v6` PrefixSets that `try_match_rule` reads on the hot path. It is
+**not** scaffolding and is **not** touched. No `protocol.rs`/`protocol.go`
+edit, no serde field change, no version bump, no HA compat hazard (compiled
+`PolicyState`/`PolicyRule`/`BookEntry` derive no `Serialize`; only the
+`*Snapshot` wire types cross the HA boundary, and each peer rebuilds compiled
+state from them).
+
+## Grep-proven dead
+
+`try_match_rule` (sole policy-evaluation path, reached from every
+`evaluate_policy*` entry point + the global-rule path) reads only literals,
+book indices, the `*_match_any` flags, and `state.books[].v4/v6` PrefixSets. No
+`*_prefixes_*` field is read at runtime; zero references outside
+`policy.rs`/`policy_tests.rs`.
+
+## Plan + adversarial review
+
+Plan doc: `docs/pr/1638-rm-scaffold/plan.md`
+
+- AGY plan r1: PLAN-READY
+- Claude SMR plan r1: PLAN-READY
+- Codex plan r1: PLAN-NEEDS-MINOR (both non-architectural minors addressed in plan v2 — read-site wording correction; preserve `test_policy_rule_v3_any4_any6_tokens` live match-any coverage)
+
+## Test plan
+
+- [x] cargo build --release clean, zero new warnings (45 never-used on this branch == master)
+- [x] cargo test --release: 1589 lib + 46 policy + integration suites pass; new `test_policy_rule_v3_any4_any6_tokens` passes
+- [x] policy tests 5/5 flake-clean (46/46 each run)
+
+*(truncated — 63 lines total)*
+
+
+---
+
+## PR #1677 — smoke: make IPv6 mtr observability-only, gate forwarding on controlled ping (#1303) [MERGED] (merged 2026-05-30)
+
+Branch: `pr/1303-mtr-smoke`
+
+## Summary
+
+The userspace HA smoke (`scripts/userspace-phase-cycle.sh` →
+`scripts/userspace-ha-validation.sh`) false-failed a healthy IPv6
+dataplane when the **external public IPv6 traceroute final hop** did not
+answer the ICMPv6 probe. #1301 made the final hop non-fatal but
+over-corrected: the IPv6 mtr check then only asserted the **first** hop
+(the firewall's own LAN gateway) resolved — L3-local liveness, not
+forwarding. A genuinely-broken IPv6 dataplane could still pass as a
+warning.
+
+This makes the IPv6 forwarding signal robust and under our control,
+without weakening the smoke into a no-op:
+
+- **Public IPv6 mtr → observability-only.** Any unresolved/silent
+  later or final hop is a recorded warning, never a hard fail (external
+  endpoint + intermediate ICMPv6 rate-limiting are outside our
+  control). An unresolved **first** hop still fails.
+- **IPv6 forwarding is gated by controlled signals that already exist:**
+  the LAN→WAN-target ping (the LAN host reaches the WAN-side target only
+  by transiting the userspace dataplane), the IPv6 TTL=1 probe, and the
+  IPv6 iperf3 leg. The ping is now an explicit `validate_reachability`
+  assertion (fails on `0 received`), not just `ping`'s exit code, and
+  `assert_forwarding_route` guards against the target drifting on-box.
+- **Classifier extracted** to `scripts/mtr_report_check.py` (unit
+  testable). The IPv4 leg keeps its final-hop hard gate (1.1.1.1 is a
+  reliable responder) but parses loss **numerically** by anchoring on
+  the `%` token, so `(waiting for reply)`, column-truncated `100.0`
+  (no `%`), integer `100%`, or an unparseable loss column fail closed.
+- Pings/mtr captured with `LC_ALL=C` + `2>&1 || true` so a 100%-loss
+  ping or non-zero mtr exit can't crash the validator under `set -e`
+  before the classifier/assertion runs.
+
+## Why this still catches a real IPv6 break
+
+| Failure mode | Caught by |
+|---|---|
+| IPv6 dataplane forwards nothing (ICMP) | `validate_reachability` — HARD FAIL |
+| Forwards ICMP but not TCP | existing IPv6 `iperf3` to `::200` — HARD FAIL |
+| Hop-decrement / firewall ICMPv6 path broken | `validate_ttl_probe ipv6` — HARD FAIL |
+| Target drifted on-box (no transit) | `assert_forwarding_route` — HARD FAIL |
+| External public final hop silent | IPv6 mtr: WARNING (correct) |
+| Healthy path, all upstream ICMPv6 rate-limited | IPv6 mtr: WARNING (no longer false-fails) |
+| IPv4 final hop dead / `(waiting for reply)` / `100%` | IPv4 mtr: HARD FAIL (numeric loss, fail-closed) |
+
+## Plan + adversarial review
+
+Plan doc: `docs/pr/1303-mtr-smoke/plan.md`
+
+- v1 **PLAN-KILLED** (Codex + AGY): the v1 "≥1 resolved hop beyond the
+
+*(truncated — 74 lines total)*
+
+
+---
+
+## PR #1679 — userspace-dp: gate DBG SEG_MISS print, record seg-miss exception (#1282) [MERGED] (merged 2026-05-30)
+
+Branch: `pr/1282-segmiss`
+
+## Summary
+
+- #1282 reported `DBG SEG_MISS` journal spam + 315k "TX errors" from a reverse all-class CoS sweep on master @ `1a4699f6`. **Reproduced on current master: both original symptoms are already resolved.**
+  - SEG_MISS false positive fixed by **#1283** (`0ce930385`, ancestor of HEAD): the precheck prefers the parsed frame L3 offset over a stale VLAN `meta.l3_offset`.
+  - The "TX errors" were CoS admission drops, not TX-ring/submit failures; **`85858ec0d`** (ancestor of HEAD) added the `TX errors non-admission` decomposition.
+- This PR fixes the **one residual logging-hygiene defect**: the `eprintln!("DBG SEG_MISS...")` was the only debug print in `tx/dispatch` *not* gated behind `cfg!(feature = "debug-log")`, so it wrote to journald in release builds (default features `[]`).
+- Naive gating would create a **production blindspot** — `seg_needed_but_none` is `pub(in crate::afxdp)` and never reaches Go/CLI, so a genuine seg-miss would be 100% silent in release while the dataplane forwards an oversized frame the NIC/switch/peer then drops. To preserve diagnosability, a genuine seg-miss now records a first-class `tcp_segmentation_miss` exception (visible under `Recent exceptions` in `show chassis cluster data-plane statistics`), **rate-capped to 20/worker-thread** so it cannot spin the `recent_exceptions` mutex on the hot path.
+
+## Reproduction (current master, post-#1283)
+
+Deployed binary `160c296ab` (current master + #1635) on `loss:xpf-userspace-fw0`. Applied the symmetric CoS fixture, ran concurrent high-rate reverse all-class load (`iperf3 -R -P 12`):
+
+| Run | Target | Port | Aggregate | Retr |
+|---|---|---|---|---|
+| v4 24g | 172.16.80.200 | 5210 | 16.9 Gb/s | 0 |
+| v4 uncapped | 172.16.80.200 | 5211 | 1.24 Gb/s | 0 |
+| v6 24g | 2001:559:8585:80::200 | 5210 | 15.7 Gb/s | 793* |
+| v6 uncapped | 2001:559:8585:80::200 | 5211 | 1.24 Gb/s | 116* |
+
+\* shaped-class TCP backoff, not drops.
+
+- Journal over the entire repro window: **0 `DBG SEG_MISS` lines** (v4 + v6).
+- `TX errors non-admission: 0` (the 618 top-level TX errors = 100m-shaped-class admission drops, matching the 618 retrans).
+
+## Plan + adversarial review
+
+Plan doc: `docs/pr/1282-segmiss/plan.md`
+
+- Codex plan round-1: PLAN-NEEDS-MINOR (`task-mprtr0ce-hmo6nh`) — all minors applied (ancestry checks, honest framing, gate short-circuit order, both-feature-mode validation).
+- AGY plan round-1: PLAN-NEEDS-MINOR (`adversarial-review-mprtr52y-la8h95`) — caught the production blindspot; adopted the `record_exception` fix.
+- Claude-SMR: PLAN-READY (independently confirmed `seg_needed_but_none` has no Go/CLI surface; added the rate-cap on the recording).
+
+## Test plan
+
+- [x] `cargo build --release` (default features) clean — eprintln DCEs out
+- [x] `cargo build --release --features debug-log` — verified the gated block compiles (the build also surfaces a **pre-existing, unrelated** `debug-log` breakage `ICMPV6_EMBED_LOGGED private`, tracked in **#1678**; not in scope here)
+- [x] `cargo test --release`: 1616/1616 pass (2 new)
+- [x] `segmentation_miss` 5/5 flake check
+- [x] `rustfmt --edition 2024 --check` clean on both touched files
+- [x] `go build ./...` clean (no Go change)
+- [x] Reproduced clean on loss userspace cluster (0 SEG_MISS, 0 non-admission TX errors)
+- [ ] Parent runs the final no-regression smoke matrix before merge
+
+Closes #1282
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #1680 — userspace-dp: per-class waterfill trace-counter instrumentation (#1628) [MERGED] (merged 2026-05-30)
+
+Branch: `pr/1628-cos-instr`
+
+## Summary
+
+Adds empirical per-class trace counters to the guarantee-rate CoS waterfill selector (`select_exact_cos_guarantee_queue_waterfill`) so future CoS work can diagnose why a class undershoots its guarantee. Scoped to the worker-local waterfill selector — the only path implementing the Phase-1/Phase-2 split that #1630's verified root-cause research indicts (multi-worker queue-ownership fragmentation + flat root shaper). **Observability only**: the scheduler reads none of these counters; all are zero on the Proportional (legacy RR) path.
+
+This is the narrower, consumer-scoped counter set the #1628 parking note (2026-05-28) anticipated — built against #1630's verified need, NOT the broad speculative `coordinator/cos_state.rs` + `rotate_epoch_v8.rs` list in the original issue body (v8 fair-share observability is deferred to the #1630 fix PR that owns that surface).
+
+## Counters
+
+Per-queue (`CoSQueueWaterfillCounters` on `CoSQueueTelemetry`, plain `u64`, single-writer owner worker, read same-thread in `build_worker_cos_statuses` + published via ArcSwap — no atomics):
+- `phase1_admissions` / `phase2_admissions` — admissions via the Phase-1 (small-first honored) vs Phase-2 (descending residual) walk.
+- `eligible_visits` — times the selector reached this queue eligible and evaluated it (both phases, before the token gate).
+
+Per-interface (on `CoSInterfaceRuntime`):
+- `waterfill_epochs` / `waterfill_phase1_budget_breaks` — cluster SUM event counters.
+- `waterfill_min_epochs_per_worker` — coordinator MIN over workers **with active exact-guarantee backlog** so a single Phase-2-locked worker (frozen epochs) is visible even while the SUM climbs; an idle worker's frozen 0 is excluded (cannot mask a real lock-in).
+
+## How each counter diagnoses #1614's three symptoms
+
+- **Starvation / shape-undershoot (Symptom 1):** `phase1_admissions` vs `phase2_admissions` + `waterfill_phase1_budget_breaks` show whether a small class is honored in Phase 1 or only ever gets Phase-2 residual, and how often Phase-1 budget runs out mid-walk.
+- **Cluster-ceiling / fragmentation (Symptom 2):** per-queue `eligible_visits` (keyed to the queue's single owner) + `waterfill_min_epochs_per_worker` expose the per-worker fragmentation — a queue whose owner rarely walks it, and a single stalled core.
+- **Per-flow CoV (Symptom 3):** complements the existing `active_flow_buckets_peak`; the `eligible_visits` + `*_starvation_parks` pairing separates "backlogged-but-parked" from "genuinely idle on this owner".
+
+**Interpretation is a contract, not a single-counter fingerprint** (both reviewers, r2/r3): `phase1=0/phase2>0` is a lock-in ONLY combined with `queued_bytes>0` + `*_starvation_parks` AND only for a small class within the Phase-1 budget; the same shape on a large above-cutoff class is healthy rate-limiting. Documented in `docs/cos-validation-notes.md`.
+
+## Plan + adversarial review
+
+Plan doc: `docs/pr/1628-cos-instr/plan.md` (4 rounds, ledger in `reviewer-ids.md`)
+
+- Codex r4 (`task-mpruu0t3-syur98`): **PLAN-READY**, no findings.
+- Antigravity r4 (`adversarial-review-mpruu5b6-4oryi3`): PLAN-NEEDS-MINOR — one new compile-borrow defect (hoist `kind` so the `head` borrow ends before the telemetry write), applied in v5.
+- Earlier rounds drove: monotonic totals (not a swap that freezes during lock-in), dropped the unverifiable `worker_fair_share` claim, dedicated struct (no `CoSQueueDropCounters` pollution), backlog-guarded MIN (idle-worker conflation + default-0 trap).
+
+## Test plan
+
+- [x] cargo build clean (lib + bin)
+- [x] cargo test --release: 1621 lib + 46/8/16/1 across bins pass (isolated target dir)
+- [x] new waterfill unit tests: Phase-1 honor, budget-break→Phase-2, Proportional-mode-stays-zero counter-factual, 5/5 flake
+- [x] coordinator MIN aggregation tests: SUM, idle-worker exclusion, no-backlog sentinel
+- [x] Go `./...` suite passes (the 2 unix-socket-path failures are a sandbox tmpdir-length limitation, pass with short TMPDIR)
+- [x] Go wire round-trip parity (`TestCoSWaterfillCountersParity1628`) + Prometheus emit (`TestEmitCoSWaterfillTelemetry_...`)
+- [x] wire golden fixture regenerated (additive `#[serde(default)]` fields)
+- [ ] **Smoke on loss userspace cluster — deferred to the parent agent** (cluster serialized across sibling agents)
+
+Closes #1628
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #1681 — userspace-dp: fix --features debug-log build (ICMPV6_EMBED_LOGGED private) (#1678) [MERGED] (merged 2026-05-30)
+
+Branch: `pr/1678-debuglog`
+
+## Summary
+
+- The `userspace-dp` `--features debug-log` build failed to compile on master with `E0425: cannot find value ICMPV6_EMBED_LOGGED in this scope`. The static at `afxdp/bpf_map/mod.rs:871` was declared private but is referenced under `#[cfg(feature = "debug-log")]` from `afxdp/poll_descriptor/mod.rs:1220`.
+- Root cause: the consumer resolves the symbol through a two-hop glob (`use self::bpf_map::*` in `afxdp/mod.rs:144`, then `use super::*` in `poll_descriptor/mod.rs:31`). A *private* `bpf_map` item never reaches `afxdp`, so the glob can't surface it. The sibling `SESSION_CREATIONS_LOGGED` is `pub(super)` and resolves fine through the same path.
+- Fix: re-scope `ICMPV6_EMBED_LOGGED` to `pub(super)`, matching the adjacent sibling exactly. Minimal-correct visibility (visible to `crate::afxdp`, the consumer's scope; not widened to `pub(crate)`/`pub`). No codegen change in any build — the static is debug-log-gated and absent from the default production binary.
+- Added a standalone **manual** Makefile target `build-userspace-dp-debug-log` (compile-only, not wired into `all`/`build`/`test`, mirroring `audit-check`) so the feature build can be revalidated with one command. There is no CI in this repo, so this is a developer convenience, not an automated gate.
+
+Default (no-feature) build and behaviour are unchanged.
+
+## Plan + adversarial review
+
+Plan doc: `docs/pr/1678-debuglog/plan.md`
+
+- Codex plan review: PLAN-NEEDS-MINOR (Makefile over-claimed as a "guard"; reframed as manual check) — addressed
+- AGY plan review: PLAN-READY (empirically compiled the `--features debug-log` build in the worktree and confirmed the resolution chain)
+- Claude SMR: PLAN-READY
+
+## Test plan
+
+- [x] `cargo build --release --features debug-log`: clean (was: E0425)
+- [x] `cargo build --release` (default features): clean, unchanged
+- [x] `cargo test --release`: 1589 + 46 + 8 + 16 + 1 pass, 0 failed
+- [x] `make build-userspace-dp-debug-log`: exits 0
+- [x] No Go change — Go suite unaffected (no Go files touched)
+
+No smoke: this is a build-config / symbol-visibility fix with no runtime or dataplane behaviour change.
+
+Closes #1678
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #1682 — config: re-home typed-leaf schema onto setSchema + generic walker (#1319 PR 1) [MERGED] (merged 2026-05-30)
+
+Branch: `pr/1319-typed-leaf-pr1`
+
+## Summary
+
+#1319 PR 1 of N. Fixes **symptom 1** (typed-value `?` completion) and
+re-homes the typed-leaf schema so the completion path and the
+commit-check validation path read ONE tree and cannot drift.
+
+Research found the merged Phase 1/2 (#1320) delivered commit-check
+validation but left symptom 1 broken on master: the live config-mode
+`set` completer routes through `config.CompleteSetPathWithValues` over
+`config.setSchema` and never consulted the cmdtree typed-leaf overlay it
+was wired against. This PR implements the 3-way-converged Option A.
+
+- Move `ValueType` + constants + `Placeholder()` to `pkg/config`
+  (`pkg/cmdtree` imports `pkg/config`, so the type can't live in cmdtree
+  without an import cycle); cmdtree re-exports via aliases. No behaviour
+  change.
+- Add typed-leaf fields (`valueType`/`valueDesc`/`valueExamples`/
+  `validator`) to `setSchema`'s `schemaNode`. **Fields only** — no
+  `children` map added/altered (SetPath grouping keys on `children==nil`,
+  `ast_edit.go:196`); `TestSetPathGrouping_Golden` pins this.
+- Populate the three schedulers leaves on `setSchema`. `buffer-size
+  temporal` is intentionally NOT carried over (compiler never consumes
+  it; typing it would violate the compiled-leaf-only invariant).
+- Wire `CompleteSetPathWithValues` to surface placeholder + examples at
+  the value slot — **the symptom-1 fix that reaches the live CLI**.
+- Replace `walkSchedulers` with a generic recursive walker
+  (`config.SchemaValidate`, `schema_walk.go`) that descends `setSchema`
+  against the AST: both AST shapes, named-instance containers, standard
+  typed leaf, `multi && children==nil` value-tail/range
+  (`destination-port 20000 to 20003`), cross-sibling modifier-only line
+  (`transmit-rate exact`). Opt-in per leaf — PR 2..N need no walker edits.
+- Remove the class-of-service-only early return; move `SchemaValidate`
+  into `pkg/config`; `configstore` calls `config.SchemaValidate`.
+- Retire the cmdtree config-mode overlay
+  (`ConfigClassOfServiceSchedulers`, `cmdtree.SchemaValidate`, the
+  unit-only `CompleteFromTreeWithDesc` set tests — a false-coverage trap).
+  cmdtree's `Node` keeps its typed-leaf fields for the operational tree
+  and the retained `set system dataplane` overlay.
+
+## Symptom-1 fixed (demo)
+
+`set class-of-service schedulers be transmit-rate ?` through the live
+completer now returns `<rate>` + `100k`/`10m`/`1g`/`10g`; after the value,
+`exact`. Pinned at the real frontend boundary in both `pkg/cli`
+(`completeConfigWithDesc`) and `pkg/grpcapi` (`completeConfigPairs`), not
+just the helper.
+
+## Plan + adversarial review
+
+Plan: `docs/pr/1319-typed-leaf-pr1/plan.md` (research-converged v2.1).
+
+*(truncated — 79 lines total)*
+
+
+---
+
+## PR #1683 — Regenerate refactoring-audit artifact after #1628 queue_service growth [MERGED] (merged 2026-05-30)
+
+Branch: `fix/audit-regen-post-1628`
+
+## Summary
+#1628 (per-class waterfill instrumentation, merged) grew the audit-tracked `queue_service/mod.rs` 1662→1711, so `make audit-check` drifted on master. Regenerate the committed artifact so the guard is green. Mechanical regen of the generated artifact, validated by the deterministic guard.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #1684 — Regenerate refactoring-audit artifact after #1319 PR1 [MERGED] (merged 2026-05-30)
+
+Branch: `fix/audit-regen-post-1319`
+
+#1319 PR1 changed audit-tracked ast.go (+fields) and cmdtree/tree.go (-overlay), drifting the artifact. Regenerate so make audit-check stays green. Mechanical regen.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #1688 — skills: merge with --merge and commit in logical increments [MERGED] (merged 2026-05-30)
+
+Branch: `chore/skill-merge-commit-policy`
+
+## Summary
+
+The `/engineer` (triple-review) skill told us to `gh pr merge --squash`
+and to commit the whole implementation with a single `git add -A` at
+PR-open time. Together those produced **monolithic commits on master** —
+the squash collapsed the entire PR into one commit, and the branch only
+ever held one giant commit to begin with. That throws away per-change
+`git log` / `git blame` / `git bisect` granularity, which hurts most on
+exactly the refactors and multi-step work this skill drives.
+
+## Changes (`.claude/skills/triple-review/SKILL.md`)
+
+- **Step 5 (Implement):** commit in logical increments — one commit per
+  extracted module/aspect, per plan step, or fix-vs-test-vs-regen; each
+  builds clean; complete CLAUDE.md-style messages. No monolithic `git add -A`.
+- **Step 7 (Open PR):** push the logical commits as-is; sanity-check the
+  branch carries discrete commits.
+- **Step 9 (Merge):** `gh pr merge --merge`, never `--squash`. Squash is
+  documented as the monolithic-commit anti-pattern; `--rebase` acceptable
+  only for already-linear history.
+- **Anti-patterns:** added the monolithic-commit entry.
+
+`merge-prs` already used `--merge` (no change). `/research` and `/review-pr`
+do not merge.
+
+## Test plan
+
+- [x] `grep -rn "--squash" .claude/skills/` → only the prohibitions remain
+- [x] all `gh pr merge` refs across skills now use `--merge`
+- [x] doc-only skill change, no production code — skips triple-review per
+  project precedent (doc-only PRs)
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #1689 — #1687: shared NAT presentation package (pkg/natshow) [MERGED] (merged 2026-05-30)
+
+Branch: `refactor/1687-shared-presentation`
+
+## Summary
+
+Factors the six byte-identical NAT operational-show renderers that the
+gRPC `ShowText` path (`pkg/grpcapi/server_show_nat.go`) and the CLI show
+path (`pkg/cli/cli_show_nat.go`) previously duplicated verbatim into a
+shared `pkg/natshow` package, behind a narrow `Reader` interface that
+both `grpcRuntime` and `cliRuntime` already satisfy. Both consumers now
+single-source identical output.
+
+Closes #1687.
+
+## Scope decision (the #1687 premise was re-scoped at plan review)
+
+The issue framed a broad "shared security/NAT/flow presentation package"
+with a byte-identical-output invariant. Plan review found that invariant
+is **already false on master** for the *security* topics: `alg`,
+`address-book`, `applications`, `screen-ids-option`, `ike`,
+`security-log`, and `dynamic-address` are independently-authored,
+structurally-divergent operator contracts (different headers, column
+widths, field syntax, sub-commands, and feature sets). Forcing them into
+a shared renderer would regress one consumer (#961 PacketContext /
+#1544 file-motion dead-end). Those topics are **intentionally preserved
+as-is**.
+
+The *NAT detail/table* renderers, by contrast, were byte-for-byte
+identical between the two consumers (differing only in the output sink:
+gRPC `*strings.Builder` vs CLI `os.Stdout`, plus a `return`/`return nil`
+wrapper). Those six — `nat-static`, `nat-nptv6`, `persistent-nat`,
+`persistent-nat-detail`, `nat-source-rule-detail`,
+`nat-dest-rule-detail` — move to `pkg/natshow` with an `io.Writer` sink.
+`nat64` is **excluded** (its empty-set message diverges: gRPC
+`"...configured\n"` vs CLI `"...configured.\n"`).
+
+This was pure code motion: the renderer bodies are moved verbatim from
+the canonical gRPC implementation; only the sink and the apply-result
+threading change.
+
+## Plan + adversarial review
+
+Plan doc: `docs/pr/1687-shared-presentation/plan.md` (v3 PLAN-READY).
+
+- Round 1: Codex **PLAN-NEEDS-MAJOR** (kill the universal package, but a
+  clean NAT seam exists); AGY **PLAN-KILL** (misread the CLI sub-command
+  dispatcher as the leaf renderer). Resolved on evidence — diffed the
+  leaf bodies directly; the NAT leaves are byte-identical.
+- Round 2 (re-scoped to `pkg/natshow`): AGY **PLAN-READY** (reversed
+  after reading the leaf bodies); Codex **PLAN-NEEDS-MINOR**, both
+  minors folded in:
+  1. `RenderDestRuleDetail` carries the full gRPC `cfg == nil || ... ==
+     nil || len(RuleSets) == 0` guard; the CLI dispatcher keeps its own
+
+*(truncated — 80 lines total)*
+
+
+---
+
+## PR #1690 — Refactor: split pkg/dataplane/maps.go (2113 LOC) into domain accessor files (#1686) [MERGED] (merged 2026-05-30)
+
+Branch: `refactor/1686-maps-domain-split`
+
+## Summary
+
+Splits the 2113-LOC `pkg/dataplane/maps.go` into 11 cohesive same-package
+domain accessor files plus a shared-helpers file. **Pure verbatim code motion**
+— all 120 declaration bodies are byte-identical to the original (mechanically
+verified); no signature, behavior, or public-API change.
+
+Closes #1686.
+
+## Why same-package files (not a `maps/` sub-package)
+
+Every accessor is a method on `*dataplane.Manager` over the **unexported**
+`m.maps` / `m.mu` / `m.userspaceCounterOffsets` fields. Go forbids declaring
+methods on a type outside its package, so a real sub-package would force an
+API break across 7 caller packages (grpcapi, api, cli, conntrack, cluster,
+daemon, fwdstatus) for zero functional benefit. The same-package
+domain-suffix layout is the established, already-merged precedent for this
+exact type (#1575: 77 `*Manager` methods → same-package siblings; #1092:
+`compiler.go` → `compiler_nat.go`/`compiler_filter.go`).
+
+## New files
+
+| File | Domain |
+|------|--------|
+| `maps_policy.go` | zone/policy/address-book/application config + policy counters |
+| `maps_session.go` | conntrack session table (iterate/batch/get/set/delete/count/clear) |
+| `maps_nat.go` | DNAT/SNAT/pools/static/NAT64/NPTv6 + NAT counters |
+| `maps_screen.go` | screen/IDS configs, session-count limits, flood counters |
+| `maps_mirror.go` | port-mirroring config |
+| `maps_filter.go` | firewall filters/policers + filter counters (read+clear together) |
+| `maps_counters.go` | generic global/interface/zone counters + ClearAllCounters |
+| `maps_flow.go` | flow config (TCP MSS, ALG, lo0 filter) + timeouts |
+| `maps_fabric.go` | HA/fabric fwd, RG active, watchdog, FIB gen, lifecycle no-ops |
+| `maps_stale.go` | hitless-restart stale reconcile (all DeleteStale*/ZeroStale*) |
+| `maps_stats.go` | MapStats + GetMapStats |
+| `maps_helpers.go` | shared key encoders htons/ipToUint32BE/ipTo16Bytes (renamed from maps.go) |
+
+Counter accessors follow an explicit rule (from plan round-1 review): a map's
+read+clear stay in one file; domain-specific counters live with their domain.
+
+## Plan + adversarial review (quad-review, plan-first)
+
+Plan doc: `docs/pr/1686-maps-domain-split/plan.md`
+
+- Round 1 (commit 7b479cb9): Codex PLAN-NEEDS-MINOR, AGY PLAN-NEEDS-MAJOR
+  (bucketing only), Claude-SMR PLAN-READY. All findings folded into v2.
+- Round 2 (commit 15029ed3b): Codex PLAN-READY, AGY PLAN-READY, Claude-SMR
+  PLAN-READY. Architecture (same-package) ratified by all reviewers.
+
+## Test plan
+
+*(truncated — 72 lines total)*
+
+
+---
+
+## PR #1695 — #1691: CoS Path B — document the ~22-24 G push-ceiling C_phys division + re-scope #1614 gates [MERGED] (merged 2026-05-30)
+
+Branch: `refactor/1691-cos-push-ceiling-gate-rescope`
+
+## Summary
+
+Path B "do first" from the #1614 CoS-regression research
+(`docs/research/1614-simul-load-diagnosis/plan.md` v3, 3-of-3
+PLAN-READY). **DOCS + TEST-GATE rescope only — no dataplane or CoS
+scheduler code is touched.** The §3.B 3g/6g guarantee-rate
+under-protection mechanism is explicitly OUT of scope (that is #1692).
+
+Two things land:
+
+1. **Document the ~22-24 G push-ceiling division** in
+   `docs/fairness-regimes.md`. The firewall's push-direction forwarding
+   throughput pins at ~22-24 G aggregate regardless of class count
+   (`park_root=0` everywhere; #1578 forwarding/TX ceiling, upstream of
+   the root token gate). When N classes are simultaneously backlogged
+   that ceiling DIVIDES among them, so per-class %-of-shape drops as N
+   rises (full-11: 100m=86%, 1g=63%, 3g=43%, 6g=41%). The ceiling is
+   expressed algebraically as `C_phys` (a hardware property), with
+   22-24 G footnoted as the measured loss-cluster reference value, NOT a
+   universal product constant. Adds a formal 3-condition
+   divided-ceiling-vs-starvation discriminator and cross-references the
+   Phase 0 22.72 G reverse number.
+
+2. **Re-scope the #1614 acceptance gates:**
+   - **Drop the flat per-flow-CoV gate** (#1614 issue body line
+     "Per-flow CoV ≤ 5% under simultaneous load") — structurally
+     unreachable per #1220/#1244 (Cstruct ≈ 53% at the multinomial(12,6)
+     floor). The only per-flow fairness gate is the already-present
+     #1217 structural `observed_CoV ≤ Cstruct + 0.05`.
+   - **Split the ≥95% small-class guarantee from the full-11 simul
+     gate.** The ≥95% guarantee is achievable SOLO / few-competitor only
+     and stays on the separate #1630 harness
+     `cos-gate1-small-four-alone.sh` (untouched). The full-11
+     `cos-simul-load-smoke.sh` gate 1 becomes a **divided-ceiling
+     regression floor** — all four small classes stay gated against
+     relaxed per-class floors (100m≥60%, 1g≥40%, 3g≥25%, 6g≥25% of
+     shape) so a collapse still trips while normal ceiling-division does
+     not. The 3g/6g ≥95% simul guarantee is deferred to #1692.
+
+Closes #1691
+
+## Plan + adversarial review
+
+Plan doc: `docs/pr/1691-cos-push-ceiling-gate-rescope/plan.md`
+(plan v2 @ 3b5c52d9, all front-matter inline).
+
+- Codex round-1: PLAN-NEEDS-MAJOR (task-mpshtrt6-9nfqxm) — caught that
+  the v1 narrow-to-{100m,1g} gate was still unsatisfiable on the
+  full-11 harness (1g=63%). Round-2: PLAN-READY (task-mpsidewm-xs9fvz).
+- AGY round-1: PLAN-NEEDS-MINOR (adversarial-review-mpshu9fs-yopiw9) —
+
+*(truncated — 76 lines total)*
+
+
+---
+
+## PR #1696 — #1694: fix GetMapStats stale map names + filter_rules ARRAY mis-count [MERGED] (merged 2026-05-30)
+
+Branch: `refactor/1694-getmapstats-name-count-fix`
+
+## Summary
+
+Fix three pre-existing correctness defects in `GetMapStats`
+(`pkg/dataplane/maps_stats.go`), surfaced by Copilot during the #1686
+byte-identical split (and confirmed present verbatim on master, so out
+of scope there):
+
+- `nat_pool_config` -> `nat_pool_configs` (the real BPF map name; setter
+  in `maps_nat.go`, C def in `bpf/headers/xpf_maps.h`).
+- `screen_profiles` -> `screen_configs` (real name; `maps_screen.go`).
+  `m.maps` is keyed by the literal collection map name
+  (`loader_userspace_shim.go`), so both stale spellings never matched a
+  key and those descriptors silently reported nothing.
+- `filter_rules` marked `countable:true` -> `false`. It is
+  `BPF_MAP_TYPE_ARRAY` (pre-allocated), so iterating yields every index
+  up to `MaxEntries`, making `UsedCount` an unconditional "100%
+  utilized" value. `struct filter_rule` has no per-slot "valid" flag
+  (validity is `filter_config.num_rules/rule_start`), so value-aware
+  counting is not a cheap iteration and is left out of scope.
+
+The function-local descriptor literal is extracted to an unexported,
+never-mutated package-level slice `mapStatsReportDescriptors` so the
+fix is unit-testable without a live BPF collection. The defects live in
+the static table: the userspace shim does not load these three maps
+today, so this is a latent descriptor-table correction, not a change in
+current runtime output.
+
+Closes #1694
+
+## Plan + adversarial review
+
+Plan doc: `docs/pr/1694-getmapstats-name-count-fix/plan.md`
+
+- Codex round-1: PLAN-NEEDS-MAJOR (task-mpsi2hph-dukvbl) — defects real,
+  but v1's "maps start reporting at runtime" acceptance claim was false
+  (shim does not load them). Reframed to static descriptor-table
+  correctness.
+- Codex round-2: PLAN-NEEDS-MINOR (task-mpsii3sl-yd1lox) — stale runtime
+  wording in plan.md; addressed.
+- AGY round-1: PLAN-READY (adversarial-review-mpsi2q1l-6ucrhb).
+- Claude-SMR round-1: PLAN-READY.
+
+No consumer is affected: CLI (`cli_show_system.go`) and gRPC
+buffers-detail (`server_show.go`) already print "-"/skip array
+`UsedCount`; the Prometheus collector does not call `GetMapStats`; only
+the REST `/system/buffers` JSON exposed the misleading raw value.
+
+## Test plan
+
+- [x] `go build ./pkg/dataplane/...` clean
+
+*(truncated — 66 lines total)*
+
+
+---
+
+## PR #1702 — #1699: split pkg/config/ast.go — separate config-mode schema grammar from AST node types [MERGED] (merged 2026-05-31)
+
+Branch: `refactor/1699-config-ast-schema-split`
+
+## Summary
+
+`pkg/config/ast.go` was 2021 LOC (`[REFACTOR]`-tagged) carrying two
+distinct concerns: the AST node types + tree navigation (the parser's
+data model) and the config-mode `set` grammar SSOT (the `schemaNode`
+type, the `setSchema` literal, its `init()`, and the completion
+functions). This PR moves the grammar concern into two new same-package
+files, finishing the `schema_*` family that already holds the walker
+(`schema_walk.go`), validators (`schema_validators.go`), and value
+classifier (`value_type.go`):
+
+- `schema.go` (1347 LOC) — the grammar SSOT: `schemaNode` + `isTypedLeaf`,
+  the `setSchema` literal, the groups-wildcard `init()`. Kept whole
+  because it is one declarative data tree (docs/config-schema.md's "one
+  tree drives four things" property).
+- `schema_complete.go` (327 LOC) — the procedural completion / resolution
+  logic: `ValueHint`, `SchemaCompletion`, `ValueProvider`,
+  `CompleteSetPath`, `appendTypedValueCompletions`,
+  `CompleteSetPathWithValues`, `ResolveConsumedSetPathTokens`.
+
+`ast.go` drops to 365 LOC (off the heatmap entirely) and holds only the
+AST data model. `keysEqual` stays in `ast.go` (its only callers are the
+AST-mutation files; no grammar/completion code references it).
+
+Pure intra-package code motion: no symbol renamed, no logic edited, moved
+blocks verbatim, no exported-API change. The dual AST shape (hierarchical
+`family inet { dhcp; }` vs flat-set `set ... family inet dhcp`) is
+untouched — `SetPath` (ast_edit.go) and `walkSchemaNode` (schema_walk.go)
+are not modified.
+
+Closes #1699.
+
+## Plan + adversarial review
+
+Plan doc: `docs/pr/1699-config-ast-schema-split/plan.md`
+
+- Codex round-1: PLAN-NEEDS-MINOR (task task-mpt40pej-mbcvej) — seam
+  judged real; four minors all adopted in v2 (split schema_complete.go,
+  doc updates, strings-only import, audit-threshold wording).
+- AGY round-1: PLAN-READY (adversarial-review-mpt40w7e-x560do).
+- Claude-SMR round-1: PLAN-READY.
+
+Both Codex and AGY independently recommended the `schema_complete.go`
+split so neither new file lands on the audit heatmap.
+
+## Test plan
+
+- [x] `gofmt -l` clean on all three files
+- [x] `go build ./...` clean
+- [x] `go vet ./pkg/config/...` clean
+
+*(truncated — 64 lines total)*
+
+
+---
+
+## PR #1704 — #1697: extract cold-path/exception helpers out of poll_descriptor/mod.rs hot loop [MERGED] (merged 2026-05-31)
+
+Branch: `refactor/1697-poll-descriptor-cold-path-split`
+
+## Summary
+
+Extracts the COLD exception machinery out of the AF_XDP ingress hot
+loop in `userspace-dp/src/afxdp/poll_descriptor/mod.rs` (the largest
+file in the tree, 2983 LOC) into three `#[inline(never)]` cold sibling
+modules so the hot loop stays L1-i resident and the cold bodies stop
+being eligible for inlining into the per-packet codegen unit:
+
+- `cookie_reply.rs` — SYN-cookie reply enqueue machinery (const, enum,
+  budget check, `enqueue_syn_cookie_reply`, moved tests).
+- `nat_exception.rs` — `source_nat_decision_for_flow` +
+  `record_source_nat_failure`.
+- `filter.rs` — interface-input-filter eval + filter-log emitters.
+
+The order-coupled hot loop body (`poll_binding_process_descriptor`) is
+NOT restructured — that is the #946 Phase-2 dead-end the issue
+explicitly forbids. This is pure body code-motion plus a per-function
+inline-attribute change. `mod.rs` drops from **2983 to 2437 LOC**.
+
+Closes #1697
+
+## Inline policy (the load-bearing detail)
+
+Round-1 plan review (Codex + AGY PLAN-KILL, Claude-SMR PLAN-NEEDS-MINOR)
+caught that a blanket `#[inline(never)]` would regress the hot path:
+`emit_cached_input_filter_log` / `emit_cached_output_filter_log` are
+called UNCONDITIONALLY from the `#[inline(always)]` flow-cache fast
+path, and `evaluate_dscp_sensitive_input_filter_on_session_hit` is the
+per-packet session-hit path for DSCP-sensitive-filter configs
+(flow_cache.rs:285 does not cache those). Forcing `#[inline(never)]`
+there would emit unconditional per-packet `call`s + 96-byte
+`UserspaceDpMeta` copies just to run a common-case early return.
+
+This PR adopts the salvage path all three reviewers endorsed:
+
+- Those three wrappers stay `#[inline]` so the cheap common-case guard
+  (the `Option` `None` check / `has_dscp_match`) folds into the hot
+  path. The output emitter's rare non-`None` tail is split into a new
+  `#[cold] #[inline(never)]` `emit_cached_output_filter_log_tail`.
+- The true-exception leaves (`record_source_nat_failure`,
+  `source_nat_decision_for_flow`, `evaluate_non_pbr_input_filter[_log_only]`,
+  `emit_input_filter_log_match`, `apply_lo0_filter_action`,
+  `enqueue_syn_cookie_reply`) get `#[cold] #[inline(never)]` for
+  `.text.unlikely` placement away from the hot loop's cache lines,
+  matching the repo's existing pattern at `tx/dispatch/slow_path.rs:23`.
+
+## Plan + adversarial review
+
+Plan doc: `docs/pr/1697-poll-descriptor-cold-path-split/plan.md`
+
+
+*(truncated — 85 lines total)*
+
+
+---
+
+## PR #1705 — #1698: split pkg/routing/routing.go into per-domain managers behind a façade [MERGED] (merged 2026-05-31)
+
+Branch: `refactor/1698-routing-domain-managers`
+
+## Summary
+
+Re-attempt of the #1544-killed `pkg/routing/routing.go` split. #1544 was
+PLAN-KILLED as pure file-motion (every method stayed on `*Manager`, no
+narrowed interface). This PR implements the successor design the #1544
+kill comment explicitly prescribed: real per-domain managers with narrow
+netlink-facing interfaces and per-domain testability, with `*Manager`
+reduced to a thin façade.
+
+`routing.go` drops from **2085 LOC** (the #1 `[REFACTOR]` audit entry) to
+a **215-LOC façade**. State and locks are distributed to unexported
+domain managers, each depending on a narrow ops interface
+(`vrfOps`/`routeLister`/`linkOps`/`ruleOps`) instead of a concrete
+`*netlink.Handle`.
+
+Closes #1698.
+
+## Why this is NOT the #1544 file-motion
+
+- Per-domain unexported managers (`vrfManager`, `tunnelManager`,
+  `xfrmManager`, `nextTableManager`/`ribGroupManager`/`pbrManager`,
+  `bondManager`, `rethManager`, `monitorManager`) each own their
+  sub-state + their own mutex (the shared `ifaceMu` is split per-domain).
+- Narrow ops interfaces make each domain fakeable. New `rules_test.go`
+  proves it: `fakeRuleOps` + three tests construct the rule domain
+  managers directly (without the whole `routing.Manager`), closing the
+  "can't test ip rule creation without netlink" gap the old suite
+  documented.
+
+## Behavior preserved
+
+- 26 public methods + 5 exported free fns keep byte-identical
+  signatures; zero call-site edits outside `pkg/routing/`.
+- Lock split verified safe: no method held `ifaceMu` across more than one
+  of the disjoint interface domains; keepalives belong to the tunnel
+  domain. Dropped cross-domain exclusion is not load-bearing (sequential
+  daemon apply + per-request netlink socket serialization).
+- `ApplyTunnels` -> `BindInterfaceToVRF` modeled as a
+  `tunnelManager.vrfBinder` dependency (no lock-ordering cycle —
+  `BindInterfaceToVRF` takes no lock).
+- `Close()` drains keepalive goroutines before closing the handle (#848).
+  VRF orphan-reap / ownership (#844/#847) and rule clear-then-add
+  semantics moved verbatim.
+
+## Plan + adversarial review
+
+Plan doc: `docs/pr/1698-routing-domain-managers/plan.md`
+
+- Round 1: Codex PLAN-NEEDS-MAJOR (affirmed NOT #1544 file-motion), AGY
+  PLAN-READY, Claude-SMR PLAN-NEEDS-MINOR.
+
+*(truncated — 65 lines total)*
+
+
+---
+
+## PR #1707 — #1700: decompose pkg/grpcapi/server_show.go (2006 -> 479 LOC) [MERGED] (merged 2026-05-31)
+
+Branch: `refactor/1700-server-show-split`
+
+## Summary
+
+Intra-package decomposition of `pkg/grpcapi/server_show.go` along topic
+seams, continuing the #1043 phased extraction. The `ShowText` gRPC RPC
+was a 2006-LOC dispatcher; this PR moves the still-inline prefix
+handlers and switch-case bodies into the existing `server_show_*.go`
+topic files, dropping `server_show.go` to **479 LOC** and removing the
+only `[REFACTOR]` (>=2000) entry from the modularity audit. Pure
+code-motion — byte-identical gRPC show output (golden-tested).
+
+Per #1687 the security show topics are independently-authored divergent
+contracts (not shareable with the CLI), so this is a WITHIN-grpcapi
+split, not further cross-consumer sharing.
+
+Closes #1700.
+
+## What moved (zero new files — into existing domain files)
+
+- security/screen: screen-ids-option/screen-statistics(-all)/screen-ids-option-detail prefix handlers, `screen`, `ike`, `alg`, `dynamic-address`, `address-book`, `screenSYNCookieCounterRows`, `writeRPMConfig` -> `server_show_security_text.go`
+- routing: route-table:/route-protocol:/route-prefix:/test-routing: prefix handlers, `routing-options`, `routing-instances(-detail)`, `route-instance`, `route-map`, `bfd-peers` -> `server_show_routes_text.go`
+- firewall: `firewall-filter:`, `test-policy:`, `firewallFilterTermExpansionCount` -> `server_show_firewall.go`
+- interfaces: `class-of-service`, `vlans`, `ipv6-router-advertisement` -> `server_show_interfaces_text.go`
+- zones: `test-zone:` -> `server_show_zones_text.go`
+- forwarding: `forwarding-options(-port-mirroring)` -> `server_show_forwarding.go`
+- events: `event-options` -> `server_show_events.go`
+- system: `login`, `internet-options`, `root-authentication`, `core-dumps`, `task`, `buffers(-detail)`, `backup-router` -> `server_show_system.go`
+
+Largest receiver is `server_show_security_text.go` at 834 LOC; all
+grpcapi files are now below the 1500 audit floor.
+
+## Plan + adversarial review
+
+Plan doc: `docs/pr/1700-server-show-split/plan.md` (v2, PLAN-READY).
+
+- Claude-SMR: PLAN-READY (verified cfg single-fetch, ctx-unused-by-inline, prefix-buf-empty invariants)
+- AGY adversarial round 1: PLAN-READY/MINOR (adopted: zero new files; golden normalizer)
+- Codex round 1: PLAN-NEEDS-MAJOR on v1 doc-text staleness only (all invariants confirmed with quoted-line evidence; no PLAN-KILL). v2 addressed every finding: zero new files, single consistent helper shape, runtime-branch golden coverage, ShowText-local cfg phrasing.
+
+## Test plan
+
+- [x] `go build ./...` clean
+- [x] `pkg/grpcapi` suite green
+- [x] **ShowText golden byte-identity guard** (`server_show_golden_test.go`) over 37 topics spanning every receiving file — passes byte-identical, 5/5 stable. Runtime-bearing branches (dynamic-address feed counts + last-fetch, firewall-filter/screen hit counters) exercised via deterministic stubs; a normalizer covers shell-out/runtime topics (buffers, task).
+- [x] `make audit-check` regenerated — `server_show.go` left the audit list (479 LOC); no grpcapi file remains flagged
+- [x] Pure code-motion: diff touches only `server_show.go`, the receiving topic files, and the golden test/testdata (incidental gofmt churn in server.go/chassis-test reverted)
+- Control-plane only -> **NO cluster smoke** (no packet path touched; gate is Go suite + golden)
+
+Note: the two `pkg/dataplane/userspace` socket-bind failures seen in the full-suite run are pre-existing environment flakes (unix sockaddr path-length limit on long temp dirs), reproduce on a clean tree, and are unrelated to this grpcapi-only change.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #1708 — #1701: split pkg/config/types.go (2055 LOC) by domain [MERGED] (merged 2026-05-31)
+
+Branch: `refactor/1701-config-types-split`
+
+## Summary
+
+Splits the 2055-LOC `pkg/config/types.go` typed config model into seven
+cohesive same-package sibling files by Junos config domain. Pure
+byte-identical intra-file motion within `package config` — every exported
+type stays `config.Foo`, so the ~194 consumer files that import
+`pkg/config` are untouched, no new package import edge is introduced, and
+there is no import-cycle risk. No runtime behavior change.
+
+Closes #1701.
+
+## Layout
+
+| File | LOC | Domain |
+|------|-----|--------|
+| `types.go` | 308 | `Config` root + cross-domain interface-name resolution helpers |
+| `types_chassis.go` | 88 | chassis cluster / HA, RGs, monitoring, events, bridge domains |
+| `types_interfaces.go` | 99 | interfaces, units, VRRP, DHCPv4/v6 client |
+| `types_cos.go` | 151 | class-of-service classifiers/schedulers/shaping |
+| `types_routing.go` | 320 | routing-options, policy-options, protocols, tunnels, VRFs |
+| `types_security.go` | 527 | zones, policy, NAT, screen, address book, applications, IPsec/IKE, dynamic-address, `[edit schedulers]` |
+| `types_system.go` | 584 | system, userspace-dp, syslog, SNMP, login, RPM, flow-monitoring, firewall filters, DHCP server/relay |
+
+IPsec/IKE, dynamic-address feeds, and the time-range `SchedulerConfig`
+land in `types_security.go` (not routing/cos/system) because they nest
+under `SecurityConfig` / are referenced by `Policy.SchedulerName` — a
+plan-review re-bucket from the adversarial round.
+
+## Plan + adversarial plan review
+
+Plan doc: `docs/pr/1701-config-types-split/plan.md`
+
+- AGY r1: PLAN-NEEDS-MAJOR (3 domain-cohesion re-buckets: IPsec/IKE,
+  dynamic-address, SchedulerConfig) -> fixed in plan v2.
+- Codex r1 (task-mpt54ogw-bnbj6h): v1 PLAN-NEEDS-MAJOR (same 3 buckets),
+  v2 PLAN-NEEDS-MINOR (name-level symbol diff; stale LOC framing) -> both
+  fixed in plan v2.1. Independently confirmed zero import cycles / zero
+  consumer churn, sound sub-package rejection, complete const/iota
+  inventory.
+- Claude-SMR r1 (`claude-smr-plan-r1.md`): PLAN-READY.
+
+## Test plan (control-plane config refactor — no cluster smoke)
+
+- [x] `gofmt -l` clean on all seven files
+- [x] `go build ./...` clean — all ~194 consumers, proving zero API churn
+- [x] `go vet ./pkg/config/...` clean
+- [x] `go test ./pkg/config/...` pass (5/5 flake check)
+- [x] All consumer package tests pass (configstore, cmdtree, frr, grpcapi,
+      api, cli, routing, ipsec, networkd, flowexport, feeds, dhcpserver,
+      eventengine, rpm, cluster)
+
+*(truncated — 61 lines total)*
+
+
+---
+
+## PR #1716 — #1709 WireGuard S1: wire-protocol compliance (TAI64N + handshake framing) [MERGED] (merged 2026-05-31)
+
+Branch: `refactor/1709-wireguard-s1-wire-protocol-compliance`
+
+## Summary
+
+First build step of the #1703 WireGuard interop umbrella. Makes xpf's
+WireGuard **handshake bytes** standards-compliant (peer-agnostic) so it can
+interoperate with any reference-compliant peer (kernel WireGuard, UniFi 10.4+,
+EdgeOS, UDM). Adds the 12-byte TAI64N timestamp and the WireGuard handshake
+on-wire framing (message types 1/2, MAC1 = keyed-BLAKE2s-128, MAC2 zeros) on
+both the build and parse paths, in both roles (initiator and responder), wired
+into the snow-based engine via a two-phase index reservation.
+
+`Closes #1709`. Part of #1703.
+
+## What changed
+
+- `wg/tai64n.rs` (new): in-process strictly-monotonic TAI64N clock. Epoch base
+  `0x400000000000000a` (`2^62 + 10` leap-second offset), whitened nanos
+  (`& 0xFF000000`), carry-into-seconds at `nanos >= 10^9`. Matches kernel WG /
+  wireguard-go byte-for-byte.
+- `wg/handshake.rs` (new): WG type-1 (148 B) / type-2 (92 B) framing. MAC1 =
+  `keyed-BLAKE2s-128(BLAKE2s-256("mac1----" || recipient_static_pub), msg)` —
+  keyed-BLAKE2s, NOT HMAC; keys on the recipient's static pub. MAC2 zeros
+  (cookie = S7), skip-verified on parse.
+- `wg/handshake_session.rs` (new): `create_initiation` / `consume_response` /
+  `consume_initiation_create_response` compose snow + framing + TAI64N, both
+  roles, control-thread only. Two-phase index reservation (reserve before
+  send, at most one pending per peer) closes the blackhole race and bounds an
+  authenticated-msg1-flood DoS.
+- `wg/engine.rs`: adds `local_public_key` (derived once via
+  `MontgomeryPoint::mul_base_clamped`) for inbound MAC1 verification + the
+  TAI64N clock + pending-handshake maps. Net stays WATCH-tier (1772 LOC); the
+  orchestration lives in `handshake_session.rs` to stay under the 2000-LOC
+  refactor threshold.
+- Docs: `docs/wireguard-interop.md` (new, with the explicit S1/S2 honesty
+  note) + flipped the handshake-framing/TAI64N items in
+  `docs/pr/wireguard-clean/plan.md` to DONE-in-S1.
+
+## Plan + adversarial review
+
+Plan: `docs/pr/1709-wireguard-s1-wire-protocol-compliance/plan.md` (v4,
+PLAN-READY). Two rounds:
+- Round 1: Codex PLAN-NEEDS-MAJOR, AGY PLAN-NEEDS-MAJOR, Claude-SMR
+  PLAN-NEEDS-MINOR. Majors fixed in v3 (TAI64N epoch offset, index blackhole
+  race, `local_public_key`, persistence story, KAT-gate strength).
+- Round 2: AGY PLAN-READY, Codex PLAN-NEEDS-MINOR (text). v4 folded the
+  nanos-carry-at-1e9 fix + the per-peer pending DoS cap + the full msg2 KAT.
+
+All three reviewers independently verified snow byte-exactness, the
+keyed-BLAKE2s-128 MAC1 construction + KAT vectors, and the recipient-key
+direction.
+
+
+*(truncated — 81 lines total)*
+
+
+---
+
+## PR #1717 — #1714: fix 3 stale 'not implemented' doc notes (SNMP traps, SYN-cookie, IPv6 VRRP) [MERGED] (merged 2026-05-31)
+
+Branch: `docs/1714-stale-not-implemented-notes`
+
+## Summary
+
+Three in-tree docs claimed features are unimplemented that are actually
+shipped. Stale "not implemented" notes mislead operators, planning, and
+risk duplicate work. Each fix was verified against current code before
+editing.
+
+1. **SNMP traps** — `docs/feature-gaps.md` said "trap sending not
+   implemented". `pkg/snmp/traps.go` `buildLinkTrap` sends SNMPv2c
+   linkUp/linkDown (OIDs `...5.4`/`.5.3`) over UDP/162, wired from
+   `pkg/daemon/daemon_flow.go`, covered by `traps_test.go`. Reworded to
+   state linkUp/linkDown done; enumerates still-missing trap classes
+   (auth-failure, cold/warm-start, HA role change, policy/security
+   alarms). Status stays Partial.
+2. **SYN-cookie** — `docs/userspace-performance-plan.md` H4 said "SYN
+   cookies not implemented". `userspace-dp/src/screen/syncookie.rs`
+   (557 LOC) implements the codec + SipHash24 MAC + validated cache,
+   wired via `screen/mod.rs` with a hot-path `syn_cookie_syn_ack_sent`
+   counter. Reworded to the real open items: under-flood benchmark/
+   validation and the unimplemented stateful `syn-proxy` mode.
+3. **IPv6 VRRP** — `docs/bugs.md` said IPv6 VRRP adverts not implemented,
+   citing a stub at `instance.go:617-628`. Both send (`sendAdvert` →
+   `sendPacketIPv6`, dst `ff02::12`, hop limit 255) and receive
+   (`receiverIPv6` ip6:112, `parseAfPacketIPv6`, AF_PACKET 0x86DD filter
+   in `manager.go`) are implemented; the cited lines now hold
+   `parseAfPacketIPv6`. Replaced with a RESOLVED note.
+
+Plan: `docs/pr/1714-stale-not-implemented-notes/plan.md`
+
+## Test plan
+
+Doc-only change — no code touched, so no cargo/Go test suite or cluster
+smoke is warranted. `go build ./...` passes clean as a sanity check.
+
+- [x] `go build ./...` clean
+- [x] Each "it's implemented" claim verified by reading the cited symbol
+      end-to-end (`traps.go`, `daemon_flow.go`, `syncookie.rs`,
+      `screen/mod.rs`, `vrrp/instance.go`, `vrrp/manager.go`)
+
+Closes #1714
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #1718 — #1712: render OSPFv2 area membership per-interface (drop network 0.0.0.0/0 catch-all) [MERGED] (merged 2026-05-31)
+
+Branch: `fix/1712-ospf-per-interface-area`
+
+## Summary
+
+`pkg/frr/policy_render.go` `generateProtocols()` rendered OSPFv2 area
+membership as a global `network 0.0.0.0/0 area <id>` statement (one per
+configured interface) via the placeholder `ifaceNetwork()` helper. In FRR
+ospfd that form matches **every IPv4 interface in the VRF**, so configuring
+OSPF on one interface activated adjacencies on all L3 interfaces, and with
+multiple areas the overlapping catch-all lines let render order silently
+decide each interface's area. FRR also does not support mixing `network` and
+`ip ospf` activation on one instance.
+
+The fix renders the standard FRR interface-level idiom — `ip ospf area <id>`
+inside the per-interface `interface <name>` block — exactly mirroring how
+OSPFv3 already renders `interface <name> area <id>` in the same function. The
+interface block is now emitted **unconditionally** for every configured OSPF
+interface (previously only when cost/network-type/auth/BFD was set) because it
+carries the sole activation line. `passive-interface` directives stay under
+`router ospf`. `ifaceNetwork()` is removed.
+
+Closes #1712
+
+## Plan + adversarial review
+
+Plan doc: `docs/pr/1712-ospf-per-interface-area/plan.md`
+
+- Codex plan review: PLAN-NEEDS-MINOR (task-mpta3w3q-yvxr2c) — all minors
+  folded into plan v2 (FRR forbids mixing network+ip-ospf; test invariant
+  strengthened to "no `network ... area`"; corrected the one-interface-block
+  claim; qualified the VRF claim).
+- AGY adversarial plan review: PLAN-READY (adversarial-review-mpta426w-nrlywl).
+- Claude-SMR plan review: PLAN-READY (mandatory constraint: emit the interface
+  block unconditionally — honored).
+
+## Test plan
+
+- [x] `go build ./pkg/frr/...` clean
+- [x] `go test ./pkg/frr/...` pass (incl. updated `TestGenerateProtocols_OSPF`
+      + new `TestGenerateProtocols_OSPFTwoAreasUnrelatedIface`)
+- [x] OSPF tests 5/5 flake check
+- [x] Full `go test ./...` — green except a **pre-existing** master failure
+      (`pkg/dataplane` `TestOperatorPackagesOnlyUseDocumentedLegacyDataplaneImports`
+      allowlist drift on `pkg/grpcapi/server_show.go`, reproduced identically on
+      pristine `origin/master` a35132bca — unrelated to this FRR change)
+- No cluster smoke: this is FRR config-render, not dataplane; the iperf smoke
+  does not exercise OSPF.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #1719 — #1713: fix systemd-resolved domain-search drop; extract DNS renderer [MERGED] (merged 2026-05-31)
+
+Branch: `refactor/1713-resolved-dns-renderer`
+
+## Summary
+
+`applySystemDNS` in `pkg/daemon/daemon_system.go` rendered the
+systemd-resolved drop-in with an `else if` that emitted only
+`Domains=<domain-name>` when both `system domain-name` and
+`system domain-search` were set, silently dropping the search list. The
+config grammar accepts both simultaneously and resolved's `Domains=`
+directive takes a single space-separated, ordered search list, so both
+must render on one line.
+
+This PR extracts the pure render logic into a new
+`pkg/daemon/system/dns.go` (`RenderResolvedDropin` over a plain
+`ResolvedDropinInput` value struct) and combines `domain-name` +
+`domain-search` into one `Domains=` line (domain-name first, search
+domains after in config order, with a search entry equal to a non-empty
+domain-name de-duplicated). `applySystemDNS` now calls the renderer and
+keeps the empty→remove, compare-before-write idempotence, and
+`restartResolved` behavior. Output is byte-identical to the prior code
+for the DNS-only, domain-name-only, and domain-search-only cases; only
+the previously-buggy both-set case changes.
+
+Closes #1713
+
+## Sequencing with #1715
+
+This is the pure-renderer seam the PLAN-READY #1715 research (Path A)
+requested in its plan §7: #1713 lands the `pkg/daemon/system/dns.go`
+extraction first, then #1715 builds `RenderResolvConf` + the
+`reconcileDNS` ownership logic on top. Out of scope here (all #1715):
+resolv.conf symlink ownership, resolved disable/mask, `reconcileDNS`,
+the DHCP notify-not-write change.
+
+## Plan + adversarial review
+
+Plan doc: `docs/pr/1713-resolved-dns-renderer/plan.md`
+
+- Codex round-1: PLAN-NEEDS-MINOR (task `bqe72n8c2`) — 3 minors
+  addressed in plan v2 (resolved.conf ordered-search rationale, precise
+  de-dup guard `domainName != "" && d == domainName`, DNS+domain
+  ordering tests)
+- AGY round-1: PLAN-READY (`adversarial-review-mptac8cu-fhtcux`)
+- Claude-SMR: PLAN-READY
+
+## Test plan
+
+- [x] `go build ./pkg/daemon/...` clean
+- [x] `pkg/daemon/system` render tests: pass (incl. the #1713 combined
+      case + de-dup + DNS-before-Domains ordering + `Empty()`)
+- [x] 5/5 flake check on `pkg/daemon/system`
+- [x] `go vet ./pkg/daemon/system` clean (the two `daemon_flow.go` vet
+
+*(truncated — 60 lines total)*
+
+
+---
+
+## PR #1720 — #1710: locate SNMPv3 USM authParams by position, not by length heuristic [MERGED] (merged 2026-05-31)
+
+Branch: `fix/1710-snmpv3-authparams-position`
+
+## Summary
+
+`pkg/snmp/v3.go` previously used a truncation-length heuristic in both
+`zeroAuthParams` and `insertAuthMAC`: each scanned the raw packet for an
+OCTET STRING whose BER length matched the HMAC truncation length (12 for
+MD5/SHA-1, 24 for SHA-256). Because `msgUserName` and
+`msgAuthoritativeEngineID` precede `msgAuthenticationParameters` in the
+USM security-parameters SEQUENCE (RFC 3414), a 12/24-byte username, a
+`truncLen`-byte engineID, or an all-zero decoy field could be matched
+first. On verify, that meant blanking the wrong field instead of
+authParams; on response build, it could mean writing the MAC into the
+wrong field instead of the authParams placeholder.
+
+The fix replaces that heuristic with `usmAuthParamsRange`, which walks the
+message to the authParams field by its RFC 3414 **position** and returns
+the field's exact value byte range. `zeroAuthParams` now zeroes exactly
+that range, and `insertAuthMAC` now writes through the same locator with
+an `end-start == len(authMAC)` guard so mismatched or malformed packets
+fail closed. The locator decodes every child TLV from its parent's bounded
+value slice (never a raw `pkt[cursor:]` window), so a nested length cannot
+escape its container and an over-run returns `ok=false`. Offsets are
+derived as `berEncodedLen(parent) - len(value)`, which also handles
+multi-byte (long-form) BER lengths.
+
+## Plan + adversarial review
+
+Plan doc: `docs/pr/1710-snmpv3-authparams-position/plan.md`
+
+- Codex round-1 (task-mpta4cny-05mmyf): PLAN-NEEDS-MINOR — core
+  positional design immune to the collision, no KILL counterexample; 4
+  minors (bounded-parse invariant, `ok` semantics, long-form length test,
+  authParams-length wording) were folded into plan v2 and the
+  implementation.
+- AGY round-1 (adversarial-review-mpta4okq-75xv55): PLAN-READY, with a
+  bounds-checking hardening note (matches Codex minor 1).
+- Claude SMR (in-conversation): concurred; validated the offset
+  accounting with a worked example and the bounded-parse fail-closed
+  posture.
+- Follow-up review feedback was folded into the implementation by routing
+  `insertAuthMAC` through the same positional locator and strengthening the
+  locator tests to check offsets against an independent manual BER walk.
+
+## Test plan
+
+- `go build ./pkg/snmp/...` clean, `go vet` clean
+- New `pkg/snmp/v3_auth_test.go` coverage includes:
+  - 12-char username MD5 + SHA-1, 24-char username SHA-256 authenticate
+    (direct #1710 regression)
+  - 12-byte engineID not mistaken for authParams
+  - ordinary short username MD5/SHA-1/SHA-256 still authenticates (no
+
+*(truncated — 73 lines total)*
+
+
+---
+
+## PR #1721 — #1711: reject malformed IP in policy simulator (all three boundaries) [MERGED] (merged 2026-05-31)
+
+Branch: `fix/1711-policy-sim-ip-validation`
+
+## Summary
+
+The policy simulator behind `show security match-policies` parsed the
+operator-supplied source/destination IP with `net.ParseIP` and fed the
+result to `matchPolicyAddr`, which treats a `nil` IP as an
+unconditional wildcard. Because `net.ParseIP` returns `nil` for both an
+empty string and a malformed one, a **non-empty but malformed** IP
+(e.g. `source-ip 10.0.0.999`) silently matched every policy term,
+producing a false-positive PERMIT verdict in the diagnostic output.
+
+Adversarial plan review (Codex + AGY, both PLAN-NEEDS-MAJOR on the
+gRPC-only v1) established that the simulator is served by **three
+independent in-process copies** of the matcher, so a gRPC-only fix
+would leave two of them false-positiveing. This PR validates the
+non-empty-but-invalid IP at all three boundaries, each with its native
+error type, while preserving the legitimate empty-means-any semantics
+and the `len(addrs)==0` policy-term "any" arm:
+
+- **gRPC** `pkg/grpcapi/server_cluster.go` `MatchPolicies` → `codes.InvalidArgument`
+- **Local CLI** `pkg/cli/cli_show_security.go` `showMatchPolicies` (runs in-process) → `error` printed to console
+- **HTTP REST** `pkg/api/security.go` `matchPoliciesHandler` → HTTP 400
+
+The three `matchPolicyAddr` copies are left unchanged; consolidating
+them is an explicitly out-of-scope refactor.
+
+Closes #1711
+
+## Plan + adversarial review
+
+Plan doc: `docs/pr/1711-policy-sim-ip-validation/plan.md`
+
+- Codex plan round 1 (`task-mpta3t25-pi958d`): PLAN-NEEDS-MAJOR — twin CLI + REST out of scope
+- AGY plan round 1 (`adversarial-review-mpta4os9-m2em4w`): PLAN-NEEDS-MAJOR — same three-boundary finding
+- Claude SMR: PLAN-NEEDS-MAJOR — local CLI runs the simulator in-process, gRPC-only insufficient
+
+All converged: expand to all three boundaries. Resolved open questions
+(empty-vs-invalid discriminator, CIDR-in-IP-field rejection, double-parse)
+are recorded in the plan.
+
+## Test plan
+
+Control-plane diagnostic change — no cluster smoke (state explicitly).
+
+- [x] `go build ./...` clean
+- [x] `go vet ./pkg/grpcapi/... ./pkg/cli/... ./pkg/api/...` clean (the
+      pre-existing `pkg/cli/cli.go:380` unreachable-code warning is on
+      master, in a file this PR does not touch)
+- [x] `go test ./pkg/grpcapi/... ./pkg/cli/... ./pkg/api/...` pass
+- [x] Full `go test ./...` green except the pre-existing
+      `TestOperatorPackagesOnlyUseDocumentedLegacyDataplaneImports`
+
+*(truncated — 63 lines total)*
+
+
+---
+
+## PR #1722 — #1715: xpf owns /etc/resolv.conf via single locked reconcileDNS [MERGED] (merged 2026-05-31)
+
+Branch: `refactor/1715-dns-resolv-ownership`
+
+## Summary
+
+xpf now owns `/etc/resolv.conf` as a managed plain file via a single
+`applySem`-locked `reconcileDNS`, with `systemd-resolved` disabled +
+masked. This fixes the verified DNS breakage on `loss:xpf-userspace-fw0`
+where `/etc/resolv.conf` was a dangling symlink to the resolved stub with
+resolved inactive, so the box had no working resolver.
+
+Three root causes, all closed:
+1. **Apply-order race** (daemon_apply.go): `applySystemDNS` wrote a
+   resolved drop-in + restarted resolved, then two lines later
+   `applyDNSService` disabled resolved (default, no `system services dns`)
+   — tearing down `/run/systemd/resolve` while the base-image symlink
+   still pointed at the stub. Now one reconciler, never enable-then-disable.
+2. **Dangling symlink**: the reconciler `os.Lstat`-detects the symlink and
+   `os.Rename`s a managed real file over it (rename replaces a symlink
+   atomically without following it; no ENOENT window), with an
+   EXDEV/EBUSY in-place-write fallback for bind-mounted `/etc/resolv.conf`.
+3. **Silent DHCP write failure**: the DHCP `installDNS` file write (which
+   wrote through the dangling symlink and clobbered the other family with
+   no merge) is removed; DHCP now stores `lease.DNS` and notifies the
+   reconciler, which merges static + v4 + v6 from live `Leases()`.
+
+Path A per `docs/research/1715-dns-resolv-ownership/plan.md` (PLAN-READY).
+Builds on the `pkg/daemon/system/dns.go` renderer extracted in #1713
+(adds a new `RenderResolvConf` alongside `RenderResolvedDropin`).
+
+Closes #1715
+
+## Logical-increment commits
+
+1. `RenderResolvConf` plain-resolv.conf renderer (+ tests)
+2. Single locked `reconcileDNS` owns `/etc/resolv.conf` (replaces
+   applySystemDNS/applyDNSService; boot empty-merge policy; resolved
+   disable+mask; stale drop-in removal)
+3. DHCP notifies reconcileDNS instead of writing resolv.conf (removes
+   installDNS write + dead UpdateDNS; mgmt-only fxp0 callback reconciles DNS)
+4. `services dns` resolved-owner commit-check warning + docs/dns-ownership.md
+5. reconciler unit tests
+
+## Test plan
+
+- [x] `go build ./...` clean
+- [x] Renderer tests (`pkg/daemon/system`): RenderResolvConf cases incl.
+      combined domain-name + domain-search and de-dup
+- [x] Reconciler tests (`pkg/daemon`): dangling-symlink replace,
+      resolved-stub-symlink replace (stub untouched), idempotent no-rewrite,
+      content-change rewrite, boot empty-merge keeps-good/repairs-bad,
+      runtime empty-merge clears, stale drop-in removal, mergeDNSInput
+      precedence + dedup
+
+*(truncated — 66 lines total)*
+
+
+---
+
+## PR #1723 — Fix legacy-dataplane import-allowlist drift after #1700 server_show split [MERGED] (merged 2026-05-31)
+
+Branch: `fix/server-show-import-allowlist-drift`
+
+## Summary
+Master is RED: `TestOperatorPackagesOnlyUseDocumentedLegacyDataplaneImports` fails with `stale allowlist entries: [pkg/grpcapi/server_show.go]`.
+
+#1700 split `server_show.go` into per-topic files, moving the legacy-`pkg/dataplane` reaching code out of `server_show.go` (it now has **zero** dataplane imports) and into topic files that #1700 correctly added to the allowlist — but it left the now-stale `server_show.go` entry behind. Several agents dismissed the resulting failure as "pre-existing"; it was #1700's own un-reconciled drift.
+
+## Change (test + docs only, no production code)
+- Remove the stale `pkg/grpcapi/server_show.go` entry from `legacyDataplaneImportAllowlist` (`pkg/dataplane/retirement_boundary_canary_test.go`).
+- Remove the matching row from the #1451 mirror table (`docs/pr/1373-retire-ebpf-dataplane/README.md`).
+- The topic files that DO still import `pkg/dataplane` (server_show_flow/status/zones/...) remain allowlisted.
+
+## Test plan
+- [x] `server_show.go` confirmed to import no `pkg/dataplane`
+- [x] canary `TestOperatorPackagesOnlyUseDocumentedLegacyDataplaneImports` → green
+- [x] `pkg/dataplane` + `pkg/grpcapi` packages pass
+- Mechanical master-red drift hotfix (test+docs only) — same expedited class as the #1675 audit-drift fix.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #1727 — #1706: fix four latent routing-correctness defects in pkg/routing [MERGED] (merged 2026-05-31)
+
+Branch: `fix/1706-routing-latent-defects`
+
+## Summary
+
+Fixes four latent correctness defects in `pkg/routing` surfaced by the
+#1698/#1705 domain-split review. All four were verbatim-identical to the
+pre-split `routing.go` on master (behavior-preserving motion left them
+unchanged); #1706 is the focused follow-up. Cohesive (one package,
+surfaced together) → one PR, logical-increment commits.
+
+1. **TUN anchor reuse** (`tunnel.go`): on the `goto anchorReady` reuse
+   arm, `LinkSetUp`/`AddrAdd` ran against the freshly-constructed,
+   ifindex-less `anchor` instead of the kernel-fetched link. Benign in
+   production (netlink `ensureIndex` re-resolves the index by name) but
+   relied on an undocumented library fallback and left other LinkAttrs
+   stale. Fixed by reusing the existing `*netlink.Tuntap`.
+2. **xfrm double `LinkByName` + `LinkSetUp(nil)`** (`xfrm.go`): the
+   already-exists path looked the link up twice and ignored the second
+   error, so a transient second-lookup failure passed `nil` to
+   `LinkSetUp`, panicking the daemon. Fixed by reusing the first lookup
+   and handling its error. (This double-call was preserved byte-identical
+   in #1705 pure-motion.)
+3. **next-table priority escape** (`rules.go`): priorities 100-199, but
+   >100 next-table routes pushed `prio` past 199 — outside the window
+   `clear()` scans — leaking rules permanently. Fixed with a hard cap at
+   the window boundary, mirroring the existing `pbrManager` cap.
+4. **rib-group priority escape** (`rules.go`): priorities 33000-33099,
+   two per leaked table; >50 leaking tables overflowed and leaked. Fixed
+   with a cap before programming each v4+v6 pair.
+
+Plus a commit-time warning in `config.ValidateConfig` (conservative
+upper bounds) so an over-limit next-table/rib-group config is surfaced
+to the operator at commit, not silently truncated at apply — the
+apply-time cap stays as defense-in-depth.
+
+Closes #1706
+
+## Plan + adversarial review
+
+Plan doc: `docs/pr/1706-routing-latent-defects/plan.md`
+
+- Codex (plan): Defect 2 PLAN-READY; Defect 1 benign-in-prod →
+  reframed as robustness cleanup; Defects 3/4 math/placement correct,
+  PLAN-NEEDS-MAJOR on silent truncation → addressed by the commit-time
+  warning.
+- AGY (plan): all four PLAN-READY; confirmed defect-2 panic real,
+  defect-4 boundary math exact (50th table 33098/33099; 51st rejected),
+  defect-1 Fds-nil safe no-op.
+
+## HA assessment
+
+These reconcilers program kernel ip-rule state only — no session-sync,
+
+*(truncated — 71 lines total)*
+
+
+---
+
+## PR #1728 — #1726: Prometheus descriptor-coverage canary (guard the #1635-class Describe() gap) [MERGED] (merged 2026-05-31)
+
+Branch: `refactor/1726-prometheus-descriptor-coverage-canary`
+
+## Summary
+
+`xpfCollector` is a *checked* Prometheus collector: every `*prometheus.Desc`
+emitted by `Collect()` must be declared in `Describe()`, or a scrape through a
+checked path errors. #1635 shipped cold-path histogram descriptors that
+`Collect()` emitted but `Describe()` never declared; the cluster smoke masked
+the resulting `Gather()` error. The existing `TestColdPathDescriptorsAreDescribed`
+guards only the cold-path family (~17 descriptors via `emitWorkerColdPath`); the
+other ~122 descriptors across every other collect path were unguarded.
+
+This PR adds `TestCollectorDescriptorCoverage`: it builds the REAL collector with
+a fully-wired fake runtime, registers it in a `prometheus.NewPedanticRegistry()`,
+and asserts `Gather()` returns no error — the exact condition that fires when a
+metric is emitted whose descriptor is not declared in `Describe()` (the #1635
+class). Test-only, control-plane, one file. No production change (no current
+`Describe()` gap exists on master — verified by both reviewers).
+
+A plain `NewRegistry()` does NOT run this check (only the pedantic registry
+populates `registeredDescIDs`), which is why the pedantic registry is the correct
+test instrument; production uses a plain registry and surfaced #1635 through
+promhttp's checked-collector logging.
+
+## Plan + adversarial review
+
+Plan doc: `docs/pr/1726-prometheus-descriptor-coverage-canary/plan.md`
+
+- Codex round-1 (task `codex-1726-plan`): PLAN-KILL-as-written → salvaged.
+  Dispositive finding: `NewRegistry()` does not validate desc coverage; use
+  `NewPedanticRegistry()`. Verified 139 emitted == 139 described, no gap on master.
+- AGY round-1 (`adversarial-review-mptva9tt-j9hv62`): PLAN-NEEDS-MINOR. Same
+  `NewPedanticRegistry()` critical fix; assert the `unregistered descriptor`
+  substring to disambiguate from dup-metric errors; confirmed nil-safety and
+  no deadlock; value approved.
+- Claude-SMR: concur; independently verified against `client_golang@v1.23.2`
+  `registry.go:67/85/442/711-715`.
+
+All minor findings are folded into plan v2 and the implementation.
+
+## Test plan
+
+- [x] `go test ./pkg/api/...` — green
+- [x] `TestCollectorDescriptorCoverage` — 5/5 flake-free
+- [x] **Non-vacuity proven live**: deleting `ch <- c.neighborWarmDropsTotal`
+  from `Describe()` makes `Gather()` error with
+  `collected metric xpf_userspace_neighbor_warm_drops_total ... with unregistered
+  descriptor` and the canary FAILS; restoring `Describe()` makes it PASS.
+- [x] `go test ./...` — only failures are pre-existing
+  `pkg/dataplane/userspace` `bind: invalid argument` sandbox socket failures,
+  which reproduce identically on clean master and are unrelated.
+- [x] No cluster smoke — test-only control-plane change.
+
+*(truncated — 54 lines total)*
+
+
+---
+
+## PR #1729 — #1725: filter/engine evaluation test coverage [MERGED] (merged 2026-05-31)
+
+Branch: `refactor/1725-filter-engine-tests`
+
+## Summary
+
+Adds 13 cargo unit tests filling the genuinely-uncovered behaviors in
+the firewall filter-engine evaluation path
+(`userspace-dp/src/filter/engine/{eval.rs, tx_selection.rs,
+cache_sensitive.rs}`). These files carry 0 *local* `cfg(test)` blocks,
+but `filter/tests.rs` (1998 LOC) already covers most of the surface via
+the parent module's `cfg(test)` submodule — so this PR is scoped to the
+nine real gaps, not a duplicate of existing coverage.
+
+Test-only. No production code change. No cluster smoke (cargo test is
+the gate, per the issue).
+
+Closes #1725. References #1663 (§3 test-gap rank 1-3).
+
+## Gaps filled
+
+1. `FilterAction::Reject` through the plain `evaluate_filter` path
+   (Reject was only asserted in `cos_classify_tests.rs` / `event_emit.rs`).
+2. Missing filter key + empty filter -> implicit Accept default.
+3. Address-family mismatch (V4 src + V6 dst) -> `_ => default` arm.
+4. IPv6 baseline `evaluate_filter`, `evaluate_lo0_filter` (is_v6), and
+   `evaluate_interface_filter` input (existing test only called is_v6=false).
+5. `evaluate_filter_counted` baseline hit-counter increment, v4 + v6,
+   including a non-match leaving the counter at 0.
+6. `evaluate_interface_filter_non_routing_counted` PBR-reject: a matching
+   routing-instance term short-circuits to default without recording.
+7. `evaluate_interface_filter_tx_selection_counted` /
+   `evaluate_interface_output_filter_tx_selection_counted` FilterState
+   wrappers + the no-filter default arm.
+8. Thin accessor predicates (`interface_filter_affects_tx_selection`,
+   `filter_state_has_input_tx_selection`,
+   `interface_input_filter_has_dscp_match`,
+   `interface_output_filter_has_dscp_match`) in one table-driven test.
+9. Cached-vs-runtime baseline parity for a plain (no-policer) term.
+
+## Plan + adversarial review
+
+Plan doc: `docs/pr/1725-filter-engine-tests/plan.md`
+
+- Codex plan review: PLAN-NEEDS-MINOR (two factual corrections folded
+  into plan v2: Reject is tested elsewhere repo-wide; v6 interface-input
+  was uncovered). Confirmed 0/9 fully covered in `filter/tests.rs`.
+- Antigravity plan review: PLAN-READY (all 9 gaps genuinely uncovered,
+  zero false positives).
+- Claude-SMR: PLAN-NEEDS-MINOR (same corrections + fold accessors).
+
+## Non-vacuity
+
+Tests build state through the real `parse_filter_state` compiler and
+
+*(truncated — 62 lines total)*
+
+
+---
+
+## PR #1730 — #1724: dedup L4 checksum-offset match sites via statically-dispatched helpers [MERGED] (merged 2026-05-31)
+
+Branch: `refactor/1724-checksum-offset-helper`
+
+## Summary
+
+Dedup the five duplicated `match protocol { TCP/UDP[/ICMPv6] => offset }`
+blocks in `userspace-dp/src/afxdp/frame/checksum.rs` into statically-
+dispatched `#[inline(always)]` free helpers, preserving the IPv4
+(UDP-only) vs IPv6 (UDP|ICMPv6) zero-checksum-canonicalization asymmetry
+the #1669 §3 triage flagged as the trap to avoid. No `dyn`, no trait, no
+generics (the #961/#1207 hot-path rule). No public API or behavior change.
+
+`match protocol` sites in the file drop from 7 to 4 (two single-source
+offset helpers + the two intentionally-untouched `recompute_l4_checksum_*`
+functions).
+
+Closes #1724. References #1669.
+
+## Design (per-family split — NOT a blind unify)
+
+- `l4_checksum_field_delta_v4` (TCP/UDP only, **no** ICMPv6 arm) and
+  `l4_checksum_field_delta_v6` (adds ICMPv6 => +2). The v4 helper has no
+  ICMPv6 arm so an IPv4 packet carrying protocol 58 still no-ops exactly
+  as before — the IPv4 NAT adjust paths call the v4 helpers without
+  protocol filtering, so a shared ICMPv6 arm would have changed live
+  behavior to adjust at `ihl+2`.
+- `checked_add` stays at the call site so recognized-protocol offset
+  overflow still propagates as `None` (failure); the helper's `None`
+  means only "unsupported protocol", mapped to the no-op `Some(())`.
+- Two clearly-named zero-checksum predicates: `l4_udp_checksum_optional`
+  (RFC 768 IPv4-UDP "checksum optional, do not fabricate" skip) is kept
+  separate from `adjust_zero_checksum_illegal(protocol, family)` (the
+  computed-zero -> 0xFFFF canonicalization), which is documented as scoped
+  to the incremental-adjust sites only. The pre-existing
+  `recompute_l4_checksum_ipv6` ICMPv6 non-canonicalization is left
+  untouched.
+- The two `recompute_l4_checksum_*` functions (full recompute with
+  distinct per-protocol min-length checks + field zeroing) are
+  intentionally NOT folded in — they don't share the offset-lookup shape.
+
+## Plan + adversarial review
+
+Plan doc: `docs/pr/1724-checksum-offset-helper/plan.md`
+
+- Codex plan-review: r1 PLAN-NEEDS-MINOR, r2 PLAN-NEEDS-MAJOR (found two
+  real correctness bugs in the v3 family-independent helper), r3
+  PLAN-NEEDS-MINOR (both bugs fixed by design; asked for the overflow/
+  proto-58 regression tests, now added).
+- AGY adversarial plan-review: r1 PLAN-KILL (LOC-negative payoff on the
+  early shape), r2 PLAN-READY (KILL lifted) — independently flagged the
+  same two issues Codex blocked on, which v4 fixes.
+- Claude SMR: independently verified the proto-58 and overflow hazards
+  and the v4/v6 canonicalization asymmetry against the source.
+
+*(truncated — 76 lines total)*
+
+
+---
+
+## PR #1737 — #1732: CoS GuaranteeRate waterfill — persistent honored set + alloc-free hot path [MERGED] (merged 2026-06-01)
+
+Branch: `refactor/1732-waterfill-persistent-honored`
+
+## Summary
+
+Fixes two defects in the GuaranteeRate waterfill selector
+(`select_exact_cos_guarantee_queue_waterfill`) on the CoS shaped hot path:
+
+1. **Per-call heap alloc** — the selector cloned
+   `exact_queues_by_rate_ascending` (`Vec<usize>`) on every selection. Now
+   iterates by index with index-copy-before-`&mut` borrow-split: zero alloc.
+2. **No persistent honored set → lowest-rate skew** — a function-local
+   `honored_mask` reset to 0 every call meant Phase 1 had no honored-skip (so
+   the smallest-rate queue was re-honored on every call and monopolised the
+   Phase-1 budget) and Phase 2 saw an empty mask (so it could not skip
+   already-honored queues — the documented "approximates"). Replaced with a
+   persistent `waterfill_honored_epoch_bits: u64` on `CoSInterfaceRuntime`,
+   keyed by ascending-vec ORDINAL, read by BOTH phases, cleared at the
+   epoch refill. Phase 1 now honors each queue at most once smallest-first;
+   Phase 2 serves the residual to the larger un-honored queues.
+
+Shift sites are guarded with `ordinal < 64` (release-safe; a >64-exact-queue
+config leaves ordinals ≥64 conservatively untracked instead of wrapping
+`1u64 << (≥64)`), with a `debug_assert` tripwire and a one-time journald
+warning at `build_cos_interface_runtime`.
+
+Closes #1732. Refs #1731 (item #2 / §4.2 of the ENGINEER-READY research
+plan). #1735 (MQFQ generalize) builds on this.
+
+## Plan + adversarial review
+
+Plan doc: `docs/pr/1732-waterfill-persistent-honored/plan.md` (4 rounds).
+
+- Codex r4: PLAN-READY · AGY r4: PLAN-READY · Claude-SMR: concur
+- Round-1: Phase-1-skip FATAL (Codex+AGY) folded
+- Round-2: ordinal-keying (was keyed by `queue_idx`, broke for root index ≥64) folded
+- Round-3: release shift-overflow guard + §6 stale text folded
+- AGY edits during r1 review were reverted (review-only policy)
+
+## Test plan
+
+- [x] cargo build clean (release)
+- [x] cargo test --release: 1660+46+8+16+1 pass, 0 fail
+- [x] 2 new distribution tests, 5/5 flake each
+- [x] Go suite: all pass (the 2 `bind: invalid argument` failures under the
+      default temp dir are a 109>108-byte unix `sun_path` artifact; both pass
+      with a short `TMPDIR` — change is Rust-only, zero Go files)
+- [x] make audit-check (queue_service/mod.rs 1711→1750 LOC, still WATCH-tier; snapshot regen)
+- [ ] **Pass A — CoS disabled** (best-effort fast path) v4+v6 push+reverse + `-P 12 -R`
+- [ ] **Pass B — CoS enabled** per-class 5201-5206 v4+v6 push+reverse
+- [ ] **#1217 structural-CoV gate** (exact-class distribution changes)
+
+`make test-failover` NOT required: the honored bitset is per-interface
+
+*(truncated — 54 lines total)*
+
+
+---
+
+## PR #1738 — #1733 Phase 1: hard-reject equal-flow-enforcement above 32 workers [MERGED] (merged 2026-06-01)
+
+Branch: `refactor/1733-equal-flow-worker-cap-reject`
+
+## Summary
+
+Closes #1733. References #1731 (sub-issue #1731-b, control-plane half).
+
+The v8 CoS lease rotation samples per-worker state from a 32-entry stack
+scratch (`MAX_WORKERS_SCRATCH` in `rotate_epoch_v8.rs`). Above 32 workers
+the only guard is a `debug_assert` (stripped in release): an active worker
+beyond index 31 makes `publish_equal_flow_epoch_v8` take
+`fail_open(UnsampledActiveWorker)`, **silently disabling equal-flow
+fairness**. On a 48-/64-core box the operator's configured fairness
+contract is silently not enforced.
+
+This PR makes the unsupported combination fail **loudly at commit** instead
+of fail-opening at runtime, while tolerating already-deployed legacy
+configs so upgrades don't black out.
+
+### What changed
+- New `config.MaxEqualFlowWorkers` (= the Rust `MAX_WORKERS_SCRATCH`, pinned
+  by a parity canary test) + `validateEqualFlowWorkerCapStrict`, wired into
+  the #1538 independent strict-validator accumulator. A candidate commit /
+  `commit check` of `system dataplane workers > 32` together with any
+  `equal-flow-enforcement` scheduler is **hard-rejected**.
+- The validator reads the **typed** `cfg.System.UserspaceDataplane.Workers`
+  (post-compile), so all worker-count AST forms are already normalized — no
+  AST re-walk, no discovery skew.
+- **Lenient compile mode** (`CompileConfigLenient` /
+  `CompileConfigForNodeLenient` + `Store.compileTreeLenient`) used ONLY by
+  `Store.Load` and `Store.SyncApply`: downgrades this one validator to a
+  `cfg.Warnings` entry + loud WARN so an upgraded node boots an
+  already-persisted config and HA sync converges. The leaf is **not**
+  mutated; the runtime keeps fail-opening equal-flow exactly as before.
+  Because leniency runs the identical compile pipeline (same group
+  expansion, same per-node context), it warns on exactly the configs the
+  strict path rejects — no false-positive on a `${node}`/group/split-stanza
+  config whose effective per-node workers are <= the cap.
+- Read-only peer-interface display re-compiles
+  (`cli_show_interfaces.go`, `server_show_interfaces.go`) switched to the
+  lenient variant so a tolerated legacy active config does not silently drop
+  peer-interface display.
+
+### Runtime visibility
+The fail-open reason is already exported end-to-end as the gauge
+`xpf_userspace_cos_equal_flow_fail_open{reason="unsampled_active_worker"}`;
+Phase 1 adds the loud commit-check rejection + the load/sync WARN. No new
+counter.
+
+### Out of scope
+Removing the 32-worker cap entirely (reusable heap scratch in the v8
+rotation) is the deferred #1731-e follow-up. No Rust dataplane change here.
+
+
+*(truncated — 84 lines total)*
+
+
+---
+
+## PR #1739 — #1432: WireGuard S2a — datapath + UDP socket + config bring-up [MERGED] (merged 2026-06-01)
+
+Branch: `refactor/1432-wg-s2a-datapath-socket-config`
+
+## Summary
+
+S2a wires the S1 wire-compliant WireGuard engine (#1709) into the live
+AF_XDP datapath for a single tunnel, initiator-capable. Before this PR
+the engine was dead code — instantiated nowhere, `try_encap`/`try_decap`
+with zero call sites, no UDP socket, the `Wg*` snapshot DTO never
+populated. After S2a xpf can encap/decap over WireGuard on the AF_XDP
+path (proven by unit tests + the engine round-trip). The live
+independent-peer interop proof is the deferred follow-up **S2b (#1736)**.
+
+Converged plan: `docs/pr/1432-wg-s2a-datapath-socket-config/plan.md`
+(PLAN-READY, 3 hostile rounds: Codex + AGY + Claude-SMR).
+
+## Architecture (the converged `wgN` TUN model)
+
+A persistent `wgN` TUN device is the inner interface; the kernel routes
+inner (decrypted) packets. A control thread owns the `UdpSocket` + the
+TUN fd + the S1 engine. WG-to-firewall is local-destination UDP that the
+XDP shim passes to the kernel via `cpumap_or_pass` (the ESP/IPsec
+precedent), so a kernel `UdpSocket` on the listen port receives WG
+datagrams. Reinject of decapped inner is via the TUN/kernel, NOT the
+AF_XDP policy engine; the engine's AllowedIPs gate is the S2a inner-src
+control.
+
+## Logical-increment commits (merge `--merge`, not squash)
+
+1. Go config DTO + parser + persistent `wgN` TUN (no reload flap, MTU cap)
+2. Runtime `TunnelEndpoint` hydration + engine instantiation (reload-stable)
+3. WG control thread (UDP socket + TUN + handshake driver)
+4. Egress encap branch (`frame/mod.rs`) + shim WG-port early-return
+5. Unit tests (engine, reload, hydration, MTU, privkey)
+6. Audit baseline regen
+
+## Hardening folded from plan review
+
+- Shim early-return requires `is_local_destination` (MANDATORY — a
+  port-only match would shunt transit/DNAT UDP on the WG port to the
+  kernel, bypassing the policy engine).
+- Persistent `wgN` TUN, reused-in-place on reload (AGY r3 Hazard B).
+- `wgN` MTU cap (1420) + exact pad-aware encap MTU guard both directions
+  (AGY r3 Hazard A / Codex r3).
+- Engine reload stability: identity-stable Arc reuse (no `reconcile_peers`
+  on the shared Arc); fresh engine seeded from prior TAI64N high-water.
+- Privkey hygiene: `skip_serializing` + redacted Debug end-to-end.
+- NoSession worker→control edge is a single relaxed atomic (no handshake
+  state on the worker; control-thread-only crypto invariant preserved).
+- `rp_filter` / `EADDRINUSE` / DNAT-to-WG-port runbook notes (plan §8).
+
+## Hot-path no-regress
+
+
+*(truncated — 71 lines total)*
+
+
+---
+
+## PR #1740 — #1735 (#1731-d): generalize per-flow MQFQ to all shaped CoS queues [MERGED] (merged 2026-06-01)
+
+Branch: `refactor/1735-mqfq-generalize-shaped`
+
+## Summary
+
+Per-flow MQFQ fairness today runs only on **exact** CoS queues;
+best-effort / residual / non-exact shaped queues collapse to a single
+FIFO, so one elephant flow starves every mouse inside the same shape.
+This generalizes the existing `FlowFairState`/MQFQ dequeue to **all
+shaped queues** without regressing the best-effort fast path (the #1183
+10x-reverse-regression class).
+
+Mechanism (converged #1731 research plan §4.1):
+
+1. **`flow_fair()` is now `flow_fair_state.is_some()`**, not
+   `config.flow_fair`. The invariant `flow_fair() == is_some()` is
+   structurally unbreakable — a `None`-state queue always takes the
+   cheap FIFO branch.
+2. **`config.flow_fair` → `config.flow_fair_eligible`** (decoupled from
+   the runtime gate). Set for every shaped queue that reaches
+   `promote_cos_queue_flow_fair`. Forwarding-only / transparent
+   interfaces never build a `CoSInterfaceRuntime` (#1183 useful-CoS
+   gate), so they stay ineligible.
+3. **Hash-free front-key contention probe** (`maybe_promote_best_effort`)
+   in `cos_queue_push_back`: a single-flow / uncontended best-effort
+   queue stays a trivial FIFO (no hash, no 232 KB `FlowFairState`); only
+   the **first genuinely-distinct flow** promotes the queue.
+   `promote_to_flow_fair` migrates the resident FIFO by re-enqueueing
+   each item through the normal MQFQ accounting path (correct for any
+   flow mix). Exact queues promote eagerly at build (unchanged).
+4. **Lazy demotion with hysteresis** at the quiescent batch-settle
+   boundary (`apply_cos_send_result` / `apply_cos_prepared_result`):
+   a fully-drained non-exact queue releases its `FlowFairState` after
+   `COS_DEMOTE_EMPTY_SETTLE_HYSTERESIS` settles. Exact queues never
+   demote.
+
+Surplus DWRR across queues + MQFQ inside the selected queue compose for
+free (`build_cos_batch_from_queue` already dispatches on `flow_fair()`),
+which also folds in the residual queue-level → flow-level item (the #1731 research plan finding #7; not GitHub issue #7).
+
+No control-plane / wire / Go change; all edits are
+`pub(in crate::afxdp)` internal.
+
+## Plan + adversarial plan-review
+
+Plan doc: `docs/pr/1735-mqfq-generalize-shaped/plan.md` (v2).
+
+- **Codex r1** (task-mpuie4sw-l40kxh): PLAN-KILL on Q2 (front-key guard
+  fragility) → all findings folded into v2 (per-item-hash migration +
+  tightened demotion predicate + completed audit).
+- **AGY** (adversarial-review-mpuiw502-ogiynq): **PLAN-READY** — a
+  mathematical proof that the Codex Q2 counter-example is invalid under
+  the synchronous single-thread worker model, and that the best-effort
+
+*(truncated — 85 lines total)*
+
+
+---
+
+## PR #1744 — #1743: CoS waterfill — anchor Phase-1 budget to shaped cap + stable honor charge + time refresh [MERGED] (merged 2026-06-01)
+
+Branch: `fix/1743-cos-waterfill-shaped-budget`
+
+## Summary
+
+The CoS GuaranteeRate waterfill selector regressed at high shapes: per-flow
+CoV spiked because Phase-2 (surplus distribution) never admitted
+(`phase2_admit≈0`). Three coupled defects in the Phase-1 accounting in
+`userspace-dp/src/afxdp/cos/queue_service/mod.rs` (opt-in
+`oversubscription-policy guarantee-rate` path only — Proportional untouched):
+
+- **Hunk A** — Phase-1 budget used `quantum_sum × fraction`, which for any
+  oversubscribed config (Σ R_i &gt; shaper) over-budgets pass1 by ~4.24× the
+  bytes the root shaper can deliver per epoch (1,855,753 B vs 437,500 B for
+  the 25g/0.7 fixture). Phase-1 then honored every class and Phase-2 never
+  fired. Now anchored to `shaping_rate_bytes × COS_GUARANTEE_VISIT_NS / 1e9 ×
+  fraction` (the documented "fraction × cap" contract); transparent (unshaped)
+  root keeps the legacy quantum_sum formula; shaped result clamped to
+  ≥ one min-quantum so a tiny fraction can't floor pass1 to 0 (AGY RISK-1).
+- **Hunk B** — Phase-1 honor charge was `queue.hot.tokens.min(quantum)`, which
+  under v8-lease pressure collapsed to one frame, marking a small queue fully
+  honored while consuming almost no budget — so Phase-2 skipped it. Now charges
+  the stable configured quantum `cos_guarantee_quantum_bytes(queue).max(head_len)`.
+- **Hunk C** — no time-based budget refresh; Phase-2 selections don't decrement
+  pass1 so it froze under saturation. Adds `waterfill_epoch_start_ns` +
+  refresh every `COS_GUARANTEE_VISIT_NS`, clearing the #1732 persistent honored
+  bitset only on genuine epoch boundaries (time tick OR Phase-2 wrap, NOT on
+  bare mid-walk `pass1 == 0` refills) while PRESERVING the Phase-2 cursor
+  across epochs (only the Phase-2 wrap None path resets the cursor — the
+  #1630 r4 invariant).
+
+Re-lands the #1630 shaper-anchor + time-refresh design (its branch was never
+merged to master) on top of #1732's persistent honored set (which exposed, not
+introduced, the Phase-2 death). #1732 is preserved, not reverted.
+
+Closes #1743
+
+## Plan + adversarial review
+
+Plan doc: `docs/pr/1743-cos-waterfill-shaped-budget/plan.md`
+- Codex plan-r1: PLAN-NEEDS-MINOR (fixture math + undersubscribed test — addressed) — task-mpvav706-nx3l72
+- AGY plan-r1: PLAN-READY (RISK-1 tiny-fraction clamp — addressed) — adversarial-review-mpvavgvw-04ia5f
+- Claude SMR: PLAN-READY (root-cause + traces verified against master e4556085a)
+
+## Live validation gate (loss:xpf-userspace-fw0, matched A/B)
+
+Ground truth = iperf3 per-stream CoV (NOT cos_active_flow_count, #1741).
+Full evidence in `docs/pr/1743-cos-waterfill-shaped-budget/validation-gate.md`.
+
+**Phase-2 admission (primary signal), full 11-class simul P12, 3 matched runs:**
+| run | master p2/p1 | fix p2/p1 |
+|----:|-------------:|----------:|
+| 1 | 0.0064 | 1.433 |
+
+*(truncated — 88 lines total)*
+
+
+---
+
+## PR #1747 — #1745: sample equal-flow active-flows at acquire time, not rotation boundary [MERGED] (merged 2026-06-02)
+
+Branch: `refactor/1745-equal-flow-failopen-sample`
+
+## Summary
+
+CoS `equal-flow-enforcement` (opt-in, default OFF) permanently
+fail-opened with `reason=insufficient_sampled_workers`, so the v8
+equalizer never clipped outlier flows. Root cause: the epoch sampler
+derived the equal-flow worker set from the instantaneous
+`worker_active_flow_buckets` read plus the per-epoch demand boolean, both
+captured at the 200 µs rotation boundary — but exact CoS queues skip
+`acquire_v8` while they hold banked tokens (`token_bucket.rs:201`), so a
+worker carrying real traffic whose per-epoch consumption stayed under the
+bank never bumped demand for that epoch even though its flow bucket was
+nonzero. At rotation it looked active-but-undemanded → the publisher
+bailed `UnsampledActiveWorker`, and with several such workers the demanded
+set fell below 2 → permanent `InsufficientSampledWorkers`.
+
+Fix: record the sample **when the worker requests lease credit**, not at
+the rotation instant. A new `EqualFlowSuppress`-only `V8State` array
+`worker_equal_flow_active_samples` holds a tagged sticky-max active-flow
+sample per worker; rotation swaps it and the publisher derives the sample
+set from `sampled_active_flows>0 && demanded && prev_grants>0`. A
+demanded-or-granted-but-unsampled worker keeps the `UnsampledActiveWorker`
+safety fail-open; a genuinely idle-at-rotation worker is excluded without
+forcing a fail-open. Target semantics stay clip-to-SLOWEST; the
+work-conserving / global-fair-rate target policy is the separate #1746,
+which this fix unblocks.
+
+The default (equal-flow-OFF) path is byte-unaffected: all new reads/writes
+are gated on the `EqualFlowSuppress` rate mode, on both the acquire and
+rotation sides.
+
+Closes #1745. References #1746.
+
+## Plan + adversarial review
+
+Plan doc: `docs/pr/1745-equal-flow-failopen-sample/plan.md`
+
+- Codex plan r1: PLAN-NEEDS-MAJOR (5 code-grounded findings)
+- Antigravity (AGY) plan r1: PLAN-NEEDS-MINOR (independent proofs, same 2 required fixes)
+- Claude-SMR plan r1: PLAN-NEEDS-MAJOR (verified all findings against code)
+- Converged NOT-KILL. Q1 (sufficiency / the kill question) resolved by
+  both external reviewers with independent proofs: exact queues have no
+  autonomous local refill, so any byte-sending worker is forced to
+  `acquire_v8` within the epoch; only a zero-traffic worker stays banked
+  and excluding it is correct. All round-1 findings folded into plan v2 +
+  the implementation (race-free helper, rotation-side gating,
+  keep-the-bail-for-real-participants, regression tests).
+
+## Test plan
+
+- [x] cargo build clean (release)
+
+*(truncated — 90 lines total)*
+
+
+---
+
+## PR #1749 — #1748: cross-worker per-flow ntuple rebalance controller (forward, default-OFF) [CLOSED] (closed 2026-06-10)
+
+Branch: `engineer/1748-ntuple-rebalance`
+
+## Summary
+Reactive cross-worker per-flow fairness via mlx5 ntuple HW re-pin, in the Rust `userspace-dp`. When a worker's byte-rate is over-loaded, the controller moves the heaviest flow's forward 5-tuple to an idle RX queue via a direct `SIOCETHTOOL`/`ethtool_rxnfc` ioctl. **Default-OFF, opt-in, forward-direction.** This is the only lever that lifts slow flows (vs the #1746 cap which only clips fast ones) — R1 spike measured per-flow CoV **16.8% → 2.3–4.2% with aggregate preserved**.
+
+Closes #1748.
+
+## Plan + adversarial review (6 hostile rounds)
+Plan: `docs/pr/1748-ntuple-rebalance/plan.md` (PLAN-READY v7). The review converted the research's "no migration code" premise into a fully-specified **session-ownership-transfer protocol**, catching 6 verified session-corruption bugs (GC cascade kill, never-cleanup leak, zero-owner race, near-expiry TTL race, unbarriered teardown, terminal-path leaks). Reviewer ledger: `docs/pr/1748-ntuple-rebalance/reviewer-ids.md`.
+
+## Design
+- Two `SessionOrigin` variants: `RebalancedOut` (abandoned W_old — suppresses **every** shared-state release/delete: Close delta, redirect+conntrack delete, SNAT release on GC+purge, `DeleteSynced`, demote/refresh/export, terminal-filter) and `RebalancedOwner` (promoted W_new — the single end-of-flow cleanup owner).
+- Applied-command **barriers** on every rule transition (install = forward; rollback + live-teardown = reverse), with structured `{seq,key,origin,result}` ack. Promote is a liveness-refreshing origin-only tag-flip (no delta/publish/NAT).
+- `ethtool_rxnfc` ioctl with compile-time UAPI offset asserts (corrected `TCP_V4_FLOW=0x01`, `rule_locs@188` against the kernel header); byte-rate-aware selection (`≤gap/2`, cooldown, ε-band, budget STOP no-eviction).
+
+## Test plan
+- [x] cargo build clean (UAPI const-asserts hold)
+- [x] cargo test --release: **1797 passed / 0 failed**; 23 rebalance/UAPI/suppression tests incl. barrier-order, both reverse-barrier rollbacks, magnitude guard, live-teardown reverse barrier, UAPI offset+round-trip, promote-side-effect-free, RebalancedOut/Owner expiry delta correctness, terminal-filter shared-state preservation
+- [x] 5× flake-loop of 5 key controller tests — 5/5
+- [x] go test ./... — pass (TMPDIR=/tmp)
+- [ ] **Pass A/B smoke matrix** (v4+v6 × push+reverse × CoS-off/on) — parent runs on loss cluster
+- [ ] **Live CoV gate** — enable knob, `-P12 -p5210`, confirm controller drives CoV ≤10% w/ aggregate preserved + bounded retransmits; default-OFF control unchanged
+- [ ] **`make test-failover`** — MANDATORY (HA-critical session-state)
+
+## Out of scope (plan §9)
+R2 reverse-direction rules, R4 peer rule-mirroring (post-failover resets to RSS — documented), R5 full eviction policy.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #1753 — #1752 Path E: in-place session refresh (eliminate per-packet remove+restore churn) [MERGED] (merged 2026-06-03)
+
+Branch: `engineer/1752-session-inplace-refresh`
+
+## Summary
+
+`SessionTable::update_session` (the established-flow refresh path —
+`refresh_local`/`promote_synced_with_origin`/`refresh_for_ha_activation` route
+through it) previously did `remove_entry` → mutate → `restore_entry` **per
+packet**, tearing down and rebuilding `key_to_handle`, the slab slot (new
+handle), all four secondary indices, and cloning `SessionMetadata` ~3× — just to
+bump `last_seen_ns`/`expires_after_ns`. This rewrites it (and
+`refresh_for_ha_transition`) to mutate the slab record in place via `get_mut`,
+touching the value-guarded secondary-index **removes** only when a key-relevant
+input (`decision.nat` / `is_reverse` / `owner_rg_id`) actually changed. Secondary
+**adds** are always re-asserted (byte-identical to `restore_entry`'s
+unconditional `index_forward_nat_key`, incl. the reject branches and the
+collision-displacement re-win). A stale-handle + primary-key guard mirrors
+`remove_entry`'s release-mode safety nets.
+
+Part of #1752 (Path E — the first lever; Paths B/A/C/D remain as tracked follow-ups, not closed by this PR).
+
+## Perf (live, loss userspace cluster, `-P48 -p5210`)
+
+Session-churn flat self-time, master → this branch:
+- `hashbrown remove_entry`: **2.73% → 0.56%**
+- `hashbrown insert`: **1.72% → 0.36%**
+- ≈ **3.5 percentage points of CPU freed** (matches the plan's ~3–3.5% target).
+
+Aggregate throughput unchanged within noise (15.9 vs 16.0 Gb/s, 0 retrans) — at
+16 Gb/s CoS-on the binding constraint is the CoS shaping path, not this churn;
+the change frees CPU headroom, which is why the plan anchors on CPU% not Gb/s.
+
+## Plan + 3-way adversarial review (research convergence)
+
+Plan doc: `docs/pr/1752-session-inplace-refresh/plan.md` (PLAN-READY @ `a983c6e59`).
+- Codex: r1 NEEDS-MAJOR (collision re-assert + stale-handle guard) → r2
+  NEEDS-MAJOR (reject-path re-assert) → r3 NEEDS-MINOR (handle-normalized test) — all folded.
+- Gemini: r1 NEEDS-MINOR → r2/r3 PLAN-READY.
+- Claude SMR: PLAN-READY.
+
+## Test plan
+
+- [x] cargo build clean (release)
+- [x] cargo test --release: 1711 pass (full suite); 11 new differential tests
+- [x] randomized differential test 5/5 flake-clean; single-threaded full suite clean
+- [x] Go suite passes (2 unrelated tests fail only on the sandbox's >108-char unix `sun_path`; no Go files changed)
+- [x] Deploy on loss userspace cluster (fw0 primary, fw1 secondary)
+- [x] **Pass A — CoS disabled**: v4/v6 push+reverse on 5201, 0 retrans; `-P12 -R` line rate **v4 22.9 / v6 22.6 Gb/s**, 0 retrans
+- [x] **Pass B — CoS enabled**: per-class 5201–5206 v4+v6 push+reverse — all 24 measurements 0 retrans; shaped classes hit caps (5201≈97M, 5202≈960M, 5203≈2.87G) cleanly
+- [x] `make test-failover`: **13/13** — fw1 synced 65 sessions; sessions survived unclean reboot + manual failover
+- [x] perf re-profile confirms the session-churn reduction
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #1759 — #1752 Path D: document the N/N/N no-headroom sizing ceiling [MERGED] (merged 2026-06-03)
+
+Branch: `engineer/1757-doc-sizing-ceiling`
+
+## Summary
+
+Docs-only. Adds a **Sizing Headroom** subsection to
+`docs/userspace-dataplane-architecture.md` (Performance Architecture) documenting
+the `workers == vCPUs` no-headroom regime — the loss cluster's 6 vCPU = 6 mlx5 RX
+queues = 6 AF_XDP workers, where the dataplane consumes the whole machine:
+
+- all 6 cores ~100% busy (worker busy-poll + same-core NET_RX softirq + shared Go GC);
+- a configured CoS shape can sit **above** the box's CPU forwarding ceiling and
+  never engage (measured ~16 Gb/s CoS-on / ~23 Gb/s CoS-off vs a 24G `exact` scheduler);
+- freeing hot-path CPU buys margin, not aggregate throughput, when the bottleneck
+  is elsewhere;
+- real headroom = scale vCPUs + RX queues + workers together (keep `workers + 2`),
+  not code.
+
+Also documents the `mlx5_core.ko.xz` perf-symbolization caveat (the "crypto DEK"
+artifact) so operators validate kernel-symbol attribution with `bpftrace` before
+trusting a perf `%`.
+
+All numbers were measured in #1752 on the loss userspace cluster.
+
+Closes #1757. Part of #1752.
+
+## Test plan
+- [x] Docs-only — no code change. No build/test/smoke impact.
+- [x] Complements the existing "CPU Layout (8 vCPU)" + `workers + 2` tuning guideline.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #1761 — #1755: eliminate per-packet __rust_probestack frames on the CoS hot path [MERGED] (merged 2026-06-03)
+
+Branch: `engineer/1755-cos-probestack`
+
+## Summary
+
+Path A of #1752. Codegen-only, **zero CoS-fairness-algorithm change**.
+
+The `-P48 -p5210` CoS-on profile attributed ~19% of self-time to the CoS
+exact-guarantee queue machinery. Live annotation showed the dominant single
+line item is not algorithmic enqueue work — it is a Rust large-stack-frame
+`__rust_probestack` page-touch loop, run on **every** packet:
+
+- `cos_queue_push_back` reserved a **352 KB** frame (`sub $0x56000,%r11`) +
+  probe loop = ~61% of its self-time, because the inlined (but at runtime
+  never-taken) `promote_to_flow_fair` materialised the ~352 KB `FlowFairState`
+  by value.
+- `ensure_cos_interface_runtime` reserved a **36 KB** frame + probe loop on
+  every ingress packet (the cold builder materialises `CoSInterfaceRuntime`
+  by value), before the `contains_key` hot early-exit.
+
+## Changes (logical commits)
+
+- **B** — `FlowFairState::new_boxed(seed) -> Box<Self>`: builds the ~352 KB
+  struct directly into a `Box<MaybeUninit<Self>>` via `addr_of_mut!` per-field
+  writes + `assume_init`, so the giant struct never lands on any stack frame.
+  POD arrays/scalars + the POD `FlowRrRing` are zeroed in place; the
+  `[VecDeque;4096]` (per-slot loop, no 128 KB temporary) and `Vec` fields are
+  written with real values (a zeroed Vec/VecDeque is invalid — new_zeroed
+  would be UB and is avoided). Panic-free body, no drop scaffold needed.
+- **A1** — `promote_to_flow_fair` marked `#[cold] #[inline(never)]` and switched
+  to `new_boxed`. `maybe_promote_best_effort` stays `#[inline]`.
+- **A2** — `ensure_cos_interface_runtime` keeps a tiny `#[inline]` outer fn
+  (early-exits only); the build/insert tail moves to a new
+  `#[cold] #[inline(never)] ensure_cos_interface_runtime_cold`.
+
+No vtime/finish/active-count/lease/V_min arithmetic or classify decision
+changes. The `flow_fair() ↔ flow_fair_state.is_some()` invariant is untouched.
+
+## Perf delta (codegen proof)
+
+`objdump -d -C` on the release binary:
+
+| symbol | before | after |
+|---|---|---|
+| `cos_queue_push_back` | `sub $0x56000,%r11` (352 KB) + probe loop | `sub $0x18,%rsp` (24 B), **no probe** |
+| `ensure_cos_interface_runtime` (per-packet) | 36 KB frame + probe loop | inlined, no giant frame; 36 KB lives only in `_cold` callee (≤1×/ifindex) |
+
+Whole-binary `__rust_probestack` call sites: **0**. Live `-P48 -p5210` CoS-on
+`perf report`: **0 probestack frames**; `cos_queue_push_back` annotate shows no
+probe-loop instructions. The probe component (~61% of push_back self-time) is
+eliminated; residual self-time is genuine queue work.
+
+## Test plan
+
+*(truncated — 68 lines total)*
+
+
+---
+
+## PR #1762 — #1760: NAT reverse-key 1:N collision telemetry counter [MERGED] (merged 2026-06-04)
+
+Branch: `engineer/1760-collision-counter`
+
+## Summary
+
+Adds a per-worker `SessionTable` telemetry counter that measures real-world
+incidence of the latent NAT reverse-path 1:N collision documented by the
+#1758 research: the single-valued `nat_reverse_index` cannot represent two
+live sessions deriving the same external reverse key K (reachable under
+interface-mode SNAT, DNAT-to-shared-backend, NAT64, and non-bijective
+static NAT; pool-mode SNAT is immune).
+
+**This is telemetry ONLY. Part of #1760 — it does NOT close it.** The
+structural fix (multi-valued index / install-time collision policy) is
+deliberately deferred to its own future `/research` per the #1758 finding;
+the bug stays open until that ships. Removing the load-bearing re-assert is
+not done (it is correct arbitration, not the bug).
+
+### Detection — cheap-proxy (near-precise)
+
+`FxHashMap::insert` already returns the displaced value, so the per-flow
+secondary-index re-assert in `index_forward_nat_key_parts` (the
+`reverse_wire_key` insert, now per-packet for established flows after
+#1753) increments the counter whenever it displaces a *different* handle.
+No extra lookup, no allocation, no atomic on the worker-owned table —
+mirrors the existing `create_drops`/`delta_drops` shape. Because removal is
+value-guarded, the displaced handle is near-always live, making this a
+near-precise upper bound on live collisions (it counts displacement
+*events*, not distinct flow-pairs — documented).
+
+### Surfaces
+
+Plumbed end-to-end like `session_table_entries`: per-worker
+`WorkerRuntime` atomics → `WorkerRuntimeStatus` → top-level `ProcessStatus`
+aggregation → Go status → Prometheus
+(`xpf_userspace_session_nat_reverse_key_collisions_total` aggregate +
+`xpf_userspace_worker_session_nat_reverse_key_collisions_total` per-worker,
+CounterValue) → `show system buffers` Counters section. All new wire fields
+are additive (`serde(default)` / `omitempty`) for mixed Rust/Go daemon
+back-compat.
+
+## Plan + adversarial plan review
+
+Plan doc: `docs/pr/1760-collision-counter/plan.md` (PLAN-READY v2)
+
+- Codex r1: PLAN-NEEDS-MINOR — 3 findings folded (stale line numbers,
+  missing `coordinator/status.rs` hop, metric semantics = "displacement
+  events"); confirmed `nat_reverse_index` is the correct single site.
+- Gemini r1 (`task-mpypb0y6-jkewb9`): PLAN-READY.
+- Claude SMR: concur; keep honest "displacement events / upper bound" label.
+
+## Test plan
+
+
+*(truncated — 84 lines total)*
+
+
+---
+
+## PR #1764 — #1763: fuse MQFQ select+pop, no-cap min-finish fast path (Path 1) [MERGED] (merged 2026-06-04)
+
+Branch: `engineer/1763-fused-minfinish`
+
+## Summary
+
+Path 1 of #1763 (residual CPU levers, sub-path of #1752). The MQFQ
+min-head-finish bucket scan (`cos_queue_min_finish_bucket`, an O(N)
+linear scan over the active flow-bucket ring, **N=14 measured** under
+iperf3 `-P48` on the loss userspace cluster) ran **twice per successful
+dequeue** on every hot drain path: once in the `cos_queue_front*` peek to
+select the bucket, then again inside `cos_queue_pop_front*` to re-derive
+the same bucket. No queue mutation occurs between peek and pop, so the
+second scan re-computes a byte-identical result.
+`cos_queue_pop_front_inner_with_cap` was **4.28% worker self-time**,
+dominated by this redundant scan.
+
+The converged research plan (Codex + AGY + Claude SMR PLAN-READY) killed
+the heap/structure-replacement framing at N=14 and converged on two
+fairness-neutral-by-construction levers:
+
+- **Lever A — fused select+pop.** `cos_queue_peek_min_bucket` returns the
+  selected bucket id alongside the head item; the caller inspects
+  len/type/budget/mirror gating and, if it commits, pops that exact
+  bucket via `cos_queue_pop_known_bucket` with NO re-scan. Peek-then-
+  abandon paths (budget break) stay at exactly one scan -> strictly
+  non-regressing. A `debug_assert` re-runs the scan in dev/test and
+  verifies the known bucket is still the active-front winner, guarding
+  the no-mutation invariant.
+- **Lever B — `target_bps == u64::MAX` no-cap fast path.** Every
+  best-effort caller passes the no-cap sentinel where `observed <=
+  u64::MAX` always holds, so the eligible/fallback two-pass collapses and
+  the second strided `flow_bucket_observed_bps` load is dead.
+  `cos_queue_min_finish_bucket_no_cap` scans only
+  `flow_bucket_head_finish_bytes`, halving per-bucket cache-miss exposure
+  (the two arrays live on different cache lines). Selection is
+  byte-identical to the cap-aware loop at `target_bps == u64::MAX`.
+
+Wired all three hot drain paths: the no-cap best-effort builder
+(`build_cos_batch_from_queue`, Local + Prepared arms) and the cap-aware
+exact drains (`drain_exact_*_to_scratch_flow_fair`, Local + Prepared).
+
+**Path 2 (neighbor/rtnl) is PLAN-KILLED and untouched** — `neigh_add`
+fires 0/s at steady state; the issue's 45 ops/s was a cold-start
+transient.
+
+## Fairness-neutrality — the hard gate
+
+This is the #1207/#1545 CoS-fairness-selection path; any change that
+picks a different bucket is a fairness regression. `fused_diff_tests.rs`
+builds two independent identically-configured flow-fair queues, drives
+the SAME enqueue/pop/push_front/drain sequence through both (reference =
+original double-scan `cos_queue_front*` + `cos_queue_pop_front*`; fused =
+`cos_queue_peek_min_bucket` + `cos_queue_pop_known_bucket`) and asserts
+
+*(truncated — 79 lines total)*
+
+
+---
+
+## PR #1768 — research(#1767): per-worker AQM/ECN/pacing cross-worker re-convergence — PLAN-KILL [CLOSED] (closed 2026-06-04)
+
+Branch: `research/1767-aqm-reconverge`
+
+Deep `/research` for #1767 (sub of #1765). Design/feasibility only — no production code. Draft PR carries the plan doc + reviewer artifacts for review trail.
+
+Plan: `docs/research/1767-aqm-reconverge/plan.md`
+Reviewers: `claude-smr-plan-r1.md`, `claude-smr-plan-r2.md` (Codex foreground + AGY background verdicts inline in issue comments).
+
+**Verdict: PLAN-KILL** all three candidate mechanisms (per-worker ECN CE-mark, per-worker/per-flow pacing to cross-worker fair share, selective AQM drop).
+
+Core finding: a congestion signal is a demand-side actuator — it changes how fast a sender offers load but cannot change which worker serves it. Bandwidth freed on an oversubscribed worker by backing its flows off is unconsumable by flows pinned to a different RX queue's worker (AF_XDP ZC `xsk_rcv_check` queue pinning) and strands idle. The only CoV reduction a demand-side signal yields is clip-to-slowest, already shipped as default-OFF `equal-flow-enforcement` v8. On the #1757 6/6 CPU-bound box, surplus-sharing pacing cannot recover throughput because budget != serve capacity.
+
+Not for merge to master as code; doc-only research artifact. Issue close + `plan-kill` label tracked on #1767.
+
+---
+
+## PR #1770 — #1769: shared on-demand neighbor resolver (immediate stuck-state fix) [MERGED] (merged 2026-06-05)
+
+Branch: `engineer/1769-neighbor-resolver`
+
+## Summary
+
+Closes the #1769 negative-cache **stuck state**: a directly-connected, outbound-only target (the smoke iperf3 dst `172.16.80.200` on `ge-0-0-2.80`) could blackhole new TCP connects for repeated 3 s windows.
+
+**Root cause.** The #1651 dead-host negative cache (`afxdp/neg_neigh.rs`) fast-fails a SYN to a negatively-cached `(egress_ifindex, next_hop)` **before** the ARP probe and the `pending_neigh` buffer in the `poll_descriptor` `MissingNeighbor` arm. Once `dynamic_neighbors` loses the entry (a transient kernel FAILED/INCOMPLETE/DELNEIGH during revalidation, or a dropped good RTM_NEWNEIGH — the monitor swallows `recv()<=0` and the full dump is startup-only) **and** the 3 s negative entry is armed, nothing re-probes or re-buffers the dst. The kernel's valid DELAY/STALE lladdr is unusable because the hot path refuses an on-demand kernel read. The wedge clears only when the kernel independently re-validates and emits a fresh RTM_NEWNEIGH.
+
+**Fix (converged plan §9, `afxdp/neighbor_resolver.rs`).** On a negative-cache fast-fail the worker enqueues the dst into ONE **shared, per-key, rate-limited** resolver (the `neg_neigh_cache` is per-binding × 6 WAN workers, so a per-binding GET would be 6× rtnl). The resolver thread holds a persistent netlink socket and, off the hot path:
+
+1. **rate-limits per `(ifindex, hop)`** (1 s) so a SYN storm fires at most one GET/probe per key per window — no probe storm;
+2. issues a **single-key `RTM_GETNEIGH`** (`NLM_F_REQUEST` + `NDA_DST`, no dump flags — NOT the RTNL-mutex dump path);
+3. caches the lladdr into `dynamic_neighbors` **only if REACHABLE/PERMANENT** AND the global neighbor epoch has not advanced since enqueue — the **epoch guard** that defeats the out-of-order race where a concurrent monitor FAILED/DELNEIGH removal would be clobbered by a late stale insert (AGY F1);
+4. on **STALE/DELAY/PROBE** (the live wedge signature) does NOT cache the unconfirmed MAC — it probes to force kernel revalidation and lets the confirmed multicast RTM_NEWNEIGH populate the map;
+5. on **FAILED/INCOMPLETE/no-reply** caches nothing and revokes any stale dynamic entry (immediate-revocation firewall posture, AGY F3) plus a probe.
+
+Preserves the #1651 dead-host storm defense (packets still fast-fail; no `pending_neigh` slot consumed) and never forwards to an unconfirmed MAC. The hot path only pays a non-blocking `try_send` on the negative fast-fail (not per-packet).
+
+## Observability
+
+New `xpf_userspace_neighbor_resolver_*` Prometheus series: queue depth (gauge), GET attempts/resolved/failures, probe-on-stale, epoch rejects, enqueue drops, disconnected. Before #1769 the only neighbor metrics were the two `neighbor_warm_*` counters, so the stuck state was invisible.
+
+## Tests
+
+- `classify_nud` / `parse_get_reply` pure decoders.
+- `decide_action` **epoch-guard race**: a confirmed insert racing a newer monitor event is rejected and does not overwrite the newer good entry.
+- `rate_limit_admit` **no probe storm** + per-key independence.
+- **Differential repro**: arm the negative entry, drop the dynamic entry, assert a new flow RESOLVES via the GET path instead of blackholing 3 s.
+- DELAY-state probes-not-caches; enqueue full-queue/disconnect/epoch-snapshot counters.
+- Regenerated `protocol_wire_v1.json` (additive) + extended the metrics descriptor coverage canary.
+
+Full `cargo test --release` green; full Go suite green.
+
+## Deferred (separate follow-up issue, plan §10a)
+
+Full per-key resolver state machine: per-key pending bound, per-key (not global) epoch, backoff coalescing, and a throttled ENOBUFS-triggered family re-dump for the silent netlink desync (D4). This immediate fix closes the live wedge; it does **not** add the ENOBUFS re-dump.
+
+Part of the #1769 neighbor work.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+Closes #1769 (immediate stuck-state fix; the §10a full per-key resolver state-machine redesign is tracked as a separate follow-up issue).
+
+
+---
+
+## PR #1773 — #1772: neighbor/ARP resolution latency metrics (pending-dwell, GETNEIGH RTT) [MERGED] (merged 2026-06-05)
+
+Branch: `engineer/1772-neighbor-latency-metrics`
+
+Closes #1772.
+
+Observability-only (no forwarding-behavior change). #1769 added
+neighbor-resolver COUNT metrics but no TIMING, so the operator's
+intermittent slow-new-connection symptom stayed invisible (warm + cold
+connects measured ~4 ms with resolver counters at 0). This adds cheap,
+fixed-bucket, shared-aggregate LATENCY histograms so the wait can be
+localized.
+
+## Metrics
+- `xpf_userspace_neighbor_pending_dwell_seconds` — how long a buffered
+  packet sat in `pending_neigh` before its neighbor resolved and it was
+  dispatched (`now_ns - pkt.queued_ns` at the `retry_pending_neigh`
+  success path). THE key metric. Reuses the existing monotonic
+  `queued_ns`; `saturating_sub` on CLOCK_MONOTONIC cannot underflow.
+- `xpf_userspace_neighbor_resolver_get_rtt_seconds` — resolver single-key
+  RTM_GETNEIGH round-trip (sent → reply read) on the resolver thread.
+- `xpf_userspace_neighbor_pending_timeout_drops_total` — pending packets
+  dropped after `PENDING_NEIGH_TIMEOUT` without resolving.
+- `xpf_userspace_neighbor_pending_max_depth` — pending-neigh queue-depth
+  high-water (also in `show system buffers`).
+
+Bucket layout: 16-bucket pow2-ns ladder (bucket `i` upper bound
+`2^(16+i)` ns; bucket 15 = `+Inf`). The 3 s blackout class from #1769
+lands in the multi-second `+Inf` tail.
+
+## Design / cost
+Aggregate (one set of atomics across all 6 WAN workers + the single
+resolver thread), monotonic Relaxed counters — same eventually-consistent
+discipline as the #1769 `ResolverCounters`. No seqlock, no TSC infra (the
+heavy per-zone-pair `cold_path_hist` machinery is deliberately NOT reused
+— it is policy-eval-scoped and far too heavy for a rare-event aggregate).
+`record()` is one bucket-index + three `fetch_add(Relaxed)`. **All
+recording fires only on the rare neighbor-miss retry sweep (off the
+per-packet path; early-returns on an empty queue) and the resolver thread
+— the forwarded-packet fast path is untouched.**
+
+Metric 4 (probe → revalidate) is a documented gap: the probe fires on the
+resolver/retry thread but the REACHABLE confirmation arrives async on the
+netlink monitor thread with no per-key request/reply correlation, so it
+is not cleanly measurable in-process without net-new shared
+monitor↔resolver state.
+
+## Plumbing
+Rust (`neighbor_latency.rs` → `NeighborManager` → coordinator status
+accessor → `server/helpers` → `protocol/control`) → Go (`protocol.go` →
+`pkg/api` Prometheus histograms + counters + `show system buffers`),
+mirroring the #1769 `neighbor_resolver_*` path.
+
+## Tests
+
+*(truncated — 65 lines total)*
+
+
+---
+
+## PR #1774 — Refactor: per-key neighbor resolver state machine (#1771 §10a) [CLOSED] (closed 2026-06-05)
+
+Branch: `issue-1771-per-key-neighbor-resolver`
+
+## Summary
+
+Implements the foundation for issue #1771 — the per-key neighbor resolver state machine follow-up to #1769/#1770.
+
+## What is implemented
+
+**Core state machine** (, 560+ lines):
+
+- **Per-key (not global) neighbor epochs** — each `(egress_ifindex, next_hop)` key has independent epoch bumped on RTM_NEWNEIGH/DELNEIGH for that key only. Eliminates false rejects from global generation churn.
+
+- **Single representative packet per key** — at most ONE packet buffered per key under fair global cap (4096). Replaces per-binding admit-everything queue.
+
+- **Backoff coalescing** — all packet pressure collapses into ONE in-flight RTM_GETNEIGH probe per key with exponential backoff (10ms → 60ms → 260ms → 1s → doubling to 5s cap).
+
+- **Negative policy** — "do not buffer duplicate SYNs", NOT "stop resolution". Resolver keeps probing on backoff schedule even in Negative state.
+
+- **Per-key TTL handling** — Resolved entries expire after 5min, Negative after 2s, returning to Idle for fresh attempts.
+
+- **Unit tests passing** — 5 tests covering state transitions, duplicate handling, resolved-wins, negative state, and epoch bumping.
+
+## What remains for production
+
+This is a **foundation PR** — the state machine is implemented and tested, but not yet wired into the packet path. Remaining work:
+
+### Phase 1 — Packet path integration
+- [ ] Replace `pending_neigh: VecDeque` and `neg_neigh_cache` in `BindingWorker` with `neighbor_resolver: NeighborResolver`
+- [ ] Update `poll_descriptor/mod.rs` MissingNeighbor handler to use `resolver.handle_missing_neighbor()`
+- [ ] Update `neighbor_dispatch.rs` retry logic to use resolver's `take_pending()` and `sweep()`
+
+### Phase 2 — Netlink monitor
+- [ ] Add ENOBUFS detection in `neigh_monitor_thread`
+- [ ] Implement throttled family re-dump on ENOBUFS
+- [ ] Add targeted single-key RTM_GETNEIGH for hot keys
+
+### Phase 3 — Observability
+- [ ] Wire `ResolverCounters` to Prometheus via `ProcessStatus`
+- [ ] Add Go protocol structs in `protocol.go`
+- [ ] Export via `/metrics` endpoint
+
+### Phase 4 — Validation
+- [ ] Full test suite: `cargo test` + `make test`
+- [ ] Adversarial review (Codex + AGY + Claude SMR) per issue requirements
+- [ ] Live gate on loss userspace cluster
+- [ ] Property/differential tests
+
+## Testing done
+
+- ✅ Unit tests for state machine (5 tests passing)
+- ✅ Compiles cleanly with `cargo test`
+- ⏳ Integration tests pending Phase 1 completion
+
+*(truncated — 61 lines total)*
+
+
+---
+
+## PR #1775 — Research: #1771 per-key neighbor resolver implementation plan (§10a) [CLOSED] (closed 2026-06-20)
+
+Branch: `research/1771-per-key-resolver`
+
+## Summary
+
+Research and implementation plan for issue #1771 — the full per-key neighbor resolver state machine follow-up to #1769.
+
+This is a **research PR** for adversarial review **before implementation**, per #1771's requirements:
+
+> Needs a fresh adversarial plan-review round (Codex + AGY + Claude SMR) + property/differential tests + a live gate on the loss userspace cluster before implementation.
+
+## Context
+
+#1769 merged the §9 immediate fix — a shared threaded resolver with global epoch guard, per-binding pending queues, and per-sweep probe dedup. It closed the live stuck-state wedge.
+
+#1771 calls for the full §10a redesign building on top of #1769's foundation.
+
+## What this PR contains
+
+**** — detailed implementation plan covering:
+
+### Architecture changes
+1. **Per-key epochs** — replace global  with per-key epoch map to eliminate false rejects under unrelated neighbor churn
+2. **Per-key pending bound** — replace per-binding 4096 VecDeque with per-key map (one representative packet per key)
+3. **Cross-sweep backoff** — extend resolver's rate limiting to track attempt count for exponential backoff across sweeps
+4. **ENOBUFS handling** — detect netlink overflow, throttled re-dump (5s window), targeted single-key GET for hot keys
+5. **Full Prometheus counters** — per-key state gauges, ENOBUFS/redump counters, extended resolver metrics
+
+### Implementation plan
+- **Phase 1:** Per-key epoch infrastructure (, monitor updates, resolver updates)
+- **Phase 2:** Per-key pending bound ( instead of , admission logic, retry logic)
+- **Phase 3:** Cross-sweep backoff (extend existing rate-limit map)
+- **Phase 4:** ENOBUFS handling (detection, throttle, re-dump, targeted GET)
+- **Phase 5:** Prometheus metrics (Rust → Go plumbing)
+- **Phase 6:** Validation (cargo test, make test, loss cluster)
+
+### Risks and mitigations
+- Per-key epoch map contention → same sharding as 
+- Per-key pending growth → same GC as existing rate-limit map
+- ENOBUFS re-dump RTNL contention → 5s throttle
+- Breaking changes → property tests + differential tests + live validation
+
+### Success criteria
+- Per-key epochs eliminate false rejects (test with concurrent churn)
+- Per-key pending limits SYN flood to 1 slot per dead host
+- Backoff coalesces across sweeps
+- ENOBUFS triggers throttled re-dump
+- All counters export correctly
+- Full test suite passes
+- Loss cluster validation passes
+- No perf regression
+
+## What this PR does NOT contain
+
+*(truncated — 63 lines total)*
+
+
+---
+
+## PR #1779 — #1771 Phases 1-2 (Path B): per-key pending_neigh bound + ENOBUFS upsert re-dump [MERGED] (merged 2026-06-06)
+
+Branch: `engineer/1771-phases-1-3`
+
+## Summary
+Implements the two **correctness/behavior** phases of the converged #1771 Path B plan (per-key neighbor resolver, §10a). The plan cleared **3 rounds of 3-way hostile review** (Codex + AGY + Claude SMR) on PR #1775 AND an **independent blind Codex-fresh research pass** that reached the identical architecture — doubly-validated.
+
+- **§2.2 — per-key `pending_neigh` bound.** `BindingWorker.pending_neigh` goes from `VecDeque<PendingNeighPacket>` (a FIFO of every admitted packet, cap 4096) to `FastMap<(egress_ifindex, next_hop), PendingNeighPacket>` — **one representative packet per unresolved next-hop**. Admission keeps the OLDEST packet for a key (drives the probe/dwell clock) and drops+recycles duplicates; the `already_probing` dedup is now a direct `contains_key`; `retry_pending_neigh`'s O(n²) pop_front/push_back rotation becomes a keyed sweep (the per-sweep probe-dedup `BTreeSet` is gone — one entry per hop). **Effect:** a SYN flood to one dead host pins ≤1 UMEM frame for that host instead of up to `MAX_PENDING_NEIGH`. #1772 dwell/depth/timeout accounting preserved verbatim.
+- **§2.5 — ENOBUFS detection + throttled upsert-only re-dump.** The `neigh_monitor` recv loop swallowed `recv()<=0` silently, so an ENOBUFS (kernel dropped neighbor multicast on rcvbuf overflow) left `dynamic_neighbors` permanently desynced. Now ENOBUFS triggers a **throttled (5s), upsert-only** family re-dump (re-learns missing entries, **NO eviction** — the map is also RX-learned + manager-populated, so a kernel dump must not delete non-kernel entries; Codex r2 finding). EAGAIN (SO_RCVTIMEO) and other errnos skip cleanly.
+
+## Out of scope (explicit follow-ups)
+- **§2.6 counters** (resolver_pending_keys / keys_negative / netlink_enobufs/redumps/upserts → Rust→Go→Prometheus) — observability plumbing, separable.
+- **§2.4 negative-keeps-probing invariant test** — needs the threaded-resolver test harness.
+- **§2.1 per-key epoch (Phase 4)** — GATED on the `epoch_rejects` rate per the converged plan; NOT implemented.
+
+## Plan + adversarial review
+Plan doc: `docs/research/1771-per-key-resolver/plan.md` (v3.1, PR #1775). Converged verdicts: Codex PLAN-NEEDS-MINOR→fixed, AGY PLAN-READY, Claude SMR PLAN-READY; + independent Codex-fresh validation (`research/1771-codex-fresh`).
+
+## Test plan
+- [x] `cargo build` + `--tests` clean
+- [x] **Full `cargo test --release`: 1829 pass, 0 fail, 2 ignored**
+- [x] `neighbor_dispatch` 13/13 + `neighbor` 83/83 + `retry_pending` pass
+- [x] Go `go build ./...` clean (no Go touched)
+- [ ] **Loss-cluster smoke** (v4+v6 × push+reverse × CoS off/on) — pending
+- [ ] **`make test-failover`** (touches HA neighbor paths) — pending
+- [ ] 4-way code review (Codex + AGY + Claude SMR + Copilot)
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #1781 — #1780 Path A: stall-harden the Go periodic neighbor-resolution loop [MERGED] (merged 2026-06-08)
+
+Branch: `engineer/1780-path-a`
+
+## Summary
+
+Path A of #1780 (idle/overnight cold-connect hang to `172.16.80.200`). A
+single synchronous phase in the Go periodic neighbor-maintenance loop
+(`runPeriodicNeighborResolution`) could wedge on a stuck netlink/probe
+syscall and freeze the entire for-select loop — observed wedging ~17.5h,
+aging out data-path next-hops and producing the cold-connect-hang-then-recover
+signature. This change makes the loop **structurally unfreezable** and adds an
+observable watchdog. It is root-cause-independent: it does not depend on
+naming *why* a given phase hangs (that resolver/probe fix is deferred and
+capture-gated — see "Out of scope").
+
+This is the **Go daemon-side** fix. No Rust/dataplane changes.
+
+## What changed
+
+**Commit 1 — supervise periodic phases (`649b0bee4`)**
+- Each periodic phase (`resolveNeighbors`, `forceProbeNeighbors`,
+  `cleanFailedNeighbors`) now runs via `runGuardedNeighborPhase`: a guarded
+  goroutine with a per-phase in-flight atomic + last-success timestamp.
+- A hung phase can no longer block the for-select loop — the loop keeps
+  ticking and every *other* phase keeps running.
+- While a pass is in flight the guard **skips** relaunch (a stuck netlink
+  syscall cannot be cancelled, so launching a second goroutine would only leak
+  another socket); it self-heals on the next tick once the prior pass returns.
+- **WHAT** is warmed/cleaned is unchanged — standby-RG skip, the 5s/15s
+  cadences, and the per-phase target sets are all preserved. Only **HOW** the
+  loop is supervised changed.
+
+**Commit 2 — watchdog gauge + guard tests (`803638c91`)**
+- New metric `xpf_daemon_neighbor_periodic_last_success_age_seconds{phase}`
+  (phase ∈ {resolve, force_probe, clean_failed, warm}): seconds since each
+  phase last completed. A stalled phase shows a monotonically climbing age
+  while healthy phases stay flat — the stall is visible *before* it becomes a
+  hang. A never-completed phase reports age-since-start so it still flags.
+- Wired through the existing `xpf_daemon_*` collector pattern
+  (`Config.NeighborPhaseAgeFn` → `Server.neighborPhaseAgeFn` →
+  `collectSystemMetrics`); descriptor declared in `Describe()` and registered
+  in the #1726 whole-collector coverage canary.
+- `neighbor_periodic_guard_test.go` (race-clean) pins: caller never blocks on
+  a hung phase; guard skips overlapping passes and self-heals; gauge advances
+  for a stalled phase vs. ~0 for a healthy one.
+
+## Validation
+- `go build ./...` clean; `go vet` clean on changed files.
+- `go test -race ./pkg/daemon -run guard` — pass.
+- `go test ./pkg/api` descriptor-coverage canaries — pass.
+- The lone daemon-suite failure (`TestWireUserspaceEventStream...`) is the
+  pre-existing `sun_path>108` unix-socket artifact from the long test name —
+  confirmed failing **identically** on the master base `ecdc16f2e`, untouched
+
+*(truncated — 64 lines total)*
+
+
+---
+
+## PR #1783 — #1782 PR-1: cold-start stall capture instrumentation (observability only) [MERGED] (merged 2026-06-09)
+
+Branch: `engineer/1782-pr1-capture-instrumentation`
+
+## Summary
+
+**PR-1 of the #1782 capture-first plan** ([converged PLAN-READY](https://github.com/psaab/xpf/issues/1782), 3-way: Codex + AGY + Claude SMR). **Observability only — no fix, no forwarding behavior change.** It adds the instrumentation an operator overnight capture needs to disambiguate the residual cold-start stall (H2 absence / H3 first-miss dwell / H5 sibling-drop / H1 neg-lockout). The fix (PR-2) is overnight-capture-gated and follows separately.
+
+Plan: `docs/research/1782-cold-start-stall-residual/plan.md` (branch `research/1782-cold-start-stall-residual`).
+
+## What it adds
+
+1. **`xpf_userspace_neg_neigh_fast_fail_total`** (H1 amplifier) — promotes the debug-only `dbg.neg_neigh_fast_fail` to a real per-binding atomic, summed cluster-wide. Increment is a single `Relaxed fetch_add` on the **existing** neg-cache discard path (`poll_descriptor/mod.rs:2054`) — no new hot-path work.
+2. **`xpf_userspace_pending_neigh_duplicate_drops_total`** (H5 sibling drop) — counts the `pending_neigh.contains_key`-duplicate case **specifically** (key already pending → sibling cold SYN dropped), split out from the co-located `MAX_PENDING_NEIGH` capacity case. **Insert behavior is identical** to the prior combined condition: insert iff key absent AND room, else recycle.
+3. **`xpf_userspace_dynamic_neighbor_present{ifindex,ip}`** — a per-key presence gauge dumped from the `dynamic_neighbors` mirror so the harness can confirm the pre-connect t0′ next-hop membership (the H2 absence fingerprint). `dynamic_neighbor_keys()` locks all shards once (like `len()`), **capped at 4096 rows**.
+4. **`test/incus/capture-cold-stall.sh`** — the operator harness (§6): pre-idle timestamped `ip monitor neigh`, pre-connect t0′ sample, cold-connect wall-time, t1 recovery sample, counter deltas (incl. the already-exposed `neighbor_pending_dwell` #1772 — the H3 signal — and the #1780 watchdog gauge as a regression guard), SYN-exchange pcap, retrans-sysctl state.
+
+Plumbing follows the `neighbor_warm_drops` template exactly: per-binding atomic → coordinator sum accessor → `server/helpers.rs` status → Go `ProcessStatus` → `metrics_userspace.go`; descriptors declared + registered in the #1726 descriptor-coverage canary.
+
+## ⚠️ Review points I want the panel to adjudicate
+- **Cardinality of `dynamic_neighbor_present{ifindex,ip}`:** one series per `dynamic_neighbors` key (ip as a label) on the always-on `/metrics`. Bounded to ≤4096; small in practice on the cluster. Is the bounded-debug-surface acceptable, or should it be gated (env/feature) / moved to a one-shot debug query? I lean acceptable-for-capture but want consensus.
+- **`dynamic_neighbor_keys()` holds all shard locks while copying ≤4096 tuples on the 1/s status path.** Microsecond-scale, but confirm it can't contend meaningfully with the per-shard hot path.
+
+## Validation
+- `make build` clean; Rust release builds clean; `go build ./...` clean.
+- `go test ./pkg/api/` green — descriptor-coverage canary passes with the 3 new metrics registered.
+- `cargo test` (userspace-dp): 1752 passed; the only failures (`session::tests::inplace_*`) are **pre-existing** (fail on clean origin/master; session/ untouched; #1626 verdict).
+- `protocol_wire_v1.json` regenerated — drift is exactly the two always-serialized counter keys at 0 (key dump omitted-when-empty).
+- The pre-existing `TestWireUserspaceEventStream...` `sun_path>108` socket artifact is unrelated.
+
+Part of #1782 (does not close it — PR-2 fix follows the capture).
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #1801 — #1800 U2: capture-harness per-node iface, third append-race site, per-tick log demotion [MERGED] (merged 2026-06-09)
+
+Branch: `engineer/1800-u2-smalls`
+
+## Summary
+
+Unit **U2** of the [#1800 sweep-remediation plan](https://github.com/psaab/xpf/issues/1800) (converged PLAN-READY v2.2 `57a5f8989`). Three scoped fixes, one logical commit each:
+
+1. **#1786** — `capture-cold-stall.sh`: the data-path interface default is now derived per-node (`ge-0-0-2` on fw0, `ge-7-0-2` on fw1 — FPC 0 vs 7), and the script **fails fast** if `DP_IFACE` doesn't exist on the target, because every per-interface evidence channel is `|| true`-tolerant and a wrong name would silently hollow out the one-shot #1782 overnight capture.
+2. **#1791** — `daemon_apply.go:795`: the next-table route list is built in a fresh pre-sized slice instead of appending in place onto the shared active-config `StaticRoutes` backing array — the third and last site of the hazard class fixed in #1781 r1 (`fbd159e55`).
+3. **#1795** — `sync_conn.go:455`: the per-1s-sweep-tick `slog.Info` demoted to `Debug` per the CLAUDE.md per-poll-tick rule (~86K journal lines/day on a busy primary). Adjacent overflow/replay transition logs untouched.
+
+Closes #1786. Closes #1791. Closes #1795.
+
+## Validation
+- `go build ./...` clean; `go test ./pkg/daemon/ ./pkg/cluster/` all pass (including the usually-flaky socket-path test this run); `go vet` clean except the two known pre-existing `daemon_flow.go` copylocks.
+- `bash -n` + `shellcheck -S warning` clean on the harness.
+- Pending (gate): loss-cluster smoke + **`make test-failover`** — #1795 touches `pkg/cluster`, and the CLAUDE.md failover rule has no triviality exemption.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #1802 — #1800 U3: bound apply-path exec sites with 15s timeouts, un-swallow errors (#1794) [MERGED] (merged 2026-06-09)
+
+Branch: `engineer/1800-u3-timeouts`
+
+## Summary
+
+Unit **U3** of the [#1800 plan](https://github.com/psaab/xpf/issues/1800). Every external command on the config-apply path (run while `applySem` is held) is now bounded by a 15s `CommandContext` timeout per the established FRR precedent, and previously-discarded errors are logged loudly. **Apply success/failure semantics are unchanged** (that's U6's domain) — failures become visible and bounded, not fatal.
+
+- New `runCommandTimeout`/`runCommandStdinTimeout` helper (`pkg/daemon/exec_timeout.go`).
+- Converted: rsyslog restart (error was discarded AND success was logged unconditionally — now gated), `id` probe, `useradd`, `chown -R` (was discarded), `systemctl reload sshd` (was discarded), `chpasswd -e` (stdin variant), `linksetup.go execCommand` (networkctlReload), plus two audit finds: `daemon_nft.go:23` stale-table cleanup and `daemon_apply.go:570` ethtool rxvlan.
+- Audited the rest of `pkg/daemon`: dns/nft-apply/chrony/scp already had context timeouts; `rss_indirection.go` is a documented executor seam off the apply path — left, with reasons in the commit body.
+
+Closes #1794.
+
+## Validation
+- `go build ./...` clean; `go test ./pkg/daemon/` 0 failures; `go vet` clean except the two known pre-existing `daemon_flow.go` copylocks.
+- Pending (gate): loss-cluster smoke.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #1803 — #1800 U1: fix doc drift — retirement framing, node1 FPC-7 names, smoke target, pre-#1771 comments [MERGED] (merged 2026-06-09)
+
+Branch: `engineer/1800-u1-docs`
+
+## Summary
+
+Unit **U1** (docs/comments only, zero behavior change) of the [#1800 plan](https://github.com/psaab/xpf/issues/1800). Three logical commits:
+
+1. **#1784** — CLAUDE.md: stale "#1373 staged retirement" framing → the completed-retirement reality (hard-rejected at commit + runtime); node1 FPC-7 interface names annotated in the cluster topology block and prose; "640+/20" test count dropped; the deleted `try_fabric_redirect()`/xdp_zone fabric bullet rewritten around the current `resolve_fabric_redirect()` in `forwarding/mod.rs`; per-class port range corrected to 5200-5211 (verified against `cos-iperf-config.set`). Same stale banner fixed in `userspace-dp/README.md`.
+2. **#1785** — `docs/engineering-style.md:99`: throughput-validation row now deploys with `make cluster-deploy` (the 172.16.80.200 / ≥23 Gbit/s endpoint is loss-cluster-only) + re-apply-CoS reminder.
+3. **#1788** — `MAX_PENDING_NEIGH` + `neg_neigh.rs` module docs rewritten to the current #1771 §2.2 one-representative-per-hop semantics (mechanically verified comment-only: the non-comment diff is empty).
+
+Closes #1784. Closes #1785. Closes #1788.
+
+## Validation
+`go build ./...` + `cargo build --release` clean; Rust diff is comment-only by construction. Gate: build-only per plan §3.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #1804 — #1800 U4: count swallowed USERSPACE_SESSIONS publish failures (#1789) [MERGED] (merged 2026-06-09)
+
+Branch: `engineer/1800-u4-counters`
+
+## Summary
+
+Unit **U4** of the [#1800 plan](https://github.com/psaab/xpf/issues/1800). Observability-only, perf-neutral: every `let _ =`-swallowed `USERSPACE_SESSIONS` BPF-map publish failure is now counted and surfaced as **`xpf_userspace_session_publish_errors_total`** — the cause-side signal for rising XDP-shim NO_SESSION degraded-path fallbacks (map at capacity, stale fd after reconcile).
+
+- Per-binding `AtomicU64` for the 3 worker poll sites (fabric-return, forward create, reverse key) — exact `neg_neigh_fast_fail` (#1782) pattern; single `Relaxed fetch_add` on the **error branch only**.
+- One always-on shared static for the no-binding-context sites (HA `upsert_synced_session` fwd+reverse, session-glue publishes, `replay_synced_sessions`, activation/reverse prewarm); `session_publish_errors_total()` sums both.
+- The pre-existing `fwd_publish_errors` prewarm counting is folded in (same failure class, single increment, no double count) and the previously-uncounted reverse-prewarm `let _ =` is now counted too.
+- Plumbed status → `ProcessStatus` → Prometheus; descriptor registered in the #1726 coverage canary; wire fixture regenerated (drift = the one new always-serialized key at 0).
+
+Closes #1789.
+
+## Validation
+- `cargo build --release` clean; `cargo test` 1752 passed (only the two known pre-existing `session::tests::inplace_*` failures; one load-induced timing-test flake passed 5/5 isolated + clean full re-run).
+- `go build ./...` + `go test ./pkg/api/ ./pkg/dataplane/...` green; descriptor-coverage canary passes with the new family.
+- Pending (gate): loss-cluster smoke, perf-neutral check (counters on error branches only).
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #1806 — #1800 U9: recover poisoned worker command mutex in update_ha_state demotion (#1790) [MERGED] (merged 2026-06-10)
+
+Branch: `engineer/1800-u9-poison`
+
+## Summary
+
+Unit **U9** of the [#1800 plan](https://github.com/psaab/xpf/issues/1800) (§5.5). `update_ha_state` publishes the new HA state via `rg_runtime.store` **before** propagating demotion side effects; the demote loop then `?`-returned on a poisoned worker-command mutex, so any retry diffed against the already-stored state (empty `demoted_rgs`) and **permanently skipped** the remaining workers' `DemoteOwnerRGS`/`VacateAllSharedExactSlots`, `demote_shared_owner_rgs`, and the `rg_epochs` bumps — exactly when a demotion is most likely (a worker just panicked).
+
+Fix: replace the `?` with the `poisoned.into_inner()` recovery pattern already used by `handle_activated_rgs` (ha.rs:109-118) and `ShardedNeighborMap::lock_shard` — a `VecDeque<WorkerCommand>` has no panic-corruptible invariant. With inline recovery the same call completes ALL propagation, so the store-before-propagate ordering is now harmless and was not moved (plan §5.5; verified: the removed `?` was the only fallible exit in the entire function — signature kept `Result` for the wide caller surface).
+
+**Regression test** (`update_ha_state_demotion_recovers_from_poisoned_worker_command_mutex`): 3 workers, one mutex deterministically poisoned (panicking thread joined before proceeding); asserts Ok return, all 3 queues received both demote commands (the poisoned one via `into_inner`), the locally-owned shared session flipped to peer-synced (proves `demote_shared_owner_rgs` ran), and `rg_epochs` bumped.
+
+Closes #1790.
+
+## Validation
+- `cargo build --release` clean; `cargo test` 1753 passed (only the two known pre-existing `inplace_*` failures); new test 5×/5 by the author + independently re-run by the reviewer-driver.
+- Pending (gate): `make test-failover` on the branch build (HA code).
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #1811 — #1800 U5a: dual-AST differential regression harness (test-only) [MERGED] (merged 2026-06-10)
+
+Branch: `engineer/1800-u5a-harness`
+
+## Summary
+
+Unit **U5a** of the [#1800 plan](https://github.com/psaab/xpf/issues/1800) (§5.1) — the class-closure instrument for dual-AST compiler gaps. **Test-only**: one new file, zero production changes.
+
+For each of 20 hierarchical fixtures (15+ stanza families): parse → `FormatSet()` → re-parse via `ParseSetCommand`+`SetPath` per line → **sanity gate** (canonical-FormatSet comparison BEFORE compiling, so generator bugs can't masquerade as compiler bugs) → compile both → reflective per-section diff of the typed configs. `expectedFail` markers carry diagnoses; **the suite fails if a marked case unexpectedly passes**, so U5b must flip markers as it fixes.
+
+### Found-broken list (the U5b work order)
+1. **vrrp-group** flat-set dropped — #1796 (known)
+2. **dhcp-relay** flat-set non-functional — #1797 (known)
+3. **NEW:** SNAT pool address-block double-append — https://github.com/psaab/xpf/issues/1808
+4. **NEW:** CoS classifier inline loss-priority leaf dropped hierarchically — https://github.com/psaab/xpf/issues/1809
+5. **NEW:** `system name-server` single-value SetPath replace — https://github.com/psaab/xpf/issues/1810
+
+References #1796 #1797 (closed by U5b, not this PR).
+
+## Validation
+`go test ./pkg/config/ -run DualAST -v` green (15 pass + 5 accounted expectedFail), stable at `-count=5`; full pkg/config suite ok; vet+gofmt clean; meta-contract verified (marking a green case expectedFail fails the suite). Independently re-run by the reviewer-driver.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #1812 — #1800 U10: monotonic HA peer-liveness — clock steps can no longer fence a healthy peer (#1792) [MERGED] (merged 2026-06-10)
+
+Branch: `engineer/1800-u10-liveness`
+
+## Summary
+
+Unit **U10** of the [#1800 plan](https://github.com/psaab/xpf/issues/1800) (§5.6) — the liveness-critical unit. HA peer-loss detection, the sync suppress guard, and GARP dampening did wall-clock arithmetic via `UnixNano`→`time.Unix` round-trips (which strip Go's monotonic reading): a forward NTP step/VM resume >500ms falsely fired `handlePeerTimeout` on **both** nodes (split-brain + disable-rg fencing of a healthy peer); backward steps masked real loss and suppressed failover GARPs.
+
+1. **Core:** `r.lastSeen` now stores `MonotonicNanos()` (CLOCK_MONOTONIC, new sibling of `monotonicSeconds` — seconds granularity unusable against a 500ms window); staleness via the injectable `heartbeatStale()`. All consumers audited (one store, one load). `startedAt` + the failover.go manual-transfer windows are direct `time.Time` (monotonic-retaining) — audited safe and untouched.
+2. **Companions:** `lastPeerRxUnix`→`lastPeerRxMono` (rename makes stale wall-clock stores a compile error) feeding `LastPeerReceiveAge`/`PeerHealthy` with negative-age clamp; `hbSuppressStart` monotonic; VRRP GARP dampening clamps negative elapsed → send-allowed (backward step can no longer blackhole failover GARPs).
+3. **RestartHeartbeat protection** (plan-decided: suppression required, window unchanged): the peer's existing `shouldSuppressPeerHeartbeatTimeout` guard is now actively fed during restarts via `SendLivenessKeepalive()` (existing `syncMsgHeartbeat` wire message — no protocol change) fired before teardown and on each bind retry. **Bonus real fix:** the replacement receiver started with `lastSeen=0`, whose timeout path only calls `handlePeerNeverSeen` (a no-op once the peer was ever seen) — a peer dying during our restart was never detected; the seed now carries over via CAS (valid since the domain is monotonic). **Documented residual:** if sync TCP is also silent >2s during a >500ms restart, the peer still fires — indistinguishable from real death without a wire-protocol change (out of scope per plan).
+4. **Default window unchanged** (5×100ms): `PrivateRGElection` is compiled on by default and suppresses RETH VRRP, so heartbeat detection owns promotion — widening would silently slow failover.
+
+Closes #1792.
+
+## Validation
+- `go build ./...` + `go test ./pkg/cluster/ ./pkg/vrrp/ ./pkg/daemon/` green; 9 new tests (staleness boundaries, step semantics, clamps, restart seed/notify/grace, GARP table) stable at `-count=5` + independently re-run.
+- Pending (gates): live clock-step repro (`date -s ±5sec` under heartbeat monitoring), heartbeat-restart repro, **`make test-failover`**.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #1813 — #1800 U5b: fix the five dual-AST gaps the differential harness pinned [MERGED] (merged 2026-06-10)
+
+Branch: `engineer/1800-u5b-fixes`
+
+## Summary
+
+Unit **U5b** of the [#1800 plan](https://github.com/psaab/xpf/issues/1800) (§5.1) — one logical commit per harness-pinned gap, each flipping its `expectedFail` marker (the U5a harness fails on an unflipped marker, so the suite enforces the contract):
+
+1. **vrrp-group flat-set silently dropped** — setSchema subtree added (9 property leaves, `virtual-address` multi) + `compileVRRPGroup` reads Keys-packed properties and merges repeated group instances.
+2. **dhcp-relay flat-set non-functional** — setSchema `forwarding-options dhcp-relay` subtree + `compileDHCPRelay` dual-shape with named-instance merging.
+3. **SNAT pool address-block double-append** — the inline branch now reads `prop.Keys[1]` directly instead of `nodeVal` (whose `Children[0]` fallback fired for the block form that the children walk also appends). `nodeVal` itself untouched — its contract for all other callers verified and preserved.
+4. **CoS classifier inline loss-priority leaf dropped** — both code-points collectors also accept the Keys-packed inline spelling through the shared dedup/expand path.
+5. **system name-server second-set replace** — `multi: true` (same modeling as other repeatable leaves); SetPath now appends.
+
+Closes #1796. Closes #1797. Closes #1808. Closes #1809. Closes #1810.
+
+## Validation
+- DualAST harness: all 20 cases PASS, zero `expectedFail` markers remain.
+- Full `go test ./pkg/config/ ./pkg/grpcapi/ ./pkg/cli/` ok (independently re-run); vet/gofmt clean on touched files (the `pkg/cli` vet nit + 2 gofmt files are pre-existing on master with zero diff here).
+- Pending (gates): **`make test-failover`** (vrrp-group is HA-adjacent) + cluster smoke.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #1815 — #1800 U8: DHCP client lifecycle reconcile-on-apply (#1793) [MERGED] (merged 2026-06-10)
+
+Branch: `engineer/1800-u8-dhcp`
+
+## Summary
+
+Unit **U8** of the [#1800 plan](https://github.com/psaab/xpf/issues/1800) (§5.4). DHCP/DHCPv6 client state was startup-only: enabling via commit did nothing (manager never created without startup DHCP), deleting left the client renewing forever, and terminal exits left stale registry entries blocking restart.
+
+- **Reconcile-on-apply**: `applyConfigLocked` step 7b diffs desired-vs-running clients on **config identity** — `(iface, family)` + an options fingerprint (v4 lease-time/retrans/force-discover; v6 duid/stateless/IA-types/PD/req-options) captured at start. **Lease/address state structurally excluded** — the AGY-mandated `TestReconcileLeaseChangeDoesNotRestart` (pkg/dhcp + daemon twin) proves the lease callback's re-entry into applyConfig cannot restart-loop.
+- Start = lazy manager creation (the `needsDHCP` startup-only gate is gone); stop = the existing per-client cancel (registry retains it) + wait; option/DUID change = stop+start.
+- **`finishClient` defer** deregisters on ALL terminal run-goroutine exits (pointer-guarded), cleans lease records + delegated PDs, and removes the leased address — covering cancellation interleavings and natural terminal exits; `StopAll` clears the registry.
+- **Background root preserved** (`pkg/dhcp/README.md:31` lease-survival invariant — graceful daemon restart leaves leases; only explicit reconcile-stop cancels). No protocol RELEASE (plan-decided). README updated with the lifecycle contract.
+
+Closes #1793.
+
+## Reviewer notes (author-flagged behavior deltas)
+- First DISCOVER now fires during the initial applyConfig (step 7b) instead of the later daemon_run call site (kept as a redundant no-op safety net) — still after dataplane start; #1715 DNS repair-only semantics hold.
+- A terminal natural exit (v4 max-retransmissions with a previously applied lease) now removes the leftover address — previously it lingered unmanaged.
+
+## Validation
+`go build ./...` clean; `go test -count=1 -race ./pkg/dhcp/ ./pkg/daemon/` ok; new tests cover add/remove/option-change/DUID-change/lease-no-restart/terminal-exit-restartable/StopAll; independently re-run. Gate: batch smoke post-merge.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #1816 — #1800 U7: reject/sanitize control characters in config free-text — fixes networkd directive injection (#1798) [MERGED] (merged 2026-06-10)
+
+Branch: `engineer/1800-u7-injection`
+
+## Summary
+
+Unit **U7** of the [#1800 plan](https://github.com/psaab/xpf/issues/1800) (§5.3). A newline in a quoted config string (e.g. interface description `"lan\nDHCP=ipv4"`) rendered verbatim into generated systemd-networkd units, injecting arbitrary directives. Three layers + migration, exactly per the converged plan:
+
+1. **Strict-path-only commit rejection:** `compileExpanded` hard-rejects the full C0 set + DEL in all tree values/annotations, gated by a `compileOpts` flag set **only** in the lenient constructors' absence — verified configstore is the sole strict-`CompileConfig*` caller (Commit/CommitCheck paths). **`SchemaValidate` untouched** — the lenient path `Load()` runs it too, and rejecting there would brick boot (the AGY plan constraint).
+2. **Sanitize-with-warning on Load/SyncApply:** the lenient compile scrubs the clone + warns, and the *stored tree* is scrubbed via `config.SanitizeTreeControlChars` so the next unrelated commit can't mysteriously fail (the Codex migration requirement — proven by test).
+3. **Render-side belt:** sanitizers at networkd Description= writers (.netdev/.link), 11 FRR free-text sites (BGP/OSPF/RIP/IS-IS descriptions+passwords), and swanctl section-names/ids/PSKs. Kea (JSON-escaped) and linksetup (kernel-validated ifnames) audited and left with reasons.
+4. **Regression gates:** persisted-newline config Loads+boots+warns; strict commit rejects (flat, hierarchical, annotation); belt tests prove no injected directive even with validation bypassed.
+
+Closes #1798.
+
+**Release note:** commit now rejects control characters (C0+DEL, incl. tab) in any config value; pre-existing persisted values are sanitized with a warning at load.
+
+## Validation
+`go build ./...` clean; config/configstore/networkd/frr/ipsec/daemon tests ok; DualAST harness green; independently re-run. Gate: batch smoke post-merge.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #1817 — #1799: split persist-failure semantics for active-config writes (U6) [MERGED] (merged 2026-06-10)
+
+Branch: `engineer/1800-u6-persistence`
+
+Closes #1799. Final code unit (U6) of the #1800 sweep-remediation campaign, implementing plan §5.2 (docs/research/1800-sweep-triage/plan.md, branch research/1800-sweep-triage).
+
+## Problem
+
+Every active-config persist path treated `WriteActive` failure as a non-fatal warning. An operator commit could report success, leave the OLD config on disk, and a daemon restart silently reverted the running config. CommitConfirmed additionally cancelled the pending confirm timer and overwrote the rollback target BEFORE the persist, and a nested CommitConfirmed clobbered `confirmPrevTree` with the unconfirmed prior tree; a failed auto-rollback persist left the unconfirmed candidate on disk.
+
+## Semantics (two distinct, per plan)
+
+**Option A — persist-before-promote (operator paths):** `Commit` / `CommitWithDescription` / `CommitConfirmed` write the candidate to disk FIRST (`WriteActive` is temp-file+rename atomic). On failure: error returned, candidate intact, nothing promoted, no history/journal/rollback-file/archive side effects, and for CommitConfirmed no timer armed and any EXISTING pending confirm state left fully intact. Nested CommitConfirmed now PRESERVES `confirmPrevTree`/`confirmPrevCfg` — the rollback target stays the last truly confirmed config.
+
+**Option B — degrade-not-fail (autonomous paths):** `SyncApply` (HA config sync) and `performAutoRollback` proceed in memory regardless (cluster convergence / safety revert win), and a persist failure becomes visible + self-healing: `persistDegraded` flag → `/health` 503 (mirrors the #758 CompileHealthFn pattern) + new gauge `xpf_daemon_config_persist_degraded` (emitted before the dp-loaded gate so it's visible with the dataplane unloaded) + journal `persist_error` entry + a SINGLETON retry goroutine (1s→60s doubling backoff, test-injectable) that re-reads the CURRENT `s.active` under `s.mu` per attempt and clears the flag on success. Any successful write on a commit/sync path also clears the flag (the disk then holds the current config).
+
+`Commit()` now delegates to `CommitWithDescription("")` — they were verbatim duplicates; the persist contract lives in one place.
+
+## Caller audit
+
+All Commit/CommitWithDescription/CommitConfirmed callers verified to propagate errors (none treats commit failure as success): daemon bootstrap (daemon_apply.go:47) fails startup loud; commitAndApply (:96,:98) and commitConfirmedAndApply (:143) return the error; HTTP handlers (pkg/api/config.go:78,:246) surface 400/503; gRPC (server_config.go:144,:181) maps to status codes; CLI (cli_config.go:289,:307) prints `commit failed: …`; eventengine (engine.go:297,:303) logs and aborts.
+
+## Tests
+
+11 new tests in pkg/configstore/persist_failure_test.go + 3 in pkg/api, including: persist-failure-fails-commit-cleanly, restart-after-failed-operator-persist-loads-PREVIOUS-config (real `Load()` from the on-disk DB), confirmed-not-armed-on-failure, persist-failure-preserves-existing-confirm-state, nested-confirm-preserves-last-confirmed-tree (drives the real timer expiry), syncApply-degrades-not-fails + retry-heals-disk + singleton guard, autoRollback-proceeds-and-flags + disk-ends-identical-to-rolled-back-config, /health 503 + gauge both states. Injection via new `SetWriteActiveForTesting` seam (pkg/dhcp/test_seams.go convention).
+
+## Validation
+
+`go build ./...` clean; pkg/configstore (+`-race`), pkg/daemon, pkg/api, pkg/grpcapi, pkg/cluster all pass; gofmt clean on touched files (pkg/api/metrics.go + server.go flagged by `gofmt -l` are pre-existing-dirty on master — verified by checking the master blobs — and my hunks are format-stable); go vet clean except the known pre-existing daemon_flow.go copylocks warning (file untouched). Docs updated: pkg/configstore/README.md (new persist-failure-semantics section) + pkg/api/README.md.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #1818 — #1805: bound gRPC/HTTP request-path exec sites [MERGED] (merged 2026-06-10)
+
+Branch: `engineer/1805-request-execs`
+
+Closes #1805. Follow-up to PR #1802 (U3/#1794): the apply-path exec sites are bounded; this bounds the request-reachable ones. Converged plan (3-way: Codex r2 PLAN-READY, AGY r1, Claude SMR) at docs/research/1805-request-execs/plan.md on branch research/1805-request-execs.
+
+## What
+
+A wedged external binary (journalctl on a broken journal, chronyc with a dead chronyd, ss on a stuck kernel) could pin gRPC/HTTP handler goroutines forever. All 17 raw `exec.Command` sites in pkg/grpcapi + pkg/api are now bounded with 15s CommandContext + WaitDelay=5s via per-package helpers (import cycle forbids reusing pkg/daemon's): `outputTimeout` (stdout-only — the 4 status sites feed stdout straight into responses; a CombinedOutput mirror would leak stderr), `combinedOutputTimeout`, and `runTimeout` (deferred power actions on context.Background — client disconnect must not cancel a confirmed reboot; errors stay ignored exactly as today). The three already-CommandContext sites (streamDiagCmd, ping, traceroute) gain WaitDelay for full parity. Request ctx is derived where in scope: showNTP gets a ctx parameter, GetSystemInfo stops discarding its ctx. The request-controlled `tail -n N` is clamped to [1,10000] — a time bound alone doesn't bound a huge fast read.
+
+Every site keeps its exact current error disposition (gRPC-error returns, fallback-chain skips, ignored power errors) — only the unbounded wait changes.
+
+## Tests
+
+Helper tests in both packages drive the kill path via a short parent deadline (the daemon helper ships without tests, so this sets the shape): stdout-only no-stderr-leak, stderr-merge, hung-command kill ×3 variants, and a 7-case tail-clamp table. `go build ./...`, pkg/grpcapi + pkg/api + pkg/daemon suites, and go vet all clean.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #1820 — #1787: cheap-first pre-check in learn_dynamic_neighbor [MERGED] (merged 2026-06-10)
+
+Branch: `engineer/1787-neighbor-learn`
+
+Closes #1787. Converged plan (3 hostile rounds: Codex ×3, AGY consumer audit, Claude SMR) at docs/research/1787-neighbor-learn/plan.md on branch research/1787-neighbor-learn.
+
+## What
+
+`learn_dynamic_neighbor` ran per validated RX packet and, whenever ≥2 source keys interleaved on a binding (ordinary multi-host traffic — the 1-entry per-binding dedup only absorbs a single key), performed two heap allocations and locked all 64 shards of the neighbor map per packet for a write that almost never changed anything, serializing every other worker's neighbor lookups.
+
+Stage 1 of the plan: a stack key array (`[(i32, IpAddr); 2]` + length) replaces `vec![...]`, and a cheap-first pre-check (1–2 single-shard `get()` reads through the pure, unit-tested `pair_write_needed` helper) elides the write entirely in the steady state. Genuine changes — first sighting, MAC flip, removed key — keep the exact `with_all_shards` bulk pair write, preserving the #949 atomic-pair contract (correctly scoped to this function's writes).
+
+Linearization semantics are documented at the call site: a no-op learn linearizes at the pre-check read, a later-landing remove wins, and the next packet reaching the function re-learns via the miss path. The per-binding dedup-delayed re-learn window is pre-existing (a write also set the dedup) — verified against master and documented, with the recovery paths enumerated.
+
+## Tests
+
+5 unit tests for the decision helper (full {current, stale, miss}² matrix) + 5 integration tests asserting end-state map contents (single-key first-learn with placeholder-leak check, VLAN pair learn, same-MAC no-op, MAC flip updates both keys, removed-key re-learn). Full `cargo test --release`: 1766 passed / 0 failed; 5× flake loop on the learn filter green. The one flake encountered (`wg::engine` snapshot test) was proven pre-existing: 5/20 failures at base `f96290a98` in an untouched module.
+
+Expected perf note: invisible in single-source smoke by design; the win is removing per-packet allocs + the 64-shard serialization point under multi-host traffic.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #1821 — #1814: VRRP track-interface — nested priority-cost parse + working single-track runtime [MERGED] (merged 2026-06-10)
+
+Branch: `engineer/1814-track-interface`
+
+Closes #1814. Converged plan v4 (Codex killed the parse-only v1 — tracking was a runtime no-op end-to-end; AGY runtime-soundness conditions folded) at docs/research/1814-track-interface/plan.md on branch research/1814-track-interface.
+
+## What
+
+Two defects closed with one surface:
+
+**Runtime (was a complete no-op):** `TrackInterface`/`TrackPriorityCost` were parsed and plumbed to pkg/vrrp but never used — advertised priority was always static. Now: `getPriority()` returns the effective priority (priority − cost while the tracked link is down), clamped to [1,254], with priority 0 passing through unchanged (resignation sentinel) and priority 255 exempt (address owner stepping down invites duplicate-IP). A singleton Manager link watcher (`netlink.LinkSubscribe`, done-channel cancellation closed from `Manager.Stop`, 1s poll fallback on subscribe failure, re-reads the tracked map under lock per event) drives `setTrackDown`; transition-only logging. `UpdateInstances` now compares track fields and track-only changes ride the in-place `updateConfig` path. Junos names are normalized via `config.LinuxIfName` before netlink (the RETH precedent). Takeover after demotion lands at masterDown expiry per RFC 5798 (preempt backups ignore lower adverts) — documented.
+
+**Parse (silently lost):** the standard Junos nested form `track-interface ge-0/0/1 { priority-cost 20; }` dropped the cost in both AST shapes. schema.go gives `track-interface` a `priority-cost` child; the compiler reads the nested child with order-independent nested-wins over the legacy flat sibling (computed separately, nested applied last). Duplicate `track-interface` in a group: strict commit rejects; lenient load/sync prunes-to-first + warning, via a new `compileOpts.lenientVRRPTrackDuplicates` set only in the Lenient constructors (the #1798 pattern — SchemaValidate untouched, boot-safe). Shape warnings cover missing-cost, orphan cost, nested+sibling both, and owner-255-with-tracking.
+
+## Tests
+
+12 config subtests (both AST shapes via ParseSetCommand+SetPath, nested-wins both orders, strict/lenient duplicate handling, warnings, FormatSet round-trip) + a differential-harness fixture; 8 vrrp tests (getPriority 8-case matrix, transitions, normalization, in-place update, watcher singleton across UpdateInstances churn, NEWLINK/DELLINK event flow, poll fallback) via injected link-state seams. `go build ./...`, config/vrrp/cli/daemon/configstore suites + vrrp -race all green.
+
+Live gate (track-interface commit + link flap on the cluster) and `make test-failover` run at the post-merge smoke stage per plan.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #1822 — #1807: recover poisoned worker command queues at every access site [MERGED] (merged 2026-06-10)
+
+Branch: `engineer/1807-worker-poison`
+
+Closes #1807. Converged plan (3 rounds: Codex prescribed the full site inventory + wire-test surface; AGY r2 PLAN-READY with an independent exhaustive re-grep; Claude SMR) at docs/research/1807-worker-poison/plan.md on branch research/1807-worker-poison.
+
+## What
+
+After U9/#1790 fixed the coordinator side, a poisoned worker-command mutex still made the WORKER permanently deaf (`try_lock().map(...).unwrap_or(false)` reads poison as empty-forever) and silently dropped producer pushes at six more site groups (session replication, activation prewarm, tunnel installs, cross-binding CoS, TX-drain) — lost HA semantics plus unbounded queue growth on the dead ear.
+
+One shared helper pair in the new `worker_queue.rs` now carries a single policy: `lock_recover` / `try_lock_recover` recover via `into_inner`, **clear the poison** (the Poisoned arm stays cold after first recovery — without clear_poison the hot-loop fast-path claim would be false forever), bump a counter, and preserve each site's exact WouldBlock disposition. The recovered deque holds the committed prefix of any multi-push section, documented at the helper. All 14 production sites are converted, including a retrofit of the five #1790 ha.rs sites to the same policy, and the contradictory "unrecoverable" comment in tx/drain is rewritten. An audit grep confirms zero direct locks remain on these queues outside tests.
+
+The recovery counter is wire-exposed end to end per the U4 pattern: `xpf_userspace_worker_command_queue_poison_recoveries_total` (worker_queue.rs static → coordinator/status.rs → server/helpers.rs → ProcessStatus → protocol.go → pkg/api), with the protocol wire fixture regenerated and key-absent backward-compat pinned on both sides.
+
+## Tests
+
+8 new Rust tests (committed-queue recovery + counter + clear_poison verified by a subsequent plain `lock()` Ok; WouldBlock preservation; a 1000-command two-thread concurrent-recovery race asserting exactly-once; poisoned-queue apply/replicate delivery) + wire round-trip both sides + pkg/api emit/descriptor coverage. Full `cargo test --release`: 1764/0 vs a clean master baseline of 1756/0 — delta is exactly the 8 new tests, and the spec's "known inplace_* failures" were proven NOT to reproduce on either tree. 5× flake green on all new groups.
+
+`make test-failover` runs at the post-merge smoke stage (HA-adjacent hot-loop change, per plan).
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #1823 — #1819: size diag-stream exec budgets from the request; kill child on stream failure [MERGED] (merged 2026-06-10)
+
+Branch: `engineer/1819-diag-bounds`
+
+Closes #1819. Part of the #1794/#1805 exec-bounding family (filed from AGY findings on PR #1818 — all pre-existing behavior, now fixed).
+
+## What
+
+**Request-sized budgets.** `streamDiagCmd` hardcoded 30s, so a gRPC ping with count > ~30 (1s/packet, iputils default) was killed mid-run despite the count clamp allowing 100. Ping (gRPC + HTTP, mirrored formula per the import-cycle convention) now gets `count × 1s + 15s` slack, floored at the old 30s so nothing tightens, capped by a 150s ceiling that `streamDiagCmd` also enforces as defense-in-depth. Traceroute aligns both paths at the HTTP side's 60s (neither request carries max_ttl — documented as a constant, parameterize if the proto grows one).
+
+**Prompt child kill.** A sendFn (stream-write) failure used to stop the pipe reader and leave the child blocked on writes for the rest of the budget. The scanner goroutine now cancels a `WithCancel` layered inside the timeout before reporting, so the child dies immediately. #1805's WaitDelay is untouched.
+
+Count clamps and every error disposition unchanged.
+
+## Tests
+
+Mirrored 9-row sizing tables in both packages (floor, the count=60 case the bug killed, clamp max → 115s, ceiling extremes); not-tighter-than-before/HTTP invariants; a streaming-contract test (line order + exit-error-as-final-line); and a prompt-kill test (chatty child + failing sendFn returns in ~0.1s vs the 30s budget). Both suites + vet + build clean.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #1832 — #1777: commit successful DHCP T1/T2 renewals instead of re-acquiring [MERGED] (merged 2026-06-10)
+
+Branch: `engineer/1777-dhcp-renew`
+
+Closes #1777.
+
+## What
+
+All four renewal paths (v4 T1 renew, v4 T2 rebind, v6 T1, v6 T2) dead-assigned a successful renewal result and `continue`d into a full re-acquisition (DORA / Solicit), discarding the renewed lease — the run-loop header even documented "always performs a full DORA on every cycle".
+
+Both run loops now commit every successful exchange through a shared `commitLease` path (the same apply/store/notify the initial acquisition uses, extracted to `pkg/dhcp/commit.go`) and return to the T1 wait with timers recomputed from the renewed lease. Only renewal failure at both T1 and T2 (NAK/timeout, per RFC 2131 §4.4.5 / RFC 8415 §18.2.4-5) falls back to re-acquisition. v6 carries its delegated-prefix handling through the same path (empty IA_PD reply retains stored prefixes, as before).
+
+**Callback contract preserved:** `onAddressChange` re-enters the daemon's full applyConfig, so `commitLease` fires it only when lease *content* changes (address/gateway/DNS, or PD prefixes/lifetimes — lifetimes included so decaying-lifetime servers still propagate to RA). `Obtained`/`LeaseTime` refresh every renewal and feed only the loop's own timers — an unchanged-content renewal is now recompile-free. The #1793 lifecycle (finishClient ownership, registry, Start's membership gate) is untouched. An address change inside a renewal is handled as re-acquisition-equivalent (old address removed before the new one is applied — which also fixes a pre-existing stale-address leak on re-acquisition after rebind failure).
+
+## Tests
+
+9 new tests in `commit_test.go` covering the timer clamps, content/PD change detection, initial acquisition, unchanged-renewal-no-callback, changed-content-fires (address/DNS/gateway), PD store/retain/changed, and stateless mode — with callback fire/no-fire observed via the synchronously-armed recompile timer. The run loops themselves open real sockets and are untestable; decision logic is concentrated in the pure helpers (seam choice documented in commit.go). `go test ./pkg/dhcp/ ./pkg/daemon/ -race` green.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #1833 — #1771 Phase 3: resolver/netlink observability + invariant N1 pinned; Phase-4 epoch declined on measurement [MERGED] (merged 2026-06-10)
+
+Branch: `engineer/1771-phase3`
+
+Closes #1771. Final phase of the per-key neighbor resolver plan (docs/research/1771-per-key-resolver/plan.md on research/1771-per-key-resolver; Phases 1–2 shipped in PR #1779).
+
+## §2.6 — the six missing metrics
+
+Reconciled against master first (the #1772 baseline and #1779's mechanism-without-telemetry): added `xpf_userspace_neighbor_pending_keys` and `xpf_userspace_neg_neigh_keys` gauges (per-binding live-state published at the existing ~65ms tick, summed at status — the active_flow_count precedent; the neg gauge's lazy-TTL upper-bound caveat is documented in the help text), `resolver_get_backoff_attempts` (counter; `rate_limit_admit` became a three-way `rate_limit_decide` so retries are distinguishable), and the three §2.5 instrumentation counters `netlink_{enobufs,redumps,redump_upserts}_total` — with re-dump upserts attributed precisely by nlmsg_seq match and `parse_neighbor_msg` returning an effect enum so FAILED/INCOMPLETE removals can't masquerade as upserts. Wire path per the established pattern with fixture regen and key-absent decode pins on both sides.
+
+## §2.4 — invariant N1
+
+**N1 holds on master unchanged** (the fast-fail path enqueues to the resolver and the 1s per-key window < 3s negative TTL), so this ships as a test + docs, no runtime change: `invariant_n1_negative_cache_does_not_stop_resolution` drives the real resolver thread on a live netlink socket and pins `get_attempts` incrementing across the backoff window while the negative gate keeps fast-failing; the buffering half pins ≤1 pending packet per key via `pending_neigh_admission` — a pure decision helper extracted behavior-identically from the poll-descriptor branch (the one structural touch, without which that half is untestable). Window<TTL is also a compile-time assert. Architecture doc gained the invariant subsection.
+
+## §2.1 Phase-4 epoch — DECLINED per the plan's gate
+
+The plan gated the per-key co-located epoch on a materially nonzero `epoch_rejects` rate. Measured on the live cluster: `epoch_rejects` = 0 on both nodes — and `get_attempts` = 0 even across a cold xpfd restart + immediate v4/v6 connects, line-rate P12 history, and failover cycles (resolution happens via RX learning under every lab load shape). The gate is unmet; the plan explicitly allows this outcome.
+
+## Validation
+
+Full `cargo test --release` green (1779 in main bin); new tests 5× no-flake; Go suites + descriptor-coverage canary + emit-type pins green; zero new compiler warnings.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #1834 — #1776: decompose worker_loop — extract setup and debug-report modules [MERGED] (merged 2026-06-10)
+
+Branch: `engineer/1776-loop-decomp`
+
+Closes #1776. Converged PLAN-READY plan (3-way, narrowed v3.1) at docs/research/1776-loop-body-decomp/plan.md on research/1776-loop-body-decomp.
+
+## What
+
+Pure code motion, exactly the narrowed scope: the one-shot setup phase (thread pin, TSC calibration, ArcSwap loads, binding construction, CoS wiring, pollfds, FD cache — 235 LOC) moves to `loop_body/setup.rs` behind a cold `#[inline(never)]` returning a struct destructured into same-named locals, and the cfg(debug-log) periodic report + stall dump (365 LOC, 44-field `DbgCounters`) moves to `loop_body/debug_report.rs` with the module cfg-gated at declaration so release builds compile none of it. All per-tick logic, the always-on binding diagnostics, and the per-second live-state publish stay inline per the plan's partition.
+
+`loop_body/mod.rs`: 1462 → 1023 LOC; `worker_loop` ~1448 → 998.
+
+## Neutrality evidence
+
+Moved-region diffs are empty modulo 11 `let mut`→`let` (mut moved to the destructure) and the mechanical `dbg_X`→`dbg.X` renames; the release-view (cfg-stripped) loop-body diff is identical except 5 dead debug-only statements rustc already flagged; codegen: `worker_loop` 32,694→26,173 B with the setup split into a separate 7,125 B cold symbol and zero debug_report symbols in release; warning count exactly at the 139 baseline in both feature configs. Both plan guards verified: the DbgCounters reset cannot wipe `dbg_last_report_ns`/stall baselines (plain persistent locals; pre-reset snapshots), and the cfg line-partition is proven by the release-view diff.
+
+## Tests
+
+Full `cargo test --release` 1845/0; 5× flake loops on the worker and degraded-path filters green; Go suite 34 packages ok. Under debug-log, one unrelated flake (`worker_queue::concurrent_recovery…`, #1807's race test) reproduced 1/10 at base `a05a73694` — pre-existing, file untouched.
+
+Post-merge: this rides the wave-end smoke (failover + Pass A line rate) before the campaign closes — worker-loop motion is gated on that run.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #1835 — #1778: make the Kea dhcpserver manager authoritative; fail-closed Apply [MERGED] (merged 2026-06-10)
+
+Branch: `engineer/1778-kea-auth`
+
+Closes #1778.
+
+## What
+
+The manager trusted process-local `running4`/`running6` booleans, so a stale Kea from a previous daemon survived an xpfd restart whenever the new config had no dhcp-server stanza — and a worse latent gap: the daemon only called `Apply` when the stanza was present, so stanza *removal* never reached the manager at all. Restart failures were also fail-open (Warn + return nil): commits reported success with no DHCP service running.
+
+Now: `Apply`/`Clear`/`IsRunning` reconcile each family against actual systemd state (`systemctl is-active` via the bounded #1794 helper; non-zero exit and unrunnable systemctl both read as inactive) — an unconfigured family stops the unit if it's active/activating/reloading regardless of who started it; the daemon calls `Apply` unconditionally on every apply; and restart/stop failures surface through the commit via the existing tail-error pattern in `applyConfigLocked` (recorded into `dhcpServerErr` after all remaining reconcile steps run — no mid-pipeline abort). Boot stays lenient structurally (the `Run()`-path `applyConfig` wrapper warns and continues — an unavailable Kea binary cannot brick boot), and the VRRP MASTER/BACKUP transition paths stay warn-and-continue so a Kea cleanup failure can never skip HA config-sync. A mutex now serializes the commit path against those VRRP callbacks.
+
+Secondaries fixed: multi-interface groups no longer silently bind only the first interface (single-interface groups bind explicitly; multi-interface groups omit the per-subnet binding so Kea selects by address, with all interfaces in `interfaces-config`); lease CSV parsing uses `encoding/csv` so quoted hostnames with commas don't shift columns.
+
+## Tests
+
+10 new tests via a `NewManagerForTesting` seam (the pkg/dhcp convention): stale-active-unit stopped on nil/removed config, restart/stop/generate failures fail Apply, Clear stops stale units, IsRunning queries systemd, multi-interface binding shape, quoted-hostname CSV. `go build ./...` clean; pkg/dhcpserver + pkg/daemon green; vet clean apart from the two pre-existing daemon_flow.go findings (verified on pristine master).
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #1836 — #1831: export V_min throttle counters; equal-flow smoke injector [MERGED] (merged 2026-06-10)
+
+Branch: `engineer/1831-fairmetrics`
+
+Closes #1831 (the two optional follow-ups recorded at #1766's close-out).
+
+**Metrics:** `v_min_throttles` and `hard_cap_overrides` were already on the wire (both BindingStatus views, with round-trip + key-absent pins) but never exported. Added `xpf_userspace_binding_v_min_throttles_total` and `xpf_userspace_binding_v_min_throttle_hard_cap_overrides_total` (per-binding counters, established label set, emitted unconditionally so 0 means the brake never fired) on the #1771/#1807 pattern with descriptor-coverage + emit-level label/value/dto-type tests. Help text corrected against the code: the two counters are disjoint (`v_min.rs:213-229`), not subset-related. Catalog entries added to docs/fairness-regimes.md.
+
+**Injector:** `COS_EQUAL_FLOW=1 ./test/incus/apply-cos-config.sh …` appends `equal-flow-enforcement` (schema.go:880 spelling) to every transmit-rate-exact scheduler in the selected fixture, mirroring the `--surplus-sharing` awk shape, with an exit-2 guard for the mutually-exclusive pair (compiler.go:573) verified live. Defaults unchanged.
+
+go build/tests/gofmt/bash -n all clean.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #1837 — #1826: cleanup batch — proto consts, SOL_XDP, SAFETY comments, debug_assert counters, dead code [MERGED] (merged 2026-06-10)
+
+Branch: `engineer/1826-cleanup`
+
+Closes #1826 (the cleanup-tier residue split from #1663 at its close-out).
+
+- **PROTO_* consolidation**: new `ip_proto.rs` (8 IANA consts, pub(crate)); all 8 duplicate sites became imports, with `pub(super) use` re-exports where siblings referenced them. No value changes.
+- **SOL_XDP dedupe**: bpf_map's local const removed; resolves to the canonical afxdp/mod.rs one via the existing glob import.
+- **SAFETY comments**: every #1663-cited unsafe site covered, with the canonical `area` raw-pointer contract written once (pointee is the binding's Rc'd UMEM allocation, never dropped/replaced on the poll path; the only &mut path runs at bind time) and per-site references; none required an unjustifiable invention.
+- **debug_assert counters**: the two release-invisible sites (producer decrement underflow; shared_cos_lease grant overflow) get static AtomicU64s + first-hit eprintln — deliberately local-only, not wire-plumbed, per the issue's disposition and the control-socket contention rules.
+- **Dead code**: the event_stream codec DataplaneEventKind allows verified stale (0 new warnings on removal) and removed; the wg/mod.rs module allow verified still load-bearing (+16 warnings without it) and kept with a re-verification note.
+
+Warnings exactly at the 139 baseline before and after. Full `cargo test --release` clean at head (twice); 5× flake loops over all touched-module filters 847×5/0. The one base-side flake encountered (`tx_latency_hist…` skew bound) passes 5/5 isolated and is full-suite-parallelism noise, pre-existing.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #1841 — #1830: remove the 32-worker CoS rotation scratch cap; bucket-vs-flow occupancy telemetry [MERGED] (merged 2026-06-10)
+
+Branch: `engineer/1830-cosscale`
+
+Closes #1830 (items (e)+(g) deferred from #1731's close-out).
+
+**(e) Cap removal.** `MAX_WORKERS_SCRATCH = 32` sized five fixed stack arrays in the v8 epoch rotation; any active worker with id ≥ 32 forced an `UnsampledActiveWorker` equal-flow fail-open on every rotation. Replaced with a once-allocated `V8RotationScratch` (boxed slices sized `max_worker_id + 1`) behind a mutex that is uncontended by construction — it is taken only after winning the EVEN→ODD seqlock CAS, so exactly one thread per rotation can reach it; zero allocation at rotation time and every slot is overwritten before read. **This retires the #1733 commit-time hard-reject of >32-worker + equal-flow on the Go side** (the gate's own retire-together contract and its Rust-const-pinning test demanded lockstep removal); the gate test files are rewritten as retirement pins proving >32-worker equal-flow configs now compile/commit/load/sync cleanly, and two new Rust pins prove enforcement reaches worker ids beyond 32.
+
+**(g) Telemetry.** `xpf_userspace_cos_flow_fair_buckets_occupied` / `…_flows_active` gauges per (ifindex, queue): buckets summed across disjoint per-worker instances; flows re-keyed from the existing flow-cache active-window source. Wire-additive on CoSQueueStatus with fixture regen (+2 keys) and both-sides key-absent pins; pkg/api emitters, descriptor canary, emit-level dto-type tests; the collision-ratio interpretation contract (valid only under continuous backlog) documented on both wire structs and in docs/fairness-regimes.md.
+
+Full cargo + Go suites green; 5× cos-filter flake loops 429×5/0; no new warnings.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #1842 — #1824: in-tree proptest harness for frame parse, NAT round-trip, TSO [MERGED] (merged 2026-06-10)
+
+Branch: `engineer/1824-proptest`
+
+Closes #1824, per its converged plan (3-way, @ fe0ac6240ba1 on research/1824-fuzz-harness; Option A in-tree proptest, cargo-fuzz rejected for the bin-only crate).
+
+26 properties across inspect (P-I1–I5: parse-never-panics, bounds, arbitration), NAT (P-N1 harness-defined undo composed exactly as production composes the hop; P-N2 oracle with a vacuity guard; P-N3 differential with checksum bytes masked per the RFC 1624 dual-encoding subtlety; P-N3b pins), and TSO (P-T1–T4 + flag gates). The research found three latent production defects, filed before the pins that reference them: **#1838** (headline — the generic v6 NAT path assumes L4 at fixed offset 40 and overwrites extension-header bytes; the descriptor fast path parses real offsets), **#1839** (v6 zero-encoding canonicalization scope), **#1840** (family-ungated UDP zero-checksum skip). Divergent domains are generator-excluded and pinned as current-behavior examples per the plan — no xfail machinery.
+
+Release binary proven **bit-identical** (all loadable sections sha256-equal; dev-dep only; 0 proptest crates in the normal dep tree). Harness runs in ~0.2s (budget ≤10s); full suite 1876/0; 5× flake green; mutation spot-check killed both planted mutations with seeds committed; llvm-cov shows the ext-header arms executed. state_writer descoped per the plan's premise correction.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #1843 — #1827 PR-1: real ICMP prober, probe pinning, and Junos-parity ip-monitoring with route-overlay failover [MERGED] (merged 2026-06-10)
+
+Branch: `engineer/1827-ipmon-pr1`
+
+PR-1 (PR-1a + PR-1b) of #1827's converged staged plan (@ 883cdb7f1 on research/1827-multiwan; 4 review rounds). The issue stays open for PR-2 (FBF per-policy selection) and beyond.
+
+**PR-1a — RPM hardening:** the icmp-ping probe never actually sent an echo; it now does (raw socket, id/seq/peer matching, injectable seam), with `destination-interface` binding (RETH-resolved SO_BINDTODEVICE) and `next-hop` pinning via the reserved fwmark/table/rule bands (0x1000+idx / 7000-7049 / rules 50-99 — one deterministic assignment shared by config validation, the routing reconciler, and the prober; crash-leak cleanup at startup; cap and collision commit-checks). Config-hash-gated re-apply fixes RPM never re-applying on commit.
+
+**PR-1b — `services ip-monitoring`:** Junos-parity match-rpm-probe → preference-1 preferred-route injection/withdrawal (Static/1 with preferred-metric as tie-break), driven by an any-FAIL/all-pass+hold-down FSM with debounce/throttle coalescing and one actuation in flight. Failover flows through a routes-only actuator — never full applyConfig — into BOTH FRR and the userspace snapshot (`PublishRouteOverlaySnapshot` on the partial-republish precedent; FIB-generation bump strictly after publish, test-pinned). The shared `assembleFRRConfig` constructor structurally prevents operator commits from wiping an active failover route (the AGY r-round fix). HA: scoped primary-only probe gating + overlay publication gate; overlay never enters config sync. Zero Rust changes (verified — the wire surface is the existing apply_snapshot/bump_fib_generation messages). Show command on all three frontends + 3 Prometheus metrics.
+
+Full `go test ./...` green; gofmt/vet clean on touched files (the two pre-existing vet findings are in untouched files). Live flip + failover smoke deferred to the cluster pass per the plan's test section.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #1845 — #1319 PR2: chassis-cluster typed leaves + boot-safe tolerant gate [MERGED] (merged 2026-06-10)
+
+Branch: `engineer/1319-typed-pr2`
+
+Part of #1319 (PR 2 of the converged per-subsystem rollout — the issue stays open for PR 3..N).
+
+**Load-bearing find first:** PR 1 wired the typed-leaf SchemaValidate gate strict on the LENIENT paths too — a stored out-of-range value failed `Store.Load` (boot blackout) and `SyncApply` (HA alarm loop). Verified empirically against master, fixed per the #1733/#1798/#1814 lenient-gate doctrine: `compileTreeLenient` downgrades violations to a warning (a persisted config written before a range was typed/tightened must boot; the operator's next strict commit rejects it loudly), pinned by real-`Load` tolerance tests + a strict CommitCheck rejection e2e.
+
+**The 13 chassis-cluster leaves** are annotated with runtime-truth-first ranges, each citing its source inline: `reth-advertise-interval` 10..40950 ms is exactly the VRRPv3-encodable range (ms→centisecond division at instance.go, 12-bit wire mask at packet.go — verified); `heartbeat-interval` 10..10000 and `heartbeat-threshold` 1..255 are deliberately xpf-divergent from Junos (the killed Phase-3a's mistake was Junos floors that reject xpf's own deployed defaults); `cluster-id` 0..255 (RETH virtual-MAC byte), node 0..1, RG priorities 1..254 (VRRP uint8 + owner-reserved 255), gratuitous-arp-count 1..16, ip-monitoring weights 0..255, `peer-fencing` enum. Validation matrix covers every leaf × in-range/boundaries/one-past/garbage in the flat-set shape; hierarchical accept/reject tests cover the deployed config shape; completion tests on both frontends. Honest residuals documented and test-pinned: the packed hierarchical one-liner (`node 0 priority 300;`) bypasses the gate (walker contract), and identity-token slots / non-compiled leaves stay untyped with reasons in schema.go.
+
+docs/config-schema.md gains the strict-vs-tolerant semantics + rollout status.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #1846 — #1829 Phase 1: dequeue-time sojourn telemetry for CoS queues [MERGED] (merged 2026-06-10)
+
+Branch: `engineer/1829-sojourn-p1`
+
+Phase 1 of #1829's converged plan (@ ebb716101e9c on research/1829-fqcodel-aqm) — the issue stays open: Phase 2 (CoDel at the fused-pop boundary) is explicitly gated on this telemetry's attribution evidence.
+
+`enqueue_ns` rides TxRequest/PreparedTxRequest/CoSPendingTxItem (+8 B each, the plan's budget), stamped once at the single CoS admission choke point from an already-held pass timestamp — zero clock syscalls added (#1734 constraint). Dequeue-time sojourn is recorded at the four fused #1763 pop-commit points (state writes strictly after pop; the peek-to-pop read-only invariant is untouched): a shift-add EWMA, a lifetime peak, and the gate metric — a 100 ms two-bucket flip-flop **windowed minimum** (CoDel's standing-queue estimator shape), with idle-gap discard and snapshot-time zeroing for quiet queues. MAX-merged across worker instances and workers (worst instance), contract documented on the wire struct.
+
+Wire: `sojourn_{ewma,peak,windowed_min}_ns` on CoSQueueStatus, serde-default/omitempty, fixture regenerated, key-absent pins both sides. Prometheus: three per-(ifindex,queue) gauges emitted unconditionally (a windowed-min of 0 is the strongest negative evidence and must stay visible) + descriptor canary + emit tests. CLI: `show class-of-service interface` gains a per-queue Sojourn line.
+
+The merge with #1841's adjacent occupancy fields needed hand-repair at five interleave points (descriptor tail, emitter body, one interleaved emission, and both wire-test twins truncated mid-literal) — all reconstructed from their pre-merge sides; full cargo + Go suites green post-merge, no new warnings (137 = base).
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #1847 — #1782 PR-2 Step 1: cold-start disambiguation counters (timer-wheel advance + v8 under-grant causes) [MERGED] (merged 2026-06-10)
+
+Branch: `engineer/1782-coldstart-s1`
+
+Step 1 of #1782 PR-2 per the converged v2 plan (@ 9bf29b4e9 on research/1782-v2-cold-stall — the re-research that refuted the neighbor chain and localized the deterministic idle-scaled first-flow stall to the CoS cold path). The issue stays open: Step 2 (the fix, leaning timer-wheel O(lag) catch-up) is gated on one cold reproduction with these instruments.
+
+**Mechanism (i):** `advance_cos_timer_wheel` returns ticks advanced (computed once at entry — O(1), no new clock reads, loop untouched); summed + single-call high-water tracked on WorkerCos (deliberately not the config-rebuild-reset runtime struct), flushed at the existing ~1s publish tick.
+
+**Mechanism (ii):** `AcquireV8ShortfallCause` (SeqlockGiveUp / CapZero / EpochRotated / ShareExhausted / ClassCap / OutstandingCap — EpochRotated added beyond the plan's five since a rotation-race transient must not corrupt capacity attribution) tracked via `acquire_v8_with_cause`, counted at the two exact-guarantee selector sites when post-top-up tokens < head_len.
+
+**Wire:** 8 per-worker fields on WorkerRuntimeStatus, both sides + fixture regen + key-absent pins; Prometheus: wheel total/max + one 6-cause `undergrant_total{worker_id,cause}` family, all series unconditional; descriptor canary + emit tests.
+
+Zero new warnings; full cargo green (2 known-ledger flakes 5/5 inline); 10/10 flake loops on cos+tx; Go suites green. One cold rep after this deploys answers (i)-vs-(ii) and gates Step 2.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #1848 — #1827 PR-2: FBF per-policy uplink selection + forwarding-instance table fix + two-upstream lab [MERGED] (merged 2026-06-10)
+
+Branch: `engineer/1827-fbf-pr2`
+
+PR-2 of #1827's converged staged plan (@ 883cdb7f1; PR-1 merged as #1843). The issue stays open for PR-3 (NAT interplay) and PR-4 (weights).
+
+**Forwarding-instance divergence fix:** `instance-type forwarding` instances compiled to the FRR default table while the dataplane filed their routes under `<ri>.inet.0` — and the FBF `ip rule` pointed at the kernel table nobody populated. FRR's `InstanceConfig` gains Name/TableID and statics render with a trailing `table <id>` for VRF-less forwarding instances, so the kernel table now matches both the PBR rule target and the dp's FIB view. PR-1b's commit-time rejection of forwarding-type targets is lifted: `preferred-route routing-instance` now resolves into the instance's table.
+
+**FBF selection:** the dataplane half already existed end-to-end (filter eval → `<ri>.inet.0` lookup, connected-inferred egress — verified, zero Rust changes); this PR makes the kernel half real and pins both halves. Per-policy steering counters are the existing filter-term `then count` hits (`xpf_filter_hits_total`) — verified counted on the PBR path and documented as such rather than inventing a parallel surface (flagged in the PR for plan-author review).
+
+**Lab:** `fbf-two-upstream-config.set` + `test-fbf-steering.sh` (atomic apply→validate→rollback, kernel-table/main-pollution/counter-delta asserts) + a CI fixture-compile guard. Files only — no live cluster mutation.
+
+All six package suites green; both AST shapes tested for the new leaves; gofmt/vet clean on touched files.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #1850 — #1828 Option C: WAN smart-queueing cookbook + validated fixture [MERGED] (merged 2026-06-10)
+
+Branch: `engineer/1828-sqm-cookbook`
+
+Option C of #1828's converged plan (@ d68a7fa5f on research/1828-wan-sq; Option B — the `smart-queueing` unit knob — is gated on #1829 Phase 2 and the issue stays open as its tracker; Option D split to #1849).
+
+The research's central finding: **the CAKE one-knob already exists** — a bare `shaping-rate` admits the unit into CoS, materializes the synthetic best-effort queue, and buys per-flow MQFQ fairness, the 5 ms delay clamp, and per-flow ECN from the second concurrent flow. The cookbook (`docs/cos-wan-sqm.md`) documents the upload one-liner with the single-flow-starts-FIFO lazy-promotion nuance stated honestly, the download direction via LAN-egress shaping (no ifb needed), rate guidance, the DiffServ variant, what maps to which existing knob, and exactly what CAKE features are NOT covered with their trackers (CoDel → #1829 P2; overhead → #1849; per-host isolation/ack-filter → not planned). The kernel-qdisc no-op verdict leads the doc.
+
+Plus a smoke-runnable fixture (`test/incus/sqm-cookbook-config.set`, 3g shape so shaped-vs-unshaped is unambiguous on the lab path) with pinned assertions (shape held; `active_flow_count > 1` after a 2-flow run = promotion engaged; clean restore) and a compile-guard test pinning the fixture against schema drift including the bare-shape compiles-empty hazard.
+
+Docs + fixture + test only; no engine/schema changes.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #1851 — #1844: DHCP-tracked ip-monitoring preferred-route next-hops [MERGED] (merged 2026-06-10)
+
+Branch: `engineer/1844-dhcp-nexthop`
+
+Closes #1844
+
+Implements the converged plan `docs/research/1844-dhcp-nexthop/plan.md` (v2.3, three-way PLAN-READY): `services ip-monitoring ... then preferred-route route <v4-prefix> next-hop <ifd>.<unit>` now tracks the named unit's DHCPv4-learned gateway, making a DHCP-addressed backup uplink (the dominant consumer/SOHO shape) usable as the ip-monitoring failover target.
+
+## Commits (logical increments)
+
+1. **Compiler** — interface-typed next-hop classification + derivation in `validateIPMonitoringStrict` (runs on every compile path, so boot Load derives too): `PreferredRoute.NextHopInterface` carries the Linux DHCP lease key from the new shared `config.DHCPLeaseIfName(ifName, unit)` helper (unit-number → vlan-id bridging concentrated in one place). Rejection matrix per plan §4.1: bare ifd, non-configured/Linux-form names, unknown units, units without `family inet dhcp`, inet6 destinations (RouteSnapshot has no device field — wire follow-up), management interfaces. Literal-IP path untouched.
+2. **pkg/dhcp** — immutable third `dhcp.New` constructor argument `onGatewayChange` (setter on a live manager would race the bare hook reads). Exactly two fire sites, both outside `m.mu`: `commitLease` on `prev == nil || prev.Gateway != lease.Gateway` (narrower than `leaseContentChanged`), and `finishClient` unconditionally — the terminal-cleanup owner covering cancel-mid-exchange / max-retransmission / v6 link-local-abort exits (successor-guard early return does not fire). RFC 2131 §4.4.5 coupling rule documented in the README.
+3. **pkg/ipmon** — injected `NextHopResolver`, resolved **pre-winner-selection** (an unresolvable winner yields the prefix to a resolvable losing candidate — the plan's load-bearing §4.2 property, pinned by test). `NotifyNextHopChange` gates on "any FAILED policy with an interface-typed route" and rides the existing dirty-bit → debounce → throttle → routes-only-actuator queue. Skips surface as `PolicyStatus.UnresolvedRoutes` (rendered by `FormatStatus`). `FilterOverlayForConfig` matches interface-typed entries on the lease key (resolved gateway is runtime state).
+4. **pendingFIBBump retry (plan Codex r2-1)** — `BumpFIBGeneration` returns `(uint32, error)` across the `DataPlane` interface, shim Manager, userspace Manager, legacy adapter; the actuator bumps when `published || pendingFIBBump`, sets the flag on bump failure, clears only on confirmed success — a publish-success/bump-failure ordering is no longer stranded by later hash-skipped duplicate publishes. Userspace error contract: failed `bump_fib_generation` control message = error; helperless/no-snapshot early returns = success; failed incremental NEIGHBOR update deliberately not an error (has its own retry semantics).
+5. **Daemon wiring (plan AGY r2-1/r2-2, SMR r3)** — `d.dhcp` created eagerly in `Run` beside the ipmon engine, write-once at boot, **FATAL** on `dhcp.New` failure (netlink is unusable anyway; the old per-apply retry is gone). Lazy-create branch removed from `reconcileDHCPClients`. Resolver (`resolveDHCPNextHop`: `LeaseFor(key, AFInet).Gateway`, nil-safe) injected before `ipmon.Start()`. `buildDHCPClientSpecs` + `dhcpLeaseChangeRequiresRecompile` switched to the shared lease-key helper.
+6. **Observability** — `xpf_ipmon_unresolved_next_hops` gauge (scrape-time pure: `Status()` recomputes the overlay through the resolver).
+7. **Docs** — `docs/multi-wan.md` limitation rewritten (DHCP failover-target supported; DHCP-as-primary-fast-path baseline limitation stays). `pkg/ipmon/README.md` + `pkg/dhcp/README.md` updated in their commits. No `docs/config-schema.md` change: no new schema node, only the `next-hop` desc string.
+
+## Withdrawal semantics (plan §4.5)
+
+Lease-record removal → hook → resolver `!ok` → next actuation withdraws (FRR + snapshot + bump). Re-acquisition window (T2 rebind failed) keeps last-known gateway — deliberate parity with the AD-200 FRR DHCP default. `request dhcp client renew` produces a withdraw/re-inject transient (documented). v4-only; zero Rust, zero wire-protocol, zero hot-path changes.
+
+## Validation
+
+- `go build ./...` clean; **full `go test ./...` green** (T=0); `-race` on pkg/{daemon,dhcp,ipmon,api,config}.
+- New tests: flat-set (`ParseSetCommand`+`SetPath`) + hierarchical parse/rejection matrix incl. unit-1/vlan-80 bridging; gateway-hook fire matrix + terminal-exit + deadlock-proof (hook calls `LeaseFor`) + concurrent `-race`; unresolvable-winner-yields-to-static, withdrawal/re-acquisition repointing, NotifyNextHopChange gate, FilterOverlayForConfig matrix, gateway-churn coalescing; actuator pendingFIBBump retry-until-confirmed + publish-failure-keeps-pending; resolveDHCPNextHop matrix; buildDHCPClientSpecs↔DHCPLeaseIfName differential.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #1853 — NAT/checksum v6 trio: ext-aware L4 offsets, zero-checksum encoding parity, family-gated RFC 768 skip [MERGED] (merged 2026-06-10)
+
+Branch: `engineer/1838-nat-v6-trio`
+
+Closes #1838
+Closes #1839
+Closes #1840
+
+Implements the converged trio plan (docs/research/1838-nat-v6-trio/plan.md @ 13666b4d3886 on research/1838-nat-v6-trio).
+
+## The three defects (all v6 NAT hot-path, found by #1824's property harness)
+
+- **#1838**: generic v6 NAT assumed L4 at fixed offset 40, silently corrupting ext-header bytes and writing ports/checksums into the wrong offsets on every extension-headered packet. Fixed via a shared `v6_rel_l4_offset` helper (meta-led precedence, ext-walk fallback) threaded through `apply_nat_ipv6`, the v6 adjusters, `recompute_l4_checksum_ipv6`, segmentation (both twins, incl. a payload-length fix), the slow-path extract, and the NAT-reversed ICMPv6 error builder (fragment-aware embedded walker; computed-zero ICMPv6 canonicalized to 0xFFFF).
+- **#1839**: descriptor-path v6 computed-zero canonicalization was applied per-protocol inconsistently vs the generic path; now scoped via `adjust_zero_checksum_illegal(proto, V6)` — UDP+ICMPv6 canonicalize, TCP keeps wire-valid 0x0000.
+- **#1840**: the RFC 768 stored-zero "checksum optional" skip leaked from v4 UDP into v6 UDP (where zero is illegal, RFC 8200); now family-gated via `l4_udp_checksum_optional(proto, family)` with a no-op-port parity rule (v6 UDP stored-0 + any port-NAT decision → 0xFFFF on both paths).
+
+## Proof shape
+
+The three #1842 defect pins that asserted the buggy behavior are FLIPPED to assert correctness; the NAT/segmentation proptest generators are re-admitted to the ext-header domain (≤4 ext headers NAT, ≤3 segmentation); the P-N3 generic-vs-descriptor differential is unmasked to FULL byte equality over the widened domain. Dead checksum trio + orphaned helper deleted.
+
+## Validation
+
+cargo build --release net-zero warning diff vs master; full suite 1852/0 (reruns hit only ledger-known flakes, each green standalone); prop_tests runtime 0.15-0.17s (within #1824 budget); go test pkg/dataplane/userspace ok. Follow-up #1852 filed for the pre-existing non-first-fragment port-NAT exposure + v6 MSS-clamp ext gap (both families, out of scope per plan Q4).
+
+---
+
+## PR #1854 — #1782 Step-2: O(slots) CoS timer-wheel snap for over-horizon cold-start catch-up [MERGED] (merged 2026-06-11)
+
+Branch: `engineer/1782-s2-wheel-snap`
+
+Closes #1782
+
+## What
+
+`advance_cos_timer_wheel` catches up one 50 µs tick per loop iteration. The #1847 Step-1 instrument confirmed plan §5.2 mechanism (i): after ~90 s of enforced idle, ONE cold connect drove `xpf_userspace_worker_cos_wheel_ticks_advanced_max{worker_id=1}` to **2,226,212 ticks in a single call** (~111 s of lag replayed tick-by-tick inside the first shaped drain) — the O(lag) wall cost behind the post-idle cold-connect stall.
+
+This PR implements the converged plan's Step-2(i) fix, **option (a)**: when the catch-up lag exceeds the full wheel horizon (`COS_TIMER_WHEEL_L0_SLOTS * COS_TIMER_WHEEL_L1_SLOTS` = 65,536 ticks, ~3.28 s), a `#[cold]` `snap_cos_timer_wheel_over_horizon` verifies **no queue is parked**, clears every L0/L1 slot vector, and sets `current_tick = now_tick` — O(slots) instead of O(lag).
+
+## Why option (a) is behavior-identical (plan Codex F1 + AGY F1 folds honored)
+
+The "wheel is empty at idle" shortcut is FALSE: `park_cos_queue` pushes indices into the slot vectors and `normalize_cos_queue_state` clears only queue flags, never the vectors; stale entries are filtered lazily by the `parked`/`wheel_level`/`wheel_slot` checks. So the snap proves identity rather than assuming emptiness:
+
+- With NO queue parked, **every** wheel entry fails the lazy `parked` filter — over an over-horizon lag the per-tick loop's only effects are emptying every slot vector (it visits all 256 L0 slots ≥256 times and cascades all 256 L1 slots) and advancing `current_tick`. The snap performs exactly those two effects and touches no queue state.
+- If any queue IS parked, the snap is refused and the existing O(lag) loop runs unchanged. That fallback is naturally bounded (plan AGY r2 F1): a parked queue is backlogged, which keeps `cos_root_can_service_after_prime` reporting it serviceable, so the owner keeps priming every poll pass and a populated wheel cannot coexist with multi-minute lag. No debug assertion encodes this invariant because (1) the fallback regression test deliberately constructs the state, and (2) park wake ticks are not statically bounded by the horizon for very low configured rates (pre-existing slot-wrap behavior) — the rationale is in the function doc comment.
+- In-horizon lag (≤ 65,536 ticks) takes the existing per-tick loop unchanged (strict `>` gate).
+- The `timer_level{0,1}_sleepers` telemetry (slot-vector lengths) ends identical either way — the loop would also have emptied the vectors.
+
+## Telemetry
+
+`cos_wheel_ticks_advanced_total/_max` keep recording the **true lag** on the snap path (the return value is computed before the snap), so the Step-1 signal stays visible — only its O(lag) wall cost is gone. No new wire counter: the plan marked one OPTIONAL and preferred reusing the existing pair; the fix is verified by the unit tests plus the acceptance-criteria cold-connect rep (≤ 20 ms after idle) in the serialized cluster smoke. Doc updates note that a large `max` no longer implies an O(lag) loop.
+
+## Cold-path discipline
+
+Hot path gains exactly one predictable compare-and-branch per advance call; the snap body is `#[cold]` and out-of-line. Zero change to the per-packet/steady-state drain path; no allocation (`Vec::clear` retains capacity).
+
+## Tests
+
+- `timer_wheel_at_horizon_lag_takes_per_tick_loop_and_wakes_due_park` — lag == horizon is in-horizon; loop unchanged, due park wakes, tick accounting unchanged.
+- `timer_wheel_over_horizon_snap_clears_stale_entries_and_reports_true_lag` — stale entries planted in BOTH levels (park-then-wake, the F1 hazard); snap at the Step-1 evidence magnitude (2,226,212 ticks) empties all slots, touches no queue state, reports the true lag; post-snap re-park does not fire early and wakes exactly on its due tick. **5×/5 standalone (flake check).**
+- `timer_wheel_over_horizon_parked_queue_falls_back_to_per_tick_loop` — parked + huge lag refuses the snap; the O(lag) loop wakes the due park.
+
+## Validation
+
+- `cargo build --release`: clean in touched files
+- Full Rust suite: **1926 passed / 0 failed**
+- `go test ./...`: green
+- Docs: `docs/cos-traffic-shaping.md` (timer-wheel advance section), `docs/fairness-regimes.md` (#1847 counter descriptions), `worker_runtime.rs` docstring, `_Log.md`
+
+Smoke (Pass A/B matrix + acceptance cold-connect rep + #1628/#1630 fairness gates) is run by the parent serialized smoke-runner — not deployed from this PR.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #1856 — #1827 PR-3: NAT interplay — per-uplink SNAT verification + source-nat-pool session clear (+ filtered-clear repairs) [MERGED] (merged 2026-06-11)
+
+Branch: `engineer/1827-pr3-nat`
+
+Part of #1827 (PR-3 of the converged plan @ `docs/research/1827-multiwan/plan.md`; PR-1 merged as #1843, PR-2 as #1848). The issue stays open for PR-4 (weights/load-share, needs fresh research).
+
+## Semantics mini-review (gate deliverable — adjudicate in this round)
+
+The staging row's gate requires a "semantics mini-review in its PR plan". It is `docs/pr/1827-pr3-nat/plan.md` (first commit). Reviewers: please adjudicate the plan's two verdicts explicitly, in addition to the code review:
+
+1. **Part A** — per-uplink SNAT pools need NO new matcher: the to-zone fed into SNAT rule matching is derived from the **resolved egress ifindex** of each new flow (`zone_pair_ids_for_flow_with_override`, poll_descriptor mod.rs:689), so an ip-monitoring route flip or FBF steer selects the other uplink-zone's rule-set/pool automatically; interface-mode SNAT uses the resolved egress interface's address. Shipped as verification tests (Rust `per_uplink_*`, test-only; Go snapshot test) + `docs/multi-wan.md` recipe. The shared-zone pool-mode case (Junos `to interface`/`to routing-instance` rule-set scoping) is a documented limitation, not built.
+2. **Part B** — on uplink transition, established sessions re-resolve egress (fib-gen bump) but keep their immutable NAT binding → stall until timeout (Junos parity). **No automatic clearing** (flap safety; Junos ip-monitoring has no session-clear action). The operator path is the Junos 23.4R1 `show`/`clear security flow session source-nat-pool <pool>` filter: translated source ∈ the named pool's address set, SNAT sessions only, unknown pool = command error. Stage-local PLAN-KILL not triggered: zero per-packet hot-path state, zero Rust hot-path changes, zero dp wire-protocol changes, zero config-schema changes.
+
+## What's in the diff
+
+- **`source-nat-pool` session filter** end-to-end: gRPC (`GetSessionsRequest`/`ClearSessionsRequest` additive fields), local CLI, remote CLI, cmdtree completion (pool-name DynamicFn), HA peer forwarding. Shared membership resolver `config.SourceNATPoolNets`.
+- **Filtered-clear repairs** (the path the runbook rides on — all latent, all pinned by regression tests):
+  - peer-forwarded clears dropped zone/interface/nat-only filters; a local `clear ... interface X` forwarded an EMPTY request, which the peer interprets as **clear-all** (peer session-table wipe);
+  - local-CLI interface-filtered clear matched **nothing** (iface maps only populated on the show path);
+  - port filters compared network-order key ports to host-order values (only byte-palindromic ports matched) in local-CLI show/clear and gRPC clear; gRPC `ClearSessions` is rebuilt on the same `sessionFilter` matcher the show path uses so they cannot diverge again;
+  - unresolvable zone names silently widened clears (zone ID 0 = no filter) — now InvalidArgument/command errors;
+  - pkg/cli `uint32ToIP` decoded BigEndian while the helper publishes `u32::from_ne_bytes(octets)` — NAT addresses displayed reversed in the local-CLI session view on little-endian (grpcapi/userspace decoders were already NativeEndian).
+- **Docs**: `docs/multi-wan.md` PR-3 section (recipe + transition semantics + runbook), README gotchas (shared-matcher invariant, clear-path filter contract), mini-plan, refactoring-audit refresh (stale at base from prior merges).
+
+## Validation
+
+- `go build ./...` = 0; full `GOCACHE=/dev/shm/cache go test ./...` green (0 failures across all packages).
+- `cargo build` + full `cargo test`: 1853 passed; the 3 failures are **pre-existing at base 5b3f9501e** — verified by reverting this PR's only Rust delta (test-only `nat/tests.rs`) and reproducing identically. Filed as #1855 (session `inplace_*` tests vs `debug_assert` contract conflict + one isolation-passing concurrency flake).
+- New tests: `per_uplink_pool_selected_by_to_zone`, `per_uplink_pool_no_match_outside_uplink_zones` (Rust); `TestBuildSourceNATSnapshotsPerUplinkZones`, `TestSourceNATPoolNets`, `TestSessionFilterSourceNATPool{V4,V6}`, `TestSessionFilterPortByteOrder`, `TestSessionFilterValidate`, `TestBuildPeerClearRequestCarriesAllFilters`, `TestServerSessionFilter*` (Go).
+- `make audit-check` green after refresh.
+
+No config-schema changes (no flat-set tests required); management protobuf only — dp wire protocol (`protocol.go`/`protocol.rs`) untouched.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #1857 — #1852: fragment-aware NAT rewrite + MSS-clamp v6 ext-header gap [MERGED] (merged 2026-06-11)
+
+Branch: `engineer/1852-frag-nat`
+
+Closes #1852.
+
+Two pre-existing, family-symmetric defects deferred by the
+#1838/#1839/#1840 trio (#1853). Research converged PLAN-READY v3.1
+(Codex r4 + AGY r3 + Claude SMR r3) on branch `research/1852-frag-nat`
+(`docs/research/1852-frag-nat/plan.md`).
+
+## Defect 1 — non-first-fragment L4 rewrite (both families, all paths)
+
+A non-first IP fragment has no L4 header at the post-IP-header offset; its
+bytes there are payload. The NAT/rewrite leaves (`apply_nat_ipv4/ipv6`,
+`apply_nat_port_rewrite`, `enforce_expected_ports*`,
+`restore_l4_tuple_from_meta`) interpreted those payload bytes as ports /
+an L4 checksum:
+
+- **Address-only NAT** (static 1:1, interface) corrupted 2 payload bytes
+  per non-first fragment while folding the address-change delta into a
+  fictitious L4 checksum.
+- **Dynamic pool SNAT** additionally allocated a mapping from the garbage
+  tuple, leaking a pool port per surviving fragment.
+
+On reassembly the receiver's L4 checksum (carried only in the first
+fragment) no longer matched → silent drop of fragmented NAT'd flows.
+Reachability narrowed honestly in research: the shim drops ~31% of TCP
+non-first fragments early, but large-payload fragments survive; this is
+pre-existing and NOT a #1853 regression.
+
+**Fix (Path A):** new read-only predicates `is_non_first_fragment` /
+`ipv4_is_non_first_fragment` / `ipv6_is_non_first_fragment`
+(`frame/inspect.rs`). Each rewrite orchestrator computes the predicate
+once and threads it into the leaves: the IP address is still rewritten on
+every fragment (consistency for reassembly), but the L4-checksum adjust,
+port rewrite, port enforcement and ICMP ident restore are skipped on
+non-first fragments — the address-change delta is folded into the first
+fragment's L4 checksum, which is correct. The descriptor fast path returns
+`None` for non-first fragments and falls back to the generic path
+(preserving the #1838 P-N3 descriptor-vs-generic byte parity). TCP
+segmentation admission refuses non-first fragments. Dynamic pool SNAT is
+gated at the allocation site — a non-first fragment that would need a pool
+mapping is dropped (`SourceNatFailureReason::NonFirstFragment`); static /
+interface (address-only) SNAT is unaffected. Embedded ICMPv4 parse +
+reversal builder get the quoted-fragment guard mirroring #1853's v6 fix.
+
+## Defect 2 — MSS-clamp v6 extension-header gap
+
+`clamp_tcp_mss` derived the v6 L4 offset as the fixed `(40, packet[6])`,
+so an ext-headered v6 SYN failed the protocol check and the clamp silently
+no-opped. The clamp now self-gates fragments (both families) and derives
+the v6 offset via the ext-aware `packet_rel_l4_offset_and_protocol` so it
+reaches the real TCP header. The shared helper is left UNCHANGED — GRE
+
+*(truncated — 65 lines total)*
+
+
+---
+
+## PR #1858 — #1855: cfg-gate inplace stale/vacant-handle tests to match the hybrid corruption contract [MERGED] (merged 2026-06-11)
+
+Branch: `engineer/1855-inplace-contract`
+
+Closes #1855
+
+## Problem
+`cargo test` (debug profile) was red on master: `session::tests::inplace_{stale,vacant}_handle_returns_false_no_panic` deliberately corrupt the private `key_to_handle` index and assert `update_session` returns false **without panicking** — but the guard arms they reach are `debug_assert!(false, ...)` (added 5d81c3ed9, minutes before the tests in d1e2ba33d/fdb4ddb3e). The tests were red in debug from birth; release gates stayed green because the asserts compile out.
+
+## Contract decision (research round, converged PLAN-READY)
+Decision record: `docs/research/1855-inplace-contract/plan.md` (reviewed by Codex `task-mq8y8sik-tup4pp`, AGY `adversarial-review-mq8y7hzh-4evslh`, Claude SMR — all converged; verdicts posted on #1855).
+
+**Path H — the code contract was already right; only the tests were wrong.** A stale/vacant `key_to_handle` mapping is impossible-by-construction: each worker owns its `SessionTable` by value with `&mut self`-only mutation, installs pair the map insert with a freshly allocated slab handle, and every removal funnels through `remove_entry`'s #964 eager-cleanup (with the `no_index_points_at` debug scan). Both reviewers independently enumerated all writers/removal paths and found no production-reachable staleness. The guards therefore follow the `remove_entry` #964 precedent: **debug = assert loudly (logic-bug detector); release = tolerate + return false** without touching the reused-slot session. No counter/log: unreachable absent a logic bug, and `update_session` is the per-packet refresh path (unthrottled log would flood under a real bug).
+
+## Change (test-only + docs; zero production code delta)
+- `session/tests.rs`: split each red test into a cfg-gated pair sharing rig helpers `rig_{stale,vacant}_handle_table`:
+  - `cfg(not(debug_assertions))` — the existing `*_returns_false_no_panic` release-contract bodies; the stale test additionally covers `refresh_for_ha_transition` (AGY finding: symmetric coverage).
+  - `cfg(debug_assertions)` + `#[should_panic(expected = ...)]` — four variants documenting each guard arm (update_session stale/vacant, refresh_for_ha_transition stale/vacant) with function-qualified expected substrings.
+- `session/mod.rs`: contract doc comments on both guard sites.
+- `session/README.md`: new "Corruption contract (#1855)" section + corrected stale ownership wording (Codex finding — per-worker by-value, not "coordinator-owned under shared locks").
+
+## Validation
+- `cargo test` (debug — the red gate): full suite **1856 passed / 0 failed** (was 2 failed), T=0
+- `cargo test --release`: full suite **1855 passed / 0 failed**, T=0 (one run hit the ledger-known `worker_queue::concurrent_recovery_processes_each_command_exactly_once` load flake noted in #1855 itself; standalone-green, full rerun green)
+- Named tests 5x per profile: 2 release tests 10/10 green; 4 debug `should_panic` variants 20/20 green
+- `go test ./...` green, T=0
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #1859 — docs: record #1827 PR-4 load-share stage killed by research criteria [MERGED] (merged 2026-06-11)
+
+Branch: `docs/1827-pr4-close`
+
+Part of #1827 (PR-4 stage close-out — doc-only).
+
+The PR-4 weights/load-share stage was PLAN-KILLED by its mandated research round (3/3 convergence: Claude SMR + Codex + AGY, two rounds; audit of record at `docs/research/1827-pr4-loadshare/plan.md` on the `research/1827-pr4-loadshare` branch). This micro-PR is the mandatory close-out item from the converged plan (§5; Codex r1 finding 8): amend the `docs/multi-wan.md` status paragraph so the module contract stops promising a later load-share PR, and state explicitly that per-flow load-balance parity remains unimplemented.
+
+Key audit facts behind the kill:
+- The userspace dp has no ECMP next-hop selection at all (`forwarding_build/fib.rs:162,196` — `next_hops.first()` at FIB build; `RouteEntryV4/V6` single next-hop; no flow hash in route resolution).
+- Synced sessions re-resolve locally (`upsert_synced.rs:39-60`), so any per-flow hash needs new cross-node hash-symmetry + transition-window invariants.
+- At 2 uplinks with PR-1 failover + PR-2 health-gated FBF steering + PR-3 per-uplink SNAT shipped, weighted hashing (new-flow-only convergence under session pinning) does not justify a ~1.5-2.5k LOC Rust hot-path program + wire change. Weighted static ECMP has no Junos analog.
+
+Prose-only; no code, no behavior change, no smoke needed.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+
+---
+
+## PR #1860 — #1741: clamp out-of-window flow-cache stamps to kill epoch-wrap ghost flows [MERGED] (merged 2026-06-11)
+
+Branch: `engineer/1741-flow-count`
+
+Closes #1741
+
+## Bug (found + deterministically reproduced in the /research round)
+
+`xpf_userspace_cos_active_flow_count` — and every gauge derived from the same per-binding flow-cache scan (`binding_active_flow_count`, the #1247 `fairness_cstruct`/CoV gauges, the #1830 `flow_fair_flows_active` overlay) — intermittently **over-counted** active flows (issue's 62/49/75 for 48 pinned streams). The activity stamp `last_used_epoch` and the scan's `current_epoch` are both **u16** aged with `wrapping_sub`, and dead flows are never removed from the cache, so every dead entry whose stamp froze nonzero re-entered the 10-epoch active window for exactly 10 ticks once per 65535-tick wrap cycle (**ghost resurrection**). A run of K flows that ended together resurrected as a +K cohort on any scrape landing in the window — explaining both the intermittency and why the symptom resisted on-demand reproduction (prior plan-kill round).
+
+Research trail: branch `research/1741-flow-count` (plan v2 + 2 deterministic repro patches + round docs); 3-way convergence Codex task-mq91ul6e-5ylq0v + AGY adversarial-review-mq91os4y-mkv4iw + Claude SMR all PLAN-READY on this exact fix (Path A).
+
+## Fix (telemetry-only, zero packet-path cost)
+
+`active_flow_debug_entries` takes `&mut self` and **sentinel-clears** (`last_used_epoch = 0`) entries whose age leaves the window, during the same owner-only ~65 ms debug-cadence scan that computes the counts. Airtight: `tick_advance_epoch` and the scan are co-located at the single production call site (`publish_binding_debug_state`, hot + #1294 idle paths), so a stamp is cleared on the first scan after leaving the window — a wrap can never re-match it. A clamped entry is NOT evicted: a later hit re-stamps it (counts again, `observed_bytes` preserved). In-window counting semantics unchanged. `active_entry_age` becomes test-only (scan inlines the age math to clamp under the `iter_mut` borrow); release warning count stays at base (138).
+
+**Restored invariant** (now documented in `docs/fairness-regimes.md`): counted active ⇔ hit within the last 10 ticks, no wrap exception. Remaining honest caveats documented: elastic window under load; slower-than-window flows legitimately drop out. This is the gauge contract #1746 should evaluate against.
+
+## Validation
+
+- 4 pinned regression tests; **mutation check: 3/4 FAIL with the clamp reverted** (10 resurrections/cycle, first at tick 65519), all pass with it. The choreography test models the production clean client-initiated close (FIN slow-path re-insert sentinel-clears — asserted; final pure ACK re-stamps — asserted), answering the research round's Codex HIGH-1.
+- Full `cargo test --release`: **1943 passed / 0 failed** (awk-aggregated). `go test ./...`: green. `cargo build --release` warnings == base (138).
+- Live (research round, loss userspace cluster): metric exact mid-run (24 pinned streams → sum 25 = 24 + control, stable ×3 scrapes), rows vanish ≤1 s post-stop. A supplementary live wrap-resonance watch is running; outcome will be posted here.
+
+Do NOT merge — parent session smokes on the loss userspace cluster and merges.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #1862 — #1760 W-lite: repair the NAT reverse-key collision watch (shared-map displacement counter + durable warn + live-fire harness) [MERGED] (merged 2026-06-11)
+
+Branch: `engineer/1760-reverse-key`
+
+**Part of #1760 — the issue stays OPEN as the watch (same contract as the #1762 stage-1 counter PR). This is W-lite from the converged stage-2 revisit plan (`docs/research/1760-reverse-key-v2/plan.md` @ `97612480ee22`, 3-way PLAN-READY: Codex `task-mq92cre3-67e0k5`, AGY `adversarial-review-mq923k3r-44j692`, Claude SMR r3).**
+
+## Why
+
+The revisit research established that the #1762 per-worker collision counter alone is not a sound revisit trigger:
+1. It resets on every restart/redeploy and emits **no durable artifact** — a collision before a redeploy is unobservable afterward.
+2. **`MissingNeighborSeed` installs are never replicated** to sibling workers (`poll_descriptor` seed block has no `replicate_session_upsert`; the origin is not promotable), so two cold-neighbor colliding flows on different workers are structurally invisible to it (Codex r2 F1, verified end-to-end).
+3. Ordinary traffic never re-asserts secondary indices (`refresh_local` is test-only), so a standing collision against an already-unindexed live loser is invisible to any displacement detector — documented honestly, not silently (plan §2.3).
+
+## What (W-lite: W1 + W3′ + W2 + W4)
+
+- **W3′ — shared-map displacement counter** (`publish_shared_session`): counts an insert into `shared_nat_sessions` that displaced a **different forward session's** entry at the same reverse key. This is the single choke point every transit forward-NAT session passes through (normal, seed, promote, HA sync, tunnel — enumerated by Codex r3), so it covers the seed case. Same-session republish (promote/RG-migration/HA re-sync) and the entry's own canonical/wire alias never count (AGY r3 verified false-positive-freedom). Exported wire-additively per the #1789/#1807 template: `ProcessStatus.nat_reverse_key_shared_displacements_total` (serde default; fixture regenerated; round-trip + key-absent pins both sides) → `xpf_userspace_session_nat_reverse_key_shared_displacements_total` (unconditional emit; honest event-count-not-census help text) → `show system buffers` Counters row (zero-suppressed).
+- **W1 — durable journald warn**: on the ~1s worker runtime-publish cadence, an increase in either collision counter emits one `xpf-dp: NAT reverse-key collision detected ...` line, rate-limited by a **process-global 60s CAS throttle** (the coordinator warm-sweep pattern) so the bound is ≤1 line/min regardless of worker count. A throttled increment keeps the prev-values unchanged and retries, so a burst inside one window (or during the first window after start) still produces its line. Zero per-packet work; one u64 compare per publish tick while the counters stay 0.
+- **W2 — live-fire harness** `test/incus/reverse-key-collision-probe.sh`: forces a real collision (two LAN source IPs, same bound source port, portless interface-SNAT) with the preflights plan review demanded (SNAT-mode assert + flow-1 reverse path proven before flow 2) and a **cold-neighbor variant** that exercises the seed path where only W3′ can fire. Not part of smoke — it corrupts its own two probe flows by design.
+- **W4 — filed #1861**: the non-transactional failed-install wart (both faces: forward-fail → reverse still installed + packet forwarded on a rolled-back SNAT allocation; reverse-fail-at-cap → forward kept, permanent one-way blackhole). Fix is its own PR (install-path behavior ⇒ failover gating an observation-only PR must not absorb).
+
+## What this is NOT
+
+- No dataplane behavior change, no HA-semantics change, no per-packet cost (observation only — failover gating not triggered; see plan §9).
+- Not the structural fix: stage-2 (install-time refusal) stays shelved with its design-of-record (now including the commit-order-inversion requirement) until the watch fires or a multi-host deployment lands.
+
+## Docs
+
+The watch design, coverage map, and counter semantics are documented in `docs/research/1760-reverse-key-v2/plan.md` (research branch); operator-facing semantics live in the Prometheus descriptor help strings and the harness header. No module .md exists for pkg/api metric additions (matching #1762/#1789/#1807 precedent).
+
+## Validation
+
+- `cargo build --release` clean; **full** `cargo test --release`: 1943 passed / 0 failed (aggregated over all "test result" lines, no flakes this run).
+- `go test ./...` clean.
+- New tests: `shared_nat_displacement_counter_counts_collisions_not_republishes` (fresh-publish/republish negatives, collision positive, alternation re-count), `shared_nat_displacement_counter_ignores_reverse_entries`, `nat_reverse_key_warn_throttle_claims_once_per_window`, `process_status_nat_reverse_key_shared_displacements_roundtrip` (+ key-absent), Go descriptor-coverage + emit pins, wire fixture regen.
+- W2 live-fire requires deploy: to be run on the loss userspace cluster under the cluster flock post-review (`flock /tmp/xpf-cluster.lock sg incus-admin -c "./test/incus/reverse-key-collision-probe.sh warm"` then `cold`).
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+
+---
+
+## PR #1867 — #1746: CoS equal-flow target-policy knob (slowest | mean | ideal-share), F1-gated [MERGED] (merged 2026-06-11)
+
+Branch: `engineer/1746-equal-flow`
+
+Closes #1746
+
+Implements the converged 3-way PLAN-READY research plan
+(`docs/research/1746-equal-flow-target-policy/plan.md` @ `fb4f2fd6a`,
+Path A): an operator-selectable per-scheduler equal-flow target policy.
+
+```
+set class-of-service schedulers <s> equal-flow-target-policy (slowest | mean | ideal-share)
+```
+
+## What changes
+
+The equal-flow publisher (`publish_equal_flow_epoch_v8`) previously
+clipped every flow to the SLOWEST sampled per-flow rate
+(`candidate_target.min(per_flow)`). That reduction is now policy-driven
+over the SAME sampled `(prev_grants[id], active_flows[id])` pairs:
+
+- **`slowest`** — the existing `min` fold. **Byte-unchanged default**:
+  unset configs (`""`) and the named value produce identical lease
+  behavior (pinned by tests + the untouched wire-invariant fixture; the
+  snapshot field is omitempty/skip-if-empty in both directions).
+- **`mean`** — `Σ prev_grants / Σ active_flows` over the sampled set:
+  clips lucky fast outliers toward the aggregate-weighted mean achieved
+  per-flow rate.
+- **`ideal-share`** — nominal equal share: the rotation's TRUE byte
+  budget (`new_cap` = rate × elapsed + carry, lag-recovered — Codex r1
+  F1 fix) divided by total active flows.
+
+Fail-open guards, EWMA smoothing, the valid-streak gate, and the
+`max_worker_cap` telemetry are identical for all three policies. A live
+policy edit rebuilds the lease (`matches_config_v8` includes the
+policy). Per-rotation cost: two saturating adds per sampled worker
+(EqualFlowSuppress mode only, >=200 µs cadence); the CstructDefault
+path is untouched.
+
+Operator surface: typed enum schema leaf (value completion, flat-set
+commit-check, strict-compile re-check, hierarchical + flat AST both
+covered), warn-not-strip when set without `equal-flow-enforcement`, a
+non-work-conserving cost warning for `slowest`/`mean`, `policy=` on the
+`show class-of-service` Equal-flow line, and a **sibling info metric**
+`xpf_userspace_cos_equal_flow_target_policy{ifindex,queue_id,policy} 1`
+(new series — existing equal-flow gauge identities unchanged; no new
+control-socket traffic). `test/incus/apply-cos-config.sh` gains
+`COS_EQUAL_FLOW_POLICY=` layered on the `COS_EQUAL_FLOW=1` injector.
+
+## F1 ship-gate + supplementary matrix (full data: `docs/pr/1746-equal-flow-target-policy/f1-measurement.md`)
+
+Primary cells (fw1 primary, v4 push, port 5210 iperf-24g exact, `-P12`,
+3 reps/cell, 12-stream-validated per-stream CoV from iperf JSON):
+
+
+*(truncated — 109 lines total)*
+
+
+---
+
+## PR #1868 — #1736 S2b: live kernel-WireGuard interop harness + the three S2a datapath bugs it caught [MERGED] (merged 2026-06-11)
+
+Branch: `engineer/1736-wg-interop`
+
+## Summary
+
+#1703 S2b: live kernel-WireGuard interop test + smoke. First-ever proof of
+the S2a WireGuard datapath (#1432 / PR #1739) against an independent
+reference peer — the Linux kernel WireGuard implementation — on the
+canonical loss userspace cluster, per the converged 3-of-3 PLAN-READY
+research plan (`docs/pr/1736-wg-interop/plan.md`, Codex + AGY + Claude SMR,
+2 hostile rounds).
+
+The live bring-up did exactly what S2b exists for: it found **three real
+S2a datapath bugs** that unit tests and the S2a responder-only smoke could
+never see. Two are fixed in this PR; one is filed (#1866).
+
+## The three bugs the live test caught
+
+1. **`collectAppliedTunnels` dropped WireGuard tunnels** (`pkg/daemon/
+   daemon_run.go`): the `Source != ""` screen for half-configured GRE
+   stanzas also dropped `mode==wireguard` (WG has no GRE-style source), so
+   `applyWireguardTunLocked` never ran on the live path — the persistent
+   wgN TUN was never created and the Rust control thread's `open_tun`
+   failed. The dataplane-snapshot side had the special case; the
+   routing side didn't. One-line fix + regression test.
+2. **EINVAL on every v4 initiation** (`wg_control.rs`): Linux rejects an
+   `AF_INET` destination sockaddr on the dual-stack `[::]:51820` socket.
+   Every initiation toward the configured v4 endpoint died silently —
+   strace-proven live:
+   ```
+   sendto(21, "\1\0\0\0...", 148, MSG_NOSIGNAL,
+          {sa_family=AF_INET, sin_port=htons(51820),
+           sin_addr=inet_addr("10.0.61.103")}, 16) = -1 EINVAL
+   ```
+   xpf-as-initiator-to-a-v4-endpoint had **never worked** (S2a's smoke was
+   responder-only with no peer). Fix: `wg_send_to()` maps V4 targets to
+   their V4-MAPPED form iff the socket is the AF_INET6 dual-stack one.
+   Loopback round-trip regression test.
+3. **v4-mapped learned endpoint inflated the MTU guard** (`wg_control.rs`):
+   `recv_from` on the dual-stack socket reports v4 peers as
+   `::ffff:a.b.c.d`; after endpoint-learning replaced the configured v4
+   endpoint, `is_ipv6()` charged the 40-byte v6 outer overhead for a
+   20-byte v4 outer. Every inner packet whose 16-pad fell in 1409..=1425
+   was silently dropped on egress. Live bisect: inner 1408 (outer 1468)
+   passed, inner 1409 (outer 1484 real / 1504 charged) blackholed —
+   handshake + pings fine, reverse iperf3 546 Mbit/s, **forward TCP moved
+   ZERO bytes** (peer cwnd pinned at 1.34 KB). Fix:
+   `canonicalize_endpoint()` unmaps learned endpoints (logical-v4 for
+   guard/learning; `wg_send_to` is the wire-side mirror). Regression tests
+   include the guard-math window itself.
+
+## Deliverables
+
+
+*(truncated — 130 lines total)*
+
+
+---
+
+## PR #1869 — #1864: pin the BPF shim toolchain + kernel-verifier load guards [MERGED] (merged 2026-06-11)
+
+Branch: `engineer/1864-toolchain-pin`
+
+Closes #1864
+
+## What
+
+`make generate` with a drifted Rust nightly produced a userspace-xdp shim object that exceeded the BPF verifier's 1M processed-insn cap and took BOTH loss-cluster dataplanes down on 2026-06-10 (config-only mode until the tracked .o was restored). This PR implements the converged research plan (docs/research/1864-toolchain-pin/plan.md r4, 3-way PLAN-converged: Codex + AGY + Claude SMR over 2 hostile rounds):
+
+1. **Verify-only kernel-verifier gate** (`pkg/dataplane/verify_userspace_shim.go` + `cmd/shimverify`): real BPF_PROG_LOAD against a candidate object with production spec validation first, hash-map MaxEntries shrunk on a copy (memory hygiene), anonymous maps only — HARD INVARIANT: never touches pins/attach/MapReplacements, so a running daemon keeps forwarding.
+2. **Toolchain pin, fail-loud** (`userspace-xdp/rust-toolchain.toml` = SSOT, `nightly-2026-05-23` + bpf-linker 0.10.2 exact-binary check, strict single-channel TOML parse, no unpinned fallback path; `.cargo/config.toml` loses the hardcoded home path). `build-userspace-xdp.sh` is now VERIFY-THEN-INSTALL: REJECT / missing privileges / unpinned-without-override all leave the tracked .o untouched.
+3. **Deploy pre-flight**: `xpfd verify-dataplane` (exit 0/3/1) verifies the embedded object on the TARGET node BEFORE the old daemon is stopped; `deploy_vm()` ordering invariant: no dataplane stop/cleanup/pkill/replacement/legacy-migration before the pre-flight. CPU contract: taskset to the complement of live worker cores (derived from single-CPU Cpus_allowed_list), nice-only fail-safe.
+4. **Source fix**: the two `saturating_sub` hot-prologue sites rewritten (semantics identical, derived in plan §4B) — the previously-failing current nightly now also produces a verifier-PASS object, making the pin defense-in-depth rather than load-bearing.
+5. **Regenerated tracked .o** through the new gate (md5 057ecde6, 6620 xlated insns, verifier PASS) + preserved incident REJECT object as inert testdata + root-gated tests (embedded-object check; shrink-equivalence proof: PASS/REJECT verdicts identical unmodified vs shrunk, 40.7s live run).
+6. **Docs**: pkg/dataplane/README.md guard-layers + recovery runbook + pin-bump procedure; CLAUDE.md Quick Start (make build does NOT need make generate); engineering-style reminder; #1451 allowlist table entry.
+
+## Root cause (research-proven)
+
+rustc/LLVM regression window (`nightly-2026-05-23`, `nightly-2026-05-27`]: `u64::saturating_sub` lowering changed to subtract + overflow-test + materialized-boolean re-branch; spilled wide-var_off booleans defeat verifier state pruning (57,464 states, 31/insn) → 1M-insn cap on any kernel ≥5.2. A year-old nightly fails differently (variable-offset pkt pointer) — the safe toolchain set is an interval, so pin AND empirical verifier gate are both required. bpftool cannot load aya legacy-maps objects; the gate uses cilium/ebpf (the production load path).
+
+## Gates run (all unmasked)
+
+- `go build ./...`, `go vet` (2 pre-existing master warnings only), `go test ./...` — 0 FAIL (incl. retirement-boundary canaries, updated allowlist).
+- `make generate` both arms: pinned → verifier PASS + install + `git diff --exit-code` clean (bit-for-bit reproducible); unpinned override without `XPF_SHIM_ALLOW_UNPINNED_INSTALL` → verified candidate but install REFUSED, tracked .o untouched; missing toolchain → actionable rustup one-liner.
+- `xpfd verify-dataplane`: PASS with tracked object embedded; exit 3 + verifier tail with the incident object embedded.
+- Root-gated tests PASS live (sudo): embedded check 2.4s; shrink-equivalence 40.7s.
+- `cargo +nightly-2026-05-23 fmt --check` clean; `clippy --release` clean (pre-existing dead-code warnings unchanged); `cargo test` N/A for the no_std bpfel-target cdylib.
+- `make audit-check` green.
+
+## Smoke
+
+Parent runs the guarded `make generate` + cluster deploy cycle under the cluster lock (including the new pre-flight) before merge. Do not merge before that.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #1871 — userspace-dp: transactional forward+reverse session install with drop-on-refusal (#1861) [MERGED] (merged 2026-06-11)
+
+Branch: `engineer/1861-install-txn`
+
+Closes #1861
+
+## Summary
+- **Pair-admission preflight** (`SessionTable::can_admit`, two integer compares): the forward+reverse install pair in the new-flow path now passes or fails atomically. The table is per-worker single-threaded `&mut`-exclusive during descriptor processing (GC/worker commands run between poll phases), so a passing preflight makes both installs infallible — no reservation/rollback machinery. Conservative replacement accounting matches the existing cap check so the preflight can never pass where the install would fail.
+- **Drop-on-refusal (Junos parity)**: a refused new flow rolls back its SNAT allocation (existing call shape), counts, recycles the trigger frame, and skips the reverse install, the forwarding block, AND the flow-cache population. Pre-fix, the refused flow forwarded its packet on a rolled-back SNAT decision and **cached the unreserved pool-SNAT tuple in the flow cache** (no idle TTL) — the allocator could re-grant the same tuple to another same-destination flow (wire-level tuple aliasing, plan §2/I2; pool-mode-only, interface SNAT allocates nothing).
+- **Reverse install gated on `forward_installed`** (was `track_in_userspace` — a forward failure fell through and still attempted the reverse: the latent half-open-reverse hazard, issue face (i)).
+- **Repair-path ride-along** (Codex research-r1 C1 + AGY r1 F1): `install_reverse_session_from_forward_match` → `(SessionLookup, bool)`; `created` now reports the actual install outcome (no more `session_creates` over-count / conntrack publish for a non-existent session), and a new `install_failed` flag gates the flow-cache insert — a failed reply repair stays on the slow path and self-heals on the first reply below cap (pre-fix it was cached sessionless and the repair never re-fired).
+- **Seed path**: a refused `MissingNeighborSeed` recycles its frame instead of buffering it for neighbor-resolution replay (the replay would forward on the rolled-back tuple with no session).
+- **Residual arms** per the #1855 contract: post-preflight install failures are impossible-by-construction → `debug_assert!` in debug, count+degrade (never half-commit; reverse residual also suppresses the cache) in release.
+- **Observability** (wire-additive, modeled on the #1760 counter path): `xpf_userspace[_worker]_session_create_drops_total` (existing `create_drops` was write-only — at-cap drops were invisible), `.._session_install_admission_refused_total`, `.._session_install_partial_total` (expected 0 forever). serde `default` + fixture regen + `protocol.go` `omitempty` + Prometheus families + key-absent pins both sides.
+
+Plan of record (3-way converged PLAN-READY, Path A): `docs/research/1861-install-txn/plan.md` on `research/1861-install-txn` @ ca1bde0c170d. Scope exclusion signed off there: I13 (local-tunnel UpsertLocal divergence at cap) stays out — filed as #1870.
+
+## Hot-path shape
+New-flow **cold path only**: 2 compares + (refusal-arm-only) one u64 add. Warm path untouched; flow-cache hit path untouched; no new allocation; no new locks/atomics on the packet path (counters ride the existing ~1s worker-runtime publish cadence).
+
+## Behavior changes (at/near `max_sessions` only)
+- Refused new flows now DROP the trigger packet (was: stateless forward + cache leak). Effective paired capacity is `max_sessions-1` (a pair needs 2 free slots) — reviewed and accepted (plan §11 Q2, all three reviewers).
+- Failed reply repairs are no longer flow-cached → per-packet slow path at cap, reverse session installs on first reply below cap.
+- Away from capacity: zero behavioral delta.
+
+## Test plan
+- [x] `cargo build --release`
+- [x] FULL `cargo test --release` awk-aggregated: **1965 passed, 0 failed** (ledger flakes wg `reconcile_peers` / worker_queue `concurrent_recovery` both passed in-run)
+- [x] debug-profile `cargo test session::` (the #1855 debug_assert contract): 78 passed
+- [x] `go test ./...`: all ok
+- [x] Deterministic at-cap pins, **debug AND release**: I1/I2/I3 (drop + no installs + no cache + counters), I4 boundary (pair at cap-2 admitted / cap-1 refused), I2 pool-mode (allocator rolled back + cache empty), I5 (failed repair forwards uncached, created==outcome, self-heals below cap), I6 (refused seed recycled not buffered; buffers below cap), I14 (NAT64 refusal drops; installs below cap)
+- [x] Wire pins both sides: Rust round-trip + key-absent (ProcessStatus + WorkerRuntimeStatus), Go round-trip + key-absent, fixture regen reviewed (6 additive keys)
+- [ ] Smoke on loss userspace cluster (parent-serialized) + **mandatory `make test-failover`** (install-path behavior change)
+
+## Deferred
+- #1870 — I13 local-tunnel UpsertLocal pair silently dropped at cap (uncapped sync/replica semantics family)
+- I11 — `upsert_synced_with_origin` has no cap check (pre-existing design asymmetry, documented in plan §4)
+
+Refs #1861 #1870 #1760 #1855 #964
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #1872 — #1866: WG tunnel removal must tear down the control thread + listen port [MERGED] (merged 2026-06-11)
+
+Branch: `engineer/1866-wg-teardown`
+
+## Summary
+
+Closes #1866 (#1703 S2a follow-up). Implements the converged research
+plan (`docs/pr/1866-wg-teardown/plan.md`, 3-way PLAN-READY — Codex +
+AGY + Claude SMR — after 5 hostile rounds on
+`research/1866-wg-teardown`).
+
+Live during #1736 S2b, removing the `wgN` stanza left the userspace WG
+control thread running with its UDP listen port bound; re-adding the
+SAME identity then EADDRINUSE'd the fresh thread and the tunnel stayed
+dead until an xpfd restart. The research pass verified the ordinary
+prune path is correct in isolation and identified five concrete
+lifecycle defects instead:
+
+- **D1** — a control thread that exits early (EADDRINUSE bind, missing
+  TUN) leaves a map entry that permanently blocks respawn under an
+  unchanged identity (engine-Arc reuse ⇒ not stale; `contains_key` ⇒
+  no spawn). This is exactly the observed "new engine never initiates"
+  permanence.
+- **D2** — thread liveness was only examined at snapshot applies.
+- **D3** — zero teardown observability (why the live triage could only
+  say the snapshot "appears to retain" the endpoint).
+- **D4** — the NOT-same-plan + `defer_workers` apply stores the
+  snapshot without reconciling, so a WG endpoint removed by such an
+  apply leaks its thread+port at least until the deferred bring-up.
+- **D5** (pre-existing) — the stale prune keyed on the engine Arc
+  alone; an interface rename with unchanged crypto identity kept the
+  live thread attached to the OLD TUN.
+
+## Design (plan v5, Option 2)
+
+- `WgControlEntry` tombstones: `handle: Option<…>` + `engine_ptr` +
+  spawn attachment (`spawned_ifindex`/`spawned_tunnel_name`) + a
+  durable `last_spawn_attempt_ns` (3s per-id backoff,
+  `WG_SPAWN_BACKOFF_NS`). Entries leave the map ONLY when the endpoint
+  leaves the desired set.
+- `spawn_wg_control_threads` = three passes: finished sweep (exited
+  thread → tombstone), attachment-aware stale prune
+  (removed / engine-changed / attachment-changed → stop+join+remove —
+  fixes D5), backoff-gated spawn via the factored
+  `spawn_one_wg_control_thread`.
+- Self-heal (D2): `reconcile_wg_control_liveness` rides the existing
+  `refresh_status` (no new control-socket request) gated on
+  `should_run_afxdp` (stop-gate). **Tombstone-only** (never creates
+  entries — the forwarding-derived desired set can be stale during a
+  defer window) and **snapshot-coherent** (a tombstone respawns only
+  when the latest stored snapshot row is identity- AND
+  attachment-identical to the forwarding endpoint it would spawn
+  against), ≤1 spawn attempt per invocation.
+- `prune_wg_control_threads_for_snapshot` (D4): narrow prune-only
+
+*(truncated — 98 lines total)*
+
+
+---
+
+## PR #1874 — #1863: close the CoS guarantee-rate honored-realization gap (v8 lease unclaimed-budget carry, Path A-ii) [MERGED] (merged 2026-06-11)
+
+Branch: `engineer/1863-realization`
+
+Closes #1863
+
+## What
+
+Closes the CoS guarantee-rate **honored-realization gap**: Phase-1-honored mid classes (3g/6g) realized only ~70% of shape under a Phase-2 aggressor (vs 88-91% alone). Root cause per the converged research plan (3-of-3 PLAN-READY, `docs/research/1863-realization-gap/plan.md` @ research branch `8309d944c`): the per-class v8 lease deals its 200µs class budget to workers flow-proportionally, workers claim shares only at drain-visit-sampled acquires, and **unclaimed share evaporated at rotation** — measured at 21-29% of the class budget under aggressor pressure (claim-sampling loss).
+
+## Commits
+
+1. **Step-0 attribution instrument** (mandated by the plan with a registered decision rule): per-worker cumulative `xpf_userspace_cos_lease_v8_{requested,granted}_bytes_total{ifindex,queue_id,worker_id}` bumped own-slot/relaxed in `acquire_v8_with_cause`, surfaced through the status overlay + wire (Rust `protocol/cos.rs` + Go `protocol.go`, byte-matched tags) + Prometheus; plus the previously wire-only admission counters as `xpf_userspace_cos_admission_*_total`. **Decision cells** (`docs/pr/1863-realization-gap/raw/step0-*`): every active worker over-asks its entitlement 1.8-48× cumulatively (no demand-starved worker — share/demand mismatch refuted) while class grants land at 71-79% of budget → **claim-sampling loss dominant → Path A-ii** per the registered rule. (Also closes the plan's worker-pooled-grants caveat: per-class grants == per-class realized.)
+2. **Path A-ii fix**: `maybe_rotate_epoch_v8` banks the just-ended epoch's unclaimed class budget (`prev_cap − prev_granted`) into the existing bounded lag-carry (`epoch_carry_bytes`); the next rotation draws it back and the unchanged flow-proportional share formula re-deals it. Per-worker isolation preserved (no mid-epoch class-room racing — the A-i shape the plan reviews rejected); all existing bounds unchanged (carry_max 8 epochs, drain_max 7/rotation, (2K−1)·rate·EPOCH per-rotation ceiling, regime-3 cold-resume drop across HA gaps); conservation: a banked byte is a published-but-ungranted byte, so Σ granted ≤ rate × wall-time + carry_max (Gate-4 hard cap unchanged); fully-claimed epochs bank 0 → **healthy steady state byte-identical**; **EqualFlowSuppress leases excluded** (enforced suppression must not recycle; IdealShare numerator must not track sampling noise) — the pre-existing equal-flow suite passes byte-identically.
+3. **PR docs**: Step-0 decision record + decisive cells + manifest.
+
+## Before/after (decisive cells, build `g75f5ed727` version-pinned pre+post in one cluster-lock hold)
+
+| Cell | class | before (master) | after | plan §6 gate |
+|------|-------|-----------------|-------|------|
+| small4+24g | **3g** | 69-73% | **92.6 / 93.7 / 94.0%** | ≥85 ✅ |
+| small4+24g | **6g** | 66-72% | **94.6 / 94.9 / 94.7%** | ≥85 ✅ |
+| small4+24g | 24g | 43-51% | 48.5-54.1% | residual (ceiling-division share ≈52%) ✅ |
+| small4+24g | aggregate | 17.4-19.6 G | **21.1-22.3 G** | ≥20.5 ✅ (C_phys(mix)=23.2) |
+| small4+9g | all | 76-82% | **92.4-95.3%**, agg 17.9-18.1 G (94% of demand) | all ≥85 ✅ |
+| small4-alone | 3g/6g | 87.5-91.5% | **95.3 / 95.3%** | unregressed ✅ |
+
+One observation: 1g at 75.9% in a single rep (fix24c-r3; 90-94.5% in all six other cells) — within the corpus band + one outlier.
+
+## Validation
+
+- `cargo build --release` clean; **full `cargo test --release`: 1965 passed / 0 failed** (5 new carry pins incl. equal-flow exclusion + byte-identical steady state; 4 claim-flow counter tests; overlay test); `go test ./...` green (incl. metrics descriptor coverage).
+- Hot-path: two relaxed own-slot fetch_adds per acquire (same contention profile as the existing `worker_grants` slots); rotation adds one saturating add in the existing single-writer seqlock ODD section. No allocation, no new atomics contention, no dyn dispatch.
+- Fairness neutrality where required: equal-flow byte-identical (suite-pinned); default-mode steady state with full claiming byte-identical (test-pinned).
+- Measurement incidents (two foreign no-lock deploys/cells) documented + excluded in `docs/pr/1863-realization-gap/raw/MANIFEST.md`.
+
+Research trail: issue #1863 comments + `research/1863-realization-gap` branch (plan v3.1, 3-reviewer convergence, 20 measurement cells).
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+
+---
+
+## PR #1876 — #1865: operator-visible WireGuard telemetry — counters, drop reasons, Prometheus, show security wireguard [MERGED] (merged 2026-06-11)
+
+Branch: `engineer/1865-wg-telemetry`
+
+Closes #1865.
+
+Implements the converged 3/3 PLAN-READY research plan
+(`docs/research/1865-wg-telemetry/plan.md` on `research/1865-wg-telemetry`,
+copied into `docs/pr/1865-wg-telemetry/plan.md`): **Path B** — per-engine
+counters + wire-additive status rows + Prometheus family + a minimal
+`show security wireguard [detail]` operational command.
+
+## Why
+
+The S2a WG datapath had ZERO release-visible telemetry; every drop
+diagnostic was `debug_log!`-gated. The #1736 interop campaign paid for
+this twice: the v4-initiation `sendto=EINVAL` bug needed strace, and the
+v4-mapped MTU-guard blackhole needed tcpdump on both ends plus the
+KERNEL PEER's `wg show` as oracle. Both are now one-glance counter
+diagnoses.
+
+## What
+
+- **`wg/counters.rs`** — one `WgCounters` per `WgEngine` (relaxed
+  atomics; engine-Arc lifetime: survives #1872 tombstone respawns and
+  unrelated commits; resets on identity rebuild — deliberately NOT
+  inherited so #1873 positional renumbering can never misattribute).
+  Engine-internal increments at the `try_encap`/`try_decap`/`consume_*`
+  boundaries via consolidated reason mappers; call-site counters for
+  both MTU guards (including the frame/wg.rs one whose comment promised
+  this), send errors (incl. the previously `let _ =`-discarded responder
+  msg2 send), TUN errors, cookie/unknown-type, responder-drain drops.
+- **Keepalive classification** (Codex r1 F1 + Claude SMR F1 independent
+  convergence): authenticated zero-length records count as
+  `decap_keepalives` instead of polluting `malformed_inner`; external
+  behavior byte-identical.
+- **Unconfirmed-vs-no-session encap split** (AGY r2 on #1736):
+  counter-only — the returned `EncapError::NoSession` and every caller
+  contract untouched.
+- **Wire**: `ProcessStatus.wg_tunnels` (skip-if-empty — non-WG
+  deployments stay wire-byte-identical; `protocol_wire_v1.json`
+  unchanged by construction), keyed by tunnel NAME; populated +
+  key-absent + empty-invariant pins on BOTH sides
+  (`protocol/tests.rs` + `pkg/dataplane/userspace/wg_status_test.go`
+  share a 1..35 value ladder as a cross-language key pin).
+- **Prometheus**: 12-descriptor `xpf_userspace_wg_*` family
+  ({tunnel} + bounded role/direction/reason/kind labels; zeros emitted —
+  0 is a real signal; `last_handshake_time_seconds` is an absolute
+  epoch gauge, absent until first handshake). Descriptor-coverage
+  canary extended with a populated fixture row + 7 family sentinels.
+- **CLI**: `show security wireguard [detail]` on the
+  show-system-buffers pattern — shared `FormatWireguardStatus`
+  formatter, cmdtree node, local CLI + gRPC topics + remote CLI.
+  STATUS only; key management/multi-tunnel selectors remain #1434 S6.
+
+*(truncated — 72 lines total)*
+
+
+---
+
+## PR #1877 — userspace-dp: UpsertLocal joins the uncapped sync-family install (#1870) [MERGED] (merged 2026-06-11)
+
+Branch: `engineer/1870-local-tunnel`
+
+Closes #1870
+
+## What
+
+`WorkerCommand::UpsertLocal` (the local-tunnel forward + synthesized-reverse prewarm pair) now installs via the **uncapped** sync-family `upsert_synced_with_origin(…, allow_replace_local=true)` instead of the capped `install_with_protocol_with_origin` whose result was discarded.
+
+## Why
+
+The coordinator publishes the pair to the shared maps unconditionally, then fans `UpsertLocal` ×2 to every worker. At `max_sessions` the worker-table copy was silently refused — a shared-map/worker-table divergence with a cap-1 partial (forward-only) variant — while the reactive shared-hit materialization (`materialize_shared_session_hit`) reinstalls the reverse entry **uncapped** on the next reply packet anyway. The cap on the proactive prewarm was futile: it polluted `create_drops` with self-reversing non-drops, voided the prewarm, and blocked at-cap same-key replacement (the old install refused before `remove_entry`, so a stale local entry could shadow the shared scope until expiry).
+
+Below cap the change is behavior-identical: same remove/insert/index/wheel sequence, the delta push was already suppressed for the pair's `SyncImport` origin, and the only `false` exit of the upsert (local-clobber guard) is bypassed by `allow_replace_local=true` — correct because the data is locally generated (the producer only runs under a `ForwardCandidate` tunnel resolution).
+
+## Residue vs #1871 (honest scope)
+
+#1871 already closed the *silence* half: the at-cap drop was counted via the exported `create_drops`. This PR closes the *behavior* half: the capped-proactive/uncapped-reactive incoherence, the cap-1 partial pair, and the counter pollution. No HA consequence either way — `SyncImport` entries are delta-suppressed AND permanently excluded from owner-RG bulk export by origin (pinned by a dedicated test).
+
+## Research
+
+Converged plan (PLAN-READY 3-of-3 after 5 hostile rounds: Codex, AGY, Claude SMR): `docs/research/1870-local-tunnel-pair/plan.md` on branch `research/1870-local-tunnel-pair`. Key plan-phase corrections folded: the v1 "HA bulk-export gap" claim was refuted by all three reviewers; the self-heal is reverse-half-only; `find_forward_wire_match` can never observe these entries (default NAT ⇒ no forward-wire alias).
+
+## Changes
+
+- `userspace-dp/src/afxdp/session_glue/mod.rs` — the `UpsertLocal` arm (+`debug_assert!` origin guard + infallibility assert, both release-inert per #1855).
+- `userspace-dp/src/afxdp/session_glue/tests.rs` — 6 deterministic at-cap pins (pair-at-cap, two-worker fan-out convergence, cap-1 no-partial, below-cap replace, at-cap replace-without-growth, bulk-export exclusion).
+- `userspace-dp/src/session/tests.rs` — table-level `upsert_synced` infallibility-at-cap pin.
+- `userspace-dp/src/session/README.md` + `pkg/api/metrics_descriptors.go` — `create_drops` no longer covers `UpsertLocal`; help-text only, **no wire/series/label change**.
+
+## Validation
+
+- `cargo build --release` — clean
+- `cargo test --release` — **2001 passed, 0 failed** (aggregated over all targets; includes the 7 new pins)
+- debug `cargo test session::` — 79 passed, 0 failed; all new pins also pass by name in debug
+- `go test ./...` — all packages ok
+
+Not deployed/smoked from this branch — parent runs smoke; failover smoke recommended since a session-install path changes (verified HA delta/export surfaces untouched).
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #1878 — #1875: serialize shared-cluster ownership — lock cells, self-locking deploys, holder visibility [MERGED] (merged 2026-06-11)
+
+Branch: `engineer/1875-cluster-ownership`
+
+Closes #1875
+
+## What
+
+Implements Path A of the converged research plan (PLAN-READY 3-of-3 after 4 Codex / 3 AGY / 3 Claude SMR rounds — see the trail on #1875 and `docs/pr/1875-cluster-ownership/plan.md`): the 2026-06-11 incident class where a concurrent agent's deploy loop swapped binaries mid-phase under another agent's validation run on `loss:xpf-userspace-fw{0,1}`.
+
+- **`test/incus/cluster-lock.sh`** (new, sourced): marker validation — `XPF_CLUSTER_LOCK_HELD=<lockpath>:<pid>` honored only for a matching lock path with a live **ancestor** pid (a leaked env marker in a backgrounded daemon can never skip locking) — plus the `set -e`-safe named-holder report.
+- **`test/incus/with-cluster.sh`** (new): the ONLY long-lived lock holder. Blocking `flock -w` windows with a holder report (pid/user/branch/purpose/inode) every 30s; optional `XPF_CLUSTER_LOCK_TIMEOUT`; post-acquire dev:ino revalidation; **fail-closed split-mutex assertion** with a `/proc/<pid>/fd/9` probe (rm-while-held is detected, pid recycling can't false-positive); atomic owner metadata; children run with the lock fd **closed** — killing a cell's tree releases the lock instantly (kills the 3-hour invisible-queue failure mode).
+- **`cluster-setup.sh`**: `deploy/start/stop/restart/create/destroy/init` re-exec through `with-cluster.sh`. The multi-minute build stays OUTSIDE the lock (`XPF_CLUSTER_SKIP_BUILD` skips the rebuild in the locked re-invocation); everything mutating shared state — including the host-parent IPv6-RA sysctl/addr/route flushes — runs inside. The `sg incus-admin` re-exec now forwards all `BPFRX_*`/`XPF_*` scalars so a cell-launched deploy can't deadlock on its own ancestor's lock.
+- **`apply-cos-config.sh`**: self-locks the same way.
+- **`wg-interop.sh` `inc()`**: skips its per-command flock inside a valid cell (resolves the self-lock asymmetry where outer-wrapping the script deadlocked); standalone behavior byte-identical.
+- **Docs**: `engineering-style.md` who-locks-what table + mutex-soundness rules (never raw-outer-flock a self-locking script; never `rm` the lock file — flock binds the inode; never kill another agent's holder; never hand-roll `incus file push` deploys); CLAUDE.md agent-facing summary; runbook + probe-script headers updated off the deprecated raw outer-flock pattern.
+
+## Validation
+
+**Dry-run contention matrix** — `test/incus/with-cluster-selftest.sh` (committed; private lock path, no cluster access) — `ALL 8 CASES PASS`:
+1. waiter blocks and reports holder pid+purpose; sub-30s `XPF_CLUSTER_LOCK_TIMEOUT` fires on time (exit 75)
+2. `kill -9` of a cell's whole tree releases the lock immediately (no orphan holder)
+3. nested cell runs lock-free; inner exit preserves outer owner metadata (acquired-only trap rule)
+4. forged markers rejected: live non-ancestor pid, dead pid, wrong lock path, garbage — all degrade to *waiting*, never skipping
+5. stale/corrupt/empty owner files tolerated under `set -euo pipefail`
+6. cell exit status propagates; owner file cleaned on failure
+7. rm-while-held → fail-closed `SPLIT MUTEX` abort (exit 70) naming both dev:inodes; reclaim works after the holder exits
+8. marker survives an sg-shaped rebuilt-command re-exec boundary
+
+The matrix caught one real bug during bring-up (fixed): the fixed 30s flock window swallowed sub-30s timeout values.
+
+**Live guarded validation on the loss userspace cluster** (the plan's §9.4):
+- `cluster-setup.sh deploy all` through the NEW self-locking path: `lock acquired (pid 3723300, purpose: cluster-setup deploy all (engineer/1875-cluster-ownership))` → rolling deploy complete, verify-dataplane preflight intact, RC=0.
+- Build identity live: both nodes report `Software version: ...-g280e73a6f` == this branch HEAD.
+- `apply-cos-config.sh` through its new self-lock: `lock acquired (... purpose: apply-cos-config loss:xpf-userspace-fw0)` → atomic commit + verification OK (deploy wipes CoS — re-applied per the standing rule).
+- iperf3 sanity through lock cells: port 5203 (3.0g-exact shaper) → 2.86 Gbit/s (correct shaped behavior); port 5211 (uncapped) → 20.7 Gbit/s.
+
+**Gates**: `bash -n` clean on all 7 touched/new scripts; `shellcheck -x` clean on the new scripts (the 7 pre-existing info-level findings in cluster-setup.sh are in untouched regions); no Go/Rust changes (binaries are master-equivalent — `go build` not applicable).
+
+@copilot review
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #1882 — #1873: stable content-derived tunnel-endpoint ids + tunnel plaintext gates [MERGED] (merged 2026-06-12)
+
+Branch: `engineer/1873-tunnel-ids`
+
+## Summary
+
+Tunnel-endpoint ids were positional (`nextID` 1..N over sorted names): adding or removing ONE tunnel renumbered every endpoint sorting after it — defeating WG engine reuse (live transport sessions reset on unrelated commits), churning wg_control threads, letting LIVE sessions re-resolve their stored id into the WRONG tunnel (cross-tunnel encap), and letting HA peers disagree on ids across config-sync timing. This PR implements the converged plan v4 (PLAN-READY 3-of-3 at round 4):
+
+- **R-A**: `config.StableTunnelEndpointID(name)` — frozen FNV-1a fold of the unit-qualified tunnel interface name into [1,0xFFFF]. Pure function of config content: no renumbering, no runtime-state input, HA nodes agree by construction. No wire schema change anywhere (ids are values; cluster `SessionValue.FibGen` LE u16 untouched).
+- **R-B**: equal folds are a deterministic COMMIT ERROR, checked over the UNION of tunnel names across all `groups` blocks (both nodes accept/reject identically); lenient load/peer-sync paths warn; the snapshot builder drops the later-sorting collider as belt-and-braces.
+- **R-C**: blanket invariant at the slow-path chokepoint — a tunnel-marked inner packet is NEVER enqueued to the kernel slow-path TUN (drop + new `tunnel_encap_unresolved_drops` counter). Closes a verified PRE-EXISTING plaintext-leak class (build-failure fallback, NoRoute/MissingNeighbor reinjection, admin-down + VRF divergence). The `local_tunnel_deliveries` branch stays open.
+- **R-D**: apply-time purge (both reconcile + refresh paths) of sessions whose stored id vanished or changed LOGICAL owner name, via the existing `delete_synced_session` machinery + Close deltas on the event stream — closes temporal hash reuse and makes the one-time positional→hash upgrade boundary clean.
+- **R-E**: tunnel-marked decisions excluded from `pending_neigh` (probe still fires; frame drops at the R-C gate) + defensive drop in `retry_pending_neigh` — closes a second verified plaintext door (in-place MAC rewrite TX of unencapsulated tunnel frames).
+
+Follow-up filed: #1881 (GRE local-origin threads frozen across `refresh_runtime_snapshot` — pre-existing lifecycle defect, verified during research, out of scope here).
+
+## Plan + adversarial review
+
+Plan doc: docs/pr/1873-tunnel-ids/plan.md (4 hostile plan-review rounds on `research/1873-tunnel-ids`)
+
+- Round 4 convergence: Codex PLAN-READY (task-mqa5sc25-bz2mkx), AGY PLAN-READY (adversarial-review-mqa5s52d-b8j1xm), Claude SMR PLAN-READY
+- Reviewer ledger: docs/pr/1873-tunnel-ids/reviewer-ids.md
+
+## Test plan
+
+- [x] `cargo build --release` clean (rc 0)
+- [x] FULL `cargo test --release`: **2021 passed / 0 failed** (awk-aggregated over all "test result" lines)
+- [x] debug `cargo test wg::`: 131/0
+- [x] `go test ./...`: all packages ok (rc 0)
+- [x] Wire fixture: single additive line (`tunnel_encap_unresolved_drops: 0`), regenerated via `XPF_PROTOCOL_WIRE_REGEN=1`
+- [x] New pins: hash freeze (incl. verified colliding pair `wg1408.0`/`wg78.0` → 824); add/remove-middle id stability; eligibility-flap isolation; collision commit-rejection + groups-union symmetry + lenient warning + builder drop; R-C gate through build-failure/NoRoute/MissingNeighbor doors firing BEFORE generic drop accounting; LocalDelivery branch stays open; R-E end-to-end (tunnel-marked MissingNeighbor never buffered, non-tunnel still buffers); R-D purge-set semantics (vanished purged / owner-change purged / cosmetic linux_name rename NOT purged); **the #1873 contract pin: removing one tunnel preserves the other tunnel's `WgEngine` Arc (`Arc::ptr_eq`)**
+
+### Live validation (loss userspace cluster, with-cluster.sh lock protocol)
+
+Deployed this branch to both nodes; wg-interop harness (container peer) + a manual GRE stanza:
+
+| Step | Result |
+|---|---|
+| Baseline | `wg0` endpoint id **16091** (= the hash-freeze pin for "wg0.0"), session confirmed, handshakes 2 initiator / 1 responder |
+| ADD `gr-0/0/0` (sorts BEFORE wg0 — the positional renumber case) | wg0 id **16091 unchanged**, session confirmed, handshake counters UNCHANGED (2/1, initiations 4), transfer counters kept accumulating (engine instance preserved) |
+| REMOVE `gr-0/0/0` (headline case) | wg0 id **16091 unchanged**, session confirmed, handshakes still 2/1, transfer counters continuous — **no rebuild, no re-handshake, no TAI64N reseed** |
+| RE-ADD `gr-0/0/0` | wg0 still undisturbed |
+| Traffic | continuous inner ping through the WG tunnel across ALL THREE commits: **600/600, 0% packet loss** |
+| WG control thread churn | journal shows ZERO `stopped/spawning WG control thread` lines at the add/remove commits (only the original configure spawn) |
+| Cluster health | RG0/1/2 node0 primary / node1 secondary, failover count 0; fw1 journal clean |
+| Cleanup | gr stanza removed, wg-interop teardown PASS (both nodes clean); peer container `loss:xpf-wg-peer` KEPT for follow-up validation |
+
+Not exercised live: `tunnel_encap_unresolved_drops` under transit tunnel traffic (no transit-permitting zone/policy in the harness topology) — covered by the unit pins; the counter is on the status wire for operators.
+
+Closes #1873
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+
+
+*(truncated — 80 lines total)*
+
+
+---
+
+## PR #1883 — #1880: FRR reload via frr-reload.py + truly-unclean failover harness reboot [MERGED] (merged 2026-06-12)
+
+Branch: `engineer/1880-boot-budget`
+
+Closes #1880
+
+## Root cause (measured, not the issue's candidates)
+
+The failover harness's 60s comeback budget was being consumed by a poisoned `frr.service`: on FRR 10.6, the unit's ExecReload (`frrinit.sh reload`) unconditionally restarts watchfrr — the Type=forking unit's MainPID — so **every `systemctl reload frr` cancels its own job, parks frr.service in `stop-sigterm` for 2 minutes, then systemd SIGKILLs every FRR daemon** (990 journal events on fw0 since 2026-04-20). Both the deploy's `xpfd cleanup` (`frr.Clear()`) and EVERY config commit (`ApplyFull → reload()`) triggered it. A harness reboot landing inside the window queues the entire guest shutdown behind the timer.
+
+Measured on the loss userspace cluster (research branch `research/1880-boot-budget`, plan converged PLAN-READY 3/3 at r5):
+
+| Scenario | Harness iterations | Wall |
+|---|---|---|
+| Reboot only (≙ the always-passing rerun) | 17 | 22.2s |
+| First reboot post-deploy, ~92s into window | 40 | 51.3s |
+| Reboot ~45s into window | **60 — exact budget boundary** | 73.6s |
+| Worst case (window start) | ~120 | ~147s |
+
+Collateral: since the systemctl branch has been 100%-failing, every commit silently applied via the ADDITIVE `vtysh -f` fallback — **stale-config removal on commit was broken** until FRR's delayed murder+restart accidentally converged it.
+
+## Path A — pkg/frr: direct bounded `frr-reload.py --reload`, never systemctl
+
+- `frrExecutor.FrrReloadPy(ctx, conf)` replaces `SystemctlReload`; the real executor runs the script in its own process group with `cmd.Cancel` = pgroup SIGKILL + `WaitDelay` (no child vtysh writer can survive a timeout and race the fallback).
+- Primary and `vtysh -f` fallback each get their OWN 15s context; fallback success returns `ErrFRRReloadDegraded` wrapping the primary cause.
+- Single-flight degraded-retry loop (15s/30s/60s → 5min) under `reloadMu` (one critical section: managed-section write + confGen bump + reload); applies pre-cancel the episode before acquiring; confGen guard refuses stale-success clears; any full convergence cancels the episode; `Manager.Stop()` wired into daemon shutdown; `DisableDegradedRetry()` for the one-shot `xpfd cleanup`.
+- `xpf_frr_reload_degraded` (0/1, no labels) Prometheus gauge; frr-pythontools-missing classified explicitly (warn-once, slow cadence) and added to cluster provisioning.
+
+## Path B — harness: truly unclean reboot + wall-clock budget
+
+- Phase 3 crashes fw0 with sysrq-b (the in-tree proven primitive, bounded by `timeout -k`… see below) instead of a graceful `reboot` that contradicted the test's own "unclean — no priority-0 burst" claim and queued behind wedged stop jobs.
+- Phase 4 budget is wall-clock now (the old loop counted iterations as seconds — ~74s real for "60s"); REBOOT_WAIT=60 wall seconds = 2.7× the measured 22.2s clean comeback.
+- Live lesson baked in: the sysrq exec is bounded with `timeout` because the guest reset kills the incus-agent serving the exec — the first live run hung 47 minutes on an exec that could never return.
+
+## Validation
+
+- `go test -race ./pkg/frr` (new: primary/fallback/sentinel paths, retry convergence, success-cancels-episode, Stop() leak gate, stale-success/confGen invariant, pythools slow-start, one-shot, ApplyFull propagation); full `go test ./...` 36/36 ok; `bash -n` harness scripts; gofmt/vet deltas clean vs base.
+- Live gate 2 (deploy + commit no longer poison): post-deploy and post-CoS-commit `frr.service` = `active/running` on both nodes (previously deterministically `deactivating/stop-sigterm` at both points), and the new daemon logs `FRR reloaded via frr-reload.py (full diff)`.
+- Two consecutive first-run-after-deploy `test-failover` passes: **in progress, evidence comment to follow** (cluster lock currently held by another agent's cell).
+
+@copilot review
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #1886 — #1319 PR3: interfaces CIDR/IP, firewall forwarding-class cross-refs, system/services typed leaves [MERGED] (merged 2026-06-12)
+
+Branch: `engineer/1319-pr3-rollout`
+
+Closes #1319 — this is the final PR of the converged per-subsystem rollout: all three remaining sections (interfaces, firewall, system/services) land here, completing the plan's PR 1 (infra+walker, #1682) → PR 2 (chassis, #1845) → PR 3 sequence. **The program is complete**; the deliberately-untyped slots below are documented deferrals outside the converged plan's section list, not open rollout work.
+
+## What lands (40 newly typed slots: 36 scalar, 2 typed key slots, 2 tree-based cross-refs)
+
+**(a) interfaces — CIDR/IP value types + the typed-KEY-slot walker feature (16 slots).** New `ValueIPAddress`/`ValueCIDR` types whose validators reuse the exact `net.ParseIP`/`net.ParseCIDR` + `ip.To4()` semantics of the runtime consumers. `family inet/inet6 address` carries its value in a named-instance IDENTITY token — the PR-2 walker contract consumed those without validation — so containers gain fields-only key-slot metadata (`keyValidator` et al.); the walker validates both the packed-Keys and nested instance-name shapes (both compiled by `namedInstances`), and `?` completion surfaces key examples. The prefix is REQUIRED because every runtime consumer ParseCIDRs and silently skips failures (a bare or garbage address committed fine and then didn't exist). Also typed: mtu ×3 (min-1; 0 is the unset sentinel), vlan-id/inner-vlan-id (1..4094, 12-bit VID), vrrp priority (1..255 wire byte), advertise-interval (1..40 s — 12-bit VRRPv3 centisecond field, documented Junos divergence), virtual-address (IPv4 CIDR — netlink.ParseAddr requires the prefix; bare Junos-style VIPs advertised but never installed), tunnel source/destination/ttl/key, wireguard listen-port/persistent-keepalive (the exact bounds the compiler enforces silently).
+
+**(b) firewall — forwarding-class cross-refs, TREE-based (2 slots).** Both production `SchemaValidate` call sites pass **cfg=nil** (validation runs before compile — `pkg/configstore/store.go` `schemaValidateExpandedTree`), so the validator resolves references against the candidate tree itself: `collectSchemaRefs` mirrors `compileClassOfService`'s queue-leaf parse and a new `schemaNode.treeValidator` checks `then forwarding-class <name>` against that set. Atomicity-correct by construction (same-commit definition + reference validate together); refs union group bodies so node-variable configs never false-reject; `best-effort` always resolvable (the dataplane synthesizes that queue); the other Junos default classes are deliberately NOT implicit — the dataplane resolves the name with a map lookup against configured classes and silently defaults the queue on a miss (`queue_by_forwarding_class`, cos_classify.rs), which is exactly the silent no-op closed. The `SchemaValidate` doc comment now states the cfg-nil production semantics; cfg-param removal is noted as a follow-up.
+
+**(c) system/services (22 slots).** name-server (IP, either family), ssh root-login (allow|deny|deny-password — the old `<permit|deny>` placeholder named values the runtime never accepted), the dataplane knobs (workers/ring-entries/netdev-budget/coalescence usecs min-1; poll-mode/rss-indirection/claim-host-tunables/adaptive enums closing only-the-literal-string silent gates; cpu-governor deliberately untyped — pass-through by design), the rpm probe knobs (aligned with the compiler's loud >0 checks; destination-port additionally capped at the 16-bit port encoding), ip-monitoring hold-down (0..MaxDurationSeconds — past the Duration-overflow the damping silently inverted) and preferred-metric (min-0, pure in-memory tie-break). Required walker extension: multi value-tail leaves are compiled from BOTH packed Keys and the hierarchical block list (`name-server { 1.1.1.1; }` — the deployed shape; `virtual-address { a; b; }` per #1813); `validateMultiValueLeaf` validates each block child's FIRST token, exactly what the compilers read.
+
+## Boot-safety doctrine (unchanged, test-pinned)
+Strict at commit-check only; Load/SyncApply warn and compile verbatim. New `TestLoad_ToleratesStored{BareInterfaceAddress,UnknownPollMode,DanglingForwardingClass}` + `TestSyncApply_ToleratesDanglingForwardingClass` pin it; each proves the next strict commit rejects loudly.
+
+## Validation
+- Per-leaf accept/boundary/one-past/garbage matrices in the flat-set shape (16 interfaces + 22 system/services cases), hierarchical deployed-config-shape acceptance for every section, compile-as-written parity checks.
+- Production-path cross-ref proofs in pkg/configstore (flat-set via ParseSetCommand+SetPath): Store CommitCheck REJECTS a dangling reference; same-commit class+reference PASSES CommitCheck and Commit; a `"${node}"` group-defined class passes the strict gate in cluster mode; the dangling reference warn-boots through Load and SyncApply.
+- Deployed config scan: all addresses in docs/ha-cluster-userspace.conf + test/incus configs carry prefixes; name-server block shape, poll-mode interrupt, rpm/ip-monitoring values all validate.
+- Gates: `go test ./...` T=0 (36 packages), `go build ./...` B=0. No Rust changes.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #1887 — #1881: reconcile GRE local-origin threads; track live forwarding state [MERGED] (merged 2026-06-12)
+
+Branch: `engineer/1881-gre-frozen`
+
+Closes #1881
+
+## What
+
+GRE local-origin threads captured a frozen `ForwardingState` clone at spawn (`coordinator/mod.rs` `spawn_local_tunnel_sources`, bring-up only) and were never reconciled by `refresh_runtime_snapshot` — tunnel interfaces are excluded from the binding plan, so every tunnel-only commit took the same-plan path and the threads went permanently stale: endpoint edits ignored until restart (F1), runtime-added tunnels got no thread (F3), removed tunnels kept ghost threads (F4), config/route/CoS changes never reached the path (F2/F5), and a dead thread never respawned (F6).
+
+Implements plan v3 (3-way PLAN-READY convergence: Codex task-mqaef55e-uplldr, AGY adversarial-review-mqaefesm-x8e5e8, Claude SMR r2 — `docs/research/1881-gre-frozen-state/plan.md`, rides along on this branch):
+
+- **D.1** — `local_tunnel_source_loop` takes the worker-visible `Arc<ArcSwap<ForwardingState>>` (`ha.forwarding`); one `load_arc_if_changed` (#1188 pattern) + one HA-state load per outer iteration, both passed through the whole packet build (single-load coherence; AGY r1 double-load TOCTOU fixed; the loop is syscall-paced so an iteration IS the batch).
+- **D.1b rotation gate** — `endpoint_attachment_valid` recomputed only on Arc rotation; thread PARKS (drops without building) when the loaded state no longer describes its TUN attachment (removed / mode-flipped same-name id / reattached). Closes the store-before-prune window the #1873 owner check structurally cannot see (Codex plan r1 MAJOR 1).
+- **D.2 three-pass reconcile** (#1866 WG shape) — `tunnel_sources` becomes `BTreeMap<u16, LocalTunnelSourceEntry>`: finished-sweep tombstone (backoff + attachment retained) / attachment-stale prune with **unpublish-before-join** + a **stop check inside the delivery drain** (bounds the join under a busy producer — Codex plan r1 MAJOR 2) / spawn with backoff **gated on live worker handles** (the defer_workers same-plan window reaches refresh with zero workers — plan SMR-1). Delivery channels are per-spawn-attempt; publication is live-handles-only.
+- **D.3 call sites** — bring-up (degenerates to pure spawn), armed same-plan refresh, disarmed stop-all + empty delivery map, defer-workers narrow prune, periodic tombstone-only liveness (snapshot-coherent on mode+attachment, ≤1 spawn/invocation, republishes the delivery map).
+- **Live-finding hardening** — TUN delivery **write** EINVAL is per-packet (drop + exception), no longer thread-fatal; reads keep the original predicate. On master, ONE mis-sliced delivery (#1885) killed gr-0-0-0's local-origin thread forever; with the new liveness it was a 15s respawn-churn loop; with this split the thread survives.
+
+Content changes (destination/source/key, routes, CoS) never restart a thread — only attachment drift does.
+
+## Follow-ups filed from live validation
+
+- #1884 — Go recreates GRE tunnel anchors on every applyConfig (flaps gr-X; WG got reuse-in-place in #1432, GRE needs the same).
+- #1885 — local-delivery TUN writes mis-sliced by 4 bytes on VLAN-tagged ingress (every GRE-to-self packet hits TUN write EINVAL; RX leg broken on this underlay independent of this PR).
+
+## Tests
+
+20 new pins (all fail or are vacuous on master): `gre1881_*` lifecycle suite (add/remove/dest-edit-no-respawn/attachment-restart/mode-flip/disarmed/defer-prune/stop-inner/tombstone-respawn-coherence + worker gate), `endpoint_attachment_valid_*` gate truth table, drain stop-latency under busy producer + EINVAL-write survival, staleness-pin companion in frame/tests.
+
+Gates: `cargo build --release` clean (136 warnings vs 137 base); full `cargo test --release` 1972+46 passed / 0 real failures (the two documented ledger flakes `reconcile_peers_snapshot_is_atomic_under_concurrent_load` + `concurrent_recovery_processes_each_command_exactly_once` standalone-proven 5/5 each); `go test ./...` 36 ok / 0 fail.
+
+## Live validation (loss userspace cluster, lock cells)
+
+- **F1 discriminator (v5)**: ping bursts over gr-0/0/0 to the real sfmix peer measured via the delivery-exception ring: **16 fresh replies (dst=::7) → 0 (dst=our non-GRE host) → 15 (rollback)** — destination edits reach the live thread immediately, no daemon restart. (On master the thread is dead in this env — see #1885 — and pre-#1873-era frozen state would keep encapping to the old peer.)
+- **F3/F4 (v4)**: runtime ADD → `spawning GRE local-origin thread … tun=gr-0-0-1` on commit; runtime REMOVE → `stopped … reason=removed` — no restarts.
+- **Self-heal + EINVAL hardening (v4)**: 75s and 45s quiet windows with **zero** lifecycle churn while peer keepalives hit the #1885 EINVAL path (was: thread death every 15s); anchor-recreate commits show the designed `exited→tombstoned` + `attachment_changed`→respawn convergence, every line correlated with a #1884 `removed existing tunnel link` event.
+- **Transit unaffected**: iperf3 through the dataplane 23.1 Gb/s v4 / 22.7 Gb/s v6.
+
+Validation transcripts: /tmp/xpf-1881/live-cell-v{3,4,5}.log (summarized above); strace + exceptions-ring evidence in #1885.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #1897 — #1890: split coordinator/mod.rs at the 2,000 prod-LOC threshold (tunnel_supervision / snapshot_refresh / cos_leases) [MERGED] (merged 2026-06-12)
+
+Branch: `refactor/1890-coordinator-split`
+
+## Summary
+
+`coordinator/mod.rs` crossed the ~2,000 prod-LOC modularity threshold in `docs/engineering-style.md` (2,544 raw lines / 1,725 audit prod-LOC after #1887 merged). This PR is the **pure code motion** split from the corrected map on the issue, with seams rederived against current master (the issue's line numbers predated #1887's rework of `refresh_runtime_snapshot_inner` and tunnel-thread supervision). **Pure motion, zero behavior delta** — every moved body is byte-identical (verified with `git diff --color-moved=dimmed-zebra`; the only non-moved lines are module headers, `impl super::Coordinator` wrappers, `mod`/`use` declarations, the visibility tokens listed below, and two signature re-wraps forced past 100 columns by the `pub(super)` token).
+
+Honest framing: the driver is the LOC threshold breach (modularity/reviewability), not performance. The audit's L1-i cache-pollution rationale is secondary and unmeasured; no perf claim is made.
+
+## Aspect map (one commit per aspect, each commit builds)
+
+| Commit | New file | Moved content | LOC |
+|---|---|---|---|
+| 67abf5fa5 | `tunnel_supervision.rs` | GRE local-origin + WG control-thread lifecycle (three-pass reconcile, tombstone backoff, liveness sweeps, defer-branch snapshot prunes) + `WG_SPAWN_BACKOFF_NS` | 831 |
+| 3733dc2c6 | `snapshot_refresh.rs` | `refresh_runtime_snapshot{,_disarmed,_inner}` + `refresh_fabric_links` | 233 |
+| 8dea62855 | `cos_leases.rs` | `refresh_cos_owner_worker_map_*` / `refresh_cos_runtime_maps` + CoS owner-map/lease/backlog/floor builders, `Arc::ptr_eq` matchers, #710 status aggregation | 788 |
+| b9f04e4dd | — | regenerate `docs/refactoring-audit-current.txt` (also folds drift from merges since ecdc16f2e) | — |
+
+`mod.rs`: **2,544 → 779 lines** (facade: struct + ctor/stop/stop_inner/accessors, session replay, neighbor warm pass, policy counters, the shared purge/log free helpers, `build_mirror_target_map`). Deliberately NOT moved: the five top-of-file free helpers (`tunnel_remap_purge_ids*`, `filter_replayed_synced_sessions`, `log_wg_endpoint_set_transition`, `wg_endpoint_set_summary`) — `reconcile/snapshot.rs`, `forwarding_build/tests.rs`, and `afxdp/tests.rs` reference them at coordinator scope; `build_mirror_target_map` — port-mirroring, not CoS, it merely sat inside the moved byte range. `refresh_runtime_snapshot_inner` stays one function: its internal phases are side-effect-ordered (preflight → key rotation → purge-before-swap → swap → stores → reconcile), and decomposing it is behavior-adjacent risk out of scope for a motion PR (no natural pure seam worth a follow-up issue).
+
+## Visibility deltas (complete list, all `pub(super)` = same coordinator-subtree audience)
+
+- `reconcile_local_tunnel_sources`, `spawn_wg_control_threads`: private → `pub(super)` (callers `reconcile/bringup.rs` + the armed snapshot-refresh leg became sibling files).
+- `refresh_cos_owner_worker_map_from_identities` / `_from_binding_statuses` / `refresh_cos_runtime_maps`: private → `pub(super)` (callers `snapshot_refresh.rs`, `refresh_bindings.rs`, `reconcile/bringup.rs`, `tests.rs`).
+- 11 CoS free builders: private → `pub(super)` (consumers `reconcile/bringup.rs` via `super::super::` paths, `status.rs`/`tests.rs` via `use super::*`); `mod.rs` re-imports them so every pre-split reference resolves **unchanged** (test-only consumers behind `#[cfg(test)]` to keep the release warning set byte-identical).
+- Stay private: all sweep/stop/spawn/tombstone helpers, the 5 `shared_cos_*_match` predicates, `build_cos_owner_live_by_queue`, `build_shared_cos_exact_backlogs_reusing_existing`, `refresh_runtime_snapshot_inner`.
+- `pub` / `pub(crate)` / wire surface: unchanged. No consumer file (server/, reconcile/, status.rs, refresh_bindings.rs, tests) touched.
+
+## Test plan
+
+- [x] `cargo build --release` at **every** commit boundary; warning set byte-identical to the origin/master baseline (diff of sorted warning lines) at each
+- [x] `cargo test --release` full: **2045 passed / 0 failed** (aggregated over all `test result` lines). One run flaked `afxdp::worker_queue::tests::concurrent_recovery_processes_each_command_exactly_once` (file untouched by this PR) — proven **5/5 standalone** + full suite green on rerun
+- [x] debug-profile `cargo test coordinator`: 79 passed / 0 failed
+- [x] `go test ./...`: clean — wire protocol and Go fixtures untouched, as a motion PR requires
+- [x] `make audit-check` green; `coordinator/mod.rs` leaves the audit listing
+- [ ] Smoke (Pass A CoS-disabled + Pass B per-class 5201-5206, v4+v6, push+reverse) — runs via the serialized smoke-runner before merge
+
+Closes #1890
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #1898 — #1892: config-doc audit — verified help for all 493 empty schema nodes, retired-knob commit warnings, remote-CLI warning surfacing [MERGED] (merged 2026-06-12)
+
+Branch: `engineer/config-doc-audit`
+
+## Config-documentation audit fix (#1892)
+
+Closes #1892
+
+Fixes every gap in the #1892 inventory: all 493 unique empty-help schema nodes (987 paths incl. the `groups <*>` pointer-mirror) now carry verified help text, the 11 dead DPDK-era `system dataplane` knobs warn at commit instead of being silently swallowed, and the remote CLI now actually prints daemon commit warnings (found during live verification — it discarded them on all four commit paths).
+
+### Commits (logical increments)
+1. **Retired-knob handling** — `compileUserspaceDataplane` records `cores`/`memory`/`socket-mem`/`rx-mode`/`ports` into `UserspaceConfig.RetiredKnobsSeen` (`json:"-"`); `userspaceRetiredKnobWarnings` emits deduped, sorted commit warnings on strict + lenient paths; schema descs say "(retired, ignored)"; new `compiler_retired_dataplane_knobs_test.go`.
+2. **Docs** — `docs/config-schema.md` gains "Help-text discipline" + "Retired knobs" sections (keep-parsing + warn + honest desc pattern vs the hard-reject sentinels).
+3-7. **Per-section help text** (one commit per section): routing-instances (73), class-of-service (49), chassis/services/system (57), firewall/forwarding-options/event-options (131), security (174). Every behavior-bearing desc was written from the verified consumer (anchors in the commit messages); write-only leaves found during verification are described factually ("accepted for Junos compatibility; no runtime effect") and recorded on #1892, never given invented behavior.
+8. **No-empty-desc pin** — `TestSchemaAllNodesHaveDesc` regression test; `groups`/`<group-name>` documented. Schema is at ZERO empty descs (was 987 paths).
+9. **Remote CLI warnings** — `commit` / `commit comment` / `commit confirmed` / `commit check` in `cmd/cli` now print `resp.Warnings` (same `warning:` format as the local CLI's `printConfigWarnings`).
+
+### Write-only knobs recorded on #1892 (described factually, not wired)
+- chassis cluster: `control-link-recovery`, `nat-state-synchronization` (compiled, zero runtime readers), `control-ports fpc/port` (never compiled)
+- `version-ipfix … export-extension` (compiled + warned, never applied to IPFIX records)
+- `security policy-stats system-wide`, `natv6v4 no-v6-frag-header`, global `address-set description`, dynamic-address `hold-interval` (display-only), `flow power-mode-disable` (display-only)
+- firewall `policer logical-interface-policer`, `flexible-match-range match-start` (layer-3 only), `forwarding-options family inet6 mode` (display-only)
+- routing-instances: instance ISIS `interface level` compiled but not rendered; instance BGP block render-dead (no `local-as` leaf ⇒ `router bgp` gate never passes)
+
+### Gates
+- `go build ./...` → 0; `go test ./...` → 0 (36 packages, full suite, unmasked)
+- `gofmt -l` clean on every touched package
+
+### Live verification (loss userspace cluster, lock protocol, CoS re-applied after each deploy)
+`set system dataplane ?` (was: blank lines for ports/rx-mode, misleading cores/memory):
+```
+Possible completions:
+  binary                Userspace dataplane helper binary path
+  cores                 Legacy DPDK core count (retired, ignored)
+  memory                Legacy DPDK memory allocation (retired, ignored)
+  ports                 Legacy DPDK per-port mapping (retired, ignored)
+  rx-mode               Legacy DPDK adaptive RX mode (retired, ignored)
+  socket-mem            Legacy DPDK socket memory (retired, ignored)
+  ...
+```
+`set system dataplane rx-mode ?` (was: three blank entries):
+```
+  idle-threshold       Legacy DPDK RX idle threshold (retired, ignored)
+  resume-threshold     Legacy DPDK RX resume threshold (retired, ignored)
+  sleep-timeout        Legacy DPDK RX sleep timeout (retired, ignored)
+```
+`set chassis cluster ?` (was: all blank): cluster-id "(0..255; one byte of the RETH virtual MAC)", nat-state-synchronization "(accepted for Junos compatibility; no runtime effect)", hitless-restart "Keep dataplane forwarding active during daemon shutdown (HA default is fail-closed)", ...
+
+`commit check` with `set system dataplane socket-mem 512` staged (remote CLI):
+```
+warning: system dataplane socket-mem: retired DPDK-era knob (#1525), accepted for config compatibility but ignored
+configuration check succeeds
+```
+
+
+*(truncated — 52 lines total)*
+
+
+---
+
+## PR #1899 — #1895: probe-pin install failures hold RPM state (ErrProbeSetup) instead of false-PASSing unpinned [MERGED] (merged 2026-06-12)
+
+Branch: `engineer/1895-probe-pin`
+
+## Summary
+
+`probePinManager.Apply` logged-and-continued on every per-pin programming failure and returned nil unconditionally; the daemon started RPM regardless, and RPM applied `m.marks[key]` via SO_MARK with no knowledge of whether the kernel rule/route behind that mark installed. Every failure mode (invalid addresses, missing egress link, RuleAdd error, RouteAdd-after-RuleAdd error) collapsed to a silently-unpinned probe: SO_MARK with no matching fwmark rule falls through to the main table, the probe measures the **default** path, and a dead pinned uplink reports healthy — **false PASS → ip-monitoring failover suppression** (codex-review-008 finding 3, triage-verified).
+
+Fix (plan: `docs/pr/1895-probe-pin/plan.md`, adjudicated with the code):
+
+- **pkg/routing** — `Apply` returns per-test install failures (keyed by `TestKey`); the fwmark rule is **rolled back** when the pinned route fails after `RuleAdd` succeeded, so a pin is never partially installed.
+- **pkg/daemon** — `reconcileRPM` threads the failed map into `rpm.Manager` (additive `SetPinInstallResults`, mirrors `SetRethMap`) before `Apply`; while any pin is failed, hash-gated reconciles retry ONLY the pin install (no probe restart — marks are deterministic under an unchanged hash), so boot-ordering/RETH-churn failures recover on any subsequent commit or RG transition. `probePinApply` is the daemon test seam.
+- **pkg/rpm** — `executeProbe` gates first: a next-hop test whose pin failed to install — or that has no pin slot at all (band-exhaustion belt-and-braces) — returns `ErrProbeSetup` **before any socket is opened**; the existing #1843 hold-state branch holds the test (no counters, no status change, no events, no Transition, rate-limited Warn).
+- **pkg/api** — new `xpf_rpm_probe_pin_install_failures` gauge (optional-Fn pattern; nonzero = those uplinks are NOT being health-checked).
+
+Residual (documented): no timer-based pin retry — a failed pin with zero subsequent reconcile triggers stays held (the safe direction; pre-#1895 was false PASS) and is visible via gauge + Warn + stalled `show services rpm` counters.
+
+## Test plan
+
+- [x] `go build ./...` rc=0
+- [x] `go test ./...` rc=0 (36 packages ok, unmasked)
+- [x] `go test -race ./pkg/rpm ./pkg/routing ./pkg/daemon` rc=0
+- [x] New unit coverage: RuleAdd fail, RouteAdd-after-RuleAdd fail (**rollback asserted**), missing link, invalid addresses, mixed two-pin success/failure, re-apply recovery (pkg/routing); failed pin → ErrProbeSetup with **zero sockets opened**, hold-state through `runSingleTest`, recovery resumes probing with pass transition, unpinned tests unaffected, failure counter (pkg/rpm); threading + retry-under-unchanged-hash + recovery + retry-stop (pkg/daemon).
+- [x] Live validation on loss userspace cluster (lock protocol): pinned test on a missing egress unit → setup-held state (journal + `show services rpm` + gauge), then interface appears + unrelated commit → hash-gated retry recovers, probing resumes. Evidence to follow as a PR comment.
+
+Closes #1895
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+
+---
+
+## PR #1900 — #1893/#1894: fail-closed configstore constructor + pkg/fsatomic durable writers [MERGED] (merged 2026-06-12)
+
+Branch: `engineer/1893-configstore-durability`
+
+## Summary
+
+Configstore durability lane from Codex audit `codex-review-008`:
+
+- **#1893** — `configstore.New()` logged "falling back to file-only" on
+  `NewDB` failure, stored a nil `*DB`, and the daemon nil-deref panicked at
+  the first `Load()`/`writeActive()`. There is no file-only backend. The
+  constructor now **fails closed** with a precise error
+  (`config db <dir> unusable: ... refusing to boot without config
+  persistence`); `daemon.New` returns the error and `cmd/xpfd` exits 1.
+- **#1894** — no fsync anywhere on durable state. New package
+  **`pkg/fsatomic`** provides `WriteFileAtomic` (temp+fchmod+close-check+
+  rename, namespace atomicity only, NO fsync) and `WriteFileDurable`
+  (adds temp-fd fsync before close + symlink-resolved parent-dir fsync
+  after rename) plus `SyncDir`, with `WithPreserveExisting` /
+  `WithResolveSymlinks` options lifted mechanically from FRR's
+  reviewed-in-#1883 `atomicWriteFile`.
+
+## Migration table (persistence class per site)
+
+| Site | Class | Writer |
+|---|---|---|
+| `configstore/db.go writeTree` (active.json) | DurableState | `WriteFileDurable` 0644 — backs the #1799 persist-before-promote contract |
+| `configstore/crypto.go readOrCreateMasterKey` | DurableState | `WriteFileDurable` 0600 — loss = undecryptable config |
+| `configstore/store.go saveRollbackFiles` | slot 1 DurableState, slots 2..N Atomic | one trailing `SyncDir` covers shuffle + stale-slot unlinks |
+| `configstore/store.go SaveRescueConfig` | DurableState | `WriteFileDurable` 0644 |
+| `configstore/store.go ArchiveConfig` | AtomicGeneratedConfig | `WriteFileAtomic` 0644 |
+| `dhcp/dhcp.go saveDUID` | DurableState | `WriteFileDurable` 0644 |
+| `frr/manager.go atomicWriteFile` | DurableState | thin wrapper, `WithPreserveExisting`+`WithResolveSymlinks` — gains the missing dir fsync |
+| `ipsec/ipsec.go Apply` | AtomicGeneratedConfig | `WriteFileAtomic` 0600 |
+| `dhcpserver writeKeaConfig` | AtomicGeneratedConfig | `WriteFileAtomic` 0644 |
+| `networkd writeIfChanged` | AtomicGeneratedConfig | `WriteFileAtomic` 0644 — zero fsync on apply path |
+| `networkd restoreSlowPathRPFilter` | BestEffortKernelKnob | direct `os.WriteFile` stays (procfs) |
+| `configstore/journal.go` | untouched | #1896 owns the journal redesign |
+
+Commit path pays 2 file fsyncs + 3 dir fsyncs total (operator-paced,
+bounded). Hot apply paths (networkd/swanctl/Kea) pay zero fsync by class.
+An AST-based canary test (`pkg/fsatomic/canary_test.go`) enforces the
+allowlist of remaining direct `os.WriteFile` calls in migrated packages.
+
+## Plan + round-1 adversarial review
+
+Plan v2 (`docs/pr/1893-configstore-durability/plan.md`) adopts all
+sustained round-1 findings: Codex task-mqal7v2u-8adha1 (PLAN-NEEDS-MAJOR,
+7 findings sustained) + AGY adversarial-review-mqal37pw-ehzagk
+(PLAN-NEEDS-MAJOR; A4 "hallucinated #1799 machinery" REFUTED — it audited
+a stale checkout). Key adoptions: slot-1-durable rollback design (one
+trailing SyncDir instead of ~50 fsyncs), ENOTDIR constructor test
+(root-proof), AST canary, crash-leaked temp sweep in `NewDB`.
+
+
+*(truncated — 64 lines total)*
+
+
+---
+
+## PR #1901 — #1885: single decap-aware delivery for LocalDelivery — fixes VLAN-tagged GRE-to-self TUN EINVAL [MERGED] (merged 2026-06-12)
+
+Branch: `engineer/1885-vlan-slice`
+
+Closes #1885
+
+## Root cause (corrects the issue's framing)
+
+The issue blamed VLAN-unaware slice arithmetic in `extract_l3_packet_with_nat`. The extraction helper is meta-driven and correct (the XDP shim's `parse_l2` sets `l3_offset = 18` for tagged frames). The real defect is a **frame/meta pairing bug in the caller**: the `poll_binding_process_descriptor` LocalDelivery arm called the desc-based `maybe_reinject_slow_path(area, desc, meta, …)` — `stage_native_gre_decap` rebinds `meta` to the INNER meta (`l3_offset = 14`, relative to its synthetic decap frame) but `desc` still points at the un-decapped UMEM frame (the VLAN-tagged GRE OUTER frame on reth0.80). The slice landed 4 bytes early on tagged ingress — the TUN payload started with the dot1q TCI tail (`00 50 86 dd …`, exactly the issue strace) and every write failed `EINVAL` (IFF_NO_PI requires the IP version nibble first).
+
+Full analysis: `docs/pr/1885-vlan-slice/plan.md`.
+
+## Blast radius (verified, all paths through the buggy call)
+
+1. **GRE-decapped LocalDelivery, tagged underlay** — per-packet TUN `EINVAL` (thread-fatal pre-#1887).
+2. **GRE-decapped LocalDelivery, untagged underlay** — `outer_frame[14..]` IS the outer L3 packet: the write *succeeds* but delivers the still-encapsulated OUTER packet. Silent content-wrong delivery.
+3. **Non-decapped LocalDelivery — latent DOUBLE enqueue.** The in-arm call was fully redundant: the same leg unconditionally ends at the decap-aware chokepoint `maybe_reinject_slow_path_from_frame(packet_frame, meta, …)` and both calls pass the identical disposition filter. Every first-of-flow host-bound packet was enqueued twice.
+4. NoRoute / MissingNeighbor / NextTableUnsupported reach only the trailing chokepoint — already correct. dispatch fabric-fallback + build-failure paths pair `Owned` frames correctly. Not affected.
+5. **Same-class defect, out of scope (follow-up to be filed):** `pending_neigh` buffers `desc` (outer frame) + post-decap `meta`; `retry_pending_neigh` would in-place-rewrite/TX the outer frame for a decapped inner packet whose non-tunnel forward decision hits a cold inner-egress neighbor. The #1873 R-E gate only covers tunnel-MARKED (encap) decisions.
+
+## Fix
+
+Delete the in-arm call; the leg's trailing decap-aware chokepoint is the single delivery point (`packet_frame` is the synthetic frame when decapped, the raw frame otherwise, and `meta` always describes it). One change fixes the tagged mis-slice, the untagged misdelivery, and the duplicate enqueue. Cold exception leg only — no hot-path cost; the change removes work. `extract_l3_packet*` is untouched, so the #1842 property harness over shared extraction is unchanged by construction (it still runs in the full-suite gate). No module doc describes this internal pairing; the plan doc carries the contract note.
+
+## Tests (all FAIL pre-fix with the live signatures)
+
+- `gre_to_self_vlan_tagged_local_delivery_is_inner_packet_exactly_once` — end-to-end VLAN-tagged GRE-to-self through `poll_binding_process_descriptor`; pre-fix payload nibble 0, bytes `00 50 08 00 45 …` (the strace shape).
+- `gre_to_self_untagged_local_delivery_is_inner_packet_exactly_once` — byte-equality pins the untagged outer-packet misdelivery (a nibble-only check would pass it).
+- `gre_to_self_session_hit_delivery_is_inner_packet_exactly_once` — same frame twice through one (binding, sessions) pair; the live keepalive stream rides an existing session.
+- `unencapsulated_local_delivery_reinjects_slow_path_exactly_once` — pre-fix `slow_path_drops == 2` (the duplicate enqueue).
+- `native_gre_decap_tagged_ingress_yields_self_consistent_frame_meta` — decap-level frame/meta consistency pin.
+- `txn_run_descriptor_with_deliveries` harness plumbing (caller-provided `local_tunnel_deliveries`).
+
+QinQ is unreachable: the shim's `parse_l2` consumes exactly one 802.1Q header, so no QinQ pin is possible.
+
+## Gates
+
+- `cargo build --release` rc0, no new warnings (136 = 136 vs base)
+- full `cargo test --release`: 2023 passed / 1 failed — `worker_queue concurrent_recovery` documented ledger flake, standalone-proven 5/5 green
+- full debug `cargo test`: 2050 passed / 0 failed
+- `go test ./...` rc0
+
+## Live validation (loss userspace cluster, lock cells, real sfmix GRE peer over VLAN-tagged reth0.80, outer IPv6)
+
+Baseline on pre-fix builds (same env): `write_local_tunnel_delivery:Invalid argument` ring entry per inbound keepalive/reply; strace of the TUN writer shows the garbage `00 50 86 dd 60 03 …` (TCI tail + outer IPv6) writes; pre-#1887 this was 100% inner-ping loss.
+
+On the fix build (`2347-g154d72c8d`, version-asserted at cell start AND end, node0 primary on all RGs):
+
+- **4-minute single-cell soak**: EINVAL ring count 0 and bad-nibble debug count 0 at six checkpoints spanning two keepalive windows (65s + 45s), session-miss pings, session-hit pings, and clear+re-miss pings; fw1 ring also 0; `Slow path local-delivery: 67` accepts with 0 dropped / 0 queue-full; transit sanity 21.6 Gb/s (uncapped CoS class).
+- **Final clean-build cell**: 40/40 inner pings over the tunnel, **0% loss**; EINVAL ring entries 0; `Slow path local-delivery: 46` accepts, 0 dropped.
+
+Honesty note: the cluster was heavily contended during validation (three agents interleaving deploys, plus a sick fw1 that another agent recovered mid-window). An early measurement window taken mid-rolling-failback showed residual EINVALs before the controlled, version-pinned cells above were run; the pinned soak + final cell are the authoritative measurements and are fully clean. The parent smoke gate re-validates before merge.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+*(truncated — 51 lines total)*
+
+
+---
+
+## PR #1903 — #1884: reconcile tunnel anchors in place — stop the per-commit gr-X flap [MERGED] (merged 2026-06-12)
+
+Branch: `engineer/1884-tunnel-flap`
+
+## Summary
+
+`tunnelManager.Apply` deleted and recreated every non-WireGuard tunnel netdev on EVERY applyConfig (`clearLocked()` + a pre-loop `LinkDel`), even with byte-identical tunnel config — observed live as `gr-0-0-0`'s ifindex climbing 16→18→20 within minutes, killing the userspace-dp GRE local-origin TUN reader per commit (bounded tombstone→respawn churn post-#1887; permanent death before it) and churning FRR routes.
+
+Apply now **reconciles in place**, per the 9-round converged research plan (`docs/research/1884-tunnel-flap/plan.md`, PLAN-READY ×3 — Codex task-mqangyjc-do7knl, AGY adversarial-review-mqan7eor-goab38 with a 27-cell claim-procedure sweep, Claude SMR):
+
+- **Set-diff removal** via the entry-time `ownedNames` DESIRED set (failure-continue paths can't leak links; failed deletes retain ownership for retry).
+- **Anchor reuse-first**: TUN + NO_PI + persistent ⇒ reuse (the Rust reader opens `IFF_TUN|IFF_NO_PI`); the #1706 EEXIST fallback preserved as exactly one re-lookup on the kernel-fetched link.
+- **MTU ownership**: new additive `TunnelConfig.MTU` (unit-overrides-interface) written on create and reconciled on reuse when configured (compiler restores ZONED interfaces only — unzoned tunnels had no writer); `MTU==0` normalized to 1500 exactly once on ADOPTION (repairs the wireguard→gre same-name flip leaking the WG-reduced MTU into snapshot live-MTU reads).
+- **Symmetric address reconcile** with the `appliedAddrs` link-local split: configured fe80 we applied is removable, kernel autoconf fe80 never touched, failed LL deletes retried. WG branch byte-identical via the nil sentinel.
+- **`appliedRI` VRF claims**: written ONLY from a successful bind or a direct master observation (never intent); step-0a `routing-instances <ri> interface` list binds are vetoed from unbinding (incl. same-VRF stanza→list moves) via the new additive `TunnelConfig.RIListMember`, populated with the SHARED step-0a normalization helper; unbind on config-wants-none is identity-gated against `vrf-<claim>`; transient errors retain the claim.
+- **Keepalive identity reconcile** (legacy branch only): unchanged runners survive applies; `LinkSetUp` skipped when a retained runner holds the tunnel down (the `state.Up` gate at keepaliveLoop would otherwise strand the link admin UP forever).
+- **Legacy non-anchor compare-then-decide**: recreate only on real attr change (type/family, endpoints, defaulted TTL, keys, proto); kernel-populated PMtu/Tos/flags/encaplimit excluded; encaplimit exec only on (re)create.
+
+## Validation
+
+- `go build ./...`, `go vet`, full `go test ./...` — 36 packages green; 18 new reconcile tests pin the plan's §9 matrix (no-churn, restart adoption, MTU cells, removal retention, fe80 split + retry, the full claim state machine, legacy comparison on kernel-shaped fixtures, keepalive retention + down-skip, EEXIST-race-on-owned-name).
+- **Live on loss:xpf-userspace-fw0** (lock cell "1884 reconcile validation"): `gr-0-0-0` ifindex **97 stable** across two unrelated commits (zero `removed existing tunnel link` journal entries — previously one per commit), tunnel address add/remove reconciled in place (ifindex unchanged, stale address removed), `systemctl restart xpfd` ADOPTED the anchor (ifindex 97, `master vrf-sfmix` list-bind retained — the A.5 claim machinery exercised live), service active.
+
+## Docs
+
+`pkg/routing/README.md` gains the reconcile-in-place section; the converged research plan + full 9-round review trail ride along under `docs/research/1884-tunnel-flap/`.
+
+Follow-ups filed: step-0a unit>0 tunnel naming gap; WG configured-link-local leak.
+
+Closes #1884
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #1906 — #1879 Path C: vSRX-style appliance images (qcow2 + incus) with day-0 config drive [MERGED] (merged 2026-06-15)
+
+Branch: `engineer/1879-pathc-images`
+
+Part of #1879 (Path C: image distribution + day-0 config drive — the operator-pinned scope). Does NOT close the issue; the deferred paths are listed at the bottom and issue closure is the operator's call at review.
+
+## Artifact model (operator-corrected scope, acknowledged)
+
+One **offline-built bootable root disk** — never boot-and-snapshot, no post-launch provisioning; `test/incus/setup.sh` was used as package/config inventory reference only — shipped for both hypervisors from the same root disk:
+
+| Artifact | Consumer | Deploy |
+|---|---|---|
+| `dist/xpf-<ver>.qcow2` | libvirt/KVM/plain QEMU | `virt-install --import --disk path=...` |
+| `dist/xpf-<ver>.incus-metadata.tar.gz` + the same qcow2 | incus | `incus image import <meta> <qcow2> --alias xpf-appliance` → `incus launch xpf-appliance x1 --vm` |
+| `dist/SHA256SUMS` | both | `sha256sum -c` |
+
+Everything baked: the **LATEST Ubuntu release** (operator-directed; 26.04 LTS today — the bake DISCOVERS the newest release from the upstream listing at bake time, `XPF_BASE_RELEASE` pins one), `linux-generic` kernel ≥ 6.18 (26.04 ships 7.0; the verifier-floor assert stays armed in case a future 'latest' regresses), FRR, strongSwan, Kea, chrony, systemd-networkd, xpfd + cli + xpf-userspace-dp + units. The image IS the dependency closure — the only complete answer to the kernel ≥ 6.18 floor (plan §C.1).
+
+Plus the vSRX `cdrom + juniper.conf` day-0 analog, identical under both hypervisors: first boot of a factory-default system probes attached media (any volume labeled `xpf-config`, or any ISO9660 medium) for `xpf.conf` (`juniper.conf` accepted as the vSRX-parity alias) at the volume root + optional `node-id` (0/1), validates it with the **real commit-check gate**, installs it, and xpfd's existing bootstrap-from-file path commits it. Invalid/missing medium → loud journal log + factory bootstrap (fxp0 DHCP). The boot is never blocked.
+
+## Quickstart (how to try)
+
+```bash
+make image      # bake → seal → export → boot-validation gate (in-guest verify-dataplane)
+
+scripts/image/make-config-drive.sh -o day0.iso my-xpf.conf   # commit-checks on the build host
+
+# incus
+incus image import dist/xpf-<ver>.incus-metadata.tar.gz dist/xpf-<ver>.qcow2 --alias xpf-appliance
+incus init xpf-appliance xpf1 --vm
+incus config device add xpf1 day0 disk source=$PWD/day0.iso
+incus start xpf1            # boots configured + management-reachable; incus exec works (agent baked, udev-gated)
+
+# libvirt
+virt-install --name xpf1 --memory 4096 --vcpus 4 --import \
+  --disk path=xpf-<ver>.qcow2 --disk path=day0.iso,device=cdrom --osinfo debian13
+```
+
+Full operator doc: `docs/install-images.md` (bake howto, both quickstarts, vSRX-parity table, security posture, replace-image upgrades, recovery).
+
+## What's in the change (one commit per component)
+
+1. **`xpfd check-config` + `configstore.CheckText`** (`2fda61508`) — the strict commit-check pipeline (parse → #1319 `SchemaValidate` on the apply-groups-expanded view → strict compile, retired-dataplane rejects included) exposed as a CLI gate. `Store.compileTree` / `schemaValidateExpandedTree` refactored to package-level helpers; the Store methods delegate — one gate, two callers, no fork to drift. Exit 0 PASS / 2 reject / 1 other; 4 MiB cap; `-node-id 0|1`. Unit-tested (valid, parse error, retired-dataplane, typed-leaf gate, `${node}` expansion).
+2. **Day-0 loader** (`6fb745f2a`) — `scripts/image/xpf-day0-config` + oneshot unit `Before=xpfd.service ssh.service`. Untrusted-input posture: mount `ro,nosuid,nodev,noexec`; only two fixed filenames at the volume root; symlinks refused; size cap (enforced again inside check-config); node-id strictly `0|1`; validation under timeout; nothing on the medium is executed. Never blocks boot: ordering-only unit (no `Requires=`), script always exits 0, `TimeoutStartSec=120` backstop. Idempotency: stamp / `.configdb` / preseeded-`xpf.conf` gates; a REJECT does **not** stamp — fix the medium and reboot retries while the system is still factory-default (the gate is "factory-default system", which is the vSRX semantic). Also regenerates ssh host keys absent after sealing.
+3. **Bake pipeline** (`0925863d8` + fixes) — `scripts/image/bake-image.sh` (`make image`): LATEST-Ubuntu server cloudimg base — operator-directed (`16520b0a2`): the newest release is auto-discovered from the upstream listing at bake time (26.04 today; `XPF_BASE_RELEASE` pins), SHA256-verified against upstream on every run, cache included; upstream owns partitioning + UEFI/BIOS GRUB → `virt-resize` → `virt-customize` offline (plan §5 runtime dependency matrix, **no build toolchain**; the cloudimg's reduced `linux-virtual` kernel replaced by `linux-generic` — mlx5/i40e for passthrough NICs live in `linux-modules-extra`, asserted in-bake; cloud-init + snapd + stale versioned kernels purged so exactly ONE kernel ships (`ba9c13ea5`) — cloud-init is a second network manager fighting xpfd's takeover, plan r1-S5; networkd/resolved/frr/chrony enabled, NTP pools neutered for xpfd-managed `sources.d`; `init_on_alloc=0` via an `/etc/default/grub.d` drop-in — Ubuntu cloudimgs override `GRUB_CMDLINE_LINUX_DEFAULT` there) → `virt-sysprep` seal (machine-id, ssh hostkeys + userdirs, logs, tmp, history, caches, seeds; `/etc/xpf` factory-empty) → `virt-sparsify --compress` export (`37feed1a4` — plain compression shipped 3.5 GB of dead freed blocks; sparsified: 1.6 GB) + incus metadata + SHA256SUMS. #1864 contract: the bake embeds the git-tracked shim object and never runs `make generate`.
+4. **incus-agent loader baked in** (`fbe329c30`) — the upstream-verbatim trio from incus's own images (unit + setup + udev rule); activation is udev on the incus virtio-serial port, so it is completely inert under libvirt/QEMU and `incus exec` works under incus.
+5. **Verifier/kernel gates** — three layers: build-host `verify-dataplane` fast-fail pre-gate; in-customize asserts that the newest installed kernel is ≥ 6.18 (`e6918e6a7` — this caught a real silent fallback, see below; stays armed if a future latest-Ubuntu regresses below the floor) and that the full driver tree is present; and the authoritative **in-guest `xpfd verify-dataplane` against the image's own kernel** during boot validation. A verifier-failing shim cannot ship (`--skip-validate` artifacts are explicitly labeled not-publishable).
+6. **Validation harness** — `scripts/image/validate-image.sh` boots the imported image under LOCAL incus (`xpf-image-*`, dedicated `xpf-image-net` NAT/DHCP network it creates and removes; the shared loss cluster is never touched) and asserts the full first-boot contract (scenarios A/B/C below).
+7. **Docs** (`d5d325423`) — `docs/install-images.md`.
+
+## Factory credential posture (deliberate, documented)
+
+No password over the network, ever. Root password is empty → hypervisor-console-only login (vSRX factory parity); sshd refuses empty-password and root-password auth by default. Headless/SSH access comes from the day-0 config (`system root-authentication ssh-ed25519 ...` — proven live in the QEMU run below).
+
+
+*(truncated — 108 lines total)*
+
+
+---
+
+## PR #1907 — #1888/#1889: WireGuard rekey/expiry/keepalive timers + blocking poll(2) control loop [MERGED] (merged 2026-06-12)
+
+Branch: `engineer/1888-wg-timers`
+
+Implements the converged plan `docs/research/1888-wg-timers/plan.md` (v9, 3/3 PLAN-READY after 4 hostile review rounds — Codex `task-mqaobjue-3oycnw`, AGY `adversarial-review-mqaofuz8-9i2bmb`, Claude SMR r4).
+
+Closes #1888
+Closes #1889
+
+## What ships
+
+**#1888 — full WireGuard whitepaper §6.1 timer machine (forward-secrecy repair).** Until now the engine had zero time-based state: AEAD keys lived until counter exhaustion, a confirmed engine never re-initiated (#1868's live finding), and `persistent_keepalive` was config plumbing with no behavior.
+
+| Timer | Mechanism |
+|---|---|
+| REKEY_AFTER_TIME 120s (T1, initiator-only on-send) | exact per-use arm in `try_encap` → rekey edge |
+| 165s receive horizon (T2, initiator-only) | per-use arm in `try_decap` |
+| REJECT_AFTER_TIME 180s (T3, both directions) | per-use refusal in encap (counter-untouched on Err, arms rekey) + decap (pre-AEAD, drop-only — replay must not drive handshake cadence) + 1s `expire_sessions` teardown with demux drain |
+| REKEY_TIMEOUT 5s / REKEY_ATTEMPT_TIME 90s | thread-local handshake **attempt machine**: retries bypass the confirmed gate; success = current-session **identity** change; give-up releases the pending reservation (stale msg2 → NoPendingHandshake), clears the T7 arm, drains edges |
+| KEEPALIVE_TIMEOUT 10s passive (T6) + persistent keepalive (T8) | **armed-timer model** (Linux pending-timer parity: CAS-from-0 set-if-unarmed, cleared by the opposite direction) — a latest-stamp model provably never fires under continuous one-directional traffic; T8 paces on authenticated traversal in either direction incl. handshakes |
+| 15s no-reply reinit (T7) | armed on first unanswered data send; this is what makes the #1868 P6 confirmed-but-dead trap self-healing |
+| post-msg2 key-confirmation keepalive | Linux receive.c parity — without it a handshake we initiate with nothing to send leaves the peer's responder session unconfirmed (its egress blackholed) |
+
+Timer state lives on `Peer`/`WgSession` (engine-Arc-resident: survives identity-unchanged reloads + thread respawns, resets on identity rebuilds). Clock = per-use CLOCK_MONOTONIC vDSO read with `#[cfg(test)]` mock (the cached-publisher design was rejected at plan review: no cadence hard-bounds staleness for the worker transit encap).
+
+**#1889 — blocking poll(2) idle wait.** The 1ms idle sleep (1,000 wakeups/s/tunnel) becomes `libc::poll` over {UDP, TUN} POLLIN with timeout = min(next timer deadline, 100ms cap): ~10 idle wakeups/s (100×), stop/join + worker-edge pickup bounded ≤ ~100ms, burst drains byte-identical under load. Fatal-fd policy: TUN ERR/HUP/NVAL or 8 consecutive fatal reads exit to the #1872 tombstone respawn; UDP POLLNVAL exits; UDP ERR/HUP stay non-fatal. Multi-entry coordinator stops are now bulk signal-then-join (~one cap per batch, not N×cap).
+
+**Telemetry (#1876 pattern, wire-additive both directions):** `xpf_userspace_wg_rekeys_initiated_total{reason}`, `keepalives_sent_total{kind}`, `sessions_expired_total`, `handshake_attempts_aborted_total`, + `expired` reasons under transport_drops. Cross-language wire pins extended to the 1..44 ladder.
+
+## Validation
+- `cargo build --release` clean; **full** `cargo test --release`: 2063 passed / 0 failed (all 5 result lines aggregated); debug `cargo test wg::` 145/145 (13 new mock-clock timer tests + 5 poll-loop tests incl. stop-join <500ms, readiness wakeup, TUN-teardown clean exit); `go test ./...` 36/36 ok; `make audit-check` green.
+- Live cluster validation (rekey at ~120s under traffic, idle keepalive cadence via peer tcpdump, idle control-thread CPU before/after, full wg-interop.sh): **queued — evidence will be posted as comments below.**
+
+HA surfaces unchanged (no cluster/VRRP/session-sync code touched) — failover run not expected to be required.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+
+---
+
+## PR #1908 — #1891: split pkg/config/schema.go into domain aspect files (pure code motion) [MERGED] (merged 2026-06-12)
+
+Branch: `refactor/1891-schema-split`
+
+## Summary
+
+Closes #1891.
+
+`pkg/config/schema.go` reached **2,169 LOC** on current master (re-measured after the #1319 typed-leaf rollout, PR #1886, added 40 typed slots and the #1892 help-text fill, PR #1898, added ~500 descs) — past the ~2,000-LOC threshold in `docs/engineering-style.md`. This PR executes the split exactly as mandated by the issue: **sibling `schema_*.go` aspect files in `package config`** (NOT a `pkg/config/schema/` subpackage — `setSchema` is unexported and consumed in-package by `schema_complete.go` / `schema_walk.go`; the two-SSOT doctrine from #1319 is untouched). Pure code motion: no desc edits, no validator changes, no structural changes, no reordering beyond the move.
+
+## Domain map + LOC
+
+| File | Top-level subtrees | LOC |
+|---|---|---|
+| `schema.go` (root) | schemaNode type, setSchema root composition, groups-wildcard `init()` | 136 |
+| `schema_security.go` | security, applications | 316 |
+| `schema_interfaces.go` | interfaces (+ `tunnelSchemaChildren()` / `wireguardSchemaNode()` constructors, referenced only from interfaces) | 395 |
+| `schema_routing.go` | routing-options, policy-options, protocols, forwarding-options, bridge-domains, routing-instances | 390 |
+| `schema_system.go` | system, services, snmp, event-options | 480 |
+| `schema_chassis.go` | chassis | 256 |
+| `schema_cos.go` | class-of-service, firewall (cohesive: filters are the CoS classifier/rewrite attachment point) | 285 |
+
+`groups` / `apply-groups` stay in the root (the groups wildcard mirrors the top level by pointer in `init()`).
+
+One building commit per extracted domain (7 motion/docs commits); every commit boundary passed `go build ./...` and the node-inventory equality check below.
+
+## Node-inventory equality proof (pure-motion verification)
+
+A temporary in-package test (not committed) walked `setSchema` and dumped a canonical serialization of **every node**: full path + all 18 `schemaNode` fields (`args`, `multi`, `valueHint`, `desc`, `placeholder`, `midKeyword`, `midKeywordAt`, `compoundKey`, `valueType`, `valueDesc`, `valueExamples`, `validator` nil/non-nil, `treeValidator` nil/non-nil, `keyValueType`, `keyValueDesc`, `keyValueExamples`, `keyValidator` nil/non-nil, wildcard presence, child count), children visited in sorted order, wildcard subtrees included.
+
+- Baseline at `origin/master` (075dbe318): **1,962 nodes** (includes the `groups <*>` pointer-mirror of the whole tree).
+- Re-dumped after **every** extraction commit and at HEAD: `diff` **byte-identical** each time — no node lost, duplicated, reordered, or field-mutated.
+
+## Non-moved diff inventory (`--color-moved=dimmed-zebra --color-moved-ws=allow-indentation-change`)
+
+154 non-moved lines total, all accounted for:
+
+1. New file headers (`package config` + aspect-file doc comment) in the 6 new files.
+2. `schema.go` header comment gains the #1891 aspect-file map (15 added comment lines).
+3. The 16 root-map entries rewritten from inline literal openers to var references (`"security": schemaSecurity,` etc.), plus gofmt realignment of the unchanged `groups`/`apply-groups` lines (key-column width changed).
+4. The 16 var declaration openers (`var schemaX = &schemaNode{...`) and their closing lines (trailing `,` of the map entry dropped).
+
+Zero subtree body lines appear as non-moved — every node line moved verbatim (indentation-only change from the one-tab outdent, handled by gofmt).
+
+## Docs
+
+- `docs/config-schema.md`: points typed-leaf authors at the domain aspect files; deliberately-untyped rationale pointers now cite `schema_chassis.go` / `schema_system.go` / `schema_interfaces.go` where those comments moved.
+- `schema.go` header: aspect-file map + subpackage rationale.
+
+## Test plan
+
+- [x] `go build ./...` — exit 0 at every commit boundary
+- [x] `GOCACHE=/dev/shm/cache GOTMPDIR=/dev/shm go test ./...` — exit 0, 36 packages ok
+- [x] `TestSchemaAllNodesHaveDesc` (#1892 desc regression pin) — passes unchanged
+
+*(truncated — 55 lines total)*
+
+
+---
+
+## PR #1909 — configstore: compact audit journal with bounded tail reads and rotation (#1896) [MERGED] (merged 2026-06-12)
+
+Branch: `engineer/1896-journal`
+
+Closes #1896
+
+## Problem
+
+Every commit/commit_confirmed/auto_rollback/config_sync appended the **full compiled `*config.Config`** to the JSONL journal, and every `show system commit` re-read and re-unmarshaled the **entire** file before applying the limit — O(lifetime commits × config size) per history view, no rotation, unbounded growth, and full config content (including secrets) accumulating in a 0644 file. Verified: the `Before` field was never populated and the `After` payload was **read by nobody** — both renderers (`pkg/grpcapi/server_show_system.go`, `pkg/cli/cli_show_system.go`) print only Timestamp/Action/Detail, and full trees already live in the rollback files with explicit retention (`saveRollbackFiles`, canonical per #1894).
+
+## Change
+
+New `pkg/configstore/journal` subpackage (per the issue's suggested split); `configstore` keeps `JournalEntry = journal.Entry` so consumers compile unchanged.
+
+- **Compact v2 entries** `{v, timestamp, action, detail, config_hash}` — payloads deleted. `config_hash` = sha256 of the post-action active tree's `Format()` text, the same bytes `saveRollbackFiles` writes, so `sha256sum <config>.N` correlates a retained rollback file to its journal entry (best-effort while retained; slots shift per commit).
+- **Bounded reads**: `Tail(limit)` reverse-scans segments newest-first in 64 KiB `ReadAt` chunks and stops at `limit` — `ListCommitHistory(50)` is O(50), not O(lifetime). Semantics preserved exactly (last `limit` entries of any action, then filter; `limit <= 0` = full scan). Pure byte-slice line assembly (UTF-8 safe across chunk splits), 16 MiB assembly cap with skip-mode resync against newline-free corruption, parse-or-skip for torn/corrupt lines.
+- **Rotation**: size-based at append (1 MiB segments, keep 2 rotated). A pre-existing fat v1 journal rotates to `.1` **intact** on the first append — history stays readable until it ages out; no migration pass, and boot never reads the journal (so an old/corrupt journal can never fail boot).
+- **Durability** (adjudicated in plan): fsync per append (operator-paced; the commit path already pays several fsyncs), `fsatomic.SyncDir` on create/rotate, torn-tail self-heal (newline prefix when the last byte isn't `\n`). `Log` failure is a `slog.Warn`, never a commit failure; the `persist_error` path cannot recurse.
+- **Concurrency**: `Journal` serializes `Log`/`Tail` internally — `ListCommitHistory` holds no `Store.mu`, and an unserialized rotation would let a reader see one inode under two segment names (duplicate entries).
+- **Back-compat**: legacy v1 fat lines decode tolerantly (unknown JSON fields ignored) — proven by an in-test v1 oracle.
+
+## Plan round (docs/pr/1896-journal/plan.md)
+
+- Claude SMR: internal mutex, gap-tolerant Tail, O_RDWR torn-tail check, Log-failure warning.
+- AGY `adversarial-review-mqb7hxhl-e7opzl` — PLAN-NEEDS-CHANGES, 4 findings, **all adopted**: reader/writer rotation race, UTF-8 chunk-split corruption, missing-segment tolerance, line-assembly OOM cap.
+- Codex: three dispatch attempts lost to the shared one-job-global companion runtime (task ids in reviewer-ids.md); will re-dispatch against this PR diff.
+
+## Tests
+
+- `TestTailBoundedRead` — the issue's headline requirement: 5,000-entry journal, counting `io.ReaderAt`, asserts `Tail(50)` reads ≤ 2 chunks of a multi-MB file; `BenchmarkTail50`.
+- `TestListCommitHistoryLegacyEquivalence` — v1 reader kept verbatim as oracle vs new path over a 120-entry fat legacy journal, limits {0,1,10,50,200}.
+- Legacy fat multi-chunk lines, UTF-8 at chunk boundaries, torn final line + self-heal, rotation boundary/gaps/legacy-file rotation, over-cap skip mode, exact chunk-boundary geometry, concurrent Log/Tail under `-race`, compact-entry leak check (no `before`/`after`/config content in new lines), hash-vs-rollback-file correlation.
+
+## Validation
+
+- `go build ./...` → 0; `GOCACHE=/dev/shm/cache GOTMPDIR=/dev/shm go test ./...` → 0 (38 packages ok); `go test -race ./pkg/configstore/journal/` → ok.
+- Live cluster validation (commits, `show system commit`, rollback, restart over a legacy fat journal) to follow under the cluster lock protocol.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #1910 — #1904/#1905: bind unit>0 RI tunnel members to the real uN device; reconcile configured fe80 off WireGuard tuns [MERGED] (merged 2026-06-12)
+
+Branch: `engineer/1904-routing-followups`
+
+Two routing follow-ups from the #1884 research, driven as one lane (both pkg/routing-adjacent; mechanisms ratified by the #1884 reviewers). Plan: `docs/pr/1904-routing-followups/plan.md`.
+
+Closes #1904
+Closes #1905
+
+## #1904 — step 0a binds the literal `.N` name for unit>0 RI tunnel members
+
+`routing-instances <ri> interface gr-0/0/0.1` was normalized by the shared `riMemberLinuxName` helper to the literal `gr-0-0-0.1`, but the compiler names unit>0 per-unit tunnel devices `gr-0-0-0u1` (uN scheme), so the step-0a `BindInterfaceToVRF` failed interface-not-found for every unit>0 tunnel list member and the tunnel manager's RIListMember veto never covered those devices.
+
+**Fix:** `riMemberLinuxName` now takes a `tunMap` built via `cfg.TunnelNameMap()` — which returns the compiler-assigned `TunnelConfig.Name` verbatim, the same field `ApplyTunnels` uses to create the kernel device, so the normalization cannot diverge from the actual device-naming scheme **by construction** (the Codex r5 exact-parity requirement). Both callers (step-0a bind loop, `collectAppliedTunnels` RIListMember scan) build the map once from the same cfg, preserving the #1884 bind/veto parity.
+
+**Deliberate scope note (recorded in the plan):** the issue's fix-direction phrase named `cfg.ResolveKernelIfName` "(which maps via TunnelNameMap)". This PR implements exactly its tunnel branch. The full resolver would additionally activate binds 0a has never performed for non-tunnel refs (`reth0` → physical member, `st0.0` → verbatim XFRM device, `irb.0` → bridge, suffix-preserving unmodeled fallback) — each a live VRF-membership behavior change outside the ratified defect. Non-tunnel refs stay byte-identical.
+
+**Known pre-existing ordering (unchanged, applies to unit-0 members too):** step 0a runs before step 1 (`ApplyTunnels`) inside one applyConfig, so the very first commit that introduces both the RI and the tunnel logs a bind warn (device not yet created) and the bind lands on the next applyConfig; the #1884 observe-only veto design deliberately reserves list binds to 0a.
+
+## #1905 — WG tun leaks configured link-local addresses removed from config
+
+`applyWireguardTunLocked` called the shared `reconcileLinkAddrsLocked` with the nil applied-set sentinel (skip ALL link-local deletion), so a CONFIGURED fe80 on the persistent wgN TUN leaked forever once removed from config. The GRE/IPIP path fixed this class in #1884 via the per-link `appliedAddrs` record; the WG branch was deliberately left byte-identical at the time.
+
+**Fix:** the WG branch now passes and stores `t.appliedAddrs[tc.Name]` exactly like the GRE branch, inheriting the ratified semantics: configured-vs-autoconf split, no deletion on the restart adoption pass, failed-delete retry tracking, and one-shot convergence when a configured fe80 coincides with a kernel-generated one. For a WG tunnel removed from config entirely, the appliedAddrs entry is retained alongside the known-S2a leaked device (S6 teardown #1434 owns deleting both).
+
+## Tests
+
+- `TestRIMemberLinuxNameResolvesPerUnitTunnels` (replaces the #1884 parity pin that froze the broken literal `.1` form — its own comment said "the shared helper guarantees both move together when 0a is fixed") + unit>0 RIListMember coverage in `TestCollectAppliedTunnelsPopulatesMTUAndRIListMember`.
+- `TestWireguardConfiguredLinkLocalRemoved`, `TestWireguardForeignLinkLocalNeverDeleted`, `TestWireguardLinkLocalDeleteFailureRetried` (fakeLinkOps, mirroring the GRE-branch battery).
+
+## Gates
+
+- `go build ./...` → 0; `go test ./...` (GOCACHE=/dev/shm) → 0; `go test -race ./pkg/routing/... ./pkg/daemon/...` → 0.
+
+## Live validation (loss userspace cluster, lock protocol, build `2443-gcd8b784dc` on both nodes)
+
+10/10 PASS:
+
+- **#1904:** commit `gr-0/0/1 unit 1 tunnel` + `routing-instances vrf1904 interface gr-0/0/1.1` → device `gr-0-0-1u1` created; after the next applyConfig: `gr-0-0-1u1: ... master vrf-vrf1904`. Every step-0a bind log line for the member targets the REAL uN name (`linux=gr-0-0-1u1`; pre-fix it was the literal `linux=gr-0-0-1.1`, which could never succeed).
+- **#1905:** configured `fe80::1905:1/64` applied to wg0; after removing it from config it reconciled away within 1s, while a planted foreign `fe80::beef/64` AND the kernel's own stable-privacy `proto kernel_ll` fe80 both survived; configured non-LL `10.66.0.1/24` retained; zero device churn.
+- Full cleanup committed (test config removed, wg0 deleted per the harness teardown runbook); cluster healthy, CoS re-applied after deploy.
+
+## Docs
+
+Module contracts here are the godoc blocks (`riMemberLinuxName`, `applyWireguardTunLocked`, `reconcileLinkAddrsLocked`) — updated in place. No standalone Markdown module doc covers WG address reconcile or step-0a binding (checked `docs/wireguard-interop.md`, `docs/wg-interop-runbook.md`).
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+
+---
+
+## PR #1911 — #1902: never buffer GRE-decapped packets in pending_neigh — the retry TXed a mis-rewritten outer frame [MERGED] (merged 2026-06-12)
+
+Branch: `engineer/1902-pending-neigh`
+
+Closes #1902
+
+Sibling of #1885 (PR #1901): the same frame/meta pairing defect class, in the MissingNeighbor retry mechanism instead of LocalDelivery.
+
+## Defect
+
+`stage_native_gre_decap` rebinds `meta` to the INNER meta (describing the synthetic heap frame in `owned_packet_frame`) while `desc` keeps pointing at the ORIGINAL UMEM frame — the GRE OUTER frame, VLAN-tagged on the live reth0.80 underlay. The MissingNeighbor arm buffered `PendingNeighPacket { desc, meta, decision, .. }`, so for a decap-INBOUND packet whose inner forward decision is non-tunnel with a cold inner-egress neighbor, the buffered pairing was OUTER frame + INNER meta + INNER decision. On neighbor resolution `retry_pending_neigh` did `rewrite_forwarded_frame_in_place(pkt.desc, pkt.meta, ..)` and TXed the result. The #1873 R-E gate only excludes tunnel-MARKED (encap) decisions; decap-INBOUND decisions are plain (`tunnel_endpoint_id == 0`) and passed it.
+
+**Captured pre-fix byte trace** (untagged underlay, from the new pin with the gate neutered): the retried TX is the inner next-hop MAC + reth1.0 src MAC + the still-encapsulated OUTER GRE header — proto 47, outer src 203.0.113.9, **outer dst 172.16.80.8 (the firewall itself)**, TTL decremented on the OUTER header — truncated to the inner-meta length (54 of 78 bytes):
+
+```
+aa bb cc dd ee ff 02 bf 72 01 00 01 08 00 45 00
+00 40 00 01 00 00 3f 2f 43 6c cb 00 71 09 ac 10
+50 08 00 00 08 00 45 00 00 28 ...
+```
+
+On the VLAN-tagged underlay the in-place rewrite refuses the dot1q tail (version-nibble 0) and the buffered packet is silently lost instead. Corrupt transmit on untagged, silent loss on tagged — both wrong.
+
+## Pairing adjudication (which frame does the retry need?)
+
+The retry mechanism is in-place-UMEM by construction: rewrite inside the area, recycle by `desc.addr`, mirror clone reads `area.slice(desc.addr, ..)`. The synthetic inner frame is heap-allocated and cannot be retried without a new TX-acquire+copy mechanism (issue option (b)); outer frame + outer meta is equally wrong because the stored decision is the INNER forward decision and the retry cannot re-run decap; copying the inner frame into the UMEM frame at admission aliases live shared borrows. None is worth one buffered first-of-flow packet, so the fix is issue option (a): **pending_neigh admission requires `owned_packet_frame.is_none()`** — entries must have `desc`/`meta`/`decision` describing the SAME UMEM frame. Refusals are counted (`xpf_userspace_pending_neigh_decap_drops_total`, plumbed Rust status -> Go -> Prometheus, both wire sides, additive/defaulted) and the frame recycles. First-packet delivery is preserved: the kernel ARP/NDP probe has already fired, and the trailing decap-aware slow-path chokepoint (#1901) still hands the correctly-paired INNER packet to the kernel. #1771 §2.2 keep-oldest/cap admission semantics untouched.
+
+Blast radius audit (plan doc): `pending_neigh.insert` has exactly ONE production site (the gated one); consumers (retry sweep, timeout/neg-cache, worker drain, depth gauges) are pairing-agnostic or post-gate-safe. Retry-time defense-in-depth was rejected: a stored entry carries no decap marker and the untagged case is byte-indistinguishable from a valid frame.
+
+## Tests (all deterministic, end-to-end through `poll_binding_process_descriptor` + `retry_pending_neigh`)
+
+- `txn_decapped_missing_neighbor_not_buffered_tagged` / `_untagged` — decapped inner packet to a cold connected neighbor is never admitted, refusal counted, frame recycled, retry produces NO prepared TX. Both FAIL pre-fix (buffered entry; untagged retried the garbage frame above).
+- `txn_non_decap_missing_neighbor_buffers_and_retries_correctly` — unchanged path: UMEM-paired packet still buffers (decap counter 0) and the resolved retry TX is the correctly rewritten original (resolved dst MAC, egress src MAC, TTL 64→63, IP/L4 bytes otherwise identical).
+
+## Gates
+
+- `cargo build --release` rc0, warnings 138 = 138 vs base (verified against a clean origin/master build)
+- full `cargo test --release`: 2072 passed / 0 failed (wire fixture regenerated for the additive field; `wg reconcile_peers_snapshot` ledger flake standalone-proven 5/5)
+- `go test ./...` rc0 (descriptor coverage test includes the new family)
+
+## Live validation
+
+Complete — see https://github.com/psaab/xpf/pull/1911#issuecomment-4695443931 : gate counter advanced exactly once per cold-neighbor window (0 -> 4 across cells), zero proto-47/malformed frames on the inner egress captures, 18/18 first-packet inner delivery via the decap-aware slow path, non-decap buffered-retry leg sub-millisecond (#1876 dwell histogram, 0 timeout drops). Pre-existing observations filed as #1912/#1913.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+
+---
+
+## PR #1927 — #1921: rebind must not double-stop workers (fix virtio multi-queue AF_XDP EBUSY loop) [MERGED] (merged 2026-06-16)
+
+Branch: `engineer/1921-virtio-mq-bind`
+
+## What
+
+Fix the virtio_net multi-queue forwarding outage (#1921): `rebind::handle`
+double-stopped the AF_XDP workers, bypassing `tear_down`'s 500ms zero-copy
+teardown quiesce and causing an infinite EBUSY/rebind loop.
+
+## Root cause (code-verified, 6-round 3-way plan review)
+
+`rebind::handle` called `guard.afxdp.stop()` (→ `stop_inner(true)`) which clears
+`coord.workers.handles` **before** `reconcile_status_bindings` → `tear_down`
+runs. `tear_down` then computes `had_live_workers =
+!coord.workers.handles.is_empty()` → **false**, so the `thread::sleep(500ms)`
+quiesce (`coordinator/reconcile/teardown.rs`, whose comment is *"avoids EBUSY
+when a later snapshot refresh rebuilds the same queue set immediately after
+shutdown"*) is **skipped**. The recreated sockets race the kernel's still-pending
+`xsk_pool` teardown → EBUSY. On virtio multi-queue the busy-binding watchdog
+re-issues `rebind`, double-stops, bypasses the quiesce again → infinite loop;
+every queue stays un-READY and the shim drops all transit (`binding_not_ready`).
+
+The "ring-mismatch" and "all-or-nothing enable gate" theories were both proposed
+and **refuted** during review (`ctrl.queue_count` tracks the bound set via
+`queueCountFromBindings`; `armed` is a forwarding *request* flag, not bind
+success). Full evolution + verdicts: #1921 plan doc
+(`docs/research/1921-virtio-mq-bind/plan.md`).
+
+## Fix
+
+Remove the explicit `guard.afxdp.stop()` from `rebind::handle`; let
+`reconcile` → `tear_down` → `stop_inner(false)` own the worker stop so
+`had_live_workers` is captured truthfully and the quiesce applies. This also
+drops `stop_inner(true)`'s two rebind-wrong side effects (verified by AGY):
+wiping the in-memory synced-session map, and blinding `tear_down`'s
+`tunnel_owners`/`snapshot_was_installed` capture (which broke the tunnel-owner
+remap purge across all rebinds).
+
+RETH-MAC link-cycle path unaffected: Go sends a separate `stop_workers` before
+the link cycle and only `rebind`s after link-up.
+
+## Test
+
+`rebind_preserves_synced_sessions` (server handler test) pins the observable
+consequence — a synced session installed before a rebind survives it. Verified
+the test FAILS if the explicit stop is re-added.
+
+## Out of scope (contingent, #1921 Phase 2)
+
+Channel/RSS queue reconciliation is deferred to a design-open Phase 2 that only
+triggers if a live virtio repro shows binds still fail after this fix (it
+collides with the global-min uniform planner / fabric-parent handling and needs
+its own review round).
+
+*(truncated — 63 lines total)*
+
+
+---
+
+## PR #1929 — #1928: don't ship phantom HA groups on standalone (virtio MQ forwarding fix) [MERGED] (merged 2026-06-16)
+
+Branch: `engineer/1928-virtio-copy-xsk-rx`
+
+## Problem
+
+The userspace dataplane dropped **all transit traffic** (IPv4 and IPv6) on a
+**standalone** (non-chassis-cluster) firewall, disposition `HAInactive`. This
+is the real cause of the #1921/#1928 "virtio multi-queue forwarding outage":
+the shim redirected packets to the XSKMAP and they reached the userspace RX
+ring, but the forwarding pipeline then dropped every transit flow before
+creating a session.
+
+## Root cause
+
+`rg_active` is a `BPF_MAP_TYPE_ARRAY` (`max_entries=16`), so the kernel always
+exposes keys 0-15 — even on standalone where every value is 0. At
+snapshot-apply, `manager.go`'s startup path called
+`refreshHAStateFromMapsLocked()` **unconditionally**; `mergeHAStateFromMaps()`
+fabricated 16 inactive HA groups and `syncHAStateLocked()` shipped them to the
+helper (`CTRL_REQ: update_ha_state groups=16`). The helper's
+`enforce_ha_resolution_snapshot()` then gated every transit `ForwardCandidate`
+(owner_rg_id<=0 && `!ha_state.is_empty()`) → `HAInactive` drop.
+
+The **periodic status poll already guarded** this same call behind
+`if m.clusterHA` (process.go); the **startup path did not** — that asymmetry is
+the bug.
+
+## Fix
+
+Guard the startup HA replay+sync behind `if m.clusterHA`, matching the poll
+path. Standalone → `m.haGroups` empty → `syncHAStateLocked` no-op → helper
+`ha_state` empty → gate bypassed for transit. Pure Go control-plane fix; **no
+helper/shim changes**. Only affects `clusterHA==false`, so clustered nodes run
+the guarded block exactly as before (no-op for HA).
+
+The earlier bind-flag commit (virtio AUTO → explicit COPY|NEED_WAKEUP) was a
+**misattribution** and is dropped: an isolation experiment showed AUTO bind
+(flags=0x0000) + this HA fix forwards 5000 pps with snat=1 — the bind flag was
+never load-bearing. Prior "AUTO forwards nothing" was the HA gate; prior "v6
+6/6" was kernel return-route forwarding (tx_completions stayed 0).
+
+## Validation (venue t1921-fw, 4-queue virtio, clean production build)
+
+- v4 transit LAN→WAN 5/5 0% loss; v6 transit 5/5 0% loss.
+- standalone daemon issues **0** `update_ha_state` requests (was groups=16).
+- `ha_inact=0` (was 1346 under load); sessions + bpf_entries nonzero.
+- `xpf_userspace_binding_tx_completions_total` nonzero on LAN+WAN bindings.
+- **SNAT proven end-to-end**: wan-host has no v4 return route to 10.66.1.0/24
+  yet v4 replies returned (interface SNAT to 10.66.2.1); DBG `NAT:snat=1`.
+- sustained UDP flood: rx≈tx≈fwd=5000/s, 0 ha_inact, 0 tx_err.
+
+## mlx5 no-regression
+
+
+*(truncated — 59 lines total)*
+
+
+---
+
+## PR #1931 — #1917 increment A: xpf Debian package + bake-consumes-the-deb (closes #1923) [MERGED] (merged 2026-06-16)
+
+Branch: `engineer/1917a-xpf-deb`
+
+## #1917 increment A — the `xpf` Debian package + bake-consumes-the-deb
+
+Part of #1917 (in-place xpf upgrade umbrella). **Closes #1923** (M1a packaging —
+this increment subsumes it).
+
+This is the **packaging-only** first increment of the converged 3-way PLAN-READY
+plan (`docs/research/1917-deb-inplace-upgrade/plan.md` §6.1/§6.3, rev 8). The
+in-place runtime cut-over mechanism (staged->runtime copy, verify-dataplane gate,
+atomic symlink flip, HA rolling failover, rollback) is **increment B** and is
+deliberately out of scope here.
+
+### What the `.deb` contains
+
+One `xpf` binary package + one `xpf-appliance` metapackage:
+
+- **`xpf`**: `xpfd`, `xpf-userspace-dp`, `cli`, and the day-0 config-drive loader,
+  installed to the **dpkg-static staging path** `/usr/local/share/xpf/staged/`
+  (plan §6.1/§6.3c — dpkg never deletes a runtime versioned dir). Plus
+  `xpfd.service` + `xpf-day0-config.service` (re-homed under
+  `/usr/lib/systemd/system`) and a `needrestart` blacklist. **The AF_XDP shim is
+  `//go:embed`'d into xpfd** (`userspace_xdp_rust.go:11`), so there is **no
+  separate shim object packaged** — plan assumption confirmed against the source.
+- **`xpf-appliance`**: pulls `xpf` + the runtime dependency set (frr, strongswan,
+  kea, chrony, networking tooling).
+
+### postinst (increment-A-safe only)
+
+- **First install**: creates the live `/usr/local/sbin/{xpfd,cli,...}` symlinks
+  into the staging path so xpfd runs.
+- **Upgrade**: leaves the live symlinks untouched (a plain `apt upgrade xpf` only
+  refreshes staging; the verified cut-over is increment B).
+- `/etc/xpf` state (`.configdb`, `node-id`, `master.key`) is never package-owned
+  and never removed, not even on purge.
+
+### Footguns handled (plan §8 / codex-review findings)
+
+- `dh_installsystemd --no-stop-on-upgrade` — `apt upgrade xpf` never cycles xpfd
+  (verified: prerm only stops on `remove`, postinst has no `try-restart`).
+- `needrestart` override blacklists `xpfd.service` so it can't auto-restart a
+  deleted-binary process mid-apt.
+- dpkg writes ONLY the static staging path; never a runtime versioned dir.
+- No operator `xpf.conf` and no conffiles for operator state.
+
+### bake change
+
+`scripts/image/bake.py` now builds the `.deb` (`make deb`, which runs the same
+`make build build-ctl build-userspace-dp` via `debian/rules`, preserving the
+embedded #1864 shim + pinned cargo) and `apt-get install`s it instead of
+`--copy-in`-ing raw binaries. The single-kernel hard-assert, the >=6.18 verifier
+floor + mlx5/i40e modules-extra check, the sysprep seal, and the in-guest
+
+*(truncated — 71 lines total)*
+
+
+---
+
+## PR #1932 — xpf .deb: declare runtime library deps (${shlibs:Depends}) — follow-up to #1931 [MERGED] (merged 2026-06-16)
+
+Branch: `fix/xpf-deb-shlibs-depends`
+
+## What
+The merged `xpf` Debian package (#1931) declared `Depends: ${misc:Depends}` only, omitting `${shlibs:Depends}` — so the shipped `.deb` declared **no runtime library dependencies** despite `xpf-userspace-dp` being dynamically linked (`libc.so.6` + `libgcc_s.so.1`). `dpkg-gencontrol` warned `substitution variable ${shlibs:Depends} unused, but is defined`. Without it the `.deb` can install on an incompatible-glibc host and fail at **runtime** instead of failing closed at **install/apt-resolve** time.
+
+Surfaced by AGY round-3 on #1931 (landed post-merge).
+
+## Fix
+One line: `Depends: ${shlibs:Depends}, ${misc:Depends}` on the `xpf` package. The `xpf-appliance` metapackage has no binaries and is unchanged.
+
+## Validation
+- `make deb` builds clean; the `dpkg-gencontrol` unused-substvar warning is gone.
+- Built `xpf` `.deb` now declares `Depends: libc6 (>= 2.38), libgcc-s1 (>= 4.2)`.
+
+Part of #1917 (increment A follow-up). Trivial packaging-correctness fix.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #1933 — #1917 increment B: in-place upgrade cut-over (verified atomic flip + HA rolling + compat floor) [MERGED] (merged 2026-06-16)
+
+Branch: `engineer/1917b-inplace-upgrade`
+
+Closes #1917
+
+Increment B of the in-place upgrade work (increment A — the `.deb` +
+`make deb` — shipped in #1931/#1932). Implements the converged
+PLAN-READY A1+B1+C1+D1 composition from
+`docs/research/1917b-inplace-upgrade-mechanism/plan.md` @ `6b6e86de4`.
+
+## What this delivers
+
+**A1 — `xpfd upgrade` cut-over state machine (`pkg/upgrade`).**
+Crash-safe, idempotent, journaled state machine:
+`STAGED→PREFLIGHT→COPIED→VERIFIED→STOPPED→FLIPPED→STARTED→COMMITTED`.
+Copies the dpkg-staged binary set into a non-dpkg versioned runtime dir,
+runs the kernel `verify-dataplane` gate against the COPIED binary, and on
+PASS does the atomic **STOP → FLIP → START** cut with binary+DB-atomic
+rollback. The ONLY live mutations are STOP and FLIP-then-START;
+PREFLIGHT/COPY/VERIFY are pure and abortable. Respawn-mismatch is closed
+two ways: STOP-before-FLIP + a concrete-version `ExecStart` drop-in (systemd
+does not symlink-resolve `argv[0]`). N=3 retention; never GC the running or
+predecessor version.
+
+**B1 — HA rolling driver (`xpfd upgrade --rolling`).** Per-node controlled
+drain so the cluster keeps forwarding: peer-alive/sync/proto precheck →
+peer-takeover-ready precheck BEFORE demote (no VIP stranding) →
+ForceSecondary → **strong drain predicate** (peer PRIMARY, local VRRP
+BACKUP/no-VIPs, rg_active false, sync clean — not merely weight-0) → cut
+(auto-rollback disabled; HA rollback is operator-driven) → re-sync →
+ResetFailover. Drain-timeout fails back and aborts WITHOUT cutting.
+
+**C1 — dogfood deploy.** postinst HA-mode contract: STAGE-ONLY on
+clustered nodes (keyed on `/etc/xpf/node-id` ALONE), verified single-node
+cut on standalone. `XPF_DEPLOY_DEB=1 make cluster-deploy` builds the
+`.deb` (outside the #1875 lock) and drives `xpfd upgrade --rolling`
+secondary-first; the raw push path stays the default until the deb path is
+live-validated.
+
+**D1 — config compatibility floor (`pkg/configstore`).** An
+old-reader-REJECTING `#`-magic envelope embedded in `active.json` +
+fatal-on-parse: a present-but-unreadable or too-new DB is FATAL at startup
+(fail closed) instead of being silently overwritten by a blind bootstrap.
+A pre-floor (no-envelope) DB still reads. Auto-rollback restores the
+pre-upgrade DB snapshot BEFORE re-flipping the binary so an old daemon
+never boots against a too-new envelope DB.
+
+## Validation
+- `go build ./...` clean; full Go suite green; `make audit-check` green.
+- `pkg/upgrade` tests: full fresh cut (asserts STOP→FLIP→START order +
+  concrete-version ExecStart), verify-REJECT (live untouched), disk-full
+  abort (pre-mutation), auto-rollback to previous version, **crash-resume
+  idempotency from every journaled state** (no orphan partials),
+
+*(truncated — 77 lines total)*
+
+
+---
+
+## PR #1934 — chore: remove stray resmoke version-bump marker [MERGED] (merged 2026-06-16)
+
+Branch: `chore/rm-resmoke-marker`
+
+Removes `docs/pr/.resmoke-1933-marker`, a live-rolling-gate test artifact accidentally carried into the #1933 merge (its commit said 'not for merge'). No production role.
+
+---
+
+## PR #1935 — #1922 Item 1a: daemon-owned commit-confirmed rollback executor [MERGED] (merged 2026-06-16)
+
+Branch: `engineer/1922-pr1-rollback-executor`
+
+## Summary
+
+Part of #1922 (M1b SAFE-BOOTSTRAP daemon hardening). This is **PR-1 = Item 1a** of a two-PR split; **PR-2 completes #1922** (hence `Part of`, not `Closes`).
+
+Fixes the commit-confirmed **timeout rollback** — it was both non-atomic and broken in service mode:
+
+- **Non-atomic:** `performAutoRollback` promoted `s.active`/`s.compiled` and persisted them under `s.mu`, released the lock, then invoked the dataplane re-apply (`centralRollbackFn`) **outside** that critical section. Store promotion and dataplane re-apply were not one transaction, so a concurrent `commit` could interleave → store-vs-kernel split-brain.
+- **Service-mode mis-wiring:** the callback was registered in `CLI.Run` (`pkg/cli/cli.go`, the **interactive** shell only). A gRPC/REST/remote-cli `commit confirmed` that timed out found `centralRollbackFn == nil` and **never re-applied the dataplane** — mgmt stranded on the unconfirmed config.
+
+## Design (Path Option B — store owns the promotion primitive; daemon owns the applySem transaction)
+
+- **`Store.PromoteRollback(gen) (prevCfg, ok)`** — the store-state half only (promote, reclone candidate, persist with #1799 degrade-not-fail, journal `auto_rollback`), returns the compiled pre-confirmed config. The #1817 `confirmGen` guard is preserved verbatim. Does **not** touch the dataplane.
+- **`SetRollbackExecutor(func(gen uint64))`** replaces `SetCentralRollbackHandler`. The confirm timer calls the executor (read under `s.mu`, invoked off-lock) when set, else falls back to the self-contained `performAutoRollback`.
+- **`Daemon.executeConfirmedRollback`** acquires `applySem` **first**, then `PromoteRollback` + `applyConfigLocked` in one critical section (lock order `applySem → s.mu`, matching `commitAndApply`). Registered at **daemon init** in `Run()` → covers gRPC/REST/remote-cli **and** the interactive in-process CLI.
+- **CLI** no longer registers a rollback apply; the daemon owns it in all modes. A CLI embedded without a daemon falls back to `performAutoRollback`.
+
+## Scope (deferred to PR-2)
+
+- **Item 1b** (first-commit `prevCfg == nil` → bootstrap + never-committed marker): `PromoteRollback` returns `(nil, false)` and leaves current behavior unchanged. Marked with a TODO at the `prevCfg == nil` branch.
+- The **forward** commit-confirmed path (`commitConfirmedAndApply`) is already correct and is **untouched**.
+- Bootstrap mode, PCI-keyed lifeline, protected-set: PR-2.
+
+## Tests
+
+- `pkg/daemon/rollback_serialize_test.go`: rollback vs concurrent commit — `maxSeen == 1` (both serialize through `applySem`) + store/apply consistency over 50 iterations (no torn state).
+- `pkg/configstore`: `PromoteRollback` gen-guard (stale/double = no-op) + `prevCfg == nil` early-return.
+
+## Validation
+
+- `go build ./...` clean; full `go test ./...` green; new serialization + configstore confirm tests 5× `-race` clean; existing apply-serialize tests 5× `-race` clean; `make audit-check` green.
+- Live functional validation on the loss cluster (service-mode `commit confirmed` timeout auto-reverts + re-applies the dataplane; v4+v6 forwarding sanity) — see PR comments.
+
+### Why test-failover / the per-class CoS matrix are out of blast radius
+
+This is a control-plane commit-confirmed transaction-atomicity fix in `pkg/configstore` + `pkg/daemon` apply serialization. It touches no VRRP/session-sync/failover code and no dataplane classifier/CoS/fair-share code, so `make test-failover` and the per-class CoS matrix exercise paths this change cannot affect. The relevant safety property (rollback ⟂ concurrent commit serialize through `applySem`) is proven by the new race tests; the live gate confirms the service-mode re-apply end to end.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #1936 — #1922 PR-2: SAFE-BOOTSTRAP daemon — bootstrap mode, lifeline, protected set, first-commit rollback [MERGED] (merged 2026-06-16)
+
+Branch: `engineer/1922-pr2-bootstrap`
+
+Closes #1922
+
+Completes the #1922 SAFE-BOOTSTRAP umbrella (PR-1 / Item 1a — daemon-owned commit-confirmed rollback executor — already merged). This PR is Items 2-4 + the deferred Item 1b, per the converged plan (`docs/research/1922-safe-bootstrap-daemon/plan.md`).
+
+## What this buys
+The daemon can no longer lock an operator out of a remote box it manages: a fresh/foreign host enters a defined **bootstrap mode** that does NOT rename NICs / cycle links / take over networkd / arm the dataplane until the operator has `commit confirmed` a config it confirmed; the management NIC is identified and preserved by PCI address; and the reconcile path can never bring down the protected mgmt NIC.
+
+## Items
+
+**Item 2 — bootstrap mode + five-case boot predicate** (`pkg/daemon/bootstrap.go`, `daemon_run.go`)
+- `computeBootClass`: fresh/never-committed → bootstrap; valid active.json / clean day-0 import / operator-committed-empty → normal; corrupt/too-new → fail-safe (already fatal via #1917 D1).
+- **HA-node guard (C2/C8)** keys on `/etc/xpf/node-id` FILE presence, not the config-derived `clusterMode` — a node-id node always resolves NOT-bootstrap (node-id-without-config = loud-error, HA not promised).
+- **C6 subsystem gate matrix**: managers constructed unconditionally (C1); only takeover ACTIONS suppressed (full rename loop, host tunables, `enableForwarding`, dataplane `Start`, boot-time `applyConfig`). gRPC/REST/CLI run normally. `bootstrapMode` is an `atomic.Bool`, cleared one-way on the first non-empty config apply (confirmed commit OR cluster `SyncApply`, both via `applyConfigLocked`).
+- First-takeover gate (OQ-B, blunt): a plain first `commit` in bootstrap is refused with guidance to `commit confirmed`.
+
+**Item 3 — PCI-keyed lifeline** (`bootstrap.go`): detect the default-route mgmt NIC (v4 then v6, else refuse + console), record PCI+MAC to `/etc/xpf/lifeline-interface` (keyed by PCI — survives rename/restart/rollback), and only if it would become fxp0 rename just it + snapshot its addressing into the bootstrap `.network`.
+
+**Item 4 — protected set** (`pkg/dataplane/compiler_iface.go`): a daemon-registered, config-independent resolver merges fxp0 / lifeline NIC / explicit `system management-interface` leaf into the `compileZones` unmanaged-strip skip map, so they are NEVER marked Unmanaged / always-down / address-stripped, even on empty/absent/rolled-back config. OQ-D auto-exempt; explicit non-fxp0 leaf narrows fxp0 off. nil resolver = pre-#1922 behavior.
+
+**Item 1b — first-commit rollback** (`pkg/configstore` step-0 marker + `enterBootstrapMode`): a timed-out first `commit confirmed` persists the never-committed marker (committed=0, not an empty committed tree) and the daemon rolls back to bootstrap (remove takeover `.network` except lifeline, clear FRR managed section, detach dataplane) instead of applying empty.
+
+## Step-0 marker (Item 2 prerequisite)
+A `committed=` field on the #1917 config-DB envelope. Migration rule C3: a missing field defaults to **committed=true**, so an upgraded box with an existing active config can never misclassify into bootstrap; the never-committed marker is forward-only.
+
+## Engineer-time resolutions
+OQ-B blunt first-commit gate; OQ-C v4-then-v6-else-refuse lifeline ladder; OQ-D auto-exempt + non-fxp0 leaf narrows fxp0; lifeline keyed by PCI+MAC. The `system management-interface` config-mode set-grammar is deferred (typed field wired; default-route signal is the primary no-config path). See `docs/pr/1922-pr2-bootstrap/reviewer-ids.md`.
+
+## Tests
+- configstore: marker round-trip, C3 migration (enveloped-no-field + no-envelope), everCommitted lifecycle, Item 1b never-committed marker.
+- daemon: five-case predicate table (incl. HA-node guard), protected-set + OQ-D narrowing, lifeline record round-trip, Item 1b enterBootstrapMode + regression boundary (non-first rollback re-applies prior config, stays out of bootstrap).
+- dataplane: protected-interface resolver wiring.
+- Full `go test ./...` green; 5x flake on configstore/daemon/dataplane clean; `make audit-check` green.
+
+Live validation (loss cluster + standalone) pending in the PR thread.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #1937 — docs: README getting-started restructure + move reference content to docs/ [MERGED] (merged 2026-06-16)
+
+Branch: `docs/readme-getting-started`
+
+## Summary
+
+Restructures the top-level `README.md` into a **getting-started guide**
+and moves the deep reference content into focused `docs/` subdocuments,
+with clear pointers from the README to those + the existing design docs.
+The README previously led with dataplane architecture, the full feature
+matrix, code layout, and test-VM topology — burying "how do I run this?"
+— and duplicated content already in `docs/install-images.md` /
+`docs/deploy-quickstart.md`.
+
+**Docs-only — no code change. No cluster smoke required** (per the
+triple-review skill's "when NOT to use": this changes no production code,
+no dataplane, no HA path).
+
+## Install paths (all cross-checked against the real tooling)
+
+- **(A) Debian package** — `make deb` → `apt install ./xpf_<ver>_amd64.deb`
+  (+ the `xpf-appliance` metapackage), grounded in `debian/control`,
+  `debian/xpf.postinst`, and the `deb` Makefile target.
+- **(B) Incus image** — `make image` (`scripts/image/bake.py`) →
+  `incus image import` → `scripts/deploy/xpf-deploy.py deploy
+  examples/deploy/standalone.yaml`.
+- **(C) KVM/QEMU/libvirt** — boot the baked qcow2 with `virt-install`,
+  day-0 ISO via `scripts/image/make_config_drive.py`; or
+  `xpf-deploy.py --hypervisor libvirt` for SR-IOV/passthrough.
+
+Every command is taken from the actual tooling; environment-specific
+values (image version, NIC sources) are shown as placeholders.
+
+## Moved-content map (relocated, not deleted)
+
+| From (old README section) | To |
+|---|---|
+| Dataplane Architecture, Architecture, Code Layout, command-tree split, APIs | `docs/architecture.md` (new) |
+| Features, Userspace Dataplane Capabilities matrix | `docs/feature-coverage.md` (new) |
+| Network Topology (test VM + HA cluster) | `docs/network-topology.md` (new) |
+| Byte-order / verifier / SR-IOV / interface-mgmt / HA-timing gotchas (from CLAUDE.md, now operator-readable) | `docs/critical-patterns.md` (new) |
+| (new documentation index) | `docs/README.md` (new) |
+
+Stale references corrected during the move: eBPF dataplane retired
+(#1373/#1476), DPDK retired (#1525) — framed as historical, not
+selectable backends.
+
+## Verification
+
+- All new markdown links resolve (checked every `docs/*.md` and
+  `examples/deploy/README.md` target).
+- `go build ./...` clean (no code touched).
+- `make audit-check` keys on Go-source counts via
+  `scripts/refactoring-audit.sh`, unaffected by docs.
+
+*(truncated — 52 lines total)*
+
+
+---
+
+## PR #1938 — Signed, hosted appliance distribution mechanism (Part of #1924) [MERGED] (merged 2026-06-17)
+
+Branch: `engineer/1924-signed-dist`
+
+## Part of #1924 — signed, hosted appliance distribution (MECHANISM)
+
+Implements the signed-distribution mechanism converged in the `/research` plan
+(`docs/research/1924-signed-hosted-dist/plan.md`, PLAN-READY at 4597a0ed1). The
+hosting URL and the signing public key are **config inputs**, never hardcoded.
+The actual live publish/host step is the only part gated on the two operator
+inputs (below).
+
+### What's implemented
+- **Image signing** (`scripts/dist/sign.py`): minisign over a per-version
+  `xpf-<ver>.SHA256SUMS`; PER-FILE verification of the exact imported bytes
+  (rejects pathful/dup manifest entries; hashes the concrete file, compares to
+  the signed entry for its basename). Secret key referenced by PATH
+  (`XPF_SIGN_SECKEY`), never embedded/committed.
+- **bake.py**: emits the per-version manifest + `.minisig` (fail-OPEN at bake
+  with a "not publishable" warning when `XPF_SIGN_SECKEY` is unset).
+- **validate.py**: `--verify-sig`/`--no-verify-sig`; verifies the exact
+  `--qcow2`/`--metadata` against the signed manifest before `incus image import`.
+- **xpf-deploy.py `fetch`**: downloads from `XPF_IMAGE_BASE_URL`, verifies the
+  exact bytes, then imports. Verify happens at fetch/import, not alias-launch.
+- **Signed apt repo** (`scripts/dist/build-apt-repo.sh`): flat signed repo by
+  default (apt-ftparchive + gpg, stateless-CI-safe), reprepro opt-in;
+  `stable`/`edge`; `Valid-Until` (default 1y, `XPF_APT_VALID_DAYS`).
+- **install.sh**: Tailscale-style — kernel≥6.18/amd64/Debian-family/networkd
+  preflight, inline archive keyring, deb822 `Signed-By` source
+  (`XPF_APT_BASE_URL`), `apt install xpf-appliance`, #1879 takeover + #1917
+  upgrade-blip caveats. `XPF_DRY_RUN=1`.
+- **publish.py**: FAIL-CLOSED gate (refuses unsigned images / unsigned or stale
+  `latest.json` / unsigned apt `InRelease`), then `XPF_PUBLISH_CMD <dir> <url>`
+  once per URL. No backend hardcoded.
+- **debian/rules**: ships the archive keyring in the `xpf` package payload
+  (`/etc/apt/keyrings/...`) so `apt upgrade` delivers rotated keys to existing
+  hosts (NIT-2 — no fleet lockout). No postinst logic.
+- **Placeholder keys** (`*.placeholder`): secrets shredded at generation (held
+  by no one) — verify FAILS until the operator drops in the real key (the
+  correct fail-safe).
+- **Docs**: `docs/distribution.md` (trust model, two operator inputs, publisher
+  + operator runbooks, rotation, freshness), `docs/install-images.md`.
+
+### Validation (no dataplane change → no cluster smoke / no failover)
+- `go build ./...` clean.
+- `shellcheck -S warning scripts/dist/*.sh` clean.
+- `make dist-selftest` (`scripts/dist/selftest.sh`): **13/13 PASS** — throwaway
+  key → sign → verify → tamper-detection (modified artifact, tampered manifest,
+  tampered signature, wrong pubkey) → per-file qcow2-only verify → flat signed
+  apt repo build → `InRelease` verify + tampered-`InRelease`-fails →
+  `install.sh` dry-run. No real key, no host.
+- publish gate verified to fail-closed on an unsigned dist tree.
+
+### NOT in this PR (needs the two operator inputs — #1924 stays OPEN)
+
+*(truncated — 60 lines total)*
+
+
+---
+
+## PR #1939 — #1930 INC-0: hold the kernel + apt safety in the appliance bake [MERGED] (merged 2026-06-17)
+
+Branch: `engineer/1930-kernel-os`
+
+## Part of #1930 — INC-0: hold the kernel + apt safety in the appliance bake
+
+The embedded AF_XDP shim `.o` is **kernel-space-verifier-gated** (#1864): a
+kernel the `.o` has never been verified against can REJECT it at boot, leaving
+the box with no dataplane (the exact 2026-06-10 incident that motivated #1864).
+Today `bake.py` pins the image to one kernel ≥ 6.18 but nothing stops a later
+`apt upgrade` from moving the running kernel out from under the gated shim.
+
+This is the first, self-contained increment of #1930 (the kernel/OS-upgrade
+umbrella). It closes the "unattended apt moves the verifier floor" hole with
+**no daemon code** — the verify-gated in-place kernel **channel** itself (LANE 1)
+is later #1930 work and is intentionally NOT in this PR.
+
+### Changes (`scripts/image/bake.py`)
+- **`apt-mark hold` the installed `linux-*` set.** `apt-mark` does not expand
+  globs, and a bare `linux-*` would shell-expand against the cwd (holding
+  nothing — empirically: in a dir containing `linux-DECOY`, `ls -d linux-*` →
+  `linux-DECOY`). The set is therefore enumerated via
+  `dpkg-query -W -f='${Package}\n' linux-image-* linux-headers-* linux-modules-*
+  linux-generic` and **HARD-ASSERTED** (`apt-mark showhold | grep -c '^linux-'`
+  ≥ 2) so a silent hold failure cannot ship an unprotected image.
+- **`/etc/apt/apt.conf.d/99-xpf-kernel-hold`** blacklists `linux-*` from
+  `unattended-upgrades` — a hold alone can be bypassed by u-u security upgrades.
+  Kernel CVEs flow through the verify-gated LANE-1 channel (#1930), not
+  background apt.
+- **`/etc/needrestart/conf.d/99-xpf.conf`** keeps `needrestart` from
+  auto-restarting `xpfd` (or anything under the runtime version dirs) mid-apt,
+  which would cut the dataplane during a kernel install.
+
+### Validation (proportionate — no boot channel, no cluster smoke)
+- `python3 -m py_compile scripts/image/bake.py` → OK.
+- `go build ./cmd/xpfd/` → OK (no Go changed; worktree builds clean).
+- Functional check of the exact hold predicate on a real apt host: the
+  dpkg-query enumeration lists the 6 installed `linux-*` packages; the ≥2-held
+  assert math passes; the bare-glob mis-expansion was reproduced to confirm why
+  dpkg-query enumeration (not a bare glob) is required.
+- No live bake on this PR (libguestfs bake host); the hold/assert/blacklist are
+  in-bake shell with explicit failure exits.
+
+### Scope
+- This PR is the kernel-pin/apt-safety increment ONLY.
+- The verify-gated one-shot-boot kernel **channel** (A4: fixed A/B UEFI slots +
+  `efibootmgr --bootnext` + `/etc/grub.d/09_xpf` `$cmdpath` branch + persistent
+  watchdog), HA orchestration, and the base-OS/image-replace story are later
+  #1930 PRs (held pending an operator decision on live-validation depth).
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+
+---
+
+## PR #1940 — #1930 INC-1: LANE-1 verify-gated in-place kernel channel (A4 — fixed A/B UEFI slots) [MERGED] (merged 2026-06-17)
+
+Branch: `engineer/1930-kernel-os`
+
+## Part of #1930 — INC-1: LANE-1 verify-gated in-place kernel channel (A4)
+
+The embedded AF_XDP shim `.o` is kernel-space-verifier-gated (#1864): a kernel
+the `.o` has never been verified against can REJECT it at boot → no dataplane.
+`verify-dataplane` runs the KERNEL verifier, so a candidate kernel can only be
+validated from inside a boot of that kernel. This PR ships the **A4** channel
+converged over 6 plan-review rounds: boot the candidate ONCE via a firmware
+one-shot, verify+forward-beacon from inside it, promote-or-revert — loop-safe by
+firmware.
+
+INC-0 (kernel apt-mark-hold, #1939) is merged; this PR is the channel itself.
+
+### Substrate (A4 — fixed A/B UEFI slots)
+Two FIXED, permanently-registered UEFI boot slots (`xpf-A`/`xpf-B`), each an ESP
+dir with the signed shim+grub + a GRUB-script `xpf.selector` (sets
+`xpf_slot_kernel`/`xpf_slot_initrd`). The SHARED `/boot/grub/grub.cfg` branches
+on `$cmdpath` via an `/etc/grub.d/09_xpf` drop-in that `source`s the launched
+slot's selector and emits ONE self-contained default menuentry. Rationale (each
+killed a prior design in review): signed grub ignores a per-dir grub.cfg → branch
+the shared cfg; `$cmdpath` carries the device prefix → reference it directly, no
+string-compare; Secure-Boot lockdown forbids GRUB env writes → no `save_env`;
+update-grub clobbers grub.cfg → ship the branch as a grub.d fragment; per-upgrade
+UEFI entries wear NVRAM → fixed A/B slots; bare-vmlinuz fails Secure-Boot sig →
+shim→grub→MOK kernel; kernels stay in `/boot`, never the ESP.
+
+A candidate is armed by pointing the INACTIVE slot's selector at it (atomic ESP
+write) + `efibootmgr --bootnext <inactive>`. The UEFI **firmware clears BootNext
+before launch**, so a candidate that hangs at ANY stage + a reset falls through
+the permanent BootOrder to the known-good slot — no bootloader/OS write at the
+failing moment, no boot-loop.
+
+### Go mechanism (`pkg/upgrade`)
+- `kernel.go` / `kernel_run.go`: a journaled, crash-safe, idempotent state
+  machine. `Arm()` = preflight (fail-closed: UEFI+efibootmgr, A/B slots
+  registered + active-first BootOrder, GRUB submenu disabled, watchdog per Path-D,
+  /boot+ESP headroom) → install candidate to `/boot` (re-assert the permanent
+  default did NOT move + kernel re-held) → arm → reboot. `Promote()` = the
+  candidate-boot gate (BootCurrent==candidate slot AND uname==candidate AND
+  verify-dataplane PASS AND forward beacon PASS) → non-destructive BootOrder
+  reorder; ANY gate fail → revert (prune candidate, reboot → firmware fallback).
+- `kernel_linux.go`: the production `KernelSystem` (efibootmgr/uname/apt/grub/
+  watchdog wrappers).
+- `cmd/xpfd/upgrade_kernel.go`: `xpfd upgrade kernel {arm <ver>|promote|status}`.
+- Static substrate in `scripts/image/`: `grub.d/09_xpf`, `xpf-uefi-slots`(+unit)
+  (separate, non-blocking, idempotent first-boot NVRAM registration — NOT
+  `Before=xpfd`, never blocks the SAFE-BOOTSTRAP lifeline), bake A/B slot staging
+  + `GRUB_DISABLE_SUBMENU=y` + watchdog-persistence README.
+
+### Validation
+- **Unit:** 20 tests (`go test ./pkg/upgrade`): the kernel state machine via a
+
+*(truncated — 83 lines total)*
+
+
+---
+
+## PR #1941 — #1930 INC-2: external HA kernel-rolling orchestration + bounded local self-recovery [MERGED] (merged 2026-06-17)
+
+Branch: `engineer/1930-kernel-os`
+
+## Part of #1930 — INC-2: external HA kernel-rolling orchestration (LANE-1)
+
+Drives a verify-gated kernel bump across an HA pair ONE NODE AT A TIME so the
+cluster keeps forwarding, building on the merged `xpfd upgrade kernel` verb
+(INC-1). Per the converged plan §3.1-HA: the per-node arm/verify/promote/revert
+is owned by the in-guest verb; this EXTERNAL driver survives the per-node reboots
+(an in-process driver dies at the reboot it triggers) and owns the cross-node
+sequencing + the "never both down" gate. Plus a Go-side bounded local
+self-recovery for the orchestrator-crash case.
+
+### Three parts
+1. **Durable promotion marker + machine-parseable status** (`pkg/upgrade`,
+   `cmd/xpfd`): Promote() writes `/var/lib/xpf/kernel-promoted` (survives the
+   journal clear) so the driver's post-reboot version-check has a durable signal;
+   `xpfd upgrade kernel status` emits `promoted=<uname>|none` / `armed=…`. Arm()
+   clears a stale marker (fatal on failure) so a prior same-version roll can't
+   false-confirm.
+2. **Bounded local self-recovery** (`pkg/upgrade/kernel_selfrecover.go` +
+   `pkg/cluster` predicates + `pkg/daemon` loop): if the external orchestrator
+   crashes mid-roll leaving a node drained, the node auto-`ResetFailover`s after
+   a grace period — UNLESS an unexpired kernel-roll lease names it (real roll in
+   progress) — and only if the peer is a healthy primary. 7 unit tests.
+3. **External driver** (`scripts/deploy/xpf-deploy.py kernel-roll`): per node,
+   acquire a lease on both nodes (cross-driver mutex + suppress the rolled node's
+   self-recovery) → `xpfd upgrade kernel drain` (confirmed) → `arm` (reboot into
+   candidate) → poll `status` for `promoted==version` (STOP + leave-peer-primary
+   on revert/timeout) → `xpfd upgrade kernel rejoin` (confirm sync before
+   touching the peer) → release lease; node0 then node1.
+   - New non-interactive in-guest verbs `xpfd upgrade kernel drain` /`rejoin`
+     (the cli `request system ... in-service-upgrade` path can't confirm in a
+     non-TTY): `DrainAndConfirm` (ForceSecondary + pre-check peer-takeover-ready
+     + HA-compat + wait the STRONG drain predicate, **fail back on timeout** so
+     VIPs are never stranded) / `RejoinAndConfirm` (ResetFailover + confirm
+     peer-alive + sync). 8 unit tests.
+
+### Concurrency (the lease is a real cross-driver mutex)
+The lease went through 4 review rounds to be race/deadlock-free: acquire runs the
+whole reclaim-expired+create critical section under `flock`; a live foreign lease
+is left untouched; partial acquisition releases what it got; leases are acquired
+in canonical (sorted) node order so opposite-order drivers can't deadlock;
+release removes ONLY our own lease (holder-guarded, under flock); expiry is
+rendered in the NODE's clock (clock-skew safe).
+
+### Validation
+- **Unit (green):** 7 self-recovery + 8 drain/rejoin tests; full `pkg/upgrade` +
+  `pkg/cluster` suites (HA suite, no regression); `go build ./...`, vet, gofmt
+  clean. `xpf-deploy.py` compiles + `kernel-roll --dry-run` shows the full
+  flock-acquire → drain → arm → poll → rejoin → release sequence.
+- **Cluster no-regression (loss userspace cluster, serialized lock cell):** the
+  INC-2 binary deployed to both nodes (verify-dataplane gated); post-deploy live
+
+*(truncated — 68 lines total)*
+
+
+---
+
+## PR #1942 — #1930 INC-3: LANE-2/3 image-replace + mixed-base gate + base-OS docs [MERGED] (merged 2026-06-17)
+
+Branch: `engineer/1930-inc3`
+
+## Closes #1930 — INC-3: LANE-2/3 image-replace + mixed-base gate (final PR)
+
+The last increment of the #1930 kernel/OS upgrade design. INC-0 (kernel
+apt-hold), INC-1 (LANE-1 A/B UEFI kernel channel), and INC-2 (HA kernel
+roll orchestration) are merged; this adds LANE-2 (image-replace) and
+LANE-3 (base-OS major upgrade) and the operator playbook.
+
+### What it adds
+1. **`xpfd protocol-versions`** — emits the compile-time HA / session-sync /
+   config-DB version constants this binary embeds (stable `key=value` lines).
+   The deploy host reads these from the staged binary unpacked from a new
+   image.
+2. **Bake version manifest** — `bake.py` records the same fields in
+   `xpf-<ver>.manifest` (run from the staged binary after it passes the
+   verify-dataplane pre-gate), so the mixed-base gate is a file read.
+3. **Mixed-base HA gate** (`pkg/upgrade/imageversions.go`,
+   `GateMixedBaseSwap`) — before a rolling image-replace swaps the second
+   node, decides whether the mixed-base window (new image on node[0], old
+   image on node[1]) preserves sessions: survive iff the peer's HA protocol
+   is within the new image's `[min-compat, version]` window AND session-sync
+   matches exactly. **Fail-closed** otherwise ("re-image both, sessions
+   drop"). 6 unit tests.
+4. **`xpf-deploy.py image-roll`** — rolling image-replace driver: gate →
+   drain (INC-2 verb) → recreate via operator `--recreate-hook`
+   (backend-specific) → poll → rejoin+confirm sync (INC-2 verb), one node at
+   a time, never-both-down. `--allow-session-drop` overrides the gate.
+5. **LANE-1/2/3 docs** (`docs/in-place-upgrade.md`) — the decision rule
+   (series change ⇒ LANE 2), the mixed-base gate, the TEXT-config
+   state-carry contract (not the encrypted DB; `master.key` is regenerated
+   on a fresh image), and **`do-release-upgrade` UNSUPPORTED**.
+
+### Design provenance
+Per the converged plan (`docs/research/1930-kernel-os-upgrades/plan.md`,
+§3.2/§3.3, Path Option B1): image-replace is the only supported base-OS
+path; B2 (`do-release-upgrade`) was dropped unanimously (irreversible
+userspace move, half-upgraded under kernel hold, N+1-userspace-on-N-kernel
+brick, untestable). The mixed-base gate closes r1 Codex Finding 7 (the v1
+"connections survive via session-sync" overclaim) — survival is now GATED,
+not assumed.
+
+### Validation
+- `go build ./...`, gofmt clean; `pkg/upgrade` (incl. 6 new gate tests) +
+  `pkg/cluster` + `pkg/configstore` green.
+- `xpfd protocol-versions` output verified; `xpf-deploy.py image-roll`
+  dry-run verified (gate fail-closes on an unreadable peer, prints the
+  re-image-both guidance).
+- The live rolling image-replace is bench/manual (recreate-from-image needs
+  the backend hook + a private HA pair); the gate + sequencing logic is
+  unit-tested + dry-run-verified, mirroring the INC-2 validation posture.
+
+
+*(truncated — 51 lines total)*
+
+
+---
+
+## PR #1945 — #1913: filter trailing slow-path reinject by disposition [MERGED] (merged 2026-06-17)
+
+Branch: `engineer/1913-fromframe-filter`
+
+## Summary
+
+The trailing `maybe_reinject_slow_path_from_frame` call at the end of the
+non-forward branch in `poll_binding_process_descriptor`
+(`userspace-dp/src/afxdp/poll_descriptor/mod.rs`) ran **unconditionally**
+after the disposition match, with no eligibility filter. `PolicyDenied`,
+`HAInactive`, and `DiscardRoute` cold-path frames were handed to the raw
+reinjection primitive, which enqueues the L3 packet to the kernel slow-path
+TUN → kernel FIB. A configured zone-policy DENY was therefore silently
+bypassed for every cold-path (sessionless) packet of a denied flow,
+rate-limited only by the slow-path token bucket and invisible in
+per-disposition slow-path telemetry.
+
+The allow-list (`LocalDelivery | NoRoute | MissingNeighbor |
+NextTableUnsupported`) lived only inside the desc-wrapper
+`maybe_reinject_slow_path`; the trailing call used the unfiltered
+`_from_frame` variant.
+
+## Fix — Path A (call-site gate via a shared predicate)
+
+1. Added `ForwardingDisposition::is_slow_path_eligible` (single source of
+   truth) co-located with `is_cacheable` in `types/forwarding.rs`.
+2. Refactored the filtered `maybe_reinject_slow_path` wrapper to call the
+   predicate (pure refactor — same allow-list).
+3. Gated the trailing call site with the predicate. Rejected dispositions
+   are already counted by `record_forwarding_disposition` and recycled by
+   the `recycle_now` epilogue — no leak, no double-count.
+4. Documented `maybe_reinject_slow_path_from_frame` as the RAW/unchecked
+   primitive. Its two intentional unfiltered callers (the FabricRedirect-Owned
+   fallback in `tx/dispatch/mod.rs` and the ForwardCandidate build-failure
+   fallback in `handle_forward_build_failure`) pass dispositions outside the
+   allow-list on purpose — which is why the filter must NOT live inside the
+   primitive (Path B, rejected by the converged plan).
+
+Out of scope (per the plan): the `dispatch/mod.rs` FabricRedirect
+desc-branch asymmetry and the buffered-MissingNeighbor duplicate (Q3).
+
+## Tests
+
+- `slow_path_eligibility_predicate_allow_list` — exact allow/deny sets.
+- `maybe_reinject_slow_path_drops_ineligible_dispositions` — the wrapper
+  drops PolicyDenied/HAInactive/DiscardRoute cleanly with a valid frame.
+- `txn_tunnel_marked_missing_neighbor_not_buffered` — updated. The fixture's
+  tunnel-marked frame resolves to residual `HAInactive` (rg=0) at the HA gate;
+  pre-fix it reached the R-C tunnel gate, post-fix it drops earlier at the
+  disposition gate. The R-E not-buffered/dropped/not-reinjected invariant is
+  preserved (now asserts `slow_path_packets == 0`).
+
+Full `cargo test --release` green (2005 unit + integration), 5× flake clean
+on affected tests.
+
+*(truncated — 52 lines total)*
+
+
+---
+
+## PR #1947 — #1918: real ICMP liveness probe for tunnel keepalive [MERGED] (merged 2026-06-17)
+
+Branch: `engineer/1918-probe-real-liveness`
+
+## Summary
+
+`probeICMP` (`pkg/routing/tunnel.go`) opened an ICMP/UDP socket and returned `true` on socket-open **without ever sending or receiving an echo** — a route-existence check, not a liveness check. A dead GRE/IPIP peer behind a valid route was reported up forever and the fail-safe `LinkSetDown` was structurally unreachable. Secondary: `keepaliveLoop` held `state.mu` across the netlink `LinkSetUp/Down`, so a slow netlink op blocked status reads.
+
+Implements the 3-way converged plan (`docs/research/1918-probe-real-liveness/plan.md`, r6).
+
+## What changed
+
+- **Real datagram-ICMP echo prober** (`tunnel_keepalive.go`) modeled on the tested `pkg/cluster/monitor.go` precedent, with the two precedent gaps fixed:
+  - **Reply match on Seq + a per-probe Data-nonce, NOT the ICMP ID** (datagram "ping" sockets rewrite the id to the socket source port).
+  - **Bind to the tunnel local Source IP** (§5c); probe the **underlay Destination in the GLOBAL FIB** (§5b — no overlay-VRF bind).
+- **Typed result** `ProbeAlive | ProbeDead | ProbeUnsupported` replaces the bool.
+- **Commit-after-success tick (Axis D)**: classify + compute intent under `state.mu`, release the lock, do the single `LinkSet*` outside the lock, commit `Up` only on netlink success. A `LinkByName`/`LinkSet*` error leaves `Up` unchanged so the transition retries — no lost/half-applied transition, no uncommitted `Up` observable by a racing `GetStatus`, no lock held across netlink.
+- **Hold-on-unknown (Axis C)**: `ProbeUnsupported` never touches `Failures` and never transitions the link. Structural → hold indefinitely + one-shot Warn; transient/unrecognized errno → hold but escalate to `slog.Error` after `MaxRetries` consecutive unknown ticks. Status renders `KeepaliveUp=nil` + `"unknown (...)"`.
+- **Recreate safety (Axis D F7)**: `applyKernelTunnelLocked` now cancels + **drains the existing keepalive runner BEFORE the LinkDel/LinkAdd recreate**, so no stale runner `LinkSet*`s a recreated link that reused the ifindex. A per-tunnel `linkGen` (`*atomic.Uint64`, read **lock-free** — the runner never takes `t.mu`, AGY r5 deadlock note) is the defense-in-depth backstop. Tunnel `Source` joins the runner identity (`matches()`).
+
+## Testing
+
+- Deterministic injected-prober tick tests: alive / dead-once / recovery-once / structural-hold / transient-escalate / LinkByName-no-latch / LinkSet*-error-retry / generation-guard-drop / status-not-blocked-by-netlink / source-bind.
+- Production-prober tests over a fake socket: Seq+nonce match, wrong-seq/nonce → Dead, foreign-reply skip, no-reply → Dead, errno structural/transient classification.
+- `go build ./...` clean; `go vet ./pkg/routing` clean; `go test -race ./pkg/routing` 5x clean; full `go test ./...` green.
+- The former `TestProbeICMP` encoded the bug (asserted route-existence == liveness) and is removed.
+
+Closes #1918
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #1948 — dhcprelay: fix socket lifecycle (#1915) [MERGED] (merged 2026-06-17)
+
+Branch: `engineer/1915-relay-socket-lifecycle`
+
+Fixes the DHCP relay socket lifecycle. Implements the converged r4 plan
+(`docs/research/1915-relay-socket-lifecycle/plan.md`).
+
+## Defects fixed (all in `pkg/dhcprelay/relay.go`)
+
+1. **Multi-interface EADDRINUSE.** `net.ListenUDP` has no pre-bind Control
+   hook, so REUSEADDR/REUSEPORT were never set before `bind(2)` — the
+   second interface in a group failed and only the first was served. Now
+   created via a `packetConnFactory` whose default uses
+   `net.ListenConfig.Control` to set REUSEADDR+REUSEPORT+BINDTODEVICE
+   pre-bind (mirrors `vrfListenConfig`). Per-interface isolation holds:
+   the kernel discards BINDTODEVICE-mismatched sockets before REUSEPORT
+   fanout, so no cross-interface/duplicate relaying.
+2. **Stop()/reapply hang.** Blocking reads with no close-on-cancel. Reads
+   now use `net.PacketConn.ReadFrom`; a close-on-cancel watcher (started
+   LAST, after both conns exist) closes BOTH conns. The server-response
+   goroutine is tracked with a WaitGroup and joined; both loops cancel the
+   shared ctx on exit, and the main loop runs in an inner func so
+   `defer cancel()` fires BEFORE the outer `wg.Wait()`. Loops exit only on
+   ctx-cancel or `net.ErrClosed`; the `default:` no-op is removed.
+3. **Dead relay on boot.** giaddr resolution now retries on a bounded,
+   ctx-cancelable interval, re-resolving the interface each attempt
+   (covers a missing interface and a missing address).
+4. **Dropped broadcast replies.** `SO_BROADCAST` now set on the client
+   conn (was never set → EACCES to 255.255.255.255:68).
+
+## Tests
+
+Lifecycle/regression tests via the injectable factory + resolver seams
+(no root, no real NICs): multi-interface no-collision (REUSEPORT +
+non-empty BINDTODEVICE invariant), bounded Stop with no packets,
+reapply-does-not-hang, response-goroutine join, startup retry
+(interface- and address-missing), Stop-during-retry, one-sided-exit
+cross-cancellation, closed-no-spin.
+
+`go build ./...`, `go vet`, and `go test ./...` green; new tests pass 5x
+under `-race`. Control-plane only — no smoke (off the HA/dataplane path).
+Public `Manager` API unchanged; daemon/CLI untouched.
+
+Deferred follow-ups (per plan): VRRP-Backup duplicate-relay suppression
+(gated on `make test-failover`); dhcp-relay/dhcp-server `:67` commit-check.
+
+Closes #1915
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #1949 — #1944: system login user encrypted-password (console login for non-root operators) [MERGED] (merged 2026-06-17)
+
+Branch: `engineer/1944-login-user-password`
+
+Closes #1944
+
+## Problem
+`system login user <name>` carried no password — only root got one
+(`root-authentication encrypted-password` → `/etc/shadow` via
+`chpasswd -e`). A non-root operator account created by xpf has a locked
+shadow field, so on the **serial console** (no SSH-key path) it cannot
+log in at all.
+
+## Change (converged r5 plan — `docs/research/1944-login-user-password/plan.md`)
+- **A1 apply**: parse `encrypted-password` under `user … authentication`;
+  apply to `/etc/shadow` via `runCommandStdinTimeout(stdin, "chpasswd",
+  "-e")`, mirroring `applyRootAuth`.
+- **C1/E1 validator** (`ValidateCryptHash`, shared by per-user AND
+  root-auth): accepts modular crypt (`$1/$2a/$2b/$2y/$5/$6/$7/$y/$gy`,
+  non-empty salt + non-empty final checksum, optional `!`/`!!` prefix)
+  and bare lock sentinels (`*`/`!`/`!!`); **hard-rejects plaintext**.
+  Legacy DES dropped so plaintext rejection is absolute. Runs through the
+  #1319 typed-leaf gate: hard-fail at commit, warning on boot/peer-sync.
+- **B1 idempotent**: pure `passwordAction` reads `/etc/shadow` directly;
+  skips `chpasswd` when unchanged; fail-OPEN toward applying, empty
+  shadow field = passwordless (not locked).
+- **D2 lock-on-removal**: removing the directive LOCKS the account
+  (`<user>:!`) instead of orphaning the hash, gated by a **UID-keyed**
+  provenance marker (`/var/lib/xpf/provisioned-users/<name>`, content =
+  UID) — leave-rejoin (same UID) locks; out-of-band recreate (new UID) is
+  left untouched; no GC pass. Never root; fail-CLOSED on a shadow read
+  error so a transient read can never lock out an operator.
+- §5.8 commit warning for a login user with no usable auth method.
+- Docs: `docs/system-login.md` (incl. hash-gen example), feature-gaps.
+
+## Gates
+- `go build ./...` clean; full `go test ./...` green; new tests stable
+  over `-count=5`; `go vet` clean (two pre-existing daemon_flow.go
+  copylock warnings are unrelated/untouched).
+- Functional shadow proof (set→shadow+login, remove→locked-not-orphaned,
+  plaintext/DES/empty-checksum rejected, idempotent no-churn) pending on
+  the standalone test VM — see PR comments.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #1950 — #1919: prune WireGuard addresses on tunnel removal, keep persistent link [MERGED] (merged 2026-06-17)
+
+Branch: `engineer/1919-wg-addr-route-prune`
+
+## Summary
+
+Removing a WireGuard tunnel from config leaked the kernel addresses this
+manager applied to its persistent `wgN` device (and the kernel connected
+route each address auto-installs, plus any FRR direct→connected
+redistribution of it). WG TUNs are intentionally excluded from the
+tunnelManager removal diff (#1432 S2a — the link must never be torn on
+reload), but address reconcile only ran for STILL-configured WG, so a
+removed WG name was never visited again.
+
+## Fix (converged r3 plan)
+
+- New WG-only `wgConfigured` tracking set in `tunnelManager` — records WG
+  names from the last Apply; NEVER feeds the LinkDel removal loop.
+- `Apply` diffs it against current WG names and, for each disappeared
+  name, prunes the device's addresses while **keeping the link** via the
+  new `pruneAppliedAddrsLocked` helper.
+- Helper returns `(failed, retry)`: deletes all present non-link-local
+  addresses + configured/applied link-locals (autoconf fe80 gated out,
+  same gate as `reconcileLinkAddrsLocked`); `retry` is true when an
+  AddrDel failed OR AddrList itself failed — decoupled from `len(failed)`
+  so an empty applied set + transient list failure still retries. Records
+  failed deletes for **all families** (unlike the frozen #1884
+  `reconcileLinkAddrsLocked` contract, which is left untouched).
+- Transient `LinkByName` error retains for retry; genuine not-found drops
+  tracking. `clearLocked` resets `wgConfigured`.
+
+## FRR routes (issue title)
+
+Closed by clarification: WG synthesizes no managed-section FRR route. The
+only FRR-visible artifact is a redistributed kernel **connected** route,
+which the kernel removes the instant its address is `AddrDel`'d — so the
+address prune is the complete fix.
+
+## Residuals (deferred to #1434, documented)
+
+- WG removed while the daemon was DOWN is not pruned (manager prunes only
+  addresses it tracked applying — restart-adoption boundary).
+- VRF membership not unbound on removal (WG binds VRF directly, bypassing
+  the `appliedRI` claim machinery).
+
+## Tests
+
+9 new cases in `tunnel_reconcile_test.go` (basic prune + link-kept +
+autoconf-fe80-preserved, idempotency, non-LL AddrDel-failure retry,
+device-not-found drop, transient-lookup retain, re-add fresh tracking,
+AddrList-failure retain with empty applied, restart-adoption deferral).
+`fakeLinkOps` gains injectable `addrListFail` + per-name `byNameHardErr`.
+
+## Validation
+
+*(truncated — 61 lines total)*
+
+
+---
+
+## PR #1951 — #1943: realign incus test env from Debian 13 to Ubuntu 26.04 (bake.py parity) [MERGED] (merged 2026-06-17)
+
+Branch: `engineer/1943-ubuntu-parity`
+
+Closes #1943
+
+Realign the in-lab incus test VMs from Debian 13 to **Ubuntu 26.04** so the
+standalone (`make test-vm`) and HA cluster envs match the production appliance
+base built by `scripts/image/bake.py`. The 3-way converged plan is on
+`research/1943-ubuntu-test-env-parity`
+(`docs/research/1943-ubuntu-test-env-parity/plan.md`).
+
+## Why
+Production already accepts the whole Debian family (`scripts/dist/install.sh`
+`*debian*|*ubuntu*`); the real gate is kernel >= 6.18. The test env was the only
+thing still on Debian 13, which (a) forced a fragile Debian-unstable kernel-pin
+dance to clear the AF_XDP verifier floor and (b) could not reproduce the
+Ubuntu/shim Secure-Boot boot path that bit #1930.
+
+## Changes (test-env / tooling + docs only — no production code)
+- **Image**: `images:ubuntu/26.04/cloud`, env-overridable via `XPF_BASE_RELEASE`
+  (mirrors bake.py's pin contract). The var pins a different *Ubuntu* release,
+  not a Debian fallback — rollback is `git revert`.
+- **Kernel**: drop the Debian-unstable dance; assert kernel >= 6.18
+  (mirrors `bake.py:233-242`).
+- **Packages** (Ubuntu names, version-exact to the stock kernel):
+  `linux-headers-amd64`->`linux-headers-$(uname -r)`,
+  `linux-perf`->`linux-tools-$(uname -r)`, `host`->`bind9-host`, drop `golang`.
+  **No `linux-modules-extra`** — on this image stream the NIC drivers
+  (mlx5/i40e/ixgbe) ship in the in-image `linux-modules` package and no
+  `linux-modules-extra-*` exists for the kernel (live `apt-cache policy` probe).
+  A driver-dir assertion (`bake.py:227-228`) guards it.
+- **init_on_alloc=0** via a grub.d drop-in (`99-xpf.cfg`) instead of a sed,
+  because the Ubuntu image's `50-*.cfg` re-sets `GRUB_CMDLINE_LINUX_DEFAULT`.
+  Keep a single grub-apply reboot + verify `/proc/cmdline`.
+- **Secure Boot (SB1)**: `xpf-vm` profile sets `security.secureboot: "true"` —
+  the production posture.
+- Docs: CLAUDE.md test-env section + `docs/{test_env,testing,ha-cluster-test-plan}.md`.
+
+## Live validation (images:ubuntu/26.04/cloud VM, plan §4/§8 GATE probes)
+- kernel **7.0.0-22-generic >= 6.18** — PASS
+- full standalone **and** cluster package lists resolve via
+  `apt-get install --simulate`; `bind9-host` / `linux-tools-$(uname -r)` /
+  `linux-headers-$(uname -r)` all have candidates — PASS
+- `linux-modules-extra-*` **absent** on this stream; `mlx5`/`i40e`/`ixgbe`
+  present in the in-image `linux-modules` (driver-dir assert) — PASS
+- grub.d `99-xpf.cfg` + `update-grub` puts `init_on_alloc=0` in `grub.cfg` — PASS
+- VM **reboots under Secure Boot** with the Canonical-signed shim, kernel
+  locked down, no MOK enrollment — PASS (confirms AF_XDP XDP-type BPF is not
+  rejected by lockdown)
+
+Deviation from plan recorded in-commit: the plan's headline "add
+`linux-modules-extra`" instruction was **overridden by the §4 GATE probe** —
+that package does not exist for this kernel/stream and the drivers are already
+
+*(truncated — 68 lines total)*
+
+
+---
+
+## PR #1952 — #1914: three-view union tunnel-endpoint collision gate (wildcard false-accept fix) [MERGED] (merged 2026-06-17)
+
+Branch: `engineer/1914-collision-gate`
+
+Closes #1914
+
+Implements Path 1 from the converged research plan
+(`docs/research/1914-tunnel-endpoint-collision-gate/plan.md`, r3 PLAN-READY
+across Claude SMR + Codex + AGY).
+
+## Defect A (High) — fixed
+
+The #1873 commit-time tunnel-endpoint id collision gate hashed the LITERAL
+pre-expansion group AST interface name. A wildcard apply-group registered
+only `<*>.0` (id 50477), never the concrete post-expansion `wg78.0` /
+`wg1408.0` (both fold to 824), so the gate falsely ACCEPTED a
+builder-emitted collision that the runtime `usedIDs` belt then dropped with
+a loud `slog.Error`.
+
+The gate now rejects on a fold collision in the UNION of three views, all
+pure functions of the candidate config (HA symmetry preserved):
+
+- **View 1** — pre-expansion presence union over `interfaces` + every
+  `groups` block. **UNCHANGED** — preserves the #1873 cross-node symmetry
+  (`TestTunnelEndpointIDCollisionAcrossGroupsIsSymmetric`).
+- **View 2 / View 3** — concrete names the builder would emit after
+  expanding the candidate for node0 / node1 (`emitNodeExpandedTunnelNames`).
+
+Views 2/3 are **recursion-free**: clone → `ExpandGroupsWithVars(node)` →
+gate-free `compileInterfaces` → `config.EmitTunnelEndpointNames`. They never
+call `CompileConfig*` (which calls the gate first → recursion) and never
+read the post-`usedIDs` snapshot. Per-node expansion/compile errors are
+**non-fatal** (that view → empty set), so a config with only `groups node0`
+applying `"${node}"` still commits cleanly.
+
+## SSOT emitter + builder refactor (kills the #1910 drift class)
+
+New config-pure `config.EmitTunnelEndpointNames` returns the
+`{Name, *TunnelConfig}` set the builder would emit (same non-WG src/dest
+gate, same interface-level-WG single-lowest-unit pick, canonical `%s.%d`),
+pre-`usedIDs`, no runtime snapshot. `buildTunnelEndpointSnapshots` is
+refactored onto it; `TestEmitTunnelEndpointNamesMatchesBuilder` pins the two
+together over a corpus so the gate and builder can never drift.
+
+## Defect B (Medium) — documented limitation, NOT fixed
+
+View 1 over-registers an incomplete non-WG tunnel (presence-only, no
+src/dest check) the builder would drop, so a ~1/65535 phantom fold-collision
+falsely REJECTS. This is mutually exclusive with the Defect-A fix (narrowing
+View 1 re-opens a false ACCEPT via group-supplied src/dst and un-applied
+nested-apply-groups). Documented in the gate doc-comment; pinned by
+`TestTunnelEndpointIDDefectBIncompleteGREStillRejects`; runtime `usedIDs`
+`slog.Error` + "rename one interface" remediation is the operator recourse.
+
+
+*(truncated — 64 lines total)*
+
+
+---
+
+## PR #1953 — fsatomic durability coverage: repo-wide canary + TLS persistence + daemon migrations (#1916) [MERGED] (merged 2026-06-17)
+
+Branch: `engineer/1916-durability`
+
+Closes #1916.
+
+Closes the durability coverage gap from #1894: the fsatomic canary
+excluded `pkg/daemon` + `pkg/api` (false coverage confidence), and the
+TLS cert/key were persisted non-atomically with ignored errors.
+
+## Persistence-class migrations
+
+Every in-scope direct `os.WriteFile` is moved to its correct class
+(`docs/engineering-style.md` "Persistence classes"), behavior-preserving
+(same content, same triggers, only the write mechanism changes):
+
+- **DurableState** (`WriteFileDurable`): `/etc/hostname`, sudoers, user +
+  root `authorized_keys`, TLS cert + key, lifeline record, provisioned-
+  users marker.
+- **AtomicGeneratedConfig** (`WriteFileAtomic`): chrony / rsyslog / sshd
+  drop-ins, `ssh_known_hosts`, `/etc/timezone`, `/etc/resolv.conf`,
+  RETH/`.link`/`.network` files.
+- **BestEffortKernelKnob** (direct, allowlisted): procfs/sysfs knobs +
+  the resolv.conf bind-mount in-place fallback.
+
+## Key decisions
+
+- **D5 (TLS write ordering)**: STRICT sequence — `MkdirAllDurable` →
+  strict-remove stale cert AND key (ignore only `os.IsNotExist`; any
+  other remove error OR a `SyncDir` error ABORTS the write, so the
+  `{neither}` start is proven) → `SyncDir` → key (0600) → cert (0644).
+  The only crash-visible states are `{neither}`, `{key-only}`,
+  `{both-matching}`; `LoadX509KeyPair` rejects `{key-only}` → clean
+  regen. No crash-visible MISMATCHED pair.
+- **D6 (cert class = DurableState)**: the HTTPS API can bind a
+  non-loopback `web-management https interface` address reached by remote
+  clients, so cert churn after a power-cut loss would break their TOFU
+  pins. Both cert and key are durable.
+- **D7 (authorized_keys ownership)**: new `fsatomic.WithOwner(uid, gid)`
+  fchowns the temp fd BEFORE the rename, so the file is correctly-owned
+  at install — a crash can never leave root-owned 0600 keys that sshd
+  refuses (EACCES → lockout). uid/gid resolved cgo-free from `/etc/passwd`
+  (`lookupUIDGID`, never `os/user`). Precedence: explicit `WithOwner`
+  wins ownership, `WithPreserveExisting` keeps mode.
+- **D5 step 5 wiring**: a persistence failure logs and returns the usable
+  in-memory cert with a NIL error, so HTTPS still installs (a disk-write
+  failure must not disable HTTPS); a non-nil error is returned only for a
+  true generation failure.
+
+## Canary rewrite
+
+`TestNoDirectOsWriteFile` now walks EVERY production `.go` under `pkg/`
+(repo-wide, not a package allowlist) and keys the allowlist
+RECEIVER-AWARE by `<pkg-relpath>::[RecvType.]func` — closing both the
+
+*(truncated — 76 lines total)*
+
+
+---
+
+## PR #1954 — #1912: fix cold ENCAP outer next-hop blackhole (key outer-hop ARP/resolver by outer L3 egress) [MERGED] (merged 2026-06-17)
+
+Branch: `engineer/1912-cold-encap-outer-nh`
+
+Closes #1912.
+
+## Root cause
+
+GRE/tunnel-bound transit replies blackhole for the full cold window when the
+tunnel's OUTER next-hop neighbor is flushed: no who-has for the outer hop
+appears on the wire, resolver counters stay flat.
+
+`resolve_tunnel_forwarding_resolution` (forwarding/mod.rs) returns a
+`ForwardingResolution` with `egress_ifindex = endpoint.logical_ifindex` (the
+TUNNEL logical ifindex) while `next_hop` is the OUTER hop, and **discards
+`outer.egress_ifindex`**. The MissingNeighbor arm (poll_descriptor/mod.rs)
+keys ALL its outer-hop recovery side-effects by `egress_ifindex`: the kernel
+ARP/NDP probe iface lookup, the #1769 resolver enqueue + key, the neg-cache
+key + resolved-wins, and the already-probing dedup. For a tunnel-marked
+decision that is the tunnel logical ifindex, so the probe binds to the GRE
+interface (a point-to-point L3 iface — no ARP on the physical wire) and the
+resolver never reaches the outer L3 egress where the outer neighbor is keyed.
+Neighbors are keyed by the L3 egress ifindex; for a VLAN outer transport that
+is the subif (`outer.egress_ifindex`), not the parent (`tx_ifindex`).
+
+## Fix (Option B — cold-path helper, no struct field)
+
+- Factor `resolve_tunnel_outer(state, dyn, id, depth) -> Option<ForwardingResolution>`
+  out of `resolve_tunnel_forwarding_resolution` as the shared SSOT for the
+  outer-destination lookup (no behavior change to that fn).
+- Add `outer_neighbor_ifindex(state, dyn, &resolution) -> i32`: returns
+  `egress_ifindex` for a non-tunnel resolution (byte-identical), else the
+  outer transport's `egress_ifindex` via `resolve_tunnel_outer` with a `> 0`
+  fallback to `egress_ifindex`. No field on `ForwardingResolution` (100+
+  literal sites); computed from live state so nothing crosses the wire / needs
+  HA-sync trust.
+- In the MissingNeighbor arm, compute `neigh_if` once per cold packet and use
+  it for the OUTER-hop side-effects only: neg-cache key + resolved-wins,
+  resolver enqueue iface + key, kernel ARP probe iface, already-probing dedup.
+  `pending_neigh` insertion stays keyed by `egress_ifindex` (never reached for
+  tunnel-marked — R-E gate).
+- Resolver-for-tunnel enhancement: for a tunnel-marked MissingNeighbor with
+  `neigh_if > 0`, also enqueue the rate-limited #1769 resolver on the
+  non-fast-fail path (hardens STALE/DELAY outer entries), reusing the existing
+  `resolver_enqueue_throttle`.
+
+## Invariants preserved
+
+- **R-C** (slow-path tunnel-encap-unresolved drop) and **R-E** (tunnel-marked
+  frames never buffered in `pending_neigh`) are unchanged. The fix only
+  changes which interface the already-fired probe/resolver bind to; it opens
+  no buffering/reinjection path and therefore no plaintext-leak window.
+- Non-tunnel MissingNeighbor path is byte-identical (`neigh_if == egress_ifindex`).
+- No wire/protocol/HA change (Go protocol tests green).
+
+*(truncated — 61 lines total)*
+
+
+---
+
+## PR #1955 — docs: correct stale virtio-no-forward venue warning (#1921 resolved) [MERGED] (merged 2026-06-17)
+
+Branch: `docs/1921-virtio-venue-warning`
+
+The `docs/image-validation.md` VENUE WARNING claimed the AF_XDP userspace dataplane cannot forward over virtio NICs in a plain incus VM (libxdp `Device or resource busy` rebind loop, 0-session transit). That described the **#1921 bug, now fixed** — the rebind double-stop + physical+unit double-bind (#1927) and the standalone 16-phantom-HA-group transit gate (#1929, guard startup HA replay behind `m.clusterHA`).
+
+This rewrites the warning as a VENUE NOTE: virtio multi-queue AF_XDP now forwards on a plain incus VM, Tier 2 forwarding assertions run on incus/virtio too, and a virtio rebind loop / 0-session transit should be read as a #1921 regression rather than an expected venue limitation.
+
+Pure doc accuracy fix (no code). Trivial follow-up from the #1944/#1943/#1921/#1919/#1918/#1916/#1915/#1914/#1913/#1912 batch.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #1957 — #1946: drop unsendable FabricRedirect frames fail-closed [MERGED] (merged 2026-06-17)
+
+Branch: `engineer/1946-fabric-redirect-asymmetry`
+
+## Summary
+
+Fixes the asymmetric FabricRedirect "no XSK binding" fallback in `userspace-dp/src/afxdp/tx/dispatch/mod.rs`: a `PendingForwardFrame::Owned` frame was raw-reinjected to the local kernel slow path (`maybe_reinject_slow_path_from_frame`) while a `PendingForwardFrame::Live` desc frame was silently dropped by the filtered `maybe_reinject_slow_path` wrapper (FabricRedirect is excluded from `is_slow_path_eligible`).
+
+**Contract: Option B (symmetric drop + count).** A FabricRedirect is a cross-chassis L2 redirect destined for the HA peer's pipeline, never a kernel-FIB-routable packet. Reinjecting it locally re-introduces the wrong-path / session-poison hazard the fabric mechanism exists to avoid (cf. #1873 R-C), and the reinject primitive strips L2 + applies NAT (wrong for a frame the fabric design wants pristine). The Owned/Live split is a frame-representation detail (Owned = GRE-decapped copy), not a forwarding semantic, so both branches must agree — on drop.
+
+Both frame kinds now drop fail-closed + count on a new per-binding `fabric_redirect_unsendable_drops` counter (BindingStatus-only, mirroring `tunnel_encap_unresolved_drops`), reason `fabric_redirect_no_binding`.
+
+## Second bypass (found in plan review by Codex + AGY)
+
+When the fabric parent binding exists but the forward-frame build/enqueue fails, `handle_forward_build_failure` raw-reinjected FabricRedirect with no disposition gate. Gated there too — drop fail-closed on the same counter (reason `fabric_redirect_build_failed`) before the surviving intentional ForwardCandidate reinject. After this change the only intentional unfiltered caller of the raw primitive is the ForwardCandidate build-failure fallback; doc comments updated to match.
+
+## Plumbing
+
+Counter follows `tunnel_encap_unresolved_drops` exactly (umem field+ctor, snapshot, worker rollup, refresh_bindings copy/zero, reconcile/reset zero, protocol serde, Go `FabricRedirectUnsendableDrops`). Regenerated `protocol_wire_v1.json` (`XPF_PROTOCOL_WIRE_REGEN=1`) — adds exactly the one new key; field is serde-default / Go-omitempty for mixed-version tolerance.
+
+## Tests
+
+- `handle_forward_build_failure_drops_fabric_redirect_fail_closed` — drops + counts, no reinject even with `fallback_to_slow_path == true`.
+- `handle_forward_build_failure_still_reinjects_forward_candidate` — regression guard the gate is FabricRedirect-only.
+- `binding_status_fabric_redirect_unsendable_drops_wire_key_1946` — wire key + roundtrip + mixed-version default.
+- Existing `!FabricRedirect.is_slow_path_eligible()` covers the Live no-binding invariant.
+
+## Validation
+
+`cargo build` clean; `cargo test --release` green (one pre-existing `concurrent_recovery` flake, passes in isolation, untouched here); 5x flake on the new tests stable; `go build ./...` + `go test ./pkg/dataplane/userspace/` green.
+
+Plan: `docs/research/1946-fabric-redirect-asymmetry/plan.md` (3-way PLAN-READY: Claude SMR + Codex r2 + AGY r2).
+
+Closes #1946
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #1959 — #1956: bare-metal interface device-map (stable-identity managed allowlist) [MERGED] (merged 2026-06-17)
+
+Branch: `engineer/1956-device-map`
+
+Closes #1956.
+
+## What
+
+Opt-in **bare-metal device-map**: a stable-identity managed allowlist that
+replaces positional interface naming for the NICs you name, and leaves
+everything else alone. Implements the converged PLAN-READY plan (v3.1).
+
+```
+set chassis device-map interface ge-0/0/3 pci 0000:09:00.0
+set chassis device-map interface ge-0/0/4 pci 0000:0a:00.0 mac aa:bb:cc:dd:ee:ff
+set chassis device-map unmapped-interface-policy leave-alone   # default
+```
+
+Identity: **PCI bus address primary, permanent-MAC fallback**, per-entry
+`key` order. Mode is selected by config presence (`len(entries) > 0`) — with
+**no** device-map, behavior is **bit-identical to today** (positional). The
+#1922 management lifeline composes with and is never overridden by the map.
+
+Architecture: pure resolver + host enumeration in `pkg/devicemap` (shared by
+the daemon rename/pre-flight and the CLI `show`); daemon glue in
+`pkg/daemon/device_map.go`; config grammar/compile/validation in `pkg/config`.
+
+## How the three operator priorities are satisfied
+
+**1. No interface churn on an unrelated / no-op commit.** The reconcile is
+idempotent and binding-delta-driven: `writeLinkFile` returns unchanged for an
+identical `.link` (no rewrite, no `networkctl reload`, no flap);
+`scrubStaleDeviceMapLinks` removes only orphaned names; the
+managed→unmapped teardown (`teardownUnmappedManaged`, run BEFORE
+`networkd.Apply` — V-4) is a no-op when nothing transitioned. Regression
+tests: `TestWriteLinkFileIdempotent`, `TestScrubStaleDeviceMapLinksNoOpWhenAllDesired`,
+`TestTeardownUnmappedManagedNoOpWhenAllMapped`, `TestTeardownManageDownIsNoOp`.
+
+**2. Boot-stable naming.** Identity (PCI/permanent-MAC) → logical name is
+resolved deterministically and written to `.link` files for next-boot
+persistence; resolution is independent of kernel enumeration order / hardware
+reorder / daemon restart. Proof:
+`devicemap.TestResolveDeterministicAcrossReorder` (same identity → same
+logical name across an enumeration reorder + kernel rename). RETH members
+keep `OriginalName=` matching (their MAC alternates physical↔virtual).
+
+**3. Braindead-simple UX — minimal explicit PCI addressing.** Promoted the
+candidates helper INTO the MVP: `show chassis device-map candidates` lists
+every NIC's PCI address / permanent MAC / current name / link state plus a
+ready-to-paste `set ...` example, so an operator never memorizes a BDF.
+`show chassis device-map` renders the resolved bindings + status
+(bound / UNBOUND / via-MAC-fallback / REFUSED-topology-changed). PCI is the
+robust default key; MAC is an explicit fallback. Both local and remote CLI.
+
+
+*(truncated — 96 lines total)*
+
+
+---
+
+## PR #1963 — docs: revert #1955 — virtio is NOT a forwarding venue (#1961) [MERGED] (merged 2026-06-18)
+
+Branch: `fix/1961-virtio-forward-doc-revert`
+
+## Summary
+
+Reverts the doc claim from #1955 (`docs: correct stale virtio-no-forward venue warning`). Live re-validation on clean master shows the AF_XDP dataplane still does **not** forward L3 transit over virtio NICs — #1955's "virtio IS a forwarding venue" claim was wrong.
+
+## What was measured (clean master: xpfd `4f453c98`, helper `cb83da9f`)
+
+- virtio trust→untrust transit: **100% loss, 0 sessions**, helper `Packets received: 0`.
+- Host-inbound ping to the firewall's own IP works (3/3) → control plane + L2 healthy; only AF_XDP XSK RX delivery is broken.
+- XDP shim attaches native, `rx_xdp_redirects` climbs, but the helper's XSK never drains the frames (the XSK-delivery layer — **not** the #1929 HA gate, which would receive-then-drop).
+- Reproduced on **kernel 6.17** (Ubuntu 25.10) **and 6.18** (Debian 13, the ≥6.18 production floor) — not kernel-specific.
+- Reproduced with **AUTO and forced COPY** bind flags, and **busy-poll and interrupt** poll modes — not a bind-flag/poll-mode issue.
+- The #1928/#1929 "AUTO bind forwards 5000 pps on virtio" claim **did not reproduce** on either venue.
+
+#1927/#1929 did fix the earlier `Device or resource busy` rebind loop (the bind now succeeds), so the restored warning describes the *current* mechanism (XSK RX delivery gap), not the old bind-loop symptom.
+
+Forwarding validation stays on a real AF_XDP NIC: mlx5 SR-IOV VFs (loss cluster) or i40e PF passthrough. Tracked in #1961.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #1969 — #1968: upgrade latent defensive hardening (sync-link parse scope/exact + copyTree dir fsync) [MERGED] (merged 2026-06-18)
+
+Branch: `engineer/1968-upgrade-latent-hardening`
+
+## Summary
+
+Closes #1968 — two latent defensive-hardening fixes in `pkg/upgrade` surfaced by AGY review-011 Part I. **Neither is a live bug on the current tree**; both harden against format/schema drift. Behavior is identical on today's inputs.
+
+1. **`parseSyncEstablished` scope + exact-match** (`cluster_cli.go`). The rolling-upgrade drain gate found the *first* `status:` line anywhere in `show chassis cluster information` and accepted it via `strings.Contains(ll, "up")`. Scoped the match to the sync/fabric link section (so a future pre-sync `Status:` section — e.g. folding in `FormatIPMonitoringStatus` — can't be mis-read and wrongly green-light a drain) and require the value to equal exactly `up` (so a future `Status: startup` isn't accepted). The `unsynced` / `Remote node: healthy` guards and fail-closed default are unchanged.
+
+2. **`copyTree` nested-directory fsync** (`runner.go`). `copyTree` fsynced file *contents* but never the nested parent directories it created; callers fsync only the top-level copy root. A power loss after the atomic rename could orphan nested entries → a later auto-rollback could restore a corrupt config-DB snapshot. Latent because both copyTree sources (`.configdb` snapshot, staged→versions) are flat today; the fix makes copyTree durable for any future nesting. Additive — checksum/rename/caller-SyncDir behavior unchanged.
+
+## Plan + research
+
+Plan doc: `docs/research/agy-review-011/plan.md` (3-way converged PLAN-READY at `/research`). SMR + AGY PLAN-READY; Codex PLAN-NEEDS-MINOR → all 5 accuracy fixes folded (incl. the exact-`up` requirement in fix 1).
+
+## Test plan
+
+- [x] `go build ./...` clean
+- [x] `go vet ./pkg/upgrade/` clean
+- [x] Full Go suite (`go test ./...`): no failures
+- [x] `pkg/upgrade` suite: pass
+- [x] New tests 5/5 flake-clean: `TestSyncParser_ScopedAndExact`, `TestParsers_AgainstRealFormatInformation` (extended), `TestCopyTree_NestedDirsDurable`
+- [x] Behavior-preservation: existing `TestSyncParser_Fixtures` (Up→true / Down→false / missing→false) still passes unchanged
+
+**Why no iperf3 CoS smoke matrix:** this is a Go-only change in `pkg/upgrade` (config-DB copy + cluster-status text parser) — it touches **no** dataplane/forwarding/CoS code, so the loss-cluster iperf matrix would exercise none of it.
+
+**Why `make test-failover` is not the gate here:** `parseSyncEstablished` gates the **rolling-upgrade drain** (`xpfd upgrade --rolling`), not the VRRP failover path that `make test-failover` (reboot-during-iperf) exercises — so test-failover would not touch this code. The change is behavior-preserving on the current `FormatInformation` output (proven by the unchanged `TestSyncParser_Fixtures` + the real-format test) and unit-covered for the new scoping/exact-match and nested-fsync paths. Happy to run a rolling-drain integration check if a reviewer wants it.
+
+**Docs:** no operator-facing behavior change; the *why* is captured in code comments. No doc update needed.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #1970 — #1966: debian/control — document postinst-driven standalone cut-over [MERGED] (merged 2026-06-18)
+
+Branch: `engineer/1966-control-postinst-doc`
+
+## Summary
+
+`debian/control` lines ~19-24 claimed the in-place upgrade cut-over
+"is a separate increment and is intentionally not part of this
+package's postinst." That is **stale**: `debian/xpf.postinst`
+(increment B of #1917) DOES drive the cut-over from postinst — on
+upgrade it invokes `"$STAGED/xpfd" upgrade` for standalone nodes,
+performing the verified, rollback-capable STOP->FLIP->START cut.
+
+This updates the package Description to match the actual postinst
+behaviour:
+
+- Binaries install to the dpkg-static staging path; live
+  `/usr/local/sbin` symlinks are created on first install.
+- On **UPGRADE**, a **standalone** node (no `/etc/xpf/node-id`) performs
+  an automatic verified in-place cut-over from postinst via
+  `xpfd upgrade`, suppressible with `XPF_NO_POSTINST_CUT=1`.
+- A **clustered** node (`/etc/xpf/node-id` present) is staged only and
+  is cut over with `xpfd upgrade --rolling` (controlled per-node drain).
+
+Wording was confirmed against `debian/xpf.postinst`.
+
+## Other stale references
+
+`debian/changelog` (increment-A entry, line 7) also says the cut-over
+"is a separate increment." That is **left as-is**: a debian changelog
+entry is a historical release-log record and was accurate for increment
+A — the postinst cut-over hook landed later in increment B. Rewriting a
+past changelog entry to describe later behaviour would be historically
+inaccurate. The forward-looking package documentation lives in the
+`Description` field, which is what this PR fixes.
+
+## Validation
+
+Doc-only change.
+- `go build ./...` clean (no Go impact).
+- `debian/control` parses as three well-formed RFC822 stanzas.
+- `dpkg-parsechangelog` OK.
+
+Closes #1966.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #1971 — #1965: serialize host-local upgrade mutators with a shared lock [MERGED] (merged 2026-06-18)
+
+Branch: `engineer/1965-upgrade-lock`
+
+## Summary
+
+Every MUTATING upgrade operation on a host now takes one host-wide
+advisory lock — `/run/xpf/upgrade.lock`, a non-blocking exclusive
+`flock(2)` (`pkg/upgrade/lock`). It serializes the standalone binary cut
+(`xpfd upgrade`), the rolling driver (`xpfd upgrade --rolling`), the
+postinst auto-cut, and the mutating `xpfd upgrade kernel`
+(`arm`/`promote`/`drain`/`rejoin`) sub-verbs. Without it two mutators
+silently corrupt the crash-safe journal (both load the same snapshot,
+modify independent copies, last-write-wins → the rollback target is
+lost). Read-only `xpfd upgrade kernel status` stays lock-free.
+
+Implements plan §5 of `docs/research/upgrade-hardening-review-011`
+(F2/#1965). #1964 (versions/ seed) and #1967 (annex) are separate
+issues and intentionally out of scope here.
+
+### What's in the change
+- **`pkg/upgrade/lock`** — `Acquire`/`Release` with `LOCK_EX|LOCK_NB`,
+  `mkdir -p /run/xpf` before acquire, owner metadata (PID, subcommand,
+  target, start time) written into the file after the flock so a busy
+  acquirer's `*ErrBusy` NAMES the owner. Release on every exit path via
+  defer; the kernel also drops the flock on process exit.
+- **Entry points** — `Runner.Run` acquires the lock unless
+  `Options.LockAlreadyHeld` (rolling re-entrancy); `RunRolling` acquires
+  at entry and holds it through rejoin (covers peer-check + ForceSecondary
+  + drain), passing `LockAlreadyHeld: true` to the inner cut so a second
+  flock on a fresh fd of the same path does not `EWOULDBLOCK` and abort.
+  The mutating `kernel` verbs take the lock in `cmd/xpfd`.
+- **`debian/xpf.preinst` (new)** — `flock -n` gate BEFORE unpack (Policy
+  6.5/6.6): busy → print owner + exit 1, apt aborts with the system
+  untouched. No `systemctl`, so no boot-guard needed.
+- **`debian/xpf.postinst`** — narrow TOCTOU residual: if the lock went
+  busy between the preinst gate and the cut, drop
+  `/run/xpf/upgrade-deferred`, log loudly, exit 0 (never non-zero — a
+  non-zero postinst leaves dpkg half-configured). Boot-guard the
+  failed-cut `systemctl` calls with `[ -d /run/systemd/system ]`.
+- **`docs/in-place-upgrade.md`** — the lock contract, re-entrancy, the
+  cluster-lock-OUTSIDE / host-lock-INSIDE ordering, and the
+  dpkg-vs-operator staged-source race + `verify-dataplane` backstop.
+
+## Test plan
+- `go build ./...` clean; `go vet ./pkg/upgrade/... ./cmd/xpfd/` clean.
+- Full Go suite green.
+- `pkg/upgrade/lock` unit tests: acquire/release idempotent, busy-names-
+  owner, release-on-panic (defer), release-on-error, release-on-process-
+  exit (kernel backstop, child process), mkdir-creates-/run/xpf.
+- `pkg/upgrade` seam/integration tests: standalone cut acquires exactly
+  once + releases; a busy lock ABORTS before any System mutation or
+  journal write (the core #1965 guarantee); release on the error path;
+  rolling holds the lock once across drain + inner cut (maxHeld ≤ 1, no
+
+*(truncated — 63 lines total)*
+
+
+---
+
+## PR #1972 — #1964: seed versioned runtime on first install (real rollback target) [MERGED] (merged 2026-06-18)
+
+Branch: `engineer/1964-versioned-runtime-seed`
+
+## Summary
+
+Seed a real, immutable rollback target on the **first** `.deb` install so the
+first/legacy-migration in-place upgrade always has a restorable
+`PreviousVersion`. Before this, the first cut had `PreviousVersion==""` and
+`rollback()` hard-refused while dpkg had already overwritten the old binary in
+`staged/` — no recovery path. This is the highest-blast-radius gap in the
+upgrade subsystem; it hits every appliance once.
+
+Implements the converged research plan (review-011 §4 + §7/§8) with three
+composed mechanisms and one layout invariant. Built **on top of** #1965's
+preinst lock gate + postinst contention residual (added to, not replaced) and
+#1966.
+
+### Layout invariant
+`versions/<ver>/` and the `current` symlink are runtime state **owned by the
+maintainer scripts, never in dpkg's file list**. dpkg only ever writes
+`staged/`. `/usr/local/sbin/*` resolve **through** `versions/current`. dpkg can
+therefore never clobber a versioned rollback target.
+
+### Mechanisms
+- **A — first-install seed (`pkg/upgrade/runtime` + `xpfd seed-runtime`).**
+  postinst on first install (before `#DEBHELPER#` starts the unit): copy
+  `staged/*` → `versions/<v>/`, `current → <v>`, repoint sbin through
+  `current`. No cut/verify/stop. Idempotent + crash-safe. Falls back to legacy
+  links on failure; never fails the install.
+- **B — legacy-migration snapshot (`debian/xpf.preinst`, self-contained
+  shell).** Runs in the SAME `upgrade` case as #1965's lock gate, AFTER it
+  passes, BEFORE unpack (the new Go binary isn't on disk yet). Snapshots the
+  OLD `staged/*` → `versions/<oldver>/` via `.partial`+rename, sets `current`,
+  atomically repoints sbin. No-op-when-current-exists + always-complete-sbin
+  idempotency, rename-collision retry (skip→create-current on ENOTEMPTY),
+  `ln -sf …tmp && mv -f` atomic symlink, `staged/xpfd version` (validated safe
+  segment) with sanitized-dpkg-`$2` fallback, never fails the transaction.
+  Writes no upgrade journal.
+- **C — refuse-before-STOP (Go, unconditional pre-STOP invariant).** The cut
+  never calls `StopUnit` unless `PreviousVersion != ""` OR
+  `Options.AllowNoRollbackFirstCut`. `recoverFromFlipFailure` (AGY-5): a flip
+  failure after STOP rolls back to the previous version, or restarts the
+  first-install binary from `versions/current` for a sanctioned first cut —
+  always returning a non-nil error.
+
+### Lifecycle (`debian/xpf.postrm`)
+remove/purge also remove sbin links through `versions/current`; purge removes
+the `versions/` tree (left on remove); downgrade to a pre-hardened package
+(detected via `seed-runtime --capability-check`) removes the unit drop-in,
+repoints sbin back to `staged/`, deletes `current`, boot-guarded
+`daemon-reload`. (Drop-in removal on remove/purge is deferred to #1967, per the
+plan; this PR leaves room.)
+
+
+*(truncated — 77 lines total)*
+
+
+---
+
+## PR #1973 — #1964 follow-up: preinst symlink-only current gate + postrm dirname drop-in [MERGED] (merged 2026-06-18)
+
+Branch: `engineer/1964-fu-postmerge-copilot`
+
+## Summary
+
+Two post-merge Copilot findings on the #1964 maintainer scripts (PR #1972, merged `d58a06783`). Both are small robustness/maintainability fixes; neither was a merge-blocker for #1972.
+
+1. **`debian/xpf.preinst` (robustness):** `migrate_legacy_layout`'s "current exists" fast-path gated on `[ -L "$CURRENT" ] || [ -e "$CURRENT" ]`. If `$CURRENT` is a regular file/dir (corruption / manual edit), the `-e` branch would still repoint `/usr/local/sbin/*` to `$CURRENT/<bin>` — which doesn't resolve and breaks operator tools. The migration is best-effort, so require `$CURRENT` to be a **symlink**; on a non-symlink, log and leave the legacy direct-staged links untouched. This mirrors the Go seed's existing non-directory guard (`TestSeed_RejectsNonDirVersionPath`).
+
+2. **`debian/xpf.postrm` (maintainability):** the downgrade cleanup `rmdir`'d the drop-in directory via a hard-coded `/etc/systemd/system/xpfd.service.d` instead of `dirname "$DROPIN"`. Derive it from `$DROPIN` (single source of truth, no path drift, tracks the test harness's `$DROPIN` rewrite).
+
+## Test plan
+- New `current_is_regular_file` + `current_is_dir` scenarios in `preinst-migrate-test.sh` assert sbin is NOT repointed and the legacy links survive when `$CURRENT` is a non-symlink.
+- `postrm-test.sh` now asserts the empty `.d` dir is removed on downgrade (exercising `dirname "$DROPIN"`) and drops the obsolete sed special-case for the hard-coded path.
+- Gates: `go build ./...` + `pkg/upgrade` tests green; all three shell harnesses 3× under `sh` + `dash`; `sh -n` / `dash -n` / `shellcheck` clean on all three maintainer scripts.
+
+No Go production code changes; no dataplane surface (iperf/CoS smoke N/A). Baked-image dogfood is the ideal validation but isn't runnable here.
+
+Refs #1964.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #1974 — #1967: cutover robustness — version validation, verify-fail cleanup, C4 sync, postrm drop-in [MERGED] (merged 2026-06-18)
+
+Branch: `engineer/1967-cutover-robustness`
+
+## Summary
+
+Implements the genuinely-remaining items of the #1967 hardening annex
+(review-011 converged plan §6), branched off current `origin/master`
+which already carries #1964 (versioned-runtime seed) and #1965 (host
+upgrade lock).
+
+**Already shipped by #1964 — SKIPPED here (no rework):**
+- flip-failure rollback (`recoverFromFlipFailure`, cutover.go) — the
+  plan's AGY-5 must-fix.
+- `ValidateVersionSegment` (Go) + `is_safe_segment` (shell) — REUSED.
+- postrm DOWNGRADE-path drop-in removal — extended to remove/purge here.
+
+**Implemented (#1967 remaining scope):**
+
+1. **C1 — harden `BinaryVersion` fallback** (`pkg/upgrade/system_linux.go`).
+   The unvalidated whole-`xpfd version`-output fallback is removed.
+   The extracted `xpfd <ver>` token is validated via
+   `ValidateVersionSegment`; an unsafe token OR an unrecognized output
+   format hard-fails. A corrupt binary / benign format-drift can no
+   longer key `versions/` by a path-escaping or garbage version.
+
+2. **verify-fail copy cleanup** (`pkg/upgrade/cutover.go`). On a VERIFY
+   failure, remove `versions/<TargetVersion>` so a same-version retry
+   recopies a corrected staged binary instead of re-verifying the stale
+   failing copy. Two mandatory guards: (a) NEVER delete the active
+   (`current`) or rollback (`PreviousVersion`) version dir; (b) rewind
+   the journal to `StatePreflight` and persist so the retry re-runs
+   `copyStaged` (else VERIFY fails file-not-found). The unlink is fsynced.
+
+3. **C4** — `SyncDir(VersionsDir)` after `removeAllPartials()`
+   (`pkg/upgrade/runner.go`), gated on a real removal, via a testable
+   `partialSweepSyncDir` seam.
+
+4. **postrm drop-in removal on remove/purge** (`debian/xpf.postrm`).
+   Shared `remove_runtime_dropin` helper removes
+   `/etc/systemd/system/xpfd.service.d/10-xpf-version.conf`, rmdirs the
+   empty `.service.d`, and boot-guards `systemctl daemon-reload`
+   (`[ -d /run/systemd/system ]`). Downgrade path refactored to reuse it.
+
+5. **C3 (diagnostic only)** — pre-START stat of
+   `versions/<ver>/{xpfd,xpf-userspace-dp}`; a vanished dir fails fast
+   with a clear cause through the existing START-failure auto-rollback
+   (HA semantics unchanged). C2 was dropped per the plan (flip.go already
+   returns daemon-reload failure).
+
+## Test plan
+
+- `pkg/upgrade/system_linux_test.go` — `BinaryVersion` accepts
+  Debian/semver shapes, rejects unsafe tokens + garbage formats + exec
+
+*(truncated — 70 lines total)*
+
+
+---
+
+## PR #1975 — image: pin bake base release to Ubuntu 26.04 (drop auto-latest) [MERGED] (merged 2026-06-18)
+
+Branch: `fix/bake-pin-ubuntu-2604`
+
+## Problem
+
+`scripts/image/bake.py:discover_base_release()` defaulted to scraping
+`cloud-images.ubuntu.com/releases` and taking the highest-numbered listing
+when `XPF_BASE_RELEASE` was unset. That silently selects whatever the mirror
+lists as newest — a non-LTS interim (e.g. 26.10) or, when an LTS image lags
+publication, the previous release (**25.10**). An ad-hoc test VM came up on
+25.10 via this path.
+
+This contradicts the already-documented contract (CLAUDE.md *Ubuntu 26.04
+parity*: "a deliberate, reviewed bump, **not auto-latest**") and the matching
+`XPF_BASE_RELEASE:-26.04` defaults already in `test/incus/setup.sh` and
+`cluster-setup.sh`. `bake.py` was the lone outlier.
+
+## Change
+
+- Default to the pinned LTS: `PINNED_BASE_RELEASE = "26.04"` — one place to
+  edit for a reviewed bump.
+- `XPF_BASE_RELEASE=<rel>` still overrides for a one-off (no behavior change
+  when set).
+- `XPF_UBUNTU_AUTODISCOVER=1` opts back into the old mirror-latest scrape for
+  anyone who explicitly wants it.
+
+## Validation
+
+`bake.py` parses; the resolver returns `26.04` when unset, honors an explicit
+`XPF_BASE_RELEASE`, and only scrapes the mirror under `XPF_UBUNTU_AUTODISCOVER=1`.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #1976 — #1961: fix Go↔Rust snapshot wire-type bug (DSCP/code-point base64) that disabled forwarding [MERGED] (merged 2026-06-18)
+
+Branch: `research/1961-wire-type-dscp`
+
+## Summary
+
+`apply_snapshot` carried DSCP and 802.1p code-point lists as Go `[]uint8`.
+Go's `encoding/json` special-cases byte slices and marshals them as a **base64
+string** (`"dscp_values":"Lg=="`), but the Rust helper's `ConfigSnapshot`
+deserializes these as `Vec<u8>` — a **numeric array** — with no base64 adapter.
+serde rejected the value, aborting the **entire** `apply_snapshot` decode; the
+helper returned an error before responding and closed the socket; Go logged a
+bare `publish userspace snapshot: EOF`; the helper stayed `enabled:false` in
+bootstrap and **forwarded nothing**. `,omitempty` hid it — only configs with a
+DSCP firewall filter or DSCP/802.1p CoS classifier failed, which is why
+plain-virtio VMs never forwarded while the loss cluster (no such config) was
+fine. This confounded the prior "rx=0 at the XSK, invariant across kernels"
+trail: the helper was never enabled.
+
+Fix is Go-side only (Rust already wanted a numeric array): a `WireUint8List`
+named type over `[]uint8` whose `MarshalJSON` emits a numeric array (never
+re-marshalling `[]uint8`, which would recreate the bug) and whose
+`UnmarshalJSON` accepts numeric arrays and, defensively, legacy base64. The
+three affected fields change to it; `[]uint8`-literal assignment sites are
+unchanged (named-type assignability).
+
+## Plan + adversarial review (research converged)
+
+Plan: `docs/research/1961-wire-type-dscp/plan.md` (PLAN-READY v2).
+- Codex: PLAN-KILL = "premise correct, go straight to /engineer"
+- AGY: PLAN-READY = "root cause completely verified"
+- Claude SMR: PLAN-NEEDS-MINOR (folded: class-level guard, type-parity audit, 26.04 verification gate)
+
+## What's in the PR
+
+1. `WireUint8List` + the 3 field changes (the fix).
+2. Go regression tests: marshal-emits-array, legacy-base64 unmarshal, the three
+   real structs, an integration test from `test/incus/xpf-test.conf`, and a
+   **reflection guard** that fails if any wire field is a raw `[]uint8`/`[]byte`
+   without a custom marshaler (closes the whole class).
+3. Rust regression tests: full-`ControlRequest` numeric decode + a negative test
+   asserting a base64 string is rejected.
+4. Observability hardening: the helper accept loops now log the previously
+   discarded `handle_stream` error (this would have surfaced #1961 in one line),
+   and the Go client enriches a bare control-socket EOF.
+
+## Test plan
+
+- [x] `cargo build` + `go build ./...` clean
+- [x] `cargo test --release`: full suite pass (incl. 2 new #1961 tests)
+- [x] `go test ./...`: full suite pass (incl. new wire tests + reflection guard)
+- [x] Reproduced VM-free: `xpf-test.conf` apply_snapshot now marshals
+  `dscp_values` as a numeric array; Rust decodes the full request.
+- [ ] Live virtio transit verification on **Ubuntu 26.04** (Q1 — does virtio
+
+*(truncated — 54 lines total)*
+
+
+---
+
+## PR #1978 — #1977: coerce flow/flow-export wire fields into Rust ranges (NUM_WIDTH sibling of #1961) [MERGED] (merged 2026-06-18)
+
+Branch: `fix/1977-numwidth-wire`
+
+## Summary
+
+Sibling class of #1961 (found by its Q5 type-parity audit). Eleven
+`FlowSnapshot`/`FlowExportSnapshot` fields are Go signed `int` on the
+`apply_snapshot` wire but Rust **unsigned** (u16/u32/u64). A negative or
+out-of-range value (e.g. operator typo `tcp-mss-gre-in 70000`, or a sampling
+input-rate exceeding u32) serializes fine from Go but makes the helper's
+`serde_json::from_str` abort the **whole** `apply_snapshot` decode → helper
+unconfigured, forwarding silently broken (the #1961 failure mode; now logged
+after #1961's hardening).
+
+Fix = **build-boundary coercion** in `buildFlowSnapshot`/`buildFlowExportSnapshot`
+— the sole pre-wire constructor of these structs (called only from
+`buildSnapshot`), so it covers every input path (CLI, gRPC, file). Per field:
+u16 MSS out-of-range → 0; CollectorPort out-of-range → skip that server; u32
+SamplingRate keeps `<=0→1` and caps `>u32max`; u32 timeouts negative→0/cap; **u64
+session timeouts capped at `MaxDurationSeconds`** (not u64-max — Rust
+`from_seconds` does `secs*1e9` unchecked → overflow). Each coercion logs one
+`slog.Warn` (config-commit time). In-range values unchanged.
+
+Commit-time CLI validation (a clear `commit check` error) needs schema-node
+expansion (the nodes are `children: nil`) and is **deferred to a follow-up**;
+this guard is the dataplane-safety guarantee.
+
+## Plan + adversarial review (3-way converged)
+
+Plan: `docs/pr/1977-numwidth-wire/plan.md` (PLAN-READY v2.1).
+- Codex r2: PLAN-NEEDS-MINOR (3 doc minors folded; confirmed overflow math + Layer-B deferral)
+- AGY r2: PLAN-READY
+- Claude SMR r2: PLAN-READY (verified chokepoint + inventory completeness)
+
+The inventory was corrected 9→**11** during review (both reviewers caught
+`TCPMSSAllTCP` + `SamplingRate`).
+
+## Test plan
+
+- [x] `go build ./...` + `cargo build` clean
+- [x] Go: out-of-range configs through the real builders land in range for all
+  11 fields; in-range unchanged; out-of-range port skips the server; helper
+  table tests (incl. `TCPMSSAllTCP`)
+- [x] Rust: full `ControlRequest` with max-range flow numbers decodes; a
+  negative session timeout aborts the decode (the defended mechanism)
+- [ ] `go test ./...` + `cargo test --release` full suites — running
+- [ ] Loss-cluster smoke (CoS off + on, v4+v6, push+reverse) — pending
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #1980 — #1962: push the xpf-userspace-dp helper in standalone setup.sh deploy (+ hash-verify) [MERGED] (merged 2026-06-18)
+
+Branch: `fix/1962-deploy-helper-push`
+
+## Summary
+
+`test/incus/setup.sh` `cmd_deploy()` built+pushed xpfd/cli/config/unit but never
+built or pushed the Rust `xpf-userspace-dp` helper (it even removed the old
+`bpfrx-userspace-dp`). xpfd is not linked against the helper — it execs it from a
+search path including `filepath.Dir(os.Args[0])` = `/usr/local/sbin/xpf-userspace-dp`
+(`pkg/dataplane/userspace/process.go` `findBinary`). So standalone test VMs came
+up with **no dataplane** (#1962).
+
+Fix: build the helper (`make build-userspace-dp`, cargo-guarded like
+`cluster-setup.sh`), push it next to xpfd, and **verify the on-VM sha256 matches
+local — `die` loudly on mismatch/empty readback** (a push can silently no-op /
+the build can be stale). Existing `bpfrx-userspace-dp` cleanup preserved.
+
+## Test plan
+
+- [x] `bash -n` + `shellcheck -S warning` pass on `setup.sh`
+- [x] `make build-userspace-dp` produces `$PROJECT_ROOT/xpf-userspace-dp` (the
+  exact path the push reads); sha256 is the comparable hash the verify uses
+- [x] Logic mirrors the live-validated `cluster-setup.sh` helper-push path; adds
+  the sha256 readback on top
+- [ ] Live `make test-deploy` against a fresh standalone VM (helper present +
+  `enabled:true`) — not run here (xpf-fwd in use by the #1961 agent; loss
+  cluster lock-protected); will be exercised on the next standalone deploy
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #1991 — #1960: fail closed (bootstrap/lifeline) when a committed config no longer compiles [MERGED] (merged 2026-06-18)
+
+Branch: `fix/1960-failclosed`
+
+## Summary
+
+If the persisted active DB is valid JSON but `compileTreeLenient` fails on boot,
+xpfd left `compiled` nil while `everCommitted=true`, the Load error was only
+`slog.Warn`'d, the daemon proceeded, and interface naming fell back to
+**positional claim-all** — fail-OPEN (can mis-bind NICs / strand mgmt) (#1960,
+found by AGY adversarial review on PR #1959; pre-existing, predates #1956).
+
+Fix — fail **closed** into the existing #1922 bootstrap/lifeline safe state:
+- New `configstore.ErrConfigCompile` sentinel; `Store.Load` tags the
+  lenient-compile failure with it (keeps `compiled` nil; `everCommitted` already set).
+- `classifyLoadError` (pure, unit-tested) maps Load errors: `ErrConfigDBUnreadable`
+  → fatal exit (#1917 D1, bytes unreadable); **`ErrConfigCompile` → bootstrap**;
+  else warn+proceed.
+- `computeBootClass` takes `configCompileFailed`, checked **first** (overrides even
+  the HA-node guard) → `bootClassBootstrap`: no `enumerateAndRenameInterfaces`
+  claim-all; mgmt stays reachable via the lifeline + protected set; dataplane not
+  armed; FRR/VRRP takeover suppressed; gRPC/REST/CLI stay up so the operator can
+  fix the config (or repair/remove the DB). Surfaced via `slog.Error`.
+- `Run` skips `bootstrapFromFile` on compile-failure (no blind-import of the text
+  config over the broken DB).
+
+A hard daemon exit was deliberately rejected — it also strands mgmt and is worse
+than the lifeline state (distinct from the genuinely-unreadable #1917 D1 case).
+
+## Provenance / note
+Implemented by an agent that committed on a stale base; salvaged by cherry-picking
+the 3 logical commits onto current master (`a963273e8`) — diff is scoped to
+configstore/daemon only (verified: no userspace-dp/other files).
+
+## Test plan
+- [x] `go build ./...` clean on current master
+- [x] `go test ./pkg/configstore/... ./pkg/daemon/...` pass
+- [x] New tests: `TestLoadCommittedConfigCompileFailureFailsClosed` (Load returns
+  ErrConfigCompile, not ErrConfigDBUnreadable; ActiveConfig nil; EverCommitted
+  true), `TestClassifyLoadError`, `TestCompileFailureForcesBootstrapNotClaimAll`,
+  +3 `TestComputeBootClass` compile-failed cases
+- [ ] Codex + AGY code review — deferred until the in-flight research-012 agent
+  frees the shared companions (single-job-global); Copilot requested now
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #1994 — #1982: centralize the managed-binary manifest (SSOT + drift canary) [MERGED] (merged 2026-06-18)
+
+Branch: `refactor/1982-managed-binary-manifest-ssot`
+
+## Summary
+
+The managed upgrade binary set `{xpfd, cli, xpf-userspace-dp, xpf-day0-config}` was duplicated across **nine** independent edit sites with no single source of truth and no guard — two Go slices (`pkg/upgrade`, `pkg/upgrade/runtime`), three maintainer-script `BINS=` literals (`debian/xpf.{preinst,postinst,postrm}`), the `debian/rules` install set, and three shell test fixtures (`test/debian/{preinst-migrate,postrm,preinst-besteffort}-test.sh`). The upgrade flow treats these binaries as one version-locked unit (stage → seed → copy → flip → verify → GC → clean), so a one-file miss ships a green build that leaves an old helper in service, fails rollback cleanup, or omits a binary from first-install seeding.
+
+This PR introduces a single source of truth and a fail-closed drift canary:
+
+- **`pkg/upgrade/manifest`** — exported ordered list `manifest.Managed` with per-binary metadata (`Name`, `StagedSrc`, `LockstepCut`), plus `Names()` (fresh slice) and `ShellBINS()`.
+- **`managedBins = manifest.Names()`** in both `pkg/upgrade/runner.go` and `pkg/upgrade/runtime/seed.go` — byte-identical value, package-level var retained so all existing tests (incl. `managedBins[1:]`) keep working.
+- **`TestManagedBinaryDriftCanary`** — parses every shell site (all 5 `BINS=` literals, the `debian/rules` install set scoped to `override_dh_auto_install`, and the literal for-loop in `preinst-besteffort-test.sh`) and FAILS the suite on any divergence. Fail-closed: a site dropping its `BINS=` literal trips the canary rather than passing vacuously.
+- **`TestDriftCanaryComparatorCatchesDivergence`** — counter-factual proving the comparator actually reports missing/extra/renamed drift and accepts an in-sync literal, so the guard cannot rot into a vacuous pass.
+- Shell sites keep self-contained literals (no build-time sed into the tracked checkout — that dirties git and double-edits on re-run, per the converged plan); each is annotated with a pointer to the SSOT + canary. `docs/in-place-upgrade.md` documents the manifest.
+
+## Plan + adversarial review
+
+Plan doc: `docs/research/1982-upgrade-manifest-ssot/plan.md` — `/research` triage converged PLAN-READY / engineer-now (Claude SMR, AGY, Codex; Codex found two extra fixture drift sites, all folded; this PR covers a ninth — the besteffort for-loop).
+
+## Scope / behavior
+
+Pure consolidation: the four-binary set is identical before and after (no binary added or dropped). Control-plane + packaging only — **no runtime forwarding behavior changes, so the loss-cluster smoke matrix is not required.**
+
+## Test plan
+
+- [x] `go build ./...` clean
+- [x] `go test ./...` — 43 packages pass, 0 failures (incl. `pkg/upgrade`, `pkg/upgrade/runtime`, `pkg/upgrade/manifest`)
+- [x] Live counter-factual: dropping `xpf-day0-config` from `debian/xpf.postinst` makes the canary FAIL with a clear diff; reverts clean
+- [x] `shellcheck -s sh` clean on the three maintainer scripts; `dash -n` syntax-checks pass
+- [x] Shell fixtures (`preinst-migrate`, `postrm`, `preinst-besteffort`) pass under both `sh` and `dash`
+- [x] Each of the 4 commits builds (bisectable)
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #1995 — #1984: truncate upgrade lock under flock on acquire and release [MERGED] (merged 2026-06-18)
+
+Branch: `worktree-agent-a02594a891aecb082`
+
+## Summary
+
+The upgrade lock (`pkg/upgrade/lock`) writes owner metadata (PID,
+subcommand, target, start time) into the lock file AFTER the flock
+succeeds, and a busy acquirer reads that file to NAME the holder. Three
+windows let a busy acquirer read a PREVIOUS owner's JSON as if it were
+the current holder's, so `ErrBusy` can misreport a long-exited process:
+the acquire->write gap, a swallowed metadata-write failure, and the
+fact that `Release` never cleared the file. The flock mutual exclusion
+itself is sound — this is diagnostics correctness only.
+
+Fix: two `f.Truncate(0)` calls, both on the HELD fd while the flock is
+owned — truncate-on-acquire (the instant the flock is held, before
+recording our own metadata) and truncate-on-release-under-lock (before
+dropping the flock). Together they keep the file empty across the whole
+ownerless interval, so a concurrent busy reader degrades to "busy, owner
+unknown" (already a supported `ErrBusy` rendering) instead of naming a
+stale owner. `os.Remove` is deliberately NOT used: flock binds the inode,
+so unlinking the path could split the mutex (the #1875 "never rm the lock
+file" lesson). `/run` is tmpfs, so a lingering zero-length file is
+harmless.
+
+## Plan + adversarial review
+
+Plan doc: `docs/research/1984-upgrade-lock-stale-owner/plan.md` (research
+phase, converged engineer-now).
+
+- Claude SMR: PLAN READY; `os.Remove`-on-release correctly rejected.
+- AGY: PLAN YES — "correct, robust; deep understanding of Unix locking
+  semantics"; endorsed rejecting `os.Remove` (split-mutex on inode-bound
+  flock).
+- Codex: PLAN NEEDS-MAJOR -> folded. truncate-on-acquire alone leaves a
+  flock->truncate scheduling gap; "never previous owner" REQUIRES
+  truncate-on-release while still holding the flock. Added.
+
+## Test plan
+
+This is a control-plane, host-local diagnostics fix. **No loss-cluster
+smoke is required** (no dataplane/forwarding/CoS/HA path is touched).
+
+- [x] `go build` / `go vet` clean
+- [x] Full Go suite in the worktree: 43 packages ok, 0 fail, 5 no-test-files
+- [x] Three new regression tests pass and FAIL if either truncate is removed:
+  - `TestReleaseTruncatesUnderLock` — fails if release-truncate dropped
+    (file still holds released owner JSON)
+  - `TestAcquireTruncatesStaleMetadataBeforeWrite` — blocking-seam test;
+    fails if acquire-truncate dropped (busy read names seeded stale owner)
+  - `TestAcquireClearsStaleMetadataOnWriteFailure` — fails if
+    acquire-truncate dropped (stale JSON survives the failed write)
+- [x] 5x `-race` flake check on the concurrency test: clean
+
+*(truncated — 52 lines total)*
+
+
+---
+
+## PR #1996 — #1985: postrm exec-free downgrade detection (incoming-version floor, no staged-binary exec) [MERGED] (merged 2026-06-18)
+
+Branch: `refactor/1985-postrm-false-downgrade`
+
+## Summary
+
+`debian/xpf.postrm` (case `upgrade`) decided whether the package being
+installed predated the #1964 hardened versioned-runtime layout by EXECUTING
+the staged binary (`"$STAGED/xpfd" seed-runtime --capability-check`). The
+`&&` short-circuited to false whenever the staged xpfd failed to exec for ANY
+reason (dynamic-link error during unpack, corruption, libc/ABI conflict, arch
+mismatch) — not only when it genuinely lacked the subcommand. On a real
+UPGRADE with a non-execable staged xpfd, the destructive branch then deleted
+`versions/current`, repointed sbin to `staged/`, and removed the
+`10-xpf-version.conf` drop-in — breaking the daemon on next boot.
+
+This keys the downgrade decision on the **dpkg-supplied incoming version
+(`$2`)** instead, which is exec-free and has no staleness hazard. A new helper
+`incoming_predates_hardened_layout()` runs
+`dpkg --compare-versions "$2" lt "$HARDENED_LAYOUT_FLOOR"`. The teardown runs
+ONLY when `$2` is a confirmed pre-#1964 version (below the floor) AND a
+hardened layout is present (`versions/current`); an upgrade or
+hardened→hardened downgrade (`$2 >= floor`), and an empty/unparsable `$2`,
+leave the layout intact (the safe default, mirroring the sibling preinst
+`migrate_legacy_layout` skip-don't-destroy posture; the verify-dataplane cut
+gate / refuse-before-STOP guard is the backstop).
+
+## Downgrade-detection mechanism + why (changed from the initial marker pivot)
+
+The converged /research plan pivoted to an exec-free **file marker**
+(`staged/.layout-version`). During implementation I found — and Codex r1
+(MERGE-NEEDS-MAJOR, citing Debian Policy 6.6) independently confirmed — that a
+presence-only marker is **unsound for the downgrade direction**: dpkg removes
+a file present ONLY in the old package AFTER the old-postrm runs, so a marker
+shipped by the hardened package LINGERS on disk at old-postrm time during a
+genuine pre-#1964 downgrade and would mis-signal "incoming is hardened",
+skipping the teardown the downgrade needs. I verified this empirically with a
+sandboxed dpkg downgrade (`DPKG_ROOT` instdir inspection): on a genuine
+downgrade the old hardened `.layout-version` is still present at old-postrm
+time.
+
+The sound exec-free signal is the **incoming version**. `dpkg
+--compare-versions` is always available in a maintainer script and is immune
+to file staleness. `HARDENED_LAYOUT_FLOOR` is `0.0.4104` — the `.deb` version
+(`0.0.<commit-count>+g<sha>`, `Makefile` `DEB_VERSION`) of commit `ef9525e70`,
+where the versioned-runtime layout first shipped in the debian maintainer
+scripts. It is a historical fixed point (the layout already shipped), never
+bumped per release. This resolves the plan's "unanchored floor" concern: the
+version scheme is monotonic in commit count, so a one-time historical floor is
+exact. Empirically validated correct across all three dpkg directions
+(upgrade → keep, hardened→hardened downgrade → keep, genuine pre-#1964
+downgrade → tear down).
+
+## Plan + adversarial review
+
+*(truncated — 81 lines total)*
+
+
+---
+
+## PR #1998 — #1983: reject non-default --unit for rolling/kernel-drain cluster control [MERGED] (merged 2026-06-18)
+
+Branch: `refactor/1983-rolling-unit-endpoint`
+
+## Summary
+
+`xpfd upgrade --rolling --unit <name>` (and `xpfd upgrade kernel drain`/`rejoin`) applied the systemd stop/start/flip actions to the SELECTED unit, but the cluster control RPCs (`PeerAlive` / `SyncEstablished` / `DrainComplete` / `ForceSecondary` / `ResetFailover`) always dialed the hard-coded default daemon at `127.0.0.1:50051`. `NewCLICluster(unit)` silently discarded its `unit` parameter, so a non-default `--unit` would force-secondary / evaluate the drain predicate against the WRONG daemon while cutting another (wrong-daemon control).
+
+This ships the converged-plan MVP: `NewCLICluster` now returns `(RollingCluster, error)` and **rejects any non-default unit at the single construction chokepoint** (covers `RunRolling` + both `kernel` sub-verbs + any future caller). The default unit (and the empty string normalized to it) is unchanged. The unit->endpoint mapping (#1983 §4.2 / a future `pkg/upgrade/clusterclient`) is a tracked follow-up.
+
+## Failover-runtime assessment
+
+**Control-TARGET selection + CLI validation only.** This changes which daemon the upgrade CLI dials and adds an input guard. It does NOT touch VRRP / session-sync / cluster failover RUNTIME behavior. The default-unit rolling path is byte-for-byte unchanged, so `make test-failover` is not gated by this change.
+
+## Plan + adversarial review
+
+Plan: docs/research/1983-rolling-unit-endpoint/plan.md — converged on the issue (engineer-now):
+- Claude SMR: PLAN READY (4.1 reject; 4.2 endpoint mapping follow-up)
+- AGY: PLAN NEEDS-MAJOR -> folded (guard moved INTO `NewCLICluster` so `kernel drain`/`rejoin` are covered, not just `RunRolling`)
+- Codex: PLAN YES (constructor chokepoint is the right place; test must hit `NewCLICluster` directly; `--unit` takes the bare name)
+
+## Test plan
+
+- [x] `go build ./pkg/upgrade/... ./cmd/xpfd/...` clean
+- [x] `go vet` clean
+- [x] `go test ./pkg/upgrade/...` pass, incl. the two new constructor tests
+  - `TestNewCLICluster_RejectsNonDefaultUnit` — `xpfd-test`, `xpfd.service`, `xpfd-staging` all return `(nil, error)`; never a client pointed at `127.0.0.1:50051`
+  - `TestNewCLICluster_AcceptsDefaultUnit` — `""` and `xpfd` return a client targeting `127.0.0.1:50051`, inspected without dialing
+- [x] Full Go suite (`go test ./...`) in the worktree
+- [ ] Loss-cluster smoke: **NOT required** — this is a control-plane CLI target-selection + validation change with no dataplane or forwarding-path effect.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #2007 — #1981: close dpkg-unpack vs operator-cut staged-source race (immutable versioned staging) [MERGED] (merged 2026-06-19)
+
+Branch: `refactor/1981-staged-generation-immutability`
+
+## Summary
+
+Closes the dpkg-unpack vs operator-cut staged-source race (#1981, HIGH)
+via the user-approved converged plan: **Option B (immutable versioned
+staging) + B-P3b OPT1**.
+
+dpkg unpacks the managed binaries into `staged/` one file at a time, so
+across an `apt upgrade` unpack window `staged/` holds a mix of old and
+new binaries. The legacy cut copied directly from that live tree; a cut
+landing inside the window could publish a `versions/<ver>` mixing two
+dpkg generations — a torn set whose `verify-dataplane` gate (xpfd+shim
+only) cannot detect a mismatched `xpf-userspace-dp`. This PR closes the
+window by construction for all four managed binaries: the cut reads a
+pinned, immutable `staged-gen/<genid>/` that dpkg is not rewriting,
+never live `staged/`.
+
+## Mechanism (Option B)
+
+- `postinst configure` (after a complete unpack) runs `xpfd
+  publish-generation`: copy `staged/` into `staged-gen/<genid>/`
+  (`.partial` + atomic rename + dir-fsync) and atomically repoint
+  `staged-gen/current-gen` (temp-symlink + rename).
+- The cut resolves `current-gen` once at INIT, records the genid in
+  `Journal.SourceGeneration`, and `copyStaged` copies from the resolved
+  `staged-gen/<SourceGeneration>/` directory (never re-reading the
+  symlink, never live `staged/`).
+- No published generation ⇒ refuse pre-PREFLIGHT (no journal, no DB
+  snapshot, daemon untouched).
+- B-P3b OPT1: `versions/<ver>/.srcgen` stamp + generation-aware skip;
+  a same-version re-stage with new bytes recopies a stale non-live dir
+  (reusing the proven guarded-delete) or refuses if the dir is the live
+  `current`/rollback target.
+- GC: `staged-gen` retention N=2, protecting `current-gen` + any
+  journal-referenced genid (GC-vs-resume); postrm removes `staged-gen/`
+  on purge + pre-B downgrade. `debian/rules` unchanged (dpkg owns only
+  `staged/`).
+
+## Crash-safety
+
+A crash before the gen-dir rename leaves a `.partial` (pre-swept on the
+next publish); a crash after the dir rename but before the `current-gen`
+repoint leaves a complete-but-unreferenced generation (prior
+`current-gen` stays valid; re-publish is idempotent). An aborted/failed
+unpack publishes no new generation — the prior generation stays the cut
+source, so there is no permanent-wedge class.
+
+## Plan + approval
+
+Converged plan (r4, 3-way Codex + AGY + Claude SMR): PLAN-READY.
+User-approved Option B + B-P3b OPT1. This PR implements that spec
+
+*(truncated — 76 lines total)*
+
+
+---
+
+## PR #2009 — snmp: enforce community authorization with a SET handler (#2008 H17) [MERGED] (merged 2026-06-19)
+
+Branch: `fix/2008-h17-snmp-authz`
+
+## Summary
+
+Fixes **#2008 H17**: SNMP community `authorization read-write` was
+parsed/compiled/stored but **never enforced**. There was no SET PDU
+handler at all — the v2c dispatch only matched GET / GETNEXT / GETBULK,
+and the default case silently dropped the PDU. `isValidCommunity()`
+checked only the community name. The agent was therefore effectively
+read-only regardless of the configured authorization, and an operator
+restricting a community to read-only (or granting read-write) had **zero
+runtime effect** — a silent divergence from Junos.
+
+## Fix
+
+`pkg/snmp/agent.go` / `pkg/snmp/v3.go`:
+
+- `getCommunity()` resolves the configured community struct (carrying the
+  authorization level); `isValidCommunity()` now delegates to it.
+- New `pduSetRequest` (0xa3) handler with an access-control gate:
+  - A community **without** `read-write` authorization is denied with
+    `noAccess` (RFC 3416 error-status 6) **before any write is
+    attempted** — the security boundary the operator configures.
+  - A `read-write` community **passes the gate**. The agent exposes only
+    read-only MIB objects (system group, ifTable, ifXTable), so the write
+    itself is refused per-varbind with `notWritable` (17). No served
+    object is mutable, so a SET never succeeds, but the read-only vs
+    read-write distinction is enforced and observable in the response
+    error-status.
+  - SNMPv3 SET is uniformly refused with `notWritable` rather than
+    silently dropped (USM users carry no read-write authorization here).
+
+`pkg/config/schema_system.go`: harden the `snmp community <name>
+authorization` leaf with a `read-only | read-write` enum so a commit-time
+typo (e.g. `read-wrote`) is rejected instead of silently defaulting to
+read-only.
+
+## Regression test
+
+`pkg/snmp/agent_set_test.go` builds real v2c SET packets end to end
+through `handlePacket`:
+
+- `TestSetRequest_ReadOnlyCommunityDenied` — read-only community SET
+  returns `noAccess`.
+- `TestSetRequest_ReadWriteCommunityPassesGate` — read-write community
+  SET returns `notWritable` (passes the authorization gate, distinct from
+  `noAccess`).
+- `TestSetRequest_UnknownCommunityDropped` — unknown community SET is
+  dropped (no response).
+- `TestGetCommunity_Authorization` — lookup returns the struct with
+  authorization intact.
+
+
+*(truncated — 64 lines total)*
+
+
+---
+
+## PR #2010 — config: validate + schema static-NAT from-zone scope (#2008 H15) [MERGED] (merged 2026-06-19)
+
+Branch: `fix/2008-flow-misc-h15-static-nat-zone`
+
+## Bucket: flow-misc (#2008 — H14 + H15)
+
+### H15 — static-NAT `from`/`to` zone (FIXED)
+
+The #2008 audit row claimed `compileStaticNAT` never reads `rs.FromZone`,
+making static NAT "effectively global." On the current tree that headline
+is **partially refuted**: the compiler sets `FromZone`, the Go builder
+threads it into the `StaticNATRuleSnapshot` wire field, and the Rust
+dataplane already enforces the zone on the inbound (DNAT) direction —
+`nat/static_nat.rs` `match_dnat` skips an entry whose `from_zone` does not
+exactly match the ingress zone name (shipped in #1542). The outbound
+(SNAT) direction is intentionally not zone-filtered (the internal-IP match
+is sufficient; documented in `static_nat.rs`).
+
+Two **genuine residual gaps** remained, both fixed here:
+
+1. **Missing commit validation.** Source NAT validates its from/to zones
+   against the defined zones, but static NAT did not. A typo'd or
+   undefined `from-zone` silently produces a rule that `match_dnat` never
+   matches (exact-string compare) with no operator signal. `ValidateConfig`
+   now warns `static-nat ruleset %q: from-zone %q not defined`, mirroring
+   the source-NAT zone validation.
+
+2. **Schema drift.** The static-nat rule-set `schemaNode` had no `from`
+   child and a `children: nil` `match`, so `from zone` parsed by
+   fallthrough with no CLI completion or commit-time structure. Added
+   `from { zone }` (zone-name value hint, bracket-list capable) plus a
+   `match { source-address destination-address }` body, matching the
+   destination-NAT rule-set shape. Junos static NAT has no `to` clause, so
+   only `from` is declared.
+
+### H14 — `flow power-mode-disable` (NOT threaded — documented no-op)
+
+The gap (display-only, absent from `FlowSnapshot`) is real, but the
+"intended runtime semantics" the audit asked to confirm are vacuous in
+xpf. Power-mode is the vSRX VPP + Intel AES-NI IPsec acceleration feature
+(PowerMode IPsec), which the AF_XDP dataplane does not implement — there
+is no acceleration to disable. Threading it "like GREAcceleration" would
+only add another dead-code wire field: `gre_acceleration` is itself
+`#[allow(dead_code)]` in `afxdp/types/forwarding.rs`, never assigned from
+the snapshot and never read. That is not runtime enforcement, so per
+HARD-RULE-4 (the test must exercise real enforcement) and the audit's own
+"once intended runtime semantics are confirmed" caveat, H14 is left as a
+display-only no-op pending the separate "accepted-but-unenforced"
+commit-warning lint described in the issue's cross-cutting recommendation.
+(Prior context: closed issue #149 reached the same conclusion.)
+
+### Regression tests (`pkg/config/static_nat_zone_test.go`)
+
+- `TestStaticNATFromZoneUndefinedWarns` — FAILS without the compiler
+
+*(truncated — 74 lines total)*
+
+
+---
+
+## PR #2011 — config,frr: keep every protocol in routing-policy from-protocol (#2008 H18) [MERGED] (merged 2026-06-19)
+
+Branch: `fix/2008-h18-routing-policy-multi-protocol`
+
+## Summary
+
+Fixes **#2008 gap H18** — `policy-options policy-statement ... term ... from
+protocol [ bgp ospf static ]` silently discarded every protocol after the
+first. The list parses fine (the lexer strips the brackets), but
+`PolicyTerm.FromProtocol` was a scalar `string`: the compiler stored only the
+first protocol and the FRR renderer emitted a single `match source-protocol`
+line. The operator's intent to match multiple source protocols was accepted at
+commit with no error yet only the first protocol took effect — a silent Junos
+divergence.
+
+## Fix
+
+- `PolicyTerm.FromProtocol` (scalar) → `FromProtocols` (`[]string`).
+- `collectProtocolList` flattens the protocol list from both AST shapes that
+  reach the compiler after bracket stripping:
+  - **hierarchical block parse**: all protocols land in the node keys
+    (`Keys=["protocol","bgp","ospf","static"]`);
+  - **flat-set `SetPath`**: the first protocol is `Keys[1]` and the rest form a
+    nested single-child chain (`Keys=["protocol","bgp"]` → child
+    `Keys=["ospf","static"]` → ...).
+- The inline-keys flat path consumes consecutive protocol tokens up to the next
+  clause keyword (`policyTermInlineKeywords`).
+- `pkg/frr/policy_render.go` now emits one `match source-protocol` line per
+  protocol (repeated match lines within a route-map entry are OR'd by FRR), and
+  the redistribute resolver iterates the whole list.
+- CLI and gRPC `show` consumers render a single protocol bare, and multiple as
+  `[ p1 p2 ... ]` (Junos display form).
+
+## Regression tests (mutation-verified — fail when the fix is reverted)
+
+- `TestPolicyTermMultiProtocolFlatSet` / `TestPolicyTermMultiProtocolHierarchical`
+  (`pkg/config`): `from protocol [ bgp ospf static ]` compiles to all three
+  protocols via both the flat-set and hierarchical walks.
+- `TestGeneratePolicyOptionsMultiProtocol` (`pkg/frr`): a multi-protocol term
+  renders exactly one `match source-protocol` line per protocol (with
+  `direct` → `connected` mapping).
+
+Confirmed each test fails against the pre-fix behavior and passes with the fix.
+
+## Validation
+
+- Full Go suite `go test ./...` passes; `gofmt` clean.
+- Control-plane config/render fix — loss-cluster smoke is **not** required.
+- No docs change: `docs/feature-gaps.md` already marks routing-policy
+  enhancements "Partial" and that row remains accurate (other match/action
+  types are still unsupported).
+
+## Scope / shared files
+
+
+*(truncated — 57 lines total)*
+
+
+---
+
+## PR #2012 — #2008 Tier-1.5: schema-harden H8/M2/M3 + RA/syslog typed leaves [MERGED] (merged 2026-06-19)
+
+Branch: `schema/2008-tier15-schema-hardening`
+
+## Summary
+
+Tier-1.5 schema-hardening sweep from #2008. Five `security`/`protocols`/
+`system` config subtrees are fully parsed, compiled, and honored at
+runtime, but their `setSchema` node carried `children: nil` (or a missing
+child). The #1319 commit-time typed-leaf gate (`SchemaValidate`) walks
+`setSchema`, so a leaf with no declared, validated child is invisible to
+it — an invalid value committed silently and then drifted from operator
+intent (the class-(c) "schema-only drift" failure mode in #2008).
+
+This declares the missing children and types the value slots whose runtime
+accepts a fixed vocabulary. **No runtime behavior change** — purely
+restores commit-time validation + CLI `?` completion.
+
+## Items (from #2008)
+
+- **H8** `security log stream transport` — add `protocol` (enum
+  `udp|tcp|tls`, mirroring the `pkg/logging/syslog.go` dial switch where
+  anything not tcp/tls silently falls back to UDP) + `tls-profile`. Both
+  are fully compiled in `compiler_security.go`.
+- **M2** IKE (`security ike proposal`) + IPsec (`security ipsec proposal`)
+  proposal leaves — type `authentication-method` (IKE only, enum
+  `pre-shared-keys|rsa-signatures|ecdsa-signatures`, matching
+  `authMethodToSwan`), `dh-group` (new `ValueDHGroup`/`ValidateDHGroup`:
+  accepts both the bare-integer and Junos `group<N>` spellings the
+  compiler strips, rejects 0/garbage that drops the modp term from the
+  swanctl proposal), and `lifetime-seconds` (`ValidateIntegerMin(1)`).
+  `protocol` / `encryption-algorithm` / `authentication-algorithm` are
+  declared but left **untyped** — the swanctl renderer normalizes
+  arbitrary algorithm spellings by string substitution, so an enum would
+  false-reject valid configs.
+- **M3** `security nat static rule-set rule match` (the static-NAT match
+  at `schema_security.go` was `children: nil`) — declare the
+  `source-address`/`destination-address` children the compiler reads.
+- **RA** `protocols router-advertisement interface` — type the
+  second-denominated leaves (`max/min-advertisement-interval`,
+  `default-lifetime`, `link-mtu`) and declare the remaining
+  compiler-consumed structural children (managed/other-stateful flags,
+  `dns-server-address`, prefix flags/lifetimes).
+- **syslog** `system syslog host/file/user` — wildcard `<facility>` child
+  (open-ended facility namespace) whose value slot is the fixed Junos
+  severity vocabulary; a misspelled severity that `ParseSeverity` would
+  silently treat as "no filter" now fails at commit. `allow-duplicates` is
+  an explicit presence-only flag.
+
+## Regression test
+
+`pkg/config/schema_validate_2008_test.go` (14 cases). Each `RejectsBad`
+case was **mutation-verified**: it FAILS against the pre-fix schema (the
+gate had nothing to validate) and PASSES with the typed child. Confirmed by
+
+*(truncated — 72 lines total)*
+
+
+---
+
+## PR #2013 — policy match: address-excluded + any-ipv4/any-ipv6 (#2008 H2/H11) [MERGED] (merged 2026-06-19)
+
+Branch: `fix/2008-policy-match-h2-h11`
+
+Fixes two silently-dropped security-policy match primitives from the
+#2008 config-parity audit (bucket: policy-match).
+
+## H2 — `source-address-excluded` / `destination-address-excluded`
+Junos `match source-address-excluded` (and the destination variant)
+were accepted at commit but had **zero runtime effect**: the compiler
+had no switch case for the tokens (`compiler_security.go`), `PolicyMatch`
+had no field, and there was no schema leaf or dataplane handling. The
+operator's intent to invert an address match was lost silently.
+
+Fix:
+- `PolicyMatch.SourceAddressExcluded` / `DestinationAddressExcluded`
+  bool (`types_security.go`).
+- compiler cases in `compilePolicy` (`compiler_security.go`).
+- schema leaves under both the from-zone and global policy `match`
+  nodes (`schema_security.go`) — restores commit-time validation + CLI
+  completion.
+- `source_address_excluded` / `destination_address_excluded` wire
+  fields on `PolicyRuleSnapshot` (Go `protocol.go` + Rust
+  `protocol/security.rs`, both with omitempty/serde-default for wire
+  back/forward compat), populated in `buildOneRuleSnapshot`.
+- dataplane: `policy.rs` carries the flags onto `PolicyRule` and
+  **inverts the per-side match** in `try_match_rule` (the rule matches
+  every address EXCEPT those in the set). The match-any short-circuit is
+  intentionally not applied when excluded; the raw "in-set" predicate is
+  XOR'd with the flag (`matched != excluded`). Family scoping preserved.
+
+## H11 — `match source-address any-ipv4` / `any-ipv6`
+Compiled to the literal strings `"any-ipv4"`/`"any-ipv6"`, which the
+dataplane could not parse as CIDRs and discarded → the rule matched no
+v4/v6 traffic at all.
+
+Fix:
+- Go compiler normalizes `any-ipv4` -> `0.0.0.0/0` and `any-ipv6` ->
+  `::/0` on every policy address token (`compiler_security.go`). `any`
+  is left intact (already match-any on both families).
+- defense-in-depth in `policy.rs` (`parse_v3_literal_set`,
+  `parse_literal_cidr_into`, `parse_address`): `any-ipv4`/`any-ipv6`
+  resolve to the single-family all-addresses prefix even on any path
+  that bypasses the Go normalization.
+
+## Regression tests
+Go (`pkg/config/policy_match_excluded_test.go`,
+`pkg/dataplane/userspace/policy_match_excluded_test.go`):
+`TestPolicyMatchAddressExcluded`,
+`TestPolicyMatchAddressExcludedDefaultFalse`,
+`TestPolicyMatchAnyIPv4IPv6Normalize`,
+`TestPolicyMatchExcludedSchemaValidates`,
+`TestPolicySnapshotCarriesExcludedFlags`.
+
+
+*(truncated — 75 lines total)*
+
+
+---
+
+## PR #2014 — #2008 H16: enforce NAT64 no-v6-frag-header at runtime [MERGED] (merged 2026-06-19)
+
+Branch: `fix/2008-h16-nat64-no-v6-frag-header`
+
+## Summary
+
+Closes the H16 gap from #2008: `security nat natv6v4 no-v6-frag-header`
+parsed, compiled into typed config (`NATv6v4Config.NoV6FragHeader`), and even
+had a wire-transport-ready path, but had **no runtime consumer**. The option
+was accepted at commit with zero effect — a silent Junos divergence in the
+"stored-but-never-enforced" class.
+
+Two dead-ends were closed:
+
+1. **Snapshot drop (Go).** `buildNAT64Snapshots` never read
+   `cfg.Security.NAT.NATv6v4`, and `NAT64RuleSnapshot` had no field for the
+   flag, so the option never reached the dataplane.
+2. **Translator ignored it (Rust).** `translate_v6_to_v4` unconditionally set
+   the IPv4 Don't-Fragment (DF) bit (`0x4000`), emitting every translated
+   packet as a non-fragmentable atomic datagram.
+
+## Fix
+
+- Add `NoV6FragHeader` to the Go `NAT64RuleSnapshot`
+  (`json:"no_v6_frag_header,omitempty"`) and replicate the global natv6v4 flag
+  onto every emitted NAT64 rule in `buildNAT64Snapshots`. The option is set
+  once at the natv6v4 level but the dataplane consumes NAT64 state per
+  rule-set, so each rule carries the same value; the Rust side ORs them.
+- Mirror the field on the Rust `NAT64RuleSnapshot`
+  (`#[serde(rename = "no_v6_frag_header", default)]`) and carry it on
+  `Nat64State` (derived in `from_snapshots`). `omitempty` + serde `default`
+  keep the wire backward compatible.
+- `translate_v6_to_v4` now takes `no_v6_frag_header`: when set it clears the
+  DF bit (frag word `0x0000`) so the packet stays fragmentable per RFC 7915
+  §5.1; when unset it keeps the default DF=1 framing. Identification stays
+  zero in both cases (non-fragmented translation), and the IPv4 header
+  checksum is recomputed so it verifies either way.
+- `build_nat64_v6_to_v4_frame` / `build_nat64_forwarded_frame` forward the
+  flag; both `tx/dispatch` call sites pass `forwarding.nat64.no_v6_frag_header`.
+- Regenerate the protocol wire golden fixture (`protocol_wire_v1.json`) for
+  the new specimen field.
+
+## Regression tests
+
+Go (`pkg/dataplane/userspace/nat64_frag_header_test.go`):
+- `TestBuildNAT64SnapshotsThreadsNoV6FragHeader` — full `CompileConfig` path;
+  asserts the snapshot carries the flag when natv6v4 is configured.
+- `TestBuildNAT64SnapshotsDefaultNoV6FragHeaderUnset` — control case.
+
+Rust (`userspace-dp/src/nat64_tests.rs`):
+- `translate_v6_to_v4_default_sets_df_bit` — DF=1 by default.
+- `translate_v6_to_v4_no_v6_frag_header_clears_df_bit` — DF=0 when set; only
+  the frag word and the derived header checksum change.
+- `build_nat64_v6_to_v4_frame_honors_no_v6_frag_header` — frame builder
+
+*(truncated — 67 lines total)*
+
+
+---
+
+## PR #2015 — #2008 H3/H4: enforce security alg dns/ftp disable in the userspace dataplane [MERGED] (merged 2026-06-19)
+
+Branch: `refactor/2008-alg-disable-enforce`
+
+## What
+
+Implements the paired #2008 HIGH gaps **H3** (`security alg dns disable`) and
+**H4** (`security alg ftp disable`), plus SIP/TFTP for free since they share
+the same plumbing.
+
+**The gap (confirmed real):** `security alg <proto> disable` parsed and
+compiled into the legacy `flow_config_map` `ALGFlags` bitfield, but:
+
+1. The userspace AF_XDP dataplane is driven by the JSON control-socket
+   snapshot, **not** the eBPF `flow_config_map` (retired path) — and
+   `FlowSnapshot` did not carry the ALG-disable flags at all.
+2. No Rust reader consumed `alg_flags`.
+3. The conntrack session value's `alg_type` was **hardcoded to `0`** at
+   `publish_conntrack.rs`.
+
+Net effect: `alg disable` was accepted at commit with **zero runtime effect**
+— a silent Junos divergence (the audit's "stored-but-never-enforced" class).
+
+## Junos semantics confirmed before coding
+
+`alg disable` turns the ALG **off**; it does **not** drop traffic. The audit
+fix-sketch's "reject/again on UDP/53" suggestion contradicts Junos and was
+**not** implemented. The enforced effect here is: a session matching a
+well-known ALG service port is tagged with its ALG type in the conntrack
+`alg_type` field *unless* that ALG is disabled, in which case it is tagged
+`none`. (xpf does not yet run the active ALG transforms — payload doctoring /
+dynamic pinholes — so a non-disabled ALG only sets the type today; the
+transform work is the separate "DNS ALG with NAT" gap in `feature-gaps.md`.)
+
+## The fix
+
+- Go: add `ALGDisableFlags uint8` to `FlowSnapshot`; pack it in
+  `buildFlowSnapshot` via `algDisableFlags` (DNS=0x01, FTP=0x02, SIP=0x04,
+  TFTP=0x08 — same layout as the legacy `flow_config_map` encoding and the
+  Rust constants). Plain `uint8` JSON number, immune to the #1961 base64
+  `[]uint8` wire-type failure class.
+- Rust: add `alg_disable_flags` to the wire `FlowSnapshot` and to
+  `ForwardingState`; wire it in `forwarding_build`. New pure helper
+  `alg_type_for_session` derives the `alg_type` (codes match
+  `bpf/headers/xpf_conntrack.h`: FTP=1, SIP=2, DNS=3) from the session
+  5-tuple, returning `none` when the matching disable bit is set. Threaded
+  through `publish_bpf_conntrack_entry` and the `ConntrackCtx` mirror path so
+  every session-publish site honours the knobs. The well-known port is matched
+  on either the src or dst slot so a reverse-keyed session resolves to the same
+  ALG.
+
+## Regression tests
+
+- Rust `alg_type_tests` (in `publish_conntrack.rs`): each ALG enabled vs
+
+*(truncated — 80 lines total)*
+
+
+---
+
+## PR #2017 — cleanup: DRY ip_proto consts + O(1) SNMP getCommunity (#2016) [MERGED] (merged 2026-06-19)
+
+Branch: `cleanup/2016-dry-ip-proto-snmp-getcommunity`
+
+Closes #2016. Two deferred cosmetic nits from the #2008 Tier-1 merges, batched into one no-behavior-change cleanup.
+
+## (a) userspace-dp `publish_conntrack.rs` — DRY the PROTO_* consts
+The module re-declared local `const PROTO_TCP: u8 = 6;` / `const PROTO_UDP: u8 = 17;` instead of using the crate-wide canonical home in `userspace-dp/src/ip_proto.rs` (consolidated in #1826). Replaced the two local definitions with `use crate::ip_proto::{PROTO_TCP, PROTO_UDP};` — the same pattern already used by `session/`, `filter/`, `nat/`, `screen/`, `policy/`, `nat64.rs`, and the other dataplane modules.
+
+The values are identical (IANA TCP=6 / UDP=17), so `alg_type_for_session` is bit-identical. The `alg_type_tests` child module continues to reach the constants via `super::`.
+
+## (b) `pkg/snmp/agent.go` `getCommunity` — O(1) map lookup
+`getCommunity` scanned `cfg.Communities` with an O(n) for-range loop comparing `c.Name == community`, but `cfg.Communities` is a `map[string]*SNMPCommunity` keyed by community name (populated as `snmp.Communities[comm.Name] = comm` in `compiler_system.go`). Replaced the scan with the direct `cfg.Communities[community]` lookup. The map key is exactly the name the loop matched on, so the result (the matching `*SNMPCommunity`, or nil when absent) is unchanged.
+
+## Validation
+- Full Go suite (`go test ./...`) passes, including `pkg/snmp`.
+- Full Rust binary suite (`cargo test --bin xpf-userspace-dp`): 2058 passed / 0 failed, including the 10 `publish_conntrack` `alg_type` tests.
+- `gofmt` + `go vet` clean on `agent.go`; `cargo build` clean with no new unused-import warning.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #2018 — test/incus: refuse multiple firewalls on the gateway bridges (#1992) [MERGED] (merged 2026-06-19)
+
+Branch: `worktree-wf_2bb36bd8-3ab-2`
+
+## Summary
+Closes #1992 (test-env only — no production code).
+
+The standalone firewall claims the **same static gateway IPs** on every run —
+`ge-0/0/0 = 10.0.1.10` on the trust bridge, `ge-0/0/1 = 10.0.2.10` on the
+untrust bridge (`test/incus/xpf-test.conf`) — and the `trust-host` /
+`untrust-host` test containers default-route through those IPs. When a SECOND
+firewall VM was attached to the same trust/untrust bridges it claimed the same
+gateway IPs, so the hosts' gateway ARP resolved **nondeterministically** to
+whichever firewall last answered or GARP'd. Mid-stream the gateway MAC could
+flip to a firewall that was not forwarding, producing a false
+`~4 Gbps -> 0 for several seconds -> recover with a retransmit burst` stall and
+an RX-queue `irq=0` reading on the intended DUT. This was misdiagnosed as a
+virtio_net NAPI-quiesce kernel bug in #1961 before an isolated run proved
+plain-virtio forwards rock-steady.
+
+## Change (shell + docs only)
+`test/incus/setup.sh`:
+- New `assert_sole_dataplane_owner()` parses the `used_by:` instances of each
+  dataplane gateway bridge (`DATAPLANE_GW_BRIDGES = xpf-trust xpf-untrust`) and
+  flags any **other** instance attached to **both** gateway bridges — one that
+  behaves like a firewall claiming both gateway IPs. Single-sided test
+  containers (trust-host on trust only, untrust-host on untrust only) are not
+  flagged because they do not claim the gateway IP. When the gateway bridges
+  don't exist yet the guard is a no-op (a fresh host is unaffected).
+- `create-vm`, `create-ct`, and `deploy` call the guard first. By default it
+  **refuses** with isolation guidance; `XPF_FORCE_TEARDOWN_PEERS=1` stops and
+  deletes the conflicting firewall(s) automatically.
+
+Docs: the isolation requirement (exactly one firewall answering each gateway
+before any forwarding/stall measurement) is documented in the `setup.sh`
+header + usage text, a new **DUT Isolation** section in `docs/testing.md`, and a
+standalone-topology note in `docs/network-topology.md`.
+
+## Path drift corrected
+The issue names the bridges `bpfrx-trust`/`bpfrx-untrust`; current
+`setup.sh` (master) creates and attaches to `xpf-trust`/`xpf-untrust`. The
+guard keys off the bridge set the script actually owns (`DATAPLANE_GW_BRIDGES`),
+so it protects whatever names the script uses. The live incus host still has
+the older `bpfrx-*` bridges (the exact 3-firewall collision the issue
+describes), which is what the guard was exercised against.
+
+## Validation
+- `bash -n` clean; `shellcheck -S warning` clean. The 5 remaining `SC2016`
+  info findings are pre-existing single-quoted remote-exec strings (identical
+  count before and after this change).
+- Exercised the guard logic end-to-end against the live incus host: with three
+  firewalls attached to both bridges it refuses and lists exactly the
+  dual-attached instances (not the single-sided test hosts);
+  `XPF_FORCE_TEARDOWN_PEERS=1` reports the teardown set; with the gateway
+
+*(truncated — 55 lines total)*
+
+
+---
+
+## PR #2019 — ipsec: decompose package into manager/ike/crypto/policy modules (#1989) [MERGED] (merged 2026-06-19)
+
+Branch: `refactor/1989-ipsec-decompose`
+
+## Summary
+
+Pure code-motion refactor of `pkg/ipsec` per #1989. The package was three
+flatly-combined files (`ipsec.go`=805 LOC, `prepare.go`=203, `junos_secret.go`=169)
+mixing the SA lifecycle, swanctl config generation, IKE/ESP proposal math,
+SA-status parsing, XFRM interface preparation, and Junos `$9$` secret decryption.
+
+This splits them by responsibility (one responsibility per module), **keeping
+everything in `package ipsec`** so the public API is byte-for-byte identical and
+no importer changes are needed (`pkg/daemon`, `pkg/grpcapi`, `pkg/api`, `pkg/cli`
+all consume only the exported `Manager`/`New`/`Apply`/`Clear`/`SAStatus`/
+`TerminateAllSAs`/`ActiveConnectionNames`/`InitiateConnection`/`GetSAStatus`/
+`PrepareConfig`, unchanged).
+
+## New file layout
+
+| File | Responsibility |
+|------|----------------|
+| `manager.go` | `Manager` lifecycle (`New`/`Apply`/`Clear`/`reload`) + swanctl shell-out helper (`runSwanctl`, `swanctlTimeout`, conf-dir consts) |
+| `ike.go` | IKE/ESP settings resolution + proposal builders (`resolveIKESettings`/`resolveESPSettings`/`deriveDPD`/`buildIKEProposal*`/`buildESPProposal`/`dhGroupBits`) and SA-status query + `swanctl --list-sas` parsing (`SAStatus`/`GetSAStatus`/`parseSAOutput`/`TerminateAllSAs`/`InitiateConnection`/`ActiveConnectionNames`) |
+| `crypto.go` | **Isolated** Junos `$9$` pre-shared-key decryption (`normalizePSK`/`decodeJunosSecret`/`junosGap`/`junosGapDecode` + `$9$` alphabet tables). Pulled into its own file so the decryption surface can be audited and unit-tested without the swanctl/XFRM machinery — the primary goal of the issue |
+| `policy.go` | swanctl config generation (`renderConfig`/`generateConfig`, traffic-selector resolution, value sanitizers, identity formatting, `authMethodToSwan`, `xfrmiIfID`) + XFRM bind-interface preparation (`PrepareConfig`, formerly `prepare.go`) |
+
+## What did NOT change
+
+No crypto, config-render, or SA-parse logic was modified — function bodies are
+relocated verbatim. A normalized multiset diff of the old vs new code lines shows
+the only differences are the per-file `import` blocks the split requires plus one
+doc comment on `crypto.go`'s isolation intent; zero logic lines added or removed.
+Git records `junos_secret.go`→`crypto.go` (82% similarity) and `ipsec.go`→`ike.go`
+(51%) as renames.
+
+The two non-crypto helpers that happened to live in `junos_secret.go`
+(`sanitizeChildName`, `authMethodToSwan`) moved to `policy.go` where they belong;
+the crypto file now contains only the `$9$` surface.
+
+## Validation
+
+- `gofmt -l` and `go vet` clean on all four new files.
+- Full Go suite green: `GOCACHE=... go test -count=1 ./...` (exit 0, 0 FAIL),
+  including the unchanged `pkg/ipsec` tests which exercise
+  `generateConfig`/`renderConfig`/`parseSAOutput`/`buildESPProposal`/`PrepareConfig`
+  across all four modules — the test suite passing is the proof behavior is preserved.
+- `go build ./...` clean (all importers compile).
+- README updated to the new module layout (docs-as-contract).
+
+Closes #1989.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #2020 — #1990: group userspace formatters into a format/ subpackage (pure code motion) [MERGED] (merged 2026-06-19)
+
+Branch: `refactor/1990-userspace-format-subpkg`
+
+## Summary
+
+Closes #1990. Pure code motion: the `pkg/dataplane/userspace/` directory had grown into a ~70-file flat tree that mixed telemetry parse/format helpers with the core forwarding managers. Per the engineering-style "one responsibility per module" guideline, this relocates the output-presentation logic into a dedicated `pkg/dataplane/userspace/format` subpackage so the packet-processing directory carries only the manager logic.
+
+## What moved (git renames, bodies unchanged)
+
+| From | To |
+|------|----|
+| `cosfmt.go` | `format/cos.go` |
+| `statusfmt.go` | `format/status.go` |
+| `buffersfmt.go` | `format/buffers.go` |
+| `wgfmt.go` | `format/wireguard.go` |
+| `format_math.go` | `format/math.go` |
+
+…plus the four matching `*_test.go` pairs. The `format_math.go` saturating-add/sub helpers are used only by the formatters, so they move too.
+
+## Public API
+
+Identical — only the import path changes. Callers now reference `dpformat.FormatStatusSummary` (etc.) instead of `dpuserspace.FormatStatusSummary` across `pkg/grpcapi`, `pkg/cli`, and `pkg/api`. The parent `userspace` package keeps the non-formatting fairness API (`CoSFairnessRSSSummaries`, `EvaluateFairnessRSSExpectations`, `FairnessRSSExpectationsFromConfig`), which several callers still use, so those files keep both imports.
+
+## Mechanical adjustments required by the move (no behavior change)
+
+- The moved files reference exported parent types (`ProcessStatus`, `BindingStatus`, `CoSInterfaceStatus`, `CoSQueueStatus`, …) and the two exported fairness functions; these are now qualified with the `userspace` package alias.
+- `format/status_test.go` inlines the unexported `persistentSourceNATHAUnsupportedReason` constant (value-identical to `manager.go`) because a sibling package cannot reference it; the test asserts the exact same rendered line.
+- `manager_test.go`'s SYN-cookie IPC test summed counters via the now-moved `SumSYNCookieCounters` helper. Importing the `format` subpackage from this internal (`package userspace`) test would create an import cycle (`format` imports `userspace`), so the test sums the per-binding counters inline. The summation helper itself remains covered by the `format` package tests.
+
+## Validation
+
+- `go build ./...` clean.
+- `go vet` clean on all touched packages (no new warnings; the pre-existing `cli.go` unreachable-code note is unrelated).
+- `gofmt` clean on all changed files.
+- Full `go test ./...` green, including the new `pkg/dataplane/userspace/format` package and every importer (`pkg/api`, `pkg/cli`, `pkg/grpcapi`, `pkg/dataplane/userspace`).
+- Verified pure motion by normalizing the moved files (strip the package decl + `userspace.` qualifiers) and diffing against `origin/master`: the formatter bodies are byte-identical save the added import line; `cos.go` and `math.go` are exactly identical.
+
+No documentation update is needed: no living module/README doc names the moved files; the only references are point-in-time historical PR/research records under `docs/`, which should not be retroactively rewritten.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #2021 — #1988: decompose pkg/flowexport into manager/netflow/ipfix/transport [MERGED] (merged 2026-06-19)
+
+Branch: `refactor/1988-flowexport-decompose`
+
+## Summary
+
+Decomposes `pkg/flowexport` into responsibility-scoped files and dedups
+the UDP transport code that the NetFlow v9 and IPFIX exporters each
+carried a private copy of. Closes #1988 (AGY review 012 Part II.3
+modularity backlog).
+
+This is **pure code motion plus the extraction of two shared transport
+helpers**. The public API is unchanged and the encoding/config logic is
+byte-identical to before the split.
+
+## New layout
+
+| File | Responsibility |
+|------|----------------|
+| `manager.go` | Resolved `ExportConfig`/`CollectorConfig`/`SamplingDir`, the shared `FlowRecord` + `SessionCloseData` shapes, the sampling scheduler (`ShouldExport`), and the `BuildExportConfig` / `BuildIPFIXExportConfig` / `BuildSamplingZones` resolvers. |
+| `netflow.go` | Renamed from `netflow9.go`. NetFlow v9 template/record encoding (unchanged) plus the `Exporter`. |
+| `ipfix.go` | IPFIX (v10) template/record encoding (unchanged) plus the `IPFIXExporter`; its config resolver moved to `manager.go`. |
+| `transport.go` | New. `collectorConns` owns the dial loop, the per-packet fan-out write, and teardown that were duplicated line-for-line across `NewExporter`/`NewIPFIXExporter` and their send paths. `flowBatch` owns the per-family (v4/v6) record accumulation and atomic drain. |
+
+`exporter.go` is removed; its content is split between `manager.go`
+(config/scheduler/shared types) and `netflow.go` (the `Exporter`).
+
+## Behavior preservation
+
+- Both exporters now hold a `*collectorConns` and a `flowBatch` instead
+  of open-coding `conns` / `batchMu` / `batchV4` / `batchV6`. The dial,
+  write-to-all-collectors, and per-family batch/flush semantics are
+  identical (the distinct debug log strings — `netflow ... send failed`
+  vs `ipfix ... send failed` — are preserved via the `errMsg` argument).
+- `dialCollectors` takes `[]CollectorConfig` (not the whole
+  `ExportConfig`) so the shared helper does not copy the atomic
+  `sampleCounter`. `go vet` on the package is unchanged from master: the
+  two pre-existing "passes lock by value" warnings on
+  `NewExporter`/`NewIPFIXExporter` remain; **no new warnings** are
+  introduced.
+- The encode and config-resolver function bodies were verified
+  byte-identical to `origin/master` via per-function diff.
+
+## Validation
+
+- `go test ./...` green (the one intermittent `pkg/dataplane/userspace`
+  flake is pre-existing on clean master, does not import `flowexport`,
+  and reproduces only under parallel-load timing).
+- `pkg/flowexport` package tests pass.
+- `gofmt -l` clean; `go vet` clean (no new findings) on the changed
+  files.
+- `pkg/flowexport/README.md` updated with the new file map.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+*(truncated — 51 lines total)*
+
+
+---
+
+## PR #2024 — #2001: sweep upgrade/install image docs after #1964/#1982/#1983 hardening [MERGED] (merged 2026-06-19)
+
+Branch: `docs/2001-upgrade-image-docs-sweep`
+
+Closes #2001.
+
+Docs-only sweep that realigns the upgrade/install image docs with the
+hardened model (#1964 versioned-runtime seed, #1982 manifest SSOT, #1983
+reject-non-default `--unit`). The stale text actively misled the next
+maintainer about postinst layout, the managed-binary symbol, and the
+cluster control contract.
+
+## Changes
+
+**`docs/install-images.md`**
+- Bake postinst step no longer says the package "creates the live sbin
+  symlinks into the staging path" (pre-#1964 layout). Now splits the four
+  version-dependent postinst flows: (a) first-install seed via
+  `versions/current` (`xpfd seed-runtime`), (b) direct-staged fallback
+  when seeding fails, (c) clustered stage-only upgrade, (d) standalone
+  verified cut-over (`xpfd upgrade`).
+- Upgrades section drops the "native .deb + `xpf-upgrade` wrapper as M1a
+  follow-up" framing — the package now owns the verified in-place cut.
+
+**`docs/in-place-upgrade.md`**
+- Managed-binary manifest section replaces the phantom `manifest.Managed`
+  symbol with the actual SSOT: the UNEXPORTED `managed` slice in
+  `pkg/upgrade/manifest/manifest.go` + the exported accessors `All()` /
+  `Names()` / `LockstepNames()`. Updates the add-a-managed-binary
+  procedure accordingly.
+- `--unit` / cluster-control section removes the "tracked follow-up
+  enhancement (#1983 §4.2 / future `pkg/upgrade/clusterclient`)" wording
+  (#1983 is CLOSED-COMPLETED; no open clusterclient issue) and documents
+  the current deliberate reject-non-default-endpoint behavior as the
+  whole contract.
+
+**`scripts/docs/check-upgrade-docs.sh` + `make docs-check`**
+- New fail-closed docs canary: greps for "symlinks into the staging path"
+  in `docs/install-images.md` and `manifest.Managed` across `docs/`,
+  exits non-zero if either reappears. Standalone `make docs-check` target,
+  same posture as `audit-check` (NOT a dependency of `make test`).
+
+## Validation
+- `bash -n scripts/docs/check-upgrade-docs.sh` clean.
+- `make docs-check` passes on the fixed docs.
+- Canary proven non-tautological: temporarily reintroduced each banned
+  phrase → canary exits 1 in both cases → returns to exit 0 after revert.
+- Re-verified the SSOT symbol/accessors against current master
+  (`managed` slice line 56, `All()` line 66, `Names()` line 74,
+  `LockstepNames()` line 88) since the issue's line numbers had drifted.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #2025 — #2006: group pkg/vrrp into manager/instance/packet/track [MERGED] (merged 2026-06-19)
+
+Branch: `refactor/2006-vrrp-regroup`
+
+Pure code-motion refactor of the flat `pkg/vrrp` package (#2006). Same
+package — intra-package file reorganization only, so NO import-path
+churn, NO visibility change, NO cycle risk.
+
+## What moved
+
+The interface-tracking subsystem (#1814) was split across two files and
+is now collected into a new `track.go` (same `package vrrp`):
+
+- From `instance.go` → `track.go`: `getPriority`, `setTrackDown`,
+  `trackedInterface` (per-instance effective-priority primitives).
+- From `manager.go` → `track.go`: `ensureLinkWatcherLocked`,
+  `runLinkWatcher`, `runLinkPoller`, `pollTrackedLinks`,
+  `applyTrackedLinkState`, `seedTrackState`, `netlinkLinkState`,
+  `linkAttrsUp` (singleton link watcher / poll fallback).
+
+The `Manager` struct's tracking fields stay in `manager.go` and the
+`vrrpInstance.trackDown` field stays in `instance.go` (struct
+definitions are single-file). `packet.go` and `vrrp.go` are unchanged.
+
+## Byte-preserving
+
+Function bodies were moved byte-identical (verified by extracting each
+moved function from `HEAD` and diffing against `track.go` — empty diff).
+Nothing changed in the priority-cost demotion clamp `[1,254]`, the
+priority-0 resignation passthrough, the priority-255 owner exemption,
+the singleton-watcher latch under `m.mu`, the 1s poll fallback, GARP, or
+any timing. gofmt re-aligned a few struct-comment columns in the two
+touched files (cosmetic; code tokens unchanged).
+
+## Line counts
+
+| file | before | after |
+|------|--------|-------|
+| instance.go | 1266 | 1203 |
+| manager.go | 872 | 724 |
+| packet.go | 205 | 205 |
+| vrrp.go | 250 | 250 |
+| track.go | — | 228 (new) |
+
+## Validation
+
+- `go build ./...` clean
+- `go test ./pkg/vrrp/...` → `ok` (pre-existing `track_test.go` suite —
+  `TestGetPriority_TrackMatrix`, `TestSetTrackDown_Transition`,
+  `TestLinkWatcher_*`, `TestPollTrackedLinks` — passes unchanged)
+- `go vet ./pkg/vrrp/...` clean
+
+Docs: `pkg/vrrp/README.md` gains a File layout section and repoints the
+tracking entries to `track.go`; `_Log.md` records the change.
+
+*(truncated — 54 lines total)*
+
+
+---
+
+## PR #2026 — #2003: split afxdp/bpf_map/mod.rs into pin/metrics/ha [MERGED] (merged 2026-06-19)
+
+Branch: `refactor/2003-bpf-map-split`
+
+## Summary
+
+Pure code-motion refactor (#2003). Splits `userspace-dp/src/afxdp/bpf_map/mod.rs`
+(~1063 LOC → ~640 LOC) into three focused submodules, following the existing
+sibling `publish_conntrack.rs` precedent (#1356). **No behavior change** — every
+function, struct, static, and const is moved verbatim with its signature, logic,
+side effects, log/error strings, and cfg gating intact.
+
+## New submodules
+
+| File | Cluster | Items moved |
+|------|---------|-------------|
+| `bpf_map/ha.rs` | HA liveness slots (XSK + heartbeat map writes that gate active-binding state) | `register_xsk_slot`, `update_heartbeat_slot`, `delete_xsk_slot`, `delete_heartbeat_slot`, `maybe_touch_heartbeat`, `touch_heartbeat`, `heartbeat_fresh` |
+| `bpf_map/metrics.rs` | Telemetry counters + diagnostics | `diagnose_raw_ring_state`, `count_bpf_session_entries`, `dump_bpf_session_entries`, `SESSION_PUBLISH_VERIFY_OK/FAIL`, `SESSION_PUBLISH_ERRORS_SHARED`, `SESSION_CREATIONS_LOGGED`, `ICMPV6_EMBED_LOGGED` |
+| `bpf_map/pin.rs` | libbpf fd pinning + pinned degraded-path reader | `OwnedFd` (+ `open_bpf_map`/`Drop`), `DEGRADED_PATH_STATS_PIN_PATH`, `DEGRADED_PATH_REASON_NAMES`, `read_degraded_path_stats` |
+
+`mod.rs` remains the coordinator over the session-map publish/delete core, the
+conntrack-mirror orchestrators, and the BPF conntrack struct definitions.
+
+## API surface preserved exactly
+
+The original items were `pub(super)` (= `pub(in crate::afxdp)`). Moved items keep
+that exact visibility via an explicit `pub(in crate::afxdp)` declaration, and
+`mod.rs` re-exports each submodule with `pub(in crate::afxdp) use {ha,metrics,pin}::*;`.
+This keeps every consumer resolving unchanged:
+
+- the parent `afxdp` glob (`use self::bpf_map::*`) and all bare-name call sites
+- the explicit paths `crate::afxdp::bpf_map::OwnedFd` (coordinator) and
+  `crate::afxdp::bpf_map::SESSION_PUBLISH_ERRORS_SHARED` (session_glue / forwarding)
+- the relocated `bpf_map_tests.rs` (`use super::*`), which references many moved
+  items by bare name
+
+No public API of `crate::afxdp::bpf_map` changed (same names, same visibility).
+
+## Visibility notes
+
+- No widening required. Items keep `pub(in crate::afxdp)` (semantically identical
+  to the original `pub(super)` for this file). The pre-existing `private_interfaces`
+  lint on the `pub(crate)` `BpfMaps` fields that hold `OwnedFd` is unchanged in
+  severity — only the type's display path moved from `bpf_map::OwnedFd` to
+  `bpf_map::pin::OwnedFd`.
+
+## Validation
+
+```
+cargo build --release   # clean (pre-existing warnings only)
+cargo test  --release   # lib: 2057 passed, 0 failed; + 46 + 8 + 16 + 1 across
+                        # the other test binaries, 0 failed
+```
+
+
+*(truncated — 54 lines total)*
+
+
+---
+
+## PR #2027 — #1986: de-monolith afxdp/mirror.rs into mirror/{mod,fast_path,resolver,vlan} [MERGED] (merged 2026-06-19)
+
+Branch: `refactor/1986-mirror-decompose`
+
+De-monoliths the 1402-line `userspace-dp/src/afxdp/mirror.rs` hot-path
+file into a `mirror/` sub-module directory. **Pure code-motion** — no
+logic, signature, or behavior changes. Same-crate file split (no new
+package boundary, no import-cycle risk).
+
+## Layout
+- **`mirror/mod.rs`** (supervisor) — `MirrorCloneResult` enum,
+  `MIRROR_TX_FRAME_RESERVE` / `MIRROR_PENDING_LIMIT` constants, the
+  config-resolution + sampling-decision entry points
+  (`select_mirror_config`, `resolve_mirror_config`,
+  `mirror_sample_allows`), submodule declarations, the
+  `crate::afxdp`-visible re-exports, and the colocated `#[cfg(test)]`
+  tests (21 tests, moved verbatim).
+- **`mirror/fast_path.rs`** (HOT) — the descriptor-copy enqueue path:
+  `enqueue_mirror_clone`, `enqueue_sampled_mirror_clone`,
+  `enqueue_mirror_clone_to_binding` (the inline UMEM frame copy + TX
+  staging), `enqueue_mirror_clone_to_live`,
+  `enqueue_admitted_mirror_clone_to_live`,
+  `enqueue_sampled_mirror_clone_to_live`.
+- **`mirror/resolver.rs`** (COLD) — target-binding lookup + accounting:
+  `mirror_target_binding_index`, `admit_mirror_clone_to_live`,
+  `mirror_cos_queue_id`, `record_mirror_clone_result`.
+
+### No `vlan.rs` (and no resolver-ifindex move)
+`mirror.rs` contained **no** VLAN injection/replication code — `vlan`
+appears only as a parameter name and as test fixture data — and
+`resolve_ingress_logical_ifindex` lives in `afxdp/forwarding/mod.rs`,
+not here. The issue's suggested `vlan.rs` and resolver-ifindex moves had
+no source to extract, so the split honestly tracks the file's real
+content (mod + fast_path + resolver).
+
+## Inlining-neutrality (hot mirror-clone path)
+Every existing `#[inline]` is preserved (`mirror_cos_queue_id`,
+`record_mirror_clone_result`). `#[inline]` is **added only** to the two
+helpers whose previously same-module calls now cross the
+`fast_path -> resolver` boundary: `mirror_target_binding_index` and
+`admit_mirror_clone_to_live`.
+
+`objdump -d` of the release binary confirms the hot path is unchanged.
+Inside the hot `enqueue_sampled_mirror_clone`, the only mirror-namespace
+`call` is the single `enqueue_admitted_mirror_clone_to_live` (the cold
+live/cross-worker fallback) — exactly as in the pre-split baseline.
+`mirror_target_binding_index`, `admit_mirror_clone_to_live`,
+`mirror_cos_queue_id`, and `enqueue_mirror_clone_to_binding` remain
+**fully inlined** (no standalone symbols, no new `call`).
+
+## Visibility
+One widening only: `mirror_target_binding_index` goes module-private
+`fn` -> `pub(super)` so the fast path can reach it across the new
+boundary. It stays mirror-module-internal (NOT added to the
+
+*(truncated — 65 lines total)*
+
+
+---
+
+## PR #2028 — #2005: split session/mod.rs into lookup/install/expire [MERGED] (merged 2026-06-19)
+
+Branch: `refactor/2005-session-decompose`
+
+## Summary
+
+Pure code-motion split of `userspace-dp/src/session/mod.rs` (the core
+conntrack fast path: tables, lookups, installs, locks, timeouts) from a
+single 1604-LOC file into focused same-crate submodules, following the
+just-merged `afxdp/bpf_map/` mod-dir idiom (#2003). No new package
+boundary → no import-cycle risk. mod.rs: 1604 → 918 LOC.
+
+| File | What it owns |
+|------|--------------|
+| `mod.rs` | `SessionTable` coordinator: slab + secondary indices + delta queue + the **#1752/#1855 in-place-refresh contract** (`update_session` / `refresh_for_ha_transition` + secondary-index re-assert + #964 eager-cleanup `remove_entry`/`index_*` helpers) |
+| `lookup.rs` | forward/reverse tuple match read path: `lookup` family (primary + NAT-translated-reverse alias), NAT/wire reverse finders, read accessors, `take_synced_local` |
+| `install.rs` | session-creation: #1861 capacity preflight + counters, new-flow installs (`install_with_protocol*` / `upsert_synced*`), delta-emit / `delete` / `demote_owner_rg` |
+| `expire.rs` | timer-wheel sweeps + eviction: `expire_stale_entries`, `push_to_wheel`, `wheel_observe` |
+
+## Invariants preserved BYTE-FOR-BYTE
+
+The #1752/#1855 in-place-refresh contract — single-writer `&mut self`
+discipline, eager #964 cleanup, forward+reverse secondary-index
+re-assert parity — is **untouched and stays in mod.rs**. A function-body
+diff against the pre-split mod.rs confirms every moved body is
+byte-identical, and the only retained-code change to mod.rs is the
+trimmed `use wheel::SessionWheel` + the three `mod` declarations.
+
+### Visibility rewrites (exhaustive)
+- `expire.rs`: `push_to_wheel` — `fn` → `pub(in crate::session)` (the
+  ONLY widening). Required because the retained in-place-refresh
+  contract in mod.rs, the install/lookup submodules, and the test
+  oracle all call it across the module boundary. Absolute
+  `pub(in crate::session)` form preserves the original scope (visible
+  to the whole `session` module tree), not narrowed to expire.rs.
+- Body diff confirms `push_to_wheel` differs from the original ONLY in
+  that signature line.
+- `tests.rs`: added `use super::wheel::{FAR_FUTURE_OFFSET, WHEEL_BUCKETS, WHEEL_TICK_NS}`
+  (the GC tests previously reached these via mod.rs's now-trimmed `use wheel::{...}` glob; same symbols, no behavior change).
+
+All other moved methods keep their original `pub`/`pub(crate)`
+visibility (callable crate-wide off the `pub(crate)` SessionTable type).
+
+## Validation
+- `cargo build --release` clean; `cargo test --release` 2128 tests, session module 78/78.
+- The fused-diff / in-place oracle suite passes (`inplace_*_matches_reference`, incl. `inplace_randomized_sequence_matches_reference` and the displaced-collision-reassert tests) — the behavior-preservation proof for the in-place-refresh contract.
+- 5x flake on `session::` = 5/5 green (78 passed each).
+- Public API of `crate::session` unchanged.
+
+NEEDS LAB SMOKE: loss userspace cluster iperf3 + full quad review before merge (conntrack hot path, #1752/#1855 in-place-refresh contract, queued by campaign owner).
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #2029 — #1997: order postrm drop-in cleanup before versions/current removal [MERGED] (merged 2026-06-19)
+
+Branch: `fix/1997-postrm-teardown-order`
+
+## Problem (#1997)
+
+In `debian/xpf.postrm`, the genuine pre-#1964 downgrade teardown deleted
+`versions/current` BEFORE calling `remove_runtime_dropin`, while the whole
+teardown block was guarded on `versions/current` existing. If the process is
+killed in that window (after `rm current`, before the drop-in removal), a postrm
+RERUN sees `current` already gone and SKIPS the drop-in removal — leaving an
+orphan `/etc/systemd/system/xpfd.service.d/10-xpf-version.conf` that pins an
+`ExecStart` for a layout the downgraded (pre-hardened) package no longer manages.
+A subsequent boot honors the stale drop-in.
+
+## Dependency-order finding (the "needs-research (small)" nit)
+
+Read `debian/xpf.postrm` fully (and `preinst`/`postinst`). **No teardown step
+depends on `versions/current` being gone first:** `remove_runtime_dropin` never
+reads `current` (it operates on `$DROPIN` + `.service.d`), and
+`repoint_owned_sbin_to_staged` operates only on `$SBIN/*` links. `preinst`/
+`postinst` run in separate dpkg phases and assume nothing about postrm teardown
+order. **Reordering is safe.**
+
+## Fix chosen — Option B (idempotent re-derive), justified
+
+A bare reorder (Option A) still leaves a one-instruction window: a crash after
+the (now-last) `rm current` but mid `remove_runtime_dropin` would still leave the
+orphan, and a rerun would still skip on a `versions/current`-only guard. So the
+stronger property is **idempotent re-run convergence**:
+
+- The presence guard now fires when `versions/current` **OR** the runtime
+  drop-in artifact is present
+  (`[ -L "$CURRENT" ] || [ -e "$CURRENT" ] || [ -L "$DROPIN" ] || [ -e "$DROPIN" ]`),
+  so a rerun re-enters and finishes the cleanup, including dangling drop-in symlinks.
+- The destructive `rm current` is also moved to **LAST** (after
+  `remove_runtime_dropin`), so the only step that can flip the guard false runs
+  after the drop-in is already gone — shrinking the single-run orphan window to
+  nothing. All three teardown steps are idempotent, so re-entry is safe.
+
+## Test (`test/debian/postrm-test.sh`, run under `sh` AND `dash`)
+
+- `rerun_after_crash_removes_orphan_dropin` — reconstructs the exact post-crash
+  on-disk state (sbin already repointed to `staged/`, `current` removed, drop-in
+  still present) and asserts a downgrade RERUN removes the orphan drop-in and
+  rmdirs the empty `.service.d`.
+- `oldbug_leaves_orphan_proves_nontautology` — synthesizes the pre-#1997
+  guard+order (via `awk`) and asserts it LEAVES the orphan, proving the rerun
+  test discriminates the fix.
+- `rerun_removes_dangling_dropin_symlink` — validates rerun convergence when the
+  drop-in exists as a dangling symlink and `versions/current` is already gone.
+- Hardened the `awk` match used by the oldbug synthesis to tolerate trailing
+  whitespace after the line-continuation backslash.
+
+
+*(truncated — 65 lines total)*
+
+
+---
+
+## PR #2030 — #1979: Layer-B commit-time NUM_WIDTH validation (flow/flow-export, tcp-mss) [MERGED] (merged 2026-06-19)
+
+Branch: `fix/1979-layerb-numwidth-validate`
+
+Layer B of #1977 — commit-time range validation for the flow/flow-export
+fields that Layer A (#1977, `buildFlowSnapshot` / `buildFlowExportSnapshot`
+in `pkg/dataplane/userspace/flow.go`) coerces to Rust `u16`/`u32`/`u64`.
+Layer A already makes every value SAFE at the wire boundary; Layer B is the
+operator-UX companion — a clear `commit check` error instead of silent
+coercion. Implemented exactly per the 3-way converged plan
+(`docs/research/1979-layerb-validate/plan.md`, PLAN v3).
+
+## Three tiers
+
+**Tier 1 — typed `setSchema` leaves (declarative #1319 path):**
+`services flow-monitoring version9 template <t> flow-active-timeout` /
+`flow-inactive-timeout` → `ValidateInteger(0, maxWireU32)` (Rust u32). The
+parallel `version-ipfix` pair is typed identically for UX parity (it does
+NOT reach the wire — `buildFlowExportSnapshot` reads `fm.Version9` only).
+
+**Tier 2 — opaque containers → typed-child containers:**
+- `security flow tcp-session`: `established-timeout` (Rust u64
+  TCPSessionTimeout) + `initial`/`closing`/`time-wait-timeout` (config-only)
+  all `ValidateInteger(0, MaxDurationSeconds)` (the Duration-overflow
+  ceiling, NOT u64-max — the helper multiplies `secs*1e9` unchecked); plus
+  the three presence flags declared presence-only for completion parity.
+- `udp-session` / `icmp-session`: typed `timeout` (same bound).
+- sampling `input rate`: `ValidateInteger(0, maxWireU32)`.
+- `flow-server port`: `ValidateInteger(1, maxWireU16)` (Rust u16
+  CollectorPort; Layer A skips a server with port `<1`/`>65535`).
+  `flow-server` gains a children map → deliberate bare-terminal
+  REPLACE→APPEND flip (benign; pinned by a golden).
+
+**Tier 3 — compiler AST pre-walk (`validateVRRPTrackInterfaceAST` precedent):**
+`tcp-mss` stays OPAQUE in `setSchema` because its MSS value can live in
+EITHER the kind node's flat `Keys[1]` OR a hierarchical `mss` sub-child — a
+dual value-location the declarative walker cannot express. New
+`validateTCPMSSRanges` (`compiler_security.go`, wired into `compileExpanded`)
+range-checks the **compiler-selected** token at `[0, 65535]` via
+`selectMSSToken` (extracted from and SHARED with `parseMSSValue` so they can
+never diverge). The mixed shape `gre-in 70000 { mss 1360; }` therefore does
+NOT false-reject (the compiler selects the child 1360).
+
+## Q3 decision = `[0, u32max]` (sampling 0 accepted)
+
+Sampling `input rate` 0 is the documented `0 = sample all` sentinel
+(`types_system.go`); Layer A normalizes `rate<=0 -> 1`. The bound is the
+EXACT Layer-A mirror, rejecting only the decode-aborting `>u32max`.
+
+## Strict vs lenient (boot/HA safety)
+
+Tiers 1+2 get the strict/lenient split for free (typed-leaf
+`SchemaValidate` violations hard-reject on strict commit, downgrade to a
+warning on `Store.Load`/`Store.SyncApply` via `compileTreeLenient`). Tier 3
+
+*(truncated — 79 lines total)*
+
+
+---
+
+## PR #2031 — #2000: recreate absent sbin links through versions/current on upgrade [MERGED] (merged 2026-06-19)
+
+Branch: `fix/2000-postinst-sbin-via-current`
+
+## Issue
+#2000 — postinst upgrade: keep repaired sbin links on `versions/current`, never staged (codex-review-013 §2).
+
+## Problem
+The hardened layout contract (#1964 seed, increment-B flip) resolves every live/operator sbin link as `/usr/local/sbin/<bin> -> versions/current/<bin>` (the verified-live version). But the UPGRADE branch of `debian/xpf.postinst` recreated a COMPLETELY ABSENT link as `ln -sfnT "$STAGED/$b"` — direct to the just-unpacked, UNVERIFIED staged binary — producing a mixed state before the cut's VERIFY/STOP/FLIP. A recreated `cli` would run against the old daemon; a recreated `xpf-userspace-dp` would expose the unverified staged helper.
+
+## Fix
+The absent-link recovery now mirrors the seed (`pkg/upgrade/runtime/seed.go:169`) and flip (`pkg/upgrade/flip.go:43`) idiom:
+
+- if `/var/lib/xpf/versions/current/<bin>` exists → recreate the link **through** `versions/current/<bin>` (the same target the flip uses → the cut's flip is a no-op-shaped repoint);
+- if the target is absent (a newly-introduced managed binary on its first upgrade, or a legacy/never-seeded host with no `versions/current`) → **leave the link absent** (logged) until the verified cut/preinst-migration populates `versions/<v>/` and flips — never expose the unverified staged binary early;
+- **never** point a hardened-layout upgrade link direct to `$STAGED`.
+
+The existing/dangling-link protection is unchanged: the `-e` AND `-L` guard still skips any existing or dangling link — only the absent-link RECOVERY action changed.
+
+### old vs new ln target
+```
+- ln -sfnT "$STAGED/$b" "$SBIN/$b"                 # direct to unverified staged
++ ln -sfnT "$CURRENT_DIR/$b" "$SBIN/$b"            # CURRENT_DIR=/var/lib/xpf/versions/current
+  # (only when versions/current/$b exists; else leave absent + log)
+```
+
+## Test
+New `test/debian/postinst-test.sh` (mirrors the #1997 `postrm-test.sh`): runs the REAL postinst with layout paths rewritten to a temp root.
+- `recovers_cli/helper_through_current` — delete one sbin link, run `configure <old>`, assert the repaired link resolves to `versions/current/<bin>`, NOT `staged/<bin>`.
+- `leaves_existing_and_dangling_links` — operator-repointed + dangling links untouched.
+- `new_managed_binary_stays_absent` — target absent from `versions/current` → link stays absent.
+- `legacy_no_current_leaves_absent` — no `versions/current` → absent link left for migration/cut.
+- `oldbug_repairs_to_staged_proves_nontautology` — awk-synthesizes the pre-#2000 direct-staged loop, asserts it repairs to staged.
+
+**Non-tautology** proven two ways: (1) the synthesized old-bug postinst repairs `cli` to `staged/cli` (the core assertion rejects that); (2) the core assertion was run against `origin/master`'s ACTUAL postinst — it recovers `cli` to `staged/cli` (FAILS the assertion), the fix recovers through `versions/current` (PASSES). Runs clean under **sh AND dash**.
+
+The fixture is added to the #1982 managed-binary drift canary (`manifest_drift_test.go` `binsSites`); a forced fixture drift was verified to fail the canary.
+
+## Validation
+- `bash -n debian/xpf.postinst` clean; `shellcheck debian/xpf.postinst` exit 0 (no new or pre-existing warnings).
+- `postinst-test.sh` PASS under sh AND dash. The only shellcheck note on the test is the pre-existing SC1007 on the `CDPATH= cd` idiom — identical to `postrm-test.sh:15`.
+- `go test ./pkg/upgrade/...` ok (including the drift canary that reads the new fixture).
+- `go build ./...` clean.
+- `docs/in-place-upgrade.md` gains an UPGRADE absent-link-recovery bullet in the postinst HA-mode contract.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #2037 — #1999: enforce manifest StagedSrc against debian/rules install sources [MERGED] (merged 2026-06-19)
+
+Branch: `fix/1999-manifest-stagedsrc`
+
+## Summary
+Closes the dead-metadata gap in the managed-binary manifest: `StagedSrc` (the build-output source path) was never checked, so a wrong artifact under the correct staged basename would ship silently past the drift canary. Extends the canary to compare debian/rules install SOURCE/DEST pairs against the manifest's `Name->StagedSrc` mapping, plus a non-tautological counterfactual test.
+
+## Changes (test-only, pkg/upgrade/manifest)
+- `rulesInstallPair` + `extractRulesInstallPairs`: parse `install -m 0755 <src> debian/xpf$(STAGED)/<dest>` pairs (joining `\`-continued lines so the wrapped `xpf-day0-config` install matches).
+- `stagedSrcMismatches`: compares dest->src pairs against `manifest.All()` `Name->StagedSrc`; flags a wrong source under a correct basename, and a managed binary with no install line.
+- Wired into `TestManagedBinaryDriftCanary` alongside the existing dest-basename check.
+- `TestStagedSrcCounterfactual`: manifest-derived pairs pass; a wrong source under the correct basename is flagged (naming the bad source); a missing install line is flagged.
+
+## Disposition
+engineer-now (codex-review-013 §1) — isolated packaging/test SSOT hardening. The real `debian/rules` already matches the manifest, so this is a guard against future drift, not a fix to a shipping bug.
+
+## Test plan
+- [x] `go test ./pkg/upgrade/...` — all pass (incl. the extended canary + counterfactual)
+- [x] `go vet ./pkg/upgrade/manifest/` clean
+- [x] Counterfactual proven non-vacuous (fails on a wrong source / missing line)
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #2038 — #2036: fail closed on overlength LLDP TLVs instead of masking length [MERGED] (merged 2026-06-19)
+
+Branch: `fix/2036-lldp-tlv-failclosed`
+
+## Summary
+`EncodeTLV` masked the value length into the 9-bit TLV length field but still appended the full value, so an overlength value (>511 bytes) wrapped the header length while the full payload stayed in the frame — receivers misparse the overflow as following TLVs (malformed advertisements). The codec is a protocol boundary; it now fails closed.
+
+## Changes (pkg/lldp, codec-only)
+- `EncodeTLV` returns `([]byte, error)`, rejects values >511 bytes (`maxTLVValueLen=0x1ff`).
+- `mustEncodeTLV` for the compile-time/OS-bounded TLVs (chassis ID, port ID=ifname, TTL, End) — panics if the impossible happens.
+- `BuildFrame` returns `([]byte, error)`; variable-length identity TLVs (system name/desc, port desc) propagate the error.
+- `sendFrame` fails closed (logs + skips) rather than sending a malformed frame.
+
+## Test plan
+- [x] `EncodeTLV` 511 encodes (header length matches), 512 + 600 rejected (not masked)
+- [x] `BuildFrame` fails closed on an overlength system-description TLV; bounded frame still builds
+- [x] existing codec test callers updated; `go test ./pkg/lldp/` passes; `go build ./...` clean
+
+## Disposition
+engineer-now (codex-review-014 finding 4). Scope is the codec fail-closed (the protocol bug). The optional LLDP timing-leaf schema bounds noted in #2036 are a separate smaller hardening — the string TLVs are system-derived and now protected by the codec regardless.
+
+Closes #2036.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #2039 — ra: add RA link-local via NODAD AddrAdd, stop addr_gen_mode/link cycle (#2034) [MERGED] (merged 2026-06-20)
+
+Branch: `fix/2034-ra-linklocal-addrgen`
+
+## Summary
+
+Fixes #2034. `pkg/ra/sender.go ensureLinkLocal` (called from
+`sender.start()` whenever an RA sender goroutine (re)starts on an
+interface) used to, when no IPv6 link-local existed yet:
+
+1. write `/proc/sys/net/ipv6/conf/<if>/addr_gen_mode = 0` (EUI-64),
+2. write `accept_dad = 0` (ignoring the error),
+3. `LinkSetDown` → sleep 50ms → `LinkSetUp` to make the kernel
+   auto-generate a link-local,
+
+and **never restored `addr_gen_mode`**.
+
+This collides with the RETH IPv6 knob contract: the apply path's
+`setRethIPv6Knobs` deliberately sets `addr_gen_mode = 1` on every RETH
+member to suppress kernel EUI-64 link-locals and the continuous MLDv2
+reports they create. Starting an RA sender on a RETH interface silently
+undid that suppression for the process lifetime. The same path also did
+an **unguarded link DOWN/UP on a live dataplane NIC**, racing the AF_XDP
+`NotifyLinkCycle` rebind and un-reconciling VIPs / stable LLAs that the
+apply pass had just restored. It is a latent landmine — it only bites
+when the RA sender reaches an interface before its LLA exists (cold-boot
+ordering races, `WithdrawOnce` temp senders on freshly-renamed
+interfaces, any future reorder of apply vs RA), which is why it survived
+review.
+
+## Fix (research Path A)
+
+Rewrite the fallback to mirror the daemon's `ensureRethLinkLocal` /
+`addStableLLToInterface`: synthesize the EUI-64 `fe80::/64` from the
+interface MAC and add it directly via `netlink.AddrAdd` with
+`IFA_F_NODAD` (EEXIST-tolerant).
+
+- **No `addr_gen_mode` write** → the RETH suppression contract is
+  preserved by construction (nothing mutated, nothing to restore).
+- **No `accept_dad` write** → the address-scoped `IFA_F_NODAD` is the
+  precise way to skip DAD on the shared RETH virtual MAC (DAD on an LLA
+  derived from it would DADFAIL against the peer's identical address).
+- **No link cycle** → removes the dataplane-interruption half of the bug.
+- A MAC-less interface returns an explicit error (soft-logged at the
+  `start()` call site; `source-link-local` config + the 10×200ms
+  `ndp.Listen` retry remain the recovery path).
+- EUI-64 math extracted to the pure helper `eui64LinkLocal` for off-lab
+  unit testing. `pkg/ra` still imports only `pkg/config`.
+- Removed the now-obsolete `ra::ensureLinkLocal` fsatomic canary
+  allowlist entry; the canary now catches any future `os.WriteFile`
+  re-added to this function.
+
+## Tests
+
+
+*(truncated — 82 lines total)*
+
+
+---
+
+## PR #2040 — lldp: close RX sockets on Stop to drop the 0-2s shutdown tail (#2035) [MERGED] (merged 2026-06-20)
+
+Branch: `fix/2035-lldp-socket-lifecycle`
+
+## Summary
+
+Removes a 0–2s sleep-gated tail from `pkg/lldp` `Manager.Stop()`, which runs on
+the daemon shutdown critical path immediately before the HA shutdown-mode
+determination and the priority-0 VRRP resignation burst
+(`pkg/daemon/daemon_run.go`).
+
+The LLDP RX loop set `SO_RCVTIMEO = 2s` and only observed cancellation between
+`Recvfrom` returns and the next `ctx.Done()` check, so `Stop()` (cancel + `wg.Wait()`)
+could block up to ~2s per shutdown waiting for every per-interface RX goroutine
+to finish its current `Recvfrom`. On a planned `systemctl restart xpfd` / ISSU
+cut-over that tail directly inflates the control-plane downtime window and pushes
+the VRRP resignation 0–2s later than necessary.
+
+Implements the #2035 research plan's **Path B** (minimal latency fix, single PR,
+**no** codec/socket/manager package split).
+
+## What changed
+
+- **`ifSession`** — per-interface RX + TX `AF_PACKET` sockets owned for the life
+  of an `Apply()` generation and tracked on the `Manager`. The RX socket drops
+  `SO_RCVTIMEO`; `recv` blocks indefinitely.
+- **`Stop()`** now: cancel context → `close()` every session → `wg.Wait()`.
+  `close()` does `shutdown(SHUT_RDWR)` + `close` on the RX fd, which wakes the
+  parked `Recvfrom` immediately, so `Stop` is bounded. Ordering is load-bearing
+  (cancel → close → wait); waiting first would re-introduce the stall. `close()`
+  is `sync.Once`-guarded so the benign close-under-read race cannot panic or
+  double-free; `rxLoop` returns on any post-cancel recv error.
+- **`shutdown` before `close`** — closing an fd under an in-flight `Recvfrom` is
+  not a reliable wakeup. `shutdown` reliably wakes a blocked reader; on a
+  connectionless `AF_PACKET` socket it returns `ENOTCONN` (ignored) and the
+  `close` tears down the RX queue (the pattern VRRP relies on,
+  `pkg/vrrp/instance.go` `stop()`). Verified in-env that `shutdown` unblocks a
+  parked socketpair reader while bare `close` does not — this also answers the
+  plan's open-question 4 (could a `recvfrom` ever miss the close and hang).
+- **TX socket reuse** — hoisted out of `sendFrame` (was opened+closed per
+  advertisement) into the reused per-interface session socket.
+- **Earlier, louder setup failure** — a socket/`CAP_NET_RAW` failure now
+  surfaces once at `Apply()` time (logged, interface skipped) instead of
+  silently per-frame. Behavior change in *when* the warning fires; called out
+  here per the plan's hidden-invariants note.
+
+No exported signature changes (`New`, `Apply`, `Stop`, `Neighbors`, `Neighbor`,
+codec funcs all preserved). No config schema change (no new typed leaf).
+
+## Tests
+
+New `pkg/lldp/socket_test.go`, using a `newIfSessionFn` construction seam to
+inject a `socketpair(2)`-backed session (no `CAP_NET_RAW` needed):
+
+
+*(truncated — 79 lines total)*
+
+
+---
+
+## PR #2041 — daemon: clear FRR managed section on compile-failed unarmed boot (#1993) [MERGED] (merged 2026-06-20)
+
+Branch: `fix/1993-frr-coldboot-blackhole`
+
+## What
+
+On a compile-failure boot (the #1960 fail-closed tuple: present,
+previously-committed `active.json` that no longer compiles →
+`ActiveConfig()==nil` + `EverCommitted()==true` → `bootClassBootstrap`), the
+daemon freezes in last-known-good for management reachability and may not arm
+the dataplane. But `frr` is an **independent systemd service** that starts from
+its persisted `/etc/frr/frr.conf` — whose managed section was written by the
+last successful `applyConfig` and is left intact by the freeze. In the **unarmed**
+case, FRR forms BGP/OSPF/IS-IS peerings and re-advertises last-good prefixes
+for routes this node cannot forward: peers route transit to this node's
+**physical interface IPs** and it **silently blackholes 100% of it** instead of
+failing over to the HA partner.
+
+`#1922`'s `enterBootstrapMode()` already clears the managed section, but it is
+only called from the Item-1b confirmed-commit rollback; the compile-failed boot
+path set the bootstrap flag directly and never ran it.
+
+## Fix (research plan Option A, refined by review feedback)
+
+Add `clearFRRForFailClosedBoot(compileFailed)` and call it on the boot path
+**right after `d.frr = frr.New()`** (and before the run loop settles). It still
+reuses the exact primitive `enterBootstrapMode()` uses (`d.frr.Clear()`,
+managed-section only) so peerings drop and upstream/peers fail over to the
+partner — **but only when the boot is compile-failed and the dataplane is not
+still attached**.
+
+The helper now probes `/sys/fs/bpf/xpf/links` for pinned `xdp_*` links:
+
+- **No pinned XDP links** → treat the node as unarmed and clear the FRR managed
+  section.
+- **Pinned XDP links present** → preserve FRR, because this is a hitless-restart
+  shape where the last-known-good dataplane is still attached and forwarding.
+
+This deliberately runs **only the FRR-clear step** — NOT the `.network`/`.link`
+removal or the link-cycle that `enterBootstrapMode()` also performs. The
+compile-failed fail-closed path is intentionally **freeze-in-last-known-good for
+management** (#1960): removing networkd files / link-cycling toward bootstrap
+fxp0-DHCP could change the mgmt IP out from under a connected operator.
+
+- **Daemon-restart behavior preserved:** a compile-failed restart with live
+  pinned XDP links no longer clears FRR, so the PR does not drop peerings while
+  last-known-good forwarding is still attached.
+- **Reversible:** the first compilable `commit confirmed` (or a cluster
+  `SyncApply`) re-renders FRR via `applyFRRConfig` and re-installs the managed
+  section.
+- **Degraded-tolerant:** a degraded reload (`ErrFRRReloadDegraded`) is logged,
+  not fatal — `Clear()` writes the empty managed section to disk before it
+  reloads, so a later FRR restart converges; mgmt reachability is never traded
+  for a clean reload.
+
+*(truncated — 106 lines total)*
+
+
+---
+
+## PR #2042 — config: Junos inactive: statement marker — deactivate without delete (#2008 H1) [MERGED] (merged 2026-06-20)
+
+Branch: `fix/2008-vsrx-parity-tier`
+
+## #2008 H1 — Junos `inactive:` statement marker (deactivate without delete)
+
+Implements the **H1** item of the #2008 vSRX config-parity audit: the
+`inactive:` statement marker. Follows the RECOMMENDED path of the research
+plan (Path A — node flag + centralized strip, increment 1). Scope is ONLY
+H1; no other Tier-2 items.
+
+### The bug
+
+Junos deactivates any statement without deleting it by prefixing it with
+`inactive:` — the node stays in the config DB (displayed, persisted,
+re-enableable) but is excluded from compilation. xpf silently lost that
+intent: because `:` is an identifier character, the lexer tokenized
+`inactive:` as a single identifier, making it the node's first key
+(`Keys[0] == "inactive:"`). No compiler walk or schema gate matched the
+mangled key, so the node was **silently dropped from compilation AND from
+every display path, with no commit error**.
+
+### The fix
+
+- **Parser** lifts a leading `inactive:` token into a new `Node.Inactive`
+  flag and leaves the node's real `Keys` intact, so every existing key
+  match, schema walk, and group merge keeps working unmodified. A lone
+  `inactive:` is now a parse error (with recovery that consumes the
+  trailing terminator).
+- **`Node.Inactive`** is JSON `,omitempty`, so active-node on-disk output
+  is byte-identical to pre-#2008 (an old DB has no key → `false` → active)
+  and the flag round-trips through the persisted config DB automatically.
+- **Centralized strip** (`ConfigTree.WithoutInactive`, a clone-free no-op
+  when nothing is deactivated) prunes inactive subtrees at two coordinated
+  entry points:
+  - both `compileConfig*` entries strip FIRST — before the pre-expansion
+    tunnel-id gate, group expansion, and section compilation — so
+    `inactive: apply-groups foo` suppresses inheritance, inactive nodes
+    inside `groups {}` are pruned, the tunnel-id gate ignores inactive
+    tunnels, and the ~15 compiler files never observe an inactive node.
+    Centralizing in the shared node-aware entry keeps both cluster nodes
+    compiling the identical active set (no split-brain posture).
+  - `SchemaValidateWithDefinitions` strips before the typed-leaf walk, so a
+    deactivated invalid leaf commits clean (Junos parks WIP).
+- **All five display serializers + `show | compare`** re-emit the marker
+  from the flag (shared `inactivePrefix` / `xmlInactiveAttr` helpers): text
+  prefix, set-form `deactivate <path>` line, XML `inactive="inactive"`
+  attribute, collision-safe JSON `@inactive` marker, and `nodesEqual` /
+  `diffNodes` surface a pure activate/deactivate as a diff.
+
+Strip can only REMOVE nodes from the compiled set, so a config that
+compiled before cannot become non-compilable.
+
+### Out of scope (increment 2)
+
+*(truncated — 90 lines total)*
+
+
+---
+
+## PR #2043 — #1387: DHCP server dynamic DNS (DDNS), increment 1 — config model + reconciler core [MERGED] (merged 2026-06-20)
+
+Branch: `fix/1387-dhcp-ddns`
+
+## #1387 — DHCP server dynamic DNS (DDNS), increment 1
+
+Implements the **first shippable increment** of #1387 per the approved
+research plan (`docs/research/1387-dhcp-ddns/plan.md`, **recommended Path C**:
+a pluggable `DNSUpdater` backend, RFC 2136 first). This is a multi-increment
+feature; this PR is the **config model + the fully unit-testable reconciler
+core** — no live DNS emission, no HA wiring, no daemon loop. **Default OFF;
+an absent `dynamic-dns` block is byte-for-byte today's behaviour.**
+
+### What this PR ships (the lab-free, fully-tested slice)
+
+- **Config model** — `config.DHCPDynamicDNSConfig`, a nilable field on
+  `DHCPServerConfig` (nil == disabled). `String()` redacts `TSIGSecret`.
+  `compileDHCPDynamicDNS` handles **both** the hierarchical and flat-set AST
+  shapes; an empty/garbage block compiles to nil.
+- **Typed schema leaves** under `dhcp-local-server` / `dhcpv6-local-server`:
+  `enable`, `ttl` (`ValidateIntegerMin(1)`), `hostname-source` /
+  `conflict-policy` / `backend` (`ValidateEnum`). `domain` / `update-server` /
+  `tsig-*` stay free-form (the live backend that constrains them is
+  increment 2; `tsig-secret` is redacted in `show`/marshal echoes).
+- **State-aware Kea lease parser** (`parseActiveLeases4/6`) — honors Kea's
+  `state` column (default/declined/expired-reclaimed) and the `expire` epoch,
+  and extracts the v6 DUID/IAID identity. **Separate** from the display-only
+  `parseLeaseCSV` (reusing that would publish/retain stale records — the exact
+  bug this feature fixes).
+- **`DNSUpdater` interface** + pure record/PTR construction. PTR names are
+  built from the **textual** address (reversed octets/nibbles), not the
+  dataplane native-endian `__be32` convention.
+- **Reconciler core** (`DDNSManager.reconcileOnceLocked`) — build-desired /
+  diff-owned / add-move-reassign-expire transitions, cleaning the old owner
+  before the new one; bounded retry that never wedges the loop;
+  withdraw-all-on-disable; `Stats()` counters.
+- **Ownership state store** (JSON via `fsatomic.WriteFileDurable`) — the
+  **never-delete-a-record-xpf-did-not-create** protection boundary:
+  `deleteOwnedLocked` re-derives the exact `(name, type, address)` from the
+  store and is the sole delete authority. A corrupt store **fails open**.
+
+### Deliberately deferred (see plan §12 and `pkg/dhcpserver/README.md`)
+
+- **Increment 2 (lab-gated):** the live `rfc2136` `DNSUpdater` backend +
+  the daemon reconcile loop + `show ... dynamic-dns` CLI/gRPC plumbing +
+  Prometheus emission. (The API collector is a **checked** collector — a
+  declared descriptor must be emitted or the descriptor-coverage canary
+  fails — so DDNS counters live in `DDNSManager.Stats()` until a value
+  source on the server exists.)
+- **Increment 3 (`make test-failover`-gated):** HA per-RG MASTER/BACKUP
+  ownership coupling. The deterministic owner-id watermark is laid down now
+  so the state store is forward-compatible.
+- **Increment 4:** the Kea D2 backend (reserved `backend kea-d2` enum;
+  D2 is not in the image).
+
+*(truncated — 75 lines total)*
+
+
+---
+
+## PR #2044 — #2033: serialize RA goodbye-withdraw with sender shutdown [MERGED] (merged 2026-06-20)
+
+Branch: `fix/2033-ra-withdraw-serialize`
+
+## Problem
+
+The embedded IPv6 RA sender (`pkg/ra`) can race shutdown: the lifetime-zero
+"goodbye" RA (router withdraw) must be the LAST RA on the wire for an
+interface, but a normal periodic / RS-triggered RA goroutine could still emit
+a normal RA AFTER the goodbye — re-advertising the demoting router. On HA
+failover this left directly attached hosts holding a dead default route.
+
+## Approach — Path A (single owner; goodbye emitted by the owner)
+
+Implements the converged plan (`research/2033-ra-withdraw-serialize`).
+
+- **Single-owner emission.** Per interface, exactly ONE goroutine
+  (`sender.run`) writes/closes the NDP conn — startup burst, periodic RAs,
+  RS replies AND the goodbye. `ResendBurst` routes the re-burst through the
+  owner via a buffered `burstCh` (no second writer).
+- **Goodbye emitted by the owner (I16/I17).** Shutdown signals the owner via a
+  published atomic `shutdownMode` {graceful|hard} + a `sync.Once`-guarded
+  `close(stopCh)`. `finishShutdown` is the ONLY goodbye-emit AND the ONLY
+  conn-close site: on graceful it sends the lifetime-zero goodbye as its FINAL
+  write, then closes the conn — so no normal RA can follow it, and a racing
+  hard close cannot kill the upgraded goodbye. Graceful UPGRADES hard, never
+  the reverse (cluster RA ops share only the manager mutex).
+- **Draining tombstone (I16).** `Withdraw`/`WithdrawInterfaces`/`Clear` move a
+  sender to a per-interface tombstone under `m.mu`, then join OUTSIDE the lock
+  (no Status/Apply stall on the failover hot path). While the tombstone is
+  present a concurrent `Apply`/`WithdrawOnce` treats it as a claim and defers —
+  guaranteeing **at most one live NDP conn per interface**. Deferred `Apply` is
+  epoch-guarded (I16b) so a stale Apply cannot re-arm RA on a node that has
+  since gone BACKUP.
+- **Owner-only `conn.Close` (I17)** + **bounded owner writes (I18,
+  `SetWriteDeadline`)** so withdrawal never wedges on a stuck socket.
+- **rsReceiver error backoff (I10)** — no 100% CPU hot-loop if the interface
+  dies while `stopCh` is still open; cleanly exits on ctx/socket error.
+- **`lastRA` data-race fix** — now guarded by `lastRAMu` (`getLastRA`/
+  `setLastRA`); `Status` reads it under the lock.
+- **`WithdrawOnce`** uses a goodbye-only path (no `run()`, no burst, no link
+  toggle — I12) so it cannot re-advertise the router it withdraws.
+- **Status()** reports a draining interface with `State == "draining"`
+  (distinct from "active"); documented in code + README.
+
+The `ndpConn` seam matches mdlayher/ndp v1.1.0 exactly
+(`ndp.Message`/`*ipv6.ControlMessage`/`netip.Addr` on WriteTo/ReadFrom,
+`*ipv6.ICMPFilter`, `netip.Addr` group). No public `Manager` signature or
+observable semantics change; daemon/VRRP callers are untouched.
+
+## Tests (`pkg/ra/serialize_test.go`)
+
+- **T1 / T1b** — forced bad interleave (RS reply / burst RA held in `WriteTo`
+  while a graceful withdraw is signalled); assert the achievable invariant **no
+
+*(truncated — 71 lines total)*
+
+
+---
+
+## PR #2045 — #1359: export per-queue CoS park-reason counters to Prometheus [MERGED] (merged 2026-06-20)
+
+Branch: `fix/1359-telemetry`
+
+## Summary
+
+Offline telemetry increment for #1359 (surplus-sharing fails the reduced
+100E100M p99.9 mouse-latency gate while strict-exact passes). This PR
+ships acceptance **item 2** — diagnostic telemetry that pins the cause —
+plus docs. The B-class scheduler tuning and the gate verdict remain
+lab-gated (DEFER-NEEDS-LAB, blocked by #1365) per the research
+disposition on `research/1359-surplus-sharing-mouse-latency`.
+
+## What changed
+
+The Rust helper already carries four per-queue park-reason counters on the
+CoS snapshot (`RootTokenStarvationParks` / `QueueTokenStarvationParks` at
+the shaper; `DrainParkRootTokens` / `DrainParkQueueTokens` in the per-batch
+drain loop), but they were never exported to Prometheus — the evidence was
+stranded on the wire. This surfaces them:
+
+- `xpf_userspace_cos_root_token_starvation_parks_total{ifindex, queue_id}`
+- `xpf_userspace_cos_queue_token_starvation_parks_total{ifindex, queue_id}`
+- `xpf_userspace_cos_drain_park_root_tokens_total{ifindex, queue_id}`
+- `xpf_userspace_cos_drain_park_queue_tokens_total{ifindex, queue_id}`
+
+A rising `root_token_starvation_parks` delta on a best-effort/mouse queue
+while a surplus-sharing borrower drains is the fingerprint of **root-surplus
+arbitration** (the borrower holds the shared root tokens) — distinct from
+the mouse hitting its OWN per-queue cap (`queue_token_*`), which would
+refute the borrow-starvation story.
+
+Wired through the struct decl + `Describe()` (`metrics.go`), `NewDesc`
+construction (`metrics_descriptors.go`), and a new
+`emitCoSParkReasonTelemetry` per-queue emit (`metrics_userspace.go`)
+invoked from `Collect` alongside the #1369 drain-phase emit.
+
+## No behavior change
+
+Diagnostic, write-only counters read from the single `Status()` snapshot
+per scrape. No hot-path/dataplane change, no HA/wire-type change (scalar
+`u64`, additive, fields already on the snapshot struct).
+
+## Tests
+
+- `TestEmitCoSParkReasonTelemetry_DistinctValuesAndCounterType` — gives the
+  four snapshot fields **distinct** values so a dropped emit drops its
+  series and a swapped field/desc mismatches the expected value; asserts
+  `CounterValue` typing and `(ifindex, queue_id)` labels. **Non-tautology
+  verified**: swapping one emit field made the test fail (got 111 want
+  222); restoring made it pass.
+- The existing pedantic-registry descriptor-coverage canary
+  (`TestCollectorDescriptorCoverage`) additionally proves every new emitted
+  `Desc` is declared in `Describe()`.
+
+*(truncated — 62 lines total)*
+
+
+---
+
+## PR #2046 — test/incus: guard mouse-latency settle gate against unsatisfiable ELEPHANT_PORT/SHAPER_BPS pairings (#1365) [MERGED] (merged 2026-06-20)
+
+Branch: `fix/1365-cos-gate-guard`
+
+## What
+
+Offline increment for #1365. The mouse-latency cwnd-settle gate requires
+the elephant aggregate to reach `0.7 * SHAPER_BPS`, but the forwarding
+class implied by `ELEPHANT_PORT` (per `cos-iperf-config.set`) can only
+ever deliver up to its configured cap — the scheduler `transmit-rate` for
+`exact` classes, or the interface `shaping-rate` for the non-exact
+best-effort / uncapped classes. When the settle floor exceeds that cap
+the gate is **arithmetically unsatisfiable**: every loaded rep
+INVALIDates with `cwnd-not-settled` before the mouse probe ever starts,
+regardless of dataplane or scheduler health.
+
+That is the #1365 footgun — the canonical 100E100M matrix was run with
+`ELEPHANT_PORT=5202` (the 1 Gbps `iperf-1g` exact class) paired with
+`SHAPER_BPS=10000000000`, so the 7 Gbps floor could never be met against
+a 1 Gbps cap and the cell reported `INSUFFICIENT-DATA`. The header
+comment ("SHAPER_BPS MUST move with ELEPHANT_PORT") stated the rule the
+run violated, but nothing enforced it.
+
+## How
+
+- `parse_cos_class_caps()` derives the port → class cap table **directly
+  from `cos-iperf-config.set`**, so the guard is a single source of truth
+  that cannot drift from the applied fixture.
+- `check_settle_threshold_satisfiable()` computes the `0.7 * SHAPER_BPS`
+  floor and compares it against the class cap.
+- A `check-env-consistency` CLI subcommand wraps both;
+  `test-mouse-latency.sh` runs it before each rep and `ABORT`s with an
+  actionable message (class, cap, floor, and a hint to match `SHAPER_BPS`
+  or pick a higher-rate port) instead of burning a whole matrix cell on
+  an impossible pairing. The guard is purely static — no cluster contact.
+
+## Scope
+
+The live high-rate fairness/throughput measurement on the loss cluster
+(acceptance items 2/3/4 of #1365) remains lab-gated and is **out of
+scope** for this offline increment.
+
+## Validation
+
+Non-tautological unit tests in `mouse_latency_orchestrate_test.py`:
+
+- the #1365 `5202`/`10G` pairing **FAILS** the guard
+- matched `5202`/`1G` and high-rate `5205`/`9G` pairings **PASS**
+- the floor==cap boundary **PASSES**; one bps over the boundary **flips
+  it to FAIL** (proves the guard is not a no-op)
+- a drift guard cross-checks the parsed table against the canonical
+  port→rate map
+- a shell-line assertion confirms the guard runs before any cluster work
+
+
+*(truncated — 55 lines total)*
+
+
+---
+
+## PR #2047 — #1925 Item 1: first-boot root auto-grow on operator-resized disks (Path A) [MERGED] (merged 2026-06-20)
+
+Branch: `fix/1925-repart-root-autogrow`
+
+Implements #1925 **Item 1** (root-partition auto-grow) — **Path A** from the
+PLAN-READY plan (`docs/research/1925-repart-root-autogrow/plan.md`). Item 2
+(HA image-replace mixed-version soak) is out of scope.
+
+## Problem
+The appliance image ships an 8 GiB root disk. When the bake purged cloud-init
+(#1879), it silently lost cloud-init's `growpart`/`resizefs` auto-grow. An
+operator who deploys onto a larger root disk (`incus -d root,size=40GiB`,
+`qemu-img resize`, a bigger libvirt volume) gets unallocated GPT free space
+that `/` cannot use — biting `/var/lib/xpf/versions` (the #1964 in-place-upgrade
+rollback target), Kea leases, FRR/journald logs, and the flow-export spool.
+
+## Path A — `growpart` + `resize2fs` first-boot one-shot
+- **`scripts/image/xpf-grow-root.service`** — `Type=oneshot`, `RemainAfterExit`,
+  `ConditionPathExists=!/etc/xpf/.root-grown`, ordered
+  `After=systemd-remount-fs.service` and
+  `Before=local-fs.target xpfd.service xpf-day0-config.service` so `/var` is
+  full-size before xpf stages its runtime / writes the config DB. Stamps
+  `/etc/xpf/.root-grown` only on a clean `ExecStart` (a failed grow retries).
+- **`scripts/image/xpf-grow-root`** — resolves the live root device from
+  `findmnt /` (bus-agnostic: `vda`/`sda`/`nvme0n1pN` — never hardcoded `sda1`),
+  then `growpart <disk> <partnum>` + `resize2fs <rootdev>`. `growpart` NOCHANGE
+  (no trailing free space) is treated as success; `resize2fs` is a no-op when
+  the fs already fills the partition. Every failure path is non-fatal — the
+  worst case is the status-quo, never a blocked boot. A clean no-op on an
+  exact-bake-size deploy.
+- **`scripts/image/bake.py`** — copies the unit + wrapper in, chmods the
+  wrapper, enables the unit (mirrors the day-0 loader / #1930 kernel-promote
+  units). The seal's `rm` list drops `.root-grown` so the stamp is guaranteed
+  absent in the artifact.
+
+### Why `growpart`/`resize2fs`, not `systemd-repart`
+Both tools are already in the image (`cloud-utils-growpart` + `e2fsprogs`).
+They can only grow a partition's end into adjacent free space and grow an ext4
+fs — they **cannot** create, reformat, shrink, or move a partition by
+construction (no `Format=`/`CopyBlocks=` to mis-set). Smallest data-loss
+surface, no added package. This restores exactly the pre-purge cloud-init
+behavior.
+
+## A/B-substrate safety guarantee (#1930)
+The LANE-1 A/B kernel "slots" are **directories inside the single ESP
+partition** (`/boot/efi/EFI/xpf-A`, `xpf-B`) plus the `/etc/grub.d/09_xpf`
+`$cmdpath` selector — **not** separate GPT partitions; kernels live in `/boot`.
+The root partition is the **physically last partition** in the canonical Ubuntu
+cloudimg layout, so growing it into trailing free space cannot touch the ESP
+(and the A/B dirs/selectors/shim/grub it holds), the BIOS-boot or `/boot`
+partitions, or any partition **number** (`growpart` only edits the selected
+partition's end; it never renumbers). The grow signs nothing and does not alter
+the ESP, so the Secure Boot posture and the kernel promote/rollback channel are
+untouched. The wrapper grows **only** the partition backing the live root mount.
+
+*(truncated — 73 lines total)*
+
+
+---
+
+## PR #2048 — #1434 Increment 1: WireGuard local-pubkey telemetry + show public-key + generate-private-key [MERGED] (merged 2026-06-20)
+
+Branch: `fix/1434-wireguard-increment-1`
+
+Implements **Increment 1** of #1434 (multi-tunnel WireGuard) — the
+feasible, no-hot-path, no-shim, no-lab slice from the converged plan
+(`docs/research/1434-multi-tunnel-wireguard/plan.md`, §9 Steps 2+3). It
+delivers real operator value with zero data-plane risk.
+
+## What this adds (three surfaces)
+
+1. **Local public-key telemetry.** The WG engine already derived its
+   local static public key at construction but never surfaced it. Added
+   `local_pubkey_hex` to the Rust `WgTunnelStatus` (sourced from
+   `engine.local_public_key()` — the snapshot redacts the private key,
+   so the engine is the only source) and the mirror `LocalPubkeyHex` Go
+   field. Hex string on the wire (not `Vec<u8>`, to dodge the Go↔Rust
+   base64 trap, MEMORY #1961); additive + `serde(default)`/`omitempty`,
+   so it is wire-compatible in both directions.
+
+2. **`show security wireguard public-key`.** Prints the local public key
+   per tunnel in WireGuard-canonical base64 (the form a peer pastes into
+   `[Peer] PublicKey =`). New cmdtree node + dispatch in the local CLI
+   and the remote CLI (a new `wireguard-public-key` gRPC text topic),
+   rendered by a shared `FormatWireguardPublicKeys`. Complements the
+   existing `show security wireguard [detail]` (#1865), which already
+   shows the *peer* key + counters.
+
+3. **`request security wireguard generate-private-key`.** Net-new
+   (the issue says "restore" but no such command ever shipped).
+   Generates a fresh X25519 private key + derived public key in
+   WireGuard base64 — like `wg genkey` / `wg pubkey`. Implemented as a
+   pure-Go package `pkg/wgkey` using stdlib `crypto/ecdh` (no new
+   dependency); the private scalar is clamped per Curve25519
+   (`priv[0]&=248; priv[31]&=127; priv[31]|=64`) so it is byte-identical
+   to `wg genkey`. Both CLIs generate the key in-process — no gRPC /
+   control-socket round-trip (Junos `request` semantics are print-only,
+   and a key generator must work with no dataplane loaded).
+
+## Scope — Increment 2 is DEFERRED / lab-gated (out of scope)
+
+The dataplane is already multi-engine (one `Arc<WgEngine>` + one control
+thread per tunnel-endpoint id). The one thing that still breaks a
+*second* tunnel is the **userspace-xdp shim's single-port WG-RX
+steering** (only the first configured listen port is steered to the
+kernel). **Generalizing that steering — the actual second-tunnel-RX fix
+— is Increment 2 and is explicitly DEFERRED and lab-gated:** it is a
+verifier-gated shim edit with a documented v6-line-rate sensitivity and
+must pass the loss cluster + perf + `make test-failover` before merge.
+**This PR does NOT touch the userspace-xdp shim, the WG/AF_XDP hot path,
+or Increment 2.**
+
+## Tests (mutation-checked, non-tautological)
+
+
+*(truncated — 74 lines total)*
+
+
+---
+
+## PR #2054 — ipsec: fix nil-deref in effectiveTrafficSelectors vpn==nil branch [MERGED] (merged 2026-06-20)
+
+Branch: `fix/2022-ipsec-ts-nil`
+
+## Summary
+
+Fixes #2022. `effectiveTrafficSelectors` (`pkg/ipsec/policy.go`) had a
+defensive `if vpn == nil || len(vpn.TrafficSelectors) == 0` guard that
+short-circuited into a branch which immediately dereferenced
+`vpn.LocalID`/`vpn.RemoteID` — so reaching the `vpn == nil` case would
+panic with a nil-pointer dereference instead of failing safe.
+
+This is a latent defect surfaced by Copilot during the #1989 pure-motion
+refactor (the code was moved `ipsec.go` -> `policy.go` unchanged; #1989
+did not introduce it). The sole caller iterates non-nil config VPN map
+values, so the nil branch is unreachable today, but the guard is still a
+real correctness defect.
+
+## Fix
+
+Split the two cases:
+- `vpn == nil` -> return `nil` (no children; there is no
+  `LocalID`/`RemoteID` to fall back to).
+- non-nil VPN with zero traffic selectors -> unchanged: emit one default
+  child built from `LocalID`/`RemoteID`.
+
+Reachable behavior is unchanged.
+
+## Tests
+
+- `TestEffectiveTrafficSelectors_NilVPN` — recovers from a panic and
+  reports it as a failure, so it **fails (not crashes)** against the
+  pre-fix code. Verified: the test panics/fails on the pre-fix
+  `policy.go`, passes with the fix (non-tautological).
+- `TestEffectiveTrafficSelectors_NoSelectors` — pins the non-nil
+  empty-selector default-child fallback so the split does not regress it.
+
+## Validation (in worktree)
+
+```
+GOCACHE=/dev/shm/cache GOTMPDIR=/dev/shm go build ./pkg/ipsec/   # OK
+go vet ./pkg/ipsec/                                              # OK
+go test ./pkg/ipsec/ -count=1                                    # ok
+```
+
+## Docs
+
+No doc change: defensive-only fix to an unexported helper with no
+reachable behavior change; `pkg/ipsec/README.md` covers traffic
+selectors only at the feature level. `_Log.md` updated per project
+logging rule.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #2055 — flowexport: surface SourceAddress resolve error, fix dial conn leak (#2023) [MERGED] (merged 2026-06-20)
+
+Branch: `fix/2023-flowexport-dial`
+
+## Summary
+
+Fixes #2023. `pkg/flowexport` `dialCollectors` had two pre-existing
+defects (surfaced by Copilot during the #1988 pure-dedup refactor; #1988
+consolidated the logic unchanged and did **not** introduce them):
+
+1. **Ignored SourceAddress resolve error** — `laddr, _ := net.ResolveUDPAddr(...)`
+   discarded the error. A misconfigured source-address silently produced a
+   nil local bind, letting `DialUDP` succeed with an OS-chosen source and
+   masking the misconfiguration. The error is now checked and wrapped.
+
+2. **Connection leak on mid-loop resolve failure** — on a destination
+   (raddr) resolve failure the function returned early without closing
+   connections already opened earlier in the loop, leaking their fds. A
+   single `fail()` closure now calls `cc.close()` on **every** error return
+   (source-resolve, raddr-resolve, dial) before returning nil.
+
+## Implementation
+
+- Added two indirection seams (`resolveUDPAddr`, `dialUDP`) defaulting to
+  the `net` package; `dialUDP` returns `net.Conn` so a recording fake can
+  observe teardown.
+- New `transport_test.go`:
+  - `SourceAddressResolveError` — error surfaced, dial never attempted
+  - `NoLeakOnMidLoopResolveFailure` — earlier conn closed on later raddr error
+  - `NoLeakOnDialFailure` — regression guard for the already-correct dial path
+
+  The first two are **non-tautological**: verified to FAIL against the
+  pre-fix body and pass against the fix.
+
+## Validation
+
+- `go build ./pkg/flowexport/` clean
+- `go test ./pkg/flowexport/ -count=1` green (full package)
+- `go vet` reports only **pre-existing** `ExportConfig` lock-by-value
+  warnings in the unmodified `ipfix.go`/`netflow.go` — none in changed code
+- `pkg/flowexport/README.md` updated to document the resolve-error-surfaced
+  and no-leak-on-partial-failure contract
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #2056 — feeds: refresh correctness + retain-last-good (#2050) [MERGED] (merged 2026-06-20)
+
+Branch: `fix/2050-feed-refresh-safety`
+
+## Summary
+
+Makes the dynamic-address feed refresh path fail-safe. Closes #2050. This is
+the **safety precondition for #2049** (feed enforcement) and ships first — a
+stale-but-enforced denylist is worse than an unenforced one, so refresh must
+prove semantic-change detection and last-good behavior before the enforcement
+join lands. **Scope is `pkg/feeds` only**; the #2049 dataplane enforcement
+join is a separate later PR.
+
+## Problem (origin/master)
+
+`pkg/feeds/feeds.go` compared prefix **count** to decide whether to recompile,
+never checked `scanner.Err()`, and could replace the last-good snapshot with a
+truncated/empty set while stamping the fetch successful. `HoldInterval` was
+parsed + displayed but never consumed. The package had no tests.
+
+## The 6 behaviors
+
+1. **scanner.Err() now fails the fetch.** Per-line cap raised to 1 MiB; an
+   overlong line (`bufio.ErrTooLong`) or mid-stream read error fails the whole
+   fetch — no silent truncation. The snapshot is not replaced and success is
+   not stamped.
+2. **Raised bufio token cap** (`maxLineBytes` = 1 MiB) so a long line doesn't
+   silently truncate; beyond the cap it is rejected as an error (1).
+3. **Content-based change detection.** Canonicalize (masked CIDR / bare IP ->
+   /32,/128) + dedup + sort + SHA-256; `onUpdate` fires on hash change, not
+   count. Same-count swap fires; reordered-identical does not.
+4. **No success stamp / no replace on a partial or errored read.**
+   `lastFetch`/`lastSuccess` are stamped and the snapshot replaced only on a
+   clean, non-empty fetch.
+5. **`HoldInterval` retain-last-good.** On failure (or a suspect zero-prefix
+   HTTP-200, which would otherwise fail-open a denylist) the last-good snapshot
+   is retained until `hold-interval` (default 7200s) elapses, then dropped to
+   empty (fail-closed, Junos-match). Startup before the first good fetch is
+   fail-closed (empty set), per the plan's P-A2.
+6. **Tests added** (net-new `feeds_test.go`, 9 tests). Bug-targeting tests are
+   mutation-verified: count-based detection, dropped `scanner.Err()`, and
+   stamp+replace-on-error each make the relevant test FAIL against the pre-fix
+   behavior.
+
+`FeedInfo` gains additive status fields (`LastSuccess`, `LastError`,
+`StaleSince`, `Hash`); legacy `URL`/`Prefixes`/`LastFetch` preserved so the
+show paths + grpcapi golden test are unaffected.
+
+## Validation
+
+- `go build ./pkg/feeds/ ./...` clean
+- `go vet ./pkg/feeds/` clean
+- `go test ./pkg/feeds/ -count=1` green (9 tests)
+- `pkg/grpcapi` golden tests green (additive `FeedInfo` fields)
+
+*(truncated — 55 lines total)*
+
+
+---
+
+## PR #2057 — config: redact all secrets at JSON/YAML marshal time (#2053) [MERGED] (merged 2026-06-20)
+
+Branch: `fix/2053-secret-redaction`
+
+## Summary
+
+Closes the **live plaintext-secret leak** on `GET /api/v1/config`. The
+handler (`pkg/api/config.go` `configHandler` → `writeOK(w, store.ActiveConfig())`)
+JSON-encodes the entire compiled `*config.Config`, so before this change it
+returned every operator secret — IKE/IPsec PSKs, OSPF/RIP/IS-IS/VRRP/interface
+auth keys, the TSIG HMAC key, SNMPv3 auth/priv passwords, root/login `crypt(3)`
+hashes, the BGP TCP-MD5 password, REST basic-auth passwords + API keys, the
+WireGuard private key, and the SNMP v1/v2c community string — **in plaintext**
+to any authorized REST client (loopback by default, but bindable non-loopback
+over HTTPS via `web-management https interface`). The per-struct `String()`
+redaction is logging-only; `encoding/json` ignores `Stringer`, so it never
+closed the marshal leak.
+
+## Mechanism (type-enforced, not by-convention)
+
+`config.Secret` (`pkg/config/secret.go`) is a named `string` type whose
+value-receiver `MarshalJSON` / `MarshalYAML` emit `<redacted>` for a non-empty
+value and `""` for empty. `Reveal()` returns the cleartext for render/reconcile
+paths; `String()` redacts for `%v`/`%s`/slog; `UnmarshalJSON` accepts a plain
+string but **fails closed** on the sentinel (a marshalled-then-reloaded config
+can never silently turn `<redacted>` into a live secret). A value receiver
+ensures redaction fires for a struct field, in a `[]Secret` slice (`APIKeys`),
+and as a map value. Adding a new secret config field is now one annotation.
+
+**16 fields converted** to `config.Secret` across `types_security.go`,
+`types_routing.go`, `types_interfaces.go`, `types_system.go`. Compiler
+producers wrap with `Secret(...)`; render/reconcile consumers read `.Reveal()`
+(`pkg/ipsec`, `pkg/frr`, `pkg/snmp`, `pkg/vrrp`, `pkg/dataplane/userspace`,
+`pkg/daemon`).
+
+### SNMP community string (the secret IS the map key)
+
+The community string is both the secret and the `SNMPConfig.Communities` map
+key, so a plain map marshal leaks it as a JSON object key regardless of the
+value's redaction. `SNMPCommunity.Name` stays a plain `string` (keeps the
+map lookup by on-wire community string in `pkg/snmp` and the text `show` paths
+unchanged) and redaction is done with **targeted struct marshallers**:
+`SNMPCommunity.MarshalJSON` redacts the `Name` field, and
+`SNMPConfig.MarshalJSON` / `MarshalYAML` render the `Communities` map as a
+sorted slice so the secret never appears as a JSON key.
+
+## Out of scope / left as-is
+
+- `show configuration` / `show snmp` text output is **unchanged** (operators
+  read their own secrets — Junos parity; a separate concern).
+- `MasterPassword` (commit-encryption PRF selector), `ArchiveSitesWithPassword`
+  (URLs whose inline password was already discarded), and `SSHKeys` (public
+  keys) are left as plain `string` per the plan's rulings.
+
+
+*(truncated — 80 lines total)*
+
+
+---
+
+## PR #2058 — #2049: enforce dynamic-address feed prefixes in the userspace dataplane [MERGED] (merged 2026-06-20)
+
+Branch: `fix/2049-feed-enforcement`
+
+## Summary
+
+Closes the never-enforced dynamic-address feed gap (#2049). Feed prefixes
+were fetched, statused, and shown but never reached the AF_XDP forwarding
+path: `feeds.GetPrefixes` had no production caller, and the userspace
+snapshot's address resolution (`buildAddressBookTable` /
+`classifyPolicyAddresses`) read only `cfg.Security.AddressBook`, so a
+policy/NAT rule referencing a feed-backed `address-name` was emitted to the
+helper as a no-match literal. Refreshing a feed re-ran `applyConfig` against
+the same static config and changed nothing in the dataplane.
+
+Per the r3 plan, the join is re-targeted to the RUNTIME userspace snapshot
+path, NOT the retired eBPF compiler (`pkg/dataplane/compiler.go`, whose
+`AddrIDs` never reach the helper and whose use would have been silently
+suppressed by the content-hash duplicate-publish gate).
+
+Sequenced strictly after #2050 / #2056 (the retain-last-good fail-safe
+snapshot layer), which this enforcement reads from.
+
+## What changed
+
+1. **Accessor** — `feeds.Manager.SnapshotForBindings` resolves each
+   `AddressBinding` to the deep-copied union of its live feed-backed CIDRs,
+   keyed by address-name. This is the first production caller of the per-feed
+   prefix snapshot (the bug was that there were none).
+2. **Hand-off** — the userspace `Manager` gains a `feedOverlay` field +
+   `SetFeedSnapshots` setter + `feedSnapshotOverlay()` accessor, mirroring
+   `routeOverlay` / `SetRouteOverlay`. The daemon
+   (`feedSnapshotsForConfig` + `feedSnapshotSetter`) pushes the overlay in at
+   the top of `applyConfigLocked`, joined against the INCOMING config so a
+   removed binding stops enforcing.
+3. **Overlay** — `buildAddressBookTableWithFeeds` merges feed CIDRs into the
+   named book's content bucket BEFORE ID assignment, so the name emits an
+   `AddressBookSnapshot` row, `nameToID` is populated, and
+   `classifyPolicyAddresses` routes the token into
+   `SourceBookIDs`/`DestinationBookIDs`. v4+v6 parity flows through
+   `expandBookNameToCIDRs` automatically. The overlay lands in the hashed
+   `AddressBooks`, so a feed `onUpdate` shifts `snapshotContentHash` and the
+   duplicate-publish gate republishes (an identical refresh is correctly
+   skipped).
+
+## Empty-feed fail-safe (operator decision, §3a)
+
+#2050 retains last-good prefixes indefinitely by default, so an enforced feed
+is normally never empty after its first fetch. The only genuine empty cases
+are startup-before-first-fetch and an explicit operator `hold-interval` drop.
+An empty book matches nothing — fail-closed for an allowlist, the
+operator-opted fail-open for a denylist. No new drop behavior is introduced.
+
+## Tests
+
+*(truncated — 66 lines total)*
+
+
+---
+
+## PR #2059 — config: activate/deactivate edits on all surfaces + load-set service parity (#2051, #2052) [MERGED] (merged 2026-06-20)
+
+Branch: `fix/2051-2052-config-edits`
+
+Combined Batch B: completes the #2008 H1 `inactive:` marker by exposing the
+interactive `activate`/`deactivate` verbs on every config surface (#2051) and
+making `load set` a real service-mode op (#2052). Builds on the shipped,
+idempotent primitives (`ConfigTree.DeactivatePath`/`ActivatePath`,
+`applyEditLine`); no dataplane / per-packet / HA path touched.
+
+## #2051 — activate/deactivate across all four surfaces
+
+Store wrappers `DeactivateFromInput`/`ActivateFromInput`
+(`pkg/configstore/store.go`) route through `applyEditLine` (the centralized
+verb switch shared with `LoadSet`/`LoadMerge` replay) — NOT
+`ParseSetCommand("set "+input)`, which would mangle the path into a junk node
+named "deactivate". The four surfaces:
+
+| Surface | Wiring |
+|---|---|
+| Local CLI | `pkg/cli/cli_dispatch.go` — two dispatch cases, prepend edit path |
+| Remote CLI | `cmd/cli/shared.go` `dispatchConfig` — ride the `Set` RPC with the verb kept as input prefix |
+| gRPC | `pkg/grpcapi/server_config.go` `Set` — prefix-route `deactivate `/`activate ` to the store wrappers BEFORE the `SetFromInput` fall-through (anti-mangling fix) |
+| REST | `pkg/api/config.go` `configDeactivate/ActivateHandler` + `pkg/api/server.go` routes `POST /api/v1/config/{deactivate,activate}` |
+
+cmdtree `ConfigTopLevel` lists both verbs; path completion has schema parity
+with `delete` (reuses `CompleteSetPathWithValues` in `pkg/cli/completion.go`
+and `pkg/grpcapi/server_cluster.go`).
+
+**gRPC anti-mangling approach:** `Server.Set` checks `strings.CutPrefix(input,
+"deactivate ")` / `"activate "` and routes to the store wrappers before the
+generic `SetFromInput` fall-through. Without this, the fall-through parses
+`set deactivate <path>` and creates a config node literally named
+"deactivate". Verified non-tautological: removing the prefix-route makes
+`TestSetRPCDeactivateRoutesNotMangled` fail on the leaked junk node.
+
+## #2052 — load set as a real service-mode op
+
+`mode == "set"` -> `store.LoadSet` on gRPC `Load` (`server_config.go`), REST
+`configLoadHandler` (`pkg/api/config.go`), and remote CLI `handleLoad`
+(`cmd/cli/main.go`, terminal + file). Applied-count is **log-only** (no
+`LoadResponse` field). Proto comment fixed
+(`proto/xpf/v1/xpf.proto` LoadRequest.mode: drop nonexistent `replace`, add
+`set`) — comment-only, `xpf.pb.go` regenerated with a comment-only diff (no
+wire change).
+
+## Tests
+
+All assert ACTUAL inactivation (display-set `deactivate <path>` line, a proxy
+for `node.Inactive==true`), not merely a nil error:
+- `pkg/configstore/activate_test.go` — wrappers mark/clear Inactive,
+  idempotency, missing-path errors, not-in-config-mode.
+- `pkg/grpcapi/server_config_activate_test.go` — Set RPC routes (not mangled);
+  Load mode=set applies deactivate lines.
+
+*(truncated — 69 lines total)*
+
+
+---
+
+## PR #2060 — config: vSRX parity batch 2 — traceoptions packet-filter protocol (M8) + ssh key-exchange (H5) (#2008) [MERGED] (merged 2026-06-20)
+
+Branch: `fix/2008-quickwins-batch2`
+
+## Summary
+
+Increment-1 quick-wins **batch 2** for #2008 — two vSRX config-parity gaps
+on the render / match paths, each verified still un-shipped on current
+master before implementing. One PR, two logical commits.
+
+### M8 — traceoptions packet-filter `protocol`
+`security flow traceoptions packet-filter <name> protocol <p>` was silently
+dropped (the packet-filter schema had only `source-prefix` /
+`destination-prefix` children, no extract, no match), so a trace scoped to
+one protocol still captured every protocol.
+
+- Schema `protocol` child + extract into `TracePacketFilter.Protocol`.
+- ANDed compare in `TraceWriter.matchFilters` (`pkg/logging/trace.go`) via a
+  `normalizeTraceProto` helper that canonicalizes both Junos protocol names
+  (tcp/udp/icmp/icmp6) and numbers (6/17/1/58) to the string `protoName`
+  already renders into `EventRecord.Protocol`, so the filter matches
+  regardless of name-vs-number spelling. Unset protocol = match any
+  (unchanged).
+- Tests: flat-set compile test (`ParseSetCommand` + `SetPath`) + trace-side
+  table tests (name/number/unset, protocol ANDed with source-prefix).
+
+### H5 — ssh `key-exchange`
+`system services ssh key-exchange <method>` (restrict the offered SSH KEX
+algorithms) had no schema leaf, typed field, or render path — it was
+ignored and the sshd KEX set stayed at the base-image default.
+
+- Repeatable typed leaf (`multi: true`) → `SSHServiceConfig.KeyExchange`
+  → comma-joined sshd `KexAlgorithms` drop-in line. No enum: sshd validates
+  spellings at reload, so an enum would false-reject newer/site methods.
+- Render body-building extracted into a pure `buildSSHDConfig` helper so it
+  is unit-testable and so key-exchange renders independently of root-login
+  (the old `applySSHConfig` early-returned when root-login was unset).
+  `PermitRootLogin` behavior unchanged.
+- Tests: flat-set compile test (multiple values accumulate in order) +
+  daemon-side `buildSSHDConfig` table test.
+
+## Validation (in worktree)
+- `go build ./...` clean.
+- `go vet ./pkg/config ./pkg/logging ./pkg/daemon` clean except two
+  **pre-existing** `daemon_flow.go:152,216` lock-copy warnings present on
+  origin/master (unrelated to this change).
+- `go test ./pkg/config ./pkg/logging ./pkg/daemon -count=1` all pass.
+
+## Docs
+- `docs/feature-gaps.md`: §10 flow line (traceoptions protocol filter), §22
+  System Enhancements (SSH key-exchange row + services summary).
+- `docs/config-schema.md`: system/services typed-leaf note for ssh
+  key-exchange.
+- `_Log.md`: batch-2 entry.
+
+*(truncated — 57 lines total)*
+
+
+---
+
+## PR #2061 — #2008 Increment-1 quick-wins batch 1: M4, H14, M9, H6 [MERGED] (merged 2026-06-20)
+
+Branch: `fix/2008-quickwins-batch1`
+
+Closes 4 small vSRX config-parity gaps from the #2008 Increment-1 quick-win
+triage. Each is one logical commit; all four were re-verified still un-shipped
+on current master before implementing.
+
+## Gaps closed
+
+- **M4 — gate policy-stats collection.** `collectPolicyCounters`
+  (`pkg/api/metrics_counters.go`) collected per-policy hit counters
+  unconditionally even though the compiler set `cfg.Security.PolicyStatsEnabled`.
+  Now gated on the flag (Junos default off), closing a stored-but-unenforced
+  divergence. The aggregate `policy_denies_total` is unaffected.
+- **H14 — power-mode-disable into FlowSnapshot.** Threaded
+  `security flow power-mode-disable` end to end, cloning the existing
+  `GREAcceleration` plumbing: Go `FlowSnapshot.PowerModeDisable` +
+  `buildFlowSnapshot`, Rust `FlowSnapshot.power_mode_disable` +
+  `ForwardingState.power_mode_disable` (assigned in `forwarding_build`).
+  Regenerated `protocol_wire_v1.json` (two `power_mode_disable: false`
+  additions). Single forwarding path, so the flag is carried for config
+  truth/parity, the same depth as the GREAcceleration thread it mirrors.
+- **M9 — tcp-session no-sequence-check.** Added the schema child,
+  `TCPSessionConfig.NoSequenceCheck`, and the compiler case, at full parity
+  with the existing `no-syn-check` / `rst-invalidate-session` presence flags.
+  Typed-config only, like those siblings (the userspace dataplane performs no
+  TCP sequence-number window validation today, so there is nothing to skip;
+  no fabricated Rust skip-path).
+- **H6 residual — login class enum validation.** RBAC is already enforced
+  (`pkg/cli/permissions.go`); added `ValidateEnum` on the `system login user
+  class` leaf (allowed set derived from `LoginClassPermissions` via
+  `config.ValidLoginClasses()`) and a `config-viewer` RBAC entry, so the schema
+  enum and the runtime RBAC table cannot drift. Mirrors the SNMP
+  `authorization` enum.
+
+## Tests
+
+- M4: `TestCollectPolicyCountersGatedOnPolicyStats` (disabled → 0 counters);
+  existing exposure test + descriptor-coverage store now enable policy-stats.
+- H14: Go `TestBuildFlowSnapshotThreadsPowerModeDisable`; Rust mutation-verify
+  `build_forwarding_state_carries_power_mode_disable`; wire fixture invariant.
+- M9: `TestCompileTCPSessionNoSequenceCheck` (flat-set ParseSetCommand path) +
+  schema completion/accept coverage.
+- H6: hierarchical + flat-set reject-bad, accept-valid over every valid class,
+  config-viewer acceptance + RBAC-entry assertion (`schema_validate_2008_test.go`).
+
+`go build ./...`, `go vet ./pkg/config/ ./pkg/api/`, and
+`go test ./pkg/config/ ./pkg/api/ ./pkg/dataplane/userspace/` all pass.
+Rust (`cargo build` + touched-module `cargo test`) passes.
+
+Docs: `docs/feature-gaps.md` (#2008 closures section), `docs/config-schema.md`
+(tcp-session leaf), `docs/system-login.md` (login-class section), `_Log.md`.
+
+
+*(truncated — 51 lines total)*
+
+
+---
+
+## PR #2063 — #2008 Tier-2: event-policy attributes-match regex (M7) + allow-dataplane-sleep schema/warn (H13 Stage 1) [MERGED] (merged 2026-06-20)
+
+Branch: `fix/2008-m7-h13s1`
+
+Tier-2 parity closures from the #2008 vSRX config-parity audit, researched
+in `docs/research/2008-tier2/plan.md`. Two self-contained, decision-free
+control-plane gaps shipped as one PR (2 logical commits). Companion-free
+(parent serializes review).
+
+## M7 — event-options `attributes-match` literal → regex
+
+Junos `attributes-match "<event>.<attr> matches <pattern>"` is a **regex**
+match; xpf did literal string equality (`pkg/eventengine/engine.go`
+`attributesMatch`), so an operator's Junos regex silently got
+literal-equality semantics and the policy under-fired.
+
+- Switch the matcher to RE2 regex (unanchored = substring, Junos semantics).
+- Compile each pattern **once at `Apply()`** into a per-pattern cache
+  (`regexCache`) so the event hot path never recompiles.
+- **Commit-time pattern validation** (`config.ValidateEventAttributesMatch`
+  wired into `CompileConfig`) rejects an uncompilable regex at commit instead
+  of silently dropping it at runtime — addresses the SMR flag that
+  literal→regex is not behavior-preserving.
+- Shared parse seam (`config.ParseEventAttributesMatch`) between the compiler
+  validator and the engine so they cannot drift.
+- **Behavior-change note:** regex is the correct Junos behavior but is NOT
+  behavior-preserving for a stored literal containing regex metacharacters.
+  Documented in the commit, `pkg/eventengine/README.md`, and
+  `docs/feature-gaps.md`.
+- Attribute field set kept at `test-owner`/`test-name` (the only `rpm.Event`
+  fields); field-widening deferred until more attributes are exposed.
+
+## H13 Stage 1 — `forwarding-options allow-dataplane-sleep` schema + warn
+
+The leaf was accepted only via the no-schema-match fall-through and silently
+dropped by `compileForwardingOptions` (a silent-drop). Stage 1 makes it
+truthful in commit; the dataplane idle-yield runtime (Stage 2) is lab-gated
+and intentionally NOT implemented here.
+
+- Typed presence-flag schema leaf (`schema_routing.go`), modeled on
+  `security flow power-mode-disable`.
+- `ForwardingOptionsConfig.AllowDataplaneSleep` field + compiler extraction.
+- Accepted-but-unenforced commit warning in `ValidateConfig` (the userspace
+  workers busy-poll), mirroring the `persist-groups-inheritance` /
+  `dns-proxy` warnings.
+- Stage 2 deferred per the research doc — busy-poll cold-start latency
+  sensitivity (#1782) needs explicit lab validation before enabling.
+
+## Tests
+
+- config: attributes-match parse, valid pattern compiles, **invalid pattern
+  rejected at commit**, malformed-not-rejected, direct validator;
+  allow-dataplane-sleep parses+field-set+warns, absent-no-warn,
+  schema-completion.
+
+*(truncated — 60 lines total)*
+
+
+---
+
+## PR #2064 — #2008 M7: correct regexCache validation comment (Copilot #2063 follow-up) [MERGED] (merged 2026-06-20)
+
+Branch: `fix/2063-comment-accuracy`
+
+Trivial comment-accuracy follow-up to PR #2063 (merged), addressing the one Copilot inline finding I should have folded before merge.
+
+The `regexCache` comment in `pkg/eventengine/engine.go` said patterns are validated at commit via `config.ValidateConfig` and a bad pattern never reaches the engine. Corrected: (1) the validator is `config.ValidateEventAttributesMatch` (from `CompileConfig`), not `ValidateConfig`; (2) after the #2063 lenient-path fix, an invalid persisted pattern is downgraded to a warning on `CompileConfigLenient` so an upgrading node boots through — so a bad pattern *can* reach the engine on the tolerant load path, making the skip-on-compile-failure fallback a real handler, not purely defensive.
+
+Comment-only, no logic change. `go build ./pkg/eventengine/` clean.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #2065 — #2008 M5: application-identification app_id end-to-end [MERGED] (merged 2026-06-20)
+
+Branch: `fix/2008-m5-appid`
+
+## What
+
+Lights up the AppID plumbing chain in the userspace dataplane, which was
+100% inert (#2008 Tier-2 gap M5). The Go control plane built the
+`app_id -> name` catalog and `show security flow session` consumed
+`val.AppID`, but the userspace dataplane hardcoded `app_id: 0` and the
+catalog was never shipped to Rust — so every session resolved to a port
+guess or `UNKNOWN`.
+
+## The chain wired
+
+1. **Catalog-ship** — `pkg/appid.BuildCatalog` produces the ordered
+   `(protocol, port-range) -> app_id` catalog, with app_id assignment in
+   lock-step with `pkg/dataplane.compileApplications`' `AppNames`. It is
+   shipped as a new additive snapshot field `app_catalog`
+   (`AppCatalogEntrySnapshot` <-> Rust `AppCatalogEntry`).
+2. **Session-stamp** — the snapshot catalog is compiled into
+   `ForwardingState.app_catalog` (`AppCatalog` matcher in `policy.rs`);
+   the resolved app_id is stamped on each new conntrack session at the
+   three live session-create sites in `poll_descriptor`, threaded through
+   `publish_bpf_conntrack_entry` -> `publish_v4/v6_session` (replacing the
+   hardcoded 0).
+3. **Resolve** — `appid.ResolveSessionName` (already present) resolves the
+   stamped app_id back to a name; the id<->name correspondence is pinned
+   by a parity test.
+
+## HA / app_id round-trip
+
+`app_id` is **not** added to the session-sync wire and does not need to be.
+HA-synced sessions are never mirrored into the BPF conntrack map (the
+synced install path passes a `None` ConntrackCtx — the same property
+`alg_type` relies on), and a session re-created locally after failover is
+re-stamped from the catalog (shipped to both nodes), so app_id is
+re-derived rather than carried. Verified by tracing the synced-install path
+(`afxdp/ha.rs` -> `handle_upsert_synced` -> `publish_worker_session_map_entry`,
+which does not pass a conntrack ctx). A pre-upgrade / no-match session with
+app_id 0 stays valid (0 = unknown, the existing default).
+
+## Go<->Rust wire parity
+
+Mirrors the GREAcceleration / power_mode_disable / alg_disable_flags
+pattern: `omitempty` on the Go field + `#[serde(default)]` on the Rust
+struct + numeric-typed fields, so an old snapshot omitting `app_catalog`
+decodes to an empty catalog (HA/upgrade-safe, avoids the #1961
+decode-abort class). Tests cover the decode of `app_catalog`, the
+old-snapshot-without-it tolerance, and the JSON round-trip;
+`protocol_wire_v1.json` regenerated.
+
+## Tests
+
+
+*(truncated — 76 lines total)*
+
+
+---
+
+## PR #2066 — #1387 inc-2: DHCP DDNS live RFC 2136 backend + reconcile loop + node-level HA gate [MERGED] (merged 2026-06-20)
+
+Branch: `fix/1387-inc2-ddns`
+
+## #1387 Increment 2 — DHCP dynamic DNS goes live
+
+Turns the lights on for DHCP dynamic DNS (#1387). Inc-1 (PR #2043, merged)
+shipped the config model + reconciler core + ownership store + the
+pluggable `DNSUpdater` interface as a no-op. This increment wires a LIVE
+RFC 2136 backend behind that interface, a daemon reconcile loop in front of
+it, a node-level HA single-writer gate, and the Prometheus + `show`
+observability surface. Implements the feasible (lab-free, CI-testable)
+slice of `docs/research/1387-inc2-ddns-backend/plan.md` (PLAN-READY r2).
+Companion-free — the parent serializes review.
+
+### Feasible slice shipped (items 1-5)
+
+1. **Live RFC 2136 backend** (`rfc2136Updater`, `pkg/dhcpserver/ddns_rfc2136.go`)
+   behind the existing `DNSUpdater` interface, using `github.com/miekg/dns`:
+   exact-RR A/AAAA + PTR **add**, symmetric exact-RR **delete** (RFC 2136
+   §2.5.4, TTL=0 / CLASS=NONE — never a delete-RRset, so a co-resident
+   manually-added record on the same name is never collateral; the R1
+   cardinal-sin boundary holds on the wire). TSIG via `TSIGSecret.Reveal()`
+   (sha1/224/256/384/512; hmac-md5 rejected as insecure; default sha256),
+   UDP→TCP-on-truncation, bounded timeout, conflict-policy
+   (replace-owned/skip-existing/strict-fail). `Domain`-derived forward zone +
+   canonical in-addr.arpa/ip6.arpa reverse; reverse NOTAUTH/REFUSED is a
+   **counted skip** (`reason=ptr-notauth`), not a blocking error.
+2. **Always-on daemon reconcile loop** (`pkg/daemon/daemon_ddns.go`): 30s poll
+   + commit/MASTER-takeover nudge, guarded skip-if-in-flight, per-pass
+   timeout. **File-I/O + DNS only — no control-socket calls** (CLAUDE.md
+   rule). Manager constructed unconditionally; updater resolved
+   per-Reconcile so enabled→disabled withdraws.
+3. **NODE-LEVEL HA single-writer gate** (the r2-corrected design): this node
+   reconciles its own Kea memfile(s) IFF it is **MASTER for ≥1 RG** (standalone
+   always open), via `snapshotRethMasterState` — NOT per-RG `subnet_id`. Sound
+   without per-lease attribution because the Kea render is master-filtered, so
+   each node's memfile holds only its own MASTER-RG leases (disjoint by RG).
+   BACKUP = **stop-writing, not withdraw**. Async-takeover ordering is benign
+   (early nudge issues zero deletes against a not-yet-repopulated memfile).
+4. **Metrics + show**: `xpf_dhcp_ddns_*` through the checked collector
+   (closed-cardinality `result`/`reason` incl. `ptr-notauth`) +
+   `show system services dhcp-server dynamic-dns [detail]` (CLI + gRPC).
+5. **Retired the Inc-1 deferred-backend commit warning**; replaced with
+   WARN-only live validation (no update-server / malformed update-server /
+   bad TSIG algorithm / still-deferred kea-d2) — never an error, so a
+   previously-inert malformed value cannot brick a boot (plan §7 Q-C).
+
+### In-process test coverage (no lab)
+
+`pkg/dhcpserver/ddns_rfc2136_test.go` drives a real in-process `miekg/dns`
+server on `127.0.0.1:0` (UDP+TCP + TSIG verify) and asserts the EXACT wire
+adds/deletes: add/delete-exact-RR/no-delete-RRset-on-upsert/conflict
+policies/NOTAUTH-skip/TSIG-wrong-secret-no-leak/timeout. Manager tests cover
+
+*(truncated — 85 lines total)*
+
+
+---
+
+## PR #2067 — daemon: ssh sshd_config.d drop-in lifecycle — remove on config-empty + revert on reload failure [MERGED] (merged 2026-06-20)
+
+Branch: `fix/2062-sshd-dropin-lifecycle`
+
+Fixes two pre-existing gaps in `Daemon.applySSHConfig` (pkg/daemon/daemon_system.go) for the xpf-managed sshd drop-in `/etc/ssh/sshd_config.d/xpf.conf`. Spun out of #2008 / PR #2060 (Copilot review), surfaced by the H5 key-exchange work. Closes #2062.
+
+## Gaps
+
+1. **Stale drop-in on config removal.** `applySSHConfig` returned early when the ssh stanza was absent (`Services`/`SSH == nil`) and when `buildSSHDConfig` rendered `""` (no recognised leaves), leaving any existing drop-in in place. Deleting/emptying the xpf-managed ssh config therefore did NOT revert sshd to base-image defaults — stale `PermitRootLogin`/`KexAlgorithms` stayed enforced until the next boot or a manual cleanup.
+2. **Bad drop-in left on reload failure.** When the atomic write succeeded but `systemctl reload sshd` failed (e.g. an invalid free-form `key-exchange` algorithm), the bad drop-in was left on disk; the running sshd kept its old in-memory config, but a future sshd RESTART would then fail to start with the bad drop-in.
+
+## Fixes
+
+- No xpf-managed ssh settings (`content == ""`, covering both the absent-stanza and empty-stanza cases via the nil-safe `buildSSHDConfig`) → remove the drop-in if present and reload so sshd reverts to base-image defaults. No-op when the drop-in is already absent (no spurious remove/reload).
+- Reload failure after a write → revert the drop-in to its prior content (or remove it if there was none) and reload again best-effort, so a bad config never persists to break the next sshd restart.
+
+## Testability seam
+
+The write/remove/reload effects were hard-wired to `os`/`fsatomic`/`systemctl` with no seam, so the remove/revert paths were untestable (only the pure `buildSSHDConfig` was tested). Added package-level function vars (`sshdConfPath`, `sshdReadFile`, `sshdWriteFile`, `sshdRemoveFile`, `sshdMkdirAll`, `sshdReloadCmd`) defaulting to the production impls, overridden by a recorder in tests — mirroring the `listenFn`/`ensureLinkLocalFn` seam in `pkg/ra`.
+
+## Tests
+
+Recorder-backed, side-effect-asserting: config-removed and config-emptied each remove the drop-in + reload once; empty-and-absent is a no-op; reload-failure-after-write reverts to the prior content; reload-failure-with-no-prior removes the bad drop-in; normal write and no-change keep existing behavior. The four new-behavior tests were verified to FAIL against the pre-fix logic (seam kept, old function body) — non-tautological.
+
+## Validation
+
+`go build ./...`, `go vet ./pkg/daemon/` (only the pre-existing `flowexport` copy-lock warnings remain), `go test ./pkg/daemon/ -count=1` all pass.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #2086 — daemon: fix lo0 input filter never installing (#2069) [MERGED] (merged 2026-06-20)
+
+Branch: `fix/2069-lo0-nft-flush`
+
+## Summary
+
+Fixes #2069 (HIGH, audit-found — fail-open control-plane filter).
+
+`applyLo0Filter` (`pkg/daemon/daemon_nft.go`) fed `nft -f -` a payload whose
+first line was `flush ruleset inet xpf_lo0`. nft's `flush ruleset` accepts at
+most an **optional family** (`flush ruleset [<family>]`), never a table name, so
+the trailing `xpf_lo0` token is a parse error. Because nft parses an `-f -`
+payload **atomically**, that line-1 syntax error rejected the **entire** payload
+— including the real filter rules. Only a `slog.Warn` fired, so a configured
+`interfaces lo0 unit 0 family inet[6] filter input <name>` silently never
+installed: the control-plane filter failed **OPEN** and host-bound traffic the
+operator meant to drop/reject reached the local stack.
+
+## Fix
+
+Replace the invalid line with the correct atomic reset idiom (one payload, so
+the table is reset and repopulated together):
+
+```
+table inet xpf_lo0          # create-if-absent, no body — idempotent
+flush table inet xpf_lo0    # reset prior contents
+table inet xpf_lo0 { ... }  # redefine with the new rules
+```
+
+The bare `table inet xpf_lo0` line creates the table if absent and is a no-op if
+present, so the subsequent `flush table` never errors on a fresh boot (unlike a
+leading `delete table`, which errors when the table is absent). The sibling
+no-filter cleanup path already uses the correct `delete table inet xpf_lo0` form
+and is unchanged.
+
+Payload assembly is extracted into a pure `buildLo0FilterPayload()` so the exact
+`nft -f -` payload is parse-checkable without the daemon apply path.
+
+## Tests
+
+The prior tests only exercised `nftRuleFromTerm` and never the `nft -f`
+invocation, so the flush line was uncovered. Added:
+
+- `TestLo0FilterPayloadFlushIdiom` — forbids `flush ruleset`, requires the
+  create-if-absent + `flush table` idiom in order, requires the real rule body.
+- `TestLo0FilterPayloadNftParses` — runs `nft -c -f -` on the real payload when
+  nft is on PATH; a syntax error fails the test, a netlink/permission error
+  without `CAP_NET_ADMIN` is a pass (syntax parsed), missing nft skips.
+
+Both tests **FAIL against the pre-fix `flush ruleset inet xpf_lo0` payload**
+(verified by injecting the old idiom: the string test trips and `nft -c` reports
+`syntax error ... xpf_lo0`). Verified against real **nftables 1.1.6** — the new
+idiom parses cleanly (only a post-parse `Operation not permitted` netlink error
+remains, expected without `CAP_NET_ADMIN`).
+
+*(truncated — 66 lines total)*
+
+
+---
+
+## PR #2087 — #2070: interface-monitor reads carrier (operstate), not admin IFF_UP [MERGED] (merged 2026-06-20)
+
+Branch: `fix/2070-carrier-monitor`
+
+## Summary
+
+Fixes #2070 (HIGH, audit-found). The chassis-cluster interface-monitor
+reported a **carrier-down** (cable-pulled / peer-link-down) interface as
+**UP**, suppressing HA failover — the cluster stayed on a node with a dead
+uplink.
+
+## Root cause
+
+Link health was `OperState == netlink.OperUp || Flags&net.FlagUp != 0`.
+`net.FlagUp` is the **administrative** IFF_UP flag. xpfd admin-ups ALL
+managed interfaces, so that term is essentially always true and the OR
+collapsed to "administratively up" regardless of carrier. On carrier loss
+the kernel keeps IFF_UP set while `OperState` transitions to
+`OperDown`/`OperLowerLayerDown`, so `up` stayed `true`. Downstream,
+`SetMonitorWeight(..., down=false, ...)` removed the iface from
+`MonitorFails` and deleted its weight, so the redundancy group was never
+demoted and the configured failover never fired.
+
+## Fix
+
+Decide link health from the kernel **operational state** (IFLA_OPERSTATE)
+via a package-local `linkAttrsUp` helper that mirrors
+`pkg/vrrp.linkAttrsUp` — the canonical link-state read already used by VRRP
+track-interface detection:
+
+- `OperUp` → up
+- `OperUnknown` → fall back to admin IFF_UP (virtual devices with no
+  carrier state)
+- `OperDown` / `OperLowerLayerDown` / anything else → down
+
+The identical buggy expression lived at **three** sites; all now route
+through the helper:
+
+- `pkg/routing/monitor.go` — display-side `InterfaceMonitorStatus` signal
+  (the location cited in the issue, ~48-49)
+- `pkg/cluster/monitor.go` — the **live** 1-second `poll()` loop feeding
+  `SetMonitorWeight` (the dominant continuous carrier-detection path the
+  issue flags as broader impact), and the `RGInterfaceReady` readiness
+  check
+
+Admin-down still reports down.
+
+## Tests (non-tautological)
+
+Added regression tests in both packages, verified to **FAIL on the pre-fix
+code** (carrier-down reported UP; RG weight stayed 255 instead of demoting
+to 155) and **PASS after the fix**:
+
+- `pkg/routing/monitor_test.go::TestInterfaceMonitor_CarrierState` —
+
+*(truncated — 77 lines total)*
+
+
+---
+
+## PR #2088 — config: compile nested application-set members (#2068) [MERGED] (merged 2026-06-20)
+
+Branch: `fix/2068-nested-appset`
+
+## Summary
+
+Fixes #2068 (HIGH, audit-found). `compileApplications`' application-set
+member loop (`pkg/config/compiler.go` ~1875) read only children named
+`application`, so a nested `application-set <child>` member was silently
+dropped from the parent set. Because the schema accepts the nested form
+(`schema_security.go:457`, `children:nil`) and `ExpandApplicationSet`
+(`predefined.go` ~184) already recurses into nested sets (max depth 3),
+nesting is an intended feature — but the compile dropped it.
+
+Result: a security policy matching the parent set **under-matched**.
+Applications defined only in the child set produced no app-match rule,
+so that traffic was never matched — a real correctness/security gap.
+
+## Fix
+
+`pkg/config/compiler.go` — added an `application-set` arm to the member
+switch, mirroring `compileAddressBook` which already handles both
+`address` and `address-set` members. The child-set name is appended to
+the parent's `Applications` slice (its doc comment already documents it
+as "references to Application or ApplicationSet names"), and the
+existing `ExpandApplicationSet` recursion resolves it. `nodeVal` handles
+both AST shapes, so flat-set and hierarchical config both populate it.
+
+No new commit-time check is added: `ExpandApplicationSet` already errors
+on unknown members at dataplane compile (consistent with predefined
+sets) and its depth-3 guard bounds cyclic/over-deep nests.
+
+## Tests (mutation-verified to FAIL before the fix)
+
+- `pkg/config`: `TestNestedApplicationSet{FlatSet,Hierarchical,Deep,Cycle}`.
+  FlatSet uses `ParseSetCommand`/`SetPath` per the CLAUDE.md dual-AST
+  rule (never `NewParser`); Hierarchical covers the braced shape; Deep is
+  a 3-level nest; Cycle confirms the depth guard bounds a
+  mutually-referential nest.
+- `pkg/dataplane/userspace`: `TestNestedApplicationSetPolicyMatch` drives
+  a flat-set config through `config.CompileConfig` (not a hand-built
+  struct, which would bypass the buggy compiler and be tautological) and
+  asserts `buildPolicySnapshots` emits an app-match term for app2's
+  `tcp/443` — reachable only via the nested child set. Pre-fix only
+  app1's `tcp/80` term is emitted.
+
+The audit repro (`parent{app1, application-set child}`, `child{app2}`):
+pre-fix `ExpandApplicationSet("parent")` returns only `[app1]`; post-fix
+it returns both `app1` and `app2`.
+
+## Docs
+
+`docs/services-application-identification.md` now documents nested
+application-set member support and the #2068 fix.
+
+*(truncated — 57 lines total)*
+
+
+---
+
+## PR #2091 — #2084: insert `--` end-of-options separator before ping/traceroute target [MERGED] (merged 2026-06-20)
+
+Branch: `hardening/2084-ping-traceroute-separator`
+
+## Summary
+
+The gRPC, REST, and local-CLI ping/traceroute exec sites build an `argv`
+slice and run it with `exec.CommandContext` (no shell). There is **no
+shell/argument injection**, but the user-supplied target was appended
+directly after the options, so a `-`-prefixed target was interpreted by
+`ping`/`traceroute` as a flag rather than a destination
+(**option-confusion**). The endpoints are loopback-API gated; this is a
+hardening fix, not a security-critical bug (#2084, re-scoped from the
+original "argument injection" framing).
+
+The fix inserts a `--` end-of-options separator immediately before the
+target at the six target-append points, extracted into pure,
+unit-testable `buildPingArgv`/`buildTracerouteArgv` helpers (one pair in
+each of `pkg/grpcapi`, `pkg/api`, `pkg/cli`).
+
+## Sites fixed
+
+| File | Function |
+|------|----------|
+| `pkg/grpcapi/server_diag.go` | `Ping`, `Traceroute` (via `buildPingArgv`/`buildTracerouteArgv`) |
+| `pkg/api/system.go` | `pingHandler`, `tracerouteHandler` (via builders) |
+| `pkg/cli/cli_request.go` | `handlePing`, `handleTraceroute` (via builders) |
+
+For the `ip vrf exec vrf-<name>` wrapped variant the `--` lands in the
+inner command's argv (after the `ping`/`traceroute` binary), where it
+must be honored.
+
+**Out of scope:** the remote CLI (`cmd/cli/main.go`) builds a protobuf
+request, not an argv, and inherits the server-side fix;
+`pkg/upgrade/kernel_linux.go` pings a daemon-internal kernel-promote
+gateway with no untrusted input.
+
+## Plan + review
+
+Plan doc: `docs/pr/2084-ping-traceroute-separator/plan.md`
+
+## Test plan
+
+- [x] `go build ./...` clean
+- [x] `go test ./pkg/grpcapi/ ./pkg/api/ ./pkg/cli/` green
+- [x] 12 new argv unit tests (4 per package) pass — assert `--` present,
+      immediately precedes the target, is the final-but-one element,
+      follows all options and the binary, and that a `-`-prefixed target
+      lands as the operand; VRF variants assert the separator sits in the
+      inner command after the wrapper
+- [x] Control-plane only — NO dataplane smoke (per #2084 re-scope)
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #2092 — #2071: render IPv6 prefix-list with the IPv6 match clause [MERGED] (merged 2026-06-20)
+
+Branch: `refactor/2071-ipv6-prefix-list`
+
+## Summary
+
+`pkg/frr/policy_render.go` `generatePolicyOptions` rendered a policy
+term's `from prefix-list <name>` unconditionally as the IPv4
+`match ip address prefix-list <name>` matcher with no address-family
+detection. When the referenced prefix-list holds IPv6 prefixes and the
+policy is applied in an IPv6 context (OSPFv3 export, BGP inet6
+route-map), FRR's `match ip address` clause never matches IPv6 routes —
+the operator's export/import filter is a **silent no-op for IPv6** (can
+leak routes that should be filtered, or fail to permit routes that should
+pass). Issue #2071.
+
+The fix mirrors the adjacent route-filter render path (which already
+branches on `strings.Contains(prefix, ":")`): look up
+`po.PrefixLists[term.PrefixList]` and emit `match ipv6 address` when any
+entry is an IPv6 prefix, otherwise `match ip address`. **Exactly one**
+matcher is emitted per `from prefix-list`, in the term's existing single
+route-map sequence — because FRR ANDs match clauses within a route-map
+index (MATCH + NOMATCH = NOMATCH) and the definition render already
+populates both the `ip` and `ipv6` prefix-list namespaces for a mixed
+list, so emitting both matchers in one index would deny the route for
+both families. A mixed (v4+v6) list renders the IPv6 matcher — the same
+homogeneous-family limitation the route-filter precedent already has.
+Unknown/empty lists default to the IPv4 matcher, byte-identical to the
+pre-fix render.
+
+Control-plane FRR config render only — **no dataplane change, no
+dataplane smoke**.
+
+## Plan + adversarial review
+
+Plan doc: `docs/pr/2071-ipv6-prefix-list/plan.md` (3 review rounds).
+
+- **Round 1** — reviewer A PLAN-NEEDS-MAJOR: v1's "emit both matchers in
+  one route-map index" is FRR-broken (verified against FRR master:
+  `lib/routemap.c` AND truth-table + no AF pre-filter in the match loop;
+  `bgpd/bgp_routemap.c route_match_address_prefix_list` returns NOMATCH
+  against a populated off-family list). reviewer B PLAN-READY w/ 2 minors.
+- **Round 2** (v2 two-sequence design) — both reviewers found it collides
+  with a co-resident `from route-filter` (relocated silent-deny) and
+  double-emits route-filter definition lines.
+- **Round 3** (v3 single family-chosen matcher) — reviewer B PLAN-READY
+  (verified the snippet is correct for all six edge cases, byte-identity
+  proven, e2e path verified live); reviewer A PLAN-NEEDS-MINOR ×3
+  (honesty/coverage), all folded. Both confirm v3 closes rounds 1 and 2
+  by construction (one matcher → no AND-in-index; no body duplication →
+  no route-filter interaction).
+
+(Codex + Antigravity companions are infra-degraded this session; two
+independent hostile Claude reviewers + a Claude SMR pass substituted.
+
+*(truncated — 72 lines total)*
+
+
+---
+
+## PR #2093 — #2078: warn-and-document non-enforced tcp-session knobs + remove dead flow_config_map TCPFlags write [MERGED] (merged 2026-06-20)
+
+Branch: `engineer/2078-c2-advisory`
+
+## Summary
+
+Closes #2078 via the converged **C2 (warn-and-document)** path. Research
+#2078 converged PLAN-KILL on enforcing the `security flow tcp-session`
+knobs — the userspace AF_XDP dataplane has no TCP state machine and no
+sequence/window tracking, the family was a knowingly-chosen config-only
+seam (#2008 M9 + the active-active RST design), and the proportionality
+of forwarding-hot-path risk vs two LOW, rarely-used knobs favours
+warn-and-document. This PR ships exactly that — no enforcement, no TCP
+state machine.
+
+Three changes:
+
+1. **Commit-time advisory** — `no-syn-check`, `no-syn-check-in-tunnel`,
+   `rst-invalidate-session`, and the #2008 M9 sibling `no-sequence-check`
+   now emit a single accepted-only commit warning so an operator who sets
+   one is not silently misled into believing it has runtime effect. Mirrors
+   the existing `allow-dataplane-sleep` accepted-only pattern in
+   `compileExpanded`.
+2. **Docs parity note** — `docs/feature-gaps.md` rows corrected from the
+   misleading "Done (legacy eBPF)" to "Config-only (#2078)" with the actual
+   userspace behavior; `docs/config-schema.md` tcp-session paragraph
+   expanded with the advisory + RST design rationale
+   (`docs/active-active-new-connections.md`) + dead-code cross-references.
+3. **Dead-code removal** — the `FlowConfigValue.TCPFlags` packing in
+   `pkg/dataplane/compiler.go` fed `dp.SetFlowConfig`, a no-op stub on the
+   userspace path whose real impl writes the retired `flow_config_map`
+   eBPF map (#1373/#1476). Removed the dead write + the always-zero
+   `tcp_flags` log field. No reader of `FlowConfigValue.TCPFlags` exists
+   (the `compiler_filter.go` `.TCPFlags` references are a different struct).
+   The struct field is kept for `xpf_common.h` layout parity.
+
+## Plan + adversarial review
+
+Converged plan (research #2078, 3-way hostile review → PLAN-KILL/C2):
+`git show research/2078-tcp-state-enforcement:docs/research/2078-tcp-state-enforcement/plan.md`
+
+This PR is the C2 implementation. Control-plane only — no runtime
+behavior change, so no dataplane smoke. Covered by pkg/config
+commit-check unit tests (mutation-verified non-tautological).
+
+## Test plan
+
+- [x] `go build ./...` clean
+- [x] `go vet ./pkg/dataplane/` clean
+- [x] `go test ./pkg/config/ ./pkg/dataplane/` green
+- [x] full `go test ./...` — 0 failures
+- [x] `pkg/config/tcp_session_advisory_test.go` — per-knob advisory fires
+      and names that knob (with prefix false-positive guard), all four fold
+      into exactly one warning, timeouts-only + absent emit nothing
+
+*(truncated — 55 lines total)*
+
+
+---
+
+## PR #2094 — #2085: filter expired/non-active + dedup Kea display lease parser [MERGED] (merged 2026-06-20)
+
+Branch: `refactor/2085-kea-lease-parser`
+
+## Summary
+
+`parseLeaseCSV` (the display-only Kea memfile lease parser behind `show dhcp server leases`, via `GetLeases4`/`GetLeases6`) returned every data row with a non-empty address — no expire filter, no state filter, no per-address dedup. Kea's memfile is **append-only** between lease-file-cleanup (LFC) compactions, so every renewal, re-allocation, release, decline, and expiry-reclaim is appended as a new row. The display therefore showed **duplicate rows** for the same address and **stale** (expired / released / declined) leases (#2085).
+
+The fix collapses the append log to one active row per address (newest wins) and drops non-active and expired rows, in the parser's existing **lenient, non-destructive** style:
+
+- **Dedup, last-write-wins** — chronological rows ⇒ last row per address is authoritative; first-appearance order preserved for a stable display.
+- **State filter BEFORE expire** — drop `state != 0` (declined / expired-reclaimed). These often carry a **future** `expire`, so expire-only would still show them — the issue's own "stale row" symptom. A later active append reclaims a tombstoned address.
+- **Expire filter** — drop rows where `now >= expire`.
+- **Lenient** — absent/unparseable `state`/`expire` ⇒ treat as active (pre-#2085 behaviour for older Kea / exotic headers); a bad row never blanks the whole `show`. Clock injected (`now time.Time`) for deterministic tests, mirroring the sibling `parseActiveLeases` seam.
+
+Only the per-row tombstone/order/emit logic is copied from the state-aware DDNS parser (`ddns_leases.go`); the destructive header-validation hard-fail is deliberately NOT adopted (it would blank the display on one mangled row, and re-merging the two would re-open the #1387 mass-delete).
+
+## Plan + adversarial review
+
+Plan doc: `docs/pr/2085-kea-lease-parser/plan.md`
+
+Round-1 plan review (two hostile Claude reviewers): **PLAN-NEEDS-MAJOR + PLAN-NEEDS-MINOR**, converged on one substantive gap — expire-only is incomplete; state-column filtering must be in scope (released/declined leases carry future expire) — plus a test-fixture `now` contradiction and the README update. All folded into plan v2 and the implementation. The reviewers agreed the `now` param seam, `>=` boundary, `address` dedup key, and keeping the two parsers separate are all correct.
+
+## Test plan
+
+Control-plane **display** bug — NO smoke (no dataplane change). Coverage is `pkg/dhcpserver` unit tests, non-tautological:
+
+- [x] `go build ./...` clean
+- [x] `go vet ./pkg/dhcpserver/...` clean
+- [x] `TestParseLeaseCSV_ExpiredAndDuplicate` — dedup keeps newest, expired dropped, stable order (pre-fix returns 4, asserts 2)
+- [x] `TestParseLeaseCSV_StateFiltered` — declined (state=1) / expired-reclaimed (state=2) with **future** expire dropped; state tombstone-reclaim; fails an expire-only half-fix (pre-fix returns 5, asserts 2)
+- [x] `TestParseLeaseCSV_Lenient` — garbage/absent state+expire and a header with no state/expire column keep rows (degrade-to-today, never blank the show)
+- [x] Four existing `parseLeaseCSV` call sites updated to pass a fixed `now` before the 2024-02 fixture expiries so their (state=0) rows stay live — pre-existing assertions preserved
+- [x] `pkg/dhcpserver` tests 5/5 (flake check)
+- [x] Full `go test ./...` — all packages pass
+- [x] Non-tautology proven: pre-fix logic returns 4 and 5 rows where the new tests assert 2
+
+## Docs
+
+- [x] `pkg/dhcpserver/README.md` updated — shifted two-parser rationale (destructive-vs-lenient) and the new active/dedup display semantics.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #2095 — #2083: bring renamed interface up instead of stranding it DOWN on final LinkSetUp failure [MERGED] (merged 2026-06-20)
+
+Branch: `fix/2083-rename-iface-down-on-linksetup-fail`
+
+## Summary
+
+`renameInterface` (`pkg/daemon/linksetup.go`) does `LinkSetDown -> LinkSetName -> LinkSetUp`. The `LinkSetDown`/`LinkSetName` failure paths roll back, but the **final `LinkSetUp` failure** returned the error with no recovery — leaving the interface **renamed-but-administratively-DOWN**. Because the `.link` file (written before the rename) already matches the new name, the next reconcile sees the name as correct and never re-attempts the rename, so the interface stayed stranded DOWN (issue #2083, audit severity LOW).
+
+A `LinkSetUp` failure means the rename **already succeeded**, so the correct recovery is to *finish the job* (bring the link up under its new name), not undo the rename. Renaming back to the old name would re-create the exact collision the device-map phase-1 path deliberately broke (`device_map.go`), making phase-2's rename of the intended occupant fail with `EEXIST` — strictly worse than the current stranding. This PR retries the bring-up once on the same cached handle (netlink set ops act on the stable ifindex, not the name) and on persistent failure returns an actionable, `%w`-wrapped error; the interface is never left under the old name and is recovered by the next config reconcile.
+
+The four netlink link ops are indirected through package-level function vars (`nlLinkByName`/`SetDown`/`SetName`/`SetUp`), mirroring the existing `deriveKernelNameFn` seam in `device_map.go`, so a unit test can inject a `LinkSetUp` failure and assert the exact call sequence.
+
+## Plan + adversarial review
+
+Plan doc: `docs/pr/2083-rename-iface-down/plan.md`
+
+- v1 design (rename-back to old name) was **rejected** by two independent hostile plan reviewers: it re-created the device-map phase-1 collision (`EEXIST` on phase-2) and restored a forbidden `xpf-tmp-*` name. Round-1 verdicts: PLAN-NEEDS-MAJOR (near KILL) and PLAN-NEEDS-MINOR.
+- v2 design (bring up under new name, never rename back) — both reviewers **PLAN-READY** in round 2, verified against `vishvananda/netlink@v1.3.1` that `LinkSetUp`/`SetName` act on `base.Index` (stable across rename; `ensureIndex` is a no-op when `Index != 0`, which `LinkByName` guarantees). Three optional doc-precision refinements were folded into the implementation comments and tests.
+
+## Test plan
+
+Control-plane-only change; **no smoke** (no dataplane impact — the HA/cluster smoke matrix does not exercise this error branch).
+
+- [x] `go build ./...` clean
+- [x] `go vet ./pkg/daemon/` clean for changed files (two pre-existing `daemon_flow.go` lock-copy warnings are unrelated and in code this PR does not touch)
+- [x] `go test ./pkg/daemon/ -run TestRenameInterface` — 6/6 pass, 5/5 flake-free
+- [x] Full Go suite `go test ./...` — all packages pass
+- [x] Tests are **non-tautological**: deleting the retry or reintroducing a rename-back makes the recorded-call-sequence assertions fail
+- [x] Tests do not call `t.Parallel()` (package-global seam vars); no other parallel test in the package touches them
+
+Tests added (`pkg/daemon/linksetup_rename_test.go`):
+- transient up-failure then retry-success: returns `nil`, link ends under the new name, no rename-back
+- persistent up-failure: actionable `%w`-wrapped error, link stays correctly named, exactly two `LinkSetUp` calls (no loop), no rename-back
+- success path unchanged (`down -> setname -> up`, single up)
+- pre-existing `LinkSetName`-failure rollback + `LinkSetDown`/`LinkByName` early-returns regression-guarded
+
+Closes #2083.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #2096 — #2074: stop IPsec gateway NAME leaking into swanctl remote_addrs [MERGED] (merged 2026-06-20)
+
+Branch: `fix/2074-remote-addrs-name-leak`
+
+## Summary
+
+Fixes #2074. An IPsec VPN whose `ike gateway <name>` references a gateway that is neither a defined-and-addressed gateway object nor a usable inline IP/hostname (a typo, or a gateway committed without `address`/`dynamic hostname`) made `renderConfig` emit `remote_addrs = <gateway-name>` — a config-object name strongSwan cannot use. strongSwan DNS-resolves the bogus name forever, the IKE SA never establishes, and the operator gets no diagnostic: a silently-dead tunnel.
+
+Two-layer fix:
+
+- **Layer 1 — commit-time validator** (`validateIPsecGatewayReferencesStrict`, `pkg/config`): rejects an undefined or addressless gateway reference at `commit` / `commit check`. Runs in the strict-validator chain in `compileExpanded`, on the fully-compiled `*Config`, so both `ike { gateway }` and `ipsec { gateway }` definitions are present regardless of stanza authoring order. Downgraded to a warning on the tolerant load / peer-sync paths via a new `compileOpts.lenientIPsecGatewayRefs` (set in `CompileConfigLenient` and `CompileConfigForNodeLenient`) so a config persisted by an older binary or synced from a peer still **boots** (mirrors the #1956 / #2008 doctrine; avoids the #1960 fail-closed-on-load class).
+- **Layer 2 — render belt** (`resolveRemoteAddr`, `pkg/ipsec/policy.go`): for any path that reaches render without passing local commit (HA sync, direct construction), an unrenderable VPN is **skipped** (with a `slog.Warn`) — its connection and secret are omitted — rather than leaking the name **or** aborting the whole file. Healthy VPNs always render, so one bad reference never zeroes healthy tunnels on cold boot. `renderConfig` adds **no** new error return, so the unchanged `Manager.Apply` still writes the healthy config.
+
+The shared predicate `config.IsUsableIPsecEndpoint` (Rule A: an inline hostname must be dotted/FQDN) is exported from `pkg/config` so both layers classify identically with no import cycle. The guarantee is narrow and exact: **a bare gateway config-object NAME never reaches `remote_addrs`**; a defined gateway's `address`/`dynamic hostname` content is passed through unchanged (trusted to the parser/schema). The legacy inline-literal-IP gateway shape and the gateway-less (cert/TS-only) VPN shape are preserved bit-for-bit.
+
+This is a control-plane (swanctl render + config compile) change with no dataplane/forwarding impact, so no iperf3/CoS/failover smoke applies.
+
+## Plan + adversarial review
+
+Plan doc: `docs/pr/2074-remote-addrs-name-leak/plan.md` (PLAN-READY).
+
+Substituted hostile Claude reviewers (Codex/Gemini companions infra-degraded), two independent read-only reviewers per round + author SMR:
+
+- Round 1: A PLAN-NEEDS-MINOR, B PLAN-NEEDS-MAJOR — whole-render-abort blast radius; altitude (warn-only doesn't fail commit). Addressed in v2.
+- Round 2: both PLAN-NEEDS-MAJOR — (1) `Apply` bails before write so v2's error-return discarded the healthy config; (2) validator inside `compileIPsec` depended on stanza order and broke the lenient load path. Addressed in v3.
+- Round 3: both **PLAN-READY** (only minor prose/import precision folded: validator edits `compileExpanded`; add `log/slog` to `policy.go`).
+
+## Test plan
+
+- [x] `go build ./...` clean (no import cycle)
+- [x] `go test ./...` — full suite green
+- [x] `go test ./pkg/ipsec/... ./pkg/config/... ./pkg/configstore/...` green; `go vet` clean
+- [x] New `pkg/ipsec` `TestRenderConfig_GatewayNameNeverLeaks` (8 sub-cases incl. multi-VPN skip-keeps-healthy-sibling) — **verified to FAIL against pre-fix `policy.go`** via `go test -overlay` (non-tautological)
+- [x] New `pkg/config` `TestValidateIPsecGatewayReferences` (strict reject undefined/addressless, accept inline-IP/defined/dynamic-hostname, stanza-order independence, lenient-load-warns-not-fails) + `TestIsUsableIPsecEndpoint` — **verified to FAIL when the validator is wired out** (non-tautological)
+- [x] Existing `pkg/ipsec` render tests + `pkg/config` parser/compiler tests pass unchanged (legacy shapes preserved)
+- [x] Docs: `pkg/ipsec/README.md` updated with the gateway-reference / `remote_addrs` invariant
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #2097 — #2090: carrier-aware no-reth-vrrp VIP-readiness gate (sibling of #2070) [MERGED] (merged 2026-06-20)
+
+Branch: `refactor/2090-checkvipreadiness-carrier`
+
+## Summary
+
+`checkVIPReadinessForConfig` (`pkg/daemon/daemon_ha_vip.go`) is the
+takeover-readiness gate for `no-reth-vrrp` / `private-rg-election` HA
+mode. It judged a VIP interface up with the disjunction
+`OperState == OperUp || Flags&FlagUp != 0` — the exact bug class fixed
+by #2070 on the interface-monitor path. Since xpfd admin-ups every
+managed interface, `IFF_UP` stays set after a cable pull while
+`OperState` goes `OperDown`/`OperLowerLayerDown`, so a **carrier-down VIP
+interface was reported ready** and a node could be judged ready to take
+over VIPs on a dead link (a black hole).
+
+This PR routes that gate — and two cosmetic reth-status display sites —
+through a now-exported `cluster.LinkAttrsUp` (operational carrier, with
+the `IFF_UP` fallback only on `OperUnknown`), the same predicate #2070
+introduced.
+
+## What changed
+
+- **`cluster.LinkAttrsUp` exported** (was private `linkAttrsUp`) as the
+  shared carrier-state read. `pkg/cluster` is the correct owner: the
+  dependency direction is `vrrp -> cluster`, so cluster is the lower
+  layer and exporting there avoids an import cycle / touching the
+  just-merged #2070 `vrrp` file. Two in-package callers updated.
+- **Daemon fix:** `checkVIPReadinessForConfig` now uses
+  `cluster.LinkAttrsUp`. The `OperUnknown` fallback is load-bearing —
+  `vrrp.RethVIPsForRG` keys the map by VLAN sub-interface names, which
+  commonly report `OperUnknown`.
+- **Cosmetic folds (display-only):** `RethController.FormatStatus`
+  (`pkg/cluster/reth.go`) and the gRPC reth-status list
+  (`pkg/grpcapi/server_cluster.go`) — both showed a
+  cable-pulled-but-admin-up RETH member as "up"/"Up"; now correct.
+- **Docs:** `pkg/cluster/README.md` updated (doc-contract names the
+  helper); godocs updated.
+
+## Promotion-only — no flap risk
+
+The gate is **promotion-only**: every readiness-gated election
+transition in `pkg/cluster/election.go` is guarded by
+`rg.State != StatePrimary`. So narrowing this read cannot demote an
+already-primary node or churn VIPs/GARP — it only stops a carrier-down
+node from being *promoted* onto a dead link. Pre-existing
+carrier-down-primary behavior is unchanged. (This resolved the
+dampening-asymmetry concern raised in plan review.)
+
+## Plan + adversarial review
+
+Plan doc: `docs/pr/2090-checkvipreadiness-carrier/plan.md`
+
+Two independent hostile Claude plan reviewers — both **PLAN-NEEDS-MINOR**
+
+*(truncated — 85 lines total)*
+
+
+---
+
+## PR #2098 — #2089: policy reject action — send TCP RST / ICMP unreachable instead of silent drop [MERGED] (merged 2026-06-20)
+
+Branch: `refactor/2089-reject-action`
+
+## Summary
+
+A Junos security policy `then reject` action was behaving as a **silent
+drop** (identical to `then deny`) — the flow was blocked but no rejection
+was returned, so clients hung until timeout. This makes `reject` actively
+reject, matching vSRX (and the project's own retired-eBPF reject prior
+art, `8400e23`/`3fc0a58`):
+
+- **TCP** (v4/v6) → **TCP RST**
+- **non-TCP** (UDP, ICMP queries, other) → **ICMP/ICMPv6 Destination
+  Unreachable, administratively prohibited** (ICMPv4 type 3 code 13 /
+  ICMPv6 type 1 code 1), with replies **suppressed** for inbound
+  ICMP/ICMPv6 *error* messages (ICMPv4 {3,4,5,11,12}, ICMPv6 <128) and
+  for non-first fragments.
+
+The whole compile + wire path already distinguished `reject` from `deny`
+(`config.PolicyReject` → `"reject"` → `PolicyAction::Reject`;
+`RT_FLOW_ACTION_REJECT` already plumbed) — the only gap was the dataplane
+treating `Reject` like `Deny` at the policy-deny drop sites. No
+control-plane/wire change was needed.
+
+## How
+
+- New `build_reject_rst_frame` (frame/tcp.rs) and
+  `build_reject_icmp_unreachable` / `reject_icmp_reply_suppressed`
+  (afxdp/icmp.rs), reusing the existing SYN-cookie TCP reply assembly
+  and the local-ICMP-error builder (generalized over (type,code) with
+  the Time Exceeded wire bytes preserved byte-identical).
+- New `#[cold]` `enqueue_policy_reject_reply` (poll_descriptor/reject_reply.rs)
+  pushes the host-generated reply onto the worker TX pipeline using the
+  same TX-frame budget gate as the SYN-cookie path (fail-closed to a
+  silent drop on budget/build failure).
+- Wired **inline at both policy-deny sites**, gated on `Reject`, before
+  each site's existing recycle — `deny` is byte-for-byte unchanged.
+- `PolicyAction::Reject` RT_FLOW mapping flipped to
+  `RT_FLOW_ACTION_REJECT` so syslog/event-stream report reject.
+- New `policy_reject_sent` / `policy_reject_reply_budget_drops` counters
+  through the full per-binding chain (observable via helper status JSON).
+
+Plan doc (incl. the two round-1 hostile plan reviews and their
+disposition): `docs/pr/2089-reject-action/plan.md`.
+
+## Hot-path impact
+
+Zero for permit/deny: the reject branch is gated behind
+`matches!(action, Reject)` and lives on the already-cold policy-deny
+exception arm; the reply body is `#[cold]`. The only shared-path edit is
+parameterizing the ICMP builders, proven byte-identical by the
+unchanged Time Exceeded builder tests.
+
+
+*(truncated — 70 lines total)*
+
+
+---
+
+## PR #2099 — #2073: reject dangling IPsec policy proposal ref; stop silently dropping PFS [MERGED] (merged 2026-06-20)
+
+Branch: `refactor/2073-ipsec-pfs`
+
+## Summary
+
+`resolveESPSettings` (`pkg/ipsec/ike.go`) applied a configured
+perfect-forward-secrecy DH group only on the branch where the IPsec
+policy's proposal reference resolved. When an IPsec policy existed with a
+configured PFS group but its `proposals` reference (or its policy-name
+fallback) did **not** resolve in `cfg.Proposals`, the function fell
+through to `return "default", 0`, emitting `esp_proposals = default` which
+carries no modp term — so PFS was **silently disabled** and the broken
+config committed cleanly and negotiated a weaker SA. There was no
+cross-reference validation that an IPsec policy's `proposals` reference
+actually resolved (the same silent-crypto-weakening class
+`ValidateDHGroup` already closes for DH-group leaves).
+
+Two complementary layers, both consistent with the project's settled
+strict-cross-reference + `lenient*` doctrine:
+
+- **Layer A (commit-time):** `validateIPsecPolicyProposalReferencesStrict`
+  in `pkg/config/compiler.go` hard-rejects a dangling ipsec
+  policy → proposal reference (mirrors
+  `validatePolicySchedulerReferencesStrict`). Distinct messages for an
+  explicit dangling ref vs a PFS policy with no `proposals` leaf (so it
+  does not blame a phantom proposal). Lives in the shared `compileExpanded`
+  so both `CompileConfig` and `CompileConfigForNode` reach it; downgraded
+  to a warning on the tolerant load / peer-sync paths
+  (`lenientIPsecPolicyProposalRef`, set in **both** `CompileConfigLenient`
+  and `CompileConfigForNodeLenient` — the node-aware one backs HA
+  peer-sync) so an already-persisted / peer-synced config still boots.
+
+- **Layer B (render-path safety net):** when the policy resolves with a
+  PFS group but the proposal ref dangles (only reachable on a tolerant
+  boot where Layer A warned), `resolveESPSettings` carries the configured
+  PFS group on a valid canonical fallback proposal
+  `aes256-sha256-modp<bits>` instead of bare `default`.
+
+Decision (issue offered fail-commit vs carry-pfs): **both** — fail the
+commit for new edits (the issue's preference for a genuinely dangling
+ref), and carry PFS on the render path so an already-committed /
+peer-synced config does not silently lose PFS on boot.
+
+## Plan + adversarial review
+
+Plan doc: `docs/pr/2073-ipsec-pfs/plan.md`
+
+- Plan review: two independent hostile reviewers (R1 PLAN-NEEDS-MAJOR,
+  R2 PLAN-NEEDS-MINOR) — all convergent findings folded into plan v2.
+- Code review: two independent hostile reviewers. The first round caught a
+  **BLOCKER** — the fallback originally emitted `aes256-sha256128-modp<bits>`
+  (routed through `buildESPProposal`), but `sha256128` is **not** a
+  strongSwan keyword (verified against upstream
+
+*(truncated — 84 lines total)*
+
+
+---
+
+## PR #2100 — vrrp: gate sync-hold preempt shortcut on peer priority (#2082) [MERGED] (merged 2026-06-20)
+
+Branch: `refactor/2082-vrrp-preempt-priority-gate`
+
+Fixes #2082.
+
+## Problem
+
+The VRRP `preemptNowCh` consumer in the `StateBackup` machine called
+`becomeMaster()` whenever `getPreempt() || force` was true, with **no**
+comparison against the priority of the master it was about to displace. On
+sync-hold release, `Manager.ReleaseSyncHold` restores the configured preempt and
+fires `triggerPreemptNow()` on every instance. A rejoining cluster Secondary
+(RETH VRRP priority 100, `preempt=true`) therefore transiently became a **second
+MASTER** while the priority-200 peer was still legitimately MASTER — adding the
+RETH VIP on the wrong node, emitting a spurious MASTER `VRRPEvent` (which flips
+`rg_active` and removes blackholes), and possibly firing a GARP burst that moves
+the L2 path. The transient self-heals within one advert interval, but the side
+effects are real.
+
+## Fix (Path A — converged plan, RFC 5798 §6.4.2)
+
+Record the last-seen master's advertised priority and gate the **non-force**
+preempt shortcut on a **strictly higher** effective priority.
+
+- `lastMasterPriority`/`lastMasterSeen` added to `vrrpInstance`, recorded by
+  `handleBackupRx`/`handleMasterRx` via `recordMasterAdvert` for every non-zero
+  peer advert. Priority-0 (resignation) adverts are **not** recorded —
+  post-resign takeover flows through the ungated `masterDownTimer` path, so a
+  stale-high recorded priority cannot block it.
+- `shouldPreemptObservedMaster()` returns true iff preempt is configured **AND**
+  (no live master observed — `lastMasterSeen` zero or older than
+  `masterDownInterval`, the cold-start / silent-death rescue — **OR** our
+  effective priority is strictly greater than the observed master's). Equal
+  priority does **not** preempt (the IP tie-break is `handleMasterRx`'s
+  MASTER-MASTER collision resolver, not a preemption rule; it is left untouched).
+  The helper snapshots all state under **one** `vi.mu.RLock()` then computes the
+  effective priority and the staleness horizon from locals — it never calls
+  `getPriority()`/`getPreempt()`/`masterDownInterval()` under the lock (Go
+  RWMutex is non-reentrant).
+- The `StateBackup` select is extracted into `stepBackup()` and the shortcut
+  rewired to `if force || shouldPreemptObservedMaster()`. **`force=true`**
+  (`ForceRGMaster`, cluster-authoritative Secondary→Primary promotion)
+  short-circuits the gate unchanged, so the **~60 ms failover path and priority-0
+  takeover are untouched**. The `stepBackup` seam lets unit tests drive the
+  run-loop decision without calling `run()`, whose preamble spawns a receiver
+  goroutine that nil-derefs `vi.conn` on a test instance.
+
+## Tests
+
+`pkg/vrrp/instance_preempt_gate_test.go`:
+- **Wiring guards via the `stepBackup` seam** — lower-priority and equal-priority
+  non-force preempt are **BLOCKED**; both (and the denied-gate invariant test)
+  **FAIL on the pre-fix `getPreempt() || force`** (non-tautological, verified by
+
+*(truncated — 87 lines total)*
+
+
+---
+
+## PR #2101 — #2075: reconcile NetFlow v9 / IPFIX exporters on config commit [MERGED] (merged 2026-06-20)
+
+Branch: `refactor/2075-flowexport-reconcile`
+
+## Summary
+
+The NetFlow v9 / IPFIX flow exporters (`pkg/flowexport`) were started only
+at daemon boot and stopped only at shutdown — the apply path
+(`daemon_apply.go`) had **zero** flowexport references. As a result, any
+runtime commit that changed `forwarding-options sampling` (collector
+address/port, source-address, 1-in-N input-rate, sampled zones) or a
+`services flow-monitoring` export-extension was silently ignored until a
+daemon restart, and flow export **added** in a later commit never started
+at all.
+
+This adds `reconcileFlowExporters` (new `pkg/daemon/daemon_flowexport.go`),
+called from `applyConfigLocked` (step 16b) and from the post-EventReader
+boot block (replacing the deleted boot-only `startFlowExporter` /
+`startIPFIXExporter`), mirroring the established `reconcileRPM` /
+`reconcileIPMon` pattern.
+
+## Design
+
+- **Config-hash-gated per family** (`flowHash` / `ipfixHash`): an unrelated
+  commit never bounces a healthy exporter (preserving its template-refresh
+  cadence and 1-in-N sampling counter); a single-family change never
+  cross-bounces the other.
+- **No callback leak.** The `EventReader` callback list is append-only with
+  only a clear-ALL primitive (no per-callback removal). A naive stop/start
+  would leak a closure (closed over a now-closed exporter) on every commit.
+  Instead a single stable indirection callback per family is registered
+  exactly once (`flowCBOnce` / `ipfixCBOnce`); it reads the live
+  `(exporter, *ExportConfig)` pair **lock-free** from an `atomic.Pointer`
+  bundle that reconcile swaps atomically. The daemon-held `*ExportConfig`
+  is the sole 1-in-N counter owner (the exporter never reads
+  `sampleCounter`), so it is held by pointer in the bundle.
+- **Boot:** the boot `applyConfig` runs before the EventReader exists, so
+  the apply-path reconcile no-ops at boot (eventReader-nil guard precedes
+  any hash store); the post-EventReader block first starts the exporters.
+  The exporter goroutine is parented to `d.daemonCtx`, so the explicit
+  `stopFlowExporter` / `stopIPFIXExporter` at shutdown stays authoritative
+  (the stop funcs now take the per-family reconcile mutex and are nil-safe).
+- **Transient-failure recovery:** a `NewExporter` create failure (e.g. a
+  pinned source-address bind before the source interface is up) leaves the
+  hash UNSET so the next commit retries, instead of gating a
+  permanently-dead exporter.
+
+## Plan + adversarial review
+
+Plan doc: `docs/pr/2075-flowexport-reconcile/plan.md`
+
+- Two independent hostile Claude plan reviewers: PLAN-NEEDS-MINOR (no kill);
+  all findings folded into plan v2 (boot load-bearing block, ctx
+  correction, per-family hashes, atomic.Pointer bundle, non-tautological
+
+*(truncated — 70 lines total)*
+
+
+---
+
+## PR #2102 — #2072: render+compile route-filter `upto /N` (bare le N) [MERGED] (merged 2026-06-20)
+
+Branch: `refactor/route-filter-upto`
+
+## Summary
+
+`from route-filter <prefix> upto /N` was silently ignored: the FRR
+renderer (`pkg/frr/policy_render.go`) had no `upto` case so it fell
+through to the default `le 32`/`le 128`, and the compiler
+(`pkg/config/compiler_routing.go`) never read the `/N` length token so
+`RouteFilter.UptoLen` stayed 0. Net: `upto /N` over-matched every
+more-specific down to /32 (/128), behaving identically to `orlonger`
+and discarding the operator's upper bound. This fixes both halves.
+
+- **Compiler:** parse the `/N` length into `UptoLen` (new
+  `parseRouteFilterLen` helper) from both AST shapes — brace parse
+  (`Keys[3]`) and flat-set SetPath (the route-filter node's first child
+  key). The inline path is patched belt-and-suspenders (dead code for
+  route-filter under the current schema).
+- **Renderer:** `upto /N` → bare `le N` (NO `ge`), mirroring the
+  existing `orlonger` case but capped at N. `upto /N == prefix-len`
+  renders as exact (bare prefix). FRR's prefix-list validator rejects a
+  `ge`/`le` value ≤ the prefix length ("len < ge-value <= le-value")
+  and a rejected line can fail the whole `frr-reload` — so the guard is
+  `UptoLen > plen` and invalid/missing lengths degrade safely to the
+  `orlonger` default, never an invalid line.
+
+`prefix-length-range` and `through` remain unrendered (a separate
+pre-existing gap; deferred to a follow-up — they need new struct
+fields). See `docs/pr/2072-route-filter-upto/plan.md`.
+
+## Plan + adversarial review
+
+Plan doc: `docs/pr/2072-route-filter-upto/plan.md`
+
+Round-1 plan review (Codex + a hostile Claude reviewer, the Gemini
+companion being down) BOTH returned **PLAN-NEEDS-MAJOR** on the same
+root cause: the v1 draft idiom `ge <prefix-len> le N` is wrong (FRR
+rejects `ge == prefix-len`). Folded into the plan before implementing:
+render bare `le N`, with `==prefix-len` → exact. Confirmed against FRR
+`filter.html`, pfSense FRR docs, VyOS T3133, FRR issue #9355. Codex's
+`/`-tokenization MAJOR was refuted empirically (`/24` is one lexer
+token in both AST shapes).
+
+## Test plan
+
+- [x] `go build ./...` clean
+- [x] `go vet ./pkg/config/... ./pkg/frr/...` clean
+- [x] `go test ./...`: all packages pass, 0 failures
+- [x] New compile tests (`pkg/config`): `TestRouteFilterUptoCompile_FlatSet`
+      (v4/v6/==plen), `TestRouteFilterUptoCompile_Brace`,
+      `TestRouteFilterMatchTypes_NonUptoUnchanged`
+- [x] New render tests (`pkg/frr`): `TestRouteFilterUptoFRR` (v4 `le 24`,
+      v6 `le 48`, ==plen→exact, UptoLen 0→degrade; each asserts no `ge`
+
+*(truncated — 62 lines total)*
+
+
+---
+
+## PR #2104 — #2008 H7: compile + validate security log profile / default-profile [MERGED] (merged 2026-06-20)
+
+Branch: `fix/2008-h7-log-default-profile`
+
+## Summary
+
+Closes the #2008 (vSRX parity) umbrella sub-gap **H7** — `security log
+profile <name>` / `default-profile`. The stanza was a **silent-drop**: a
+real imported config such as `vsrx-ha.conf`'s
+
+```
+security log {
+    profile default-syslog {
+        stream-name syslog-container;
+        category { session { field-extra-name hostname; } }
+        default-profile;
+    }
+}
+```
+
+parsed but was discarded before reaching typed structs (no `profile`
+schema child, no `compileLog` case), so it committed with no validation
+and no effect — the audit's operationally-dangerous silent-drop class.
+
+This compiles the stanza into typed `LogConfig.Profiles`
+(`LogProfile{Name, StreamName, DefaultProfile}`), declares the schema
+subtree (restoring `?` completion + commit-time recognition), and
+cross-references `stream-name` against the configured streams
+(`validateLogProfileStreamReferencesStrict`): a profile naming an
+undefined stream is rejected at commit / commit-check (strict) and
+downgraded to a warning on the tolerant load / peer-sync paths
+(`lenientLogProfileStreamRef`), mirroring the IPsec proposal/gateway
+cross-ref gates and the #1960 fail-closed-on-load doctrine.
+
+**No runtime/dataplane change.** xpf per-stream routing is already a
+Junos superset (every stream whose category/severity filter matches
+receives the event), so a profile's `stream-name` designates the stream
+that carries its events; the `default-profile` flag records the
+operator's default designation, and `category field-extra-name` is
+accepted for parity but not yet used to alter the emitted structured
+data. This does **not** close the #2008 umbrella (other Tier-2/3 gaps
+remain).
+
+## Plan basis
+
+`docs/research/2008-tier3/plan.md` (H7 = FEASIBLE-INCREMENT small),
+sharpened to the real grammar found in the imported `vsrx-ha.conf` (the
+audit row's "whole stanza absent" was inaccurate — the per-stream routing
+machinery already existed; the residual was the `profile` object + its
+`stream-name`/`default-profile`). Plan doc:
+`docs/pr/2008-h7-log-default-profile/plan.md`.
+
+## Test plan (control-plane — no dataplane smoke)
+
+
+*(truncated — 76 lines total)*
+
+
+---
+
+## PR #2107 — vrrp: force post-MAC-change ReconcileVIPs GARP past the 500ms dampener (#2081) [MERGED] (merged 2026-06-20)
+
+Branch: `fix/2081-reconcilevips-garp-dampener`
+
+## Summary
+
+Fixes #2081. `pkg/vrrp` `sendGARP` has TWO suppression gates: a per-epoch
+dedup (`garpEpoch`/`lastGARPEpoch`) and a 500ms time dampener
+(`garpDampened` over `lastGARPTime`). `ReconcileVIPs` is called after
+`programRethMAC` does a link DOWN/UP that changes the RETH virtual MAC
+(failover/failback), so peers hold a stale ARP/NA entry and the
+post-MAC-change GARP is critical. `ReconcileVIPs` bumped `garpEpoch` to
+defeat the epoch dedup — but did **not** touch `lastGARPTime`, so if any
+routine GARP fired in the prior 500ms (e.g. the `becomeMaster` burst that
+precedes the MAC reprogram), the **time dampener still silently dropped the
+critical correction burst**. Peers then blackholed traffic to the VIP until
+the stale ARP entry aged out.
+
+## Fix
+
+Thread a `force bool` through `sendGARP` and centralise both gates in a new
+network-free helper `garpSendAllowed(force, now)`:
+
+- `force=true` bypasses **only** the time dampener — the per-epoch dedup
+  still applies (a forced caller bumps the epoch first, so dedup only
+  suppresses a genuine duplicate for the same transition).
+- `ReconcileVIPs` → `sendGARP(true)` (post-MAC-change correction).
+- `becomeMaster` (incl. manual takeover via `ForceRGMaster`, which does
+  **not** change the MAC) → `sendGARP(false)`, so the 500ms storm-control
+  for rapid VRRP flaps is preserved unchanged.
+- `lastGARPTime` is still recorded on a forced send (spaces the next
+  *routine* GARP), but a forced send is never blocked by it.
+
+**Scope:** vrrp.Manager (RETH-VRRP) path only — the issue is filed against
+`pkg/vrrp` `sendGARP`/`ReconcileVIPs`. The no-RETH "direct" announce path in
+`daemon_apply.go` uses a separate `scheduleDirectAnnounce` mechanism and is
+out of scope for #2081.
+
+## Tests (`pkg/vrrp/instance_garp_force_test.go`)
+
+- **Seam tests** drive `garpSendAllowed` directly: forced send within 500ms
+  allowed; normal send within 500ms still dampened; normal send after the
+  window allowed; forced send still honours the epoch dedup; the full
+  `becomeMaster → epoch-bump → forced ReconcileVIPs` sequence allowed while
+  the same state on the non-forced path is dampened; plus `force` at epoch 0
+  and `force` under a backward wall-clock step (#1792 interaction).
+- **Caller-wiring tests** drive the real call sites with an empty VIP set (no
+  network I/O) and assert state advancement: `m.ReconcileVIPs()` emits within
+  the dampen window (force reaches the wire), respects `suppressGARP`, and the
+  non-forced `becomeMaster` path stays dampened. These catch an arg-swap that
+  would reintroduce #2081 while leaving the seam tests green.
+
+**Verified non-tautological:** neutralising the `force` bypass fails the two
+core seam tests; swapping `ReconcileVIPs` to `force=false` fails the
+
+*(truncated — 70 lines total)*
+
+
+---
+
+## PR #2108 — cluster: re-check heartbeat staleness after peer-timeout guard (#2080) [MERGED] (merged 2026-06-20)
+
+Branch: `fix/2080-heartbeat-staleness-recheck`
+
+## Summary
+
+Fixes #2080. In `pkg/cluster`, `handlePeerTimeout` runs its peer-timeout
+guard (`peerTimeoutGuardFn`) with `m.mu` released, then post-guard it
+re-checked only `m.peerAlive` — which is essentially always true at that
+point — instead of re-checking heartbeat **staleness**. A peer heartbeat
+that lands during the guard window advances the receiver's `lastSeen` and
+sets `peerAlive = true`, yet the peer was still marked lost, producing a
+spurious peer-loss and unnecessary failover churn.
+
+The fix adds a post-guard staleness re-check: a new
+`(*heartbeatReceiver).peerHeartbeatFresh()` re-reads `lastSeen` against
+the live monotonic clock (reusing `heartbeatStale` + the receiver's own
+`threshold*interval` timeout), and `handlePeerTimeout` aborts the
+peer-lost transition if a fresh heartbeat arrived during the guard. The
+abort returns **before** any state mutation, election, or fencing, so a
+live peer is never fenced or left half-cleared.
+
+**Failover-safe by construction:** `peerHeartbeatFresh` uses the *same*
+timeout that `timeoutLoop` used to declare staleness, and `MonotonicNanos`
+is forward-only — so once `timeoutLoop` fired, a re-check can only confirm
+stale unless a *real* heartbeat advanced `lastSeen`. A dead peer can never
+wrongly abort failover. A nil receiver / unset seam reports not-fresh, so
+every existing no-receiver call path behaves exactly as before.
+
+## Review (companions infra-degraded — independent hostile Claude reviewers)
+
+- Hostile Claude reviewer 1 (correctness/locking/TOCTOU/test-tautology): **MERGE-READY** — neutered the fix line and confirmed the key test FAILS pre-fix, then reverted clean. One cosmetic NIT.
+- Hostile Claude reviewer 2 (HA-semantics/failover-safety): **MERGE-READY** — independently derived that a dead peer cannot abort failover (monotonic-forward + identical receiver timeout source). Two NITs.
+- Maintainer SMR (contrarian final pass): **MERGE-READY** — re-derived failover safety from scratch; raised one MINOR (comment/commit over-emphasized "slow guard" when the window exists for any guard duration due to the lock release) which has been **folded in**. Other items NITs.
+
+## Test plan
+
+- [x] `go build ./pkg/cluster/` clean
+- [x] `go vet ./pkg/cluster/` clean
+- [x] `go test ./pkg/cluster/` passes
+- [x] Heartbeat/timeout path passes under `-race` with `-count=3`
+- [x] Full `pkg/cluster` suite passes under `-race` **except** the pre-existing `TestBulkEpochMismatchIgnored` test-side data race (bulk-epoch sync path; reproduces on clean origin/master; unrelated to this change)
+- [x] New tests are non-tautological: `TestHandlePeerTimeout_FreshHeartbeatDuringGuardWindow` FAILS against pre-fix code (verified by removing the re-check line); negative control + no-receiver default still mark the peer lost; receiver-backed `peerHeartbeatFresh` + `peerHeartbeatFreshLocked` wiring exercised directly
+- [x] `pkg/cluster/README.md` updated with the post-guard staleness re-check gotcha
+- [ ] **HA cluster `make test-failover` — PENDING the parent harness run** (this PR was driven without running cluster smoke / test-failover per the campaign division of labor; the parent runs the central test-failover before merge)
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #2109 — nat: implement runtime consumer for pool-utilization-alarm (#2079) [MERGED] (merged 2026-06-20)
+
+Branch: `engineer/2079-nat-pool-util-alarm`
+
+Closes #2079.
+
+`set security nat source pool-utilization-alarm raise-threshold/clear-threshold` was parsed and stored on `NATConfig.PoolUtilizationAlarm` but had **no runtime consumer** — an operator who configured it got silent no-op behaviour, contrary to vSRX where crossing the raise threshold raises a `show security alarms` entry + NAT syslog event, and dropping below the clear threshold clears it.
+
+This is the converged **Path B** from `docs/research/2079-nat-pool-util-alarm/plan.md` (r10). Closed entirely in the Go control plane: **no Rust change, no wire change, no new control-socket request.**
+
+## What ships
+
+- **`pkg/natpoolalarm`** — a slow (10s) daemon-resident `Monitor` over the helper's LAST-APPLIED NAT pool snapshot. Per rule-referenced non-deterministic pool it computes `UsedPorts*100/(AddressCount*(PortHigh-PortLow+1))` and applies hysteresis (raise `>=` raise-threshold, clear strict `<` clear-threshold). Sampler + emitter are dependency-injected (unit-testable without a live dataplane/syslog).
+- **Generation coherency (r10 fixed point)** — new Go-only `dp.AppliedNATView()` returns a single coherent `(config, counters)` pair from `m.appliedSnapshot {Config, Generation}`, captured (`markAppliedSnapshotLocked`) **only** at successful full-`apply_snapshot` publish/catch-up sites — the gen the helper echoes as `last_snapshot_generation`. The provable fixed point between `publishedSnapshot` (too loose: content-dedup no-ops + neighbor-regen advance it) and `lastSnapshot.Generation` (too strict: FIB/neighbor bumps make it permanently exceed the helper's gen → alarm never fires). Unavailable (helper down) or mid-apply → **HOLD all** (no data ≠ decision to clear).
+- **Eligibility is rule-referenced config** (the status producer is rule-derived). Last referencing rule removed (pool still configured) → pruned/cleared; rule-referenced pool transiently absent → HOLD. Deterministic pools skipped (block-based util is a follow-up). Pool statuses deduped by name (shared allocator → identical `UsedPorts`, take one, never sum).
+- **`show security alarms`** — BOTH render sites (gRPC `Server.showSecurityAlarms` + local-CLI `CLI.showSecurityAlarms`) render via a shared `natpoolalarm.RenderAlarms` helper (Class NAT, Severity Minor). Wired via `NATPoolAlarmsFn` / `SetNATPoolAlarmsFn`, mirroring `IPMonStatusFn`.
+- **Transition syslog** — one structured `RT_NAT NAT_POOL_UTILIZATION_ALARM_RAISED/..._CLEARED` line per transition (never per tick) via `logging.EventReader.ForwardLogMsg`.
+- **Commit-time validation** — `compileNAT` hard-rejects thresholds outside `0 < clear < raise <= 100` (bare `pool-utilization-alarm;` → raise=0/clear=0 always-firing; inverted/equal). Monitor also treats raise<=0 as disabled.
+
+The dead eBPF `nat_port_counters` path (reports garbage in userspace mode) is deliberately NOT used — the alarm uses the allocator snapshot. Fixing those legacy surfaces is a separate follow-up.
+
+## Validation
+- `go build ./...` + `go test ./...` green; `-race` clean on the two new packages.
+- Tests **mutation-verified non-tautological**: eligibility source (SourcePools vs rule-referenced), raise emit removal, updatePct no-op, validation-block removal, clear-on-unavailable, and the r9-bug coherency source each FAIL pre-fix.
+- Control-plane only; covered by Go unit tests (no dataplane smoke). HA-neutral (node-local derived state, no sync coupling).
+
+## Docs
+`docs/deterministic-nat-cgnat.md` (runtime behaviour), `docs/feature-gaps.md` (consumer done), `docs/config-schema.md` (#2079 validation), `pkg/natpoolalarm/README.md`.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+
+---
+
+## PR #2110 — #2103 + #2105: route-filter FRR-validity (longer max-len skip + prefix CIDR validation) [MERGED] (merged 2026-06-20)
+
+Branch: `refactor/2103-2105-route-filter-frr-validity`
+
+## Summary
+
+Two sibling route-filter FRR-validity bugs, both surfaced by the #2072
+(PR #2102, merged) hostile review and both in
+`pkg/frr/policy_render.go` `generatePolicyOptions` — fixed together to
+avoid a self-conflict in that file.
+
+- **Closes #2103** — `route-filter <prefix> longer` rendered
+  `ge <plen+1> le <maxLen>` even for a max-length prefix, producing an
+  FRR-invalid line (`10.0.0.0/32 longer` → `ge 33 le 32`: `ge 33` fails
+  FRR's prefix-list YANG range `0..32` and `ge > le`). "Strictly more
+  specific than a /32" is the empty set, so the entry is now **skipped**
+  (mirrors the #2102 `upto` `plen>=maxLen` guard). The boundary skips
+  ONLY `plen == max`, so `/31 longer` still emits the valid
+  `ge 32 le 32`.
+
+- **Closes #2105** — the `route-filter` schema node (`args: 2`) had no
+  `keyValidator`, so a malformed CIDR prefix committed silently and
+  reached the renderer as an FRR-garbage line (all match-types). A new
+  `ValidateRouteFilterArg` rejects a malformed prefix at commit /
+  commit-check (strict) while inheriting lenient-downgrade-on-load
+  (#1960), plus a render-side belt (`net.ParseCIDR`) backstops the
+  lenient load / HA-sync path.
+
+A rejected FRR line can fail the whole managed `frr-reload`
+(`frr-reload.py` applies the add-batch via a single `vtysh -f`),
+taking down ALL routing config — so both are reload-safety fixes.
+
+### Implementation notes
+- The post-loop `match ip/ipv6 address prefix-list` line is **always
+  emitted** for a term that declares any route-filter, with the address
+  family taken from the first **emitted** entry, else the first
+  **parseable** route-filter (a skipped `/32 longer` still names a real
+  family), else IPv4 (matching the `term.PrefixList` "unknown/empty
+  defaults to IPv4" default). It is NOT `RouteFilters[0]`-keyed.
+- When ALL entries in a term are skipped (every route-filter is a
+  max-length `longer` empty set, or every prefix is malformed) the
+  renderer writes **no** `ip/ipv6 prefix-list … permit` entry (a
+  materialised count==0 prefix-list is FRR `PREFIX_PERMIT`/match-ALL, so
+  the list name is never created) but **still emits the match line**
+  referencing the now-undefined list → FRR resolves it to NULL →
+  `RMAP_NOMATCH` (DENY) → the term matches nothing and stays
+  **fail-closed**. The match line must NOT be suppressed: a
+  `route-map … permit <seq>` with no match clauses is FRR match-ALL,
+  which would flip a `/32 longer` term to permit-everything (Copilot
+  #2110). This mirrors the existing `term.PrefixList` branch, which also
+  emits a match line for an unknown/empty list.
+- `prefix-length-range`/`through` are admitted as commit keywords (they
+  commit fine today; rejecting would regress the grammar) but remain
+  unrendered — a separate #2072 follow-up.
+
+*(truncated — 95 lines total)*
+
+
+---
+
+## PR #2111 — #2077: gate IPv4 TCP-segmentation TTL drop on fabric-ingress (v4/v6 symmetry) [MERGED] (merged 2026-06-20)
+
+Branch: `refactor/2077-fabric-ingress-v4-ttl-symmetry`
+
+## Summary
+
+Fixes #2077. The TCP-segmentation builders had a v4/v6-asymmetric
+TTL/hop-limit expiry gate. The **IPv4** arm dropped the segment
+**unconditionally** on `packet[8] <= 1` (TTL field), while the
+**IPv6** arm correctly gated the hop-limit==1 drop on
+`(meta.meta_flags & 0x80) == 0` — the NOT-fabric-ingress condition
+(`FABRIC_INGRESS_FLAG = 0x80`).
+
+Effect: a **fabric-ingress** oversized **IPv4** TCP segment that
+legitimately arrived with TTL==1 — because the peer chassis already
+decremented the TTL at its real ingress — was **wrongly dropped**,
+while the equivalent IPv6 segment was correctly forwarded.
+
+### Why v6 gates on fabric-ingress (and v4 must too)
+
+The fabric crossing is an internal cross-chassis redirect, **not an
+IP hop**. When a packet arrives over the fabric link the sending peer
+already performed the TTL/hop-limit decrement at its real ingress, so
+this node must NOT decrement again — and must NOT treat a
+legitimately-low arrived TTL as an expiry. Both the decrement AND the
+expiry drop are suppressed when `FABRIC_INGRESS_FLAG` is set. This is
+exactly what every other forwarding path already does
+(`frame/build/ipv4.rs`, `frame/build/ipv6.rs`, `frame/mod.rs`,
+`frame/rewrite/ipv4.rs`, `frame/rewrite/ipv6.rs`). The decrement just
+below the gate in the segmentation builders **already** checked the
+flag — only the IPv4 *expiry drop* forgot to, so v4 was the lone
+asymmetric site. See `docs/userspace-fabric-redirect-fix.md` §2.
+
+### Scope: both segmentation copies
+
+The dispatch path (`tx/dispatch/mod.rs`) uses two segmentation
+builders and both carried the identical bug:
+
+- `tx/tcp_segmentation.rs::segment_forwarded_tcp_frames_into_prepared`
+  — local-owner zero-copy fast path (tried first).
+- `frame/tcp_segmentation.rs::segment_forwarded_tcp_frames_from_frame`
+  — copy-path fallback (the file #2077 points at).
+
+Both are fixed with the same one-line gate
+`(meta.meta_flags & 0x80) == 0 && packet[8] <= 1`.
+
+No behavior change on the normal path: a non-fabric segment with
+TTL==1 is still dropped (TTL expiry), and a non-fabric segment with a
+healthy TTL still decrements normally.
+
+## Test plan
+
+- [x] `cargo build` clean (140 pre-existing warnings, all unrelated
+      dead-code).
+
+*(truncated — 87 lines total)*
+
+
+---
+
+## PR #2112 — dhcprelay: raw-L2 unicast OFFER/ACK for broadcast-flag-clear clients (#2076) [MERGED] (merged 2026-06-20)
+
+Branch: `engineer/2076-dhcp-relay-unicast`
+
+Closes #2076.
+
+## Problem
+
+The relay forwarded server replies on an ordinary `udp4` socket and, for a
+reply with the broadcast flag **clear** and a real `yiaddr`, unicast it to
+`yiaddr`. A client in SELECTING/REQUESTING has not yet configured the offered
+address, so the kernel's ARP for `yiaddr` goes unanswered and the OFFER/ACK is
+silently dropped — flag-clear clients (some Linux/Windows/embedded stacks) could
+never acquire a lease via the relay (RFC 2131 §4.1).
+
+## Fix (converged plan Option d)
+
+RFC-correct raw `AF_PACKET` L2 unicast by default + opt-in Junos `overrides
+always-broadcast` + automatic broadcast fallback. The relay honors the client's
+broadcast flag and **never regresses to undeliverable** (worst case is
+broadcast, which always works).
+
+Reply-destination matrix:
+
+| Condition | Delivery |
+|-----------|----------|
+| `overrides always-broadcast` | broadcast (operator override wins) |
+| broadcast flag **set** | broadcast (existing path) |
+| flag **clear**, real `yiaddr` | raw-L2 unicast to `chaddr` + `yiaddr` |
+| flag **clear**, `yiaddr==0`, real `ciaddr` | UDP-unicast to `ciaddr` (client owns the IP) |
+| flag **clear**, no `yiaddr`/`ciaddr` | broadcast (nothing routable) |
+| raw-L2 path fails/unavailable | broadcast fallback (+ alert counter) |
+
+### Raw-L2 sender (`pkg/dhcprelay/l2send_linux.go`)
+- Hand-rolled Ethernet(0x0800)+IPv4(proto 17, **header checksum computed**)+
+  UDP(67→68, **checksum 0** — legal for IPv4 per RFC 768, removes the
+  pseudo-header bug class). `garp.go` hand-roll pattern.
+- IPv4 source = the **saved interface giaddr** (what the server saw in the
+  relayed request), never the per-reply `GatewayIPAddr` field that `runRelay`
+  zeroes before sending.
+- **Per-send interface re-resolution** (ifindex + source MAC) — link flap /
+  dynamic recreate / VRRP `programMAC` cannot leave a stale ifindex or MAC.
+- Guards fall back to broadcast: non-Ethernet `htype`, non-6-byte `chaddr`,
+  over-MTU reply (raw path can't fragment), invalid IPs, `Sendto` error.
+- **Fail-soft open** (no `CAP_NET_RAW` → nil sender → broadcast, relay stays
+  up). TX-only fd kept **out** of the #1915 cancel watcher and closed
+  idempotently (`sync.Once`) only **after** `wg.Wait()`.
+
+### Config (Phase 2)
+`set forwarding-options dhcp-relay group <g> overrides always-broadcast` →
+`DHCPRelayGroup.AlwaysBroadcast`. The flat-set inline-interface consumer now
+treats `overrides` as a property boundary so it (and `always-broadcast`) are
+**not swallowed** into the interface list (the dual-AST swallow blocker); both
+block and flat-set shapes parse; schema offers the leaf for completion.
+
+*(truncated — 89 lines total)*
+
+
+---
+
+## PR #2113 — #2008 H9/H10: reject unsupported interface stanzas at commit [MERGED] (merged 2026-06-20)
+
+Branch: `refactor/2008-h9-h10-m1-commit-validation`
+
+## Summary
+
+Closes the H9 + H10 silent-drop quick-wins from the #2008 vSRX-parity triage. `interfaces <if> unit <n> family inet|inet6 policer arp <name>` (H9) and `interfaces <if> [unit <n>] mac <addr>` (H10) parse-accepted and were silently dropped on every binary — no schema child, no compiler case, no dataplane consumer. The userspace AF_XDP dataplane has no per-interface ARP policer (`feature-gaps.md` "Interface Policer ... Missing") and computes the cluster RETH MAC deterministically per node (`programRethMAC`), so a committed `policer arp`/`mac` is a false promise about enforcement/identity. They are now hard-rejected at commit / commit-check and downgraded to a warning on the tolerant load / peer-sync paths (#1960 fail-closed-on-load doctrine).
+
+**M1 (`commit persist-groups-inheritance`) is deliberately NOT in this PR.** It is already commit-warned + runtime no-op (not a silent drop), and its only remaining work is a large daemon group-membership-persistence feature — split to /research per the #2008 Tier-2 research disposition. M1's existing warning is untouched.
+
+This references #2008 (H9/H10); it does NOT close the umbrella.
+
+## Design
+
+`validateUnsupportedInterfaceStanzasAST` (`pkg/config/compiler_interfaces_unsupported.go`) is an AST pre-walk in `compileExpanded`, mirroring the existing reject-at-commit gates (`validateVRRPTrackInterfaceAST`, `validateTCPMSSRanges`). It is an AST pre-walk rather than a `SchemaValidate` typed leaf because `SchemaValidate` returns nil for unknown keywords by design and cannot reject an unknown stanza. A paired `compileOpts.lenientUnsupportedInterfaceStanzas` flag (set only in the two `*Lenient` entry points) downgrades to a warning. The walk runs after the inactive-prune + apply-groups expansion, so an `inactive:` stanza is ignored (#2008 H1) and an apply-groups-inherited stanza is caught. Detection is scoped to the `interfaces` stanza so the firewall `policer <name>` definition and chassis `device-map ... mac` identity key are untouched; the H9 matcher is precise to `policer arp` (not `policer input/output`). Both flat-set and hierarchical AST shapes handled.
+
+The stanzas are NOT given schema children: advertising a stanza that is then rejected would mislead. The honest contract for an unenforceable stanza is a commit rejection.
+
+## Plan + adversarial review
+
+Plan doc: `docs/pr/2008-h9-h10-m1-commit-validation/plan.md`
+
+- Codex plan review: **PLAN-NEEDS-MINOR** (task-mqmx7m0r-4nmff6) — confirmed reject-at-commit is the right disposition for H9/H10, M1 split-to-research correct, scoping sound, lenient warn-only-no-prune safe, no PLAN-KILL. All three minor points folded (citation reproducibility, dual-AST H9 tests added + passing, M1-vs-H9/H10 strictness rationale).
+- Gemini Code Assist companion is deprecated (client no longer supported) — second independent review to be dispatched by the maintainer.
+
+## Test plan (control-plane — no dataplane smoke)
+
+- [x] `go build ./...` clean
+- [x] `go test ./pkg/config/...` pass
+- [x] full `go test ./...` pass
+- [x] new gate tests 5/5 stable (flake check)
+- [x] non-tautological: neutering the validator fails every reject/warn test (proven pre-fix)
+- [x] dual-AST: flat-set (`ParseSetCommand`+`SetPath`) AND hierarchical (`NewParser`)
+- [x] `inactive:` and apply-groups-inherited paths covered
+- [x] non-regression: firewall `policer`, chassis device-map `mac`, unit `family inet filter`, `policer input/output` all left alone
+
+Regression coverage: `pkg/config/compiler_interfaces_unsupported_test.go`.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #2116 — #2114: fix NAT pool-alarm monitor data race on bootstrap-exit d.dp [MERGED] (merged 2026-06-20)
+
+Branch: `refactor/2114-natpoolalarm-bootstrap-race`
+
+## Summary
+
+The #2079 NAT pool-utilization-alarm monitor (PR #2109) launched a 10s
+background sampler goroutine whose closure reads the daemon's `d.dp`
+(`dataplane.RuntimeDataPlane`) interface field **without synchronization**.
+The monitor was started even in bootstrap mode (gated only on `d.dp != nil`,
+NOT on `!inBootstrap()`), where the bootstrap-exit path
+(`runBootstrapExitStartup`) writes `d.dp = nil` on a dataplane arm failure
+under `d.applySem` on the apply goroutine. Sampler read vs apply-goroutine
+write of the same non-atomic interface value is a data race per the Go memory
+model — the race detector flags it, and a torn interface read can panic or
+mis-resolve the sampler's type assertion. It requires bootstrap mode plus an
+arm failure on the first confirmed commit (the unhappy path of a fresh
+foreign-host install, #1922/#2079).
+
+## Fix (Option A — match how the daemon already guards `d.dp`)
+
+The codebase's invariant is: `d.dp` is written only on the boot/apply
+goroutine (under `applySem`), and a continuously-running reader must not be
+launched while a write can still occur. #2109 violated that by launching a
+continuous reader during the bootstrap window. This mirrors the existing
+dataplane `dp.Start()` bootstrap gate. Option B (a uniform `d.dp`
+mutex/accessor across ~40 readers) is the larger durable refactor the issue
+frames as separate, and is left out of scope.
+
+- **Edit 1 (boot start gate):** start the monitor only when `!inBootstrap()`
+  (via `maybeStartNATPoolAlarm`, which also checks `!NoDataplane` and
+  `d.dp != nil`).
+- **Edit 2 (bootstrap-exit start):** start the monitor at the tail of
+  `runBootstrapExitStartup`'s successful-arm branch — the single
+  bootstrap-exit pipeline shared by a local confirmed commit and a cluster
+  `SyncApply` (`applyConfigLocked`). `exitBootstrapMode` flips
+  `bootstrapMode=false` before this runs, so the gate passes.
+- **Edit 3 (rollback discard):** `enterBootstrapMode` (first-commit-timeout
+  rollback) now **stops AND discards** the monitor. The rollback Teardown()s
+  the dataplane but keeps `d.dp` non-nil and is reached after a successful
+  arm, so without this a stale sampler survives to race a later corrected
+  commit's re-arm-failure `d.dp = nil` write. Discard (not just Stop) because
+  `natpoolalarm.Monitor` is not restartable after `Stop()`; the next
+  successful re-arm builds a fresh one.
+- **Edit 0 (atomic pointer):** moving the start out of the single-threaded
+  boot window made `d.natPoolAlarm` runtime-mutated while the
+  `show security alarms` render reader (`natPoolAlarms`, wired into the
+  gRPC/CLI callbacks) reads it on request goroutines — a second race the fix
+  must not introduce. `d.natPoolAlarm` is now
+  `atomic.Pointer[natpoolalarm.Monitor]` and all access (start, stop+discard,
+  read, shutdown) is routed through helpers. `ActiveAlarms()` is itself
+  mutex-guarded inside the monitor.
+
+## Plan + adversarial review
+
+*(truncated — 83 lines total)*
+
+
+---
+
+## PR #2119 — config: merged-Keys overrides regression test for DHCP relay (#2115 item 2) [MERGED] (merged 2026-06-21)
+
+Branch: `refactor/2115-overrides-mergedkeys-test`
+
+## Summary
+
+Adds a **non-tautological** regression test for the #2076 DHCP-relay
+`overrides always-broadcast` boundary fix. The committed flat-set
+BLOCKER test (`TestDHCPRelayOverrides_FlatSet_NotSwallowed`) passes even
+with the #2076 fix reverted — because `ParseSetCommand`+`SetPath` split
+the four `set` lines into per-property sub-nodes, so the inline-`Keys[2:]`
+consumer in `compileDHCPRelay` never sees `interface` and `overrides`
+packed into one group node, which is the only shape that triggers the
+swallow. The flat-set test therefore does not actually guard the code
+path #2076 repaired.
+
+This PR adds `TestDHCPRelayOverrides_MergedKeys_NotSwallowed`, which
+builds the `forwarding-options dhcp-relay` node directly with a single
+**merged-Keys** group child —
+`Keys = [group lan interface ge-0/0/0.0 overrides always-broadcast]` —
+the packed shape the parser emits when a whole statement flattens into
+one node (the input `compiler_services.go:~1106` was written to handle).
+It drives `compileDHCPRelay` directly and asserts `AlwaysBroadcast=true`
+and `Interfaces==[ge-0/0/0.0]`.
+
+A second test (`_OverridesBeforeInterface`) pins the reverse packed
+token order as a complementary contract guard.
+
+**Pure test addition — no behavior change.** `compiler_services.go` is
+byte-identical to master (`git diff origin/master -- pkg/config/compiler_services.go`
+is empty).
+
+This is **item 2** of #2115. Item 1 (live flag0 wire-capture) remains
+lab-gated; this PR does not close the issue.
+
+## Non-tautology / mutation proof
+
+With the `keys[i+1] != "overrides"` boundary removed from the interface
+case (i.e. the #2076 fix reverted):
+
+- `TestDHCPRelayOverrides_MergedKeys_NotSwallowed` **FAILS** —
+  `AlwaysBroadcast=false`, `Interfaces=[ge-0/0/0.0 overrides always-broadcast]`.
+- `TestDHCPRelayOverrides_FlatSet_NotSwallowed` (the committed test)
+  still **PASSES** — confirming the tautology this PR fixes.
+
+## Test plan
+
+- [x] `go test ./pkg/config/` — full package passes
+- [x] new tests 5/5 flake-clean
+- [x] `go vet ./pkg/config/` clean
+- [x] mutation proof: reverting the #2076 boundary fails
+      `_MergedKeys_NotSwallowed` while `_FlatSet_NotSwallowed` keeps passing
+- [x] `compiler_services.go` confirmed byte-identical to master
+
+
+*(truncated — 55 lines total)*
+
+
+---
+
+## PR #2131 — #2125 #2126: IPsec swanctl render — IKE PRF for AEAD GCM + PSK/identity quote escaping [MERGED] (merged 2026-06-21)
+
+Branch: `fix/2125-2126-ipsec-swanctl-render`
+
+## Summary
+
+Two control-plane swanctl-render correctness fixes in `pkg/ipsec`
+(the file the issues cite as `ipsec.go` was split on master into
+`ike.go` / `policy.go`):
+
+- **#2125 — IKE PRF for AEAD GCM proposals.** strongSwan IKEv2 AEAD
+  (AES-GCM) proposals require an explicit PRF — an AEAD cipher carries
+  no integrity algorithm for strongSwan to derive a PRF from — so a GCM
+  IKE (Phase 1) proposal with no PRF is incomplete and the IKE SA fails
+  to negotiate (a silently-dead tunnel while the commit succeeds). The
+  IKE builders emitted `aes256gcm-modp2048` with no PRF; they now emit
+  `aes256gcm16-prfsha256-modp2048` (PRF mirrors the proposal's auth
+  alg, default `prfsha256`). The Junos GCM names are also canonicalized
+  to the explicit 16-octet-ICV tokens (`aes-256-gcm` -> `aes256gcm16`;
+  Junos AES-GCM uses a 16-octet ICV). Note: the original issue claimed
+  the bare `aes256gcm` token was unparseable — that is false (it is a
+  valid strongSwan keyword -> `ENCR_AES_GCM_ICV16`, verified in master
+  + 5.9.14), so the ESP canonicalization is a clarity fix; the IKE PRF
+  is the load-bearing correctness fix.
+
+- **#2126 — swanctl double-quote / backslash escaping.** A PSK or IKE
+  identity containing a literal `"` corrupted the generated secrets /
+  identity block (`secret = "pa"ss"` mis-parses). New
+  `escapeSwanctlQuoted` doubles backslashes then escapes double-quotes
+  (the swanctl settings lexer treats a bare `"` as the string
+  terminator and processes `\\`/`\"` inside quotes). Applied to the PSK
+  secret and the now-quoted `id =` / `certs =` identity lines (a DN with
+  spaces/commas now parses as one value). Composes with — does not
+  replace — the #1798 control-char belt.
+
+## Plan + adversarial review
+
+Plan doc: `docs/pr/2125-2126-ipsec-swanctl-render/plan.md`
+
+- Codex plan round-1: **PLAN-KILL** (task-mqn9xb9o-aaue4r) — correctly
+  refuted the "bare `aes256gcm` is unparseable" premise. Plan rewritten
+  to v2, load-bearing fix re-anchored to the IKE PRF, section-name
+  hardening scoped out as a follow-up. Re-review in progress.
+- Gemini plan round-1: infra failure (ACP timeout) — re-dispatched.
+
+## Test plan (control-plane only — no dataplane smoke)
+
+- [x] `go build ./...` clean
+- [x] `go test ./pkg/ipsec/... ./pkg/config/... ./pkg/grpcapi/... ./pkg/daemon/...` — all pass
+- [x] New regression tests (`swanctl_render_test.go`) verified
+      **non-tautological** — each fails when the fix is reverted:
+  - [x] GCM ESP/IKE render + mandatory IKE PRF + legacy/CBC unchanged
+  - [x] `escapeSwanctlQuoted` table (quote / backslash / order)
+  - [x] end-to-end PSK-with-quote, PSK-with-backslash, DN-identity
+
+*(truncated — 56 lines total)*
+
+
+---
+
+## PR #2132 — #2122/#2123: strip canonical /32-/128 mask before parsing static NAT + NAT64 addresses [MERGED] (merged 2026-06-21)
+
+Branch: `refactor/2122-2123-nat-cidr-parse`
+
+## Summary
+
+Static 1:1 NAT (#2122) and NAT64 source pools (#2123) silently dropped
+every rule/pool written in canonical Junos prefix form, because the Rust
+dataplane parsed the address with the bare std parser, which rejects CIDR
+notation. Same root cause, two modules — fixed together at the parse
+boundary, mirroring the existing SNAT-pool idiom in `nat/source.rs`.
+
+## Root cause (verified against source)
+
+- **#2122** `StaticNatTable::from_snapshots` (`userspace-dp/src/nat/static_nat.rs`)
+  parsed `external_ip`/`internal_ip` with `IpAddr::from_str`, which errors
+  on `"203.0.113.5/32"`. The Go compiler keeps the canonical mask
+  (`match destination-address X/32`, `then static-nat prefix Y/32`) and
+  `buildStaticNATSnapshots` copies it verbatim, so every rule hit the skip
+  arm: no 1:1 translation occurred AND the external IP was never registered
+  as a local address (`forwarding_build` iterates `external_ips()`), so
+  inbound traffic to it was not even recognized.
+- **#2123** `Nat64State::from_snapshots` (`userspace-dp/src/nat64.rs`)
+  collected the pool with `filter_map(|s| s.parse::<Ipv4Addr>())`. A
+  range-form pool (`address A to B`) is expanded by the Go compiler into
+  per-IP `/32` entries, so `filter_map` discarded all of them, leaving
+  `pool_v4` empty → `allocate_v4_source` returns `None` → NAT64 forward
+  translation non-functional.
+
+## Fix
+
+Strip the canonical host mask before the parse:
+`s.split('/').next().unwrap_or(s).parse()` — the exact idiom already used
+for SNAT pool addresses at `nat/source.rs:242`. Decided on the **parse
+side** (not Go): it composes with any caller, fixes both the translation
+maps and `external_ips()` local-address recognition in one place, and
+matches the established codebase idiom. These are exact host IPs, so
+stripping `/32` (`/128`) loses no prefix information. A genuinely
+malformed address still returns `None`/is filtered (skip path preserved);
+bare-IP configs are unaffected. Config-apply path only — no per-packet
+cost, no allocation (the strip returns a borrowed `&str`). The NAT64
+`/96` prefix parse is untouched (it already splits and validates).
+
+## Test plan
+
+- [x] cargo build clean (release)
+- [x] cargo test --release: full suite green except a pre-existing,
+  change-independent flake `afxdp::worker_queue::tests::concurrent_recovery_processes_each_command_exactly_once`
+  (reproduced 1/12 on pristine `origin/master` with no NAT changes;
+  branch does not touch `worker_queue`). All NAT tests deterministic.
+- [x] 6 new regression tests, each verified **non-tautological** (FAIL
+  pre-fix, pass post-fix): static v4/v6 `/32`-`/128`, static masked+bare
+  coexist, NAT64 `/32` range pool yields non-empty pool + round-robin
+  alloc, NAT64 mixed bare+masked, NAT64 malformed-still-dropped.
+
+*(truncated — 63 lines total)*
+
+
+---
+
+## PR #2133 — #2118: unify per-policy hit-count display gate across CLI/gRPC/Prometheus [MERGED] (merged 2026-06-21)
+
+Branch: `refactor/2118-policy-hit-count-display`
+
+## Summary
+
+Fixes #2118. `show security policies hit-count` (and `... detail`, the
+structured gRPC `GetPolicies` block, and the local-CLI table) read the
+per-rule hit counters **unconditionally**, while #2008 M4 had gated only
+the Prometheus collector on `cfg.Security.PolicyStatsEnabled`. The four
+display surfaces therefore disagreed. This PR gates all four on the same
+knob (display-only), so per-policy hit counts are shown only when
+`set security policy-stats system-wide enable` is configured (Junos
+default off) and read 0 uniformly otherwise.
+
+## Diagnosis (the issue is NOT a missing feature)
+
+The increment -> coordinator snapshot -> `policy_rule_counters` wire
+array -> Go `ReadPolicyCounters` chain is **intact end-to-end** and was
+already Go-unit-tested (verified by static reading + an independent
+second-pass agent). The observed "all 0" in the 2026-06-20 smoke was:
+
+1. **DENY rows = 0 is CORRECT.** The loss-cluster config has
+   `default-policy deny-all` and ONLY explicit permit rules. Blocked
+   traffic rode the implicit default-deny, which bumps the aggregate
+   `policy_deny` counter, not any per-rule counter. Not a bug.
+2. **The smoke ran with `policy-stats` OFF**, so 0 is the intended
+   Prometheus read per M4.
+3. **The genuine bug:** the display-gate inconsistency above (CLI/gRPC
+   text/structured surfaces ignored the knob while Prometheus honored
+   it). The permit-row 0 is also consistent with the single-flow
+   "0 is really 1" artifact (one new flow bumps a permit rule by exactly
+   packets=1).
+
+Fix = unify the gate (display-only; the Rust increment stays always-on,
+a single relaxed atomic). No wire-format change — the existing
+`policy_rule_counters` array (numeric, serde-default / omitempty) is
+reused, so old<->new compatibility is unaffected.
+
+## Flagged for decision (behavior left UNCHANGED)
+
+xpf **preserves** per-policy hit counts across a recompile as long as the
+stable `from-zone->to-zone/name` rule identity is unchanged; Junos
+**resets** per-policy counts on a commit that changes the policy. This PR
+keeps the preserve-on-recompile behavior (more useful for long-running
+rules) and documents the divergence in `docs/feature-gaps.md`. Change it
+only on an explicit decision.
+
+## Test plan
+
+- [x] `go build ./...` clean
+- [x] Go tests: pkg/grpcapi, pkg/cli, pkg/api, pkg/dataplane/userspace,
+      pkg/config — all pass (incl. the new gate tests + the M4 collector
+      test still green)
+
+*(truncated — 65 lines total)*
+
+
+---
+
+## PR #2135 — #2127: fix rtProtoName mislabeling of FRR route protocols [MERGED] (merged 2026-06-21)
+
+Branch: `refactor/2127-rtproto-name-mapping`
+
+## Summary
+
+`rtProtoName()` in `pkg/routing/routes.go` converts the kernel rtnetlink
+`rtm_protocol` byte into the xpf protocol name shown by `show route` (it
+feeds `protoTag()`/`junosProtoName()` in `pkg/routing/routeformat.go` and
+the `show route protocol <x>` filter in `pkg/cli/cli_show_routing.go`).
+Several switch arms were wrong against the real kernel/FRR constants:
+
+- **IS-IS (`RTPROT_ISIS=187`) had no case**, so isisd-installed routes fell
+  through to `default: strconv.Itoa(pi)` and displayed as the literal
+  `"187"` (`protoTag` -> `"?"`, `junosProtoName` -> `"187"`, and
+  `show route protocol isis` matched nothing) instead of `I` / `IS-IS`.
+- `case 11` (`RTPROT_ZEBRA`) was mislabeled `"ospf"`.
+- `case 12` (`RTPROT_BIRD`) was mislabeled `"isis"`.
+
+## Corrected mapping
+
+- Add `RTPROT_ISIS(187) -> "isis"`.
+- Keep `196 -> "static"`: `196` is FRR's private `RTPROT_ZSTATIC`
+  (`zebra/rt_netlink.h`); `zebra2proto()` maps
+  `ZEBRA_ROUTE_STATIC -> RTPROT_ZSTATIC(196)` and `proto2zebra()` reads
+  both `RTPROT_STATIC(4)` and `RTPROT_ZSTATIC(196)` back as
+  `ZEBRA_ROUTE_STATIC`. Expressed via a local `rtprotZStatic = 196`
+  const (no `golang.org/x/sys/unix` counterpart — it is FRR-private, not
+  a Linux UAPI constant). The old comment calling 196 "RTPROT_ZEBRA" was
+  wrong; corrected.
+- Drop `RTPROT_ZEBRA(11)` so it falls through to the numeric string — FRR
+  uses 11 for `ZEBRA_ROUTE_TABLE`/`ZEBRA_ROUTE_NHG`, not static, and xpf
+  has no Junos name for those. (Both the pre-fix `11 -> ospf` and the
+  first-cut `11 -> static` were wrong.)
+- Drop `RTPROT_BIRD(12)` (not emitted by FRR) so it falls through.
+- Express all arms via the named `unix.RTPROT_*` constants (numeric value
+  in a comment); previously-correct BGP/OSPF/RIP/KERNEL/BOOT/STATIC/DHCP
+  preserved.
+
+Constant values verified against `golang.org/x/sys/unix`,
+`/usr/include/linux/rtnetlink.h`, and FRR upstream
+`zebra/rt_netlink.{h,c}`. Display-only; no forwarding impact (LOW
+severity).
+
+## Plan + review
+
+Plan doc: `docs/pr/2127-rtproto-name-mapping/plan.md`. Codex round-1
+returned **PLAN-NEEDS-MAJOR** and correctly caught that `196` is FRR's
+`RTPROT_ZSTATIC` (so the original `196 -> static` arm was right and the
+first cut wrongly dropped it) and that `RTPROT_ZEBRA(11)` is not static.
+Both findings were verified against FRR source and folded in. The Gemini
+companion is unavailable (deprecated Code Assist personal tier); the
+independent second review is via AGY adversarial review.
+
+
+*(truncated — 67 lines total)*
+
+
+---
+
+## PR #2137 — #2129 + #2130: gate NetFlow v9 export on `version9`; remove dead Rust flow exporter [MERGED] (merged 2026-06-21)
+
+Branch: `refactor/2129-2130-netflow-impl`
+
+## Summary
+
+Two coupled NetFlow/IPFIX flow-export findings from the 2026-06-20 campaign-2 audit, driven via /research → /engineer per the converged PLAN-READY plan (`docs/research/2129-2130-netflow/plan.md`).
+
+Ground truth (verified against source): NetFlow v9 export WORKS today and is **Go-side** (`pkg/flowexport`, driven by `pkg/logging.EventReader` SESSION_CLOSE callbacks; lifecycle owned by `reconcileFlowExporters`, #2075/#2101). The Rust dataplane `FlowExporter` is **dead code** (constructed only by tests, never wired; `flow_export_config` is write-only). So these are a gating bug + dead code, not a broken feature.
+
+- **#2129 (gating, MEDIUM):** `BuildExportConfig` started a v9 exporter whenever `forwarding-options sampling` had a flow-server, ignoring whether `services flow-monitoring version9` was configured. An IPFIX-only operator therefore received an unrequested v9 datagram stream. **Fix:** gate `BuildExportConfig` on `svc.FlowMonitoring.Version9 != nil`, mirroring the existing `BuildIPFIXExportConfig` `VersionIPFIX != nil` guard. This is the **partial** fix — it stops the unrequested v9 stream; the both-versions double-export-to-one-collector case is deferred (see Follow-up).
+- **#2130 (dead code, LOW):** removed the never-wired Rust `FlowExporter` executable path (`flowexport.rs`, `flowexport_tests.rs`, `mod flowexport;`, the write-only `flow_export_config` field + its `forwarding_build` writer). Retained the `flow_export` snapshot **wire field** as documented-reserved (`#[allow(dead_code)]`) to preserve the #1977 decode-safety tests and avoid a cross-language protocol break (Path A / 5.2-keep from the plan; Path B — re-implementing the mature Go feature in Rust — was rejected).
+
+## Behavior change (release-note)
+
+A config with `sampling` + flow-server but no `flow-monitoring version9` stanza used to emit NetFlow v9. After this fix it does not (it must now declare `version9`, matching IPFIX's existing requirement and Junos semantics). Export is observability-only; no forwarding/traffic risk.
+
+## Follow-up (filed before merge, per plan §8)
+
+#2136 — flow-server configured with BOTH `version9` and `version-ipfix` still double-exports to one collector; needs per-flow-server version-binding + a commit-check warning. (References #2129.)
+
+## Plan + review
+
+- Converged plan: `docs/research/2129-2130-netflow/plan.md` (r3, CONVERGED / PLAN-READY; Claude SMR + 2 hostile reviewers).
+- Driven via /triple-review (engineer). Independent code reviewers dispatched separately; Copilot requested below.
+
+## Test plan
+
+- [x] go build ./... clean
+- [x] go test ./pkg/flowexport/... ./pkg/daemon/ ./pkg/dataplane/userspace/ — all pass
+- [x] #2129 regression guards `TestReconcileIPFIXOnlyDoesNotStartV9` + `TestReconcileV9RequiresVersion9Stanza` — **non-tautological**, verified by mutation (both FAIL when the gate is disabled, PASS with it)
+- [x] All 7 pre-existing v9-reconcile tests pass via the one base-helper edit; IPFIX-unaffected
+- [x] cargo build clean after Rust dead-code removal (no new flowexport warnings)
+- [x] #1977 decode-safety tests (`protocol/tests.rs` + Go `flow_wire_coerce_test.go`) still pass — reserved wire field intact
+- [x] dead-code grep gate clean: no `FlowExporter` / `FlowExportConfig` / `crate::flowexport` / `mod flowexport` / `flow_export_config` non-comment references remain
+- [x] full cargo suite 2076/2077 — the lone failure (`afxdp::worker_queue::concurrent_recovery_processes_each_command_exactly_once`) is a **pre-existing ~20%-rate concurrency flake** on a file byte-identical to origin/master, unrelated to flow export
+- Control-plane change (flowexport gating + dead-code removal) — **no dataplane smoke** required.
+
+## Docs
+
+`pkg/flowexport/README.md` (v9 presence gate + the known both-versions gap), `pkg/dataplane/README.md` (flow export is control-plane-only; dataplane emits no flow records), and the Go `buildFlowExportSnapshot` header (field reserved/ignored).
+
+Closes #2130. Partially addresses #2129 (primary harm; #2136 tracks the remainder).
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #2159 — #2128: stop screen session-limit tracker from leaking phantom zero entries (memory-DoS) [MERGED] (merged 2026-06-21)
+
+Branch: `refactor/2128-session-limit-leak`
+
+## Summary
+
+The screen session-limit tracker (`limit-session source-ip-based` /
+`destination-ip-based`) leaked an unbounded zero-count HashMap entry per
+distinct source/destination IP. `SessionLimitTracker::check_src` /
+`check_dst` read the per-IP count with `self.src_counts.entry(ip).or_insert(0)`,
+whose insert side effect permanently allocates an entry for every IP that
+reaches the screen stage on the ingress hot path — even when the packet
+never creates a session (spoofed-source flood, dropped-by-policy,
+stateless UDP/ICMP). These phantom entries are never reclaimed
+(`session_expired` only removes entries first incremented by
+`session_created`), so a many-distinct/spoofed-source flood grows the
+per-worker map without bound — a memory-exhaustion DoS, the precise
+inversion of the protection `limit-session` is meant to provide (issue
+#2128).
+
+**Fix (evict-on-zero / read-only check):** make `check_src`/`check_dst`
+strictly read-only — `get(&ip).copied().unwrap_or(0) >= limit`. An absent
+IP reads as 0 so the first attempt for a never-seen IP still passes,
+identical to the old freshly-inserted-zero behaviour; limit enforcement
+at the threshold is byte-for-byte equivalent. The count map is then
+populated only by `session_created` and pruned to empty by
+`session_expired` (which already evicts on count 0), bounding it to IPs
+with live sessions. The receiver is tightened `&mut self` -> `&self` so
+the read-only contract is **compiler-enforced** and the leak cannot
+silently regress.
+
+## Plan + adversarial review
+
+Plan doc: `docs/pr/2128-session-limit-leak/plan.md`
+
+- **Codex round-1: PLAN-KILL** (task `task-mqn9ue7w-e3kuyd`) — correct
+  and addressed. Codex found the v1 plan's premise ("count map already
+  maintained by create/expire") was false: production never calls
+  `ScreenState::session_created`/`session_expired` (only tests do; the
+  methods are `#[cfg_attr(not(test), allow(dead_code))]`). This surfaced
+  an **orthogonal latent defect** — session-limit enforcement is a no-op
+  in the dataplane because the lifecycle is unwired (the count is always
+  0). That is filed as **#2134** and is deliberately OUT OF SCOPE for
+  this security leak fix. The plan was revised to v2 to drop the false
+  premise and separate the two defects.
+- **Codex round-2:** re-review of the v2 plan + committed leak fix — in
+  progress.
+- **Independent second review (AGY):** to be dispatched by the parent
+  (the AGY MCP tool operates on the MCP workspace, not safely scoped to
+  this worktree from a sub-agent — flagged rather than risk a checkout
+  hijack).
+
+## Scope note
+
+
+*(truncated — 87 lines total)*
+
+
+---
+
+## PR #2163 — #2121: re-journal un-sent deletes on a full send queue (no silent drop) [MERGED] (merged 2026-06-21)
+
+Branch: `refactor/2121-flushdeletejournal-requeue`
+
+## Summary
+
+`flushDeleteJournal` (pkg/cluster/sync_conn.go) drained the bounded delete
+journal under lock (setting it nil) then replayed each delete via the
+non-blocking `queueMessage`. On a full `sendCh` (cap 4096) the un-sent deletes
+were **silently dropped** — the journal was already nil'd — leaving stale
+sessions on the HA peer until they aged out, defeating the journal's purpose
+(#2121, LOW severity).
+
+This makes the flush path mirror the already-shipped `QueueDeleteV4`/`V6`
+journal-on-failure contract: when `queueMessage` returns false (full queue or
+peer disconnect), re-journal the un-sent tail via the new `rejournalTail` and
+stop. `rejournalTail` FIFO-prepends the tail ahead of any deletes concurrently
+journaled during the flush and, on overflow, drops the oldest from the merged
+front (never the newer concurrent deletes), counting dropped entries in
+`DeletesDropped`. Non-blocking throughout — no timeout, no force-disconnect; the
+un-sent deletes replay on the next reconnect flush, exactly as `QueueDeleteV4`'s
+full-queue deletes already do.
+
+### Honest trade-off
+This converts an unrecoverable silent loss of a delete into bounded retention.
+It deliberately **widens** the pre-existing key-only-delete-kills-replacement
+exposure (a re-journaled delete replayed after a same-key replacement was synced
+can remove the replacement) from the `QueueDeleteV4` paths to the flush path.
+Fully closing that class requires a wire-protocol generation guard on deletes —
+**a follow-up issue will be filed.** Accepted across five adversarial plan-review
+rounds (v1/v2 plan-killed for ordering; v3/v4 needs-major for liveness/ordering;
+v5.1 plan-ready).
+
+## Plan + adversarial review
+
+Plan doc: `docs/pr/2121-flushdeletejournal-requeue/plan.md` (v1 → v5.1)
+
+- Claude-SMR (v5): PLAN-READY
+- Antigravity (v5): PLAN-READY
+- Codex (v5): NEEDS-MAJOR on the "never worse than drop" wording only (same
+  facts) → re-scoped honestly in v5.1
+
+## Test plan
+
+- [x] `go build ./...` clean
+- [x] `go test -race ./pkg/cluster/` green
+- [x] New tests (`pkg/cluster/sync_test.go`):
+  - [x] `TestDeleteJournalFlushRetainsTailOnFullQueue` — non-tautological
+        regression (verified to **fail** against the pre-fix silent drop)
+  - [x] `TestDeleteJournalFlushPartialThenRetains`
+  - [x] `TestRejournalTailFIFOPrependAndOverflow` — all three merge branches
+  - [x] `TestDeleteJournalFlushAllFit`
+  - [x] `TestDeleteJournalFlushOrderingWithQueuedSession`
+  - [x] new tests 5/5 flake-free under -race
+
+*(truncated — 62 lines total)*
+
+
+---
+
+## PR #2164 — #2153: relay DHCPINFORM, not just DISCOVER/REQUEST [MERGED] (merged 2026-06-21)
+
+Branch: `refactor/2153-dhcp-relay-inform`
+
+## Summary
+
+The DHCP relay's client→server forwarding loop (`runRelay`) gated on
+message type and `continue`d on everything that was not DISCOVER or
+REQUEST, silently dropping **DHCPINFORM**. Per RFC 2131 §3.4 a client
+that already holds an address (statically configured, or post-lease)
+sends DHCPINFORM to fetch supplemental parameters (DNS/domain/NTP); a
+relay agent must forward it. Dropping it leaves domain-joined endpoints
+on a relayed subnet without central configuration.
+
+This widens the gate to include `MessageTypeInform`, extracted into a
+pure `clientRequestRelayable` predicate for testability.
+
+## Reply path — no change required
+
+An INFORM is answered by the server with an **ACK**, which the
+server→client loop already permits (`handleServerResponses` gates on
+Offer/Ack). The #2076 reply-destination matrix already handles the
+INFORM-ACK shape: `yiaddr==0` with a real `ciaddr` takes the
+`ciaddrReal` case and UDP-unicasts to the client's own address (which it
+owns and ARP-answers for). Existing coverage:
+`TestDeliverReply_Matrix/flag0_no_yiaddr_ciaddr_unicast`.
+
+## Scope
+
+- `pkg/dhcprelay/relay.go` — gate widen + `clientRequestRelayable`.
+  DECLINE/RELEASE remain unrelayed (pre-#2153 behavior).
+- `pkg/dhcprelay/relay_test.go` — `TestClientRequestRelayable` (table)
+  + `TestRunRelay_RelaysInform` (drives a live INFORM through the real
+  `runRelay` loop). Both **fail against the pre-fix gate** (proven by
+  reverting) — non-tautological.
+- `pkg/dhcprelay/README.md` — relayed-message-type matrix + INFORM-ACK
+  reply route.
+
+## Test plan
+
+- [x] `go test -race ./pkg/dhcprelay/` — green
+- [x] New tests proven to FAIL pre-fix (gate reverted to DISCOVER/REQUEST only)
+- [x] `TestRunRelay_RelaysInform` 5/5 flake check (-race)
+- [x] `go vet ./pkg/dhcprelay/` clean
+- [x] `go build ./pkg/dhcprelay/ ./pkg/daemon/` clean
+- N/A loss-cluster smoke — control-plane relay change; live flag0
+  capture is lab-gated per #2115.
+
+Closes #2153.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #2165 — #2154: parseLeaseCSV must skip malformed lines, not abort whole file [MERGED] (merged 2026-06-21)
+
+Branch: `refactor/2154-parseleasecsv-skip-malformed`
+
+## Summary
+
+`parseLeaseCSV` (backing `show dhcp server leases` + REST/gRPC lease
+endpoints) read Kea's append-only memfile with a single
+`csv.Reader.ReadAll()`. Kea appends a row on every renewal / release /
+decline / expiry-reclaim concurrently with xpf reading, so the file can
+end on a torn last line. `ReadAll()` aborts on the FIRST malformed
+record and returns `(nil, err)`, blanking the entire lease display over
+one torn line — worst exactly when lease churn is highest.
+
+This replaces `ReadAll()` with a record-by-record `csv.Reader.Read()`
+loop: the first successful record is the header, a malformed row is
+logged at debug and SKIPPED, and `io.EOF` terminates normally.
+`FieldsPerRecord = -1` makes a short concurrent line a non-event, and
+`csv.Read()` recovers after a `*csv.ParseError` (verified empirically),
+so the skip loop terminates naturally rather than spinning.
+
+This is the **I/O-layer** companion to #2085, which made the per-record
+**semantics** lenient (dedup/expire/state) but left the **read**
+all-or-nothing. The #2085 dedup/tombstone/expire/state/order loop body
+is preserved verbatim — only record acquisition changes.
+
+## Plan + design
+
+Plan doc: `docs/pr/2154-parseleasecsv/plan.md` (empirical `csv.Read`
+semantics, behavioral-equivalence table vs `ReadAll`, risk assessment).
+
+## Test plan
+
+- [x] `go build ./...` clean (whole repo)
+- [x] `go test ./pkg/dhcpserver/` green (all #2085 dedup/expire/state/
+      leniency tests pass unchanged — fix does not regress them)
+- [x] `go test -race ./pkg/dhcpserver/ -run ParseLeaseCSV` clean
+- [x] New **non-tautological** `TestParseLeaseCSV_SkipsMalformedLine`:
+      malformed row in the middle (bare quote, csv recovers), torn quoted
+      field on the last line (canonical Kea append-in-progress), and a
+      short line. **Verified it FAILS against the pre-fix `ReadAll` code**
+      (`parse ...: bare " in non-quoted-field`) and PASSES with the fix.
+- [x] 5/5 flake check on the new test
+- [x] `go vet ./pkg/dhcpserver/` clean
+
+**No HA/cluster smoke** — control-plane lease-display path only (per
+issue disposition: "Smoke-class: standard (display path), no HA smoke
+required").
+
+## Docs
+
+`pkg/dhcpserver/README.md` updated: the display parser's leniency is now
+enforced at BOTH the semantic (#2085) and read (#2154) layers; contrasts
+with the DDNS parser's delete-safe reject-on-torn posture.
+
+*(truncated — 54 lines total)*
+
+
+---
+
+## PR #2166 — #2120: hold synced sessions on the standby wheel (forwarding-keyed HOLD) [MERGED] (merged 2026-06-21)
+
+Branch: `refactor/2120-standby-wheel-expiry`
+
+## Summary
+
+The STANDBY node silently expires long-lived peer-synced sessions whose
+idle timeout elapses with no local refresh; on failover the newly-promoted
+primary has no conntrack/session match and drops their return traffic as a
+brand-new connection (#131 reintroduced by the eBPF→userspace migration).
+
+This restores the dead Go-GC `IsLocalPrimary` standby-retention contract
+into the Rust per-worker timer wheel as a **per-RG forwarding-keyed HOLD**
+(converged-plan **Option B** — no control-plane re-sync, so #270's
+empty-sweep back-off and the >1/s control-socket contention guard are both
+preserved). The control-plane sync sweep is **unchanged**.
+
+## Mechanism (Option B)
+
+`expire_stale_entries_ha(now_ns, Some(ctx))` makes a three-way decision per
+idle-crossed entry before `remove_entry` (the `ha = None` standalone path
+ages everything exactly as before):
+
+- **SELF-HEAL** (edge) — peer-synced, this node now FORWARDS the RG, but
+  `seen_rg_epoch` predates the activation (`RefreshOwnerRGS` may not have
+  landed). Re-stamp `last_seen`, record the new epoch, re-bucket; fires
+  once per activation. `first_held_ns` left untouched (flapping-safe).
+- **HOLD** — this node does NOT forward the session (standby / demotion
+  window) and it is `peer_synced || node_active` (the "in a cluster" guard
+  that excludes a standalone node). Keys on **forwarding, not origin**, so
+  a still-`ForwardFlow` demotion-window entry is held too. `owner_rg_id<=0`
+  fabric/reverse uses the node-level `rg_epochs[0]` edge.
+- **AGE** — normal removal (active-node-owned, standalone, fabric-ingress,
+  or held past the ceiling).
+
+**Stale-synced ceiling** = `min(3 × expires_after_ns, ~7d)` measured from
+`first_held_ns` — bounds the lost-primary-delete leak. RELATIVE (a live
+long-`inactivity-timeout` session is never reaped on the standby before
+failover), ABS-capped (bounds the pathological `MaxDurationSeconds`),
+`first_held_ns`-based (a flapping RG's self-heal re-stamps can't reset it).
+
+**Epoch-before-publish ordering** (MANDATORY): `rg_epochs` for each
+activated/demoted RG plus the node-level `rg_epochs[0]` is now bumped
+BEFORE `rg_runtime.store` in `afxdp/ha.rs::update_ha_state`, so a worker
+that observes the active `rg_runtime` always observes the bumped epoch
+(never new-rg + old-epoch) — airtight self-heal. The duplicate after-store
+demote loop and the `handle_activated_rgs` activation loop are removed
+(one increment per transition).
+
+The afxdp-private HA-forwarding predicate
+(`HAGroupRuntime::is_forwarding_active`, lease-backed → fails CLOSED) is
+handed to the wheel as `ExpireHaContext` closures so afxdp types never leak
+into `crate::session`.
+
+
+*(truncated — 85 lines total)*
+
+
+---
+
+## PR #2167 — #2122/#2123 follow-up: reject non-host masks in NAT address parse (Codex + Copilot review) [MERGED] (merged 2026-06-21)
+
+Branch: `refactor/2122-2123-nat-mask-hardening`
+
+## Summary
+
+Follow-up to PR #2132 (the #2122/#2123 NAT canonical /32-/128 mask fix,
+merged at `66965bdff`). PR #2132 was **merged before this review-response
+commit landed**, so the lenient-parse hardening that both Codex and Copilot
+asked for is not yet on master. This PR carries just that hardening commit.
+
+The merged fix resolved the actual bugs (static NAT and NAT64 install rules
+written in canonical Junos /32-/128 form). However the initial strip
+(`s.split('/').next()`) accepted ANY suffix before the first slash, so a
+non-host mask or garbage — `203.0.113.5/24`, `100.64.0.7//32`,
+`addr/not-a-mask`, `addr/` — silently parsed as a bare host address rather
+than being dropped.
+
+Both reviewers independently flagged this (Codex MERGE-NEEDS-MINOR; Copilot
+two inline comments on `static_nat.rs` and `nat64.rs`). Static NAT and the
+NAT64 pool are exact host-IP mappings, so a non-host mask carries no
+representable meaning and would translate the wrong scope — surfacing the
+misconfiguration (drop) is safer than coercing it to a host route.
+
+## Change
+
+Harden both helpers to accept only a bare address or the canonical host mask
+(/32 for v4, /128 for v6) and reject anything else:
+- `static_nat.rs` `parse_nat_addr`: `splitn(2,'/')`, validate the mask matches
+  the parsed family's host length.
+- `nat64.rs` `parse_pool_v4`: bare or `/32` only (pool is v4).
+
+Not a behavior regression — pre-#2122/#2123 every masked form (including the
+legitimate /32) was already rejected by the bare parser. Real-world inputs
+from the Go compiler (bare + canonical /32-/128) are unaffected.
+
+## Test plan
+
+- [x] cargo build clean (release)
+- [x] All NAT tests: 313 passed, 0 failed
+- [x] New tests: `static_nat_non_host_mask_rejected` (v4 non-host prefix,
+  non-numeric, empty, double-slash, cross-family host length, v6 non-host),
+  `nat64_pool_non_host_mask_rejected` (bad entries filtered while a valid /32
+  survives)
+- [ ] Loss-cluster NAT smoke — pending parent-run (covered by /security-matrix)
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #2168 — #2152: VRRP gateway ARP probe must use the VIP as sender, not the primary IP [MERGED] (merged 2026-06-21)
+
+Branch: `refactor/2152-vrrp-arp-probe-vip-sender`
+
+## Summary
+
+`SendARPProbe` self-resolved its ARP sender protocol address from the
+interface address list (first non-link-local IPv4). On a RETH carrying
+both the node primary and the VRRP VIP, that selects the **primary**, so
+the post-failover unicast ARP probe to the gateway refreshed the
+gateway's cache for the primary and left the **VIP -> MAC** binding stale
+until it aged out (minutes) — blackholing VIP traffic against gateways
+that ignore gratuitous ARP, defeating sub-100ms failover. Both the
+`sendGARP` and `SendARPProbe` comments already said "use the VIP"; this
+was an intent/impl mismatch.
+
+Fix: make the sender explicit — `SendARPProbe(iface, senderIP, targetIP)`.
+`vrrp.sendGARP` and `daemon.directSendGARPs` now pass the in-scope VIP;
+the NUD_FAILED neighbor reprobe keeps interface-derived (primary) sender
+semantics via the new `cluster.PrimaryIPv4` helper.
+
+## Signature + callers
+
+- `pkg/cluster/garp.go`: `SendARPProbe(iface, senderIP, targetIP net.IP)`;
+  dead self-resolve loop extracted to `PrimaryIPv4(iface)`; raw send moved
+  behind an `arpProbeSend` package-var seam.
+- `pkg/vrrp/instance.go` `sendGARP`: passes `ip.To4()` (the VIP) via an
+  `arpProbeFn` seam. **(the core failover-correctness fix)**
+- `pkg/daemon/daemon_ha_vip.go` `directSendGARPs`: passes the VIP; also
+  adds the `skip-if-VIP-is-.1` guard for parity with `sendGARP` (review).
+- `pkg/daemon/daemon_neighbor.go` `cleanFailedNeighbors`: uses
+  `cluster.PrimaryIPv4` (preserves prior interface-derived sender; not a
+  VIP move).
+
+## Plan + adversarial review
+
+Plan doc: `docs/pr/2152-vrrp-arp-probe-vip-sender/plan.md`
+
+- Codex plan review (task-mqncaton-c1y329): **PLAN-NEEDS-MINOR** — all
+  minors resolved (call-site test seam; honest `PrimaryIPv4` naming;
+  `directSendGARPs` skip-.1 guard).
+- AGY adversarial plan review (adversarial-review-mqncbb5u-u4se03):
+  **PLAN-NEEDS-MINOR** — same minors resolved; confirmed caller-3
+  primary-IP is "100% correct". AGY-raised MASTER->BACKUP goroutine
+  state race is recorded DEFERRED/out-of-scope (pre-dates #2152, also
+  affects the existing GARP/NA burst).
+
+## Test plan
+
+Non-tautological: the crafted ARP frame's sender protocol address field
+(`pkt[28:32]`) is asserted to equal the VIP, via call-site seams that
+execute `sendGARP`/`SendARPProbe` and capture the frame — fails against
+the pre-fix self-resolve-to-primary behavior.
+
+
+*(truncated — 64 lines total)*
+
+
+---
+
+## PR #2169 — #2124: fix policy app-term unparseable-protocol fail-open (fail closed + parse named protocols) [MERGED] (merged 2026-06-21)
+
+Branch: `refactor/2124-protocol-failopen`
+
+## Summary
+
+Closes a verified **security fail-open** (#2124, 3/3 adversarial votes). A policy `permit` rule matching a user-defined `application` whose named L3 protocol the Rust matcher could not parse (`sctp`/`esp`/`ah`/`vrrp`/`igmp`/`pim`/`egp`) silently **failed OPEN to match-any** — the rule permitted ALL traffic for the zone pair instead of only the intended protocol. `parse_protocol` returned `None`, `parse_applications` dropped the term, and a rule whose terms all dropped collapsed to `CompiledApplications { match_any: true }`.
+
+Fix is three cohering layers (design driven through 3 Codex plan-review rounds, r1/r2 PLAN-NEEDS-MAJOR → r3 PLAN-READY):
+
+1. **Centralize** the named→number table in `appid.ProtocolNumber(name) (uint8, bool)` (cycle-safe leaf package). `pkg/dataplane.protocolNumber`, `pkg/appid.catalogProtocolNumber`, and the app-id runtime `protocolNumber` all delegate — eliminating the (formerly four) divergent copies. `(0, true)` preserves a deliberate `protocol 0`; `(0, false)` is the unrepresentable sentinel.
+2. **Rust matcher**: `parse_protocol` now maps the named IANA set to their numbers (esp=50, ah=51, sctp=132, vrrp=112, igmp=2, pim=103, egp=8 + `icmp6` alias) so those policies are honored. A rule whose `application_terms` are NON-empty but ALL drop now raises `SnapshotIntegrityError::UnrepresentableApplicationProtocol` → the preflight rejects the whole snapshot and keeps the previous good state. **Action-agnostic**: never turns a permit into match-any nor a deny into a pass. Genuinely-empty terms (`application any`) stay match-any, unchanged.
+3. **Go control plane**: `expandUserspacePolicyApplications` rejects any unrepresentable protocol OR port (`ForwardingSupported=false`, operator-visible refuse-to-arm) and canonicalizes the newly-supported names to their number on the wire (only those — tcp/udp/icmp/... keep their string so the snapshot hash is unchanged for existing policies). On a failed expansion `buildOneRuleSnapshot` emits a reserved `__unsupported__` **fail-closed sentinel** term instead of `nil` (nil reads as genuine match-any on the Rust side), closing the publish-before-disarm window Codex r2 identified.
+
+## Plan + adversarial review
+
+Plan doc: `docs/pr/2124-protocol-failopen/plan.md`
+
+- Codex round-1: PLAN-NEEDS-MAJOR (validateProtocol warning-only → gate load-bearing; action-blind never_match unsafe; duplicate maps) — addressed in v2
+- Codex round-2: PLAN-NEEDS-MAJOR (publish-before-disarm `nil`→match-any; import cycle) — addressed in v3
+- Codex round-3: PLAN-NEEDS-MINOR (2 doc consistency fixes) — all substantive checks pass; minors folded
+
+Self-review (SMR) additionally caught and fixed: port-alias case sensitivity must mirror Rust `parse_port_spec` exactly (was lowercasing), and a fourth divergent protocol table in `pkg/appid/runtime.go` (folded into `ProtocolNumber`).
+
+## Test plan
+
+- [x] `cargo build` clean
+- [x] `cargo test` full suite green (2 pre-existing concurrency flakes in unrelated `worker_queue` / `wg-engine` modules — proven flaky on clean `origin/master`, do not touch this code)
+- [x] 8 new Rust policy tests, 5/5 flake check; `policy::` module 57/57 deterministic (3x)
+- [x] Go suite: 49 packages pass; new gate/sentinel/parity tests + 5/5 flake
+- [ ] **Cluster smoke: NOT run here.** Hot-path/security change — the parent runs the `/security-matrix` directional smoke (trust→untrust ALLOW, untrust→trust BLOCK, plain forwarding throughput) after merge. **Smoke pending parent-run.**
+
+Non-tautological tests: a named sctp/esp policy permits its protocol and DENIES TCP (pre-fix TCP was wrongly permitted); an all-unparseable term list and the `__unsupported__` sentinel both raise the integrity error (pre-fix returned Ok with a match-any rule); the Go gate fails closed on unknown protocol / malformed port (pre-fix `ok=true`).
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #2171 — #2145: screen/SYN-cookie L3 offset on tag presence, not VID>0 (priority-tagged VLAN-0) [MERGED] (merged 2026-06-21)
+
+Branch: `refactor/2145-vlan-present`
+
+## Summary
+
+The userspace screen stage and the SYN-cookie-ACK stage computed the L3
+offset with `if meta.ingress_vlan_id > 0 { 18 } else { 14 }`
+(`poll_stages.rs:276/377`). 802.1p **priority-tagged** frames carry a
+real 802.1Q tag (TPID 0x8100, PCP bits) but with **VID 0**; the shim
+sets `ingress_vlan_present=1`, `ingress_vlan_id=0` for them. The
+VID-based test therefore picked offset 14 (untagged) and
+`extract_screen_info` read the IP header from the tag's TPID/TCI bytes
+— **LAND / SYN-frag / flood misclassification**, and the SYN-cookie
+challenge **skipped or computed from corrupted bytes** (HIGH, security).
+
+This switches both offset decisions to `meta.ingress_vlan_present != 0`
+(tag presence), matching `tx/cos_classify.rs` and the production frame
+parser `frame_l3_offset` (which already keys on the TPID, returning 18
+regardless of VID).
+
+Narrow correctness fix only. The broader `afxdp/l2` `L2Tag` /
+`l3_offset_from_meta` centralization is deferred to **#2150**. Egress
+frame builders (`egress.vlan_id`, `write_eth_header`) keep `vlan_id > 0`
+— there VID 0 == untagged is the correct, intended semantic.
+
+## Sites switched to `ingress_vlan_present`
+
+- `userspace-dp/src/afxdp/poll_stages.rs:276` — `stage_screen_check`
+- `userspace-dp/src/afxdp/poll_stages.rs:377` — `stage_screen_syn_cookie_ack_on_session_miss`
+
+These are the only two `vlan_id > 0` L3-offset decisions on the ingress
+screen path (all other `vlan_id > 0` sites are egress builders — left
+unchanged).
+
+## Property-strategy extension
+
+Decoupled tag presence from VID so `present=true, vid=0, pcp>0` frames
+are generatable (the old `present = (vid != 0)` derivation masked this):
+
+- `PacketSpec` gains `vlan_present: bool` + `pcp: u8`.
+- `build_valid_frame` emits the 802.1Q tag on `vlan_present` (not VID)
+  and sets `ingress_vlan_present` / `ingress_pcp`.
+- new `arb_vlan_tag()` generates untagged / normal-tagged /
+  priority-tagged-VID-0; egress `arb_vlan()` kept as `u16`.
+
+## Test plan
+
+- [x] `cargo build` clean
+- [x] `cargo test --no-run` clean (all test binaries)
+- [x] New `poll_stages` regression test
+  `priority_tagged_vlan0_screen_stage_parses_l3_at_offset_18`:
+  - tagged VID-0 SYN → `stage_screen_check` trips `ip-source-route`
+    only if `ip_ihl` is read at offset 18; untagged control still uses 14
+
+*(truncated — 67 lines total)*
+
+
+---
+
+## PR #2172 — #2138: abort commit on persistent-SNAT (and any required) helper protocol-gate mismatch [MERGED] (merged 2026-06-21)
+
+Branch: `refactor/2138-snat-protocol-abort`
+
+## Summary
+
+Fixes #2138 (HIGH, fail-open at commit). When the Rust AF_XDP helper is too old for a committed feature, `Manager.ApplyConfig` fail-closes the helper (disarms forwarding) and returns a protocol-incompatible sentinel. The daemon's `compileErrorMustAbortApply` decided whether that aborts the commit — but it matched **only** `ErrPolicySchedulerProtocolIncompatible`, so the sibling `ErrPersistentSourceNATProtocolIncompatible` fell through: a persistent-source-NAT config committed against a too-old helper **disarmed the dataplane but still promoted/persisted the commit** — the operator saw a "successful" commit against a dead dataplane (silent forwarding outage).
+
+The fix makes the abort set **table-driven and co-located with the sentinels**: a new `dpuserspace.IsRequiredProtocolGateError` predicate walks `requiredProtocolGateSentinels` (both gates today), and `compileErrorMustAbortApply` delegates to it. Any future `ensureRequiredSnapshotProtocolLocked` gate is covered the moment its sentinel joins the list — the omission this bug was cannot silently recur.
+
+**Lenient-load (#1960) preserved by construction.** The abort predicate only changes behavior for callers that *propagate* the apply error. The boot apply (`daemon_run.go` → void `applyConfig`) and peer config-sync (`daemon_ha_sync.go` → `syncAndApply`, caller logs+continues) use the swallowing wrapper, so an already-persisted or peer-synced persistent-SNAT config against an old helper still boots through (warn + disarmed helper, **not a brick**). Only the operator-facing commit path (`commitAndApply` / `commitConfirmedAndApply`) surfaces the abort. The protocol mismatch is an apply-time runtime condition, not an `ErrConfigCompile`, so it never enters the #1960 fail-closed-on-compile boot classification.
+
+## Plan + adversarial review
+
+Plan doc: `docs/pr/2138-snat-protocol-abort/plan.md`
+
+- **Codex r1: PLAN-NEEDS-MINOR** (task `task-mqncndt4-e3uon9`). Premise holds, no PLAN-KILL, independently verified there is no restart/peer-sync brick regression. Three minors folded: (1) remove now-unused `errors` import from `daemon_apply.go`; (2) tighten "abort commit" wording (the abort makes the commit-RPC result non-nil; store promotion already happened — accepted scheduler-gate contract); (3) generalize two comments that named only the scheduler sentinel.
+- **Gemini companion is decommissioned** ("no longer supported for individuals — migrate to Antigravity"). AGY is the substitute second reviewer, dispatched on this PR's diff.
+
+## What changed
+
+- `pkg/dataplane/userspace/manager.go` — `requiredProtocolGateSentinels` list + exported `IsRequiredProtocolGateError`.
+- `pkg/daemon/daemon_apply.go` — `compileErrorMustAbortApply` delegates; unused `errors` import removed; comment generalized.
+- `pkg/daemon/daemon_snmp_reconcile_test.go` — comment generalized.
+- Tests + docs (see below).
+
+## Test plan
+
+- [x] `go build ./...` clean (pre-existing `daemon_flowexport.go` vet warnings only — present unchanged on master).
+- [x] `go test ./pkg/dataplane/...` — green.
+- [x] `go test ./pkg/daemon/...` — green.
+- [x] `go test ./pkg/configstore/... ./pkg/cluster/...` — green.
+- [x] New `TestIsRequiredProtocolGateError` (userspace) — both gates bare+wrapped, nil/unrelated rejected.
+- [x] Extended `TestCompileErrorMustAbortApply` (daemon) — persistent-SNAT bare+wrapped aborts; nil does not.
+- [x] New `TestApplyConfigLockedAbortsCommitOnPersistentSourceNATProtocolMismatch` — commit path RETURNS the sentinel (aborts).
+- [x] New `TestApplyConfigLenientWrapperSwallowsPersistentSourceNATProtocolMismatch` — void wrapper logs+swallows, releases applySem (lenient-load half).
+- [x] **Non-tautological confirmed**: the predicate + commit-abort tests FAIL against a scheduler-only abort set (`error = <nil>, want ErrPersistentSourceNATProtocolIncompatible`); the lenient test correctly still passes (lenient behavior is unchanged by the bug).
+
+### No CoS/iperf smoke matrix — by design
+
+This is a Go control-plane commit-policy change. It does not touch the Rust dataplane, the AF_XDP fast path, the CoS classifier/shaper, or any forwarding code; the loss-cluster CoS smoke matrix exercises none of the changed lines. Validation is the deterministic unit-test gate above (commit aborts / load is lenient). Declining the throughput smoke with a reason rather than skipping silently.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #2174 — diag: fix CLI ping/traceroute double-prefixing the VRF device (#2143) [MERGED] (merged 2026-06-21)
+
+Branch: `fix/2143-ping-vrf-double-prefix`
+
+## Summary
+
+Fixes #2143. The interactive CLI ping/traceroute diagnostic
+double-prefixed the routing-instance VRF device. `buildPingArgv` /
+`buildTracerouteArgv` in `pkg/cli/cli_request.go` prepended `vrf-`
+unconditionally, so `run ping 192.0.2.1 routing-instance vrf-red`
+executed `ip vrf exec vrf-vrf-red ping ... -- 192.0.2.1` against a
+non-existent device — a false diagnostic failure. The REST
+(`pkg/api/system.go`) and gRPC (`pkg/grpcapi/server_diag.go`) handlers
+already normalized the name (add `vrf-` only when absent), so the same
+routing-instance behaved differently per control surface.
+
+## Fix
+
+Per the issue's suggested approach, introduce a shared `pkg/diagcmd`
+that owns the diag argv construction once:
+
+- `VRFDeviceName(name)` maps a Junos routing-instance name to its kernel
+  VRF master device, applying the `vrf-` prefix **exactly once** (bare →
+  prefixed, already-prefixed → unchanged, empty → empty). The
+  const-backed prefix is now the only place `vrf-` is written for diag.
+- `PingArgv` / `TracerouteArgv` build the full argv (VRF wrapping +
+  `-c`/`-I`/`-s` + the `#2084` `--` end-of-options separator).
+
+All three surfaces are now thin wrappers over these builders, so the
+argv is byte-for-byte identical across CLI, REST, and gRPC. REST/gRPC
+behavior is unchanged; the CLI is corrected. This also removes the
+triple-duplication that forced #2084 to be applied three times.
+
+`grep` confirms the `vrf-` prefix is applied in exactly one place after
+the fix (`const vrfPrefix` in `pkg/diagcmd/diagcmd.go`); all other hits
+in the diag builders are comments.
+
+## Tests
+
+- `pkg/diagcmd/diagcmd_test.go` — table-driven exact-argv assertions
+  (`reflect.DeepEqual`) over with/without-VRF × bare/already-prefixed ×
+  ping/traceroute × v4/v6, plus `VRFDeviceName` directly.
+- `pkg/cli`, `pkg/api`, `pkg/grpcapi` argv tests each gain a #2143
+  regression case asserting an already-prefixed `vrf-red` yields the
+  device `vrf-red`, not `vrf-vrf-red`.
+- Regression-proofed: temporarily re-introducing the double prefix in
+  `diagcmd` fails all four packages on exactly the `already-prefixed`
+  cases; reverting restores green.
+
+## Validation
+
+```
+GOCACHE=/dev/shm/cache GOTMPDIR=/dev/shm go build ./...   # clean
+go test ./pkg/diagcmd/... ./pkg/cli/... ./pkg/api/... ./pkg/grpcapi/...  # all ok
+
+*(truncated — 71 lines total)*
+
+
+---
+
+## PR #2177 — userspace-dp: enforce per-IP screen session-limit at new-flow (#2134) [MERGED] (merged 2026-06-21)
+
+Branch: `refactor/2134-screen-session-limit-enforce`
+
+## Summary
+
+The screen session-limit (`set security screen ids-option <name>
+limit-session source-ip-based <n>` / `destination-ip-based <n>`) was a
+**no-op** in the userspace dataplane. `check_src`/`check_dst` consulted a
+per-IP count that **nothing in production ever incremented**
+(`session_created`/`session_expired` were called only from tests). The
+production count was always 0, so `count >= limit` never fired and the
+(limit+1)-th session was always admitted. An operator who configured the
+limit got zero protection. #2159 had already made the count read
+read-only, closing the phantom-zero leak (**#2128**, already CLOSED);
+this PR wires the actual enforcement and keeps the read non-mutating, so
+turning the now-live feature on cannot reintroduce that leak.
+
+This is the converged r3 plan
+(`docs/research/2128-2134-screen-session-limit/plan.md`, Path B), one PR,
+`userspace-dp` only — no Go, no eBPF.
+
+- **Count owned by `SessionTable`.** Incremented at the two create
+  transitions — the fresh-install choke point
+  (`install_with_protocol_with_origin`) and the in-place HA promote
+  (`update_session` promote branch) — and decremented at the two remove
+  transitions — the sole removal sink (`remove_entry` success path:
+  expire / clear / RST / fabric-cancel / take_synced_local) and the
+  in-place HA demote (`demote_owner_rg`, before the origin flip). All
+  four sites share the counted-class predicate `!is_reverse &&
+  !origin.is_peer_synced() && !origin.is_transient_local_seed()`, the
+  same predicate that gates the HA Open delta. Evict-on-zero keeps the
+  maps bounded by distinct IPs with ≥1 live counted session.
+- **Check relocated to the new-flow / session-MISS decision** in
+  `poll_descriptor` (`new_flow_session_limit_drop`), NOT the per-packet
+  screen stage. The screen stage runs on every data packet before the
+  session lookup; a `count >= limit` test there would re-evaluate an
+  established flow's own counted session and self-drop it at the limit
+  boundary. The new-flow check fires once per new flow, dominates both
+  counted install sites (LocalMiss + ForwardFlow), reads the count via a
+  non-mutating query, and emits the `session-limit-{src,dst}`
+  screen-drop event + counter.
+- **#2128 stays fixed by construction**: the new-flow check reads the
+  count via a non-mutating query, so an IP that never installs a session
+  never gets a map entry — turning the live feature on does not
+  reintroduce the phantom-zero leak.
+- **OFF-gate + clear-on-disable**: `set_session_limit_active` driven from
+  the applied screen-profile snapshot at startup + runtime reload. OFF =
+  zero maintenance cost on install/remove for the ~99% of deployments
+  with no `limit-session`. ON→OFF clears both maps so a re-enable can't
+  resume from stale over-counted values.
+- Retired the dead `ScreenState` session-limit tracker (per-packet
+  sub-check, `session_created`/`session_expired` wrappers, the
+  `SessionLimitTracker` field) and deleted `screen/session_limit.rs`.
+
+*(truncated — 100 lines total)*
+
+
+---
+
+## PR #2178 — #2148: walk IPv6 ext-header chain in frame/tcp.rs inspection helpers [MERGED] (merged 2026-06-21)
+
+Branch: `fix/2148-frame-tcp-ipv6-exthdr`
+
+Fixes #2148.
+
+## Problem
+
+`frame_has_tcp_rst`, `extract_tcp_flags_and_window`, and
+`extract_tcp_window` in `userspace-dp/src/afxdp/frame/tcp.rs` hard-coded
+the IPv6 TCP header at L3+40 (`6 if ip.len() >= 40 => (ip[6], 40usize)`),
+ignoring IPv6 extension headers. Any IPv6 TCP flow carrying a hop-by-hop,
+routing, fragment, or dest-opts header had its RST flag / flags+window
+read from **inside the extension header** instead of the real TCP header,
+so operator-visible RST and zero-window diagnostics became wrong on those
+flows. The same module already walks the chain correctly elsewhere
+(`clamp_tcp_mss`, `parse_tcp_reply_source` via
+`packet_rel_l4_offset_and_protocol`).
+
+## Fix
+
+Route all three helpers through the existing ext-aware
+`packet_rel_l4_offset_and_protocol` walker (no new parser written — reuse
+the shared one). It returns the true L4 offset after the IPv6
+extension-header chain plus the final protocol, is bounded (≤6
+iterations), allocation-free (**no per-packet heap**), and fails safe on
+a truncated / malformed / looping chain (returns `None` → "no RST" /
+"flags unknown"). IPv4 and plain (no-ext-header) IPv6 behavior is
+unchanged; the IPv4 path additionally gains the walker's `ihl >= 20`
+validation (strictly safer, fires only on malformed IPv4).
+
+## Where the ext-header walk happens
+
+`packet_rel_l4_offset_and_protocol` in `frame/inspect.rs` — the single
+source of L4-offset truth shared with the MSS clamp and the SYN-cookie /
+reject-RST reply builders.
+
+## Callers that benefit
+
+`cos/queue_service/service.rs`, `poll_descriptor/rx_telemetry.rs`,
+`poll_descriptor/mod.rs`, `frame/build/mod.rs` (RST corruption check),
+`tx/transmit/mod.rs`, `tunnel.rs` (inner-frame inspection). All read-only
+diagnostics/telemetry today.
+
+## Hot-path classification
+
+Diagnostics/telemetry-only at present (rx telemetry and tx transmit run
+per-frame, but read-only with no allocation). Routing through the shared
+walker adds no per-packet heap allocation and removes the standing hazard
+that the next caller turns the fixed-40 read into a real dataplane
+decision bug.
+
+## Tests
+
+
+*(truncated — 72 lines total)*
+
+
+---
+
+## PR #2179 — state_writer: fsync fallback file and parent dir on both paths (#2147) [MERGED] (merged 2026-06-21)
+
+Branch: `fix/2147-state-writer-fallback-fsync`
+
+## Summary
+
+Fixes #2147. The userspace `state_writer`'s sync fallback (`persist_sync`,
+used when io_uring is unavailable — e.g. a container that blocks it) wrote the
+temp file via `fs::write` and renamed it with **no file fsync at all**. The
+io_uring path fsync'd the temp file but **neither path fsync'd the parent
+directory** after the rename. On power loss the fallback could leave the
+snapshot empty or torn, and either path could lose the rename (the dirent
+change) itself. This is the Rust-side equivalent of the Go configstore
+crash-safety contract.
+
+## Fix
+
+Extract one shared durable finalizer, `finalize_durably`, that both write
+transports route through:
+
+1. fsync the temp file (data + metadata to stable storage),
+2. atomically `rename` it onto the destination,
+3. fsync the parent directory so the rename survives power loss.
+
+io_uring is now only the write *transport*, not a separate durability
+protocol. The fallback opens the temp file with `OpenOptions` and writes
+through the same `File` handle so it can fsync it before the rename. Any
+step's error propagates, so a caller never believes a snapshot is durable
+when an fsync failed and the rename may be lost.
+
+## Tests
+
+Added a `sync_all` test seam (a function-pointer hook; production always uses
+`real_sync_all`) and four unit tests:
+
+- `fallback_persist_fsyncs_file_and_parent_dir` — the fallback fsyncs exactly
+  the temp file + the parent dir.
+- `finalize_durably_fsyncs_file_and_parent_dir` — pins the shared contract
+  directly.
+- `file_fsync_failure_is_propagated_and_does_not_rename` — a temp-file fsync
+  failure aborts before the rename; the destination keeps its prior bytes.
+- `parent_dir_fsync_failure_is_propagated` — a parent-dir fsync failure
+  surfaces.
+
+Per the #1968 durability-test discipline, the tests are **mutation-verified**:
+deleting either fsync from `finalize_durably` makes them fail (confirmed
+locally — removing the parent-dir fsync fails 3/4, removing the file fsync
+fails 4/4).
+
+## Validation
+
+- Full `userspace-dp` test suite green: 2094 + 46 + 8 + 16 + 1 passed, 0 failed.
+- The four new tests pass 5/5 flake runs.
+- Release build clean (no new warnings; the previously-unused alias warning is gone).
+
+*(truncated — 65 lines total)*
+
+
+---
+
+## PR #2180 — event-options robustness: transactional batch, cooldown survives reload, strict attributes-match, fail-safe queue (#2139/#2140/#2141/#2157) [MERGED] (merged 2026-06-21)
+
+Branch: `fix/2139-eventoptions-cluster`
+
+## Summary
+
+Implements the converged event-options robustness cluster plan
+(`docs/research/2139-eventoptions-cluster/plan.md`): four interlocking
+defects in `pkg/eventengine` that make RPM-triggered
+`change-configuration` remediation unsafe. Control-plane correctness only
+— no forwarding/HA/VRRP/session-sync touched, so no cluster smoke
+required per the plan disposition.
+
+Closes #2139, #2140, #2141, #2157.
+
+## What each bug was and how it's fixed
+
+### #2139 (HIGH) — non-transactional batch
+`executeCommands` applied each `then` command best-effort and committed
+whatever subset succeeded, so a typo in the middle of a multi-command
+remediation committed a **half-applied** config. Reworked into
+validate-then-commit-or-discard on the existing candidate (the candidate
+IS the rollback — no new transaction primitive): pre-classify
+`ThenCommands` into a typed plan *before* touching the candidate, apply
+every op, validate the whole candidate with `CommitCheck()`, then commit
+through `CommitFn`. **Any** failure discards the candidate
+(`ExitConfigure`) — never a partial commit. A `delete` of a missing path
+stays a tolerated (documented) exception.
+
+### #2140 (HIGH) — cooldown/window state wiped on every Apply
+The daemon calls `Apply` on every commit, including the engine's own
+remediation commit, and `Apply` unconditionally recreated the
+window/lastTrigger maps — so a policy erased its **own** cooldown the
+instant it remediated, and unrelated operator commits wiped every
+policy's within-window memory. Split runtime state from immutable config
+and **reconcile** it on `Apply` (the proven `pkg/ipmon` pattern): carry
+state forward when `(policy name, semantic revision)` is unchanged, reset
+for new/changed/removed policies. Cooldown is armed on a **successful
+commit** (not at evaluate) so a dropped/queued action does not consume
+it. The within window is pruned on every append (latent unbounded-growth
+leak this change owns).
+
+### #2141 (MEDIUM-HIGH) — fail-open attributes-match
+A malformed line (no ` matches ` / no `.`) or an unknown `<field>` was
+silently dropped, **broadening** the policy while commit succeeded.
+Strict-reject at commit (`ValidateEventAttributesMatchStrict`), lenient
+downgrade-to-warning on LOAD (mirrors #2008 M7 / #1960), fail-**closed**
+at runtime for legacy loads (#2124 doctrine — a typo'd policy now *stops*
+firing rather than over-fires). One SSOT (`EventAttributesKnownFields`)
+shared by validator + runtime matcher, with a drift-guard test.
+
+### #2157 (MEDIUM) — remediation dropped on held config lock + cross-probe race
+`executeCommands` dropped the action with only a warning when the config
+lock was held, and `fireEvent` runs on per-probe goroutines so two
+
+*(truncated — 91 lines total)*
+
+
+---
+
+## PR #2181 — #2136: NetFlow per-flow-server export-version binding (no double-export) [MERGED] (merged 2026-06-21)
+
+Branch: `fix/2136-netflow-per-server-version`
+
+## Summary
+
+Fixes #2136 — the deferred per-flow-server version-binding half of the
+NetFlow gating work (the unrequested-v9-stream half shipped in #2129).
+
+When a `services flow-monitoring` flow-server was reachable under BOTH
+the global `version9` and `version-ipfix` stanzas, `BuildExportConfig`
+(v9) and `BuildIPFIXExportConfig` (IPFIX) each flattened *every*
+flow-server into their own collector set. The daemon then started both
+exporters against the same collector `address:port`, each with its own
+`SESSION_CLOSE` callback and its own independent 1-in-N sample counter,
+so every sampled flow was exported **twice** to one socket: one NetFlow
+v9 (version 9) datagram and one IPFIX (v10) datagram, with mismatched
+selection.
+
+Junos binds each flow-server to exactly one export version + template.
+This PR makes xpf honour that binding so a given collector receives at
+most one version's datagrams.
+
+## What changed
+
+- **Config model + parser** (`pkg/config`): `FlowServer` gains `Version`
+  (`version9` | `version-ipfix` | `""` unbound) and
+  `VersionIPFIXTemplate`. The compiler now parses the per-server
+  `version-ipfix { template … }` / `version-ipfix-template …` selectors
+  (it previously parsed only the v9 selectors and discarded any IPFIX
+  one). Schema declares the new leaves so completion + the commit-walk
+  don't drop them.
+- **Exporter collector loops** (`pkg/flowexport/manager.go`): new shared
+  `resolveFlowServerVersion` + `collectVersionCollectors` route each
+  flow-server to a single version's set. The v9 builder skips
+  IPFIX-bound servers and vice versa; the duplicated dedup loop is
+  collapsed into `dedupeCollectors`.
+- **CLI + docs**: `show` displays the per-server IPFIX template;
+  `pkg/flowexport/README.md` + `docs/config-schema.md` document the
+  binding and resolution order.
+
+## Both-versions semantics (and why)
+
+`resolveFlowServerVersion`:
+
+1. An **explicit per-server selector wins** — but only if the matching
+   global stanza is configured (it supplies the template
+   timeouts/fields). A server pinned to a version whose global stanza is
+   absent exports nothing and does **not** silently fall back.
+2. An **unbound** server inherits the single configured global version.
+3. An **unbound** server with **both** globals set resolves to **IPFIX**
+   (documented precedence). IPFIX (v10) is the IETF-standard superset of
+   NetFlow v9, so an operator who turned both on but did not pin the
+   collector gets the modern protocol — and, critically, **exactly one
+
+*(truncated — 102 lines total)*
+
+
+---
+
+## PR #2182 — #2173: reject non-host static-NAT/NAT64 mask at commit [MERGED] (merged 2026-06-21)
+
+Branch: `fix/2173-staticnat-host-mask-commit`
+
+## Summary
+
+Follow-up to #2122/#2123/#2132 + PR #2167. Static NAT is strictly host-1:1 and
+NAT64 source-pool entries are discrete host source IPs, so the only meaningful
+mask on a static-NAT match/prefix or a NAT64 pool address is the canonical host
+mask (`/32` for IPv4, `/128` for IPv6; a bare address is a host too).
+
+#2132 made the Rust dataplane TOLERATE the canonical host mask; PR #2167 then
+hardened the Rust parser (`parse_nat_addr` in `userspace-dp/src/nat/static_nat.rs`,
+`parse_pool_v4` in `userspace-dp/src/nat64.rs`) to REJECT a non-host mask
+(`/24`, `/64`, garbage suffix). The net effect before this PR was a **silent
+dataplane drop**: a misconfigured `/24` match/prefix or pool address was
+parsed-out and the rule was never installed, with no operator feedback.
+
+This PR adds the missing **commit-time** validation in the Go config compiler so
+the operator learns at `commit` / `commit check`, not via a silent dataplane
+drop.
+
+## Change
+
+`validateNATHostMaskStrict` (`pkg/config/compiler_nat.go`), invoked from the
+typed-config phase of `compileExpanded` alongside the other strict-vs-lenient
+gates. The host-route rule mirrors the Rust gate EXACTLY via a shared predicate
+`isHostMaskAddress` (bare IP OK, `/32` v4 OK, `/128` v6 OK, anything else
+rejected; a cross-family mask is non-host; a non-IP token is left to existing
+address handling).
+
+Scope and exemptions match the Rust gate:
+- static-NAT `match destination-address` (→ `ExternalIP`) and `then static-nat
+  prefix` (→ `InternalIP`) are host-checked.
+- **NPTv6** (`nptv6-prefix`) rules are exempt — genuine RFC 6296 prefix
+  translation, never run through `parse_nat_addr`.
+- **NAT64** (`then static-nat inet`) rules are exempt as a whole — the `match` is
+  the NAT64 well-known prefix (e.g. `64:ff9b::/96`) and translation is driven by
+  the separate NAT64 snapshot, not the static_nat table.
+- NAT64 source-pool addresses (`parse_pool_v4` host-mask gate) are host-checked.
+  Range-expanded pool entries are always `/32` by construction, so only an
+  operator-authored single non-host pool address can trip this.
+
+Strict-vs-lenient split (same doctrine as `#2079` pool-utilization-alarm):
+- **Strict (`commit` / `commit check`):** hard-reject, naming the rule-set,
+  rule, slot, and offending prefix.
+- **Lenient (`Store.Load` / HA peer-sync — `CompileConfigLenient` /
+  `CompileConfigForNodeLenient`, flag `lenientNATHostMask`):** downgrade to a
+  `cfg.Warnings` entry so a node that committed a non-host mask before this gate
+  existed (or a peer-synced config) still BOOTS after upgrade instead of failing
+  closed (#1960 fail-closed-on-compile-failure). The dataplane drops the bad
+  entry independently, so a leniently-loaded config is already inert for that
+  rule.
+
+
+*(truncated — 76 lines total)*
+
+
+---
+
+## PR #2184 — flowexport: build IPv6 collector addresses with net.JoinHostPort (#2183) [MERGED] (merged 2026-06-21)
+
+Branch: `fix/2183-flowexport-ipv6-joinhostport`
+
+Fixes #2183.
+
+## Problem
+
+The flow-export collector destination address was built with
+`fmt.Sprintf("%s:%d", fs.Address, fs.Port)` (`pkg/flowexport/manager.go`)
+and the local source-bind address with `c.SourceAddress+":0"`
+(`pkg/flowexport/transport.go`). For an IPv6 literal both forms leave the
+address unbracketed (`2001:db8::9:4739` / `2001:db8::1:0`), which
+`net.ResolveUDPAddr` / `net.Dial` cannot parse. A `services
+flow-monitoring` collector (or `source-address`) configured with an IPv6
+address therefore failed to resolve/dial and IPv6 NetFlow/IPFIX export
+silently did nothing. IPv4 collectors were unaffected.
+
+Pre-existing — #2181 moved the `manager.go` site verbatim and did not
+introduce or worsen it. Surfaced by the Copilot inline + independent
+review of PR #2181, filed as a follow-up so #2136 could merge.
+
+## Fix
+
+Use `net.JoinHostPort` (with `strconv.Itoa` for the port) at both
+address-build sites. `JoinHostPort` brackets an IPv6 host
+(`[2001:db8::9]:4739`) and leaves an IPv4 address as `host:port`. Both
+the v9 (`BuildExportConfig`) and IPFIX (`BuildIPFIXExportConfig`)
+collector sets funnel through `collectVersionCollectors`, so the single
+destination-side fix covers both protocols; the `transport.go`
+source-address site is the only sibling and shared the identical bug.
+
+## Tests
+
+- `TestCollectorAddress_IPv6IsBracketed` drives the real v9 + IPFIX
+  builder paths with an IPv4 and an IPv6 flow-server, asserting
+  `1.2.3.4:4739` (unchanged) / `[2001:db8::9]:4739` (bracketed) and that
+  `net.ResolveUDPAddr` accepts both.
+- `TestCollectorAddress_NoPortLeavesBareAddress` covers the `Port==0`
+  bare-address path (unchanged by the fix).
+- `TestDialCollectors_IPv6SourceAddressResolves` exercises the
+  source-bind sibling fix through the existing dial/resolve seams.
+
+All three FAIL against the pre-fix code (verified by reverting the fix
+and re-running) and pass after. IPv4 sub-cases pass either way.
+
+## Acceptance
+
+- IPv6 flow-collector address produces `[addr]:port`;
+  `net.ResolveUDPAddr("udp", addr)` succeeds; unit tests cover v4 + v6;
+  IPv4 behavior unchanged. ✓
+
+## Validation
+
+
+*(truncated — 58 lines total)*
+
+
+---
+
+## PR #2185 — #2142: reject invalid referenced application port/protocol at commit (fail-closed) [MERGED] (merged 2026-06-21)
+
+Branch: `fix/2142-appid-invalid-spec-reject`
+
+## Summary
+
+Closes the **application-DEFINITION** layer of the fail-open class #2124
+closed at the policy-app-term layer (#2142, MEDIUM-HIGH, verified not a
+duplicate of #2124).
+
+A user-defined `set applications application <name>` whose
+`destination-port` / `source-port` was malformed (non-numeric, out of
+`1..65535`, or an inverted `low>high` range) or whose `protocol` was
+unknown was only **WARNED** at commit (`ValidateConfig`). Commit
+succeeded, the dataplane app-id compiler recorded the AppID name and then
+`continue`d past the unparsable port — a **never-match AppID** — and a
+policy referencing it failed **CLOSED** on a `permit` rule or fell through
+**OPEN** on a `deny` rule. This is a control-plane fail-open automation
+gap: an operator (or pipeline) sees a successful commit while the firewall
+silently does not enforce the intended rule.
+
+### Fix
+
+`validateApplicationSpecsStrict` (`pkg/config/compiler.go`), wired into
+`compileExpanded` with the established strict-vs-lenient downgrade (new
+`lenientApplicationSpecs` opt, set on both lenient compilers — mirrors
+`lenientPolicyMatchAddress` / `lenientNATHostMask`):
+
+- **Strict on commit / commit-check** — hard-reject a malformed spec, but
+  ONLY for applications actually referenced by a zone-pair or global
+  policy (directly, or as a member of a referenced application-set), OR for
+  every user application when `services application-identification` is
+  enabled (app-id compiles them all into the catalog). This is the
+  referenced-vs-unreferenced distinction the issue explicitly calls for.
+- **Unreferenced + app-id disabled stays a warning** — such an app matches
+  nothing, so its malformed spec cannot break a live policy decision. This
+  keeps an operator iterating on a not-yet-wired application library
+  unblocked, and preserves existing configs that carry an unreferenced app
+  with a port form the policy matcher cannot represent (e.g. a
+  `source-port 0-N` range, which Rust `parse_port_spec` rejects on
+  `low==0`).
+- **Lenient on load / peer-sync** (#1960 / #2008 no-brick) — downgrade the
+  error to a warning so an already-persisted or peer-synced config
+  carrying a bad referenced app still BOOTS. The dataplane independently
+  skips the bad port and the #2124 runtime capability gate
+  (`expandUserspacePolicyApplications`) fails the snapshot closed
+  (`ForwardingSupported=false`) for a referenced app it cannot represent,
+  so the leniently-loaded bad app is inert rather than silently
+  mis-matching.
+
+**Single SSOT, no new table.** The gate reuses `validatePortSpec` /
+`validateProtocol` — the same config-layer validators that produced the
+warning — so no sixth divergent port/protocol table is introduced
+(#2124's `appid.ProtocolNumber` and the Rust `parse_port_spec` gate remain
+
+*(truncated — 90 lines total)*
+
+
+---
+
+## PR #2188 — VRRP cluster: IPv6 ext-header RX tolerance (#2155) + orphan-free UpdateInstances (#2156) [MERGED] (merged 2026-06-21)
+
+Branch: `fix/2155-vrrp-cluster`
+
+Fixes #2155 and #2156. Two independent VRRP-manager defects from
+agy-review-016, implemented per the converged PLAN-READY plan
+(`docs/research/2155-vrrp-cluster/plan.md`). One PR, two bisectable
+commits (build clean at each boundary).
+
+## #2155 — IPv6 VRRP adverts with extension headers were dropped (LOW)
+
+The AF_PACKET RX path assumed every IPv6 VRRP advert had a bare 40-byte
+base header. The cBPF prefilter matched the IPv6 base Next-Header against
+112 at a fixed offset (a chained advert's base Next-Header is the first
+ext-header's type, so `jeq 112` failed and the kernel dropped the frame),
+and `parseAfPacketIPv6` hardcoded `ipv6HeaderLen = 40` and sliced the VRRP
+payload inside the ext-header. The IPv4 arm already walks IHL — a real
+IPv4/IPv6 asymmetry that could make a non-xpf IPv6 VRRP speaker invisible
+→ split brain.
+
+**Fix (approach A2):**
+- cBPF: the IPv6 arm (untagged + 802.1Q) matches the base Next-Header
+  against `{112, 0, 43, 60, 44}` instead of 112 only. Any conformant VRRP
+  advert — bare or chained — starts with one of these; ordinary IPv6
+  TCP/UDP/ICMPv6/ND stays kernel-dropped on a data-bearing RETH VLAN
+  (e.g. `reth0.80`). IPv4 + 802.1Q demux byte-identical except re-derived
+  jump targets.
+- `parseAfPacketIPv6`: a bounded `walkIPv6ExtHeaders` finds the real
+  proto-112 payload offset. HBH/Routing/Dest-Opts use `(HdrExtLen+1)*8`
+  byte units; AH uses `(PayloadLen+2)*4`; Fragment (44) is a hard drop
+  (fragmented VRRP is non-conformant); capped at 8 iterations, bounds-
+  checked every step (no loop, no OOB).
+
+The raw `ip6:112` fallback is unaffected. AH/fragmented VRRP out of scope
+on both paths.
+
+## #2156 — UpdateInstances orphaned an RG on transient link/socket failure (MEDIUM)
+
+The "VIPs changed → restart" branch stopped+deleted the working instance
+**before** building the replacement, then `continue`d on
+`InterfaceByName`/`openSocket` error — orphaning the RG out of VRRP
+election with no retry until an operator re-commit.
+
+**Fix (Option A + B1):**
+- **Build-before-teardown**: resolve iface, construct, seed track state,
+  and open the socket (the proof step) on a local `vi`; on any failure
+  keep the old instance running and advertising its old VIPs. Only after
+  the socket opens do we stop the old, swap in, and start `run()` (commit
+  step). `openSocket` does not start `run()`, so the two run-loops never
+  overlap for a key (no double-run). No placeholder state, so
+  `RGVRRPReady`/`States`/`InstanceStates`/`Status` stay truthful — a
+  non-running placeholder can't fool the HA takeover gate.
+- **2s re-drive**: `reconcileRGState` now calls a new
+  `reconcileVRRPInstances()` (recompute desired set from active config,
+
+*(truncated — 107 lines total)*
+
+
+---
+
+## PR #2189 — #2146: fail-closed the screen extractor on a truncated IPv6 fragment header [MERGED] (merged 2026-06-21)
+
+Branch: `fix/2146-ipv6-frag-screen-failclosed`
+
+## Summary
+
+Fixes #2146 (HIGH, security-adjacent fail-closed correctness — IDS
+evasion). A SYN-bearing IPv6 frame whose extension-header chain is
+truncated before the FRAGMENT header is reached used to **pass** the
+`syn-frag` screen instead of being dropped.
+
+`extract_screen_info()` (`userspace-dp/src/screen/extract.rs`) bounded
+its IPv6 extension-header walk but, on running out of captured bytes,
+silently `break`d out of the loop and returned defaults with
+`is_first_fragment=false`. The stale code comment even told operators
+to "keep the BPF screen path enabled upstream" — a mitigation that no
+longer exists: the legacy BPF dataplane was retired (#1373) and its
+source deleted (#1476). With no upstream component left to drop the
+malformed frame, the Rust screen path **failed OPEN** for the exact
+fragmentation-based attack it claims to defend against.
+
+## Fix (fail-closed)
+
+- `extract_screen_info()` now returns `Result<ScreenPacketInfo,
+  ScreenParseError>`. Every place the IPv6 walk runs out of bytes (the
+  mandatory 40-byte base header is short, an extension header's
+  declared length runs past the captured frame, or the FRAGMENT header
+  is truncated) returns `Err(ScreenParseError::TruncatedIpv6ExtChain)`.
+  The legacy BPF `parse_ipv6hdr` returned `-1` (drop) on the same
+  condition — the extractor is now the only enforcement point.
+- Both production screen poll stages (`stage_screen_check` and the
+  SYN-cookie ACK session-miss stage) map `Err` to a **drop**: emit a
+  `ScreenDrop` event with the new `ip-malformed` reason, bump
+  `screen_drops` (batched per the existing #1187 DDoS discipline), and
+  recycle the frame. Both already gate on `screen.has_profiles()`, so
+  the fail-closed drop only applies where a screen profile is
+  configured for the ingress zone.
+- New `SCREEN_IP_MALFORMED` (1 << 18) **event reason** bit distinguishes
+  a malformed-frame drop from `syn-frag` in the event payload. It is a
+  drop-reason only, NOT a configurable screen-profile flag, so it
+  deliberately stays out of the `dataplane.ScreenFlagNames` config-flag
+  map (no Go-side wire/parity change).
+- Legitimate walk terminations (found upper-layer / found FRAGMENT /
+  unknown next-header / MAX_EXT_HDRS bound) keep their benign `break`
+  and BPF parity. The IPv4 path is unchanged — its L4 flags come from
+  metadata, not this walk; the reported bug is IPv6-specific, so IPv4
+  is intentionally left as-is to avoid dropping legitimate short frames.
+- Removed the stale "keep the BPF screen path enabled" comment.
+
+## Where the drop happens
+
+`userspace-dp/src/screen/extract.rs` returns `Err` on the truncated
+chain → `userspace-dp/src/afxdp/poll_stages.rs::stage_screen_check`
+turns the `Err` into `RecycleAndContinue` (drop) + `ip-malformed`
+
+*(truncated — 95 lines total)*
+
+
+---
+
+## PR #2190 — #2175: route firewall-filter protocol resolution through appid.ProtocolNumber (5th SSOT site) [MERGED] (merged 2026-06-21)
+
+Branch: `fix/2175-compiler-filter-protocol-ssot`
+
+Closes #2175.
+
+## Context
+
+#2124 (PR #2169, merged) centralized the four policy-application
+protocol-name→IANA-number tables onto a single source of truth,
+`appid.ProtocolNumber(name) (uint8, bool)`. The independent review of that
+PR found a **fifth** copy that was not folded in: `compiler_filter.go`
+resolved a firewall-filter term's `from protocol <name>` with a hard-coded
+`tcp/udp/icmp/icmpv6` switch plus a silent numeric fallback.
+
+This is a LOW-severity consistency sweep (the table has a numeric fallback,
+so it is **not** a #2124-class silent fail-open), but it is a latent drift:
+the same `protocol <name>` token resolved in a security policy yet was
+silently unavailable in a firewall filter, and a typo'd name silently
+degraded the term to "match protocol 0" (HOPOPT).
+
+## Decision: SSOT delegation (not documented-subset)
+
+Junos firewall filters legitimately accept the broad named/IANA protocol
+set in `from protocol` — `esp`, `ah`, `gre`, `ospf`, `sctp`, `vrrp`,
+`igmp`, `pim`, … — not just the L4 subset. So `from protocol sctp` is a
+real, valid Junos firewall filter match. The acceptance's preferred path
+(SSOT delegation when firewall-filter legitimately supports the broader
+set) applies; the documented-L4-subset path would have been incorrect for
+Junos semantics.
+
+## Changes
+
+- `expandFilterTerm` resolves `from protocol` through
+  `appid.ProtocolNumber`, so every protocol a security policy accepts a
+  firewall filter accepts too. The L4 subset (`tcp/udp/icmp/icmpv6`) and
+  numeric tokens (including the deliberate `0` for HOPOPT) are byte-for-byte
+  unchanged.
+- New `validateFilterProtocols` pass runs first in `compileFirewallFilters`
+  and rejects an unrepresentable token **at commit** with a clear error
+  naming the offending family/filter/term/token — replacing the silent
+  numeric-fallback surprise. `compileFirewallFilters` is on the live
+  userspace commit path (`CompileUserspaceShim` → `CompileConfig` →
+  `compileFirewallFilters`), so the error surfaces at config commit before
+  any new snapshot is published (fail-closed).
+
+**No import cycle:** `pkg/dataplane` already imports `pkg/appid`
+(`pkg/appid` is a leaf importing only `pkg/config`), so the SSOT stays in
+`pkg/appid` exactly as #2124's note prescribes.
+
+## Tests (`pkg/dataplane`)
+
+- `TestExpandFilterTermProtocolSSOT` — broad named set resolves to the
+  correct IANA number (sctp=132, esp=50, ah=51, vrrp=112, gre=47, ospf=89,
+
+*(truncated — 73 lines total)*
+
+
+---
+
+## PR #2191 — #2144: validate routing export references at commit [MERGED] (merged 2026-06-21)
+
+Branch: `fix/2144-routingpolicy-export-refs`
+
+Closes #2144.
+
+## Root cause
+Routing export references reached the FRR renderer with **no commit-time validation** (no check existed in `pkg/config/compiler*.go`). A typo'd or undefined export passed commit and failed OPEN at render time:
+
+- `pkg/frr/policy_render.go:67-101` `resolveRedistribute` — fallback emits `redistribute <typo>` for ANY unknown export token (FRR rejects the line, failing the whole frr-reload, or silently no-ops). Backs OSPF/OSPFv3/BGP/IS-IS export and RIP redistribute.
+- BGP group/neighbor export renders `neighbor <addr> route-map <typo> out` — FRR resolves a missing route-map to NULL = **permit-all**, silently advertising everything.
+- `pkg/frr/config_render.go:318-326` `resolveECMP` — returns 0 max-paths for a missing `forwarding-table export` policy, **silently disabling ECMP / consistent-hash**.
+
+## Fix
+`validateRoutingExportReferencesStrict` (`pkg/config/compiler.go`), wired into the strict/lenient validator block:
+
+- **Redistribute-backed exports** (OSPF/OSPFv3/BGP/IS-IS `export`, RIP `redistribute`): accept a known protocol token (`connected`/`direct`/`static`/`kernel`/`ospf`/`bgp`/`rip`/`isis`) OR a defined policy-statement, matching `resolveRedistribute`.
+- **BGP group/neighbor export** and **forwarding-table export**: render directly as a route-map / ECMP policy name, so only a defined policy-statement is accepted (a protocol token is a dangling route-map / missing-policy reference there).
+- Covers top-level **and** per-routing-instance protocols (policy-options is global).
+- **Strict** on commit / commit-check; **lenient (warn)** on tolerant load / HA-sync via `lenientRoutingExportRef` — #1960 fail-closed-on-load doctrine, mirroring `validateLogProfileStreamReferencesStrict`.
+
+Also fixes a render-side mismatch the gate exposed: the bare-protocol path did not normalize the Junos `direct` token to FRR `connected`, so `export direct` rendered the FRR-invalid `redistribute direct` (failing the reload). `resolveRedistribute` now maps `direct` → `connected` on the bare path too.
+
+## Proving tests
+`pkg/config/routing_export_ref_test.go` (18 tests) + 2 `pkg/frr/frr_test.go` render tests. The rejection and lenient-downgrade tests were confirmed to **FAIL against pre-fix code** (validator call-site temporarily neutered). Two pre-existing parser tests carried dangling export refs and now seed the referenced policy-statement.
+
+`go build ./...` and `go test ./pkg/config/... ./pkg/frr/... ./pkg/routing/... ./pkg/configstore/... ./pkg/daemon/... ./pkg/cluster/...` all green. Control-plane correctness — no cluster smoke (unit-testable via generated FRR config), per the issue disposition.
+
+## Claude SMR self-review
+- Protocol-token acceptance is **site-dependent** and deliberate: redistribute-backed exports accept tokens (real Junos `export static`); neighbor/forwarding-table exports do not (they are route-map / policy names). Verified `TestBGPNeighborExportProtocolTokenRejected`.
+- `routingRedistProtocolTokens` is kept in sync with the renderer's `knownRedistProtocols` (+ `direct`); the `direct`→`connected` render fix closes the one token the renderer lacked, so acceptance and render now agree.
+- Lenient path verified on both `CompileConfigLenient` (standalone) and `CompileConfigForNodeLenient` (HA peer-sync) — an already-persisted / peer-synced typo warns and boots; the render-path fallbacks keep it behaving exactly as before the gate.
+- Deterministic first-error: policy maps are not iterated; BGP neighbors sorted by address.
+- Empty / unset export tokens are skipped (no false positive on a config with no exports).
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #2192 — docs: screen session-limit cap is per-worker (× num_workers) (#2186) [MERGED] (merged 2026-06-21)
+
+Branch: `docs/2186-per-worker-session-limit`
+
+Closes #2186.
+
+## Summary
+
+DOCS-only (plus two trivial comment/wording corrections). The per-IP
+screen session-limit enforcement added in #2134 (PR #2177) maintains its
+count in the **per-worker** `SessionTable`. With N RX queues → N workers
+and RSS spreading a single source/destination's flows across all workers,
+the limit is enforced N times in parallel, so the **effective admitted
+cap ≈ `configured_limit × num_workers`**, not a single global cap.
+
+Live evidence (loss userspace cluster, 6 RX queues → 6 workers):
+`source-session-limit 2` admitted **12** sessions (2 × 6) from one source
+before screen-drops engaged. Enforcement is correct and fires on every
+worker; the cap is just per-worker-multiplied — consistent with the rest
+of the per-worker dataplane (same was true under the eBPF per-CPU map) and
+with Junos-approximate multi-queue semantics. The docs previously
+described per-IP counting without making this multiplier explicit.
+
+## Changes
+
+- **`userspace-dp/src/session/README.md`** — "Per-worker scoping" section
+  now states the `configured × num_workers` multiplier with the formula,
+  the 6-worker worked example, and an operator sizing note.
+- **`docs/feature-gaps.md`** — per-worker multiplier note added to both
+  the source-ip and dest-ip Session Limiting rows.
+
+### #2177 Copilot wording nits swept in
+
+- `poll_descriptor` ~L823 comment: the session-limit check runs on every
+  miss-path flow reaching the new-flow decision, ahead of install-class
+  branching. Reverse / transient-seed installs are merely *uncounted* at
+  the maintenance sites (counted-class predicate excludes them), not
+  exempt from the check. Reworded for accuracy.
+- "#2128 closes/fixes" attribution: #2128 (the phantom-zero leak) was
+  closed by **#2159**; #2134/#2177 *preserves* that leak-fix by
+  construction (the count read is non-mutating). Corrected in the README
+  header, the `poll_descriptor` doc-comment, and `_Log.md`.
+
+## Validation
+
+No code logic change. `cargo build --release` clean for the comment-only
+`.rs` touch (pre-existing dead-code warnings only). No Go touched, no
+cluster smoke (docs-only).
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+
+---
+
+## PR #2193 — #2187: validate source/destination-NAT match-application app refs at commit [MERGED] (merged 2026-06-21)
+
+Branch: `fix/2187-nat-app-ref-validate`
+
+## Summary
+
+Closes #2187 (correctness follow-up to #2142 / PR #2185).
+
+The #2142 strict commit-time validation of application port/proto specs
+(`validateApplicationSpecsStrict`) scoped its reference walk to security
+**policies** only, mirroring #2124's policy-only runtime gate. A
+source/destination-NAT rule's `match application <name>` also consumes the
+referenced app's port/proto (`pkg/dataplane/userspace/nat.go`
+`appPortsFromSpec` returns `nil` on a malformed spec → the NAT term silently
+never-matches, or over-matches on a degenerate proto). So a malformed user app
+referenced **only** by a NAT rule (not by any policy) escaped both the #2142
+commit gate and the #2124 runtime gate.
+
+## Fix
+
+Extend `applicationsToValidateStrict` (`pkg/config/compiler.go`) to also collect
+app references from **source-nat** and **destination-nat** rule-sets'
+`match application`, reusing the existing `addRef` closure so single-app and
+application-set references — including the dangling-member fallback from #2185
+F1 — resolve identically to the policy path. The strict-commit / lenient-load
+wiring and warning text live at the single `validateApplicationSpecsStrict` call
+site, so NAT references inherit them unchanged: hard-rejected at commit /
+commit-check, downgraded to a warning on the tolerant load and peer-sync paths
+(#1960 no-brick doctrine).
+
+**Static NAT is intentionally not walked**: `StaticNATRule` has no application
+match (`compileNATStatic` parses only source/destination-address), so there is
+no app reference to validate there. Verified against the type + compiler.
+
+## Tests (`pkg/config/compiler_nat_application_specs_test.go`)
+
+Drive the real `CompileConfig` / `CompileConfigLenient` path:
+
+- source-nat / destination-nat rule referencing a malformed app (bad
+  destination-port, out-of-range port, unknown protocol) is **rejected** at
+  commit, error naming the app + bad field;
+- the same NAT rule referencing a **valid** app commits cleanly
+  (non-tautological control);
+- malformed app referenced via an application-set named by a NAT rule also
+  rejects;
+- an **unreferenced** malformed app with a NAT rule that does not reference it
+  stays a **warning** (the #2142 referenced-vs-unreferenced distinction is
+  preserved — the NAT walk only adds references);
+- a NAT-referenced malformed app **loads** on the lenient path with an
+  application-spec downgrade warning.
+
+The reject + lenient tests **FAIL on the pre-fix tree** (verified by neutralizing
+the NAT walk: the reject/lenient cases fail, the valid + unreferenced controls
+still pass). Updated the appid drift-guard comment
+
+*(truncated — 71 lines total)*
+
+
+---
+
+## PR #2194 — #2161: NAT64 translations counter reads 0 despite live translations [MERGED] (merged 2026-06-21)
+
+Branch: `fix/2161-nat64-counter`
+
+Fixes #2161.
+
+## Problem
+During a confirmed live NAT64 v6→v4 translation in the #2132 NAT smoke,
+the `NAT64 translations` counter and the userspace status summary read
+**0** even though tcpdump proved translated packets flowed. Root cause:
+nothing on the NAT64 translate path ever incremented a NAT64 tally —
+`GlobalCtrNAT64Xlate` exists and is read by the CLI / gRPC status /
+Prometheus, but no producer fed it. Operators saw "0 translations" while
+NAT64 was working — a pure observability gap, not a forwarding bug.
+
+## Fix
+Add a per-binding `nat64_translations` counter in the Rust dataplane and
+plumb it to the Go control plane, mirroring the existing snat/dnat
+plumbing end to end.
+
+- **Count site** (`poll_descriptor`): increment on every NAT64-translated
+  forwarded packet at the single forward-candidate site that **both**
+  directions of a NAT64 flow pass through. The forward v6→v4 decision
+  carries `nat64=true` and `NatDecision::reverse()` preserves it onto the
+  reverse session, so the v4→v6 reply counts too. NAT64 flows are
+  non-cacheable (`FlowCacheEntry::should_cache` excludes nat64), so the
+  flow-cache-hit fast path never serves them — this is the only site that
+  needs to count.
+- **Wire**: `BatchCounters` → `BindingLiveState` atomic → snapshot → wire
+  `BindingStatus` (Rust `serde default` + Go `omitempty` for #1961-class
+  cross-version safety — an older helper omits the field and the reader
+  sees 0 rather than failing decode) → coordinator refresh/reset sites.
+- **Go surfacing**: summed in `sumBindingCounters`, delta pushed into
+  `GlobalCtrNAT64Xlate` from `syncBPFCountersLocked`. The CLI
+  (`show security flow statistics`), gRPC status (`Nat64Translations`),
+  and userspace status summary now reflect live translations; added a new
+  `xpf_nat64_translations_total` Prometheus metric.
+
+**New wire field:** yes — `nat64_translations` on `BindingStatus`
+(serde `default` / json `omitempty`, cross-version safe).
+
+`show security flow session` needed **no** change: NAT64 sessions already
+install via the normal forward+reverse session path with `nat64_reverse`
+metadata, so they already appear in the session table. The live "0" was
+the missing counter, not a missing session entry.
+
+## Tests
+- Rust: `txn_nat64_translation_bumps_counter_both_directions` (forward
+  v6→v4 counts 1, reverse v4→v6 counts 1, refused-at-cap stays 0) and
+  `nat64_translations_flushes_to_live_and_snapshot` (batch→live→snapshot
+  plumbing). `cargo test nat64` = 39 pass.
+- Go: `TestSumBindingCounters` extended for the aggregation;
+  `TestFormatStatusSummaryShowsNAT64Translations` added. `go build ./...`
+  clean; `go test ./pkg/dataplane/userspace/... ./pkg/api/...` +
+
+*(truncated — 57 lines total)*
+
+
+---
+
+## PR #2195 — #2160: enable per-interface proxy responder sysctl for proxy-ARP NAT addresses [MERGED] (merged 2026-06-21)
+
+Branch: `fix/2160-staticnat-proxyarp`
+
+## Summary
+
+Fixes #2160 (found in the PR #2132 live NAT smoke). For an inbound static
+NAT whose external/match address is proxy-ARP'd on the ingress interface,
+`ReconcileProxyARP` installed the `NTF_PROXY` neighbor entry but left
+`net.ipv4.conf.<if>.proxy_arp = 0`. The Linux kernel **ignores a
+proxy-neigh entry unless the per-interface `proxy_arp` (or
+`proxy_arp_pvlan`) sysctl is enabled**, so the firewall never answered ARP
+for the external address — inbound static NAT was non-functional out of
+the box (the smoke had to add a host-side static ARP to proceed).
+
+## Root cause
+
+`pkg/dataplane/proxyarp.go::ReconcileProxyARP` did the neighbor-table half
+of proxy ARP (add/remove `NTF_PROXY` entries + GARP) but never enabled the
+kernel responder sysctl. A proxy-neigh entry without
+`net.ipv4.conf.<if>.proxy_arp = 1` is inert.
+
+## Fix
+
+After the neighbor reconcile, enable the kernel proxy responder sysctl for
+every interface that has a desired proxy entry:
+- `net.ipv4.conf.<if>.proxy_arp` for IPv4 entries
+- `net.ipv6.conf.<if>.proxy_ndp` for IPv6 entries
+
+Details:
+- The interface→family set is collected during the desired-set build,
+  keyed by ifindex; the procfs interface name is resolved from the **same
+  ifindex the neighbor entry was installed on** (`netlink.LinkByIndex`) so
+  VLAN sub-interface naming stays consistent with the install.
+- **Re-enabled on every reconcile, not just on add** — networkd reload
+  resets per-interface sysctls, so an idempotent re-enable is required (the
+  kernel no-ops a write of the already-set value).
+- The procfs write goes through a `proxyARPSysctlSeam` package var so the
+  enable logic is unit-testable without touching real `/proc`. Production
+  writer is a best-effort `os.WriteFile`; a failure is logged, never fatal
+  — matching the surrounding reconcile's posture.
+
+This covers static-NAT external addresses, SNAT pool addresses, and DNAT
+addresses — anything configured under `security nat proxy-arp`.
+
+## Tests
+
+`pkg/dataplane/proxyarp_test.go` (8 new):
+- `enableProxyResponders` units: v4 (the core regression), v6, dual-stack
+  deterministic ordering (v4 then v6), multi-interface sorted ordering,
+  failure-non-fatal (a write error doesn't abort remaining writes),
+  empty input, unsupported-family rejection.
+- `TestReconcileProxyARP_EnablesSysctl`: drives the full `ReconcileProxyARP`
+  path against `lo` and asserts the `proxy_arp` sysctl enable is issued.
+
+*(truncated — 91 lines total)*
+
+
+---
+
+## PR #2196 — deploy: target VM by name + reconcile stale upgrade residue + verify deployed binary (#2162, #2176) [MERGED] (merged 2026-06-21)
+
+Branch: `fix/2162-2176-deploy-robustness`
+
+Fixes #2162 and #2176 — two deploy-tooling robustness bugs that both cause
+SILENT STALE-BINARY deploys (the #1 false-result hazard).
+
+## #2162 — standalone deploy targeted the wrong instance
+
+`test/incus/setup.sh` hardcoded `INSTANCE_NAME=xpf-fw`, so `make test-deploy`
+always hit `xpf-fw`. When the standalone VM was created under another name
+(e.g. the ad-hoc `xpf-fwd` used in the #2132 NAT smoke) the deploy errored
+mid-flow against a non-existent `xpf-fw` or, worse, would have wiped the config
+of an unrelated `xpf-fw`. Now env-overridable: `INSTANCE_NAME=${XPF_INSTANCE:-xpf-fw}`,
+default unchanged. `XPF_INSTANCE=xpf-fwd make test-deploy`.
+
+The helper push + sha-verify that #2162 also mentions was already added by
+#1962/#1980 (standalone `setup.sh` builds/pushes/sha-verifies the Rust helper).
+This PR extends that sha-verify to **xpfd and cli** too (the remaining #2162
+"sha-verify it == local build" gap), via the shared lib below.
+
+## #2176 — raw deploy silently runs OLD code over #1917 residue
+
+A raw `incus file push` + restart could report success while systemd kept
+launching stale code, because of two residues from a prior #1917 in-place-upgrade
+`.deb` dogfood (both hit live in the #2166 smoke, worked around by hand):
+
+- a leftover `xpfd.service.d/10-xpf-version.conf` drop-in pinning `ExecStart`
+  to an OLD versioned binary; and
+- dangling `/usr/local/sbin/{xpfd,cli,xpf-userspace-dp}` symlinks into a
+  removed `versions/` dir, which break `incus file push`.
+
+New shared `test/incus/deploy-lib.sh` (sourced by both `setup.sh` and
+`cluster-setup.sh` raw-deploy paths) makes the deploy **rc!=0** instead of
+silently running stale code:
+
+1. **`deploy_reconcile_stale_pin`** — remove the xpf-managed `10-xpf-version.conf`
+   (revert to base-unit `ExecStart=/usr/local/sbin/xpfd`) + daemon-reload. Any
+   OTHER, operator-authored `ExecStart` override under `xpfd.service.d` is a
+   HARD FAILURE — never silently deleted.
+2. **`deploy_reconcile_dangling_sbin`** — remove dangling sbin symlinks so the
+   push lands a fresh regular file.
+3. **`deploy_verify_pushed_sha`** — sha256 readback of EACH pushed binary
+   (xpfd, cli, helper) == local build; mismatch/empty fails the deploy.
+4. **`deploy_verify_running_xpfd`** — after restart, assert the LIVE xpfd
+   process image sha == the pushed build AND the effective systemd ExecStart is
+   the base-unit path.
+
+Both raw paths call (1)+(2) before the push and (4) after `enable --now`. The
+#1917 deb-dogfood path (`deploy_vm_deb` / `xpfd upgrade --rolling`) is
+untouched — it legitimately keeps the version pin; only the raw dev/test push
+reconciles against a prior dogfood's residue.
+
+## Validation
+
+*(truncated — 79 lines total)*
+
+
+---
+
+## PR #2198 — #2170: HA session-sync install-generation guard (deferred-delete safety) [MERGED] (merged 2026-06-21)
+
+Branch: `fix/2170-ha-deferred-delete-gen`
+
+Implements the converged #2170 plan
+(`docs/research/2170-ha-deferred-delete/plan.md`): an install-generation
+guard so a deferred/journaled session delete cannot kill a same-5-tuple
+replacement session that was re-synced after the old incarnation closed.
+
+## The bug (§3.4 race)
+
+A journaled/deferred delete `D(K)` for a closed session `S(K)` could be
+applied on the standby AFTER a new same-5-tuple session `S'(K)` was synced
+over a different (healthy) connection epoch — killing the live replacement.
+#2163's `flushDeleteJournal` requeue widened this class by retaining un-sent
+deletes across exactly this reconnect boundary. The synthesized `SessionID`
+cannot disambiguate it (non-monotonic `now_seconds<<16|slot`, collides on
+same-second/same-slot reuse, and never reaches the helper).
+
+## The fix
+
+Stamp every session install AND every delete with a **monotonic
+per-(sender,key) install generation**, carried as a length-gated trailing
+`uint64` on the session and delete wire messages (+ the Go→Rust
+`SessionSyncRequest` and the Rust `SyncedSessionEntry`). The peer applies a
+delete only if its generation is **not strictly older** than the stored
+entry's; `gen == 0` on either side falls back to today's unconditional
+delete (rolling-upgrade safe).
+
+### SMR-folded MUST-fixes
+
+- **Wire field**: length-gated trailing `uint64` on session (after `FibGen`)
+  and delete (16→24 / 40→48 bytes). Old decoders ignore it; a new decoder
+  on an old payload sees `Generation == 0`.
+- **Echo the install generation** (SMR #1): the delete echoes the exact `g`
+  of the install it cancels (sender-side per-key map), so the comparison is
+  always same-domain — handles the cross-owner failover edge.
+- **Authoritative delete guard in the cluster apply layer**
+  (`deleteClusterSynced*`): a refusal short-circuits BOTH the BPF map delete
+  and the helper; the BPF C struct stays generation-free (SMR #3).
+- **Install-side guard** (`installClusterSynced*`): refuses a strictly-older
+  install so the per-key stored generation never regresses — closes the
+  delayed-stale-install variant (SMR #2/C3).
+- **Reverse-companion + fabric-alias parity** (SMR #4): they share the
+  install's generation (Go) / inherit the forward entry's generation (Rust
+  synthesized reverse).
+- **gen==0 fallback**: an old peer (no generation) ↔ a new peer degrades to
+  exact pre-#2170 behavior in both directions.
+
+The Rust helper mirrors the field and enforces the same guard in
+`upsert_synced_session` / `delete_synced_session_gen` as belt-and-suspenders;
+the Go cluster apply layer is authoritative. New counters
+(`DeletesStaleIgnored`, `InstallsStaleIgnored`, `SESSION_*_STALE_IGNORED`)
+report the real-world incidence.
+
+*(truncated — 74 lines total)*
+
+
+---
+
+## PR #2199 — #2151: consolidate scattered TCP-flag constants/literals to a shared SSOT [MERGED] (merged 2026-06-21)
+
+Branch: `refactor/2151-tcp-flag-ssot`
+
+## Summary
+
+Closes #2151. Pure code-motion refactor (no behavior change). TCP control-flag
+bit constants and the inline checks that read them were duplicated across the
+userspace dataplane under three naming schemes (`TCP_FLAG_*`, `TCP_*`, partial
+`TCP_FIN`/`TCP_RST`) plus raw hex literals on the hot path
+(e.g. `(meta.tcp_flags & 0x17) == 0x10`). A flag-aware change could update one
+private set and leave a hot-path literal stale — a latent correctness hazard.
+
+This adds **`userspace-dp/src/tcp_flags.rs`** as the single source of truth,
+mirroring the existing `ip_proto.rs` (#1826) consolidation, and routes every
+scattered definition and inline check through it.
+
+## What's in the module
+
+- Wire bit constants `TCP_FIN/SYN/RST/PSH/ACK/URG` (+ the `FIN|SYN|RST|ACK`
+  control mask, 0x17).
+- Single-bit predicates `has_syn/has_ack/has_rst/has_fin/has_urg/has_psh`.
+- Composite predicates that encode the exact inline checks consolidated:
+  - `is_ack_only` — `(f & 0x17) == 0x10` (flow-cache admission)
+  - `is_initial_syn` — SYN set, ACK clear (forwarding cluster-return, screen)
+  - `is_syn_ack` — `(f & 0x12) == 0x12` (rx telemetry)
+  - `is_closing` — `(f & (FIN|RST)) != 0` (conntrack session-closing)
+
+## Sites consolidated (15)
+
+**Definition sites (now re-export from `crate::tcp_flags`):** `afxdp/mod.rs`,
+`frame/tcp.rs`, `screen/packet.rs`, `session/mod.rs`.
+
+**Inline-check sites (predicates):** `flow_cache.rs` (is_ack_only),
+`forwarding/mod.rs` x2 (is_initial_syn; has_ack && !has_syn — local
+`TCP_SYN_FLAG`/`TCP_ACK_FLAG` consts deleted), session `mod.rs`/`install.rs`
+x2/`lookup.rs` (is_closing + has_rst), `screen/mod.rs` x3 (is_initial_syn x2,
+is_closing), `frame/tcp.rs` (has_rst/has_syn/has_fin reads + tcp_flags_str),
+`poll_descriptor/mod.rs` x2 + `rx_telemetry.rs` x3 (debug telemetry).
+
+Raw `0x..` masks left intentionally untouched are NOT TCP control flags
+(`meta.meta_flags & 0x80` skip-TTL, IHL/data-offset nibbles) and one test-only
+assert on an emitted RST wire byte.
+
+## Behavior preservation
+
+Each predicate carries the original expression it consolidates. The new
+truth-table tests assert the constants equal their RFC 9293 wire values and
+that every predicate matches its raw-literal expression across the full
+`0..=255` flags domain. The refactor is verified by the unchanged full existing
+test suite passing.
+
+## Validation
+
+
+*(truncated — 65 lines total)*
+
+
+---
+
+## PR #2200 — #2149: frame builders emit priority-tagged VLAN-0 + preserve PCP/TPID [MERGED] (merged 2026-06-21)
+
+Branch: `fix/2149-vlan0-pcp-builder`
+
+Closes #2149.
+
+## Problem
+
+The userspace frame builders could not emit an 802.1p **priority-tagged VLAN-0** frame (a real 802.1Q tag with VID 0 but PCP != 0, used for priority-only QoS without VLAN membership), and they dropped PCP/DEI plus the original TPID (0x88a8 vs 0x8100) when reflecting an inbound tag.
+
+- `frame/headers.rs` — the Ethernet writers gated tag emission on `vlan_id > 0`, hard-coded TPID 0x8100, and had no PCP/DEI input, so a VID-0 tag collapsed to a bare 14-byte untagged header with the priority bits lost.
+- `icmp.rs` — `ingress_reply_l2` parsed the inbound tag but returned only a `u16` VID, discarding PCP, DEI, and the TPID. The local-origin ICMP error builders (Time Exceeded, #2089 reject Destination Unreachable) therefore reflected a priority-tagged VLAN-0 inbound frame untagged with its priority gone, and rewrote 0x88a8 to 0x8100.
+
+This is the **builder** side of the VLAN-0 work; #2171/#2145 fixed the screen/SYN-cookie L3-offset on tag presence (the parse side).
+
+## Fix
+
+Introduce `TxVlanTag` (TPID + full TCI: PCP | DEI | VID, plus a presence flag) in `frame/headers.rs`. The Ethernet writers now serialize a tag whenever `tag.emits()` — present AND a non-zero TCI, i.e. **VID > 0 OR PCP/DEI set** — preserving the full TCI and the carried TPID, mirroring the `ingress_vlan_present`-based presence semantics from #2171.
+
+- `From<u16>` reproduces the legacy bare-VID bytes exactly (present iff `vid > 0`, TPID 0x8100, PCP/DEI 0), so the config-driven egress builders (forwarding, GRE/WG outer, TSO) stay **bit-identical** — VID 0 == untagged is the intended semantic there because those paths have no PCP source.
+- `write_eth_header` / `write_eth_header_slice` keep their `u16` signature and delegate through `TxVlanTag::from(vid)`; new `_tagged` variants take a `TxVlanTag`.
+- `ingress_reply_l2` returns the full `TxVlanTag`; the v4/v6 ICMP-error builders reflect it verbatim when present, falling back to the egress interface's configured VID when the inbound frame was untagged (preserving the legacy `ingress_vlan_id > 0 ? ingress : egress` behavior for the untagged case).
+
+Hot-path safe: `TxVlanTag` is `Copy`, the writers stay allocation-free, all `#[inline]`.
+
+## Tests
+
+7 new unit tests. The load-bearing proof is `eth_header_tagged_priority_tagged_vlan0_preserves_full_tci` (builder) and `reflected_v4_error_preserves_priority_tagged_vlan0` (end-to-end via `build_local_icmp_error_v4`): a priority-tagged VLAN-0 frame (PCP 5, VID 0) is emitted with the 802.1Q tag and TCI 0xA000 (PCP preserved); pre-fix it was emitted untagged with PCP dropped. Companions cover normal VID-100 (unchanged), untagged stays untagged, untagged falls back to egress VID, and 802.1ad TPID/DEI preservation. **All three priority-tagged tests fail under the pre-fix `vlan_id > 0` gating** (verified by temporarily restoring the old predicate) — non-tautological.
+
+## Validation
+
+- `cargo build --release` clean — no new warnings (the only re-export unused-import warning predates this change and lists symbols unrelated to it).
+- `cargo test --release` frame/icmp/poll_stages/nat64: 365/0.
+- New tests pass 5x with no flake.
+
+PENDING-PARENT: live PCP-on-the-wire verification on the loss userspace cluster was not run here.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #2201 — #2158 (1 of N): relocate wg/engine.rs inline tests to engine_tests.rs sibling [MERGED] (merged 2026-06-21)
+
+Branch: `refactor/2158-wg-engine-tests-reloc`
+
+## What
+
+File-split **1 of N** for #2158 (split files over the ~2,000 prod-LOC
+modularity threshold). This is the cheapest, lowest-risk P1 split from the
+converged plan (§5.5): pure inline-test relocation, the established #1046
+`frame/tests.rs` pattern.
+
+`userspace-dp/src/afxdp/wg/engine.rs` had crossed the threshold (2086
+audit-LOC) almost entirely on the back of its ~809-line inline
+`#[cfg(test)] mod engine_internal_tests` block.
+
+## How (pure code-motion, no behavior change)
+
+- Cut the entire `#[cfg(test)] mod engine_internal_tests { ... }` block out
+  of `engine.rs` into a new sibling `wg/engine_tests.rs`.
+- Re-declared it in `engine.rs` with:
+  ```rust
+  #[cfg(test)]
+  #[path = "engine_tests.rs"]
+  mod engine_internal_tests;
+  ```
+  `#[path]` keeps the module a **child of `wg::engine`**, so the block's
+  `use super::*;` (and its other imports) resolve identically — no test
+  body changed.
+- The relocated test bodies are **byte-identical** to the former inline
+  module modulo a uniform 4-space dedent. `engine.rs`'s production code
+  (lines 1-1277) is **byte-identical to master**. No production fn, type,
+  receiver, or visibility was touched. The two `#[cfg(test)]` prod-file
+  test hooks (`mock_now_ns` field, `table_for_test()` accessor) stay in
+  `engine.rs`.
+
+## Result
+
+- `engine.rs`: **2086 -> 1280 LOC**, off the REFACTOR/WATCH list entirely.
+- `engine_tests.rs` is test-named so `scripts/refactoring-audit.sh`
+  excludes it from the heatmap.
+- Regenerated `docs/refactoring-audit-current.txt` (separate commit; the
+  committed heatmap was last regenerated at #1745 and was stale relative to
+  current master). `make audit-check` passes.
+
+## Validation
+
+- Release build (`make build-userspace-dp` equivalent): clean (exit 0).
+- `cargo test --release wg::`: **145 passed / 0 failed** — same count and
+  same tests as master; the relocated module now runs under
+  `afxdp::wg::engine::engine_internal_tests::*` (an unchanged module path).
+- wg `#[test]` census unchanged vs `origin/master` (`engine.rs` 14 -> 0,
+  `engine_tests.rs` 0 -> 14; all other wg files unchanged).
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #2202 — #2197 items 1+2: v6 proxy-NDP pneigh install + 30s proxy-ARP re-assert [MERGED] (merged 2026-06-21)
+
+Branch: `fix/2197-proxyarp-v6-reassert`
+
+Implements **items 1 and 2** of the converged #2197 proxy-ARP follow-up plan
+(`docs/research/2197-proxyarp-followups/plan.md`). **Item 3 (per-address
+narrowing) is PLAN-DEFER** — not implemented (lab characterization pending;
+dropping the v4 `proxy_arp` sysctl would re-break the same-L2 #2160 case).
+
+## Item 1 (MEDIUM) — v6 proxy-NDP pneigh install
+
+PR #2195 (#2160) fixed static-NAT proxy-ARP, but the `AF_INET6` branch in
+`ReconcileProxyARP` enabled `net.ipv6.conf.<if>.proxy_ndp` and `continue`d
+**before** installing any neighbor entry. The kernel answers an IPv6 NS only
+with forwarding **AND** `proxy_ndp` **AND** a matching v6 pneigh entry
+(`net/ipv6/ndisc.c` `pneigh_lookup`), so IPv6 static-NAT / NAT64 external
+proxy was non-functional end-to-end despite the sysctl being on.
+
+Fix: mirror the v4 `NTF_PROXY` install for v6 — family-aware desired set, a
+parallel `NeighList(idx, AF_INET6)` stale-removal pass, and add/remove that
+derive `netlink.Neigh.Family` from `key.ip.Is6() && !Is4In6()`. A v4-mapped
+(`::ffff:a.b.c.d`) literal classifies as IPv4 and takes the v4 path. v6
+proxy-NDP is `pneigh_lookup`-gated (per-address by construction), so there is
+no v6 over-answer breadth — item 3 narrowing is IPv4-only. `ProxyARPAdded`
+gains a `Family` field so the IPv4-only `SendGratuitousARP` is skipped for v6
+added entries (a v6 responder needs no unsolicited NA).
+
+## Item 2 (LOW) — re-assert after a non-commit link cycle
+
+The reconcile ran only inside `applyConfigLocked` (a commit). A kernel link
+DOWN/UP **outside** a commit (HA RETH member flap, `programRethMAC` link
+cycle) re-defaults `proxy_arp`/`proxy_ndp` to its parent value, leaving the
+interface silent until the next operator commit.
+
+Fix: extract the apply-path reconcile into `(*Daemon).reconcileProxyARP`
+(preserving the #2195 RETH ifindex resolution via a separately-tested
+`proxyARPIfaceMap`) and drive it from a new **always-on 30s ticker**
+(`proxyARPReassertLoop`), started unconditionally when the dataplane is
+enabled. It covers both standalone and cluster (reconcileRGStateLoop is
+cluster-only, monitorLinkState SNMP-gated). Per plan §6.5 a post-`programRethMAC`
+trigger is **not** added — the commit-time 2.6c reconcile already re-covers a
+commit-time cycle, so it would be dead-code-by-default. The reconcile is
+idempotent and a no-op without proxy-arp config; netlink + procfs only (no
+control socket), so the 30s cadence stays clear of the >1/s contention rule.
+
+## Tests (fail-pre / pass-post)
+
+- **Item 1:** seam-driven (root-free) tests assert a v6 proxy address produces
+  exactly one `AF_INET6 NTF_PROXY` `NeighSet` with the right addr/ifindex, a
+  v4-mapped literal stays AF_INET, stale v6 entries are removed, and the
+  reconcile is idempotent. A privileged loopback live test (`SKIP` without
+  root) checks the kernel pneigh table directly. **Pre-fix: zero AF_INET6
+  NeighSet, and the v6 desired entry is wrongly torn down → tests fail.**
+- **Item 2:** the always-on ticker drives the reconcile with the store's
+
+*(truncated — 63 lines total)*
+
+
+---
+
+## PR #2203 — configstore: split store.go into cohesive same-package files (file-split 1 of M, #2158) [MERGED] (merged 2026-06-21)
+
+Branch: `refactor/2158-store-split`
+
+## Summary
+
+P1 Go file-split from the converged #2158 plan (section 5.3): split
+`pkg/configstore/store.go` (2112 LOC, over the ~2000 production-LOC
+modularity threshold in `docs/engineering-style.md`) into six cohesive
+files in the same `configstore` package.
+
+**Pure code-motion** — no logic change, no exported-API change,
+byte-identical runtime behavior.
+
+## The split
+
+| File | Contents | LOC |
+|---|---|---:|
+| `store.go` (kept) | `Store` struct, `New`, `SetConfigDBWriterVersion`, node/cluster accessors, the compile + schema-validate pipeline, `SyncApply` | 419 |
+| `store_persist.go` | `Load`/`Save`, `writeActive*`, journal helpers, the #1799 degrade-and-retry persist machinery, config archival, rescue config | 378 |
+| `store_lock.go` | config-mode enter/exit locking + edit-path navigation | 165 |
+| `store_command.go` | candidate edit verbs (`Set`/`Delete`/`Copy`/...) + flat-line replay (`applyEditLine`/`LoadSet`/...) | 324 |
+| `store_commit.go` | commit / commit-confirmed / rollback, confirm-timer machinery, commit history, rollback-history file persistence | 580 |
+| `store_format.go` | the `Show*` render family, `ShowCompare*`, `ExportJSON`, read-only accessors, `splitLines` | 307 |
+
+All six files are well under the threshold (largest 580).
+
+## Behavior-preservation proof (plan section 8)
+
+- **Move-only**: the set of top-level func/method signatures is byte
+  identical before and after (103 funcs, identical sorted set); a
+  line-level diff of all non-import/non-package body lines shows **zero
+  lines removed** and only the new package-doc comment added.
+- **No API diff**: `go doc -all ./pkg/configstore/` is byte identical
+  before and after.
+- **No init-order risk**: store.go has no package-level `var` initializer
+  or `init()` function, so source-file-name ordering is irrelevant.
+- **Receivers preserved**: every moved method keeps its exact
+  `(s *Store)` receiver.
+- **Build + test green**: `go build ./...`, `go vet ./pkg/configstore/`,
+  and `go test ./pkg/configstore/... ./pkg/daemon/...` all pass unchanged
+  from master.
+- **Audit regenerated**: `docs/refactoring-audit-current.txt` regenerated
+  (store.go drops off the heatmap); `make audit-check` clean.
+
+Refs #2158.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #2204 — #2150 PR-1: Ethernet/IPv6 parser correctness fixes (0x88a8 + ext-hdr NDP) + drift canaries [MERGED] (merged 2026-06-21)
+
+Branch: `refactor/2150-parser-correctness`
+
+## #2150 PR-1 of 2: Ethernet/IPv6 parser correctness sub-fixes + drift canaries
+
+Refs #2150. This is **PR-1 of 2** (Option A from the converged research
+plan, `docs/research/2150-parser-consolidation/plan.md`). PR-2 — the full
+unification of all five L2 parsers + three IPv6 walkers onto one canonical
+`parse_l2` + one `walk_ipv6_ext` — is a **deferred follow-up**, gated on
+these PR-1 drift canaries staying green.
+
+### Problem
+
+The userspace dataplane has five Ethernet-L2 offset parsers and three
+IPv6 extension-header walkers that provably **disagree** on a single
+0x88a8 (802.1ad) tag and on NDP behind an IPv6 extension header. The
+forwarding parsers (`frame/inspect.rs::frame_l3_offset`,
+`cos/ecn.rs::ethernet_l3`) already handle these shapes; the learning and
+NAT64 parsers did not. The bug is currently **latent** (the XDP shim
+XDP_PASSes ARP, diverts NDP control frames, and drops QinQ-double tags,
+so the buggy parsers never receive the trap frames) — but it becomes a
+live blackhole the instant a future steering change routes a
+provider-tagged or NDP-control frame through the wrong parser. This
+closes the trap before that change springs it.
+
+### The three minimal fixes
+
+1. **`afxdp/parser.rs::parse_eth_offsets`** — a single 0x88a8 tag is now
+   treated as a VLAN tag (l3=18), matching the forwarding parsers. It was
+   matching only 0x8100, so a 0x88a8-tagged ARP/NDP frame parsed as
+   L3-at-14 with ethertype 0x88a8 → classified NotArp / non-IPv6 →
+   neighbor learning skipped. Adds `ETHERTYPE_VLAN_8021AD` to
+   `ethernet.rs`. Untagged and 0x8100 frames are byte-identical.
+
+2. **`nat64.rs::frame_l3_offset`** — a single 0x88a8 tag now yields
+   l3=18. It was treated as untagged (l3=14), so the IP header was read 4
+   bytes into the VLAN tag → corrupted NAT64 translation.
+
+3. **`afxdp/parser.rs::parse_ndp_neighbor_advert`** — now walks the IPv6
+   extension-header chain via the shared #2148
+   `packet_rel_l4_offset_and_protocol` engine instead of assuming ICMPv6
+   at a fixed `l3+40`. An NA behind a hop-by-hop / dest-options / routing
+   header was missed. The walker keeps its existing 6-iteration bound, so
+   behavior is byte-identical for the no-ext-header case (offset ==
+   l3+40, protocol == 58). Allocation-free, bounded, no panic / no OOB.
+
+Per-caller walker bounds (6/8/6) are preserved so the non-disagreeing
+cases stay byte-identical. QinQ-double tags are not unwound here — the
+upstream XDP shim drops double-tagged frames before they reach userspace;
+the canonical contract is "single tag → l3=18".
+
+### Drift-guard canaries (non-tautology proven)
+
+
+*(truncated — 97 lines total)*
+
+
+---
+
+## PR #2205 — config: split compiler.go into cohesive same-package files (file-split, #2158) [MERGED] (merged 2026-06-21)
+
+Branch: `refactor/2158-compiler-split`
+
+## Summary
+
+Pure code-motion split of `pkg/config/compiler.go` (3050 LOC) — the worst
+*splittable* REFACTOR-tier offender in the `#2158` audit heatmap, and over the
+3000 "must split before adding logic" line in `docs/engineering-style.md`
+modularity discipline. Per the converged plan (`docs/research/2158-file-split/plan.md`
+§5.2), the file is split into four cohesive files, all in `package config`:
+
+| File | LOC | Contents |
+|------|----:|----------|
+| `compiler.go` (kept) | 953 | AST→typed-struct compile core: `Err*` retirement sentinels, `compileOpts`, `CompileConfig*`, `compileConfigWithOpts`, `compileConfigForNode*`, `compileExpanded` |
+| `compiler_validate_strict.go` | 947 | the `validate*Strict` commit-time hard-reject family (three-color policer, dataplane-type, scheduler/IPsec-proposal/log-profile refs, routing-export #2144, policy match-address, application-spec #2142, filter-protocol #2175, class-of-service) + their helpers (`routingRedistProtocolTokens`, `applicationsToValidateStrict`/`ApplicationsToValidateStrict`, `filterProtocolResolvable`, `policyMatchAddressError`, the `dataplaneType` const block + effective/valid helpers, `userspaceSynCookieProtectionActive`, `knownManagedProcessNames`/`isKnownProcessName`) |
+| `compiler_validate_warn.go` | 900 | `ValidateConfig` + its non-fatal warning helpers (DDNS backend, routing-rule window, CoS oversubscription) |
+| `compiler_applications.go` | 270 | `compileApplications`, `parseApplicationTerms`, `normalizeProtocol`, `validatePortSpec`, `validateProtocol`, `nodeVal` |
+
+This is a tracking/janitorial refactor under #2158: **no logic change, no
+exported-API change, byte-identical runtime behavior.** File placement is
+purely organizational — Go resolves package-level symbols across files within
+a package, so the split does not affect compilation or behavior.
+
+## Behavior-preservation evidence (the code-motion bar)
+
+- **`go doc -all ./pkg/config/` is byte-identical** before and after the split
+  (proves zero exported-API change).
+- **Declaration-set conservation:** identical 38-`func` signature set and
+  identical `type`/`var`/`const` set vs master (move-only).
+- **No init-order risk:** the only package-level state relocated
+  (`routingRedistProtocolTokens`, `knownManagedProcessNames`, the
+  `dataplaneType` consts) are plain map/string literals with no side-effecting
+  initializers; the package has no `init()`.
+- **`gofmt -l`** reports all four new files clean (the four pre-existing
+  gofmt-unclean files in `pkg/config/` are untouched by this PR).
+- **`go build ./...`**, **`go vet ./pkg/config/`**, and
+  **`go test ./pkg/config/... ./pkg/daemon/...`** all pass, unchanged from
+  master.
+- Regenerated `docs/refactoring-audit-current.txt` (compiler.go drops off the
+  REFACTOR heatmap entirely; all four files are under the 1500 WATCH
+  threshold); **`make audit-check` clean**.
+
+Refs #2158. Sibling of the #2203 `configstore/store.go` split.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #2206 — refactor(#2158): split manager.go + cli_show_security.go (pure code-motion) [MERGED] (merged 2026-06-21)
+
+Branch: `refactor/2158-manager-cli-split`
+
+## Summary
+
+Two same-package, pure code-motion file-splits from the converged #2158
+plan (`docs/research/2158-file-split/plan.md`, sections 5.6 and 5.7), landed
+as one PR. Both target files had crossed the ~2,000 prod-LOC modularity
+threshold (`docs/engineering-style.md` "Modularity discipline").
+
+### `pkg/dataplane/userspace/manager.go` (2186 → 1593) — plan §5.6
+Split into three files, all `package userspace`:
+| File | LOC | Contents |
+|------|----:|----------|
+| `manager.go` (kept) | 1593 | Manager struct, lifecycle, Compile, apply/overlay plumbing, neighbor snapshot, accessors. `init()`/`Boot()` kept in place (no init-order change). |
+| `capabilities.go` (new) | 469 | The config→capability derivation cluster (`deriveUserspace*`, `userspace*Supported`, `expandUserspace*`, `normalizeUserspace*`, `resolveUserspace*`) — all free functions. |
+| `controllers.go` (new) | 144 | The dataplane adapter types (`userspaceLinkController`, `userspaceHAOps`/`managerHAOps`, `userspaceHAController`, `userspaceSessionStore`) and their methods. |
+
+### `pkg/cli/cli_show_security.go` (2018 → 342) — plan §5.7
+Split by `show security` subject, all `package cli`:
+| File | LOC | Subject |
+|------|----:|---------|
+| `cli_show_security.go` (kept) | 342 | policies (`showPoliciesHitCount`, `showPoliciesDetail`, `showMatchPolicies`) |
+| `cli_show_security_zones.go` | 182 | zones |
+| `cli_show_security_screen.go` | 398 | screen (incl. SYN-cookie counter rows) |
+| `cli_show_security_objects.go` | 291 | address-book, applications, dynamic-address, ALG |
+| `cli_show_security_ipsec.go` | 272 | IPsec / IPsec-statistics / IKE |
+| `cli_show_security_log.go` | 232 | security log + security alarms |
+| `cli_show_security_filters.go` | 351 | firewall filters + `filterTermExpansionCount` |
+
+## Pure code-motion guarantees
+- Functions, methods, and types moved **verbatim**; no logic change, no
+  exported-API change, no receiver change.
+- The only non-move lines are the per-file import blocks and package
+  declarations. The `showMatchPolicies` doc comment moved with its function;
+  the stray `resolveAddressDetail` doc comment stayed in place (its function
+  lives in `cli_show_security_dispatch.go`, still referenced by
+  `showPoliciesDetail`).
+- No package-level `var`/`init()` was moved (manager.go's `init()` stays put;
+  cli_show_security.go has none), so no source-name init-order risk.
+
+## Validation
+- `go build ./...` clean.
+- `go test ./pkg/dataplane/userspace/... ./pkg/cli/...` green; the `-v` test
+  set is **byte-identical to master** (606 tests, verified by diff against an
+  origin/master worktree).
+- `go doc -all` is **byte-identical before/after** for **both** packages
+  (the exported-and-documented surface is unchanged).
+- Top-level declaration sets are byte-identical to master (104 userspace
+  decls, 22 cli decls); sorted non-blank body lines are byte-identical.
+- `make audit-check` clean: `manager.go` drops to WATCH-tier (1593),
+  `cli_show_security.go` falls off the heatmap entirely (342).
+- `gofmt -l` clean on every new file and the kept `cli_show_security.go`.
+
+*(truncated — 62 lines total)*
+
+
+---
+
+## PR #2207 — #2158: split shared_cos_lease/mod.rs into cohesive submodules (last in-scope file) [MERGED] (merged 2026-06-21)
+
+Branch: `refactor/2158-shared-cos-lease-split`
+
+## Summary
+
+Splits `userspace-dp/src/afxdp/types/shared_cos_lease/mod.rs` (2,121 LOC,
+over the ~2,000-LOC modularity threshold per `docs/engineering-style.md`)
+into cohesive same-module submodules. This is the **last in-scope file**
+of #2158 — `poll_descriptor/mod.rs` is a god-function and defers to #961
+(not pure code-motion), and the WATCH-tier files split opportunistically
+with their next change.
+
+HOT-PATH CoS shaper. Pure code-motion: bodies move verbatim, no logic
+change, no afxdp-facing API change.
+
+### New layout (all well under threshold)
+
+| file | LOC | contents |
+|---|---:|---|
+| `mod.rs` | 92 | thin shell — `mod`/`use` wiring + re-exports + test mod |
+| `backlog.rs` | 210 | `SharedCoSExactBacklog` + residual-surplus token bucket (self-contained) |
+| `vtime.rs` | 179 | cross-worker MQFQ V_min floor `PaddedVtimeSlot` / `SharedCoSQueueVtimeFloor` (self-contained) |
+| `epoch.rs` | 536 | #1229 Phase-6 v8 epoch state: `V8State`, `SharedCoSEpochState`, `PackedEpochGrant`, the v8 enums/consts, equal-flow suppress state |
+| `lease.rs` | 1325 | `SharedCoS{Queue,Root}Lease` token bucket + the v8 per-worker fair-share acquire path + free helpers |
+
+`backlog.rs` and `vtime.rs` are self-contained and need **no** visibility
+change.
+
+### Visibility widenings (the only non-move edits)
+
+A private item is visible only in its defining module and that module's
+**descendants**; a sibling submodule is not a descendant. Before the
+split these epoch/lease types lived in `mod.rs` (the parent), so every
+sibling saw their inherent-private fields for free. Moving the
+definitions into child submodules makes those fields private-to-the-child,
+so each item a sibling reaches across the new file boundary widens from
+inherent-private to **`pub(super)`** — exactly the forced widening the
+already-extracted `rotate_epoch_v8.rs` / `publish_equal_flow_epoch_v8.rs`
+(#1588) documented. **No new `pub` / `pub(crate)`; no cross-crate surface
+change** (verified: zero bare-`pub`/`pub(crate)` in the new files). Each
+widening is justified inline at its definition.
+
+**epoch.rs** (reached by `lease.rs` / `rotate_epoch_v8.rs` /
+`publish_equal_flow_epoch_v8.rs`): the v8 consts (`EPOCH_DURATION_NS`,
+`MAX_ROTATION_LAG_EPOCHS`, `STALL_THRESHOLD_EPOCHS`, `CARRY_MAX_EPOCHS`,
+`CARRY_DRAIN_MAX_EPOCHS`, `MAX_SEQ_SPINS`, `MAX_ROLLBACK_RETRIES`, the
+three `EQUAL_FLOW_*`); `PackedEpochGrant` (struct + tuple field `.0` +
+`pack`/`unpack`/`new`); `PaddedAtomicU64` (struct + field `.0`);
+`SharedCoSEpochState` (struct + every field a sibling reads + `::new`);
+`V8State` (struct + all fields); `V8RotationScratch` (struct + fields +
+`::new`); `V8EqualFlowSuppressState` (struct + all fields + `new` /
+`fail_open` / `enforce_epoch` / `disable_for_epoch`);
+`V8EqualFlowFailOpenReason::from_u32` / `as_str`. (The v8/cause/fail-open
+
+*(truncated — 107 lines total)*
+
+
+---
+
+## PR #2213 — #2208: recycle ingress UMEM descriptor on every TX dispatch exit [MERGED] (merged 2026-06-21)
+
+Branch: `fix/2208-tx-dispatch-descriptor-leak`
+
+Fixes #2208.
+
+## Problem
+
+`enqueue_pending_forwards` (the per-tick forwarding dispatcher) had four
+bare `continue;` statements in the copy paths that jumped to the next
+loop iteration BEFORE the per-request finalizer:
+
+- cp1 oversized (built frame > `tx_frame_capacity()`)
+- cp1 cross-binding CoS-owner enqueue failed
+- cp2 oversized
+- cp2 enqueue failed
+
+`recycle_ingress_frame` — run only by the finalizer — is the SOLE path
+that returns the ingress descriptor to `pending_fill_frames` → the fill
+ring. The RX worker already released the descriptor from the RX ring and
+the frame is read directly out of ingress UMEM, so skipping recycle
+**permanently leaks the descriptor**. The UMEM is a fixed pre-allocated
+pool, so a sustained TX-congestion episode (a cross-binding CoS owner's
+bounded queue filling) or a burst of oversized frames drains the pool one
+descriptor per failed forward until RX can no longer acquire frames and
+the worker wedges (CRITICAL — no recovery without restart).
+
+The two enqueue-failure sites additionally set `build_failed = true;
+fallback_to_slow_path = true;` then `continue`, so
+`handle_forward_build_failure` (the slow-path reinject the flags were
+asking for) was ALSO skipped — directly contradicting the flags.
+
+Present since `73ad37083` (frame_tx split) and `e4ae9eebc` (exact-cos
+path); not touched by the recent #2148/#2189/#2150/#2207 work.
+
+## Fix (pure control flow — no per-packet allocation)
+
+Make all four sites fall through to the finalizer instead of `continue`:
+
+- **enqueue-failure (cp1/cp2):** restructured `if enqueue(...).is_err()`
+  into an if/else — the Err arm sets the build-failure flags and reaches
+  the finalizer (recycle + reinject from `source_frame`; the failed
+  enqueue already consumed/dropped the `TxRequest`), the Ok arm keeps the
+  success counters.
+- **oversized (cp1/cp2):** set `build_failed = true` (no
+  `fallback_to_slow_path` — an oversized frame is undeliverable and
+  reinjecting it is pointless, matching the existing direct-TX oversized
+  drop-and-recycle branch) and fall through so the finalizer recycles.
+
+`retained_source_frame` is false on all four paths (true only on the
+in-place-rewrite branch, where the descriptor IS the TX frame), so the
+finalizer recycles each descriptor **exactly once** — no leak, no
+double-recycle. The success path is unchanged.
+
+
+*(truncated — 112 lines total)*
+
+
+---
+
+## PR #2227 — screen: per-zone + bounded scan/sweep, count only on new-flow (#2209, #2210) [OPEN]
+
+Branch: `fix/2209-2210-screen-scan-sweep`
+
+Fixes #2209 and #2210 — two HIGH screen scan/sweep correctness bugs in the
+userspace AF_XDP dataplane, shipped as one cohesive change because they share
+the same call site and tracker rewrite.
+
+## #2210 — count IP-sweep only on the session-MISS / new-flow path
+
+The pre-session per-packet screen stage ran IP-sweep on **every** packet of
+**every** protocol *before* the dataplane knew whether a session already
+existed, so mid-stream established TCP ACKs/data and UDP all counted toward the
+sweep. A single legitimate high-fan-out client (one host with live connections
+to many backends) tripped IP-sweep without ever sending a probe, and the
+original #867 ACK-evasion contract ("an ACK that matches a live session is not
+a sweep probe") was lost.
+
+The scan/sweep **mutation** now lives in a new NEW-FLOW / session-MISS hook
+(`ScreenState::scan_sweep_drop_on_new_flow`), invoked from `poll_descriptor`
+right next to the #2134 `new_flow_session_limit_drop`. An established flow's
+packets are session HITS and never reach the hook, so only a genuinely-new flow
+counts. Port-scan keeps its TCP-initial-SYN gate; IP-sweep counts the new flow
+on any protocol (a session-miss ACK fanned out to many destinations is exactly
+the ACK-evasion sweep it must catch).
+
+## #2209 — per-zone keying + bounded fail-safe state + drop the per-packet clone
+
+- **Per-zone keying.** Junos screen thresholds are read from the per-zone
+  profile, but `PortScanTracker` / `IpSweepTracker` were a single global
+  per-`src_ip` instance, so a source scanning zone `wan` bled its count into
+  the `dmz` threshold evaluation. Both trackers are now keyed by
+  `(zone_id, src_ip)`.
+- **Bounded, fail-safe state.** The backing maps are attacker-driven (spoofed
+  source flood multiplies source keys; fan-out flood multiplies inner unique
+  entries). Both axes are capped (`MAX_SOURCES_PER_ZONE=4096`,
+  `MAX_UNIQUE_PER_SOURCE=1024`). On overflow the tracker **SKIPS** the record
+  and bumps a `skipped_pressure` counter — it degrades to *not-counting* that
+  source (can only make a drop verdict less likely), never fail-opens the drop,
+  and never grows without bound. Cleanup is budgeted (`CLEANUP_BUDGET=256` per
+  tick). Mirrors the #2134/#2177 session-limit skip-on-full discipline.
+- **Per-packet clone removed.** `check_packet_with_zone_id` no longer clones the
+  whole `ScreenProfile` per screened packet; it borrows it and copies only the
+  small scalar thresholds the SYN-cookie `&mut self` path needs.
+
+## Validation
+
+- `cargo build --release` clean
+- `cargo test screen` — 104/0
+- 10 new fail-on-revert tests pass 5x with no flake:
+  - cross-zone non-bleed (`scan_sweep_per_zone_no_cross_count`,
+    `port_scan_keyed_per_zone_no_cross_count`,
+    `ip_sweep_keyed_per_zone_no_cross_count`)
+  - established (session-hit) traffic does not count via the per-packet stage
+
+*(truncated — 62 lines total)*
+
+
+---
+
+## PR #2228 — #2222: fix address-book described entry prefix corruption [MERGED] (merged 2026-06-21)
+
+Branch: `fix/2222-addressbook-description-corruption`
+
+## Summary
+
+Fixes #2222 (HIGH, config-compiler silent corruption). An address-book
+`address <name> <prefix>` entry that also carries a `description` had its
+prefix silently corrupted or dropped at compile, so a policy keyed on that
+address matched nothing or failed open to the next/default policy — a
+security-relevant silent misconfiguration that committed with only a
+non-blocking warning.
+
+## Root cause
+
+`compileAddressBook` iterated `global.Children` raw and treated each
+`address` node independently: it keyed by `Keys[1]` and blindly read
+`Keys[2]` as the prefix. A described address renders as TWO sibling AST
+nodes in flat-set order — `[address X <prefix>]` (leaf) and
+`[address X description]` (block) — so the second node overwrote `Value`
+with the literal `"description"`. The hierarchical block form
+`address X { <prefix>; description "..."; }` has `len(Keys) < 3` and was
+dropped entirely (zero addresses). Unlike zones / SNAT pools (which merge
+by name via `namedInstances`), address-book was the only compiler iterating
+children raw — which is why this entry alone was affected.
+
+## Fix
+
+- Merge all `address` nodes by name (mirrors the `namedInstances` grouping
+  used elsewhere).
+- Parse each sub-stanza independently: the prefix is taken from `Keys[2]`
+  ONLY when it parses as a CIDR/IP (`looksLikeIPOrCIDR`), otherwise from a
+  bare-leaf child (the hierarchical-block prefix).
+- Route `description` into a new `Address.Description` field so a non-prefix
+  sub-stanza can never clobber `Value`.
+- Handles both AST shapes and either sub-stanza ordering; multi-word quoted
+  descriptions and IPv6 prefixes are preserved.
+
+## Tests
+
+- `TestAddressBookDescriptionPrefix` — table-driven over both AST shapes and
+  both orderings; asserts the prefix is kept, the description lands in the
+  new field, an undescribed address still works, and the corrupted-value
+  warning is gone.
+- `TestAddressBookDescriptionResolvesInPolicy` — proves the described
+  address resolves to a parseable CIDR on the policy-match expansion path
+  rather than the corrupted `"description"` literal.
+
+**Fail-on-revert proof:** reverting only the `compileAddressBook` merge
+logic (keeping the `Description` field) makes the tests fail at runtime —
+flat-set: `Value = "description" want "192.168.2.0/24"`; hierarchical:
+entry dropped (0 addresses); policy: address resolves to `"description"`.
+
+## Validation
+
+*(truncated — 58 lines total)*
+
+
+---
+
+## PR #2230 — #2216: regression-lock eventengine window-prune + concurrent-multimatch [MERGED] (merged 2026-06-21)
+
+Branch: `fix/2216-eventopts-window-concurrent`
+
+Closes #2216.
+
+## Summary
+
+Issue #2216 reports two HIGH defects in `pkg/eventengine`:
+- **A.** temporal windows grow unbounded because pruning is gated behind the trigger-success path;
+- **B.** concurrent policy triggers from one event drop all-but-one policy's actions.
+
+**Both are already fixed in master** by #2157 (`da8e35bc9`):
+- `evaluateEvent` prunes the sliding window on **every append**, regardless of whether the policy triggers (`engine.go` — `rt.windows[...] = append(...)` immediately followed by `e.pruneWindow(...)`). A no-within policy is bounded to the 60s default horizon; a below-threshold `within` policy to its clause horizon.
+- `HandleEvent` enqueues **every** triggered policy onto a single serialized worker (`actionWorker`), so concurrent triggers never race the config lock and none is dropped.
+
+The issue's line-number analysis (`engine.go:93`, `165-202`, `64-71`, `242-251`, with `executeCommands`/`pruneWindows`) describes the **pre-#2157** engine. The campaign-3 audit cited the post-merge SHA `489483e68` but read a stale checkout — verified by diffing `da8e35bc9~1` (which matches the issue text exactly) against current master (which already has both fixes).
+
+## What this PR adds
+
+The genuinely-missing piece: the **fail-on-revert regression coverage** #2216 explicitly asks for. The package had no test asserting either invariant. Three tests, all driving the real engine path (`HandleEvent → evaluateEvent` / single worker), not a helper in isolation:
+
+- `TestWindow_NoWithinClauseBounded_2216A` — no-within policy fed 1000 events over 1000 simulated seconds (injected clock) retains only the most-recent ~60s, not all 1000.
+- `TestWindow_BelowTriggerThresholdBounded_2216A` — `within 30 { trigger on 100 }` policy that never reaches the threshold at 1 event/s still prunes to the 30s horizon and never fires.
+- `TestConcurrent_OneEventMatchesManyPolicies_2216B` — one event matching three policies (each appending a distinct additive `system domain-search` value) commits **all three** (`Committed==3` and all three values present in the active config).
+
+## Fail-on-revert proof (both findings)
+
+| Finding | Revert | Result |
+|---------|--------|--------|
+| A | delete the `pruneWindow` on-append call in `evaluateEvent` | both A tests observe **1000/1000** retained timestamps (the unbounded growth) |
+| B | revert `HandleEvent` to pre-#2157 per-policy concurrent racing apply | only **1 of 3** commits; test times out: `timed out waiting for all three commits` |
+
+With the fixes in place all three pass.
+
+## Validation
+
+- `go build ./...` — clean
+- `go test ./pkg/eventengine/...` — green
+- `go test -race ./pkg/eventengine/...` — clean
+- `go vet ./pkg/eventengine/...` — clean
+
+Behavior is unchanged (test + docs only). README gotchas updated to record the #2216 invariants and the tests that lock them in.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #2231 — #2214: empty NAT64 pool / zero-term filter serialize as JSON null -> whole-snapshot decode abort -> no transit [MERGED] (merged 2026-06-21)
+
+Branch: `fix/2214-wire-null-collections`
+
+Fixes #2214 (HIGH, #1961-class).
+
+## The bug
+A nil Go slice on a `ConfigSnapshot` field declared WITHOUT `,omitempty`
+marshals as JSON `null`. Two ordinary one-line configs hit this:
+
+- **NAT64 rule with no resolvable source-pool** — `buildNAT64Snapshots`
+  still emits the rule but leaves `NAT64RuleSnapshot.PoolAddresses` nil
+  (`pkg/dataplane/userspace/nat.go`), so the wire carries
+  `"pool_addresses":null`.
+- **Firewall filter declared with zero terms** — the compiler stores the
+  filter regardless of term count, and `buildFilterTermSnapshots` returns
+  nil terms (`pkg/dataplane/userspace/filters.go`), so the wire carries
+  `"terms":null`.
+
+The Rust helper decodes both fields as `Vec<T>`. With only
+`#[serde(default)]`, an explicit `null` is still handed to
+`Vec<T>::deserialize`, which rejects it (`invalid type: null, expected a
+sequence`) and aborts the ENTIRE `apply_snapshot` decode -> helper returns
+an error before responding -> control socket closes -> Go side sees a bare
+EOF -> helper stays in bootstrap (`enabled:false`) -> the dataplane forwards
+NOTHING. This is the exact #1961 no-transit signature, reachable from a
+single ordinary stanza, and it kills ALL transit, not just the affected
+feature.
+
+## The fix (BOTH-sided, #1961/#1976/#1977 pattern)
+- **Go producer** — initialize both slices non-nil at the build site so
+  they marshal as `[]`, never `null`. `,omitempty` is deliberately NOT
+  used: an empty pool ("no source-pool resolved") and a zero-term filter
+  are meaningful states the dataplane must still see; emitting `[]` keeps
+  the field present, matching the `WireUint8List` (#1961) convention.
+- **Rust consumer** — add a generic `null_tolerant_vec` deserializer
+  (`protocol/mod.rs`, absolute-path attribute convention mirroring
+  `u64_is_zero`) that decodes `null` -> empty Vec while leaving the
+  absent-key (`default`) and populated-sequence paths unchanged. Applied
+  to `NAT64RuleSnapshot.pool_addresses` and `FirewallFilterSnapshot.terms`.
+  Deserialize-only; the serialize path is unchanged. This keeps
+  mixed-version Go/Rust pairs safe in both directions.
+
+## Audit
+Swept all of `protocol.go` for slice fields lacking `,omitempty`: ONLY
+these two were hazardous. (`WireUint8List` fields already render nil as
+`[]` via their custom `MarshalJSON`.)
+
+## Tests (fail-on-revert proven both sides)
+- **Go** (`protocol_null_collections_2214_test.go`): the empty-pool NAT64
+  rule and zero-term filter must marshal `[]` not `null`, plus a
+  full-snapshot wire assertion. All FAIL on the pre-fix nil-emitting code
+  with the exact `"pool_addresses":null` whole-snapshot wire.
+- **Rust** (`protocol/tests.rs`): `null` / absent / populated decode for
+
+*(truncated — 67 lines total)*
+
+
+---
+
+## PR #2232 — nat64: zero-per-packet-alloc transit (#2211) + fail-closed config parse (#2212) [MERGED] (merged 2026-06-21)
+
+Branch: `fix/2211-2212-nat64`
+
+Closes #2211 and #2212. Both touch `userspace-dp/src/nat64.rs`, so they ship as one cohesive PR (two logical commits).
+
+## #2211 (PERF) — eliminate per-packet heap allocation on the NAT64 transit path
+
+The v6↔v4 transit translate path allocated and copied several buffers per packet: each `translate_*` allocated an intermediate L3 `Vec`, every L4 pseudo-header checksum allocated another `Vec` and copied the payload into it, and the frame builders allocated a second full output `Vec` and copied the translated L3 in again. That is allocator contention + LLC churn + long-tail latency on a path the project's hot-path rule forbids from allocating per packet.
+
+- New allocation-free cores `write_v6_to_v4_into` / `write_v4_to_v6_into` translate the IPv4/IPv6 L3 packet directly into a caller-provided buffer and return the written length.
+- The L4 pseudo-header checksum is now **streamed** (`checksum16_add` / `checksum16_fold`) instead of building a pseudo-header `Vec`; the streamed fold is bit-identical to running `checksum16` over a contiguous pseudo+payload buffer (16-bit one's-complement addition is associative across the concatenation).
+- The frame builders make exactly **ONE** output allocation — the `Vec` the TX path requires as `TxRequest.bytes` — write the Ethernet header in place, translate straight into the tail, and truncate to the exact length. The intermediate L3 `Vec`, the pseudo-header `Vec`s, and the double L4 copy are gone.
+- `translate_v6_to_v4` / `translate_v4_to_v6` remain as thin `Vec`-returning wrappers over the `_into` cores for tests and any caller that needs an owned packet; they are not on the forwarding hot path.
+
+On-the-wire output is byte-identical to the previous translators (same header fields, same DF/Identification policy, same checksums).
+
+## #2212 (MEDIUM) — fail closed on an unparseable NAT64 config rule
+
+The runtime snapshot parser silently dropped a bad NAT64 entry: a malformed/non-/96 prefix hit `continue`, and pool addresses were collected via `filter_map(parse_pool_v4)` so a malformed entry was silently filtered. A prefix could stay present while its pool became empty → `allocate_v4_source` returns `None` and NAT64 forward translation silently stops, with no failure surfaced. In the retired-eBPF world the userspace helper is the enforcement plane, so the dataplane should fail the apply and keep the previous live state.
+
+- `Nat64State::from_snapshots` → fallible `try_from_snapshots(snaps) -> Result<Self, SnapshotIntegrityError>`. An empty / malformed / non-/96 prefix, a malformed prefix address, or a pool address that is neither a bare IPv4 nor a `/32` host now returns the new `SnapshotIntegrityError::Nat64UnparseableRule` (names the rule + offending field). One bad pool entry rejects the whole rule. A genuinely-unconfigured pool (no pool addresses on the wire — the legitimate no-source-pool state the Go side emits) is **not** an error.
+- `forwarding_build` propagates with `?`, so the existing reconcile/refresh apply preflights catch it and keep the previous live forwarding state (the established #2124/#2142/#2173/#2175 disarm-before-publish / reject-snapshot pattern).
+- The infallible `from_snapshots` is retained as a `#[cfg(test)]` wrapper.
+
+This is the **helper-boundary backstop**; the primary gate stays the Go commit-time validation in `pkg/config/compiler_nat.go` (#2173, host-mask + pool representability).
+
+## Validation
+
+- 44 nat64 module tests pass, stable across 5 runs; 50 tests matching `nat64` (incl. afxdp + dispatch) pass post-rebase. Full lib suite green (2199 + 46 + 8 + 16 + 1, 0 failed). `go test ./pkg/config ./pkg/dataplane/userspace` pass.
+- **Fail-on-revert proven** for both fixes: a counting-allocator probe caught an injected per-packet `Vec` on the translate path; restoring the `continue`/`filter_map` silent-drop makes the #2212 tests fail (they observe `Ok` with a narrowed pool / empty prefixes instead of `Err`). New tests assert no-realloc across thousands of translations into one reused buffer, `_into`-vs-`Vec` byte-identity, streamed-vs-contiguous checksum equality, a source guard against reintroducing a per-checksum `Vec`, and the fail-closed reject for each malformed input.
+- Existing translate / frame-builder / traffic-class / no-v6-frag-header / 802.1ad tests pin the absolute output bytes and pass unchanged.
+
+**NAT64 transit smoke is PENDING-PARENT** — the standalone DUT cannot forward (per the #2169 lesson), so this relies on mechanism + unit tests; the NAT64 forward path was live-validated in #2132 and this change keeps it byte-equivalent on the wire.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #2233 — #2220: per-session flow-cache keepalive (replace binding-global modulo-64) [OPEN]
+
+Branch: `fix/2220-cache-session-keepalive`
+
+Fixes #2220.
+
+## Problem
+
+The flow-cache fast path (`userspace-dp/src/afxdp/poll_descriptor/flow_cache_hit.rs`) is the ONLY code path that refreshes a forwarded flow's `last_seen_ns` — a flow served entirely from the per-worker flow cache never re-runs the slow path that would otherwise touch its session. That refresh used a binding-GLOBAL modulo-64 counter (`flow_cache_session_touch` on `WorkerFlowCacheState`):
+
+```rust
+flow_state.flow_cache_session_touch += 1;          // single u64, shared by ALL flows on the binding
+if flow_state.flow_cache_session_touch & 63 == 0 {
+    sessions.touch(&flow.forward_key, now_ns);       // touches only the CURRENT flow
+}
+```
+
+The counter incremented across **all** flows on the binding and touched only the flow whose hit happened to land on a global multiple of 64. A low/moderate-rate flow co-resident with a saturating flow (which monopolizes the `& 63 == 0` boundaries) could be served entirely from the cache for the whole session-timeout window — UDP's 60s default is the most exposed — without its session ever being touched, then be reaped by `expire_stale_entries` while still actively forwarding:
+
+1. An HA `Close` delta replicated to the peer for a session the local node is still forwarding (split-brain on failover).
+2. Deletion of the live BPF session-map redirect keys (breaks userspace-xdp steering for any non-cached packet, notably the reverse direction).
+3. A stale flow-cache descriptor out-living its session (`show security flow session` shows the flow gone while packets still flow).
+
+## Fix
+
+Replace the counter with `SessionTable::touch_if_stale`, a **per-session** time-threshold keepalive. It re-stamps the matched session's `last_seen_ns` ONLY once that session has gone idle for at least `expires_after_ns / SESSION_KEEPALIVE_DIVISOR` (a quarter of its OWN timeout), bounding every cache-served session's worst-case age to `(1 + 1/N) × expires_after_ns` regardless of co-resident flow rates — an actively-forwarding cached flow can never be GC'd mid-flow.
+
+- **Hot-path-cheap / allocation-free**: in steady state one `key_to_handle` probe (the same probe `touch` performs) plus an integer compare; the `last_seen_ns` write and the throttled `push_to_wheel` run only when actually stale.
+- Removes the now-unused `flow_cache_session_touch` field + its three constructor inits.
+- Updates `session/README.md` (new "Flow-cache keepalive (#2220)" section) and `afxdp/worker/README.md`.
+
+## Tests (fail-on-revert)
+
+Three new tests in `session/tests.rs`, all **proven to FAIL** when `touch_if_stale` is temporarily reverted to the global modulo-64 behavior:
+
+- `touch_if_stale_throttles_until_quarter_timeout` — throttle semantics (no write before idle reaches timeout/4; write at the threshold; pure read after).
+- `touch_if_stale_keeps_active_cache_flow_alive` — a cache-served UDP flow driven for 10× its timeout never appears in an expiry batch and its `last_seen` advances, while a no-traffic control session expires and emits a `Close` (proving expiry is real, not disabled).
+- `touch_if_stale_survives_skew_that_starves_global_modulo` — replays the exact #2220 skew: reproduces the OLD global-modulo logic inline and asserts it reaps the low-rate flow, then asserts the NEW per-session keepalive keeps the same flow alive. The fail-on-revert proof is embedded in the test.
+
+### Validation
+
+- `cargo build --release` clean (145 warnings == master baseline).
+- `cargo test` filters `session` (292), `flow_cache`, `poll_descriptor` (17), `keepalive` all green.
+- New tests: `3 passed; 0 failed` and **5/5 flake-clean**.
+- Fail-on-revert confirmed: temporarily reverting `touch_if_stale` to the binding-global modulo-64 logic makes all 3 new tests FAIL.
+
+A loss-cluster SUSTAINED-FLOW dataplane smoke (a long-lived cached flow co-resident with a saturating flow does not drop after its timeout window) is **PENDING-PARENT**.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+
+---
+
+## PR #2235 — #2223: skip protocol-less redistribute exports instead of poisoning the FRR reload [OPEN]
+
+Branch: `fix/2223-frr-redistribute-protocolless`
+
+Fixes #2223.
+
+## Problem
+
+`resolveRedistribute` (`pkg/frr/policy_render.go`) translates an
+OSPF/OSPFv3/BGP/RIP/IS-IS `export` (RIP `redistribute`) into FRR
+`redistribute <proto> [route-map <name>]`. When the referenced
+policy-statement exists but **no term carries a `from protocol`** (it
+matches only `from community` / `from prefix-list` / `from as-path`),
+`len(protocols)==0` and control fell through to a best-effort fallback
+that emitted `redistribute <policy-name>`.
+
+A policy name is **not** a valid FRR redistribute source protocol, so
+`frr-reload.py` rejects the line. Because the line lands in the
+xpf-**managed** section, that single rejected line degrades the **whole**
+managed-section reload: `frr-reload.py` exits non-zero on any
+`CMD_WARNING_CONFIG_FAILED`, then the additive `vtysh -f` fallback rejects
+the same line too — so every managed route and redistribute is lost, not
+just this stanza (#1880 reload semantics; `xpf_frr_reload_degraded=1`).
+
+The commit-time strict validator (`validateRoutingExportReferencesStrict`,
+#2144) accepts any **defined** policy-statement for a redistribute-backed
+export and does **not** require it to contain a `from protocol`, so the
+config passes commit and only fails at render/reload time.
+
+## Fix
+
+Never emit a syntactically-invalid `redistribute` line. When the resolved
+export is a defined policy-statement that yields zero source protocols —
+or is neither a known protocol token nor a defined policy-statement (a name
+that slipped past validation on a lenient load / HA-sync path) — SKIP
+emission and `slog.Warn` (return `""`) instead of the bare-name fallback.
+FRR's `redistribute` has no construct to express "redistribute whatever
+this policy matches" without a source protocol, so skipping is the only
+correct outcome; the operator is warned to add a `from protocol <proto>`
+or use a bare protocol token.
+
+The load-bearing invariant: a single unresolvable export can never poison
+the entire managed-section reload — guard/validate before emitting.
+
+## Tests (fail-on-revert)
+
+- `TestResolveRedistribute_ProtocolLessPolicy` / `_UnknownToken` — assert
+  `resolveRedistribute` returns `""` for a community-only policy and for an
+  undefined name.
+- `TestGenerateProtocols_ProtocolLessPolicyExport` — an OSPF instance
+  exporting **both** a protocol-less and a protocol-qualified policy omits
+  the invalid `redistribute export-comm` line while still emitting the valid
+  `redistribute static route-map export-static` (one bad stanza never
+  suppresses the good one).
+
+*(truncated — 75 lines total)*
+
+
+---
+
+## PR #2236 — flowexport: hold ExportConfig by pointer to stop atomic-copy (#2224) [OPEN]
+
+Branch: `fix/2224-flowexport-atomic-copy`
+
+Fixes #2224.
+
+## Problem
+
+`ExportConfig` embeds the live 1-in-N `sampleCounter` (an `atomic.Uint64`,
+which carries a `noCopy` marker). `NewExporter` / `NewIPFIXExporter` took
+the config by VALUE and the daemon called `NewExporter(*ec)` /
+`NewIPFIXExporter(*ec)`, so every construction copied the atomic. `go vet
+./pkg/flowexport/ ./pkg/daemon/` flagged six `copies lock value` /
+`passes lock by value` diagnostics.
+
+The copy was latent (not yet live) only because `ShouldExport` is always
+invoked on the daemon-held `*ExportConfig` in the bundle, never on the
+exporter's internal copy. Any future caller that sampled off the
+exporter's copy would read a freshly-zeroed counter, restarting the
+modulo cycle and double-sampling / mis-pacing 1-in-N NetFlow export.
+There is no CI `go vet` gate, so the failure was silent.
+
+## Fix
+
+Both `Exporter` and `IPFIXExporter` now hold `*ExportConfig`, and their
+constructors take `*ExportConfig`. The daemon reconcile path passes the
+bundle's `ec` pointer directly, so the exporter, the `atomic.Pointer`
+bundle, and the session-close callback's `ShouldExport` all share
+exactly ONE counter per family. Smallest correct change — it strengthens
+the single-counter-owner contract the `daemon_flowexport.go` header
+already documented.
+
+Also scoped a `go vet ./pkg/flowexport/...` gate into the Makefile `test`
+target so this atomic-copy regression class is caught. Deliberately NOT
+tree-wide: two unrelated vet diagnostics pre-exist on master (cmd/cli
+protobuf `MessageState` copy, pkg/cli unreachable code); widen to `./...`
+once those are resolved.
+
+## Fail-on-revert proof
+
+`TestExporterSharesSingleSampleCounter` asserts pointer identity
+(`exp.cfg == ec`) and drives the 1-in-N sampler across 100 packets on the
+shared config, requiring exactly `floor(N/rate)` samples on the
+documented `n%rate==0` cadence and the shared counter advancing to N.
+Reverting `cfg` to a value type breaks the test's compilation (mismatched
+pointer/value types) AND re-triggers the `go vet` diagnostics — verified
+both: reverting yields 2 `copies lock value` diagnostics in the package
+and a build-failed test.
+
+## Validation
+
+- `go build ./...` — clean
+- `go vet ./pkg/flowexport/ ./pkg/daemon/` — clean (was 6 diagnostics)
+- `go test ./pkg/flowexport/... ./pkg/daemon/...` — pass
+
+*(truncated — 54 lines total)*
 
 
 ---

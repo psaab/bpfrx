@@ -8731,3 +8731,32 @@ top.
 - **File(s)**: pkg/flowexport/netflow.go, pkg/flowexport/ipfix.go,
   pkg/flowexport/exporter_test.go (new test),
   pkg/daemon/daemon_flowexport.go, pkg/flowexport/README.md, Makefile
+- **Timestamp**: 2026-06-21
+- **Action**: #2223 — guard `resolveRedistribute` against emitting an
+  FRR-invalid `redistribute <name>` line for a protocol-less export.
+  `resolveRedistribute` (pkg/frr/policy_render.go) translated an
+  OSPF/OSPFv3/BGP/RIP/IS-IS export into FRR `redistribute <proto>
+  [route-map <name>]`. When the referenced policy-statement existed but
+  no term carried a `from protocol` (matches only from community /
+  prefix-list / as-path), `len(protocols)==0` fell through to the
+  best-effort fallback `return " redistribute <name>\n"`. A policy name is
+  not a valid FRR redistribute source protocol, so frr-reload.py rejects
+  the line; because it sits in the xpf-managed section, the WHOLE reload
+  degrades (frr-reload exits non-zero on any CMD_WARNING_CONFIG_FAILED →
+  additive vtysh -f also rejects it) — every managed route/redistribute is
+  lost. The commit-time strict validator (validateRoutingExportReferences-
+  Strict, #2144) accepts any DEFINED policy-statement and does NOT require
+  a `from protocol`, so the config passes commit and only fails at render.
+  Fix: in the protocol-less-policy branch and the unknown-token fallback,
+  SKIP emission + slog.Warn (return "") instead of the bare-name line.
+  redistribute has no construct for "redistribute what this policy matches"
+  without a source protocol, so skipping is the only correct outcome.
+  Added fail-on-revert tests (TestResolveRedistribute_ProtocolLessPolicy,
+  _UnknownToken, TestGenerateProtocols_ProtocolLessPolicyExport +
+  assertNoInvalidRedistribute syntax belt): pre-fix the invalid
+  `redistribute export-comm` line is emitted alongside a valid one; post-
+  fix the invalid line is gone and the valid `redistribute static route-map
+  export-static` still renders. go build ./..., go vet ./pkg/frr/...,
+  go test ./pkg/frr/... ./pkg/config/... all green.
+- **File(s)**: pkg/frr/policy_render.go, pkg/frr/frr_test.go,
+  pkg/frr/README.md
