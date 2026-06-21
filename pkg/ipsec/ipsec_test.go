@@ -552,6 +552,14 @@ func TestGenerateConfig_IKEChain(t *testing.T) {
 func TestGenerateConfig_DynamicHostname(t *testing.T) {
 	m := &Manager{configDir: "/tmp", configPath: "/tmp/xpf.conf"}
 	cfg := &config.IPsecConfig{
+		// The ike-policy -> ike-proposal chain must resolve, else
+		// renderConfig fail-closed-skips the VPN (#2270).
+		IKEPolicies: map[string]*config.IKEPolicy{
+			"pol1": {Name: "pol1", Proposals: "ike-p1"},
+		},
+		IKEProposals: map[string]*config.IKEProposal{
+			"ike-p1": {Name: "ike-p1", AuthMethod: "pre-shared-keys", EncryptionAlg: "aes-256-cbc", AuthAlg: "sha-256", DHGroup: 14},
+		},
 		Gateways: map[string]*config.IPsecGateway{
 			"dyn-gw": {
 				Name:            "dyn-gw",
@@ -707,6 +715,11 @@ func TestGenerateConfig_AggressiveMode(t *testing.T) {
 				PSK:       "secret",
 			},
 		},
+		// The ike-policy -> ike-proposal chain must resolve, else
+		// renderConfig fail-closed-skips the VPN (#2270).
+		IKEProposals: map[string]*config.IKEProposal{
+			"ike-p1": {Name: "ike-p1", AuthMethod: "pre-shared-keys", EncryptionAlg: "aes-256-cbc", AuthAlg: "sha-256", DHGroup: 14},
+		},
 		Gateways: map[string]*config.IPsecGateway{
 			"gw": {
 				Name:      "gw",
@@ -734,10 +747,16 @@ func TestGenerateConfig_AggressiveMode_NotSet(t *testing.T) {
 	cfg := &config.IPsecConfig{
 		IKEPolicies: map[string]*config.IKEPolicy{
 			"main-pol": {
-				Name: "main-pol",
-				Mode: "main",
-				PSK:  "secret",
+				Name:      "main-pol",
+				Mode:      "main",
+				Proposals: "ike-p1",
+				PSK:       "secret",
 			},
+		},
+		// The ike-policy -> ike-proposal chain must resolve, else
+		// renderConfig fail-closed-skips the VPN (#2270).
+		IKEProposals: map[string]*config.IKEProposal{
+			"ike-p1": {Name: "ike-p1", AuthMethod: "pre-shared-keys", EncryptionAlg: "aes-256-cbc", AuthAlg: "sha-256", DHGroup: 14},
 		},
 		Gateways: map[string]*config.IPsecGateway{
 			"gw": {
