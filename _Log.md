@@ -1,5 +1,33 @@
 # Action Log
 
+## 2026-06-21 — #2144 validate routing export references at commit
+
+- **Timestamp**: 2026-06-21
+- **Action**: Fixed #2144 — routing export references reached FRR render
+  with no commit-time validation. A dynamic-protocol `export`
+  (OSPF/OSPFv3/BGP/IS-IS), a RIP `redistribute`, a BGP group/neighbor
+  `export`, or a `routing-options forwarding-table export` naming a
+  typo'd / undefined policy-statement passed commit, then failed OPEN at
+  render: `resolveRedistribute`'s fallback emits `redistribute <typo>`
+  (FRR reload rejected or no-op), a BGP neighbor export renders a missing
+  `route-map <name> out` (FRR permit-all → advertise everything), and
+  `resolveECMP` returns 0 max-paths for a missing forwarding-table policy
+  (silently disables ECMP/consistent-hash). Added
+  `validateRoutingExportReferencesStrict` (pkg/config/compiler.go):
+  redistribute-backed exports accept a known protocol token
+  (connected/direct/static/kernel/ospf/bgp/rip/isis) OR a defined
+  policy-statement; BGP neighbor/group export and forwarding-table export
+  accept only a defined policy-statement. Covers top-level + per
+  routing-instance protocols. Strict on commit/commit-check; lenient
+  (warn) on load/HA-sync via `lenientRoutingExportRef` (#1960 doctrine,
+  mirrors validateLogProfileStreamReferencesStrict). 18 new commit-time
+  tests + 1 FRR render test; the rejection/lenient tests FAIL on pre-fix
+  code (verified). Two pre-existing parser tests carried dangling export
+  refs and now seed the referenced policy-statement. build + go test
+  ./pkg/config/... ./pkg/frr/... ./pkg/routing/... ./pkg/configstore/...
+  ./pkg/daemon/... ./pkg/cluster/... green.
+- **File(s)**: pkg/config/compiler.go, pkg/config/routing_export_ref_test.go,
+  pkg/config/parser_routing_test.go, pkg/frr/frr_test.go, pkg/frr/README.md
 ## 2026-06-21 — #2183 flowexport IPv6 collector address bracketing
 
 - **Timestamp**: 2026-06-21

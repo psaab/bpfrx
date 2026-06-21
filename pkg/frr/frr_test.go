@@ -344,6 +344,65 @@ func TestGenerateProtocols_BGPExport(t *testing.T) {
 	}
 }
 
+// TestGenerateProtocols_OSPFExportPolicyStatement covers the #2144
+// render path: an OSPF `export` that names a defined policy-statement (not
+// a bare protocol token) is expanded by resolveRedistribute into one
+// `redistribute <proto> route-map <name>` line per `from protocol` the
+// policy matches. This is the well-formed reference whose dangling sibling
+// the new commit-time validator rejects.
+func TestGenerateProtocols_OSPFExportPolicyStatement(t *testing.T) {
+	m := New()
+	ospf := &config.OSPFConfig{
+		RouterID: "1.1.1.1",
+		Areas: []*config.OSPFArea{
+			{ID: "0.0.0.0", Interfaces: []*config.OSPFInterface{{Name: "ge-0-0-0"}}},
+		},
+		Export: []string{"EXPORT-DIRECT-STATIC"},
+	}
+	po := &config.PolicyOptionsConfig{
+		PolicyStatements: map[string]*config.PolicyStatement{
+			"EXPORT-DIRECT-STATIC": {
+				Name: "EXPORT-DIRECT-STATIC",
+				Terms: []*config.PolicyTerm{
+					{Name: "t1", FromProtocols: []string{"direct", "static"}, Action: "accept"},
+				},
+			},
+		},
+	}
+	got := m.generateProtocols(ospf, nil, nil, nil, nil, "", 0, po)
+	// "direct" maps to FRR "connected"; both protocols carry the route-map.
+	if !strings.Contains(got, "redistribute connected route-map EXPORT-DIRECT-STATIC\n") {
+		t.Errorf("missing redistribute connected route-map line, got:\n%s", got)
+	}
+	if !strings.Contains(got, "redistribute static route-map EXPORT-DIRECT-STATIC\n") {
+		t.Errorf("missing redistribute static route-map line, got:\n%s", got)
+	}
+}
+
+// TestGenerateProtocols_ExportDirectNormalized covers the #2144 render fix:
+// a bare `export direct` (Junos spelling for directly-connected routes)
+// must render the FRR keyword `redistribute connected`, NOT the invalid
+// `redistribute direct` (which fails the frr-reload). The commit-time
+// validator accepts "direct" as a known token, so render and validation
+// must agree.
+func TestGenerateProtocols_ExportDirectNormalized(t *testing.T) {
+	m := New()
+	ospf := &config.OSPFConfig{
+		RouterID: "1.1.1.1",
+		Areas: []*config.OSPFArea{
+			{ID: "0.0.0.0", Interfaces: []*config.OSPFInterface{{Name: "ge-0-0-0"}}},
+		},
+		Export: []string{"direct"},
+	}
+	got := m.generateProtocols(ospf, nil, nil, nil, nil, "", 0, nil)
+	if !strings.Contains(got, "redistribute connected\n") {
+		t.Errorf("bare `export direct` must render `redistribute connected`, got:\n%s", got)
+	}
+	if strings.Contains(got, "redistribute direct") {
+		t.Errorf("rendered the FRR-invalid `redistribute direct`, got:\n%s", got)
+	}
+}
+
 func TestGenerateProtocols_ISISExport(t *testing.T) {
 	m := New()
 	isis := &config.ISISConfig{
