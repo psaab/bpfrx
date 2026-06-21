@@ -9076,3 +9076,38 @@ top.
   pkg/config/compiler_undefined_ref_2217_test.go (new),
   pkg/config/parser_security_test.go, pkg/config/application_set_nested_test.go,
   docs/config-schema.md
+
+- **Timestamp**: 2026-06-21
+- **Action**: #2218 PR #2249 review fixes — NAT translation-hit counter
+  durability + counter-ID collision. (MAJOR) operator clear was not durable:
+  the helper-side `clear_nat_counters` IPC was never SENT by Go, so the next
+  1/s `syncBPFCountersLocked` re-mirrored the helper's cumulative total over
+  the cleared offset (`SetNATRuleCounterOffset` overwrites absolutely) and the
+  value snapped back within <=1s. Fix mirrors the policy-counter pattern:
+  added `userspace.Manager.ClearNATRuleCounters` (zeroes the bpfShim offset map
+  AND sends `clear_nat_counters` via `clearHelperNATCountersLocked`), routed
+  the operator clear path through an explicit `LegacyDataPlaneAdapter`
+  delegation (the adapter promotes the bpfShim method by default, bypassing the
+  override), and extended `Manager.ClearAllCounters` to reset the NAT helper
+  store too. (MINOR) counter-ID collision: `assignNATCounterID` keyed by
+  `ruleset/rule` only, so same-named SNAT/DNAT/static rules merged hit counts;
+  added `dataplane.NATCounterKey(natType, ruleset, rule)` (snat/dnat/static
+  prefix) as the single key formatter, threaded through the write site and all
+  read sites (snapshot builder + CLI/gRPC/REST/natshow). (MINOR doc)
+  nat/mod.rs snapshots() doc + userspace-dataplane-gaps.md clear claim + the
+  Rust IPC handler comment corrected. Tests: fail-on-revert clear-durability
+  (helper reports cumulative until it sees the IPC; verified RED on revert) +
+  collision distinct-IDs (verified RED on revert). Also folded pre-existing
+  #2158-bookkeeping master canary drift (cli_show_security_log/screen
+  allowlist+docs; userspaceLinkController link-cycle canary target moved to
+  controllers.go) so the suite is green.
+- **File(s)**: pkg/dataplane/userspace/natcounters.go (new),
+  pkg/dataplane/userspace/legacy_dataplane.go,
+  pkg/dataplane/userspace/policycounters.go, pkg/dataplane/userspace/nat.go,
+  pkg/dataplane/compiler_nat.go, pkg/dataplane/userspace/manager_test.go,
+  pkg/dataplane/compiler_nat_counter_collision_test.go (new),
+  pkg/{api/nat.go,grpcapi/server_nat.go,cli/cli_show_nat.go},
+  pkg/natshow/{source.go,dest.go}, userspace-dp/src/nat/mod.rs,
+  userspace-dp/src/server/handlers/mod.rs,
+  pkg/dataplane/retirement_boundary_canary_test.go,
+  docs/userspace-dataplane-gaps.md, docs/pr/1373-retire-ebpf-dataplane/README.md
