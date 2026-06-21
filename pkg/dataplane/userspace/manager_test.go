@@ -5489,6 +5489,169 @@ func TestSyncBPFCountersMirrorsNATRuleCounters(t *testing.T) {
 	}
 }
 
+// TestClearNATRuleCountersSendsHelperIPCAndIsDurable is the #2218 fail-on-
+// revert guard for the MAJOR clear-durability bug. The operator NAT-counter
+// clear must reset BOTH the Go offset map AND the helper's cumulative
+// NatCounterStore (via the clear_nat_counters IPC); otherwise the next 1/s
+// status poll re-mirrors the helper's cumulative total over the cleared offset
+// (SetNATRuleCounterOffset overwrites absolutely) and the cleared value snaps
+// back within <=1s.
+//
+// The fake helper models exactly that: a `status` request reports the
+// cumulative total UNTIL it has received a `clear_nat_counters` request, after
+// which it reports 0 (the real helper's NatCounterStore.clear()). The test:
+//  1. seeds the offset map with a cumulative total (a prior poll),
+//  2. clears via Manager.ClearNATRuleCounters,
+//  3. asserts the clear_nat_counters IPC was sent,
+//  4. runs a follow-up status poll through the real syncBPFCountersLocked and
+//     asserts the offset stays 0 (not restored to the cumulative).
+//
+// Pre-fix (Manager.ClearNATRuleCounters only zeroes the offset / the embedded
+// bpfShim method runs and no IPC is sent): the helper still reports the
+// cumulative, step 4's poll overwrites the offset back to it, and the final
+// assertion fails (counter snaps back).
+func TestClearNATRuleCountersSendsHelperIPCAndIsDurable(t *testing.T) {
+	dir := t.TempDir()
+	controlSock := filepath.Join(dir, "control.sock")
+	ln, err := net.Listen("unix", controlSock)
+	if err != nil {
+		t.Fatalf("listen control socket: %v", err)
+	}
+	defer ln.Close()
+
+	const counterID = uint16(1)
+	const cumPackets = uint64(42)
+	const cumBytes = uint64(4200)
+
+	reqCh := make(chan string, 8)
+	// Helper state: once cleared, status reports 0 for the NAT counter.
+	cleared := make(chan struct{})
+	go func() {
+		clearedFlag := false
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			var req ControlRequest
+			if err := json.NewDecoder(conn).Decode(&req); err != nil {
+				conn.Close()
+				return
+			}
+			reqCh <- req.Type
+			var natCounters []NATRuleCounterStatus
+			switch req.Type {
+			case "clear_nat_counters":
+				if !clearedFlag {
+					clearedFlag = true
+					close(cleared)
+				}
+				natCounters = []NATRuleCounterStatus{{CounterID: counterID, Packets: 0, Bytes: 0}}
+			case "status":
+				if clearedFlag {
+					natCounters = []NATRuleCounterStatus{{CounterID: counterID, Packets: 0, Bytes: 0}}
+				} else {
+					natCounters = []NATRuleCounterStatus{{CounterID: counterID, Packets: cumPackets, Bytes: cumBytes}}
+				}
+			}
+			_ = json.NewEncoder(conn).Encode(ControlResponse{
+				OK:     true,
+				Status: &ProcessStatus{NATRuleCounters: natCounters},
+			})
+			conn.Close()
+		}
+	}()
+
+	proc, err := os.FindProcess(os.Getpid())
+	if err != nil {
+		t.Fatalf("FindProcess: %v", err)
+	}
+	m := New()
+	m.proc = &exec.Cmd{Process: proc}
+	m.cfg.ControlSocket = controlSock
+
+	// Step 1: a prior poll mirrored the helper's cumulative total into the
+	// bpfShim offset map. ReadNATRuleCounter should report it.
+	m.mu.Lock()
+	m.syncBPFCountersLocked(&ProcessStatus{
+		NATRuleCounters: []NATRuleCounterStatus{{CounterID: counterID, Packets: cumPackets, Bytes: cumBytes}},
+	})
+	m.mu.Unlock()
+	if got, _ := m.bpfShim.ReadNATRuleCounter(uint32(counterID)); got != (dataplane.CounterValue{Packets: cumPackets, Bytes: cumBytes}) {
+		t.Fatalf("pre-clear ReadNATRuleCounter = %+v, want packets=%d bytes=%d", got, cumPackets, cumBytes)
+	}
+
+	// Step 2: operator clear.
+	if err := m.ClearNATRuleCounters(); err != nil {
+		t.Fatalf("ClearNATRuleCounters: %v", err)
+	}
+
+	// Step 3: the clear_nat_counters IPC must have been sent (load-bearing
+	// half — revert the IPC send and this never fires).
+	select {
+	case <-cleared:
+	case <-time.After(2 * time.Second):
+		t.Fatal("helper never received clear_nat_counters IPC")
+	}
+	// Offset must be zeroed immediately after clear.
+	if got, _ := m.bpfShim.ReadNATRuleCounter(uint32(counterID)); got != (dataplane.CounterValue{}) {
+		t.Fatalf("ReadNATRuleCounter right after clear = %+v, want zero", got)
+	}
+
+	// Step 4: simulate the next 1/s status poll. The helper (now cleared)
+	// reports 0, so syncBPFCountersLocked overwrites the offset with 0 and the
+	// cleared value DOES NOT snap back. Without the IPC the helper would still
+	// report the cumulative here and this overwrite would restore it.
+	m.mu.Lock()
+	var status ProcessStatus
+	err = m.requestLocked(ControlRequest{Type: "status"}, &status)
+	if err == nil {
+		m.syncBPFCountersLocked(&status)
+	}
+	m.mu.Unlock()
+	if err != nil {
+		t.Fatalf("status poll: %v", err)
+	}
+	if got, _ := m.bpfShim.ReadNATRuleCounter(uint32(counterID)); got != (dataplane.CounterValue{}) {
+		t.Fatalf("ReadNATRuleCounter after post-clear poll = %+v, want zero (counter snapped back — clear_nat_counters IPC missing?)", got)
+	}
+
+	// Drain to confirm the sequence included the clear IPC.
+	var sawClear bool
+	for {
+		select {
+		case typ := <-reqCh:
+			if typ == "clear_nat_counters" {
+				sawClear = true
+			}
+			continue
+		default:
+		}
+		break
+	}
+	if !sawClear {
+		t.Fatal("clear_nat_counters request not observed in helper request log")
+	}
+}
+
+// TestClearNATRuleCountersZerosCachedHelperCountersWithoutHelper covers the
+// no-live-helper path (#2218): with no helper process the cached
+// m.lastStatus.NATRuleCounters are zeroed directly so a clear still takes
+// effect (parity with clearHelperPolicyCountersLocked's without-helper branch).
+func TestClearNATRuleCountersZerosCachedHelperCountersWithoutHelper(t *testing.T) {
+	m := New()
+	m.proc = nil // no live helper
+	m.lastStatus = ProcessStatus{
+		NATRuleCounters: []NATRuleCounterStatus{{CounterID: 1, Packets: 9, Bytes: 900}},
+	}
+	if err := m.ClearNATRuleCounters(); err != nil {
+		t.Fatalf("ClearNATRuleCounters: %v", err)
+	}
+	if got := m.lastStatus.NATRuleCounters[0]; got.Packets != 0 || got.Bytes != 0 {
+		t.Fatalf("cached helper NAT counter after clear = %+v, want zero packets/bytes", got)
+	}
+}
+
 func TestSafeDelta(t *testing.T) {
 	// Normal increment
 	if d := safeDelta(100, 50); d != 50 {

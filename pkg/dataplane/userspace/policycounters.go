@@ -116,6 +116,14 @@ func (m *Manager) ClearAllCounters() error {
 	if err := m.clearHelperPolicyCountersLocked(); err != nil {
 		errs = append(errs, err)
 	}
+	// #2218: a clear-all must also reset the helper NAT translation hit store,
+	// otherwise the per-rule NAT totals snap back on the next status poll (the
+	// helper reports cumulative-since-start and syncBPFCountersLocked overwrites
+	// the offset absolutely). bpfShim.ClearAllCounters() already zeroed the Go
+	// offset map; this sends the clear_nat_counters IPC.
+	if err := m.clearHelperNATCountersLocked(); err != nil {
+		errs = append(errs, err)
+	}
 	return errors.Join(errs...)
 }
 

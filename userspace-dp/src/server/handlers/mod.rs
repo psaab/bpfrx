@@ -118,9 +118,12 @@ pub(crate) fn handle_stream(
                 refresh_status(&mut guard);
                 persist_state = true;
             }
-            // #2218: reset the helper-side NAT translation hit atomics. The Go
-            // side ALSO clears its offset map, so this is a best-effort
-            // symmetry handler (the offset clear is the authoritative one).
+            // #2218: reset the helper-side NAT translation hit atomics. This is
+            // the LOAD-BEARING half of the operator clear: the Go side also
+            // zeroes its offset map, but the helper reports cumulative-since-
+            // start totals on every status poll and the Go side mirrors them
+            // ABSOLUTELY (SetNATRuleCounterOffset overwrites). Without resetting
+            // this store the cleared total would snap back on the next poll.
             "clear_nat_counters" => {
                 guard.afxdp.clear_nat_counters();
                 refresh_status(&mut guard);
