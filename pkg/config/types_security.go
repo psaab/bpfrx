@@ -443,8 +443,9 @@ type AddressBook struct {
 
 // Address is a named address entry (IP prefix).
 type Address struct {
-	Name  string
-	Value string // CIDR notation
+	Name        string
+	Value       string // CIDR notation
+	Description string // optional Junos `description` sub-stanza
 }
 
 // AddressSet is a named group of addresses and/or nested address-sets.

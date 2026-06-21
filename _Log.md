@@ -37,6 +37,42 @@
   (re-adding pre-session ip_sweep → established-traffic test FAILS;
   zone-key→global → 3 per-zone tests FAIL). Live screen/flood smoke on the
   loss cluster is PENDING-PARENT.
+## 2026-06-21 — #2222: address-book described-entry prefix corruption
+
+- **Timestamp**: 2026-06-21
+- **Action**: Fixed compileAddressBook so an `address <name> <prefix>` that
+  also carries a `description` keeps its real prefix instead of having
+  Value silently overwritten with the literal "description" (flat-set,
+  prefix-first) or dropped entirely (hierarchical block, len(Keys) < 3).
+  Merge `address` nodes by name; derive the prefix from Keys[2] only when
+  it parses as a CIDR/IP, otherwise from a bare-leaf child; route
+  description into a new Address.Description field. Added dual-AST
+  table-driven regression tests (fail-on-revert proven: pre-fix logic
+  yields Value="description" / dropped entry). Documented in docs/bugs.md.
+- **File(s)**: pkg/config/compiler_security.go, pkg/config/types_security.go,
+  pkg/config/parser_security_test.go, docs/bugs.md
+## 2026-06-21 — #2208: TX dispatch recycle-on-every-path (UMEM descriptor leak)
+
+- **Timestamp**: 2026-06-21
+- **Action**: Fixed four bare `continue;` statements in
+  `enqueue_pending_forwards` that jumped past the loop finalizer, leaking
+  the ingress UMEM descriptor (never recycled to the fill ring) under TX
+  congestion / oversized-frame edges → per-packet pool drain → worker
+  stall. The two enqueue-failure sites (cp1/cp2) now fall through with
+  `build_failed=true; fallback_to_slow_path=true` so the finalizer both
+  recycles and runs `handle_forward_build_failure` (slow-path reinject);
+  the two oversized sites (cp1/cp2) fall through with `build_failed=true`
+  only (undeliverable — drop-and-recycle, no reinject). Added three
+  dispatch tests (enqueue-failure recycle+reinject, oversized
+  recycle+no-reinject, N-forward conservation) that FAIL against the
+  pre-fix `continue;` (recycle-count == 0 leak); two `#[cfg(test)]`-only
+  fault-injection thread-locals (`FORCE_ENQUEUE_ERR`, `FORCE_OVERSIZED`)
+  drive the otherwise hard-to-reach branches with zero release-build cost.
+  Documented the recycle-on-every-path invariant in `afxdp/README.md`.
+- **File(s)**: userspace-dp/src/afxdp/tx/dispatch/mod.rs,
+  userspace-dp/src/afxdp/tx/dispatch/cos.rs,
+  userspace-dp/src/afxdp/tx/dispatch/dispatch_tests.rs,
+  userspace-dp/src/afxdp/README.md
 
 ## 2026-06-21 — #2150 PR-1: Ethernet/IPv6 parser correctness sub-fixes + drift canaries
 

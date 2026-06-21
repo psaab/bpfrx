@@ -1,6 +1,7 @@
 package config
 
 import (
+	"net"
 	"strings"
 	"testing"
 )
@@ -4611,5 +4612,186 @@ security {
 	}
 	if screen.LimitSession.DestinationIPBased != 75 {
 		t.Errorf("DestinationIPBased = %d, want 75", screen.LimitSession.DestinationIPBased)
+	}
+}
+
+// TestAddressBookDescriptionPrefix is the #2222 regression: an address-book
+// `address <name> <prefix>` entry that ALSO carries a `description` (or
+// renders as a hierarchical block) must keep its real prefix. Before the fix
+// the second AST node (the description sub-stanza) overwrote Value with the
+// literal "description" in flat-set order, and the hierarchical block form
+// dropped the entry entirely (len(Keys) < 3). Either way a policy referencing
+// the address matched nothing / failed open. The test drives the real compile
+// path for both AST shapes and both sub-stanza orderings.
+func TestAddressBookDescriptionPrefix(t *testing.T) {
+	const wantPrefix = "192.168.2.0/24"
+
+	// flatSet builds a ConfigTree from `set` lines via the canonical
+	// ParseSetCommand + SetPath loop (NEVER NewParser for flat-set fixtures).
+	flatSet := func(t *testing.T, lines []string) *ConfigTree {
+		t.Helper()
+		tree := &ConfigTree{}
+		for _, cmd := range lines {
+			path, err := ParseSetCommand(cmd)
+			if err != nil {
+				t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+			}
+			if err := tree.SetPath(path); err != nil {
+				t.Fatalf("SetPath(%q): %v", cmd, err)
+			}
+		}
+		return tree
+	}
+	hier := func(t *testing.T, src string) *ConfigTree {
+		t.Helper()
+		p := NewParser(src)
+		tree, errs := p.Parse()
+		if len(errs) > 0 {
+			t.Fatalf("Parse hierarchical: %v", errs)
+		}
+		return tree
+	}
+
+	cases := []struct {
+		name     string
+		tree     func(t *testing.T) *ConfigTree
+		wantDesc string
+	}{
+		{
+			name: "flat-set prefix-first then description",
+			tree: func(t *testing.T) *ConfigTree {
+				return flatSet(t, []string{
+					"set security address-book global address h2 192.168.2.0/24",
+					"set security address-book global address h2 description web-server",
+				})
+			},
+			wantDesc: "web-server",
+		},
+		{
+			name: "flat-set description-first then prefix",
+			tree: func(t *testing.T) *ConfigTree {
+				return flatSet(t, []string{
+					"set security address-book global address h2 description web-server",
+					"set security address-book global address h2 192.168.2.0/24",
+				})
+			},
+			wantDesc: "web-server",
+		},
+		{
+			name: "flat-set undescribed address still works",
+			tree: func(t *testing.T) *ConfigTree {
+				return flatSet(t, []string{
+					"set security address-book global address h2 192.168.2.0/24",
+				})
+			},
+			wantDesc: "",
+		},
+		{
+			name: "hierarchical block prefix + description",
+			tree: func(t *testing.T) *ConfigTree {
+				return hier(t, `security {
+    address-book {
+        global {
+            address h2 {
+                192.168.2.0/24;
+                description "web-server";
+            }
+        }
+    }
+}`)
+			},
+			wantDesc: "web-server",
+		},
+		{
+			name: "hierarchical block description + prefix (reversed)",
+			tree: func(t *testing.T) *ConfigTree {
+				return hier(t, `security {
+    address-book {
+        global {
+            address h2 {
+                description "web-server";
+                192.168.2.0/24;
+            }
+        }
+    }
+}`)
+			},
+			wantDesc: "web-server",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tree := tc.tree(t)
+			cfg, err := CompileConfig(tree)
+			if err != nil {
+				t.Fatalf("CompileConfig: %v", err)
+			}
+			ab := cfg.Security.AddressBook
+			if ab == nil {
+				t.Fatal("AddressBook is nil")
+			}
+			addr := ab.Addresses["h2"]
+			if addr == nil {
+				t.Fatalf("address %q dropped (got %d addresses)", "h2", len(ab.Addresses))
+			}
+			if addr.Value != wantPrefix {
+				t.Errorf("address h2 Value = %q, want %q", addr.Value, wantPrefix)
+			}
+			if addr.Description != tc.wantDesc {
+				t.Errorf("address h2 Description = %q, want %q", addr.Description, tc.wantDesc)
+			}
+
+			// The corrupted value used to surface as a non-blocking warning
+			// "address-book \"h2\": invalid address \"description\"". With the
+			// fix the value parses as a CIDR, so that warning must be gone.
+			for _, w := range ValidateConfig(cfg) {
+				if strings.Contains(w, `address-book "h2": invalid address`) {
+					t.Errorf("unexpected invalid-address warning: %q", w)
+				}
+			}
+		})
+	}
+}
+
+// TestAddressBookDescriptionResolvesInPolicy proves the described address
+// resolves to its real prefix on the policy-match expansion path, not to the
+// corrupted "description" literal (which fails CIDR parse → matches nothing).
+func TestAddressBookDescriptionResolvesInPolicy(t *testing.T) {
+	tree := &ConfigTree{}
+	lines := []string{
+		"set security address-book global address h2 192.168.2.0/24",
+		"set security address-book global address h2 description web-server",
+		"set security address-book global address plain 10.0.0.0/8",
+		"set security policies from-zone trust to-zone untrust policy p1 match source-address h2",
+		"set security policies from-zone trust to-zone untrust policy p1 match destination-address plain",
+		"set security policies from-zone trust to-zone untrust policy p1 match application any",
+		"set security policies from-zone trust to-zone untrust policy p1 then permit",
+	}
+	for _, cmd := range lines {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%q): %v", cmd, err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	ab := cfg.Security.AddressBook
+	if got := ab.Addresses["h2"].Value; got != "192.168.2.0/24" {
+		t.Fatalf("described address h2 resolves to %q, want 192.168.2.0/24", got)
+	}
+	if got := ab.Addresses["plain"].Value; got != "10.0.0.0/8" {
+		t.Fatalf("undescribed address plain resolves to %q, want 10.0.0.0/8", got)
+	}
+	// Sanity: the policy references the address by name and the book holds
+	// the correct prefix, so the dataplane expansion (ab.Addresses[name].Value)
+	// yields a parseable CIDR rather than the literal "description".
+	if _, _, perr := net.ParseCIDR(ab.Addresses["h2"].Value); perr != nil {
+		t.Fatalf("policy source-address h2 prefix not parseable: %v", perr)
 	}
 }
