@@ -232,6 +232,11 @@ type xpfCollector struct {
 	// cause-side signal for rising XDP-shim NO_SESSION fallbacks.
 	userspaceSessionPublishErrors *prometheus.Desc
 
+	// #2244: total failed dnat_table reverse-SNAT BPF-map publishes — the
+	// cause-side signal for dnat_table map-capacity pressure that silently
+	// breaks embedded-ICMP NAT reversal (PMTUD / traceroute).
+	userspaceDnatPublishErrors *prometheus.Desc
+
 	// #1760 W3': shared-map NAT reverse-key displacement events (the
 	// authoritative collision watch; covers seed installs the per-worker
 	// counter cannot see).
@@ -523,6 +528,7 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.userspaceSessionTableCapacity
 	ch <- c.userspaceNatReverseKeyCollisions
 	ch <- c.userspaceSessionPublishErrors
+	ch <- c.userspaceDnatPublishErrors
 	ch <- c.userspaceNatReverseKeySharedDisplacements
 	ch <- c.userspaceWorkerCommandQueuePoisonRecoveries
 	ch <- c.userspaceFlowCacheActiveFlows
