@@ -509,6 +509,127 @@ func TestParseLeaseCSV_Lenient(t *testing.T) {
 	}
 }
 
+// TestParseLeaseCSV_SkipsMalformedLine pins #2154: the READ layer must be
+// row-robust, not all-or-nothing. Kea appends to its memfile concurrently
+// with our read, so the file can end on a torn line (a partially-written
+// row, e.g. an unterminated quoted field). The pre-#2154 ReadAll() aborted
+// the WHOLE parse on the first such record and returned (nil, err), so
+// `show dhcp server leases` blanked even though most rows were valid —
+// worst exactly when the network is busy. The fix reads record-by-record,
+// logs+skips a malformed row, and keeps every valid lease around it.
+//
+// Non-tautological: against the ReadAll() code this fixture returns
+// (nil, err) and the valid leases are LOST. It also exercises the #2085
+// dedup/expire/state body on the surviving rows to prove that logic is
+// preserved on top of the robust read.
+func TestParseLeaseCSV_SkipsMalformedLine(t *testing.T) {
+	now := time.Unix(1707900000, 0)
+	future := now.Unix() + 3600
+	past := now.Unix() - 3600
+	dir := t.TempDir()
+
+	// A self-contained malformed row in the MIDDLE — a bare quote in a
+	// non-quoted field — produces a *csv.ParseError that csv.Read RECOVERS
+	// from on the next call (verified: the following record reads cleanly),
+	// so the valid rows AFTER it survive too. (An UNTERMINATED quote is a
+	// different shape: it opens a field that spans to EOF and is covered by
+	// the torn-tail case below — that matches ReadAll and is unavoidable.)
+	// Surrounding rows include a #2085 duplicate (newest wins), an expired
+	// row (dropped), and a declined row (state=1, dropped) so the read fix
+	// is proven to compose with #2085's per-record semantics.
+	path := filepath.Join(dir, "kea-leases4.csv")
+	csvData := fmt.Sprintf(`address,hwaddr,client_id,valid_lifetime,expire,subnet_id,fqdn_fwd,fqdn_rev,hostname,state,user_context,pool_id
+10.0.4.10,aa:bb:cc:dd:ee:10,,86400,%d,1,0,0,first,0,,0
+10.0.4.20,aa:bb:cc:dd:ee:20,,86400,%d,1,0,0,ba"req,0,,0
+10.0.4.30,aa:bb:cc:dd:ee:30,,86400,%d,1,0,0,dupA,0,,0
+10.0.4.30,aa:bb:cc:dd:ee:30,,86400,%d,1,0,0,dupB,0,,0
+10.0.4.40,aa:bb:cc:dd:ee:40,,86400,%d,1,0,0,expired,0,,0
+10.0.4.50,aa:bb:cc:dd:ee:50,,86400,%d,1,0,0,declined,1,,0
+10.0.4.60,aa:bb:cc:dd:ee:60,,86400,%d,1,0,0,last,0,,0
+`, future, future, future, future, past, future, future)
+	if err := os.WriteFile(path, []byte(csvData), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	leases, err := parseLeaseCSV(path, now)
+	if err != nil {
+		t.Fatalf("malformed line must not abort the whole read; got err %v", err)
+	}
+	byAddr := indexLeasesByAddr(leases)
+
+	// The valid rows surrounding the malformed line survive. The bad row
+	// (10.0.4.20) is skipped; what matters is that the read did not abort
+	// and every row it could parse is returned.
+	if _, ok := byAddr["10.0.4.10"]; !ok {
+		t.Errorf("valid row before malformed line lost; got %+v", leases)
+	}
+	if _, ok := byAddr["10.0.4.20"]; ok {
+		t.Errorf("malformed row 10.0.4.20 must be skipped; got %+v", leases)
+	}
+	if _, ok := byAddr["10.0.4.60"]; !ok {
+		t.Errorf("valid row after malformed line lost; got %+v", leases)
+	}
+	// #2085 logic preserved on the surviving rows:
+	if dup, ok := byAddr["10.0.4.30"]; !ok {
+		t.Errorf("deduped row 10.0.4.30 missing; got %+v", leases)
+	} else if dup.Hostname != "dupB" {
+		t.Errorf("dedup must keep newest row: hostname got %q, want dupB", dup.Hostname)
+	}
+	if _, ok := byAddr["10.0.4.40"]; ok {
+		t.Errorf("expired row 10.0.4.40 must be dropped; got %+v", leases)
+	}
+	if _, ok := byAddr["10.0.4.50"]; ok {
+		t.Errorf("declined row 10.0.4.50 (state=1) must be dropped; got %+v", leases)
+	}
+
+	// Canonical Kea case: the torn line is the VERY LAST line (an append in
+	// progress). The leading valid rows must still render. Against ReadAll
+	// this returns (nil, err) and shows nothing.
+	path2 := filepath.Join(dir, "torn-tail.csv")
+	csv2 := fmt.Sprintf(`address,hwaddr,client_id,valid_lifetime,expire,subnet_id,fqdn_fwd,fqdn_rev,hostname,state,user_context,pool_id
+10.0.5.10,aa:bb:cc:dd:ee:10,,86400,%d,1,0,0,good1,0,,0
+10.0.5.11,aa:bb:cc:dd:ee:11,,86400,%d,1,0,0,good2,0,,0
+10.0.5.12,aa:bb:cc:dd:ee:12,,86400,%d,1,0,0,"torn-mid-append`, future, future, future)
+	if err := os.WriteFile(path2, []byte(csv2), 0644); err != nil {
+		t.Fatal(err)
+	}
+	leases2, err := parseLeaseCSV(path2, now)
+	if err != nil {
+		t.Fatalf("torn last line must not abort the read; got err %v", err)
+	}
+	by2 := indexLeasesByAddr(leases2)
+	if _, ok := by2["10.0.5.10"]; !ok {
+		t.Errorf("leading valid row lost to torn tail; got %+v", leases2)
+	}
+	if _, ok := by2["10.0.5.11"]; !ok {
+		t.Errorf("leading valid row lost to torn tail; got %+v", leases2)
+	}
+
+	// A short concurrent line (fewer fields) must also be tolerated, not
+	// fatal. With FieldsPerRecord = -1 it is not even an error; the field()
+	// helper bounds-checks the column index.
+	path3 := filepath.Join(dir, "short.csv")
+	csv3 := fmt.Sprintf(`address,hwaddr,client_id,valid_lifetime,expire,subnet_id,fqdn_fwd,fqdn_rev,hostname,state,user_context,pool_id
+10.0.6.10,aa:bb:cc:dd:ee:10,,86400,%d,1,0,0,full,0,,0
+10.0.6.11,aa:bb:cc:dd:ee:11
+10.0.6.12,aa:bb:cc:dd:ee:12,,86400,%d,1,0,0,after,0,,0
+`, future, future)
+	if err := os.WriteFile(path3, []byte(csv3), 0644); err != nil {
+		t.Fatal(err)
+	}
+	leases3, err := parseLeaseCSV(path3, now)
+	if err != nil {
+		t.Fatalf("short line must not abort the read; got err %v", err)
+	}
+	by3 := indexLeasesByAddr(leases3)
+	if _, ok := by3["10.0.6.10"]; !ok {
+		t.Errorf("row before short line lost; got %+v", leases3)
+	}
+	if _, ok := by3["10.0.6.12"]; !ok {
+		t.Errorf("row after short line lost; got %+v", leases3)
+	}
+}
+
 // TestApplyStopsDeactivatingUnit pins the Codex finding on PR #1835:
 // a unit reported "deactivating" can have a queued start behind it, so
 // the reconcile must treat it as active-for-stop (unitIsActive returns

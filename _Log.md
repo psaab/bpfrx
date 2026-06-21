@@ -1,5 +1,41 @@
 # Action Log
 
+## 2026-06-20 — #2153 DHCP relay must relay DHCPINFORM
+
+- **Timestamp**: 2026-06-20
+- **Action**: Fixed #2153 — the relay's client→server gate dropped
+  every BOOTREQUEST that was not DISCOVER/REQUEST, silently discarding
+  DHCPINFORM (RFC 2131 §3.4) so clients lost DNS/domain/NTP options.
+  Extracted the gate into a pure `clientRequestRelayable` predicate and
+  added `MessageTypeInform` to the relayable set. The server→client
+  reply path needed NO change: an INFORM is answered with an ACK (already
+  permitted at relay.go:566), and the #2076 reply matrix already routes
+  an ACK with yiaddr==0 + real ciaddr via the `ciaddrReal` UDP-unicast
+  case (relay.go:628). Added a `clientRequestRelayable` table test and an
+  end-to-end `TestRunRelay_RelaysInform` that drives a live INFORM through
+  the real runRelay loop; both fail pre-fix (non-tautological). Documented
+  relayed message types in the package README.
+- **File(s)**: pkg/dhcprelay/relay.go, pkg/dhcprelay/relay_test.go,
+  pkg/dhcprelay/README.md
+- **Validation**: go test -race ./pkg/dhcprelay/ green; new tests proven
+  to FAIL against the pre-fix gate; 5/5 flake on TestRunRelay_RelaysInform;
+  go vet clean. Control-plane relay change — no loss-cluster smoke
+  required (lab-gated per #2115).
+- **Review-driven fixes (PR #2164)**: Copilot flagged a stale README row
+  claiming NAK is forwarded (handleServerResponses forwards OFFER/ACK
+  only) — corrected. Codex hostile review found a real hop-count wrap on
+  the forward path that INFORM newly exercises: HopCount is uint8 and the
+  "> 16" check ran AFTER the ++ , so an incoming 255 wrapped to 0 and was
+  relayed (loop protection defeated). Fixed to enforce the RFC 1542
+  4.1.1 limit BEFORE incrementing (drop on HopCount >= 16) +
+  TestRunRelay_HopCountLimit (255 case non-tautological). Also corrected
+  the DECLINE doc comment (DECLINE is broadcast per RFC 2131 4.4.1, not
+  unicast-to-server).
+- **Out of scope (follow-ups noted, NOT fixed here)**: NAK is silently
+  dropped by handleServerResponses (pre-existing, separate from the
+  INFORM forward gate); giaddr is overwritten even when already nonzero
+  (second-hop relay, RFC 1542/3046 — pre-existing, affects
+  DISCOVER/REQUEST identically). Both predate #2153.
 ## 2026-06-20 — #2129 + #2130 NetFlow v9 export gating + dead Rust exporter removal
 
 - **Timestamp**: 2026-06-20
@@ -7654,3 +7690,17 @@ top.
   concurrency test (worker_queue_tests concurrent_recovery, untouched)
   4/5 in isolation — unrelated. Broader L2-centralization deferred to
   #2150. Smoke deferred to parent (hot-path/security).
+- **Timestamp**: 2026-06-20
+  **Action**: #2154 — parseLeaseCSV reads Kea memfile record-by-record
+  (`csv.Reader.Read` loop) instead of `ReadAll`, so one torn/concurrent
+  Kea append no longer blanks the whole `show dhcp server leases`. Header
+  is the first successful record; a malformed row is logged at debug and
+  SKIPPED (csv.Read recovers after a *csv.ParseError; FieldsPerRecord=-1
+  makes a short line a non-event). #2085's per-record dedup/expire/state
+  loop body is preserved verbatim — robust READ layered ON TOP of #2085's
+  lenient SEMANTICS. New non-tautological TestParseLeaseCSV_SkipsMalformedLine
+  (fails against pre-fix ReadAll with "bare \" in non-quoted-field").
+  Full pkg/dhcpserver suite green, 5/5 flake. Control-plane display path —
+  no dataplane smoke.
+  **File(s)**: pkg/dhcpserver/dhcpserver.go, pkg/dhcpserver/dhcpserver_test.go,
+  pkg/dhcpserver/README.md, docs/pr/2154-parseleasecsv/plan.md
