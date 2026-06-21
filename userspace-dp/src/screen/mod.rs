@@ -458,6 +458,18 @@ impl ScreenState {
         self.port_scan.skipped_pressure() + self.ip_sweep.skipped_pressure()
     }
 
+    /// #2227 MAJOR-1: total scan/sweep checks whose operator threshold
+    /// exceeded the supported maximum (`MAX_UNIQUE_PER_SOURCE - 1`) and was
+    /// clamped to it (fail-closed clamp — detection fires AT THE CAP rather
+    /// than never). Pure observability; surfaces an operator misconfiguration
+    /// (a threshold the bounded set could never reach un-clamped). The Go
+    /// control plane also warns at commit time when a threshold exceeds the
+    /// supported maximum.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn scan_sweep_threshold_clamped(&self) -> u64 {
+        self.port_scan.threshold_clamped() + self.ip_sweep.threshold_clamped()
+    }
+
     /// Validate a returning SYN-cookie ACK only after the caller has already
     /// established that no normal session matched. This preserves established
     /// ACK traffic and prevents random ACKs from installing sessions while a

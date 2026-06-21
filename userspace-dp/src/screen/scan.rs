@@ -15,16 +15,23 @@
 //!   (a spoofed-source flood multiplies the source keys; a fan-out flood
 //!   multiplies the inner unique entries). Both axes are capped:
 //!   `MAX_SOURCES_PER_ZONE` distinct source keys per zone and
-//!   `MAX_UNIQUE_PER_SOURCE` unique entries per source. On overflow the
-//!   tracker SKIPS the record and bumps an eviction/pressure counter — it
-//!   degrades to *not counting* that source, which can only make a drop
-//!   verdict LESS likely. It never fail-opens the screen drop and never
-//!   grows without bound. This mirrors the #2134/#2177 session-limit
-//!   per-IP bound discipline (skip-on-full, never a phantom growth).
+//!   `MAX_UNIQUE_PER_SOURCE` unique entries per source. On a SOURCE-axis
+//!   overflow the tracker SKIPS the new source and bumps `skipped_pressure`
+//!   — it degrades to *not counting* that source (a verdict can only become
+//!   LESS likely). On the UNIQUE-entry axis the set is capped, but the
+//!   detection threshold is CLAMPED to `MAX_UNIQUE_PER_SOURCE - 1` so a
+//!   source that fills the set ALWAYS crosses it: a threshold larger than
+//!   the cap detects AT THE CAP rather than never (fail-CLOSED, #2227
+//!   MAJOR-1). The maps never grow without bound. This mirrors the
+//!   #2134/#2177 session-limit per-IP bound discipline (skip-on-full, never
+//!   a phantom growth) plus a fail-closed clamp on the inner axis.
 //!
-//! - **Budgeted cleanup.** The periodic sweep removes at most
-//!   `CLEANUP_BUDGET` expired entries per call so one unlucky packet can
-//!   never pay an O(total-sources) scan under a volumetric attack.
+//! - **Budgeted cleanup.** The periodic sweep walks the source table
+//!   (`HashMap::retain`, O(sources)) but removes at most `CLEANUP_BUDGET`
+//!   expired entries per call, so the per-tick MUTATION cost is bounded even
+//!   though the scan is not. The real ceiling on the walk is the
+//!   `MAX_SOURCES_PER_ZONE` per-zone source cap, which bounds the table size
+//!   itself; the budget just spreads reclamation across ticks.
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::net::IpAddr;
@@ -37,13 +44,24 @@ use std::net::IpAddr;
 const MAX_SOURCES_PER_ZONE: usize = 4096;
 
 /// Maximum unique entries (dst ports for port-scan, dst IPs for IP-sweep)
-/// tracked per source within the window. The detection threshold is the
-/// operator-configured value; this cap only bounds memory for a source
-/// whose unique fan-out is far above any sane threshold. Once a source's
-/// set is full, a genuinely-new entry is skipped — the verdict still
-/// fires if the threshold was already crossed (the set is at least
-/// `MAX_UNIQUE_PER_SOURCE`, which dominates any practical threshold), so
-/// skipping cannot cause a missed detection in practice.
+/// tracked per source within the window. This caps memory for a source
+/// whose unique fan-out is large; the bounded set can hold at most
+/// `MAX_UNIQUE_PER_SOURCE` entries.
+///
+/// **Fail-CLOSED clamp (#2227 MAJOR-1).** The operator-configured
+/// threshold is unbounded (`strconv.Atoi`, no clamp), so it can legitimately
+/// exceed this cap (e.g. `port-scan threshold 5000`). The detection compares
+/// `set.len() > threshold`, but `len()` can never exceed `MAX_UNIQUE_PER_SOURCE`.
+/// If the comparison used the raw threshold, a threshold `>= MAX_UNIQUE_PER_SOURCE`
+/// could NEVER be crossed and the scanner would NEVER be dropped — a silent
+/// fail-OPEN. To preserve the fail-closed contract, [`check_unique`] clamps the
+/// EFFECTIVE comparison threshold to `MAX_UNIQUE_PER_SOURCE - 1`, so a source
+/// that fills the bounded set ALWAYS crosses it and is dropped (detection fires
+/// AT THE CAP rather than never). The clamp is counted in `threshold_clamped`
+/// so it is visible. The Go control plane mirrors this maximum
+/// (`pkg/config/compiler_security.go` `maxScanSweepThreshold`) and emits a
+/// commit-time WARNING when an operator threshold exceeds it — the two
+/// constants MUST stay in sync.
 const MAX_UNIQUE_PER_SOURCE: usize = 1024;
 
 /// Maximum expired entries removed per `cleanup` call. Bounds the
@@ -61,6 +79,14 @@ pub(super) fn max_sources_per_zone_for_test() -> usize {
     MAX_SOURCES_PER_ZONE
 }
 
+/// Test-only accessor for the per-source unique-entry cap, used by the
+/// `ScreenState`-level fail-closed clamp test in `screen/tests.rs` (#2227
+/// MAJOR-1). The supported maximum operator threshold is this value minus 1.
+#[cfg(test)]
+pub(super) fn max_unique_per_source_for_test() -> usize {
+    MAX_UNIQUE_PER_SOURCE
+}
+
 /// Per-zone scan/sweep tracker key: `(zone_id, src_ip)`.
 type ScanKey = (u16, IpAddr);
 
@@ -73,6 +99,12 @@ pub(super) struct PortScanTracker {
     /// hit. Pure observability — exposed for the bounded-state tests and
     /// the screen status surface. Never affects a verdict.
     skipped_pressure: u64,
+    /// Count of checks whose operator threshold exceeded the supported
+    /// maximum (`MAX_UNIQUE_PER_SOURCE - 1`) and was clamped to it
+    /// (fail-closed clamp, #2227 MAJOR-1). Pure observability — surfaces an
+    /// operator misconfiguration (threshold the bounded set can never reach
+    /// un-clamped) without changing the (clamped) verdict.
+    threshold_clamped: u64,
 }
 
 impl PortScanTracker {
@@ -94,6 +126,7 @@ impl PortScanTracker {
         check_unique(
             &mut self.per_src,
             &mut self.skipped_pressure,
+            &mut self.threshold_clamped,
             zone_id,
             src_ip,
             dst_port,
@@ -113,6 +146,12 @@ impl PortScanTracker {
         self.skipped_pressure
     }
 
+    /// Checks whose operator threshold was clamped to the supported maximum
+    /// (`MAX_UNIQUE_PER_SOURCE - 1`). Pure observability (#2227 MAJOR-1).
+    pub(super) fn threshold_clamped(&self) -> u64 {
+        self.threshold_clamped
+    }
+
     #[cfg(test)]
     pub(super) fn tracked_sources(&self) -> usize {
         self.per_src.len()
@@ -125,6 +164,8 @@ impl PortScanTracker {
 pub(super) struct IpSweepTracker {
     per_src: FxHashMap<ScanKey, (u64, FxHashSet<IpAddr>)>, // (window_start_secs, unique_dst_ips)
     skipped_pressure: u64,
+    /// See [`PortScanTracker::threshold_clamped`].
+    threshold_clamped: u64,
 }
 
 impl IpSweepTracker {
@@ -145,6 +186,7 @@ impl IpSweepTracker {
         check_unique(
             &mut self.per_src,
             &mut self.skipped_pressure,
+            &mut self.threshold_clamped,
             zone_id,
             src_ip,
             dst_ip,
@@ -164,6 +206,12 @@ impl IpSweepTracker {
         self.skipped_pressure
     }
 
+    /// Checks whose operator threshold was clamped to the supported maximum
+    /// (`MAX_UNIQUE_PER_SOURCE - 1`). Pure observability (#2227 MAJOR-1).
+    pub(super) fn threshold_clamped(&self) -> u64 {
+        self.threshold_clamped
+    }
+
     #[cfg(test)]
     pub(super) fn tracked_sources(&self) -> usize {
         self.per_src.len()
@@ -173,25 +221,48 @@ impl IpSweepTracker {
 /// Shared bounded windowed-unique check used by both trackers. `entry`
 /// is the per-(zone_id, src_ip) unique set of `T` (dst port or dst IP).
 ///
-/// Bounds (fail-safe, never fail-open):
+/// Bounds (fail-safe, never fail-OPEN):
 /// - a brand-new source key for a zone already holding
 ///   `MAX_SOURCES_PER_ZONE` keys is SKIPPED (returns `false`, bumps
 ///   pressure) — the screen drop is the more-restrictive verdict, so
 ///   declining to track can only relax it;
 /// - a new unique entry for a source whose set already holds
 ///   `MAX_UNIQUE_PER_SOURCE` entries is SKIPPED, but the threshold is
-///   still evaluated against the current (capped) set size, so an
-///   already-crossed threshold still drops.
+///   still evaluated against the current (capped) set size;
+/// - the EFFECTIVE comparison threshold is CLAMPED to
+///   `MAX_UNIQUE_PER_SOURCE - 1` (#2227 MAJOR-1). The set can hold at most
+///   `MAX_UNIQUE_PER_SOURCE` entries, so an operator threshold `>=
+///   MAX_UNIQUE_PER_SOURCE` could otherwise NEVER be crossed by
+///   `len() > threshold` — a silent fail-OPEN where the scanner is never
+///   dropped. Clamping guarantees a source that fills the bounded set
+///   ALWAYS crosses the effective threshold: detection fires AT THE CAP
+///   rather than never. The clamp is counted in `threshold_clamped` (pure
+///   observability) and the Go control plane warns at commit time when an
+///   operator threshold exceeds the supported maximum.
 #[inline]
 fn check_unique<T: std::hash::Hash + Eq>(
     per_src: &mut FxHashMap<ScanKey, (u64, FxHashSet<T>)>,
     skipped_pressure: &mut u64,
+    threshold_clamped: &mut u64,
     zone_id: u16,
     src_ip: IpAddr,
     entry_val: T,
     now_secs: u64,
     threshold: u32,
 ) -> bool {
+    // Fail-closed clamp: the bounded set tops out at MAX_UNIQUE_PER_SOURCE,
+    // so the comparison `len() > effective_threshold` can only ever fire if
+    // `effective_threshold <= MAX_UNIQUE_PER_SOURCE - 1`. A larger operator
+    // threshold is clamped here (and counted) so detection fires at the cap
+    // instead of never. `MAX_UNIQUE_PER_SOURCE` fits a u32, so the cast and
+    // subtraction are safe.
+    let max_effective = (MAX_UNIQUE_PER_SOURCE - 1) as u32;
+    let effective_threshold = if threshold > max_effective {
+        *threshold_clamped += 1;
+        max_effective
+    } else {
+        threshold
+    };
     let key: ScanKey = (zone_id, src_ip);
     // Per-zone source-count bound: refuse to register a brand-new source
     // for a zone that is already at the cap. An existing key is always
@@ -218,7 +289,7 @@ fn check_unique<T: std::hash::Hash + Eq>(
     } else {
         entry.1.insert(entry_val);
     }
-    entry.1.len() as u32 > threshold
+    entry.1.len() as u32 > effective_threshold
 }
 
 /// Count of source keys currently tracked for `zone_id`. Linear in the
@@ -229,9 +300,11 @@ fn sources_in_zone<T>(per_src: &FxHashMap<ScanKey, (u64, FxHashSet<T>)>, zone_id
     per_src.keys().filter(|(z, _)| *z == zone_id).count()
 }
 
-/// Remove up to `CLEANUP_BUDGET` expired or empty entries. Budgeted so a
-/// single tick can never pay an O(total) scan under volumetric load —
-/// stale entries that survive a tick are reclaimed on subsequent ticks.
+/// Remove up to `CLEANUP_BUDGET` expired or empty entries. `HashMap::retain`
+/// still WALKS every entry (O(sources)), but the number REMOVED per call is
+/// budgeted — so the per-tick mutation/rehash cost is bounded, and stale
+/// entries that survive a tick are reclaimed on subsequent ticks. The walk
+/// itself is bounded only by the `MAX_SOURCES_PER_ZONE` cap on the table.
 #[inline]
 fn cleanup_expired<T>(per_src: &mut FxHashMap<ScanKey, (u64, FxHashSet<T>)>, now_secs: u64) {
     let mut removed = 0usize;
@@ -314,6 +387,73 @@ mod scan_tests {
         assert!(
             t.skipped_pressure() >= 1,
             "over-cap source records pressure"
+        );
+    }
+
+    #[test]
+    fn threshold_above_cap_still_fires_fail_closed() {
+        // #2227 MAJOR-1 fail-on-revert: an IP-sweep at a threshold ABOVE the
+        // per-source unique cap (e.g. 3000, which parses/validates fine on
+        // the Go side) must STILL fire detection. Pre-fix the comparison was
+        // `len() as u32 > threshold`, but `len()` tops out at
+        // MAX_UNIQUE_PER_SOURCE (1024) < 3000, so the scanner was NEVER
+        // dropped — a silent fail-OPEN. The clamp makes the bounded set's
+        // worst case (full = MAX_UNIQUE_PER_SOURCE) always cross the effective
+        // threshold (MAX_UNIQUE_PER_SOURCE - 1).
+        let mut t = IpSweepTracker::default();
+        let src = v4(1);
+        let threshold: u32 = 3000;
+        assert!(
+            threshold as usize > MAX_UNIQUE_PER_SOURCE,
+            "test premise: threshold must exceed the per-source cap"
+        );
+        // Sweep more distinct destinations than the cap. The set saturates at
+        // MAX_UNIQUE_PER_SOURCE; once it does, the effective (clamped)
+        // threshold is crossed and the check returns a drop.
+        let mut fired = false;
+        for i in 0..(MAX_UNIQUE_PER_SOURCE + 50) {
+            let dst = IpAddr::V4(Ipv4Addr::from(0x0e00_0000u32 + i as u32));
+            if t.check(0, src, dst, 100, threshold) {
+                fired = true;
+                break;
+            }
+        }
+        assert!(
+            fired,
+            "IP-sweep with threshold {threshold} (> cap {MAX_UNIQUE_PER_SOURCE}) must fire \
+             detection — pre-fix it NEVER fired (silent fail-open)"
+        );
+        assert!(
+            t.threshold_clamped() >= 1,
+            "an over-cap threshold must be recorded as clamped, got {}",
+            t.threshold_clamped()
+        );
+    }
+
+    #[test]
+    fn threshold_at_cap_minus_one_is_max_unclamped() {
+        // Boundary: a threshold of exactly MAX_UNIQUE_PER_SOURCE - 1 is the
+        // largest value that is NOT clamped. The (MAX_UNIQUE_PER_SOURCE)th
+        // unique entry crosses it. (We cannot drive 1023 distinct entries
+        // cheaply here without a large loop; assert the no-clamp accounting
+        // on a single representative check.)
+        let mut t = PortScanTracker::default();
+        let src = v4(1);
+        let at_max = (MAX_UNIQUE_PER_SOURCE - 1) as u32;
+        // One SYN at the boundary threshold: not clamped, not yet crossed.
+        assert!(!t.check(0, src, 80, 100, at_max));
+        assert_eq!(
+            t.threshold_clamped(),
+            0,
+            "threshold == MAX_UNIQUE_PER_SOURCE-1 must NOT be clamped"
+        );
+        // One above the boundary IS clamped.
+        let mut t2 = PortScanTracker::default();
+        assert!(!t2.check(0, src, 80, 100, at_max + 1));
+        assert_eq!(
+            t2.threshold_clamped(),
+            1,
+            "threshold == MAX_UNIQUE_PER_SOURCE must be clamped"
         );
     }
 
