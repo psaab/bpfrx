@@ -1,5 +1,24 @@
 # Action Log
 
+## 2026-06-21 — #2158 file-split (1 of N): relocate wg/engine.rs inline tests
+
+- **Timestamp**: 2026-06-21
+- **Action**: Pure code-motion per the converged #2158 plan (§5.5,
+  #1046 pattern). Cut the inline `#[cfg(test)] mod engine_internal_tests`
+  block (former lines 1278-2086, ~809 LOC) out of
+  `userspace-dp/src/afxdp/wg/engine.rs` into a new sibling
+  `wg/engine_tests.rs`, wired with `#[cfg(test)] #[path =
+  "engine_tests.rs"] mod engine_internal_tests;`. `#[path]` keeps the
+  module a child of `wg::engine`, so `use super::*;` resolves identically
+  and no test body changed (byte-identical modulo a uniform 4-space
+  dedent; production lines 1-1277 are byte-identical to master). engine.rs
+  drops 2086 -> 1280 LOC, off the REFACTOR/WATCH list entirely. wg::
+  tests: 145 pass / 0 fail (unchanged count; relocated module runs as
+  `afxdp::wg::engine::engine_internal_tests::*`). Regenerated
+  `docs/refactoring-audit-current.txt`; `make audit-check` passes.
+- **File(s)**: userspace-dp/src/afxdp/wg/engine.rs,
+  userspace-dp/src/afxdp/wg/engine_tests.rs,
+  docs/refactoring-audit-current.txt
 ## 2026-06-21 — #2151: consolidate TCP-flag constants to shared SSOT
 
 - **Timestamp**: 2026-06-21
@@ -51,6 +70,32 @@
   flake; all three priority-tagged tests fail under the pre-fix
   `vlan_id > 0` gating (non-tautological). PENDING-PARENT: live
   PCP-on-the-wire verification on the loss cluster (not run here).
+
+## 2026-06-21 — #2197 items 1+2: v6 proxy-NDP pneigh install + 30s re-assert
+
+- **Timestamp**: 2026-06-21
+- **Action**: Implemented #2197 plan items 1 (MEDIUM) and 2 (LOW); item 3
+  (per-address narrowing) stays PLAN-DEFER / lab-pending.
+  **Item 1 (v6 proxy-NDP pneigh install):** `ReconcileProxyARP` now installs
+  an AF_INET6 NTF_PROXY neighbor entry for v6 proxy addresses (the v6 analogue
+  of `ip -6 neigh add proxy`), mirroring the v4 install path — desired set is
+  family-aware, a parallel `NeighList(idx, AF_INET6)` stale-removal pass runs,
+  and add/remove derive Family from `key.ip.Is6()/!Is4In6()`. Added `Family`
+  to `ProxyARPAdded` so the IPv4-only GARP is skipped for v6 (risk R1). v6 is
+  `pneigh_lookup`-gated (per-address), so no over-answer breadth. Added netlink
+  seams (`neighListSeam`/`neighSetSeam`/`neighDelSeam`) for root-free tests.
+  **Item 2 (re-assert after non-commit link cycle):** extracted the apply-path
+  reconcile into `(*Daemon).reconcileProxyARP(cfg)` (preserving the #2195 RETH
+  ifindex resolution via a separately-tested `proxyARPIfaceMap`), and drive it
+  from a new always-on 30s ticker (`proxyARPReassertLoop`) started
+  unconditionally when the dataplane is enabled — covers standalone + cluster
+  (reconcileRGStateLoop is cluster-only, monitorLinkState SNMP-gated). Idempotent.
+- **File(s)**: `pkg/dataplane/proxyarp.go`, `pkg/dataplane/proxyarp_test.go`,
+  `pkg/daemon/daemon_apply.go`, `pkg/daemon/daemon_proxyarp.go`,
+  `pkg/daemon/daemon_proxyarp_test.go`, `pkg/daemon/daemon_run.go`,
+  `pkg/dataplane/retirement_boundary_canary_test.go`, `docs/feature-gaps.md`,
+  `docs/pr/1373-retire-ebpf-dataplane/README.md`,
+  `docs/research/2197-proxyarp-followups/plan.md`.
 
 ## 2026-06-21 — #2146 (PR #2189) fold: close IPv6 ext-header overshoot fail-open
 
