@@ -7,11 +7,6 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// frrZStatic is FRR's private RTPROT_ZSTATIC value (zebra/rt_netlink.h)
-// for staticd-installed routes; it has no golang.org/x/sys/unix
-// constant. Mirrors the package-internal rtprotZStatic.
-const frrZStatic = 196
-
 // TestRtProtoName asserts that each kernel rtnetlink rtm_protocol value
 // maps to the xpf protocol name shown by "show route" (#2127). The
 // inputs use the named unix.RTPROT_* constants so the test stays correct
@@ -37,7 +32,7 @@ func TestRtProtoName(t *testing.T) {
 		// FRR staticd installs routes as RTPROT_ZSTATIC=196, mapped to
 		// "static". This arm pre-dates #2127 and must be preserved (the
 		// kernel UAPI RTPROT_STATIC=4 above is a different value).
-		{"frr-zstatic-196", frrZStatic, "static"},
+		{"frr-zstatic-196", rtprotZStatic, "static"},
 
 		// The #2127 fixes.
 		{"isis-187", unix.RTPROT_ISIS, "isis"}, // was the literal "187"
