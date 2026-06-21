@@ -7854,3 +7854,24 @@ top.
   **File(s)**: userspace-dp/src/afxdp/frame/tcp.rs,
   userspace-dp/src/afxdp/frame/tcp_tests.rs,
   userspace-dp/src/afxdp/frame/README.md
+
+- **Timestamp**: 2026-06-21
+  **Action**: #2175 — centralize the firewall-filter `from protocol <name>`
+  resolution table onto the `appid.ProtocolNumber` SSOT (#2124). It was the
+  fifth, independent protocol-name→IANA-number copy: a hard-coded
+  tcp/udp/icmp/icmpv6 switch with a silent numeric fallback in
+  `compiler_filter.go`, so a name added to the SSOT (sctp/esp/ah/vrrp/...)
+  was silently unavailable to firewall filters even though the identical
+  token resolved in a security policy, and a typo'd name degraded to
+  "match protocol 0". Chose SSOT delegation (Junos firewall filters
+  legitimately accept the broad named/IANA protocol set in `from protocol`,
+  not just L4) plus a `validateFilterProtocols` pass at the top of
+  `compileFirewallFilters` that rejects an unrepresentable token at commit
+  with a clear family/filter/term/token error. No import cycle: pkg/dataplane
+  already imports pkg/appid. L4 subset + numeric (incl. HOPOPT "0") unchanged.
+  5 new Go tests (sctp/esp/ah/vrrp/gre/ospf/igmp/pim resolve; unknown name
+  fails commit on the full compileFirewallFilters path; sctp end-to-end
+  programs protocol 132); SSOT assertions FAIL on pre-fix. build ./... +
+  go test pkg/dataplane/... pkg/appid/... pkg/config/... green.
+  **File(s)**: pkg/dataplane/compiler_filter.go,
+  pkg/dataplane/compiler_filter_protocol_test.go, docs/feature-gaps.md

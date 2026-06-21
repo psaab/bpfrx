@@ -342,6 +342,16 @@ xpf has a broad chassis cluster implementation with redundancy groups, RETH (VRR
 
 xpf has firewall filters with source/dest addresses, prefix-lists (with except), DSCP, protocol, dest/source ports, ICMP type/code, TCP flags, fragment match, actions (accept/reject/discard), routing-instance, log, count, forwarding-class, loss-priority, DSCP rewrite, and IPv6 traffic-class matching.
 
+`from protocol <name>` resolution is centralized (#2175) on the same
+`appid.ProtocolNumber` source of truth used by security-policy applications
+(#2124), so every protocol a policy accepts a firewall filter accepts too: the
+L4 subset (`tcp`/`udp`/`icmp`/`icmpv6`), the broader named set
+(`gre`/`ospf`/`esp`/`ah`/`sctp`/`vrrp`/`igmp`/`pim`/`egp`/`ipip`/...), Junos
+predefined aliases, and any numeric value `0`-`255` (including the deliberate
+`0` for HOPOPT). An unrepresentable protocol token is **rejected at commit with
+a clear error** naming the offending family/filter/term/token, rather than
+silently degrading to "match protocol 0".
+
 | Feature | Junos Config Path | Description | Priority | Status |
 |---------|-------------------|-------------|----------|--------|
 | **Policer (Rate Limiting)** | `firewall policer ... bandwidth-limit N burst-size-limit N` | Token-bucket rate limiter applied to filter terms or interfaces. Single-rate two-color, three-color policers. | High | Partial for #1373: legacy eBPF/~~DPDK~~ (DPDK retired #1525) token-bucket policer support existed; userspace supports the admitted filter path and the color-blind `then discard` three-color slice. #1375 is closed; unsupported color-aware/non-drop behavior and broader Junos parity remain production/future parity work, not active #1373 source-removal blockers. |
