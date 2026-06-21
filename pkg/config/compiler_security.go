@@ -2,6 +2,7 @@ package config
 
 import (
 	"fmt"
+	"net"
 	"strconv"
 )
 
@@ -460,13 +461,22 @@ func compileAddressBook(node *Node, sec *SecurityConfig) error {
 	for _, child := range globalNode.Children {
 		switch child.Name() {
 		case "address":
-			if len(child.Keys) >= 3 {
-				addr := &Address{
-					Name:  child.Keys[1],
-					Value: child.Keys[2],
-				}
-				ab.Addresses[addr.Name] = addr
+			// A single Junos `address <name>` may render as MULTIPLE sibling
+			// AST nodes (flat-set: one leaf per sub-stanza) or as a single
+			// hierarchical block, and the sub-stanzas (prefix, description,
+			// ...) arrive in arbitrary order. Merge by name so a described
+			// address keeps its prefix and a non-prefix sub-stanza never
+			// overwrites Value (#2222).
+			if len(child.Keys) < 2 {
+				continue
 			}
+			name := child.Keys[1]
+			addr := ab.Addresses[name]
+			if addr == nil {
+				addr = &Address{Name: name}
+				ab.Addresses[name] = addr
+			}
+			mergeAddressNode(addr, child)
 		case "address-set":
 			if len(child.Keys) >= 2 {
 				as := &AddressSet{Name: child.Keys[1]}
@@ -489,6 +499,73 @@ func compileAddressBook(node *Node, sec *SecurityConfig) error {
 
 	sec.AddressBook = ab
 	return nil
+}
+
+// mergeAddressNode folds one `address <name> ...` AST node into addr,
+// handling both AST shapes and arbitrary sub-stanza ordering (#2222):
+//
+//   - flat-set prefix leaf:   Keys=[address name <prefix>], IsLeaf, no children
+//   - flat-set sub-stanza:    Keys=[address name <kw> ...] with children
+//     (e.g. [address name description] + child [web-server])
+//   - hierarchical block:     Keys=[address name] with bare-leaf prefix child
+//     and/or [description <text>] child
+//
+// The prefix is taken from Keys[2] ONLY when it parses as a CIDR/IP, never
+// when it is a sub-stanza keyword such as "description". A bare-leaf child
+// (hierarchical block prefix) is the other prefix source. Description is
+// routed to its own field so it can never clobber Value.
+func mergeAddressNode(addr *Address, node *Node) {
+	// Sub-stanza keyword form: Keys[2] is a known attribute keyword
+	// (currently only "description"), so it is NOT the prefix.
+	if len(node.Keys) >= 3 && node.Keys[2] == "description" {
+		if d := descriptionText(node); d != "" {
+			addr.Description = d
+		}
+		return
+	}
+
+	// Prefix-bearing leaf: Keys[2] is the prefix iff it parses as an IP/CIDR.
+	if len(node.Keys) >= 3 && looksLikeIPOrCIDR(node.Keys[2]) {
+		addr.Value = node.Keys[2]
+	}
+
+	// Hierarchical-block children: bare-leaf prefix and/or `description`.
+	for _, sub := range node.Children {
+		switch sub.Name() {
+		case "description":
+			if d := nodeVal(sub); d != "" {
+				addr.Description = d
+			}
+		default:
+			// A bare value leaf (the hierarchical block prefix) parses as a
+			// single token that is an IP/CIDR. Anything else is an unknown
+			// sub-stanza and is intentionally ignored (preserves the prior
+			// permissive behaviour; the warn validator flags a bad Value).
+			if len(sub.Keys) == 1 && looksLikeIPOrCIDR(sub.Keys[0]) {
+				addr.Value = sub.Keys[0]
+			}
+		}
+	}
+}
+
+// descriptionText extracts the description string from a flat-set
+// `address <name> description <text>` node. The node's own Keys are
+// [address, name, description]; the text lives in the single child leaf.
+func descriptionText(node *Node) string {
+	if len(node.Children) > 0 {
+		return node.Children[0].Name()
+	}
+	return ""
+}
+
+// looksLikeIPOrCIDR reports whether s is a bare IP or a CIDR prefix,
+// mirroring the acceptance of the address-book warn validator
+// (net.ParseCIDR || net.ParseIP).
+func looksLikeIPOrCIDR(s string) bool {
+	if _, _, err := net.ParseCIDR(s); err == nil {
+		return true
+	}
+	return net.ParseIP(s) != nil
 }
 
 func compileLog(node *Node, sec *SecurityConfig) error {
