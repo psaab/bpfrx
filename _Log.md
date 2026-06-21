@@ -9451,3 +9451,29 @@ top.
   (dhcpserver, cluster) green; new tests 5x no flake.
   **File(s)**: pkg/dhcpserver/lease_sync.go, pkg/dhcpserver/lease_sync_test.go,
   pkg/dhcpserver/README.md, _Log.md
+
+- **Timestamp**: 2026-06-21
+  **Action**: #2273 — surface per-family RuleList errors from routing clear()
+  instead of swallowing them. All three policy-routing reconcilers
+  (nextTableManager, ribGroupManager, pbrManager in pkg/routing/rules.go)
+  looped [AF_INET, AF_INET6], called RuleList(family), `continue`d on error,
+  and returned nil unconditionally. A transient AF_INET dump failure left the
+  IPv4 rules in the manager's priority window orphaned for that pass while
+  IPv6 was cleaned, and the caller (daemon_apply.go 3b-3d) never learned — a
+  brief, unobservable self-healing window (re-cleared on next commit). Fix:
+  each clear() now aggregates per-family RuleList failures (errors.Join,
+  wrapped with the family) and returns them, while still best-effort deleting
+  every family whose dump succeeded. Each Apply captures the clear error,
+  logs it at WARN, still re-adds the desired rules (forward progress preserved,
+  including the empty-config early returns), then returns the clear error so
+  the daemon observes it. Decision: Apply logs-and-continues — it does NOT
+  abort on a clear() error — so the common (no-error) path is unchanged; the
+  daemon still logs+continues, the failure is now just visible/retryable.
+  Extended fakeRuleOps with a per-family listErr injector + failList helper;
+  added TestRulesClearListErrorSurfaced (table-driven over all three managers)
+  asserting Apply returns an error wrapping the injected failure AND still
+  deletes the successful family's window rule. Fail-on-revert verified
+  (reverting next-table to continue+return-nil fails the next-table subtest).
+  build+vet+test green, new test 5x no flake.
+  **File(s)**: pkg/routing/rules.go, pkg/routing/rules_test.go,
+  pkg/routing/README.md, _Log.md
