@@ -295,6 +295,8 @@ fn pin_segmentation_v6_ext_chain_segments_valid() {
         src_port: 0x1111,
         dst_port: 0x2222,
         vlan_id: 0,
+        vlan_present: false,
+        pcp: 0,
         ttl: 64,
         ihl: 20,
         ext: vec![ExtHdr::HopByHop(0), ExtHdr::DestOpts(0)],

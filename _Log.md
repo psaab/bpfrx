@@ -7660,6 +7660,36 @@ top.
   MERGE-READY; Copilot reviewed 3/3 files, no comments. Control-plane
   display only — no dataplane smoke. PR #2135 MERGEABLE.
 
+## #2145 — screen/SYN-cookie L3-offset on tag-presence, not VID>0
+- **Timestamp**: 2026-06-20
+- **Action**: Fix priority-tagged VLAN-0 misclassification. The screen
+  and SYN-cookie-ACK stages computed the L3 offset as
+  `if meta.ingress_vlan_id > 0 { 18 } else { 14 }`, so an 802.1p
+  priority-tagged frame (real 802.1Q tag, VID 0, PCP>0,
+  ingress_vlan_present=1) was read at offset 14 — parsing the tag's
+  TPID/TCI bytes as the IP header (LAND/syn-frag/flood misclassification,
+  SYN-cookie skipped or computed from garbage). Switched both sites to
+  `meta.ingress_vlan_present != 0` (tag presence), matching
+  tx/cos_classify.rs. Extended the property strategy: PacketSpec gains
+  `vlan_present`/`pcp`; build_valid_frame emits the tag on presence (not
+  VID); new arb_vlan_tag() generates present=true,vid=0,pcp>0 (egress
+  arb_vlan() kept u16, VID-0=untagged is correct there). Added a
+  non-tautological poll_stages unit test (priority-tagged VID-0 SYN
+  parsed at offset 18 via ip-source-route signal + cookie-ACK validates
+  only when tcp_ack read at 18; untagged control still uses 14) and a
+  frame-level pin (frame_l3_offset->18 for the priority-tagged shape).
+- **File(s)**: userspace-dp/src/afxdp/poll_stages.rs,
+  userspace-dp/src/afxdp/frame/prop_tests/strategies.rs,
+  userspace-dp/src/afxdp/frame/prop_tests/inspect.rs,
+  userspace-dp/src/afxdp/frame/prop_tests/rewrite.rs,
+  userspace-dp/src/afxdp/frame/prop_tests/segment.rs,
+  userspace-dp/src/afxdp/README.md
+- **Validation**: cargo build + cargo test --no-run clean; new tests
+  pass and FAIL with the fix reverted (proven non-tautological); 33/33
+  frame prop_tests green; affected suites green. Pre-existing flaky
+  concurrency test (worker_queue_tests concurrent_recovery, untouched)
+  4/5 in isolation — unrelated. Broader L2-centralization deferred to
+  #2150. Smoke deferred to parent (hot-path/security).
 - **Timestamp**: 2026-06-20
   **Action**: #2154 — parseLeaseCSV reads Kea memfile record-by-record
   (`csv.Reader.Read` loop) instead of `ReadAll`, so one torn/concurrent

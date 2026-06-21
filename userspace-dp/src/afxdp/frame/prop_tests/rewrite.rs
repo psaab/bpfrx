@@ -299,6 +299,8 @@ fn pin_packet(v6: bool, protocol: u8, ttl: u8, ext: Vec<ExtHdr>) -> ValidPacket 
         src_port: 0x1111,
         dst_port: 0x2222,
         vlan_id: 0,
+        vlan_present: false,
+        pcp: 0,
         ttl,
         ihl: 20,
         ext,
