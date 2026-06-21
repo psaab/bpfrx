@@ -142,3 +142,73 @@ func TestRibGroupImportRibUndefinedLenientWarns(t *testing.T) {
 		t.Fatalf("expected a downgraded import-rib-reference warning, got: %v", cfg.Warnings)
 	}
 }
+
+// #2253: a malformed family token (".inetX.0", ".inetfoo.0", ".inet60.0",
+// trailing garbage) whose prefix IS a DEFINED routing-instance must still be
+// hard-rejected at commit. The previous loose ".inet" substring match
+// resolved these onto the defined instance — a sloppy rib name silently
+// leaking into the operator's real target table. The exact ".inet.0" /
+// ".inet6.0" suffix match rejects them. Restoring the substring match makes
+// each of these commit cleanly (the fail-on-revert assertion). The commit
+// gate (this test) and the runtime applier (pkg/routing) MUST agree, so both
+// use the same exact-suffix matcher (#2226 gate↔runtime consistency).
+func TestRibGroupImportRibMalformedFamilyRejected(t *testing.T) {
+	malformed := []string{
+		"dmz-vr.inet9.0",
+		"dmz-vr.inetX.0",
+		"dmz-vr.inetfoo.0",
+		"dmz-vr.inet60.0",
+		"dmz-vr.inet.0.garbage",
+	}
+	for _, ribName := range malformed {
+		t.Run(ribName, func(t *testing.T) {
+			tree := buildTree(t, []string{
+				"set routing-instances dmz-vr instance-type virtual-router",
+				"set routing-instances dmz-vr interface-routes rib-group inet dmz-leak",
+				"set routing-options rib-groups dmz-leak import-rib " + ribName,
+			})
+			_, err := CompileConfig(tree)
+			if err == nil {
+				t.Fatalf("expected commit rejection for malformed import-rib %q, got nil", ribName)
+			}
+			if !strings.Contains(err.Error(), "undefined rib") ||
+				!strings.Contains(err.Error(), ribName) {
+				t.Fatalf("error = %v, want it to name the malformed rib %q", err, ribName)
+			}
+		})
+	}
+}
+
+// #2253: the exact-suffix family matcher mirrored from
+// pkg/routing.ribInstanceFromName. Pins acceptance of valid
+// "<instance>.inet.0" / "<instance>.inet6.0" and rejection of malformed
+// family tokens + trailing garbage + empty-prefix forms.
+func TestRibInstanceFromNameConfig(t *testing.T) {
+	tests := []struct {
+		ribName  string
+		instance string
+		ok       bool
+	}{
+		{"vrf1.inet.0", "vrf1", true},
+		{"vrf1.inet6.0", "vrf1", true},
+		{"a.b.inet.0", "a.b", true},
+		{"inet.0", "", false},
+		{"inet6.0", "", false},
+		{"vrf1.inet9.0", "", false},
+		{"vrf1.inetX.0", "", false},
+		{"vrf1.inetfoo.0", "", false},
+		{"vrf1.inet60.0", "", false},
+		{"vrf1.inet.0.garbage", "", false},
+		{".inet.0", "", false},
+		{".inet6.0", "", false},
+		{"garbage", "", false},
+		{"", "", false},
+	}
+	for _, tt := range tests {
+		instance, ok := ribInstanceFromName(tt.ribName)
+		if instance != tt.instance || ok != tt.ok {
+			t.Errorf("ribInstanceFromName(%q) = (%q, %v), want (%q, %v)",
+				tt.ribName, instance, ok, tt.instance, tt.ok)
+		}
+	}
+}

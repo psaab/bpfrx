@@ -547,12 +547,68 @@ func TestResolveRibTable(t *testing.T) {
 		// and spuriously leak the source table into the main lookup).
 		{"unknown-vr.inet.0", 0, false},
 		{"garbage", 0, false},
+		// #2253: a malformed family token whose prefix IS a defined
+		// instance must NOT resolve. A loose ".inet" substring match
+		// accepted these and mapped them onto the instance table; the
+		// exact ".inet.0" / ".inet6.0" suffix match rejects them.
+		{"dmz-vr.inet9.0", 0, false},
+		{"dmz-vr.inetX.0", 0, false},
+		{"dmz-vr.inetfoo.0", 0, false},
+		{"dmz-vr.inet60.0", 0, false},
+		{"dmz-vr.inet.0.garbage", 0, false},
+		{"dmz-vr.inet", 0, false},
+		{".inet.0", 0, false},   // empty instance prefix
+		{".inet6.0", 0, false},  // empty instance prefix
 	}
 
 	for _, tt := range tests {
 		got, ok := resolveRibTable(tt.ribName, tableIDs)
 		if got != tt.want || ok != tt.wantOK {
 			t.Errorf("resolveRibTable(%q) = (%d, %v), want (%d, %v)", tt.ribName, got, ok, tt.want, tt.wantOK)
+		}
+	}
+}
+
+// TestRibInstanceFromName (#2253) pins the EXACT-suffix family matcher that
+// resolveRibTable and the commit-time gate share in spirit. A loose ".inet"
+// substring match accepted malformed family tokens (".inetX.0", ".inetfoo.0",
+// ".inet60.0") and trailing garbage (".inet.0.x"), mapping a typo'd rib onto
+// a real instance table. Restoring the substring match must break this test.
+func TestRibInstanceFromName(t *testing.T) {
+	tests := []struct {
+		ribName  string
+		instance string
+		ok       bool
+	}{
+		// Valid: exact ".inet.0" / ".inet6.0" suffix, non-empty instance.
+		{"vrf1.inet.0", "vrf1", true},
+		{"vrf1.inet6.0", "vrf1", true},
+		{"tunnel-vr.inet.0", "tunnel-vr", true},
+		{"a.b.inet.0", "a.b", true}, // dotted instance prefix is fine
+		// Bare main-table names are NOT instance ribs (caller handles them).
+		{"inet.0", "", false},
+		{"inet6.0", "", false},
+		// Malformed family token — the #2253 bug class.
+		{"vrf1.inet9.0", "", false},
+		{"vrf1.inetX.0", "", false},
+		{"vrf1.inetfoo.0", "", false},
+		{"vrf1.inet60.0", "", false},
+		{"inet9.0", "", false},
+		// Trailing garbage after a valid suffix is rejected.
+		{"vrf1.inet.0.garbage", "", false},
+		// Empty instance prefix is rejected.
+		{".inet.0", "", false},
+		{".inet6.0", "", false},
+		// No family suffix at all.
+		{"garbage", "", false},
+		{"vrf1.inet", "", false},
+		{"", "", false},
+	}
+	for _, tt := range tests {
+		instance, ok := ribInstanceFromName(tt.ribName)
+		if instance != tt.instance || ok != tt.ok {
+			t.Errorf("ribInstanceFromName(%q) = (%q, %v), want (%q, %v)",
+				tt.ribName, instance, ok, tt.instance, tt.ok)
 		}
 	}
 }

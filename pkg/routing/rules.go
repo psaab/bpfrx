@@ -516,12 +516,35 @@ func resolveRibTable(ribName string, tableIDs map[string]int) (int, bool) {
 	if ribName == "inet.0" || ribName == "inet6.0" {
 		return 254, true // main table
 	}
-	// Parse "instance-name.inet.0" or "instance-name.inet6.0"
-	if idx := strings.Index(ribName, ".inet"); idx > 0 {
-		instanceName := ribName[:idx]
+	// Parse "<instance>.inet.0" or "<instance>.inet6.0" with an EXACT family
+	// suffix — a loose ".inet" substring match would accept malformed names
+	// like "<instance>.inetX.0" or "<instance>.inet.0.garbage" and resolve
+	// them to the instance table (#2253). ribInstanceFromName returns the
+	// instance only for the two valid unicast families.
+	if instanceName, ok := ribInstanceFromName(ribName); ok {
 		if tableID, ok := tableIDs[instanceName]; ok {
 			return tableID, true
 		}
 	}
 	return 0, false
+}
+
+// ribInstanceFromName extracts the routing-instance prefix from a non-default
+// rib name of the EXACT form "<instance>.inet.0" or "<instance>.inet6.0",
+// returning ok=false for any other shape. The instance prefix must be
+// non-empty. Junos rib names are exactly "<table>.inet.0" (IPv4 unicast) or
+// "<table>.inet6.0" (IPv6 unicast); bare "inet.0" / "inet6.0" (the main
+// table) are handled by the caller and are NOT treated as instance ribs here.
+// Malformed family tokens (".inetX.0", ".inetfoo.0", ".inet60.0") and trailing
+// garbage (".inet.0.x") return ok=false so the caller rejects them rather than
+// silently mapping a typo'd rib onto the instance table (#2253). This mirrors
+// pkg/config.ribInstanceFromName — the two MUST stay in lockstep so the
+// commit-time gate and the runtime applier agree on what resolves (#2226).
+func ribInstanceFromName(ribName string) (string, bool) {
+	for _, suffix := range []string{".inet.0", ".inet6.0"} {
+		if instance, ok := strings.CutSuffix(ribName, suffix); ok && instance != "" {
+			return instance, true
+		}
+	}
+	return "", false
 }

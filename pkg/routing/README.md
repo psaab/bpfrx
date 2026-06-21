@@ -79,11 +79,21 @@ delegate to the owning domain. Exported types:
   import-rib (typo, non-existent instance, garbage — `ok == false`) is
   skipped with a warning and never sets `needsLeak`, so it cannot install
   a phantom `from all lookup <sourceTable>` rule — and nothing is ever
-  installed into table 0 from an unresolved name (#2226). The matching
+  installed into table 0 from an unresolved name (#2226). The family
+  suffix is matched **exactly**: `resolveRibTable` (via
+  `ribInstanceFromName`) resolves only `inet.0` / `inet6.0` (main table)
+  and `<instance>.inet.0` / `<instance>.inet6.0` (an instance with a
+  non-empty prefix). A malformed family token whose prefix happens to be
+  a defined instance — `<instance>.inetX.0`, `.inetfoo.0`, `.inet60.0`,
+  or trailing garbage like `.inet.0.x` — returns `ok == false` and is
+  rejected, not silently mapped onto the instance table (#2253). The
+  earlier loose `.inet` substring match accepted those. The matching
   commit-time gate `validateRibGroupImportRibReferencesStrict`
-  (`pkg/config`) hard-rejects the dangling import-rib before apply; this
-  runtime guard is the defense-in-depth backstop for the tolerant load /
-  peer-sync path.
+  (`pkg/config`) mirrors the same exact-suffix matcher and hard-rejects
+  the dangling/malformed import-rib before apply; both sides MUST stay in
+  lockstep so the commit gate and the runtime applier agree on what
+  resolves. This runtime guard is the defense-in-depth backstop for the
+  tolerant load / peer-sync path.
 - main table at `32766`. The next-table range sits **before** main
   (lower priority value = higher priority). PBR sits before main as
   well; rib-group sits after.
