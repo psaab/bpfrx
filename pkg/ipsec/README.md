@@ -120,3 +120,31 @@ all files stay in `package ipsec`, so the public API is unchanged.
     gateway — `set security ike gateway <name> address <ip>` (or
     `dynamic hostname <fqdn>`). The shared accept predicate is
     `config.IsUsableIPsecEndpoint`.
+- **AES-GCM proposal ICV suffix + IKE PRF (#2125).** strongSwan has no
+  bare `aes<N>gcm` keyword — AEAD ciphers MUST carry an explicit ICV
+  length. `normalizeEncAlg` (`ike.go`) maps the Junos-native GCM names
+  (`aes-128-gcm`/`aes-192-gcm`/`aes-256-gcm`) to the 16-octet-ICV
+  swanctl tokens (`aes128gcm16`/`aes192gcm16`/`aes256gcm16` — Junos
+  AES-GCM uses a 16-octet ICV) before the generic dash-strip, so the
+  proposal builders no longer emit the unparseable `aes256gcm-modp2048`
+  that silently failed the SA at apply while the commit succeeded.
+  Already-suffixed forms (e.g. `aes256gcm128`) pass through unchanged.
+  For AEAD the integrity algorithm is dropped (GCM carries its own ICV)
+  and, for IKE (Phase 1) only, an explicit PRF is appended
+  (`aes256gcm16-prfsha256-modp2048`) because an AEAD proposal has no
+  integrity algorithm for strongSwan to derive a PRF from; the PRF
+  mirrors the proposal's auth algorithm when set, defaulting to
+  `prfsha256`. ESP children take no PRF.
+- **swanctl double-quote / backslash escaping (#2126).** Free-text
+  values interpolated inside a swanctl double-quoted string — the PSK
+  `secret = "..."` and the `id = "..."` / `certs = "..."` lines — are
+  run through `escapeSwanctlQuoted` (`policy.go`), which doubles
+  backslashes then escapes double-quotes (order matters). The swanctl
+  settings lexer treats a bare `"` as the string terminator and
+  processes `\\`/`\"` escapes inside quotes, so a PSK or distinguished-
+  name identity containing a literal `"` (e.g. `pa"ss`, `CN=fw, O=acme`)
+  no longer corrupts the secrets/identity block (a silent IKE auth
+  failure). This composes with — does not replace — the #1798
+  `sanitizeSwanctlValue` control-char belt (sanitize first, then
+  escape). Identity values are now always emitted quoted so a DN with
+  spaces/commas parses as a single value.
