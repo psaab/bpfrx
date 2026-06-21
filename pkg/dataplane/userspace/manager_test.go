@@ -2177,7 +2177,7 @@ func TestBuildSourceNATSnapshotsPopulatesPoolFields(t *testing.T) {
 		}},
 	}}
 
-	snaps := buildSourceNATSnapshots(cfg)
+	snaps := buildSourceNATSnapshots(cfg, nil)
 	if len(snaps) != 1 {
 		t.Fatalf("len(snaps) = %d, want 1", len(snaps))
 	}
@@ -2257,7 +2257,7 @@ func TestBuildSourceNATSnapshotsMarksUnsafePoolModeRules(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			cfg := sourceNATPoolTestConfig()
 			cfg.Security.NAT.SourcePools = tt.pools
-			snaps := buildSourceNATSnapshots(cfg)
+			snaps := buildSourceNATSnapshots(cfg, nil)
 			if len(snaps) != 1 {
 				t.Fatalf("len(snaps) = %d, want 1; snaps=%+v", len(snaps), snaps)
 			}
@@ -5418,6 +5418,74 @@ func TestSumBindingCounters(t *testing.T) {
 	// snat/dnat and pushed into GlobalCtrNAT64Xlate by syncBPFCountersLocked.
 	if s.nat64Translations != 30 {
 		t.Fatalf("nat64Translations = %d, want 30", s.nat64Translations)
+	}
+}
+
+// TestSyncBPFCountersMirrorsNATRuleCounters is the #2218 fail-on-revert
+// guard for the Go control-plane half: the Rust helper reports per-rule SNAT/
+// DNAT/static-NAT translation hits in ProcessStatus.NATRuleCounters, and
+// syncBPFCountersLocked must mirror them into the bpfShim offset map so the
+// existing operator read path (Manager/adapter ReadNATRuleCounter →
+// `show security nat ... rule`) returns the live total instead of a perpetual
+// 0. Before the fix the helper counts were never surfaced through
+// ReadNATRuleCounter; this test FAILS (counter stays 0) if the mirror loop is
+// reverted.
+func TestSyncBPFCountersMirrorsNATRuleCounters(t *testing.T) {
+	m := New()
+	status := &ProcessStatus{
+		NATRuleCounters: []NATRuleCounterStatus{
+			{CounterID: 1, Packets: 7, Bytes: 700},
+			{CounterID: 3, Packets: 11, Bytes: 1100},
+			// CounterID 0 is the "no per-rule counter" sentinel and must be
+			// skipped (never overwrite counter slot 0).
+			{CounterID: 0, Packets: 99, Bytes: 9900},
+		},
+	}
+	m.mu.Lock()
+	m.syncBPFCountersLocked(status)
+	m.mu.Unlock()
+
+	got, err := m.bpfShim.ReadNATRuleCounter(1)
+	if err != nil {
+		t.Fatalf("ReadNATRuleCounter(1): %v", err)
+	}
+	if got != (dataplane.CounterValue{Packets: 7, Bytes: 700}) {
+		t.Fatalf("counter 1 = %+v, want packets=7 bytes=700 (mirror loop reverted?)", got)
+	}
+	got, err = m.bpfShim.ReadNATRuleCounter(3)
+	if err != nil {
+		t.Fatalf("ReadNATRuleCounter(3): %v", err)
+	}
+	if got != (dataplane.CounterValue{Packets: 11, Bytes: 1100}) {
+		t.Fatalf("counter 3 = %+v, want packets=11 bytes=1100", got)
+	}
+	// Counter 0 must be untouched (sentinel skipped).
+	got, err = m.bpfShim.ReadNATRuleCounter(0)
+	if err != nil {
+		t.Fatalf("ReadNATRuleCounter(0): %v", err)
+	}
+	if got != (dataplane.CounterValue{}) {
+		t.Fatalf("counter 0 = %+v, want zero (sentinel must be skipped)", got)
+	}
+
+	// Subsequent polls overwrite absolutely (helper reports cumulative).
+	status.NATRuleCounters[0].Packets = 50
+	status.NATRuleCounters[0].Bytes = 5000
+	m.mu.Lock()
+	m.syncBPFCountersLocked(status)
+	m.mu.Unlock()
+	got, _ = m.bpfShim.ReadNATRuleCounter(1)
+	if got != (dataplane.CounterValue{Packets: 50, Bytes: 5000}) {
+		t.Fatalf("counter 1 after second poll = %+v, want packets=50 bytes=5000 (absolute overwrite)", got)
+	}
+
+	// ClearNATRuleCounters drops the offsets.
+	if err := m.bpfShim.ClearNATRuleCounters(); err != nil {
+		t.Fatalf("ClearNATRuleCounters: %v", err)
+	}
+	got, _ = m.bpfShim.ReadNATRuleCounter(1)
+	if got != (dataplane.CounterValue{}) {
+		t.Fatalf("counter 1 after clear = %+v, want zero", got)
 	}
 }
 

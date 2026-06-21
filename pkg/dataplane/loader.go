@@ -46,8 +46,16 @@ type Manager struct {
 	EnableCPUMap            bool // Enable cpumap multi-CPU distribution (adds startup overhead)
 	xdpEntryProg            string
 	VlanSubInterfaces       map[int]bool      // VLAN sub-interface ifindexes (skip XDP swap for these)
-	mu                      sync.Mutex        // protects userspaceCounterOffsets
+	mu                      sync.Mutex        // protects userspaceCounterOffsets + natRuleCounterOffsets
 	userspaceCounterOffsets map[uint32]uint64 // userspace counter deltas merged in ReadGlobalCounter
+	// natRuleCounterOffsets holds per-rule NAT translation hit totals reported
+	// by the Rust userspace dataplane (keyed by compiler-assigned counter ID),
+	// merged into ReadNATRuleCounter. The Rust forwarder never writes the
+	// nat_rule_counters BPF map (#2218: the #1476 eBPF retirement dropped the
+	// legacy XDP increments), so these mirror the live helper totals into the
+	// existing operator read path. Values are absolute cumulative totals, not
+	// deltas (SetNATRuleCounterOffset overwrites).
+	natRuleCounterOffsets map[uint32]CounterValue
 
 	// #863: refcount of XDP-attached ifindexes that "claim" the
 	// IFACE_FLAG_XDP_ATTACHED bit on each iface_zone_map entry.
