@@ -172,3 +172,92 @@ func TestKea6StaticBindingRendersReservation(t *testing.T) {
 		t.Errorf("hostname: got %q, want nas", res[0].Hostname)
 	}
 }
+
+// TestKeaStaticBindingMACCanonicalized is the FAIL-ON-REVERT proof for the
+// MAC-canonicalization fix (#2243 review): ValidateMAC/net.ParseMAC accept
+// the Cisco dotted-triplet form (0011.2233.4455) and uppercase, but Kea's
+// hw-address parser REJECTS the dotted form. Render MUST normalize to
+// canonical colon-lowercase (aa:bb:cc:dd:ee:ff) for BOTH v4 and v6 so a
+// config that commits clean cannot break the Kea reconfigure. Pre-fix the
+// MAC rendered verbatim (dotted / upper), so this test fails on revert.
+func TestKeaStaticBindingMACCanonicalized(t *testing.T) {
+	t.Run("v4 dotted-triplet + uppercase", func(t *testing.T) {
+		m, _ := testManager(t, map[string]bool{}, "")
+		cfg := &config.DHCPServerConfig{
+			DHCPLocalServer: &config.DHCPLocalServerConfig{
+				Groups: map[string]*config.DHCPServerGroup{
+					"g0": {
+						Name:       "g0",
+						Interfaces: []string{"ge-0-0-0"},
+						Pools: []*config.DHCPPool{{
+							Name:   "p0",
+							Subnet: "10.0.1.0/24",
+							StaticBindings: []*config.DHCPStaticBinding{
+								// Cisco dotted-triplet form.
+								{MACAddress: "0011.2233.4455", FixedAddress: "10.0.1.50"},
+								// Uppercase colon form.
+								{MACAddress: "AA:BB:CC:DD:EE:FF", FixedAddress: "10.0.1.51"},
+							},
+						}},
+					},
+				},
+			},
+		}
+		if err := m.Apply(cfg); err != nil {
+			t.Fatalf("Apply: %v", err)
+		}
+		subs := readSubnet4(t, m.confPath4)
+		if len(subs) != 1 {
+			t.Fatalf("want 1 subnet, got %d", len(subs))
+		}
+		res := subs[0].Reservations
+		if len(res) != 2 {
+			t.Fatalf("want 2 reservations, got %d (%+v)", len(res), res)
+		}
+		if res[0].HWAddress != "00:11:22:33:44:55" {
+			t.Errorf("dotted MAC not canonicalized: got %q, want 00:11:22:33:44:55", res[0].HWAddress)
+		}
+		if res[1].HWAddress != "aa:bb:cc:dd:ee:ff" {
+			t.Errorf("uppercase MAC not lowercased: got %q, want aa:bb:cc:dd:ee:ff", res[1].HWAddress)
+		}
+	})
+
+	t.Run("v6 dotted-triplet + uppercase", func(t *testing.T) {
+		m, _ := testManager(t, map[string]bool{}, "")
+		cfg := &config.DHCPServerConfig{
+			DHCPv6LocalServer: &config.DHCPLocalServerConfig{
+				Groups: map[string]*config.DHCPServerGroup{
+					"g0": {
+						Name:       "g0",
+						Interfaces: []string{"ge-0-0-0"},
+						Pools: []*config.DHCPPool{{
+							Name:   "p0",
+							Subnet: "2001:db8::/64",
+							StaticBindings: []*config.DHCPStaticBinding{
+								{MACAddress: "0011.2233.4466", FixedAddress: "2001:db8::50"},
+								{MACAddress: "AA:BB:CC:DD:EE:F0", FixedAddress: "2001:db8::51"},
+							},
+						}},
+					},
+				},
+			},
+		}
+		if err := m.Apply(cfg); err != nil {
+			t.Fatalf("Apply: %v", err)
+		}
+		subs := readSubnet6(t, m.confPath6)
+		if len(subs) != 1 {
+			t.Fatalf("want 1 subnet, got %d", len(subs))
+		}
+		res := subs[0].Reservations
+		if len(res) != 2 {
+			t.Fatalf("want 2 reservations, got %d (%+v)", len(res), res)
+		}
+		if res[0].HWAddress != "00:11:22:33:44:66" {
+			t.Errorf("dotted MAC not canonicalized: got %q, want 00:11:22:33:44:66", res[0].HWAddress)
+		}
+		if res[1].HWAddress != "aa:bb:cc:dd:ee:f0" {
+			t.Errorf("uppercase MAC not lowercased: got %q, want aa:bb:cc:dd:ee:f0", res[1].HWAddress)
+		}
+	})
+}

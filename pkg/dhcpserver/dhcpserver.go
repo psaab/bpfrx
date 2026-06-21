@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/netip"
 	"os"
 	"os/exec"
@@ -598,6 +599,25 @@ func (m *Manager) warnAmbiguousV4SubnetSelection(srv *config.DHCPLocalServerConf
 	}
 }
 
+// canonicalMAC normalizes a static-binding MAC to Kea's accepted
+// colon-separated lowercase form (aa:bb:cc:dd:ee:ff). ValidateMAC at
+// commit accepts Go's net.ParseMAC inputs, which include the Cisco
+// dotted-triplet form (0011.2233.4455) and uppercase — but Kea's
+// hw-address parser REJECTS the dotted form, so a config that commits
+// clean would otherwise break the entire Kea Dhcp4/6 reconfigure (parse
+// failure -> server down). Render canonically. The MAC was already
+// validated at commit, so a parse error here is not expected; on the
+// off chance it occurs we report it so the caller can skip the entry
+// (consistent with the tolerant-load skip guard) rather than emit a
+// malformed reservation.
+func canonicalMAC(mac string) (string, bool) {
+	hw, err := net.ParseMAC(mac)
+	if err != nil {
+		return "", false
+	}
+	return hw.String(), true
+}
+
 func (m *Manager) generateKea4Config(cfg *config.DHCPServerConfig) error {
 	type keaPool struct {
 		Pool string `json:"pool"`
@@ -666,8 +686,14 @@ func (m *Manager) generateKea4Config(cfg *config.DHCPServerConfig) error {
 				if sb == nil || sb.MACAddress == "" || sb.FixedAddress == "" {
 					continue
 				}
+				hw, ok := canonicalMAC(sb.MACAddress)
+				if !ok {
+					m.warn("skipping DHCP static binding with unparseable MAC",
+						"group", group.Name, "mac", sb.MACAddress)
+					continue
+				}
 				sub.Reservations = append(sub.Reservations, keaReservation{
-					HWAddress: sb.MACAddress,
+					HWAddress: hw,
 					IPAddress: sb.FixedAddress,
 					Hostname:  sb.HostName,
 				})
@@ -771,8 +797,14 @@ func (m *Manager) generateKea6Config(cfg *config.DHCPServerConfig) error {
 				if sb == nil || sb.MACAddress == "" || sb.FixedAddress == "" {
 					continue
 				}
+				hw, ok := canonicalMAC(sb.MACAddress)
+				if !ok {
+					m.warn("skipping DHCPv6 static binding with unparseable MAC",
+						"group", group.Name, "mac", sb.MACAddress)
+					continue
+				}
 				sub.Reservations = append(sub.Reservations, keaReservation6{
-					HWAddress:   sb.MACAddress,
+					HWAddress:   hw,
 					IPAddresses: []string{sb.FixedAddress},
 					Hostname:    sb.HostName,
 				})
