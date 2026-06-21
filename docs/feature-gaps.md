@@ -350,7 +350,15 @@ L4 subset (`tcp`/`udp`/`icmp`/`icmpv6`), the broader named set
 predefined aliases, and any numeric value `0`-`255` (including the deliberate
 `0` for HOPOPT). An unrepresentable protocol token is **rejected at commit with
 a clear error** naming the offending family/filter/term/token, rather than
-silently degrading to "match protocol 0".
+silently degrading to "match protocol 0". The operator-visible refusal is
+enforced at the config commit-check layer
+(`config.validateFilterProtocolsStrict`, lenient warn-only on the load /
+peer-sync path so a persisted/synced config still boots — #1960), with the
+dataplane compiler (`validateFilterProtocols`) keeping an identical check as a
+strictly-more-fail-closed backstop. Because `pkg/appid` imports `pkg/config`,
+the commit-check gate INLINE-mirrors the `appid.ProtocolNumber` acceptance set
+(it cannot import `appid` — an import cycle); a `pkg/appid` drift-guard test
+pins the two together so the duplicated table cannot diverge silently.
 
 | Feature | Junos Config Path | Description | Priority | Status |
 |---------|-------------------|-------------|----------|--------|

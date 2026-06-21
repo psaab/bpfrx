@@ -142,10 +142,18 @@ func TestValidateFilterProtocolsAcceptsRepresentable(t *testing.T) {
 	}
 }
 
-// TestCompileFirewallFiltersUnknownProtocolFailsCommit drives the full
-// compileFirewallFilters entry point to prove the unknown-protocol error
-// propagates to the caller (the commit path) rather than being swallowed.
-func TestCompileFirewallFiltersUnknownProtocolFailsCommit(t *testing.T) {
+// TestCompileFirewallFiltersUnknownProtocolReturnsDataplaneError drives the
+// full compileFirewallFilters entry point to prove the dataplane defense-in-
+// depth gate returns an error and programs NO rules for an unrepresentable
+// protocol. NOTE: in production the daemon SWALLOWS this dataplane-layer error
+// (compileErrorMustAbortApply == false — it is not in
+// requiredProtocolGateSentinels), so this does NOT by itself refuse the
+// operator commit. The operator-visible commit refusal is enforced one layer
+// up by config.validateFilterProtocolsStrict — see
+// pkg/config/compiler_filter_protocol_test.go
+// (TestFilterProtocol_*_RejectsAtCommit). This test pins the dataplane gate as
+// the strictly-more-fail-closed backstop.
+func TestCompileFirewallFiltersUnknownProtocolReturnsDataplaneError(t *testing.T) {
 	cfg := filterCfgWithProtocol("inet", "bogus-proto")
 	dp := &recordingFilterDP{}
 	result := &CompileResult{}

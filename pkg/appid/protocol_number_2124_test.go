@@ -1,6 +1,10 @@
 package appid
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/psaab/xpf/pkg/config"
+)
 
 // #2124 — ProtocolNumber is the single source of truth for resolving a protocol
 // name/alias/numeric string to its IANA number. These tests pin the table the
@@ -63,6 +67,47 @@ func TestProtocolNumberParityWithCatalog(t *testing.T) {
 		want, _ := ProtocolNumber(name)
 		if got := catalogProtocolNumber(name); got != want {
 			t.Errorf("catalogProtocolNumber(%q) = %d, ProtocolNumber = %d (divergence)", name, got, want)
+		}
+	}
+}
+
+// TestFilterProtocolResolvableMatchesProtocolNumber is the #2175 drift guard
+// for the firewall-filter commit-check gate. The compiler's
+// validateFilterProtocolsStrict resolves `from protocol <token>` via
+// config.filterProtocolResolvable, which INLINE-duplicates the acceptance set
+// of ProtocolNumber's ok==true result because pkg/appid imports pkg/config (so
+// the compiler cannot call ProtocolNumber directly without an import cycle —
+// the same constraint behind ApplicationsToValidateStrict / #2185). This test
+// pins the two together: for every token, config.FilterProtocolResolvable must
+// equal the ok bool of ProtocolNumber. If a future change to ProtocolNumber's
+// table silently diverges from the compiler copy, this fails — turning a silent
+// commit-gate drift (commit accepts a token the dataplane SSOT then drops, or
+// rejects one it accepts) into a test failure. It is a cross-check TEST, not a
+// runtime coupling.
+func TestFilterProtocolResolvableMatchesProtocolNumber(t *testing.T) {
+	tokens := []string{
+		// L4 subset + broader named set.
+		"tcp", "udp", "icmp", "icmpv6", "icmp6", "gre", "ospf", "ipip",
+		"esp", "ah", "sctp", "vrrp", "igmp", "pim", "egp",
+		// Junos predefined aliases.
+		"junos-tcp-any", "junos-udp-any", "junos-icmp-all", "junos-ping",
+		"junos-icmp6-all", "junos-pingv6", "junos-gre", "junos-ospf",
+		"junos-ip-in-ip", "junos-ipip",
+		// Case-insensitivity + whitespace trim.
+		"ESP", "Sctp", " tcp ",
+		// Numeric, including the deliberate "0" (HOPOPT) and the 0..255 bounds.
+		"0", "1", "47", "132", "255",
+		// Unrepresentable: out of range, malformed, junk, empty, and a
+		// junos-* alias that ProtocolNumber does NOT resolve (validateProtocol
+		// blanket-accepts any junos-* prefix, but the filter gate must not).
+		"256", "-1", "0x50", "bogus", "definitely-not-a-proto", "",
+		"junos-foobar",
+	}
+	for _, tok := range tokens {
+		_, want := ProtocolNumber(tok)
+		if got := config.FilterProtocolResolvable(tok); got != want {
+			t.Errorf("FilterProtocolResolvable(%q) = %v, ProtocolNumber ok = %v (divergence)",
+				tok, got, want)
 		}
 	}
 }

@@ -1,5 +1,53 @@
 # Action Log
 
+## 2026-06-21 — #2175 review fold: firewall-filter protocol refuses commit
+
+- **Timestamp**: 2026-06-21
+- **Action**: Folded a MINOR review fix into the #2175 SSOT PR. The
+  branch routed `from protocol <token>` through the centralized
+  `appid.ProtocolNumber` and added `validateFilterProtocols` in the
+  DATAPLANE compiler (`compileFirewallFilters`), but that error path is
+  not in `requiredProtocolGateSentinels`, so
+  `compileErrorMustAbortApply` is false at `daemon_apply.go` — the
+  daemon SWALLOWS it (journal WARN + /health LastError only) and commit
+  reports SUCCESS while the term silently programs no protocol match.
+  Inconsistent with siblings #2142 (`validateApplicationSpecsStrict`)
+  and #2173 (`validateNATHostMaskStrict`) which refuse at the
+  `pkg/config` commit-check layer. Added
+  `validateFilterProtocolsStrict` (pkg/config/compiler.go), wired into
+  `compileExpanded` after the application-specs gate behind a new
+  `lenientFilterProtocols` opt (true on the load / peer-sync paths,
+  false on commit / commit-check). An invalid token (not a known name,
+  junos-* alias, or 0..255 numeric) now FAILS commit with a
+  family/filter/term/token error; LOAD / peer-sync downgrade to a
+  warning so a persisted/synced config still boots (#1960 no-brick).
+  Because `pkg/appid` imports `pkg/config` (import cycle), the gate
+  INLINE-mirrors `appid.ProtocolNumber`'s acceptance set via
+  `filterProtocolResolvable` (tighter than `validateProtocol`, which
+  blanket-accepts any `junos-` prefix); a `pkg/appid` drift-guard test
+  (`TestFilterProtocolResolvableMatchesProtocolNumber`) pins it to the
+  SSOT via the exported `FilterProtocolResolvable` accessor (#2185
+  pattern). KEPT the dataplane `validateFilterProtocols` as
+  strictly-more-fail-closed defense-in-depth. Reworded
+  docs/feature-gaps.md to attribute the commit refusal to the
+  commit-check layer + dataplane backstop. Renamed the misleading
+  `TestCompileFirewallFiltersUnknownProtocolFailsCommit` (it exercised
+  the dataplane drop, not commit refusal) to
+  `...ReturnsDataplaneError`. Added commit-refusal + valid-commit +
+  lenient-load tests; verified the commit-refusal tests FAIL when the
+  strict gate is neutralized.
+- **File(s)**: pkg/config/compiler.go,
+  pkg/config/compiler_filter_protocol_test.go,
+  pkg/appid/protocol_number_2124_test.go,
+  pkg/dataplane/compiler_filter_protocol_test.go,
+  docs/feature-gaps.md, _Log.md
+- **Validation**: `go build ./...` clean; `go test ./pkg/config/...
+  ./pkg/dataplane/... ./pkg/appid/... ./pkg/daemon/...` all pass;
+  `go vet` clean; revert-proof confirmed (commit-refusal + lenient-warn
+  tests fail with the gate removed); valid protocols
+  (tcp/udp/icmp/icmpv6/sctp/esp/ah/gre/ospf/vrrp/igmp/pim/junos-*/0/47/
+  132/255) still commit.
+
 ## 2026-06-21 — #2144 validate routing export references at commit
 
 - **Timestamp**: 2026-06-21
