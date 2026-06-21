@@ -41,6 +41,228 @@ func validatePoolUtilizationAlarm(cfg *Config, lenient bool) ([]string, error) {
 	return nil, fmt.Errorf("%s", msg)
 }
 
+// natAddrFamily classifies an IP-part string the way the Rust parsers do,
+// so the Go commit gate and the dataplane agree on every input.
+//
+//   - kind "v4": parses as IPv4 AND is textually a dotted-quad (no colon) —
+//     i.e. exactly what Rust `Ipv4Addr::from_str` / `IpAddr::V4` accept.
+//   - kind "v6": parses as IPv6 (textually colon-bearing) — what Rust
+//     `IpAddr::V6` represents.
+//   - kind "": does not parse as an IP at all (e.g. an address-book name);
+//     NOT this validator's concern.
+//
+// The colon test is load-bearing: Go's net.ParseIP("::ffff:1.2.3.4").To4()
+// is NON-nil (Go folds the IPv4-mapped form), but Rust `Ipv4Addr::from_str`
+// REJECTS it and `IpAddr::from_str` classifies it as V6. Keying the family
+// on text (no colon == v4) reproduces the Rust classification exactly, so a
+// mapped form is treated as IPv6 here too — never accepted as a v4 host that
+// the dataplane would then silently drop.
+func natAddrFamily(ipPart string) string {
+	if net.ParseIP(ipPart) == nil {
+		return ""
+	}
+	if strings.IndexByte(ipPart, ':') >= 0 {
+		return "v6"
+	}
+	return "v4"
+}
+
+// isHostMaskAddress reports whether addr is a host route the static-NAT
+// dataplane can install: a bare IP (no mask) or the canonical host mask
+// (/32 for IPv4, /128 for IPv6). It mirrors EXACTLY the Rust host-mask gate
+// added in PR #2167 for static NAT (parse_nat_addr in
+// userspace-dp/src/nat/static_nat.rs): static NAT is a strictly 1:1 host
+// mapping, so a non-host mask carries no representable meaning. The family
+// (hence the required mask) is keyed on natAddrFamily so an IPv4-mapped
+// IPv6 literal is classified the SAME as Rust (V6, host_len 128). The
+// second return value reports whether addr parsed as an IP at all; a non-IP
+// token (e.g. an address-book name) is NOT this validator's concern and is
+// left to the existing address handling.
+//
+// NOTE: NAT64 source-pool addresses use isNAT64PoolHostAddress, NOT this
+// predicate — the Rust parse_pool_v4 (nat64.rs) is IPv4-ONLY (the pool
+// translates to IPv4 source addresses), so an IPv6 pool entry that this
+// predicate would accept (its /128 host form) is silently dropped there.
+func isHostMaskAddress(addr string) (host bool, parsed bool) {
+	slash := strings.IndexByte(addr, '/')
+	ipPart := addr
+	if slash >= 0 {
+		ipPart = addr[:slash]
+	}
+	fam := natAddrFamily(ipPart)
+	if fam == "" {
+		return false, false
+	}
+	if slash < 0 {
+		// Bare address — a host in both families.
+		return true, true
+	}
+	maskPart := addr[slash+1:]
+	wantMask := "128"
+	if fam == "v4" {
+		wantMask = "32"
+	}
+	return maskPart == wantMask, true
+}
+
+// isNAT64PoolHostAddress reports whether addr is an IPv4 host route the
+// NAT64 source pool can install. It mirrors EXACTLY the Rust parse_pool_v4
+// gate (userspace-dp/src/nat64.rs): the NAT64 pool holds IPv4 source
+// addresses, so it accepts ONLY a bare IPv4 address or an IPv4 /32 — an
+// IPv6 address (bare or any mask, INCLUDING the IPv4-mapped ::ffff:x.x.x.x
+// form that Ipv4Addr::from_str rejects) and a non-host IPv4 mask are all
+// silently dropped by parse_pool_v4, so the commit gate must reject them
+// too or the gate and the dataplane disagree. Family is keyed on
+// natAddrFamily (textual, colon == v6) to match Ipv4Addr::from_str. The
+// second return value reports whether addr parsed as an IP at all (so a
+// non-IP address-book token is left to existing handling); a parseable
+// non-IPv4 address returns (host=false, parsed=true) — it parsed, but is
+// not an installable pool address.
+func isNAT64PoolHostAddress(addr string) (host bool, parsed bool) {
+	slash := strings.IndexByte(addr, '/')
+	ipPart := addr
+	if slash >= 0 {
+		ipPart = addr[:slash]
+	}
+	fam := natAddrFamily(ipPart)
+	if fam == "" {
+		return false, false
+	}
+	if fam != "v4" {
+		// Parsed, but not an IPv4 pool address — reject (parse_pool_v4 drops).
+		return false, true
+	}
+	if slash < 0 {
+		return true, true
+	}
+	// Only an IPv4 /32 is an installable pool host address.
+	return addr[slash+1:] == "32", true
+}
+
+// validateNATHostMaskStrict is the #2173 strict-vs-lenient gate that
+// rejects a static-NAT match/prefix or a NAT64 source-pool address whose
+// mask is not a host route (/32 for v4, /128 for v6; a bare address is a
+// host too). #2132 made the Rust dataplane TOLERATE the canonical host
+// mask, and PR #2167 then hardened the Rust parser to REJECT a non-host
+// mask — so today a misconfigured /24 static-NAT match or pool address is
+// SILENTLY DROPPED at the dataplane (the rule is parsed-out, never
+// installed) with no operator feedback. This commit-time check surfaces
+// the misconfiguration at `commit`/`commit check` instead.
+//
+// Scope mirrors what the Rust host-mask gate covers:
+//   - static-NAT rules' `match destination-address` (-> ExternalIP) and
+//     `then static-nat prefix` (-> InternalIP). NPTv6 (`nptv6-prefix`) and
+//     NAT64 (`static-nat inet`) rules are EXEMPT: NPTv6 is a genuine prefix
+//     translation (RFC 6296), and an `inet` rule's match is the NAT64
+//     well-known prefix (e.g. 64:ff9b::/96) with translation driven by the
+//     separate NAT64 snapshot, not the static_nat table.
+//   - NAT64 source-pool addresses (the IPv4 pool referenced by a
+//     `nat64 rule-set ... source-pool` — parse_pool_v4 host-mask gate).
+//
+// Strict (commit / commit-check): hard-reject. Lenient (load / peer-sync,
+// #1960 / #1979 doctrine): return the message as a warning so a config
+// committed before this gate existed still boots (fail-closed-on-compile-
+// failure would otherwise brick the daemon on restart); the dataplane
+// independently drops the bad entry, so a leniently-loaded config is
+// already inert for that rule, not mis-installed.
+func validateNATHostMaskStrict(cfg *Config, lenient bool) ([]string, error) {
+	if cfg == nil {
+		return nil, nil
+	}
+	var warnings []string
+	// emitSuffix returns a violation as an error (strict) or appends it to the
+	// lenient warning list with a dataplane-effect suffix. The suffix differs
+	// by case: a static-NAT IP failure drops the WHOLE rule (parse_nat_addr
+	// returns None for the rule's match/then), whereas a NAT64 source-pool
+	// entry is dropped individually by filter_map(parse_pool_v4) — the rest of
+	// the pool/rule stays installed. Keep the load-path text precise so the
+	// operator does not over-read the impact.
+	emitSuffix := func(msg, suffix string) error {
+		if lenient {
+			warnings = append(warnings, msg+suffix)
+			return nil
+		}
+		return fmt.Errorf("%s", msg)
+	}
+	emit := func(msg string) error {
+		return emitSuffix(msg, " (ignored: rule dropped by dataplane until corrected)")
+	}
+
+	for _, rs := range cfg.Security.NAT.Static {
+		if rs == nil {
+			continue
+		}
+		for _, rule := range rs.Rules {
+			if rule == nil || rule.IsNPTv6 {
+				continue
+			}
+			// `then static-nat inet` is a NAT64 translation, not host-1:1
+			// static NAT: its `match destination-address` is the NAT64
+			// well-known prefix (e.g. 64:ff9b::/96, a legitimate non-host
+			// prefix) and the actual translation is driven by the separate
+			// NAT64 snapshot (buildNAT64Snapshots), not the static_nat table
+			// (the inet rule's static_nat snapshot entry is expected to be a
+			// no-op the Rust parse drops). Exempt the whole rule.
+			if rule.Then == "inet" {
+				continue
+			}
+			if rule.Match != "" {
+				if host, parsed := isHostMaskAddress(rule.Match); parsed && !host {
+					if err := emit(fmt.Sprintf(
+						"security nat static rule-set %q rule %q match destination-address %q must be a host route (/32 for IPv4, /128 for IPv6); a non-host mask is silently dropped by the dataplane",
+						rs.Name, rule.Name, rule.Match)); err != nil {
+						return nil, err
+					}
+				}
+			}
+			if rule.Then != "" {
+				if host, parsed := isHostMaskAddress(rule.Then); parsed && !host {
+					if err := emit(fmt.Sprintf(
+						"security nat static rule-set %q rule %q then static-nat prefix %q must be a host route (/32 for IPv4, /128 for IPv6); a non-host mask is silently dropped by the dataplane",
+						rs.Name, rule.Name, rule.Then)); err != nil {
+						return nil, err
+					}
+				}
+			}
+		}
+	}
+
+	// NAT64 source-pool addresses are discrete IPv4 host source IPs: the Rust
+	// parse_pool_v4 (nat64.rs) accepts ONLY a bare IPv4 or an IPv4 /32 and
+	// silently drops everything else (an IPv6 address, a non-host IPv4 mask).
+	// Range-expanded pool entries are always /32 by construction
+	// (expandAddressRange), so only an operator-authored single
+	// `pool address <X>` can trip this.
+	for _, rs := range cfg.Security.NAT.NAT64 {
+		if rs == nil || rs.SourcePool == "" {
+			continue
+		}
+		pool, ok := cfg.Security.NAT.SourcePools[rs.SourcePool]
+		if !ok || pool == nil {
+			continue
+		}
+		addrs := pool.Addresses
+		if pool.Address != "" {
+			addrs = append([]string{pool.Address}, addrs...)
+		}
+		for _, a := range addrs {
+			if a == "" {
+				continue
+			}
+			if host, parsed := isNAT64PoolHostAddress(a); parsed && !host {
+				if err := emitSuffix(fmt.Sprintf(
+					"security nat source pool %q address %q is referenced by nat64 rule-set %q source-pool and must be an IPv4 host route (a bare IPv4 address or /32); a non-host or IPv6 address is silently dropped by the dataplane",
+					pool.Name, a, rs.Name),
+					" (ignored: only this pool address is dropped by the dataplane until corrected)"); err != nil {
+					return nil, err
+				}
+			}
+		}
+	}
+
+	return warnings, nil
+}
+
 func compileNAT(node *Node, sec *SecurityConfig) error {
 	// Initialize SourcePools map
 	if sec.NAT.SourcePools == nil {

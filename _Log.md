@@ -1,5 +1,15 @@
 # Action Log
 
+## 2026-06-21 — #2173 (PR #2182) fold: v4-mapped-v6 host-mask family divergence
+
+- **2026-06-21** — Folded MINOR review fixes into PR #2182: NAT host-mask family is now classified textually via `natAddrFamily` (colon => IPv6, matching Rust `IpAddr`/`Ipv4Addr`), NOT `net.ParseIP(...).To4()` — `::ffff:203.0.113.5/32` was wrongly accepted at commit but dropped by the dataplane; the NAT64-pool lenient warning now says only the offending pool address is dropped (not the whole rule); added commit-level mapped-v6 tests for both static-NAT and the NAT64 pool. Files: pkg/config/compiler_nat.go, pkg/config/compiler_nat_host_mask_test.go.
+
+## 2026-06-21 — #2173 static-NAT / NAT64 host-mask commit-time validation
+
+- **Timestamp**: 2026-06-21
+- **Action**: Added `validateNATHostMaskStrict` (strict-vs-lenient gate, `lenientNATHostMask` flag) rejecting a non-host (non-/32//128) static-NAT match/prefix or NAT64 source-pool address at commit, mirroring the Rust PR #2167 host-mask gate (NPTv6 + `inet` rules exempt). New `compiler_nat_host_mask_test.go`; doc section in `docs/config-schema.md`; fixed `TestNAT64` fixture to a /32 pool address.
+- **File(s)**: pkg/config/compiler_nat.go, pkg/config/compiler.go, pkg/config/compiler_nat_host_mask_test.go, pkg/config/parser_security_test.go, docs/config-schema.md
+
 ## 2026-06-21 — #2139 review #2180: discriminating transactionality test
 
 - **Timestamp**: 2026-06-21
