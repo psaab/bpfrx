@@ -1,5 +1,22 @@
 # Action Log
 
+## 2026-06-21 — #2147 state_writer fallback path crash-safety
+
+- **Timestamp**: 2026-06-21
+- **Action**: Fixed #2147 — the userspace state_writer's sync fallback
+  (`persist_sync`) wrote the temp file via `fs::write` then renamed with
+  NO file fsync, and neither transport fsync'd the parent directory, so a
+  state snapshot could be lost or torn on power loss. Extracted one shared
+  `finalize_durably` (file fsync → atomic rename → parent-dir fsync) used
+  by BOTH the io_uring transport and the fallback, so neither can drift
+  from the durability contract. Added a `sync_all` test seam (function-
+  pointer hook) and four unit tests, mutation-verified to FAIL if either
+  fsync is deleted from the finalizer.
+- **File(s)**: userspace-dp/src/state_writer.rs,
+  userspace-dp/src/FEATURES.md
+- **Validation**: full userspace-dp test suite green (2094+46+8+16+1, 0
+  failed); new tests 5/5 flake-clean; both fsync-removal mutations fail
+  the tests.
 ## 2026-06-21 — #2136 NetFlow per-flow-server export-version binding (no double-export)
 
 - **Timestamp**: 2026-06-21
