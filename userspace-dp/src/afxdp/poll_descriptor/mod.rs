@@ -903,6 +903,29 @@ pub(super) fn poll_binding_process_descriptor(
                                     flow.dst_ip,
                                 )
                             });
+                        // #2234: surface a rare (logarithmic) operator alarm
+                        // when the scan/sweep source table is saturated and
+                        // the detector is displacing stale sources to stay
+                        // able to track a fresh real scanner. This is NOT a
+                        // drop — the packet still forwards — so it uses the
+                        // ALARM emitter (RT_FLOW action PERMIT), which rides
+                        // the screen event frame with a dedicated
+                        // `scan-table-pressure` reason WITHOUT inflating the
+                        // drop/deny counters. It fires at most a handful of
+                        // times under a sustained flood (never per-flow), and
+                        // is checked here on the cold session-miss path only
+                        // (the same path that performs the eviction), so the
+                        // hot established-flow path pays nothing.
+                        if screen.take_scan_table_pressure_event() {
+                            emit_screen_alarm_event(
+                                worker_ctx.event_stream,
+                                &screen_pkt,
+                                meta,
+                                from_zone_id,
+                                "scan-table-pressure",
+                                event_now_ns_from_secs(now_secs),
+                            );
+                        }
                         if let Some(reason) = new_flow_screen_reason {
                             // The screen verdict is already decided; reuse
                             // the single parse above for the drop event's

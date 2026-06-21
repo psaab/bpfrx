@@ -9543,3 +9543,52 @@ top.
   pkg/config/compiler.go, pkg/config/compiler_validate_strict.go,
   pkg/config/ike_policy_chain_ref_test.go, pkg/config/parser_security_test.go,
   _Log.md
+
+- **Timestamp**: 2026-06-21
+  **Action**: #2234 — bounded stalest-eviction for the screen scan/sweep
+  per-zone source table (restore detection under saturation). Replaced the
+  hard skip-on-full cliff (`MAX_SOURCES_PER_ZONE = 4096`) with O(K) eviction
+  (K = `EVICT_SCAN_LIMIT` = 64): a brand-new `(zone, src_ip)` at a full zone
+  reclaims any expired window in a fixed sample, else evicts the stalest
+  sampled entry — so a fresh real scanner is always trackable (closes the
+  detection-DoS where a spoofed flood pinned the table and suppressed a real
+  scanner). Per-zone source count maintained incrementally (`per_zone_count`)
+  so the cap test is O(1) — replaces the pre-#2234 O(sources) `sources_in_zone`
+  scan that on the new-source-at-cap path was itself an O(n)-per-packet
+  amplifier. Both trackers unified on a shared `ScanCore<T>` (one source of
+  truth for bound/eviction/clamp/pressure). Added `evicted_pressure` counter +
+  a rare LOGARITHMIC `scan-table-pressure` screen event (powers of two in the
+  eviction count) emitted from the cold session-miss hook — never per-flow.
+  New reason bit `SCREEN_SCAN_TABLE_PRESSURE = 1<<19` (Rust + Go
+  `ScreenFlagNames`, also backfilled the stale 1<<17/1<<18 names). Tests:
+  fail-on-revert (fresh scanner detected after saturation, both scan.rs and
+  ScreenState levels), eviction-prefers-stalest, eviction-prefers-expired,
+  bounded-cost + count-exact under sustained churn, logarithmic pressure-event
+  rate. cargo build/test green (full suite 2255/0 main bin + all targets;
+  new tests 5x no flake); go build/vet clean. SMOKE on loss cluster PENDING.
+  **File(s)**: userspace-dp/src/screen/scan.rs,
+  userspace-dp/src/screen/mod.rs, userspace-dp/src/screen/tests.rs,
+  userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/event_emit.rs, pkg/dataplane/types.go,
+  userspace-dp/src/session/README.md, _Log.md
+
+- **Timestamp**: 2026-06-21
+  **Action**: #2234 — applied Copilot-review fixes + loss-cluster smoke.
+  Fixes: (1) take_pressure_event uses checked_next_power_of_two().unwrap_or
+  (u64::MAX) — next_power_of_two() panics/wraps past 2^63; (2/3) tightened
+  scan.rs + README wording (eviction scans a FIXED PREFIX of the whole
+  source table, not "the zone's entries", with the documented same-zone
+  fallback); (4) added emit_screen_alarm_event (RT_FLOW action PERMIT) so the
+  scan-table-pressure alarm is NOT counted as a drop/deny downstream — was
+  riding emit_screen_drop_event (action DENY). New fail-on-revert test
+  screen_alarm_event_is_permit_not_deny. SMOKE on loss userspace cluster
+  (deploy verify-dataplane gate PASSED both nodes; fw1 was RG0 primary;
+  scan-protect screen profile with ip-sweep+port-scan threshold attached to
+  lan+wan; CoS re-applied): iperf3 -P12 -t20 uncapped port 5211 —
+  v4-push 22.9 / v4-rev 22.7 / v6-push 22.5 / v6-rev 22.2 Gbit/s. Screen
+  drops: 0 total, Packets dropped: 0 — legit multi-flow traffic NOT spuriously
+  flagged by scan/sweep. cargo screen 123/0.
+  **File(s)**: userspace-dp/src/screen/scan.rs,
+  userspace-dp/src/afxdp/event_emit.rs,
+  userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/session/README.md, _Log.md

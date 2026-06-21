@@ -471,6 +471,30 @@ impl ScreenState {
         self.port_scan.threshold_clamped() + self.ip_sweep.threshold_clamped()
     }
 
+    /// #2234: total stalest-evictions on the scan/sweep source-saturation
+    /// path. A non-zero value means the per-zone source table hit its cap and
+    /// the detector displaced stale sources to keep a fresh real scanner
+    /// trackable (it no longer silently drops new sources on a full table).
+    /// Pure observability; never affects a verdict.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn scan_sweep_evicted_pressure(&self) -> u64 {
+        self.port_scan.evicted_pressure() + self.ip_sweep.evicted_pressure()
+    }
+
+    /// #2234: returns `true` on a rare (logarithmic) eviction-rate threshold
+    /// crossing, signalling the caller to emit a `scan-table-pressure` screen
+    /// event so the operator is told the scan/sweep detector is saturated.
+    /// Fires at most a handful of times under a sustained flood (powers of
+    /// two in the cumulative eviction count) — NEVER per flow, honouring the
+    /// no-per-packet-logging rule. The crossing is consumed on read.
+    pub fn take_scan_table_pressure_event(&mut self) -> bool {
+        // Evaluate BOTH so each tracker's epoch advances independently; the
+        // `|` (not `||`) avoids short-circuiting the second take.
+        let port = self.port_scan.take_pressure_event();
+        let sweep = self.ip_sweep.take_pressure_event();
+        port | sweep
+    }
+
     /// Validate a returning SYN-cookie ACK only after the caller has already
     /// established that no normal session matched. This preserves established
     /// ACK traffic and prevents random ACKs from installing sessions while a

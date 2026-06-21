@@ -33,6 +33,13 @@ const SCREEN_ICMP_FRAGMENT: u32 = 1 << 17;
 /// evaluate the fragment/TCP screens (e.g. a truncated IPv6
 /// extension-header chain) is dropped FAIL-CLOSED under this reason.
 const SCREEN_IP_MALFORMED: u32 = 1 << 18;
+/// #2234: NOT a packet drop — a rare (logarithmic) operator ALARM that the
+/// per-zone scan/sweep source table is saturated and the detector is
+/// displacing stale sources (bounded stalest-eviction) to keep tracking a
+/// fresh real scanner under a high-cardinality spoofed flood. Rides the
+/// screen event path so it surfaces alongside other screen activity; the
+/// triggering 5-tuple is the new source that forced an eviction.
+const SCREEN_SCAN_TABLE_PRESSURE: u32 = 1 << 19;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum FilterLogSource {
@@ -122,6 +129,55 @@ pub(super) fn emit_screen_drop_event(
         addr_family: pkt.addr_family,
         protocol: pkt.protocol,
         action: RT_FLOW_ACTION_DENY,
+        src_ip: pkt.src_ip,
+        dst_ip: pkt.dst_ip,
+        src_port: pkt.src_port,
+        dst_port: pkt.dst_port,
+        nat_src_ip: None,
+        nat_dst_ip: None,
+        nat_src_port: 0,
+        nat_dst_port: 0,
+        ingress_zone_id,
+        egress_zone_id: 0,
+        ingress_ifindex: ingress_ifindex_to_wire(meta.ingress_ifindex),
+        policy_id: 0,
+        rule_id: 0,
+        term_id: 0,
+        reason: 0,
+        owner_rg_id: 0,
+        application_id: 0,
+        filter_id: 0,
+        screen_id: screen_reason_id(reason),
+        timestamp_ns: 0,
+    };
+    let _ = event_stream.try_emit_dataplane_event_at(event, now_ns);
+}
+
+/// Emit a screen ALARM event — a `ScreenDrop`-kind event that did NOT drop
+/// the packet (#2234 scan-table-pressure). It shares the screen event frame
+/// so it surfaces alongside other screen activity, but the RT_FLOW action is
+/// PERMIT (the flow forwards), so downstream stats / syslog / dashboards do
+/// NOT count it as a deny/drop. The `reason` maps to a dedicated `screen_id`
+/// bit; the 5-tuple is the source that forced an eviction.
+#[inline]
+pub(super) fn emit_screen_alarm_event(
+    event_stream: Option<&EventStreamWorkerHandle>,
+    pkt: &ScreenPacketInfo,
+    meta: UserspaceDpMeta,
+    ingress_zone_id: u16,
+    reason: &'static str,
+    now_ns: u64,
+) {
+    let Some(event_stream) = event_stream else {
+        return;
+    };
+    let event = DataplaneEventPayload {
+        kind: DataplaneEventKind::ScreenDrop,
+        addr_family: pkt.addr_family,
+        protocol: pkt.protocol,
+        // PERMIT — this is a saturation alarm, not a drop. The packet still
+        // forwards; reporting DENY here would inflate drop/deny counters.
+        action: RT_FLOW_ACTION_PERMIT,
         src_ip: pkt.src_ip,
         dst_ip: pkt.dst_ip,
         src_port: pkt.src_port,
@@ -281,6 +337,7 @@ fn screen_reason_id(reason: &'static str) -> u32 {
         "session-limit-dst" => SCREEN_SESSION_LIMIT_DST,
         "icmp-fragment" => SCREEN_ICMP_FRAGMENT,
         "ip-malformed" => SCREEN_IP_MALFORMED,
+        "scan-table-pressure" => SCREEN_SCAN_TABLE_PRESSURE,
         _ => 0,
     }
 }
@@ -441,6 +498,49 @@ mod tests {
     }
 
     #[test]
+    fn screen_alarm_event_is_permit_not_deny() {
+        // #2234 fail-on-revert: the scan-table-pressure ALARM must carry the
+        // PERMIT action so downstream stats / syslog / dashboards do NOT count
+        // it as a drop/deny (the packet still forwards). Reverting the alarm
+        // emitter back to emit_screen_drop_event (action=DENY) breaks this.
+        let (handle, rx) = unlimited_handle();
+        let pkt = ScreenPacketInfo {
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_TCP,
+            tcp_flags: TCP_FLAG_SYN,
+            src_ip: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 77)),
+            dst_ip: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 5)),
+            src_port: 40000,
+            dst_port: 443,
+            tcp_seq: 1,
+            tcp_ack: 0,
+            tcp_mss: 1460,
+            pkt_len: 60,
+            is_fragment: false,
+            is_first_fragment: false,
+            ip_ihl: 5,
+            ip_frag_off: 0,
+            ip_total_len: 60,
+        };
+
+        emit_screen_alarm_event(Some(&handle), &pkt, test_meta(), 2, "scan-table-pressure", 789);
+
+        let event = rx
+            .try_recv()
+            .expect("screen alarm frame")
+            .decode_dataplane_event()
+            .expect("screen alarm payload");
+        assert_eq!(event.kind, DataplaneEventKind::ScreenDrop);
+        assert_eq!(
+            event.action, RT_FLOW_ACTION_PERMIT,
+            "a pressure ALARM must not report a drop/deny action"
+        );
+        assert_eq!(event.screen_id, SCREEN_SCAN_TABLE_PRESSURE);
+        assert_eq!(event.src_ip, pkt.src_ip);
+        assert_eq!(event.dst_ip, pkt.dst_ip);
+    }
+
+    #[test]
     fn screen_reason_id_maps_icmp_fragment() {
         let (handle, rx) = unlimited_handle();
         let pkt = ScreenPacketInfo {
@@ -480,6 +580,21 @@ mod tests {
         // malformed-frame drop apart from the syn-frag screen.
         assert_eq!(screen_reason_id("ip-malformed"), SCREEN_IP_MALFORMED);
         assert_ne!(SCREEN_IP_MALFORMED, SCREEN_SYN_FRAG);
+    }
+
+    #[test]
+    fn screen_reason_id_maps_scan_table_pressure() {
+        // #2234: the bounded stalest-eviction operator ALARM must map to a
+        // dedicated screen_id bit, distinct from the port-scan / ip-sweep
+        // DROP reasons (it is a saturation signal, not a packet drop), so an
+        // operator can tell "detector is saturated" apart from a real scan
+        // detection.
+        assert_eq!(
+            screen_reason_id("scan-table-pressure"),
+            SCREEN_SCAN_TABLE_PRESSURE
+        );
+        assert_ne!(SCREEN_SCAN_TABLE_PRESSURE, SCREEN_PORT_SCAN);
+        assert_ne!(SCREEN_SCAN_TABLE_PRESSURE, SCREEN_IP_SWEEP);
     }
 
     #[test]
