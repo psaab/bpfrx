@@ -1,9 +1,8 @@
-[REFACTOR]   3462  userspace-dp/src/afxdp/poll_descriptor/mod.rs
-[REFACTOR]   2121  userspace-dp/src/afxdp/types/shared_cos_lease/mod.rs
+[REFACTOR]   3468  userspace-dp/src/afxdp/poll_descriptor/mod.rs
 [WATCH]      1932  pkg/daemon/daemon_run.go
 [WATCH]      1880  userspace-dp/src/afxdp/cos/queue_service/mod.rs
-[WATCH]      1829  pkg/dataplane/userspace/protocol.go
-[WATCH]      1762  userspace-dp/src/afxdp/forwarding/mod.rs
+[WATCH]      1839  pkg/dataplane/userspace/protocol.go
+[WATCH]      1764  userspace-dp/src/afxdp/forwarding/mod.rs
 [WATCH]      1748  pkg/routing/tunnel.go
 [WATCH]      1745  userspace-dp/src/afxdp/cold_path_hist.rs
 [WATCH]      1688  cmd/cli/show.go
@@ -12,5 +11,6 @@
 [WATCH]      1593  pkg/dataplane/userspace/manager.go
 [WATCH]      1580  userspace-dp/src/afxdp/types/cos.rs
 [WATCH]      1578  pkg/api/metrics_userspace.go
+[WATCH]      1515  pkg/cluster/sync_conn.go
 [WATCH]      1512  userspace-dp/src/afxdp/neighbor_resolver.rs
 [WATCH]      1510  userspace-dp/src/afxdp/frame/mod.rs

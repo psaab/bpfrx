@@ -1821,15 +1821,22 @@ fn v8_carry_field_is_reader_private() {
     // the coordinator status path it re-introduces the #1619 seqlock
     // tearing class for the carry. Grep the crate source: the only
     // references allowed are the field definition + its initializer in
-    // mod.rs, and the rotation read/write in rotate_epoch_v8.rs, and this
+    // epoch.rs, the rotation read/write in rotate_epoch_v8.rs, and this
     // test file. Any reference in acquire_v8 / snapshot_epoch_v8 /
     // coordinator/status.rs is a regression.
+    //
+    // #2158 (P2): the `SharedCoSEpochState` definition (and thus the
+    // `epoch_carry_bytes` field decl + initializer + doc) moved from the
+    // lease `mod.rs` into the `epoch.rs` submodule during the file-split;
+    // the allowlist entry tracks that move. The rotation-private
+    // invariant is unchanged — the only READER/WRITER is still the
+    // rotation winner in `rotate_epoch_v8.rs`.
     use std::path::Path;
     let crate_src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut offenders = Vec::new();
     let allowed = [
-        // field def + initializer + doc live in the lease mod.rs
-        "afxdp/types/shared_cos_lease/mod.rs",
+        // field def + initializer + doc live in the epoch submodule
+        "afxdp/types/shared_cos_lease/epoch.rs",
         // the single legitimate writer/reader: the rotation winner
         "afxdp/types/shared_cos_lease/rotate_epoch_v8.rs",
         // this test file
