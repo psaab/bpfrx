@@ -8639,3 +8639,23 @@ top.
   userspace-dp/src/afxdp/types/shared_cos_lease/lease.rs,
   userspace-dp/src/afxdp/types/shared_cos_lease/shared_cos_lease_tests.rs,
   docs/refactoring-audit-current.txt
+
+- **Timestamp**: 2026-06-21
+- **Action**: #2216 — regression-lock the eventengine temporal-window
+  prune-on-append + concurrent-multimatch dispatch invariants. Both defects
+  the issue describes were already fixed by #2157 (da8e35bc9): evaluateEvent
+  prunes the sliding window on every append (not gated behind the trigger
+  path), and HandleEvent enqueues every triggered policy onto the single
+  serialized worker (no per-probe EnterConfigure race / all-but-one drop). The
+  issue's line-number analysis described the PRE-#2157 engine. Added the
+  fail-on-revert regression tests #2216 asked for (none existed): finding A
+  (no-within bounded to 60s + below-threshold bounded to clause horizon),
+  finding B (one event matching N policies commits ALL N). Proven fail-on-
+  revert for finding A: deleting prune-on-append → windows hold 1000/1000
+  entries. Finding B's cross-goroutine drop race stays locked by the
+  pre-existing `TestQueue_ConcurrentProbesSerialize` (added by #2157); the new
+  single-event fan-out test is a complementary invariant (not a standalone
+  1-of-3 revert-lock — a faithful pre-#2157 sequential revert handled a single
+  multi-match event in-order, so it does not reliably trip that one test).
+- **File(s)**: pkg/eventengine/engine_window_test.go (new),
+  pkg/eventengine/README.md
