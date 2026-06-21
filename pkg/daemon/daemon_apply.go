@@ -1054,6 +1054,12 @@ func (d *Daemon) applyConfigLocked(cfg *config.Config) error {
 	// daemon boot.
 	var dhcpServerErr error
 	if d.dhcpServer != nil {
+		// #2239: gate the Kea control-socket + lease_cmds hook on the cluster
+		// `dhcp-lease-synchronization` knob so the generated config carries the
+		// read/seed surface only when lease sync is configured. Standalone or
+		// knob-off renders bit-identical to pre-#2239. Set BEFORE the apply so
+		// the regenerated config reflects the current knob.
+		d.dhcpServer.SetLeaseSyncEnabled(d.dhcpLeaseSyncEnabled(cfg))
 		if !isCluster {
 			// Resolve RETH interface names for Kea (needs real Linux names)
 			resolveDHCPRethInterfaces(&cfg.System.DHCPServer, cfg)
@@ -1082,6 +1088,12 @@ func (d *Daemon) applyConfigLocked(cfg *config.Config) error {
 	// file I/O + DNS only), so it never blocks the apply path. A
 	// disabled/removed block drives withdrawAllLocked on the next pass.
 	d.nudgeDDNSReconcile()
+
+	// #2239: nudge an immediate lease-sync push so a commit that changes the
+	// DHCP-server config (and thus the lease set / serving interfaces) is
+	// replicated to the peer within one pass rather than waiting a heartbeat.
+	// Non-blocking depth-1 send; the loop's gate decides if this node pushes.
+	d.nudgeDHCPLeaseSync()
 
 	// 7b. Reconcile DHCP clients (#1793): start clients for units that
 	// gained dhcp/dhcpv6 in this commit, stop clients for units that

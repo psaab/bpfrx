@@ -336,6 +336,16 @@ func (d *Daemon) watchClusterEvents(ctx context.Context) {
 						go d.reinitiateIPsecSAs()
 					}
 
+					// #2239: on failover to primary, nudge the lease-sync push
+					// loop so this node begins replicating its (now owned)
+					// lease set. The actual Kea pre-seed + post-start lease-add
+					// seed are tied to the per-RG Kea start in
+					// applyRethServicesForRG (where Kea is restarted on the
+					// VRRP MASTER transition).
+					if cc := d.clusterConfig(); cc != nil && cc.DHCPLeaseSync && d.dhcpServer != nil && d.sessionSync != nil {
+						d.nudgeDHCPLeaseSync()
+					}
+
 				case cluster.StateSecondary, cluster.StateSecondaryHold:
 					slog.Info("cluster: became secondary for RG0, disabling config writes")
 					d.store.SetClusterReadOnly(true)
@@ -958,6 +968,14 @@ func (d *Daemon) applyRethServicesForRG(rgID int) {
 	if d.dhcpServer != nil && (cfg.System.DHCPServer.DHCPLocalServer != nil || cfg.System.DHCPServer.DHCPv6LocalServer != nil) {
 		dhcpCfg := d.filterDHCPConfigForMasterRGs(cfg)
 		if dhcpCfg != nil {
+			// #2239 Q3: pre-seed the held peer leases into the Kea
+			// memfile BEFORE the (re)start so Kea loads the in-use
+			// bindings at boot and can never hand an in-use address to
+			// a different client even before the post-start lease-add
+			// seed runs (fully closes the duplicate-allocation window).
+			// Best-effort + fail-open; the post-start seed is the
+			// backstop.
+			d.preSeedDHCPLeaseMemfile()
 			// ApplyAsync (#1835 F2): Kea reconcile shells out to
 			// systemctl with a 15s bound; running it inline would
 			// block this VRRP event loop. Latest-wins coalescing in
@@ -965,6 +983,18 @@ func (d *Daemon) applyRethServicesForRG(rgID int) {
 			// logged by the worker with this reason.
 			d.dhcpServer.ApplyAsync(dhcpCfg, fmt.Sprintf("vrrp MASTER rg%d", rgID))
 			slog.Info("vrrp: DHCP server apply enqueued (MASTER)", "rg", rgID)
+			// #2239: after the async Kea start, seed the held peer
+			// leases via lease{4,6}-add (the reinitiateIPsecSAs
+			// precedent). Async so it never blocks this VRRP event
+			// loop; it waits a bounded time for the control socket and
+			// re-anchors lifetimes to the local clock. Idempotent with
+			// the memfile pre-seed (lease-add → lease-update on
+			// collision). Nudge the push loop so this node replicates
+			// its now-owned set.
+			if cc := d.clusterConfig(); cc != nil && cc.DHCPLeaseSync && d.sessionSync != nil {
+				go d.seedDHCPLeasesFromPeer(context.Background())
+				d.nudgeDHCPLeaseSync()
+			}
 		}
 	}
 	// #1387 inc-2: nudge the DDNS reconcile loop on MASTER takeover so
