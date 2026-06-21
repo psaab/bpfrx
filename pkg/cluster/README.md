@@ -208,12 +208,15 @@ outside the monitor loop:
   `(key,value)` snapshot. Reverse-session, DNAT/DNATv6, and persistent-NAT
   side effects are backend-owned; do not add local map cleanup in
   `pkg/cluster`.
-- **Install-generation delete guard (#2170)**: every session install and every
-  delete carries a per-`(sender,key)` monotonic install generation as a
+- **Install-generation delete guard (#2170, #2221)**: every session install and
+  every delete carries a per-`(sender,key)` monotonic install generation as a
   length-gated trailing `uint64` (see `docs/sync-protocol.md`). The sender
   (`sync_conn.go`/`sync_bulk.go`) stamps installs from a single boot-seeded
-  counter and the matching delete **echoes** the install generation it cancels
-  (so the comparison is always same-domain, even across an ownership change).
+  counter. A delete draws a **fresh, strictly-greater** generation
+  (`takeDeleteGenV4/V6` → `nextInstallGen`) rather than echoing the install's
+  stamp, so a delete always out-ranks the install it cancels — this is what makes
+  a reordered delete/install pair orderable (#2221). The comparison is always
+  same-`(sender,key)`-domain, even across an ownership change.
   The receiver keeps the authoritative per-key stored generation in
   `SessionSync.recvGenV4/V6` (the BPF C struct stays generation-free) and the
   apply layer refuses a delete whose generation is **strictly older** than the
@@ -225,16 +228,25 @@ outside the monitor loop:
   replacement that was re-synced with a newer generation. Do NOT reuse the
   synthesized `SessionID` for this — it is non-monotonic
   (`now_seconds<<16|slot`) and collides on same-second/same-slot reuse.
-  The generation maps are bounded by `genGuardMapCap` (200000); on overflow
-  the map is NEVER cleared (#2198 F1) — an existing key updates in place, a new
-  key skip-records (degrades to safe gen-0) and bumps `GenMapOverflow`. The
-  receiver also RESETS `recvGenV4/V6` when the peer begins a bulk transfer
-  (`resetRecvGen` from the `syncMsgBulkStart` handler, #2198 F2) so a rebooted
-  peer — whose monotonic-seeded counter legitimately restarts lower — has its
-  cold-start bulk re-prime accepted instead of refused as stale (the
-  stale-RETAIN inverse of #2170). The check→Put→record apply sequence is not
-  held under one `recvGenMu` acquisition; it is safe because the per-peer
-  receive path is single-threaded over the single active fabric (#2198 F3).
+  **#2221 (same-generation reorder residual):** an applied non-zero delete now
+  records the delete generation as a **TOMBSTONE** in `recvGenV4/V6` (it does not
+  evict). A reordered install of the very session that delete cancelled carries
+  the OLDER install generation and is refused by the install guard, so the
+  standby converges to the master's state (session GONE) regardless of
+  install/delete arrival order; a genuinely newer incarnation (re-stamped by a
+  later sweep) carries a higher generation and still installs (last-writer-wins).
+  A `gen == 0` (legacy) delete still evicts. The generation maps are bounded by
+  `genGuardMapCap` (200000); on overflow the map is NEVER cleared (#2198 F1) — an
+  existing key updates in place, a new key skip-records (degrades to safe gen-0)
+  and bumps `GenMapOverflow`. The receiver also RESETS `recvGenV4/V6` when the
+  peer begins a bulk transfer (`resetRecvGen` from the `syncMsgBulkStart`
+  handler, #2198 F2) so a rebooted peer — whose monotonic-seeded counter
+  legitimately restarts lower — has its cold-start bulk re-prime accepted instead
+  of refused as stale (the stale-RETAIN inverse of #2170), and so a delete
+  tombstone never permanently blocks a legitimate cold re-prime. The
+  check→Put→record apply sequence is not held under one `recvGenMu` acquisition;
+  it is safe because the per-peer receive path is single-threaded over the single
+  active fabric (#2198 F3).
 - Dual-active overlap is intentional: primary sets `rg_active=true`
   immediately on becoming master; secondary defers `rg_active=false` until
   it sees the VRRP BACKUP event. Brief overlap, never both inactive.

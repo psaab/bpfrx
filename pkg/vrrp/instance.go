@@ -69,11 +69,26 @@ type vrrpInstance struct {
 	lastMasterPriority int       // last non-zero peer advert priority
 	lastMasterSeen     time.Time // when lastMasterPriority was recorded
 
-	state     VRRPState
-	iface     *net.Interface
-	eventCh   chan<- VRRPEvent
-	localIP   net.IP // our IPv4 address on this interface (for filtering self-sent)
-	localIPv6 net.IP // our link-local IPv6 address (source for IPv6 VRRP adverts)
+	state   VRRPState
+	iface   *net.Interface
+	eventCh chan<- VRRPEvent
+
+	// localIP / localIPv6 are our IPv4 address (for filtering self-sent
+	// adverts) and our link-local IPv6 address (source for IPv6 VRRP
+	// adverts). They are resolved once at openSocket() time, BEFORE any
+	// goroutine is started — but that resolution can come back empty (no
+	// IPv4 address assigned yet, or IPv6 DAD still running). In that case
+	// sendPacket()/sendPacketIPv6() perform a one-shot lazy resolve from
+	// the run-loop goroutine. Meanwhile the receiver goroutines
+	// (receiver/receiverIPv6/parseAfPacketIPv4/parseAfPacketIPv6) read
+	// these fields to filter self-sent packets. The lazy-resolve write
+	// thus races the receiver reads (#2258), so the fields are
+	// atomic.Pointer[net.IP] accessed only via getLocalIP/setLocalIP and
+	// getLocalIPv6/setLocalIPv6. A nil pointer means unresolved; the
+	// resolve semantics are preserved (the address still becomes available
+	// once resolvable). Mirrors the lastDropWarn atomic pattern (#2225).
+	localIP   atomic.Pointer[net.IP] // our IPv4 address on this interface
+	localIPv6 atomic.Pointer[net.IP] // our link-local IPv6 address
 
 	// Per-instance raw socket and receiver.
 	conn    net.PacketConn
@@ -136,6 +151,44 @@ func newInstance(cfg Instance, iface *net.Interface, eventCh chan<- VRRPEvent, o
 	}
 }
 
+// getLocalIP returns the resolved local IPv4 address, or nil if unresolved.
+// Safe to call from any goroutine — the field is written via setLocalIP from
+// openSocket() (pre-goroutine) and from the sendPacket() lazy-resolve path
+// (run-loop goroutine), while the receiver goroutines read it (#2258).
+func (vi *vrrpInstance) getLocalIP() net.IP {
+	if p := vi.localIP.Load(); p != nil {
+		return *p
+	}
+	return nil
+}
+
+// setLocalIP atomically stores the resolved local IPv4 address.
+func (vi *vrrpInstance) setLocalIP(ip net.IP) {
+	if ip == nil {
+		vi.localIP.Store(nil)
+		return
+	}
+	vi.localIP.Store(&ip)
+}
+
+// getLocalIPv6 returns the resolved local link-local IPv6 address, or nil if
+// unresolved. Safe to call from any goroutine — see getLocalIP (#2258).
+func (vi *vrrpInstance) getLocalIPv6() net.IP {
+	if p := vi.localIPv6.Load(); p != nil {
+		return *p
+	}
+	return nil
+}
+
+// setLocalIPv6 atomically stores the resolved local link-local IPv6 address.
+func (vi *vrrpInstance) setLocalIPv6(ip net.IP) {
+	if ip == nil {
+		vi.localIPv6.Store(nil)
+		return
+	}
+	vi.localIPv6.Store(&ip)
+}
+
 // openSocket creates the per-instance raw socket bound to the interface.
 func (vi *vrrpInstance) openSocket() error {
 	isVLAN := strings.Contains(vi.cfg.Interface, ".")
@@ -186,13 +239,13 @@ func (vi *vrrpInstance) openSocket() error {
 		}
 		ip4 := ipNet.IP.To4()
 		if ip4 != nil && !vipSet[ip4.String()] {
-			vi.localIP = ip4
+			vi.setLocalIP(ip4)
 		}
 	}
 	// Deterministic IPv6 link-local selection: sort candidates and
 	// pick the lowest address. This ensures the same source address
 	// is used even when the interface has multiple link-locals.
-	vi.localIPv6 = vi.resolveIPv6LinkLocal(vipSet)
+	vi.setLocalIPv6(vi.resolveIPv6LinkLocal(vipSet))
 
 	// Open IPv6 raw socket if any VIPs are IPv6.
 	if hasIPv6VIPs {
@@ -444,7 +497,7 @@ func (vi *vrrpInstance) run() {
 			slog.Warn("vrrp: af_packet unavailable, using separate IPv6 raw socket fallback",
 				"key", vi.key())
 			go vi.receiverIPv6()
-		} else if vi.localIPv6 != nil {
+		} else if vi.getLocalIPv6() != nil {
 			slog.Warn("vrrp: af_packet unavailable and no IPv6 socket — IPv6 VRRP reception disabled",
 				"key", vi.key())
 		}
@@ -576,7 +629,7 @@ func (vi *vrrpInstance) receiver() {
 		}
 
 		// Filter self-sent packets (RFC 5798 §6.4.2/6.4.3).
-		if vi.localIP != nil && hdr.Src.Equal(vi.localIP) {
+		if lip := vi.getLocalIP(); lip != nil && hdr.Src.Equal(lip) {
 			continue
 		}
 
@@ -650,7 +703,7 @@ func (vi *vrrpInstance) receiverIPv6() {
 		}
 
 		// Filter self-sent packets.
-		if vi.localIPv6 != nil && srcIP != nil && srcIP.Equal(vi.localIPv6) {
+		if lip6 := vi.getLocalIPv6(); lip6 != nil && srcIP != nil && srcIP.Equal(lip6) {
 			continue
 		}
 
@@ -749,7 +802,7 @@ func (vi *vrrpInstance) parseAfPacketIPv4(buf []byte, n, ethHeaderLen int) {
 	copy(srcIP, ip[12:16])
 
 	// Filter self-sent packets.
-	if vi.localIP != nil && srcIP.Equal(vi.localIP) {
+	if lip := vi.getLocalIP(); lip != nil && srcIP.Equal(lip) {
 		return
 	}
 
@@ -800,7 +853,7 @@ func (vi *vrrpInstance) parseAfPacketIPv6(buf []byte, n, ethHeaderLen int) {
 	copy(srcIP, ip6[8:24])
 
 	// Filter self-sent packets.
-	if vi.localIPv6 != nil && srcIP.Equal(vi.localIPv6) {
+	if lip6 := vi.getLocalIPv6(); lip6 != nil && srcIP.Equal(lip6) {
 		return
 	}
 
@@ -972,15 +1025,17 @@ func (vi *vrrpInstance) handleMasterRx(pkt *VRRPPacket, masterDownTimer, advertT
 	} else if pktPri == pri && pkt.SrcIP != nil {
 		// Equal priority — RFC 5798 §6.4.3 tie-break: higher IP wins.
 		// Handle both IPv4 and IPv6 address families.
+		localIP := vi.getLocalIP()
+		localIPv6 := vi.getLocalIPv6()
 		var peerHigher bool
-		if pkt.SrcIP.To4() != nil && vi.localIP != nil {
-			peerHigher = bytes.Compare(pkt.SrcIP.To4(), vi.localIP.To4()) > 0
-		} else if pkt.SrcIP.To4() == nil && vi.localIPv6 != nil {
-			peerHigher = bytes.Compare(pkt.SrcIP.To16(), vi.localIPv6.To16()) > 0
+		if pkt.SrcIP.To4() != nil && localIP != nil {
+			peerHigher = bytes.Compare(pkt.SrcIP.To4(), localIP.To4()) > 0
+		} else if pkt.SrcIP.To4() == nil && localIPv6 != nil {
+			peerHigher = bytes.Compare(pkt.SrcIP.To16(), localIPv6.To16()) > 0
 		}
 		if peerHigher {
 			slog.Info("vrrp: equal priority tie-break, peer IP is higher — stepping down",
-				"key", vi.key(), "our_ip", vi.localIP, "our_ipv6", vi.localIPv6,
+				"key", vi.key(), "our_ip", localIP, "our_ipv6", localIPv6,
 				"peer_ip", pkt.SrcIP, "priority", pri)
 			vi.becomeBackup(masterDownTimer, advertTimer)
 		}
@@ -1108,10 +1163,12 @@ func (vi *vrrpInstance) sendPacket(pkt *VRRPPacket, isIPv6 bool) error {
 		return nil
 	}
 
-	srcIP := vi.localIP
+	srcIP := vi.getLocalIP()
 	if srcIP == nil {
 		// Lazy resolve: interface may not have had an address at socket open time.
-		// Skip VIPs — must send from primary/base address.
+		// Skip VIPs — must send from primary/base address. The atomic
+		// setLocalIP makes this run-loop write race-clean against the
+		// receiver-goroutine reads (#2258).
 		vipSet := make(map[string]bool, len(vi.cfg.VirtualAddresses))
 		for _, vip := range vi.cfg.VirtualAddresses {
 			addr := vip
@@ -1124,8 +1181,8 @@ func (vi *vrrpInstance) sendPacket(pkt *VRRPPacket, isIPv6 bool) error {
 			for _, a := range addrs {
 				if ipNet, ok := a.(*net.IPNet); ok && ipNet.IP.To4() != nil {
 					if !vipSet[ipNet.IP.To4().String()] {
-						vi.localIP = ipNet.IP.To4()
-						srcIP = vi.localIP
+						srcIP = ipNet.IP.To4()
+						vi.setLocalIP(srcIP)
 						break
 					}
 				}
@@ -1175,11 +1232,13 @@ func (vi *vrrpInstance) sendPacketIPv6(pkt *VRRPPacket) error {
 		return nil
 	}
 
-	srcIP := vi.localIPv6
+	srcIP := vi.getLocalIPv6()
 	if srcIP == nil {
 		// Lazy resolve: deterministically select the lowest link-local
 		// address. This happens when the interface didn't have a
-		// link-local at openSocket() time (e.g. DAD still running).
+		// link-local at openSocket() time (e.g. DAD still running). The
+		// atomic setLocalIPv6 makes this run-loop write race-clean against
+		// the receiver-goroutine reads (#2258).
 		vipSet := make(map[string]bool, len(vi.cfg.VirtualAddresses))
 		for _, vip := range vi.cfg.VirtualAddresses {
 			addr := vip
@@ -1190,7 +1249,7 @@ func (vi *vrrpInstance) sendPacketIPv6(pkt *VRRPPacket) error {
 		}
 		resolved := vi.resolveIPv6LinkLocal(vipSet)
 		if resolved != nil {
-			vi.localIPv6 = resolved
+			vi.setLocalIPv6(resolved)
 			srcIP = resolved
 			slog.Info("vrrp: late-resolved IPv6 link-local address",
 				"key", vi.key(), "addr", srcIP)

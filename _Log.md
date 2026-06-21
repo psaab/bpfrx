@@ -1,5 +1,36 @@
 # Action Log
 
+## 2026-06-21 — #2258 VRRP localIP/localIPv6 lazy-resolve race (run-loop write vs receiver reads)
+
+- **Timestamp**: 2026-06-21
+- **Action**: Fixed a Go data race on `vrrpInstance.localIP`/`localIPv6`
+  (found during the #2257/#2225 review; pre-existing, distinct from the
+  `lastDropWarn` race). `localIP`/`localIPv6` are resolved once in
+  `openSocket()` before any goroutine starts, but that resolution can come
+  back empty (no IPv4 address yet, or IPv6 DAD still running). In that case
+  `sendPacket()`/`sendPacketIPv6()` perform a one-shot LAZY-RESOLVE WRITE
+  from the run-loop goroutine, while the receiver goroutines
+  (`receiver`/`receiverIPv6`/`parseAfPacketIPv4`/`parseAfPacketIPv6`) read
+  the fields to filter self-sent adverts — an unsynchronized write/read
+  (`go test -race` flags it; fires at most once, only when unresolved at
+  socket-open). Option (a) early-resolve was infeasible because the address
+  genuinely may be unresolvable at socket-open (DAD/no-addr); chose option
+  (b): both fields are now `atomic.Pointer[net.IP]` accessed only via
+  `getLocalIP`/`setLocalIP` and `getLocalIPv6`/`setLocalIPv6` (nil pointer =
+  unresolved). Lazy-resolve semantics preserved (the address still becomes
+  available once resolvable); packet hot path stays lock-free, mirroring
+  the `lastDropWarn` atomic pattern (#2225). Sibling audit: the run-loop
+  tie-break reader in `handleMasterRx` and the `run()` IPv6-receiver gate
+  also route through the accessors (same-goroutine, but consistent). New
+  fail-on-revert `-race` tests drive the lazy-resolve write concurrently
+  with the real `parseAfPacketIPv4`/`parseAfPacketIPv6` reader (CLEAN with
+  the atomic fix, DETECTS the race when reverted to a plain net.IP).
+  make test-failover (HA/VRRP no-regression) PENDING-PARENT — the -race
+  unit test is the primary gate.
+- **File(s)**: pkg/vrrp/instance.go,
+  pkg/vrrp/instance_localip_race_test.go (new), pkg/vrrp/vrrp_test.go,
+  pkg/vrrp/instance_preempt_gate_test.go, pkg/vrrp/README.md
+
 ## 2026-06-21 — #2255 NAT translation-hit counter_id stability
 
 - **Timestamp**: 2026-06-21
@@ -9349,3 +9380,20 @@ top.
   userspace-dp/src/FEATURES.md. go build/vet/test ./pkg/config/... green.
   **File(s)**: pkg/config/compiler_nat.go, pkg/config/compiler_nptv6_test.go,
   userspace-dp/src/FEATURES.md, _Log.md
+  **Action**: #2221 (MEDIUM, residual of #2170) — same-generation install/delete
+  REORDER no longer leaves a stale session on the standby. Sender: a delete now
+  draws a FRESH generation strictly greater than the install it cancels
+  (takeDeleteGenV4/V6 -> nextInstallGen) instead of echoing it, so a delete
+  out-ranks its install on the wire. Receiver: an applied non-zero delete records
+  the delete generation as a TOMBSTONE in recvGenV4/V6 (no eviction) so a
+  reordered older install of the cancelled session is refused by the install
+  guard; gen-0 (legacy) delete still evicts. Last-writer-wins per key: standby
+  converges to the master's final state regardless of install/delete arrival
+  order. Composes with the #2170 gen-guard, the #2198 F1 overflow bound, the F2
+  bulk-barrier resetRecvGen, and the bulk reconcile. New regression tests drive
+  the real sender enqueue + receiver apply in wire order (both reorder
+  directions) and prove fail-on-revert. build/vet/test/-race green on
+  pkg/cluster. test-failover REQUIRED before merge (PENDING-PARENT).
+  **File(s)**: pkg/cluster/sync_conn.go, pkg/cluster/sync.go,
+  pkg/cluster/sync_gen_guard_test.go, docs/sync-protocol.md,
+  pkg/cluster/README.md, _Log.md

@@ -179,11 +179,14 @@ func TestStaleInstallDoesNotRegressStoredGen(t *testing.T) {
 	}
 }
 
-// TestSenderEchoesInstallGenerationV4 verifies the sender stamps a fresh,
-// strictly-increasing generation on every install send and echoes the exact
-// install generation on the matching delete (SMR fix #1). This is the property
-// that makes a journaled delete strictly older than a re-synced replacement.
-func TestSenderEchoesInstallGenerationV4(t *testing.T) {
+// TestDeleteGenerationStrictlyGreaterThanInstallV4 (#2221) verifies the sender
+// stamps a fresh, strictly-increasing generation on every install send and that
+// the matching delete draws a FRESH generation STRICTLY GREATER than the last
+// install of the key (rather than echoing it). A delete out-ranking its install
+// is what lets the receiver order a reordered delete-then-install pair (the
+// delete tombstone refuses the late, lower-generation install of the cancelled
+// session). A key never installed still returns 0 (legacy unconditional path).
+func TestDeleteGenerationStrictlyGreaterThanInstallV4(t *testing.T) {
 	ss := NewSessionSync(":0", "10.0.0.2:4785", nil)
 	ss.stats.Connected.Store(true)
 	key := gen2170KeyV4()
@@ -202,14 +205,37 @@ func TestSenderEchoesInstallGenerationV4(t *testing.T) {
 		t.Fatalf("second install generation %d must be strictly greater than first %d", g2, g1)
 	}
 
-	// The delete echoes the LAST stamped generation for the key.
-	if echoed := ss.takeDeleteGenV4(key); echoed != g2 {
-		t.Fatalf("delete echoed generation %d, want last-installed %d", echoed, g2)
+	// The delete draws a fresh generation strictly greater than the last
+	// install, so it out-ranks the install it cancels.
+	del := ss.takeDeleteGenV4(key)
+	if del <= g2 {
+		t.Fatalf("delete generation %d must be strictly greater than last install %d (#2221)", del, g2)
 	}
-	// After the echo the entry is evicted; a second delete returns 0 (legacy
-	// fallback) rather than a stale value.
-	if echoed := ss.takeDeleteGenV4(key); echoed != 0 {
-		t.Fatalf("delete after eviction echoed %d, want 0", echoed)
+	// After the take the entry is evicted; a second delete returns 0 (legacy
+	// fallback) rather than a stale or fresh value.
+	if again := ss.takeDeleteGenV4(key); again != 0 {
+		t.Fatalf("delete after eviction returned %d, want 0", again)
+	}
+}
+
+// TestDeleteGenerationStrictlyGreaterThanInstallV6 mirrors the V4 #2221 contract.
+func TestDeleteGenerationStrictlyGreaterThanInstallV6(t *testing.T) {
+	ss := NewSessionSync(":0", "10.0.0.2:4785", nil)
+	ss.stats.Connected.Store(true)
+	key := gen2170KeyV6()
+
+	val := dataplane.SessionValueV6{}
+	ss.stampInstallGenV6(key, &val)
+	g1 := val.Generation
+	if g1 == 0 {
+		t.Fatal("first install generation must be non-zero")
+	}
+	del := ss.takeDeleteGenV6(key)
+	if del <= g1 {
+		t.Fatalf("delete generation %d must be strictly greater than install %d (#2221)", del, g1)
+	}
+	if again := ss.takeDeleteGenV6(key); again != 0 {
+		t.Fatalf("delete after eviction returned %d, want 0", again)
 	}
 }
 
@@ -598,14 +624,21 @@ func TestGenGuardConcurrentMaps(t *testing.T) {
 				if apply {
 					ss.recordInstalledGenV4(key, rec)
 				}
-				_ = ss.deleteGenGuardV4(key, val.Generation)
+				// #2221: a non-zero delete generation records a tombstone in
+				// recvGenV4 rather than evicting, so the receiver map retains a
+				// per-key entry. Use a fresh, strictly-greater delete generation
+				// (as the real sender does via takeDeleteGenV4) so the delete
+				// out-ranks its install.
+				_ = ss.deleteGenGuardV4(key, ss.nextInstallGen())
 			}
 		}(w)
 	}
 	wg.Wait()
 
-	// Every key was install-then-delete-guarded at equal generation, so both
-	// maps must be fully drained.
+	// Every key was install-then-delete-guarded. The sender map evicts on
+	// delete, so genSentV4 must be fully drained. The receiver map records the
+	// delete generation as a tombstone (#2221) rather than evicting, so it
+	// retains exactly one entry per distinct key (bounded by genGuardMapCap).
 	ss.genSentMu.Lock()
 	sentRemaining := len(ss.genSentV4)
 	ss.genSentMu.Unlock()
@@ -615,7 +648,177 @@ func TestGenGuardConcurrentMaps(t *testing.T) {
 	if sentRemaining != 0 {
 		t.Fatalf("genSentV4 not drained: %d entries remain", sentRemaining)
 	}
-	if recvRemaining != 0 {
-		t.Fatalf("recvGenV4 not drained: %d entries remain", recvRemaining)
+	if recvRemaining == 0 || recvRemaining > genGuardMapCap {
+		t.Fatalf("recvGenV4 tombstone count = %d, want (0, %d]", recvRemaining, genGuardMapCap)
+	}
+}
+
+// --- #2221: same-generation install/delete reorder convergence -------------
+
+// applySendChInOrder drains the sender's sendCh and applies each framed message
+// to the SAME SessionSync's receiver apply path in the exact order it was
+// enqueued. This models a single ACTIVE fabric: the receiver applies messages
+// in the order the sender placed them on the wire, so whichever of the
+// install/delete pair won the enqueue race is applied first. Returns the count
+// drained.
+func applySendChInOrder(t *testing.T, ss *SessionSync) int {
+	t.Helper()
+	n := 0
+	for {
+		select {
+		case msg := <-ss.sendCh:
+			if len(msg) < syncHeaderSize {
+				t.Fatalf("framed message too short: %d", len(msg))
+			}
+			ss.handleMessage(nil, msg[4], msg[syncHeaderSize:])
+			n++
+		default:
+			return n
+		}
+	}
+}
+
+// TestSameGenReorderDeleteThenInstallConvergesV4 is the #2170 RESIDUAL (#2221):
+// within the SAME generation domain, a session's install and its cancelling
+// delete are reordered on sendCh so the receiver applies DELETE then INSTALL.
+// The master closed the session, so the standby MUST end with the session GONE.
+//
+// It drives the REAL sender enqueue path: the sweep stamps a live key (model:
+// stampInstallGenV4 + queue the install), then the delta-drain takes the close
+// (QueueDeleteV4), then the install is enqueued AFTER the delete — exactly the
+// "delete wins the sendCh enqueue race" ordering the issue documents. Both
+// messages then apply through handleMessage in enqueue order.
+//
+// Pre-fix (delete echoes the install's IDENTICAL generation, delete evicts the
+// stored generation): delete(N) applies + evicts; install(N) sees stored==0 →
+// applies → the closed session is RESURRECTED on the standby. This FAILS.
+// Post-fix (delete draws a strictly-greater generation + records a tombstone):
+// delete(N+1) applies + tombstones N+1; install(N) is N < N+1 → REFUSED. GONE.
+func TestSameGenReorderDeleteThenInstallConvergesV4(t *testing.T) {
+	key := gen2170KeyV4()
+	dp := &mockSweepDP{v4sessions: map[dataplane.SessionKey]dataplane.SessionValue{}}
+	ss := NewSessionSync(":0", "10.0.0.2:4785", dp)
+	ss.stats.Connected.Store(true)
+
+	// The sweep re-stamps the LIVE session and builds the install message.
+	val := dataplane.SessionValue{State: dataplane.SessStateEstablished, IngressZone: 1, EgressZone: 2}
+	ss.stampInstallGenV4(key, &val)
+	installMsg := encodeSessionV4(key, val)
+
+	// The delta-drain closes the session and enqueues the delete FIRST (it won
+	// the enqueue race against the still-queued install).
+	ss.QueueDeleteV4(key)
+	// The install is enqueued AFTER the delete.
+	if !ss.queueMessage(installMsg, &ss.stats.SessionsSent, "test_install_v4") {
+		t.Fatal("install enqueue failed")
+	}
+
+	// Apply in wire (enqueue) order: delete then install.
+	if got := applySendChInOrder(t, ss); got != 2 {
+		t.Fatalf("expected to drain 2 messages, drained %d", got)
+	}
+
+	if _, ok := dp.v4sessions[key]; ok {
+		t.Fatal("#2221: reordered delete-then-install resurrected the closed session on the standby (master deleted it last)")
+	}
+}
+
+func TestSameGenReorderDeleteThenInstallConvergesV6(t *testing.T) {
+	key := gen2170KeyV6()
+	dp := &mockSweepDP{v6sessions: map[dataplane.SessionKeyV6]dataplane.SessionValueV6{}}
+	ss := NewSessionSync(":0", "10.0.0.2:4785", dp)
+	ss.stats.Connected.Store(true)
+
+	val := dataplane.SessionValueV6{State: dataplane.SessStateEstablished, IngressZone: 1, EgressZone: 2}
+	ss.stampInstallGenV6(key, &val)
+	installMsg := encodeSessionV6(key, val)
+
+	ss.QueueDeleteV6(key)
+	if !ss.queueMessage(installMsg, &ss.stats.SessionsSent, "test_install_v6") {
+		t.Fatal("install enqueue failed")
+	}
+
+	if got := applySendChInOrder(t, ss); got != 2 {
+		t.Fatalf("expected to drain 2 messages, drained %d", got)
+	}
+	if _, ok := dp.v6sessions[key]; ok {
+		t.Fatal("#2221: reordered v6 delete-then-install resurrected the closed session on the standby")
+	}
+}
+
+// TestSameGenInstallThenDeleteConvergesV4 is the in-order half of #2221: the
+// install is enqueued before its cancelling delete (the common case). The
+// standby must still end with the session GONE. This guards against a fix that
+// only handled the reorder direction and broke the normal path.
+func TestSameGenInstallThenDeleteConvergesV4(t *testing.T) {
+	key := gen2170KeyV4()
+	dp := &mockSweepDP{v4sessions: map[dataplane.SessionKey]dataplane.SessionValue{}}
+	ss := NewSessionSync(":0", "10.0.0.2:4785", dp)
+	ss.stats.Connected.Store(true)
+
+	val := dataplane.SessionValue{State: dataplane.SessStateEstablished, IngressZone: 1, EgressZone: 2}
+	ss.stampInstallGenV4(key, &val)
+	installMsg := encodeSessionV4(key, val)
+
+	// Install first, then the delete.
+	if !ss.queueMessage(installMsg, &ss.stats.SessionsSent, "test_install_v4") {
+		t.Fatal("install enqueue failed")
+	}
+	ss.QueueDeleteV4(key)
+
+	if got := applySendChInOrder(t, ss); got != 2 {
+		t.Fatalf("expected to drain 2 messages, drained %d", got)
+	}
+	if _, ok := dp.v4sessions[key]; ok {
+		t.Fatal("#2221: in-order install-then-delete left a stale session (the normal close path regressed)")
+	}
+}
+
+// TestReestablishAfterDeleteAppliesV4 (#2221): after a session is closed (its
+// delete recorded a tombstone), a GENUINELY NEW incarnation of the same key —
+// re-established and re-stamped by a later sweep with a strictly-greater
+// generation — MUST install. The tombstone must not block a legitimately newer
+// session. This is the "install last, present" half of last-writer-wins.
+func TestReestablishAfterDeleteAppliesV4(t *testing.T) {
+	key := gen2170KeyV4()
+	dp := &mockSweepDP{v4sessions: map[dataplane.SessionKey]dataplane.SessionValue{}}
+	ss := NewSessionSync(":0", "10.0.0.2:4785", dp)
+
+	// Install gen=5, delete at a strictly-greater gen=6 (as the fixed sender
+	// produces). The delete applies and tombstones gen=6.
+	installWithGenV4(ss, key, 5)
+	ss.deleteClusterSyncedV4(key, 6)
+	if _, ok := dp.v4sessions[key]; ok {
+		t.Fatal("delete did not remove the session")
+	}
+
+	// A new incarnation re-established later carries a higher generation (the
+	// sweep re-stamps from a strictly-monotonic counter) and MUST install.
+	installWithGenV4(ss, key, 7)
+	if _, ok := dp.v4sessions[key]; !ok {
+		t.Fatal("#2221: a genuinely newer incarnation (gen>tombstone) was wrongly blocked by the delete tombstone")
+	}
+	if got := ss.stats.InstallsStaleIgnored.Load(); got != 0 {
+		t.Fatalf("InstallsStaleIgnored = %d, want 0 for a newer-generation re-establishment", got)
+	}
+}
+
+// TestReorderedInstallRefusedByTombstoneV4 (#2221, apply-layer unit): a delete
+// applies at gen=6 (tombstone), then the OLDER install (gen=5) of the very
+// session that delete cancelled arrives late and MUST be refused — the standby
+// stays GONE. This is the direct receiver-side property the wire test exercises
+// end-to-end.
+func TestReorderedInstallRefusedByTombstoneV4(t *testing.T) {
+	key := gen2170KeyV4()
+	dp := &mockSweepDP{v4sessions: map[dataplane.SessionKey]dataplane.SessionValue{}}
+	ss := NewSessionSync(":0", "10.0.0.2:4785", dp)
+
+	ss.deleteClusterSyncedV4(key, 6) // tombstone gen=6 (no prior stored entry)
+	installWithGenV4(ss, key, 5)     // reordered older install — must be refused
+	if _, ok := dp.v4sessions[key]; ok {
+		t.Fatal("#2221: a reordered older install (gen<tombstone) resurrected the closed session")
+	}
+	if got := ss.stats.InstallsStaleIgnored.Load(); got != 1 {
+		t.Fatalf("InstallsStaleIgnored = %d, want 1 (the reordered install must be refused by the tombstone)", got)
 	}
 }

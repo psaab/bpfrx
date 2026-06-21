@@ -1036,7 +1036,7 @@ func TestHandleMasterRx_HigherPriority_StepsDown(t *testing.T) {
 		GroupID:   101,
 		Priority:  100,
 	}, &net.Interface{Name: "eth0"}, eventCh, nil)
-	vi.localIP = net.IPv4(10, 0, 0, 1)
+	vi.setLocalIP(net.IPv4(10, 0, 0, 1))
 	vi.setState(StateMaster)
 
 	masterDownTimer := time.NewTimer(time.Hour)
@@ -1062,7 +1062,7 @@ func TestHandleMasterRx_LowerPriority_StaysMaster(t *testing.T) {
 		GroupID:   101,
 		Priority:  200,
 	}, &net.Interface{Name: "eth0"}, eventCh, nil)
-	vi.localIP = net.IPv4(10, 0, 0, 1)
+	vi.setLocalIP(net.IPv4(10, 0, 0, 1))
 	vi.setState(StateMaster)
 
 	masterDownTimer := time.NewTimer(time.Hour)
@@ -1088,7 +1088,7 @@ func TestHandleMasterRx_EqualPriority_HigherPeerIP_StepsDown(t *testing.T) {
 		GroupID:   101,
 		Priority:  200,
 	}, &net.Interface{Name: "eth0"}, eventCh, nil)
-	vi.localIP = net.IPv4(10, 0, 0, 1) // lower IP
+	vi.setLocalIP(net.IPv4(10, 0, 0, 1)) // lower IP
 	vi.setState(StateMaster)
 
 	masterDownTimer := time.NewTimer(time.Hour)
@@ -1114,7 +1114,7 @@ func TestHandleMasterRx_EqualPriority_LowerPeerIP_StaysMaster(t *testing.T) {
 		GroupID:   101,
 		Priority:  200,
 	}, &net.Interface{Name: "eth0"}, eventCh, nil)
-	vi.localIP = net.IPv4(10, 0, 0, 2) // higher IP
+	vi.setLocalIP(net.IPv4(10, 0, 0, 2)) // higher IP
 	vi.setState(StateMaster)
 
 	masterDownTimer := time.NewTimer(time.Hour)
@@ -1140,7 +1140,7 @@ func TestHandleMasterRx_EqualPriority_NilSrcIP_StaysMaster(t *testing.T) {
 		GroupID:   101,
 		Priority:  200,
 	}, &net.Interface{Name: "eth0"}, eventCh, nil)
-	vi.localIP = net.IPv4(10, 0, 0, 1)
+	vi.setLocalIP(net.IPv4(10, 0, 0, 1))
 	vi.setState(StateMaster)
 
 	masterDownTimer := time.NewTimer(time.Hour)
@@ -1167,7 +1167,7 @@ func TestHandleMasterRx_Priority0_StaysMaster(t *testing.T) {
 		GroupID:   101,
 		Priority:  200,
 	}, &net.Interface{Name: "eth0"}, eventCh, nil)
-	vi.localIP = net.IPv4(10, 0, 0, 1)
+	vi.setLocalIP(net.IPv4(10, 0, 0, 1))
 	vi.setState(StateMaster)
 
 	masterDownTimer := time.NewTimer(time.Hour)
@@ -1193,7 +1193,7 @@ func TestHandleMasterRx_EqualPriority_HigherPeerIPv6_StepsDown(t *testing.T) {
 		GroupID:   101,
 		Priority:  200,
 	}, &net.Interface{Name: "eth0"}, eventCh, nil)
-	vi.localIPv6 = net.ParseIP("fe80::1") // lower IPv6
+	vi.setLocalIPv6(net.ParseIP("fe80::1")) // lower IPv6
 	vi.setState(StateMaster)
 
 	masterDownTimer := time.NewTimer(time.Hour)
@@ -1219,7 +1219,7 @@ func TestHandleMasterRx_EqualPriority_LowerPeerIPv6_StaysMaster(t *testing.T) {
 		GroupID:   101,
 		Priority:  200,
 	}, &net.Interface{Name: "eth0"}, eventCh, nil)
-	vi.localIPv6 = net.ParseIP("fe80::2") // higher IPv6
+	vi.setLocalIPv6(net.ParseIP("fe80::2")) // higher IPv6
 	vi.setState(StateMaster)
 
 	masterDownTimer := time.NewTimer(time.Hour)
@@ -1975,7 +1975,7 @@ func TestReceiverIPv6_DeliversPacket(t *testing.T) {
 		GroupID:   42,
 		Priority:  100,
 	}, &net.Interface{Name: "eth0"}, eventCh, nil)
-	vi.localIPv6 = net.ParseIP("fe80::1")
+	vi.setLocalIPv6(net.ParseIP("fe80::1"))
 
 	// Build a valid VRRPv3 packet.
 	srcIP := net.ParseIP("fe80::2")
@@ -2074,7 +2074,7 @@ func TestSendPacketIPv6_NilLocalIPv6_ReturnsError(t *testing.T) {
 		VirtualAddresses: []string{"2001:db8::1/128"},
 	}, &net.Interface{Name: "lo", Index: 1}, eventCh, nil)
 	// localIPv6 is nil and interface has no link-local → should error.
-	vi.localIPv6 = nil
+	vi.setLocalIPv6(nil)
 
 	// Create a mock conn so ipv6Conn is non-nil (we test the srcIP path).
 	vi.ipv6Conn = &mockPacketConn{
@@ -2104,7 +2104,7 @@ func TestSendPacketIPv6_WithLocalIPv6_SendsPacket(t *testing.T) {
 		Priority:  200,
 		VirtualAddresses: []string{"2001:db8::1/128"},
 	}, &net.Interface{Name: "lo", Index: 1}, eventCh, nil)
-	vi.localIPv6 = net.ParseIP("fe80::1")
+	vi.setLocalIPv6(net.ParseIP("fe80::1"))
 
 	var sentData []byte
 	var sentAddr net.Addr
