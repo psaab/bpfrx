@@ -651,6 +651,31 @@ drift) closed in `fix/2008-quickwins-batch1`:
   more useful for long-running rules and is left as-is; it is documented here
   rather than changed. Per-policy hit counts are also per-node (node-local),
   not cluster-aggregated, matching Junos per-node behavior.
+- **Per-NAT-rule "Translation hits" — FIXED (#2218).** `show security nat
+  source rule`, `... destination rule`, and `... static rule` reported
+  "Translation hits: 0 packets 0 bytes" for every rule even under live,
+  confirmed-translating traffic: the #1476 eBPF retirement deleted the legacy
+  XDP per-packet `nat_rule_counters` increments and the Rust forwarder never
+  replaced them, so nothing wrote the counter the operator read path
+  (`Manager.ReadNATRuleCounter`) still consulted. The fix mirrors the policy
+  hit-count chain exactly: the compiler assigns a per-rule `counter_id`
+  (`assignNATCounterID`, single SSOT for SNAT/DNAT/static in
+  `compiler_nat.go`; DNAT and static had NO counter ID before, so DNAT hits
+  never displayed at all), the snapshot builders stamp it onto each rule
+  (`SourceNATRuleSnapshot`/`DestinationNATRuleSnapshot`/
+  `StaticNATRuleSnapshot.CounterID`), the Rust dataplane keeps an
+  `Arc<NatRuleCounter>` per rule (`NatCounterStore`, the NAT analogue of
+  `PolicyCounterStore`) and bumps it once per committed translated forward
+  flow on the cold (session-miss) path, and the counts ride
+  `ProcessStatus.nat_rule_counters` (counter_id/packets/bytes) → the Go
+  control plane's `syncBPFCountersLocked` → `Manager.SetNATRuleCounterOffset`
+  → the `bpfShim` `nat_rule_counters` offset that `ReadNATRuleCounter` merges.
+  INTENTIONAL semantic divergence from vSRX (FLAGGED): xpf counts PER-FLOW
+  (one packet + its bytes per new translated flow), not per-transit-packet, so
+  the displayed "packets" is the translated-flow count, not the total
+  translated packet count; the value is node-local and resets on helper
+  restart. The fast (established-flow) transit path adds no per-packet work —
+  the increment is cold-path only, allocation-free, a single relaxed atomic.
 - **H14 `security flow power-mode-disable`** — DONE (threaded). The parsed
   `cfg.Security.Flow.PowerModeDisable` now reaches the dataplane via
   `FlowSnapshot.PowerModeDisable` (`pkg/dataplane/userspace/protocol.go` +

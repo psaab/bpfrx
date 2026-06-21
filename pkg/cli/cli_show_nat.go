@@ -385,7 +385,7 @@ func (c *CLI) showNATSourceRuleSet(cfg *config.Config, rsName string) error {
 
 			// Show hit counters if dataplane is loaded
 			if c.dp != nil && cr != nil {
-				ruleKey := rs.Name + "/" + rule.Name
+				ruleKey := dataplane.NATCounterKey(dataplane.NATCounterTypeSource, rs.Name, rule.Name)
 				if cid, ok := cr.NATCounterIDs[ruleKey]; ok {
 					cnt, err := c.dp.ReadNATRuleCounter(uint32(cid))
 					if err == nil {
@@ -433,7 +433,7 @@ func (c *CLI) showNATSourceRuleAll(cfg *config.Config) error {
 			fmt.Printf("  Match: source %s destination %s\n", srcMatch, dstMatch)
 
 			if c.dp != nil && cr != nil {
-				ruleKey := rs.Name + "/" + rule.Name
+				ruleKey := dataplane.NATCounterKey(dataplane.NATCounterTypeSource, rs.Name, rule.Name)
 				if cid, ok := cr.NATCounterIDs[ruleKey]; ok {
 					cnt, err := c.dp.ReadNATRuleCounter(uint32(cid))
 					if err == nil {
@@ -520,7 +520,7 @@ func (c *CLI) showNATDestination(cfg *config.Config, args []string) error {
 
 			// Show hit counters if dataplane is loaded
 			if c.dp != nil && cr != nil {
-				ruleKey := rs.Name + "/" + rule.Name
+				ruleKey := dataplane.NATCounterKey(dataplane.NATCounterTypeDest, rs.Name, rule.Name)
 				if cid, ok := cr.NATCounterIDs[ruleKey]; ok {
 					cnt, err := c.dp.ReadNATRuleCounter(uint32(cid))
 					if err == nil {
@@ -585,7 +585,7 @@ func (c *CLI) showNATDestinationSummary(cfg *config.Config) error {
 				if rule.Then.PoolName == "" {
 					continue
 				}
-				ruleKey := rs.Name + "/" + rule.Name
+				ruleKey := dataplane.NATCounterKey(dataplane.NATCounterTypeDest, rs.Name, rule.Name)
 				if cid, ok := cr.NATCounterIDs[ruleKey]; ok {
 					cnt, err := c.dp.ReadNATRuleCounter(uint32(cid))
 					if err == nil {
@@ -686,7 +686,7 @@ func (c *CLI) showNATDestinationPool(cfg *config.Config, poolName string) error 
 					if rule.Then.PoolName != name {
 						continue
 					}
-					ruleKey := rs.Name + "/" + rule.Name
+					ruleKey := dataplane.NATCounterKey(dataplane.NATCounterTypeDest, rs.Name, rule.Name)
 					if cid, ok := cr.NATCounterIDs[ruleKey]; ok {
 						cnt, err := c.dp.ReadNATRuleCounter(uint32(cid))
 						if err == nil {
@@ -743,7 +743,7 @@ func (c *CLI) showNATDestinationRuleSet(cfg *config.Config, rsName string) error
 
 			// Show hit counters if dataplane is loaded
 			if c.dp != nil && cr != nil {
-				ruleKey := rs.Name + "/" + rule.Name
+				ruleKey := dataplane.NATCounterKey(dataplane.NATCounterTypeDest, rs.Name, rule.Name)
 				if cid, ok := cr.NATCounterIDs[ruleKey]; ok {
 					cnt, err := c.dp.ReadNATRuleCounter(uint32(cid))
 					if err == nil {
@@ -791,7 +791,7 @@ func (c *CLI) showNATDestinationRuleAll(cfg *config.Config) error {
 			fmt.Printf("  Match: destination %s\n", dstMatch)
 
 			if c.dp != nil && cr != nil {
-				ruleKey := rs.Name + "/" + rule.Name
+				ruleKey := dataplane.NATCounterKey(dataplane.NATCounterTypeDest, rs.Name, rule.Name)
 				if cid, ok := cr.NATCounterIDs[ruleKey]; ok {
 					cnt, err := c.dp.ReadNATRuleCounter(uint32(cid))
 					if err == nil {

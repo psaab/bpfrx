@@ -6,14 +6,15 @@
 // machine lives in the sibling allocator.rs.
 
 use super::allocator::{
-    PersistentSourceKey, PoolAddressFamily, PortAllocator, TranslatedTuple, NS_PER_SEC,
+    NS_PER_SEC, PersistentSourceKey, PoolAddressFamily, PortAllocator, TranslatedTuple,
 };
-use super::NatDecision;
-use crate::prefix::{PrefixV4, PrefixV6};
+use super::{NatCounterStore, NatDecision, NatRuleCounter};
 use crate::SourceNATRuleSnapshot;
+use crate::prefix::{PrefixV4, PrefixV6};
 use ipnet::IpNet;
 use rustc_hash::FxHashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::sync::Arc;
 
 const DEFAULT_PERSISTENT_NAT_TIMEOUT_SECS: i64 = 300;
 
@@ -128,6 +129,12 @@ pub(crate) struct SourceNatRule {
     pub(crate) pool_addresses_v4: Vec<Ipv4Addr>,
     pub(crate) pool_addresses_v6: Vec<Ipv6Addr>,
     pub(crate) pool_allocator: PortAllocator,
+    /// #2218: per-rule translation hit counter, shared from the
+    /// coordinator's `NatCounterStore`. `None` when the rule carries no
+    /// per-rule counter (`counter_id == 0`). Captured at build time; the
+    /// cold-path commit site clones the `Arc` and calls `.add(len)` once
+    /// per committed translated forward flow.
+    pub(crate) hit_counter: Option<Arc<NatRuleCounter>>,
 }
 
 #[derive(Clone, Debug, Hash, PartialEq, Eq)]
@@ -176,12 +183,13 @@ impl SourceNatRule {
 
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn parse_source_nat_rules(snaps: &[SourceNATRuleSnapshot]) -> Vec<SourceNatRule> {
-    parse_source_nat_rules_with_previous(snaps, None)
+    parse_source_nat_rules_with_previous(snaps, None, &NatCounterStore::default())
 }
 
 pub(crate) fn parse_source_nat_rules_with_previous(
     snaps: &[SourceNATRuleSnapshot],
     previous: Option<&[SourceNatRule]>,
+    nat_counters: &NatCounterStore,
 ) -> Vec<SourceNatRule> {
     // Persistent SNAT allocator state is helper-local runtime state. A
     // compatible in-process refresh may reuse the previous allocator below,
@@ -219,6 +227,8 @@ pub(crate) fn parse_source_nat_rules_with_previous(
             persistent_nat_permit_any_remote_host: snap.persistent_nat_permit_any_remote_host,
             persistent_nat_inactivity_timeout_secs: timeout_secs,
             persistent_nat_timeout_ns: (timeout_secs as u64).saturating_mul(NS_PER_SEC),
+            // #2218: resolve the per-rule hit counter (None for counter_id 0).
+            hit_counter: nat_counters.rule_counter(snap.counter_id),
             ..SourceNatRule::default()
         };
         for prefix in &snap.source_addresses {
@@ -402,11 +412,31 @@ pub(crate) fn match_source_nat_result(
     egress_v4: Option<Ipv4Addr>,
     egress_v6: Option<Ipv6Addr>,
 ) -> SourceNatLookup {
+    let mut counter = None;
     match_source_nat_result_for_tuple(
-        rules, from_zone, to_zone, src_ip, dst_ip, 0, 0, 0, egress_v4, egress_v6, 0, false,
+        rules,
+        from_zone,
+        to_zone,
+        src_ip,
+        dst_ip,
+        0,
+        0,
+        0,
+        egress_v4,
+        egress_v6,
+        0,
+        false,
+        &mut counter,
     )
 }
 
+/// #2218: same as `match_source_nat_result_for_tuple` but the matched
+/// rule's per-rule hit counter (if any) is written to `matched_counter`.
+/// The `SourceNatLookup` enum stays wire-/Eq-frozen (it is destructured
+/// and `matches!`-compared in many tests and over no wire), so the counter
+/// rides out via this out-parameter rather than a new enum payload — the
+/// least-invasive shape. The cold-path commit site clones the captured
+/// `Arc` and increments it once per committed translated flow.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn match_source_nat_result_for_tuple(
     rules: &[SourceNatRule],
@@ -424,6 +454,7 @@ pub(crate) fn match_source_nat_result_for_tuple(
     // a non-first fragment has no L4 ports. Interface-mode (address-only)
     // and `off`/static rules are unaffected.
     non_first_fragment: bool,
+    matched_counter: &mut Option<Arc<NatRuleCounter>>,
 ) -> SourceNatLookup {
     let flow = SourceNatFlowKey {
         protocol,
@@ -437,8 +468,11 @@ pub(crate) fn match_source_nat_result_for_tuple(
             continue;
         }
         if rule.off {
+            // An `off` rule applies no translation — leave matched_counter
+            // unset so no hit is counted for a no-op match.
             return SourceNatLookup::Matched(NatDecision::default());
         }
+        *matched_counter = rule.hit_counter.clone();
         if rule.interface_mode {
             let rewrite_src = match src_ip {
                 IpAddr::V4(_) => egress_v4.map(IpAddr::V4),
@@ -455,6 +489,10 @@ pub(crate) fn match_source_nat_result_for_tuple(
                 return SourceNatLookup::Unavailable(SourceNatFailure::for_rule(rule, reason));
             }
         } else {
+            // This rule matched the zone/addresses but is neither
+            // interface-mode nor pool-mode — it applies no translation, so
+            // clear the tentatively-captured counter and try the next rule.
+            *matched_counter = None;
             continue;
         }
         // #1852: pool-mode SNAT translates the L4 port. A non-first

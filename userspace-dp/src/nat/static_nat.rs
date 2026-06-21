@@ -1,9 +1,10 @@
 // Static 1:1 NAT table — bidirectional internal↔external mapping.
 
-use super::NatDecision;
+use super::{NatCounterStore, NatDecision, NatRuleCounter};
 use crate::StaticNATRuleSnapshot;
 use rustc_hash::FxHashMap;
 use std::net::IpAddr;
+use std::sync::Arc;
 
 /// Static 1:1 NAT entry (bidirectional).
 #[derive(Clone, Debug)]
@@ -11,6 +12,8 @@ pub(crate) struct StaticNatEntry {
     pub(crate) external_ip: IpAddr,
     pub(crate) internal_ip: IpAddr,
     pub(crate) from_zone: String,
+    /// #2218: per-rule translation hit counter (None for counter_id 0).
+    pub(crate) hit_counter: Option<Arc<NatRuleCounter>>,
 }
 
 /// Lookup table for static NAT -- indexed by IP for O(1) matching.
@@ -54,7 +57,10 @@ fn parse_nat_addr(s: &str) -> Option<IpAddr> {
 }
 
 impl StaticNatTable {
-    pub(crate) fn from_snapshots(snaps: &[StaticNATRuleSnapshot]) -> Self {
+    pub(crate) fn from_snapshots(
+        snaps: &[StaticNATRuleSnapshot],
+        nat_counters: &NatCounterStore,
+    ) -> Self {
         let mut table = StaticNatTable::default();
         for snap in snaps {
             let external_ip: IpAddr = match parse_nat_addr(&snap.external_ip) {
@@ -69,6 +75,7 @@ impl StaticNatTable {
                 external_ip,
                 internal_ip,
                 from_zone: snap.from_zone.clone(),
+                hit_counter: nat_counters.rule_counter(snap.counter_id),
             };
             table.dnat.insert(external_ip, entry.clone());
             table.snat.insert(internal_ip, entry);
@@ -77,16 +84,35 @@ impl StaticNatTable {
     }
 
     /// Match inbound: if dst_ip is an external IP, return DNAT decision.
+    ///
+    /// Returns just the decision; existing callers/tests keep their
+    /// `Option<NatDecision>` shape. The cold path uses
+    /// [`match_dnat_with_counter`] (#2218) for the per-rule hit counter.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn match_dnat(&self, dst_ip: IpAddr, ingress_zone: &str) -> Option<NatDecision> {
+        self.match_dnat_with_counter(dst_ip, ingress_zone)
+            .map(|(decision, _)| decision)
+    }
+
+    /// #2218: as [`match_dnat`] but also returns the matched entry's
+    /// per-rule hit counter (if any).
+    pub(crate) fn match_dnat_with_counter(
+        &self,
+        dst_ip: IpAddr,
+        ingress_zone: &str,
+    ) -> Option<(NatDecision, Option<Arc<NatRuleCounter>>)> {
         let entry = self.dnat.get(&dst_ip)?;
         if !entry.from_zone.is_empty() && entry.from_zone != ingress_zone {
             return None;
         }
-        Some(NatDecision {
-            rewrite_src: None,
-            rewrite_dst: Some(entry.internal_ip),
-            ..NatDecision::default()
-        })
+        Some((
+            NatDecision {
+                rewrite_src: None,
+                rewrite_dst: Some(entry.internal_ip),
+                ..NatDecision::default()
+            },
+            entry.hit_counter.clone(),
+        ))
     }
 
     /// Match outbound: if src_ip is an internal IP, return SNAT decision.
@@ -96,13 +122,31 @@ impl StaticNatTable {
     /// triggers DNAT only. For SNAT (outbound), the internal IP match is
     /// sufficient -- the traffic originates from the internal host regardless
     /// of which zone it enters through.
-    pub(crate) fn match_snat(&self, src_ip: IpAddr, _ingress_zone: &str) -> Option<NatDecision> {
+    ///
+    /// Returns just the decision; the cold path uses
+    /// [`match_snat_with_counter`] (#2218) for the per-rule hit counter.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn match_snat(&self, src_ip: IpAddr, ingress_zone: &str) -> Option<NatDecision> {
+        self.match_snat_with_counter(src_ip, ingress_zone)
+            .map(|(decision, _)| decision)
+    }
+
+    /// #2218: as [`match_snat`] but also returns the matched entry's
+    /// per-rule hit counter (if any).
+    pub(crate) fn match_snat_with_counter(
+        &self,
+        src_ip: IpAddr,
+        _ingress_zone: &str,
+    ) -> Option<(NatDecision, Option<Arc<NatRuleCounter>>)> {
         let entry = self.snat.get(&src_ip)?;
-        Some(NatDecision {
-            rewrite_src: Some(entry.external_ip),
-            rewrite_dst: None,
-            ..NatDecision::default()
-        })
+        Some((
+            NatDecision {
+                rewrite_src: Some(entry.external_ip),
+                rewrite_dst: None,
+                ..NatDecision::default()
+            },
+            entry.hit_counter.clone(),
+        ))
     }
 
     /// Returns true if the table has any entries.

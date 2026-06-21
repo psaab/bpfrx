@@ -131,6 +131,7 @@ pub(super) fn match_source_nat_for_flow_result(
     egress_ifindex: i32,
     flow: &SessionFlow,
 ) -> SourceNatLookup {
+    let mut counter = None;
     match_source_nat_for_flow_result_at(
         forwarding,
         from_zone,
@@ -139,6 +140,7 @@ pub(super) fn match_source_nat_for_flow_result(
         flow,
         0,
         false,
+        &mut counter,
     )
 }
 
@@ -152,6 +154,8 @@ pub(super) fn match_source_nat_for_flow_result_at(
     now_ns: u64,
     // #1852: gate pool-mode SNAT allocation for non-first fragments.
     non_first_fragment: bool,
+    // #2218: out-param — the matched SNAT rule's per-rule hit counter.
+    matched_counter: &mut Option<std::sync::Arc<crate::nat::NatRuleCounter>>,
 ) -> SourceNatLookup {
     let Some(egress) = forwarding.egress.get(&egress_ifindex) else {
         return SourceNatLookup::NoMatch;
@@ -169,6 +173,7 @@ pub(super) fn match_source_nat_for_flow_result_at(
         egress.primary_v6,
         now_ns,
         non_first_fragment,
+        matched_counter,
     )
 }
 

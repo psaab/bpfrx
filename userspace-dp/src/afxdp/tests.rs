@@ -930,6 +930,7 @@ fn static_nat_snat_matches_when_zone_is_empty() {
     // Create a snapshot where from_zone is empty (matches any zone)
     let mut snapshot = static_nat_snapshot();
     snapshot.static_nat_rules = vec![StaticNATRuleSnapshot {
+        counter_id: 0,
         name: "web-server".to_string(),
         from_zone: String::new(), // matches any zone
         external_ip: "203.0.113.10".to_string(),
@@ -955,6 +956,7 @@ fn static_nat_takes_priority_over_interface_snat() {
     // Create snapshot with both static NAT and interface SNAT
     let mut snapshot = static_nat_snapshot();
     snapshot.static_nat_rules = vec![StaticNATRuleSnapshot {
+        counter_id: 0,
         name: "static-web".to_string(),
         from_zone: String::new(),
         external_ip: "203.0.113.10".to_string(),
@@ -988,6 +990,7 @@ fn static_nat_takes_priority_over_interface_snat() {
 fn static_nat_v6_dnat_and_snat() {
     let mut snapshot = static_nat_snapshot();
     snapshot.static_nat_rules = vec![StaticNATRuleSnapshot {
+        counter_id: 0,
         name: "v6-server".to_string(),
         from_zone: String::new(),
         external_ip: "2001:db8::10".to_string(),
@@ -1051,6 +1054,7 @@ fn post_dnat_source_nat_matches_translated_destination() {
         ..Default::default()
     }];
     snapshot.destination_nat_rules = vec![DestinationNATRuleSnapshot {
+        counter_id: 0,
         name: "web-dnat".to_string(),
         from_zone: "wan".to_string(),
         destination_address: "172.16.80.8".to_string(),
@@ -1643,7 +1647,9 @@ fn build_udp_frame_v4(src: Ipv4Addr, dst: Ipv4Addr) -> Vec<u8> {
         0x02, 0x11, 0x22, 0x33, 0x44, 0x55, // src mac (client)
         0x08, 0x00,
     ]);
-    frame.extend_from_slice(&[0x45, 0x00, 0x00, 0x1c, 0x00, 0x00, 0x40, 0x00, 64, PROTO_UDP, 0, 0]);
+    frame.extend_from_slice(&[
+        0x45, 0x00, 0x00, 0x1c, 0x00, 0x00, 0x40, 0x00, 64, PROTO_UDP, 0, 0,
+    ]);
     frame.extend_from_slice(&src.octets());
     frame.extend_from_slice(&dst.octets());
     frame.extend_from_slice(&[0xc0, 0x00, 0x00, 0x35, 0x00, 0x08, 0x00, 0x00]); // UDP hdr
@@ -1694,8 +1700,7 @@ fn reject_icmp_unreachable_v6_is_type1_code1_admin_prohibited() {
         protocol: PROTO_ICMPV6,
         ..UserspaceDpMeta::default()
     };
-    let forwarding =
-        reject_egress_forwarding(None, Some("2001:559:8585:ef00::1".parse().unwrap()));
+    let forwarding = reject_egress_forwarding(None, Some("2001:559:8585:ef00::1".parse().unwrap()));
     let out = build_reject_icmp_unreachable(&frame, meta, 5, &forwarding)
         .expect("reject ICMPv6 unreachable v6");
     // ICMPv6 type 1 (dest unreachable), code 1 (admin prohibited).
@@ -2345,7 +2350,11 @@ fn build_icmpv6_te_frame_ext(
     // Embedded IPv6 (+ optional fragment header) + 8 bytes of TCP.
     let mut embedded = Vec::new();
     embedded.extend_from_slice(&[0x60, 0x00, 0x00, 0x00]);
-    let frag_len = if embedded_frag_off_flags.is_some() { 8 } else { 0 };
+    let frag_len = if embedded_frag_off_flags.is_some() {
+        8
+    } else {
+        0
+    };
     let emb_payload_len = (frag_len + 8) as u16;
     embedded.extend_from_slice(&emb_payload_len.to_be_bytes());
     embedded.push(if embedded_frag_off_flags.is_some() {
@@ -2461,7 +2470,14 @@ fn icmpv6_te_nat_reversal_outer_ext_header_lands_at_real_offsets() {
     let client_port: u16 = 12345;
 
     let frame = build_icmpv6_te_frame_ext(
-        router_ip, snat_ip, server_ip, snat_port, 80, true, None, &[],
+        router_ip,
+        snat_ip,
+        server_ip,
+        snat_port,
+        80,
+        true,
+        None,
+        &[],
     );
     // Outer L4 (ICMPv6) at eth(14) + IPv6(40) + hop-by-hop(8) = 62.
     let meta = icmpv6_te_meta(62);
@@ -2588,10 +2604,16 @@ fn icmpv6_te_nat_reversal_computed_zero_checksum_stored_as_ffff() {
     let meta = icmpv6_te_meta(54);
     let icmp_match = icmpv6_te_match_fixture(snat_ip, client_ip, snat_port, client_port);
     let frame = build_icmpv6_te_frame_ext(
-        router_ip, snat_ip, server_ip, snat_port, 80, false, None, &[0, 0],
+        router_ip,
+        snat_ip,
+        server_ip,
+        snat_port,
+        80,
+        false,
+        None,
+        &[0, 0],
     );
-    let pass1 =
-        build_nat_reversed_icmp_error_v6(&frame, meta, &icmp_match).expect("pass 1 builds");
+    let pass1 = build_nat_reversed_icmp_error_v6(&frame, meta, &icmp_match).expect("pass 1 builds");
     let c1 = u16::from_be_bytes([pass1[icmp6_start + 2], pass1[icmp6_start + 3]]);
 
     // Pass 2: balancer = C1 forces the recomputed sum to zero.
@@ -4346,11 +4368,8 @@ fn maybe_reinject_slow_path_drops_ineligible_dispositions() {
         ForwardingDisposition::HAInactive,
         ForwardingDisposition::DiscardRoute,
     ] {
-        let frame = build_icmp_echo_frame_v4(
-            Ipv4Addr::new(10, 0, 61, 102),
-            Ipv4Addr::new(1, 1, 1, 1),
-            64,
-        );
+        let frame =
+            build_icmp_echo_frame_v4(Ipv4Addr::new(10, 0, 61, 102), Ipv4Addr::new(1, 1, 1, 1), 64);
         let mut area = MmapArea::new(4096).expect("mmap");
         area.slice_mut(0, frame.len())
             .expect("slice")
@@ -4756,7 +4775,8 @@ fn handle_forward_build_failure_drops_fabric_redirect_fail_closed() {
 
     assert_eq!(dbg.build_fail, 1);
     assert_eq!(
-        live.fabric_redirect_unsendable_drops.load(Ordering::Relaxed),
+        live.fabric_redirect_unsendable_drops
+            .load(Ordering::Relaxed),
         1
     );
     // Fail-closed: no slow-path reinjection of any kind.
@@ -4839,7 +4859,8 @@ fn handle_forward_build_failure_still_reinjects_forward_candidate() {
     assert_eq!(dbg.build_fail, 1);
     // The fabric gate must NOT have caught a ForwardCandidate.
     assert_eq!(
-        live.fabric_redirect_unsendable_drops.load(Ordering::Relaxed),
+        live.fabric_redirect_unsendable_drops
+            .load(Ordering::Relaxed),
         0
     );
     // It reinjected (and dropped only because slow_path is None).
@@ -5479,7 +5500,10 @@ fn txn_failed_reply_repair_forwards_uncached_then_self_heals_below_cap() {
         dst_port: 443,
     };
     let forward_decision = SessionDecision {
-        resolution: lookup_forwarding_resolution(&forwarding, IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8))),
+        resolution: lookup_forwarding_resolution(
+            &forwarding,
+            IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+        ),
         nat: NatDecision {
             rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
             ..NatDecision::default()
@@ -5614,7 +5638,12 @@ fn txn_refused_seed_recycles_instead_of_buffering() {
     );
 }
 
-fn build_txn_tcp_syn_frame_v6(src: Ipv6Addr, dst: Ipv6Addr, src_port: u16, dst_port: u16) -> Vec<u8> {
+fn build_txn_tcp_syn_frame_v6(
+    src: Ipv6Addr,
+    dst: Ipv6Addr,
+    src_port: u16,
+    dst_port: u16,
+) -> Vec<u8> {
     let mut frame = Vec::new();
     write_eth_header(
         &mut frame,
@@ -5707,7 +5736,11 @@ fn txn_nat64_refusal_at_cap_drops_translated_packet() {
         &frame,
         meta2,
     );
-    assert_eq!(sessions.len(), 2, "NAT64 forward + reverse install below cap");
+    assert_eq!(
+        sessions.len(),
+        2,
+        "NAT64 forward + reverse install below cap"
+    );
     assert_eq!(batch2.session_creates, 2);
     assert_eq!(dbg2.tx, 1);
 }
@@ -5793,7 +5826,10 @@ fn txn_nat64_translation_bumps_counter_both_directions() {
         &fwd_frame,
         UserspaceDpMeta { ..fwd_meta },
     );
-    assert_eq!(fwd_dbg.tx, 1, "admitted NAT64 forward must translate + forward");
+    assert_eq!(
+        fwd_dbg.tx, 1,
+        "admitted NAT64 forward must translate + forward"
+    );
     assert_eq!(sessions.len(), 2, "NAT64 forward + reverse install");
     assert_eq!(
         fwd_batch.nat64_translations, 1,
@@ -5822,6 +5858,118 @@ fn txn_nat64_translation_bumps_counter_both_directions() {
     assert_eq!(
         rev_batch.nat64_translations, 1,
         "the v4->v6 reverse translation must bump the counter exactly once"
+    );
+}
+
+// #2218: a translated forward flow through the worker poll path must bump the
+// matched SNAT rule's per-rule hit counter exactly once on the committed
+// install, and NOT bump it for a refused-at-cap flow (the trigger is dropped,
+// no session is created). FAIL-ON-REVERT: with the cold-path increment line
+// removed, the admitted-flow assertion (count == 1) fails.
+#[test]
+fn txn_source_nat_translation_bumps_rule_counter_once() {
+    let mut snapshot = nat_snapshot();
+    // Stamp a per-rule counter id on the interface-mode SNAT rule that the
+    // 10.0.61.x -> 8.8.8.8 lan->wan flow matches.
+    snapshot.source_nat_rules[0].counter_id = 5;
+
+    let policy_counters = crate::policy::PolicyCounterStore::default();
+    let nat_counters = crate::nat::NatCounterStore::default();
+    let forwarding =
+        build_forwarding_state_with_counters(&snapshot, &policy_counters, &nat_counters);
+    let counter = nat_counters
+        .rule_counter(5)
+        .expect("store must hold the parsed rule's counter");
+
+    let ha_state = txn_ha_state();
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, 24, 0);
+    binding.interface = Arc::<str>::from("reth1.0");
+    let mut sessions = SessionTable::new();
+
+    // Phase 1 — refused at cap 0: the trigger is dropped, nothing installs, so
+    // the counter MUST stay 0.
+    sessions.set_max_sessions_for_test(0);
+    let frame = build_txn_tcp_syn_frame_v4(
+        Ipv4Addr::new(10, 0, 61, 102),
+        Ipv4Addr::new(8, 8, 8, 8),
+        12345,
+        443,
+        TCP_FLAG_SYN,
+    );
+    let meta = txn_meta_v4(24, TCP_FLAG_SYN, (frame.len() - 14) as u16);
+    let (_b0, d0) = txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &frame,
+        meta,
+    );
+    assert_eq!(d0.tx, 0, "refused SNAT flow must not forward");
+    assert_eq!(
+        nat_counters.snapshots()[0].packets,
+        0,
+        "a refused (rolled-back) SNAT translation must not be counted"
+    );
+
+    // Phase 2 — admitted below cap: the forward translation commits and the
+    // counter bumps exactly once (per committed flow, with the trigger len).
+    sessions.set_max_sessions_for_test(16);
+    let (_b1, d1) = txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &frame,
+        meta,
+    );
+    assert_eq!(d1.tx, 1, "admitted SNAT flow must forward its trigger");
+    let snaps = nat_counters.snapshots();
+    assert_eq!(snaps.len(), 1, "exactly one NAT rule counter");
+    assert_eq!(snaps[0].counter_id, 5);
+    assert_eq!(
+        snaps[0].packets, 1,
+        "the committed SNAT translation must bump the counter exactly once"
+    );
+    assert_eq!(
+        snaps[0].bytes,
+        frame.len() as u64,
+        "the per-flow byte count is the trigger descriptor length (full frame, matching the policy counter's desc.len semantic)"
+    );
+    // The shared Arc reflects the same count.
+    assert_eq!(
+        counter.snapshot(5).packets,
+        1,
+        "the rule's shared Arc carries the committed count"
+    );
+
+    // Phase 3 — a NON-translated flow (different SNAT rule with no counter):
+    // build a fresh forwarding with the rule's counter_id back to 0 and verify
+    // the store stays empty after a flow.
+    let mut snapshot2 = nat_snapshot();
+    snapshot2.source_nat_rules[0].counter_id = 0;
+    let nat_counters2 = crate::nat::NatCounterStore::default();
+    let forwarding2 = build_forwarding_state_with_counters(
+        &snapshot2,
+        &crate::policy::PolicyCounterStore::default(),
+        &nat_counters2,
+    );
+    let mut binding2 = BindingWorker::new_for_mirror_test(0, 0, 24, 0);
+    binding2.interface = Arc::<str>::from("reth1.0");
+    let mut sessions2 = SessionTable::new();
+    sessions2.set_max_sessions_for_test(16);
+    let (_b2, d2) = txn_run_descriptor(
+        &mut binding2,
+        &mut sessions2,
+        &forwarding2,
+        &ha_state,
+        &frame,
+        meta,
+    );
+    assert_eq!(d2.tx, 1, "the uncounted SNAT flow still forwards");
+    assert!(
+        nat_counters2.snapshots().is_empty(),
+        "a counter_id-0 SNAT rule allocates no counter, so the store stays empty"
     );
 }
 
@@ -5973,7 +6121,10 @@ fn tunnel_marked_build_failure_drops_instead_of_slow_path() {
         true,
         &ForwardingState::default(),
     );
-    assert_eq!(live.tunnel_encap_unresolved_drops.load(Ordering::Relaxed), 1);
+    assert_eq!(
+        live.tunnel_encap_unresolved_drops.load(Ordering::Relaxed),
+        1
+    );
     assert_eq!(live.slow_path_drops.load(Ordering::Relaxed), 0);
 }
 
@@ -6001,7 +6152,10 @@ fn tunnel_gate_keeps_local_tunnel_delivery_open() {
         "forward_build_slow_path",
         &ForwardingState::default(),
     );
-    assert_eq!(live.tunnel_encap_unresolved_drops.load(Ordering::Relaxed), 0);
+    assert_eq!(
+        live.tunnel_encap_unresolved_drops.load(Ordering::Relaxed),
+        0
+    );
     let delivered = rx.try_recv().expect("local tunnel delivery still open");
     assert!(!delivered.is_empty());
 }
@@ -6233,10 +6387,9 @@ fn txn_policy_denied_missing_neighbor_skips_neg_cache_fast_fail() {
     // the deny gate ran AFTER neg_neigh_gate, this packet would fast-fail
     // and recycle as a dead-host miss with NO policy deny counted.
     let now_ns = 123_000_000_000u64;
-    binding.neg_neigh_cache.insert(
-        (12, IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200))),
-        now_ns,
-    );
+    binding
+        .neg_neigh_cache
+        .insert((12, IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200))), now_ns);
     let mut sessions = SessionTable::new();
 
     let frame = build_policy_deny_tcp_syn_frame();
@@ -6315,8 +6468,8 @@ fn gre_to_self_snapshot() -> ConfigSnapshot {
 fn build_gre_inner_icmp_packet_v4() -> Vec<u8> {
     let mut packet = Vec::new();
     packet.extend_from_slice(&[
-        0x45, 0x00, 0x00, 0x24, 0x00, 0x01, 0x00, 0x00, 64, PROTO_ICMP, 0x00, 0x00, 10, 255, 0,
-        2, 10, 255, 0, 1,
+        0x45, 0x00, 0x00, 0x24, 0x00, 0x01, 0x00, 0x00, 64, PROTO_ICMP, 0x00, 0x00, 10, 255, 0, 2,
+        10, 255, 0, 1,
     ]);
     let ip_sum = checksum16(&packet[0..20]);
     packet[10] = (ip_sum >> 8) as u8;
@@ -6583,8 +6736,8 @@ fn build_gre_inner_tcp_syn_packet_v4(dst: Ipv4Addr) -> Vec<u8> {
     let mut packet = Vec::new();
     let d = dst.octets();
     packet.extend_from_slice(&[
-        0x45, 0x00, 0x00, 0x28, 0x00, 0x01, 0x00, 0x00, 64, PROTO_TCP, 0x00, 0x00, 10, 255, 0,
-        2, d[0], d[1], d[2], d[3],
+        0x45, 0x00, 0x00, 0x28, 0x00, 0x01, 0x00, 0x00, 64, PROTO_TCP, 0x00, 0x00, 10, 255, 0, 2,
+        d[0], d[1], d[2], d[3],
     ]);
     let ip_sum = checksum16(&packet[0..20]);
     packet[10] = (ip_sum >> 8) as u8;
@@ -6738,13 +6891,8 @@ fn txn_non_decap_missing_neighbor_buffers_and_retries_correctly() {
     // LAN hairpin: 10.0.61.102 -> 10.0.61.50, directly connected on
     // reth1.0 (egress == ingress binding), neighbor cold.
     let dst = Ipv4Addr::new(10, 0, 61, 50);
-    let frame = build_txn_tcp_syn_frame_v4(
-        Ipv4Addr::new(10, 0, 61, 102),
-        dst,
-        12345,
-        443,
-        TCP_FLAG_SYN,
-    );
+    let frame =
+        build_txn_tcp_syn_frame_v4(Ipv4Addr::new(10, 0, 61, 102), dst, 12345, 443, TCP_FLAG_SYN);
     let meta = txn_meta_v4(24, TCP_FLAG_SYN, (frame.len() - 14) as u16);
     let (_batch, dbg) = txn_run_descriptor(
         &mut bindings[0],
@@ -6876,25 +7024,24 @@ fn replay_filter_drops_purged_forward_and_derived_reverse_companion() {
         tunnel_endpoint_id: 0,
         ..tunnel_resolution
     };
-    let make = |key: &SessionKey,
-                resolution: ForwardingResolution,
-                is_reverse: bool| SyncedSessionEntry {
-        key: key.clone(),
-        decision: SessionDecision { resolution, nat },
-        metadata: SessionMetadata {
-            ingress_zone: 1,
-            egress_zone: 2,
-            owner_rg_id: 1,
-            fabric_ingress: false,
-            is_reverse,
-            nat64_reverse: None,
-        },
-        origin: SessionOrigin::SyncImport,
-        protocol: PROTO_TCP,
-        tcp_flags: 0,
-        // #2170 test fixture: no peer install generation.
-        generation: 0,
-    };
+    let make =
+        |key: &SessionKey, resolution: ForwardingResolution, is_reverse: bool| SyncedSessionEntry {
+            key: key.clone(),
+            decision: SessionDecision { resolution, nat },
+            metadata: SessionMetadata {
+                ingress_zone: 1,
+                egress_zone: 2,
+                owner_rg_id: 1,
+                fabric_ingress: false,
+                is_reverse,
+                nat64_reverse: None,
+            },
+            origin: SessionOrigin::SyncImport,
+            protocol: PROTO_TCP,
+            tcp_flags: 0,
+            // #2170 test fixture: no peer install generation.
+            generation: 0,
+        };
     let unrelated_key = SessionKey {
         src_port: 23456,
         ..forward_key.clone()

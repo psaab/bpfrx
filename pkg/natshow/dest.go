@@ -90,7 +90,7 @@ func RenderDestRuleDetail(w io.Writer, cfg *config.Config, dp Reader, crFn func(
 			}
 
 			if dp != nil && cr != nil {
-				ruleKey := rs.Name + "/" + rule.Name
+				ruleKey := dataplane.NATCounterKey(dataplane.NATCounterTypeDest, rs.Name, rule.Name)
 				if cid, ok := cr.NATCounterIDs[ruleKey]; ok {
 					cnt, err := dp.ReadNATRuleCounter(uint32(cid))
 					if err == nil {

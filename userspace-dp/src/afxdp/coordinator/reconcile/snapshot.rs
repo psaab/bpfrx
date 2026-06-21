@@ -35,6 +35,7 @@ pub(super) fn apply_snapshot(
     let new_forwarding = match build_forwarding_state_with_policy_counters_and_previous(
         snapshot,
         &coord.policy_counters,
+        &coord.nat_counters,
         Some(&coord.forwarding),
     ) {
         Ok(fwd) => fwd,
@@ -53,13 +54,13 @@ pub(super) fn apply_snapshot(
         fib_generation: snapshot.fib_generation,
     };
     coord.policy_counters.reconcile_rules(&snapshot.policies);
+    // #2218: drop hit counters for NAT rules removed by this config.
+    coord
+        .nat_counters
+        .reconcile_ids(&super::super::snapshot_active_nat_counter_ids(snapshot));
     // #1866 D3: WG endpoint-set transition log at the reconcile apply
     // boundary (mirrors refresh_runtime_snapshot).
-    super::super::log_wg_endpoint_set_transition(
-        "reconcile",
-        &coord.forwarding,
-        &new_forwarding,
-    );
+    super::super::log_wg_endpoint_set_transition("reconcile", &coord.forwarding, &new_forwarding);
     // #1873 R-D: the purge diff runs against the tunnel-owner map
     // captured BEFORE teardown (AGY code r3) — stop_inner(false) has
     // already defaulted coord.forwarding, so diffing the live state
@@ -82,10 +83,7 @@ pub(super) fn apply_snapshot(
     // AND their derived reverse companions out so the replay cannot
     // resurrect them, whole or as half-dead pairs (code r3; companion
     // semantics per AGY code r4).
-    super::super::filter_replayed_synced_sessions(
-        preserved_synced_sessions,
-        &tunnel_purge_ids,
-    );
+    super::super::filter_replayed_synced_sessions(preserved_synced_sessions, &tunnel_purge_ids);
     coord.forwarding = new_forwarding;
     coord.shared_validation.store(Arc::new(coord.validation));
     coord

@@ -6,9 +6,23 @@ import (
 	"strings"
 
 	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/dataplane"
 )
 
-func buildSourceNATSnapshots(cfg *config.Config) []SourceNATRuleSnapshot {
+// natCounterID returns the compiler-assigned per-rule translation hit counter
+// ID for the type-namespaced "natType/rulesetName/ruleName" key (#2218). The
+// natType MUST match the type the compiler stamped (dataplane.NATCounterKey),
+// otherwise same-named SNAT/DNAT/static rules collide. A nil map or a missing
+// key yields 0 ("no counter"), preserving the legacy behavior where the
+// snapshot carried no per-rule counter attribution.
+func natCounterID(ids map[string]uint16, natType, ruleSet, rule string) uint16 {
+	if ids == nil {
+		return 0
+	}
+	return ids[dataplane.NATCounterKey(natType, ruleSet, rule)]
+}
+
+func buildSourceNATSnapshots(cfg *config.Config, natCounterIDs map[string]uint16) []SourceNATRuleSnapshot {
 	if cfg == nil || len(cfg.Security.NAT.Source) == 0 {
 		return nil
 	}
@@ -91,6 +105,7 @@ func buildSourceNATSnapshots(cfg *config.Config) []SourceNATRuleSnapshot {
 				PersistentNATInactivityTimeout:   persistentNATInactivityTimeout,
 				PoolUnusable:                     poolUnusable,
 				PoolUnusableReason:               poolUnusableReason,
+				CounterID:                        natCounterID(natCounterIDs, dataplane.NATCounterTypeSource, rs.Name, rule.Name),
 			})
 		}
 	}
@@ -115,7 +130,7 @@ func sourceNATPoolPortRange(pool *config.NATPool) (uint16, uint16, bool) {
 	return uint16(low), uint16(high), true
 }
 
-func buildStaticNATSnapshots(cfg *config.Config) []StaticNATRuleSnapshot {
+func buildStaticNATSnapshots(cfg *config.Config, natCounterIDs map[string]uint16) []StaticNATRuleSnapshot {
 	if cfg == nil || len(cfg.Security.NAT.Static) == 0 {
 		return nil
 	}
@@ -133,6 +148,7 @@ func buildStaticNATSnapshots(cfg *config.Config) []StaticNATRuleSnapshot {
 				FromZone:   rs.FromZone,
 				ExternalIP: rule.Match,
 				InternalIP: rule.Then,
+				CounterID:  natCounterID(natCounterIDs, dataplane.NATCounterTypeStatic, rs.Name, rule.Name),
 			})
 		}
 	}
@@ -171,7 +187,7 @@ func appPortsFromSpec(spec string) []int {
 	return []int{int(p)}
 }
 
-func buildDestinationNATSnapshots(cfg *config.Config) []DestinationNATRuleSnapshot {
+func buildDestinationNATSnapshots(cfg *config.Config, natCounterIDs map[string]uint16) []DestinationNATRuleSnapshot {
 	if cfg == nil || cfg.Security.NAT.Destination == nil || len(cfg.Security.NAT.Destination.RuleSets) == 0 {
 		return nil
 	}
@@ -184,6 +200,7 @@ func buildDestinationNATSnapshots(cfg *config.Config) []DestinationNATRuleSnapsh
 			if rule == nil || rule.Then.PoolName == "" {
 				continue
 			}
+			ruleCounterID := natCounterID(natCounterIDs, dataplane.NATCounterTypeDest, rs.Name, rule.Name)
 			pool, ok := cfg.Security.NAT.Destination.Pools[rule.Then.PoolName]
 			if !ok || pool == nil || pool.Address == "" {
 				continue
@@ -266,6 +283,7 @@ func buildDestinationNATSnapshots(cfg *config.Config) []DestinationNATRuleSnapsh
 						Protocol:           proto,
 						PoolAddress:        poolAddr,
 						PoolPort:           poolPort,
+						CounterID:          ruleCounterID,
 					})
 				}
 			}
