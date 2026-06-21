@@ -83,6 +83,22 @@ inspect or rewrite a packet sitting in a UMEM frame.
   `packet_rel_l4_offset_and_protocol` so MSS clamping reaches
   ext-headered v6 SYNs (the shared helper is left unchanged — GRE decap
   and tunnel local-origin read it to forward fragmented inner packets).
+- **TCP inspection helpers are ext-header-aware (#2148)**: the read-only
+  diagnostic/telemetry helpers `frame_has_tcp_rst`,
+  `extract_tcp_flags_and_window`, and `extract_tcp_window` (`tcp.rs`) all
+  derive the IPv6 L4 offset via the shared `packet_rel_l4_offset_and_protocol`
+  ext-header walker, NOT a fixed L3+40. Before #2148 they hard-coded the
+  TCP header at L3+40, so an IPv6 flow carrying any extension header
+  (hop-by-hop, routing, fragment, dest-opts) had its RST/flags/window read
+  from inside the extension header — operator-visible RST and zero-window
+  diagnostics (cos queue service, rx telemetry, tx transmit, frame build
+  corruption check, tunnel inner inspection) were false on those flows.
+  The walker is bounded (≤6 iterations), allocation-free (no per-packet
+  heap), and fails safe — a truncated/malformed/looping chain yields
+  "no RST" / "flags unknown" (false / None) rather than panicking or
+  reading OOB. Today these helpers are diagnostics-only, but routing them
+  through the shared walker means the next caller cannot reintroduce the
+  fixed-40 bug. IPv4 and plain (no-ext-header) IPv6 behavior is unchanged.
 
 ## Property tests (`prop_tests/`, #1824)
 

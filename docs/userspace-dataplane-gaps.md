@@ -67,7 +67,7 @@ final-validation artifact set are closed. The explicit gates live in
 
 | Feature/config shape | Userspace status | Tracker / disposition |
 |----------------------|-------------|--------------------|
-| Unsupported policy shapes | Gated | Address/application expansion must succeed for userspace |
+| Unsupported policy shapes | Gated | Address/application expansion must succeed for userspace. #2124: an application term whose protocol the matcher cannot represent (sctp/esp/ah/vrrp/igmp/pim/egp now parse and are canonicalized to their IANA number; anything else, or a malformed port, is unrepresentable) fails the capability gate (`expandUserspacePolicyApplications` -> `ForwardingSupported=false`, refuse-to-arm) rather than collapsing the rule to match-any. On a failed expansion the daemon emits a reserved `__unsupported__` sentinel term so the Rust matcher rejects the whole snapshot via `SnapshotIntegrityError` (keeping the previous good state) — an action-agnostic fail-closed that never turns a permit into match-any nor a deny into a pass, closing the publish-before-disarm window. |
 | Screen behavior requiring SYN cookies | Supported | Closed feature-gap (#1374); #1477 final validation closed |
 | HA with per-pool source NAT `persistent-nat` | Gated | Closed/documented contract: helper-memory persistent-NAT leases are not HA-synchronized, so HA configs that reference persistent source-NAT pools are not admitted |
 | Port mirroring | Supported | Closed feature-gap (#1376); #1477 final validation closed |
