@@ -1,5 +1,40 @@
 # Action Log
 
+## 2026-06-21 — #2158 file-split: split pkg/config/compiler.go (3050 LOC)
+
+- **Timestamp**: 2026-06-21
+- **Action**: Pure code-motion per the converged #2158 plan (§5.2). Split
+  pkg/config/compiler.go (3050 LOC, the worst splittable REFACTOR-tier
+  offender, over the 3000 must-split line) into four cohesive same-package
+  (`package config`) files. compiler.go keeps the AST->typed-struct compile
+  core (sentinels, compileOpts, CompileConfig*, compileConfigWithOpts,
+  compileConfigForNode*, compileExpanded). compiler_validate_strict.go holds
+  the validate*Strict family (#2142/#2144/#2173/#2175/#2187 cluster:
+  application-spec, routing-export, filter-protocol, NAT app-ref, class-of-
+  service strict validators) plus their helpers (routingRedistProtocolTokens,
+  filterProtocolResolvable, policyMatchAddressError, the dataplaneType const
+  block + effective/valid dataplane helpers, userspaceSynCookieProtectionActive,
+  knownManagedProcessNames/isKnownProcessName). compiler_validate_warn.go holds
+  ValidateConfig + the DDNS/routing-rule-window/CoS-oversubscription warning
+  helpers. compiler_applications.go holds compileApplications,
+  parseApplicationTerms, normalizeProtocol, validatePortSpec, validateProtocol,
+  nodeVal. No logic change, no exported-API change, byte-identical runtime
+  behavior. Verified move-only: reconstructing the original from the four
+  parts diffs to zero (modulo seam blank lines), `go doc -all ./pkg/config/`
+  is byte-identical before/after (zero API change), gofmt -l clean on all four
+  files, `go build ./...`, `go vet ./pkg/config/`, and
+  `go test ./pkg/config/... ./pkg/daemon/...` all green unchanged from master.
+  No init-order risk (the only package-level state moved is plain map/string
+  literal vars with no side-effecting initializers; no init()). Regenerated
+  docs/refactoring-audit-current.txt (compiler.go drops off the REFACTOR
+  heatmap entirely; the four files are all well under threshold);
+  make audit-check clean.
+- **File(s)**: pkg/config/compiler.go (trimmed to 956),
+  pkg/config/compiler_validate_strict.go (947),
+  pkg/config/compiler_validate_warn.go (902),
+  pkg/config/compiler_applications.go (270),
+  docs/refactoring-audit-current.txt
+
 ## 2026-06-21 — #2158 file-split (1 of N): relocate wg/engine.rs inline tests
 
 - **Timestamp**: 2026-06-21

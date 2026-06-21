@@ -1,5 +1,4 @@
 [REFACTOR]   3462  userspace-dp/src/afxdp/poll_descriptor/mod.rs
-[REFACTOR]   3050  pkg/config/compiler.go
 [REFACTOR]   2186  pkg/dataplane/userspace/manager.go
 [REFACTOR]   2121  userspace-dp/src/afxdp/types/shared_cos_lease/mod.rs
 [REFACTOR]   2018  pkg/cli/cli_show_security.go
