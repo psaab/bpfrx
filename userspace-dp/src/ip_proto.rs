@@ -8,10 +8,16 @@
 //! matching, and screen checks.
 
 pub(crate) const PROTO_ICMP: u8 = 1;
+pub(crate) const PROTO_IGMP: u8 = 2;
 pub(crate) const PROTO_IPIP: u8 = 4;
 pub(crate) const PROTO_TCP: u8 = 6;
+pub(crate) const PROTO_EGP: u8 = 8;
 pub(crate) const PROTO_UDP: u8 = 17;
 pub(crate) const PROTO_GRE: u8 = 47;
 pub(crate) const PROTO_ESP: u8 = 50;
+pub(crate) const PROTO_AH: u8 = 51;
 pub(crate) const PROTO_ICMPV6: u8 = 58;
 pub(crate) const PROTO_OSPF: u8 = 89;
+pub(crate) const PROTO_PIM: u8 = 103;
+pub(crate) const PROTO_VRRP: u8 = 112;
+pub(crate) const PROTO_SCTP: u8 = 132;
