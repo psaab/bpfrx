@@ -150,6 +150,80 @@ func TestSendGratuitousIPv6_IPv4Rejected(t *testing.T) {
 	}
 }
 
+// TestSendARPProbe_EmitsExplicitSender proves the crafted ARP Request uses
+// the senderIP passed by the caller as the ARP sender protocol address
+// (pkt[28:32]), NOT the interface's own address. This is the #2152 fix: the
+// VRRP failover probe must carry the VIP as sender so the gateway re-binds
+// VIP -> our MAC. The test is non-tautological — pre-fix, SendARPProbe
+// ignored any passed sender and self-resolved to the interface primary, so
+// this assertion (sender field == the VIP we passed, which is NOT an address
+// of "lo") would fail.
+func TestSendARPProbe_EmitsExplicitSender(t *testing.T) {
+	const vip = "10.0.0.100" // a VRRP VIP — deliberately NOT an address of lo
+	const gw = "10.0.0.1"    // the gateway target
+
+	var captured []byte
+	orig := arpProbeSend
+	arpProbeSend = func(_ *net.Interface, pkt []byte) error {
+		captured = append([]byte(nil), pkt...)
+		return nil
+	}
+	defer func() { arpProbeSend = orig }()
+
+	if err := SendARPProbe("lo", net.ParseIP(vip), net.ParseIP(gw)); err != nil {
+		t.Fatalf("SendARPProbe returned error: %v", err)
+	}
+	if len(captured) != 42 {
+		t.Fatalf("captured frame length = %d, want 42", len(captured))
+	}
+
+	// ARP sender protocol address is at pkt[28:32]; it MUST equal the VIP.
+	gotSender := net.IP(captured[28:32]).String()
+	if gotSender != vip {
+		t.Errorf("ARP sender IP = %s, want VIP %s (probe used wrong sender)", gotSender, vip)
+	}
+	// Sanity: the target protocol address (pkt[38:42]) is the gateway.
+	gotTarget := net.IP(captured[38:42]).String()
+	if gotTarget != gw {
+		t.Errorf("ARP target IP = %s, want gateway %s", gotTarget, gw)
+	}
+	// Opcode (pkt[20:22]) must be ARP Request (1).
+	if op := binary.BigEndian.Uint16(captured[20:22]); op != 1 {
+		t.Errorf("opcode = %d, want 1 (request)", op)
+	}
+}
+
+func TestSendARPProbe_RejectsIPv6Sender(t *testing.T) {
+	err := SendARPProbe("lo", net.ParseIP("2001:db8::1"), net.ParseIP("10.0.0.1"))
+	if err == nil {
+		t.Error("expected error for IPv6 sender")
+	}
+}
+
+func TestSendARPProbe_RejectsIPv6Target(t *testing.T) {
+	err := SendARPProbe("lo", net.ParseIP("10.0.0.100"), net.ParseIP("2001:db8::1"))
+	if err == nil {
+		t.Error("expected error for IPv6 target")
+	}
+}
+
+// TestPrimaryIPv4_SkipsLinkLocal verifies PrimaryIPv4 preserves the
+// pre-#2152 self-resolved-sender behavior used by the neighbor-table
+// reprobe path: it returns a non-link-local IPv4 and never a 169.254.x.x
+// address. Loopback carries 127.0.0.1 (and no 169.254.x.x), so on a normal
+// host it resolves to 127.0.0.1.
+func TestPrimaryIPv4_SkipsLinkLocal(t *testing.T) {
+	ip, err := PrimaryIPv4("lo")
+	if err != nil {
+		t.Skipf("lo has no usable IPv4 in this environment: %v", err)
+	}
+	if ip4 := ip.To4(); ip4 == nil {
+		t.Fatalf("PrimaryIPv4 returned non-IPv4: %v", ip)
+	} else if ip4[0] == 169 && ip4[1] == 254 {
+		t.Errorf("PrimaryIPv4 returned link-local %v, want non-link-local", ip)
+	}
+}
+
 func TestBuildUnsolicitedNA(t *testing.T) {
 	mac, _ := net.ParseMAC("de:ad:be:ef:00:01")
 	ip := net.ParseIP("2001:db8::1")
