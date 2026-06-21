@@ -1207,10 +1207,10 @@ fn parse_applications(terms: &[PolicyApplicationSnapshot]) -> ParsedApplications
 /// `validateProtocol` accept (`sctp`/`esp`/`ah`/`vrrp`/`igmp`/`pim`/`egp`) to
 /// their numbers, so a policy that matches only those protocols is honored
 /// instead of silently failing OPEN to match-any. Returning `None` for an
-/// unparseable token causes `parse_applications` to drop the term; a rule whose
-/// terms ALL drop is then rejected as a `SnapshotIntegrityError` (fail closed)
-/// rather than collapsing to match-any — see `parse_applications` /
-/// `parse_policy_state_with_counters`.
+/// unparseable token records a dropped term in `parse_applications`; a rule with
+/// ANY dropped term is then rejected as a `SnapshotIntegrityError` (fail closed)
+/// rather than collapsing to match-any (all-dropped) or silently narrowing
+/// (partial-drop) — see `parse_applications` / `parse_policy_state_with_counters`.
 ///
 /// The numeric `_ => parse::<u8>()` arm is preserved, so a config that names a
 /// protocol numerically (e.g. `protocol 132`) still parses. Numbers MUST match
