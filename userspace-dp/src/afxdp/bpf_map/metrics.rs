@@ -239,6 +239,17 @@ pub(in crate::afxdp) static SESSION_PUBLISH_VERIFY_FAIL: AtomicU64 = AtomicU64::
 /// by `Coordinator::session_publish_errors_total()` and surfaced as
 /// `xpf_userspace_session_publish_errors_total`.
 pub(in crate::afxdp) static SESSION_PUBLISH_ERRORS_SHARED: AtomicU64 = AtomicU64::new(0);
+/// #2170 HA deferred-delete generation guard observability. These count how
+/// often the helper's in-memory SyncedSessionEntry generation guard refused a
+/// stale-generation install (`upsert_synced_session`, the delayed-stale-install
+/// variant) or a stale-generation delete (`delete_synced_session_gen`,
+/// belt-and-suspenders for any helper-side generation-aware delete). The
+/// authoritative guard lives in the Go cluster apply layer; these helper-side
+/// counters report any divergence/back-stop activity. Surfaced via
+/// `Coordinator::session_install_stale_ignored_total()` /
+/// `session_delete_stale_ignored_total()`.
+pub(in crate::afxdp) static SESSION_INSTALL_STALE_IGNORED: AtomicU64 = AtomicU64::new(0);
+pub(in crate::afxdp) static SESSION_DELETE_STALE_IGNORED: AtomicU64 = AtomicU64::new(0);
 pub(in crate::afxdp) static SESSION_CREATIONS_LOGGED: AtomicU64 = AtomicU64::new(0);
 #[cfg(feature = "debug-log")]
 pub(in crate::afxdp) static ICMPV6_EMBED_LOGGED: AtomicU32 = AtomicU32::new(0);

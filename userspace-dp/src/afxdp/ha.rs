@@ -273,6 +273,20 @@ impl super::Coordinator {
             .lock()
             .ok()
             .and_then(|sessions| sessions.get(&entry.key).cloned());
+        // #2170 install-side guard (SMR C3): refuse a strictly-older-
+        // generation install so the per-key stored generation never
+        // regresses (closes the delayed-stale-install variant on the
+        // helper). Only acts when BOTH the stored and incoming generations
+        // are non-zero — local-origin entries (generation 0) and legacy
+        // peers fall back to today's unconditional upsert.
+        if let Some(previous) = previous_entry.as_ref()
+            && previous.generation != 0
+            && entry.generation != 0
+            && entry.generation < previous.generation
+        {
+            SESSION_INSTALL_STALE_IGNORED.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         let reverse_entry = if !entry.metadata.is_reverse {
             synthesized_synced_reverse_entry(
                 &self.forwarding,
@@ -361,11 +375,35 @@ impl super::Coordinator {
     }
 
     pub fn delete_synced_session(&self, key: SessionKey) {
+        // Helper-local deletes (tunnel-remap purge, GC) are authoritative and
+        // carry no peer install generation — apply unconditionally.
+        self.delete_synced_session_gen(key, 0);
+    }
+
+    /// #2170 delete-side guard (belt-and-suspenders for any helper-side delete
+    /// that carries a peer install generation): refuse to remove a stored
+    /// entry whose generation is strictly NEWER than the delete's, so a stale
+    /// delete cannot kill a same-key replacement the helper already mirrored.
+    /// The authoritative guard lives in the Go cluster apply layer
+    /// (deleteClusterSynced*) — that short-circuits both the BPF map delete and
+    /// this helper path, so the cluster-delete path never reaches here with a
+    /// non-zero delete_gen today; the seam exists for future helper-originated
+    /// generation-aware deletes. A delete_gen of 0, or a stored generation of
+    /// 0, falls back to unconditional delete (rolling-upgrade safe).
+    pub fn delete_synced_session_gen(&self, key: SessionKey, delete_gen: u64) {
         let removed_entry = self
             .sessions.synced
             .lock()
             .ok()
             .and_then(|sessions| sessions.get(&key).cloned());
+        if let Some(entry) = removed_entry.as_ref()
+            && entry.generation != 0
+            && delete_gen != 0
+            && delete_gen < entry.generation
+        {
+            SESSION_DELETE_STALE_IGNORED.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         let reverse_key = removed_entry.as_ref().and_then(|entry| {
             if entry.metadata.is_reverse {
                 None

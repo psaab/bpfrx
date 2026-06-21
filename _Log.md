@@ -36,6 +36,74 @@
   origin/master, `worker_queue::concurrent_recovery` is a known timing
   flake). 8 new tests green; 7 canary/sub-fix tests proven to FAIL on
   pre-fix source and PASS post-fix.
+## 2026-06-21 — #2170 (PR #2198) fold: gen-map overflow, cross-boot regression, atomicity note
+
+- **Timestamp**: 2026-06-21
+- **Action**: Folded the independent review's three findings into the #2170
+  HA session-sync install-generation guard PR.
+  **F1 (MAJOR — reintroduced the #2170 bug under churn):** the generation
+  maps (`genSentV4/V6`, `recvGenV4/V6`) cleared the WHOLE map on reaching
+  `genGuardMapCap` (200000, reachable inside the 10M MaxSessions envelope),
+  dropping every live key's stored generation and disabling the guard
+  cluster-wide for a churn window — a stale delete could then kill a live
+  re-established session. Fix: `putGenBounded[K]` generic helper — NEVER
+  clears; updates an existing key in place, skip-records a new key at cap
+  (degrades to safe gen-0) and bumps the new `GenMapOverflow` counter.
+  **F2 (MINOR — cross-boot stale-RETAIN, inverse of #2170):** `genCounter`
+  seeded from `MonotonicNanos()` resets at OS reboot, so a rebooted peer's
+  cold-start bulk re-prime carries lower generations and the install guard
+  refused it as stale. Fix: receiver resets `recvGenV4/V6` on
+  `syncMsgBulkStart` (`resetRecvGen`) so the authoritative bulk re-prime
+  lands and re-records fresh generations; safe because deletes only act at
+  `BulkEnd`. Seed comment in `initGenState` rewritten to match.
+  **F3 (MINOR):** documented that the check->Put->record apply sequence is
+  not held under one `recvGenMu` acquisition and why it is safe (per-peer
+  receive path is single-threaded over the single active fabric).
+- **File(s)**: pkg/cluster/sync_conn.go, pkg/cluster/sync.go,
+  pkg/cluster/sync_gen_guard_test.go, docs/sync-protocol.md,
+  pkg/cluster/README.md
+- **Validation**: new F1 hazard test (`TestGenMapOverflowKeepsLiveKeyV4`),
+  F1 semantics test (`TestRecordInstalledGenSkipsNewKeyOnFull`), and F2
+  test (`TestPeerRebootBulkRePrimeAcceptedAfterReset`) all FAIL pre-fix
+  (proven by temporarily neutralizing the behavior) and PASS post-fix.
+  `go build ./...` clean; `go test ./pkg/cluster/... ./pkg/conntrack/...`
+  green; `go test -race ./pkg/cluster/... -count=3` clean. Existing tests
+  untouched and green. No wire-format or Rust-helper change.
+
+## 2026-06-21 — #2158 file-split: split pkg/config/compiler.go (3050 LOC)
+
+- **Timestamp**: 2026-06-21
+- **Action**: Pure code-motion per the converged #2158 plan (§5.2). Split
+  pkg/config/compiler.go (3050 LOC, the worst splittable REFACTOR-tier
+  offender, over the 3000 must-split line) into four cohesive same-package
+  (`package config`) files. compiler.go keeps the AST->typed-struct compile
+  core (sentinels, compileOpts, CompileConfig*, compileConfigWithOpts,
+  compileConfigForNode*, compileExpanded). compiler_validate_strict.go holds
+  the validate*Strict family (#2142/#2144/#2173/#2175/#2187 cluster:
+  application-spec, routing-export, filter-protocol, NAT app-ref, class-of-
+  service strict validators) plus their helpers (routingRedistProtocolTokens,
+  filterProtocolResolvable, policyMatchAddressError, the dataplaneType const
+  block + effective/valid dataplane helpers, userspaceSynCookieProtectionActive,
+  knownManagedProcessNames/isKnownProcessName). compiler_validate_warn.go holds
+  ValidateConfig + the DDNS/routing-rule-window/CoS-oversubscription warning
+  helpers. compiler_applications.go holds compileApplications,
+  parseApplicationTerms, normalizeProtocol, validatePortSpec, validateProtocol,
+  nodeVal. No logic change, no exported-API change, byte-identical runtime
+  behavior. Verified move-only: reconstructing the original from the four
+  parts diffs to zero (modulo seam blank lines), `go doc -all ./pkg/config/`
+  is byte-identical before/after (zero API change), gofmt -l clean on all four
+  files, `go build ./...`, `go vet ./pkg/config/`, and
+  `go test ./pkg/config/... ./pkg/daemon/...` all green unchanged from master.
+  No init-order risk (the only package-level state moved is plain map/string
+  literal vars with no side-effecting initializers; no init()). Regenerated
+  docs/refactoring-audit-current.txt (compiler.go drops off the REFACTOR
+  heatmap entirely; the four files are all well under threshold);
+  make audit-check clean.
+- **File(s)**: pkg/config/compiler.go (trimmed to 956),
+  pkg/config/compiler_validate_strict.go (947),
+  pkg/config/compiler_validate_warn.go (902),
+  pkg/config/compiler_applications.go (270),
+  docs/refactoring-audit-current.txt
 
 ## 2026-06-21 — #2158 file-split (1 of N): relocate wg/engine.rs inline tests
 
@@ -108,6 +176,32 @@
   flake; all three priority-tagged tests fail under the pre-fix
   `vlan_id > 0` gating (non-tautological). PENDING-PARENT: live
   PCP-on-the-wire verification on the loss cluster (not run here).
+
+## 2026-06-21 — #2197 items 1+2: v6 proxy-NDP pneigh install + 30s re-assert
+
+- **Timestamp**: 2026-06-21
+- **Action**: Implemented #2197 plan items 1 (MEDIUM) and 2 (LOW); item 3
+  (per-address narrowing) stays PLAN-DEFER / lab-pending.
+  **Item 1 (v6 proxy-NDP pneigh install):** `ReconcileProxyARP` now installs
+  an AF_INET6 NTF_PROXY neighbor entry for v6 proxy addresses (the v6 analogue
+  of `ip -6 neigh add proxy`), mirroring the v4 install path — desired set is
+  family-aware, a parallel `NeighList(idx, AF_INET6)` stale-removal pass runs,
+  and add/remove derive Family from `key.ip.Is6()/!Is4In6()`. Added `Family`
+  to `ProxyARPAdded` so the IPv4-only GARP is skipped for v6 (risk R1). v6 is
+  `pneigh_lookup`-gated (per-address), so no over-answer breadth. Added netlink
+  seams (`neighListSeam`/`neighSetSeam`/`neighDelSeam`) for root-free tests.
+  **Item 2 (re-assert after non-commit link cycle):** extracted the apply-path
+  reconcile into `(*Daemon).reconcileProxyARP(cfg)` (preserving the #2195 RETH
+  ifindex resolution via a separately-tested `proxyARPIfaceMap`), and drive it
+  from a new always-on 30s ticker (`proxyARPReassertLoop`) started
+  unconditionally when the dataplane is enabled — covers standalone + cluster
+  (reconcileRGStateLoop is cluster-only, monitorLinkState SNMP-gated). Idempotent.
+- **File(s)**: `pkg/dataplane/proxyarp.go`, `pkg/dataplane/proxyarp_test.go`,
+  `pkg/daemon/daemon_apply.go`, `pkg/daemon/daemon_proxyarp.go`,
+  `pkg/daemon/daemon_proxyarp_test.go`, `pkg/daemon/daemon_run.go`,
+  `pkg/dataplane/retirement_boundary_canary_test.go`, `docs/feature-gaps.md`,
+  `docs/pr/1373-retire-ebpf-dataplane/README.md`,
+  `docs/research/2197-proxyarp-followups/plan.md`.
 
 ## 2026-06-21 — #2146 (PR #2189) fold: close IPv6 ext-header overshoot fail-open
 
@@ -8383,3 +8477,85 @@ top.
 - **File(s)**: test/incus/deploy-lib.sh, test/incus/deploy-lib-selftest.sh,
   test/incus/setup.sh, test/incus/cluster-setup.sh, Makefile, docs/test_env.md,
   CLAUDE.md
+
+- **Timestamp**: 2026-06-21
+  **Action**: #2170 — HA session-sync install-generation guard so a
+  deferred/journaled delete cannot kill a same-5-tuple replacement session.
+  Stamp every session install AND delete with a monotonic per-(sender,key)
+  install generation carried as a length-gated trailing uint64 on the session
+  and delete wire messages (+ Go SessionSyncRequest + Rust SyncedSessionEntry).
+  Sender (pkg/cluster) uses a single boot-seeded monotonic counter and ECHOES
+  the install generation on the matching delete (handles the cross-owner
+  failover edge). Receiver keeps the authoritative per-key stored generation in
+  SessionSync.recvGenV4/V6 (BPF C struct stays generation-free); the apply layer
+  refuses a delete whose generation is strictly older than the stored entry
+  (deleteClusterSynced*, DeletesStaleIgnored) and refuses an install that would
+  regress the stored generation (installClusterSynced*, InstallsStaleIgnored).
+  Equality applies; gen==0 on either side falls back to today's unconditional
+  delete (rolling-upgrade safe). Reverse-companion + fabric-alias share the
+  install's generation. Rust helper mirrors the field and guards
+  upsert_synced_session / delete_synced_session_gen as belt-and-suspenders
+  (authoritative guard is the Go apply layer). New counters
+  SESSION_INSTALL_STALE_IGNORED / SESSION_DELETE_STALE_IGNORED with coordinator
+  accessors. Unit tests (Go + Rust) each FAIL on pre-fix for the §3.4 race,
+  the delayed-stale-install variant, the gen==0 rolling-upgrade fallback,
+  same-second/same-slot monotonicity, failover-domain re-stamp, and wire
+  round-trip / cross-version short-payload decode. go build ./... +
+  go test pkg/cluster/... pkg/conntrack/... pkg/dataplane/... pkg/daemon/...
+  green; cargo build --release + cargo test --release session (288) green;
+  new concurrency test race-clean 5x. test-failover PENDING-PARENT.
+  **File(s)**: pkg/dataplane/types.go, pkg/cluster/sync.go,
+  pkg/cluster/sync_conn.go, pkg/cluster/sync_protocol.go, pkg/cluster/sync_bulk.go,
+  pkg/cluster/sync_test.go, pkg/cluster/sync_gen_guard_test.go,
+  pkg/dataplane/userspace/protocol.go, pkg/dataplane/userspace/manager_ha.go,
+  pkg/dataplane/userspace/manager_test.go, userspace-dp/src/protocol/control.rs,
+  userspace-dp/src/protocol/tests.rs, userspace-dp/src/afxdp/worker/mod.rs,
+  userspace-dp/src/afxdp/ha.rs, userspace-dp/src/afxdp/ha_tests.rs,
+  userspace-dp/src/afxdp/shared_ops.rs, userspace-dp/src/afxdp/tunnel.rs,
+  userspace-dp/src/afxdp/forwarding/mod.rs, userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/session_glue/promote.rs,
+  userspace-dp/src/afxdp/bpf_map/metrics.rs, userspace-dp/src/afxdp/coordinator/status.rs,
+  userspace-dp/src/server/helpers.rs,
+  userspace-dp/src/afxdp/tests.rs, userspace-dp/src/afxdp/forwarding/tests.rs,
+  userspace-dp/src/afxdp/session_glue/tests.rs,
+  docs/sync-protocol.md, pkg/cluster/README.md, userspace-dp/src/session/README.md,
+  docs/research/2170-ha-deferred-delete/plan.md
+- **Action**: #2158 P1 Go file-split — split pkg/configstore/store.go (2112
+  LOC, over the ~2000 modularity threshold) into six cohesive same-package
+  files per the converged plan section 5.3. Pure code-motion: no logic
+  change, no exported-API change, byte-identical runtime behavior. store.go
+  keeps the Store struct + New + node/cluster accessors + compile/schema
+  pipeline + SyncApply (419 LOC); store_persist.go (378), store_lock.go
+  (165), store_command.go (324), store_commit.go (580), store_format.go
+  (307). All files now well under threshold. Verified move-only (identical
+  103-func signature set, zero body lines removed, `go doc -all` byte
+  identical), no init-order risk (no package-level var/init in store.go),
+  build + vet + `go test ./pkg/configstore/... ./pkg/daemon/...` all green
+  unchanged from master. Regenerated docs/refactoring-audit-current.txt
+  (store.go drops off the heatmap); make audit-check clean.
+- **File(s)**: pkg/configstore/store.go (trimmed),
+  pkg/configstore/store_persist.go, pkg/configstore/store_lock.go,
+  pkg/configstore/store_command.go, pkg/configstore/store_commit.go,
+  pkg/configstore/store_format.go, docs/refactoring-audit-current.txt
+
+- **Timestamp**: 2026-06-21
+- **Action**: #2158 P3 Go file-splits — split pkg/dataplane/userspace/manager.go
+  (2186 LOC) and pkg/cli/cli_show_security.go (2018 LOC), both over the ~2000
+  modularity threshold, into cohesive same-package siblings per the converged
+  plan sections 5.6 and 5.7. manager.go -> manager.go (1594) + capabilities.go
+  (469, config->capability derivation) + controllers.go (144, dataplane adapter
+  types). cli_show_security.go -> cli_show_security.go (342, policies subject) +
+  zones/screen/objects/ipsec/log/filters siblings (182/398/291/272/232/351).
+  Pure code-motion: funcs/types moved verbatim, no logic change, no exported-API
+  change, no receiver change, no package-level var/init moved (no init-order
+  risk). go doc -all byte-identical for both packages before/after; go test
+  ./pkg/dataplane/userspace/... ./pkg/cli/... green with a test set byte-
+  identical to master (606 tests). gofmt -l clean on all new files; go build
+  ./... clean. Regenerated docs/refactoring-audit-current.txt (manager.go drops
+  to WATCH, cli_show_security.go off the heatmap); make audit-check clean.
+- **File(s)**: pkg/dataplane/userspace/manager.go (trimmed),
+  pkg/dataplane/userspace/capabilities.go, pkg/dataplane/userspace/controllers.go,
+  pkg/cli/cli_show_security.go (trimmed), pkg/cli/cli_show_security_zones.go,
+  pkg/cli/cli_show_security_screen.go, pkg/cli/cli_show_security_objects.go,
+  pkg/cli/cli_show_security_ipsec.go, pkg/cli/cli_show_security_log.go,
+  pkg/cli/cli_show_security_filters.go, docs/refactoring-audit-current.txt

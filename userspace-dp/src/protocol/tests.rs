@@ -1776,3 +1776,26 @@ fn apply_snapshot_rejects_oversize_collector_port_1977() {
         "unexpected error: {err}"
     );
 }
+
+// #2170: the SessionSyncRequest install generation must round-trip as a
+// numeric field, and a legacy payload that omits `generation` must decode to 0
+// (serde default). Wire parity with the Go SessionSyncRequest.Generation field.
+#[test]
+fn session_sync_request_generation_roundtrip_2170() {
+    let req = SessionSyncRequest {
+        operation: "upsert".to_string(),
+        generation: 0x1122_3344_5566_7788,
+        ..Default::default()
+    };
+    let json = serde_json::to_string(&req).expect("serialize SessionSyncRequest");
+    let back: SessionSyncRequest =
+        serde_json::from_str(&json).expect("deserialize SessionSyncRequest");
+    assert_eq!(back.generation, req.generation, "generation must round-trip");
+
+    // A legacy payload without the field decodes to 0 (serde default), so an
+    // old peer's request falls back to unconditional behavior.
+    let legacy: SessionSyncRequest =
+        serde_json::from_str(r#"{"operation":"upsert","src_ip":"10.0.0.1"}"#)
+            .expect("legacy SessionSyncRequest without generation decodes");
+    assert_eq!(legacy.generation, 0, "missing generation must default to 0");
+}

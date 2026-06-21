@@ -79,7 +79,9 @@ func encodeRawMessage(msgType uint8, payload []byte) []byte {
 func encodeSessionV4Payload(key dataplane.SessionKey, val dataplane.SessionValue) []byte {
 	keySize := 16
 	valSize := 160
-	buf := make([]byte, keySize+valSize)
+	// +8 trailing bytes for the #2170 install Generation (length-gated:
+	// old decoders stop after FibGen and ignore it).
+	buf := make([]byte, keySize+valSize+8)
 	off := 0
 	copy(buf[off:], key.SrcIP[:])
 	off += 4
@@ -153,6 +155,9 @@ func encodeSessionV4Payload(key dataplane.SessionKey, val dataplane.SessionValue
 	off += 6
 	binary.LittleEndian.PutUint16(buf[off:], val.FibGen)
 	off += 2
+	// #2170: install generation (length-gated trailing field).
+	binary.LittleEndian.PutUint64(buf[off:], val.Generation)
+	off += 8
 	return buf[:off]
 }
 func encodeSessionV6(key dataplane.SessionKeyV6, val dataplane.SessionValueV6) []byte {
@@ -238,13 +243,24 @@ func encodeSessionV6Payload(key dataplane.SessionKeyV6, val dataplane.SessionVal
 	off += 6
 	binary.LittleEndian.PutUint16(buf[off:], val.FibGen)
 	off += 2
+	// #2170: install generation (length-gated trailing field).
+	binary.LittleEndian.PutUint64(buf[off:], val.Generation)
+	off += 8
 	return buf[:off]
 }
-func encodeDeleteV4(key dataplane.SessionKey) []byte {
-	hdr := make([]byte, syncHeaderSize+16)
+
+// encodeDeleteV4 emits a delete message for a v4 session key. The 16-byte
+// 5-tuple payload grows to 24 bytes with a length-gated trailing #2170
+// install Generation: an old decoder reads only the first 16 bytes (its
+// `len(payload) >= 16` check tolerates the longer payload) and ignores the
+// generation; a new decoder reads the trailing uint64 when present. A
+// generation of 0 means "unknown / legacy" and the receiver falls back to
+// today's unconditional delete.
+func encodeDeleteV4(key dataplane.SessionKey, gen uint64) []byte {
+	hdr := make([]byte, syncHeaderSize+24)
 	copy(hdr[:4], syncMagic[:])
 	hdr[4] = syncMsgDeleteV4
-	binary.LittleEndian.PutUint32(hdr[8:12], 16)
+	binary.LittleEndian.PutUint32(hdr[8:12], 24)
 	off := syncHeaderSize
 	copy(hdr[off:], key.SrcIP[:])
 	off += 4
@@ -255,13 +271,15 @@ func encodeDeleteV4(key dataplane.SessionKey) []byte {
 	binary.LittleEndian.PutUint16(hdr[off:], key.DstPort)
 	off += 2
 	hdr[off] = key.Protocol
+	off += 4 // 5-tuple block is 16 bytes total (1 proto byte + 3 pad)
+	binary.LittleEndian.PutUint64(hdr[off:], gen)
 	return hdr
 }
-func encodeDeleteV6(key dataplane.SessionKeyV6) []byte {
-	hdr := make([]byte, syncHeaderSize+40)
+func encodeDeleteV6(key dataplane.SessionKeyV6, gen uint64) []byte {
+	hdr := make([]byte, syncHeaderSize+48)
 	copy(hdr[:4], syncMagic[:])
 	hdr[4] = syncMsgDeleteV6
-	binary.LittleEndian.PutUint32(hdr[8:12], 40)
+	binary.LittleEndian.PutUint32(hdr[8:12], 48)
 	off := syncHeaderSize
 	copy(hdr[off:], key.SrcIP[:])
 	off += 16
@@ -272,6 +290,8 @@ func encodeDeleteV6(key dataplane.SessionKeyV6) []byte {
 	binary.LittleEndian.PutUint16(hdr[off:], key.DstPort)
 	off += 2
 	hdr[off] = key.Protocol
+	off += 4 // 5-tuple block is 40 bytes total (1 proto byte + 3 pad)
+	binary.LittleEndian.PutUint64(hdr[off:], gen)
 	return hdr
 }
 
@@ -369,6 +389,12 @@ func decodeSessionV4Payload(payload []byte) (dataplane.SessionKey, dataplane.Ses
 		copy(val.FibSmac[:], payload[off:off+6])
 		off += 6
 		val.FibGen = binary.LittleEndian.Uint16(payload[off:])
+		off += 2
+	}
+	// #2170: install generation (length-gated; absent → 0 = legacy peer).
+	if off+8 <= len(payload) {
+		val.Generation = binary.LittleEndian.Uint64(payload[off:])
+		off += 8
 	}
 	return key, val, true
 }
@@ -470,6 +496,12 @@ func decodeSessionV6Payload(payload []byte) (dataplane.SessionKeyV6, dataplane.S
 		copy(val.FibSmac[:], payload[off:off+6])
 		off += 6
 		val.FibGen = binary.LittleEndian.Uint16(payload[off:])
+		off += 2
+	}
+	// #2170: install generation (length-gated; absent → 0 = legacy peer).
+	if off+8 <= len(payload) {
+		val.Generation = binary.LittleEndian.Uint64(payload[off:])
+		off += 8
 	}
 	return key, val, true
 }
