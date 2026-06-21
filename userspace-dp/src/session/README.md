@@ -345,6 +345,90 @@ scales with queue count.
 
 Decision record: `docs/research/2128-2134-screen-session-limit/plan.md`.
 
+## Scan/sweep detection on the new-flow path (#2210; per-zone + bounded #2209)
+
+Port-scan and IP-sweep follow the SAME structural rule as the per-IP
+session limit above: the scan/sweep MUTATION runs at the NEW-FLOW /
+session-MISS decision in `afxdp/poll_descriptor`
+(`ScreenState::scan_sweep_drop_on_new_flow`), NOT on the per-packet
+pre-session screen stage.
+
+- **#2210 (count-after-lookup).** The pre-#2210 code ran IP-sweep on the
+  per-packet stage, which executes BEFORE the session lookup and on every
+  protocol — so mid-stream established TCP ACKs/data and UDP all counted
+  toward the sweep. A single legitimate high-fan-out client (one host with
+  live connections to many backends) would trip IP-sweep without ever
+  sending a probe, and the original #867 ACK-evasion contract ("an ACK
+  that matches a live session is not a sweep probe") was lost. Moving the
+  mutation to the session-MISS hook means an established flow's packets are
+  session HITS and never reach it, so only a genuinely-new flow counts.
+  Port-scan keeps its TCP-initial-SYN gate; IP-sweep counts the new flow
+  on any protocol (a session-miss ACK to many destinations is the
+  ACK-evasion sweep it is meant to catch).
+
+- **#2209 (per-zone + bounded).** The trackers are keyed by
+  `(zone_id, src_ip)` (was a single global per-`src_ip` instance), so a
+  source scanning zone `wan` no longer bleeds its count into the `dmz`
+  threshold evaluation. The backing maps are bounded on both
+  attacker-driven axes: `MAX_SOURCES_PER_ZONE` distinct sources per zone
+  and `MAX_UNIQUE_PER_SOURCE` unique entries per source. On a SOURCE-axis
+  overflow the tracker SKIPS the new source (degrades to not-counting that
+  source) and bumps a `skipped_pressure` counter — that can only make a
+  drop verdict LESS likely, never grow without bound. The per-tick cleanup
+  walks the source table (`HashMap::retain`, O(sources)) but removes at
+  most `CLEANUP_BUDGET` entries per call, so the per-tick MUTATION cost is
+  bounded; the real ceiling on the walk is the `MAX_SOURCES_PER_ZONE` cap
+  on the table itself, with the budget spreading reclamation across ticks
+  (`screen/scan.rs`). This mirrors the #2134/#2177 session-limit
+  skip-on-full discipline.
+
+- **#2227 MAJOR-1 (fail-CLOSED on over-cap thresholds).** The
+  unique-entry set tops out at `MAX_UNIQUE_PER_SOURCE` (1024), but the
+  operator threshold is unbounded (`strconv.Atoi`, no clamp — e.g.
+  `port-scan threshold 5000`). The detection compares
+  `set.len() > threshold`, and `len()` can never exceed the cap, so an
+  un-clamped threshold `>= MAX_UNIQUE_PER_SOURCE` could NEVER be crossed:
+  the scanner would never be dropped (silent fail-OPEN). The dataplane
+  therefore CLAMPS the effective comparison threshold to
+  `MAX_UNIQUE_PER_SOURCE - 1`, so a source that fills the bounded set
+  always crosses it — **detection fires AT THE CAP rather than never**.
+  Each clamp is counted in `scan_sweep_threshold_clamped`. The config
+  value is preserved unchanged (operator intent is kept); the Go control
+  plane (`pkg/config/compiler_security.go`, constant
+  `maxScanSweepThreshold` kept in sync with the Rust `MAX_UNIQUE_PER_SOURCE`)
+  emits a commit-time WARNING when a port-scan/ip-sweep threshold exceeds
+  the supported maximum, telling the operator it will be clamped. The
+  effective contract is: scan/sweep detection NEVER silently fail-opens for
+  any parseable config — at worst it detects at the cap.
+
+- **Perf (#2209).** The per-packet `check_packet_with_zone_id` no longer
+  clones the whole `ScreenProfile` per screened packet — it borrows it and
+  copies only the small scalar thresholds it needs. The scan/sweep stage
+  reads the profile by zone name only on the cold session-miss path.
+
+Per-worker scoping applies identically to scan/sweep (each worker owns its
+`ScreenState`), so the effective unique-entry count is multiplied by the
+worker count, exactly as documented for the session limit above.
+
+**Known limitation (#2227 MINOR-2 — detection-DoS via source-table
+saturation).** The per-zone source table is a hard cap
+(`MAX_SOURCES_PER_ZONE = 4096`). Once a zone holds 4096 tracked sources, a
+brand-new source key is SKIPPED (not recorded) — so a spoofed-source flood
+that fills the table can prevent a *subsequently-arriving* genuine scanner
+from being tracked, and therefore from being detected, until table entries
+expire. Worse, each existing source's window is refreshed whenever that
+source sends another new flow, so an attacker controlling 4096 sources can
+keep the table pinned full indefinitely (the entries never expire while the
+attacker keeps touching them; cleanup only reclaims windows older than
+`WINDOW_SECS`). This is a fail-SAFE-but-detection-degrading bound: it never
+fail-opens the *forwarding* path (no traffic is admitted that policy would
+deny) and never grows memory without bound, but it can suppress scan/sweep
+*detection* under a high-cardinality spoofed flood. `skipped_pressure`
+surfaces the saturation so an operator/alarm can see it. A follow-up
+(oldest/LRU eviction so a fresh real source can displace a stale tracked one,
+or a pressure-driven alarm) is tracked in #2234. Mitigations today:
+anti-spoofing / uRPF upstream and the `skipped_pressure` signal.
+
 ## Why a slab + integer handles
 
 Pre-#964 the table was `HashMap<Key, Arc<SessionEntry>>`. Reverse-NAT
