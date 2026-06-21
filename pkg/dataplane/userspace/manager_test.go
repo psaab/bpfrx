@@ -2966,6 +2966,34 @@ func TestEnsureRequiredSnapshotProtocolRejectsOldHelperForPersistentSourceNAT(t 
 	}
 }
 
+// TestIsRequiredProtocolGateError is the #2138 regression: the
+// commit-abort set must cover every sentinel emitted by
+// ensureRequiredSnapshotProtocolLocked. Before #2138 the persistent
+// source NAT gate disarmed the helper but was missing from the daemon's
+// abort set, so a mismatch promoted the commit against a disarmed
+// dataplane. The predicate must match BOTH required gates (bare and
+// wrapped) and must NOT match unrelated errors.
+func TestIsRequiredProtocolGateError(t *testing.T) {
+	for _, sentinel := range []error{
+		ErrPolicySchedulerProtocolIncompatible,
+		ErrPersistentSourceNATProtocolIncompatible,
+	} {
+		if !IsRequiredProtocolGateError(sentinel) {
+			t.Errorf("IsRequiredProtocolGateError(%v) = false, want true (bare sentinel)", sentinel)
+		}
+		wrapped := fmt.Errorf("apply userspace config: %w", sentinel)
+		if !IsRequiredProtocolGateError(wrapped) {
+			t.Errorf("IsRequiredProtocolGateError(%v) = false, want true (wrapped sentinel)", wrapped)
+		}
+	}
+	if IsRequiredProtocolGateError(nil) {
+		t.Error("IsRequiredProtocolGateError(nil) = true, want false")
+	}
+	if IsRequiredProtocolGateError(errors.New("unrelated apply failure")) {
+		t.Error("IsRequiredProtocolGateError(unrelated) = true, want false")
+	}
+}
+
 func TestDesiredForwardingArmedKeepsClusterStandbyArmed(t *testing.T) {
 	m := &Manager{
 		clusterHA: true,
