@@ -190,7 +190,11 @@ pub(super) fn build_forwarding_state_with_policy_counters_and_previous(
     );
     state.static_nat = StaticNatTable::from_snapshots(&snapshot.static_nat_rules);
     state.dnat_table = DnatTable::from_snapshots(&snapshot.destination_nat_rules);
-    state.nat64 = Nat64State::from_snapshots(&snapshot.nat64_rules);
+    // #2212: fail CLOSED on an unparseable NAT64 rule. The preflight in the
+    // reconcile/refresh apply paths catches this Err and keeps the previous
+    // live forwarding state rather than installing a silently-narrower NAT64
+    // config (the helper-boundary backstop to the Go #2173 commit-time gate).
+    state.nat64 = Nat64State::try_from_snapshots(&snapshot.nat64_rules)?;
     state.nptv6 = Nptv6State::from_snapshots(&snapshot.nptv6_rules);
     state.screen_profiles = build_screen_profiles(snapshot);
     state.syn_cookie_master_key = parse_syn_cookie_master_key(&snapshot.syn_cookie_master_key);

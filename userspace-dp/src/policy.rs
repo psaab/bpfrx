@@ -27,6 +27,21 @@ pub(crate) enum SnapshotIntegrityError {
     /// preflight keeps the previous good state) is action-agnostic: it never
     /// turns a deny into a pass nor a permit into match-any.
     UnrepresentableApplicationProtocol { rule_id: String },
+    /// #2212: a NAT64 rule snapshot carried an unparseable field — a prefix
+    /// that is empty / malformed / not /96, or a pool address that is neither a
+    /// bare IPv4 nor a `/32` host. (A pool that is genuinely UNCONFIGURED — no
+    /// pool addresses on the wire — is the legitimate "no source-pool" state the
+    /// Go side emits and is NOT an error; only an entry that fails to parse,
+    /// which would silently narrow the pool, is rejected.) Silently dropping the
+    /// rule (the pre-fix `continue`/`filter_map`) is a fail-OPEN regression in a
+    /// retired-eBPF world where the userspace helper is the enforcement plane: a
+    /// present prefix with an emptied pool makes `allocate_v4_source` return
+    /// `None`, so NAT64 forward translation stops with no failure surfaced. The
+    /// Go commit-time validation (`pkg/config/compiler_nat.go`, #2173) is the
+    /// primary gate; this is the helper-boundary backstop. Rejecting the whole
+    /// snapshot keeps the previous live NAT64 state rather than installing a
+    /// silently narrower one.
+    Nat64UnparseableRule { rule_name: String, field: String },
 }
 
 impl std::fmt::Display for SnapshotIntegrityError {
@@ -45,6 +60,11 @@ impl std::fmt::Display for SnapshotIntegrityError {
                 f,
                 "rule {:?} has an unrepresentable application term (unparseable protocol or port) — refusing to fail open by dropping it",
                 rule_id
+            ),
+            Self::Nat64UnparseableRule { rule_name, field } => write!(
+                f,
+                "nat64 rule {:?} has an unparseable {} — refusing to fail open by silently dropping the rule",
+                rule_name, field
             ),
         }
     }

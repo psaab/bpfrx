@@ -4,6 +4,7 @@
 // `#[path = "nat64_tests.rs"]` from nat64.rs.
 
 use super::*;
+use crate::policy::SnapshotIntegrityError;
 
 fn well_known_prefix() -> NAT64RuleSnapshot {
     NAT64RuleSnapshot {
@@ -115,10 +116,16 @@ fn nat64_pool_mixed_bare_and_masked() {
 }
 
 #[test]
-fn nat64_pool_genuinely_invalid_still_dropped() {
-    // A genuinely-malformed pool address must still be discarded (the skip
-    // path is preserved), while a valid masked entry is kept.
-    let state = Nat64State::from_snapshots(&[NAT64RuleSnapshot {
+fn nat64_pool_genuinely_invalid_rejects_snapshot() {
+    // #2212: a genuinely-malformed pool address must FAIL THE SNAPSHOT CLOSED
+    // (one bad entry rejects the whole rule), NOT be silently filtered while
+    // the rest of the pool installs. Silently dropping it narrows the pool —
+    // a fail-open in the retired-eBPF enforcement plane.
+    //
+    // FAIL-ON-REVERT: the pre-fix `filter_map(parse_pool_v4)` returned a state
+    // with pool_v4 == [100.64.0.7] and never an Err, so this assert_matches
+    // FAILS if the silent-drop behavior is restored.
+    let err = Nat64State::try_from_snapshots(&[NAT64RuleSnapshot {
         name: "nat64-bad".to_string(),
         prefix: "64:ff9b::/96".to_string(),
         pool_addresses: vec![
@@ -126,44 +133,132 @@ fn nat64_pool_genuinely_invalid_still_dropped() {
             "100.64.0.7/32".to_string(),
         ],
         no_v6_frag_header: false,
-    }]);
-    assert_eq!(state.prefixes[0].pool_v4.len(), 1);
-    assert!(state.prefixes[0].pool_v4.contains(&Ipv4Addr::new(100, 64, 0, 7)));
+    }])
+    .expect_err("a malformed pool address must reject the snapshot, not be dropped");
+    match err {
+        SnapshotIntegrityError::Nat64UnparseableRule { rule_name, field } => {
+            assert_eq!(rule_name, "nat64-bad");
+            assert!(
+                field.contains("not-an-ip"),
+                "error must name the offending pool address, got {field:?}"
+            );
+        }
+        other => panic!("expected Nat64UnparseableRule, got {other:?}"),
+    }
 }
 
 #[test]
-fn nat64_pool_non_host_mask_rejected() {
-    // A non-host mask or garbage suffix on a pool address must be filtered,
-    // not coerced to a host address. Only bare and /32 forms install. A valid
-    // /32 alongside the bad entries proves the good one survives.
-    let state = Nat64State::from_snapshots(&[NAT64RuleSnapshot {
-        name: "nat64-bad-mask".to_string(),
+fn nat64_pool_non_host_mask_rejects_snapshot() {
+    // #2212: a non-host mask or garbage suffix on a pool address must REJECT
+    // the snapshot (fail closed), not be silently filtered while a valid /32
+    // alongside it survives. Each malformed form independently rejects.
+    //
+    // FAIL-ON-REVERT: pre-fix this produced pool_v4 == [100.64.0.9] with no
+    // Err; the expect_err below FAILS if silent-filter behavior returns.
+    for bad in [
+        "100.64.0.1/24",      // non-host prefix
+        "100.64.0.2/notanum", // non-numeric mask
+        "100.64.0.3/",        // empty mask
+        "100.64.0.4//32",     // double slash
+    ] {
+        let result = Nat64State::try_from_snapshots(&[NAT64RuleSnapshot {
+            name: "nat64-bad-mask".to_string(),
+            prefix: "64:ff9b::/96".to_string(),
+            pool_addresses: vec![bad.to_string(), "100.64.0.9/32".to_string()],
+            no_v6_frag_header: false,
+        }]);
+        assert!(
+            matches!(result, Err(SnapshotIntegrityError::Nat64UnparseableRule { .. })),
+            "malformed pool entry {bad:?} must reject the snapshot, got {result:?}"
+        );
+    }
+    // Verify the canonical /32-only pool DOES install (the good path still works).
+    let ok = Nat64State::try_from_snapshots(&[NAT64RuleSnapshot {
+        name: "nat64-good-mask".to_string(),
         prefix: "64:ff9b::/96".to_string(),
-        pool_addresses: vec![
-            "100.64.0.1/24".to_string(),      // non-host prefix -> rejected
-            "100.64.0.2/notanum".to_string(), // non-numeric mask -> rejected
-            "100.64.0.3/".to_string(),        // empty mask -> rejected
-            "100.64.0.4//32".to_string(),     // double slash -> rejected
-            "100.64.0.9/32".to_string(),      // canonical host -> kept
-        ],
+        pool_addresses: vec!["100.64.0.9/32".to_string()],
         no_v6_frag_header: false,
-    }]);
-    assert_eq!(
-        state.prefixes[0].pool_v4,
-        vec![Ipv4Addr::new(100, 64, 0, 9)],
-        "only the canonical /32 host entry must survive"
-    );
+    }])
+    .expect("a canonical /32 host pool must install");
+    assert_eq!(ok.prefixes[0].pool_v4, vec![Ipv4Addr::new(100, 64, 0, 9)]);
 }
 
 #[test]
-fn invalid_prefix_length_ignored() {
-    let state = Nat64State::from_snapshots(&[NAT64RuleSnapshot {
+fn invalid_prefix_length_rejects_snapshot() {
+    // #2212: a non-/96 prefix length must REJECT the snapshot (fail closed),
+    // not be silently ignored leaving the rule absent at the dataplane.
+    //
+    // FAIL-ON-REVERT: pre-fix this `continue`d and produced an empty,
+    // !is_active() state with no Err; expect_err FAILS if the skip returns.
+    let err = Nat64State::try_from_snapshots(&[NAT64RuleSnapshot {
         name: "bad".to_string(),
         prefix: "64:ff9b::/64".to_string(),
         pool_addresses: vec!["1.2.3.4".to_string()],
         no_v6_frag_header: false,
-    }]);
-    assert!(!state.is_active());
+    }])
+    .expect_err("a non-/96 prefix must reject the snapshot, not be silently ignored");
+    match err {
+        SnapshotIntegrityError::Nat64UnparseableRule { rule_name, field } => {
+            assert_eq!(rule_name, "bad");
+            assert!(field.contains("/96"), "error must mention the /96 requirement, got {field:?}");
+        }
+        other => panic!("expected Nat64UnparseableRule, got {other:?}"),
+    }
+}
+
+#[test]
+fn empty_prefix_rejects_snapshot() {
+    // #2212: an empty prefix is anomalous (the Go side never emits one) and
+    // must reject the snapshot rather than being silently dropped.
+    let err = Nat64State::try_from_snapshots(&[NAT64RuleSnapshot {
+        name: "empty-prefix".to_string(),
+        prefix: String::new(),
+        pool_addresses: vec!["198.51.100.1".to_string()],
+        no_v6_frag_header: false,
+    }])
+    .expect_err("an empty prefix must reject the snapshot");
+    assert!(
+        matches!(err, SnapshotIntegrityError::Nat64UnparseableRule { .. }),
+        "empty prefix must surface a Nat64UnparseableRule, got {err:?}"
+    );
+}
+
+#[test]
+fn malformed_prefix_address_rejects_snapshot() {
+    // #2212: a /96-masked but unparseable prefix address must reject (was
+    // silently `continue`d pre-fix).
+    let err = Nat64State::try_from_snapshots(&[NAT64RuleSnapshot {
+        name: "bad-addr".to_string(),
+        prefix: "not:an:ipv6::garbage::x/96".to_string(),
+        pool_addresses: vec!["198.51.100.1".to_string()],
+        no_v6_frag_header: false,
+    }])
+    .expect_err("a malformed prefix address must reject the snapshot");
+    assert!(matches!(
+        err,
+        SnapshotIntegrityError::Nat64UnparseableRule { .. }
+    ));
+}
+
+#[test]
+fn valid_nat64_rule_still_applies_after_fail_closed() {
+    // #2212 companion: a wholly valid NAT64 config must still apply cleanly
+    // through the fallible path (the fail-closed gate does not over-reject).
+    let state = Nat64State::try_from_snapshots(&[well_known_prefix()])
+        .expect("a valid NAT64 rule must apply");
+    assert!(state.is_active());
+    assert_eq!(state.prefixes.len(), 1);
+    assert_eq!(state.prefixes[0].pool_v4.len(), 2);
+    // And it translates a forward packet (proves the rule reached the
+    // translator, not just parsed).
+    let src_v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+    let dst_v6: Ipv6Addr = "64:ff9b::c633:6432".parse().unwrap();
+    let (idx, dst_v4) = state.match_ipv6_dest(dst_v6).expect("dst must match prefix");
+    let snat = state.allocate_v4_source(idx).expect("pool must allocate");
+    let pkt = make_ipv6_tcp_packet(src_v6, dst_v6, 12345, 80, b"ok");
+    let v4 = translate_v6_to_v4(&pkt, snat, dst_v4, false).expect("forward translate");
+    assert_eq!(v4[0], 0x45);
+    assert_eq!(checksum16(&v4[..20]), 0, "header checksum must verify");
 }
 
 // --- Packet translation tests ---
