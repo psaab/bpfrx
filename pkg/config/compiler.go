@@ -917,6 +917,16 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 	}
 	cfg.Warnings = append(cfg.Warnings, napWarnings...)
 
+	// #2227 MAJOR-1: port-scan / ip-sweep threshold clamp warning. The AF_XDP
+	// dataplane bounds its per-(zone,source) unique-destination set at
+	// MAX_UNIQUE_PER_SOURCE and clamps the effective detection threshold to
+	// maxScanSweepThreshold (= MAX_UNIQUE_PER_SOURCE - 1) so an over-cap
+	// threshold detects at the cap (fail-closed) instead of never (the
+	// pre-fix silent fail-OPEN). A configured threshold above the maximum is
+	// preserved unchanged but warned about here — clamp-warn, never reject, so
+	// existing/peer-synced configs keep booting on both compile paths.
+	cfg.Warnings = append(cfg.Warnings, validateScreenScanSweepThresholds(cfg)...)
+
 	// #2173: static-NAT / NAT64 host-mask gate. #2132 made the Rust
 	// dataplane tolerate the canonical /32-/128 host mask and PR #2167 then
 	// hardened it to REJECT a non-host mask — so a misconfigured non-host
