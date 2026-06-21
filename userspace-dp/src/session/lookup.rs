@@ -67,11 +67,11 @@ impl SessionTable {
                 }
             }
             let entry = &mut record.entry;
-            if matches!(key.protocol, PROTO_TCP) && (tcp_flags & (TCP_FIN | TCP_RST)) != 0 {
+            if matches!(key.protocol, PROTO_TCP) && is_closing(tcp_flags) {
                 if !entry.closing {
                     debug_log!(
                         "SESS_CLOSING: {} proto=TCP {}:{} -> {}:{} rev={} tcp_flags=0x{:02x}",
-                        if (tcp_flags & TCP_RST) != 0 {
+                        if has_rst(tcp_flags) {
                             "RST"
                         } else {
                             "FIN"

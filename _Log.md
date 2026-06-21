@@ -1,5 +1,25 @@
 # Action Log
 
+## 2026-06-21 — #2151: consolidate TCP-flag constants to shared SSOT
+
+- **Timestamp**: 2026-06-21
+- **Action**: Pure code-motion refactor. Added
+  `userspace-dp/src/tcp_flags.rs` (constants TCP_FIN/SYN/RST/PSH/ACK/URG +
+  0x17 control mask, predicates has_syn/has_ack/has_rst/has_fin/has_urg/
+  has_psh, is_ack_only, is_initial_syn, is_syn_ack, is_closing) with a
+  full-domain truth-table test file `tcp_flags_tests.rs` asserting wire
+  bit values and predicate==inline equivalence. Replaced every scattered
+  TCP-flag definition and inline check (afxdp/mod.rs, frame/tcp.rs,
+  screen/packet.rs, session/mod.rs definition sites; flow_cache,
+  forwarding, screen, session install/lookup, frame/tcp, poll_descriptor,
+  rx_telemetry decision sites) with the shared symbols. No behavior
+  change — verified by the unchanged full test suite passing.
+- **File(s)**: userspace-dp/src/tcp_flags.rs (new),
+  userspace-dp/src/tcp_flags_tests.rs (new), userspace-dp/src/main.rs,
+  userspace-dp/src/afxdp/{mod.rs, flow_cache.rs, forwarding/mod.rs,
+  frame/tcp.rs, poll_descriptor/mod.rs, poll_descriptor/rx_telemetry.rs},
+  userspace-dp/src/screen/{mod.rs, packet.rs},
+  userspace-dp/src/session/{mod.rs, install.rs, lookup.rs}
 ## 2026-06-21 — #2149: frame builders emit priority-tagged VLAN-0 + preserve PCP
 
 - **Timestamp**: 2026-06-21

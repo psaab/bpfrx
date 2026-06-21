@@ -21,6 +21,7 @@ mod slowpath;
 #[cfg(test)]
 mod test_zone_ids;
 mod state_writer;
+mod tcp_flags;
 #[allow(dead_code)]
 mod xsk_ffi;
 

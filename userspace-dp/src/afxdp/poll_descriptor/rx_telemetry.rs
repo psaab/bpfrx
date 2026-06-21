@@ -127,17 +127,17 @@ pub(super) fn record_rx_descriptor_telemetry(
         if desc.len >= 54 {
             if let Some(rx_frame) = unsafe { &*area }.slice(desc.addr as usize, desc.len as usize)
             {
-                // Check for FIN, SYN+ACK, zero-window
+                // Check for FIN, SYN+ACK, zero-window (#2151: shared predicates).
                 if let Some(tcp_info) = extract_tcp_flags_and_window(rx_frame) {
-                    if (tcp_info.0 & 0x01) != 0 {
+                    if crate::tcp_flags::has_fin(tcp_info.0) {
                         // FIN
                         telemetry.dbg.rx_tcp_fin += 1;
                     }
-                    if (tcp_info.0 & 0x12) == 0x12 {
+                    if crate::tcp_flags::is_syn_ack(tcp_info.0) {
                         // SYN+ACK
                         telemetry.dbg.rx_tcp_synack += 1;
                     }
-                    if tcp_info.1 == 0 && (tcp_info.0 & 0x02) == 0 {
+                    if tcp_info.1 == 0 && !crate::tcp_flags::has_syn(tcp_info.0) {
                         // zero window, not SYN
                         telemetry.dbg.rx_tcp_zero_window += 1;
                         if telemetry.dbg.rx_tcp_zero_window <= 10 {

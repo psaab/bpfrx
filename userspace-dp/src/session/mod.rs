@@ -140,8 +140,11 @@ impl SessionTimeouts {
 }
 const MAX_SESSION_DELTAS: usize = 4096;
 use crate::ip_proto::{PROTO_ICMP, PROTO_ICMPV6, PROTO_TCP, PROTO_UDP};
-const TCP_FIN: u8 = 0x01;
-const TCP_RST: u8 = 0x04;
+// #2151: TCP flag bits from the shared crate::tcp_flags SSOT. Re-exported
+// so the conntrack submodules (install, lookup, expire) keep referencing
+// TCP_FIN/TCP_RST via `super::*`. The session-closing test is the shared
+// `is_closing` predicate.
+use crate::tcp_flags::{TCP_FIN, TCP_RST, has_rst, is_closing};
 
 #[allow(unused_macros)]
 macro_rules! debug_log {
@@ -648,8 +651,7 @@ impl SessionTable {
             record.entry.install_epoch = epoch;
             record.entry.last_seen_ns = now_ns;
             record.entry.expires_after_ns = session_timeout_ns(protocol, tcp_flags, &self.timeouts);
-            record.entry.closing =
-                matches!(protocol, PROTO_TCP) && (tcp_flags & (TCP_FIN | TCP_RST)) != 0;
+            record.entry.closing = matches!(protocol, PROTO_TCP) && is_closing(tcp_flags);
             // wheel_tick deliberately preserved (parity with restore_entry).
             // #2120: a real-traffic refresh (or a peer→local promote) means
             // this entry now genuinely lives on this node — it leaves the
@@ -1149,7 +1151,7 @@ fn remove_owner_rg_index_entry(
 fn session_timeout_ns(protocol: u8, tcp_flags: u8, timeouts: &SessionTimeouts) -> u64 {
     match protocol {
         PROTO_TCP => {
-            if (tcp_flags & (TCP_FIN | TCP_RST)) != 0 {
+            if is_closing(tcp_flags) {
                 TCP_CLOSING_TIMEOUT_NS
             } else {
                 timeouts.tcp_established_ns
