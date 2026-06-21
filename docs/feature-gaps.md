@@ -568,14 +568,19 @@ drift) closed in `fix/2008-quickwins-batch1`:
   compiled into typed state but counters were always collected; Junos only
   maintains per-policy stats when the knob is enabled (default off).
   **#2118 follow-on (DONE):** M4 gated only the Prometheus collector; the
-  text/structured display surfaces (`show security policies hit-count` and
-  `... detail` in `pkg/grpcapi/server_show_policies_text.go` +
-  `pkg/cli/cli_show_security.go`, and the structured `GetPolicies` block in
-  `pkg/grpcapi/server_show_zones.go`) read the per-rule counters
-  unconditionally, so the four surfaces disagreed. They are now gated on the
-  same knob: when `policy-stats system-wide enable` is absent (the default),
-  all four surfaces report 0 per-rule counts; when set, they all report the
-  same live counts. The Rust increment (`policy.rs` `try_match_rule`) stays
+  text/structured display surfaces read the per-rule counters
+  unconditionally, so the surfaces disagreed. All SIX display surfaces are
+  now gated on the same knob: Prometheus (`metrics_counters.go`), gRPC text
+  `show security policies hit-count` and `... detail`
+  (`pkg/grpcapi/server_show_policies_text.go`), the structured gRPC
+  `GetPolicies` block (`pkg/grpcapi/server_show_zones.go`), the REST
+  `GET /api/v1/security/policies` endpoint (`pkg/api/security.go`), and the
+  local CLI `show security policies hit-count` + `... brief` views
+  (`pkg/cli/cli_show_security.go`, `pkg/cli/cli_show_security_dispatch.go`).
+  When `policy-stats system-wide enable` is absent (the default), all six
+  report 0 per-rule counts; when set, they all report the same live counts.
+  The raw read primitive (`Manager.ReadPolicyCounters`) and
+  `clear security policies hit-count` stay ungated by design. The Rust increment (`policy.rs` `try_match_rule`) stays
   always-on (a single relaxed atomic) — the gate is display-only, so enabling
   the knob surfaces counts that accrued while it was off, and no wire-format
   change was needed. NOTE: the per-rule hit-count chain itself (increment →

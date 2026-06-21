@@ -12,8 +12,10 @@
   per-rule); (b) the smoke ran with `policy-stats` OFF; and (c) the genuine
   bug: #2008 M4 gated ONLY the Prometheus collector on
   `cfg.Security.PolicyStatsEnabled`, leaving the gRPC text/CLI/structured
-  display surfaces reading counters unconditionally — so the four surfaces
-  disagreed. Fix: gate all four surfaces on the same knob (display-only;
+  display surfaces reading counters unconditionally — so the surfaces
+  disagreed. Fix: gate all SIX display surfaces (Prometheus, gRPC text
+  hit-count + detail, structured gRPC GetPolicies, REST policies endpoint,
+  local CLI hit-count + brief) on the same knob (display-only;
   Rust increment stays always-on, no wire change). Added Go gate tests
   (gRPC text hit-count + detail, structured GetPolicies, local CLI),
   a `policies-hit-count` golden topic, and a Rust test proving explicit
@@ -21,10 +23,12 @@
   default-deny does not. Flagged (not changed) the Junos divergence: xpf
   preserves per-policy counts across recompile (Junos resets on commit).
 - **File(s)**: pkg/grpcapi/server_show_policies_text.go,
-  pkg/cli/cli_show_security.go, pkg/grpcapi/server_show_zones.go,
+  pkg/cli/cli_show_security.go, pkg/cli/cli_show_security_dispatch.go,
+  pkg/grpcapi/server_show_zones.go, pkg/api/security.go,
   pkg/grpcapi/server_show_zones_test.go,
   pkg/grpcapi/server_show_policies_hitcount_gate_test.go,
   pkg/cli/cli_show_policies_hitcount_gate_test.go,
+  pkg/api/policy_counters_test.go,
   pkg/grpcapi/server_show_golden_test.go,
   pkg/grpcapi/testdata/server_show_golden.json,
   userspace-dp/src/policy_tests.rs, docs/feature-gaps.md,

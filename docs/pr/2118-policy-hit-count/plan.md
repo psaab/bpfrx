@@ -55,7 +55,13 @@ paths were NOT gated:
 | gRPC text `show ... hit-count` | `pkg/grpcapi/server_show_policies_text.go:26` | NO |
 | gRPC text `show ... detail` | `pkg/grpcapi/server_show_policies_text.go:88` | NO |
 | Local CLI `show ... hit-count` | `pkg/cli/cli_show_security.go:21` | NO |
+| Local CLI `show ... brief` (Hits col) | `pkg/cli/cli_show_security_dispatch.go:176` | NO |
 | Structured gRPC `GetPolicies` | `pkg/grpcapi/server_show_zones.go:95` | NO |
+| REST `GET /api/v1/security/policies` | `pkg/api/security.go:103` | NO |
+
+(The CLI `brief` and REST surfaces were found by Codex's hostile review
+after the first three were gated — the gate is now uniform across all
+six display surfaces.)
 
 This is divergent behavior: the same traffic+config can read nonzero on
 CLI/gRPC but zero on Prometheus. That is the consistency defect #2118
