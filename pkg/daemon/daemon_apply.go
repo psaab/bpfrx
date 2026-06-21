@@ -6,7 +6,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"net"
 	"os"
 	"strconv"
 	"strings"
@@ -911,39 +910,10 @@ func (d *Daemon) applyConfigLocked(cfg *config.Config) error {
 	// the reconcile loop (reconcileRGState) after election settles,
 	// not here — we don't know who's primary during config apply.
 
-	// 2.6c. Reconcile proxy ARP entries for NAT addresses.
-	if len(cfg.Security.NAT.ProxyARP) > 0 {
-		ifaceMap := make(map[string]int)
-		rethToPhys := cfg.RethToPhysical()
-		for _, entry := range cfg.Security.NAT.ProxyARP {
-			parts := strings.SplitN(entry.Interface, ".", 2)
-			baseName := parts[0]
-			if phys, ok := rethToPhys[baseName]; ok {
-				baseName = phys
-			}
-			linuxName := config.LinuxIfName(baseName)
-			if _, ok := ifaceMap[entry.Interface]; ok {
-				continue
-			}
-			iface, err := net.InterfaceByName(linuxName)
-			if err != nil {
-				slog.Warn("proxy-arp: interface not found", "iface", entry.Interface, "linux", linuxName, "err", err)
-				continue
-			}
-			ifaceMap[entry.Interface] = iface.Index
-		}
-		added, err := dataplane.ReconcileProxyARP(cfg, ifaceMap)
-		if err != nil {
-			slog.Warn("failed to reconcile proxy ARP", "err", err)
-		}
-		for _, a := range added {
-			if a.Iface != "" {
-				if err := cluster.SendGratuitousARP(a.Iface, a.IP, 1); err != nil {
-					slog.Warn("proxy-arp: GARP failed", "ip", a.IP, "iface", a.Iface, "err", err)
-				}
-			}
-		}
-	}
+	// 2.6c. Reconcile proxy ARP/NDP entries for NAT addresses. Factored into
+	// reconcileProxyARP so the always-on periodic re-assert loop (#2197 item
+	// 2) can re-run the identical reconcile after a non-commit link cycle.
+	d.reconcileProxyARP(cfg)
 
 	// 2.7. Re-bind management VRF interfaces after networkd.Apply().
 	// networkctl reconfigure strips VRF master bindings because networkd

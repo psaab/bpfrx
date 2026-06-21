@@ -170,8 +170,8 @@ xpf has SNAT (interface + pool, address-persistent, source-nat off bypass), DNAT
 
 | Feature | Junos Config Path | Description | Priority | Status |
 |---------|-------------------|-------------|----------|--------|
-| **Proxy ARP for NAT** | `security nat proxy-arp interface ... address ...` | Auto-reply ARP for NAT pool addresses on same subnet as ingress interface. Required when SNAT pool, DNAT, or static-NAT external addresses are on same L2 segment. | High | **Done** -- Proxy ARP neighbor entries (NTF_PROXY) for NAT addresses with GARP on addition, AND the per-interface `net.ipv4.conf.<if>.proxy_arp` sysctl is enabled so the kernel actually answers the ARP (#2160). The kernel has two ARP-proxy paths: the pneigh (NTF_PROXY) reply branch, which answers only when the target routes out a *different* interface and does not consult the sysctl; and the `arp_fwd_proxy` path, gated by the per-interface `proxy_arp` sysctl. Whether the sysctl is load-bearing is therefore route-topology dependent (a same-L2-subnet external address is answered by neither path until the sysctl is on -- the #2160 case); enabling it guarantees a reply. Note: with the default `medium_id=0`, `proxy_arp=1` makes the kernel answer ARP on that interface for ANY target routed out a different interface -- broader than Junos `proxy-arp` (which proxies only listed addresses); per-address narrowing is tracked in #2197. Config: `set security nat proxy-arp interface <iface> address <addr>` with range support. |
-| **Proxy NDP for NAT** | `security nat proxy-ndp interface ... address ...` | IPv6 equivalent of proxy ARP for NAT64/static NAT addresses | Medium | **Partial** -- An IPv6 address under `proxy-arp` enables the per-interface `net.ipv6.conf.<if>.proxy_ndp` responder sysctl (#2160). The kernel proxy-NDP *neighbor table* install (the v6 analogue of the NTF_PROXY entry) is not yet wired, so v6 still needs a manual `ip -6 neigh add proxy`. |
+| **Proxy ARP for NAT** | `security nat proxy-arp interface ... address ...` | Auto-reply ARP for NAT pool addresses on same subnet as ingress interface. Required when SNAT pool, DNAT, or static-NAT external addresses are on same L2 segment. | High | **Done** -- Proxy ARP neighbor entries (NTF_PROXY) for NAT addresses with GARP on addition, AND the per-interface `net.ipv4.conf.<if>.proxy_arp` sysctl is enabled so the kernel actually answers the ARP (#2160). The kernel has two ARP-proxy paths: the pneigh (NTF_PROXY) reply branch, which answers only when the target routes out a *different* interface and does not consult the sysctl; and the `arp_fwd_proxy` path, gated by the per-interface `proxy_arp` sysctl. Whether the sysctl is load-bearing is therefore route-topology dependent (a same-L2-subnet external address is answered by neither path until the sysctl is on -- the #2160 case); enabling it guarantees a reply. Note: with the default `medium_id=0`, `proxy_arp=1` makes the kernel answer ARP on that interface for ANY target routed out a different interface -- broader than Junos `proxy-arp` (which proxies only listed addresses); per-address (v4-only) narrowing is **deferred** in #2197 item 3 (PLAN-DEFER, lab characterization pending -- dropping the sysctl would re-break the same-L2 #2160 case). IPv6 addresses get a real proxy-NDP pneigh install (#2197 item 1, see Proxy NDP row). Config: `set security nat proxy-arp interface <iface> address <addr>` with range support. |
+| **Proxy NDP for NAT** | `security nat proxy-ndp interface ... address ...` | IPv6 equivalent of proxy ARP for NAT64/static NAT addresses | Medium | **Done** -- An IPv6 address under `proxy-arp` now installs the kernel proxy-NDP *neighbor table* entry (the v6 NTF_PROXY analogue of `ip -6 neigh add proxy <addr> dev <if>`) AND enables the per-interface `net.ipv6.conf.<if>.proxy_ndp` responder sysctl (#2197 item 1, completing #2160). The kernel answers a v6 NS only with forwarding + `proxy_ndp` + a matching v6 pneigh entry (`net/ipv6/ndisc.c` `pneigh_lookup`), so all three pieces are now wired -- IPv6 static-NAT / NAT64 external proxy works end-to-end with no manual `ip -6 neigh`. v6 proxy-NDP is `pneigh_lookup`-gated (per-address by construction), so there is no v6 over-answer breadth -- the per-address narrowing follow-up (#2197 item 3) is IPv4-only. |
 | **Twice NAT** | Combination of SNAT + DNAT rule-sets matching same traffic | Simultaneous source and destination translation in single flow. | Medium | **Done** -- Combined SNAT+DNAT flows now preserve both translations in one session path. Static DNAT is keyed by ingress zone with wildcard fallback for SNAT return-path entries across eBPF and userspace (DPDK retired #1525). Userspace post-DNAT SNAT matching now evaluates destination filters against the translated destination, and session/gRPC visibility preserves both NAT legs. |
 | **DNS ALG with NAT** | `security alg dns enable` | DNS payload rewriting when NAT changes embedded IP addresses (A/AAAA record doctoring) | Medium | Missing |
 | **Overflow Pool** | `security nat source pool ... overflow-pool ...` | Fallback to interface NAT or another pool when primary SNAT pool is exhausted | Low | Missing |
@@ -481,7 +481,7 @@ xpf has hostname, domain-name, domain-search, timezone, name-servers, NTP, servi
 ### Tier 1 - High Priority (Core NGFW / Common vSRX Features)
 Features most commonly used in production vSRX deployments:
 
-1. ~~**Proxy ARP/NDP for NAT**~~ - **Done** (proxy ARP with GARP; proxy NDP still missing)
+1. ~~**Proxy ARP/NDP for NAT**~~ - **Done** (proxy ARP with GARP; proxy NDP pneigh install + responder sysctl wired in #2197 item 1)
 2. ~~**Session Limiting (source/dest-ip)**~~ - **Done** on the legacy BPF path (GC sweep + BPF LRU maps + xdp_screen enforcement); userspace admission is tracked in `userspace-dataplane-gaps.md`.
 3. ~~**Firewall Filter Policers**~~ - **Legacy done** (token bucket: single-rate, two-rate RFC 2698, single-rate-3c RFC 2697; eBPF + ~~DPDK~~ (DPDK retired #1525)). Userspace supports the color-blind `then discard` three-color slice; #1375 is closed. Remaining color-aware/non-drop and broader Junos parity work is production/future parity, not active #1373 source-removal work.
 4. ~~**BFD**~~ - **Done** (OSPF/IS-IS/BGP BFD via FRR profiles)
@@ -554,13 +554,25 @@ evidence, not as active eBPF source-removal blockers.
   *different* interface and does NOT require the sysctl; the `arp_fwd_proxy` path
   is gated by the sysctl. So whether the sysctl is load-bearing is route-topology
   dependent -- a same-L2-subnet external address (the #2160 case) is answered by
-  neither path until the sysctl is enabled. IPv6 entries enable
-  `net.ipv6.conf.<if>.proxy_ndp`.
-- Breadth tradeoff: with the default `medium_id=0`, `proxy_arp=1` makes the kernel
-  answer ARP on that interface for ANY target routed out a different interface --
-  broader than Junos `proxy-arp`, which proxies only the listed addresses. This is
-  operator-opted-in (they configured proxy-arp on the interface) but matters on a
-  WAN/untrust interface; per-address narrowing is tracked in follow-up #2197.
+  neither path until the sysctl is enabled.
+- IPv6 (proxy-NDP, #2197 item 1, completing #2160): an IPv6 address under
+  `proxy-arp` now installs the kernel v6 NTF_PROXY *neighbor table* entry (the v6
+  analogue of `ip -6 neigh add proxy <addr> dev <if>`) in addition to enabling the
+  `net.ipv6.conf.<if>.proxy_ndp` sysctl. The kernel answers a v6 NS only with
+  forwarding + `proxy_ndp` + a matching v6 pneigh entry (`net/ipv6/ndisc.c`), so
+  all three pieces are wired -- v6 static-NAT / NAT64 external proxy is functional
+  end-to-end. v6 is `pneigh_lookup`-gated (per-address by construction), so there
+  is no v6 over-answer breadth; the narrowing concern below is IPv4-only. A
+  v4-mapped (`::ffff:a.b.c.d`) literal classifies as IPv4 and takes the v4 path.
+- Breadth tradeoff (IPv4): with the default `medium_id=0`, `proxy_arp=1` makes the
+  kernel answer ARP on that interface for ANY target routed out a different
+  interface -- broader than Junos `proxy-arp`, which proxies only the listed
+  addresses. This is operator-opted-in (they configured proxy-arp on the
+  interface) but matters on a WAN/untrust interface. Per-address narrowing
+  (#2197 item 3) is **PLAN-DEFER / lab-pending**: the sysctl is load-bearing for
+  the same-L2 #2160 case, so dropping it to gain Junos parity would re-break that
+  case; any narrowing ships only after a lab repro confirms a pneigh-only
+  different-device topology answers without it.
 - Config: `set security nat proxy-arp interface <iface> address <addr>` with address range support
 
 ### Session Limiting (Tier 1) -- DONE

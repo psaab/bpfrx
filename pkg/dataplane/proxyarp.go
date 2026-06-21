@@ -13,12 +13,32 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-// ProxyARPAdded describes a newly added proxy ARP entry (for GARP).
+// ProxyARPAdded describes a newly added proxy ARP/NDP entry (for GARP).
+//
+// Family is the address family of the installed entry (unix.AF_INET or
+// unix.AF_INET6). The caller uses it to gate the gratuitous-ARP send:
+// SendGratuitousARP is IPv4-only, so a v6 (AF_INET6) added entry must not be
+// handed to it (#2197 item 1, risk R1). The v6 proxy-NDP responder works
+// without an unsolicited Neighbor Advertisement, so v6 entries simply skip the
+// GARP step rather than emitting a v6 equivalent.
 type ProxyARPAdded struct {
 	Ifindex int
 	IP      net.IP
 	Iface   string
+	Family  int
 }
+
+// netlink seams. The neighbor list/set/del operations are wrapped in package
+// vars so unit tests can exercise the family-correct install/stale-removal
+// logic (#2197 item 1) without CAP_NET_ADMIN. Production wiring is the real
+// vishvananda/netlink calls; the kernel handles both AF_INET and AF_INET6
+// NTF_PROXY entries through the same RTM_NEWNEIGH/RTM_DELNEIGH (Family-aware,
+// To4()/To16() serialized), so no library-side family branching is required.
+var (
+	neighListSeam = netlink.NeighList
+	neighSetSeam  = netlink.NeighSet
+	neighDelSeam  = netlink.NeighDel
+)
 
 // proxyARPSysctlSeam wraps the per-interface procfs writes that enable the
 // kernel's proxy-responder for the families we install neighbor entries for.
@@ -160,17 +180,23 @@ func ReconcileProxyARP(cfg *config.Config, ifaceMap map[string]int) ([]ProxyARPA
 				continue
 			}
 			addr := prefix.Addr()
+			// #2197 item 1: install an NTF_PROXY neighbor entry for v6
+			// addresses too (the v6 analogue of `ip -6 neigh add proxy
+			// <addr> dev <if>`). Unlike v4 — where the broad arp_fwd_proxy
+			// path can answer without a pneigh entry — IPv6 proxy-NDP is
+			// gated on pneigh_lookup itself (net/ipv6/ndisc.c): the kernel
+			// answers a v6 NS only if a matching v6 pneigh entry exists
+			// (plus forwarding + proxy_ndp). So the v6 install is the
+			// necessary-and-sufficient piece per listed address, and there
+			// is no v6 over-answer breadth (the #2197 narrowing follow-up is
+			// v4-only). A ::ffff:0:0/96 v4-mapped literal classifies as v4
+			// (Is4In6) so it takes the v4 install path, never a v6 NeighSet.
+			family := unix.AF_INET
 			if addr.Is6() && !addr.Is4In6() {
-				// IPv6 proxy entry — needs proxy_ndp on the ingress
-				// interface. The NTF_PROXY neighbor install below is
-				// IPv4-only (the kernel proxy-NDP table is managed
-				// separately); record the family so the v6 responder
-				// sysctl still gets enabled.
-				recordFamily(ifindex, unix.AF_INET6)
-				continue
+				family = unix.AF_INET6
 			}
 			desired[proxyKey{ifindex, addr}] = struct{}{}
-			recordFamily(ifindex, unix.AF_INET)
+			recordFamily(ifindex, family)
 		}
 	}
 
@@ -181,40 +207,71 @@ func ReconcileProxyARP(cfg *config.Config, ifaceMap map[string]int) ([]ProxyARPA
 		managedSet[idx] = true
 	}
 
-	for idx := range managedSet {
-		neighs, err := netlink.NeighList(idx, unix.AF_INET)
-		if err != nil {
-			slog.Warn("proxy-arp: failed to list neighbors", "ifindex", idx, "err", err)
-			continue
+	// keyFamily derives the netlink address family for a key from its IP so
+	// the add/remove netlink.Neigh carries the correct family. A v4-mapped v6
+	// literal (Is4In6) is treated as v4 — consistent with the desired-set
+	// classification above.
+	keyFamily := func(ip netip.Addr) int {
+		if ip.Is6() && !ip.Is4In6() {
+			return unix.AF_INET6
 		}
-		for _, n := range neighs {
-			if n.Flags&unix.NTF_PROXY == 0 {
+		return unix.AF_INET
+	}
+
+	// List existing NTF_PROXY entries for BOTH families on each managed
+	// interface. The netip.Addr key keeps v4 and v6 disjoint, and each
+	// NeighList(family) pass already only returns that family's entries, so a
+	// v4-mapped form cannot be double-counted (#2197 item 1, risk R2).
+	for idx := range managedSet {
+		for _, family := range []int{unix.AF_INET, unix.AF_INET6} {
+			neighs, err := neighListSeam(idx, family)
+			if err != nil {
+				slog.Warn("proxy-arp: failed to list neighbors",
+					"ifindex", idx, "family", family, "err", err)
 				continue
 			}
-			if n.IP == nil {
-				continue
+			for _, n := range neighs {
+				if n.Flags&unix.NTF_PROXY == 0 {
+					continue
+				}
+				if n.IP == nil {
+					continue
+				}
+				var addr netip.Addr
+				var ok bool
+				if family == unix.AF_INET6 {
+					// Skip v4-mapped entries surfaced on the v6 pass; the
+					// v4 pass owns them via To4().
+					if n.IP.To4() != nil {
+						continue
+					}
+					addr, ok = netip.AddrFromSlice(n.IP.To16())
+				} else {
+					addr, ok = netip.AddrFromSlice(n.IP.To4())
+				}
+				if !ok {
+					continue
+				}
+				existing[proxyKey{idx, addr}] = struct{}{}
 			}
-			addr, ok := netip.AddrFromSlice(n.IP.To4())
-			if !ok {
-				continue
-			}
-			existing[proxyKey{idx, addr}] = struct{}{}
 		}
 	}
 
-	// Add missing entries.
+	// Add missing entries (family derived from the key — v4 and v6 share the
+	// same NTF_PROXY install path; #2197 item 1).
 	var added []ProxyARPAdded
 	for key := range desired {
 		if _, ok := existing[key]; ok {
 			continue
 		}
+		family := keyFamily(key.ip)
 		neigh := &netlink.Neigh{
 			LinkIndex: key.ifindex,
 			IP:        key.ip.AsSlice(),
 			Flags:     unix.NTF_PROXY,
-			Family:    unix.AF_INET,
+			Family:    family,
 		}
-		if err := netlink.NeighSet(neigh); err != nil {
+		if err := neighSetSeam(neigh); err != nil {
 			return nil, fmt.Errorf("proxy-arp: add %s on ifindex %d: %w", key.ip, key.ifindex, err)
 		}
 		ifaceName := ""
@@ -225,10 +282,11 @@ func ReconcileProxyARP(cfg *config.Config, ifaceMap map[string]int) ([]ProxyARPA
 			Ifindex: key.ifindex,
 			IP:      net.IP(key.ip.AsSlice()),
 			Iface:   ifaceName,
+			Family:  family,
 		})
 	}
 
-	// Remove stale entries on managed interfaces.
+	// Remove stale entries on managed interfaces (both families now listed).
 	var removed int
 	for key := range existing {
 		if _, ok := desired[key]; ok {
@@ -238,9 +296,9 @@ func ReconcileProxyARP(cfg *config.Config, ifaceMap map[string]int) ([]ProxyARPA
 			LinkIndex: key.ifindex,
 			IP:        key.ip.AsSlice(),
 			Flags:     unix.NTF_PROXY,
-			Family:    unix.AF_INET,
+			Family:    keyFamily(key.ip),
 		}
-		if err := netlink.NeighDel(neigh); err != nil {
+		if err := neighDelSeam(neigh); err != nil {
 			slog.Warn("proxy-arp: failed to remove stale entry",
 				"ip", key.ip, "ifindex", key.ifindex, "err", err)
 		} else {
