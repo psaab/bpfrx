@@ -138,6 +138,11 @@ info()  { echo "==> $*"; }
 warn()  { echo "WARNING: $*" >&2; }
 die()   { echo "ERROR: $*" >&2; exit 1; }
 
+# Shared raw-deploy reconciliation + sha-verify helpers (#2162/#2176). Sourced
+# after info/warn/die so the lib can use them.
+# shellcheck source=deploy-lib.sh
+source "${SCRIPT_DIR}/deploy-lib.sh"
+
 # ── Helpers ───────────────────────────────────────────────────────────
 
 run_on_host() {
@@ -867,6 +872,15 @@ deploy_vm() {
 	incus exec "$rinst" -- rm -f /usr/local/sbin/bpfrx-userspace-dp 2>/dev/null || true
 	incus exec "$rinst" -- bash -c 'if [ -d /etc/bpfrx ] && [ ! -d /etc/xpf ]; then mv /etc/bpfrx /etc/xpf; elif [ -d /etc/bpfrx ] && [ -d /etc/xpf ]; then shopt -s dotglob nullglob; for f in /etc/bpfrx/*; do base=$(basename "$f"); if [ ! -e "/etc/xpf/$base" ]; then cp -a "$f" "/etc/xpf/$base"; fi; done; shopt -u dotglob nullglob; rm -rf /etc/bpfrx; fi; if [ -f /etc/xpf/bpfrx.conf ] && [ ! -f /etc/xpf/xpf.conf ]; then mv /etc/xpf/bpfrx.conf /etc/xpf/xpf.conf; fi' 2>/dev/null || true
 
+	# Reconcile prior #1917 in-place-upgrade residue BEFORE pushing binaries
+	# (#2176). A stale 10-xpf-version.conf ExecStart pin (left by a deb dogfood)
+	# would make systemd keep launching an OLD versioned binary after this raw
+	# push, and dangling sbin symlinks into a removed versions/ dir would break
+	# `incus file push`. This was hit live during the #2166 smoke and worked
+	# around by hand — both silently produce a "successful" deploy of stale code.
+	deploy_reconcile_stale_pin "$rinst"
+	deploy_reconcile_dangling_sbin "$rinst"
+
 	# Stop service gracefully, then clean BPF state for binary upgrade.
 	# Order matters: systemctl stop sends SIGTERM (graceful socket close),
 	# then xpfd cleanup removes pinned BPF maps/links.  The final
@@ -880,15 +894,21 @@ deploy_vm() {
 	incus exec "$rinst" -- pkill -9 cli 2>/dev/null || true
 	sleep 1
 
+	# Push each binary, then HARD-verify its on-VM sha256 == the local build
+	# (#2162/#2176). An `incus file push` can silently no-op and a local build
+	# can be stale — either runs old code, the #1 false-result hazard.
 	info "Pushing xpfd to $vm..."
 	incus file push "$PROJECT_ROOT/xpfd" "${rinst}/usr/local/sbin/xpfd" --mode 0755
+	deploy_verify_pushed_sha "$rinst" "$PROJECT_ROOT/xpfd" /usr/local/sbin/xpfd xpfd
 
 	info "Pushing cli to $vm..."
 	incus file push "$PROJECT_ROOT/cli" "${rinst}/usr/local/sbin/cli" --mode 0755
+	deploy_verify_pushed_sha "$rinst" "$PROJECT_ROOT/cli" /usr/local/sbin/cli cli
 
 	if [[ -f "$PROJECT_ROOT/xpf-userspace-dp" ]]; then
 		info "Pushing xpf-userspace-dp to $vm..."
 		incus file push "$PROJECT_ROOT/xpf-userspace-dp" "${rinst}/usr/local/sbin/xpf-userspace-dp" --mode 0755
+		deploy_verify_pushed_sha "$rinst" "$PROJECT_ROOT/xpf-userspace-dp" /usr/local/sbin/xpf-userspace-dp xpf-userspace-dp
 	else
 		warn "xpf-userspace-dp not found locally; helper not pushed to $vm"
 	fi
@@ -917,6 +937,11 @@ deploy_vm() {
 	incus file push "${SCRIPT_DIR}/xpfd.service" "${rinst}/etc/systemd/system/xpfd.service"
 	incus exec "$rinst" -- systemctl daemon-reload
 	incus exec "$rinst" -- systemctl enable --now xpfd
+
+	# Backstop (#2176): assert the LIVE xpfd is the binary we just pushed and the
+	# effective ExecStart is the base-unit path — a HARD failure if a version pin
+	# survived or systemd is launching stale code.
+	deploy_verify_running_xpfd "$rinst" "$PROJECT_ROOT/xpfd"
 
 	info "Deploy complete for $vm."
 }
