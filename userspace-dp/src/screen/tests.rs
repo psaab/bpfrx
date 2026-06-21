@@ -4,7 +4,7 @@
 // `#[path = "screen_tests.rs"]` from screen.rs.
 
 use super::*;
-use std::net::{Ipv4Addr, Ipv6Addr};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
 fn default_profile() -> ScreenProfile {
     ScreenProfile {
@@ -1260,11 +1260,21 @@ fn syn_cookie_ack_validation_marks_next_syn_bypass_without_session_creation() {
 }
 
 #[test]
-fn syn_cookie_validated_syn_still_runs_later_screen_checks() {
+fn syn_cookie_validated_syn_bypasses_flood_gate_and_passes() {
+    // #2134: this test used to prove "a SYN-cookie-validated SYN still
+    // runs the LATER screen checks" by asserting the session-limit drop
+    // fires on the validated tuple. That check moved out of the screen
+    // stage (it now enforces at the new-flow decision in
+    // poll_descriptor), and the only remaining later stateful checks
+    // (port-scan / ip-sweep) key on tuple-uniqueness — which conflicts
+    // with the validated cache, that only bypasses the flood gate for the
+    // EXACT validated tuple. So we prove the load-bearing property
+    // directly: a cookie-validated SYN bypasses the SYN-flood gate and
+    // traverses the rest of `check_packet_with_zone_id` to a clean Pass,
+    // whereas the identical un-validated SYN is challenged at the gate.
     let mut profile = ScreenProfile::default();
     profile.syn_flood_threshold = 1;
     profile.syn_cookie = true;
-    profile.session_limit_src = 1;
     let mut state = make_state("trust", profile);
     state.update_syn_cookie_master_key(Some(syn_cookie_key()));
     let syn = tcp_pkt(
@@ -1275,10 +1285,12 @@ fn syn_cookie_validated_syn_still_runs_later_screen_checks() {
         TCP_SYN,
     );
 
+    // First SYN passes (under the SYN-flood threshold of 1).
     assert_eq!(
         state.check_packet_with_zone_id("trust", 7, &syn, 128),
         ScreenVerdict::Pass
     );
+    // Second SYN crosses the SYN-flood threshold -> cookie challenge.
     let challenge = match state.check_packet_with_zone_id("trust", 7, &syn, 128) {
         ScreenVerdict::SynCookieChallenge(challenge) => challenge,
         other => panic!("expected SYN-cookie challenge, got {other:?}"),
@@ -1292,10 +1304,14 @@ fn syn_cookie_validated_syn_still_runs_later_screen_checks() {
         SynCookieAckVerdict::Validated
     );
 
-    state.session_created(syn.src_ip, syn.dst_ip);
+    // The client's next SYN (identical tuple), now cookie-validated,
+    // bypasses the SYN-flood gate and runs to completion: SynCookieBypass
+    // (a Pass-equivalent that records the bypass), NOT another challenge
+    // or drop. The validated tuple is single-use, so the cache is empty
+    // again afterwards.
     assert_eq!(
         state.check_packet_with_zone_id("trust", 7, &syn, 128),
-        ScreenVerdict::Drop("session-limit-src")
+        ScreenVerdict::SynCookieBypass
     );
     assert_eq!(state.syn_cookie_validated_len(), 0);
 }
@@ -1825,204 +1841,17 @@ fn extract_info_from_ipv4_frame() {
 }
 
 // ================================================================
-// Per-IP session limits
+// Per-IP session limits — #2134: enforcement + lifecycle now live in
+// `session::SessionTable` (count maintained at the install/remove sinks,
+// checked at the new-flow decision in poll_descriptor). The screen stage
+// no longer evaluates the per-IP count. End-to-end enforcement, the
+// established-flow no-self-drop regression, evict-on-zero (#2128), the
+// HA promote/demote count sites, the differential invariant, and
+// clear-on-disable are covered by `session/tests.rs`
+// (`session_limit_*`). The obsolete ScreenState-resident tests that
+// drove the now-retired `session_created`/`session_expired` mutators
+// were removed here.
 // ================================================================
-
-#[test]
-fn session_limit_src_enforced() {
-    let mut profile = ScreenProfile::default();
-    profile.session_limit_src = 2;
-    let mut state = make_state("trust", profile);
-
-    let src = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1));
-    let dst1 = IpAddr::V4(Ipv4Addr::new(10, 0, 2, 1));
-    let dst2 = IpAddr::V4(Ipv4Addr::new(10, 0, 2, 2));
-    let dst3 = IpAddr::V4(Ipv4Addr::new(10, 0, 2, 3));
-
-    // First two sessions pass and get created
-    let pkt1 = tcp_pkt(src, dst1, 1234, 80, TCP_SYN);
-    assert_eq!(state.check_packet("trust", &pkt1, 1), ScreenVerdict::Pass);
-    state.session_created(src, dst1);
-
-    let pkt2 = tcp_pkt(src, dst2, 1235, 80, TCP_SYN);
-    assert_eq!(state.check_packet("trust", &pkt2, 1), ScreenVerdict::Pass);
-    state.session_created(src, dst2);
-
-    // Third session should be dropped (limit = 2)
-    let pkt3 = tcp_pkt(src, dst3, 1236, 80, TCP_SYN);
-    assert_eq!(
-        state.check_packet("trust", &pkt3, 1),
-        ScreenVerdict::Drop("session-limit-src")
-    );
-}
-
-#[test]
-fn session_limit_dst_enforced() {
-    let mut profile = ScreenProfile::default();
-    profile.session_limit_dst = 2;
-    let mut state = make_state("trust", profile);
-
-    let dst = IpAddr::V4(Ipv4Addr::new(10, 0, 2, 1));
-    let src1 = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1));
-    let src2 = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 2));
-    let src3 = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 3));
-
-    let pkt1 = tcp_pkt(src1, dst, 1234, 80, TCP_SYN);
-    assert_eq!(state.check_packet("trust", &pkt1, 1), ScreenVerdict::Pass);
-    state.session_created(src1, dst);
-
-    let pkt2 = tcp_pkt(src2, dst, 1235, 80, TCP_SYN);
-    assert_eq!(state.check_packet("trust", &pkt2, 1), ScreenVerdict::Pass);
-    state.session_created(src2, dst);
-
-    let pkt3 = tcp_pkt(src3, dst, 1236, 80, TCP_SYN);
-    assert_eq!(
-        state.check_packet("trust", &pkt3, 1),
-        ScreenVerdict::Drop("session-limit-dst")
-    );
-}
-
-#[test]
-fn session_limit_decrements_on_expire() {
-    let mut profile = ScreenProfile::default();
-    profile.session_limit_src = 1;
-    let mut state = make_state("trust", profile);
-
-    let src = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1));
-    let dst1 = IpAddr::V4(Ipv4Addr::new(10, 0, 2, 1));
-    let dst2 = IpAddr::V4(Ipv4Addr::new(10, 0, 2, 2));
-
-    // Create one session
-    let pkt1 = tcp_pkt(src, dst1, 1234, 80, TCP_SYN);
-    assert_eq!(state.check_packet("trust", &pkt1, 1), ScreenVerdict::Pass);
-    state.session_created(src, dst1);
-
-    // Second session blocked
-    let pkt2 = tcp_pkt(src, dst2, 1235, 80, TCP_SYN);
-    assert_eq!(
-        state.check_packet("trust", &pkt2, 1),
-        ScreenVerdict::Drop("session-limit-src")
-    );
-
-    // Expire first session
-    state.session_expired(src, dst1);
-
-    // Now second session passes
-    assert_eq!(state.check_packet("trust", &pkt2, 1), ScreenVerdict::Pass);
-}
-
-/// Regression guard for #2128: the session-limit tracker must NOT leak a
-/// phantom zero-count entry per distinct source IP. Driving many distinct
-/// source IPs through the screen check WITHOUT ever creating a session
-/// (the spoofed-flood / dropped-by-policy / stateless-packet case) must
-/// leave the tracker map empty. Pre-fix `check_src` used
-/// `entry(ip).or_insert(0)`, which inserted a permanent entry per IP and
-/// would leave the map at size N here — an unbounded memory-exhaustion
-/// DoS. This test FAILS against that implementation and passes only with
-/// the read-only check, so it is non-tautological.
-#[test]
-fn session_limit_no_leak_on_distinct_ip_churn() {
-    let mut profile = ScreenProfile::default();
-    profile.session_limit_src = 5;
-    profile.session_limit_dst = 5;
-    let mut state = make_state("untrust", profile);
-
-    let dst = IpAddr::V4(Ipv4Addr::new(10, 0, 2, 1));
-    // Spray 1000 distinct source IPs (and 1000 distinct dst IPs) through
-    // the screen check. None of them ever calls session_created, mirroring
-    // a spoofed-source flood whose packets pass stateless screen but never
-    // establish a session.
-    for i in 0..1000u32 {
-        let octets = i.to_be_bytes();
-        let src = IpAddr::V4(Ipv4Addr::new(10, 1, octets[2], octets[3]));
-        let dst_spray = IpAddr::V4(Ipv4Addr::new(10, 2, octets[2], octets[3]));
-        let pkt = tcp_pkt(src, dst, 1234, 80, TCP_SYN);
-        assert_eq!(state.check_packet("untrust", &pkt, 1), ScreenVerdict::Pass);
-        let pkt2 = tcp_pkt(IpAddr::V4(Ipv4Addr::new(10, 3, 0, 1)), dst_spray, 1235, 80, TCP_SYN);
-        assert_eq!(
-            state.check_packet("untrust", &pkt2, 1),
-            ScreenVerdict::Pass
-        );
-    }
-
-    // The read-only check must not have populated the tracker maps: no
-    // session was ever created, so the maps stay empty regardless of how
-    // many distinct IPs were checked.
-    assert_eq!(
-        state.session_limit_src_len(),
-        0,
-        "src_counts leaked entries under distinct-IP churn (#2128)"
-    );
-    assert_eq!(
-        state.session_limit_dst_len(),
-        0,
-        "dst_counts leaked entries under distinct-IP churn (#2128)"
-    );
-}
-
-/// The tracker map must grow only with live sessions and return to empty
-/// when the last session for an IP closes (#2128 evict-on-zero invariant).
-#[test]
-fn session_limit_entry_removed_on_last_expire() {
-    let mut profile = ScreenProfile::default();
-    profile.session_limit_src = 4;
-    profile.session_limit_dst = 4;
-    let mut state = make_state("trust", profile);
-
-    let src = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1));
-    let dst = IpAddr::V4(Ipv4Addr::new(10, 0, 2, 1));
-
-    // No sessions yet -> empty.
-    assert_eq!(state.session_limit_src_len(), 0);
-    assert_eq!(state.session_limit_dst_len(), 0);
-
-    // One live session -> one entry on each side.
-    state.session_created(src, dst);
-    assert_eq!(state.session_limit_src_len(), 1);
-    assert_eq!(state.session_limit_dst_len(), 1);
-
-    // A read-only check for the same (and a different) IP must not change
-    // the entry count.
-    let other = IpAddr::V4(Ipv4Addr::new(10, 9, 9, 9));
-    let pkt = tcp_pkt(src, dst, 1111, 80, TCP_SYN);
-    assert_eq!(state.check_packet("trust", &pkt, 1), ScreenVerdict::Pass);
-    let pkt_other = tcp_pkt(other, other, 2222, 80, TCP_SYN);
-    assert_eq!(state.check_packet("trust", &pkt_other, 1), ScreenVerdict::Pass);
-    assert_eq!(state.session_limit_src_len(), 1);
-    assert_eq!(state.session_limit_dst_len(), 1);
-
-    // Expiring the last session prunes the entry back to empty.
-    state.session_expired(src, dst);
-    assert_eq!(state.session_limit_src_len(), 0);
-    assert_eq!(state.session_limit_dst_len(), 0);
-}
-
-/// Count tracks up and down across multiple sessions for one IP, and the
-/// entry survives until the final expire (#2128).
-#[test]
-fn session_limit_count_tracks_up_and_down() {
-    let mut profile = ScreenProfile::default();
-    profile.session_limit_src = 10;
-    let mut state = make_state("trust", profile);
-
-    let src = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1));
-    let dst1 = IpAddr::V4(Ipv4Addr::new(10, 0, 2, 1));
-    let dst2 = IpAddr::V4(Ipv4Addr::new(10, 0, 2, 2));
-    let dst3 = IpAddr::V4(Ipv4Addr::new(10, 0, 2, 3));
-
-    state.session_created(src, dst1);
-    state.session_created(src, dst2);
-    state.session_created(src, dst3);
-    // Three sessions for one src IP collapse to a single map entry (count 3).
-    assert_eq!(state.session_limit_src_len(), 1);
-
-    state.session_expired(src, dst1);
-    assert_eq!(state.session_limit_src_len(), 1, "entry must survive while count > 0");
-    state.session_expired(src, dst2);
-    assert_eq!(state.session_limit_src_len(), 1, "entry must survive while count > 0");
-    state.session_expired(src, dst3);
-    assert_eq!(state.session_limit_src_len(), 0, "entry removed when count hits 0");
-}
 
 // ================================================================
 // Port scan detection

@@ -108,6 +108,48 @@ fn try_enqueue_resolver(
     true
 }
 
+/// #2134: per-IP session-limit enforcement at the NEW-FLOW decision.
+///
+/// Junos `limit-session source-ip-based <n>` / `destination-ip-based <n>`
+/// caps the concurrent locally-admitted sessions a single source /
+/// destination IP may hold. The decision MUST fire exactly once per new
+/// flow, before that flow's own session exists — NOT in the per-packet
+/// screen stage, which runs on every data packet of every flow and would
+/// re-check an established flow's own counted session and self-drop it at
+/// the limit boundary (#2134 r2 BLOCKER).
+///
+/// This is a read-only query on the per-worker `SessionTable` count
+/// (maintained at the install/remove sinks + HA promote/demote), so it
+/// fixes #2128 by construction: an IP that never installs a session never
+/// gets a map entry. Returns the screen-drop reason if the new flow must
+/// be rejected, or `None` to proceed to install. Cold path (session
+/// miss only); the profile lookup short-circuits on the common
+/// no-`limit-session` zone.
+#[inline]
+fn new_flow_session_limit_drop(
+    forwarding: &ForwardingState,
+    sessions: &SessionTable,
+    from_zone: &str,
+    src_ip: IpAddr,
+    dst_ip: IpAddr,
+) -> Option<&'static str> {
+    // `screen_profiles` is keyed by zone NAME. An empty/absent zone or a
+    // zone with no `limit-session` configured short-circuits with no cost
+    // beyond the map probe.
+    let profile = forwarding.screen_profiles.get(from_zone)?;
+    if profile.session_limit_src > 0
+        && sessions.session_limit_src_count(src_ip) >= profile.session_limit_src
+    {
+        return Some("session-limit-src");
+    }
+    if profile.session_limit_dst > 0
+        && sessions.session_limit_dst_count(dst_ip) >= profile.session_limit_dst
+    {
+        return Some("session-limit-dst");
+    }
+    None
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn poll_binding_process_descriptor(
     binding: &mut BindingWorker,
@@ -768,6 +810,52 @@ pub(super) fn poll_binding_process_descriptor(
                             let is_trust_flow = meta.ingress_ifindex == 5
                                 || from_zone == "lan"
                                 || matches!(flow.src_ip, IpAddr::V4(ip) if ip.octets()[0] == 10);
+                            // #2134: per-IP session-limit enforcement at the
+                            // new-flow decision. This dominates BOTH counted
+                            // install sites below (LocalMiss host-inbound and
+                            // ForwardFlow transit), fires exactly once per new
+                            // flow before its session exists, and reads the
+                            // SessionTable count read-only (so an over-limit /
+                            // rejected IP never gets a phantom map entry —
+                            // #2128). Keys on the pre-NAT original src/dst
+                            // (`flow.src_ip`/`flow.dst_ip`), matching Junos
+                            // per-source-IP semantics and the screen stage's
+                            // own tuple. Reverse/seed installs below are
+                            // uncounted and correctly need neither check nor
+                            // count.
+                            if let Some(reason) = new_flow_session_limit_drop(
+                                worker_ctx.forwarding,
+                                sessions,
+                                from_zone,
+                                flow.src_ip,
+                                flow.dst_ip,
+                            ) {
+                                let l3_off = if meta.ingress_vlan_present != 0 { 18 } else { 14 };
+                                let screen_pkt = extract_screen_info(
+                                    packet_frame,
+                                    meta.addr_family,
+                                    meta.protocol,
+                                    meta.tcp_flags,
+                                    meta.pkt_len,
+                                    flow.src_ip,
+                                    flow.dst_ip,
+                                    flow.forward_key.src_port,
+                                    flow.forward_key.dst_port,
+                                    l3_off,
+                                );
+                                emit_screen_drop_event(
+                                    worker_ctx.event_stream,
+                                    &screen_pkt,
+                                    meta,
+                                    from_zone_id,
+                                    reason,
+                                    event_now_ns_from_secs(now_secs),
+                                );
+                                telemetry.counters.touched = true;
+                                telemetry.counters.screen_drops += 1;
+                                binding.scratch.scratch_recycle.push(desc.addr);
+                                continue;
+                            }
                             decision.resolution = finalize_new_flow_ha_resolution(
                                 worker_ctx.forwarding,
                                 worker_ctx.ha_state,
@@ -3179,5 +3267,168 @@ mod try_enqueue_resolver_tests {
         assert!(!try_enqueue_resolver(&resolver, &mut throttle, &names, key, 1_000));
         assert!(rx.try_recv().is_err());
         assert!(throttle.is_empty());
+    }
+}
+
+/// #2134: unit tests for the new-flow session-limit enforcement decision.
+/// These drive `new_flow_session_limit_drop` directly against a real
+/// `SessionTable` count, so they FAIL if the check is reverted to a
+/// never-drop no-op (the #2134 bug) — the under/at/over-limit boundary
+/// and the unconfigured-zone short-circuit are all pinned.
+#[cfg(test)]
+mod new_flow_session_limit_tests {
+    use super::*;
+    use crate::screen::ScreenProfile;
+    use crate::session::{SessionMetadata, SessionOrigin};
+    use std::net::{IpAddr, Ipv4Addr};
+
+    fn forwarding_with_limit(zone: &str, src_limit: u32, dst_limit: u32) -> ForwardingState {
+        let mut fw = ForwardingState::default();
+        let mut profile = ScreenProfile::default();
+        profile.session_limit_src = src_limit;
+        profile.session_limit_dst = dst_limit;
+        fw.screen_profiles.insert(zone.to_string(), profile);
+        fw
+    }
+
+    fn counted_key(src: IpAddr, dst: IpAddr, src_port: u16) -> crate::session::SessionKey {
+        crate::session::SessionKey {
+            addr_family: 2,
+            protocol: crate::ip_proto::PROTO_TCP,
+            src_ip: src,
+            dst_ip: dst,
+            src_port,
+            dst_port: 443,
+        }
+    }
+
+    fn meta() -> SessionMetadata {
+        SessionMetadata {
+            ingress_zone: 1,
+            egress_zone: 2,
+            owner_rg_id: 0,
+            fabric_ingress: false,
+            is_reverse: false,
+            nat64_reverse: None,
+        }
+    }
+
+    fn decision() -> crate::session::SessionDecision {
+        crate::session::SessionDecision {
+            resolution: ForwardingResolution {
+                disposition: ForwardingDisposition::ForwardCandidate,
+                local_ifindex: 0,
+                egress_ifindex: 12,
+                tx_ifindex: 12,
+                tunnel_endpoint_id: 0,
+                next_hop: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 50, 1))),
+                neighbor_mac: Some([0, 1, 2, 3, 4, 5]),
+                src_mac: None,
+                tx_vlan_id: 0,
+            },
+            nat: crate::nat::NatDecision::default(),
+        }
+    }
+
+    /// Install `n` distinct counted forward flows (distinct src ports) for
+    /// the same (src, dst). `port_base` lets callers add MORE without
+    /// re-installing already-present keys (which would net via the
+    /// idempotent pre-clear).
+    fn install_n(table: &mut SessionTable, src: IpAddr, dst: IpAddr, port_base: u16, n: u32) {
+        for i in 0..n {
+            assert!(table.install_with_protocol_with_origin(
+                counted_key(src, dst, port_base + i as u16),
+                decision(),
+                meta(),
+                SessionOrigin::ForwardFlow,
+                1_000_000_000,
+                crate::ip_proto::PROTO_TCP,
+                0x10,
+            ));
+        }
+    }
+
+    #[test]
+    fn under_limit_passes_at_and_over_limit_drops_src() {
+        let fw = forwarding_with_limit("untrust", 3, 0);
+        let mut table = SessionTable::new();
+        table.set_session_limit_active(true);
+        let src = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 50));
+        let dst = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 1));
+
+        // 0 sessions: under limit -> pass (None).
+        assert_eq!(
+            new_flow_session_limit_drop(&fw, &table, "untrust", src, dst),
+            None
+        );
+        // 2 sessions (under 3): still pass.
+        install_n(&mut table, src, dst, 40000, 2);
+        assert_eq!(table.session_limit_src_count(src), 2);
+        assert_eq!(
+            new_flow_session_limit_drop(&fw, &table, "untrust", src, dst),
+            None
+        );
+        // 3 sessions (== limit): the next new flow MUST drop.
+        install_n(&mut table, src, dst, 40002, 1); // distinct port -> count 3
+        assert_eq!(table.session_limit_src_count(src), 3);
+        assert_eq!(
+            new_flow_session_limit_drop(&fw, &table, "untrust", src, dst),
+            Some("session-limit-src"),
+            "at/over the limit, a new flow must be dropped"
+        );
+    }
+
+    #[test]
+    fn over_limit_drops_dst() {
+        let fw = forwarding_with_limit("untrust", 0, 2);
+        let mut table = SessionTable::new();
+        table.set_session_limit_active(true);
+        let src = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 51));
+        let dst = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 2));
+        install_n(&mut table, src, dst, 40000, 2);
+        assert_eq!(table.session_limit_dst_count(dst), 2);
+        assert_eq!(
+            new_flow_session_limit_drop(&fw, &table, "untrust", src, dst),
+            Some("session-limit-dst")
+        );
+    }
+
+    #[test]
+    fn unconfigured_zone_never_drops() {
+        // Zone present but no limit configured.
+        let fw = forwarding_with_limit("untrust", 0, 0);
+        let mut table = SessionTable::new();
+        table.set_session_limit_active(true);
+        let src = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 52));
+        let dst = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 3));
+        install_n(&mut table, src, dst, 40000, 50);
+        assert_eq!(
+            new_flow_session_limit_drop(&fw, &table, "untrust", src, dst),
+            None,
+            "no limit configured -> never drop"
+        );
+        // Unknown zone name -> short-circuit None.
+        assert_eq!(
+            new_flow_session_limit_drop(&fw, &table, "nonexistent", src, dst),
+            None
+        );
+    }
+
+    #[test]
+    fn read_only_check_never_creates_phantom_entry() {
+        // #2128: checking an IP that never installed a session must not
+        // populate the count maps.
+        let fw = forwarding_with_limit("untrust", 5, 5);
+        let table = SessionTable::new();
+        let src = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 53));
+        let dst = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 4));
+        for _ in 0..1000 {
+            assert_eq!(
+                new_flow_session_limit_drop(&fw, &table, "untrust", src, dst),
+                None
+            );
+        }
+        assert_eq!(table.session_limit_src_map_len(), 0);
+        assert_eq!(table.session_limit_dst_map_len(), 0);
     }
 }

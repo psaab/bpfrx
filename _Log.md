@@ -15,6 +15,62 @@
   the pre-fix code. Documented in pkg/flowexport/README.md gotchas.
 - **File(s)**: pkg/flowexport/manager.go, pkg/flowexport/transport.go,
   pkg/flowexport/addr_format_test.go, pkg/flowexport/README.md
+## 2026-06-21 — #2142 (PR #2185) fold: set-with-dangling-member escape + drift guard + wording
+
+- **Timestamp**: 2026-06-21
+- **Action**: Folded two MINOR review fixes into PR #2185.
+  **F1 (real escape)** `applicationsToValidateStrict.addRef`: when a policy
+  references an application-SET whose `ExpandApplicationSet` errors on a
+  dangling/undefined or over-nested member, addRef used to bail silently, so a
+  MALFORMED user app that was ALSO a direct member of that set escaped the
+  strict gate and commit succeeded (the #2142 fail-closed-on-permit pathology,
+  scoped to a set carrying a dangling member). Fix: on expansion error, fall
+  back to the set's DIRECT user-app members so each resolvable malformed member
+  is still hard-rejected; the unrelated dangling member no longer masks it. New
+  test `TestApplicationSpec_SetWithDanglingMember_StillRejectsBadMember` (fails
+  pre-fix). **Drift guard (check #4)**: the strict walk inline-duplicates
+  `appid.CatalogNames`'s reference resolution (appid imports config → cycle).
+  Added exported test seam `config.ApplicationsToValidateStrict` + cross-check
+  test `TestStrictValidationSetMatchesCatalogNames` (pkg/appid) asserting the
+  two walks agree on the user-app subset for a resolvable fixture — so a future
+  CatalogNames resolution change cannot let the compiler copy drift silently.
+  **F3 (wording)**: comment (`compiler.go`) and doc line
+  (`docs/services-application-identification.md`) said a malformed port is
+  "non-numeric"; reworded to "not a valid numeric port, port range, or known
+  service name" (`validatePortSpec` accepts 15 named service ports).
+- **File(s)**: pkg/config/compiler.go, pkg/config/compiler_application_specs_test.go, pkg/appid/runtime_test.go, docs/services-application-identification.md
+
+## 2026-06-21 — #2142 application-definition port/protocol commit-time validation
+
+- **Timestamp**: 2026-06-21
+- **Action**: Added `validateApplicationSpecsStrict` (strict-vs-lenient gate, `lenientApplicationSpecs` flag) rejecting a malformed `set applications application <name>` destination-port/source-port (non-numeric, out of 1..65535, inverted range) or unknown protocol at commit — but ONLY for apps referenced by a security policy (direct or via application-set) OR when `services application-identification` is enabled. Previously warning-only (`ValidateConfig`): commit succeeded, the app-id compiler skipped the unparsable port (never-match AppID), and a referencing policy failed CLOSED on permit / OPEN on deny. Application-DEFINITION sibling of #2124's policy-app-term fail-closed gate; reuses `validatePortSpec`/`validateProtocol` (no new table). Lenient on load/peer-sync (#1960/#2008 no-brick). New `compiler_application_specs_test.go` (10 tests, 8 fail pre-fix); doc note in `docs/services-application-identification.md`.
+- **File(s)**: pkg/config/compiler.go, pkg/config/compiler_application_specs_test.go, docs/services-application-identification.md
+
+## 2026-06-21 — #2134 wire screen session-limit enforcement (closes #2128)
+
+- **Timestamp**: 2026-06-21
+- **Action**: Fixed #2134 — `limit-session source-ip-based`/`destination-ip-based`
+  was a no-op (the per-IP count was computed but never incremented in
+  production). Moved the per-IP count into `SessionTable`: incremented at
+  the install choke point + in-place HA promote, decremented at the
+  removal sink + in-place HA demote (counted-class predicate
+  `!is_reverse && !is_peer_synced && !is_seed`, evict-on-zero). Relocated
+  the limit CHECK out of the per-packet screen stage into the new-flow /
+  session-MISS decision in `poll_descriptor` (`new_flow_session_limit_drop`)
+  so an established flow can't self-drop at the boundary; the read is
+  non-mutating, closing the #2128 phantom-zero leak by construction.
+  OFF-gated (zero cost unconfigured) with clear-on-disable. Retired the
+  dead `ScreenState` session-limit tracker + `screen/session_limit.rs`.
+  Added 14 unit tests (enforcement decision, established-flow no-self-drop,
+  evict-on-zero, HA promote/demote, differential invariant,
+  clear-on-disable) that fail if the wiring is reverted.
+- **File(s)**: userspace-dp/src/session/{mod.rs,install.rs,tests.rs,README.md},
+  userspace-dp/src/screen/{mod.rs,tests.rs}, userspace-dp/src/screen/session_limit.rs (deleted),
+  userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/worker/loop_body/{setup.rs,mod.rs},
+  docs/feature-gaps.md, docs/pr/2134-screen-session-limit-enforce/self-review.md
+- **Validation**: cargo build --release clean; cargo test --release green.
+  Live screen/flood smoke on the loss cluster is PENDING-PARENT.
 
 ## 2026-06-21 — #2173 (PR #2182) fold: v4-mapped-v6 host-mask family divergence
 
