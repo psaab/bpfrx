@@ -76,11 +76,31 @@ pub(super) fn request_runs_under_shared_exact_policy(
         .is_some_and(|queue_fast| queue_fast.shared_exact)
 }
 
+// #2208: test-only fault injection for the enqueue-failure control flow.
+// The owner-path `enqueue_tx_owned` swallows overflow today (it records a
+// redirect-inbox drop but returns Ok), so the `is_err()` arms in the
+// dispatch copy paths are not reachable from pure production inputs. They
+// ARE on the hot path (the function returns `Result<(), TxRequest>` and
+// the Err arm is compiled), and a future backpressure change would make
+// them live. This thread-local lets the dispatch tests drive the Err arm
+// deterministically to prove it recycles the ingress descriptor and runs
+// the slow-path fallback. It is `#[cfg(test)]` only — the production build
+// never sees the branch, so the hot path is unchanged.
+#[cfg(test)]
+thread_local! {
+    pub(super) static FORCE_ENQUEUE_ERR: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
 #[inline]
 pub(super) fn enqueue_local_request_to_target_or_owner(
     target_binding: &mut BindingWorker,
     req: TxRequest,
 ) -> Result<(), TxRequest> {
+    #[cfg(test)]
+    if FORCE_ENQUEUE_ERR.with(|c| c.get()) {
+        return Err(req);
+    }
     // #1598 secondary fix: gate on the routing-level `shared_exact`
     // flag rather than on `shared_queue_lease.is_some()`. The lease is
     // an exact-queue-only marker — non-exact uncapped queues run under
