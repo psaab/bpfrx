@@ -5700,6 +5700,144 @@ fn txn_nat64_refusal_at_cap_drops_translated_packet() {
     assert_eq!(dbg2.tx, 1);
 }
 
+// #2161: a successful NAT64 forward translation (v6 client SYN -> v4) must
+// bump the per-binding nat64_translations counter, and the matching v4
+// reply (v4 server -> v6 client, reverse session hit) must bump it again.
+// The counter previously stayed 0 even though the translated packets flowed
+// on the wire (observability gap caught in the #2132 NAT smoke). A refused
+// flow (table at cap, packet dropped) must NOT bump it.
+#[test]
+fn txn_nat64_translation_bumps_counter_both_directions() {
+    let mut snapshot = nat_snapshot();
+    snapshot.nat64_rules = vec![crate::protocol::NAT64RuleSnapshot {
+        name: "nat64".to_string(),
+        prefix: "64:ff9b::/96".to_string(),
+        pool_addresses: vec!["172.16.80.50".to_string()],
+        no_v6_frag_header: false,
+    }];
+    // The reverse v4->v6 reply forwards back to the v6 client on reth1.0;
+    // seed its neighbor so the reverse resolution is a usable ForwardCandidate
+    // (otherwise the reply would stall on MissingNeighbor and never reach the
+    // forward-candidate counting site — a fixture gap, not a code gap).
+    snapshot.neighbors.push(NeighborSnapshot {
+        interface: "reth1.0".to_string(),
+        ifindex: 24,
+        family: "inet6".to_string(),
+        ip: "2001:559:8585:ef00::102".to_string(),
+        mac: "02:aa:bb:cc:dd:ee".to_string(),
+        state: "reachable".to_string(),
+        router: false,
+        link_local: false,
+    });
+    let forwarding = build_forwarding_state(&snapshot);
+    let ha_state = txn_ha_state();
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, 24, 0);
+    binding.interface = Arc::<str>::from("reth1.0");
+    let mut sessions = SessionTable::new();
+
+    // Refused-at-cap case first: the translated trigger is dropped, so the
+    // counter must stay 0 (counting happens only on the admitted forward).
+    sessions.set_max_sessions_for_test(0);
+    let src: Ipv6Addr = "2001:559:8585:ef00::102".parse().expect("src v6");
+    let dst: Ipv6Addr = "64:ff9b::808:808".parse().expect("nat64 dst");
+    let fwd_frame = build_txn_tcp_syn_frame_v6(src, dst, 12345, 443);
+    let fwd_meta = UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+        ingress_ifindex: 24,
+        l3_offset: 14,
+        l4_offset: 54,
+        payload_offset: 74,
+        pkt_len: (fwd_frame.len() - 14) as u16,
+        addr_family: libc::AF_INET6 as u8,
+        protocol: PROTO_TCP,
+        tcp_flags: TCP_FLAG_SYN,
+        config_generation: 7,
+        fib_generation: 9,
+        ..UserspaceDpMeta::default()
+    };
+    let (refused_batch, refused_dbg) = txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &fwd_frame,
+        fwd_meta,
+    );
+    assert_eq!(refused_dbg.tx, 0, "refused NAT64 flow must not forward");
+    assert_eq!(
+        refused_batch.nat64_translations, 0,
+        "a dropped NAT64 trigger must not increment the translations counter"
+    );
+
+    // Below cap: the forward v6->v4 translation is admitted and counted once.
+    sessions.set_max_sessions_for_test(16);
+    let (fwd_batch, fwd_dbg) = txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &fwd_frame,
+        UserspaceDpMeta { ..fwd_meta },
+    );
+    assert_eq!(fwd_dbg.tx, 1, "admitted NAT64 forward must translate + forward");
+    assert_eq!(sessions.len(), 2, "NAT64 forward + reverse install");
+    assert_eq!(
+        fwd_batch.nat64_translations, 1,
+        "the admitted v6->v4 translation must bump the counter exactly once"
+    );
+
+    // Reverse: the v4 server reply (8.8.8.8:443 -> 172.16.80.50:12345 — the
+    // SNAT pool address, port preserved because forward_decision keeps the
+    // source port) hits the reverse session and translates v4->v6, bumping
+    // the counter again.
+    let pool_v4: Ipv4Addr = "172.16.80.50".parse().expect("pool v4");
+    let dst_v4: Ipv4Addr = "8.8.8.8".parse().expect("dst v4");
+    // SYN-ACK = SYN (0x02) | ACK (0x10). TCP_FLAG_ACK is not exported at the
+    // afxdp module level, so spell the ACK bit inline.
+    const ACK: u8 = 0x10;
+    let reply_frame = build_txn_tcp_syn_frame_v4(dst_v4, pool_v4, 443, 12345, TCP_FLAG_SYN | ACK);
+    let reply_meta = txn_meta_v4(24, TCP_FLAG_SYN | ACK, (reply_frame.len() - 14) as u16);
+    let (rev_batch, _rev_dbg) = txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &reply_frame,
+        reply_meta,
+    );
+    assert_eq!(
+        rev_batch.nat64_translations, 1,
+        "the v4->v6 reverse translation must bump the counter exactly once"
+    );
+}
+
+// #2161: BatchCounters.nat64_translations must flush into BindingLiveState
+// and survive into the snapshot the coordinator reads to build the wire
+// BindingStatus.nat64_translations the Go control plane sums. This guards
+// the deepest plumbing layer end to end (counter -> live atomic ->
+// snapshot) so a dropped flush line or a missed snapshot field is caught.
+#[test]
+fn nat64_translations_flushes_to_live_and_snapshot() {
+    let live = BindingLiveState::new();
+    let mut batch = BatchCounters::default();
+    // rx_telemetry sets `touched` for every RX packet before the
+    // forward-candidate counting site; mirror that so flush runs.
+    batch.touched = true;
+    batch.nat64_translations = 3;
+    batch.flush(&live);
+    assert_eq!(
+        batch.nat64_translations, 0,
+        "flush must zero the batched count"
+    );
+    let snap = live.snapshot();
+    assert_eq!(
+        snap.nat64_translations, 3,
+        "the live atomic + snapshot must carry the flushed NAT64 count"
+    );
+}
+
 // === #1873 R-C: blanket tunnel gate at the slow-path chokepoint ===
 
 fn tunnel_gate_test_fixture() -> (

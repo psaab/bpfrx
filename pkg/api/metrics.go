@@ -24,6 +24,7 @@ type xpfCollector struct {
 	screenDropsTotal     *prometheus.Desc
 	policyDeniesTotal    *prometheus.Desc
 	natAllocFailsTotal   *prometheus.Desc
+	nat64XlateTotal      *prometheus.Desc
 	hostInboundDeny      *prometheus.Desc
 	tcEgressPacketsTotal *prometheus.Desc
 	syncookieTotal       *prometheus.Desc
@@ -397,6 +398,7 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.screenDropsTotal
 	ch <- c.policyDeniesTotal
 	ch <- c.natAllocFailsTotal
+	ch <- c.nat64XlateTotal
 	ch <- c.hostInboundDeny
 	ch <- c.tcEgressPacketsTotal
 	ch <- c.syncookieTotal

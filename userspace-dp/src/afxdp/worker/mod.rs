@@ -1266,6 +1266,8 @@ pub(crate) struct BindingLiveSnapshot {
     pub(crate) policy_reject_reply_budget_drops: u64,
     pub(crate) snat_packets: u64,
     pub(crate) dnat_packets: u64,
+    /// #2161: cumulative NAT64 translations snapshotted from BindingLiveState.
+    pub(crate) nat64_translations: u64,
     pub(crate) slow_path_packets: u64,
     pub(crate) slow_path_bytes: u64,
     pub(crate) slow_path_local_delivery_packets: u64,

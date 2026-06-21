@@ -77,10 +77,10 @@ type ConfigSnapshot struct {
 	// catalog empty (every session keeps app_id 0, the existing default). The
 	// app_id values match CompileResult.AppNames so `show security flow
 	// session` resolves them back to names.
-	AppCatalog         []AppCatalogEntrySnapshot    `json:"app_catalog,omitempty"`
-	Config             *config.Config               `json:"config,omitempty"`
-	Userspace          config.UserspaceConfig       `json:"userspace"`
-	DeferWorkers       bool                         `json:"defer_workers,omitempty"`
+	AppCatalog   []AppCatalogEntrySnapshot `json:"app_catalog,omitempty"`
+	Config       *config.Config            `json:"config,omitempty"`
+	Userspace    config.UserspaceConfig    `json:"userspace"`
+	DeferWorkers bool                      `json:"defer_workers,omitempty"`
 	// #1620: cold-path latency histogram sample mask. *uint64 with
 	// omitempty so a nil pointer omits the field entirely from the
 	// wire (matching the Rust Option<u64>::None behavior). Default
@@ -104,16 +104,16 @@ type AddressBookSnapshot struct {
 }
 
 type FlowSnapshot struct {
-	AllowDNSReply      bool   `json:"allow_dns_reply,omitempty"`
-	AllowEmbeddedICMP  bool   `json:"allow_embedded_icmp,omitempty"`
-	TCPMSSAllTCP       int    `json:"tcp_mss_all_tcp,omitempty"`
-	TCPMSSIPsecVPN     int    `json:"tcp_mss_ipsec_vpn,omitempty"`
-	TCPMSSGreIn        int    `json:"tcp_mss_gre_in,omitempty"`
-	TCPMSSGreOut       int    `json:"tcp_mss_gre_out,omitempty"`
-	TCPSessionTimeout  int    `json:"tcp_session_timeout,omitempty"`  // seconds, 0=default
-	UDPSessionTimeout  int    `json:"udp_session_timeout,omitempty"`  // seconds, 0=default
-	ICMPSessionTimeout int    `json:"icmp_session_timeout,omitempty"` // seconds, 0=default
-	GREAcceleration    bool   `json:"gre_acceleration,omitempty"`     // extract GRE key into session ports
+	AllowDNSReply      bool `json:"allow_dns_reply,omitempty"`
+	AllowEmbeddedICMP  bool `json:"allow_embedded_icmp,omitempty"`
+	TCPMSSAllTCP       int  `json:"tcp_mss_all_tcp,omitempty"`
+	TCPMSSIPsecVPN     int  `json:"tcp_mss_ipsec_vpn,omitempty"`
+	TCPMSSGreIn        int  `json:"tcp_mss_gre_in,omitempty"`
+	TCPMSSGreOut       int  `json:"tcp_mss_gre_out,omitempty"`
+	TCPSessionTimeout  int  `json:"tcp_session_timeout,omitempty"`  // seconds, 0=default
+	UDPSessionTimeout  int  `json:"udp_session_timeout,omitempty"`  // seconds, 0=default
+	ICMPSessionTimeout int  `json:"icmp_session_timeout,omitempty"` // seconds, 0=default
+	GREAcceleration    bool `json:"gre_acceleration,omitempty"`     // extract GRE key into session ports
 	// PowerModeDisable carries `security flow power-mode-disable` (#2008 H14).
 	// On vSRX power-mode is an express datapath; disabling it forces the
 	// regular flow path. The userspace dataplane has a single forwarding path,
@@ -121,9 +121,9 @@ type FlowSnapshot struct {
 	// GREAcceleration plumbing) and is read on the Rust side for parity; it does
 	// not currently alter packet handling (there is no express/regular split to
 	// switch between).
-	PowerModeDisable   bool   `json:"power_mode_disable,omitempty"`
-	Lo0FilterInputV4   string `json:"lo0_filter_input_v4,omitempty"`  // lo0 inet input filter name
-	Lo0FilterInputV6   string `json:"lo0_filter_input_v6,omitempty"`  // lo0 inet6 input filter name
+	PowerModeDisable bool   `json:"power_mode_disable,omitempty"`
+	Lo0FilterInputV4 string `json:"lo0_filter_input_v4,omitempty"` // lo0 inet input filter name
+	Lo0FilterInputV6 string `json:"lo0_filter_input_v6,omitempty"` // lo0 inet6 input filter name
 	// ALGDisableFlags carries the `security alg <proto> disable` bitfield
 	// (bit 0: DNS, bit 1: FTP, bit 2: SIP, bit 3: TFTP — same layout as the
 	// legacy flow_config_map FlowConfigValue.ALGFlags). The userspace
@@ -1437,32 +1437,36 @@ type BindingStatus struct {
 	// Together: VMinThrottles = "fairness brake fired",
 	// VMinThrottleHardCapOverrides = "brake too tight, escape hatch
 	// rescued throughput". Ratio is the LAG_THRESHOLD diagnostic.
-	VMinThrottleHardCapOverrides   uint64 `json:"v_min_throttle_hard_cap_overrides,omitempty"`
-	VMinThrottles                  uint64 `json:"v_min_throttles,omitempty"`
-	SessionHits                    uint64 `json:"session_hits,omitempty"`
-	SessionMisses                  uint64 `json:"session_misses,omitempty"`
-	SessionCreates                 uint64 `json:"session_creates,omitempty"`
-	SessionExpires                 uint64 `json:"session_expires,omitempty"`
-	SessionDeltaPending            uint64 `json:"session_delta_pending,omitempty"`
-	SessionDeltaGenerated          uint64 `json:"session_delta_generated,omitempty"`
-	SessionDeltaDropped            uint64 `json:"session_delta_dropped,omitempty"`
-	SessionDeltaDrained            uint64 `json:"session_delta_drained,omitempty"`
-	PolicyDeniedPackets            uint64 `json:"policy_denied_packets,omitempty"`
-	ScreenDrops                    uint64 `json:"screen_drops,omitempty"`
-	SYNCookieChallenges            uint64 `json:"syn_cookie_challenges,omitempty"`
-	SYNCookieSecretUnavailable     uint64 `json:"syn_cookie_secret_unavailable,omitempty"`
-	SYNCookieSynAckSent            uint64 `json:"syn_cookie_syn_ack_sent,omitempty"`
-	SYNCookieAckRstSent            uint64 `json:"syn_cookie_ack_rst_sent,omitempty"`
-	SYNCookieReplyBudgetDrops      uint64 `json:"syn_cookie_reply_budget_drops,omitempty"`
-	SYNCookieAckValid              uint64 `json:"syn_cookie_ack_valid,omitempty"`
-	SYNCookieAckInvalid            uint64 `json:"syn_cookie_ack_invalid,omitempty"`
-	SYNCookieBypass                uint64 `json:"syn_cookie_bypass,omitempty"`
+	VMinThrottleHardCapOverrides uint64 `json:"v_min_throttle_hard_cap_overrides,omitempty"`
+	VMinThrottles                uint64 `json:"v_min_throttles,omitempty"`
+	SessionHits                  uint64 `json:"session_hits,omitempty"`
+	SessionMisses                uint64 `json:"session_misses,omitempty"`
+	SessionCreates               uint64 `json:"session_creates,omitempty"`
+	SessionExpires               uint64 `json:"session_expires,omitempty"`
+	SessionDeltaPending          uint64 `json:"session_delta_pending,omitempty"`
+	SessionDeltaGenerated        uint64 `json:"session_delta_generated,omitempty"`
+	SessionDeltaDropped          uint64 `json:"session_delta_dropped,omitempty"`
+	SessionDeltaDrained          uint64 `json:"session_delta_drained,omitempty"`
+	PolicyDeniedPackets          uint64 `json:"policy_denied_packets,omitempty"`
+	ScreenDrops                  uint64 `json:"screen_drops,omitempty"`
+	SYNCookieChallenges          uint64 `json:"syn_cookie_challenges,omitempty"`
+	SYNCookieSecretUnavailable   uint64 `json:"syn_cookie_secret_unavailable,omitempty"`
+	SYNCookieSynAckSent          uint64 `json:"syn_cookie_syn_ack_sent,omitempty"`
+	SYNCookieAckRstSent          uint64 `json:"syn_cookie_ack_rst_sent,omitempty"`
+	SYNCookieReplyBudgetDrops    uint64 `json:"syn_cookie_reply_budget_drops,omitempty"`
+	SYNCookieAckValid            uint64 `json:"syn_cookie_ack_valid,omitempty"`
+	SYNCookieAckInvalid          uint64 `json:"syn_cookie_ack_invalid,omitempty"`
+	SYNCookieBypass              uint64 `json:"syn_cookie_bypass,omitempty"`
 	// #2089: policy `reject` action — RST/ICMP-unreachable replies sent,
 	// and replies suppressed due to TX-frame budget exhaustion.
-	PolicyRejectSent               uint64 `json:"policy_reject_sent,omitempty"`
-	PolicyRejectReplyBudgetDrops   uint64 `json:"policy_reject_reply_budget_drops,omitempty"`
-	SNATPackets                    uint64 `json:"snat_packets,omitempty"`
-	DNATPackets                    uint64 `json:"dnat_packets,omitempty"`
+	PolicyRejectSent             uint64 `json:"policy_reject_sent,omitempty"`
+	PolicyRejectReplyBudgetDrops uint64 `json:"policy_reject_reply_budget_drops,omitempty"`
+	SNATPackets                  uint64 `json:"snat_packets,omitempty"`
+	DNATPackets                  uint64 `json:"dnat_packets,omitempty"`
+	// #2161: NAT64 (v6<->v4) translations on this binding. omitempty +
+	// the Rust serde `default` keep cross-version wire safety (#1961-class:
+	// an older helper omits the field, Go reads 0 rather than failing decode).
+	Nat64Translations              uint64 `json:"nat64_translations,omitempty"`
 	SlowPathPackets                uint64 `json:"slow_path_packets,omitempty"`
 	SlowPathBytes                  uint64 `json:"slow_path_bytes,omitempty"`
 	SlowPathLocalDeliveryPackets   uint64 `json:"slow_path_local_delivery_packets,omitempty"`

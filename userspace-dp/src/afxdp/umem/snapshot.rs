@@ -98,6 +98,7 @@ impl BindingLiveState {
                 .load(Ordering::Relaxed),
             snat_packets: self.snat_packets.load(Ordering::Relaxed),
             dnat_packets: self.dnat_packets.load(Ordering::Relaxed),
+            nat64_translations: self.nat64_translations.load(Ordering::Relaxed),
             slow_path_packets: self.slow_path_packets.load(Ordering::Relaxed),
             slow_path_bytes: self.slow_path_bytes.load(Ordering::Relaxed),
             slow_path_local_delivery_packets: self

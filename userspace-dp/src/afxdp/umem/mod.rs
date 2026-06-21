@@ -377,6 +377,9 @@ pub(in crate::afxdp) struct BindingLiveState {
     pub(super) policy_reject_reply_budget_drops: AtomicU64,
     pub(super) snat_packets: AtomicU64,
     pub(super) dnat_packets: AtomicU64,
+    /// #2161: cumulative NAT64 (v6<->v4) translations on this binding,
+    /// surfaced as the `NAT64 translations` operator counter.
+    pub(super) nat64_translations: AtomicU64,
     pub(super) slow_path_packets: AtomicU64,
     pub(super) slow_path_bytes: AtomicU64,
     pub(super) slow_path_local_delivery_packets: AtomicU64,
@@ -742,6 +745,7 @@ impl BindingLiveState {
             policy_reject_reply_budget_drops: AtomicU64::new(0),
             snat_packets: AtomicU64::new(0),
             dnat_packets: AtomicU64::new(0),
+            nat64_translations: AtomicU64::new(0),
             slow_path_packets: AtomicU64::new(0),
             slow_path_bytes: AtomicU64::new(0),
             slow_path_local_delivery_packets: AtomicU64::new(0),

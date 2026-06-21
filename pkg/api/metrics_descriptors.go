@@ -46,6 +46,11 @@ func newCollector(srv *Server) *xpfCollector {
 			"Total NAT port allocation failures.",
 			nil, nil,
 		),
+		nat64XlateTotal: prometheus.NewDesc(
+			"xpf_nat64_translations_total",
+			"Total NAT64 (IPv6<->IPv4) packet translations.",
+			nil, nil,
+		),
 		hostInboundDeny: prometheus.NewDesc(
 			"xpf_host_inbound_denies_total",
 			"Total host-inbound traffic denials.",

@@ -32,6 +32,8 @@ func (c *xpfCollector) collectGlobalCounters(ch chan<- prometheus.Metric, dp api
 		readCounter(dataplane.GlobalCtrPolicyDeny))
 	ch <- prometheus.MustNewConstMetric(c.natAllocFailsTotal, prometheus.CounterValue,
 		readCounter(dataplane.GlobalCtrNATAllocFail))
+	ch <- prometheus.MustNewConstMetric(c.nat64XlateTotal, prometheus.CounterValue,
+		readCounter(dataplane.GlobalCtrNAT64Xlate))
 	ch <- prometheus.MustNewConstMetric(c.hostInboundDeny, prometheus.CounterValue,
 		readCounter(dataplane.GlobalCtrHostInboundDeny))
 	ch <- prometheus.MustNewConstMetric(c.tcEgressPacketsTotal, prometheus.CounterValue,
