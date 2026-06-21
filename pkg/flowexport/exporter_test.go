@@ -140,6 +140,80 @@ func TestShouldExport(t *testing.T) {
 	}
 }
 
+// TestExporterSharesSingleSampleCounter is the #2224 fail-on-revert
+// guard: ExportConfig embeds the live 1-in-N sampleCounter
+// (atomic.Uint64), so it MUST be held by pointer everywhere. NewExporter
+// / NewIPFIXExporter take *ExportConfig and store that same pointer, so
+// the exporter's internal cfg, the daemon-held *ExportConfig, and the
+// session-close callback's ShouldExport all increment ONE counter.
+//
+// Revert the fix (cfg ExportConfig by value + NewExporter(*ec)) and this
+// test fails two ways: (1) the exporter's cfg is a distinct copy with a
+// freshly-zeroed counter, so sampling through it re-seeds the modulo
+// cadence; (2) go vet flags the "copies lock value" diagnostic that this
+// test's contract exists to prevent.
+func TestExporterSharesSingleSampleCounter(t *testing.T) {
+	const rate = 5
+	// Empty Collectors -> dialCollectors opens no sockets and returns no
+	// error, so the exporters construct without touching the network.
+	ec := &ExportConfig{SamplingRate: rate}
+
+	v9, err := NewExporter(ec)
+	if err != nil {
+		t.Fatalf("NewExporter: %v", err)
+	}
+	if v9.cfg != ec {
+		t.Fatalf("v9 exporter cfg is a value copy (%p) not the shared *ExportConfig (%p): "+
+			"copying forks the sampleCounter and re-seeds the 1-in-N cadence (#2224)", v9.cfg, ec)
+	}
+
+	ipfix, err := NewIPFIXExporter(ec)
+	if err != nil {
+		t.Fatalf("NewIPFIXExporter: %v", err)
+	}
+	if ipfix.cfg != ec {
+		t.Fatalf("ipfix exporter cfg is a value copy (%p) not the shared *ExportConfig (%p) (#2224)",
+			ipfix.cfg, ec)
+	}
+
+	// Drive the 1-in-N sampler across N packets through the SHARED config
+	// (no SamplingZones -> every packet is eligible). The counter
+	// increments per call (n := counter.Add(1)); ShouldExport returns true
+	// exactly when n % rate == 0. So packet k (1-indexed) samples iff
+	// k % rate == 0 -> exactly floor(N/rate) samples, evenly spaced.
+	const packets = 100
+	got := 0
+	for k := 1; k <= packets; k++ {
+		sampled := ec.ShouldExport(0, 0)
+		wantSampled := k%rate == 0
+		if sampled != wantSampled {
+			t.Fatalf("packet %d: ShouldExport=%v, want %v (cadence broke -> "+
+				"counter was forked, not shared)", k, sampled, wantSampled)
+		}
+		if sampled {
+			got++
+		}
+	}
+	want := packets / rate
+	if got != want {
+		t.Fatalf("sampled %d of %d packets at 1-in-%d, want %d", got, packets, rate, want)
+	}
+
+	// The shared counter has advanced to exactly `packets` — proving the
+	// exporters did not fork their own zeroed copies. If cfg were copied
+	// by value, v9.cfg/ipfix.cfg would each hold an independent counter
+	// still at 0 while only `ec`'s advanced.
+	if n := ec.sampleCounter.Load(); n != packets {
+		t.Fatalf("shared sampleCounter = %d, want %d", n, packets)
+	}
+	if n := v9.cfg.sampleCounter.Load(); n != packets {
+		t.Fatalf("v9 exporter sees sampleCounter = %d, want %d (counter forked)", n, packets)
+	}
+	if n := ipfix.cfg.sampleCounter.Load(); n != packets {
+		t.Fatalf("ipfix exporter sees sampleCounter = %d, want %d (counter forked)", n, packets)
+	}
+}
+
 func TestParseIfaceRef(t *testing.T) {
 	tests := []struct {
 		ref      string

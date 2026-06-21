@@ -23,10 +23,14 @@
 // every commit. Instead we register a single stable indirection
 // callback per family exactly once (flowCBOnce / ipfixCBOnce) that
 // reads the live (exporter, config) pair from an atomic.Pointer bundle;
-// reconcile swaps the bundle atomically. The exporter never reads the
-// config's 1-in-N sampleCounter (only the callback's ShouldExport
-// does), so the daemon-held *ExportConfig is the sole counter owner and
-// is held by pointer in the bundle.
+// reconcile swaps the bundle atomically. The resolved *ExportConfig is
+// held by pointer everywhere — in the bundle, by the session-close
+// callback's ShouldExport, AND inside the exporter (#2224) — so there is
+// exactly ONE live 1-in-N sampleCounter per family. ExportConfig embeds
+// that counter as an atomic.Uint64; passing it by value would copy the
+// atomic (a go-vet "copies lock value" failure) and fork the counter,
+// silently re-seeding the modulo cadence the moment any caller sampled
+// off the copy.
 package daemon
 
 import (
@@ -155,7 +159,7 @@ func (d *Daemon) reconcileV9Exporter(cfg *config.Config) bool {
 		return true
 	}
 
-	exp, err := flowexport.NewExporter(*ec)
+	exp, err := flowexport.NewExporter(ec)
 	if err != nil {
 		slog.Warn("failed to create flow exporter", "err", err)
 		// Do NOT record the hash on a create failure: NewExporter ->
@@ -228,7 +232,7 @@ func (d *Daemon) reconcileIPFIXExporter(cfg *config.Config) bool {
 		return true
 	}
 
-	exp, err := flowexport.NewIPFIXExporter(*ec)
+	exp, err := flowexport.NewIPFIXExporter(ec)
 	if err != nil {
 		slog.Warn("failed to create IPFIX exporter", "err", err)
 		// Do NOT record the hash on a create failure (see the v9 path):

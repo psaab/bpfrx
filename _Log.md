@@ -8710,3 +8710,24 @@ top.
   multi-match event in-order, so it does not reliably trip that one test).
 - **File(s)**: pkg/eventengine/engine_window_test.go (new),
   pkg/eventengine/README.md
+
+- **Timestamp**: 2026-06-21
+- **Action**: #2224 — fix flowexport ExportConfig atomic-copy (go vet
+  "copies lock value" + latent double-sampling). ExportConfig embeds the
+  live 1-in-N sampleCounter (atomic.Uint64); NewExporter/NewIPFIXExporter
+  took it by VALUE and the daemon called NewExporter(*ec) — six go-vet
+  "copies lock value" / "passes lock by value" diagnostics, and a forked
+  counter that re-seeds the sampling cadence if any caller ever sampled
+  off the exporter's copy. Fix: both exporters now hold *ExportConfig and
+  the constructors take *ExportConfig; daemon passes the bundle's ec
+  pointer directly, so exporter + bundle + ShouldExport share ONE counter.
+  Added fail-on-revert test TestExporterSharesSingleSampleCounter (pointer
+  identity + 1-in-N cadence across 100 packets on the shared counter;
+  reverting to value-type breaks compilation AND go vet). Scoped a
+  `go vet ./pkg/flowexport/...` gate into the Makefile test target (NOT
+  tree-wide: two pre-existing vet diagnostics live in cmd/cli + pkg/cli).
+  Build + vet (flowexport+daemon) clean; flowexport -race green; daemon
+  tests green.
+- **File(s)**: pkg/flowexport/netflow.go, pkg/flowexport/ipfix.go,
+  pkg/flowexport/exporter_test.go (new test),
+  pkg/daemon/daemon_flowexport.go, pkg/flowexport/README.md, Makefile
