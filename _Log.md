@@ -7514,3 +7514,8 @@ top.
 - **Validation**: `go test ./pkg/dhcprelay/ -race` 25/25 pass; config + cli +
   daemon green; `go build ./...` clean. Live flag0 wire-capture +
   test-failover pending parent-run (lab-gated).
+
+## 2026-06-20 — #2129+#2130 NetFlow v9 research (PLAN-READY drive)
+- **Timestamp**: 2026-06-20
+- **Action**: Drafted converged research plan for #2129 (v9 gating bug) + #2130 (dead Rust flow-export). Ground truth: v9 export works today, Go-side (pkg/flowexport off SESSION_CLOSE EventReader); Rust FlowExporter is dead (write-only flow_export_config, constructed only in tests). Decision PLAN-READY: gate v9 on Version9!=nil (mirror IPFIX) + remove dead Rust path (keep wire field documented-reserved).
+- **File(s)**: docs/research/2129-2130-netflow/plan.md (new)
