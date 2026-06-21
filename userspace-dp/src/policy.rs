@@ -695,8 +695,8 @@ pub(crate) fn parse_policy_state_with_counters(
         // term before publish (and emits a `__unsupported__` sentinel for the
         // failed-expansion case), so a normal Go snapshot never trips this; it
         // is the backstop for that sentinel and for any corrupt/non-Go
-        // snapshot. Genuinely-empty terms (`application any`) keep
-        // `had_terms == false`, `dropped_any == false`, and stay match-any.
+        // snapshot. Genuinely-empty terms (`application any`) drop nothing, so
+        // `dropped_any == false` and the rule stays match-any.
         let parsed = parse_applications(&snap.application_terms);
         if parsed.dropped_any {
             return Err(SnapshotIntegrityError::UnrepresentableApplicationProtocol {
