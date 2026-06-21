@@ -37,6 +37,9 @@ schedulers {
     }
 }
 security {
+    policy-stats {
+        system-wide enable;
+    }
     zones {
         security-zone dmz;
         security-zone trust;
@@ -133,6 +136,99 @@ func TestGetPoliciesExposesScheduledRuleCounters(t *testing.T) {
 		}
 	}
 	t.Fatal("scheduled-allow rule not found in gRPC response")
+}
+
+// newPolicyCounterGRPCStoreNoStats builds the same policy fixture as
+// newSchedulerCounterGRPCStore but WITHOUT `policy-stats system-wide
+// enable`, so the #2118 display gate must suppress the counters.
+func newPolicyCounterGRPCStoreNoStats(t *testing.T) *configstore.Store {
+	t.Helper()
+
+	store := newConfigStore(t, filepath.Join(t.TempDir(), "xpf.conf"))
+	if err := store.EnterConfigure(); err != nil {
+		t.Fatalf("EnterConfigure() error = %v", err)
+	}
+	if err := store.LoadOverride(`
+schedulers {
+    scheduler workhours {
+        daily;
+    }
+}
+security {
+    zones {
+        security-zone dmz;
+        security-zone trust;
+        security-zone untrust;
+    }
+    policies {
+        from-zone trust to-zone dmz {
+            policy plain-allow {
+                match { source-address any; destination-address any; application any; }
+                then { permit; }
+            }
+        }
+        from-zone trust to-zone untrust {
+            policy scheduled-allow {
+                match { source-address any; destination-address any; application any; }
+                then { permit; count; }
+                scheduler-name workhours;
+            }
+        }
+        global {
+            policy global-scheduled {
+                match { source-address any; destination-address any; application any; }
+                then { permit; count; }
+                scheduler-name workhours;
+            }
+        }
+    }
+}
+`); err != nil {
+		t.Fatalf("LoadOverride() error = %v", err)
+	}
+	if _, err := store.Commit(); err != nil {
+		t.Fatalf("Commit() error = %v", err)
+	}
+	if cfg := store.ActiveConfig(); cfg == nil || cfg.Security.PolicyStatsEnabled {
+		t.Fatal("test precondition: policy-stats must be disabled in this store")
+	}
+	return store
+}
+
+// TestGetPoliciesGatesCountersOnPolicyStats verifies the #2118 display
+// gate: with a fully populated dataplane but `policy-stats` OFF, the
+// structured GetPolicies response reports zero HitPackets/HitBytes —
+// matching the Prometheus collector (#2008 M4) and the CLI/gRPC text
+// surfaces. Without the gate the same fixture (verified nonzero by
+// TestGetPoliciesExposesScheduledRuleCounters) would leak live counts.
+func TestGetPoliciesGatesCountersOnPolicyStats(t *testing.T) {
+	store := newPolicyCounterGRPCStoreNoStats(t)
+	policyID := scheduledCounterGRPCPolicyID(t, store)
+	s := &Server{
+		store: store,
+		dp: &schedulerCounterGRPCDP{
+			Manager: dataplane.New(),
+			counters: map[uint32]dataplane.CounterValue{
+				1:                               {Packets: 99, Bytes: 9900},
+				policyID:                        {Packets: 23, Bytes: 2300},
+				dataplane.MaxRulesPerPolicy * 2: {Packets: 31, Bytes: 3100},
+			},
+		},
+	}
+
+	resp, err := s.GetPolicies(context.Background(), &pb.GetPoliciesRequest{})
+	if err != nil {
+		t.Fatalf("GetPolicies() error = %v", err)
+	}
+	for _, policy := range resp.GetPolicies() {
+		for _, rule := range policy.GetRules() {
+			if rule.GetHitPackets() != 0 || rule.GetHitBytes() != 0 {
+				t.Fatalf("policy %s->%s rule %q: counters = %d/%d, want 0/0 (policy-stats off)",
+					policy.GetFromZone(), policy.GetToZone(), rule.GetName(),
+					rule.GetHitPackets(), rule.GetHitBytes())
+			}
+		}
+	}
 }
 
 func TestGetPoliciesExposesGlobalScheduledRuleCounters(t *testing.T) {
