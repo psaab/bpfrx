@@ -792,6 +792,19 @@ func newCollector(srv *Server) *xpfCollector {
 				"reconcile) (#1789).",
 			nil, nil,
 		),
+		userspaceDnatPublishErrors: prometheus.NewDesc(
+			"xpf_userspace_dnat_publish_errors_total",
+			"Failed dnat_table reverse-SNAT BPF-map publishes across "+
+				"userspace workers. The dnat_table backs embedded-ICMP NAT "+
+				"reversal — the reverse lookup that maps an inbound ICMP "+
+				"error (PMTUD Packet Too Big / Time Exceeded / traceroute) "+
+				"back to the original pre-NAT source. A failed publish (map "+
+				"at capacity, EINVAL, kernel resource exhaustion) silently "+
+				"omits the reverse record, so the error is dropped or "+
+				"mis-delivered; a rising value attributes that loss to "+
+				"dnat_table map-capacity pressure (#2244).",
+			nil, nil,
+		),
 		userspaceWorkerCommandQueuePoisonRecoveries: prometheus.NewDesc(
 			"xpf_userspace_worker_command_queue_poison_recoveries_total",
 			"Worker command-queue mutex poison recoveries across all "+

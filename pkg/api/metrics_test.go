@@ -787,6 +787,12 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 			nil,
 			nil,
 		),
+		userspaceDnatPublishErrors: prometheus.NewDesc(
+			"xpf_userspace_dnat_publish_errors_total",
+			"dnat publish errors",
+			nil,
+			nil,
+		),
 		// #1861 install-refusal trio.
 		userspaceSessionCreateDrops: prometheus.NewDesc(
 			"xpf_userspace_session_create_drops_total",
@@ -842,6 +848,9 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 		MaxSessions:         100,
 		// #1789: publish-error counter emitted unconditionally.
 		SessionPublishErrorsTotal: 6,
+		// #2244: dnat_table reverse-NAT publish-error counter emitted
+		// unconditionally.
+		DnatPublishErrorsTotal: 7,
 		// #1760 W3': shared-map displacement counter emitted unconditionally.
 		NatReverseKeySharedDisplacementsTotal: 4,
 		// #1807: poison-recovery counter emitted unconditionally.
@@ -879,9 +888,10 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 	for m := range ch {
 		got = append(got, m)
 	}
-	// 10 pre-#1861 metrics + the #1861 install-refusal trio = 13.
-	if len(got) != 13 {
-		t.Fatalf("emitUserspaceDynamicBufferMetrics: want 13 metrics, got %d", len(got))
+	// 10 pre-#1861 metrics + the #1861 install-refusal trio + the #2244
+	// dnat_table reverse-NAT publish-error counter = 14.
+	if len(got) != 14 {
+		t.Fatalf("emitUserspaceDynamicBufferMetrics: want 14 metrics, got %d", len(got))
 	}
 
 	assertGaugeClose(t, got, c.userspaceSessionTableEntries, nil, 77)
@@ -891,6 +901,9 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 	assertCounterClose(t, got, c.userspaceNatReverseKeyCollisions, nil, 0)
 	// #1789: publish-error counter emitted unconditionally.
 	assertCounterClose(t, got, c.userspaceSessionPublishErrors, nil, 6)
+	// #2244: dnat_table reverse-NAT publish-error counter emitted
+	// unconditionally.
+	assertCounterClose(t, got, c.userspaceDnatPublishErrors, nil, 7)
 	// #1760 W3': shared-map displacement counter emitted unconditionally.
 	assertCounterClose(t, got, c.userspaceNatReverseKeySharedDisplacements, nil, 4)
 	// #1807: poison-recovery counter emitted unconditionally.

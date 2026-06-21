@@ -494,6 +494,15 @@ func (c *xpfCollector) emitUserspaceDynamicBufferMetrics(ch chan<- prometheus.Me
 		float64(status.SessionPublishErrorsTotal),
 	)
 
+	// #2244: failed dnat_table reverse-SNAT BPF-map publishes. Also
+	// emitted unconditionally so a 0 is a real "no reverse-NAT publish
+	// failures" signal rather than an absent series.
+	ch <- prometheus.MustNewConstMetric(
+		c.userspaceDnatPublishErrors,
+		prometheus.CounterValue,
+		float64(status.DnatPublishErrorsTotal),
+	)
+
 	// #1760 W3': shared-map NAT reverse-key displacement events. Emitted
 	// unconditionally so a 0 is a real "no collisions" signal rather
 	// than an absent series.
