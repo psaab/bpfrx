@@ -21,6 +21,21 @@
   to FAIL against the pre-fix gate; 5/5 flake on TestRunRelay_RelaysInform;
   go vet clean. Control-plane relay change — no loss-cluster smoke
   required (lab-gated per #2115).
+- **Review-driven fixes (PR #2164)**: Copilot flagged a stale README row
+  claiming NAK is forwarded (handleServerResponses forwards OFFER/ACK
+  only) — corrected. Codex hostile review found a real hop-count wrap on
+  the forward path that INFORM newly exercises: HopCount is uint8 and the
+  "> 16" check ran AFTER the ++ , so an incoming 255 wrapped to 0 and was
+  relayed (loop protection defeated). Fixed to enforce the RFC 1542
+  4.1.1 limit BEFORE incrementing (drop on HopCount >= 16) +
+  TestRunRelay_HopCountLimit (255 case non-tautological). Also corrected
+  the DECLINE doc comment (DECLINE is broadcast per RFC 2131 4.4.1, not
+  unicast-to-server).
+- **Out of scope (follow-ups noted, NOT fixed here)**: NAK is silently
+  dropped by handleServerResponses (pre-existing, separate from the
+  INFORM forward gate); giaddr is overwritten even when already nonzero
+  (second-hop relay, RFC 1542/3046 — pre-existing, affects
+  DISCOVER/REQUEST identically). Both predate #2153.
 
 ## 2026-06-20 — #2118 policy hit-count display-gate consistency
 
