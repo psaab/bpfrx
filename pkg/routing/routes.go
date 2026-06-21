@@ -202,32 +202,37 @@ func (rr *routeReader) routeToEntry(r netlink.Route, family int) RouteEntry {
 }
 
 // rtProtoName maps a netlink route protocol to its xpf protocol name.
+//
+// The argument is the kernel rtnetlink rtm_protocol byte. FRR's zebra
+// stamps each FIB route with the originating daemon's RTPROT_* value
+// (bgpd->BGP, ospfd/ospf6d->OSPF, isisd->ISIS, ripd/ripngd->RIP);
+// zebra/staticd-originated routes appear as RTPROT_ZEBRA. The numeric
+// comments record the constant values for the reader. Protocol bytes
+// xpf does not recognize fall through to their numeric string. The
+// returned name feeds protoTag()/junosProtoName() in routeformat.go.
 func rtProtoName(p netlink.RouteProtocol) string {
-	pi := int(p)
-	switch pi {
-	case unix.RTPROT_REDIRECT:
+	switch int(p) {
+	case unix.RTPROT_REDIRECT: // 1
 		return "redirect"
-	case unix.RTPROT_KERNEL:
+	case unix.RTPROT_KERNEL: // 2
 		return "connected"
-	case unix.RTPROT_BOOT:
+	case unix.RTPROT_BOOT: // 3
 		return "dhcp"
-	case unix.RTPROT_STATIC:
+	case unix.RTPROT_STATIC: // 4
 		return "static"
-	case 16: // RTPROT_DHCP
+	case unix.RTPROT_ZEBRA: // 11 — FRR zebra/staticd-installed routes
+		return "static"
+	case unix.RTPROT_DHCP: // 16
 		return "dhcp"
-	case 11:
-		return "ospf"
-	case 12:
-		return "isis"
-	case 186:
+	case unix.RTPROT_BGP: // 186
 		return "bgp"
-	case 188:
+	case unix.RTPROT_ISIS: // 187
+		return "isis"
+	case unix.RTPROT_OSPF: // 188
 		return "ospf"
-	case 189:
+	case unix.RTPROT_RIP: // 189
 		return "rip"
-	case 196:
-		return "static" // RTPROT_ZEBRA — FRR staticd-installed routes
 	default:
-		return strconv.Itoa(pi)
+		return strconv.Itoa(int(p))
 	}
 }
