@@ -626,12 +626,21 @@ pub(crate) fn build_nat64_v4_to_v6_frame(
 }
 
 /// Find the L3 offset by checking Ethernet type/VLAN.
+///
+/// #2150: a single 0x88a8 (802.1ad) tag carries the same 4-byte
+/// TPID+TCI layout as 0x8100, so the L3 header sits at offset 18, not
+/// 14. The previous `== 0x8100` check treated a 0x88a8-tagged frame as
+/// untagged (l3=14) and read the IP header 4 bytes into the VLAN tag,
+/// corrupting any NAT64 translation of a provider-tagged frame. This
+/// now matches the canonical L2 contract
+/// (`afxdp/frame/inspect.rs::frame_l3_offset`,
+/// `afxdp/cos/ecn.rs::ethernet_l3`, `afxdp/parser.rs::parse_eth_offsets`).
 fn frame_l3_offset(frame: &[u8]) -> Option<usize> {
     if frame.len() < 14 {
         return None;
     }
     let ethertype = u16::from_be_bytes([frame[12], frame[13]]);
-    if ethertype == 0x8100 {
+    if matches!(ethertype, 0x8100 | 0x88a8) {
         if frame.len() < 18 {
             return None;
         }

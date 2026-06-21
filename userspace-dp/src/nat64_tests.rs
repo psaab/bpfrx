@@ -1010,3 +1010,82 @@ fn nat64_state_threads_no_v6_frag_header_from_snapshot() {
         "from_snapshots must surface the no_v6_frag_header flag"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #2150: NAT64 L2 offset must agree with the canonical contract on a single
+// 0x88a8 (802.1ad) tag. Pre-fix `frame_l3_offset` matched only 0x8100, so a
+// 0x88a8-tagged frame was treated as untagged (l3=14) and the IP header was
+// read 4 bytes into the VLAN tag → corrupted translation. This canary FAILS on
+// pre-fix code (l3=14) and passes after (l3=18).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn nat64_l2_offset_canary() {
+    // dst+src MAC, then the outer ethertype slot.
+    let mut frame = vec![0u8; 14];
+    frame[12] = 0x88;
+    frame[13] = 0xa8; // 802.1ad
+    frame.extend_from_slice(&0x0064u16.to_be_bytes()); // TCI VID 100
+    frame.extend_from_slice(&0x86ddu16.to_be_bytes()); // inner ethertype
+    frame.extend_from_slice(&[0u8; 64]); // body
+
+    // Single 0x88a8 tag → l3 at 18, matching frame/inspect::frame_l3_offset.
+    assert_eq!(frame_l3_offset(&frame), Some(18));
+
+    // 0x8100 still maps to 18.
+    frame[12] = 0x81;
+    frame[13] = 0x00;
+    assert_eq!(frame_l3_offset(&frame), Some(18));
+
+    // Untagged (inner ethertype directly at 12..14) → l3 at 14.
+    let untagged = {
+        let mut f = vec![0u8; 14];
+        f[12] = 0x86;
+        f[13] = 0xdd;
+        f.extend_from_slice(&[0u8; 64]);
+        f
+    };
+    assert_eq!(frame_l3_offset(&untagged), Some(14));
+}
+
+#[test]
+fn nat64_v4_to_v6_frame_reads_ip_at_offset_18_under_8021ad() {
+    // End-to-end proof: a 0x88a8-tagged IPv4 frame fed to the reverse NAT64
+    // builder reads the IPv4 header at offset 18 (not 14). Pre-fix the
+    // builder offset the IP read into the VLAN tag and translate_v4_to_v6
+    // would see a corrupted (version != 4) header.
+    let src_v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+    let dst_v6: Ipv6Addr = "64:ff9b::c633:6432".parse().unwrap();
+    let inner = make_ipv4_tcp_packet(
+        Ipv4Addr::new(198, 51, 100, 50),
+        Ipv4Addr::new(198, 51, 100, 1),
+        80,
+        12345,
+        b"x",
+    );
+
+    let mut frame = Vec::new();
+    frame.extend_from_slice(&[0xaa; 6]); // dst
+    frame.extend_from_slice(&[0xbb; 6]); // src
+    frame.extend_from_slice(&0x88a8u16.to_be_bytes()); // 802.1ad TPID
+    frame.extend_from_slice(&0x0064u16.to_be_bytes()); // TCI VID 100
+    frame.extend_from_slice(&0x0800u16.to_be_bytes()); // inner: IPv4
+    frame.extend_from_slice(&inner);
+
+    let out = build_nat64_v4_to_v6_frame(
+        &frame,
+        src_v6,
+        dst_v6,
+        [0x11; 6],
+        [0x22; 6],
+        100, // emit a VLAN-tagged output
+    )
+    .expect("v4->v6 build must succeed for an 0x88a8-tagged input");
+
+    // The output IPv6 header (after the rebuilt eth+vlan = 18 bytes) must be
+    // a valid IPv6 header (version nibble 6), proving the inner IPv4 was read
+    // from offset 18, not from inside the VLAN tag.
+    assert_eq!(u16::from_be_bytes([out[12], out[13]]), 0x8100);
+    assert_eq!(u16::from_be_bytes([out[16], out[17]]), 0x86dd);
+    assert_eq!(out[18] >> 4, 6, "translated payload must be a valid IPv6 header");
+}

@@ -16,7 +16,9 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 
-use super::ethernet::{ETH_HDR_LEN, ETHERTYPE_ARP, ETHERTYPE_IPV6, ETHERTYPE_VLAN, VLAN_TAG_LEN};
+use super::ethernet::{
+    ETH_HDR_LEN, ETHERTYPE_ARP, ETHERTYPE_IPV6, ETHERTYPE_VLAN, ETHERTYPE_VLAN_8021AD, VLAN_TAG_LEN,
+};
 
 const ARP_BODY_LEN: usize = 28;
 const IPV6_HDR_LEN: usize = 40;
@@ -26,18 +28,31 @@ const ICMPV6_TYPE_NA: u8 = 136;
 const ARP_OP_REPLY: u16 = 2;
 const NDP_OPT_TARGET_LL: u8 = 2;
 
-/// Resolve the L3-header offset and the EtherType. Handles both
-/// untagged and 802.1Q VLAN-tagged frames.
+/// Resolve the L3-header offset and the EtherType. Handles untagged
+/// and single-tagged frames carrying either an 802.1Q (0x8100) or an
+/// 802.1ad (0x88a8) VLAN tag.
 ///
 /// Returns `(l3_start, ethertype)` if the frame is large enough to
 /// contain the L2 header, otherwise `None`.
+///
+/// #2150: 0x88a8 was previously treated as the inner ethertype (l3=14),
+/// which made a single-0x88a8-tagged ARP/NDP frame parse as a non-IP /
+/// non-ARP frame and silently skip neighbor learning. Both forwarding
+/// L2 parsers (`frame/inspect.rs::frame_l3_offset`,
+/// `cos/ecn.rs::ethernet_l3`) already treat 0x88a8 as a single tag with
+/// l3 at 18; this learning parser must agree. A QinQ DOUBLE tag (a tag
+/// whose inner ethertype is itself a VLAN TPID) is NOT unwound here —
+/// the upstream XDP shim drops double-tagged frames before they reach
+/// userspace, so the canonical contract is "single tag → l3=18; the
+/// inner (possibly still-VLAN) ethertype is returned as-is". The
+/// canary in parser_tests.rs pins this agreement across all L2 parsers.
 #[inline(always)]
 pub(super) fn parse_eth_offsets(raw_frame: &[u8]) -> Option<(usize, u16)> {
     if raw_frame.len() < ETH_HDR_LEN {
         return None;
     }
     let outer_ethertype = u16::from_be_bytes([raw_frame[12], raw_frame[13]]);
-    if outer_ethertype == ETHERTYPE_VLAN {
+    if matches!(outer_ethertype, ETHERTYPE_VLAN | ETHERTYPE_VLAN_8021AD) {
         if raw_frame.len() < ETH_HDR_LEN + VLAN_TAG_LEN {
             return None;
         }
@@ -126,6 +141,18 @@ pub(super) struct NdpNeighborAdvert {
 /// is not an NA or is too short. Handles VLAN-tagged frames.
 ///
 /// Replaces the inline parser at `afxdp.rs:948-1014` (pre-#947).
+///
+/// #2150: previously this assumed ICMPv6 sat at a fixed `l3 + 40` and
+/// read the base `next_header` (`raw[l3 + 6]`) directly, so an NA that
+/// arrived behind an IPv6 extension header (hop-by-hop, dest-options,
+/// routing, fragment) was missed — the exact asymmetry the
+/// forwarding/screen walkers (#2148/#2189) were written to avoid. It now
+/// reuses the shared #2148 walker `packet_rel_l4_offset_and_protocol`
+/// over the L3-relative slice to locate the real L4 offset and confirm
+/// the terminal protocol is ICMPv6 (58). The walker keeps its existing
+/// 6-iteration bound, so behavior is byte-identical for the no-ext-header
+/// case (offset == l3 + 40, protocol == 58). The parser-agreement canary
+/// in parser_tests.rs pins this against the forwarding walker.
 #[inline(always)]
 pub(super) fn parse_ndp_neighbor_advert(raw_frame: &[u8]) -> Option<NdpNeighborAdvert> {
     let (l3_start, ethertype) = parse_eth_offsets(raw_frame)?;
@@ -135,9 +162,15 @@ pub(super) fn parse_ndp_neighbor_advert(raw_frame: &[u8]) -> Option<NdpNeighborA
     if raw_frame.len() < l3_start + IPV6_HDR_LEN {
         return None;
     }
-    let next_header = raw_frame[l3_start + 6];
-    let l4_start = l3_start + IPV6_HDR_LEN;
-    if next_header != NEXT_HEADER_ICMPV6
+    // Walk the IPv6 extension-header chain (shared #2148 engine) to find
+    // the real L4 offset + terminal protocol. The walker operates on the
+    // L3-relative slice; translate its relative offset back to a
+    // frame-absolute offset.
+    let l3_slice = raw_frame.get(l3_start..)?;
+    let (rel_l4, protocol) =
+        super::frame::packet_rel_l4_offset_and_protocol(l3_slice, libc::AF_INET6 as u8)?;
+    let l4_start = l3_start.checked_add(rel_l4)?;
+    if protocol != NEXT_HEADER_ICMPV6
         || raw_frame.len() < l4_start + ICMPV6_NA_HDR_LEN
         || raw_frame[l4_start] != ICMPV6_TYPE_NA
     {
