@@ -64,26 +64,46 @@ pub(super) fn check_tcp_flag_screens(
     None
 }
 
-/// Ping of Death: oversized ICMP (>65535 bytes total length).
+/// Ping of Death: an IPv4 fragment whose contribution to the
+/// reassembled datagram would exceed the 65535-byte IP length limit.
 ///
-/// Mirror of the BPF screen `SCREEN_PING_OF_DEATH` check. With the
-/// current `ScreenPacketInfo::pkt_len: u16` shape the cast-to-u32
-/// comparison `pkt.pkt_len as u32 > 65535` is structurally
-/// unreachable (the u16 maxes at 65535), but the predicate is kept
-/// intact for BPF parity and so the check fires automatically if a
-/// future widening of `pkt_len` (e.g. to track reassembled
-/// IPv6-jumbo payloads) restores the oversized case without a code
-/// change here.
+/// Ports the authoritative BPF screen `SCREEN_PING_OF_DEATH` formula
+/// (#2215, restored from #893 / `git show
+/// 13fa1009e^:bpf/xdp/xdp_screen.c`). The dataplane does not reassemble
+/// fragments, so the classic ping-of-death (many small fragments that
+/// reassemble to >65535 bytes) is detected per-fragment from the
+/// fragment offset plus this fragment's total length:
+///
+/// ```text
+///   offset_bytes = (frag_off & 0x1FFF) << 3   // 8-byte fragment units
+///   if offset_bytes + ip_total_len > 65535 -> drop
+/// ```
+///
+/// Applies to ANY IPv4 protocol (not just ICMP) and only to fragmented
+/// packets, exactly matching the BPF reference. The pre-#2215 userspace
+/// port reverted to the original pre-#893 dead-code shape (an
+/// ICMP-only `pkt.pkt_len as u32 > 65535` predicate that is structurally
+/// unsatisfiable because `pkt_len` is a u16), so fragment-based
+/// ping-of-death went entirely undetected.
+///
+/// Limitation (inherited from #893): a first fragment carrying IP
+/// options combined with non-first fragments without them can craft
+/// `offset_bytes + ip_total_len <= 65535` while the reassembled total
+/// overflows by up to 40 bytes. Operators concerned about this should
+/// also enable the `ip-source-route` screen, which drops any IPv4
+/// packet with `ihl > 5`. IPv4 only — IPv6 ping-of-death would need
+/// reassembled-length tracking across NEXTHDR_FRAGMENT and is not
+/// covered by the BPF reference either.
 #[inline]
 pub(super) fn check_ping_of_death(
     profile: &ScreenProfile,
     pkt: &ScreenPacketInfo,
 ) -> Option<&'static str> {
-    if profile.ping_death
-        && (pkt.protocol == PROTO_ICMP || pkt.protocol == PROTO_ICMPV6)
-        && pkt.pkt_len as u32 > 65535
-    {
-        return Some("ping-of-death");
+    if profile.ping_death && pkt.addr_family == libc::AF_INET as u8 && pkt.is_fragment {
+        let offset_bytes = ((pkt.ip_frag_off & 0x1FFF) as u32) << 3;
+        if offset_bytes + pkt.ip_total_len as u32 > 65535 {
+            return Some("ping-of-death");
+        }
     }
     None
 }
