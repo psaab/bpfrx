@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/netip"
 	"os"
@@ -409,22 +410,28 @@ func parseLeaseCSV(path string, now time.Time) ([]Lease, error) {
 	}
 	defer f.Close()
 
+	// Read the memfile RECORD-BY-RECORD rather than with ReadAll so a
+	// single torn/concurrent Kea append (Kea appends a row on every
+	// renewal/release/decline/reclaim while we read) does not blank the
+	// entire `show dhcp server leases` (#2154). ReadAll aborts on the
+	// FIRST malformed record and returns (nil, err); the per-record loop
+	// logs and SKIPS the bad row, keeping every valid lease around it.
+	// This is the I/O-layer companion to #2085's per-record semantic
+	// leniency (dedup/expire/state) — #2085 made the SEMANTICS lenient
+	// but left the READ all-or-nothing.
+	//
+	// FieldsPerRecord = -1 means a short concurrent line is not even an
+	// error; csv.Read() also RECOVERS after a *csv.ParseError (the next
+	// Read returns the following valid record or io.EOF), so the skip
+	// loop terminates naturally rather than spinning.
 	r := csv.NewReader(f)
-	r.FieldsPerRecord = -1 // memfile rows can vary across Kea versions
+	r.FieldsPerRecord = -1 // memfile rows can vary across Kea versions / torn appends
 	r.Comment = '#'
-	records, err := r.ReadAll()
-	if err != nil {
-		return nil, fmt.Errorf("parse %s: %w", path, err)
-	}
-	if len(records) < 2 {
-		return nil, nil
-	}
 
-	// Parse CSV header to find column indices
-	cols := make(map[string]int)
-	for i, h := range records[0] {
-		cols[h] = i
-	}
+	// cols maps header name -> column index; it stays nil until the
+	// first successful record (the header) is read. field() reads a named
+	// column out of a data row.
+	var cols map[string]int
 	field := func(fields []string, name string) string {
 		if idx, ok := cols[name]; ok && idx >= 0 && idx < len(fields) {
 			return fields[idx]
@@ -438,12 +445,37 @@ func parseLeaseCSV(path string, now time.Time) ([]Lease, error) {
 	// so the display is stable and deterministic. Re-recording the
 	// disposition on every row lets a later active append RECLAIM an
 	// address an earlier row tombstoned (release-then-reallocate).
-	latest := make(map[string]Lease, len(records)-1)
-	order := make([]string, 0, len(records)-1)
-	seen := make(map[string]struct{}, len(records)-1)
+	latest := make(map[string]Lease)
+	order := make([]string, 0)
+	seen := make(map[string]struct{})
 	nowUnix := now.Unix()
 
-	for _, fields := range records[1:] {
+	for {
+		fields, err := r.Read()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			// Torn/concurrent Kea append or an exotic malformed row.
+			// Skip just this record and keep reading the rest (#2154);
+			// csv.Read recovers on the next call. Debug, not Warn: a
+			// persistently corrupt file is polled once per `show`, and
+			// the issue mandates debug-level so a busy network does not
+			// spam the log.
+			slog.Debug("dhcpserver: skipping malformed lease row",
+				"path", path, "err", err)
+			continue
+		}
+		if cols == nil {
+			// First successful record is the header; build the column
+			// index map and move on (mirrors the old records[0]).
+			cols = make(map[string]int, len(fields))
+			for i, h := range fields {
+				cols[h] = i
+			}
+			continue
+		}
+
 		addr := field(fields, "address")
 		if addr == "" {
 			continue
@@ -485,6 +517,14 @@ func parseLeaseCSV(path string, now time.Time) ([]Lease, error) {
 			ExpireTime: expireStr,
 			SubnetID:   field(fields, "subnet_id"),
 		}
+	}
+
+	if cols == nil {
+		// No header row was ever read (empty file, comment-only file, or
+		// a file whose only line was malformed). Mirrors the old
+		// len(records) < 2 ⇒ nil,nil guard. A header-only file falls
+		// through with an empty order and returns nil,nil below.
+		return nil, nil
 	}
 
 	leases := make([]Lease, 0, len(order))

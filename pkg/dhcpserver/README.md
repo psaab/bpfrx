@@ -86,7 +86,18 @@ What increment 1 ships (the fully unit-testable, lab-free slice):
   authorizes deleting owned DNS records), so it must hard-error on a
   mangled / duplicate-column / ragged header; the display parser is
   **non-destructive and lenient** — an exotic or short row must degrade
-  to showing what it can, never blank the whole `show`. Merging them
+  to showing what it can, never blank the whole `show`. That leniency is
+  enforced at BOTH layers: #2085 made the per-record SEMANTICS lenient
+  (dedup/expire/state), and #2154 made the READ itself robust — the
+  display parser reads the memfile record-by-record (`csv.Reader.Read`)
+  and logs+SKIPS a malformed row (torn/concurrent Kea append, e.g. an
+  unterminated quote on the in-progress last line) instead of `ReadAll`'s
+  all-or-nothing abort, which used to blank `show dhcp server leases`
+  exactly when lease churn was highest. (`FieldsPerRecord = -1` makes a
+  short concurrent line a non-event, and `csv.Read` recovers after a
+  `*csv.ParseError`, so the skip loop terminates naturally.) The DDNS
+  parser keeps the opposite posture by design: there a torn/short row is
+  delete-UNSAFE, so it is rejected, not skipped. Merging the two parsers
   would force one posture onto the other (re-opening the #1387
   mass-delete, or blanking the display on one bad row). Header columns are
   matched CASE-INSENSITIVELY (both the header keys AND the lookup name are
