@@ -81,3 +81,36 @@ pub(crate) enum ScreenVerdict {
     Drop(&'static str),
     SynCookieChallenge(SynCookieChallenge),
 }
+
+/// Reason an L3 header could not be parsed far enough to evaluate the
+/// screen checks. Any variant means the extractor could NOT prove the
+/// packet is benign for the fragment/TCP screens, so the caller MUST
+/// fail CLOSED (drop) rather than admit a frame whose fragmentation or
+/// L4 flags it was unable to read (#2146).
+///
+/// The legacy BPF `parse_ipv6hdr` returned `-1` on the same condition,
+/// which dropped the frame earlier in the (now-retired #1373/#1476)
+/// pipeline. With no upstream BPF screen path left, the extractor is
+/// the only place that can enforce the defense.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ScreenParseError {
+    /// The IPv6 extension-header chain was truncated before the walk
+    /// could reach the upper-layer (or FRAGMENT) header — the frame is
+    /// too short to contain the headers its own chaining claims. A
+    /// SYN-bearing frame with a truncated FRAGMENT header would
+    /// otherwise leave `is_first_fragment=false` and silently bypass
+    /// the `syn-frag` screen.
+    TruncatedIpv6ExtChain,
+}
+
+impl ScreenParseError {
+    /// Stable screen-drop reason string for the fail-closed verdict.
+    /// Mapped to `SCREEN_IP_MALFORMED` in the event-emit reason table
+    /// and `screenIPMalformed` on the Go ring-buffer decoder.
+    #[inline]
+    pub(crate) fn screen_reason(self) -> &'static str {
+        match self {
+            ScreenParseError::TruncatedIpv6ExtChain => "ip-malformed",
+        }
+    }
+}

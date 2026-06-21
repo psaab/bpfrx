@@ -41,7 +41,7 @@ mod stateless;
 mod syncookie;
 
 pub(crate) use extract::extract_screen_info;
-pub(crate) use packet::{ScreenPacketInfo, ScreenProfile, ScreenVerdict};
+pub(crate) use packet::{ScreenPacketInfo, ScreenParseError, ScreenProfile, ScreenVerdict};
 pub(crate) use syncookie::{
     SYN_COOKIE_MSS_VALUES, SynCookieAckVerdict, SynCookieChallenge, SynCookieCodec,
     SynCookieTuple, SynCookieValidation,
