@@ -41,10 +41,96 @@
 use super::checksum::checksum16;
 use std::net::{Ipv4Addr, Ipv6Addr};
 
+/// Default 802.1Q customer-VLAN TPID.
+pub(in crate::afxdp) const TPID_8021Q: u16 = 0x8100;
+/// 802.1ad service-VLAN (Q-in-Q outer) TPID. Recognized on ingress and
+/// preserved on reflected local-origin errors so an inbound 0x88a8 tag
+/// is not silently rewritten to 0x8100.
+pub(in crate::afxdp) const TPID_8021AD: u16 = 0x88a8;
+
+/// An egress 802.1Q/802.1ad tag carrying the full TCI (PCP, DEI, VID)
+/// plus the TPID and a presence flag.
+///
+/// #2149: the old builder API took a bare `vlan_id: u16` and emitted a
+/// tag only when `vlan_id > 0`, hard-coding TPID 0x8100 and zeroing
+/// PCP/DEI. That cannot emit an 802.1p *priority-tagged* frame (a real
+/// tag with VID 0 but PCP != 0, used for priority-only QoS without VLAN
+/// membership), and it dropped the inbound PCP/DEI/TPID when reflecting
+/// a local-origin ICMP error. `TxVlanTag` carries enough state to do
+/// both: emit on tag *presence* (VID > 0 OR PCP > 0, or an explicitly
+/// present tag) and preserve the full TCI + TPID.
+///
+/// `From<u16>` reproduces the legacy bare-VID semantics exactly
+/// (present iff `vid > 0`, TPID 0x8100, PCP/DEI 0), so the egress
+/// config-driven call sites that only have a VID are bit-identical.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub(in crate::afxdp) struct TxVlanTag {
+    /// Tag Protocol Identifier (0x8100 for 802.1Q, 0x88a8 for 802.1ad).
+    pub tpid: u16,
+    /// Tag Control Information: PCP (3 bits) | DEI (1 bit) | VID (12 bits).
+    pub tci: u16,
+    /// Whether a tag should be emitted at all.
+    pub present: bool,
+}
+
+impl TxVlanTag {
+    /// No tag — emit a bare 14-byte Ethernet header.
+    pub(in crate::afxdp) const NONE: TxVlanTag = TxVlanTag {
+        tpid: TPID_8021Q,
+        tci: 0,
+        present: false,
+    };
+
+    /// Build a present tag from its parts. `pcp` low 3 bits, `dei` low
+    /// bit, `vid` low 12 bits are packed into the TCI. Used by the
+    /// reflected-local-error path to preserve the inbound priority bits.
+    #[inline]
+    pub(in crate::afxdp) fn from_parts(tpid: u16, pcp: u8, dei: bool, vid: u16) -> TxVlanTag {
+        let tci = (((pcp & 0x07) as u16) << 13)
+            | ((dei as u16) << 12)
+            | (vid & 0x0fff);
+        TxVlanTag {
+            tpid,
+            tci,
+            present: true,
+        }
+    }
+
+    /// True iff this tag should be serialized (present AND carries at
+    /// least one meaningful bit — VID > 0 or PCP/DEI set). A present tag
+    /// with an all-zero TCI is a degenerate "tag with no information"
+    /// and is treated as untagged, matching the legacy bare-VID
+    /// behavior for `vid == 0`.
+    #[inline]
+    pub(in crate::afxdp) fn emits(&self) -> bool {
+        self.present && self.tci != 0
+    }
+
+    /// Serialized L2 header length: 18 if a tag is emitted, else 14.
+    #[inline]
+    pub(in crate::afxdp) fn header_len(&self) -> usize {
+        if self.emits() { 18 } else { 14 }
+    }
+}
+
+impl From<u16> for TxVlanTag {
+    /// Legacy bare-VID semantics: present iff `vid > 0`, TPID 0x8100,
+    /// PCP/DEI 0. Bit-identical to the pre-#2149 `vlan_id > 0` builders.
+    #[inline]
+    fn from(vid: u16) -> TxVlanTag {
+        let vid = vid & 0x0fff;
+        TxVlanTag {
+            tpid: TPID_8021Q,
+            tci: vid,
+            present: vid > 0,
+        }
+    }
+}
+
 /// Length of an outer L2 header with optional 802.1Q tag.
 #[inline]
 pub(in crate::afxdp) fn eth_header_len(vlan_id: u16) -> usize {
-    if vlan_id > 0 { 18 } else { 14 }
+    TxVlanTag::from(vlan_id).header_len()
 }
 
 /// Write the Ethernet header (with optional 802.1Q tag) into a
@@ -59,11 +145,25 @@ pub(in crate::afxdp) fn write_eth_header(
     vlan_id: u16,
     ether_type: u16,
 ) {
+    write_eth_header_tagged(buf, dst, src, TxVlanTag::from(vlan_id), ether_type);
+}
+
+/// Tag-aware Vec-push Ethernet writer. Emits an 802.1Q/802.1ad tag
+/// whenever `tag.emits()` — i.e. VID > 0 OR PCP/DEI set (priority-
+/// tagged VLAN-0) — preserving the full TCI and the carried TPID.
+#[inline]
+pub(in crate::afxdp) fn write_eth_header_tagged(
+    buf: &mut Vec<u8>,
+    dst: [u8; 6],
+    src: [u8; 6],
+    tag: TxVlanTag,
+    ether_type: u16,
+) {
     buf.extend_from_slice(&dst);
     buf.extend_from_slice(&src);
-    if vlan_id > 0 {
-        buf.extend_from_slice(&0x8100u16.to_be_bytes());
-        buf.extend_from_slice(&(vlan_id & 0x0fff).to_be_bytes());
+    if tag.emits() {
+        buf.extend_from_slice(&tag.tpid.to_be_bytes());
+        buf.extend_from_slice(&tag.tci.to_be_bytes());
     }
     buf.extend_from_slice(&ether_type.to_be_bytes());
 }
@@ -81,26 +181,35 @@ pub(in crate::afxdp) fn write_eth_header_slice(
     vlan_id: u16,
     ether_type: u16,
 ) -> Option<()> {
-    let eth_len = eth_header_len(vlan_id);
+    write_eth_header_slice_tagged(buf, dst, src, TxVlanTag::from(vlan_id), ether_type)
+}
+
+/// Tag-aware in-place Ethernet writer. Emits the full TCI + carried
+/// TPID whenever `tag.emits()`, so a priority-tagged VLAN-0 tag (VID 0,
+/// PCP != 0) is serialized rather than collapsed to untagged (#2149).
+#[inline]
+pub(in crate::afxdp) fn write_eth_header_slice_tagged(
+    buf: &mut [u8],
+    dst: [u8; 6],
+    src: [u8; 6],
+    tag: TxVlanTag,
+    ether_type: u16,
+) -> Option<()> {
+    let eth_len = tag.header_len();
     if buf.len() < eth_len {
         return None;
     }
     let ether_type_bytes = ether_type.to_be_bytes();
     // SAFETY: buf.len() >= eth_len is guaranteed by the guard above.
-    // eth_len is 14 (no VLAN) or 18 (VLAN), so all writes are
-    // in-bounds.
+    // eth_len is 14 (no tag) or 18 (tag), so all writes are in-bounds.
     debug_assert!(buf.len() >= eth_len);
     unsafe {
         let ptr = buf.as_mut_ptr();
         core::ptr::copy_nonoverlapping(dst.as_ptr(), ptr, 6);
         core::ptr::copy_nonoverlapping(src.as_ptr(), ptr.add(6), 6);
-        if vlan_id > 0 {
-            core::ptr::copy_nonoverlapping(0x8100u16.to_be_bytes().as_ptr(), ptr.add(12), 2);
-            core::ptr::copy_nonoverlapping(
-                (vlan_id & 0x0fff).to_be_bytes().as_ptr(),
-                ptr.add(14),
-                2,
-            );
+        if tag.emits() {
+            core::ptr::copy_nonoverlapping(tag.tpid.to_be_bytes().as_ptr(), ptr.add(12), 2);
+            core::ptr::copy_nonoverlapping(tag.tci.to_be_bytes().as_ptr(), ptr.add(14), 2);
             core::ptr::copy_nonoverlapping(ether_type_bytes.as_ptr(), ptr.add(16), 2);
         } else {
             core::ptr::copy_nonoverlapping(ether_type_bytes.as_ptr(), ptr.add(12), 2);

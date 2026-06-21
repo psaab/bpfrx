@@ -11,12 +11,11 @@ use super::syncookie::SynCookieChallenge;
 
 pub(super) use crate::ip_proto::{PROTO_ICMP, PROTO_ICMPV6, PROTO_TCP, PROTO_UDP};
 
-// TCP flag bits (matching BPF layout: FIN=0x01, SYN=0x02, RST=0x04, PSH=0x08, ACK=0x10, URG=0x20)
-pub(super) const TCP_FIN: u8 = 0x01;
-pub(super) const TCP_SYN: u8 = 0x02;
-pub(super) const TCP_RST: u8 = 0x04;
-pub(super) const TCP_ACK: u8 = 0x10;
-pub(super) const TCP_URG: u8 = 0x20;
+// TCP flag bits (#2151: re-exported from the shared crate::tcp_flags SSOT;
+// values match the wire layout FIN=0x01 SYN=0x02 RST=0x04 PSH=0x08
+// ACK=0x10 URG=0x20). Re-exported at `pub(super)` so the screen
+// submodules keep importing them via `packet::TCP_*`.
+pub(super) use crate::tcp_flags::{TCP_ACK, TCP_FIN, TCP_RST, TCP_SYN, TCP_URG};
 
 /// Parsed packet fields needed for screen checks.
 /// Extracted from raw packet bytes for speed — no allocations.

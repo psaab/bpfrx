@@ -314,10 +314,14 @@ const LOCAL_TUNNEL_DELIVERY_QUEUE_DEPTH: usize = 4096;
 const HA_WATCHDOG_STALE_AFTER_SECS: u64 = 10;
 const FABRIC_ZONE_MAC_MAGIC: u8 = 0xfe;
 use crate::ip_proto::{PROTO_ESP, PROTO_GRE, PROTO_ICMP, PROTO_ICMPV6, PROTO_TCP, PROTO_UDP};
-const TCP_FLAG_FIN: u8 = 0x01;
-const TCP_FLAG_RST: u8 = 0x04;
-const TCP_FLAG_PSH: u8 = 0x08;
-const TCP_FLAG_SYN: u8 = 0x02;
+// #2151: TCP flag bits now live in the shared crate::tcp_flags SSOT.
+// Re-exported here under the historical TCP_FLAG_* spellings (and made
+// visible to `super::*` consumers: event_emit, tx/tcp_segmentation,
+// frame/tcp_segmentation, frame/*) so the move is value-identical.
+use crate::tcp_flags::{
+    TCP_FIN as TCP_FLAG_FIN, TCP_PSH as TCP_FLAG_PSH, TCP_RST as TCP_FLAG_RST,
+    TCP_SYN as TCP_FLAG_SYN,
+};
 const TUNNEL_HA_STARTUP_GRACE_SECS: u64 = 10;
 const SOL_XDP: c_int = 283;
 const XDP_OPTIONS: c_int = 8;

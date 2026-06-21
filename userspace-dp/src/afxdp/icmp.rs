@@ -90,20 +90,36 @@ pub(super) fn build_local_time_exceeded_request(
     })
 }
 
-fn ingress_reply_l2(frame: &[u8]) -> Option<([u8; 6], [u8; 6], u16)> {
+/// Parse the inbound L2 header for a reflected local-origin reply:
+/// swapped MACs plus the full ingress 802.1Q/802.1ad tag (TPID + TCI:
+/// PCP, DEI, VID). #2149: this previously returned only `vlan_id: u16`,
+/// collapsing VID 0 to untagged and dropping PCP/DEI/TPID — so a
+/// priority-tagged VLAN-0 frame (a real tag with VID 0 and PCP != 0,
+/// used for 802.1p priority-only QoS) was reflected untagged with its
+/// priority lost, and an 802.1ad (0x88a8) tag was lost entirely.
+/// Returning a `TxVlanTag` preserves the full tag so the reflected
+/// error carries the original priority and TPID.
+fn ingress_reply_l2(frame: &[u8]) -> Option<([u8; 6], [u8; 6], TxVlanTag)> {
     if frame.len() < 14 {
         return None;
     }
     let dst_mac = <[u8; 6]>::try_from(frame.get(0..6)?).ok()?;
     let src_mac = <[u8; 6]>::try_from(frame.get(6..12)?).ok()?;
     let eth_proto = u16::from_be_bytes([frame[12], frame[13]]);
-    let vlan_id = if matches!(eth_proto, 0x8100 | 0x88a8) {
+    let ingress_tag = if matches!(eth_proto, TPID_8021Q | TPID_8021AD) {
         let tci = u16::from_be_bytes([*frame.get(14)?, *frame.get(15)?]);
-        tci & 0x0fff
+        // Preserve the full TCI (PCP | DEI | VID) and the original TPID.
+        // `present: true` makes a priority-tagged VID-0 frame reflect
+        // its tag; an all-zero TCI degrades to untagged via `emits()`.
+        TxVlanTag {
+            tpid: eth_proto,
+            tci,
+            present: true,
+        }
     } else {
-        0
+        TxVlanTag::NONE
     };
-    Some((src_mac, dst_mac, vlan_id))
+    Some((src_mac, dst_mac, ingress_tag))
 }
 
 pub(super) fn build_local_time_exceeded_v4(
@@ -131,7 +147,7 @@ pub(super) fn build_local_icmp_error_v4(
     icmp_code: u8,
 ) -> Option<Vec<u8>> {
     let egress = forwarding.egress.get(&ingress_ifindex)?;
-    let (dst_mac, fallback_src_mac, ingress_vlan_id) = ingress_reply_l2(frame)?;
+    let (dst_mac, fallback_src_mac, ingress_tag) = ingress_reply_l2(frame)?;
     let src_ip = egress.primary_v4?;
     let src_mac = egress.src_mac;
     let l3 = match meta.l3_offset {
@@ -150,15 +166,20 @@ pub(super) fn build_local_icmp_error_v4(
     let total_len = u16::from_be_bytes([packet[2], packet[3]]) as usize;
     let packet_len = total_len.min(packet.len());
     let quoted_len = packet_len.min(ihl.saturating_add(8));
-    let vlan_id = if ingress_vlan_id > 0 {
-        ingress_vlan_id
+    // #2149: reflect the inbound tag verbatim (TPID + PCP + DEI + VID)
+    // when one was present, so a priority-tagged VLAN-0 inbound error
+    // is reflected with its priority intact. Fall back to the egress
+    // interface's configured VID (bare 802.1Q, PCP 0) when ingress was
+    // untagged.
+    let tag = if ingress_tag.emits() {
+        ingress_tag
     } else {
-        egress.vlan_id
+        TxVlanTag::from(egress.vlan_id)
     };
-    let eth_len = if vlan_id > 0 { 18 } else { 14 };
+    let eth_len = tag.header_len();
     let total_len = 20usize.checked_add(8)?.checked_add(quoted_len)?;
     let mut out = Vec::with_capacity(eth_len + total_len);
-    write_eth_header(
+    write_eth_header_tagged(
         &mut out,
         dst_mac,
         if src_mac == [0; 6] {
@@ -166,7 +187,7 @@ pub(super) fn build_local_icmp_error_v4(
         } else {
             src_mac
         },
-        vlan_id,
+        tag,
         0x0800,
     );
     // #1440: consolidated IPv4 outer builder. Sets DF=1 + computes
@@ -218,7 +239,7 @@ pub(super) fn build_local_icmp_error_v6(
     icmp_code: u8,
 ) -> Option<Vec<u8>> {
     let egress = forwarding.egress.get(&ingress_ifindex)?;
-    let (dst_mac, fallback_src_mac, ingress_vlan_id) = ingress_reply_l2(frame)?;
+    let (dst_mac, fallback_src_mac, ingress_tag) = ingress_reply_l2(frame)?;
     let src_ip = egress.primary_v6?;
     let src_mac = egress.src_mac;
     let l3 = match meta.l3_offset {
@@ -233,15 +254,18 @@ pub(super) fn build_local_icmp_error_v6(
     let payload_len = u16::from_be_bytes([packet[4], packet[5]]) as usize;
     let packet_len = (40 + payload_len).min(packet.len());
     let quoted_len = packet_len.min(48);
-    let vlan_id = if ingress_vlan_id > 0 {
-        ingress_vlan_id
+    // #2149: preserve the inbound tag (TPID + PCP + DEI + VID) on the
+    // reflected error; fall back to the egress configured VID when
+    // ingress was untagged. See the v4 builder for the rationale.
+    let tag = if ingress_tag.emits() {
+        ingress_tag
     } else {
-        egress.vlan_id
+        TxVlanTag::from(egress.vlan_id)
     };
-    let eth_len = if vlan_id > 0 { 18 } else { 14 };
+    let eth_len = tag.header_len();
     let outer_payload_len = 8usize.checked_add(quoted_len)?;
     let mut out = Vec::with_capacity(eth_len + 40 + outer_payload_len);
-    write_eth_header(
+    write_eth_header_tagged(
         &mut out,
         dst_mac,
         if src_mac == [0; 6] {
@@ -249,7 +273,7 @@ pub(super) fn build_local_icmp_error_v6(
         } else {
             src_mac
         },
-        vlan_id,
+        tag,
         0x86dd,
     );
     // #1440: consolidated IPv6 outer builder.
@@ -348,5 +372,164 @@ pub(super) fn is_icmp_error(protocol: u8, icmp_type: u8) -> bool {
         PROTO_ICMP => matches!(icmp_type, 3 | 11 | 12),
         PROTO_ICMPV6 => matches!(icmp_type, 1 | 2 | 3 | 4),
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const ICMP_IFINDEX: i32 = 24;
+    const EGRESS_SRC_MAC: [u8; 6] = [0x02, 0xbf, 0x72, 0x00, 0x00, 0x01];
+
+    /// A ForwardingState with one egress interface (the ingress index
+    /// the reflected-error builders look up). `egress.vlan_id` is the
+    /// fallback used when the inbound frame is untagged.
+    fn forwarding_with_egress(vlan_id: u16) -> ForwardingState {
+        let mut state = ForwardingState::default();
+        state.egress.insert(
+            ICMP_IFINDEX,
+            EgressInterface {
+                bind_ifindex: 0,
+                vlan_id,
+                mtu: 1500,
+                src_mac: EGRESS_SRC_MAC,
+                zone_id: 0,
+                redundancy_group: 0,
+                primary_v4: Some(Ipv4Addr::new(172, 16, 80, 8)),
+                primary_v6: Some("2001:559:8585:80::8".parse().expect("v6")),
+            },
+        );
+        state
+    }
+
+    #[derive(Clone, Copy)]
+    enum InL2 {
+        Untagged,
+        /// 802.1p priority-tagged VLAN-0: TPID 0x8100, PCP 5, VID 0.
+        PriorityTaggedVlan0,
+        /// Normal 802.1Q tag, PCP 0, VID 100.
+        Vlan100,
+    }
+
+    /// Build an inbound IPv4 UDP packet (so the reflected reply is a
+    /// real error, not suppressed) with the chosen L2 header. The TTL
+    /// is 1 so `build_local_time_exceeded_v4` fires; the builders read
+    /// the inbound tag straight from the frame bytes.
+    fn inbound_v4(l2: InL2) -> (Vec<u8>, UserspaceDpMeta) {
+        let mut frame = Vec::new();
+        let dst_mac = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]; // firewall NIC
+        let src_mac = [0x00, 0x25, 0x90, 0x12, 0x34, 0x56]; // sender
+        frame.extend_from_slice(&dst_mac);
+        frame.extend_from_slice(&src_mac);
+        let l3_off: u16 = match l2 {
+            InL2::Untagged => {
+                frame.extend_from_slice(&0x0800u16.to_be_bytes());
+                14
+            }
+            InL2::PriorityTaggedVlan0 => {
+                frame.extend_from_slice(&0x8100u16.to_be_bytes());
+                // TCI = PCP 5 << 13 | DEI 0 | VID 0 = 0xA000.
+                frame.extend_from_slice(&0xA000u16.to_be_bytes());
+                frame.extend_from_slice(&0x0800u16.to_be_bytes());
+                18
+            }
+            InL2::Vlan100 => {
+                frame.extend_from_slice(&0x8100u16.to_be_bytes());
+                frame.extend_from_slice(&100u16.to_be_bytes());
+                frame.extend_from_slice(&0x0800u16.to_be_bytes());
+                18
+            }
+        };
+        let l3 = frame.len();
+        // IPv4 header, IHL 5, TTL 1, proto UDP, total_len = 20 + 8.
+        frame.push(0x45);
+        frame.push(0x00);
+        frame.extend_from_slice(&28u16.to_be_bytes());
+        frame.extend_from_slice(&[0x00, 0x01, 0x40, 0x00, 1, 17, 0x00, 0x00]);
+        frame.extend_from_slice(&Ipv4Addr::new(198, 51, 100, 20).octets()); // src
+        frame.extend_from_slice(&Ipv4Addr::new(172, 16, 80, 200).octets()); // dst
+        let ip_csum = checksum16(&frame[l3..l3 + 20]);
+        frame[l3 + 10..l3 + 12].copy_from_slice(&ip_csum.to_be_bytes());
+        // 8-byte UDP header.
+        frame.extend_from_slice(&49152u16.to_be_bytes());
+        frame.extend_from_slice(&5201u16.to_be_bytes());
+        frame.extend_from_slice(&8u16.to_be_bytes());
+        frame.extend_from_slice(&0u16.to_be_bytes());
+
+        let meta = UserspaceDpMeta {
+            ingress_ifindex: ICMP_IFINDEX as u32,
+            l3_offset: l3_off,
+            addr_family: libc::AF_INET as u8,
+            protocol: 17,
+            ..UserspaceDpMeta::default()
+        };
+        (frame, meta)
+    }
+
+    /// #2149 regression: a priority-tagged VLAN-0 inbound frame
+    /// (TPID 0x8100, PCP 5, VID 0) must have its tag — including PCP —
+    /// reflected on the local-origin ICMP error. Pre-fix the builder
+    /// gated tag emission on `vlan_id > 0`, so VID 0 collapsed to
+    /// untagged (14-byte L2) and PCP was lost.
+    #[test]
+    fn reflected_v4_error_preserves_priority_tagged_vlan0() {
+        let (frame, meta) = inbound_v4(InL2::PriorityTaggedVlan0);
+        // Egress config VID is 0 (no membership) — the ONLY tag source
+        // is the inbound priority tag, proving preservation rather than
+        // an egress-config fallback.
+        let fwd = forwarding_with_egress(0);
+        let out =
+            build_local_icmp_error_v4(&frame, meta, ICMP_IFINDEX, &fwd, 11, 0).expect("v4 error");
+
+        assert_eq!(&out[12..14], &[0x81, 0x00], "reflected frame must carry an 802.1Q TPID");
+        assert_eq!(
+            &out[14..16],
+            &[0xA0, 0x00],
+            "reflected TCI must preserve PCP=5, VID=0 (the priority tag)"
+        );
+        // EtherType IPv4 follows the tag → L3 starts at byte 18.
+        assert_eq!(&out[16..18], &[0x08, 0x00]);
+        assert_eq!(out[18], 0x45, "IPv4 outer header starts at offset 18");
+        // MACs swapped: reflected dst = inbound src.
+        assert_eq!(&out[0..6], &[0x00, 0x25, 0x90, 0x12, 0x34, 0x56]);
+        assert_eq!(&out[6..12], &EGRESS_SRC_MAC);
+    }
+
+    /// A normal VID > 0 inbound tag is reflected unchanged (regression
+    /// guard for the common path).
+    #[test]
+    fn reflected_v4_error_preserves_normal_vlan() {
+        let (frame, meta) = inbound_v4(InL2::Vlan100);
+        let fwd = forwarding_with_egress(0);
+        let out =
+            build_local_icmp_error_v4(&frame, meta, ICMP_IFINDEX, &fwd, 11, 0).expect("v4 error");
+        assert_eq!(&out[12..14], &[0x81, 0x00]);
+        assert_eq!(&out[14..16], &100u16.to_be_bytes(), "VID 100 preserved, PCP 0");
+        assert_eq!(out[18], 0x45);
+    }
+
+    /// An untagged inbound frame stays untagged on the reflected error
+    /// when the egress interface has no configured VID.
+    #[test]
+    fn reflected_v4_error_untagged_stays_untagged() {
+        let (frame, meta) = inbound_v4(InL2::Untagged);
+        let fwd = forwarding_with_egress(0);
+        let out =
+            build_local_icmp_error_v4(&frame, meta, ICMP_IFINDEX, &fwd, 11, 0).expect("v4 error");
+        assert_eq!(&out[12..14], &[0x08, 0x00], "EtherType IPv4 at byte 12 (untagged)");
+        assert_eq!(out[14], 0x45, "IPv4 outer header starts at offset 14");
+    }
+
+    /// An untagged inbound frame on an egress interface WITH a
+    /// configured VID falls back to that VID (legacy egress behavior).
+    #[test]
+    fn reflected_v4_error_untagged_falls_back_to_egress_vid() {
+        let (frame, meta) = inbound_v4(InL2::Untagged);
+        let fwd = forwarding_with_egress(50);
+        let out =
+            build_local_icmp_error_v4(&frame, meta, ICMP_IFINDEX, &fwd, 11, 0).expect("v4 error");
+        assert_eq!(&out[12..14], &[0x81, 0x00]);
+        assert_eq!(&out[14..16], &50u16.to_be_bytes(), "egress VID 50 fallback");
     }
 }

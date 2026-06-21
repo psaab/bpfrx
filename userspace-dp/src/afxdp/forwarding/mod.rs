@@ -462,10 +462,10 @@ pub(super) fn cluster_peer_return_fast_path(
     if is_icmp_echo_request(packet_frame, meta) {
         return None;
     }
-    if meta.protocol == PROTO_TCP
-        && (meta.tcp_flags & TCP_FLAG_SYN) != 0
-        && (meta.tcp_flags & 0x10) == 0
-    {
+    // #2151: `is_initial_syn` == the prior
+    // `(tcp_flags & SYN) != 0 && (tcp_flags & ACK) == 0` — a bare
+    // connection-opening SYN has no peer-owned session to return for.
+    if meta.protocol == PROTO_TCP && crate::tcp_flags::is_initial_syn(meta.tcp_flags) {
         return None;
     }
 
@@ -1069,9 +1069,10 @@ pub(super) fn should_cache_local_delivery_session_on_miss(
     if !matches!(protocol, PROTO_TCP) {
         return true;
     }
-    const TCP_SYN_FLAG: u8 = 0x02;
-    const TCP_ACK_FLAG: u8 = 0x10;
-    if (tcp_flags & TCP_ACK_FLAG) != 0 && (tcp_flags & TCP_SYN_FLAG) == 0 {
+    // #2151: prior inline `(tcp_flags & ACK) != 0 && (tcp_flags & SYN) == 0`
+    // — do not cache a local-delivery session off a bare/established ACK
+    // (no SYN), only off the handshake.
+    if crate::tcp_flags::has_ack(tcp_flags) && !crate::tcp_flags::has_syn(tcp_flags) {
         return false;
     }
     let _ = state;

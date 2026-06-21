@@ -33,12 +33,10 @@ const SYN_COOKIE_REPLY_HOP_LIMIT: u8 = 64;
 const SYN_COOKIE_TCP_WINDOW: u16 = 64240;
 #[cfg_attr(not(test), allow(dead_code))]
 const ETHERNET_MIN_FRAME_LEN: usize = 60;
-#[cfg_attr(not(test), allow(dead_code))]
-const TCP_FLAG_ACK: u8 = 0x10;
-#[cfg_attr(not(test), allow(dead_code))]
-const TCP_FLAG_RST: u8 = 0x04;
-#[cfg_attr(not(test), allow(dead_code))]
-const TCP_FLAG_SYN: u8 = 0x02;
+// #2151: TCP flag bits come from the shared crate::tcp_flags SSOT.
+// Re-aliased to the historical TCP_FLAG_* spellings used in this module's
+// reply builders; values are bit-identical.
+use crate::tcp_flags::{TCP_ACK as TCP_FLAG_ACK, TCP_RST as TCP_FLAG_RST, TCP_SYN as TCP_FLAG_SYN};
 #[cfg_attr(not(test), allow(dead_code))]
 const TCP_MIN_HEADER_LEN: usize = 20;
 #[cfg_attr(not(test), allow(dead_code))]
@@ -79,8 +77,8 @@ pub(in crate::afxdp) fn frame_has_tcp_rst(frame: &[u8]) -> bool {
         Some(t) if t.len() >= 14 => t,
         _ => return false,
     };
-    // TCP flags at offset 13: RST = 0x04
-    (tcp[13] & 0x04) != 0
+    // TCP flags at offset 13 (#2151: shared RST predicate).
+    crate::tcp_flags::has_rst(tcp[13])
 }
 
 /// Extract TCP flags and window from raw frame, auto-detecting L3 from Ethernet header.
@@ -143,23 +141,24 @@ pub(in crate::afxdp) fn extract_tcp_window(frame: &[u8], addr_family: u8) -> Opt
 
 #[inline]
 pub(in crate::afxdp) fn tcp_flags_str(flags: u8) -> String {
+    use crate::tcp_flags::{has_ack, has_fin, has_psh, has_rst, has_syn, has_urg};
     let mut s = String::with_capacity(12);
-    if flags & 0x02 != 0 {
+    if has_syn(flags) {
         s.push_str("SYN ");
     }
-    if flags & 0x10 != 0 {
+    if has_ack(flags) {
         s.push_str("ACK ");
     }
-    if flags & 0x01 != 0 {
+    if has_fin(flags) {
         s.push_str("FIN ");
     }
-    if flags & 0x04 != 0 {
+    if has_rst(flags) {
         s.push_str("RST ");
     }
-    if flags & 0x08 != 0 {
+    if has_psh(flags) {
         s.push_str("PSH ");
     }
-    if flags & 0x20 != 0 {
+    if has_urg(flags) {
         s.push_str("URG ");
     }
     if s.ends_with(' ') {
@@ -245,8 +244,8 @@ pub(super) fn clamp_tcp_mss(packet: &mut [u8], max_mss: u16) -> bool {
         _ => return false,
     };
     let flags = tcp[13];
-    // Only clamp on SYN or SYN+ACK
-    if (flags & 0x02) == 0 {
+    // Only clamp on SYN or SYN+ACK (#2151: shared SYN predicate).
+    if !crate::tcp_flags::has_syn(flags) {
         return false;
     }
     let data_offset = ((tcp[12] >> 4) as usize) * 4;
@@ -378,8 +377,8 @@ fn tcp_segment_consumed_len(frame: &[u8], parsed: TcpReplySource) -> Option<u32>
     if (parsed.flags & TCP_FLAG_SYN) != 0 {
         len = len.wrapping_add(1);
     }
-    // FIN consumes one sequence number too (FIN = 0x01).
-    if (parsed.flags & 0x01) != 0 {
+    // FIN consumes one sequence number too (#2151: shared FIN predicate).
+    if crate::tcp_flags::has_fin(parsed.flags) {
         len = len.wrapping_add(1);
     }
     let ip = frame.get(parsed.l3..)?;
