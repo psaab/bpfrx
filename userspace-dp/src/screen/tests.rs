@@ -140,11 +140,61 @@ fn land_attack_v6() {
 }
 
 #[test]
-fn land_attack_different_ports_passes() {
+fn land_attack_different_ports_drops() {
+    // #2215 fail-on-revert (sub-bug B): the LAND signature is
+    // src_ip == dst_ip ALONE, matching the authoritative BPF screen
+    // (`13fa1009e^:bpf/xdp/xdp_screen.c` ~715-723) — NO port equality.
+    // Pre-#2215 the check additionally required src_port == dst_port,
+    // so this same-IP/different-port frame PASSED. It must now DROP.
     let mut state = make_state("trust", default_profile());
     let src = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1));
-    // Same IP but different ports should pass
     let pkt = tcp_pkt(src, src, 80, 443, TCP_SYN);
+    assert_eq!(
+        state.check_packet("trust", &pkt, 1),
+        ScreenVerdict::Drop("land-attack")
+    );
+}
+
+#[test]
+fn land_attack_v6_different_ports_drops() {
+    // #2215 (sub-bug B): the BPF reference drops src==dst for IPv6 too,
+    // unconditionally. Different ports must still DROP.
+    let mut state = make_state("trust", default_profile());
+    let src = IpAddr::V6("2001:db8::1".parse::<Ipv6Addr>().unwrap());
+    let pkt = tcp_pkt(src, src, 80, 443, TCP_SYN);
+    assert_eq!(
+        state.check_packet("trust", &pkt, 1),
+        ScreenVerdict::Drop("land-attack")
+    );
+}
+
+#[test]
+fn land_attack_udp_different_ports_drops() {
+    // #2215 (sub-bug B): the LAND/anti-spoofing invariant is not
+    // TCP-specific. A UDP frame whose source IP equals its destination
+    // IP (different ports) must DROP. Pre-#2215 it passed.
+    let mut profile = default_profile();
+    // Keep the rate-based screens disabled so only LAND can fire.
+    profile.udp_flood_threshold = 0;
+    let mut state = make_state("trust", profile);
+    let src = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1));
+    let mut pkt = udp_pkt(src, src);
+    pkt.src_port = 5000;
+    pkt.dst_port = 5001;
+    assert_eq!(
+        state.check_packet("trust", &pkt, 1),
+        ScreenVerdict::Drop("land-attack")
+    );
+}
+
+#[test]
+fn land_attack_distinct_ips_passes() {
+    // Control: a normal frame whose source != destination must NOT be
+    // flagged as a LAND attack regardless of ports.
+    let mut state = make_state("trust", default_profile());
+    let src = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1));
+    let dst = IpAddr::V4(Ipv4Addr::new(10, 0, 2, 1));
+    let pkt = tcp_pkt(src, dst, 80, 80, TCP_SYN);
     assert_eq!(state.check_packet("trust", &pkt, 1), ScreenVerdict::Pass);
 }
 

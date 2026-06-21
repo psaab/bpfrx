@@ -13,10 +13,22 @@ use super::packet::{
     TCP_SYN, TCP_URG,
 };
 
-/// LAND attack: src_ip == dst_ip AND src_port == dst_port.
+/// LAND attack: `src_ip == dst_ip`.
+///
+/// Mirrors the authoritative BPF screen (#2215, see
+/// `git show 13fa1009e^:bpf/xdp/xdp_screen.c` ~lines 715-723), which
+/// dropped on `src_ip == dst_ip` ALONE for both IPv4 and IPv6, with NO
+/// port comparison. The classic named LAND attack does use equal ports,
+/// but the source==destination IP match is the LAND signature and an
+/// unconditional anti-spoofing invariant — a spoofed frame whose source
+/// equals its destination is illegal regardless of L4 ports (and need
+/// not even be TCP/UDP). The pre-#2215 userspace port added a
+/// `src_port == dst_port` requirement that silently admitted such frames
+/// when the ports differed; that narrowing is removed here for BPF
+/// parity.
 #[inline]
 pub(super) fn check_land(profile: &ScreenProfile, pkt: &ScreenPacketInfo) -> Option<&'static str> {
-    if profile.land && pkt.src_ip == pkt.dst_ip && pkt.src_port == pkt.dst_port {
+    if profile.land && pkt.src_ip == pkt.dst_ip {
         return Some("land-attack");
     }
     None
