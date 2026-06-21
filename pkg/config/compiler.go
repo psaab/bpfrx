@@ -291,6 +291,35 @@ type compileOpts struct {
 	// is inert. Commit stays strict so the operator's next edit fails loudly.
 	// Same doctrine as lenientNATHostMask.
 	lenientNPTv6 bool
+	// lenientFirewallRefs (#2217) downgrades the firewall-filter term
+	// cross-reference gates — `then policer <name>` (Finding A,
+	// validateFirewallPolicerReferencesStrict) and `then routing-instance
+	// <name>` FBF (Finding C, validateFirewallRoutingInstanceReferencesStrict)
+	// — from a hard compile error to a cfg.Warnings entry. Both references were
+	// previously unvalidated: a dangling policer silently never rate-limited
+	// (fail-open) and a dangling FBF routing-instance silently blackholed /
+	// fell through to the default table. The strict commit / commit-check path
+	// hard-rejects so the typo is operator-visible; the tolerant load /
+	// peer-sync paths warn so an already-persisted or peer-synced config still
+	// BOOTS (#1960 fail-closed-on-load class) — the dataplane behaves as it did
+	// before (term unpoliced / steered to a missing table), so a leniently-
+	// loaded config is no worse than before the gate. Same doctrine as
+	// lenientRoutingExportRef.
+	lenientFirewallRefs bool
+	// lenientApplicationSetMembers (#2217 Finding B) downgrades the
+	// application-set member cross-reference gate
+	// (validateApplicationSetMembersStrict) from a hard compile error to a
+	// cfg.Warnings entry. An application-set member referencing neither a
+	// defined application (user / junos-* predefined) nor a defined nested
+	// application-set was previously unvalidated: a policy matching such a set
+	// silently failed to match the intended traffic (the unresolved member
+	// never matches — an effective no-op term, fail-open). The strict commit /
+	// commit-check path hard-rejects; the tolerant load / peer-sync paths warn
+	// so an already-persisted or peer-synced config carrying a dangling member
+	// still BOOTS (#1960) — the dataplane drops the unresolved member
+	// independently, so it is already inert. Same doctrine as
+	// lenientApplicationSpecs.
+	lenientApplicationSetMembers bool
 }
 
 // CompileConfig converts a parsed ConfigTree AST into a typed Config struct.
@@ -328,6 +357,8 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientApplicationSpecs:            true,
 		lenientFilterProtocols:             true,
 		lenientNPTv6:                       true,
+		lenientFirewallRefs:                true,
+		lenientApplicationSetMembers:       true,
 	})
 }
 
@@ -416,6 +447,8 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientApplicationSpecs:            true,
 		lenientFilterProtocols:             true,
 		lenientNPTv6:                       true,
+		lenientFirewallRefs:                true,
+		lenientApplicationSetMembers:       true,
 	})
 }
 
@@ -905,6 +938,60 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		if opts.lenientRoutingExportRef {
 			cfg.Warnings = append(cfg.Warnings,
 				fmt.Sprintf("routing export reference (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
+	// #2217 Finding A: firewall-filter `then policer <name>` cross-reference.
+	// A term naming a policer that is not defined under `firewall policer` /
+	// `firewall three-color-policer` compiled cleanly and the rate-limit
+	// silently never applied (fail-open — the term's traffic passed
+	// unpoliced). Strict on commit / commit-check (hard reject so the typo is
+	// operator-visible); lenient on load / peer-sync (warn so an already-
+	// persisted or peer-synced config still boots — #1960). Runs on the
+	// fully-compiled *Config so the policer maps are populated regardless of
+	// authoring order. Mirrors validateRoutingExportReferencesStrict.
+	if err := validateFirewallPolicerReferencesStrict(cfg); err != nil {
+		if opts.lenientFirewallRefs {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("firewall policer reference (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
+	// #2217 Finding C: firewall-filter `then routing-instance <name>` (FBF)
+	// cross-reference. A term naming a routing-instance not defined under
+	// `routing-instances` compiled cleanly and the dataplane steered matched
+	// packets toward a routing table that does not exist — a silent blackhole
+	// / fall-through to the default table. Strict on commit / commit-check;
+	// lenient on load / peer-sync (warn — #1960). Mirrors the policer gate
+	// above.
+	if err := validateFirewallRoutingInstanceReferencesStrict(cfg); err != nil {
+		if opts.lenientFirewallRefs {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("firewall routing-instance reference (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
+	// #2217 Finding B: application-set member cross-reference. An
+	// `applications application-set <set>` member referencing neither a defined
+	// application (user / junos-* predefined) nor a defined nested
+	// application-set compiled cleanly; a policy matching the set silently
+	// failed to match the intended traffic (the unresolved member never
+	// matches — an effective no-op term, fail-open). Strict on commit /
+	// commit-check; lenient on load / peer-sync (warn — #1960; the dataplane
+	// drops the unresolved member independently, so it is already inert).
+	// Reuses ExpandApplicationSet, the same resolver the compiler already uses,
+	// so no new definedness table is introduced. Mirrors
+	// validateApplicationSpecsStrict.
+	if err := validateApplicationSetMembersStrict(cfg); err != nil {
+		if opts.lenientApplicationSetMembers {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("application-set member (downgraded to warning on tolerant path): %v", err))
 		} else {
 			return nil, err
 		}
