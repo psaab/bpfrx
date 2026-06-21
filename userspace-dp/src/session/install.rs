@@ -168,6 +168,16 @@ impl SessionTable {
         // #965: schedule the new entry for expiration check.
         self.push_to_wheel(&key, now_ns);
         if !metadata.is_reverse && !origin.is_peer_synced() && !origin.is_transient_local_seed() {
+            // #2134: this is the fresh-install choke point for counted
+            // (locally-admitted, forward-direction, non-seed,
+            // non-peer-synced) sessions — increment the per-IP count
+            // under the SAME counted-class gate as the Open-delta push.
+            // Capture the Copy IPs before `key` is moved into the delta.
+            // The function returned `false` early at `len() >=
+            // max_sessions` before any state change, so this only runs
+            // on a real install.
+            let (sip, dip) = (key.src_ip, key.dst_ip);
+            self.session_limit_inc(sip, dip);
             self.push_delta(SessionDelta {
                 kind: SessionDeltaKind::Open,
                 key,
@@ -321,8 +331,23 @@ impl SessionTable {
             let Some(entry) = self.entry_by_key_mut(&key) else {
                 continue;
             };
+            // #2134: an in-place demote local→synced un-counts a counted
+            // session WITHOUT going through `remove_entry`, so it must be
+            // decremented explicitly. Snapshot the counted-class
+            // predicate inputs from the CURRENT (pre-mutation)
+            // origin/metadata while the borrow is live, perform the
+            // in-place flip, end the borrow, THEN decrement (semantically
+            // "decrement before flip" — the snapshot is the pre-flip
+            // state). `entry.origin` cannot be re-borrowed mutably for
+            // the &mut self count helper while `entry` is alive.
+            let was_counted = !entry.origin.is_peer_synced()
+                && !entry.origin.is_transient_local_seed()
+                && !entry.metadata.is_reverse;
             if !entry.origin.is_peer_synced() {
                 entry.origin = SessionOrigin::SyncImport;
+            }
+            if was_counted {
+                self.session_limit_dec(key.src_ip, key.dst_ip);
             }
             demoted_keys.push(key);
         }
