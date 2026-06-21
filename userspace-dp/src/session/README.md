@@ -29,7 +29,12 @@ structure.)
   in-place-refresh path stays in `mod.rs`.
 - `expire.rs` — timer-wheel sweeps + eviction: `expire_stale_entries`
   (the per-tick bucket drain / lazy-delete GC pass), the throttled
-  `push_to_wheel` scheduler, and `wheel_observe`.
+  `push_to_wheel` scheduler, `wheel_observe`, and the #2120 standby
+  retention gate (`expire_stale_entries_ha` + `standby_gate_decision` +
+  `rebucket_alive_entry`).
+- `entry.rs` carries the per-entry `SessionEntry` (decision / metadata /
+  origin / timestamps / wheel tick) PLUS the #2120 standby-gate fields
+  `seen_rg_epoch` and `first_held_ns` (see "Standby retention" below).
 - `key.rs` — `SessionKey`, `forward_wire_key` (ingress 5-tuple),
   `reverse_canonical_key` (post-NAT lookup), and
   `reply_matches_forward_session` (the predicate used to detect "this
@@ -60,6 +65,71 @@ per-entry `expires_after_ns`.
 sweep walks the wheel bucket for the current tick; stale entries get
 lazy-deleted on the next lookup if they slip past the sweep (e.g.
 because they were re-bucketed mid-sweep).
+
+## Standby retention (#2120)
+
+The Rust wheel now owns HA standby session retention — the contract the
+eBPF Go-GC `IsLocalPrimary` gate used to enforce before the eBPF dataplane
+was retired (#1373/#1476). Without it, the STANDBY node silently expired
+long-lived peer-synced sessions whose idle timeout elapsed with no local
+refresh, and the newly-promoted primary then dropped their return traffic
+as a brand-new connection (#131, reintroduced by the eBPF→userspace
+migration).
+
+`expire_stale_entries_ha(now_ns, Some(ctx))` makes a three-way decision
+for each idle-crossed entry before removing it (the plain
+`expire_stale_entries(now_ns)` / `ha = None` path is standalone behavior —
+every idle entry ages, exactly as before):
+
+- **SELF-HEAL** (edge) — peer-synced, this node now FORWARDS the entry's
+  RG, but `seen_rg_epoch` predates the activation (`RefreshOwnerRGS` may
+  not have landed). Re-stamp `last_seen_ns`, record the new epoch,
+  re-bucket; fires once per activation, then the entry ages normally.
+  `first_held_ns` is left UNTOUCHED so a flapping RG cannot reset the leak
+  ceiling.
+- **HOLD** — this node does NOT forward the entry (standby / demotion
+  window) and it is peer-synced or this node forwards something
+  (`peer_synced || node_active`, the "in a cluster" guard that excludes a
+  standalone node). Held unless held past the stale-synced ceiling.
+- **AGE** — normal removal: active-node-owned, standalone, fabric-ingress,
+  or a held entry past the ceiling.
+
+The HOLD keys on FORWARDING, not origin, so a still-`ForwardFlow`
+demotion-window entry (the demote flip not yet applied) is held too.
+`owner_rg_id <= 0` (fabric / unresolved-owner reverse) uses the
+node-level `rg_epochs[0]` activation edge so the self-heal fires for
+those entries.
+
+The **stale-synced ceiling** is
+`min(STALE_SYNCED_CEILING_MULT × expires_after_ns,
+STALE_SYNCED_CEILING_ABS_NS)` (MULT = 3, ABS ≈ 7 days), measured from
+`first_held_ns` (when the entry FIRST entered the held state). It bounds
+the lost-primary-delete leak: a held entry whose Close delta AND journal
+entry were both lost is reaped without a primary delete. RELATIVE so a
+live long-`inactivity-timeout` session is never reaped on the standby
+before failover; ABS-capped to bound the pathological `MaxDurationSeconds`
+config; `first_held_ns`-based so self-heal re-stamps on a flapping RG
+cannot reset the clock.
+
+The HA-forwarding predicate (`HAGroupRuntime::is_forwarding_active`, which
+includes the watchdog lease and so fails CLOSED — a node that lost cluster
+state reads inactive → holds) lives on the `afxdp` side and is handed in
+as `ExpireHaContext` closures (`forwards_rg`, `epoch_of`, `node_active`)
+so the afxdp-private HA types never leak into `crate::session`. The
+context is built in `afxdp/worker/loop_body/mod.rs` right before the
+expire call.
+
+The self-heal edge is made airtight by the **epoch-before-publish
+ordering** in `afxdp/ha.rs::update_ha_state`: `rg_epochs` for every
+activated/demoted RG (and the node-level `rg_epochs[0]` on any activation)
+is bumped BEFORE `rg_runtime.store`, so a worker that observes the active
+`rg_runtime` always observes the bumped epoch (never new-rg + old-epoch).
+
+`WheelPopStats` exposes `held_standby`, `reaped_stale_synced`,
+`healed_on_promote`, and `aged_owner_rg_zero_active_node` (the last makes
+the known active/active `owner_rg_id == 0` under-retention residual
+observable — a `==0` entry for a standby RG path on an otherwise-active
+node ages and is re-derived on promotion via the reverse-synced prewarm).
 
 ## Corruption contract (#1855)
 

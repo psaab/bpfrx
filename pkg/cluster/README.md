@@ -145,6 +145,18 @@ outside the monitor loop:
 - HA delete-sync callbacks fire from the GC loop. They must not block, and
   must log at `slog.Debug` — earlier `slog.Info` flooded at 15 req/s and
   drowned out real diagnostics (per CLAUDE.md logging rules).
+- The incremental sync sweep (`sync_conn.go`) re-syncs a session ONLY on
+  `val.Created >= threshold` — it deliberately does NOT re-publish an
+  established flow on `LastSeen` activity (#270 narrowed this; #131's
+  `|| val.LastSeen >= threshold` clause was removed on purpose to keep the
+  empty-sweep back-off and avoid >1/s control-socket contention). Standby
+  retention of long-lived synced sessions is NOT the sweep's job — it is
+  owned by the userspace Rust timer wheel's standby gate (#2120,
+  `userspace-dp/src/session/expire.rs`): the standby HOLDS a peer-synced
+  session for an RG it does not forward instead of aging it. Do NOT
+  "restore the LastSeen re-sync" to fix a failover-retention bug — that
+  re-introduces the per-second control-socket hammer #270 removed; the fix
+  belongs in the wheel. The sweep narrowing is intentional and must stay.
 - Session-sync key-only delete messages use `SessionStore.DeleteWithCompanions*`.
   Bulk stale reconciliation must use the known-value batch delete path through
   `SessionStore.ReconcileClusterBulk`, which deletes with the iterator's

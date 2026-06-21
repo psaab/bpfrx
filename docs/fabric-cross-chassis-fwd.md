@@ -210,3 +210,35 @@ silently dropped by the filtered `maybe_reinject_slow_path` wrapper
 (`FabricRedirect` is excluded by `is_slow_path_eligible`), and the
 build-failure path raw-reinjected both. #1946 makes all of them drop
 fail-closed + count.
+
+## Standby session retention on the userspace wheel (#2120)
+
+Fabric cross-chassis forwarding keeps a flow alive across a VRRP
+failback, but it only helps if the new primary still HAS the synced
+session to redirect for. The standby must therefore RETAIN its synced
+sessions until it is promoted.
+
+In the eBPF era the Go conntrack GC's `IsLocalPrimary` gate kept the
+standby from aging synced sessions. After the eBPF retirement
+(#1373/#1476) the Go GC is `SkipSweep`'d in userspace mode (its
+`IsLocalPrimary` gate is dead code) and expiry moved to the Rust
+per-worker timer wheel, which had NO standby gate — so the standby
+silently reaped long-lived peer-synced sessions at ~300 s (TCP idle) with
+no local refresh, and the newly-promoted primary then dropped their return
+traffic as a brand-new connection (#131 reintroduced).
+
+#2120 restores the contract as a **per-RG standby retention gate in the
+wheel** (`userspace-dp/src/session/expire.rs`): the standby HOLDS a
+peer-synced session for an RG it does not currently FORWARD
+(`HAGroupRuntime::is_forwarding_active`, the same lease-backed predicate
+the fabric-redirect path trusts), self-heals it on promotion via the
+`rg_epochs` edge (including the node-level `rg_epochs[0]` for
+`owner_rg_id == 0` fabric/reverse entries), and reaps it at a bounded
+`min(3 × timeout, ~7 d)` ceiling if a primary delete is lost. The epoch
+bump moved BEFORE `rg_runtime.store` in `afxdp/ha.rs::update_ha_state` so
+a worker that sees the active RG always sees the bumped epoch (airtight
+self-heal). The control-plane sync sweep is unchanged — retention is the
+wheel's job, not the sweep's (see `pkg/cluster/README.md` and
+`userspace-dp/src/session/README.md` "Standby retention"). This keeps
+#270's empty-sweep back-off and avoids the >1/s control-socket contention
+CLAUDE.md warns against.
