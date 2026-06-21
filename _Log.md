@@ -1,5 +1,25 @@
 # Action Log
 
+## 2026-06-21 — #2158 file-split (1 of N): relocate wg/engine.rs inline tests
+
+- **Timestamp**: 2026-06-21
+- **Action**: Pure code-motion per the converged #2158 plan (§5.5,
+  #1046 pattern). Cut the inline `#[cfg(test)] mod engine_internal_tests`
+  block (former lines 1278-2086, ~809 LOC) out of
+  `userspace-dp/src/afxdp/wg/engine.rs` into a new sibling
+  `wg/engine_tests.rs`, wired with `#[cfg(test)] #[path =
+  "engine_tests.rs"] mod engine_internal_tests;`. `#[path]` keeps the
+  module a child of `wg::engine`, so `use super::*;` resolves identically
+  and no test body changed (byte-identical modulo a uniform 4-space
+  dedent; production lines 1-1277 are byte-identical to master). engine.rs
+  drops 2086 -> 1280 LOC, off the REFACTOR/WATCH list entirely. wg::
+  tests: 145 pass / 0 fail (unchanged count; relocated module runs as
+  `afxdp::wg::engine::engine_internal_tests::*`). Regenerated
+  `docs/refactoring-audit-current.txt`; `make audit-check` passes.
+- **File(s)**: userspace-dp/src/afxdp/wg/engine.rs,
+  userspace-dp/src/afxdp/wg/engine_tests.rs,
+  docs/refactoring-audit-current.txt
+
 ## 2026-06-21 — #2146 (PR #2189) fold: close IPv6 ext-header overshoot fail-open
 
 - **Timestamp**: 2026-06-21
