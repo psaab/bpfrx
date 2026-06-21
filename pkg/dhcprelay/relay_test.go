@@ -91,6 +91,93 @@ func TestInterfaceIPv4_Loopback(t *testing.T) {
 	}
 }
 
+// TestClientRequestRelayable asserts the client->server forwarding gate
+// (#2153): a relay must forward DISCOVER, REQUEST, and INFORM, but not server
+// reply types or client-to-server-direct types (DECLINE/RELEASE). The INFORM
+// case is the regression target — before #2153 the gate dropped it, so a
+// domain-joined client that holds its own address never received DNS/domain/NTP
+// options from the central server. This test FAILS against the pre-fix gate
+// (which returned false for INFORM).
+func TestClientRequestRelayable(t *testing.T) {
+	cases := []struct {
+		msgType dhcpv4.MessageType
+		want    bool
+	}{
+		{dhcpv4.MessageTypeDiscover, true},
+		{dhcpv4.MessageTypeRequest, true},
+		{dhcpv4.MessageTypeInform, true}, // #2153 regression target
+		{dhcpv4.MessageTypeDecline, false},
+		{dhcpv4.MessageTypeRelease, false},
+		{dhcpv4.MessageTypeOffer, false},
+		{dhcpv4.MessageTypeAck, false},
+		{dhcpv4.MessageTypeNak, false},
+		{dhcpv4.MessageType(0), false}, // missing/zero message type
+	}
+	for _, tc := range cases {
+		if got := clientRequestRelayable(tc.msgType); got != tc.want {
+			t.Errorf("clientRequestRelayable(%v) = %v, want %v",
+				tc.msgType, got, tc.want)
+		}
+	}
+}
+
+// TestRunRelay_RelaysInform is the end-to-end gate proof for #2153: a real
+// BOOTREQUEST/INFORM datagram pushed through the live runRelay loop must be
+// forwarded to the server conn (not silently dropped). It drives the production
+// path via Apply + the recording factory; the client conn delivers one INFORM
+// then blocks. The assertion FAILS against the pre-#2153 gate, which `continue`d
+// on INFORM and never wrote to the server conn.
+func TestRunRelay_RelaysInform(t *testing.T) {
+	// Build a client INFORM: BOOTREQUEST with ciaddr set (client owns its
+	// address) and no yiaddr — the canonical DHCPINFORM shape (RFC 2131 §3.4).
+	inform, err := dhcpv4.New()
+	if err != nil {
+		t.Fatalf("dhcpv4.New: %v", err)
+	}
+	inform.OpCode = dhcpv4.OpcodeBootRequest
+	inform.ClientHWAddr = net.HardwareAddr{0x02, 0x00, 0x00, 0x00, 0x00, 0x01}
+	inform.ClientIPAddr = net.IPv4(192, 0, 2, 50)
+	inform.UpdateOption(dhcpv4.OptMessageType(dhcpv4.MessageTypeInform))
+
+	// The factory hands out the client conn first (runRelay's first newConn
+	// call) then the server conn. Seed the client conn with the INFORM; after
+	// it is consumed ReadFrom blocks until Stop.
+	client := newFakeConn()
+	client.pending = [][]byte{inform.ToBytes()}
+	server := newFakeConn()
+	factory, _ := recordingFactory(client, server)
+	m := testManager(factory)
+
+	m.Apply(context.Background(), singleInterfaceConfig())
+	defer m.Stop()
+
+	// Wait for the INFORM to be relayed onto the server conn.
+	deadline := time.Now().Add(2 * time.Second)
+	for server.writeCount() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if server.writeCount() == 0 {
+		t.Fatal("INFORM was not relayed to the server within 2s " +
+			"(pre-#2153 gate dropped it)")
+	}
+
+	// The relayed datagram must parse, be a BOOTREQUEST/INFORM, and carry the
+	// relay-set giaddr (10.0.0.254, from testManager's resolver).
+	relayed, err := dhcpv4.FromBytes(server.firstWrite(t))
+	if err != nil {
+		t.Fatalf("relayed datagram does not parse: %v", err)
+	}
+	if relayed.OpCode != dhcpv4.OpcodeBootRequest {
+		t.Errorf("relayed opcode = %v, want BOOTREQUEST", relayed.OpCode)
+	}
+	if relayed.MessageType() != dhcpv4.MessageTypeInform {
+		t.Errorf("relayed message type = %v, want INFORM", relayed.MessageType())
+	}
+	if !relayed.GatewayIPAddr.Equal(net.IPv4(10, 0, 0, 254)) {
+		t.Errorf("relayed giaddr = %v, want 10.0.0.254", relayed.GatewayIPAddr)
+	}
+}
+
 // --- Lifecycle test scaffolding (#1915) ---
 
 // fakeConn is a fake net.PacketConn whose ReadFrom blocks until Close (unless
@@ -165,6 +252,24 @@ func (f *fakeConn) isClosed() bool {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.closed
+}
+
+// writeCount returns the number of datagrams written to this conn.
+func (f *fakeConn) writeCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.writes)
+}
+
+// firstWrite returns a copy of the first datagram written to this conn.
+func (f *fakeConn) firstWrite(t *testing.T) []byte {
+	t.Helper()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.writes) == 0 {
+		t.Fatal("no datagram was written to the conn")
+	}
+	return append([]byte(nil), f.writes[0].data...)
 }
 
 func (f *fakeConn) LocalAddr() net.Addr                { return &net.UDPAddr{} }

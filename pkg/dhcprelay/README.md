@@ -23,6 +23,25 @@ to the interface name.
 (the last for the AF_PACKET raw-L2 reply socket — see "Reply delivery
 model" below). No dependency on other `pkg/*` packages.
 
+## Relayed client message types
+
+The client→server forwarding loop (`runRelay`, gated by
+`clientRequestRelayable`) relays every client-originated BOOTREQUEST that
+carries server-bound options, per RFC 2131 §3.4:
+
+| Message type | Relayed | Notes |
+|--------------|---------|-------|
+| `DISCOVER` | yes | lease acquisition |
+| `REQUEST` | yes | lease selection / renewal / rebinding |
+| `INFORM` | yes (#2153) | client already holds an address, asks only for supplemental parameters (DNS/domain/NTP) |
+| `DECLINE`, `RELEASE` | no | sent by the client directly to its bound server; no relay-agent obligation |
+| server reply types (`OFFER`/`ACK`/`NAK`) | no | handled by the server→client path below |
+
+The `INFORM` reply (a server-issued `ACK` with no `yiaddr` but a real
+`ciaddr`) is delivered by the matrix below via the "flag clear, `yiaddr==0`,
+real `ciaddr`" UDP-unicast row — the client already owns and ARP-answers for
+its address.
+
 ## Reply delivery model (#2076)
 
 Server replies (OFFER/ACK) are delivered to clients honoring the RFC 2131

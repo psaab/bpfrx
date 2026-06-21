@@ -449,7 +449,7 @@ func (m *Manager) runRelay(ctx context.Context, cancel context.CancelFunc,
 			}
 
 			msgType := pkt.MessageType()
-			if msgType != dhcpv4.MessageTypeDiscover && msgType != dhcpv4.MessageTypeRequest {
+			if !clientRequestRelayable(msgType) {
 				continue
 			}
 
@@ -654,6 +654,36 @@ func broadcastReply(ir *interfaceRelay, clientConn net.PacketConn, replyData []b
 		return false
 	}
 	return true
+}
+
+// clientRequestRelayable reports whether a client-originated BOOTREQUEST of the
+// given DHCP message type must be relayed to the configured servers.
+//
+// Per RFC 2131 §3.4 a relay agent forwards all client-originated requests that
+// carry server-bound options, not just lease acquisition (DISCOVER) and
+// lease (re)negotiation (REQUEST):
+//
+//   - DISCOVER / REQUEST — lease acquisition and renewal/rebinding.
+//   - INFORM — a client that already holds an address (statically configured,
+//     or post-lease) asking only for supplemental parameters (DNS servers,
+//     domain search, NTP, etc.). Dropping it leaves such clients without
+//     central configuration; the server answers an INFORM with an ACK, which
+//     the reply path already forwards (see deliverReply: the flag-clear,
+//     yiaddr==0, real-ciaddr case unicasts to the client's ciaddr).
+//
+// DECLINE and RELEASE are intentionally not relayed here: they are handled by
+// the client directly to the server it is bound to and carry no relay-agent
+// obligation in this agent's model (matching the pre-#2153 behavior, which
+// only relayed DISCOVER/REQUEST).
+func clientRequestRelayable(msgType dhcpv4.MessageType) bool {
+	switch msgType {
+	case dhcpv4.MessageTypeDiscover,
+		dhcpv4.MessageTypeRequest,
+		dhcpv4.MessageTypeInform:
+		return true
+	default:
+		return false
+	}
 }
 
 // l2Eligible reports whether a reply can be sent via the raw-L2 path: the
