@@ -3,8 +3,63 @@ package config
 import (
 	"fmt"
 	"net"
+	"sort"
 	"strconv"
 )
+
+// maxScanSweepThreshold is the largest port-scan / ip-sweep threshold the
+// AF_XDP dataplane can actually enforce. The dataplane tracks at most
+// MAX_UNIQUE_PER_SOURCE (1024) unique destinations/ports per (zone, source)
+// within the detection window and bounds memory at that cap, so the effective
+// comparison threshold is clamped to MAX_UNIQUE_PER_SOURCE - 1 (fail-closed:
+// a saturated set always crosses it — see
+// userspace-dp/src/screen/scan.rs `check_unique`). A configured threshold
+// above this value is preserved unchanged in the typed config but is clamped
+// to this maximum at runtime; we warn the operator at commit time.
+//
+// MUST stay in sync with the Rust constant MAX_UNIQUE_PER_SOURCE in
+// userspace-dp/src/screen/scan.rs (= maxScanSweepThreshold + 1).
+const maxScanSweepThreshold = 1023
+
+// validateScreenScanSweepThresholds emits a WARNING (never a hard reject) for
+// any screen profile whose port-scan or ip-sweep threshold exceeds
+// maxScanSweepThreshold. The dataplane clamps the effective threshold to that
+// maximum (fail-closed), so a larger configured value detects AT THE CAP
+// rather than as configured. We preserve the operator's configured value (no
+// mutation, no rejection — existing configs keep booting) and tell them it is
+// clamped. Clamp-warn applies on BOTH the strict and lenient compile paths:
+// the value is valid and parseable, it just exceeds what the dataplane can
+// enforce.
+func validateScreenScanSweepThresholds(cfg *Config) []string {
+	var warnings []string
+	// Deterministic order so the warning set is stable across runs.
+	names := make([]string, 0, len(cfg.Security.Screen))
+	for name := range cfg.Security.Screen {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		sp := cfg.Security.Screen[name]
+		if sp == nil {
+			continue
+		}
+		if sp.TCP.PortScanThreshold > maxScanSweepThreshold {
+			warnings = append(warnings, fmt.Sprintf(
+				"security screen ids-option %s tcp port-scan threshold %d exceeds the "+
+					"dataplane maximum (%d) and will be clamped to %d at runtime "+
+					"(detection fires at the cap, not at the configured value)",
+				name, sp.TCP.PortScanThreshold, maxScanSweepThreshold, maxScanSweepThreshold))
+		}
+		if sp.IP.IPSweepThreshold > maxScanSweepThreshold {
+			warnings = append(warnings, fmt.Sprintf(
+				"security screen ids-option %s ip ip-sweep threshold %d exceeds the "+
+					"dataplane maximum (%d) and will be clamped to %d at runtime "+
+					"(detection fires at the cap, not at the configured value)",
+				name, sp.IP.IPSweepThreshold, maxScanSweepThreshold, maxScanSweepThreshold))
+		}
+	}
+	return warnings
+}
 
 func compileSecurity(node *Node, sec *SecurityConfig) error {
 	for _, child := range node.Children {

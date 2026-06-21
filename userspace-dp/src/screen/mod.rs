@@ -1,7 +1,13 @@
 //! Screen/IDS attack protection checks for the userspace dataplane.
 //!
 //! Implements pre-session packet validation that mirrors the eBPF screen stage
-//! (`bpf/xdp/xdp_screen.c`). Checks run on every packet BEFORE session lookup.
+//! (`bpf/xdp/xdp_screen.c`). The stateless + rate-based checks run on every
+//! packet BEFORE session lookup. The stateful scan/sweep detectors
+//! (port-scan, IP-sweep) and the per-IP session limit are NOT pre-session —
+//! they run at the NEW-FLOW / session-MISS decision in `poll_descriptor`
+//! (`scan_sweep_drop_on_new_flow` here, `new_flow_session_limit_drop`
+//! there) so an established flow's mid-stream packets never count toward a
+//! scan/sweep or a session limit (#2210 / #2134 ACK-evasion contract).
 //!
 //! Supported checks:
 //! - Land attack (src == dst)
@@ -217,59 +223,85 @@ impl ScreenState {
         pkt: &ScreenPacketInfo,
         now_secs: u64,
     ) -> ScreenVerdict {
-        let profile = match self.profiles.get(zone) {
-            Some(p) => p.clone(), // clone to avoid borrow issues with &mut self
-            None => return ScreenVerdict::Pass,
+        // #2209 perf: borrow the profile instead of cloning it. The
+        // stateless/rate checks below read `self.profiles` immutably while
+        // mutating disjoint per-zone counter fields (`icmp_counters`,
+        // `syn_counters`, …) and the SYN-cookie sub-state — Rust's
+        // disjoint-field borrow rules permit holding `&self.profiles[..]`
+        // across `self.<other_field>.get_mut(..)`. The pre-#2209 per-packet
+        // `ScreenProfile::clone()` was a convenience to dodge a borrow
+        // conflict that does not actually exist; on the screen hot path it
+        // was a full-struct copy on every screened packet. Helper methods
+        // that need `&mut self` (SYN-cookie codec/epoch/validated-cache)
+        // copy the small fields they need out of `*profile` first so the
+        // immutable `profiles` borrow is not held across them.
+        let Some(profile) = self.profiles.get(zone) else {
+            return ScreenVerdict::Pass;
         };
 
         // --- Stateless checks (side-effect-free) ---
-        if let Some(reason) = stateless::check_land(&profile, pkt) {
+        if let Some(reason) = stateless::check_land(profile, pkt) {
             return ScreenVerdict::Drop(reason);
         }
-        if let Some(reason) = stateless::check_tcp_flag_screens(&profile, pkt) {
+        if let Some(reason) = stateless::check_tcp_flag_screens(profile, pkt) {
             return ScreenVerdict::Drop(reason);
         }
-        if let Some(reason) = stateless::check_ping_of_death(&profile, pkt) {
+        if let Some(reason) = stateless::check_ping_of_death(profile, pkt) {
             return ScreenVerdict::Drop(reason);
         }
-        if let Some(reason) = stateless::check_teardrop(&profile, pkt) {
+        if let Some(reason) = stateless::check_teardrop(profile, pkt) {
             return ScreenVerdict::Drop(reason);
         }
-        if let Some(reason) = stateless::check_icmp_fragment(&profile, pkt) {
+        if let Some(reason) = stateless::check_icmp_fragment(profile, pkt) {
             return ScreenVerdict::Drop(reason);
         }
-        if let Some(reason) = stateless::check_source_route(&profile, pkt) {
+        if let Some(reason) = stateless::check_source_route(profile, pkt) {
             return ScreenVerdict::Drop(reason);
         }
 
         // --- Rate-based flood checks ---
+        // Copy the small scalar thresholds/flags out of the profile so the
+        // immutable `self.profiles` borrow is released before the SYN-cookie
+        // path needs `&mut self` (`current_syn_cookie_full_epoch`,
+        // `syn_cookie_validated`). The flood counters below are disjoint
+        // fields so they could borrow alongside `profile`, but pulling the
+        // scalars up front keeps the SYN-cookie borrow story trivial.
+        let icmp_flood_threshold = profile.icmp_flood_threshold;
+        let udp_flood_threshold = profile.udp_flood_threshold;
+        let syn_flood_threshold = profile.syn_flood_threshold;
+        let syn_cookie = profile.syn_cookie;
+        // `profile` borrow ends here (NLL): no further reads of
+        // `self.profiles` in this method. Scan/sweep moved to the new-flow
+        // hook (`scan_sweep_drop_on_new_flow`), so the advanced trackers are
+        // not touched on this per-packet path anymore (#2210).
+
         let mut syn_cookie_bypassed = false;
 
         // ICMP flood
-        if profile.icmp_flood_threshold > 0
+        if icmp_flood_threshold > 0
             && (pkt.protocol == PROTO_ICMP || pkt.protocol == PROTO_ICMPV6)
         {
             if let Some(counter) = self.icmp_counters.get_mut(zone) {
-                if counter.increment(now_secs, profile.icmp_flood_threshold) {
+                if counter.increment(now_secs, icmp_flood_threshold) {
                     return ScreenVerdict::Drop("icmp-flood");
                 }
             }
         }
 
         // UDP flood
-        if profile.udp_flood_threshold > 0 && pkt.protocol == PROTO_UDP {
+        if udp_flood_threshold > 0 && pkt.protocol == PROTO_UDP {
             if let Some(counter) = self.udp_counters.get_mut(zone) {
-                if counter.increment(now_secs, profile.udp_flood_threshold) {
+                if counter.increment(now_secs, udp_flood_threshold) {
                     return ScreenVerdict::Drop("udp-flood");
                 }
             }
         }
 
         // SYN flood: count TCP SYN (without ACK) per zone
-        if profile.syn_flood_threshold > 0 && pkt.protocol == PROTO_TCP {
+        if syn_flood_threshold > 0 && pkt.protocol == PROTO_TCP {
             let tf = pkt.tcp_flags;
             if is_initial_syn(tf) {
-                let syn_cookie_validated = profile.syn_cookie
+                let syn_cookie_validated = syn_cookie
                     && self.syn_cookie_validated.take_valid(
                         zone_id,
                         SynCookieTuple::from_packet(pkt),
@@ -280,9 +312,9 @@ impl ScreenState {
                 }
                 if !syn_cookie_validated {
                     if let Some(counter) = self.syn_counters.get_mut(zone)
-                        && counter.increment(now_secs, profile.syn_flood_threshold)
+                        && counter.increment(now_secs, syn_flood_threshold)
                     {
-                        if profile.syn_cookie {
+                        if syn_cookie {
                             if let Some(active_until) =
                                 self.syn_cookie_active_until_secs.get_mut(zone)
                             {
@@ -315,60 +347,127 @@ impl ScreenState {
             }
         }
 
-        // --- Advanced stateful checks ---
-        // These run only on TCP SYN (new connection attempts) to avoid
-        // false positives on established traffic.
-        if pkt.protocol == PROTO_TCP {
-            let tf = pkt.tcp_flags;
-            let is_syn = is_initial_syn(tf);
+        // #2210: port-scan / IP-sweep are NOT evaluated here. They used to
+        // run on this per-packet pre-session stage, so IP-sweep counted
+        // EVERY packet — including mid-flow established TCP ACKs/data and
+        // UDP — before the dataplane knew whether a session already
+        // existed. A single legitimate high-fan-out client (one host with
+        // live connections to many backends) would trip ip-sweep without
+        // ever sending a probe, and the original #867 ACK-evasion contract
+        // ("an ACK that matches a live session is not a sweep probe") was
+        // lost. The scan/sweep mutation now lives in
+        // `scan_sweep_drop_on_new_flow`, invoked from the new-flow /
+        // session-MISS decision in `poll_descriptor` (the same hook that
+        // owns the #2134 per-IP session-limit check), so only a genuinely
+        // new flow counts toward a scan/sweep.
 
-            // Port scan detection: count unique dst ports per src IP
-            if is_syn && profile.port_scan_threshold > 0 {
-                if self.port_scan.check(
-                    pkt.src_ip,
-                    pkt.dst_port,
-                    now_secs,
-                    profile.port_scan_threshold,
-                ) {
-                    return ScreenVerdict::Drop("port-scan");
-                }
-            }
-        }
-
-        // IP sweep detection: count unique dst IPs per src IP (all protocols)
-        if profile.ip_sweep_threshold > 0 {
-            if self
-                .ip_sweep
-                .check(pkt.src_ip, pkt.dst_ip, now_secs, profile.ip_sweep_threshold)
-            {
-                return ScreenVerdict::Drop("ip-sweep");
-            }
-        }
-
-        // #2134: per-IP session limits are NOT checked here. The screen
-        // stage runs on EVERY packet of EVERY flow (this code sits
-        // outside the `is_syn` gate that guards `port_scan`), and runs
-        // BEFORE the session lookup — so checking `count >= limit` here
-        // would re-evaluate an established flow's own counted session on
-        // every data packet and self-drop it at the limit boundary. The
-        // session-limit enforcement now lives at the new-flow /
-        // session-MISS decision in `poll_descriptor`, where it fires
-        // exactly once per new flow, before that flow's session exists.
-        // See `session::SessionTable::session_limit_{src,dst}_count` and
-        // the count maintenance at the install/remove sinks.
-
-        // Periodic cleanup of tracker state (every 30 seconds)
-        if now_secs.saturating_sub(self.last_cleanup_secs) >= 30 {
-            self.port_scan.cleanup(now_secs);
-            self.ip_sweep.cleanup(now_secs);
-            self.last_cleanup_secs = now_secs;
-        }
+        // #2134: per-IP session limits are NOT checked here either, for the
+        // same reason — they live at the new-flow / session-MISS decision in
+        // `poll_descriptor`, where they fire exactly once per new flow
+        // before that flow's session exists. See
+        // `session::SessionTable::session_limit_{src,dst}_count` and the
+        // count maintenance at the install/remove sinks.
 
         if syn_cookie_bypassed {
             ScreenVerdict::SynCookieBypass
         } else {
             ScreenVerdict::Pass
         }
+    }
+
+    /// #2210 + #2209: port-scan / IP-sweep evaluation at the NEW-FLOW
+    /// decision, mirroring the #2134 session-limit-on-miss hook.
+    ///
+    /// This MUST be called only after the caller has determined the packet
+    /// is a session MISS (no established session matched). That is what
+    /// preserves the ACK-evasion contract: an established flow's mid-stream
+    /// packets are session HITS and never reach this hook, so they never
+    /// inflate the sweep counter (the #2210 false-positive root cause).
+    /// port-scan additionally keeps its TCP-initial-SYN gate; IP-sweep
+    /// counts the new flow on any protocol.
+    ///
+    /// State is keyed by `(zone_id, src_ip)` (per-zone, #2209) and bounded
+    /// (per-zone source cap + per-source unique-entry cap, fail-safe on
+    /// overflow — see `scan.rs`). Returns the screen-drop reason if the new
+    /// flow crosses a threshold, or `None` to proceed. Cold path
+    /// (session-miss only).
+    pub fn scan_sweep_drop_on_new_flow(
+        &mut self,
+        zone: &str,
+        zone_id: u16,
+        pkt: &ScreenPacketInfo,
+        now_secs: u64,
+    ) -> Option<&'static str> {
+        let Some(profile) = self.profiles.get(zone) else {
+            return None;
+        };
+        let port_scan_threshold = profile.port_scan_threshold;
+        let ip_sweep_threshold = profile.ip_sweep_threshold;
+        // `profile` borrow ends here (NLL).
+        if port_scan_threshold == 0 && ip_sweep_threshold == 0 {
+            // Still tick the cleanup so a config with the feature briefly
+            // enabled-then-disabled cannot strand tracker state.
+            self.maybe_cleanup_trackers(now_secs);
+            return None;
+        }
+
+        // Port scan: count unique dst ports per (zone, src) on initial SYN.
+        if port_scan_threshold > 0
+            && pkt.protocol == PROTO_TCP
+            && is_initial_syn(pkt.tcp_flags)
+            && self
+                .port_scan
+                .check(zone_id, pkt.src_ip, pkt.dst_port, now_secs, port_scan_threshold)
+        {
+            self.maybe_cleanup_trackers(now_secs);
+            return Some("port-scan");
+        }
+
+        // IP sweep: count unique dst IPs per (zone, src) for the new flow
+        // (any protocol). Because this only runs on a session MISS, an
+        // established flow's packets never count.
+        if ip_sweep_threshold > 0
+            && self
+                .ip_sweep
+                .check(zone_id, pkt.src_ip, pkt.dst_ip, now_secs, ip_sweep_threshold)
+        {
+            self.maybe_cleanup_trackers(now_secs);
+            return Some("ip-sweep");
+        }
+
+        self.maybe_cleanup_trackers(now_secs);
+        None
+    }
+
+    /// Periodic (>=30s) budgeted cleanup of the scan/sweep trackers. Driven
+    /// from the new-flow hook so it is co-located with the only site that
+    /// mutates the trackers.
+    fn maybe_cleanup_trackers(&mut self, now_secs: u64) {
+        if now_secs.saturating_sub(self.last_cleanup_secs) >= 30 {
+            self.port_scan.cleanup(now_secs);
+            self.ip_sweep.cleanup(now_secs);
+            self.last_cleanup_secs = now_secs;
+        }
+    }
+
+    /// #2209: total scan/sweep records skipped because a per-zone source
+    /// cap or per-source unique-entry cap was hit (fail-safe overflow
+    /// pressure). Pure observability; never affects a verdict.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn scan_sweep_skipped_pressure(&self) -> u64 {
+        self.port_scan.skipped_pressure() + self.ip_sweep.skipped_pressure()
+    }
+
+    /// #2227 MAJOR-1: total scan/sweep checks whose operator threshold
+    /// exceeded the supported maximum (`MAX_UNIQUE_PER_SOURCE - 1`) and was
+    /// clamped to it (fail-closed clamp — detection fires AT THE CAP rather
+    /// than never). Pure observability; surfaces an operator misconfiguration
+    /// (a threshold the bounded set could never reach un-clamped). The Go
+    /// control plane also warns at commit time when a threshold exceeds the
+    /// supported maximum.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn scan_sweep_threshold_clamped(&self) -> u64 {
+        self.port_scan.threshold_clamped() + self.ip_sweep.threshold_clamped()
     }
 
     /// Validate a returning SYN-cookie ACK only after the caller has already

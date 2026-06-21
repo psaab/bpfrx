@@ -1,5 +1,42 @@
 # Action Log
 
+## 2026-06-21 — #2209 + #2210: screen scan/sweep per-zone + bounded + count-after-lookup
+
+- **Timestamp**: 2026-06-21
+- **Action**: One cohesive PR fixing two HIGH screen scan/sweep
+  correctness bugs in the userspace AF_XDP dataplane.
+  - **#2210 (count-after-lookup)**: moved port-scan + IP-sweep MUTATION off
+    the per-packet pre-session screen stage (`check_packet_with_zone_id`)
+    onto a new NEW-FLOW / session-MISS hook
+    (`ScreenState::scan_sweep_drop_on_new_flow`), invoked from
+    `poll_descriptor` next to the #2134 `new_flow_session_limit_drop`. An
+    established flow's packets are session HITS and never reach the hook, so
+    mid-stream ACKs/data/UDP no longer inflate the sweep counter (restores
+    the #867 ACK-evasion contract). Port-scan keeps its initial-SYN gate;
+    IP-sweep counts any new-flow protocol.
+  - **#2209 (per-zone + bounded + perf)**: re-keyed `PortScanTracker` /
+    `IpSweepTracker` from a single global per-`src_ip` map to
+    `(zone_id, src_ip)` (no cross-zone bleed); bounded both axes
+    (`MAX_SOURCES_PER_ZONE=4096`, `MAX_UNIQUE_PER_SOURCE=1024`) with
+    fail-safe skip-on-full + `skipped_pressure` counter (never fail-open the
+    drop, never unbounded growth) and a budgeted per-tick cleanup
+    (`CLEANUP_BUDGET=256`); replaced the per-packet `ScreenProfile::clone()`
+    on the hot path with a borrow (copy only the scalar thresholds needed
+    for the SYN-cookie `&mut self` calls).
+- **File(s)**: `userspace-dp/src/screen/scan.rs` (rewrite — per-zone +
+  bounded + scan_tests), `userspace-dp/src/screen/mod.rs` (borrow not
+  clone; scan/sweep removed from per-packet path; new
+  `scan_sweep_drop_on_new_flow` + `scan_sweep_skipped_pressure` +
+  `maybe_cleanup_trackers`), `userspace-dp/src/afxdp/poll_descriptor/mod.rs`
+  (wire the new-flow scan/sweep hook into the session-miss decision),
+  `userspace-dp/src/screen/tests.rs` (scan/sweep tests retargeted to the
+  miss hook + 4 fail-on-revert tests), `userspace-dp/src/session/README.md`
+  (count-on-miss + per-zone + bounded semantics).
+- **Validation**: `cargo build --release` clean; `cargo test screen` 104/0;
+  10 new tests pass 5x (no flake); fail-on-revert proven for both issues
+  (re-adding pre-session ip_sweep → established-traffic test FAILS;
+  zone-key→global → 3 per-zone tests FAIL). Live screen/flood smoke on the
+  loss cluster is PENDING-PARENT.
 ## 2026-06-21 — #2211 + #2212: NAT64 zero-per-packet-alloc transit + fail-closed config parse
 
 - **Timestamp**: 2026-06-21
@@ -8716,6 +8753,31 @@ top.
   docs/refactoring-audit-current.txt
 
 - **Timestamp**: 2026-06-21
+- **Action**: #2227 (#2209/#2210) MERGE-NEEDS-MAJOR fixes. MAJOR-1
+  security fail-open: scan/sweep `check_unique` capped the per-source set
+  at MAX_UNIQUE_PER_SOURCE=1024 then compared `len() > threshold`, so an
+  operator threshold >= 1024 (valid/parseable, e.g. port-scan 5000)
+  could NEVER be crossed -> scanner never dropped (silent fail-OPEN).
+  Fix: clamp the EFFECTIVE comparison threshold to MAX_UNIQUE_PER_SOURCE-1
+  (fail-CLOSED: detect AT THE CAP), count via `threshold_clamped` /
+  `scan_sweep_threshold_clamped`, and add a Go commit-time clamp WARNING
+  (compiler_security.go `maxScanSweepThreshold=1023`, kept in sync with
+  the Rust const; warn+preserve value, never reject). MINOR-3: real
+  negative-Copy guard for ScreenProfile (autoref specialization, fails on
+  revert). MINOR-4: softened "O(total-sources)"/"never fail-opens" docs
+  (retain walks all entries; budget bounds removals; source cap bounds
+  the table). MINOR-5: deduped the double extract_screen_info on the cold
+  new-flow drop path. MINOR-2 (source-table saturation detection-DoS):
+  documented as known limitation + follow-up #2234. Fail-on-revert proven
+  for MAJOR-1 (both tests fail with the un-clamped compare) and MINOR-3
+  (guard fails when ScreenProfile is made Copy). Rust 107 screen tests +
+  4 new (5x flake clean); Go pkg/config green (5x flake clean).
+- **File(s)**: userspace-dp/src/screen/scan.rs,
+  userspace-dp/src/screen/mod.rs, userspace-dp/src/screen/tests.rs,
+  userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/session/README.md,
+  pkg/config/compiler_security.go, pkg/config/compiler.go,
+  pkg/config/parser_security_test.go
 - **Action**: #2214 — fix Go<->Rust empty-collection null-decode no-transit
   bug (#1961-class). A NAT64 rule with no resolvable source-pool emitted
   `pool_addresses:null` and a firewall filter with zero terms emitted
