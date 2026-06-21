@@ -122,45 +122,69 @@ func BuildCatalog(cfg *config.Config) (Catalog, error) {
 	return cat, nil
 }
 
-// catalogProtocolNumber mirrors pkg/dataplane.protocolNumber so the catalog's
-// protocol byte matches what the legacy compiler used. Kept private to pkg/appid
-// to avoid an import cycle with pkg/dataplane.
-func catalogProtocolNumber(name string) uint8 {
-	switch strings.ToLower(name) {
+// ProtocolNumber is the single source of truth (#2124) for resolving an IANA
+// protocol name, a Junos predefined-protocol alias, or a numeric string to its
+// IANA protocol number. It is the centralized replacement for the formerly
+// duplicated tables in pkg/appid (catalogProtocolNumber) and pkg/dataplane
+// (protocolNumber); both now delegate here so the userspace policy capability
+// gate, the legacy compiler, and the app-identification catalog agree on
+// exactly which protocols are representable.
+//
+// ok=false means the token is neither a known name/alias nor a valid 0..255
+// numeric. Crucially, the deliberate "protocol 0" (HOPOPT) resolves to
+// (0, true) — distinct from the unrepresentable (0, false) case — so callers
+// that fail closed on unrepresentable protocols (#2124 Layer G) do not also
+// reject a legitimate "protocol 0".
+//
+// pkg/appid is a leaf package (imports only pkg/config), so housing the helper
+// here keeps it importable by both pkg/dataplane (which already imports
+// pkg/appid) and pkg/dataplane/userspace without an import cycle.
+func ProtocolNumber(name string) (uint8, bool) {
+	switch strings.ToLower(strings.TrimSpace(name)) {
 	case "tcp", "junos-tcp-any":
-		return 6
+		return 6, true
 	case "udp", "junos-udp-any":
-		return 17
+		return 17, true
 	case "icmp", "junos-icmp-all", "junos-ping":
-		return 1
+		return 1, true
 	case "icmpv6", "icmp6", "junos-icmp6-all", "junos-pingv6":
-		return 58
+		return 58, true
 	case "gre", "junos-gre":
-		return 47
+		return 47, true
 	case "ospf", "junos-ospf":
-		return 89
+		return 89, true
 	case "junos-ip-in-ip", "junos-ipip", "ipip":
-		return 4
+		return 4, true
 	case "egp":
-		return 8
+		return 8, true
 	case "igmp":
-		return 2
+		return 2, true
 	case "pim":
-		return 103
+		return 103, true
 	case "ah":
-		return 51
+		return 51, true
 	case "esp":
-		return 50
+		return 50, true
 	case "sctp":
-		return 132
+		return 132, true
 	case "vrrp":
-		return 112
+		return 112, true
 	default:
-		if n, err := strconv.Atoi(name); err == nil && n > 0 && n < 256 {
-			return uint8(n)
+		// Numeric protocol number, including the deliberate "0" (HOPOPT).
+		if n, err := strconv.Atoi(strings.TrimSpace(name)); err == nil && n >= 0 && n < 256 {
+			return uint8(n), true
 		}
-		return 0
+		return 0, false
 	}
+}
+
+// catalogProtocolNumber resolves a protocol to its byte for the app-id catalog,
+// returning 0 for an unrepresentable token (the catalog's historical
+// "unknown -> 0" behavior). Delegates to ProtocolNumber (#2124) so the catalog
+// and the capability gate share one table.
+func catalogProtocolNumber(name string) uint8 {
+	n, _ := ProtocolNumber(name)
+	return n
 }
 
 // parsePortRange mirrors pkg/dataplane.parsePortRange. Inclusive boundaries;
