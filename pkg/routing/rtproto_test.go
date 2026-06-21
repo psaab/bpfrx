@@ -7,12 +7,17 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+// frrZStatic is FRR's private RTPROT_ZSTATIC value (zebra/rt_netlink.h)
+// for staticd-installed routes; it has no golang.org/x/sys/unix
+// constant. Mirrors the package-internal rtprotZStatic.
+const frrZStatic = 196
+
 // TestRtProtoName asserts that each kernel rtnetlink rtm_protocol value
 // maps to the xpf protocol name shown by "show route" (#2127). The
 // inputs use the named unix.RTPROT_* constants so the test stays correct
 // if the constant numbers ever change. The cases are non-tautological:
-// against pre-#2127 code, RTPROT_ISIS yielded "187", RTPROT_ZEBRA
-// yielded "ospf", RTPROT_BIRD yielded "isis", and 196 yielded "static".
+// against pre-#2127 code, RTPROT_ISIS yielded the literal "187",
+// RTPROT_ZEBRA yielded "ospf", and RTPROT_BIRD yielded "isis".
 func TestRtProtoName(t *testing.T) {
 	tests := []struct {
 		name  string
@@ -29,13 +34,22 @@ func TestRtProtoName(t *testing.T) {
 		{"ospf", unix.RTPROT_OSPF, "ospf"},
 		{"rip", unix.RTPROT_RIP, "rip"},
 
-		// The #2127 fixes.
-		{"isis-187", unix.RTPROT_ISIS, "isis"},    // was "187" (unmapped)
-		{"zebra-11", unix.RTPROT_ZEBRA, "static"}, // was "ospf"
+		// FRR staticd installs routes as RTPROT_ZSTATIC=196, mapped to
+		// "static". This arm pre-dates #2127 and must be preserved (the
+		// kernel UAPI RTPROT_STATIC=4 above is a different value).
+		{"frr-zstatic-196", frrZStatic, "static"},
 
-		// Dropped/bogus arms now fall through to the numeric string.
-		{"bird-12-falls-through", unix.RTPROT_BIRD, "12"}, // was "isis"
-		{"bogus-196-falls-through", 196, "196"},           // was "static"
+		// The #2127 fixes.
+		{"isis-187", unix.RTPROT_ISIS, "isis"}, // was the literal "187"
+
+		// RTPROT_ZEBRA(11) is FRR's ZEBRA_ROUTE_TABLE/NHG marker, not a
+		// named xpf protocol, so it falls through to the numeric string.
+		// Pre-#2127 it was wrongly mapped to "ospf".
+		{"zebra-11-falls-through", unix.RTPROT_ZEBRA, "11"},
+
+		// BIRD(12) is not emitted by FRR; fall through to numeric.
+		// Pre-#2127 it was wrongly mapped to "isis".
+		{"bird-12-falls-through", unix.RTPROT_BIRD, "12"},
 
 		// Genuinely unknown protocol byte.
 		{"unknown-250", 250, "250"},

@@ -201,26 +201,36 @@ func (rr *routeReader) routeToEntry(r netlink.Route, family int) RouteEntry {
 	return entry
 }
 
+// rtprotZStatic is FRR's private rtnetlink protocol value for staticd-
+// installed routes (RTPROT_ZSTATIC). It is NOT a Linux UAPI constant, so
+// it has no golang.org/x/sys/unix counterpart; FRR's zebra2proto() maps
+// ZEBRA_ROUTE_STATIC -> RTPROT_ZSTATIC (zebra/rt_netlink.h, value 196)
+// and proto2zebra() reads both RTPROT_STATIC and RTPROT_ZSTATIC back as
+// ZEBRA_ROUTE_STATIC.
+const rtprotZStatic = 196
+
 // rtProtoName maps a netlink route protocol to its xpf protocol name.
 //
 // The argument is the kernel rtnetlink rtm_protocol byte. FRR's zebra
-// stamps each FIB route with the originating daemon's RTPROT_* value
-// (bgpd->BGP, ospfd/ospf6d->OSPF, isisd->ISIS, ripd/ripngd->RIP);
-// zebra/staticd-originated routes appear as RTPROT_ZEBRA. The numeric
-// comments record the constant values for the reader. Protocol bytes
-// xpf does not recognize fall through to their numeric string. The
-// returned name feeds protoTag()/junosProtoName() in routeformat.go.
+// stamps each FIB route with the originating daemon's RTPROT_* value via
+// zebra2proto(): bgpd->RTPROT_BGP, ospfd/ospf6d->RTPROT_OSPF,
+// isisd->RTPROT_ISIS, ripd->RTPROT_RIP, staticd->RTPROT_ZSTATIC(196),
+// connected/local/kernel->RTPROT_KERNEL. RTPROT_ZEBRA(11) is reserved by
+// FRR for ZEBRA_ROUTE_TABLE/NHG routes, which xpf does not surface as a
+// named protocol, so it falls through to its numeric string like any
+// other unrecognized value. The numeric comments record the constant
+// values for the reader. The returned name feeds protoTag() and
+// junosProtoName() in routeformat.go and the `show route protocol <x>`
+// filter in pkg/cli/cli_show_routing.go.
 func rtProtoName(p netlink.RouteProtocol) string {
 	switch int(p) {
 	case unix.RTPROT_REDIRECT: // 1
 		return "redirect"
-	case unix.RTPROT_KERNEL: // 2
+	case unix.RTPROT_KERNEL: // 2 — also FRR connected/local/kernel
 		return "connected"
 	case unix.RTPROT_BOOT: // 3
 		return "dhcp"
-	case unix.RTPROT_STATIC: // 4
-		return "static"
-	case unix.RTPROT_ZEBRA: // 11 — FRR zebra/staticd-installed routes
+	case unix.RTPROT_STATIC: // 4 — manual `ip route` static
 		return "static"
 	case unix.RTPROT_DHCP: // 16
 		return "dhcp"
@@ -232,6 +242,8 @@ func rtProtoName(p netlink.RouteProtocol) string {
 		return "ospf"
 	case unix.RTPROT_RIP: // 189
 		return "rip"
+	case rtprotZStatic: // 196 — FRR staticd (RTPROT_ZSTATIC)
+		return "static"
 	default:
 		return strconv.Itoa(int(p))
 	}

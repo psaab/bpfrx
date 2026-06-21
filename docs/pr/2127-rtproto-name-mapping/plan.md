@@ -1,6 +1,47 @@
 # #2127 — rtProtoName mislabels FRR route protocols
 
-**Status:** DRAFT v1 — pending adversarial plan review
+**Status:** v2 — Codex round-1 PLAN-NEEDS-MAJOR resolved (see "Plan
+review resolution" below). Implemented.
+
+## Plan review resolution (round 1)
+
+Codex (task-mqnaft7k-62iwbm) returned **PLAN-NEEDS-MAJOR** with one
+load-bearing finding that the v1 plan got wrong, verified against FRR
+upstream source (`zebra/rt_netlink.h` + `zebra/rt_netlink.c`
+`zebra2proto`/`proto2zebra`):
+
+- **`196` is FRR's private `RTPROT_ZSTATIC`** (not a bogus value).
+  `zebra2proto()` maps `ZEBRA_ROUTE_STATIC -> RTPROT_ZSTATIC(196)`, and
+  `proto2zebra()` reads BOTH `RTPROT_STATIC`(4) and `RTPROT_ZSTATIC`(196)
+  back as `ZEBRA_ROUTE_STATIC`. So FRR staticd routes ARE stamped 196 and
+  the original `196 -> static` arm was CORRECT. **Resolution:** keep
+  `196 -> static`, define a local `rtprotZStatic = 196` const (no
+  `unix` counterpart exists) with a correct comment citing FRR.
+- **`RTPROT_ZEBRA(11)` is NOT static.** `zebra2proto()` maps
+  `ZEBRA_ROUTE_TABLE` / `ZEBRA_ROUTE_NHG -> RTPROT_ZEBRA(11)`. Mapping 11
+  to "static" (v1 plan) would mislabel table/NHG routes; `11 -> ospf`
+  (pre-fix) is also wrong. **Resolution:** drop the 11 arm entirely so it
+  falls through to the numeric string (xpf has no Junos name for
+  table/NHG routes). Verified against FRR source, the `unix.RTPROT_*`
+  values (BGP 186, ISIS 187, OSPF 188, RIP 189, ZEBRA 11, BIRD 12,
+  DHCP 16) are correct.
+- **`RouteEntry.Protocol` also feeds the `show route protocol <x>`
+  filter** (`pkg/cli/cli_show_routing.go:170`, `strings.ToLower(
+  e.Protocol) == proto`) and gRPC route text — confirmed. This makes the
+  fix MORE valuable: pre-fix, `show route protocol isis` returned nothing
+  because IS-IS routes carried `Protocol="187"`. The corrected names
+  ("isis"/"static"/etc.) are exactly the filter tokens, so the fix is
+  downstream-consistent. No change to consumers needed.
+
+Gemini companion is **unavailable** (the abiswas97-gemini runtime
+returned "This client is no longer supported for Gemini Code Assist for
+individuals" — the Code Assist personal tier is deprecated). The
+independent second plan review is delegated to AGY (Antigravity) / the
+parent's reviewer set instead.
+
+---
+
+## v1 (superseded by the resolution above)
 
 ## Issue framing
 
