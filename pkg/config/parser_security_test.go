@@ -4897,3 +4897,169 @@ func TestAddressBookDescriptionResolvesInPolicy(t *testing.T) {
 		t.Fatalf("policy source-address h2 prefix not parseable: %v", perr)
 	}
 }
+
+// TestAddressBookEmptyValueWarns is the #2229 regression: after #2228 an
+// address-book `address <name>` entry that compiles with no usable prefix —
+// either no prefix at all (description-only) or only an as-yet-uncompiled
+// sub-stanza (dns-name/range-address/wildcard-address) — has Value=="". That
+// is fail-closed and safe at resolution (net.ParseCIDR("") errors → matches
+// nothing), but before this fix the warn validator skipped empty Values, so an
+// operator authoring error went silent. ValidateConfig must now emit a
+// non-blocking warning, while commit still succeeds (warning, not reject), and
+// an address WITH a valid prefix must produce NO warning (no false-positive).
+//
+// FAIL-ON-REVERT: revert compiler_validate_warn.go and the empty-Value subtests
+// lose their warning; the valid-prefix subtest still passes (proves the new
+// branch is the load-bearing change). Both AST shapes are exercised.
+func TestAddressBookEmptyValueWarns(t *testing.T) {
+	const wantMsg = `address-book "h2": no usable prefix configured; it will match nothing`
+
+	flatSet := func(t *testing.T, lines []string) *ConfigTree {
+		t.Helper()
+		tree := &ConfigTree{}
+		for _, cmd := range lines {
+			path, err := ParseSetCommand(cmd)
+			if err != nil {
+				t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+			}
+			if err := tree.SetPath(path); err != nil {
+				t.Fatalf("SetPath(%q): %v", cmd, err)
+			}
+		}
+		return tree
+	}
+	hier := func(t *testing.T, src string) *ConfigTree {
+		t.Helper()
+		p := NewParser(src)
+		tree, errs := p.Parse()
+		if len(errs) > 0 {
+			t.Fatalf("Parse hierarchical: %v", errs)
+		}
+		return tree
+	}
+
+	hasMsg := func(ws []string, msg string) bool {
+		for _, w := range ws {
+			if strings.Contains(w, msg) {
+				return true
+			}
+		}
+		return false
+	}
+	hasH2InvalidOrEmpty := func(ws []string) bool {
+		for _, w := range ws {
+			if strings.Contains(w, `address-book "h2": invalid address`) ||
+				strings.Contains(w, `address-book "h2": no usable prefix`) {
+				return true
+			}
+		}
+		return false
+	}
+
+	cases := []struct {
+		name      string
+		tree      func(t *testing.T) *ConfigTree
+		wantWarn  bool // expect the empty-prefix warning for h2
+		wantValue string
+	}{
+		{
+			name: "flat-set description-only (no prefix) warns",
+			tree: func(t *testing.T) *ConfigTree {
+				return flatSet(t, []string{
+					"set security address-book global address h2 description web-server",
+				})
+			},
+			wantWarn:  true,
+			wantValue: "",
+		},
+		{
+			name: "hierarchical description-only (no prefix) warns",
+			tree: func(t *testing.T) *ConfigTree {
+				return hier(t, `security {
+    address-book {
+        global {
+            address h2 {
+                description "web-server";
+            }
+        }
+    }
+}`)
+			},
+			wantWarn:  true,
+			wantValue: "",
+		},
+		{
+			name: "flat-set uncompiled sub-stanza (dns-name) warns",
+			tree: func(t *testing.T) *ConfigTree {
+				return flatSet(t, []string{
+					"set security address-book global address h2 dns-name example.com",
+				})
+			},
+			wantWarn:  true,
+			wantValue: "",
+		},
+		{
+			name: "flat-set valid prefix does NOT warn (no false-positive)",
+			tree: func(t *testing.T) *ConfigTree {
+				return flatSet(t, []string{
+					"set security address-book global address h2 192.168.2.0/24",
+				})
+			},
+			wantWarn:  false,
+			wantValue: "192.168.2.0/24",
+		},
+		{
+			name: "hierarchical valid prefix does NOT warn (no false-positive)",
+			tree: func(t *testing.T) *ConfigTree {
+				return hier(t, `security {
+    address-book {
+        global {
+            address h2 {
+                192.168.2.0/24;
+            }
+        }
+    }
+}`)
+			},
+			wantWarn:  false,
+			wantValue: "192.168.2.0/24",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tree := tc.tree(t)
+
+			// Commit succeeds (compiles without error) in BOTH cases — the
+			// empty-prefix entry is a warning, never a hard reject.
+			cfg, err := CompileConfig(tree)
+			if err != nil {
+				t.Fatalf("CompileConfig: %v (commit must succeed — warning, not reject)", err)
+			}
+			ab := cfg.Security.AddressBook
+			if ab == nil {
+				t.Fatal("AddressBook is nil")
+			}
+			addr := ab.Addresses["h2"]
+			if addr == nil {
+				t.Fatalf("address h2 dropped (got %d addresses)", len(ab.Addresses))
+			}
+			if addr.Value != tc.wantValue {
+				t.Errorf("address h2 Value = %q, want %q", addr.Value, tc.wantValue)
+			}
+
+			warnings := ValidateConfig(cfg)
+			if tc.wantWarn {
+				if !hasMsg(warnings, wantMsg) {
+					t.Errorf("expected empty-prefix warning %q, got warnings: %v", wantMsg, warnings)
+				}
+			} else {
+				// Valid prefix: no empty-prefix warning AND no invalid-address
+				// warning for h2 (no false-positive of either flavour).
+				if hasH2InvalidOrEmpty(warnings) {
+					t.Errorf("unexpected h2 address warning for a valid prefix: %v", warnings)
+				}
+			}
+		})
+	}
+}
