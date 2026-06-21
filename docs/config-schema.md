@@ -411,6 +411,41 @@ reserved for whole-dataplane selection where a rewrite shim
   empty-tree-compiles-non-nil trap). Regression coverage:
   `pkg/config/compiler_dhcp_ddns_test.go` (dual-AST equality, absent-default,
   TSIG redaction, enum/ttl accept+reject).
+- **#2243 (DHCP-server static / fixed / reserved host bindings):** added a
+  `static-binding <mac>` named-instance subtree under `services
+  dhcp-local-server group <g> pool <p>` AND `services dhcpv6-local-server
+  group <g> pool <p>`. The schema tree is built by `dhcpStaticBindingSchema()`
+  in `schema_system.go` (returned fresh per call so the v4/v6 parents do not
+  alias a mutable map). The instance key is the client hardware (MAC)
+  address — `keyValueType: ValueMAC` + `keyValidator: ValidateMAC`, so a
+  malformed MAC fails at `?` completion and commit-check. Typed children:
+  - `fixed-address` — `ValueIPAddress` + `ValidateIPAddress` (the reserved
+    IP the matching client always receives).
+  - `host-name` — free-form `args:1` (optional Kea reservation hostname).
+  Compile lives in the `static-binding` case of `compileDHCPLocalServer`
+  (`compiler_services.go`), handling both AST shapes via
+  `namedInstances([]*Node{pp})` (the MAC is `Keys[1]` in flat-set and
+  hierarchical alike; the leaves are the instance node's children). It
+  populates `DHCPPool.StaticBindings []*DHCPStaticBinding`
+  (`types_system.go`). Cross-binding semantics that need the compiled pool
+  (subnet) live in `validateDHCPStaticBindingsStrict`
+  (`compiler_validate_strict.go`, wired into the commit-check strict
+  accumulator in `compiler.go`): it rejects a missing/malformed
+  fixed-address, a family-mismatched literal (v6 under v4 or vice-versa),
+  an address outside the pool subnet (Kea would silently drop it), and a
+  duplicate MAC identity or duplicate fixed-address within the same pool.
+  The Kea renderer (`generateKea4Config`/`generateKea6Config`,
+  `pkg/dhcpserver/dhcpserver.go`) emits a per-subnet `reservations` array
+  (`hw-address` → `ip-address` for v4; `hw-address` → `ip-addresses[]` for
+  v6, plus optional `hostname`). Reservations derive entirely from the
+  committed config, so an HA pair serving identical subnets is
+  reservation-consistent by construction via the existing cluster
+  config-sync — no per-lease replication is needed for the static case
+  (the dynamic-lease HA gap is the separate companion #2239). Regression
+  coverage: `pkg/config/dhcp_static_binding_test.go` (dual-AST compile,
+  schema MAC/IP rejection, strict out-of-subnet / duplicate / family /
+  missing-address rejection) and `pkg/dhcpserver/reservations_test.go`
+  (v4 + v6 Kea `reservations` render, no-binding omits the key).
 
 ### #2053 — Config secret redaction at JSON/YAML marshal time
 

@@ -53,6 +53,50 @@ parses a torn file, no fsync on the apply path.
   `systemctl` seams + config paths, per the `pkg/dhcp/test_seams.go`
   convention.
 
+## Static host reservations — #2243
+
+Fixed / reserved address bindings let an operator pin a client (by
+hardware address) to a stable address served by the DHCP server, e.g. a
+printer, NAS, or appliance. Junos shape, scoped to a pool's subnet:
+
+```
+set system services dhcp-local-server group lan pool office \
+    static-binding 00:11:22:33:44:55 fixed-address 10.0.1.50
+set system services dhcp-local-server group lan pool office \
+    static-binding 00:11:22:33:44:55 host-name printer
+```
+
+(The `dhcpv6-local-server` hierarchy takes the same `static-binding`
+subtree with an IPv6 `fixed-address`.)
+
+- **Config model:** `DHCPPool.StaticBindings []*DHCPStaticBinding`
+  (`pkg/config/types_system.go`); each carries `MACAddress`,
+  `FixedAddress`, optional `HostName`. The schema subtree is
+  `dhcpStaticBindingSchema()` (`pkg/config/schema_system.go`), a
+  MAC-keyed named-instance container (`keyValidator: ValidateMAC`) with a
+  typed `fixed-address` leaf (`ValidateIPAddress`) and a free-form
+  `host-name`. Compile is the `static-binding` case in
+  `compileDHCPLocalServer` (`pkg/config/compiler_services.go`), handling
+  both AST shapes via `namedInstances`.
+- **Commit validation:** `validateDHCPStaticBindingsStrict`
+  (`pkg/config/compiler_validate_strict.go`, in the commit-check strict
+  accumulator) rejects a missing/malformed fixed-address, a
+  family-mismatched literal, an address outside the pool subnet (Kea
+  would silently drop it), and a duplicate MAC identity or duplicate
+  fixed-address within the same pool.
+- **Kea render:** `generateKea4Config`/`generateKea6Config` emit a
+  per-subnet `reservations` array — v4 `hw-address` → `ip-address`, v6
+  `hw-address` → `ip-addresses[]`, plus optional `hostname`. A pool with
+  no bindings emits no `reservations` key (`omitempty`), byte-for-byte
+  identical to pre-#2243 output.
+- **HA:** reservations derive entirely from committed config, which the
+  cluster config-sync already replicates, so both nodes serve identical
+  reservations and the reserved client gets the same address regardless
+  of which node is MASTER — reservation-consistent by construction, no
+  per-lease replication. (Dynamic-lease HA sync across failover is the
+  separate companion gap, #2239.) ISC Kea handles static reservations
+  entirely in the config file, independent of its HA hook.
+
 ## Dynamic DNS (DDNS) — #1387, increment 1
 
 Opt-in publishing of forward (`A`/`AAAA`) and reverse (`PTR`) DNS records

@@ -9046,3 +9046,22 @@ top.
   pkg/config/compiler_undefined_ref_2217_test.go (new),
   pkg/config/parser_security_test.go, pkg/config/application_set_nested_test.go,
   docs/config-schema.md
+
+- **Timestamp**: 2026-06-21
+- **Action**: #2243 — DHCP-server static/fixed/reserved host bindings. Added a
+  MAC-keyed `static-binding <mac> { fixed-address; host-name; }` typed subtree
+  under both `dhcp-local-server` and `dhcpv6-local-server` `group <g> pool <p>`
+  (schema completion + commit validation: keyValidator ValidateMAC,
+  fixed-address ValidateIPAddress). Compiles to DHCPPool.StaticBindings
+  (dual-AST). Strict commit validator rejects missing/malformed/family-
+  mismatched/out-of-subnet fixed-address and duplicate MAC/address in a pool.
+  Kea renderer emits per-subnet `reservations` (v4 hw-address->ip-address; v6
+  hw-address->ip-addresses[]; +hostname). HA-consistent via existing config-sync
+  (no per-lease replication; dynamic-lease HA sync is companion #2239).
+  Fail-on-revert proven (Kea render loop neutered -> render test fails).
+- **File(s)**: pkg/config/types_system.go, pkg/config/schema_system.go,
+  pkg/config/compiler_services.go, pkg/config/compiler_validate_strict.go,
+  pkg/config/compiler.go, pkg/config/dhcp_static_binding_test.go (new),
+  pkg/dhcpserver/dhcpserver.go, pkg/dhcpserver/reservations_test.go (new),
+  pkg/dhcpserver/README.md, docs/config-schema.md, docs/feature-coverage.md,
+  docs/feature-gaps.md
