@@ -74,18 +74,21 @@ func TestApplyConfigLockedAbortsCommitOnPersistentSourceNATProtocolMismatch(t *t
 }
 
 // TestApplyConfigLenientWrapperSwallowsPersistentSourceNATProtocolMismatch is
-// the #2138 lenient-load (#1960) half. The boot apply, peer config-sync, and
-// the DHCP/feed/event re-apply paths all go through the void applyConfig
-// wrapper, which logs the error and SWALLOWS it so an already-persisted or
-// peer-synced persistent-SNAT config against an old helper still boots through
-// (warn + disarmed helper, not a brick). The commit-abort fix must NOT change
-// that: applyConfig must not panic or surface the error, and the underlying
-// apply must still have been attempted.
+// the #2138 lenient-load (#1960) half. The boot apply and the DHCP/feed/event
+// re-apply paths go through the void applyConfig wrapper, which logs slog.Warn
+// and SWALLOWS the error so an already-persisted persistent-SNAT config
+// against an old helper still boots through (warn + disarmed helper, not a
+// brick). The commit-abort fix must NOT change that: applyConfig must not
+// panic or surface the error, and the underlying apply must still have been
+// attempted. (The peer config-sync path is lenient too, but by a different
+// mechanism — syncAndApply propagates the error and handleConfigSync logs
+// slog.Error and returns; it is not exercised by this test, which targets the
+// void wrapper specifically.)
 //
 // Together with the commit-path test above, this proves the fail-closed-at-
 // commit / lenient-at-load split: the SAME protocol mismatch aborts when it
 // flows through the operator-facing commit path but is swallowed when it flows
-// through the boot/peer-sync/background apply wrapper.
+// through the void boot/background apply wrapper.
 func TestApplyConfigLenientWrapperSwallowsPersistentSourceNATProtocolMismatch(t *testing.T) {
 	dp := &runtimeOnlyApplyTestDP{
 		applyErr: dpuserspace.ErrPersistentSourceNATProtocolIncompatible,

@@ -40,10 +40,17 @@ var ErrPersistentSourceNATProtocolIncompatible = errors.New("userspace persisten
 // failed commit to the operator rather than report success against a
 // disarmed dataplane (#2138).
 //
-// The lenient-load doctrine (#1960) is unaffected: an already-persisted or
-// peer-synced config is applied through the daemon's swallowing apply
-// wrapper, which logs and continues, so a node still boots through (warn,
-// not brick). Only the operator-facing commit path propagates the error.
+// The lenient-load doctrine (#1960) is unaffected, because abort changes
+// behavior ONLY for daemon callers that surface the apply error to a human:
+//   - Boot/restart of an already-persisted config goes through the void
+//     applyConfig wrapper, which logs slog.Warn and swallows the error —
+//     the node boots through (warn, not brick).
+//   - Peer config-sync goes through syncAndApply, which DOES propagate the
+//     error, but its caller (handleConfigSync) logs slog.Error and returns;
+//     the store is already promoted by SyncApply, so the node stays
+//     consistent with the peer (helper disarmed, not bricked).
+// Only the operator-facing commit path (commitAndApply /
+// commitConfirmedAndApply) returns the abort to the committer.
 //
 // Every future ensureRequiredSnapshotProtocolLocked gate MUST add its
 // sentinel here so the commit-abort policy can never silently omit it
