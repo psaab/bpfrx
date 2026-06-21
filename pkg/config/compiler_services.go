@@ -136,6 +136,16 @@ func compileDHCPLocalServer(node *Node, dhcp *DHCPServerConfig, isV6 bool) error
 		}
 	}
 
+	// #1387 (stale-lease-cleanup slice / Path S): the
+	// expired-leases-processing block is GLOBAL to the family (Kea renders
+	// it per Dhcp4/Dhcp6, never per-subnet), so it attaches to this
+	// family's DHCPLocalServerConfig (lsc), NOT to a pool. v4 and v6 are
+	// tuned independently. A truly empty/garbage block compiles to nil so
+	// it neither forces reclamation on nor renders anything.
+	if elpNode := node.FindChild("expired-leases-processing"); elpNode != nil {
+		lsc.ExpiredLeases = compileDHCPExpiredLeases(elpNode)
+	}
+
 	for _, groupInst := range namedInstances(node.FindChildren("group")) {
 		group := &DHCPServerGroup{Name: groupInst.name}
 
@@ -343,6 +353,99 @@ func compileDHCPDynamicDNS(node *Node) *DHCPDynamicDNSConfig {
 		return nil
 	}
 	return d
+}
+
+// dhcpExpiredLeasesIntProps are the integer-valued expired-leases-processing
+// leaves (everything except the valueless `enable` flag). Used by
+// compileDHCPExpiredLeases's subtree walker to recognize a "<leaf> <value>"
+// pair at any depth regardless of the AST shape.
+var dhcpExpiredLeasesIntProps = map[string]bool{
+	"reclaim-timer":   true,
+	"flush-timer":     true,
+	"hold-time":       true,
+	"max-leases":      true,
+	"max-time":        true,
+	"unwarned-cycles": true,
+}
+
+// compileDHCPExpiredLeases converts a parsed `expired-leases-processing`
+// subtree into a typed *DHCPExpiredLeasesConfig (#1387 stale-lease-cleanup
+// slice). Like compileDHCPDynamicDNS it handles BOTH the hierarchical
+// shape (`expired-leases-processing { enable; reclaim-timer 10; }`, each
+// leaf a separate child node) and the flat-set shape
+// (`set ... expired-leases-processing reclaim-timer 10`, where SetPath may
+// pack trailing property tokens into a single leaf node's Keys). First
+// value wins so a later malformed re-set cannot clobber a good one.
+//
+// Returns nil for a truly empty/garbage block so an empty stanza neither
+// forces reclamation on nor renders anything (closing the
+// empty-tree-compiles-non-nil trap). The set/unset distinction for the
+// cap knobs (max-leases / max-time) is preserved into the model: 0 is a
+// MEANINGFUL Kea value (unlimited) that must render distinctly from unset
+// (invariant H2), so a *Set bool latches when the operator supplies the
+// key.
+func compileDHCPExpiredLeases(node *Node) *DHCPExpiredLeasesConfig {
+	c := &DHCPExpiredLeasesConfig{}
+	props := map[string]string{}
+	enabled := false
+
+	var walk func(n *Node, isRoot bool)
+	walk = func(n *Node, isRoot bool) {
+		start := 0
+		if isRoot {
+			start = 1 // skip the "expired-leases-processing" identifier itself
+		}
+		for i := start; i < len(n.Keys); i++ {
+			k := n.Keys[i]
+			switch {
+			case k == "enable":
+				enabled = true
+			case dhcpExpiredLeasesIntProps[k] && i+1 < len(n.Keys):
+				if _, ok := props[k]; !ok {
+					props[k] = n.Keys[i+1]
+				}
+				i++
+			}
+		}
+		for _, ch := range n.Children {
+			walk(ch, false)
+		}
+	}
+	walk(node, true)
+
+	c.Enabled = enabled
+	// parseInt sets the field from a decimal prop value when present and
+	// well-formed, returning whether the key was present at all (so the
+	// caller can distinguish a configured 0 from an unset key for the cap
+	// knobs). A garbage value is treated as unset for that field.
+	parseInt := func(key string, dst *int) bool {
+		v, present := props[key]
+		if !present {
+			return false
+		}
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			return false
+		}
+		*dst = n
+		return true
+	}
+	parseInt("reclaim-timer", &c.ReclaimTimerWait)
+	parseInt("flush-timer", &c.FlushReclaimedTimerWait)
+	parseInt("hold-time", &c.HoldReclaimedTime)
+	c.MaxReclaimLeasesSet = parseInt("max-leases", &c.MaxReclaimLeases)
+	c.MaxReclaimTimeSet = parseInt("max-time", &c.MaxReclaimTime)
+	parseInt("unwarned-cycles", &c.UnwarnedReclaimCycles)
+
+	// Empty block -> treat as absent (no reclamation block rendered). A
+	// block with only `enable` is meaningful (Kea reads {} as "defaults"),
+	// so check the union of enable + any configured field.
+	if !c.Enabled && c.ReclaimTimerWait == 0 && c.FlushReclaimedTimerWait == 0 &&
+		c.HoldReclaimedTime == 0 && !c.MaxReclaimLeasesSet && !c.MaxReclaimTimeSet &&
+		c.UnwarnedReclaimCycles == 0 {
+		return nil
+	}
+	return c
 }
 
 func compileDynamicAddress(node *Node, sec *SecurityConfig) error {

@@ -332,7 +332,8 @@ var schemaSystem = &schemaNode{desc: "System configuration", children: map[strin
 					"static-binding": dhcpStaticBindingSchema(),
 				}},
 			}},
-			"dynamic-dns": dhcpDynamicDNSSchema(),
+			"dynamic-dns":               dhcpDynamicDNSSchema(),
+			"expired-leases-processing": dhcpExpiredLeasesSchema(),
 		}},
 		"dhcpv6-local-server": {desc: "DHCPv6 local server", children: map[string]*schemaNode{
 			"group": {desc: "DHCPv6 group", args: 1, placeholder: "<group-name>", children: map[string]*schemaNode{
@@ -340,7 +341,8 @@ var schemaSystem = &schemaNode{desc: "System configuration", children: map[strin
 					"static-binding": dhcpStaticBindingSchema(),
 				}},
 			}},
-			"dynamic-dns": dhcpDynamicDNSSchema(),
+			"dynamic-dns":               dhcpDynamicDNSSchema(),
+			"expired-leases-processing": dhcpExpiredLeasesSchema(),
 		}},
 	}},
 }}
@@ -621,6 +623,82 @@ func dhcpDynamicDNSSchema() *schemaNode {
 			args:        1,
 			placeholder: "<secret>",
 			children:    nil,
+		},
+	}}
+}
+
+// dhcpExpiredLeasesSchema returns the typed-leaf schema for the #1387
+// stale-lease-cleanup slice (Path S): the per-family
+// `expired-leases-processing` reclamation block, shared by
+// dhcp-local-server and dhcpv6-local-server. Returned fresh per call so
+// the two parents do not alias a mutable map (same pattern as
+// dhcpDynamicDNSSchema / dhcpStaticBindingSchema).
+//
+// Floor split (SMR MAJOR-3, fail-safe default): the three TIMERS
+// (reclaim/flush/hold) use ValidateIntegerMin(1) because a 0 some Kea
+// versions reject would take DHCP DOWN on the fail-closed restart; the
+// two CAP knobs (max-leases, max-time) use ValidateIntegerMin(0) because
+// Kea documents 0 = unlimited there (a value the model tracks distinctly
+// from unset — invariant H2), and unwarned-cycles uses Min(0). Kea has
+// no documented hard upper bound on these knobs, so min-only validation
+// is correct (no schema-only cap, per the docs/config-schema.md range
+// policy).
+func dhcpExpiredLeasesSchema() *schemaNode {
+	return &schemaNode{desc: "Kea expired-lease reclamation policy (#1387)", children: map[string]*schemaNode{
+		"enable": {desc: "Enable expired-lease reclamation tuning", children: nil},
+		"reclaim-timer": {
+			desc:          "Seconds between reclamation cycles (reclaim-timer-wait-time)",
+			args:          1,
+			valueType:     ValueInteger,
+			valueDesc:     "Seconds (>= 1)",
+			valueExamples: []string{"10"},
+			validator:     ValidateIntegerMin(1),
+			children:      nil,
+		},
+		"flush-timer": {
+			desc:          "Seconds between reclaimed-lease flush passes (flush-reclaimed-timer-wait-time)",
+			args:          1,
+			valueType:     ValueInteger,
+			valueDesc:     "Seconds (>= 1)",
+			valueExamples: []string{"25"},
+			validator:     ValidateIntegerMin(1),
+			children:      nil,
+		},
+		"hold-time": {
+			desc:          "Seconds a reclaimed lease is held before removal (hold-reclaimed-time)",
+			args:          1,
+			valueType:     ValueInteger,
+			valueDesc:     "Seconds (>= 1)",
+			valueExamples: []string{"600"},
+			validator:     ValidateIntegerMin(1),
+			children:      nil,
+		},
+		"max-leases": {
+			desc:          "Maximum leases reclaimed per cycle, 0 = unlimited (max-reclaim-leases)",
+			args:          1,
+			valueType:     ValueInteger,
+			valueDesc:     "Leases per cycle (>= 0; 0 = unlimited)",
+			valueExamples: []string{"100", "0"},
+			validator:     ValidateIntegerMin(0),
+			children:      nil,
+		},
+		"max-time": {
+			desc:          "Max milliseconds spent reclaiming per cycle, 0 = unlimited (max-reclaim-time)",
+			args:          1,
+			valueType:     ValueInteger,
+			valueDesc:     "Milliseconds (>= 0; 0 = unlimited)",
+			valueExamples: []string{"250", "0"},
+			validator:     ValidateIntegerMin(0),
+			children:      nil,
+		},
+		"unwarned-cycles": {
+			desc:          "Consecutive capped cycles before Kea warns (unwarned-reclaim-cycles)",
+			args:          1,
+			valueType:     ValueInteger,
+			valueDesc:     "Cycles (>= 0)",
+			valueExamples: []string{"5"},
+			validator:     ValidateIntegerMin(0),
+			children:      nil,
 		},
 	}}
 }
