@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -18,6 +19,7 @@ import (
 
 	"net/netip"
 
+	"github.com/psaab/xpf/pkg/appid"
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/dataplane"
 	dpruntime "github.com/psaab/xpf/pkg/dataplane/runtime"
@@ -1732,6 +1734,34 @@ func expandUserspacePolicyApplications(cfg *config.Config, apps []string) ([]Pol
 			if proto == "" {
 				return nil, false
 			}
+			// #2124: fail closed on any protocol the Rust matcher cannot
+			// represent. Returning ok=false trips the existing
+			// ForwardingSupported=false refuse-to-arm gate
+			// (userspaceSupportsSecurityPolicies). Without this a named
+			// protocol like esp/ah/sctp (accepted at commit, only lowercased
+			// here) reaches the matcher, gets dropped, and the rule collapses
+			// to match-any — permitting ALL traffic for the zone pair.
+			num, ok := appid.ProtocolNumber(proto)
+			if !ok {
+				return nil, false
+			}
+			// Canonicalize ONLY the named protocols that the Rust matcher could
+			// not parse before this fix (esp/ah/sctp/vrrp/igmp/pim/egp) to their
+			// IANA number, so a mixed-version helper that predates the new
+			// parse_protocol arms still parses them. Protocols the matcher has
+			// always understood (tcp/udp/icmp/icmpv6/gre/ospf/ipip + numeric)
+			// are left as-is to avoid churning the wire form (and the snapshot
+			// hash) for every existing policy.
+			if !rustParsedProtocolBeforeFix(proto) {
+				proto = strconv.Itoa(int(num))
+			}
+			// #2124: ports must parse the way the Rust parse_port_spec does;
+			// a malformed port would otherwise drop the term and collapse the
+			// rule to match-any (the same fail-open as the protocol case).
+			if !userspacePortSpecRepresentable(app.SourcePort) ||
+				!userspacePortSpecRepresentable(app.DestinationPort) {
+				return nil, false
+			}
 			snap := PolicyApplicationSnapshot{
 				Name:            resolvedName,
 				Protocol:        proto,
@@ -1786,6 +1816,57 @@ func normalizeUserspaceApplicationProtocol(proto string) string {
 	default:
 		return strings.ToLower(strings.TrimSpace(proto))
 	}
+}
+
+// rustParsedProtocolBeforeFix reports whether the Rust dataplane's
+// parse_protocol recognized this protocol token PRIOR to #2124 (the named arms
+// {tcp,udp,icmp,icmpv6,gre,ospf,ipip} plus any pure-numeric token). Such tokens
+// are emitted on the wire unchanged so existing policy snapshots keep their
+// current protocol string (and hash); only the newly-supported named protocols
+// are canonicalized to their number for old-helper compatibility. `proto` is
+// already lowercased by normalizeUserspaceApplicationProtocol.
+func rustParsedProtocolBeforeFix(proto string) bool {
+	switch proto {
+	case "tcp", "udp", "icmp", "icmpv6", "gre", "ospf", "ipip":
+		return true
+	}
+	// A bare numeric token (e.g. "132") was always parsed by parse_protocol's
+	// numeric fallback.
+	if _, err := strconv.ParseUint(proto, 10, 8); err == nil {
+		return true
+	}
+	return false
+}
+
+// userspacePortSpecRepresentable reports whether a policy application port spec
+// parses the way the Rust dataplane's parse_port_spec does (#2124). It must stay
+// in lock-step with userspace-dp/src/policy.rs::parse_port_spec, because a spec
+// this gate accepts but Rust rejects would silently drop the term and collapse
+// the rule to match-any (the same fail-open this fix closes). Empty means "no
+// port constraint" (ok); known service aliases resolve to a single port; a bare
+// number must be 1..65535; a low-high range needs low > 0 && low <= high.
+func userspacePortSpecRepresentable(spec string) bool {
+	if spec == "" {
+		return true
+	}
+	switch strings.ToLower(spec) {
+	case "http", "https", "ssh", "telnet", "ftp", "ftp-data", "smtp",
+		"dns", "pop3", "imap", "snmp", "ntp", "bgp", "ldap", "syslog":
+		return true
+	}
+	if low, high, found := strings.Cut(spec, "-"); found {
+		l, errL := strconv.ParseUint(low, 10, 16)
+		h, errH := strconv.ParseUint(high, 10, 16)
+		if errL != nil || errH != nil {
+			return false
+		}
+		return l != 0 && l <= h
+	}
+	p, err := strconv.ParseUint(spec, 10, 16)
+	if err != nil {
+		return false
+	}
+	return p != 0
 }
 
 func userspaceSupportsSourceNAT(ruleSets []*config.NATRuleSet) bool {

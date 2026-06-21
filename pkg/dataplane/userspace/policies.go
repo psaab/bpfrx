@@ -13,6 +13,15 @@ import (
 	"github.com/psaab/xpf/pkg/dataplane"
 )
 
+// unsupportedApplicationSentinel is the reserved protocol/name token emitted in
+// a policy rule's application terms (#2124) when the userspace matcher cannot
+// represent the rule's configured applications. It is deliberately not a valid
+// protocol name or 0..255 numeric, so the Rust matcher drops it and the rule's
+// all-dropped non-empty term list is rejected as a SnapshotIntegrityError
+// (fail closed) instead of decoding to genuine match-any. Must stay unparseable
+// by both appid.ProtocolNumber and userspace-dp parse_protocol.
+const unsupportedApplicationSentinel = "__unsupported__"
+
 func buildPolicySnapshots(cfg *config.Config) []PolicyRuleSnapshot {
 	return buildPolicySnapshotsWithSchedulerStateAndFeeds(cfg, nil, nil)
 }
@@ -84,7 +93,20 @@ func buildOneRuleSnapshot(
 	}
 	applicationTerms, ok := expandUserspacePolicyApplications(cfg, pol.Match.Applications)
 	if !ok {
-		applicationTerms = nil
+		// #2124: the rule cites application terms the userspace matcher cannot
+		// honor (unrepresentable protocol or port). Emit a reserved unparseable
+		// sentinel term instead of nil. nil would decode on the Rust side as
+		// GENUINE match-any (no application constraint), so even though the
+		// capability gate sets ForwardingSupported=false the published snapshot
+		// could fail OPEN in the window before the helper is disarmed (and on a
+		// same-plan refresh). The sentinel makes Rust drop the only term, see
+		// an all-dropped non-empty term list, and reject the WHOLE snapshot via
+		// SnapshotIntegrityError (keeping the previous good state) — an
+		// action-agnostic fail-closed for both permit and deny rules.
+		applicationTerms = []PolicyApplicationSnapshot{{
+			Name:     unsupportedApplicationSentinel,
+			Protocol: unsupportedApplicationSentinel,
+		}}
 	}
 	// #1606 v3 fields: classify each address token as "named book
 	// reference" vs "free-form literal".
@@ -482,8 +504,9 @@ func sortV6CIDRs(s []string) {
 // framing (Codex r3 F4 fix).
 //
 // Layout:
-//   "V4" || u32_be(len(v4)) || (for each: u8(prefix_len) || u32_be(addr_bytes))
-//   "V6" || u32_be(len(v6)) || (for each: u8(prefix_len) || u128_be(addr_bytes))
+//
+//	"V4" || u32_be(len(v4)) || (for each: u8(prefix_len) || u32_be(addr_bytes))
+//	"V6" || u32_be(len(v6)) || (for each: u8(prefix_len) || u128_be(addr_bytes))
 //
 // CIDR strings that fail to parse are skipped (defensive).
 func canonicalizeAddressBookContent(v4, v6 []string) []byte {
