@@ -282,7 +282,7 @@ pub(super) fn stage_screen_check(
     // tag-presence signal the shim already sets (mirrors the CoS path
     // in tx/cos_classify.rs).
     let l3_off = if meta.ingress_vlan_present != 0 { 18 } else { 14 };
-    let screen_pkt = extract_screen_info(
+    let screen_pkt = match extract_screen_info(
         packet_frame,
         meta.addr_family,
         meta.protocol,
@@ -293,7 +293,30 @@ pub(super) fn stage_screen_check(
         flow.forward_key.src_port,
         flow.forward_key.dst_port,
         l3_off,
-    );
+    ) {
+        Ok(pkt) => pkt,
+        // FAIL-CLOSED (#2146): the extractor could not parse the L3
+        // header far enough to evaluate the fragment/TCP screens (e.g.
+        // a truncated IPv6 extension-header chain). With screen
+        // profiles active on this zone, drop the unparseable frame
+        // rather than admit it — a SYN-bearing frame with a truncated
+        // FRAGMENT header must not bypass `syn-frag`.
+        Err(err) => {
+            let reason = err.screen_reason();
+            let drop_info = screen_parse_error_info(&meta, flow);
+            emit_screen_drop_event(
+                worker_ctx.event_stream,
+                &drop_info,
+                meta,
+                zone_id,
+                reason,
+                event_now_ns_from_secs(now_secs),
+            );
+            counters.touched = true;
+            counters.screen_drops += 1;
+            return StageOutcome::RecycleAndContinue;
+        }
+    };
     match screen.check_packet_with_zone_id(zone_name, zone_id, &screen_pkt, now_secs) {
         ScreenVerdict::Pass => StageOutcome::Continue(ScreenCheckOutcome::Pass),
         ScreenVerdict::SynCookieBypass => {
@@ -386,7 +409,7 @@ pub(super) fn stage_screen_syn_cookie_ack_on_session_miss(
     // VID > 0, so a priority-tagged VID-0 cookie ACK is parsed at the
     // correct offset (18) instead of mis-reading the tag bytes (#2145).
     let l3_off = if meta.ingress_vlan_present != 0 { 18 } else { 14 };
-    let screen_pkt = extract_screen_info(
+    let screen_pkt = match extract_screen_info(
         packet_frame,
         meta.addr_family,
         meta.protocol,
@@ -397,7 +420,26 @@ pub(super) fn stage_screen_syn_cookie_ack_on_session_miss(
         flow.forward_key.src_port,
         flow.forward_key.dst_port,
         l3_off,
-    );
+    ) {
+        Ok(pkt) => pkt,
+        // FAIL-CLOSED (#2146): an unparseable L3 header on the
+        // SYN-cookie ACK session-miss path is dropped, never admitted.
+        Err(err) => {
+            let reason = err.screen_reason();
+            let drop_info = screen_parse_error_info(&meta, flow);
+            emit_screen_drop_event(
+                worker_ctx.event_stream,
+                &drop_info,
+                meta,
+                zone_id,
+                reason,
+                event_now_ns_from_secs(now_secs),
+            );
+            counters.touched = true;
+            counters.screen_drops += 1;
+            return StageOutcome::RecycleAndContinue;
+        }
+    };
     match screen.validate_syn_cookie_ack_on_session_miss(zone_name, zone_id, &screen_pkt, now_secs)
     {
         SynCookieAckVerdict::NotApplicable => StageOutcome::Continue(SynCookieAckOutcome::Pass),
@@ -723,7 +765,8 @@ mod tests {
             syn_flow.forward_key.src_port,
             syn_flow.forward_key.dst_port,
             syn_meta.l3_offset as usize,
-        );
+        )
+        .expect("valid SYN frame parses");
 
         assert_eq!(
             screen.check_packet_with_zone_id("lan", TEST_LAN_ZONE_ID, &syn_info, TEST_NOW_SECS),
@@ -972,7 +1015,8 @@ mod tests {
             syn_flow.forward_key.src_port,
             syn_flow.forward_key.dst_port,
             syn_meta.l3_offset as usize,
-        );
+        )
+        .expect("valid SYN frame parses");
         // First SYN passes; second crosses the flood threshold and
         // mints the cookie challenge (mirrors the SYN-cookie test).
         assert_eq!(

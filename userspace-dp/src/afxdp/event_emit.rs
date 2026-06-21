@@ -29,6 +29,10 @@ const SCREEN_SYN_COOKIE: u32 = 1 << 14;
 const SCREEN_SESSION_LIMIT_SRC: u32 = 1 << 15;
 const SCREEN_SESSION_LIMIT_DST: u32 = 1 << 16;
 const SCREEN_ICMP_FRAGMENT: u32 = 1 << 17;
+/// #2146: a frame whose L3 header could not be parsed far enough to
+/// evaluate the fragment/TCP screens (e.g. a truncated IPv6
+/// extension-header chain) is dropped FAIL-CLOSED under this reason.
+const SCREEN_IP_MALFORMED: u32 = 1 << 18;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum FilterLogSource {
@@ -142,6 +146,38 @@ pub(super) fn emit_screen_drop_event(
     let _ = event_stream.try_emit_dataplane_event_at(event, now_ns);
 }
 
+/// Build a minimal `ScreenPacketInfo` describing an L3 header that the
+/// screen extractor could NOT parse (#2146 fail-closed path). The
+/// packet bytes are untrustworthy past L3, so only the fields the
+/// upstream metadata/flow parser already resolved are populated —
+/// enough for `emit_screen_drop_event` to log the offending 5-tuple.
+/// Fragment/TCP fields stay at their conservative defaults; the verdict
+/// is already DROP so they are never consulted for a screen decision.
+#[inline]
+pub(super) fn screen_parse_error_info(
+    meta: &UserspaceDpMeta,
+    flow: &SessionFlow,
+) -> ScreenPacketInfo {
+    ScreenPacketInfo {
+        addr_family: meta.addr_family,
+        protocol: meta.protocol,
+        tcp_flags: meta.tcp_flags,
+        src_ip: flow.src_ip,
+        dst_ip: flow.dst_ip,
+        src_port: flow.forward_key.src_port,
+        dst_port: flow.forward_key.dst_port,
+        tcp_seq: 0,
+        tcp_ack: 0,
+        tcp_mss: 0,
+        pkt_len: meta.pkt_len,
+        is_fragment: false,
+        is_first_fragment: false,
+        ip_ihl: 5,
+        ip_frag_off: 0,
+        ip_total_len: 0,
+    }
+}
+
 #[inline]
 pub(super) fn emit_filter_log_event(
     event_stream: Option<&EventStreamWorkerHandle>,
@@ -244,6 +280,7 @@ fn screen_reason_id(reason: &'static str) -> u32 {
         "session-limit-src" => SCREEN_SESSION_LIMIT_SRC,
         "session-limit-dst" => SCREEN_SESSION_LIMIT_DST,
         "icmp-fragment" => SCREEN_ICMP_FRAGMENT,
+        "ip-malformed" => SCREEN_IP_MALFORMED,
         _ => 0,
     }
 }
@@ -434,6 +471,29 @@ mod tests {
             .expect("screen event payload");
         assert_eq!(event.kind, DataplaneEventKind::ScreenDrop);
         assert_eq!(event.screen_id, SCREEN_ICMP_FRAGMENT);
+    }
+
+    #[test]
+    fn screen_reason_id_maps_ip_malformed() {
+        // #2146: the fail-closed reason for an unparseable L3 header
+        // must map to a dedicated screen_id bit so operators can tell a
+        // malformed-frame drop apart from the syn-frag screen.
+        assert_eq!(screen_reason_id("ip-malformed"), SCREEN_IP_MALFORMED);
+        assert_ne!(SCREEN_IP_MALFORMED, SCREEN_SYN_FRAG);
+    }
+
+    #[test]
+    fn screen_parse_error_info_carries_flow_tuple() {
+        // The fail-closed event built from meta+flow must log the
+        // offending 5-tuple even though the packet bytes past L3 are
+        // untrustworthy.
+        let info = screen_parse_error_info(&test_meta(), &test_flow());
+        assert_eq!(info.addr_family, libc::AF_INET as u8);
+        assert_eq!(info.protocol, PROTO_TCP);
+        assert_eq!(info.src_ip, IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)));
+        assert_eq!(info.dst_ip, IpAddr::V4(Ipv4Addr::new(198, 51, 100, 20)));
+        assert_eq!(info.src_port, 49152);
+        assert_eq!(info.dst_port, 443);
     }
 
     #[test]
