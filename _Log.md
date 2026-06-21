@@ -1,5 +1,34 @@
 # Action Log
 
+## 2026-06-21 — #2211 + #2212: NAT64 zero-per-packet-alloc transit + fail-closed config parse
+
+- **Timestamp**: 2026-06-21
+- **Action**: Two-commit PR on branch fix/2211-2212-nat64.
+  (#2211 perf) Eliminated per-packet heap allocation on the NAT64 v6<->v4
+  transit translate path: added allocation-free `write_v6_to_v4_into` /
+  `write_v4_to_v6_into` cores that translate straight into a caller buffer,
+  streamed the L4 pseudo-header checksum (`checksum16_add`/`_fold`, no Vec),
+  and rewrote the frame builders to make exactly ONE output allocation (the
+  required `TxRequest.bytes`) and translate into its tail — dropping the
+  intermediate L3 Vec, the pseudo-header Vecs, and the double L4 copy.
+  `translate_v6_to_v4`/`translate_v4_to_v6` kept as thin Vec wrappers for
+  tests; output byte-identical to before.
+  (#2212 fail-closed) Replaced `Nat64State::from_snapshots` with fallible
+  `try_from_snapshots -> Result<_, SnapshotIntegrityError>`: an empty /
+  malformed / non-/96 prefix, a malformed prefix address, or a pool address
+  that is neither bare IPv4 nor /32 now rejects the whole snapshot
+  (`Nat64UnparseableRule`) instead of silently `continue`/`filter_map`
+  dropping it; forwarding_build propagates with `?` so the reconcile/refresh
+  preflights keep the previous live state. Helper-boundary backstop to the Go
+  #2173 commit-time gate. Tests fail-on-revert verified for both fixes;
+  44 nat64 tests green 5x; full lib suite 2199+46+8+16+1 pass; go test
+  ./pkg/config ./pkg/dataplane/userspace pass. NAT64 transit smoke
+  PENDING-PARENT (standalone DUT cannot forward per #2169; forward path
+  live-validated in #2132).
+- **File(s)**: userspace-dp/src/nat64.rs, userspace-dp/src/nat64_tests.rs,
+  userspace-dp/src/policy.rs, userspace-dp/src/afxdp/forwarding_build/mod.rs,
+  userspace-dp/src/FEATURES.md
+
 ## 2026-06-21 — #2222: address-book described-entry prefix corruption
 
 - **Timestamp**: 2026-06-21
@@ -8685,3 +8714,95 @@ top.
   userspace-dp/src/afxdp/types/shared_cos_lease/lease.rs,
   userspace-dp/src/afxdp/types/shared_cos_lease/shared_cos_lease_tests.rs,
   docs/refactoring-audit-current.txt
+
+- **Timestamp**: 2026-06-21
+- **Action**: #2214 — fix Go<->Rust empty-collection null-decode no-transit
+  bug (#1961-class). A NAT64 rule with no resolvable source-pool emitted
+  `pool_addresses:null` and a firewall filter with zero terms emitted
+  `terms:null`; the Rust helper's `Vec<T>` decoder rejects an explicit null
+  ("invalid type: null, expected a sequence"), aborting the WHOLE
+  apply_snapshot decode -> helper EOF -> enabled:false -> NO TRANSIT.
+  BOTH-sided fix: Go builders now initialize the two slices non-nil so they
+  marshal as `[]` (buildNAT64Snapshots, buildFilterTermSnapshots — no
+  `,omitempty`, the empty states are meaningful, WireUint8List convention);
+  Rust adds a generic `null_tolerant_vec` deserializer (protocol/mod.rs)
+  applied to NAT64RuleSnapshot.pool_addresses + FirewallFilterSnapshot.terms
+  for mixed-version safety. Audited protocol.go: ONLY these two slice fields
+  lacked omitempty (no other hazard). Fail-on-revert proven on both sides
+  (Go: 4 tests fail with `"pool_addresses":null`; Rust: 3 tests panic with
+  the exact serde "expected a sequence" error). Go tests + go vet clean;
+  cargo release build clean (145 pre-existing warnings, none on changed
+  files); 68 Rust protocol tests pass.
+- **File(s)**: pkg/dataplane/userspace/nat.go,
+  pkg/dataplane/userspace/filters.go,
+  pkg/dataplane/userspace/protocol_null_collections_2214_test.go,
+  userspace-dp/src/protocol/mod.rs, userspace-dp/src/protocol/nat.rs,
+  userspace-dp/src/protocol/security.rs, userspace-dp/src/protocol/tests.rs
+- **Action**: #2216 — regression-lock the eventengine temporal-window
+  prune-on-append + concurrent-multimatch dispatch invariants. Both defects
+  the issue describes were already fixed by #2157 (da8e35bc9): evaluateEvent
+  prunes the sliding window on every append (not gated behind the trigger
+  path), and HandleEvent enqueues every triggered policy onto the single
+  serialized worker (no per-probe EnterConfigure race / all-but-one drop). The
+  issue's line-number analysis described the PRE-#2157 engine. Added the
+  fail-on-revert regression tests #2216 asked for (none existed): finding A
+  (no-within bounded to 60s + below-threshold bounded to clause horizon),
+  finding B (one event matching N policies commits ALL N). Proven fail-on-
+  revert for finding A: deleting prune-on-append → windows hold 1000/1000
+  entries. Finding B's cross-goroutine drop race stays locked by the
+  pre-existing `TestQueue_ConcurrentProbesSerialize` (added by #2157); the new
+  single-event fan-out test is a complementary invariant (not a standalone
+  1-of-3 revert-lock — a faithful pre-#2157 sequential revert handled a single
+  multi-match event in-order, so it does not reliably trip that one test).
+- **File(s)**: pkg/eventengine/engine_window_test.go (new),
+  pkg/eventengine/README.md
+
+- **Timestamp**: 2026-06-21
+- **Action**: #2224 — fix flowexport ExportConfig atomic-copy (go vet
+  "copies lock value" + latent double-sampling). ExportConfig embeds the
+  live 1-in-N sampleCounter (atomic.Uint64); NewExporter/NewIPFIXExporter
+  took it by VALUE and the daemon called NewExporter(*ec) — six go-vet
+  "copies lock value" / "passes lock by value" diagnostics, and a forked
+  counter that re-seeds the sampling cadence if any caller ever sampled
+  off the exporter's copy. Fix: both exporters now hold *ExportConfig and
+  the constructors take *ExportConfig; daemon passes the bundle's ec
+  pointer directly, so exporter + bundle + ShouldExport share ONE counter.
+  Added fail-on-revert test TestExporterSharesSingleSampleCounter (pointer
+  identity + 1-in-N cadence across 100 packets on the shared counter;
+  reverting to value-type breaks compilation AND go vet). Scoped a
+  `go vet ./pkg/flowexport/...` gate into the Makefile test target (NOT
+  tree-wide: two pre-existing vet diagnostics live in cmd/cli + pkg/cli).
+  Build + vet (flowexport+daemon) clean; flowexport -race green; daemon
+  tests green.
+- **File(s)**: pkg/flowexport/netflow.go, pkg/flowexport/ipfix.go,
+  pkg/flowexport/exporter_test.go (new test),
+  pkg/daemon/daemon_flowexport.go, pkg/flowexport/README.md, Makefile
+- **Timestamp**: 2026-06-21
+- **Action**: #2223 — guard `resolveRedistribute` against emitting an
+  FRR-invalid `redistribute <name>` line for a protocol-less export.
+  `resolveRedistribute` (pkg/frr/policy_render.go) translated an
+  OSPF/OSPFv3/BGP/RIP/IS-IS export into FRR `redistribute <proto>
+  [route-map <name>]`. When the referenced policy-statement existed but
+  no term carried a `from protocol` (matches only from community /
+  prefix-list / as-path), `len(protocols)==0` fell through to the
+  best-effort fallback `return " redistribute <name>\n"`. A policy name is
+  not a valid FRR redistribute source protocol, so frr-reload.py rejects
+  the line; because it sits in the xpf-managed section, the WHOLE reload
+  degrades (frr-reload exits non-zero on any CMD_WARNING_CONFIG_FAILED →
+  additive vtysh -f also rejects it) — every managed route/redistribute is
+  lost. The commit-time strict validator (validateRoutingExportReferences-
+  Strict, #2144) accepts any DEFINED policy-statement and does NOT require
+  a `from protocol`, so the config passes commit and only fails at render.
+  Fix: in the protocol-less-policy branch and the unknown-token fallback,
+  SKIP emission + slog.Warn (return "") instead of the bare-name line.
+  redistribute has no construct for "redistribute what this policy matches"
+  without a source protocol, so skipping is the only correct outcome.
+  Added fail-on-revert tests (TestResolveRedistribute_ProtocolLessPolicy,
+  _UnknownToken, TestGenerateProtocols_ProtocolLessPolicyExport +
+  assertNoInvalidRedistribute syntax belt): pre-fix the invalid
+  `redistribute export-comm` line is emitted alongside a valid one; post-
+  fix the invalid line is gone and the valid `redistribute static route-map
+  export-static` still renders. go build ./..., go vet ./pkg/frr/...,
+  go test ./pkg/frr/... ./pkg/config/... all green.
+- **File(s)**: pkg/frr/policy_render.go, pkg/frr/frr_test.go,
+  pkg/frr/README.md

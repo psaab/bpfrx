@@ -46,3 +46,30 @@ pub(crate) use nat::*;
 pub(crate) use resolution::*;
 pub(crate) use security::*;
 pub(crate) use snapshot::*;
+
+/// Deserialize a `Vec<T>` that tolerates an explicit JSON `null` as an empty
+/// vector (#2214).
+///
+/// `#[serde(default)]` alone only supplies a value when the KEY IS ABSENT; an
+/// explicit `null` is still handed to the field's `Deserialize` impl, and
+/// `Vec<T>::deserialize` rejects `null` with `invalid type: null, expected a
+/// sequence`. For a field on `ConfigSnapshot` (or any nested snapshot type)
+/// that rejection aborts the ENTIRE `apply_snapshot` decode — the helper
+/// returns an error before responding, closes the control socket, the Go side
+/// sees a bare EOF, the helper stays in bootstrap (`enabled:false`), and the
+/// dataplane forwards NOTHING. This is the #1961 no-transit signature.
+///
+/// A nil Go slice declared WITHOUT `,omitempty` marshals as JSON `null`, so any
+/// such field is one un-resolvable config away from this crash (e.g. a NAT64
+/// rule with an empty source-pool -> `pool_addresses:null`, or a firewall
+/// filter with zero terms -> `terms:null`). Pair this null-tolerant decoder
+/// with `,omitempty` (or an empty-not-nil slice) on the Go side so the wire is
+/// robust across mixed-version Go/Rust pairs in BOTH directions.
+pub(crate) fn null_tolerant_vec<'de, D, T>(deserializer: D) -> Result<Vec<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    use serde::Deserialize as _;
+    Ok(Option::<Vec<T>>::deserialize(deserializer)?.unwrap_or_default())
+}

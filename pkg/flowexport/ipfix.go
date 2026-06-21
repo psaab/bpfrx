@@ -283,7 +283,7 @@ func encodeIPFIXRecordV6(b []byte, off int, r FlowRecord) int {
 
 // IPFIXExporter sends IPFIX (NetFlow v10) messages to configured collectors.
 type IPFIXExporter struct {
-	cfg         ExportConfig
+	cfg         *ExportConfig
 	sourceID    uint32
 	templateSet []byte
 
@@ -297,8 +297,11 @@ type IPFIXExporter struct {
 	exportedPkts  atomic.Uint64
 }
 
-// NewIPFIXExporter creates a new IPFIX exporter.
-func NewIPFIXExporter(cfg ExportConfig) (*IPFIXExporter, error) {
+// NewIPFIXExporter creates a new IPFIX exporter. cfg is held by pointer
+// (never copied) for the same reason as NewExporter: ExportConfig
+// embeds the live 1-in-N sampleCounter (atomic.Uint64) and copying it
+// would fork the counter, re-seeding the sampling cadence (#2224).
+func NewIPFIXExporter(cfg *ExportConfig) (*IPFIXExporter, error) {
 	e := &IPFIXExporter{
 		cfg:         cfg,
 		sourceID:    1,
