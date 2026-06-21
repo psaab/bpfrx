@@ -216,6 +216,23 @@ type compileOpts struct {
 	// lenientVRRPTrackDuplicates / lenientLogProfileStreamRef.
 	lenientUnsupportedInterfaceStanzas bool
 
+	// lenientRoutingExportRef (#2144) downgrades the routing-export
+	// cross-reference gate (validateRoutingExportReferencesStrict) from a
+	// hard compile error to a cfg.Warnings entry. Set ONLY on the tolerant
+	// load / peer-sync paths (CompileConfigLenient /
+	// CompileConfigForNodeLenient): a dynamic-protocol `export`, RIP
+	// `redistribute`, BGP group/neighbor `export`, or `routing-options
+	// forwarding-table export` naming an undefined policy-statement (or a
+	// non-protocol typo) passed commit on every binary up to this gate, so
+	// an already-persisted or peer-synced config may carry it; an upgrading
+	// / receiving node must still BOOT through it (warn) rather than fail
+	// closed (#1960). Commit / commit-check stay strict — a new operator
+	// edit whose export FRR would reject, silently no-op, fail open
+	// (route-map permit-all), or silently disable ECMP is rejected loudly.
+	// The render-path fallbacks keep a leniently-loaded config behaving
+	// exactly as it did before this gate. Same doctrine as
+	// lenientLogProfileStreamRef.
+	lenientRoutingExportRef bool
 	// lenientApplicationSpecs (#2142) downgrades the application-definition
 	// port/protocol gate (validateApplicationSpecsStrict) from a hard compile
 	// error to a cfg.Warnings entry. The strict commit / commit-check path
@@ -239,6 +256,27 @@ type compileOpts struct {
 	// SchemaValidate (applications stay opaque there). Same doctrine as
 	// lenientPolicyMatchAddress / lenientNATHostMask.
 	lenientApplicationSpecs bool
+	// lenientFilterProtocols (#2175 review) downgrades the firewall-filter
+	// `from protocol <token>` gate (validateFilterProtocolsStrict) from a
+	// hard compile error to a cfg.Warnings entry. The strict commit /
+	// commit-check path hard-rejects a term whose protocol token is neither
+	// a known protocol name, a junos-* alias, nor a 0..255 number — the same
+	// acceptance set the centralized appid.ProtocolNumber SSOT admits (#2124
+	// / #2175). Before this gate such a token was caught only by the
+	// dataplane compiler (compileFirewallFilters → validateFilterProtocols),
+	// whose error the daemon SWALLOWS (it is not in
+	// requiredProtocolGateSentinels, so compileErrorMustAbortApply == false):
+	// commit returned SUCCESS, the config was promoted, and the term silently
+	// programmed NO protocol match (the pre-#2175 "match protocol 0"
+	// surprise). The dataplane gate stays as defense-in-depth; this commit-
+	// check gate makes the refusal operator-visible. The tolerant load /
+	// peer-sync paths downgrade to a warning so an already-persisted or
+	// peer-synced config carrying a bad token still BOOTS (#1960 no-brick) —
+	// the dataplane independently drops the protocol constraint, so a
+	// leniently-loaded bad term is inert (it matches without a protocol
+	// constraint, never silently "protocol 0"). Same doctrine as
+	// lenientApplicationSpecs.
+	lenientFilterProtocols bool
 }
 
 // CompileConfig converts a parsed ConfigTree AST into a typed Config struct.
@@ -272,7 +310,9 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientNATPoolAlarmThreshold:       true,
 		lenientNATHostMask:                 true,
 		lenientUnsupportedInterfaceStanzas: true,
+		lenientRoutingExportRef:            true,
 		lenientApplicationSpecs:            true,
+		lenientFilterProtocols:             true,
 	})
 }
 
@@ -357,7 +397,9 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientNATPoolAlarmThreshold:       true,
 		lenientNATHostMask:                 true,
 		lenientUnsupportedInterfaceStanzas: true,
+		lenientRoutingExportRef:            true,
 		lenientApplicationSpecs:            true,
+		lenientFilterProtocols:             true,
 	})
 }
 
@@ -726,6 +768,32 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		}
 	}
 
+	// #2175 firewall-filter `from protocol <token>` fail-open gate. Strict on
+	// commit / commit-check (hard-reject a term whose protocol token is not
+	// resolvable by the centralized appid.ProtocolNumber SSOT — neither a
+	// known protocol name, a junos-* alias, nor a 0..255 number). Before this
+	// gate such a token was caught only by the dataplane compiler
+	// (compileFirewallFilters → validateFilterProtocols), whose error the
+	// daemon SWALLOWS (not in requiredProtocolGateSentinels, so
+	// compileErrorMustAbortApply == false): commit returned SUCCESS, the
+	// config was promoted, and the term silently programmed NO protocol match
+	// (the pre-#2175 "match protocol 0" surprise). The dataplane gate remains
+	// as defense-in-depth; this gate makes the refusal operator-visible at
+	// commit, consistent with validateApplicationSpecsStrict / the other
+	// fail-open gates. Lenient on load / peer-sync (warn so an already-
+	// persisted or peer-synced config carrying a bad token still boots — #1960
+	// no-brick; the dataplane drops the constraint independently so the term
+	// is inert, never silently "protocol 0"). Runs on the fully-compiled
+	// *Config (firewall filters compiled) so the typed term list is populated.
+	if err := validateFilterProtocolsStrict(cfg); err != nil {
+		if opts.lenientFilterProtocols {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("firewall filter protocol (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
 	// #2073 IPsec policy proposal cross-reference gate. Strict on commit /
 	// commit-check (hard-reject a dangling ipsec policy -> proposal
 	// reference that would silently drop the configured perfect-forward-
@@ -800,6 +868,27 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		if opts.lenientLogProfileStreamRef {
 			cfg.Warnings = append(cfg.Warnings,
 				fmt.Sprintf("security log profile stream reference (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
+	// #2144 routing export cross-reference gate. A dynamic-protocol
+	// `export` (OSPF/OSPFv3/BGP/IS-IS), a RIP `redistribute`, a BGP
+	// group/neighbor `export`, or a `routing-options forwarding-table
+	// export` whose token is neither a known redistribution protocol nor a
+	// defined policy-statement passes commit unnoticed, then at FRR render
+	// time either fails the reload, silently no-ops, fails OPEN as a
+	// permit-all route-map, or silently disables ECMP. Strict on commit /
+	// commit-check (hard reject so the typo is operator-visible); lenient on
+	// load / peer-sync (warn so an already-persisted or peer-synced config
+	// still boots — #1960 fail-closed-on-load class). Runs on the fully-
+	// compiled *Config so the policy-statement map is populated regardless
+	// of authoring order. Mirrors validateLogProfileStreamReferencesStrict.
+	if err := validateRoutingExportReferencesStrict(cfg); err != nil {
+		if opts.lenientRoutingExportRef {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("routing export reference (downgraded to warning on tolerant path): %v", err))
 		} else {
 			return nil, err
 		}
@@ -1096,6 +1185,176 @@ func validateLogProfileStreamReferencesStrict(cfg *Config) error {
 	return nil
 }
 
+// routingRedistProtocolTokens is the set of bare protocol keywords that an
+// OSPF/OSPFv3/BGP/IS-IS `export` (or a RIP `redistribute`) accepts in lieu
+// of a named policy-statement. resolveRedistribute (pkg/frr/policy_render.go)
+// emits a bare `redistribute <token>` for these. It mirrors
+// knownRedistProtocols there, plus Junos's `direct` spelling for FRR's
+// `connected`. Keep the two in sync: a token accepted here but unknown to
+// the renderer would emit a line FRR rejects; a token the renderer accepts
+// but missing here would be wrongly rejected at commit.
+var routingRedistProtocolTokens = map[string]bool{
+	"connected": true, "direct": true, "static": true, "kernel": true,
+	"ospf": true, "bgp": true, "rip": true, "isis": true,
+}
+
+// validateRoutingExportReferencesStrict hard-rejects a dynamic-protocol
+// `export` (OSPF / OSPFv3 / BGP / IS-IS), a RIP `redistribute`, a BGP
+// group/neighbor `export`, or a `routing-options forwarding-table export`
+// whose token resolves to neither a known redistribution protocol nor a
+// defined policy-statement (#2144).
+//
+// Without this gate a typo passes commit and reaches FRR render-time, where
+// it fails OPEN in three distinct ways:
+//
+//   - resolveRedistribute's fallback (policy_render.go) emits
+//     `redistribute <typo>` for any unknown token. FRR either rejects the
+//     line — failing the whole frr-reload (a single vtysh -f add-batch
+//     exits non-zero on any CMD_WARNING_CONFIG_FAILED) — or silently
+//     no-ops, so the intended redistribution never happens.
+//   - a BGP group/neighbor `export` renders `neighbor <addr> route-map
+//     <typo> out`. FRR resolves a route-map name with no definition to
+//     NULL, which it treats as permit-all — the outbound filter the
+//     operator wrote silently advertises EVERYTHING.
+//   - `forwarding-table export <typo>` is read by resolveECMP
+//     (config_render.go), which returns 0 max-paths when the policy is
+//     missing — silently DISABLING the expected ECMP / consistent-hash
+//     load balancing instead of rejecting the config.
+//
+// Protocol-token acceptance differs by site. A redistribute-backed export
+// (OSPF/OSPFv3/BGP/IS-IS export, RIP redistribute) legitimately names a
+// bare protocol (`export static`) OR a policy-statement, matching
+// resolveRedistribute. A BGP group/neighbor export and a forwarding-table
+// export render directly as a route-map / ECMP policy name, so only a
+// defined policy-statement is valid there — a protocol token would be a
+// dangling route-map / missing-policy reference, not a redistribute verb.
+//
+// On the tolerant load / peer-sync paths the call site downgrades this to a
+// warning (opts.lenientRoutingExportRef) so an already-persisted or
+// peer-synced config carrying the typo still boots (#1960
+// fail-closed-on-load class); the render-path fallbacks above keep it inert
+// or fail-open-on-an-already-committed-config exactly as before. Commit /
+// commit-check stay strict. Mirrors validateLogProfileStreamReferencesStrict.
+func validateRoutingExportReferencesStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	defined := func(name string) bool {
+		if cfg.PolicyOptions.PolicyStatements == nil {
+			return false
+		}
+		_, ok := cfg.PolicyOptions.PolicyStatements[name]
+		return ok
+	}
+
+	// checkRedist validates a redistribute-backed export list: each token
+	// must be a known protocol OR a defined policy-statement.
+	checkRedist := func(scope, proto string, exports []string) error {
+		for _, e := range exports {
+			if e == "" || routingRedistProtocolTokens[e] || defined(e) {
+				continue
+			}
+			return fmt.Errorf("%s%s export %q references neither a known "+
+				"redistribution protocol (connected/direct/static/kernel/"+
+				"ospf/bgp/rip/isis) nor a defined policy-statement — the "+
+				"FRR redistribute line would be rejected or silently no-op; "+
+				"define the policy-statement or fix the export name",
+				scope, proto, e)
+		}
+		return nil
+	}
+
+	// checkPolicyRef validates an export list that renders directly as a
+	// route-map / ECMP policy name: only a defined policy-statement is valid.
+	checkPolicyRef := func(detail, name string) error {
+		if name == "" || defined(name) {
+			return nil
+		}
+		return fmt.Errorf("%s references undefined policy-statement %q; %s",
+			detail, name, "define the policy-statement or fix the export name")
+	}
+
+	checkProtocols := func(scope string, ospf *OSPFConfig, ospfv3 *OSPFv3Config, bgp *BGPConfig, rip *RIPConfig, isis *ISISConfig) error {
+		if ospf != nil {
+			if err := checkRedist(scope, "protocols ospf", ospf.Export); err != nil {
+				return err
+			}
+		}
+		if ospfv3 != nil {
+			if err := checkRedist(scope, "protocols ospf3", ospfv3.Export); err != nil {
+				return err
+			}
+		}
+		if rip != nil {
+			if err := checkRedist(scope, "protocols rip", rip.Redistribute); err != nil {
+				return err
+			}
+		}
+		if isis != nil {
+			if err := checkRedist(scope, "protocols isis", isis.Export); err != nil {
+				return err
+			}
+		}
+		if bgp != nil {
+			if err := checkRedist(scope, "protocols bgp", bgp.Export); err != nil {
+				return err
+			}
+			// A BGP group/neighbor export renders `route-map <name> out`,
+			// so it must be a defined policy-statement (no protocol-token
+			// fallback). Sort neighbor addresses for a deterministic
+			// first-error message.
+			neighbors := append([]*BGPNeighbor(nil), bgp.Neighbors...)
+			sort.SliceStable(neighbors, func(i, j int) bool {
+				return neighbors[i].Address < neighbors[j].Address
+			})
+			for _, n := range neighbors {
+				if n == nil {
+					continue
+				}
+				for _, e := range n.Export {
+					detail := fmt.Sprintf("%sprotocols bgp neighbor %s export", scope, n.Address)
+					if n.GroupName != "" {
+						detail = fmt.Sprintf("%sprotocols bgp group %s neighbor %s export", scope, n.GroupName, n.Address)
+					}
+					if err := checkPolicyRef(detail, e); err != nil {
+						return err
+					}
+				}
+			}
+		}
+		return nil
+	}
+
+	// Top-level protocols.
+	if err := checkProtocols("", cfg.Protocols.OSPF, cfg.Protocols.OSPFv3, cfg.Protocols.BGP, cfg.Protocols.RIP, cfg.Protocols.ISIS); err != nil {
+		return err
+	}
+
+	// Per routing-instance protocols.
+	for _, ri := range cfg.RoutingInstances {
+		if ri == nil {
+			continue
+		}
+		scope := fmt.Sprintf("routing-instance %s ", ri.Name)
+		if err := checkProtocols(scope, ri.OSPF, ri.OSPFv3, ri.BGP, ri.RIP, ri.ISIS); err != nil {
+			return err
+		}
+	}
+
+	// forwarding-table export → resolveECMP (config_render.go). Renders
+	// directly as an ECMP policy lookup, so it must be a defined
+	// policy-statement; a missing one silently disables ECMP/consistent-hash.
+	if err := checkPolicyRef(
+		"routing-options forwarding-table export",
+		cfg.RoutingOptions.ForwardingTableExport,
+	); err != nil {
+		return fmt.Errorf("%s (the expected ECMP / consistent-hash "+
+			"load-balancing would be silently disabled)", err)
+	}
+
+	return nil
+}
+
 // validatePolicyMatchAddressesStrict hard-rejects a policy
 // source-address / destination-address token that is neither a known
 // address-book name (Address or AddressSet), the `any` keyword, nor a
@@ -1181,7 +1440,8 @@ func validatePolicyMatchAddressesStrict(cfg *Config) error {
 // service name, out of 1..65535, or an inverted low>high range) or whose
 // protocol token is not a known name, a junos-*
 // alias, or a 0..255 number (#2142) — but ONLY for applications that are
-// actually REFERENCED by a security policy, or for ALL applications when
+// actually REFERENCED by a security policy or a source/destination-NAT rule's
+// `match application` (#2187), or for ALL applications when
 // `services application-identification` is enabled (every app then compiles
 // into the app-id catalog). Such a spec is accepted by ValidateConfig as a
 // WARNING only; commit succeeds, the dataplane app-id compiler records the
@@ -1244,13 +1504,17 @@ func validateApplicationSpecsStrict(cfg *Config) error {
 // names whose port/protocol spec is validated as a hard COMMIT error rather
 // than a warning. That is every user application referenced (directly, or as a
 // member of a referenced application-set) by a zone-pair or global security
-// policy, plus — when `services application-identification` is enabled — every
-// user application (app-id compiles them all into the catalog). It mirrors the
-// policy-reference walk in appid.CatalogNames; the logic is duplicated here
-// because pkg/appid imports pkg/config (so the compiler cannot call back into
-// appid without an import cycle). Predefined junos-* applications are never
-// returned — they are not in cfg.Applications.Applications and their specs are
-// owned by the predefined table, not the operator.
+// policy, OR by a source/destination-NAT rule's `match application` (#2187 — a
+// NAT term consumes the app's port/proto the same way a policy does, so a
+// malformed app referenced only by a NAT rule must reject too), plus — when
+// `services application-identification` is enabled — every user application
+// (app-id compiles them all into the catalog). It mirrors the policy-reference
+// walk in appid.CatalogNames; the logic is duplicated here because pkg/appid
+// imports pkg/config (so the compiler cannot call back into appid without an
+// import cycle). Predefined junos-* applications are never returned — they are
+// not in cfg.Applications.Applications and their specs are owned by the
+// predefined table, not the operator. Static NAT carries no application match,
+// so only source and destination NAT rule-sets are walked.
 func applicationsToValidateStrict(cfg *Config) map[string]struct{} {
 	out := make(map[string]struct{})
 	if cfg == nil {
@@ -1317,6 +1581,38 @@ func applicationsToValidateStrict(cfg *Config) map[string]struct{} {
 		walk(zpp.Policies)
 	}
 	walk(cfg.Security.GlobalPolicies)
+
+	// #2187: a source/destination-NAT rule with `match application <name>` also
+	// consumes the referenced app's port/proto (pkg/dataplane/userspace/nat.go
+	// appPortsFromSpec). A malformed spec there returns nil ports, so the NAT
+	// term silently never-matches (or over-matches on a degenerate proto) with
+	// no commit error — and a bad app referenced ONLY by a NAT rule (not by any
+	// policy) escaped both this commit gate (policy-only) and the #2124 runtime
+	// gate (policy-only). Collect NAT-rule app references the same way as policy
+	// references (single app or application-set) so they are hard-rejected at
+	// commit, lenient on load — identical wiring to the policy path. Static NAT
+	// is intentionally not walked: StaticNATRule has no application match
+	// (compileNATStatic parses only source/destination-address), so there is no
+	// app reference to validate there.
+	walkNATRules := func(rs *NATRuleSet) {
+		if rs == nil {
+			return
+		}
+		for _, rule := range rs.Rules {
+			if rule == nil {
+				continue
+			}
+			addRef(rule.Match.Application)
+		}
+	}
+	for _, rs := range cfg.Security.NAT.Source {
+		walkNATRules(rs)
+	}
+	if cfg.Security.NAT.Destination != nil {
+		for _, rs := range cfg.Security.NAT.Destination.RuleSets {
+			walkNATRules(rs)
+		}
+	}
 	return out
 }
 
@@ -1331,6 +1627,114 @@ func applicationsToValidateStrict(cfg *Config) map[string]struct{} {
 // unexported validateApplicationSpecsStrict directly.
 func ApplicationsToValidateStrict(cfg *Config) map[string]struct{} {
 	return applicationsToValidateStrict(cfg)
+}
+
+// validateFilterProtocolsStrict hard-rejects any firewall-filter term whose
+// `from protocol <token>` is not resolvable by the centralized protocol SSOT
+// (#2175) — neither a known protocol name, a junos-* alias, nor a 0..255
+// number. It walks every inet and inet6 filter and reports the first offending
+// family / filter / term / token (sorted by filter name, then by the term's
+// position, so the first-reported error is deterministic across runs).
+//
+// Resolution goes through filterProtocolResolvable, which INLINE-mirrors the
+// acceptance set of appid.ProtocolNumber. The compiler cannot call
+// appid.ProtocolNumber directly because pkg/appid imports pkg/config (an import
+// cycle) — the same constraint that forces validateApplicationSpecsStrict to
+// duplicate appid.CatalogNames's policy-reference walk (#2142). A pkg/appid
+// drift-guard test (TestFilterProtocolResolvableMatchesProtocolNumber) asserts
+// the two acceptance sets agree via the exported FilterProtocolResolvable
+// accessor, so a future change to appid.ProtocolNumber cannot let this copy
+// drift silently.
+//
+// The dataplane compiler (compileFirewallFilters → validateFilterProtocols)
+// keeps an identical check as defense-in-depth, but its error is swallowed by
+// the daemon (compileErrorMustAbortApply == false): this commit-check gate is
+// what makes the refusal operator-visible. On the tolerant load / peer-sync
+// path the caller downgrades the returned error to a warning (#1960 no-brick).
+func validateFilterProtocolsStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	check := func(family string, filters map[string]*FirewallFilter) error {
+		names := make([]string, 0, len(filters))
+		for name := range filters {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			filter := filters[name]
+			if filter == nil {
+				continue
+			}
+			for _, term := range filter.Terms {
+				if term == nil || term.Protocol == "" {
+					continue
+				}
+				if !filterProtocolResolvable(term.Protocol) {
+					return fmt.Errorf(
+						"firewall family %s filter %q term %q: unknown protocol %q "+
+							"(use a protocol name such as tcp/udp/icmp/icmpv6/gre/esp/ah/"+
+							"sctp/ospf or a numeric value 0-255)",
+						family, name, term.Name, term.Protocol)
+				}
+			}
+		}
+		return nil
+	}
+	if err := check("inet", cfg.Firewall.FiltersInet); err != nil {
+		return err
+	}
+	return check("inet6", cfg.Firewall.FiltersInet6)
+}
+
+// filterProtocolResolvable reports whether a `from protocol <token>` is
+// representable: it INLINE-mirrors the acceptance set of
+// appid.ProtocolNumber's ok==true result (the #2124/#2175 SSOT). pkg/config
+// cannot import pkg/appid (import cycle: pkg/appid imports pkg/config), so the
+// known-name set is duplicated here and pinned by the pkg/appid drift-guard
+// test TestFilterProtocolResolvableMatchesProtocolNumber via the exported
+// FilterProtocolResolvable accessor.
+//
+// The acceptance set is intentionally TIGHTER than validateProtocol (used by
+// validateApplicationSpecsStrict): validateProtocol blanket-accepts ANY
+// "junos-" prefix, but appid.ProtocolNumber only resolves the specific
+// junos-* aliases below, so an unknown "junos-foobar" must be rejected here to
+// stay consistent with the dataplane SSOT — otherwise commit would pass while
+// the swallowed dataplane gate dropped the constraint.
+func filterProtocolResolvable(token string) bool {
+	switch strings.ToLower(strings.TrimSpace(token)) {
+	case "tcp", "junos-tcp-any",
+		"udp", "junos-udp-any",
+		"icmp", "junos-icmp-all", "junos-ping",
+		"icmpv6", "icmp6", "junos-icmp6-all", "junos-pingv6",
+		"gre", "junos-gre",
+		"ospf", "junos-ospf",
+		"junos-ip-in-ip", "junos-ipip", "ipip",
+		"egp",
+		"igmp",
+		"pim",
+		"ah",
+		"esp",
+		"sctp",
+		"vrrp":
+		return true
+	default:
+		// Numeric protocol number, including the deliberate "0" (HOPOPT).
+		if n, err := strconv.Atoi(strings.TrimSpace(token)); err == nil && n >= 0 && n < 256 {
+			return true
+		}
+		return false
+	}
+}
+
+// FilterProtocolResolvable exposes filterProtocolResolvable for the pkg/appid
+// drift-guard test (TestFilterProtocolResolvableMatchesProtocolNumber), which
+// asserts this acceptance set agrees with appid.ProtocolNumber's ok==true
+// result so the INLINE-duplicated table cannot drift from the SSOT silently. It
+// is a TEST seam, not a runtime coupling — production code uses the unexported
+// filterProtocolResolvable directly.
+func FilterProtocolResolvable(token string) bool {
+	return filterProtocolResolvable(token)
 }
 
 func policyMatchAddressError(scope, polName, field, addr string) error {

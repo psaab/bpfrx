@@ -218,7 +218,7 @@ installs — they cannot fail. The future cap arbitration for the sync
 family (row I11) now covers `UpsertLocal` automatically. Decision
 record: `docs/research/1870-local-tunnel-pair/plan.md`.
 
-## Per-IP session-limit lifecycle (#2134, fixes #2128)
+## Per-IP session-limit lifecycle (#2134; #2128 leak-fix preserved)
 
 Junos `set security screen ids-option <name> limit-session
 source-ip-based <n>` / `destination-ip-based <n>` caps the concurrent
@@ -275,10 +275,24 @@ spuriously block an under-limit IP. After a re-enable the maps start
 empty and re-populate from new installs; pre-existing live sessions are
 not back-counted (benign, Junos-approximate).
 
-**Per-worker scoping.** Each worker owns its `SessionTable`, so the count
-is per-worker — a single IP spreading flows across N RX queues sees an
-effective limit up to N×limit. This is a pre-existing property (same
-under the eBPF per-CPU map), not introduced by this change.
+**Per-worker scoping — the effective cap is `configured × num_workers`
+(#2186).** Each worker owns its `SessionTable` by value, so the per-IP
+count is maintained *independently per worker (per RX queue)*. With RSS
+spreading the flows of a single source/destination across all N RX
+queues, the limit is enforced N times in parallel, so the **effective
+admitted cap ≈ `configured_limit × number_of_RX_queues/workers`**, not a
+single global cap. The configured value is the per-worker ceiling.
+
+Worked example (loss userspace cluster, 6 mlx5 RX queues → 6 workers):
+`limit-session source-ip-based 2` admitted **12** sessions (2 × 6) from
+one source before screen-drops engaged. Enforcement is correct and fires
+on every worker; the cap is just per-worker-multiplied. This is a
+pre-existing property of the per-worker dataplane (the same was true of
+the eBPF per-CPU map), not introduced by #2134, and it is consistent
+with Junos-approximate multi-queue semantics. Operators sizing a cap
+should divide the desired global ceiling by the worker count, or treat
+the configured value as an approximate per-source/destination bound that
+scales with queue count.
 
 Decision record: `docs/research/2128-2134-screen-session-limit/plan.md`.
 

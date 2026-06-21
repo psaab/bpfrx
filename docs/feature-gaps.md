@@ -188,8 +188,8 @@ xpf implements 11 screen checks (land, syn-flood, ping-death, teardrop, rate-lim
 
 | Feature | Junos Config Path | Description | Priority | Status |
 |---------|-------------------|-------------|----------|--------|
-| **Session Limiting (source-ip)** | `security screen ids-option ... limit-session source-ip-based N` | Limit max concurrent sessions from single source IP (1-8M). Prevents session table exhaustion. | High | **Done** (#2134) -- the userspace dataplane `SessionTable` keeps a per-source-IP count of locally-admitted forward sessions (incremented at the install choke point + HA promote, decremented at the removal sink + HA demote, evict-on-zero). The limit is enforced at the new-flow / session-MISS decision in `poll_descriptor`: the (limit+1)-th new flow from an over-limit IP is dropped + counted (`session-limit-src`). Pre-#2134 the count was computed but never wired, so the limit was a no-op. |
-| **Session Limiting (dest-ip)** | `security screen ids-option ... limit-session destination-ip-based N` | Limit max concurrent sessions to single destination IP | High | **Done** (#2134) -- same per-IP `SessionTable` mechanism as source-ip limiting, keyed on the destination IP (`session-limit-dst`). |
+| **Session Limiting (source-ip)** | `security screen ids-option ... limit-session source-ip-based N` | Limit max concurrent sessions from single source IP (1-8M). Prevents session table exhaustion. | High | **Done** (#2134) -- the userspace dataplane `SessionTable` keeps a per-source-IP count of locally-admitted forward sessions (incremented at the install choke point + HA promote, decremented at the removal sink + HA demote, evict-on-zero). The limit is enforced at the new-flow / session-MISS decision in `poll_descriptor`: the (limit+1)-th new flow from an over-limit IP is dropped + counted (`session-limit-src`). Pre-#2134 the count was computed but never wired, so the limit was a no-op. **Per-worker cap (#2186):** the count is maintained per-worker (per RX queue), so with RSS the effective admitted cap is `N × configured` where N = number of RX queues/workers (live: `limit 2` admitted 12 on a 6-worker cluster) -- consistent with the rest of the per-worker dataplane, NOT a global cap. Size the configured value as a per-worker ceiling. |
+| **Session Limiting (dest-ip)** | `security screen ids-option ... limit-session destination-ip-based N` | Limit max concurrent sessions to single destination IP | High | **Done** (#2134) -- same per-IP `SessionTable` mechanism as source-ip limiting, keyed on the destination IP (`session-limit-dst`). Same per-worker multiplier applies (#2186): effective cap ≈ `N × configured`. |
 | **TCP Port Scan Detection** | `security screen ids-option ... tcp port-scan threshold N` | Detect TCP port scanning by counting unique destination ports per source within time window | Medium | Partial (threshold parsed but detection algorithm may be incomplete) |
 | **UDP Port Scan Detection** | `security screen ids-option ... udp port-scan threshold N` | Same as TCP port scan but for UDP | Medium | Missing |
 | **UDP Sweep Detection** | `security screen ids-option ... udp udp-sweep threshold N` | Detect UDP sweeps (same port, many destinations) | Low | Missing |
@@ -341,6 +341,24 @@ xpf has a broad chassis cluster implementation with redundancy groups, RETH (VRR
 ## 17. Firewall Filter Enhancements
 
 xpf has firewall filters with source/dest addresses, prefix-lists (with except), DSCP, protocol, dest/source ports, ICMP type/code, TCP flags, fragment match, actions (accept/reject/discard), routing-instance, log, count, forwarding-class, loss-priority, DSCP rewrite, and IPv6 traffic-class matching.
+
+`from protocol <name>` resolution is centralized (#2175) on the same
+`appid.ProtocolNumber` source of truth used by security-policy applications
+(#2124), so every protocol a policy accepts a firewall filter accepts too: the
+L4 subset (`tcp`/`udp`/`icmp`/`icmpv6`), the broader named set
+(`gre`/`ospf`/`esp`/`ah`/`sctp`/`vrrp`/`igmp`/`pim`/`egp`/`ipip`/...), Junos
+predefined aliases, and any numeric value `0`-`255` (including the deliberate
+`0` for HOPOPT). An unrepresentable protocol token is **rejected at commit with
+a clear error** naming the offending family/filter/term/token, rather than
+silently degrading to "match protocol 0". The operator-visible refusal is
+enforced at the config commit-check layer
+(`config.validateFilterProtocolsStrict`, lenient warn-only on the load /
+peer-sync path so a persisted/synced config still boots — #1960), with the
+dataplane compiler (`validateFilterProtocols`) keeping an identical check as a
+strictly-more-fail-closed backstop. Because `pkg/appid` imports `pkg/config`,
+the commit-check gate INLINE-mirrors the `appid.ProtocolNumber` acceptance set
+(it cannot import `appid` — an import cycle); a `pkg/appid` drift-guard test
+pins the two together so the duplicated table cannot diverge silently.
 
 | Feature | Junos Config Path | Description | Priority | Status |
 |---------|-------------------|-------------|----------|--------|
