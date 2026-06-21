@@ -1,9 +1,13 @@
 # #2138 — persistent-SNAT protocol mismatch must abort the commit
 
-**Status:** v2 — Codex PLAN-NEEDS-MINOR (all minors folded), AGY plan
-review pending (Gemini companion is decommissioned — "no longer
-supported for individuals, migrate to Antigravity"; AGY is the
-migration target and the substitute second reviewer)
+**Status:** v3 — IMPLEMENTED. Codex r1 PLAN-NEEDS-MINOR (premise holds,
+no brick regression, all claims independently verified; 3 minors folded
+into v2 + code). Gemini companion is decommissioned ("no longer
+supported for individuals, migrate to Antigravity") — AGY is the
+substitute second reviewer, dispatched at code-review time. Fix + tests
+committed; `go test ./pkg/dataplane/... ./pkg/daemon/...` green;
+`go build ./...` clean; abort/predicate tests confirmed
+non-tautological (FAIL against a scheduler-only abort set).
 
 ## Codex r1 minor findings (folded into v2)
 
