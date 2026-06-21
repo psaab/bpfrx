@@ -1,6 +1,54 @@
 # #2128 — Screen session-limit tracker phantom zero-entry leak (memory-exhaustion DoS)
 
-**Status:** DRAFT v1 — pending adversarial plan review
+**Status:** v2 — Codex round-1 PLAN-KILL addressed (false "already
+maintained" premise removed; enforcement gap split to a follow-up issue;
+leak fix retained as the correct + complete fix for the filed DoS).
+
+## Round-1 adversarial review outcome
+
+**Codex round-1: PLAN-KILL** (task `task-mqn9ue7w-e3kuyd`). The verdict
+was correct and is taken seriously. Codex found that the v1 plan's claim
+"the count map is already maintained by `session_created` /
+`session_expired`, leave it untouched" is **false**: production never
+calls `ScreenState::session_created` or `ScreenState::session_expired`.
+Verified independently against source —
+`grep -rn '\.session_created(\|\.session_expired(' userspace-dp/src`
+finds callers ONLY in `screen/tests.rs`; the production session-create
+hook (`poll_descriptor/mod.rs:321`, `resolved.created`) and the expiry
+loop (`worker/loop_body/mod.rs:573`) never notify `screen`. `git log -S`
+confirms `screen_state.session_created` was NEVER wired in `afxdp/`.
+The methods carry `#[cfg_attr(not(test), allow(dead_code))]`, which is
+the smoking gun.
+
+**Consequence (two distinct defects):**
+
+1. **The filed leak (#2128)** — REAL. `check_src`/`check_dst` use
+   `entry(ip).or_insert(0)` to read, inserting a phantom zero entry per
+   distinct IP on the hot path; never reclaimed; unbounded growth ->
+   memory-exhaustion DoS. **This plan's fix fully closes it.**
+2. **Latent enforcement gap** — surfaced by Codex, NOT the filed issue.
+   Because the lifecycle is unwired, the production count map only ever
+   held phantom ZEROS, so `*count >= limit` was `0 >= limit` — always
+   false. **Session-limit screen enforcement has been a no-op in the
+   userspace dataplane since inception.** The read-only fix does not
+   change that (the map stays empty), it just stops the leak. Wiring
+   enforcement correctly requires covering ALL session deletion paths
+   (stale expiry, conntrack GC, HA delete-sync, session clear) plus HA
+   considerations — a separate feature-bug with its own design and test
+   surface. Bolting it onto a security leak fix would be exactly the
+   scope-creep / partial-delete-path leak risk Codex warned about.
+
+**Resolution:** scope this PR to the filed leak (defect 1). Remove the
+false v1 premise. File the enforcement gap (defect 2) as a dedicated
+follow-up issue (#2134) and link it. The leak fix is correct and complete for
+the filed bug regardless of whether enforcement is ever wired: with the
+read path made read-only, the map is populated ONLY by
+`session_created` (currently nothing in production, tests in the suite)
+and pruned to empty by `session_expired` — bounded by definition.
+
+---
+
+DRAFT v1 superseded.
 
 ## Issue framing
 
@@ -53,16 +101,23 @@ PLAN-KILL is an acceptable verdict. (It should not be killed on perf
 grounds — the justification is security/DoS, not throughput — but the
 bar is stated for completeness.)
 
-## What's already shipped / partially batched
+## What's already in the code (corrected after Codex round-1)
 
-- `session_created` / `session_expired` already maintain the count
-  correctly via `entry().or_insert(0) += 1` and saturating decrement +
-  `remove` on reaching 0. Those are the ONLY legitimate writers of the
-  count map and they already prune to empty. The fix must leave them
-  untouched so the prune-to-empty invariant holds.
-- The orchestrator calls `check_src`/`check_dst` BEFORE session
-  creation (mod.rs:342-358) so the `(limit+1)`-th attempt is dropped.
-  This pre-check ordering is preserved.
+- `SessionLimitTracker::session_created` / `session_expired` are the only
+  legitimate WRITERS of the count map: `session_created` does
+  `entry().or_insert(0) += 1`; `session_expired` saturating-decrements
+  and `remove`s on reaching 0 (evict-on-zero is already correct on the
+  write path). They are pruned-to-empty by construction.
+- **They are NOT called from production.** The only callers of the
+  `ScreenState` wrappers are `screen/tests.rs`. The methods are
+  `#[cfg_attr(not(test), allow(dead_code))]`. So in production the count
+  map is, today, populated ONLY as a side effect of the buggy read path
+  (`entry().or_insert(0)` in `check_src`/`check_dst`), and only ever with
+  zeros. This is the v1 plan's error; see the round-1 outcome above.
+- The orchestrator calls `check_src`/`check_dst` BEFORE session creation
+  (`mod.rs:342-358`) so a real `(limit+1)`-th attempt WOULD be dropped —
+  if the count were ever non-zero. The pre-check ordering is preserved
+  by this change; making enforcement actually fire is the follow-up.
 
 ## Concrete design
 
@@ -165,8 +220,10 @@ fn session_limit_dst_len(&self) -> usize { self.session_limits.dst_len() }
    pass. `get().unwrap_or(0)` returns 0 for absent → `0 >= limit` is
    false for `limit >= 1`. Preserved.
 3. **Count map populated only by `session_created`, drained to empty by
-   `session_expired`**: after the fix this becomes strictly true (it was
-   the intended contract; the bug was the read path also populating it).
+   `session_expired`**: after the fix this becomes strictly true — the
+   read path no longer writes. (In production today nothing calls
+   `session_created`, so the map stays empty; that is the separate
+   enforcement gap, not a leak.)
 4. **No new per-packet allocation**: `get` does not allocate or grow the
    table; strictly fewer writes than before. No regression.
 5. **`limit == 0` early return** unchanged (session-limit disabled path).
@@ -197,14 +254,22 @@ fn session_limit_dst_len(&self) -> usize { self.session_limits.dst_len() }
 
 ## Out of scope (explicitly)
 
+- **Wiring session-limit enforcement into the production lifecycle**
+  (defect 2 above) — filed as #2134. It needs a
+  design that notifies `screen.session_created` on `resolved.created`
+  (poll_descriptor) and `screen.session_expired` on EVERY session
+  delete path (stale expiry in loop_body, conntrack GC, HA delete-sync,
+  `clear security flow session`), or it will leak in the opposite
+  direction (counts that never decrement eventually block legitimate
+  traffic). That is a feature-correctness change with its own test
+  surface and HA implications — deliberately NOT bundled with this
+  security leak fix.
 - Capping / LRU-bounding the count map beyond evict-on-zero. With the
-  read side effect removed, the map is already bounded by the number of
-  IPs with live sessions, which is itself bounded by the configured
-  per-IP limit times the number of distinct peers with live sessions —
-  no separate cap needed. A hard cap is a possible future hardening but
-  is not required to close this DoS.
+  read side effect removed, the map is bounded by the number of IPs with
+  live sessions (which, once enforcement is wired, is itself bounded by
+  the configured limit). No separate cap is needed to close THIS DoS.
 - Extending periodic cleanup to sweep `session_limits` — unnecessary
-  once the map only holds live-session IPs and prunes to empty.
+  once the read path no longer inserts.
 - Any change to `port_scan` / `ip_sweep` trackers.
 
 ## Open questions for adversarial review
