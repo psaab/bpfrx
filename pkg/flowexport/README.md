@@ -40,13 +40,18 @@ The package is split by responsibility (#1988):
 
 NetFlow v9:
 - `Exporter` — `netflow.go`.
-- `NewExporter(cfg ExportConfig) (*Exporter, error)` — `netflow.go`.
+- `NewExporter(cfg *ExportConfig) (*Exporter, error)` — `netflow.go`.
+  Takes `*ExportConfig` (never a value copy): `ExportConfig` embeds the
+  live 1-in-N `sampleCounter` (`atomic.Uint64`), and copying it would
+  fork the counter (a go-vet "copies lock value" failure) — see #2224.
 - `Run(ctx context.Context)` — `netflow.go`. Main export loop.
 - `Exporter.ExportSessionClose(rec, evt)` — emit one record.
 
 IPFIX:
 - `IPFIXExporter` — `ipfix.go`.
-- `NewIPFIXExporter(cfg ExportConfig) (*IPFIXExporter, error)` — `ipfix.go`.
+- `NewIPFIXExporter(cfg *ExportConfig) (*IPFIXExporter, error)` — `ipfix.go`.
+  Also takes `*ExportConfig` (never a value copy) for the same #2224
+  reason as `NewExporter`.
 - `IPFIXExporter.Run(ctx context.Context)` — `ipfix.go`.
 - `IPFIXExporter.ExportSessionClose(rec, evt)` — emit one record.
 
@@ -123,9 +128,13 @@ indirection callback per family exactly once
 pair lock-free from an `atomic.Pointer` bundle; reconcile swaps the
 bundle atomically. The callback calls `Exporter.ExportSessionClose()`
 (NetFlow v9) / `IPFIXExporter.ExportSessionClose()` (IPFIX) from the
-`logging.EventReader` SESSION_CLOSE event. The daemon-held
-`*ExportConfig` is the sole 1-in-N counter owner (the exporter never
-reads `sampleCounter`), so it is held by pointer in the bundle.
+`logging.EventReader` SESSION_CLOSE event. The resolved `*ExportConfig`
+is shared by pointer everywhere — in the bundle, by the callback's
+`ShouldExport`, AND inside the exporter — so there is exactly ONE live
+1-in-N `sampleCounter` (`atomic.Uint64`) per family. `ExportConfig` is
+never copied by value: doing so would fork the atomic counter (a go-vet
+"copies lock value" failure) and silently re-seed the modulo cadence the
+moment any caller sampled off the copy (#2224).
 `stopFlowExporter`/`stopIPFIXExporter` drain the exporter at shutdown.
 
 ## Dependencies
