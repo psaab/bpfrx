@@ -7567,3 +7567,18 @@ top.
   against FRR source; Codex code review + AGY adversarial both
   MERGE-READY; Copilot reviewed 3/3 files, no comments. Control-plane
   display only — no dataplane smoke. PR #2135 MERGEABLE.
+
+- **Timestamp**: 2026-06-20
+  **Action**: #2154 — parseLeaseCSV reads Kea memfile record-by-record
+  (`csv.Reader.Read` loop) instead of `ReadAll`, so one torn/concurrent
+  Kea append no longer blanks the whole `show dhcp server leases`. Header
+  is the first successful record; a malformed row is logged at debug and
+  SKIPPED (csv.Read recovers after a *csv.ParseError; FieldsPerRecord=-1
+  makes a short line a non-event). #2085's per-record dedup/expire/state
+  loop body is preserved verbatim — robust READ layered ON TOP of #2085's
+  lenient SEMANTICS. New non-tautological TestParseLeaseCSV_SkipsMalformedLine
+  (fails against pre-fix ReadAll with "bare \" in non-quoted-field").
+  Full pkg/dhcpserver suite green, 5/5 flake. Control-plane display path —
+  no dataplane smoke.
+  **File(s)**: pkg/dhcpserver/dhcpserver.go, pkg/dhcpserver/dhcpserver_test.go,
+  pkg/dhcpserver/README.md, docs/pr/2154-parseleasecsv/plan.md
