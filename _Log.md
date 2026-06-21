@@ -1,5 +1,11 @@
 # Action Log
 
+## 2026-06-20 — #2120 PR #2166 Copilot fold (doc nits + SELF-HEAL/HOLD expect hardening)
+
+- **Timestamp**: 2026-06-20
+- **Action**: Folded all 7 Copilot inline comments on PR #2166. Commit 1 (doc/comment only): clarified `seen_rg_epoch` reset-to-0 lifecycle, `WheelPopStats.re_bucketed` now covers standby-gate re-buckets, `epoch_of` comment + `ExpireHaContext` doc no longer imply flow-cache parity and state the out-of-range rg→rg_epochs[0] fallback, README `entry.rs` bullets de-duplicated to public data types. Commit 2 (invariant-loudening): SELF-HEAL + HOLD arms convert `if let Some(em)` → `let em = ...expect(...)` matching Case-4. Build clean; session tests green (expire_ 23/0); the 2 full-suite failures are pre-existing concurrency flakes (worker_queue concurrent_recovery confirmed non-deterministic 2/5, wg reconcile_peers_snapshot) outside session. NOT merged, not pushed to GitHub PR comments.
+- **File(s)**: userspace-dp/src/session/mod.rs, userspace-dp/src/session/ctx.rs, userspace-dp/src/session/expire.rs, userspace-dp/src/afxdp/worker/loop_body/mod.rs, userspace-dp/src/session/README.md
+
 ## 2026-06-20 — #2129 + #2130 NetFlow v9 export gating + dead Rust exporter removal
 
 - **Timestamp**: 2026-06-20
