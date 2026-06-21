@@ -766,12 +766,17 @@ fn empty_application_terms_stay_match_any() {
 }
 
 #[test]
-fn mixed_parseable_and_unparseable_keeps_parseable_term() {
-    // A rule with one parseable (esp) and one unparseable term is NOT
-    // all-dropped, so it parses Ok and matches ESP via the surviving term. The
-    // bogus term is silently dropped (the gate is the front-line reject); the
-    // rule does NOT fail closed because it still has a real constraint.
-    let state = parse_policy_state(
+fn mixed_parseable_and_unparseable_fails_closed() {
+    // A rule with one parseable (esp) and one unparseable term has dropped_any
+    // set, so it fails CLOSED (whole-snapshot integrity error) rather than
+    // silently NARROWING the match by dropping the bad term. Narrowing matters
+    // for a deny rule: a dropped term would let traffic the deny meant to block
+    // fall through to a later permit / default. Normal Go snapshots never reach
+    // this (the capability gate rejects any unrepresentable term before
+    // publish); this is the corrupt/non-Go-snapshot backstop (Codex code-review
+    // finding 2). Pre-fix this returned Ok with the bad term silently dropped.
+    let store = PolicyCounterStore::default();
+    let result = parse_policy_state_with_counters(
         "deny",
         &[PolicyRuleSnapshot {
             rule_id: "esp-plus-bogus".to_string(),
@@ -799,6 +804,50 @@ fn mixed_parseable_and_unparseable_keeps_parseable_term() {
             ..Default::default()
         }],
         &test_zone_name_to_id(),
+        &[],
+        &store,
+    );
+    assert!(
+        matches!(
+            result,
+            Err(SnapshotIntegrityError::UnrepresentableApplicationProtocol { .. })
+        ),
+        "a partially-unparseable term list must fail closed, got {result:?}"
+    );
+}
+
+#[test]
+fn all_parseable_terms_match_each_protocol() {
+    // Sanity: a rule with two fully-parseable terms (esp + tcp/443) parses Ok
+    // and matches BOTH, without tripping the dropped_any backstop.
+    let state = parse_policy_state(
+        "deny",
+        &[PolicyRuleSnapshot {
+            rule_id: "esp-and-https".to_string(),
+            name: "esp-and-https".to_string(),
+            from_zone: "lan".to_string(),
+            to_zone: "wan".to_string(),
+            source_addresses: vec!["any".to_string()],
+            destination_addresses: vec!["any".to_string()],
+            applications: vec!["esp-and-https".to_string()],
+            application_terms: vec![
+                PolicyApplicationSnapshot {
+                    name: "esp".to_string(),
+                    protocol: "esp".to_string(),
+                    source_port: String::new(),
+                    destination_port: String::new(),
+                },
+                PolicyApplicationSnapshot {
+                    name: "https".to_string(),
+                    protocol: "tcp".to_string(),
+                    source_port: String::new(),
+                    destination_port: "443".to_string(),
+                },
+            ],
+            action: "permit".to_string(),
+            ..Default::default()
+        }],
+        &test_zone_name_to_id(),
     );
     let src = "10.0.61.100".parse().expect("src");
     let dst = "172.16.80.200".parse().expect("dst");
@@ -807,14 +856,21 @@ fn mixed_parseable_and_unparseable_keeps_parseable_term() {
             &state, TEST_LAN_ZONE_ID, TEST_WAN_ZONE_ID, src, dst, PROTO_ESP, 0, 0,
         ),
         PolicyAction::Permit,
-        "the surviving esp term must still match"
+        "esp term must match"
     );
     assert_eq!(
         evaluate_policy(
             &state, TEST_LAN_ZONE_ID, TEST_WAN_ZONE_ID, src, dst, PROTO_TCP, 40000, 443,
         ),
+        PolicyAction::Permit,
+        "tcp/443 term must match"
+    );
+    assert_eq!(
+        evaluate_policy(
+            &state, TEST_LAN_ZONE_ID, TEST_WAN_ZONE_ID, src, dst, PROTO_TCP, 40000, 80,
+        ),
         PolicyAction::Deny,
-        "TCP must NOT match (rule is not match-any despite the dropped term)"
+        "tcp/80 must NOT match (not match-any)"
     );
 }
 

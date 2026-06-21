@@ -683,20 +683,25 @@ pub(crate) fn parse_policy_state_with_counters(
         // the constructor is updated, eliminating the silent-zero-
         // default hazard (originally raised by AGY r2 D on #1632).
         // #2124: parse the application terms and FAIL CLOSED if a rule cites
-        // application terms but NONE are representable (unparseable protocol or
-        // port). Such a rule must not collapse to match-any — that is the
-        // security fail-open this fixes. The Go capability gate emits a
-        // `__unsupported__` sentinel term for the unsupported-protocol case, so
-        // this fires for that sentinel and for any otherwise-corrupt snapshot.
-        // Genuinely-empty terms (`application any`) keep `had_terms == false`
-        // and remain match-any.
+        // application terms and ANY of them is unrepresentable (unparseable
+        // protocol or port). Dropping a term silently is the security fail-open
+        // this fixes: an all-dropped rule would collapse to match-any (a permit
+        // over-matching), and a PARTIALLY-dropped rule would NARROW the match —
+        // for a deny rule that narrowing lets traffic the deny meant to block
+        // fall through to a later permit / default-permit. Rejecting on
+        // `dropped_any` (not just all-dropped) is action-agnostic for permit
+        // and deny alike. The Go capability gate rejects any unrepresentable
+        // term before publish (and emits a `__unsupported__` sentinel for the
+        // failed-expansion case), so a normal Go snapshot never trips this; it
+        // is the backstop for that sentinel and for any corrupt/non-Go
+        // snapshot. Genuinely-empty terms (`application any`) keep
+        // `had_terms == false`, `dropped_any == false`, and stay match-any.
         let parsed = parse_applications(&snap.application_terms);
-        if parsed.had_terms && parsed.matches.is_empty() {
+        if parsed.dropped_any {
             return Err(SnapshotIntegrityError::UnrepresentableApplicationProtocol {
                 rule_id: rule_id.clone(),
             });
         }
-        let _ = parsed.dropped_any; // retained for diagnostics/future counters
         let applications = parsed.matches;
         let compiled_apps = CompiledApplications::from_matches(&applications);
 
@@ -1156,15 +1161,14 @@ fn parse_address(prefix: &str, out_v4: &mut Vec<PrefixV4>, out_v6: &mut Vec<Pref
 }
 
 /// #2124: outcome of parsing a rule's application terms. `dropped_any` records
-/// whether at least one term failed to parse (unparseable protocol or port).
-/// The caller uses `(matches.is_empty() && had_terms)` — i.e. terms were
-/// configured but ALL dropped — to fail the rule closed via
-/// `SnapshotIntegrityError`, rather than letting an empty `matches` collapse to
-/// match-any. A genuinely-empty input (`application any` / no match application)
-/// has `had_terms == false` and stays match-any.
+/// whether at least one configured term failed to parse (unparseable protocol
+/// or port). The caller fails the rule closed via `SnapshotIntegrityError`
+/// whenever `dropped_any` is set, rather than letting a dropped term collapse
+/// the rule to match-any (all-dropped) or silently narrow it (partial-drop).
+/// A genuinely-empty input (`application any` / no match application) drops
+/// nothing, so `dropped_any == false` and the rule stays match-any.
 struct ParsedApplications {
     matches: Vec<ApplicationMatch>,
-    had_terms: bool,
     dropped_any: bool,
 }
 
@@ -1192,7 +1196,6 @@ fn parse_applications(terms: &[PolicyApplicationSnapshot]) -> ParsedApplications
     }
     ParsedApplications {
         matches: out,
-        had_terms: !terms.is_empty(),
         dropped_any,
     }
 }
