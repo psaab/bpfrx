@@ -1247,6 +1247,12 @@ func (vi *vrrpInstance) garpSendAllowed(force bool, nowNanos int64) bool {
 	return true
 }
 
+// arpProbeFn is the gateway ARP-probe sender used by sendGARP. It is a
+// package var so tests can capture the sender/target sendGARP passes,
+// proving the probe carries the VIP (not the interface primary) as the ARP
+// sender (#2152) without performing real AF_PACKET I/O.
+var arpProbeFn = cluster.SendARPProbe
+
 // sendGARP sends gratuitous ARP (IPv4) and unsolicited NA (IPv6) for all VIPs.
 // Uses burst mode: one immediate pair then background follow-ups at 50ms intervals.
 // After each IPv4 GARP burst, also sends a standard ARP probe to the subnet's
@@ -1258,12 +1264,6 @@ func (vi *vrrpInstance) garpSendAllowed(force bool, nowNanos int64) bool {
 // post-MAC-change reconcile GARP is always emitted; see garpSendAllowed.
 //
 // This method may be called in a goroutine from becomeMaster().
-// arpProbeFn is the gateway ARP-probe sender used by sendGARP. It is a
-// package var so tests can capture the sender/target sendGARP passes,
-// proving the probe carries the VIP (not the interface primary) as the ARP
-// sender (#2152) without performing real AF_PACKET I/O.
-var arpProbeFn = cluster.SendARPProbe
-
 func (vi *vrrpInstance) sendGARP(force bool) {
 	epoch := vi.garpEpoch.Load()
 	if !vi.garpSendAllowed(force, time.Now().UnixNano()) {
