@@ -160,6 +160,17 @@ func buildAppCatalogSnapshot(cfg *config.Config) []AppCatalogEntrySnapshot {
 	return out
 }
 
+// buildFlowExportSnapshot constructs the FlowExportSnapshot wire field.
+//
+// #2130: the userspace dataplane does NOT emit flow records — flow export
+// is owned entirely by the Go control plane (pkg/flowexport), driven by
+// SESSION_CLOSE events. The Rust FlowExporter that once consumed this
+// snapshot was dead code (never wired into the forwarding path) and was
+// removed; the helper now deserializes this field and ignores it. The
+// field (and this builder) are retained as a documented-reserved wire
+// contract so the #1977 decode-safety coercion tests
+// (flow_wire_coerce_test.go, protocol/tests.rs) keep guarding the path and
+// no cross-language wire break is introduced.
 func buildFlowExportSnapshot(cfg *config.Config) *FlowExportSnapshot {
 	if cfg == nil || cfg.Services.FlowMonitoring == nil {
 		return nil

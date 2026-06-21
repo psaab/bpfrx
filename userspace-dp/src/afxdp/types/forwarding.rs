@@ -83,7 +83,9 @@ pub(in crate::afxdp) struct ForwardingState {
     /// is no express/regular split to select between).
     #[allow(dead_code)]
     pub(in crate::afxdp) power_mode_disable: bool,
-    pub(in crate::afxdp) flow_export_config: Option<crate::flowexport::FlowExportConfig>,
+    // #2130: the dead Rust FlowExporter + its flow_export_config field were
+    // removed. Flow export is owned by the Go control plane (pkg/flowexport);
+    // the dataplane emits no flow records.
     pub(in crate::afxdp) mirror_configs: FastMap<i32, MirrorRuntimeConfig>,
     pub(in crate::afxdp) tcp_mss_all_tcp: u16,
     pub(in crate::afxdp) tcp_mss_ipsec_vpn: u16,

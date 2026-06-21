@@ -247,18 +247,13 @@ pub(super) fn build_forwarding_state_with_policy_counters_and_previous(
             .filter_state
             .iface_filter_out_v6_needs_tx_eval
             .is_empty();
-    // Build flow export config from snapshot
-    state.flow_export_config = snapshot.flow_export.as_ref().and_then(|fe| {
-        let addr = format!("{}:{}", fe.collector_address, fe.collector_port);
-        addr.parse::<std::net::SocketAddr>().ok().map(|collector| {
-            crate::flowexport::FlowExportConfig {
-                collector,
-                sampling_rate: fe.sampling_rate,
-                active_timeout_secs: fe.active_timeout as u64,
-                inactive_timeout_secs: fe.inactive_timeout as u64,
-            }
-        })
-    });
+    // #2130: flow export (NetFlow v9 / IPFIX) is owned entirely by the
+    // Go control plane (pkg/flowexport), driven by SESSION_CLOSE events.
+    // The dataplane never emitted flow records; the Rust FlowExporter and
+    // the flow_export_config field were dead code and have been removed.
+    // The flow_export wire field is retained as reserved/ignored (see
+    // protocol/snapshot.rs) to preserve the #1977 decode-safety tests and
+    // avoid a wire-protocol break.
     for mirror in &snapshot.mirror_configs {
         if mirror.ingress_ifindex <= 0 || mirror.output_ifindex <= 0 {
             continue;

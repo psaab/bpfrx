@@ -1,5 +1,37 @@
 # Action Log
 
+## 2026-06-20 — #2129 + #2130 NetFlow v9 export gating + dead Rust exporter removal
+
+- **Timestamp**: 2026-06-20
+- **Action**: #2129 — gated `BuildExportConfig` on
+  `svc.FlowMonitoring.Version9 != nil`, mirroring the existing IPFIX
+  `VersionIPFIX` guard, so a NetFlow v9 exporter only starts when
+  `services flow-monitoring version9` is configured (fixes the
+  unrequested-v9-stream harm for IPFIX-only operators). Updated the
+  daemon reconcile test helper `flowSamplingConfig` to carry a `version9`
+  stanza (one edit fixes the 7 v9-reconcile tests), updated
+  `ipfixSamplingConfig` to set VersionIPFIX on the existing FlowMonitoring
+  (so it drives both exporters), switched the 3 `BuildExportConfig(nil,..)`
+  exporter_test sites to a `v9Svc()` helper, and added two non-tautological
+  #2129 regression guards (IPFIX-only starts IPFIX not v9; v9 requires a
+  version9 stanza). #2130 — removed the dead Rust executable export path
+  (`flowexport.rs`, `flowexport_tests.rs`, `mod flowexport;`, the
+  write-only `flow_export_config` field + its forwarding_build writer);
+  retained the `flow_export` snapshot wire field as documented-reserved
+  with `#[allow(dead_code)]` to preserve the #1977 decode-safety tests and
+  avoid a wire-protocol break. Docs updated (pkg/flowexport/README.md,
+  pkg/dataplane/README.md, flow.go header). Deferred per-flow-server
+  version-binding / double-export de-dup filed as a follow-up issue.
+- **File(s)**: pkg/flowexport/manager.go, pkg/flowexport/exporter_test.go,
+  pkg/daemon/daemon_flowexport_reconcile_test.go,
+  userspace-dp/src/main.rs, userspace-dp/src/flowexport.rs (deleted),
+  userspace-dp/src/flowexport_tests.rs (deleted),
+  userspace-dp/src/afxdp/types/forwarding.rs,
+  userspace-dp/src/afxdp/forwarding_build/mod.rs,
+  userspace-dp/src/protocol/snapshot.rs,
+  pkg/dataplane/userspace/flow.go, pkg/flowexport/README.md,
+  pkg/dataplane/README.md, _Log.md
+
 ## 2026-06-20 — #2118 policy hit-count display-gate consistency
 
 - **Timestamp**: 2026-06-20
