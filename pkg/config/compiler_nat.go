@@ -170,12 +170,22 @@ func validateNATHostMaskStrict(cfg *Config, lenient bool) ([]string, error) {
 		return nil, nil
 	}
 	var warnings []string
-	emit := func(msg string) error {
+	// emitSuffix returns a violation as an error (strict) or appends it to the
+	// lenient warning list with a dataplane-effect suffix. The suffix differs
+	// by case: a static-NAT IP failure drops the WHOLE rule (parse_nat_addr
+	// returns None for the rule's match/then), whereas a NAT64 source-pool
+	// entry is dropped individually by filter_map(parse_pool_v4) — the rest of
+	// the pool/rule stays installed. Keep the load-path text precise so the
+	// operator does not over-read the impact.
+	emitSuffix := func(msg, suffix string) error {
 		if lenient {
-			warnings = append(warnings, msg+" (ignored: rule dropped by dataplane until corrected)")
+			warnings = append(warnings, msg+suffix)
 			return nil
 		}
 		return fmt.Errorf("%s", msg)
+	}
+	emit := func(msg string) error {
+		return emitSuffix(msg, " (ignored: rule dropped by dataplane until corrected)")
 	}
 
 	for _, rs := range cfg.Security.NAT.Static {
@@ -240,9 +250,10 @@ func validateNATHostMaskStrict(cfg *Config, lenient bool) ([]string, error) {
 				continue
 			}
 			if host, parsed := isNAT64PoolHostAddress(a); parsed && !host {
-				if err := emit(fmt.Sprintf(
+				if err := emitSuffix(fmt.Sprintf(
 					"security nat source pool %q address %q is referenced by nat64 rule-set %q source-pool and must be an IPv4 host route (a bare IPv4 address or /32); a non-host or IPv6 address is silently dropped by the dataplane",
-					pool.Name, a, rs.Name)); err != nil {
+					pool.Name, a, rs.Name),
+					" (ignored: only this pool address is dropped by the dataplane until corrected)"); err != nil {
 					return nil, err
 				}
 			}

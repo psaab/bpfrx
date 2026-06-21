@@ -178,6 +178,55 @@ func TestNAT64SourcePoolHostMaskRejectsIPv6(t *testing.T) {
 	}
 }
 
+// #2182: the IPv4-mapped IPv6 literal (`::ffff:203.0.113.5`) is the
+// pathological case where Go's net.ParseIP(...).To4() and Rust's IpAddr
+// family decision DISAGREE — exercised end-to-end at COMMIT (not just the
+// predicate-unit table). To4() returns non-nil (Go would call it IPv4 and
+// accept a /32), but Rust's parse_nat_addr parses it as IpAddr::V6 and demands
+// /128, so a /32 is silently dropped by the dataplane, re-creating the exact
+// "commit passes, dataplane drops" gap #2173 closes. The /32 form must now be
+// REJECTED at commit; the /128 form must compile.
+func TestStaticNATHostMaskV4MappedV6RejectsSlash32(t *testing.T) {
+	tree := buildTree(t, staticNATSet("::ffff:203.0.113.5/32", "10.0.0.5/32"))
+	_, err := CompileConfig(tree)
+	if err == nil {
+		t.Fatal("static-NAT v4-mapped-v6 match /32 must be rejected (Rust treats it as IPv6, requires /128)")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "::ffff:203.0.113.5/32") || !strings.Contains(msg, "host route") {
+		t.Fatalf("error must name the offending v4-mapped-v6 prefix + host-route rule, got: %v", err)
+	}
+}
+
+func TestStaticNATHostMaskV4MappedV6AcceptsSlash128(t *testing.T) {
+	// As an IPv6 literal the host mask is /128 — must compile.
+	tree := buildTree(t, staticNATSet("::ffff:203.0.113.5/128", "::ffff:10.0.0.5/128"))
+	if _, err := CompileConfig(tree); err != nil {
+		t.Fatalf("static-NAT v4-mapped-v6 /128 host mask must compile, got: %v", err)
+	}
+}
+
+// NAT64 source pool: Rust's parse_pool_v4 (Ipv4Addr::from_str) rejects ANY
+// colon-bearing literal, so the v4-mapped-v6 form is dropped regardless of
+// mask. To4() would have wrongly accepted `::ffff:.../32` as an IPv4 pool
+// host; the commit gate must reject BOTH /32 and /128 to match the dataplane.
+func TestNAT64SourcePoolHostMaskRejectsV4MappedV6(t *testing.T) {
+	for _, a := range []string{"::ffff:203.0.113.5/32", "::ffff:203.0.113.5/128", "::ffff:203.0.113.5"} {
+		tree := buildTree(t, []string{
+			"set security nat source pool p64 address " + a,
+			"set security nat nat64 rule-set rs1 prefix 64:ff9b::/96",
+			"set security nat nat64 rule-set rs1 source-pool p64",
+		})
+		_, err := CompileConfig(tree)
+		if err == nil {
+			t.Fatalf("nat64 source-pool v4-mapped-v6 address %q must be rejected (parse_pool_v4 is IPv4-only, rejects colon)", a)
+		}
+		if !strings.Contains(err.Error(), "IPv4 host route") {
+			t.Fatalf("error must say IPv4 host route for %q, got: %v", a, err)
+		}
+	}
+}
+
 // The strict commit gate must NOT brick a daemon restart: a config committed
 // before this gate existed (non-host static-NAT mask) must LOAD under the
 // lenient path (Store.Load) with the violation downgraded to a warning —
@@ -213,6 +262,38 @@ func TestStaticNATHostMaskLenientLoadAccepts(t *testing.T) {
 		if !found {
 			t.Fatalf("case %d: lenient load must emit a host-route warning, warnings=%v", i, cfg.Warnings)
 		}
+	}
+}
+
+// #2182: the lenient warning text must be precise about dataplane impact. A
+// static-NAT IP failure makes parse_nat_addr return None for the rule's
+// match/then -> the WHOLE rule is dropped. A NAT64 source-pool entry is
+// dropped individually by filter_map(parse_pool_v4) -> only that pool address
+// is dropped, the rest of the pool/rule stays installed. The two warnings must
+// say different things so the operator does not over-read the impact.
+func TestNATHostMaskLenientWarningSuffixPrecision(t *testing.T) {
+	staticCfg, err := CompileConfigLenient(buildTree(t, staticNATSet("203.0.113.0/24", "10.0.0.5/32")))
+	if err != nil {
+		t.Fatalf("static-NAT lenient compile: %v", err)
+	}
+	if !hasWarningContaining(staticCfg.Warnings, "rule dropped by dataplane") {
+		t.Fatalf("static-NAT warning must say the rule is dropped, got: %v", staticCfg.Warnings)
+	}
+
+	poolCfg, err := CompileConfigLenient(buildTree(t, []string{
+		"set security nat source pool p64 address 100.64.0.0/24",
+		"set security nat nat64 rule-set rs1 prefix 64:ff9b::/96",
+		"set security nat nat64 rule-set rs1 source-pool p64",
+	}))
+	if err != nil {
+		t.Fatalf("nat64-pool lenient compile: %v", err)
+	}
+	if !hasWarningContaining(poolCfg.Warnings, "only this pool address is dropped") {
+		t.Fatalf("nat64-pool warning must say only the pool address is dropped, got: %v", poolCfg.Warnings)
+	}
+	// And it must NOT claim the whole rule is dropped.
+	if hasWarningContaining(poolCfg.Warnings, "rule dropped by dataplane") {
+		t.Fatalf("nat64-pool warning must NOT claim the whole rule is dropped, got: %v", poolCfg.Warnings)
 	}
 }
 
