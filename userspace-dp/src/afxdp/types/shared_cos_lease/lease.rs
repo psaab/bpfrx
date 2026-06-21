@@ -10,7 +10,8 @@
 // `rotate_epoch_v8.rs`, which reaches `self.config` and `self.v8`.
 // Because a sibling submodule is not a descendant of `lease`, those two
 // fields are widened from inherent-private to `pub(super)` (the `state`
-// field has no cross-submodule reader and stays private). All epoch-state
+// field has no sibling-submodule reader; it is `pub(super)` only so the
+// co-located `tests` module can read `lease.state.credits`). All epoch-state
 // types this file reaches (`V8State`, `SharedCoSEpochState`,
 // `PackedEpochGrant`, the enums, the consts, …) live in the sibling
 // `epoch.rs` and are already widened to `pub(super)` there.
