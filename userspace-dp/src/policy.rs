@@ -16,15 +16,16 @@ pub(crate) enum SnapshotIntegrityError {
     AddressBookIdZero,
     DuplicateAddressBookId(u32),
     UnknownAddressBookId { rule_id: String, book_id: u32 },
-    /// #2124: a policy rule's `application_terms` are NON-empty but EVERY term
-    /// failed to parse (unrepresentable protocol or malformed port). Collapsing
-    /// such a rule to match-any is a security fail-open (a permit meant for one
-    /// protocol would permit ALL traffic). The Go capability gate emits a
-    /// reserved `__unsupported__` sentinel term for exactly this case, and any
-    /// corrupt snapshot that produces an all-dropped term list lands here too.
-    /// Rejecting the whole snapshot (the preflight keeps the previous good
-    /// state) is action-agnostic: it never turns a deny into a pass nor a
-    /// permit into match-any.
+    /// #2124: a policy rule has at least one `application_terms` entry that
+    /// failed to parse (unrepresentable protocol or malformed port). Dropping a
+    /// term silently is a security fail-open: an all-dropped rule collapses to
+    /// match-any (a permit over-matching), and a partially-dropped rule narrows
+    /// the match (for a deny rule, narrowing lets blocked traffic fall through).
+    /// The Go capability gate emits a reserved `__unsupported__` sentinel term
+    /// for the failed-expansion case, and any corrupt snapshot with an
+    /// unparseable term lands here too. Rejecting the whole snapshot (the
+    /// preflight keeps the previous good state) is action-agnostic: it never
+    /// turns a deny into a pass nor a permit into match-any.
     UnrepresentableApplicationProtocol { rule_id: String },
 }
 
@@ -42,7 +43,7 @@ impl std::fmt::Display for SnapshotIntegrityError {
             ),
             Self::UnrepresentableApplicationProtocol { rule_id } => write!(
                 f,
-                "rule {:?} has application terms but none are representable (unparseable protocol or port) — refusing to fail open to match-any",
+                "rule {:?} has an unrepresentable application term (unparseable protocol or port) — refusing to fail open by dropping it",
                 rule_id
             ),
         }
