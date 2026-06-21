@@ -1440,7 +1440,8 @@ func validatePolicyMatchAddressesStrict(cfg *Config) error {
 // service name, out of 1..65535, or an inverted low>high range) or whose
 // protocol token is not a known name, a junos-*
 // alias, or a 0..255 number (#2142) — but ONLY for applications that are
-// actually REFERENCED by a security policy, or for ALL applications when
+// actually REFERENCED by a security policy or a source/destination-NAT rule's
+// `match application` (#2187), or for ALL applications when
 // `services application-identification` is enabled (every app then compiles
 // into the app-id catalog). Such a spec is accepted by ValidateConfig as a
 // WARNING only; commit succeeds, the dataplane app-id compiler records the
@@ -1503,13 +1504,17 @@ func validateApplicationSpecsStrict(cfg *Config) error {
 // names whose port/protocol spec is validated as a hard COMMIT error rather
 // than a warning. That is every user application referenced (directly, or as a
 // member of a referenced application-set) by a zone-pair or global security
-// policy, plus — when `services application-identification` is enabled — every
-// user application (app-id compiles them all into the catalog). It mirrors the
-// policy-reference walk in appid.CatalogNames; the logic is duplicated here
-// because pkg/appid imports pkg/config (so the compiler cannot call back into
-// appid without an import cycle). Predefined junos-* applications are never
-// returned — they are not in cfg.Applications.Applications and their specs are
-// owned by the predefined table, not the operator.
+// policy, OR by a source/destination-NAT rule's `match application` (#2187 — a
+// NAT term consumes the app's port/proto the same way a policy does, so a
+// malformed app referenced only by a NAT rule must reject too), plus — when
+// `services application-identification` is enabled — every user application
+// (app-id compiles them all into the catalog). It mirrors the policy-reference
+// walk in appid.CatalogNames; the logic is duplicated here because pkg/appid
+// imports pkg/config (so the compiler cannot call back into appid without an
+// import cycle). Predefined junos-* applications are never returned — they are
+// not in cfg.Applications.Applications and their specs are owned by the
+// predefined table, not the operator. Static NAT carries no application match,
+// so only source and destination NAT rule-sets are walked.
 func applicationsToValidateStrict(cfg *Config) map[string]struct{} {
 	out := make(map[string]struct{})
 	if cfg == nil {
@@ -1576,6 +1581,38 @@ func applicationsToValidateStrict(cfg *Config) map[string]struct{} {
 		walk(zpp.Policies)
 	}
 	walk(cfg.Security.GlobalPolicies)
+
+	// #2187: a source/destination-NAT rule with `match application <name>` also
+	// consumes the referenced app's port/proto (pkg/dataplane/userspace/nat.go
+	// appPortsFromSpec). A malformed spec there returns nil ports, so the NAT
+	// term silently never-matches (or over-matches on a degenerate proto) with
+	// no commit error — and a bad app referenced ONLY by a NAT rule (not by any
+	// policy) escaped both this commit gate (policy-only) and the #2124 runtime
+	// gate (policy-only). Collect NAT-rule app references the same way as policy
+	// references (single app or application-set) so they are hard-rejected at
+	// commit, lenient on load — identical wiring to the policy path. Static NAT
+	// is intentionally not walked: StaticNATRule has no application match
+	// (compileNATStatic parses only source/destination-address), so there is no
+	// app reference to validate there.
+	walkNATRules := func(rs *NATRuleSet) {
+		if rs == nil {
+			return
+		}
+		for _, rule := range rs.Rules {
+			if rule == nil {
+				continue
+			}
+			addRef(rule.Match.Application)
+		}
+	}
+	for _, rs := range cfg.Security.NAT.Source {
+		walkNATRules(rs)
+	}
+	if cfg.Security.NAT.Destination != nil {
+		for _, rs := range cfg.Security.NAT.Destination.RuleSets {
+			walkNATRules(rs)
+		}
+	}
 	return out
 }
 
