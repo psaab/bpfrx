@@ -824,27 +824,32 @@ pub(super) fn poll_binding_process_descriptor(
                             // and bounded (see `screen/scan.rs`). The reason
                             // is `port-scan` / `ip-sweep`; emit + recycle in
                             // the shared block below.
+                            // #2227 MINOR-5: parse the screen 5-tuple ONCE on
+                            // this cold new-flow path. It feeds both the
+                            // scan/sweep check below and the drop-event tuple
+                            // if a drop fires. If the L3 header is unparseable
+                            // (#2146 Err), fall back to a meta+flow info so the
+                            // scan/sweep tuple and any drop event still carry
+                            // the offending 5-tuple.
+                            let l3_off = if meta.ingress_vlan_present != 0 { 18 } else { 14 };
+                            let screen_pkt = extract_screen_info(
+                                packet_frame,
+                                meta.addr_family,
+                                meta.protocol,
+                                meta.tcp_flags,
+                                meta.pkt_len,
+                                flow.src_ip,
+                                flow.dst_ip,
+                                flow.forward_key.src_port,
+                                flow.forward_key.dst_port,
+                                l3_off,
+                            )
+                            .unwrap_or_else(|_| screen_parse_error_info(&meta, flow));
                             let new_flow_screen_reason = screen
                                 .scan_sweep_drop_on_new_flow(
                                     from_zone,
                                     from_zone_id,
-                                    &{
-                                        let l3_off =
-                                            if meta.ingress_vlan_present != 0 { 18 } else { 14 };
-                                        extract_screen_info(
-                                            packet_frame,
-                                            meta.addr_family,
-                                            meta.protocol,
-                                            meta.tcp_flags,
-                                            meta.pkt_len,
-                                            flow.src_ip,
-                                            flow.dst_ip,
-                                            flow.forward_key.src_port,
-                                            flow.forward_key.dst_port,
-                                            l3_off,
-                                        )
-                                        .unwrap_or_else(|_| screen_parse_error_info(&meta, flow))
-                                    },
+                                    &screen_pkt,
                                     now_secs,
                                 )
                                 // #2134: per-IP session-limit enforcement at the
@@ -869,26 +874,9 @@ pub(super) fn poll_binding_process_descriptor(
                                     )
                                 });
                             if let Some(reason) = new_flow_screen_reason {
-                                let l3_off = if meta.ingress_vlan_present != 0 { 18 } else { 14 };
-                                // The screen verdict is already decided
-                                // (session-limit `reason`); extract_screen_info
-                                // is used here only to populate the drop event's
-                                // 5-tuple. If the L3 header is unparseable
-                                // (#2146 Err), fall back to a meta+flow info so
-                                // the event still logs the offending tuple.
-                                let screen_pkt = extract_screen_info(
-                                    packet_frame,
-                                    meta.addr_family,
-                                    meta.protocol,
-                                    meta.tcp_flags,
-                                    meta.pkt_len,
-                                    flow.src_ip,
-                                    flow.dst_ip,
-                                    flow.forward_key.src_port,
-                                    flow.forward_key.dst_port,
-                                    l3_off,
-                                )
-                                .unwrap_or_else(|_| screen_parse_error_info(&meta, flow));
+                                // The screen verdict is already decided; reuse
+                                // the single parse above for the drop event's
+                                // 5-tuple.
                                 emit_screen_drop_event(
                                     worker_ctx.event_stream,
                                     &screen_pkt,
