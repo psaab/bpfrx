@@ -111,3 +111,55 @@ func TestCLIShowPoliciesHitCountHonorsPolicyStats(t *testing.T) {
 		})
 	}
 }
+
+// TestCLIShowPoliciesBriefHonorsPolicyStats covers the `show security
+// policies brief` "Hits" column gate (#2118 — the brief view is a
+// separate display surface from the hit-count table).
+func TestCLIShowPoliciesBriefHonorsPolicyStats(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		statsOn bool
+	}{
+		{name: "enabled", statsOn: true},
+		{name: "disabled", statsOn: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newPolicyHitCountCLIStore(t, tc.statsOn)
+			c := &CLI{
+				store: store,
+				dp: &policyCounterCLIDP{
+					Manager:  dataplane.New(),
+					counters: map[uint32]dataplane.CounterValue{0: {Packets: 42, Bytes: 4242}},
+				},
+			}
+
+			var callErr error
+			out := captureStdout(t, func() {
+				callErr = c.handleShowSecurity([]string{"policies", "brief"})
+			})
+			if callErr != nil {
+				t.Fatalf("handleShowSecurity(policies brief) error = %v", callErr)
+			}
+
+			var row string
+			for _, line := range strings.Split(out, "\n") {
+				if strings.Contains(line, "allow-web") {
+					row = line
+					break
+				}
+			}
+			if row == "" {
+				t.Fatalf("allow-web row not found in brief output:\n%s", out)
+			}
+			if tc.statsOn {
+				if !strings.Contains(row, "42") {
+					t.Fatalf("policy-stats ON: brief allow-web row missing live hits 42:\n%s", row)
+				}
+			} else {
+				if strings.Contains(row, "42") {
+					t.Fatalf("policy-stats OFF: brief allow-web row leaked live hits 42:\n%s", row)
+				}
+			}
+		})
+	}
+}

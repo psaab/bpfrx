@@ -150,6 +150,13 @@ func (c *CLI) handleShowSecurity(args []string) error {
 		}
 		brief := len(args) >= 2 && args[1] == "brief"
 		if brief {
+			// Honor `set security policy-stats system-wide enable`
+			// (#2008 M4 / #2118): the brief view's "Hits" column is
+			// per-policy hit-count display, so it must obey the same
+			// knob as the hit-count table, the gRPC/REST surfaces, and
+			// the Prometheus collector. When the knob is off the column
+			// reads 0 (we skip the dataplane read).
+			statsEnabled := cfg.Security.PolicyStatsEnabled
 			// Brief tabular summary
 			fmt.Printf("%-12s %-12s %-20s %-8s %s\n",
 				"From", "To", "Name", "Action", "Hits")
@@ -173,10 +180,12 @@ func (c *CLI) handleShowSecurity(args []string) error {
 					}
 					ruleID := policySetID*dataplane.MaxRulesPerPolicy + uint32(i)
 					hits := "-"
-					if c.dp != nil && c.dp.IsLoaded() {
+					if statsEnabled && c.dp != nil && c.dp.IsLoaded() {
 						if counters, err := c.dp.ReadPolicyCounters(ruleID); err == nil {
 							hits = fmt.Sprintf("%d", counters.Packets)
 						}
+					} else if !statsEnabled {
+						hits = "0"
 					}
 					fmt.Printf("%-12s %-12s %-20s %-8s %s\n",
 						zpp.FromZone, zpp.ToZone, pol.Name, action, hits)
@@ -195,10 +204,12 @@ func (c *CLI) handleShowSecurity(args []string) error {
 					}
 					ruleID := policySetID*dataplane.MaxRulesPerPolicy + uint32(i)
 					hits := "-"
-					if c.dp != nil && c.dp.IsLoaded() {
+					if statsEnabled && c.dp != nil && c.dp.IsLoaded() {
 						if counters, err := c.dp.ReadPolicyCounters(ruleID); err == nil {
 							hits = fmt.Sprintf("%d", counters.Packets)
 						}
+					} else if !statsEnabled {
+						hits = "0"
 					}
 					fmt.Printf("%-12s %-12s %-20s %-8s %s\n",
 						"*", "*", pol.Name, action, hits)
