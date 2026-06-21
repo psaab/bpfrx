@@ -1226,6 +1226,16 @@ Closed all 6 remaining HA feature gaps from docs/feature-gaps.md section 16 (exc
 - **Stats:** `IPsecSASent`/`IPsecSAReceived` counters, shown in FormatStats()
 - **Tests:** `TestIPsecSAPayloadRoundTrip`, `TestIPsecSAPayloadEmpty`, `TestPeerIPsecSAs`
 
+### DHCP-server Lease Synchronization (#2239, PATH C — re-instantiates the IPsec-SA-sync pattern)
+- **Wire:** `syncMsgDHCPLeaseV4=25`/`syncMsgDHCPLeaseV6=26`; `encode/decodeDHCPLeasePayload` (count + length-gated per-lease records, #2170 trailing-field discipline). Additive + config-gated → NO `CurrentHAProtocolVersion` bump (legacy peers ignore via default case).
+- **Clock invariant:** leases carry REMAINING LIFETIME, re-anchored to the local clock at seed (`expire = now + remaining`) — immune to peer wall-clock skew (the channel syncs only a monotonic offset).
+- **SessionSync:** `QueueDHCPLeases(family, leases)` send; `peerDHCPLeases{4,6}` hold + `PeerDHCPLeases{4,6}()`; `RecordDHCPLeasesSeeded`; receive cases store the full set.
+- **Kea side (`pkg/dhcpserver/lease_sync.go`):** control-socket `lease{4,6}-get-all` read (memfile fallback) + `lease{4,6}-add`/`-update` seed + `PreSeedMemfile{4,6}` (pre-Kea-start, closes dup-alloc window). `SetLeaseSyncEnabled` emits the control-socket + `libdhcp_lease_cmds.so` hook only when the knob is set.
+- **Daemon wiring:** `syncDHCPLeasesPeriodic` (30s heartbeat + 2s on-grant change-detect, RG-MASTER gated), `seedDHCPLeasesFromPeer` (async takeover seed) + `preSeedDHCPLeaseMemfile`; standby Kea stays STOPPED (`clearRethServicesForRG` unchanged). Gate `dhcpLeaseSyncGateOpen` mirrors `ddnsWriterGateOpen`.
+- **Config:** `DHCPLeaseSync bool` on ClusterConfig; AST `dhcp-lease-synchronization` leaf.
+- **Stats:** `DHCPLeases{Sent,Received,Seeded}`, shown in `show chassis cluster statistics`.
+- **Open-question resolutions:** Q1 incremental on-grant push (2s change-detect); Q3 pre-seed memfile before start; Q4 explicit knob; Q5 v6 DUID/IAID/PD; Q7 full re-push on reconnect (`OnPeerConnected` nudge).
+
 ### Active/Active Mode (Partial → Implemented)
 - Per-RG primary election already worked (electRG per redundancy group)
 - Validated with `TestActiveActive_DifferentPrimariesPerRG`:
