@@ -8559,3 +8559,46 @@ top.
   pkg/cli/cli_show_security_screen.go, pkg/cli/cli_show_security_objects.go,
   pkg/cli/cli_show_security_ipsec.go, pkg/cli/cli_show_security_log.go,
   pkg/cli/cli_show_security_filters.go, docs/refactoring-audit-current.txt
+
+- **Timestamp**: 2026-06-21
+- **Action**: #2158 P2 Rust file-split — split
+  userspace-dp/src/afxdp/types/shared_cos_lease/mod.rs (2121 LOC, over the
+  ~2000 modularity threshold) into cohesive same-module submodules per the
+  converged plan section 5.4. mod.rs -> mod.rs (92, thin shell of mod/use
+  wiring) + backlog.rs (210, SharedCoSExactBacklog + residual-surplus
+  bucket; self-contained, no widening) + vtime.rs (179, cross-worker MQFQ
+  V_min floor; self-contained, no widening) + epoch.rs (536, #1229 Phase-6
+  v8 epoch state: V8State/SharedCoSEpochState/PackedEpochGrant + the v8
+  enums/consts + equal-flow suppress state; carries the minimal pub(super)
+  widening) + lease.rs (1325, SharedCoS{Queue,Root}Lease token bucket + v8
+  fair-share acquire path + free helpers). HOT-PATH CoS shaper. Pure
+  code-motion: bodies moved verbatim, no logic change, no afxdp-facing API
+  change (only pub(super) widenings WITHIN the module — no new
+  pub/pub(crate), no cross-crate surface). Because the lease/rotation/
+  publish logic lives in sibling submodules (a sibling is NOT a descendant),
+  every epoch field/method/const a sibling reaches widened from
+  inherent-private to pub(super) (documented at each item) — the same
+  forced widening the already-extracted rotate_epoch_v8.rs /
+  publish_equal_flow_epoch_v8.rs (#1588) did. lease.rs widened config/state/
+  v8 fields (rotate sibling + the co-located tests module) plus the
+  test-only reaches (SharedCoSLeaseState fields, root-lease config/state,
+  equal_flow_cap_v8, the pack/unpack/refill/record free fns). Added
+  #[inline] on the cross-module hot helper try_bump_outstanding (LTO off,
+  codegen-units 16 — preserve the implicit single-TU inline). Updated the
+  v8_carry_field_is_reader_private allowlist (field def moved mod.rs ->
+  epoch.rs; rotation-private invariant unchanged). Full Rust suite ==
+  master (2187 passed; the 3 fails — concurrent_recovery / wg
+  reconcile_peers / tx_latency_hist — are pre-existing concurrency flakes,
+  verified failing on the unmodified master baseline). shared_cos_lease
+  module 88/88 and all cos+lease named tests 508/508 green across 5 runs.
+  cargo fmt clean on all new files; release build clean (145 warnings ==
+  master). Regenerated docs/refactoring-audit-current.txt (mod.rs drops off
+  the heatmap; no split file reaches the WATCH floor); make audit-check
+  clean. CoS per-class iperf smoke is PENDING-PARENT.
+- **File(s)**: userspace-dp/src/afxdp/types/shared_cos_lease/mod.rs (shell),
+  userspace-dp/src/afxdp/types/shared_cos_lease/backlog.rs,
+  userspace-dp/src/afxdp/types/shared_cos_lease/vtime.rs,
+  userspace-dp/src/afxdp/types/shared_cos_lease/epoch.rs,
+  userspace-dp/src/afxdp/types/shared_cos_lease/lease.rs,
+  userspace-dp/src/afxdp/types/shared_cos_lease/shared_cos_lease_tests.rs,
+  docs/refactoring-audit-current.txt
