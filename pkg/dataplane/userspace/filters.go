@@ -54,8 +54,14 @@ func buildFirewallFilterSnapshots(cfg *config.Config) []FirewallFilterSnapshot {
 }
 
 func buildFilterTermSnapshots(filter *config.FirewallFilter, cfg *config.Config) []FirewallTermSnapshot {
+	// #2214: return a non-nil empty slice (never nil) so the enclosing
+	// FirewallFilterSnapshot.Terms marshals as `[]`, never JSON `null`. The
+	// Terms field has no `,omitempty` (the compiler can store a filter with
+	// zero terms — see compileFirewall) and the Rust `Vec<FirewallTermSnapshot>`
+	// rejects an explicit null, which aborts the whole snapshot decode and
+	// kills ALL transit (#1961 no-transit signature).
 	if filter == nil || len(filter.Terms) == 0 {
-		return nil
+		return []FirewallTermSnapshot{}
 	}
 	terms := make([]FirewallTermSnapshot, 0, len(filter.Terms))
 	for _, term := range filter.Terms {
