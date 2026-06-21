@@ -1,5 +1,20 @@
 # Action Log
 
+## 2026-06-20 — #2143 CLI ping/traceroute double-prefixed the VRF
+
+- **Action**: Fixed #2143 — the local CLI ping/traceroute builders
+  unconditionally prepended `vrf-`, so `routing-instance vrf-red` ran
+  `ip vrf exec vrf-vrf-red` (non-existent device → false failure) while
+  REST/gRPC normalized correctly. Added shared `pkg/diagcmd`
+  (`VRFDeviceName` applies the prefix exactly once + `PingArgv`/
+  `TracerouteArgv`) and routed all three surfaces (CLI, REST, gRPC)
+  through it. Added regression tests that fail on the `vrf-vrf-*` double
+  prefix.
+- **File(s)**: pkg/diagcmd/diagcmd.go, pkg/diagcmd/diagcmd_test.go,
+  pkg/cli/cli_request.go, pkg/cli/cli_request_argv_test.go,
+  pkg/api/system.go, pkg/api/system_argv_test.go,
+  pkg/grpcapi/server_diag.go, pkg/grpcapi/server_diag_argv_test.go
+
 ## 2026-06-20 — #2153 DHCP relay must relay DHCPINFORM
 
 - **Timestamp**: 2026-06-20
