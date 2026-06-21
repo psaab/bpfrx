@@ -71,10 +71,17 @@ impl Nat64State {
             let octets = addr.octets();
             let mut prefix_bytes = [0u8; 12];
             prefix_bytes.copy_from_slice(&octets[..12]);
+            // Pool addresses may carry a canonical host mask: an
+            // address-range source pool (`address A to B`) is expanded by
+            // the Go compiler into per-IP `/32` entries (#2123), and
+            // `Ipv4Addr::from_str` rejects CIDR notation. Strip the mask
+            // before parse (mirroring the SNAT-pool idiom in nat/source.rs)
+            // so range-form pools are not silently dropped, leaving pool_v4
+            // empty and NAT64 forward translation non-functional.
             let pool_v4: Vec<Ipv4Addr> = snap
                 .pool_addresses
                 .iter()
-                .filter_map(|s| s.parse().ok())
+                .filter_map(|s| s.split('/').next().unwrap_or(s).parse().ok())
                 .collect();
             prefixes.push(Nat64Prefix {
                 prefix_bytes,

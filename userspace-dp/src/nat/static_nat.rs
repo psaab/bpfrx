@@ -22,17 +22,29 @@ pub(crate) struct StaticNatTable {
     snat: FxHashMap<IpAddr, StaticNatEntry>,
 }
 
+/// Parse a NAT address that may carry a canonical host mask
+/// (`x.x.x.x/32`, `addr/128`). Junos emits static-NAT match/then in
+/// canonical prefix form, and the Go compiler copies that mask verbatim
+/// into the snapshot; `IpAddr::from_str` REJECTS CIDR notation, so the mask
+/// must be stripped before the parse or the rule is silently dropped (#2122).
+/// Mirrors the SNAT-pool idiom in `nat/source.rs`. A genuinely-malformed
+/// address still returns `None` so callers preserve their skip-on-invalid
+/// behavior.
+fn parse_nat_addr(s: &str) -> Option<IpAddr> {
+    s.split('/').next().unwrap_or(s).parse().ok()
+}
+
 impl StaticNatTable {
     pub(crate) fn from_snapshots(snaps: &[StaticNATRuleSnapshot]) -> Self {
         let mut table = StaticNatTable::default();
         for snap in snaps {
-            let external_ip: IpAddr = match snap.external_ip.parse() {
-                Ok(ip) => ip,
-                Err(_) => continue,
+            let external_ip: IpAddr = match parse_nat_addr(&snap.external_ip) {
+                Some(ip) => ip,
+                None => continue,
             };
-            let internal_ip: IpAddr = match snap.internal_ip.parse() {
-                Ok(ip) => ip,
-                Err(_) => continue,
+            let internal_ip: IpAddr = match parse_nat_addr(&snap.internal_ip) {
+                Some(ip) => ip,
+                None => continue,
             };
             let entry = StaticNatEntry {
                 external_ip,
