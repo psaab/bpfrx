@@ -46,6 +46,19 @@ type Manager struct {
 	// netlink). Production defaults are set in NewManager.
 	linkState      func(name string) (bool, error)
 	subscribeLinks func(ch chan<- netlink.LinkUpdate, done <-chan struct{}) error
+
+	// Injectable instance-lifecycle seams (#2156). Unit tests must not
+	// require real raw sockets or a live run() goroutine to exercise the
+	// build-before-teardown ordering in UpdateInstances. Production
+	// defaults are set in NewManager:
+	//   resolveIface       -> net.InterfaceByName
+	//   openInstanceSocket -> vi.openSocket()   (the "proof" step)
+	//   runInstance        -> `go vi.run()`     (the "commit" step)
+	//   stopInstance       -> vi.stop()
+	resolveIface       func(name string) (*net.Interface, error)
+	openInstanceSocket func(vi *vrrpInstance) error
+	runInstance        func(vi *vrrpInstance)
+	stopInstance       func(vi *vrrpInstance)
 }
 
 // SetOnEventDrop registers a callback invoked when a VRRP event is dropped
@@ -60,11 +73,15 @@ func (m *Manager) SetOnEventDrop(fn func()) {
 // NewManager creates a new VRRP manager.
 func NewManager() *Manager {
 	return &Manager{
-		instances:      make(map[instanceKey]*vrrpInstance),
-		eventCh:        make(chan VRRPEvent, 256),
-		watcherStop:    make(chan struct{}),
-		linkState:      netlinkLinkState,
-		subscribeLinks: netlink.LinkSubscribe,
+		instances:          make(map[instanceKey]*vrrpInstance),
+		eventCh:            make(chan VRRPEvent, 256),
+		watcherStop:        make(chan struct{}),
+		linkState:          netlinkLinkState,
+		subscribeLinks:     netlink.LinkSubscribe,
+		resolveIface:       net.InterfaceByName,
+		openInstanceSocket: func(vi *vrrpInstance) error { return vi.openSocket() },
+		runInstance:        func(vi *vrrpInstance) { go vi.run() },
+		stopInstance:       func(vi *vrrpInstance) { vi.stop() },
 	}
 }
 
@@ -246,18 +263,32 @@ func (m *Manager) UpdateInstances(desired []*Instance) error {
 				}
 				continue
 			}
-			// VIPs changed — must restart instance.
+			// VIPs changed — the instance must be restarted (changing the
+			// VIP set requires re-opening sockets and re-running the state
+			// machine). BUILD THE REPLACEMENT BEFORE TEARING DOWN the old
+			// one (#2156): a transient member-link failure (carrier flap,
+			// mid-rename by networkd) used to delete the working instance
+			// and then `continue` on InterfaceByName/openSocket error,
+			// orphaning the RG out of VRRP election until an operator
+			// re-commit. Falls through to the shared build block below; the
+			// old instance is only stopped+replaced on a fully-built
+			// replacement.
 			slog.Info("vrrp: restarting instance", "key", existing.key(),
 				"old_pri", existing.cfg.Priority, "new_pri", inst.Priority)
-			existing.stop()
-			delete(m.instances, key)
 		}
 
-		// Create new instance.
-		iface, err := net.InterfaceByName(inst.Interface)
+		// Build the (possibly replacement) instance. On ANY build failure
+		// we leave m.instances untouched: an existing instance keeps
+		// advertising its old VIP set (strictly better than dropping out of
+		// election), and a brand-new key is simply not created yet. The 2s
+		// reconcile re-drive (daemon reconcileVRRPInstances) and the two
+		// existing UpdateInstances callers retry until the interface
+		// returns. No placeholder state is added, so RGVRRPReady and the
+		// other map readers stay truthful.
+		iface, err := m.resolveIface(inst.Interface)
 		if err != nil {
-			slog.Warn("vrrp: interface not found, skipping",
-				"interface", inst.Interface, "err", err)
+			slog.Warn("vrrp: interface not found, keeping existing instance",
+				"interface", inst.Interface, "have_existing", ok, "err", err)
 			continue
 		}
 
@@ -268,12 +299,6 @@ func (m *Manager) UpdateInstances(desired []*Instance) error {
 		vi := newInstance(instCfg, iface, m.eventCh, m.onEventDrop)
 		// Store the real configured preempt value for when sync hold releases.
 		vi.desiredPreempt = inst.Preempt
-		if err := vi.openSocket(); err != nil {
-			slog.Warn("vrrp: failed to open socket",
-				"interface", inst.Interface, "err", err)
-			continue
-		}
-		m.instances[key] = vi
 
 		// Seed tracked-link state before the state machine starts so the
 		// first advert already carries the effective priority (#1814).
@@ -281,7 +306,29 @@ func (m *Manager) UpdateInstances(desired []*Instance) error {
 			m.seedTrackState(vi, inst.TrackInterface)
 		}
 
-		go vi.run()
+		// PROOF step: open the per-instance socket. This is the operation
+		// that fails on a transient member-link problem. On failure the new
+		// instance is discarded WITHOUT touching m.instances — the old one
+		// (if any) keeps running and advertising its old VIPs
+		// (build-before-teardown). run() has NOT been started, so there is
+		// no goroutine to stop and no fd leak (openSocket closes its own
+		// conn on error).
+		if err := m.openInstanceSocket(vi); err != nil {
+			slog.Warn("vrrp: failed to open socket, keeping existing instance",
+				"interface", inst.Interface, "have_existing", ok, "err", err)
+			continue
+		}
+
+		// COMMIT step: the replacement is proven buildable. Only now tear
+		// down the old instance, then swap in and start the new one. stop()
+		// blocks on the old run() goroutine exiting before the new run()
+		// owns the key, so the two state machines never run concurrently
+		// for the same key (no double-run).
+		if ok {
+			m.stopInstance(existing)
+		}
+		m.instances[key] = vi
+		m.runInstance(vi)
 	}
 
 	return nil
@@ -597,46 +644,71 @@ func openAfPacketReceiver(ifIndex int) (int, error) {
 		slog.Debug("vrrp: failed to set promisc", "err", err)
 	}
 
-	// BPF filter: accept VRRP (proto/next-header 112) for IPv4, IPv6,
-	// and 802.1Q-tagged variants. SOCK_RAW includes the Ethernet header.
-	// Protocol/next-header offsets:
+	// BPF filter: accept VRRP for IPv4, IPv6, and 802.1Q-tagged variants.
+	// SOCK_RAW includes the Ethernet header. Protocol/next-header offsets:
 	//   IPv4 untagged:  ethertype 0x0800 @12, proto @23 (14+9)
 	//   IPv6 untagged:  ethertype 0x86DD @12, next-hdr @20 (14+6)
 	//   IPv4 802.1Q:    ethertype 0x8100 @12, real 0x0800 @16, proto @27 (18+9)
 	//   IPv6 802.1Q:    ethertype 0x8100 @12, real 0x86DD @16, next-hdr @24 (18+6)
 	//
+	// IPv4 matches base proto == 112 (the IPv4 arm already re-validates IHL +
+	// TTL in Go, so it tolerates IPv4 options). IPv6 must additionally admit
+	// VRRP adverts that carry one or more IPv6 extension headers (#2155): the
+	// base Next-Header of such a frame is the FIRST ext-header's type, not 112.
+	// A fixed-offset cBPF cannot walk an ext-header chain, so the IPv6 arm
+	// instead matches the base Next-Header against the small set
+	//   {112 VRRP, 0 Hop-by-Hop, 43 Routing, 60 Dest-Opts}
+	// (approach A2). Any conformant VRRP advert — bare or chained — starts with
+	// one of these, while ordinary IPv6 TCP/UDP/ICMPv6/ND stays kernel-dropped
+	// on a data-bearing RETH VLAN (e.g. reth0.80). Fragment (44) and AH (51)
+	// are deliberately NOT admitted: VRRP adverts are never legitimately
+	// fragmented (the receiver does no reassembly) and never AH-wrapped (VRRP
+	// has its own authentication, not IPsec-AH), so those frames stay
+	// kernel-dropped here rather than waking the RX goroutine only for the Go
+	// walker to drop them. The authoritative ext-header walk + proto-112 +
+	// hop-limit-255 + VRID validation happens in Go (parseAfPacketIPv6); the
+	// cBPF is only an in-kernel volume reducer.
+	//
 	// Jump offsets (Jt/Jf) are relative to the NEXT instruction.
 	filter := []unix.SockFilter{
 		{Code: 0x28, K: 12},                    //  0: ldh [12] — ethertype
 		{Code: 0x15, Jt: 7, Jf: 0, K: 0x0800},  //  1: jeq 0x0800 → 9 (check_ipv4)
-		{Code: 0x15, Jt: 10, Jf: 0, K: 0x86DD}, //  2: jeq 0x86DD → 13 (check_ipv6)
+		{Code: 0x15, Jt: 14, Jf: 0, K: 0x86DD}, //  2: jeq 0x86DD → 17 (check_ipv6)
 		{Code: 0x15, Jt: 1, Jf: 0, K: 0x8100},  //  3: jeq 0x8100 → 5 (check_vlan); else reject
 		{Code: 0x06, K: 0},                     //  4: ret reject
 		// check_vlan:
 		{Code: 0x28, K: 16},                    //  5: ldh [16] — real ethertype
-		{Code: 0x15, Jt: 10, Jf: 0, K: 0x0800}, //  6: jeq 0x0800 → 17 (check_ipv4_vlan)
-		{Code: 0x15, Jt: 13, Jf: 0, K: 0x86DD}, //  7: jeq 0x86DD → 21 (check_ipv6_vlan)
+		{Code: 0x15, Jt: 6, Jf: 0, K: 0x0800},  //  6: jeq 0x0800 → 13 (check_ipv4_vlan)
+		{Code: 0x15, Jt: 16, Jf: 0, K: 0x86DD}, //  7: jeq 0x86DD → 24 (check_ipv6_vlan)
 		{Code: 0x06, K: 0},                     //  8: ret reject
 		// check_ipv4: proto at 14+9=23
 		{Code: 0x30, K: 23},                //  9: ldb [23]
 		{Code: 0x15, Jt: 0, Jf: 1, K: 112}, // 10: jeq 112 → accept; else reject
 		{Code: 0x06, K: 0xFFFFFFFF},        // 11: ret accept
 		{Code: 0x06, K: 0},                 // 12: ret reject
-		// check_ipv6: next-header at 14+6=20
-		{Code: 0x30, K: 20},                // 13: ldb [20]
+		// check_ipv4_vlan: proto at 18+9=27
+		{Code: 0x30, K: 27},                // 13: ldb [27]
 		{Code: 0x15, Jt: 0, Jf: 1, K: 112}, // 14: jeq 112 → accept; else reject
 		{Code: 0x06, K: 0xFFFFFFFF},        // 15: ret accept
 		{Code: 0x06, K: 0},                 // 16: ret reject
-		// check_ipv4_vlan: proto at 18+9=27
-		{Code: 0x30, K: 27},                // 17: ldb [27]
-		{Code: 0x15, Jt: 0, Jf: 1, K: 112}, // 18: jeq 112 → accept; else reject
-		{Code: 0x06, K: 0xFFFFFFFF},        // 19: ret accept
-		{Code: 0x06, K: 0},                 // 20: ret reject
-		// check_ipv6_vlan: next-header at 18+6=24
-		{Code: 0x30, K: 24},                // 21: ldb [24]
-		{Code: 0x15, Jt: 0, Jf: 1, K: 112}, // 22: jeq 112 → accept; else reject
+		// check_ipv6: base next-header at 14+6=20. Accept the VRRP/ext-header
+		// set {112,0,43,60}; anything else (incl. Fragment 44, AH 51) is
+		// non-VRRP → reject in-kernel.
+		{Code: 0x30, K: 20},                // 17: ldb [20]
+		{Code: 0x15, Jt: 4, Jf: 0, K: 112}, // 18: jeq 112  → 23 accept
+		{Code: 0x15, Jt: 3, Jf: 0, K: 0},   // 19: jeq 0    → 23 accept (Hop-by-Hop)
+		{Code: 0x15, Jt: 2, Jf: 0, K: 43},  // 20: jeq 43   → 23 accept (Routing)
+		{Code: 0x15, Jt: 1, Jf: 0, K: 60},  // 21: jeq 60   → 23 accept (Dest-Opts)
+		{Code: 0x06, K: 0},                 // 22: ret reject
 		{Code: 0x06, K: 0xFFFFFFFF},        // 23: ret accept
-		{Code: 0x06, K: 0},                 // 24: ret reject
+		// check_ipv6_vlan: base next-header at 18+6=24. Same accept set.
+		{Code: 0x30, K: 24},                // 24: ldb [24]
+		{Code: 0x15, Jt: 4, Jf: 0, K: 112}, // 25: jeq 112  → 30 accept
+		{Code: 0x15, Jt: 3, Jf: 0, K: 0},   // 26: jeq 0    → 30 accept (Hop-by-Hop)
+		{Code: 0x15, Jt: 2, Jf: 0, K: 43},  // 27: jeq 43   → 30 accept (Routing)
+		{Code: 0x15, Jt: 1, Jf: 0, K: 60},  // 28: jeq 60   → 30 accept (Dest-Opts)
+		{Code: 0x06, K: 0},                 // 29: ret reject
+		{Code: 0x06, K: 0xFFFFFFFF},        // 30: ret accept
 	}
 	if err := unix.SetsockoptSockFprog(fd, unix.SOL_SOCKET, unix.SO_ATTACH_FILTER, &unix.SockFprog{
 		Len:    uint16(len(filter)),

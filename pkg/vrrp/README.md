@@ -22,6 +22,14 @@ This is the package that drives chassis-cluster failover.
   `stopCh`.
 - `Stop()` — `manager.go`.
 - `UpdateInstances(desired []*Instance) error` — `manager.go`.
+  Diffs the running instance set against the desired set. A VIP change
+  forces an instance restart, which is done **build-before-teardown**
+  (#2156): the replacement's interface is resolved and its socket opened
+  (the "proof" step) BEFORE the old instance is stopped and removed. A
+  transient member-link failure (carrier flap, mid-rename by networkd)
+  therefore leaves the old instance running and advertising its old VIPs
+  rather than orphaning the RG out of election. Priority/preempt/track
+  changes still update in-place (no restart, no master-down gap).
 - `ReleaseSyncHold()` — `manager.go`. No-arg; releases hold for all
   instances.
 - `ResignRG(rgID int)` — `manager.go`. Forces this node out of master
@@ -136,6 +144,61 @@ load/peer-sync compile paths.
   multicast on VLANs).
 - IPv6: separate raw socket; hop limit set to 255 per RFC.
 
+### AF_PACKET cBPF filter + IPv6 extension headers (#2155)
+
+The AF_PACKET receiver attaches a cBPF prefilter
+(`openAfPacketReceiver`, `manager.go`) so the kernel drops non-VRRP
+frames before they reach the per-instance RX goroutine. It handles
+untagged and 802.1Q-tagged IPv4/IPv6:
+
+- IPv4 matches base protocol `== 112`; `parseAfPacketIPv4` then
+  re-walks IHL + re-checks TTL 255 in Go (so IPv4 options are tolerated).
+- IPv6 matches the base **Next-Header** against the set
+  `{112 VRRP, 0 Hop-by-Hop, 43 Routing, 60 Dest-Opts}`
+  (approach A2). A chained VRRP advert's base Next-Header is the FIRST
+  ext-header's type, not 112, and a fixed-offset cBPF cannot walk an
+  ext-header chain — so admitting these ext-header types lets any
+  conformant advert through while ordinary IPv6 TCP/UDP/ICMPv6/ND stays
+  kernel-dropped on a data-bearing RETH VLAN (e.g. `reth0.80`).
+  Fragment (44) and AH (51) are deliberately **not** admitted: VRRP is
+  never legitimately fragmented (no reassembly) and never IPsec-AH-wrapped
+  (it authenticates itself), so such frames stay kernel-dropped instead of
+  waking the RX goroutine only for the Go walker to drop them. The cBPF is
+  only a volume reducer; authoritative validation is in Go.
+
+`parseAfPacketIPv6` performs a **bounded** IPv6 ext-header walk
+(`walkIPv6ExtHeaders`) to locate the real proto-112 payload offset
+instead of assuming the old fixed 40-byte base header. Conventions and
+explicit drop bounds (deliberate, documented):
+
+- Hop-by-Hop (0) / Routing (43) / Dest-Opts (60) are the only chained
+  headers a conformant advert can carry; each is `(HdrExtLen+1)*8` bytes
+  (8-byte units) and is walked to the next header.
+- Fragment (44) is a **hard drop** — VRRP adverts are never legitimately
+  fragmented and the receiver does no reassembly. The cBPF prefilter
+  already refuses base Next-Header 44, so the walker's drop is
+  defense-in-depth for a Fragment header buried mid-chain.
+- AH (51) and any other Next-Header is **dropped** — VRRP is not
+  IPsec-AH-wrapped, so AH is not a VRRP carrier. The cBPF likewise
+  refuses base Next-Header 51, so an AH-first advert is kernel-dropped
+  before the walk runs.
+- The walk is capped at 8 iterations and bounds-checks every step
+  against the captured length, so a truncated or maliciously long chain
+  can neither loop nor read out of bounds — it is simply dropped.
+
+The raw `ip6:112` socket fallback (non-AF_PACKET path) is ext-header-safe
+for the common extension headers because the kernel walks the chain and
+hands `ReadFrom` the upper-layer payload directly. AH and fragmented
+VRRP are out of scope on **both** paths — the cBPF, the Go walker, and the
+fallback all agree that only `{112, 0, 43, 60}` carry a VRRP advert.
+
+**Homogeneous-peer expectation:** xpf's own IPv6 sender emits a bare
+base header (no ext-headers, hop-limit 255) per RFC 5798, which is the
+normal way VRRPv3 IPv6 adverts are sent. The ext-header walk exists only
+to interoperate with an unusual non-xpf VRRP speaker that inserts
+extension headers; deploy homogeneous xpf peers and this path is never
+exercised.
+
 ## Gotchas
 
 - Use the **non-VIP** primary IP as source on advertisements. Sourcing
@@ -149,3 +212,23 @@ load/peer-sync compile paths.
   counter and triggers a reconciliation callback. Don't switch to an
   unbounded channel — the counter is the early warning that something
   upstream stopped draining.
+- Instance restart on VIP change is **build-before-teardown** (#2156):
+  the new socket must open before the old instance is stopped, so the
+  old `run()` goroutine and the new one never run concurrently for the
+  same key (the proof step opens the socket but does NOT start `run()`;
+  only the commit step stops the old, swaps, and starts the new). On a
+  build failure no placeholder is added to `m.instances`, so
+  `RGVRRPReady` / `States` / `InstanceStates` / `Status` stay truthful.
+  Bounded self-recovery comes from the daemon's 2s
+  `reconcileRGStateLoop`, which re-drives `reconcileVRRPInstances` →
+  `UpdateInstances` every tick; a deferred restart retries (and succeeds)
+  once the interface returns, with no operator re-commit. During the
+  failure window the RG keeps advertising the OLD VIP set — strictly
+  better than dropping out of election; the intended VIPs land on the
+  next successful re-drive (~2s).
+- The instance-lifecycle seams (`resolveIface`, `openInstanceSocket`,
+  `runInstance`, `stopInstance`) and link seams (`linkState`,
+  `subscribeLinks`) exist so unit tests exercise the diff/lifecycle logic
+  without real netlink, raw sockets, or live goroutines. Production
+  defaults are wired in `NewManager`; do not change a seam's production
+  default without updating the matching test fakes.

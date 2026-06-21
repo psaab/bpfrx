@@ -1,5 +1,37 @@
 # Action Log
 
+## 2026-06-21 — #2188 fold three review NITs (VRRP IPv6 ext-header consistency)
+
+- **Timestamp**: 2026-06-21
+- **Action**: Folded three polish/consistency NITs into PR #2188
+  (VRRP cluster #2155/#2156) so the cBPF accept-set, the Go ext-header
+  walker, the tests, and the README all tell ONE story:
+  "HBH(0)/Routing(43)/Dest-Opts(60) are walked; Fragment(44) and AH(51)
+  are not VRRP carriers and are dropped."
+  (1) Dropped Fragment(44) from the cBPF IPv6 accept-set so fragmented
+  IPv6 stays kernel-dropped instead of waking the RX goroutine only for
+  the Go walker to drop it (wasted wakeup). Re-verified every cBPF jump
+  offset after the filter shrank from 33->31 instructions (both IPv6 arms
+  lost their jeq 44; instruction 7's Jt 17->16; both arms' internal
+  accept offsets recomputed).
+  (2) Removed AH(51) handling from walkIPv6ExtHeaders -- AH-wrapped VRRP
+  is not a real scenario (VRRP authenticates itself, never IPsec-AH) and
+  the cBPF never admitted 51 anyway, so an AH-first advert was already
+  kernel-dropped before Go ran (test/reality gap). The single-ah test
+  case was rewritten to ah-dropped (accept:false). Kept the chained
+  HBH+Dest-Opts accept case and the bounded/safety tests.
+  (3) Reconciled pkg/vrrp/README.md accept-set to {112,0,43,60} and
+  fixed the contradictory "AH out of scope on both paths" line so it is
+  now true on all three (cBPF/walker/fallback).
+  Did NOT touch the #2156 build-before-teardown logic.
+- **File(s)**: pkg/vrrp/manager.go, pkg/vrrp/instance.go,
+  pkg/vrrp/vrrp_test.go, pkg/vrrp/README.md
+- **Validation**: go build ./... clean; go test ./pkg/vrrp/... PASS;
+  go test -race ./pkg/vrrp/... -count=3 clean; go vet ./pkg/vrrp/...
+  clean. Ext-header walk subtests confirm HBH/Routing/Dest-Opts (single +
+  chained + VLAN-tagged) accepted; Fragment + AH dropped; bare-base
+  regression + bounded/safety subtests still pass.
+
 ## 2026-06-21 — #2187 validate NAT-rule app references at commit
 
 - **Timestamp**: 2026-06-21
@@ -8024,6 +8056,29 @@ top.
   userspace-dp/src/afxdp/frame/README.md
 
 - **Timestamp**: 2026-06-21
+  **Action**: #2155 + #2156 VRRP cluster fixes (one PR, two commits).
+  #2155 — AF_PACKET RX IPv6 ext-header tolerance: cBPF IPv6 arm (untagged
+  + 802.1Q) now matches base Next-Header against {112,0,43,60,44}
+  (approach A2 — ordinary IPv6 data stays kernel-dropped on data-bearing
+  RETH VLANs); parseAfPacketIPv6 + its test mirror gain a bounded
+  walkIPv6ExtHeaders (HBH/Routing/Dest-Opts (HdrExtLen+1)*8, AH
+  (PayloadLen+2)*4, Fragment hard-drop, <=8 iter cap, per-step bounds
+  check). 12 new table/safety cases; ext-header acceptance + walk-safety
+  cases FAIL on pre-fix fixed-offset-40. #2156 — UpdateInstances VIP-
+  change restart reordered to build-before-teardown (open the replacement
+  socket BEFORE stopping the old instance; on failure keep the old
+  running, no orphan, no double-run, no phantom in m.instances so
+  RGVRRPReady stays truthful) + a 2s reconcileVRRPInstances re-drive from
+  reconcileRGStateLoop for bounded self-recovery. 4 new lifecycle seams
+  (resolveIface/openInstanceSocket/runInstance/stopInstance). 3 new
+  manager tests; both orphan tests FAIL on pre-fix teardown-first.
+  go build ./... clean at each commit boundary; go test + -race
+  pkg/vrrp + pkg/daemon green; 5x flake green. test-failover is
+  PENDING-PARENT (cluster busy). Plan: docs/research/2155-vrrp-cluster/plan.md.
+  **File(s)**: pkg/vrrp/manager.go, pkg/vrrp/instance.go,
+  pkg/vrrp/vrrp_test.go, pkg/vrrp/update_instances_test.go,
+  pkg/vrrp/README.md, pkg/daemon/daemon_ha.go,
+  docs/research/2155-vrrp-cluster/plan.md
   **Action**: #2175 — centralize the firewall-filter `from protocol <name>`
   resolution table onto the `appid.ProtocolNumber` SSOT (#2124). It was the
   fifth, independent protocol-name→IANA-number copy: a hard-coded

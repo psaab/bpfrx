@@ -1365,7 +1365,10 @@ func parseAfPacketFrame(buf []byte, n int, localIP net.IP, groupID int) (*VRRPPa
 	return ParseVRRPPacket(payload, false, srcIP, dstIP)
 }
 
-// parseAfPacketIPv6Frame parses an IPv6 VRRP packet from a raw Ethernet frame.
+// parseAfPacketIPv6Frame parses an IPv6 VRRP packet from a raw Ethernet
+// frame. It mirrors vrrpInstance.parseAfPacketIPv6 exactly — including the
+// bounded extension-header walk (#2155) — so the table tests exercise the
+// production payload-offset logic via walkIPv6ExtHeaders.
 func parseAfPacketIPv6Frame(buf []byte, n, ethHeaderLen int, localIP net.IP, groupID int) (*VRRPPacket, error) {
 	const ipv6HeaderLen = 40
 	if n < ethHeaderLen+ipv6HeaderLen+vrrpHeaderLen {
@@ -1386,7 +1389,12 @@ func parseAfPacketIPv6Frame(buf []byte, n, ethHeaderLen int, localIP net.IP, gro
 		return nil, fmt.Errorf("self-sent")
 	}
 
-	payload := ip6[ipv6HeaderLen:ip6Len]
+	off, ok := walkIPv6ExtHeaders(ip6, ip6Len)
+	if !ok {
+		return nil, fmt.Errorf("no VRRP payload (ext-header walk failed)")
+	}
+
+	payload := ip6[off:ip6Len]
 	if len(payload) < vrrpHeaderLen {
 		return nil, fmt.Errorf("payload too short")
 	}
@@ -1602,6 +1610,222 @@ func TestAfPacket_IPv6SelfSentFiltered(t *testing.T) {
 	if err == nil {
 		t.Error("expected self-sent filter to reject IPv6 packet")
 	}
+}
+
+// --- #2155: IPv6 extension-header tolerance on the AF_PACKET RX path ---
+
+// extHeader describes one IPv6 extension header to inject between the base
+// header and the VRRP payload, for the #2155 ext-header walk tests.
+//   - typ is this header's own protocol number (Hop-by-Hop 0, Routing 43,
+//     AH 51, Dest-Opts 60, Fragment 44); it sets the previous header's
+//     Next-Header link.
+//   - extLen is the value written into the header's length field, in the
+//     header's native length unit (8-byte units for HBH/Routing/Dest-Opts,
+//     4-byte units for AH). The header body is padded to the size implied
+//     by extLen so the encoded length matches the real bytes.
+//
+// The builder always points the LAST header's Next-Header at the VRRP
+// payload (proto 112), so a chain terminates at a real advert.
+type extHeader struct {
+	typ    int
+	extLen int
+}
+
+// buildEthIPv6FrameExt builds an IPv6 VRRP frame with an arbitrary chain of
+// extension headers inserted before the VRRP payload. The base header's
+// Next-Header is the first ext-header's type (or 112 if none), exactly as a
+// real chained advert appears on the wire.
+func buildEthIPv6FrameExt(t *testing.T, vlanID int, srcIP, dstIP net.IP, vrrpPkt *VRRPPacket, exts []extHeader) []byte {
+	t.Helper()
+	vrrpData, err := vrrpPkt.Marshal(true, srcIP, dstIP)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Encode the extension-header chain. Each header's first byte is the
+	// Next-Header (the next ext-header's type, or 112 for the last one),
+	// second byte is the length field. The remaining bytes are padding to
+	// reach the encoded size.
+	var extBytes []byte
+	for i, e := range exts {
+		nh := 112 // last header points at the VRRP payload (proto 112)
+		if i+1 < len(exts) {
+			nh = exts[i+1].typ
+		}
+		var size int
+		switch e.typ {
+		case 51: // AH: (extLen+2)*4 bytes
+			size = (e.extLen + 2) * 4
+		default: // HBH/Routing/Dest-Opts: (extLen+1)*8 bytes
+			size = (e.extLen + 1) * 8
+		}
+		if size < 2 {
+			size = 2
+		}
+		hdr := make([]byte, size)
+		hdr[0] = byte(nh)
+		hdr[1] = byte(e.extLen)
+		extBytes = append(extBytes, hdr...)
+	}
+
+	baseNH := 112
+	if len(exts) > 0 {
+		baseNH = exts[0].typ
+	}
+
+	payloadLen := len(extBytes) + len(vrrpData)
+	ip6Hdr := make([]byte, 40)
+	ip6Hdr[0] = 0x60
+	binary.BigEndian.PutUint16(ip6Hdr[4:6], uint16(payloadLen))
+	ip6Hdr[6] = byte(baseNH)
+	ip6Hdr[7] = 255 // hop limit
+	copy(ip6Hdr[8:24], srcIP.To16())
+	copy(ip6Hdr[24:40], dstIP.To16())
+
+	var frame []byte
+	ethDstSrc := make([]byte, 12)
+	ethDstSrc[0] = 0x33
+	ethDstSrc[1] = 0x33
+	ethDstSrc[4] = 0x00
+	ethDstSrc[5] = 0x12
+	frame = append(frame, ethDstSrc...)
+	if vlanID > 0 {
+		frame = append(frame, 0x81, 0x00)
+		frame = append(frame, byte(vlanID>>8), byte(vlanID))
+		frame = append(frame, 0x86, 0xDD)
+	} else {
+		frame = append(frame, 0x86, 0xDD)
+	}
+	frame = append(frame, ip6Hdr...)
+	frame = append(frame, extBytes...)
+	frame = append(frame, vrrpData...)
+	return frame
+}
+
+// TestAfPacket_IPv6ExtHeaderWalk asserts that the AF_PACKET parse path
+// tolerates IPv6 extension headers preceding the VRRP payload (#2155): a
+// single Hop-by-Hop and a chained HBH+Dest-Opts advert are now ACCEPTED
+// (they were dropped pre-fix because parseAfPacketIPv6 sliced at a fixed
+// offset 40), while the bare-base regression still passes.
+func TestAfPacket_IPv6ExtHeaderWalk(t *testing.T) {
+	srcIP := net.ParseIP("fe80::1")
+	dstIP := net.ParseIP("ff02::12")
+	mkPkt := func() *VRRPPacket {
+		return &VRRPPacket{
+			VRID:         101,
+			Priority:     200,
+			MaxAdvertInt: 3,
+			IPAddresses:  []net.IP{net.ParseIP("2001:db8::10")},
+		}
+	}
+
+	tests := []struct {
+		name   string
+		vlanID int
+		exts   []extHeader
+		accept bool
+	}{
+		{name: "bare-base-regression", exts: nil, accept: true},
+		{name: "single-hop-by-hop", exts: []extHeader{{typ: 0, extLen: 0}}, accept: true},
+		{name: "single-routing", exts: []extHeader{{typ: 43, extLen: 0}}, accept: true},
+		{name: "single-dest-opts", exts: []extHeader{{typ: 60, extLen: 0}}, accept: true},
+		{name: "chained-hbh-destopts", exts: []extHeader{{typ: 0, extLen: 0}, {typ: 60, extLen: 0}}, accept: true},
+		{name: "vlan-tagged-with-hbh", vlanID: 50, exts: []extHeader{{typ: 0, extLen: 1}}, accept: true},
+		// Fragment (44) and AH (51) are NOT VRRP carriers — both are dropped.
+		// VRRP is never legitimately fragmented and never IPsec-AH-wrapped, and
+		// the cBPF prefilter does not admit base Next-Header 44 or 51 either, so
+		// such adverts are kernel-dropped before the Go walk runs (here the walk
+		// itself drops them as defense-in-depth).
+		{name: "fragment-dropped", exts: []extHeader{{typ: 44, extLen: 0}}, accept: false},
+		{name: "ah-dropped", exts: []extHeader{{typ: 51, extLen: 1}}, accept: false},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			frame := buildEthIPv6FrameExt(t, tt.vlanID, srcIP, dstIP, mkPkt(), tt.exts)
+			parsed, err := parseAfPacketFrame(frame, len(frame), nil, 101)
+			if tt.accept {
+				if err != nil {
+					t.Fatalf("expected accept, got error: %v", err)
+				}
+				if parsed.VRID != 101 || parsed.Priority != 200 {
+					t.Errorf("parsed VRID/Priority = %d/%d, want 101/200", parsed.VRID, parsed.Priority)
+				}
+				if len(parsed.IPAddresses) != 1 || !parsed.IPAddresses[0].Equal(net.ParseIP("2001:db8::10")) {
+					t.Errorf("addresses = %v, want [2001:db8::10]", parsed.IPAddresses)
+				}
+			} else if err == nil {
+				t.Fatalf("expected drop, got parsed packet VRID=%d", parsed.VRID)
+			}
+		})
+	}
+}
+
+// TestWalkIPv6ExtHeaders_BoundedAndSafe asserts the walk never panics or
+// reads out of bounds on hostile input: a too-long chain, a truncated
+// header, and a chain that lies about its length (claims to extend past the
+// buffer) must all return ok=false without an OOB access (#2155 R2).
+func TestWalkIPv6ExtHeaders_BoundedAndSafe(t *testing.T) {
+	const ipv6HeaderLen = 40
+	mkBase := func(baseNH byte, body []byte) []byte {
+		ip6 := make([]byte, ipv6HeaderLen)
+		ip6[6] = baseNH
+		ip6[7] = 255
+		return append(ip6, body...)
+	}
+
+	t.Run("chain-too-long-bounded", func(t *testing.T) {
+		// 9 Hop-by-Hop headers (each 8 bytes), all chaining to the next,
+		// last pointing at VRRP. The walk cap is 8 iterations, so this must
+		// be dropped (the cap is reached before 112).
+		var body []byte
+		const n = 9
+		for i := 0; i < n; i++ {
+			nh := byte(0) // next is Hop-by-Hop
+			if i == n-1 {
+				nh = 112
+			}
+			hdr := make([]byte, 8)
+			hdr[0] = nh
+			hdr[1] = 0 // (0+1)*8 = 8 bytes
+			body = append(body, hdr...)
+		}
+		body = append(body, make([]byte, vrrpHeaderLen)...)
+		ip6 := mkBase(0, body)
+		if _, ok := walkIPv6ExtHeaders(ip6, len(ip6)); ok {
+			t.Error("expected too-long chain to be dropped (ok=false)")
+		}
+	})
+
+	t.Run("truncated-header-preamble", func(t *testing.T) {
+		// Base says Hop-by-Hop follows, but only 1 byte of the ext-header
+		// preamble is present — must not read off+1.
+		ip6 := mkBase(0, []byte{0x00})
+		if _, ok := walkIPv6ExtHeaders(ip6, len(ip6)); ok {
+			t.Error("expected truncated preamble to be dropped (ok=false)")
+		}
+	})
+
+	t.Run("lying-length-overruns-buffer", func(t *testing.T) {
+		// A Hop-by-Hop header claiming extLen=10 → (10+1)*8 = 88 bytes, but
+		// only 8 bytes are present. The advance must overrun ip6Len and the
+		// walk must drop without an OOB read.
+		hdr := make([]byte, 8)
+		hdr[0] = 112 // would chain to VRRP if length were honest
+		hdr[1] = 10  // claims 88 bytes
+		ip6 := mkBase(0, hdr)
+		if _, ok := walkIPv6ExtHeaders(ip6, len(ip6)); ok {
+			t.Error("expected lying length to be dropped (ok=false)")
+		}
+	})
+
+	t.Run("bare-base-returns-40", func(t *testing.T) {
+		ip6 := mkBase(112, make([]byte, vrrpHeaderLen))
+		off, ok := walkIPv6ExtHeaders(ip6, len(ip6))
+		if !ok || off != ipv6HeaderLen {
+			t.Errorf("bare base: off=%d ok=%v, want 40/true", off, ok)
+		}
+	})
 }
 
 func TestAfPacket_SelfSentFiltered(t *testing.T) {
