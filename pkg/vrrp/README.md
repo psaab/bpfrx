@@ -144,6 +144,24 @@ load/peer-sync compile paths.
   multicast on VLANs).
 - IPv6: separate raw socket; hop limit set to 255 per RFC.
 
+### Receiver goroutine model
+
+When AF_PACKET opens (`afPacketFD >= 0`), a single `receiverAfPacket()`
+goroutine handles both IPv4 and IPv6 (it captures full link-layer frames
+and dispatches by EtherType). When AF_PACKET is unavailable, `run()`
+falls back to the raw-socket path and starts **two concurrent receiver
+goroutines** — `receiver()` (IPv4 raw, proto 112) and, if an IPv6 socket
+exists, `receiverIPv6()` (`ip6:112`). Both feed the same per-instance
+`rxCh` and, on a full channel, both call `warnRXDrop()`. Every field
+they share on that drop path is therefore concurrency-safe: `rxReceived`
+and `rxDrops` are `atomic.Uint64`, and `lastDropWarn` (the once-per-10s
+warning rate-limiter) is an `atomic.Int64` of Unix nanos updated with
+`CompareAndSwap` — only the goroutine that swaps the stale timestamp logs
+the warning, so a concurrent drop burst yields one log line per interval
+(#2225, mirrors the `lastGARPTime` dampener). A plain `time.Time` here
+was an unsynchronized read-modify-write across the two goroutines (a
+`go test -race` data race).
+
 ### AF_PACKET cBPF filter + IPv6 extension headers (#2155)
 
 The AF_PACKET receiver attaches a cBPF prefilter
