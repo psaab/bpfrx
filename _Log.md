@@ -1,5 +1,37 @@
 # Action Log
 
+## 2026-06-21 — #2146 (PR #2189) fold: close IPv6 ext-header overshoot fail-open
+
+- **Timestamp**: 2026-06-21
+- **Action**: Folded the independent review's findings into the #2146
+  IPv6-frag screen fail-closed PR. **F1 (MAJOR security fail-open):** in
+  the IPv6 extension-header walk (`extract_screen_info`), an intermediate
+  header (HOP/ROUTING/DEST or AUTH) could advance `offset` past
+  `frame.len()` via its own DECLARED length; the next iteration's terminal
+  arm (`PROTO_TCP` / `_` / `NEXTHDR_FRAGMENT`) then trusted the
+  out-of-range `offset` and `break`-returned `Ok{is_first_fragment:false}`
+  — a SYN bypassed `syn-frag` (IDS evasion the PR set out to close).
+  Fix: re-validate `offset > frame.len()` at the TOP of the loop body
+  before any arm runs, covering all advances and all terminal arms while
+  preserving the exact-fit boundary (strict `>`, ≤8-iter cap kept).
+  **F2 (minor doc):** corrected the `ScreenParseError::screen_reason`
+  comment — there is NO `screenIPMalformed` Go decoder mapping; the flag
+  (1<<18) decodes via the generic `screen(0x%x)` fallback in
+  `pkg/logging/ringbuf.go`, same as the unmapped `icmp-fragment` (1<<17).
+  **F3 (minor warning):** removed the now-unused `ScreenParseError` import
+  from `afxdp/mod.rs` (call sites use `.screen_reason()` on the value) and
+  gated the crate-wide re-export `#[cfg(test)]` (last non-test consumer
+  gone). **F4 (tests):** added two overshoot regressions —
+  HOP-BY-HOP HdrExtLen=200 → inner TCP, and ROUTING overshoot →
+  unknown inner — both assert `Err(TruncatedIpv6ExtChain)` (fail-CLOSED).
+  Both FAIL against the pre-F1 code (verified: returned Ok → expect_err
+  panics) and PASS after; the exact-fit boundary test stays green (no
+  over-rejection). screen 94/94 stable across 5 runs; poll_stages 2/2;
+  release build clean (no new warnings).
+- **File(s)**: userspace-dp/src/screen/extract.rs,
+  userspace-dp/src/screen/packet.rs, userspace-dp/src/screen/mod.rs,
+  userspace-dp/src/afxdp/mod.rs, userspace-dp/src/screen/tests.rs
+
 ## 2026-06-21 — #2183 flowexport IPv6 collector address bracketing
 
 - **Timestamp**: 2026-06-21

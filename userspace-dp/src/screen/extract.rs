@@ -88,6 +88,20 @@ pub(crate) fn extract_screen_info(
         let mut nexthdr = frame[l3_offset + 6];
         let mut offset = l3_offset + 40;
         for _ in 0..8 {
+            // FAIL-CLOSED (#2146/#2189): an intermediate extension header
+            // can advance `offset` past the captured frame using its own
+            // DECLARED length (HOP/ROUTING/DEST `hdr_ext_len`, AUTH
+            // `payload_len`). The terminal arms below (`NEXTHDR_FRAGMENT`,
+            // `PROTO_TCP`, `_`) read or trust `offset`, so re-validate it
+            // at the TOP of every iteration before any arm runs. Without
+            // this, a base NextHdr=HOP-BY-HOP with HdrExtLen=200 jumps
+            // `offset` far past `frame.len()`, then an inner NextHdr=TCP
+            // hits `PROTO_TCP`, sets `tcp_offset=Some(offset)` and breaks
+            // with `Ok{is_first_fragment:false}` — a SYN bypasses the
+            // `syn-frag` screen (the IDS evasion #2146 set out to close).
+            if offset > frame.len() {
+                return Err(ScreenParseError::TruncatedIpv6ExtChain);
+            }
             match nexthdr {
                 NEXTHDR_HOP | NEXTHDR_ROUTING | NEXTHDR_DEST => {
                     if offset + 2 > frame.len() {

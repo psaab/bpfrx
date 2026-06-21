@@ -14,9 +14,7 @@ use crate::policy::{
     parse_policy_state_with_counters,
 };
 use crate::prefix::{PrefixV4, PrefixV6};
-use crate::screen::{
-    ScreenParseError, ScreenProfile, ScreenState, ScreenVerdict, extract_screen_info,
-};
+use crate::screen::{ScreenProfile, ScreenState, ScreenVerdict, extract_screen_info};
 use crate::session::{
     ForwardSessionMatch, SessionDecision, SessionDelta, SessionDeltaKind, SessionInstall,
     SessionKey, SessionLookup, SessionMetadata, SessionOrigin, SessionTable, SessionUpdate,

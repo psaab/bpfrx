@@ -105,8 +105,11 @@ pub(crate) enum ScreenParseError {
 
 impl ScreenParseError {
     /// Stable screen-drop reason string for the fail-closed verdict.
-    /// Mapped to `SCREEN_IP_MALFORMED` in the event-emit reason table
-    /// and `screenIPMalformed` on the Go ring-buffer decoder.
+    /// Mapped to `SCREEN_IP_MALFORMED` (1<<18) in the event-emit reason
+    /// table (`screen_reason_id`). The Go ring-buffer decoder has no
+    /// dedicated name for this flag, so it decodes via the generic
+    /// `screen(0x%x)` fallback in `pkg/logging/ringbuf.go` — same as the
+    /// unmapped `icmp-fragment` (1<<17) flag.
     #[inline]
     pub(crate) fn screen_reason(self) -> &'static str {
         match self {

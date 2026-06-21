@@ -41,7 +41,14 @@ mod stateless;
 mod syncookie;
 
 pub(crate) use extract::extract_screen_info;
-pub(crate) use packet::{ScreenPacketInfo, ScreenParseError, ScreenProfile, ScreenVerdict};
+pub(crate) use packet::{ScreenPacketInfo, ScreenProfile, ScreenVerdict};
+// `ScreenParseError` is named only by `extract.rs` (via the `packet`
+// path) and by the test module. Production call sites in `afxdp/`
+// consume the error by calling `.screen_reason()` on the value returned
+// from `extract_screen_info`, so the crate-wide re-export is test-only
+// (#2189 removed the last non-test consumer in `afxdp/mod.rs`).
+#[cfg(test)]
+pub(crate) use packet::ScreenParseError;
 pub(crate) use syncookie::{
     SYN_COOKIE_MSS_VALUES, SynCookieAckVerdict, SynCookieChallenge, SynCookieCodec,
     SynCookieTuple, SynCookieValidation,

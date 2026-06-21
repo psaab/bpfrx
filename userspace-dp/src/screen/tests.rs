@@ -789,6 +789,74 @@ fn extract_screen_info_ipv6_exact_fragment_bytes_parses_ok() {
 }
 
 #[test]
+fn extract_screen_info_ipv6_hopbyhop_overshoot_inner_tcp_fails_closed() {
+    // #2189 MAJOR fail-open: the base NextHdr=HOP-BY-HOP (0) header's own
+    // length bytes ARE present, but its DECLARED length (HdrExtLen=200)
+    // advances `offset` far past the captured frame. The inner NextHdr is
+    // TCP (6). Pre-fix, the walk advanced `offset` without re-validating
+    // it, then the next iteration hit the `PROTO_TCP` arm, set
+    // `tcp_offset=Some(offset)` and returned `Ok{is_first_fragment:false}`
+    // — a SYN with NO captured FRAGMENT header bypassed `syn-frag`. The
+    // fix re-validates `offset > frame.len()` at the top of the loop, so
+    // this now FAILS CLOSED before the terminal arm runs.
+    //
+    // Frame: 14 Ethernet + 40 IPv6 base + 8 bytes of hop-by-hop header
+    // (only the first 2 — NextHdr + HdrExtLen — are read).
+    let mut frame = vec![0u8; 14 + 40 + 8];
+    frame[14] = 0x60; // version=6
+    frame[14 + 6] = 0; // base NextHdr = HOP-BY-HOP
+    frame[14 + 40] = 6; // hop-by-hop NextHdr = TCP (the inner upper-layer)
+    frame[14 + 40 + 1] = 200; // HdrExtLen=200 → offset jumps far past frame
+
+    let res = extract_screen_info(
+        &frame,
+        libc::AF_INET6 as u8,
+        6,    // TCP
+        0x02, // SYN — the attack-relevant flag
+        48,
+        IpAddr::V6("2001:db8::1".parse::<Ipv6Addr>().unwrap()),
+        IpAddr::V6("2001:db8::2".parse::<Ipv6Addr>().unwrap()),
+        12345,
+        80,
+        14,
+    );
+    assert_eq!(
+        res.expect_err("hop-by-hop overshoot to inner TCP must FAIL CLOSED, not pass syn-frag"),
+        ScreenParseError::TruncatedIpv6ExtChain
+    );
+}
+
+#[test]
+fn extract_screen_info_ipv6_routing_overshoot_unknown_inner_fails_closed() {
+    // #2189 sibling: a ROUTING (43) header whose DECLARED length
+    // overshoots the frame, with an UNKNOWN inner NextHdr that would hit
+    // the `_` terminal arm and `break` with `Ok` pre-fix. The fix's
+    // top-of-loop `offset > frame.len()` guard covers the `_` arm too.
+    let mut frame = vec![0u8; 14 + 40 + 8];
+    frame[14] = 0x60;
+    frame[14 + 6] = 43; // base NextHdr = ROUTING
+    frame[14 + 40] = 253; // routing NextHdr = unknown/experimental → `_` arm
+    frame[14 + 40 + 1] = 200; // HdrExtLen=200 → offset overshoots
+
+    let res = extract_screen_info(
+        &frame,
+        libc::AF_INET6 as u8,
+        6,
+        0x02,
+        48,
+        IpAddr::V6("2001:db8::1".parse::<Ipv6Addr>().unwrap()),
+        IpAddr::V6("2001:db8::2".parse::<Ipv6Addr>().unwrap()),
+        12345,
+        80,
+        14,
+    );
+    assert_eq!(
+        res.expect_err("routing overshoot to unknown inner must FAIL CLOSED"),
+        ScreenParseError::TruncatedIpv6ExtChain
+    );
+}
+
+#[test]
 fn syn_frag_drops_truncated_ipv6_first_fragment_at_screen() {
     // End-to-end at the screen layer: a properly-parsed IPv6 SYN first
     // fragment is dropped by `syn-frag`. This pins the defense the
