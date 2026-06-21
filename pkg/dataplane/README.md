@@ -191,6 +191,17 @@ authoritative list; quick recap:
   interfaces are virtio with native XDP. Per-VF passthrough would need
   generic XDP and hit the iavf cliff.
 
+## Flow export ownership
+
+Flow export (NetFlow v9 / IPFIX) is owned by `pkg/flowexport` on the
+**control plane**, driven by `pkg/logging.EventReader` SESSION_CLOSE
+events. The userspace dataplane does NOT emit flow packets. The Rust
+dataplane once carried a dead `FlowExporter` plus a write-only
+`flow_export_config` field that emitted nothing; both were removed in
+#2130. The Go→Rust `flow_export` snapshot wire field is retained as
+reserved/ignored (the helper deserializes and drops it) to preserve the
+#1977 decode-safety tests and avoid a wire-protocol break.
+
 ## Byte order
 
 Use `binary.NativeEndian.Uint32(ip4)` for `__be32` BPF fields, **not**

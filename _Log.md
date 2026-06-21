@@ -36,6 +36,37 @@
   INFORM forward gate); giaddr is overwritten even when already nonzero
   (second-hop relay, RFC 1542/3046 — pre-existing, affects
   DISCOVER/REQUEST identically). Both predate #2153.
+## 2026-06-20 — #2129 + #2130 NetFlow v9 export gating + dead Rust exporter removal
+
+- **Timestamp**: 2026-06-20
+- **Action**: #2129 — gated `BuildExportConfig` on
+  `svc.FlowMonitoring.Version9 != nil`, mirroring the existing IPFIX
+  `VersionIPFIX` guard, so a NetFlow v9 exporter only starts when
+  `services flow-monitoring version9` is configured (fixes the
+  unrequested-v9-stream harm for IPFIX-only operators). Updated the
+  daemon reconcile test helper `flowSamplingConfig` to carry a `version9`
+  stanza (one edit fixes the 7 v9-reconcile tests), updated
+  `ipfixSamplingConfig` to set VersionIPFIX on the existing FlowMonitoring
+  (so it drives both exporters), switched the 3 `BuildExportConfig(nil,..)`
+  exporter_test sites to a `v9Svc()` helper, and added two non-tautological
+  #2129 regression guards (IPFIX-only starts IPFIX not v9; v9 requires a
+  version9 stanza). #2130 — removed the dead Rust executable export path
+  (`flowexport.rs`, `flowexport_tests.rs`, `mod flowexport;`, the
+  write-only `flow_export_config` field + its forwarding_build writer);
+  retained the `flow_export` snapshot wire field as documented-reserved
+  with `#[allow(dead_code)]` to preserve the #1977 decode-safety tests and
+  avoid a wire-protocol break. Docs updated (pkg/flowexport/README.md,
+  pkg/dataplane/README.md, flow.go header). Deferred per-flow-server
+  version-binding / double-export de-dup filed as a follow-up issue.
+- **File(s)**: pkg/flowexport/manager.go, pkg/flowexport/exporter_test.go,
+  pkg/daemon/daemon_flowexport_reconcile_test.go,
+  userspace-dp/src/main.rs, userspace-dp/src/flowexport.rs (deleted),
+  userspace-dp/src/flowexport_tests.rs (deleted),
+  userspace-dp/src/afxdp/types/forwarding.rs,
+  userspace-dp/src/afxdp/forwarding_build/mod.rs,
+  userspace-dp/src/protocol/snapshot.rs,
+  pkg/dataplane/userspace/flow.go, pkg/flowexport/README.md,
+  pkg/dataplane/README.md, _Log.md
 
 ## 2026-06-20 — #2118 policy hit-count display-gate consistency
 
@@ -7586,6 +7617,30 @@ top.
   daemon green; `go build ./...` clean. Live flag0 wire-capture +
   test-failover pending parent-run (lab-gated).
 
+## 2026-06-20 — #2121 flushDeleteJournal: re-journal un-sent deletes (no silent drop)
+- **Timestamp**: 2026-06-20
+- **Action**: Fix flushDeleteJournal silently dropping journaled deletes on a
+  full send queue. Replay now goes through the ordered send channel; on a
+  queueMessage failure (full sendCh or disconnect) the un-sent tail is
+  re-journaled (FIFO-prepended, oldest-evicted on overflow) instead of dropped,
+  matching the QueueDeleteV4/V6 journal-on-failure contract. Non-blocking — no
+  timeout/force-disconnect (5 prior plan rounds; v1/v2 KILLED, v3/v4 NEEDS-MAJOR
+  for ordering/liveness; v5.1 PLAN-READY by Claude-SMR + AGY, Codex framing-only
+  NEEDS-MAJOR re-scoped honestly). Also fixed a pre-existing data race in
+  TestBulkEpochMismatchIgnored (test-local `called` bool) surfaced by -race.
+- **File(s)**:
+  - `pkg/cluster/sync_conn.go` — flushDeleteJournal re-journal-on-failure +
+    new rejournalTail (FIFO-prepend, cap-bounded, DeletesDropped accounting).
+  - `pkg/cluster/sync_test.go` — TestDeleteJournalFlushRetainsTailOnFullQueue
+    (non-tautological regression), …FlushPartialThenRetains,
+    TestRejournalTailFIFOPrependAndOverflow (3 branches), …FlushAllFit,
+    …FlushOrderingWithQueuedSession; TestBulkEpochMismatchIgnored race fix.
+  - `docs/session-sync-architecture.md` — Delete Journal replay/retention +
+    key-only-delete residual exposure note.
+  - `docs/pr/2121-flushdeletejournal-requeue/plan.md` — plan v1→v5.1.
+- **Validation**: `go test -race ./pkg/cluster/` green; new tests 5/5 pass (flake-free);
+  regression tests verified FAIL against pre-fix (silent drop); `go build ./...`
+  clean; full `go test ./...` green. Control-plane HA fix — no dataplane smoke.
 ## #2127 — rtProtoName FRR route-protocol mislabel fix (PR #2135)
 - **Timestamp**: 2026-06-21
 - **Action**: Fix rtProtoName() rtnetlink protocol→name mapping. Add
@@ -7604,3 +7659,18 @@ top.
   against FRR source; Codex code review + AGY adversarial both
   MERGE-READY; Copilot reviewed 3/3 files, no comments. Control-plane
   display only — no dataplane smoke. PR #2135 MERGEABLE.
+
+- **Timestamp**: 2026-06-20
+  **Action**: #2154 — parseLeaseCSV reads Kea memfile record-by-record
+  (`csv.Reader.Read` loop) instead of `ReadAll`, so one torn/concurrent
+  Kea append no longer blanks the whole `show dhcp server leases`. Header
+  is the first successful record; a malformed row is logged at debug and
+  SKIPPED (csv.Read recovers after a *csv.ParseError; FieldsPerRecord=-1
+  makes a short line a non-event). #2085's per-record dedup/expire/state
+  loop body is preserved verbatim — robust READ layered ON TOP of #2085's
+  lenient SEMANTICS. New non-tautological TestParseLeaseCSV_SkipsMalformedLine
+  (fails against pre-fix ReadAll with "bare \" in non-quoted-field").
+  Full pkg/dhcpserver suite green, 5/5 flake. Control-plane display path —
+  no dataplane smoke.
+  **File(s)**: pkg/dhcpserver/dhcpserver.go, pkg/dhcpserver/dhcpserver_test.go,
+  pkg/dhcpserver/README.md, docs/pr/2154-parseleasecsv/plan.md

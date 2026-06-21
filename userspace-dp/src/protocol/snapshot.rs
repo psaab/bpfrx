@@ -256,6 +256,13 @@ pub(crate) struct ConfigSnapshot {
     pub three_color_policers: Vec<ThreeColorPolicerSnapshot>,
     #[serde(rename = "class_of_service", default)]
     pub class_of_service: Option<ClassOfServiceSnapshot>,
+    /// #2130: reserved wire field. Flow export (NetFlow v9 / IPFIX) is owned
+    /// entirely by the Go control plane (pkg/flowexport); the dataplane emits
+    /// no flow records. The dead Rust FlowExporter that once consumed this was
+    /// removed, but the field is retained as documented-reserved to preserve
+    /// the #1977 NUM_WIDTH decode-safety tests (protocol/tests.rs) and avoid a
+    /// cross-language wire-protocol break. It is deserialized and ignored.
+    #[allow(dead_code)]
     #[serde(rename = "flow_export", default)]
     pub flow_export: Option<FlowExportSnapshot>,
     #[serde(rename = "mirror_configs", default)]

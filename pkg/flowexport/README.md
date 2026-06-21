@@ -6,6 +6,14 @@ session sampling. Wired off `pkg/logging.EventReader` SESSION_CLOSE
 events in `pkg/daemon/daemon_flowexport.go`, not the conntrack GC
 delete callback. No per-packet sampling path.
 
+Flow export is **entirely control-plane**. The userspace dataplane
+(`userspace-dp`) does NOT emit flow records — it never has. Flow records
+are assembled in this package from SESSION_CLOSE events. The Rust
+dataplane carried a dead `FlowExporter` and a write-only
+`flow_export_config` field that emitted nothing; both were removed in
+#2130. (The Go→Rust `flow_export` snapshot wire field is retained as
+reserved/ignored to preserve the #1977 decode-safety tests.)
+
 ## File layout
 
 The package is split by responsibility (#1988):
@@ -45,6 +53,14 @@ IPFIX:
 Shared:
 - `ExportConfig` — `manager.go`. Resolved per-collector config.
 - `BuildExportConfig(svc *config.ServicesConfig, fo *config.ForwardingOptionsConfig) *ExportConfig` — `manager.go`.
+  Returns nil (no v9 exporter) unless BOTH `forwarding-options sampling`
+  has a flow-server AND `services flow-monitoring version9` is configured
+  (#2129). This mirrors the `BuildIPFIXExportConfig` `version-ipfix` gate.
+  Before #2129 the v9 exporter started on sampling alone, emitting an
+  unrequested v9 stream to an IPFIX-only operator's collector. (Known
+  remaining gap: a flow-server configured with BOTH `version9` and
+  `version-ipfix` still double-exports to one collector — the
+  per-flow-server version-binding fix is a tracked follow-up.)
 - `BuildIPFIXExportConfig(...)` / `BuildSamplingZones(...)` — `manager.go`.
 - `SamplingDir` — `manager.go`. Direction enum.
 - `SessionCloseData` — `manager.go`. Wire shape built from
