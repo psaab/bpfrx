@@ -124,6 +124,120 @@ fn default_deny_applies_without_match() {
     );
 }
 
+// #2118: explicit permit AND explicit deny rules both attribute their
+// hit to the matched rule's per-rule counter (visible in
+// counter_snapshots), while a flow that matches NO explicit rule and
+// rides the implicit default-deny increments NO per-rule counter. The
+// last assertion is the load-bearing one for #2118: it proves that the
+// "deny rows read 0" observed in the loss-cluster smoke is CORRECT when
+// the config has only explicit permit rules plus default-policy
+// deny-all — the blocked traffic rode the default-deny, which bumps the
+// aggregate counter but no per-rule counter, so there is no bug to fix
+// on the deny rows.
+#[test]
+fn hit_counter_attributes_permit_and_deny_but_not_default_deny() {
+    let permit_id = "security-policy:lan:wan:permit-web".to_string();
+    let deny_id = "security-policy:lan:wan:deny-ssh".to_string();
+    let state = parse_policy_state(
+        "deny",
+        &[
+            PolicyRuleSnapshot {
+                rule_id: permit_id.clone(),
+                name: "permit-web".to_string(),
+                from_zone: "lan".to_string(),
+                to_zone: "wan".to_string(),
+                source_addresses: vec!["any".to_string()],
+                destination_addresses: vec!["10.0.0.0/8".to_string()],
+                applications: vec!["any".to_string()],
+                action: "permit".to_string(),
+                ..Default::default()
+            },
+            PolicyRuleSnapshot {
+                rule_id: deny_id.clone(),
+                name: "deny-ssh".to_string(),
+                from_zone: "lan".to_string(),
+                to_zone: "wan".to_string(),
+                source_addresses: vec!["any".to_string()],
+                destination_addresses: vec!["192.168.0.0/16".to_string()],
+                applications: vec!["any".to_string()],
+                action: "deny".to_string(),
+                ..Default::default()
+            },
+        ],
+        &test_zone_name_to_id(),
+    );
+
+    // Flow matching the explicit PERMIT rule (dst in 10.0.0.0/8).
+    assert_eq!(
+        evaluate_policy_with_len(
+            &state,
+            TEST_LAN_ZONE_ID,
+            TEST_WAN_ZONE_ID,
+            "10.0.61.100".parse().expect("src"),
+            "10.0.2.5".parse().expect("dst"),
+            PROTO_TCP,
+            12345,
+            80,
+            100,
+        ),
+        PolicyAction::Permit
+    );
+    // Flow matching the explicit DENY rule (dst in 192.168.0.0/16).
+    assert_eq!(
+        evaluate_policy_with_len(
+            &state,
+            TEST_LAN_ZONE_ID,
+            TEST_WAN_ZONE_ID,
+            "10.0.61.100".parse().expect("src"),
+            "192.168.1.7".parse().expect("dst"),
+            PROTO_TCP,
+            12345,
+            22,
+            200,
+        ),
+        PolicyAction::Deny
+    );
+    // Flow matching NEITHER explicit rule (dst 172.16.x) -> implicit
+    // default-deny.
+    assert_eq!(
+        evaluate_policy_with_len(
+            &state,
+            TEST_LAN_ZONE_ID,
+            TEST_WAN_ZONE_ID,
+            "10.0.61.100".parse().expect("src"),
+            "172.16.80.200".parse().expect("dst"),
+            PROTO_TCP,
+            12345,
+            443,
+            300,
+        ),
+        PolicyAction::Deny
+    );
+
+    let permit_counter = policy_counter(&state, &permit_id);
+    assert_eq!(permit_counter.packets, 1, "permit rule must record 1 hit");
+    assert_eq!(permit_counter.bytes, 100);
+
+    let deny_counter = policy_counter(&state, &deny_id);
+    assert_eq!(deny_counter.packets, 1, "explicit deny rule must record 1 hit");
+    assert_eq!(deny_counter.bytes, 200);
+
+    // The default-deny flow must NOT have inflated either per-rule
+    // counter — there is no rule_id for the default action, so no
+    // per-rule counter exists for it (the aggregate policy_deny counter,
+    // owned by the forwarding path, accounts for it instead).
+    let total_per_rule_packets: u64 = state
+        .counter_snapshots()
+        .into_iter()
+        .map(|c| c.packets)
+        .sum();
+    assert_eq!(
+        total_per_rule_packets, 2,
+        "default-deny must not increment any per-rule counter (only the \
+         permit + explicit-deny hits should be attributed)"
+    );
+}
+
 #[test]
 fn evaluate_policy_skips_inactive_rules() {
     let state = parse_policy_state(

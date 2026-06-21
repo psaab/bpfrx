@@ -109,10 +109,14 @@ func (m *Manager) renderConfig(ipsecCfg *config.IPsecConfig) (string, error) {
 		b.WriteString("    local {\n")
 		fmt.Fprintf(&b, "      auth = %s\n", authMethod)
 		if gw != nil && gw.LocalCertificate != "" {
-			fmt.Fprintf(&b, "      certs = %s\n", sanitizeSwanctlValue(gw.LocalCertificate))
+			fmt.Fprintf(&b, "      certs = \"%s\"\n", escapeSwanctlQuoted(sanitizeSwanctlValue(gw.LocalCertificate)))
 		}
 		if gw != nil && gw.LocalIDValue != "" {
-			fmt.Fprintf(&b, "      id = %s\n", sanitizeSwanctlValue(formatIdentity(gw.LocalIDType, gw.LocalIDValue)))
+			// Quote + escape the identity: a distinguished-name id with
+			// spaces/commas (id = CN=fw, O=acme) is mis-parsed when
+			// emitted unquoted, and swanctl accepts a quoted value for
+			// every identity type (@fqdn, IP, DN) (#2126).
+			fmt.Fprintf(&b, "      id = \"%s\"\n", escapeSwanctlQuoted(sanitizeSwanctlValue(formatIdentity(gw.LocalIDType, gw.LocalIDValue))))
 		}
 		b.WriteString("    }\n")
 
@@ -120,7 +124,7 @@ func (m *Manager) renderConfig(ipsecCfg *config.IPsecConfig) (string, error) {
 		b.WriteString("    remote {\n")
 		fmt.Fprintf(&b, "      auth = %s\n", authMethod)
 		if gw != nil && gw.RemoteIDValue != "" {
-			fmt.Fprintf(&b, "      id = %s\n", sanitizeSwanctlValue(formatIdentity(gw.RemoteIDType, gw.RemoteIDValue)))
+			fmt.Fprintf(&b, "      id = \"%s\"\n", escapeSwanctlQuoted(sanitizeSwanctlValue(formatIdentity(gw.RemoteIDType, gw.RemoteIDValue))))
 		}
 		b.WriteString("    }\n")
 
@@ -201,7 +205,11 @@ func (m *Manager) renderConfig(ipsecCfg *config.IPsecConfig) (string, error) {
 				return "", fmt.Errorf("vpn %s: %w", name, err)
 			}
 			fmt.Fprintf(&b, "  ike-%s {\n", sanitizeSwanctlValue(name))
-			fmt.Fprintf(&b, "    secret = \"%s\"\n", sanitizeSwanctlValue(decoded))
+			// sanitizeSwanctlValue strips control chars (#1798); the
+			// quote/backslash escaper (#2126) makes a PSK containing a
+			// double-quote or backslash render as a balanced, swanctl-
+			// parseable quoted string instead of corrupting the block.
+			fmt.Fprintf(&b, "    secret = \"%s\"\n", escapeSwanctlQuoted(sanitizeSwanctlValue(decoded)))
 			fmt.Fprintf(&b, "  }\n")
 		}
 	}
@@ -340,6 +348,27 @@ func sanitizeSwanctlValue(s string) string {
 		}
 	}
 	return string(b)
+}
+
+// escapeSwanctlQuoted escapes a string for safe inclusion inside a
+// swanctl double-quoted value (secret = "...", id = "...",
+// certs = "..."). The swanctl settings lexer treats a bare double-quote
+// as the string terminator and processes backslash escapes inside
+// quotes (\\ -> a literal backslash, \" -> a literal double-quote).
+// Without escaping, a value containing a double-quote — legal in a real
+// pre-shared key or a distinguished-name identity — truncates or
+// corrupts the rendered config (#2126).
+//
+// Order matters: backslashes are doubled FIRST, then double-quotes are
+// escaped. Escaping quotes first would let the second pass double the
+// backslash it just inserted. A literal backslash renders as \\ (lexer
+// \\. -> \) and a literal " renders as \" (lexer \\. -> "), so a PSK
+// like `a\nb` renders as `a\\nb` and round-trips to the literal
+// backslash + n, never the \n newline escape.
+func escapeSwanctlQuoted(s string) string {
+	s = strings.ReplaceAll(s, `\`, `\\`)
+	s = strings.ReplaceAll(s, `"`, `\"`)
+	return s
 }
 
 func sanitizeChildName(name string) string {

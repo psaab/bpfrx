@@ -1,5 +1,39 @@
 # Action Log
 
+## 2026-06-20 — #2118 policy hit-count display-gate consistency
+
+- **Timestamp**: 2026-06-20
+- **Action**: Diagnosed #2118 ("show security policies hit-count reads 0").
+  The increment→snapshot→wire→read→display chain is intact end-to-end and
+  Go-unit-tested (verified by static reading + an independent second-pass
+  agent). The observed all-0 was (a) deny rows correctly 0 — the loss
+  cluster has only explicit permit rules + default-policy deny-all, so
+  blocked traffic rode the implicit default-deny (aggregate counter, not
+  per-rule); (b) the smoke ran with `policy-stats` OFF; and (c) the genuine
+  bug: #2008 M4 gated ONLY the Prometheus collector on
+  `cfg.Security.PolicyStatsEnabled`, leaving the gRPC text/CLI/structured
+  display surfaces reading counters unconditionally — so the surfaces
+  disagreed. Fix: gate all SIX display surfaces (Prometheus, gRPC text
+  hit-count + detail, structured gRPC GetPolicies, REST policies endpoint,
+  local CLI hit-count + brief) on the same knob (display-only;
+  Rust increment stays always-on, no wire change). Added Go gate tests
+  (gRPC text hit-count + detail, structured GetPolicies, local CLI),
+  a `policies-hit-count` golden topic, and a Rust test proving explicit
+  permit AND explicit deny rules attribute per-rule hits while the implicit
+  default-deny does not. Flagged (not changed) the Junos divergence: xpf
+  preserves per-policy counts across recompile (Junos resets on commit).
+- **File(s)**: pkg/grpcapi/server_show_policies_text.go,
+  pkg/cli/cli_show_security.go, pkg/cli/cli_show_security_dispatch.go,
+  pkg/grpcapi/server_show_zones.go, pkg/api/security.go,
+  pkg/grpcapi/server_show_zones_test.go,
+  pkg/grpcapi/server_show_policies_hitcount_gate_test.go,
+  pkg/cli/cli_show_policies_hitcount_gate_test.go,
+  pkg/api/policy_counters_test.go,
+  pkg/grpcapi/server_show_golden_test.go,
+  pkg/grpcapi/testdata/server_show_golden.json,
+  userspace-dp/src/policy_tests.rs, docs/feature-gaps.md,
+  docs/pr/2118-policy-hit-count/plan.md
+
 ## 2026-06-20 — #2079 nat pool-utilization-alarm lenient-disable runtime parity
 
 - **Timestamp**: 2026-06-20
@@ -7539,3 +7573,21 @@ top.
 - **Validation**: `go test -race ./pkg/cluster/` green; new tests 5/5 pass (flake-free);
   regression tests verified FAIL against pre-fix (silent drop); `go build ./...`
   clean; full `go test ./...` green. Control-plane HA fix — no dataplane smoke.
+## #2127 — rtProtoName FRR route-protocol mislabel fix (PR #2135)
+- **Timestamp**: 2026-06-21
+- **Action**: Fix rtProtoName() rtnetlink protocol→name mapping. Add
+  RTPROT_ISIS(187)->isis (was unmapped, displayed literal "187"); keep
+  196->static as FRR private RTPROT_ZSTATIC (local rtprotZStatic const;
+  verified ZEBRA_ROUTE_STATIC->RTPROT_ZSTATIC(196) in FRR zebra2proto);
+  drop RTPROT_ZEBRA(11) (FRR TABLE/NHG, not static — falls through) and
+  RTPROT_BIRD(12) (not emitted by FRR). Express all arms via named
+  unix.RTPROT_* constants. New rtproto_test.go (non-tautological table
+  test + end-to-end protoTag/junosProtoName IS-IS check).
+- **File(s)**: pkg/routing/routes.go, pkg/routing/rtproto_test.go,
+  docs/pr/2127-rtproto-name-mapping/plan.md
+- **Validation**: go build/vet clean; go test ./pkg/routing/ green;
+  5/5 flake on new tests; full go test ./... green. Codex round-1
+  PLAN-NEEDS-MAJOR (caught the 196=RTPROT_ZSTATIC semantics) resolved
+  against FRR source; Codex code review + AGY adversarial both
+  MERGE-READY; Copilot reviewed 3/3 files, no comments. Control-plane
+  display only — no dataplane smoke. PR #2135 MERGEABLE.

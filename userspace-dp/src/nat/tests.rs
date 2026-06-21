@@ -344,6 +344,114 @@ fn static_nat_external_ips_iterator() {
     assert!(ips.contains(&"203.0.113.20".parse::<IpAddr>().unwrap()));
 }
 
+#[test]
+fn static_nat_canonical_cidr_mask_v4_installs_entry() {
+    // #2122: Junos emits static-NAT match/then in canonical prefix form
+    // ("203.0.113.5/32" / "10.0.0.5/32") and the Go compiler copies the mask
+    // verbatim into the snapshot. IpAddr::from_str rejects CIDR, so pre-fix
+    // every rule hit the Err/skip arm and was silently dropped — no
+    // translation occurred and the external IP was never registered as a
+    // local address. The parse must strip the /32 mask. This test FAILS on
+    // the unfixed code (table is empty, every assertion is None).
+    let table = StaticNatTable::from_snapshots(&[StaticNATRuleSnapshot {
+        name: "static-cidr".to_string(),
+        from_zone: "untrust".to_string(),
+        external_ip: "203.0.113.5/32".to_string(),
+        internal_ip: "10.0.0.5/32".to_string(),
+    }]);
+    // Inbound DNAT on the bare external IP -> bare internal IP.
+    assert_eq!(
+        table.match_dnat("203.0.113.5".parse().expect("ext"), "untrust"),
+        Some(NatDecision {
+            rewrite_src: None,
+            rewrite_dst: Some("10.0.0.5".parse().expect("int")),
+            ..NatDecision::default()
+        })
+    );
+    // Outbound SNAT on the bare internal IP -> bare external IP.
+    assert_eq!(
+        table.match_snat("10.0.0.5".parse().expect("int"), "trust"),
+        Some(NatDecision {
+            rewrite_src: Some("203.0.113.5".parse().expect("ext")),
+            rewrite_dst: None,
+            ..NatDecision::default()
+        })
+    );
+    // The external IP must be registered (bare, no mask) for local delivery
+    // recognition (forwarding_build iterates external_ips()).
+    let ips: Vec<IpAddr> = table.external_ips().copied().collect();
+    assert_eq!(ips, vec!["203.0.113.5".parse::<IpAddr>().unwrap()]);
+}
+
+#[test]
+fn static_nat_canonical_cidr_mask_v6_installs_entry() {
+    // IPv6 canonical host form carries /128; same root cause as the v4 case.
+    let table = StaticNatTable::from_snapshots(&[StaticNATRuleSnapshot {
+        name: "static-cidr-v6".to_string(),
+        from_zone: "untrust".to_string(),
+        external_ip: "2001:db8::1/128".to_string(),
+        internal_ip: "fd00::1/128".to_string(),
+    }]);
+    assert_eq!(
+        table.match_dnat("2001:db8::1".parse().expect("ext"), "untrust"),
+        Some(NatDecision {
+            rewrite_src: None,
+            rewrite_dst: Some("fd00::1".parse().expect("int")),
+            ..NatDecision::default()
+        })
+    );
+    assert_eq!(
+        table.match_snat("fd00::1".parse().expect("int"), "trust"),
+        Some(NatDecision {
+            rewrite_src: Some("2001:db8::1".parse().expect("ext")),
+            rewrite_dst: None,
+            ..NatDecision::default()
+        })
+    );
+    let ips: Vec<IpAddr> = table.external_ips().copied().collect();
+    assert_eq!(ips, vec!["2001:db8::1".parse::<IpAddr>().unwrap()]);
+}
+
+#[test]
+fn static_nat_cidr_and_bare_coexist() {
+    // A masked rule and a bare-IP rule must both install — stripping the mask
+    // on one must not regress the other.
+    let table = StaticNatTable::from_snapshots(&[
+        StaticNATRuleSnapshot {
+            name: "masked".to_string(),
+            from_zone: String::new(),
+            external_ip: "203.0.113.5/32".to_string(),
+            internal_ip: "10.0.0.5".to_string(),
+        },
+        StaticNATRuleSnapshot {
+            name: "bare".to_string(),
+            from_zone: String::new(),
+            external_ip: "203.0.113.6".to_string(),
+            internal_ip: "10.0.0.6/32".to_string(),
+        },
+    ]);
+    assert!(
+        table
+            .match_dnat("203.0.113.5".parse().expect("ext"), "any")
+            .is_some()
+    );
+    assert!(
+        table
+            .match_dnat("203.0.113.6".parse().expect("ext"), "any")
+            .is_some()
+    );
+    assert!(
+        table
+            .match_snat("10.0.0.5".parse().expect("int"), "any")
+            .is_some()
+    );
+    assert!(
+        table
+            .match_snat("10.0.0.6".parse().expect("int"), "any")
+            .is_some()
+    );
+}
+
 // --- DNAT table tests ---
 
 #[test]

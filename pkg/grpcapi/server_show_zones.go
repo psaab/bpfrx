@@ -65,6 +65,12 @@ func (s *Server) GetPolicies(_ context.Context, _ *pb.GetPoliciesRequest) (*pb.G
 		return &pb.GetPoliciesResponse{}, nil
 	}
 
+	// Honor `set security policy-stats system-wide enable` (#2008 M4 /
+	// #2118): per-policy hit counters are populated only when policy-stats
+	// is enabled system-wide (default off), matching the Prometheus
+	// collector and the CLI/gRPC text surfaces. When the knob is off,
+	// HitPackets/HitBytes stay 0 (we skip the dataplane read).
+	statsEnabled := cfg.Security.PolicyStatsEnabled
 	resp := &pb.GetPoliciesResponse{}
 	var policySetID uint32
 	for _, zpp := range cfg.Security.Policies {
@@ -92,7 +98,7 @@ func (s *Server) GetPolicies(_ context.Context, _ *pb.GetPoliciesRequest) (*pb.G
 			if pr.Applications == nil {
 				pr.Applications = []string{}
 			}
-			if s.dp != nil && s.dp.IsLoaded() {
+			if statsEnabled && s.dp != nil && s.dp.IsLoaded() {
 				policyID := policySetID*dataplane.MaxRulesPerPolicy + uint32(i)
 				if ctrs, err := s.dp.ReadPolicyCounters(policyID); err == nil {
 					pr.HitPackets = ctrs.Packets
@@ -134,7 +140,7 @@ func (s *Server) GetPolicies(_ context.Context, _ *pb.GetPoliciesRequest) (*pb.G
 			if pr.Applications == nil {
 				pr.Applications = []string{}
 			}
-			if s.dp != nil && s.dp.IsLoaded() {
+			if statsEnabled && s.dp != nil && s.dp.IsLoaded() {
 				policyID := policySetID*dataplane.MaxRulesPerPolicy + uint32(i)
 				if ctrs, err := s.dp.ReadPolicyCounters(policyID); err == nil {
 					pr.HitPackets = ctrs.Packets

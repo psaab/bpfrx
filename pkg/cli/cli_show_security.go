@@ -24,6 +24,16 @@ func (c *CLI) showPoliciesHitCount(cfg *config.Config, fromZone, toZone string) 
 		return nil
 	}
 
+	// Honor `set security policy-stats system-wide enable` (#2008 M4 /
+	// #2118): per-policy hit counters are maintained and displayed only
+	// when policy-stats is enabled system-wide (default off). The
+	// Prometheus collector already gates on this knob; gate the CLI
+	// hit-count table identically so the CLI, gRPC text, structured
+	// gRPC, and Prometheus surfaces all report the SAME values. When the
+	// knob is off the "Policy count" column reads 0 (we skip the
+	// dataplane read).
+	statsEnabled := cfg.Security.PolicyStatsEnabled
+
 	fmt.Println("Logical system: root-logical-system")
 	fmt.Printf("%-8s%-17s%-18s%-24s%-14s%s\n",
 		"Index", "From zone", "To zone", "Name", "Policy count", "Action")
@@ -49,8 +59,10 @@ func (c *CLI) showPoliciesHitCount(cfg *config.Config, fromZone, toZone string) 
 			}
 			ruleID := policySetID*dataplane.MaxRulesPerPolicy + uint32(i)
 			var count uint64
-			if counters, err := c.dp.ReadPolicyCounters(ruleID); err == nil {
-				count = counters.Packets
+			if statsEnabled {
+				if counters, err := c.dp.ReadPolicyCounters(ruleID); err == nil {
+					count = counters.Packets
+				}
 			}
 			fmt.Printf("%-8d%-17s%-18s%-24s%-14d%s\n",
 				index, zpp.FromZone, zpp.ToZone, pol.Name, count, action)
@@ -70,8 +82,10 @@ func (c *CLI) showPoliciesHitCount(cfg *config.Config, fromZone, toZone string) 
 			}
 			ruleID := policySetID*dataplane.MaxRulesPerPolicy + uint32(i)
 			var count uint64
-			if counters, err := c.dp.ReadPolicyCounters(ruleID); err == nil {
-				count = counters.Packets
+			if statsEnabled {
+				if counters, err := c.dp.ReadPolicyCounters(ruleID); err == nil {
+					count = counters.Packets
+				}
 			}
 			fmt.Printf("%-8d%-17s%-18s%-24s%-14d%s\n",
 				index, "junos-global", "junos-global", pol.Name, count, action)

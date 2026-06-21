@@ -83,6 +83,16 @@ var goldenShowTopics = []string{
 	"test-policy:from=trust,to=untrust,src=10.0.1.1,dst=10.0.2.1,port=80,proto=tcp",
 	"test-routing:dest=10.0.2.1",
 	"test-zone:interface=ge-0-0-0.0",
+	// #2118: lock the per-policy hit-count table SHAPE (headers, columns,
+	// the gated render path) so a future regression in the rendered table
+	// fails the golden. The golden config has `policy-stats system-wide
+	// enable` set (showGoldenConfigCommands) so the table takes the
+	// stats-enabled branch; the golden server's dataplane is unloaded
+	// (dataplane.New(), IsLoaded()==false), so the counter columns read
+	// 0/0 — the regression value is the table layout and the fact that
+	// the gated path renders, not non-zero counts (those are covered by
+	// the dedicated gate tests with a fake loaded dataplane).
+	"policies-hit-count",
 	"firewall-filter:bandwidth-output",
 	"firewall-filter:bandwidth-output:inet",
 	// switch cases (cfg-rendered)
@@ -174,6 +184,11 @@ var showGoldenConfigCommands = []string{
 	"security policies from-zone trust to-zone untrust policy p1 match destination-address any",
 	"security policies from-zone trust to-zone untrust policy p1 match application any",
 	"security policies from-zone trust to-zone untrust policy p1 then permit",
+	// #2118: enable policy-stats so the policies-hit-count golden topic
+	// takes the stats-enabled display branch. (The golden server's
+	// dataplane is unloaded, so the counter columns still render 0/0;
+	// non-zero counter behavior is covered by the dedicated gate tests.)
+	"security policy-stats system-wide enable",
 	"security alg sip disable",
 	"security dynamic-address feed-server office url http://example.com/feed feed-name blocklist",
 	"security address-book global address host1 10.0.1.1/32",

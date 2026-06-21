@@ -532,8 +532,8 @@ func TestGenerateConfig_IKEChain(t *testing.T) {
 		{"no NAT-T", "encap = no"},
 		{"DPD", "dpd_delay = 10s"},
 		{"DPD timeout", "dpd_timeout = 50s"},
-		{"local identity", "id = @vpn.example.com"},
-		{"remote identity", "id = 203.0.113.1"},
+		{"local identity", `id = "@vpn.example.com"`},
+		{"remote identity", `id = "203.0.113.1"`},
 		{"IKE proposal", "proposals = aes256-sha256-modp2048"},
 		{"ESP proposal", "esp_proposals = aes256-sha256128-modp2048"},
 		{"copy DF", "copy_df = yes"},
@@ -937,7 +937,7 @@ func TestGenerateConfig_PubkeyAuth(t *testing.T) {
 	if !strings.Contains(got, "auth = pubkey") {
 		t.Fatalf("expected pubkey auth, got:\n%s", got)
 	}
-	if !strings.Contains(got, "certs = gw-cert.pem") {
+	if !strings.Contains(got, `certs = "gw-cert.pem"`) {
 		t.Fatalf("expected local certificate, got:\n%s", got)
 	}
 	if strings.Contains(got, "secret = ") {

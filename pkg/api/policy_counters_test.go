@@ -88,8 +88,30 @@ func scheduledCounterPolicyID(t *testing.T, store *configstore.Store) uint32 {
 	return 0
 }
 
+// enablePolicyStatsAPI commits `security policy-stats system-wide
+// enable` onto an existing store so the per-policy display gate (#2118)
+// admits the live counters. Kept separate from newSchedulerCounterAPI
+// Store so the M4 gate-off test (TestCollectPolicyCountersGatedOnPolicy
+// Stats) can keep using the knob-disabled store.
+func enablePolicyStatsAPI(t *testing.T, store *configstore.Store) {
+	t.Helper()
+	// newSchedulerCounterAPIStore leaves the store in configure mode
+	// (EnterConfigure was called and Commit does not exit it), so set the
+	// knob directly without re-entering configure.
+	if err := store.SetFromInput("security policy-stats system-wide enable"); err != nil {
+		t.Fatalf("SetFromInput(policy-stats) error = %v", err)
+	}
+	if _, err := store.Commit(); err != nil {
+		t.Fatalf("Commit() error = %v", err)
+	}
+	if cfg := store.ActiveConfig(); cfg == nil || !cfg.Security.PolicyStatsEnabled {
+		t.Fatal("policy-stats enable did not take effect")
+	}
+}
+
 func TestPoliciesHandlerExposesScheduledRuleCounters(t *testing.T) {
 	store := newSchedulerCounterAPIStore(t)
+	enablePolicyStatsAPI(t, store)
 	policyID := scheduledCounterPolicyID(t, store)
 	s := &Server{
 		store: store,
@@ -139,4 +161,98 @@ func TestPoliciesHandlerExposesScheduledRuleCounters(t *testing.T) {
 		}
 	}
 	t.Fatal("scheduled-allow rule not found in API response")
+}
+
+// newPolicyCounterAPIStoreNoStats builds the same fixture as
+// newSchedulerCounterAPIStore but WITHOUT `policy-stats system-wide
+// enable`, so the #2118 display gate must suppress the REST counters.
+func newPolicyCounterAPIStoreNoStats(t *testing.T) *configstore.Store {
+	t.Helper()
+
+	store := newConfigStore(t, filepath.Join(t.TempDir(), "xpf.conf"))
+	if err := store.EnterConfigure(); err != nil {
+		t.Fatalf("EnterConfigure() error = %v", err)
+	}
+	if err := store.LoadOverride(`
+schedulers {
+    scheduler workhours {
+        daily;
+    }
+}
+security {
+    zones {
+        security-zone dmz;
+        security-zone trust;
+        security-zone untrust;
+    }
+    policies {
+        from-zone trust to-zone dmz {
+            policy plain-allow {
+                match { source-address any; destination-address any; application any; }
+                then { permit; }
+            }
+        }
+        from-zone trust to-zone untrust {
+            policy scheduled-allow {
+                match { source-address any; destination-address any; application any; }
+                then { permit; count; }
+                scheduler-name workhours;
+            }
+        }
+    }
+}
+`); err != nil {
+		t.Fatalf("LoadOverride() error = %v", err)
+	}
+	if _, err := store.Commit(); err != nil {
+		t.Fatalf("Commit() error = %v", err)
+	}
+	if cfg := store.ActiveConfig(); cfg == nil || cfg.Security.PolicyStatsEnabled {
+		t.Fatal("test precondition: policy-stats must be disabled in this store")
+	}
+	return store
+}
+
+// TestPoliciesHandlerGatesCountersOnPolicyStats verifies the #2118
+// display gate on the REST `GET /api/v1/security/policies` endpoint:
+// with a fully populated dataplane but `policy-stats` OFF, every rule's
+// hit_packets/hit_bytes are 0, matching the Prometheus collector and the
+// CLI/gRPC surfaces. Without the gate the same fixture (verified nonzero
+// by TestPoliciesHandlerExposesScheduledRuleCounters) would leak counts.
+func TestPoliciesHandlerGatesCountersOnPolicyStats(t *testing.T) {
+	store := newPolicyCounterAPIStoreNoStats(t)
+	policyID := scheduledCounterPolicyID(t, store)
+	s := &Server{
+		store: store,
+		dp: &schedulerCounterAPIDP{
+			Manager: dataplane.New(),
+			counters: map[uint32]dataplane.CounterValue{
+				1:        {Packets: 99, Bytes: 9900},
+				policyID: {Packets: 17, Bytes: 1700},
+			},
+		},
+	}
+
+	rr := httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/api/v1/security/policies", nil)
+	s.policiesHandler(rr, req)
+
+	if rr.Code != 200 {
+		t.Fatalf("status = %d, want 200; body: %s", rr.Code, rr.Body.String())
+	}
+	var resp struct {
+		Success bool         `json:"success"`
+		Data    []PolicyInfo `json:"data"`
+	}
+	if err := json.Unmarshal(rr.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	for _, policy := range resp.Data {
+		for _, rule := range policy.Rules {
+			if rule.HitPackets != 0 || rule.HitBytes != 0 {
+				t.Fatalf("policy %s->%s rule %q: counters = %d/%d, want 0/0 (policy-stats off)",
+					policy.FromZone, policy.ToZone, rule.Name, rule.HitPackets, rule.HitBytes)
+			}
+		}
+	}
 }

@@ -437,6 +437,15 @@ ConfigSnapshot {
     source_nat_rules:[{from_zone, to_zone, src/dst, interface/pool metadata}]
     static_nat_rules:[{name, from_zone, external_ip, internal_ip}]
     flow:            {allow_dns_reply, allow_embedded_icmp}
+    # NAT address fields (static_nat external_ip/internal_ip and the NAT64
+    # source-pool addresses) may arrive in canonical Junos host form carrying
+    # a /32 (or /128) mask — the Go compiler keeps the prefix from
+    # `match destination-address X/32` / `then static-nat prefix Y/32` and
+    # address-range expansion stamps /32 on every produced pool IP. These are
+    # exact host IPs, so the Rust parse strips the mask before IpAddr parsing
+    # (mirroring the SNAT-pool idiom in nat/source.rs). Pre-#2122/#2123 the
+    # bare IpAddr::from_str rejected the mask and silently dropped the rule /
+    # pool entry (no translation, external IP not even recognized).
     map_pins:        {xsk_map, heartbeat_map, sessions_map}
     ha_groups:       [{rg_id, active, watchdog_ts}]
 }
