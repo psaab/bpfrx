@@ -9284,3 +9284,13 @@ top.
   pkg/daemon/{daemon.go,daemon_apply.go,daemon_ha.go,daemon_ha_sync.go,
   daemon_dhcp_lease_sync.go,daemon_dhcp_lease_sync_test.go},
   docs/{feature-gaps.md,phases.md,research/2239-dhcp-ha-lease-sync/*}
+
+- **Timestamp**: 2026-06-21
+  **Action**: #2239 PATH C shipped as PR #2260 (head 2da12f190) — 6 logical
+  commits (config knob; dhcpserver Kea read/seed + control-socket; cluster sync
+  replication; daemon push-loop + takeover-seed; tests; docs) rebased onto
+  master 815889740 (clean auto-merge of #2243 reservations / #2229 / #2225).
+  build+vet+test green incl -race on lease-sync paths. Kea STOPPED on BACKUP,
+  standby mem-hold + takeover pre-seed/lease-add seed. test-failover + live
+  lease-survives-failover smoke PENDING-PARENT before merge.
+  **File(s)**: _Log.md
