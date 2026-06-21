@@ -773,6 +773,15 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 	if err := validateIPMonitoringStrict(cfg); err != nil {
 		strictErrs = append(strictErrs, err)
 	}
+	// #2243 DHCP-server static (fixed/reserved) host bindings: reject a
+	// fixed-address that is malformed, family-mismatched, outside the pool
+	// subnet, or duplicates another binding's MAC/address in the same pool.
+	// Independent of the other accumulator families (reads only the
+	// DHCP-server sub-struct), so it slots into the same single-response
+	// commit-check group.
+	if err := validateDHCPStaticBindingsStrict(cfg); err != nil {
+		strictErrs = append(strictErrs, err)
+	}
 	// #1830 (e): the #1733 equal-flow worker-cap validator
 	// (validateEqualFlowWorkerCapStrict / MaxEqualFlowWorkers) is retired.
 	// The v8 lease rotation now sizes its per-worker scratch from the true

@@ -176,6 +176,29 @@ func compileDHCPLocalServer(node *Node, dhcp *DHCPServerConfig, isV6 bool) error
 							}
 						case "domain-name":
 							pool.Domain = nodeVal(pp)
+						case "static-binding":
+							// #2243: fixed/reserved host bindings. Dual-AST:
+							// hierarchical `static-binding <mac> { fixed-address
+							// <ip>; host-name <n>; }` packs the MAC into Keys[1]
+							// (namedInstances picks it up directly); a flat-set
+							// `static-binding <mac> fixed-address <ip>` lands the
+							// MAC in Keys[1] too. A bare `static-binding { <mac> {
+							// ... } }` block nests the MAC one level down, which
+							// namedInstances also handles. Each instance's leaves
+							// (fixed-address / host-name) are the instance node's
+							// children in both shapes.
+							for _, sbInst := range namedInstances([]*Node{pp}) {
+								sb := &DHCPStaticBinding{MACAddress: sbInst.name}
+								for _, leaf := range sbInst.node.Children {
+									switch leaf.Name() {
+									case "fixed-address":
+										sb.FixedAddress = nodeVal(leaf)
+									case "host-name":
+										sb.HostName = nodeVal(leaf)
+									}
+								}
+								pool.StaticBindings = append(pool.StaticBindings, sb)
+							}
 						}
 					}
 					group.Pools = append(group.Pools, pool)
