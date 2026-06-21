@@ -149,6 +149,59 @@ func TestNPTv6RejectsNonIPv6(t *testing.T) {
 	}
 }
 
+// TestNPTv6IPv4MappedFamilyParity is the #2247 item-2 FAIL-ON-REVERT proof. The
+// family classification must use the textual natAddrFamily (colon == v6), NOT
+// net.IP.To4(): Go folds an IPv4-mapped IPv6 literal (::ffff:1.2.3.4) so its
+// parsed .To4() is non-nil, but Rust's Ipv6Addr::from_str (parse_prefix in
+// userspace-dp/src/nptv6.rs) accepts the same text as IPv6 and APPLIES the
+// rule. A To4()-based check warn-skips on the lenient load path while the
+// dataplane installs the rule — a Go<->Rust divergence.
+//
+// With the colon-based check an ::ffff:x.x.x.x/48 prefix is classified as IPv6,
+// so it does NOT trip the "nptv6 prefixes must be IPv6" family gate. (It is a
+// nonsensical NPTv6 prefix, but the point of this test is parity: Go must reach
+// the same verdict as Rust, which is to accept it as IPv6.) If the check
+// regresses to To4(), the family gate fires and the assertions below fail.
+func TestNPTv6IPv4MappedFamilyParity(t *testing.T) {
+	// A single IPv4-mapped rule, so no overlap gate can fire (any two
+	// ::ffff:x.x.x.x prefixes masked to /48 collapse to ::/48 and would
+	// overlap — irrelevant here). The match prefix is IPv4-mapped (the case
+	// that diverges under To4()); the nptv6-prefix is an ordinary IPv6 /48 so
+	// the only family verdict under test is on the IPv4-mapped match prefix.
+	// natCIDRIPPart + natAddrFamily classify ::ffff:... as v6, matching Rust's
+	// parse_prefix.
+	lines := nptv6Set([3]string{"mapped", "::ffff:1.2.3.4/48", "fd00:1::/48"})
+
+	// Strict compile must NOT reject on the "must be IPv6" family ground.
+	if _, err := CompileConfig(buildTree(t, lines)); err != nil {
+		if strings.Contains(err.Error(), "must be IPv6") {
+			t.Fatalf("IPv4-mapped IPv6 NPTv6 prefix must be classified as IPv6 (parity with Rust "+
+				"Ipv6Addr::from_str), not rejected by the To4()-based family gate; got: %v", err)
+		}
+		t.Fatalf("unexpected strict rejection of IPv4-mapped IPv6 NPTv6 rule: %v", err)
+	}
+
+	// Lenient compile must NOT emit the family ("must be IPv6") warning either —
+	// that is the exact divergence: a To4() check would warn-skip on lenient
+	// load while the dataplane applies. With the colon-based check there is no
+	// nptv6 family warning at all.
+	cfg, err := CompileConfigLenient(buildTree(t, lines))
+	if err != nil {
+		t.Fatalf("lenient compile of IPv4-mapped IPv6 NPTv6 rule must not fail: %v", err)
+	}
+	if hasWarningContaining(cfg.Warnings, "must be IPv6") {
+		t.Fatalf("IPv4-mapped IPv6 NPTv6 prefix must NOT trip the family warn-skip on the lenient "+
+			"path (Go<->Rust divergence #2247 item 2); warnings=%v", cfg.Warnings)
+	}
+
+	// Sanity: natAddrFamily classifies the textual IPv4-mapped form as v6,
+	// while a parsed net.IP.To4() would (wrongly) report v4. This locks the
+	// helper-level invariant the validator relies on.
+	if got := natAddrFamily(natCIDRIPPart("::ffff:1.2.3.4/48")); got != "v6" {
+		t.Fatalf("natAddrFamily(::ffff:1.2.3.4) = %q, want v6 (Rust parity)", got)
+	}
+}
+
 // TestNPTv6RejectsOverlappingInternal is the #2241 FAIL-ON-REVERT proof for the
 // outbound (internal) direction: a broad /48 and a nested /64 with the same
 // internal base overlap, so first-match insertion order would shadow the /64.
@@ -272,10 +325,16 @@ func TestNPTv6LenientLoadAccepts(t *testing.T) {
 		if !hasWarningContaining(cfg.Warnings, "nptv6") {
 			t.Fatalf("case %d: lenient load must emit an nptv6 warning, warnings=%v", i, cfg.Warnings)
 		}
-		// The lenient warning must carry the "rejected by dataplane, previous
-		// state kept" impact note so the operator knows it is inert, not applied.
-		if !hasWarningContaining(cfg.Warnings, "previous state kept") {
-			t.Fatalf("case %d: lenient warning must state the dataplane keeps the previous state, warnings=%v", i, cfg.Warnings)
+		// The lenient warning must carry the impact note so the operator knows
+		// the rule is inert (not applied). The note is scoped to the userspace
+		// apply/preflight — it must say the previous state is kept AND tie that
+		// claim to the helper apply/preflight, not state it as a general
+		// validator guarantee (#2247 item 1).
+		if !hasWarningContaining(cfg.Warnings, "the previous state is kept") {
+			t.Fatalf("case %d: lenient warning must state the previous state is kept, warnings=%v", i, cfg.Warnings)
+		}
+		if !hasWarningContaining(cfg.Warnings, "apply/preflight") {
+			t.Fatalf("case %d: lenient warning must scope the impact note to the userspace apply/preflight, warnings=%v", i, cfg.Warnings)
 		}
 	}
 }

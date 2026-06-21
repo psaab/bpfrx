@@ -9366,6 +9366,20 @@ top.
   **File(s)**: _Log.md
 
 - **Timestamp**: 2026-06-21
+  **Action**: #2247 NPTv6 fail-closed Copilot polish (3 items). Item 1:
+  reworded the lenient-load warning + doc comment so the "previous state
+  kept" claim is scoped to the userspace apply/preflight, not stated as a
+  general validator guarantee. Item 2 (VERIFIED REAL): the NPTv6 family
+  check used extIP.To4()/intIP.To4(), which classifies IPv4-mapped IPv6
+  (::ffff:1.2.3.4) as v4 while Rust Ipv6Addr::from_str accepts it as v6 —
+  on the lenient path Go warn-skipped while the dataplane would apply.
+  Switched to the textual colon-based natAddrFamily (added natCIDRIPPart
+  helper) for Go<->Rust parity; added TestNPTv6IPv4MappedFamilyParity
+  (fail-on-revert proven against the restored To4 check). Item 3:
+  documented the #2241 overlap-rejection (Nptv6OverlappingPrefix) in
+  userspace-dp/src/FEATURES.md. go build/vet/test ./pkg/config/... green.
+  **File(s)**: pkg/config/compiler_nat.go, pkg/config/compiler_nptv6_test.go,
+  userspace-dp/src/FEATURES.md, _Log.md
   **Action**: #2221 (MEDIUM, residual of #2170) — same-generation install/delete
   REORDER no longer leaves a stale session on the standby. Sender: a delete now
   draws a FRESH generation strictly greater than the install it cancels

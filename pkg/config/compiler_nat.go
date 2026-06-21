@@ -67,6 +67,20 @@ func natAddrFamily(ipPart string) string {
 	return "v4"
 }
 
+// natCIDRIPPart returns the address portion of a CIDR string (everything before
+// the first '/'), or the whole string if it carries no mask. It exists so the
+// textual natAddrFamily classification can be applied to the ORIGINAL config
+// text rather than a parsed net.IP — net.ParseCIDR/ParseIP folds an
+// IPv4-mapped IPv6 literal (::ffff:1.2.3.4) into a 4-byte form whose .To4() is
+// non-nil, which diverges from Rust's Ipv6Addr::from_str (it keeps the literal
+// as V6). Keying the family on the un-parsed text preserves Go<->Rust parity.
+func natCIDRIPPart(cidr string) string {
+	if slash := strings.IndexByte(cidr, '/'); slash >= 0 {
+		return cidr[:slash]
+	}
+	return cidr
+}
+
 // isHostMaskAddress reports whether addr is a host route the static-NAT
 // dataplane can install: a bare IP (no mask) or the canonical host mask
 // (/32 for IPv4, /128 for IPv6). It mirrors EXACTLY the Rust host-mask gate
@@ -287,11 +301,15 @@ func validateNATHostMaskStrict(cfg *Config, lenient bool) ([]string, error) {
 //
 // Strict (commit / commit-check): hard-reject. Lenient (load / peer-sync, #1960
 // / #1979 doctrine): return the messages as warnings so a config committed
-// before this gate existed (or peer-synced) still boots — the Rust helper's
-// own #2240/#2241 backstop (`Nptv6State::try_from_snapshots`) rejects the
-// snapshot at apply, so the apply preflight keeps the previous live forwarding
-// state and a leniently-loaded bad config never installs a torn-down or
-// nondeterministic NPTv6 runtime.
+// before this gate existed (or peer-synced) still boots. The "previous state is
+// kept" impact note in the lenient warning is scoped to the userspace
+// apply/preflight, not asserted as a general validator guarantee: the Rust
+// helper's own #2240/#2241 backstop (`Nptv6State::try_from_snapshots`) rejects
+// the whole snapshot at apply, so the apply preflight keeps the previous live
+// forwarding state and a leniently-loaded bad config never installs a
+// torn-down or nondeterministic NPTv6 runtime. The validator itself only
+// classifies the rule as invalid; it is the helper preflight that preserves
+// the prior forwarding state.
 func validateNPTv6Strict(cfg *Config, lenient bool) ([]string, error) {
 	if cfg == nil {
 		return nil, nil
@@ -300,7 +318,9 @@ func validateNPTv6Strict(cfg *Config, lenient bool) ([]string, error) {
 	emit := func(msg string) error {
 		if lenient {
 			warnings = append(warnings,
-				msg+" (ignored: NPTv6 snapshot rejected by dataplane, previous state kept, until corrected)")
+				msg+" (this NPTv6 rule is invalid; on a userspace-dataplane apply/preflight"+
+					" the helper rejects the whole NPTv6 snapshot and the previous state is kept,"+
+					" so the rule will not take effect until corrected)")
 			return nil
 		}
 		return fmt.Errorf("%s", msg)
@@ -335,10 +355,13 @@ func validateNPTv6Strict(cfg *Config, lenient bool) ([]string, error) {
 				continue
 			}
 
-			// External prefix = `match destination-address`.
-			extIP, extNet, errExt := net.ParseCIDR(rule.Match)
+			// External prefix = `match destination-address`. The family is
+			// classified from the original CIDR text (natCIDRIPPart +
+			// natAddrFamily below), not the parsed net.IP, so the parsed IP
+			// values are intentionally discarded.
+			_, extNet, errExt := net.ParseCIDR(rule.Match)
 			// Internal prefix = `then static-nat nptv6-prefix`.
-			intIP, intNet, errInt := net.ParseCIDR(rule.Then)
+			_, intNet, errInt := net.ParseCIDR(rule.Then)
 
 			if errExt != nil {
 				if err := emit(fmt.Sprintf(
@@ -376,7 +399,21 @@ func validateNPTv6Strict(cfg *Config, lenient bool) ([]string, error) {
 				}
 				continue
 			}
-			if extIP.To4() != nil || intIP.To4() != nil {
+			// Family classification MUST be textual (natAddrFamily), not
+			// net.IP.To4(): Go folds an IPv4-mapped IPv6 literal
+			// (::ffff:1.2.3.4) so its parsed .To4() is non-nil, but Rust's
+			// Ipv6Addr::from_str (parse_prefix in userspace-dp/src/nptv6.rs)
+			// accepts the same text as a valid IPv6 address and APPLIES the
+			// rule. A To4()-based check here would warn-skip on the lenient
+			// load path while the dataplane installs the rule — a Go<->Rust
+			// divergence (#2247 item 2). Classifying on the original text
+			// (colon == v6) matches the helper exactly, so an IPv4-mapped form
+			// is treated as IPv6 here too. We split the IP part off the CIDR
+			// (the same idiom as isHostMaskAddress); ParseCIDR already proved
+			// these parse, so a missing slash cannot happen, but the helper is
+			// robust either way.
+			if natAddrFamily(natCIDRIPPart(rule.Match)) != "v6" ||
+				natAddrFamily(natCIDRIPPart(rule.Then)) != "v6" {
 				if err := emit(fmt.Sprintf(
 					"security nat static rule-set %q rule %q nptv6 prefixes must be IPv6 (match %q, nptv6-prefix %q)",
 					rs.Name, rule.Name, rule.Match, rule.Then)); err != nil {
