@@ -34,7 +34,8 @@ carries server-bound options, per RFC 2131 §3.4:
 | `DISCOVER` | yes | lease acquisition |
 | `REQUEST` | yes | lease selection / renewal / rebinding |
 | `INFORM` | yes (#2153) | client already holds an address, asks only for supplemental parameters (DNS/domain/NTP) |
-| `DECLINE`, `RELEASE` | no | sent by the client directly to its bound server; no relay-agent obligation |
+| `DECLINE` | no | broadcast by the client on address conflict (RFC 2131 §4.4); not relayed (out of scope for #2153) |
+| `RELEASE` | no | unicast by the client to its bound server; no relay-agent obligation |
 | server reply types (`OFFER`/`ACK`/`NAK`) | n/a | not client-originated; the client→server gate never sees them. The reverse server→client path (`handleServerResponses`) forwards `OFFER` and `ACK` only — see the reply matrix below |
 
 The `INFORM` reply (a server-issued `ACK` with no `yiaddr` but a real
