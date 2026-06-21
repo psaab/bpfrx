@@ -141,3 +141,24 @@ func TestPeerDHCPLeasesHold(t *testing.T) {
 		t.Errorf("full-set replace did not clear v4")
 	}
 }
+
+// Test (#2239 review): a frame claiming an absurd record count must not
+// over-allocate. Pre-fix decodeDHCPLeasePayload did make([]SyncLease, 0,
+// count) with the untrusted on-wire count, so a frame claiming
+// count=0xFFFFFFFF (~160 bytes/record => hundreds of GB) panicked in
+// makeslice before the loop's truncation guard fired. The clamp bounds the
+// preallocation to len(payload)/4; decoding a huge-count empty-body frame
+// returns zero leases without panicking.
+func TestDHCPLeasePayload_HugeCountDoesNotOverAllocate(t *testing.T) {
+	defer func() {
+		if r := recover(); r != nil {
+			t.Fatalf("decodeDHCPLeasePayload panicked on a huge on-wire count (preallocation not clamped): %v", r)
+		}
+	}()
+	payload := make([]byte, 4)
+	binary.LittleEndian.PutUint32(payload, 0xFFFFFFFF)
+	out := decodeDHCPLeasePayload(payload)
+	if len(out) != 0 {
+		t.Errorf("huge-count empty-body frame: got %d leases, want 0", len(out))
+	}
+}

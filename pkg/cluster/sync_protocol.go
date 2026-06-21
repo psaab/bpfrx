@@ -696,6 +696,16 @@ func decodeDHCPLeasePayload(payload []byte) []dhcpserver.SyncLease {
 	}
 	count := int(binary.LittleEndian.Uint32(payload[:4]))
 	off := 4
+	// Clamp the preallocation to what the payload can physically hold: count
+	// is untrusted on-wire data, and each record consumes at least its 4-byte
+	// length prefix, so there can be at most len(payload)/4 records. Without
+	// this, a corrupt/malicious frame claiming count=0xFFFFFFFF would attempt
+	// a ~hundreds-of-GB make() (SyncLease is ~160 bytes) and panic before the
+	// loop's truncation guard fires. Valid payloads are unaffected (a real
+	// count is always <= len(payload)/4). Clamping count also bounds the loop.
+	if maxRecords := len(payload) / 4; count > maxRecords {
+		count = maxRecords
+	}
 	out := make([]dhcpserver.SyncLease, 0, count)
 	for i := 0; i < count; i++ {
 		if off+4 > len(payload) {
