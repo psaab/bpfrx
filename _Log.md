@@ -1,5 +1,19 @@
 # Action Log
 
+## 2026-06-21 — #2222: address-book described-entry prefix corruption
+
+- **Timestamp**: 2026-06-21
+- **Action**: Fixed compileAddressBook so an `address <name> <prefix>` that
+  also carries a `description` keeps its real prefix instead of having
+  Value silently overwritten with the literal "description" (flat-set,
+  prefix-first) or dropped entirely (hierarchical block, len(Keys) < 3).
+  Merge `address` nodes by name; derive the prefix from Keys[2] only when
+  it parses as a CIDR/IP, otherwise from a bare-leaf child; route
+  description into a new Address.Description field. Added dual-AST
+  table-driven regression tests (fail-on-revert proven: pre-fix logic
+  yields Value="description" / dropped entry). Documented in docs/bugs.md.
+- **File(s)**: pkg/config/compiler_security.go, pkg/config/types_security.go,
+  pkg/config/parser_security_test.go, docs/bugs.md
 ## 2026-06-21 — #2208: TX dispatch recycle-on-every-path (UMEM descriptor leak)
 
 - **Timestamp**: 2026-06-21
