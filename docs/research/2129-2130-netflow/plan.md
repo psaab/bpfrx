@@ -1,10 +1,14 @@
 # Plan of Action — #2129 + #2130 NetFlow v9 export: exporter gating + Rust dead-code scope
 
-- **Revision:** r1 (DRAFT, pre-review)
+- **Revision:** r2 (folds 3-way hostile review — Claude SMR + 2 hostile Claude
+  plan-reviewers; all three converged PLAN-CHANGES-REQUIRED on r1 over the same
+  blocking finding: the gate fix breaks existing tests; r2 scopes that.)
 - **Issues:** #2129 (MEDIUM, gating bug), #2130 (LOW, dead Rust code)
 - **Base:** origin/master `325d106838` (issue text says `5fa964c13`; the
-  flowexport/userspace-dp files are bit-identical between the two — only one
-  unrelated commit, `b1747e4e4` DHCP-relay test, sits between them).
+  `pkg/flowexport`/`userspace-dp/src` files are **bit-identical** between the
+  two SHAs — `git diff 5fa964c13 325d106838 -- pkg/flowexport ...` is empty.
+  TWO commits sit between them: `b1747e4e4` (unrelated DHCP-relay test) and the
+  merge `325d10683`. Neither touches flow export.)
 - **Mode:** `/research` — STOP at PLAN-READY/PLAN-KILL. No code ships from this
   doc.
 
@@ -137,10 +141,18 @@ IPFIX both target the same address:port.
 
 **PLAN-READY**, scoped as **two coupled fixes on one PR**:
 
-- **#2129 = real bug, fix it.** Gate v9 export on `Version9 != nil` (mirror the
-  existing IPFIX guard). This is a 3-line behavior fix with high operator value
-  (stops an unrequested duplicate flow stream to a remote host) and is the
-  primary deliverable.
+- **#2129 = real bug, PARTIALLY fix it.** #2129 has TWO harms: (1) an
+  IPFIX-only operator gets an *unrequested* v9 stream, and (2) a both-versions
+  operator gets *double-export to one collector* with mismatched 1-in-N. This
+  PR fixes harm (1) — the broader, higher-incidence defect (an operator who
+  never asked for v9 at all) — by gating v9 export on `Version9 != nil` (mirror
+  the existing IPFIX guard). Harm (2) requires the per-flow-server version-
+  binding redesign and is **explicitly deferred** (§8). The issue comment and
+  PR must state #2129 is *partially* fixed and link the concrete follow-up — do
+  NOT imply #2129 is fully resolved. (Both v9 and IPFIX still pass their gates
+  when both stanzas are present, so the both-configured double-export survives
+  this PR by design; that is arguably correct Junos "you asked for two streams"
+  behavior until the per-server binding lands.)
 
 - **#2130 = dead code, REMOVE it (Option A below).** Flow export is
   *intentionally and permanently Go-side*. The Rust path is vestigial (added
@@ -234,15 +246,26 @@ func BuildExportConfig(svc *config.ServicesConfig, fo *config.ForwardingOptionsC
 
 ### 5.2 #2130 — remove the dead Rust export path
 
-Delete / edit, Rust side:
-- `userspace-dp/src/flowexport.rs` — delete file.
-- `userspace-dp/src/flowexport_tests.rs` — delete file.
+Delete / edit, Rust side (`flowexport.rs` is **352 lines**, `flowexport_tests.rs`
+is **137 lines** — 489 total; the deletable *executable module* is 352):
+- `userspace-dp/src/flowexport.rs` — delete file (352 lines).
+- `userspace-dp/src/flowexport_tests.rs` — delete file (137 lines).
 - `userspace-dp/src/main.rs:11` — remove `mod flowexport;`.
 - `userspace-dp/src/afxdp/types/forwarding.rs:86` — remove the
-  `flow_export_config` field (and its initializer wherever the struct is
-  constructed — grep `flow_export_config` after removal to confirm zero refs).
+  `flow_export_config` field (struct is built field-by-field; no `..Default`
+  shorthand covers it, so removing the decl + the one writer is sufficient).
 - `userspace-dp/src/afxdp/forwarding_build/mod.rs:251-261` — remove the writer
   block.
+- **(review r1 finding — required) `userspace-dp/src/protocol/snapshot.rs:259`:**
+  after the writer at mod.rs:251 is removed, `snapshot.flow_export` is read ONLY
+  from `#[cfg(test)]` code (`protocol/tests.rs:1735`) under 5.2-keep, so a
+  `--release` build emits a NEW `dead_code` warning on the field. There is no
+  `#![deny(warnings)]` / `RUSTFLAGS=-D warnings` in the Makefile
+  `build-userspace-dp` target, so the build does NOT fail — but the warning must
+  be pre-empted with `#[allow(dead_code)]` on `snapshot.flow_export`, matching
+  the existing same-pattern precedent (`gre_acceleration` /
+  `power_mode_disable`, `forwarding.rs:78`/`:85`, "held for config truth/parity").
+  (Not needed under 5.2-remove — the field is gone.)
 
 **Decision point (flag to reviewers): the Go↔Rust `FlowExportSnapshot` wire
 field.** Two sub-options:
@@ -292,11 +315,43 @@ forward-compat/rolling-upgrade case moot.
   bug lose v9 export. MEDIUM-severity issue → the fix IS the point, but it must
   be release-noted. No silent data-path change; export is observability only, so
   no traffic/forwarding risk.
-- **Tests:** Go — `pkg/flowexport` unit tests + any daemon reconcile tests must
-  add a case asserting "sampling + flow-server WITHOUT version9 → nil v9
-  ExportConfig" and "WITH version9 → non-nil". Rust — deleting
-  `flowexport_tests.rs` removes 6 tests of dead code (zero coverage loss for
-  live behavior). Under 5.2-keep, the #1977 wire tests stay and must still pass.
+- **Tests (BLOCKING — convergent r1 finding from all three reviewers): the
+  §5.1 guard BREAKS 9 existing tests that encode the current buggy behavior.**
+  The test work is NOT purely additive — the guard invalidates the foundational
+  helper the entire v9-reconcile suite is built on. In-scope edits, verified
+  against source:
+  - `pkg/flowexport/exporter_test.go` — THREE tests call
+    `BuildExportConfig(nil, fo)` (svc=nil) and assert non-nil:
+    `TestBuildExportConfig_InlineJflowSourceAddress` (call at :30),
+    `TestBuildExportConfig_FlowServerSourceAddressTakesPrecedence` (:166),
+    `TestBuildExportConfig_DistinctSourceAddressesAreNotDeduped` (:198). After
+    the guard, `svc==nil → return nil` → each hits its `t.Fatal`. Fix: pass a
+    non-nil `*config.ServicesConfig` with `FlowMonitoring.Version9` set instead
+    of `nil` (these tests assert source-address handling, orthogonal to gating).
+  - `pkg/daemon/daemon_flowexport_reconcile_test.go` — the base helper
+    `flowSamplingConfig` (lines 19-35) sets NO `Services.FlowMonitoring` at all
+    (only `ipfixSamplingConfig` at :40-50 adds a `VersionIPFIX` stanza). SIX
+    tests drive `flowSamplingConfig` and assert the v9 exporter STARTS:
+    `TestReconcileFlowExporterAddAfterBoot` (:66), `...RemoveAfterBoot` (:92),
+    `...HashGate` (:119), `TestReconcileV9IPFIXIndependence` (:177),
+    `...RetriesAfterCreateFailure` (:220, via `flowSamplingConfigSrc` which
+    also lacks `Version9`), `TestApplyConfigLockedReconcilesFlowExporters`
+    (:254). Fix: add `Services.FlowMonitoring.Version9 = &config.NetFlowV9Config{
+    Templates: map[string]*config.NetFlowV9Template{"t": {Name: "t"}}}` to
+    `flowSamplingConfig` (and `flowSamplingConfigSrc`) — ONE edit fixes all six.
+    (`TestReconcileFlowExporterNoCallbackLeak` at :155 — re-check after the
+    helper edit; it should follow the helper.)
+  - **New positive/negative cases to ADD:** "sampling + flow-server WITHOUT
+    `version9` → nil v9 ExportConfig (no v9 exporter starts)" and "WITH
+    `version9` → non-nil"; and a daemon-level case asserting that an
+    IPFIX-only config (`ipfixSamplingConfig`) starts the IPFIX exporter but
+    NOT the v9 exporter (the #2129 regression guard).
+  - Rust — deleting `flowexport_tests.rs` removes 6 tests of dead code (zero
+    coverage loss for live behavior). Under 5.2-keep, the #1977 wire-decode
+    tests (`protocol/tests.rs:1708-1769`) stay and must still pass.
+  - Confirm `config.NetFlowV9Config` / `NetFlowV9Template` field names at
+    /engineer time (the IPFIX helper uses `NetFlowIPFIXConfig` /
+    `NetFlowIPFIXTemplate`; the v9 analogues live in `types_system.go`).
 - **Rolling upgrade (HA):** under 5.2-keep, no wire change → no skew risk.
   Under 5.2-remove, a mixed-version cluster could see one node sending the
   `flow_export` field and the other not parsing it — `#[serde(default)]` +
@@ -313,10 +368,15 @@ forward-compat/rolling-upgrade case moot.
 
 ## 7. Validation plan (for /engineer, not now)
 
-1. `make test` (Go) — new gating test cases pass; existing flowexport tests
-   pass.
-2. `make build-userspace-dp` (Rust) — compiles after dead-code removal; `grep`
-   confirms zero `flow_export_config` / `mod flowexport` refs.
+1. `make test` (Go) — the 9 updated existing tests (§6) + new positive/negative
+   gating cases pass; all other flowexport/daemon tests pass.
+2. `make build-userspace-dp` (Rust) — compiles after dead-code removal. Explicit
+   grep gate (must return ZERO hits except the documented reserved field):
+   `grep -rn 'FlowExporter\|FlowExportConfig\|crate::flowexport\|mod flowexport\|flow_export_config' userspace-dp/src`
+   — after removal, the ONLY remaining `flow_export`-family reference is
+   `snapshot.flow_export` (the reserved wire field, 5.2-keep) + its `#[cfg(test)]`
+   reader; there must be NO `FlowExporter`, `FlowExportConfig`,
+   `crate::flowexport`, `mod flowexport`, or `flow_export_config` left.
 3. Functional: on a VM, configure (a) sampling + flow-server + `version9` →
    confirm v9 datagrams (`version field == 9`) at the collector; (b) sampling +
    flow-server + `version-ipfix` only (NO version9) → confirm **no** v9
@@ -329,15 +389,17 @@ forward-compat/rolling-upgrade case moot.
 
 ## 8. Explicit follow-ups (NOT in this PR)
 
-- **#2129 part 2 (per-flow-server version binding + double-export de-dup):**
-  resolve the collector set *per flow-server* from its version selector so each
-  flow-server is bound to exactly one export protocol (Junos semantics), and add
-  a commit-check warning when v9 and IPFIX both target one address:port. This is
-  a larger collector-resolution redesign (touches `BuildExportConfig` /
-  `BuildIPFIXExportConfig` collector loops + `FlowServer.Version9Template`
-  consumption + a new schema/commit-check warning). File as a follow-up issue;
-  the presence-gate fix in §5.1 addresses #2129's *primary* observable defect
-  (unrequested v9 stream) without it.
+- **#2129 part 2 (per-flow-server version binding + double-export de-dup) —
+  MUST be filed as a concrete GitHub issue BEFORE this PR merges** (review
+  finding: don't leave it as prose that evaporates). Resolve the collector set
+  *per flow-server* from its version selector (`FlowServer.Version9Template` /
+  a per-server protocol field) so each flow-server is bound to exactly one
+  export protocol (Junos semantics), and add a commit-check warning when v9 and
+  IPFIX both target one address:port. This is a larger collector-resolution
+  redesign (touches `BuildExportConfig` / `BuildIPFIXExportConfig` collector
+  loops + `FlowServer.Version9Template` consumption + a new schema/commit-check
+  warning). The presence-gate fix in §5.1 addresses #2129's *primary* observable
+  defect (unrequested v9 stream) without it; this follow-up closes the remainder.
 - If 5.2-keep is chosen: optionally a later cleanup to remove the
   `FlowExportSnapshot` wire field once a wire-version bump is otherwise required.
 
@@ -349,11 +411,18 @@ forward-compat/rolling-upgrade case moot.
   SESSION_CLOSE EventReader callbacks; lifecycle by #2075/#2101
   `reconcileFlowExporters`). The Rust dataplane emits nothing.
 - **#2129** is a real gating asymmetry (v9 not gated on `version9`; IPFIX is
-  gated on `version-ipfix`). Fix = 3-line guard mirroring the IPFIX gate.
-  Operator-visible behavior change → release-note.
+  gated on `version-ipfix`). Fix = guard mirroring the IPFIX gate. This is the
+  PARTIAL fix — it stops the *unrequested* v9 stream (the broader defect) but
+  leaves the both-versions double-export for the §8 follow-up. The guard breaks
+  9 existing tests that encode the buggy behavior (3 `BuildExportConfig(nil,..)`
+  + 6 driving the `Version9`-less `flowSamplingConfig` helper) — these are
+  in-scope edits, NOT additive (§6). Operator-visible behavior change →
+  release-note.
 - **#2130** is genuine dead code (Rust `FlowExporter` + write-only
   `flow_export_config`), not a forwarding bug. Fix = remove the dead executable
   path; retain the wire field as documented-reserved (5.2-keep) to preserve the
-  #1977 decode-safety tests and avoid a protocol break.
-- **Out of scope / follow-up:** true per-flow-server version binding +
-  double-export de-dup (#2129 part 2).
+  #1977 decode-safety tests and avoid a protocol break. Add `#[allow(dead_code)]`
+  to `snapshot.flow_export` so the build stays warning-clean after the consumer
+  is removed.
+- **Out of scope / follow-up (file as a concrete issue before merge):** true
+  per-flow-server version binding + double-export de-dup (#2129 part 2).

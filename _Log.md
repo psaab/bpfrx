@@ -7519,3 +7519,8 @@ top.
 - **Timestamp**: 2026-06-20
 - **Action**: Drafted converged research plan for #2129 (v9 gating bug) + #2130 (dead Rust flow-export). Ground truth: v9 export works today, Go-side (pkg/flowexport off SESSION_CLOSE EventReader); Rust FlowExporter is dead (write-only flow_export_config, constructed only in tests). Decision PLAN-READY: gate v9 on Version9!=nil (mirror IPFIX) + remove dead Rust path (keep wire field documented-reserved).
 - **File(s)**: docs/research/2129-2130-netflow/plan.md (new)
+
+## 2026-06-20 — #2129+#2130 plan r2 (folded 3-way hostile review)
+- **Timestamp**: 2026-06-20
+- **Action**: Folded convergent PLAN-CHANGES-REQUIRED from Claude SMR + 2 hostile Claude reviewers. Blocking fix: enumerated the 9 existing tests the v9 gate breaks (3 BuildExportConfig(nil,..) + 6 via Version9-less flowSamplingConfig helper) as in-scope edits. Added #[allow(dead_code)] on snapshot.flow_export, sharpened partial-fix framing, concrete follow-up commitment, grep gate.
+- **File(s)**: docs/research/2129-2130-netflow/plan.md (r2), claude-smr-plan-r1.md, reviewer-r1-verdicts.md
