@@ -33,6 +33,13 @@ const SCREEN_ICMP_FRAGMENT: u32 = 1 << 17;
 /// evaluate the fragment/TCP screens (e.g. a truncated IPv6
 /// extension-header chain) is dropped FAIL-CLOSED under this reason.
 const SCREEN_IP_MALFORMED: u32 = 1 << 18;
+/// #2234: NOT a packet drop — a rare (logarithmic) operator ALARM that the
+/// per-zone scan/sweep source table is saturated and the detector is
+/// displacing stale sources (bounded stalest-eviction) to keep tracking a
+/// fresh real scanner under a high-cardinality spoofed flood. Rides the
+/// screen event path so it surfaces alongside other screen activity; the
+/// triggering 5-tuple is the new source that forced an eviction.
+const SCREEN_SCAN_TABLE_PRESSURE: u32 = 1 << 19;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum FilterLogSource {
@@ -281,6 +288,7 @@ fn screen_reason_id(reason: &'static str) -> u32 {
         "session-limit-dst" => SCREEN_SESSION_LIMIT_DST,
         "icmp-fragment" => SCREEN_ICMP_FRAGMENT,
         "ip-malformed" => SCREEN_IP_MALFORMED,
+        "scan-table-pressure" => SCREEN_SCAN_TABLE_PRESSURE,
         _ => 0,
     }
 }
@@ -480,6 +488,21 @@ mod tests {
         // malformed-frame drop apart from the syn-frag screen.
         assert_eq!(screen_reason_id("ip-malformed"), SCREEN_IP_MALFORMED);
         assert_ne!(SCREEN_IP_MALFORMED, SCREEN_SYN_FRAG);
+    }
+
+    #[test]
+    fn screen_reason_id_maps_scan_table_pressure() {
+        // #2234: the bounded stalest-eviction operator ALARM must map to a
+        // dedicated screen_id bit, distinct from the port-scan / ip-sweep
+        // DROP reasons (it is a saturation signal, not a packet drop), so an
+        // operator can tell "detector is saturated" apart from a real scan
+        // detection.
+        assert_eq!(
+            screen_reason_id("scan-table-pressure"),
+            SCREEN_SCAN_TABLE_PRESSURE
+        );
+        assert_ne!(SCREEN_SCAN_TABLE_PRESSURE, SCREEN_PORT_SCAN);
+        assert_ne!(SCREEN_SCAN_TABLE_PRESSURE, SCREEN_IP_SWEEP);
     }
 
     #[test]

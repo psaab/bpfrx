@@ -410,24 +410,39 @@ Per-worker scoping applies identically to scan/sweep (each worker owns its
 `ScreenState`), so the effective unique-entry count is multiplied by the
 worker count, exactly as documented for the session limit above.
 
-**Known limitation (#2227 MINOR-2 — detection-DoS via source-table
-saturation).** The per-zone source table is a hard cap
-(`MAX_SOURCES_PER_ZONE = 4096`). Once a zone holds 4096 tracked sources, a
-brand-new source key is SKIPPED (not recorded) — so a spoofed-source flood
-that fills the table can prevent a *subsequently-arriving* genuine scanner
-from being tracked, and therefore from being detected, until table entries
-expire. Worse, each existing source's window is refreshed whenever that
-source sends another new flow, so an attacker controlling 4096 sources can
-keep the table pinned full indefinitely (the entries never expire while the
-attacker keeps touching them; cleanup only reclaims windows older than
-`WINDOW_SECS`). This is a fail-SAFE-but-detection-degrading bound: it never
-fail-opens the *forwarding* path (no traffic is admitted that policy would
-deny) and never grows memory without bound, but it can suppress scan/sweep
-*detection* under a high-cardinality spoofed flood. `skipped_pressure`
-surfaces the saturation so an operator/alarm can see it. A follow-up
-(oldest/LRU eviction so a fresh real source can displace a stale tracked one,
-or a pressure-driven alarm) is tracked in #2234. Mitigations today:
-anti-spoofing / uRPF upstream and the `skipped_pressure` signal.
+**Source-table saturation — bounded stalest-eviction (#2234, was MINOR-2).**
+The per-zone source table is still capped at `MAX_SOURCES_PER_ZONE = 4096`
+(memory never grows without bound), but the cap is no longer a HARD cliff. The
+pre-#2234 behaviour SKIPPED a brand-new source once the zone was full, so a
+high-cardinality spoofed-source flood that filled the table could prevent a
+*subsequently-arriving* genuine scanner from being tracked — and therefore
+from being detected — until entries expired (which the attacker could defer
+indefinitely by keeping its 4096 sources fresh). That was a detection-DoS: it
+never fail-opened the *forwarding* path, but it suppressed scan/sweep
+*detection*.
+
+The new-source path now makes BOUNDED room instead of skipping. When a brand-
+new `(zone, src_ip)` arrives at a full zone, the tracker reclaims any expired
+window found within a FIXED-SIZE sample (`EVICT_SCAN_LIMIT = 64` entries) of
+the zone, and if none is expired it evicts the STALEST (oldest `window_start`)
+sampled entry. A fresh real scanner is therefore ALWAYS admissible, so the
+detection-suppression cliff is gone. The per-new-flow worst case is
+O(`EVICT_SCAN_LIMIT`) — a fixed prefix of the table, NOT an O(sources)
+min-scan, which under a saturation flood would itself be an O(n)-per-packet
+amplifier. The per-zone source count is maintained incrementally
+(`per_zone_count`) so the cap test is O(1); the only walk is the bounded
+eviction sample. In the pathological many-zones-sparsely-interleaved case
+where the fixed sample finds no same-zone victim, the path degrades back to
+skip-on-full (`skipped_pressure`) — still bounded, still never fail-open.
+
+Each eviction bumps `evicted_pressure` (surfaced via
+`ScreenState::scan_sweep_evicted_pressure`), and a rare LOGARITHMIC threshold
+crossing (powers of two in the cumulative eviction count) emits a
+`scan-table-pressure` screen event so the operator is told the detector is
+saturated — at a handful of alarms under a sustained flood, never per-flow
+(honouring the no-per-packet-logging rule). Defence-in-depth mitigations still
+apply: anti-spoofing / uRPF upstream reduces the spoofed-source axis, and the
+`skipped_pressure` / `evicted_pressure` signals surface the pressure.
 
 ## Why a slab + integer handles
 

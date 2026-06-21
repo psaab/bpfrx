@@ -653,27 +653,37 @@ const (
 	ScreenSynCookie       = 1 << 14
 	ScreenSessionLimitSrc = 1 << 15
 	ScreenSessionLimitDst = 1 << 16
+	// Bits 17-19 mirror the userspace-dp screen reason flags added after the
+	// original eBPF parity set: ICMP fragment (#2146 sibling), IP malformed
+	// (#2146 fail-closed parse error), and scan-table pressure (#2234, the
+	// bounded stalest-eviction operator alarm — NOT a packet drop).
+	ScreenICMPFragment      = 1 << 17
+	ScreenIPMalformed       = 1 << 18
+	ScreenScanTablePressure = 1 << 19
 )
 
 // ScreenFlagNames maps screen flag values to human-readable names.
 var ScreenFlagNames = map[uint32]string{
-	ScreenSynFlood:        "SYN flood",
-	ScreenICMPFlood:       "ICMP flood",
-	ScreenUDPFlood:        "UDP flood",
-	ScreenPortScan:        "port scan",
-	ScreenIPSweep:         "IP sweep",
-	ScreenLandAttack:      "LAND attack",
-	ScreenPingOfDeath:     "ping of death",
-	ScreenTearDrop:        "tear drop",
-	ScreenTCPSynFin:       "TCP SYN+FIN",
-	ScreenTCPNoFlag:       "TCP no-flag",
-	ScreenTCPFinNoAck:     "TCP FIN-no-ACK",
-	ScreenWinNuke:         "WinNuke",
-	ScreenIPSourceRoute:   "IP source-route",
-	ScreenSynFrag:         "SYN fragment",
-	ScreenSynCookie:       "SYN cookie",
-	ScreenSessionLimitSrc: "session limit (source)",
-	ScreenSessionLimitDst: "session limit (destination)",
+	ScreenSynFlood:          "SYN flood",
+	ScreenICMPFlood:         "ICMP flood",
+	ScreenUDPFlood:          "UDP flood",
+	ScreenPortScan:          "port scan",
+	ScreenIPSweep:           "IP sweep",
+	ScreenLandAttack:        "LAND attack",
+	ScreenPingOfDeath:       "ping of death",
+	ScreenTearDrop:          "tear drop",
+	ScreenTCPSynFin:         "TCP SYN+FIN",
+	ScreenTCPNoFlag:         "TCP no-flag",
+	ScreenTCPFinNoAck:       "TCP FIN-no-ACK",
+	ScreenWinNuke:           "WinNuke",
+	ScreenIPSourceRoute:     "IP source-route",
+	ScreenSynFrag:           "SYN fragment",
+	ScreenSynCookie:         "SYN cookie",
+	ScreenSessionLimitSrc:   "session limit (source)",
+	ScreenSessionLimitDst:   "session limit (destination)",
+	ScreenICMPFragment:      "ICMP fragment",
+	ScreenIPMalformed:       "IP malformed",
+	ScreenScanTablePressure: "scan-table pressure",
 }
 
 // SessionCountKey mirrors the C struct session_count_key.
