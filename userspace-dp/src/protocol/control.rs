@@ -198,6 +198,17 @@ pub(crate) struct ProcessStatus {
     /// Additive / defaulted for backward compatibility.
     #[serde(rename = "session_publish_errors_total", default)]
     pub session_publish_errors_total: u64,
+    /// #2244: total failed `dnat_table` reverse-SNAT BPF-map publishes
+    /// summed across worker bindings. The `dnat_table` is the reverse
+    /// lookup the embedded-ICMP NAT path consults to map an inbound ICMP
+    /// error (PMTUD Packet Too Big / Time Exceeded / traceroute) back to
+    /// the original pre-NAT source; a failed publish silently omits the
+    /// record so the error is dropped or mis-delivered. Always-on
+    /// cause-side signal for `dnat_table` map-capacity pressure. Surfaced
+    /// as the Prometheus counter `xpf_userspace_dnat_publish_errors_total`.
+    /// Additive / defaulted for backward compatibility.
+    #[serde(rename = "dnat_publish_errors_total", default)]
+    pub dnat_publish_errors_total: u64,
     /// #1760 W3': shared-map NAT reverse-key displacement events — a
     /// `publish_shared_session` insert into `shared_nat_sessions`
     /// displaced a DIFFERENT forward session's entry at the same reverse

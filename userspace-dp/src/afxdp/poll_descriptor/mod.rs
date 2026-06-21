@@ -1566,11 +1566,18 @@ pub(super) fn poll_binding_process_descriptor(
                                             );
                                             // Populate BPF dnat_table for embedded ICMP NAT reversal.
                                             // Without this, mtr/traceroute intermediate hops are invisible.
-                                            publish_dnat_table_entry(
+                                            // #2244: a failed map publish silently loses the reverse
+                                            // record — count it so map pressure is operator-visible.
+                                            if !publish_dnat_table_entry(
                                                 &worker_ctx.dnat_fds,
                                                 &flow.forward_key,
                                                 decision.nat,
-                                            );
+                                            ) {
+                                                binding
+                                                    .live
+                                                    .dnat_publish_errors
+                                                    .fetch_add(1, Ordering::Relaxed);
+                                            }
                                             replicate_session_upsert(
                                                 worker_ctx.peer_worker_commands,
                                                 &forward_entry,
@@ -3009,11 +3016,18 @@ pub(super) fn poll_binding_process_descriptor(
                                             worker_ctx.forwarding.alg_disable_flags,
                                             app_id,
                                         );
-                                        publish_dnat_table_entry(
+                                        // #2244: count failed reverse-NAT publishes so
+                                        // map-pressure loss is operator-visible.
+                                        if !publish_dnat_table_entry(
                                             &worker_ctx.dnat_fds,
                                             &flow.forward_key,
                                             pending_decision.nat,
-                                        );
+                                        ) {
+                                            binding
+                                                .live
+                                                .dnat_publish_errors
+                                                .fetch_add(1, Ordering::Relaxed);
+                                        }
                                         telemetry.counters.session_creates += 1;
                                     } else {
                                         // #1861 §5.3: at-cap seed refusal. The

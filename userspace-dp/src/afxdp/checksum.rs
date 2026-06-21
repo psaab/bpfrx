@@ -118,20 +118,31 @@ pub(super) fn ipv4_csum_words(ip: Ipv4Addr) -> [u16; 2] {
 
 /// Write a reverse SNAT entry to the BPF dnat_table so the eBPF
 /// embedded ICMP handler can find the original pre-NAT source.
+///
+/// Returns `true` when the entry was published (or when there was
+/// nothing to publish for this flow — no SNAT rewrite, an unsupported
+/// address family, or an absent table fd), and `false` ONLY when the
+/// `bpf_map_update_elem` syscall actually failed (map at capacity,
+/// EINVAL, kernel resource exhaustion). #2244: the caller bumps a
+/// per-binding `dnat_publish_errors` counter on `false` so map-pressure
+/// reverse-NAT loss is operator-visible instead of silent. The result
+/// is `#[must_use]` to keep the syscall return from being discarded
+/// again.
+#[must_use]
 pub(super) fn publish_dnat_table_entry(
     fds: &DnatTableFds,
     key: &crate::session::SessionKey,
     nat: NatDecision,
-) {
+) -> bool {
     let Some(snat_ip) = nat.rewrite_src else {
-        return;
+        return true;
     };
     match (key.addr_family as i32, snat_ip) {
         (libc::AF_INET, IpAddr::V4(snat_v4)) => {
-            let Some(fd) = fds.v4 else { return };
+            let Some(fd) = fds.v4 else { return true };
             let snat_port = nat.rewrite_src_port.unwrap_or(key.src_port);
             let IpAddr::V4(orig_v4) = key.src_ip else {
-                return;
+                return true;
             };
             let mut dk = [0u8; 12];
             dk[0] = key.protocol;
@@ -143,15 +154,30 @@ pub(super) fn publish_dnat_table_entry(
             dv[4..6].copy_from_slice(&key.src_port.to_be_bytes());
             dv[6] = 0;
 
-            unsafe {
+            let rc = unsafe {
                 libbpf_sys::bpf_map_update_elem(
                     fd,
                     dk.as_ptr().cast::<libc::c_void>(),
                     dv.as_ptr().cast::<libc::c_void>(),
                     libbpf_sys::BPF_ANY as u64,
+                )
+            };
+            if rc < 0 {
+                // Rare error branch (map full / EINVAL / resource
+                // exhaustion). Keep the log here cheap — the counter the
+                // caller bumps is the durable signal; this stderr line
+                // goes to journald and only fires on the (rare) failure
+                // path, never per packet on success.
+                eprintln!(
+                    "xpf: dnat_table reverse-NAT publish failed (proto={} snat_port={}): {}",
+                    key.protocol,
+                    snat_port,
+                    std::io::Error::last_os_error()
                 );
+                return false;
             }
+            true
         }
-        _ => {}
+        _ => true,
     }
 }

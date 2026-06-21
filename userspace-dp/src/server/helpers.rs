@@ -69,6 +69,10 @@ pub(crate) fn refresh_status(state: &mut ServerState) {
     // (per-binding worker-poll sites + shared no-binding sites). The
     // cause-side signal for rising XDP-shim NO_SESSION fallbacks.
     state.status.session_publish_errors_total = state.afxdp.session_publish_errors_total();
+    // #2244: total failed dnat_table reverse-SNAT BPF-map publishes. The
+    // cause-side signal for dnat_table capacity pressure that silently
+    // breaks embedded-ICMP NAT reversal (PMTUD / traceroute).
+    state.status.dnat_publish_errors_total = state.afxdp.dnat_publish_errors_total();
     // #1760 W3': shared-map NAT reverse-key displacement events — the
     // authoritative collision watch (covers MissingNeighborSeed installs
     // the per-worker counter cannot see).
