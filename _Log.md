@@ -1,5 +1,21 @@
 # Action Log
 
+## 2026-06-21 — #2183 flowexport IPv6 collector address bracketing
+
+- **Timestamp**: 2026-06-21
+- **Action**: Build flow-export collector destination + source-bind
+  addresses with `net.JoinHostPort` (was `fmt.Sprintf("%s:%d", ...)` /
+  `addr+":0"`). An unbracketed IPv6 literal (`2001:db8::9:4739`) is
+  unparseable by `net.ResolveUDPAddr`/`net.Dial`, so IPv6 NetFlow/IPFIX
+  collectors silently never dialed. Fixed both address-build sites
+  (manager.go destination, transport.go source-address sibling). Added
+  `addr_format_test.go` driving the real v9 + IPFIX builder paths
+  (IPv4 unchanged, IPv6 bracketed, `ResolveUDPAddr` accepts both) and a
+  transport-seam test for the IPv6 source-address bind; all FAIL against
+  the pre-fix code. Documented in pkg/flowexport/README.md gotchas.
+- **File(s)**: pkg/flowexport/manager.go, pkg/flowexport/transport.go,
+  pkg/flowexport/addr_format_test.go, pkg/flowexport/README.md
+
 ## 2026-06-21 — #2173 (PR #2182) fold: v4-mapped-v6 host-mask family divergence
 
 - **2026-06-21** — Folded MINOR review fixes into PR #2182: NAT host-mask family is now classified textually via `natAddrFamily` (colon => IPv6, matching Rust `IpAddr`/`Ipv4Addr`), NOT `net.ParseIP(...).To4()` — `::ffff:203.0.113.5/32` was wrongly accepted at commit but dropped by the dataplane; the NAT64-pool lenient warning now says only the offending pool address is dropped (not the whole rule); added commit-level mapped-v6 tests for both static-NAT and the NAT64 pool. Files: pkg/config/compiler_nat.go, pkg/config/compiler_nat_host_mask_test.go.

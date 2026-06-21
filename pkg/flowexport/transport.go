@@ -50,7 +50,10 @@ func dialCollectors(collectors []CollectorConfig) (*collectorConns, error) {
 			// A misconfigured SourceAddress must be surfaced, not
 			// silently dropped to a nil local bind (which would let the
 			// OS pick an arbitrary source and mask the misconfiguration).
-			laddr, err2 := resolveUDPAddr("udp", c.SourceAddress+":0")
+			// JoinHostPort brackets an IPv6 source-address literal so
+			// resolveUDPAddr can parse it; "addr:0" leaves an IPv6
+			// address unbracketed and unparseable (sibling of #2183).
+			laddr, err2 := resolveUDPAddr("udp", net.JoinHostPort(c.SourceAddress, "0"))
 			if err2 != nil {
 				return fail(fmt.Errorf("resolve collector %s source-address %s: %w", c.Address, c.SourceAddress, err2))
 			}
