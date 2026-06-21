@@ -131,7 +131,7 @@ func TestRenderConfig_BrokenChainSkipsVPN_HealthyTunnelSurvives(t *testing.T) {
 	if !strings.Contains(out, "tun-good {") {
 		t.Errorf("healthy tunnel tun-good missing from render:\n%s", out)
 	}
-	if !strings.Contains(out, "proposals = aes256") { // SCRATCH OLD WEAK CHECK
+	if !strings.Contains(out, "\n    proposals = aes256") {
 		t.Errorf("healthy tunnel missing a non-empty Phase-1 proposals line:\n%s", out)
 	}
 
