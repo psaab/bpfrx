@@ -66,6 +66,72 @@ fn empty_pool_returns_none() {
 }
 
 #[test]
+fn nat64_pool_with_cidr_mask_yields_nonempty_pool() {
+    // #2123: a range-form source pool (`address A to B`) is expanded by the
+    // Go compiler into per-IP /32 entries. Ipv4Addr::from_str rejects the
+    // mask, so pre-fix the filter_map discarded every entry, leaving pool_v4
+    // empty and allocate_v4_source returning None. The parse must strip the
+    // /32 mask. This test FAILS on the unfixed code.
+    let state = Nat64State::from_snapshots(&[NAT64RuleSnapshot {
+        name: "nat64-range".to_string(),
+        prefix: "64:ff9b::/96".to_string(),
+        pool_addresses: vec![
+            "100.64.0.1/32".to_string(),
+            "100.64.0.2/32".to_string(),
+        ],
+        no_v6_frag_header: false,
+    }]);
+    assert!(state.is_active());
+    assert_eq!(
+        state.prefixes[0].pool_v4.len(),
+        2,
+        "range-expanded /32 pool addresses must parse, not be dropped"
+    );
+    // Round-robin allocation must now succeed (was None pre-fix).
+    let a1 = state.allocate_v4_source(0).expect("alloc1");
+    let a2 = state.allocate_v4_source(0).expect("alloc2");
+    let a3 = state.allocate_v4_source(0).expect("alloc3 wraps");
+    assert_eq!(a1, Ipv4Addr::new(100, 64, 0, 1));
+    assert_eq!(a2, Ipv4Addr::new(100, 64, 0, 2));
+    assert_eq!(a3, Ipv4Addr::new(100, 64, 0, 1));
+}
+
+#[test]
+fn nat64_pool_mixed_bare_and_masked() {
+    // Discrete bare-IP `address` lines and range-expanded /32 entries must
+    // coexist: stripping the mask must not break the bare-IP parse.
+    let state = Nat64State::from_snapshots(&[NAT64RuleSnapshot {
+        name: "nat64-mixed".to_string(),
+        prefix: "64:ff9b::/96".to_string(),
+        pool_addresses: vec![
+            "198.51.100.1".to_string(),
+            "198.51.100.5/32".to_string(),
+        ],
+        no_v6_frag_header: false,
+    }]);
+    assert_eq!(state.prefixes[0].pool_v4.len(), 2);
+    assert!(state.prefixes[0].pool_v4.contains(&Ipv4Addr::new(198, 51, 100, 1)));
+    assert!(state.prefixes[0].pool_v4.contains(&Ipv4Addr::new(198, 51, 100, 5)));
+}
+
+#[test]
+fn nat64_pool_genuinely_invalid_still_dropped() {
+    // A genuinely-malformed pool address must still be discarded (the skip
+    // path is preserved), while a valid masked entry is kept.
+    let state = Nat64State::from_snapshots(&[NAT64RuleSnapshot {
+        name: "nat64-bad".to_string(),
+        prefix: "64:ff9b::/96".to_string(),
+        pool_addresses: vec![
+            "not-an-ip".to_string(),
+            "100.64.0.7/32".to_string(),
+        ],
+        no_v6_frag_header: false,
+    }]);
+    assert_eq!(state.prefixes[0].pool_v4.len(), 1);
+    assert!(state.prefixes[0].pool_v4.contains(&Ipv4Addr::new(100, 64, 0, 7)));
+}
+
+#[test]
 fn invalid_prefix_length_ignored() {
     let state = Nat64State::from_snapshots(&[NAT64RuleSnapshot {
         name: "bad".to_string(),
