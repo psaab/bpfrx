@@ -69,8 +69,11 @@ pub(crate) use syncookie::{
 
 use crate::tcp_flags::{is_closing, is_initial_syn};
 use packet::{PROTO_ICMP, PROTO_ICMPV6, PROTO_TCP, PROTO_UDP, TCP_ACK, TCP_SYN};
+// #2151: production screen no longer references these directly (the
+// FIN/closing checks moved to is_closing); the screen test module still
+// builds flag bytes with the named bits, so keep them test-visible.
 #[cfg(test)]
-use packet::TCP_URG;
+use packet::{TCP_FIN, TCP_URG};
 use rate::RateCounter;
 use scan::{IpSweepTracker, PortScanTracker};
 #[cfg(not(test))]
