@@ -449,7 +449,7 @@ func (m *Manager) runRelay(ctx context.Context, cancel context.CancelFunc,
 			}
 
 			msgType := pkt.MessageType()
-			if msgType != dhcpv4.MessageTypeDiscover && msgType != dhcpv4.MessageTypeRequest {
+			if !clientRequestRelayable(msgType) {
 				continue
 			}
 
@@ -462,13 +462,17 @@ func (m *Manager) runRelay(ctx context.Context, cancel context.CancelFunc,
 			// Set giaddr to our interface IP so the server knows where to reply.
 			pkt.GatewayIPAddr = giaddr
 
-			// Increment hop count.
-			pkt.HopCount++
-			if pkt.HopCount > 16 {
+			// Enforce the RFC 1542 §4.1.1 hop limit BEFORE incrementing.
+			// HopCount is uint8: checking after a ++ lets an incoming value
+			// of 255 wrap to 0 and slip past a post-increment "> 16" test,
+			// defeating loop protection. A request that already carries 16
+			// hops has reached the limit and must be dropped.
+			if pkt.HopCount >= 16 {
 				slog.Warn("dhcp-relay: hop count exceeded, dropping",
 					"interface", ifaceName, "hops", pkt.HopCount)
 				continue
 			}
+			pkt.HopCount++
 
 			// Add Option 82 (Relay Agent Information) with circuit-id sub-option.
 			addOption82(pkt, ifaceName)
@@ -654,6 +658,39 @@ func broadcastReply(ir *interfaceRelay, clientConn net.PacketConn, replyData []b
 		return false
 	}
 	return true
+}
+
+// clientRequestRelayable reports whether a client-originated BOOTREQUEST of the
+// given DHCP message type must be relayed to the configured servers.
+//
+// Per RFC 2131 §3.4 a relay agent forwards all client-originated requests that
+// carry server-bound options, not just lease acquisition (DISCOVER) and
+// lease (re)negotiation (REQUEST):
+//
+//   - DISCOVER / REQUEST — lease acquisition and renewal/rebinding.
+//   - INFORM — a client that already holds an address (statically configured,
+//     or post-lease) asking only for supplemental parameters (DNS servers,
+//     domain search, NTP, etc.). Dropping it leaves such clients without
+//     central configuration; the server answers an INFORM with an ACK, which
+//     the reply path already forwards (see deliverReply: the flag-clear,
+//     yiaddr==0, real-ciaddr case unicasts to the client's ciaddr).
+//
+// DECLINE and RELEASE are intentionally not relayed here, preserving the
+// pre-#2153 behavior (which relayed only DISCOVER/REQUEST). RELEASE is
+// unicast by the client to the server it is bound to, so it does not require
+// relaying. DECLINE is broadcast (RFC 2131 §4.4.1) but signals an address
+// conflict back to the originating server, which is reachable on the relayed
+// path only via DISCOVER/REQUEST state; this relay does not forward it, and
+// widening that set is out of scope for #2153.
+func clientRequestRelayable(msgType dhcpv4.MessageType) bool {
+	switch msgType {
+	case dhcpv4.MessageTypeDiscover,
+		dhcpv4.MessageTypeRequest,
+		dhcpv4.MessageTypeInform:
+		return true
+	default:
+		return false
+	}
 }
 
 // l2Eligible reports whether a reply can be sent via the raw-L2 path: the
