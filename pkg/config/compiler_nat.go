@@ -310,9 +310,10 @@ func validateNPTv6Strict(cfg *Config, lenient bool) ([]string, error) {
 	// Outbound matches on the internal prefix; inbound matches on the external
 	// (match) prefix. Each direction is checked independently.
 	type seenPrefix struct {
-		net      *net.IPNet
-		ones     int
-		ruleName string
+		net         *net.IPNet
+		ones        int
+		ruleSetName string
+		ruleName    string
 	}
 	var internalSeen, externalSeen []seenPrefix
 
@@ -391,8 +392,8 @@ func validateNPTv6Strict(cfg *Config, lenient bool) ([]string, error) {
 				if overlaps(prev.net, intNet) {
 					overlapFound = true
 					if err := emit(fmt.Sprintf(
-						"security nat static rule-set %q rule %q nptv6-prefix %q overlaps rule %q (outbound/internal prefixes overlap; first-match resolution would be order-dependent)",
-						rs.Name, rule.Name, rule.Then, prev.ruleName)); err != nil {
+						"security nat static rule-set %q rule %q nptv6-prefix %q overlaps rule-set %q rule %q (outbound/internal prefixes overlap; first-match resolution would be order-dependent)",
+						rs.Name, rule.Name, rule.Then, prev.ruleSetName, prev.ruleName)); err != nil {
 						return nil, err
 					}
 					break
@@ -402,8 +403,8 @@ func validateNPTv6Strict(cfg *Config, lenient bool) ([]string, error) {
 				if overlaps(prev.net, extNet) {
 					overlapFound = true
 					if err := emit(fmt.Sprintf(
-						"security nat static rule-set %q rule %q match destination-address %q overlaps rule %q (inbound/external prefixes overlap; first-match resolution would be order-dependent)",
-						rs.Name, rule.Name, rule.Match, prev.ruleName)); err != nil {
+						"security nat static rule-set %q rule %q match destination-address %q overlaps rule-set %q rule %q (inbound/external prefixes overlap; first-match resolution would be order-dependent)",
+						rs.Name, rule.Name, rule.Match, prev.ruleSetName, prev.ruleName)); err != nil {
 						return nil, err
 					}
 					break
@@ -415,8 +416,8 @@ func validateNPTv6Strict(cfg *Config, lenient bool) ([]string, error) {
 				continue
 			}
 
-			internalSeen = append(internalSeen, seenPrefix{net: intNet, ones: intOnes, ruleName: rule.Name})
-			externalSeen = append(externalSeen, seenPrefix{net: extNet, ones: extOnes, ruleName: rule.Name})
+			internalSeen = append(internalSeen, seenPrefix{net: intNet, ones: intOnes, ruleSetName: rs.Name, ruleName: rule.Name})
+			externalSeen = append(externalSeen, seenPrefix{net: extNet, ones: extOnes, ruleSetName: rs.Name, ruleName: rule.Name})
 		}
 	}
 

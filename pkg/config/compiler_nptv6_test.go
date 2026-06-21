@@ -217,6 +217,36 @@ func TestNPTv6IdenticalPrefixesRejected(t *testing.T) {
 	}
 }
 
+// TestNPTv6RejectsCrossRuleSetOverlap: NPTv6 rules in DIFFERENT rule-sets are
+// flattened into one first-match list by buildNptv6Snapshots, so an overlap
+// across rule-sets is just as order-dependent and must be rejected. The error
+// must name BOTH the offending rule-set/rule and the prior rule-set/rule so the
+// operator can disambiguate a rule name reused across rule-sets.
+func TestNPTv6RejectsCrossRuleSetOverlap(t *testing.T) {
+	tree := buildTree(t, []string{
+		"set security zones security-zone trust",
+		"set security nat static rule-set rsA from zone trust",
+		"set security nat static rule-set rsA rule shared match destination-address 2001:db8:1::/48",
+		"set security nat static rule-set rsA rule shared then static-nat nptv6-prefix fd00:1::/48",
+		"set security nat static rule-set rsB from zone trust",
+		"set security nat static rule-set rsB rule shared match destination-address 2001:db8:1:1234::/64",
+		"set security nat static rule-set rsB rule shared then static-nat nptv6-prefix fd00:1:0:1234::/64",
+	})
+	_, err := CompileConfig(tree)
+	if err == nil {
+		t.Fatal("overlapping NPTv6 prefixes across rule-sets must be rejected at commit")
+	}
+	msg := err.Error()
+	// Both rule-sets must be named (the rule name "shared" is reused, so the
+	// rule-set qualifier is what disambiguates).
+	if !strings.Contains(msg, "rsB") || !strings.Contains(msg, "rsA") {
+		t.Fatalf("error must name both rule-sets (rsA and rsB), got: %v", err)
+	}
+	if !strings.Contains(msg, "overlaps rule-set") {
+		t.Fatalf("error must qualify the prior rule with its rule-set, got: %v", err)
+	}
+}
+
 // TestNPTv6LenientLoadAccepts is the #1960 no-brick guarantee: a config
 // committed before this gate existed (or peer-synced) carrying a malformed or
 // overlapping NPTv6 rule must LOAD under the lenient path with the violation
