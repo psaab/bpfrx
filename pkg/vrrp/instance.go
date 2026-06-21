@@ -1451,7 +1451,12 @@ func (vi *vrrpInstance) warnRXDrop() {
 	drops := vi.rxDrops.Add(1)
 	now := time.Now().UnixNano()
 	last := vi.lastDropWarn.Load()
-	if now-last < int64(10*time.Second) {
+	// Clamp negative elapsed: lastDropWarn is wall-clock UnixNano (not a
+	// monotonic time.Time), so a backward wall-clock step makes now-last
+	// negative — without the >= 0 guard that would read as "< 10s" and
+	// suppress drop warnings until the clock re-advances. Mirrors
+	// garpDampened's elapsed>=0 clamp (#1792).
+	if elapsed := now - last; elapsed >= 0 && elapsed < int64(10*time.Second) {
 		return
 	}
 	if !vi.lastDropWarn.CompareAndSwap(last, now) {
