@@ -1,6 +1,40 @@
 # #2152 — VRRP gateway ARP probe must use the VIP as sender, not the primary IP
 
-Status: DRAFT v1 — pending adversarial plan review
+Status: PLAN-READY — Codex PLAN-NEEDS-MINOR + AGY PLAN-NEEDS-MINOR, all
+minors resolved (see "Adversarial plan review" below).
+
+## Adversarial plan review
+
+- Codex (task-mqncaton-c1y329): PLAN-NEEDS-MINOR. Confirmed architecture
+  correct; confirmed caller-3 must stay primary-IP; confirmed exactly 3
+  callers; confirmed VIP sites gated by `ip.To4()!=nil`. Minors:
+  (1) the vrrp test must be a CALL-SITE seam executing sendGARP and
+  capturing the sender, not a pure frame-build helper (tautological) —
+  ADDRESSED: implemented `arpProbeFn` seam +
+  `TestSendGARPProbeUsesVIPAsSender`. (2) `PrimaryIPv4` returns
+  first-non-LL IPv4 (kernel order), not "the configured primary" —
+  ADDRESSED: comment/name describe it honestly ("first non-link-local
+  IPv4", "interface-derived sender"); kept exported as it is a
+  cross-package (cluster -> daemon) helper with a unit test. (3) the
+  skip-if-VIP-is-.1 guard exists in sendGARP but NOT directSendGARPs —
+  ADDRESSED: added the guard to directSendGARPs for parity.
+- AGY (adversarial-review-mqncbb5u-u4se03): PLAN-NEEDS-MINOR. Confirmed
+  caller-3 primary-IP is "100% correct". Minors: (3) directSendGARPs
+  missing the skip-.1 guard — ADDRESSED (same as Codex 3). (4) test must
+  be a real seam, not a frame-build — ADDRESSED. (2) flagged a
+  MASTER->BACKUP goroutine state-race (sendGARP runs async; a node that
+  just lost MASTER could still emit a probe for a VIP it no longer
+  owns). DEFERRED as out of scope: this race pre-dates #2152 and already
+  affects the gratuitous-ARP burst (`SendGratuitousARPBurst`) and IPv6
+  NA in the same goroutine — the sender-IP fix does not make it worse.
+  Adding a `getState()!=StateMaster` guard would gate the GARP/NA burst
+  too and interacts with the #2081/#2082 forced-send / ReconcileVIPs
+  semantics; it deserves its own issue, not a rider on this surgical
+  fix. NOTE: AGY wrote its own implementation into the MAIN checkout
+  (`/home/ps/git/bpfrx`), not this worktree — those edits are NOT part
+  of this PR and must be discarded by the operator.
+
+Original status: DRAFT v1 — pending adversarial plan review
 
 ## Issue framing
 
