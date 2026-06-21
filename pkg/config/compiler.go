@@ -274,6 +274,23 @@ type compileOpts struct {
 	// constraint, never silently "protocol 0"). Same doctrine as
 	// lenientApplicationSpecs.
 	lenientFilterProtocols bool
+	// lenientNPTv6 (#2240) downgrades the NPTv6 (RFC 6296) validation gate
+	// (validateNPTv6Strict) from a hard compile error to a cfg.Warnings entry.
+	// The strict commit / commit-check path hard-rejects an NPTv6 static-NAT
+	// rule whose `match destination-address` / `then static-nat nptv6-prefix` is
+	// unparseable, not a /48 or /64, has mismatched prefix lengths, or is
+	// non-IPv6. Before this gate such a rule was only WARNED by the dataplane
+	// compiler (compileNPTv6 logged + `continue`d) and then DeleteStaleNPTv6
+	// tore down the working translation entries of the valid subset's
+	// predecessors — a fail-OPEN that silently disabled a working translation on
+	// a typo. The tolerant load / peer-sync paths downgrade to a warning so an
+	// already-persisted or peer-synced config carrying a bad NPTv6 rule still
+	// BOOTS (#1960 no-brick) — the Rust helper's #2240 backstop
+	// (Nptv6State::try_from_snapshots) rejects the snapshot at apply, so the
+	// preflight keeps the previous live state and a leniently-loaded bad config
+	// is inert. Commit stays strict so the operator's next edit fails loudly.
+	// Same doctrine as lenientNATHostMask.
+	lenientNPTv6 bool
 }
 
 // CompileConfig converts a parsed ConfigTree AST into a typed Config struct.
@@ -310,6 +327,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientRoutingExportRef:            true,
 		lenientApplicationSpecs:            true,
 		lenientFilterProtocols:             true,
+		lenientNPTv6:                       true,
 	})
 }
 
@@ -397,6 +415,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientRoutingExportRef:            true,
 		lenientApplicationSpecs:            true,
 		lenientFilterProtocols:             true,
+		lenientNPTv6:                       true,
 	})
 }
 
@@ -943,6 +962,22 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		return nil, err
 	}
 	cfg.Warnings = append(cfg.Warnings, hostMaskWarnings...)
+
+	// #2240: NPTv6 (RFC 6296) validation gate. The dataplane compiler
+	// (compileNPTv6) historically warned + `continue`d past a malformed NPTv6
+	// rule and then deleted stale entries over only the VALID subset, so a typo
+	// in one rule silently tore down a previously-working translation
+	// (fail-open). Strict (commit / commit-check): hard-reject a malformed NPTv6
+	// rule so the operator sees the misconfiguration and the previous forwarding
+	// state is preserved. Lenient (load / peer-sync): warn so a config committed
+	// before this gate existed still boots; the Rust helper independently
+	// rejects the snapshot and keeps the previous live state, so the bad config
+	// is inert.
+	nptv6Warnings, err := validateNPTv6Strict(cfg, opts.lenientNPTv6)
+	if err != nil {
+		return nil, err
+	}
+	cfg.Warnings = append(cfg.Warnings, nptv6Warnings...)
 
 	// #1892: retired DPDK-era `system dataplane` knobs (cores, memory,
 	// socket-mem, rx-mode, ports) parse for stored-config compatibility

@@ -9,8 +9,25 @@
 //! - Adjust the next word (word[3] for /48, word[4] for /64) using
 //!   ones-complement arithmetic to maintain checksum neutrality.
 //! - If the adjusted word becomes 0xFFFF, replace with 0x0000.
+//!
+//! Two module invariants the rest of the crate relies on:
+//!
+//! * **Fail CLOSED on an unparseable config rule (#2240).**
+//!   [`Nptv6State::try_from_snapshots`] rejects the whole snapshot (returning a
+//!   [`crate::policy::SnapshotIntegrityError`]) on an empty/malformed prefix, an
+//!   unsupported prefix length (not /48 or /64), or a mismatched internal/
+//!   external prefix-length pair — one bad rule fails the snapshot rather than
+//!   being silently filtered. The pre-fix parser silently `continue`d past a bad
+//!   rule, and the Go dataplane compiler then deleted stale entries over only
+//!   the VALID subset, so editing one previously-good rule into an invalid one
+//!   tore down its working translation with no replacement. The apply preflight
+//!   keeps the previous live forwarding state on this Err. This is the
+//!   helper-boundary backstop to the Go commit-time gate
+//!   (`pkg/config/compiler_nat.go`, #2240), consistent with the
+//!   #2124/#2142/#2173/#2212 fail-closed family.
 
 use crate::Nptv6RuleSnapshot;
+use crate::policy::SnapshotIntegrityError;
 use std::net::Ipv6Addr;
 
 /// A parsed NPTv6 rule with precomputed adjustment.
@@ -120,21 +137,61 @@ fn parse_prefix(s: &str) -> Option<([u16; 4], usize)> {
 }
 
 impl Nptv6State {
-    /// Build from config snapshot NPTv6 rules.
-    pub(crate) fn from_snapshots(snaps: &[Nptv6RuleSnapshot]) -> Self {
+    /// Build from config snapshot NPTv6 rules, failing CLOSED on an
+    /// unparseable / unsupported / mismatched rule (#2240).
+    ///
+    /// In a retired-eBPF world (#1373) the userspace helper is the enforcement
+    /// plane. The pre-fix parser silently `continue`d past a bad rule, and the
+    /// Go dataplane compiler then called `DeleteStaleNPTv6(written)` over only
+    /// the VALID subset — so editing one previously-good rule into an invalid
+    /// one removed its working translation entry with no replacement installed,
+    /// silently disabling a working translation. The primary gate is the Go
+    /// commit-time validation (`pkg/config/compiler_nat.go`, #2240); this is the
+    /// helper-boundary backstop, consistent with the #2124/#2142/#2173/#2212
+    /// fail-closed family.
+    ///
+    /// On any unparseable rule this returns a `SnapshotIntegrityError`; the
+    /// apply preflight (`forwarding_build`/`reconcile`/`refresh`) then keeps the
+    /// previous live forwarding state rather than installing a narrower NPTv6
+    /// config.
+    pub(crate) fn try_from_snapshots(
+        snaps: &[Nptv6RuleSnapshot],
+    ) -> Result<Self, SnapshotIntegrityError> {
         let mut state = Nptv6State::default();
         for snap in snaps {
             let (internal_prefix, iwords) = match parse_prefix(&snap.internal_prefix) {
                 Some(v) => v,
-                None => continue,
+                None => {
+                    return Err(SnapshotIntegrityError::Nptv6UnparseableRule {
+                        rule_name: snap.name.clone(),
+                        field: format!(
+                            "internal/nptv6 prefix {:?} (must be a valid IPv6 /48 or /64)",
+                            snap.internal_prefix
+                        ),
+                    });
+                }
             };
             let (external_prefix, ewords) = match parse_prefix(&snap.external_prefix) {
                 Some(v) => v,
-                None => continue,
+                None => {
+                    return Err(SnapshotIntegrityError::Nptv6UnparseableRule {
+                        rule_name: snap.name.clone(),
+                        field: format!(
+                            "external/match prefix {:?} (must be a valid IPv6 /48 or /64)",
+                            snap.external_prefix
+                        ),
+                    });
+                }
             };
             // Both prefixes must have the same length.
             if iwords != ewords {
-                continue;
+                return Err(SnapshotIntegrityError::Nptv6UnparseableRule {
+                    rule_name: snap.name.clone(),
+                    field: format!(
+                        "prefix lengths must match (internal {:?} vs external {:?})",
+                        snap.internal_prefix, snap.external_prefix
+                    ),
+                });
             }
             let adjustment = compute_adjustment(&internal_prefix, &external_prefix, iwords);
 
@@ -150,7 +207,17 @@ impl Nptv6State {
             // Outbound: match internal prefix on src, rewrite to external.
             state.outbound.push(rule);
         }
-        state
+        Ok(state)
+    }
+
+    /// Infallible test convenience wrapper over [`try_from_snapshots`] (#2240).
+    /// Panics on a snapshot integrity error, which valid test snapshots never
+    /// produce. Production builds the state through `try_from_snapshots` so an
+    /// unparseable rule rejects the snapshot and keeps the previous live state.
+    #[cfg(test)]
+    pub(crate) fn from_snapshots(snaps: &[Nptv6RuleSnapshot]) -> Self {
+        Self::try_from_snapshots(snaps)
+            .expect("test snapshot must not produce an NPTv6 integrity error")
     }
 
     /// Translate an inbound packet's destination address.

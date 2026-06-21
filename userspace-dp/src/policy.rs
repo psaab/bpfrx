@@ -42,6 +42,21 @@ pub(crate) enum SnapshotIntegrityError {
     /// snapshot keeps the previous live NAT64 state rather than installing a
     /// silently narrower one.
     Nat64UnparseableRule { rule_name: String, field: String },
+    /// #2240: an NPTv6 (RFC 6296) rule snapshot carried an unparseable or
+    /// unsupported prefix — a match/internal prefix that is empty / malformed /
+    /// not a /48 or /64, or an internal/external pair whose prefix lengths do
+    /// not match. Silently `continue`-ing past the bad rule (the pre-fix parser)
+    /// is a fail-OPEN regression: the Go dataplane compiler then calls
+    /// `DeleteStaleNPTv6(written)` over only the VALID subset, so editing one
+    /// previously-good rule into an invalid one TEARS DOWN the working
+    /// translation entry with no replacement installed — traffic that
+    /// previously translated silently stops, and HA peers converge on the same
+    /// partial state with no hard failure. The Go commit-time validation
+    /// (`pkg/config/compiler_nat.go`, #2240) is the primary gate; this is the
+    /// helper-boundary backstop, consistent with the #2124/#2142/#2173/#2212
+    /// fail-closed family. Rejecting the whole snapshot keeps the previous live
+    /// NPTv6 state rather than installing a silently narrower one.
+    Nptv6UnparseableRule { rule_name: String, field: String },
 }
 
 impl std::fmt::Display for SnapshotIntegrityError {
@@ -64,6 +79,11 @@ impl std::fmt::Display for SnapshotIntegrityError {
             Self::Nat64UnparseableRule { rule_name, field } => write!(
                 f,
                 "nat64 rule {:?} has an unparseable {} — refusing to fail open by silently dropping the rule",
+                rule_name, field
+            ),
+            Self::Nptv6UnparseableRule { rule_name, field } => write!(
+                f,
+                "nptv6 rule {:?} has an unparseable {} — refusing to fail open by silently dropping the rule (which would tear down working translations)",
                 rule_name, field
             ),
         }

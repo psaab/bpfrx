@@ -263,6 +263,106 @@ func validateNATHostMaskStrict(cfg *Config, lenient bool) ([]string, error) {
 	return warnings, nil
 }
 
+// validateNPTv6Strict is the #2240 strict-vs-lenient gate for NPTv6 (RFC 6296)
+// static-NAT rules (`then static-nat nptv6-prefix`).
+//
+// The dataplane compiler (`pkg/dataplane/compiler_nat.go` compileNPTv6)
+// historically logged a warning and `continue`d past any per-rule validation
+// failure (unparseable prefix, mismatched /48-vs-/64 lengths, an unsupported
+// length, a non-IPv6 prefix), then unconditionally called
+// `DeleteStaleNPTv6(written)` over only the VALID subset — so editing one
+// previously-good rule into an invalid one TORE DOWN its working translation
+// entry with no replacement installed, silently disabling a working
+// translation. The Rust helper mirrored the silent skip. In a retired-eBPF
+// world (#1373) the userspace helper is the enforcement plane, so this is a
+// fail-OPEN regression: a typo silently changes reachability and source/
+// destination identity while the commit still reports success. This
+// commit-time gate surfaces the misconfiguration loudly.
+//
+// Strict (commit / commit-check): hard-reject. Lenient (load / peer-sync, #1960
+// / #1979 doctrine): return the messages as warnings so a config committed
+// before this gate existed (or peer-synced) still boots — the Rust helper's
+// own #2240 backstop (`Nptv6State::try_from_snapshots`) rejects the snapshot at
+// apply, so the apply preflight keeps the previous live forwarding state and a
+// leniently-loaded bad config never installs a torn-down NPTv6 runtime.
+func validateNPTv6Strict(cfg *Config, lenient bool) ([]string, error) {
+	if cfg == nil {
+		return nil, nil
+	}
+	var warnings []string
+	emit := func(msg string) error {
+		if lenient {
+			warnings = append(warnings,
+				msg+" (ignored: NPTv6 snapshot rejected by dataplane, previous state kept, until corrected)")
+			return nil
+		}
+		return fmt.Errorf("%s", msg)
+	}
+
+	for _, rs := range cfg.Security.NAT.Static {
+		if rs == nil {
+			continue
+		}
+		for _, rule := range rs.Rules {
+			if rule == nil || !rule.IsNPTv6 {
+				continue
+			}
+
+			// External prefix = `match destination-address`.
+			extIP, extNet, errExt := net.ParseCIDR(rule.Match)
+			// Internal prefix = `then static-nat nptv6-prefix`.
+			intIP, intNet, errInt := net.ParseCIDR(rule.Then)
+
+			if errExt != nil {
+				if err := emit(fmt.Sprintf(
+					"security nat static rule-set %q rule %q match destination-address %q is not a valid IPv6 prefix for nptv6-prefix translation",
+					rs.Name, rule.Name, rule.Match)); err != nil {
+					return nil, err
+				}
+				continue
+			}
+			if errInt != nil {
+				if err := emit(fmt.Sprintf(
+					"security nat static rule-set %q rule %q then static-nat nptv6-prefix %q is not a valid IPv6 prefix",
+					rs.Name, rule.Name, rule.Then)); err != nil {
+					return nil, err
+				}
+				continue
+			}
+
+			extOnes, _ := extNet.Mask.Size()
+			intOnes, _ := intNet.Mask.Size()
+
+			if extOnes != intOnes {
+				if err := emit(fmt.Sprintf(
+					"security nat static rule-set %q rule %q nptv6 prefix lengths must match (match %q is /%d, nptv6-prefix %q is /%d)",
+					rs.Name, rule.Name, rule.Match, extOnes, rule.Then, intOnes)); err != nil {
+					return nil, err
+				}
+				continue
+			}
+			if extOnes != 48 && extOnes != 64 {
+				if err := emit(fmt.Sprintf(
+					"security nat static rule-set %q rule %q nptv6 prefix length /%d is unsupported (only /48 and /64 are allowed)",
+					rs.Name, rule.Name, extOnes)); err != nil {
+					return nil, err
+				}
+				continue
+			}
+			if extIP.To4() != nil || intIP.To4() != nil {
+				if err := emit(fmt.Sprintf(
+					"security nat static rule-set %q rule %q nptv6 prefixes must be IPv6 (match %q, nptv6-prefix %q)",
+					rs.Name, rule.Name, rule.Match, rule.Then)); err != nil {
+					return nil, err
+				}
+				continue
+			}
+		}
+	}
+
+	return warnings, nil
+}
+
 func compileNAT(node *Node, sec *SecurityConfig) error {
 	// Initialize SourcePools map
 	if sec.NAT.SourcePools == nil {

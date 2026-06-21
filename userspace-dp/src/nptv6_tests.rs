@@ -260,31 +260,76 @@ fn empty_state() {
 }
 
 #[test]
-fn invalid_snapshot_skipped() {
-    let state = Nptv6State::from_snapshots(&[
-        Nptv6RuleSnapshot {
-            name: "bad".to_string(),
-            from_zone: String::new(),
-            internal_prefix: "not-a-prefix".to_string(),
-            external_prefix: "2001:db8:1::/48".to_string(),
-        },
-        Nptv6RuleSnapshot {
-            name: "bad-len".to_string(),
-            from_zone: String::new(),
-            internal_prefix: "fd00:1::/48".to_string(),
-            external_prefix: "2001:db8:1:2::/64".to_string(), // mismatched length
-        },
-        Nptv6RuleSnapshot {
-            name: "good".to_string(),
-            from_zone: String::new(),
-            internal_prefix: "fd00:1::/48".to_string(),
-            external_prefix: "2001:db8:1::/48".to_string(),
-        },
-    ]);
-    // Only the good rule should be present.
-    assert_eq!(state.inbound.len(), 1);
-    assert_eq!(state.outbound.len(), 1);
+fn invalid_snapshot_rejected_fail_closed() {
+    // #2240 fail-on-revert: a snapshot mixing a malformed rule with several
+    // VALID rules must REJECT the WHOLE snapshot (fail closed), so the apply
+    // preflight keeps the previous live state instead of installing only the
+    // valid subset and (via the Go DeleteStaleNPTv6) tearing down the working
+    // translations. The pre-fix code silently kept just the "good" rule.
+    let good_a = Nptv6RuleSnapshot {
+        name: "good-a".to_string(),
+        from_zone: String::new(),
+        internal_prefix: "fd00:1::/48".to_string(),
+        external_prefix: "2001:db8:1::/48".to_string(),
+    };
+    let good_b = Nptv6RuleSnapshot {
+        name: "good-b".to_string(),
+        from_zone: String::new(),
+        internal_prefix: "fd00:2::/48".to_string(),
+        external_prefix: "2001:db8:2::/48".to_string(),
+    };
+
+    // Unparseable internal prefix.
+    let bad_parse = Nptv6RuleSnapshot {
+        name: "bad-parse".to_string(),
+        from_zone: String::new(),
+        internal_prefix: "not-a-prefix".to_string(),
+        external_prefix: "2001:db8:9::/48".to_string(),
+    };
+    let err = Nptv6State::try_from_snapshots(&[good_a.clone(), bad_parse, good_b.clone()])
+        .expect_err("a malformed NPTv6 rule must reject the whole snapshot");
+    match err {
+        SnapshotIntegrityError::Nptv6UnparseableRule { rule_name, .. } => {
+            assert_eq!(rule_name, "bad-parse");
+        }
+        other => panic!("expected Nptv6UnparseableRule, got {other:?}"),
+    }
+
+    // Mismatched prefix lengths (/48 internal vs /64 external).
+    let bad_len = Nptv6RuleSnapshot {
+        name: "bad-len".to_string(),
+        from_zone: String::new(),
+        internal_prefix: "fd00:9::/48".to_string(),
+        external_prefix: "2001:db8:9:2::/64".to_string(),
+    };
+    let err = Nptv6State::try_from_snapshots(&[good_a.clone(), bad_len, good_b.clone()])
+        .expect_err("mismatched prefix lengths must reject the whole snapshot");
+    assert!(
+        matches!(err, SnapshotIntegrityError::Nptv6UnparseableRule { .. }),
+        "expected Nptv6UnparseableRule, got {err:?}"
+    );
+
+    // Unsupported prefix length (/56).
+    let bad_unsupported = Nptv6RuleSnapshot {
+        name: "bad-56".to_string(),
+        from_zone: String::new(),
+        internal_prefix: "fd00:9::/56".to_string(),
+        external_prefix: "2001:db8:9::/56".to_string(),
+    };
+    let err = Nptv6State::try_from_snapshots(&[good_a.clone(), bad_unsupported])
+        .expect_err("unsupported prefix length must reject the whole snapshot");
+    assert!(
+        matches!(err, SnapshotIntegrityError::Nptv6UnparseableRule { .. }),
+        "expected Nptv6UnparseableRule, got {err:?}"
+    );
+
+    // Control: the all-valid snapshot still installs BOTH rules.
+    let ok = Nptv6State::try_from_snapshots(&[good_a, good_b])
+        .expect("all-valid snapshot must build");
+    assert_eq!(ok.inbound.len(), 2);
+    assert_eq!(ok.outbound.len(), 2);
 }
+
 
 #[test]
 fn real_world_prefixes() {
