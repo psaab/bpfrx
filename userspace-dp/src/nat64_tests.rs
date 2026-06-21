@@ -1434,3 +1434,407 @@ fn streamed_pseudo_header_checksum_matches_contiguous_buffer() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// #2219: ICMP ERROR-message translation (Dest-Unreachable, Time-Exceeded,
+// Packet-Too-Big <-> Fragmentation-Needed, Parameter-Problem) across NAT64.
+//
+// Pre-fix the ICMP type translators handled ONLY echo (128/129, 8/0) and
+// returned None for every error type, which aborted the whole frame build
+// (`?` on the translator) — so PMTUD and traceroute were blackholed. These
+// tests are FAIL-ON-REVERT: each asserts the outer ICMP type/code/checksum AND
+// the EMBEDDED translated IP header (addresses NAT64-mapped, lengths/checksums
+// correct), with an independent oracle for both checksums. Reverting the fix
+// (translators return None for errors) drops the packet -> `expect("translate")`
+// panics, failing the test.
+//
+// ICMP error message layout: type(1) code(1) checksum(2) rest-of-header(4) then
+// the quoted original packet (IP header + leading L4 bytes).
+// ---------------------------------------------------------------------------
+
+const PROTO_ICMP_C: u8 = 1;
+const PROTO_ICMPV6_C: u8 = 58;
+
+/// Build an IPv4 packet (header + given L4 bytes) with a valid header checksum.
+/// Used to construct the embedded/quoted original packet inside an ICMP error.
+fn build_v4_with_l4(src: Ipv4Addr, dst: Ipv4Addr, proto: u8, ttl: u8, l4: &[u8]) -> Vec<u8> {
+    let total = 20 + l4.len();
+    let mut p = vec![0u8; total];
+    p[0] = 0x45;
+    p[2..4].copy_from_slice(&(total as u16).to_be_bytes());
+    p[6..8].copy_from_slice(&0x4000u16.to_be_bytes());
+    p[8] = ttl;
+    p[9] = proto;
+    p[12..16].copy_from_slice(&src.octets());
+    p[16..20].copy_from_slice(&dst.octets());
+    let s = checksum16(&p[..20]);
+    p[10..12].copy_from_slice(&s.to_be_bytes());
+    p[20..].copy_from_slice(l4);
+    p
+}
+
+/// Build an IPv6 packet (header + given L4 bytes).
+fn build_v6_with_l4(src: Ipv6Addr, dst: Ipv6Addr, nh: u8, hl: u8, l4: &[u8]) -> Vec<u8> {
+    let mut p = vec![0u8; 40 + l4.len()];
+    p[0] = 0x60;
+    p[4..6].copy_from_slice(&(l4.len() as u16).to_be_bytes());
+    p[6] = nh;
+    p[7] = hl;
+    p[8..24].copy_from_slice(&src.octets());
+    p[24..40].copy_from_slice(&dst.octets());
+    p[40..].copy_from_slice(l4);
+    p
+}
+
+/// Wrap a quoted packet as an ICMPv4 error message: type/code/rest + quote.
+/// Computes a correct ICMPv4 checksum so the input is well-formed.
+fn build_icmpv4_error(typ: u8, code: u8, rest: [u8; 4], quote: &[u8]) -> Vec<u8> {
+    let mut m = vec![0u8; 8 + quote.len()];
+    m[0] = typ;
+    m[1] = code;
+    m[4..8].copy_from_slice(&rest);
+    m[8..].copy_from_slice(quote);
+    let s = checksum16(&m);
+    m[2..4].copy_from_slice(&s.to_be_bytes());
+    m
+}
+
+/// Wrap a quoted packet as an ICMPv6 error message (checksum filled by caller
+/// via the IPv6 pseudo-header).
+fn build_icmpv6_error(typ: u8, code: u8, rest: [u8; 4], quote: &[u8]) -> Vec<u8> {
+    let mut m = vec![0u8; 8 + quote.len()];
+    m[0] = typ;
+    m[1] = code;
+    m[4..8].copy_from_slice(&rest);
+    m[8..].copy_from_slice(quote);
+    m
+}
+
+// === v4 -> v6 reverse direction (the PMTUD / traceroute return path) =========
+
+#[test]
+fn nat64_v4_to_v6_time_exceeded_translates_outer_and_embedded() {
+    // Topology: v6 client 2001:db8::1 reached v4 server 192.0.2.5 via the WKP.
+    // SNAT pool source 198.51.100.1. A v4 hop (203.0.113.9) returns ICMPv4
+    // Time Exceeded quoting the original forward v4 packet
+    // (198.51.100.1 -> 192.0.2.5). The reverse translation rewrites the outer
+    // addresses from the session reverse-info (src_v6 = prefix::server,
+    // dst_v6 = client).
+    let client_v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+    let server_v4 = Ipv4Addr::new(192, 0, 2, 5);
+    let server_v6: Ipv6Addr = "64:ff9b::c000:0205".parse().unwrap(); // prefix::192.0.2.5
+    let pool_v4 = Ipv4Addr::new(198, 51, 100, 1);
+
+    // Embedded = original forward v4 packet, quoting IP header + 8 L4 bytes.
+    let inner_l4 = [0x30u8, 0x39, 0x00, 0x50, 0xaa, 0xbb, 0xcc, 0xdd]; // src/dst ports + seq
+    let embedded = build_v4_with_l4(pool_v4, server_v4, PROTO_TCP, 1, &inner_l4);
+    let icmp = build_icmpv4_error(11, 0, [0, 0, 0, 0], &embedded);
+    let v4_pkt = build_v4_with_l4(
+        Ipv4Addr::new(203, 0, 113, 9),
+        pool_v4,
+        PROTO_ICMP_C,
+        64,
+        &icmp,
+    );
+
+    // Reverse builder args: src_v6 = orig_dst (prefix::server), dst_v6 = client.
+    let v6 = translate_v4_to_v6(&v4_pkt, server_v6, client_v6)
+        .expect("ICMPv4 Time-Exceeded must translate, not drop");
+
+    // Outer IPv6 header.
+    assert_eq!(v6[6], PROTO_ICMPV6_C, "outer next-header must be ICMPv6");
+    assert_eq!(&v6[8..24], &server_v6.octets(), "outer src = prefix::server");
+    assert_eq!(&v6[24..40], &client_v6.octets(), "outer dst = client");
+    // Outer ICMPv6 type/code: Time Exceeded (3), code preserved (0).
+    assert_eq!(v6[40], 3, "ICMPv6 Time Exceeded type");
+    assert_eq!(v6[41], 0, "code preserved");
+    // Outer ICMPv6 checksum valid (independent oracle: pseudo-header sum == 0).
+    let s6 = Ipv6Addr::from(<[u8; 16]>::try_from(&v6[8..24]).unwrap());
+    let d6 = Ipv6Addr::from(<[u8; 16]>::try_from(&v6[24..40]).unwrap());
+    assert_eq!(
+        checksum16_ipv6_pseudo(s6, d6, PROTO_ICMPV6_C, &v6[40..]),
+        0,
+        "outer ICMPv6 checksum must verify"
+    );
+
+    // EMBEDDED translated IPv6 header begins at v6[48] (40 outer IP + 8 ICMP).
+    let emb = &v6[48..];
+    assert_eq!(emb[0] >> 4, 6, "embedded must be IPv6");
+    assert_eq!(emb[6], PROTO_TCP, "embedded protocol preserved");
+    // Embedded src (was pool_v4) -> original v6 client.
+    assert_eq!(&emb[8..24], &client_v6.octets(), "embedded src = client");
+    // Embedded dst (was server_v4) -> prefix::server.
+    assert_eq!(&emb[24..40], &server_v6.octets(), "embedded dst = prefix::server");
+    // Embedded TTL copied verbatim (NOT decremented — it's a quote).
+    assert_eq!(emb[7], 1, "embedded hop limit copied verbatim");
+    // Embedded quoted L4 bytes preserved.
+    assert_eq!(&emb[40..48], &inner_l4, "embedded quoted L4 preserved");
+    // Embedded payload length consistent.
+    assert_eq!(
+        u16::from_be_bytes([emb[4], emb[5]]) as usize,
+        inner_l4.len(),
+        "embedded payload length"
+    );
+}
+
+#[test]
+fn nat64_v4_to_v6_frag_needed_becomes_packet_too_big_with_mtu() {
+    // ICMPv4 Dest-Unreachable / Fragmentation-Needed (3/4) carrying Next-Hop
+    // MTU 1400 in bytes 6-7 -> ICMPv6 Packet-Too-Big (2/0) with MTU 1420
+    // (1400 + 20, the NAT64 header delta), clamped to the v6 minimum (1280).
+    let client_v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+    let server_v4 = Ipv4Addr::new(192, 0, 2, 5);
+    let server_v6: Ipv6Addr = "64:ff9b::c000:0205".parse().unwrap();
+    let pool_v4 = Ipv4Addr::new(198, 51, 100, 1);
+
+    let inner_l4 = [0x30u8, 0x39, 0x00, 0x50, 0x11, 0x22, 0x33, 0x44];
+    let embedded = build_v4_with_l4(pool_v4, server_v4, PROTO_TCP, 60, &inner_l4);
+    // RFC 1191: Frag-Needed rest-of-header = [unused(2)][next-hop MTU(2)].
+    let rest = [0u8, 0, (1400u16 >> 8) as u8, 1400u16 as u8];
+    let icmp = build_icmpv4_error(3, 4, rest, &embedded);
+    let v4_pkt = build_v4_with_l4(server_v4, pool_v4, PROTO_ICMP_C, 64, &icmp);
+
+    let v6 = translate_v4_to_v6(&v4_pkt, server_v6, client_v6)
+        .expect("ICMPv4 Frag-Needed must translate to Packet-Too-Big, not drop");
+
+    assert_eq!(v6[40], 2, "ICMPv6 Packet Too Big type");
+    assert_eq!(v6[41], 0, "PTB code 0");
+    // MTU is the full 32-bit rest-of-header word (bytes 4-7 of the ICMPv6 msg).
+    let mtu = u32::from_be_bytes([v6[44], v6[45], v6[46], v6[47]]);
+    assert_eq!(mtu, 1420, "PTB MTU must be v4 next-hop MTU + 20");
+    // Checksum oracle.
+    let s6 = Ipv6Addr::from(<[u8; 16]>::try_from(&v6[8..24]).unwrap());
+    let d6 = Ipv6Addr::from(<[u8; 16]>::try_from(&v6[24..40]).unwrap());
+    assert_eq!(checksum16_ipv6_pseudo(s6, d6, PROTO_ICMPV6_C, &v6[40..]), 0);
+
+    // Embedded check: addresses mapped.
+    let emb = &v6[48..];
+    assert_eq!(&emb[8..24], &client_v6.octets(), "embedded src = client");
+    assert_eq!(&emb[24..40], &server_v6.octets(), "embedded dst = prefix::server");
+}
+
+#[test]
+fn nat64_v4_to_v6_frag_needed_mtu_clamped_to_v6_minimum() {
+    // A tiny advertised v4 MTU (e.g. 1000) + 20 = 1020 < 1280; clamp to 1280
+    // so the v6 client is never told to go below the IPv6 minimum link MTU.
+    let client_v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+    let server_v6: Ipv6Addr = "64:ff9b::c000:0205".parse().unwrap();
+    let pool_v4 = Ipv4Addr::new(198, 51, 100, 1);
+    let server_v4 = Ipv4Addr::new(192, 0, 2, 5);
+
+    let embedded = build_v4_with_l4(pool_v4, server_v4, PROTO_UDP, 60, &[0u8; 8]);
+    let rest = [0u8, 0, (1000u16 >> 8) as u8, 1000u16 as u8];
+    let icmp = build_icmpv4_error(3, 4, rest, &embedded);
+    let v4_pkt = build_v4_with_l4(server_v4, pool_v4, PROTO_ICMP_C, 64, &icmp);
+
+    let v6 = translate_v4_to_v6(&v4_pkt, server_v6, client_v6).expect("translate");
+    let mtu = u32::from_be_bytes([v6[44], v6[45], v6[46], v6[47]]);
+    assert_eq!(mtu, 1280, "MTU must clamp to the IPv6 minimum link MTU");
+}
+
+#[test]
+fn nat64_v4_to_v6_dest_unreachable_port_maps() {
+    // ICMPv4 Dest-Unreachable / Port-Unreachable (3/3) -> ICMPv6
+    // Dest-Unreachable / Port-Unreachable (1/4).
+    let client_v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+    let server_v6: Ipv6Addr = "64:ff9b::c000:0205".parse().unwrap();
+    let pool_v4 = Ipv4Addr::new(198, 51, 100, 1);
+    let server_v4 = Ipv4Addr::new(192, 0, 2, 5);
+
+    let inner_l4 = [0x00u8, 0x35, 0x12, 0x34, 0xde, 0xad, 0xbe, 0xef];
+    let embedded = build_v4_with_l4(pool_v4, server_v4, PROTO_UDP, 60, &inner_l4);
+    let icmp = build_icmpv4_error(3, 3, [0, 0, 0, 0], &embedded);
+    let v4_pkt = build_v4_with_l4(server_v4, pool_v4, PROTO_ICMP_C, 64, &icmp);
+
+    let v6 = translate_v4_to_v6(&v4_pkt, server_v6, client_v6)
+        .expect("ICMPv4 Port-Unreachable must translate, not drop");
+    assert_eq!(v6[40], 1, "ICMPv6 Destination Unreachable type");
+    assert_eq!(v6[41], 4, "ICMPv6 Port Unreachable code");
+    let s6 = Ipv6Addr::from(<[u8; 16]>::try_from(&v6[8..24]).unwrap());
+    let d6 = Ipv6Addr::from(<[u8; 16]>::try_from(&v6[24..40]).unwrap());
+    assert_eq!(checksum16_ipv6_pseudo(s6, d6, PROTO_ICMPV6_C, &v6[40..]), 0);
+    let emb = &v6[48..];
+    assert_eq!(&emb[8..24], &client_v6.octets());
+    assert_eq!(&emb[24..40], &server_v6.octets());
+    assert_eq!(emb[6], PROTO_UDP, "embedded protocol preserved");
+    assert_eq!(&emb[40..48], &inner_l4, "embedded quoted L4 preserved");
+}
+
+// === v6 -> v4 forward direction =============================================
+
+#[test]
+fn nat64_v6_to_v4_packet_too_big_becomes_frag_needed_with_mtu() {
+    // ICMPv6 Packet-Too-Big (type 2) MTU 1500 -> ICMPv4 Dest-Unreachable /
+    // Fragmentation-Needed (3/4), next-hop MTU 1480 (1500 - 20).
+    let client_v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+    let dst_v6: Ipv6Addr = "64:ff9b::0808:0808".parse().unwrap(); // prefix::8.8.8.8
+    let snat_v4 = Ipv4Addr::new(198, 51, 100, 1);
+    let dst_v4 = Ipv4Addr::new(8, 8, 8, 8);
+
+    // Embedded = original v6 forward packet (client -> prefix::8.8.8.8).
+    let inner_l4 = [0x30u8, 0x39, 0x00, 0x50, 0x01, 0x02, 0x03, 0x04];
+    let embedded = build_v6_with_l4(client_v6, dst_v6, PROTO_TCP, 1, &inner_l4);
+    // ICMPv6 PTB rest-of-header = the 32-bit MTU.
+    let icmp = build_icmpv6_error(2, 0, 1500u32.to_be_bytes(), &embedded);
+    // Wrap as a v6 packet from a v6 hop back toward dst_v6 with valid checksum.
+    let hop_v6: Ipv6Addr = "2001:db8:ffff::1".parse().unwrap();
+    let mut v6_pkt = build_v6_with_l4(hop_v6, client_v6, PROTO_ICMPV6_C, 64, &icmp);
+    // Fix the outer ICMPv6 checksum for the input.
+    let icmp_off = 40;
+    v6_pkt[icmp_off + 2..icmp_off + 4].copy_from_slice(&[0, 0]);
+    let s = checksum16_ipv6_pseudo(hop_v6, client_v6, PROTO_ICMPV6_C, &v6_pkt[icmp_off..]);
+    v6_pkt[icmp_off + 2..icmp_off + 4].copy_from_slice(&s.to_be_bytes());
+
+    let v4 = translate_v6_to_v4(&v6_pkt, snat_v4, dst_v4, false)
+        .expect("ICMPv6 Packet-Too-Big must translate to Frag-Needed, not drop");
+
+    assert_eq!(v4[9], PROTO_ICMP_C, "outer protocol ICMPv4");
+    assert_eq!(v4[20], 3, "ICMPv4 Destination Unreachable type");
+    assert_eq!(v4[21], 4, "ICMPv4 Fragmentation Needed code");
+    // Next-hop MTU in bytes 26-27 (ICMP rest-of-header word, low 16 bits).
+    let mtu = u16::from_be_bytes([v4[26], v4[27]]);
+    assert_eq!(mtu, 1480, "next-hop MTU = v6 MTU - 20");
+    // Outer IPv4 + ICMPv4 checksums valid (oracle).
+    assert_eq!(checksum16(&v4[..20]), 0, "outer IPv4 header checksum");
+    assert_eq!(checksum16(&v4[20..]), 0, "outer ICMPv4 checksum");
+
+    // EMBEDDED translated IPv4 header begins at v4[28] (20 IP + 8 ICMP).
+    let emb = &v4[28..];
+    assert_eq!(emb[0], 0x45, "embedded IPv4 header");
+    assert_eq!(emb[9], PROTO_TCP, "embedded protocol preserved");
+    // Embedded src (was client_v6) -> dst_v4 (the mapped embedded src).
+    assert_eq!(&emb[12..16], &dst_v4.octets(), "embedded src mapped to dst_v4");
+    // Embedded dst (was prefix::8.8.8.8) -> snat_v4 (mapped embedded dst).
+    assert_eq!(&emb[16..20], &snat_v4.octets(), "embedded dst mapped to snat_v4");
+    // Embedded IPv4 header checksum valid (oracle).
+    assert_eq!(checksum16(&emb[..20]), 0, "embedded IPv4 header checksum");
+    assert_eq!(&emb[20..28], &inner_l4, "embedded quoted L4 preserved");
+}
+
+#[test]
+fn nat64_v6_to_v4_time_exceeded_translates() {
+    // ICMPv6 Time Exceeded (3) -> ICMPv4 Time Exceeded (11), code preserved.
+    let client_v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+    let dst_v6: Ipv6Addr = "64:ff9b::0808:0808".parse().unwrap();
+    let snat_v4 = Ipv4Addr::new(198, 51, 100, 1);
+    let dst_v4 = Ipv4Addr::new(8, 8, 8, 8);
+
+    let inner_l4 = [0x30u8, 0x39, 0x00, 0x50, 0x09, 0x08, 0x07, 0x06];
+    let embedded = build_v6_with_l4(client_v6, dst_v6, PROTO_UDP, 1, &inner_l4);
+    let icmp = build_icmpv6_error(3, 0, [0, 0, 0, 0], &embedded);
+    let hop_v6: Ipv6Addr = "2001:db8:ffff::1".parse().unwrap();
+    let mut v6_pkt = build_v6_with_l4(hop_v6, client_v6, PROTO_ICMPV6_C, 64, &icmp);
+    v6_pkt[42..44].copy_from_slice(&[0, 0]);
+    let s = checksum16_ipv6_pseudo(hop_v6, client_v6, PROTO_ICMPV6_C, &v6_pkt[40..]);
+    v6_pkt[42..44].copy_from_slice(&s.to_be_bytes());
+
+    let v4 = translate_v6_to_v4(&v6_pkt, snat_v4, dst_v4, false)
+        .expect("ICMPv6 Time-Exceeded must translate, not drop");
+    assert_eq!(v4[20], 11, "ICMPv4 Time Exceeded type");
+    assert_eq!(v4[21], 0, "code preserved");
+    assert_eq!(checksum16(&v4[..20]), 0);
+    assert_eq!(checksum16(&v4[20..]), 0);
+    let emb = &v4[28..];
+    assert_eq!(&emb[12..16], &dst_v4.octets());
+    assert_eq!(&emb[16..20], &snat_v4.octets());
+    assert_eq!(checksum16(&emb[..20]), 0);
+}
+
+#[test]
+fn nat64_v6_to_v4_dest_unreachable_admin_maps() {
+    // ICMPv6 Dest-Unreachable / admin-prohibited (1/1) -> ICMPv4
+    // Dest-Unreachable / comm-administratively-prohibited (3/10).
+    let client_v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+    let dst_v6: Ipv6Addr = "64:ff9b::0808:0808".parse().unwrap();
+    let snat_v4 = Ipv4Addr::new(198, 51, 100, 1);
+    let dst_v4 = Ipv4Addr::new(8, 8, 8, 8);
+
+    let embedded = build_v6_with_l4(client_v6, dst_v6, PROTO_TCP, 1, &[0u8; 8]);
+    let icmp = build_icmpv6_error(1, 1, [0, 0, 0, 0], &embedded);
+    let hop_v6: Ipv6Addr = "2001:db8:ffff::1".parse().unwrap();
+    let mut v6_pkt = build_v6_with_l4(hop_v6, client_v6, PROTO_ICMPV6_C, 64, &icmp);
+    v6_pkt[42..44].copy_from_slice(&[0, 0]);
+    let s = checksum16_ipv6_pseudo(hop_v6, client_v6, PROTO_ICMPV6_C, &v6_pkt[40..]);
+    v6_pkt[42..44].copy_from_slice(&s.to_be_bytes());
+
+    let v4 = translate_v6_to_v4(&v6_pkt, snat_v4, dst_v4, false)
+        .expect("ICMPv6 admin-prohibited must translate, not drop");
+    assert_eq!(v4[20], 3, "ICMPv4 Destination Unreachable type");
+    assert_eq!(v4[21], 10, "ICMPv4 comm admin prohibited code");
+    assert_eq!(checksum16(&v4[20..]), 0);
+}
+
+// === regression: echo still works (no behavior change) ======================
+
+#[test]
+fn nat64_icmp_echo_unaffected_by_error_path() {
+    // The echo path must remain byte-correct after the error-path refactor.
+    let src_v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+    let dst_v6: Ipv6Addr = "64:ff9b::0808:0808".parse().unwrap();
+    let snat_v4 = Ipv4Addr::new(198, 51, 100, 1);
+    let dst_v4 = Ipv4Addr::new(8, 8, 8, 8);
+    let mut icmp = vec![0u8; 8];
+    icmp[0] = ICMPV6_ECHO_REQUEST;
+    icmp[4..6].copy_from_slice(&0x1234u16.to_be_bytes());
+    icmp[6..8].copy_from_slice(&0x0001u16.to_be_bytes());
+    let mut pkt = build_v6_with_l4(src_v6, dst_v6, PROTO_ICMPV6_C, 64, &icmp);
+    let s = checksum16_ipv6_pseudo(src_v6, dst_v6, PROTO_ICMPV6_C, &pkt[40..]);
+    pkt[42..44].copy_from_slice(&s.to_be_bytes());
+
+    let v4 = translate_v6_to_v4(&pkt, snat_v4, dst_v4, false).expect("echo translate");
+    assert_eq!(v4[20], ICMP_ECHO_REQUEST);
+    assert_eq!(v4.len(), 20 + 8, "echo length unchanged");
+    assert_eq!(checksum16(&v4[20..]), 0);
+}
+
+#[test]
+fn nat64_truncated_icmp_error_header_dropped_not_panicked() {
+    // A Packet-Too-Big / Frag-Needed message with a truncated rest-of-header
+    // (< 8 ICMP bytes) must be dropped, never panic on an out-of-bounds index
+    // of the attacker-controlled MTU word.
+    let src_v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+    let dst_v6: Ipv6Addr = "64:ff9b::0808:0808".parse().unwrap();
+    let snat_v4 = Ipv4Addr::new(198, 51, 100, 1);
+    let dst_v4 = Ipv4Addr::new(8, 8, 8, 8);
+    // ICMPv6 PTB header truncated to 6 bytes (no full MTU word).
+    let icmp = vec![2u8, 0, 0, 0, 0, 0];
+    let mut pkt = build_v6_with_l4(src_v6, dst_v6, PROTO_ICMPV6_C, 64, &icmp);
+    let s = checksum16_ipv6_pseudo(src_v6, dst_v6, PROTO_ICMPV6_C, &pkt[40..]);
+    pkt[42..44].copy_from_slice(&s.to_be_bytes());
+    assert!(
+        translate_v6_to_v4(&pkt, snat_v4, dst_v4, false).is_none(),
+        "truncated ICMPv6 PTB must be dropped"
+    );
+
+    // ICMPv4 Frag-Needed header truncated to 6 bytes.
+    let server_v4 = Ipv4Addr::new(192, 0, 2, 5);
+    let server_v6: Ipv6Addr = "64:ff9b::c000:0205".parse().unwrap();
+    let client_v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+    let pool_v4 = Ipv4Addr::new(198, 51, 100, 1);
+    let icmp4 = vec![3u8, 4, 0, 0, 0, 0]; // 6 bytes, no next-hop MTU word
+    let mut p4 = build_v4_with_l4(server_v4, pool_v4, PROTO_ICMP_C, 64, &icmp4);
+    let s4 = checksum16(&p4[20..]);
+    p4[22..24].copy_from_slice(&s4.to_be_bytes());
+    assert!(
+        translate_v4_to_v6(&p4, server_v6, client_v6).is_none(),
+        "truncated ICMPv4 Frag-Needed must be dropped"
+    );
+}
+
+#[test]
+fn nat64_unsupported_icmpv6_type_still_dropped() {
+    // A link-local-only ICMPv6 type (e.g. Neighbor Solicitation 135) has no
+    // IPv4 mapping and must still be dropped (None), not mistranslated.
+    let src_v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+    let dst_v6: Ipv6Addr = "64:ff9b::0808:0808".parse().unwrap();
+    let snat_v4 = Ipv4Addr::new(198, 51, 100, 1);
+    let dst_v4 = Ipv4Addr::new(8, 8, 8, 8);
+    let icmp = vec![135u8, 0, 0, 0, 0, 0, 0, 0]; // Neighbor Solicitation
+    let mut pkt = build_v6_with_l4(src_v6, dst_v6, PROTO_ICMPV6_C, 64, &icmp);
+    let s = checksum16_ipv6_pseudo(src_v6, dst_v6, PROTO_ICMPV6_C, &pkt[40..]);
+    pkt[42..44].copy_from_slice(&s.to_be_bytes());
+    assert!(
+        translate_v6_to_v4(&pkt, snat_v4, dst_v4, false).is_none(),
+        "unmappable ICMPv6 type must be dropped"
+    );
+}

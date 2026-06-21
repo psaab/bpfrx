@@ -1,6 +1,24 @@
 //! NAT64 (RFC 6052 / RFC 7915) stateless IPv4↔IPv6 translation for the
 //! userspace dataplane.
 //!
+//! ## ICMP error translation (#2219)
+//!
+//! Both directions translate ICMP *error* messages, not only echo
+//! request/reply: Destination-Unreachable, Time-Exceeded, Parameter-Problem,
+//! and Packet-Too-Big↔Fragmentation-Needed (with the 20-byte MTU adjustment for
+//! the NAT64 header-size delta, clamped to the IPv6 minimum link MTU on the
+//! v4→v6 side) per the RFC 7915 §4.2 (v4→v6) and §5.2 (v6→v4) type/code maps.
+//! An ICMP error carries the original (return-direction) packet quoted inside
+//! it, so the EMBEDDED IP header (+leading L4 bytes) is also NAT64-translated:
+//! its addresses are mapped v6↔v4 and its lengths/checksum fixed, because the
+//! embedded packet is the return-direction tuple a receiver matches the error
+//! against. Without this, PMTUD blackholes (a server's Fragmentation-Needed
+//! never reaches the v6 client) and traceroute shows no hops across NAT64.
+//! The embedded packet is translated through a fixed stack scratch buffer
+//! ([`MAX_EMBEDDED_LEN`]) — NO per-packet heap allocation, consistent with the
+//! zero-alloc invariant below. Types with no IPv4/IPv6 analogue (NDP, MLD,
+//! ICMPv4 redirect/source-quench, etc.) are dropped, not mistranslated.
+//!
 //! Two module invariants the rest of the crate relies on:
 //!
 //! * **No per-packet heap allocation on the translate hot path (#2211).** The
@@ -257,8 +275,42 @@ const ICMPV6_ECHO_REQUEST: u8 = 128;
 const ICMPV6_ECHO_REPLY: u8 = 129;
 const ICMP_ECHO_REQUEST: u8 = 8;
 const ICMP_ECHO_REPLY: u8 = 0;
+
+// ICMPv6 error message types (RFC 4443).
+const ICMPV6_DEST_UNREACHABLE: u8 = 1;
+const ICMPV6_PACKET_TOO_BIG: u8 = 2;
+const ICMPV6_TIME_EXCEEDED: u8 = 3;
+const ICMPV6_PARAMETER_PROBLEM: u8 = 4;
+
+// ICMPv4 error message types (RFC 792).
+const ICMP_DEST_UNREACHABLE: u8 = 3;
+const ICMP_TIME_EXCEEDED: u8 = 11;
+const ICMP_PARAMETER_PROBLEM: u8 = 12;
+
+/// Lower bound a Packet-Too-Big MTU is clamped to when it crosses the NAT64
+/// boundary. The IPv6 minimum link MTU (RFC 8200) — a translated v6 client
+/// must never be told to use a path MTU below this.
+const IPV6_MIN_MTU: u32 = 1280;
+
+/// Upper bound an IPv6 Packet-Too-Big MTU is clamped to when translated to an
+/// IPv4 Fragmentation-Needed Next-Hop-MTU. The v4 datagram is 20 bytes smaller
+/// than the v6 one it was translated from (40-byte v6 header vs 20-byte v4
+/// header), so a v6 path-MTU `M` corresponds to a v4 next-hop MTU of `M - 20`
+/// (RFC 7915 5.2). Subtracting 20 keeps the advertised v4 MTU consistent with
+/// the smaller translated datagram.
+const NAT64_HEADER_DELTA: u32 = 20;
+
 use crate::ip_proto::{PROTO_ICMP, PROTO_ICMPV6, PROTO_TCP, PROTO_UDP};
 use std::sync::atomic::AtomicU32;
+
+/// Maximum embedded (quoted) original-packet bytes the ICMP-error translator
+/// processes. RFC 4443 lets an ICMPv6 error quote "as much of the invoking
+/// packet as possible" up to the IPv6 minimum MTU (1280). The translated
+/// embedded packet is built into a fixed stack scratch buffer — NO per-packet
+/// heap allocation (#2211) — sized for the v6 worst case; v4→v6 embedded
+/// translation grows the header by 20 bytes, so the scratch headroom must cover
+/// `1280 + 20`.
+const MAX_EMBEDDED_LEN: usize = 1280 + NAT64_HEADER_DELTA as usize;
 
 /// Process-global IPv4 Fragment Identification generator for translated,
 /// *fragmentable* (DF=0) IPv6->IPv4 packets.
@@ -410,14 +462,18 @@ pub(crate) fn write_v6_to_v4_into(
     let l4_payload = packet.get(40..40 + payload_len)?;
     let new_ttl = hop_limit - 1;
 
-    // Total IPv4 packet length: 20 (header) + L4 payload.
-    let ipv4_total_len = 20usize + l4_payload.len();
-    let out = dst.get_mut(..ipv4_total_len)?;
+    // The L4 length is normally unchanged, but an ICMP *error* message embeds
+    // the original (return-direction) packet, which is itself NAT64-translated
+    // v6->v4 and so SHRINKS by 20 bytes. The translated L4 therefore never
+    // exceeds the input L4, so reserving `20 + l4_payload.len()` is a safe upper
+    // bound; the exact written length is computed below.
+    let max_total_len = 20usize + l4_payload.len();
+    let out = dst.get_mut(..max_total_len)?;
 
-    // Build IPv4 header.
+    // Build IPv4 header (total length + checksum patched after the L4 length is
+    // known, since an ICMP-error translation can shrink the L4).
     out[0] = 0x45; // version=4, IHL=5
     out[1] = traffic_class; // DSCP/ECN copied from IPv6 traffic class (RFC 7915 §5)
-    out[2..4].copy_from_slice(&(ipv4_total_len as u16).to_be_bytes());
     // DF policy is the option-gated LOCAL choice (not the size-driven RFC 7915
     // 5.1 selection). Either way the flags+frag-offset word (bytes 6-7) and the
     // Identification field (bytes 4-5) must stay mutually consistent:
@@ -442,16 +498,30 @@ pub(crate) fn write_v6_to_v4_into(
     out[12..16].copy_from_slice(&snat_v4.octets());
     out[16..20].copy_from_slice(&dst_v4.octets());
 
-    // Copy L4 payload directly into the output L4 region (single copy).
-    out[20..].copy_from_slice(l4_payload);
+    // Translate the L4 region into the output and learn its final length.
+    let l4_len = if next_header == PROTO_ICMPV6 {
+        // The embedded (quoted) original packet is the RETURN-direction packet:
+        // its addresses are the outer error's addresses swapped, so v6->v4 the
+        // embedded src maps to `dst_v4` and the embedded dst maps to `snat_v4`.
+        let embedded = EmbeddedV6ToV4 {
+            mapped_embedded_src: dst_v4,
+            mapped_embedded_dst: snat_v4,
+        };
+        translate_icmpv6_message_to_icmpv4(&mut out[20..], l4_payload, &embedded)?
+    } else {
+        // Non-ICMP: copy L4 payload verbatim (single copy).
+        out[20..max_total_len].copy_from_slice(l4_payload);
+        l4_payload.len()
+    };
 
-    // ICMP type/code translation.
-    if next_header == PROTO_ICMPV6 {
-        translate_icmpv6_to_icmpv4(&mut out[20..])?;
-    }
+    let ipv4_total_len = 20 + l4_len;
+    out[2..4].copy_from_slice(&(ipv4_total_len as u16).to_be_bytes());
 
-    // Recompute L4 checksum (pseudo-header changes from IPv6 to IPv4).
-    recompute_l4_checksum_after_nat64_v6_to_v4(out, ipv4_protocol)?;
+    // Recompute L4 checksum (pseudo-header changes from IPv6 to IPv4). ICMPv4
+    // does not use a pseudo-header, so its checksum is recomputed inside
+    // `translate_icmpv6_message_to_icmpv4`; the generic helper still rewrites it
+    // identically and is a no-op for the already-correct ICMP case.
+    recompute_l4_checksum_after_nat64_v6_to_v4(&mut out[..ipv4_total_len], ipv4_protocol)?;
 
     // Compute IPv4 header checksum.
     let hdr_sum = checksum16(&out[..20]);
@@ -478,10 +548,12 @@ pub(crate) fn translate_v4_to_v6(
     src_v6: Ipv6Addr,
     dst_v6: Ipv6Addr,
 ) -> Option<Vec<u8>> {
-    // IPv4→IPv6 grows by 20 bytes (the IPv6 header is 40 vs the 20-byte IPv4
-    // header), so the output is at most `packet.len() + 20`. Allocate that
-    // upper bound, then truncate to the exact written length.
-    let mut out = vec![0u8; packet.len().saturating_add(20)];
+    // IPv4→IPv6 grows the outer header by 20 bytes (40-byte v6 header vs the
+    // 20-byte v4 header). An ICMP-error message ALSO grows its embedded quoted
+    // packet by another 20 bytes (the embedded v4 header expands to a v6
+    // header). The worst-case output is therefore `packet.len() + 40`. Allocate
+    // that upper bound, then truncate to the exact written length.
+    let mut out = vec![0u8; packet.len().saturating_add(2 * NAT64_HEADER_DELTA as usize)];
     let written = write_v4_to_v6_into(&mut out, packet, src_v6, dst_v6)?;
     out.truncate(written);
     Some(out)
@@ -540,72 +612,541 @@ pub(crate) fn write_v4_to_v6_into(
     };
 
     let new_hop_limit = ttl - 1;
-    let ipv6_payload_len = l4_payload.len() as u16;
-    let ipv6_total_len = 40 + l4_payload.len();
-    let out = dst.get_mut(..ipv6_total_len)?;
 
-    // Build IPv6 header. The 8-bit traffic class straddles bytes 0-1: TC[7:4]
-    // in the low nibble of byte 0 (alongside the version=6 nibble) and TC[3:0]
-    // in the high nibble of byte 1 (alongside the flow-label high nibble, left
-    // at 0). Mirrors apply_dscp_rewrite_to_frame in afxdp/frame/mod.rs:133-134.
-    // The caller's buffer may be reused (a TX UMEM frame), so write every byte
-    // of the IPv6 header explicitly rather than relying on a zero-initialized
-    // destination: zero byte 1's low nibble + bytes 2-3 (the flow label).
-    out[0] = 0x60 | (tos >> 4); // version=6 | TC[7:4]
-    out[1] = (tos & 0x0f) << 4; // TC[3:0] | flow-label high nibble (0)
-    out[2] = 0; // flow label
-    out[3] = 0; // flow label
-    out[4..6].copy_from_slice(&ipv6_payload_len.to_be_bytes());
-    out[6] = next_header;
-    out[7] = new_hop_limit;
-    out[8..24].copy_from_slice(&src_v6.octets());
-    out[24..40].copy_from_slice(&dst_v6.octets());
+    // Build the 40-byte IPv6 header. The 8-bit traffic class straddles bytes
+    // 0-1: TC[7:4] in the low nibble of byte 0 (alongside the version=6 nibble)
+    // and TC[3:0] in the high nibble of byte 1 (alongside the flow-label high
+    // nibble, left at 0). Mirrors apply_dscp_rewrite_to_frame in
+    // afxdp/frame/mod.rs:133-134. The caller's buffer may be reused (a TX UMEM
+    // frame), so write every byte of the IPv6 header explicitly rather than
+    // relying on a zero-initialized destination: zero byte 1's low nibble +
+    // bytes 2-3 (the flow label). The payload-length field (bytes 4-5) is
+    // patched after the L4 length is known — an ICMP-error translation grows
+    // the embedded packet by 20 bytes.
+    let hdr = dst.get_mut(..40)?;
+    hdr[0] = 0x60 | (tos >> 4); // version=6 | TC[7:4]
+    hdr[1] = (tos & 0x0f) << 4; // TC[3:0] | flow-label high nibble (0)
+    hdr[2] = 0; // flow label
+    hdr[3] = 0; // flow label
+    hdr[6] = next_header;
+    hdr[7] = new_hop_limit;
+    hdr[8..24].copy_from_slice(&src_v6.octets());
+    hdr[24..40].copy_from_slice(&dst_v6.octets());
 
-    // Copy L4 payload directly into the output L4 region (single copy).
-    out[40..].copy_from_slice(l4_payload);
+    // Translate the L4 region into the output tail and learn its final length.
+    // `get_mut(40..)` only borrows the space actually present in `dst`; the
+    // ICMP-error path may need up to 20 bytes more than the input L4 (embedded
+    // packet growth), so the frame builder over-allocates by 20.
+    let l4_dst = dst.get_mut(40..)?;
+    let l4_len = if protocol == PROTO_ICMP {
+        // The embedded (quoted) original packet is the RETURN-direction packet:
+        // its addresses are the outer error's addresses swapped. v4->v6 the
+        // embedded src (our SNAT pool v4) maps to the original v6 client
+        // (`dst_v6`), and the embedded dst (the v4 server) maps to the NAT64
+        // prefix + server address — the prefix being the top 96 bits of the
+        // outer translated source (`src_v6` = prefix::server).
+        let mut prefix_bytes = [0u8; 12];
+        prefix_bytes.copy_from_slice(&src_v6.octets()[..12]);
+        let embedded = EmbeddedV4ToV6 {
+            mapped_embedded_src: dst_v6,
+            prefix_bytes,
+        };
+        translate_icmpv4_message_to_icmpv6(l4_dst, l4_payload, &embedded)?
+    } else {
+        // Non-ICMP: copy L4 payload verbatim (single copy).
+        l4_dst.get_mut(..l4_payload.len())?.copy_from_slice(l4_payload);
+        l4_payload.len()
+    };
 
-    // ICMP type/code translation.
-    if protocol == PROTO_ICMP {
-        translate_icmpv4_to_icmpv6(&mut out[40..])?;
-    }
+    let ipv6_total_len = 40 + l4_len;
+    dst[4..6].copy_from_slice(&(l4_len as u16).to_be_bytes());
 
     // Recompute L4 checksum (pseudo-header changes from IPv4 to IPv6).
-    recompute_l4_checksum_after_nat64_v4_to_v6(out, next_header)?;
+    recompute_l4_checksum_after_nat64_v4_to_v6(&mut dst[..ipv6_total_len], next_header)?;
 
     Some(ipv6_total_len)
 }
 
-/// Translate ICMPv6 type/code to ICMPv4.
-fn translate_icmpv6_to_icmpv4(icmp: &mut [u8]) -> Option<()> {
-    if icmp.len() < 4 {
-        return None;
+/// Map an ICMPv6 error type/code to its ICMPv4 equivalent per RFC 7915 §5.2.
+/// Returns `None` for ICMPv6 types that have no IPv4 mapping (e.g. NDP, MLD —
+/// which are link-local and never cross the translator) so the caller drops
+/// them rather than emitting a malformed ICMPv4 error.
+///
+/// Packet-Too-Big (type 2) is handled separately by the caller because it also
+/// rewrites the MTU field, so it is intentionally absent here.
+fn map_icmpv6_error_to_icmpv4(icmpv6_type: u8, icmpv6_code: u8) -> Option<(u8, u8)> {
+    match icmpv6_type {
+        ICMPV6_DEST_UNREACHABLE => {
+            // RFC 7915 5.2: ICMPv6 Destination Unreachable codes map onto the
+            // ICMPv4 Destination Unreachable code space.
+            let v4_code = match icmpv6_code {
+                0 => 1, // no route to destination       -> host unreachable
+                1 => 10, // communication administratively prohibited
+                //          -> communication with destination host
+                //             administratively prohibited
+                2 => 1, // beyond scope of source address -> host unreachable
+                3 => 1, // address unreachable            -> host unreachable
+                4 => 3, // port unreachable               -> port unreachable
+                _ => return None,
+            };
+            Some((ICMP_DEST_UNREACHABLE, v4_code))
+        }
+        ICMPV6_TIME_EXCEEDED => {
+            // RFC 7915 5.2: Time Exceeded (3) maps 1:1 with its code preserved
+            // (0 = hop limit exceeded, 1 = fragment reassembly time exceeded).
+            Some((ICMP_TIME_EXCEEDED, icmpv6_code))
+        }
+        ICMPV6_PARAMETER_PROBLEM => {
+            // RFC 7915 5.2: Parameter Problem.
+            match icmpv6_code {
+                // code 0 (erroneous header field) -> ICMPv4 Parameter Problem
+                // code 0 (pointer indicates the error). The embedded-pointer
+                // remap (RFC 7915 Figure 6) is not performed; the pointer is a
+                // best-effort hint, and Junos/vSRX parity does not depend on it.
+                0 => Some((ICMP_PARAMETER_PROBLEM, 0)),
+                // code 1 (unrecognized Next Header) -> ICMPv4 Destination
+                // Unreachable / Protocol Unreachable.
+                1 => Some((ICMP_DEST_UNREACHABLE, 2)),
+                // code 2 (unrecognized IPv6 option) is silently dropped per
+                // RFC 7915 — it has no IPv4 analogue.
+                _ => None,
+            }
+        }
+        _ => None,
     }
-    let icmpv6_type = icmp[0];
-    let (icmpv4_type, icmpv4_code) = match icmpv6_type {
-        ICMPV6_ECHO_REQUEST => (ICMP_ECHO_REQUEST, 0u8),
-        ICMPV6_ECHO_REPLY => (ICMP_ECHO_REPLY, 0u8),
-        _ => return None, // Unsupported ICMPv6 type
-    };
-    icmp[0] = icmpv4_type;
-    icmp[1] = icmpv4_code;
-    // Checksum will be recomputed below.
-    Some(())
 }
 
-/// Translate ICMPv4 type/code to ICMPv6.
-fn translate_icmpv4_to_icmpv6(icmp: &mut [u8]) -> Option<()> {
-    if icmp.len() < 4 {
+/// Map an ICMPv4 error type/code to its ICMPv6 equivalent per RFC 7915 §4.2.
+/// Returns `None` for ICMPv4 types/codes that have no IPv6 mapping so the
+/// caller drops them. Fragmentation-Needed (type 3 code 4) is handled
+/// separately by the caller because it rewrites the MTU field.
+fn map_icmpv4_error_to_icmpv6(icmpv4_type: u8, icmpv4_code: u8) -> Option<(u8, u8)> {
+    match icmpv4_type {
+        ICMP_DEST_UNREACHABLE => {
+            // RFC 7915 4.2: ICMPv4 Destination Unreachable codes map onto the
+            // ICMPv6 Destination Unreachable / Packet Too Big code space.
+            // (code 4, Fragmentation Needed, is handled by the caller — it
+            // becomes Packet Too Big with an MTU rewrite.)
+            let mapped = match icmpv4_code {
+                0 => (ICMPV6_DEST_UNREACHABLE, 0), // net unreachable -> no route
+                1 => (ICMPV6_DEST_UNREACHABLE, 0), // host unreachable -> no route
+                2 => (ICMPV6_PARAMETER_PROBLEM, 1), // protocol unreachable ->
+                //  parameter problem, unrecognized Next Header
+                3 => (ICMPV6_DEST_UNREACHABLE, 4), // port unreachable -> port unreachable
+                5 => (ICMPV6_DEST_UNREACHABLE, 0), // source route failed -> no route
+                6 => (ICMPV6_DEST_UNREACHABLE, 0), // dest network unknown -> no route
+                7 => (ICMPV6_DEST_UNREACHABLE, 0), // dest host unknown -> no route
+                8 => (ICMPV6_DEST_UNREACHABLE, 0), // src host isolated -> no route
+                11 => (ICMPV6_DEST_UNREACHABLE, 0), // net unreachable for TOS -> no route
+                12 => (ICMPV6_DEST_UNREACHABLE, 0), // host unreachable for TOS -> no route
+                9 | 10 | 13 | 15 => (ICMPV6_DEST_UNREACHABLE, 1), // admin prohibited
+                _ => return None,
+            };
+            Some(mapped)
+        }
+        ICMP_TIME_EXCEEDED => {
+            // RFC 7915 4.2: Time Exceeded (11) maps 1:1 with its code preserved.
+            Some((ICMPV6_TIME_EXCEEDED, icmpv4_code))
+        }
+        ICMP_PARAMETER_PROBLEM => {
+            // RFC 7915 4.2: Parameter Problem (12).
+            match icmpv4_code {
+                // code 0 (pointer indicates error) and code 2 (bad length) ->
+                // ICMPv6 Parameter Problem, erroneous header field.
+                0 | 2 => Some((ICMPV6_PARAMETER_PROBLEM, 0)),
+                // code 1 (missing required option) has no IPv6 analogue.
+                _ => None,
+            }
+        }
+        _ => return None,
+    }
+}
+
+/// Address mapping for the embedded (quoted) packet of an ICMPv6 error being
+/// translated v6->v4. The embedded packet is the RETURN-direction original
+/// packet whose addresses are the outer error's addresses swapped, so both
+/// embedded addresses are known constants derived from the outer translation —
+/// no NAT64 prefix arithmetic is needed in this direction (the outer src/dst v4
+/// already carry the fully-mapped values).
+struct EmbeddedV6ToV4 {
+    /// IPv4 the embedded IPv6 source maps to.
+    mapped_embedded_src: Ipv4Addr,
+    /// IPv4 the embedded IPv6 destination maps to.
+    mapped_embedded_dst: Ipv4Addr,
+}
+
+/// Address mapping for the embedded (quoted) packet of an ICMPv4 error being
+/// translated v4->v6. The embedded packet is the RETURN-direction original
+/// packet: its IPv4 source (our SNAT pool) maps to the original v6 client
+/// (`mapped_embedded_src`); its IPv4 destination (the v4 server) maps to the
+/// NAT64 prefix + that destination (`prefix_bytes` :: dst-v4).
+struct EmbeddedV4ToV6 {
+    /// IPv6 the embedded IPv4 source maps to (the original v6 client).
+    mapped_embedded_src: Ipv6Addr,
+    /// NAT64 /96 prefix the embedded IPv4 destination is composed onto.
+    prefix_bytes: [u8; 12],
+}
+
+/// Translate a complete ICMPv6 message (`src`, starting at the ICMPv6 type
+/// byte) into ICMPv4 in `dst`, returning the written ICMPv4 message length.
+///
+/// Handles echo request/reply (length unchanged) AND error messages
+/// (Destination Unreachable, Packet Too Big, Time Exceeded, Parameter Problem)
+/// per RFC 7915 §5.2 — for an error the leading 8-byte ICMP header is followed
+/// by the quoted original packet, whose embedded IPv6 header is NAT64-translated
+/// to IPv4 (addresses mapped, lengths/checksums fixed). The ICMPv4 checksum is
+/// computed here (ICMPv4 has no pseudo-header), so the caller's generic
+/// recompute is a consistent no-op over the already-correct value.
+///
+/// Allocation-free: the embedded packet is translated through a fixed stack
+/// scratch buffer (`MAX_EMBEDDED_LEN`), never the heap (#2211). `None` aborts
+/// the frame (drop) for an untranslatable type/code or a malformed/oversized
+/// embedded packet.
+fn translate_icmpv6_message_to_icmpv4(
+    dst: &mut [u8],
+    src: &[u8],
+    embedded: &EmbeddedV6ToV4,
+) -> Option<usize> {
+    if src.len() < 4 {
         return None;
     }
-    let icmpv4_type = icmp[0];
-    let (icmpv6_type, icmpv6_code) = match icmpv4_type {
-        ICMP_ECHO_REQUEST => (ICMPV6_ECHO_REQUEST, 0u8),
-        ICMP_ECHO_REPLY => (ICMPV6_ECHO_REPLY, 0u8),
+    let icmpv6_type = src[0];
+    let icmpv6_code = src[1];
+
+    match icmpv6_type {
+        ICMPV6_ECHO_REQUEST | ICMPV6_ECHO_REPLY => {
+            // Echo: length preserved, only type/code change.
+            let out = dst.get_mut(..src.len())?;
+            out.copy_from_slice(src);
+            out[0] = if icmpv6_type == ICMPV6_ECHO_REQUEST {
+                ICMP_ECHO_REQUEST
+            } else {
+                ICMP_ECHO_REPLY
+            };
+            out[1] = 0;
+            finalize_icmpv4_checksum(out);
+            Some(out.len())
+        }
+        ICMPV6_PACKET_TOO_BIG => {
+            // An ICMP error always carries the full 8-byte header (type/code/
+            // checksum + the 4-byte rest-of-header). `src` is packet data, so
+            // reject a truncated header before indexing the MTU word.
+            if src.len() < 8 {
+                return None;
+            }
+            // RFC 7915 5.2: ICMPv6 Packet Too Big (type 2) -> ICMPv4
+            // Destination Unreachable / Fragmentation Needed (type 3 code 4).
+            // The 4-byte "unused" word of an ICMPv6 PTB carries the MTU; the
+            // ICMPv4 Fragmentation-Needed instead carries the Next-Hop MTU in
+            // its low 16 bits (bytes 6-7), with bytes 4-5 unused (RFC 1191).
+            let mtu = u32::from_be_bytes([src[4], src[5], src[6], src[7]]);
+            // The translated v4 datagram is 20 bytes smaller than the v6 one, so
+            // advertise an MTU 20 bytes smaller (clamped to a sane 16-bit range
+            // and never below the v4 minimum). RFC 7915 5.2.
+            let v4_mtu = mtu.saturating_sub(NAT64_HEADER_DELTA).clamp(68, 0xffff) as u16;
+            write_icmpv4_error_with_embedded(
+                dst,
+                src,
+                ICMP_DEST_UNREACHABLE,
+                4,
+                [0, 0, (v4_mtu >> 8) as u8, v4_mtu as u8],
+                embedded,
+            )
+        }
+        ICMPV6_DEST_UNREACHABLE | ICMPV6_TIME_EXCEEDED | ICMPV6_PARAMETER_PROBLEM => {
+            let (v4_type, v4_code) = map_icmpv6_error_to_icmpv4(icmpv6_type, icmpv6_code)?;
+            // RFC 7915 5.2: the 4-byte rest-of-header is preserved verbatim for
+            // these types (the ICMPv6 Parameter-Problem pointer is NOT remapped
+            // — see map_icmpv6_error_to_icmpv4). Time-Exceeded / Dest-Unreach
+            // carry an unused word.
+            write_icmpv4_error_with_embedded(
+                dst, src, v4_type, v4_code, [0, 0, 0, 0], embedded,
+            )
+        }
+        _ => None, // NDP, MLD, etc. — never crosses the translator.
+    }
+}
+
+/// Translate a complete ICMPv4 message (`src`, starting at the ICMPv4 type
+/// byte) into ICMPv6 in `dst`, returning the written ICMPv6 message length.
+///
+/// The v6->v4 twin of [`translate_icmpv6_message_to_icmpv4`]; same contract.
+/// The ICMPv6 checksum is NOT computed here (it needs the IPv6 pseudo-header):
+/// the caller's `recompute_l4_checksum_after_nat64_v4_to_v6` finishes it over
+/// the full message, so this leaves the checksum field zeroed.
+fn translate_icmpv4_message_to_icmpv6(
+    dst: &mut [u8],
+    src: &[u8],
+    embedded: &EmbeddedV4ToV6,
+) -> Option<usize> {
+    if src.len() < 4 {
+        return None;
+    }
+    let icmpv4_type = src[0];
+    let icmpv4_code = src[1];
+
+    match icmpv4_type {
+        ICMP_ECHO_REQUEST | ICMP_ECHO_REPLY => {
+            let out = dst.get_mut(..src.len())?;
+            out.copy_from_slice(src);
+            out[0] = if icmpv4_type == ICMP_ECHO_REQUEST {
+                ICMPV6_ECHO_REQUEST
+            } else {
+                ICMPV6_ECHO_REPLY
+            };
+            out[1] = 0;
+            // Checksum is recomputed by the caller (needs the v6 pseudo-header).
+            out[2..4].copy_from_slice(&[0, 0]);
+            Some(out.len())
+        }
+        ICMP_DEST_UNREACHABLE if icmpv4_code == 4 => {
+            // An ICMP error always carries the full 8-byte header; reject a
+            // truncated header before indexing the Next-Hop MTU word.
+            if src.len() < 8 {
+                return None;
+            }
+            // RFC 7915 4.2: ICMPv4 Fragmentation Needed (type 3 code 4) ->
+            // ICMPv6 Packet Too Big (type 2). The Next-Hop MTU is in the low
+            // 16 bits (bytes 6-7) of the ICMPv4 rest-of-header (RFC 1191); the
+            // ICMPv6 PTB carries the MTU as a full 32-bit word (bytes 4-7).
+            let v4_mtu = u16::from_be_bytes([src[6], src[7]]) as u32;
+            // The translated v6 datagram is 20 bytes larger than the v4 one, so
+            // the v6 path MTU is 20 bytes larger; clamp to the v6 minimum link
+            // MTU (1280) so a v6 client is never told to go below it.
+            let v6_mtu = v4_mtu.saturating_add(NAT64_HEADER_DELTA).max(IPV6_MIN_MTU);
+            write_icmpv6_error_with_embedded(
+                dst,
+                src,
+                ICMPV6_PACKET_TOO_BIG,
+                0,
+                v6_mtu.to_be_bytes(),
+                embedded,
+            )
+        }
+        ICMP_DEST_UNREACHABLE | ICMP_TIME_EXCEEDED | ICMP_PARAMETER_PROBLEM => {
+            let (v6_type, v6_code) = map_icmpv4_error_to_icmpv6(icmpv4_type, icmpv4_code)?;
+            write_icmpv6_error_with_embedded(
+                dst, src, v6_type, v6_code, [0, 0, 0, 0], embedded,
+            )
+        }
+        _ => None,
+    }
+}
+
+/// Build an ICMPv4 error message (8-byte header + translated embedded packet)
+/// in `dst` from the ICMPv6 error `src`. `rest_of_header` is the 4-byte word
+/// after type/code/checksum. Returns the written length, or `None` on a
+/// malformed/oversized embedded packet.
+fn write_icmpv4_error_with_embedded(
+    dst: &mut [u8],
+    src: &[u8],
+    v4_type: u8,
+    v4_code: u8,
+    rest_of_header: [u8; 4],
+    embedded: &EmbeddedV6ToV4,
+) -> Option<usize> {
+    // The quoted original packet starts after the 8-byte ICMPv6 error header.
+    let embedded_in = src.get(8..)?;
+    // Translate the embedded IPv6 header (+leading L4) into a stack scratch
+    // buffer — no heap alloc on the hot path (#2211).
+    let mut scratch = [0u8; MAX_EMBEDDED_LEN];
+    let embedded_len = translate_embedded_v6_to_v4(&mut scratch, embedded_in, embedded)?;
+
+    let total = 8 + embedded_len;
+    let out = dst.get_mut(..total)?;
+    out[0] = v4_type;
+    out[1] = v4_code;
+    out[2..4].copy_from_slice(&[0, 0]); // checksum (computed below)
+    out[4..8].copy_from_slice(&rest_of_header);
+    out[8..total].copy_from_slice(&scratch[..embedded_len]);
+    finalize_icmpv4_checksum(out);
+    Some(total)
+}
+
+/// Build an ICMPv6 error message (8-byte header + translated embedded packet)
+/// in `dst` from the ICMPv4 error `src`. The ICMPv6 checksum is left zeroed —
+/// the caller recomputes it with the IPv6 pseudo-header.
+fn write_icmpv6_error_with_embedded(
+    dst: &mut [u8],
+    src: &[u8],
+    v6_type: u8,
+    v6_code: u8,
+    rest_of_header: [u8; 4],
+    embedded: &EmbeddedV4ToV6,
+) -> Option<usize> {
+    let embedded_in = src.get(8..)?;
+    let mut scratch = [0u8; MAX_EMBEDDED_LEN];
+    let embedded_len = translate_embedded_v4_to_v6(&mut scratch, embedded_in, embedded)?;
+
+    let total = 8 + embedded_len;
+    let out = dst.get_mut(..total)?;
+    out[0] = v6_type;
+    out[1] = v6_code;
+    out[2..4].copy_from_slice(&[0, 0]); // checksum recomputed by caller
+    out[4..8].copy_from_slice(&rest_of_header);
+    out[8..total].copy_from_slice(&scratch[..embedded_len]);
+    Some(total)
+}
+
+/// Translate the embedded (quoted) IPv6 header + leading L4 bytes of an ICMPv6
+/// error into IPv4, writing into `dst` and returning the written length.
+///
+/// RFC 7915 §5.2: the embedded packet is translated like a normal v6->v4 packet
+/// but with the embedded addresses' pre-computed mappings. The embedded L4 is
+/// quoted (often truncated to 8 bytes), so its own checksum is left unchanged —
+/// it is informational and a receiver does not validate the quoted L4 checksum.
+/// The embedded packet is bounded to `MAX_EMBEDDED_LEN`; an oversized or
+/// truncated-below-the-IPv6-header quote returns `None`.
+fn translate_embedded_v6_to_v4(
+    dst: &mut [u8],
+    embedded: &[u8],
+    map: &EmbeddedV6ToV4,
+) -> Option<usize> {
+    if embedded.len() < 40 {
+        return None; // need a full IPv6 header to translate
+    }
+    // Clamp the quoted bytes to the scratch capacity (a hostile or large quote
+    // must not overflow the fixed buffer); a clamp shortens the quote, which is
+    // always legal for an ICMP error.
+    let quote_in = &embedded[..embedded.len().min(MAX_EMBEDDED_LEN)];
+
+    let payload_len = u16::from_be_bytes([quote_in[4], quote_in[5]]) as usize;
+    let next_header = quote_in[6];
+    let hop_limit = quote_in[7];
+    let traffic_class = ((quote_in[0] & 0x0f) << 4) | (quote_in[1] >> 4);
+
+    // Map protocol (same set the outer translator supports). An embedded packet
+    // carrying an unsupported protocol can't be faithfully translated -> drop.
+    let ipv4_protocol = match next_header {
+        PROTO_ICMPV6 => PROTO_ICMP,
+        PROTO_TCP | PROTO_UDP => next_header,
         _ => return None,
     };
-    icmp[0] = icmpv6_type;
-    icmp[1] = icmpv6_code;
-    Some(())
+
+    // The quoted L4 is whatever bytes are present after the IPv6 header, capped
+    // by both the IPv6 payload_len field and the bytes actually quoted.
+    let avail_l4 = quote_in.len() - 40;
+    let l4_len = payload_len.min(avail_l4);
+    let l4 = quote_in.get(40..40 + l4_len)?;
+
+    let total = 20 + l4_len;
+    let out = dst.get_mut(..total)?;
+    out[0] = 0x45;
+    out[1] = traffic_class;
+    out[2..4].copy_from_slice(&(total as u16).to_be_bytes());
+    out[4..6].copy_from_slice(&[0, 0]); // identification (quoted header)
+    out[6..8].copy_from_slice(&0x4000u16.to_be_bytes()); // DF
+    out[8] = hop_limit; // embedded hop limit copied verbatim (NOT decremented)
+    out[9] = ipv4_protocol;
+    out[10..12].copy_from_slice(&[0, 0]); // header checksum (computed below)
+    out[12..16].copy_from_slice(&map.mapped_embedded_src.octets());
+    out[16..20].copy_from_slice(&map.mapped_embedded_dst.octets());
+    out[20..total].copy_from_slice(l4);
+
+    // If the embedded protocol is ICMPv6, fix the embedded ICMP type byte so the
+    // quoted v4 packet is internally consistent (the quoted L4 checksum is left
+    // as-is — it is not validated by a receiver). Only the leading type/code are
+    // touched; a fuller embedded-ICMP translation is unnecessary for the quote.
+    if next_header == PROTO_ICMPV6 && l4_len >= 2 {
+        if let Some((t, c)) = embedded_icmpv6_type_to_icmpv4(out[20]) {
+            out[20] = t;
+            out[21] = c;
+        }
+    }
+
+    let hdr_sum = checksum16(&out[..20]);
+    out[10..12].copy_from_slice(&hdr_sum.to_be_bytes());
+    Some(total)
+}
+
+/// Translate the embedded (quoted) IPv4 header + leading L4 bytes of an ICMPv4
+/// error into IPv6, writing into `dst` and returning the written length. The
+/// v6->v4 twin of [`translate_embedded_v6_to_v4`]; same quote/checksum policy.
+fn translate_embedded_v4_to_v6(
+    dst: &mut [u8],
+    embedded: &[u8],
+    map: &EmbeddedV4ToV6,
+) -> Option<usize> {
+    if embedded.len() < 20 {
+        return None;
+    }
+    let ihl = ((embedded[0] & 0x0f) as usize) * 4;
+    if ihl < 20 || embedded.len() < ihl {
+        return None;
+    }
+    let quote_in = &embedded[..embedded.len().min(MAX_EMBEDDED_LEN - NAT64_HEADER_DELTA as usize)];
+    let tos = quote_in[1];
+    let ttl = quote_in[8];
+    let protocol = quote_in[9];
+    let total_len_field = u16::from_be_bytes([quote_in[2], quote_in[3]]) as usize;
+
+    let next_header = match protocol {
+        PROTO_ICMP => PROTO_ICMPV6,
+        PROTO_TCP | PROTO_UDP => protocol,
+        _ => return None,
+    };
+
+    // Quoted L4 bytes after the IPv4 header, capped by the advertised total
+    // length and what was actually quoted.
+    let end = total_len_field.clamp(ihl, quote_in.len());
+    let l4 = quote_in.get(ihl..end)?;
+    let l4_len = l4.len();
+
+    let total = 40 + l4_len;
+    let out = dst.get_mut(..total)?;
+    out[0] = 0x60 | (tos >> 4);
+    out[1] = (tos & 0x0f) << 4;
+    out[2] = 0;
+    out[3] = 0;
+    out[4..6].copy_from_slice(&(l4_len as u16).to_be_bytes());
+    out[6] = next_header;
+    out[7] = ttl; // embedded hop limit copied verbatim (NOT decremented)
+    // Embedded src (our SNAT pool v4) -> original v6 client.
+    out[8..24].copy_from_slice(&map.mapped_embedded_src.octets());
+    // Embedded dst (the v4 server) -> NAT64 prefix :: dst-v4.
+    out[24..36].copy_from_slice(&map.prefix_bytes);
+    out[36..40].copy_from_slice(&quote_in[16..20]);
+    out[40..total].copy_from_slice(l4);
+
+    if protocol == PROTO_ICMP && l4_len >= 2 {
+        if let Some((t, c)) = embedded_icmpv4_type_to_icmpv6(out[40]) {
+            out[40] = t;
+            out[41] = c;
+        }
+    }
+    Some(total)
+}
+
+/// Best-effort embedded ICMPv6->ICMPv4 type/code remap for the quoted L4 of an
+/// embedded packet (echo only, which is the realistic embedded-ICMP case for a
+/// PMTUD/traceroute error quoting a ping). Returns `None` to leave the byte
+/// untouched for anything else — the quoted L4 is informational.
+fn embedded_icmpv6_type_to_icmpv4(t: u8) -> Option<(u8, u8)> {
+    match t {
+        ICMPV6_ECHO_REQUEST => Some((ICMP_ECHO_REQUEST, 0)),
+        ICMPV6_ECHO_REPLY => Some((ICMP_ECHO_REPLY, 0)),
+        _ => None,
+    }
+}
+
+/// Best-effort embedded ICMPv4->ICMPv6 type/code remap (echo only); twin of
+/// [`embedded_icmpv6_type_to_icmpv4`].
+fn embedded_icmpv4_type_to_icmpv6(t: u8) -> Option<(u8, u8)> {
+    match t {
+        ICMP_ECHO_REQUEST => Some((ICMPV6_ECHO_REQUEST, 0)),
+        ICMP_ECHO_REPLY => Some((ICMPV6_ECHO_REPLY, 0)),
+        _ => None,
+    }
+}
+
+/// Zero then recompute the ICMPv4 checksum (no pseudo-header) over `icmp`.
+fn finalize_icmpv4_checksum(icmp: &mut [u8]) {
+    if icmp.len() < 4 {
+        return;
+    }
+    icmp[2..4].copy_from_slice(&[0, 0]);
+    let sum = checksum16(icmp);
+    icmp[2..4].copy_from_slice(&sum.to_be_bytes());
 }
 
 /// Recompute L4 checksum after IPv6→IPv4 translation.
@@ -810,12 +1351,14 @@ pub(crate) fn build_nat64_v4_to_v6_frame(
     let ipv4_packet = frame.get(l3..)?;
     let eth_len = if vlan_id > 0 { 18 } else { 14 };
     // Single output allocation (the unavoidable `TxRequest.bytes`): IPv4→IPv6
-    // grows the L3 by 20 bytes (40-byte IPv6 header vs 20-byte IPv4 header), so
-    // the IPv6 frame can never exceed `eth_len + ipv4_packet.len() + 20`.
-    // Allocate that upper bound, write the translated IPv6 L3 directly into the
-    // tail with the allocation-free `_into` core (no intermediate L3 `Vec`, no
-    // second copy — #2211), then truncate to the exact length.
-    let mut out = vec![0u8; eth_len + ipv4_packet.len().saturating_add(20)];
+    // grows the outer L3 header by 20 bytes (40-byte IPv6 header vs 20-byte IPv4
+    // header). An ICMP-error message ALSO grows its embedded quoted packet by
+    // another 20 bytes (#2219), so the worst-case IPv6 frame is
+    // `eth_len + ipv4_packet.len() + 40`. Allocate that upper bound, write the
+    // translated IPv6 L3 directly into the tail with the allocation-free `_into`
+    // core (no intermediate L3 `Vec`, no second copy — #2211), then truncate to
+    // the exact length.
+    let mut out = vec![0u8; eth_len + ipv4_packet.len().saturating_add(2 * NAT64_HEADER_DELTA as usize)];
     write_eth_header(&mut out, eth_dst, eth_src, vlan_id, 0x86dd)?;
     let written = write_v4_to_v6_into(&mut out[eth_len..], ipv4_packet, src_v6, dst_v6)?;
     out.truncate(eth_len + written);

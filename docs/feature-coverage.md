@@ -123,7 +123,7 @@ The exact admission boundary is documented in
 | Source NAT (interface + pool) | Interface and pool mode yes; userspace `address-persistent` uses a documented userspace-v1 hash. Non-HA per-pool `persistent-nat` lease reuse and pool exhaustion counters are implemented in helper-local runtime state; HA/restart persistence and cross-backend new-flow parity remain outside the current contract |
 | Destination NAT | Yes |
 | Static NAT (1:1) | Yes |
-| NAT64 (IPv6↔IPv4) | Yes |
+| NAT64 (IPv6↔IPv4) | Yes; translates ICMP echo AND error messages (Destination-Unreachable, Time-Exceeded, Packet-Too-Big↔Fragmentation-Needed with MTU adjustment, Parameter-Problem) per RFC 7915 §4.2/§5.2, including the embedded quoted packet — so PMTUD and traceroute work across the boundary (#2219) |
 | NPTv6 (RFC 6296) | Yes |
 | Screen/IDS (11 checks) | Yes; userspace SYN-cookie runtime is wired |
 | Firewall filters + policers | Filters yes; three-color policers admitted for the reviewed color-blind `then discard` slice; broader color-aware and non-drop action work is tracked as production hardening |

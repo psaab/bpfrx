@@ -8806,3 +8806,23 @@ top.
   go test ./pkg/frr/... ./pkg/config/... all green.
 - **File(s)**: pkg/frr/policy_render.go, pkg/frr/frr_test.go,
   pkg/frr/README.md
+
+- **Timestamp**: 2026-06-21
+  **Action**: #2219 — NAT64 ICMP error-message translation (PMTUD +
+  traceroute). Extended the NAT64 ICMP translators (nat64.rs) beyond
+  echo to translate ICMPv6↔ICMPv4 ERROR messages per RFC 7915 §4.2/§5.2:
+  Destination-Unreachable, Time-Exceeded, Parameter-Problem, and
+  Packet-Too-Big↔Fragmentation-Needed with the 20-byte NAT64 MTU
+  adjustment (clamped to the IPv6 minimum link MTU v4→v6). Both the outer
+  ICMP type/code/checksum AND the embedded quoted original packet are
+  translated (embedded addresses NAT64-mapped, lengths/checksums fixed).
+  Reuses the merged #2232 zero-alloc `write_*_into` cores; the embedded
+  packet is translated through a fixed stack scratch buffer
+  (MAX_EMBEDDED_LEN) — no per-packet heap allocation. Pre-fix every error
+  type returned None, aborting the frame build (drop) → PMTUD blackholed,
+  traceroute blank. 13 fail-on-revert byte-level tests added (v6→v4 and
+  v4→v6 of Time-Exceeded, PTB↔Frag-Needed with MTU check, Dest-Unreach),
+  asserting outer + embedded translation with independent checksum oracles.
+  All 60 nat64 tests pass.
+  **File(s)**: userspace-dp/src/nat64.rs, userspace-dp/src/nat64_tests.rs,
+  docs/feature-coverage.md, _Log.md
