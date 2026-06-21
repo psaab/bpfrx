@@ -606,13 +606,19 @@ func (m *Manager) generateKea4Config(cfg *config.DHCPServerConfig) error {
 		Name string `json:"name"`
 		Data string `json:"data"`
 	}
+	type keaReservation struct {
+		HWAddress string `json:"hw-address"`
+		IPAddress string `json:"ip-address"`
+		Hostname  string `json:"hostname,omitempty"`
+	}
 	type keaSubnet4 struct {
-		ID            int       `json:"id"`
-		Subnet        string    `json:"subnet"`
-		Pools         []keaPool `json:"pools,omitempty"`
-		Interface     string    `json:"interface,omitempty"`
-		OptionData    []keaOpt  `json:"option-data,omitempty"`
-		ValidLifetime int       `json:"valid-lifetime,omitempty"`
+		ID            int              `json:"id"`
+		Subnet        string           `json:"subnet"`
+		Pools         []keaPool        `json:"pools,omitempty"`
+		Interface     string           `json:"interface,omitempty"`
+		OptionData    []keaOpt         `json:"option-data,omitempty"`
+		ValidLifetime int              `json:"valid-lifetime,omitempty"`
+		Reservations  []keaReservation `json:"reservations,omitempty"`
 	}
 
 	m.warnAmbiguousV4SubnetSelection(cfg.DHCPLocalServer)
@@ -650,6 +656,22 @@ func (m *Manager) generateKea4Config(cfg *config.DHCPServerConfig) error {
 			if pool.LeaseTime > 0 {
 				sub.ValidLifetime = pool.LeaseTime
 			}
+			// #2243: per-subnet static (fixed/reserved) host reservations.
+			// Each binds a client hw-address to a fixed ip-address; the
+			// matching client always receives that address. Commit-time
+			// validation (validateDHCPStaticBindingsStrict) has already
+			// rejected a malformed MAC, an out-of-subnet address, or a
+			// duplicate identity/address, so the render is a direct mapping.
+			for _, sb := range pool.StaticBindings {
+				if sb == nil || sb.MACAddress == "" || sb.FixedAddress == "" {
+					continue
+				}
+				sub.Reservations = append(sub.Reservations, keaReservation{
+					HWAddress: sb.MACAddress,
+					IPAddress: sb.FixedAddress,
+					Hostname:  sb.HostName,
+				})
+			}
 			subnets = append(subnets, sub)
 		}
 	}
@@ -685,13 +707,23 @@ func (m *Manager) generateKea6Config(cfg *config.DHCPServerConfig) error {
 		Name string `json:"name"`
 		Data string `json:"data"`
 	}
+	// Kea DHCPv6 reservations bind an identity (hw-address / duid) to an
+	// ARRAY of addresses (ip-addresses), unlike v4's scalar ip-address.
+	// #2243 reserves by client hardware address with a single fixed
+	// address.
+	type keaReservation6 struct {
+		HWAddress   string   `json:"hw-address"`
+		IPAddresses []string `json:"ip-addresses"`
+		Hostname    string   `json:"hostname,omitempty"`
+	}
 	type keaSubnet6 struct {
-		ID            int       `json:"id"`
-		Subnet        string    `json:"subnet"`
-		Pools         []keaPool `json:"pools,omitempty"`
-		Interface     string    `json:"interface,omitempty"`
-		OptionData    []keaOpt  `json:"option-data,omitempty"`
-		ValidLifetime int       `json:"valid-lifetime,omitempty"`
+		ID            int               `json:"id"`
+		Subnet        string            `json:"subnet"`
+		Pools         []keaPool         `json:"pools,omitempty"`
+		Interface     string            `json:"interface,omitempty"`
+		OptionData    []keaOpt          `json:"option-data,omitempty"`
+		ValidLifetime int               `json:"valid-lifetime,omitempty"`
+		Reservations  []keaReservation6 `json:"reservations,omitempty"`
 	}
 
 	var subnets []keaSubnet6
@@ -730,6 +762,20 @@ func (m *Manager) generateKea6Config(cfg *config.DHCPServerConfig) error {
 			}
 			if pool.LeaseTime > 0 {
 				sub.ValidLifetime = pool.LeaseTime
+			}
+			// #2243: per-subnet static (fixed/reserved) host reservations.
+			// v6 binds hw-address -> ip-addresses array. Commit-time
+			// validation already rejected malformed / out-of-subnet /
+			// duplicate bindings.
+			for _, sb := range pool.StaticBindings {
+				if sb == nil || sb.MACAddress == "" || sb.FixedAddress == "" {
+					continue
+				}
+				sub.Reservations = append(sub.Reservations, keaReservation6{
+					HWAddress:   sb.MACAddress,
+					IPAddresses: []string{sb.FixedAddress},
+					Hostname:    sb.HostName,
+				})
 			}
 			subnets = append(subnets, sub)
 		}
