@@ -120,6 +120,43 @@ all files stay in `package ipsec`, so the public API is unchanged.
     gateway — `set security ike gateway <name> address <ip>` (or
     `dynamic hostname <fqdn>`). The shared accept predicate is
     `config.IsUsableIPsecEndpoint`.
+- **IKE policy chain → proposal cross-reference (#2270).** A gateway's
+  `ike-policy` reference walks gateway → `ike-policy` → `ike-proposal`
+  (`resolveIKESettings`, `ike.go`). When that chain breaks — the
+  `ike-policy` is undefined, or its `proposals` reference dangles —
+  `resolveIKESettings` previously returned an EMPTY proposal string with a
+  nil error, and `renderConfig` (which guards the line with
+  `if ikeProposals != ""`) emitted the connection block with NO
+  `proposals =` line. strongSwan then negotiated phase-1 with its
+  compiled-in default proposal set instead of the configured/required
+  crypto — a silent security-posture downgrade, the Phase-1 analogue of the
+  #2073 ESP gap.
+  - **Fail-closed resolution** (`resolveIKESettings`): the intentional
+    no-policy case (gateway with no `ike-policy`) still returns an empty
+    proposal with a nil error (strongSwan's default set is the operator's
+    explicit choice). A gateway that DOES name an `ike-policy` whose chain
+    cannot resolve now returns the `errIKEChainUnresolved` sentinel instead
+    of an empty proposal. The legacy direct-proposal fallback (an
+    `ike-policy` value that is itself the name of a defined Phase-2
+    proposal, rendered via `buildIKEProposal`) is still accepted.
+  - **Commit-time rejection** (`validateIKEPolicyChainReferencesStrict`,
+    `pkg/config/compiler_validate_strict.go`, run from the strict-validator
+    chain in `compileExpanded`): a VPN whose gateway names an undefined
+    `ike-policy`, or an `ike-policy` whose `proposals` reference dangles,
+    fails `commit` / `commit check`. Only gateways actually referenced by a
+    VPN are validated (an orphan never reaches render, matching Junos). On
+    the tolerant load / peer-sync paths the same check is downgraded to a
+    warning (`lenientIKEPolicyChainRef`) so a config persisted by an older
+    binary or synced from a peer still boots (#1960 no-brick).
+  - **Render belt** (`renderConfig`, `policy.go`): for any path that
+    reaches render without passing local commit (HA sync / direct
+    construction / pre-fix persisted config), a VPN whose IKE chain does
+    not resolve is SKIPPED (logged via `slog.Warn`) — its connection and
+    secret are omitted — rather than emitting a proposal-less connection.
+    Healthy VPNs always render, so one bad reference never zeroes a healthy
+    tunnel. A non-chain resolve error (e.g. an unknown auth-method token
+    from `authMethodToSwan`) is a different class and still aborts the
+    whole render.
 - **AES-GCM IKE PRF + ICV-suffix canonicalization (#2125).** The
   load-bearing fix: a strongSwan IKEv2 AEAD (AES-GCM) proposal MUST
   name a PRF explicitly — an AEAD cipher carries no integrity algorithm
