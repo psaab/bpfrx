@@ -200,38 +200,55 @@ impl SessionTable {
                                 // the held world (real-traffic / promotion
                                 // refresh, re-import) clears it, so a flapping
                                 // RG cannot reset the ceiling.
-                                if let Some(em) = self.entry_by_key_mut(&key) {
-                                    em.last_seen_ns = now_ns;
-                                    em.seen_rg_epoch = new_epoch;
-                                }
+                                //
+                                // The entry was just read by key immediately
+                                // above (Case 3) with no intervening mutation,
+                                // so the matching mutable lookup is a hard
+                                // invariant — `expect` (matching the Case-4 /
+                                // AGE arm) so an invariant violation surfaces
+                                // loudly instead of silently skipping the
+                                // re-stamp and leaving the entry mis-counted.
+                                let em = self
+                                    .entry_by_key_mut(&key)
+                                    .expect("SELF-HEAL: entry was just read via entry_by_key in Case 3; no concurrent mutation");
+                                em.last_seen_ns = now_ns;
+                                em.seen_rg_epoch = new_epoch;
                                 self.last_pop_stats.healed_on_promote += 1;
                                 self.rebucket_alive_entry(&key, now_ns);
                                 continue;
                             }
                             StandbyGateDecision::Hold => {
-                                if let Some(em) = self.entry_by_key_mut(&key) {
-                                    if em.first_held_ns == 0 {
-                                        em.first_held_ns = now_ns;
-                                    }
-                                    // #2120 (Codex MAJOR): do NOT stamp
-                                    // seen_rg_epoch here. The worker reads the
-                                    // HA map (loop_body:491) and the rg_epochs
-                                    // counter (epoch_of) separately, so a HOLD
-                                    // can observe an OLD map (forwards_here =
-                                    // false) together with a NEW (already
-                                    // bumped) epoch. Stamping that new epoch
-                                    // would make the NEXT pass — which sees the
-                                    // new ACTIVE map — find current_epoch ==
-                                    // seen_rg_epoch and SKIP the self-heal,
-                                    // aging the very synced session this gate
-                                    // exists to preserve. Leaving seen_rg_epoch
-                                    // at its install/refresh value guarantees
-                                    // the first forwarding pass after ANY
-                                    // activation that bumped the epoch fires the
-                                    // self-heal (current != seen); the self-heal
-                                    // arm then records the epoch so it does not
-                                    // re-fire perpetually.
+                                // Same hard invariant as the SELF-HEAL /
+                                // Case-4 arms: the entry was just read by key
+                                // in Case 3 with no intervening mutation, so
+                                // `expect` (not `if let Some`) makes an
+                                // invariant break loud instead of silently
+                                // skipping the hold-clock stamp and the
+                                // re-bucket.
+                                let em = self
+                                    .entry_by_key_mut(&key)
+                                    .expect("HOLD: entry was just read via entry_by_key in Case 3; no concurrent mutation");
+                                if em.first_held_ns == 0 {
+                                    em.first_held_ns = now_ns;
                                 }
+                                // #2120 (Codex MAJOR): do NOT stamp
+                                // seen_rg_epoch here. The worker reads the
+                                // HA map (loop_body:491) and the rg_epochs
+                                // counter (epoch_of) separately, so a HOLD
+                                // can observe an OLD map (forwards_here =
+                                // false) together with a NEW (already
+                                // bumped) epoch. Stamping that new epoch
+                                // would make the NEXT pass — which sees the
+                                // new ACTIVE map — find current_epoch ==
+                                // seen_rg_epoch and SKIP the self-heal,
+                                // aging the very synced session this gate
+                                // exists to preserve. Leaving seen_rg_epoch
+                                // at its install/refresh value guarantees
+                                // the first forwarding pass after ANY
+                                // activation that bumped the epoch fires the
+                                // self-heal (current != seen); the self-heal
+                                // arm then records the epoch so it does not
+                                // re-fire perpetually.
                                 self.last_pop_stats.held_standby += 1;
                                 self.rebucket_alive_entry(&key, now_ns);
                                 continue;
