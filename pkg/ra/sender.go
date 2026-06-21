@@ -544,6 +544,25 @@ func (s *sender) buildRA() *ndp.RouterAdvertisement {
 			prefLife = defaultPreferredLifetime
 		}
 
+		// RFC 4861 §4.6.2: the Preferred Lifetime MUST NOT exceed the Valid
+		// Lifetime. A PrefixInformation that violates this is malformed; per
+		// RFC 4862 §5.5.3 a conforming host treats prefLife>validLife as an
+		// error and ignores the prefix, so a misconfigured pair (operator types
+		// preferred-lifetime larger than valid-lifetime, or a 0-defaulted valid
+		// life paired with a large explicit preferred life) could silently drop
+		// the prefix on every host. Clamp prefLife DOWN to validLife — never the
+		// reverse, since extending the valid lifetime would advertise a
+		// longer-lived prefix than the operator configured. Both values are plain
+		// non-negative seconds (the schema gate rejects negatives, and a 0 has
+		// already been replaced by its SLAAC default above), so the comparison is
+		// a straight integer ordering check. "Infinite" is simply the largest
+		// value the operator can express; the same clamp keeps it ordered (a
+		// finite valid life still pulls an over-large preferred life down to it,
+		// and an infinite valid life leaves any preferred life unchanged).
+		if prefLife > validLife {
+			prefLife = validLife
+		}
+
 		ra.Options = append(ra.Options, &ndp.PrefixInformation{
 			PrefixLength:                   uint8(prefix.Bits()),
 			OnLink:                         pfx.OnLink,

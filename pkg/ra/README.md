@@ -174,6 +174,15 @@ best-effort).
   or shutting down. It is emitted by the per-interface owner goroutine as
   its last write (see the shutdown contract above) so a normal RA can
   never follow it on the wire.
+- Prefix lifetimes are clamped to satisfy RFC 4861 §4.6.2 (#2271):
+  `buildRA` (`sender.go`) clamps each PrefixInformation's preferred
+  lifetime DOWN to its valid lifetime (`if prefLife > validLife`). A pair
+  where preferred > valid is malformed and a conforming host (RFC 4862
+  §5.5.3) ignores the prefix, so an operator that types
+  `preferred-lifetime` larger than `valid-lifetime` (or a 0-defaulted
+  valid life paired with a large explicit preferred life) would otherwise
+  silently lose SLAAC on every host. The clamp is never the reverse —
+  extending validity would advertise a longer-lived prefix than configured.
 - IPv6 NODAD is set on the per-instance NDP socket so it doesn't fight
   the kernel's own duplicate-address detection on the link-local
   address.
