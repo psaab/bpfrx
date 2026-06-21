@@ -2092,15 +2092,28 @@ New feature — auto-reply ARP for NAT pool addresses on same L2 segment.
   - Removes stale entries with `netlink.NeighDel()`
   - Enables the per-interface kernel proxy responder sysctl for every
     interface with a desired entry (#2160): `net.ipv4.conf.<if>.proxy_arp`
-    for IPv4, `net.ipv6.conf.<if>.proxy_ndp` for IPv6. The NTF_PROXY neighbor
-    entry alone is **not** sufficient — the Linux kernel ignores a proxy-neigh
-    entry unless the responder sysctl is on, so without this the firewall never
-    answers ARP for a static-NAT (or any) external address and the address is
-    unreachable until a manual static ARP is added. The procfs interface name
-    is resolved from the same ifindex the neighbor entry was installed on (via
+    for IPv4, `net.ipv6.conf.<if>.proxy_ndp` for IPv6. The kernel has two
+    ARP-proxy paths (net/ipv4/arp.c): the pneigh (NTF_PROXY) reply branch,
+    which answers only when the target routes out a *different* interface and
+    does NOT consult the sysctl; and the `arp_fwd_proxy` path, which is gated
+    by the per-interface sysctl. So whether the sysctl is load-bearing is
+    route-topology dependent — a same-L2-subnet external address (the #2160
+    case, where the route stays on the ingress device) is answered by neither
+    path until the sysctl is enabled, leaving the address unreachable until a
+    manual static ARP is added; enabling the sysctl guarantees a reply
+    regardless of topology. The procfs interface name is resolved from the
+    same ifindex the neighbor entry was installed on (via
     `netlink.LinkByIndex`) so VLAN sub-interface naming stays consistent. The
     write goes through the `proxyARPSysctlSeam` package var (best-effort
     `os.WriteFile`) so unit tests capture it without touching real procfs.
+  - Breadth caveat: with the default `medium_id=0`, per-interface
+    `proxy_arp=1` makes the kernel (the `arp_fwd_proxy` path) answer ARP on
+    that interface for ANY target routed out a different interface — not only
+    the configured static-NAT external address. This is BROADER than Junos
+    `proxy-arp`, which proxies only the listed addresses. It is an
+    operator-opted-in tradeoff (proxy-arp was configured on the interface),
+    but the breadth matters on a WAN/untrust interface; narrowing to
+    per-address (Junos parity) is tracked in follow-up #2197.
   - Returns `ProxyARPAdded` structs for caller to send GARPs (avoids cluster import cycle)
 - **`pkg/daemon/daemon.go`** — Calls `ReconcileProxyARP()` after VRRP VIP reconciliation;
   sends GARPs for newly added entries

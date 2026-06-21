@@ -170,7 +170,7 @@ xpf has SNAT (interface + pool, address-persistent, source-nat off bypass), DNAT
 
 | Feature | Junos Config Path | Description | Priority | Status |
 |---------|-------------------|-------------|----------|--------|
-| **Proxy ARP for NAT** | `security nat proxy-arp interface ... address ...` | Auto-reply ARP for NAT pool addresses on same subnet as ingress interface. Required when SNAT pool, DNAT, or static-NAT external addresses are on same L2 segment. | High | **Done** -- Proxy ARP neighbor entries (NTF_PROXY) for NAT addresses with GARP on addition, AND the per-interface `net.ipv4.conf.<if>.proxy_arp` sysctl is enabled so the kernel actually answers the ARP (#2160 -- a proxy-neigh entry is ignored unless the responder sysctl is on). Config: `set security nat proxy-arp interface <iface> address <addr>` with range support. |
+| **Proxy ARP for NAT** | `security nat proxy-arp interface ... address ...` | Auto-reply ARP for NAT pool addresses on same subnet as ingress interface. Required when SNAT pool, DNAT, or static-NAT external addresses are on same L2 segment. | High | **Done** -- Proxy ARP neighbor entries (NTF_PROXY) for NAT addresses with GARP on addition, AND the per-interface `net.ipv4.conf.<if>.proxy_arp` sysctl is enabled so the kernel actually answers the ARP (#2160). The kernel has two ARP-proxy paths: the pneigh (NTF_PROXY) reply branch, which answers only when the target routes out a *different* interface and does not consult the sysctl; and the `arp_fwd_proxy` path, gated by the per-interface `proxy_arp` sysctl. Whether the sysctl is load-bearing is therefore route-topology dependent (a same-L2-subnet external address is answered by neither path until the sysctl is on -- the #2160 case); enabling it guarantees a reply. Note: with the default `medium_id=0`, `proxy_arp=1` makes the kernel answer ARP on that interface for ANY target routed out a different interface -- broader than Junos `proxy-arp` (which proxies only listed addresses); per-address narrowing is tracked in #2197. Config: `set security nat proxy-arp interface <iface> address <addr>` with range support. |
 | **Proxy NDP for NAT** | `security nat proxy-ndp interface ... address ...` | IPv6 equivalent of proxy ARP for NAT64/static NAT addresses | Medium | **Partial** -- An IPv6 address under `proxy-arp` enables the per-interface `net.ipv6.conf.<if>.proxy_ndp` responder sysctl (#2160). The kernel proxy-NDP *neighbor table* install (the v6 analogue of the NTF_PROXY entry) is not yet wired, so v6 still needs a manual `ip -6 neigh add proxy`. |
 | **Twice NAT** | Combination of SNAT + DNAT rule-sets matching same traffic | Simultaneous source and destination translation in single flow. | Medium | **Done** -- Combined SNAT+DNAT flows now preserve both translations in one session path. Static DNAT is keyed by ingress zone with wildcard fallback for SNAT return-path entries across eBPF and userspace (DPDK retired #1525). Userspace post-DNAT SNAT matching now evaluates destination filters against the translated destination, and session/gRPC visibility preserves both NAT legs. |
 | **DNS ALG with NAT** | `security alg dns enable` | DNS payload rewriting when NAT changes embedded IP addresses (A/AAAA record doctoring) | Medium | Missing |
@@ -549,9 +549,18 @@ evidence, not as active eBPF source-removal blockers.
 ### Proxy ARP for NAT (Tier 1) -- DONE
 - Proxy ARP neighbor entries (NTF_PROXY) for NAT addresses with GARP on addition
 - Per-interface `net.ipv4.conf.<if>.proxy_arp` responder sysctl enabled for every
-  interface with a proxy entry (#2160) -- the kernel ignores a proxy-neigh entry
-  unless this sysctl is on, so without it the firewall never answers ARP for a
-  static-NAT external address. IPv6 entries enable `net.ipv6.conf.<if>.proxy_ndp`.
+  interface with a proxy entry (#2160). The kernel has two ARP-proxy paths: the
+  pneigh (NTF_PROXY) reply branch answers only when the target routes out a
+  *different* interface and does NOT require the sysctl; the `arp_fwd_proxy` path
+  is gated by the sysctl. So whether the sysctl is load-bearing is route-topology
+  dependent -- a same-L2-subnet external address (the #2160 case) is answered by
+  neither path until the sysctl is enabled. IPv6 entries enable
+  `net.ipv6.conf.<if>.proxy_ndp`.
+- Breadth tradeoff: with the default `medium_id=0`, `proxy_arp=1` makes the kernel
+  answer ARP on that interface for ANY target routed out a different interface --
+  broader than Junos `proxy-arp`, which proxies only the listed addresses. This is
+  operator-opted-in (they configured proxy-arp on the interface) but matters on a
+  WAN/untrust interface; per-address narrowing is tracked in follow-up #2197.
 - Config: `set security nat proxy-arp interface <iface> address <addr>` with address range support
 
 ### Session Limiting (Tier 1) -- DONE

@@ -1,5 +1,33 @@
 # Action Log
 
+## 2026-06-21 — #2195 (#2160) fold two doc/comment-accuracy MINORs
+
+- **Timestamp**: 2026-06-21
+- **Action**: Folded two review MINORs into PR #2195 (#2160 static-NAT
+  proxy-ARP). DOC/COMMENT-ONLY — the proxy_arp/proxy_ndp enable logic is
+  unchanged and correct.
+  MINOR-1 (mechanism over-simplified): the prior wording claimed the kernel
+  ignores a proxy-neigh entry "unless the proxy_arp sysctl is on." Per
+  net/ipv4/arp.c the pneigh (NTF_PROXY) reply branch (arp.c:863-868) requires
+  only forwarding + addr_type==RTN_UNICAST + rt.dst.dev != dev — it does NOT
+  consult the sysctl; the sysctl gates the SEPARATE `arp_fwd_proxy` path.
+  Softened to the accurate route-topology-dependent statement (same-L2-subnet
+  external address where rt.dst.dev==dev is answered by neither path until the
+  sysctl is on — the real #2160 case; an off-interface-routed address may
+  already answer via pneigh without it). Both kernel paths now cited.
+  MINOR-2 (over-answer breadth undocumented): documented that per-interface
+  `proxy_arp=1` (default medium_id=0) makes the kernel answer ARP for ANY
+  target routed out a different interface — broader than Junos `proxy-arp`
+  (listed addresses only). Operator-opted-in tradeoff; matters on WAN/untrust.
+  Per-address narrowing tracked in follow-up #2197.
+  Reworded: proxyarp.go (proxyARPSysctlSeam doc + ReconcileProxyARP
+  ifindexFamilies + enable-call comments), feature-gaps.md (proxy-ARP row +
+  Implementation Suggestions bullet), phases.md (ReconcileProxyARP
+  description). go build ./... + go vet ./pkg/dataplane/ + go test
+  ./pkg/dataplane/ all green (comments/docs only).
+  **File(s)**: pkg/dataplane/proxyarp.go, docs/feature-gaps.md,
+  docs/phases.md, _Log.md
+
 ## 2026-06-21 — #2160 static-NAT proxy-ARP: enable per-interface responder sysctl
 
 - **Timestamp**: 2026-06-21

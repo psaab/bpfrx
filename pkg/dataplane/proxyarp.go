@@ -25,12 +25,37 @@ type ProxyARPAdded struct {
 // It exists as a package var so unit tests can capture the writes without
 // touching real procfs (the production writer is a best-effort os.WriteFile).
 //
-// #2160: installing an NTF_PROXY neighbor entry is necessary but NOT
-// sufficient — the Linux kernel ignores proxy-neigh entries unless the
-// per-interface sysctl is enabled (net.ipv4.conf.<if>.proxy_arp for ARP,
-// net.ipv6.conf.<if>.proxy_ndp for NDP). Without this, the firewall never
-// answers ARP/NDP for a static-NAT (or any) proxy-ARP'd external address,
-// so the address is unreachable until a manual static ARP is added.
+// #2160: installing an NTF_PROXY neighbor entry is necessary but, depending
+// on the route topology of the proxied address, often not sufficient. The
+// Linux kernel has two distinct ARP-proxy reply paths (net/ipv4/arp.c):
+//
+//   1. the pneigh (NTF_PROXY) reply branch (arp.c:863-868), which fires when
+//      forwarding is on, the target's addr_type is RTN_UNICAST, and the route
+//      to the target leaves a *different* device than the one the request
+//      arrived on (rt.dst.dev != dev) — this branch does NOT consult the
+//      per-interface proxy_arp sysctl; and
+//   2. the arp_fwd_proxy path, which is gated by net.ipv4.conf.<if>.proxy_arp
+//      (and answers for any forwarded-out-a-different-iface target, not only
+//      installed pneigh entries).
+//
+// So whether enabling the sysctl is load-bearing is route-topology dependent:
+// for an external address that is on the SAME L2 subnet as the ingress
+// interface (rt.dst.dev == dev) neither path answers, and for an address
+// routed OUT a different interface the pneigh branch may already answer
+// without the sysctl. The empirical #2160 observation (sysctl=0 → no reply
+// for the static-NAT external address) is real, so enabling the sysctl is the
+// correct fix; we set net.ipv4.conf.<if>.proxy_arp (ARP) and
+// net.ipv6.conf.<if>.proxy_ndp (NDP) on every interface with a desired proxy
+// entry to guarantee a reply regardless of the topology.
+//
+// Breadth tradeoff: with the default medium_id=0, per-interface proxy_arp=1
+// makes the kernel (path 2 above) answer ARP on that interface for ANY target
+// IP that routes out a DIFFERENT interface — not only the configured
+// static-NAT external address. This is BROADER than Junos `proxy-arp`, which
+// proxies only the listed addresses. It is an operator-opted-in tradeoff (they
+// configured proxy-arp on this interface), but the breadth matters on a
+// WAN/untrust interface. Narrowing to per-address (Junos parity) is tracked in
+// follow-up #2197.
 var proxyARPSysctlSeam = writeProxyResponderSysctl
 
 // writeProxyResponderSysctl enables the kernel proxy responder for the given
@@ -102,9 +127,12 @@ func ReconcileProxyARP(cfg *config.Config, ifaceMap map[string]int) ([]ProxyARPA
 
 	// ifindexFamilies records, per interface ifindex, the set of address
 	// families that have at least one desired proxy entry. Used to enable
-	// the per-interface kernel proxy responder sysctl (#2160) — installing
-	// the NTF_PROXY neighbor entry alone is not enough; the kernel won't
-	// answer ARP/NDP unless net.ipv4.conf.<if>.proxy_arp / proxy_ndp is set.
+	// the per-interface kernel proxy responder sysctl (#2160). The NTF_PROXY
+	// neighbor entry alone answers only via the kernel's pneigh reply branch,
+	// which is route-topology dependent (it requires the target to route out a
+	// different device than the request arrived on — see the proxyARPSysctlSeam
+	// doc); setting net.ipv4.conf.<if>.proxy_arp / proxy_ndp guarantees a reply
+	// regardless of topology, which is what #2160 needed.
 	// Keyed by ifindex so the procfs interface name resolves from the same
 	// link the neighbor entry is installed on (handles VLAN sub-interface
 	// renaming consistently with the install).
@@ -221,9 +249,12 @@ func ReconcileProxyARP(cfg *config.Config, ifaceMap map[string]int) ([]ProxyARPA
 	}
 
 	// Enable the per-interface kernel proxy responder sysctl for every
-	// interface that has a desired proxy entry (#2160). Resolve the procfs
-	// interface name from the same ifindex the neighbor entry was installed
-	// on so VLAN sub-interface naming stays consistent with the install.
+	// interface that has a desired proxy entry (#2160). The pneigh entry
+	// installed above only answers via a route-topology-dependent kernel path
+	// (see proxyARPSysctlSeam); the sysctl guarantees a reply. Resolve the
+	// procfs interface name from the same ifindex the neighbor entry was
+	// installed on so VLAN sub-interface naming stays consistent with the
+	// install.
 	ifaceFamilies := make(map[string]map[int]struct{}, len(ifindexFamilies))
 	for ifindex, fams := range ifindexFamilies {
 		link, err := netlink.LinkByIndex(ifindex)
