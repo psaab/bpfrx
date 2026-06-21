@@ -32,6 +32,126 @@
   userspace-dp/src/screen/packet.rs, userspace-dp/src/screen/mod.rs,
   userspace-dp/src/afxdp/mod.rs, userspace-dp/src/screen/tests.rs
 
+## 2026-06-21 — #2187 validate NAT-rule app references at commit
+
+- **Timestamp**: 2026-06-21
+- **Action**: Fixed #2187 (follow-up to #2142/#2185) — the strict
+  commit-time application-spec validation walk
+  (`applicationsToValidateStrict`) was policy-only, so a malformed user
+  app referenced ONLY by a source/destination-NAT rule's `match
+  application` escaped both the #2142 commit gate and the #2124 runtime
+  gate (`appPortsFromSpec` returns nil → NAT term silently never/over-
+  matches). Extended the walk to collect NAT-rule references via the
+  existing `addRef` closure (single app + application-set, inheriting the
+  #2185 F1 dangling-member fallback); strict-commit / lenient-load wiring
+  is unchanged (single call site). Static NAT not walked (no `match
+  application` on `StaticNATRule`). Added compiler-package tests
+  (source + destination reject / valid / via-set / unreferenced-warn /
+  lenient-warn) that FAIL on the pre-fix tree; updated the appid
+  drift-guard comment. go test ./pkg/config/... ./pkg/appid/... +
+  ./pkg/dataplane/userspace/... green; go vet clean.
+- **File(s)**: pkg/config/compiler.go,
+  pkg/config/compiler_nat_application_specs_test.go,
+  pkg/appid/runtime_test.go, docs/services-application-identification.md
+
+## 2026-06-21 — #2186 docs: screen session-limit cap is per-worker (× num_workers)
+
+- **Timestamp**: 2026-06-21
+- **Action**: DOCS-only (#2186). The #2134 (PR #2177) per-IP screen
+  session-limit enforcement maintains its count in the per-worker
+  `SessionTable`, so with N RX queues/workers and RSS the effective
+  admitted cap is `configured × num_workers`, not a single global cap
+  (live: `limit 2` admitted 12 on the 6-worker loss cluster). Made the
+  per-worker multiplier explicit in the session README "Per-worker
+  scoping" section (formula + worked example + operator sizing note) and
+  in both `docs/feature-gaps.md` session-limiting rows. Swept the two
+  #2177 Copilot wording nits: (a) reworded the `poll_descriptor` ~L823
+  comment — the check runs on every miss-path flow before install-class
+  branching; reverse/seed installs are merely uncounted at the
+  maintenance sites, they are not "exempt from the check"; (b) corrected
+  the "#2128 closes/fixes" attribution in the README header, the
+  `poll_descriptor` doc-comment, and `_Log.md` — #2128 (the phantom-zero
+  leak) was closed by #2159; #2134/#2177 *preserves* that leak-fix by
+  construction (read-only count query). No code logic change.
+- **File(s)**: userspace-dp/src/session/README.md,
+  userspace-dp/src/afxdp/poll_descriptor/mod.rs, docs/feature-gaps.md,
+  _Log.md
+## 2026-06-21 — #2175 review fold: firewall-filter protocol refuses commit
+
+- **Timestamp**: 2026-06-21
+- **Action**: Folded a MINOR review fix into the #2175 SSOT PR. The
+  branch routed `from protocol <token>` through the centralized
+  `appid.ProtocolNumber` and added `validateFilterProtocols` in the
+  DATAPLANE compiler (`compileFirewallFilters`), but that error path is
+  not in `requiredProtocolGateSentinels`, so
+  `compileErrorMustAbortApply` is false at `daemon_apply.go` — the
+  daemon SWALLOWS it (journal WARN + /health LastError only) and commit
+  reports SUCCESS while the term silently programs no protocol match.
+  Inconsistent with siblings #2142 (`validateApplicationSpecsStrict`)
+  and #2173 (`validateNATHostMaskStrict`) which refuse at the
+  `pkg/config` commit-check layer. Added
+  `validateFilterProtocolsStrict` (pkg/config/compiler.go), wired into
+  `compileExpanded` after the application-specs gate behind a new
+  `lenientFilterProtocols` opt (true on the load / peer-sync paths,
+  false on commit / commit-check). An invalid token (not a known name,
+  junos-* alias, or 0..255 numeric) now FAILS commit with a
+  family/filter/term/token error; LOAD / peer-sync downgrade to a
+  warning so a persisted/synced config still boots (#1960 no-brick).
+  Because `pkg/appid` imports `pkg/config` (import cycle), the gate
+  INLINE-mirrors `appid.ProtocolNumber`'s acceptance set via
+  `filterProtocolResolvable` (tighter than `validateProtocol`, which
+  blanket-accepts any `junos-` prefix); a `pkg/appid` drift-guard test
+  (`TestFilterProtocolResolvableMatchesProtocolNumber`) pins it to the
+  SSOT via the exported `FilterProtocolResolvable` accessor (#2185
+  pattern). KEPT the dataplane `validateFilterProtocols` as
+  strictly-more-fail-closed defense-in-depth. Reworded
+  docs/feature-gaps.md to attribute the commit refusal to the
+  commit-check layer + dataplane backstop. Renamed the misleading
+  `TestCompileFirewallFiltersUnknownProtocolFailsCommit` (it exercised
+  the dataplane drop, not commit refusal) to
+  `...ReturnsDataplaneError`. Added commit-refusal + valid-commit +
+  lenient-load tests; verified the commit-refusal tests FAIL when the
+  strict gate is neutralized.
+- **File(s)**: pkg/config/compiler.go,
+  pkg/config/compiler_filter_protocol_test.go,
+  pkg/appid/protocol_number_2124_test.go,
+  pkg/dataplane/compiler_filter_protocol_test.go,
+  docs/feature-gaps.md, _Log.md
+- **Validation**: `go build ./...` clean; `go test ./pkg/config/...
+  ./pkg/dataplane/... ./pkg/appid/... ./pkg/daemon/...` all pass;
+  `go vet` clean; revert-proof confirmed (commit-refusal + lenient-warn
+  tests fail with the gate removed); valid protocols
+  (tcp/udp/icmp/icmpv6/sctp/esp/ah/gre/ospf/vrrp/igmp/pim/junos-*/0/47/
+  132/255) still commit.
+
+## 2026-06-21 — #2144 validate routing export references at commit
+
+- **Timestamp**: 2026-06-21
+- **Action**: Fixed #2144 — routing export references reached FRR render
+  with no commit-time validation. A dynamic-protocol `export`
+  (OSPF/OSPFv3/BGP/IS-IS), a RIP `redistribute`, a BGP group/neighbor
+  `export`, or a `routing-options forwarding-table export` naming a
+  typo'd / undefined policy-statement passed commit, then failed OPEN at
+  render: `resolveRedistribute`'s fallback emits `redistribute <typo>`
+  (FRR reload rejected or no-op), a BGP neighbor export renders a missing
+  `route-map <name> out` (FRR permit-all → advertise everything), and
+  `resolveECMP` returns 0 max-paths for a missing forwarding-table policy
+  (silently disables ECMP/consistent-hash). Added
+  `validateRoutingExportReferencesStrict` (pkg/config/compiler.go):
+  redistribute-backed exports accept a known protocol token
+  (connected/direct/static/kernel/ospf/bgp/rip/isis) OR a defined
+  policy-statement; BGP neighbor/group export and forwarding-table export
+  accept only a defined policy-statement. Covers top-level + per
+  routing-instance protocols. Strict on commit/commit-check; lenient
+  (warn) on load/HA-sync via `lenientRoutingExportRef` (#1960 doctrine,
+  mirrors validateLogProfileStreamReferencesStrict). 18 new commit-time
+  tests + 1 FRR render test; the rejection/lenient tests FAIL on pre-fix
+  code (verified). Two pre-existing parser tests carried dangling export
+  refs and now seed the referenced policy-statement. build + go test
+  ./pkg/config/... ./pkg/frr/... ./pkg/routing/... ./pkg/configstore/...
+  ./pkg/daemon/... ./pkg/cluster/... green.
+- **File(s)**: pkg/config/compiler.go, pkg/config/routing_export_ref_test.go,
+  pkg/config/parser_routing_test.go, pkg/frr/frr_test.go, pkg/frr/README.md
 ## 2026-06-21 — #2183 flowexport IPv6 collector address bracketing
 
 - **Timestamp**: 2026-06-21
@@ -78,7 +198,7 @@
 - **Action**: Added `validateApplicationSpecsStrict` (strict-vs-lenient gate, `lenientApplicationSpecs` flag) rejecting a malformed `set applications application <name>` destination-port/source-port (non-numeric, out of 1..65535, inverted range) or unknown protocol at commit — but ONLY for apps referenced by a security policy (direct or via application-set) OR when `services application-identification` is enabled. Previously warning-only (`ValidateConfig`): commit succeeded, the app-id compiler skipped the unparsable port (never-match AppID), and a referencing policy failed CLOSED on permit / OPEN on deny. Application-DEFINITION sibling of #2124's policy-app-term fail-closed gate; reuses `validatePortSpec`/`validateProtocol` (no new table). Lenient on load/peer-sync (#1960/#2008 no-brick). New `compiler_application_specs_test.go` (10 tests, 8 fail pre-fix); doc note in `docs/services-application-identification.md`.
 - **File(s)**: pkg/config/compiler.go, pkg/config/compiler_application_specs_test.go, docs/services-application-identification.md
 
-## 2026-06-21 — #2134 wire screen session-limit enforcement (closes #2128)
+## 2026-06-21 — #2134 wire screen session-limit enforcement (#2128 leak-fix preserved; #2128 closed by #2159)
 
 - **Timestamp**: 2026-06-21
 - **Action**: Fixed #2134 — `limit-session source-ip-based`/`destination-ip-based`
@@ -90,7 +210,8 @@
   the limit CHECK out of the per-packet screen stage into the new-flow /
   session-MISS decision in `poll_descriptor` (`new_flow_session_limit_drop`)
   so an established flow can't self-drop at the boundary; the read is
-  non-mutating, closing the #2128 phantom-zero leak by construction.
+  non-mutating, preserving the #2128 phantom-zero leak-fix (closed by
+  #2159) by construction.
   OFF-gated (zero cost unconfigured) with clear-on-disable. Retired the
   dead `ScreenState` session-limit tracker + `screen/session_limit.rs`.
   Added 14 unit tests (enforcement decision, established-flow no-self-drop,
@@ -7951,3 +8072,24 @@ top.
   **File(s)**: userspace-dp/src/afxdp/frame/tcp.rs,
   userspace-dp/src/afxdp/frame/tcp_tests.rs,
   userspace-dp/src/afxdp/frame/README.md
+
+- **Timestamp**: 2026-06-21
+  **Action**: #2175 — centralize the firewall-filter `from protocol <name>`
+  resolution table onto the `appid.ProtocolNumber` SSOT (#2124). It was the
+  fifth, independent protocol-name→IANA-number copy: a hard-coded
+  tcp/udp/icmp/icmpv6 switch with a silent numeric fallback in
+  `compiler_filter.go`, so a name added to the SSOT (sctp/esp/ah/vrrp/...)
+  was silently unavailable to firewall filters even though the identical
+  token resolved in a security policy, and a typo'd name degraded to
+  "match protocol 0". Chose SSOT delegation (Junos firewall filters
+  legitimately accept the broad named/IANA protocol set in `from protocol`,
+  not just L4) plus a `validateFilterProtocols` pass at the top of
+  `compileFirewallFilters` that rejects an unrepresentable token at commit
+  with a clear family/filter/term/token error. No import cycle: pkg/dataplane
+  already imports pkg/appid. L4 subset + numeric (incl. HOPOPT "0") unchanged.
+  5 new Go tests (sctp/esp/ah/vrrp/gre/ospf/igmp/pim resolve; unknown name
+  fails commit on the full compileFirewallFilters path; sctp end-to-end
+  programs protocol 132); SSOT assertions FAIL on pre-fix. build ./... +
+  go test pkg/dataplane/... pkg/appid/... pkg/config/... green.
+  **File(s)**: pkg/dataplane/compiler_filter.go,
+  pkg/dataplane/compiler_filter_protocol_test.go, docs/feature-gaps.md

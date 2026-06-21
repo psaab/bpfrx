@@ -105,14 +105,23 @@ runtime effect is the L3/L4 catalog classification above
     range) or whose `protocol` is not a known name, a `junos-*`
     alias, or a `0..255` number is **rejected at commit** —
     *but only when the application is referenced by a security
-    policy, or when `services application-identification` is
+    policy or a source/destination-NAT rule's `match application`
+    (#2187), or when `services application-identification` is
     enabled* (every user application then compiles into the
     catalog). Such a spec was previously only WARNED: commit
     succeeded, the app-id compiler recorded the AppID name and
     then skipped the unparsable port (a never-match AppID), and a
     policy referencing it failed CLOSED on a `permit` rule or fell
     through OPEN on a `deny` rule (`validateApplicationSpecsStrict`,
-    `pkg/config/compiler.go`). An **unreferenced** application with
+    `pkg/config/compiler.go`). A source/destination-NAT rule's
+    `match application` consumes the same port/proto
+    (`appPortsFromSpec`, `pkg/dataplane/userspace/nat.go`), so a
+    malformed app referenced only by a NAT rule used to escape both
+    this commit gate and the #2124 runtime gate, silently
+    never-matching (or over-matching) the NAT term; #2187 closes that
+    by collecting NAT-rule references into the same strict walk
+    (static NAT carries no `match application`, so only source and
+    destination NAT rule-sets are walked). An **unreferenced** application with
     app-id disabled is not matchable by anything, so its malformed
     spec stays a *warning* (the operator can iterate on a
     not-yet-wired application library). This is the
