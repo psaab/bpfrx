@@ -1,7 +1,13 @@
 package userspace
 
 import (
+	"encoding/json"
+	"net"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/psaab/xpf/pkg/config"
 )
@@ -143,4 +149,113 @@ func TestUserspacePortSpecRepresentableMirrorsRust(t *testing.T) {
 			t.Errorf("userspacePortSpecRepresentable(%q) = true, want false", s)
 		}
 	}
+}
+
+// recordingControlServer accepts control requests, records them, and replies OK
+// with an enabled+forwarding-armed status so applyHelperStatusLocked succeeds.
+func recordingControlServer(t *testing.T) (string, chan ControlRequest) {
+	t.Helper()
+	// Use a short os.MkdirTemp path (NOT t.TempDir(), whose long subtest-named
+	// path can exceed the ~108-char unix sun_path limit -> bind: invalid arg).
+	dir, err := os.MkdirTemp("", "xpf2124")
+	if err != nil {
+		t.Fatalf("mkdtemp: %v", err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	sock := filepath.Join(dir, "c.sock")
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatalf("listen control socket: %v", err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	reqCh := make(chan ControlRequest, 8)
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			var req ControlRequest
+			if err := json.NewDecoder(conn).Decode(&req); err == nil {
+				reqCh <- req
+				_ = json.NewEncoder(conn).Encode(ControlResponse{
+					OK:     true,
+					Status: &ProcessStatus{Enabled: true, ForwardingArmed: false},
+				})
+			}
+			conn.Close()
+		}
+	}()
+	return sock, reqCh
+}
+
+func TestDisarmBeforeUnsupportedPublishLocked(t *testing.T) {
+	t.Run("unsupported config disarms before publish", func(t *testing.T) {
+		sock, reqCh := recordingControlServer(t)
+		m := New()
+		m.proc = &exec.Cmd{Process: &os.Process{Pid: os.Getpid()}}
+		m.cfg.ControlSocket = sock
+		m.lastStatus.ForwardingArmed = true
+		// A policy naming an unrepresentable-protocol application -> caps say
+		// ForwardingSupported=false.
+		cfg := twoZonePolicyCfg(&config.Application{Name: "weird", Protocol: "definitely-not-a-proto"}, "weird")
+		// The disarm CONTROL REQUEST is the security-critical behavior under
+		// test. applyHelperStatusLocked touches a BPF map that is absent in a
+		// unit test ("userspace_ctrl map not loaded"), so the function may
+		// return that local-bookkeeping error AFTER the wire disarm succeeds;
+		// that env artifact must not mask the assertion that the disarm was
+		// actually issued.
+		_ = m.disarmBeforeUnsupportedPublishLocked(cfg)
+		select {
+		case req := <-reqCh:
+			if req.Type != "set_forwarding_state" || req.Forwarding == nil || req.Forwarding.Armed {
+				t.Fatalf("got request %+v, want set_forwarding_state{Armed:false}", req)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatal("no disarm request sent for unsupported config")
+		}
+	})
+
+	t.Run("supported config does not disarm", func(t *testing.T) {
+		sock, reqCh := recordingControlServer(t)
+		m := New()
+		m.proc = &exec.Cmd{Process: &os.Process{Pid: os.Getpid()}}
+		m.cfg.ControlSocket = sock
+		m.lastStatus.ForwardingArmed = true
+		cfg := twoZonePolicyCfg(&config.Application{Name: "esp-only", Protocol: "esp"}, "esp-only")
+		if err := m.disarmBeforeUnsupportedPublishLocked(cfg); err != nil {
+			t.Fatalf("disarmBeforeUnsupportedPublishLocked: %v", err)
+		}
+		select {
+		case req := <-reqCh:
+			t.Fatalf("unexpected control request for supported config: %+v", req)
+		case <-time.After(200 * time.Millisecond):
+		}
+	})
+
+	t.Run("no helper is a no-op", func(t *testing.T) {
+		m := New()
+		m.lastStatus.ForwardingArmed = true
+		cfg := twoZonePolicyCfg(&config.Application{Name: "weird", Protocol: "definitely-not-a-proto"}, "weird")
+		if err := m.disarmBeforeUnsupportedPublishLocked(cfg); err != nil {
+			t.Fatalf("disarmBeforeUnsupportedPublishLocked with no helper: %v", err)
+		}
+	})
+
+	t.Run("already disarmed is a no-op", func(t *testing.T) {
+		sock, reqCh := recordingControlServer(t)
+		m := New()
+		m.proc = &exec.Cmd{Process: &os.Process{Pid: os.Getpid()}}
+		m.cfg.ControlSocket = sock
+		m.lastStatus.ForwardingArmed = false
+		cfg := twoZonePolicyCfg(&config.Application{Name: "weird", Protocol: "definitely-not-a-proto"}, "weird")
+		if err := m.disarmBeforeUnsupportedPublishLocked(cfg); err != nil {
+			t.Fatalf("disarmBeforeUnsupportedPublishLocked: %v", err)
+		}
+		select {
+		case req := <-reqCh:
+			t.Fatalf("unexpected control request when already disarmed: %+v", req)
+		case <-time.After(200 * time.Millisecond):
+		}
+	})
 }

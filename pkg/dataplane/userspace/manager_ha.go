@@ -378,6 +378,48 @@ func (m *Manager) configHasDataRGLocked() bool {
 	return false
 }
 
+// disarmBeforeUnsupportedPublishLocked disarms helper forwarding BEFORE a full
+// apply_snapshot publish when the snapshot's config capabilities forbid
+// forwarding (#2124). A policy that names an application the userspace matcher
+// cannot represent makes deriveUserspaceCapabilities return
+// ForwardingSupported=false, and buildOneRuleSnapshot emits a `__unsupported__`
+// sentinel term. A current-version helper rejects that sentinel via its
+// integrity preflight, but an OLDER same-protocol-version helper that predates
+// the preflight would silently drop the sentinel and could process the
+// resulting match-any rule with forwarding still armed in the window before the
+// post-publish syncDesiredForwardingStateLocked() disarm — including via the
+// XSK-startup deferred same-plan publish path (process.go), which publishes
+// independently of Compile(). Disarming first, at EVERY full publish site,
+// closes that window for every helper version.
+//
+// caps are derived from the snapshot's own config (not m.lastStatus, which
+// still reflects the prior good config). The disarm is issued only when a
+// running helper currently believes it is armed, so steady-state supported
+// configs take no extra control round-trip. The post-publish desired-state
+// sync still reconciles the final state.
+func (m *Manager) disarmBeforeUnsupportedPublishLocked(cfg *config.Config) error {
+	if cfg == nil {
+		return nil
+	}
+	if m.proc == nil || m.proc.Process == nil || !m.lastStatus.ForwardingArmed {
+		return nil
+	}
+	if deriveUserspaceCapabilities(cfg).ForwardingSupported {
+		return nil
+	}
+	var status ProcessStatus
+	if err := m.requestLocked(ControlRequest{
+		Type:       "set_forwarding_state",
+		Forwarding: &ForwardingControlRequest{Armed: false},
+	}, &status); err != nil {
+		return fmt.Errorf("disarm userspace forwarding before unsupported-config publish: %w", err)
+	}
+	if err := m.applyHelperStatusLocked(&status); err != nil {
+		return fmt.Errorf("sync helper status after pre-publish disarm: %w", err)
+	}
+	return nil
+}
+
 func (m *Manager) syncDesiredForwardingStateLocked() error {
 	if m.proc == nil || m.proc.Process == nil {
 		return nil

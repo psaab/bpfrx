@@ -693,29 +693,8 @@ func (m *Manager) Compile(cfg *config.Config) (*dataplane.CompileResult, error) 
 		snap.DeferWorkers = true
 	}
 	var status ProcessStatus
-	// #2124: when THIS config's capabilities forbid forwarding (e.g. a policy
-	// names an application the userspace matcher cannot represent), disarm the
-	// helper BEFORE publishing the snapshot. A current-version helper would
-	// reject the snapshot's `__unsupported__` sentinel via the integrity
-	// preflight, but an OLDER same-protocol-version helper that predates that
-	// preflight would silently drop the sentinel term and could process the
-	// resulting match-any rule with forwarding still armed in the window before
-	// the post-publish syncDesiredForwardingStateLocked() disarm. Disarming
-	// first closes that window for every helper version. We gate on the freshly
-	// computed caps (not m.lastStatus, which still reflects the prior good
-	// config) and only act when the helper currently believes it is armed.
-	if !caps.ForwardingSupported && m.proc != nil && m.proc.Process != nil &&
-		m.lastStatus.ForwardingArmed {
-		var disarmStatus ProcessStatus
-		if derr := m.requestLocked(ControlRequest{
-			Type:       "set_forwarding_state",
-			Forwarding: &ForwardingControlRequest{Armed: false},
-		}, &disarmStatus); derr != nil {
-			return result, fmt.Errorf("disarm userspace forwarding before unsupported-config publish: %w", derr)
-		}
-		if aerr := m.applyHelperStatusLocked(&disarmStatus); aerr != nil {
-			return result, fmt.Errorf("sync helper status after pre-publish disarm: %w", aerr)
-		}
+	if err := m.disarmBeforeUnsupportedPublishLocked(snap.Config); err != nil {
+		return result, err
 	}
 	// #1197 v5 (Codex code-review v4 #2): apply_snapshot must
 	// send publishable-only neighbors to match the
@@ -835,6 +814,12 @@ func (m *Manager) UpdatePolicyScheduleState(cfg *config.Config, activeState map[
 	publishSnap := next
 	publishSnap.Neighbors = filterPublishableNeighbors(next.Neighbors)
 	var status ProcessStatus
+	// #2124: disarm before publishing an unsupported-config snapshot (see
+	// disarmBeforeUnsupportedPublishLocked). cfg is this snapshot's config.
+	if err := m.disarmBeforeUnsupportedPublishLocked(cfg); err != nil {
+		slog.Warn("userspace: failed to disarm before unsupported-config policy scheduler publish", "err", err)
+		return
+	}
 	if err := m.requestLocked(ControlRequest{Type: "apply_snapshot", Snapshot: &publishSnap}, &status); err != nil {
 		slog.Warn("userspace: failed to publish policy scheduler state", "err", err)
 		return
@@ -991,6 +976,10 @@ func (m *Manager) PublishRouteOverlaySnapshot(cfg *config.Config, overlay []conf
 	publishSnap := next
 	publishSnap.Neighbors = filterPublishableNeighbors(next.Neighbors)
 	var status ProcessStatus
+	// #2124: disarm before publishing an unsupported-config snapshot.
+	if err := m.disarmBeforeUnsupportedPublishLocked(next.Config); err != nil {
+		return false, err
+	}
 	if err := m.requestLocked(ControlRequest{Type: "apply_snapshot", Snapshot: &publishSnap}, &status); err != nil {
 		return false, fmt.Errorf("publish route overlay snapshot: %w", err)
 	}
@@ -1769,13 +1758,17 @@ func expandUserspacePolicyApplications(cfg *config.Config, apps []string) ([]Pol
 			if !ok {
 				return nil, false
 			}
-			// Canonicalize ONLY the named protocols that the Rust matcher could
-			// not parse before this fix (esp/ah/sctp/vrrp/igmp/pim/egp) to their
-			// IANA number, so a mixed-version helper that predates the new
-			// parse_protocol arms still parses them. Protocols the matcher has
-			// always understood (tcp/udp/icmp/icmpv6/gre/ospf/ipip + numeric)
-			// are left as-is to avoid churning the wire form (and the snapshot
-			// hash) for every existing policy.
+			// Canonicalize to the IANA number any protocol token the Rust
+			// matcher could NOT parse before this fix — i.e. anything
+			// `rustParsedProtocolBeforeFix` returns false for. In practice that
+			// is the newly-supported named set (esp/ah/sctp/vrrp/igmp/pim/egp),
+			// but it also covers any other appid-resolvable token outside the
+			// pre-fix set (e.g. a junos-* alias such as junos-ospf, were one to
+			// reach this path) so a mixed-version helper that predates the new
+			// parse_protocol arms still parses it. Tokens the matcher has always
+			// understood (tcp/udp/icmp/icmpv6/gre/ospf/ipip + bare numeric) are
+			// left as-is to avoid churning the wire form (and the snapshot hash)
+			// for every existing policy.
 			if !rustParsedProtocolBeforeFix(proto) {
 				proto = strconv.Itoa(int(num))
 			}
