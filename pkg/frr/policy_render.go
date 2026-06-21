@@ -18,6 +18,7 @@ package frr
 
 import (
 	"fmt"
+	"log/slog"
 	"net"
 	"sort"
 	"strconv"
@@ -64,6 +65,30 @@ var knownRedistProtocols = map[string]bool{
 // If the value is a known protocol name, it emits a bare "redistribute <proto>".
 // If it matches a policy-statement, it extracts protocols from the terms and emits
 // "redistribute <proto> route-map <name>" for each.
+//
+// Invariant: this never emits a syntactically-invalid `redistribute
+// <name>` line. FRR's `redistribute` requires a source protocol token
+// (connected/static/ospf/bgp/rip/isis/kernel); a bare policy-statement or
+// typo name is rejected by frr-reload.py. Because the line lands in the
+// xpf-managed section, ONE rejected line degrades the WHOLE reload
+// (frr-reload exits non-zero on any CMD_WARNING_CONFIG_FAILED, then the
+// additive vtysh -f fallback rejects it too — every managed route and
+// redistribute is lost, not just this stanza, #1880/#2223). So when an
+// export cannot be resolved to a source protocol we SKIP it and warn
+// rather than poison the managed reload.
+//
+// Two cases reach the skip-and-warn path (both pass the commit-time
+// strict validator, which only checks the name is a known token OR a
+// defined policy-statement — it does NOT require a `from protocol`):
+//
+//   - The export names a defined policy-statement, but none of its terms
+//     carry a `from protocol` (e.g. it matches only from community /
+//     prefix-list / as-path). FRR's redistribute has no construct to
+//     express "redistribute whatever this policy matches" without a
+//     source protocol, so there is no valid line to emit.
+//   - The export is neither a known protocol token nor a defined
+//     policy-statement (a name that slipped past validation on a tolerant
+//     load / peer-sync path, opts.lenientRoutingExportRef in pkg/config).
 func (m *Manager) resolveRedistribute(export string, po *config.PolicyOptionsConfig) string {
 	// Junos spells directly-connected routes "direct"; FRR's redistribute
 	// keyword is "connected". A bare `export direct` must render
@@ -103,11 +128,26 @@ func (m *Manager) resolveRedistribute(export string, po *config.PolicyOptionsCon
 				}
 				return sb.String()
 			}
+			// Defined policy-statement with no resolvable source protocol:
+			// nothing valid to redistribute. Skip + warn rather than emit
+			// the FRR-invalid `redistribute <policy>` that would degrade the
+			// managed-section reload (#2223).
+			slog.Warn("FRR redistribute export skipped: policy-statement has no `from protocol`",
+				"policy", export,
+				"hint", "redistribute requires a source protocol; add `from protocol <proto>` to the policy or use a bare protocol token")
+			return ""
 		}
 	}
 
-	// Fallback: treat as bare redistribute (best-effort)
-	return fmt.Sprintf(" redistribute %s\n", export)
+	// Unknown token: neither a known protocol nor a defined policy-statement
+	// (a name that slipped past the strict validator on a tolerant load /
+	// peer-sync path). Never emit a bare `redistribute <name>` — it has no
+	// valid source protocol and would be rejected by frr-reload, degrading
+	// the entire managed reload (#2223).
+	slog.Warn("FRR redistribute export skipped: not a known protocol or defined policy-statement",
+		"export", export,
+		"hint", "use a known protocol (connected/static/ospf/bgp/rip/isis/kernel) or a defined policy-statement with a `from protocol`")
+	return ""
 }
 
 // bfdProfile holds a unique BFD profile (interval + multiplier).

@@ -90,20 +90,40 @@ move or rename the markers — they're literal strings.
   `validateRoutingExportReferencesStrict` in `pkg/config/compiler.go`.
   Strict on commit/commit-check; lenient (warn) on load/HA-sync (#1960).
   This closes the render-side fail-open paths that previously turned a typo
-  into broken or silent config: `resolveRedistribute`'s fallback emits
-  `redistribute <token>` for ANY unknown export (FRR rejects the line or
-  no-ops); a BGP group/neighbor export renders `route-map <name> out`, where
-  a missing route-map resolves to permit-all (silently advertises
-  everything); and `resolveECMP` returns 0 max-paths for a missing
-  forwarding-table policy (silently disables ECMP/consistent-hash). Those
-  render fallbacks remain as belt-and-suspenders for a config that reaches
-  the renderer via the lenient path (an older-binary persisted config or a
-  peer-synced one). The bare-protocol render path also normalizes the Junos
-  `direct` token to the FRR `redistribute connected` keyword (`export
-  direct` previously rendered the FRR-invalid `redistribute direct`,
-  failing the reload) — matching the policy-term `FromProtocols`
-  normalization and keeping the commit gate's acceptance of `direct`
-  honest.
+  into broken or silent config: a BGP group/neighbor export renders
+  `route-map <name> out`, where a missing route-map resolves to permit-all
+  (silently advertises everything); and `resolveECMP` returns 0 max-paths
+  for a missing forwarding-table policy (silently disables
+  ECMP/consistent-hash). Those render fallbacks remain as
+  belt-and-suspenders for a config that reaches the renderer via the
+  lenient path (an older-binary persisted config or a peer-synced one). The
+  bare-protocol render path also normalizes the Junos `direct` token to the
+  FRR `redistribute connected` keyword (`export direct` previously rendered
+  the FRR-invalid `redistribute direct`, failing the reload) — matching the
+  policy-term `FromProtocols` normalization and keeping the commit gate's
+  acceptance of `direct` honest.
+- **`resolveRedistribute` never emits an invalid `redistribute <name>`
+  line (#2223).** FRR's `redistribute` requires a source-protocol token
+  (`connected`/`static`/`ospf`/`bgp`/`rip`/`isis`/`kernel`); a bare
+  policy-statement name or a typo is rejected by `frr-reload.py`, and
+  because the line lives in the xpf-managed section that ONE rejected line
+  degrades the WHOLE reload (`frr-reload.py` exits non-zero on any
+  `CMD_WARNING_CONFIG_FAILED`, then the additive `vtysh -f` fallback
+  rejects it too) — every managed route/redistribute is lost, not just the
+  bad stanza. The commit-time strict validator accepts any DEFINED
+  policy-statement for a redistribute-backed export; it does NOT require the
+  policy to carry a `from protocol`. So a policy that matches only `from
+  community` / `from prefix-list` / `from as-path` passes commit but yields
+  zero `FromProtocols` at render time. In that case — and for any token that
+  is neither a known protocol nor a defined policy-statement (a name slipped
+  past validation on a lenient load/HA-sync path) — `resolveRedistribute`
+  now SKIPS emission and logs a `slog.Warn` (returns `""`) rather than
+  falling back to the FRR-invalid bare-name line. Redistribute has no
+  construct to express "redistribute whatever this policy matches" without a
+  source protocol, so skipping is the only correct outcome; the operator is
+  warned to add a `from protocol <proto>` (or use a bare protocol token).
+  This is the load-bearing invariant: a single unresolvable export can never
+  poison the entire managed-section reload.
 - `vtysh -c` is run synchronously in batch mode for state queries. There
   is no streaming; long output is buffered.
 - All `vtysh` and `frr-reload.py` shell-outs route through the
