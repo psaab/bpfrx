@@ -77,11 +77,11 @@ type SyncLease struct {
 	HWAddress string // "aa:bb:cc:dd:ee:ff"
 	ClientID  string // RFC 2131 client identifier, Kea hex form ("01:..")
 
-	// v6 identity (DUID/IAID) + lease kind. Type is "IA_NA" or "IA_PD".
+	// v6 identity (DUID/IAID) + lease kind. Type is "IA_NA", "IA_TA", or "IA_PD".
 	DUID      string
 	IAID      uint32
-	LeaseType string // v6: "IA_NA" (address) or "IA_PD" (prefix delegation)
-	PrefixLen int    // v6 IA_PD: delegated prefix length (0 for IA_NA)
+	LeaseType string // v6: "IA_NA"/"IA_TA" (address) or "IA_PD" (prefix delegation)
+	PrefixLen int    // v6 IA_PD: delegated prefix length (0 for IA_NA / IA_TA)
 
 	Hostname  string
 	FQDNFwd   bool // client requested forward DNS update
@@ -353,6 +353,14 @@ func splitV4Identity(identity string) (hwaddr, clientID string) {
 // caller skips a row it cannot faithfully type rather than mis-seeding it
 // (#2262). IA_TA is passed through for parity with the socket path, which
 // reports whatever kind Kea returns.
+//
+// keaLeaseTypeToString and stringToKeaLeaseType are a single total inverse
+// pair: every value one accepts, the other round-trips back, and neither has a
+// branch the other lacks. The memfile WRITE path (writeMemfile6) and the
+// control-socket add path (syncLeaseToKea) both go through stringToKeaLeaseType
+// so the read↔write lease-type mapping cannot drift to re-introduce the #2268
+// IA_TA downgrade (a synced IA_TA lease read as IA_TA but written back as
+// IA_NA).
 func keaLeaseTypeToString(t int) (string, bool) {
 	switch t {
 	case keaLeaseTypeIANA:
@@ -363,6 +371,24 @@ func keaLeaseTypeToString(t int) (string, bool) {
 		return "IA_PD", true
 	}
 	return "", false
+}
+
+// stringToKeaLeaseType is the exact inverse of keaLeaseTypeToString: it maps the
+// SyncLease.LeaseType string back to the numeric Kea memfile lease_type column.
+// An empty string defaults to IA_NA (an address lease) — the historical
+// behavior for a lease whose kind the read side could not determine. ok is false
+// for any other non-empty value so the WRITE path never silently emits a
+// mis-typed row; the caller falls back to IA_NA and logs.
+func stringToKeaLeaseType(s string) (int, bool) {
+	switch s {
+	case "", "IA_NA":
+		return keaLeaseTypeIANA, true
+	case "IA_TA":
+		return keaLeaseTypeIATA, true
+	case "IA_PD":
+		return keaLeaseTypeIAPD, true
+	}
+	return keaLeaseTypeIANA, false
 }
 
 // splitV6Identity inverts identity6 ("duid:DUID/IAID") back into DUID + IAID.
@@ -491,11 +517,19 @@ func syncLeaseToKea(l SyncLease, now time.Time) keaLeaseJSON {
 	if l.Family == 6 {
 		kl.DUID = l.DUID
 		kl.IAID = l.IAID
-		kl.Type = l.LeaseType
-		if kl.Type == "" {
-			kl.Type = "IA_NA"
+		// Normalize the lease kind through the shared inverse so the socket-add
+		// path and the memfile pre-seed path agree on every type (#2268). An
+		// unknown string falls back to IA_NA, matching writeMemfile6.
+		lt, ok := stringToKeaLeaseType(l.LeaseType)
+		if !ok {
+			slog.Warn("dhcpserver: seed v6 lease with unknown lease_type, sending as IA_NA",
+				"address", l.Address, "lease_type", l.LeaseType)
 		}
-		if kl.Type == "IA_PD" {
+		s, _ := keaLeaseTypeToString(lt)
+		kl.Type = s
+		// Only IA_PD carries a delegated prefix length; IA_NA / IA_TA are address
+		// bindings (Kea infers /128), so prefix-len stays unset for them.
+		if lt == keaLeaseTypeIAPD {
 			kl.PrefixLen = l.PrefixLen
 		}
 	} else {
@@ -632,12 +666,19 @@ func writeMemfile6(path string, leases []SyncLease, now time.Time) error {
 			rem = 1
 		}
 		expire := now.Unix() + int64(rem)
-		leaseType := 0 // IA_NA
-		if l.LeaseType == "IA_PD" {
-			leaseType = 2 // IA_PD
+		// Encode the v6 lease kind symmetrically with the read path
+		// (keaLeaseTypeToString) via the shared inverse so IA_NA / IA_TA / IA_PD
+		// all round-trip (#2268). An unknown string falls back to IA_NA (an
+		// address lease) and is logged rather than silently mis-typed.
+		leaseType, ok := stringToKeaLeaseType(l.LeaseType)
+		if !ok {
+			slog.Warn("dhcpserver: pre-seed v6 lease with unknown lease_type, writing as IA_NA",
+				"address", l.Address, "lease_type", l.LeaseType)
 		}
+		// IA_PD carries a delegated prefix length; IA_NA and IA_TA are full /128
+		// address bindings (no prefix concept), so their prefix_len column is 128.
 		prefixLen := l.PrefixLen
-		if leaseType == 0 {
+		if leaseType != keaLeaseTypeIAPD {
 			prefixLen = 128
 		}
 		// address,duid,valid_lifetime,expire,subnet_id,pref_lifetime,
