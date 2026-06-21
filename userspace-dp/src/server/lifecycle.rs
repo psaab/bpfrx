@@ -112,6 +112,7 @@ pub(crate) fn run() -> Result<(), String> {
             pending_neigh_duplicate_drops_total: 0,
             pending_neigh_decap_drops_total: 0,
             session_publish_errors_total: 0,
+            dnat_publish_errors_total: 0,
             nat_reverse_key_shared_displacements_total: 0,
             worker_command_queue_poison_recoveries: 0,
             dynamic_neighbor_keys: Vec::new(),

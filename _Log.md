@@ -99,6 +99,35 @@
   pkg/dataplane/userspace/nat_per_uplink_test.go,
   userspace-dp/tests/fixtures/protocol_wire_v1.json,
   docs/feature-gaps.md, docs/userspace-dataplane-gaps.md
+## 2026-06-21 — #2244: dnat_table reverse-NAT publish failure now counted + surfaced
+
+- **Timestamp**: 2026-06-21
+- **Action**: Stop silently discarding the `bpf_map_update_elem` return in
+  `publish_dnat_table_entry()` (reverse-SNAT entry for embedded-ICMP NAT
+  reversal). The function now returns `bool` (`#[must_use]`): `true` for the
+  no-op / nothing-to-publish paths, `false` only when the syscall fails. Both
+  worker poll call sites bump a new per-binding `dnat_publish_errors`
+  (`BindingLiveState`) on `false` and `publish_dnat_table_entry` logs the first
+  32 failures to journald then suppresses the rest (session-install path — the
+  counter is the durable signal). Summed by `Coordinator::dnat_publish_errors_total()`, carried
+  on `ProcessStatus.dnat_publish_errors_total` (wire `dnat_publish_errors_total`,
+  omitempty), and surfaced as the Prometheus counter
+  `xpf_userspace_dnat_publish_errors_total`. Mirrors the #1789
+  `session_publish_errors` pattern end to end. Allocation-free hot path (one
+  Relaxed fetch_add on the rare error branch). Regenerated
+  `protocol_wire_v1.json` (one new `process_status` key). Fail-on-revert Rust
+  tests assert `false` + counter increment on an injected bad-fd failure.
+- **File(s)**: userspace-dp/src/afxdp/checksum.rs,
+  userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/umem/mod.rs,
+  userspace-dp/src/afxdp/coordinator/status.rs,
+  userspace-dp/src/protocol/control.rs, userspace-dp/src/server/lifecycle.rs,
+  userspace-dp/src/server/helpers.rs, userspace-dp/src/afxdp/tests.rs,
+  userspace-dp/tests/fixtures/protocol_wire_v1.json,
+  pkg/dataplane/userspace/protocol.go, pkg/api/metrics.go,
+  pkg/api/metrics_descriptors.go, pkg/api/metrics_userspace.go,
+  pkg/api/metrics_test.go, pkg/api/metrics_descriptor_coverage_test.go,
+  docs/userspace-icmp-te-debugging.md
 
 ## 2026-06-21 — #2215: screen parity — ping-of-death port + LAND widen
 

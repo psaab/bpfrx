@@ -737,6 +737,7 @@
     "debug_reconcile_calls": 0,
     "debug_reconcile_stage": "",
     "debug_worker_threads": 0,
+    "dnat_publish_errors_total": 0,
     "enabled": false,
     "event_stream_acked": 0,
     "event_stream_connected": false,

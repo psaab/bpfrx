@@ -746,6 +746,17 @@ type ProcessStatus struct {
 	// as xpf_userspace_session_publish_errors_total. Omitempty for wire
 	// compat with older helpers.
 	SessionPublishErrorsTotal uint64 `json:"session_publish_errors_total,omitempty"`
+	// DnatPublishErrorsTotal counts failed dnat_table reverse-SNAT BPF-map
+	// publishes across userspace workers (#2244). The dnat_table is the
+	// reverse lookup the embedded-ICMP NAT path consults to map an inbound
+	// ICMP error (PMTUD Packet Too Big / Time Exceeded / traceroute) back
+	// to the original pre-NAT source; a failed publish (map at capacity,
+	// EINVAL) silently omits the record so the error is dropped or
+	// mis-delivered. A rising value is the cause-side signal for dnat_table
+	// map-capacity pressure. Surfaced as
+	// xpf_userspace_dnat_publish_errors_total. Omitempty for wire compat
+	// with older helpers.
+	DnatPublishErrorsTotal uint64 `json:"dnat_publish_errors_total,omitempty"`
 	// #1760 W3': shared-map NAT reverse-key displacement events — a
 	// publish_shared_session insert into shared_nat_sessions displaced a
 	// DIFFERENT forward session's entry at the same reverse key (two live

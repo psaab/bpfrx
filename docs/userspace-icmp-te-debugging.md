@@ -85,6 +85,30 @@ correctly. When forwarding was armed, the userspace shim redirected ICMP TE to
 userspace where the NAT reversal did not work (per-worker session isolation
 plus cross-worker shared session lookup issue).
 
+## Observability: `dnat_table` reverse-NAT publish failures (#2244)
+
+The reverse-NAT records the embedded-ICMP handler looks up are written to the
+BPF `dnat_table` by `publish_dnat_table_entry()`
+(`userspace-dp/src/afxdp/checksum.rs`) on the worker session-install poll path.
+Before #2244 the `bpf_map_update_elem` return code was discarded: under
+`dnat_table` capacity pressure or kernel resource exhaustion the reverse record
+was silently omitted, so a later inbound ICMP error (Time Exceeded / Packet Too
+Big for PMTUD, traceroute) could not be reverse-NAT'd back to the original
+pre-NAT source — dropped or mis-delivered with no operator signal.
+
+`publish_dnat_table_entry()` now returns `false` only when the syscall actually
+fails (the no-SNAT / unsupported-family / absent-fd no-op paths return `true`).
+Each worker poll call site bumps the per-binding `dnat_publish_errors`
+(`BindingLiveState`, `userspace-dp/src/afxdp/umem/mod.rs`) on `false`;
+`publish_dnat_table_entry` logs the first 32 failures to journald then
+suppresses the rest (the counter is the durable signal — both call sites are on
+the session-install path, so an unbounded log would storm under sustained
+`dnat_table` pressure). The counter is summed by
+`Coordinator::dnat_publish_errors_total()` and surfaced as the Prometheus
+counter **`xpf_userspace_dnat_publish_errors_total`**. A nonzero value is the
+cause-side signal for `dnat_table` map-capacity pressure that degrades
+embedded-ICMP NAT reversal.
+
 ## XDP Shim Fixes Applied
 
 1. **GRE/ESP XDP_PASS** (`7af4829`): GRE (proto 47) and ESP (proto 50) use `cpumap_or_pass()` directly instead of `fallback_to_main()` tail-call, which was silently failing (XDP_DROP fallthrough).

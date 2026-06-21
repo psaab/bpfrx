@@ -7075,3 +7075,116 @@ fn replay_filter_drops_purged_forward_and_derived_reverse_companion() {
     filter_replayed_synced_sessions(&mut entries, &[7]);
     assert_eq!(entries.len(), 1);
 }
+
+// ---------------------------------------------------------------------------
+// #2244: publish_dnat_table_entry must surface bpf_map_update_elem failures.
+//
+// Before #2244 the syscall return was discarded with `unsafe { ... };`, so a
+// failed reverse-SNAT dnat_table publish (map at capacity / EINVAL / bad fd)
+// was completely silent — no counter, no log. The embedded-ICMP NAT path then
+// cannot reverse-NAT an inbound ICMP error (PMTUD / traceroute) back to the
+// original source. These tests pin the new contract:
+//   * the function returns `true` for the no-op / nothing-to-publish paths,
+//   * it returns `false` when the syscall actually fails, and
+//   * the worker call-site increment logic bumps `dnat_publish_errors` on
+//     `false` and leaves it at 0 otherwise.
+//
+// FAIL-ON-REVERT: if the syscall return is discarded again (function reverts
+// to `-> ()` / ignores `rc`), `publish_dnat_table_entry` can no longer report
+// the failure, the `false` assertion and the counter-increment assertion both
+// regress, and these tests fail.
+// ---------------------------------------------------------------------------
+
+fn dnat_snat_decision() -> NatDecision {
+    NatDecision {
+        rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
+        rewrite_src_port: Some(54321),
+        ..NatDecision::default()
+    }
+}
+
+fn dnat_v4_key() -> SessionKey {
+    SessionKey {
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_TCP,
+        src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 100)),
+        dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+        src_port: 12345,
+        dst_port: 443,
+    }
+}
+
+#[test]
+fn publish_dnat_table_entry_noops_return_true() {
+    // No SNAT rewrite → nothing to publish, treated as success.
+    let no_snat = NatDecision::default();
+    assert!(publish_dnat_table_entry(
+        &DnatTableFds { v4: Some(-1), v6: None },
+        &dnat_v4_key(),
+        no_snat,
+    ));
+
+    // SNAT present but no v4 table fd → nothing to publish, success.
+    assert!(publish_dnat_table_entry(
+        &DnatTableFds::default(),
+        &dnat_v4_key(),
+        dnat_snat_decision(),
+    ));
+
+    // SNAT present but the key is not AF_INET → unsupported family, success.
+    let mut v6_key = dnat_v4_key();
+    v6_key.addr_family = libc::AF_INET6 as u8;
+    assert!(publish_dnat_table_entry(
+        &DnatTableFds { v4: Some(-1), v6: None },
+        &v6_key,
+        dnat_snat_decision(),
+    ));
+}
+
+#[test]
+fn publish_dnat_table_entry_reports_syscall_failure() {
+    // An invalid map fd forces bpf_map_update_elem to fail (EBADF). The
+    // function must now report that failure instead of swallowing it.
+    let fds = DnatTableFds { v4: Some(-1), v6: None };
+    let ok = publish_dnat_table_entry(&fds, &dnat_v4_key(), dnat_snat_decision());
+    assert!(
+        !ok,
+        "publish_dnat_table_entry must return false when bpf_map_update_elem fails"
+    );
+}
+
+#[test]
+fn publish_dnat_table_entry_failure_increments_counter() {
+    // Mirror the worker poll call-site increment logic against a real
+    // BindingLiveState. Pre-#2244 the counter did not exist and the syscall
+    // result was discarded, so this increment was impossible.
+    let live = BindingLiveState::new();
+    assert_eq!(live.dnat_publish_errors.load(Ordering::Relaxed), 0);
+
+    // Success / no-op path: no increment.
+    if !publish_dnat_table_entry(&DnatTableFds::default(), &dnat_v4_key(), dnat_snat_decision()) {
+        live.dnat_publish_errors.fetch_add(1, Ordering::Relaxed);
+    }
+    assert_eq!(
+        live.dnat_publish_errors.load(Ordering::Relaxed),
+        0,
+        "no-op publish must not bump the error counter"
+    );
+
+    // Failing publish (bad fd): increment fires.
+    let fds = DnatTableFds { v4: Some(-1), v6: None };
+    if !publish_dnat_table_entry(&fds, &dnat_v4_key(), dnat_snat_decision()) {
+        live.dnat_publish_errors.fetch_add(1, Ordering::Relaxed);
+    }
+    assert_eq!(
+        live.dnat_publish_errors.load(Ordering::Relaxed),
+        1,
+        "failed dnat_table publish must increment dnat_publish_errors"
+    );
+
+    // A second failure accumulates.
+    if !publish_dnat_table_entry(&fds, &dnat_v4_key(), dnat_snat_decision()) {
+        live.dnat_publish_errors.fetch_add(1, Ordering::Relaxed);
+    }
+    assert_eq!(live.dnat_publish_errors.load(Ordering::Relaxed), 2);
+}
