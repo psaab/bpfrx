@@ -2090,6 +2090,17 @@ New feature — auto-reply ARP for NAT pool addresses on same L2 segment.
   - Lists existing NTF_PROXY neighbors via `netlink.NeighList()`
   - Adds missing entries with `netlink.NeighSet()` (NTF_PROXY flag)
   - Removes stale entries with `netlink.NeighDel()`
+  - Enables the per-interface kernel proxy responder sysctl for every
+    interface with a desired entry (#2160): `net.ipv4.conf.<if>.proxy_arp`
+    for IPv4, `net.ipv6.conf.<if>.proxy_ndp` for IPv6. The NTF_PROXY neighbor
+    entry alone is **not** sufficient — the Linux kernel ignores a proxy-neigh
+    entry unless the responder sysctl is on, so without this the firewall never
+    answers ARP for a static-NAT (or any) external address and the address is
+    unreachable until a manual static ARP is added. The procfs interface name
+    is resolved from the same ifindex the neighbor entry was installed on (via
+    `netlink.LinkByIndex`) so VLAN sub-interface naming stays consistent. The
+    write goes through the `proxyARPSysctlSeam` package var (best-effort
+    `os.WriteFile`) so unit tests capture it without touching real procfs.
   - Returns `ProxyARPAdded` structs for caller to send GARPs (avoids cluster import cycle)
 - **`pkg/daemon/daemon.go`** — Calls `ReconcileProxyARP()` after VRRP VIP reconciliation;
   sends GARPs for newly added entries

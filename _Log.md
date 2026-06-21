@@ -1,5 +1,33 @@
 # Action Log
 
+## 2026-06-21 — #2160 static-NAT proxy-ARP: enable per-interface responder sysctl
+
+- **Timestamp**: 2026-06-21
+- **Action**: Fixed #2160 (found in the PR #2132 NAT smoke). `ReconcileProxyARP`
+  installed the NTF_PROXY neighbor entry for a proxy-ARP'd NAT external address
+  but left `net.ipv4.conf.<if>.proxy_arp = 0`, and the Linux kernel ignores a
+  proxy-neigh entry unless that per-interface sysctl is on — so the firewall
+  never answered ARP for a static-NAT (or any) external address and the address
+  was unreachable until a manual static ARP was added (the smoke had to add a
+  host-side static ARP). Fix: after the neighbor reconcile, enable the kernel
+  proxy responder sysctl for every interface that has a desired proxy entry —
+  `proxy_arp` for IPv4, `proxy_ndp` for IPv6 — resolving the procfs interface
+  name from the same ifindex the neighbor entry was installed on (so VLAN
+  sub-interface naming matches the install). Re-enabled on every reconcile, not
+  just on add, because networkd reload resets per-interface sysctls. The procfs
+  write goes through a `proxyARPSysctlSeam` package var so it is unit-testable
+  without touching real /proc. Best-effort: a write failure is logged, never
+  fatal, matching the surrounding reconcile. 8 new Go tests (v4/v6/dual-stack/
+  multi-interface ordering/failure-non-fatal/empty/unsupported-family +
+  end-to-end `ReconcileProxyARP` against lo that FAILS on simulated pre-fix —
+  neighbor installed, sysctl left 0). build ./... + go vet + go test
+  pkg/dataplane/... green; integration test verified PASS under sudo and FAIL
+  when the enable call is removed. Live ARP-answer verification is
+  PENDING-PARENT (standalone DUT RX black-hole #1928/#1961; needs the loss
+  cluster or deferral). Docs: feature-gaps.md (proxy-ARP row now notes the
+  sysctl; proxy-NDP row Missing→Partial), phases.md (sysctl step documented).
+  **File(s)**: pkg/dataplane/proxyarp.go, pkg/dataplane/proxyarp_test.go,
+  docs/feature-gaps.md, docs/phases.md, _Log.md
 ## 2026-06-21 — #2188 fold three review NITs (VRRP IPv6 ext-header consistency)
 
 - **Timestamp**: 2026-06-21
