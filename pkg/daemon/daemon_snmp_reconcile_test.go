@@ -71,8 +71,10 @@ func TestApplyConfigLockedReconcilesSNMPAuthorization(t *testing.T) {
 
 // TestApplyConfigLockedReconcilesSNMPBeforeDataplaneAbort is the Codex r2
 // regression: the SNMP reconcile must run BEFORE the dataplane apply, which
-// aborts applyConfigLocked early on ErrPolicySchedulerProtocolIncompatible
-// (compileErrorMustAbortApply). Store.Commit() has already promoted/persisted
+// aborts applyConfigLocked early on any required userspace protocol-gate error
+// (compileErrorMustAbortApply — this test uses the policy-scheduler sentinel
+// as the abort vector; the persistent-source-NAT gate, #2138, aborts
+// identically). Store.Commit() has already promoted/persisted
 // the compiled config, so the committed authorization is live regardless of
 // whether the dataplane apply later fails. If the reconcile is placed AFTER the
 // abort (the original step-16b position), an early-aborting apply leaves the

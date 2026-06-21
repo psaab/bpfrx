@@ -4,7 +4,6 @@ package daemon
 import (
 	"bytes"
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -347,8 +346,9 @@ func (d *Daemon) applyConfigLocked(cfg *config.Config) error {
 	// stale authorization.
 	//
 	// This MUST run before any reconcile step that can abort applyConfigLocked
-	// early — specifically the dataplane apply below, which returns early on
-	// ErrPolicySchedulerProtocolIncompatible (compileErrorMustAbortApply).
+	// early — specifically the dataplane apply below, which returns early on a
+	// required userspace protocol-gate error (compileErrorMustAbortApply:
+	// policy-scheduler OR persistent-source-NAT protocol incompatibility, #2138).
 	// Store.Commit() has ALREADY promoted and persisted this compiled config
 	// before applyConfigLocked runs, so the committed authorization is live
 	// regardless of whether the later dataplane apply succeeds. Reconciling
@@ -1321,8 +1321,28 @@ func (d *Daemon) applyConfigLocked(cfg *config.Config) error {
 	return dhcpServerErr
 }
 
+// compileErrorMustAbortApply reports whether a dataplane ApplyConfig error
+// must abort the commit — i.e. the operator-facing commit must report
+// failure rather than success against a fail-closed (disarmed) dataplane.
+//
+// It delegates to dpuserspace.IsRequiredProtocolGateError so the abort set
+// is table-driven and co-located with the protocol-gate sentinels and the
+// ensureRequiredSnapshotProtocolLocked gate that emits them. Before #2138
+// this matched ONLY ErrPolicySchedulerProtocolIncompatible, so the sibling
+// ErrPersistentSourceNATProtocolIncompatible fell through: ApplyConfig
+// disarmed the helper but the commit was promoted/persisted anyway — a
+// silent forwarding outage on a "successful" commit. The delegation covers
+// both gates and any future required protocol gate the moment its sentinel
+// joins the list.
+//
+// "Abort" here means the apply/commit-RPC result returned up to the
+// HTTP/gRPC/CLI committer becomes non-nil. Store.Commit/CommitConfirmed/
+// SyncApply have ALREADY promoted+persisted the compiled config before
+// applyConfigLocked runs, so the abort does not unwind store promotion;
+// the operator-visible signal is the failed commit plus the disarmed
+// dataplane (the same contract the scheduler gate has always had).
 func compileErrorMustAbortApply(err error) bool {
-	return errors.Is(err, dpuserspace.ErrPolicySchedulerProtocolIncompatible)
+	return dpuserspace.IsRequiredProtocolGateError(err)
 }
 
 func (d *Daemon) setDataplaneDeferWorkers(deferWorkers bool) {
