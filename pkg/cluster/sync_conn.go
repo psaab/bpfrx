@@ -100,24 +100,47 @@ func (s *SessionSync) stampInstallGenV6(key dataplane.SessionKeyV6, val *datapla
 	s.genSentMu.Unlock()
 }
 
-// takeDeleteGenV4 returns the generation last stamped for this wire key and
-// evicts the entry, so a delete carries the exact generation of the install it
-// cancels. A key never installed in this boot returns 0 (legacy fallback →
-// unconditional delete in the apply guard), which is the safe behavior.
+// takeDeleteGenV4 returns the generation a delete for this wire key should
+// carry and evicts the sender-side stamp.
+//
+// #2221: the delete draws a FRESH, strictly-greater generation
+// (nextInstallGen) rather than echoing the install's stamp. The stamp and the
+// sendCh enqueue are not atomic and two producer goroutines (the sweep
+// stamping a live re-send, the delta-drain taking the close) mutate the same
+// key, so a delete can be enqueued onto sendCh BEFORE the install it cancels.
+// On the wire the receiver then applies delete then install with IDENTICAL
+// generations; the receiver guards only refuse a STRICTLY-older operation, so
+// the late install resurrects the closed session (the #2170 residual:
+// stale-RETAIN rather than stale-delete). Drawing a fresh generation that is
+// strictly greater than every prior install of this key makes a delete always
+// out-rank the install it cancels: the receiver's install guard refuses a
+// reordered older install (incoming < the delete tombstone), while a genuinely
+// newer incarnation (re-established + re-stamped by a later sweep) carries an
+// even higher generation and still applies. This composes with #2170: the
+// per-key generation only ever climbs, so a journaled stale delete from before
+// a re-sync is still strictly older than the live entry and refused.
+//
+// A key never installed in this boot (no stamp recorded) returns 0 (legacy
+// fallback → unconditional delete in the apply guard), which is the safe
+// behavior and preserves rolling-upgrade compatibility.
 func (s *SessionSync) takeDeleteGenV4(key dataplane.SessionKey) uint64 {
 	s.genSentMu.Lock()
 	defer s.genSentMu.Unlock()
-	g := s.genSentV4[key]
+	if _, ok := s.genSentV4[key]; !ok {
+		return 0
+	}
 	delete(s.genSentV4, key)
-	return g
+	return s.nextInstallGen()
 }
 
 func (s *SessionSync) takeDeleteGenV6(key dataplane.SessionKeyV6) uint64 {
 	s.genSentMu.Lock()
 	defer s.genSentMu.Unlock()
-	g := s.genSentV6[key]
+	if _, ok := s.genSentV6[key]; !ok {
+		return 0
+	}
 	delete(s.genSentV6, key)
-	return g
+	return s.nextInstallGen()
 }
 
 // installGenGuardV4 implements the receiver-side install-side guard (#2170 SMR
@@ -188,9 +211,21 @@ func (s *SessionSync) recordInstalledGenV6(key dataplane.SessionKeyV6, gen uint6
 // is refused only when both the stored and delete generations are non-zero and
 // the delete generation is STRICTLY older than the stored entry's. Equality
 // applies (it is the delete of the very session installed); gen==0 on either
-// side falls back to today's unconditional delete (rolling-upgrade safe). On
-// an applied delete the stored generation is evicted. The bool reports whether
-// the delete should proceed.
+// side falls back to today's unconditional delete (rolling-upgrade safe). The
+// bool reports whether the delete should proceed.
+//
+// #2221: on an applied delete the stored generation is NOT evicted — it is
+// upgraded to the (strictly-greater, see takeDeleteGenV4) delete generation as
+// a TOMBSTONE. A subsequent reordered install that carries the OLDER generation
+// of the very session this delete cancelled is then refused by installGenGuard*
+// (incoming < the tombstone), so the standby converges to the master's state
+// (session GONE) regardless of install/delete arrival order. A genuinely newer
+// incarnation re-established and re-stamped by a later sweep carries a higher
+// generation and still applies (incoming > tombstone). A gen-0 (legacy) delete
+// evicts (no tombstone to record) — the legacy unconditional path is unchanged.
+// Tombstones are bounded by genGuardMapCap (putGenBounded) and cleared by the
+// bulk barrier (resetRecvGen), so a churning workload cannot grow the map
+// without limit and a cross-boot generation regression is handled at BulkStart.
 func (s *SessionSync) deleteGenGuardV4(key dataplane.SessionKey, deleteGen uint64) bool {
 	s.recvGenMu.Lock()
 	defer s.recvGenMu.Unlock()
@@ -198,7 +233,18 @@ func (s *SessionSync) deleteGenGuardV4(key dataplane.SessionKey, deleteGen uint6
 	if stored != 0 && deleteGen != 0 && deleteGen < stored {
 		return false
 	}
-	delete(s.recvGenV4, key)
+	if deleteGen != 0 {
+		// Record the delete generation as a tombstone so a reordered older
+		// install of the cancelled session is refused. Bounded; never clears.
+		if s.recvGenV4 == nil {
+			s.recvGenV4 = make(map[dataplane.SessionKey]uint64)
+		}
+		if !putGenBounded(s.recvGenV4, key, deleteGen) {
+			s.stats.GenMapOverflow.Add(1)
+		}
+	} else {
+		delete(s.recvGenV4, key)
+	}
 	return true
 }
 
@@ -209,7 +255,16 @@ func (s *SessionSync) deleteGenGuardV6(key dataplane.SessionKeyV6, deleteGen uin
 	if stored != 0 && deleteGen != 0 && deleteGen < stored {
 		return false
 	}
-	delete(s.recvGenV6, key)
+	if deleteGen != 0 {
+		if s.recvGenV6 == nil {
+			s.recvGenV6 = make(map[dataplane.SessionKeyV6]uint64)
+		}
+		if !putGenBounded(s.recvGenV6, key, deleteGen) {
+			s.stats.GenMapOverflow.Add(1)
+		}
+	} else {
+		delete(s.recvGenV6, key)
+	}
 	return true
 }
 
@@ -772,9 +827,12 @@ func (s *SessionSync) QueueSessionV6(key dataplane.SessionKeyV6, val dataplane.S
 
 // QueueDeleteV4 queues a v4 session deletion for synchronization. If the peer
 // is disconnected, the delete is journaled for replay on reconnect. The delete
-// echoes the install generation last stamped for this key (#2170) so a
-// journaled delete that replays after a same-key replacement was re-synced is
-// refused by the peer (its generation is strictly older than the live entry).
+// draws a fresh generation strictly greater than the install it cancels
+// (takeDeleteGenV4, #2170 + #2221) so (a) a journaled delete that replays after
+// a same-key replacement was re-synced is refused by the peer (its generation
+// is strictly older than the live entry) and (b) a delete reordered ahead of
+// its own install out-ranks it, letting the peer's tombstone refuse the late
+// install of the cancelled session.
 func (s *SessionSync) QueueDeleteV4(key dataplane.SessionKey) {
 	gen := s.takeDeleteGenV4(key)
 	msg := encodeDeleteV4(key, gen)
