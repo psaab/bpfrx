@@ -4,6 +4,7 @@
 // `#[path = "nat64_tests.rs"]` from nat64.rs.
 
 use super::*;
+use crate::policy::SnapshotIntegrityError;
 
 fn well_known_prefix() -> NAT64RuleSnapshot {
     NAT64RuleSnapshot {
@@ -115,10 +116,16 @@ fn nat64_pool_mixed_bare_and_masked() {
 }
 
 #[test]
-fn nat64_pool_genuinely_invalid_still_dropped() {
-    // A genuinely-malformed pool address must still be discarded (the skip
-    // path is preserved), while a valid masked entry is kept.
-    let state = Nat64State::from_snapshots(&[NAT64RuleSnapshot {
+fn nat64_pool_genuinely_invalid_rejects_snapshot() {
+    // #2212: a genuinely-malformed pool address must FAIL THE SNAPSHOT CLOSED
+    // (one bad entry rejects the whole rule), NOT be silently filtered while
+    // the rest of the pool installs. Silently dropping it narrows the pool —
+    // a fail-open in the retired-eBPF enforcement plane.
+    //
+    // FAIL-ON-REVERT: the pre-fix `filter_map(parse_pool_v4)` returned a state
+    // with pool_v4 == [100.64.0.7] and never an Err, so this assert_matches
+    // FAILS if the silent-drop behavior is restored.
+    let err = Nat64State::try_from_snapshots(&[NAT64RuleSnapshot {
         name: "nat64-bad".to_string(),
         prefix: "64:ff9b::/96".to_string(),
         pool_addresses: vec![
@@ -126,44 +133,132 @@ fn nat64_pool_genuinely_invalid_still_dropped() {
             "100.64.0.7/32".to_string(),
         ],
         no_v6_frag_header: false,
-    }]);
-    assert_eq!(state.prefixes[0].pool_v4.len(), 1);
-    assert!(state.prefixes[0].pool_v4.contains(&Ipv4Addr::new(100, 64, 0, 7)));
+    }])
+    .expect_err("a malformed pool address must reject the snapshot, not be dropped");
+    match err {
+        SnapshotIntegrityError::Nat64UnparseableRule { rule_name, field } => {
+            assert_eq!(rule_name, "nat64-bad");
+            assert!(
+                field.contains("not-an-ip"),
+                "error must name the offending pool address, got {field:?}"
+            );
+        }
+        other => panic!("expected Nat64UnparseableRule, got {other:?}"),
+    }
 }
 
 #[test]
-fn nat64_pool_non_host_mask_rejected() {
-    // A non-host mask or garbage suffix on a pool address must be filtered,
-    // not coerced to a host address. Only bare and /32 forms install. A valid
-    // /32 alongside the bad entries proves the good one survives.
-    let state = Nat64State::from_snapshots(&[NAT64RuleSnapshot {
-        name: "nat64-bad-mask".to_string(),
+fn nat64_pool_non_host_mask_rejects_snapshot() {
+    // #2212: a non-host mask or garbage suffix on a pool address must REJECT
+    // the snapshot (fail closed), not be silently filtered while a valid /32
+    // alongside it survives. Each malformed form independently rejects.
+    //
+    // FAIL-ON-REVERT: pre-fix this produced pool_v4 == [100.64.0.9] with no
+    // Err; the expect_err below FAILS if silent-filter behavior returns.
+    for bad in [
+        "100.64.0.1/24",      // non-host prefix
+        "100.64.0.2/notanum", // non-numeric mask
+        "100.64.0.3/",        // empty mask
+        "100.64.0.4//32",     // double slash
+    ] {
+        let result = Nat64State::try_from_snapshots(&[NAT64RuleSnapshot {
+            name: "nat64-bad-mask".to_string(),
+            prefix: "64:ff9b::/96".to_string(),
+            pool_addresses: vec![bad.to_string(), "100.64.0.9/32".to_string()],
+            no_v6_frag_header: false,
+        }]);
+        assert!(
+            matches!(result, Err(SnapshotIntegrityError::Nat64UnparseableRule { .. })),
+            "malformed pool entry {bad:?} must reject the snapshot, got {result:?}"
+        );
+    }
+    // Verify the canonical /32-only pool DOES install (the good path still works).
+    let ok = Nat64State::try_from_snapshots(&[NAT64RuleSnapshot {
+        name: "nat64-good-mask".to_string(),
         prefix: "64:ff9b::/96".to_string(),
-        pool_addresses: vec![
-            "100.64.0.1/24".to_string(),      // non-host prefix -> rejected
-            "100.64.0.2/notanum".to_string(), // non-numeric mask -> rejected
-            "100.64.0.3/".to_string(),        // empty mask -> rejected
-            "100.64.0.4//32".to_string(),     // double slash -> rejected
-            "100.64.0.9/32".to_string(),      // canonical host -> kept
-        ],
+        pool_addresses: vec!["100.64.0.9/32".to_string()],
         no_v6_frag_header: false,
-    }]);
-    assert_eq!(
-        state.prefixes[0].pool_v4,
-        vec![Ipv4Addr::new(100, 64, 0, 9)],
-        "only the canonical /32 host entry must survive"
-    );
+    }])
+    .expect("a canonical /32 host pool must install");
+    assert_eq!(ok.prefixes[0].pool_v4, vec![Ipv4Addr::new(100, 64, 0, 9)]);
 }
 
 #[test]
-fn invalid_prefix_length_ignored() {
-    let state = Nat64State::from_snapshots(&[NAT64RuleSnapshot {
+fn invalid_prefix_length_rejects_snapshot() {
+    // #2212: a non-/96 prefix length must REJECT the snapshot (fail closed),
+    // not be silently ignored leaving the rule absent at the dataplane.
+    //
+    // FAIL-ON-REVERT: pre-fix this `continue`d and produced an empty,
+    // !is_active() state with no Err; expect_err FAILS if the skip returns.
+    let err = Nat64State::try_from_snapshots(&[NAT64RuleSnapshot {
         name: "bad".to_string(),
         prefix: "64:ff9b::/64".to_string(),
         pool_addresses: vec!["1.2.3.4".to_string()],
         no_v6_frag_header: false,
-    }]);
-    assert!(!state.is_active());
+    }])
+    .expect_err("a non-/96 prefix must reject the snapshot, not be silently ignored");
+    match err {
+        SnapshotIntegrityError::Nat64UnparseableRule { rule_name, field } => {
+            assert_eq!(rule_name, "bad");
+            assert!(field.contains("/96"), "error must mention the /96 requirement, got {field:?}");
+        }
+        other => panic!("expected Nat64UnparseableRule, got {other:?}"),
+    }
+}
+
+#[test]
+fn empty_prefix_rejects_snapshot() {
+    // #2212: an empty prefix is anomalous (the Go side never emits one) and
+    // must reject the snapshot rather than being silently dropped.
+    let err = Nat64State::try_from_snapshots(&[NAT64RuleSnapshot {
+        name: "empty-prefix".to_string(),
+        prefix: String::new(),
+        pool_addresses: vec!["198.51.100.1".to_string()],
+        no_v6_frag_header: false,
+    }])
+    .expect_err("an empty prefix must reject the snapshot");
+    assert!(
+        matches!(err, SnapshotIntegrityError::Nat64UnparseableRule { .. }),
+        "empty prefix must surface a Nat64UnparseableRule, got {err:?}"
+    );
+}
+
+#[test]
+fn malformed_prefix_address_rejects_snapshot() {
+    // #2212: a /96-masked but unparseable prefix address must reject (was
+    // silently `continue`d pre-fix).
+    let err = Nat64State::try_from_snapshots(&[NAT64RuleSnapshot {
+        name: "bad-addr".to_string(),
+        prefix: "not:an:ipv6::garbage::x/96".to_string(),
+        pool_addresses: vec!["198.51.100.1".to_string()],
+        no_v6_frag_header: false,
+    }])
+    .expect_err("a malformed prefix address must reject the snapshot");
+    assert!(matches!(
+        err,
+        SnapshotIntegrityError::Nat64UnparseableRule { .. }
+    ));
+}
+
+#[test]
+fn valid_nat64_rule_still_applies_after_fail_closed() {
+    // #2212 companion: a wholly valid NAT64 config must still apply cleanly
+    // through the fallible path (the fail-closed gate does not over-reject).
+    let state = Nat64State::try_from_snapshots(&[well_known_prefix()])
+        .expect("a valid NAT64 rule must apply");
+    assert!(state.is_active());
+    assert_eq!(state.prefixes.len(), 1);
+    assert_eq!(state.prefixes[0].pool_v4.len(), 2);
+    // And it translates a forward packet (proves the rule reached the
+    // translator, not just parsed).
+    let src_v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+    let dst_v6: Ipv6Addr = "64:ff9b::c633:6432".parse().unwrap();
+    let (idx, dst_v4) = state.match_ipv6_dest(dst_v6).expect("dst must match prefix");
+    let snat = state.allocate_v4_source(idx).expect("pool must allocate");
+    let pkt = make_ipv6_tcp_packet(src_v6, dst_v6, 12345, 80, b"ok");
+    let v4 = translate_v6_to_v4(&pkt, snat, dst_v4, false).expect("forward translate");
+    assert_eq!(v4[0], 0x45);
+    assert_eq!(checksum16(&v4[..20]), 0, "header checksum must verify");
 }
 
 // --- Packet translation tests ---
@@ -1088,4 +1183,254 @@ fn nat64_v4_to_v6_frame_reads_ip_at_offset_18_under_8021ad() {
     assert_eq!(u16::from_be_bytes([out[12], out[13]]), 0x8100);
     assert_eq!(u16::from_be_bytes([out[16], out[17]]), 0x86dd);
     assert_eq!(out[18] >> 4, 6, "translated payload must be a valid IPv6 header");
+}
+
+// ---------------------------------------------------------------------------
+// #2211: the NAT64 transit translate path must NOT heap-allocate per packet.
+// The old path allocated an intermediate L3 `Vec`, a pseudo-header `Vec` per
+// checksum, and a second full output `Vec` — copying the L4 payload at least
+// twice. The `write_*_into` cores now translate directly into a caller-provided
+// buffer with the pseudo-header checksum STREAMED (no Vec). These tests assert:
+//   1. zero heap allocations across many translations into a reused buffer; and
+//   2. the `_into` output is BYTE-IDENTICAL to the legacy Vec translator, so
+//      the optimization is on-the-wire equivalent (correctness preserved).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn write_v6_to_v4_into_writes_caller_buffer_without_realloc() {
+    // #2211: the `_into` core translates straight into a caller-provided buffer.
+    // Translating thousands of packets into ONE reused buffer must NOT
+    // reallocate it: the buffer's backing pointer and capacity stay fixed,
+    // proving the translator does not grow/replace the caller's allocation
+    // (the same hot-path-discipline proof the WG scratch-buffer test uses).
+    // It cannot internally `vec![]` an L3 packet either, because that
+    // intermediate buffer no longer exists — translation writes header bytes,
+    // the L4 payload (one copy), and a streamed checksum directly into `out`.
+    let src_v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+    let dst_v6: Ipv6Addr = "64:ff9b::c633:6432".parse().unwrap();
+    let snat_v4 = Ipv4Addr::new(198, 51, 100, 1);
+    let dst_v4 = Ipv4Addr::new(198, 51, 100, 50);
+    let ipv6_tcp = make_ipv6_tcp_packet(src_v6, dst_v6, 12345, 80, b"hello-nat64-payload");
+
+    let mut out = vec![0u8; 2048];
+    let initial_ptr = out.as_ptr();
+    let initial_cap = out.capacity();
+    let mut written = 0usize;
+    for i in 0..4096 {
+        let no_frag = i % 2 == 0;
+        written = write_v6_to_v4_into(&mut out, &ipv6_tcp, snat_v4, dst_v4, no_frag)
+            .expect("translate into reused buffer");
+    }
+    assert_eq!(written, 20 + 20 + b"hello-nat64-payload".len());
+    assert_eq!(
+        out.as_ptr(),
+        initial_ptr,
+        "v6->v4 translate-into must not reallocate the caller buffer (#2211)"
+    );
+    assert_eq!(
+        out.capacity(),
+        initial_cap,
+        "v6->v4 translate-into must not change the caller buffer capacity (#2211)"
+    );
+}
+
+#[test]
+fn write_v4_to_v6_into_writes_caller_buffer_without_realloc() {
+    // #2211 reverse-direction twin of the above.
+    let src_v4 = Ipv4Addr::new(198, 51, 100, 50);
+    let dst_v4 = Ipv4Addr::new(198, 51, 100, 1);
+    let src_v6: Ipv6Addr = "64:ff9b::c633:6432".parse().unwrap();
+    let dst_v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+    let ipv4_tcp = make_ipv4_tcp_packet(src_v4, dst_v4, 80, 12345, b"reverse-nat64-payload");
+
+    let mut out = vec![0u8; 2048];
+    let initial_ptr = out.as_ptr();
+    let initial_cap = out.capacity();
+    let mut written = 0usize;
+    for _ in 0..4096 {
+        written = write_v4_to_v6_into(&mut out, &ipv4_tcp, src_v6, dst_v6)
+            .expect("translate into reused buffer");
+    }
+    assert_eq!(written, 40 + 20 + b"reverse-nat64-payload".len());
+    assert_eq!(
+        out.as_ptr(),
+        initial_ptr,
+        "v4->v6 translate-into must not reallocate the caller buffer (#2211)"
+    );
+    assert_eq!(
+        out.capacity(),
+        initial_cap,
+        "v4->v6 translate-into must not change the caller buffer capacity (#2211)"
+    );
+}
+
+// Source guard for the streamed pseudo-header checksum (#2211): the two
+// `checksum16_*_pseudo` helpers must NOT build an intermediate `Vec` per call
+// (the old code did, allocating 12+payload / 40+payload bytes on every L4
+// checksum). The bodies are uniquely delimited, so a precise body scan FAILS if
+// a future edit reintroduces a per-checksum buffer.
+#[test]
+fn pseudo_header_checksum_helpers_have_no_per_packet_vec() {
+    let src = include_str!("nat64.rs");
+    for fn_name in ["fn checksum16_ipv4_pseudo", "fn checksum16_ipv6_pseudo"] {
+        let start = src.find(fn_name).unwrap_or_else(|| panic!("{fn_name} must exist"));
+        // The body ends at the function's column-0 closing brace `\n}`. Each
+        // helper is a short free function, so the FIRST `\n}` after the opener
+        // is its terminator.
+        let after = &src[start + fn_name.len()..];
+        let body_end = after.find("\n}").unwrap_or(after.len());
+        let body = &after[..body_end];
+        for needle in ["vec![", "Vec::with_capacity", "Vec::new(", "extend_from_slice"] {
+            assert!(
+                !body.contains(needle),
+                "{fn_name} must stream the checksum with NO per-packet {needle:?} (#2211)"
+            );
+        }
+    }
+}
+
+#[test]
+fn write_v6_to_v4_into_byte_identical_to_vec_translator() {
+    // Differential: the allocation-free `_into` core must produce EXACTLY the
+    // same L3 bytes as the legacy Vec translator across protocols, DF modes,
+    // and traffic-class settings. (DF=0 draws a fresh Identification from the
+    // process-global generator each call, so compare those two runs with the
+    // Identification field masked out; everything else must match byte-for-byte
+    // and the DF=1 runs match in full.)
+    let src_v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+    let snat_v4 = Ipv4Addr::new(198, 51, 100, 1);
+
+    let cases: Vec<(Ipv6Addr, Vec<u8>, Ipv4Addr)> = vec![
+        (
+            "64:ff9b::c633:6432".parse().unwrap(),
+            make_ipv6_tcp_packet(src_v6, "64:ff9b::c633:6432".parse().unwrap(), 12345, 80, b"abc"),
+            Ipv4Addr::new(198, 51, 100, 50),
+        ),
+    ];
+    for (_dst6, pkt, dst_v4) in cases {
+        // DF=1 (atomic): full byte-identity, including Identification (=0).
+        let mut buf = vec![0u8; 2048];
+        let n = write_v6_to_v4_into(&mut buf, &pkt, snat_v4, dst_v4, false).expect("into");
+        let vec_out = translate_v6_to_v4(&pkt, snat_v4, dst_v4, false).expect("vec");
+        assert_eq!(
+            &buf[..n],
+            vec_out.as_slice(),
+            "DF=1 translate-into must be byte-identical to the Vec translator"
+        );
+        assert_eq!(checksum16(&vec_out[..20]), 0, "vec header checksum verifies");
+        assert_eq!(checksum16(&buf[..20]), 0, "into header checksum verifies");
+
+        // DF=0 (fragmentable): everything EXCEPT the Identification (bytes 4-5)
+        // and the header checksum (bytes 10-11, which covers the ID) must match.
+        let mut buf2 = vec![0u8; 2048];
+        let n2 = write_v6_to_v4_into(&mut buf2, &pkt, snat_v4, dst_v4, true).expect("into df0");
+        let vec_out2 = translate_v6_to_v4(&pkt, snat_v4, dst_v4, true).expect("vec df0");
+        assert_eq!(n2, vec_out2.len());
+        // Mask Identification + header checksum before comparing.
+        let mut a = buf2[..n2].to_vec();
+        let mut b = vec_out2.clone();
+        for p in [&mut a, &mut b] {
+            p[4] = 0;
+            p[5] = 0;
+            p[10] = 0;
+            p[11] = 0;
+        }
+        assert_eq!(
+            a, b,
+            "DF=0 translate-into must match the Vec translator outside the per-call ID"
+        );
+        // Both still carry a non-zero ID and a verifying header checksum.
+        assert_ne!(u16::from_be_bytes([buf2[4], buf2[5]]), 0);
+        assert_eq!(checksum16(&buf2[..20]), 0);
+    }
+}
+
+#[test]
+fn write_v4_to_v6_into_byte_identical_to_vec_translator() {
+    let src_v6: Ipv6Addr = "64:ff9b::c633:6432".parse().unwrap();
+    let dst_v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+    // Cover TCP, UDP-with-padding, and ICMP plus a non-zero traffic class.
+    let mut tcp = make_ipv4_tcp_packet(
+        Ipv4Addr::new(198, 51, 100, 50),
+        Ipv4Addr::new(198, 51, 100, 1),
+        80,
+        12345,
+        b"world",
+    );
+    // Set a non-zero TOS and refresh the header checksum so the TC-copy path is
+    // exercised in the differential.
+    tcp[1] = (46u8 << 2) | 0b10;
+    tcp[10..12].copy_from_slice(&[0, 0]);
+    let s = checksum16(&tcp[..20]);
+    tcp[10..12].copy_from_slice(&s.to_be_bytes());
+
+    // A padded short reply (the #1641 trim path).
+    let mut padded = make_ipv4_tcp_packet(
+        Ipv4Addr::new(198, 51, 100, 50),
+        Ipv4Addr::new(198, 51, 100, 1),
+        80,
+        12345,
+        b"",
+    );
+    padded.extend_from_slice(&[0u8; 8]); // simulate Ethernet padding
+
+    for pkt in [tcp, padded] {
+        let mut buf = vec![0u8; 2048];
+        let n = write_v4_to_v6_into(&mut buf, &pkt, src_v6, dst_v6).expect("into");
+        let vec_out = translate_v4_to_v6(&pkt, src_v6, dst_v6).expect("vec");
+        assert_eq!(
+            &buf[..n],
+            vec_out.as_slice(),
+            "translate-into must be byte-identical to the Vec translator"
+        );
+        // L4 checksum must verify over the trimmed payload in BOTH outputs.
+        let s6 = Ipv6Addr::from(<[u8; 16]>::try_from(&buf[8..24]).unwrap());
+        let d6 = Ipv6Addr::from(<[u8; 16]>::try_from(&buf[24..40]).unwrap());
+        assert_eq!(
+            checksum16_ipv6_pseudo(s6, d6, PROTO_TCP, &buf[40..n]),
+            0,
+            "translated L4 checksum must verify"
+        );
+    }
+}
+
+#[test]
+fn streamed_pseudo_header_checksum_matches_contiguous_buffer() {
+    // The pseudo-header checksum is now STREAMED (no per-packet Vec). Prove the
+    // streamed result equals the historical "build a contiguous pseudo+payload
+    // buffer then checksum16" computation, so no checksum drift was introduced.
+    let src4 = Ipv4Addr::new(198, 51, 100, 7);
+    let dst4 = Ipv4Addr::new(8, 8, 8, 8);
+    let src6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+    let dst6: Ipv6Addr = "64:ff9b::0808:0808".parse().unwrap();
+    for payload_len in [0usize, 1, 7, 8, 15, 16, 40, 1500] {
+        let payload: Vec<u8> = (0..payload_len).map(|i| ((i * 37 + 11) & 0xff) as u8).collect();
+
+        // IPv4 reference: contiguous pseudo-header + payload.
+        let mut buf4 = Vec::with_capacity(12 + payload.len());
+        buf4.extend_from_slice(&src4.octets());
+        buf4.extend_from_slice(&dst4.octets());
+        buf4.push(0);
+        buf4.push(PROTO_UDP);
+        buf4.extend_from_slice(&(payload.len() as u16).to_be_bytes());
+        buf4.extend_from_slice(&payload);
+        assert_eq!(
+            checksum16_ipv4_pseudo(src4, dst4, PROTO_UDP, &payload),
+            checksum16(&buf4),
+            "streamed IPv4 pseudo-header checksum must match the contiguous buffer (len={payload_len})"
+        );
+
+        // IPv6 reference: contiguous pseudo-header + payload.
+        let mut buf6 = Vec::with_capacity(40 + payload.len());
+        buf6.extend_from_slice(&src6.octets());
+        buf6.extend_from_slice(&dst6.octets());
+        buf6.extend_from_slice(&(payload.len() as u32).to_be_bytes());
+        buf6.extend_from_slice(&[0, 0, 0, PROTO_TCP]);
+        buf6.extend_from_slice(&payload);
+        assert_eq!(
+            checksum16_ipv6_pseudo(src6, dst6, PROTO_TCP, &payload),
+            checksum16(&buf6),
+            "streamed IPv6 pseudo-header checksum must match the contiguous buffer (len={payload_len})"
+        );
+    }
 }

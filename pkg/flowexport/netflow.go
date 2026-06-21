@@ -397,7 +397,7 @@ func uptimeMs(boot, t time.Time) uint32 {
 
 // Exporter sends NetFlow v9 packets to configured collectors.
 type Exporter struct {
-	cfg             ExportConfig
+	cfg             *ExportConfig
 	bootTime        time.Time
 	sourceID        uint32
 	fieldsV4        []templateField
@@ -418,8 +418,13 @@ type Exporter struct {
 	exportedPkts  atomic.Uint64
 }
 
-// NewExporter creates a new NetFlow v9 exporter.
-func NewExporter(cfg ExportConfig) (*Exporter, error) {
+// NewExporter creates a new NetFlow v9 exporter. cfg is held by pointer
+// (never copied) because ExportConfig embeds the live 1-in-N
+// sampleCounter (atomic.Uint64); copying it would fork the counter and
+// silently re-seed the sampling cadence (#2224). The caller (the daemon
+// reconcile path) shares the same *ExportConfig with the session-close
+// callback so there is exactly one counter per exporter.
+func NewExporter(cfg *ExportConfig) (*Exporter, error) {
 	e := &Exporter{
 		cfg:      cfg,
 		bootTime: time.Now(),

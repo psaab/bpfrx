@@ -68,6 +68,13 @@ install: build build-ctl
 	install -m 0755 cli $(PREFIX)/bin/cli
 
 test:
+	# go vet gate scoped to pkg/flowexport (#2224): catches the
+	# atomic.Uint64-copy regression class (ExportConfig embeds the live
+	# 1-in-N sampleCounter and must never be copied by value). NOT
+	# tree-wide yet — two pre-existing vet diagnostics live outside this
+	# package (cmd/cli protobuf MessageState copy, pkg/cli unreachable
+	# code); widen to ./... once those are resolved.
+	$(GO) vet ./pkg/flowexport/...
 	$(GO) test ./...
 
 # Drift guard for the committed refactoring heatmap (#1661 item 8).

@@ -144,7 +144,19 @@ cannot occur.
   trigger more than once in any 30 s window. Armed on successful commit.
 - Temporal `within` clauses keep a sliding window of timestamps per
   (policy, event) pair, **pruned on every append** so a cooldown-suppressed
-  event can never grow the window unbounded.
+  event can never grow the window unbounded. This holds for the cases #2216
+  flagged: a no-within policy (bounded to the 60s default horizon) and a
+  `within N { trigger on M }` policy whose threshold is never met (bounded to
+  the clause horizon). Pruning is NOT gated behind the trigger-success path.
+  Regression-locked by `TestWindow_*_2216A`.
+- A single event that matches several policies fires EVERY matching policy's
+  action — `HandleEvent` enqueues each triggered policy onto the single worker,
+  which applies them serially, so none is dropped racing the config lock (the
+  #2216-B all-but-one drop the pre-#2157 per-probe `executeCommands` path had).
+  The cross-goroutine drop race is regression-locked by the pre-existing
+  `TestQueue_ConcurrentProbesSerialize` (8 concurrent `HandleEvent` callers);
+  `TestConcurrent_OneEventMatchesManyPolicies_2216B` adds the complementary
+  single-event fan-out invariant (one event → all N matching policies commit).
 - `CommitFn` holds the apply semaphore across both commit and apply (#846) so
   event-triggered commits serialize with operator commits.
 - The engine holds no engine-level lock (`e.mu`) while in configure/commit

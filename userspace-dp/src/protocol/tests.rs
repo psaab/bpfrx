@@ -1100,6 +1100,94 @@ fn config_snapshot_decodes_without_app_catalog() {
         "snapshot without app_catalog must decode to an empty catalog (HA/upgrade compat)");
 }
 
+// #2214 (HIGH, #1961-class): a NAT64 rule with no resolvable source pool makes
+// the Go builder emit `pool_addresses:null` (nil slice, no `,omitempty`). Plain
+// `#[serde(default)]` only fills an ABSENT key; an explicit null is still handed
+// to `Vec<String>::deserialize`, which rejects it ("invalid type: null,
+// expected a sequence") and aborts the ENTIRE ConfigSnapshot decode -> helper
+// EOF -> enabled:false -> NO TRANSIT. These tests pin the null-tolerant decoder
+// so a mixed-version Go binary that still emits null decodes cleanly.
+//
+// FAIL-ON-REVERT: drop the `deserialize_with = "crate::protocol::null_tolerant_vec"`
+// attribute on NAT64RuleSnapshot.pool_addresses / FirewallFilterSnapshot.terms
+// and the two `*_null` snapshot tests below fail with the serde "expected a
+// sequence" error — i.e. the whole snapshot decode aborts, exactly the
+// no-transit signature.
+#[test]
+fn nat64_rule_snapshot_tolerates_null_pool_addresses() {
+    // An explicit null (not absent) must decode to an empty Vec, not error.
+    let json = r#"{"name":"rs1","prefix":"64:ff9b::/96","pool_addresses":null}"#;
+    let rule: NAT64RuleSnapshot =
+        serde_json::from_str(json).expect("NAT64 rule with pool_addresses:null must decode (#2214)");
+    assert_eq!(rule.name, "rs1");
+    assert_eq!(rule.prefix, "64:ff9b::/96");
+    assert!(
+        rule.pool_addresses.is_empty(),
+        "pool_addresses:null must decode to an empty Vec"
+    );
+    // Absent key (omitempty path) still works.
+    let absent: NAT64RuleSnapshot =
+        serde_json::from_str(r#"{"name":"rs1","prefix":"64:ff9b::/96"}"#)
+            .expect("NAT64 rule with absent pool_addresses must decode");
+    assert!(absent.pool_addresses.is_empty());
+    // A populated array still round-trips.
+    let full: NAT64RuleSnapshot = serde_json::from_str(
+        r#"{"name":"rs1","prefix":"64:ff9b::/96","pool_addresses":["192.0.2.1","192.0.2.2"]}"#,
+    )
+    .expect("populated pool_addresses must decode");
+    assert_eq!(full.pool_addresses, vec!["192.0.2.1", "192.0.2.2"]);
+}
+
+#[test]
+fn firewall_filter_snapshot_tolerates_null_terms() {
+    let json = r#"{"name":"EMPTY","family":"inet","terms":null}"#;
+    let filter: FirewallFilterSnapshot =
+        serde_json::from_str(json).expect("filter with terms:null must decode (#2214)");
+    assert_eq!(filter.name, "EMPTY");
+    assert_eq!(filter.family, "inet");
+    assert!(filter.terms.is_empty(), "terms:null must decode to an empty Vec");
+    // Absent key still works.
+    let absent: FirewallFilterSnapshot =
+        serde_json::from_str(r#"{"name":"EMPTY","family":"inet"}"#)
+            .expect("filter with absent terms must decode");
+    assert!(absent.terms.is_empty());
+    // Populated terms still round-trip.
+    let full: FirewallFilterSnapshot = serde_json::from_str(
+        r#"{"name":"F","family":"inet","terms":[{"name":"t1","action":"accept"}]}"#,
+    )
+    .expect("populated terms must decode");
+    assert_eq!(full.terms.len(), 1);
+    assert_eq!(full.terms[0].name, "t1");
+    assert_eq!(full.terms[0].action, "accept");
+}
+
+// The whole-snapshot guarantee: a ConfigSnapshot whose nat64_rules[].pool_addresses
+// AND filters[].terms are both explicit null must STILL decode in full (no abort).
+// This is the no-transit-prevention test — pre-fix this returned a serde error,
+// which is exactly the failure the Go side sees as helper EOF / enabled:false.
+#[test]
+fn config_snapshot_decodes_with_null_collections_2214() {
+    let json = r#"{
+        "version": 3,
+        "generation": 1,
+        "generated_at": "2024-01-01T00:00:00Z",
+        "summary": {"host_name":"h","dataplane_type":"userspace","interface_count":0,
+                    "zone_count":0,"policy_count":0,"scheduler_count":0,"ha_enabled":false},
+        "nat64_rules": [
+            {"name":"rs1","prefix":"64:ff9b::/96","pool_addresses":null}
+        ],
+        "filters": [
+            {"name":"EMPTY","family":"inet","terms":null}
+        ]
+    }"#;
+    let snap: ConfigSnapshot = serde_json::from_str(json)
+        .expect("snapshot with null pool_addresses + null terms must decode in full (#2214 no-transit)");
+    assert_eq!(snap.nat64_rules.len(), 1);
+    assert!(snap.nat64_rules[0].pool_addresses.is_empty());
+    assert_eq!(snap.filters.len(), 1);
+    assert!(snap.filters[0].terms.is_empty());
+}
+
 #[test]
 fn app_catalog_entry_roundtrip() {
     let e = AppCatalogEntry {
