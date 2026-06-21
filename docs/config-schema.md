@@ -521,10 +521,16 @@ the value sits in a single typed slot:
     server whose port is `<1` or `>65535`). `flow-server` keeps `args:1` for
     the collector address and gains a children map (the typed `port` plus the
     other compiler-read children `version9-template`, `version9 { template }`,
-    `source-address`), which deliberately flips a BARE `flow-server <addr>`
-    from single-value REPLACE to named-container APPEND — benign: a bare
-    no-port server compiles `Port==0` and the snapshot builder skips it, and
-    real multi-collector configs already take the container path.
+    `version-ipfix-template`, `version-ipfix { template }`, `source-address`),
+    which deliberately flips a BARE `flow-server <addr>` from single-value
+    REPLACE to named-container APPEND — benign: a bare no-port server compiles
+    `Port==0` and the snapshot builder skips it, and real multi-collector
+    configs already take the container path. The `version9` / `version-ipfix`
+    per-server selectors bind the collector to exactly one export protocol
+    (Junos semantics, #2136); the live Go exporter routes each flow-server to a
+    single version's collector set so a collector configured under both global
+    version stanzas is never double-exported (an unbound server resolves to
+    IPFIX when both globals are set — see `pkg/flowexport/README.md`).
   - `forwarding-options allow-dataplane-sleep` (#2008 H13 Stage 1) — a
     presence-only flag (no value, `children: nil`). Previously accepted via the
     no-schema-match fall-through and silently dropped; now a typed leaf that
