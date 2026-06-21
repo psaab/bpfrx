@@ -565,7 +565,46 @@ func (m *Manager) ResendBurst() {
 // sender (VRRP MASTER already won) or an existing tombstone are skipped — a
 // goodbye must not clobber a live primary.
 func (m *Manager) WithdrawOnce(configs []*config.RAInterfaceConfig) {
+	// The busy-check and the tombstone install MUST be atomic under m.mu —
+	// claimWithdrawOnceLocked does both while holding the lock. Splitting them
+	// (check, drop the lock, then install) reopens the #2272 check-and-act race:
+	// between the check and the install, an Apply() or a concurrent WithdrawOnce
+	// could start a real sender on the same interface, producing two owners on
+	// one link or a sender that races the goodbye (the #2033 blackhole class).
+	toGoodbye := m.claimWithdrawOnceLocked(configs)
+
+	// The tombstone for each claimed interface is HELD across sendOneGoodbye
+	// (which runs without m.mu so the emit's blocking writes do not stall other
+	// callers). While it is held, interfaceBusy reports the interface as busy, so
+	// a concurrent Apply defers instead of opening a second NDP conn (#2033 I4),
+	// and a concurrent WithdrawOnce skips it. sendOneGoodbye never launches a
+	// run() loop, so it emits only the lifetime-0 goodbye and never a normal RA
+	// after it — preserving the single-owner-emit invariant. The tombstone is
+	// removed only AFTER the goodbye fully completes.
+	for _, cfg := range toGoodbye {
+		m.sendOneGoodbye(cfg)
+		m.mu.Lock()
+		delete(m.draining, cfg.Interface)
+		m.mu.Unlock()
+	}
+}
+
+// claimWithdrawOnceLocked performs the WithdrawOnce check-and-claim for each
+// config ATOMICALLY under a single m.mu hold (#2272). For every interface that
+// is not already busy (no live sender, no draining tombstone) it installs a
+// claim-and-hold tombstone and returns it for the caller to emit a goodbye on.
+// Holding m.mu across BOTH the interfaceBusy check AND the tombstone install is
+// the whole point: it closes the window in which an Apply()/WithdrawOnce could
+// otherwise start a competing sender between the check and the claim. The
+// returned slice is the set this call OWNS the goodbye + tombstone-release for.
+//
+// The tombstone pre-marks goodbyeClaimed=true: WithdrawOnce emits exactly one
+// goodbye itself, so a racing graceful Withdraw that flips goodbyeWanted on this
+// entry must NOT also emit a standalone (claim-once, #2033). sender is nil — a
+// WithdrawOnce claim has no run() loop to join.
+func (m *Manager) claimWithdrawOnceLocked(configs []*config.RAInterfaceConfig) []*config.RAInterfaceConfig {
 	m.mu.Lock()
+	defer m.mu.Unlock()
 	m.bumpEpoch()
 	var toGoodbye []*config.RAInterfaceConfig
 	for _, cfg := range configs {
@@ -574,21 +613,10 @@ func (m *Manager) WithdrawOnce(configs []*config.RAInterfaceConfig) {
 				"interface", cfg.Interface)
 			continue
 		}
-		// Claim the interface (sender:nil — no run() loop) and pre-mark the
-		// goodbye as CLAIMED: WithdrawOnce emits exactly one goodbye below, so a
-		// racing graceful Withdraw that flips goodbyeWanted must NOT also emit.
-		// The entry is HELD across the emit so a concurrent Apply defers.
 		m.draining[cfg.Interface] = &drainEntry{cfg: cfg, goodbyeClaimed: true}
 		toGoodbye = append(toGoodbye, cfg)
 	}
-	m.mu.Unlock()
-
-	for _, cfg := range toGoodbye {
-		m.sendOneGoodbye(cfg)
-		m.mu.Lock()
-		delete(m.draining, cfg.Interface)
-		m.mu.Unlock()
-	}
+	return toGoodbye
 }
 
 // sendOneGoodbye opens a temporary sender for cfg, emits the standalone goodbye

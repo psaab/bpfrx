@@ -148,7 +148,15 @@ best-effort).
 - `WithdrawInterfaces(names []string)` — `ra.go`. Graceful goodbye + stop
   by interface name.
 - `WithdrawOnce(configs []*config.RAInterfaceConfig)` — `ra.go`.
-  Goodbye-only (no burst, no link toggle); skips busy interfaces.
+  Goodbye-only (no burst, no link toggle); skips busy interfaces. The
+  busy-check and the claim-and-hold tombstone install are performed
+  ATOMICALLY under `m.mu` by `claimWithdrawOnceLocked` (#2272): holding the
+  lock across BOTH closes the check-and-act window in which a concurrent
+  `Apply`/`WithdrawOnce` could otherwise start a competing sender between
+  the check and the claim (two owners on one link, or a sender racing the
+  goodbye — the #2033 blackhole class). The tombstone is then HELD across
+  the goodbye emit, so the busy state — and thus the mutual exclusion —
+  extends over the whole operation, not just the install instant.
 - `Clear() error` — `ra.go`. Hard stop (no goodbye) of every sender.
 - `Status()` — `ra.go`. Per-interface `SenderInfo`. A running sender has
   `State == "active"`; an interface whose sender is tearing down /
