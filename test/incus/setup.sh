@@ -38,7 +38,13 @@ if ! incus list &>/dev/null 2>&1; then
 	fi
 fi
 
-INSTANCE_NAME="xpf-fw"
+# INSTANCE_NAME is env-overridable (XPF_INSTANCE) so a deploy can target the
+# actual standalone VM when it was created under a non-default name (e.g. an
+# ad-hoc xpf-fwd). Defaulting silently to xpf-fw was the #2162 footgun: a deploy
+# either errored mid-flow against a non-existent xpf-fw or, worse, wiped the
+# config of an unrelated xpf-fw instance. cmd_deploy/cmd_ssh/etc already guard on
+# instance existence, so an overridden name that does not exist fails clearly.
+INSTANCE_NAME="${XPF_INSTANCE:-xpf-fw}"
 VM_PROFILE="xpf-vm"
 CT_PROFILE="xpf-container"
 # Ubuntu 26.04 to match the production appliance base (scripts/image/bake.py).
@@ -93,6 +99,11 @@ DATAPLANE_GW_BRIDGES=(xpf-trust xpf-untrust)
 info()  { echo "==> $*"; }
 warn()  { echo "WARNING: $*" >&2; }
 die()   { echo "ERROR: $*" >&2; exit 1; }
+
+# Shared raw-deploy reconciliation + sha-verify helpers (#2162/#2176). Sourced
+# after info/warn/die so the lib can use them.
+# shellcheck source=deploy-lib.sh
+source "${SCRIPT_DIR}/deploy-lib.sh"
 
 # ── DUT isolation guard (#1992) ───────────────────────────────────────
 
@@ -583,6 +594,14 @@ cmd_deploy() {
 	incus exec "$INSTANCE_NAME" -- rm -f /usr/local/sbin/bpfrx-userspace-dp 2>/dev/null || true
 	incus exec "$INSTANCE_NAME" -- bash -c 'if [ -d /etc/bpfrx ] && [ ! -d /etc/xpf ]; then mv /etc/bpfrx /etc/xpf; elif [ -d /etc/bpfrx ] && [ -d /etc/xpf ]; then shopt -s dotglob nullglob; for f in /etc/bpfrx/*; do base=$(basename "$f"); if [ ! -e "/etc/xpf/$base" ]; then cp -a "$f" "/etc/xpf/$base"; fi; done; shopt -u dotglob nullglob; rm -rf /etc/bpfrx; fi; if [ -f /etc/xpf/bpfrx.conf ] && [ ! -f /etc/xpf/xpf.conf ]; then mv /etc/xpf/bpfrx.conf /etc/xpf/xpf.conf; fi' 2>/dev/null || true
 
+	# Reconcile prior #1917 in-place-upgrade residue BEFORE pushing binaries
+	# (#2176). A stale 10-xpf-version.conf ExecStart pin would make systemd keep
+	# launching an OLD versioned binary after the raw push, and dangling sbin
+	# symlinks into a removed versions/ dir would break `incus file push`. Both
+	# silently produce a "successful" deploy that runs stale code.
+	deploy_reconcile_stale_pin "$INSTANCE_NAME"
+	deploy_reconcile_dangling_sbin "$INSTANCE_NAME"
+
 	# Stop service gracefully, then clean BPF state for binary upgrade.
 	# Order matters: systemctl stop sends SIGTERM (graceful socket close),
 	# then xpfd cleanup removes pinned BPF maps/links.  The final
@@ -595,30 +614,25 @@ cmd_deploy() {
 	incus exec "$INSTANCE_NAME" -- pkill -9 cli 2>/dev/null || true
 	sleep 1
 
+	# Push each binary, then HARD-verify its on-VM sha256 == the local build
+	# (#2162 extends the #1962/#1980 helper-only readback to xpfd and cli). An
+	# `incus file push` can silently no-op and a local build can be stale —
+	# either runs old code, the #1 false-result hazard.
 	info "Pushing xpfd to $INSTANCE_NAME..."
 	incus file push "$PROJECT_ROOT/xpfd" "$INSTANCE_NAME/usr/local/sbin/xpfd" --mode 0755
+	deploy_verify_pushed_sha "$INSTANCE_NAME" "$PROJECT_ROOT/xpfd" /usr/local/sbin/xpfd xpfd
 
 	info "Pushing cli to $INSTANCE_NAME..."
 	incus file push "$PROJECT_ROOT/cli" "$INSTANCE_NAME/usr/local/sbin/cli" --mode 0755
+	deploy_verify_pushed_sha "$INSTANCE_NAME" "$PROJECT_ROOT/cli" /usr/local/sbin/cli cli
 
 	# Push the Rust AF_XDP helper next to xpfd (see the findBinary search path
-	# above), then verify the on-VM sha256 matches the local binary. A push can
-	# silently no-op and the build can be stale, either of which leaves xpfd
-	# without a working dataplane — fail the deploy loudly if they differ (#1962).
+	# above), then verify the on-VM sha256 matches the local binary. Without it
+	# the standalone VM comes up with no dataplane (#1962).
 	if [[ -f "$PROJECT_ROOT/xpf-userspace-dp" ]]; then
 		info "Pushing xpf-userspace-dp to $INSTANCE_NAME..."
 		incus file push "$PROJECT_ROOT/xpf-userspace-dp" "$INSTANCE_NAME/usr/local/sbin/xpf-userspace-dp" --mode 0755
-
-		local local_sum vm_sum
-		local_sum=$(sha256sum "$PROJECT_ROOT/xpf-userspace-dp" | awk '{print $1}')
-		vm_sum=$(incus exec "$INSTANCE_NAME" -- sha256sum /usr/local/sbin/xpf-userspace-dp 2>/dev/null | awk '{print $1}' || true)
-		if [[ -z "$vm_sum" ]]; then
-			die "xpf-userspace-dp not present on $INSTANCE_NAME after push (sha256 readback empty)"
-		fi
-		if [[ "$local_sum" != "$vm_sum" ]]; then
-			die "xpf-userspace-dp sha256 mismatch after push to $INSTANCE_NAME (local=$local_sum vm=$vm_sum) — push silently no-op'd or the build is stale"
-		fi
-		info "Verified xpf-userspace-dp sha256 on $INSTANCE_NAME ($local_sum)."
+		deploy_verify_pushed_sha "$INSTANCE_NAME" "$PROJECT_ROOT/xpf-userspace-dp" /usr/local/sbin/xpf-userspace-dp xpf-userspace-dp
 	else
 		warn "xpf-userspace-dp not found locally ($PROJECT_ROOT/xpf-userspace-dp); helper not pushed — xpfd will have no dataplane"
 	fi
@@ -637,6 +651,11 @@ cmd_deploy() {
 	incus file push "${SCRIPT_DIR}/xpfd.service" "$INSTANCE_NAME/etc/systemd/system/xpfd.service"
 	incus exec "$INSTANCE_NAME" -- systemctl daemon-reload
 	incus exec "$INSTANCE_NAME" -- systemctl enable --now xpfd
+
+	# Backstop (#2176): assert the LIVE xpfd is the binary we just pushed and the
+	# effective ExecStart is the base-unit path — a HARD failure if a version pin
+	# survived or systemd is launching stale code.
+	deploy_verify_running_xpfd "$INSTANCE_NAME" "$PROJECT_ROOT/xpfd"
 
 	# Suppress management interface default route so FRR-managed routes take effect.
 	# The permanent fix is UseRoutes=false in networkd, but on existing VMs the
@@ -728,6 +747,10 @@ usage() {
 	echo "  journal     Follow xpfd logs (live)"
 	echo ""
 	echo "Env:"
+	echo "  XPF_INSTANCE=<name>         Target instance name (default: xpf-fw). Set this"
+	echo "                              when the VM was created under a different name"
+	echo "                              (e.g. an ad-hoc xpf-fwd) so deploy/ssh/etc do not"
+	echo "                              hit the wrong instance (#2162)"
 	echo "  XPF_FORCE_TEARDOWN_PEERS=1  On create-vm/create-ct/deploy, remove any"
 	echo "                              OTHER firewall holding the dataplane gateway"
 	echo "                              IPs instead of aborting (DUT isolation, #1992)"

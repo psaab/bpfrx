@@ -589,7 +589,10 @@ sg incus-admin -c 'incus exec xpf-fw0 -- grep -l OriginalName /etc/systemd/netwo
 make test-env-init   # Install incus, create networks + profiles
 make test-vm         # Create Ubuntu 26.04 VM with FRR, strongSwan
 make test-deploy     # Build -> push xpfd + cli + xpf-userspace-dp helper
-                     #   (sha256-verified) + config + unit -> systemctl enable --now
+                     #   (each sha256-verified == local build) + config + unit
+                     #   -> systemctl enable --now -> assert the RUNNING xpfd
+                     #   matches the pushed build + base-unit ExecStart (#2176)
+make test-deploy-lib # Self-test the deploy reconcile/sha-verify helpers (no VM)
 make test-ssh        # Shell into VM
 make test-status     # Instance + service + network info
 make test-logs       # journalctl -u xpfd -n 50
@@ -597,3 +600,44 @@ make test-journal    # journalctl -u xpfd -f (follow)
 make test-start/stop/restart  # Service lifecycle
 make test-destroy    # Tear down
 ```
+
+### Target the standalone VM by name (#2162)
+
+`setup.sh` defaults `INSTANCE_NAME` to `xpf-fw`. If the standalone VM was
+created under a different name (e.g. an ad-hoc `xpf-fwd`), point the deploy at
+it with `XPF_INSTANCE`, otherwise the deploy hits the wrong instance (or a
+non-existent `xpf-fw`):
+
+```
+XPF_INSTANCE=xpf-fwd make test-deploy
+XPF_INSTANCE=xpf-fwd ./test/incus/setup.sh ssh
+```
+
+### Raw-deploy stale-state reconciliation (#2162 / #2176)
+
+Both raw deploy paths (`setup.sh deploy` and `cluster-setup.sh deploy`) now
+reconcile prior #1917 in-place-upgrade residue and HARD-verify the swap, so a
+deploy can no longer silently run OLD code:
+
+- **Stale ExecStart pin.** A leftover `xpfd.service.d/10-xpf-version.conf` (from
+  a `.deb` dogfood) pins systemd to a concrete versioned binary; a raw
+  `incus file push` replaces `/usr/local/sbin/xpfd` but systemd keeps launching
+  the pinned path. The deploy detects and removes the xpf-managed pin (reverting
+  to base-unit `ExecStart=/usr/local/sbin/xpfd`); any OTHER, operator-authored
+  `ExecStart` override under `xpfd.service.d` is a HARD FAILURE (never silently
+  deleted).
+- **Dangling sbin symlinks.** After a `versions/` dir is removed,
+  `/usr/local/sbin/{xpfd,cli,xpf-userspace-dp}` can be left as dangling symlinks
+  that break `incus file push`. The deploy removes them so the push lands a
+  fresh regular file.
+- **Pushed-sha verify.** Each of xpfd, cli, and xpf-userspace-dp is sha256-read
+  back from the VM and compared to the local build; mismatch or empty readback
+  fails the deploy (extends the #1962/#1980 helper-only check to all three).
+- **Running-binary backstop.** After restart, the deploy asserts the live xpfd
+  process image sha == the pushed build AND the effective systemd ExecStart is
+  the base-unit path. If a pin survived or systemd is launching stale code, the
+  deploy exits non-zero.
+
+The reconcile/verify logic lives in `test/incus/deploy-lib.sh` (sourced by both
+scripts) and is covered by `test/incus/deploy-lib-selftest.sh`
+(`make test-deploy-lib`), which mocks `incus` against a fake VM rootfs.
