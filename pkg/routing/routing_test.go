@@ -535,20 +535,24 @@ func TestResolveRibTable(t *testing.T) {
 	tests := []struct {
 		ribName string
 		want    int
+		wantOK  bool
 	}{
-		{"inet.0", 254},
-		{"inet6.0", 254},
-		{"dmz-vr.inet.0", 101},
-		{"dmz-vr.inet6.0", 101},
-		{"tunnel-vr.inet.0", 100},
-		{"unknown-vr.inet.0", 0},
-		{"garbage", 0},
+		{"inet.0", 254, true},
+		{"inet6.0", 254, true},
+		{"dmz-vr.inet.0", 101, true},
+		{"dmz-vr.inet6.0", 101, true},
+		{"tunnel-vr.inet.0", 100, true},
+		// #2226: unresolvable rib names report ok=false (NOT a bare
+		// table 0 the needsLeak loop would read as a real target table
+		// and spuriously leak the source table into the main lookup).
+		{"unknown-vr.inet.0", 0, false},
+		{"garbage", 0, false},
 	}
 
 	for _, tt := range tests {
-		got := resolveRibTable(tt.ribName, tableIDs)
-		if got != tt.want {
-			t.Errorf("resolveRibTable(%q) = %d, want %d", tt.ribName, got, tt.want)
+		got, ok := resolveRibTable(tt.ribName, tableIDs)
+		if got != tt.want || ok != tt.wantOK {
+			t.Errorf("resolveRibTable(%q) = (%d, %v), want (%d, %v)", tt.ribName, got, ok, tt.want, tt.wantOK)
 		}
 	}
 }
@@ -584,7 +588,7 @@ func TestRibGroupNeedsLeak(t *testing.T) {
 	inst := instances[1] // dmz-vr
 	needsLeak := false
 	for _, ribName := range rg.ImportRibs {
-		if resolveRibTable(ribName, tableIDs) != inst.TableID {
+		if t, ok := resolveRibTable(ribName, tableIDs); ok && t != inst.TableID {
 			needsLeak = true
 			break
 		}
@@ -598,7 +602,7 @@ func TestRibGroupNeedsLeak(t *testing.T) {
 	inst = instances[0] // tunnel-vr
 	needsLeak = false
 	for _, ribName := range rg.ImportRibs {
-		if resolveRibTable(ribName, tableIDs) != inst.TableID {
+		if t, ok := resolveRibTable(ribName, tableIDs); ok && t != inst.TableID {
 			needsLeak = true
 			break
 		}
@@ -1075,7 +1079,7 @@ func TestMultiVRFRibGroupLeaking(t *testing.T) {
 		rg := ribGroups[inst.InterfaceRoutesRibGroup]
 		needsLeak := false
 		for _, ribName := range rg.ImportRibs {
-			if resolveRibTable(ribName, tableIDs) != inst.TableID {
+			if t, ok := resolveRibTable(ribName, tableIDs); ok && t != inst.TableID {
 				needsLeak = true
 				break
 			}
@@ -1107,7 +1111,7 @@ func TestIPv6OnlyRibGroupLeaking(t *testing.T) {
 	rg := ribGroups[rgName]
 	needsLeak := false
 	for _, ribName := range rg.ImportRibs {
-		if resolveRibTable(ribName, tableIDs) != inst.TableID {
+		if t, ok := resolveRibTable(ribName, tableIDs); ok && t != inst.TableID {
 			needsLeak = true
 			break
 		}
