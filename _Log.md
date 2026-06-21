@@ -7725,3 +7725,19 @@ top.
   no dataplane smoke.
   **File(s)**: pkg/dhcpserver/dhcpserver.go, pkg/dhcpserver/dhcpserver_test.go,
   pkg/dhcpserver/README.md, docs/pr/2154-parseleasecsv/plan.md
+- **Timestamp**: 2026-06-21
+  **Action**: #2148 — route frame/tcp.rs IPv6 inspection helpers through
+  the shared ext-header walker. `frame_has_tcp_rst`,
+  `extract_tcp_flags_and_window`, and `extract_tcp_window` hard-coded IPv6
+  TCP at L3+40, so any IPv6 flow with extension headers (hop-by-hop,
+  routing, fragment, dest-opts) had RST/flags/window read from inside the
+  ext header → false diagnostics. Fix: derive the L4 offset via the
+  existing `packet_rel_l4_offset_and_protocol` (bounded ≤6 iters,
+  allocation-free, fail-safe). 16 new crafted-packet tests (plain v6 +
+  1/2 ext hdrs + fragment + malformed/looping + non-TCP-after-ext); 7
+  FAIL against pre-fix code. IPv4 + plain v6 unchanged. Diagnostics-only
+  callers today (read-only, no per-packet heap). Release build + frame::
+  suite green, 5/5 flake.
+  **File(s)**: userspace-dp/src/afxdp/frame/tcp.rs,
+  userspace-dp/src/afxdp/frame/tcp_tests.rs,
+  userspace-dp/src/afxdp/frame/README.md
