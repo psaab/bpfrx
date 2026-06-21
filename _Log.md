@@ -9479,6 +9479,35 @@ top.
   pkg/routing/README.md, _Log.md
 
 - **Timestamp**: 2026-06-21
+  **Action**: #1387 Path S — Kea expired-leases-processing (stale-lease
+  cleanup) config. Opt-in per-family reclamation subtree under
+  `dhcp-local-server` / `dhcpv6-local-server`. Config model
+  `DHCPExpiredLeasesConfig` on the per-family `DHCPLocalServerConfig`
+  (GLOBAL per Dhcp4/Dhcp6, never per-pool — trap 1). The two cap knobs
+  (max-leases/max-time) carry a `*Set` bool so `0` (= unlimited in Kea)
+  renders distinctly from unset (trap 2). Schema floor split: the three
+  timers use ValidateIntegerMin(1) (a 0 some Kea versions reject would
+  brick the fail-closed restart), the cap knobs + unwarned-cycles use
+  Min(0) (trap 3). Compile (`compileDHCPExpiredLeases`, dual-AST walker
+  mirroring compileDHCPDynamicDNS) lands inside the shared compileExpanded
+  core, so it is present on BOTH the strict commit and the tolerant
+  load/peer-sync compile sites (trap 4); the typed-leaf schema gate
+  hard-rejects on commit but warns on Load/SyncApply (boot/HA safety).
+  Render `keaExpiredLeasesMap` returns nil for nil/disabled (UNCONDITIONAL
+  omit -> byte-identical to pre-#1387, H1); enabled-no-knobs renders {}.
+  Tests: dhcpserver golden render (v4/v6 all-knobs, disabled/absent omit,
+  max-leases 0 vs unset, one-knob-omits-rest, enabled-no-knobs-{}, per-
+  family independence); config dual-AST compile equality + per-family +
+  absent-default + H2 set/unset + schema completion + commit-check floor
+  split + lenient compile; configstore stored/peer-sync tolerance. All
+  build+vet+test green; new tests 5x no flake. Kea binaries not present
+  locally so `kea-dhcp4 -t` config-test is deploy-deferred. DDNS half of
+  #1387 already shipped (#2043/#2066); kea-d2 backend PLAN-KILLed.
+  **File(s)**: pkg/config/types_system.go, pkg/config/schema_system.go,
+  pkg/config/compiler_services.go, pkg/dhcpserver/dhcpserver.go,
+  pkg/dhcpserver/README.md, pkg/config/dhcp_expired_leases_test.go,
+  pkg/dhcpserver/expired_leases_test.go,
+  pkg/configstore/typed_leaf_lenient_test.go, _Log.md
   **Action**: #2270 — fail closed when an IKE (Phase 1) policy chain cannot
   resolve, instead of silently emitting a proposal-less swanctl connection
   that strongSwan negotiates with its compiled-in default crypto set (a
@@ -9538,3 +9567,51 @@ top.
   **File(s)**: pkg/ipsec/ike_chain_failclosed_test.go,
   pkg/config/compiler_validate_strict.go,
   pkg/config/ike_policy_chain_ref_test.go, _Log.md
+- **Timestamp**: 2026-06-21
+  **Action**: #2234 — bounded stalest-eviction for the screen scan/sweep
+  per-zone source table (restore detection under saturation). Replaced the
+  hard skip-on-full cliff (`MAX_SOURCES_PER_ZONE = 4096`) with O(K) eviction
+  (K = `EVICT_SCAN_LIMIT` = 64): a brand-new `(zone, src_ip)` at a full zone
+  reclaims any expired window in a fixed sample, else evicts the stalest
+  sampled entry — so a fresh real scanner is always trackable (closes the
+  detection-DoS where a spoofed flood pinned the table and suppressed a real
+  scanner). Per-zone source count maintained incrementally (`per_zone_count`)
+  so the cap test is O(1) — replaces the pre-#2234 O(sources) `sources_in_zone`
+  scan that on the new-source-at-cap path was itself an O(n)-per-packet
+  amplifier. Both trackers unified on a shared `ScanCore<T>` (one source of
+  truth for bound/eviction/clamp/pressure). Added `evicted_pressure` counter +
+  a rare LOGARITHMIC `scan-table-pressure` screen event (powers of two in the
+  eviction count) emitted from the cold session-miss hook — never per-flow.
+  New reason bit `SCREEN_SCAN_TABLE_PRESSURE = 1<<19` (Rust + Go
+  `ScreenFlagNames`, also backfilled the stale 1<<17/1<<18 names). Tests:
+  fail-on-revert (fresh scanner detected after saturation, both scan.rs and
+  ScreenState levels), eviction-prefers-stalest, eviction-prefers-expired,
+  bounded-cost + count-exact under sustained churn, logarithmic pressure-event
+  rate. cargo build/test green (full suite 2255/0 main bin + all targets;
+  new tests 5x no flake); go build/vet clean. SMOKE on loss cluster PENDING.
+  **File(s)**: userspace-dp/src/screen/scan.rs,
+  userspace-dp/src/screen/mod.rs, userspace-dp/src/screen/tests.rs,
+  userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/event_emit.rs, pkg/dataplane/types.go,
+  userspace-dp/src/session/README.md, _Log.md
+
+- **Timestamp**: 2026-06-21
+  **Action**: #2234 — applied Copilot-review fixes + loss-cluster smoke.
+  Fixes: (1) take_pressure_event uses checked_next_power_of_two().unwrap_or
+  (u64::MAX) — next_power_of_two() panics/wraps past 2^63; (2/3) tightened
+  scan.rs + README wording (eviction scans a FIXED PREFIX of the whole
+  source table, not "the zone's entries", with the documented same-zone
+  fallback); (4) added emit_screen_alarm_event (RT_FLOW action PERMIT) so the
+  scan-table-pressure alarm is NOT counted as a drop/deny downstream — was
+  riding emit_screen_drop_event (action DENY). New fail-on-revert test
+  screen_alarm_event_is_permit_not_deny. SMOKE on loss userspace cluster
+  (deploy verify-dataplane gate PASSED both nodes; fw1 was RG0 primary;
+  scan-protect screen profile with ip-sweep+port-scan threshold attached to
+  lan+wan; CoS re-applied): iperf3 -P12 -t20 uncapped port 5211 —
+  v4-push 22.9 / v4-rev 22.7 / v6-push 22.5 / v6-rev 22.2 Gbit/s. Screen
+  drops: 0 total, Packets dropped: 0 — legit multi-flow traffic NOT spuriously
+  flagged by scan/sweep. cargo screen 123/0.
+  **File(s)**: userspace-dp/src/screen/scan.rs,
+  userspace-dp/src/afxdp/event_emit.rs,
+  userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/session/README.md, _Log.md

@@ -113,6 +113,97 @@ subtree with an IPv6 `fixed-address`.)
   separate companion gap, #2239.) ISC Kea handles static reservations
   entirely in the config file, independent of its HA hook.
 
+## Expired-lease reclamation — #1387 (stale-lease-cleanup slice / Path S)
+
+The "stale lease cleanup" half of #1387. Kea keeps an expired / released /
+declined lease ROW in its memfile (`kea-leases4.csv` / `kea-leases6.csv`)
+as an appended record until its reclamation cycle removes it; the defaults
+are conservative. Without tuning, expired rows accumulate — they bloat the
+memfile, slow startup re-load, and delay Kea's internal reclamation/reuse
+of the expired address. (They do NOT make `show dhcp-server` lie: since
+#2085 the lease display already filters non-active / expired rows, so the
+display is truthful today. This slice makes the *source* truthful by
+actually removing the rows Kea would otherwise keep.) This is the
+DHCP-lease-database layer — entirely distinct from the DDNS stale-*record*
+cleanup below (the reconciler withdrawing A/AAAA/PTR when a lease leaves
+the active set).
+
+Opt-in, per family, Junos-shaped — the keys map to Kea's per-`Dhcp4` /
+per-`Dhcp6` `expired-leases-processing` block:
+
+```
+set system services dhcp-local-server expired-leases-processing enable
+set system services dhcp-local-server expired-leases-processing reclaim-timer 10
+set system services dhcp-local-server expired-leases-processing flush-timer 25
+set system services dhcp-local-server expired-leases-processing hold-time 600
+set system services dhcp-local-server expired-leases-processing max-leases 100
+set system services dhcp-local-server expired-leases-processing max-time 250
+set system services dhcp-local-server expired-leases-processing unwarned-cycles 5
+```
+
+(The `dhcpv6-local-server` hierarchy takes the same subtree; v4 and v6 are
+tuned independently because Kea renders the block once per family.)
+
+- **Reclamation is GLOBAL per family, NOT per pool.** Kea's
+  `expired-leases-processing` is a top-level `Dhcp4`/`Dhcp6` block — there
+  is no per-subnet reclamation. The config model therefore attaches to the
+  per-family `DHCPLocalServerConfig.ExpiredLeases`
+  (`pkg/config/types_system.go`), never to `DHCPPool` (invariant H3).
+- **Reclamation is ORTHOGONAL to lease-time (invariant H4).** `valid-lifetime`
+  / per-pool `lease-time` set how long a lease stays VALID;
+  `expired-leases-processing` sets how aggressively Kea REMOVES leases that
+  have ALREADY expired. This slice does NOT touch lease-time — do not
+  conflate the two.
+- **Config model:** `DHCPExpiredLeasesConfig` carries `Enabled` plus the six
+  Kea knobs. The two CAP knobs (`max-leases` → `max-reclaim-leases`,
+  `max-time` → `max-reclaim-time`) carry a companion `*Set bool` because in
+  Kea **0 means UNLIMITED** there — a value distinct from "omit the key and
+  inherit Kea's default" (invariant H2). The model tracks set-vs-unset so an
+  operator can express `max-leases 0` (unlimited) distinctly from not
+  configuring it; a naive `if x > 0` render would make 0 un-expressible. The
+  schema is `dhcpExpiredLeasesSchema()` (`pkg/config/schema_system.go`),
+  returned fresh per call so the two parents do not alias a mutable map.
+- **Schema floor split (fail-safe):** the three TIMERS (`reclaim-timer`,
+  `flush-timer`, `hold-time`) use `ValidateIntegerMin(1)` because a 0 some
+  Kea versions reject would take DHCP DOWN on the fail-closed restart; the
+  two CAP knobs use `ValidateIntegerMin(0)` (0 = unlimited is documented Kea
+  behaviour) and `unwarned-cycles` is `Min(0)`. No schema-only upper cap
+  (Kea documents no hard ceiling; min-only validation per the
+  `docs/config-schema.md` range policy).
+- **Compile:** `compileDHCPExpiredLeases` (`pkg/config/compiler_services.go`),
+  handling both the hierarchical and flat-set AST shapes (walk +
+  first-value-wins, mirroring `compileDHCPDynamicDNS`); a truly empty /
+  garbage block returns nil (no block forced on, nothing rendered —
+  closing the empty-tree-compiles-non-nil trap). It runs inside the shared
+  `compileExpanded` core, so it lands on BOTH the strict commit and the
+  tolerant load / peer-sync compile sites — a peer-synced or stored config
+  carrying the block compiles on both (invariant R4); the typed-leaf schema
+  gate hard-rejects on commit but downgrades to a warning on Load /
+  SyncApply (boot/HA safety, invariant H7).
+- **Kea render:** `keaExpiredLeasesMap` (`pkg/dhcpserver/dhcpserver.go`)
+  renders the per-family `expired-leases-processing` JSON, or nil when the
+  block is absent OR disabled (UNCONDITIONAL omit → byte-identical to
+  pre-#1387 output, the cardinal invariant H1). Each numeric field emits
+  only when set (an operator tunes one knob without pinning the rest); the
+  two cap knobs emit on their `*Set` bool so `max-reclaim-leases: 0`
+  (unlimited) is rendered distinctly. `Enabled` with no knobs renders a
+  present empty `{}` (Kea reads it as "reclaim with built-in defaults"; the
+  block surfaces that the feature is on).
+- **No service-lifecycle / HA change.** The block is read by Kea on the
+  existing (re)start / reconfigure path exactly like every other generated
+  key — no new `systemctl` call, no extra daemon. It is in the
+  MASTER-filtered config each node already renders, so it is HA-neutral by
+  construction.
+
+**Validation status:** fully unit-tested (golden render for v4/v6,
+disabled/absent omit, `max-leases 0` vs unset, per-family independence,
+dual-AST compile, schema completion + commit-check floor split, stored /
+peer-sync lenient tolerance). End-to-end reclamation against a live Kea
+(hand a lease, let it expire, confirm the row is removed within
+`reclaim-timer + flush-timer + hold-time`) is lab-deferred — the unit
+golden is the binding gate; a `kea-dhcp4 -t <generated.json>` acceptance
+check on deploy confirms Kea parses the rendered block.
+
 ## Dynamic DNS (DDNS) — #1387, increment 1
 
 Opt-in publishing of forward (`A`/`AAAA`) and reverse (`PTR`) DNS records

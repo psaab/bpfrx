@@ -657,6 +657,50 @@ func canonicalMAC(mac string) (string, bool) {
 	return hw.String(), true
 }
 
+// keaExpiredLeasesMap renders the per-family `expired-leases-processing`
+// reclamation block (#1387 stale-lease-cleanup slice / Path S), or nil
+// when the block is absent OR disabled. Returning nil makes the caller
+// omit the key entirely, so the generated Kea config is BYTE-IDENTICAL to
+// the pre-#1387 output (invariant H1, the cardinal compatibility
+// invariant — the disabled/nil omit is UNCONDITIONAL).
+//
+// Each numeric field is emitted only when set, so an operator can tune one
+// knob without pinning the rest to a value we invented. The two CAP knobs
+// (max-reclaim-leases / max-reclaim-time) emit on the model's *Set bool,
+// NOT on `> 0`, because 0 means UNLIMITED in Kea — a value distinct from
+// "omit -> Kea default" (invariant H2).
+//
+// When Enabled is true but no knob is configured this returns a non-nil
+// empty map, so the caller emits `"expired-leases-processing": {}` — Kea
+// reads an empty block as "reclamation with built-in defaults," and
+// surfacing the empty block lets an operator see the feature is on in the
+// rendered config.
+func keaExpiredLeasesMap(c *config.DHCPExpiredLeasesConfig) map[string]any {
+	if c == nil || !c.Enabled {
+		return nil
+	}
+	m := map[string]any{}
+	if c.ReclaimTimerWait > 0 {
+		m["reclaim-timer-wait-time"] = c.ReclaimTimerWait
+	}
+	if c.FlushReclaimedTimerWait > 0 {
+		m["flush-reclaimed-timer-wait-time"] = c.FlushReclaimedTimerWait
+	}
+	if c.HoldReclaimedTime > 0 {
+		m["hold-reclaimed-time"] = c.HoldReclaimedTime
+	}
+	if c.MaxReclaimLeasesSet {
+		m["max-reclaim-leases"] = c.MaxReclaimLeases // 0 == unlimited, intentional (H2)
+	}
+	if c.MaxReclaimTimeSet {
+		m["max-reclaim-time"] = c.MaxReclaimTime // 0 == unlimited, intentional (H2)
+	}
+	if c.UnwarnedReclaimCycles > 0 {
+		m["unwarned-reclaim-cycles"] = c.UnwarnedReclaimCycles
+	}
+	return m
+}
+
 func (m *Manager) generateKea4Config(cfg *config.DHCPServerConfig) error {
 	type keaPool struct {
 		Pool string `json:"pool"`
@@ -757,6 +801,11 @@ func (m *Manager) generateKea4Config(cfg *config.DHCPServerConfig) error {
 		},
 		"valid-lifetime": 86400,
 		"subnet4":        subnets,
+	}
+	// #1387: opt-in expired-lease reclamation tuning. nil/disabled -> key
+	// omitted -> byte-identical to pre-#1387 (H1).
+	if elp := keaExpiredLeasesMap(cfg.DHCPLocalServer.ExpiredLeases); elp != nil {
+		dhcp4["expired-leases-processing"] = elp
 	}
 	m.addLeaseSyncStanza(dhcp4, 4)
 	keaCfg := map[string]any{"Dhcp4": dhcp4}
@@ -867,6 +916,11 @@ func (m *Manager) generateKea6Config(cfg *config.DHCPServerConfig) error {
 		},
 		"valid-lifetime": 86400,
 		"subnet6":        subnets,
+	}
+	// #1387: opt-in expired-lease reclamation tuning. nil/disabled -> key
+	// omitted -> byte-identical to pre-#1387 (H1).
+	if elp := keaExpiredLeasesMap(cfg.DHCPv6LocalServer.ExpiredLeases); elp != nil {
+		dhcp6["expired-leases-processing"] = elp
 	}
 	m.addLeaseSyncStanza(dhcp6, 6)
 	keaCfg := map[string]any{"Dhcp6": dhcp6}
