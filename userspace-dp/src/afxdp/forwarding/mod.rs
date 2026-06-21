@@ -1127,6 +1127,8 @@ pub(super) fn install_helper_local_session_on_miss(
         origin,
         protocol,
         tcp_flags,
+        // Local forwarding-learn entry: no peer install generation (#2170).
+        generation: 0,
     };
     // #1789: count a failed helper-local session publish (same
     // shim-missing-key consequence as every other publish site).
