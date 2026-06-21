@@ -1287,6 +1287,22 @@ func (s *SessionSync) handleMessage(conn net.Conn, msgType uint8, payload []byte
 		if s.OnIPsecSAReceived != nil {
 			s.OnIPsecSAReceived(names)
 		}
+	case syncMsgDHCPLeaseV4:
+		s.stats.DHCPLeasesReceived.Add(1)
+		leases := decodeDHCPLeasePayload(payload)
+		s.storePeerDHCPLeases(4, leases)
+		slog.Debug("cluster sync: received DHCP v4 lease set", "count", len(leases))
+		if s.OnDHCPLeasesReceived != nil {
+			s.OnDHCPLeasesReceived(4, leases)
+		}
+	case syncMsgDHCPLeaseV6:
+		s.stats.DHCPLeasesReceived.Add(1)
+		leases := decodeDHCPLeasePayload(payload)
+		s.storePeerDHCPLeases(6, leases)
+		slog.Debug("cluster sync: received DHCP v6 lease set", "count", len(leases))
+		if s.OnDHCPLeasesReceived != nil {
+			s.OnDHCPLeasesReceived(6, leases)
+		}
 	case syncMsgFailover:
 		if len(payload) < 9 {
 			slog.Warn("cluster sync: failover message too short")

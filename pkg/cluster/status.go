@@ -377,6 +377,12 @@ func (m *Manager) FormatStatistics() string {
 			syncStats.ConfigsSent, syncStats.ConfigsReceived)
 		fmt.Fprintf(&b, "    %-32s %-12d %d\n", "IPsec SA",
 			syncStats.IPsecSASent, syncStats.IPsecSAReceived)
+		fmt.Fprintf(&b, "    %-32s %-12d %d\n", "DHCP leases",
+			syncStats.DHCPLeasesSent, syncStats.DHCPLeasesReceived)
+		if syncStats.DHCPLeasesSeeded > 0 {
+			fmt.Fprintf(&b, "    %-32s %-12s %d\n", "DHCP leases seeded",
+				"", syncStats.DHCPLeasesSeeded)
+		}
 		fmt.Fprintf(&b, "    %-32s %-12d %d\n", "Bulk syncs",
 			syncStats.BulkSyncs, syncStats.BulkSyncs)
 		fmt.Fprintf(&b, "    %-32s %-12s %d\n", "Sessions installed",
@@ -425,6 +431,12 @@ func (m *Manager) FormatDataPlaneStatistics() string {
 		syncStats.ConfigsSent, syncStats.ConfigsReceived)
 	fmt.Fprintf(&b, "    %-32s %-12d %d\n", "IPsec SA",
 		syncStats.IPsecSASent, syncStats.IPsecSAReceived)
+	fmt.Fprintf(&b, "    %-32s %-12d %d\n", "DHCP leases",
+		syncStats.DHCPLeasesSent, syncStats.DHCPLeasesReceived)
+	if syncStats.DHCPLeasesSeeded > 0 {
+		fmt.Fprintf(&b, "    %-32s %-12s %d\n", "DHCP leases seeded",
+			"", syncStats.DHCPLeasesSeeded)
+	}
 	fmt.Fprintf(&b, "    %-32s %-12d %d\n", "Bulk syncs",
 		syncStats.BulkSyncs, syncStats.BulkSyncs)
 	fmt.Fprintf(&b, "    %-32s %-12s %d\n", "Sessions installed",
