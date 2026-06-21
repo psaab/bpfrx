@@ -53,9 +53,18 @@ func waitFor(t *testing.T, what string, fn func() bool) {
 // #2139: a change-configuration action with two valid commands and one invalid
 // in the middle (a command that parses but fails CommitCheck) must commit
 // NOTHING — the candidate is discarded, the active config is unchanged, and
-// the action is counted as rejected. Proves the transactional all-or-nothing
-// batch. On pre-fix code (best-effort apply + commit-the-residue), the first
-// valid command would have been committed.
+// the action is counted as rejected.
+//
+// NOTE (review #2180): this case is NON-discriminating for the #2139
+// classifyPlan fix. The mid-batch command (`set system dataplane-type ebpf`)
+// parses and applies to the candidate fine; it fails only at the
+// whole-candidate COMPILE (the eBPF retirement reject). The PRE-FIX best-effort
+// path (apply-all-then-Commit) ALSO discards the whole candidate here, because
+// store.Commit compiles the whole candidate atomically and refuses to promote a
+// candidate that won't compile. So this test passes on both pre- and post-fix
+// code. It is retained as a useful corner case (compile-time reject), but the
+// GENUINE pre-fix partial-commit bug is exercised by
+// TestBatch_UnknownCommandMidBatchRevertsWholeCandidate below.
 func TestBatch_PartialFailureRevertsWholeCandidate(t *testing.T) {
 	s := newStore(t)
 	pol := &config.EventPolicy{
@@ -86,6 +95,61 @@ func TestBatch_PartialFailureRevertsWholeCandidate(t *testing.T) {
 	}
 	if got := e.Stats().Committed; got != 0 {
 		t.Errorf("Committed=%d; a rejected batch must not commit", got)
+	}
+}
+
+// #2139 (review #2180): the DISCRIMINATING transactionality test. A batch with
+// a valid set, then an UNSUPPORTED command (`reboot now` — not a set/delete, so
+// it can never apply to the candidate), then another valid set must commit
+// NOTHING. The whole batch is pre-classified and rejected BEFORE the candidate
+// is touched, so the active config is unchanged and committed==0.
+//
+// This is the case the headline test above does NOT discriminate. Here the bad
+// command is one that classifyPlan rejects BEFORE any mutation — NOT one that
+// applies to the candidate and fails only at compile. On the PRE-FIX
+// best-effort path (executeCommands: apply each command, log+SKIP an
+// unsupported one, then store.Commit the residue), the first `set` is applied,
+// `reboot now` is silently skipped, the trailing `set` is applied, and the
+// resulting candidate compiles cleanly and COMMITS — a partial commit
+// (host-name changed). The #2139 classifyPlan fix rejects the whole batch up
+// front (unsupported prefix → ok=false), so host-name stays "base" and nothing
+// commits. See the simulate-pre-fix proof recorded in the commit message:
+// stubbing the engine back to apply-then-commit makes THIS test fail with
+// host-name="changed-1" / Committed=1, while it passes on the real fix.
+func TestBatch_UnknownCommandMidBatchRevertsWholeCandidate(t *testing.T) {
+	s := newStore(t)
+	pol := &config.EventPolicy{
+		Name:   "p",
+		Events: []string{"ping_test_failed"},
+		ThenCommands: []string{
+			"set system host-name changed-1",          // valid set
+			"reboot now",                              // unsupported: not set/delete
+			"set system domain-name should-not-apply", // valid set
+		},
+	}
+	e := New(s, nil) // nil commitFn: store.Commit path
+	defer e.Close()
+	e.Apply([]*config.EventPolicy{pol})
+
+	e.HandleEvent(eventFor("ping_test_failed"))
+
+	// The whole batch must be rejected (pre-classify), with no candidate touched.
+	waitFor(t, "rejected counter", func() bool { return e.Stats().Rejected >= 1 })
+
+	// Give a worker (if one wrongly ran) time to commit a partial residue, then
+	// assert it did NOT. On pre-fix code this is where host-name=="changed-1".
+	time.Sleep(50 * time.Millisecond)
+
+	active := s.ActiveConfig()
+	if active.System.HostName != "base" {
+		t.Errorf("host-name changed to %q; an unsupported mid-batch command must reject the WHOLE batch before any mutation (no partial commit)",
+			active.System.HostName)
+	}
+	if active.System.DomainName != "" {
+		t.Errorf("domain-name applied (%q) from a rejected batch", active.System.DomainName)
+	}
+	if got := e.Stats().Committed; got != 0 {
+		t.Errorf("Committed=%d; a batch rejected at classify must not commit anything", got)
 	}
 }
 
