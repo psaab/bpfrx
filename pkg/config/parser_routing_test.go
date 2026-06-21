@@ -918,7 +918,11 @@ func TestISISExport(t *testing.T) {
 
 func TestBGPGroupExportFamily(t *testing.T) {
 	tree := &ConfigTree{}
-	for _, cmd := range []string{"set protocols bgp local-as 64701", "set protocols bgp group ebgp-peer family inet unicast", "set protocols bgp group ebgp-peer family inet6 unicast", "set protocols bgp group ebgp-peer export my-export-policy", "set protocols bgp group ebgp-peer peer-as 65002", "set protocols bgp group ebgp-peer neighbor 10.1.0.1", "set protocols bgp group ebgp-peer neighbor 10.2.0.1"} {
+	// my-export-policy must be a defined policy-statement: a BGP
+	// group/neighbor export renders `route-map <name> out`, which the
+	// #2144 commit gate requires to resolve (a dangling route-map name
+	// fails open to permit-all in FRR).
+	for _, cmd := range []string{"set protocols bgp local-as 64701", "set protocols bgp group ebgp-peer family inet unicast", "set protocols bgp group ebgp-peer family inet6 unicast", "set protocols bgp group ebgp-peer export my-export-policy", "set protocols bgp group ebgp-peer peer-as 65002", "set protocols bgp group ebgp-peer neighbor 10.1.0.1", "set protocols bgp group ebgp-peer neighbor 10.2.0.1", "set policy-options policy-statement my-export-policy term t1 then accept"} {
 		if err := tree.SetPath(strings.Fields(cmd)[1:]); err != nil {
 			t.Fatalf("SetPath(%q): %v", cmd, err)
 		}
@@ -953,7 +957,20 @@ func TestBGPGroupExportFamily(t *testing.T) {
 }
 
 func TestRoutingOptionsExtended(t *testing.T) {
-	input := `routing-options {
+	// load-balancing-policy must be a defined policy-statement: the #2144
+	// commit gate rejects a forwarding-table export naming a missing policy
+	// (resolveECMP silently returns 0 max-paths, disabling ECMP).
+	input := `policy-options {
+    policy-statement load-balancing-policy {
+        term t1 {
+            then {
+                load-balance per-packet;
+                accept;
+            }
+        }
+    }
+}
+routing-options {
     autonomous-system 64701;
     rib inet6.0 {
         static {

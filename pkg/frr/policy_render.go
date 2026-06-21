@@ -65,6 +65,17 @@ var knownRedistProtocols = map[string]bool{
 // If it matches a policy-statement, it extracts protocols from the terms and emits
 // "redistribute <proto> route-map <name>" for each.
 func (m *Manager) resolveRedistribute(export string, po *config.PolicyOptionsConfig) string {
+	// Junos spells directly-connected routes "direct"; FRR's redistribute
+	// keyword is "connected". A bare `export direct` must render
+	// `redistribute connected`, not the FRR-invalid `redistribute direct`
+	// (which fails the reload). This mirrors the policy-term FromProtocols
+	// normalization below and in generatePolicyOptions. The commit-time
+	// gate (validateRoutingExportReferencesStrict, pkg/config) accepts
+	// "direct" as a known token, so this keeps render and validation in
+	// agreement (#2144).
+	if export == "direct" {
+		export = "connected"
+	}
 	if knownRedistProtocols[export] {
 		return fmt.Sprintf(" redistribute %s\n", export)
 	}

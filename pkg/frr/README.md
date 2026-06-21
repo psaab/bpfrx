@@ -81,6 +81,29 @@ move or rename the markers — they're literal strings.
 - In cluster mode the package emits a blackhole default at admin distance
   250 so traffic to the active fabric peer survives a brief
   active/active overlap.
+- **Export references are validated at commit (#2144).** A dynamic-protocol
+  `export` (OSPF/OSPFv3/BGP/IS-IS), a RIP `redistribute`, a BGP
+  group/neighbor `export`, and a `routing-options forwarding-table export`
+  are checked against the defined policy-statement set (and, for the
+  redistribute-backed exports, the known protocol tokens
+  `connected`/`direct`/`static`/`kernel`/`ospf`/`bgp`/`rip`/`isis`) by
+  `validateRoutingExportReferencesStrict` in `pkg/config/compiler.go`.
+  Strict on commit/commit-check; lenient (warn) on load/HA-sync (#1960).
+  This closes the render-side fail-open paths that previously turned a typo
+  into broken or silent config: `resolveRedistribute`'s fallback emits
+  `redistribute <token>` for ANY unknown export (FRR rejects the line or
+  no-ops); a BGP group/neighbor export renders `route-map <name> out`, where
+  a missing route-map resolves to permit-all (silently advertises
+  everything); and `resolveECMP` returns 0 max-paths for a missing
+  forwarding-table policy (silently disables ECMP/consistent-hash). Those
+  render fallbacks remain as belt-and-suspenders for a config that reaches
+  the renderer via the lenient path (an older-binary persisted config or a
+  peer-synced one). The bare-protocol render path also normalizes the Junos
+  `direct` token to the FRR `redistribute connected` keyword (`export
+  direct` previously rendered the FRR-invalid `redistribute direct`,
+  failing the reload) — matching the policy-term `FromProtocols`
+  normalization and keeping the commit gate's acceptance of `direct`
+  honest.
 - `vtysh -c` is run synchronously in batch mode for state queries. There
   is no streaming; long output is buffered.
 - All `vtysh` and `frr-reload.py` shell-outs route through the

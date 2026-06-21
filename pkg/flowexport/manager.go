@@ -16,8 +16,8 @@
 package flowexport
 
 import (
-	"fmt"
 	"net"
+	"strconv"
 	"sync/atomic"
 	"time"
 
@@ -118,7 +118,13 @@ func collectVersionCollectors(fo *config.ForwardingOptionsConfig, version string
 				}
 				addr := fs.Address
 				if fs.Port > 0 {
-					addr = fmt.Sprintf("%s:%d", fs.Address, fs.Port)
+					// net.JoinHostPort brackets an IPv6 literal
+					// ([2001:db8::9]:4739) so net.ResolveUDPAddr /
+					// net.Dial in transport.go can parse it. A plain
+					// "%s:%d" leaves an IPv6 address unbracketed
+					// (2001:db8::9:4739), which they cannot parse, so
+					// IPv6 flow collectors never dial (#2183).
+					addr = net.JoinHostPort(fs.Address, strconv.Itoa(fs.Port))
 				}
 				srcAddr := fam.SourceAddress
 				if srcAddr == "" {

@@ -1,5 +1,79 @@
 # Action Log
 
+## 2026-06-21 — #2144 validate routing export references at commit
+
+- **Timestamp**: 2026-06-21
+- **Action**: Fixed #2144 — routing export references reached FRR render
+  with no commit-time validation. A dynamic-protocol `export`
+  (OSPF/OSPFv3/BGP/IS-IS), a RIP `redistribute`, a BGP group/neighbor
+  `export`, or a `routing-options forwarding-table export` naming a
+  typo'd / undefined policy-statement passed commit, then failed OPEN at
+  render: `resolveRedistribute`'s fallback emits `redistribute <typo>`
+  (FRR reload rejected or no-op), a BGP neighbor export renders a missing
+  `route-map <name> out` (FRR permit-all → advertise everything), and
+  `resolveECMP` returns 0 max-paths for a missing forwarding-table policy
+  (silently disables ECMP/consistent-hash). Added
+  `validateRoutingExportReferencesStrict` (pkg/config/compiler.go):
+  redistribute-backed exports accept a known protocol token
+  (connected/direct/static/kernel/ospf/bgp/rip/isis) OR a defined
+  policy-statement; BGP neighbor/group export and forwarding-table export
+  accept only a defined policy-statement. Covers top-level + per
+  routing-instance protocols. Strict on commit/commit-check; lenient
+  (warn) on load/HA-sync via `lenientRoutingExportRef` (#1960 doctrine,
+  mirrors validateLogProfileStreamReferencesStrict). 18 new commit-time
+  tests + 1 FRR render test; the rejection/lenient tests FAIL on pre-fix
+  code (verified). Two pre-existing parser tests carried dangling export
+  refs and now seed the referenced policy-statement. build + go test
+  ./pkg/config/... ./pkg/frr/... ./pkg/routing/... ./pkg/configstore/...
+  ./pkg/daemon/... ./pkg/cluster/... green.
+- **File(s)**: pkg/config/compiler.go, pkg/config/routing_export_ref_test.go,
+  pkg/config/parser_routing_test.go, pkg/frr/frr_test.go, pkg/frr/README.md
+## 2026-06-21 — #2183 flowexport IPv6 collector address bracketing
+
+- **Timestamp**: 2026-06-21
+- **Action**: Build flow-export collector destination + source-bind
+  addresses with `net.JoinHostPort` (was `fmt.Sprintf("%s:%d", ...)` /
+  `addr+":0"`). An unbracketed IPv6 literal (`2001:db8::9:4739`) is
+  unparseable by `net.ResolveUDPAddr`/`net.Dial`, so IPv6 NetFlow/IPFIX
+  collectors silently never dialed. Fixed both address-build sites
+  (manager.go destination, transport.go source-address sibling). Added
+  `addr_format_test.go` driving the real v9 + IPFIX builder paths
+  (IPv4 unchanged, IPv6 bracketed, `ResolveUDPAddr` accepts both) and a
+  transport-seam test for the IPv6 source-address bind; all FAIL against
+  the pre-fix code. Documented in pkg/flowexport/README.md gotchas.
+- **File(s)**: pkg/flowexport/manager.go, pkg/flowexport/transport.go,
+  pkg/flowexport/addr_format_test.go, pkg/flowexport/README.md
+## 2026-06-21 — #2142 (PR #2185) fold: set-with-dangling-member escape + drift guard + wording
+
+- **Timestamp**: 2026-06-21
+- **Action**: Folded two MINOR review fixes into PR #2185.
+  **F1 (real escape)** `applicationsToValidateStrict.addRef`: when a policy
+  references an application-SET whose `ExpandApplicationSet` errors on a
+  dangling/undefined or over-nested member, addRef used to bail silently, so a
+  MALFORMED user app that was ALSO a direct member of that set escaped the
+  strict gate and commit succeeded (the #2142 fail-closed-on-permit pathology,
+  scoped to a set carrying a dangling member). Fix: on expansion error, fall
+  back to the set's DIRECT user-app members so each resolvable malformed member
+  is still hard-rejected; the unrelated dangling member no longer masks it. New
+  test `TestApplicationSpec_SetWithDanglingMember_StillRejectsBadMember` (fails
+  pre-fix). **Drift guard (check #4)**: the strict walk inline-duplicates
+  `appid.CatalogNames`'s reference resolution (appid imports config → cycle).
+  Added exported test seam `config.ApplicationsToValidateStrict` + cross-check
+  test `TestStrictValidationSetMatchesCatalogNames` (pkg/appid) asserting the
+  two walks agree on the user-app subset for a resolvable fixture — so a future
+  CatalogNames resolution change cannot let the compiler copy drift silently.
+  **F3 (wording)**: comment (`compiler.go`) and doc line
+  (`docs/services-application-identification.md`) said a malformed port is
+  "non-numeric"; reworded to "not a valid numeric port, port range, or known
+  service name" (`validatePortSpec` accepts 15 named service ports).
+- **File(s)**: pkg/config/compiler.go, pkg/config/compiler_application_specs_test.go, pkg/appid/runtime_test.go, docs/services-application-identification.md
+
+## 2026-06-21 — #2142 application-definition port/protocol commit-time validation
+
+- **Timestamp**: 2026-06-21
+- **Action**: Added `validateApplicationSpecsStrict` (strict-vs-lenient gate, `lenientApplicationSpecs` flag) rejecting a malformed `set applications application <name>` destination-port/source-port (non-numeric, out of 1..65535, inverted range) or unknown protocol at commit — but ONLY for apps referenced by a security policy (direct or via application-set) OR when `services application-identification` is enabled. Previously warning-only (`ValidateConfig`): commit succeeded, the app-id compiler skipped the unparsable port (never-match AppID), and a referencing policy failed CLOSED on permit / OPEN on deny. Application-DEFINITION sibling of #2124's policy-app-term fail-closed gate; reuses `validatePortSpec`/`validateProtocol` (no new table). Lenient on load/peer-sync (#1960/#2008 no-brick). New `compiler_application_specs_test.go` (10 tests, 8 fail pre-fix); doc note in `docs/services-application-identification.md`.
+- **File(s)**: pkg/config/compiler.go, pkg/config/compiler_application_specs_test.go, docs/services-application-identification.md
+
 ## 2026-06-21 — #2134 wire screen session-limit enforcement (closes #2128)
 
 - **Timestamp**: 2026-06-21
@@ -25,6 +99,7 @@
   docs/feature-gaps.md, docs/pr/2134-screen-session-limit-enforce/self-review.md
 - **Validation**: cargo build --release clean; cargo test --release green.
   Live screen/flood smoke on the loss cluster is PENDING-PARENT.
+
 ## 2026-06-21 — #2173 (PR #2182) fold: v4-mapped-v6 host-mask family divergence
 
 - **2026-06-21** — Folded MINOR review fixes into PR #2182: NAT host-mask family is now classified textually via `natAddrFamily` (colon => IPv6, matching Rust `IpAddr`/`Ipv4Addr`), NOT `net.ParseIP(...).To4()` — `::ffff:203.0.113.5/32` was wrongly accepted at commit but dropped by the dataplane; the NAT64-pool lenient warning now says only the offending pool address is dropped (not the whole rule); added commit-level mapped-v6 tests for both static-NAT and the NAT64 pool. Files: pkg/config/compiler_nat.go, pkg/config/compiler_nat_host_mask_test.go.

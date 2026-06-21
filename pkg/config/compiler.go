@@ -215,6 +215,47 @@ type compileOpts struct {
 	// instead of silently ignored. Same doctrine as
 	// lenientVRRPTrackDuplicates / lenientLogProfileStreamRef.
 	lenientUnsupportedInterfaceStanzas bool
+
+	// lenientRoutingExportRef (#2144) downgrades the routing-export
+	// cross-reference gate (validateRoutingExportReferencesStrict) from a
+	// hard compile error to a cfg.Warnings entry. Set ONLY on the tolerant
+	// load / peer-sync paths (CompileConfigLenient /
+	// CompileConfigForNodeLenient): a dynamic-protocol `export`, RIP
+	// `redistribute`, BGP group/neighbor `export`, or `routing-options
+	// forwarding-table export` naming an undefined policy-statement (or a
+	// non-protocol typo) passed commit on every binary up to this gate, so
+	// an already-persisted or peer-synced config may carry it; an upgrading
+	// / receiving node must still BOOT through it (warn) rather than fail
+	// closed (#1960). Commit / commit-check stay strict — a new operator
+	// edit whose export FRR would reject, silently no-op, fail open
+	// (route-map permit-all), or silently disable ECMP is rejected loudly.
+	// The render-path fallbacks keep a leniently-loaded config behaving
+	// exactly as it did before this gate. Same doctrine as
+	// lenientLogProfileStreamRef.
+	lenientRoutingExportRef bool
+	// lenientApplicationSpecs (#2142) downgrades the application-definition
+	// port/protocol gate (validateApplicationSpecsStrict) from a hard compile
+	// error to a cfg.Warnings entry. The strict commit / commit-check path
+	// hard-rejects a `set applications application <name>` whose
+	// destination-port / source-port is malformed (non-numeric, out of
+	// 1..65535, or an inverted low>high range) or whose protocol token is
+	// neither a known name, a junos-* alias, nor a 0..255 number. Such a spec
+	// was previously only WARNED (ValidateConfig): commit succeeded, the
+	// dataplane app-id compiler skipped the unparsable port (recording the
+	// AppID name first, then `continue`-ing past the bad port — a never-match
+	// AppID), and a policy referencing it failed CLOSED on permit / fell
+	// through OPEN on deny. The tolerant load / peer-sync paths downgrade to a
+	// warning so an already-persisted or peer-synced config carrying a bad app
+	// def still BOOTS (#1960 no-brick) — the dataplane independently skips the
+	// unparsable port, and the runtime #2124 capability gate
+	// (expandUserspacePolicyApplications) fails the snapshot closed
+	// (ForwardingSupported=false) for a referenced app it cannot represent, so
+	// a leniently-loaded bad app is inert rather than silently mis-matching.
+	// Commit stays strict so the operator's next edit fails loudly. This is an
+	// AST/typed-config compile decision and deliberately does NOT live in
+	// SchemaValidate (applications stay opaque there). Same doctrine as
+	// lenientPolicyMatchAddress / lenientNATHostMask.
+	lenientApplicationSpecs bool
 }
 
 // CompileConfig converts a parsed ConfigTree AST into a typed Config struct.
@@ -248,6 +289,8 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientNATPoolAlarmThreshold:       true,
 		lenientNATHostMask:                 true,
 		lenientUnsupportedInterfaceStanzas: true,
+		lenientRoutingExportRef:            true,
+		lenientApplicationSpecs:            true,
 	})
 }
 
@@ -332,6 +375,8 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientNATPoolAlarmThreshold:       true,
 		lenientNATHostMask:                 true,
 		lenientUnsupportedInterfaceStanzas: true,
+		lenientRoutingExportRef:            true,
+		lenientApplicationSpecs:            true,
 	})
 }
 
@@ -680,6 +725,26 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		}
 	}
 
+	// #2142 application-definition port/protocol fail-open gate. Strict on
+	// commit / commit-check (hard-reject a `set applications application` whose
+	// destination-port / source-port is malformed or whose protocol is unknown
+	// — such a spec was only warned, then compiled into a never-match AppID a
+	// referenced policy depends on, failing CLOSED on permit / OPEN on deny);
+	// lenient on load / peer-sync (warn so an already-persisted or peer-synced
+	// config carrying a bad app def still boots — the dataplane skips the bad
+	// port and the #2124 runtime capability gate fails closed for a referenced
+	// app it cannot represent). Reuses validatePortSpec / validateProtocol, the
+	// same config-layer validators that produced the warning, so no new
+	// divergent table is introduced.
+	if err := validateApplicationSpecsStrict(cfg); err != nil {
+		if opts.lenientApplicationSpecs {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("application spec (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
 	// #2073 IPsec policy proposal cross-reference gate. Strict on commit /
 	// commit-check (hard-reject a dangling ipsec policy -> proposal
 	// reference that would silently drop the configured perfect-forward-
@@ -754,6 +819,27 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		if opts.lenientLogProfileStreamRef {
 			cfg.Warnings = append(cfg.Warnings,
 				fmt.Sprintf("security log profile stream reference (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
+	// #2144 routing export cross-reference gate. A dynamic-protocol
+	// `export` (OSPF/OSPFv3/BGP/IS-IS), a RIP `redistribute`, a BGP
+	// group/neighbor `export`, or a `routing-options forwarding-table
+	// export` whose token is neither a known redistribution protocol nor a
+	// defined policy-statement passes commit unnoticed, then at FRR render
+	// time either fails the reload, silently no-ops, fails OPEN as a
+	// permit-all route-map, or silently disables ECMP. Strict on commit /
+	// commit-check (hard reject so the typo is operator-visible); lenient on
+	// load / peer-sync (warn so an already-persisted or peer-synced config
+	// still boots — #1960 fail-closed-on-load class). Runs on the fully-
+	// compiled *Config so the policy-statement map is populated regardless
+	// of authoring order. Mirrors validateLogProfileStreamReferencesStrict.
+	if err := validateRoutingExportReferencesStrict(cfg); err != nil {
+		if opts.lenientRoutingExportRef {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("routing export reference (downgraded to warning on tolerant path): %v", err))
 		} else {
 			return nil, err
 		}
@@ -1050,6 +1136,176 @@ func validateLogProfileStreamReferencesStrict(cfg *Config) error {
 	return nil
 }
 
+// routingRedistProtocolTokens is the set of bare protocol keywords that an
+// OSPF/OSPFv3/BGP/IS-IS `export` (or a RIP `redistribute`) accepts in lieu
+// of a named policy-statement. resolveRedistribute (pkg/frr/policy_render.go)
+// emits a bare `redistribute <token>` for these. It mirrors
+// knownRedistProtocols there, plus Junos's `direct` spelling for FRR's
+// `connected`. Keep the two in sync: a token accepted here but unknown to
+// the renderer would emit a line FRR rejects; a token the renderer accepts
+// but missing here would be wrongly rejected at commit.
+var routingRedistProtocolTokens = map[string]bool{
+	"connected": true, "direct": true, "static": true, "kernel": true,
+	"ospf": true, "bgp": true, "rip": true, "isis": true,
+}
+
+// validateRoutingExportReferencesStrict hard-rejects a dynamic-protocol
+// `export` (OSPF / OSPFv3 / BGP / IS-IS), a RIP `redistribute`, a BGP
+// group/neighbor `export`, or a `routing-options forwarding-table export`
+// whose token resolves to neither a known redistribution protocol nor a
+// defined policy-statement (#2144).
+//
+// Without this gate a typo passes commit and reaches FRR render-time, where
+// it fails OPEN in three distinct ways:
+//
+//   - resolveRedistribute's fallback (policy_render.go) emits
+//     `redistribute <typo>` for any unknown token. FRR either rejects the
+//     line — failing the whole frr-reload (a single vtysh -f add-batch
+//     exits non-zero on any CMD_WARNING_CONFIG_FAILED) — or silently
+//     no-ops, so the intended redistribution never happens.
+//   - a BGP group/neighbor `export` renders `neighbor <addr> route-map
+//     <typo> out`. FRR resolves a route-map name with no definition to
+//     NULL, which it treats as permit-all — the outbound filter the
+//     operator wrote silently advertises EVERYTHING.
+//   - `forwarding-table export <typo>` is read by resolveECMP
+//     (config_render.go), which returns 0 max-paths when the policy is
+//     missing — silently DISABLING the expected ECMP / consistent-hash
+//     load balancing instead of rejecting the config.
+//
+// Protocol-token acceptance differs by site. A redistribute-backed export
+// (OSPF/OSPFv3/BGP/IS-IS export, RIP redistribute) legitimately names a
+// bare protocol (`export static`) OR a policy-statement, matching
+// resolveRedistribute. A BGP group/neighbor export and a forwarding-table
+// export render directly as a route-map / ECMP policy name, so only a
+// defined policy-statement is valid there — a protocol token would be a
+// dangling route-map / missing-policy reference, not a redistribute verb.
+//
+// On the tolerant load / peer-sync paths the call site downgrades this to a
+// warning (opts.lenientRoutingExportRef) so an already-persisted or
+// peer-synced config carrying the typo still boots (#1960
+// fail-closed-on-load class); the render-path fallbacks above keep it inert
+// or fail-open-on-an-already-committed-config exactly as before. Commit /
+// commit-check stay strict. Mirrors validateLogProfileStreamReferencesStrict.
+func validateRoutingExportReferencesStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	defined := func(name string) bool {
+		if cfg.PolicyOptions.PolicyStatements == nil {
+			return false
+		}
+		_, ok := cfg.PolicyOptions.PolicyStatements[name]
+		return ok
+	}
+
+	// checkRedist validates a redistribute-backed export list: each token
+	// must be a known protocol OR a defined policy-statement.
+	checkRedist := func(scope, proto string, exports []string) error {
+		for _, e := range exports {
+			if e == "" || routingRedistProtocolTokens[e] || defined(e) {
+				continue
+			}
+			return fmt.Errorf("%s%s export %q references neither a known "+
+				"redistribution protocol (connected/direct/static/kernel/"+
+				"ospf/bgp/rip/isis) nor a defined policy-statement — the "+
+				"FRR redistribute line would be rejected or silently no-op; "+
+				"define the policy-statement or fix the export name",
+				scope, proto, e)
+		}
+		return nil
+	}
+
+	// checkPolicyRef validates an export list that renders directly as a
+	// route-map / ECMP policy name: only a defined policy-statement is valid.
+	checkPolicyRef := func(detail, name string) error {
+		if name == "" || defined(name) {
+			return nil
+		}
+		return fmt.Errorf("%s references undefined policy-statement %q; %s",
+			detail, name, "define the policy-statement or fix the export name")
+	}
+
+	checkProtocols := func(scope string, ospf *OSPFConfig, ospfv3 *OSPFv3Config, bgp *BGPConfig, rip *RIPConfig, isis *ISISConfig) error {
+		if ospf != nil {
+			if err := checkRedist(scope, "protocols ospf", ospf.Export); err != nil {
+				return err
+			}
+		}
+		if ospfv3 != nil {
+			if err := checkRedist(scope, "protocols ospf3", ospfv3.Export); err != nil {
+				return err
+			}
+		}
+		if rip != nil {
+			if err := checkRedist(scope, "protocols rip", rip.Redistribute); err != nil {
+				return err
+			}
+		}
+		if isis != nil {
+			if err := checkRedist(scope, "protocols isis", isis.Export); err != nil {
+				return err
+			}
+		}
+		if bgp != nil {
+			if err := checkRedist(scope, "protocols bgp", bgp.Export); err != nil {
+				return err
+			}
+			// A BGP group/neighbor export renders `route-map <name> out`,
+			// so it must be a defined policy-statement (no protocol-token
+			// fallback). Sort neighbor addresses for a deterministic
+			// first-error message.
+			neighbors := append([]*BGPNeighbor(nil), bgp.Neighbors...)
+			sort.SliceStable(neighbors, func(i, j int) bool {
+				return neighbors[i].Address < neighbors[j].Address
+			})
+			for _, n := range neighbors {
+				if n == nil {
+					continue
+				}
+				for _, e := range n.Export {
+					detail := fmt.Sprintf("%sprotocols bgp neighbor %s export", scope, n.Address)
+					if n.GroupName != "" {
+						detail = fmt.Sprintf("%sprotocols bgp group %s neighbor %s export", scope, n.GroupName, n.Address)
+					}
+					if err := checkPolicyRef(detail, e); err != nil {
+						return err
+					}
+				}
+			}
+		}
+		return nil
+	}
+
+	// Top-level protocols.
+	if err := checkProtocols("", cfg.Protocols.OSPF, cfg.Protocols.OSPFv3, cfg.Protocols.BGP, cfg.Protocols.RIP, cfg.Protocols.ISIS); err != nil {
+		return err
+	}
+
+	// Per routing-instance protocols.
+	for _, ri := range cfg.RoutingInstances {
+		if ri == nil {
+			continue
+		}
+		scope := fmt.Sprintf("routing-instance %s ", ri.Name)
+		if err := checkProtocols(scope, ri.OSPF, ri.OSPFv3, ri.BGP, ri.RIP, ri.ISIS); err != nil {
+			return err
+		}
+	}
+
+	// forwarding-table export → resolveECMP (config_render.go). Renders
+	// directly as an ECMP policy lookup, so it must be a defined
+	// policy-statement; a missing one silently disables ECMP/consistent-hash.
+	if err := checkPolicyRef(
+		"routing-options forwarding-table export",
+		cfg.RoutingOptions.ForwardingTableExport,
+	); err != nil {
+		return fmt.Errorf("%s (the expected ECMP / consistent-hash "+
+			"load-balancing would be silently disabled)", err)
+	}
+
+	return nil
+}
+
 // validatePolicyMatchAddressesStrict hard-rejects a policy
 // source-address / destination-address token that is neither a known
 // address-book name (Address or AddressSet), the `any` keyword, nor a
@@ -1127,6 +1383,164 @@ func validatePolicyMatchAddressesStrict(cfg *Config) error {
 		}
 	}
 	return nil
+}
+
+// validateApplicationSpecsStrict hard-rejects a user-defined application
+// (`set applications application <name> ...`) whose destination-port /
+// source-port is malformed (not a valid numeric port, port range, or known
+// service name, out of 1..65535, or an inverted low>high range) or whose
+// protocol token is not a known name, a junos-*
+// alias, or a 0..255 number (#2142) — but ONLY for applications that are
+// actually REFERENCED by a security policy, or for ALL applications when
+// `services application-identification` is enabled (every app then compiles
+// into the app-id catalog). Such a spec is accepted by ValidateConfig as a
+// WARNING only; commit succeeds, the dataplane app-id compiler records the
+// AppID name and then `continue`s past the unparsable port (a never-match
+// AppID), and a policy referencing the application fails CLOSED on a permit
+// rule or falls through OPEN on a deny rule. Failing the spec at commit turns
+// that silent semantic break into an operator-visible error.
+//
+// The referenced-only scope is deliberate (the issue's explicit
+// referenced-vs-unreferenced distinction): an UNREFERENCED, app-id-disabled
+// application definition compiles into nothing the dataplane can match against,
+// so its malformed spec cannot break a live policy decision — it stays a
+// warning so an operator iterating on a not-yet-wired application library is
+// not blocked, and so existing configs that carry an unreferenced app with a
+// port form the policy matcher cannot represent (e.g. a `source-port 0-N`
+// range, which Rust parse_port_spec rejects on low==0) still commit. The moment
+// such an app is referenced by a policy, or app-id is turned on, the gate
+// engages.
+//
+// It reuses validatePortSpec and validateProtocol — the same config-layer
+// validators that produce the warning in ValidateConfig — so no new divergent
+// port/protocol table is introduced (the dataplane's #2124 capability gate is
+// the runtime backstop, and these validators are a superset of what it admits).
+// Iteration is sorted by application name so the first-reported error is
+// deterministic across runs (Go map order is randomized).
+func validateApplicationSpecsStrict(cfg *Config) error {
+	if cfg == nil || len(cfg.Applications.Applications) == 0 {
+		return nil
+	}
+	toCheck := applicationsToValidateStrict(cfg)
+	if len(toCheck) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(toCheck))
+	for name := range toCheck {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		app := cfg.Applications.Applications[name]
+		if app == nil {
+			continue
+		}
+		if err := validatePortSpec(app.DestinationPort); err != nil {
+			return fmt.Errorf("application %q: destination-port: %w", name, err)
+		}
+		if err := validatePortSpec(app.SourcePort); err != nil {
+			return fmt.Errorf("application %q: source-port: %w", name, err)
+		}
+		if app.Protocol != "" {
+			if err := validateProtocol(app.Protocol); err != nil {
+				return fmt.Errorf("application %q: %w", name, err)
+			}
+		}
+	}
+	return nil
+}
+
+// applicationsToValidateStrict returns the set of user-defined application
+// names whose port/protocol spec is validated as a hard COMMIT error rather
+// than a warning. That is every user application referenced (directly, or as a
+// member of a referenced application-set) by a zone-pair or global security
+// policy, plus — when `services application-identification` is enabled — every
+// user application (app-id compiles them all into the catalog). It mirrors the
+// policy-reference walk in appid.CatalogNames; the logic is duplicated here
+// because pkg/appid imports pkg/config (so the compiler cannot call back into
+// appid without an import cycle). Predefined junos-* applications are never
+// returned — they are not in cfg.Applications.Applications and their specs are
+// owned by the predefined table, not the operator.
+func applicationsToValidateStrict(cfg *Config) map[string]struct{} {
+	out := make(map[string]struct{})
+	if cfg == nil {
+		return out
+	}
+	userApps := cfg.Applications.Applications
+	// app-id enabled: the catalog compiles every user application, so validate
+	// them all.
+	if cfg.Services.ApplicationIdentification {
+		for name := range userApps {
+			out[name] = struct{}{}
+		}
+		return out
+	}
+	addRef := func(appName string) {
+		if appName == "" || appName == "any" {
+			return
+		}
+		if set, isSet := cfg.Applications.ApplicationSets[appName]; isSet {
+			expanded, err := ExpandApplicationSet(appName, &cfg.Applications)
+			if err == nil {
+				for _, member := range expanded {
+					if _, isUser := userApps[member]; isUser {
+						out[member] = struct{}{}
+					}
+				}
+				return
+			}
+			// ExpandApplicationSet bails on the FIRST dangling/undefined or
+			// over-nested member, which would otherwise let a MALFORMED user app
+			// that is ALSO a direct member of the same set escape the strict gate
+			// (commit silently succeeds — the #2142 fail-closed-on-permit
+			// pathology, scoped to a set carrying a dangling member). A dangling
+			// member is a separate existing concern; it must not mask a malformed
+			// spec on a sibling member. Fall back to the set's DIRECT user-app
+			// members so each one that resolves is still hard-rejected at commit.
+			if set != nil {
+				for _, member := range set.Applications {
+					if _, isUser := userApps[member]; isUser {
+						out[member] = struct{}{}
+					}
+				}
+			}
+			return
+		}
+		if _, isUser := userApps[appName]; isUser {
+			out[appName] = struct{}{}
+		}
+	}
+	walk := func(policies []*Policy) {
+		for _, pol := range policies {
+			if pol == nil {
+				continue
+			}
+			for _, appName := range pol.Match.Applications {
+				addRef(appName)
+			}
+		}
+	}
+	for _, zpp := range cfg.Security.Policies {
+		if zpp == nil {
+			continue
+		}
+		walk(zpp.Policies)
+	}
+	walk(cfg.Security.GlobalPolicies)
+	return out
+}
+
+// ApplicationsToValidateStrict exposes the strict-validation reference set
+// (the user-app names the commit-time gate hard-rejects) for cross-checking
+// against appid.CatalogNames. The strict walk INLINE-duplicates CatalogNames's
+// policy-reference resolution because pkg/appid imports pkg/config (so the
+// compiler cannot call back into appid without a cycle). This accessor lets a
+// pkg/appid test assert the two walks agree on the user-app subset, so a future
+// change to CatalogNames's resolution cannot let the compiler copy drift
+// silently. It is a TEST seam, not a runtime coupling — production code uses the
+// unexported validateApplicationSpecsStrict directly.
+func ApplicationsToValidateStrict(cfg *Config) map[string]struct{} {
+	return applicationsToValidateStrict(cfg)
 }
 
 func policyMatchAddressError(scope, polName, field, addr string) error {
