@@ -8676,3 +8676,30 @@ top.
   userspace-dp/src/afxdp/types/shared_cos_lease/lease.rs,
   userspace-dp/src/afxdp/types/shared_cos_lease/shared_cos_lease_tests.rs,
   docs/refactoring-audit-current.txt
+
+- **Timestamp**: 2026-06-21
+- **Action**: #2227 (#2209/#2210) MERGE-NEEDS-MAJOR fixes. MAJOR-1
+  security fail-open: scan/sweep `check_unique` capped the per-source set
+  at MAX_UNIQUE_PER_SOURCE=1024 then compared `len() > threshold`, so an
+  operator threshold >= 1024 (valid/parseable, e.g. port-scan 5000)
+  could NEVER be crossed -> scanner never dropped (silent fail-OPEN).
+  Fix: clamp the EFFECTIVE comparison threshold to MAX_UNIQUE_PER_SOURCE-1
+  (fail-CLOSED: detect AT THE CAP), count via `threshold_clamped` /
+  `scan_sweep_threshold_clamped`, and add a Go commit-time clamp WARNING
+  (compiler_security.go `maxScanSweepThreshold=1023`, kept in sync with
+  the Rust const; warn+preserve value, never reject). MINOR-3: real
+  negative-Copy guard for ScreenProfile (autoref specialization, fails on
+  revert). MINOR-4: softened "O(total-sources)"/"never fail-opens" docs
+  (retain walks all entries; budget bounds removals; source cap bounds
+  the table). MINOR-5: deduped the double extract_screen_info on the cold
+  new-flow drop path. MINOR-2 (source-table saturation detection-DoS):
+  documented as known limitation + follow-up #2234. Fail-on-revert proven
+  for MAJOR-1 (both tests fail with the un-clamped compare) and MINOR-3
+  (guard fails when ScreenProfile is made Copy). Rust 107 screen tests +
+  4 new (5x flake clean); Go pkg/config green (5x flake clean).
+- **File(s)**: userspace-dp/src/screen/scan.rs,
+  userspace-dp/src/screen/mod.rs, userspace-dp/src/screen/tests.rs,
+  userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/session/README.md,
+  pkg/config/compiler_security.go, pkg/config/compiler.go,
+  pkg/config/parser_security_test.go

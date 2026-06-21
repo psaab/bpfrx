@@ -2367,10 +2367,36 @@ fn scan_sweep_per_zone_no_cross_count() {
 /// auditable.)
 #[test]
 fn screen_profile_is_not_copy_so_per_packet_copies_stay_auditable() {
-    fn assert_not_copy<T: Clone>() {}
-    // Compiles for Clone (used by config update_profiles). The absence of a
-    // `Copy` bound is the contract: the hot path must borrow, never copy.
-    assert_not_copy::<ScreenProfile>();
+    // REAL negative-Copy guard (#2227 MINOR-3): autoref specialization.
+    // `IsCopy::is_copy` (the inherent method on the `Witness<T>` wrapper) is
+    // selected ONLY when `T: Copy`; otherwise method resolution autorefs to
+    // the `NotCopy` trait's `is_copy(&self)`. So the returned flag is `true`
+    // iff `ScreenProfile: Copy`. A test (not just a compile gate) lets this
+    // FAIL-ON-REVERT loudly if someone makes `ScreenProfile` `Copy` — which
+    // would silently hide a per-packet copy on the screen hot path.
+    struct Witness<T>(core::marker::PhantomData<T>);
+    trait NotCopy {
+        fn is_copy(&self) -> bool {
+            false
+        }
+    }
+    impl<T> NotCopy for Witness<T> {}
+    impl<T: Copy> Witness<T> {
+        fn is_copy(&self) -> bool {
+            true
+        }
+    }
+    assert!(
+        !Witness::<ScreenProfile>(core::marker::PhantomData).is_copy(),
+        "ScreenProfile must NOT be Copy — a Copy profile silently hides a \
+         per-packet copy on the screen hot path (#2209 perf invariant)"
+    );
+    // Sanity: the witness reports `true` for a genuinely-Copy type, proving
+    // the negative assertion above is discriminating (not vacuously false).
+    assert!(
+        Witness::<u32>(core::marker::PhantomData).is_copy(),
+        "witness must detect a Copy type"
+    );
 
     // Drive the borrow-only hot path many times; this would not compile if
     // the body still required a `self.profiles.get(zone).clone()` and we had
@@ -2411,5 +2437,48 @@ fn scan_sweep_state_bounded_and_records_pressure() {
         state.scan_sweep_skipped_pressure() >= 200,
         "over-cap sources must record pressure, got {}",
         state.scan_sweep_skipped_pressure()
+    );
+}
+
+/// #2227 MAJOR-1 fail-on-revert (at the production `ScreenState` hook): an
+/// IP-sweep configured with a threshold ABOVE the per-source unique cap
+/// (3000 — a value `pkg/config` parses and stores unchanged) must STILL fire
+/// detection. Pre-fix the dataplane compared `set.len() > threshold` and
+/// `len()` could never exceed `MAX_UNIQUE_PER_SOURCE` (1024 < 3000), so the
+/// scanner was NEVER dropped (silent fail-OPEN). The fail-closed clamp makes a
+/// saturated set always cross the effective threshold, and the clamp is
+/// recorded for observability.
+#[test]
+fn ip_sweep_above_unique_cap_still_fires_at_screen_state() {
+    let mut profile = ScreenProfile::default();
+    // 3000 mirrors parser_security_test.go's TestScreenCompilation and exceeds
+    // MAX_UNIQUE_PER_SOURCE — the exact case the reviewer reproduced.
+    profile.ip_sweep_threshold = 3000;
+    let mut state = make_state("trust", profile);
+    let cap = super::scan::max_unique_per_source_for_test();
+    assert!(
+        3000 > cap,
+        "test premise: configured threshold (3000) must exceed the cap ({cap})"
+    );
+
+    let src = IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1));
+    let mut fired = false;
+    // Sweep more distinct destinations than the cap from the same source.
+    for i in 0..(cap + 50) {
+        let dst = IpAddr::V4(Ipv4Addr::from(0xac10_0000u32 + i as u32)); // 172.16.x.x
+        let pkt = tcp_pkt(src, dst, 1234, 80, TCP_SYN);
+        if state.scan_sweep_drop_on_new_flow("trust", ZID, &pkt, 100) == Some("ip-sweep") {
+            fired = true;
+            break;
+        }
+    }
+    assert!(
+        fired,
+        "ip-sweep threshold 3000 (> cap {cap}) must fire — pre-fix it NEVER fired (fail-open)"
+    );
+    assert!(
+        state.scan_sweep_threshold_clamped() >= 1,
+        "an over-cap threshold must be recorded as clamped, got {}",
+        state.scan_sweep_threshold_clamped()
     );
 }
