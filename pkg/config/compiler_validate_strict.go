@@ -408,6 +408,224 @@ func validateRoutingExportReferencesStrict(cfg *Config) error {
 	return nil
 }
 
+// validateFirewallPolicerReferencesStrict hard-rejects a firewall-filter
+// term whose `then policer <name>` (Finding A, #2217) references neither a
+// defined single-rate policer (`firewall policer <name>`) nor a defined
+// three-color-policer (`firewall three-color-policer <name>`).
+//
+// The schema declares `then policer` with no validator and ValidateConfig
+// never checked the reference, so a typo'd / dangling policer name compiled
+// cleanly: the term keeps Policer="no-such-policer" and the rate-limit
+// silently never applies (fail-OPEN — traffic the operator meant to police
+// passes unpoliced). This gate turns that silent fail-open into an operator-
+// visible commit error, mirroring the SNAT/DNAT-pool reference family.
+//
+// Both filter families (inet + inet6) are walked, sorted by filter name then
+// by the term's position, so the first-reported error is deterministic across
+// runs (Go map order is randomized).
+//
+// On the tolerant load / peer-sync paths the call site downgrades this to a
+// warning (opts.lenientFirewallRefs) so an already-persisted or peer-synced
+// config carrying the typo still BOOTS (#1960 fail-closed-on-load class); the
+// dataplane simply does not police the term, exactly as before. Commit /
+// commit-check stay strict. Mirrors validateRoutingExportReferencesStrict.
+func validateFirewallPolicerReferencesStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	defined := func(name string) bool {
+		if cfg.Firewall.Policers != nil {
+			if _, ok := cfg.Firewall.Policers[name]; ok {
+				return true
+			}
+		}
+		if cfg.Firewall.ThreeColorPolicers != nil {
+			if _, ok := cfg.Firewall.ThreeColorPolicers[name]; ok {
+				return true
+			}
+		}
+		return false
+	}
+	check := func(family string, filters map[string]*FirewallFilter) error {
+		names := make([]string, 0, len(filters))
+		for name := range filters {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			filter := filters[name]
+			if filter == nil {
+				continue
+			}
+			for _, term := range filter.Terms {
+				if term == nil || term.Policer == "" || defined(term.Policer) {
+					continue
+				}
+				return fmt.Errorf(
+					"firewall family %s filter %q term %q references undefined "+
+						"policer %q (define `firewall policer %s` or `firewall "+
+						"three-color-policer %s`, or fix the policer name — the "+
+						"rate-limit would otherwise silently never apply)",
+					family, name, term.Name, term.Policer, term.Policer, term.Policer)
+			}
+		}
+		return nil
+	}
+	if err := check("inet", cfg.Firewall.FiltersInet); err != nil {
+		return err
+	}
+	return check("inet6", cfg.Firewall.FiltersInet6)
+}
+
+// validateFirewallRoutingInstanceReferencesStrict hard-rejects a
+// firewall-filter term whose `then routing-instance <name>` (FBF /
+// filter-based-forwarding, Finding C, #2217) does not name a routing-instance
+// defined under `routing-instances <name>`.
+//
+// ValidateConfig validated routing-instance INTERFACE membership but never the
+// FBF steering reference. A dangling reference compiled with no warning; the
+// FBF snapshot carries the unknown instance name and the dataplane steers
+// matched packets toward a routing table that does not exist — a silent
+// blackhole / fall-through to the default table. This gate makes the typo
+// operator-visible at commit, consistent with the other cross-reference gates.
+//
+// Any defined routing-instance is a valid steer target (Junos FBF accepts
+// virtual-router / vrf / forwarding instances alike); the gap closed here is
+// strictly the dangling-name case, so instance-type is intentionally not
+// constrained.
+//
+// Both filter families are walked, sorted by filter name then by term position
+// for a deterministic first-error. On the tolerant load / peer-sync paths the
+// call site downgrades to a warning (opts.lenientFirewallRefs) so an already-
+// persisted or peer-synced config still BOOTS (#1960). Mirrors
+// validateFirewallPolicerReferencesStrict.
+func validateFirewallRoutingInstanceReferencesStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	defined := make(map[string]bool, len(cfg.RoutingInstances))
+	for _, ri := range cfg.RoutingInstances {
+		if ri != nil && ri.Name != "" {
+			defined[ri.Name] = true
+		}
+	}
+	check := func(family string, filters map[string]*FirewallFilter) error {
+		names := make([]string, 0, len(filters))
+		for name := range filters {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			filter := filters[name]
+			if filter == nil {
+				continue
+			}
+			for _, term := range filter.Terms {
+				if term == nil || term.RoutingInstance == "" || defined[term.RoutingInstance] {
+					continue
+				}
+				return fmt.Errorf(
+					"firewall family %s filter %q term %q references undefined "+
+						"routing-instance %q (define `routing-instances %s` or "+
+						"fix the name — filter-based-forwarding would otherwise "+
+						"steer matched traffic into a routing table that does not "+
+						"exist, silently blackholing it or falling through to the "+
+						"default table)",
+					family, name, term.Name, term.RoutingInstance, term.RoutingInstance)
+			}
+		}
+		return nil
+	}
+	if err := check("inet", cfg.Firewall.FiltersInet); err != nil {
+		return err
+	}
+	return check("inet6", cfg.Firewall.FiltersInet6)
+}
+
+// validateApplicationSetMembersStrict hard-rejects an `applications
+// application-set <set>` (Finding B, #2217) whose member references neither a
+// defined application (user-defined or junos-* predefined), nor a defined
+// nested application-set.
+//
+// ValidateConfig warned on a POLICY referencing an unknown application but
+// never validated the MEMBERS of an application-set. A policy referencing a
+// defined application-set whose member is undefined passed validation with no
+// warning; at the dataplane that member simply never matches, so the policy
+// silently fails to match the intended traffic (an effective no-op term,
+// fail-OPEN). This gate validates each set's membership at commit.
+//
+// Reuses ExpandApplicationSet, the SAME resolver the compiler and the strict
+// application-spec gate already use to expand a set: it recurses nested sets
+// (max depth 3), resolves each leaf member through ResolveApplication
+// (user-defined first, then the junos-* predefined table), and returns an
+// error on the first dangling/over-nested member — so no new divergent
+// definedness table is introduced. Sets are iterated in sorted name order for
+// a deterministic first-error.
+//
+// IMPLICIT sets minted for multi-term user applications (compileApplications
+// stores `applications application <name> term ...` as an ApplicationSet whose
+// members are the generated per-term application names) are skipped: their
+// members are synthesized by the compiler, always resolve, and are not
+// operator-authored references — validating them would only risk a false
+// reject on a compiler-internal name shape.
+//
+// On the tolerant load / peer-sync paths the call site downgrades this to a
+// warning (opts.lenientApplicationSetMembers) so an already-persisted or peer-
+// synced config carrying a dangling member still BOOTS (#1960); the dataplane
+// drops the unresolved member independently, so it is already inert. Commit /
+// commit-check stay strict. Mirrors validateApplicationSpecsStrict.
+func validateApplicationSetMembersStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	sets := cfg.Applications.ApplicationSets
+	if len(sets) == 0 {
+		return nil
+	}
+	// An implicit set minted for a multi-term application shares its name with
+	// a user application term-bundle; its members are compiler-synthesized, not
+	// operator references. Skip those.
+	isImplicitTermSet := func(setName string) bool {
+		set := sets[setName]
+		if set == nil {
+			return false
+		}
+		for _, member := range set.Applications {
+			// A synthesized term application is named "<parent>-<term>"; the
+			// reliable signal that this is a compiler-minted set (rather than an
+			// operator `application-set`) is that EVERY member is a user
+			// application whose name is prefixed with the set name plus "-". A
+			// hand-authored application-set members reference unrelated app names.
+			if _, isUserApp := cfg.Applications.Applications[member]; !isUserApp {
+				return false
+			}
+			if !strings.HasPrefix(member, setName+"-") {
+				return false
+			}
+		}
+		return true
+	}
+	names := make([]string, 0, len(sets))
+	for name := range sets {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		set := sets[name]
+		if set == nil || len(set.Applications) == 0 || isImplicitTermSet(name) {
+			continue
+		}
+		if _, err := ExpandApplicationSet(name, &cfg.Applications); err != nil {
+			return fmt.Errorf(
+				"applications application-set %q: %w (define the missing "+
+					"application / application-set or fix the member name — a "+
+					"policy matching this set would otherwise silently fail to "+
+					"match the intended traffic)", name, err)
+		}
+	}
+	return nil
+}
+
 // validatePolicyMatchAddressesStrict hard-rejects a policy
 // source-address / destination-address token that is neither a known
 // address-book name (Address or AddressSet), the `any` keyword, nor a

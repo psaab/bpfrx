@@ -29,6 +29,31 @@
   pkg/api/metrics_test.go, pkg/api/metrics_descriptor_coverage_test.go,
   docs/userspace-icmp-te-debugging.md
 
+## 2026-06-21 — #2215: screen parity — ping-of-death port + LAND widen
+
+- **Timestamp**: 2026-06-21
+- **Action**: Fixed two screen parity regressions in the userspace
+  AF_XDP dataplane (the only forwarding path post-#1373/#1476):
+  - **Sub-bug A (ping-of-death dead code)**: `check_ping_of_death`
+    was an ICMP-only `pkt.pkt_len as u32 > 65535` predicate —
+    structurally unsatisfiable because `pkt_len` is a `u16`, so
+    fragment-based ping-of-death went entirely undetected. Ported the
+    authoritative #893 BPF formula: for any IPv4 fragment,
+    `((ip_frag_off & 0x1FFF) << 3) + ip_total_len > 65535 -> drop`
+    (any protocol, fragments only).
+  - **Sub-bug B (LAND too narrow)**: `check_land` required
+    `src_port == dst_port` in addition to `src_ip == dst_ip`, admitting
+    same-IP different-port spoofed frames the BPF screen dropped.
+    Removed the port clause — LAND now fires on `src_ip == dst_ip`
+    alone for IPv4/IPv6, matching the BPF reference
+    (`13fa1009e^:bpf/xdp/xdp_screen.c` ~715-723).
+- **File(s)**: `userspace-dp/src/screen/stateless.rs`,
+  `userspace-dp/src/screen/tests.rs`,
+  `userspace-dp/src/screen/mod.rs`, `userspace-dp/src/FEATURES.md`
+- **Validation**: `cargo build --release` clean; 113 screen tests +
+  9 new/updated land/ping fail-on-revert tests pass; 5x flake clean;
+  reverting either production fix fails the matching new test.
+
 ## 2026-06-21 — #2209 + #2210: screen scan/sweep per-zone + bounded + count-after-lookup
 
 - **Timestamp**: 2026-06-21
@@ -8958,3 +8983,25 @@ top.
   correctness + overlap determinism + fail-on-revert all CONFIRMED both sides;
   no wire regen; 2 pre-existing pkg/dataplane canary failures unrelated).
 - **File(s)**: pkg/config/compiler_nat.go, pkg/config/compiler_nptv6_test.go
+
+- **Timestamp**: 2026-06-21
+- **Action**: #2217 — strict commit-time validation for three previously-
+  unvalidated firewall/application cross-references that each silently fail OPEN
+  at the dataplane. (A) firewall filter `then policer <name>` must resolve to a
+  defined `firewall policer` / `three-color-policer`
+  (validateFirewallPolicerReferencesStrict). (B) `applications application-set`
+  members must resolve to a defined application (user / junos-* predefined) or
+  nested set, reusing ExpandApplicationSet (validateApplicationSetMembersStrict;
+  implicit multi-term sets skipped). (C) firewall filter `then routing-instance
+  <name>` (FBF) must name a defined routing-instance
+  (validateFirewallRoutingInstanceReferencesStrict). Strict on commit/commit-
+  check; lenient (warn) on load/peer-sync via lenientFirewallRefs +
+  lenientApplicationSetMembers (#1960 no-brick). Both AST shapes. Fail-on-revert
+  proven (7 reject tests fail when validators neutered). Two pre-existing
+  firewall parse tests + the app-set cycle test updated for the now-stricter
+  compiler (genuine catches: define the steered RI / assert commit-time cycle
+  reject).
+- **File(s)**: pkg/config/compiler_validate_strict.go, pkg/config/compiler.go,
+  pkg/config/compiler_undefined_ref_2217_test.go (new),
+  pkg/config/parser_security_test.go, pkg/config/application_set_nested_test.go,
+  docs/config-schema.md

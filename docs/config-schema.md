@@ -655,6 +655,65 @@ lenient-warn / valid-no-warning; `isHostMaskAddress` table). Like
 `pool-utilization-alarm`, this is compiler-side only — not yet a typed
 `setSchema` leaf.
 
+### #2217 — firewall / application undefined-reference validation
+
+Three firewall/application cross-references compiled cleanly with no operator
+feedback and then silently FAILED OPEN at the dataplane. The schema declared the
+relevant leaves with `args:1` and no validator, and `ValidateConfig` checked the
+neighbouring references (SNAT/DNAT pools, forwarding-class, routing-instance
+interface membership) but not these three. Each gap is closed by a strict
+commit-time gate in `pkg/config/compiler_validate_strict.go`, invoked from the
+typed-config phase of `compileExpanded` (`compiler.go`) alongside the other
+strict-vs-lenient gates:
+
+- **Finding A — `then policer <name>` →
+  `validateFirewallPolicerReferencesStrict`.** A firewall-filter term whose
+  `then policer` names a policer defined under neither `firewall policer` nor
+  `firewall three-color-policer` is rejected. Pre-fix the term kept
+  `Policer="no-such-policer"` and the rate-limit silently never applied
+  (fail-open — the term's traffic passed unpoliced).
+- **Finding B — application-set member →
+  `validateApplicationSetMembersStrict`.** An `applications application-set
+  <set>` member that resolves to neither a defined application (user-defined or
+  `junos-*` predefined) nor a defined nested application-set is rejected. It
+  reuses `ExpandApplicationSet` — the SAME resolver the compiler already uses —
+  so no new definedness table is introduced (it also surfaces the existing
+  max-depth-3 nesting bound at commit). Implicit application-sets minted for
+  multi-term user applications are skipped (their members are
+  compiler-synthesized, not operator references). Pre-fix a policy matching the
+  set silently failed to match the intended traffic (the unresolved member never
+  matches — an effective no-op term).
+- **Finding C — `then routing-instance <name>` (FBF) →
+  `validateFirewallRoutingInstanceReferencesStrict`.** A firewall-filter term
+  whose filter-based-forwarding steer names a routing-instance not defined under
+  `routing-instances` is rejected. Any defined instance is a valid steer target
+  (virtual-router / vrf / forwarding alike), so instance-type is intentionally
+  not constrained — only the dangling-name case is closed. Pre-fix the FBF
+  snapshot carried the unknown name and the dataplane steered matched packets
+  toward a routing table that does not exist (silent blackhole / fall-through to
+  the default table).
+
+All three walk both filter families (`inet` + `inet6`) / both AST shapes
+(hierarchical and flat-set), sorted for a deterministic first-error message.
+
+**Strict (`commit` / `commit check`):** a dangling reference is a HARD commit
+error naming the filter/term (or application-set) and the offending name.
+**Lenient (`Store.Load` / HA peer-sync — `CompileConfigLenient` /
+`CompileConfigForNodeLenient`, flags `lenientFirewallRefs` and
+`lenientApplicationSetMembers`):** the violation downgrades to a `cfg.Warnings`
+entry so a node that committed a dangling reference BEFORE this gate existed (or
+a peer-synced config) still BOOTS after upgrade instead of failing closed (#1960
+fail-closed-on-compile-failure). The dataplane behaves exactly as before for the
+leniently-loaded reference (term unpoliced / steered to a missing table /
+unresolved member dropped), so it is already inert — and the operator's next
+strict commit rejects it loudly.
+
+Regression coverage: `pkg/config/compiler_undefined_ref_2217_test.go` (per
+finding: undefined-reject in both AST shapes, defined-commits-cleanly,
+lenient-warns; plus three-color-policer + `junos-*` predefined + nested-set +
+implicit-multi-term-not-false-rejected cases). Like the gates above, these are
+compiler-side only — not yet typed `setSchema` leaves.
+
 ## The `inactive:` universal node modifier (#2008 H1)
 
 `inactive:` is the Junos deactivate-without-delete marker and is NOT a
