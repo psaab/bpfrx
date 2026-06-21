@@ -287,14 +287,32 @@ func validateIKEPolicyChainReferencesStrict(cfg *Config) error {
 		if chainResolves(gw.IKEPolicy) {
 			continue
 		}
+		// A gateway may be authored under either `security ike gateway` or
+		// `security ipsec gateway` (both compileIKE and compileIPsec populate
+		// the same Gateways map; #2279). The typed gateway does not record
+		// which stanza it came from, so the message names both candidates
+		// rather than asserting a single (possibly wrong) prefix.
 		if _, polDefined := ikePolicies[gw.IKEPolicy]; !polDefined {
-			return fmt.Errorf("security ike gateway %q (used by ipsec vpn %q) "+
-				"references undefined ike-policy %q; phase-1 would silently "+
-				"negotiate with the strongSwan default proposal set instead "+
-				"of the configured crypto",
+			return fmt.Errorf("gateway %q (under `security ike` or "+
+				"`security ipsec`, used by ipsec vpn %q) references undefined "+
+				"ike-policy %q; phase-1 would silently negotiate with the "+
+				"strongSwan default proposal set instead of the configured "+
+				"crypto",
 				gw.Name, vpnName, gw.IKEPolicy)
 		}
 		pol := ikePolicies[gw.IKEPolicy]
+		if pol.Proposals == "" {
+			// The ike-policy exists but has no `proposals` leaf at all, so
+			// pol.Proposals is the empty string. Reporting an "undefined
+			// ike-proposal \"\"" misleads the operator into hunting for a
+			// proposal named "" — say plainly that the policy is missing its
+			// proposals configuration.
+			return fmt.Errorf("ike-policy %q (via gateway %q, ipsec vpn %q) "+
+				"has no proposals configured; phase-1 would silently negotiate "+
+				"with the strongSwan default proposal set instead of the "+
+				"configured crypto",
+				gw.IKEPolicy, gw.Name, vpnName)
+		}
 		return fmt.Errorf("ike-policy %q (via gateway %q, ipsec vpn %q) "+
 			"references undefined ike-proposal %q; phase-1 would silently "+
 			"negotiate with the strongSwan default proposal set instead of "+
