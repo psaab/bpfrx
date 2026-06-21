@@ -13,6 +13,7 @@ import (
 
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 	dpformat "github.com/psaab/xpf/pkg/dataplane/userspace/format"
+	"github.com/psaab/xpf/pkg/diagcmd"
 )
 
 func (s *Server) systemInfoHandler(w http.ResponseWriter, r *http.Request) {
@@ -156,57 +157,35 @@ func (s *Server) tracerouteHandler(w http.ResponseWriter, r *http.Request) {
 	writeOK(w, TextResponse{Output: output})
 }
 
-// buildPingArgv builds the argv for the REST ping handler. The
-// user-supplied target is placed after a "--" end-of-options separator
-// so a "-"-prefixed target is treated as the destination operand rather
-// than a ping flag (option-confusion hardening, #2084). count is the
-// already-clamped probe count.
+// buildPingArgv builds the argv for the REST ping handler. It delegates
+// to the shared diagcmd builder so the VRF-device normalization (apply
+// "vrf-" exactly once, #2143) and the "--" end-of-options separator
+// (option-confusion hardening, #2084) match the CLI and gRPC surfaces
+// byte-for-byte. count is the already-clamped probe count.
 func buildPingArgv(req PingRequest, count int) []string {
-	args := []string{"-c", fmt.Sprintf("%d", count)}
-	if req.Source != "" {
-		args = append(args, "-I", req.Source)
-	}
+	size := ""
 	if req.Size > 0 {
-		args = append(args, "-s", fmt.Sprintf("%d", req.Size))
+		size = fmt.Sprintf("%d", req.Size)
 	}
-	args = append(args, "--", req.Target)
-
-	var cmd []string
-	if req.RoutingInstance != "" {
-		vrfDev := req.RoutingInstance
-		if !strings.HasPrefix(vrfDev, "vrf-") {
-			vrfDev = "vrf-" + vrfDev
-		}
-		cmd = append(cmd, "ip", "vrf", "exec", vrfDev)
-	}
-	cmd = append(cmd, "ping")
-	cmd = append(cmd, args...)
-	return cmd
+	return diagcmd.PingArgv(diagcmd.PingOptions{
+		Target:          req.Target,
+		Count:           fmt.Sprintf("%d", count),
+		Source:          req.Source,
+		Size:            size,
+		RoutingInstance: req.RoutingInstance,
+	})
 }
 
 // buildTracerouteArgv builds the argv for the REST traceroute handler.
-// The user-supplied target is placed after a "--" end-of-options
-// separator so a "-"-prefixed target is treated as the destination
-// operand rather than a traceroute flag (option-confusion hardening,
-// #2084).
+// Like buildPingArgv it delegates to the shared diagcmd builder so VRF
+// normalization (#2143) and the "--" separator (#2084) stay identical
+// across the CLI, REST, and gRPC surfaces.
 func buildTracerouteArgv(req TracerouteRequest) []string {
-	args := []string{}
-	if req.Source != "" {
-		args = append(args, "-s", req.Source)
-	}
-	args = append(args, "--", req.Target)
-
-	var cmd []string
-	if req.RoutingInstance != "" {
-		vrfDev := req.RoutingInstance
-		if !strings.HasPrefix(vrfDev, "vrf-") {
-			vrfDev = "vrf-" + vrfDev
-		}
-		cmd = append(cmd, "ip", "vrf", "exec", vrfDev)
-	}
-	cmd = append(cmd, "traceroute")
-	cmd = append(cmd, args...)
-	return cmd
+	return diagcmd.TracerouteArgv(diagcmd.TracerouteOptions{
+		Target:          req.Target,
+		Source:          req.Source,
+		RoutingInstance: req.RoutingInstance,
+	})
 }
 
 func (s *Server) systemBuffersHandler(w http.ResponseWriter, _ *http.Request) {

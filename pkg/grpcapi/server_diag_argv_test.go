@@ -99,6 +99,29 @@ func TestBuildPingArgvVRFInnerSeparator(t *testing.T) {
 	assertSeparatorBeforeTarget(t, argv, "-bad")
 }
 
+// TestBuildPingArgvVRFNoDoublePrefix locks the #2143 invariant on the
+// gRPC surface: one "vrf-" prefix for a bare name, no doubling for an
+// already-prefixed name.
+func TestBuildPingArgvVRFNoDoublePrefix(t *testing.T) {
+	tests := []struct {
+		name    string
+		vrf     string
+		wantDev string
+	}{
+		{"bare name gets one prefix", "red", "vrf-red"},
+		{"already-prefixed name not doubled", "vrf-red", "vrf-red"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			argv := buildPingArgv(&pb.PingRequest{Target: "192.0.2.1", RoutingInstance: tt.vrf}, 5)
+			exec := indexOf(argv, "exec")
+			if exec < 0 || exec+1 >= len(argv) || argv[exec+1] != tt.wantDev {
+				t.Fatalf("argv %v: VRF device != %q (double-prefix regression?)", argv, tt.wantDev)
+			}
+		})
+	}
+}
+
 func TestBuildTracerouteArgvSeparator(t *testing.T) {
 	tests := []struct {
 		name string

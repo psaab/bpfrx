@@ -516,8 +516,15 @@ func (d *Daemon) directSendGARPs(rgID int) {
 					gw := make(net.IP, len(ipNet.IP))
 					copy(gw, ipNet.IP)
 					gw[len(gw)-1] = 1
-					if err := cluster.SendARPProbe(ifName, gw); err != nil {
-						slog.Warn("directSendGARPs: ARP probe failed", "iface", ifName, "gw", gw, "err", err)
+					// Skip when the VIP is itself the subnet .1 — otherwise we
+					// would probe ourselves. Mirrors the guard in
+					// vrrp.sendGARP (Codex/AGY #2152 review).
+					if !gw.Equal(ip.To4()) {
+						// Use the VIP as the ARP sender so the gateway re-binds
+						// VIP -> our MAC, not the primary IP -> MAC (#2152).
+						if err := cluster.SendARPProbe(ifName, ip.To4(), gw); err != nil {
+							slog.Warn("directSendGARPs: ARP probe failed", "iface", ifName, "gw", gw, "err", err)
+						}
 					}
 				}
 			} else {

@@ -197,6 +197,8 @@ fn v6_frame_with_n_hbh(n: usize) -> Vec<u8> {
         src_port: 1000,
         dst_port: 2000,
         vlan_id: 0,
+        vlan_present: false,
+        pcp: 0,
         ttl: 64,
         ihl: 20,
         ext: vec![ExtHdr::HopByHop(0); n],
@@ -264,6 +266,8 @@ fn pin_ext_walk_mixed_chain_exact_offset() {
         src_port: 53,
         dst_port: 5353,
         vlan_id: 80,
+        vlan_present: true,
+        pcp: 0,
         ttl: 64,
         ihl: 20,
         ext,
@@ -300,6 +304,54 @@ fn pin_ext_walk_no_next_header_is_none() {
     assert_eq!(frame_l4_offset(&frame, AF6), None);
 }
 
+/// #2145 pin: an 802.1p priority-tagged VLAN-0 frame
+/// (`vlan_present = true, vlan_id = 0, pcp > 0`) carries a real 802.1Q
+/// tag, so L3 starts at offset 18 and `ingress_vlan_present` is 1
+/// while `ingress_vlan_id` is 0. The strategy builder must be able to
+/// produce this shape (the old `present = vlan_id != 0` derivation
+/// could not), and the production `frame_l3_offset` parser must resolve
+/// it to 18 from the TPID, not 14.
+#[test]
+fn pin_priority_tagged_vlan0_frame_parses_l3_at_offset_18() {
+    use super::strategies::{build_valid_frame, PacketSpec};
+    let spec = PacketSpec {
+        v6: false,
+        src4: 0x0a00_3d66,
+        dst4: 0xac10_50c8,
+        src6: [0; 16],
+        dst6: [0; 16],
+        protocol: PROTO_TCP,
+        src_port: 49152,
+        dst_port: 443,
+        vlan_id: 0,
+        vlan_present: true,
+        pcp: 5,
+        ttl: 64,
+        ihl: 20,
+        ext: Vec::new(),
+        payload_len: 0,
+        payload_seed: 1,
+        udp_zero_csum: false,
+        tcp_flags: 0x02,
+        tcp_opt_len: 0,
+        seq: 1,
+    };
+    let pkt = build_valid_frame(&spec);
+    assert_eq!(pkt.l3, 18, "priority-tagged VLAN-0 frame keeps the tag → L3 at 18");
+    assert_eq!(
+        pkt.meta.ingress_vlan_present, 1,
+        "tag is present even though VID is 0"
+    );
+    assert_eq!(pkt.meta.ingress_vlan_id, 0, "priority tag carries VID 0");
+    assert_eq!(pkt.meta.ingress_pcp, 5);
+    // The on-wire TPID is 802.1Q so the production parser resolves 18.
+    assert_eq!(u16::from_be_bytes([pkt.frame[12], pkt.frame[13]]), 0x8100);
+    assert_eq!(frame_l3_offset(&pkt.frame), Some(18));
+    // The flow still parses correctly through the tagged header.
+    let flow = parse_session_flow_from_bytes(&pkt.frame, pkt.meta).expect("flow");
+    assert_eq!(flow, pkt.session_flow());
+}
+
 /// P-I5 divergence pin (inspect.rs:329-356 arbitration): when
 /// `meta.protocol` disagrees with the frame's protocol byte, the
 /// meta-led fast path wins for TCP/UDP-complete metadata and the
@@ -320,6 +372,8 @@ fn pin_meta_frame_protocol_arbitration_divergence() {
         src_port: 1234,
         dst_port: 80,
         vlan_id: 0,
+        vlan_present: false,
+        pcp: 0,
         ttl: 64,
         ihl: 20,
         ext: Vec::new(),

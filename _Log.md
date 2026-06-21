@@ -6,6 +6,57 @@
 - **Action**: Folded all 7 Copilot inline comments on PR #2166. Commit 1 (doc/comment only): clarified `seen_rg_epoch` reset-to-0 lifecycle, `WheelPopStats.re_bucketed` now covers standby-gate re-buckets, `epoch_of` comment + `ExpireHaContext` doc no longer imply flow-cache parity and state the out-of-range rg→rg_epochs[0] fallback, README `entry.rs` bullets de-duplicated to public data types. Commit 2 (invariant-loudening): SELF-HEAL + HOLD arms convert `if let Some(em)` → `let em = ...expect(...)` matching Case-4. Build clean; session tests green (expire_ 23/0); the 2 full-suite failures are pre-existing concurrency flakes (worker_queue concurrent_recovery confirmed non-deterministic 2/5, wg reconcile_peers_snapshot) outside session. NOT merged, not pushed to GitHub PR comments.
 - **File(s)**: userspace-dp/src/session/mod.rs, userspace-dp/src/session/ctx.rs, userspace-dp/src/session/expire.rs, userspace-dp/src/afxdp/worker/loop_body/mod.rs, userspace-dp/src/session/README.md
 
+## 2026-06-20 — #2143 CLI ping/traceroute double-prefixed the VRF
+
+- **Action**: Fixed #2143 — the local CLI ping/traceroute builders
+  unconditionally prepended `vrf-`, so `routing-instance vrf-red` ran
+  `ip vrf exec vrf-vrf-red` (non-existent device → false failure) while
+  REST/gRPC normalized correctly. Added shared `pkg/diagcmd`
+  (`VRFDeviceName` applies the prefix exactly once + `PingArgv`/
+  `TracerouteArgv`) and routed all three surfaces (CLI, REST, gRPC)
+  through it. Added regression tests that fail on the `vrf-vrf-*` double
+  prefix.
+- **File(s)**: pkg/diagcmd/diagcmd.go, pkg/diagcmd/diagcmd_test.go,
+  pkg/cli/cli_request.go, pkg/cli/cli_request_argv_test.go,
+  pkg/api/system.go, pkg/api/system_argv_test.go,
+  pkg/grpcapi/server_diag.go, pkg/grpcapi/server_diag_argv_test.go
+
+## 2026-06-20 — #2153 DHCP relay must relay DHCPINFORM
+
+- **Timestamp**: 2026-06-20
+- **Action**: Fixed #2153 — the relay's client→server gate dropped
+  every BOOTREQUEST that was not DISCOVER/REQUEST, silently discarding
+  DHCPINFORM (RFC 2131 §3.4) so clients lost DNS/domain/NTP options.
+  Extracted the gate into a pure `clientRequestRelayable` predicate and
+  added `MessageTypeInform` to the relayable set. The server→client
+  reply path needed NO change: an INFORM is answered with an ACK (already
+  permitted at relay.go:566), and the #2076 reply matrix already routes
+  an ACK with yiaddr==0 + real ciaddr via the `ciaddrReal` UDP-unicast
+  case (relay.go:628). Added a `clientRequestRelayable` table test and an
+  end-to-end `TestRunRelay_RelaysInform` that drives a live INFORM through
+  the real runRelay loop; both fail pre-fix (non-tautological). Documented
+  relayed message types in the package README.
+- **File(s)**: pkg/dhcprelay/relay.go, pkg/dhcprelay/relay_test.go,
+  pkg/dhcprelay/README.md
+- **Validation**: go test -race ./pkg/dhcprelay/ green; new tests proven
+  to FAIL against the pre-fix gate; 5/5 flake on TestRunRelay_RelaysInform;
+  go vet clean. Control-plane relay change — no loss-cluster smoke
+  required (lab-gated per #2115).
+- **Review-driven fixes (PR #2164)**: Copilot flagged a stale README row
+  claiming NAK is forwarded (handleServerResponses forwards OFFER/ACK
+  only) — corrected. Codex hostile review found a real hop-count wrap on
+  the forward path that INFORM newly exercises: HopCount is uint8 and the
+  "> 16" check ran AFTER the ++ , so an incoming 255 wrapped to 0 and was
+  relayed (loop protection defeated). Fixed to enforce the RFC 1542
+  4.1.1 limit BEFORE incrementing (drop on HopCount >= 16) +
+  TestRunRelay_HopCountLimit (255 case non-tautological). Also corrected
+  the DECLINE doc comment (DECLINE is broadcast per RFC 2131 4.4.1, not
+  unicast-to-server).
+- **Out of scope (follow-ups noted, NOT fixed here)**: NAK is silently
+  dropped by handleServerResponses (pre-existing, separate from the
+  INFORM forward gate); giaddr is overwritten even when already nonzero
+  (second-hop relay, RFC 1542/3046 — pre-existing, affects
+  DISCOVER/REQUEST identically). Both predate #2153.
 ## 2026-06-20 — #2129 + #2130 NetFlow v9 export gating + dead Rust exporter removal
 
 - **Timestamp**: 2026-06-20
@@ -7630,6 +7681,36 @@ top.
   MERGE-READY; Copilot reviewed 3/3 files, no comments. Control-plane
   display only — no dataplane smoke. PR #2135 MERGEABLE.
 
+## #2145 — screen/SYN-cookie L3-offset on tag-presence, not VID>0
+- **Timestamp**: 2026-06-20
+- **Action**: Fix priority-tagged VLAN-0 misclassification. The screen
+  and SYN-cookie-ACK stages computed the L3 offset as
+  `if meta.ingress_vlan_id > 0 { 18 } else { 14 }`, so an 802.1p
+  priority-tagged frame (real 802.1Q tag, VID 0, PCP>0,
+  ingress_vlan_present=1) was read at offset 14 — parsing the tag's
+  TPID/TCI bytes as the IP header (LAND/syn-frag/flood misclassification,
+  SYN-cookie skipped or computed from garbage). Switched both sites to
+  `meta.ingress_vlan_present != 0` (tag presence), matching
+  tx/cos_classify.rs. Extended the property strategy: PacketSpec gains
+  `vlan_present`/`pcp`; build_valid_frame emits the tag on presence (not
+  VID); new arb_vlan_tag() generates present=true,vid=0,pcp>0 (egress
+  arb_vlan() kept u16, VID-0=untagged is correct there). Added a
+  non-tautological poll_stages unit test (priority-tagged VID-0 SYN
+  parsed at offset 18 via ip-source-route signal + cookie-ACK validates
+  only when tcp_ack read at 18; untagged control still uses 14) and a
+  frame-level pin (frame_l3_offset->18 for the priority-tagged shape).
+- **File(s)**: userspace-dp/src/afxdp/poll_stages.rs,
+  userspace-dp/src/afxdp/frame/prop_tests/strategies.rs,
+  userspace-dp/src/afxdp/frame/prop_tests/inspect.rs,
+  userspace-dp/src/afxdp/frame/prop_tests/rewrite.rs,
+  userspace-dp/src/afxdp/frame/prop_tests/segment.rs,
+  userspace-dp/src/afxdp/README.md
+- **Validation**: cargo build + cargo test --no-run clean; new tests
+  pass and FAIL with the fix reverted (proven non-tautological); 33/33
+  frame prop_tests green; affected suites green. Pre-existing flaky
+  concurrency test (worker_queue_tests concurrent_recovery, untouched)
+  4/5 in isolation — unrelated. Broader L2-centralization deferred to
+  #2150. Smoke deferred to parent (hot-path/security).
 - **Timestamp**: 2026-06-20
   **Action**: #2154 — parseLeaseCSV reads Kea memfile record-by-record
   (`csv.Reader.Read` loop) instead of `ReadAll`, so one torn/concurrent

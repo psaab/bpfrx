@@ -163,13 +163,24 @@ func SendGratuitousARPBurst(iface string, ip net.IP, count int) error {
 	return nil
 }
 
-// SendARPProbe sends a standard ARP Request for targetIP from the interface's
-// primary address. This forces the target (typically a router) to respond,
-// updating its ARP cache with our MAC as a side effect.
-func SendARPProbe(iface string, targetIP net.IP) error {
+// SendARPProbe sends a standard ARP Request for targetIP with senderIP as
+// the ARP sender protocol address. The target (typically a router) updates
+// its ARP cache with senderIP -> our MAC as a side effect, so senderIP MUST
+// be the address whose MAC binding we want refreshed.
+//
+// On a VRRP failover this MUST be the VIP, not the interface's primary
+// address: a RETH carries both, and refreshing the gateway's cache for the
+// primary leaves the VIP -> MAC binding stale until it ages out (#2152).
+// Callers that merely want a neighbor-table reprobe (no specific source)
+// can pass the interface primary via PrimaryIPv4.
+func SendARPProbe(iface string, senderIP, targetIP net.IP) error {
+	sender4 := senderIP.To4()
+	if sender4 == nil {
+		return fmt.Errorf("sender not an IPv4 address: %s", senderIP)
+	}
 	target4 := targetIP.To4()
 	if target4 == nil {
-		return fmt.Errorf("not an IPv4 address: %s", targetIP)
+		return fmt.Errorf("target not an IPv4 address: %s", targetIP)
 	}
 
 	ifi, err := net.InterfaceByName(iface)
@@ -177,31 +188,16 @@ func SendARPProbe(iface string, targetIP net.IP) error {
 		return fmt.Errorf("interface %s: %w", iface, err)
 	}
 
-	// Find the interface's primary IPv4 address to use as sender IP.
-	addrs, err := ifi.Addrs()
-	if err != nil {
-		return fmt.Errorf("interface addrs: %w", err)
-	}
-	var senderIP net.IP
-	for _, a := range addrs {
-		ipNet, ok := a.(*net.IPNet)
-		if !ok {
-			continue
-		}
-		if ip4 := ipNet.IP.To4(); ip4 != nil && !ip4.Equal(net.IPv4(169, 254, 0, 0).Mask(net.CIDRMask(16, 32))) {
-			// Skip link-local 169.254.x.x addresses — use the VIP.
-			if ip4[0] != 169 || ip4[1] != 254 {
-				senderIP = ip4
-				break
-			}
-		}
-	}
-	if senderIP == nil {
-		return fmt.Errorf("no suitable IPv4 address on %s", iface)
-	}
+	pkt := buildARPRequest(ifi.HardwareAddr, sender4, target4)
 
-	pkt := buildARPRequest(ifi.HardwareAddr, senderIP, target4)
+	return arpProbeSend(ifi, pkt)
+}
 
+// arpProbeSend transmits a crafted ARP probe frame on iface via a raw
+// AF_PACKET socket. It is a package var so tests can intercept the exact
+// frame SendARPProbe emits (sender field at pkt[28:32]) without socket I/O,
+// proving the wiring passes the VIP and not the interface primary (#2152).
+var arpProbeSend = func(ifi *net.Interface, pkt []byte) error {
 	fd, err := unix.Socket(unix.AF_PACKET, unix.SOCK_RAW, int(htons(unix.ETH_P_ARP)))
 	if err != nil {
 		return fmt.Errorf("raw socket: %w", err)
@@ -216,6 +212,39 @@ func SendARPProbe(iface string, targetIP net.IP) error {
 	copy(addr.Addr[:], []byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff})
 
 	return unix.Sendto(fd, pkt, 0, &addr)
+}
+
+// PrimaryIPv4 returns the interface's first non-link-local IPv4 address,
+// for use as an ARP sender IP when no specific source (such as a VRRP VIP)
+// is required — e.g. a neighbor-table reprobe that just wants the kernel to
+// repopulate ARP for a forwarded next-hop. This preserves the self-resolved
+// sender semantics that SendARPProbe used before #2152 made the sender
+// explicit. 169.254.x.x link-local addresses are skipped.
+func PrimaryIPv4(iface string) (net.IP, error) {
+	ifi, err := net.InterfaceByName(iface)
+	if err != nil {
+		return nil, fmt.Errorf("interface %s: %w", iface, err)
+	}
+	addrs, err := ifi.Addrs()
+	if err != nil {
+		return nil, fmt.Errorf("interface addrs: %w", err)
+	}
+	for _, a := range addrs {
+		ipNet, ok := a.(*net.IPNet)
+		if !ok {
+			continue
+		}
+		ip4 := ipNet.IP.To4()
+		if ip4 == nil {
+			continue
+		}
+		// Skip link-local 169.254.x.x addresses.
+		if ip4[0] == 169 && ip4[1] == 254 {
+			continue
+		}
+		return ip4, nil
+	}
+	return nil, fmt.Errorf("no suitable IPv4 address on %s", iface)
 }
 
 func probeIPv6Source(addrs []net.Addr) net.IP {

@@ -31,6 +31,52 @@ var _ dataplane.RuntimeDataPlane = (*Manager)(nil)
 var ErrPolicySchedulerProtocolIncompatible = errors.New("userspace policy scheduler snapshot protocol incompatible")
 var ErrPersistentSourceNATProtocolIncompatible = errors.New("userspace persistent source NAT snapshot protocol incompatible")
 
+// requiredProtocolGateSentinels enumerates every "this config cannot be
+// committed against the helper's current ConfigSnapshotProtocolVersion"
+// sentinel produced by ensureRequiredSnapshotProtocolLocked. ApplyConfig
+// disarms the helper (Armed=false, fail-closed) and returns one of these
+// when the running helper is too old to honor the committed config. A
+// commit that hits any of them MUST abort — i.e. the daemon must surface a
+// failed commit to the operator rather than report success against a
+// disarmed dataplane (#2138).
+//
+// The lenient-load doctrine (#1960) is unaffected, because abort changes
+// behavior ONLY for daemon callers that surface the apply error to a human:
+//   - Boot/restart of an already-persisted config goes through the void
+//     applyConfig wrapper, which logs slog.Warn and swallows the error —
+//     the node boots through (warn, not brick).
+//   - Peer config-sync goes through syncAndApply, which DOES propagate the
+//     error, but its caller (handleConfigSync) logs slog.Error and returns;
+//     the store is already promoted by SyncApply, so the node stays
+//     consistent with the peer (helper disarmed, not bricked).
+// Only the operator-facing commit path (commitAndApply /
+// commitConfirmedAndApply) returns the abort to the committer.
+//
+// Every future ensureRequiredSnapshotProtocolLocked gate MUST add its
+// sentinel here so the commit-abort policy can never silently omit it
+// (the omission this list exists to prevent was exactly #2138: the
+// persistent-source-NAT gate disarmed the helper but was missing from the
+// daemon's abort set).
+var requiredProtocolGateSentinels = []error{
+	ErrPolicySchedulerProtocolIncompatible,
+	ErrPersistentSourceNATProtocolIncompatible,
+}
+
+// IsRequiredProtocolGateError reports whether err is (or wraps) any
+// required helper-protocol gate sentinel — the set that must abort a
+// commit. The daemon commit policy (compileErrorMustAbortApply) delegates
+// to this so the abort set has a single source of truth co-located with
+// the sentinels and the ensureRequiredSnapshotProtocolLocked gate that
+// emits them.
+func IsRequiredProtocolGateError(err error) bool {
+	for _, sentinel := range requiredProtocolGateSentinels {
+		if errors.Is(err, sentinel) {
+			return true
+		}
+	}
+	return false
+}
+
 const persistentSourceNATHAUnsupportedReason = "userspace persistent-nat source pool leases are not HA-synchronized"
 
 // DataplaneMode describes which packet-processing pipeline is active.

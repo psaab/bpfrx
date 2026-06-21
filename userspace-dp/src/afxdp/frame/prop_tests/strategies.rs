@@ -130,6 +130,14 @@ pub(super) struct PacketSpec {
     pub(super) src_port: u16,
     pub(super) dst_port: u16,
     pub(super) vlan_id: u16,
+    /// Whether an 802.1Q tag is present on the wire. Decoupled from
+    /// `vlan_id` so the generators can produce 802.1p priority-tagged
+    /// VLAN-0 frames (`vlan_present = true, vlan_id = 0, pcp > 0`) — the
+    /// #2145 shape that a `vlan_id != 0` test could not reach.
+    pub(super) vlan_present: bool,
+    /// 802.1p priority code point (0..=7), only meaningful when
+    /// `vlan_present` is set.
+    pub(super) pcp: u8,
     pub(super) ttl: u8,
     /// v4 only — header length in bytes (20..=60, multiple of 4).
     pub(super) ihl: usize,
@@ -164,7 +172,20 @@ fn fill_payload(out: &mut Vec<u8>, len: usize, seed: u64) {
 pub(super) fn build_valid_frame(spec: &PacketSpec) -> ValidPacket {
     let mut frame = Vec::new();
     let ether_type: u16 = if spec.v6 { 0x86dd } else { 0x0800 };
-    write_eth_header(&mut frame, DST_MAC, SRC_MAC, spec.vlan_id, ether_type);
+    // Emit the L2 header by tag PRESENCE, not by `vlan_id != 0`, so a
+    // priority-tagged VLAN-0 frame still carries the 4-byte 802.1Q tag
+    // and lands L3 at offset 18. `write_eth_header` (production egress
+    // helper) keys on `vlan_id > 0`, so the priority-tagged-VID-0 case
+    // is built explicitly here (#2145).
+    frame.extend_from_slice(&DST_MAC);
+    frame.extend_from_slice(&SRC_MAC);
+    if spec.vlan_present {
+        // TCI = PCP(3) | DEI(1=0) | VID(12).
+        let tci = ((spec.pcp as u16 & 0x7) << 13) | (spec.vlan_id & 0x0fff);
+        frame.extend_from_slice(&0x8100u16.to_be_bytes());
+        frame.extend_from_slice(&tci.to_be_bytes());
+    }
+    frame.extend_from_slice(&ether_type.to_be_bytes());
     let l3 = frame.len();
 
     let l4_header_len = match spec.protocol {
@@ -322,7 +343,8 @@ pub(super) fn build_valid_frame(spec: &PacketSpec) -> ValidPacket {
             0
         },
         ingress_vlan_id: spec.vlan_id,
-        ingress_vlan_present: u8::from(spec.vlan_id != 0),
+        ingress_pcp: spec.pcp,
+        ingress_vlan_present: u8::from(spec.vlan_present),
         flow_src_port: src_port,
         flow_dst_port: dst_port,
         flow_src_addr: if spec.v6 {
@@ -456,10 +478,39 @@ pub(super) fn arb_meta() -> impl Strategy<Value = UserspaceDpMeta> {
 // Valid-packet strategies
 // ---------------------------------------------------------------------------
 
+/// Egress VLAN ID for the TX/rewrite/segment differential strategies,
+/// where VID 0 == untagged is the correct semantic (`write_eth_header`
+/// keys on `vid > 0`). The ingress frame builders use [`arb_vlan_tag`]
+/// instead so they can also generate priority-tagged VLAN-0 frames.
 pub(super) fn arb_vlan() -> impl Strategy<Value = u16> {
     prop_oneof![
         2 => Just(0u16),
         1 => 1u16..4095,
+    ]
+}
+
+/// A generated 802.1Q tag decision for an INGRESS frame: whether a tag
+/// is present, the VID, and the PCP. Untagged frames carry
+/// `present = false`; tagged frames carry `present = true` with an
+/// arbitrary VID (which may be 0 — the 802.1p priority-tagged shape)
+/// and PCP (#2145).
+#[derive(Clone, Copy, Debug)]
+pub(super) struct VlanTag {
+    pub(super) present: bool,
+    pub(super) vid: u16,
+    pub(super) pcp: u8,
+}
+
+pub(super) fn arb_vlan_tag() -> impl Strategy<Value = VlanTag> {
+    prop_oneof![
+        // Untagged.
+        2 => Just(VlanTag { present: false, vid: 0, pcp: 0 }),
+        // Tagged with a non-zero VID (the common 802.1Q case).
+        2 => (1u16..4095, 0u8..=7)
+            .prop_map(|(vid, pcp)| VlanTag { present: true, vid, pcp }),
+        // Priority-tagged VLAN 0 (PCP > 0, VID 0) — the #2145 shape the
+        // old `present = (vid != 0)` derivation could never produce.
+        1 => (1u8..=7).prop_map(|pcp| VlanTag { present: true, vid: 0, pcp }),
     ]
 }
 
@@ -485,8 +536,8 @@ pub(super) fn arb_ext_chain(max: usize) -> impl Strategy<Value = Vec<ExtHdr>> {
 type TupleParts = (
     (u32, u32, [u8; 16], [u8; 16]),
     (u16, u16),
-    u16, // vlan
-    u8,  // ttl 2..=255
+    VlanTag, // 802.1Q tag decision (present / vid / pcp)
+    u8,      // ttl 2..=255
     (usize, u64), // payload (len, seed)
 );
 
@@ -499,7 +550,7 @@ fn arb_tuple_parts(max_payload: usize) -> impl Strategy<Value = TupleParts> {
             any::<[u8; 16]>(),
         ),
         (any::<u16>(), any::<u16>()),
-        arb_vlan(),
+        arb_vlan_tag(),
         2u8..=255,
         (0usize..=max_payload, any::<u64>()),
     )
@@ -516,7 +567,7 @@ fn spec_from_parts(
     tcp_opt_len: usize,
     seq: u32,
 ) -> PacketSpec {
-    let ((src4, dst4, src6, dst6), (src_port, dst_port), vlan_id, ttl, (payload_len, payload_seed)) =
+    let ((src4, dst4, src6, dst6), (src_port, dst_port), vlan, ttl, (payload_len, payload_seed)) =
         parts;
     PacketSpec {
         v6,
@@ -527,7 +578,9 @@ fn spec_from_parts(
         protocol,
         src_port,
         dst_port,
-        vlan_id,
+        vlan_id: vlan.vid,
+        vlan_present: vlan.present,
+        pcp: vlan.pcp,
         ttl,
         ihl,
         ext,
@@ -705,7 +758,7 @@ pub(super) fn arb_seg_packet() -> impl Strategy<Value = (ValidPacket, usize)> {
             any::<[u8; 16]>(),
         ),
         (any::<u16>(), any::<u16>()),
-        arb_vlan(),
+        arb_vlan_tag(),
         2u8..=255,
         any::<bool>(),
         arb_ihl(),
@@ -727,7 +780,7 @@ pub(super) fn arb_seg_packet() -> impl Strategy<Value = (ValidPacket, usize)> {
             |(
                 ips,
                 ports,
-                vlan_id,
+                vlan,
                 ttl,
                 v6,
                 ihl,
@@ -752,7 +805,9 @@ pub(super) fn arb_seg_packet() -> impl Strategy<Value = (ValidPacket, usize)> {
                     protocol: PROTO_TCP,
                     src_port,
                     dst_port,
-                    vlan_id,
+                    vlan_id: vlan.vid,
+                    vlan_present: vlan.present,
+                    pcp: vlan.pcp,
                     ttl,
                     ihl,
                     ext: if v6 { ext } else { Vec::new() },
