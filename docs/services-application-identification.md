@@ -98,6 +98,33 @@ runtime effect is the L3/L4 catalog classification above
 - `applications application <name>` — populates the catalog
   for port-based matching; a session matching it is stamped
   with this application's `app_id`.
+  - **#2142 commit-time validation (fail-closed):** an application
+    whose `destination-port` / `source-port` is malformed
+    (non-numeric, out of `1..65535`, or an inverted `low>high`
+    range) or whose `protocol` is not a known name, a `junos-*`
+    alias, or a `0..255` number is **rejected at commit** —
+    *but only when the application is referenced by a security
+    policy, or when `services application-identification` is
+    enabled* (every user application then compiles into the
+    catalog). Such a spec was previously only WARNED: commit
+    succeeded, the app-id compiler recorded the AppID name and
+    then skipped the unparsable port (a never-match AppID), and a
+    policy referencing it failed CLOSED on a `permit` rule or fell
+    through OPEN on a `deny` rule (`validateApplicationSpecsStrict`,
+    `pkg/config/compiler.go`). An **unreferenced** application with
+    app-id disabled is not matchable by anything, so its malformed
+    spec stays a *warning* (the operator can iterate on a
+    not-yet-wired application library). This is the
+    application-DEFINITION sibling of #2124's policy-app-term
+    fail-closed gate. On the tolerant LOAD / peer-sync path the
+    error is downgraded to a warning (no-brick, #1960/#2008
+    doctrine): an already-persisted/synced config carrying a bad
+    referenced app still BOOTS — the dataplane independently skips
+    the bad port and the #2124 runtime capability gate
+    (`expandUserspacePolicyApplications`) fails the snapshot closed
+    (`ForwardingSupported=false`) for a referenced app it cannot
+    represent, so the leniently-loaded bad app is inert rather than
+    silently mis-matching.
 - `applications application-set` — expands into individual
   applications at compile time. Members may be either
   `application <name>` references or nested

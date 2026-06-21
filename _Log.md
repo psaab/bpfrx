@@ -1,5 +1,11 @@
 # Action Log
 
+## 2026-06-21 — #2142 application-definition port/protocol commit-time validation
+
+- **Timestamp**: 2026-06-21
+- **Action**: Added `validateApplicationSpecsStrict` (strict-vs-lenient gate, `lenientApplicationSpecs` flag) rejecting a malformed `set applications application <name>` destination-port/source-port (non-numeric, out of 1..65535, inverted range) or unknown protocol at commit — but ONLY for apps referenced by a security policy (direct or via application-set) OR when `services application-identification` is enabled. Previously warning-only (`ValidateConfig`): commit succeeded, the app-id compiler skipped the unparsable port (never-match AppID), and a referencing policy failed CLOSED on permit / OPEN on deny. Application-DEFINITION sibling of #2124's policy-app-term fail-closed gate; reuses `validatePortSpec`/`validateProtocol` (no new table). Lenient on load/peer-sync (#1960/#2008 no-brick). New `compiler_application_specs_test.go` (10 tests, 8 fail pre-fix); doc note in `docs/services-application-identification.md`.
+- **File(s)**: pkg/config/compiler.go, pkg/config/compiler_application_specs_test.go, docs/services-application-identification.md
+
 ## 2026-06-21 — #2173 (PR #2182) fold: v4-mapped-v6 host-mask family divergence
 
 - **2026-06-21** — Folded MINOR review fixes into PR #2182: NAT host-mask family is now classified textually via `natAddrFamily` (colon => IPv6, matching Rust `IpAddr`/`Ipv4Addr`), NOT `net.ParseIP(...).To4()` — `::ffff:203.0.113.5/32` was wrongly accepted at commit but dropped by the dataplane; the NAT64-pool lenient warning now says only the offending pool address is dropped (not the whole rule); added commit-level mapped-v6 tests for both static-NAT and the NAT64 pool. Files: pkg/config/compiler_nat.go, pkg/config/compiler_nat_host_mask_test.go.
