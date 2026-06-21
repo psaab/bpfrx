@@ -7514,3 +7514,28 @@ top.
 - **Validation**: `go test ./pkg/dhcprelay/ -race` 25/25 pass; config + cli +
   daemon green; `go build ./...` clean. Live flag0 wire-capture +
   test-failover pending parent-run (lab-gated).
+
+## 2026-06-20 — #2121 flushDeleteJournal: re-journal un-sent deletes (no silent drop)
+- **Timestamp**: 2026-06-20
+- **Action**: Fix flushDeleteJournal silently dropping journaled deletes on a
+  full send queue. Replay now goes through the ordered send channel; on a
+  queueMessage failure (full sendCh or disconnect) the un-sent tail is
+  re-journaled (FIFO-prepended, oldest-evicted on overflow) instead of dropped,
+  matching the QueueDeleteV4/V6 journal-on-failure contract. Non-blocking — no
+  timeout/force-disconnect (5 prior plan rounds; v1/v2 KILLED, v3/v4 NEEDS-MAJOR
+  for ordering/liveness; v5.1 PLAN-READY by Claude-SMR + AGY, Codex framing-only
+  NEEDS-MAJOR re-scoped honestly). Also fixed a pre-existing data race in
+  TestBulkEpochMismatchIgnored (test-local `called` bool) surfaced by -race.
+- **File(s)**:
+  - `pkg/cluster/sync_conn.go` — flushDeleteJournal re-journal-on-failure +
+    new rejournalTail (FIFO-prepend, cap-bounded, DeletesDropped accounting).
+  - `pkg/cluster/sync_test.go` — TestDeleteJournalFlushRetainsTailOnFullQueue
+    (non-tautological regression), …FlushPartialThenRetains,
+    TestRejournalTailFIFOPrependAndOverflow (3 branches), …FlushAllFit,
+    …FlushOrderingWithQueuedSession; TestBulkEpochMismatchIgnored race fix.
+  - `docs/session-sync-architecture.md` — Delete Journal replay/retention +
+    key-only-delete residual exposure note.
+  - `docs/pr/2121-flushdeletejournal-requeue/plan.md` — plan v1→v5.1.
+- **Validation**: `go test -race ./pkg/cluster/` green; new tests 5/5 flake;
+  regression tests verified FAIL against pre-fix (silent drop); `go build ./...`
+  clean; full `go test ./...` green. Control-plane HA fix — no dataplane smoke.
