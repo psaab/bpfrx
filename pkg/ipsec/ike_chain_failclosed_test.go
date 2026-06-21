@@ -121,13 +121,18 @@ func TestRenderConfig_BrokenChainSkipsVPN_HealthyTunnelSurvives(t *testing.T) {
 	m := New()
 	out := m.generateConfig(cfg)
 
-	// Healthy tunnel: connection block present, with a non-empty proposals
-	// line carrying the configured crypto.
+	// Healthy tunnel: connection block present, with a non-empty Phase-1
+	// proposals line carrying the configured crypto. Match the four-space-
+	// indented connection-level "\n    proposals = aes256" specifically:
+	// a bare substring "proposals = aes256" would FALSE-PASS off the child
+	// "        esp_proposals = aes256..." line even if the Phase-1
+	// "    proposals = " line were missing (mirror of the negative guard in
+	// TestRenderConfig_NoPolicyGatewayRendersWithoutProposalsLine).
 	if !strings.Contains(out, "tun-good {") {
 		t.Errorf("healthy tunnel tun-good missing from render:\n%s", out)
 	}
-	if !strings.Contains(out, "proposals = aes256") {
-		t.Errorf("healthy tunnel missing a non-empty proposals line:\n%s", out)
+	if !strings.Contains(out, "\n    proposals = aes256") {
+		t.Errorf("healthy tunnel missing a non-empty Phase-1 proposals line:\n%s", out)
 	}
 
 	// Broken tunnel: connection block must NOT be emitted (no proposal-less

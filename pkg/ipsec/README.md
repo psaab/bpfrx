@@ -142,8 +142,14 @@ all files stay in `package ipsec`, so the public API is unchanged.
   - **Commit-time rejection** (`validateIKEPolicyChainReferencesStrict`,
     `pkg/config/compiler_validate_strict.go`, run from the strict-validator
     chain in `compileExpanded`): a VPN whose gateway names an undefined
-    `ike-policy`, or an `ike-policy` whose `proposals` reference dangles,
-    fails `commit` / `commit check`. Only gateways actually referenced by a
+    `ike-policy`, an `ike-policy` whose `proposals` reference dangles, or an
+    `ike-policy` defined with no `proposals` leaf at all, fails `commit` /
+    `commit check`. The diagnostics name the offending object precisely
+    (#2279): the gateway message is stanza-agnostic ("under `security ike`
+    or `security ipsec`", since both stanzas populate the same gateway map),
+    and the missing-`proposals`-leaf case reports "has no proposals
+    configured" rather than a misleading `undefined ike-proposal ""`.
+    Only gateways actually referenced by a
     VPN are validated (an orphan never reaches render, matching Junos). On
     the tolerant load / peer-sync paths the same check is downgraded to a
     warning (`lenientIKEPolicyChainRef`) so a config persisted by an older

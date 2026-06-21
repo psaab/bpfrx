@@ -53,6 +53,57 @@ func TestIKEPolicyDanglingProposalRejected(t *testing.T) {
 	}
 }
 
+// (b2) an ike-policy that is DEFINED but has no `proposals` leaf at all
+// (pol.Proposals == "") must be hard-rejected with a clear "no proposals
+// configured" message — not the pre-#2279 "undefined ike-proposal \"\""
+// which sent the operator hunting for a proposal literally named "".
+func TestIKEPolicyMissingProposalsLeafRejected(t *testing.T) {
+	tree := buildTreeFromSet(t, []string{
+		"set security ike gateway gw1 address 192.0.2.1",
+		"set security ike gateway gw1 ike-policy ike-pol",
+		// ike-pol is defined (mode set) but carries no `proposals` leaf.
+		"set security ike policy ike-pol mode main",
+		"set security ipsec vpn tun1 ike gateway gw1",
+	})
+	_, err := CompileConfig(tree)
+	if err == nil {
+		t.Fatal("CompileConfig accepted an ike-policy with no proposals leaf; expected rejection")
+	}
+	if !strings.Contains(err.Error(), "has no proposals configured") {
+		t.Errorf("error %q must say the ike-policy has no proposals configured", err.Error())
+	}
+	// The confusing pre-#2279 phrasing must be gone.
+	if strings.Contains(err.Error(), `undefined ike-proposal ""`) {
+		t.Errorf("error %q still reports the misleading empty-proposal name", err.Error())
+	}
+	if !strings.Contains(err.Error(), "ike-pol") {
+		t.Errorf("error %q must name the offending ike-policy", err.Error())
+	}
+}
+
+// (b3) the dangling-ike-policy message must NOT assert a single authoring
+// stanza: a gateway can be authored under `security ike` OR `security ipsec`
+// (#2279). The stanza-agnostic phrasing names both so the operator can find
+// the offending gateway regardless of where it was written.
+func TestIKEGatewayDanglingPolicyMessageStanzaAgnostic(t *testing.T) {
+	tree := buildTreeFromSet(t, []string{
+		"set security ike gateway gw1 address 192.0.2.1",
+		"set security ike gateway gw1 ike-policy does-not-exist",
+		"set security ipsec vpn tun1 ike gateway gw1",
+	})
+	_, err := CompileConfig(tree)
+	if err == nil {
+		t.Fatal("CompileConfig accepted a gateway with an undefined ike-policy; expected rejection")
+	}
+	msg := err.Error()
+	// Both candidate stanzas are named so the message is not misleading.
+	for _, want := range []string{"security ike", "security ipsec", "gw1", "does-not-exist"} {
+		if !strings.Contains(msg, want) {
+			t.Errorf("stanza-agnostic message %q missing %q", msg, want)
+		}
+	}
+}
+
 // (c) a fully resolvable chain compiles cleanly and the IKE proposal object
 // is present so the renderer emits a non-empty `proposals =` line.
 func TestIKEPolicyResolvableChainAccepted(t *testing.T) {
