@@ -20,6 +20,37 @@
   frame/tcp.rs, poll_descriptor/mod.rs, poll_descriptor/rx_telemetry.rs},
   userspace-dp/src/screen/{mod.rs, packet.rs},
   userspace-dp/src/session/{mod.rs, install.rs, lookup.rs}
+## 2026-06-21 — #2149: frame builders emit priority-tagged VLAN-0 + preserve PCP
+
+- **Timestamp**: 2026-06-21
+- **Action**: Fixed the userspace frame builders so an 802.1p
+  priority-tagged VLAN-0 frame (real 802.1Q tag, VID 0, PCP != 0) is
+  emitted WITH its tag and PCP preserved, and the reflected local-origin
+  ICMP error path carries the inbound PCP/DEI/TPID through verbatim. The
+  Ethernet writers gated tag emission on `vlan_id > 0`, hard-coded TPID
+  0x8100, and had no PCP input; `ingress_reply_l2` returned a bare `u16`
+  VID, dropping PCP/DEI and the original TPID (0x88a8 vs 0x8100).
+  Introduced `TxVlanTag` (TPID + full TCI + present) in
+  `frame/headers.rs`: writers emit on `tag.emits()` (present AND non-zero
+  TCI — VID > 0 OR PCP/DEI set). `From<u16>` reproduces the legacy
+  bare-VID bytes exactly, so the config-driven egress builders
+  (forwarding, GRE/WG outer, TSO) stay bit-identical (VID 0 == untagged
+  is the intended semantic there — no PCP source). Builder side: new
+  `_tagged` variants; ICMP side: `ingress_reply_l2` returns `TxVlanTag`,
+  v4/v6 builders reflect it when present, fall back to egress VID when
+  untagged. Companion to #2171/#2145, which fixed the screen/SYN-cookie
+  L3-offset on tag presence (the parse side); this is the builder side.
+- **File(s)**: userspace-dp/src/afxdp/frame/headers.rs,
+  userspace-dp/src/afxdp/frame/headers_tests.rs,
+  userspace-dp/src/afxdp/frame/mod.rs,
+  userspace-dp/src/afxdp/icmp.rs,
+  userspace-dp/src/afxdp/README.md
+- **Validation**: cargo build --release clean (no new warnings — the only
+  re-export unused-import warning predates this change);
+  frame/icmp/poll_stages/nat64 365/0; the 7 new tests pass 5x with no
+  flake; all three priority-tagged tests fail under the pre-fix
+  `vlan_id > 0` gating (non-tautological). PENDING-PARENT: live
+  PCP-on-the-wire verification on the loss cluster (not run here).
 
 ## 2026-06-21 — #2146 (PR #2189) fold: close IPv6 ext-header overshoot fail-open
 
