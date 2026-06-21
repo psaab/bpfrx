@@ -87,7 +87,28 @@ type ddnsLease struct {
 	HostName   string // host-name option
 	ClientFQDN string // client-supplied FQDN option (fqdn_fwd implied)
 	Expire     int64  // unix epoch
+
+	// v6 lease kind, recovered from the memfile so the #2239 lease-sync
+	// fallback (readSyncLeasesViaMemfile) preserves IA_PD vs IA_NA instead of
+	// mis-seeding a prefix-delegation lease as an address lease (#2262). These
+	// are NOT used by the DDNS reconciler (it keys on identity+address) — the
+	// fields are inert for v4 and for the DDNS path. lease_type / prefix_len are
+	// OPTIONAL memfile columns (not in requiredLeaseColumns): an old memfile or
+	// a v4 file leaves LeaseType == keaLeaseTypeIANA and LeaseTypeOK == true,
+	// preserving the prior (hardcoded IA_NA) behavior. A PRESENT but
+	// unparseable lease_type sets LeaseTypeOK == false so the sync path can
+	// skip the row rather than silently mis-type it.
+	LeaseType   int  // Kea numeric lease_type: 0=IA_NA, 1=IA_TA, 2=IA_PD
+	LeaseTypeOK bool // false ⇒ lease_type column present but unparseable
+	PrefixLen   int  // v6 IA_PD delegated prefix length (0 when absent)
 }
+
+// Kea memfile lease_type column values (v6 only).
+const (
+	keaLeaseTypeIANA = 0
+	keaLeaseTypeIATA = 1
+	keaLeaseTypeIAPD = 2
+)
 
 // parseActiveLeases4 reads the Kea v4 memfile and returns only active
 // leases (state default, not yet expired). now is the reference time for
@@ -294,15 +315,35 @@ func parseActiveLeases(path string, family int, now time.Time) ([]ddnsLease, err
 
 		hostName, clientFQDN := splitLeaseNames(get(fields, "hostname"), get(fields, "fqdn_fwd"))
 		l := ddnsLease{
-			Family:     family,
-			Address:    addr,
-			SubnetID:   get(fields, "subnet_id"),
-			HostName:   hostName,
-			ClientFQDN: clientFQDN,
-			Expire:     expire,
+			Family:      family,
+			Address:     addr,
+			SubnetID:    get(fields, "subnet_id"),
+			HostName:    hostName,
+			ClientFQDN:  clientFQDN,
+			Expire:      expire,
+			LeaseType:   keaLeaseTypeIANA, // address lease by default (v4, or v6 sans column)
+			LeaseTypeOK: true,
 		}
 		if family == 6 {
 			l.Identity = identity6(get(fields, "duid"), get(fields, "iaid"))
+			// Recover the v6 lease kind so the lease-sync memfile fallback can
+			// preserve IA_PD vs IA_NA (#2262). lease_type / prefix_len are
+			// OPTIONAL columns: an absent or empty lease_type leaves the IA_NA
+			// default (matching the prior hardcoded behavior); a PRESENT but
+			// unparseable value flips LeaseTypeOK so the sync path skips the row
+			// instead of mis-typing it. The DDNS reconciler ignores both fields.
+			if lt := get(fields, "lease_type"); lt != "" {
+				if v, e := strconv.Atoi(strings.TrimSpace(lt)); e == nil {
+					l.LeaseType = v
+				} else {
+					l.LeaseTypeOK = false
+				}
+			}
+			if pl := get(fields, "prefix_len"); pl != "" {
+				if v, e := strconv.Atoi(strings.TrimSpace(pl)); e == nil {
+					l.PrefixLen = v
+				}
+			}
 		} else {
 			l.Identity = identity4(get(fields, "client_id"), get(fields, "hwaddr"))
 		}
