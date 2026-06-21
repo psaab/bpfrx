@@ -453,6 +453,20 @@ impl ScreenState {
             .unwrap_or(0)
     }
 
+    /// Live source-IP session-limit entry count. Lets tests assert the
+    /// tracker map does not leak phantom zero-count entries under
+    /// distinct-IP churn (#2128).
+    #[cfg(test)]
+    fn session_limit_src_len(&self) -> usize {
+        self.session_limits.src_len()
+    }
+
+    /// Live destination-IP session-limit entry count (#2128).
+    #[cfg(test)]
+    fn session_limit_dst_len(&self) -> usize {
+        self.session_limits.dst_len()
+    }
+
     /// Notify the screen state that a new session was created. This increments
     /// per-IP session counters for session limiting.
     #[cfg_attr(not(test), allow(dead_code))]
