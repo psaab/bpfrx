@@ -17,7 +17,11 @@ sync.
   the per-worker handle table.
 - `worker/` — the per-worker poll loop (`mod.rs` runs the dispatch).
 - `poll_stages.rs` — sibling of `worker/`, not inside it. Holds the
-  per-packet pipeline stages extracted in #946 Phase 1.
+  per-packet pipeline stages extracted in #946 Phase 1. The screen and
+  SYN-cookie stages decide the L3 offset (14 vs 18) on tag PRESENCE
+  (`meta.ingress_vlan_present != 0`), not `vlan_id > 0` — 802.1p
+  priority-tagged frames carry a real 802.1Q tag with VID 0, so a
+  VID-based test would mis-read the IP header at offset 14 (#2145).
 - `frame/` — packet parsing (L2 / L3 / L4), checksum helpers, TCP MSS
   clamp. `tests.rs` was relocated out of `mod.rs` in #1046 Phase 1.
 - `umem/` — UMEM allocator, fill ring, completion ring. Frames are
