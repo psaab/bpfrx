@@ -5519,7 +5519,7 @@ func TestClearNATRuleCountersSendsHelperIPCAndIsDurable(t *testing.T) {
 	}
 	defer ln.Close()
 
-	const counterID = uint16(1)
+	const counterID = uint32(1)
 	const cumPackets = uint64(42)
 	const cumBytes = uint64(4200)
 

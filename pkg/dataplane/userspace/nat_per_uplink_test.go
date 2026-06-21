@@ -98,7 +98,7 @@ func TestBuildNATSnapshotsStampCounterID(t *testing.T) {
 
 	// #2218: counter-ID map keys are type-namespaced (dataplane.NATCounterKey)
 	// so same-named rules across NAT types do not collide.
-	natCounterIDs := map[string]uint16{
+	natCounterIDs := map[string]uint32{
 		dataplane.NATCounterKey(dataplane.NATCounterTypeSource, "srcnat", "snat-rule"):    5,
 		dataplane.NATCounterKey(dataplane.NATCounterTypeDest, "dstnat", "dnat-rule"):      6,
 		dataplane.NATCounterKey(dataplane.NATCounterTypeStatic, "statnat", "static-rule"): 7,
@@ -129,7 +129,7 @@ func TestBuildNATSnapshotsStampCounterID(t *testing.T) {
 	}
 }
 
-func srcCounterID(s []SourceNATRuleSnapshot) uint16 {
+func srcCounterID(s []SourceNATRuleSnapshot) uint32 {
 	if len(s) == 0 {
 		return 0
 	}

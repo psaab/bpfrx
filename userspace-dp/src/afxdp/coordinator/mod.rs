@@ -782,8 +782,8 @@ impl Coordinator {
 /// Mirrors `policy_counters.reconcile_rules(&snapshot.policies)`.
 pub(super) fn snapshot_active_nat_counter_ids(
     snapshot: &crate::protocol::ConfigSnapshot,
-) -> Vec<u16> {
-    let mut ids: Vec<u16> = Vec::new();
+) -> Vec<u32> {
+    let mut ids: Vec<u32> = Vec::new();
     for rule in &snapshot.source_nat_rules {
         if rule.counter_id != 0 {
             ids.push(rule.counter_id);

@@ -55,10 +55,15 @@ type CompileResult struct {
 	Lo0FilterV4 uint32 // lo0 inet filter ID (0=none), set by compileFirewallFilters
 	Lo0FilterV6 uint32 // lo0 inet6 filter ID (0=none), set by compileFirewallFilters
 
-	nextAddrID       uint32            // next available address ID (after address book)
-	implicitSets     map[string]uint32 // cache of implicit set key -> set ID
-	nextNATCounterID uint16            // next available NAT rule counter ID (1-based, 0 = no counter)
-	NATCounterIDs    map[string]uint16 // "rulesetName/ruleName" -> counter ID
+	nextAddrID   uint32            // next available address ID (after address book)
+	implicitSets map[string]uint32 // cache of implicit set key -> set ID
+	// NATCounterIDs maps a type-namespaced NAT rule key (NATCounterKey →
+	// "natType/rulesetName/ruleName") to its per-rule translation hit counter
+	// ID. The ID is DERIVED from the key by a stable hash (assignNATCounterID),
+	// not a sequential position counter, so a rule keeps the same ID across a
+	// config reorder/removal — the cumulative helper counter store stays
+	// correctly attributed by construction (#2255). 0 = no counter.
+	NATCounterIDs map[string]uint32
 
 	// pendingXDP/TC collect interface indexes for deferred program attachment.
 	// Attachment happens AFTER all compilation phases so that link.Update()
@@ -163,8 +168,7 @@ func CompileConfig(dp DataPlane, cfg *config.Config, isRecompile bool) (*Compile
 		AppIDs:              make(map[string]uint32),
 		PoolIDs:             make(map[string]uint8),
 		implicitSets:        make(map[string]uint32),
-		nextNATCounterID:    1, // 0 = no counter
-		NATCounterIDs:       make(map[string]uint16),
+		NATCounterIDs:       make(map[string]uint32),
 		FilterSpans:         make(map[string]FilterCounterSpan),
 		Lo0FilterV4:         0xFFFFFFFF, // sentinel: no lo0 filter
 		Lo0FilterV6:         0xFFFFFFFF,
