@@ -163,17 +163,23 @@ pub(super) fn publish_dnat_table_entry(
                 )
             };
             if rc < 0 {
-                // Rare error branch (map full / EINVAL / resource
-                // exhaustion). Keep the log here cheap — the counter the
-                // caller bumps is the durable signal; this stderr line
-                // goes to journald and only fires on the (rare) failure
-                // path, never per packet on success.
-                eprintln!(
-                    "xpf: dnat_table reverse-NAT publish failed (proto={} snat_port={}): {}",
-                    key.protocol,
-                    snat_port,
-                    std::io::Error::last_os_error()
-                );
+                // Error branch (map full / EINVAL / resource exhaustion).
+                // The per-binding counter the caller bumps is the durable
+                // signal. Both call sites are on the session-install path, so
+                // under sustained dnat_table pressure every new SNAT'd session
+                // would log — a journald storm. Gate the line to the first 32
+                // failures (mirrors the first-N idiom at poll_descriptor's
+                // ICMPV6_EMBED_LOGGED); after that the counter alone carries it.
+                static DNAT_PUBLISH_LOG_COUNT: std::sync::atomic::AtomicU32 =
+                    std::sync::atomic::AtomicU32::new(0);
+                if DNAT_PUBLISH_LOG_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 32 {
+                    eprintln!(
+                        "xpf: dnat_table reverse-NAT publish failed (proto={} snat_port={}): {} (further occurrences suppressed; see xpf_userspace_dnat_publish_errors_total)",
+                        key.protocol,
+                        snat_port,
+                        std::io::Error::last_os_error()
+                    );
+                }
                 return false;
             }
             true

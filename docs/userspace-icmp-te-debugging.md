@@ -99,8 +99,11 @@ pre-NAT source — dropped or mis-delivered with no operator signal.
 `publish_dnat_table_entry()` now returns `false` only when the syscall actually
 fails (the no-SNAT / unsupported-family / absent-fd no-op paths return `true`).
 Each worker poll call site bumps the per-binding `dnat_publish_errors`
-(`BindingLiveState`, `userspace-dp/src/afxdp/umem/mod.rs`) on `false` and emits
-a single throttled-by-rarity journald line. The counter is summed by
+(`BindingLiveState`, `userspace-dp/src/afxdp/umem/mod.rs`) on `false`;
+`publish_dnat_table_entry` logs the first 32 failures to journald then
+suppresses the rest (the counter is the durable signal — both call sites are on
+the session-install path, so an unbounded log would storm under sustained
+`dnat_table` pressure). The counter is summed by
 `Coordinator::dnat_publish_errors_total()` and surfaced as the Prometheus
 counter **`xpf_userspace_dnat_publish_errors_total`**. A nonzero value is the
 cause-side signal for `dnat_table` map-capacity pressure that degrades

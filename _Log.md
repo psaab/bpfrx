@@ -8,8 +8,9 @@
   reversal). The function now returns `bool` (`#[must_use]`): `true` for the
   no-op / nothing-to-publish paths, `false` only when the syscall fails. Both
   worker poll call sites bump a new per-binding `dnat_publish_errors`
-  (`BindingLiveState`) on `false` and the function emits one throttled-by-rarity
-  journald line. Summed by `Coordinator::dnat_publish_errors_total()`, carried
+  (`BindingLiveState`) on `false` and `publish_dnat_table_entry` logs the first
+  32 failures to journald then suppresses the rest (session-install path — the
+  counter is the durable signal). Summed by `Coordinator::dnat_publish_errors_total()`, carried
   on `ProcessStatus.dnat_publish_errors_total` (wire `dnat_publish_errors_total`,
   omitempty), and surfaced as the Prometheus counter
   `xpf_userspace_dnat_publish_errors_total`. Mirrors the #1789
