@@ -105,7 +105,10 @@ the userspace dataplane admission boundary is in
   slots, `load override`/`load merge`, `show | display set`.
 - **Configure mode protection**: blocked on secondary cluster nodes (RG0
   primary is config authority).
-- **DHCP server**: Kea integration with lease display.
+- **DHCP server**: Kea integration with lease display; static / fixed /
+  reserved host bindings (`static-binding <mac> { fixed-address; host-name; }`
+  under `dhcp-local-server`/`dhcpv6-local-server` → Kea per-subnet
+  `reservations`, HA-consistent via config-sync — #2243).
 - **DHCP relay**: Option 82 support.
 - **Event engine**: event-driven automation.
 

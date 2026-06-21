@@ -335,6 +335,19 @@ type compileOpts struct {
 	// guard skips the phantom rib and installs no rule, so a leniently-loaded
 	// config is already inert. Same doctrine as lenientRoutingExportRef.
 	lenientRibGroupRefs bool
+	// lenientDHCPStaticBindings (#2243 review) downgrades the DHCP-server
+	// static (fixed/reserved) host-binding gate (validateDHCPStaticBindingsStrict)
+	// from a hard compile error to a cfg.Warnings entry. The strict commit /
+	// commit-check path hard-rejects a binding whose fixed-address is malformed,
+	// family-mismatched, outside the enclosing pool subnet, or duplicates another
+	// binding's MAC/address in the same pool. The tolerant load / peer-sync paths
+	// downgrade to a warning so an already-persisted or peer-synced config
+	// carrying a bad binding still BOOTS (#1960 no-brick) — without the gate the
+	// whole config-load HARD-REJECTED, unlike every sibling validator. The Kea
+	// renderer skips an empty/unparseable binding independently (and canonicalizes
+	// the MAC), so a leniently-loaded bad binding is inert. Same doctrine as
+	// lenientPolicyMatchAddress.
+	lenientDHCPStaticBindings bool
 }
 
 // CompileConfig converts a parsed ConfigTree AST into a typed Config struct.
@@ -375,6 +388,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientFirewallRefs:                true,
 		lenientApplicationSetMembers:       true,
 		lenientRibGroupRefs:                true,
+		lenientDHCPStaticBindings:          true,
 	})
 }
 
@@ -466,6 +480,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientFirewallRefs:                true,
 		lenientApplicationSetMembers:       true,
 		lenientRibGroupRefs:                true,
+		lenientDHCPStaticBindings:          true,
 	})
 }
 
@@ -809,6 +824,27 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		if opts.lenientPolicyMatchAddress {
 			cfg.Warnings = append(cfg.Warnings,
 				fmt.Sprintf("policy match-address (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
+	// #2243 DHCP-server static (fixed/reserved) host bindings. Strict on
+	// commit / commit-check (hard-reject a fixed-address that is malformed,
+	// family-mismatched, outside the enclosing pool subnet, or duplicates
+	// another binding's MAC/address in the same pool); lenient on load /
+	// peer-sync (warn so an already-persisted or peer-synced config carrying a
+	// bad binding still boots — #1960 no-brick). Moved OUT of the strictErrs
+	// accumulator (#2243 review): like every sibling fail-open gate it must
+	// downgrade on the tolerant path, not hard-reject the whole config-load.
+	// The Kea renderer skips an empty/unparseable binding independently, so a
+	// leniently-loaded bad binding is inert. Runs AFTER the accumulator so a
+	// structural CoS/policer/device-map/policy error still wins the first-error
+	// slot.
+	if err := validateDHCPStaticBindingsStrict(cfg); err != nil {
+		if opts.lenientDHCPStaticBindings {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("DHCP static binding (downgraded to warning on tolerant path): %v", err))
 		} else {
 			return nil, err
 		}

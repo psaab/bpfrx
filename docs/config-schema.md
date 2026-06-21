@@ -411,6 +411,56 @@ reserved for whole-dataplane selection where a rewrite shim
   empty-tree-compiles-non-nil trap). Regression coverage:
   `pkg/config/compiler_dhcp_ddns_test.go` (dual-AST equality, absent-default,
   TSIG redaction, enum/ttl accept+reject).
+- **#2243 (DHCP-server static / fixed / reserved host bindings):** added a
+  `static-binding <mac>` named-instance subtree under `services
+  dhcp-local-server group <g> pool <p>` AND `services dhcpv6-local-server
+  group <g> pool <p>`. The schema tree is built by `dhcpStaticBindingSchema()`
+  in `schema_system.go` (returned fresh per call so the v4/v6 parents do not
+  alias a mutable map). The instance key is the client hardware (MAC)
+  address — `keyValueType: ValueMAC` + `keyValidator: ValidateMAC`, so a
+  malformed MAC fails at `?` completion and commit-check. Typed children:
+  - `fixed-address` — `ValueIPAddress` + `ValidateIPAddress` (the reserved
+    IP the matching client always receives).
+  - `host-name` — free-form `args:1` (optional Kea reservation hostname).
+  Compile lives in the `static-binding` case of `compileDHCPLocalServer`
+  (`compiler_services.go`), handling both AST shapes via
+  `namedInstances([]*Node{pp})` (the MAC is `Keys[1]` in flat-set and
+  hierarchical alike; the leaves are the instance node's children). It
+  populates `DHCPPool.StaticBindings []*DHCPStaticBinding`
+  (`types_system.go`). Cross-binding semantics that need the compiled pool
+  (subnet) live in `validateDHCPStaticBindingsStrict`
+  (`compiler_validate_strict.go`): it rejects a missing/malformed
+  fixed-address, a family-mismatched literal (v6 under v4 or vice-versa),
+  an address outside the pool subnet (Kea would silently drop it), and a
+  duplicate MAC identity or duplicate fixed-address within the same pool.
+  **Strict/lenient split (#2243 review, flag `lenientDHCPStaticBindings`):**
+  the gate is strict on the commit / commit-check path (`CompileConfig` —
+  hard-reject) and downgraded to a `cfg.Warnings` entry on the tolerant
+  load / peer-sync paths (`CompileConfigLenient` /
+  `CompileConfigForNodeLenient`) so an already-persisted or peer-synced
+  config carrying a bad binding still BOOTS (#1960 fail-closed-on-load
+  doctrine). It runs AFTER the strict accumulator (mirroring
+  `validatePolicyMatchAddressesStrict`), not inside it — the original
+  in-accumulator placement hard-rejected the whole tolerant config-load,
+  inconsistent with every sibling fail-open validator.
+  The Kea renderer (`generateKea4Config`/`generateKea6Config`,
+  `pkg/dhcpserver/dhcpserver.go`) emits a per-subnet `reservations` array
+  (`hw-address` → `ip-address` for v4; `hw-address` → `ip-addresses[]` for
+  v6, plus optional `hostname`). The MAC is canonicalized to Kea's accepted
+  colon-lowercase form via `canonicalMAC` (`net.ParseMAC().String()`) at
+  both render sites — `ValidateMAC` accepts the Cisco dotted-triplet and
+  uppercase, which Kea's hw-address parser rejects, so a clean-committing
+  config would otherwise break the Kea reconfigure. Reservations derive
+  entirely from the committed config, so an HA pair serving identical
+  subnets is reservation-consistent by construction via the existing
+  cluster config-sync — no per-lease replication is needed for the static
+  case (the dynamic-lease HA gap is the separate companion #2239).
+  Regression coverage: `pkg/config/dhcp_static_binding_test.go` (dual-AST
+  compile, schema MAC/IP rejection, strict out-of-subnet / duplicate /
+  family / missing-address rejection, **strict-reject-vs-lenient-warn
+  gate**) and `pkg/dhcpserver/reservations_test.go` (v4 + v6 Kea
+  `reservations` render, **dotted/uppercase MAC canonicalization**,
+  no-binding omits the key).
 
 ### #2053 — Config secret redaction at JSON/YAML marshal time
 

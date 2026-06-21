@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"net"
+	"net/netip"
 	"sort"
 	"strconv"
 	"strings"
@@ -1251,4 +1252,101 @@ func validateRibGroupImportRibReferencesStrict(cfg *Config) error {
 		}
 	}
 	return nil
+}
+
+// validateDHCPStaticBindingsStrict (#2243) hard-rejects, at commit /
+// commit-check, a DHCP-server static (fixed/reserved) host binding that
+// would render a broken or silently-mismatched Kea reservation:
+//
+//   - a binding missing its fixed-address (no reservation can be emitted);
+//   - a fixed-address that is not a valid IP literal;
+//   - a fixed-address whose family disagrees with the local-server family
+//     (a v6 literal under dhcp-local-server, or a v4 literal under
+//     dhcpv6-local-server) — Kea would reject the subnet;
+//   - a fixed-address outside the enclosing pool's subnet (Kea silently
+//     ignores such a reservation, so the client never gets the reserved
+//     address — fail loud instead);
+//   - a duplicate MAC identity or duplicate fixed-address within the same
+//     pool (the reservation set would be ambiguous / Kea-rejected).
+//
+// The MAC shape itself is already gated by the schema (ValidateMAC); this
+// validator re-parses it only to normalize the duplicate-identity key. A
+// binding with no Subnet on its pool skips the in-subnet check (the pool is
+// then incomplete in other ways the operator will hit first) but still gets
+// the family/duplicate checks.
+func validateDHCPStaticBindingsStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	check := func(srv *DHCPLocalServerConfig, family string, wantV6 bool) error {
+		if srv == nil {
+			return nil
+		}
+		// Deterministic iteration so the first reported error is stable
+		// across runs (map order is otherwise random).
+		groupNames := make([]string, 0, len(srv.Groups))
+		for name := range srv.Groups {
+			groupNames = append(groupNames, name)
+		}
+		sort.Strings(groupNames)
+		for _, gname := range groupNames {
+			group := srv.Groups[gname]
+			if group == nil {
+				continue
+			}
+			for _, pool := range group.Pools {
+				if pool == nil || len(pool.StaticBindings) == 0 {
+					continue
+				}
+				var prefix netip.Prefix
+				havePrefix := false
+				if pool.Subnet != "" {
+					if p, err := netip.ParsePrefix(pool.Subnet); err == nil {
+						prefix = p.Masked()
+						havePrefix = true
+					}
+				}
+				seenMAC := make(map[string]string, len(pool.StaticBindings))
+				seenAddr := make(map[string]string, len(pool.StaticBindings))
+				for _, sb := range pool.StaticBindings {
+					if sb == nil {
+						continue
+					}
+					where := fmt.Sprintf("%s group %q pool %q static-binding %q",
+						family, group.Name, pool.Name, sb.MACAddress)
+					if sb.FixedAddress == "" {
+						return fmt.Errorf("%s has no fixed-address — a reservation cannot be emitted", where)
+					}
+					addr, err := netip.ParseAddr(sb.FixedAddress)
+					if err != nil {
+						return fmt.Errorf("%s fixed-address %q is not a valid IP address", where, sb.FixedAddress)
+					}
+					if wantV6 && !addr.Is6() {
+						return fmt.Errorf("%s fixed-address %q is not an IPv6 address (required under dhcpv6-local-server)", where, sb.FixedAddress)
+					}
+					if !wantV6 && !addr.Is4() {
+						return fmt.Errorf("%s fixed-address %q is not an IPv4 address (required under dhcp-local-server)", where, sb.FixedAddress)
+					}
+					if havePrefix && !prefix.Contains(addr) {
+						return fmt.Errorf("%s fixed-address %q is outside the pool subnet %s (Kea would silently drop the reservation)", where, sb.FixedAddress, pool.Subnet)
+					}
+					macKey := strings.ToLower(sb.MACAddress)
+					if prev, dup := seenMAC[macKey]; dup {
+						return fmt.Errorf("%s duplicates the hardware-address already bound to %s in the same pool", where, prev)
+					}
+					seenMAC[macKey] = sb.FixedAddress
+					addrKey := addr.String()
+					if prevMAC, dup := seenAddr[addrKey]; dup {
+						return fmt.Errorf("%s fixed-address %q is already reserved for %s in the same pool", where, sb.FixedAddress, prevMAC)
+					}
+					seenAddr[addrKey] = sb.MACAddress
+				}
+			}
+		}
+		return nil
+	}
+	if err := check(cfg.System.DHCPServer.DHCPLocalServer, "dhcp-local-server", false); err != nil {
+		return err
+	}
+	return check(cfg.System.DHCPServer.DHCPv6LocalServer, "dhcpv6-local-server", true)
 }

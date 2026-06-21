@@ -1,5 +1,75 @@
 # Action Log
 
+## 2026-06-21 — #2225 VRRP data race on lastDropWarn (AF_PACKET fallback dual receivers)
+
+- **Timestamp**: 2026-06-21
+- **Action**: Fixed a Go data race on `vrrpInstance.lastDropWarn`. On the
+  AF_PACKET-fallback path `run()` starts two concurrent receiver goroutines
+  (`receiver()` IPv4 raw + `receiverIPv6()`); both call `warnRXDrop()` on a
+  full `rxCh`, which did an unsynchronized read-modify-write of the
+  `lastDropWarn time.Time` rate-limiter field (`go test -race` flag).
+  Converted `lastDropWarn` to `atomic.Int64` of Unix nanos updated with
+  `CompareAndSwap` (mirrors the existing `lastGARPTime` dampener); the CAS
+  preserves the once-per-10s dampener under contention (only the swapping
+  goroutine logs). Audited the two receiver paths for sibling races: no
+  other field is shared+mutated between them (`rxReceived`/`rxDrops` already
+  atomic; `localIPv6`/`key()`/`cfg` read-only on those paths). Added
+  `instance_rxdrop_race_test.go` (concurrent hammer + dampener-once +
+  interval-reset); fail-on-revert proven — `-race` flags the DATA RACE on
+  `lastDropWarn` (`warnRXDrop` instance.go) when reverted to `time.Time`,
+  clean with the atomic fix. Documented the dual-receiver concurrency model
+  in `pkg/vrrp/README.md`.
+- **File(s)**: pkg/vrrp/instance.go, pkg/vrrp/instance_rxdrop_race_test.go,
+  pkg/vrrp/README.md, _Log.md
+- **Validation**: `go build ./...` OK; `go vet ./pkg/vrrp/...` OK;
+  `go test ./pkg/vrrp/...` ok; `go test -race ./pkg/vrrp/...` ok.
+  make test-failover no-regression run PENDING-PARENT (VRRP/HA change).
+## 2026-06-21 — #2229 address-book empty-prefix entry warn-flag
+
+- **Timestamp**: 2026-06-21
+- **Action**: Follow-up to #2228. An address-book `address <name>` entry
+  that compiles with no usable prefix (no prefix at all, or only an
+  uncompiled sub-stanza like dns-name/range-address/wildcard-address)
+  yields Value=="". This is fail-closed/safe at resolution but the warn
+  validator only flagged a NON-empty unparseable Value, so a prefix-less
+  entry produced no commit-time warning — an operator authoring error went
+  silent. Extended the address-book warn loop to emit a non-blocking
+  warning (`address-book "X": no usable prefix configured; it will match
+  nothing`) for an empty compiled Value. WARNING, not a hard reject (never
+  worked + fail-closed; don't brick existing configs). Added
+  TestAddressBookEmptyValueWarns (dual-AST, fail-on-revert) and a
+  docs/bugs.md entry.
+- **File(s)**: pkg/config/compiler_validate_warn.go,
+  pkg/config/parser_security_test.go, docs/bugs.md, _Log.md
+
+## 2026-06-21 — #2243 PR #2254 review fixes: Kea MAC canonicalization + lenient validator gate
+
+- **Timestamp**: 2026-06-21
+- **Action**: Two PR #2254 review MINORs on #2243 DHCP static reservations.
+  (1) MAC canonicalization (correctness): the static-binding MAC was
+  rendered VERBATIM into the Kea `hw-address` field. `ValidateMAC`/
+  `net.ParseMAC` accept the Cisco dotted-triplet form (`0011.2233.4455`)
+  and uppercase, but Kea's hw-address parser REJECTS the dotted form -> a
+  clean-committing config would break the entire Kea Dhcp4/6 reconfigure.
+  Added `canonicalMAC` (`net.ParseMAC().String()` -> `aa:bb:cc:dd:ee:ff`)
+  and normalized at BOTH the v4 and v6 reservation render sites; a binding
+  whose MAC fails to parse at render is skipped with a warning (consistent
+  with the tolerant-load skip guard). (2) Lenient-gate the validator
+  (#1960 no-brick): `validateDHCPStaticBindingsStrict` lived in the
+  always-strict `strictErrs` accumulator with no lenient gate, so the
+  tolerant `CompileConfigLenient`/`CompileConfigForNodeLenient` paths
+  HARD-REJECTED a bad binding (bricking boot) unlike all ~19 sibling
+  validators. Added `lenientDHCPStaticBindings` to compileOpts (true in
+  both lenient entry points) and MOVED the validator out of the
+  accumulator into a post-accumulator lenient-gated block mirroring
+  `validatePolicyMatchAddressesStrict`. Fail-on-revert proven for both new
+  tests (MAC verbatim -> render test fails; validator back in accumulator
+  -> lenient test fails).
+- **File(s)**: pkg/dhcpserver/dhcpserver.go,
+  pkg/dhcpserver/reservations_test.go, pkg/config/compiler.go,
+  pkg/config/dhcp_static_binding_test.go, pkg/dhcpserver/README.md,
+  docs/config-schema.md
+
 ## 2026-06-21 — #2218: per-rule SNAT/DNAT/static-NAT translation hit counters (Rust dataplane)
 
 - **Timestamp**: 2026-06-21
@@ -9147,6 +9217,23 @@ top.
   docs/config-schema.md
 
 - **Timestamp**: 2026-06-21
+- **Action**: #2243 — DHCP-server static/fixed/reserved host bindings. Added a
+  MAC-keyed `static-binding <mac> { fixed-address; host-name; }` typed subtree
+  under both `dhcp-local-server` and `dhcpv6-local-server` `group <g> pool <p>`
+  (schema completion + commit validation: keyValidator ValidateMAC,
+  fixed-address ValidateIPAddress). Compiles to DHCPPool.StaticBindings
+  (dual-AST). Strict commit validator rejects missing/malformed/family-
+  mismatched/out-of-subnet fixed-address and duplicate MAC/address in a pool.
+  Kea renderer emits per-subnet `reservations` (v4 hw-address->ip-address; v6
+  hw-address->ip-addresses[]; +hostname). HA-consistent via existing config-sync
+  (no per-lease replication; dynamic-lease HA sync is companion #2239).
+  Fail-on-revert proven (Kea render loop neutered -> render test fails).
+- **File(s)**: pkg/config/types_system.go, pkg/config/schema_system.go,
+  pkg/config/compiler_services.go, pkg/config/compiler_validate_strict.go,
+  pkg/config/compiler.go, pkg/config/dhcp_static_binding_test.go (new),
+  pkg/dhcpserver/dhcpserver.go, pkg/dhcpserver/reservations_test.go (new),
+  pkg/dhcpserver/README.md, docs/config-schema.md, docs/feature-coverage.md,
+  docs/feature-gaps.md
 - **Action**: #2218 PR #2249 review fixes — NAT translation-hit counter
   durability + counter-ID collision. (MAJOR) operator clear was not durable:
   the helper-side `clear_nat_counters` IPC was never SENT by Go, so the next
