@@ -1,8 +1,11 @@
 # #2121 — flushDeleteJournal must not silently drop journaled deletes on a full send queue
 
-Status: DRAFT v5 — radical simplification after THREE NEEDS-MAJOR on v4
-(Codex + Claude-SMR + AGY converged: the timeout/force-disconnect/deferral
-machinery is the problem). Pending re-review.
+Status: PLAN-READY v5.1 — v5 design approved by Claude-SMR (READY) + AGY
+(READY); Codex (NEEDS-MAJOR) required the safety claim be re-scoped
+honestly (it is, below) — all three agree on the FACTS and the design;
+the disagreement was purely whether the "never worse than drop" wording
+was accurate. v5.1 corrects that over-claim and the full-queue-only
+wording. Design unchanged from v5.
 
 ## Design history (why every "active drain" variant failed)
 
@@ -108,13 +111,18 @@ func (s *SessionSync) flushDeleteJournal() {
 			flushed++
 			continue
 		}
-		// First failure: queue is full. Re-journal this message and the rest
+		// First failure: queueMessage returned false — either the send queue
+		// is full OR the peer disconnected (queueMessage checks Connected
+		// first). Either way, re-journal this message and the rest
 		// (FIFO-prepended ahead of any deletes concurrently journaled during
-		// the flush) and stop — further attempts on a full queue would also
-		// fail, and stopping preserves order.
+		// the flush) and stop: on a full queue the rest would also fail, and
+		// on a disconnect there is nothing to send to. Stopping preserves
+		// order. They replay on the next reconnect flush (the QueueDeleteV4
+		// contract).
 		s.rejournalTail(journal[i:])
-		slog.Warn("cluster sync: delete journal flush hit full send queue, re-journaled un-sent tail for next reconnect",
+		slog.Warn("cluster sync: delete journal flush could not enqueue (queue full or disconnected), re-journaled un-sent tail for next reconnect",
 			"total", len(journal), "flushed", flushed, "rejournaled", len(journal)-i,
+			"connected", s.stats.Connected.Load(),
 			"queue_len", len(s.sendCh), "queue_cap", cap(s.sendCh))
 		return
 	}
@@ -162,41 +170,66 @@ is full the rest will fail too, and stopping keeps the un-sent suffix
 contiguous and ordered. This matches `QueueDeleteV4`, which makes a single
 attempt per delete.)
 
-### Why this is correct AND never worse than today
+### What this fixes, and the honest trade-off (Codex re-scoping)
 
 - **Fixes the filed bug:** un-sent journaled deletes are RETAINED, not
-  dropped. They replay on the next reconnect flush.
-- **No new hazard:** the only behavior change on failure is "re-journal"
-  vs "drop". Re-journal is exactly what `QueueDeleteV4` already does on a
-  full queue (sync_conn.go:517), so the deferred-delete-vs-replacement
-  exposure is identical to existing, accepted behavior — NOT introduced or
-  widened by #2121.
-- **Never worse than the silent drop:** for any `D(K)` that today is
-  silently dropped, v5 retains it for later delivery. The only outcome
-  difference is "D(K) eventually delivered" vs "D(K) lost". Delivering the
-  delete is the issue's goal (the lost delete is the bug). The
-  replacement-resurrection concern is the pre-existing journal property,
-  not a regression here.
+  silently lost. They replay on the next reconnect flush, so a session
+  deleted on the primary is no longer leaked indefinitely on the peer.
+- **Behaviorally identical to the shipped `QueueDeleteV4` contract:** the
+  only change on a `queueMessage` failure is "re-journal" instead of
+  "drop". `QueueDeleteV4`/`V6` already re-journal on a `queueMessage`
+  failure (sync_conn.go:517-529), including a full `sendCh` while
+  connected. So the flush path now uses the same journal, the same replay
+  timing (reconnect flush, before bulk), and the same deferral semantics
+  as the runtime delete path. Consistency, not a new mechanism.
 - **No liveness risk:** non-blocking throughout (queueMessage's
   `default`). No timeout, no force-disconnect, no reconnect storm, no
   accept-loop hang, no dual-fabric teardown — all the v3/v4 hazard surface
   is gone.
-- **Ordering for the delivered deletes:** the deletes that DO enqueue go
+- **Ordering for the delivered deletes:** deletes that DO enqueue go
   through `sendCh` in journal order behind already-queued sessions (the v2
   reorder cannot occur — same single ordered path). The re-journaled tail
   is FIFO-prepended so a later flush replays it before concurrently-
   journaled newer deletes.
 
-### Residual exposure (pre-existing, scoped out)
+**Honest safety statement (corrects the v5 over-claim Codex flagged):**
+v5.1 is NOT unconditionally "never worse than the silent drop." There is a
+specific sequence where retain is worse than drop:
+
+1. `D(K)` journaled while disconnected.
+2. Reconnect; `sendCh` full; flush re-journals `D(K)` (today: drops it).
+3. Link stays healthy; a replacement `S'(K)` is created and successfully
+   synced; the peer installs it; a later sweep advances `lastSweepTime`
+   past `S'(K)` (so it is not re-swept).
+4. A later reconnect flushes the retained `D(K)` before peer callbacks /
+   bulk (handleNewConnection:198); the receiver applies a key-only delete
+   (sync_conn.go:832) and removes the live `S'(K)`.
+
+Silent drop would have spared `S'(K)`; retain can delete it. So #2121
+**widens** the pre-existing key-only-delete-kills-replacement hazard from
+the `QueueDeleteV4` full-queue/disconnect paths TO the flush path. This is
+accepted as a **deliberate trade-off**: it converts an *unrecoverable
+silent loss of a delete* (the filed bug — a session leaked on the peer
+forever) into a *bounded retention with the same already-shipped
+deferred-delete exposure that `QueueDeleteV4` carries today*. The class is
+not new; the surface is widened by one path. Two of three reviewers judged
+this acceptable for a LOW-severity fix; Codex agrees the fix is meaningful
+and required only that the plan say this plainly rather than claim
+"never worse." Done.
+
+### Residual exposure & the real fix
 
 The "a journaled delete can kill a same-key replacement re-synced before
-it replays" class is intrinsic to key-only deletes + a reconnect-surviving
-journal. It already exists for `QueueDeleteV4`'s full-queue and disconnect
-journaling. #2121 does not widen it (v5 only changes drop→retain on the
-flush path, matching `QueueDeleteV4`). Fully eliminating it needs a wire-
-protocol generation/session-identity guard on deletes — a larger,
-backward-incompatible change. **Recommend a follow-up issue.** #2121
-deliberately does the narrow, safe fix.
+it replays" class is intrinsic to **key-only deletes + a reconnect-
+surviving journal**. It already exists for `QueueDeleteV4`'s full-queue and
+disconnect journaling; v5.1 extends it to the flush path (above). Fully
+eliminating it requires a wire-protocol **generation / session-identity
+guard** on deletes so the receiver can refuse a stale delete whose
+generation predates the installed session — a larger, backward-
+incompatible change. **A follow-up issue MUST be filed for the generation
+guard**, and the PR references it. #2121 deliberately ships the narrow,
+LOW-severity fix (stop silently losing deletes) and explicitly defers the
+generation guard.
 
 ## Public API preservation
 
@@ -223,6 +256,11 @@ dependence in tests).
 8. Concurrency: a `QueueDeleteV4` racing the flush appends to the new
    (nil'd→empty) journal; `rejournalTail` FIFO-prepends the older tail
    ahead of it under one lock. No race, no lost delete (validated -race).
+   Benign nil-window (SMR note): between the flush nil-ing `s.deleteJournal`
+   and `rejournalTail` repopulating it, a concurrent `QueueDeleteV4` either
+   enqueues to `sendCh` (succeeds — not journaled) or journals into the
+   empty journal (retained). No delete is ever both un-journaled AND
+   un-sent in that window.
 
 ## Risk assessment
 
@@ -238,24 +276,35 @@ dependence in tests).
 
 New `pkg/cluster` tests, `go test -race ./pkg/cluster/`:
 
+   Test-mechanism note (SMR): `NewSessionSync` hardcodes `sendCh` cap 4096
+   with no knob; in-package tests reassign `s.sendCh = make(chan []byte, N)`
+   post-construction (or push 4096 dummies). Tests #1/#2 use the small-cap
+   reassignment.
+
 1. **TestDeleteJournalFlushRetainsTailOnFullQueue** (non-tautological
-   regression): Connected=true, NO drainer; pre-fill `sendCh` to cap so
-   `queueMessage` fails immediately; journal N deletes; `flushDeleteJournal`.
-   Assert: `s.deleteJournal` now holds all N (re-journaled, FIFO order),
-   `DeletesSent == 0`, `DeletesDropped == 0` (N ≤ cap). Pre-fix: journal
-   nil'd + all dropped → `len(s.deleteJournal)==0` → test fails pre-fix.
-   Deterministic (no goroutine/timing — sendCh full ⇒ queueMessage's
-   `default` fires synchronously).
-2. **TestDeleteJournalFlushPartialThenRetains**: cap-3 `sendCh`, drain
-   nothing; Connected=true; journal 5 deletes; flush. Assert `DeletesSent
-   == 3` (first 3 enqueue), the un-sent 2 are re-journaled at the FRONT,
-   journal len == 2.
+   regression): Connected=true, NO drainer; reassign `s.sendCh` small and
+   pre-fill to cap so `queueMessage` fails immediately; journal N deletes;
+   `flushDeleteJournal`. Assert: `s.deleteJournal` now holds all N
+   (re-journaled, FIFO order), `DeletesSent == 0`, `DeletesDropped == 0`
+   (N ≤ cap). Pre-fix: journal nil'd + all dropped →
+   `len(s.deleteJournal)==0` → test fails pre-fix. Deterministic (no
+   goroutine/timing — sendCh full ⇒ queueMessage's `default` fires
+   synchronously).
+2. **TestDeleteJournalFlushPartialThenRetains**: reassign `s.sendCh` to
+   cap-3, drain nothing; Connected=true; journal 5 deletes; flush. Assert
+   `DeletesSent == 3` (first 3 enqueue), the un-sent 2 are re-journaled at
+   the FRONT, journal len == 2.
 3. **TestRejournalTailFIFOPrependAndOverflow** (unit-test rejournalTail
-   directly): seed `s.deleteJournal` with concurrent `[N1,N2]`; call
-   `rejournalTail([T3,T4,T5])`; assert order `[T3,T4,T5,N1,N2]`. Then with a
-   small cap assert overflow drops oldest tail first
-   (`[T4,T5,N1,N2]`/`[N2,N3]`-style per the dry-runs) and `DeletesDropped`
-   counts exactly the dropped.
+   directly). Cover ALL THREE branches with correctly-derived vectors
+   (SMR: the illustrative `[N2,N3]` label in the design dry-run is a
+   comment artifact — write the actual expected slices from the branch):
+   - no overflow: seed journal `[N1,N2]`; `rejournalTail([T3,T4,T5])`;
+     assert `[T3,T4,T5,N1,N2]`, `DeletesDropped==0`.
+   - overflow within tail (`dropped < len(tail)`): cap 4, journal `[N1,N2]`,
+     tail `[T3,T4,T5]` → assert `[T4,T5,N1,N2]`, `DeletesDropped+=1`.
+   - tail fully dropped (`dropped >= len(tail)`): cap 2, journal
+     `[N1,N2,N3]`, tail `[T3,T4,T5]` → assert `[N2,N3]`,
+     `DeletesDropped+=4`.
 4. **TestDeleteJournalFlushAllFit**: room in `sendCh` + a drainer; journal
    N; flush; assert `DeletesSent == N`, journal empty.
 5. **TestDeleteJournalFlushOrderingWithQueuedSession**: enqueue a session
