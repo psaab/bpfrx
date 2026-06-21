@@ -2229,7 +2229,14 @@ func TestInlineJflowSourceAddress(t *testing.T) {
 }
 
 func TestRibGroups(t *testing.T) {
-	input := `routing-options {
+	// ATT is defined so the import-rib reference resolves (#2226 strict
+	// gate); the test's purpose is the rib-groups parse/compile shape.
+	input := `routing-instances {
+    ATT {
+        instance-type virtual-router;
+    }
+}
+routing-options {
     rib-groups {
         Other-ISPS {
             import-rib [ ATT.inet.0 inet.0 ];

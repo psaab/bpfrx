@@ -2414,7 +2414,15 @@ func TestPointToPointFlag(t *testing.T) {
 }
 
 func TestGlobalInterfaceRoutesRibGroup(t *testing.T) {
-	input := `routing-options {
+	// The ISP instances are defined so the import-rib references resolve
+	// (#2226 strict gate); the test's purpose is the rib-group parse shape.
+	input := `routing-instances {
+    Comcast-BCI { instance-type virtual-router; }
+    ATT { instance-type virtual-router; }
+    Atherton-Fiber { instance-type virtual-router; }
+    sfmix { instance-type virtual-router; }
+}
+routing-options {
     interface-routes {
         rib-group {
             inet Other-ISPS;
@@ -2462,7 +2470,17 @@ func TestGlobalInterfaceRoutesRibGroup(t *testing.T) {
 }
 
 func TestGlobalInterfaceRoutesRibGroupSetSyntax(t *testing.T) {
-	lines := []string{"set routing-options interface-routes rib-group inet Other-ISPS", "set routing-options interface-routes rib-group inet6 Other-ISP6", "set routing-options rib-groups Other-ISPS import-rib Comcast-BCI.inet.0", "set routing-options rib-groups Other-ISPS import-rib inet.0", "set routing-options rib-groups Other-ISPS import-rib Other-GigabitPro.inet.0", "set routing-options rib-groups Other-ISPS import-rib bv-firehouse-vpn.inet.0", "set routing-options rib-groups Other-ISPS import-rib Comcast-GigabitPro.inet.0", "set routing-options rib-groups Other-ISPS import-rib ATT.inet.0", "set routing-options rib-groups Other-ISPS import-rib Atherton-Fiber.inet.0", "set routing-options rib-groups Other-ISPS import-rib sfmix.inet.0", "set routing-options rib-groups Other-ISP6 import-rib Comcast-BCI.inet6.0", "set routing-options rib-groups Other-ISP6 import-rib inet6.0", "set routing-options rib-groups Other-ISP6 import-rib Comcast-GigabitPro.inet6.0", "set routing-options rib-groups Other-ISP6 import-rib ATT.inet6.0", "set routing-options rib-groups Other-ISP6 import-rib Atherton-Fiber.inet6.0"}
+	lines := []string{
+		// Define the ISP instances so the import-rib references resolve
+		// (#2226 strict gate); the test's purpose is the parse shape.
+		"set routing-instances Comcast-BCI instance-type virtual-router",
+		"set routing-instances Other-GigabitPro instance-type virtual-router",
+		"set routing-instances bv-firehouse-vpn instance-type virtual-router",
+		"set routing-instances Comcast-GigabitPro instance-type virtual-router",
+		"set routing-instances ATT instance-type virtual-router",
+		"set routing-instances Atherton-Fiber instance-type virtual-router",
+		"set routing-instances sfmix instance-type virtual-router",
+		"set routing-options interface-routes rib-group inet Other-ISPS", "set routing-options interface-routes rib-group inet6 Other-ISP6", "set routing-options rib-groups Other-ISPS import-rib Comcast-BCI.inet.0", "set routing-options rib-groups Other-ISPS import-rib inet.0", "set routing-options rib-groups Other-ISPS import-rib Other-GigabitPro.inet.0", "set routing-options rib-groups Other-ISPS import-rib bv-firehouse-vpn.inet.0", "set routing-options rib-groups Other-ISPS import-rib Comcast-GigabitPro.inet.0", "set routing-options rib-groups Other-ISPS import-rib ATT.inet.0", "set routing-options rib-groups Other-ISPS import-rib Atherton-Fiber.inet.0", "set routing-options rib-groups Other-ISPS import-rib sfmix.inet.0", "set routing-options rib-groups Other-ISP6 import-rib Comcast-BCI.inet6.0", "set routing-options rib-groups Other-ISP6 import-rib inet6.0", "set routing-options rib-groups Other-ISP6 import-rib Comcast-GigabitPro.inet6.0", "set routing-options rib-groups Other-ISP6 import-rib ATT.inet6.0", "set routing-options rib-groups Other-ISP6 import-rib Atherton-Fiber.inet6.0"}
 	tree := &ConfigTree{}
 	for _, line := range lines {
 		cmd, err := ParseSetCommand(line)
