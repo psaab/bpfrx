@@ -77,18 +77,21 @@ var knownRedistProtocols = map[string]bool{
 // export cannot be resolved to a source protocol we SKIP it and warn
 // rather than poison the managed reload.
 //
-// Two cases reach the skip-and-warn path (both pass the commit-time
-// strict validator, which only checks the name is a known token OR a
-// defined policy-statement — it does NOT require a `from protocol`):
+// Two cases reach the skip-and-warn path:
 //
 //   - The export names a defined policy-statement, but none of its terms
 //     carry a `from protocol` (e.g. it matches only from community /
-//     prefix-list / as-path). FRR's redistribute has no construct to
-//     express "redistribute whatever this policy matches" without a
-//     source protocol, so there is no valid line to emit.
+//     prefix-list / as-path). This case PASSES the commit-time strict
+//     validator, which checks only that the name is a known token OR a
+//     defined policy-statement — it does NOT require a `from protocol`.
+//     FRR's redistribute has no construct to express "redistribute
+//     whatever this policy matches" without a source protocol, so there
+//     is no valid line to emit.
 //   - The export is neither a known protocol token nor a defined
 //     policy-statement (a name that slipped past validation on a tolerant
 //     load / peer-sync path, opts.lenientRoutingExportRef in pkg/config).
+//     The strict validator REJECTS this case at commit; only the lenient
+//     load/peer-sync path can reach the renderer with such a name.
 func (m *Manager) resolveRedistribute(export string, po *config.PolicyOptionsConfig) string {
 	// Junos spells directly-connected routes "direct"; FRR's redistribute
 	// keyword is "connected". A bare `export direct` must render
