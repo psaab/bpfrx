@@ -67,7 +67,13 @@ make test            # Run Go tests
 ```bash
 make test-env-init   # One-time: install incus, create networks + profiles
 make test-vm         # Create Ubuntu 26.04 VM with FRR, strongSwan
-make test-deploy     # Build -> push binary + config + unit -> systemctl enable --now
+make test-deploy     # Build -> push xpfd+cli+helper (each sha256-verified ==
+                     #   local build) + config + unit -> systemctl enable --now,
+                     #   then assert the RUNNING xpfd == pushed build + base-unit
+                     #   ExecStart (reconciles stale #1917 version pins / dangling
+                     #   sbin symlinks, #2162/#2176). Override target instance with
+                     #   XPF_INSTANCE=<name> (default xpf-fw).
+make test-deploy-lib # Self-test the deploy reconcile/sha-verify helpers (no VM)
 make test-ssh        # Shell into VM
 make test-status     # Instance + service + network info
 make test-logs       # journalctl -u xpfd -n 50
