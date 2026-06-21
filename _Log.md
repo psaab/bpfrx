@@ -1,5 +1,23 @@
 # Action Log
 
+## 2026-06-21 — #2229 address-book empty-prefix entry warn-flag
+
+- **Timestamp**: 2026-06-21
+- **Action**: Follow-up to #2228. An address-book `address <name>` entry
+  that compiles with no usable prefix (no prefix at all, or only an
+  uncompiled sub-stanza like dns-name/range-address/wildcard-address)
+  yields Value=="". This is fail-closed/safe at resolution but the warn
+  validator only flagged a NON-empty unparseable Value, so a prefix-less
+  entry produced no commit-time warning — an operator authoring error went
+  silent. Extended the address-book warn loop to emit a non-blocking
+  warning (`address-book "X": no usable prefix configured; it will match
+  nothing`) for an empty compiled Value. WARNING, not a hard reject (never
+  worked + fail-closed; don't brick existing configs). Added
+  TestAddressBookEmptyValueWarns (dual-AST, fail-on-revert) and a
+  docs/bugs.md entry.
+- **File(s)**: pkg/config/compiler_validate_warn.go,
+  pkg/config/parser_security_test.go, docs/bugs.md, _Log.md
+
 ## 2026-06-21 — #2243 PR #2254 review fixes: Kea MAC canonicalization + lenient validator gate
 
 - **Timestamp**: 2026-06-21
