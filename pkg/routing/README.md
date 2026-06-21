@@ -98,6 +98,34 @@ delegate to the owning domain. Exported types:
   (lower priority value = higher priority). PBR sits before main as
   well; rib-group sits after.
 
+### clear()/Apply error contract (#2273)
+
+Each reconciler's `Apply` is clear-then-re-add: `clear()` removes every
+rule in the manager's own priority window, then `Apply` re-installs the
+desired set. `clear()` walks `[AF_INET, AF_INET6]`, calling `RuleList`
+(a per-family netlink dump) on each. The error handling is:
+
+- **Per-family `RuleList` failures are best-effort but observable.** A
+  family whose dump fails is skipped (its in-window rules are left in
+  place that pass), but the failure is **aggregated and returned**
+  (`errors.Join`, wrapped with the family) rather than swallowed. Every
+  family whose dump succeeds is still cleaned. Before #2273 a transient
+  `AF_INET` dump failure orphaned the IPv4 rules in the window for that
+  pass and `clear()` returned `nil`, so the caller never learned — a
+  brief, unobservable self-healing window (the rules are re-cleared on
+  the next commit once the transient clears).
+- **`Apply` logs-and-continues; it does NOT abort on a `clear()` error.**
+  The clear error is captured, logged at WARN, and the desired rules are
+  still re-added (forward progress on the common path is preserved,
+  including the empty-config early returns). `Apply` then **returns the
+  clear error** so `pkg/daemon` (`daemon_apply.go` steps 3b–3d) observes
+  it. The daemon currently logs Apply errors at WARN and continues; the
+  change makes the failure visible (and lets a future caller retry)
+  without changing the daemon's apply sequencing. `RuleDel` failures on
+  individual rules remain debug-logged and do not fail `Apply` — a stale
+  rule that survives one delete is swept by the next pass and re-add uses
+  `NLM_F_CREATE|NLM_F_EXCL`, so a still-desired rule stays correct.
+
 ## Tunnel reconcile-in-place (#1884)
 
 `tunnelManager.Apply` reconciles instead of clear-all +

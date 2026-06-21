@@ -1,6 +1,7 @@
 package routing
 
 import (
+	"errors"
 	"fmt"
 	"testing"
 
@@ -20,6 +21,12 @@ type fakeRuleOps struct {
 	// rules holds the current rule set keyed by family, mirroring the
 	// kernel's per-family rule list that RuleList returns.
 	rules map[int][]netlink.Rule
+
+	// listErr injects a per-family RuleList dump failure, simulating a
+	// transient netlink error on one address family while the other
+	// succeeds — the failure mode #2273 fixes. RuleList(family) returns
+	// listErr[family] (and a nil slice) when present.
+	listErr map[int]error
 
 	adds int
 	dels int
@@ -53,7 +60,21 @@ func (f *fakeRuleOps) RuleDel(r *netlink.Rule) error {
 }
 
 func (f *fakeRuleOps) RuleList(family int) ([]netlink.Rule, error) {
+	if f.listErr != nil {
+		if err := f.listErr[family]; err != nil {
+			return nil, err
+		}
+	}
 	return f.rules[family], nil
+}
+
+// failList arms RuleList(family) to return err. Used to recreate the
+// transient per-family netlink dump failure from #2273.
+func (f *fakeRuleOps) failList(family int, err error) {
+	if f.listErr == nil {
+		f.listErr = map[int]error{}
+	}
+	f.listErr[family] = err
 }
 
 // count returns the number of rules currently present for a family.
@@ -442,5 +463,112 @@ func TestPBRRulesApply_Fake(t *testing.T) {
 	if ops.count(unix.AF_INET) != 0 || ops.count(unix.AF_INET6) != 0 {
 		t.Errorf("expected all PBR rules cleared, v4=%d v6=%d",
 			ops.count(unix.AF_INET), ops.count(unix.AF_INET6))
+	}
+}
+
+// seedRule inserts a rule at the given family/priority/table directly into
+// the fake's backing store (bypassing RuleAdd accounting) so a clear() can
+// be exercised against pre-existing kernel rules.
+func seedRule(ops *fakeRuleOps, family, prio, table int) {
+	ops.rules[family] = append(ops.rules[family], netlink.Rule{
+		Family:   family,
+		Priority: prio,
+		Table:    table,
+	})
+}
+
+// TestRulesClearListErrorSurfaced is the #2273 fail-on-revert guard. When
+// RuleList(AF_INET) fails transiently while RuleList(AF_INET6) succeeds,
+// clear() (via Apply) must:
+//
+//  1. return a non-nil error naming the failing family (so the daemon
+//     apply loop observes it instead of a silent self-healing-orphan
+//     window), and
+//  2. still best-effort delete the rules it COULD list — the AF_INET6
+//     rule in the managed window is removed.
+//
+// The AF_INET rule in the window is left in place because its family's
+// dump failed (the orphan this PR makes observable). Reverting clear() to
+// `continue` + `return nil` makes assertion (1) fail for all three
+// managers, and reverting the Apply wiring (returning bare nil) also fails
+// (1) — this is the regression pin.
+func TestRulesClearListErrorSurfaced(t *testing.T) {
+	injErr := errors.New("netlink: transient EBUSY on AF_INET dump")
+
+	type tc struct {
+		name string
+		// run pre-seeds rules, arms the AF_INET list failure, runs Apply
+		// with a desired config that produces ZERO new rules (so the only
+		// activity is the clear), and returns the Apply error.
+		run func(ops *fakeRuleOps) error
+		// inetPrio / inet6Prio are managed-window priorities for each
+		// domain so the seeded rules fall inside clear()'s scan range.
+		inetPrio  int
+		inet6Prio int
+	}
+
+	cases := []tc{
+		{
+			name:      "next-table",
+			inetPrio:  nextTableRulePriority + 1,
+			inet6Prio: nextTableRulePriority + 2,
+			run: func(ops *fakeRuleOps) error {
+				nt := &nextTableManager{ops: ops}
+				// No routes carry a next-table directive → no re-adds; the
+				// only work clear() does is delete-in-window.
+				return nt.Apply(nil, nil)
+			},
+		},
+		{
+			name:      "rib-group",
+			inetPrio:  ribGroupRulePriority + 1,
+			inet6Prio: ribGroupRulePriority + 2,
+			run: func(ops *fakeRuleOps) error {
+				rg := &ribGroupManager{ops: ops}
+				// Empty rib-groups → early return after clear; no re-adds.
+				return rg.Apply(nil, nil)
+			},
+		},
+		{
+			name:      "pbr",
+			inetPrio:  pbrRulePriority + 1,
+			inet6Prio: pbrRulePriority + 2,
+			run: func(ops *fakeRuleOps) error {
+				p := &pbrManager{ops: ops}
+				// Empty PBR set → early return after clear; no re-adds.
+				return p.Apply(nil)
+			},
+		},
+	}
+
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			ops := newFakeRuleOps()
+			// One managed-window rule per family.
+			seedRule(ops, unix.AF_INET, c.inetPrio, 100)
+			seedRule(ops, unix.AF_INET6, c.inet6Prio, 101)
+			// AF_INET dump fails transiently; AF_INET6 succeeds.
+			ops.failList(unix.AF_INET, injErr)
+
+			err := c.run(ops)
+			if err == nil {
+				t.Fatalf("%s: Apply must return an error when RuleList(AF_INET) fails (#2273) — got nil", c.name)
+			}
+			if !errors.Is(err, injErr) {
+				t.Errorf("%s: returned error must wrap the injected list failure, got %v", c.name, err)
+			}
+
+			// Best-effort delete preserved: the family that DID list is
+			// cleaned. The AF_INET6 window rule must be gone.
+			if got := ops.count(unix.AF_INET6); got != 0 {
+				t.Errorf("%s: AF_INET6 window rule must still be deleted despite the AF_INET list failure, count=%d rules=%v",
+					c.name, got, ops.rules[unix.AF_INET6])
+			}
+			// The AF_INET window rule could not be listed, so it survives
+			// (the orphan this PR makes observable, not silent).
+			if got := ops.count(unix.AF_INET); got != 1 {
+				t.Errorf("%s: AF_INET window rule should remain (its dump failed), count=%d", c.name, got)
+			}
+		})
 	}
 }
