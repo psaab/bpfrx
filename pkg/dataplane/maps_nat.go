@@ -349,39 +349,24 @@ func (m *Manager) SetNPTv6Rule(key NPTv6Key, val NPTv6Value) error {
 	return zm.Update(key, val, ebpf.UpdateAny)
 }
 
-// ReadNATRuleCounter reads the per-CPU NAT rule hit counter and returns
-// the summed packets and bytes across all CPUs, plus any userspace-reported
-// offset for this counter ID (#2218). The Rust userspace dataplane does not
-// write the nat_rule_counters BPF map; it reports per-rule translation hits
-// over the status channel, which the userspace Manager mirrors here via
-// SetNATRuleCounterOffset so this read path returns the live total.
+// ReadNATRuleCounter returns the per-rule NAT translation hit total for a
+// counter ID (#2218). The value is the userspace-reported offset: the Rust
+// userspace dataplane never writes the legacy nat_rule_counters BPF array map
+// (the #1476 eBPF retirement dropped the XDP increment), it reports per-rule
+// hits over the status channel, which the userspace Manager mirrors here via
+// SetNATRuleCounterOffset.
+//
+// #2255: counter IDs are now a stable key-derived hash (sparse u32), not a
+// dense [0,256) array index, so this read path keys the sparse offset map
+// directly and never indexes the legacy 256-entry nat_rule_counters array
+// (a hash id ≥ MaxNATRuleCounters would fail that bounded Lookup). The legacy
+// array only ever held zeros at runtime, so dropping the Lookup changes no
+// observable value.
 func (m *Manager) ReadNATRuleCounter(counterID uint32) (CounterValue, error) {
-	zm, ok := m.maps["nat_rule_counters"]
-	if !ok {
-		// No BPF map (userspace-only runtime): fall back to the userspace
-		// offset so `show security nat ... rule` still reports live hits.
-		m.mu.Lock()
-		offset := m.natRuleCounterOffsets[counterID]
-		m.mu.Unlock()
-		return offset, nil
-	}
-	var perCPU []CounterValue
-	if err := zm.Lookup(counterID, &perCPU); err != nil {
-		return CounterValue{}, err
-	}
-	var total CounterValue
-	for _, v := range perCPU {
-		total.Packets += v.Packets
-		total.Bytes += v.Bytes
-	}
-	// Merge userspace-reported offsets (stored separately to avoid per-CPU
-	// race with the legacy BPF path, mirroring ReadGlobalCounter).
 	m.mu.Lock()
 	offset := m.natRuleCounterOffsets[counterID]
 	m.mu.Unlock()
-	total.Packets += offset.Packets
-	total.Bytes += offset.Bytes
-	return total, nil
+	return offset, nil
 }
 
 // SetNATRuleCounterOffset records the absolute cumulative per-rule NAT

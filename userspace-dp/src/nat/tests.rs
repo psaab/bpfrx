@@ -3077,6 +3077,72 @@ fn nat_counter_store_counts_and_skips_id_zero() {
     assert_eq!((snaps[0].packets, snaps[0].bytes), (0, 0), "clear zeroes");
 }
 
+// === #2255: counter_id stability across config reorder/removal ===
+
+// FAIL-ON-REVERT for #2255 at the store layer. The cumulative numeric-keyed
+// store stays correctly attributed ONLY because the compiler now derives a
+// STABLE, identity-bound counter_id (a wide u32 hash) for each rule. This test
+// proves the store's two safety properties that the stable id relies on:
+//
+//   1. A retained id keeps its cumulative count across reconcile (a rule that
+//      survives a config reorder reads its OWN prior count).
+//   2. A removed id is dropped, so a later rule that gets a DIFFERENT stable id
+//      can never read the removed rule's leftover count.
+//
+// With the pre-#2255 sequential id assignment, a reorder reused a small id (1)
+// for a different rule, and reconcile_ids([1]) would RETAIN the old slot 1 — so
+// the new rule inherited the old rule's count. The wide, identity-derived ids
+// here are the values the compiler produces (no two distinct rules share one),
+// so reconcile retains the right rule and drops the rest.
+#[test]
+fn nat_counter_store_stable_ids_survive_reorder_and_removal() {
+    let store = NatCounterStore::default();
+
+    // Two rules with stable, identity-derived u32 ids (as the compiler emits).
+    const ID_A: u32 = 0x9E37_79B1; // "rule-a"-shaped wide id
+    const ID_B: u32 = 0x1234_5678; // "rule-b"-shaped wide id
+
+    let a = store.rule_counter(ID_A).expect("id A");
+    let b = store.rule_counter(ID_B).expect("id B");
+    for _ in 0..5 {
+        a.add(10);
+    }
+    for _ in 0..3 {
+        b.add(10);
+    }
+
+    // Reorder: the snapshot now lists the SAME ids (identity-bound), just in a
+    // different order. reconcile retains both; each rule reads its OWN count.
+    store.reconcile_ids(&[ID_B, ID_A]);
+    let snaps = store.snapshots();
+    let a_pkts = snaps.iter().find(|s| s.counter_id == ID_A).map(|s| s.packets);
+    let b_pkts = snaps.iter().find(|s| s.counter_id == ID_B).map(|s| s.packets);
+    assert_eq!(a_pkts, Some(5), "rule A keeps its count across reorder");
+    assert_eq!(b_pkts, Some(3), "rule B keeps its count across reorder");
+
+    // Removal: rule A is removed. Its id is dropped from the store entirely.
+    store.reconcile_ids(&[ID_B]);
+    let snaps = store.snapshots();
+    assert_eq!(snaps.len(), 1, "removed rule A's counter is dropped");
+    assert_eq!(snaps[0].counter_id, ID_B);
+    assert_eq!(snaps[0].packets, 3, "surviving rule B is untouched");
+
+    // Re-add a NEW rule C with a different stable id. It starts at zero — it can
+    // never inherit removed rule A's count, because A's id is gone and C's id
+    // (a function of C's identity) differs from A's.
+    const ID_C: u32 = 0xCAFE_BABE;
+    let c = store.rule_counter(ID_C).expect("id C");
+    c.add(10);
+    store.reconcile_ids(&[ID_B, ID_C]);
+    let snaps = store.snapshots();
+    let c_pkts = snaps.iter().find(|s| s.counter_id == ID_C).map(|s| s.packets);
+    assert_eq!(c_pkts, Some(1), "re-added rule C starts from its own count, not A's");
+    assert!(
+        snaps.iter().all(|s| s.counter_id != ID_A),
+        "removed rule A's id never reappears"
+    );
+}
+
 // FAIL-ON-REVERT: a parsed SourceNatRule / DnatEntry / StaticNatEntry must
 // SHARE the store's Arc for its counter_id, and carry None for counter_id 0.
 // If the build wiring drops the store, the Arcs would not be ptr-eq (or the

@@ -7,13 +7,15 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub(crate) struct SourceNATRuleSnapshot {
     pub name: String,
-    /// #2218: compiler-assigned per-rule translation hit-counter id (u16,
-    /// 1-based; 0 = no per-rule counter). Mirrors the policy rule_id ->
-    /// PolicyRuleCounter design; the helper resolves an `Arc<NatRuleCounter>`
-    /// from the coordinator's `NatCounterStore` and increments it once per
-    /// committed translated forward flow.
+    /// #2218: compiler-assigned per-rule translation hit-counter id (non-zero;
+    /// 0 = no per-rule counter). Mirrors the policy rule_id -> PolicyRuleCounter
+    /// design; the helper resolves an `Arc<NatRuleCounter>` from the
+    /// coordinator's `NatCounterStore` and increments it once per committed
+    /// translated forward flow. #2255: the id is a STABLE key-derived hash, so
+    /// it is u32-wide and survives a config reorder/removal — the cumulative
+    /// store stays correctly attributed. The JSON wire is unchanged (a number).
     #[serde(rename = "counter_id", default)]
-    pub counter_id: u16,
+    pub counter_id: u32,
     #[serde(rename = "from_zone", default)]
     pub from_zone: String,
     #[serde(rename = "to_zone", default)]
@@ -53,7 +55,7 @@ pub(crate) struct StaticNATRuleSnapshot {
     pub name: String,
     /// #2218: per-rule translation hit-counter id (see SourceNATRuleSnapshot).
     #[serde(rename = "counter_id", default)]
-    pub counter_id: u16,
+    pub counter_id: u32,
     #[serde(rename = "from_zone", default)]
     pub from_zone: String,
     #[serde(rename = "external_ip", default)]
@@ -67,7 +69,7 @@ pub(crate) struct DestinationNATRuleSnapshot {
     pub name: String,
     /// #2218: per-rule translation hit-counter id (see SourceNATRuleSnapshot).
     #[serde(rename = "counter_id", default)]
-    pub counter_id: u16,
+    pub counter_id: u32,
     #[serde(rename = "from_zone", default)]
     pub from_zone: String,
     #[serde(rename = "destination_address", default)]
@@ -126,7 +128,7 @@ pub(crate) struct Nptv6RuleSnapshot {
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub(crate) struct NatRuleCounterStatus {
     #[serde(rename = "counter_id", default)]
-    pub counter_id: u16,
+    pub counter_id: u32,
     #[serde(rename = "packets", default)]
     pub packets: u64,
     #[serde(rename = "bytes", default)]

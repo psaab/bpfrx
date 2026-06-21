@@ -14,15 +14,16 @@ import (
 // natType MUST match the type the compiler stamped (dataplane.NATCounterKey),
 // otherwise same-named SNAT/DNAT/static rules collide. A nil map or a missing
 // key yields 0 ("no counter"), preserving the legacy behavior where the
-// snapshot carried no per-rule counter attribution.
-func natCounterID(ids map[string]uint16, natType, ruleSet, rule string) uint16 {
+// snapshot carried no per-rule counter attribution. The ID is the stable
+// key-derived hash assigned by the compiler (#2255), so it is u32-wide.
+func natCounterID(ids map[string]uint32, natType, ruleSet, rule string) uint32 {
 	if ids == nil {
 		return 0
 	}
 	return ids[dataplane.NATCounterKey(natType, ruleSet, rule)]
 }
 
-func buildSourceNATSnapshots(cfg *config.Config, natCounterIDs map[string]uint16) []SourceNATRuleSnapshot {
+func buildSourceNATSnapshots(cfg *config.Config, natCounterIDs map[string]uint32) []SourceNATRuleSnapshot {
 	if cfg == nil || len(cfg.Security.NAT.Source) == 0 {
 		return nil
 	}
@@ -130,7 +131,7 @@ func sourceNATPoolPortRange(pool *config.NATPool) (uint16, uint16, bool) {
 	return uint16(low), uint16(high), true
 }
 
-func buildStaticNATSnapshots(cfg *config.Config, natCounterIDs map[string]uint16) []StaticNATRuleSnapshot {
+func buildStaticNATSnapshots(cfg *config.Config, natCounterIDs map[string]uint32) []StaticNATRuleSnapshot {
 	if cfg == nil || len(cfg.Security.NAT.Static) == 0 {
 		return nil
 	}
@@ -187,7 +188,7 @@ func appPortsFromSpec(spec string) []int {
 	return []int{int(p)}
 }
 
-func buildDestinationNATSnapshots(cfg *config.Config, natCounterIDs map[string]uint16) []DestinationNATRuleSnapshot {
+func buildDestinationNATSnapshots(cfg *config.Config, natCounterIDs map[string]uint32) []DestinationNATRuleSnapshot {
 	if cfg == nil || cfg.Security.NAT.Destination == nil || len(cfg.Security.NAT.Destination.RuleSets) == 0 {
 		return nil
 	}
