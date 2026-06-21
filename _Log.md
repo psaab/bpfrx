@@ -1,5 +1,9 @@
 # Action Log
 
+## 2026-06-21 — #2139/#2140/#2141/#2157 event-options robustness cluster
+
+- **Action**: Implemented the converged event-options plan — #2139 transactional batch (validate-then-commit-or-discard on the candidate), #2140 cooldown survives reload (reconcile-not-recreate keyed by name+semantic-revision, arm-on-commit), #2141 strict-reject malformed/unknown attributes-match at commit + fail-closed runtime + SSOT field set, #2157 fail-safe single-worker action queue with ErrConfigLocked backoff retry + drop/retry/commit counters. Files: pkg/eventengine/{engine,engine_test,engine_integration_test,README}.go/md, pkg/config/{event_options_match,event_options_match_test,compiler}.go, pkg/configstore/{envelope,store}.go, pkg/api/{metrics,metrics_descriptors,metrics_system,server}.go, pkg/daemon/daemon_run.go. -race + 5x flake clean.
+
 ## 2026-06-20 — #2120 PR #2166 Copilot fold (doc nits + SELF-HEAL/HOLD expect hardening)
 
 - **Timestamp**: 2026-06-20
