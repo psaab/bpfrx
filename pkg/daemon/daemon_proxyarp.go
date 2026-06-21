@@ -1,9 +1,11 @@
 package daemon
 
 import (
+	"context"
 	"log/slog"
 	"net"
 	"strings"
+	"time"
 
 	"golang.org/x/sys/unix"
 
@@ -11,6 +13,21 @@ import (
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/dataplane"
 )
+
+// proxyARPReassertInterval is the cadence of the always-on proxy-ARP/NDP
+// re-assert loop (#2197 item 2). Proxy-ARP is not latency sensitive, so a
+// worst-case ~30s lag re-asserting net.ipv4.conf.<if>.proxy_arp /
+// net.ipv6.conf.<if>.proxy_ndp (and the NTF_PROXY entries) after a non-commit
+// link cycle is acceptable. The reconcile is netlink + procfs only (no helper
+// control socket), so a 30s cadence keeps load trivial and stays well clear of
+// the >1/s control-socket contention rule. A package var (not a const) so the
+// loop test can shorten it.
+var proxyARPReassertInterval = 30 * time.Second
+
+// proxyARPReconcileFn is the function the re-assert loop invokes each tick. It
+// is a package var so the loop test can substitute a counting fake without
+// touching netlink/procfs; production wiring is (*Daemon).reconcileProxyARP.
+var proxyARPReconcileFn = (*Daemon).reconcileProxyARP
 
 // ifaceIndexByName resolves a Linux interface name to its kernel ifindex. It
 // is a package var so the RETH-resolution unit test can drive
@@ -62,11 +79,12 @@ func proxyARPIfaceMap(cfg *config.Config) map[string]int {
 //
 // This is the apply-path reconcile (formerly inline in applyConfigLocked step
 // 2.6c) extracted so the always-on periodic loop can re-run the identical
-// reconcile after a non-commit link cycle (#2197 item 2). The reconcile is
-// idempotent (it diffs desired vs existing entries and re-writes the sysctl,
-// which the kernel no-ops when already set) and best-effort (a netlink/sysctl
-// failure is logged and never fatal), so re-running it on a steady config
-// causes no churn.
+// reconcile after a non-commit link cycle (an HA RETH member flap or the
+// programRethMAC link-DOWN/UP fallback) re-defaults the per-interface sysctl
+// to its parent value (#2197 item 2). The reconcile is idempotent (it diffs
+// desired vs existing entries and re-writes the sysctl, which the kernel
+// no-ops when already set) and best-effort (a netlink/sysctl failure is logged
+// and never fatal), so re-running it on a steady config causes no churn.
 //
 // The RETH interface resolution (proxy-arp on a reth name resolves to the
 // physical member ifindex via cfg.RethToPhysical() + config.LinuxIfName) is
@@ -90,6 +108,34 @@ func (d *Daemon) reconcileProxyARP(cfg *config.Config) {
 		if a.Iface != "" && a.Family != unix.AF_INET6 {
 			if err := cluster.SendGratuitousARP(a.Iface, a.IP, 1); err != nil {
 				slog.Warn("proxy-arp: GARP failed", "ip", a.IP, "iface", a.Iface, "err", err)
+			}
+		}
+	}
+}
+
+// proxyARPReassertLoop is an always-on periodic re-assert of the proxy-ARP/NDP
+// state (#2197 item 2). The apply-path reconcile only runs on a config commit;
+// a kernel link DOWN/UP outside a commit (HA RETH flap, programRethMAC link
+// cycle) re-defaults the per-interface proxy_arp/proxy_ndp sysctl and leaves
+// the interface silent until the next operator commit. This loop re-asserts the
+// desired state on a low-frequency ticker so a non-commit link cycle self-heals
+// within proxyARPReassertInterval.
+//
+// It is the only proxy-ARP re-assert hook that covers both standalone and
+// cluster modes: reconcileRGStateLoop is cluster-only and monitorLinkState is
+// SNMP-gated, so this is a dedicated, unconditionally-started loop. The
+// reconcile is a no-op when no proxy-arp entries are configured, so the loop is
+// cheap on configs that do not use proxy-arp.
+func (d *Daemon) proxyARPReassertLoop(ctx context.Context) {
+	t := time.NewTicker(proxyARPReassertInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			if cfg := d.store.ActiveConfig(); cfg != nil {
+				proxyARPReconcileFn(d, cfg)
 			}
 		}
 	}

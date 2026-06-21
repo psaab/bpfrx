@@ -1,10 +1,15 @@
 package daemon
 
 import (
+	"context"
 	"errors"
+	"path/filepath"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/configstore"
 )
 
 // withFakeIfaceResolver replaces the proxyARPIfaceMap interface resolver with a
@@ -97,5 +102,92 @@ func TestReconcileProxyARP_NoEntriesIsNoOp(t *testing.T) {
 	d.reconcileProxyARP(nil)              // nil config
 	if called {
 		t.Fatal("reconcileProxyARP resolved interfaces despite no proxy-arp entries")
+	}
+}
+
+// TestProxyARPReassertLoop_DrivesReconcile verifies the always-on ticker drives
+// reconcileProxyARP (#2197 item 2). On pre-fix code there is NO periodic
+// re-assert loop at all, so this test (which asserts the loop invokes the
+// reconcile against the active config) cannot pass — the loop does not exist.
+// Here we substitute a counting reconcile fn and a short interval, then confirm
+// the loop fires it with the store's active config.
+func TestProxyARPReassertLoop_DrivesReconcile(t *testing.T) {
+	dir := t.TempDir()
+	s, err := configstore.New(filepath.Join(dir, "xpf.conf"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.EnterConfigure(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.LoadSet(
+		"set security nat proxy-arp interface ge-0/0/1 address 10.0.2.50/32\n",
+	); err != nil {
+		t.Fatalf("LoadSet: %v", err)
+	}
+	if _, err := s.Commit(); err != nil {
+		t.Fatalf("Commit: %v", err)
+	}
+
+	var calls int64
+	var gotEntries int64
+	prevFn := proxyARPReconcileFn
+	proxyARPReconcileFn = func(_ *Daemon, cfg *config.Config) {
+		atomic.AddInt64(&calls, 1)
+		if cfg != nil && len(cfg.Security.NAT.ProxyARP) > 0 {
+			atomic.StoreInt64(&gotEntries, 1)
+		}
+	}
+	prevIvl := proxyARPReassertInterval
+	proxyARPReassertInterval = 10 * time.Millisecond
+	t.Cleanup(func() {
+		proxyARPReconcileFn = prevFn
+		proxyARPReassertInterval = prevIvl
+	})
+
+	d := &Daemon{store: s}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { d.proxyARPReassertLoop(ctx); close(done) }()
+
+	deadline := time.After(2 * time.Second)
+	for atomic.LoadInt64(&calls) < 2 {
+		select {
+		case <-deadline:
+			cancel()
+			<-done
+			t.Fatalf("loop did not drive reconcile twice in time (calls=%d)", atomic.LoadInt64(&calls))
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+	cancel()
+	<-done
+
+	if atomic.LoadInt64(&gotEntries) != 1 {
+		t.Fatal("loop did not pass the active config (with proxy-arp entries) to the reconcile")
+	}
+}
+
+// TestProxyARPReassertLoop_StopsOnContextCancel verifies the loop exits
+// promptly when its context is cancelled (clean daemon shutdown).
+func TestProxyARPReassertLoop_StopsOnContextCancel(t *testing.T) {
+	dir := t.TempDir()
+	s, err := configstore.New(filepath.Join(dir, "xpf.conf"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	prevIvl := proxyARPReassertInterval
+	proxyARPReassertInterval = time.Hour // never ticks during the test
+	t.Cleanup(func() { proxyARPReassertInterval = prevIvl })
+
+	d := &Daemon{store: s}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { d.proxyARPReassertLoop(ctx); close(done) }()
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("loop did not exit on context cancel")
 	}
 }
