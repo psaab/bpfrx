@@ -199,6 +199,16 @@ to interoperate with an unusual non-xpf VRRP speaker that inserts
 extension headers; deploy homogeneous xpf peers and this path is never
 exercised.
 
+**Deliberately separate from the Rust dataplane walkers (#2150):** this
+Go `walkIPv6ExtHeaders` is a parallel, intentionally non-shared
+implementation. The Rust AF_XDP dataplane has its OWN canonical IPv6
+ext-header walker (`userspace-dp/src/afxdp/frame/inspect.rs::packet_rel_l4_offset_and_protocol`,
+#2148) and its own L2 parse contract (see
+`userspace-dp/src/afxdp/frame/README.md`, #2150). Code cannot be shared
+across the Go/Rust boundary, so any change to the ext-header walk
+semantics must be mirrored by hand in both — do NOT assume the Rust
+dataplane reuses this Go walker, and do NOT try to consolidate them.
+
 ## Gotchas
 
 - Use the **non-VIP** primary IP as source on advertisements. Sourcing

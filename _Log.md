@@ -1,5 +1,42 @@
 # Action Log
 
+## 2026-06-21 — #2150 PR-1: Ethernet/IPv6 parser correctness sub-fixes + drift canaries
+
+- **Timestamp**: 2026-06-21
+- **Action**: PR-1 of the #2150 parser-consolidation plan (Option A — the
+  latent-correctness sub-fixes + drift-guard canaries; PR-2 full
+  unification deferred). Three minimal fixes so the disagreeing userspace
+  L2/IPv6 parsers AGREE with the canonical forwarding parsers on a single
+  0x88a8 (802.1ad) tag and on NDP behind an IPv6 ext-header:
+  (1) `afxdp/parser.rs::parse_eth_offsets` now treats a single 0x88a8 tag
+  as a VLAN tag (l3=18) — was treating it as the inner ethertype (l3=14),
+  so a 0x88a8-tagged ARP/NDP frame skipped neighbor learning;
+  (2) `nat64.rs::frame_l3_offset` now handles 0x88a8 (l3=18) — was
+  treating it as untagged (l3=14), reading the IP header inside the VLAN
+  tag and corrupting a NAT64 translation;
+  (3) `afxdp/parser.rs::parse_ndp_neighbor_advert` now walks the IPv6
+  ext-header chain via the shared #2148 `packet_rel_l4_offset_and_protocol`
+  — was assuming ICMPv6 at a fixed l3+40, missing an NA behind a
+  hop-by-hop / dest-options header. Added drift-guard CANARIES that FAIL
+  on pre-fix code (proven) and PASS after: L2 four-parser agreement, IPv6
+  learning-vs-forwarding walk agreement, nat64 L2 offset. These bugs were
+  LATENT (the XDP shim XDP_PASSes ARP / diverts NDP / drops QinQ-double, so
+  the buggy parsers never received the trap frames); the fix closes the
+  trap before a future steering change springs it.
+- **File(s)**: `userspace-dp/src/afxdp/ethernet.rs` (new
+  `ETHERTYPE_VLAN_8021AD` const), `userspace-dp/src/afxdp/parser.rs`,
+  `userspace-dp/src/nat64.rs`, `userspace-dp/src/afxdp/parser_tests.rs`
+  (canaries + sub-fix tests), `userspace-dp/src/nat64_tests.rs` (canary +
+  e2e), `userspace-dp/src/afxdp/frame/README.md` (canonical contract +
+  deferred PR-2), `pkg/vrrp/README.md` (cross-ref: Go walker stays
+  separate), `docs/research/2150-parser-consolidation/plan.md` (PR record).
+- **Validation**: `cargo build --release` clean; full `cargo test
+  --release` = 2164 passed, 2 failed (both pre-existing/unrelated:
+  `protocol::wire_invariant_default_specimens` fails on pristine
+  origin/master, `worker_queue::concurrent_recovery` is a known timing
+  flake). 8 new tests green; 7 canary/sub-fix tests proven to FAIL on
+  pre-fix source and PASS post-fix.
+
 ## 2026-06-21 — #2146 (PR #2189) fold: close IPv6 ext-header overshoot fail-open
 
 - **Timestamp**: 2026-06-21
