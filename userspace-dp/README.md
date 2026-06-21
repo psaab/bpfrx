@@ -34,7 +34,7 @@ the DPDK backend is retired under #1525.
 | `src/filter/` | Junos-style firewall filter compiler + engine + policer. |
 | `src/event_stream/` | Push-based binary session-delta stream to the daemon. |
 | `src/bin/` | Helper binaries (`fairness-eval`). |
-| `src/nat.rs`, `src/nat64.rs`, `src/nptv6.rs`, `src/policy.rs`, `src/screen.rs`, `src/slowpath.rs`, `src/fairness.rs`, `src/flowexport.rs` | Single-file feature modules consumed by the worker hot path. |
+| `src/nat.rs`, `src/nat64.rs`, `src/nptv6.rs`, `src/policy.rs`, `src/screen.rs`, `src/slowpath.rs`, `src/fairness.rs` | Single-file feature modules consumed by the worker hot path. |
 
 ## Architecture
 
