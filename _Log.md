@@ -72,6 +72,24 @@
 - **Validation**: cargo build --release clean; cargo test --release green.
   Live screen/flood smoke on the loss cluster is PENDING-PARENT.
 
+## 2026-06-21 — #2146 userspace screen: truncated IPv6 fragment header fails OPEN
+
+- **2026-06-21** — Fail-closed the screen extractor: `extract_screen_info` now
+  returns `Result<ScreenPacketInfo, ScreenParseError>`; a truncated/unparseable
+  IPv6 base or extension-header chain returns `Err(TruncatedIpv6ExtChain)` instead
+  of silently breaking the walk with `is_first_fragment=false` (which let a
+  SYN-bearing truncated IPv6 fragment bypass `syn-frag` — IDS evasion now that the
+  BPF screen path is retired #1373/#1476). Both production poll-stage call sites map
+  `Err` to a drop+count+`ip-malformed` screen event (`SCREEN_IP_MALFORMED` 1<<18).
+  Removed the stale "keep the BPF screen path enabled" comment. New extractor tests
+  (truncated frag / truncated base / truncated hop-by-hop / exactly-enough boundary)
+  fail against pre-fix fail-open code; release build + screen/event_emit/poll_stages
+  suites green, 5/5 flake. Live screen/flood smoke PENDING-PARENT.
+- **File(s)**: userspace-dp/src/screen/extract.rs, userspace-dp/src/screen/packet.rs,
+  userspace-dp/src/screen/mod.rs, userspace-dp/src/screen/tests.rs,
+  userspace-dp/src/afxdp/mod.rs, userspace-dp/src/afxdp/poll_stages.rs,
+  userspace-dp/src/afxdp/event_emit.rs
+
 ## 2026-06-21 — #2173 (PR #2182) fold: v4-mapped-v6 host-mask family divergence
 
 - **2026-06-21** — Folded MINOR review fixes into PR #2182: NAT host-mask family is now classified textually via `natAddrFamily` (colon => IPv6, matching Rust `IpAddr`/`Ipv4Addr`), NOT `net.ParseIP(...).To4()` — `::ffff:203.0.113.5/32` was wrongly accepted at commit but dropped by the dataplane; the NAT64-pool lenient warning now says only the offending pool address is dropped (not the whole rule); added commit-level mapped-v6 tests for both static-NAT and the NAT64 pool. Files: pkg/config/compiler_nat.go, pkg/config/compiler_nat_host_mask_test.go.
