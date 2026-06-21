@@ -98,9 +98,14 @@ type vrrpInstance struct {
 	stopped chan struct{}
 
 	// RX backpressure counters (atomic).
-	rxDrops      atomic.Uint64 // packets dropped due to full rxCh
-	rxReceived   atomic.Uint64 // total packets delivered to rxCh
-	lastDropWarn time.Time     // last time we logged a drop warning (rate-limited)
+	rxDrops    atomic.Uint64 // packets dropped due to full rxCh
+	rxReceived atomic.Uint64 // total packets delivered to rxCh
+	// lastDropWarn is the Unix-nanos timestamp of the last drop warning we
+	// logged (rate-limited). It is an atomic.Int64 because warnRXDrop is
+	// called concurrently from both receiver() and receiverIPv6() on the
+	// AF_PACKET-fallback path (#2225); a plain time.Time would be a data
+	// race. Mirrors the lastGARPTime atomic pattern below.
+	lastDropWarn atomic.Int64
 
 	// GARP suppression for strict-vip-ownership mode.
 	suppressGARP  atomic.Bool   // when true, becomeMaster() skips GARP/NA
@@ -1434,14 +1439,27 @@ func (vi *vrrpInstance) resolveIPv6LinkLocal(vipSet map[string]bool) net.IP {
 }
 
 // warnRXDrop increments the drop counter and logs a rate-limited warning.
+//
+// warnRXDrop may run concurrently from both receiver() and receiverIPv6() on
+// the AF_PACKET-fallback path (#2225), so lastDropWarn is an atomic.Int64 of
+// Unix nanos and the read-modify-write is done with CompareAndSwap. The CAS
+// ensures the once-per-interval dampener holds even under contention: only the
+// goroutine that successfully swaps the stale timestamp emits the warning, so a
+// burst of concurrent drops produces a single log line per interval rather than
+// one per racing goroutine.
 func (vi *vrrpInstance) warnRXDrop() {
 	drops := vi.rxDrops.Add(1)
-	now := time.Now()
-	if now.Sub(vi.lastDropWarn) >= 10*time.Second {
-		vi.lastDropWarn = now
-		slog.Warn("vrrp: rx channel full, dropping advertisements",
-			"key", vi.key(), "total_drops", drops)
+	now := time.Now().UnixNano()
+	last := vi.lastDropWarn.Load()
+	if now-last < int64(10*time.Second) {
+		return
 	}
+	if !vi.lastDropWarn.CompareAndSwap(last, now) {
+		// Another goroutine just emitted the warning for this interval.
+		return
+	}
+	slog.Warn("vrrp: rx channel full, dropping advertisements",
+		"key", vi.key(), "total_drops", drops)
 }
 
 // stop signals the instance goroutine to stop and waits for it to finish.

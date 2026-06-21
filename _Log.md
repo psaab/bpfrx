@@ -1,5 +1,30 @@
 # Action Log
 
+## 2026-06-21 — #2225 VRRP data race on lastDropWarn (AF_PACKET fallback dual receivers)
+
+- **Timestamp**: 2026-06-21
+- **Action**: Fixed a Go data race on `vrrpInstance.lastDropWarn`. On the
+  AF_PACKET-fallback path `run()` starts two concurrent receiver goroutines
+  (`receiver()` IPv4 raw + `receiverIPv6()`); both call `warnRXDrop()` on a
+  full `rxCh`, which did an unsynchronized read-modify-write of the
+  `lastDropWarn time.Time` rate-limiter field (`go test -race` flag).
+  Converted `lastDropWarn` to `atomic.Int64` of Unix nanos updated with
+  `CompareAndSwap` (mirrors the existing `lastGARPTime` dampener); the CAS
+  preserves the once-per-10s dampener under contention (only the swapping
+  goroutine logs). Audited the two receiver paths for sibling races: no
+  other field is shared+mutated between them (`rxReceived`/`rxDrops` already
+  atomic; `localIPv6`/`key()`/`cfg` read-only on those paths). Added
+  `instance_rxdrop_race_test.go` (concurrent hammer + dampener-once +
+  interval-reset); fail-on-revert proven — `-race` flags the DATA RACE on
+  `lastDropWarn` (`warnRXDrop` instance.go) when reverted to `time.Time`,
+  clean with the atomic fix. Documented the dual-receiver concurrency model
+  in `pkg/vrrp/README.md`.
+- **File(s)**: pkg/vrrp/instance.go, pkg/vrrp/instance_rxdrop_race_test.go,
+  pkg/vrrp/README.md, _Log.md
+- **Validation**: `go build ./...` OK; `go vet ./pkg/vrrp/...` OK;
+  `go test ./pkg/vrrp/...` ok; `go test -race ./pkg/vrrp/...` ok.
+  make test-failover no-regression run PENDING-PARENT (VRRP/HA change).
+
 ## 2026-06-21 — #2243 PR #2254 review fixes: Kea MAC canonicalization + lenient validator gate
 
 - **Timestamp**: 2026-06-21
