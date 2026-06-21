@@ -855,10 +855,12 @@ fn translate_icmpv6_message_to_icmpv4(
         }
         ICMPV6_DEST_UNREACHABLE | ICMPV6_TIME_EXCEEDED | ICMPV6_PARAMETER_PROBLEM => {
             let (v4_type, v4_code) = map_icmpv6_error_to_icmpv4(icmpv6_type, icmpv6_code)?;
-            // RFC 7915 5.2: the 4-byte rest-of-header is preserved verbatim for
-            // these types (the ICMPv6 Parameter-Problem pointer is NOT remapped
-            // — see map_icmpv6_error_to_icmpv4). Time-Exceeded / Dest-Unreach
-            // carry an unused word.
+            // RFC 7915 5.2: the 4-byte rest-of-header is ZEROED for these
+            // types. Time-Exceeded / Dest-Unreach carry an unused word (zero
+            // is correct on the wire). The ICMPv6 Parameter-Problem pointer is
+            // intentionally NOT remapped to an ICMPv4 pointer (see
+            // map_icmpv6_error_to_icmpv4), so it is dropped to zero rather than
+            // translated.
             write_icmpv4_error_with_embedded(
                 dst, src, v4_type, v4_code, [0, 0, 0, 0], embedded,
             )
