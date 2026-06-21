@@ -442,9 +442,19 @@ func NewSessionSync(localAddr, peerAddr string, rt clusterRuntime) *SessionSync 
 // initGenState seeds the #2170 install-generation counter from CLOCK_MONOTONIC
 // nanos and initializes the sender/receiver generation maps. Seeding from the
 // boot-relative monotonic clock keeps the counter from regressing below a
-// value the peer may already hold after this node restarts within a single
-// boot; cross-boot regression is masked by the cold-start bulk re-prime (which
-// re-installs every owned session with a fresh, higher generation).
+// value the peer may already hold after this node restarts (process restart)
+// WITHIN a single OS boot.
+//
+// CROSS-BOOT (OS reboot) the monotonic clock resets, so this node's counter
+// can come up LOWER than a generation the peer stored from our previous boot.
+// That is handled on the RECEIVER side, not here: when a (reconnecting,
+// possibly rebooted) peer begins its bulk re-prime, the receiver resets its
+// per-key stored generations (resetRecvGen, called from the syncMsgBulkStart
+// handler, #2198 F2). The bulk re-prime — which re-installs every owned
+// session — then lands unconditionally and re-records each key's fresh
+// generation, so the install guard accepts it instead of refusing it as stale
+// (the stale-RETAIN inverse of #2170). A persisted cross-boot high-water mark
+// is therefore unnecessary.
 func (s *SessionSync) initGenState() {
 	seed := uint64(MonotonicNanos())
 	if seed == 0 {

@@ -515,6 +515,62 @@ func TestRecordInstalledGenSkipsNewKeyOnFull(t *testing.T) {
 	}
 }
 
+// TestPeerRebootBulkRePrimeAcceptedAfterReset is the #2198 F2 scenario:
+// cross-boot generation regression. The peer installed S(K) at a HIGH
+// generation (say 10_000) before it rebooted. After reboot its genCounter
+// restarts LOWER (monotonic clock reset), so its cold-start bulk re-prime
+// carries a LOWER generation (say 5). Without the recvGen reset on BulkStart,
+// the install guard refuses the re-prime as stale (stored 10_000 > incoming 5)
+// — the inverse of #2170 (stale-RETAIN) — and the standby never re-learns the
+// flow. With the F2 reset, the bulk re-prime is accepted and re-records gen=5.
+//
+// Against the pre-F2 code (no resetRecvGen) the bulk re-prime is refused →
+// the session is NOT (re)installed → this FAILS.
+func TestPeerRebootBulkRePrimeAcceptedAfterReset(t *testing.T) {
+	key := gen2170KeyV4()
+	dp := &mockSweepDP{v4sessions: map[dataplane.SessionKey]dataplane.SessionValue{}}
+	ss := NewSessionSync(":0", "10.0.0.2:4785", dp)
+
+	// Pre-reboot: the peer synced S(K) at a high generation; we stored 10_000.
+	installWithGenV4(ss, key, 10000)
+	if _, ok := dp.v4sessions[key]; !ok {
+		t.Fatal("pre-reboot session should be installed")
+	}
+	// Drop the dataplane entry to model the standby losing the flow across the
+	// reconnect window (the cold-start re-prime is what must re-establish it).
+	delete(dp.v4sessions, key)
+
+	// Peer reconnects after reboot and starts a fresh bulk transfer. This
+	// resets our stored generations (F2).
+	var bulkStart [8]byte
+	binary.LittleEndian.PutUint64(bulkStart[:], 1) // epoch
+	ss.handleMessage(nil, syncMsgBulkStart, bulkStart[:])
+
+	// The rebooted peer's bulk re-prime carries a LOWER generation (genCounter
+	// restarted). It MUST be accepted.
+	rePrime := func() []byte {
+		v := dataplane.SessionValue{State: dataplane.SessStateEstablished, IngressZone: 1, EgressZone: 2, Generation: 5}
+		return encodeSessionV4Payload(key, v)
+	}()
+	ss.handleMessage(nil, syncMsgSessionV4, rePrime)
+
+	if _, ok := dp.v4sessions[key]; !ok {
+		t.Fatal("post-reboot lower-generation bulk re-prime was wrongly refused (F2: stale-RETAIN inverse of #2170)")
+	}
+	if got := ss.stats.InstallsStaleIgnored.Load(); got != 0 {
+		t.Fatalf("InstallsStaleIgnored = %d, want 0 (the re-prime must not be treated as stale after the reset)", got)
+	}
+
+	// The stored generation is now the re-primed gen=5; a peer delete at gen=5
+	// (its own current generation) applies normally.
+	ss.recvGenMu.Lock()
+	stored := ss.recvGenV4[key]
+	ss.recvGenMu.Unlock()
+	if stored != 5 {
+		t.Fatalf("stored generation after re-prime = %d, want 5", stored)
+	}
+}
+
 // TestGenGuardConcurrentMaps stress-tests the sender- and receiver-side
 // generation maps under concurrent access to surface any data race on
 // genSentV4 / recvGenV4 (run with -race). It exercises the guard/echo helpers

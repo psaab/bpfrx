@@ -213,6 +213,29 @@ func (s *SessionSync) deleteGenGuardV6(key dataplane.SessionKeyV6, deleteGen uin
 	return true
 }
 
+// resetRecvGen clears the receiver-side stored-generation maps. It is called
+// when the peer begins a fresh bulk transfer (#2198 F2): a reconnecting peer
+// may have REBOOTED, which legitimately restarts its sender genCounter (it is
+// seeded from CLOCK_MONOTONIC nanos, which resets at OS boot). Its bulk
+// re-prime then carries generations that may be LOWER than the generations we
+// stored from the peer's previous boot. Without this reset the install guard
+// would refuse the bulk re-prime as "stale" (stored > incoming) — the inverse
+// of the #2170 bug (stale-RETAIN) — and the cold-start re-prime would silently
+// fail to land.
+//
+// This is safe against opening a stale-delete window: deletes are only acted
+// on after the bulk completes (reconcileStaleSessions runs at BulkEnd), and
+// the bulk re-prime re-establishes the live set (re-recording each key's fresh
+// generation) before any such delete is processed. A delete that arrives
+// mid-bulk for a key the bulk has not yet re-recorded falls back to gen-0
+// (stored==0 after reset) → unconditional, which is the legacy-safe behavior.
+func (s *SessionSync) resetRecvGen() {
+	s.recvGenMu.Lock()
+	s.recvGenV4 = make(map[dataplane.SessionKey]uint64)
+	s.recvGenV6 = make(map[dataplane.SessionKeyV6]uint64)
+	s.recvGenMu.Unlock()
+}
+
 func (s *SessionSync) installClusterSyncedV4(key dataplane.SessionKey, val dataplane.SessionValue) {
 	if s.sessions == nil {
 		return
@@ -1164,6 +1187,11 @@ func (s *SessionSync) handleMessage(conn net.Conn, msgType uint8, payload []byte
 		s.stats.BulkSyncStartTime.Store(time.Now().UnixNano())
 		s.stats.BulkSyncEndTime.Store(0)
 		s.stats.BulkSyncSessions.Store(0)
+		// #2198 F2: the peer is re-priming its authoritative live set. Reset
+		// our stored generations so a rebooted peer's bulk (whose genCounter
+		// restarted lower) is accepted by the install guard instead of being
+		// refused as stale (stale-RETAIN, the inverse of #2170).
+		s.resetRecvGen()
 		zoneSnap := s.snapshotZoneOwnership()
 		s.bulkMu.Lock()
 		s.bulkInProgress = true

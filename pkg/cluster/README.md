@@ -182,7 +182,12 @@ outside the monitor loop:
   (`now_seconds<<16|slot`) and collides on same-second/same-slot reuse.
   The generation maps are bounded by `genGuardMapCap` (200000); on overflow
   the map is NEVER cleared (#2198 F1) — an existing key updates in place, a new
-  key skip-records (degrades to safe gen-0) and bumps `GenMapOverflow`.
+  key skip-records (degrades to safe gen-0) and bumps `GenMapOverflow`. The
+  receiver also RESETS `recvGenV4/V6` when the peer begins a bulk transfer
+  (`resetRecvGen` from the `syncMsgBulkStart` handler, #2198 F2) so a rebooted
+  peer — whose monotonic-seeded counter legitimately restarts lower — has its
+  cold-start bulk re-prime accepted instead of refused as stale (the
+  stale-RETAIN inverse of #2170).
 - Dual-active overlap is intentional: primary sets `rg_active=true`
   immediately on becoming master; secondary defers `rg_active=false` until
   it sees the VRRP BACKUP event. Brief overlap, never both inactive.

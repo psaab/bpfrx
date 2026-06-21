@@ -185,6 +185,26 @@ the stored generation of every live key, disabling the guard for a churn window
 and re-opening the exact #2170 hazard (a stale delete killing a live
 re-established session).
 
+### Cross-boot generation regression and the bulk re-prime reset (#2198 F2)
+
+The sender `genCounter` is seeded from `CLOCK_MONOTONIC` nanos, which is
+boot-relative and **resets at OS reboot**. After a reboot this node's counter
+can come up LOWER than a generation the peer stored from its previous boot, so a
+post-reboot same-5-tuple re-install would carry a lower generation and the
+peer's install guard would refuse it as stale (a stale-RETAIN — the inverse of
+#2170), and the cold-start bulk re-prime would silently fail to land.
+
+This is handled on the **receiver** side: when a (reconnecting, possibly
+rebooted) peer begins its bulk transfer (`syncMsgBulkStart`), the receiver
+resets its per-key stored generations (`resetRecvGen`). The bulk re-prime — the
+authoritative live set — then lands unconditionally and re-records each key's
+fresh generation, so the install guard accepts it. This is safe against opening
+a stale-delete window: deletes are only acted on after the bulk completes
+(`reconcileStaleSessions` at `BulkEnd`), and the re-prime re-establishes the
+live set before any such delete; a delete that arrives mid-bulk for a
+not-yet-re-recorded key falls back to gen-0 (unconditional), the legacy-safe
+behavior. No persisted cross-boot high-water mark is required.
+
 ## Config Payload (Variable)
 
 Raw UTF-8 text of the full Junos-format configuration. Sent as-is after `commitConfig()` on the primary. The secondary's `OnConfigReceived` callback invokes `load override` + commit to apply it.
