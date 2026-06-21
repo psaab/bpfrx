@@ -462,13 +462,17 @@ func (m *Manager) runRelay(ctx context.Context, cancel context.CancelFunc,
 			// Set giaddr to our interface IP so the server knows where to reply.
 			pkt.GatewayIPAddr = giaddr
 
-			// Increment hop count.
-			pkt.HopCount++
-			if pkt.HopCount > 16 {
+			// Enforce the RFC 1542 §4.1.1 hop limit BEFORE incrementing.
+			// HopCount is uint8: checking after a ++ lets an incoming value
+			// of 255 wrap to 0 and slip past a post-increment "> 16" test,
+			// defeating loop protection. A request that already carries 16
+			// hops has reached the limit and must be dropped.
+			if pkt.HopCount >= 16 {
 				slog.Warn("dhcp-relay: hop count exceeded, dropping",
 					"interface", ifaceName, "hops", pkt.HopCount)
 				continue
 			}
+			pkt.HopCount++
 
 			// Add Option 82 (Relay Agent Information) with circuit-id sub-option.
 			addOption82(pkt, ifaceName)
@@ -671,10 +675,13 @@ func broadcastReply(ir *interfaceRelay, clientConn net.PacketConn, replyData []b
 //     the reply path already forwards (see deliverReply: the flag-clear,
 //     yiaddr==0, real-ciaddr case unicasts to the client's ciaddr).
 //
-// DECLINE and RELEASE are intentionally not relayed here: they are handled by
-// the client directly to the server it is bound to and carry no relay-agent
-// obligation in this agent's model (matching the pre-#2153 behavior, which
-// only relayed DISCOVER/REQUEST).
+// DECLINE and RELEASE are intentionally not relayed here, preserving the
+// pre-#2153 behavior (which relayed only DISCOVER/REQUEST). RELEASE is
+// unicast by the client to the server it is bound to, so it does not require
+// relaying. DECLINE is broadcast (RFC 2131 §4.4.1) but signals an address
+// conflict back to the originating server, which is reachable on the relayed
+// path only via DISCOVER/REQUEST state; this relay does not forward it, and
+// widening that set is out of scope for #2153.
 func clientRequestRelayable(msgType dhcpv4.MessageType) bool {
 	switch msgType {
 	case dhcpv4.MessageTypeDiscover,

@@ -178,6 +178,67 @@ func TestRunRelay_RelaysInform(t *testing.T) {
 	}
 }
 
+// TestRunRelay_HopCountLimit asserts the RFC 1542 §4.1.1 hop limit is enforced
+// before the uint8 increment, so a request whose HopCount has already reached
+// (or maxed out) the limit is dropped rather than wrapped past the check.
+// HopCount==255 is the regression case: a post-increment "> 16" test wraps it
+// to 0 and relays it, defeating loop protection.
+func TestRunRelay_HopCountLimit(t *testing.T) {
+	cases := []struct {
+		name        string
+		hops        uint8
+		wantRelayed bool
+		wantHops    uint8 // relayed hop count (only checked when wantRelayed)
+	}{
+		{"below_limit", 15, true, 16},
+		{"at_limit", 16, false, 0},
+		{"wrap_boundary_255", 255, false, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			req, err := dhcpv4.New()
+			if err != nil {
+				t.Fatalf("dhcpv4.New: %v", err)
+			}
+			req.OpCode = dhcpv4.OpcodeBootRequest
+			req.ClientHWAddr = net.HardwareAddr{0x02, 0, 0, 0, 0, 1}
+			req.HopCount = tc.hops
+			req.UpdateOption(dhcpv4.OptMessageType(dhcpv4.MessageTypeRequest))
+
+			client := newFakeConn()
+			client.pending = [][]byte{req.ToBytes()}
+			server := newFakeConn()
+			factory, _ := recordingFactory(client, server)
+			m := testManager(factory)
+			m.Apply(context.Background(), singleInterfaceConfig())
+			defer m.Stop()
+
+			// Give the loop time to consume the datagram and act on it.
+			deadline := time.Now().Add(1 * time.Second)
+			for client.readCalls.Load() < 2 && time.Now().Before(deadline) {
+				time.Sleep(time.Millisecond)
+			}
+
+			got := server.writeCount()
+			if tc.wantRelayed && got == 0 {
+				t.Fatalf("hops=%d: expected relay, got none", tc.hops)
+			}
+			if !tc.wantRelayed && got != 0 {
+				t.Fatalf("hops=%d: expected drop, but %d datagram(s) relayed", tc.hops, got)
+			}
+			if tc.wantRelayed {
+				relayed, err := dhcpv4.FromBytes(server.firstWrite(t))
+				if err != nil {
+					t.Fatalf("relayed datagram does not parse: %v", err)
+				}
+				if relayed.HopCount != tc.wantHops {
+					t.Errorf("relayed HopCount = %d, want %d", relayed.HopCount, tc.wantHops)
+				}
+			}
+		})
+	}
+}
+
 // --- Lifecycle test scaffolding (#1915) ---
 
 // fakeConn is a fake net.PacketConn whose ReadFrom blocks until Close (unless
