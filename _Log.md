@@ -1,5 +1,49 @@
 # Action Log
 
+## 2026-06-21 — #2161 NAT64 translations counter + show security flow session
+
+- **Timestamp**: 2026-06-21
+- **Action**: Fixed #2161 — NAT64 v6↔v4 translations happened on the wire
+  (verified live in #2132) but the `NAT64 translations` counter and the
+  status summary read 0: nothing incremented `GlobalCtrNAT64Xlate`. Added
+  a per-binding `nat64_translations` counter in the Rust dataplane,
+  incremented at the single forward-candidate site that both directions
+  of a NAT64 flow pass through (NAT64 flows are non-cacheable, so the
+  flow-cache-hit fast path never serves them). Plumbed it through the full
+  snapshot/wire chain (BatchCounters → BindingLiveState atomic → snapshot
+  → wire BindingStatus with `serde default` / Go `omitempty` for #1961-
+  class cross-version safety), summed it on the Go side in
+  `sumBindingCounters`, and pushed the delta into `GlobalCtrNAT64Xlate`
+  in `syncBPFCountersLocked` (mirrors the existing snat/dnat plumbing).
+  The CLI (`show security flow statistics`), gRPC status
+  (`Nat64Translations`), and userspace status summary already / now read
+  it; added a new `xpf_nat64_translations_total` Prometheus metric.
+  `show security flow session` already installs NAT64 sessions via the
+  normal session path (forward + reverse with `nat64_reverse` metadata),
+  so no session-display change was needed — the live "0" was the counter
+  bug, not a missing session entry.
+- **File(s)**: userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/mod.rs, userspace-dp/src/afxdp/umem/mod.rs,
+  userspace-dp/src/afxdp/umem/snapshot.rs,
+  userspace-dp/src/afxdp/worker/mod.rs,
+  userspace-dp/src/protocol/binding.rs,
+  userspace-dp/src/afxdp/coordinator/refresh_bindings.rs,
+  userspace-dp/src/afxdp/coordinator/reconcile/reset.rs,
+  userspace-dp/src/afxdp/tests.rs,
+  pkg/dataplane/userspace/protocol.go,
+  pkg/dataplane/userspace/manager_ha.go,
+  pkg/dataplane/userspace/format/status.go,
+  pkg/dataplane/userspace/manager_test.go,
+  pkg/dataplane/userspace/format/status_test.go,
+  pkg/api/metrics.go, pkg/api/metrics_descriptors.go,
+  pkg/api/metrics_counters.go, docs/userspace-dataplane-gaps.md
+- **Validation**: Rust `cargo test nat64` (39 pass incl. new
+  `txn_nat64_translation_bumps_counter_both_directions` forward+reverse +
+  refused-stays-0 and `nat64_translations_flushes_to_live_and_snapshot`);
+  Go build + `go test ./pkg/dataplane/userspace/... ./pkg/api/...` pass
+  (TestSumBindingCounters extended, TestFormatStatusSummaryShowsNAT64-
+  Translations added); cli + grpcapi tests pass.
+
 ## 2026-06-21 — #2187 validate NAT-rule app references at commit
 
 - **Timestamp**: 2026-06-21
