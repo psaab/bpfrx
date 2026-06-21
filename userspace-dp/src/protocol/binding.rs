@@ -437,6 +437,11 @@ pub(crate) struct BindingStatus {
     pub snat_packets: u64,
     #[serde(rename = "dnat_packets", default)]
     pub dnat_packets: u64,
+    // #2161: `default` keeps cross-version wire safety — a peer/helper that
+    // predates this field simply omits it and Go/Rust read 0 (the #1961-class
+    // omitempty/serde-default contract).
+    #[serde(rename = "nat64_translations", default)]
+    pub nat64_translations: u64,
     #[serde(rename = "slow_path_packets", default)]
     pub slow_path_packets: u64,
     #[serde(rename = "slow_path_bytes", default)]
