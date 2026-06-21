@@ -180,6 +180,9 @@ outside the monitor loop:
   replacement that was re-synced with a newer generation. Do NOT reuse the
   synthesized `SessionID` for this — it is non-monotonic
   (`now_seconds<<16|slot`) and collides on same-second/same-slot reuse.
+  The generation maps are bounded by `genGuardMapCap` (200000); on overflow
+  the map is NEVER cleared (#2198 F1) — an existing key updates in place, a new
+  key skip-records (degrades to safe gen-0) and bumps `GenMapOverflow`.
 - Dual-active overlap is intentional: primary sets `rg_active=true`
   immediately on becoming master; secondary defers `rg_active=false` until
   it sees the VRRP BACKUP event. Brief overlap, never both inactive.

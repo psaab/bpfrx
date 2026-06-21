@@ -385,6 +385,136 @@ func TestJournalFlushReplayRefusesStaleDelete(t *testing.T) {
 	}
 }
 
+// synthKeyV4 produces the i-th distinct synthetic v4 key for filling the
+// generation maps in the overflow tests.
+func synthKeyV4(i int) dataplane.SessionKey {
+	k := dataplane.SessionKey{
+		Protocol: 17,
+		SrcPort:  uint16(i & 0xFFFF),
+		DstPort:  uint16((i >> 16) & 0xFFFF),
+	}
+	binary.LittleEndian.PutUint32(k.SrcIP[:], uint32(i))
+	binary.LittleEndian.PutUint32(k.DstIP[:], uint32(i)^0xA5A5A5A5)
+	return k
+}
+
+// fillRecvGenV4ToCount inserts distinct synthetic keys into recvGenV4 (directly,
+// under lock) until it holds exactly `count` entries, never touching liveKey.
+func fillRecvGenV4ToCount(ss *SessionSync, liveKey dataplane.SessionKey, count int) {
+	ss.recvGenMu.Lock()
+	defer ss.recvGenMu.Unlock()
+	for i := 0; len(ss.recvGenV4) < count; i++ {
+		k := synthKeyV4(i)
+		if k == liveKey {
+			continue
+		}
+		ss.recvGenV4[k] = uint64(i + 1)
+	}
+}
+
+// TestGenMapOverflowKeepsLiveKeyV4 is the #2198 F1 hazard: when the receiver
+// stored-generation map reaches genGuardMapCap, the OLD code cleared the WHOLE
+// map (make(...)) on the NEXT record, dropping every live key's stored
+// generation and disabling the guard cluster-wide. A stale delete could then
+// kill a live re-established session — the exact #2170 bug.
+//
+// This drives the REAL recordInstalledGen path: a live key is installed
+// (stored gen=2), the map is filled to one below cap, then a NEW key install
+// pushes a recording at cap. Pre-fix that recording cleared the whole map →
+// the live key's gen=2 was wiped → the stale delete (gen=1) saw stored=0 →
+// unconditional delete killed the live session. Post-fix the new key is
+// skip-recorded, the live key's gen=2 survives, and the stale delete is
+// refused. Fails pre-fix, passes post-fix.
+func TestGenMapOverflowKeepsLiveKeyV4(t *testing.T) {
+	key := gen2170KeyV4()
+	dp := &mockSweepDP{v4sessions: map[dataplane.SessionKey]dataplane.SessionValue{}}
+	ss := NewSessionSync(":0", "10.0.0.2:4785", dp)
+
+	// Install the live session through the real apply path (records stored
+	// gen=2 via recordInstalledGenV4).
+	installWithGenV4(ss, key, 2)
+	if _, ok := dp.v4sessions[key]; !ok {
+		t.Fatal("live session should be installed")
+	}
+
+	// Fill the stored-generation map to exactly cap-1 (live key already counts
+	// as one entry, so the map holds the live key + (cap-1) synthetic keys).
+	fillRecvGenV4ToCount(ss, key, genGuardMapCap)
+	if got := len(ss.recvGenV4); got != genGuardMapCap {
+		t.Fatalf("recvGenV4 pre-condition: %d entries, want %d", got, genGuardMapCap)
+	}
+
+	// A NEW-key install now drives recordInstalledGenV4 while the map is at
+	// cap. Pre-fix this make(...)-cleared the whole map (wiping the live key);
+	// post-fix the new key is skip-recorded and the live key is untouched.
+	newKey := dataplane.SessionKey{Protocol: 6, SrcPort: 0x1234, DstPort: 0x5678}
+	installWithGenV4(ss, newKey, 3)
+
+	// The live key's stored generation must still be 2 after the overflow.
+	ss.recvGenMu.Lock()
+	stored, ok := ss.recvGenV4[key]
+	ss.recvGenMu.Unlock()
+	if !ok || stored != 2 {
+		t.Fatalf("live key stored generation lost across overflow: ok=%v stored=%d (want 2) — F1 overflow-clear regression", ok, stored)
+	}
+
+	// A stale delete (gen=1, strictly older) MUST be refused.
+	ss.deleteClusterSyncedV4(key, 1)
+	if _, ok := dp.v4sessions[key]; !ok {
+		t.Fatal("stale delete (gen=1) wrongly removed the live session after a gen-map overflow (F1 regression)")
+	}
+	if got := ss.stats.DeletesStaleIgnored.Load(); got != 1 {
+		t.Fatalf("DeletesStaleIgnored = %d, want 1", got)
+	}
+}
+
+// TestRecordInstalledGenSkipsNewKeyOnFull verifies the F1 skip-record-on-full
+// semantics directly: at cap, a NEW key is NOT recorded (the map is never
+// cleared and never grows past cap), the GenMapOverflow counter increments, and
+// an EXISTING key is still updated in place (its stored generation is never
+// dropped).
+func TestRecordInstalledGenSkipsNewKeyOnFull(t *testing.T) {
+	ss := NewSessionSync(":0", "10.0.0.2:4785", nil)
+	live := gen2170KeyV4()
+
+	// Record the live key first (it exists), then fill to cap around it.
+	ss.recordInstalledGenV4(live, 2)
+	fillRecvGenV4ToCount(ss, live, genGuardMapCap)
+
+	// A NEW key at cap is skipped — map stays at cap, counter increments.
+	newKey := dataplane.SessionKey{Protocol: 6, SrcPort: 0xBEEF, DstPort: 0xCAFE}
+	ss.recordInstalledGenV4(newKey, 99)
+	ss.recvGenMu.Lock()
+	_, newStored := ss.recvGenV4[newKey]
+	sz := len(ss.recvGenV4)
+	liveStored := ss.recvGenV4[live]
+	ss.recvGenMu.Unlock()
+	if newStored {
+		t.Fatal("a new key was recorded while the map was at cap (should skip-record)")
+	}
+	if sz != genGuardMapCap {
+		t.Fatalf("map grew/shrank past cap on overflow: %d != %d", sz, genGuardMapCap)
+	}
+	if got := ss.stats.GenMapOverflow.Load(); got != 1 {
+		t.Fatalf("GenMapOverflow = %d, want 1", got)
+	}
+
+	// An EXISTING key is still updated in place even at cap (never dropped).
+	ss.recordInstalledGenV4(live, 7)
+	ss.recvGenMu.Lock()
+	liveStored2 := ss.recvGenV4[live]
+	ss.recvGenMu.Unlock()
+	if liveStored != 2 {
+		t.Fatalf("existing live key stored gen = %d before update, want 2", liveStored)
+	}
+	if liveStored2 != 7 {
+		t.Fatalf("existing live key not updated in place at cap: stored=%d, want 7", liveStored2)
+	}
+	if got := ss.stats.GenMapOverflow.Load(); got != 1 {
+		t.Fatalf("GenMapOverflow = %d after updating an existing key, want 1 (no overflow on in-place update)", got)
+	}
+}
+
 // TestGenGuardConcurrentMaps stress-tests the sender- and receiver-side
 // generation maps under concurrent access to surface any data race on
 // genSentV4 / recvGenV4 (run with -race). It exercises the guard/echo helpers

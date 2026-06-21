@@ -103,14 +103,22 @@ type SyncStats struct {
 	// the per-key stored generation monotonic so a later stale delete can
 	// still be matched and refused.
 	InstallsStaleIgnored atomic.Uint64
-	Connected            atomic.Bool
-	BulkSyncStartTime    atomic.Int64
-	BulkSyncEndTime      atomic.Int64
-	BulkSyncSessions     atomic.Uint64
-	LastConfigSyncTime   atomic.Int64
-	LastConfigSyncSize   atomic.Uint64
-	LastFenceSeq         atomic.Uint64
-	LastFenceAckAt       atomic.Int64
+	// GenMapOverflow counts how many times a #2170 generation map (sender
+	// echo or receiver stored) was at genGuardMapCap and a NEW key therefore
+	// could not be recorded (#2198 F1). The key degrades to gen-0 (safe,
+	// unconditional) behavior. A nonzero value means a churn workload pushed
+	// a generation map to its cap; the map is never cleared, so existing live
+	// keys retain their stored generation and the guard stays correct for
+	// them.
+	GenMapOverflow     atomic.Uint64
+	Connected          atomic.Bool
+	BulkSyncStartTime  atomic.Int64
+	BulkSyncEndTime    atomic.Int64
+	BulkSyncSessions   atomic.Uint64
+	LastConfigSyncTime atomic.Int64
+	LastConfigSyncSize atomic.Uint64
+	LastFenceSeq       atomic.Uint64
+	LastFenceAckAt     atomic.Int64
 }
 
 // SyncStatsSnapshot is a point-in-time copy of SyncStats with plain
@@ -132,6 +140,7 @@ type SyncStatsSnapshot struct {
 	DeletesDropped       uint64
 	DeletesStaleIgnored  uint64
 	InstallsStaleIgnored uint64
+	GenMapOverflow       uint64
 	Connected            bool
 	ActiveFabric         int
 	BulkSyncStartTime    int64
@@ -534,7 +543,7 @@ func (s *SessionSync) Stats() SyncStatsSnapshot {
 		activeFabric = -1
 	}
 	s.mu.Unlock()
-	return SyncStatsSnapshot{SessionsSent: s.stats.SessionsSent.Load(), SessionsReceived: s.stats.SessionsReceived.Load(), SessionsInstalled: s.stats.SessionsInstalled.Load(), DeletesSent: s.stats.DeletesSent.Load(), DeletesReceived: s.stats.DeletesReceived.Load(), BulkSyncs: s.stats.BulkSyncs.Load(), ConfigsSent: s.stats.ConfigsSent.Load(), ConfigsReceived: s.stats.ConfigsReceived.Load(), IPsecSASent: s.stats.IPsecSASent.Load(), IPsecSAReceived: s.stats.IPsecSAReceived.Load(), FencesSent: s.stats.FencesSent.Load(), FencesReceived: s.stats.FencesReceived.Load(), Errors: s.stats.Errors.Load(), DeletesDropped: s.stats.DeletesDropped.Load(), DeletesStaleIgnored: s.stats.DeletesStaleIgnored.Load(), InstallsStaleIgnored: s.stats.InstallsStaleIgnored.Load(), Connected: s.stats.Connected.Load(), ActiveFabric: activeFabric, BulkSyncStartTime: s.stats.BulkSyncStartTime.Load(), BulkSyncEndTime: s.stats.BulkSyncEndTime.Load(), BulkSyncSessions: s.stats.BulkSyncSessions.Load(), LastConfigSyncTime: s.stats.LastConfigSyncTime.Load(), LastConfigSyncSize: s.stats.LastConfigSyncSize.Load(), LastFenceSeq: s.stats.LastFenceSeq.Load(), LastFenceAckAt: s.stats.LastFenceAckAt.Load()}
+	return SyncStatsSnapshot{SessionsSent: s.stats.SessionsSent.Load(), SessionsReceived: s.stats.SessionsReceived.Load(), SessionsInstalled: s.stats.SessionsInstalled.Load(), DeletesSent: s.stats.DeletesSent.Load(), DeletesReceived: s.stats.DeletesReceived.Load(), BulkSyncs: s.stats.BulkSyncs.Load(), ConfigsSent: s.stats.ConfigsSent.Load(), ConfigsReceived: s.stats.ConfigsReceived.Load(), IPsecSASent: s.stats.IPsecSASent.Load(), IPsecSAReceived: s.stats.IPsecSAReceived.Load(), FencesSent: s.stats.FencesSent.Load(), FencesReceived: s.stats.FencesReceived.Load(), Errors: s.stats.Errors.Load(), DeletesDropped: s.stats.DeletesDropped.Load(), DeletesStaleIgnored: s.stats.DeletesStaleIgnored.Load(), InstallsStaleIgnored: s.stats.InstallsStaleIgnored.Load(), GenMapOverflow: s.stats.GenMapOverflow.Load(), Connected: s.stats.Connected.Load(), ActiveFabric: activeFabric, BulkSyncStartTime: s.stats.BulkSyncStartTime.Load(), BulkSyncEndTime: s.stats.BulkSyncEndTime.Load(), BulkSyncSessions: s.stats.BulkSyncSessions.Load(), LastConfigSyncTime: s.stats.LastConfigSyncTime.Load(), LastConfigSyncSize: s.stats.LastConfigSyncSize.Load(), LastFenceSeq: s.stats.LastFenceSeq.Load(), LastFenceAckAt: s.stats.LastFenceAckAt.Load()}
 }
 
 // IsConnected reports whether a peer sync connection is currently established.

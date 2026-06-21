@@ -32,7 +32,36 @@ func (s *SessionSync) noteHelperMirrorResult(af string, warned *atomic.Bool, err
 // limit. Both are evicted on delete; the cap is a safety valve for keys whose
 // delete never arrives (e.g. dropped close delta). It matches the delete
 // journal cap order-of-magnitude.
+//
+// Overflow handling (#2198 F1): when a map is at cap, a NEW key is NOT
+// recorded (skip-record-on-full) and an EXISTING key is updated in place. The
+// map is NEVER cleared. Clearing the whole map would drop the stored
+// generation of every live key, disabling the guard cluster-wide for a churn
+// window — exactly the #2170 hazard the guard exists to close: a stale delete
+// could then kill a live re-established session. A skipped new key degrades to
+// gen-0 (unconditional delete / unconditional install), which is always SAFE
+// — gen-0 never causes a wrongful delete of a *different* live incarnation,
+// it only loses the stale-delete protection for that one new key.
 const genGuardMapCap = 200000
+
+// putGenBounded records gen for key in m without ever clearing the map or
+// dropping the stored generation of an existing key. An existing key is always
+// updated in place; a new key is recorded only while the map is below
+// genGuardMapCap. Returns true if the entry was stored. The caller holds the
+// map's mutex. Generic over the two wire-key types.
+func putGenBounded[K comparable](m map[K]uint64, key K, gen uint64) bool {
+	if _, exists := m[key]; exists {
+		m[key] = gen
+		return true
+	}
+	if len(m) >= genGuardMapCap {
+		// Map is full and this is a new key: skip-record. The key degrades to
+		// gen-0 behavior, which is safe (see genGuardMapCap doc).
+		return false
+	}
+	m[key] = gen
+	return true
+}
 
 // nextInstallGen returns the next strictly-monotonic install generation.
 func (s *SessionSync) nextInstallGen() uint64 {
@@ -49,10 +78,12 @@ func (s *SessionSync) stampInstallGenV4(key dataplane.SessionKey, val *dataplane
 	g := s.nextInstallGen()
 	val.Generation = g
 	s.genSentMu.Lock()
-	if s.genSentV4 == nil || len(s.genSentV4) >= genGuardMapCap {
+	if s.genSentV4 == nil {
 		s.genSentV4 = make(map[dataplane.SessionKey]uint64)
 	}
-	s.genSentV4[key] = g
+	if !putGenBounded(s.genSentV4, key, g) {
+		s.stats.GenMapOverflow.Add(1)
+	}
 	s.genSentMu.Unlock()
 }
 
@@ -60,10 +91,12 @@ func (s *SessionSync) stampInstallGenV6(key dataplane.SessionKeyV6, val *datapla
 	g := s.nextInstallGen()
 	val.Generation = g
 	s.genSentMu.Lock()
-	if s.genSentV6 == nil || len(s.genSentV6) >= genGuardMapCap {
+	if s.genSentV6 == nil {
 		s.genSentV6 = make(map[dataplane.SessionKeyV6]uint64)
 	}
-	s.genSentV6[key] = g
+	if !putGenBounded(s.genSentV6, key, g) {
+		s.stats.GenMapOverflow.Add(1)
+	}
 	s.genSentMu.Unlock()
 }
 
@@ -128,10 +161,12 @@ func (s *SessionSync) recordInstalledGenV4(key dataplane.SessionKey, gen uint64)
 		return
 	}
 	s.recvGenMu.Lock()
-	if s.recvGenV4 == nil || len(s.recvGenV4) >= genGuardMapCap {
+	if s.recvGenV4 == nil {
 		s.recvGenV4 = make(map[dataplane.SessionKey]uint64)
 	}
-	s.recvGenV4[key] = gen
+	if !putGenBounded(s.recvGenV4, key, gen) {
+		s.stats.GenMapOverflow.Add(1)
+	}
 	s.recvGenMu.Unlock()
 }
 
@@ -140,10 +175,12 @@ func (s *SessionSync) recordInstalledGenV6(key dataplane.SessionKeyV6, gen uint6
 		return
 	}
 	s.recvGenMu.Lock()
-	if s.recvGenV6 == nil || len(s.recvGenV6) >= genGuardMapCap {
+	if s.recvGenV6 == nil {
 		s.recvGenV6 = make(map[dataplane.SessionKeyV6]uint64)
 	}
-	s.recvGenV6[key] = gen
+	if !putGenBounded(s.recvGenV6, key, gen) {
+		s.stats.GenMapOverflow.Add(1)
+	}
 	s.recvGenMu.Unlock()
 }
 

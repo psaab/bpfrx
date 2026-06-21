@@ -167,6 +167,24 @@ belt-and-suspenders for helper-originated deletes; the Go cluster apply layer is
 authoritative. A mixed-version cluster degrades to exact pre-#2170 behavior for
 any pair where either end lacks a generation.
 
+### Generation-map bounds and overflow (#2198 F1)
+
+Both the sender echo maps (`genSentV4/V6`) and the receiver stored-generation
+maps (`recvGenV4/V6`) are bounded by `genGuardMapCap` (200000) so a churning
+workload cannot grow them without limit. Entries are normally evicted on the
+matching delete; the cap is the safety valve for keys whose delete never
+arrives (e.g. a dropped close delta).
+
+On overflow the map is **never cleared**. A map at cap updates an EXISTING key
+in place (its stored generation is never dropped) and **skip-records** a NEW
+key, incrementing `GenMapOverflow`. A skipped key degrades to gen-0
+(unconditional install / unconditional delete), which is safe: gen-0 never
+causes a wrongful delete of a *different* live incarnation — it only forgoes the
+stale-delete protection for that one new key. Clearing the whole map would drop
+the stored generation of every live key, disabling the guard for a churn window
+and re-opening the exact #2170 hazard (a stale delete killing a live
+re-established session).
+
 ## Config Payload (Variable)
 
 Raw UTF-8 text of the full Junos-format configuration. Sent as-is after `commitConfig()` on the primary. The secondary's `OnConfigReceived` callback invokes `load override` + commit to apply it.
