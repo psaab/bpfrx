@@ -51,6 +51,38 @@ func resolveSNATMatchAddr(dp DataPlane, cidr string, result *CompileResult) (uin
 	return addrID, nil
 }
 
+// assignNATCounterID assigns (or reuses) the per-rule translation hit
+// counter ID for a NAT rule keyed by "rulesetName/ruleName". Counter IDs
+// are 1-based (0 means "no counter"); the assignment is shared across all
+// expanded address/port/protocol pairs of the same rule so every hit on
+// that rule attributes to a single counter slot. When the counter space is
+// exhausted the rule falls back to counter 0 (no per-rule attribution) and
+// a warning is logged, mirroring the historical SNAT behavior.
+//
+// This is the single source of truth for NAT rule counter IDs across SNAT,
+// DNAT, and static NAT. The compiler-assigned IDs are surfaced to the Rust
+// userspace dataplane via the config snapshot (so the hot path can attribute
+// a translation hit to the matched rule) and read back by the operator
+// surfaces through Manager.ReadNATRuleCounter (#2218).
+func assignNATCounterID(result *CompileResult, ruleSet, rule string) uint16 {
+	ruleKey := ruleSet + "/" + rule
+	if existing, ok := result.NATCounterIDs[ruleKey]; ok {
+		return existing
+	}
+	counterID := result.nextNATCounterID
+	if counterID >= MaxNATRuleCounters {
+		slog.Warn("NAT rule counter IDs exhausted, reusing counter 0",
+			"rule-set", ruleSet, "rule", rule,
+			"counter_id", counterID, "max", MaxNATRuleCounters)
+		counterID = 0
+	}
+	result.NATCounterIDs[ruleKey] = counterID
+	if counterID != 0 {
+		result.nextNATCounterID++
+	}
+	return counterID
+}
+
 func compileNAT(dp DataPlane, cfg *config.Config, result *CompileResult) error {
 	// Track written keys for populate-before-clear.
 	writtenSNAT := make(map[SNATKey]bool)
@@ -115,18 +147,7 @@ func compileNAT(dp DataPlane, cfg *config.Config, result *CompileResult) error {
 				}
 
 				zp := zonePairIdx{fromZone, toZone}
-				ruleKey := rs.Name + "/" + rule.Name
-				counterID := result.nextNATCounterID
-				if counterID >= MaxNATRuleCounters {
-					slog.Warn("NAT rule counter IDs exhausted, reusing counter 0",
-						"rule-set", rs.Name, "rule", rule.Name,
-						"counter_id", counterID, "max", MaxNATRuleCounters)
-					counterID = 0
-				}
-				result.NATCounterIDs[ruleKey] = counterID
-				if counterID != 0 {
-					result.nextNATCounterID++
-				}
+				counterID := assignNATCounterID(result, rs.Name, rule.Name)
 
 				for _, srcAddr := range srcAddrs {
 					srcAddrID, err := resolveSNATMatchAddr(dp, srcAddr, result)
@@ -474,18 +495,7 @@ func compileNAT(dp DataPlane, cfg *config.Config, result *CompileResult) error {
 			zp := zonePairIdx{fromZone, toZone}
 
 			// Assign NAT rule counter ID (shared across expanded address pairs)
-			ruleKey := rs.Name + "/" + rule.Name
-			counterID := result.nextNATCounterID
-			if counterID >= MaxNATRuleCounters {
-				slog.Warn("NAT rule counter IDs exhausted, reusing counter 0",
-					"rule-set", rs.Name, "rule", rule.Name,
-					"counter_id", counterID, "max", MaxNATRuleCounters)
-				counterID = 0
-			}
-			result.NATCounterIDs[ruleKey] = counterID
-			if counterID != 0 {
-				result.nextNATCounterID++
-			}
+			counterID := assignNATCounterID(result, rs.Name, rule.Name)
 
 			for _, srcAddr := range srcAddrs {
 				srcAddrID, err := resolveSNATMatchAddr(dp, srcAddr, result)
@@ -573,6 +583,12 @@ func compileNAT(dp DataPlane, cfg *config.Config, result *CompileResult) error {
 					return fmt.Errorf("DNAT pool %q not found (rule %q)",
 						rule.Then.PoolName, rule.Name)
 				}
+
+				// Assign the per-rule translation hit counter ID (#2218). The
+				// legacy BPF DNAT table did not carry a counter ID, so DNAT
+				// "Translation hits" never displayed at all; the userspace
+				// dataplane attributes hits via the snapshot-stamped ID.
+				_ = assignNATCounterID(result, rs.Name, rule.Name)
 
 				// Validate source-address-name if present (config compatibility)
 				if rule.Match.SourceAddressName != "" {
@@ -816,6 +832,11 @@ func compileStaticNAT(dp DataPlane, cfg *config.Config, result *CompileResult) e
 				return fmt.Errorf("static NAT rule %q has mixed address families (match=%s, then=%s)",
 					rule.Name, rule.Match, rule.Then)
 			}
+
+			// Assign the per-rule translation hit counter ID (#2218) so the
+			// userspace dataplane can attribute static-NAT translations to
+			// this rule and `show security nat static rule` reports non-zero.
+			_ = assignNATCounterID(result, rs.Name, rule.Name)
 
 			// Insert DNAT entry (external -> internal) and SNAT entry (internal -> external)
 			if extIsV4 && intIsV4 {

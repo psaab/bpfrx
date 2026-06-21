@@ -362,6 +362,11 @@ type SourceNATRuleSnapshot struct {
 	PersistentNATInactivityTimeout   int      `json:"persistent_nat_inactivity_timeout,omitempty"`
 	PoolUnusable                     bool     `json:"pool_unusable,omitempty"`
 	PoolUnusableReason               string   `json:"pool_unusable_reason,omitempty"`
+	// CounterID is the compiler-assigned per-rule translation hit counter ID
+	// (1-based; 0 means "no counter"). The userspace dataplane attributes each
+	// SNAT translation on this rule to this slot, and Manager.ReadNATRuleCounter
+	// reads it back for `show security nat source rule` (#2218).
+	CounterID uint16 `json:"counter_id,omitempty"`
 }
 
 type StaticNATRuleSnapshot struct {
@@ -369,6 +374,9 @@ type StaticNATRuleSnapshot struct {
 	FromZone   string `json:"from_zone,omitempty"`
 	ExternalIP string `json:"external_ip"`
 	InternalIP string `json:"internal_ip"`
+	// CounterID is the compiler-assigned per-rule translation hit counter ID
+	// (1-based; 0 means "no counter") for this static NAT rule (#2218).
+	CounterID uint16 `json:"counter_id,omitempty"`
 }
 
 // DestinationNATRuleSnapshot captures a pre-expanded DNAT table entry for the
@@ -382,6 +390,11 @@ type DestinationNATRuleSnapshot struct {
 	Protocol           string `json:"protocol,omitempty"` // "tcp", "udp", or ""
 	PoolAddress        string `json:"pool_address"`
 	PoolPort           uint16 `json:"pool_port,omitempty"`
+	// CounterID is the compiler-assigned per-rule translation hit counter ID
+	// (1-based; 0 means "no counter"). All expanded (protocol, port) tuples of
+	// the same DNAT rule share one counter ID so every hit attributes to a
+	// single slot read back for `show security nat destination rule` (#2218).
+	CounterID uint16 `json:"counter_id,omitempty"`
 }
 
 // NAT64RuleSnapshot captures a NAT64 prefix and its IPv4 source pool for the
@@ -679,6 +692,13 @@ type ProcessStatus struct {
 	EventStreamAcked          uint64                            `json:"event_stream_acked,omitempty"`
 	CoSInterfaces             []CoSInterfaceStatus              `json:"cos_interfaces,omitempty"`
 	PolicyRuleCounters        []PolicyRuleCounterStatus         `json:"policy_rule_counters,omitempty"`
+	// NATRuleCounters carries the userspace dataplane's per-rule SNAT/DNAT/
+	// static-NAT translation hit counters keyed by the compiler-assigned
+	// counter ID (#2218). The Go control plane mirrors these into the legacy
+	// bpfShim nat_rule_counters offset map so Manager.ReadNATRuleCounter (and
+	// thus `show security nat source/destination/static rule`) reports the
+	// live translation count instead of a perpetual 0.
+	NATRuleCounters           []NATRuleCounterStatus            `json:"nat_rule_counters,omitempty"`
 	FilterTermCounters        []FirewallFilterTermCounterStatus `json:"filter_term_counters,omitempty"`
 	ThreeColorPolicerCounters []ThreeColorPolicerStatus         `json:"three_color_policer_counters,omitempty"`
 	SourceNATPools            []SourceNATPoolStatus             `json:"source_nat_pools,omitempty"`
@@ -1146,6 +1166,17 @@ type PolicyRuleCounterStatus struct {
 	RuleID  string `json:"rule_id,omitempty"`
 	Packets uint64 `json:"packets,omitempty"`
 	Bytes   uint64 `json:"bytes,omitempty"`
+}
+
+// NATRuleCounterStatus is one per-rule NAT translation hit counter reported
+// by the userspace dataplane (#2218). CounterID is the compiler-assigned NAT
+// rule counter ID (1-based; matches CompileResult.NATCounterIDs and the
+// CounterID stamped on the SNAT/DNAT/static rule snapshots). Packets/Bytes are
+// cumulative since helper start (or last clear).
+type NATRuleCounterStatus struct {
+	CounterID uint16 `json:"counter_id,omitempty"`
+	Packets   uint64 `json:"packets,omitempty"`
+	Bytes     uint64 `json:"bytes,omitempty"`
 }
 
 type HAStateUpdateRequest struct {
