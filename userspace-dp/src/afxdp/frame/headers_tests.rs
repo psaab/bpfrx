@@ -331,3 +331,126 @@ fn eth_header_vec_push_with_vlan() {
     assert_eq!(&buf[14..16], &[0x01, 0x00]);
     assert_eq!(&buf[16..18], &[0x86, 0xdd]);
 }
+
+// ---- #2149: TxVlanTag priority-tagged VLAN-0 / PCP preservation ----
+
+#[test]
+fn txvlantag_from_vid_matches_legacy_semantics() {
+    // `From<u16>` must reproduce the pre-#2149 bare-VID behavior
+    // exactly: present iff VID > 0, TPID 0x8100, PCP/DEI 0, VID masked
+    // to 12 bits.
+    assert_eq!(
+        TxVlanTag::from(0),
+        TxVlanTag {
+            tpid: 0x8100,
+            tci: 0,
+            present: false
+        }
+    );
+    assert!(!TxVlanTag::from(0).emits(), "VID 0 must not emit a tag");
+    assert_eq!(TxVlanTag::from(0).header_len(), 14);
+
+    let t = TxVlanTag::from(0x123);
+    assert!(t.emits());
+    assert_eq!(t.tpid, 0x8100);
+    assert_eq!(t.tci, 0x123, "bare VID has PCP/DEI 0");
+    assert_eq!(t.header_len(), 18);
+
+    // VID > 0xFFF masked to 12 bits.
+    assert_eq!(TxVlanTag::from(0xF123).tci, 0x123);
+}
+
+#[test]
+fn txvlantag_priority_tagged_vlan0_emits() {
+    // The 802.1p priority-tagged VLAN-0 case: VID 0, PCP 5. A bare VID
+    // would NOT emit (the pre-fix bug); the tag MUST emit because PCP
+    // is non-zero.
+    let t = TxVlanTag::from_parts(0x8100, 5, false, 0);
+    assert!(t.present);
+    assert!(t.emits(), "PCP != 0 with VID 0 must still emit a tag");
+    assert_eq!(t.header_len(), 18);
+    // TCI = PCP(5) << 13 | DEI(0) << 12 | VID(0) = 0xA000.
+    assert_eq!(t.tci, 0xA000);
+}
+
+#[test]
+fn txvlantag_present_but_empty_tci_degrades_to_untagged() {
+    // A present tag with an all-zero TCI carries no information (no
+    // VID, no priority) and must be treated as untagged — matching the
+    // legacy `vid == 0` behavior so an inbound plain VID-0 tag does not
+    // produce a meaningless tag on the reflected error.
+    let t = TxVlanTag {
+        tpid: 0x8100,
+        tci: 0,
+        present: true,
+    };
+    assert!(!t.emits());
+    assert_eq!(t.header_len(), 14);
+}
+
+#[test]
+fn eth_header_tagged_priority_tagged_vlan0_preserves_full_tci() {
+    // The core #2149 builder proof: a priority-tagged VLAN-0 tag
+    // (TPID 0x8100, PCP 5, DEI 0, VID 0) is serialized WITH the tag and
+    // the full TCI preserved. Pre-fix (`vlan_id > 0` gating) this frame
+    // was emitted untagged (14 bytes) with PCP lost.
+    let tag = TxVlanTag::from_parts(0x8100, 5, false, 0);
+
+    // Vec-push variant.
+    let mut vbuf = Vec::new();
+    write_eth_header_tagged(&mut vbuf, [1, 2, 3, 4, 5, 6], [7, 8, 9, 10, 11, 12], tag, 0x0800);
+    assert_eq!(vbuf.len(), 18, "priority-tagged VLAN-0 must be 18 bytes");
+    assert_eq!(&vbuf[12..14], &[0x81, 0x00], "TPID 0x8100");
+    // TCI 0xA000: PCP 5 in the top 3 bits, DEI 0, VID 0.
+    assert_eq!(&vbuf[14..16], &[0xA0, 0x00], "TCI must preserve PCP=5, VID=0");
+    assert_eq!(&vbuf[16..18], &[0x08, 0x00], "ether_type follows the tag");
+
+    // Slice variant must produce identical bytes.
+    let mut sbuf = [0xffu8; 18];
+    write_eth_header_slice_tagged(
+        &mut sbuf,
+        [1, 2, 3, 4, 5, 6],
+        [7, 8, 9, 10, 11, 12],
+        tag,
+        0x0800,
+    )
+    .expect("slice writer");
+    assert_eq!(&sbuf[..], &vbuf[..], "slice and vec writers must agree");
+}
+
+#[test]
+fn eth_header_tagged_preserves_8021ad_tpid_and_dei() {
+    // A reflected 802.1ad (0x88a8) tag must keep its TPID, and DEI must
+    // survive. TCI = PCP(3) | DEI(1) | VID(100).
+    let tag = TxVlanTag::from_parts(0x88a8, 3, true, 100);
+    let mut buf = [0u8; 18];
+    write_eth_header_slice_tagged(&mut buf, [0; 6], [0; 6], tag, 0x86dd).expect("writer");
+    assert_eq!(&buf[12..14], &[0x88, 0xa8], "802.1ad TPID preserved");
+    // TCI = (3 << 13) | (1 << 12) | 100 = 0x6000 | 0x1000 | 0x64 = 0x7064.
+    assert_eq!(&buf[14..16], &[0x70, 0x64], "PCP=3, DEI=1, VID=100");
+    assert_eq!(&buf[16..18], &[0x86, 0xdd]);
+}
+
+#[test]
+fn eth_header_tagged_untagged_stays_untagged() {
+    // No tag ⇒ 14-byte header, ether_type at byte 12, nothing past 14.
+    let mut buf = [0xffu8; 18];
+    write_eth_header_slice_tagged(&mut buf, [1; 6], [2; 6], TxVlanTag::NONE, 0x0800)
+        .expect("writer");
+    assert_eq!(&buf[12..14], &[0x08, 0x00], "ether_type at byte 12 when untagged");
+    // Bytes 14.. are untouched by the writer (still the 0xff sentinel),
+    // proving no tag was written.
+    assert_eq!(&buf[14..18], &[0xff, 0xff, 0xff, 0xff], "no tag bytes written");
+}
+
+#[test]
+fn eth_header_legacy_vid_path_still_emits_8021q_tag() {
+    // The bare-VID `write_eth_header` path (egress config VID) must be
+    // unchanged: a normal VID > 0 still emits a plain 802.1Q tag.
+    let mut buf = Vec::new();
+    write_eth_header(&mut buf, [0; 6], [0; 6], 0x064, 0x0800);
+    assert_eq!(buf.len(), 18);
+    assert_eq!(&buf[12..14], &[0x81, 0x00]);
+    assert_eq!(&buf[14..16], &[0x00, 0x64], "PCP 0, VID 100");
+    assert_eq!(&buf[16..18], &[0x08, 0x00]);
+}
