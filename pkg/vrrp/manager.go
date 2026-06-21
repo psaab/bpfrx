@@ -46,6 +46,19 @@ type Manager struct {
 	// netlink). Production defaults are set in NewManager.
 	linkState      func(name string) (bool, error)
 	subscribeLinks func(ch chan<- netlink.LinkUpdate, done <-chan struct{}) error
+
+	// Injectable instance-lifecycle seams (#2156). Unit tests must not
+	// require real raw sockets or a live run() goroutine to exercise the
+	// build-before-teardown ordering in UpdateInstances. Production
+	// defaults are set in NewManager:
+	//   resolveIface       -> net.InterfaceByName
+	//   openInstanceSocket -> vi.openSocket()   (the "proof" step)
+	//   runInstance        -> `go vi.run()`     (the "commit" step)
+	//   stopInstance       -> vi.stop()
+	resolveIface       func(name string) (*net.Interface, error)
+	openInstanceSocket func(vi *vrrpInstance) error
+	runInstance        func(vi *vrrpInstance)
+	stopInstance       func(vi *vrrpInstance)
 }
 
 // SetOnEventDrop registers a callback invoked when a VRRP event is dropped
@@ -60,11 +73,15 @@ func (m *Manager) SetOnEventDrop(fn func()) {
 // NewManager creates a new VRRP manager.
 func NewManager() *Manager {
 	return &Manager{
-		instances:      make(map[instanceKey]*vrrpInstance),
-		eventCh:        make(chan VRRPEvent, 256),
-		watcherStop:    make(chan struct{}),
-		linkState:      netlinkLinkState,
-		subscribeLinks: netlink.LinkSubscribe,
+		instances:          make(map[instanceKey]*vrrpInstance),
+		eventCh:            make(chan VRRPEvent, 256),
+		watcherStop:        make(chan struct{}),
+		linkState:          netlinkLinkState,
+		subscribeLinks:     netlink.LinkSubscribe,
+		resolveIface:       net.InterfaceByName,
+		openInstanceSocket: func(vi *vrrpInstance) error { return vi.openSocket() },
+		runInstance:        func(vi *vrrpInstance) { go vi.run() },
+		stopInstance:       func(vi *vrrpInstance) { vi.stop() },
 	}
 }
 
@@ -246,18 +263,32 @@ func (m *Manager) UpdateInstances(desired []*Instance) error {
 				}
 				continue
 			}
-			// VIPs changed — must restart instance.
+			// VIPs changed — the instance must be restarted (changing the
+			// VIP set requires re-opening sockets and re-running the state
+			// machine). BUILD THE REPLACEMENT BEFORE TEARING DOWN the old
+			// one (#2156): a transient member-link failure (carrier flap,
+			// mid-rename by networkd) used to delete the working instance
+			// and then `continue` on InterfaceByName/openSocket error,
+			// orphaning the RG out of VRRP election until an operator
+			// re-commit. Falls through to the shared build block below; the
+			// old instance is only stopped+replaced on a fully-built
+			// replacement.
 			slog.Info("vrrp: restarting instance", "key", existing.key(),
 				"old_pri", existing.cfg.Priority, "new_pri", inst.Priority)
-			existing.stop()
-			delete(m.instances, key)
 		}
 
-		// Create new instance.
-		iface, err := net.InterfaceByName(inst.Interface)
+		// Build the (possibly replacement) instance. On ANY build failure
+		// we leave m.instances untouched: an existing instance keeps
+		// advertising its old VIP set (strictly better than dropping out of
+		// election), and a brand-new key is simply not created yet. The 2s
+		// reconcile re-drive (daemon reconcileVRRPInstances) and the two
+		// existing UpdateInstances callers retry until the interface
+		// returns. No placeholder state is added, so RGVRRPReady and the
+		// other map readers stay truthful.
+		iface, err := m.resolveIface(inst.Interface)
 		if err != nil {
-			slog.Warn("vrrp: interface not found, skipping",
-				"interface", inst.Interface, "err", err)
+			slog.Warn("vrrp: interface not found, keeping existing instance",
+				"interface", inst.Interface, "have_existing", ok, "err", err)
 			continue
 		}
 
@@ -268,12 +299,6 @@ func (m *Manager) UpdateInstances(desired []*Instance) error {
 		vi := newInstance(instCfg, iface, m.eventCh, m.onEventDrop)
 		// Store the real configured preempt value for when sync hold releases.
 		vi.desiredPreempt = inst.Preempt
-		if err := vi.openSocket(); err != nil {
-			slog.Warn("vrrp: failed to open socket",
-				"interface", inst.Interface, "err", err)
-			continue
-		}
-		m.instances[key] = vi
 
 		// Seed tracked-link state before the state machine starts so the
 		// first advert already carries the effective priority (#1814).
@@ -281,7 +306,29 @@ func (m *Manager) UpdateInstances(desired []*Instance) error {
 			m.seedTrackState(vi, inst.TrackInterface)
 		}
 
-		go vi.run()
+		// PROOF step: open the per-instance socket. This is the operation
+		// that fails on a transient member-link problem. On failure the new
+		// instance is discarded WITHOUT touching m.instances — the old one
+		// (if any) keeps running and advertising its old VIPs
+		// (build-before-teardown). run() has NOT been started, so there is
+		// no goroutine to stop and no fd leak (openSocket closes its own
+		// conn on error).
+		if err := m.openInstanceSocket(vi); err != nil {
+			slog.Warn("vrrp: failed to open socket, keeping existing instance",
+				"interface", inst.Interface, "have_existing", ok, "err", err)
+			continue
+		}
+
+		// COMMIT step: the replacement is proven buildable. Only now tear
+		// down the old instance, then swap in and start the new one. stop()
+		// blocks on the old run() goroutine exiting before the new run()
+		// owns the key, so the two state machines never run concurrently
+		// for the same key (no double-run).
+		if ok {
+			m.stopInstance(existing)
+		}
+		m.instances[key] = vi
+		m.runInstance(vi)
 	}
 
 	return nil

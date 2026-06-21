@@ -22,6 +22,14 @@ This is the package that drives chassis-cluster failover.
   `stopCh`.
 - `Stop()` — `manager.go`.
 - `UpdateInstances(desired []*Instance) error` — `manager.go`.
+  Diffs the running instance set against the desired set. A VIP change
+  forces an instance restart, which is done **build-before-teardown**
+  (#2156): the replacement's interface is resolved and its socket opened
+  (the "proof" step) BEFORE the old instance is stopped and removed. A
+  transient member-link failure (carrier flap, mid-rename by networkd)
+  therefore leaves the old instance running and advertising its old VIPs
+  rather than orphaning the RG out of election. Priority/preempt/track
+  changes still update in-place (no restart, no master-down gap).
 - `ReleaseSyncHold()` — `manager.go`. No-arg; releases hold for all
   instances.
 - `ResignRG(rgID int)` — `manager.go`. Forces this node out of master
@@ -194,3 +202,23 @@ exercised.
   counter and triggers a reconciliation callback. Don't switch to an
   unbounded channel — the counter is the early warning that something
   upstream stopped draining.
+- Instance restart on VIP change is **build-before-teardown** (#2156):
+  the new socket must open before the old instance is stopped, so the
+  old `run()` goroutine and the new one never run concurrently for the
+  same key (the proof step opens the socket but does NOT start `run()`;
+  only the commit step stops the old, swaps, and starts the new). On a
+  build failure no placeholder is added to `m.instances`, so
+  `RGVRRPReady` / `States` / `InstanceStates` / `Status` stay truthful.
+  Bounded self-recovery comes from the daemon's 2s
+  `reconcileRGStateLoop`, which re-drives `reconcileVRRPInstances` →
+  `UpdateInstances` every tick; a deferred restart retries (and succeeds)
+  once the interface returns, with no operator re-commit. During the
+  failure window the RG keeps advertising the OLD VIP set — strictly
+  better than dropping out of election; the intended VIPs land on the
+  next successful re-drive (~2s).
+- The instance-lifecycle seams (`resolveIface`, `openInstanceSocket`,
+  `runInstance`, `stopInstance`) and link seams (`linkState`,
+  `subscribeLinks`) exist so unit tests exercise the diff/lifecycle logic
+  without real netlink, raw sockets, or live goroutines. Production
+  defaults are wired in `NewManager`; do not change a seam's production
+  default without updating the matching test fakes.

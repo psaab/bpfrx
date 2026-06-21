@@ -486,6 +486,34 @@ func (d *Daemon) triggerReconcile() {
 	}
 }
 
+// reconcileVRRPInstances recomputes the desired VRRP instance set from the
+// active config and re-drives vrrp.UpdateInstances (#2156, B1). It is the
+// bounded self-recovery hook for the build-before-teardown ordering: a
+// VIP-change restart that was deferred because a member interface was
+// transiently down is retried here on the next reconcile tick once the
+// interface returns. It mirrors the desired-set computation in applyConfig
+// (collect standalone VRRP, then RETH VRRP when clustered) so the reconcile
+// path and the commit path agree on the canonical instance set. Cheap no-op
+// on a steady config. Nil-guards d.vrrpMgr / d.store so it is safe to call
+// from reconcileRGState in minimal (test) daemon constructions.
+func (d *Daemon) reconcileVRRPInstances() {
+	if d.vrrpMgr == nil || d.store == nil {
+		return
+	}
+	cfg := d.store.ActiveConfig()
+	if cfg == nil {
+		return
+	}
+	instances := vrrp.CollectInstances(cfg)
+	if d.cluster != nil {
+		localPri := d.cluster.LocalPriorities()
+		instances = append(instances, vrrp.CollectRethInstances(cfg, localPri)...)
+	}
+	if err := d.vrrpMgr.UpdateInstances(instances); err != nil {
+		slog.Warn("reconcile: failed to re-drive VRRP instances", "err", err)
+	}
+}
+
 func shouldRemoveBlackholesOnClusterPrimary(s *rgStateMachine) bool {
 	active, _ := s.CurrentDesired()
 	return active
@@ -495,6 +523,18 @@ func (d *Daemon) reconcileRGState() {
 	if d.cluster == nil || d.vrrpMgr == nil {
 		return
 	}
+
+	// #2156 (B1): re-drive the VRRP instance set from the active config on
+	// every reconcile pass. Combined with the build-before-teardown
+	// ordering in vrrp.UpdateInstances, this gives bounded (~2s)
+	// self-recovery: if a VIP-change restart was deferred because a member
+	// interface was transiently down (carrier flap, mid-rename), the old
+	// instance kept running and this pass re-attempts the swap once the
+	// interface returns — no operator re-commit needed. On a steady config
+	// this is a cheap no-op (UpdateInstances' no-change paths continue;
+	// priority-only deltas hit the in-place updateConfig path, never a
+	// restart, so it cannot cause a restart storm).
+	d.reconcileVRRPInstances()
 
 	// Read authoritative VRRP instance states.
 	vrrpStates := d.vrrpMgr.InstanceStates()
