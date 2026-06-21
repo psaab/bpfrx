@@ -3278,3 +3278,596 @@ fn promotion_refresh_with_nonzero_epoch_ages_after_one_selfheal() {
     let expired = run_expire_ha(&mut table, t3, &[1], &|_| 5);
     assert_eq!(expired.len(), 1, "ages on the next pass -- no perpetual re-stamp");
 }
+
+// ===================================================================
+// #2134: per-IP session-limit lifecycle, maintained inside SessionTable
+// at the install/remove sinks + the two in-place HA transitions. These
+// tests drive the REAL install/expire/promote/demote paths (NOT the
+// retired ScreenState `session_created` manual hook the old screen tests
+// used — that gap was exactly the #2134 no-op). Each is written to FAIL
+// if its enforcement-driving count maintenance is reverted to a no-op.
+// ===================================================================
+
+/// A counted forward install with a distinct src IP per flow.
+fn limit_key(src_octet: u8, dst_octet: u8, src_port: u16) -> SessionKey {
+    SessionKey {
+        addr_family: 2,
+        protocol: PROTO_TCP,
+        src_ip: IpAddr::V4(Ipv4Addr::new(203, 0, 113, src_octet)),
+        dst_ip: IpAddr::V4(Ipv4Addr::new(198, 51, 100, dst_octet)),
+        src_port,
+        dst_port: 443,
+    }
+}
+
+/// §5.1 enforcement decision (the security purpose): with the OFF-gate
+/// ON, installing `n` forward flows from one source IP drives the count
+/// to exactly `n` through the REAL install path, and the new-flow
+/// enforcement predicate (`count >= limit`) holds for the (n+1)-th
+/// attempt. This FAILS if the install-site increment is reverted (count
+/// stays 0, the predicate never fires, the limit is a no-op — the #2134
+/// bug). The DST mirror is asserted too.
+#[test]
+fn session_limit_count_increments_on_forward_install_src_and_dst() {
+    let mut table = SessionTable::new();
+    table.set_session_limit_active(true);
+    let now = 1_000_000_000u64;
+    let src = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7));
+    let dst = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 9));
+    let limit = 3u32;
+
+    // Distinct flows (distinct dst host so each is a fresh key) sharing
+    // one src IP, all targeting one dst host so dst also counts.
+    for i in 0..limit {
+        let key = SessionKey {
+            src_ip: src,
+            dst_ip: dst,
+            src_port: 40000 + i as u16,
+            ..limit_key(7, 9, 0)
+        };
+        assert!(table.install_with_protocol_with_origin(
+            key,
+            decision(),
+            metadata(),
+            SessionOrigin::ForwardFlow,
+            now,
+            PROTO_TCP,
+            0x10,
+        ));
+    }
+
+    assert_eq!(
+        table.session_limit_src_count(src),
+        limit,
+        "src count must equal the number of forward installs"
+    );
+    assert_eq!(
+        table.session_limit_dst_count(dst),
+        limit,
+        "dst count must equal the number of forward installs"
+    );
+    // The (limit+1)-th new flow's enforcement predicate must fire.
+    assert!(
+        table.session_limit_src_count(src) >= limit,
+        "over-limit src predicate must hold (enforcement would drop)"
+    );
+    assert!(
+        table.session_limit_dst_count(dst) >= limit,
+        "over-limit dst predicate must hold"
+    );
+}
+
+/// §5.2 established-flow regression (the r2 BLOCKER): the per-packet
+/// session HIT path (`lookup` / `touch`) must NOT change the per-IP
+/// count — only a NEW install does. If the count were maintained
+/// per-packet (or the check left in the screen stage), an at-limit
+/// flow's own data packets would re-trip the limit. Here, after `n`
+/// installs (count == n), MANY lookups/touches of those live sessions
+/// leave the count at exactly `n` — never n+1, never growing.
+#[test]
+fn session_limit_count_unchanged_by_established_flow_packets() {
+    let mut table = SessionTable::new();
+    table.set_session_limit_active(true);
+    let now = 1_000_000_000u64;
+    let src = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 11));
+    let n = 4u32;
+    let mut keys = Vec::new();
+    for i in 0..n {
+        let key = SessionKey {
+            src_ip: src,
+            src_port: 41000 + i as u16,
+            ..limit_key(11, 9, 0)
+        };
+        assert!(table.install_with_protocol_with_origin(
+            key.clone(),
+            decision(),
+            metadata(),
+            SessionOrigin::ForwardFlow,
+            now,
+            PROTO_TCP,
+            0x10,
+        ));
+        keys.push(key);
+    }
+    assert_eq!(table.session_limit_src_count(src), n);
+
+    // Drive many established-flow data packets (session HIT + keepalive).
+    for tick in 1..200u64 {
+        for key in &keys {
+            let _ = table.lookup(key, now + tick * 1_000_000, 0x10);
+            table.touch(key, now + tick * 1_000_000);
+        }
+    }
+    assert_eq!(
+        table.session_limit_src_count(src),
+        n,
+        "established-flow packets must NOT change the count (r2 BLOCKER)"
+    );
+}
+
+/// §5.3 decrement + evict-to-0 across the timer wheel + re-admit: after
+/// expiry the count decrements and the map ENTRY is removed at 0 (#2128
+/// evict-on-zero), and the IP can be admitted again.
+#[test]
+fn session_limit_decrements_and_evicts_on_expire() {
+    let mut table = SessionTable::new();
+    table.set_session_limit_active(true);
+    let then = 1_000_000_000u64;
+    let src = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 13));
+    let key = SessionKey {
+        src_ip: src,
+        ..limit_key(13, 9, 42000)
+    };
+    assert!(table.install_with_protocol_with_origin(
+        key.clone(),
+        decision(),
+        metadata(),
+        SessionOrigin::ForwardFlow,
+        then,
+        PROTO_TCP,
+        0x10,
+    ));
+    assert_eq!(table.session_limit_src_count(src), 1);
+    assert_eq!(table.session_limit_src_map_len(), 1);
+
+    table.last_gc_ns = then + 301_000_000_000;
+    let expired = table.expire_stale_entries(then + 302_000_000_000);
+    assert_eq!(expired.len(), 1);
+    assert_eq!(
+        table.session_limit_src_count(src),
+        0,
+        "count must decrement on expire"
+    );
+    assert_eq!(
+        table.session_limit_src_map_len(),
+        0,
+        "map entry must be evicted at 0 (#2128)"
+    );
+    assert_eq!(table.session_limit_dst_map_len(), 0);
+
+    // Re-admittable: a fresh install for the same IP works and counts.
+    let key2 = SessionKey {
+        src_ip: src,
+        src_port: 42001,
+        ..limit_key(13, 9, 0)
+    };
+    assert!(table.install_with_protocol_with_origin(
+        key2,
+        decision(),
+        metadata(),
+        SessionOrigin::ForwardFlow,
+        then + 303_000_000_000,
+        PROTO_TCP,
+        0x10,
+    ));
+    assert_eq!(table.session_limit_src_count(src), 1);
+}
+
+/// §5.4 decrement across the explicit `delete` path (clear / RST
+/// teardown / fabric-cancel all funnel through `remove_entry`).
+#[test]
+fn session_limit_decrements_on_explicit_delete() {
+    let mut table = SessionTable::new();
+    table.set_session_limit_active(true);
+    let now = 1_000_000_000u64;
+    let src = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 15));
+    let key = SessionKey {
+        src_ip: src,
+        ..limit_key(15, 9, 43000)
+    };
+    assert!(table.install_with_protocol_with_origin(
+        key.clone(),
+        decision(),
+        metadata(),
+        SessionOrigin::ForwardFlow,
+        now,
+        PROTO_TCP,
+        0x10,
+    ));
+    assert_eq!(table.session_limit_src_count(src), 1);
+    table.delete(&key);
+    assert_eq!(table.session_limit_src_count(src), 0);
+    assert_eq!(table.session_limit_src_map_len(), 0);
+}
+
+/// §5.6 HA exclusion + promote + demote — the two in-place transition
+/// sites that bypass the install/remove choke points. FAILS if either
+/// explicit increment (promote) or decrement (demote) is omitted.
+#[test]
+fn session_limit_ha_import_promote_demote_count() {
+    let mut table = SessionTable::new();
+    table.set_session_limit_active(true);
+    let now = 1_000_000_000u64;
+    let src = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 17));
+    let key = SessionKey {
+        src_ip: src,
+        ..limit_key(17, 9, 44000)
+    };
+    let mut meta = metadata();
+    meta.owner_rg_id = 1;
+
+    // Import a peer session (SyncImport) — must NOT count locally.
+    assert!(table.upsert_synced_with_origin(
+        SessionInstall {
+            key: key.clone(),
+            decision: decision(),
+            metadata: meta.clone(),
+            origin: SessionOrigin::SyncImport,
+            now_ns: now,
+            protocol: PROTO_TCP,
+            tcp_flags: 0x10,
+        },
+        false,
+    ));
+    assert_eq!(
+        table.session_limit_src_count(src),
+        0,
+        "peer-synced import must not count locally"
+    );
+
+    // Promote synced -> local: +1 exactly (in-place update_session).
+    assert!(table.promote_synced_with_origin(SessionUpdate {
+        key: &key,
+        decision: decision(),
+        metadata: meta.clone(),
+        origin: SessionOrigin::SharedPromote,
+        now_ns: now + 1_000_000,
+        protocol: PROTO_TCP,
+        tcp_flags: 0x10,
+    }));
+    assert_eq!(
+        table.session_limit_src_count(src),
+        1,
+        "promote synced->local must increment (in-place site)"
+    );
+
+    // Demote local -> synced: -1 and evict at 0 (in-place demote).
+    assert_eq!(table.demote_owner_rg(1).len(), 1);
+    assert_eq!(
+        table.session_limit_src_count(src),
+        0,
+        "demote local->synced must decrement (in-place site)"
+    );
+    assert_eq!(table.session_limit_src_map_len(), 0);
+}
+
+/// §5.7 reverse + seed exclusion: reverse-flow and MissingNeighborSeed
+/// installs must NOT increment (counted-class predicate).
+#[test]
+fn session_limit_excludes_reverse_and_seed_installs() {
+    let mut table = SessionTable::new();
+    table.set_session_limit_active(true);
+    let now = 1_000_000_000u64;
+
+    let rev_src = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 19));
+    let rev_key = SessionKey {
+        src_ip: rev_src,
+        ..limit_key(19, 9, 45000)
+    };
+    let mut rev_meta = metadata();
+    rev_meta.is_reverse = true;
+    assert!(table.install_with_protocol_with_origin(
+        rev_key,
+        decision(),
+        rev_meta,
+        SessionOrigin::ReverseFlow,
+        now,
+        PROTO_TCP,
+        0x10,
+    ));
+    assert_eq!(
+        table.session_limit_src_count(rev_src),
+        0,
+        "reverse-flow install must not count"
+    );
+
+    let seed_src = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 21));
+    let seed_key = SessionKey {
+        src_ip: seed_src,
+        ..limit_key(21, 9, 46000)
+    };
+    assert!(table.install_with_protocol_with_origin(
+        seed_key,
+        decision(),
+        metadata(),
+        SessionOrigin::MissingNeighborSeed,
+        now,
+        PROTO_TCP,
+        0x10,
+    ));
+    assert_eq!(
+        table.session_limit_src_count(seed_src),
+        0,
+        "missing-neighbor seed install must not count"
+    );
+}
+
+/// §5.8 idempotent re-install (the defensive pre-clear path): installing
+/// the same key twice nets to count 1, not 2 (pre-clear decrement +
+/// install increment self-cancel on the same IP).
+#[test]
+fn session_limit_idempotent_reinstall_nets_to_one() {
+    let mut table = SessionTable::new();
+    table.set_session_limit_active(true);
+    let now = 1_000_000_000u64;
+    let src = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 23));
+    let key = SessionKey {
+        src_ip: src,
+        ..limit_key(23, 9, 47000)
+    };
+    for t in 0..2u64 {
+        assert!(table.install_with_protocol_with_origin(
+            key.clone(),
+            decision(),
+            metadata(),
+            SessionOrigin::ForwardFlow,
+            now + t * 1_000_000,
+            PROTO_TCP,
+            0x10,
+        ));
+    }
+    assert_eq!(
+        table.session_limit_src_count(src),
+        1,
+        "re-install of the same key must net to 1, not 2"
+    );
+    assert_eq!(table.session_limit_src_map_len(), 1);
+}
+
+/// §5.9 differential / invariant (the strongest guard): after an
+/// arbitrary sequence of install / expire / delete / promote / demote /
+/// refresh, the sum of per-IP src counts EQUALS the number of live
+/// counted entries (`!is_reverse && !is_peer_synced && !is_seed`). Same
+/// for dst. Catches ANY missed transition site.
+#[test]
+fn session_limit_counts_match_live_counted_entries_invariant() {
+    let mut table = SessionTable::new();
+    table.set_session_limit_active(true);
+    let mut now = 1_000_000_000u64;
+
+    // Build a varied population.
+    let mut counted_keys: Vec<SessionKey> = Vec::new();
+    for i in 0..12u32 {
+        now += 1_000_000;
+        let key = SessionKey {
+            src_ip: IpAddr::V4(Ipv4Addr::new(203, 0, 113, (i % 4) as u8 + 1)),
+            dst_ip: IpAddr::V4(Ipv4Addr::new(198, 51, 100, (i % 3) as u8 + 1)),
+            src_port: 50000 + i as u16,
+            ..limit_key(0, 0, 0)
+        };
+        let mut meta = metadata();
+        meta.owner_rg_id = 1;
+        assert!(table.install_with_protocol_with_origin(
+            key.clone(),
+            decision(),
+            meta,
+            SessionOrigin::ForwardFlow,
+            now,
+            PROTO_TCP,
+            0x10,
+        ));
+        counted_keys.push(key);
+    }
+    // A reverse + a seed (uncounted) + a synced import (uncounted).
+    let mut rev_meta = metadata();
+    rev_meta.is_reverse = true;
+    let _ = table.install_with_protocol_with_origin(
+        SessionKey {
+            src_port: 60001,
+            ..limit_key(9, 9, 0)
+        },
+        decision(),
+        rev_meta,
+        SessionOrigin::ReverseFlow,
+        now,
+        PROTO_TCP,
+        0x10,
+    );
+    let _ = table.install_with_protocol_with_origin(
+        SessionKey {
+            src_port: 60002,
+            ..limit_key(9, 9, 0)
+        },
+        decision(),
+        metadata(),
+        SessionOrigin::MissingNeighborSeed,
+        now,
+        PROTO_TCP,
+        0x10,
+    );
+    let synced_key = SessionKey {
+        src_port: 60003,
+        ..limit_key(8, 8, 0)
+    };
+    let mut synced_meta = metadata();
+    synced_meta.owner_rg_id = 1;
+    let _ = table.upsert_synced_with_origin(
+        SessionInstall {
+            key: synced_key.clone(),
+            decision: decision(),
+            metadata: synced_meta.clone(),
+            origin: SessionOrigin::SyncImport,
+            now_ns: now,
+            protocol: PROTO_TCP,
+            tcp_flags: 0x10,
+        },
+        false,
+    );
+
+    // Mutate: delete a few, promote the synced import, refresh one,
+    // then demote RG 1.
+    table.delete(&counted_keys[0]);
+    table.delete(&counted_keys[5]);
+    assert!(table.promote_synced_with_origin(SessionUpdate {
+        key: &synced_key,
+        decision: decision(),
+        metadata: synced_meta.clone(),
+        origin: SessionOrigin::SharedPromote,
+        now_ns: now + 1_000_000,
+        protocol: PROTO_TCP,
+        tcp_flags: 0x10,
+    }));
+    // refresh that preserves origin/direction (must not change counts).
+    let refresh_target = counted_keys[2].clone();
+    assert!(table.refresh_for_ha_transition(&refresh_target, decision(), metadata(), now + 2_000_000));
+
+    let check_invariant = |table: &SessionTable, label: &str| {
+        let mut src_live: std::collections::HashMap<IpAddr, u32> = std::collections::HashMap::new();
+        let mut dst_live: std::collections::HashMap<IpAddr, u32> = std::collections::HashMap::new();
+        table.iter_with_origin(|key, _decision, md, origin| {
+            if !md.is_reverse && !origin.is_peer_synced() && !origin.is_transient_local_seed() {
+                *src_live.entry(key.src_ip).or_insert(0) += 1;
+                *dst_live.entry(key.dst_ip).or_insert(0) += 1;
+            }
+        });
+        // Per-IP count must equal the number of live counted entries for
+        // that IP, for every IP that has at least one live counted entry.
+        for (ip, cnt) in &src_live {
+            assert_eq!(
+                table.session_limit_src_count(*ip),
+                *cnt,
+                "{label}: src count for {ip:?} must match live counted entries"
+            );
+        }
+        for (ip, cnt) in &dst_live {
+            assert_eq!(
+                table.session_limit_dst_count(*ip),
+                *cnt,
+                "{label}: dst count for {ip:?} must match live counted entries"
+            );
+        }
+        // Map sizes must exactly equal distinct live counted IP sets
+        // (no leaked / orphaned entries — #2128).
+        assert_eq!(
+            table.session_limit_src_map_len(),
+            src_live.len(),
+            "{label}: src map size must equal distinct live counted src IPs"
+        );
+        assert_eq!(
+            table.session_limit_dst_map_len(),
+            dst_live.len(),
+            "{label}: dst map size must equal distinct live counted dst IPs"
+        );
+    };
+    check_invariant(&table, "after mutations");
+
+    // Demote RG 1 — every counted RG-1 session becomes uncounted.
+    table.demote_owner_rg(1);
+    check_invariant(&table, "after demote RG1");
+
+    // Expire everything; counts must drain to empty.
+    table.last_gc_ns = now + 600_000_000_000;
+    let _ = table.expire_stale_entries(now + 601_000_000_000);
+    assert_eq!(table.session_limit_src_map_len(), 0);
+    assert_eq!(table.session_limit_dst_map_len(), 0);
+}
+
+/// §5.10 runtime disable clears the maps (reviewer B MAJOR): turning the
+/// OFF-gate off must clear both count maps so a later re-enable starts
+/// from 0 and cannot spuriously block an under-limit IP. FAILS if
+/// clear-on-disable is omitted.
+#[test]
+fn session_limit_clear_on_disable() {
+    let mut table = SessionTable::new();
+    table.set_session_limit_active(true);
+    let now = 1_000_000_000u64;
+    let src = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 25));
+    for i in 0..3u32 {
+        let key = SessionKey {
+            src_ip: src,
+            src_port: 52000 + i as u16,
+            ..limit_key(25, 9, 0)
+        };
+        assert!(table.install_with_protocol_with_origin(
+            key,
+            decision(),
+            metadata(),
+            SessionOrigin::ForwardFlow,
+            now,
+            PROTO_TCP,
+            0x10,
+        ));
+    }
+    assert_eq!(table.session_limit_src_count(src), 3);
+
+    // Disable: both maps must clear.
+    table.set_session_limit_active(false);
+    assert_eq!(table.session_limit_src_map_len(), 0, "src map must clear on disable");
+    assert_eq!(table.session_limit_dst_map_len(), 0, "dst map must clear on disable");
+
+    // Re-enable: a fresh flow starts the count from 0 (not stale 3).
+    table.set_session_limit_active(true);
+    let key = SessionKey {
+        src_ip: src,
+        src_port: 52999,
+        ..limit_key(25, 9, 0)
+    };
+    assert!(table.install_with_protocol_with_origin(
+        key,
+        decision(),
+        metadata(),
+        SessionOrigin::ForwardFlow,
+        now + 1_000_000,
+        PROTO_TCP,
+        0x10,
+    ));
+    assert_eq!(
+        table.session_limit_src_count(src),
+        1,
+        "re-enable must start from 0, not the stale pre-disable count"
+    );
+}
+
+/// OFF-gate zero-cost: when the feature is OFF, install/remove perform NO
+/// counter maintenance (the maps stay empty regardless of traffic).
+#[test]
+fn session_limit_off_gate_skips_all_maintenance() {
+    let mut table = SessionTable::new();
+    // OFF (default).
+    let now = 1_000_000_000u64;
+    let src = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 27));
+    for i in 0..5u32 {
+        let key = SessionKey {
+            src_ip: src,
+            src_port: 53000 + i as u16,
+            ..limit_key(27, 9, 0)
+        };
+        assert!(table.install_with_protocol_with_origin(
+            key.clone(),
+            decision(),
+            metadata(),
+            SessionOrigin::ForwardFlow,
+            now,
+            PROTO_TCP,
+            0x10,
+        ));
+        table.delete(&key);
+    }
+    assert_eq!(
+        table.session_limit_src_count(src),
+        0,
+        "OFF-gate: no count maintained"
+    );
+    assert_eq!(table.session_limit_src_map_len(), 0);
+    assert_eq!(table.session_limit_dst_map_len(), 0);
+}

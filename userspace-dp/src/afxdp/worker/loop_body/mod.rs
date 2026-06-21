@@ -318,6 +318,13 @@ pub(crate) fn worker_loop(
             screen_state.update_profiles(new_forwarding.screen_profiles.clone());
             screen_state.update_syn_cookie_master_key(new_forwarding.syn_cookie_master_key);
             sessions.set_timeouts(new_forwarding.session_timeouts);
+            // #2134: re-derive the per-IP session-limit OFF-gate on every
+            // runtime forwarding-snapshot rotation. A runtime ON->OFF
+            // transition (operator removes `limit-session`) clears the
+            // stale count maps via set_session_limit_active so a later
+            // re-enable starts clean and cannot spuriously block an
+            // under-limit IP.
+            sessions.set_session_limit_active(screen_state.any_session_limit_configured());
 
             // #1635 (plan §2.4): a config apply may have reassigned
             // cold-path histogram slots to new zone-pairs. Zero those

@@ -122,6 +122,10 @@ pub(super) fn worker_loop_setup(
     screen_state.update_profiles(forwarding.screen_profiles.clone());
     screen_state.update_syn_cookie_master_key(forwarding.syn_cookie_master_key);
     sessions.set_timeouts(forwarding.session_timeouts);
+    // #2134: drive the per-IP session-limit OFF-gate from the applied
+    // screen profiles. Off when no zone configures `limit-session`, so
+    // install/remove counter maintenance is skipped for the ~99% case.
+    sessions.set_session_limit_active(screen_state.any_session_limit_configured());
     let mut bindings = Vec::with_capacity(binding_plans.len());
     let (private_plans, shared_groups) = partition_binding_plans(binding_plans);
     for plan in private_plans {

@@ -218,6 +218,70 @@ installs — they cannot fail. The future cap arbitration for the sync
 family (row I11) now covers `UpsertLocal` automatically. Decision
 record: `docs/research/1870-local-tunnel-pair/plan.md`.
 
+## Per-IP session-limit lifecycle (#2134, fixes #2128)
+
+Junos `set security screen ids-option <name> limit-session
+source-ip-based <n>` / `destination-ip-based <n>` caps the concurrent
+locally-admitted sessions one source / destination IP may hold. The
+per-IP count is owned by `SessionTable` (`session_limit_src_counts` /
+`session_limit_dst_counts`), NOT by `ScreenState` — the count must track
+the real session lifecycle, and `SessionTable` is the choke point every
+create/remove already passes through.
+
+**Counted-class predicate.** A session counts iff it is locally-admitted,
+forward-direction, real (not a transient seed), and not imported from the
+HA peer: `!is_reverse && !origin.is_peer_synced() &&
+!origin.is_transient_local_seed()`. This is exactly the predicate that
+gates the HA Open delta, so the count and the delta stay in lockstep.
+
+**Maintenance sites (all OFF-gated by `session_limit_active`).** The
+count is incremented at the two create transitions and decremented at the
+two remove transitions:
+
+| Transition | Site | Action |
+|---|---|---|
+| fresh install | `install_with_protocol_with_origin` (next to the Open-delta push) | increment |
+| in-place HA promote synced→local | `update_session` promote branch (`mod.rs`) | increment |
+| any removal (expire / clear / RST / fabric-cancel / take_synced_local) | `remove_entry` success path (the sole removal sink) | decrement |
+| in-place HA demote local→synced | `demote_owner_rg` (before the origin flip) | decrement |
+
+Removals are structurally exhaustive through `remove_entry`, so a future
+delete site cannot forget the decrement. The two in-place HA transitions
+bypass the install/remove sinks, so they carry explicit, enumerated
+count adjustments. Every decrement uses `saturating_sub` and **evicts the
+map entry the moment its count reaches 0** — so the maps are bounded by
+distinct IPs with ≥1 live counted session (this is the #2128 fix: the
+read path never inserts a phantom zero entry).
+
+**Where the limit is CHECKED.** At the NEW-FLOW / session-MISS decision
+in `afxdp/poll_descriptor` (`new_flow_session_limit_drop`), NOT in the
+per-packet screen stage. The screen stage runs on every data packet of
+every flow and before the session lookup; checking `count >= limit`
+there would re-evaluate an established flow's own counted session and
+self-drop it at the limit boundary. The new-flow check fires exactly once
+per new flow, before its session exists, via a non-mutating
+`session_limit_{src,dst}_count` query, and emits the
+`session-limit-src` / `session-limit-dst` screen-drop event + counter.
+
+**OFF-gate + clear-on-disable.** `set_session_limit_active(active)` is
+driven from the applied screen-profile snapshot (startup +
+runtime-reload, next to `set_timeouts` /
+`ScreenState::update_profiles`). When no zone configures `limit-session`
+the gate is OFF and every maintenance op short-circuits, so the ~99% of
+deployments pay nothing. On an ON→OFF runtime transition the gate setter
+**clears both count maps** — otherwise the decrement paths stop firing
+and a later re-enable would resume from stale, over-counted values and
+spuriously block an under-limit IP. After a re-enable the maps start
+empty and re-populate from new installs; pre-existing live sessions are
+not back-counted (benign, Junos-approximate).
+
+**Per-worker scoping.** Each worker owns its `SessionTable`, so the count
+is per-worker — a single IP spreading flows across N RX queues sees an
+effective limit up to N×limit. This is a pre-existing property (same
+under the eBPF per-CPU map), not introduced by this change.
+
+Decision record: `docs/research/2128-2134-screen-session-limit/plan.md`.
+
 ## Why a slab + integer handles
 
 Pre-#964 the table was `HashMap<Key, Arc<SessionEntry>>`. Reverse-NAT
