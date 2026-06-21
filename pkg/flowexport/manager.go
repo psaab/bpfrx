@@ -48,6 +48,107 @@ type CollectorConfig struct {
 	SourceAddress string // local bind address (empty = auto)
 }
 
+// resolveFlowServerVersion returns the export protocol a single
+// flow-server is bound to, given the per-server selector and which
+// global flow-monitoring version stanzas are configured. Junos binds
+// each flow-server to exactly one export version + template; xpf
+// honours that binding so a collector never receives both a NetFlow v9
+// and an IPFIX datagram for the same flow (#2136).
+//
+// Resolution:
+//   - An explicit per-server selector (`version9` / `version-ipfix`
+//     nested under the flow-server) wins outright — but only if the
+//     matching global `services flow-monitoring` stanza is configured
+//     (the global stanza supplies the template timeouts/fields). A
+//     server bound to a version whose global stanza is absent exports
+//     nothing (it has no template), matching the existing global gates.
+//   - With no per-server selector, the server inherits the single
+//     configured global version. When BOTH global versions are set the
+//     unbound server resolves to IPFIX (documented precedence): IPFIX
+//     (v10) is the IETF-standard superset of NetFlow v9, so an operator
+//     who turned on both and did not pin the collector gets the modern
+//     protocol — and, critically, exactly ONE datagram stream rather
+//     than the pre-#2136 double-export.
+//
+// Returns "" when the server resolves to no configured version (it is
+// then skipped by both collector builders).
+func resolveFlowServerVersion(fs *config.FlowServer, hasV9, hasIPFIX bool) string {
+	switch fs.Version {
+	case config.FlowServerVersion9:
+		if hasV9 {
+			return config.FlowServerVersion9
+		}
+		return ""
+	case config.FlowServerVersionIPFIX:
+		if hasIPFIX {
+			return config.FlowServerVersionIPFIX
+		}
+		return ""
+	}
+	// Unbound: inherit the single configured global version. IPFIX wins
+	// when both are configured (documented precedence — see above).
+	switch {
+	case hasIPFIX:
+		return config.FlowServerVersionIPFIX
+	case hasV9:
+		return config.FlowServerVersion9
+	default:
+		return ""
+	}
+}
+
+// collectVersionCollectors walks every sampling family's flow-servers
+// and returns the deduplicated collector set for the requested export
+// version, skipping flow-servers resolved to the other version. This is
+// the per-flow-server version binding that prevents double-export
+// (#2136): the v9 builder calls it with version=version9, the IPFIX
+// builder with version=version-ipfix, and a server appears in at most
+// one of the two sets.
+func collectVersionCollectors(fo *config.ForwardingOptionsConfig, version string, hasV9, hasIPFIX bool) []CollectorConfig {
+	var collectors []CollectorConfig
+	for _, inst := range fo.Sampling.Instances {
+		families := []*config.SamplingFamily{inst.FamilyInet, inst.FamilyInet6}
+		for _, fam := range families {
+			if fam == nil {
+				continue
+			}
+			for _, fs := range fam.FlowServers {
+				if resolveFlowServerVersion(fs, hasV9, hasIPFIX) != version {
+					continue
+				}
+				addr := fs.Address
+				if fs.Port > 0 {
+					addr = fmt.Sprintf("%s:%d", fs.Address, fs.Port)
+				}
+				srcAddr := fam.SourceAddress
+				if srcAddr == "" {
+					srcAddr = fam.InlineJflowSourceAddress
+				}
+				collectors = append(collectors, CollectorConfig{
+					Address:       addr,
+					SourceAddress: srcAddr,
+				})
+			}
+		}
+	}
+	return dedupeCollectors(collectors)
+}
+
+// dedupeCollectors removes duplicate collector destinations (same
+// address + source-address) in-place, preserving first-seen order.
+func dedupeCollectors(collectors []CollectorConfig) []CollectorConfig {
+	seen := make(map[string]bool)
+	deduped := collectors[:0]
+	for _, c := range collectors {
+		key := collectorKey(c)
+		if !seen[key] {
+			seen[key] = true
+			deduped = append(deduped, c)
+		}
+	}
+	return deduped
+}
+
 // BuildExportConfig resolves config types into an ExportConfig.
 // Returns nil if no flow export is configured.
 func BuildExportConfig(svc *config.ServicesConfig, fo *config.ForwardingOptionsConfig) *ExportConfig {
@@ -109,45 +210,19 @@ func BuildExportConfig(svc *config.ServicesConfig, fo *config.ForwardingOptionsC
 		}
 	}
 
-	// Collect flow servers from all sampling instances
-	for _, inst := range fo.Sampling.Instances {
-		families := []*config.SamplingFamily{inst.FamilyInet, inst.FamilyInet6}
-		for _, fam := range families {
-			if fam == nil {
-				continue
-			}
-			for _, fs := range fam.FlowServers {
-				addr := fs.Address
-				if fs.Port > 0 {
-					addr = fmt.Sprintf("%s:%d", fs.Address, fs.Port)
-				}
-				srcAddr := fam.SourceAddress
-				if srcAddr == "" {
-					srcAddr = fam.InlineJflowSourceAddress
-				}
-				ec.Collectors = append(ec.Collectors, CollectorConfig{
-					Address:       addr,
-					SourceAddress: srcAddr,
-				})
-			}
-		}
-	}
+	// Collect only the flow-servers bound to NetFlow v9. A server is
+	// bound to v9 by an explicit per-server selector, or — when it has
+	// no per-server selector — by inheriting v9 only if IPFIX is not
+	// also configured (IPFIX wins the unbound precedence). This is the
+	// #2136 per-flow-server version binding: it skips servers resolved
+	// to IPFIX so a collector configured under both versions receives
+	// exactly one datagram stream, not two.
+	hasIPFIX := svc.FlowMonitoring.VersionIPFIX != nil
+	ec.Collectors = collectVersionCollectors(fo, config.FlowServerVersion9, true, hasIPFIX)
 
 	if len(ec.Collectors) == 0 {
 		return nil
 	}
-
-	// Deduplicate collectors by address
-	seen := make(map[string]bool)
-	deduped := ec.Collectors[:0]
-	for _, c := range ec.Collectors {
-		key := collectorKey(c)
-		if !seen[key] {
-			seen[key] = true
-			deduped = append(deduped, c)
-		}
-	}
-	ec.Collectors = deduped
 
 	return ec
 }
@@ -185,7 +260,7 @@ func BuildIPFIXExportConfig(svc *config.ServicesConfig, fo *config.ForwardingOpt
 		TemplateRefreshRate: refreshRate,
 	}
 
-	// Reuse same sampling rate + collectors as v9 (shared forwarding-options)
+	// Same sampling rate as v9 (shared forwarding-options sampling).
 	for _, inst := range fo.Sampling.Instances {
 		if inst.InputRate > 0 {
 			ec.SamplingRate = inst.InputRate
@@ -193,44 +268,17 @@ func BuildIPFIXExportConfig(svc *config.ServicesConfig, fo *config.ForwardingOpt
 		}
 	}
 
-	for _, inst := range fo.Sampling.Instances {
-		families := []*config.SamplingFamily{inst.FamilyInet, inst.FamilyInet6}
-		for _, fam := range families {
-			if fam == nil {
-				continue
-			}
-			for _, fs := range fam.FlowServers {
-				addr := fs.Address
-				if fs.Port > 0 {
-					addr = fmt.Sprintf("%s:%d", fs.Address, fs.Port)
-				}
-				srcAddr := fam.SourceAddress
-				if srcAddr == "" {
-					srcAddr = fam.InlineJflowSourceAddress
-				}
-				ec.Collectors = append(ec.Collectors, CollectorConfig{
-					Address:       addr,
-					SourceAddress: srcAddr,
-				})
-			}
-		}
-	}
+	// Collect only the flow-servers bound to IPFIX (#2136). A server is
+	// bound to IPFIX by an explicit per-server selector, or — when it
+	// has no per-server selector — by inheriting IPFIX (which wins the
+	// unbound precedence whenever IPFIX is configured). The v9 builder
+	// skips exactly these servers, so no collector is double-exported.
+	hasV9 := svc.FlowMonitoring.Version9 != nil
+	ec.Collectors = collectVersionCollectors(fo, config.FlowServerVersionIPFIX, hasV9, true)
 
 	if len(ec.Collectors) == 0 {
 		return nil
 	}
-
-	// Deduplicate collectors
-	seen := make(map[string]bool)
-	deduped := ec.Collectors[:0]
-	for _, c := range ec.Collectors {
-		key := collectorKey(c)
-		if !seen[key] {
-			seen[key] = true
-			deduped = append(deduped, c)
-		}
-	}
-	ec.Collectors = deduped
 
 	return ec
 }
