@@ -8425,3 +8425,25 @@ top.
   pkg/configstore/store_persist.go, pkg/configstore/store_lock.go,
   pkg/configstore/store_command.go, pkg/configstore/store_commit.go,
   pkg/configstore/store_format.go, docs/refactoring-audit-current.txt
+
+- **Timestamp**: 2026-06-21
+- **Action**: #2158 P3 Go file-splits — split pkg/dataplane/userspace/manager.go
+  (2186 LOC) and pkg/cli/cli_show_security.go (2018 LOC), both over the ~2000
+  modularity threshold, into cohesive same-package siblings per the converged
+  plan sections 5.6 and 5.7. manager.go -> manager.go (1594) + capabilities.go
+  (469, config->capability derivation) + controllers.go (144, dataplane adapter
+  types). cli_show_security.go -> cli_show_security.go (342, policies subject) +
+  zones/screen/objects/ipsec/log/filters siblings (182/398/291/272/232/351).
+  Pure code-motion: funcs/types moved verbatim, no logic change, no exported-API
+  change, no receiver change, no package-level var/init moved (no init-order
+  risk). go doc -all byte-identical for both packages before/after; go test
+  ./pkg/dataplane/userspace/... ./pkg/cli/... green with a test set byte-
+  identical to master (606 tests). gofmt -l clean on all new files; go build
+  ./... clean. Regenerated docs/refactoring-audit-current.txt (manager.go drops
+  to WATCH, cli_show_security.go off the heatmap); make audit-check clean.
+- **File(s)**: pkg/dataplane/userspace/manager.go (trimmed),
+  pkg/dataplane/userspace/capabilities.go, pkg/dataplane/userspace/controllers.go,
+  pkg/cli/cli_show_security.go (trimmed), pkg/cli/cli_show_security_zones.go,
+  pkg/cli/cli_show_security_screen.go, pkg/cli/cli_show_security_objects.go,
+  pkg/cli/cli_show_security_ipsec.go, pkg/cli/cli_show_security_log.go,
+  pkg/cli/cli_show_security_filters.go, docs/refactoring-audit-current.txt
