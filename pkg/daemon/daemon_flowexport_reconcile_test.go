@@ -52,6 +52,14 @@ func flowSamplingConfig(collector string, rate int) *config.Config {
 // also becomes configured. The base config already sets Version9 (#2129),
 // so this config drives BOTH exporters — used by the no-callback-leak and
 // independence tests.
+//
+// #2136: each flow-server now binds to exactly one export version, so to
+// drive BOTH exporters this fixture pins the base v9 server explicitly to
+// version9 and adds a SECOND, IPFIX-bound flow-server. (An UNBOUND server
+// under both global versions resolves to IPFIX only — the documented
+// precedence — so leaving the single server unbound would start only the
+// IPFIX exporter. That behaviour is asserted directly by
+// TestReconcileBothVersionsUnboundServerNoDoubleExport.)
 func ipfixSamplingConfig(collector string, rate int) *config.Config {
 	cfg := flowSamplingConfig(collector, rate)
 	cfg.Services.FlowMonitoring.VersionIPFIX = &config.NetFlowIPFIXConfig{
@@ -59,6 +67,13 @@ func ipfixSamplingConfig(collector string, rate int) *config.Config {
 			"t": {Name: "t"},
 		},
 	}
+	fam := cfg.ForwardingOptions.Sampling.Instances["s"].FamilyInet
+	// Pin the existing server to v9 so the v9 exporter keeps its collector.
+	fam.FlowServers[0].Version = config.FlowServerVersion9
+	// Add a distinct IPFIX-bound collector so the IPFIX exporter also runs.
+	fam.FlowServers = append(fam.FlowServers, &config.FlowServer{
+		Address: collector, Port: 4739, Version: config.FlowServerVersionIPFIX,
+	})
 	return cfg
 }
 
@@ -329,6 +344,50 @@ func TestReconcileIPFIXOnlyDoesNotStartV9(t *testing.T) {
 	if n := d.eventReader.CallbackCount(); n != 1 {
 		t.Fatalf("#2129: IPFIX-only config must register exactly 1 callback "+
 			"(IPFIX), got %d", n)
+	}
+}
+
+// bothVersionsUnboundConfig returns sampling with a SINGLE flow-server
+// that carries NO per-server version selector, under BOTH global version
+// stanzas. Per #2136 the unbound server resolves to IPFIX (documented
+// precedence), so this drives ONLY the IPFIX exporter — not both.
+func bothVersionsUnboundConfig(collector string, rate int) *config.Config {
+	cfg := flowSamplingConfig(collector, rate) // sets Version9
+	cfg.Services.FlowMonitoring.VersionIPFIX = &config.NetFlowIPFIXConfig{
+		Templates: map[string]*config.NetFlowIPFIXTemplate{"t": {Name: "t"}},
+	}
+	// The single flow-server stays UNBOUND (no .Version).
+	return cfg
+}
+
+// TestReconcileBothVersionsUnboundServerNoDoubleExport is the #2136
+// regression at the live exporter-wiring layer: a single, unbound
+// flow-server configured under BOTH version9 and version-ipfix must
+// register exactly ONE session-close callback (IPFIX), not two. Before
+// #2136 both exporters started against the same collector and each
+// registered its own callback, so every flow was exported twice (one v9
+// + one IPFIX datagram). With per-server binding the unbound server
+// resolves to IPFIX only, so the v9 exporter never starts.
+func TestReconcileBothVersionsUnboundServerNoDoubleExport(t *testing.T) {
+	d := newFlowTestDaemon()
+	t.Cleanup(d.stopFlowExporter)
+	t.Cleanup(d.stopIPFIXExporter)
+
+	if !d.reconcileFlowExporters(bothVersionsUnboundConfig("127.0.0.1", 100)) {
+		t.Fatal("both-versions config must reconcile (the IPFIX exporter starts)")
+	}
+	if b := d.ipfixBundlePtr.Load(); b == nil || b.exp == nil {
+		t.Fatal("#2136: unbound server under both versions must run the IPFIX exporter")
+	}
+	if b := d.flowBundle.Load(); b != nil && b.exp != nil {
+		t.Fatal("#2136: an UNBOUND collector under both versions must NOT also " +
+			"start the v9 exporter — that is the double-export bug")
+	}
+	// Exactly one callback (IPFIX), not two — the wire-level proof of no
+	// double-export to the single collector socket.
+	if n := d.eventReader.CallbackCount(); n != 1 {
+		t.Fatalf("#2136: both-versions unbound server must register exactly 1 "+
+			"callback (IPFIX), got %d — double-export", n)
 	}
 }
 

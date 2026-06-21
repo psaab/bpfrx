@@ -25,6 +25,64 @@
   docs/feature-gaps.md, docs/pr/2134-screen-session-limit-enforce/self-review.md
 - **Validation**: cargo build --release clean; cargo test --release green.
   Live screen/flood smoke on the loss cluster is PENDING-PARENT.
+## 2026-06-21 — #2173 (PR #2182) fold: v4-mapped-v6 host-mask family divergence
+
+- **2026-06-21** — Folded MINOR review fixes into PR #2182: NAT host-mask family is now classified textually via `natAddrFamily` (colon => IPv6, matching Rust `IpAddr`/`Ipv4Addr`), NOT `net.ParseIP(...).To4()` — `::ffff:203.0.113.5/32` was wrongly accepted at commit but dropped by the dataplane; the NAT64-pool lenient warning now says only the offending pool address is dropped (not the whole rule); added commit-level mapped-v6 tests for both static-NAT and the NAT64 pool. Files: pkg/config/compiler_nat.go, pkg/config/compiler_nat_host_mask_test.go.
+
+## 2026-06-21 — #2173 static-NAT / NAT64 host-mask commit-time validation
+
+- **Timestamp**: 2026-06-21
+- **Action**: Added `validateNATHostMaskStrict` (strict-vs-lenient gate, `lenientNATHostMask` flag) rejecting a non-host (non-/32//128) static-NAT match/prefix or NAT64 source-pool address at commit, mirroring the Rust PR #2167 host-mask gate (NPTv6 + `inet` rules exempt). New `compiler_nat_host_mask_test.go`; doc section in `docs/config-schema.md`; fixed `TestNAT64` fixture to a /32 pool address.
+- **File(s)**: pkg/config/compiler_nat.go, pkg/config/compiler.go, pkg/config/compiler_nat_host_mask_test.go, pkg/config/parser_security_test.go, docs/config-schema.md
+
+## 2026-06-21 — #2139 review #2180: discriminating transactionality test
+
+- **Timestamp**: 2026-06-21
+- **Action**: Test-only fold for PR #2180. The independent review found the
+  headline #2139 transactionality test (TestBatch_PartialFailureRevertsWhole
+  Candidate) was TAUTOLOGICAL: its mid-batch "invalid" command
+  (`set system dataplane-type ebpf`) parses and applies to the candidate
+  fine and fails only at the whole-candidate COMPILE (eBPF-retirement
+  reject), which store.Commit already discards atomically — so the PRE-FIX
+  best-effort path passes it too. Added a DISCRIMINATING test
+  (TestBatch_UnknownCommandMidBatchRevertsWholeCandidate) whose mid-batch
+  command is an UNSUPPORTED prefix (`reboot now`) that classifyPlan rejects
+  BEFORE any candidate mutation — the genuine #2139 partial-commit case.
+  Proof: stubbing the engine back to the pre-fix apply-then-commit path
+  makes the new test fail with host-name="changed-1" / domain-name=
+  "should-not-apply" / Committed=1 (a partial commit, reboot silently
+  skipped); on the real classifyPlan fix the whole batch is rejected
+  (host-name unchanged "base", Committed=0, Rejected>=1) and the test
+  passes. Annotated the retained tautological test as a corner case. No
+  production code changed. go test ./pkg/eventengine/... green;
+  -race -count=3 clean.
+- **File(s)**: pkg/eventengine/engine_integration_test.go
+
+## 2026-06-21 — #2139/#2140/#2141/#2157 event-options robustness cluster
+
+- **Action**: Implemented the converged event-options plan — #2139 transactional batch (validate-then-commit-or-discard on the candidate), #2140 cooldown survives reload (reconcile-not-recreate keyed by name+semantic-revision, arm-on-commit), #2141 strict-reject malformed/unknown attributes-match at commit + fail-closed runtime + SSOT field set, #2157 fail-safe single-worker action queue with ErrConfigLocked backoff retry + drop/retry/commit counters. Files: pkg/eventengine/{engine,engine_test,engine_integration_test,README}.go/md, pkg/config/{event_options_match,event_options_match_test,compiler}.go, pkg/configstore/{envelope,store}.go, pkg/api/{metrics,metrics_descriptors,metrics_system,server}.go, pkg/daemon/daemon_run.go. -race + 5x flake clean.
+## 2026-06-21 — #2147 state_writer fallback path crash-safety
+
+- **Timestamp**: 2026-06-21
+- **Action**: Fixed #2147 — the userspace state_writer's sync fallback
+  (`persist_sync`) wrote the temp file via `fs::write` then renamed with
+  NO file fsync, and neither transport fsync'd the parent directory, so a
+  state snapshot could be lost or torn on power loss. Extracted one shared
+  `finalize_durably` (file fsync → atomic rename → parent-dir fsync) used
+  by BOTH the io_uring transport and the fallback, so neither can drift
+  from the durability contract. Added a `sync_all` test seam (function-
+  pointer hook) and four unit tests, mutation-verified to FAIL if either
+  fsync is deleted from the finalizer.
+- **File(s)**: userspace-dp/src/state_writer.rs,
+  userspace-dp/src/FEATURES.md
+- **Validation**: full userspace-dp test suite green (2094+46+8+16+1, 0
+  failed); new tests 5/5 flake-clean; both fsync-removal mutations fail
+  the tests.
+## 2026-06-21 — #2136 NetFlow per-flow-server export-version binding (no double-export)
+
+- **Timestamp**: 2026-06-21
+- **Action**: Fixed #2136 (deferred #2129 follow-up). A flow-server under BOTH global `version9` and `version-ipfix` was double-exported (one v9 + one IPFIX datagram to the same collector socket, mismatched 1-in-N). Bound each flow-server to exactly one export version (Junos semantics): added `FlowServer.Version`/`VersionIPFIXTemplate` + parse the per-server `version-ipfix`/`version-ipfix-template` selectors; `BuildExportConfig`/`BuildIPFIXExportConfig` now take only the flow-servers resolved to their version via shared `resolveFlowServerVersion`/`collectVersionCollectors`. Semantics for an UNBOUND server with both globals set: IPFIX wins (documented precedence — IETF-standard superset of v9; one stream not two). CLI shows IPFIX template; README/config-schema docs updated. Tests FAIL on pre-fix collect-all (mutation-verified) at both the build-config and live-reconcile/callback layers.
+- **File(s)**: pkg/config/types_system.go, pkg/config/compiler_services.go, pkg/config/schema_routing.go, pkg/config/parser_security_test.go, pkg/flowexport/manager.go, pkg/flowexport/version_binding_test.go, pkg/daemon/daemon_flowexport_reconcile_test.go, pkg/cli/cli_show_flow.go, pkg/cli/cli_show_routing.go, pkg/flowexport/README.md, docs/config-schema.md
 
 ## 2026-06-20 — #2120 PR #2166 Copilot fold (doc nits + SELF-HEAL/HOLD expect hardening)
 
@@ -148,6 +206,35 @@
   pkg/grpcapi/testdata/server_show_golden.json,
   userspace-dp/src/policy_tests.rs, docs/feature-gaps.md,
   docs/pr/2118-policy-hit-count/plan.md
+
+## 2026-06-20 — #2124 policy app-term unparseable named protocol fail-open
+
+- **Timestamp**: 2026-06-20
+- **Action**: Fixed a verified security fail-open. A policy `application`
+  term whose named L3 protocol the Rust matcher could not parse
+  (sctp/esp/ah/vrrp/igmp/pim/egp) was silently dropped and a rule whose
+  terms all dropped collapsed to match-any, permitting ALL traffic for
+  the zone pair. Fix (3 layers, per Codex r1/r2/r3 plan review):
+  (1) centralized the named->number table in `appid.ProtocolNumber`
+  (cycle-safe; dataplane/catalog delegate); (2) extended Rust
+  `parse_protocol` for the named IANA set and made an all-unparseable
+  term list raise `SnapshotIntegrityError` (whole-snapshot reject,
+  action-agnostic) instead of match-any; (3) Go capability gate now
+  rejects unrepresentable protocol/port (ForwardingSupported=false) and
+  emits a `__unsupported__` fail-closed sentinel term instead of nil so
+  the published snapshot cannot fail open in the publish-before-disarm
+  window. Rust 8 new tests + Go gate/sentinel/parity tests; full Go
+  suite green; full Rust suite green (two pre-existing concurrency flakes
+  in unrelated worker_queue/wg-engine modules verified flaky on clean
+  master). HOT-PATH/SECURITY: cluster smoke NOT run by the engineer
+  agent; parent runs the /security-matrix directional smoke after merge.
+- **File(s)**: pkg/appid/catalog.go, pkg/appid/protocol_number_2124_test.go,
+  pkg/dataplane/compiler.go, pkg/dataplane/userspace/manager.go,
+  pkg/dataplane/userspace/policies.go,
+  pkg/dataplane/userspace/protocol_failopen_2124_test.go,
+  userspace-dp/src/ip_proto.rs, userspace-dp/src/policy.rs,
+  userspace-dp/src/policy_tests.rs, docs/userspace-dataplane-gaps.md,
+  docs/pr/2124-protocol-failopen/plan.md, _Log.md
 
 ## 2026-06-20 — #2079 nat pool-utilization-alarm lenient-disable runtime parity
 
@@ -7751,3 +7838,19 @@ top.
   no dataplane smoke.
   **File(s)**: pkg/dhcpserver/dhcpserver.go, pkg/dhcpserver/dhcpserver_test.go,
   pkg/dhcpserver/README.md, docs/pr/2154-parseleasecsv/plan.md
+- **Timestamp**: 2026-06-21
+  **Action**: #2148 — route frame/tcp.rs IPv6 inspection helpers through
+  the shared ext-header walker. `frame_has_tcp_rst`,
+  `extract_tcp_flags_and_window`, and `extract_tcp_window` hard-coded IPv6
+  TCP at L3+40, so any IPv6 flow with extension headers (hop-by-hop,
+  routing, fragment, dest-opts) had RST/flags/window read from inside the
+  ext header → false diagnostics. Fix: derive the L4 offset via the
+  existing `packet_rel_l4_offset_and_protocol` (bounded ≤6 iters,
+  allocation-free, fail-safe). 16 new crafted-packet tests (plain v6 +
+  1/2 ext hdrs + fragment + malformed/looping + non-TCP-after-ext); 7
+  FAIL against pre-fix code. IPv4 + plain v6 unchanged. Diagnostics-only
+  callers today (read-only, no per-packet heap). Release build + frame::
+  suite green, 5/5 flake.
+  **File(s)**: userspace-dp/src/afxdp/frame/tcp.rs,
+  userspace-dp/src/afxdp/frame/tcp_tests.rs,
+  userspace-dp/src/afxdp/frame/README.md

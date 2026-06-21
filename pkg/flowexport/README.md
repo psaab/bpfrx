@@ -57,15 +57,51 @@ Shared:
   has a flow-server AND `services flow-monitoring version9` is configured
   (#2129). This mirrors the `BuildIPFIXExportConfig` `version-ipfix` gate.
   Before #2129 the v9 exporter started on sampling alone, emitting an
-  unrequested v9 stream to an IPFIX-only operator's collector. (Known
-  remaining gap: a flow-server configured with BOTH `version9` and
-  `version-ipfix` still double-exports to one collector — the
-  per-flow-server version-binding fix is a tracked follow-up.)
+  unrequested v9 stream to an IPFIX-only operator's collector. Its
+  collector set now contains ONLY the flow-servers bound to v9 (#2136 —
+  see "Per-flow-server export-version binding" below).
 - `BuildIPFIXExportConfig(...)` / `BuildSamplingZones(...)` — `manager.go`.
 - `SamplingDir` — `manager.go`. Direction enum.
 - `SessionCloseData` — `manager.go`. Wire shape built from
   `logging.EventReader` SESSION_CLOSE records (in
   `pkg/daemon/daemon_flow.go`).
+
+## Per-flow-server export-version binding (#2136)
+
+Junos binds each `flow-server` to exactly one export version + template.
+`BuildExportConfig` (v9) and `BuildIPFIXExportConfig` (IPFIX) therefore
+no longer flatten every flow-server into both collector sets — they each
+take only the flow-servers resolved to their own version, via the shared
+`collectVersionCollectors` / `resolveFlowServerVersion` helpers in
+`manager.go`. A given collector address:port appears in at most one of
+the two sets, so it never receives both a NetFlow v9 (version 9) AND an
+IPFIX (v10) datagram for the same flow.
+
+Before #2136 both builders returned every flow-server, and the daemon
+started both exporters against the same collector socket — each with its
+own SESSION_CLOSE callback and its own independent 1-in-N counter — so a
+flow-server reachable under both global version stanzas was exported
+twice with mismatched sampling.
+
+Resolution order for one flow-server (`resolveFlowServerVersion`):
+
+1. **Explicit per-server selector wins.** A flow-server configured with
+   `version9 { template … }` / `version9-template …` binds to v9; one
+   configured with `version-ipfix { template … }` /
+   `version-ipfix-template …` binds to IPFIX (parsed by
+   `compiler_services.go` into `FlowServer.Version`). It is then bound to
+   that version *only if* the matching global `services flow-monitoring`
+   stanza exists (the global stanza supplies template timeouts/fields); a
+   server bound to a version whose global stanza is absent exports
+   nothing and does NOT silently fall back to the other version.
+2. **Unbound server inherits the single configured global version.**
+3. **Unbound server with BOTH global versions configured → IPFIX**
+   (documented precedence). IPFIX (v10) is the IETF-standard superset of
+   NetFlow v9, so an operator who enabled both but did not pin the
+   collector gets the modern protocol — and, critically, exactly ONE
+   datagram stream rather than the pre-#2136 double-export. To send v9 to
+   such a collector, pin it explicitly with a per-server `version9`
+   selector.
 
 ## Callers
 

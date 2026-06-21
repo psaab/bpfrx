@@ -187,6 +187,21 @@ type compileOpts struct {
 	// lenientIPsecPolicyProposalRef.
 	lenientLogProfileStreamRef bool
 
+	// lenientNATHostMask (#2173) downgrades the static-NAT / NAT64
+	// host-mask gate (validateNATHostMaskStrict) from a hard compile error
+	// to a cfg.Warnings entry. Set ONLY on the tolerant load / peer-sync
+	// paths (CompileConfigLenient / CompileConfigForNodeLenient): #2132 made
+	// the Rust dataplane tolerate the canonical host mask, PR #2167 then
+	// hardened it to REJECT a non-host mask, so a config persisted/synced
+	// with a non-host static-NAT match/prefix or NAT64 pool address (which
+	// an older binary parsed-out silently, or a peer authored) must still
+	// BOOT after upgrade (warn) instead of failing closed (#1960). Commit /
+	// commit-check stay strict — a new operator edit whose rule the
+	// dataplane will silently drop is rejected loudly. The dataplane drops
+	// the bad entry independently, so a leniently-loaded config is already
+	// inert for that rule. Same doctrine as lenientNATPoolAlarmThreshold.
+	lenientNATHostMask bool
+
 	// lenientUnsupportedInterfaceStanzas (#2008 H9/H10) downgrades the
 	// interface silent-drop gate (validateUnsupportedInterfaceStanzasAST:
 	// `interface [unit] mac` static-MAC override, `family inet|inet6
@@ -231,6 +246,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientIPsecGatewayRefs:            true,
 		lenientLogProfileStreamRef:         true,
 		lenientNATPoolAlarmThreshold:       true,
+		lenientNATHostMask:                 true,
 		lenientUnsupportedInterfaceStanzas: true,
 	})
 }
@@ -314,6 +330,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientIPsecGatewayRefs:            true,
 		lenientLogProfileStreamRef:         true,
 		lenientNATPoolAlarmThreshold:       true,
+		lenientNATHostMask:                 true,
 		lenientUnsupportedInterfaceStanzas: true,
 	})
 }
@@ -679,15 +696,21 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		}
 	}
 
-	// #2008 M7: event-options attributes-match patterns are RE2 regexes
-	// (Junos `matches` semantics). Reject an uncompilable pattern at commit
-	// so the operator gets immediate feedback instead of the event engine
-	// silently dropping the constraint at runtime. On the tolerant LOAD path
-	// (#2063 review), downgrade to a warning: a config persisted under the
-	// pre-#2008 literal-equality matcher could hold a non-RE2 pattern, and an
-	// upgrading node must still boot through it (mirrors every sibling
-	// validator above). Commit stays strict.
-	if err := ValidateEventAttributesMatch(cfg); err != nil {
+	// #2008 M7 / #2141: event-options attributes-match patterns are RE2
+	// regexes (Junos `matches` semantics). The strict validator rejects at
+	// commit not only an uncompilable pattern (#2008 M7) but also a malformed
+	// match expression and an unknown <field> name (#2141) — both previously
+	// fail-open: the runtime matcher silently DROPPED the constraint, turning
+	// targeted remediation into broad config mutation while commit succeeded.
+	// Strict-reject gives the operator immediate feedback. On the tolerant
+	// LOAD path (#2063 review), downgrade to a warning: a config persisted
+	// under the pre-#2008 literal-equality matcher could hold a non-RE2
+	// pattern or a now-rejected malformed/unknown line, and an upgrading node
+	// must still boot through it (mirrors every sibling validator above). The
+	// runtime matcher then fails CLOSED on the legacy malformed line (#2141 /
+	// #2124 doctrine) so the suspicious policy does not over-fire. Commit
+	// stays strict.
+	if err := ValidateEventAttributesMatchStrict(cfg); err != nil {
 		if opts.lenientEventAttributesMatch {
 			cfg.Warnings = append(cfg.Warnings,
 				fmt.Sprintf("event-options attributes-match (downgraded to warning on tolerant path): %v", err))
@@ -761,6 +784,23 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		return nil, err
 	}
 	cfg.Warnings = append(cfg.Warnings, napWarnings...)
+
+	// #2173: static-NAT / NAT64 host-mask gate. #2132 made the Rust
+	// dataplane tolerate the canonical /32-/128 host mask and PR #2167 then
+	// hardened it to REJECT a non-host mask — so a misconfigured non-host
+	// static-NAT match/prefix or NAT64 pool address is now SILENTLY DROPPED
+	// at the dataplane (parsed-out, never installed) with no operator
+	// feedback. Strict (commit / commit-check): hard-reject a non-host mask
+	// (static NAT is strictly host-1:1, NAT64 pool entries are discrete host
+	// IPs). Lenient (load / peer-sync): warn so a config committed before
+	// this gate existed (or peer-synced) still boots (#1960
+	// fail-closed-on-compile-failure would otherwise brick restart); the
+	// dataplane drops the bad entry independently, so it is already inert.
+	hostMaskWarnings, err := validateNATHostMaskStrict(cfg, opts.lenientNATHostMask)
+	if err != nil {
+		return nil, err
+	}
+	cfg.Warnings = append(cfg.Warnings, hostMaskWarnings...)
 
 	// #1892: retired DPDK-era `system dataplane` knobs (cores, memory,
 	// socket-mem, rx-mode, ports) parse for stored-config compatibility

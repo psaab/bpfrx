@@ -164,22 +164,12 @@ func matchTuple(proto uint8, dstPort uint16, appProto, appPort string) bool {
 	return err == nil && uint16(v) == dstPort
 }
 
+// protocolNumber resolves a protocol token for app-id runtime tuple matching.
+// #2124: delegates to the centralized ProtocolNumber so this path agrees with
+// the policy capability gate and the catalog table on the full named set
+// (previously this copy recognized only tcp/udp/icmp/icmpv6/gre by name, so a
+// user-defined esp/ah/sctp application could never name-match here). The
+// (uint8, bool) contract is preserved.
 func protocolNumber(proto string) (uint8, bool) {
-	switch strings.ToLower(proto) {
-	case "tcp":
-		return 6, true
-	case "udp":
-		return 17, true
-	case "icmp":
-		return 1, true
-	case "icmpv6":
-		return 58, true
-	case "gre":
-		return 47, true
-	}
-	v, err := strconv.Atoi(proto)
-	if err != nil || v < 0 || v > 255 {
-		return 0, false
-	}
-	return uint8(v), true
+	return ProtocolNumber(proto)
 }

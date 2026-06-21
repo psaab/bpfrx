@@ -521,10 +521,16 @@ the value sits in a single typed slot:
     server whose port is `<1` or `>65535`). `flow-server` keeps `args:1` for
     the collector address and gains a children map (the typed `port` plus the
     other compiler-read children `version9-template`, `version9 { template }`,
-    `source-address`), which deliberately flips a BARE `flow-server <addr>`
-    from single-value REPLACE to named-container APPEND — benign: a bare
-    no-port server compiles `Port==0` and the snapshot builder skips it, and
-    real multi-collector configs already take the container path.
+    `version-ipfix-template`, `version-ipfix { template }`, `source-address`),
+    which deliberately flips a BARE `flow-server <addr>` from single-value
+    REPLACE to named-container APPEND — benign: a bare no-port server compiles
+    `Port==0` and the snapshot builder skips it, and real multi-collector
+    configs already take the container path. The `version9` / `version-ipfix`
+    per-server selectors bind the collector to exactly one export protocol
+    (Junos semantics, #2136); the live Go exporter routes each flow-server to a
+    single version's collector set so a collector configured under both global
+    version stanzas is never double-exported (an unbound server resolves to
+    IPFIX when both globals are set — see `pkg/flowexport/README.md`).
   - `forwarding-options allow-dataplane-sleep` (#2008 H13 Stage 1) — a
     presence-only flag (no value, `children: nil`). Previously accepted via the
     no-schema-match fall-through and silently dropped; now a typed leaf that
@@ -593,6 +599,61 @@ documented in `docs/deterministic-nat-cgnat.md`.
 NOTE: `pool-utilization-alarm` is not yet a typed `setSchema` leaf (no
 config-mode value-slot completion); the validation is compiler-side only. Adding
 schema completion is a separate, optional UX follow-up.
+
+### #2173 — static-NAT / NAT64 host-mask validation
+
+Static NAT is strictly host-1:1 and NAT64 source-pool entries are discrete host
+source IPs, so the ONLY meaningful mask on a static-NAT match/prefix or a NAT64
+pool address is the canonical host mask (`/32` for IPv4, `/128` for IPv6; a bare
+address is a host too). #2122/#2123 (PR #2132) made the Rust dataplane TOLERATE
+the canonical host mask; PR #2167 then hardened the Rust parser
+(`parse_nat_addr` in `userspace-dp/src/nat/static_nat.rs`, `parse_pool_v4` in
+`userspace-dp/src/nat64.rs`) to REJECT a non-host mask (`/24`, `/64`, garbage
+suffix, ...). The net effect before #2173 was a SILENT dataplane drop: a
+misconfigured `/24` match/prefix was parsed-out and the rule was never installed,
+with no operator feedback.
+
+`validateNATHostMaskStrict` (`pkg/config/compiler_nat.go`, invoked from the
+typed-config phase of `compileExpanded` in `compiler.go`, alongside the other
+strict-vs-lenient gates) closes that gap. The host-route rule mirrors the Rust
+gate EXACTLY (shared predicate `isHostMaskAddress`):
+
+- **Scope:** static-NAT rules' `match destination-address` (→ snapshot
+  `ExternalIP`) and `then static-nat prefix` (→ `InternalIP`) are checked with
+  the family-aware `isHostMaskAddress` (matching `parse_nat_addr`). A NAT64
+  `rule-set ... source-pool` pool's addresses are checked with the **IPv4-only**
+  `isNAT64PoolHostAddress` (matching `parse_pool_v4`, which is `Ipv4Addr`-only):
+  the pool translates to IPv4 source addresses, so an IPv6 pool entry — even a
+  `/128` — is silently dropped by the dataplane and is rejected at commit too.
+  Both predicates classify address family **textually** (`natAddrFamily`: a
+  colon means IPv6) to match the Rust `from_str` parsers exactly — Go's
+  `net.ParseIP(...).To4()` folds the IPv4-mapped `::ffff:1.2.3.4` form to v4,
+  but Rust `Ipv4Addr::from_str` rejects it and `IpAddr::from_str` classifies it
+  as V6, so the mapped form is treated as IPv6 here (never accepted as a v4 host
+  the dataplane would then silently drop).
+- **Exempt:** `then static-nat nptv6-prefix` rules (genuine RFC 6296 prefix
+  translation, never host-checked by the Rust parser) and `then static-nat
+  inet` rules (a NAT64 translation whose `match` is the well-known prefix, e.g.
+  `64:ff9b::/96`, driven by the separate NAT64 snapshot, not the static_nat
+  table). A non-IP token (an address-book name) is left to the existing address
+  handling.
+- **Strict (`commit` / `commit check`):** a non-host mask is a HARD commit error
+  naming the rule-set, rule, slot, and offending prefix.
+- **Lenient (`Store.Load` / HA peer-sync — `CompileConfigLenient` /
+  `CompileConfigForNodeLenient`, flag `lenientNATHostMask`):** the violation
+  downgrades to a `cfg.Warnings` entry so a node that committed a non-host
+  static-NAT mask BEFORE this gate existed (or a peer-synced config) still BOOTS
+  after upgrade instead of failing closed (#1960
+  fail-closed-on-compile-failure). The dataplane drops the bad entry
+  independently, so a leniently-loaded config is already inert for that rule —
+  and the operator's next strict commit rejects it loudly.
+
+Regression coverage: `pkg/config/compiler_nat_host_mask_test.go` (bare/​/32/​/128
+accept; v4 + v6 non-host match/prefix reject with asserted message; NPTv6 and
+`inet` exemptions; NAT64 source-pool host vs non-host; strict-reject /
+lenient-warn / valid-no-warning; `isHostMaskAddress` table). Like
+`pool-utilization-alarm`, this is compiler-side only — not yet a typed
+`setSchema` leaf.
 
 ## The `inactive:` universal node modifier (#2008 H1)
 

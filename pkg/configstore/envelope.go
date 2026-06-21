@@ -34,6 +34,17 @@ var ErrConfigDBUnreadable = errors.New("config DB present but unreadable")
 // avoid. See pkg/daemon/daemon_run.go.
 var ErrConfigCompile = errors.New("config DB present but does not compile")
 
+// ErrConfigLocked tags an EnterConfigure/EnterConfigureSession failure caused
+// by the candidate already being held by another session (an interactive
+// `configure`, a REST/gRPC config session, or another non-interactive
+// committer). It is a TRANSIENT condition — the lock is released when the
+// holder commits or exits — so callers that can defer should retry rather
+// than drop. The event-options engine's action worker uses errors.Is to
+// distinguish a held lock (retry with bounded backoff) from a permanent
+// failure such as a read-only secondary (#2157). The plain-text message is
+// preserved for operators that grep logs; only the error VALUE is new.
+var ErrConfigLocked = errors.New("configuration is locked by another user")
+
 // Config-DB compatibility envelope (#1917 increment B, plan §6.4 / D1).
 //
 // The envelope is EMBEDDED in active.json as a single magic header LINE

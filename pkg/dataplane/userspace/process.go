@@ -352,6 +352,14 @@ func (m *Manager) syncSnapshotLocked() error {
 		}
 		return err
 	}
+	// #2124: this is the XSK-startup deferred same-plan publish path, which
+	// publishes apply_snapshot independently of Compile(). Disarm before
+	// publishing an unsupported-config snapshot here too, so an old
+	// same-protocol-version helper that drops the `__unsupported__` sentinel
+	// cannot process the resulting match-any rule while still armed.
+	if err := m.disarmBeforeUnsupportedPublishLocked(publishSnap.Config); err != nil {
+		return err
+	}
 	var status ProcessStatus
 	if err := m.requestLocked(ControlRequest{Type: "apply_snapshot", Snapshot: &publishSnap}, &status); err != nil {
 		return fmt.Errorf("publish userspace snapshot: %w", err)
