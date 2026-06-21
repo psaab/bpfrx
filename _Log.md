@@ -8929,3 +8929,25 @@ top.
   correctness + overlap determinism + fail-on-revert all CONFIRMED both sides;
   no wire regen; 2 pre-existing pkg/dataplane canary failures unrelated).
 - **File(s)**: pkg/config/compiler_nat.go, pkg/config/compiler_nptv6_test.go
+
+- **Timestamp**: 2026-06-21
+- **Action**: #2217 — strict commit-time validation for three previously-
+  unvalidated firewall/application cross-references that each silently fail OPEN
+  at the dataplane. (A) firewall filter `then policer <name>` must resolve to a
+  defined `firewall policer` / `three-color-policer`
+  (validateFirewallPolicerReferencesStrict). (B) `applications application-set`
+  members must resolve to a defined application (user / junos-* predefined) or
+  nested set, reusing ExpandApplicationSet (validateApplicationSetMembersStrict;
+  implicit multi-term sets skipped). (C) firewall filter `then routing-instance
+  <name>` (FBF) must name a defined routing-instance
+  (validateFirewallRoutingInstanceReferencesStrict). Strict on commit/commit-
+  check; lenient (warn) on load/peer-sync via lenientFirewallRefs +
+  lenientApplicationSetMembers (#1960 no-brick). Both AST shapes. Fail-on-revert
+  proven (7 reject tests fail when validators neutered). Two pre-existing
+  firewall parse tests + the app-set cycle test updated for the now-stricter
+  compiler (genuine catches: define the steered RI / assert commit-time cycle
+  reject).
+- **File(s)**: pkg/config/compiler_validate_strict.go, pkg/config/compiler.go,
+  pkg/config/compiler_undefined_ref_2217_test.go (new),
+  pkg/config/parser_security_test.go, pkg/config/application_set_nested_test.go,
+  docs/config-schema.md

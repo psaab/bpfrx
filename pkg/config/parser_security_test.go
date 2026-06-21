@@ -202,7 +202,9 @@ routing-instances {
 	if len(cfg.RoutingInstances) != 2 {
 		t.Errorf("expected 2 routing instances, got %d", len(cfg.RoutingInstances))
 	}
-	setCommands := []string{"set firewall family inet filter test-filter term t1 from dscp af43", "set firewall family inet filter test-filter term t1 then routing-instance ATT", "set firewall family inet filter test-filter term default then accept"}
+	// `then routing-instance ATT` (FBF) now requires the routing-instance to
+	// be defined (#2217 Finding C), so define it before steering to it.
+	setCommands := []string{"set routing-instances ATT instance-type forwarding", "set firewall family inet filter test-filter term t1 from dscp af43", "set firewall family inet filter test-filter term t1 then routing-instance ATT", "set firewall family inet filter test-filter term default then accept"}
 	tree2 := &ConfigTree{}
 	for _, cmd := range setCommands {
 		path, err := ParseSetCommand(cmd)
@@ -231,7 +233,9 @@ routing-instances {
 
 func TestFirewallFilterMultiAddressSet(t *testing.T) {
 	tree := &ConfigTree{}
-	setCommands := []string{"set firewall family inet filter pbr term route from destination-address 10.255.192.40/30", "set firewall family inet filter pbr term route from destination-address 1.0.0.1/32", "set firewall family inet filter pbr term route from source-address 192.203.228.0/24", "set firewall family inet filter pbr term route from source-address 198.182.225.0/24", "set firewall family inet filter pbr term route then routing-instance sfmix"}
+	// `then routing-instance sfmix` (FBF) now requires the routing-instance to
+	// be defined (#2217 Finding C), so define it before steering to it.
+	setCommands := []string{"set routing-instances sfmix instance-type forwarding", "set firewall family inet filter pbr term route from destination-address 10.255.192.40/30", "set firewall family inet filter pbr term route from destination-address 1.0.0.1/32", "set firewall family inet filter pbr term route from source-address 192.203.228.0/24", "set firewall family inet filter pbr term route from source-address 198.182.225.0/24", "set firewall family inet filter pbr term route then routing-instance sfmix"}
 	for _, cmd := range setCommands {
 		path, err := ParseSetCommand(cmd)
 		if err != nil {
