@@ -2078,7 +2078,7 @@ pub(super) fn poll_binding_process_descriptor(
                                         );
                                     }
                                 }
-                                if (meta.tcp_flags & 0x04) != 0 {
+                                if crate::tcp_flags::has_rst(meta.tcp_flags) {
                                     // RST
                                     telemetry.dbg.fwd_tcp_rst += 1;
                                     if telemetry.dbg.fwd_tcp_rst <= 5 {
@@ -2127,7 +2127,7 @@ pub(super) fn poll_binding_process_descriptor(
                                         }
                                     }
                                 }
-                                if (meta.tcp_flags & 0x01) != 0 {
+                                if crate::tcp_flags::has_fin(meta.tcp_flags) {
                                     // FIN
                                     telemetry.dbg.fwd_tcp_fin += 1;
                                     if telemetry.dbg.fwd_tcp_fin <= 5 {

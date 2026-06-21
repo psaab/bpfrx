@@ -67,7 +67,8 @@ pub(crate) use syncookie::{
     SYN_COOKIE_MSS_MASK, SYN_COOKIE_MSS_SHIFT, SipHash24, SynCookieValidatedCache,
 };
 
-use packet::{PROTO_ICMP, PROTO_ICMPV6, PROTO_TCP, PROTO_UDP, TCP_ACK, TCP_FIN, TCP_RST, TCP_SYN};
+use crate::tcp_flags::{is_closing, is_initial_syn};
+use packet::{PROTO_ICMP, PROTO_ICMPV6, PROTO_TCP, PROTO_UDP, TCP_ACK, TCP_SYN};
 #[cfg(test)]
 use packet::TCP_URG;
 use rate::RateCounter;
@@ -264,7 +265,7 @@ impl ScreenState {
         // SYN flood: count TCP SYN (without ACK) per zone
         if profile.syn_flood_threshold > 0 && pkt.protocol == PROTO_TCP {
             let tf = pkt.tcp_flags;
-            if (tf & TCP_SYN) != 0 && (tf & TCP_ACK) == 0 {
+            if is_initial_syn(tf) {
                 let syn_cookie_validated = profile.syn_cookie
                     && self.syn_cookie_validated.take_valid(
                         zone_id,
@@ -316,7 +317,7 @@ impl ScreenState {
         // false positives on established traffic.
         if pkt.protocol == PROTO_TCP {
             let tf = pkt.tcp_flags;
-            let is_syn = (tf & TCP_SYN) != 0 && (tf & TCP_ACK) == 0;
+            let is_syn = is_initial_syn(tf);
 
             // Port scan detection: count unique dst ports per src IP
             if is_syn && profile.port_scan_threshold > 0 {
@@ -393,7 +394,7 @@ impl ScreenState {
             .get(zone)
             .copied()
             .is_some_and(|until| until > now_secs);
-        if (flags & (TCP_FIN | TCP_RST)) != 0 {
+        if is_closing(flags) {
             return if locally_active {
                 SynCookieAckVerdict::Invalid
             } else {
