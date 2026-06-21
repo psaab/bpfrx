@@ -1,5 +1,34 @@
 # Action Log
 
+## 2026-06-21 — #2211 + #2212: NAT64 zero-per-packet-alloc transit + fail-closed config parse
+
+- **Timestamp**: 2026-06-21
+- **Action**: Two-commit PR on branch fix/2211-2212-nat64.
+  (#2211 perf) Eliminated per-packet heap allocation on the NAT64 v6<->v4
+  transit translate path: added allocation-free `write_v6_to_v4_into` /
+  `write_v4_to_v6_into` cores that translate straight into a caller buffer,
+  streamed the L4 pseudo-header checksum (`checksum16_add`/`_fold`, no Vec),
+  and rewrote the frame builders to make exactly ONE output allocation (the
+  required `TxRequest.bytes`) and translate into its tail — dropping the
+  intermediate L3 Vec, the pseudo-header Vecs, and the double L4 copy.
+  `translate_v6_to_v4`/`translate_v4_to_v6` kept as thin Vec wrappers for
+  tests; output byte-identical to before.
+  (#2212 fail-closed) Replaced `Nat64State::from_snapshots` with fallible
+  `try_from_snapshots -> Result<_, SnapshotIntegrityError>`: an empty /
+  malformed / non-/96 prefix, a malformed prefix address, or a pool address
+  that is neither bare IPv4 nor /32 now rejects the whole snapshot
+  (`Nat64UnparseableRule`) instead of silently `continue`/`filter_map`
+  dropping it; forwarding_build propagates with `?` so the reconcile/refresh
+  preflights keep the previous live state. Helper-boundary backstop to the Go
+  #2173 commit-time gate. Tests fail-on-revert verified for both fixes;
+  44 nat64 tests green 5x; full lib suite 2199+46+8+16+1 pass; go test
+  ./pkg/config ./pkg/dataplane/userspace pass. NAT64 transit smoke
+  PENDING-PARENT (standalone DUT cannot forward per #2169; forward path
+  live-validated in #2132).
+- **File(s)**: userspace-dp/src/nat64.rs, userspace-dp/src/nat64_tests.rs,
+  userspace-dp/src/policy.rs, userspace-dp/src/afxdp/forwarding_build/mod.rs,
+  userspace-dp/src/FEATURES.md
+
 ## 2026-06-21 — #2222: address-book described-entry prefix corruption
 
 - **Timestamp**: 2026-06-21
