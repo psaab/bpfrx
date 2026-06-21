@@ -330,6 +330,104 @@ fn invalid_snapshot_rejected_fail_closed() {
     assert_eq!(ok.outbound.len(), 2);
 }
 
+#[test]
+fn overlapping_prefixes_rejected_fail_closed() {
+    // #2241 fail-on-revert: a /48 and a nested /64 with the same internal
+    // base overlap in the outbound (internal) direction; first-match insertion
+    // order would make the translation identity order-dependent. Reject at
+    // build time so the dataplane stays deterministic. Pre-fix BOTH rules
+    // installed and resolution depended purely on insertion order.
+    let rule_a = Nptv6RuleSnapshot {
+        name: "broad-48".to_string(),
+        from_zone: String::new(),
+        internal_prefix: "fd00:1::/48".to_string(),
+        external_prefix: "2001:db8:1::/48".to_string(),
+    };
+    let rule_b = Nptv6RuleSnapshot {
+        name: "nested-64".to_string(),
+        from_zone: String::new(),
+        internal_prefix: "fd00:1:0:1234::/64".to_string(),
+        external_prefix: "2001:db8:ffff:1234::/64".to_string(),
+    };
+
+    // /48 first, nested /64 second — overlap detected on the internal prefix.
+    let err = Nptv6State::try_from_snapshots(&[rule_a.clone(), rule_b.clone()])
+        .expect_err("overlapping internal prefixes must reject the snapshot");
+    match err {
+        SnapshotIntegrityError::Nptv6OverlappingPrefix {
+            first_rule,
+            second_rule,
+            ..
+        } => {
+            assert_eq!(first_rule, "broad-48");
+            assert_eq!(second_rule, "nested-64");
+        }
+        other => panic!("expected Nptv6OverlappingPrefix, got {other:?}"),
+    }
+
+    // Reordered — still rejected (determinism does not depend on order).
+    let err = Nptv6State::try_from_snapshots(&[rule_b, rule_a])
+        .expect_err("reordered overlapping prefixes must also reject");
+    assert!(
+        matches!(err, SnapshotIntegrityError::Nptv6OverlappingPrefix { .. }),
+        "expected Nptv6OverlappingPrefix, got {err:?}"
+    );
+}
+
+#[test]
+fn overlapping_external_prefixes_rejected() {
+    // Overlap only on the external (inbound) prefix — distinct internal
+    // prefixes but the inbound dst match would be order-dependent.
+    let rule_a = Nptv6RuleSnapshot {
+        name: "ext-48".to_string(),
+        from_zone: String::new(),
+        internal_prefix: "fd00:1::/48".to_string(),
+        external_prefix: "2001:db8:1::/48".to_string(),
+    };
+    let rule_b = Nptv6RuleSnapshot {
+        name: "ext-64".to_string(),
+        from_zone: String::new(),
+        internal_prefix: "fd00:2::/64".to_string(),
+        external_prefix: "2001:db8:1:5678::/64".to_string(),
+    };
+    let err = Nptv6State::try_from_snapshots(&[rule_a, rule_b])
+        .expect_err("overlapping external prefixes must reject the snapshot");
+    match err {
+        SnapshotIntegrityError::Nptv6OverlappingPrefix { direction, .. } => {
+            assert_eq!(direction, "inbound (external)");
+        }
+        other => panic!("expected inbound Nptv6OverlappingPrefix, got {other:?}"),
+    }
+}
+
+#[test]
+fn non_overlapping_distinct_prefixes_accepted() {
+    // Distinct /48s and a non-nested /64 must all build (no false-positive
+    // overlap rejection).
+    let state = Nptv6State::try_from_snapshots(&[
+        Nptv6RuleSnapshot {
+            name: "a".to_string(),
+            from_zone: String::new(),
+            internal_prefix: "fd00:1::/48".to_string(),
+            external_prefix: "2001:db8:1::/48".to_string(),
+        },
+        Nptv6RuleSnapshot {
+            name: "b".to_string(),
+            from_zone: String::new(),
+            internal_prefix: "fd00:2::/48".to_string(),
+            external_prefix: "2001:db8:2::/48".to_string(),
+        },
+        Nptv6RuleSnapshot {
+            name: "c".to_string(),
+            from_zone: String::new(),
+            internal_prefix: "fd00:3:4:5::/64".to_string(),
+            external_prefix: "2001:db8:3:4::/64".to_string(),
+        },
+    ])
+    .expect("distinct non-overlapping prefixes must build");
+    assert_eq!(state.inbound.len(), 3);
+    assert_eq!(state.outbound.len(), 3);
+}
 
 #[test]
 fn real_world_prefixes() {

@@ -25,6 +25,13 @@
 //!   helper-boundary backstop to the Go commit-time gate
 //!   (`pkg/config/compiler_nat.go`, #2240), consistent with the
 //!   #2124/#2142/#2173/#2212 fail-closed family.
+//! * **Reject overlapping prefixes — deterministic translation (#2241).**
+//!   `translate_inbound`/`translate_outbound` resolve a match by FIRST hit in
+//!   insertion order with no longest-prefix-match. Two rules whose prefixes
+//!   overlap in the same direction (e.g. a /48 and a nested /64) would make the
+//!   translation identity depend purely on rule order. `try_from_snapshots`
+//!   rejects an overlapping pair so resolution stays deterministic. The Go
+//!   commit-time gate (#2241) is primary; this is the helper-boundary backstop.
 
 use crate::Nptv6RuleSnapshot;
 use crate::policy::SnapshotIntegrityError;
@@ -138,7 +145,8 @@ fn parse_prefix(s: &str) -> Option<([u16; 4], usize)> {
 
 impl Nptv6State {
     /// Build from config snapshot NPTv6 rules, failing CLOSED on an
-    /// unparseable / unsupported / mismatched rule (#2240).
+    /// unparseable / unsupported / mismatched rule (#2240) and on overlapping
+    /// prefixes (#2241).
     ///
     /// In a retired-eBPF world (#1373) the userspace helper is the enforcement
     /// plane. The pre-fix parser silently `continue`d past a bad rule, and the
@@ -150,14 +158,18 @@ impl Nptv6State {
     /// helper-boundary backstop, consistent with the #2124/#2142/#2173/#2212
     /// fail-closed family.
     ///
-    /// On any unparseable rule this returns a `SnapshotIntegrityError`; the
-    /// apply preflight (`forwarding_build`/`reconcile`/`refresh`) then keeps the
-    /// previous live forwarding state rather than installing a narrower NPTv6
-    /// config.
+    /// On any unparseable rule or overlapping pair this returns a
+    /// `SnapshotIntegrityError`; the apply preflight
+    /// (`forwarding_build`/`reconcile`/`refresh`) then keeps the previous live
+    /// forwarding state rather than installing a narrower / nondeterministic
+    /// NPTv6 config.
     pub(crate) fn try_from_snapshots(
         snaps: &[Nptv6RuleSnapshot],
     ) -> Result<Self, SnapshotIntegrityError> {
         let mut state = Nptv6State::default();
+        // Track (prefix, prefix_words, rule_name) to reject overlaps (#2241).
+        let mut internal_seen: Vec<([u16; 4], usize, String)> = Vec::with_capacity(snaps.len());
+        let mut external_seen: Vec<([u16; 4], usize, String)> = Vec::with_capacity(snaps.len());
         for snap in snaps {
             let (internal_prefix, iwords) = match parse_prefix(&snap.internal_prefix) {
                 Some(v) => v,
@@ -193,6 +205,31 @@ impl Nptv6State {
                     ),
                 });
             }
+            // #2241: reject overlapping prefixes in either direction so the
+            // first-match dataplane resolution stays deterministic. Outbound
+            // matches on the internal prefix; inbound matches on the external
+            // prefix; check each independently.
+            if let Some(prev) =
+                find_overlap(&internal_seen, &internal_prefix, iwords)
+            {
+                return Err(SnapshotIntegrityError::Nptv6OverlappingPrefix {
+                    first_rule: prev,
+                    second_rule: snap.name.clone(),
+                    direction: "outbound (internal)",
+                });
+            }
+            if let Some(prev) =
+                find_overlap(&external_seen, &external_prefix, ewords)
+            {
+                return Err(SnapshotIntegrityError::Nptv6OverlappingPrefix {
+                    first_rule: prev,
+                    second_rule: snap.name.clone(),
+                    direction: "inbound (external)",
+                });
+            }
+            internal_seen.push((internal_prefix, iwords, snap.name.clone()));
+            external_seen.push((external_prefix, ewords, snap.name.clone()));
+
             let adjustment = compute_adjustment(&internal_prefix, &external_prefix, iwords);
 
             let rule = Nptv6Rule {
@@ -213,7 +250,8 @@ impl Nptv6State {
     /// Infallible test convenience wrapper over [`try_from_snapshots`] (#2240).
     /// Panics on a snapshot integrity error, which valid test snapshots never
     /// produce. Production builds the state through `try_from_snapshots` so an
-    /// unparseable rule rejects the snapshot and keeps the previous live state.
+    /// unparseable rule or an overlapping pair rejects the snapshot and keeps
+    /// the previous live state.
     #[cfg(test)]
     pub(crate) fn from_snapshots(snaps: &[Nptv6RuleSnapshot]) -> Self {
         Self::try_from_snapshots(snaps)
@@ -295,6 +333,27 @@ fn prefix_matches(addr_words: &[u16; 8], prefix: &[u16; 4], prefix_words: usize)
         }
     }
     true
+}
+
+/// #2241: returns the name of an already-seen rule whose prefix OVERLAPS the
+/// candidate prefix, or `None` if there is no overlap. Two prefixes overlap
+/// when one is a prefix of the other — i.e. their first `min(words_a, words_b)`
+/// 16-bit words are equal. This covers identical /48-/48, identical /64-/64, and
+/// a /48 nesting a /64 (the case that makes first-match resolution
+/// order-dependent). Each direction (internal for outbound, external for
+/// inbound) is checked independently by the caller.
+fn find_overlap(
+    seen: &[([u16; 4], usize, String)],
+    candidate: &[u16; 4],
+    candidate_words: usize,
+) -> Option<String> {
+    for (prefix, words, name) in seen {
+        let common = candidate_words.min(*words);
+        if candidate[..common] == prefix[..common] {
+            return Some(name.clone());
+        }
+    }
+    None
 }
 
 #[cfg(test)]

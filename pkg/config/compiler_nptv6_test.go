@@ -5,15 +5,19 @@ import (
 	"testing"
 )
 
-// #2240: commit-time validation for NPTv6 (RFC 6296) static-NAT rules.
+// #2240/#2241: commit-time validation for NPTv6 (RFC 6296) static-NAT rules.
 //
-// The dataplane compiler (compileNPTv6) historically logged a warning and
-// `continue`d past a malformed NPTv6 rule, then called DeleteStaleNPTv6 over
-// only the VALID subset — so editing one previously-good rule into an invalid
-// one tore down its working translation entry with no replacement (a fail-OPEN
-// that silently disabled a working translation on a typo). The strict commit
-// gate now hard-rejects so the operator sees the misconfiguration and the
-// previous forwarding state is preserved.
+// #2240 (fail-closed): the dataplane compiler (compileNPTv6) historically
+// logged a warning and `continue`d past a malformed NPTv6 rule, then called
+// DeleteStaleNPTv6 over only the VALID subset — so editing one previously-good
+// rule into an invalid one tore down its working translation entry with no
+// replacement (a fail-OPEN that silently disabled a working translation on a
+// typo). The strict commit gate now hard-rejects so the operator sees the
+// misconfiguration and the previous forwarding state is preserved.
+//
+// #2241 (overlap): NPTv6 supports /48 and /64 rules; the runtime resolved a
+// match by first-hit insertion order with no LPM, so an overlapping pair
+// translated nondeterministically. The strict gate rejects overlaps.
 //
 // All tests use the production ParseSetCommand + SetPath path (buildTree),
 // never NewParser (the flat-set gotcha in CLAUDE.md).
@@ -145,15 +149,87 @@ func TestNPTv6RejectsNonIPv6(t *testing.T) {
 	}
 }
 
+// TestNPTv6RejectsOverlappingInternal is the #2241 FAIL-ON-REVERT proof for the
+// outbound (internal) direction: a broad /48 and a nested /64 with the same
+// internal base overlap, so first-match insertion order would shadow the /64.
+func TestNPTv6RejectsOverlappingInternal(t *testing.T) {
+	tree := buildTree(t, nptv6Set(
+		[3]string{"broad", "2001:db8:1::/48", "fd00:1::/48"},
+		[3]string{"nested", "2001:db8:ffff:1234::/64", "fd00:1:0:1234::/64"},
+	))
+	_, err := CompileConfig(tree)
+	if err == nil {
+		t.Fatal("overlapping NPTv6 internal prefixes (/48 nesting /64) must be rejected at commit; " +
+			"pre-fix both installed and resolution depended on insertion order")
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "overlaps") || !strings.Contains(msg, "nested") || !strings.Contains(msg, "broad") {
+		t.Fatalf("error must name both overlapping rules, got: %v", err)
+	}
+}
+
+// TestNPTv6RejectsOverlappingExternal: distinct internal prefixes but the
+// external (inbound) prefixes overlap.
+func TestNPTv6RejectsOverlappingExternal(t *testing.T) {
+	tree := buildTree(t, nptv6Set(
+		[3]string{"ext48", "2001:db8:1::/48", "fd00:1::/48"},
+		[3]string{"ext64", "2001:db8:1:5678::/64", "fd00:2::/64"},
+	))
+	_, err := CompileConfig(tree)
+	if err == nil {
+		t.Fatal("overlapping NPTv6 external prefixes must be rejected at commit")
+	}
+	if !strings.Contains(err.Error(), "match destination-address") ||
+		!strings.Contains(err.Error(), "overlaps") {
+		t.Fatalf("error must name the inbound/external overlap, got: %v", err)
+	}
+}
+
+// TestNPTv6RejectsOverlapOrderIndependent: the same overlapping pair must be
+// rejected regardless of insertion order (determinism is the point of #2241).
+func TestNPTv6RejectsOverlapOrderIndependent(t *testing.T) {
+	forward := buildTree(t, nptv6Set(
+		[3]string{"broad", "2001:db8:1::/48", "fd00:1::/48"},
+		[3]string{"nested", "2001:db8:ffff:1234::/64", "fd00:1:0:1234::/64"},
+	))
+	reverse := buildTree(t, nptv6Set(
+		[3]string{"nested", "2001:db8:ffff:1234::/64", "fd00:1:0:1234::/64"},
+		[3]string{"broad", "2001:db8:1::/48", "fd00:1::/48"},
+	))
+	if _, err := CompileConfig(forward); err == nil {
+		t.Fatal("overlap (broad-then-nested) must be rejected")
+	}
+	if _, err := CompileConfig(reverse); err == nil {
+		t.Fatal("overlap (nested-then-broad) must also be rejected — determinism is order-independent")
+	}
+}
+
+// TestNPTv6IdenticalPrefixesRejected: two rules with the same /48 prefix in a
+// direction is the degenerate overlap.
+func TestNPTv6IdenticalPrefixesRejected(t *testing.T) {
+	tree := buildTree(t, nptv6Set(
+		[3]string{"r1", "2001:db8:1::/48", "fd00:1::/48"},
+		[3]string{"r2", "2001:db8:9::/48", "fd00:1::/48"}, // same internal prefix
+	))
+	_, err := CompileConfig(tree)
+	if err == nil {
+		t.Fatal("two NPTv6 rules with the same internal prefix must be rejected (identical-prefix overlap)")
+	}
+}
+
 // TestNPTv6LenientLoadAccepts is the #1960 no-brick guarantee: a config
-// committed before this gate existed (or peer-synced) carrying a malformed
-// NPTv6 rule must LOAD under the lenient path with the violation downgraded to
-// a warning, never a hard compile failure.
+// committed before this gate existed (or peer-synced) carrying a malformed or
+// overlapping NPTv6 rule must LOAD under the lenient path with the violation
+// downgraded to a warning, never a hard compile failure.
 func TestNPTv6LenientLoadAccepts(t *testing.T) {
 	cases := [][]string{
 		nptv6Set([3]string{"r1", "2001:db8:1::/48", "fd00:1:2::/64"}), // mismatched
 		nptv6Set([3]string{"r1", "not-a-prefix", "fd00:1::/48"}),      // unparseable
 		nptv6Set([3]string{"r1", "2001:db8:1::/56", "fd00:1::/56"}),   // unsupported len
+		nptv6Set( // overlap
+			[3]string{"broad", "2001:db8:1::/48", "fd00:1::/48"},
+			[3]string{"nested", "2001:db8:ffff:1234::/64", "fd00:1:0:1234::/64"},
+		),
 	}
 	for i, lines := range cases {
 		if _, err := CompileConfig(buildTree(t, lines)); err == nil {
