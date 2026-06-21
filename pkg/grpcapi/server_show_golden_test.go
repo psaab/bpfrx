@@ -83,6 +83,11 @@ var goldenShowTopics = []string{
 	"test-policy:from=trust,to=untrust,src=10.0.1.1,dst=10.0.2.1,port=80,proto=tcp",
 	"test-routing:dest=10.0.2.1",
 	"test-zone:interface=ge-0-0-0.0",
+	// #2118: lock the per-policy hit-count table so a future all-0 /
+	// gate regression in the rendered table fails the golden. The golden
+	// config has `policy-stats system-wide enable` set (showGolden-
+	// ConfigCommands) so the table renders the policy-stats-gated path.
+	"policies-hit-count",
 	"firewall-filter:bandwidth-output",
 	"firewall-filter:bandwidth-output:inet",
 	// switch cases (cfg-rendered)
@@ -174,6 +179,9 @@ var showGoldenConfigCommands = []string{
 	"security policies from-zone trust to-zone untrust policy p1 match destination-address any",
 	"security policies from-zone trust to-zone untrust policy p1 match application any",
 	"security policies from-zone trust to-zone untrust policy p1 then permit",
+	// #2118: enable policy-stats so the policies-hit-count golden topic
+	// renders the gated display path (counters read from the dataplane).
+	"security policy-stats system-wide enable",
 	"security alg sip disable",
 	"security dynamic-address feed-server office url http://example.com/feed feed-name blocklist",
 	"security address-book global address host1 10.0.1.1/32",
