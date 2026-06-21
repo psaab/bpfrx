@@ -17,9 +17,12 @@ package config
 // carry `port` (taking the container path already). The `port` value feeds
 // the Rust u16 CollectorPort wire field; Layer A skips a server whose port
 // is <1 or >65535, so the bound is [1, 65535]. version9-template /
-// version9 { template } / source-address are the other children the
-// sampling compiler reads (compiler_services.go compileSamplingFamily) —
-// declared so completion does not silently drop them.
+// version9 { template } / version-ipfix-template / version-ipfix
+// { template } / source-address are the other children the sampling
+// compiler reads (compiler_services.go compileSamplingFamily) — declared
+// so completion does not silently drop them. A per-server version9 /
+// version-ipfix selector binds THIS collector to exactly one export
+// protocol (Junos semantics, #2136).
 func samplingFlowServerNode() *schemaNode {
 	return &schemaNode{
 		desc: "Flow collector address", args: 1, placeholder: "<address>",
@@ -30,6 +33,10 @@ func samplingFlowServerNode() *schemaNode {
 			"version9-template": {desc: "NetFlow v9 template name for this collector", args: 1, placeholder: "<template-name>", children: nil},
 			"version9": {desc: "NetFlow v9 export options", children: map[string]*schemaNode{
 				"template": {desc: "NetFlow v9 template name", args: 1, placeholder: "<template-name>", children: nil},
+			}},
+			"version-ipfix-template": {desc: "IPFIX template name for this collector", args: 1, placeholder: "<template-name>", children: nil},
+			"version-ipfix": {desc: "IPFIX export options", children: map[string]*schemaNode{
+				"template": {desc: "IPFIX template name", args: 1, placeholder: "<template-name>", children: nil},
 			}},
 			"source-address": {desc: "Source address for exported flows", args: 1, placeholder: "<address>", children: nil},
 		},
