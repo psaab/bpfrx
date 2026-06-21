@@ -1,6 +1,41 @@
 # #2124 — Policy application term with an unparseable named protocol fails OPEN to match-any
 
-**Status:** DRAFT v1 — pending adversarial plan review
+**Status:** DRAFT v2 — Codex r1 PLAN-NEEDS-MAJOR addressed; pending r2
+
+## v2 changelog (addresses Codex r1 PLAN-NEEDS-MAJOR)
+
+Codex r1 (task-mqn9wfro-ef9dsh) returned PLAN-NEEDS-MAJOR with three
+findings, all valid and verified against source:
+
+1. **`validateProtocol` is warning-only — the Go capability gate is
+   LOAD-BEARING, not optional.** v1 falsely claimed truly-unknown
+   protocols are already a hard commit error. They are NOT
+   (`compiler.go` appends a warning; `CommitCheck`/`store.go` never
+   promotes app-protocol warnings to errors; `parser_ast_test.go`
+   asserts warning-only). → Layer G (capability gate) is promoted to
+   the **PRIMARY** fix.
+2. **Action-blind `never_match` is NOT universally fail-closed.** A
+   malformed `deny`/`reject` rule that stops matching lets traffic fall
+   through to a later permit / default-permit. AND Rust drops terms for
+   bad PORTS too (port validation also warning-only), so a blanket
+   all-dropped guard would change standard-path behavior for invalid-
+   port deny rules. → Drop per-rule action-blind `never_match` as the
+   primary mechanism. Make the gate (action-agnostic whole-config
+   refuse-to-arm) primary; the Rust residual backstop uses a
+   whole-snapshot `SnapshotIntegrityError` (reject snapshot, keep
+   last-good) which is action-agnostic.
+3. **Duplicate protocol maps are a divergence hazard.** Go ALREADY has
+   complete named→number maps: `pkg/dataplane.protocolNumber`
+   (compiler.go:1196) and `pkg/appid.catalogProtocolNumber`
+   (catalog.go:128), both covering esp/ah/sctp/vrrp/igmp/pim/egp +
+   junos aliases. → Do NOT add a third map. Centralize via an exported
+   `(uint8, bool)` variant and reuse it; preserve numeric `0`.
+
+The v1 design below is superseded by §4'/§5' (primed sections). The
+original §4/§5 are retained for history but marked SUPERSEDED.
+
+---
+
 
 ## 1. Issue framing (in my words)
 
@@ -75,7 +110,153 @@ introduces a worse hazard", which IS a valid verdict.)*
   protocol would freeze the whole policy plane — wrong granularity.
   Rejected in favor of per-rule fail-closed (§5.2).
 
-## 4. Decision: which layer(s) fix it
+## 4'. Decision: which layer(s) fix it (v2 — PRIMED)
+
+Three layers, with the **Go capability gate as the PRIMARY,
+action-agnostic fix** (Codex r1 F1/F2):
+
+- **Layer G (Go capability gate — PRIMARY):** make
+  `expandUserspacePolicyApplications` (manager.go:1712) reject any
+  application term whose protocol OR ports the Rust matcher cannot
+  represent. Returning `ok=false` trips the EXISTING, deliberate
+  `userspaceSupportsSecurityPolicies → ForwardingSupported=false`
+  whole-config fail-closed gate (manager.go:1479,1556). This is
+  ACTION-AGNOSTIC: nothing arms, so both `permit` AND `deny` rules are
+  honored-or-nothing-forwards. There is no permit/deny asymmetry, no
+  fall-through, no over-match. It is also OPERATOR-VISIBLE (forwarding
+  refuses to arm — surfaced in status) rather than a silent per-rule
+  runtime outcome. For the protocols we now SUPPORT (esp/ah/sctp/...),
+  Layer G canonicalizes them to numeric strings the Rust matcher
+  already parses, so the gate stays `ok=true` and they WORK. Only
+  TRULY-unrepresentable terms (unknown protocol, malformed port) trip
+  the gate.
+
+- **Layer R (Rust — make the named set work + last-resort backstop):**
+  (a) extend `parse_protocol` to map the named IANA protocols to their
+  numbers, so a snapshot carrying a named protocol (e.g. an
+  un-canonicalized or hand-crafted snapshot, or a future direct path)
+  still matches correctly rather than fails open. (b) Backstop: if a
+  rule's `application_terms` are NON-empty but ALL drop as unparseable
+  (which Layer G should now prevent end-to-end), raise a
+  `SnapshotIntegrityError` so the whole snapshot is rejected and the
+  previous good state is kept (the existing preflight path,
+  snapshot_refresh.rs:69). This is ACTION-AGNOSTIC (no per-rule
+  permit/deny asymmetry) and never silently collapses a rule to
+  match-any. It only fires on a corrupt/inconsistent snapshot that
+  bypassed Layer G — a true integrity violation, the correct trigger
+  for that mechanism.
+
+- **Centralization (Codex r1 F3):** add an exported
+  `dataplane.ProtocolNumber(name string) (uint8, bool)` and refactor
+  the existing `protocolNumber` + `pkg/appid.catalogProtocolNumber` to
+  delegate to one source of truth, eliminating the divergence hazard.
+  Layer G uses it to canonicalize/validate. `ProtocolNumber` returns
+  `(n, true)` for a valid name OR a `0..255` numeric (INCLUDING `"0"` /
+  HOPOPT, preserving the deliberate-`protocol 0` case Codex flagged),
+  and `(0, false)` only for a genuinely unrepresentable token.
+
+- **Layer C (commit-time):** OUT OF SCOPE for the fix; documented as a
+  known property. `validateProtocol` already accepts the named set
+  (warning-only); with Layers G+R they now work end-to-end. A
+  truly-unknown protocol still warns at commit and then trips Layer G's
+  refuse-to-arm at apply — operator-visible at apply time. A stricter
+  commit-time hard reject (#1960 doctrine) is a reasonable follow-up
+  but is deferred (Q5) to keep this PR a focused security fix.
+
+## 5'. Concrete design (v2 — PRIMED)
+
+### 5'.1 Centralize the named→number map (`pkg/dataplane`)
+
+`pkg/dataplane/compiler.go` currently has `protocolNumber(name) uint8`
+returning `0` for BOTH unknown and `"0"`. Add:
+
+```go
+// ProtocolNumber resolves an IANA protocol name or numeric string to its
+// number. ok=false means the token is neither a known name nor a valid
+// 0..255 numeric (so 0/HOPOPT resolves to (0, true), distinct from the
+// unrepresentable (0, false) case).
+func ProtocolNumber(name string) (uint8, bool) { ... }
+```
+
+`protocolNumber` becomes `n, _ := ProtocolNumber(name); return n`
+(behavior-preserving). `pkg/appid.catalogProtocolNumber` is refactored
+to delegate to `dataplane.ProtocolNumber` (it mirrors the same table per
+its own doc comment) — eliminating the third copy. A parity test asserts
+the two former tables agree with the centralized one for the full named
+set + boundary numerics (0, 255, 256→false, ""→false).
+
+### 5'.2 Layer G: validate protocol AND ports in the capability gate
+
+In `expandUserspacePolicyApplications` (manager.go:1712), after
+resolving each application, validate representability BEFORE building the
+snapshot term:
+
+```go
+proto := normalizeUserspaceApplicationProtocol(app.Protocol)
+if proto == "" {
+    return nil, false               // existing empty-protocol gate
+}
+// NEW: protocol must be representable by the Rust matcher.
+num, ok := dataplane.ProtocolNumber(proto)
+if !ok {
+    return nil, false               // unrepresentable -> fail closed (refuse to arm)
+}
+// Canonicalize named protocols to their number so the wire snapshot is
+// always Rust-parseable (belt-and-suspenders for mixed-version helpers).
+proto = strconv.Itoa(int(num))
+// NEW: ports must parse the way the Rust parse_port_spec does.
+if !userspacePortSpecRepresentable(app.SourcePort) ||
+   !userspacePortSpecRepresentable(app.DestinationPort) {
+    return nil, false               // malformed port -> fail closed
+}
+```
+
+`userspacePortSpecRepresentable` mirrors Rust `parse_port_spec`
+(empty=ok; named service aliases http/https/...; single 1..65535;
+`low-high` with `low>0 && low<=high`). This closes the bad-PORT
+fail-open (Codex r1 F2) at the same action-agnostic gate.
+
+`normalizeUserspaceApplicationProtocol` keeps its `icmp6→icmpv6` mapping;
+the numeric canonicalization happens via `ProtocolNumber` above so we do
+NOT add a fourth named-protocol list to it.
+
+### 5'.3 Layer R(a): extend Rust `parse_protocol`
+
+Add named arms (numbers from `ip_proto.rs`, with new constants
+`PROTO_IGMP=2 PROTO_EGP=8 PROTO_AH=51 PROTO_PIM=103 PROTO_VRRP=112
+PROTO_SCTP=132`):
+
+```rust
+"esp" => Some(PROTO_ESP), "ah" => Some(PROTO_AH),
+"sctp" => Some(PROTO_SCTP), "vrrp" => Some(PROTO_VRRP),
+"igmp" => Some(PROTO_IGMP), "pim" => Some(PROTO_PIM),
+"egp" => Some(PROTO_EGP), "icmp6" => Some(PROTO_ICMPV6), // alias
+```
+
+Numeric `_ => parse::<u8>()` preserved (so `"0"`/`"132"` still parse).
+
+### 5'.4 Layer R(b): residual backstop via SnapshotIntegrityError
+
+`parse_applications` reports whether it had terms and dropped all of
+them. `parse_policy_state_with_counters` (the only constructor of rules,
+already returns `Result<_, SnapshotIntegrityError>`) raises a new
+`SnapshotIntegrityError::UnrepresentableApplicationProtocol { rule_id,
+protocol }` when a rule has NON-empty `application_terms` but ALL terms
+dropped. The preflight (snapshot_refresh.rs:69) already rejects the
+whole snapshot and keeps previous state on any integrity error — so a
+corrupt snapshot that slipped past Layer G fails closed action-
+agnostically instead of collapsing a rule to match-any.
+
+Genuine-empty `application_terms` (Junos `application any` / no
+`match application`) is UNCHANGED → match-any (correct). The default
+rule and `PolicyRule::default()` keep `match_any:true, never_match
+absent` — no new field on the hot struct; the integrity check lives in
+the parser, not in `matches()` (zero per-packet cost). This also means
+NO `matches()` signature/branch change and NO #2008-style per-rule flag
+— simpler than v1.
+
+### 4./5. (v1, SUPERSEDED — retained for history)
+
 
 Per the issue's "Suggested fix", BOTH complementary layers, because each
 covers a different failure mode and the defense-in-depth matches the
@@ -288,9 +469,50 @@ scope (Q5).
 | Performance regression | LOW | One extra `bool` branch in `matches()`; parse path is config-apply, not per-packet forward. |
 | Architectural mismatch | LOW | Directly mirrors the shipped #2008 `*_empty` fail-closed pattern — same author-intended design, same struct. Not a novel architecture. |
 
-## 9. Test plan
+## 9'. Test plan (v2 — PRIMED)
 
 Rust (`userspace-dp/src/policy_tests.rs`):
+- **Known named protocol now matches** — a rule with one term
+  `{protocol:"sctp", destination_port:"9999"}` permits SCTP/9999 and
+  DENIES TCP/443 (proves R(a), NOT match-any). Repeat for `esp`
+  (protocol-only, no port) → permits ESP, denies TCP. **Non-tautological:**
+  on pre-fix code the term drops → match-any → TCP/443 wrongly Permit.
+- **Numeric still parses** — `{protocol:"132"}` permits SCTP, denies TCP.
+- **All-dropped raises SnapshotIntegrityError** — a rule with NON-empty
+  `application_terms` all unparseable
+  (`{protocol:"definitely-not-a-proto"}`) makes
+  `parse_policy_state_with_counters` return
+  `Err(UnrepresentableApplicationProtocol{..})`. **Non-tautological:**
+  pre-fix it returns Ok with a match-any rule.
+- **Genuine-empty stays match-any (Ok)** — empty `application_terms`
+  parses Ok and match-anys (regression guard; default behavior).
+- **Mixed parseable+unparseable** — terms `[{esp},{bogus}]`: with R(a)
+  esp parses → ≥1 real term → Ok, NOT all-dropped, matches ESP. (The
+  bogus term still drops; rule is not all-dropped so no integrity
+  error — consistent with Layer G being the front-line reject.)
+- **`PolicyRule::default()` unchanged** — match-any preserved.
+- `cargo test --release` green; 5/5 flake on the new integrity-error
+  test.
+
+Go (`pkg/dataplane/`, `pkg/dataplane/userspace/`, `pkg/appid/`):
+- **`ProtocolNumber` parity** — for the full named set + junos aliases,
+  `ProtocolNumber` agrees with the old `protocolNumber` and
+  `catalogProtocolNumber`; `("0")→(0,true)`, `("256")→(0,false)`,
+  `("")→(0,false)`, `("bogus")→(0,false)`.
+- **Gate fails closed on unknown protocol** — an app with protocol
+  `"bogus"` → `expandUserspacePolicyApplications` returns `ok=false` →
+  `userspaceSupportsSecurityPolicies` false → `ForwardingSupported`
+  false. **Non-tautological:** pre-fix `ok=true`.
+- **Gate fails closed on malformed port** — app with
+  `DestinationPort:"99999"` (or `"5-1"`) → `ok=false`.
+- **Gate canonicalizes + accepts named protocol** — app with `esp` →
+  `ok=true`, emitted snapshot term Protocol == `"50"`.
+- **Existing working configs unchanged** — tcp/udp/icmp/gre/ospf +
+  numeric still `ok=true`.
+- `go test ./pkg/dataplane/... ./pkg/appid/... ./pkg/config/...` green.
+
+### 9. (v1, SUPERSEDED)
+
 1. **Known named protocol now matches** — a permit rule with one
    application term `{protocol:"sctp", destination_port:"9999"}` permits
    SCTP/9999 and DENIES TCP/443 (proves R(a) + that it is NOT match-any).
