@@ -2198,6 +2198,20 @@ pub(super) fn poll_binding_process_descriptor(
                         if decision.nat.rewrite_dst.is_some() {
                             telemetry.counters.dnat_packets += 1;
                         }
+                        // #2161: count every NAT64-translated forwarded packet
+                        // here, the single forward-candidate site reached by
+                        // both directions of a NAT64 flow (v6->v4 forward and
+                        // v4->v6 reverse — both carry `decision.nat.nat64`).
+                        // NAT64 flows are non-cacheable (FlowCacheEntry::
+                        // should_cache excludes nat64), so the flow-cache-hit
+                        // fast path never serves them and this is the only site
+                        // that needs to count. Forward NAT64 also sets
+                        // rewrite_src/rewrite_dst, so it is additionally counted
+                        // as SNAT+DNAT above — the NAT64 counter is a distinct,
+                        // additive translation tally, not a replacement.
+                        if decision.nat.nat64 {
+                            telemetry.counters.nat64_translations += 1;
+                        }
                         if let Some(mut request) = build_live_forward_request_from_frame(
                             worker_ctx.binding_lookup,
                             binding_index,

@@ -31,6 +31,136 @@
 - **File(s)**: userspace-dp/src/screen/extract.rs,
   userspace-dp/src/screen/packet.rs, userspace-dp/src/screen/mod.rs,
   userspace-dp/src/afxdp/mod.rs, userspace-dp/src/screen/tests.rs
+## 2026-06-21 — #2161 NAT64 translations counter + show security flow session
+
+- **Timestamp**: 2026-06-21
+- **Action**: Fixed #2161 — NAT64 v6↔v4 translations happened on the wire
+  (verified live in #2132) but the `NAT64 translations` counter and the
+  status summary read 0: nothing incremented `GlobalCtrNAT64Xlate`. Added
+  a per-binding `nat64_translations` counter in the Rust dataplane,
+  incremented at the single forward-candidate site that both directions
+  of a NAT64 flow pass through (NAT64 flows are non-cacheable, so the
+  flow-cache-hit fast path never serves them). Plumbed it through the full
+  snapshot/wire chain (BatchCounters → BindingLiveState atomic → snapshot
+  → wire BindingStatus with `serde default` / Go `omitempty` for #1961-
+  class cross-version safety), summed it on the Go side in
+  `sumBindingCounters`, and pushed the delta into `GlobalCtrNAT64Xlate`
+  in `syncBPFCountersLocked` (mirrors the existing snat/dnat plumbing).
+  The CLI (`show security flow statistics`), gRPC status
+  (`Nat64Translations`), and userspace status summary already / now read
+  it; added a new `xpf_nat64_translations_total` Prometheus metric.
+  `show security flow session` already installs NAT64 sessions via the
+  normal session path (forward + reverse with `nat64_reverse` metadata),
+  so no session-display change was needed — the live "0" was the counter
+  bug, not a missing session entry.
+- **File(s)**: userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/mod.rs, userspace-dp/src/afxdp/umem/mod.rs,
+  userspace-dp/src/afxdp/umem/snapshot.rs,
+  userspace-dp/src/afxdp/worker/mod.rs,
+  userspace-dp/src/protocol/binding.rs,
+  userspace-dp/src/afxdp/coordinator/refresh_bindings.rs,
+  userspace-dp/src/afxdp/coordinator/reconcile/reset.rs,
+  userspace-dp/src/afxdp/tests.rs,
+  pkg/dataplane/userspace/protocol.go,
+  pkg/dataplane/userspace/manager_ha.go,
+  pkg/dataplane/userspace/format/status.go,
+  pkg/dataplane/userspace/manager_test.go,
+  pkg/dataplane/userspace/format/status_test.go,
+  pkg/api/metrics.go, pkg/api/metrics_descriptors.go,
+  pkg/api/metrics_counters.go, docs/userspace-dataplane-gaps.md
+- **Validation**: Rust `cargo test nat64` (39 pass incl. new
+  `txn_nat64_translation_bumps_counter_both_directions` forward+reverse +
+  refused-stays-0 and `nat64_translations_flushes_to_live_and_snapshot`);
+  Go build + `go test ./pkg/dataplane/userspace/... ./pkg/api/...` pass
+  (TestSumBindingCounters extended, TestFormatStatusSummaryShowsNAT64-
+  Translations added); cli + grpcapi tests pass.
+## 2026-06-21 — #2195 (#2160) fold two doc/comment-accuracy MINORs
+
+- **Timestamp**: 2026-06-21
+- **Action**: Folded two review MINORs into PR #2195 (#2160 static-NAT
+  proxy-ARP). DOC/COMMENT-ONLY — the proxy_arp/proxy_ndp enable logic is
+  unchanged and correct.
+  MINOR-1 (mechanism over-simplified): the prior wording claimed the kernel
+  ignores a proxy-neigh entry "unless the proxy_arp sysctl is on." Per
+  net/ipv4/arp.c the pneigh (NTF_PROXY) reply branch (arp.c:863-868) requires
+  only forwarding + addr_type==RTN_UNICAST + rt.dst.dev != dev — it does NOT
+  consult the sysctl; the sysctl gates the SEPARATE `arp_fwd_proxy` path.
+  Softened to the accurate route-topology-dependent statement (same-L2-subnet
+  external address where rt.dst.dev==dev is answered by neither path until the
+  sysctl is on — the real #2160 case; an off-interface-routed address may
+  already answer via pneigh without it). Both kernel paths now cited.
+  MINOR-2 (over-answer breadth undocumented): documented that per-interface
+  `proxy_arp=1` (default medium_id=0) makes the kernel answer ARP for ANY
+  target routed out a different interface — broader than Junos `proxy-arp`
+  (listed addresses only). Operator-opted-in tradeoff; matters on WAN/untrust.
+  Per-address narrowing tracked in follow-up #2197.
+  Reworded: proxyarp.go (proxyARPSysctlSeam doc + ReconcileProxyARP
+  ifindexFamilies + enable-call comments), feature-gaps.md (proxy-ARP row +
+  Implementation Suggestions bullet), phases.md (ReconcileProxyARP
+  description). go build ./... + go vet ./pkg/dataplane/ + go test
+  ./pkg/dataplane/ all green (comments/docs only).
+  **File(s)**: pkg/dataplane/proxyarp.go, docs/feature-gaps.md,
+  docs/phases.md, _Log.md
+
+## 2026-06-21 — #2160 static-NAT proxy-ARP: enable per-interface responder sysctl
+
+- **Timestamp**: 2026-06-21
+- **Action**: Fixed #2160 (found in the PR #2132 NAT smoke). `ReconcileProxyARP`
+  installed the NTF_PROXY neighbor entry for a proxy-ARP'd NAT external address
+  but left `net.ipv4.conf.<if>.proxy_arp = 0`, and the Linux kernel ignores a
+  proxy-neigh entry unless that per-interface sysctl is on — so the firewall
+  never answered ARP for a static-NAT (or any) external address and the address
+  was unreachable until a manual static ARP was added (the smoke had to add a
+  host-side static ARP). Fix: after the neighbor reconcile, enable the kernel
+  proxy responder sysctl for every interface that has a desired proxy entry —
+  `proxy_arp` for IPv4, `proxy_ndp` for IPv6 — resolving the procfs interface
+  name from the same ifindex the neighbor entry was installed on (so VLAN
+  sub-interface naming matches the install). Re-enabled on every reconcile, not
+  just on add, because networkd reload resets per-interface sysctls. The procfs
+  write goes through a `proxyARPSysctlSeam` package var so it is unit-testable
+  without touching real /proc. Best-effort: a write failure is logged, never
+  fatal, matching the surrounding reconcile. 8 new Go tests (v4/v6/dual-stack/
+  multi-interface ordering/failure-non-fatal/empty/unsupported-family +
+  end-to-end `ReconcileProxyARP` against lo that FAILS on simulated pre-fix —
+  neighbor installed, sysctl left 0). build ./... + go vet + go test
+  pkg/dataplane/... green; integration test verified PASS under sudo and FAIL
+  when the enable call is removed. Live ARP-answer verification is
+  PENDING-PARENT (standalone DUT RX black-hole #1928/#1961; needs the loss
+  cluster or deferral). Docs: feature-gaps.md (proxy-ARP row now notes the
+  sysctl; proxy-NDP row Missing→Partial), phases.md (sysctl step documented).
+  **File(s)**: pkg/dataplane/proxyarp.go, pkg/dataplane/proxyarp_test.go,
+  docs/feature-gaps.md, docs/phases.md, _Log.md
+## 2026-06-21 — #2188 fold three review NITs (VRRP IPv6 ext-header consistency)
+
+- **Timestamp**: 2026-06-21
+- **Action**: Folded three polish/consistency NITs into PR #2188
+  (VRRP cluster #2155/#2156) so the cBPF accept-set, the Go ext-header
+  walker, the tests, and the README all tell ONE story:
+  "HBH(0)/Routing(43)/Dest-Opts(60) are walked; Fragment(44) and AH(51)
+  are not VRRP carriers and are dropped."
+  (1) Dropped Fragment(44) from the cBPF IPv6 accept-set so fragmented
+  IPv6 stays kernel-dropped instead of waking the RX goroutine only for
+  the Go walker to drop it (wasted wakeup). Re-verified every cBPF jump
+  offset after the filter shrank from 33->31 instructions (both IPv6 arms
+  lost their jeq 44; instruction 7's Jt 17->16; both arms' internal
+  accept offsets recomputed).
+  (2) Removed AH(51) handling from walkIPv6ExtHeaders -- AH-wrapped VRRP
+  is not a real scenario (VRRP authenticates itself, never IPsec-AH) and
+  the cBPF never admitted 51 anyway, so an AH-first advert was already
+  kernel-dropped before Go ran (test/reality gap). The single-ah test
+  case was rewritten to ah-dropped (accept:false). Kept the chained
+  HBH+Dest-Opts accept case and the bounded/safety tests.
+  (3) Reconciled pkg/vrrp/README.md accept-set to {112,0,43,60} and
+  fixed the contradictory "AH out of scope on both paths" line so it is
+  now true on all three (cBPF/walker/fallback).
+  Did NOT touch the #2156 build-before-teardown logic.
+- **File(s)**: pkg/vrrp/manager.go, pkg/vrrp/instance.go,
+  pkg/vrrp/vrrp_test.go, pkg/vrrp/README.md
+- **Validation**: go build ./... clean; go test ./pkg/vrrp/... PASS;
+  go test -race ./pkg/vrrp/... -count=3 clean; go vet ./pkg/vrrp/...
+  clean. Ext-header walk subtests confirm HBH/Routing/Dest-Opts (single +
+  chained + VLAN-tagged) accepted; Fragment + AH dropped; bare-base
+  regression + bounded/safety subtests still pass.
 
 ## 2026-06-21 — #2187 validate NAT-rule app references at commit
 
@@ -8074,6 +8204,29 @@ top.
   userspace-dp/src/afxdp/frame/README.md
 
 - **Timestamp**: 2026-06-21
+  **Action**: #2155 + #2156 VRRP cluster fixes (one PR, two commits).
+  #2155 — AF_PACKET RX IPv6 ext-header tolerance: cBPF IPv6 arm (untagged
+  + 802.1Q) now matches base Next-Header against {112,0,43,60,44}
+  (approach A2 — ordinary IPv6 data stays kernel-dropped on data-bearing
+  RETH VLANs); parseAfPacketIPv6 + its test mirror gain a bounded
+  walkIPv6ExtHeaders (HBH/Routing/Dest-Opts (HdrExtLen+1)*8, AH
+  (PayloadLen+2)*4, Fragment hard-drop, <=8 iter cap, per-step bounds
+  check). 12 new table/safety cases; ext-header acceptance + walk-safety
+  cases FAIL on pre-fix fixed-offset-40. #2156 — UpdateInstances VIP-
+  change restart reordered to build-before-teardown (open the replacement
+  socket BEFORE stopping the old instance; on failure keep the old
+  running, no orphan, no double-run, no phantom in m.instances so
+  RGVRRPReady stays truthful) + a 2s reconcileVRRPInstances re-drive from
+  reconcileRGStateLoop for bounded self-recovery. 4 new lifecycle seams
+  (resolveIface/openInstanceSocket/runInstance/stopInstance). 3 new
+  manager tests; both orphan tests FAIL on pre-fix teardown-first.
+  go build ./... clean at each commit boundary; go test + -race
+  pkg/vrrp + pkg/daemon green; 5x flake green. test-failover is
+  PENDING-PARENT (cluster busy). Plan: docs/research/2155-vrrp-cluster/plan.md.
+  **File(s)**: pkg/vrrp/manager.go, pkg/vrrp/instance.go,
+  pkg/vrrp/vrrp_test.go, pkg/vrrp/update_instances_test.go,
+  pkg/vrrp/README.md, pkg/daemon/daemon_ha.go,
+  docs/research/2155-vrrp-cluster/plan.md
   **Action**: #2175 — centralize the firewall-filter `from protocol <name>`
   resolution table onto the `appid.ProtocolNumber` SSOT (#2124). It was the
   fifth, independent protocol-name→IANA-number copy: a hard-coded
@@ -8093,3 +8246,31 @@ top.
   go test pkg/dataplane/... pkg/appid/... pkg/config/... green.
   **File(s)**: pkg/dataplane/compiler_filter.go,
   pkg/dataplane/compiler_filter_protocol_test.go, docs/feature-gaps.md
+
+## 2026-06-21 — #2162/#2176 deploy robustness (stale-binary hazards)
+- **Timestamp**: 2026-06-21
+- **Action**: #2162 — make the standalone deploy target env-overridable
+  (`INSTANCE_NAME=${XPF_INSTANCE:-xpf-fw}`) so `make test-deploy` can hit the
+  actual VM (e.g. ad-hoc `xpf-fwd`) instead of the hardcoded `xpf-fw`. The
+  helper push + sha-verify was already added by #1962/#1980; #2162's remaining
+  gap was the instance targeting + extending sha-verify to xpfd/cli.
+- **Action**: #2176 — new shared `test/incus/deploy-lib.sh` (sourced by both
+  `setup.sh` and `cluster-setup.sh` raw-deploy paths): (1) detect+remove a stale
+  #1917 `10-xpf-version.conf` ExecStart pin (revert to base-unit ExecStart),
+  HARD-FAIL on any OTHER operator-authored ExecStart override; (2) detect+remove
+  dangling `/usr/local/sbin/{xpfd,cli,xpf-userspace-dp}` symlinks into a removed
+  versions/ dir (which break `incus file push`); (3) sha256-verify EACH pushed
+  binary == local build; (4) after restart, assert the LIVE xpfd process image
+  sha == pushed build AND the effective systemd ExecStart is the base-unit path.
+  All four are HARD failures — a deploy now rc!=0 instead of silently running
+  stale code. The #1917 deb-dogfood path (`deploy_vm_deb`) is untouched (it
+  legitimately keeps the version pin).
+- **Validation**: `test/incus/deploy-lib-selftest.sh` (`make test-deploy-lib`)
+  mocks `incus` against a fake VM rootfs — 12/12, including the five hard-fail
+  cases (sha mismatch, absent binary, foreign ExecStart override, surviving
+  version pin, stale running binary). shellcheck -x -S warning clean on all
+  four scripts; bash -n clean. Not run on a live cluster (shared + no lock; the
+  logic is tooling and fully covered by the mocked self-test).
+- **File(s)**: test/incus/deploy-lib.sh, test/incus/deploy-lib-selftest.sh,
+  test/incus/setup.sh, test/incus/cluster-setup.sh, Makefile, docs/test_env.md,
+  CLAUDE.md

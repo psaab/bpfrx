@@ -118,6 +118,7 @@ fn copy_live_snapshot(binding: &mut BindingStatus, snap: BindingLiveSnapshot) {
     binding.policy_reject_reply_budget_drops = snap.policy_reject_reply_budget_drops;
     binding.snat_packets = snap.snat_packets;
     binding.dnat_packets = snap.dnat_packets;
+    binding.nat64_translations = snap.nat64_translations;
     binding.slow_path_packets = snap.slow_path_packets;
     binding.slow_path_bytes = snap.slow_path_bytes;
     binding.slow_path_local_delivery_packets = snap.slow_path_local_delivery_packets;
@@ -295,6 +296,7 @@ fn zero_unbound_slot(binding: &mut BindingStatus) {
     binding.policy_reject_reply_budget_drops = 0;
     binding.snat_packets = 0;
     binding.dnat_packets = 0;
+    binding.nat64_translations = 0;
     binding.slow_path_packets = 0;
     binding.slow_path_bytes = 0;
     binding.slow_path_local_delivery_packets = 0;

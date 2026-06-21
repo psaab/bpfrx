@@ -417,6 +417,9 @@ pub(in crate::afxdp) struct BatchCounters {
     session_creates: u64,
     snat_packets: u64,
     dnat_packets: u64,
+    // #2161: per-translation NAT64 (v6<->v4) tally, batched like snat/dnat
+    // and flushed to BindingLiveState.nat64_translations.
+    nat64_translations: u64,
     // #1187: 8 disposition-path counters added to eliminate per-packet
     // MESI thrash on BindingLiveState atomics during DDoS / config-
     // reload windows. See docs/pr/1187-telemetry-double-buffer/plan.md
@@ -508,6 +511,11 @@ impl BatchCounters {
             live.dnat_packets
                 .fetch_add(self.dnat_packets, Ordering::Relaxed);
             self.dnat_packets = 0;
+        }
+        if self.nat64_translations != 0 {
+            live.nat64_translations
+                .fetch_add(self.nat64_translations, Ordering::Relaxed);
+            self.nat64_translations = 0;
         }
         // #1187 disposition-path counters
         if self.screen_drops != 0 {

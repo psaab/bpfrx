@@ -148,6 +148,7 @@ func FormatStatusSummary(status userspace.ProcessStatus) string {
 	var synCookieBypass uint64
 	var snatPackets uint64
 	var dnatPackets uint64
+	var nat64Translations uint64
 	var txPackets uint64
 	var txBytes uint64
 	var txErrors uint64
@@ -239,6 +240,7 @@ func FormatStatusSummary(status userspace.ProcessStatus) string {
 		synCookieBypass += binding.SYNCookieBypass
 		snatPackets += binding.SNATPackets
 		dnatPackets += binding.DNATPackets
+		nat64Translations += binding.Nat64Translations
 		txPackets += binding.TXPackets
 		txBytes += binding.TXBytes
 		txErrors += binding.TXErrors
@@ -435,6 +437,7 @@ func FormatStatusSummary(status userspace.ProcessStatus) string {
 	}
 	fmt.Fprintf(&b, "  SNAT packets:              %d\n", snatPackets)
 	fmt.Fprintf(&b, "  DNAT packets:              %d\n", dnatPackets)
+	fmt.Fprintf(&b, "  NAT64 translations:        %d\n", nat64Translations)
 	if len(status.SourceNATPools) > 0 {
 		rows := append([]userspace.SourceNATPoolStatus(nil), status.SourceNATPools...)
 		sort.Slice(rows, func(i, j int) bool {

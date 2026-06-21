@@ -181,6 +181,24 @@ func TestFormatStatusSummaryShowsDegradedPathCounters(t *testing.T) {
 	}
 }
 
+// #2161: the status summary surfaces a per-binding-summed NAT64 translations
+// row alongside SNAT/DNAT, so an operator can see live NAT64 activity (the
+// counter previously read 0 even while translated traffic flowed).
+func TestFormatStatusSummaryShowsNAT64Translations(t *testing.T) {
+	status := userspace.ProcessStatus{
+		Bindings: []userspace.BindingStatus{
+			{Slot: 0, Nat64Translations: 12},
+			{Slot: 1, Nat64Translations: 30},
+		},
+	}
+
+	out := FormatStatusSummary(status)
+	want := "NAT64 translations:        42"
+	if !strings.Contains(out, want) {
+		t.Fatalf("summary missing NAT64 translations row %q:\n%s", want, out)
+	}
+}
+
 func TestFormatSYNCookieCounterRows(t *testing.T) {
 	status := userspace.ProcessStatus{
 		Bindings: []userspace.BindingStatus{

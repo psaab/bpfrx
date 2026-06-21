@@ -164,7 +164,10 @@ clean:
 	rm -rf userspace-dp/target
 
 # Legacy standalone test environment management (single Incus VM/container).
-.PHONY: test-env-init test-vm standalone-test-vm test-ct test-deploy test-ssh test-destroy test-status test-start test-stop test-restart test-logs test-journal
+# The standalone instance name defaults to xpf-fw; override it for an
+# ad-hoc/renamed VM with `XPF_INSTANCE=<name> make test-deploy` (#2162). The
+# env var flows through to setup.sh (INSTANCE_NAME=${XPF_INSTANCE:-xpf-fw}).
+.PHONY: test-env-init test-vm standalone-test-vm test-ct test-deploy test-deploy-lib test-ssh test-destroy test-status test-start test-stop test-restart test-logs test-journal
 
 test-env-init:
 	./test/incus/setup.sh init
@@ -179,6 +182,11 @@ test-ct:
 
 test-deploy: build build-ctl
 	./test/incus/setup.sh deploy
+
+# Self-test the raw-deploy reconciliation + sha-verify helpers (#2162/#2176)
+# against a mocked fake VM. No incus, no cluster, no network — pure bash logic.
+test-deploy-lib:
+	bash ./test/incus/deploy-lib-selftest.sh
 
 test-ssh:
 	./test/incus/setup.sh ssh

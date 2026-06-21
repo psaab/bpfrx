@@ -5289,6 +5289,7 @@ func TestSumBindingCounters(t *testing.T) {
 				SYNCookieBypass:      17,
 				SNATPackets:          20,
 				DNATPackets:          15,
+				Nat64Translations:    9,
 			},
 			{
 				RXPackets:            200,
@@ -5304,6 +5305,7 @@ func TestSumBindingCounters(t *testing.T) {
 				SYNCookieBypass:      29,
 				SNATPackets:          40,
 				DNATPackets:          30,
+				Nat64Translations:    21,
 			},
 		},
 	}
@@ -5346,6 +5348,11 @@ func TestSumBindingCounters(t *testing.T) {
 	}
 	if s.dnatPackets != 45 {
 		t.Fatalf("dnatPackets = %d, want 45", s.dnatPackets)
+	}
+	// #2161: NAT64 translations are aggregated across bindings like
+	// snat/dnat and pushed into GlobalCtrNAT64Xlate by syncBPFCountersLocked.
+	if s.nat64Translations != 30 {
+		t.Fatalf("nat64Translations = %d, want 30", s.nat64Translations)
 	}
 }
 
