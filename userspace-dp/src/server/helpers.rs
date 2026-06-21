@@ -63,8 +63,7 @@ pub(crate) fn refresh_status(state: &mut ServerState) {
     // #1902: decap-refusal gate at pending_neigh admission (the
     // outer-frame/inner-meta pairing must never reach the in-place
     // retry TX path).
-    state.status.pending_neigh_decap_drops_total =
-        state.afxdp.pending_neigh_decap_drops_total();
+    state.status.pending_neigh_decap_drops_total = state.afxdp.pending_neigh_decap_drops_total();
     // #1789: total failed USERSPACE_SESSIONS BPF-map publishes
     // (per-binding worker-poll sites + shared no-binding sites). The
     // cause-side signal for rising XDP-shim NO_SESSION fallbacks.
@@ -239,6 +238,7 @@ pub(crate) fn refresh_status(state: &mut ServerState) {
     state.status.recent_exceptions = state.afxdp.recent_exceptions();
     state.status.cos_interfaces = state.afxdp.cos_statuses();
     state.status.policy_rule_counters = state.afxdp.policy_rule_counters();
+    state.status.nat_rule_counters = state.afxdp.nat_rule_counters();
     state.status.filter_term_counters = state.afxdp.filter_term_counters();
     state.status.three_color_policer_counters = state.afxdp.three_color_policer_counters();
     state.status.source_nat_pools = state.afxdp.source_nat_pool_statuses();

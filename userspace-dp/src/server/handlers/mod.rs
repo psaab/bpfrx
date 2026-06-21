@@ -9,7 +9,7 @@
 //   - `match request.request_type.as_str()` dispatch into per-verb
 //     handlers (substantive verbs) or inline bodies (trivial arms:
 //     `ping`/`status`, `update_fabrics`, `clear_policy_counters`,
-//     `shutdown`, catch-all)
+//     `clear_nat_counters`, `shutdown`, catch-all)
 //   - Post-match `refresh_status` + status attach (gated by
 //     `!suppress_status`)
 //   - Post-lock `write_state` (when `persist_state` is set)
@@ -95,9 +95,12 @@ pub(crate) fn handle_stream(
                 &mut response,
                 &mut persist_state,
             ),
-            "update_ha_state" => {
-                ha::update(&mut guard, request.ha_state, &mut response, &mut persist_state)
-            }
+            "update_ha_state" => ha::update(
+                &mut guard,
+                request.ha_state,
+                &mut response,
+                &mut persist_state,
+            ),
             "update_fabrics" => {
                 if let Some(fabrics) = request.fabrics.as_ref() {
                     guard.afxdp.refresh_fabric_links(fabrics);
@@ -115,12 +118,17 @@ pub(crate) fn handle_stream(
                 refresh_status(&mut guard);
                 persist_state = true;
             }
-            "set_queue_state" => queue::set(
-                &mut guard,
-                request.queue,
-                &mut response,
-                &mut persist_state,
-            ),
+            // #2218: reset the helper-side NAT translation hit atomics. The Go
+            // side ALSO clears its offset map, so this is a best-effort
+            // symmetry handler (the offset clear is the authoritative one).
+            "clear_nat_counters" => {
+                guard.afxdp.clear_nat_counters();
+                refresh_status(&mut guard);
+                persist_state = true;
+            }
+            "set_queue_state" => {
+                queue::set(&mut guard, request.queue, &mut response, &mut persist_state)
+            }
             "set_binding_state" => binding::set(
                 &mut guard,
                 request.binding,
@@ -133,9 +141,7 @@ pub(crate) fn handle_stream(
                 &mut response,
                 &mut persist_state,
             ),
-            "sync_session" => {
-                sync_session::handle(&mut guard, request.session_sync, &mut response)
-            }
+            "sync_session" => sync_session::handle(&mut guard, request.session_sync, &mut response),
             "drain_session_deltas" => session_deltas::drain(
                 &mut guard,
                 request.session_deltas.as_ref(),

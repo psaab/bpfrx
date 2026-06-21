@@ -420,6 +420,7 @@
     "transmit_rate_exact": false
   },
   "destination_nat_rule_snapshot": {
+    "counter_id": 0,
     "destination_address": "",
     "destination_port": 0,
     "from_zone": "",
@@ -645,6 +646,11 @@
     "pool_addresses": [],
     "prefix": ""
   },
+  "nat_rule_counter_status": {
+    "bytes": 0,
+    "counter_id": 0,
+    "packets": 0
+  },
   "neighbor_snapshot": {
     "family": "",
     "ifindex": 0,
@@ -757,6 +763,7 @@
     "max_sessions": 0,
     "nat_reverse_key_collisions": 0,
     "nat_reverse_key_shared_displacements_total": 0,
+    "nat_rule_counters": [],
     "neg_neigh_fast_fail_total": 0,
     "neg_neigh_keys": 0,
     "neighbor_cache_capacity": 0,
@@ -976,6 +983,7 @@
   },
   "source_nat_rule_snapshot": {
     "address_persistent": false,
+    "counter_id": 0,
     "destination_addresses": [],
     "from_zone": "",
     "interface_mode": false,
@@ -994,6 +1002,7 @@
     "to_zone": ""
   },
   "static_nat_rule_snapshot": {
+    "counter_id": 0,
     "external_ip": "",
     "from_zone": "",
     "internal_ip": "",

@@ -12,7 +12,7 @@ use super::binding::{
     SessionDeltaInfo, WorkerRuntimeStatus,
 };
 use super::cos::{CoSActiveFlowCountStatus, CoSInterfaceStatus};
-use super::nat::SourceNatPoolStatus;
+use super::nat::{NatRuleCounterStatus, SourceNatPoolStatus};
 use super::resolution::{FlowWorkerStatus, PacketResolution};
 use super::security::{
     FirewallFilterTermCounterStatus, PolicyRuleCounterStatus, ThreeColorPolicerStatus,
@@ -359,6 +359,10 @@ pub(crate) struct ProcessStatus {
     pub cos_interfaces: Vec<CoSInterfaceStatus>,
     #[serde(rename = "policy_rule_counters", default)]
     pub policy_rule_counters: Vec<PolicyRuleCounterStatus>,
+    /// #2218: per-rule NAT translation hit counters (SNAT/DNAT/static),
+    /// keyed by the compiler-assigned counter_id.
+    #[serde(rename = "nat_rule_counters", default)]
+    pub nat_rule_counters: Vec<NatRuleCounterStatus>,
     #[serde(rename = "filter_term_counters", default)]
     pub filter_term_counters: Vec<FirewallFilterTermCounterStatus>,
     #[serde(rename = "three_color_policer_counters", default)]

@@ -163,9 +163,7 @@ pub(in crate::afxdp) fn log_wg_endpoint_set_transition(
     let old_set = wg_endpoint_set_summary(old);
     let new_set = wg_endpoint_set_summary(new);
     if old_set != new_set {
-        eprintln!(
-            "xpf-userspace-dp: WG endpoint set changed ({path}): [{old_set}] => [{new_set}]"
-        );
+        eprintln!("xpf-userspace-dp: WG endpoint set changed ({path}): [{old_set}] => [{new_set}]");
     }
 }
 
@@ -196,6 +194,10 @@ pub struct Coordinator {
     pub(crate) mirror_targets: Arc<ArcSwap<MirrorTargetMap>>,
     pub(crate) forwarding: ForwardingState,
     pub(crate) policy_counters: PolicyCounterStore,
+    /// #2218: per-rule NAT translation hit counters (SNAT/DNAT/static),
+    /// owned alongside `policy_counters` and threaded into the
+    /// forwarding-state build so parsed rules share its `Arc`s.
+    pub(crate) nat_counters: crate::nat::NatCounterStore,
     pub(crate) recent_exceptions: Arc<Mutex<VecDeque<ExceptionStatus>>>,
     pub(crate) recent_session_deltas: Arc<Mutex<VecDeque<SessionDeltaInfo>>>,
     pub(crate) last_resolution: Arc<Mutex<Option<PacketResolution>>>,
@@ -235,6 +237,7 @@ impl Coordinator {
             mirror_targets: Arc::new(ArcSwap::from_pointee(MirrorTargetMap::default())),
             forwarding: ForwardingState::default(),
             policy_counters: PolicyCounterStore::default(),
+            nat_counters: crate::nat::NatCounterStore::default(),
             recent_exceptions: Arc::new(Mutex::new(VecDeque::with_capacity(MAX_RECENT_EXCEPTIONS))),
             recent_session_deltas: Arc::new(Mutex::new(VecDeque::with_capacity(
                 MAX_RECENT_SESSION_DELTAS,
@@ -481,7 +484,9 @@ impl Coordinator {
         if let Ok(mut probed) = self.neighbors.last_probed_at.lock() {
             probed.clear();
         }
-        self.neighbors.last_warm_sweep_ns.store(0, Ordering::Relaxed);
+        self.neighbors
+            .last_warm_sweep_ns
+            .store(0, Ordering::Relaxed);
         self.neighbors
             .warned_disconnect
             .store(false, Ordering::Relaxed);
@@ -751,13 +756,50 @@ impl Coordinator {
         self.policy_counters.clear();
     }
 
+    /// #2218: per-rule NAT translation hit-counter snapshots reported back
+    /// to the Go control plane via `ProcessStatus.nat_rule_counters`.
+    pub fn nat_rule_counters(&self) -> Vec<crate::protocol::NatRuleCounterStatus> {
+        self.nat_counters.snapshots()
+    }
+
+    /// #2218: operator clear of NAT translation hit counters (the Go side
+    /// also clears the corresponding offset entries; this resets the
+    /// helper-side atomics).
+    pub fn clear_nat_counters(&self) {
+        self.nat_counters.clear();
+    }
+
     /// Bump just the FIB generation counter without a full snapshot rebuild.
     /// Workers will invalidate flow cache entries with stale FIB generations.
     pub fn bump_fib_generation(&mut self, fib_generation: u32) {
         self.validation.fib_generation = fib_generation;
         self.shared_validation.store(Arc::new(self.validation));
     }
+}
 
+/// #2218: collect the nonzero per-rule NAT counter ids referenced by a
+/// snapshot (SNAT + DNAT + static), for `NatCounterStore::reconcile_ids`.
+/// Mirrors `policy_counters.reconcile_rules(&snapshot.policies)`.
+pub(super) fn snapshot_active_nat_counter_ids(
+    snapshot: &crate::protocol::ConfigSnapshot,
+) -> Vec<u16> {
+    let mut ids: Vec<u16> = Vec::new();
+    for rule in &snapshot.source_nat_rules {
+        if rule.counter_id != 0 {
+            ids.push(rule.counter_id);
+        }
+    }
+    for rule in &snapshot.destination_nat_rules {
+        if rule.counter_id != 0 {
+            ids.push(rule.counter_id);
+        }
+    }
+    for rule in &snapshot.static_nat_rules {
+        if rule.counter_id != 0 {
+            ids.push(rule.counter_id);
+        }
+    }
+    ids
 }
 
 fn build_mirror_target_map(

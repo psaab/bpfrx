@@ -1284,6 +1284,7 @@ fn wire_invariant_default_specimens() {
     s.insert("map_pins".into(), dump(&MapPins::default()));
     s.insert("mirror_config_snapshot".into(), dump(&MirrorConfigSnapshot::default()));
     s.insert("nat64_rule_snapshot".into(), dump(&NAT64RuleSnapshot::default()));
+    s.insert("nat_rule_counter_status".into(), dump(&NatRuleCounterStatus::default()));
     s.insert("neighbor_snapshot".into(), dump(&NeighborSnapshot::default()));
     s.insert("nptv6_rule_snapshot".into(), dump(&Nptv6RuleSnapshot::default()));
     s.insert("packet_resolution".into(), dump(&PacketResolution::default()));

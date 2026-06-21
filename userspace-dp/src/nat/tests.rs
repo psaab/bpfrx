@@ -4,7 +4,7 @@
 // allocator.rs / destination.rs.
 
 use super::allocator::{
-    sticky_pool_index, PersistentLease, PersistentSourceKey, ALLOCATION_GC_BUDGET, NS_PER_SEC,
+    ALLOCATION_GC_BUDGET, NS_PER_SEC, PersistentLease, PersistentSourceKey, sticky_pool_index,
 };
 use super::destination::{PROTO_TCP, PROTO_UDP};
 use super::*;
@@ -118,12 +118,16 @@ fn reverse_decision_turns_snat_into_reply_dnat() {
 
 #[test]
 fn static_nat_dnat_matches_external_ip_v4() {
-    let table = StaticNatTable::from_snapshots(&[StaticNATRuleSnapshot {
-        name: "static-1".to_string(),
-        from_zone: "untrust".to_string(),
-        external_ip: "203.0.113.10".to_string(),
-        internal_ip: "192.168.1.10".to_string(),
-    }]);
+    let table = StaticNatTable::from_snapshots(
+        &[StaticNATRuleSnapshot {
+            counter_id: 0,
+            name: "static-1".to_string(),
+            from_zone: "untrust".to_string(),
+            external_ip: "203.0.113.10".to_string(),
+            internal_ip: "192.168.1.10".to_string(),
+        }],
+        &crate::nat::NatCounterStore::default(),
+    );
     let decision = table.match_dnat("203.0.113.10".parse().expect("ext"), "untrust");
     assert_eq!(
         decision,
@@ -137,12 +141,16 @@ fn static_nat_dnat_matches_external_ip_v4() {
 
 #[test]
 fn static_nat_snat_matches_internal_ip_v4() {
-    let table = StaticNatTable::from_snapshots(&[StaticNATRuleSnapshot {
-        name: "static-1".to_string(),
-        from_zone: "trust".to_string(),
-        external_ip: "203.0.113.10".to_string(),
-        internal_ip: "192.168.1.10".to_string(),
-    }]);
+    let table = StaticNatTable::from_snapshots(
+        &[StaticNATRuleSnapshot {
+            counter_id: 0,
+            name: "static-1".to_string(),
+            from_zone: "trust".to_string(),
+            external_ip: "203.0.113.10".to_string(),
+            internal_ip: "192.168.1.10".to_string(),
+        }],
+        &crate::nat::NatCounterStore::default(),
+    );
     let decision = table.match_snat("192.168.1.10".parse().expect("int"), "trust");
     assert_eq!(
         decision,
@@ -156,12 +164,16 @@ fn static_nat_snat_matches_internal_ip_v4() {
 
 #[test]
 fn static_nat_dnat_matches_external_ip_v6() {
-    let table = StaticNatTable::from_snapshots(&[StaticNATRuleSnapshot {
-        name: "static-v6".to_string(),
-        from_zone: "untrust".to_string(),
-        external_ip: "2001:db8::1".to_string(),
-        internal_ip: "fd00::1".to_string(),
-    }]);
+    let table = StaticNatTable::from_snapshots(
+        &[StaticNATRuleSnapshot {
+            counter_id: 0,
+            name: "static-v6".to_string(),
+            from_zone: "untrust".to_string(),
+            external_ip: "2001:db8::1".to_string(),
+            internal_ip: "fd00::1".to_string(),
+        }],
+        &crate::nat::NatCounterStore::default(),
+    );
     let decision = table.match_dnat("2001:db8::1".parse().expect("ext"), "untrust");
     assert_eq!(
         decision,
@@ -175,12 +187,16 @@ fn static_nat_dnat_matches_external_ip_v6() {
 
 #[test]
 fn static_nat_snat_matches_internal_ip_v6() {
-    let table = StaticNatTable::from_snapshots(&[StaticNATRuleSnapshot {
-        name: "static-v6".to_string(),
-        from_zone: "trust".to_string(),
-        external_ip: "2001:db8::1".to_string(),
-        internal_ip: "fd00::1".to_string(),
-    }]);
+    let table = StaticNatTable::from_snapshots(
+        &[StaticNATRuleSnapshot {
+            counter_id: 0,
+            name: "static-v6".to_string(),
+            from_zone: "trust".to_string(),
+            external_ip: "2001:db8::1".to_string(),
+            internal_ip: "fd00::1".to_string(),
+        }],
+        &crate::nat::NatCounterStore::default(),
+    );
     let decision = table.match_snat("fd00::1".parse().expect("int"), "trust");
     assert_eq!(
         decision,
@@ -194,12 +210,16 @@ fn static_nat_snat_matches_internal_ip_v6() {
 
 #[test]
 fn static_nat_zone_mismatch_returns_none_for_dnat() {
-    let table = StaticNatTable::from_snapshots(&[StaticNATRuleSnapshot {
-        name: "static-1".to_string(),
-        from_zone: "untrust".to_string(),
-        external_ip: "203.0.113.10".to_string(),
-        internal_ip: "192.168.1.10".to_string(),
-    }]);
+    let table = StaticNatTable::from_snapshots(
+        &[StaticNATRuleSnapshot {
+            counter_id: 0,
+            name: "static-1".to_string(),
+            from_zone: "untrust".to_string(),
+            external_ip: "203.0.113.10".to_string(),
+            internal_ip: "192.168.1.10".to_string(),
+        }],
+        &crate::nat::NatCounterStore::default(),
+    );
     // DNAT from wrong zone should fail
     assert!(
         table
@@ -217,12 +237,16 @@ fn static_nat_zone_mismatch_returns_none_for_dnat() {
 
 #[test]
 fn static_nat_empty_zone_matches_any() {
-    let table = StaticNatTable::from_snapshots(&[StaticNATRuleSnapshot {
-        name: "static-any".to_string(),
-        from_zone: String::new(),
-        external_ip: "203.0.113.10".to_string(),
-        internal_ip: "192.168.1.10".to_string(),
-    }]);
+    let table = StaticNatTable::from_snapshots(
+        &[StaticNATRuleSnapshot {
+            counter_id: 0,
+            name: "static-any".to_string(),
+            from_zone: String::new(),
+            external_ip: "203.0.113.10".to_string(),
+            internal_ip: "192.168.1.10".to_string(),
+        }],
+        &crate::nat::NatCounterStore::default(),
+    );
     assert!(
         table
             .match_dnat("203.0.113.10".parse().expect("ext"), "untrust")
@@ -242,12 +266,16 @@ fn static_nat_empty_zone_matches_any() {
 
 #[test]
 fn static_nat_bidirectional_reverse() {
-    let table = StaticNatTable::from_snapshots(&[StaticNATRuleSnapshot {
-        name: "static-1".to_string(),
-        from_zone: "untrust".to_string(),
-        external_ip: "203.0.113.10".to_string(),
-        internal_ip: "192.168.1.10".to_string(),
-    }]);
+    let table = StaticNatTable::from_snapshots(
+        &[StaticNATRuleSnapshot {
+            counter_id: 0,
+            name: "static-1".to_string(),
+            from_zone: "untrust".to_string(),
+            external_ip: "203.0.113.10".to_string(),
+            internal_ip: "192.168.1.10".to_string(),
+        }],
+        &crate::nat::NatCounterStore::default(),
+    );
     // Inbound DNAT: external -> internal
     let dnat = table
         .match_dnat("203.0.113.10".parse().expect("ext"), "untrust")
@@ -279,12 +307,16 @@ fn static_nat_bidirectional_reverse() {
 
 #[test]
 fn static_nat_no_match_returns_none() {
-    let table = StaticNatTable::from_snapshots(&[StaticNATRuleSnapshot {
-        name: "static-1".to_string(),
-        from_zone: "untrust".to_string(),
-        external_ip: "203.0.113.10".to_string(),
-        internal_ip: "192.168.1.10".to_string(),
-    }]);
+    let table = StaticNatTable::from_snapshots(
+        &[StaticNATRuleSnapshot {
+            counter_id: 0,
+            name: "static-1".to_string(),
+            from_zone: "untrust".to_string(),
+            external_ip: "203.0.113.10".to_string(),
+            internal_ip: "192.168.1.10".to_string(),
+        }],
+        &crate::nat::NatCounterStore::default(),
+    );
     assert!(
         table
             .match_dnat("203.0.113.99".parse().expect("unknown"), "untrust")
@@ -299,20 +331,25 @@ fn static_nat_no_match_returns_none() {
 
 #[test]
 fn static_nat_invalid_ip_skipped() {
-    let table = StaticNatTable::from_snapshots(&[
-        StaticNATRuleSnapshot {
-            name: "bad".to_string(),
-            from_zone: String::new(),
-            external_ip: "not-an-ip".to_string(),
-            internal_ip: "192.168.1.10".to_string(),
-        },
-        StaticNATRuleSnapshot {
-            name: "good".to_string(),
-            from_zone: String::new(),
-            external_ip: "203.0.113.10".to_string(),
-            internal_ip: "192.168.1.10".to_string(),
-        },
-    ]);
+    let table = StaticNatTable::from_snapshots(
+        &[
+            StaticNATRuleSnapshot {
+                counter_id: 0,
+                name: "bad".to_string(),
+                from_zone: String::new(),
+                external_ip: "not-an-ip".to_string(),
+                internal_ip: "192.168.1.10".to_string(),
+            },
+            StaticNATRuleSnapshot {
+                counter_id: 0,
+                name: "good".to_string(),
+                from_zone: String::new(),
+                external_ip: "203.0.113.10".to_string(),
+                internal_ip: "192.168.1.10".to_string(),
+            },
+        ],
+        &crate::nat::NatCounterStore::default(),
+    );
     // The bad entry should be skipped, the good one should work
     assert!(
         table
@@ -323,20 +360,25 @@ fn static_nat_invalid_ip_skipped() {
 
 #[test]
 fn static_nat_external_ips_iterator() {
-    let table = StaticNatTable::from_snapshots(&[
-        StaticNATRuleSnapshot {
-            name: "s1".to_string(),
-            from_zone: String::new(),
-            external_ip: "203.0.113.10".to_string(),
-            internal_ip: "192.168.1.10".to_string(),
-        },
-        StaticNATRuleSnapshot {
-            name: "s2".to_string(),
-            from_zone: String::new(),
-            external_ip: "203.0.113.20".to_string(),
-            internal_ip: "192.168.1.20".to_string(),
-        },
-    ]);
+    let table = StaticNatTable::from_snapshots(
+        &[
+            StaticNATRuleSnapshot {
+                counter_id: 0,
+                name: "s1".to_string(),
+                from_zone: String::new(),
+                external_ip: "203.0.113.10".to_string(),
+                internal_ip: "192.168.1.10".to_string(),
+            },
+            StaticNATRuleSnapshot {
+                counter_id: 0,
+                name: "s2".to_string(),
+                from_zone: String::new(),
+                external_ip: "203.0.113.20".to_string(),
+                internal_ip: "192.168.1.20".to_string(),
+            },
+        ],
+        &crate::nat::NatCounterStore::default(),
+    );
     let mut ips: Vec<IpAddr> = table.external_ips().copied().collect();
     ips.sort_by(|a, b| a.to_string().cmp(&b.to_string()));
     assert_eq!(ips.len(), 2);
@@ -353,12 +395,16 @@ fn static_nat_canonical_cidr_mask_v4_installs_entry() {
     // translation occurred and the external IP was never registered as a
     // local address. The parse must strip the /32 mask. This test FAILS on
     // the unfixed code (table is empty, every assertion is None).
-    let table = StaticNatTable::from_snapshots(&[StaticNATRuleSnapshot {
-        name: "static-cidr".to_string(),
-        from_zone: "untrust".to_string(),
-        external_ip: "203.0.113.5/32".to_string(),
-        internal_ip: "10.0.0.5/32".to_string(),
-    }]);
+    let table = StaticNatTable::from_snapshots(
+        &[StaticNATRuleSnapshot {
+            counter_id: 0,
+            name: "static-cidr".to_string(),
+            from_zone: "untrust".to_string(),
+            external_ip: "203.0.113.5/32".to_string(),
+            internal_ip: "10.0.0.5/32".to_string(),
+        }],
+        &crate::nat::NatCounterStore::default(),
+    );
     // Inbound DNAT on the bare external IP -> bare internal IP.
     assert_eq!(
         table.match_dnat("203.0.113.5".parse().expect("ext"), "untrust"),
@@ -386,12 +432,16 @@ fn static_nat_canonical_cidr_mask_v4_installs_entry() {
 #[test]
 fn static_nat_canonical_cidr_mask_v6_installs_entry() {
     // IPv6 canonical host form carries /128; same root cause as the v4 case.
-    let table = StaticNatTable::from_snapshots(&[StaticNATRuleSnapshot {
-        name: "static-cidr-v6".to_string(),
-        from_zone: "untrust".to_string(),
-        external_ip: "2001:db8::1/128".to_string(),
-        internal_ip: "fd00::1/128".to_string(),
-    }]);
+    let table = StaticNatTable::from_snapshots(
+        &[StaticNATRuleSnapshot {
+            counter_id: 0,
+            name: "static-cidr-v6".to_string(),
+            from_zone: "untrust".to_string(),
+            external_ip: "2001:db8::1/128".to_string(),
+            internal_ip: "fd00::1/128".to_string(),
+        }],
+        &crate::nat::NatCounterStore::default(),
+    );
     assert_eq!(
         table.match_dnat("2001:db8::1".parse().expect("ext"), "untrust"),
         Some(NatDecision {
@@ -416,20 +466,25 @@ fn static_nat_canonical_cidr_mask_v6_installs_entry() {
 fn static_nat_cidr_and_bare_coexist() {
     // A masked rule and a bare-IP rule must both install — stripping the mask
     // on one must not regress the other.
-    let table = StaticNatTable::from_snapshots(&[
-        StaticNATRuleSnapshot {
-            name: "masked".to_string(),
-            from_zone: String::new(),
-            external_ip: "203.0.113.5/32".to_string(),
-            internal_ip: "10.0.0.5".to_string(),
-        },
-        StaticNATRuleSnapshot {
-            name: "bare".to_string(),
-            from_zone: String::new(),
-            external_ip: "203.0.113.6".to_string(),
-            internal_ip: "10.0.0.6/32".to_string(),
-        },
-    ]);
+    let table = StaticNatTable::from_snapshots(
+        &[
+            StaticNATRuleSnapshot {
+                counter_id: 0,
+                name: "masked".to_string(),
+                from_zone: String::new(),
+                external_ip: "203.0.113.5/32".to_string(),
+                internal_ip: "10.0.0.5".to_string(),
+            },
+            StaticNATRuleSnapshot {
+                counter_id: 0,
+                name: "bare".to_string(),
+                from_zone: String::new(),
+                external_ip: "203.0.113.6".to_string(),
+                internal_ip: "10.0.0.6/32".to_string(),
+            },
+        ],
+        &crate::nat::NatCounterStore::default(),
+    );
     assert!(
         table
             .match_dnat("203.0.113.5".parse().expect("ext"), "any")
@@ -460,20 +515,24 @@ fn static_nat_non_host_mask_rejected() {
     // rejected too (the bare parser errored on any mask), so this is not a
     // regression; it keeps the hardened parse strict about misconfiguration.
     for bad in [
-        "203.0.113.5/24",     // non-host v4 prefix
+        "203.0.113.5/24",      // non-host v4 prefix
         "203.0.113.5/notanum", // non-numeric mask
-        "203.0.113.5/",       // empty mask
-        "203.0.113.5//32",    // double slash
-        "203.0.113.5/128",    // v6 host length applied to a v4 address
-        "2001:db8::1/64",     // non-host v6 prefix
-        "2001:db8::1/32",     // v4 host length applied to a v6 address
+        "203.0.113.5/",        // empty mask
+        "203.0.113.5//32",     // double slash
+        "203.0.113.5/128",     // v6 host length applied to a v4 address
+        "2001:db8::1/64",      // non-host v6 prefix
+        "2001:db8::1/32",      // v4 host length applied to a v6 address
     ] {
-        let table = StaticNatTable::from_snapshots(&[StaticNATRuleSnapshot {
-            name: "bad-mask".to_string(),
-            from_zone: String::new(),
-            external_ip: bad.to_string(),
-            internal_ip: "10.0.0.5".to_string(),
-        }]);
+        let table = StaticNatTable::from_snapshots(
+            &[StaticNATRuleSnapshot {
+                counter_id: 0,
+                name: "bad-mask".to_string(),
+                from_zone: String::new(),
+                external_ip: bad.to_string(),
+                internal_ip: "10.0.0.5".to_string(),
+            }],
+            &crate::nat::NatCounterStore::default(),
+        );
         assert_eq!(
             table.external_ips().count(),
             0,
@@ -486,15 +545,19 @@ fn static_nat_non_host_mask_rejected() {
 
 #[test]
 fn dnat_basic_lookup_tcp() {
-    let table = DnatTable::from_snapshots(&[DestinationNATRuleSnapshot {
-        name: "web".to_string(),
-        destination_address: "203.0.113.10".to_string(),
-        destination_port: 80,
-        protocol: "tcp".to_string(),
-        pool_address: "192.168.1.10".to_string(),
-        pool_port: 8080,
-        ..DestinationNATRuleSnapshot::default()
-    }]);
+    let table = DnatTable::from_snapshots(
+        &[DestinationNATRuleSnapshot {
+            counter_id: 0,
+            name: "web".to_string(),
+            destination_address: "203.0.113.10".to_string(),
+            destination_port: 80,
+            protocol: "tcp".to_string(),
+            pool_address: "192.168.1.10".to_string(),
+            pool_port: 8080,
+            ..DestinationNATRuleSnapshot::default()
+        }],
+        &crate::nat::NatCounterStore::default(),
+    );
     let decision = table.lookup(PROTO_TCP, "203.0.113.10".parse().unwrap(), 80, "");
     assert_eq!(
         decision,
@@ -509,15 +572,19 @@ fn dnat_basic_lookup_tcp() {
 #[test]
 fn dnat_wildcard_port_fallback() {
     // port=0 entry matches any destination port
-    let table = DnatTable::from_snapshots(&[DestinationNATRuleSnapshot {
-        name: "any-port".to_string(),
-        destination_address: "203.0.113.10".to_string(),
-        destination_port: 0,
-        protocol: "tcp".to_string(),
-        pool_address: "192.168.1.10".to_string(),
-        pool_port: 0,
-        ..DestinationNATRuleSnapshot::default()
-    }]);
+    let table = DnatTable::from_snapshots(
+        &[DestinationNATRuleSnapshot {
+            counter_id: 0,
+            name: "any-port".to_string(),
+            destination_address: "203.0.113.10".to_string(),
+            destination_port: 0,
+            protocol: "tcp".to_string(),
+            pool_address: "192.168.1.10".to_string(),
+            pool_port: 0,
+            ..DestinationNATRuleSnapshot::default()
+        }],
+        &crate::nat::NatCounterStore::default(),
+    );
     // Any port should match via wildcard
     let decision = table.lookup(PROTO_TCP, "203.0.113.10".parse().unwrap(), 12345, "");
     assert!(decision.is_some());
@@ -530,15 +597,19 @@ fn dnat_wildcard_port_fallback() {
 #[test]
 fn dnat_protocol_specificity() {
     // TCP entry should not match UDP lookups
-    let table = DnatTable::from_snapshots(&[DestinationNATRuleSnapshot {
-        name: "tcp-only".to_string(),
-        destination_address: "203.0.113.10".to_string(),
-        destination_port: 80,
-        protocol: "tcp".to_string(),
-        pool_address: "192.168.1.10".to_string(),
-        pool_port: 8080,
-        ..DestinationNATRuleSnapshot::default()
-    }]);
+    let table = DnatTable::from_snapshots(
+        &[DestinationNATRuleSnapshot {
+            counter_id: 0,
+            name: "tcp-only".to_string(),
+            destination_address: "203.0.113.10".to_string(),
+            destination_port: 80,
+            protocol: "tcp".to_string(),
+            pool_address: "192.168.1.10".to_string(),
+            pool_port: 8080,
+            ..DestinationNATRuleSnapshot::default()
+        }],
+        &crate::nat::NatCounterStore::default(),
+    );
     assert!(
         table
             .lookup(PROTO_TCP, "203.0.113.10".parse().unwrap(), 80, "")
@@ -553,15 +624,19 @@ fn dnat_protocol_specificity() {
 
 #[test]
 fn dnat_ipv6_lookup() {
-    let table = DnatTable::from_snapshots(&[DestinationNATRuleSnapshot {
-        name: "web-v6".to_string(),
-        destination_address: "2001:db8::1".to_string(),
-        destination_port: 443,
-        protocol: "tcp".to_string(),
-        pool_address: "fd00::1".to_string(),
-        pool_port: 8443,
-        ..DestinationNATRuleSnapshot::default()
-    }]);
+    let table = DnatTable::from_snapshots(
+        &[DestinationNATRuleSnapshot {
+            counter_id: 0,
+            name: "web-v6".to_string(),
+            destination_address: "2001:db8::1".to_string(),
+            destination_port: 443,
+            protocol: "tcp".to_string(),
+            pool_address: "fd00::1".to_string(),
+            pool_port: 8443,
+            ..DestinationNATRuleSnapshot::default()
+        }],
+        &crate::nat::NatCounterStore::default(),
+    );
     let decision = table.lookup(PROTO_TCP, "2001:db8::1".parse().unwrap(), 443, "");
     assert_eq!(
         decision,
@@ -575,26 +650,31 @@ fn dnat_ipv6_lookup() {
 
 #[test]
 fn dnat_multiple_entries() {
-    let table = DnatTable::from_snapshots(&[
-        DestinationNATRuleSnapshot {
-            name: "http".to_string(),
-            destination_address: "203.0.113.10".to_string(),
-            destination_port: 80,
-            protocol: "tcp".to_string(),
-            pool_address: "192.168.1.10".to_string(),
-            pool_port: 8080,
-            ..DestinationNATRuleSnapshot::default()
-        },
-        DestinationNATRuleSnapshot {
-            name: "https".to_string(),
-            destination_address: "203.0.113.10".to_string(),
-            destination_port: 443,
-            protocol: "tcp".to_string(),
-            pool_address: "192.168.1.10".to_string(),
-            pool_port: 8443,
-            ..DestinationNATRuleSnapshot::default()
-        },
-    ]);
+    let table = DnatTable::from_snapshots(
+        &[
+            DestinationNATRuleSnapshot {
+                counter_id: 0,
+                name: "http".to_string(),
+                destination_address: "203.0.113.10".to_string(),
+                destination_port: 80,
+                protocol: "tcp".to_string(),
+                pool_address: "192.168.1.10".to_string(),
+                pool_port: 8080,
+                ..DestinationNATRuleSnapshot::default()
+            },
+            DestinationNATRuleSnapshot {
+                counter_id: 0,
+                name: "https".to_string(),
+                destination_address: "203.0.113.10".to_string(),
+                destination_port: 443,
+                protocol: "tcp".to_string(),
+                pool_address: "192.168.1.10".to_string(),
+                pool_port: 8443,
+                ..DestinationNATRuleSnapshot::default()
+            },
+        ],
+        &crate::nat::NatCounterStore::default(),
+    );
     let http = table.lookup(PROTO_TCP, "203.0.113.10".parse().unwrap(), 80, "");
     assert_eq!(http.unwrap().rewrite_dst_port, Some(8080));
     let https = table.lookup(PROTO_TCP, "203.0.113.10".parse().unwrap(), 443, "");
@@ -603,15 +683,19 @@ fn dnat_multiple_entries() {
 
 #[test]
 fn dnat_no_match_returns_none() {
-    let table = DnatTable::from_snapshots(&[DestinationNATRuleSnapshot {
-        name: "web".to_string(),
-        destination_address: "203.0.113.10".to_string(),
-        destination_port: 80,
-        protocol: "tcp".to_string(),
-        pool_address: "192.168.1.10".to_string(),
-        pool_port: 8080,
-        ..DestinationNATRuleSnapshot::default()
-    }]);
+    let table = DnatTable::from_snapshots(
+        &[DestinationNATRuleSnapshot {
+            counter_id: 0,
+            name: "web".to_string(),
+            destination_address: "203.0.113.10".to_string(),
+            destination_port: 80,
+            protocol: "tcp".to_string(),
+            pool_address: "192.168.1.10".to_string(),
+            pool_port: 8080,
+            ..DestinationNATRuleSnapshot::default()
+        }],
+        &crate::nat::NatCounterStore::default(),
+    );
     // Different IP
     assert!(
         table
@@ -680,15 +764,19 @@ fn default_nat_decision_unchanged() {
 
 #[test]
 fn dnat_empty_protocol_expands_to_both() {
-    let table = DnatTable::from_snapshots(&[DestinationNATRuleSnapshot {
-        name: "both".to_string(),
-        destination_address: "203.0.113.10".to_string(),
-        destination_port: 0,
-        protocol: String::new(),
-        pool_address: "192.168.1.10".to_string(),
-        pool_port: 0,
-        ..DestinationNATRuleSnapshot::default()
-    }]);
+    let table = DnatTable::from_snapshots(
+        &[DestinationNATRuleSnapshot {
+            counter_id: 0,
+            name: "both".to_string(),
+            destination_address: "203.0.113.10".to_string(),
+            destination_port: 0,
+            protocol: String::new(),
+            pool_address: "192.168.1.10".to_string(),
+            pool_port: 0,
+            ..DestinationNATRuleSnapshot::default()
+        }],
+        &crate::nat::NatCounterStore::default(),
+    );
     // Both TCP and UDP should match
     assert!(
         table
@@ -705,15 +793,19 @@ fn dnat_empty_protocol_expands_to_both() {
 #[test]
 fn dnat_same_port_no_port_rewrite() {
     // When pool_port == destination_port, no port rewrite needed
-    let table = DnatTable::from_snapshots(&[DestinationNATRuleSnapshot {
-        name: "same-port".to_string(),
-        destination_address: "203.0.113.10".to_string(),
-        destination_port: 80,
-        protocol: "tcp".to_string(),
-        pool_address: "192.168.1.10".to_string(),
-        pool_port: 80,
-        ..DestinationNATRuleSnapshot::default()
-    }]);
+    let table = DnatTable::from_snapshots(
+        &[DestinationNATRuleSnapshot {
+            counter_id: 0,
+            name: "same-port".to_string(),
+            destination_address: "203.0.113.10".to_string(),
+            destination_port: 80,
+            protocol: "tcp".to_string(),
+            pool_address: "192.168.1.10".to_string(),
+            pool_port: 80,
+            ..DestinationNATRuleSnapshot::default()
+        }],
+        &crate::nat::NatCounterStore::default(),
+    );
     let decision = table
         .lookup(PROTO_TCP, "203.0.113.10".parse().unwrap(), 80, "")
         .unwrap();
@@ -724,26 +816,31 @@ fn dnat_same_port_no_port_rewrite() {
 
 #[test]
 fn dnat_destination_ips_iterator() {
-    let table = DnatTable::from_snapshots(&[
-        DestinationNATRuleSnapshot {
-            name: "web".to_string(),
-            destination_address: "203.0.113.10".to_string(),
-            destination_port: 80,
-            protocol: "tcp".to_string(),
-            pool_address: "192.168.1.10".to_string(),
-            pool_port: 8080,
-            ..DestinationNATRuleSnapshot::default()
-        },
-        DestinationNATRuleSnapshot {
-            name: "ssh".to_string(),
-            destination_address: "203.0.113.20".to_string(),
-            destination_port: 22,
-            protocol: "tcp".to_string(),
-            pool_address: "192.168.1.20".to_string(),
-            pool_port: 22,
-            ..DestinationNATRuleSnapshot::default()
-        },
-    ]);
+    let table = DnatTable::from_snapshots(
+        &[
+            DestinationNATRuleSnapshot {
+                counter_id: 0,
+                name: "web".to_string(),
+                destination_address: "203.0.113.10".to_string(),
+                destination_port: 80,
+                protocol: "tcp".to_string(),
+                pool_address: "192.168.1.10".to_string(),
+                pool_port: 8080,
+                ..DestinationNATRuleSnapshot::default()
+            },
+            DestinationNATRuleSnapshot {
+                counter_id: 0,
+                name: "ssh".to_string(),
+                destination_address: "203.0.113.20".to_string(),
+                destination_port: 22,
+                protocol: "tcp".to_string(),
+                pool_address: "192.168.1.20".to_string(),
+                pool_port: 22,
+                ..DestinationNATRuleSnapshot::default()
+            },
+        ],
+        &crate::nat::NatCounterStore::default(),
+    );
     let mut ips: Vec<IpAddr> = table.destination_ips().collect();
     ips.sort_by(|a, b| a.to_string().cmp(&b.to_string()));
     assert_eq!(ips.len(), 2);
@@ -753,26 +850,31 @@ fn dnat_destination_ips_iterator() {
 
 #[test]
 fn dnat_exact_port_beats_wildcard() {
-    let table = DnatTable::from_snapshots(&[
-        DestinationNATRuleSnapshot {
-            name: "wildcard".to_string(),
-            destination_address: "203.0.113.10".to_string(),
-            destination_port: 0,
-            protocol: "tcp".to_string(),
-            pool_address: "192.168.1.100".to_string(),
-            pool_port: 0,
-            ..DestinationNATRuleSnapshot::default()
-        },
-        DestinationNATRuleSnapshot {
-            name: "exact".to_string(),
-            destination_address: "203.0.113.10".to_string(),
-            destination_port: 80,
-            protocol: "tcp".to_string(),
-            pool_address: "192.168.1.10".to_string(),
-            pool_port: 8080,
-            ..DestinationNATRuleSnapshot::default()
-        },
-    ]);
+    let table = DnatTable::from_snapshots(
+        &[
+            DestinationNATRuleSnapshot {
+                counter_id: 0,
+                name: "wildcard".to_string(),
+                destination_address: "203.0.113.10".to_string(),
+                destination_port: 0,
+                protocol: "tcp".to_string(),
+                pool_address: "192.168.1.100".to_string(),
+                pool_port: 0,
+                ..DestinationNATRuleSnapshot::default()
+            },
+            DestinationNATRuleSnapshot {
+                counter_id: 0,
+                name: "exact".to_string(),
+                destination_address: "203.0.113.10".to_string(),
+                destination_port: 80,
+                protocol: "tcp".to_string(),
+                pool_address: "192.168.1.10".to_string(),
+                pool_port: 8080,
+                ..DestinationNATRuleSnapshot::default()
+            },
+        ],
+        &crate::nat::NatCounterStore::default(),
+    );
     // Exact match should win over wildcard
     let decision = table
         .lookup(PROTO_TCP, "203.0.113.10".parse().unwrap(), 80, "")
@@ -789,27 +891,32 @@ fn dnat_exact_port_beats_wildcard() {
 
 #[test]
 fn dnat_prefers_exact_from_zone_over_any_zone() {
-    let table = DnatTable::from_snapshots(&[
-        DestinationNATRuleSnapshot {
-            name: "any-zone".to_string(),
-            destination_address: "203.0.113.10".to_string(),
-            destination_port: 443,
-            protocol: "tcp".to_string(),
-            pool_address: "192.168.1.200".to_string(),
-            pool_port: 9443,
-            ..DestinationNATRuleSnapshot::default()
-        },
-        DestinationNATRuleSnapshot {
-            name: "wan-only".to_string(),
-            from_zone: "wan".to_string(),
-            destination_address: "203.0.113.10".to_string(),
-            destination_port: 443,
-            protocol: "tcp".to_string(),
-            pool_address: "192.168.1.10".to_string(),
-            pool_port: 8443,
-            ..DestinationNATRuleSnapshot::default()
-        },
-    ]);
+    let table = DnatTable::from_snapshots(
+        &[
+            DestinationNATRuleSnapshot {
+                counter_id: 0,
+                name: "any-zone".to_string(),
+                destination_address: "203.0.113.10".to_string(),
+                destination_port: 443,
+                protocol: "tcp".to_string(),
+                pool_address: "192.168.1.200".to_string(),
+                pool_port: 9443,
+                ..DestinationNATRuleSnapshot::default()
+            },
+            DestinationNATRuleSnapshot {
+                counter_id: 0,
+                name: "wan-only".to_string(),
+                from_zone: "wan".to_string(),
+                destination_address: "203.0.113.10".to_string(),
+                destination_port: 443,
+                protocol: "tcp".to_string(),
+                pool_address: "192.168.1.10".to_string(),
+                pool_port: 8443,
+                ..DestinationNATRuleSnapshot::default()
+            },
+        ],
+        &crate::nat::NatCounterStore::default(),
+    );
     let decision = table
         .lookup(PROTO_TCP, "203.0.113.10".parse().unwrap(), 443, "wan")
         .unwrap();
@@ -819,27 +926,32 @@ fn dnat_prefers_exact_from_zone_over_any_zone() {
 
 #[test]
 fn dnat_zone_mismatch_falls_back_to_any_zone_rule() {
-    let table = DnatTable::from_snapshots(&[
-        DestinationNATRuleSnapshot {
-            name: "wan-only".to_string(),
-            from_zone: "wan".to_string(),
-            destination_address: "203.0.113.10".to_string(),
-            destination_port: 443,
-            protocol: "tcp".to_string(),
-            pool_address: "192.168.1.10".to_string(),
-            pool_port: 8443,
-            ..DestinationNATRuleSnapshot::default()
-        },
-        DestinationNATRuleSnapshot {
-            name: "any-zone".to_string(),
-            destination_address: "203.0.113.10".to_string(),
-            destination_port: 443,
-            protocol: "tcp".to_string(),
-            pool_address: "192.168.1.200".to_string(),
-            pool_port: 9443,
-            ..DestinationNATRuleSnapshot::default()
-        },
-    ]);
+    let table = DnatTable::from_snapshots(
+        &[
+            DestinationNATRuleSnapshot {
+                counter_id: 0,
+                name: "wan-only".to_string(),
+                from_zone: "wan".to_string(),
+                destination_address: "203.0.113.10".to_string(),
+                destination_port: 443,
+                protocol: "tcp".to_string(),
+                pool_address: "192.168.1.10".to_string(),
+                pool_port: 8443,
+                ..DestinationNATRuleSnapshot::default()
+            },
+            DestinationNATRuleSnapshot {
+                counter_id: 0,
+                name: "any-zone".to_string(),
+                destination_address: "203.0.113.10".to_string(),
+                destination_port: 443,
+                protocol: "tcp".to_string(),
+                pool_address: "192.168.1.200".to_string(),
+                pool_port: 9443,
+                ..DestinationNATRuleSnapshot::default()
+            },
+        ],
+        &crate::nat::NatCounterStore::default(),
+    );
     let decision = table
         .lookup(PROTO_TCP, "203.0.113.10".parse().unwrap(), 443, "dmz")
         .unwrap();
@@ -849,16 +961,20 @@ fn dnat_zone_mismatch_falls_back_to_any_zone_rule() {
 
 #[test]
 fn dnat_zone_mismatch_without_wildcard_returns_none() {
-    let table = DnatTable::from_snapshots(&[DestinationNATRuleSnapshot {
-        name: "wan-only".to_string(),
-        from_zone: "wan".to_string(),
-        destination_address: "203.0.113.10".to_string(),
-        destination_port: 443,
-        protocol: "tcp".to_string(),
-        pool_address: "192.168.1.10".to_string(),
-        pool_port: 8443,
-        ..DestinationNATRuleSnapshot::default()
-    }]);
+    let table = DnatTable::from_snapshots(
+        &[DestinationNATRuleSnapshot {
+            counter_id: 0,
+            name: "wan-only".to_string(),
+            from_zone: "wan".to_string(),
+            destination_address: "203.0.113.10".to_string(),
+            destination_port: 443,
+            protocol: "tcp".to_string(),
+            pool_address: "192.168.1.10".to_string(),
+            pool_port: 8443,
+            ..DestinationNATRuleSnapshot::default()
+        }],
+        &crate::nat::NatCounterStore::default(),
+    );
     assert!(
         table
             .lookup(PROTO_TCP, "203.0.113.10".parse().unwrap(), 443, "dmz")
@@ -868,28 +984,33 @@ fn dnat_zone_mismatch_without_wildcard_returns_none() {
 
 #[test]
 fn dnat_duplicate_same_zone_last_rule_wins() {
-    let table = DnatTable::from_snapshots(&[
-        DestinationNATRuleSnapshot {
-            name: "first".to_string(),
-            from_zone: "wan".to_string(),
-            destination_address: "203.0.113.10".to_string(),
-            destination_port: 443,
-            protocol: "tcp".to_string(),
-            pool_address: "192.168.1.101".to_string(),
-            pool_port: 8443,
-            ..DestinationNATRuleSnapshot::default()
-        },
-        DestinationNATRuleSnapshot {
-            name: "second".to_string(),
-            from_zone: "wan".to_string(),
-            destination_address: "203.0.113.10".to_string(),
-            destination_port: 443,
-            protocol: "tcp".to_string(),
-            pool_address: "192.168.1.102".to_string(),
-            pool_port: 9443,
-            ..DestinationNATRuleSnapshot::default()
-        },
-    ]);
+    let table = DnatTable::from_snapshots(
+        &[
+            DestinationNATRuleSnapshot {
+                counter_id: 0,
+                name: "first".to_string(),
+                from_zone: "wan".to_string(),
+                destination_address: "203.0.113.10".to_string(),
+                destination_port: 443,
+                protocol: "tcp".to_string(),
+                pool_address: "192.168.1.101".to_string(),
+                pool_port: 8443,
+                ..DestinationNATRuleSnapshot::default()
+            },
+            DestinationNATRuleSnapshot {
+                counter_id: 0,
+                name: "second".to_string(),
+                from_zone: "wan".to_string(),
+                destination_address: "203.0.113.10".to_string(),
+                destination_port: 443,
+                protocol: "tcp".to_string(),
+                pool_address: "192.168.1.102".to_string(),
+                pool_port: 9443,
+                ..DestinationNATRuleSnapshot::default()
+            },
+        ],
+        &crate::nat::NatCounterStore::default(),
+    );
     let decision = table
         .lookup(PROTO_TCP, "203.0.113.10".parse().unwrap(), 443, "wan")
         .unwrap();
@@ -899,26 +1020,31 @@ fn dnat_duplicate_same_zone_last_rule_wins() {
 
 #[test]
 fn dnat_duplicate_any_zone_last_rule_wins() {
-    let table = DnatTable::from_snapshots(&[
-        DestinationNATRuleSnapshot {
-            name: "first".to_string(),
-            destination_address: "203.0.113.10".to_string(),
-            destination_port: 443,
-            protocol: "tcp".to_string(),
-            pool_address: "192.168.1.101".to_string(),
-            pool_port: 8443,
-            ..DestinationNATRuleSnapshot::default()
-        },
-        DestinationNATRuleSnapshot {
-            name: "second".to_string(),
-            destination_address: "203.0.113.10".to_string(),
-            destination_port: 443,
-            protocol: "tcp".to_string(),
-            pool_address: "192.168.1.102".to_string(),
-            pool_port: 9443,
-            ..DestinationNATRuleSnapshot::default()
-        },
-    ]);
+    let table = DnatTable::from_snapshots(
+        &[
+            DestinationNATRuleSnapshot {
+                counter_id: 0,
+                name: "first".to_string(),
+                destination_address: "203.0.113.10".to_string(),
+                destination_port: 443,
+                protocol: "tcp".to_string(),
+                pool_address: "192.168.1.101".to_string(),
+                pool_port: 8443,
+                ..DestinationNATRuleSnapshot::default()
+            },
+            DestinationNATRuleSnapshot {
+                counter_id: 0,
+                name: "second".to_string(),
+                destination_address: "203.0.113.10".to_string(),
+                destination_port: 443,
+                protocol: "tcp".to_string(),
+                pool_address: "192.168.1.102".to_string(),
+                pool_port: 9443,
+                ..DestinationNATRuleSnapshot::default()
+            },
+        ],
+        &crate::nat::NatCounterStore::default(),
+    );
     let decision = table
         .lookup(PROTO_TCP, "203.0.113.10".parse().unwrap(), 443, "wan")
         .unwrap();
@@ -1160,6 +1286,7 @@ fn tuple_snat_lookup_from_src(
     dst_port: u16,
     now_ns: u64,
 ) -> SourceNatLookup {
+    let mut counter = None;
     match_source_nat_result_for_tuple(
         rules,
         "lan",
@@ -1173,6 +1300,7 @@ fn tuple_snat_lookup_from_src(
         None,
         now_ns,
         false,
+        &mut counter,
     )
 }
 
@@ -1212,9 +1340,7 @@ fn session_key_from_src(
 }
 
 fn assert_persistent_expiry_indexes_consistent(rule: &SourceNatRule) {
-    let live = rule
-        .pool_allocator
-        .debug_live();
+    let live = rule.pool_allocator.debug_live();
     let mut expected_global = BTreeSet::new();
     let mut expected_by_addr = vec![BTreeSet::new(); live.lease_expirations_by_addr.len()];
 
@@ -1342,7 +1468,11 @@ fn pool_snat_persistent_compatible_refresh_preserves_lease_state() {
     assert_eq!(before[0].allocations_total, 1);
     assert_eq!(before[0].reuses_total, 0);
 
-    let refreshed = parse_source_nat_rules_with_previous(&[snapshot], Some(&rules));
+    let refreshed = parse_source_nat_rules_with_previous(
+        &[snapshot],
+        Some(&rules),
+        &crate::nat::NatCounterStore::default(),
+    );
     let after_refresh = source_nat_pool_statuses(&refreshed);
     assert_eq!(after_refresh[0].live_flows, 0);
     assert_eq!(after_refresh[0].used_ports, 1);
@@ -1473,6 +1603,7 @@ fn pool_snat_shared_pool_exhaustion_crosses_rules() {
         None,
         1,
         false,
+        &mut None,
     );
     assert!(matches!(first, SourceNatLookup::Matched(_)));
 
@@ -1489,6 +1620,7 @@ fn pool_snat_shared_pool_exhaustion_crosses_rules() {
         None,
         2,
         false,
+        &mut None,
     );
     assert_eq!(
         second,
@@ -1548,6 +1680,7 @@ fn pool_snat_shared_pool_exhaustion_crosses_persistence_modes() {
         None,
         1,
         false,
+        &mut None,
     );
     assert!(matches!(first, SourceNatLookup::Matched(_)));
 
@@ -1564,6 +1697,7 @@ fn pool_snat_shared_pool_exhaustion_crosses_persistence_modes() {
         None,
         2,
         false,
+        &mut None,
     );
     assert_eq!(
         second,
@@ -1630,9 +1764,7 @@ fn pool_snat_persistent_rollback_keeps_lease_reused_by_another_flow() {
     assert_eq!(status[0].used_ports, 1);
     assert_eq!(status[0].persistent_leases, 1);
     {
-        let live = rules[0]
-            .pool_allocator
-            .debug_live();
+        let live = rules[0].pool_allocator.debug_live();
         let lease = live.persistent_by_source.values().next().unwrap();
         assert_eq!(lease.active_flows, 1);
         assert!(live.lease_expirations.is_empty());
@@ -1659,9 +1791,7 @@ fn pool_snat_persistent_rollback_preserves_lease_after_reuser_release() {
     assert_eq!(status[0].used_ports, 1);
     assert_eq!(status[0].persistent_leases, 1);
     {
-        let live = rules[0]
-            .pool_allocator
-            .debug_live();
+        let live = rules[0].pool_allocator.debug_live();
         let lease = live.persistent_by_source.values().next().unwrap();
         assert_eq!(lease.active_flows, 0);
         assert_eq!(lease.completed_flows, 1);
@@ -1690,9 +1820,7 @@ fn pool_snat_persistent_double_rollback_removes_unused_lease() {
     assert_eq!(status[0].used_ports, 0);
     assert_eq!(status[0].persistent_leases, 0);
     {
-        let live = rules[0]
-            .pool_allocator
-            .debug_live();
+        let live = rules[0].pool_allocator.debug_live();
         assert!(live.persistent_by_source.is_empty());
         assert!(live.lease_expirations.is_empty());
         assert!(live.lease_expirations_by_addr[0].is_empty());
@@ -1715,14 +1843,13 @@ fn pool_snat_persistent_reactivation_uses_fresh_expiry_after_success() {
 
     let old_expiry = 2 + timeout_ns;
     {
-        let live = rules[0]
-            .pool_allocator
-            .debug_live();
+        let live = rules[0].pool_allocator.debug_live();
         let lease = live.persistent_by_source.values().next().unwrap();
         assert_eq!(lease.expires_at_ns, old_expiry);
-        assert!(live
-            .lease_expirations
-            .contains(&(old_expiry, lease_key(10000))));
+        assert!(
+            live.lease_expirations
+                .contains(&(old_expiry, lease_key(10000)))
+        );
     }
 
     let first = expect_snat_decision(tuple_snat_lookup(&rules, 10000, "1.1.1.1", 53, 3));
@@ -1730,20 +1857,8 @@ fn pool_snat_persistent_reactivation_uses_fresh_expiry_after_success() {
     assert_eq!(second.rewrite_src, first.rewrite_src);
     assert_eq!(second.rewrite_src_port, first.rewrite_src_port);
 
-    release_source_nat_allocation(
-        &rules,
-        &session_key(10000, "9.9.9.9", 53),
-        second,
-        false,
-        5,
-    );
-    rollback_source_nat_allocation(
-        &rules,
-        &session_key(10000, "1.1.1.1", 53),
-        first,
-        false,
-        6,
-    );
+    release_source_nat_allocation(&rules, &session_key(10000, "9.9.9.9", 53), second, false, 5);
+    rollback_source_nat_allocation(&rules, &session_key(10000, "1.1.1.1", 53), first, false, 6);
 
     let fresh_expiry = 6 + timeout_ns;
     let status = source_nat_pool_statuses(&rules);
@@ -1751,20 +1866,21 @@ fn pool_snat_persistent_reactivation_uses_fresh_expiry_after_success() {
     assert_eq!(status[0].used_ports, 1);
     assert_eq!(status[0].persistent_leases, 1);
     {
-        let live = rules[0]
-            .pool_allocator
-            .debug_live();
+        let live = rules[0].pool_allocator.debug_live();
         let lease = live.persistent_by_source.values().next().unwrap();
         assert_eq!(lease.active_flows, 0);
         assert_eq!(lease.completed_flows, 2);
         assert_eq!(lease.expires_at_ns, fresh_expiry);
         assert_eq!(live.lease_expirations.len(), 1);
-        assert!(live
-            .lease_expirations
-            .contains(&(fresh_expiry, lease_key(10000))));
-        assert!(!live
-            .lease_expirations
-            .contains(&(old_expiry, lease_key(10000))));
+        assert!(
+            live.lease_expirations
+                .contains(&(fresh_expiry, lease_key(10000)))
+        );
+        assert!(
+            !live
+                .lease_expirations
+                .contains(&(old_expiry, lease_key(10000)))
+        );
     }
 }
 
@@ -1783,9 +1899,7 @@ fn pool_snat_persistent_reactivation_completion_survives_saturated_counter() {
 
     let old_expiry = 2 + timeout_ns;
     {
-        let mut live = rules[0]
-            .pool_allocator
-            .debug_live();
+        let mut live = rules[0].pool_allocator.debug_live();
         let lease = live.persistent_by_source.values_mut().next().unwrap();
         lease.completed_flows = u64::MAX;
         assert_eq!(lease.expires_at_ns, old_expiry);
@@ -1796,36 +1910,25 @@ fn pool_snat_persistent_reactivation_completion_survives_saturated_counter() {
     assert_eq!(second.rewrite_src, first.rewrite_src);
     assert_eq!(second.rewrite_src_port, first.rewrite_src_port);
 
-    release_source_nat_allocation(
-        &rules,
-        &session_key(10000, "9.9.9.9", 53),
-        second,
-        false,
-        5,
-    );
-    rollback_source_nat_allocation(
-        &rules,
-        &session_key(10000, "1.1.1.1", 53),
-        first,
-        false,
-        6,
-    );
+    release_source_nat_allocation(&rules, &session_key(10000, "9.9.9.9", 53), second, false, 5);
+    rollback_source_nat_allocation(&rules, &session_key(10000, "1.1.1.1", 53), first, false, 6);
 
     let fresh_expiry = 6 + timeout_ns;
     {
-        let live = rules[0]
-            .pool_allocator
-            .debug_live();
+        let live = rules[0].pool_allocator.debug_live();
         let lease = live.persistent_by_source.values().next().unwrap();
         assert_eq!(lease.active_flows, 0);
         assert_eq!(lease.completed_flows, u64::MAX);
         assert_eq!(lease.expires_at_ns, fresh_expiry);
-        assert!(live
-            .lease_expirations
-            .contains(&(fresh_expiry, lease_key(10000))));
-        assert!(!live
-            .lease_expirations
-            .contains(&(old_expiry, lease_key(10000))));
+        assert!(
+            live.lease_expirations
+                .contains(&(fresh_expiry, lease_key(10000)))
+        );
+        assert!(
+            !live
+                .lease_expirations
+                .contains(&(old_expiry, lease_key(10000)))
+        );
     }
 }
 
@@ -1848,37 +1951,24 @@ fn pool_snat_persistent_reactivation_double_rollback_restores_old_expiry() {
     assert_eq!(second.rewrite_src, first.rewrite_src);
     assert_eq!(second.rewrite_src_port, first.rewrite_src_port);
 
-    rollback_source_nat_allocation(
-        &rules,
-        &session_key(10000, "1.1.1.1", 53),
-        first,
-        false,
-        5,
-    );
-    rollback_source_nat_allocation(
-        &rules,
-        &session_key(10000, "9.9.9.9", 53),
-        second,
-        false,
-        6,
-    );
+    rollback_source_nat_allocation(&rules, &session_key(10000, "1.1.1.1", 53), first, false, 5);
+    rollback_source_nat_allocation(&rules, &session_key(10000, "9.9.9.9", 53), second, false, 6);
 
     let status = source_nat_pool_statuses(&rules);
     assert_eq!(status[0].live_flows, 0);
     assert_eq!(status[0].used_ports, 1);
     assert_eq!(status[0].persistent_leases, 1);
     {
-        let live = rules[0]
-            .pool_allocator
-            .debug_live();
+        let live = rules[0].pool_allocator.debug_live();
         let lease = live.persistent_by_source.values().next().unwrap();
         assert_eq!(lease.active_flows, 0);
         assert_eq!(lease.completed_flows, 1);
         assert_eq!(lease.expires_at_ns, old_expiry);
         assert_eq!(live.lease_expirations.len(), 1);
-        assert!(live
-            .lease_expirations
-            .contains(&(old_expiry, lease_key(10000))));
+        assert!(
+            live.lease_expirations
+                .contains(&(old_expiry, lease_key(10000)))
+        );
     }
 }
 
@@ -1921,9 +2011,7 @@ fn pool_snat_persistent_expiry_index_is_bounded_by_leases() {
         );
     }
 
-    let live = rules[0]
-        .pool_allocator
-        .debug_live();
+    let live = rules[0].pool_allocator.debug_live();
     assert_eq!(live.persistent_by_source.len(), 1);
     assert_eq!(live.lease_expirations.len(), 1);
     assert_eq!(live.lease_expirations_by_addr[0].len(), 1);
@@ -1935,8 +2023,7 @@ fn pool_snat_persistent_expiry_index_is_bounded_by_leases() {
 #[should_panic(expected = "global persistent expiry index mismatch")]
 fn pool_snat_expiry_invariant_rejects_stale_global_entry() {
     let rules = persistent_pool_rules(300, 40000, 40000);
-    let decision =
-        expect_snat_decision(tuple_snat_lookup(&rules, 10000, "8.8.8.8", 53, 1_000));
+    let decision = expect_snat_decision(tuple_snat_lookup(&rules, 10000, "8.8.8.8", 53, 1_000));
     release_source_nat_allocation(
         &rules,
         &session_key(10000, "8.8.8.8", 53),
@@ -1945,9 +2032,7 @@ fn pool_snat_expiry_invariant_rejects_stale_global_entry() {
         2_000,
     );
     {
-        let mut live = rules[0]
-            .pool_allocator
-            .debug_live();
+        let mut live = rules[0].pool_allocator.debug_live();
         let (key, lease) = live
             .persistent_by_source
             .iter()
@@ -1965,8 +2050,7 @@ fn pool_snat_expiry_invariant_rejects_stale_global_entry() {
 #[should_panic(expected = "per-address persistent expiry index mismatch")]
 fn pool_snat_expiry_invariant_rejects_stale_per_address_entry() {
     let rules = persistent_pool_rules(300, 40000, 40000);
-    let decision =
-        expect_snat_decision(tuple_snat_lookup(&rules, 10000, "8.8.8.8", 53, 1_000));
+    let decision = expect_snat_decision(tuple_snat_lookup(&rules, 10000, "8.8.8.8", 53, 1_000));
     release_source_nat_allocation(
         &rules,
         &session_key(10000, "8.8.8.8", 53),
@@ -1975,17 +2059,14 @@ fn pool_snat_expiry_invariant_rejects_stale_per_address_entry() {
         2_000,
     );
     {
-        let mut live = rules[0]
-            .pool_allocator
-            .debug_live();
+        let mut live = rules[0].pool_allocator.debug_live();
         let (key, lease) = live
             .persistent_by_source
             .iter()
             .next()
             .map(|(key, lease)| (*key, *lease))
             .unwrap();
-        live.lease_expirations_by_addr[lease.addr_index]
-            .insert((lease.expires_at_ns + 1, key));
+        live.lease_expirations_by_addr[lease.addr_index].insert((lease.expires_at_ns + 1, key));
     }
 
     assert_persistent_expiry_indexes_consistent(&rules[0]);
@@ -2001,8 +2082,7 @@ fn pool_snat_expiry_invariant_rejects_wrong_addr_index() {
         vec!["203.0.113.10", "203.0.113.11"],
         false,
     );
-    let decision =
-        expect_snat_decision(tuple_snat_lookup(&rules, 10000, "8.8.8.8", 53, 1_000));
+    let decision = expect_snat_decision(tuple_snat_lookup(&rules, 10000, "8.8.8.8", 53, 1_000));
     release_source_nat_allocation(
         &rules,
         &session_key(10000, "8.8.8.8", 53),
@@ -2011,9 +2091,7 @@ fn pool_snat_expiry_invariant_rejects_wrong_addr_index() {
         2_000,
     );
     {
-        let mut live = rules[0]
-            .pool_allocator
-            .debug_live();
+        let mut live = rules[0].pool_allocator.debug_live();
         let (key, lease) = live
             .persistent_by_source
             .iter()
@@ -2039,12 +2117,9 @@ fn pool_snat_expiry_invariant_rejects_wrong_addr_index() {
 #[test]
 fn pool_snat_persistent_release_replaces_stale_expiry_tuple() {
     let rules = persistent_pool_rules(300, 40000, 40000);
-    let decision =
-        expect_snat_decision(tuple_snat_lookup(&rules, 10000, "8.8.8.8", 53, 1_000));
+    let decision = expect_snat_decision(tuple_snat_lookup(&rules, 10000, "8.8.8.8", 53, 1_000));
     let stale_expires_at_ns = {
-        let mut live = rules[0]
-            .pool_allocator
-            .debug_live();
+        let mut live = rules[0].pool_allocator.debug_live();
         let (key, lease) = live
             .persistent_by_source
             .iter()
@@ -2065,9 +2140,7 @@ fn pool_snat_persistent_release_replaces_stale_expiry_tuple() {
         2_000,
     );
 
-    let live = rules[0]
-        .pool_allocator
-        .debug_live();
+    let live = rules[0].pool_allocator.debug_live();
     let (key, lease) = live
         .persistent_by_source
         .iter()
@@ -2079,9 +2152,7 @@ fn pool_snat_persistent_release_replaces_stale_expiry_tuple() {
     assert!(live.lease_expirations.contains(&(lease.expires_at_ns, key)));
     assert!(!live.lease_expirations.contains(&(stale_expires_at_ns, key)));
     assert_eq!(live.lease_expirations_by_addr[lease.addr_index].len(), 1);
-    assert!(
-        live.lease_expirations_by_addr[lease.addr_index].contains(&(lease.expires_at_ns, key))
-    );
+    assert!(live.lease_expirations_by_addr[lease.addr_index].contains(&(lease.expires_at_ns, key)));
     assert!(
         !live.lease_expirations_by_addr[lease.addr_index].contains(&(stale_expires_at_ns, key))
     );
@@ -2125,9 +2196,7 @@ fn pool_snat_allocation_gc_is_bounded_when_not_under_pressure() {
         after[0].persistent_leases,
         (expired_lease_count - ALLOCATION_GC_BUDGET + 1) as u64
     );
-    let live = rules[0]
-        .pool_allocator
-        .debug_live();
+    let live = rules[0].pool_allocator.debug_live();
     assert_eq!(
         live.lease_expirations.len(),
         expired_lease_count - ALLOCATION_GC_BUDGET
@@ -2192,9 +2261,7 @@ fn pool_snat_pressure_gc_reclaims_expired_lease_for_selected_address() {
     }
 
     {
-        let live = rules[0]
-            .pool_allocator
-            .debug_live();
+        let live = rules[0].pool_allocator.debug_live();
         assert_eq!(
             live.lease_expirations_by_addr[0].len(),
             ALLOCATION_GC_BUDGET
@@ -2217,9 +2284,7 @@ fn pool_snat_pressure_gc_reclaims_expired_lease_for_selected_address() {
 
     assert_eq!(decision.rewrite_src, Some("203.0.113.11".parse().unwrap()));
     assert!(matches!(decision.rewrite_src_port, Some(40000..=40007)));
-    let live = rules[0]
-        .pool_allocator
-        .debug_live();
+    let live = rules[0].pool_allocator.debug_live();
     assert_eq!(live.lease_expirations_by_addr[0].len(), 0);
     assert!(live.lease_expirations_by_addr[1].len() < ALLOCATION_GC_BUDGET);
     drop(live);
@@ -2658,6 +2723,7 @@ fn pool_snat_address_persistent_userspace_v1_selects_pool_addresses() {
             None,
             0,
             false,
+            &mut None,
         ));
 
         assert_eq!(decision.rewrite_src, Some(want_src.parse().unwrap()));
@@ -2920,6 +2986,7 @@ fn pool_snat_non_first_fragment_refused_no_allocation() {
         None,
         1,
         true,
+        &mut None,
     );
     match frag {
         SourceNatLookup::Unavailable(failure) => {
@@ -2942,9 +3009,164 @@ fn pool_snat_non_first_fragment_refused_no_allocation() {
         None,
         1,
         false,
+        &mut None,
     );
     assert!(
         matches!(first, SourceNatLookup::Matched(d) if d.rewrite_src_port.is_some()),
         "first fragment must still allocate a pool mapping"
+    );
+}
+
+// === #2218: per-rule NAT translation hit counters ===
+
+// FAIL-ON-REVERT: this test fails if NatRuleCounter::add stops counting or
+// snapshots() drops a stored id. It exercises the store contract directly
+// (get-or-insert, add packets+bytes, snapshot, the counter_id==0 skip, and
+// reconcile/clear) independent of the worker path.
+#[test]
+fn nat_counter_store_counts_and_skips_id_zero() {
+    let store = NatCounterStore::default();
+
+    // counter_id 0 is the "no per-rule counter" sentinel — never allocated.
+    assert!(
+        store.rule_counter(0).is_none(),
+        "counter_id 0 must not allocate a counter"
+    );
+
+    // get-or-insert returns the SAME Arc for the same id.
+    let c1 = store.rule_counter(1).expect("id 1 counter");
+    let c1_again = store.rule_counter(1).expect("id 1 counter again");
+    assert!(
+        std::sync::Arc::ptr_eq(&c1, &c1_again),
+        "rule_counter must share one Arc per id"
+    );
+
+    // N adds of 100 bytes each -> packets=N, bytes=100*N.
+    const N: u64 = 7;
+    for _ in 0..N {
+        c1.add(100);
+    }
+    let snaps = store.snapshots();
+    assert_eq!(snaps.len(), 1, "exactly one stored counter");
+    assert_eq!(snaps[0].counter_id, 1);
+    assert_eq!(snaps[0].packets, N, "one packet counted per add");
+    assert_eq!(snaps[0].bytes, 100 * N, "bytes accumulate per add");
+
+    // A second id is independent.
+    let c2 = store.rule_counter(2).expect("id 2 counter");
+    c2.add(40);
+    let mut snaps = store.snapshots();
+    snaps.sort_by_key(|s| s.counter_id);
+    assert_eq!(snaps.len(), 2);
+    assert_eq!(
+        (snaps[1].counter_id, snaps[1].packets, snaps[1].bytes),
+        (2, 1, 40)
+    );
+
+    // reconcile_ids drops counters whose id is no longer active.
+    store.reconcile_ids(&[1]);
+    let snaps = store.snapshots();
+    assert_eq!(snaps.len(), 1, "id 2 dropped by reconcile");
+    assert_eq!(snaps[0].counter_id, 1);
+    assert_eq!(snaps[0].packets, N, "surviving counter keeps its count");
+
+    // clear zeroes the survivors but keeps them registered.
+    store.clear();
+    let snaps = store.snapshots();
+    assert_eq!(snaps.len(), 1, "clear keeps the registration");
+    assert_eq!((snaps[0].packets, snaps[0].bytes), (0, 0), "clear zeroes");
+}
+
+// FAIL-ON-REVERT: a parsed SourceNatRule / DnatEntry / StaticNatEntry must
+// SHARE the store's Arc for its counter_id, and carry None for counter_id 0.
+// If the build wiring drops the store, the Arcs would not be ptr-eq (or the
+// rule would carry None), and this fails.
+#[test]
+fn parsed_nat_rules_share_store_counters() {
+    let store = NatCounterStore::default();
+
+    // SNAT rule with a counter and one without.
+    let snat = parse_source_nat_rules_with_previous(
+        &[
+            SourceNATRuleSnapshot {
+                name: "snat-counted".to_string(),
+                from_zone: "lan".to_string(),
+                to_zone: "wan".to_string(),
+                source_addresses: vec!["0.0.0.0/0".to_string()],
+                interface_mode: true,
+                counter_id: 11,
+                ..SourceNATRuleSnapshot::default()
+            },
+            SourceNATRuleSnapshot {
+                name: "snat-uncounted".to_string(),
+                from_zone: "lan".to_string(),
+                to_zone: "wan".to_string(),
+                source_addresses: vec!["0.0.0.0/0".to_string()],
+                interface_mode: true,
+                counter_id: 0,
+                ..SourceNATRuleSnapshot::default()
+            },
+        ],
+        None,
+        &store,
+    );
+    let snat_counter = snat[0]
+        .hit_counter
+        .clone()
+        .expect("counted snat has counter");
+    assert!(
+        std::sync::Arc::ptr_eq(&snat_counter, &store.rule_counter(11).expect("store id 11")),
+        "SNAT rule shares the store Arc for counter_id 11"
+    );
+    assert!(
+        snat[1].hit_counter.is_none(),
+        "counter_id 0 SNAT rule carries no counter"
+    );
+
+    // Static NAT entry with a counter.
+    let static_tbl = StaticNatTable::from_snapshots(
+        &[StaticNATRuleSnapshot {
+            name: "static-counted".to_string(),
+            from_zone: "untrust".to_string(),
+            external_ip: "203.0.113.10".to_string(),
+            internal_ip: "192.168.1.10".to_string(),
+            counter_id: 22,
+        }],
+        &store,
+    );
+    let (_d, static_counter) = static_tbl
+        .match_dnat_with_counter("203.0.113.10".parse().unwrap(), "untrust")
+        .expect("static dnat match");
+    assert!(
+        std::sync::Arc::ptr_eq(
+            &static_counter.expect("static has counter"),
+            &store.rule_counter(22).expect("store id 22")
+        ),
+        "static NAT entry shares the store Arc for counter_id 22"
+    );
+
+    // DNAT entry with a counter.
+    let dnat_tbl = DnatTable::from_snapshots(
+        &[DestinationNATRuleSnapshot {
+            name: "dnat-counted".to_string(),
+            counter_id: 33,
+            from_zone: "untrust".to_string(),
+            destination_address: "203.0.113.20".to_string(),
+            destination_port: 443,
+            protocol: "tcp".to_string(),
+            pool_address: "10.0.0.20".to_string(),
+            pool_port: 8443,
+        }],
+        &store,
+    );
+    let (_d, dnat_counter) = dnat_tbl
+        .lookup_with_counter(PROTO_TCP, "203.0.113.20".parse().unwrap(), 443, "untrust")
+        .expect("dnat match");
+    assert!(
+        std::sync::Arc::ptr_eq(
+            &dnat_counter.expect("dnat has counter"),
+            &store.rule_counter(33).expect("store id 33")
+        ),
+        "DNAT entry shares the store Arc for counter_id 33"
     );
 }

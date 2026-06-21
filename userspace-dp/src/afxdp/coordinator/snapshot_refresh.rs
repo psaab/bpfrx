@@ -52,11 +52,7 @@ impl super::Coordinator {
         self.refresh_runtime_snapshot_inner(snapshot, false);
     }
 
-    fn refresh_runtime_snapshot_inner(
-        &mut self,
-        snapshot: &crate::ConfigSnapshot,
-        spawn_wg: bool,
-    ) {
+    fn refresh_runtime_snapshot_inner(&mut self, snapshot: &crate::ConfigSnapshot, spawn_wg: bool) {
         // #1606: preflight policy validation BEFORE any
         // side-effecting mutation (neighbor manager keys,
         // validation, policy_counters). If integrity errors fire,
@@ -132,6 +128,7 @@ impl super::Coordinator {
         let new_forwarding = match build_forwarding_state_with_policy_counters_and_previous(
             snapshot,
             &self.policy_counters,
+            &self.nat_counters,
             Some(&self.forwarding),
         ) {
             Ok(fwd) => fwd,
@@ -144,6 +141,9 @@ impl super::Coordinator {
             }
         };
         self.policy_counters.reconcile_rules(&snapshot.policies);
+        // #2218: drop hit counters for NAT rules removed by this config.
+        self.nat_counters
+            .reconcile_ids(&super::snapshot_active_nat_counter_ids(snapshot));
         // #1866 D3: WG endpoint-set transition log at the Rust apply
         // boundary. Rare (only when the set actually changes); pairs
         // with the Go publish-boundary log to pin which layer dropped
@@ -170,11 +170,8 @@ impl super::Coordinator {
         // ran — `self.forwarding` is still default), so a same-plan
         // disarmed refresh would otherwise see every configured id as
         // "new" and wipe those boot-time entries.
-        let tunnel_purge_ids = tunnel_remap_purge_ids(
-            &self.forwarding,
-            &new_forwarding,
-            prior_snapshot_installed,
-        );
+        let tunnel_purge_ids =
+            tunnel_remap_purge_ids(&self.forwarding, &new_forwarding, prior_snapshot_installed);
         self.purge_remapped_tunnel_sessions(&tunnel_purge_ids);
         self.forwarding = new_forwarding;
         if self.forwarding.fabrics.is_empty() && !preserved_fabrics.is_empty() {

@@ -345,6 +345,7 @@ impl super::Coordinator {
         egress_v6: Option<Ipv6Addr>,
         now_ns: u64,
     ) -> crate::nat::SourceNatLookup {
+        let mut counter = None;
         crate::nat::match_source_nat_result_for_tuple(
             &self.forwarding.source_nat_rules,
             from_zone,
@@ -358,6 +359,7 @@ impl super::Coordinator {
             egress_v6,
             now_ns,
             false,
+            &mut counter,
         )
     }
 
@@ -701,8 +703,7 @@ impl super::Coordinator {
                 .get(&endpoint.logical_ifindex)
                 .cloned()
                 .or_else(|| {
-                    (!endpoint.interface_label.is_empty())
-                        .then(|| endpoint.interface_label.clone())
+                    (!endpoint.interface_label.is_empty()).then(|| endpoint.interface_label.clone())
                 })
                 .unwrap_or_else(|| format!("wg-endpoint-{id}"));
             let c = engine.counters();
@@ -735,8 +736,7 @@ impl super::Coordinator {
                     .wg_endpoint
                     .map(|ep| ep.to_string())
                     .unwrap_or_default(),
-                session_confirmed: engine
-                    .peer_has_confirmed_session(&endpoint.wg_peer_pubkey),
+                session_confirmed: engine.peer_has_confirmed_session(&endpoint.wg_peer_pubkey),
                 last_handshake_unix_secs,
                 hs_initiations_created: c.hs_initiations_created.load(Ordering::Relaxed),
                 hs_initiation_build_failures: c
@@ -748,12 +748,8 @@ impl super::Coordinator {
                 hs_rx_drops_malformed: c.hs_rx_drops_malformed.load(Ordering::Relaxed),
                 hs_rx_drops_crypto: c.hs_rx_drops_crypto.load(Ordering::Relaxed),
                 hs_rx_drops_unknown_peer: c.hs_rx_drops_unknown_peer.load(Ordering::Relaxed),
-                hs_rx_drops_stale_response: c
-                    .hs_rx_drops_stale_response
-                    .load(Ordering::Relaxed),
-                hs_rx_drops_index_exhausted: c
-                    .hs_rx_drops_index_exhausted
-                    .load(Ordering::Relaxed),
+                hs_rx_drops_stale_response: c.hs_rx_drops_stale_response.load(Ordering::Relaxed),
+                hs_rx_drops_index_exhausted: c.hs_rx_drops_index_exhausted.load(Ordering::Relaxed),
                 hs_rx_cookie_unsupported: c.hs_rx_cookie_unsupported.load(Ordering::Relaxed),
                 rx_unknown_type: c.rx_unknown_type.load(Ordering::Relaxed),
                 hs_send_errors: c.hs_send_errors.load(Ordering::Relaxed),
@@ -764,26 +760,18 @@ impl super::Coordinator {
                 decap_drops_malformed_header: c
                     .decap_drops_malformed_header
                     .load(Ordering::Relaxed),
-                decap_drops_unknown_session: c
-                    .decap_drops_unknown_session
-                    .load(Ordering::Relaxed),
-                decap_drops_counter_ceiling: c
-                    .decap_drops_counter_ceiling
-                    .load(Ordering::Relaxed),
+                decap_drops_unknown_session: c.decap_drops_unknown_session.load(Ordering::Relaxed),
+                decap_drops_counter_ceiling: c.decap_drops_counter_ceiling.load(Ordering::Relaxed),
                 decap_drops_crypto: c.decap_drops_crypto.load(Ordering::Relaxed),
                 decap_drops_replay: c.decap_drops_replay.load(Ordering::Relaxed),
                 decap_drops_allowed_ips: c.decap_drops_allowed_ips.load(Ordering::Relaxed),
-                decap_drops_malformed_inner: c
-                    .decap_drops_malformed_inner
-                    .load(Ordering::Relaxed),
+                decap_drops_malformed_inner: c.decap_drops_malformed_inner.load(Ordering::Relaxed),
                 decap_drops_buffer: c.decap_drops_buffer.load(Ordering::Relaxed),
                 encap_packets: c.encap_packets.load(Ordering::Relaxed),
                 encap_bytes: c.encap_bytes.load(Ordering::Relaxed),
                 encap_drops_no_session: c.encap_drops_no_session.load(Ordering::Relaxed),
                 encap_drops_unconfirmed: c.encap_drops_unconfirmed.load(Ordering::Relaxed),
-                encap_drops_rekey_required: c
-                    .encap_drops_rekey_required
-                    .load(Ordering::Relaxed),
+                encap_drops_rekey_required: c.encap_drops_rekey_required.load(Ordering::Relaxed),
                 encap_drops_other: c.encap_drops_other.load(Ordering::Relaxed),
                 encap_mtu_drops: c.encap_mtu_drops.load(Ordering::Relaxed),
                 transport_send_errors: c.transport_send_errors.load(Ordering::Relaxed),
@@ -793,16 +781,12 @@ impl super::Coordinator {
                 decap_drops_expired: c.decap_drops_expired.load(Ordering::Relaxed),
                 sessions_expired: c.sessions_expired.load(Ordering::Relaxed),
                 rekeys_initiated_age: c.rekeys_initiated_age.load(Ordering::Relaxed),
-                rekeys_initiated_dead_peer: c
-                    .rekeys_initiated_dead_peer
-                    .load(Ordering::Relaxed),
+                rekeys_initiated_dead_peer: c.rekeys_initiated_dead_peer.load(Ordering::Relaxed),
                 rekeys_initiated_keepalive_no_session: c
                     .rekeys_initiated_keepalive_no_session
                     .load(Ordering::Relaxed),
                 keepalives_tx_passive: c.keepalives_tx_passive.load(Ordering::Relaxed),
-                keepalives_tx_persistent: c
-                    .keepalives_tx_persistent
-                    .load(Ordering::Relaxed),
+                keepalives_tx_persistent: c.keepalives_tx_persistent.load(Ordering::Relaxed),
                 pending_aborted_attempt_window: c
                     .pending_aborted_attempt_window
                     .load(Ordering::Relaxed),
@@ -880,8 +864,7 @@ fn overlay_shared_cos_queue_lease_statuses(
             queue.equal_flow_fail_open_reason =
                 lease.v8_equal_flow_fail_open_reason_label().to_string();
             // #1746: surface which target policy the lease enforces.
-            queue.equal_flow_target_policy =
-                lease.v8_equal_flow_target_policy_label().to_string();
+            queue.equal_flow_target_policy = lease.v8_equal_flow_target_policy_label().to_string();
         }
     }
 }

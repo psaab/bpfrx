@@ -1,9 +1,10 @@
 // Destination NAT (DNAT) table — O(1) lookup by (protocol, dst_ip, dst_port).
 
-use super::NatDecision;
+use super::{NatCounterStore, NatDecision, NatRuleCounter};
 use crate::DestinationNATRuleSnapshot;
 use rustc_hash::FxHashMap;
 use std::net::IpAddr;
+use std::sync::Arc;
 
 pub(super) use crate::ip_proto::{PROTO_TCP, PROTO_UDP};
 
@@ -24,6 +25,8 @@ pub(crate) struct DnatValue {
 struct DnatEntry {
     from_zone: Box<str>,
     value: DnatValue,
+    /// #2218: per-rule translation hit counter (None for counter_id 0).
+    hit_counter: Option<Arc<NatRuleCounter>>,
 }
 
 /// Destination NAT lookup table.
@@ -37,7 +40,10 @@ pub(crate) struct DnatTable {
 }
 
 impl DnatTable {
-    pub(crate) fn from_snapshots(snaps: &[DestinationNATRuleSnapshot]) -> Self {
+    pub(crate) fn from_snapshots(
+        snaps: &[DestinationNATRuleSnapshot],
+        nat_counters: &NatCounterStore,
+    ) -> Self {
         let mut table = DnatTable::default();
         for snap in snaps {
             let dst_ip: IpAddr = match snap.destination_address.parse() {
@@ -63,6 +69,7 @@ impl DnatTable {
                 }
                 _ => continue,
             };
+            let hit_counter = nat_counters.rule_counter(snap.counter_id);
             for proto in protos {
                 Self::insert_entry(
                     table.entries.entry(DnatKey {
@@ -80,6 +87,7 @@ impl DnatTable {
                                 snap.destination_port
                             },
                         },
+                        hit_counter: hit_counter.clone(),
                     },
                 );
             }
@@ -91,6 +99,13 @@ impl DnatTable {
     ///
     /// 1. Exact match: `(protocol, dst_ip, dst_port)`
     /// 2. Wildcard port fallback: `(protocol, dst_ip, 0)`
+    ///
+    /// Returns just the decision; existing callers/tests keep their
+    /// `Option<NatDecision>` shape. The cold path uses
+    /// [`lookup_with_counter`] (#2218) to also obtain the matched rule's
+    /// per-rule hit counter — `NatDecision` (wire-frozen over HA) does NOT
+    /// grow a field.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn lookup(
         &self,
         protocol: u8,
@@ -98,7 +113,20 @@ impl DnatTable {
         dst_port: u16,
         ingress_zone: &str,
     ) -> Option<NatDecision> {
-        let value = self
+        self.lookup_with_counter(protocol, dst_ip, dst_port, ingress_zone)
+            .map(|(decision, _)| decision)
+    }
+
+    /// #2218: as [`lookup`] but also returns the matched entry's per-rule
+    /// hit counter (if any), for the cold-path commit site.
+    pub(crate) fn lookup_with_counter(
+        &self,
+        protocol: u8,
+        dst_ip: IpAddr,
+        dst_port: u16,
+        ingress_zone: &str,
+    ) -> Option<(NatDecision, Option<Arc<NatRuleCounter>>)> {
+        let (value, hit_counter) = self
             .match_entries(
                 self.entries.get(&DnatKey {
                     protocol,
@@ -122,31 +150,34 @@ impl DnatTable {
         } else {
             None
         };
-        Some(NatDecision {
-            rewrite_src: None,
-            rewrite_dst: Some(value.new_dst_ip),
-            rewrite_src_port: None,
-            rewrite_dst_port,
-            nat64: false,
-            nptv6: false,
-        })
+        Some((
+            NatDecision {
+                rewrite_src: None,
+                rewrite_dst: Some(value.new_dst_ip),
+                rewrite_src_port: None,
+                rewrite_dst_port,
+                nat64: false,
+                nptv6: false,
+            },
+            hit_counter,
+        ))
     }
 
     fn match_entries(
         &self,
         entries: Option<&Vec<DnatEntry>>,
         ingress_zone: &str,
-    ) -> Option<DnatValue> {
+    ) -> Option<(DnatValue, Option<Arc<NatRuleCounter>>)> {
         let entries = entries?;
         entries
             .iter()
             .find(|entry| !entry.from_zone.is_empty() && entry.from_zone.as_ref() == ingress_zone)
-            .map(|entry| entry.value)
+            .map(|entry| (entry.value, entry.hit_counter.clone()))
             .or_else(|| {
                 entries
                     .iter()
                     .find(|entry| entry.from_zone.is_empty())
-                    .map(|entry| entry.value)
+                    .map(|entry| (entry.value, entry.hit_counter.clone()))
             })
     }
 

@@ -614,6 +614,7 @@ pub(super) fn static_nat_snapshot() -> ConfigSnapshot {
             next_table: String::new(),
         }],
         static_nat_rules: vec![StaticNATRuleSnapshot {
+            counter_id: 0,
             name: "web-server".to_string(),
             from_zone: "untrust".to_string(),
             external_ip: "203.0.113.10".to_string(),
