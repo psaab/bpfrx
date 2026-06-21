@@ -8098,3 +8098,31 @@ top.
   go test pkg/dataplane/... pkg/appid/... pkg/config/... green.
   **File(s)**: pkg/dataplane/compiler_filter.go,
   pkg/dataplane/compiler_filter_protocol_test.go, docs/feature-gaps.md
+
+## 2026-06-21 — #2162/#2176 deploy robustness (stale-binary hazards)
+- **Timestamp**: 2026-06-21
+- **Action**: #2162 — make the standalone deploy target env-overridable
+  (`INSTANCE_NAME=${XPF_INSTANCE:-xpf-fw}`) so `make test-deploy` can hit the
+  actual VM (e.g. ad-hoc `xpf-fwd`) instead of the hardcoded `xpf-fw`. The
+  helper push + sha-verify was already added by #1962/#1980; #2162's remaining
+  gap was the instance targeting + extending sha-verify to xpfd/cli.
+- **Action**: #2176 — new shared `test/incus/deploy-lib.sh` (sourced by both
+  `setup.sh` and `cluster-setup.sh` raw-deploy paths): (1) detect+remove a stale
+  #1917 `10-xpf-version.conf` ExecStart pin (revert to base-unit ExecStart),
+  HARD-FAIL on any OTHER operator-authored ExecStart override; (2) detect+remove
+  dangling `/usr/local/sbin/{xpfd,cli,xpf-userspace-dp}` symlinks into a removed
+  versions/ dir (which break `incus file push`); (3) sha256-verify EACH pushed
+  binary == local build; (4) after restart, assert the LIVE xpfd process image
+  sha == pushed build AND the effective systemd ExecStart is the base-unit path.
+  All four are HARD failures — a deploy now rc!=0 instead of silently running
+  stale code. The #1917 deb-dogfood path (`deploy_vm_deb`) is untouched (it
+  legitimately keeps the version pin).
+- **Validation**: `test/incus/deploy-lib-selftest.sh` (`make test-deploy-lib`)
+  mocks `incus` against a fake VM rootfs — 12/12, including the five hard-fail
+  cases (sha mismatch, absent binary, foreign ExecStart override, surviving
+  version pin, stale running binary). shellcheck -x -S warning clean on all
+  four scripts; bash -n clean. Not run on a live cluster (shared + no lock; the
+  logic is tooling and fully covered by the mocked self-test).
+- **File(s)**: test/incus/deploy-lib.sh, test/incus/deploy-lib-selftest.sh,
+  test/incus/setup.sh, test/incus/cluster-setup.sh, Makefile, docs/test_env.md,
+  CLAUDE.md
