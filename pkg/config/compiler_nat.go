@@ -41,17 +41,20 @@ func validatePoolUtilizationAlarm(cfg *Config, lenient bool) ([]string, error) {
 	return nil, fmt.Errorf("%s", msg)
 }
 
-// isHostMaskAddress reports whether addr is a host route the static-NAT /
-// NAT64 dataplane can install: a bare IP (no mask) or the canonical host
-// mask (/32 for IPv4, /128 for IPv6). It mirrors EXACTLY the Rust
-// host-mask gate added in PR #2167 (parse_nat_addr in
-// userspace-dp/src/nat/static_nat.rs, parse_pool_v4 in
-// userspace-dp/src/nat64.rs): static NAT is a strictly 1:1 host mapping
-// and NAT64 pool entries are discrete host source addresses, so a non-host
-// mask carries no representable meaning. The third return value reports
-// whether addr parsed as an IP at all; a non-IP token (e.g. an
-// address-book name) is NOT this validator's concern and is left to the
-// existing address handling.
+// isHostMaskAddress reports whether addr is a host route the static-NAT
+// dataplane can install: a bare IP (no mask) or the canonical host mask
+// (/32 for IPv4, /128 for IPv6). It mirrors EXACTLY the Rust host-mask gate
+// added in PR #2167 for static NAT (parse_nat_addr in
+// userspace-dp/src/nat/static_nat.rs): static NAT is a strictly 1:1 host
+// mapping, so a non-host mask carries no representable meaning. The second
+// return value reports whether addr parsed as an IP at all; a non-IP token
+// (e.g. an address-book name) is NOT this validator's concern and is left
+// to the existing address handling.
+//
+// NOTE: NAT64 source-pool addresses use isNAT64PoolHostAddress, NOT this
+// predicate — the Rust parse_pool_v4 (nat64.rs) is IPv4-ONLY (the pool
+// translates to IPv4 source addresses), so an IPv6 pool entry that this
+// family-agnostic predicate would accept is silently dropped there.
 func isHostMaskAddress(addr string) (host bool, parsed bool) {
 	slash := strings.IndexByte(addr, '/')
 	if slash < 0 {
@@ -72,6 +75,37 @@ func isHostMaskAddress(addr string) (host bool, parsed bool) {
 		wantMask = "32"
 	}
 	return maskPart == wantMask, true
+}
+
+// isNAT64PoolHostAddress reports whether addr is an IPv4 host route the
+// NAT64 source pool can install. It mirrors EXACTLY the Rust parse_pool_v4
+// gate (userspace-dp/src/nat64.rs): the NAT64 pool holds IPv4 source
+// addresses, so it accepts ONLY a bare IPv4 address or an IPv4 /32 — an
+// IPv6 address (bare or any mask) and a non-host IPv4 mask are both
+// silently dropped by parse_pool_v4, so the commit gate must reject them
+// too or the gate and the dataplane disagree. The second return value
+// reports whether addr parsed as an IP at all (so a non-IP address-book
+// token is left to existing handling); a parseable IPv6 returns
+// (host=false, parsed=true) — it parsed, but is not an installable pool
+// address.
+func isNAT64PoolHostAddress(addr string) (host bool, parsed bool) {
+	slash := strings.IndexByte(addr, '/')
+	if slash < 0 {
+		ip := net.ParseIP(addr)
+		if ip == nil {
+			return false, false
+		}
+		// Bare address — installable iff IPv4.
+		return ip.To4() != nil, true
+	}
+	ipPart := addr[:slash]
+	maskPart := addr[slash+1:]
+	ip := net.ParseIP(ipPart)
+	if ip == nil {
+		return false, false
+	}
+	// Only an IPv4 /32 is an installable pool host address.
+	return ip.To4() != nil && maskPart == "32", true
 }
 
 // validateNATHostMaskStrict is the #2173 strict-vs-lenient gate that
@@ -152,10 +186,12 @@ func validateNATHostMaskStrict(cfg *Config, lenient bool) ([]string, error) {
 		}
 	}
 
-	// NAT64 source-pool addresses are discrete host source IPs (parse_pool_v4
-	// host-mask gate). Range-expanded pool entries are always /32 by
-	// construction (expandAddressRange), so only an operator-authored single
-	// `pool address <X>/<non-host>` can trip this.
+	// NAT64 source-pool addresses are discrete IPv4 host source IPs: the Rust
+	// parse_pool_v4 (nat64.rs) accepts ONLY a bare IPv4 or an IPv4 /32 and
+	// silently drops everything else (an IPv6 address, a non-host IPv4 mask).
+	// Range-expanded pool entries are always /32 by construction
+	// (expandAddressRange), so only an operator-authored single
+	// `pool address <X>` can trip this.
 	for _, rs := range cfg.Security.NAT.NAT64 {
 		if rs == nil || rs.SourcePool == "" {
 			continue
@@ -172,9 +208,9 @@ func validateNATHostMaskStrict(cfg *Config, lenient bool) ([]string, error) {
 			if a == "" {
 				continue
 			}
-			if host, parsed := isHostMaskAddress(a); parsed && !host {
+			if host, parsed := isNAT64PoolHostAddress(a); parsed && !host {
 				if err := emit(fmt.Sprintf(
-					"security nat source pool %q address %q is referenced by nat64 rule-set %q source-pool and must be a host route (/32 for IPv4, /128 for IPv6); a non-host mask is silently dropped by the dataplane",
+					"security nat source pool %q address %q is referenced by nat64 rule-set %q source-pool and must be an IPv4 host route (a bare IPv4 address or /32); a non-host or IPv6 address is silently dropped by the dataplane",
 					pool.Name, a, rs.Name)); err != nil {
 					return nil, err
 				}

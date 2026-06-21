@@ -613,8 +613,12 @@ strict-vs-lenient gates) closes that gap. The host-route rule mirrors the Rust
 gate EXACTLY (shared predicate `isHostMaskAddress`):
 
 - **Scope:** static-NAT rules' `match destination-address` (→ snapshot
-  `ExternalIP`) and `then static-nat prefix` (→ `InternalIP`), plus a NAT64
-  `rule-set ... source-pool` pool's addresses (→ `parse_pool_v4`).
+  `ExternalIP`) and `then static-nat prefix` (→ `InternalIP`) are checked with
+  the family-aware `isHostMaskAddress` (matching `parse_nat_addr`). A NAT64
+  `rule-set ... source-pool` pool's addresses are checked with the **IPv4-only**
+  `isNAT64PoolHostAddress` (matching `parse_pool_v4`, which is `Ipv4Addr`-only):
+  the pool translates to IPv4 source addresses, so an IPv6 pool entry — even a
+  `/128` — is silently dropped by the dataplane and is rejected at commit too.
 - **Exempt:** `then static-nat nptv6-prefix` rules (genuine RFC 6296 prefix
   translation, never host-checked by the Rust parser) and `then static-nat
   inet` rules (a NAT64 translation whose `match` is the well-known prefix, e.g.

@@ -156,6 +156,28 @@ func TestNAT64SourcePoolHostMaskHostOK(t *testing.T) {
 	}
 }
 
+// A NAT64 source pool translates to IPv4 source addresses (the Rust
+// parse_pool_v4 is IPv4-only). An IPv6 pool address — even a /128 "host" —
+// is silently dropped by the dataplane, so the commit gate must reject it
+// (Codex MAJOR: family-agnostic isHostMaskAddress would have wrongly accepted
+// the /128).
+func TestNAT64SourcePoolHostMaskRejectsIPv6(t *testing.T) {
+	for _, a := range []string{"2001:db8::5/128", "2001:db8::5"} {
+		tree := buildTree(t, []string{
+			"set security nat source pool p64 address " + a,
+			"set security nat nat64 rule-set rs1 prefix 64:ff9b::/96",
+			"set security nat nat64 rule-set rs1 source-pool p64",
+		})
+		_, err := CompileConfig(tree)
+		if err == nil {
+			t.Fatalf("nat64 source-pool IPv6 address %q must be rejected (parse_pool_v4 is IPv4-only)", a)
+		}
+		if !strings.Contains(err.Error(), "IPv4 host route") {
+			t.Fatalf("error must say IPv4 host route for %q, got: %v", a, err)
+		}
+	}
+}
+
 // The strict commit gate must NOT brick a daemon restart: a config committed
 // before this gate existed (non-host static-NAT mask) must LOAD under the
 // lenient path (Store.Load) with the violation downgraded to a warning —
@@ -232,6 +254,34 @@ func TestIsHostMaskAddress(t *testing.T) {
 		host, parsed := isHostMaskAddress(c.in)
 		if host != c.wantHost || parsed != c.wantParsed {
 			t.Errorf("isHostMaskAddress(%q) = (host=%v, parsed=%v), want (host=%v, parsed=%v)",
+				c.in, host, parsed, c.wantHost, c.wantParsed)
+		}
+	}
+}
+
+// isNAT64PoolHostAddress is IPv4-ONLY (mirrors Rust parse_pool_v4): bare IPv4
+// or IPv4 /32 are installable; an IPv6 address (bare or any mask) and a
+// non-host IPv4 mask are not.
+func TestIsNAT64PoolHostAddress(t *testing.T) {
+	cases := []struct {
+		in         string
+		wantHost   bool
+		wantParsed bool
+	}{
+		{"100.64.0.7", true, true},       // bare IPv4
+		{"100.64.0.7/32", true, true},    // IPv4 host mask
+		{"100.64.0.0/24", false, true},   // IPv4 non-host
+		{"2001:db8::5", false, true},     // bare IPv6 -> not installable (parsed)
+		{"2001:db8::5/128", false, true}, // IPv6 /128 -> not installable (parsed)
+		{"2001:db8::/64", false, true},   // IPv6 non-host
+		{"100.64.0.7/128", false, true},  // cross-family mask on IPv4
+		{"not-an-ip", false, false},      // not an IP
+		{"100.64.0.7/", false, true},     // empty mask -> non-host
+	}
+	for _, c := range cases {
+		host, parsed := isNAT64PoolHostAddress(c.in)
+		if host != c.wantHost || parsed != c.wantParsed {
+			t.Errorf("isNAT64PoolHostAddress(%q) = (host=%v, parsed=%v), want (host=%v, parsed=%v)",
 				c.in, host, parsed, c.wantHost, c.wantParsed)
 		}
 	}
