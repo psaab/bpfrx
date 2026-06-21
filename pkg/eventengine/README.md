@@ -153,7 +153,10 @@ cannot occur.
   action — `HandleEvent` enqueues each triggered policy onto the single worker,
   which applies them serially, so none is dropped racing the config lock (the
   #2216-B all-but-one drop the pre-#2157 per-probe `executeCommands` path had).
-  Regression-locked by `TestConcurrent_OneEventMatchesManyPolicies_2216B`.
+  The cross-goroutine drop race is regression-locked by the pre-existing
+  `TestQueue_ConcurrentProbesSerialize` (8 concurrent `HandleEvent` callers);
+  `TestConcurrent_OneEventMatchesManyPolicies_2216B` adds the complementary
+  single-event fan-out invariant (one event → all N matching policies commit).
 - `CommitFn` holds the apply semaphore across both commit and apply (#846) so
   event-triggered commits serialize with operator commits.
 - The engine holds no engine-level lock (`e.mu`) while in configure/commit

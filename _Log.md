@@ -8651,7 +8651,11 @@ top.
   fail-on-revert regression tests #2216 asked for (none existed): finding A
   (no-within bounded to 60s + below-threshold bounded to clause horizon),
   finding B (one event matching N policies commits ALL N). Proven fail-on-
-  revert: deleting prune-on-append → windows hold 1000/1000 entries; reverting
-  to per-policy concurrent racing apply → only 1 of 3 commits (timeout).
+  revert for finding A: deleting prune-on-append → windows hold 1000/1000
+  entries. Finding B's cross-goroutine drop race stays locked by the
+  pre-existing `TestQueue_ConcurrentProbesSerialize` (added by #2157); the new
+  single-event fan-out test is a complementary invariant (not a standalone
+  1-of-3 revert-lock — a faithful pre-#2157 sequential revert handled a single
+  multi-match event in-order, so it does not reliably trip that one test).
 - **File(s)**: pkg/eventengine/engine_window_test.go (new),
   pkg/eventengine/README.md
