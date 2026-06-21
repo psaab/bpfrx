@@ -162,6 +162,22 @@ the warning, so a concurrent drop burst yields one log line per interval
 was an unsynchronized read-modify-write across the two goroutines (a
 `go test -race` data race).
 
+The self-sent-advert filter is a second cross-goroutine hazard.
+`localIP` / `localIPv6` are resolved once in `openSocket()` — **before**
+any goroutine starts — but that resolution can come back empty (no IPv4
+address assigned yet, or IPv6 DAD still running). In that case
+`sendPacket()` / `sendPacketIPv6()` perform a one-shot **lazy-resolve
+write** from the run-loop goroutine, while every receiver
+(`receiver` / `receiverIPv6` / `parseAfPacketIPv4` / `parseAfPacketIPv6`)
+reads the fields to drop self-sent adverts. With the fields as plain
+`net.IP` this write/read was an unsynchronized data race (#2258, fires
+at most once — only when the address was unresolved at socket-open).
+They are now `atomic.Pointer[net.IP]` accessed solely via
+`getLocalIP`/`setLocalIP` and `getLocalIPv6`/`setLocalIPv6` (a `nil`
+pointer means unresolved). The lazy-resolve semantics are preserved —
+the address still becomes available once it is resolvable — and the
+packet hot path stays lock-free, mirroring the `lastDropWarn` atomic.
+
 ### AF_PACKET cBPF filter + IPv6 extension headers (#2155)
 
 The AF_PACKET receiver attaches a cBPF prefilter
