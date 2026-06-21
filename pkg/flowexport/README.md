@@ -147,3 +147,10 @@ reads `sampleCounter`), so it is held by pointer in the bundle.
   event-reader callback. The export goroutine (started in `Run(ctx)`)
   is what actually transmits and refreshes templates; record assembly
   itself isn't offloaded.
+- Collector destination and source-bind addresses are built with
+  `net.JoinHostPort` (`manager.go` / `transport.go`), so an IPv6
+  flow-server or `source-address` is bracketed (`[2001:db8::9]:4739`)
+  and parses under `net.ResolveUDPAddr` / `net.Dial`. A plain
+  `"%s:%d"` / `addr+":0"` left an IPv6 literal unbracketed and
+  unparseable, so IPv6 collectors silently never dialed (#2183). IPv4
+  addresses are unaffected.
