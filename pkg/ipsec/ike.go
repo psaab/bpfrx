@@ -171,6 +171,71 @@ func hasIKEChain(cfg *config.IPsecConfig, ikePolicyName string) bool {
 	return ok
 }
 
+// normalizeEncAlg maps a Junos encryption-algorithm name to its swanctl
+// token. For AES-GCM it returns the explicit 16-octet-ICV token
+// (aes-256-gcm -> aes256gcm16). This is a canonicalization for clarity,
+// not a parse fix: strongSwan also accepts the bare "aes256gcm" alias
+// (it maps to ENCR_AES_GCM_ICV16 in proposal_keywords_static.txt), so
+// the previous bare render parsed fine — the suffix just makes the ICV
+// length explicit in the generated config, matching the operator's
+// Junos intent (Junos AES-GCM uses a 16-octet ICV). The load-bearing
+// #2125 correctness fix is the explicit IKE PRF the callers add for
+// AEAD, not this spelling. isGCM reports whether the algorithm is AEAD
+// (the caller skips the integrity algorithm for AEAD and, for IKE,
+// appends an explicit PRF instead).
+//
+// Already-suffixed forms (e.g. aes256gcm128 fed directly by config or
+// older tests) pass through the generic dash-strip unchanged so they
+// keep rendering as before. Non-GCM algorithms return ("", false) and
+// the caller applies the historical "-cbc"/"-" normalization.
+func normalizeEncAlg(enc string) (token string, isGCM bool) {
+	switch enc {
+	case "aes-128-gcm", "aes128gcm":
+		return "aes128gcm16", true
+	case "aes-192-gcm", "aes192gcm":
+		return "aes192gcm16", true
+	case "aes-256-gcm", "aes256gcm":
+		return "aes256gcm16", true
+	}
+	if strings.Contains(enc, "gcm") {
+		// Already carries an ICV suffix (or some other GCM spelling);
+		// strip Junos punctuation but otherwise leave it intact.
+		t := strings.ReplaceAll(enc, "-cbc", "")
+		t = strings.ReplaceAll(t, "-", "")
+		return t, true
+	}
+	return "", false
+}
+
+// gcmPRF derives the swanctl PRF token for an IKE (Phase 1) AEAD
+// proposal. AEAD ciphers carry no integrity algorithm for strongSwan to
+// derive a PRF from, so IKEv2 GCM proposals MUST name a PRF explicitly
+// (e.g. aes256gcm16-prfsha256-modp2048). When the proposal names an
+// auth/integrity algorithm we mirror it as the PRF; otherwise we default
+// to prfsha256.
+func gcmPRF(authAlg string) string {
+	switch {
+	case strings.Contains(authAlg, "512"):
+		return "prfsha512"
+	case strings.Contains(authAlg, "384"):
+		return "prfsha384"
+	case strings.Contains(authAlg, "256"):
+		return "prfsha256"
+	case strings.Contains(authAlg, "sha1"), strings.Contains(authAlg, "sha-1"):
+		return "prfsha1"
+	default:
+		return "prfsha256"
+	}
+}
+
+// normalizeAuthAlg maps a Junos authentication-algorithm name to its
+// swanctl integrity token (hmac-sha-256 -> sha256).
+func normalizeAuthAlg(authAlg string) string {
+	a := strings.ReplaceAll(authAlg, "hmac-", "")
+	a = strings.ReplaceAll(a, "-", "")
+	return a
+}
+
 // buildIKEProposalFromIKE builds a swanctl IKE proposal string from an IKE proposal.
 func buildIKEProposalFromIKE(prop *config.IKEProposal) string {
 	var parts []string
@@ -179,15 +244,17 @@ func buildIKEProposalFromIKE(prop *config.IKEProposal) string {
 	if enc == "" {
 		enc = "aes256"
 	}
-	enc = strings.ReplaceAll(enc, "-cbc", "")
-	enc = strings.ReplaceAll(enc, "-", "")
-	parts = append(parts, enc)
-
-	if prop.AuthAlg != "" && !strings.Contains(prop.EncryptionAlg, "gcm") {
-		auth := prop.AuthAlg
-		auth = strings.ReplaceAll(auth, "hmac-", "")
-		auth = strings.ReplaceAll(auth, "-", "")
-		parts = append(parts, auth)
+	if tok, isGCM := normalizeEncAlg(enc); isGCM {
+		parts = append(parts, tok)
+		// IKEv2 AEAD proposals require an explicit PRF.
+		parts = append(parts, gcmPRF(prop.AuthAlg))
+	} else {
+		enc = strings.ReplaceAll(enc, "-cbc", "")
+		enc = strings.ReplaceAll(enc, "-", "")
+		parts = append(parts, enc)
+		if prop.AuthAlg != "" {
+			parts = append(parts, normalizeAuthAlg(prop.AuthAlg))
+		}
 	}
 
 	if prop.DHGroup > 0 {
@@ -205,16 +272,18 @@ func buildIKEProposal(prop *config.IPsecProposal) string {
 	if enc == "" {
 		enc = "aes256"
 	}
-	enc = strings.ReplaceAll(enc, "-cbc", "")
-	enc = strings.ReplaceAll(enc, "-", "")
-	parts = append(parts, enc)
-
-	// IKE always includes integrity/PRF (even for GCM, swanctl adds PRFHMACSHA256 implicitly)
-	if prop.AuthAlg != "" && !strings.Contains(prop.EncryptionAlg, "gcm") {
-		auth := prop.AuthAlg
-		auth = strings.ReplaceAll(auth, "hmac-", "")
-		auth = strings.ReplaceAll(auth, "-", "")
-		parts = append(parts, auth)
+	if tok, isGCM := normalizeEncAlg(enc); isGCM {
+		parts = append(parts, tok)
+		// IKEv2 AEAD proposals require an explicit PRF — there is no
+		// integrity algorithm to derive one from.
+		parts = append(parts, gcmPRF(prop.AuthAlg))
+	} else {
+		enc = strings.ReplaceAll(enc, "-cbc", "")
+		enc = strings.ReplaceAll(enc, "-", "")
+		parts = append(parts, enc)
+		if prop.AuthAlg != "" {
+			parts = append(parts, normalizeAuthAlg(prop.AuthAlg))
+		}
 	}
 
 	if prop.DHGroup > 0 {
@@ -232,17 +301,18 @@ func buildESPProposal(prop *config.IPsecProposal, pfsGroup int) string {
 	if enc == "" {
 		enc = "aes256"
 	}
-	// Normalize Junos names to swanctl names
-	enc = strings.ReplaceAll(enc, "-cbc", "")
-	enc = strings.ReplaceAll(enc, "-", "")
-	parts = append(parts, enc)
-
-	// Authentication algorithm (skip for GCM modes)
-	if !strings.Contains(prop.EncryptionAlg, "gcm") && prop.AuthAlg != "" {
-		auth := prop.AuthAlg
-		auth = strings.ReplaceAll(auth, "hmac-", "")
-		auth = strings.ReplaceAll(auth, "-", "")
-		parts = append(parts, auth)
+	// Normalize Junos names to swanctl names. AEAD (GCM) ciphers carry
+	// an ICV suffix and take no separate integrity algorithm and no PRF.
+	if tok, isGCM := normalizeEncAlg(enc); isGCM {
+		parts = append(parts, tok)
+	} else {
+		enc = strings.ReplaceAll(enc, "-cbc", "")
+		enc = strings.ReplaceAll(enc, "-", "")
+		parts = append(parts, enc)
+		// Authentication algorithm (non-GCM only)
+		if prop.AuthAlg != "" {
+			parts = append(parts, normalizeAuthAlg(prop.AuthAlg))
+		}
 	}
 
 	// DH group
