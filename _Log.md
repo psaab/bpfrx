@@ -1,5 +1,36 @@
 # Action Log
 
+## 2026-06-21 — #2146 (PR #2189) fold: close IPv6 ext-header overshoot fail-open
+
+- **Timestamp**: 2026-06-21
+- **Action**: Folded the independent review's findings into the #2146
+  IPv6-frag screen fail-closed PR. **F1 (MAJOR security fail-open):** in
+  the IPv6 extension-header walk (`extract_screen_info`), an intermediate
+  header (HOP/ROUTING/DEST or AUTH) could advance `offset` past
+  `frame.len()` via its own DECLARED length; the next iteration's terminal
+  arm (`PROTO_TCP` / `_` / `NEXTHDR_FRAGMENT`) then trusted the
+  out-of-range `offset` and `break`-returned `Ok{is_first_fragment:false}`
+  — a SYN bypassed `syn-frag` (IDS evasion the PR set out to close).
+  Fix: re-validate `offset > frame.len()` at the TOP of the loop body
+  before any arm runs, covering all advances and all terminal arms while
+  preserving the exact-fit boundary (strict `>`, ≤8-iter cap kept).
+  **F2 (minor doc):** corrected the `ScreenParseError::screen_reason`
+  comment — there is NO `screenIPMalformed` Go decoder mapping; the flag
+  (1<<18) decodes via the generic `screen(0x%x)` fallback in
+  `pkg/logging/ringbuf.go`, same as the unmapped `icmp-fragment` (1<<17).
+  **F3 (minor warning):** removed the now-unused `ScreenParseError` import
+  from `afxdp/mod.rs` (call sites use `.screen_reason()` on the value) and
+  gated the crate-wide re-export `#[cfg(test)]` (last non-test consumer
+  gone). **F4 (tests):** added two overshoot regressions —
+  HOP-BY-HOP HdrExtLen=200 → inner TCP, and ROUTING overshoot →
+  unknown inner — both assert `Err(TruncatedIpv6ExtChain)` (fail-CLOSED).
+  Both FAIL against the pre-F1 code (verified: returned Ok → expect_err
+  panics) and PASS after; the exact-fit boundary test stays green (no
+  over-rejection). screen 94/94 stable across 5 runs; poll_stages 2/2;
+  release build clean (no new warnings).
+- **File(s)**: userspace-dp/src/screen/extract.rs,
+  userspace-dp/src/screen/packet.rs, userspace-dp/src/screen/mod.rs,
+  userspace-dp/src/afxdp/mod.rs, userspace-dp/src/screen/tests.rs
 ## 2026-06-21 — #2161 NAT64 translations counter + show security flow session
 
 - **Timestamp**: 2026-06-21
@@ -323,6 +354,24 @@
   docs/feature-gaps.md, docs/pr/2134-screen-session-limit-enforce/self-review.md
 - **Validation**: cargo build --release clean; cargo test --release green.
   Live screen/flood smoke on the loss cluster is PENDING-PARENT.
+
+## 2026-06-21 — #2146 userspace screen: truncated IPv6 fragment header fails OPEN
+
+- **2026-06-21** — Fail-closed the screen extractor: `extract_screen_info` now
+  returns `Result<ScreenPacketInfo, ScreenParseError>`; a truncated/unparseable
+  IPv6 base or extension-header chain returns `Err(TruncatedIpv6ExtChain)` instead
+  of silently breaking the walk with `is_first_fragment=false` (which let a
+  SYN-bearing truncated IPv6 fragment bypass `syn-frag` — IDS evasion now that the
+  BPF screen path is retired #1373/#1476). Both production poll-stage call sites map
+  `Err` to a drop+count+`ip-malformed` screen event (`SCREEN_IP_MALFORMED` 1<<18).
+  Removed the stale "keep the BPF screen path enabled" comment. New extractor tests
+  (truncated frag / truncated base / truncated hop-by-hop / exactly-enough boundary)
+  fail against pre-fix fail-open code; release build + screen/event_emit/poll_stages
+  suites green, 5/5 flake. Live screen/flood smoke PENDING-PARENT.
+- **File(s)**: userspace-dp/src/screen/extract.rs, userspace-dp/src/screen/packet.rs,
+  userspace-dp/src/screen/mod.rs, userspace-dp/src/screen/tests.rs,
+  userspace-dp/src/afxdp/mod.rs, userspace-dp/src/afxdp/poll_stages.rs,
+  userspace-dp/src/afxdp/event_emit.rs
 
 ## 2026-06-21 — #2173 (PR #2182) fold: v4-mapped-v6 host-mask family divergence
 

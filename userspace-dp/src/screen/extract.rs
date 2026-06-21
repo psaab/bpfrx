@@ -4,10 +4,19 @@
 
 use std::net::IpAddr;
 
-use super::packet::{PROTO_TCP, ScreenPacketInfo};
+use super::packet::{PROTO_TCP, ScreenPacketInfo, ScreenParseError};
 
 /// Extract screen-relevant fields from raw packet bytes and metadata.
 /// This avoids full packet parsing — just reads the fields needed for checks.
+///
+/// Returns `Err(ScreenParseError)` when the L3 header cannot be parsed
+/// far enough to evaluate the fragment/TCP screens (#2146). The caller
+/// MUST treat an `Err` as FAIL-CLOSED (drop). A truncated IPv6
+/// extension-header chain used to `break` out of the walk silently and
+/// leave `is_first_fragment=false`, which let a SYN-bearing frame with
+/// a truncated FRAGMENT header bypass the `syn-frag` screen — the exact
+/// IDS-evasion the screen claims to defend against now that the BPF
+/// screen path (#1373/#1476) that masked it is gone.
 pub(crate) fn extract_screen_info(
     frame: &[u8],
     addr_family: u8,
@@ -19,7 +28,7 @@ pub(crate) fn extract_screen_info(
     src_port: u16,
     dst_port: u16,
     l3_offset: usize,
-) -> ScreenPacketInfo {
+) -> Result<ScreenPacketInfo, ScreenParseError> {
     let mut info = ScreenPacketInfo {
         addr_family,
         protocol,
@@ -54,25 +63,23 @@ pub(crate) fn extract_screen_info(
         info.is_first_fragment =
             (info.ip_frag_off & 0x2000) != 0 && (info.ip_frag_off & 0x1FFF) == 0;
         tcp_offset = Some(l3_offset + (info.ip_ihl as usize) * 4);
-    } else if addr_family == libc::AF_INET6 as u8 && l3_offset + 40 <= frame.len() {
+    } else if addr_family == libc::AF_INET6 as u8 {
         // IPv6: walk the extension header chain looking for
         // NEXTHDR_FRAGMENT (44). Fixed IPv6 base header is 40 bytes.
         // We bound the walk to MAX_EXT_HDRS=8 like the BPF parser.
         //
-        // Parity note (#1137 / Codex round-1): if the chain is
-        // truncated (out-of-bounds before we find a FRAGMENT
-        // header), we silently `break` and leave is_first_fragment
-        // at its default `false`. The BPF `parse_ipv6hdr` returns
-        // -1 on the same condition, causing the packet to be
-        // dropped earlier in the pipeline. On the userspace-dp
-        // path the upstream metadata parser (try_parse_metadata)
-        // should already have rejected malformed IPv6 packets
-        // before they reach extract_screen_info, so the parity
-        // gap is theoretical. If a SYN-bearing IPv6 frame with a
-        // truncated FRAGMENT header somehow reaches the screen
-        // layer, it would pass syn_frag — operators relying on
-        // that defense should keep the BPF screen path enabled
-        // upstream of userspace-dp.
+        // FAIL-CLOSED (#2146): every place the walk runs out of bytes
+        // (the base header is short, or an extension header's declared
+        // length runs past the captured frame) returns
+        // `Err(TruncatedIpv6ExtChain)`. Returning defaults here would
+        // leave `is_first_fragment=false` and let a SYN-bearing frame
+        // with a truncated FRAGMENT header bypass the `syn-frag`
+        // screen. The legacy BPF `parse_ipv6hdr` returned -1 (drop)
+        // on the same condition; with the BPF screen path retired
+        // (#1373/#1476) the extractor is the only enforcement point.
+        if l3_offset + 40 > frame.len() {
+            return Err(ScreenParseError::TruncatedIpv6ExtChain);
+        }
         const NEXTHDR_HOP: u8 = 0;
         const NEXTHDR_ROUTING: u8 = 43;
         const NEXTHDR_FRAGMENT: u8 = 44;
@@ -81,24 +88,38 @@ pub(crate) fn extract_screen_info(
         let mut nexthdr = frame[l3_offset + 6];
         let mut offset = l3_offset + 40;
         for _ in 0..8 {
+            // FAIL-CLOSED (#2146/#2189): an intermediate extension header
+            // can advance `offset` past the captured frame using its own
+            // DECLARED length (HOP/ROUTING/DEST `hdr_ext_len`, AUTH
+            // `payload_len`). The terminal arms below (`NEXTHDR_FRAGMENT`,
+            // `PROTO_TCP`, `_`) read or trust `offset`, so re-validate it
+            // at the TOP of every iteration before any arm runs. Without
+            // this, a base NextHdr=HOP-BY-HOP with HdrExtLen=200 jumps
+            // `offset` far past `frame.len()`, then an inner NextHdr=TCP
+            // hits `PROTO_TCP`, sets `tcp_offset=Some(offset)` and breaks
+            // with `Ok{is_first_fragment:false}` — a SYN bypasses the
+            // `syn-frag` screen (the IDS evasion #2146 set out to close).
+            if offset > frame.len() {
+                return Err(ScreenParseError::TruncatedIpv6ExtChain);
+            }
             match nexthdr {
                 NEXTHDR_HOP | NEXTHDR_ROUTING | NEXTHDR_DEST => {
                     if offset + 2 > frame.len() {
-                        break;
+                        return Err(ScreenParseError::TruncatedIpv6ExtChain);
                     }
                     nexthdr = frame[offset];
                     offset += (frame[offset + 1] as usize + 1) * 8;
                 }
                 NEXTHDR_AUTH => {
                     if offset + 2 > frame.len() {
-                        break;
+                        return Err(ScreenParseError::TruncatedIpv6ExtChain);
                     }
                     nexthdr = frame[offset];
                     offset += (frame[offset + 1] as usize + 2) * 4;
                 }
                 NEXTHDR_FRAGMENT => {
                     if offset + 8 > frame.len() {
-                        break;
+                        return Err(ScreenParseError::TruncatedIpv6ExtChain);
                     }
                     // IPv6 frag_off layout (big-endian u16 at offset+2):
                     //   offset (13 bits, top) | reserved (2 bits) | M (1 bit, lowest)
@@ -157,5 +178,5 @@ pub(crate) fn extract_screen_info(
         }
     }
 
-    info
+    Ok(info)
 }
