@@ -1,5 +1,11 @@
 # Action Log
 
+## 2026-06-21 — #2173 static-NAT / NAT64 host-mask commit-time validation
+
+- **Timestamp**: 2026-06-21
+- **Action**: Added `validateNATHostMaskStrict` (strict-vs-lenient gate, `lenientNATHostMask` flag) rejecting a non-host (non-/32//128) static-NAT match/prefix or NAT64 source-pool address at commit, mirroring the Rust PR #2167 host-mask gate (NPTv6 + `inet` rules exempt). New `compiler_nat_host_mask_test.go`; doc section in `docs/config-schema.md`; fixed `TestNAT64` fixture to a /32 pool address.
+- **File(s)**: pkg/config/compiler_nat.go, pkg/config/compiler.go, pkg/config/compiler_nat_host_mask_test.go, pkg/config/parser_security_test.go, docs/config-schema.md
+
 ## 2026-06-20 — #2120 PR #2166 Copilot fold (doc nits + SELF-HEAL/HOLD expect hardening)
 
 - **Timestamp**: 2026-06-20
