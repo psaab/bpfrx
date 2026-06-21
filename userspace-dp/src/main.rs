@@ -8,7 +8,6 @@ mod event_stream;
 #[cfg(test)]
 mod fairness;
 mod filter;
-mod flowexport;
 mod ip_proto;
 mod nat;
 mod nat64;

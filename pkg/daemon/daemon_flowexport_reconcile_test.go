@@ -16,6 +16,12 @@ import (
 // export to a single (loopback, unreachable-but-resolvable) collector.
 // UDP connect does not require a live listener, so NewExporter succeeds
 // with no external dependency.
+//
+// #2129: it now carries a `services flow-monitoring version9` stanza.
+// BuildExportConfig gates the v9 exporter on Version9 != nil (mirroring
+// the IPFIX VersionIPFIX guard), so without this stanza no v9 exporter
+// would start and the whole reconcile suite below — which asserts the v9
+// exporter DOES start — would fail.
 func flowSamplingConfig(collector string, rate int) *config.Config {
 	cfg := &config.Config{}
 	cfg.ForwardingOptions.Sampling = &config.SamplingConfig{
@@ -31,19 +37,26 @@ func flowSamplingConfig(collector string, rate int) *config.Config {
 			},
 		},
 	}
+	cfg.Services.FlowMonitoring = &config.FlowMonitoringConfig{
+		Version9: &config.NetFlowV9Config{
+			Templates: map[string]*config.NetFlowV9Template{
+				"t": {Name: "t"},
+			},
+		},
+	}
 	return cfg
 }
 
 // ipfixSamplingConfig augments a v9 sampling config with a
 // services flow-monitoring version-ipfix stanza so the IPFIX exporter
-// also becomes configured.
+// also becomes configured. The base config already sets Version9 (#2129),
+// so this config drives BOTH exporters — used by the no-callback-leak and
+// independence tests.
 func ipfixSamplingConfig(collector string, rate int) *config.Config {
 	cfg := flowSamplingConfig(collector, rate)
-	cfg.Services.FlowMonitoring = &config.FlowMonitoringConfig{
-		VersionIPFIX: &config.NetFlowIPFIXConfig{
-			Templates: map[string]*config.NetFlowIPFIXTemplate{
-				"t": {Name: "t"},
-			},
+	cfg.Services.FlowMonitoring.VersionIPFIX = &config.NetFlowIPFIXConfig{
+		Templates: map[string]*config.NetFlowIPFIXTemplate{
+			"t": {Name: "t"},
 		},
 	}
 	return cfg
@@ -272,5 +285,77 @@ func TestApplyConfigLockedReconcilesFlowExporters(t *testing.T) {
 		t.Fatal("applyConfigLocked did not reconcile the flow exporter: " +
 			"a committed forwarding-options sampling stanza left the NetFlow " +
 			"exporter unstarted (missing reconcileFlowExporters wiring)")
+	}
+}
+
+// ipfixOnlySamplingConfig returns a config with sampling + flow-server +
+// `services flow-monitoring version-ipfix` but NO `version9` stanza. It is
+// the #2129 regression fixture: an IPFIX-only operator must NOT get a v9
+// exporter.
+func ipfixOnlySamplingConfig(collector string, rate int) *config.Config {
+	cfg := flowSamplingConfig(collector, rate)
+	// Drop the v9 stanza the base helper installs; keep only IPFIX.
+	cfg.Services.FlowMonitoring = &config.FlowMonitoringConfig{
+		VersionIPFIX: &config.NetFlowIPFIXConfig{
+			Templates: map[string]*config.NetFlowIPFIXTemplate{
+				"t": {Name: "t"},
+			},
+		},
+	}
+	return cfg
+}
+
+// TestReconcileIPFIXOnlyDoesNotStartV9 is the #2129 regression guard:
+// a config with sampling + flow-server + version-ipfix but NO version9
+// must start the IPFIX exporter and must NOT start the v9 exporter.
+// Before the BuildExportConfig Version9 gate, this config started a v9
+// exporter too, emitting an unrequested NetFlow v9 stream to the
+// collector. If the gate is removed this test fails (v9 exporter live).
+func TestReconcileIPFIXOnlyDoesNotStartV9(t *testing.T) {
+	d := newFlowTestDaemon()
+	t.Cleanup(d.stopFlowExporter)
+	t.Cleanup(d.stopIPFIXExporter)
+
+	if !d.reconcileFlowExporters(ipfixOnlySamplingConfig("127.0.0.1", 100)) {
+		t.Fatal("an IPFIX-only config must reconcile (the IPFIX exporter starts)")
+	}
+	if b := d.ipfixBundlePtr.Load(); b == nil || b.exp == nil {
+		t.Fatal("IPFIX exporter must be live for an IPFIX-only config")
+	}
+	if b := d.flowBundle.Load(); b != nil && b.exp != nil {
+		t.Fatal("#2129: no v9 exporter may start without a `version9` stanza " +
+			"— an IPFIX-only operator must not get an unrequested v9 stream")
+	}
+	if n := d.eventReader.CallbackCount(); n != 1 {
+		t.Fatalf("#2129: IPFIX-only config must register exactly 1 callback "+
+			"(IPFIX), got %d", n)
+	}
+}
+
+// TestReconcileV9RequiresVersion9Stanza is the positive/negative pair for
+// the #2129 gate at the daemon reconcile layer: sampling + flow-server
+// alone (no flow-monitoring stanza at all) starts no v9 exporter, and
+// adding `version9` in a later commit starts it.
+func TestReconcileV9RequiresVersion9Stanza(t *testing.T) {
+	d := newFlowTestDaemon()
+	t.Cleanup(d.stopFlowExporter)
+
+	// sampling + flow-server but NO services flow-monitoring stanza.
+	cfg := flowSamplingConfig("127.0.0.1", 100)
+	cfg.Services.FlowMonitoring = nil
+	if d.reconcileFlowExporters(cfg) {
+		t.Fatal("#2129: sampling without any flow-monitoring stanza must " +
+			"NOT start a v9 exporter (no change to reconcile)")
+	}
+	if b := d.flowBundle.Load(); b != nil && b.exp != nil {
+		t.Fatal("#2129: no v9 exporter may start without a `version9` stanza")
+	}
+
+	// Add version9 — now the exporter must start.
+	if !d.reconcileFlowExporters(flowSamplingConfig("127.0.0.1", 100)) {
+		t.Fatal("adding version9 must start the v9 exporter")
+	}
+	if b := d.flowBundle.Load(); b == nil || b.exp == nil {
+		t.Fatal("v9 exporter must be live once version9 is configured")
 	}
 }

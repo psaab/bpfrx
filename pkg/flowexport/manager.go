@@ -54,32 +54,44 @@ func BuildExportConfig(svc *config.ServicesConfig, fo *config.ForwardingOptionsC
 	if fo == nil || fo.Sampling == nil || len(fo.Sampling.Instances) == 0 {
 		return nil
 	}
+	// #2129: a NetFlow v9 exporter must only start when `services
+	// flow-monitoring version9` is configured. This mirrors the
+	// VersionIPFIX guard in BuildIPFIXExportConfig below. Without it an
+	// IPFIX-only operator (or one with sampling+flow-server but no
+	// flow-monitoring stanza at all) received an unrequested v9 datagram
+	// stream at the collector. NOTE: this fixes only the *unrequested* v9
+	// stream; a flow-server configured with BOTH version9 and
+	// version-ipfix still double-exports to one collector (each version
+	// passes its own gate) — that per-flow-server version-binding fix is
+	// deferred to a follow-up.
+	if svc == nil || svc.FlowMonitoring == nil || svc.FlowMonitoring.Version9 == nil {
+		return nil
+	}
 
 	// Collect template timeouts from services config
 	activeTimeout := 60 * time.Second
 	inactiveTimeout := 15 * time.Second
 	refreshRate := 60 * time.Second
 
+	// The guard above guarantees svc.FlowMonitoring.Version9 != nil.
 	var v9opts V9TemplateOptions
-	if svc != nil && svc.FlowMonitoring != nil && svc.FlowMonitoring.Version9 != nil {
-		for _, tmpl := range svc.FlowMonitoring.Version9.Templates {
-			if tmpl.FlowActiveTimeout > 0 {
-				activeTimeout = time.Duration(tmpl.FlowActiveTimeout) * time.Second
-			}
-			if tmpl.FlowInactiveTimeout > 0 {
-				inactiveTimeout = time.Duration(tmpl.FlowInactiveTimeout) * time.Second
-			}
-			if tmpl.TemplateRefreshRate > 0 {
-				refreshRate = time.Duration(tmpl.TemplateRefreshRate) * time.Second
-			}
-			for _, ext := range tmpl.ExportExtensions {
-				switch ext {
-				case "flow-dir":
-					v9opts.IncludeFlowDir = true
-				}
-			}
-			break // use first template
+	for _, tmpl := range svc.FlowMonitoring.Version9.Templates {
+		if tmpl.FlowActiveTimeout > 0 {
+			activeTimeout = time.Duration(tmpl.FlowActiveTimeout) * time.Second
 		}
+		if tmpl.FlowInactiveTimeout > 0 {
+			inactiveTimeout = time.Duration(tmpl.FlowInactiveTimeout) * time.Second
+		}
+		if tmpl.TemplateRefreshRate > 0 {
+			refreshRate = time.Duration(tmpl.TemplateRefreshRate) * time.Second
+		}
+		for _, ext := range tmpl.ExportExtensions {
+			switch ext {
+			case "flow-dir":
+				v9opts.IncludeFlowDir = true
+			}
+		}
+		break // use first template
 	}
 
 	ec := &ExportConfig{

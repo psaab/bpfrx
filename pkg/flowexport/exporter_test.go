@@ -9,6 +9,22 @@ import (
 	"github.com/psaab/xpf/pkg/config"
 )
 
+// v9Svc returns a minimal *config.ServicesConfig carrying a
+// `flow-monitoring version9` stanza. BuildExportConfig gates the v9
+// exporter on Version9 != nil (#2129), so tests that assert a non-nil
+// ExportConfig must pass this instead of a nil services config.
+func v9Svc() *config.ServicesConfig {
+	return &config.ServicesConfig{
+		FlowMonitoring: &config.FlowMonitoringConfig{
+			Version9: &config.NetFlowV9Config{
+				Templates: map[string]*config.NetFlowV9Template{
+					"t": {Name: "t"},
+				},
+			},
+		},
+	}
+}
+
 func TestBuildExportConfig_InlineJflowSourceAddress(t *testing.T) {
 	fo := &config.ForwardingOptionsConfig{
 		Sampling: &config.SamplingConfig{
@@ -27,7 +43,7 @@ func TestBuildExportConfig_InlineJflowSourceAddress(t *testing.T) {
 		},
 	}
 
-	ec := BuildExportConfig(nil, fo)
+	ec := BuildExportConfig(v9Svc(), fo)
 	if ec == nil {
 		t.Fatal("expected non-nil ExportConfig")
 	}
@@ -163,7 +179,7 @@ func TestBuildExportConfig_FlowServerSourceAddressTakesPrecedence(t *testing.T) 
 		},
 	}
 
-	ec := BuildExportConfig(nil, fo)
+	ec := BuildExportConfig(v9Svc(), fo)
 	if ec == nil {
 		t.Fatal("expected non-nil ExportConfig")
 	}
@@ -195,7 +211,7 @@ func TestBuildExportConfig_DistinctSourceAddressesAreNotDeduped(t *testing.T) {
 		},
 	}
 
-	ec := BuildExportConfig(nil, fo)
+	ec := BuildExportConfig(v9Svc(), fo)
 	if ec == nil {
 		t.Fatal("expected non-nil ExportConfig")
 	}
