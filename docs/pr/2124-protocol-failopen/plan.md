@@ -1,6 +1,6 @@
 # #2124 — Policy application term with an unparseable named protocol fails OPEN to match-any
 
-**Status:** DRAFT v3 — Codex r2 PLAN-NEEDS-MAJOR addressed; pending r3
+**Status:** PLAN-READY v3 — Codex r3 PLAN-NEEDS-MINOR (2 doc minors fixed); all substantive checks pass. Gemini companion non-functional this session (infra failures) — parent should dispatch an independent second reviewer.
 
 ## v3 changelog (addresses Codex r2 PLAN-NEEDS-MAJOR)
 
@@ -146,11 +146,20 @@ introduces a worse hazard", which IS a valid verdict.)*
 - **Predefined junos apps** (`pkg/config/predefined.go`) only use
   `tcp/udp/icmp/gre/89/4` — all already parse. The risk vector is
   **user-defined** `applications` with named L3 protocols.
-- **`SnapshotIntegrityError` is a whole-snapshot hammer.** The preflight
+- **`SnapshotIntegrityError` whole-snapshot reject.** The preflight
   in `snapshot_refresh.rs:69` REJECTS the ENTIRE snapshot and keeps
-  previous state on any integrity error. Using it for one typo'd
-  protocol would freeze the whole policy plane — wrong granularity.
-  Rejected in favor of per-rule fail-closed (§5.2).
+  previous good state on any integrity error.
+  **v3 UPDATE (supersedes the v1 conclusion below):** this whole-snapshot
+  reject is the CHOSEN action-agnostic backstop (§4''/§5''.4) — it never
+  collapses a rule to match-any and never turns a deny into a pass, and
+  in practice fires only on the Layer-S sentinel / a corrupt snapshot
+  (Layer G keeps normal-path malformed terms out). The v1 reasoning that
+  follows ("wrong granularity — rejected in favor of per-rule
+  never-match") is SUPERSEDED: per-rule action-blind `never_match` was
+  itself the unsafe choice Codex r2 F2 flagged (it regresses deny
+  rules). _[v1, retained for history:] Using it for one typo'd protocol
+  would freeze the whole policy plane — wrong granularity. Rejected in
+  favor of per-rule fail-closed (§5.2)._
 
 ## 4''. Decision (v3 — CURRENT)
 
@@ -283,7 +292,9 @@ if proto == "" {
     return nil, false               // existing empty-protocol gate
 }
 // NEW: protocol must be representable by the Rust matcher.
-num, ok := dataplane.ProtocolNumber(proto)
+// (appid.ProtocolNumber — pkg/appid is the cycle-safe home; userspace
+//  imports appid directly. See §5''.1.)
+num, ok := appid.ProtocolNumber(proto)
 if !ok {
     return nil, false               // unrepresentable -> fail closed (refuse to arm)
 }
