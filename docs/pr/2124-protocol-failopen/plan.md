@@ -1,6 +1,48 @@
 # #2124 — Policy application term with an unparseable named protocol fails OPEN to match-any
 
-**Status:** DRAFT v2 — Codex r1 PLAN-NEEDS-MAJOR addressed; pending r2
+**Status:** DRAFT v3 — Codex r2 PLAN-NEEDS-MAJOR addressed; pending r3
+
+## v3 changelog (addresses Codex r2 PLAN-NEEDS-MAJOR)
+
+Codex r2 (task-mqna9yks-ubuxup) returned PLAN-NEEDS-MAJOR with two NEW
+findings, both verified against source and both decisive:
+
+1. **Publish-before-disarm gap — Layer G alone does NOT close the
+   fail-open.** `policies.go:85-88` converts a failed
+   `expandUserspacePolicyApplications` (`ok=false`) into
+   `applicationTerms = nil`, which Rust reads as GENUINE match-any. The
+   snapshot is still BUILT and `apply_snapshot` is still SENT before
+   `syncDesiredForwardingStateLocked` disarms; on a same-plan policy
+   update the disarmed-refresh path can process that match-any rule with
+   live workers. So `ForwardingSupported=false` is necessary but NOT
+   sufficient — the published snapshot must not be able to fail open.
+   → **Fix:** when expansion fails, `policies.go` emits an explicit
+   **fail-closed sentinel term** (reserved unparseable protocol
+   `"__unsupported__"`) instead of `nil`. Rust drops it → the rule has
+   NON-empty `application_terms` but ALL dropped → Rust raises
+   `SnapshotIntegrityError` → the WHOLE snapshot is rejected and the
+   previous good state is kept (snapshot_refresh.rs:69). This makes the
+   Rust integrity error the actual enforcement for the publish window,
+   action-agnostically. The sentinel is distinct from genuine-empty
+   (`application any` → no terms), so match-any is preserved for the
+   legit case.
+
+2. **Import cycle in the proposed centralization.** `pkg/dataplane`
+   already imports `pkg/appid` (compiler.go:19), and `pkg/appid` imports
+   only `pkg/config`. So `appid.catalogProtocolNumber →
+   dataplane.ProtocolNumber` is a cycle. → **Fix:** put the centralized
+   `ProtocolNumber(name) (uint8, bool)` in **`pkg/appid`** (the leaf
+   already holding the full table). `pkg/dataplane.protocolNumber` and
+   `pkg/appid.catalogProtocolNumber` both delegate to it;
+   `pkg/dataplane/userspace` imports `pkg/appid` directly (no cycle —
+   appid imports nothing from dataplane). 0/HOPOPT preserved as
+   `(0,true)`.
+
+Also: cleaned stale v1 §10 text (it still listed SnapshotIntegrityError
+and port-parser work as out-of-scope, contradicting §4'/§5').
+
+---
+
 
 ## v2 changelog (addresses Codex r1 PLAN-NEEDS-MAJOR)
 
@@ -110,7 +152,43 @@ introduces a worse hazard", which IS a valid verdict.)*
   protocol would freeze the whole policy plane — wrong granularity.
   Rejected in favor of per-rule fail-closed (§5.2).
 
-## 4'. Decision: which layer(s) fix it (v2 — PRIMED)
+## 4''. Decision (v3 — CURRENT)
+
+The fail-open is closed by **two cohering enforcement mechanisms**, with
+the Rust integrity-error as the actual hard backstop (Codex r2 F1):
+
+- **Layer G (Go capability gate) — operator signal + disarm driver +
+  canonicalization.** `expandUserspacePolicyApplications` returns
+  `ok=false` for an unrepresentable protocol/port, tripping
+  `ForwardingSupported=false` (operator-visible refuse-to-arm). For the
+  now-SUPPORTED named protocols it canonicalizes to the numeric string
+  Rust parses, and validates ports — so legit configs WORK and arm.
+
+- **Layer S (fail-closed sentinel) — closes the publish-before-disarm
+  window.** `policies.go` (buildOneRuleSnapshot) NO LONGER turns a
+  failed expansion into `applicationTerms = nil`. It emits ONE sentinel
+  term `{name:"__unsupported__", protocol:"__unsupported__"}`. This is
+  the bridge: it makes the published snapshot UN-fail-open-able.
+
+- **Layer R (Rust) — the hard enforcement + named-set support.**
+  (a) `parse_protocol` maps the named IANA set to numbers (so canonical
+  numeric AND named both parse). (b) `parse_policy_state_with_counters`
+  raises `SnapshotIntegrityError::UnrepresentableApplicationProtocol`
+  when a rule's `application_terms` are NON-empty but ALL drop as
+  unparseable — which is exactly the sentinel case (and any corrupt
+  snapshot). The preflight rejects the whole snapshot, keeping last-good
+  state. ACTION-AGNOSTIC: never collapses a rule to match-any, never
+  turns a deny into a pass.
+
+- **Centralization (Codex r2 F2):** `ProtocolNumber(name) (uint8, bool)`
+  lives in **`pkg/appid`**; `dataplane.protocolNumber` and
+  `appid.catalogProtocolNumber` delegate to it; `userspace` imports
+  `appid`. No import cycle. 0/HOPOPT → `(0,true)`.
+
+- **Layer C (commit-time):** out of scope (Q5). Named set now works;
+  unknown still warns at commit + trips refuse-to-arm at apply.
+
+### 4'. (v2, SUPERSEDED by 4'')
 
 Three layers, with the **Go capability gate as the PRIMARY,
 action-agnostic fix** (Codex r1 F1/F2):
@@ -163,27 +241,35 @@ action-agnostic fix** (Codex r1 F1/F2):
   commit-time hard reject (#1960 doctrine) is a reasonable follow-up
   but is deferred (Q5) to keep this PR a focused security fix.
 
-## 5'. Concrete design (v2 — PRIMED)
+## 5''. Concrete design (v3 — CURRENT)
 
-### 5'.1 Centralize the named→number map (`pkg/dataplane`)
+### 5''.1 Centralize the named→number map in `pkg/appid` (cycle-safe)
 
-`pkg/dataplane/compiler.go` currently has `protocolNumber(name) uint8`
-returning `0` for BOTH unknown and `"0"`. Add:
+`pkg/appid` already holds the full table (`catalogProtocolNumber`) and
+imports ONLY `pkg/config`, while `pkg/dataplane` already imports
+`pkg/appid` — so the centralized helper goes in `pkg/appid`:
 
 ```go
+// pkg/appid/catalog.go (or protocol.go)
 // ProtocolNumber resolves an IANA protocol name or numeric string to its
 // number. ok=false means the token is neither a known name nor a valid
-// 0..255 numeric (so 0/HOPOPT resolves to (0, true), distinct from the
+// 0..255 numeric (so "0"/HOPOPT resolves to (0, true), distinct from the
 // unrepresentable (0, false) case).
 func ProtocolNumber(name string) (uint8, bool) { ... }
 ```
 
-`protocolNumber` becomes `n, _ := ProtocolNumber(name); return n`
-(behavior-preserving). `pkg/appid.catalogProtocolNumber` is refactored
-to delegate to `dataplane.ProtocolNumber` (it mirrors the same table per
-its own doc comment) — eliminating the third copy. A parity test asserts
-the two former tables agree with the centralized one for the full named
-set + boundary numerics (0, 255, 256→false, ""→false).
+- `pkg/appid.catalogProtocolNumber(name) uint8` → `n, _ :=
+  ProtocolNumber(name); return n` (behavior-preserving).
+- `pkg/dataplane.protocolNumber(name) uint8` → `n, _ :=
+  appid.ProtocolNumber(name); return n` (behavior-preserving;
+  `pkg/dataplane` already imports `pkg/appid`).
+- `pkg/dataplane/userspace` imports `pkg/appid` directly to use
+  `ProtocolNumber` in the gate (no cycle: appid imports nothing from
+  dataplane or userspace — verified).
+- Parity test: `ProtocolNumber` agrees with the pre-refactor
+  `protocolNumber`/`catalogProtocolNumber` tables for the full named set
+  + junos aliases; `("0")→(0,true)`, `("255")→(255,true)`,
+  `("256")→(0,false)`, `("")→(0,false)`, `("bogus")→(0,false)`.
 
 ### 5'.2 Layer G: validate protocol AND ports in the capability gate
 
@@ -214,11 +300,41 @@ if !userspacePortSpecRepresentable(app.SourcePort) ||
 `userspacePortSpecRepresentable` mirrors Rust `parse_port_spec`
 (empty=ok; named service aliases http/https/...; single 1..65535;
 `low-high` with `low>0 && low<=high`). This closes the bad-PORT
-fail-open (Codex r1 F2) at the same action-agnostic gate.
+fail-open at the same action-agnostic gate. Uses `appid.ProtocolNumber`,
+NOT a new named-protocol list.
 
-`normalizeUserspaceApplicationProtocol` keeps its `icmp6→icmpv6` mapping;
-the numeric canonicalization happens via `ProtocolNumber` above so we do
-NOT add a fourth named-protocol list to it.
+### 5''.2b Layer S: fail-closed sentinel in `policies.go` (Codex r2 F1)
+
+`buildOneRuleSnapshot` (policies.go:85-88) currently does:
+
+```go
+applicationTerms, ok := expandUserspacePolicyApplications(cfg, pol.Match.Applications)
+if !ok {
+    applicationTerms = nil   // BUG: Rust reads nil as genuine match-any
+}
+```
+
+Replace with an explicit fail-closed sentinel so the published snapshot
+cannot fail open even in the publish-before-disarm window:
+
+```go
+applicationTerms, ok := expandUserspacePolicyApplications(cfg, pol.Match.Applications)
+if !ok {
+    // The rule cites applications the userspace matcher cannot honor.
+    // Emit a reserved unparseable sentinel so Rust drops it and raises
+    // SnapshotIntegrityError (whole-snapshot reject, keep last-good) —
+    // action-agnostic fail-closed — instead of an empty term list that
+    // Rust would read as genuine match-any.
+    applicationTerms = []PolicyApplicationSnapshot{{
+        Name:     unsupportedApplicationSentinel, // "__unsupported__"
+        Protocol: unsupportedApplicationSentinel,
+    }}
+}
+```
+
+`unsupportedApplicationSentinel = "__unsupported__"` — a token that
+`parse_protocol` will never accept (not a name, not 0..255 numeric) and
+that no real Junos protocol/app name collides with.
 
 ### 5'.3 Layer R(a): extend Rust `parse_protocol`
 
@@ -494,11 +610,11 @@ Rust (`userspace-dp/src/policy_tests.rs`):
 - `cargo test --release` green; 5/5 flake on the new integrity-error
   test.
 
-Go (`pkg/dataplane/`, `pkg/dataplane/userspace/`, `pkg/appid/`):
-- **`ProtocolNumber` parity** — for the full named set + junos aliases,
-  `ProtocolNumber` agrees with the old `protocolNumber` and
-  `catalogProtocolNumber`; `("0")→(0,true)`, `("256")→(0,false)`,
-  `("")→(0,false)`, `("bogus")→(0,false)`.
+Go (`pkg/appid/`, `pkg/dataplane/`, `pkg/dataplane/userspace/`):
+- **`appid.ProtocolNumber` parity** — agrees with the pre-refactor
+  `protocolNumber` + `catalogProtocolNumber` over the full named set +
+  junos aliases; `("0")→(0,true)`, `("255")→(255,true)`,
+  `("256")→(0,false)`, `("")→(0,false)`, `("bogus")→(0,false)`.
 - **Gate fails closed on unknown protocol** — an app with protocol
   `"bogus"` → `expandUserspacePolicyApplications` returns `ok=false` →
   `userspaceSupportsSecurityPolicies` false → `ForwardingSupported`
@@ -507,11 +623,21 @@ Go (`pkg/dataplane/`, `pkg/dataplane/userspace/`, `pkg/appid/`):
   `DestinationPort:"99999"` (or `"5-1"`) → `ok=false`.
 - **Gate canonicalizes + accepts named protocol** — app with `esp` →
   `ok=true`, emitted snapshot term Protocol == `"50"`.
+- **Sentinel on failed expansion (Codex r2 F1)** — a policy citing an
+  app with an unrepresentable protocol → `buildOneRuleSnapshot` emits a
+  rule whose `ApplicationTerms` is the `"__unsupported__"` sentinel (NOT
+  nil). **Non-tautological:** pre-fix it is `nil`.
 - **Existing working configs unchanged** — tcp/udp/icmp/gre/ospf +
-  numeric still `ok=true`.
-- `go test ./pkg/dataplane/... ./pkg/appid/... ./pkg/config/...` green.
+  numeric still `ok=true`; normal apps emit normal terms (no sentinel).
+- `go test ./pkg/appid/... ./pkg/dataplane/... ./pkg/config/...` green.
 
-### 9. (v1, SUPERSEDED)
+Rust end-to-end sentinel test (`policy_tests.rs`):
+- A `PolicyRuleSnapshot` carrying the `"__unsupported__"` sentinel term
+  → `parse_policy_state_with_counters` returns
+  `Err(UnrepresentableApplicationProtocol)`. This is the cross-language
+  contract test proving Layer S + Layer R(b) cohere.
+
+### 9'. / 9. (v2/v1, SUPERSEDED)
 
 1. **Known named protocol now matches** — a permit rule with one
    application term `{protocol:"sctp", destination_port:"9999"}` permits
@@ -549,15 +675,22 @@ task directive, the PARENT runs the `/security-matrix` directional
 smoke after merge (trust→untrust ALLOW, untrust→trust BLOCK, plain
 forwarding throughput). Stated explicitly in the PR + return.
 
-## 10. Out of scope (explicitly)
+## 10'. Out of scope (explicitly) (v3 — CURRENT)
 
-- A new strict/lenient commit-time `validateProtocol` toggle (Q5) —
-  the named set now works; truly-unknown is already a commit error.
+- A new strict/lenient commit-time `validateProtocol` hard-reject (Q5).
+  The named set now works end-to-end; a truly-unknown protocol warns at
+  commit (existing behavior) and trips the operator-visible refuse-to-
+  arm at apply. A #1960-doctrine commit-time toggle is a reasonable
+  follow-up but is deferred to keep this PR a focused security fix.
 - Adding the named protocols to the `AppCatalog` show-path (app-id
   naming) — separate concern (matcher vs. display); no fail-open there.
-- SnapshotIntegrityError-based whole-snapshot rejection for unparseable
-  protocols — rejected as wrong granularity (§3).
-- Extending the *port* spec parser — orthogonal.
+- Note: SnapshotIntegrityError-based whole-snapshot rejection IS now IN
+  scope (Layer R(b)/Layer S) — it is the action-agnostic hard backstop,
+  NOT out of scope as v1 wrongly stated.
+- Note: the port-spec representability check IS now IN scope (Layer G) —
+  it closes the bad-port fail-open Codex r1 F2 flagged.
+
+### 10. (v1, SUPERSEDED — see 10')
 
 ## 11. Open questions for adversarial review (each PLAN-KILL-able)
 
