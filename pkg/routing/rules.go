@@ -191,7 +191,21 @@ func (rg *ribGroupManager) Apply(ribGroups map[string]*config.RibGroup, instance
 				continue
 			}
 			for _, ribName := range rgDef.ImportRibs {
-				targetTable := resolveRibTable(ribName, tableIDs)
+				targetTable, ok := resolveRibTable(ribName, tableIDs)
+				if !ok {
+					// Unknown / undefined rib name: do NOT treat it as
+					// a (non-source) target table — that would set
+					// needsLeak and install an `ip rule from all lookup
+					// <sourceTable>` for a rib that does not exist,
+					// silently leaking the source table into the main
+					// lookup (#2226). Skip it; warn for visibility. The
+					// strict commit-time gate normally rejects this
+					// before apply, but a tolerantly-loaded / peer-synced
+					// config can still reach here.
+					slog.Warn("rib-group import-rib references unknown rib; skipping (not leaking)",
+						"instance", inst.Name, "rib-group", rgName, "import-rib", ribName)
+					continue
+				}
 				if targetTable != sourceTable {
 					needsLeak = true
 					break
@@ -485,16 +499,29 @@ func dscpToTOS(dscp string) uint8 {
 
 // resolveRibTable maps a Junos rib name to its kernel routing table ID.
 // "<instance>.inet.0" or "<instance>.inet6.0" maps to the instance's table.
-func resolveRibTable(ribName string, tableIDs map[string]int) int {
+//
+// The boolean return distinguishes "resolved to a real table" (ok=true)
+// from "unresolvable rib name" (ok=false) — a name that is neither
+// inet.0/inet6.0 nor "<known-instance>.inet[6].0". Callers MUST treat
+// ok=false as "unknown rib": never fall back to table 0 (#2226). Before
+// this split the unresolvable case returned a bare 0, which the Apply
+// needsLeak loop read as a real (non-source) table and spuriously
+// installed an `ip rule from all lookup <sourceTable>` for a typo'd /
+// non-existent import-rib — a silent mis-leak of the source table into
+// the main lookup. Commit-time validation
+// (validateRibGroupImportRibReferencesStrict) now also rejects the
+// dangling reference; this guard is defense in depth for any reference
+// that reaches apply via the tolerant load / peer-sync path.
+func resolveRibTable(ribName string, tableIDs map[string]int) (int, bool) {
 	if ribName == "inet.0" || ribName == "inet6.0" {
-		return 254 // main table
+		return 254, true // main table
 	}
 	// Parse "instance-name.inet.0" or "instance-name.inet6.0"
 	if idx := strings.Index(ribName, ".inet"); idx > 0 {
 		instanceName := ribName[:idx]
 		if tableID, ok := tableIDs[instanceName]; ok {
-			return tableID
+			return tableID, true
 		}
 	}
-	return 0
+	return 0, false
 }

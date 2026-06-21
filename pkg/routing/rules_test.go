@@ -129,6 +129,88 @@ func TestRibGroupRulesApply_Fake(t *testing.T) {
 	}
 }
 
+// TestRibGroupRulesApply_UnknownRibNoLeak is the #2226 fail-on-revert
+// guard. A rib-group whose ONLY import-rib names a rib that resolves to
+// no real routing table (a typo / non-existent instance) must NOT install
+// any leak rule for the source table. Before the fix, resolveRibTable
+// returned a bare 0 for the unknown name; 0 != sourceTable(101) set
+// needsLeak, and the applier installed `ip rule from all lookup 101` —
+// a silent mis-leak of the source table into the main lookup. With the
+// fix the unknown rib is skipped (ok=false) and no rule is programmed.
+//
+// Reverting either the resolveRibTable (int,bool) split or the
+// needsLeak-loop ok guard makes this test fail (a phantom rule for
+// table 101 appears).
+func TestRibGroupRulesApply_UnknownRibNoLeak(t *testing.T) {
+	ops := newFakeRuleOps()
+	rg := &ribGroupManager{ops: ops}
+
+	ribGroups := map[string]*config.RibGroup{
+		"typo-leak": {
+			Name: "typo-leak",
+			// Both names are undefined: a non-existent instance and pure
+			// garbage. Neither resolves to a real table.
+			ImportRibs: []string{"does-not-exist.inet.0", "garbage"},
+		},
+	}
+	instances := []*config.RoutingInstanceConfig{
+		{Name: "dmz-vr", TableID: 101, InterfaceRoutesRibGroup: "typo-leak"},
+	}
+
+	if err := rg.Apply(ribGroups, instances); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	if ops.hasTable(unix.AF_INET, 101) {
+		t.Errorf("unknown import-rib must NOT install an IPv4 leak rule for table 101 (#2226), rules=%v", ops.rules[unix.AF_INET])
+	}
+	if ops.hasTable(unix.AF_INET6, 101) {
+		t.Errorf("unknown import-rib must NOT install an IPv6 leak rule for table 101 (#2226), rules=%v", ops.rules[unix.AF_INET6])
+	}
+	// And specifically never a rule into table 0 (the old fallback target).
+	if ops.hasTable(unix.AF_INET, 0) || ops.hasTable(unix.AF_INET6, 0) {
+		t.Errorf("must never install a rule into table 0 from an unresolved rib (#2226)")
+	}
+	if got := ops.count(unix.AF_INET) + ops.count(unix.AF_INET6); got != 0 {
+		t.Errorf("expected zero rules for an all-unknown rib-group, got %d (%v / %v)",
+			got, ops.rules[unix.AF_INET], ops.rules[unix.AF_INET6])
+	}
+}
+
+// TestRibGroupRulesApply_DefinedRibStillLeaks is the companion no-false-
+// reject guard for #2226: a rib-group importing a DEFINED rib (another
+// real instance's table, plus the main table) still leaks the source
+// table correctly. This pins that the (int,bool) split did not break the
+// happy path — only the unresolvable case changed.
+func TestRibGroupRulesApply_DefinedRibStillLeaks(t *testing.T) {
+	ops := newFakeRuleOps()
+	rg := &ribGroupManager{ops: ops}
+
+	ribGroups := map[string]*config.RibGroup{
+		"dmz-leak": {
+			Name: "dmz-leak",
+			// dmz-vr.inet.0 (self, table 101), tunnel-vr.inet.0 (defined,
+			// table 100), inet.0 (main, 254). The defined non-self ribs
+			// must drive the leak.
+			ImportRibs: []string{"dmz-vr.inet.0", "tunnel-vr.inet.0", "inet.0"},
+		},
+	}
+	instances := []*config.RoutingInstanceConfig{
+		{Name: "tunnel-vr", TableID: 100},
+		{Name: "dmz-vr", TableID: 101, InterfaceRoutesRibGroup: "dmz-leak"},
+	}
+
+	if err := rg.Apply(ribGroups, instances); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if !ops.hasTable(unix.AF_INET, 101) {
+		t.Errorf("defined import-rib must still leak table 101 (IPv4), rules=%v", ops.rules[unix.AF_INET])
+	}
+	if !ops.hasTable(unix.AF_INET6, 101) {
+		t.Errorf("defined import-rib must still leak table 101 (IPv6), rules=%v", ops.rules[unix.AF_INET6])
+	}
+}
+
 // TestNextTableRulesApply_Fake exercises nextTableManager over a fake,
 // asserting a next-table directive becomes an ip rule pointing at the
 // target instance's table.

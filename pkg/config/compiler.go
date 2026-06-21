@@ -320,6 +320,21 @@ type compileOpts struct {
 	// independently, so it is already inert. Same doctrine as
 	// lenientApplicationSpecs.
 	lenientApplicationSetMembers bool
+	// lenientRibGroupRefs (#2226) downgrades the rib-group import-rib
+	// cross-reference gate (validateRibGroupImportRibReferencesStrict) from a
+	// hard compile error to a cfg.Warnings entry. An `import-rib` naming a rib
+	// that resolves to no real routing table (a typo, a non-existent instance,
+	// or unparseable garbage) was previously unvalidated: the applier mapped
+	// the unresolvable name to a bare table 0, which differs from any
+	// instance's (>= 100) source table, so it spuriously installed an `ip rule
+	// from all lookup <sourceTable>` — a silent mis-leak of the source table
+	// into the main lookup. The strict commit / commit-check path hard-rejects
+	// so the typo is operator-visible; the tolerant load / peer-sync paths warn
+	// so an already-persisted or peer-synced config carrying a dangling
+	// import-rib still BOOTS (#1960) — the applier's resolveRibTable ok=false
+	// guard skips the phantom rib and installs no rule, so a leniently-loaded
+	// config is already inert. Same doctrine as lenientRoutingExportRef.
+	lenientRibGroupRefs bool
 }
 
 // CompileConfig converts a parsed ConfigTree AST into a typed Config struct.
@@ -359,6 +374,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientNPTv6:                       true,
 		lenientFirewallRefs:                true,
 		lenientApplicationSetMembers:       true,
+		lenientRibGroupRefs:                true,
 	})
 }
 
@@ -449,6 +465,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientNPTv6:                       true,
 		lenientFirewallRefs:                true,
 		lenientApplicationSetMembers:       true,
+		lenientRibGroupRefs:                true,
 	})
 }
 
@@ -992,6 +1009,25 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		if opts.lenientApplicationSetMembers {
 			cfg.Warnings = append(cfg.Warnings,
 				fmt.Sprintf("application-set member (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
+	// #2226: rib-group `import-rib <rib>` cross-reference. An import-rib naming
+	// a rib that resolves to no real routing table (a typo, a non-existent
+	// instance, or unparseable garbage) compiled cleanly; the applier mapped
+	// the unresolvable name to table 0, which differs from the (>= 100) source
+	// table, and spuriously installed an `ip rule from all lookup <sourceTable>`
+	// — a silent mis-leak of the source table into the main lookup. Strict on
+	// commit / commit-check (hard reject so the typo is operator-visible);
+	// lenient on load / peer-sync (warn — #1960; the applier's resolveRibTable
+	// ok=false guard skips the phantom rib so it is already inert). Mirrors
+	// validateRoutingExportReferencesStrict.
+	if err := validateRibGroupImportRibReferencesStrict(cfg); err != nil {
+		if opts.lenientRibGroupRefs {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("rib-group import-rib reference (downgraded to warning on tolerant path): %v", err))
 		} else {
 			return nil, err
 		}

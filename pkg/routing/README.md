@@ -72,7 +72,18 @@ delegate to the owning domain. Exported types:
 - `31000–31999`: PBR (firewall-filter `routing-instance` action).
   `pbrRulePriority` in `rules.go`.
 - `33000–33099`: rib-group inter-VRF leaking (`from all lookup
-  <table>`).
+  <table>`). `ribGroupManager.Apply` only installs a leak rule when an
+  instance's `interface-routes` rib-group imports a rib that resolves to
+  a real table *different* from the instance's own source table.
+  `resolveRibTable` returns `(tableID, ok)`; an **unknown / undefined**
+  import-rib (typo, non-existent instance, garbage — `ok == false`) is
+  skipped with a warning and never sets `needsLeak`, so it cannot install
+  a phantom `from all lookup <sourceTable>` rule — and nothing is ever
+  installed into table 0 from an unresolved name (#2226). The matching
+  commit-time gate `validateRibGroupImportRibReferencesStrict`
+  (`pkg/config`) hard-rejects the dangling import-rib before apply; this
+  runtime guard is the defense-in-depth backstop for the tolerant load /
+  peer-sync path.
 - main table at `32766`. The next-table range sits **before** main
   (lower priority value = higher priority). PBR sits before main as
   well; rib-group sits after.

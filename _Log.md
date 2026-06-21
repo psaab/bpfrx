@@ -1,5 +1,45 @@
 # Action Log
 
+## 2026-06-21 — #2226: rib-group import-rib undefined-reference validation
+
+- **Timestamp**: 2026-06-21
+- **Action**: Closed the rib-group `import-rib` table-0 mis-leak. An
+  import-rib naming a rib that resolves to no real table (typo,
+  non-existent instance, garbage) previously mapped to a bare table 0 in
+  `resolveRibTable`; because an instance's source table is always
+  `>= 100`, `targetTable(0) != sourceTable` set `needsLeak` and the
+  applier installed a phantom `ip rule from all lookup <sourceTable>
+  pref 33000` — a silent mis-leak with no diagnostic. Two layers:
+  - **Commit-time (preferred)**: new
+    `validateRibGroupImportRibReferencesStrict` in
+    `compiler_validate_strict.go`, wired into `compileExpanded` next to
+    the #2217/#2240/#2144 strict gates. A valid import-rib names
+    `inet.0` / `inet6.0` or `<defined-instance>.inet[6].0`; anything else
+    is a HARD commit error. Lenient (load / HA peer-sync,
+    `lenientRibGroupRefs`) downgrades to a warning so an
+    already-persisted / peer-synced config still BOOTS (#1960).
+  - **Runtime backstop**: `resolveRibTable` now returns
+    `(tableID int, ok bool)`; the `Apply` needsLeak loop skips
+    `ok == false` ribs with a warn and never installs a rule into table 0
+    from an unresolved name.
+- **File(s)**: `pkg/config/compiler_validate_strict.go`,
+  `pkg/config/compiler.go`,
+  `pkg/config/compiler_ribgroup_ref_2226_test.go` (new),
+  `pkg/config/parser_ast_test.go`, `pkg/config/parser_routing_test.go`
+  (three pre-existing parse tests gained the routing-instance
+  definitions their import-ribs name — genuine catches),
+  `pkg/routing/rules.go`, `pkg/routing/rules_test.go` (new
+  fail-on-revert + no-false-reject tests), `pkg/routing/routing_test.go`
+  (call-site updates), `docs/config-schema.md`, `pkg/routing/README.md`.
+- **Validation**: `go build ./...`; `go vet ./pkg/routing/...
+  ./pkg/config/...`; `go test ./pkg/routing/... ./pkg/config/...` green.
+  Fail-on-revert proven both layers: neutering the `Apply` ok-guard
+  reinstalls the phantom `table 101` rule (runtime test fails); neutering
+  the strict validator call makes the four reject/lenient config tests
+  fail. Defined-rib tests pass unchanged (no false reject). Three
+  pre-existing `pkg/dataplane` / `pkg/fsatomic` canary failures are
+  unrelated to this change (fail identically on origin/master).
+
 ## 2026-06-21 — #2244: dnat_table reverse-NAT publish failure now counted + surfaced
 
 - **Timestamp**: 2026-06-21
