@@ -63,8 +63,11 @@ pub(crate) struct WheelPopStats {
     pub(crate) dropped_stale: usize,
     /// Entries that actually expired and were removed.
     pub(crate) expired: usize,
-    /// Entries that were re-bucketed (long-timeout / not yet
-    /// expired).
+    /// Entries that were re-bucketed (kept on the wheel rather than
+    /// removed). Covers the long-timeout / not-yet-expired Case-4 entries
+    /// AND, since #2120, idle-crossed entries kept alive by the standby
+    /// gate (HOLD and SELF-HEAL both re-bucket). Telemetry/tests must not
+    /// read this as "long-timeout only".
     pub(crate) re_bucketed: usize,
     /// #2120: peer-synced (or whole-node-standby `owner_rg_id==0`)
     /// entries that crossed their idle timeout but were HELD instead of
@@ -182,14 +185,22 @@ struct SessionEntry {
     /// entry was self-healed (the expire pass observed this node START
     /// forwarding the RG). The expire pass compares the current epoch
     /// against it to detect the activation edge and fire the self-heal
-    /// re-stamp exactly once per activation. Written ONLY by SELF-HEAL
-    /// (→ current epoch) and by install / refresh (→ 0). The HOLD branch
-    /// deliberately does NOT write it — the worker reads the HA map and
-    /// `rg_epochs` as separate loads, so a HOLD can see an old (inactive)
-    /// map with a new (already-bumped) epoch; stamping that epoch on a
-    /// hold would make the next (active-map) pass skip the self-heal and
-    /// age the synced session (the Codex old-map/new-epoch race). An
-    /// epoch of 0 is the standalone / never-self-healed default.
+    /// re-stamp exactly once per activation. This field is NOT
+    /// write-once — it is reset and re-stamped over the entry's life:
+    ///   - SELF-HEAL stamps it to the current epoch (the only write that
+    ///     records a live epoch).
+    ///   - `install` / `upsert_synced`, `update_session` (real-traffic
+    ///     refresh), and `refresh_for_ha_transition` (promotion refresh)
+    ///     RESET it to 0. A reset means "epoch unknown; re-stamp on the
+    ///     next SELF-HEAL", and is load-bearing: it guarantees the first
+    ///     forwarding pass after any epoch-bumping activation observes
+    ///     `current_epoch != seen_rg_epoch` and fires the self-heal.
+    /// The HOLD branch deliberately does NOT write it — the worker reads
+    /// the HA map and `rg_epochs` as separate loads, so a HOLD can see an
+    /// old (inactive) map with a new (already-bumped) epoch; stamping that
+    /// epoch on a hold would make the next (active-map) pass skip the
+    /// self-heal and age the synced session (the Codex old-map/new-epoch
+    /// race). An epoch of 0 is the standalone / never-self-healed default.
     seen_rg_epoch: u32,
     /// #2120: monotonic timestamp (ns) at which this entry FIRST entered
     /// the held (non-forwarding standby) state, or 0 when not held. The

@@ -32,15 +32,16 @@ structure.)
   `push_to_wheel` scheduler, `wheel_observe`, and the #2120 standby
   retention gate (`expire_stale_entries_ha` + `standby_gate_decision` +
   `rebucket_alive_entry`).
-- `entry.rs` carries the per-entry `SessionEntry` (decision / metadata /
-  origin / timestamps / wheel tick) PLUS the #2120 standby-gate fields
-  `seen_rg_epoch` and `first_held_ns` (see "Standby retention" below).
+- `entry.rs` — the PUBLIC session data types: `SessionDecision`,
+  `SessionMetadata`, `SessionLookup`, `ForwardSessionMatch`,
+  `SessionOrigin`, `SessionDeltaKind`, `SessionDelta`, and
+  `ExpiredSession`. The internal per-entry `SessionEntry` (and its #2120
+  standby-gate fields `seen_rg_epoch` / `first_held_ns`, see "Standby
+  retention" below) stays file-private in `mod.rs`, NOT here.
 - `key.rs` — `SessionKey`, `forward_wire_key` (ingress 5-tuple),
   `reverse_canonical_key` (post-NAT lookup), and
   `reply_matches_forward_session` (the predicate used to detect "this
   inbound packet matches an existing outbound flow").
-- `entry.rs` — `SessionEntry`: decision, metadata, origin, timestamps,
-  expiry tick, wheel bucket.
 - `wheel.rs` — bucketed timer wheel (1 s per tick, 256 buckets). Each
   worker sweeps its own table once per second from its poll loop
   (`expire_stale_entries` in `afxdp/worker/loop_body/mod.rs`);

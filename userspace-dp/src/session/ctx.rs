@@ -76,9 +76,13 @@ pub(crate) struct SessionUpdate<'a> {
 ///   node-level "forwards any RG" predicate (`node_active`).
 /// - `epoch_of(rg)` reads the RG epoch counter with the
 ///   `< MAX_RG_EPOCHS` index guard, falling back to the node-level
-///   `rg_epochs[0]` for `rg <= 0` (the node-level activation edge that
-///   lets the self-heal fire for `owner_rg_id == 0` fabric/reverse
-///   entries).
+///   `rg_epochs[0]` for any `rg` that is not a valid per-RG index — both
+///   `rg <= 0` AND an out-of-range `rg` map to `rg_epochs[0]` (the
+///   node-level activation edge that lets the self-heal fire for
+///   `owner_rg_id == 0` fabric/reverse entries, and that keeps a
+///   corrupt/out-of-range RG from silently pinning epoch 0). The exact
+///   fallback for out-of-range RG is caller-defined; the worker's
+///   `epoch_of` implements this `rg_epochs[0]` behavior.
 ///
 /// `node_active` is hoisted once per expire call (true iff this node
 /// forwards at least one RG, i.e. it is a real, currently-forwarding
@@ -92,8 +96,9 @@ pub(crate) struct ExpireHaContext<'a> {
     /// Per-RG forwarding predicate (see struct docs). `rg <= 0` maps to
     /// `node_active`.
     pub(crate) forwards_rg: &'a dyn Fn(i32) -> bool,
-    /// RG epoch reader (see struct docs). `rg <= 0` maps to the
-    /// node-level `rg_epochs[0]`.
+    /// RG epoch reader (see struct docs). Any `rg` that is not a valid
+    /// per-RG index (`rg <= 0` OR out of range) maps to the node-level
+    /// `rg_epochs[0]`.
     pub(crate) epoch_of: &'a dyn Fn(i32) -> u32,
     /// Stale-synced ceiling multiplier: a held entry is reaped once it
     /// has been held longer than `min(mult × expires_after_ns, abs_ns)`.
