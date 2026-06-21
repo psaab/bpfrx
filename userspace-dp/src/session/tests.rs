@@ -3871,3 +3871,236 @@ fn session_limit_off_gate_skips_all_maintenance() {
     assert_eq!(table.session_limit_src_map_len(), 0);
     assert_eq!(table.session_limit_dst_map_len(), 0);
 }
+
+// === #2220 flow-cache per-session keepalive ====================
+//
+// The flow-cache fast path (poll_descriptor/flow_cache_hit.rs) is the
+// ONLY code path that refreshes a forwarded flow's last_seen_ns. Before
+// #2220 it used a binding-GLOBAL modulo-64 counter: a low-rate flow
+// co-resident with a saturating flow could be served entirely from the
+// cache for a whole timeout window without its session ever being
+// touched, then reaped while still forwarding. The fix replaces that
+// counter with `SessionTable::touch_if_stale`, a per-session
+// time-threshold keepalive. These tests pin that contract and FAIL
+// against the old global-modulo logic (modelled inline below).
+
+/// touch_if_stale re-stamps a session ONLY once it has gone idle for at
+/// least `expires_after_ns / SESSION_KEEPALIVE_DIVISOR` (a quarter of
+/// its own timeout). Below that threshold it is a pure read (no write,
+/// no wheel re-bucket); at/after it, last_seen advances.
+#[test]
+fn touch_if_stale_throttles_until_quarter_timeout() {
+    let mut table = SessionTable::new();
+    let key = key_v6(); // UDP, 60 s timeout
+    let install_ns = 1_000_000_000u64;
+    assert!(table.install_with_protocol(
+        key.clone(),
+        decision(),
+        metadata(),
+        install_ns,
+        PROTO_UDP,
+        0
+    ));
+    let timeout = table
+        .entry_by_key(&key)
+        .expect("session installed")
+        .expires_after_ns;
+    assert_eq!(timeout, DEFAULT_UDP_SESSION_TIMEOUT_NS, "UDP 60 s timeout");
+    let quarter = timeout / SESSION_KEEPALIVE_DIVISOR; // 15 s
+
+    // One ns BEFORE the quarter-timeout threshold: must NOT touch.
+    let before = install_ns + quarter - 1;
+    table.touch_if_stale(&key, before);
+    assert_eq!(
+        table.entry_by_key(&key).unwrap().last_seen_ns,
+        install_ns,
+        "touch_if_stale must not re-stamp before idle reaches timeout/4"
+    );
+
+    // AT the quarter-timeout threshold: must touch.
+    let at = install_ns + quarter;
+    table.touch_if_stale(&key, at);
+    assert_eq!(
+        table.entry_by_key(&key).unwrap().last_seen_ns,
+        at,
+        "touch_if_stale must re-stamp once idle reaches timeout/4"
+    );
+
+    // Immediately again (idle ~0): must NOT touch (steady-state read).
+    table.touch_if_stale(&key, at + 1_000_000);
+    assert_eq!(
+        table.entry_by_key(&key).unwrap().last_seen_ns,
+        at,
+        "touch_if_stale must stay a pure read until the next threshold"
+    );
+}
+
+/// FAIL-ON-REVERT core: a UDP flow served continuously from the flow
+/// cache (touch_if_stale on every hit, sub-timeout cadence) must NEVER
+/// be GC'd, and its last_seen must keep advancing across the whole run.
+/// A control session that receives NO keepalive expires at its timeout
+/// — proving the keepalive, not the wheel, is what keeps the live flow.
+#[test]
+fn touch_if_stale_keeps_active_cache_flow_alive() {
+    let mut table = SessionTable::new();
+    let live = key_v6(); // UDP 60 s, actively forwarding via the cache
+    let dead = SessionKey {
+        src_port: 6001,
+        ..key_v6()
+    }; // UDP 60 s, no traffic (control)
+    let install_ns = 1_000_000_000u64;
+    for k in [&live, &dead] {
+        assert!(table.install_with_protocol(
+            k.clone(),
+            decision(),
+            metadata(),
+            install_ns,
+            PROTO_UDP,
+            0
+        ));
+    }
+    let _ = table.drain_deltas(64);
+
+    // Drive 600 s (10× the UDP timeout) of cache hits for the LIVE flow
+    // at a 2 s per-flow cadence — the kind of moderate-rate flow #2220
+    // says the old global-modulo counter could starve. Run GC every tick.
+    let cadence = 2 * WHEEL_TICK_NS;
+    let mut now = install_ns;
+    for _ in 0..300u64 {
+        now += cadence;
+        table.touch_if_stale(&live, now);
+        // GC gate: advance last_gc so each call actually sweeps.
+        table.last_gc_ns = now - SESSION_GC_INTERVAL_NS;
+        let expired = table.expire_stale_entries(now);
+        // The live flow must never appear in an expiry batch.
+        assert!(
+            !expired.iter().any(|e| e.key == live),
+            "active cache-served flow GC'd mid-flow at now={now}: {expired:?}"
+        );
+    }
+
+    // Live flow still present, last_seen well past install (keepalive ran).
+    let live_last = table
+        .entry_by_key(&live)
+        .expect("active cache flow must still be in the table")
+        .last_seen_ns;
+    assert!(
+        live_last > install_ns + DEFAULT_UDP_SESSION_TIMEOUT_NS,
+        "live flow last_seen ({live_last}) must advance past one timeout window"
+    );
+
+    // The untouched control flow expired at its 60 s timeout (a Close
+    // delta was emitted for it) — confirms expiry is real, not disabled.
+    assert!(
+        table.entry_by_key(&dead).is_none(),
+        "the no-traffic control session must have expired"
+    );
+    assert!(
+        table
+            .drain_deltas(64)
+            .iter()
+            .any(|d| d.key == dead && d.kind == SessionDeltaKind::Close),
+        "expired control session must emit a Close delta"
+    );
+}
+
+/// FAIL-ON-REVERT (explicit): replays the exact #2220 skew. A saturating
+/// high-rate flow and a steady low-rate flow share a binding. The old
+/// code is reproduced inline (one binding-global counter; a flow is
+/// touched only when its OWN hit lands on a global multiple of 64). The
+/// new code calls `touch_if_stale` per hit. The low-rate flow survives
+/// under the new code and is reaped under the old — so this test fails
+/// if `touch_if_stale` is reverted to the global-modulo counter.
+#[test]
+fn touch_if_stale_survives_skew_that_starves_global_modulo() {
+    let install_ns = 1_000_000_000u64;
+    let high = make_v4_key(1, 7001); // saturating UDP flow
+    let low = make_v4_key(2, 7002); // steady low-rate UDP flow
+
+    // Interleave: 64 high-rate hits per 1 low-rate hit, both cache-
+    // resident. Run for 10× the UDP timeout. Per-flow now_ns spacing:
+    // high hits ~every 1 ms, the low hit closes each 64-hit group.
+    let group_span = 5 * WHEEL_TICK_NS; // low flow ~ every 5 s
+    let groups = 120u64; // 600 s total
+
+    // --- OLD logic (binding-global modulo-64), reproduced inline ---
+    {
+        let mut table = SessionTable::new();
+        for k in [&high, &low] {
+            assert!(table.install_with_protocol(
+                k.clone(),
+                decision(),
+                metadata(),
+                install_ns,
+                PROTO_UDP,
+                0
+            ));
+        }
+        let mut global_touch: u64 = 0;
+        let mut now = install_ns;
+        let mut low_reaped = false;
+        for _ in 0..groups {
+            // 64 high-rate hits monopolise the modulo boundaries.
+            for _ in 0..64u64 {
+                now += group_span / 64;
+                global_touch += 1;
+                if global_touch & 63 == 0 {
+                    table.touch(&high, now);
+                }
+            }
+            // one low-rate hit — lands mid-group, never on & 63 == 0.
+            global_touch += 1;
+            if global_touch & 63 == 0 {
+                table.touch(&low, now);
+            }
+            table.last_gc_ns = now - SESSION_GC_INTERVAL_NS;
+            let expired = table.expire_stale_entries(now);
+            if expired.iter().any(|e| e.key == low) {
+                low_reaped = true;
+            }
+        }
+        assert!(
+            low_reaped && table.entry_by_key(&low).is_none(),
+            "PRECONDITION: the OLD global-modulo logic must starve+reap \
+             the low-rate flow — if this fails the test no longer proves \
+             a regression"
+        );
+    }
+
+    // --- NEW logic (per-session touch_if_stale) ---
+    {
+        let mut table = SessionTable::new();
+        for k in [&high, &low] {
+            assert!(table.install_with_protocol(
+                k.clone(),
+                decision(),
+                metadata(),
+                install_ns,
+                PROTO_UDP,
+                0
+            ));
+        }
+        let mut now = install_ns;
+        for _ in 0..groups {
+            for _ in 0..64u64 {
+                now += group_span / 64;
+                table.touch_if_stale(&high, now);
+            }
+            table.touch_if_stale(&low, now);
+            table.last_gc_ns = now - SESSION_GC_INTERVAL_NS;
+            let expired = table.expire_stale_entries(now);
+            assert!(
+                !expired.iter().any(|e| e.key == low),
+                "NEW logic must keep the low-rate flow alive (got {expired:?})"
+            );
+        }
+        assert!(
+            table.entry_by_key(&low).is_some(),
+            "NEW per-session keepalive must leave the low-rate flow live"
+        );
+        assert!(
+            table.entry_by_key(&high).is_some(),
+            "the high-rate flow stays live too"
+        );
+    }
+}

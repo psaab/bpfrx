@@ -66,6 +66,52 @@
   userspace-dp/src/afxdp/tx/dispatch/dispatch_tests.rs,
   userspace-dp/src/afxdp/README.md
 
+## 2026-06-21 — #2220: flow-cache per-session keepalive (replaces binding-global modulo-64)
+
+- **Timestamp**: 2026-06-21
+- **Action**: Fix HIGH #2220 — a cache-served session could expire while
+  still actively forwarding. The flow-cache fast path
+  (`poll_descriptor/flow_cache_hit.rs`) is the ONLY path that refreshes a
+  forwarded flow's `last_seen_ns`, and it used a binding-GLOBAL
+  modulo-64 counter (`flow_cache_session_touch` on
+  `WorkerFlowCacheState`): the counter incremented across ALL flows on
+  the binding and touched only the flow whose hit happened to land on a
+  global multiple of 64. A low-rate flow co-resident with a saturating
+  flow could be served entirely from the cache for a whole timeout
+  window (UDP 60 s most exposed) without its session ever being touched,
+  then be reaped mid-flow — emitting an HA Close delta to the peer,
+  deleting the live BPF redirect keys, and leaving a stale flow-cache
+  descriptor out-living its session. Replaced the counter with
+  `SessionTable::touch_if_stale`, a per-session time-threshold keepalive
+  that re-stamps a session only once it has gone idle for
+  `expires_after_ns / SESSION_KEEPALIVE_DIVISOR` (a quarter of its own
+  timeout), bounding every cache-served session's age to
+  `(1 + 1/N) × expires_after_ns` independent of co-resident flow rates.
+  Hot-path-cheap (one `key_to_handle` probe + integer compare in steady
+  state; write + throttled `push_to_wheel` only when stale) and
+  allocation-free. Removed the now-unused `flow_cache_session_touch`
+  field from `WorkerFlowCacheState` and its three constructor inits.
+- **Tests**: Added 3 fail-on-revert tests in `session/tests.rs`:
+  `touch_if_stale_throttles_until_quarter_timeout` (throttle semantics),
+  `touch_if_stale_keeps_active_cache_flow_alive` (a cache-served UDP flow
+  survives 10x its timeout while a no-traffic control session expires +
+  emits a Close), and `touch_if_stale_survives_skew_that_starves_global_modulo`
+  (replays the exact #2220 skew — reproduces the old global-modulo logic
+  inline and asserts it reaps the low-rate flow, then asserts the new
+  per-session keepalive keeps it alive). PROVEN fail-on-revert: all 3
+  FAIL when `touch_if_stale` is temporarily reverted to the global
+  modulo-64 behavior; all 3 pass + 5/5 flake-clean against the fix.
+  Full `session` (292) / `flow_cache` / `poll_descriptor` (17) /
+  `keepalive` filters green; release build clean.
+- **File(s)**: userspace-dp/src/afxdp/poll_descriptor/flow_cache_hit.rs,
+  userspace-dp/src/afxdp/worker/flow_cache_state.rs,
+  userspace-dp/src/afxdp/worker/mod.rs,
+  userspace-dp/src/session/mod.rs,
+  userspace-dp/src/session/tests.rs,
+  userspace-dp/src/session/README.md,
+  userspace-dp/src/afxdp/worker/README.md,
+  _Log.md
+
 ## 2026-06-21 — #2150 PR-1: Ethernet/IPv6 parser correctness sub-fixes + drift canaries
 
 - **Timestamp**: 2026-06-21

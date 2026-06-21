@@ -175,9 +175,11 @@ pub(crate) struct BindingWorker {
     /// into `WorkerTxCounters`. Field semantics unchanged; access
     /// via `binding.tx_counters.pending_X`.
     pub(crate) tx_counters: WorkerTxCounters,
-    /// #959 Phase 9: 2 flow-cache state fields extracted into
-    /// `WorkerFlowCacheState`. Field semantics unchanged; access
-    /// via `binding.flow.flow_cache` and `binding.flow.flow_cache_session_touch`.
+    /// #959 Phase 9: flow-cache state extracted into
+    /// `WorkerFlowCacheState`. Field semantics unchanged; access via
+    /// `binding.flow.flow_cache`. (#2220 dropped the binding-global
+    /// modulo-64 `flow_cache_session_touch` keepalive counter in favour
+    /// of `SessionTable::touch_if_stale`.)
     pub(crate) flow: WorkerFlowCacheState,
     /// #1620: cold-path latency histogram worker-local state.
     /// Co-located with `flow` because the policy-eval slow path
@@ -484,7 +486,6 @@ impl BindingWorker {
             },
             flow: WorkerFlowCacheState {
                 flow_cache: FlowCache::new(),
-                flow_cache_session_touch: 0,
             },
             // #1620: cold-path histogram worker-local state; default
             // zero-initialized. ns_per_tsc_q32 / wrapper_ns_baseline /
@@ -625,7 +626,6 @@ impl BindingWorker {
             },
             flow: WorkerFlowCacheState {
                 flow_cache: FlowCache::new(),
-                flow_cache_session_touch: 0,
             },
             // #1620: cold-path histogram worker-local state; default
             // zero-initialized. ns_per_tsc_q32 / wrapper_ns_baseline /
@@ -745,7 +745,6 @@ impl BindingWorker {
             },
             flow: WorkerFlowCacheState {
                 flow_cache: FlowCache::new(),
-                flow_cache_session_touch: 0,
             },
             // #1620: cold-path histogram worker-local state; default
             // zero-initialized. ns_per_tsc_q32 / wrapper_ns_baseline /
