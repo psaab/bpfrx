@@ -38,7 +38,13 @@ if ! incus list &>/dev/null 2>&1; then
 	fi
 fi
 
-INSTANCE_NAME="xpf-fw"
+# INSTANCE_NAME is env-overridable (XPF_INSTANCE) so a deploy can target the
+# actual standalone VM when it was created under a non-default name (e.g. an
+# ad-hoc xpf-fwd). Defaulting silently to xpf-fw was the #2162 footgun: a deploy
+# either errored mid-flow against a non-existent xpf-fw or, worse, wiped the
+# config of an unrelated xpf-fw instance. cmd_deploy/cmd_ssh/etc already guard on
+# instance existence, so an overridden name that does not exist fails clearly.
+INSTANCE_NAME="${XPF_INSTANCE:-xpf-fw}"
 VM_PROFILE="xpf-vm"
 CT_PROFILE="xpf-container"
 # Ubuntu 26.04 to match the production appliance base (scripts/image/bake.py).
@@ -728,6 +734,10 @@ usage() {
 	echo "  journal     Follow xpfd logs (live)"
 	echo ""
 	echo "Env:"
+	echo "  XPF_INSTANCE=<name>         Target instance name (default: xpf-fw). Set this"
+	echo "                              when the VM was created under a different name"
+	echo "                              (e.g. an ad-hoc xpf-fwd) so deploy/ssh/etc do not"
+	echo "                              hit the wrong instance (#2162)"
 	echo "  XPF_FORCE_TEARDOWN_PEERS=1  On create-vm/create-ct/deploy, remove any"
 	echo "                              OTHER firewall holding the dataplane gateway"
 	echo "                              IPs instead of aborting (DUT isolation, #1992)"
