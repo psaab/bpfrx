@@ -9430,3 +9430,24 @@ top.
   hardcoding IA_NA breaks them). build+vet+test green, new tests 5x no flake.
   **File(s)**: pkg/dhcpserver/ddns_leases.go, pkg/dhcpserver/lease_sync.go,
   pkg/dhcpserver/lease_sync_test.go, pkg/dhcpserver/README.md, _Log.md
+
+- **Timestamp**: 2026-06-21
+  **Action**: #2268 — round-trip IA_TA lease type symmetrically in the DHCP
+  HA lease-sync pre-seed writer. Follow-up to #2267 (#2262), which fixed the
+  READ path to distinguish all three Kea v6 lease kinds (keaLeaseTypeToString:
+  0=IA_NA/1=IA_TA/2=IA_PD) but left the WRITE/pre-seed path asymmetric:
+  writeMemfile6 only encoded IA_PD vs "everything-else as IA_NA", so a synced
+  IA_TA lease read as IA_TA but was written back as lease_type=0 (IA_NA) on
+  takeover — a silent type downgrade across failover for temporary-address
+  bindings. Added stringToKeaLeaseType as the exact total inverse of
+  keaLeaseTypeToString and routed BOTH v6 write callers (writeMemfile6 memfile
+  pre-seed AND syncLeaseToKea lease6-add) through it so the read↔write mapping
+  cannot drift. IA_TA is a full /128 address binding, so its prefix_len column
+  is 128 (only IA_PD carries a delegated prefix). Unknown kind → IA_NA + log.
+  Added TestPreSeedMemfile6_RoundTrip_PreservesIATA (sync→pre-seed→read-back
+  round trip + byte-level lease_type=1 assertion; IA_NA/IA_PD no-regression)
+  and TestKeaLeaseTypeInverseTotality. Fail-on-revert verified (restoring the
+  IA_PD-vs-IA_NA-only writer makes the IA_TA assertions fail). build+vet+test
+  (dhcpserver, cluster) green; new tests 5x no flake.
+  **File(s)**: pkg/dhcpserver/lease_sync.go, pkg/dhcpserver/lease_sync_test.go,
+  pkg/dhcpserver/README.md, _Log.md

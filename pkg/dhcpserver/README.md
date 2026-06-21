@@ -394,6 +394,15 @@ This package owns the KEA side of #2239 cross-chassis DHCP-server lease sync
   bindings at boot and can never hand an in-use address to a different client
   even in the pre-`lease-add` window (the duplicate-allocation-window closer).
   Durable (`fsatomic.WriteFileDurable`).
+  The v6 WRITE side (memfile pre-seed AND `lease6-add`) encodes the lease kind
+  SYMMETRICALLY with the read side: `stringToKeaLeaseType` is the exact total
+  inverse of the read path's `keaLeaseTypeToString`, so IA_NA / IA_TA / IA_PD
+  all round-trip (read IA_TA → write `lease_type=1`, not a downgrade to IA_NA).
+  Both write callers go through this one inverse so the read↔write mapping
+  cannot drift to re-introduce the #2268 IA_TA downgrade. Only IA_PD carries a
+  delegated `prefix_len`; IA_NA and IA_TA are full `/128` address bindings, so
+  their `prefix_len` column is 128. An unknown lease-type string falls back to
+  IA_NA (logged), never silently mis-typed.
 - `WaitControlSocket{4,6}(ctx, within)` — bounded readiness wait before the
   post-start seed.
 
