@@ -129,6 +129,41 @@ func TestApplicationSpec_ReferencedViaSet_RejectsAtCommit(t *testing.T) {
 	}
 }
 
+// The set-with-dangling-member escape (independent review F1): a policy
+// references an application-SET that contains BOTH a malformed user app (BAD,
+// destination-port "nope") AND an undefined/dangling member (MISSING).
+// ExpandApplicationSet bails on the FIRST member it cannot resolve, so before
+// the fix the whole expansion errored, applicationsToValidateStrict's addRef
+// silently returned, and BAD escaped the strict gate — commit succeeded (the
+// exact #2142 fail-closed-on-permit pathology, scoped to a set carrying a
+// dangling member). The malformed member must still be hard-rejected; the
+// unrelated dangling member must not mask it.
+func TestApplicationSpec_SetWithDanglingMember_StillRejectsBadMember(t *testing.T) {
+	tree := flatTreeFromSets(t,
+		"set applications application BAD protocol tcp",
+		"set applications application BAD destination-port nope",
+		// SET carries BAD plus an undefined member MISSING; member order in the
+		// flat AST follows set-line order, so MISSING-first would make the
+		// dangling error fire before BAD is even reached pre-fix.
+		"set applications application-set SET application BAD",
+		"set applications application-set SET application MISSING",
+		"set security policies from-zone trust to-zone untrust policy p match source-address any",
+		"set security policies from-zone trust to-zone untrust policy p match destination-address any",
+		"set security policies from-zone trust to-zone untrust policy p match application SET",
+		"set security policies from-zone trust to-zone untrust policy p then permit",
+	)
+	_, err := CompileConfig(tree)
+	if err == nil {
+		t.Fatal("expected commit to reject malformed application BAD even though " +
+			"application-set SET also has a dangling member MISSING")
+	}
+	if !strings.Contains(err.Error(), "BAD") ||
+		!strings.Contains(err.Error(), "destination-port") {
+		t.Fatalf("error %q must name the malformed member BAD and destination-port "+
+			"(the dangling MISSING must not mask the malformed spec)", err.Error())
+	}
+}
+
 // app-id (services application-identification) enabled: EVERY user application
 // compiles into the catalog, so a malformed app must reject at commit even when
 // no policy references it.

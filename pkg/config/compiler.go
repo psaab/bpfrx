@@ -1177,8 +1177,9 @@ func validatePolicyMatchAddressesStrict(cfg *Config) error {
 
 // validateApplicationSpecsStrict hard-rejects a user-defined application
 // (`set applications application <name> ...`) whose destination-port /
-// source-port is malformed (non-numeric, out of 1..65535, or an inverted
-// low>high range) or whose protocol token is not a known name, a junos-*
+// source-port is malformed (not a valid numeric port, port range, or known
+// service name, out of 1..65535, or an inverted low>high range) or whose
+// protocol token is not a known name, a junos-*
 // alias, or a 0..255 number (#2142) — but ONLY for applications that are
 // actually REFERENCED by a security policy, or for ALL applications when
 // `services application-identification` is enabled (every app then compiles
@@ -1268,14 +1269,29 @@ func applicationsToValidateStrict(cfg *Config) map[string]struct{} {
 		if appName == "" || appName == "any" {
 			return
 		}
-		if _, isSet := cfg.Applications.ApplicationSets[appName]; isSet {
+		if set, isSet := cfg.Applications.ApplicationSets[appName]; isSet {
 			expanded, err := ExpandApplicationSet(appName, &cfg.Applications)
-			if err != nil {
+			if err == nil {
+				for _, member := range expanded {
+					if _, isUser := userApps[member]; isUser {
+						out[member] = struct{}{}
+					}
+				}
 				return
 			}
-			for _, member := range expanded {
-				if _, isUser := userApps[member]; isUser {
-					out[member] = struct{}{}
+			// ExpandApplicationSet bails on the FIRST dangling/undefined or
+			// over-nested member, which would otherwise let a MALFORMED user app
+			// that is ALSO a direct member of the same set escape the strict gate
+			// (commit silently succeeds — the #2142 fail-closed-on-permit
+			// pathology, scoped to a set carrying a dangling member). A dangling
+			// member is a separate existing concern; it must not mask a malformed
+			// spec on a sibling member. Fall back to the set's DIRECT user-app
+			// members so each one that resolves is still hard-rejected at commit.
+			if set != nil {
+				for _, member := range set.Applications {
+					if _, isUser := userApps[member]; isUser {
+						out[member] = struct{}{}
+					}
 				}
 			}
 			return
@@ -1302,6 +1318,19 @@ func applicationsToValidateStrict(cfg *Config) map[string]struct{} {
 	}
 	walk(cfg.Security.GlobalPolicies)
 	return out
+}
+
+// ApplicationsToValidateStrict exposes the strict-validation reference set
+// (the user-app names the commit-time gate hard-rejects) for cross-checking
+// against appid.CatalogNames. The strict walk INLINE-duplicates CatalogNames's
+// policy-reference resolution because pkg/appid imports pkg/config (so the
+// compiler cannot call back into appid without a cycle). This accessor lets a
+// pkg/appid test assert the two walks agree on the user-app subset, so a future
+// change to CatalogNames's resolution cannot let the compiler copy drift
+// silently. It is a TEST seam, not a runtime coupling — production code uses the
+// unexported validateApplicationSpecsStrict directly.
+func ApplicationsToValidateStrict(cfg *Config) map[string]struct{} {
+	return applicationsToValidateStrict(cfg)
 }
 
 func policyMatchAddressError(scope, polName, field, addr string) error {

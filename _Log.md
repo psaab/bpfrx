@@ -1,5 +1,30 @@
 # Action Log
 
+## 2026-06-21 — #2142 (PR #2185) fold: set-with-dangling-member escape + drift guard + wording
+
+- **Timestamp**: 2026-06-21
+- **Action**: Folded two MINOR review fixes into PR #2185.
+  **F1 (real escape)** `applicationsToValidateStrict.addRef`: when a policy
+  references an application-SET whose `ExpandApplicationSet` errors on a
+  dangling/undefined or over-nested member, addRef used to bail silently, so a
+  MALFORMED user app that was ALSO a direct member of that set escaped the
+  strict gate and commit succeeded (the #2142 fail-closed-on-permit pathology,
+  scoped to a set carrying a dangling member). Fix: on expansion error, fall
+  back to the set's DIRECT user-app members so each resolvable malformed member
+  is still hard-rejected; the unrelated dangling member no longer masks it. New
+  test `TestApplicationSpec_SetWithDanglingMember_StillRejectsBadMember` (fails
+  pre-fix). **Drift guard (check #4)**: the strict walk inline-duplicates
+  `appid.CatalogNames`'s reference resolution (appid imports config → cycle).
+  Added exported test seam `config.ApplicationsToValidateStrict` + cross-check
+  test `TestStrictValidationSetMatchesCatalogNames` (pkg/appid) asserting the
+  two walks agree on the user-app subset for a resolvable fixture — so a future
+  CatalogNames resolution change cannot let the compiler copy drift silently.
+  **F3 (wording)**: comment (`compiler.go`) and doc line
+  (`docs/services-application-identification.md`) said a malformed port is
+  "non-numeric"; reworded to "not a valid numeric port, port range, or known
+  service name" (`validatePortSpec` accepts 15 named service ports).
+- **File(s)**: pkg/config/compiler.go, pkg/config/compiler_application_specs_test.go, pkg/appid/runtime_test.go, docs/services-application-identification.md
+
 ## 2026-06-21 — #2142 application-definition port/protocol commit-time validation
 
 - **Timestamp**: 2026-06-21

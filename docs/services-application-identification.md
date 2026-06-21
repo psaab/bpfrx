@@ -100,7 +100,8 @@ runtime effect is the L3/L4 catalog classification above
   with this application's `app_id`.
   - **#2142 commit-time validation (fail-closed):** an application
     whose `destination-port` / `source-port` is malformed
-    (non-numeric, out of `1..65535`, or an inverted `low>high`
+    (not a valid numeric port, port range, or known service
+    name, out of `1..65535`, or an inverted `low>high`
     range) or whose `protocol` is not a known name, a `junos-*`
     alias, or a `0..255` number is **rejected at commit** —
     *but only when the application is referenced by a security
