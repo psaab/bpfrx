@@ -75,12 +75,11 @@ func allowWebPolicyID(t *testing.T, store *configstore.Store) uint32 {
 
 func TestShowPoliciesHitCountHonorsPolicyStats(t *testing.T) {
 	for _, tc := range []struct {
-		name        string
-		statsOn     bool
-		wantPackets string // substring that must / must-not appear
+		name    string
+		statsOn bool
 	}{
-		{name: "enabled", statsOn: true, wantPackets: "42"},
-		{name: "disabled", statsOn: false, wantPackets: "0"},
+		{name: "enabled", statsOn: true},
+		{name: "disabled", statsOn: false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			store := newHitCountGateStore(t, tc.statsOn)
