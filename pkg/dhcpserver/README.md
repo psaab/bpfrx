@@ -377,7 +377,14 @@ This package owns the KEA side of #2239 cross-chassis DHCP-server lease sync
   destructive-safe memfile parser (`parseActiveLeases`) when the socket is not
   up. Each `SyncLease` carries REMAINING LIFETIME (`expire - now` on the
   reader's clock), never an absolute epoch — the clock-skew-immunity invariant.
-  Expired / non-active leases are dropped at read time.
+  Expired / non-active leases are dropped at read time. The v6 fallback
+  PRESERVES the lease kind: it reads the memfile `lease_type` (0=IA_NA,
+  1=IA_TA, 2=IA_PD) and `prefix_len` columns and maps them to
+  `SyncLease.LeaseType` / `PrefixLen` exactly as the socket path does, so an
+  IA_PD prefix-delegation lease read during the socket-down window is no longer
+  mis-seeded as an IA_NA address lease (#2262). A present-but-unparseable
+  `lease_type` is fail-closed: the row is skipped (logged), never defaulted to
+  IA_NA. An absent/empty column (old memfile, v4) stays IA_NA-equivalent.
 - `SeedSyncLeases{4,6}(ctx, leases, now)` — write held peer leases into a
   just-started Kea via `lease{4,6}-add` (→ `lease{4,6}-update` on collision,
   idempotent), re-anchoring `expire = now + remaining` on the LOCAL clock.

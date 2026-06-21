@@ -9397,3 +9397,20 @@ top.
   **File(s)**: pkg/cluster/sync_conn.go, pkg/cluster/sync.go,
   pkg/cluster/sync_gen_guard_test.go, docs/sync-protocol.md,
   pkg/cluster/README.md, _Log.md
+
+- **Timestamp**: 2026-06-21
+  **Action**: #2262 — preserve IA_PD lease type in DHCP memfile-fallback read
+  (no IA_NA mis-seed). Follow-up to #2239 (PR #2260). The v6 memfile-fallback
+  path (readSyncLeasesViaMemfile, taken only when the Kea control socket is
+  down) hardcoded LeaseType="IA_NA" and dropped the prefix length, mis-seeding
+  an IA_PD prefix-delegation lease as an address lease on the peer. Added
+  LeaseType/LeaseTypeOK/PrefixLen to ddnsLease, parse the OPTIONAL v6 memfile
+  lease_type (0=IA_NA/1=IA_TA/2=IA_PD) + prefix_len columns non-destructively
+  in parseActiveLeases (DDNS posture unchanged — fields inert there), and map
+  them to SyncLease in the fallback exactly as the socket path does. Present-
+  but-unparseable lease_type is fail-closed (skip+log), absent/empty stays
+  IA_NA-equivalent. Two new tests (PreservesType + SkipMalformedType) feed a
+  v6 memfile with both IA_NA and IA_PD rows; fail-on-revert verified (re-
+  hardcoding IA_NA breaks them). build+vet+test green, new tests 5x no flake.
+  **File(s)**: pkg/dhcpserver/ddns_leases.go, pkg/dhcpserver/lease_sync.go,
+  pkg/dhcpserver/lease_sync_test.go, pkg/dhcpserver/README.md, _Log.md
