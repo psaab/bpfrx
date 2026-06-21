@@ -34,6 +34,60 @@
   green; `go test -race ./pkg/cluster/... -count=3` clean. Existing tests
   untouched and green. No wire-format or Rust-helper change.
 
+## 2026-06-21 — #2158 file-split: split pkg/config/compiler.go (3050 LOC)
+
+- **Timestamp**: 2026-06-21
+- **Action**: Pure code-motion per the converged #2158 plan (§5.2). Split
+  pkg/config/compiler.go (3050 LOC, the worst splittable REFACTOR-tier
+  offender, over the 3000 must-split line) into four cohesive same-package
+  (`package config`) files. compiler.go keeps the AST->typed-struct compile
+  core (sentinels, compileOpts, CompileConfig*, compileConfigWithOpts,
+  compileConfigForNode*, compileExpanded). compiler_validate_strict.go holds
+  the validate*Strict family (#2142/#2144/#2173/#2175/#2187 cluster:
+  application-spec, routing-export, filter-protocol, NAT app-ref, class-of-
+  service strict validators) plus their helpers (routingRedistProtocolTokens,
+  filterProtocolResolvable, policyMatchAddressError, the dataplaneType const
+  block + effective/valid dataplane helpers, userspaceSynCookieProtectionActive,
+  knownManagedProcessNames/isKnownProcessName). compiler_validate_warn.go holds
+  ValidateConfig + the DDNS/routing-rule-window/CoS-oversubscription warning
+  helpers. compiler_applications.go holds compileApplications,
+  parseApplicationTerms, normalizeProtocol, validatePortSpec, validateProtocol,
+  nodeVal. No logic change, no exported-API change, byte-identical runtime
+  behavior. Verified move-only: reconstructing the original from the four
+  parts diffs to zero (modulo seam blank lines), `go doc -all ./pkg/config/`
+  is byte-identical before/after (zero API change), gofmt -l clean on all four
+  files, `go build ./...`, `go vet ./pkg/config/`, and
+  `go test ./pkg/config/... ./pkg/daemon/...` all green unchanged from master.
+  No init-order risk (the only package-level state moved is plain map/string
+  literal vars with no side-effecting initializers; no init()). Regenerated
+  docs/refactoring-audit-current.txt (compiler.go drops off the REFACTOR
+  heatmap entirely; the four files are all well under threshold);
+  make audit-check clean.
+- **File(s)**: pkg/config/compiler.go (trimmed to 956),
+  pkg/config/compiler_validate_strict.go (947),
+  pkg/config/compiler_validate_warn.go (902),
+  pkg/config/compiler_applications.go (270),
+  docs/refactoring-audit-current.txt
+
+## 2026-06-21 — #2158 file-split (1 of N): relocate wg/engine.rs inline tests
+
+- **Timestamp**: 2026-06-21
+- **Action**: Pure code-motion per the converged #2158 plan (§5.5,
+  #1046 pattern). Cut the inline `#[cfg(test)] mod engine_internal_tests`
+  block (former lines 1278-2086, ~809 LOC) out of
+  `userspace-dp/src/afxdp/wg/engine.rs` into a new sibling
+  `wg/engine_tests.rs`, wired with `#[cfg(test)] #[path =
+  "engine_tests.rs"] mod engine_internal_tests;`. `#[path]` keeps the
+  module a child of `wg::engine`, so `use super::*;` resolves identically
+  and no test body changed (byte-identical modulo a uniform 4-space
+  dedent; production lines 1-1277 are byte-identical to master). engine.rs
+  drops 2086 -> 1280 LOC, off the REFACTOR/WATCH list entirely. wg::
+  tests: 145 pass / 0 fail (unchanged count; relocated module runs as
+  `afxdp::wg::engine::engine_internal_tests::*`). Regenerated
+  `docs/refactoring-audit-current.txt`; `make audit-check` passes.
+- **File(s)**: userspace-dp/src/afxdp/wg/engine.rs,
+  userspace-dp/src/afxdp/wg/engine_tests.rs,
+  docs/refactoring-audit-current.txt
 ## 2026-06-21 — #2151: consolidate TCP-flag constants to shared SSOT
 
 - **Timestamp**: 2026-06-21
@@ -85,6 +139,32 @@
   flake; all three priority-tagged tests fail under the pre-fix
   `vlan_id > 0` gating (non-tautological). PENDING-PARENT: live
   PCP-on-the-wire verification on the loss cluster (not run here).
+
+## 2026-06-21 — #2197 items 1+2: v6 proxy-NDP pneigh install + 30s re-assert
+
+- **Timestamp**: 2026-06-21
+- **Action**: Implemented #2197 plan items 1 (MEDIUM) and 2 (LOW); item 3
+  (per-address narrowing) stays PLAN-DEFER / lab-pending.
+  **Item 1 (v6 proxy-NDP pneigh install):** `ReconcileProxyARP` now installs
+  an AF_INET6 NTF_PROXY neighbor entry for v6 proxy addresses (the v6 analogue
+  of `ip -6 neigh add proxy`), mirroring the v4 install path — desired set is
+  family-aware, a parallel `NeighList(idx, AF_INET6)` stale-removal pass runs,
+  and add/remove derive Family from `key.ip.Is6()/!Is4In6()`. Added `Family`
+  to `ProxyARPAdded` so the IPv4-only GARP is skipped for v6 (risk R1). v6 is
+  `pneigh_lookup`-gated (per-address), so no over-answer breadth. Added netlink
+  seams (`neighListSeam`/`neighSetSeam`/`neighDelSeam`) for root-free tests.
+  **Item 2 (re-assert after non-commit link cycle):** extracted the apply-path
+  reconcile into `(*Daemon).reconcileProxyARP(cfg)` (preserving the #2195 RETH
+  ifindex resolution via a separately-tested `proxyARPIfaceMap`), and drive it
+  from a new always-on 30s ticker (`proxyARPReassertLoop`) started
+  unconditionally when the dataplane is enabled — covers standalone + cluster
+  (reconcileRGStateLoop is cluster-only, monitorLinkState SNMP-gated). Idempotent.
+- **File(s)**: `pkg/dataplane/proxyarp.go`, `pkg/dataplane/proxyarp_test.go`,
+  `pkg/daemon/daemon_apply.go`, `pkg/daemon/daemon_proxyarp.go`,
+  `pkg/daemon/daemon_proxyarp_test.go`, `pkg/daemon/daemon_run.go`,
+  `pkg/dataplane/retirement_boundary_canary_test.go`, `docs/feature-gaps.md`,
+  `docs/pr/1373-retire-ebpf-dataplane/README.md`,
+  `docs/research/2197-proxyarp-followups/plan.md`.
 
 ## 2026-06-21 — #2146 (PR #2189) fold: close IPv6 ext-header overshoot fail-open
 
@@ -8403,3 +8483,42 @@ top.
   userspace-dp/src/afxdp/session_glue/tests.rs,
   docs/sync-protocol.md, pkg/cluster/README.md, userspace-dp/src/session/README.md,
   docs/research/2170-ha-deferred-delete/plan.md
+- **Action**: #2158 P1 Go file-split — split pkg/configstore/store.go (2112
+  LOC, over the ~2000 modularity threshold) into six cohesive same-package
+  files per the converged plan section 5.3. Pure code-motion: no logic
+  change, no exported-API change, byte-identical runtime behavior. store.go
+  keeps the Store struct + New + node/cluster accessors + compile/schema
+  pipeline + SyncApply (419 LOC); store_persist.go (378), store_lock.go
+  (165), store_command.go (324), store_commit.go (580), store_format.go
+  (307). All files now well under threshold. Verified move-only (identical
+  103-func signature set, zero body lines removed, `go doc -all` byte
+  identical), no init-order risk (no package-level var/init in store.go),
+  build + vet + `go test ./pkg/configstore/... ./pkg/daemon/...` all green
+  unchanged from master. Regenerated docs/refactoring-audit-current.txt
+  (store.go drops off the heatmap); make audit-check clean.
+- **File(s)**: pkg/configstore/store.go (trimmed),
+  pkg/configstore/store_persist.go, pkg/configstore/store_lock.go,
+  pkg/configstore/store_command.go, pkg/configstore/store_commit.go,
+  pkg/configstore/store_format.go, docs/refactoring-audit-current.txt
+
+- **Timestamp**: 2026-06-21
+- **Action**: #2158 P3 Go file-splits — split pkg/dataplane/userspace/manager.go
+  (2186 LOC) and pkg/cli/cli_show_security.go (2018 LOC), both over the ~2000
+  modularity threshold, into cohesive same-package siblings per the converged
+  plan sections 5.6 and 5.7. manager.go -> manager.go (1594) + capabilities.go
+  (469, config->capability derivation) + controllers.go (144, dataplane adapter
+  types). cli_show_security.go -> cli_show_security.go (342, policies subject) +
+  zones/screen/objects/ipsec/log/filters siblings (182/398/291/272/232/351).
+  Pure code-motion: funcs/types moved verbatim, no logic change, no exported-API
+  change, no receiver change, no package-level var/init moved (no init-order
+  risk). go doc -all byte-identical for both packages before/after; go test
+  ./pkg/dataplane/userspace/... ./pkg/cli/... green with a test set byte-
+  identical to master (606 tests). gofmt -l clean on all new files; go build
+  ./... clean. Regenerated docs/refactoring-audit-current.txt (manager.go drops
+  to WATCH, cli_show_security.go off the heatmap); make audit-check clean.
+- **File(s)**: pkg/dataplane/userspace/manager.go (trimmed),
+  pkg/dataplane/userspace/capabilities.go, pkg/dataplane/userspace/controllers.go,
+  pkg/cli/cli_show_security.go (trimmed), pkg/cli/cli_show_security_zones.go,
+  pkg/cli/cli_show_security_screen.go, pkg/cli/cli_show_security_objects.go,
+  pkg/cli/cli_show_security_ipsec.go, pkg/cli/cli_show_security_log.go,
+  pkg/cli/cli_show_security_filters.go, docs/refactoring-audit-current.txt
