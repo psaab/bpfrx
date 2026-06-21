@@ -557,6 +557,267 @@ fn named_application_matches_protocol_and_port() {
     );
 }
 
+// #2124 — a policy application term whose named protocol the Rust matcher
+// previously could not parse (sctp/esp/ah/vrrp/igmp/pim/egp) silently failed
+// OPEN to match-any: parse_protocol returned None, the term was dropped, and a
+// rule whose only term dropped collapsed to match_any, permitting ALL traffic.
+// These tests assert the named set now matches correctly AND that an
+// all-unparseable term list fails CLOSED (whole-snapshot integrity error)
+// rather than match-any.
+
+fn proto_only_app_rule(rule_id: &str, protocol: &str) -> PolicyRuleSnapshot {
+    PolicyRuleSnapshot {
+        rule_id: rule_id.to_string(),
+        name: rule_id.to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec!["any".to_string()],
+        destination_addresses: vec!["any".to_string()],
+        applications: vec![rule_id.to_string()],
+        application_terms: vec![PolicyApplicationSnapshot {
+            name: rule_id.to_string(),
+            protocol: protocol.to_string(),
+            source_port: String::new(),
+            destination_port: String::new(),
+        }],
+        action: "permit".to_string(),
+        ..Default::default()
+    }
+}
+
+#[test]
+fn named_protocol_sctp_matches_only_sctp_not_tcp() {
+    // PROVES #2124(R-a): a permit rule for an sctp-only application permits
+    // SCTP and DENIES TCP. Pre-fix the sctp term dropped -> match_any ->
+    // TCP would be (wrongly) Permit, so this is non-tautological.
+    let state = parse_policy_state(
+        "deny",
+        &[proto_only_app_rule("esp-or-sctp", "sctp")],
+        &test_zone_name_to_id(),
+    );
+    let src = "10.0.61.100".parse().expect("src");
+    let dst = "172.16.80.200".parse().expect("dst");
+    assert_eq!(
+        evaluate_policy(
+            &state, TEST_LAN_ZONE_ID, TEST_WAN_ZONE_ID, src, dst, PROTO_SCTP, 0, 0,
+        ),
+        PolicyAction::Permit,
+        "sctp must match an sctp-only rule"
+    );
+    assert_eq!(
+        evaluate_policy(
+            &state, TEST_LAN_ZONE_ID, TEST_WAN_ZONE_ID, src, dst, PROTO_TCP, 40000, 443,
+        ),
+        PolicyAction::Deny,
+        "TCP must NOT match an sctp-only rule (no fail-open to match-any)"
+    );
+}
+
+#[test]
+fn named_protocol_esp_matches_only_esp_not_tcp() {
+    let state = parse_policy_state(
+        "deny",
+        &[proto_only_app_rule("esp-only", "esp")],
+        &test_zone_name_to_id(),
+    );
+    let src = "10.0.61.100".parse().expect("src");
+    let dst = "172.16.80.200".parse().expect("dst");
+    assert_eq!(
+        evaluate_policy(
+            &state, TEST_LAN_ZONE_ID, TEST_WAN_ZONE_ID, src, dst, PROTO_ESP, 0, 0,
+        ),
+        PolicyAction::Permit
+    );
+    assert_eq!(
+        evaluate_policy(
+            &state, TEST_LAN_ZONE_ID, TEST_WAN_ZONE_ID, src, dst, PROTO_TCP, 40000, 443,
+        ),
+        PolicyAction::Deny
+    );
+}
+
+#[test]
+fn named_protocol_parse_covers_full_iana_set() {
+    // Every named protocol the Go validateProtocol/capability gate accepts must
+    // resolve to its IANA number here, or the gate-and-matcher contract breaks.
+    assert_eq!(parse_protocol("sctp"), Some(PROTO_SCTP));
+    assert_eq!(parse_protocol("esp"), Some(PROTO_ESP));
+    assert_eq!(parse_protocol("ah"), Some(PROTO_AH));
+    assert_eq!(parse_protocol("vrrp"), Some(PROTO_VRRP));
+    assert_eq!(parse_protocol("igmp"), Some(PROTO_IGMP));
+    assert_eq!(parse_protocol("pim"), Some(PROTO_PIM));
+    assert_eq!(parse_protocol("egp"), Some(PROTO_EGP));
+    assert_eq!(parse_protocol("icmp6"), Some(PROTO_ICMPV6));
+    // Numeric forms (including the canonicalized wire form the Go gate emits).
+    assert_eq!(parse_protocol("132"), Some(PROTO_SCTP));
+    assert_eq!(parse_protocol("50"), Some(PROTO_ESP));
+    assert_eq!(parse_protocol("0"), Some(0));
+    // Unparseable tokens stay None (so parse_applications drops + fails closed).
+    assert_eq!(parse_protocol(""), None);
+    assert_eq!(parse_protocol("definitely-not-a-proto"), None);
+    assert_eq!(parse_protocol("__unsupported__"), None);
+    assert_eq!(parse_protocol("256"), None);
+}
+
+#[test]
+fn numeric_protocol_still_matches() {
+    // Regression guard for the numeric parse arm.
+    let state = parse_policy_state(
+        "deny",
+        &[proto_only_app_rule("num-132", "132")],
+        &test_zone_name_to_id(),
+    );
+    let src = "10.0.61.100".parse().expect("src");
+    let dst = "172.16.80.200".parse().expect("dst");
+    assert_eq!(
+        evaluate_policy(
+            &state, TEST_LAN_ZONE_ID, TEST_WAN_ZONE_ID, src, dst, PROTO_SCTP, 0, 0,
+        ),
+        PolicyAction::Permit
+    );
+    assert_eq!(
+        evaluate_policy(
+            &state, TEST_LAN_ZONE_ID, TEST_WAN_ZONE_ID, src, dst, PROTO_TCP, 40000, 443,
+        ),
+        PolicyAction::Deny
+    );
+}
+
+#[test]
+fn all_unparseable_terms_fail_closed_with_integrity_error() {
+    // PROVES #2124(R-b/Layer S): a rule whose application_terms are NON-empty
+    // but ALL unparseable raises SnapshotIntegrityError instead of collapsing
+    // to match-any. Pre-fix this returned Ok with a match_any rule (the
+    // fail-open), so this is non-tautological.
+    let store = PolicyCounterStore::default();
+    let result = parse_policy_state_with_counters(
+        "deny",
+        &[proto_only_app_rule("bogus", "definitely-not-a-proto")],
+        &test_zone_name_to_id(),
+        &[],
+        &store,
+    );
+    match result {
+        Err(SnapshotIntegrityError::UnrepresentableApplicationProtocol { rule_id }) => {
+            assert_eq!(rule_id, "bogus");
+        }
+        other => panic!("expected UnrepresentableApplicationProtocol, got {other:?}"),
+    }
+}
+
+#[test]
+fn go_unsupported_sentinel_fails_closed() {
+    // Cross-language contract: the Go capability gate emits a "__unsupported__"
+    // sentinel term for an unrepresentable application; Rust must drop it and
+    // reject the whole snapshot (fail closed), NOT decode it as match-any.
+    let store = PolicyCounterStore::default();
+    let result = parse_policy_state_with_counters(
+        "deny",
+        &[proto_only_app_rule("sentinel-rule", "__unsupported__")],
+        &test_zone_name_to_id(),
+        &[],
+        &store,
+    );
+    assert!(
+        matches!(
+            result,
+            Err(SnapshotIntegrityError::UnrepresentableApplicationProtocol { .. })
+        ),
+        "the Go __unsupported__ sentinel must fail closed, got {result:?}"
+    );
+}
+
+#[test]
+fn empty_application_terms_stay_match_any() {
+    // Regression guard: genuinely-empty application_terms (Junos
+    // `application any` / no match application) must remain match-any and parse
+    // Ok — the new integrity check must NOT fire here.
+    let state = parse_policy_state(
+        "deny",
+        &[PolicyRuleSnapshot {
+            rule_id: "allow-any-app".to_string(),
+            name: "allow-any-app".to_string(),
+            from_zone: "lan".to_string(),
+            to_zone: "wan".to_string(),
+            source_addresses: vec!["any".to_string()],
+            destination_addresses: vec!["any".to_string()],
+            applications: vec!["any".to_string()],
+            application_terms: Vec::new(),
+            action: "permit".to_string(),
+            ..Default::default()
+        }],
+        &test_zone_name_to_id(),
+    );
+    let src = "10.0.61.100".parse().expect("src");
+    let dst = "172.16.80.200".parse().expect("dst");
+    // Both an arbitrary TCP flow and an SCTP flow must be permitted (match-any).
+    assert_eq!(
+        evaluate_policy(
+            &state, TEST_LAN_ZONE_ID, TEST_WAN_ZONE_ID, src, dst, PROTO_TCP, 40000, 443,
+        ),
+        PolicyAction::Permit
+    );
+    assert_eq!(
+        evaluate_policy(
+            &state, TEST_LAN_ZONE_ID, TEST_WAN_ZONE_ID, src, dst, PROTO_SCTP, 0, 0,
+        ),
+        PolicyAction::Permit
+    );
+}
+
+#[test]
+fn mixed_parseable_and_unparseable_keeps_parseable_term() {
+    // A rule with one parseable (esp) and one unparseable term is NOT
+    // all-dropped, so it parses Ok and matches ESP via the surviving term. The
+    // bogus term is silently dropped (the gate is the front-line reject); the
+    // rule does NOT fail closed because it still has a real constraint.
+    let state = parse_policy_state(
+        "deny",
+        &[PolicyRuleSnapshot {
+            rule_id: "esp-plus-bogus".to_string(),
+            name: "esp-plus-bogus".to_string(),
+            from_zone: "lan".to_string(),
+            to_zone: "wan".to_string(),
+            source_addresses: vec!["any".to_string()],
+            destination_addresses: vec!["any".to_string()],
+            applications: vec!["esp-plus-bogus".to_string()],
+            application_terms: vec![
+                PolicyApplicationSnapshot {
+                    name: "esp".to_string(),
+                    protocol: "esp".to_string(),
+                    source_port: String::new(),
+                    destination_port: String::new(),
+                },
+                PolicyApplicationSnapshot {
+                    name: "bogus".to_string(),
+                    protocol: "definitely-not-a-proto".to_string(),
+                    source_port: String::new(),
+                    destination_port: String::new(),
+                },
+            ],
+            action: "permit".to_string(),
+            ..Default::default()
+        }],
+        &test_zone_name_to_id(),
+    );
+    let src = "10.0.61.100".parse().expect("src");
+    let dst = "172.16.80.200".parse().expect("dst");
+    assert_eq!(
+        evaluate_policy(
+            &state, TEST_LAN_ZONE_ID, TEST_WAN_ZONE_ID, src, dst, PROTO_ESP, 0, 0,
+        ),
+        PolicyAction::Permit,
+        "the surviving esp term must still match"
+    );
+    assert_eq!(
+        evaluate_policy(
+            &state, TEST_LAN_ZONE_ID, TEST_WAN_ZONE_ID, src, dst, PROTO_TCP, 40000, 443,
+        ),
+        PolicyAction::Deny,
+        "TCP must NOT match (rule is not match-any despite the dropped term)"
+    );
+}
+
 #[test]
 fn application_set_matches_any_expanded_term() {
     let state = parse_policy_state(

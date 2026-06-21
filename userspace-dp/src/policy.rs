@@ -16,6 +16,16 @@ pub(crate) enum SnapshotIntegrityError {
     AddressBookIdZero,
     DuplicateAddressBookId(u32),
     UnknownAddressBookId { rule_id: String, book_id: u32 },
+    /// #2124: a policy rule's `application_terms` are NON-empty but EVERY term
+    /// failed to parse (unrepresentable protocol or malformed port). Collapsing
+    /// such a rule to match-any is a security fail-open (a permit meant for one
+    /// protocol would permit ALL traffic). The Go capability gate emits a
+    /// reserved `__unsupported__` sentinel term for exactly this case, and any
+    /// corrupt snapshot that produces an all-dropped term list lands here too.
+    /// Rejecting the whole snapshot (the preflight keeps the previous good
+    /// state) is action-agnostic: it never turns a deny into a pass nor a
+    /// permit into match-any.
+    UnrepresentableApplicationProtocol { rule_id: String },
 }
 
 impl std::fmt::Display for SnapshotIntegrityError {
@@ -29,6 +39,11 @@ impl std::fmt::Display for SnapshotIntegrityError {
                 f,
                 "rule {:?} references unknown address book id={}",
                 rule_id, book_id
+            ),
+            Self::UnrepresentableApplicationProtocol { rule_id } => write!(
+                f,
+                "rule {:?} has application terms but none are representable (unparseable protocol or port) — refusing to fail open to match-any",
+                rule_id
             ),
         }
     }
@@ -60,7 +75,8 @@ pub(crate) const JUNOS_GLOBAL_ZONE_ID: u16 = u16::MAX;
 pub(crate) const ZONE_ID_RESERVED_MIN: u16 = u16::MAX - 1;
 
 use crate::ip_proto::{
-    PROTO_GRE, PROTO_ICMP, PROTO_ICMPV6, PROTO_IPIP, PROTO_OSPF, PROTO_TCP, PROTO_UDP,
+    PROTO_AH, PROTO_EGP, PROTO_ESP, PROTO_GRE, PROTO_ICMP, PROTO_ICMPV6, PROTO_IGMP, PROTO_IPIP,
+    PROTO_OSPF, PROTO_PIM, PROTO_SCTP, PROTO_TCP, PROTO_UDP, PROTO_VRRP,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -666,7 +682,22 @@ pub(crate) fn parse_policy_state_with_counters(
         // forces a compile error on any future field addition until
         // the constructor is updated, eliminating the silent-zero-
         // default hazard (originally raised by AGY r2 D on #1632).
-        let applications = parse_applications(&snap.application_terms);
+        // #2124: parse the application terms and FAIL CLOSED if a rule cites
+        // application terms but NONE are representable (unparseable protocol or
+        // port). Such a rule must not collapse to match-any — that is the
+        // security fail-open this fixes. The Go capability gate emits a
+        // `__unsupported__` sentinel term for the unsupported-protocol case, so
+        // this fires for that sentinel and for any otherwise-corrupt snapshot.
+        // Genuinely-empty terms (`application any`) keep `had_terms == false`
+        // and remain match-any.
+        let parsed = parse_applications(&snap.application_terms);
+        if parsed.had_terms && parsed.matches.is_empty() {
+            return Err(SnapshotIntegrityError::UnrepresentableApplicationProtocol {
+                rule_id: rule_id.clone(),
+            });
+        }
+        let _ = parsed.dropped_any; // retained for diagnostics/future counters
+        let applications = parsed.matches;
         let compiled_apps = CompiledApplications::from_matches(&applications);
 
         let rule = PolicyRule {
@@ -1124,16 +1155,33 @@ fn parse_address(prefix: &str, out_v4: &mut Vec<PrefixV4>, out_v6: &mut Vec<Pref
     }
 }
 
-fn parse_applications(terms: &[PolicyApplicationSnapshot]) -> Vec<ApplicationMatch> {
+/// #2124: outcome of parsing a rule's application terms. `dropped_any` records
+/// whether at least one term failed to parse (unparseable protocol or port).
+/// The caller uses `(matches.is_empty() && had_terms)` — i.e. terms were
+/// configured but ALL dropped — to fail the rule closed via
+/// `SnapshotIntegrityError`, rather than letting an empty `matches` collapse to
+/// match-any. A genuinely-empty input (`application any` / no match application)
+/// has `had_terms == false` and stays match-any.
+struct ParsedApplications {
+    matches: Vec<ApplicationMatch>,
+    had_terms: bool,
+    dropped_any: bool,
+}
+
+fn parse_applications(terms: &[PolicyApplicationSnapshot]) -> ParsedApplications {
     let mut out = Vec::with_capacity(terms.len());
+    let mut dropped_any = false;
     for term in terms {
         let Some(protocol) = parse_protocol(&term.protocol) else {
+            dropped_any = true;
             continue;
         };
         let Some(source_ports) = parse_port_spec(&term.source_port) else {
+            dropped_any = true;
             continue;
         };
         let Some(destination_ports) = parse_port_spec(&term.destination_port) else {
+            dropped_any = true;
             continue;
         };
         out.push(ApplicationMatch {
@@ -1142,19 +1190,44 @@ fn parse_applications(terms: &[PolicyApplicationSnapshot]) -> Vec<ApplicationMat
             destination_ports,
         });
     }
-    out
+    ParsedApplications {
+        matches: out,
+        had_terms: !terms.is_empty(),
+        dropped_any,
+    }
 }
 
+/// Resolve a policy application term's protocol token to its IANA number.
+///
+/// #2124: extended to map the named IANA protocols Junos / the Go
+/// `validateProtocol` accept (`sctp`/`esp`/`ah`/`vrrp`/`igmp`/`pim`/`egp`) to
+/// their numbers, so a policy that matches only those protocols is honored
+/// instead of silently failing OPEN to match-any. Returning `None` for an
+/// unparseable token causes `parse_applications` to drop the term; a rule whose
+/// terms ALL drop is then rejected as a `SnapshotIntegrityError` (fail closed)
+/// rather than collapsing to match-any — see `parse_applications` /
+/// `parse_policy_state_with_counters`.
+///
+/// The numeric `_ => parse::<u8>()` arm is preserved, so a config that names a
+/// protocol numerically (e.g. `protocol 132`) still parses. Numbers MUST match
+/// `crate::ip_proto` / the centralized Go `appid.ProtocolNumber` table.
 fn parse_protocol(protocol: &str) -> Option<u8> {
     match protocol {
         "" => None,
         "tcp" => Some(PROTO_TCP),
         "udp" => Some(PROTO_UDP),
         "icmp" => Some(PROTO_ICMP),
-        "icmpv6" => Some(PROTO_ICMPV6),
+        "icmp6" | "icmpv6" => Some(PROTO_ICMPV6),
         "gre" => Some(PROTO_GRE),
         "89" | "ospf" => Some(PROTO_OSPF),
         "4" | "ipip" => Some(PROTO_IPIP),
+        "esp" => Some(PROTO_ESP),
+        "ah" => Some(PROTO_AH),
+        "sctp" => Some(PROTO_SCTP),
+        "vrrp" => Some(PROTO_VRRP),
+        "igmp" => Some(PROTO_IGMP),
+        "pim" => Some(PROTO_PIM),
+        "egp" => Some(PROTO_EGP),
         _ => protocol.parse::<u8>().ok(),
     }
 }
