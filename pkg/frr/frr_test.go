@@ -2067,6 +2067,134 @@ func TestGenerateProtocols_MixedBareAndRouteMap(t *testing.T) {
 	}
 }
 
+// TestResolveRedistribute_ProtocolLessPolicy is the #2223 fail-on-revert
+// guard. A defined policy-statement whose terms carry NO `from protocol`
+// (it matches only from community / prefix-list / as-path) has no
+// resolvable redistribute source protocol. resolveRedistribute MUST skip
+// it (emit nothing) rather than fall back to the FRR-invalid
+// `redistribute <policy>` line — that line is rejected by frr-reload.py
+// and, because it lands in the xpf-managed section, degrades the WHOLE
+// reload (every managed route/redistribute is lost, not just this one).
+//
+// Pre-fix this returned " redistribute export-comm\n". Post-fix it
+// returns "".
+func TestResolveRedistribute_ProtocolLessPolicy(t *testing.T) {
+	m := New()
+	po := &config.PolicyOptionsConfig{
+		PolicyStatements: map[string]*config.PolicyStatement{
+			"export-comm": {
+				Name: "export-comm",
+				Terms: []*config.PolicyTerm{
+					// from community only — no `from protocol`.
+					{Name: "t1", FromCommunity: "my-comm", Action: "accept"},
+				},
+				DefaultAction: "accept",
+			},
+		},
+	}
+	got := m.resolveRedistribute("export-comm", po)
+	if got != "" {
+		t.Errorf("protocol-less policy must yield no redistribute line, got %q", got)
+	}
+	// Specifically must NOT emit the FRR-invalid bare-policy line.
+	if strings.Contains(got, "redistribute export-comm") {
+		t.Errorf("emitted FRR-invalid `redistribute <policy>` line, got %q", got)
+	}
+}
+
+// TestResolveRedistribute_UnknownToken covers an export name that is
+// neither a known protocol token nor a defined policy-statement (a name
+// that slipped past the strict validator on a tolerant load / peer-sync
+// path). It must never render a bare `redistribute <name>` — there is no
+// valid source protocol, and the line would degrade the managed reload
+// exactly as the protocol-less-policy case does (#2223).
+func TestResolveRedistribute_UnknownToken(t *testing.T) {
+	m := New()
+	// nil policy-options: the name resolves to nothing.
+	if got := m.resolveRedistribute("no-such-policy", nil); got != "" {
+		t.Errorf("unknown token must yield no redistribute line, got %q", got)
+	}
+	// Non-nil policy-options that simply does not define the name.
+	po := &config.PolicyOptionsConfig{
+		PolicyStatements: map[string]*config.PolicyStatement{
+			"other": {Name: "other"},
+		},
+	}
+	if got := m.resolveRedistribute("typo-name", po); got != "" {
+		t.Errorf("undefined policy name must yield no redistribute line, got %q", got)
+	}
+}
+
+// TestGenerateProtocols_ProtocolLessPolicyExport is the end-to-end #2223
+// guard at the generateProtocols level: an OSPF instance exporting a
+// protocol-less policy alongside a normal protocol-qualified policy must
+// (a) omit any invalid `redistribute <policy>` line for the protocol-less
+// export, and (b) still emit the correct `redistribute <proto> route-map
+// <name>` for the well-formed one — one bad stanza never suppresses the
+// good one.
+func TestGenerateProtocols_ProtocolLessPolicyExport(t *testing.T) {
+	m := New()
+	po := &config.PolicyOptionsConfig{
+		PolicyStatements: map[string]*config.PolicyStatement{
+			// Protocol-less: from community only.
+			"export-comm": {
+				Name:          "export-comm",
+				Terms:         []*config.PolicyTerm{{Name: "t1", FromCommunity: "my-comm", Action: "accept"}},
+				DefaultAction: "accept",
+			},
+			// Well-formed: from protocol static.
+			"export-static": {
+				Name:  "export-static",
+				Terms: []*config.PolicyTerm{{Name: "t1", FromProtocols: []string{"static"}, Action: "accept"}},
+			},
+		},
+	}
+	ospf := &config.OSPFConfig{
+		RouterID: "1.1.1.1",
+		Export:   []string{"export-comm", "export-static"},
+		Areas: []*config.OSPFArea{
+			{ID: "0.0.0.0", Interfaces: []*config.OSPFInterface{{Name: "trust0"}}},
+		},
+	}
+	got := m.generateProtocols(ospf, nil, nil, nil, nil, "", 0, po)
+
+	// The protocol-less export must NOT produce any invalid line.
+	if strings.Contains(got, "redistribute export-comm") {
+		t.Errorf("rendered FRR-invalid `redistribute export-comm`, got:\n%s", got)
+	}
+	// The well-formed export must still render correctly.
+	if !strings.Contains(got, "redistribute static route-map export-static\n") {
+		t.Errorf("missing valid `redistribute static route-map export-static`, got:\n%s", got)
+	}
+
+	// Belt: no redistribute line in the managed output may name a policy
+	// (i.e. a non-protocol token) as its source protocol. Every
+	// `redistribute <tok>` must have <tok> in the known protocol set.
+	assertNoInvalidRedistribute(t, got)
+}
+
+// assertNoInvalidRedistribute is an frr.conf-syntax-validity belt: it
+// fails if any generated `redistribute <tok> ...` line names a token that
+// is not a valid FRR redistribute source protocol. This is the structural
+// invariant #2223 protects — a bad source protocol degrades the whole
+// managed-section reload.
+func assertNoInvalidRedistribute(t *testing.T, conf string) {
+	t.Helper()
+	valid := map[string]bool{
+		"connected": true, "static": true, "ospf": true, "ospf6": true,
+		"bgp": true, "rip": true, "ripng": true, "isis": true,
+		"kernel": true, "babel": true, "table": true, "sharp": true,
+	}
+	for _, line := range strings.Split(conf, "\n") {
+		f := strings.Fields(line)
+		if len(f) >= 2 && f[0] == "redistribute" {
+			if !valid[f[1]] {
+				t.Errorf("invalid FRR redistribute source protocol %q in line %q", f[1], strings.TrimSpace(line))
+			}
+		}
+	}
+}
+
 func TestGenerateProtocols_BGPAllowASIn(t *testing.T) {
 	m := New()
 	bgp := &config.BGPConfig{
