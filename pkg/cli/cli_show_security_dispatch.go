@@ -179,13 +179,15 @@ func (c *CLI) handleShowSecurity(args []string) error {
 						action = "reject"
 					}
 					ruleID := policySetID*dataplane.MaxRulesPerPolicy + uint32(i)
-					hits := "-"
+					// Default to "0" (consistent with the hit-count table
+					// and the gRPC/REST surfaces, which render 0 whenever
+					// the counter is unavailable or the knob is off);
+					// overwrite only on a successful gated read.
+					hits := "0"
 					if statsEnabled && c.dp != nil && c.dp.IsLoaded() {
 						if counters, err := c.dp.ReadPolicyCounters(ruleID); err == nil {
 							hits = fmt.Sprintf("%d", counters.Packets)
 						}
-					} else if !statsEnabled {
-						hits = "0"
 					}
 					fmt.Printf("%-12s %-12s %-20s %-8s %s\n",
 						zpp.FromZone, zpp.ToZone, pol.Name, action, hits)
@@ -203,13 +205,13 @@ func (c *CLI) handleShowSecurity(args []string) error {
 						action = "reject"
 					}
 					ruleID := policySetID*dataplane.MaxRulesPerPolicy + uint32(i)
-					hits := "-"
+					// Default to "0" for the same cross-surface
+					// consistency reason as the zone-pair branch above.
+					hits := "0"
 					if statsEnabled && c.dp != nil && c.dp.IsLoaded() {
 						if counters, err := c.dp.ReadPolicyCounters(ruleID); err == nil {
 							hits = fmt.Sprintf("%d", counters.Packets)
 						}
-					} else if !statsEnabled {
-						hits = "0"
 					}
 					fmt.Printf("%-12s %-12s %-20s %-8s %s\n",
 						"*", "*", pol.Name, action, hits)
