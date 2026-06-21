@@ -619,6 +619,12 @@ gate EXACTLY (shared predicate `isHostMaskAddress`):
   `isNAT64PoolHostAddress` (matching `parse_pool_v4`, which is `Ipv4Addr`-only):
   the pool translates to IPv4 source addresses, so an IPv6 pool entry — even a
   `/128` — is silently dropped by the dataplane and is rejected at commit too.
+  Both predicates classify address family **textually** (`natAddrFamily`: a
+  colon means IPv6) to match the Rust `from_str` parsers exactly — Go's
+  `net.ParseIP(...).To4()` folds the IPv4-mapped `::ffff:1.2.3.4` form to v4,
+  but Rust `Ipv4Addr::from_str` rejects it and `IpAddr::from_str` classifies it
+  as V6, so the mapped form is treated as IPv6 here (never accepted as a v4 host
+  the dataplane would then silently drop).
 - **Exempt:** `then static-nat nptv6-prefix` rules (genuine RFC 6296 prefix
   translation, never host-checked by the Rust parser) and `then static-nat
   inet` rules (a NAT64 translation whose `match` is the well-known prefix, e.g.

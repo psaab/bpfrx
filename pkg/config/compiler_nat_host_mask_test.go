@@ -249,6 +249,12 @@ func TestIsHostMaskAddress(t *testing.T) {
 		{"not-an-ip", false, false},      // not an IP -> not our concern
 		{"addr/", false, false},          // garbage suffix, bad IP part anyway
 		{"203.0.113.5/", false, true},    // empty mask -> non-host (mask "" != "32")
+		// IPv4-mapped IPv6: Rust IpAddr::from_str classifies as V6 (host_len
+		// 128), so the colon-keyed family must agree — /128 is the host form,
+		// /32 is NOT (Go's To4() would have wrongly chosen /32).
+		{"::ffff:1.2.3.4", true, true},     // bare mapped -> host (V6)
+		{"::ffff:1.2.3.4/128", true, true}, // mapped /128 -> host (V6 mask)
+		{"::ffff:1.2.3.4/32", false, true}, // mapped /32 -> NOT host (V6 wants /128)
 	}
 	for _, c := range cases {
 		host, parsed := isHostMaskAddress(c.in)
@@ -277,6 +283,11 @@ func TestIsNAT64PoolHostAddress(t *testing.T) {
 		{"100.64.0.7/128", false, true},  // cross-family mask on IPv4
 		{"not-an-ip", false, false},      // not an IP
 		{"100.64.0.7/", false, true},     // empty mask -> non-host
+		// IPv4-mapped IPv6: Ipv4Addr::from_str REJECTS this (Rust drops it),
+		// so the IPv4-only pool gate must reject it too — Go's To4() would
+		// have wrongly accepted it as a v4 host.
+		{"::ffff:1.2.3.4", false, true},    // mapped bare -> not IPv4 pool addr
+		{"::ffff:1.2.3.4/32", false, true}, // mapped /32 -> not IPv4 pool addr
 	}
 	for _, c := range cases {
 		host, parsed := isNAT64PoolHostAddress(c.in)
