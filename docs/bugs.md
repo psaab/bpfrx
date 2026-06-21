@@ -184,6 +184,12 @@
 - Config compiler only handled flat `source-nat interface` keys, not hierarchical `source-nat { interface; }` with child nodes
 - **Fix:** FindChild() fallback in compiler.go
 
+### Address-book described entry prefix corruption (#2222, FIXED)
+- **Symptom:** An address-book `address <name> <prefix>` entry that also carries a `description` resolves to the wrong prefix (or empty) in policies, so a policy keyed on that address matches nothing / fails open to the next policy. Order-dependent and silent — `commit` succeeds with only a non-blocking `address-book "X": invalid address "description"` warning.
+- **Root cause:** `compileAddressBook` iterated `global.Children` raw and treated each `address` node independently, keying by `Keys[1]` and blindly reading `Keys[2]` as the prefix. A described address renders as TWO sibling AST nodes in flat-set order — `[address X <prefix>]` (leaf) and `[address X description]` (block) — so the second overwrote `Value` with the literal `"description"`. The hierarchical block form `address X { <prefix>; description "..."; }` has `len(Keys) < 3` and was dropped entirely (0 addresses). Unlike zones / SNAT pools (which merge by name via `namedInstances`), address-book was the only compiler iterating children raw.
+- **Fix (pkg/config/compiler_security.go):** Merge all `address` nodes by name; derive the prefix from `Keys[2]` ONLY when it parses as a CIDR/IP (`looksLikeIPOrCIDR`), otherwise from a bare-leaf child (hierarchical block prefix); route `description` into a new `Address.Description` field so a non-prefix sub-stanza can never clobber `Value`. Handles both AST shapes and either sub-stanza ordering.
+- **Tests:** `TestAddressBookDescriptionPrefix` (dual-AST × ordering table) + `TestAddressBookDescriptionResolvesInPolicy` in `parser_security_test.go`.
+
 ### iter.Next(&key, nil) crash
 - cilium/ebpf v0.20 panics when iterating non-empty maps with nil value pointer
 - **Fix:** Always use `var val []byte; iter.Next(&key, &val)`
