@@ -178,6 +178,69 @@ func TestLoad_ToleratesStoredUnknownPollMode(t *testing.T) {
 	}
 }
 
+// #1387 stale-lease-cleanup slice (Path S) — boot/HA safety (invariant
+// H7 / R4). A stored config that committed an expired-leases-processing
+// timer of 0 BEFORE the Min(1) floor existed (or a peer-synced config from
+// an un-upgraded primary) must still LOAD — the schema gate downgrades to a
+// warning on the tolerant Load / SyncApply path. The compiler (the shared
+// compileExpanded core) lands the block on both strict and lenient sites,
+// so the block is present in the loaded active config, and the next strict
+// operator commit rejects the bad value loudly.
+func TestLoad_ToleratesStoredExpiredLeasesTimerZero(t *testing.T) {
+	cfgPath := filepath.Join(t.TempDir(), "config")
+	writeStoredConfig(t, cfgPath,
+		"set system services dhcp-local-server expired-leases-processing enable",
+		"set system services dhcp-local-server expired-leases-processing reclaim-timer 0")
+
+	s := newTestStoreAt(t, cfgPath)
+	if err := s.Load(); err != nil {
+		t.Fatalf("Load() must tolerate a stored expired-leases timer 0, got: %v", err)
+	}
+	active := s.ActiveConfig()
+	if active == nil {
+		t.Fatal("ActiveConfig() is nil after tolerated Load")
+	}
+	// The block must be present (compiled on the lenient path too — R4).
+	ls := active.System.DHCPServer.DHCPLocalServer
+	if ls == nil || ls.ExpiredLeases == nil || !ls.ExpiredLeases.Enabled {
+		t.Fatalf("lenient Load dropped the expired-leases block: %+v", ls)
+	}
+
+	// The next STRICT operator commit must reject the bad timer.
+	if err := s.EnterConfigure(); err != nil {
+		t.Fatalf("EnterConfigure: %v", err)
+	}
+	_, err := s.CommitCheck()
+	if err == nil {
+		t.Fatal("CommitCheck must reject the stored timer 0, got nil")
+	}
+	if !strings.Contains(err.Error(), "reclaim-timer") {
+		t.Fatalf("CommitCheck error should reference reclaim-timer: %v", err)
+	}
+}
+
+// HA config sync from a primary carrying a sub-floor timer must not
+// alarm-loop the standby: SyncApply uses the same lenient path as Load.
+func TestSyncApply_ToleratesExpiredLeasesTimerZero(t *testing.T) {
+	s := newTestStoreAt(t, filepath.Join(t.TempDir(), "config"))
+	cfg, err := s.SyncApply(`system {
+    services {
+        dhcp-local-server {
+            expired-leases-processing {
+                enable;
+                reclaim-timer 0;
+            }
+        }
+    }
+}`, nil)
+	if err != nil {
+		t.Fatalf("SyncApply must tolerate a sub-floor expired-leases timer, got: %v", err)
+	}
+	if cfg == nil {
+		t.Fatal("SyncApply returned nil config on tolerated violation")
+	}
+}
+
 // #1319 PR 3 — firewall forwarding-class cross-ref, end-to-end through
 // the PRODUCTION gate path (Store commit-check / Load / SyncApply, the
 // call sites that pass cfg=nil to SchemaValidate). These are the proving

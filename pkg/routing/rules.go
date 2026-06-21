@@ -1,6 +1,8 @@
 package routing
 
 import (
+	"errors"
+	"fmt"
 	"log/slog"
 	"net"
 	"strconv"
@@ -54,9 +56,15 @@ func (n *nextTableManager) Apply(routes []*config.StaticRoute, instances []*conf
 		tableIDs[inst.Name] = inst.TableID
 	}
 
-	// Clean up old next-table rules (priority range 100-199)
-	if err := n.clear(); err != nil {
-		slog.Warn("failed to clear old next-table rules", "err", err)
+	// Clean up old next-table rules (priority range 100-199). A failed
+	// per-family list does NOT abort the apply — we still re-add every
+	// desired rule below so forward progress is preserved on the common
+	// path. The clear error is captured and returned at the end so the
+	// caller can observe (and a future caller retry) instead of leaving
+	// orphaned rules in an unobservable window (#2273).
+	clearErr := n.clear()
+	if clearErr != nil {
+		slog.Warn("failed to clear old next-table rules", "err", clearErr)
 	}
 
 	prio := nextTableRulePriority
@@ -111,14 +119,27 @@ func (n *nextTableManager) Apply(routes []*config.StaticRoute, instances []*conf
 			"destination", sr.Destination, "instance", sr.NextTable, "table", tableID)
 		prio++
 	}
-	return nil
+	// Desired rules are re-added; surface any clear() list failure so the
+	// orphaned-rule window is observable rather than silently nil.
+	return clearErr
 }
 
 // clear removes all ip rules in the next-table priority range.
+//
+// A per-family RuleList dump that fails transiently must NOT be silently
+// swallowed: continuing past it means the rules in that family's window
+// are left in place (orphaned) for this pass while the other family is
+// cleaned, and the caller never learns it happened. We still best-effort
+// delete every family whose dump DID succeed, but we aggregate the dump
+// failures and return them so Apply (and ultimately the daemon apply
+// loop) can observe — and a future caller could retry — instead of the
+// brief, unobservable self-healing-orphan window described in #2273.
 func (n *nextTableManager) clear() error {
+	var errs []error
 	for _, family := range []int{unix.AF_INET, unix.AF_INET6} {
 		rules, err := n.ops.RuleList(family)
 		if err != nil {
+			errs = append(errs, fmt.Errorf("list next-table rules family %d: %w", family, err))
 			continue
 		}
 		for _, r := range rules {
@@ -130,7 +151,7 @@ func (n *nextTableManager) clear() error {
 			}
 		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 // ribGroupManager reconciles rib-group route-leak ip rules. Stateless
@@ -154,13 +175,17 @@ type ribGroupManager struct {
 //
 //	ip rule add from all lookup 101 pref 33000
 func (rg *ribGroupManager) Apply(ribGroups map[string]*config.RibGroup, instances []*config.RoutingInstanceConfig) error {
-	// Clean up old rib-group rules
-	if err := rg.clear(); err != nil {
-		slog.Warn("failed to clear old rib-group rules", "err", err)
+	// Clean up old rib-group rules. As with next-table, a failed per-family
+	// list does not abort the apply; the clear error is captured and
+	// returned at the end (or at the early-return below) so the caller can
+	// observe it (#2273).
+	clearErr := rg.clear()
+	if clearErr != nil {
+		slog.Warn("failed to clear old rib-group rules", "err", clearErr)
 	}
 
 	if len(ribGroups) == 0 || len(instances) == 0 {
-		return nil
+		return clearErr
 	}
 
 	// Build instance name → table ID map
@@ -269,15 +294,21 @@ func (rg *ribGroupManager) Apply(ribGroups map[string]*config.RibGroup, instance
 		}
 		prio++
 	}
-	return nil
+	// Desired rules are re-added; surface any clear() list failure.
+	return clearErr
 }
 
 // clear removes all ip rules in the rib-group priority range. Also
 // cleans up legacy rules from the old 200-299 range.
+//
+// Per-family RuleList dump failures are aggregated and returned rather
+// than swallowed; see the rationale on nextTableManager.clear (#2273).
 func (rg *ribGroupManager) clear() error {
+	var errs []error
 	for _, family := range []int{unix.AF_INET, unix.AF_INET6} {
 		rules, err := rg.ops.RuleList(family)
 		if err != nil {
+			errs = append(errs, fmt.Errorf("list rib-group rules family %d: %w", family, err))
 			continue
 		}
 		for _, r := range rules {
@@ -291,7 +322,7 @@ func (rg *ribGroupManager) clear() error {
 			}
 		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 // PBRRule describes a single policy-based routing rule derived from a
@@ -316,13 +347,17 @@ type pbrManager struct {
 // policy-based routing: traffic matching DSCP/source/destination
 // criteria is routed via the specified VRF's routing table.
 func (p *pbrManager) Apply(rules []PBRRule) error {
-	// Clean up old PBR rules first
-	if err := p.clear(); err != nil {
-		slog.Warn("failed to clear old PBR rules", "err", err)
+	// Clean up old PBR rules first. As with next-table, a failed per-family
+	// list does not abort the apply; the clear error is captured and
+	// returned at the end (or at the early-return below) so the caller can
+	// observe it (#2273).
+	clearErr := p.clear()
+	if clearErr != nil {
+		slog.Warn("failed to clear old PBR rules", "err", clearErr)
 	}
 
 	if len(rules) == 0 {
-		return nil
+		return clearErr
 	}
 
 	prio := pbrRulePriority
@@ -368,14 +403,20 @@ func (p *pbrManager) Apply(rules []PBRRule) error {
 			break
 		}
 	}
-	return nil
+	// Desired rules are re-added; surface any clear() list failure.
+	return clearErr
 }
 
 // clear removes all ip rules in the PBR priority range.
+//
+// Per-family RuleList dump failures are aggregated and returned rather
+// than swallowed; see the rationale on nextTableManager.clear (#2273).
 func (p *pbrManager) clear() error {
+	var errs []error
 	for _, family := range []int{unix.AF_INET, unix.AF_INET6} {
 		rules, err := p.ops.RuleList(family)
 		if err != nil {
+			errs = append(errs, fmt.Errorf("list PBR rules family %d: %w", family, err))
 			continue
 		}
 		for _, r := range rules {
@@ -387,7 +428,7 @@ func (p *pbrManager) clear() error {
 			}
 		}
 	}
-	return nil
+	return errors.Join(errs...)
 }
 
 // BuildPBRRules extracts policy-based routing rules from firewall filter

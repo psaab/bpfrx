@@ -9461,3 +9461,186 @@ top.
   merge — parent runs test-failover (RA withdraw fires on failover).
   **File(s)**: pkg/ra/sender.go, pkg/ra/ra.go, pkg/ra/ra_test.go,
   pkg/ra/serialize_test.go, pkg/ra/README.md, _Log.md
+  **Action**: #2268 — round-trip IA_TA lease type symmetrically in the DHCP
+  HA lease-sync pre-seed writer. Follow-up to #2267 (#2262), which fixed the
+  READ path to distinguish all three Kea v6 lease kinds (keaLeaseTypeToString:
+  0=IA_NA/1=IA_TA/2=IA_PD) but left the WRITE/pre-seed path asymmetric:
+  writeMemfile6 only encoded IA_PD vs "everything-else as IA_NA", so a synced
+  IA_TA lease read as IA_TA but was written back as lease_type=0 (IA_NA) on
+  takeover — a silent type downgrade across failover for temporary-address
+  bindings. Added stringToKeaLeaseType as the exact total inverse of
+  keaLeaseTypeToString and routed BOTH v6 write callers (writeMemfile6 memfile
+  pre-seed AND syncLeaseToKea lease6-add) through it so the read↔write mapping
+  cannot drift. IA_TA is a full /128 address binding, so its prefix_len column
+  is 128 (only IA_PD carries a delegated prefix). Unknown kind → IA_NA + log.
+  Added TestPreSeedMemfile6_RoundTrip_PreservesIATA (sync→pre-seed→read-back
+  round trip + byte-level lease_type=1 assertion; IA_NA/IA_PD no-regression)
+  and TestKeaLeaseTypeInverseTotality. Fail-on-revert verified (restoring the
+  IA_PD-vs-IA_NA-only writer makes the IA_TA assertions fail). build+vet+test
+  (dhcpserver, cluster) green; new tests 5x no flake.
+  **File(s)**: pkg/dhcpserver/lease_sync.go, pkg/dhcpserver/lease_sync_test.go,
+  pkg/dhcpserver/README.md, _Log.md
+
+- **Timestamp**: 2026-06-21
+  **Action**: #2273 — surface per-family RuleList errors from routing clear()
+  instead of swallowing them. All three policy-routing reconcilers
+  (nextTableManager, ribGroupManager, pbrManager in pkg/routing/rules.go)
+  looped [AF_INET, AF_INET6], called RuleList(family), `continue`d on error,
+  and returned nil unconditionally. A transient AF_INET dump failure left the
+  IPv4 rules in the manager's priority window orphaned for that pass while
+  IPv6 was cleaned, and the caller (daemon_apply.go 3b-3d) never learned — a
+  brief, unobservable self-healing window (re-cleared on next commit). Fix:
+  each clear() now aggregates per-family RuleList failures (errors.Join,
+  wrapped with the family) and returns them, while still best-effort deleting
+  every family whose dump succeeded. Each Apply captures the clear error,
+  logs it at WARN, still re-adds the desired rules (forward progress preserved,
+  including the empty-config early returns), then returns the clear error so
+  the daemon observes it. Decision: Apply logs-and-continues — it does NOT
+  abort on a clear() error — so the common (no-error) path is unchanged; the
+  daemon still logs+continues, the failure is now just visible/retryable.
+  Extended fakeRuleOps with a per-family listErr injector + failList helper;
+  added TestRulesClearListErrorSurfaced (table-driven over all three managers)
+  asserting Apply returns an error wrapping the injected failure AND still
+  deletes the successful family's window rule. Fail-on-revert verified
+  (reverting next-table to continue+return-nil fails the next-table subtest).
+  build+vet+test green, new test 5x no flake.
+  **File(s)**: pkg/routing/rules.go, pkg/routing/rules_test.go,
+  pkg/routing/README.md, _Log.md
+
+- **Timestamp**: 2026-06-21
+  **Action**: #1387 Path S — Kea expired-leases-processing (stale-lease
+  cleanup) config. Opt-in per-family reclamation subtree under
+  `dhcp-local-server` / `dhcpv6-local-server`. Config model
+  `DHCPExpiredLeasesConfig` on the per-family `DHCPLocalServerConfig`
+  (GLOBAL per Dhcp4/Dhcp6, never per-pool — trap 1). The two cap knobs
+  (max-leases/max-time) carry a `*Set` bool so `0` (= unlimited in Kea)
+  renders distinctly from unset (trap 2). Schema floor split: the three
+  timers use ValidateIntegerMin(1) (a 0 some Kea versions reject would
+  brick the fail-closed restart), the cap knobs + unwarned-cycles use
+  Min(0) (trap 3). Compile (`compileDHCPExpiredLeases`, dual-AST walker
+  mirroring compileDHCPDynamicDNS) lands inside the shared compileExpanded
+  core, so it is present on BOTH the strict commit and the tolerant
+  load/peer-sync compile sites (trap 4); the typed-leaf schema gate
+  hard-rejects on commit but warns on Load/SyncApply (boot/HA safety).
+  Render `keaExpiredLeasesMap` returns nil for nil/disabled (UNCONDITIONAL
+  omit -> byte-identical to pre-#1387, H1); enabled-no-knobs renders {}.
+  Tests: dhcpserver golden render (v4/v6 all-knobs, disabled/absent omit,
+  max-leases 0 vs unset, one-knob-omits-rest, enabled-no-knobs-{}, per-
+  family independence); config dual-AST compile equality + per-family +
+  absent-default + H2 set/unset + schema completion + commit-check floor
+  split + lenient compile; configstore stored/peer-sync tolerance. All
+  build+vet+test green; new tests 5x no flake. Kea binaries not present
+  locally so `kea-dhcp4 -t` config-test is deploy-deferred. DDNS half of
+  #1387 already shipped (#2043/#2066); kea-d2 backend PLAN-KILLed.
+  **File(s)**: pkg/config/types_system.go, pkg/config/schema_system.go,
+  pkg/config/compiler_services.go, pkg/dhcpserver/dhcpserver.go,
+  pkg/dhcpserver/README.md, pkg/config/dhcp_expired_leases_test.go,
+  pkg/dhcpserver/expired_leases_test.go,
+  pkg/configstore/typed_leaf_lenient_test.go, _Log.md
+  **Action**: #2270 — fail closed when an IKE (Phase 1) policy chain cannot
+  resolve, instead of silently emitting a proposal-less swanctl connection
+  that strongSwan negotiates with its compiled-in default crypto set (a
+  silent downgrade). resolveIKESettings (pkg/ipsec/ike.go) now distinguishes
+  the intentional no-policy case (gateway with no ike-policy → empty
+  proposal, nil error) from a broken chain (gateway names an ike-policy that
+  is undefined, or whose `proposals` ref dangles, and the legacy direct-
+  proposal fallback also misses) → returns the errIKEChainUnresolved
+  sentinel. renderConfig (policy.go) resolves IKE settings BEFORE writing
+  the connection block and SKIPS the VPN on that sentinel (mirroring the
+  #2074 render belt — one bad reference never zeroes a healthy tunnel; the
+  secrets block already excludes skipped VPNs). Added the commit-time strict
+  validator validateIKEPolicyChainReferencesStrict (compiler_validate_strict
+  .go), wired into compileExpanded right after the #2074 gateway gate;
+  strict on commit/commit-check, lenient (warn, no-brick) on the tolerant
+  load / peer-sync paths via lenientIKEPolicyChainRef (set in
+  CompileConfigLenient + CompileConfigForNodeLenient). Only gateways
+  referenced by a VPN are validated (orphans never render; matches Junos).
+  Tests: config-side reject (dangling policy / dangling proposal), accept
+  (resolvable chain / no-policy / legacy direct-proposal / orphan gateway),
+  lenient downgrade (standalone + node-aware), and a load-bearing fail-on-
+  revert (unwiring the validator makes the dangling tests fail — verified by
+  neutering the call site). ipsec-side: resolveIKESettings sentinel/no-policy
+  behavior + renderConfig skips broken chain while healthy tunnel + no-policy
+  tunnel survive. Mirrors the #2073 ESP fail-closed family. Three pre-
+  existing tests (TestIPsecGatewaySetSyntax, TestGenerateConfig_AggressiveMode
+  /_NotSet, TestGenerateConfig_DynamicHostname) carried latent dangling IKE
+  chains and were made self-consistent (define the referenced ike-policy +
+  proposal) — they assert flags orthogonal to the chain. build+vet green,
+  new tests 5x no flake.
+  **File(s)**: pkg/ipsec/ike.go, pkg/ipsec/policy.go, pkg/ipsec/README.md,
+  pkg/ipsec/ike_chain_failclosed_test.go, pkg/ipsec/ipsec_test.go,
+  pkg/config/compiler.go, pkg/config/compiler_validate_strict.go,
+  pkg/config/ike_policy_chain_ref_test.go, pkg/config/parser_security_test.go,
+  _Log.md
+
+- **Timestamp**: 2026-06-21 (#2279)
+  **Action**: IKE-chain validator diagnostics + test-robustness polish (3
+  Copilot follow-up items from merged #2277). (1) Tightened the healthy-tunnel
+  assertion in TestRenderConfig_BrokenChainSkipsVPN_HealthyTunnelSurvives:
+  `proposals = aes256` → `\n    proposals = aes256` (anchored to the 4-space
+  Phase-1 line) so it cannot FALSE-PASS off the child 8-space
+  `esp_proposals = aes256...` line, mirroring the negative guard in
+  TestRenderConfig_NoPolicyGatewayRendersWithoutProposalsLine. Fail-on-revert
+  proven: removing the Phase-1 `proposals =` emission now breaks the test
+  (old bare substring would have false-passed — demonstrated structurally).
+  (2) compiler_validate_strict.go: an ike-policy defined with NO proposals
+  leaf (pol.Proposals == "") now reports "ike-policy <name> ... has no
+  proposals configured" instead of the misleading `undefined ike-proposal ""`.
+  (3) The dangling-ike-policy message no longer asserts a single
+  `security ike gateway` prefix — gateways are authored under either
+  `security ike` or `security ipsec` (both compileIKE/compileIPsec populate
+  the same Gateways map), so the message is stanza-agnostic
+  ("gateway <name> (under `security ike` or `security ipsec`)"). Diagnostics/
+  test-quality only; no security-logic change. build+vet green; pkg/ipsec +
+  pkg/config tests pass; affected tests 5x no flake.
+  **File(s)**: pkg/ipsec/ike_chain_failclosed_test.go,
+  pkg/config/compiler_validate_strict.go,
+  pkg/config/ike_policy_chain_ref_test.go, _Log.md
+- **Timestamp**: 2026-06-21
+  **Action**: #2234 — bounded stalest-eviction for the screen scan/sweep
+  per-zone source table (restore detection under saturation). Replaced the
+  hard skip-on-full cliff (`MAX_SOURCES_PER_ZONE = 4096`) with O(K) eviction
+  (K = `EVICT_SCAN_LIMIT` = 64): a brand-new `(zone, src_ip)` at a full zone
+  reclaims any expired window in a fixed sample, else evicts the stalest
+  sampled entry — so a fresh real scanner is always trackable (closes the
+  detection-DoS where a spoofed flood pinned the table and suppressed a real
+  scanner). Per-zone source count maintained incrementally (`per_zone_count`)
+  so the cap test is O(1) — replaces the pre-#2234 O(sources) `sources_in_zone`
+  scan that on the new-source-at-cap path was itself an O(n)-per-packet
+  amplifier. Both trackers unified on a shared `ScanCore<T>` (one source of
+  truth for bound/eviction/clamp/pressure). Added `evicted_pressure` counter +
+  a rare LOGARITHMIC `scan-table-pressure` screen event (powers of two in the
+  eviction count) emitted from the cold session-miss hook — never per-flow.
+  New reason bit `SCREEN_SCAN_TABLE_PRESSURE = 1<<19` (Rust + Go
+  `ScreenFlagNames`, also backfilled the stale 1<<17/1<<18 names). Tests:
+  fail-on-revert (fresh scanner detected after saturation, both scan.rs and
+  ScreenState levels), eviction-prefers-stalest, eviction-prefers-expired,
+  bounded-cost + count-exact under sustained churn, logarithmic pressure-event
+  rate. cargo build/test green (full suite 2255/0 main bin + all targets;
+  new tests 5x no flake); go build/vet clean. SMOKE on loss cluster PENDING.
+  **File(s)**: userspace-dp/src/screen/scan.rs,
+  userspace-dp/src/screen/mod.rs, userspace-dp/src/screen/tests.rs,
+  userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/event_emit.rs, pkg/dataplane/types.go,
+  userspace-dp/src/session/README.md, _Log.md
+
+- **Timestamp**: 2026-06-21
+  **Action**: #2234 — applied Copilot-review fixes + loss-cluster smoke.
+  Fixes: (1) take_pressure_event uses checked_next_power_of_two().unwrap_or
+  (u64::MAX) — next_power_of_two() panics/wraps past 2^63; (2/3) tightened
+  scan.rs + README wording (eviction scans a FIXED PREFIX of the whole
+  source table, not "the zone's entries", with the documented same-zone
+  fallback); (4) added emit_screen_alarm_event (RT_FLOW action PERMIT) so the
+  scan-table-pressure alarm is NOT counted as a drop/deny downstream — was
+  riding emit_screen_drop_event (action DENY). New fail-on-revert test
+  screen_alarm_event_is_permit_not_deny. SMOKE on loss userspace cluster
+  (deploy verify-dataplane gate PASSED both nodes; fw1 was RG0 primary;
+  scan-protect screen profile with ip-sweep+port-scan threshold attached to
+  lan+wan; CoS re-applied): iperf3 -P12 -t20 uncapped port 5211 —
+  v4-push 22.9 / v4-rev 22.7 / v6-push 22.5 / v6-rev 22.2 Gbit/s. Screen
+  drops: 0 total, Packets dropped: 0 — legit multi-flow traffic NOT spuriously
+  flagged by scan/sweep. cargo screen 123/0.
+  **File(s)**: userspace-dp/src/screen/scan.rs,
+  userspace-dp/src/afxdp/event_emit.rs,
+  userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/session/README.md, _Log.md

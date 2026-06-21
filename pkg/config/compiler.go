@@ -171,6 +171,22 @@ type compileOpts struct {
 	// lenientPolicyMatchAddress.
 	lenientIPsecGatewayRefs bool
 
+	// lenientIKEPolicyChainRef (#2270) downgrades the IKE (Phase 1)
+	// gateway -> ike-policy -> ike-proposal cross-reference check from a
+	// hard error to a warning on the tolerant load / peer-sync paths
+	// (CompileConfigLenient / CompileConfigForNodeLenient). A dangling
+	// ike-policy reference (the policy is undefined, or its `proposals`
+	// reference dangles) made resolveIKESettings return an empty proposal,
+	// which renderConfig omitted entirely — strongSwan then negotiated
+	// phase-1 with its compiled-in default set (a silent crypto downgrade).
+	// Commit / commit-check hard-reject it so a new operator edit fails
+	// loudly, but an already-persisted or peer-synced config carrying this
+	// latent misconfiguration must still boot (the render-path safety net in
+	// pkg/ipsec resolveIKESettings -> renderConfig skips the unrenderable VPN
+	// rather than negotiating with defaults). Same doctrine as
+	// lenientIPsecPolicyProposalRef.
+	lenientIKEPolicyChainRef bool
+
 	// lenientLogProfileStreamRef (#2008 H7) downgrades the
 	// `security log profile <name> stream-name <stream>` cross-reference
 	// from a hard error to a warning on the tolerant load / peer-sync
@@ -377,6 +393,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientEventAttributesMatch:        true,
 		lenientIPsecPolicyProposalRef:      true,
 		lenientIPsecGatewayRefs:            true,
+		lenientIKEPolicyChainRef:           true,
 		lenientLogProfileStreamRef:         true,
 		lenientNATPoolAlarmThreshold:       true,
 		lenientNATHostMask:                 true,
@@ -469,6 +486,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientEventAttributesMatch:        true,
 		lenientIPsecPolicyProposalRef:      true,
 		lenientIPsecGatewayRefs:            true,
+		lenientIKEPolicyChainRef:           true,
 		lenientLogProfileStreamRef:         true,
 		lenientNATPoolAlarmThreshold:       true,
 		lenientNATHostMask:                 true,
@@ -949,6 +967,29 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		if opts.lenientIPsecGatewayRefs {
 			cfg.Warnings = append(cfg.Warnings,
 				fmt.Sprintf("ipsec gateway reference (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
+	// #2270 IKE (Phase 1) gateway -> ike-policy -> ike-proposal cross-
+	// reference. A gateway that names an ike-policy whose chain does not
+	// resolve (the policy is undefined, or its `proposals` reference
+	// dangles) made resolveIKESettings return an empty proposal, which
+	// renderConfig omitted — strongSwan then negotiated phase-1 with its
+	// compiled-in default set instead of the configured crypto (a silent
+	// downgrade). Strict on commit / commit-check (hard reject so the
+	// operator gets a diagnostic); lenient on load / peer-sync (warn so a
+	// pre-fix or peer-synced config still boots — #1960 fail-closed-on-load
+	// class; the render belt in pkg/ipsec skips the unrenderable VPN rather
+	// than negotiating with defaults). Runs on the fully-compiled *Config so
+	// both ike{} and ipsec{} gateway/policy/proposal definitions are present
+	// regardless of stanza authoring order. Mirrors
+	// validateIPsecPolicyProposalReferencesStrict (its Phase-2 sibling).
+	if err := validateIKEPolicyChainReferencesStrict(cfg); err != nil {
+		if opts.lenientIKEPolicyChainRef {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("ike-policy chain reference (downgraded to warning on tolerant path): %v", err))
 		} else {
 			return nil, err
 		}

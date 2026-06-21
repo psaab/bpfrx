@@ -490,3 +490,134 @@ func TestPreSeedMemfile4_RoundTrip(t *testing.T) {
 		t.Errorf("expire = %d, want %d (local re-anchor)", got[0].Expire, localNow.Unix()+900)
 	}
 }
+
+// Test (#2268): the v6 memfile pre-seed must round-trip the lease KIND
+// symmetrically with the read path — an IA_TA (temporary-address) lease read
+// and held as IA_TA must be written back as lease_type=1 (IA_TA), never silently
+// downgraded to lease_type=0 (IA_NA). Before the fix writeMemfile6 only encoded
+// IA_PD vs "everything-else as IA_NA", so an IA_TA lease lost its kind across a
+// failover. IA_NA and IA_PD rows in the same file prove no regression.
+//
+// Fail-on-revert: reverting writeMemfile6 to the IA_PD-vs-IA_NA-only writer
+// makes the IA_TA assertions fail (the row would read back as IA_NA with
+// prefix_len=128, never IA_TA).
+func TestPreSeedMemfile6_RoundTrip_PreservesIATA(t *testing.T) {
+	localNow := time.Unix(1_700_000_000, 0)
+	dir := t.TempDir()
+	memfile := filepath.Join(dir, "kea-leases6.csv")
+	m := New()
+	// Pre-seed writes to memfile6; the read-back fallback (no socket) reads it.
+	m.SetLeaseSyncSeamsForTesting(nil, "", filepath.Join(dir, "missing.sock"), "", memfile)
+
+	in := []SyncLease{
+		{Family: 6, Address: "2001:db8::1", DUID: "00:01:00:01", IAID: 10,
+			LeaseType: "IA_NA", SubnetID: 1, Remaining: 1200, State: keaStateDefault},
+		{Family: 6, Address: "2001:db8::ta", DUID: "00:01:00:02", IAID: 20,
+			LeaseType: "IA_TA", SubnetID: 1, Remaining: 1800, State: keaStateDefault},
+		{Family: 6, Address: "2001:db8:abcd::", DUID: "00:01:00:03", IAID: 30,
+			LeaseType: "IA_PD", PrefixLen: 56, SubnetID: 1, Remaining: 2400, State: keaStateDefault},
+	}
+	if err := m.PreSeedMemfile6(in, localNow); err != nil {
+		t.Fatalf("PreSeedMemfile6: %v", err)
+	}
+
+	// Direct byte-level assertion: the IA_TA row must carry lease_type=1. This is
+	// the tightest fail-on-revert guard — an IA_PD-vs-IA_NA-only writer would
+	// emit lease_type=0 for the IA_TA address. The Kea v6 memfile lease_type is
+	// the 7th column (index 6).
+	raw, err := os.ReadFile(memfile)
+	if err != nil {
+		t.Fatalf("read pre-seeded memfile: %v", err)
+	}
+	var sawTAColumn bool
+	for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+		if !strings.HasPrefix(line, "2001:db8::ta,") {
+			continue
+		}
+		cols := strings.Split(line, ",")
+		if len(cols) < 9 {
+			t.Fatalf("IA_TA row has too few columns: %q", line)
+		}
+		if cols[6] != "1" {
+			t.Errorf("IA_TA row lease_type column = %q, want 1 (#2268 downgrade regression): %q", cols[6], line)
+		}
+		// IA_TA is a full /128 address binding, not a delegated prefix.
+		if cols[8] != "128" {
+			t.Errorf("IA_TA row prefix_len column = %q, want 128: %q", cols[8], line)
+		}
+		sawTAColumn = true
+	}
+	if !sawTAColumn {
+		t.Fatalf("IA_TA row not found in pre-seeded memfile:\n%s", raw)
+	}
+
+	// Full round trip: read the pre-seeded memfile back through the production
+	// read path (socket missing → memfile fallback) and assert each kind survives.
+	got, err := m.GetSyncLeases6(context.Background(), localNow)
+	if err != nil {
+		t.Fatalf("GetSyncLeases6 (read-back): %v", err)
+	}
+	if len(got) != 3 {
+		t.Fatalf("read back %d leases, want 3: %+v", len(got), got)
+	}
+	byAddr := map[string]SyncLease{}
+	for _, l := range got {
+		byAddr[l.Address] = l
+	}
+
+	ta, ok := byAddr["2001:db8::ta"]
+	if !ok {
+		t.Fatalf("IA_TA lease missing after round trip: %+v", got)
+	}
+	if ta.LeaseType != "IA_TA" {
+		t.Errorf("IA_TA lease round-tripped as %q, want IA_TA (#2268 downgrade)", ta.LeaseType)
+	}
+	if ta.PrefixLen != 0 {
+		t.Errorf("IA_TA lease PrefixLen = %d, want 0 (address, not prefix)", ta.PrefixLen)
+	}
+	if ta.DUID != "00:01:00:02" || ta.IAID != 20 {
+		t.Errorf("IA_TA identity wrong: DUID=%q IAID=%d", ta.DUID, ta.IAID)
+	}
+
+	// No regression: IA_NA and IA_PD still round-trip.
+	if na := byAddr["2001:db8::1"]; na.LeaseType != "IA_NA" || na.PrefixLen != 0 {
+		t.Errorf("IA_NA lease regressed: %+v", na)
+	}
+	if pd := byAddr["2001:db8:abcd::"]; pd.LeaseType != "IA_PD" || pd.PrefixLen != 56 {
+		t.Errorf("IA_PD lease regressed: %+v", pd)
+	}
+}
+
+// Test (#2268): the lease-type read↔write mapping is a single total inverse —
+// keaLeaseTypeToString and stringToKeaLeaseType must agree on every value so the
+// pair can never drift to re-introduce an asymmetric downgrade. Every numeric
+// type the reader produces must invert back to the same number, and every string
+// the writer accepts must come from the reader. The empty string (unknown kind)
+// defaults to IA_NA on the write side.
+func TestKeaLeaseTypeInverseTotality(t *testing.T) {
+	for _, n := range []int{keaLeaseTypeIANA, keaLeaseTypeIATA, keaLeaseTypeIAPD} {
+		s, ok := keaLeaseTypeToString(n)
+		if !ok {
+			t.Fatalf("keaLeaseTypeToString(%d) not ok", n)
+		}
+		back, ok := stringToKeaLeaseType(s)
+		if !ok {
+			t.Fatalf("stringToKeaLeaseType(%q) not ok", s)
+		}
+		if back != n {
+			t.Errorf("inverse drift: %d -> %q -> %d", n, s, back)
+		}
+	}
+	// Empty string is the write-side default (unknown kind) → IA_NA.
+	if v, ok := stringToKeaLeaseType(""); !ok || v != keaLeaseTypeIANA {
+		t.Errorf(`stringToKeaLeaseType("") = %d ok=%v, want %d true`, v, ok, keaLeaseTypeIANA)
+	}
+	// An unknown non-empty string is rejected (ok=false) and falls back to IA_NA.
+	if v, ok := stringToKeaLeaseType("IA_BOGUS"); ok || v != keaLeaseTypeIANA {
+		t.Errorf(`stringToKeaLeaseType("IA_BOGUS") = %d ok=%v, want %d false`, v, ok, keaLeaseTypeIANA)
+	}
+	// An unknown numeric type is rejected (mirrors the read side fail-closed).
+	if _, ok := keaLeaseTypeToString(99); ok {
+		t.Errorf("keaLeaseTypeToString(99) ok=true, want false")
+	}
+}

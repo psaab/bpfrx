@@ -182,6 +182,146 @@ func validateIPsecPolicyProposalReferencesStrict(cfg *Config) error {
 	return nil
 }
 
+// validateIKEPolicyChainReferencesStrict hard-rejects an IKE (Phase 1)
+// reference chain that cannot resolve to a real proposal (#2270). A
+// gateway names an `ike-policy`; that policy names a `proposals` (an
+// `ike-proposal`). resolveIKESettings (pkg/ipsec/ike.go) walks
+// gateway -> ike-policy -> ike-proposal. When that chain breaks — the
+// ike-policy is undefined, or the policy's `proposals` reference dangles —
+// resolveIKESettings used to return an empty proposal string with a nil
+// error, and renderConfig (which guards the line with `if ikeProposals !=
+// ""`) emitted the connection block with NO `proposals =` line. strongSwan
+// then negotiates phase-1 with its compiled-in default proposal set instead
+// of the configured/required crypto — a silent security-posture downgrade,
+// the same class validateIPsecPolicyProposalReferencesStrict closes for the
+// Phase-2 (ESP) chain.
+//
+// What is accepted (mirror resolveIKESettings exactly so commit and render
+// agree on what resolves):
+//   - a gateway with no `ike-policy` at all: the intentional no-policy
+//     case — strongSwan's default set is the operator's explicit choice,
+//     nothing dangles.
+//   - gateway -> defined ike-policy -> defined ike-proposal.
+//   - the legacy direct-proposal fallback: a gateway whose `ike-policy`
+//     value is itself the NAME of a defined IPsec (Phase 2) proposal, which
+//     resolveIKESettings renders via buildIKEProposal when the ike-policy
+//     chain is absent. Accepted so a config that genuinely renders a
+//     non-empty proposal is never rejected.
+//
+// Rejected:
+//   - a gateway whose `ike-policy` names no defined ike-policy AND is not a
+//     defined IPsec-proposal name (a typo / dangling reference).
+//   - a gateway whose `ike-policy` resolves to a defined ike-policy but
+//     that policy's `proposals` reference names no defined ike-proposal,
+//     and the ike-policy value is not also a defined IPsec-proposal name.
+//
+// Only gateways actually referenced by a VPN are validated: an orphan
+// gateway never reaches render, so an unreferenced dangling chain is inert
+// (and Junos likewise only faults a gateway in use). Gateways are iterated
+// via the sorted VPN list so the first-reported error is deterministic.
+//
+// On the tolerant load / peer-sync paths the call site downgrades this to a
+// warning (opts.lenientIKEPolicyChainRef) so an already-persisted or
+// peer-synced config carrying a dangling reference still BOOTS (#1960
+// fail-closed-on-load class); the render-path safety net in pkg/ipsec
+// (resolveIKESettings -> errIKEChainUnresolved -> renderConfig skips the
+// VPN) keeps the bad tunnel out of the generated config rather than letting
+// it negotiate with defaults. Commit / commit-check stay strict. Mirrors
+// validateIPsecPolicyProposalReferencesStrict.
+func validateIKEPolicyChainReferencesStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	ipsec := &cfg.Security.IPsec
+	if len(ipsec.VPNs) == 0 {
+		return nil
+	}
+	gateways := ipsec.Gateways
+	ikePolicies := ipsec.IKEPolicies
+	ikeProposals := ipsec.IKEProposals
+	espProposals := ipsec.Proposals
+
+	// chainResolves mirrors resolveIKESettings' acceptance: the
+	// ike-policy -> ike-proposal chain, OR the legacy direct-proposal
+	// fallback (the ike-policy value is itself a defined Phase-2 proposal
+	// name).
+	chainResolves := func(ikePolicyName string) bool {
+		if pol, ok := ikePolicies[ikePolicyName]; ok && pol != nil {
+			if _, ok := ikeProposals[pol.Proposals]; ok {
+				return true
+			}
+		}
+		// Legacy fallback: a gateway's ike-policy value naming an IPsec
+		// proposal directly. resolveIKESettings only consults this when the
+		// ike-policy chain is absent, so checking it unconditionally here is
+		// a superset that never wrongly rejects a renderable config.
+		if _, ok := espProposals[ikePolicyName]; ok {
+			return true
+		}
+		return false
+	}
+
+	// VPNs is a map (unordered); sort keys so the first-error commit-check
+	// message is deterministic across runs.
+	vpnNames := make([]string, 0, len(ipsec.VPNs))
+	for name := range ipsec.VPNs {
+		vpnNames = append(vpnNames, name)
+	}
+	sort.Strings(vpnNames)
+	for _, vpnName := range vpnNames {
+		vpn := ipsec.VPNs[vpnName]
+		if vpn == nil || vpn.Gateway == "" {
+			continue
+		}
+		gw, ok := gateways[vpn.Gateway]
+		if !ok || gw == nil {
+			// An undefined / inline gateway is the domain of
+			// validateIPsecGatewayReferencesStrict (#2074); there is no
+			// ike-policy chain to validate here.
+			continue
+		}
+		if gw.IKEPolicy == "" {
+			// Intentional no-policy case (strongSwan defaults chosen).
+			continue
+		}
+		if chainResolves(gw.IKEPolicy) {
+			continue
+		}
+		// A gateway may be authored under either `security ike gateway` or
+		// `security ipsec gateway` (both compileIKE and compileIPsec populate
+		// the same Gateways map; #2279). The typed gateway does not record
+		// which stanza it came from, so the message names both candidates
+		// rather than asserting a single (possibly wrong) prefix.
+		if _, polDefined := ikePolicies[gw.IKEPolicy]; !polDefined {
+			return fmt.Errorf("gateway %q (under `security ike` or "+
+				"`security ipsec`, used by ipsec vpn %q) references undefined "+
+				"ike-policy %q; phase-1 would silently negotiate with the "+
+				"strongSwan default proposal set instead of the configured "+
+				"crypto",
+				gw.Name, vpnName, gw.IKEPolicy)
+		}
+		pol := ikePolicies[gw.IKEPolicy]
+		if pol.Proposals == "" {
+			// The ike-policy exists but has no `proposals` leaf at all, so
+			// pol.Proposals is the empty string. Reporting an "undefined
+			// ike-proposal \"\"" misleads the operator into hunting for a
+			// proposal named "" — say plainly that the policy is missing its
+			// proposals configuration.
+			return fmt.Errorf("ike-policy %q (via gateway %q, ipsec vpn %q) "+
+				"has no proposals configured; phase-1 would silently negotiate "+
+				"with the strongSwan default proposal set instead of the "+
+				"configured crypto",
+				gw.IKEPolicy, gw.Name, vpnName)
+		}
+		return fmt.Errorf("ike-policy %q (via gateway %q, ipsec vpn %q) "+
+			"references undefined ike-proposal %q; phase-1 would silently "+
+			"negotiate with the strongSwan default proposal set instead of "+
+			"the configured crypto",
+			gw.IKEPolicy, gw.Name, vpnName, pol.Proposals)
+	}
+	return nil
+}
+
 // validateLogProfileStreamReferencesStrict hard-rejects a
 // `security log profile <name>` whose `stream-name` reference does not
 // resolve to a configured `security log stream` (#2008 H7). xpf routes
