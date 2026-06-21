@@ -1,5 +1,37 @@
 # Action Log
 
+## 2026-06-21 — #2188 fold three review NITs (VRRP IPv6 ext-header consistency)
+
+- **Timestamp**: 2026-06-21
+- **Action**: Folded three polish/consistency NITs into PR #2188
+  (VRRP cluster #2155/#2156) so the cBPF accept-set, the Go ext-header
+  walker, the tests, and the README all tell ONE story:
+  "HBH(0)/Routing(43)/Dest-Opts(60) are walked; Fragment(44) and AH(51)
+  are not VRRP carriers and are dropped."
+  (1) Dropped Fragment(44) from the cBPF IPv6 accept-set so fragmented
+  IPv6 stays kernel-dropped instead of waking the RX goroutine only for
+  the Go walker to drop it (wasted wakeup). Re-verified every cBPF jump
+  offset after the filter shrank from 33->31 instructions (both IPv6 arms
+  lost their jeq 44; instruction 7's Jt 17->16; both arms' internal
+  accept offsets recomputed).
+  (2) Removed AH(51) handling from walkIPv6ExtHeaders -- AH-wrapped VRRP
+  is not a real scenario (VRRP authenticates itself, never IPsec-AH) and
+  the cBPF never admitted 51 anyway, so an AH-first advert was already
+  kernel-dropped before Go ran (test/reality gap). The single-ah test
+  case was rewritten to ah-dropped (accept:false). Kept the chained
+  HBH+Dest-Opts accept case and the bounded/safety tests.
+  (3) Reconciled pkg/vrrp/README.md accept-set to {112,0,43,60} and
+  fixed the contradictory "AH out of scope on both paths" line so it is
+  now true on all three (cBPF/walker/fallback).
+  Did NOT touch the #2156 build-before-teardown logic.
+- **File(s)**: pkg/vrrp/manager.go, pkg/vrrp/instance.go,
+  pkg/vrrp/vrrp_test.go, pkg/vrrp/README.md
+- **Validation**: go build ./... clean; go test ./pkg/vrrp/... PASS;
+  go test -race ./pkg/vrrp/... -count=3 clean; go vet ./pkg/vrrp/...
+  clean. Ext-header walk subtests confirm HBH/Routing/Dest-Opts (single +
+  chained + VLAN-tagged) accepted; Fragment + AH dropped; bare-base
+  regression + bounded/safety subtests still pass.
+
 ## 2026-06-21 — #2134 wire screen session-limit enforcement (closes #2128)
 
 - **Timestamp**: 2026-06-21

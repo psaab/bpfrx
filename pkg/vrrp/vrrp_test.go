@@ -1729,11 +1729,15 @@ func TestAfPacket_IPv6ExtHeaderWalk(t *testing.T) {
 		{name: "single-hop-by-hop", exts: []extHeader{{typ: 0, extLen: 0}}, accept: true},
 		{name: "single-routing", exts: []extHeader{{typ: 43, extLen: 0}}, accept: true},
 		{name: "single-dest-opts", exts: []extHeader{{typ: 60, extLen: 0}}, accept: true},
-		{name: "single-ah", exts: []extHeader{{typ: 51, extLen: 1}}, accept: true},
 		{name: "chained-hbh-destopts", exts: []extHeader{{typ: 0, extLen: 0}, {typ: 60, extLen: 0}}, accept: true},
 		{name: "vlan-tagged-with-hbh", vlanID: 50, exts: []extHeader{{typ: 0, extLen: 1}}, accept: true},
-		// Fragment header is a hard drop (fragmented VRRP is non-conformant).
+		// Fragment (44) and AH (51) are NOT VRRP carriers — both are dropped.
+		// VRRP is never legitimately fragmented and never IPsec-AH-wrapped, and
+		// the cBPF prefilter does not admit base Next-Header 44 or 51 either, so
+		// such adverts are kernel-dropped before the Go walk runs (here the walk
+		// itself drops them as defense-in-depth).
 		{name: "fragment-dropped", exts: []extHeader{{typ: 44, extLen: 0}}, accept: false},
+		{name: "ah-dropped", exts: []extHeader{{typ: 51, extLen: 1}}, accept: false},
 	}
 
 	for _, tt := range tests {

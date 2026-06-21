@@ -154,25 +154,34 @@ untagged and 802.1Q-tagged IPv4/IPv6:
 - IPv4 matches base protocol `== 112`; `parseAfPacketIPv4` then
   re-walks IHL + re-checks TTL 255 in Go (so IPv4 options are tolerated).
 - IPv6 matches the base **Next-Header** against the set
-  `{112 VRRP, 0 Hop-by-Hop, 43 Routing, 60 Dest-Opts, 44 Fragment}`
+  `{112 VRRP, 0 Hop-by-Hop, 43 Routing, 60 Dest-Opts}`
   (approach A2). A chained VRRP advert's base Next-Header is the FIRST
   ext-header's type, not 112, and a fixed-offset cBPF cannot walk an
-  ext-header chain — so admitting the ext-header types lets any
+  ext-header chain — so admitting these ext-header types lets any
   conformant advert through while ordinary IPv6 TCP/UDP/ICMPv6/ND stays
-  kernel-dropped on a data-bearing RETH VLAN (e.g. `reth0.80`). The
-  cBPF is only a volume reducer; authoritative validation is in Go.
+  kernel-dropped on a data-bearing RETH VLAN (e.g. `reth0.80`).
+  Fragment (44) and AH (51) are deliberately **not** admitted: VRRP is
+  never legitimately fragmented (no reassembly) and never IPsec-AH-wrapped
+  (it authenticates itself), so such frames stay kernel-dropped instead of
+  waking the RX goroutine only for the Go walker to drop them. The cBPF is
+  only a volume reducer; authoritative validation is in Go.
 
 `parseAfPacketIPv6` performs a **bounded** IPv6 ext-header walk
 (`walkIPv6ExtHeaders`) to locate the real proto-112 payload offset
 instead of assuming the old fixed 40-byte base header. Conventions and
 explicit drop bounds (deliberate, documented):
 
-- Hop-by-Hop (0) / Routing (43) / Dest-Opts (60): length is
-  `(HdrExtLen+1)*8` (8-byte units). AH (51): `(PayloadLen+2)*4`
-  (4-byte units). Mixing the two unit conventions is the classic walk
-  bug — keep them distinct.
+- Hop-by-Hop (0) / Routing (43) / Dest-Opts (60) are the only chained
+  headers a conformant advert can carry; each is `(HdrExtLen+1)*8` bytes
+  (8-byte units) and is walked to the next header.
 - Fragment (44) is a **hard drop** — VRRP adverts are never legitimately
-  fragmented and the receiver does no reassembly.
+  fragmented and the receiver does no reassembly. The cBPF prefilter
+  already refuses base Next-Header 44, so the walker's drop is
+  defense-in-depth for a Fragment header buried mid-chain.
+- AH (51) and any other Next-Header is **dropped** — VRRP is not
+  IPsec-AH-wrapped, so AH is not a VRRP carrier. The cBPF likewise
+  refuses base Next-Header 51, so an AH-first advert is kernel-dropped
+  before the walk runs.
 - The walk is capped at 8 iterations and bounds-checks every step
   against the captured length, so a truncated or maliciously long chain
   can neither loop nor read out of bounds — it is simply dropped.
@@ -180,7 +189,8 @@ explicit drop bounds (deliberate, documented):
 The raw `ip6:112` socket fallback (non-AF_PACKET path) is ext-header-safe
 for the common extension headers because the kernel walks the chain and
 hands `ReadFrom` the upper-layer payload directly. AH and fragmented
-VRRP are out of scope on **both** paths.
+VRRP are out of scope on **both** paths — the cBPF, the Go walker, and the
+fallback all agree that only `{112, 0, 43, 60}` carry a VRRP advert.
 
 **Homogeneous-peer expectation:** xpf's own IPv6 sender emits a bare
 base header (no ext-headers, hop-limit 255) per RFC 5798, which is the

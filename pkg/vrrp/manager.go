@@ -657,12 +657,17 @@ func openAfPacketReceiver(ifIndex int) (int, error) {
 	// base Next-Header of such a frame is the FIRST ext-header's type, not 112.
 	// A fixed-offset cBPF cannot walk an ext-header chain, so the IPv6 arm
 	// instead matches the base Next-Header against the small set
-	//   {112 VRRP, 0 Hop-by-Hop, 43 Routing, 60 Dest-Opts, 44 Fragment}
+	//   {112 VRRP, 0 Hop-by-Hop, 43 Routing, 60 Dest-Opts}
 	// (approach A2). Any conformant VRRP advert — bare or chained — starts with
 	// one of these, while ordinary IPv6 TCP/UDP/ICMPv6/ND stays kernel-dropped
-	// on a data-bearing RETH VLAN (e.g. reth0.80). The authoritative ext-header
-	// walk + proto-112 + hop-limit-255 + VRID validation happens in Go
-	// (parseAfPacketIPv6); the cBPF is only an in-kernel volume reducer.
+	// on a data-bearing RETH VLAN (e.g. reth0.80). Fragment (44) and AH (51)
+	// are deliberately NOT admitted: VRRP adverts are never legitimately
+	// fragmented (the receiver does no reassembly) and never AH-wrapped (VRRP
+	// has its own authentication, not IPsec-AH), so those frames stay
+	// kernel-dropped here rather than waking the RX goroutine only for the Go
+	// walker to drop them. The authoritative ext-header walk + proto-112 +
+	// hop-limit-255 + VRID validation happens in Go (parseAfPacketIPv6); the
+	// cBPF is only an in-kernel volume reducer.
 	//
 	// Jump offsets (Jt/Jf) are relative to the NEXT instruction.
 	filter := []unix.SockFilter{
@@ -674,7 +679,7 @@ func openAfPacketReceiver(ifIndex int) (int, error) {
 		// check_vlan:
 		{Code: 0x28, K: 16},                    //  5: ldh [16] — real ethertype
 		{Code: 0x15, Jt: 6, Jf: 0, K: 0x0800},  //  6: jeq 0x0800 → 13 (check_ipv4_vlan)
-		{Code: 0x15, Jt: 17, Jf: 0, K: 0x86DD}, //  7: jeq 0x86DD → 25 (check_ipv6_vlan)
+		{Code: 0x15, Jt: 16, Jf: 0, K: 0x86DD}, //  7: jeq 0x86DD → 24 (check_ipv6_vlan)
 		{Code: 0x06, K: 0},                     //  8: ret reject
 		// check_ipv4: proto at 14+9=23
 		{Code: 0x30, K: 23},                //  9: ldb [23]
@@ -687,24 +692,23 @@ func openAfPacketReceiver(ifIndex int) (int, error) {
 		{Code: 0x06, K: 0xFFFFFFFF},        // 15: ret accept
 		{Code: 0x06, K: 0},                 // 16: ret reject
 		// check_ipv6: base next-header at 14+6=20. Accept the VRRP/ext-header
-		// set {112,0,43,60,44}; anything else is non-VRRP → reject in-kernel.
+		// set {112,0,43,60}; anything else (incl. Fragment 44, AH 51) is
+		// non-VRRP → reject in-kernel.
 		{Code: 0x30, K: 20},                // 17: ldb [20]
-		{Code: 0x15, Jt: 5, Jf: 0, K: 112}, // 18: jeq 112  → 24 accept
-		{Code: 0x15, Jt: 4, Jf: 0, K: 0},   // 19: jeq 0    → 24 accept (Hop-by-Hop)
-		{Code: 0x15, Jt: 3, Jf: 0, K: 43},  // 20: jeq 43   → 24 accept (Routing)
-		{Code: 0x15, Jt: 2, Jf: 0, K: 60},  // 21: jeq 60   → 24 accept (Dest-Opts)
-		{Code: 0x15, Jt: 1, Jf: 0, K: 44},  // 22: jeq 44   → 24 accept (Fragment)
-		{Code: 0x06, K: 0},                 // 23: ret reject
-		{Code: 0x06, K: 0xFFFFFFFF},        // 24: ret accept
+		{Code: 0x15, Jt: 4, Jf: 0, K: 112}, // 18: jeq 112  → 23 accept
+		{Code: 0x15, Jt: 3, Jf: 0, K: 0},   // 19: jeq 0    → 23 accept (Hop-by-Hop)
+		{Code: 0x15, Jt: 2, Jf: 0, K: 43},  // 20: jeq 43   → 23 accept (Routing)
+		{Code: 0x15, Jt: 1, Jf: 0, K: 60},  // 21: jeq 60   → 23 accept (Dest-Opts)
+		{Code: 0x06, K: 0},                 // 22: ret reject
+		{Code: 0x06, K: 0xFFFFFFFF},        // 23: ret accept
 		// check_ipv6_vlan: base next-header at 18+6=24. Same accept set.
-		{Code: 0x30, K: 24},                // 25: ldb [24]
-		{Code: 0x15, Jt: 5, Jf: 0, K: 112}, // 26: jeq 112  → 32 accept
-		{Code: 0x15, Jt: 4, Jf: 0, K: 0},   // 27: jeq 0    → 32 accept (Hop-by-Hop)
-		{Code: 0x15, Jt: 3, Jf: 0, K: 43},  // 28: jeq 43   → 32 accept (Routing)
-		{Code: 0x15, Jt: 2, Jf: 0, K: 60},  // 29: jeq 60   → 32 accept (Dest-Opts)
-		{Code: 0x15, Jt: 1, Jf: 0, K: 44},  // 30: jeq 44   → 32 accept (Fragment)
-		{Code: 0x06, K: 0},                 // 31: ret reject
-		{Code: 0x06, K: 0xFFFFFFFF},        // 32: ret accept
+		{Code: 0x30, K: 24},                // 24: ldb [24]
+		{Code: 0x15, Jt: 4, Jf: 0, K: 112}, // 25: jeq 112  → 30 accept
+		{Code: 0x15, Jt: 3, Jf: 0, K: 0},   // 26: jeq 0    → 30 accept (Hop-by-Hop)
+		{Code: 0x15, Jt: 2, Jf: 0, K: 43},  // 27: jeq 43   → 30 accept (Routing)
+		{Code: 0x15, Jt: 1, Jf: 0, K: 60},  // 28: jeq 60   → 30 accept (Dest-Opts)
+		{Code: 0x06, K: 0},                 // 29: ret reject
+		{Code: 0x06, K: 0xFFFFFFFF},        // 30: ret accept
 	}
 	if err := unix.SetsockoptSockFprog(fd, unix.SOL_SOCKET, unix.SO_ATTACH_FILTER, &unix.SockFprog{
 		Len:    uint16(len(filter)),

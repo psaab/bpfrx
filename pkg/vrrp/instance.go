@@ -839,14 +839,19 @@ func (vi *vrrpInstance) parseAfPacketIPv6(buf []byte, n, ethHeaderLen int) {
 // VRRP advert; drop". A bare advert (base Next-Header == 112) returns
 // (40, true).
 //
-// Length-unit conventions differ per header and mixing them is the classic
-// walk bug:
+// Length-unit conventions and the deliberately small admit set:
 //   - Hop-by-Hop (0), Routing (43), Destination Options (60): the header is
-//     8 + HdrExtLen*8 bytes, i.e. (HdrExtLen+1)*8.
-//   - Authentication Header (51): the header is (PayloadLen+2)*4 bytes
-//     (PayloadLen is in 4-byte units, not counting the first two words).
+//     8 + HdrExtLen*8 bytes, i.e. (HdrExtLen+1)*8. These are the only chained
+//     headers a conformant VRRP advert can carry, so they are walked.
 //   - Fragment (44): VRRP adverts are never legitimately fragmented and the
-//     receiver does no reassembly, so a Fragment header is a hard drop.
+//     receiver does no reassembly, so a Fragment header is a hard drop. The
+//     cBPF prefilter (manager.go) does not admit base Next-Header 44 either,
+//     so this hard drop is defense-in-depth for the path the kernel can't
+//     prefilter (a Fragment header buried mid-chain).
+//   - Authentication Header (51) and every other Next-Header: not a VRRP
+//     carrier (VRRP authenticates itself, it is never IPsec-AH-wrapped), so
+//     it is dropped. The cBPF likewise does not admit base Next-Header 51, so
+//     an AH-first advert is kernel-dropped before this walk ever runs.
 //
 // The walk is bounded to maxIPv6ExtHeaders iterations and bounds-checks every
 // access against ip6Len, so a malicious or truncated chain can neither loop
@@ -860,7 +865,6 @@ func walkIPv6ExtHeaders(ip6 []byte, ip6Len int) (int, bool) {
 		nhRouting         = 43
 		nhFragment        = 44
 		nhDestOpts        = 60
-		nhAH              = 51
 	)
 
 	if ip6Len < ipv6HeaderLen {
@@ -885,13 +889,11 @@ func walkIPv6ExtHeaders(ip6 []byte, ip6Len int) (int, bool) {
 		switch nh {
 		case nhHopByHop, nhRouting, nhDestOpts:
 			hdrLen = (int(ip6[off+1]) + 1) * 8
-		case nhAH:
-			hdrLen = (int(ip6[off+1]) + 2) * 4
 		case nhFragment:
 			// Fragmented VRRP is non-conformant — drop.
 			return 0, false
 		default:
-			// Some other terminal protocol — not VRRP.
+			// AH (51) or any other terminal protocol — not VRRP.
 			return 0, false
 		}
 
