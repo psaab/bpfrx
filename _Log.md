@@ -71,6 +71,32 @@
   `vlan_id > 0` gating (non-tautological). PENDING-PARENT: live
   PCP-on-the-wire verification on the loss cluster (not run here).
 
+## 2026-06-21 — #2197 items 1+2: v6 proxy-NDP pneigh install + 30s re-assert
+
+- **Timestamp**: 2026-06-21
+- **Action**: Implemented #2197 plan items 1 (MEDIUM) and 2 (LOW); item 3
+  (per-address narrowing) stays PLAN-DEFER / lab-pending.
+  **Item 1 (v6 proxy-NDP pneigh install):** `ReconcileProxyARP` now installs
+  an AF_INET6 NTF_PROXY neighbor entry for v6 proxy addresses (the v6 analogue
+  of `ip -6 neigh add proxy`), mirroring the v4 install path — desired set is
+  family-aware, a parallel `NeighList(idx, AF_INET6)` stale-removal pass runs,
+  and add/remove derive Family from `key.ip.Is6()/!Is4In6()`. Added `Family`
+  to `ProxyARPAdded` so the IPv4-only GARP is skipped for v6 (risk R1). v6 is
+  `pneigh_lookup`-gated (per-address), so no over-answer breadth. Added netlink
+  seams (`neighListSeam`/`neighSetSeam`/`neighDelSeam`) for root-free tests.
+  **Item 2 (re-assert after non-commit link cycle):** extracted the apply-path
+  reconcile into `(*Daemon).reconcileProxyARP(cfg)` (preserving the #2195 RETH
+  ifindex resolution via a separately-tested `proxyARPIfaceMap`), and drive it
+  from a new always-on 30s ticker (`proxyARPReassertLoop`) started
+  unconditionally when the dataplane is enabled — covers standalone + cluster
+  (reconcileRGStateLoop is cluster-only, monitorLinkState SNMP-gated). Idempotent.
+- **File(s)**: `pkg/dataplane/proxyarp.go`, `pkg/dataplane/proxyarp_test.go`,
+  `pkg/daemon/daemon_apply.go`, `pkg/daemon/daemon_proxyarp.go`,
+  `pkg/daemon/daemon_proxyarp_test.go`, `pkg/daemon/daemon_run.go`,
+  `pkg/dataplane/retirement_boundary_canary_test.go`, `docs/feature-gaps.md`,
+  `docs/pr/1373-retire-ebpf-dataplane/README.md`,
+  `docs/research/2197-proxyarp-followups/plan.md`.
+
 ## 2026-06-21 — #2146 (PR #2189) fold: close IPv6 ext-header overshoot fail-open
 
 - **Timestamp**: 2026-06-21

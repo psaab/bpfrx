@@ -1072,6 +1072,20 @@ func (d *Daemon) Run(ctx context.Context) error {
 				d.neighborListener(ctx)
 			}()
 		}
+		// #2197 item 2: always-on proxy-ARP/NDP re-assert. Started
+		// unconditionally (independent of ActiveConfig at start, which it
+		// re-reads each tick) so a non-commit link cycle that re-defaults
+		// the per-interface proxy_arp/proxy_ndp sysctl self-heals within
+		// proxyARPReassertInterval. The reconcile is a no-op when no
+		// proxy-arp entries are configured, so the loop is cheap on configs
+		// that do not use proxy-arp. It covers BOTH standalone and cluster
+		// modes (reconcileRGStateLoop is cluster-only; monitorLinkState is
+		// SNMP-gated).
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			d.proxyARPReassertLoop(ctx)
+		}()
 	}
 
 	// #1387 inc-2: start the always-on DHCP dynamic-DNS reconcile loop. It
