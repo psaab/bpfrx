@@ -74,7 +74,15 @@ pub(crate) struct NAT64RuleSnapshot {
     pub name: String,
     #[serde(default)]
     pub prefix: String,
-    #[serde(rename = "pool_addresses", default)]
+    // #2214: null-tolerant. A NAT64 rule with no resolvable source pool
+    // makes the Go builder emit `pool_addresses:null` (nil slice, no
+    // `,omitempty`); plain `default` would only cover an ABSENT key, so an
+    // explicit null would abort the whole snapshot decode (#1961 no-transit).
+    #[serde(
+        rename = "pool_addresses",
+        default,
+        deserialize_with = "crate::protocol::null_tolerant_vec"
+    )]
     pub pool_addresses: Vec<String>,
     /// Mirrors `security nat natv6v4 no-v6-frag-header`. This is an
     /// option-gated LOCAL DF policy (not the size-driven RFC 7915 5.1

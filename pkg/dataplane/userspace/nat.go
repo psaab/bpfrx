@@ -292,7 +292,13 @@ func buildNAT64Snapshots(cfg *config.Config) []NAT64RuleSnapshot {
 		if rs == nil || rs.Prefix == "" {
 			continue
 		}
-		var poolAddresses []string
+		// #2214: initialize non-nil so a rule with no resolvable source pool
+		// marshals `pool_addresses` as `[]`, never JSON `null`. The field has
+		// no `,omitempty` (an empty pool is still a meaningful "no source-pool
+		// resolved" state the dataplane must see), and the Rust `Vec<String>`
+		// rejects an explicit null — which aborts the whole snapshot decode and
+		// kills ALL transit (#1961 no-transit signature).
+		poolAddresses := []string{}
 		if rs.SourcePool != "" {
 			if pool, ok := cfg.Security.NAT.SourcePools[rs.SourcePool]; ok && pool != nil {
 				if pool.Address != "" {
