@@ -178,13 +178,18 @@ struct SessionEntry {
     /// stale duplicate (lazy-delete discriminator).
     wheel_tick: u64,
     /// #2120: the RG epoch (`rg_epochs[owner_rg_id]`, or the node-level
-    /// `rg_epochs[0]` for `owner_rg_id <= 0`) observed the last time this
-    /// entry was installed, refreshed, or HELD by the standby retention
-    /// gate. The expire pass compares it against the current epoch to
-    /// detect the edge "this node just started forwarding this RG" and
-    /// fire the self-heal re-stamp exactly once per activation. Stamped
-    /// on install / refresh / hold; NEVER cleared (an epoch of 0 is the
-    /// natural standalone / never-seen-an-activation default).
+    /// `rg_epochs[0]` for `owner_rg_id <= 0`) recorded the last time this
+    /// entry was self-healed (the expire pass observed this node START
+    /// forwarding the RG). The expire pass compares the current epoch
+    /// against it to detect the activation edge and fire the self-heal
+    /// re-stamp exactly once per activation. Written ONLY by SELF-HEAL
+    /// (→ current epoch) and by install / refresh (→ 0). The HOLD branch
+    /// deliberately does NOT write it — the worker reads the HA map and
+    /// `rg_epochs` as separate loads, so a HOLD can see an old (inactive)
+    /// map with a new (already-bumped) epoch; stamping that epoch on a
+    /// hold would make the next (active-map) pass skip the self-heal and
+    /// age the synced session (the Codex old-map/new-epoch race). An
+    /// epoch of 0 is the standalone / never-self-healed default.
     seen_rg_epoch: u32,
     /// #2120: monotonic timestamp (ns) at which this entry FIRST entered
     /// the held (non-forwarding standby) state, or 0 when not held. The
@@ -519,8 +524,9 @@ impl SessionTable {
             // this entry now genuinely lives on this node — it leaves the
             // held world. Clear the hold clock so the stale-synced ceiling
             // restarts cleanly if it is ever held again, and reset the
-            // observed epoch to the never-seen default (the next HOLD pass,
-            // if any, re-stamps the live epoch).
+            // self-healed-epoch to the never-self-healed default (a later
+            // SELF-HEAL, if this node forwards the RG, records the live
+            // epoch; the HOLD branch never writes seen_rg_epoch).
             record.entry.first_held_ns = 0;
             record.entry.seen_rg_epoch = 0;
         }

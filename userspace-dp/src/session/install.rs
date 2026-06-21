@@ -150,17 +150,13 @@ impl SessionTable {
                 closing: matches!(protocol, PROTO_TCP) && (tcp_flags & (TCP_FIN | TCP_RST)) != 0,
                 wheel_tick: 0,
                 // #2120: a freshly-installed entry has never been HELD and
-                // has not yet observed an RG epoch. 0 is the never-seen-an-
-                // activation default; the first standby HOLD observation in
-                // the expire pass stamps the live epoch (see
-                // session/expire.rs). The install path has no `rg_epochs`
-                // handle, so stamping the live epoch here would mean
-                // threading the array through every install caller — the
-                // expire-pass HOLD stamp gives the same self-heal edge with
-                // a far smaller blast radius. The only difference is a
-                // one-shot, bounded self-heal re-stamp if a synced entry is
-                // imported on an already-active node and then never sees
-                // traffic; it ages on the next pass.
+                // has not yet been self-healed. 0 is the never-self-healed
+                // default; the first forwarding pass after any RG activation
+                // that bumped the epoch will see current_epoch != 0 and fire
+                // the self-heal (see session/expire.rs). The HOLD branch
+                // does NOT write seen_rg_epoch, so it stays 0 throughout the
+                // held lifetime — exactly what keeps the self-heal edge
+                // intact under the old-map/new-epoch read skew.
                 seen_rg_epoch: 0,
                 first_held_ns: 0,
             },
@@ -251,11 +247,12 @@ impl SessionTable {
                 wheel_tick: 0,
                 // #2120: a re-imported synced entry leaves the held world
                 // with a fresh `last_seen_ns`, so it carries no carried-over
-                // hold clock. `seen_rg_epoch` resets to the never-seen
-                // default (the next HOLD/SELF-HEAL pass re-stamps the live
-                // epoch). `upsert_synced` first `remove_entry`s any prior
-                // entry, so this is the canonical re-import refresh that the
-                // §6.4 contract clears `first_held_ns` on.
+                // hold clock. `seen_rg_epoch` resets to the never-self-healed
+                // default (the next SELF-HEAL pass, if this node forwards the
+                // RG, records the live epoch; HOLD never writes it).
+                // `upsert_synced` first `remove_entry`s any prior entry, so
+                // this is the canonical re-import refresh that the §6.4
+                // contract clears `first_held_ns` on.
                 seen_rg_epoch: 0,
                 first_held_ns: 0,
             },
