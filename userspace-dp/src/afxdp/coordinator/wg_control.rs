@@ -1802,9 +1802,9 @@ mod tests {
 
     /// Build a `msghdr` whose msg_control holds a single cmsg of
     /// `(level, ctype)` carrying the one-byte DS payload `ds`, and return
-    /// the parsed outer ECN. The cmsg buffer is leaked into a Vec the
-    /// caller keeps alive for the duration of the parse (the msghdr
-    /// borrows it).
+    /// the parsed outer ECN. The cmsg buffer is a stack `CmsgBuf`
+    /// (8-byte-aligned, #2334) that the msghdr borrows for the duration
+    /// of the parse.
     fn parse_ecn_with_cmsg(level: libc::c_int, ctype: libc::c_int, ds: u8) -> Option<u8> {
         unsafe {
             // CMSG_SPACE(1) bytes hold a header + 1 padded payload byte.
