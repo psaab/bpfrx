@@ -442,6 +442,12 @@ pub(crate) struct BindingStatus {
     // omitempty/serde-default contract).
     #[serde(rename = "nat64_translations", default)]
     pub nat64_translations: u64,
+    // #2291: fail-closed NAT64 drops — a prefix matched but no IPv4 source
+    // could be allocated (empty/exhausted pool), so the synthetic IPv6
+    // destination was dropped rather than route-looked-up as IPv6. `default`
+    // keeps the same cross-version wire safety as nat64_translations above.
+    #[serde(rename = "nat64_no_source_pool", default)]
+    pub nat64_no_source_pool: u64,
     #[serde(rename = "slow_path_packets", default)]
     pub slow_path_packets: u64,
     #[serde(rename = "slow_path_bytes", default)]
