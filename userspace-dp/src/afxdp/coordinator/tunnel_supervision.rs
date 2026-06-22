@@ -660,12 +660,13 @@ impl super::Coordinator {
         let Some(endpoint) = self.forwarding.tunnel_endpoints.get(&id) else {
             return crate::afxdp::coordinator::wg_control::WG_DEFAULT_OUTER_MTU;
         };
-        let Some(peer) = endpoint.wg_endpoint else {
-            // No configured endpoint to route toward (responder-only /
-            // endpoint learned at runtime). Use the default; the
-            // transit-egress guard still applies the real egress MTU for
-            // routed WG, and the per-peer learned-endpoint case is the
-            // documented follow-up.
+        // #1434: all endpoint-bearing peers on a WG interface share the
+        // outer transport family (commit-gated), so the first peer that
+        // declares an endpoint gives the underlay-MTU egress route. A
+        // tunnel with no configured endpoint (responder-only /
+        // learn-only) uses the default; the transit-egress guard applies
+        // the real egress MTU for routed WG.
+        let Some(peer) = endpoint.wg_peers.iter().find_map(|p| p.endpoint) else {
             return crate::afxdp::coordinator::wg_control::WG_DEFAULT_OUTER_MTU;
         };
         let table = if endpoint.transport_table.is_empty() {
@@ -709,7 +710,6 @@ impl super::Coordinator {
         };
         let spawned_ifindex = endpoint.logical_ifindex;
         let listen_port = endpoint.wg_listen_port;
-        let peer_endpoint = endpoint.wg_endpoint;
         let stop = Arc::new(AtomicBool::new(false));
         let stop_clone = stop.clone();
         let recent_exceptions = self.recent_exceptions.clone();
@@ -725,7 +725,6 @@ impl super::Coordinator {
                     id,
                     engine,
                     listen_port,
-                    peer_endpoint,
                     outer_mtu,
                     recent_exceptions,
                     stop_clone,

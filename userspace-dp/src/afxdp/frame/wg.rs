@@ -61,7 +61,6 @@ pub(super) fn wg_encap_frame(
         return None;
     }
     let engine = forwarding.wg_engines.get(&id)?;
-    let peer_endpoint = endpoint.wg_endpoint?;
     let dst_mac = decision.resolution.neighbor_mac?;
     let src_mac = decision.resolution.src_mac?;
     let vlan_id = decision.resolution.tx_vlan_id;
@@ -75,6 +74,18 @@ pub(super) fn wg_encap_frame(
     let inner_packet = inner_frame.get(inner_l3..)?;
     let inner_len = crate::afxdp::gre::packet_trimmed_len(inner_packet, inner_meta.addr_family)?;
     let inner_packet = &inner_packet[..inner_len];
+
+    // #1434 B1b cryptokey routing: select the egress peer by the inner
+    // destination's longest-prefix match in the AllowedIPs trie (NOT a
+    // single scalar peer). A packet with no covering peer is dropped —
+    // there is no peer to encrypt it to.
+    let inner_dst = crate::afxdp::gre::inner_dst_ip(inner_packet, inner_meta.addr_family)?;
+    let (peer_pubkey, peer_endpoint) = engine.peer_for_dest(inner_dst)?;
+    // A responder-only peer with no learned endpoint cannot be an encap
+    // TARGET on this transit path (the control thread learns the
+    // endpoint from inbound traffic; this AF_XDP transit site has no
+    // such state). Drop rather than encap to a phantom destination.
+    let peer_endpoint = peer_endpoint?;
     // #2303: copy the inner DSCP+ECN onto the outer header (uniform
     // DSCP model + RFC 6040 ECN ingress copy) instead of hardcoding 0.
     let outer_tos = crate::afxdp::gre::inner_tos_byte(inner_packet, inner_meta.addr_family);
@@ -108,7 +119,7 @@ pub(super) fn wg_encap_frame(
     // RefCell scratch; this rarely-hit transit site uses a local buffer
     // sized once to the record length.
     let mut wg_record = vec![0u8; wg_record_len];
-    let outcome = match engine.try_encap(&endpoint.wg_peer_pubkey, inner_packet, &mut wg_record) {
+    let outcome = match engine.try_encap(&peer_pubkey, inner_packet, &mut wg_record) {
         Ok(o) => o,
         Err(EncapError::NoSession) => {
             // Request a handshake (rate-limited relaxed atomic) and drop.

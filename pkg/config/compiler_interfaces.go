@@ -682,6 +682,11 @@ func compileInterfaces(node *Node, ifaces *InterfacesConfig) error {
 // grammar (S6); it compiles to the TunnelEndpointSnapshot Wg* DTO
 // fields without committing to that surface.
 func parseTunnelWireguard(tc *TunnelConfig, wgNode *Node) {
+	// listen-port / private-key are tunnel-level. The `peer` children
+	// are named instances keyed by pubkey (#1434 multi-peer); collapse
+	// both AST shapes via namedInstances and append one WgPeerConfig
+	// per instance (preserving config order — the snapshot builder
+	// sorts by pubkey for HA determinism).
 	for _, prop := range wgNode.Children {
 		switch prop.Name() {
 		case "listen-port":
@@ -694,35 +699,55 @@ func parseTunnelWireguard(tc *TunnelConfig, wgNode *Node) {
 			if v := nodeVal(prop); v != "" {
 				tc.WgLocalPrivkeyHex = Secret(v)
 			}
-		case "peer":
-			parseTunnelWireguardPeer(tc, prop)
 		}
+	}
+	for _, inst := range namedInstances(wgNode.FindChildren("peer")) {
+		if inst.name == "" {
+			continue
+		}
+		tc.WgPeers = append(tc.WgPeers, parseTunnelWireguardPeer(inst.name, inst.node))
 	}
 }
 
-func parseTunnelWireguardPeer(tc *TunnelConfig, peerNode *Node) {
+// parseTunnelWireguardPeer parses ONE WG peer instance into a
+// WgPeerConfig (#1434). The peer identity (pubkey) is the named-instance
+// key; allowed-ips/endpoint/persistent-keepalive/preshared-key are the
+// instance's children. Both AST shapes are already collapsed by the
+// namedInstances caller, so `peerNode.Children` are the leaves.
+//
+// The pubkey is lowercased here so the canonical form drives EVERYTHING
+// downstream at once: the dup-pubkey dedup in validateWireguardPeers
+// (so `AA..` and `aa..` collide instead of both surviving and orphaning
+// a peer in the engine's release-build reconcile, where the dup
+// debug_assert is compiled out), the wire bytes the Rust hex decoder
+// consumes, and the "64-char lowercase hex" contract the status row
+// documents. A non-hex key (operator typo) survives unchanged and the
+// commit-time hex validator rejects it.
+func parseTunnelWireguardPeer(pubkey string, peerNode *Node) WgPeerConfig {
+	peer := WgPeerConfig{PublicKeyHex: strings.ToLower(pubkey)}
 	for _, prop := range peerNode.Children {
 		switch prop.Name() {
-		case "public-key":
-			if v := nodeVal(prop); v != "" {
-				tc.WgPeerPubkeyHex = v
-			}
 		case "allowed-ips":
 			if v := nodeVal(prop); v != "" {
-				tc.WgAllowedIPs = append(tc.WgAllowedIPs, v)
+				peer.AllowedIPs = append(peer.AllowedIPs, v)
 			}
 		case "endpoint":
 			if v := nodeVal(prop); v != "" {
-				tc.WgEndpoint = v
+				peer.Endpoint = v
 			}
 		case "persistent-keepalive":
 			if v := nodeVal(prop); v != "" {
 				if n, err := strconv.Atoi(v); err == nil && n >= 0 && n <= 65535 {
-					tc.WgKeepaliveSecs = uint16(n)
+					peer.KeepaliveSecs = uint16(n)
 				}
+			}
+		case "preshared-key":
+			if v := nodeVal(prop); v != "" {
+				peer.PresharedKeyHex = Secret(v)
 			}
 		}
 	}
+	return peer
 }
 
 // selectMSSToken returns the raw MSS token the compiler would actually

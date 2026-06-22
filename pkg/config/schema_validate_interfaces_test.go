@@ -153,7 +153,7 @@ var interfacesLeafMatrix = []interfacesLeafCase{
 	{
 		name:     "wireguard-persistent-keepalive",
 		leaf:     "persistent-keepalive",
-		template: "set interfaces wg-0-0-0 tunnel wireguard peer persistent-keepalive %s",
+		template: "set interfaces wg-0-0-0 tunnel wireguard peer aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa persistent-keepalive %s",
 		accept:   []string{"0", "25", "65535"},
 		reject:   []string{"-1", "65536", "asd", ""},
 	},

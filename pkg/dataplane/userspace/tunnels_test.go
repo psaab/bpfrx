@@ -1,6 +1,7 @@
 package userspace
 
 import (
+	"encoding/json"
 	"fmt"
 	"testing"
 
@@ -20,8 +21,10 @@ func TestBuildTunnelEndpointSnapshotsDropsRemovedWireguard(t *testing.T) {
 				Mode:              "wireguard",
 				WgListenPort:      51820,
 				WgLocalPrivkeyHex: "a01010101010101010101010101010101010101010101010101010101010101a",
-				WgPeerPubkeyHex:   "b02020202020202020202020202020202020202020202020202020202020202b",
-				WgAllowedIPs:      []string{"10.77.0.0/24"},
+				WgPeers: []config.WgPeerConfig{{
+					PublicKeyHex: "b02020202020202020202020202020202020202020202020202020202020202b",
+					AllowedIPs:   []string{"10.77.0.0/24"},
+				}},
 			},
 		},
 	}
@@ -66,8 +69,10 @@ func TestBuildTunnelEndpointSnapshotsInterfaceLevelWireguardMultiUnitSingleEndpo
 				Mode:              "wireguard",
 				WgListenPort:      51820,
 				WgLocalPrivkeyHex: "a01010101010101010101010101010101010101010101010101010101010101a",
-				WgPeerPubkeyHex:   "b02020202020202020202020202020202020202020202020202020202020202b",
-				WgAllowedIPs:      []string{"10.77.0.0/24"},
+				WgPeers: []config.WgPeerConfig{{
+					PublicKeyHex: "b02020202020202020202020202020202020202020202020202020202020202b",
+					AllowedIPs:   []string{"10.77.0.0/24"},
+				}},
 			},
 			Units: map[int]*config.InterfaceUnit{
 				0: {Number: 0},
@@ -386,4 +391,64 @@ func cfgWith(ifaces map[string]*config.InterfaceConfig) *config.Config {
 	c := &config.Config{}
 	c.Interfaces.Interfaces = ifaces
 	return c
+}
+
+// #1434 multi-peer: a two-peer WG tunnel produces a snapshot whose
+// WgPeers carries BOTH peers, sorted by pubkey hex, and two builds of
+// the SAME config produce byte-identical JSON (HA compile determinism —
+// both nodes ship the config TEXT and recompile; the snapshot must be
+// stable regardless of authored peer order).
+func TestBuildTunnelEndpointSnapshotsMultiPeerSortedDeterministic(t *testing.T) {
+	const (
+		keyA = "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1"
+		keyB = "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2"
+		keyC = "c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3"
+	)
+	build := func() []TunnelEndpointSnapshot {
+		cfg := &config.Config{}
+		cfg.Interfaces.Interfaces = map[string]*config.InterfaceConfig{
+			"wg0": {Name: "wg0", Tunnel: &config.TunnelConfig{
+				Name:         "wg0",
+				Mode:         "wireguard",
+				WgListenPort: 51820,
+				// Authored OUT of pubkey-sort order (C before B) — the
+				// builder must sort so the snapshot is stable.
+				WgPeers: []config.WgPeerConfig{
+					{PublicKeyHex: keyC, AllowedIPs: []string{"10.3.0.0/16"}, Endpoint: "198.51.100.7:51820"},
+					{PublicKeyHex: keyB, AllowedIPs: []string{"10.2.0.0/16"}, Endpoint: "203.0.113.1:51820"},
+				},
+			}},
+		}
+		return buildTunnelEndpointSnapshots(cfg, []InterfaceSnapshot{
+			{Name: "wg0", LinuxName: "wg0", Ifindex: 42, Zone: "vpn"},
+		})
+	}
+	eps := build()
+	if len(eps) != 1 {
+		t.Fatalf("len(endpoints) = %d, want 1", len(eps))
+	}
+	peers := eps[0].WgPeers
+	if len(peers) != 2 {
+		t.Fatalf("WgPeers = %d, want 2", len(peers))
+	}
+	// Sorted by pubkey: B (b2..) before C (c3..) despite authored order.
+	if peers[0].WgPeerPubkeyHex != keyB || peers[1].WgPeerPubkeyHex != keyC {
+		t.Fatalf("peers not sorted by pubkey: %q then %q", peers[0].WgPeerPubkeyHex, peers[1].WgPeerPubkeyHex)
+	}
+	// Per-peer AllowedIPs stay with their peer.
+	if peers[0].WgAllowedIPs[0] != "10.2.0.0/16" || peers[1].WgAllowedIPs[0] != "10.3.0.0/16" {
+		t.Fatalf("AllowedIPs crossed: %v / %v", peers[0].WgAllowedIPs, peers[1].WgAllowedIPs)
+	}
+	// HA determinism: two builds of the same config marshal identically.
+	j1, err := json.Marshal(build())
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	j2, err := json.Marshal(build())
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if string(j1) != string(j2) {
+		t.Fatalf("snapshot JSON not deterministic:\n%s\n%s", j1, j2)
+	}
 }

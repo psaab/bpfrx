@@ -2028,9 +2028,12 @@ fn wg_snapshot(listen_port: u16, allowed: &[&str], endpoint: &str) -> ConfigSnap
             mode: "wireguard".into(),
             wg_listen_port: listen_port,
             wg_local_privkey_hex: WG_TEST_PRIVKEY_HEX.into(),
-            wg_peer_pubkey_hex: WG_TEST_PEERKEY_HEX.into(),
-            wg_allowed_ips: allowed.iter().map(|s| s.to_string()).collect(),
-            wg_endpoint: endpoint.into(),
+            wg_peers: vec![crate::protocol::snapshot::TunnelWgPeerSnapshot {
+                wg_peer_pubkey_hex: WG_TEST_PEERKEY_HEX.into(),
+                wg_allowed_ips: allowed.iter().map(|s| s.to_string()).collect(),
+                wg_endpoint: endpoint.into(),
+                ..Default::default()
+            }],
             ..Default::default()
         }],
         ..Default::default()
@@ -2045,8 +2048,12 @@ fn wg_endpoint_hydrates_runtime_tunnel_endpoint() {
     let ep = state.tunnel_endpoints.get(&7).expect("WG endpoint present");
     assert_eq!(ep.mode, "wireguard");
     assert_eq!(ep.wg_listen_port, 51820);
-    assert_eq!(ep.wg_allowed_ips.len(), 1);
-    assert_eq!(ep.wg_endpoint, Some("203.0.113.1:51820".parse().unwrap()));
+    assert_eq!(ep.wg_peers.len(), 1);
+    assert_eq!(ep.wg_peers[0].allowed_ips.len(), 1);
+    assert_eq!(
+        ep.wg_peers[0].endpoint,
+        Some("203.0.113.1:51820".parse().unwrap())
+    );
     // Engine instantiated and keyed by endpoint id.
     assert!(state.wg_engines.contains_key(&7), "engine instantiated");
     assert_eq!(state.wg_engines.get(&7).unwrap().listen_port(), 51820);
@@ -2160,9 +2167,12 @@ fn two_tunnel_snapshot() -> ConfigSnapshot {
                 mode: "wireguard".into(),
                 wg_listen_port: 51820,
                 wg_local_privkey_hex: WG_TEST_PRIVKEY_HEX.into(),
-                wg_peer_pubkey_hex: WG_TEST_PEERKEY_HEX.into(),
-                wg_allowed_ips: vec!["10.0.0.0/24".into()],
-                wg_endpoint: "203.0.113.1:51820".into(),
+                wg_peers: vec![crate::protocol::snapshot::TunnelWgPeerSnapshot {
+                    wg_peer_pubkey_hex: WG_TEST_PEERKEY_HEX.into(),
+                    wg_allowed_ips: vec!["10.0.0.0/24".into()],
+                    wg_endpoint: "203.0.113.1:51820".into(),
+                    ..Default::default()
+                }],
                 ..Default::default()
             },
         ],

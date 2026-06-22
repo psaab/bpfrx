@@ -1,5 +1,82 @@
 # Action Log
 
+## 2026-06-22 — #1434 review round 1 (NEEDS-MINOR fold)
+
+- **Timestamp**: 2026-06-22 PDT
+- **Action**: PR #2320 review (quad, verdict NEEDS-MINOR, no MAJOR; the
+  #1961 no-transit risk verified fully mitigated). Folded the two code
+  MINORs + the migration-gap note: (1) Copilot #1 — lowercase the peer
+  pubkey at parse (`strings.ToLower` in `parseTunnelWireguardPeer`) so the
+  dup-pubkey dedup, the wire bytes, and the documented "64-char lowercase
+  hex" contract all agree; `AA..`/`aa..` now collide at commit instead of
+  orphaning a peer in the engine's release-build reconcile (where the dup
+  `debug_assert` is compiled out). Added `TestWireguardDuplicatePubkeyCase
+  Insensitive` (fail-on-revert) + `TestWireguardPubkeyLowercasedAtParse`.
+  (2) Copilot #3 — `Peer.preshared_key` is now `RwLock<Zeroizing<[u8;32]>>`
+  so the engine-resident PSK copy is wiped on drop / rotation, matching
+  the wire+runtime copies (was a plain `[u8;32]`). (3) Documented the
+  pre-#1434 `peer { public-key <k>; }` → `peer <k> { }` syntax-migration
+  gap in docs/config-schema.md (no auto-migration; an old-form config
+  reloads to a lenient load-time warning, fail-safe per #1960, but loses
+  its peer until re-authored — bounded: WG experimental, interop deferred
+  to #1703).
+- **File(s)**: pkg/config/{compiler_interfaces.go, wireguard_multipeer_test.go},
+  userspace-dp/src/afxdp/wg/peer.rs, docs/config-schema.md.
+- **Validation**: `go test ./pkg/config/` green incl. the two new case
+  tests (5x); `cargo build --release` clean; wg-domain Rust suite
+  177/177 (the lone `install_session_serializes_with_reconcile_removal`
+  miss is the documented pre-existing reconcile-race flake — isolated
+  PASS=5/FAIL=1, unrelated to this change). PSK roundtrip + LPM tests
+  pass deterministically.
+
+## 2026-06-22 — #1434 multi-PEER WireGuard per interface (B1a + B1b + B2)
+
+- **Timestamp**: 2026-06-22 PDT
+- **Action**: #1434 — multi-peer WireGuard on one interface (Path A,
+  REV v1.2). B1a (config/schema/wire/RX): `TunnelConfig.WgPeers
+  []WgPeerConfig` replaces the scalar peer fields; schema `peer
+  <public-key>` named-instance (vrrp-group model, dual-AST); compiler
+  loop; commit-time `validateWireguardPeersStrict` (zero-peer / dup-key /
+  bad-hex / mixed-endpoint-family REJECT, lenient-downgrade on
+  load/peer-sync); wire DTO `wg_peers []TunnelWgPeerWire` sorted by pubkey
+  for HA determinism; Rust snapshot `wg_peers Vec<TunnelWgPeerSnapshot>`,
+  runtime `TunnelEndpoint.wg_peers Vec<WgRuntimePeer>`, build-path loop
+  feeds the engine N peers, `wg_identity_unchanged` slice compare; per-peer
+  status row (`WgPeerStatus` Rust+Go + renderer + Prometheus
+  `session_confirmed{tunnel,peer}`); regenerated `protocol_wire_v1.json`.
+  B1b (egress): encap LPM peer-select by inner-dst (`engine.peer_for_dest`
+  + `frame/wg.rs`), WG control thread per-peer effective-endpoint +
+  per-peer handshake attempt + per-peer keepalive/rekey timers
+  (`timer_pass_for_peer`, iterate `engine.peer_pubkeys()`), per-peer
+  endpoint learning (`InboundOutcome` carries the peer;
+  `consume_response` returns the peer). B2 (PSK): per-peer
+  `preshared_key` on engine `WgPeerConfig` + `Peer`, initiator
+  `.psk(2,peer_psk)` at build, responder `set_psk(2,…)` after
+  `get_remote_static`; Secret/Zeroizing/skip_serializing hygiene.
+- **File(s)**: pkg/config/{types_routing.go, schema_interfaces.go,
+  compiler_interfaces.go, compiler.go, compiler_validate_wireguard.go(new)},
+  pkg/routing/tunnel.go, pkg/dataplane/userspace/{protocol.go, tunnels.go,
+  format/wireguard.go}, pkg/api/{metrics_userspace.go, metrics_descriptors.go},
+  userspace-dp/src/{protocol/{snapshot.rs,control.rs}, afxdp/wg/{engine.rs,
+  peer.rs,timers.rs,handshake_session.rs}, afxdp/forwarding_build/{wg.rs,
+  tunnels.rs}, afxdp/frame/wg.rs, afxdp/gre.rs, afxdp/types/forwarding.rs,
+  afxdp/coordinator/{wg_control.rs,tunnel_supervision.rs,status.rs}},
+  userspace-dp/tests/fixtures/protocol_wire_v1.json, docs/config-schema.md,
+  docs/wireguard-interop.md + the migrated/new test files.
+- **Validation**: `go build ./...` + `go test` (config/routing/userspace/
+  daemon/api/cli/grpcapi) green incl. new
+  `pkg/config/wireguard_multipeer_test.go` (single/dual-peer compile,
+  dup/zero/bad-hex/mixed-family reject, String() redaction) and the
+  snapshot HA-determinism test; `cargo build --release` clean; `cargo test`
+  green except pre-existing concurrency-test flakes
+  (`reconcile_peers_snapshot`/`install_session_serializes`/worker_queue —
+  different test each run, all pass in isolation; reconcile flakiness is a
+  known base condition). New Rust tests
+  `peer_for_dest_lpm_selects_owning_peer` + `per_peer_psk_handshake_roundtrip`.
+  Deferred to #1703: live multi-peer handshake / Ubiquiti interop; per-peer
+  NoSession/rekey request edges (engine-wide today). Parent runs the
+  batched iperf smoke before merge.
+
 ## 2026-06-21 — #2238 classify locally-generated replies by their own egress tuple (Path B)
 
 - **Timestamp**: 2026-06-21

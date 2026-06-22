@@ -174,12 +174,34 @@ pub(crate) struct DecapOutcome {
 }
 
 /// Per-peer config passed to `WgEngine::reconcile`.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub(crate) struct WgPeerConfig {
     pub(crate) pubkey: [u8; 32],
     pub(crate) endpoint: Option<std::net::SocketAddr>,
     pub(crate) persistent_keepalive: u16,
     pub(crate) allowed_ips: Vec<ipnet::IpNet>,
+    /// Optional per-peer preshared key (#1434 B2). `WG_ZERO_PSK` (32
+    /// zero bytes) when no PSK is configured — semantically identical
+    /// to "no PSK" in Noise IKpsk2. SECRET: never logged (the manual
+    /// Debug below redacts it).
+    pub(crate) preshared_key: [u8; 32],
+}
+
+impl std::fmt::Debug for WgPeerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let psk_state = if self.preshared_key == WG_ZERO_PSK {
+            "<unset>"
+        } else {
+            "<redacted>"
+        };
+        f.debug_struct("WgPeerConfig")
+            .field("pubkey", &self.pubkey)
+            .field("endpoint", &self.endpoint)
+            .field("persistent_keepalive", &self.persistent_keepalive)
+            .field("allowed_ips", &self.allowed_ips)
+            .field("preshared_key", &psk_state)
+            .finish()
+    }
 }
 
 /// Per-engine config.
@@ -444,6 +466,56 @@ impl WgEngine {
         self.load_table().peers.first().map(|p| p.pubkey)
     }
 
+    /// The pubkeys of ALL configured peers, in table (pubkey-sorted)
+    /// order (#1434). Used by the control thread's per-peer egress +
+    /// timer iteration. Slow path (1s tick / TUN-read fallback).
+    pub(crate) fn peer_pubkeys(&self) -> Vec<[u8; WG_KEY_LEN]> {
+        self.load_table().peers.iter().map(|p| p.pubkey).collect()
+    }
+
+    /// Each peer's (pubkey, configured-or-learned endpoint), in table
+    /// order (#1434). The control thread seeds its per-peer
+    /// effective-endpoint map from this at start. Slow path.
+    pub(crate) fn peer_endpoints(&self) -> Vec<([u8; WG_KEY_LEN], Option<std::net::SocketAddr>)> {
+        self.load_table()
+            .peers
+            .iter()
+            .map(|p| (p.pubkey, *p.endpoint.read().unwrap()))
+            .collect()
+    }
+
+    /// The pubkey iff the engine has EXACTLY one peer (#1434). Used by
+    /// the control thread's bare-keepalive endpoint-learning fallback,
+    /// where try_decap's MalformedInner/keepalive arm does not surface
+    /// the peer: with one peer the attribution is unambiguous, with
+    /// many it is not. Slow path.
+    pub(crate) fn single_peer_pubkey(&self) -> Option<[u8; WG_KEY_LEN]> {
+        let table = self.load_table();
+        if table.peers.len() == 1 {
+            table.peers.first().map(|p| p.pubkey)
+        } else {
+            None
+        }
+    }
+
+    /// #1434 B1b cryptokey routing on EGRESS: longest-prefix-match the
+    /// inner destination IP against the AllowedIPs trie and return the
+    /// owning peer's (pubkey, configured-or-learned endpoint). `None`
+    /// when no peer's AllowedIPs cover `inner_dst`. This is the encap
+    /// counterpart to the decap-side AllowedIPs src-gate — the engine
+    /// owns the LPM so the table swap is observed atomically. Slow-path
+    /// / transit-encap (per WG-egress packet — the AllowedIps lookup is
+    /// a linear scan of a small, prefix-sorted table; no allocation).
+    pub(crate) fn peer_for_dest(
+        &self,
+        inner_dst: std::net::IpAddr,
+    ) -> Option<([u8; WG_KEY_LEN], Option<std::net::SocketAddr>)> {
+        let table = self.load_table();
+        let idx = table.allowed_ips.lookup(inner_dst)?;
+        let peer = table.peers.get(idx as usize)?;
+        Some((peer.pubkey, *peer.endpoint.read().unwrap()))
+    }
+
     /// Whether the named peer currently has a confirmed (usable for
     /// egress) transport session. Control thread uses this to decide
     /// whether to (re-)initiate a handshake. Slow path.
@@ -527,14 +599,17 @@ impl WgEngine {
                     // keepalive on an existing pubkey would be silently
                     // ignored until the integration layer dropped and
                     // recreated the peer (which it does not). Codex
-                    // final pre-merge finding 3.
-                    p.update_config(cfg.endpoint, cfg.persistent_keepalive);
+                    // final pre-merge finding 3. #1434 B2: the PSK is
+                    // updated in place too so a PSK rotation on an
+                    // existing pubkey takes effect on the next handshake.
+                    p.update_config(cfg.endpoint, cfg.persistent_keepalive, cfg.preshared_key);
                     p
                 }
                 None => Arc::new(Peer::new(
                     cfg.pubkey,
                     cfg.endpoint,
                     cfg.persistent_keepalive,
+                    cfg.preshared_key,
                 )),
             };
             new_peers.push(peer);
@@ -1154,11 +1229,19 @@ impl WgEngine {
         // transcript that no real peer will authenticate. Codex final
         // pre-merge review caught this after nine prior review rounds
         // missed it; see WG_PROTOCOL_ID_BYTES doc in mod.rs.
+        //
+        // #1434 B2: the initiator knows the peer at build time, so it
+        // sets that peer's PSK directly. `WG_ZERO_PSK` (no configured
+        // PSK) reproduces the pre-#1434 behavior bit-for-bit.
+        let psk = self
+            .peer_arc(peer_pubkey)
+            .map(|p| p.preshared_key())
+            .unwrap_or(WG_ZERO_PSK);
         Builder::new(WG_NOISE_PATTERN.parse()?)
             .prologue(WG_PROTOCOL_ID_BYTES)?
             .local_private_key(self.local_private_key.as_slice())?
             .remote_public_key(peer_pubkey)?
-            .psk(2, &WG_ZERO_PSK)?
+            .psk(2, &psk)?
             .build_initiator()
     }
 

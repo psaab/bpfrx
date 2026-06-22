@@ -835,10 +835,13 @@ fn wg1866_disarmed_same_plan_apply_does_not_hold_wg_ports() {
             wg_local_privkey_hex:
                 "a01010101010101010101010101010101010101010101010101010101010101a"
                     .to_string(),
-            wg_peer_pubkey_hex:
-                "b02020202020202020202020202020202020202020202020202020202020202b"
-                    .to_string(),
-            wg_allowed_ips: vec!["10.77.0.0/24".to_string()],
+            wg_peers: vec![crate::protocol::snapshot::TunnelWgPeerSnapshot {
+                wg_peer_pubkey_hex:
+                    "b02020202020202020202020202020202020202020202020202020202020202b"
+                        .to_string(),
+                wg_allowed_ips: vec!["10.77.0.0/24".to_string()],
+                ..Default::default()
+            }],
             ..Default::default()
         }],
         ..Default::default()

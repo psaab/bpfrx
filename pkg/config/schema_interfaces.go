@@ -375,8 +375,14 @@ func wireguardSchemaNode() *schemaNode {
 				children:      nil,
 			},
 			"private-key": {desc: "Local static private key (hex)", args: 1, placeholder: "<hex-key>", children: nil},
-			"peer": {desc: "WireGuard peer", children: map[string]*schemaNode{
-				"public-key":  {desc: "Peer static public key (hex)", args: 1, placeholder: "<hex-key>", children: nil},
+			// peer is a NAMED-INSTANCE container keyed by the peer's
+			// public key (#1434 multi-peer): `peer <public-key> { ... }`.
+			// Modeled on vrrp-group (args:1 with a child block). A WG
+			// tunnel may carry N peers; the identity IS the pubkey, so
+			// it moves to the instance arg (no separate public-key
+			// child). The compiler hard-rejects duplicate pubkeys at
+			// commit (schema_walk.go validateWireguardPeers).
+			"peer": {desc: "WireGuard peer (keyed by public key)", args: 1, placeholder: "<public-key>", children: map[string]*schemaNode{
 				"allowed-ips": {desc: "Peer allowed IPs (CIDR)", args: 1, multi: true, placeholder: "<prefix>", children: nil},
 				"endpoint":    {desc: "Peer endpoint (ip:port)", args: 1, placeholder: "<ip:port>", children: nil},
 				"persistent-keepalive": {
@@ -389,6 +395,7 @@ func wireguardSchemaNode() *schemaNode {
 					validator:     ValidateInteger(0, 65535),
 					children:      nil,
 				},
+				"preshared-key": {desc: "Per-peer preshared key (hex)", args: 1, placeholder: "<hex-key>", children: nil},
 			}},
 		},
 	}

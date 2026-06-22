@@ -33,19 +33,29 @@ func FormatWireguardStatus(status userspace.ProcessStatus, detail bool, now time
 		}
 		fmt.Fprintf(&b, "Tunnel: %s (endpoint id %d)\n", t.Tunnel, t.TunnelEndpointID)
 		fmt.Fprintf(&b, "  Listen port:        %d\n", t.ListenPort)
-		fmt.Fprintf(&b, "  Peer public key:    %s\n", t.PeerPubkeyHex)
-		endpoint := t.PeerEndpoint
-		if endpoint == "" {
-			endpoint = "(responder-only; learned at runtime)"
+		// #1434 multi-peer: one block per peer. Counters below are
+		// tunnel-level (per-engine).
+		if len(t.Peers) == 0 {
+			fmt.Fprintf(&b, "  Peers:              (none configured)\n")
 		}
-		fmt.Fprintf(&b, "  Peer endpoint:      %s\n", endpoint)
-		state := "no session"
-		if t.SessionConfirmed {
-			state = "session confirmed"
-		} else if t.LastHandshakeUnixSecs > 0 {
-			state = "handshake completed, unconfirmed"
+		for pi, p := range t.Peers {
+			if len(t.Peers) > 1 {
+				fmt.Fprintf(&b, "  Peer %d:\n", pi+1)
+			}
+			fmt.Fprintf(&b, "  Peer public key:    %s\n", p.PeerPubkeyHex)
+			endpoint := p.PeerEndpoint
+			if endpoint == "" {
+				endpoint = "(responder-only; learned at runtime)"
+			}
+			fmt.Fprintf(&b, "  Peer endpoint:      %s\n", endpoint)
+			state := "no session"
+			if p.SessionConfirmed {
+				state = "session confirmed"
+			} else if t.LastHandshakeUnixSecs > 0 {
+				state = "handshake completed, unconfirmed"
+			}
+			fmt.Fprintf(&b, "  Session:            %s\n", state)
 		}
-		fmt.Fprintf(&b, "  Session:            %s\n", state)
 		fmt.Fprintf(&b, "  Latest handshake:   %s\n",
 			formatHandshakeAge(t.LastHandshakeUnixSecs, now))
 		fmt.Fprintf(&b, "  Handshakes:         %d initiator, %d responder (initiations created %d, send errors %d)\n",

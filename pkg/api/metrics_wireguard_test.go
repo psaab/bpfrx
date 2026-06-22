@@ -40,7 +40,7 @@ func TestEmitWireguardTelemetrySeriesSet(t *testing.T) {
 		wgSendErrorsTotal: prometheus.NewDesc(
 			"xpf_userspace_wg_send_errors_total", "t", []string{"tunnel", "kind"}, nil),
 		wgSessionConfirmed: prometheus.NewDesc(
-			"xpf_userspace_wg_session_confirmed", "t", []string{"tunnel"}, nil),
+			"xpf_userspace_wg_session_confirmed", "t", []string{"tunnel", "peer"}, nil),
 		wgLastHandshakeTimeSeconds: prometheus.NewDesc(
 			"xpf_userspace_wg_last_handshake_time_seconds", "t", []string{"tunnel"}, nil),
 		wgRekeysInitiatedTotal: prometheus.NewDesc(
@@ -54,8 +54,11 @@ func TestEmitWireguardTelemetrySeriesSet(t *testing.T) {
 	}
 	status := dpuserspace.ProcessStatus{
 		WgTunnels: []dpuserspace.WgTunnelStatus{{
-			Tunnel:                    "wg0",
-			SessionConfirmed:          true,
+			Tunnel: "wg0",
+			Peers: []dpuserspace.WgPeerStatus{{
+				PeerPubkeyHex:    "ab",
+				SessionConfirmed: true,
+			}},
 			LastHandshakeUnixSecs:     1770000000,
 			HsInitiationsCreated:      1,
 			HsInitiationBuildFailures: 2,
@@ -172,7 +175,7 @@ func TestEmitWireguardTelemetrySeriesSet(t *testing.T) {
 		"xpf_userspace_wg_send_errors_total,kind=transport,tunnel=wg0":                              33,
 		"xpf_userspace_wg_send_errors_total,kind=tun_write,tunnel=wg0":                              34,
 		"xpf_userspace_wg_send_errors_total,kind=tun_rx_no_endpoint,tunnel=wg0":                     0,
-		"xpf_userspace_wg_session_confirmed,tunnel=wg0":                                             1,
+		"xpf_userspace_wg_session_confirmed,peer=ab,tunnel=wg0":                                     1,
 		"xpf_userspace_wg_last_handshake_time_seconds,tunnel=wg0":                                   1770000000,
 		"xpf_userspace_wg_transport_drops_total,direction=encap,reason=expired,tunnel=wg0":          36,
 		"xpf_userspace_wg_transport_drops_total,direction=decap,reason=expired,tunnel=wg0":          37,
@@ -202,7 +205,7 @@ func TestEmitWireguardTelemetrySeriesSet(t *testing.T) {
 			t.Errorf("unexpected series %s", k)
 		}
 	}
-	if gotType["xpf_userspace_wg_session_confirmed,tunnel=wg0"] != "gauge" {
+	if gotType["xpf_userspace_wg_session_confirmed,peer=ab,tunnel=wg0"] != "gauge" {
 		t.Errorf("session_confirmed must be a gauge")
 	}
 	if gotType["xpf_userspace_wg_transport_packets_total,direction=encap,tunnel=wg0"] != "counter" {
@@ -236,7 +239,7 @@ func TestEmitWireguardTelemetryNeverHandshakedGauge(t *testing.T) {
 		wgSendErrorsTotal: prometheus.NewDesc(
 			"xpf_userspace_wg_send_errors_total", "t", []string{"tunnel", "kind"}, nil),
 		wgSessionConfirmed: prometheus.NewDesc(
-			"xpf_userspace_wg_session_confirmed", "t", []string{"tunnel"}, nil),
+			"xpf_userspace_wg_session_confirmed", "t", []string{"tunnel", "peer"}, nil),
 		wgLastHandshakeTimeSeconds: prometheus.NewDesc(
 			"xpf_userspace_wg_last_handshake_time_seconds", "t", []string{"tunnel"}, nil),
 		wgRekeysInitiatedTotal: prometheus.NewDesc(
@@ -249,7 +252,13 @@ func TestEmitWireguardTelemetryNeverHandshakedGauge(t *testing.T) {
 			"xpf_userspace_wg_handshake_attempts_aborted_total", "t", []string{"tunnel"}, nil),
 	}
 	status := dpuserspace.ProcessStatus{
-		WgTunnels: []dpuserspace.WgTunnelStatus{{Tunnel: "wg1"}},
+		// One peer (no session) so the per-peer session_confirmed gauge
+		// (#1434) still emits exactly one series for the never-handshaked
+		// tunnel.
+		WgTunnels: []dpuserspace.WgTunnelStatus{{
+			Tunnel: "wg1",
+			Peers:  []dpuserspace.WgPeerStatus{{PeerPubkeyHex: "ab"}},
+		}},
 	}
 	ch := make(chan prometheus.Metric, 256)
 	c.emitWireguardTelemetry(ch, status)
@@ -263,8 +272,9 @@ func TestEmitWireguardTelemetryNeverHandshakedGauge(t *testing.T) {
 	}
 	// 2 completions + 3 singles + 8 hs reasons + 2 pkts + 2 bytes +
 	// 1 keepalive + 15 drop reasons (incl. 2x expired, #1888) + 4 send
-	// kinds + 1 confirmed + 3 rekey reasons + 2 keepalive-sent kinds +
-	// 1 sessions-expired + 1 attempts-aborted = 45.
+	// kinds + 1 confirmed (per-peer, #1434; one peer here) + 3 rekey
+	// reasons + 2 keepalive-sent kinds + 1 sessions-expired +
+	// 1 attempts-aborted = 45.
 	if count != 45 {
 		t.Errorf("emitted %d series for a zeroed tunnel, want 45 (zeros are real signals)", count)
 	}

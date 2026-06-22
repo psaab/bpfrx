@@ -123,7 +123,6 @@ pub(super) fn wg_control_loop(
     tunnel_endpoint_id: u16,
     engine: Arc<crate::afxdp::wg::WgEngine>,
     listen_port: u16,
-    peer_endpoint: Option<SocketAddr>,
     outer_mtu: usize,
     recent_exceptions: Arc<Mutex<VecDeque<ExceptionStatus>>>,
     stop: Arc<AtomicBool>,
@@ -184,7 +183,6 @@ pub(super) fn wg_control_loop(
         &socket,
         socket_is_v6,
         tun,
-        peer_endpoint,
         outer_mtu,
         &recent_exceptions,
         &stop,
@@ -202,17 +200,32 @@ enum InboundOutcome {
     /// Failed authentication / cookie / unknown type — no endpoint
     /// learning, no stamps.
     Unauthenticated,
-    /// Authenticated transport record (data or keepalive).
-    Authenticated,
-    /// Valid msg2 consumed — initiator-side handshake completion.
-    CompletedInitiator,
-    /// Valid msg1 consumed + msg2 sent — responder-side completion.
-    CompletedResponder,
+    /// Authenticated transport record (data or keepalive). Carries the
+    /// peer that owned the session (#1434: endpoint roaming is
+    /// per-peer — we learn THIS peer's endpoint from `from`).
+    Authenticated([u8; 32]),
+    /// Valid msg2 consumed — initiator-side handshake completion (carries
+    /// the responding peer).
+    CompletedInitiator([u8; 32]),
+    /// Valid msg1 consumed + msg2 sent — responder-side completion
+    /// (carries the initiating peer).
+    CompletedResponder([u8; 32]),
 }
 
 impl InboundOutcome {
     fn authenticated(&self) -> bool {
         !matches!(self, InboundOutcome::Unauthenticated)
+    }
+
+    /// The authenticated peer's pubkey, if any (#1434 per-peer endpoint
+    /// learning).
+    fn peer(&self) -> Option<[u8; 32]> {
+        match self {
+            InboundOutcome::Unauthenticated => None,
+            InboundOutcome::Authenticated(pk)
+            | InboundOutcome::CompletedInitiator(pk)
+            | InboundOutcome::CompletedResponder(pk) => Some(*pk),
+        }
     }
 }
 
@@ -313,20 +326,25 @@ fn run_wg_control_loop(
     socket: &UdpSocket,
     socket_is_v6: bool,
     mut tun: std::fs::File,
-    peer_endpoint: Option<SocketAddr>,
     outer_mtu: usize,
     recent_exceptions: &Arc<Mutex<VecDeque<ExceptionStatus>>>,
     stop: &AtomicBool,
 ) {
-    let peer_pubkey = engine.first_peer_pubkey();
-    // The endpoint used for egress + re-init. Starts at the configured
-    // `wg_endpoint` (initiator role) and is LEARNED from the source of
-    // any inbound WG datagram for a responder-only peer (Codex BLOCKER:
-    // a responder-only peer has no configured endpoint, so without
-    // endpoint-learning the TUN-read egress would have nowhere to send
-    // and the tunnel would black-hole the reply path). This is the WG
-    // endpoint-roaming behavior peer.rs documents as required.
-    let mut effective_endpoint: Option<SocketAddr> = peer_endpoint;
+    use std::collections::HashMap;
+    // #1434 multi-peer: the control loop tracks PER-PEER state. The
+    // effective endpoint (configured initiator endpoint, or the source
+    // LEARNED from an authenticated inbound datagram for a responder-only
+    // peer — WG endpoint roaming) is per-peer, as is the handshake
+    // attempt window. Egress TUN packets are LPM-routed to the peer that
+    // owns the inner destination's AllowedIPs (cryptokey routing); each
+    // peer drives its own keepalive/rekey timers.
+    let peer_pubkeys: Vec<[u8; 32]> = engine.peer_pubkeys();
+    let mut effective_endpoints: HashMap<[u8; 32], SocketAddr> = HashMap::new();
+    for (pk, ep) in engine.peer_endpoints() {
+        if let Some(ep) = ep {
+            effective_endpoints.insert(pk, ep);
+        }
+    }
     // 64 KiB scratch for both directions (max IP packet; WG records are
     // smaller). Single allocation at thread start — no per-packet alloc.
     let mut sock_buf = vec![0u8; 65_535];
@@ -337,31 +355,35 @@ fn run_wg_control_loop(
     let socket_fd = socket.as_raw_fd();
     let tun_fd = tun.as_raw_fd();
 
-    // #1888 S5 thread-local timer state. `next_deadline` starts at 0 so
-    // the FIRST iteration always runs a timer pass and computes real
+    // #1888 S5 / #1434 per-peer timer state. `next_deadline` starts at 0
+    // so the FIRST iteration always runs a timer pass and computes real
     // deadlines (u64::MAX = no deadline; never a stale past value).
-    let mut attempt: Option<HandshakeAttempt> = None;
+    let mut attempts: HashMap<[u8; 32], HandshakeAttempt> = HashMap::new();
     let mut next_deadline: u64 = 0;
     let mut last_timer_pass_ns: u64 = 0;
     let mut tun_fatal_reads: u32 = 0;
 
-    // Initial initiator bring-up: a configured endpoint starts a real
-    // attempt window (BringUp class) so the REKEY_TIMEOUT/
-    // REKEY_ATTEMPT_TIME discipline applies from packet one and boot
-    // does not double-fire.
-    if let (Some(ep), Some(pk)) = (effective_endpoint, peer_pubkey) {
-        attempt = start_attempt(
-            engine,
-            socket,
-            socket_is_v6,
-            &pk,
-            ep,
-            AttemptTrigger::BringUp,
-            monotonic_nanos(),
-            &mut encap_buf,
-            tunnel_name,
-            recent_exceptions,
-        );
+    // Initial initiator bring-up: every peer with a configured endpoint
+    // starts a real attempt window (BringUp class) so the REKEY_TIMEOUT/
+    // REKEY_ATTEMPT_TIME discipline applies from packet one and boot does
+    // not double-fire.
+    for pk in &peer_pubkeys {
+        if let Some(&ep) = effective_endpoints.get(pk) {
+            if let Some(att) = start_attempt(
+                engine,
+                socket,
+                socket_is_v6,
+                pk,
+                ep,
+                AttemptTrigger::BringUp,
+                monotonic_nanos(),
+                &mut encap_buf,
+                tunnel_name,
+                recent_exceptions,
+            ) {
+                attempts.insert(*pk, att);
+            }
+        }
     }
 
     while !stop.load(Ordering::Relaxed) {
@@ -389,8 +411,13 @@ fn run_wg_control_loop(
                         tunnel_name,
                         recent_exceptions,
                     );
-                    if outcome.authenticated() {
-                        effective_endpoint = Some(canonicalize_endpoint(from));
+                    // #1434: learn THIS peer's endpoint from `from` (WG
+                    // endpoint roaming is per-peer). Only the
+                    // authenticated peer's egress target is updated — a
+                    // spoofed source for one peer cannot redirect another
+                    // peer's traffic.
+                    if let Some(peer) = outcome.peer() {
+                        effective_endpoints.insert(peer, canonicalize_endpoint(from));
                     }
                     // Completion-site cleanup (plan v9, Codex r5/r6):
                     // a handshake completion obsoletes any request
@@ -402,7 +429,7 @@ fn run_wg_control_loop(
                     // path — a valid msg1/msg2 is an authenticated
                     // receive.)
                     match outcome {
-                        InboundOutcome::CompletedInitiator => {
+                        InboundOutcome::CompletedInitiator(peer) => {
                             let _ = engine.take_rekey_request();
                             let _ = engine.take_handshake_request();
                             // Post-msg2 key-confirmation keepalive
@@ -413,22 +440,20 @@ fn run_wg_control_loop(
                             // keepalive now so a handshake we
                             // initiated with nothing to send does not
                             // leave the peer's egress blackholed.
-                            if let Some(pk) = peer_pubkey {
-                                send_keepalive(
-                                    engine,
-                                    socket,
-                                    socket_is_v6,
-                                    &pk,
-                                    canonicalize_endpoint(from),
-                                    crate::afxdp::wg::timers::KeepaliveKind::Passive,
-                                    monotonic_nanos(),
-                                    &mut encap_buf,
-                                    tunnel_name,
-                                    recent_exceptions,
-                                );
-                            }
+                            send_keepalive(
+                                engine,
+                                socket,
+                                socket_is_v6,
+                                &peer,
+                                canonicalize_endpoint(from),
+                                crate::afxdp::wg::timers::KeepaliveKind::Passive,
+                                monotonic_nanos(),
+                                &mut encap_buf,
+                                tunnel_name,
+                                recent_exceptions,
+                            );
                         }
-                        InboundOutcome::CompletedResponder => {
+                        InboundOutcome::CompletedResponder(_) => {
                             let _ = engine.take_rekey_request();
                             let _ = engine.take_handshake_request();
                         }
@@ -449,60 +474,68 @@ fn run_wg_control_loop(
         }
 
         // --- Egress: TUN → engine → kernel socket ---
-        if let (Some(ep), Some(pk)) = (effective_endpoint, peer_pubkey) {
-            for _ in 0..WG_RX_BURST {
-                match tun.read(&mut tun_buf) {
-                    Ok(len) if len > 0 => {
-                        did_work = true;
-                        tun_fatal_reads = 0;
-                        encap_and_send(
-                            engine,
-                            socket,
-                            socket_is_v6,
-                            &pk,
-                            ep,
-                            &tun_buf[..len],
-                            &mut encap_buf,
-                            outer_mtu,
-                            tunnel_name,
-                            recent_exceptions,
-                        );
-                    }
-                    Ok(_) => break,
-                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                    Err(e) => {
-                        tun_fatal_reads += 1;
-                        record_local_tunnel_exception(
-                            recent_exceptions,
-                            tunnel_name,
-                            format!("wg_tun_read:{e}"),
-                        );
-                        break;
-                    }
-                }
-            }
-        } else {
-            // Responder-only peer that hasn't been heard from yet: drain
-            // the TUN so the kernel does not back up, but we have no
-            // endpoint to send to until the peer initiates. Bounded by
-            // WG_RX_BURST (Codex r3 MAJOR — an unbounded drain under
-            // continuous local traffic could starve socket RX and delay
-            // stop/join during reconcile).
-            for _ in 0..WG_RX_BURST {
-                match tun.read(&mut tun_buf) {
-                    Ok(len) if len > 0 => {
-                        // #1865: inner packet drained + dropped — no
-                        // learned endpoint to send to yet.
+        // #1434 cryptokey routing: each inner packet read off the TUN is
+        // routed to the peer whose AllowedIPs cover its DESTINATION
+        // (longest-prefix match), then encapped toward THAT peer's
+        // effective endpoint. A packet whose dst no peer claims, or whose
+        // peer has no known endpoint yet (responder-only, pre-handshake),
+        // is dropped (counted) — there is nowhere to send it.
+        for _ in 0..WG_RX_BURST {
+            match tun.read(&mut tun_buf) {
+                Ok(len) if len > 0 => {
+                    did_work = true;
+                    tun_fatal_reads = 0;
+                    let inner = &tun_buf[..len];
+                    // The TUN delivers a bare inner IP packet (no L2).
+                    // Sniff the family from the version nibble.
+                    let af = match inner.first().map(|b| b >> 4) {
+                        Some(4) => libc::AF_INET as u8,
+                        Some(6) => libc::AF_INET6 as u8,
+                        _ => {
+                            WgCounters::bump(&engine.counters().tun_rx_drops_no_endpoint);
+                            continue;
+                        }
+                    };
+                    let Some(dst) = crate::afxdp::gre::inner_dst_ip(inner, af) else {
                         WgCounters::bump(&engine.counters().tun_rx_drops_no_endpoint);
-                        did_work = true;
-                        tun_fatal_reads = 0;
-                    }
-                    Ok(_) => break,
-                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
-                    Err(_) => {
-                        tun_fatal_reads += 1;
-                        break;
-                    }
+                        continue;
+                    };
+                    let Some((pk, _ep)) = engine.peer_for_dest(dst) else {
+                        // No peer owns this destination's AllowedIPs.
+                        WgCounters::bump(&engine.counters().tun_rx_drops_no_endpoint);
+                        continue;
+                    };
+                    let Some(&ep) = effective_endpoints.get(&pk) else {
+                        // The owning peer has no known endpoint yet
+                        // (responder-only, learned at runtime). Drop —
+                        // the reply path opens once the peer is heard
+                        // from (#1865 endpoint-learning, now per-peer).
+                        WgCounters::bump(&engine.counters().tun_rx_drops_no_endpoint);
+                        continue;
+                    };
+                    encap_and_send(
+                        engine,
+                        socket,
+                        socket_is_v6,
+                        &pk,
+                        ep,
+                        inner,
+                        &mut encap_buf,
+                        outer_mtu,
+                        tunnel_name,
+                        recent_exceptions,
+                    );
+                }
+                Ok(_) => break,
+                Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                Err(e) => {
+                    tun_fatal_reads += 1;
+                    record_local_tunnel_exception(
+                        recent_exceptions,
+                        tunnel_name,
+                        format!("wg_tun_read:{e}"),
+                    );
+                    break;
                 }
             }
         }
@@ -526,25 +559,32 @@ fn run_wg_control_loop(
         let tick_due = now.saturating_sub(last_timer_pass_ns) >= WG_TIMER_TICK_NS;
         if tick_due || now >= next_deadline {
             next_deadline = crate::afxdp::wg::timers::WG_NO_DEADLINE_NS;
-            if let Some(pk) = peer_pubkey {
-                engine.expire_sessions(now);
+            // Session expiry is engine-wide (sweeps every peer's
+            // sessions); run it once per pass, not per peer.
+            engine.expire_sessions(now);
+            // #1434: drive each peer's keepalive/rekey timers and
+            // attempt machine independently. The earliest deadline
+            // across ALL peers gates the poll timeout.
+            for pk in &peer_pubkeys {
+                let effective_endpoint = effective_endpoints.get(pk).copied();
                 let endpoint_known = effective_endpoint.is_some();
-                let actions = engine.timer_pass(now, endpoint_known);
+                let actions = engine.timer_pass_for_peer(pk, now, endpoint_known);
                 if let Some(kind) = actions.send_keepalive {
                     if let Some(ep) = effective_endpoint {
                         send_keepalive(
-                            engine, socket, socket_is_v6, &pk, ep, kind, now,
+                            engine, socket, socket_is_v6, pk, ep, kind, now,
                             &mut encap_buf, tunnel_name, recent_exceptions,
                         );
                     } else {
-                        pace_keepalive_skip(engine, &pk, kind, now);
+                        pace_keepalive_skip(engine, pk, kind, now);
                     }
                 }
+                let mut attempt = attempts.remove(pk);
                 let attempt_deadline = drive_attempt_machine(
                     engine,
                     socket,
                     socket_is_v6,
-                    &pk,
+                    pk,
                     effective_endpoint,
                     &actions,
                     now,
@@ -553,7 +593,12 @@ fn run_wg_control_loop(
                     tunnel_name,
                     recent_exceptions,
                 );
-                next_deadline = actions.next_deadline_ns.min(attempt_deadline);
+                if let Some(att) = attempt {
+                    attempts.insert(*pk, att);
+                }
+                next_deadline = next_deadline
+                    .min(actions.next_deadline_ns)
+                    .min(attempt_deadline);
             }
             if tick_due {
                 // Only tick-condition runs advance the 1s anchor —
@@ -1019,7 +1064,7 @@ fn dispatch_inbound(
                             );
                         }
                     }
-                    InboundOutcome::CompletedResponder
+                    InboundOutcome::CompletedResponder(peer_pubkey)
                 }
                 Err(_e) => {
                     debug_log!("WG[{}]: drop initiation reason={:?}", tunnel_name, _e);
@@ -1028,7 +1073,7 @@ fn dispatch_inbound(
             }
         }
         crate::afxdp::wg::WG_TYPE_RESPONSE => match engine.consume_response(datagram) {
-            Ok(_) => InboundOutcome::CompletedInitiator,
+            Ok((peer_pubkey, _idx)) => InboundOutcome::CompletedInitiator(peer_pubkey),
             Err(_e) => {
                 debug_log!("WG[{}]: drop response reason={:?}", tunnel_name, _e);
                 InboundOutcome::Unauthenticated
@@ -1056,7 +1101,7 @@ fn dispatch_inbound(
                             format!("wg_tun_write:{e}"),
                         );
                     }
-                    InboundOutcome::Authenticated
+                    InboundOutcome::Authenticated(outcome.peer_pubkey)
                 }
                 Err(crate::afxdp::wg::DecapError::MalformedInner) => {
                     // MalformedInner is only ever returned POST-AEAD:
@@ -1066,8 +1111,21 @@ fn dispatch_inbound(
                     // the peer holds the session keys. Both count for
                     // endpoint learning (this closes the #1865 plan §9
                     // latent gap: a keepalive-only roaming peer now
-                    // updates our egress endpoint).
-                    InboundOutcome::Authenticated
+                    // updates our egress endpoint). #1434: try_decap's
+                    // MalformedInner/keepalive arm does not surface the
+                    // peer, so per-peer endpoint learning is only
+                    // unambiguous when the tunnel has exactly ONE peer
+                    // (the keepalive-roaming case the #1865 fix targets).
+                    // With multiple peers we cannot attribute a bare
+                    // keepalive to a specific peer here, so skip the
+                    // learn for THIS datagram (the next DATA record from
+                    // the peer learns it via the Authenticated(peer)
+                    // arm above). Return Unauthenticated so no wrong-peer
+                    // endpoint is learned.
+                    match engine.single_peer_pubkey() {
+                        Some(pk) => InboundOutcome::Authenticated(pk),
+                        None => InboundOutcome::Unauthenticated,
+                    }
                 }
                 Err(_e) => {
                     debug_log!("WG[{}]: drop transport reason={:?}", tunnel_name, _e);
@@ -1245,6 +1303,7 @@ mod tests {
                     endpoint: None, // responder-only: no bring-up sends
                     persistent_keepalive: 0,
                     allowed_ips: vec![],
+                    preshared_key: [0u8; 32],
                 }],
             },
         ));
@@ -1276,7 +1335,6 @@ mod tests {
                 &socket,
                 false,
                 tun,
-                None,
                 WG_DEFAULT_OUTER_MTU,
                 &exceptions,
                 &stop,

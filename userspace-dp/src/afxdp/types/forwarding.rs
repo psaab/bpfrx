@@ -206,16 +206,48 @@ pub(in crate::afxdp) struct TunnelEndpoint {
     pub(in crate::afxdp) key: u32,
     pub(in crate::afxdp) ttl: u8,
     pub(in crate::afxdp) transport_table: String,
-    // WireGuard (#1432 S2a). Populated only when mode == "wireguard".
+    // WireGuard (#1432 S2a, multi-peer #1434). Populated only when
+    // mode == "wireguard".
     pub(in crate::afxdp) wg_listen_port: u16,
     /// Local static X25519 private key, hex-decoded. Zeroized on drop
     /// and redacted in Debug — must never leak via `{:?}` or the
     /// on-disk state snapshot.
     pub(in crate::afxdp) wg_local_privkey: zeroize::Zeroizing<[u8; 32]>,
-    pub(in crate::afxdp) wg_peer_pubkey: [u8; 32],
-    pub(in crate::afxdp) wg_allowed_ips: Vec<ipnet::IpNet>,
-    pub(in crate::afxdp) wg_endpoint: Option<std::net::SocketAddr>,
-    pub(in crate::afxdp) wg_keepalive_secs: u16,
+    /// Ordered per-peer set (#1434). Built from the sorted-by-pubkey
+    /// wire slice; the engine peer table is fed from this, and the
+    /// encap path LPM-selects the peer by inner-dst (#1434 B1b).
+    pub(in crate::afxdp) wg_peers: Vec<WgRuntimePeer>,
+}
+
+/// One WireGuard peer as hydrated into the runtime forwarding state
+/// (#1434). Decoded/parsed from the wire `TunnelWgPeerSnapshot`.
+#[derive(Clone)]
+pub(in crate::afxdp) struct WgRuntimePeer {
+    pub(in crate::afxdp) pubkey: [u8; 32],
+    pub(in crate::afxdp) allowed_ips: Vec<ipnet::IpNet>,
+    pub(in crate::afxdp) endpoint: Option<std::net::SocketAddr>,
+    pub(in crate::afxdp) keepalive_secs: u16,
+    /// Per-peer preshared key (#1434 B2), hex-decoded. 32 zero bytes =
+    /// no PSK. Zeroized on drop; redacted in the Debug impl. Must never
+    /// leak via `{:?}` or the on-disk state snapshot.
+    pub(in crate::afxdp) preshared_key: zeroize::Zeroizing<[u8; 32]>,
+}
+
+impl std::fmt::Debug for WgRuntimePeer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let psk_state = if *self.preshared_key == [0u8; 32] {
+            "<unset>"
+        } else {
+            "<redacted>"
+        };
+        f.debug_struct("WgRuntimePeer")
+            .field("pubkey", &self.pubkey)
+            .field("allowed_ips", &self.allowed_ips)
+            .field("endpoint", &self.endpoint)
+            .field("keepalive_secs", &self.keepalive_secs)
+            .field("preshared_key", &psk_state)
+            .finish()
+    }
 }
 
 impl std::fmt::Debug for TunnelEndpoint {
@@ -242,10 +274,9 @@ impl std::fmt::Debug for TunnelEndpoint {
                     "<unset>"
                 },
             )
-            .field("wg_peer_pubkey", &self.wg_peer_pubkey)
-            .field("wg_allowed_ips", &self.wg_allowed_ips)
-            .field("wg_endpoint", &self.wg_endpoint)
-            .field("wg_keepalive_secs", &self.wg_keepalive_secs)
+            // wg_peers uses WgRuntimePeer's own Debug, which redacts
+            // each peer's PSK.
+            .field("wg_peers", &self.wg_peers)
             .finish()
     }
 }

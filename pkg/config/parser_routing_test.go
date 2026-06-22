@@ -3115,6 +3115,7 @@ func TestTunnelNameMapWireguardInterfaceLevel(t *testing.T) {
 	cmds := []string{
 		"set interfaces wg0 tunnel mode wireguard",
 		"set interfaces wg0 tunnel wireguard listen-port 51820",
+		"set interfaces wg0 tunnel wireguard peer aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa allowed-ips 10.0.0.0/24",
 		"set interfaces wg0 unit 0 family inet address 10.66.0.1/24",
 		"set interfaces wg0 unit 1 family inet address 10.66.1.1/24",
 	}
@@ -3290,11 +3291,10 @@ func TestWireGuardTunnelSetSyntax(t *testing.T) {
 		"set interfaces wg0 tunnel mode wireguard",
 		"set interfaces wg0 tunnel wireguard listen-port 51820",
 		"set interfaces wg0 tunnel wireguard private-key a01010101010101010101010101010101010101010101010101010101010101a",
-		"set interfaces wg0 tunnel wireguard peer public-key b02020202020202020202020202020202020202020202020202020202020202b",
-		"set interfaces wg0 tunnel wireguard peer allowed-ips 10.0.0.0/24",
-		"set interfaces wg0 tunnel wireguard peer allowed-ips 10.0.1.0/24",
-		"set interfaces wg0 tunnel wireguard peer endpoint 203.0.113.1:51820",
-		"set interfaces wg0 tunnel wireguard peer persistent-keepalive 25",
+		"set interfaces wg0 tunnel wireguard peer b02020202020202020202020202020202020202020202020202020202020202b allowed-ips 10.0.0.0/24",
+		"set interfaces wg0 tunnel wireguard peer b02020202020202020202020202020202020202020202020202020202020202b allowed-ips 10.0.1.0/24",
+		"set interfaces wg0 tunnel wireguard peer b02020202020202020202020202020202020202020202020202020202020202b endpoint 203.0.113.1:51820",
+		"set interfaces wg0 tunnel wireguard peer b02020202020202020202020202020202020202020202020202020202020202b persistent-keepalive 25",
 	}
 	tree := &ConfigTree{}
 	for _, cmd := range cmds {
@@ -3324,17 +3324,21 @@ func TestWireGuardTunnelSetSyntax(t *testing.T) {
 	if tc.WgLocalPrivkeyHex != "a01010101010101010101010101010101010101010101010101010101010101a" {
 		t.Errorf("WgLocalPrivkeyHex not parsed: %q", tc.WgLocalPrivkeyHex)
 	}
-	if tc.WgPeerPubkeyHex != "b02020202020202020202020202020202020202020202020202020202020202b" {
-		t.Errorf("WgPeerPubkeyHex = %q", tc.WgPeerPubkeyHex)
+	if len(tc.WgPeers) != 1 {
+		t.Fatalf("WgPeers = %v, want 1 peer", tc.WgPeers)
 	}
-	if len(tc.WgAllowedIPs) != 2 {
-		t.Errorf("WgAllowedIPs = %v, want 2 entries", tc.WgAllowedIPs)
+	peer := tc.WgPeers[0]
+	if peer.PublicKeyHex != "b02020202020202020202020202020202020202020202020202020202020202b" {
+		t.Errorf("WgPeers[0].PublicKeyHex = %q", peer.PublicKeyHex)
 	}
-	if tc.WgEndpoint != "203.0.113.1:51820" {
-		t.Errorf("WgEndpoint = %q", tc.WgEndpoint)
+	if len(peer.AllowedIPs) != 2 {
+		t.Errorf("WgPeers[0].AllowedIPs = %v, want 2 entries", peer.AllowedIPs)
 	}
-	if tc.WgKeepaliveSecs != 25 {
-		t.Errorf("WgKeepaliveSecs = %d, want 25", tc.WgKeepaliveSecs)
+	if peer.Endpoint != "203.0.113.1:51820" {
+		t.Errorf("WgPeers[0].Endpoint = %q", peer.Endpoint)
+	}
+	if peer.KeepaliveSecs != 25 {
+		t.Errorf("WgPeers[0].KeepaliveSecs = %d, want 25", peer.KeepaliveSecs)
 	}
 }
 

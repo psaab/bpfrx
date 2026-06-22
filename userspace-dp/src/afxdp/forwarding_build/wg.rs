@@ -45,12 +45,21 @@ pub(super) fn populate_wg_engines(
         if endpoint.mode != "wireguard" {
             continue;
         }
-        let peer = WgPeerConfig {
-            pubkey: endpoint.wg_peer_pubkey,
-            endpoint: endpoint.wg_endpoint,
-            persistent_keepalive: endpoint.wg_keepalive_secs,
-            allowed_ips: endpoint.wg_allowed_ips.clone(),
-        };
+        // #1434: build one WgPeerConfig per configured peer (the engine
+        // peer table is multi-peer; the table-feeding collapse to one
+        // peer is gone). The peer order is the snapshot order, which the
+        // Go builder sorts by pubkey.
+        let peers: Vec<WgPeerConfig> = endpoint
+            .wg_peers
+            .iter()
+            .map(|p| WgPeerConfig {
+                pubkey: p.pubkey,
+                endpoint: p.endpoint,
+                persistent_keepalive: p.keepalive_secs,
+                allowed_ips: p.allowed_ips.clone(),
+                preshared_key: *p.preshared_key,
+            })
+            .collect();
         // Identity-stable reuse: same endpoint id with an unchanged WG
         // identity tuple reuses the prior engine Arc verbatim.
         if let Some(prev_state) = previous {
@@ -69,7 +78,7 @@ pub(super) fn populate_wg_engines(
         let engine = WgEngine::new(WgEngineConfig {
             local_private_key: *endpoint.wg_local_privkey,
             listen_port: endpoint.wg_listen_port,
-            peers: vec![peer],
+            peers,
         });
         if let Some(prev_state) = previous {
             if let Some(prev_engine) = prev_state.wg_engines.get(&id) {
@@ -84,11 +93,10 @@ pub(super) fn populate_wg_engines(
 
 /// Whether two WG endpoints have a byte-identical WG identity tuple, so
 /// the engine Arc can be reused across a reload without `reconcile_peers`.
+/// #1434: the per-peer set is compared via `wg_peers_eq` (order-sensitive
+/// — the Go builder sorts by pubkey, so a stable config is stable order).
 fn wg_identity_unchanged(prev: &TunnelEndpoint, next: &TunnelEndpoint) -> bool {
     prev.wg_listen_port == next.wg_listen_port
         && *prev.wg_local_privkey == *next.wg_local_privkey
-        && prev.wg_peer_pubkey == next.wg_peer_pubkey
-        && prev.wg_allowed_ips == next.wg_allowed_ips
-        && prev.wg_endpoint == next.wg_endpoint
-        && prev.wg_keepalive_secs == next.wg_keepalive_secs
+        && super::tunnels::wg_peers_eq(&prev.wg_peers, &next.wg_peers)
 }

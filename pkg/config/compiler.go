@@ -364,6 +364,19 @@ type compileOpts struct {
 	// the MAC), so a leniently-loaded bad binding is inert. Same doctrine as
 	// lenientPolicyMatchAddress.
 	lenientDHCPStaticBindings bool
+	// lenientWireguardPeers (#1434 multi-peer) downgrades the WireGuard
+	// per-peer gate (validateWireguardPeersStrict) from a hard compile
+	// error to a cfg.Warnings entry. The strict commit / commit-check
+	// path hard-rejects a WG tunnel with zero peers, a duplicate peer
+	// pubkey, a malformed (non-64-hex) pubkey/PSK, or endpoint-bearing
+	// peers that disagree on outer transport family (one UDP socket = one
+	// outer family). The tolerant load / peer-sync paths downgrade to a
+	// warning so an already-persisted or peer-synced config still BOOTS
+	// (#1960 no-brick) — the Rust hydrate path independently drops a WG
+	// row with a malformed key (hydrate_wg_identity) and the engine
+	// reconcile is dup-pubkey-safe, so a leniently-loaded bad config is
+	// inert. Same doctrine as lenientNATHostMask.
+	lenientWireguardPeers bool
 }
 
 // CompileConfig converts a parsed ConfigTree AST into a typed Config struct.
@@ -406,6 +419,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientApplicationSetMembers:       true,
 		lenientRibGroupRefs:                true,
 		lenientDHCPStaticBindings:          true,
+		lenientWireguardPeers:              true,
 	})
 }
 
@@ -499,6 +513,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientApplicationSetMembers:       true,
 		lenientRibGroupRefs:                true,
 		lenientDHCPStaticBindings:          true,
+		lenientWireguardPeers:              true,
 	})
 }
 
@@ -1178,6 +1193,20 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		return nil, err
 	}
 	cfg.Warnings = append(cfg.Warnings, nptv6Warnings...)
+
+	// #1434 multi-peer WireGuard: per-peer commit gate. Strict (commit /
+	// commit-check): hard-reject a WG tunnel with zero peers, a duplicate
+	// or malformed (non-64-hex) peer pubkey, a malformed PSK, or
+	// endpoint-bearing peers that disagree on outer transport family.
+	// Lenient (load / peer-sync): warn so an already-persisted or
+	// peer-synced config still boots — the Rust hydrate path drops a row
+	// with a malformed key independently and the engine reconcile is
+	// dup-safe, so a leniently-loaded bad config is inert.
+	wgPeerWarnings, err := validateWireguardPeersStrict(cfg, opts.lenientWireguardPeers)
+	if err != nil {
+		return nil, err
+	}
+	cfg.Warnings = append(cfg.Warnings, wgPeerWarnings...)
 
 	// #1892: retired DPDK-era `system dataplane` knobs (cores, memory,
 	// socket-mem, rx-mode, ports) parse for stored-config compatibility

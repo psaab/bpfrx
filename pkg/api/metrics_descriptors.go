@@ -1375,8 +1375,8 @@ func newCollector(srv *Server) *xpfCollector {
 		),
 		wgSessionConfirmed: prometheus.NewDesc(
 			"xpf_userspace_wg_session_confirmed",
-			"Whether the tunnel's peer currently holds a CONFIRMED (egress-usable) transport session (1/0 gauge). The liveness signal — a responder-side handshake completion alone does not imply the peer ever received our response (#1865).",
-			[]string{"tunnel"}, nil,
+			"Whether a tunnel peer currently holds a CONFIRMED (egress-usable) transport session (1/0 gauge). Labeled by tunnel AND peer public key (#1434 multi-peer). The liveness signal — a responder-side handshake completion alone does not imply the peer ever received our response (#1865).",
+			[]string{"tunnel", "peer"}, nil,
 		),
 		wgLastHandshakeTimeSeconds: prometheus.NewDesc(
 			"xpf_userspace_wg_last_handshake_time_seconds",

@@ -11,13 +11,15 @@ import (
 func wgFmtFixture() userspace.ProcessStatus {
 	return userspace.ProcessStatus{
 		WgTunnels: []userspace.WgTunnelStatus{{
-			Tunnel:                 "wg0",
-			TunnelEndpointID:       3,
-			ListenPort:             51820,
-			PeerPubkeyHex:          strings.Repeat("ab", 32),
-			LocalPubkeyHex:         strings.Repeat("cd", 32),
-			PeerEndpoint:           "192.0.2.10:51820",
-			SessionConfirmed:       true,
+			Tunnel:           "wg0",
+			TunnelEndpointID: 3,
+			ListenPort:       51820,
+			LocalPubkeyHex:   strings.Repeat("cd", 32),
+			Peers: []userspace.WgPeerStatus{{
+				PeerPubkeyHex:    strings.Repeat("ab", 32),
+				PeerEndpoint:     "192.0.2.10:51820",
+				SessionConfirmed: true,
+			}},
 			LastHandshakeUnixSecs:  1_770_000_000,
 			HsCompletionsInitiator: 2,
 			HsResponsesCreated:     1,
@@ -84,7 +86,12 @@ func TestFormatWireguardStatusNeverAndEmpty(t *testing.T) {
 	if !strings.Contains(out, "No WireGuard tunnels configured") {
 		t.Errorf("empty status rendering = %q", out)
 	}
-	status := userspace.ProcessStatus{WgTunnels: []userspace.WgTunnelStatus{{Tunnel: "wg1"}}}
+	// A tunnel with one peer that has no endpoint / no session: renders
+	// "never", "no session", and the responder-only placeholder.
+	status := userspace.ProcessStatus{WgTunnels: []userspace.WgTunnelStatus{{
+		Tunnel: "wg1",
+		Peers:  []userspace.WgPeerStatus{{PeerPubkeyHex: strings.Repeat("ab", 32)}},
+	}}}
 	out = FormatWireguardStatus(status, false, time.Now())
 	if !strings.Contains(out, "Latest handshake:   never") {
 		t.Errorf("never-handshaked tunnel must render 'never':\n%s", out)
@@ -94,6 +101,12 @@ func TestFormatWireguardStatusNeverAndEmpty(t *testing.T) {
 	}
 	if !strings.Contains(out, "(responder-only; learned at runtime)") {
 		t.Errorf("empty endpoint placeholder missing:\n%s", out)
+	}
+	// A tunnel with NO peers configured renders the explicit marker.
+	noPeers := userspace.ProcessStatus{WgTunnels: []userspace.WgTunnelStatus{{Tunnel: "wg2"}}}
+	out = FormatWireguardStatus(noPeers, false, time.Now())
+	if !strings.Contains(out, "Peers:              (none configured)") {
+		t.Errorf("no-peer tunnel must render the (none configured) marker:\n%s", out)
 	}
 }
 

@@ -382,14 +382,27 @@ pub(crate) struct TunnelEndpointSnapshot {
     /// future accidental `{:?}` log line from leaking key material.
     #[serde(rename = "wg_local_privkey_hex", default, skip_serializing)]
     pub wg_local_privkey_hex: String,
-    /// Peer's static public key, hex-encoded. The WG engine uses
-    /// this as the encap key — not AllowedIPs LPM. See plan §
-    /// "Engine keying" for why this matters.
+    /// Ordered per-peer set (#1434 multi-peer). The Go control plane
+    /// sorts by pubkey at the snapshot-builder boundary so both HA
+    /// nodes serialize byte-identical snapshots. The engine peer table
+    /// is fed from this slice; RX/decap demuxes by receiver_index
+    /// across ALL peers, and TX/encap selects the peer by inner-dst
+    /// AllowedIPs LPM (#1434 B1b).
+    #[serde(rename = "wg_peers", default)]
+    pub wg_peers: Vec<TunnelWgPeerSnapshot>,
+}
+
+/// One WireGuard peer on the Go→Rust wire (#1434). Mirrors the Go
+/// TunnelWgPeerWire (pkg/dataplane/userspace/protocol.go). Keep json
+/// tags identical on BOTH sides.
+#[derive(Clone, Serialize, Deserialize, Default)]
+pub(crate) struct TunnelWgPeerSnapshot {
+    /// Peer's static public key, hex-encoded.
     #[serde(rename = "wg_peer_pubkey_hex", default)]
     pub wg_peer_pubkey_hex: String,
-    /// Peer AllowedIPs, as CIDR strings. Only consulted on the
-    /// decap path (inner src-IP gate); never used to choose a peer
-    /// on egress.
+    /// Peer AllowedIPs, as CIDR strings. Consulted on the decap path
+    /// (inner src-IP gate) AND on the encap path (#1434 B1b inner-dst
+    /// → peer LPM).
     #[serde(rename = "wg_allowed_ips", default)]
     pub wg_allowed_ips: Vec<String>,
     /// Optional peer endpoint (`IP:port`) for initiator-role
@@ -399,6 +412,34 @@ pub(crate) struct TunnelEndpointSnapshot {
     /// Optional persistent keepalive in seconds. 0 = off.
     #[serde(rename = "wg_keepalive_secs", default)]
     pub wg_keepalive_secs: u16,
+    /// Optional per-peer preshared key, hex-encoded (#1434 B2). Empty
+    /// = zero PSK. SECRET: like wg_local_privkey_hex it is delivered
+    /// on the control socket (the engine needs it) but is
+    /// `skip_serializing` so it can NEVER be written back into the
+    /// on-disk state snapshot. The custom Debug impl on
+    /// TunnelEndpointSnapshot redacts the whole peer set; see also the
+    /// per-peer Debug below.
+    #[serde(rename = "wg_preshared_key_hex", default, skip_serializing)]
+    pub wg_preshared_key_hex: String,
+}
+
+impl std::fmt::Debug for TunnelWgPeerSnapshot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Redact the PSK; the pubkey/allowed-ips/endpoint are not
+        // secret and are useful for triage.
+        let psk_state = if self.wg_preshared_key_hex.is_empty() {
+            "<unset>"
+        } else {
+            "<redacted>"
+        };
+        f.debug_struct("TunnelWgPeerSnapshot")
+            .field("wg_peer_pubkey_hex", &self.wg_peer_pubkey_hex)
+            .field("wg_allowed_ips", &self.wg_allowed_ips)
+            .field("wg_endpoint", &self.wg_endpoint)
+            .field("wg_keepalive_secs", &self.wg_keepalive_secs)
+            .field("wg_preshared_key_hex", &psk_state)
+            .finish()
+    }
 }
 
 impl std::fmt::Debug for TunnelEndpointSnapshot {
@@ -428,10 +469,9 @@ impl std::fmt::Debug for TunnelEndpointSnapshot {
             .field("transport_table", &self.transport_table)
             .field("wg_listen_port", &self.wg_listen_port)
             .field("wg_local_privkey_hex", &privkey_state)
-            .field("wg_peer_pubkey_hex", &self.wg_peer_pubkey_hex)
-            .field("wg_allowed_ips", &self.wg_allowed_ips)
-            .field("wg_endpoint", &self.wg_endpoint)
-            .field("wg_keepalive_secs", &self.wg_keepalive_secs)
+            // wg_peers uses TunnelWgPeerSnapshot's own Debug, which
+            // redacts each peer's PSK.
+            .field("wg_peers", &self.wg_peers)
             .finish()
     }
 }
@@ -488,8 +528,11 @@ mod wg_snapshot_tests {
             mode: "wireguard".into(),
             wg_local_privkey_hex:
                 "a01010101010101010101010101010101010101010101010101010101010101a".into(),
-            wg_peer_pubkey_hex:
-                "b02020202020202020202020202020202020202020202020202020202020202b".into(),
+            wg_peers: vec![TunnelWgPeerSnapshot {
+                wg_peer_pubkey_hex:
+                    "b02020202020202020202020202020202020202020202020202020202020202b".into(),
+                ..Default::default()
+            }],
             ..Default::default()
         };
         let json = serde_json::to_string(&snap).unwrap();

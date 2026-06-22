@@ -228,11 +228,13 @@ func populatedCoverageStatus() dpuserspace.ProcessStatus {
 		// LastHandshakeUnixSecs is nonzero so the gated gauge emits.
 		WgTunnels: []dpuserspace.WgTunnelStatus{
 			{
-				Tunnel:                "wg0",
-				TunnelEndpointID:      9,
-				ListenPort:            51820,
-				PeerPubkeyHex:         "ab",
-				SessionConfirmed:      true,
+				Tunnel:           "wg0",
+				TunnelEndpointID: 9,
+				ListenPort:       51820,
+				Peers: []dpuserspace.WgPeerStatus{{
+					PeerPubkeyHex:    "ab",
+					SessionConfirmed: true,
+				}},
 				LastHandshakeUnixSecs: 1_770_000_000,
 				HsInitiationsCreated:  3,
 				DecapPackets:          5,

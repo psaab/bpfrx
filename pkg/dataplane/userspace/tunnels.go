@@ -90,12 +90,12 @@ func buildTunnelEndpointSnapshots(cfg *config.Config, interfaces []InterfaceSnap
 		}
 		// For WG the outer family follows the peer endpoint address
 		// (the Source/Destination heuristic above sees empty strings).
-		if isWireguard && tunnel.WgEndpoint != "" {
-			if host, _, err := net.SplitHostPort(tunnel.WgEndpoint); err == nil {
-				if ip := net.ParseIP(host); ip != nil && ip.To4() == nil {
-					outerFamily = "inet6"
-				}
-			}
+		// With multi-peer (#1434) the family is a tunnel-level property
+		// (one UDP socket); WgOuterFamilyV6 resolves it from the
+		// endpoint-bearing peer(s) (validateWireguardPeers rejects
+		// mixed-family at commit).
+		if isWireguard && tunnel.WgOuterFamilyV6() {
+			outerFamily = "inet6"
 		}
 		id := config.StableTunnelEndpointID(ifName)
 		if owner, taken := usedIDs[id]; taken {
@@ -122,10 +122,24 @@ func buildTunnelEndpointSnapshots(cfg *config.Config, interfaces []InterfaceSnap
 		if isWireguard {
 			snap.WgListenPort = tunnel.WgListenPort
 			snap.WgLocalPrivkeyHex = tunnel.WgLocalPrivkeyHex.Reveal()
-			snap.WgPeerPubkeyHex = tunnel.WgPeerPubkeyHex
-			snap.WgAllowedIPs = tunnel.WgAllowedIPs
-			snap.WgEndpoint = tunnel.WgEndpoint
-			snap.WgKeepaliveSecs = tunnel.WgKeepaliveSecs
+			// Copy the peer set sorted by pubkey hex so both HA nodes
+			// serialize byte-identical snapshots (compile determinism,
+			// #1434 §5.4) and the wire fixture is stable regardless of
+			// the order peers were authored in.
+			peers := make([]TunnelWgPeerWire, 0, len(tunnel.WgPeers))
+			for _, p := range tunnel.WgPeers {
+				peers = append(peers, TunnelWgPeerWire{
+					WgPeerPubkeyHex:   p.PublicKeyHex,
+					WgAllowedIPs:      p.AllowedIPs,
+					WgEndpoint:        p.Endpoint,
+					WgKeepaliveSecs:   p.KeepaliveSecs,
+					WgPresharedKeyHex: p.PresharedKeyHex.Reveal(),
+				})
+			}
+			sort.Slice(peers, func(i, j int) bool {
+				return peers[i].WgPeerPubkeyHex < peers[j].WgPeerPubkeyHex
+			})
+			snap.WgPeers = peers
 		}
 		out = append(out, snap)
 		usedIDs[id] = ifName

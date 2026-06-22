@@ -146,12 +146,16 @@ func (c *xpfCollector) emitWireguardTelemetry(ch chan<- prometheus.Metric, statu
 		counter(c.wgSessionsExpiredTotal, t.SessionsExpired, t.Tunnel)
 		counter(c.wgHandshakeAttemptsAbortedTotal, t.PendingAbortedAttemptWindow, t.Tunnel)
 
-		confirmed := 0.0
-		if t.SessionConfirmed {
-			confirmed = 1.0
+		// #1434 multi-peer: one confirmed-session gauge per peer,
+		// labeled by tunnel + peer pubkey.
+		for _, p := range t.Peers {
+			confirmed := 0.0
+			if p.SessionConfirmed {
+				confirmed = 1.0
+			}
+			ch <- prometheus.MustNewConstMetric(
+				c.wgSessionConfirmed, prometheus.GaugeValue, confirmed, t.Tunnel, p.PeerPubkeyHex)
 		}
-		ch <- prometheus.MustNewConstMetric(
-			c.wgSessionConfirmed, prometheus.GaugeValue, confirmed, t.Tunnel)
 		if t.LastHandshakeUnixSecs > 0 {
 			ch <- prometheus.MustNewConstMetric(
 				c.wgLastHandshakeTimeSeconds,
