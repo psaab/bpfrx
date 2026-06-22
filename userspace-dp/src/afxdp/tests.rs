@@ -7981,16 +7981,23 @@ fn publish_dnat_table_entry_failure_increments_counter() {
 // #2345: inbound destination-translation policy is evaluated on the
 // POST-translation destination tuple (Junos parity).
 //
-// For every inbound destination translation that happens BEFORE the
-// route/zone lookup — DNAT, static-DNAT, inbound NPTv6, and NAT64 — the
-// security policy must match on the TRANSLATED (real/internal)
-// destination address + port, in the zone derived from that translated
-// destination. These tests are fail-on-revert: each builds a config
-// where the ORIGINAL (public/virtual) destination and the TRANSLATED
-// (internal) destination would draw DIFFERENT policy verdicts, so the
-// observed forward/deny outcome can only be produced if the match ran on
-// the translated tuple. If the policy lookup reverts to the pre-
-// translation tuple/zone these tests flip and fail.
+// For the SAME-FAMILY inbound destination translations that happen BEFORE
+// the route/zone lookup — DNAT, static-DNAT, and inbound NPTv6 — the
+// security policy must match on the TRANSLATED (real/internal) destination
+// address + port, in the zone derived from that translated destination.
+// These tests are fail-on-revert: each builds a config where the ORIGINAL
+// (public/virtual) destination and the TRANSLATED (internal) destination
+// would draw DIFFERENT policy verdicts, so the observed forward/deny
+// outcome can only be produced if the match ran on the translated tuple.
+// If the policy lookup reverts to the pre-translation tuple/zone these
+// tests flip and fail.
+//
+// NAT64 is DELIBERATELY EXCLUDED from post-translation matching. It is a
+// cross-family translation (IPv6 source, IPv4 destination) and the policy
+// matcher requires same-family src+dst, so NAT64 policy is matched on the
+// SYNTHETIC IPv6 destination (the only same-family tuple available at the
+// policy-eval site), NOT the extracted IPv4 destination. The NAT64 tests
+// below pin that synthetic-IPv6 behavior.
 // =====================================================================
 
 /// v6 ingress meta for the txn harness (TCP, ingress on `ifindex`).
@@ -8472,4 +8479,252 @@ fn inbound_dnat_reverse_session_key_uses_public_facing_tuple() {
         "reverse dst = original external client"
     );
     assert_eq!(reverse.dst_port, 54321, "reverse dst port = original src port");
+}
+
+// =====================================================================
+// #2345 MissingNeighbor (neighbor-ABSENT) cold-path coverage.
+//
+// All the tests above install the next-hop neighbor, so they exercise
+// ONLY the ForwardCandidate policy-eval site. These tests drop the
+// next-hop neighbor so the resolution returns MissingNeighbor and the
+// SEPARATE policy gate at the MissingNeighbor site runs instead. That
+// site reconstructs the post-translation tuple from the merged
+// `decision.nat` (the miss-block `effective_resolution_target` is out of
+// scope there), so a revert there would not be caught by the
+// ForwardCandidate tests.
+//
+// MissingNeighbor verdict signals used below:
+//   - PERMIT: the cold path seeds a MissingNeighborSeed session (forward
+//     + reverse), so `sessions.len() >= 1` and `policy_deny == 0`. The
+//     trigger packet is NOT forwarded yet (it buffers / probes), so
+//     `dbg.tx == 0` on this path even on permit.
+//   - DENY: the deny gate recycles the frame, installs no session, and
+//     bumps `policy_deny` (>= 1). `sessions.len() == 0`.
+// `missing_neigh >= 1` confirms the MissingNeighbor arm was actually the
+// path taken (rather than the flow silently resolving to ForwardCandidate
+// because a neighbor leaked in).
+// =====================================================================
+
+/// Drop a neighbor entry (by IP) from a snapshot so its next hop stays
+/// unresolved → MissingNeighbor.
+fn drop_neighbor(snapshot: &mut ConfigSnapshot, ip: &str) {
+    snapshot.neighbors.retain(|n| n.ip != ip);
+}
+
+/// DNAT MissingNeighbor: a policy permitting ONLY the translated internal
+/// destination must PERMIT (seed a session) the inbound DNAT'd flow when
+/// the internal host's neighbor is unresolved. Proves the MissingNeighbor
+/// site matches on the post-DNAT internal dst. Fails if the MissingNeighbor
+/// eval reverts to flow.dst_ip (the public VIP, uncovered → deny).
+#[test]
+fn policy_inbound_dnat_missing_neighbor_permits_on_translated_dst() {
+    let mut snapshot =
+        inbound_dnat_snapshot(wan_to_lan_permit("10.0.61.102/32", "permit-internal"));
+    drop_neighbor(&mut snapshot, "10.0.61.102");
+    let forwarding = build_forwarding_state(&snapshot);
+    let ha_state = txn_ha_state();
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, 12, 0);
+    binding.interface = Arc::<str>::from("reth0.80");
+    let mut sessions = SessionTable::new();
+
+    let frame = build_txn_tcp_syn_frame_v4(
+        Ipv4Addr::new(198, 51, 100, 10),
+        Ipv4Addr::new(172, 16, 80, 8),
+        54331,
+        443,
+        TCP_FLAG_SYN,
+    );
+    let meta = txn_meta_v4(12, TCP_FLAG_SYN, (frame.len() - 14) as u16);
+    let (_batch, dbg) = txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &frame,
+        meta,
+    );
+
+    assert!(
+        dbg.missing_neigh >= 1,
+        "the unresolved internal host must drive the MissingNeighbor arm"
+    );
+    assert_eq!(
+        dbg.policy_deny, 0,
+        "MissingNeighbor policy on the translated internal dst must NOT deny"
+    );
+    assert!(
+        sessions.len() >= 1,
+        "a permitted MissingNeighbor DNAT flow seeds a session"
+    );
+}
+
+/// DNAT MissingNeighbor fail-on-revert: a policy permitting ONLY the
+/// original public VIP must DENY the inbound DNAT'd flow at the
+/// MissingNeighbor site (the match runs on the post-DNAT internal dst,
+/// which the policy does not cover). Fails if the MissingNeighbor eval
+/// reverts to the pre-DNAT tuple (which would wrongly permit + seed).
+#[test]
+fn policy_inbound_dnat_missing_neighbor_denies_when_only_original_dst_permitted() {
+    let mut snapshot =
+        inbound_dnat_snapshot(wan_to_lan_permit("172.16.80.8/32", "permit-public-vip"));
+    drop_neighbor(&mut snapshot, "10.0.61.102");
+    let forwarding = build_forwarding_state(&snapshot);
+    let ha_state = txn_ha_state();
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, 12, 0);
+    binding.interface = Arc::<str>::from("reth0.80");
+    let mut sessions = SessionTable::new();
+
+    let frame = build_txn_tcp_syn_frame_v4(
+        Ipv4Addr::new(198, 51, 100, 10),
+        Ipv4Addr::new(172, 16, 80, 8),
+        54332,
+        443,
+        TCP_FLAG_SYN,
+    );
+    let meta = txn_meta_v4(12, TCP_FLAG_SYN, (frame.len() - 14) as u16);
+    let (_batch, dbg) = txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &frame,
+        meta,
+    );
+
+    assert!(
+        dbg.policy_deny >= 1,
+        "MissingNeighbor match on the post-DNAT internal dst (uncovered) must deny"
+    );
+    assert_eq!(
+        sessions.len(),
+        0,
+        "a denied MissingNeighbor flow seeds no session"
+    );
+    assert_eq!(dbg.tx, 0, "denied flow does not forward");
+}
+
+/// NPTv6 MissingNeighbor: a policy permitting ONLY the internal prefix
+/// must PERMIT (seed) the inbound external-prefix flow when the internal
+/// host's neighbor is unresolved — proving the MissingNeighbor site uses
+/// the post-NPTv6 internal dst.
+#[test]
+fn policy_inbound_nptv6_missing_neighbor_permits_on_translated_dst() {
+    let mut snapshot = inbound_nptv6_snapshot(wan_to_lan_permit(
+        "fd35:1940:27::/48",
+        "permit-internal-prefix",
+    ));
+    drop_neighbor(&mut snapshot, "fd35:1940:27:100::102");
+    let forwarding = build_forwarding_state(&snapshot);
+    let ha_state = txn_ha_state();
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, 12, 0);
+    binding.interface = Arc::<str>::from("reth0.80");
+    let mut sessions = SessionTable::new();
+
+    let src: Ipv6Addr = "2001:559:8585:80::200".parse().expect("ext client");
+    let dst: Ipv6Addr = "2602:fd41:70:100::102".parse().expect("ext dst");
+    let frame = build_txn_tcp_syn_frame_v6(src, dst, 54331, 443);
+    let meta = txn_meta_v6(12, frame.len());
+    let (_batch, dbg) = txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &frame,
+        meta,
+    );
+
+    assert!(
+        dbg.missing_neigh >= 1,
+        "the unresolved internal host must drive the MissingNeighbor arm"
+    );
+    assert_eq!(
+        dbg.policy_deny, 0,
+        "MissingNeighbor policy on the translated internal prefix must NOT deny"
+    );
+    assert!(
+        sessions.len() >= 1,
+        "a permitted MissingNeighbor NPTv6 flow seeds a session"
+    );
+}
+
+/// NPTv6 MissingNeighbor fail-on-revert: a policy permitting ONLY the
+/// external prefix must DENY at the MissingNeighbor site.
+#[test]
+fn policy_inbound_nptv6_missing_neighbor_denies_when_only_external_prefix_permitted() {
+    let mut snapshot = inbound_nptv6_snapshot(wan_to_lan_permit(
+        "2602:fd41:70::/48",
+        "permit-external-prefix",
+    ));
+    drop_neighbor(&mut snapshot, "fd35:1940:27:100::102");
+    let forwarding = build_forwarding_state(&snapshot);
+    let ha_state = txn_ha_state();
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, 12, 0);
+    binding.interface = Arc::<str>::from("reth0.80");
+    let mut sessions = SessionTable::new();
+
+    let src: Ipv6Addr = "2001:559:8585:80::200".parse().expect("ext client");
+    let dst: Ipv6Addr = "2602:fd41:70:100::102".parse().expect("ext dst");
+    let frame = build_txn_tcp_syn_frame_v6(src, dst, 54332, 443);
+    let meta = txn_meta_v6(12, frame.len());
+    let (_batch, dbg) = txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &frame,
+        meta,
+    );
+
+    assert!(
+        dbg.policy_deny >= 1,
+        "MissingNeighbor match on the post-NPTv6 internal dst (uncovered) must deny"
+    );
+    assert_eq!(sessions.len(), 0);
+}
+
+/// NAT64 MissingNeighbor: directly pins that Copilot's feared "NAT64
+/// default-deny at MissingNeighbor" does NOT happen. With the IPv4 server's
+/// next-hop neighbor (172.16.80.1) unresolved, the NAT64 flow takes the
+/// MissingNeighbor arm; the policy on the SYNTHETIC IPv6 prefix permits it
+/// (NOT default-denied). This holds because at the MissingNeighbor site
+/// NAT64 populates neither nptv6_nat nor pre_routing_dnat, so
+/// `decision.nat.rewrite_dst` is None and `policy_dst_ip` falls back to
+/// `flow.dst_ip` (the synthetic IPv6 dst) — exactly the ForwardCandidate
+/// NAT64 exclusion. If the fallback were reverted to unconditionally feed
+/// the extracted IPv4 dst, the synthetic-V6 policy would no longer match
+/// (cross-family) and this flow would default-deny — failing this test.
+#[test]
+fn policy_inbound_nat64_missing_neighbor_permits_on_synthetic_v6_not_default_deny() {
+    let mut snapshot =
+        nat64_snapshot(lan_to_wan_permit("64:ff9b::/96", "permit-synthetic-v6"));
+    // Unresolve the IPv4 server's next hop so the NAT64 flow hits
+    // MissingNeighbor instead of ForwardCandidate.
+    drop_neighbor(&mut snapshot, "172.16.80.1");
+    let forwarding = build_forwarding_state(&snapshot);
+    let ha_state = txn_ha_state();
+    let mut binding = BindingWorker::new_for_mirror_test(0, 0, 24, 0);
+    binding.interface = Arc::<str>::from("reth1.0");
+    let mut sessions = SessionTable::new();
+
+    let src: Ipv6Addr = "2001:559:8585:ef00::102".parse().expect("v6 client");
+    let dst: Ipv6Addr = "64:ff9b::808:808".parse().expect("nat64 dst");
+    let frame = build_txn_tcp_syn_frame_v6(src, dst, 12345, 443);
+    let meta = txn_meta_v6(24, frame.len());
+    let (_batch, dbg) = txn_run_descriptor(
+        &mut binding,
+        &mut sessions,
+        &forwarding,
+        &ha_state,
+        &frame,
+        meta,
+    );
+
+    assert!(
+        dbg.missing_neigh >= 1,
+        "the unresolved IPv4 next hop must drive the NAT64 flow to MissingNeighbor"
+    );
+    assert_eq!(
+        dbg.policy_deny, 0,
+        "NAT64 MissingNeighbor must match the synthetic IPv6 policy, NOT default-deny"
+    );
 }
