@@ -31,6 +31,19 @@ type cliCompleter struct {
 	helpWritten bool // set by ? Listener to suppress duplicate help from Do()
 }
 
+// helpWriter returns the io.Writer that completion help is drawn to. It is the
+// readline-managed stdout when a readline instance is wired (the live CLI),
+// and io.Discard otherwise. The nil guard lets Do() run without a readline
+// instance — both for tests that drive the completer directly and as a
+// defensive measure against a completion firing before Run() wires c.rl
+// (#2288).
+func (cc *cliCompleter) helpWriter() io.Writer {
+	if cc.cli != nil && cc.cli.rl != nil {
+		return cc.cli.rl.Stdout()
+	}
+	return io.Discard
+}
+
 func (cc *cliCompleter) Do(line []rune, pos int) ([][]rune, int) {
 	// If the ? Listener already wrote help, suppress duplicate output.
 	if cc.helpWritten {
@@ -52,17 +65,20 @@ func (cc *cliCompleter) Do(line []rune, pos int) ([][]rune, int) {
 
 		sort.Slice(pipeCandidates, func(i, j int) bool { return pipeCandidates[i].name < pipeCandidates[j].name })
 		if len(pipeCandidates) == 1 {
-			suffix := pipeCandidates[0].name[len(partial):]
+			suffix, ok := completionSuffix(pipeCandidates[0].name, partial)
+			if !ok {
+				return nil, 0
+			}
 			return [][]rune{[]rune(suffix + " ")}, len(partial)
 		}
-		writeCompletionHelp(cc.cli.rl.Stdout(), pipeCandidates)
+		writeCompletionHelp(cc.helpWriter(), pipeCandidates)
 		names := make([]string, len(pipeCandidates))
 		for i, c := range pipeCandidates {
 			names[i] = c.name
 		}
 		cp := commonPrefix(names)
-		suffix := cp[len(partial):]
-		if suffix == "" {
+		suffix, ok := completionSuffix(cp, partial)
+		if !ok || suffix == "" {
 			return nil, 0
 		}
 		return [][]rune{[]rune(suffix)}, len(partial)
@@ -106,12 +122,15 @@ func (cc *cliCompleter) Do(line []rune, pos int) ([][]rune, int) {
 	sort.Slice(candidates, func(i, j int) bool { return candidates[i].name < candidates[j].name })
 
 	if len(candidates) == 1 {
-		suffix := candidates[0].name[len(partial):]
+		suffix, ok := completionSuffix(candidates[0].name, partial)
+		if !ok {
+			return nil, 0
+		}
 		return [][]rune{[]rune(suffix + " ")}, len(partial)
 	}
 
 	// Multiple matches: show descriptions above prompt.
-	writeCompletionHelp(cc.cli.rl.Stdout(), candidates)
+	writeCompletionHelp(cc.helpWriter(), candidates)
 
 	// Complete common prefix.
 	names := make([]string, len(candidates))
@@ -119,8 +138,8 @@ func (cc *cliCompleter) Do(line []rune, pos int) ([][]rune, int) {
 		names[i] = c.name
 	}
 	cp := commonPrefix(names)
-	suffix := cp[len(partial):]
-	if suffix == "" {
+	suffix, ok := completionSuffix(cp, partial)
+	if !ok || suffix == "" {
 		return nil, 0
 	}
 	return [][]rune{[]rune(suffix)}, len(partial)
@@ -317,6 +336,22 @@ func showConfigurationSubPath(words []string) ([]string, bool) {
 // commonPrefix returns the longest shared prefix among the given strings.
 func commonPrefix(items []string) string {
 	return cmdtree.CommonPrefix(items)
+}
+
+// completionSuffix returns the portion of name that follows the already-typed
+// partial, suitable for echoing back to readline. It guards the slice
+// expression name[len(partial):] against panics: candidate names can be
+// SHORTER than the typed partial (e.g. an over-typed token like "show f zzzzz"
+// where cmdtree returns the unfiltered "f" matches and commonPrefix("filter",
+// "flow") = "f" is shorter than "zzzzz"), and they need not even share a prefix
+// with partial. Returns (suffix, true) only when name is a genuine extension of
+// partial (name has partial as a prefix); otherwise (\"\", false) so callers
+// emit no completion instead of crashing (#2288).
+func completionSuffix(name, partial string) (string, bool) {
+	if len(partial) > len(name) || !strings.HasPrefix(name, partial) {
+		return "", false
+	}
+	return name[len(partial):], true
 }
 
 // pipeFilters defines the available pipe filter names and descriptions.
