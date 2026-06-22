@@ -1,0 +1,185 @@
+//! #2238: parse a LOCALLY-GENERATED reply frame (the bytes the dataplane
+//! built in response to an inbound packet) back into a classification key.
+//!
+//! Locally-generated control frames — ICMP/ICMPv6 Time Exceeded, the
+//! policy-`reject` TCP RST / ICMP-unreachable, and SYN-cookie SYN-ACK /
+//! ACK-RST — are *reflections* of the inbound packet (MAC swap, IP swap,
+//! frequently a protocol change). Their true egress 5-tuple is the reverse
+//! of the trigger, with ICMP/ICMPv6 as the protocol for the error cases.
+//! Classifying them by the *trigger* tuple (what the pre-#2238 code did)
+//! means an output firewall filter / CoS forwarding-class / DSCP rewrite
+//! keyed on the GENERATED packet never fires (or the wrong term fires).
+//!
+//! [`generated_reply_session_key`] walks the BUILT bytes (the same byte
+//! layout the `build_*` reflectors emit) and returns the generated frame's
+//! own `(SessionKey, ForwardPacketMeta)` so the shared classifier
+//! ([`crate::afxdp::tx::classify_generated_reply`]) can evaluate the egress
+//! output filter + CoS against the reply's real tuple.
+//!
+//! This reuses [`super::frame_l3_offset`] (the single L2/VLAN walker) so
+//! there is ONE parser of wire bytes, not a second hand-rolled one. ICMP /
+//! ICMPv6 carry no L4 ports; ports are reported as 0 — the output filter's
+//! ICMP terms key on protocol (+ optionally addresses), never on L4 ports
+//! (Junos has no `port` match for ICMP), and the TX-selection evaluator
+//! takes ports as `u16` with 0 the natural "no port" sentinel (same as how
+//! ICMP is keyed everywhere else in the dataplane).
+//!
+//! Cold path only — every caller is on a generator's exception arm
+//! (`#[cold]` reject/cookie bodies, or the TTL<=1 Time Exceeded path). No
+//! hot-path cost.
+
+use super::frame_l3_offset;
+use super::*;
+
+/// Parse a locally-generated reply frame into its own egress
+/// `(SessionKey, ForwardPacketMeta)`.
+///
+/// Returns `None` on any parse failure (truncated header, unknown family,
+/// over-bound IPv6 extension chain). The caller MUST fail CLOSED on `None`
+/// (#2238 §6.2): an output-filter terminal `discard`/`reject` is a security
+/// boundary, so a reply whose own bytes cannot be classified is DROPPED, not
+/// leaked past the filter. The bytes are our own, so `None` is a logic bug —
+/// the caller attributes it on a dedicated parse-error counter.
+///
+/// The returned `ForwardPacketMeta`:
+///   - `addr_family` / `protocol` / `dscp` are read from the generated L3
+///     header;
+///   - `flow_src_port` / `flow_dst_port` carry the L4 ports for TCP/UDP, or
+///     0 for ICMP/ICMPv6;
+///   - `pkt_len` is the L3-onwards length of the generated frame (what the
+///     output-filter byte counter should be charged);
+///   - `ingress_*` fields are left neutral/zero: the reply is host-
+///     originated, so it has no meaningful ingress PCP/VLAN for an IEEE-802.1
+///     classifier. The egress output filter + DSCP classifier are the
+///     relevant inputs, and both key off the fields populated above.
+pub(in crate::afxdp) fn generated_reply_session_key(
+    frame: &[u8],
+) -> Option<(SessionKey, ForwardPacketMeta)> {
+    let l3 = frame_l3_offset(frame)?;
+    let packet = frame.get(l3..)?;
+    let version = (packet.first()? >> 4) & 0x0f;
+    match version {
+        4 => parse_generated_v4(packet, l3),
+        6 => parse_generated_v6(packet, l3),
+        _ => None,
+    }
+}
+
+fn parse_generated_v4(packet: &[u8], l3_offset: usize) -> Option<(SessionKey, ForwardPacketMeta)> {
+    if packet.len() < 20 {
+        return None;
+    }
+    let ihl = usize::from(packet[0] & 0x0f) * 4;
+    if ihl < 20 || packet.len() < ihl {
+        return None;
+    }
+    // ToS byte: DSCP is the top 6 bits.
+    let dscp = packet[1] >> 2;
+    let protocol = packet[9];
+    let src_ip = IpAddr::V4(Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]));
+    let dst_ip = IpAddr::V4(Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]));
+    // IPv4 total length bounds the L3-onward byte count; clamp to the slice
+    // so a built frame with trailing slack does not over-charge the filter
+    // byte counter.
+    let total_len = u16::from_be_bytes([packet[2], packet[3]]) as usize;
+    let pkt_len = total_len.clamp(ihl, packet.len());
+    let (src_port, dst_port) = generated_l4_ports(packet, ihl, protocol);
+    finish_generated_key(
+        libc::AF_INET as u8,
+        protocol,
+        src_ip,
+        dst_ip,
+        src_port,
+        dst_port,
+        dscp,
+        pkt_len,
+        l3_offset,
+        ihl,
+    )
+}
+
+fn parse_generated_v6(packet: &[u8], l3_offset: usize) -> Option<(SessionKey, ForwardPacketMeta)> {
+    if packet.len() < 40 {
+        return None;
+    }
+    // Traffic class spans the low nibble of byte 0 and the high nibble of
+    // byte 1: tc[7:0] = (byte0[3:0] << 4) | (byte1[7:4]); DSCP is tc[7:2].
+    let traffic_class = ((packet[0] & 0x0f) << 4) | (packet[1] >> 4);
+    let dscp = traffic_class >> 2;
+    let src_ip = IpAddr::V6(Ipv6Addr::from(<[u8; 16]>::try_from(packet.get(8..24)?).ok()?));
+    let dst_ip = IpAddr::V6(Ipv6Addr::from(<[u8; 16]>::try_from(packet.get(24..40)?).ok()?));
+    let payload_len = u16::from_be_bytes([packet[4], packet[5]]) as usize;
+    let pkt_len = (40usize.saturating_add(payload_len)).clamp(40, packet.len());
+    // Walk the extension-header chain to the L4 protocol + offset (bounded,
+    // fail-closed at the bound — same contract as the forwarding walkers).
+    let (rel_l4, protocol) = packet_rel_l4_offset_and_protocol(packet, libc::AF_INET6 as u8)?;
+    let (src_port, dst_port) = generated_l4_ports(packet, rel_l4, protocol);
+    finish_generated_key(
+        libc::AF_INET6 as u8,
+        protocol,
+        src_ip,
+        dst_ip,
+        src_port,
+        dst_port,
+        dscp,
+        pkt_len,
+        l3_offset,
+        rel_l4,
+    )
+}
+
+/// L4 ports for the generated frame: real ports for TCP/UDP, 0/0 for
+/// ICMP/ICMPv6 (no transport ports) and anything else.
+fn generated_l4_ports(packet: &[u8], rel_l4: usize, protocol: u8) -> (u16, u16) {
+    match protocol {
+        PROTO_TCP | PROTO_UDP => packet
+            .get(rel_l4..rel_l4 + 4)
+            .map(|b| {
+                (
+                    u16::from_be_bytes([b[0], b[1]]),
+                    u16::from_be_bytes([b[2], b[3]]),
+                )
+            })
+            .unwrap_or((0, 0)),
+        _ => (0, 0),
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn finish_generated_key(
+    addr_family: u8,
+    protocol: u8,
+    src_ip: IpAddr,
+    dst_ip: IpAddr,
+    src_port: u16,
+    dst_port: u16,
+    dscp: u8,
+    pkt_len: usize,
+    l3_offset: usize,
+    rel_l4: usize,
+) -> Option<(SessionKey, ForwardPacketMeta)> {
+    let key = SessionKey {
+        addr_family,
+        protocol,
+        src_ip,
+        dst_ip,
+        src_port,
+        dst_port,
+    };
+    let meta = ForwardPacketMeta {
+        addr_family,
+        protocol,
+        dscp,
+        l3_offset: u16::try_from(l3_offset).unwrap_or(0),
+        l4_offset: u16::try_from(l3_offset.saturating_add(rel_l4)).unwrap_or(0),
+        pkt_len: u16::try_from(pkt_len).unwrap_or(u16::MAX),
+        flow_src_port: src_port,
+        flow_dst_port: dst_port,
+        ..ForwardPacketMeta::default()
+    };
+    Some((key, meta))
+}
+
+#[cfg(test)]
+#[path = "generated_tests.rs"]
+mod tests;

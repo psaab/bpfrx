@@ -257,6 +257,7 @@ pub(super) fn poll_binding_process_descriptor(
                     StageOutcome::Continue(ScreenCheckOutcome::SynCookieChallenge(challenge)) => {
                         enqueue_syn_cookie_reply(
                             &mut binding.tx_pipeline,
+                            worker_ctx.forwarding,
                             binding.ifindex,
                             packet_frame,
                             meta,
@@ -496,6 +497,7 @@ pub(super) fn poll_binding_process_descriptor(
                                 worker_ctx.dynamic_neighbors,
                                 worker_ctx.ha_state,
                                 now_secs,
+                                telemetry.counters,
                             );
                             if let Some(request) = local_icmp_te {
                                 binding.scratch.scratch_forwards.push(request);
@@ -527,6 +529,7 @@ pub(super) fn poll_binding_process_descriptor(
                             StageOutcome::Continue(SynCookieAckOutcome::Validated) => {
                                 enqueue_syn_cookie_reply(
                                     &mut binding.tx_pipeline,
+                                    worker_ctx.forwarding,
                                     binding.ifindex,
                                     packet_frame,
                                     meta,
@@ -1510,6 +1513,7 @@ pub(super) fn poll_binding_process_descriptor(
                                     worker_ctx.dynamic_neighbors,
                                     worker_ctx.ha_state,
                                     now_secs,
+                                    telemetry.counters,
                                 );
                                 if let Some(request) = local_icmp_te {
                                     if let Some(release_key) = source_nat_release_key.as_ref() {

@@ -48,6 +48,28 @@ pub(super) fn enqueue_policy_reject_reply(
         return false;
     };
 
+    // #2238: classify the GENERATED reply (TCP RST or ICMP/ICMPv6
+    // unreachable) by its OWN egress 5-tuple + egress interface — the
+    // reflected reply egresses on the interface it arrived on, so
+    // `ingress_ifindex` IS the egress. An output firewall filter terminal
+    // `discard`/`reject` (or three-color policer) on that interface drops
+    // the reply; a parse failure of our own built bytes fails CLOSED (§6.2).
+    // Pre-#2238 this enqueued an UNCLASSIFIED TxRequest (`cos_queue_id:
+    // None, dscp_rewrite: None`) that the drain path honored verbatim — no
+    // output filter / CoS / DSCP was ever applied to the reply.
+    let now_ns = monotonic_nanos();
+    let verdict = classify_generated_reply(forwarding, ingress_ifindex, &bytes, now_ns);
+    if verdict.drop {
+        counters.touched = true;
+        if verdict.parse_error {
+            counters.generated_reply_classify_parse_errors += 1;
+        } else {
+            counters.policy_reject_output_filter_drops += 1;
+        }
+        // Fail-closed to the silent drop the caller already performs.
+        return false;
+    }
+
     tx_pipeline.pending_tx_local.push_back(TxRequest {
         bytes,
         expected_ports: None,
@@ -55,8 +77,8 @@ pub(super) fn enqueue_policy_reject_reply(
         expected_protocol: meta.protocol,
         flow_key: Some(flow.forward_key.clone()),
         egress_ifindex: ingress_ifindex,
-        cos_queue_id: None,
-        dscp_rewrite: None,
+        cos_queue_id: verdict.cos_queue_id,
+        dscp_rewrite: verdict.dscp_rewrite,
         mirror_clone: false,
         enqueue_ns: 0,
     });

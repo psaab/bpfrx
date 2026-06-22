@@ -1311,6 +1311,7 @@ fn build_local_time_exceeded_request_returns_prebuilt_forward_for_ttl_expiry() {
         &Arc::new(ShardedNeighborMap::new()),
         &BTreeMap::new(),
         0,
+        &mut BatchCounters::default(),
     )
     .expect("ttl-expiring session/flow-cache hit should enqueue local TE");
 
@@ -1322,17 +1323,27 @@ fn build_local_time_exceeded_request_returns_prebuilt_forward_for_ttl_expiry() {
     assert!(matches!(request.frame, PendingForwardFrame::Prebuilt(_)));
 }
 
+/// #2238: the generated ICMP Time Exceeded is classified by its OWN egress
+/// tuple, so an OUTPUT firewall filter + three-color policer on the egress
+/// interface (matching `protocol icmp`) drops it — and the drop lands on the
+/// dedicated `time_exceeded_output_filter_drops` counter, not the trigger's
+/// ingress input policer. Pre-#2238 the trigger's tuple was used, so an
+/// *input* policer on the ingress interface keyed off the TCP/UDP trigger;
+/// that is exactly the bug this fixes (the reply's own egress treatment was
+/// never consulted).
 #[test]
-fn build_local_time_exceeded_request_meters_icmp_flow_key() {
+fn build_local_time_exceeded_request_classifies_generated_icmp_on_egress() {
     let client_ip = Ipv4Addr::new(10, 0, 61, 102);
     let dst_ip = Ipv4Addr::new(1, 1, 1, 1);
-    let frame = build_icmp_echo_frame_v4(client_ip, dst_ip, 1);
+    // The TRIGGER is a UDP flow (proto 17) — proving the egress filter keys
+    // off the GENERATED ICMP reply, not the UDP trigger.
+    let frame = build_udp_frame_v4_full([0x00, 0x25, 0x90, 0x12, 0x34, 0x56], client_ip, dst_ip, 1);
     let meta = UserspaceDpMeta {
         l3_offset: 14,
         l4_offset: 34,
         ingress_ifindex: 5,
         addr_family: libc::AF_INET as u8,
-        protocol: PROTO_ICMP,
+        protocol: PROTO_UDP,
         pkt_len: 128,
         ..UserspaceDpMeta::default()
     };
@@ -1348,21 +1359,13 @@ fn build_local_time_exceeded_request_meters_icmp_flow_key() {
         interface: Arc::<str>::from("ge-0-0-1"),
         ifindex: 5,
     };
-    let flow = SessionFlow {
-        src_ip: IpAddr::V4(client_ip),
-        dst_ip: IpAddr::V4(dst_ip),
-        forward_key: SessionKey {
-            addr_family: libc::AF_INET as u8,
-            protocol: PROTO_ICMP,
-            src_ip: IpAddr::V4(client_ip),
-            dst_ip: IpAddr::V4(dst_ip),
-            src_port: 0x1234,
-            dst_port: 0,
-        },
-    };
+    let flow = icmp_suppress_flow_v4(client_ip, dst_ip);
+    // OUTPUT filter on the egress interface (ifindex 5) with an ICMP
+    // three-color policer that red-drops. A term matching `protocol icmp`
+    // only fires for the GENERATED reply (the trigger is UDP).
     let filter_state = crate::filter::parse_filter_state_with_three_color(
         &[FirewallFilterSnapshot {
-            name: "policed-icmp".into(),
+            name: "policed-icmp-out".into(),
             family: "inet".into(),
             terms: vec![FirewallTermSnapshot {
                 name: "meter-icmp".into(),
@@ -1386,10 +1389,10 @@ fn build_local_time_exceeded_request_meters_icmp_flow_key() {
         &[crate::InterfaceSnapshot {
             name: "ge-0/0/1.0".into(),
             ifindex: 5,
-            filter_input_v4: "policed-icmp".into(),
+            filter_output_v4: "policed-icmp-out".into(),
             ..Default::default()
         }],
-        "policed-icmp",
+        "policed-icmp-out",
         "",
     );
     let mut forwarding = ForwardingState {
@@ -1411,6 +1414,7 @@ fn build_local_time_exceeded_request_meters_icmp_flow_key() {
         },
     );
 
+    let mut counters = BatchCounters::default();
     let request = build_local_time_exceeded_request(
         &frame,
         desc,
@@ -1421,12 +1425,18 @@ fn build_local_time_exceeded_request_meters_icmp_flow_key() {
         &Arc::new(ShardedNeighborMap::new()),
         &BTreeMap::new(),
         0,
+        &mut counters,
     );
 
     assert!(
         request.is_none(),
-        "red-drop policer should reject the generated ICMP response"
+        "egress output-filter red-drop policer should reject the generated ICMP reply"
     );
+    assert_eq!(
+        counters.time_exceeded_output_filter_drops, 1,
+        "the output-filter drop must land on the dedicated TE counter"
+    );
+    assert_eq!(counters.generated_reply_classify_parse_errors, 0);
     let status = forwarding.filter_state.three_color_policer_statuses();
     assert_eq!(status[0].red_packets, 1);
     assert_eq!(status[0].drop_packets, 1);
@@ -1740,6 +1750,7 @@ fn te_request_built(frame: &[u8], meta: UserspaceDpMeta) -> bool {
         &Arc::new(ShardedNeighborMap::new()),
         &BTreeMap::new(),
         0,
+        &mut BatchCounters::default(),
     )
     .is_some()
 }
@@ -1793,6 +1804,7 @@ fn time_exceeded_emitted_for_unicast_udp() {
         &Arc::new(ShardedNeighborMap::new()),
         &BTreeMap::new(),
         0,
+        &mut BatchCounters::default(),
     );
     assert!(
         req.is_some(),
@@ -1858,6 +1870,7 @@ fn time_exceeded_suppressed_for_inbound_icmp_error_v4() {
         &Arc::new(ShardedNeighborMap::new()),
         &BTreeMap::new(),
         0,
+        &mut BatchCounters::default(),
     );
     assert!(req.is_none(), "no Time Exceeded for an inbound ICMP error");
     // An echo *request* (a query, type 8) is NOT suppressed.

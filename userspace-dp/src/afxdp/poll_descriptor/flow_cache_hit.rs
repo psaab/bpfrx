@@ -177,6 +177,7 @@ pub(super) fn stage_flow_cache_hit(
                 worker_ctx.dynamic_neighbors,
                 worker_ctx.ha_state,
                 now_secs,
+                telemetry.counters,
             );
             if let Some(request) = local_icmp_te {
                 scratch.scratch_forwards.push(request);
