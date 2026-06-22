@@ -1,5 +1,36 @@
 # Action Log
 
+## 2026-06-22 — #2334 WG recvmsg cmsg buffer alignment fix
+
+- **Timestamp**: 2026-06-22 PDT
+- **Action**: Fixed the latent UB in the #2317 WG decap-ECN recv path: the
+  `recvmsg` control buffer was a bare `[u8; 256]` (alignment 1), but the
+  `CMSG_FIRSTHDR`/`CMSG_NXTHDR` macros and `parse_outer_ecn_from_cmsg`
+  dereference a `*const cmsghdr` (alignment 8 on LP64) pointing into it to
+  read the multi-byte `cmsg_len`/`cmsg_level`/`cmsg_type` header fields —
+  an unaligned access (UB in Rust; SIGBUS / alignment-trap risk on
+  strict-alignment targets such as ARMv8, which xpf also targets per
+  #2332/#1958). Introduced a `#[repr(C, align(8))] struct CmsgBuf([u8;
+  256])` newtype (matching the codebase's existing `#[repr(align(N))]`
+  idiom) and point `msg_control` at `cmsg_space.0.as_mut_ptr()` /
+  `msg_controllen = cmsg_space.0.len()`. Added a fail-on-revert
+  compile-time sentinel `const _: () = assert!(align_of::<CmsgBuf>() >=
+  align_of::<libc::cmsghdr>())` that breaks the build if the alignment is
+  ever dropped (verified: removing `align(8)` produces the #2334 panic).
+  Routed the #2317 `parse_ecn_with_cmsg` test helper through the same
+  `CmsgBuf` so the synthetic cmsg is align-8 like production. Updated the
+  inaccurate SAFETY comment that claimed only payload bytes were read. The
+  #2317 cmsg_len underflow guard and the `MSG_CTRUNC` skip are untouched —
+  this PR changes ONLY the buffer's alignment, not the parse logic. No wire
+  field changed.
+- **File(s)**: userspace-dp/src/afxdp/coordinator/wg_control.rs (CmsgBuf
+  newtype + static assertion, wg_recvmsg buffer, parse SAFETY comment,
+  parse_ecn_with_cmsg test helper).
+- **Validation**: `cargo build --release` clean (static-assert compiles);
+  `cargo test --release --bin xpf-userspace-dp -- cmsg wg_recv outer_ecn
+  wg_control` 17/0, stable 5x; sentinel verified to fail compilation when
+  `align(8)` is removed.
+
 ## 2026-06-22 — #2317 WG decap RFC 6040 §4.2 ECN combine
 
 - **Timestamp**: 2026-06-22 PDT
