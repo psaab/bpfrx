@@ -1190,6 +1190,15 @@ func (d *Daemon) applyConfigLocked(cfg *config.Config) error {
 	// to the next clean commit.
 	d.reconcileFlowExporters(cfg)
 
+	// 16c. Reconcile the DHCP relay (#2348). Before this the relay was
+	// applied only at boot (daemon_run.go), so a day-2 commit that added,
+	// removed, or changed a `forwarding-options dhcp-relay` group was
+	// ignored until a daemon restart. Manager.Apply diffs desired-vs-running
+	// per interface (start added, stop removed, restart changed, leave
+	// unchanged) and a nil relay config stops all relays. Bound to
+	// d.daemonCtx so the relay goroutines outlive this apply call.
+	d.reconcileDHCPRelay(cfg)
+
 	// 17. Update event-options policies (RPM-driven failover)
 	if d.eventEngine != nil {
 		d.eventEngine.Apply(cfg.EventOptions)
@@ -1337,6 +1346,27 @@ func (d *Daemon) setDataplaneDeferWorkers(deferWorkers bool) {
 		return
 	}
 	d.dp.Link().SetDeferWorkers(deferWorkers)
+}
+
+// reconcileDHCPRelay re-applies the DHCP relay config on every commit (#2348).
+// The relay Manager is created at boot (daemon_run.go) regardless of whether a
+// relay was configured then, so a relay added on a day-2 commit starts here and
+// a relay removed here stops. Manager.Apply diffs desired-vs-running per
+// interface (start added / stop removed / restart changed / leave unchanged),
+// and a nil relay config stops all relays. The relay goroutines bind to
+// d.daemonCtx (the daemon lifetime) — NOT a request-scoped context — so they
+// survive past this apply call and are torn down only at daemon stop. Guarded
+// on d.dhcpRelay so a daemon constructed without a relay Manager (e.g. a test
+// harness or NoDataplane boot that skipped the boot wiring) is a safe no-op.
+func (d *Daemon) reconcileDHCPRelay(cfg *config.Config) {
+	if d.dhcpRelay == nil {
+		return
+	}
+	ctx := d.daemonCtx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	d.dhcpRelay.Apply(ctx, cfg.ForwardingOptions.DHCPRelay)
 }
 
 func (d *Daemon) publishInitialPolicySchedulerStateLocked(cfg *config.Config, activeState map[string]bool, applyResult *dataplane.ApplyResult) {
