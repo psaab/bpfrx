@@ -1,4 +1,4 @@
-use io_uring::{IoUring, opcode, types};
+use io_uring::IoUring;
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::os::fd::AsRawFd;
@@ -209,40 +209,12 @@ fn sync_parent_dir(dest: &str) -> Result<(), String> {
 }
 
 fn write_all_with_ring(ring: &mut IoUring, fd: i32, data: &[u8]) -> Result<(), String> {
-    let mut offset = 0usize;
-    while offset < data.len() {
-        let entry = opcode::Write::new(
-            types::Fd(fd),
-            unsafe { data.as_ptr().add(offset) },
-            (data.len() - offset) as _,
-        )
-        .offset(offset as _)
-        .build()
-        .user_data(1);
-        unsafe {
-            ring.submission()
-                .push(&entry)
-                .map_err(|_| "submit queue full".to_string())?;
-        }
-        ring.submit_and_wait(1)
-            .map_err(|e| format!("submit io_uring write: {e}"))?;
-        let mut completion = ring.completion();
-        let cqe = completion
-            .next()
-            .ok_or_else(|| "missing io_uring completion".to_string())?;
-        let res = cqe.result();
-        if res < 0 {
-            return Err(format!(
-                "io_uring write failed: {}",
-                io::Error::from_raw_os_error(-res)
-            ));
-        }
-        if res == 0 {
-            return Err("io_uring short write: 0".to_string());
-        }
-        offset += res as usize;
-    }
-    Ok(())
+    // Positioned write to the temp state file. The shared loop retries the wait
+    // on EINTR rather than abandoning an in-flight SQE, matches the completion
+    // by user_data so a stale CQE cannot corrupt the file offset, and returns
+    // only after the matching CQE is reaped so `data` outlives every kernel
+    // reference (#2297).
+    crate::io_uring_write::write_all_to_fd(ring, fd, data, true, "state")
 }
 
 fn temporary_path(path: &str) -> PathBuf {

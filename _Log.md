@@ -30,6 +30,71 @@
   tunnel_tests.rs; pkg/routing/tunnel.go,
   pkg/routing/tunnel_reconcile_test.go; docs/wireguard-interop.md;
   docs/pr/2299-2300-2303-wg-mtu-ecn/plan.md.
+## 2026-06-21 — #2293 IPv6 ping-of-death screen (was IPv4-only)
+
+- **Timestamp**: 2026-06-21
+- **Action**: Implemented IPv6 ping-of-death detection in the
+  `ping-death` screen, which was silently IPv4-only. Added two fields to
+  `ScreenPacketInfo` (`ip_payload_len` — the IPv6 base-header payload
+  length; `frag_data_off` — payload-region bytes consumed by ext headers
+  up to and including the fragment header) populated in `extract.rs`.
+  `check_ping_of_death` now applies the per-fragment oversize formula to
+  AF_INET6: `offset_bytes (frag_off & 0xFFF8) + (ip_payload_len -
+  frag_data_off) > 65535 -> drop`, mirroring the v4 path and firing for
+  any IPv6 protocol on fragments only. Removed the "IPv6 ... not covered"
+  doc note. Added 5 tests (oversize ICMPv6 + UDP drop, in-bounds pass,
+  non-fragment pass, profile-disabled pass) plus an `ipv6_fragment`
+  fixture helper.
+- **File(s)**: userspace-dp/src/screen/packet.rs,
+  userspace-dp/src/screen/extract.rs,
+  userspace-dp/src/screen/stateless.rs,
+  userspace-dp/src/screen/tests.rs,
+  userspace-dp/src/afxdp/event_emit.rs (ScreenPacketInfo field additions)
+
+## 2026-06-21 — #2292 IPv6 forwarding ext-walker fail-closed at bound (parity with screen)
+
+- **Timestamp**: 2026-06-21
+- **Action**: Made the IPv6 forwarding extension-header walkers fail
+  CLOSED at the chain bound and raised the bound from 6 to 8 to match
+  the screen path. Added `MAX_IPV6_EXT_HEADERS = 8` in inspect.rs and
+  switched `frame_l4_offset`, `packet_rel_l4_offset`,
+  `packet_rel_l4_offset_and_protocol`, and `ipv6_is_non_first_fragment`
+  to that bound. The post-loop terminal arms now return `None` instead
+  of surrendering the unconsumed ext-header offset (and a fake
+  `proto=0`). gre.rs `parse_inner_protocol_and_offsets` drops any
+  unresolved/ext-header sentinel (0/43/51/59/60) rather than forwarding
+  it. Rewrote the pin test to assert fail-closed (was pinning the buggy
+  surrender-open behavior).
+- **File(s)**: userspace-dp/src/afxdp/frame/inspect.rs,
+  userspace-dp/src/afxdp/frame/mod.rs,
+  userspace-dp/src/afxdp/gre.rs,
+  userspace-dp/src/afxdp/frame/prop_tests/inspect.rs
+## 2026-06-21 — #2297 io_uring EINTR retry + CQE match-by-user_data (slow path / state writer)
+
+- **Timestamp**: 2026-06-21
+- **Action**: Fixed two io_uring defects in the slow-path TUN reinjector
+  (`write_packet_io_uring`) and the state writer (`write_all_with_ring`).
+  Both pushed one Write SQE, called `submit_and_wait(1)`, then reaped one
+  CQE. The io-uring crate does not retry EINTR, so a signal during the wait
+  returned Err with the SQE already submitted and the CQE unreaped:
+  (a) the next write on the reused ring reaped the leftover CQE and applied
+  the prior write's byte count to the new buffer's offset (silent
+  truncation / OOB offset); (b) an io-wq-punted write could read the
+  caller's buffer after it was dropped (UAF). Fix factors both sites onto a
+  shared write loop in a new `io_uring_write` module that: retries the wait
+  on EINTR/error (never abandoning an in-flight SQE; the crate recomputes
+  to_submit from the now-empty SQ so the retry is wait-only, bounded by a
+  retry ceiling), tags each submission with a distinct monotonic user_data
+  and matches the CQE by it (draining/discarding stale CQEs), and returns
+  only after the matching CQE is reaped so the buffer outlives every kernel
+  reference. Fast forwarding path untouched. Retry/drain logic exercised via
+  a `RingPort` trait seam (io_uring is unavailable in the build sandbox):
+  EINTR-retry full-count, stale-CQE-skip, short/negative-result errors,
+  positioned multi-chunk. Validated: release build clean; io_uring_write
+  8/8, state_writer 4/4, slowpath 2/2; `go build ./...` clean.
+- **File(s)**: userspace-dp/src/io_uring_write.rs (new),
+  userspace-dp/src/main.rs, userspace-dp/src/slowpath.rs,
+  userspace-dp/src/state_writer.rs, _Log.md
 
 ## 2026-06-21 — #2295 + #2302 pkg/logging syslog follow-ups
 
@@ -67,6 +132,33 @@
 - **File(s)**: pkg/logging/slog_handler.go, pkg/logging/goid.go,
   pkg/logging/syslog.go, pkg/logging/syslog_reentrancy_test.go,
   pkg/logging/syslog_resilience_test.go, pkg/logging/README.md
+
+## 2026-06-21 — #2290 + #2291 NAT64 ext-header walk + fail-closed empty-pool
+
+- **Timestamp**: 2026-06-21
+- **Action**: #2290 — walk the IPv6 extension-header chain in the NAT64
+  v6->v4 translator (`write_v6_to_v4_into`) and the embedded ICMP-error
+  path (`translate_embedded_v6_to_v4`) instead of assuming L4 at fixed
+  offset 40 / reading the raw next-header. Added local bounded walker
+  `ipv6_l4_offset_and_protocol` + `ipv6_is_non_first_fragment` to
+  nat64.rs (does not reach into crate::afxdp, which depends on nat64;
+  unification tracked #2292). Fail closed on non-first fragments.
+  #2291 — tri-state `Nat64Match` enum + `classify_ipv6_dest`: a matched
+  NAT64 prefix with no allocatable source pool now DROPS + bumps the new
+  `nat64_no_source_pool` counter instead of falling through to plain IPv6
+  route lookup on the synthetic destination (was fail-open). Counter wired
+  BatchCounters -> BindingLiveState -> snapshot -> BindingStatus JSON ->
+  Go protocol.go + format/status.go operator line.
+- **File(s)**: userspace-dp/src/nat64.rs,
+  userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/mod.rs, userspace-dp/src/afxdp/umem/mod.rs,
+  userspace-dp/src/afxdp/umem/snapshot.rs,
+  userspace-dp/src/afxdp/worker/mod.rs,
+  userspace-dp/src/afxdp/coordinator/refresh_bindings.rs,
+  userspace-dp/src/afxdp/coordinator/reconcile/reset.rs,
+  userspace-dp/src/protocol/binding.rs,
+  pkg/dataplane/userspace/protocol.go,
+  pkg/dataplane/userspace/format/status.go
 
 ## 2026-06-21 — #2258 VRRP localIP/localIPv6 lazy-resolve race (run-loop write vs receiver reads)
 

@@ -236,6 +236,8 @@ pub(super) fn screen_parse_error_info(
         ip_ihl: 5,
         ip_frag_off: 0,
         ip_total_len: 0,
+        ip_payload_len: 0,
+        frag_data_off: 0,
     }
 }
 
@@ -483,6 +485,8 @@ mod tests {
             ip_ihl: 5,
             ip_frag_off: 0,
             ip_total_len: 60,
+            ip_payload_len: 0,
+            frag_data_off: 0,
         };
 
         emit_screen_drop_event(Some(&handle), &pkt, test_meta(), 11, "land-attack", 456);
@@ -526,6 +530,8 @@ mod tests {
             ip_ihl: 5,
             ip_frag_off: 0,
             ip_total_len: 60,
+            ip_payload_len: 0,
+            frag_data_off: 0,
         };
 
         emit_screen_alarm_event(Some(&handle), &pkt, test_meta(), 2, "scan-table-pressure", 789);
@@ -565,6 +571,8 @@ mod tests {
             ip_ihl: 5,
             ip_frag_off: 0x2000,
             ip_total_len: 60,
+            ip_payload_len: 0,
+            frag_data_off: 0,
         };
 
         emit_screen_drop_event(Some(&handle), &pkt, test_meta(), 11, "icmp-fragment", 456);

@@ -12,6 +12,17 @@ use super::*;
 // extract_tcp_flags_and_window, extract_tcp_window) and tcp_flags_str
 // were relocated to `frame/tcp.rs`.
 
+/// #2292: maximum IPv6 extension headers the forwarding walkers will
+/// chase before giving up. Kept equal to the screen path's bound in
+/// `screen/extract.rs` (`for _ in 0..8`) so screen and forwarding agree
+/// on what "valid enough IPv6" means — a chain that is still on an
+/// extension header at the bound is treated identically (fail-closed)
+/// by both paths. Before #2292 the forwarding walkers used 6 and
+/// surrendered open at the bound (returned `Some(offset)` with the
+/// unconsumed ext-header type as a bogus "L4 protocol"), so a 7th ext
+/// header was classified one way by screen and another by forwarding.
+pub(in crate::afxdp) const MAX_IPV6_EXT_HEADERS: usize = 8;
+
 pub(in crate::afxdp) fn frame_l3_offset(frame: &[u8]) -> Option<usize> {
     if frame.len() < 14 {
         return None;
@@ -47,7 +58,7 @@ pub(in crate::afxdp) fn frame_l4_offset(frame: &[u8], addr_family: u8) -> Option
             }
             let mut protocol = *frame.get(l3 + 6)?;
             let mut offset = l3 + 40;
-            for _ in 0..6 {
+            for _ in 0..MAX_IPV6_EXT_HEADERS {
                 match protocol {
                     0 | 43 | 60 => {
                         let opt = frame.get(offset..offset + 2)?;
@@ -77,7 +88,12 @@ pub(in crate::afxdp) fn frame_l4_offset(frame: &[u8], addr_family: u8) -> Option
                     _ => return Some(offset),
                 }
             }
-            Some(offset)
+            // #2292: still on an extension header at the bound — fail
+            // CLOSED (None → caller drops) instead of surrendering the
+            // ext-header offset as a fake L4 offset. Matches the screen
+            // path (`screen/extract.rs`), which returns
+            // `Err(TruncatedIpv6ExtChain)` on the same over-bound chain.
+            None
         }
         _ => None,
     }
@@ -101,7 +117,7 @@ pub(in crate::afxdp) fn packet_rel_l4_offset(packet: &[u8], addr_family: u8) -> 
             }
             let mut protocol = *packet.get(6)?;
             let mut offset = 40usize;
-            for _ in 0..6 {
+            for _ in 0..MAX_IPV6_EXT_HEADERS {
                 match protocol {
                     0 | 43 | 60 => {
                         let opt = packet.get(offset..offset + 2)?;
@@ -131,7 +147,8 @@ pub(in crate::afxdp) fn packet_rel_l4_offset(packet: &[u8], addr_family: u8) -> 
                     _ => return Some(offset),
                 }
             }
-            Some(offset)
+            // #2292: fail-CLOSED at the bound (see frame_l4_offset).
+            None
         }
         _ => None,
     }
@@ -163,7 +180,7 @@ pub(in crate::afxdp) fn packet_rel_l4_offset_and_protocol(
             }
             let mut protocol = *packet.get(6)?;
             let mut offset = 40usize;
-            for _ in 0..6 {
+            for _ in 0..MAX_IPV6_EXT_HEADERS {
                 match protocol {
                     0 | 43 | 60 => {
                         let opt = packet.get(offset..offset + 2)?;
@@ -193,7 +210,12 @@ pub(in crate::afxdp) fn packet_rel_l4_offset_and_protocol(
                     _ => return Some((offset, protocol)),
                 }
             }
-            Some((offset, protocol))
+            // #2292: fail-CLOSED at the bound. Previously this returned
+            // `Some((offset, protocol))` where `protocol` was the
+            // unconsumed extension-header type (0/43/51/60), which
+            // callers (GRE inner-parse, tunnel local-origin metadata,
+            // NDP/TCP-flag helpers) then trusted as a real L4 protocol.
+            None
         }
         _ => None,
     }
@@ -214,8 +236,9 @@ pub(in crate::afxdp) fn ipv4_is_non_first_fragment(packet: &[u8]) -> bool {
 
 /// #1852: is this L3-relative IPv6 packet a NON-first fragment?
 ///
-/// Walks the extension-header chain (bounded, same 6-iteration limit as
-/// `packet_rel_l4_offset`) looking for a fragment header (44). Returns
+/// Walks the extension-header chain (bounded, same iteration limit as
+/// `packet_rel_l4_offset` — `MAX_IPV6_EXT_HEADERS`) looking for a
+/// fragment header (44). Returns
 /// `true` iff a fragment header is present AND its fragment-offset bits
 /// (upper 13 bits of bytes 2-3, mask `0xFFF8`, RFC 8200 §4.5) are
 /// non-zero. First/atomic fragments (offset 0) and packets without a
@@ -231,7 +254,7 @@ pub(in crate::afxdp) fn ipv6_is_non_first_fragment(packet: &[u8]) -> bool {
     }
     let mut protocol = packet[6];
     let mut offset = 40usize;
-    for _ in 0..6 {
+    for _ in 0..MAX_IPV6_EXT_HEADERS {
         match protocol {
             0 | 43 | 60 => {
                 let Some(opt) = packet.get(offset..offset + 2) else {

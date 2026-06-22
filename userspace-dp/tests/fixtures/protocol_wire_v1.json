@@ -106,6 +106,7 @@
     "mirror_drops_tx_frame_reserve": 0,
     "mirrored_bytes": 0,
     "mirrored_packets": 0,
+    "nat64_no_source_pool": 0,
     "nat64_translations": 0,
     "neighbor_miss_packets": 0,
     "next_table_packets": 0,
