@@ -1,12 +1,14 @@
 # #1434 — Multi-Tunnel WireGuard: Go config-model refactor for N peers per tunnel
 
-**Status: DRAFT v1 (research, plan-of-action only — NO code, NO PR, NO production source touched)**
+**Status: REV v1.1 (research, plan-of-action only — NO code, NO PR, NO production source touched)**
 
-Plan-of-action only. No Codex/AGY/Copilot pass has run at the time of this
-draft header; reviewer verdicts are appended in the round files
-(`codex-plan-r<N>.md`, `agy-plan-r<N>.md`, `claude-smr-plan-r<N>.md`) and the
-header status is bumped per round. Every load-bearing claim is verified
-against `origin/master` at HEAD `cf9ccd3ac`.
+Plan-of-action only. Claude SMR r1 (hostile) has run — see
+`claude-smr-plan-r1.md`; its MAJOR-1 (B2 PSK-ordering self-catch, §6.3),
+MINOR-1/2/3 and NIT-2 are folded into this revision. Codex + AGY hostile
+plan-reviews are in flight; their round files (`codex-plan-r<N>.md`,
+`agy-plan-r<N>.md`) and verdicts are appended per round and the header bumped.
+Every load-bearing claim is verified against `origin/master` at HEAD
+`cf9ccd3ac` and the pinned snow 0.10.0 source.
 
 This plan covers the **multi-PEER-per-tunnel** axis of #1434. It is distinct
 from the prior `research/1434-wireguard-multitunnel` plan, which covered the
@@ -339,12 +341,19 @@ layer.
 - **Pubkey format:** 64-hex (32-byte X25519). Validate at commit (typed leaf or
   compiler check) — the engine `from_hex`s it; a bad key today fails silently
   at the dataplane.
-- **At-least-one-peer / zero-peer:** a WG tunnel with zero peers is a
-  responder-only-no-peers config — decide reject-vs-allow. Recommend allow
-  zero peers ONLY if there is a clear use (probably reject: a WG tunnel with no
-  peer can never handshake; reject at commit with a clear message). Confirm
-  against the engine: `reconcile_peers(&[])` is valid (empty PeerTable) but
-  useless. Reject for operator clarity.
+- **Zero-peer = REJECT (LOCKED, SMR MINOR-3).** A WG tunnel with zero peers
+  can never handshake; xpf has no dynamic peer learning (peers are
+  config-static), so zero-peer is always an operator mistake.
+  `reconcile_peers(&[])` is valid-but-useless (empty PeerTable). Hard
+  commit-reject with a clear message ("wireguard tunnel <if> has no peer").
+- **Mixed peer endpoint family = REJECT (LOCKED, SMR MINOR-2).** One WG
+  interface = one kernel UDP socket = one outer transport family. If peers on
+  one tunnel declare endpoints of mixed v4/v6 family, the outer-family sniff
+  (`tunnels.go:93`) and outer-MTU calc (`pkg/routing/tunnel.go:1152`) cannot
+  pick a single correct value and forwarding half-breaks silently. Make this a
+  NAMED commit-time validator, not just documentation. (Peers with NO endpoint
+  — responder-only — do not constrain the family; the family is set by the
+  peer(s) that DO declare an endpoint, and they must all agree.)
 - **AllowedIPs overlap across peers:** the engine LPM tolerates overlap
   (allowed_ips.rs:144 documents "overlap across peers"); LAST-inserted wins per
   the trie. Do NOT hard-reject overlap (valid WG configs overlap, e.g. a
@@ -383,10 +392,14 @@ userspace-dp/`, worktrees excluded):
 **Confirmed NOT readers of the scalar peer fields (no migration needed):**
 - The `show security wireguard` CLI renderer reads from the DATAPLANE STATUS
   (`pkg/cli/cli_show_security_wireguard.go` → `provider.Status()` →
-  `dpuserspace.FormatWireguardStatus`), NOT the config scalar. Per-peer
-  telemetry surfaces from the engine, so multi-peer status display rides the
-  existing telemetry path (confirm it already iterates peers; a follow-on if
-  it shows only one).
+  `dpuserspace.FormatWireguardStatus`), NOT the config scalar.
+  **CLI-peer-cardinality confirm (SMR MINOR-1, round-1 deliverable):** verify
+  the status row (`coordinator/status.rs`) + `FormatWireguardStatus` already
+  iterate N peers per tunnel. If they render only ONE peer, multi-peer is
+  configurable + forwarding but INVISIBLE in the CLI — do NOT ship B1 claiming
+  "operator can configure N peers" if the operator cannot SEE them: either
+  widen the status/renderer in B1, or file a tight follow-on and say so in the
+  PR.
 - `logWgEndpointSetTransitionLocked` / its summary (`tunnels.go:212`) formats
   only `ep.WgListenPort` (tunnel-level) — unaffected.
 - `pkg/daemon/daemon_run.go:141` is a COMMENT, not a read — unaffected.
@@ -408,40 +421,56 @@ userspace-dp/`, worktrees excluded):
 
 ## 6. Path-PSK — per-peer preshared key (sub-increment B2)
 
-### 6.1 Why it is harder than the slice
-PSK is mixed into the Noise IKpsk2 transcript at message 2 (psk index 2). snow
-sets the PSK at **Builder** time (`.psk(2, &key)`), i.e. BEFORE any message is
-read. For the INITIATOR this is fine — we know the peer (and thus its PSK)
-before building (`build_initiator_handshake(&peer_pubkey)`, engine.rs:1145), so
-the initiator path just selects the peer's PSK instead of `WG_ZERO_PSK`. Easy.
+### 6.1 Why it is harder than the slice (but NOT a blocker)
+PSK is mixed into the Noise IKpsk2 transcript at message 2 (psk index 2). The
+engine sets the PSK at snow **Builder** time today (`.psk(2, &WG_ZERO_PSK)`),
+but snow 0.10.0 ALSO supports `set_psk` AFTER build (§6.3), so the responder's
+"identify peer, then pick PSK" ordering is solvable. For the INITIATOR it is
+trivially easy — we know the peer (and its PSK) before building
+(`build_initiator_handshake(&peer_pubkey)`, engine.rs:1145), so the initiator
+path selects the peer's PSK instead of `WG_ZERO_PSK`. The responder is the only
+subtlety, and §6.3 resolves it. The remaining cost is an engine field +
+plumbing + secret hygiene — NOT a protocol-ordering blocker.
 
 ### 6.2 Initiator path (easy)
 `build_initiator_handshake` already takes `peer_pubkey`; look up the peer's PSK
 from the PeerTable and pass `.psk(2, &peer_psk)`. One-line conditional.
 
-### 6.3 Responder path (the real subtlety — the B1/B2 gate)
+### 6.3 Responder path (RESOLVED — `set_psk` mid-handshake, version-confirmed)
 `build_responder_handshake` (engine.rs:1177) builds the snow responder state
 with `.psk(2, &WG_ZERO_PSK)` BEFORE reading msg1. But the peer identity is only
 known AFTER `read_message(msg1)` via `get_remote_static`
-(`handshake_session.rs:465-477`). The PSK belongs to the identified peer.
-Because IKpsk2 mixes the PSK at msg2 (consumed during the responder's
-`write_message(msg2)` at handshake_session.rs:493, AFTER identification), the
-PSK must be set on the snow state AFTER `get_remote_static` but BEFORE
-`write_message`. snow's Builder cannot set PSK mid-handshake.
+(`handshake_session.rs:465-477`). The PSK belongs to the identified peer, so it
+must be set AFTER identification but BEFORE `write_message(msg2)`.
 
-**Two resolutions, both citable, to settle in round 1:**
-- **B2-i (re-build):** after `get_remote_static` identifies the peer, look up
-  the peer's PSK, REBUILD a responder snow state WITH that PSK, and re-run
-  `read_message(msg1)` on it (the msg1 read is deterministic and does not
-  consume the PSK — IKpsk2 mixes psk only at msg2). Then `write_message(msg2)`.
-  Cost: a second `read_message` of the same msg1. Clean, no snow fork.
-- **B2-ii (snow API):** if snow exposes a `set_psk`/`receive_psk` mid-handshake
-  hook (verify the pinned snow version), use it. Less re-work but
-  version-dependent.
+**VERIFIED against the pinned snow 0.10.0 (`userspace-dp/Cargo.lock`):**
+- In `IKpsk2`, the `Psk(2)` token is appended to the END of the SECOND message
+  pattern: `apply_psk_modifier(n=2)` does `patterns.get_mut(n-1=1)` (the 2nd
+  message) `.push(Token::Psk(2))` —
+  `snow-0.10.0/src/params/patterns.rs:533-545`. So the PSK is mixed
+  (`mix_key_and_hash`) only while message 2 is processed — i.e. during the
+  responder's `write_message(msg2)`
+  (`handshakestate.rs:262-266`/`396-401`), AFTER `read_message(msg1)`.
+- snow `HandshakeState` exposes a PUBLIC `set_psk(location, key)`
+  (`handshakestate.rs:457`) usable AFTER construction, mid-handshake.
 
-If neither resolves cleanly in round 1, **B2 splits to a follow-on issue**;
-B1 (the slice, with PSK staying `WG_ZERO_PSK`) ships standalone and is still
-the headline #1434 deliverable. The plan EXPLICITLY does not block B1 on B2.
+**Resolution (B2-ii, clean — no rebuild, no re-read):** the responder builds
+its state, `read_message(msg1)`, `get_remote_static` → peer, looks up the
+peer's PSK, calls `state.set_psk(2, peer_psk)`, then `write_message(msg2)`
+which mixes the now-correct PSK. The initiator already knows the peer at build
+time (§6.2) and can either `.psk(2, peer_psk)` at Builder time or `set_psk`
+after build — symmetric. **No "rebuild + re-read msg1" fallback is needed.**
+(The DRAFT-v1 of this plan proposed that conservative B2-i fallback under the
+false premise that snow could not set PSK mid-handshake; the source check
+refutes that premise — see the Claude SMR self-catch.)
+
+**Bound on engine API change:** B2 still requires a NEW per-peer
+`preshared_key: [u8;32]` on the engine's `WgPeerConfig` + plumbing into the two
+handshake builders + the `set_psk` call site. That is a real (small) ENGINE
+change, distinct from B1 which touches NO engine code. The B1/B2 gate is
+therefore secret-hygiene (R3) and the engine-edit blast radius, NOT a snow
+ordering blocker. **B2 can ride B1's PR** given §6.3 resolves cleanly (it
+does); split B2 only if the secret-hygiene review (R3) proves non-trivial.
 
 ### 6.4 PSK data-model wiring (if B2 in scope)
 - Go: `WgPeerConfig.PresharedKeyHex string` (§4). Schema: `preshared-key`
@@ -545,8 +574,11 @@ not node-scoped). No `pkg/cluster` code change expected — confirm in round 1.
   security defect. Mitigation: §6.4 hygiene mirrors the proven privkey
   `skip_serializing` + String() redaction; the secret-redaction review is the
   B2 gate. If hygiene is non-trivial, B2 splits.
-- **R4 — responder PSK ordering (B2).** §6.3 — re-build-and-re-read is the
-  fallback; if it complicates the hot-tested handshake path, split B2.
+- **R4 — responder PSK ordering (B2). RETIRED.** §6.3 — snow 0.10.0 `set_psk`
+  resolves it cleanly (responder reads msg1, identifies the peer, `set_psk(2,
+  peer_psk)`, then `write_message(msg2)` mixes it). No rebuild, no re-read. The
+  draft's B2-i fallback is unnecessary (SMR MAJOR-1). Residual risk is only the
+  small engine-field plumbing, folded into R3.
 - **R5 — outer-family with mixed-endpoint peers.** §5.4/5.6b — constrain to one
   family per WG interface (true for one UDP socket); commit-reject mixed.
 - **R6 — HA non-determinism from unsorted peers.** §5.4 sort-by-pubkey;
@@ -562,10 +594,14 @@ wire DTO slice + Rust build-path loop + fixture regen + Go/Rust tests). No
 shim, no hot-path, no lab. One normal quad-reviewed PR. This is the headline
 #1434 deliverable for the multi-peer axis.
 
-**B2 (per-peer PSK):** in scope per directive, rides B1's PR IF §6.3 resolves
-cleanly in round 1; else splits to a focused follow-on. B2 adds an engine field
-+ both handshake builders + secret hygiene; its risk surface (R3/R4) is real
-and self-contained.
+**B2 (per-peer PSK):** in scope per directive. §6.3 RESOLVED — snow 0.10.0
+`set_psk` mid-handshake lets the responder pick the peer's PSK after
+`get_remote_static`, so there is NO snow-ordering blocker (the draft's
+rebuild-and-re-read fallback was unnecessary; SMR MAJOR-1 self-catch). B2 adds
+a per-peer engine `preshared_key` field + plumbing into both handshake builders
++ the `set_psk` call site + secret hygiene (R3). It MAY ride B1's PR; split to
+a focused follow-on ONLY if the secret-hygiene review (R3) proves heavy. R4
+(responder ordering) is retired by the §6.3 resolution.
 
 **Deferred (NOT this plan):** Axis A shim multi-PORT steering (prior plan
 Increment 2 / lab); live multi-peer handshake + Ubiquiti interop (#1703);
