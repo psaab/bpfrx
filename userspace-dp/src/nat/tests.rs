@@ -2659,17 +2659,20 @@ fn pool_snat_address_persistent_spreads_distinct_sources_across_pool() {
 }
 
 #[test]
-fn pool_snat_address_persistent_userspace_v1_contract_fixtures() {
+fn pool_snat_address_persistent_userspace_v2_contract_fixtures() {
+    // Golden vectors pinning the FxHash-seeded mapping (#2349). These guard
+    // against an accidental change to the sticky-index hash; a deliberate hash
+    // change must re-pin them and bump the seed version.
     assert_eq!(sticky_pool_index("10.0.1.100".parse().unwrap(), 4), 3);
-    assert_eq!(sticky_pool_index("10.0.1.101".parse().unwrap(), 4), 0);
-    assert_eq!(sticky_pool_index("192.0.2.1".parse().unwrap(), 5), 4);
-    assert_eq!(sticky_pool_index("198.51.100.25".parse().unwrap(), 5), 0);
-    assert_eq!(sticky_pool_index("2001:db8::1".parse().unwrap(), 257), 197);
-    assert_eq!(sticky_pool_index("2001:db8::2".parse().unwrap(), 257), 125);
+    assert_eq!(sticky_pool_index("10.0.1.101".parse().unwrap(), 4), 2);
+    assert_eq!(sticky_pool_index("192.0.2.1".parse().unwrap(), 5), 3);
+    assert_eq!(sticky_pool_index("198.51.100.25".parse().unwrap(), 5), 2);
+    assert_eq!(sticky_pool_index("2001:db8::1".parse().unwrap(), 257), 109);
+    assert_eq!(sticky_pool_index("2001:db8::2".parse().unwrap(), 257), 240);
 }
 
 #[test]
-fn pool_snat_address_persistent_userspace_v1_selects_pool_addresses() {
+fn pool_snat_address_persistent_userspace_v2_selects_pool_addresses() {
     let rules = parse_source_nat_rules(&[SourceNATRuleSnapshot {
         name: "userspace-v1-selection".to_string(),
         from_zone: "lan".to_string(),
@@ -2694,18 +2697,18 @@ fn pool_snat_address_persistent_userspace_v1_selects_pool_addresses() {
 
     let cases = [
         ("10.0.1.100", "8.8.8.8", 50000, "203.0.113.13"),
-        ("10.0.1.101", "8.8.4.4", 50001, "203.0.113.10"),
+        ("10.0.1.101", "8.8.4.4", 50001, "203.0.113.12"),
         (
             "2001:db8::1",
             "2001:4860:4860::8888",
             50002,
-            "2001:db8:ffff::12",
+            "2001:db8:ffff::11",
         ),
         (
-            "fd00::1234",
+            "fd00::3",
             "2001:4860:4860::8844",
             50003,
-            "2001:db8:ffff::11",
+            "2001:db8:ffff::13",
         ),
     ];
 
@@ -2738,7 +2741,7 @@ fn pool_snat_address_persistent_differs_from_legacy_backend_algorithms() {
     assert_eq!(legacy_backend_v4_index(v4, 4), 2);
 
     let v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
-    assert_eq!(sticky_pool_index(IpAddr::V6(v6), 257), 197);
+    assert_eq!(sticky_pool_index(IpAddr::V6(v6), 257), 109);
     assert_eq!(legacy_backend_v6_index(v6, 257), 116);
 }
 
@@ -2767,8 +2770,61 @@ fn pool_snat_address_persistent_hashes_full_ipv6_address() {
     let a: IpAddr = "2001:db8::1".parse().unwrap();
     let b: IpAddr = "2001:db8::2".parse().unwrap();
 
-    assert_eq!(sticky_pool_index(a, 257), 197);
-    assert_eq!(sticky_pool_index(b, 257), 125);
+    assert_eq!(sticky_pool_index(a, 257), 109);
+    assert_eq!(sticky_pool_index(b, 257), 240);
+}
+
+#[test]
+fn pool_snat_address_persistent_sticky_index_is_deterministic_and_stable() {
+    // Determinism + persistence contract (#2349): the same source IP must map
+    // to the same pool slot on every call, regardless of how many other
+    // sources have been hashed in between (the FxHasher is constructed fresh
+    // per call, so there is no shared mutable state — but assert it anyway so
+    // a future change that introduces state fails here).
+    let sources: &[&str] = &[
+        "10.0.1.100",
+        "10.0.1.101",
+        "192.0.2.1",
+        "198.51.100.25",
+        "2001:db8::1",
+        "2001:db8::2",
+        "fd00::1234",
+    ];
+    let pool_lens = [2usize, 3, 4, 5, 64, 257];
+
+    for pool_len in pool_lens {
+        for src in sources {
+            let ip: IpAddr = src.parse().unwrap();
+            let first = sticky_pool_index(ip, pool_len);
+
+            // Repeated calls return the same slot.
+            for _ in 0..16 {
+                assert_eq!(
+                    sticky_pool_index(ip, pool_len),
+                    first,
+                    "sticky index for {src} (pool_len={pool_len}) changed across calls"
+                );
+            }
+
+            // Interleaving other sources does not perturb this one's slot —
+            // proves there is no shared/accumulating allocator state behind the
+            // hash (address-persistence is computed live, not cached).
+            for other in sources {
+                let _ = sticky_pool_index(other.parse().unwrap(), pool_len);
+            }
+            assert_eq!(
+                sticky_pool_index(ip, pool_len),
+                first,
+                "sticky index for {src} (pool_len={pool_len}) drifted after hashing other sources"
+            );
+
+            // Result is always a valid slot.
+            assert!(
+                first < pool_len,
+                "sticky index {first} out of range for pool_len={pool_len}"
+            );
+        }
+    }
 }
 
 #[test]

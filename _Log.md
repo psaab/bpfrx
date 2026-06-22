@@ -10719,3 +10719,20 @@ top.
     "shim drops double-tagged" → "XDP_PASSes to kernel". Filed feature
     follow-up #2354 for real QinQ transit build.
   - **File(s)**: docs/feature-gaps.md, userspace-dp/src/afxdp/frame/README.md, _Log.md
+
+- **Timestamp**: 2026-06-22T23:55Z
+  - **Action**: #2349 — replace SHA-256 with a seeded FxHash for the
+    `address-persistent` SNAT sticky pool-address selector. Confirmed (not
+    over-claimed): `sticky_pool_index` (allocator.rs) ran SHA-256 over a salt +
+    family tag + source-IP octets on the SNAT *allocation* path (new-flow,
+    address-persistent only — not per-packet). The mapping is computed live,
+    never persisted to disk or HA-synced (`persistent_by_source` is in-memory),
+    so the only contract is same-source→same-slot within a process lifetime;
+    swapping the hash is safe (existing sessions keep their address, new flows
+    pick up the new mapping). Replaced with `rustc_hash::FxHasher` (already a
+    dependency, already imported in this file for the allocator hash maps),
+    seeded with a `-v2` quality salt. sha2 stays in Cargo.toml — still used by
+    server/helpers.rs snapshot binding-plan key (NOT removed). Re-pinned the
+    golden-vector fixtures (v1→v2) and added a determinism+stability test.
+  - **File(s)**: userspace-dp/src/nat/allocator.rs, userspace-dp/src/nat/tests.rs,
+    docs/userspace-dataplane-gaps.md, _Log.md
