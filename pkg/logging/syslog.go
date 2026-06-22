@@ -35,6 +35,7 @@ const (
 const (
 	SyslogError   = 3
 	SyslogWarning = 4
+	SyslogNotice  = 5
 	SyslogInfo    = 6
 )
 
@@ -74,9 +75,14 @@ type SyslogClient struct {
 	// Stream-transport resilience (TCP/TLS). All guarded by mu except the
 	// atomic counters, which are observability only.
 	writeTimeout      time.Duration // per-Write deadline; 0 disables (UDP)
-	reconnectCooldown time.Duration // min interval between dial attempts
-	lastDialFailure   time.Time     // when the last dial failed (mu-guarded)
-	lastDropLog       time.Time     // rate-limit for the drop warning (mu-guarded)
+	reconnectCooldown time.Duration // min interval between reconnect attempts
+	// lastReconnectFailure is when the last reconnect CYCLE failed: either the
+	// dial errored, OR the dial succeeded but the retry-write that followed it
+	// failed (accept-then-reset). Armed by both modes so an accept-then-reset
+	// target cannot bypass the cooldown (#2302); cleared only on a fully
+	// successful reconnect (dial + retry-write). mu-guarded.
+	lastReconnectFailure time.Time
+	lastDropLog          time.Time // rate-limit for the drop warning (mu-guarded)
 
 	// droppedWrites counts messages dropped because the write itself failed:
 	// a write timeout (SetWriteDeadline expiry) or a write error
@@ -222,13 +228,27 @@ func (s *SyslogClient) dialTLS() (net.Conn, error) {
 // reconnect attempts to re-establish the connection, subject to a cooldown so
 // a down server cannot drive a fresh dial on every event. Called with mu held.
 //
-// Returns errReconnectCooldown without dialing if the previous dial failed
-// within reconnectCooldown; the caller drops the message and continues. The
-// event hot-path therefore never spends more than one dial's worth of time per
-// cooldown window on a dead target.
+// Returns errReconnectCooldown without dialing if the previous reconnect cycle
+// failed within reconnectCooldown; the caller drops the message and continues.
+// The event hot-path therefore never spends more than one dial's worth of time
+// per cooldown window on a dead target.
+//
+// The cooldown clock (lastReconnectFailure) is armed by BOTH failure modes:
+//   - a failed dial (set here), and
+//   - a dial that SUCCEEDS but whose subsequent retry-write fails (set by the
+//     caller via armReconnectCooldown).
+//
+// Arming on dial-success-then-write-failure closes #2302: an accept-then-reset
+// target (overloaded collector, half-open server, TLS app-layer drop) lets the
+// dial succeed every time, so gating only on a failed dial left the cooldown
+// permanently disengaged and every log message drove a fresh TCP connect +
+// teardown — a dial storm. The clock is cleared only on a FULLY successful
+// reconnect (dial AND the retry-write that follows it land), so the legitimate
+// recovery path (a single broken-pipe error that the reconnect repairs) is
+// unaffected.
 func (s *SyslogClient) reconnect() error {
-	if s.reconnectCooldown > 0 && !s.lastDialFailure.IsZero() {
-		if s.now().Sub(s.lastDialFailure) < s.reconnectCooldown {
+	if s.reconnectCooldown > 0 && !s.lastReconnectFailure.IsZero() {
+		if s.now().Sub(s.lastReconnectFailure) < s.reconnectCooldown {
 			return errReconnectCooldown
 		}
 	}
@@ -238,12 +258,30 @@ func (s *SyslogClient) reconnect() error {
 	}
 	conn, err := s.dialConn()
 	if err != nil {
-		s.lastDialFailure = s.now()
+		s.lastReconnectFailure = s.now()
 		return err
 	}
-	s.lastDialFailure = time.Time{}
+	// Dial succeeded. Do NOT clear the cooldown clock yet — the retry-write may
+	// still fail (accept-then-reset). The caller clears it on a successful
+	// retry-write and arms it (armReconnectCooldown) if the retry-write fails.
 	s.conn = conn
 	return nil
+}
+
+// armReconnectCooldown records a reconnect-cycle failure on the cooldown clock
+// so the NEXT reconnect within the window fails fast. Called with mu held from
+// the post-reconnect retry-write-failure path (dial succeeded, write failed):
+// without this, an accept-then-reset target bypasses the cooldown forever
+// because the dial never errors (#2302).
+func (s *SyslogClient) armReconnectCooldown() {
+	s.lastReconnectFailure = s.now()
+}
+
+// clearReconnectCooldown marks the reconnect cycle as fully recovered (dial AND
+// the retry-write both succeeded), re-enabling immediate reconnect on the next
+// failure. Called with mu held.
+func (s *SyslogClient) clearReconnectCooldown() {
+	s.lastReconnectFailure = time.Time{}
 }
 
 // errReconnectCooldown signals that a reconnect was suppressed by the cooldown
@@ -302,10 +340,10 @@ func (s *SyslogClient) noteDrop(reason dropReason, err error) *pendingDropWarn {
 	}
 }
 
-// emitDropWarn emits the rate-limited drop warning. It MUST be called with s.mu
-// NOT held (typically via a defer ordered to run after the Unlock) so the
-// slog.Warn cannot re-enter SyslogClient.Send under the lock (#2287). A nil
-// receiver (rate-limited) is a no-op.
+// emit emits the rate-limited drop warning. It MUST be called with s.mu NOT
+// held (typically via a defer ordered to run after the Unlock) so the slog.Warn
+// cannot re-enter SyslogClient.Send under the lock (#2287). A nil receiver
+// (rate-limited) is a no-op.
 func (w *pendingDropWarn) emit(remoteAddr string) {
 	if w == nil {
 		return
@@ -395,9 +433,16 @@ func (s *SyslogClient) Send(severity int, msg string) error {
 				return fmt.Errorf("syslog reconnect %s: %w", s.remoteAddr, rerr)
 			}
 			if werr := s.writeMsg(line); werr != nil {
+				// Dial succeeded but the retry-write failed (accept-then-reset).
+				// Arm the cooldown so the NEXT message's reconnect is throttled
+				// instead of dialing afresh every time (#2302).
+				s.armReconnectCooldown()
 				pendingWarn = s.noteDrop(dropWrite, werr)
 				return werr
 			}
+			// Full recovery: dial AND retry-write both succeeded. Clear the
+			// cooldown clock so a future failure can reconnect immediately.
+			s.clearReconnectCooldown()
 			return nil
 		}
 		return err
@@ -473,9 +518,14 @@ func (s *SyslogClient) SendBinary(data []byte) error {
 				return fmt.Errorf("syslog reconnect %s: %w", s.remoteAddr, rerr)
 			}
 			if werr := s.writeBinaryMsg(data); werr != nil {
+				// Dial succeeded but the retry-write failed (accept-then-reset):
+				// arm the cooldown so the next reconnect is throttled (#2302).
+				s.armReconnectCooldown()
 				pendingWarn = s.noteDrop(dropWrite, werr)
 				return werr
 			}
+			// Full recovery: clear the cooldown clock.
+			s.clearReconnectCooldown()
 			return nil
 		}
 		return err

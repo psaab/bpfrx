@@ -60,11 +60,20 @@ connectionless and exempt:
   path below.
 - **Reconnect cooldown.** A non-timeout write failure on a stream
   transport attempts one reconnect, gated by `reconnectCooldown`
-  (default `defaultReconnectCooldown`, 1s). If the previous dial failed
-  inside the window, the reconnect is skipped and the send fails fast
-  (drop) — so a down server cannot drive a fresh 5s-timeout dial on
-  every event (thundering herd). `lastDialFailure` is cleared on a
-  successful dial.
+  (default `defaultReconnectCooldown`, 1s). If the previous reconnect
+  cycle failed inside the window, the reconnect is skipped and the send
+  fails fast (drop) — so a down server cannot drive a fresh 5s-timeout
+  dial on every event (thundering herd). The cooldown clock
+  (`lastReconnectFailure`) is armed by BOTH failure modes (#2302): a
+  failed **dial**, AND a dial that succeeds but whose subsequent
+  retry-**write** fails (accept-then-reset collector, half-open server,
+  TLS app-layer drop). Gating only on a failed dial left an
+  accept-then-reset target permanently un-throttled — the dial succeeded
+  every time, so every log message drove a fresh TCP connect + teardown
+  (a dial storm: ephemeral port exhaustion + SYN pressure on the
+  collector). The clock is cleared only on a FULLY successful reconnect
+  (dial AND the retry-write both land), so the legitimate
+  single-broken-pipe recovery path is unaffected.
 - **Drop warning emitted AFTER the lock is released (#2287).**
   `SyslogClient.Send`/`SendBinary` hold `s.mu` for the whole write +
   reconnect sequence. The rate-limited drop warning (`slog.Warn`) must
@@ -86,6 +95,11 @@ connectionless and exempt:
   concurrent `Handle` calls on different goroutines are never falsely
   skipped. Forwarding to the base handler (stderr) stays unconditional,
   even on a re-entrant call, so records are never lost from local logs.
+  `Handle` snapshots the client set FIRST and returns before the guard
+  when there are no clients (the default until syslog config applies), so
+  the guard's `goID()` (`runtime.Stack` + `ParseUint`) never runs on the
+  common no-client path (#2295) — only when a record is actually being
+  forwarded to at least one client.
 
 Drops are observable via `DroppedWrites()` (write timeout or write
 error), `DroppedDials()` (post-write-failure reconnect dial failed),
@@ -97,11 +111,15 @@ attribute is one of `write` / `dial` / `cooldown`.
 Tests (`syslog_resilience_test.go`, `syslog_reentrancy_test.go`) use
 deterministic fakes — a deadline-honouring conn, an always-fail conn, a
 timeout conn, a recording conn, a controllable clock, and a dial seam
-(`dialFn`/`nowFn`) — with no sleeps. The hang test fails if the write
-deadline is removed; the cooldown test fails if the cooldown gate is
-removed; the re-entrancy test deadlocks (and times out) if the drop
-warning is moved back under `s.mu` or the handler guard is removed; the
-timeout-drop test fails (sees a dial) if a write timeout reconnects.
+(`dialFn`/`nowFn`) — plus a `goIDFn` seam — with no sleeps. The hang
+test fails if the write deadline is removed; the cooldown test fails if
+the cooldown gate is removed; the accept-then-reset test (#2302) fails
+(sees a 50-dial storm) if the cooldown is not armed on a
+dial-success-then-write-failure; the re-entrancy test deadlocks (and
+times out) if the drop warning is moved back under `s.mu` or the handler
+guard is removed; the timeout-drop test fails (sees a dial) if a write
+timeout reconnects; the no-client test (#2295) fails (sees `goID` calls)
+if `Handle` runs the re-entrancy guard before the client check.
 
 ## Gotchas
 
