@@ -1274,6 +1274,9 @@ pub(crate) struct BindingLiveSnapshot {
     pub(crate) dnat_packets: u64,
     /// #2161: cumulative NAT64 translations snapshotted from BindingLiveState.
     pub(crate) nat64_translations: u64,
+    /// #2291: cumulative fail-closed NAT64 drops (prefix matched, no source
+    /// pool available) snapshotted from BindingLiveState.
+    pub(crate) nat64_no_source_pool: u64,
     pub(crate) slow_path_packets: u64,
     pub(crate) slow_path_bytes: u64,
     pub(crate) slow_path_local_delivery_packets: u64,

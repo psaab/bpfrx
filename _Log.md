@@ -64,6 +64,33 @@
   pkg/logging/syslog.go, pkg/logging/syslog_reentrancy_test.go,
   pkg/logging/syslog_resilience_test.go, pkg/logging/README.md
 
+## 2026-06-21 — #2290 + #2291 NAT64 ext-header walk + fail-closed empty-pool
+
+- **Timestamp**: 2026-06-21
+- **Action**: #2290 — walk the IPv6 extension-header chain in the NAT64
+  v6->v4 translator (`write_v6_to_v4_into`) and the embedded ICMP-error
+  path (`translate_embedded_v6_to_v4`) instead of assuming L4 at fixed
+  offset 40 / reading the raw next-header. Added local bounded walker
+  `ipv6_l4_offset_and_protocol` + `ipv6_is_non_first_fragment` to
+  nat64.rs (does not reach into crate::afxdp, which depends on nat64;
+  unification tracked #2292). Fail closed on non-first fragments.
+  #2291 — tri-state `Nat64Match` enum + `classify_ipv6_dest`: a matched
+  NAT64 prefix with no allocatable source pool now DROPS + bumps the new
+  `nat64_no_source_pool` counter instead of falling through to plain IPv6
+  route lookup on the synthetic destination (was fail-open). Counter wired
+  BatchCounters -> BindingLiveState -> snapshot -> BindingStatus JSON ->
+  Go protocol.go + format/status.go operator line.
+- **File(s)**: userspace-dp/src/nat64.rs,
+  userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/mod.rs, userspace-dp/src/afxdp/umem/mod.rs,
+  userspace-dp/src/afxdp/umem/snapshot.rs,
+  userspace-dp/src/afxdp/worker/mod.rs,
+  userspace-dp/src/afxdp/coordinator/refresh_bindings.rs,
+  userspace-dp/src/afxdp/coordinator/reconcile/reset.rs,
+  userspace-dp/src/protocol/binding.rs,
+  pkg/dataplane/userspace/protocol.go,
+  pkg/dataplane/userspace/format/status.go
+
 ## 2026-06-21 — #2258 VRRP localIP/localIPv6 lazy-resolve race (run-loop write vs receiver reads)
 
 - **Timestamp**: 2026-06-21
