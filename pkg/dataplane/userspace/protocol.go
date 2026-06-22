@@ -691,11 +691,11 @@ type ProcessStatus struct {
 	// *EventStreamStatus above carries different, Go-populated counters
 	// (frames_read, decode_errors) the Rust helper never emits. JSON tags
 	// MUST match Rust serde rename(...) exactly.
-	EventStreamConnected      bool                              `json:"event_stream_connected,omitempty"`
-	EventStreamSeq            uint64                            `json:"event_stream_seq,omitempty"`
-	EventStreamAcked          uint64                            `json:"event_stream_acked,omitempty"`
-	CoSInterfaces             []CoSInterfaceStatus              `json:"cos_interfaces,omitempty"`
-	PolicyRuleCounters        []PolicyRuleCounterStatus         `json:"policy_rule_counters,omitempty"`
+	EventStreamConnected bool                      `json:"event_stream_connected,omitempty"`
+	EventStreamSeq       uint64                    `json:"event_stream_seq,omitempty"`
+	EventStreamAcked     uint64                    `json:"event_stream_acked,omitempty"`
+	CoSInterfaces        []CoSInterfaceStatus      `json:"cos_interfaces,omitempty"`
+	PolicyRuleCounters   []PolicyRuleCounterStatus `json:"policy_rule_counters,omitempty"`
 	// NATRuleCounters carries the userspace dataplane's per-rule SNAT/DNAT/
 	// static-NAT translation hit counters keyed by the compiler-assigned
 	// counter ID (#2218). The Go control plane mirrors these into the legacy
@@ -1521,11 +1521,11 @@ type BindingStatus struct {
 	SYNCookieOutputFilterDrops        uint64 `json:"syn_cookie_output_filter_drops,omitempty"`
 	GeneratedReplyClassifyParseErrors uint64 `json:"generated_reply_classify_parse_errors,omitempty"`
 	SNATPackets                       uint64 `json:"snat_packets,omitempty"`
-	DNATPackets                  uint64 `json:"dnat_packets,omitempty"`
+	DNATPackets                       uint64 `json:"dnat_packets,omitempty"`
 	// #2161: NAT64 (v6<->v4) translations on this binding. omitempty +
 	// the Rust serde `default` keep cross-version wire safety (#1961-class:
 	// an older helper omits the field, Go reads 0 rather than failing decode).
-	Nat64Translations              uint64 `json:"nat64_translations,omitempty"`
+	Nat64Translations uint64 `json:"nat64_translations,omitempty"`
 	// #2291: fail-closed NAT64 drops — a prefix matched but no IPv4 source
 	// could be allocated (empty/exhausted pool), so the synthetic IPv6
 	// destination was dropped rather than route-looked-up as IPv6. omitempty +
