@@ -831,6 +831,23 @@ func newCollector(srv *Server) *xpfCollector {
 				"traffic on a congested path (#2315).",
 			nil, nil,
 		),
+		userspaceWgDecapEcnIllegalDrops: prometheus.NewDesc(
+			"xpf_userspace_wg_decap_ecn_illegal_drops_total",
+			"WireGuard-decap inner packets dropped by the RFC 6040 4.2 "+
+				"decap-side ECN combine because the (recvmsg-captured) "+
+				"outer header carried a CE (congestion experienced) mark "+
+				"over an inner packet that was Not-ECT (the illegal "+
+				"combination: a congested router CE-marked a packet whose "+
+				"endpoints never negotiated ECN). The WG decap path reads "+
+				"the outer ECN out-of-band via IP_RECVTOS/IPV6_RECVTCLASS "+
+				"(the kernel UDP socket strips the outer IP header before "+
+				"userspace) and applies the same combine. RFC 6040 mandates "+
+				"dropping this rather than silently clearing the bogus CE. "+
+				"A nonzero value flags a misbehaving WG ingress that "+
+				"ECT-marked the outer for un-ECN inner traffic on a "+
+				"congested path (#2317).",
+			nil, nil,
+		),
 		userspaceFlowCacheActiveFlows: prometheus.NewDesc(
 			"xpf_userspace_flow_cache_active_flows",
 			"Aggregate active userspace flow-cache entries across bindings.",

@@ -156,6 +156,15 @@ pub(super) fn wg_control_loop(
         );
         return;
     }
+    // #2317: request the outer IP TOS / Traffic Class as ancillary data so
+    // the RFC 6040 §4.2 decap ECN combine has the outer ECN to fold into
+    // the decrypted inner packet. The kernel UDP socket strips the outer
+    // IP header before the WG record reaches userspace, so `IP_RECVTOS`
+    // (v4 / v4-mapped) and `IPV6_RECVTCLASS` (v6) are the only way to see
+    // it. Best-effort: a kernel that rejects the option just leaves the
+    // outer ECN unseen and the combine is skipped (the pre-#2317
+    // behavior) — never fatal to the tunnel.
+    set_recv_tos_options(socket.as_raw_fd(), socket_is_v6);
 
     // Attach to the persistent wgN TUN (Go pre-created it; open_tun
     // attaches to the existing device by name). Non-blocking.
@@ -391,8 +400,18 @@ fn run_wg_control_loop(
 
         // --- Inbound: kernel socket → engine → TUN ---
         for _ in 0..WG_RX_BURST {
-            match socket.recv_from(&mut sock_buf) {
-                Ok((len, from)) if len > 0 => {
+            // #2317: recvmsg (not recv_from) so the outer IP TOS /
+            // Traffic Class arrives as ancillary data — the only way to
+            // see the outer ECN the kernel UDP stack stripped with the
+            // outer IP header. `outer_ecn` is None when no TOS cmsg
+            // arrived (kernel ignored the sockopt); the decap combine is
+            // then skipped.
+            match wg_recvmsg(socket, &mut sock_buf) {
+                Ok(WgRecv {
+                    len,
+                    from,
+                    outer_ecn,
+                }) if len > 0 => {
                     did_work = true;
                     // Learn / refresh the peer endpoint from `from` ONLY
                     // after the datagram cryptographically authenticates
@@ -406,6 +425,7 @@ fn run_wg_control_loop(
                         &mut tun,
                         &sock_buf[..len],
                         from,
+                        outer_ecn,
                         &mut decap_buf,
                         &mut encap_buf,
                         tunnel_name,
@@ -979,6 +999,200 @@ fn wg_send_to(
     socket.send_to(buf, wire_target)
 }
 
+/// #2317: enable receiving the outer IP TOS / Traffic Class as ancillary
+/// data on the WG listen socket so the RFC 6040 §4.2 decap ECN combine
+/// can fold the outer ECN into the decrypted inner packet (the kernel
+/// UDP socket strips the outer IP header before the WG record reaches
+/// userspace). Sets `IP_RECVTOS` on every socket (it governs both native
+/// v4 and the v4-mapped datagrams the dual-stack v6 socket delivers) and
+/// additionally `IPV6_RECVTCLASS` on the dual-stack v6 socket for native
+/// v6 peers. Best-effort: a failure is logged via the return value being
+/// ignored by the caller — the combine is simply skipped when no cmsg
+/// arrives, which is the pre-#2317 behavior, so this is never fatal.
+/// #2317: enable outer-TOS ancillary delivery (`IP_RECVTOS` /
+/// `IPV6_RECVTCLASS`) on a WG UDP socket so the decap ECN combine can see
+/// the outer DS byte the kernel UDP stack otherwise strips. Best-effort:
+/// a kernel that rejects the sockopt (very old, or a restricted sandbox)
+/// simply delivers no TOS cmsg and the combine is skipped (outer_ecn =
+/// None). A failure is logged once here — this runs only at socket
+/// creation, never on the packet path — so an operator can see why ECN
+/// propagation is inactive.
+fn set_recv_tos_options(fd: i32, socket_is_v6: bool) {
+    let on: libc::c_int = 1;
+    // IP_RECVTOS — outer IPv4 TOS (also delivered for v4-mapped peers on
+    // the dual-stack socket).
+    let rc = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_IP,
+            libc::IP_RECVTOS,
+            &on as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        eprintln!(
+            "xpf-wg: IP_RECVTOS not enabled (fd {fd}): {} — decap ECN combine inactive for v4",
+            io::Error::last_os_error()
+        );
+    }
+    if socket_is_v6 {
+        // IPV6_RECVTCLASS — outer IPv6 Traffic Class for native v6 peers.
+        let rc6 = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::IPPROTO_IPV6,
+                libc::IPV6_RECVTCLASS,
+                &on as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if rc6 != 0 {
+            eprintln!(
+                "xpf-wg: IPV6_RECVTCLASS not enabled (fd {fd}): {} — decap ECN combine inactive for v6",
+                io::Error::last_os_error()
+            );
+        }
+    }
+}
+
+/// #2317: outcome of a single `recvmsg` on the WG socket — the datagram
+/// length plus the 2-bit outer ECN parsed from the `IP_RECVTOS` /
+/// `IPV6_RECVTCLASS` ancillary data (None when no TOS cmsg arrived, e.g.
+/// the kernel did not honor the sockopt, in which case the decap combine
+/// is skipped).
+struct WgRecv {
+    len: usize,
+    from: SocketAddr,
+    outer_ecn: Option<u8>,
+}
+
+/// #2317: receive one WG datagram via `recvmsg`, capturing the outer IP
+/// TOS / Traffic Class from the ancillary `IP_RECVTOS` /
+/// `IPV6_RECVTCLASS` control message. Replaces `recv_from` so the outer
+/// ECN — stripped by the kernel UDP stack with the outer IP header —
+/// reaches the RFC 6040 §4.2 decap combine.
+///
+/// The cmsg buffer is a fixed 256-byte stack array (a single TOS cmsg is
+/// ~16-20 bytes; 256 covers both the v4 and v6 TOS cmsgs with margin and
+/// never allocates on the hot path). `MSG_TRUNC`/`MSG_CTRUNC` are not
+/// requested — the data buffer is the loop's 64 KiB scratch (max IP
+/// datagram) so transport records never truncate, and a truncated cmsg
+/// only loses the (best-effort) ECN, not the datagram.
+fn wg_recvmsg(socket: &UdpSocket, buf: &mut [u8]) -> io::Result<WgRecv> {
+    let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    let mut cmsg_space = [0u8; 256];
+    let mut iov = libc::iovec {
+        iov_base: buf.as_mut_ptr() as *mut libc::c_void,
+        iov_len: buf.len(),
+    };
+    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+    msg.msg_name = &mut storage as *mut _ as *mut libc::c_void;
+    msg.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    msg.msg_iov = &mut iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control = cmsg_space.as_mut_ptr() as *mut libc::c_void;
+    msg.msg_controllen = cmsg_space.len() as _;
+
+    let n = unsafe { libc::recvmsg(socket.as_raw_fd(), &mut msg, 0) };
+    if n < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let len = n as usize;
+    let from = sockaddr_storage_to_socketaddr(&storage, msg.msg_namelen)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "recvmsg bad sockaddr"))?;
+    // If the kernel truncated the ancillary data (MSG_CTRUNC), the cmsg
+    // chain may be incomplete — don't trust it for the best-effort ECN.
+    // The 256-byte control buffer is sized so this never triggers for a
+    // single ~20-byte TOS cmsg, but skip defensively rather than walk a
+    // partial chain (worst case: the decap combine is skipped this once).
+    let outer_ecn = if msg.msg_flags & libc::MSG_CTRUNC != 0 {
+        None
+    } else {
+        parse_outer_ecn_from_cmsg(&msg)
+    };
+    Ok(WgRecv {
+        len,
+        from,
+        outer_ecn,
+    })
+}
+
+/// #2317: walk the control-message chain of a populated `msghdr` and
+/// return the 2-bit ECN (low 2 bits of the DS byte) from the first
+/// `IP_RECVTOS` / `IPV6_TCLASS` cmsg found. `IP_RECVTOS` delivers the
+/// IPv4 TOS as a single byte (some kernels pad it into an `int`-sized
+/// payload); `IPV6_TCLASS` delivers the Traffic Class as an `int`. We
+/// read the FIRST payload byte in both cases — the DS byte is the
+/// low-order byte on the little-endian hosts xpf targets and, more
+/// robustly, IP_RECVTOS's documented payload is a `u8`. Returns `None`
+/// when no TOS cmsg is present (kernel ignored the sockopt, or a
+/// truncated cmsg).
+fn parse_outer_ecn_from_cmsg(msg: &libc::msghdr) -> Option<u8> {
+    // SAFETY: `msg` is a fully-initialized msghdr returned by recvmsg
+    // (msg_control / msg_controllen describe a valid buffer). CMSG_*
+    // macros walk it; we only read aligned payload bytes within
+    // `cmsg_len`.
+    unsafe {
+        let mut cmsg = libc::CMSG_FIRSTHDR(msg);
+        while !cmsg.is_null() {
+            let level = (*cmsg).cmsg_level;
+            let ctype = (*cmsg).cmsg_type;
+            let is_v4_tos = level == libc::IPPROTO_IP && ctype == libc::IP_TOS;
+            let is_v6_tclass = level == libc::IPPROTO_IPV6 && ctype == libc::IPV6_TCLASS;
+            if is_v4_tos || is_v6_tclass {
+                let data = libc::CMSG_DATA(cmsg);
+                // cmsg_len includes the header; the payload starts at
+                // CMSG_DATA. Guard with `>=` against a malformed/truncated
+                // cmsg_len shorter than the header offset (a raw
+                // subtraction would underflow the unsigned length): require
+                // cmsg_len to cover the header plus at least one payload
+                // byte before reading the DS byte.
+                let data_off = data as usize - cmsg as usize;
+                if (*cmsg).cmsg_len as usize >= data_off + 1 {
+                    let ds = *data;
+                    return Some(ds & 0x03);
+                }
+            }
+            cmsg = libc::CMSG_NXTHDR(msg, cmsg);
+        }
+    }
+    None
+}
+
+/// #2317: convert a `recvmsg`-populated `sockaddr_storage` to a Rust
+/// `SocketAddr`. The dual-stack v6 socket reports v4 peers as v4-mapped
+/// IPv6 (caller `canonicalize_endpoint`s the result, as the prior
+/// `recv_from` path did). Returns `None` for an unrecognized family.
+fn sockaddr_storage_to_socketaddr(
+    storage: &libc::sockaddr_storage,
+    len: libc::socklen_t,
+) -> Option<SocketAddr> {
+    match storage.ss_family as libc::c_int {
+        libc::AF_INET => {
+            if (len as usize) < std::mem::size_of::<libc::sockaddr_in>() {
+                return None;
+            }
+            // SAFETY: family is AF_INET and len covers a sockaddr_in.
+            let sin = unsafe { &*(storage as *const _ as *const libc::sockaddr_in) };
+            let ip = std::net::Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr));
+            let port = u16::from_be(sin.sin_port);
+            Some(SocketAddr::new(std::net::IpAddr::V4(ip), port))
+        }
+        libc::AF_INET6 => {
+            if (len as usize) < std::mem::size_of::<libc::sockaddr_in6>() {
+                return None;
+            }
+            // SAFETY: family is AF_INET6 and len covers a sockaddr_in6.
+            let sin6 = unsafe { &*(storage as *const _ as *const libc::sockaddr_in6) };
+            let ip = std::net::Ipv6Addr::from(sin6.sin6_addr.s6_addr);
+            let port = u16::from_be(sin6.sin6_port);
+            Some(SocketAddr::new(std::net::IpAddr::V6(ip), port))
+        }
+        _ => None,
+    }
+}
+
 /// Build + send a fresh initiation toward the peer endpoint. A send
 /// error is surfaced as an exception (the next tick retries); a missing
 /// session keeps the timer armed.
@@ -1033,6 +1247,7 @@ fn dispatch_inbound(
     tun: &mut std::fs::File,
     datagram: &[u8],
     from: SocketAddr,
+    outer_ecn: Option<u8>,
     decap_buf: &mut [u8],
     response_buf: &mut [u8],
     tunnel_name: &str,
@@ -1089,6 +1304,42 @@ fn dispatch_inbound(
         crate::afxdp::wg::WG_TYPE_DATA => {
             match engine.try_decap(datagram, decap_buf) {
                 Ok(outcome) => {
+                    // #2317: RFC 6040 §4.2 decap-side ECN combine. The
+                    // outer ECN was captured out-of-band via recvmsg's
+                    // IP_RECVTOS / IPV6_RECVTCLASS cmsg (the kernel UDP
+                    // stack stripped the outer IP header before this WG
+                    // record reached userspace). Fold it into the
+                    // freshly-decrypted inner IP packet: an outer CE
+                    // upgrades an ECN-capable inner to CE (recomputing the
+                    // inner IPv4 header checksum), and the illegal
+                    // outer-CE / inner-Not-ECT combination is dropped
+                    // (counter bumped in apply_decap_ecn_combine). Reuses
+                    // the GRE decap combine body, with the WG-specific
+                    // illegal-drop counter. Skipped when no TOS cmsg
+                    // arrived (`outer_ecn` is None) or the inner family is
+                    // unrecognizable — never mutate on a malformed inner.
+                    if let Some(outer_ecn) = outer_ecn {
+                        let inner = &mut decap_buf[..outcome.len];
+                        let inner_family = match inner.first().map(|b| b >> 4) {
+                            Some(4) => Some(libc::AF_INET as u8),
+                            Some(6) => Some(libc::AF_INET6 as u8),
+                            _ => None,
+                        };
+                        if let Some(fam) = inner_family
+                            && !crate::afxdp::gre::apply_decap_ecn_combine(
+                                inner,
+                                fam,
+                                outer_ecn,
+                                &crate::afxdp::gre::WG_DECAP_ECN_ILLEGAL_DROPS,
+                            )
+                        {
+                            // Illegal RFC 6040 §4.2 combination — drop the
+                            // inner without writing it to the TUN. The
+                            // datagram still authenticated (the peer holds
+                            // the keys), so endpoint-learning proceeds.
+                            return InboundOutcome::Authenticated(outcome.peer_pubkey);
+                        }
+                    }
                     // Write the plaintext inner IP to the wgN TUN; the
                     // kernel routes/firewalls it (NOT the AF_XDP policy
                     // engine — the AllowedIPs gate inside try_decap is
@@ -1508,5 +1759,171 @@ mod tests {
         // the old constant would have capped this at 1500.
         assert!(wg_inner_fits_outer_mtu(5000, false, 9000));
         assert!(!wg_inner_fits_outer_mtu(5000, false, 1500));
+    }
+
+    // =======================================================================
+    // #2317: recvmsg / cmsg outer-ECN capture + RFC 6040 §4.2 WG decap
+    // combine. The cmsg-parse tests build a synthetic control buffer with
+    // the real libc CMSG_* macros and feed it to the same
+    // `parse_outer_ecn_from_cmsg` the recv path uses, so the alignment +
+    // walk logic is exercised exactly as in production.
+    // =======================================================================
+
+    /// Build a `msghdr` whose msg_control holds a single cmsg of
+    /// `(level, ctype)` carrying the one-byte DS payload `ds`, and return
+    /// the parsed outer ECN. The cmsg buffer is leaked into a Vec the
+    /// caller keeps alive for the duration of the parse (the msghdr
+    /// borrows it).
+    fn parse_ecn_with_cmsg(level: libc::c_int, ctype: libc::c_int, ds: u8) -> Option<u8> {
+        unsafe {
+            // CMSG_SPACE(1) bytes hold a header + 1 padded payload byte.
+            let space = libc::CMSG_SPACE(1) as usize;
+            let mut buf = vec![0u8; space];
+            let mut msg: libc::msghdr = std::mem::zeroed();
+            msg.msg_control = buf.as_mut_ptr() as *mut libc::c_void;
+            msg.msg_controllen = space as _;
+            let cmsg = libc::CMSG_FIRSTHDR(&msg);
+            assert!(!cmsg.is_null(), "CMSG_FIRSTHDR null");
+            (*cmsg).cmsg_level = level;
+            (*cmsg).cmsg_type = ctype;
+            (*cmsg).cmsg_len = libc::CMSG_LEN(1) as _;
+            *libc::CMSG_DATA(cmsg) = ds;
+            // msg_controllen must reflect the actual bytes written for the
+            // walk to terminate correctly.
+            msg.msg_controllen = libc::CMSG_SPACE(1) as _;
+            parse_outer_ecn_from_cmsg(&msg)
+        }
+    }
+
+    #[test]
+    fn cmsg_parse_v4_ip_tos_extracts_ecn() {
+        // IPv4 IP_TOS cmsg: DS byte 0xB8 = EF (DSCP 46) + Not-ECT(00).
+        assert_eq!(
+            parse_ecn_with_cmsg(libc::IPPROTO_IP, libc::IP_TOS, 0xB8),
+            Some(0b00)
+        );
+        // DS byte with ECT(0) low bits: DSCP 0 + ECT(0)=0b10.
+        assert_eq!(
+            parse_ecn_with_cmsg(libc::IPPROTO_IP, libc::IP_TOS, 0b10),
+            Some(0b10)
+        );
+        // DS byte with CE low bits: AF41 (DSCP 34 << 2 = 0x88) | CE(0b11).
+        assert_eq!(
+            parse_ecn_with_cmsg(libc::IPPROTO_IP, libc::IP_TOS, 0x88 | 0b11),
+            Some(0b11)
+        );
+    }
+
+    #[test]
+    fn cmsg_parse_v6_tclass_extracts_ecn() {
+        // IPv6 IPV6_TCLASS cmsg: Traffic Class byte with ECT(1) low bits.
+        assert_eq!(
+            parse_ecn_with_cmsg(libc::IPPROTO_IPV6, libc::IPV6_TCLASS, 0b01),
+            Some(0b01)
+        );
+        // CE in the low 2 bits.
+        assert_eq!(
+            parse_ecn_with_cmsg(libc::IPPROTO_IPV6, libc::IPV6_TCLASS, 0xFF),
+            Some(0b11)
+        );
+    }
+
+    #[test]
+    fn cmsg_parse_ignores_unrelated_cmsg() {
+        // A non-TOS cmsg (e.g. SOL_SOCKET / SO_TIMESTAMP-shaped) yields no
+        // ECN — only IP_TOS / IPV6_TCLASS are honored.
+        assert_eq!(
+            parse_ecn_with_cmsg(libc::SOL_SOCKET, libc::SCM_RIGHTS, 0xFF),
+            None
+        );
+    }
+
+    #[test]
+    fn cmsg_parse_empty_control_yields_none() {
+        // No control buffer at all (kernel ignored the sockopt) → None,
+        // and the decap combine is skipped.
+        unsafe {
+            let mut msg: libc::msghdr = std::mem::zeroed();
+            msg.msg_control = std::ptr::null_mut();
+            msg.msg_controllen = 0;
+            assert_eq!(parse_outer_ecn_from_cmsg(&msg), None);
+        }
+    }
+
+    /// The WG decap site reuses the shared `apply_decap_ecn_combine`: an
+    /// outer CE over an ECN-capable IPv4 inner upgrades the inner to CE
+    /// and recomputes the IPv4 header checksum, and a LEGAL upgrade does
+    /// NOT touch the (per-tunnel) illegal-drop counter. A test-local
+    /// `AtomicU64` stands in for the counter so the strict delta is
+    /// deterministic regardless of concurrent tests touching the
+    /// process-global GRE/WG statics.
+    #[test]
+    fn wg_apply_combine_sets_ipv4_ce_and_recomputes_checksum() {
+        use crate::afxdp::gre::apply_decap_ecn_combine;
+        // Minimal 20-byte IPv4 header, DSCP 0 + ECT(0), valid checksum.
+        let mut inner = vec![0u8; 20];
+        inner[0] = 0x45; // version 4, IHL 5
+        inner[1] = 0b10; // DSCP 0, ECT(0)
+        inner[9] = PROTO_TCP;
+        let cs = crate::afxdp::frame::checksum16(&inner[..20]);
+        inner[10..12].copy_from_slice(&cs.to_be_bytes());
+        assert_eq!(crate::afxdp::frame::checksum16(&inner[..20]), 0);
+
+        let counter = AtomicU64::new(0);
+        let forward = apply_decap_ecn_combine(&mut inner, libc::AF_INET as u8, 0b11, &counter);
+        assert!(forward, "ECT inner + outer CE forwards after CE upgrade");
+        assert_eq!(inner[1] & 0x03, 0b11, "inner ECN upgraded to CE");
+        assert_eq!(inner[1] >> 2, 0, "inner DSCP untouched");
+        assert_eq!(
+            crate::afxdp::frame::checksum16(&inner[..20]),
+            0,
+            "IPv4 header checksum recomputed after the TOS change"
+        );
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            0,
+            "a legal CE upgrade must not bump the illegal-drop counter"
+        );
+    }
+
+    /// The illegal §4.2 combo (outer CE over a Not-ECT inner) DROPS and
+    /// bumps the passed counter exactly once. The WG production wiring
+    /// passes `WG_DECAP_ECN_ILLEGAL_DROPS` (asserted separately below with
+    /// a concurrency-tolerant `>=` check); the strict +1 is verified on a
+    /// test-local atomic so it is deterministic under parallel tests.
+    #[test]
+    fn wg_apply_combine_drops_illegal_combo_and_counts() {
+        use crate::afxdp::gre::{apply_decap_ecn_combine, WG_DECAP_ECN_ILLEGAL_DROPS};
+        let mut inner = vec![0u8; 20];
+        inner[0] = 0x45;
+        inner[1] = 0x88; // AF41 (DSCP 34), ECN Not-ECT(00)
+
+        // Strict +1 on an isolated counter — deterministic.
+        let counter = AtomicU64::new(0);
+        let forward = apply_decap_ecn_combine(&mut inner, libc::AF_INET as u8, 0b11, &counter);
+        assert!(!forward, "outer CE over a Not-ECT inner must DROP (§4.2)");
+        assert_eq!(
+            counter.load(Ordering::Relaxed),
+            1,
+            "the illegal combo must bump the passed counter exactly once"
+        );
+
+        // Production wiring: the WG global advances (>= because other
+        // parallel tests may also bump it). Proves the WG path routes to
+        // the WG counter, not just an arbitrary one.
+        let wg_before = WG_DECAP_ECN_ILLEGAL_DROPS.load(Ordering::Relaxed);
+        let mut inner2 = vec![0u8; 20];
+        inner2[0] = 0x45;
+        inner2[1] = 0x88;
+        assert!(!apply_decap_ecn_combine(
+            &mut inner2,
+            libc::AF_INET as u8,
+            0b11,
+            &WG_DECAP_ECN_ILLEGAL_DROPS,
+        ));
+        assert!(
+            WG_DECAP_ECN_ILLEGAL_DROPS.load(Ordering::Relaxed) >= wg_before + 1,
+            "the WG global illegal-drop counter must advance on the WG path"
+        );
     }
 }

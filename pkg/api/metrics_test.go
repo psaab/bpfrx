@@ -830,6 +830,12 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 			nil,
 			nil,
 		),
+		userspaceWgDecapEcnIllegalDrops: prometheus.NewDesc(
+			"xpf_userspace_wg_decap_ecn_illegal_drops_total",
+			"wg decap rfc6040 illegal-combo drops",
+			nil,
+			nil,
+		),
 		userspaceFlowCacheActiveFlows: prometheus.NewDesc(
 			"xpf_userspace_flow_cache_active_flows",
 			"flow-cache active flows",
@@ -864,6 +870,9 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 		// #2315: GRE-decap RFC 6040 §4.2 illegal-combo drop counter
 		// emitted unconditionally.
 		GreDecapEcnIllegalDropsTotal: 3,
+		// #2317: WG-decap RFC 6040 §4.2 illegal-combo drop counter
+		// emitted unconditionally.
+		WgDecapEcnIllegalDropsTotal: 5,
 		// #1861: install-refusal trio emitted unconditionally.
 		SessionCreateDrops:             9,
 		SessionInstallAdmissionRefused: 8,
@@ -899,9 +908,10 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 	}
 	// 10 pre-#1861 metrics + the #1861 install-refusal trio + the #2244
 	// dnat_table reverse-NAT publish-error counter (= 14) + the #2315
-	// gre_decap_ecn_illegal_drops_total counter = 15.
-	if len(got) != 15 {
-		t.Fatalf("emitUserspaceDynamicBufferMetrics: want 15 metrics, got %d", len(got))
+	// gre_decap_ecn_illegal_drops_total counter (= 15) + the #2317
+	// wg_decap_ecn_illegal_drops_total counter = 16.
+	if len(got) != 16 {
+		t.Fatalf("emitUserspaceDynamicBufferMetrics: want 16 metrics, got %d", len(got))
 	}
 
 	assertGaugeClose(t, got, c.userspaceSessionTableEntries, nil, 77)
@@ -921,6 +931,9 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 	// #2315: GRE-decap RFC 6040 §4.2 illegal-combo drop counter emitted
 	// unconditionally.
 	assertCounterClose(t, got, c.userspaceGreDecapEcnIllegalDrops, nil, 3)
+	// #2317: WG-decap RFC 6040 §4.2 illegal-combo drop counter emitted
+	// unconditionally.
+	assertCounterClose(t, got, c.userspaceWgDecapEcnIllegalDrops, nil, 5)
 	// #1861: install-refusal trio emitted unconditionally.
 	assertCounterClose(t, got, c.userspaceSessionCreateDrops, nil, 9)
 	assertCounterClose(t, got, c.userspaceSessionInstallAdmissionRefused, nil, 8)

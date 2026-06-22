@@ -15,14 +15,20 @@
 //! helper remains for the DSCP-only case (a config-set DSCP value with
 //! no inner-packet ECN to carry).
 //!
-//! NOTE (#2315): the complementary DECAP-side RFC 6040 §4.2 ECN
+//! NOTE (#2315/#2317): the complementary DECAP-side RFC 6040 §4.2 ECN
 //! *combine* (outer ECN → inner ECN — the half that reflects a CE mark
-//! back to the inner endpoints) is implemented for the GRE decap path
-//! only (`crate::afxdp::gre::apply_decap_ecn_combine`). The WG decap
-//! path reads transport records from a plain `UdpSocket::recv_from`, so
-//! the kernel strips the outer IP header (and its ECN) before userspace
-//! sees the datagram; the WG decap combine is a tracked follow-up
-//! (#2317) gated on `IP_RECVTOS`/`IPV6_RECVTCLASS` + `recvmsg`.
+//! back to the inner endpoints) is implemented for BOTH tunnel paths via
+//! the shared `crate::afxdp::gre::apply_decap_ecn_combine`. The GRE path
+//! reads the outer ECN from the still-present outer IP header in the
+//! frame (#2315). The WG control thread reads transport records from a
+//! kernel `UdpSocket`, which strips the outer IP header (and its ECN)
+//! before userspace sees the datagram; #2317 captures the outer ECN
+//! out-of-band via `recvmsg` + `IP_RECVTOS` (v4 / v4-mapped) /
+//! `IPV6_RECVTCLASS` (v6) ancillary data and feeds it into the same
+//! combine after WG-decrypt, before the inner packet is written to the
+//! wgN TUN (see `crate::afxdp::coordinator::wg_control`). The two
+//! tunnel families keep independent illegal-combination drop counters
+//! (`GRE_DECAP_ECN_ILLEGAL_DROPS` / `WG_DECAP_ECN_ILLEGAL_DROPS`).
 
 /// Build the outer IPv4 TOS / IPv6 Traffic Class byte from a
 /// 6-bit DSCP value. ECN bits are cleared (use

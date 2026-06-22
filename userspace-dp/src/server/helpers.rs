@@ -87,6 +87,12 @@ pub(crate) fn refresh_status(state: &mut ServerState) {
     // ECT-marked the outer for un-ECN inner traffic on a congested path.
     state.status.gre_decap_ecn_illegal_drops_total =
         state.afxdp.gre_decap_ecn_illegal_drops_total();
+    // #2317: WG-decap RFC 6040 §4.2 illegal-combination drops (outer CE,
+    // captured via recvmsg IP_RECVTOS/IPV6_RECVTCLASS, over a Not-ECT
+    // inner). Nonzero = a misbehaving WG ingress CE-marked the outer for
+    // un-ECN inner traffic on a congested path.
+    state.status.wg_decap_ecn_illegal_drops_total =
+        state.afxdp.wg_decap_ecn_illegal_drops_total();
     // The per-key dynamic_neighbors dump is a high-cardinality
     // (ifindex,ip)-labelled debug surface used only by the #1782 cold-start
     // capture. Gate it behind XPF_DEBUG_NEIGHBOR_KEYS so it is OFF by default:

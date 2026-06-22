@@ -466,7 +466,9 @@ fn apply_decap_combine_sets_ipv4_ce_and_recomputes_checksum() {
     // Inner IPv4, ECT(0), valid checksum. Outer CE → inner must become
     // CE and the IPv4 header checksum must stay valid after the TOS
     // byte changed.
-    let before = GRE_DECAP_ECN_ILLEGAL_DROPS.load(Ordering::Relaxed);
+    // Test-local counter so the "must not bump" assertion is
+    // deterministic regardless of parallel tests touching the global.
+    let counter = AtomicU64::new(0);
     let mut inner = inner_ipv4_with_tos((0u8 << 2) | ECT_0); // DSCP 0, ECT(0)
     // Seed a correct checksum for the starting header.
     inner[10] = 0;
@@ -475,7 +477,7 @@ fn apply_decap_combine_sets_ipv4_ce_and_recomputes_checksum() {
     inner[10..12].copy_from_slice(&cs.to_be_bytes());
     assert!(ipv4_header_checksum_ok(&inner), "fixture must start valid");
 
-    let forward = apply_decap_ecn_combine(&mut inner, libc::AF_INET as u8, CE);
+    let forward = apply_decap_ecn_combine(&mut inner, libc::AF_INET as u8, CE, &counter);
     assert!(forward, "ECT inner + outer CE forwards (after CE upgrade)");
     assert_eq!(inner[1] & 0x03, CE, "inner ECN must be upgraded to CE");
     assert_eq!(inner[1] >> 2, 0, "inner DSCP must be untouched (was 0)");
@@ -484,8 +486,8 @@ fn apply_decap_combine_sets_ipv4_ce_and_recomputes_checksum() {
         "IPv4 header checksum must be recomputed after the TOS change"
     );
     assert_eq!(
-        GRE_DECAP_ECN_ILLEGAL_DROPS.load(Ordering::Relaxed),
-        before,
+        counter.load(Ordering::Relaxed),
+        0,
         "a legal upgrade must not bump the illegal-drop counter"
     );
 }
@@ -499,7 +501,12 @@ fn apply_decap_combine_preserves_dscp_on_ce_upgrade() {
     let cs = crate::afxdp::frame::checksum16(&inner[..20]);
     inner[10..12].copy_from_slice(&cs.to_be_bytes());
 
-    assert!(apply_decap_ecn_combine(&mut inner, libc::AF_INET as u8, CE));
+    assert!(apply_decap_ecn_combine(
+        &mut inner,
+        libc::AF_INET as u8,
+        CE,
+        &GRE_DECAP_ECN_ILLEGAL_DROPS,
+    ));
     assert_eq!(inner[1] >> 2, 46, "DSCP (EF) must survive the CE upgrade");
     assert_eq!(inner[1] & 0x03, CE);
     assert!(ipv4_header_checksum_ok(&inner));
@@ -510,12 +517,19 @@ fn apply_decap_combine_drops_illegal_ipv4_combo_and_counts() {
     // Inner Not-ECT + outer CE → drop + counter bump.
     let before = GRE_DECAP_ECN_ILLEGAL_DROPS.load(Ordering::Relaxed);
     let mut inner = inner_ipv4_with_tos((34u8 << 2) | NOT_ECT); // AF41, Not-ECT
-    let forward = apply_decap_ecn_combine(&mut inner, libc::AF_INET as u8, CE);
+    let forward = apply_decap_ecn_combine(
+        &mut inner,
+        libc::AF_INET as u8,
+        CE,
+        &GRE_DECAP_ECN_ILLEGAL_DROPS,
+    );
     assert!(!forward, "outer CE over a Not-ECT inner must DROP (§4.2)");
-    assert_eq!(
-        GRE_DECAP_ECN_ILLEGAL_DROPS.load(Ordering::Relaxed),
-        before + 1,
-        "the illegal-combo drop must bump the counter"
+    // `>=` not `== before + 1`: GRE_DECAP_ECN_ILLEGAL_DROPS is a
+    // process-global static and other parallel tests (the IPv6 drop test,
+    // the WG-wiring test) may bump it between the snapshots.
+    assert!(
+        GRE_DECAP_ECN_ILLEGAL_DROPS.load(Ordering::Relaxed) >= before + 1,
+        "the illegal-combo drop must advance the counter"
     );
 }
 
@@ -530,7 +544,12 @@ fn apply_decap_combine_keeps_inner_when_outer_not_congested() {
     inner[10..12].copy_from_slice(&cs.to_be_bytes());
     let snapshot = inner.clone();
 
-    assert!(apply_decap_ecn_combine(&mut inner, libc::AF_INET as u8, NOT_ECT));
+    assert!(apply_decap_ecn_combine(
+        &mut inner,
+        libc::AF_INET as u8,
+        NOT_ECT,
+        &GRE_DECAP_ECN_ILLEGAL_DROPS,
+    ));
     assert_eq!(
         inner, snapshot,
         "outer Not-ECT must leave the inner byte-for-byte unchanged"
@@ -549,7 +568,12 @@ fn apply_decap_combine_sets_ipv6_ce_without_checksum() {
     v6[1] = ECT_0 << 4; // ECN = ECT(0) in the high nibble of octet 1
     let snapshot_octet0 = v6[0];
 
-    assert!(apply_decap_ecn_combine(&mut v6, libc::AF_INET6 as u8, CE));
+    assert!(apply_decap_ecn_combine(
+        &mut v6,
+        libc::AF_INET6 as u8,
+        CE,
+        &GRE_DECAP_ECN_ILLEGAL_DROPS,
+    ));
     // ECN = (octet1 >> 4) & 0x03 must be CE.
     assert_eq!((v6[1] >> 4) & 0x03, CE, "inner IPv6 ECN must become CE");
     assert_eq!(
@@ -564,20 +588,29 @@ fn apply_decap_combine_drops_illegal_ipv6_combo_and_counts() {
     let mut v6 = vec![0u8; 40];
     v6[0] = 0x60;
     v6[1] = (NOT_ECT) << 4; // inner Not-ECT
-    assert!(!apply_decap_ecn_combine(&mut v6, libc::AF_INET6 as u8, CE));
-    assert_eq!(
-        GRE_DECAP_ECN_ILLEGAL_DROPS.load(Ordering::Relaxed),
-        before + 1
-    );
+    assert!(!apply_decap_ecn_combine(
+        &mut v6,
+        libc::AF_INET6 as u8,
+        CE,
+        &GRE_DECAP_ECN_ILLEGAL_DROPS,
+    ));
+    // `>=`: process-global static; parallel tests may also bump it.
+    assert!(GRE_DECAP_ECN_ILLEGAL_DROPS.load(Ordering::Relaxed) >= before + 1);
 }
 
 #[test]
 fn apply_decap_combine_short_packet_forwards_unchanged() {
     // Too short to hold the TOS byte: forward, never panic, no counter.
-    let before = GRE_DECAP_ECN_ILLEGAL_DROPS.load(Ordering::Relaxed);
+    // Test-local counter so the "no bump" assertion is deterministic.
+    let counter = AtomicU64::new(0);
     let mut tiny = vec![0x45u8]; // 1 byte
-    assert!(apply_decap_ecn_combine(&mut tiny, libc::AF_INET as u8, CE));
-    assert_eq!(GRE_DECAP_ECN_ILLEGAL_DROPS.load(Ordering::Relaxed), before);
+    assert!(apply_decap_ecn_combine(
+        &mut tiny,
+        libc::AF_INET as u8,
+        CE,
+        &counter,
+    ));
+    assert_eq!(counter.load(Ordering::Relaxed), 0);
 }
 
 // --- #2299 WG SYN MSS clamp uses the WG-overhead formula --------------

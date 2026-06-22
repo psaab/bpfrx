@@ -250,8 +250,12 @@ type xpfCollector struct {
 	// that ECT-marked the outer for un-ECN inner traffic on a congested
 	// path.
 	userspaceGreDecapEcnIllegalDrops *prometheus.Desc
-	userspaceFlowCacheActiveFlows    *prometheus.Desc
-	userspaceFlowCacheCapacity                  *prometheus.Desc
+	// #2317: WG-decap RFC 6040 §4.2 illegal-combination drops (outer CE,
+	// captured via recvmsg IP_RECVTOS/IPV6_RECVTCLASS, over a Not-ECT
+	// inner) — the WG sibling of the GRE counter above.
+	userspaceWgDecapEcnIllegalDrops *prometheus.Desc
+	userspaceFlowCacheActiveFlows   *prometheus.Desc
+	userspaceFlowCacheCapacity      *prometheus.Desc
 	// #1379: daemon-side userspace event-stream transport counters.
 	userspaceEventStreamFramesTotal          *prometheus.Desc
 	userspaceEventStreamProducerFramesTotal  *prometheus.Desc
@@ -537,6 +541,7 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.userspaceNatReverseKeySharedDisplacements
 	ch <- c.userspaceWorkerCommandQueuePoisonRecoveries
 	ch <- c.userspaceGreDecapEcnIllegalDrops
+	ch <- c.userspaceWgDecapEcnIllegalDrops
 	ch <- c.userspaceFlowCacheActiveFlows
 	ch <- c.userspaceFlowCacheCapacity
 	ch <- c.userspaceEventStreamFramesTotal

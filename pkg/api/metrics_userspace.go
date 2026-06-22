@@ -534,6 +534,16 @@ func (c *xpfCollector) emitUserspaceDynamicBufferMetrics(ch chan<- prometheus.Me
 		float64(status.GreDecapEcnIllegalDropsTotal),
 	)
 
+	// #2317: WG-decap RFC 6040 4.2 illegal-combination drops (outer CE,
+	// recvmsg-captured, over a Not-ECT inner). Emitted unconditionally so
+	// a 0 is a real "no illegal combinations seen" signal rather than an
+	// absent series.
+	ch <- prometheus.MustNewConstMetric(
+		c.userspaceWgDecapEcnIllegalDrops,
+		prometheus.CounterValue,
+		float64(status.WgDecapEcnIllegalDropsTotal),
+	)
+
 	var activeFlows, flowCapacity uint64
 	for _, b := range status.Bindings {
 		activeFlows += uint64(b.ActiveFlowCount)

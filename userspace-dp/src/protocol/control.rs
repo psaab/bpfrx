@@ -244,6 +244,17 @@ pub(crate) struct ProcessStatus {
     /// Additive / defaulted for backward compatibility.
     #[serde(rename = "gre_decap_ecn_illegal_drops_total", default)]
     pub gre_decap_ecn_illegal_drops_total: u64,
+    /// #2317: WireGuard-decap inner packets dropped by the SAME RFC 6040
+    /// §4.2 decap-side ECN combine, for the WG path. The WG decap site
+    /// captures the outer ECN out-of-band via `recvmsg` +
+    /// `IP_RECVTOS`/`IPV6_RECVTCLASS` (the kernel UDP socket strips the
+    /// outer IP header before userspace) and feeds it into the same
+    /// combine. Surfaced as the Prometheus counter
+    /// `xpf_userspace_wg_decap_ecn_illegal_drops_total`; nonzero flags a
+    /// misbehaving WG ingress on a congested path. Additive / defaulted
+    /// for backward compatibility.
+    #[serde(rename = "wg_decap_ecn_illegal_drops_total", default)]
+    pub wg_decap_ecn_illegal_drops_total: u64,
     /// #1782 cold-start capture instrumentation. Debug dump of every key
     /// present in the userspace `dynamic_neighbors` mirror, rendered as
     /// `"ifindex ip"` strings. The capture harness greps this at the

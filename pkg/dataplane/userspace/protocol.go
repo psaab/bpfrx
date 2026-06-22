@@ -809,6 +809,14 @@ type ProcessStatus struct {
 	// xpf_userspace_gre_decap_ecn_illegal_drops_total. Omitempty for wire
 	// compat with older helpers (defaults to 0).
 	GreDecapEcnIllegalDropsTotal uint64 `json:"gre_decap_ecn_illegal_drops_total,omitempty"`
+	// #2317: WireGuard-decap inner packets dropped by the SAME RFC 6040
+	// §4.2 decap-side ECN combine, for the WG path. The WG decap site
+	// captures the outer ECN out-of-band via recvmsg + IP_RECVTOS /
+	// IPV6_RECVTCLASS (the kernel UDP socket strips the outer IP header
+	// before userspace) and feeds it into the same combine. Surfaced as
+	// xpf_userspace_wg_decap_ecn_illegal_drops_total. Omitempty for wire
+	// compat with older helpers (defaults to 0).
+	WgDecapEcnIllegalDropsTotal uint64 `json:"wg_decap_ecn_illegal_drops_total,omitempty"`
 	// #1769: on-demand neighbor-resolver telemetry. The resolver fires
 	// when a MissingNeighbor negative-cache fast-fail nudges a wedged dst
 	// (single-key RTM_GETNEIGH + epoch-guarded cache or probe-on-stale).

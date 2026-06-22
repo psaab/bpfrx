@@ -18,7 +18,7 @@ therefore staged by capability, not by vendor.
 | #1434 | Multi-PEER per WG interface (N peers on one listen port) | **DONE (#1434 B1a+B1b)** — Go config `TunnelConfig.WgPeers []WgPeerConfig` (named-instance `peer <pubkey>` schema + dual-AST compiler + commit gate), wire slice `wg_peers`, Rust engine fed N peers (RX/decap already multi-peer), egress generalized: encap LPM-selects the peer by inner-dst AllowedIPs (`frame/wg.rs` + `engine.peer_for_dest`), the WG control thread keeps per-peer effective-endpoint + per-peer handshake attempt + per-peer keepalive/rekey timers (`timer_pass_for_peer`), and per-peer status rows. The LIVE multi-peer handshake / Ubiquiti interop validation is #1703. KNOWN LIMITATION: the worker-driven NoSession/rekey REQUEST edges are still engine-wide (single edge), not per-peer — the per-peer T6/T7/T8 timers ARE per-peer; per-peer request edges ride #1703. |
 | S5 | Persistent-keepalive + REKEY/REJECT-AFTER timers + endpoint roaming + empty-record (keepalive/key-confirm) handling + TAI64N disk persistence | **timers + keepalives DONE (#1888/#1889)** — full whitepaper §6.1 timer machine (REKEY_AFTER_TIME 120s initiator-only, 165s receive horizon, REJECT_AFTER_TIME 180s per-use + expiry teardown, 5s/90s retry discipline, 10s passive + configured persistent keepalives, post-msg2 key-confirmation keepalive) on a blocking-poll(2) control loop; design of record `docs/research/1888-wg-timers/plan.md`. Authenticated-datagram endpoint LEARNING shipped in S2a/#1888 (keepalives now count); engine-level roam API + TAI64N disk persistence remain pending |
 | S6 | Junos config surface (grammar + compiler + snapshot population, base64↔hex keys) | pending |
-| S7 | Type-3 CookieReply + MAC2 generation/verification + IPv6 outer encap + DSCP/ECN | **DSCP/ECN encap DONE (#2303)** — inner DSCP+ECN copied onto the outer header (uniform DSCP + RFC 6040 ECN ingress copy). GRE decap-side RFC 6040 §4.2 ECN *combine* shipped in #2315; **WG decap-side combine still pending (#2317)** — blocked on `IP_RECVTOS`/`recvmsg` recv-loop changes. CookieReply/MAC2 still pending |
+| S7 | Type-3 CookieReply + MAC2 generation/verification + IPv6 outer encap + DSCP/ECN | **DSCP/ECN encap DONE (#2303)** — inner DSCP+ECN copied onto the outer header (uniform DSCP + RFC 6040 ECN ingress copy). RFC 6040 §4.2 decap-side ECN *combine* shipped for GRE (#2315) AND WG (#2317) — WG captures the outer ECN via `recvmsg` + `IP_RECVTOS`/`IPV6_RECVTCLASS` cmsg and folds it into the decrypted inner via the shared `apply_decap_ecn_combine` (live ECN-propagation verification lab-deferred to #1703-class interop). CookieReply/MAC2 still pending |
 | S8 | HA RG WG-session migration | pending |
 
 ## Tunnel MTU + MSS + DSCP/ECN model (#2299 / #2300 / #2303)
@@ -70,25 +70,37 @@ plus the RFC 6040 normal-mode ECN ingress COPY (inner ECN → outer ECN).
 `wg::dscp::tos_from_dscp` (which clears ECN) is retained for the
 DSCP-only case but is NOT the encap reader.
 
-**Decap (#2315).** The RFC 6040 §4.2 decap-side ECN *combine* (outer ECN
-→ inner ECN) — the half that actually reflects a CE mark applied by a
-congested router on the outer path back to the inner endpoints — is
-implemented for the **GRE decap path only**
-(`gre::apply_decap_ecn_combine`, wired into
-`try_native_gre_decap_from_frame`): an outer CE upgrades an ECN-capable
-inner to CE; the illegal outer-CE / inner-Not-ECT combination is dropped
-(`xpf_userspace_gre_decap_ecn_illegal_drops_total`); the inner DSCP is
-authoritative at decap and is never copied from the outer. DSCP is not
-copied back at decap.
+**Decap (#2315 GRE / #2317 WG).** The RFC 6040 §4.2 decap-side ECN
+*combine* (outer ECN → inner ECN) — the half that actually reflects a CE
+mark applied by a congested router on the outer path back to the inner
+endpoints — is implemented for **both tunnel paths** via the shared
+`gre::apply_decap_ecn_combine`: an outer CE upgrades an ECN-capable inner
+to CE; the illegal outer-CE / inner-Not-ECT combination is dropped; the
+inner DSCP is authoritative at decap and is never copied from the outer.
+DSCP is not copied back at decap.
 
-> **WireGuard decap is NOT yet combined (#2317).** The WG control thread
-> reads transport records from a plain `UdpSocket::recv_from`, so the
-> kernel has already stripped the outer IP header before the datagram
-> reaches userspace — the outer ECN is gone at that layer. Recovering it
-> needs `IP_RECVTOS` / `IPV6_RECVTCLASS` + a `recvmsg` control-message
-> recv loop, then combining into the inner before the `tun.write_all`.
-> Tracked as a follow-up; do NOT read the encap-copy as "ECN is
-> reflected at WG decap".
+- **GRE (#2315)** reads the outer ECN from the still-present outer IP
+  header in the frame (`outer_ecn_bits`, wired into
+  `try_native_gre_decap_from_frame`). Illegal-combination drops surface as
+  `xpf_userspace_gre_decap_ecn_illegal_drops_total`.
+
+- **WireGuard (#2317)** captures the outer ECN out-of-band. The WG control
+  thread reads transport records from a kernel `UdpSocket`, which strips
+  the outer IP header (and its ECN) before the datagram reaches
+  userspace, so the recv loop uses `recvmsg` with the `IP_RECVTOS` (v4 /
+  v4-mapped) and `IPV6_RECVTCLASS` (v6) socket options enabled at bind;
+  the outer DS byte arrives as ancillary data (`IP_TOS` / `IPV6_TCLASS`
+  cmsg), and its low 2 bits are folded into the freshly-decrypted inner IP
+  packet — before `tun.write_all` — through the same combine. Illegal-
+  combination drops surface as
+  `xpf_userspace_wg_decap_ecn_illegal_drops_total` (a sibling counter, so
+  the two families are independently observable). The combine is skipped
+  best-effort when no TOS cmsg arrives (a kernel that did not honor the
+  sockopt) — never fatal to the tunnel. Live end-to-end verification (a
+  real WG peer CE-marking the outer → CE on the inner) is lab-bound,
+  deferred to the #1703-class interop validation; the code path and unit
+  tests (cmsg parse for v4/v6, the §4.2 combine reuse, CE upgrade + IPv4
+  checksum, illegal-combo drop+count) are in tree.
 
 ## What S1 delivers
 

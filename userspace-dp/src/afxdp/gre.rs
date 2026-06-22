@@ -94,6 +94,19 @@ pub(in crate::afxdp) fn packet_trimmed_len(packet: &[u8], addr_family: u8) -> Op
 /// the bogus CE — would silently hide the protocol violation).
 pub(in crate::afxdp) static GRE_DECAP_ECN_ILLEGAL_DROPS: AtomicU64 = AtomicU64::new(0);
 
+/// #2317: count of WireGuard-decap inner packets DROPPED by the same
+/// RFC 6040 §4.2 combine, for the WG path. Separate from the GRE
+/// counter so the two tunnel families are independently observable.
+/// Surfaced via `coordinator/status.rs` as
+/// `xpf_userspace_wg_decap_ecn_illegal_drops_total`. The WG decap path
+/// captures the outer ECN out-of-band (the kernel UDP socket strips the
+/// outer IP header before userspace, so the bits arrive as `IP_RECVTOS`
+/// / `IPV6_RECVTCLASS` ancillary data on `recvmsg` — see
+/// `coordinator/wg_control.rs`) and feeds it into the SAME
+/// `apply_decap_ecn_combine` below. A nonzero value means a misbehaving
+/// WG ingress / congested path CE-marked the outer of a Not-ECT inner.
+pub(in crate::afxdp) static WG_DECAP_ECN_ILLEGAL_DROPS: AtomicU64 = AtomicU64::new(0);
+
 /// Read the inner IP packet's DSCP+ECN byte for outer-header
 /// propagation on tunnel encap (#2303). Returns the full 8-bit
 /// TOS / Traffic-Class value (DSCP in the high 6 bits, ECN in the
@@ -275,11 +288,16 @@ pub(in crate::afxdp) fn decap_ecn_combine(inner_ecn: u8, outer_ecn: u8) -> Decap
 /// header checksum but NOT by the L4 checksum). IPv6 inners have no IP
 /// header checksum, and the IPv6 Traffic Class is not covered by the L4
 /// pseudo-header, so no checksum work is needed.
+///
+/// `illegal_drops` is the per-tunnel-family drop counter bumped on the
+/// illegal §4.2 combination (GRE and WG keep independent counters,
+/// #2315 / #2317), so this one body is shared by both decap paths.
 #[inline]
 pub(in crate::afxdp) fn apply_decap_ecn_combine(
     inner_packet: &mut [u8],
     inner_family: u8,
     outer_ecn: u8,
+    illegal_drops: &AtomicU64,
 ) -> bool {
     match inner_family as i32 {
         libc::AF_INET => {
@@ -292,7 +310,7 @@ pub(in crate::afxdp) fn apply_decap_ecn_combine(
             match decap_ecn_combine(ecn_of_tos(tos), outer_ecn) {
                 DecapEcn::Keep => true,
                 DecapEcn::Drop => {
-                    GRE_DECAP_ECN_ILLEGAL_DROPS.fetch_add(1, Ordering::Relaxed);
+                    illegal_drops.fetch_add(1, Ordering::Relaxed);
                     false
                 }
                 DecapEcn::SetCe => {
@@ -313,7 +331,7 @@ pub(in crate::afxdp) fn apply_decap_ecn_combine(
             match decap_ecn_combine(inner_ecn, outer_ecn) {
                 DecapEcn::Keep => true,
                 DecapEcn::Drop => {
-                    GRE_DECAP_ECN_ILLEGAL_DROPS.fetch_add(1, Ordering::Relaxed);
+                    illegal_drops.fetch_add(1, Ordering::Relaxed);
                     false
                 }
                 DecapEcn::SetCe => {
@@ -524,7 +542,12 @@ pub(super) fn try_native_gre_decap_from_frame(
     // recomputes the inner IPv4 header checksum when CE is set. Skipped
     // when the outer header is truncated (`outer_ecn_bits` → None).
     if let Some(outer_ecn) = outer_ecn_bits(frame, meta)
-        && !apply_decap_ecn_combine(&mut synthetic[14..], inner_family, outer_ecn)
+        && !apply_decap_ecn_combine(
+            &mut synthetic[14..],
+            inner_family,
+            outer_ecn,
+            &GRE_DECAP_ECN_ILLEGAL_DROPS,
+        )
     {
         // Illegal RFC 6040 §4.2 combination — drop (counter bumped in
         // apply_decap_ecn_combine).
