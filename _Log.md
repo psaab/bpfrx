@@ -10369,3 +10369,45 @@ top.
   userspace-dp/src/afxdp/README.md,
   pkg/dataplane/userspace/protocol.go,
   pkg/dataplane/userspace/format/status.go, docs/feature-coverage.md
+
+## 2026-06-22 — #2330 post-transform PMTUD (NAT64/GRE/WireGuard inner-source PTB)
+
+- **Timestamp**: 2026-06-22
+- **Action**: Added a POST-TRANSFORM PMTUD path so size-changing forwards
+  (NAT64, native GRE, WireGuard) generate an inner-source ICMP Frag-Needed /
+  Packet-Too-Big derived from the INNER MTU, closing the silent-blackhole gap
+  #2301 left (it gated PTB on `!is_nat64 && !uses_native_tunnel`) and the
+  PTB signal #2331 explicitly deferred here. New `post_transform_inner_mtu`
+  (icmp_ptb.rs) derives the inner MTU from the existing SSOT: GRE via
+  `native_gre_inner_mtu`, WireGuard via the new pad-aware `wg::mss::wg_inner_mtu`
+  (inverse of `frame::wg::wg_encapped_size`), NAT64 via the egress MTU ± 20
+  v6<->v4 header delta (RFC 7915). The dispatcher (tx/dispatch/mod.rs) now
+  runs the existing `forwarded_egress_mtu_decision` + `build_frag_needed_v4` /
+  `build_packet_too_big_v6` against the inner `source_frame` (which IS the
+  pre-encap/pre-translate inner packet; `meta.addr_family` is the inner
+  family) with the inner MTU as the comparison, and the generated PTB routes
+  through `classify_generated_reply` (#2328) at the shared finalizer. Pre-build
+  `mtu_signalled` skips the encap/translate build entirely, so the #2331
+  `GRE_ENCAP_DF_OVERSIZE_DROPS` and WG `encap_mtu_drops` guards are NOT bumped
+  for the PTB case (no double-drop / double-count); they remain the backstop
+  only for the residual non-DF-IPv4-inner `Forward` case. Fail-open when no
+  MTU resolvable / unknown tunnel kind (decision returns Forward). No wire
+  counter added — reuses existing `mtu_signalled` / `egress_mtu_exceeded`
+  exception / `ptb_output_filter_drops` accounting, so no protocol_wire_v1.json
+  / Go rebuild needed. Tests: 10 in icmp_ptb_tests.rs (inner-MTU per type,
+  GRE key-word, WG pad-aware, NAT64 both directions, unknown-kind fail-open,
+  end-to-end oversize -> inner PTB for GRE-v4-DF / WG-v6 / NAT64-v6,
+  in-MTU-no-PTB), 2 in cos_classify_tests.rs (post-transform PTB through
+  classify_generated_reply: terminal-discard drop + filterless admit), 4 in
+  wg/mss.rs (wg_inner_mtu). cargo build --release clean; full suite green;
+  new tests 5x stable.
+- **File(s)**: userspace-dp/src/afxdp/icmp_ptb.rs,
+  userspace-dp/src/afxdp/icmp_ptb_tests.rs,
+  userspace-dp/src/afxdp/mod.rs,
+  userspace-dp/src/afxdp/tx/dispatch/mod.rs,
+  userspace-dp/src/afxdp/tx/cos_classify_tests.rs,
+  userspace-dp/src/afxdp/wg/mss.rs,
+  userspace-dp/src/afxdp/gre.rs,
+  userspace-dp/src/afxdp/frame/wg.rs,
+  userspace-dp/src/afxdp/README.md,
+  docs/userspace-native-gre-plan.md
