@@ -2710,3 +2710,112 @@ fn classify_generated_reply_counterfactual_trigger_keying_would_misverdict() {
         "trigger-keyed classification would WRONGLY admit the reply (the #2238 bug)"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #2330: the POST-TRANSFORM inner-source PTB (NAT64/GRE/WG) must route
+// through the SAME classify_generated_reply contract as the #2301/#2328
+// egress-MTU PTB — i.e. an output `then discard protocol icmp` drops it, and
+// a malformed PTB fails closed. This proves the inner-MTU PTB built by
+// build_frag_needed_v4 / build_packet_too_big_v6 from the #2330 site is a
+// well-formed, classifiable reply (the finalizer enqueue is shared verbatim
+// with #2301, so classification behavior is identical).
+// ---------------------------------------------------------------------------
+
+/// Build a real inner-source Frag-Needed PTB (carrying an INNER MTU, the
+/// #2330 GRE/WG/NAT64 case) on egress ifindex 202's address pair, using the
+/// production builder. The trigger is a 1500-byte inner v4 DF UDP datagram.
+fn post_transform_inner_frag_needed_ptb(inner_mtu: u16) -> Vec<u8> {
+    let mut frame = Vec::new();
+    frame.extend_from_slice(&[0x02, 0xbf, 0x72, 0x00, 0x80, 0x08]); // fw mac (becomes PTB src side)
+    frame.extend_from_slice(&[0x02, 0x00, 0x00, 0x00, 0x00, 0x02]); // sender mac (becomes PTB dst)
+    frame.extend_from_slice(&0x0800u16.to_be_bytes());
+    let l3 = frame.len();
+    let total_len = (20 + 8 + 1500) as u16;
+    frame.push(0x45);
+    frame.push(0x00);
+    frame.extend_from_slice(&total_len.to_be_bytes());
+    frame.extend_from_slice(&[0x00, 0x01, 0x40, 0x00, 64, 17, 0x00, 0x00]); // DF set, UDP
+    frame.extend_from_slice(&Ipv4Addr::new(198, 51, 100, 20).octets()); // inner src
+    frame.extend_from_slice(&Ipv4Addr::new(172, 16, 80, 200).octets()); // inner dst
+    let ip_csum = crate::afxdp::checksum16(&frame[l3..l3 + 20]);
+    frame[l3 + 10..l3 + 12].copy_from_slice(&ip_csum.to_be_bytes());
+    frame.extend_from_slice(&49152u16.to_be_bytes());
+    frame.extend_from_slice(&5201u16.to_be_bytes());
+    frame.extend_from_slice(&((8 + 1500) as u16).to_be_bytes());
+    frame.extend_from_slice(&0u16.to_be_bytes());
+    frame.extend(std::iter::repeat(0xABu8).take(1500));
+
+    let meta = UserspaceDpMeta {
+        ingress_ifindex: 202,
+        l3_offset: l3 as u16,
+        l4_offset: (l3 + 20) as u16,
+        addr_family: libc::AF_INET as u8,
+        protocol: 17,
+        ..Default::default()
+    };
+
+    let mut fwd = ForwardingState::default();
+    fwd.egress.insert(
+        202,
+        EgressInterface {
+            bind_ifindex: 0,
+            vlan_id: 0,
+            mtu: 1400,
+            src_mac: [0x02, 0xbf, 0x72, 0x00, 0x80, 0x08],
+            zone_id: 0,
+            redundancy_group: 0,
+            primary_v4: Some(Ipv4Addr::new(172, 16, 80, 8)),
+            primary_v6: None,
+        },
+    );
+    crate::afxdp::build_frag_needed_v4(&frame, meta, 202, &fwd, inner_mtu)
+        .expect("inner-source frag-needed must build")
+}
+
+#[test]
+fn classify_post_transform_inner_ptb_drops_on_terminal_discard() {
+    // The #2330 inner-source PTB (advertising a GRE/WG/NAT64 inner MTU)
+    // routes through classify_generated_reply exactly like #2328's PTB: an
+    // output `then discard protocol icmp` drops it.
+    let forwarding = forwarding_with_v4_output_filter(
+        "drop-icmp",
+        FirewallTermSnapshot {
+            name: "drop-icmp".into(),
+            action: "discard".into(),
+            protocols: vec!["icmp".into()],
+            ..Default::default()
+        },
+    );
+    let ptb = post_transform_inner_frag_needed_ptb(1376); // GRE inner MTU
+    // Sanity: the built PTB carries the INNER MTU, not the transport MTU.
+    let icmp = 14 + 20;
+    assert_eq!(ptb[icmp], 3, "ICMP Frag-Needed");
+    assert_eq!(
+        u16::from_be_bytes([ptb[icmp + 6], ptb[icmp + 7]]),
+        1376,
+        "PTB advertises the inner MTU"
+    );
+    let verdict = classify_generated_reply(&forwarding, 202, &ptb, 0);
+    assert!(verdict.drop, "post-transform PTB must honor the output discard filter");
+    assert!(!verdict.parse_error, "a well-formed PTB must NOT fail as a parse error");
+}
+
+#[test]
+fn classify_post_transform_inner_ptb_admitted_without_filter() {
+    // No matching output filter -> the inner PTB is admitted (drop=false),
+    // proving classification is keyed on the PTB's own ICMP tuple and the
+    // built bytes parse cleanly (so the only drop is an intentional filter).
+    let forwarding = forwarding_with_v4_output_filter(
+        "drop-tcp",
+        FirewallTermSnapshot {
+            name: "drop-tcp".into(),
+            action: "discard".into(),
+            protocols: vec!["tcp".into()],
+            ..Default::default()
+        },
+    );
+    let ptb = post_transform_inner_frag_needed_ptb(1325); // WG inner MTU
+    let verdict = classify_generated_reply(&forwarding, 202, &ptb, 0);
+    assert!(!verdict.drop, "a TCP-only discard must not drop the ICMP PTB");
+    assert!(!verdict.parse_error);
+}

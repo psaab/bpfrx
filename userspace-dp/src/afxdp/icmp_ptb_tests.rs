@@ -522,3 +522,271 @@ fn no_primary_address_fails_closed() {
         "no ingress primary v4 -> fail-closed None"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #2330: post-transform (NAT64 / GRE / WireGuard) inner-source PMTUD.
+//
+// The on-wire size of a transformed forward differs from the SOURCE frame
+// (encap grows, NAT64 header shrinks/grows), so #2301's source-vs-egress
+// comparison is wrong and was deliberately skipped for these paths. #2330
+// derives the INNER-source MTU from the #2300/#2331 SSOT helpers and compares
+// the inner `source_frame` against THAT — feeding the existing decision +
+// builders so the inner sender gets a PTB carrying the INNER MTU instead of a
+// silent encap/translate drop.
+// ---------------------------------------------------------------------------
+
+const TUN_ID: u16 = 7;
+const TRANSPORT_IFINDEX: i32 = PTB_IFINDEX; // egress carries the transport MTU
+
+/// A ForwardingResolution wired for a native tunnel on `TRANSPORT_IFINDEX`.
+fn tunnel_resolution() -> ForwardingResolution {
+    ForwardingResolution {
+        disposition: ForwardingDisposition::ForwardCandidate,
+        local_ifindex: 0,
+        egress_ifindex: TRANSPORT_IFINDEX,
+        tx_ifindex: TRANSPORT_IFINDEX,
+        tunnel_endpoint_id: TUN_ID,
+        next_hop: None,
+        neighbor_mac: Some([0x02, 0x00, 0x00, 0x00, 0x00, 0x09]),
+        src_mac: Some(EGRESS_SRC_MAC),
+        tx_vlan_id: 0,
+    }
+}
+
+fn tunnel_decision() -> SessionDecision {
+    SessionDecision {
+        resolution: tunnel_resolution(),
+        nat: NatDecision::default(),
+    }
+}
+
+fn nat64_decision(nat64: bool) -> SessionDecision {
+    SessionDecision {
+        resolution: ForwardingResolution {
+            disposition: ForwardingDisposition::ForwardCandidate,
+            local_ifindex: 0,
+            egress_ifindex: TRANSPORT_IFINDEX,
+            tx_ifindex: TRANSPORT_IFINDEX,
+            tunnel_endpoint_id: 0,
+            next_hop: None,
+            neighbor_mac: Some([0x02, 0x00, 0x00, 0x00, 0x00, 0x09]),
+            src_mac: Some(EGRESS_SRC_MAC),
+            tx_vlan_id: 0,
+        },
+        nat: NatDecision {
+            nat64,
+            ..NatDecision::default()
+        },
+    }
+}
+
+/// Insert a minimal tunnel endpoint of the given `mode` / outer family /
+/// `key` so the SSOT inner-MTU helpers resolve.
+fn insert_tunnel_endpoint(fwd: &mut ForwardingState, mode: &str, outer_family: i32, key: u32) {
+    fwd.tunnel_endpoints.insert(
+        TUN_ID,
+        TunnelEndpoint {
+            id: TUN_ID,
+            logical_ifindex: TRANSPORT_IFINDEX,
+            interface_label: "tun0".into(),
+            interface: "tun0.0".into(),
+            redundancy_group: 0,
+            mode: mode.into(),
+            outer_family,
+            source: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8)),
+            destination: IpAddr::V4(Ipv4Addr::new(203, 0, 113, 1)),
+            key,
+            ttl: 64,
+            transport_table: String::new(),
+            wg_listen_port: 51820,
+            wg_local_privkey: zeroize::Zeroizing::new([0u8; 32]),
+            wg_peers: Vec::new(),
+        },
+    );
+}
+
+#[test]
+fn post_transform_inner_mtu_gre_subtracts_outer_and_gre_header() {
+    // transport MTU 1400, IPv4 outer (20) + GRE base (4), no key:
+    // inner MTU = 1400 - 24 = 1376. SAME value the #2331 encap drop guard
+    // enforces (native_gre_inner_mtu).
+    let mut fwd = forwarding_with_egress(1400);
+    insert_tunnel_endpoint(&mut fwd, "gre", libc::AF_INET, 0);
+    let decision = tunnel_decision();
+    let inner = post_transform_inner_mtu(&decision, &fwd, false, libc::AF_INET as u8, 1400);
+    assert_eq!(inner, 1376, "GRE inner MTU = transport - outer_ip(20) - gre(4)");
+    assert_eq!(
+        inner,
+        native_gre_inner_mtu(&fwd, &decision),
+        "post-transform GRE inner MTU MUST equal the #2331 encap-guard SSOT"
+    );
+}
+
+#[test]
+fn post_transform_inner_mtu_gre_counts_key_word() {
+    // A key-present endpoint adds 4 bytes of GRE header: 1400 - 28 = 1372.
+    let mut fwd = forwarding_with_egress(1400);
+    insert_tunnel_endpoint(&mut fwd, "gre", libc::AF_INET, 0xdead_beef);
+    let inner =
+        post_transform_inner_mtu(&tunnel_decision(), &fwd, false, libc::AF_INET as u8, 1400);
+    assert_eq!(inner, 1372, "key-present GRE counts the extra 4-byte key word");
+}
+
+#[test]
+fn post_transform_inner_mtu_wireguard_is_pad_aware() {
+    // WG over an IPv4 outer: inner MTU = outer_mtu - WG_OVERHEAD_V4 - 15
+    // (worst-case §5.4.6 padding). WG_OVERHEAD_V4 = 20 + 8 + 16 + 16 = 60.
+    // 1400 - 60 - 15 = 1325. The inverse of frame::wg::wg_encapped_size.
+    let mut fwd = forwarding_with_egress(1400);
+    insert_tunnel_endpoint(&mut fwd, "wireguard", libc::AF_INET, 0);
+    let inner =
+        post_transform_inner_mtu(&tunnel_decision(), &fwd, false, libc::AF_INET as u8, 1400);
+    assert_eq!(inner, 1325, "WG inner MTU = outer_mtu - WG_OVERHEAD_V4 - max_pad");
+    assert_eq!(
+        inner,
+        crate::afxdp::wg::mss::wg_inner_mtu(libc::AF_INET, 1400),
+        "post-transform WG inner MTU MUST equal the wg_inner_mtu SSOT"
+    );
+}
+
+#[test]
+fn post_transform_inner_mtu_unknown_tunnel_kind_fails_open() {
+    // An unknown/missing mode yields 0 (fail-open: the decision then returns
+    // Forward and the frame falls through to its normal fail-closed build).
+    let mut fwd = forwarding_with_egress(1400);
+    insert_tunnel_endpoint(&mut fwd, "l2tp", libc::AF_INET, 0);
+    assert_eq!(
+        post_transform_inner_mtu(&tunnel_decision(), &fwd, false, libc::AF_INET as u8, 1400),
+        0,
+        "unknown tunnel mode -> 0 (fail-open)"
+    );
+}
+
+#[test]
+fn post_transform_inner_mtu_nat64_v6_to_v4_adds_header_delta() {
+    // Inner v6 translated to a v4 egress: the v4 frame is 20 bytes SMALLER,
+    // so a v6 inner up to egress_mtu + 20 still fits. egress 1400 -> 1420.
+    let fwd = forwarding_with_egress(1400);
+    let inner =
+        post_transform_inner_mtu(&nat64_decision(true), &fwd, true, libc::AF_INET6 as u8, 1400);
+    assert_eq!(inner, 1420, "NAT64 v6->v4 inner MTU = egress + 20");
+}
+
+#[test]
+fn post_transform_inner_mtu_nat64_v4_to_v6_subtracts_header_delta() {
+    // Inner v4 translated to a v6 egress: the v6 frame is 20 bytes LARGER,
+    // so the v4 inner must be 20 bytes SMALLER. egress 1400 -> 1380.
+    let fwd = forwarding_with_egress(1400);
+    let inner =
+        post_transform_inner_mtu(&nat64_decision(true), &fwd, true, libc::AF_INET as u8, 1400);
+    assert_eq!(inner, 1380, "NAT64 v4->v6 inner MTU = egress - 20");
+}
+
+#[test]
+fn post_transform_gre_oversized_v4_df_emits_inner_ptb() {
+    // End-to-end: a 1500-byte inner v4 DF datagram over a GRE tunnel whose
+    // inner MTU is 1376 must emit a Frag-Needed advertising 1376 (NOT the
+    // 1400 transport MTU, NOT a silent #2331 drop). This is the #2331-loop
+    // closure: the oversize that #2331 drops now yields a PTB.
+    let (frame, meta) = inbound_v4_udp(1500, true);
+    let l3 = meta.l3_offset as usize;
+    let mut fwd = forwarding_with_egress(1400);
+    insert_tunnel_endpoint(&mut fwd, "gre", libc::AF_INET, 0);
+    let decision = tunnel_decision();
+    let inner_mtu =
+        post_transform_inner_mtu(&decision, &fwd, false, meta.addr_family, 1400);
+    assert_eq!(inner_mtu, 1376);
+
+    // Source-vs-egress (the WRONG pre-#2330 comparison) would advertise 1400;
+    // the inner-MTU decision advertises 1376.
+    let next_hop_mtu = match forwarded_egress_mtu_decision(&frame, l3, meta.addr_family, inner_mtu)
+    {
+        EgressMtuDecision::EmitPacketTooBig { next_hop_mtu } => next_hop_mtu,
+        other => panic!("expected EmitPacketTooBig, got {other:?}"),
+    };
+    assert_eq!(next_hop_mtu, 1376, "advertised MTU = GRE inner MTU, not transport MTU");
+    assert!(!ptb_reply_suppressed(&frame, meta, l3));
+    let out = build_frag_needed_v4(&frame, meta, PTB_IFINDEX, &fwd, next_hop_mtu)
+        .expect("inner-source frag-needed must build");
+    let icmp = 14 + 20;
+    assert_eq!(out[icmp], 3);
+    assert_eq!(out[icmp + 1], 4);
+    assert_eq!(
+        u16::from_be_bytes([out[icmp + 6], out[icmp + 7]]),
+        1376,
+        "PTB carries the inner MTU"
+    );
+    assert_eq!(&out[30..34], &Ipv4Addr::new(198, 51, 100, 20).octets(), "dst = inner source");
+}
+
+#[test]
+fn post_transform_wireguard_oversized_v6_emits_inner_ptb() {
+    // A 1300-payload inner v6 over a WG tunnel whose inner MTU is 1325
+    // (1400 - 60 - 15) — the inner L3 is 40 + 8 + 1300 = 1348 > 1325 — must
+    // emit a Packet-Too-Big advertising the WG inner MTU.
+    let (frame, meta) = inbound_v6_udp(1300);
+    let l3 = meta.l3_offset as usize;
+    let mut fwd = forwarding_with_egress(1400);
+    insert_tunnel_endpoint(&mut fwd, "wireguard", libc::AF_INET, 0);
+    let inner_mtu =
+        post_transform_inner_mtu(&tunnel_decision(), &fwd, false, meta.addr_family, 1400);
+    assert_eq!(inner_mtu, 1325);
+    let next_hop_mtu = match forwarded_egress_mtu_decision(&frame, l3, meta.addr_family, inner_mtu)
+    {
+        EgressMtuDecision::EmitPacketTooBig { next_hop_mtu } => next_hop_mtu,
+        other => panic!("expected EmitPacketTooBig, got {other:?}"),
+    };
+    assert_eq!(next_hop_mtu, 1325, "advertised MTU = WG pad-aware inner MTU");
+    let out = build_packet_too_big_v6(&frame, meta, PTB_IFINDEX, &fwd, next_hop_mtu as u32)
+        .expect("inner-source PTB must build");
+    let icmp = 14 + 40;
+    assert_eq!(out[icmp], 2, "ICMPv6 Packet Too Big");
+    assert_eq!(
+        u32::from_be_bytes([out[icmp + 4], out[icmp + 5], out[icmp + 6], out[icmp + 7]]),
+        1325,
+    );
+}
+
+#[test]
+fn post_transform_nat64_v6_oversized_emits_inner_ptb() {
+    // NAT64 v6->v4: a 1400-payload inner v6 (L3 = 40 + 8 + 1400 = 1448)
+    // translated to a v4 egress of MTU 1400. Inner MTU = 1400 + 20 = 1420;
+    // 1448 > 1420 -> Packet-Too-Big advertising 1420 to the v6 inner source.
+    let (frame, meta) = inbound_v6_udp(1400);
+    let l3 = meta.l3_offset as usize;
+    let fwd = forwarding_with_egress(1400);
+    let inner_mtu =
+        post_transform_inner_mtu(&nat64_decision(true), &fwd, true, meta.addr_family, 1400);
+    assert_eq!(inner_mtu, 1420, "NAT64 v6->v4 inner MTU = egress + 20");
+    let next_hop_mtu = match forwarded_egress_mtu_decision(&frame, l3, meta.addr_family, inner_mtu)
+    {
+        EgressMtuDecision::EmitPacketTooBig { next_hop_mtu } => next_hop_mtu,
+        other => panic!("expected EmitPacketTooBig, got {other:?}"),
+    };
+    assert_eq!(next_hop_mtu, 1420);
+    let out = build_packet_too_big_v6(&frame, meta, PTB_IFINDEX, &fwd, next_hop_mtu as u32)
+        .expect("NAT64 inner v6 PTB must build");
+    let icmp = 14 + 40;
+    assert_eq!(out[icmp], 2);
+    assert_eq!(
+        u32::from_be_bytes([out[icmp + 4], out[icmp + 5], out[icmp + 6], out[icmp + 7]]),
+        1420,
+    );
+}
+
+#[test]
+fn post_transform_in_mtu_forwards_no_ptb() {
+    // An inner packet that fits the GRE inner MTU must NOT emit a PTB
+    // (no false signal on a correctly-sized transformed flow).
+    let (frame, meta) = inbound_v4_udp(1000, true); // L3 = 1028 <= 1376
+    let l3 = meta.l3_offset as usize;
+    let mut fwd = forwarding_with_egress(1400);
+    insert_tunnel_endpoint(&mut fwd, "gre", libc::AF_INET, 0);
+    let inner_mtu =
+        post_transform_inner_mtu(&tunnel_decision(), &fwd, false, meta.addr_family, 1400);
+    assert_eq!(
+        forwarded_egress_mtu_decision(&frame, l3, meta.addr_family, inner_mtu),
+        EgressMtuDecision::Forward,
+        "in-inner-MTU transformed frame must forward, no PTB"
+    );
+}

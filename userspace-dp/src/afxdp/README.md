@@ -71,11 +71,31 @@ sync.
     and drops the oversized original (`mtu_signalled` keeps
     `retained_source_frame` false → the finalizer recycles the ingress
     descriptor; a suppressed/unbuildable reply is the fail-closed silent
-    drop). NAT64 / native-tunnel encap are skipped (their on-wire L3 size
-    differs from the source frame; the descriptor-capacity oversized
-    backstop still applies). The reply is built inside the
-    `target_binding` borrow and enqueued onto `ingress_binding` once that
-    borrow ends.
+    drop). The reply is built inside the `target_binding` borrow and
+    enqueued onto `ingress_binding` once that borrow ends.
+    **Post-transform PMTUD (#2330):** the #2301 decision above compares the
+    SOURCE frame against the egress MTU, which is correct ONLY for a
+    size-preserving plain forward. For the size-CHANGING paths (NAT64,
+    native GRE, WireGuard) the on-wire frame grows (encap) or its header
+    shrinks/grows (NAT64), so a source-vs-egress comparison is wrong and
+    #2301 skipped them entirely — leaving the inner source with NO PMTUD
+    signal (a silent blackhole). #2330 derives the INNER-source MTU (the
+    largest inner IP packet whose TRANSFORMED frame fits the
+    egress/transport MTU) from the #2300/#2331 SSOT helpers
+    (`post_transform_inner_mtu` → `native_gre_inner_mtu` for GRE,
+    `wg::mss::wg_inner_mtu` for WireGuard, the v6↔v4 ±20 header delta for
+    NAT64) and runs the SAME `forwarded_egress_mtu_decision` + builders
+    against the inner `source_frame` (which IS the pre-encap / pre-translate
+    inner packet, with `meta.addr_family` the inner family). The generated
+    PTB carries the INNER MTU and routes through `classify_generated_reply`
+    (#2328) at the finalizer, identically to the plain path. This CLOSES the
+    PTB signal #2331 deferred: an oversized GRE/WG inner now yields a
+    Frag-Needed/PTB instead of a silent `GRE_ENCAP_DF_OVERSIZE_DROPS` /
+    `encap_mtu_drops` — and because `mtu_signalled` skips the build entirely,
+    there is no double-drop/double-count with those encap guards (a non-DF
+    IPv4 inner stays fragmentable → `Forward` → the #2331 drop guard remains
+    the backstop). `mtu == 0` (no MTU resolvable / unknown tunnel kind)
+    fails open to `Forward`.
 - `icmp_ptb.rs` — #2301 PMTUD error generators for the generic
   forwarder: the egress-MTU decision plus the ICMPv4 Frag-Needed /
   ICMPv6 Packet-Too-Big builders (MTU in the body). Mirrors

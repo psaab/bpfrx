@@ -106,6 +106,92 @@ pub(in crate::afxdp) fn forwarded_egress_mtu_decision(
     }
 }
 
+/// #2330: the inner-source post-transform MTU for a size-changing forward
+/// path (NAT64 / native GRE / WireGuard).
+///
+/// #2301's `forwarded_egress_mtu_decision` compares the SOURCE frame against
+/// the egress MTU, which is correct ONLY for a plain forward where the
+/// on-wire size does not change. For a transformed path the on-wire frame
+/// GROWS (GRE/WG encap) or its header SHRINKS/GROWS (NAT64 v6<->v4), so a
+/// source-frame-vs-egress-MTU comparison is wrong and #2301 deliberately
+/// SKIPS these paths (`if !is_nat64 && !uses_native_tunnel`). The result was
+/// a silent blackhole: an inner source whose packet will not fit
+/// post-transform got NO PMTUD signal.
+///
+/// This returns the largest INNER IP packet length (the L3 size of the
+/// pre-transform `source_frame` the dispatcher already holds) whose
+/// transformed frame is guaranteed to fit the egress/transport MTU. Feeding
+/// it to `forwarded_egress_mtu_decision` as the `mtu` argument turns the
+/// existing per-family DF/IPv6 decision + the existing PTB builders into the
+/// correct INNER-source signal:
+///   - GRE: the #2300 SSOT `native_gre_inner_mtu` (transport MTU minus the
+///     outer IP + GRE[+key] header) — the SAME value the #2331 encap drop
+///     guard enforces, so this site and that drop site agree.
+///   - WireGuard: the pad-aware `wg::mss::wg_inner_mtu` derived from
+///     `tunnel_outer_mtu` (the #2300 transport-MTU SSOT) minus the WG outer
+///     overhead and worst-case §5.4.6 padding — the inverse of the
+///     `frame::wg::wg_encapped_size` drop guard.
+///   - NAT64: the egress MTU adjusted by the v6<->v4 header-size delta
+///     (RFC 7915): a v6 inner translated to a v4 egress may be 20 bytes
+///     LARGER on the inner side; a v4 inner translated to a v6 egress 20
+///     bytes SMALLER. The advertised value is floored at the per-family
+///     minimum by `forwarded_egress_mtu_decision`.
+///
+/// Returns 0 (fail-open — never invent a too-small MTU) when the endpoint
+/// row is missing, the tunnel kind is unknown, or the computed inner MTU is
+/// below the usable minimum (the per-kind inner-MTU helper returns 0). Note:
+/// the outer/transport MTU itself always resolves — `tunnel_outer_mtu` falls
+/// back to 1500 — so a 0 return reflects a missing/unknown endpoint or an
+/// unusably-small inner budget, never an unresolved outer MTU.
+/// `egress_mtu` is the already-resolved physical egress-interface MTU
+/// (`forwarded_egress_mtu`); used only for the NAT64 arm (the tunnel arms
+/// re-resolve the transport MTU via the SSOT helpers).
+pub(in crate::afxdp) fn post_transform_inner_mtu(
+    decision: &SessionDecision,
+    forwarding: &ForwardingState,
+    is_nat64: bool,
+    inner_addr_family: u8,
+    egress_mtu: usize,
+) -> usize {
+    if is_nat64 {
+        if egress_mtu == 0 {
+            return 0;
+        }
+        // RFC 7915 §4 / §5: the translator changes the IP header size by 20
+        // bytes (IPv6 40 vs IPv4 20). The inner source advertises a PTB in
+        // ITS family, so the inner MTU is the egress MTU adjusted by the
+        // header delta in the direction that keeps the TRANSLATED frame at
+        // or under the egress MTU.
+        return match inner_addr_family as i32 {
+            // Inner v6 -> egress v4: translated v4 is 20 bytes SMALLER, so a
+            // v6 inner up to egress_mtu + 20 still fits the v4 egress. Floor
+            // at the IPv6 minimum is applied by the decision helper.
+            libc::AF_INET6 => egress_mtu.saturating_add(20),
+            // Inner v4 -> egress v6: translated v6 is 20 bytes LARGER, so the
+            // v4 inner must be 20 bytes SMALLER than the v6 egress MTU.
+            libc::AF_INET => egress_mtu.saturating_sub(20),
+            _ => 0,
+        };
+    }
+    if decision.resolution.tunnel_endpoint_id == 0 {
+        return 0;
+    }
+    let Some(endpoint) = forwarding
+        .tunnel_endpoints
+        .get(&decision.resolution.tunnel_endpoint_id)
+    else {
+        return 0;
+    };
+    match tunnel_mode_kind(&endpoint.mode) {
+        TunnelKind::Gre => native_gre_inner_mtu(forwarding, decision),
+        TunnelKind::WireGuard => {
+            let outer_mtu = tunnel_outer_mtu(forwarding, decision, endpoint);
+            crate::afxdp::wg::mss::wg_inner_mtu(endpoint.outer_family, outer_mtu)
+        }
+        TunnelKind::Unknown => 0,
+    }
+}
+
 /// Read the IPv4 Don't-Fragment bit from an L3 (IP-header-first) slice.
 #[inline]
 fn ipv4_df_set(packet: &[u8]) -> bool {

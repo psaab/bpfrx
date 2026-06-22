@@ -195,14 +195,41 @@ signal back to the inner source). The drop bumps
 A nonzero counter flags inner flows whose encapped size exceeds the
 tunnel path MTU — typically a missing/too-high inner MSS clamp
 (`native_gre_tcp_mss`), or a non-TCP inner (UDP/ICMP/ESP) with no
-segmentation lever. PMTUD (ICMP Frag-Needed / Packet-Too-Big) signalling
-back to the inner source is **deferred to #2330** (the post-transform
-PMTUD plumbing; inner TCP-segment sizing is #2329). This site scopes to
-drop+count only, mirroring the deliberate `!uses_native_tunnel`
-exclusion in the plain-forward PTB path (tx/dispatch/mod.rs, #2301):
-the source-frame-vs-egress-MTU check there would produce a false PTB for
-tunnel encap because the correct inner-source PTB must be derived from
-the inner MTU after subtracting tunnel overhead.
+segmentation lever.
+
+#### Post-transform PMTUD (#2330, closes the #2331-deferred signal)
+
+The inner-source PTB that #2331 deferred is now generated in the TX
+dispatcher (`tx/dispatch/mod.rs`). #2301's plain-forward PTB compared the
+SOURCE frame against the egress MTU — correct only for a size-preserving
+forward — and deliberately excluded `!uses_native_tunnel` / `!is_nat64`
+because the source-vs-egress check produces a FALSE PTB for a transformed
+path (the frame grows on encap / changes header size on NAT64). #2330
+replaces that exclusion with a PRE-build `post_transform_inner_mtu`
+decision: it derives the INNER MTU (the largest inner IP packet whose
+TRANSFORMED frame fits the egress/transport MTU) from the same SSOT this
+guard uses —
+
+- **GRE**: `native_gre_inner_mtu` (== `tunnel_outer_mtu − outer_ip − gre`,
+  the exact inverse of this guard's comparison),
+- **WireGuard**: `wg::mss::wg_inner_mtu` (pad-aware, the inverse of
+  `frame::wg::wg_encapped_size`),
+- **NAT64**: the egress MTU ± 20 for the v6↔v4 header delta (RFC 7915),
+
+— and runs the existing `forwarded_egress_mtu_decision` + ICMP builders
+(`build_frag_needed_v4` / `build_packet_too_big_v6`) against the inner
+`source_frame` (the pre-encap / pre-translate inner packet, `meta`'s
+family = the inner family). The PTB carries the inner MTU and routes
+through `classify_generated_reply` (#2328) at the finalizer, identically
+to the plain path.
+
+Coordination with this drop guard: when a PTB is owed (inner IPv4 DF or
+IPv6) the decision sets `mtu_signalled` and SKIPS the encap build, so
+`GRE_ENCAP_DF_OVERSIZE_DROPS` is NOT bumped — no double-drop / double-
+count. The guard's drop+count now fires only for the residual case where
+no PTB is owed (a non-DF IPv4 inner, kept `Forward` to preserve
+fragmentable behaviour) whose encapped outer still exceeds the DF-set
+transport MTU. Inner TCP-segment sizing remains #2329.
 
 ### 4. Session Model
 
