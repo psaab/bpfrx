@@ -1276,6 +1276,11 @@ pub(crate) struct BindingLiveSnapshot {
     pub(crate) time_exceeded_output_filter_drops: u64,
     pub(crate) policy_reject_output_filter_drops: u64,
     pub(crate) syn_cookie_output_filter_drops: u64,
+    /// #2328: locally-generated egress-MTU PTB / Frag-Needed replies (the
+    /// #2301 PMTUD path) dropped by an OUTPUT firewall filter terminal
+    /// discard/reject (or three-color policer) on the egress interface,
+    /// classified by the PTB's OWN egress tuple. Per-leg.
+    pub(crate) ptb_output_filter_drops: u64,
     /// #2238: fail-closed drops — a generated reply's own bytes could not be
     /// re-parsed for output classification (§6.2; builder/parser logic bug).
     pub(crate) generated_reply_classify_parse_errors: u64,

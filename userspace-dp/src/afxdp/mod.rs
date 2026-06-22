@@ -466,6 +466,11 @@ pub(in crate::afxdp) struct BatchCounters {
     time_exceeded_output_filter_drops: u64,
     policy_reject_output_filter_drops: u64,
     syn_cookie_output_filter_drops: u64,
+    // #2328: egress-MTU PTB / Frag-Needed (the #2301 PMTUD generator) is now
+    // classified by its OWN egress tuple like the siblings above, so an
+    // output firewall filter terminal `discard`/`reject` on the egress
+    // interface drops it. Counted per-leg.
+    ptb_output_filter_drops: u64,
     generated_reply_classify_parse_errors: u64,
     policy_denied_packets: u64,
     route_miss_packets: u64,
@@ -620,6 +625,11 @@ impl BatchCounters {
             live.syn_cookie_output_filter_drops
                 .fetch_add(self.syn_cookie_output_filter_drops, Ordering::Relaxed);
             self.syn_cookie_output_filter_drops = 0;
+        }
+        if self.ptb_output_filter_drops != 0 {
+            live.ptb_output_filter_drops
+                .fetch_add(self.ptb_output_filter_drops, Ordering::Relaxed);
+            self.ptb_output_filter_drops = 0;
         }
         if self.generated_reply_classify_parse_errors != 0 {
             live.generated_reply_classify_parse_errors

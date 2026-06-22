@@ -275,6 +275,7 @@ pub(super) fn poll_binding(
                 local_tunnel_deliveries,
                 recent_exceptions,
                 dbg,
+                &mut counters,
                 worker_id,
                 worker_commands_by_id,
             );

@@ -150,6 +150,7 @@ func FormatStatusSummary(status userspace.ProcessStatus) string {
 	var timeExceededOutputFilterDrops uint64
 	var policyRejectOutputFilterDrops uint64
 	var synCookieOutputFilterDrops uint64
+	var ptbOutputFilterDrops uint64
 	var generatedReplyClassifyParseErrors uint64
 	var snatPackets uint64
 	var dnatPackets uint64
@@ -247,6 +248,7 @@ func FormatStatusSummary(status userspace.ProcessStatus) string {
 		timeExceededOutputFilterDrops += binding.TimeExceededOutputFilterDrops
 		policyRejectOutputFilterDrops += binding.PolicyRejectOutputFilterDrops
 		synCookieOutputFilterDrops += binding.SYNCookieOutputFilterDrops
+		ptbOutputFilterDrops += binding.PTBOutputFilterDrops
 		generatedReplyClassifyParseErrors += binding.GeneratedReplyClassifyParseErrors
 		snatPackets += binding.SNATPackets
 		dnatPackets += binding.DNATPackets
@@ -452,10 +454,11 @@ func FormatStatusSummary(status userspace.ProcessStatus) string {
 	// parse-error drops when any are non-zero (operator-installed output
 	// filters suppressing a generated control frame, RFC-1812 style).
 	if timeExceededOutputFilterDrops != 0 || policyRejectOutputFilterDrops != 0 ||
-		synCookieOutputFilterDrops != 0 || generatedReplyClassifyParseErrors != 0 {
-		fmt.Fprintf(&b, "  Generated-reply drops:     time_exceeded=%d policy_reject=%d syn_cookie=%d classify_parse_errors=%d\n",
+		synCookieOutputFilterDrops != 0 || ptbOutputFilterDrops != 0 ||
+		generatedReplyClassifyParseErrors != 0 {
+		fmt.Fprintf(&b, "  Generated-reply drops:     time_exceeded=%d policy_reject=%d syn_cookie=%d ptb=%d classify_parse_errors=%d\n",
 			timeExceededOutputFilterDrops, policyRejectOutputFilterDrops,
-			synCookieOutputFilterDrops, generatedReplyClassifyParseErrors)
+			synCookieOutputFilterDrops, ptbOutputFilterDrops, generatedReplyClassifyParseErrors)
 	}
 	fmt.Fprintf(&b, "  SNAT packets:              %d\n", snatPackets)
 	fmt.Fprintf(&b, "  DNAT packets:              %d\n", dnatPackets)

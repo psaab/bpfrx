@@ -10344,3 +10344,28 @@ top.
   pkg/api/metrics_descriptors.go, pkg/api/metrics_userspace.go,
   pkg/api/metrics_test.go, pkg/api/metrics_descriptor_coverage_test.go,
   docs/userspace-native-gre-plan.md, _Log.md
+
+## 2026-06-22 — #2328 PTB generated-reply output classification
+
+- **Timestamp**: 2026-06-22
+- **Action**: Route the #2301 egress-MTU PTB / Frag-Needed reply through
+  `classify_generated_reply` (the #2238 generated-reply output classifier)
+  so the PTB is classified by its OWN egress 5-tuple — output firewall
+  filter / CoS forwarding-class / DSCP rewrite now apply, matching the
+  Time Exceeded / policy-reject / SYN-cookie generators. Fail-CLOSED on a
+  parse failure (drop + `generated_reply_classify_parse_errors`). Added the
+  wire-visible `ptb_output_filter_drops` counter (BatchCounters →
+  BindingLiveState atomic → snapshot → BindingStatus wire →
+  Go BindingStatus → `show` aggregation). Threaded `&mut BatchCounters`
+  into `enqueue_pending_forwards`. Regenerated protocol_wire_v1.json.
+- **File(s)**: userspace-dp/src/afxdp/tx/dispatch/mod.rs,
+  userspace-dp/src/afxdp/tx/dispatch/dispatch_tests.rs,
+  userspace-dp/src/afxdp/worker/lifecycle.rs,
+  userspace-dp/src/afxdp/worker/mod.rs, userspace-dp/src/afxdp/mod.rs,
+  userspace-dp/src/afxdp/umem/mod.rs, userspace-dp/src/afxdp/umem/snapshot.rs,
+  userspace-dp/src/afxdp/coordinator/refresh_bindings.rs,
+  userspace-dp/src/protocol/binding.rs,
+  userspace-dp/tests/fixtures/protocol_wire_v1.json,
+  userspace-dp/src/afxdp/README.md,
+  pkg/dataplane/userspace/protocol.go,
+  pkg/dataplane/userspace/format/status.go, docs/feature-coverage.md

@@ -444,6 +444,11 @@ pub(crate) struct BindingStatus {
     pub policy_reject_output_filter_drops: u64,
     #[serde(rename = "syn_cookie_output_filter_drops", default)]
     pub syn_cookie_output_filter_drops: u64,
+    // #2328: egress-MTU PTB / Frag-Needed replies dropped by an output
+    // firewall filter, classified by the PTB's own egress tuple. `default`
+    // keeps cross-version wire safety (an older helper omits it → 0).
+    #[serde(rename = "ptb_output_filter_drops", default)]
+    pub ptb_output_filter_drops: u64,
     #[serde(rename = "generated_reply_classify_parse_errors", default)]
     pub generated_reply_classify_parse_errors: u64,
     #[serde(rename = "snat_packets", default)]
