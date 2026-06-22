@@ -10411,3 +10411,34 @@ top.
   userspace-dp/src/afxdp/frame/wg.rs,
   userspace-dp/src/afxdp/README.md,
   docs/userspace-native-gre-plan.md
+
+- **Timestamp**: 2026-06-22
+- **Action**: #2329 — make the fallback TCP-segmentation egress path
+  (`frame/tcp_segmentation.rs::segment_forwarded_tcp_frames_from_frame`)
+  mode-aware on BOTH axes. (a) Inner-L3 MTU math: dispatch on the #2327
+  `TunnelKind` classifier — `Gre` → `native_gre_inner_mtu`, `WireGuard` →
+  `wg::mss::wg_inner_mtu(outer_family, tunnel_outer_mtu(...))` (the
+  pad-aware SSOT added by #2330; reused, not re-derived), `Unknown`/missing
+  → 0 budget → drop. The 1280 floor now applies to the plain-forward path
+  ONLY (a tunnel keeps its exact, possibly-smaller inner budget so a
+  small-outer-MTU tunnel does not re-introduce the oversized-then-dropped
+  blackhole). (b) Encap dispatch (was an unconditional
+  `encapsulate_native_gre_frame` for every `tunnel_endpoint_id != 0`): now
+  `Gre` → `encapsulate_native_gre_frame`, `WireGuard` →
+  `frame/wg.rs::wg_encap_frame` (same builder the normal egress uses; pulls
+  the live noise session from `forwarding.wg_engines`, so the seg site
+  needs no extra keystate — NOT a design fork), `Unknown`/missing → drop
+  (fail closed). Mirrors the #2327 `frame/mod.rs` build-egress dispatch.
+  Closes the WG blackhole (#2329 original) + the WG-as-GRE
+  mis-encapsulation (scope-expansion comment). 5 fail-on-revert tests in a
+  new `mode_aware_segmentation_tests` module: WG segments size to
+  `wg_inner_mtu` (1425 @ 1500 MTU) not GRE (1476) and decap cleanly under a
+  real established responder engine; WG outer is UDP never GRE; GRE inner
+  size unchanged (1476); unknown mode drops; missing endpoint drops.
+  Confirmed both gates are revert-protected (reverting either gate fails
+  the corresponding test). cargo build --release clean; new tests 5x
+  stable; tcp_seg/segmentation/tunnel/mtu/wg_inner buckets green. No wire
+  field added → no protocol_wire_v1.json / Go rebuild.
+- **File(s)**: userspace-dp/src/afxdp/frame/tcp_segmentation.rs,
+  userspace-dp/src/afxdp/frame/README.md,
+  docs/wireguard-interop.md
