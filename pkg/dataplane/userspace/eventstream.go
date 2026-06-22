@@ -72,6 +72,7 @@ type EventStream struct {
 	SeqGaps           atomic.Uint64
 	PolicyDenyEvents  atomic.Uint64
 	ScreenDropEvents  atomic.Uint64
+	ScreenAlarmEvents atomic.Uint64 // screen event with action=PERMIT (#2298)
 	FilterLogEvents   atomic.Uint64
 	PolicyDenyDrops   atomic.Uint64
 	ScreenDropDrops   atomic.Uint64
@@ -217,6 +218,7 @@ func (es *EventStream) Status() EventStreamStatus {
 		SeqGaps:           es.SeqGaps.Load(),
 		PolicyDenyEvents:  es.PolicyDenyEvents.Load(),
 		ScreenDropEvents:  es.ScreenDropEvents.Load(),
+		ScreenAlarmEvents: es.ScreenAlarmEvents.Load(),
 		FilterLogEvents:   es.FilterLogEvents.Load(),
 		PolicyDenyDrops:   es.PolicyDenyDrops.Load(),
 		ScreenDropDrops:   es.ScreenDropDrops.Load(),
@@ -532,7 +534,7 @@ func (es *EventStream) dispatchOrQueueDataplaneFrame(
 	} else {
 		onDataplaneEvent(seq, rec)
 	}
-	es.recordDataplaneEvent(typ)
+	es.recordDataplaneEvent(typ, dataplaneEventAction(payload))
 	es.markFrameApplied(seq)
 	return true
 }
@@ -607,7 +609,7 @@ func (es *EventStream) flushPendingCallbackFrames() {
 			} else {
 				onDataplaneEvent(frame.seq, frame.dataplaneRecord)
 			}
-			es.recordDataplaneEvent(frame.typ)
+			es.recordDataplaneEvent(frame.typ, dataplaneEventAction(frame.dataplanePayload))
 		default:
 			slog.Warn("event stream: dropping unsupported pending callback frame",
 				"type", frame.typ, "seq", frame.seq)
@@ -623,12 +625,25 @@ func (es *EventStream) flushPendingCallbackFrames() {
 	}
 }
 
-func (es *EventStream) recordDataplaneEvent(typ uint8) {
+// recordDataplaneEvent accounts a successfully decoded dataplane event.
+//
+// Screen events are classified by BOTH frame type and action (#2298): the
+// scan-table-pressure saturation alarm (#2234) is a screen event with
+// action=PERMIT — the packet still forwards. It must NOT inflate the
+// screen-DROP counter (that would mask real screen drops under exactly the
+// condition the alarm fires) — it is accounted separately as a screen alarm.
+// Only a screen event that actually dropped (action=DENY/REJECT) bumps
+// ScreenDropEvents.
+func (es *EventStream) recordDataplaneEvent(typ, action uint8) {
 	switch typ {
 	case EventFrameTypePolicyDeny:
 		es.PolicyDenyEvents.Add(1)
 	case EventFrameTypeScreenDrop:
-		es.ScreenDropEvents.Add(1)
+		if action == dataplane.ActionPermit {
+			es.ScreenAlarmEvents.Add(1)
+		} else {
+			es.ScreenDropEvents.Add(1)
+		}
 	case EventFrameTypeFilterLog:
 		es.FilterLogEvents.Add(1)
 	}
@@ -933,6 +948,25 @@ func dataplaneEventPayloadMatchesFrame(typ uint8, payload []byte) bool {
 		return false
 	}
 	return payload[52] == want
+}
+
+// dataplaneEventActionOffset is the byte offset of the RT_FLOW action field in
+// the canonical dataplane.Event wire payload (mirrors ringbuf.DecodeRawEventRecord
+// at data[54], and the C struct field order in bpf/headers/xpf_common.h). A
+// screen event with action=PERMIT is the #2234 saturation alarm — it must be
+// counted as a screen alarm, not a screen drop (#2298).
+const dataplaneEventActionOffset = 54
+
+// dataplaneEventAction returns the RT_FLOW action byte from a decoded-OK event
+// payload. The caller has already validated the payload via
+// dataplaneEventPayloadMatchesFrame (len > 52) and decodeDataplaneEventPayload,
+// but the bound is rechecked defensively; a short payload reports ActionDeny so
+// it is never misclassified as a permit alarm.
+func dataplaneEventAction(payload []byte) uint8 {
+	if len(payload) <= dataplaneEventActionOffset {
+		return dataplane.ActionDeny
+	}
+	return payload[dataplaneEventActionOffset]
 }
 
 // formatIP converts raw IP bytes to a string representation.

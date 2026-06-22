@@ -5998,6 +5998,28 @@ fn nat64_translations_flushes_to_live_and_snapshot() {
     );
 }
 
+// #2291: the fail-closed NAT64 drop counter (prefix matched, no source pool)
+// must flush BatchCounters -> BindingLiveState -> snapshot the same way as
+// nat64_translations, so an operator can see the drops and a dropped flush
+// line is caught at build/test time.
+#[test]
+fn nat64_no_source_pool_flushes_to_live_and_snapshot() {
+    let live = BindingLiveState::new();
+    let mut batch = BatchCounters::default();
+    batch.touched = true;
+    batch.nat64_no_source_pool = 5;
+    batch.flush(&live);
+    assert_eq!(
+        batch.nat64_no_source_pool, 0,
+        "flush must zero the batched no-source-pool drop count"
+    );
+    let snap = live.snapshot();
+    assert_eq!(
+        snap.nat64_no_source_pool, 5,
+        "the live atomic + snapshot must carry the flushed no-source-pool count"
+    );
+}
+
 // === #1873 R-C: blanket tunnel gate at the slow-path chokepoint ===
 
 fn tunnel_gate_test_fixture() -> (

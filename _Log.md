@@ -39,6 +39,96 @@
   userspace-dp/src/afxdp/frame/mod.rs,
   userspace-dp/src/afxdp/gre.rs,
   userspace-dp/src/afxdp/frame/prop_tests/inspect.rs
+## 2026-06-21 — #2297 io_uring EINTR retry + CQE match-by-user_data (slow path / state writer)
+
+- **Timestamp**: 2026-06-21
+- **Action**: Fixed two io_uring defects in the slow-path TUN reinjector
+  (`write_packet_io_uring`) and the state writer (`write_all_with_ring`).
+  Both pushed one Write SQE, called `submit_and_wait(1)`, then reaped one
+  CQE. The io-uring crate does not retry EINTR, so a signal during the wait
+  returned Err with the SQE already submitted and the CQE unreaped:
+  (a) the next write on the reused ring reaped the leftover CQE and applied
+  the prior write's byte count to the new buffer's offset (silent
+  truncation / OOB offset); (b) an io-wq-punted write could read the
+  caller's buffer after it was dropped (UAF). Fix factors both sites onto a
+  shared write loop in a new `io_uring_write` module that: retries the wait
+  on EINTR/error (never abandoning an in-flight SQE; the crate recomputes
+  to_submit from the now-empty SQ so the retry is wait-only, bounded by a
+  retry ceiling), tags each submission with a distinct monotonic user_data
+  and matches the CQE by it (draining/discarding stale CQEs), and returns
+  only after the matching CQE is reaped so the buffer outlives every kernel
+  reference. Fast forwarding path untouched. Retry/drain logic exercised via
+  a `RingPort` trait seam (io_uring is unavailable in the build sandbox):
+  EINTR-retry full-count, stale-CQE-skip, short/negative-result errors,
+  positioned multi-chunk. Validated: release build clean; io_uring_write
+  8/8, state_writer 4/4, slowpath 2/2; `go build ./...` clean.
+- **File(s)**: userspace-dp/src/io_uring_write.rs (new),
+  userspace-dp/src/main.rs, userspace-dp/src/slowpath.rs,
+  userspace-dp/src/state_writer.rs, _Log.md
+
+## 2026-06-21 — #2295 + #2302 pkg/logging syslog follow-ups
+
+- **Timestamp**: 2026-06-21
+- **Action**: Two pkg/logging follow-ups from the #2287/#2289 review.
+  - #2295: `SyslogSlogHandler.Handle` now snapshots the client set FIRST
+    and returns before the re-entrancy guard when `len(clients)==0`, so
+    `goID()` (`runtime.Stack` + `ParseUint`) never runs on the common
+    no-syslog-client path. Added a `goIDFn` package seam so a test can
+    assert the no-client path makes zero `goID` calls. Corrected the
+    `goid.go` doc comment (runs once per forwarded record when clients
+    are present) and renamed the stale `emitDropWarn` reference in
+    `syslog.go` to the actual method name `emit`. The #2287 guard
+    (base.Handle unconditional, guard wraps forwarding when clients
+    present) is unchanged.
+  - #2302: the reconnect cooldown was bypassed when the TCP/TLS dial
+    succeeds but the subsequent Write fails (accept-then-reset
+    collector / half-open server / TLS app-layer drop). `lastDialFailure`
+    was set only on a dial ERROR and cleared on dial SUCCESS → the
+    cooldown stayed permanently disengaged and every log message drove a
+    fresh connect+teardown (a dial storm). Renamed the field to
+    `lastReconnectFailure` and arm it from BOTH failure modes — a failed
+    dial (in `reconnect`) and a dial-success-then-retry-write-failure
+    (via `armReconnectCooldown` in the Send/SendBinary retry-write path).
+    Cleared only on a fully successful reconnect (dial AND retry-write),
+    so the legit single-broken-pipe recovery path and the #2287
+    timeout-drop behavior are preserved.
+  - Tests: `TestHandleNoClientsSkipsGoID` /
+    `TestHandleWithClientsStillCallsGoID` (#2295),
+    `TestAcceptThenResetRateLimitsDials` /
+    `TestAcceptThenRecoverClearsCooldown` (#2302). Deterministic fakes,
+    fake clock, no sleeps, `-race` clean, 5x no flake. Fail-on-revert
+    verified for both fixes (100 goID calls / 50-dial storm when
+    reverted).
+- **File(s)**: pkg/logging/slog_handler.go, pkg/logging/goid.go,
+  pkg/logging/syslog.go, pkg/logging/syslog_reentrancy_test.go,
+  pkg/logging/syslog_resilience_test.go, pkg/logging/README.md
+
+## 2026-06-21 — #2290 + #2291 NAT64 ext-header walk + fail-closed empty-pool
+
+- **Timestamp**: 2026-06-21
+- **Action**: #2290 — walk the IPv6 extension-header chain in the NAT64
+  v6->v4 translator (`write_v6_to_v4_into`) and the embedded ICMP-error
+  path (`translate_embedded_v6_to_v4`) instead of assuming L4 at fixed
+  offset 40 / reading the raw next-header. Added local bounded walker
+  `ipv6_l4_offset_and_protocol` + `ipv6_is_non_first_fragment` to
+  nat64.rs (does not reach into crate::afxdp, which depends on nat64;
+  unification tracked #2292). Fail closed on non-first fragments.
+  #2291 — tri-state `Nat64Match` enum + `classify_ipv6_dest`: a matched
+  NAT64 prefix with no allocatable source pool now DROPS + bumps the new
+  `nat64_no_source_pool` counter instead of falling through to plain IPv6
+  route lookup on the synthetic destination (was fail-open). Counter wired
+  BatchCounters -> BindingLiveState -> snapshot -> BindingStatus JSON ->
+  Go protocol.go + format/status.go operator line.
+- **File(s)**: userspace-dp/src/nat64.rs,
+  userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/mod.rs, userspace-dp/src/afxdp/umem/mod.rs,
+  userspace-dp/src/afxdp/umem/snapshot.rs,
+  userspace-dp/src/afxdp/worker/mod.rs,
+  userspace-dp/src/afxdp/coordinator/refresh_bindings.rs,
+  userspace-dp/src/afxdp/coordinator/reconcile/reset.rs,
+  userspace-dp/src/protocol/binding.rs,
+  pkg/dataplane/userspace/protocol.go,
+  pkg/dataplane/userspace/format/status.go
 
 ## 2026-06-21 — #2258 VRRP localIP/localIPv6 lazy-resolve race (run-loop write vs receiver reads)
 
@@ -9757,3 +9847,24 @@ top.
   **File(s)**: pkg/logging/syslog.go, pkg/logging/slog_handler.go,
   pkg/logging/goid.go, pkg/logging/syslog_reentrancy_test.go,
   pkg/logging/README.md, _Log.md
+
+- **Timestamp**: 2026-06-21
+  **Action**: #2298 — classify scan-table-pressure ALARM by action, not as a
+  screen drop. The #2234 saturation alarm is a ScreenDrop-kind event with
+  action=PERMIT; Go consumers classified by KIND only, so it inflated
+  ScreenDropEvents and logged at SyslogError. Fix (approach b): eventSeverity
+  takes action (PERMIT screen event -> new SyslogNotice; real drop ->
+  SyslogError); recordDataplaneEvent takes action (PERMIT screen event ->
+  new ScreenAlarmEvents counter; real drop -> ScreenDropEvents). Plumbed
+  ScreenAlarmEvents through EventStreamStatus + show-status + Prometheus
+  screen_alarm label. Rust wire/KIND unchanged; rustdoc updated. Added
+  regression tests (counter + severity + payload-offset, fail-on-revert).
+  **File(s)**: pkg/logging/syslog.go, pkg/logging/ringbuf.go,
+  pkg/logging/event_severity_test.go,
+  pkg/dataplane/userspace/eventstream.go,
+  pkg/dataplane/userspace/eventstream_test.go,
+  pkg/dataplane/userspace/protocol.go,
+  pkg/dataplane/userspace/format/status.go,
+  pkg/dataplane/userspace/format/status_test.go,
+  pkg/api/metrics_userspace.go,
+  userspace-dp/src/afxdp/event_emit.rs, _Log.md

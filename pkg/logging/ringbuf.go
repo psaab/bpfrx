@@ -545,7 +545,7 @@ func (er *EventReader) logEvent(data []byte) {
 	er.syslogMu.RUnlock()
 
 	if len(clients) > 0 {
-		severity := eventSeverity(evt.EventType)
+		severity := eventSeverity(evt.EventType, evt.Action)
 		catBit := eventCategory(evt.EventType)
 		// Cache formatted messages lazily per format type
 		var stdMsg, structMsg string
@@ -587,7 +587,7 @@ func (er *EventReader) logEvent(data []byte) {
 	er.localMu.RUnlock()
 
 	if len(localWriters) > 0 {
-		severity := eventSeverity(evt.EventType)
+		severity := eventSeverity(evt.EventType, evt.Action)
 		catBit := eventCategory(evt.EventType)
 		var stdMsg string
 		var localBinMsg []byte
@@ -729,9 +729,20 @@ func eventCategory(eventType uint8) uint8 {
 }
 
 // eventSeverity maps event types to syslog severity levels.
-func eventSeverity(eventType uint8) int {
+//
+// A screen event must be classified by BOTH type and action (#2298): the
+// scan-table-pressure saturation alarm (#2234) is emitted as a screen event
+// with action=PERMIT — the packet still forwards, it is an informational
+// alarm, not a drop. Logging it at SyslogError is contradictory and would
+// page drop-severity alerts. Such an alarm is surfaced at SyslogNotice; only
+// a screen event that actually dropped (action=DENY/REJECT) stays at
+// SyslogError.
+func eventSeverity(eventType, action uint8) int {
 	switch eventType {
 	case eventTypeScreenDrop:
+		if action == actionPermit {
+			return SyslogNotice
+		}
 		return SyslogError
 	case eventTypePolicyDeny:
 		return SyslogWarning
