@@ -50,23 +50,58 @@ connectionless and exempt:
   `os.ErrDeadlineExceeded`; the message is dropped (counted, not
   retried-in-place) and the reader continues. Without this a hung
   server stalls the entire event reader indefinitely.
-- **Reconnect cooldown.** A write failure on a stream transport
-  attempts one reconnect, gated by `reconnectCooldown` (default
-  `defaultReconnectCooldown`, 1s). If the previous dial failed inside
-  the window, the reconnect is skipped and the send fails fast (drop) —
-  so a down server cannot drive a fresh 5s-timeout dial on every event
-  (thundering herd). `lastDialFailure` is cleared on a successful dial.
+- **Timeout drops without retry (#2287).** A write that fails with a
+  *timeout* (the deadline expired — `net.Error.Timeout()==true`) is
+  dropped and returned immediately. It is NOT reconnect+retried: the
+  deadline already bounded the attempt, and reconnecting would re-arm
+  another full `writeTimeout`, doubling the worst-case stall on the
+  event reader (~2× plus a dial). Only a *genuine connection error*
+  (broken pipe / ECONNRESET, non-timeout) triggers the reconnect+retry
+  path below.
+- **Reconnect cooldown.** A non-timeout write failure on a stream
+  transport attempts one reconnect, gated by `reconnectCooldown`
+  (default `defaultReconnectCooldown`, 1s). If the previous dial failed
+  inside the window, the reconnect is skipped and the send fails fast
+  (drop) — so a down server cannot drive a fresh 5s-timeout dial on
+  every event (thundering herd). `lastDialFailure` is cleared on a
+  successful dial.
+- **Drop warning emitted AFTER the lock is released (#2287).**
+  `SyslogClient.Send`/`SendBinary` hold `s.mu` for the whole write +
+  reconnect sequence. The rate-limited drop warning (`slog.Warn`) must
+  NOT be emitted while `s.mu` is held: `slog.Default()` is the
+  `SyslogSlogHandler`, whose `Handle` synchronously calls back into
+  this same client's `Send`, which re-locks `s.mu` (`sync.Mutex` is
+  non-reentrant) → self-deadlock on the dataplane event-reader
+  goroutine. `noteDrop` therefore only *captures* the warning snapshot
+  under the lock; the caller emits it via a `defer` ordered to run
+  after the `Unlock`. The ≤1/s gate is preserved.
+- **Handler re-entrancy guard (#2287).** As defense-in-depth,
+  `SyslogSlogHandler.Handle` tracks the set of goroutine IDs currently
+  inside its syslog-forwarding section. If a client `Send` emits any
+  slog record (drop warning or otherwise) that routes back through the
+  handler on the SAME goroutine, the nested record is NOT re-forwarded
+  to syslog — so no present or future under-lock/transitive slog call
+  from the send path can wedge the daemon by recursing into a client's
+  `Send`. The guard is per-goroutine (not a per-handler flag), so
+  concurrent `Handle` calls on different goroutines are never falsely
+  skipped. Forwarding to the base handler (stderr) stays unconditional,
+  even on a re-entrant call, so records are never lost from local logs.
 
-Drops are observable via `DroppedWrites()` (write timeout/error) and
-`DroppedCooldown()` (reconnect suppressed by cooldown); the drop
+Drops are observable via `DroppedWrites()` (write timeout or write
+error), `DroppedDials()` (post-write-failure reconnect dial failed),
+and `DroppedCooldown()` (reconnect suppressed by cooldown); the drop
 warning is rate-limited to ≤1/s so a flapping target cannot spam the
-log from the hot-path (CLAUDE.md logging rules).
+log from the hot-path (CLAUDE.md logging rules). The warning's `reason`
+attribute is one of `write` / `dial` / `cooldown`.
 
-Tests (`syslog_resilience_test.go`) use deterministic fakes — a
-deadline-honouring conn, an always-fail conn, a controllable clock, and
-a dial seam (`dialFn`/`nowFn`) — with no sleeps. The hang test fails if
-the write deadline is removed; the cooldown test fails if the cooldown
-gate is removed.
+Tests (`syslog_resilience_test.go`, `syslog_reentrancy_test.go`) use
+deterministic fakes — a deadline-honouring conn, an always-fail conn, a
+timeout conn, a recording conn, a controllable clock, and a dial seam
+(`dialFn`/`nowFn`) — with no sleeps. The hang test fails if the write
+deadline is removed; the cooldown test fails if the cooldown gate is
+removed; the re-entrancy test deadlocks (and times out) if the drop
+warning is moved back under `s.mu` or the handler guard is removed; the
+timeout-drop test fails (sees a dial) if a write timeout reconnects.
 
 ## Gotchas
 
