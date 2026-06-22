@@ -15,6 +15,19 @@ sync.
   receives lifecycle commands from the control socket. `mod.rs` is the
   single entry that owns shared state Arcs; `worker_manager.rs` keeps
   the per-worker handle table.
+  - **Worker-liveness clock (`#2332`, Rust sibling of `#1792`):** the
+    binding-readiness gate in `coordinator/refresh_bindings.rs` MUST use
+    a monotonic-clock freshness verdict, never the wall clock. Each
+    worker stamps its heartbeat slot with `monotonic_nanos()`
+    (CLOCK_MONOTONIC); `BindingLiveState::snapshot()` computes
+    `heartbeat_fresh` via `bpf_map::heartbeat_fresh_mono(last_ns,
+    now_mono)` in the same monotonic domain and carries the verdict on
+    `BindingLiveSnapshot`. The `last_heartbeat: DateTime<Utc>` field is
+    back-projected onto the wall clock for operator display ONLY — a
+    forward CLOCK_REALTIME step (NTP `makestep`, VM pause/resume) would
+    poison any wall-clock age and falsely mark a healthy worker unready,
+    which the control plane can read as a hung worker and turn into a
+    spurious VRRP failover / route withdrawal.
 - `worker/` — the per-worker poll loop (`mod.rs` runs the dispatch).
 - `poll_stages.rs` — sibling of `worker/`, not inside it. Holds the
   per-packet pipeline stages extracted in #946 Phase 1. The screen and

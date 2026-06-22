@@ -143,13 +143,36 @@ pub(in crate::afxdp) fn touch_heartbeat(
     Ok(())
 }
 
-pub(in crate::afxdp) fn heartbeat_fresh(last_heartbeat: Option<chrono::DateTime<Utc>>) -> bool {
-    match last_heartbeat {
-        Some(last) => Utc::now()
-            .signed_duration_since(last)
-            .to_std()
-            .map(|age| age <= HEARTBEAT_STALE_AFTER)
-            .unwrap_or(true),
-        None => false,
+/// Decide whether a worker's last heartbeat is fresh, comparing two
+/// CLOCK_MONOTONIC nanosecond readings: `last_heartbeat_ns` is the value
+/// the worker thread stamped into its `BindingLiveState` slot via
+/// `set_last_heartbeat_at(now_ns)` (a `monotonic_nanos()` reading), and
+/// `now_mono_ns` is the coordinator's own `monotonic_nanos()` reading
+/// taken in `snapshot()`. Both come from the SAME process's monotonic
+/// clock, so the subtraction is a true elapsed interval.
+///
+/// HA liveness MUST NOT use the wall clock (`Utc::now()`). A forward
+/// CLOCK_REALTIME step (NTP `makestep`, manual `date -s`, VM
+/// pause/resume) would make a wall-clock age jump past
+/// `HEARTBEAT_STALE_AFTER` and falsely mark a healthy binding unready —
+/// which the control plane can read as a hung worker and turn into a
+/// spurious VRRP failover / route withdrawal (the Rust-dataplane sibling
+/// of the Go control-plane bug fixed in #1792). CLOCK_MONOTONIC is
+/// immune to clock steps, so this decision is step-safe.
+///
+/// `last_heartbeat_ns == 0` is the sentinel for "never stamped" (see
+/// `monotonic_timestamp_to_datetime`) and is treated as not-fresh. A
+/// backward monotonic anomaly (`now_mono_ns < last_heartbeat_ns`, which
+/// cannot happen on a well-behaved CLOCK_MONOTONIC) is clamped by
+/// `saturating_sub` to a zero age, i.e. treated as fresh — the
+/// fail-safe direction for a liveness check.
+pub(in crate::afxdp) fn heartbeat_fresh_mono(last_heartbeat_ns: u64, now_mono_ns: u64) -> bool {
+    if last_heartbeat_ns == 0 {
+        return false;
     }
+    let age_ns = now_mono_ns.saturating_sub(last_heartbeat_ns);
+    // Compare in the u128 domain so the threshold can never be silently
+    // truncated by an `as u64` cast (HEARTBEAT_STALE_AFTER is 5s today, far
+    // below u64::MAX ns, but this keeps the bound exact if it ever grows).
+    u128::from(age_ns) <= HEARTBEAT_STALE_AFTER.as_nanos()
 }

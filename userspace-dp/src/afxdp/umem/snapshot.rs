@@ -243,6 +243,18 @@ impl BindingLiveState {
                 now_mono,
                 now_wall,
             ),
+            // #2332: the load-bearing HA-liveness verdict is computed here,
+            // in the CLOCK_MONOTONIC domain, from the worker-stamped
+            // monotonic heartbeat (`last_heartbeat`, a `monotonic_nanos()`
+            // value) and this snapshot's own monotonic `now_mono`. The
+            // `last_heartbeat` DateTime<Utc> field above is back-projected
+            // onto the wall clock for operator display ONLY — it must never
+            // drive the freshness decision, because a wall-clock step would
+            // poison it (Rust sibling of #1792).
+            heartbeat_fresh: crate::afxdp::bpf_map::heartbeat_fresh_mono(
+                self.last_heartbeat.load(Ordering::Relaxed),
+                now_mono,
+            ),
             last_error: self
                 .last_error
                 .lock()

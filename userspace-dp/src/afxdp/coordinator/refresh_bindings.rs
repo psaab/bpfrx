@@ -233,10 +233,15 @@ fn copy_live_snapshot(binding: &mut BindingStatus, snap: BindingLiveSnapshot) {
     binding.tx_kick_retry_count = snap.tx_kick_retry_count;
     binding.last_heartbeat = snap.last_heartbeat;
     binding.last_error = snap.last_error;
-    binding.ready = binding.registered
-        && binding.bound
-        && binding.xsk_registered
-        && heartbeat_fresh(snap.last_heartbeat);
+    // #2332: gate readiness on the monotonic-clock freshness verdict
+    // (`snap.heartbeat_fresh`), computed at snapshot time from
+    // CLOCK_MONOTONIC readings. NEVER re-derive freshness from the
+    // wall-clock `snap.last_heartbeat` here — that re-introduces the
+    // clock-step bug (a forward CLOCK_REALTIME step between snapshot and
+    // this check would falsely mark a healthy binding unready → spurious
+    // failover). Rust sibling of the Go fix in #1792.
+    binding.ready =
+        binding.registered && binding.bound && binding.xsk_registered && snap.heartbeat_fresh;
 }
 
 /// Zero out a `BindingStatus` whose slot has no live worker
