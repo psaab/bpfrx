@@ -580,6 +580,17 @@ func TestSyncHold_AppliesToExistingInstances(t *testing.T) {
 func TestUpdateInstances_PreservesSyncHoldForExistingInstances(t *testing.T) {
 	m := NewManager()
 
+	// Pin resolveIface so the #2294 ifindex-drift probe is hermetic
+	// regardless of whether the build/CI host has a real eth0: return the
+	// same Index (0) the instance below binds, so no drift is detected and
+	// this test exercises the priority-only in-place update it targets.
+	// Without the injection, a host that HAS an eth0 would resolve a
+	// non-zero index, trip the drift restart, and break the in-place
+	// assertion.
+	m.resolveIface = func(name string) (*net.Interface, error) {
+		return &net.Interface{Name: name, Index: 0}, nil
+	}
+
 	vi := newInstance(Instance{
 		Interface: "eth0",
 		GroupID:   101,
