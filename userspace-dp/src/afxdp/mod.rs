@@ -81,6 +81,7 @@ mod ha;
 #[path = "icmp.rs"]
 mod icmp;
 mod icmp_embed;
+mod icmp_ptb;
 mod mirror;
 #[path = "mpsc_inbox.rs"]
 mod mpsc_inbox;
@@ -152,6 +153,10 @@ use self::forwarding_build::*;
 use self::frame::*;
 use self::gre::{encapsulate_native_gre_frame, try_native_gre_decap_from_frame};
 use self::icmp::{FABRIC_INGRESS_FLAG, build_local_time_exceeded_request, is_icmp_error};
+use self::icmp_ptb::{
+    EgressMtuDecision, build_frag_needed_v4, build_packet_too_big_v6,
+    forwarded_egress_mtu_decision, ptb_reply_suppressed,
+};
 #[cfg(test)]
 use self::icmp::{
     build_local_time_exceeded_v4, build_local_time_exceeded_v6, build_reject_icmp_unreachable,

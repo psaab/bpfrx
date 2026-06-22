@@ -9879,6 +9879,32 @@ top.
   pkg/logging/README.md, _Log.md
 
 - **Timestamp**: 2026-06-21
+  **Action**: #2301 — add egress-MTU PTB decision to the generic forwarder.
+  The TX dispatcher only had a TCP-specific segmentation decision; every
+  other oversized forwarded L3 frame (UDP/ICMP/ESP/GRE, TCP seg-miss,
+  non-segmentable TCP) was forwarded into an MTU violation and silently
+  dropped with no PMTUD signal. Added `afxdp::icmp_ptb` (decision
+  `forwarded_egress_mtu_decision` + ICMPv4 Frag-Needed type 3 code 4 with
+  next-hop MTU per RFC 1191 + ICMPv6 Packet-Too-Big type 2 with MTU per
+  RFC 4443; reuses icmp.rs's reflected-error shape + RFC suppression gate
+  `reject_icmp_reply_suppressed`/`is_non_first_fragment`, kept additive to
+  avoid the in-flight #2237/#2242 icmp.rs edit). The dispatcher evaluates
+  the decision for frames the TCP-seg path did not handle (skipping
+  NAT64/native-tunnel encap), emits the PTB back out the ingress and drops
+  the oversized original instead of forwarding it. Fast path untouched
+  (one usize comparison for in-MTU frames); non-DF oversized IPv4 still
+  forwards. Tests: 10 unit (builders/decision/suppression/floor/fail-
+  closed) + 2 dispatch-level e2e (`oversized_forward_emits_ptb_and_drops_
+  original` + in-MTU counter-factual), fail-on-revert verified. Validation:
+  cargo build --release clean; new tests pass; full suite 2267 pass / 2
+  pre-existing flaky-concurrency fails (wg reconcile + worker_queue, both
+  pass in isolation, unrelated); go build ./... clean.
+  **File(s)**: userspace-dp/src/afxdp/icmp_ptb.rs,
+  userspace-dp/src/afxdp/icmp_ptb_tests.rs,
+  userspace-dp/src/afxdp/mod.rs,
+  userspace-dp/src/afxdp/tx/dispatch/mod.rs,
+  userspace-dp/src/afxdp/tx/dispatch/dispatch_tests.rs,
+  userspace-dp/src/afxdp/README.md, docs/feature-coverage.md, _Log.md
   **Action**: #2298 — classify scan-table-pressure ALARM by action, not as a
   screen drop. The #2234 saturation alarm is a ScreenDrop-kind event with
   action=PERMIT; Go consumers classified by KIND only, so it inflated

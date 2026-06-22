@@ -973,6 +973,217 @@ fn enqueue_failure_conserves_free_frames_across_many_forwards() {
     );
 }
 
+// #2301: end-to-end egress-MTU PTB through `enqueue_pending_forwards`.
+//
+// Build a large UDP IPv4 (DF) frame in the ingress UMEM, point the forward
+// at egress ifindex 80 with a SMALL MTU, and add an egress entry for the
+// INGRESS interface (ifindex 11) so the reflected reply can be sourced.
+// The dispatcher must:
+//   - enqueue an ICMP Frag-Needed (type 3 code 4, next-hop MTU) back out
+//     the ingress binding,
+//   - NOT forward the oversized original to the egress binding,
+//   - recycle the ingress descriptor exactly once,
+//   - record the `egress_mtu_exceeded` exception.
+// The counter-factual (large MTU) proves the gate fires only on a real MTU
+// violation: the frame forwards normally and no PTB lands on the ingress.
+
+/// Build a large IPv4 UDP frame (Ethernet + IP + UDP + payload) with the
+/// DF bit set. `l3_payload` is the total L3 length excluding the 14-byte
+/// Ethernet header.
+fn large_udp_v4_df_frame(l3_payload: usize) -> Vec<u8> {
+    assert!(l3_payload >= 28, "need room for IP+UDP headers");
+    let mut frame = Vec::with_capacity(14 + l3_payload);
+    // L2: dst = firewall NIC, src = sender. EtherType IPv4.
+    frame.extend_from_slice(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
+    frame.extend_from_slice(&[0x00, 0x25, 0x90, 0x12, 0x34, 0x56]);
+    frame.extend_from_slice(&0x0800u16.to_be_bytes());
+    let l3 = frame.len();
+    frame.push(0x45);
+    frame.push(0x00);
+    frame.extend_from_slice(&(l3_payload as u16).to_be_bytes());
+    frame.extend_from_slice(&[0x00, 0x01]); // ID
+    frame.extend_from_slice(&0x4000u16.to_be_bytes()); // DF=1
+    frame.extend_from_slice(&[64, 17, 0x00, 0x00]); // TTL, proto UDP, csum
+    frame.extend_from_slice(&[198, 51, 100, 20]); // src
+    frame.extend_from_slice(&[203, 0, 113, 9]); // dst
+    let csum = crate::afxdp::tx::test_support::compute_ipv4_header_checksum(&frame[l3..l3 + 20]);
+    frame[l3 + 10..l3 + 12].copy_from_slice(&csum.to_be_bytes());
+    // UDP header + payload to fill out to l3_payload.
+    frame.extend_from_slice(&49152u16.to_be_bytes());
+    frame.extend_from_slice(&5201u16.to_be_bytes());
+    frame.extend_from_slice(&((l3_payload - 20) as u16).to_be_bytes());
+    frame.extend_from_slice(&0u16.to_be_bytes());
+    frame.resize(14 + l3_payload, 0xAB);
+    frame
+}
+
+/// Forwarding state for the PTB e2e test: egress 80 with `mtu`, plus an
+/// egress entry for the ingress interface (ifindex 11) carrying a primary
+/// v4 so the reflected error can be built.
+fn forwarding_for_ptb(mtu: usize) -> ForwardingState {
+    let mut forwarding = test_forwarding_with_egress_mtu(mtu);
+    forwarding.egress.insert(
+        11,
+        EgressInterface {
+            bind_ifindex: 11,
+            vlan_id: 0,
+            mtu: 1500,
+            src_mac: [0x02, 0xbf, 0x72, 0x16, 0x00, 0x01],
+            zone_id: TEST_TRUST_ZONE_ID,
+            redundancy_group: 0,
+            primary_v4: Some(std::net::Ipv4Addr::new(10, 0, 1, 1)),
+            primary_v6: None,
+        },
+    );
+    forwarding
+}
+
+fn run_ptb_dispatch(egress_mtu: usize) -> (Vec<BindingWorker>, DebugPollCounters, Vec<String>) {
+    let mut bindings = vec![
+        BindingWorker::new_for_mirror_test(0, 0, 11, 0),
+        BindingWorker::new_for_mirror_test(1, 0, 22, 0),
+    ];
+    // 1600-byte L3 payload -> 1614-byte frame. Fits a 4096 UMEM frame but
+    // exceeds a 1400 egress MTU.
+    let frame = large_udp_v4_df_frame(1600);
+    unsafe {
+        bindings[0]
+            .umem
+            .area()
+            .slice_mut_unchecked(0, frame.len())
+    }
+    .expect("ingress frame")
+    .copy_from_slice(&frame);
+
+    let forwarding = forwarding_for_ptb(egress_mtu);
+    let lookup = WorkerBindingLookup::from_bindings(&bindings);
+    let mirror_targets = MirrorTargetMap::default();
+    // UDP (not TCP) so the TCP-segmentation path is skipped and the
+    // egress-MTU decision is the only oversized handler.
+    let mut req = test_live_forward_request_for_frame(
+        frame.len(),
+        test_forwarding_decision_to_bound_ifindex(22),
+    );
+    req.meta.protocol = PROTO_UDP;
+    req.meta.l3_offset = 14;
+    req.meta.l4_offset = 34;
+    req.meta.pkt_len = (frame.len() - 14) as u16;
+    let mut pending = vec![req];
+    let mut post_recycles = Vec::new();
+    let ingress_ident = bindings[0].identity();
+    let ingress_live = &*bindings[0].live as *const BindingLiveState;
+    let local_tunnel_deliveries: Arc<ArcSwap<BTreeMap<i32, SyncSender<Vec<u8>>>>> =
+        Arc::new(ArcSwap::from_pointee(BTreeMap::new()));
+    let recent_exceptions = Arc::new(Mutex::new(VecDeque::new()));
+    let worker_commands_by_id: BTreeMap<u32, Arc<Mutex<VecDeque<WorkerCommand>>>> = BTreeMap::new();
+    let mut dbg = DebugPollCounters::default();
+
+    let (left, rest) = bindings.split_at_mut(0);
+    let (ingress, right) = rest.split_first_mut().expect("ingress binding");
+    enqueue_pending_forwards(
+        left,
+        0,
+        ingress,
+        right,
+        &lookup,
+        &mirror_targets,
+        &mut pending,
+        &mut post_recycles,
+        1,
+        &forwarding,
+        &ingress_ident,
+        unsafe { &*ingress_live },
+        None,
+        &local_tunnel_deliveries,
+        &recent_exceptions,
+        &mut dbg,
+        0,
+        &worker_commands_by_id,
+    );
+    let reasons: Vec<String> = recent_exceptions
+        .lock()
+        .expect("exceptions")
+        .iter()
+        .map(|e| e.reason.clone())
+        .collect();
+    (bindings, dbg, reasons)
+}
+
+#[test]
+fn oversized_forward_emits_ptb_and_drops_original() {
+    let (bindings, _dbg, reasons) = run_ptb_dispatch(1400);
+
+    // PTB enqueued back out the INGRESS binding (slot 0).
+    let ingress_tx = &bindings[0].tx_pipeline.pending_tx_local;
+    assert_eq!(
+        ingress_tx.len(),
+        1,
+        "exactly one ICMP Frag-Needed must be enqueued on the ingress binding"
+    );
+    let reply = &ingress_tx[0];
+    assert_eq!(reply.egress_ifindex, 11, "PTB leaves via the ingress interface");
+    let b = &reply.bytes;
+    assert_eq!(&b[0..6], &[0x00, 0x25, 0x90, 0x12, 0x34, 0x56], "reflected to the sender");
+    assert_eq!(&b[12..14], &[0x08, 0x00], "IPv4 reply");
+    assert_eq!(b[14], 0x45);
+    assert_eq!(b[23], PROTO_ICMP, "outer ICMP");
+    let icmp = 14 + 20;
+    assert_eq!(b[icmp], 3, "ICMP type 3");
+    assert_eq!(b[icmp + 1], 4, "code 4 (Frag Needed)");
+    assert_eq!(
+        u16::from_be_bytes([b[icmp + 6], b[icmp + 7]]),
+        1400,
+        "advertised next-hop MTU"
+    );
+
+    // The oversized original was NOT forwarded to the egress binding.
+    assert_eq!(
+        bindings[1].tx_pipeline.pending_tx_local.len(),
+        0,
+        "oversized original must not be forwarded"
+    );
+    assert_eq!(
+        bindings[1].tx_pipeline.pending_tx_prepared.len(),
+        0,
+        "oversized original must not be prepared for the egress TX ring"
+    );
+    // Ingress descriptor recycled exactly once (no leak, no double).
+    assert_eq!(ingress_recycled_count(&bindings[0]), 1);
+    assert!(
+        reasons.iter().any(|r| r == "egress_mtu_exceeded"),
+        "egress-MTU exception recorded: {reasons:?}"
+    );
+    // The original was NOT silently dropped without a signal: no
+    // oversized_forward_frame / slow-path drop was recorded.
+    assert!(
+        !reasons.iter().any(|r| r == "oversized_forward_frame"),
+        "MTU drop must not be miscounted as a descriptor-capacity overflow: {reasons:?}"
+    );
+}
+
+#[test]
+fn in_mtu_forward_emits_no_ptb_counterfactual() {
+    // Same 1614-byte frame, but a 9000 (jumbo) egress MTU. The frame now
+    // fits, so it forwards normally and NO PTB lands on the ingress. This
+    // is the fail-on-revert pin: if the decision wrongly fired on an
+    // in-MTU frame, the ingress would carry a spurious ICMP error.
+    let (bindings, _dbg, reasons) = run_ptb_dispatch(9000);
+    assert_eq!(
+        bindings[0].tx_pipeline.pending_tx_local.len(),
+        0,
+        "no PTB may be generated for an in-MTU frame"
+    );
+    assert!(
+        !reasons.iter().any(|r| r == "egress_mtu_exceeded"),
+        "no egress-MTU exception for an in-MTU frame: {reasons:?}"
+    );
+    // The frame was actually forwarded to the egress binding (slot 1),
+    // proving the in-MTU fast path is untouched.
+    let egress_tx = bindings[1].tx_pipeline.pending_tx_local.len()
+        + bindings[1].tx_pipeline.pending_tx_prepared.len();
+    assert_eq!(egress_tx, 1, "in-MTU frame must forward to the egress binding");
+}
+
 #[test]
 fn shared_exact_policy_uses_requested_queue_id() {
     let cos_fast_interfaces = test_cos_fast_interfaces(80, 5, &[(5, true)]);
