@@ -9684,6 +9684,9 @@ top.
   pkg/grpcapi/server_input_validation_test.go,
   pkg/grpcapi/README.md, _Log.md
 
+## 2026-06-21 — #2288 CLI completion panic guard + monitor match filter
+- **Action**: salvaged + committed the #2288 engineer worktree after a 529 death
+- **File(s)**: pkg/cli/completion.go, completion_panic_test.go, monitor.go, monitor_match_test.go
 - **Timestamp**: 2026-06-21
   **Action**: #2287 syslog re-entrant deadlock fix (regression from #2285).
   Three fixes in pkg/logging. (1) Deadlock: noteDrop no longer emits

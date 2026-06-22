@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -67,10 +68,11 @@ func (f *monitorFlowFilter) matches(rec *logging.EventRecord) bool {
 // monitorFlowState holds the daemon-side state for "monitor security flow".
 type monitorFlowState struct {
 	mu       sync.Mutex
-	filename string // trace file name (base name, written to /var/log/)
-	fileSize int64  // max file size in bytes
-	files    int    // max number of trace files
-	match    string // regex for line filtering
+	filename string         // trace file name (base name, written to /var/log/)
+	fileSize int64          // max file size in bytes
+	files    int            // max number of trace files
+	match    string         // regex for line filtering (raw pattern, as typed)
+	matchRe  *regexp.Regexp // compiled form of match; nil when match is empty
 	filters  map[string]*monitorFlowFilter
 	active   bool
 	cancel   context.CancelFunc // cancel the active monitor goroutine
@@ -105,6 +107,13 @@ func extractPort(addrPort string) uint16 {
 		return 0
 	}
 	return uint16(p)
+}
+
+// traceLineMatches reports whether a formatted trace line should be written
+// given the optional compiled match regex (#2288). A nil regex (no `match`
+// configured) admits every line; otherwise the line must match the pattern.
+func traceLineMatches(line string, re *regexp.Regexp) bool {
+	return re == nil || re.MatchString(line)
 }
 
 // formatFlowEvent formats an EventRecord into Junos-style flow trace output.
@@ -232,7 +241,13 @@ func (c *CLI) handleMonitorSecurityFlowFile(args []string) error {
 		case "match":
 			if i+1 < len(args) {
 				i++
+				re, err := regexp.Compile(args[i])
+				if err != nil {
+					fmt.Printf("error: invalid match regex %q: %v\n", args[i], err)
+					return nil
+				}
 				c.monitorFlow.match = args[i]
+				c.monitorFlow.matchRe = re
 			}
 		}
 	}
@@ -365,6 +380,11 @@ func (c *CLI) handleMonitorSecurityFlowStart() error {
 		filters = append(filters, &fc)
 	}
 
+	// Snapshot the optional match regex (compiled at parse time). Applied
+	// as a post-format line filter so the advertised `file <name> match
+	// <regex>` filter actually drops non-matching trace lines (#2288).
+	matchRe := c.monitorFlow.matchRe
+
 	// Open trace file.
 	path := "/var/log/" + c.monitorFlow.filename
 	logFile, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
@@ -403,6 +423,9 @@ func (c *CLI) handleMonitorSecurityFlowStart() error {
 					continue
 				}
 				line := formatFlowEvent(rec)
+				if !traceLineMatches(line, matchRe) {
+					continue
+				}
 				fmt.Fprintln(logFile, line)
 			}
 		}
@@ -448,6 +471,9 @@ func (c *CLI) showMonitorSecurityFlow() error {
 		fmt.Printf("  Monitor security flow trace file: /var/log/%s\n", c.monitorFlow.filename)
 	} else {
 		fmt.Printf("  Monitor security flow trace file: (not configured)\n")
+	}
+	if c.monitorFlow.match != "" {
+		fmt.Printf("  Monitor security flow match: %s\n", c.monitorFlow.match)
 	}
 	fmt.Printf("  Monitor security flow filters: %d\n", len(c.monitorFlow.filters))
 
