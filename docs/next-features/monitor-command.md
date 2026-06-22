@@ -59,6 +59,12 @@ Observed behavior:
 - `monitor security flow start` fails if file is not configured:
   - `error: Please specify the monitor flow trace file.`
 - The configured file resolves to `/var/log/<filename>` in status output.
+- `match <regex>` is a Go-RE2 regular expression evaluated against the
+  formatted trace line; only matching lines are written to the trace file.
+  The pattern is compiled at configure time — an invalid regex is rejected
+  immediately (`error: invalid match regex ...`) and never starts a trace
+  with a silently-broken filter (#2288). When set, the active pattern is
+  echoed in `show monitor security flow` output.
 
 #### Filter configuration
 ```text
