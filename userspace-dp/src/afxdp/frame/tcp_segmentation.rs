@@ -658,8 +658,10 @@ mod mode_aware_segmentation_tests {
     #[test]
     fn wireguard_segmentation_uses_wg_inner_mtu_not_gre() {
         // At a 1500 v4 outer MTU the WG inner-L3 budget is 1425 (pad-aware:
-        // 1500 - 20 IP - 8 UDP - 16 WG hdr - 16 tag, floored to a 16
-        // multiple). The GRE inner budget would be 1476 (only IP+GRE). A
+        // 1500 - 20 IP - 8 UDP - 16 WG hdr - 16 tag = 1440, minus the
+        // worst-case 15-byte WG §5.4.6 transport padding = 1425, the
+        // conservative bound `wg_inner_mtu` subtracts for any alignment).
+        // The GRE inner budget would be 1476 (only IP+GRE). A
         // 2000-byte inner payload must therefore split with each inner IP
         // total length <= 1425, NOT <= 1476. A revert to GRE math sizes the
         // first segment to ~1476 and this assertion fails.
@@ -892,8 +894,8 @@ mod mode_aware_segmentation_tests {
         u16::from_be_bytes([inner[2], inner[3]]) as usize
     }
 
-    /// Mirror of the GRE inner-MTU arithmetic for the no-key v6-outer
-    /// fixture (40-byte outer IP + 4-byte GRE), so the GRE-unchanged test
+    /// Mirror of the GRE inner-MTU arithmetic for the no-key v4-outer
+    /// fixture (20-byte outer IP + 4-byte GRE), so the GRE-unchanged test
     /// asserts against an explicit constant rather than re-calling the
     /// private helper indirectly.
     fn native_gre_inner_mtu_for_test(outer_mtu: usize) -> usize {
