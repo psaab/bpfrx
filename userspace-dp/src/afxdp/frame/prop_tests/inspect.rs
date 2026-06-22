@@ -115,8 +115,9 @@ proptest! {
     /// P-I4: a synthesized valid packet parses back to exactly the
     /// tuple it was built from — with consistent metadata AND with the
     /// metadata tuple/offsets zeroed (frame-led fallback agreement).
-    /// v6 ext chains up to 6 headers (the inspect walk's loop bound;
-    /// the >6 behavior is pinned separately below).
+    /// v6 ext chains up to 6 headers, well within the inspect walk's
+    /// `MAX_IPV6_EXT_HEADERS` (8) loop bound; the fail-closed
+    /// over-bound behavior is pinned separately below (#2292).
     #[test]
     fn parse_valid_round_trip(pkt in arb_parse_packet(6)) {
         let expected = pkt.session_flow();
@@ -212,31 +213,53 @@ fn v6_frame_with_n_hbh(n: usize) -> Vec<u8> {
     build_valid_frame(&spec).frame
 }
 
-/// Walk-bound pin: a chain of exactly 6 ext headers resolves to the
-/// true L4 offset via the post-loop `Some(offset)`; a chain of 7
-/// returns the offset of the SEVENTH extension header (current,
-/// deliberate bound at inspect.rs:50 — six iterations, then surrender
-/// the current offset). P-I4 therefore only feeds chains ≤ 6.
+/// #2292 walk-bound pin (fail-CLOSED): a chain of exactly
+/// `MAX_IPV6_EXT_HEADERS` (8) ext headers resolves to the true L4
+/// offset; a chain of 9 fails CLOSED — both `packet_rel_l4_offset` and
+/// `packet_rel_l4_offset_and_protocol` return `None` instead of
+/// surrendering the offset of the unconsumed extension header with a
+/// fake `proto == 0`. This is the exact behavior the screen path
+/// (`screen/extract.rs`, `for _ in 0..8` returning
+/// `Err(TruncatedIpv6ExtChain)` at the bound) enforces, so screen and
+/// forwarding no longer diverge on an over-bound chain. P-I4 feeds
+/// chains ≤ 8.
+///
+/// Fail-on-revert: if the walkers regress to the pre-#2292 6-iteration
+/// surrender-open shape, the 8-header case returns `None` (bound too
+/// low) AND the 9-header case returns `Some(..)` / `proto == 0` — both
+/// assertions below flip, so this pin cannot pass against the old code.
 #[test]
-fn pin_ext_walk_six_header_bound() {
-    let six = v6_frame_with_n_hbh(6);
+fn pin_ext_walk_bound_fail_closed() {
+    let max = v6_frame_with_n_hbh(MAX_IPV6_EXT_HEADERS);
     assert_eq!(
-        packet_rel_l4_offset(&six[14..], AF6),
-        Some(40 + 6 * 8),
-        "6-header chain must resolve to the real L4 offset"
-    );
-    let seven = v6_frame_with_n_hbh(7);
-    assert_eq!(
-        packet_rel_l4_offset(&seven[14..], AF6),
-        Some(40 + 6 * 8),
-        "7-header chain currently stops at the 7th ext header (loop bound)"
+        packet_rel_l4_offset(&max[14..], AF6),
+        Some(40 + MAX_IPV6_EXT_HEADERS * 8),
+        "an exactly-{MAX_IPV6_EXT_HEADERS}-header chain must resolve to the real L4 offset"
     );
     let (rel, proto) =
-        packet_rel_l4_offset_and_protocol(&seven[14..], AF6).expect("walk result");
-    assert_eq!(rel, 40 + 6 * 8);
+        packet_rel_l4_offset_and_protocol(&max[14..], AF6).expect("walk result at bound");
+    assert_eq!(rel, 40 + MAX_IPV6_EXT_HEADERS * 8);
+    assert_eq!(proto, PROTO_TCP, "terminal protocol at the bound is the real L4");
+
+    // One header past the bound: the walk is still on an extension
+    // header when it runs out of iterations → fail CLOSED (None), never
+    // a surrendered offset with a fake proto=0.
+    let over = v6_frame_with_n_hbh(MAX_IPV6_EXT_HEADERS + 1);
     assert_eq!(
-        proto, 0,
-        "post-bound 'protocol' is the unconsumed ext header type (hop-by-hop)"
+        packet_rel_l4_offset(&over[14..], AF6),
+        None,
+        "an over-bound ext chain must fail CLOSED (None), not surrender the offset"
+    );
+    assert_eq!(
+        packet_rel_l4_offset_and_protocol(&over[14..], AF6),
+        None,
+        "_and_protocol must also fail CLOSED — no fake proto=0 surrender"
+    );
+    // The frame-relative walker agrees.
+    assert_eq!(
+        frame_l4_offset(&over, AF6),
+        None,
+        "frame_l4_offset must fail CLOSED on the same over-bound chain"
     );
 }
 

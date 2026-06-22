@@ -1,5 +1,24 @@
 # Action Log
 
+## 2026-06-21 — #2292 IPv6 forwarding ext-walker fail-closed at bound (parity with screen)
+
+- **Timestamp**: 2026-06-21
+- **Action**: Made the IPv6 forwarding extension-header walkers fail
+  CLOSED at the chain bound and raised the bound from 6 to 8 to match
+  the screen path. Added `MAX_IPV6_EXT_HEADERS = 8` in inspect.rs and
+  switched `frame_l4_offset`, `packet_rel_l4_offset`,
+  `packet_rel_l4_offset_and_protocol`, and `ipv6_is_non_first_fragment`
+  to that bound. The post-loop terminal arms now return `None` instead
+  of surrendering the unconsumed ext-header offset (and a fake
+  `proto=0`). gre.rs `parse_inner_protocol_and_offsets` drops any
+  unresolved/ext-header sentinel (0/43/51/59/60) rather than forwarding
+  it. Rewrote the pin test to assert fail-closed (was pinning the buggy
+  surrender-open behavior).
+- **File(s)**: userspace-dp/src/afxdp/frame/inspect.rs,
+  userspace-dp/src/afxdp/frame/mod.rs,
+  userspace-dp/src/afxdp/gre.rs,
+  userspace-dp/src/afxdp/frame/prop_tests/inspect.rs
+
 ## 2026-06-21 — #2258 VRRP localIP/localIPv6 lazy-resolve race (run-loop write vs receiver reads)
 
 - **Timestamp**: 2026-06-21

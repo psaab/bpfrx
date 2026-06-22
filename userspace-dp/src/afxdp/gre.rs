@@ -146,6 +146,18 @@ fn parse_inner_protocol_and_offsets(packet: &[u8], addr_family: u8) -> Option<(u
             // Use the extension-header-aware helper to get both the final L4
             // protocol and the correct offset. packet[6] may be an extension
             // header type, not the actual L4 protocol.
+            //
+            // #2292: `packet_rel_l4_offset_and_protocol` now fails CLOSED
+            // (returns `None`) when the ext-header chain is still on an
+            // extension header at the `MAX_IPV6_EXT_HEADERS` bound, so a
+            // surrendered `protocol == 0` (unconsumed Hop-by-Hop) can no
+            // longer reach this match. The `_` arm below additionally
+            // DROPS any leftover ext-header / no-next-header sentinel
+            // (Hop-by-Hop 0, Routing 43, AH 51, No-Next 59, Dest-Opts 60)
+            // rather than forwarding it with the ext-header offset used as
+            // a fake L4/payload offset — defense in depth so this caller
+            // never forwards a packet whose L4 protocol it could not
+            // resolve.
             let (l4_off, protocol) = packet_rel_l4_offset_and_protocol(packet, addr_family)?;
             let rel_l4 = l4_off as u16;
             let payload_offset = match protocol {
@@ -162,6 +174,10 @@ fn parse_inner_protocol_and_offsets(packet: &[u8], addr_family: u8) -> Option<(u
                 }
                 PROTO_UDP => rel_l4 + 8,
                 PROTO_ICMPV6 => rel_l4 + 8,
+                // #2292: an unresolved/extension-header protocol is a drop,
+                // not a forward. 0/43/51/59/60 are IPv6 ext-header or
+                // no-next-header sentinels, never a real inner L4.
+                0 | 43 | 51 | 59 | 60 => return None,
                 _ => rel_l4,
             };
             Some((protocol, rel_l4, payload_offset))
