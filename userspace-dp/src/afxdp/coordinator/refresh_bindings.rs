@@ -119,6 +119,7 @@ fn copy_live_snapshot(binding: &mut BindingStatus, snap: BindingLiveSnapshot) {
     binding.time_exceeded_output_filter_drops = snap.time_exceeded_output_filter_drops;
     binding.policy_reject_output_filter_drops = snap.policy_reject_output_filter_drops;
     binding.syn_cookie_output_filter_drops = snap.syn_cookie_output_filter_drops;
+    binding.ptb_output_filter_drops = snap.ptb_output_filter_drops;
     binding.generated_reply_classify_parse_errors = snap.generated_reply_classify_parse_errors;
     binding.snat_packets = snap.snat_packets;
     binding.dnat_packets = snap.dnat_packets;
@@ -302,6 +303,7 @@ fn zero_unbound_slot(binding: &mut BindingStatus) {
     binding.time_exceeded_output_filter_drops = 0;
     binding.policy_reject_output_filter_drops = 0;
     binding.syn_cookie_output_filter_drops = 0;
+    binding.ptb_output_filter_drops = 0;
     binding.generated_reply_classify_parse_errors = 0;
     binding.snat_packets = 0;
     binding.dnat_packets = 0;

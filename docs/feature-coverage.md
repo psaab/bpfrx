@@ -35,7 +35,14 @@ the userspace dataplane admission boundary is in
   Big (type 2, MTU) for IPv6 back to the sender, instead of a silent MTU
   drop (#2301). RFC 792/4443 suppression applies (no reply to inbound
   ICMP errors or non-first fragments). NAT64 already translates
-  PTB↔Frag-Needed across the boundary (#2219).
+  PTB↔Frag-Needed across the boundary (#2219). The generated PTB is
+  classified by its OWN egress 5-tuple through the shared
+  `classify_generated_reply` output classifier (#2328, #2238 contract
+  parity with the Time Exceeded / policy-reject / SYN-cookie generators):
+  an output firewall filter `then discard` / CoS forwarding-class / DSCP
+  rewrite keyed on the generated ICMP fires, and a parse failure of the
+  built bytes fails CLOSED (drop + `generated_reply_classify_parse_errors`).
+  Output-filter drops of the PTB land on `ptb_output_filter_drops`.
 - **ALG control**, allow-dns-reply, allow-embedded-icmp.
 - **Configurable timeouts** (per-application inactivity).
 - **Session management**: filtered clearing, idle time tracking, brief

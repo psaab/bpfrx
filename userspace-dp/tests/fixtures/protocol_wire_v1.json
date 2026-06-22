@@ -120,6 +120,7 @@
     "post_drain_backup_bytes": 0,
     "post_drain_backup_cos_drop_bytes": 0,
     "post_drain_backup_cos_drops": 0,
+    "ptb_output_filter_drops": 0,
     "queue_id": 0,
     "ready": false,
     "redirect_inbox_overflow_drops": 0,

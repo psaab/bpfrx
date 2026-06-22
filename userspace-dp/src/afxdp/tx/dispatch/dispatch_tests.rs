@@ -564,6 +564,7 @@ fn enqueue_pending_forwards_mirrors_live_frame_and_records_counter() {
         &local_tunnel_deliveries,
         &recent_exceptions,
         &mut dbg,
+        &mut BatchCounters::default(),
         0,
         &worker_commands_by_id,
     );
@@ -646,6 +647,7 @@ fn enqueue_pending_forwards_counts_prebuilt_fabric_redirect_no_binding() {
         &local_tunnel_deliveries,
         &recent_exceptions,
         &mut dbg,
+        &mut BatchCounters::default(),
         0,
         &worker_commands_by_id,
     );
@@ -773,6 +775,7 @@ fn enqueue_failure_recycles_ingress_descriptor_and_reinjects_slow_path() {
         &local_tunnel_deliveries,
         &recent_exceptions,
         &mut dbg,
+        &mut BatchCounters::default(),
         0,
         &worker_commands_by_id,
     );
@@ -853,6 +856,7 @@ fn oversized_forward_frame_recycles_ingress_descriptor_without_reinject() {
         &local_tunnel_deliveries,
         &recent_exceptions,
         &mut dbg,
+        &mut BatchCounters::default(),
         0,
         &worker_commands_by_id,
     );
@@ -955,6 +959,7 @@ fn enqueue_failure_conserves_free_frames_across_many_forwards() {
         &local_tunnel_deliveries,
         &recent_exceptions,
         &mut dbg,
+        &mut BatchCounters::default(),
         0,
         &worker_commands_by_id,
     );
@@ -1039,6 +1044,19 @@ fn forwarding_for_ptb(mtu: usize) -> ForwardingState {
 }
 
 fn run_ptb_dispatch(egress_mtu: usize) -> (Vec<BindingWorker>, DebugPollCounters, Vec<String>) {
+    let (bindings, dbg, _counters, reasons) =
+        run_ptb_dispatch_with_forwarding(forwarding_for_ptb(egress_mtu));
+    (bindings, dbg, reasons)
+}
+
+/// #2328: PTB e2e harness parameterized on the full `ForwardingState` so a
+/// test can install an output firewall filter / CoS classifier on the egress
+/// (ingress-reflected) interface (ifindex 11) and observe the generated PTB
+/// being classified by its OWN egress tuple. Returns the `BatchCounters` so
+/// the fail-on-revert tests can assert the generated-reply drop counters.
+fn run_ptb_dispatch_with_forwarding(
+    forwarding: ForwardingState,
+) -> (Vec<BindingWorker>, DebugPollCounters, BatchCounters, Vec<String>) {
     let mut bindings = vec![
         BindingWorker::new_for_mirror_test(0, 0, 11, 0),
         BindingWorker::new_for_mirror_test(1, 0, 22, 0),
@@ -1055,7 +1073,6 @@ fn run_ptb_dispatch(egress_mtu: usize) -> (Vec<BindingWorker>, DebugPollCounters
     .expect("ingress frame")
     .copy_from_slice(&frame);
 
-    let forwarding = forwarding_for_ptb(egress_mtu);
     let lookup = WorkerBindingLookup::from_bindings(&bindings);
     let mirror_targets = MirrorTargetMap::default();
     // UDP (not TCP) so the TCP-segmentation path is skipped and the
@@ -1077,6 +1094,7 @@ fn run_ptb_dispatch(egress_mtu: usize) -> (Vec<BindingWorker>, DebugPollCounters
     let recent_exceptions = Arc::new(Mutex::new(VecDeque::new()));
     let worker_commands_by_id: BTreeMap<u32, Arc<Mutex<VecDeque<WorkerCommand>>>> = BTreeMap::new();
     let mut dbg = DebugPollCounters::default();
+    let mut counters = BatchCounters::default();
 
     let (left, rest) = bindings.split_at_mut(0);
     let (ingress, right) = rest.split_first_mut().expect("ingress binding");
@@ -1097,6 +1115,7 @@ fn run_ptb_dispatch(egress_mtu: usize) -> (Vec<BindingWorker>, DebugPollCounters
         &local_tunnel_deliveries,
         &recent_exceptions,
         &mut dbg,
+        &mut counters,
         0,
         &worker_commands_by_id,
     );
@@ -1106,7 +1125,7 @@ fn run_ptb_dispatch(egress_mtu: usize) -> (Vec<BindingWorker>, DebugPollCounters
         .iter()
         .map(|e| e.reason.clone())
         .collect();
-    (bindings, dbg, reasons)
+    (bindings, dbg, counters, reasons)
 }
 
 #[test]
@@ -1182,6 +1201,157 @@ fn in_mtu_forward_emits_no_ptb_counterfactual() {
     let egress_tx = bindings[1].tx_pipeline.pending_tx_local.len()
         + bindings[1].tx_pipeline.pending_tx_prepared.len();
     assert_eq!(egress_tx, 1, "in-MTU frame must forward to the egress binding");
+}
+
+/// #2328: build a v4 output firewall filter on the PTB egress interface
+/// (ifindex 11 — the ingress interface the PTB is reflected back out of)
+/// carrying a single term, and splice it onto `forwarding_for_ptb`. The
+/// trigger frame is UDP, so a term keyed on `protocol icmp` fires ONLY for
+/// the GENERATED ICMP Frag-Needed reply — proving classify-by-the-PTB's-own
+/// egress tuple, not the UDP trigger tuple.
+fn forwarding_for_ptb_with_output_term(
+    mtu: usize,
+    term: crate::FirewallTermSnapshot,
+) -> ForwardingState {
+    let mut forwarding = forwarding_for_ptb(mtu);
+    forwarding.filter_state = crate::filter::parse_filter_state(
+        &[crate::FirewallFilterSnapshot {
+            name: "ptb-out".into(),
+            family: "inet".into(),
+            terms: vec![term],
+        }],
+        &[],
+        &[crate::InterfaceSnapshot {
+            name: "ge-0/0/0.0".into(),
+            ifindex: 11,
+            filter_output_v4: "ptb-out".into(),
+            ..Default::default()
+        }],
+        "",
+        "",
+    );
+    forwarding.tx_selection_enabled_v4 = true;
+    forwarding
+}
+
+/// #2328: an OUTPUT firewall filter `then discard` matching `protocol icmp`
+/// on the PTB egress interface drops the GENERATED Frag-Needed reply — the
+/// PTB is now classified by its own egress tuple (#2238 contract parity with
+/// Time Exceeded / policy-reject / SYN-cookie). The drop lands on the
+/// dedicated `ptb_output_filter_drops` counter. Fail-on-revert: if the PTB
+/// enqueue reverts to the pre-#2328 unclassified `cos_queue_id: None,
+/// dscp_rewrite: None` (no `classify_generated_reply` call), the PTB would be
+/// enqueued and this assertion fails.
+#[test]
+fn ptb_dropped_by_egress_output_filter_discard() {
+    let (bindings, _dbg, counters, reasons) = run_ptb_dispatch_with_forwarding(
+        forwarding_for_ptb_with_output_term(
+            1400,
+            crate::FirewallTermSnapshot {
+                name: "drop-icmp".into(),
+                action: "discard".into(),
+                protocols: vec!["icmp".into()],
+                ..Default::default()
+            },
+        ),
+    );
+    // The generated PTB was DROPPED (not enqueued) by the output `discard`.
+    assert_eq!(
+        bindings[0].tx_pipeline.pending_tx_local.len(),
+        0,
+        "an output `then discard` (protocol icmp) on the egress interface must drop the generated PTB"
+    );
+    // Drop attributed to the dedicated PTB counter, not the parse-error one.
+    assert!(
+        counters.ptb_output_filter_drops >= 1,
+        "output-filter drop of the PTB must land on ptb_output_filter_drops"
+    );
+    assert_eq!(counters.generated_reply_classify_parse_errors, 0);
+    // The oversized original is still dropped (PMTUD), and the descriptor is
+    // recycled exactly once — no leak past the fail-closed drop.
+    assert_eq!(bindings[1].tx_pipeline.pending_tx_local.len(), 0);
+    assert_eq!(bindings[1].tx_pipeline.pending_tx_prepared.len(), 0);
+    assert_eq!(ingress_recycled_count(&bindings[0]), 1);
+    assert!(reasons.iter().any(|r| r == "egress_mtu_exceeded"));
+}
+
+/// #2328: an output filter matching the UDP TRIGGER tuple does NOT drop the
+/// generated ICMP PTB — discriminating proof the PTB is classified by its
+/// OWN (ICMP) egress tuple, not the trigger's (UDP). Sibling of the Time
+/// Exceeded `ignores_trigger_matching_output_filter` test.
+#[test]
+fn ptb_ignores_trigger_matching_output_filter() {
+    let (bindings, _dbg, counters, _reasons) = run_ptb_dispatch_with_forwarding(
+        forwarding_for_ptb_with_output_term(
+            1400,
+            crate::FirewallTermSnapshot {
+                name: "drop-udp".into(),
+                action: "discard".into(),
+                protocols: vec!["udp".into()],
+                ..Default::default()
+            },
+        ),
+    );
+    assert_eq!(
+        bindings[0].tx_pipeline.pending_tx_local.len(),
+        1,
+        "an output filter matching the UDP trigger must NOT drop the generated ICMP PTB"
+    );
+    assert_eq!(counters.ptb_output_filter_drops, 0);
+    assert_eq!(counters.generated_reply_classify_parse_errors, 0);
+}
+
+/// #2328: a forwarding-class / DSCP-rewrite output filter matching the
+/// generated PTB's ICMP tuple sets the enqueued PTB TxRequest's
+/// `dscp_rewrite` from the classifier verdict — NOT the pre-#2328
+/// hard-coded `None`. Fail-on-revert: reverting the PTB enqueue to
+/// `dscp_rewrite: None` makes the asserted rewrite disappear.
+#[test]
+fn ptb_dscp_rewrite_comes_from_classifier_not_none() {
+    let (bindings, _dbg, counters, _reasons) = run_ptb_dispatch_with_forwarding(
+        forwarding_for_ptb_with_output_term(
+            1400,
+            crate::FirewallTermSnapshot {
+                name: "mark-icmp".into(),
+                action: "accept".into(),
+                protocols: vec!["icmp".into()],
+                dscp_rewrite: Some(46),
+                ..Default::default()
+            },
+        ),
+    );
+    let ptb = &bindings[0].tx_pipeline.pending_tx_local;
+    assert_eq!(ptb.len(), 1, "PTB accepted (then accept) and enqueued");
+    assert_eq!(
+        ptb[0].dscp_rewrite,
+        Some(46),
+        "the PTB TxRequest dscp_rewrite must come from classify_generated_reply, not None"
+    );
+    assert_eq!(counters.ptb_output_filter_drops, 0);
+    assert_eq!(counters.generated_reply_classify_parse_errors, 0);
+}
+
+/// #2328 §6.2 fail-CLOSED canary: the PTB path routes a generated-reply parse
+/// failure through `classify_generated_reply`, which returns
+/// `drop: true, parse_error: true` for bytes it cannot re-parse. The
+/// dispatch wiring maps that verdict onto
+/// `generated_reply_classify_parse_errors` and drops the PTB (never leaking
+/// it past an output `discard`). This pins the shared mechanism the PTB
+/// enqueue depends on: truncated/malformed reply bytes fail closed.
+#[test]
+fn ptb_parse_failure_fails_closed_with_parse_error_verdict() {
+    let forwarding = forwarding_for_ptb(1400);
+    // Bytes too short for an L3 header — frame_l3_offset / the v4 parser
+    // reject them, exactly the canary a malformed PTB builder would hit.
+    let malformed: Vec<u8> = vec![0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff];
+    let verdict = classify_generated_reply(&forwarding, 11, &malformed, 1);
+    assert!(verdict.drop, "unparseable generated bytes must fail CLOSED (drop)");
+    assert!(
+        verdict.parse_error,
+        "the drop must be attributed as a parse error so the PTB path bumps generated_reply_classify_parse_errors"
+    );
+    assert_eq!(verdict.cos_queue_id, None);
+    assert_eq!(verdict.dscp_rewrite, None);
 }
 
 #[test]

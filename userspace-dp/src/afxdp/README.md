@@ -97,7 +97,18 @@ sync.
   (`frame/inspect.rs`, the IEEE I/G group bit on the destination MAC's
   first octet; all-FF broadcast is a group address). No new counter: a
   suppressed PTB is folded into the existing fail-closed silent-drop path
-  (the oversized original is still dropped via `mtu_signalled`).
+  (the oversized original is still dropped via `mtu_signalled`). #2328: a
+  PTB that IS generated is now classified by its OWN egress 5-tuple through
+  the shared `classify_generated_reply` (`tx/cos_classify.rs`) before the
+  enqueue in `tx/dispatch/mod.rs`, exactly like the ICMP/ICMPv6 Time
+  Exceeded (#2238), policy-`reject`, and SYN-cookie generators — so an
+  output firewall filter `discard`/`reject` / CoS forwarding-class / DSCP
+  rewrite keyed on the generated ICMP fires, and the resulting
+  `cos_queue_id`/`dscp_rewrite` drive the PTB TxRequest (pre-#2328 it was
+  `None`/`None`). An output-filter drop lands on `ptb_output_filter_drops`;
+  a parse failure of the built bytes fails CLOSED on
+  `generated_reply_classify_parse_errors` (§6.2), never leaking the PTB
+  past an output `discard`.
 - `cos/` — Class-of-Service scheduler: token-bucket admission, MQFQ
   active-bucket selection, fair-share lease (#1229 Phase 6 v8). See
   `docs/per-5-tuple/state.md` for the architectural ceiling.

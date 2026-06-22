@@ -383,6 +383,12 @@ pub(in crate::afxdp) struct BindingLiveState {
     pub(super) time_exceeded_output_filter_drops: AtomicU64,
     pub(super) policy_reject_output_filter_drops: AtomicU64,
     pub(super) syn_cookie_output_filter_drops: AtomicU64,
+    /// #2328: egress-MTU PTB / Frag-Needed (the #2301 PMTUD generator)
+    /// dropped by an OUTPUT firewall filter terminal `discard`/`reject` (or
+    /// three-color policer) on the egress interface, now that the PTB is
+    /// classified by its OWN egress tuple. Per-leg, sibling of the three
+    /// generator counters above.
+    pub(super) ptb_output_filter_drops: AtomicU64,
     /// #2238: fail-CLOSED drops — a generated reply's own bytes could not be
     /// re-parsed for output classification (§6.2). A builder/parser logic
     /// bug; a non-zero value is never silent (the reply is dropped, not
@@ -778,6 +784,7 @@ impl BindingLiveState {
             time_exceeded_output_filter_drops: AtomicU64::new(0),
             policy_reject_output_filter_drops: AtomicU64::new(0),
             syn_cookie_output_filter_drops: AtomicU64::new(0),
+            ptb_output_filter_drops: AtomicU64::new(0),
             generated_reply_classify_parse_errors: AtomicU64::new(0),
             snat_packets: AtomicU64::new(0),
             dnat_packets: AtomicU64::new(0),

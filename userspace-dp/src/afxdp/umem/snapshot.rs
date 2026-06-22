@@ -105,6 +105,7 @@ impl BindingLiveState {
             syn_cookie_output_filter_drops: self
                 .syn_cookie_output_filter_drops
                 .load(Ordering::Relaxed),
+            ptb_output_filter_drops: self.ptb_output_filter_drops.load(Ordering::Relaxed),
             generated_reply_classify_parse_errors: self
                 .generated_reply_classify_parse_errors
                 .load(Ordering::Relaxed),
