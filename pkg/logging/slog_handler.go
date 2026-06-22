@@ -61,19 +61,37 @@ func (h *SyslogSlogHandler) Enabled(ctx context.Context, level slog.Level) bool 
 	return h.base.Enabled(ctx, level)
 }
 
+// goIDFn resolves the current goroutine ID. It is a package var so tests can
+// install a counting seam to assert the no-client fast path never pays the
+// runtime.Stack cost (#2295). Production always uses goID.
+var goIDFn = goID
+
 // Handle implements slog.Handler.
 func (h *SyslogSlogHandler) Handle(ctx context.Context, r slog.Record) error {
 	// Always forward to the base handler (stderr) — unconditionally, even on a
 	// re-entrant call, so the record is never lost from local logs.
 	err := h.base.Handle(ctx, r)
 
+	// Snapshot the client set first. With no syslog clients configured (the
+	// default until syslog config applies) there is nothing to forward, so
+	// return before paying for the re-entrancy guard's goID() — runtime.Stack +
+	// ParseUint per record is wasted work on the common no-client path (#2295).
+	h.mu.RLock()
+	clients := h.clients
+	h.mu.RUnlock()
+
+	if len(clients) == 0 {
+		return err
+	}
+
 	// Re-entrancy guard (#2287): if this goroutine is already inside the
 	// syslog-forwarding section (a client Send emitted an slog record that
 	// routed back here), skip re-forwarding to syslog. Defense-in-depth so no
 	// under-lock or transitive slog call from the send path can wedge the
-	// daemon by recursing into a client's Send.
+	// daemon by recursing into a client's Send. Only reached when clients are
+	// present, so goID() runs only when there is something to forward (#2295).
 	if h.forwarding != nil {
-		gid := goID()
+		gid := goIDFn()
 		if _, busy := h.forwarding.Load(gid); busy {
 			return err
 		}
@@ -81,18 +99,12 @@ func (h *SyslogSlogHandler) Handle(ctx context.Context, r slog.Record) error {
 		defer h.forwarding.Delete(gid)
 	}
 
-	// Forward to syslog clients
-	h.mu.RLock()
-	clients := h.clients
-	h.mu.RUnlock()
-
-	if len(clients) > 0 {
-		severity := slogLevelToSyslog(r.Level)
-		msg := formatRecord(r, h.attrs, h.groups)
-		for _, c := range clients {
-			if c.ShouldSend(severity) {
-				c.Send(severity, msg)
-			}
+	// Forward to syslog clients.
+	severity := slogLevelToSyslog(r.Level)
+	msg := formatRecord(r, h.attrs, h.groups)
+	for _, c := range clients {
+		if c.ShouldSend(severity) {
+			c.Send(severity, msg)
 		}
 	}
 

@@ -1,6 +1,7 @@
 package logging
 
 import (
+	"context"
 	"errors"
 	"io"
 	"log/slog"
@@ -297,6 +298,74 @@ func TestDialFailureCountsAsDialDrop(t *testing.T) {
 	if c.DroppedWrites() != 0 {
 		t.Fatalf("a dial failure must not be counted as a write drop, got %d",
 			c.DroppedWrites())
+	}
+}
+
+// TestHandleNoClientsSkipsGoID is the #2295 fix-on-revert proof: with NO syslog
+// clients configured (the default until syslog config applies), Handle must
+// return before paying the goID() runtime.Stack + ParseUint cost. A counting
+// seam over goIDFn records calls; the no-client path must record zero. Reverting
+// the reorder (calling the guard before the client check) makes goID fire on
+// every record and trips this test.
+func TestHandleNoClientsSkipsGoID(t *testing.T) {
+	var goIDCalls int32
+	prev := goIDFn
+	goIDFn = func() uint64 {
+		atomic.AddInt32(&goIDCalls, 1)
+		return goID()
+	}
+	t.Cleanup(func() { goIDFn = prev })
+
+	h := NewSyslogSlogHandler(slog.NewTextHandler(io.Discard, nil))
+	// No SetClients: the zero-client default.
+
+	for i := 0; i < 100; i++ {
+		if err := h.Handle(context.Background(), slog.Record{}); err != nil {
+			t.Fatalf("Handle returned an error on the no-client path: %v", err)
+		}
+	}
+
+	if got := atomic.LoadInt32(&goIDCalls); got != 0 {
+		t.Fatalf("expected goID NOT to be called on the no-client path, got %d calls "+
+			"(runtime.Stack regression #2295)", got)
+	}
+}
+
+// TestHandleWithClientsStillCallsGoID asserts the reorder did NOT disable the
+// re-entrancy guard: when at least one client is present, goID still runs (the
+// guard remains armed). Combined with TestHandleReentrancyGuardSkipsNestedForward
+// (the guard still suppresses the nested forward), this proves the #2287 fix is
+// intact after the #2295 fast-path reorder.
+func TestHandleWithClientsStillCallsGoID(t *testing.T) {
+	var goIDCalls int32
+	prev := goIDFn
+	goIDFn = func() uint64 {
+		atomic.AddInt32(&goIDCalls, 1)
+		return goID()
+	}
+	t.Cleanup(func() { goIDFn = prev })
+
+	rec := &recordingConn{}
+	c := &SyslogClient{
+		hostname:          "test",
+		remoteAddr:        "203.0.113.14:514",
+		protocol:          "tcp",
+		Facility:          FacilityLocal0,
+		writeTimeout:      defaultWriteTimeout,
+		reconnectCooldown: defaultReconnectCooldown,
+		conn:              rec,
+	}
+	h := NewSyslogSlogHandler(slog.NewTextHandler(io.Discard, nil))
+	h.SetClients([]*SyslogClient{c})
+
+	if err := h.Handle(context.Background(), slog.Record{}); err != nil {
+		t.Fatalf("Handle returned an error with a client present: %v", err)
+	}
+	if got := atomic.LoadInt32(&goIDCalls); got != 1 {
+		t.Fatalf("expected goID to run once when a client is present (guard armed), got %d", got)
+	}
+	if n := atomic.LoadInt32(&rec.writes); n != 1 {
+		t.Fatalf("expected the record to be forwarded to the client, got %d writes", n)
 	}
 }
 
