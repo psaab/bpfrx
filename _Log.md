@@ -9717,3 +9717,24 @@ top.
   **File(s)**: pkg/logging/syslog.go, pkg/logging/slog_handler.go,
   pkg/logging/goid.go, pkg/logging/syslog_reentrancy_test.go,
   pkg/logging/README.md, _Log.md
+
+- **Timestamp**: 2026-06-21
+  **Action**: #2298 — classify scan-table-pressure ALARM by action, not as a
+  screen drop. The #2234 saturation alarm is a ScreenDrop-kind event with
+  action=PERMIT; Go consumers classified by KIND only, so it inflated
+  ScreenDropEvents and logged at SyslogError. Fix (approach b): eventSeverity
+  takes action (PERMIT screen event -> new SyslogNotice; real drop ->
+  SyslogError); recordDataplaneEvent takes action (PERMIT screen event ->
+  new ScreenAlarmEvents counter; real drop -> ScreenDropEvents). Plumbed
+  ScreenAlarmEvents through EventStreamStatus + show-status + Prometheus
+  screen_alarm label. Rust wire/KIND unchanged; rustdoc updated. Added
+  regression tests (counter + severity + payload-offset, fail-on-revert).
+  **File(s)**: pkg/logging/syslog.go, pkg/logging/ringbuf.go,
+  pkg/logging/event_severity_test.go,
+  pkg/dataplane/userspace/eventstream.go,
+  pkg/dataplane/userspace/eventstream_test.go,
+  pkg/dataplane/userspace/protocol.go,
+  pkg/dataplane/userspace/format/status.go,
+  pkg/dataplane/userspace/format/status_test.go,
+  pkg/api/metrics_userspace.go,
+  userspace-dp/src/afxdp/event_emit.rs, _Log.md
