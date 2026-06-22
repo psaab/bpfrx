@@ -1,5 +1,35 @@
 # Action Log
 
+## 2026-06-22 — #2294 VRRP ifindex-drift restart (rebind on stale socket)
+
+- **Timestamp**: 2026-06-22 PDT
+- **Action**: Fixed the HA-availability gap where a VRRP instance was never
+  restarted when its member interface's kernel ifindex changed under an
+  otherwise byte-identical config. The per-instance AF_PACKET / raw / IPv6
+  sockets are bound to the ifindex at `openSocket()` time; a netdev
+  delete+recreate or rename (carrier/VLAN flap that fully removes and re-adds
+  the link) gives a new ifindex, but the reconcile diff only compared
+  priority/preempt/track/VIPs, so the "No change" branch left the sockets
+  bound to the STALE ifindex → permanent VRRP silence (split-brain /
+  blackhole). Added a cheap, tolerant `name→ifindex` probe at the top of the
+  per-instance branch in `Manager.UpdateInstances`: when the live ifindex
+  differs from `existing.iface.Index`, force the existing
+  build-before-teardown (#2156) restart path so the instance rebinds to a
+  fresh socket on the new ifindex. A resolve failure is treated as "no drift"
+  so a transient netlink hiccup never blocks a time-critical priority/preempt
+  in-place update; the build block already owns resolve-failure-keeps-old
+  recovery. Idempotent (unchanged ifindex → no restart). The restart rebuilds
+  from the same desired `inst` (preserves priority/preempt/track) and
+  re-applies sync-hold suppression, so a rebind cannot spuriously preempt or
+  break the sync hold; RG role stays driven by the cluster heartbeat /
+  debounced priority. Composes with the config-change restart (no
+  double-restart — drift and VIP-change share the one build block).
+- **File(s)**: pkg/vrrp/manager.go, pkg/vrrp/update_instances_test.go,
+  pkg/vrrp/README.md, _Log.md
+- **Validation**: `go build ./...` clean; `go test ./pkg/vrrp/...
+  ./pkg/daemon/... ./pkg/cluster/...` green; new tests `-count=5` green;
+  `go test -race ./pkg/vrrp/` clean.
+
 ## 2026-06-22 — #2334 WG recvmsg cmsg buffer alignment fix
 
 - **Timestamp**: 2026-06-22 PDT

@@ -30,6 +30,23 @@ This is the package that drives chassis-cluster failover.
   therefore leaves the old instance running and advertising its old VIPs
   rather than orphaning the RG out of election. Priority/preempt/track
   changes still update in-place (no restart, no master-down gap).
+  **Ifindex drift (#2294):** before the no-change / in-place branch, a
+  cheap tolerant `name→ifindex` probe compares the live kernel ifindex
+  against the one the instance's sockets are bound to. A member netdev
+  that is deleted+recreated or renamed (carrier/VLAN flap that fully
+  removes and re-adds the link) gets a NEW ifindex while the xpf config
+  stays byte-identical; without the probe the instance would keep its
+  sockets bound to the STALE ifindex and go permanently silent
+  (split-brain / blackhole). A drift forces the same
+  build-before-teardown restart path so the instance rebinds to the new
+  ifindex; a resolve failure is treated as "no drift" (a transient
+  netlink hiccup never blocks a time-critical priority update — the
+  build block already owns resolve-failure recovery). The probe runs
+  every ~2s reconcile tick and is idempotent (unchanged ifindex → no
+  restart, no churn). The restart preserves configured
+  priority/preempt/tracking and re-applies sync-hold suppression, so a
+  rebind cannot spuriously preempt or break the sync hold; RG role is
+  driven separately by the cluster heartbeat / debounced priority.
 - `ReleaseSyncHold()` — `manager.go`. No-arg; releases hold for all
   instances.
 - `ResignRG(rgID int)` — `manager.go`. Forces this node out of master

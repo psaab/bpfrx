@@ -234,19 +234,52 @@ func (m *Manager) UpdateInstances(desired []*Instance) error {
 	for key, inst := range desiredMap {
 		existing, ok := m.instances[key]
 		if ok {
-			// Check if config changed.
-			if existing.cfg.Priority == inst.Priority &&
+			// #2294: detect ifindex drift on an otherwise-unchanged
+			// instance. The per-instance AF_PACKET / raw / IPv6 sockets are
+			// bound to the member interface's kernel ifindex at openSocket()
+			// time. If the netdev is deleted+recreated or renamed
+			// (carrier/VLAN flap that fully removes and re-adds the link) its
+			// ifindex changes while the xpf config stays byte-identical, so
+			// the no-change and in-place (priority-only) branches below would
+			// leave the instance bound to the STALE ifindex — its sockets can
+			// no longer send/receive VRRP adverts and the RG goes permanently
+			// silent (split-brain / blackhole) until an operator re-commit or
+			// daemon restart. When the live ifindex differs from the bound
+			// one we force the build-before-teardown restart path below (a
+			// fresh socket is mandatory; a config-only in-place update cannot
+			// rebind).
+			//
+			// The probe is a cheap, TOLERANT name->ifindex resolve: a resolve
+			// FAILURE is treated as "no drift" so a transient netlink hiccup
+			// never blocks a time-critical priority/preempt in-place update
+			// (failover priority, sync-hold release) — those paths
+			// historically never touched netlink, and the build block below
+			// already owns the resolve-failure-keeps-old-instance recovery.
+			// Detection is idempotent: an unchanged ifindex returns false and
+			// the normal no-change / in-place path runs with no churn. This
+			// runs every ~2s reconcile tick (daemon reconcileVRRPInstances),
+			// so it neither allocates nor restarts on a steady config.
+			ifindexChanged := false
+			if probe, perr := m.resolveIface(inst.Interface); perr == nil && probe.Index != existing.iface.Index {
+				ifindexChanged = true
+			}
+
+			// Check if config changed (and the live ifindex is unchanged).
+			if !ifindexChanged &&
+				existing.cfg.Priority == inst.Priority &&
 				existing.cfg.Preempt == inst.Preempt &&
 				existing.cfg.TrackInterface == inst.TrackInterface &&
 				existing.cfg.TrackPriorityCost == inst.TrackPriorityCost &&
 				vipsEqual(existing.cfg.VirtualAddresses, inst.VirtualAddresses) {
 				continue // No change.
 			}
-			// If only priority/preempt/tracking changed, update in-place
-			// without stopping. Restarting would cause a 3s master-down
-			// gap where the node falsely becomes MASTER before hearing
-			// the peer.
-			if vipsEqual(existing.cfg.VirtualAddresses, inst.VirtualAddresses) {
+			// If only priority/preempt/tracking changed (and the ifindex is
+			// unchanged), update in-place without stopping. Restarting would
+			// cause a 3s master-down gap where the node falsely becomes
+			// MASTER before hearing the peer. An ifindex change is NOT
+			// in-place-updatable — it requires a fresh socket — so it skips
+			// this arm and falls through to the build-before-teardown path.
+			if !ifindexChanged && vipsEqual(existing.cfg.VirtualAddresses, inst.VirtualAddresses) {
 				slog.Info("vrrp: priority update", "key", existing.key(),
 					"old_pri", existing.cfg.Priority, "new_pri", inst.Priority)
 				trackIfaceChanged := existing.cfg.TrackInterface != inst.TrackInterface
@@ -263,28 +296,40 @@ func (m *Manager) UpdateInstances(desired []*Instance) error {
 				}
 				continue
 			}
-			// VIPs changed — the instance must be restarted (changing the
-			// VIP set requires re-opening sockets and re-running the state
-			// machine). BUILD THE REPLACEMENT BEFORE TEARING DOWN the old
-			// one (#2156): a transient member-link failure (carrier flap,
-			// mid-rename by networkd) used to delete the working instance
-			// and then `continue` on InterfaceByName/openSocket error,
-			// orphaning the RG out of VRRP election until an operator
-			// re-commit. Falls through to the shared build block below; the
-			// old instance is only stopped+replaced on a fully-built
-			// replacement.
-			slog.Info("vrrp: restarting instance", "key", existing.key(),
-				"old_pri", existing.cfg.Priority, "new_pri", inst.Priority)
+			// VIPs changed OR the ifindex drifted — the instance must be
+			// restarted (changing the VIP set or rebinding to a new ifindex
+			// requires re-opening sockets and re-running the state machine).
+			// BUILD THE REPLACEMENT BEFORE TEARING DOWN the old one (#2156):
+			// a transient member-link failure (carrier flap, mid-rename by
+			// networkd) used to delete the working instance and then
+			// `continue` on InterfaceByName/openSocket error, orphaning the
+			// RG out of VRRP election until an operator re-commit. Falls
+			// through to the shared build block below; the old instance is
+			// only stopped+replaced on a fully-built replacement. The restart
+			// preserves the configured priority/preempt/tracking (it rebuilds
+			// from the same desired `inst`) and re-applies sync-hold
+			// suppression below, so an ifindex rebind cannot spuriously
+			// preempt or break the sync hold. RG role in the cluster state
+			// machine is driven separately (heartbeat / debounced priority),
+			// not reset here.
+			if ifindexChanged {
+				slog.Info("vrrp: restarting instance (ifindex changed)",
+					"key", existing.key(), "old_ifindex", existing.iface.Index)
+			} else {
+				slog.Info("vrrp: restarting instance", "key", existing.key(),
+					"old_pri", existing.cfg.Priority, "new_pri", inst.Priority)
+			}
 		}
 
-		// Build the (possibly replacement) instance. On ANY build failure
-		// we leave m.instances untouched: an existing instance keeps
-		// advertising its old VIP set (strictly better than dropping out of
-		// election), and a brand-new key is simply not created yet. The 2s
-		// reconcile re-drive (daemon reconcileVRRPInstances) and the two
-		// existing UpdateInstances callers retry until the interface
-		// returns. No placeholder state is added, so RGVRRPReady and the
-		// other map readers stay truthful.
+		// Build the (possibly replacement) instance. On ANY build failure we
+		// leave m.instances untouched: an existing instance keeps advertising
+		// its old VIP set (strictly better than dropping out of election), and
+		// a brand-new key is simply not created yet. The 2s reconcile re-drive
+		// (daemon reconcileVRRPInstances) and the two existing UpdateInstances
+		// callers retry until the interface returns. No placeholder state is
+		// added, so RGVRRPReady and the other map readers stay truthful. This
+		// resolve is the authoritative one bound into the new instance; the
+		// #2294 drift probe above is only a cheap detector.
 		iface, err := m.resolveIface(inst.Interface)
 		if err != nil {
 			slog.Warn("vrrp: interface not found, keeping existing instance",
