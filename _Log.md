@@ -9683,3 +9683,7 @@ top.
   pkg/grpcapi/server_nat.go,
   pkg/grpcapi/server_input_validation_test.go,
   pkg/grpcapi/README.md, _Log.md
+
+## 2026-06-21 — #2288 CLI completion panic guard + monitor match filter
+- **Action**: salvaged + committed the #2288 engineer worktree after a 529 death
+- **File(s)**: pkg/cli/completion.go, completion_panic_test.go, monitor.go, monitor_match_test.go
