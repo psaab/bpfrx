@@ -10714,7 +10714,7 @@ top.
     stacked-VLAN .netdev; AF_XDP shim parse_l2 strips exactly one tag
     (lib.rs:1091, if not while) → double-tagged frame's inner TPID hits the
     `_` dispatch arm → pass_non_ip_l2_direct() = XDP_PASS to kernel
-    (lib.rs:375), never delivered to XSK. No silent misparse on the transit
+    (lib.rs:376), never delivered to XSK. No silent misparse on the transit
     path. Corrected feature-gaps.md:439 Done→Partial; corrected frame/README.md
     "shim drops double-tagged" → "XDP_PASSes to kernel". Filed feature
     follow-up #2354 for real QinQ transit build.
