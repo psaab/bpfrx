@@ -486,20 +486,50 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
                 let is_nat64 = request.decision.nat.nat64;
                 let uses_native_tunnel = request.decision.resolution.tunnel_endpoint_id != 0;
 
-                // #2301: egress-MTU decision for forwarded frames the TCP
-                // segmentation path did not handle (non-TCP, TCP seg-miss,
-                // non-segmentable TCP). For NAT64 and native-tunnel encap
-                // the on-wire L3 size differs from `source_frame` (header
-                // grow/shrink), and the built frame still hits the
-                // `copy_frame_is_oversized` descriptor-capacity backstop —
-                // skip the source-frame MTU check for them to avoid a false
-                // PTB. When the L3 payload exceeds the egress MTU and the
-                // sender forbade fragmentation (IPv4 DF) or it is IPv6,
-                // generate a Frag-Needed / Packet-Too-Big back to the
-                // sender so PMTUD converges, and drop the original instead
-                // of forwarding it into a silent MTU drop.
-                if !is_nat64 && !uses_native_tunnel {
-                    let mtu = forwarded_egress_mtu(&request.decision, forwarding);
+                // #2301 + #2330: the PMTUD decision for forwarded frames the
+                // TCP segmentation path did not handle (non-TCP, TCP
+                // seg-miss, non-segmentable TCP).
+                //
+                // #2301 handled ONLY plain forwards (size-preserving), where
+                // the egress MTU compared against the SOURCE frame is exact.
+                // #2330 closes the gap for the size-CHANGING paths (NAT64,
+                // native GRE, WireGuard): there the on-wire frame grows
+                // (encap) or its header shrinks/grows (NAT64), so a
+                // source-frame-vs-egress comparison is wrong. Instead we
+                // derive the INNER-source MTU (the largest inner IP packet
+                // whose TRANSFORMED frame fits the egress/transport MTU) from
+                // the #2300/#2331 SSOT helpers (`native_gre_inner_mtu` /
+                // `wg::mss::wg_inner_mtu` / the NAT64 v6<->v4 header delta)
+                // and compare the SAME inner `source_frame` against THAT.
+                //
+                // In all three transformed cases `source_frame` IS the
+                // pre-encap / pre-translation inner packet and
+                // `request.meta.addr_family` is the inner family, so the
+                // existing `build_frag_needed_v4` / `build_packet_too_big_v6`
+                // builders already target the correct inner source — they
+                // just carry the inner MTU instead of the egress MTU. The
+                // generated PTB then routes through `classify_generated_reply`
+                // (#2328) at the finalizer below, exactly like the plain
+                // path. When `mtu` is 0 (no MTU resolvable / unknown tunnel
+                // kind) `forwarded_egress_mtu_decision` returns `Forward`
+                // (fail-open) and the transformed frame falls through to its
+                // normal build (and, for GRE/WG oversize, the #2331 encap
+                // drop guard). This CLOSES the signal #2331 deferred here: an
+                // oversized GRE/WG inner now yields a PTB instead of a silent
+                // `GRE_ENCAP_DF_OVERSIZE_DROPS` / `encap_mtu_drops`.
+                {
+                    let egress_mtu = forwarded_egress_mtu(&request.decision, forwarding);
+                    let mtu = if is_nat64 || uses_native_tunnel {
+                        post_transform_inner_mtu(
+                            &request.decision,
+                            forwarding,
+                            is_nat64,
+                            request.meta.addr_family,
+                            egress_mtu,
+                        )
+                    } else {
+                        egress_mtu
+                    };
                     let ptb_meta: UserspaceDpMeta = request.meta.into();
                     let l3 = frame_l3_offset(source_frame).or_else(|| {
                         match request.meta.l3_offset {

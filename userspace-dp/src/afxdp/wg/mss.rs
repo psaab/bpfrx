@@ -94,6 +94,37 @@ pub(crate) fn wg_tcp_mss(outer_family: i32, inner_family: i32, mtu: usize) -> u1
         .unwrap_or(0)
 }
 
+/// #2330: the pad-aware WireGuard INNER-IP MTU for the given outer-link MTU
+/// and outer IP family — the largest inner IP packet length whose encapped
+/// outer frame is guaranteed to fit `outer_mtu`, accounting for the
+/// worst-case 15 bytes of WG §5.4.6 transport-padding the encap side may
+/// add. This is the inverse of the encap MTU guard
+/// (`frame::wg::wg_encapped_size`): `wg_encapped_size(inner, outer_v6) <=
+/// outer_mtu` iff `inner <= wg_inner_mtu(outer_family, outer_mtu)` for a
+/// 16-aligned inner (the conservative `WG_MAX_PADDING` subtraction makes the
+/// bound hold for ANY inner length).
+///
+/// The advertised value is what a post-transform Packet-Too-Big / Frag-
+/// Needed back to the INNER source must carry so the inner sender shrinks
+/// its packets below the WG encap drop threshold (`encap_mtu_drops`).
+/// Returns 0 when `outer_mtu` is too small to carry any inner payload
+/// (fail-open: never advertise a nonsensical inner MTU).
+///
+/// `outer_family` is the family of the WG transport (the peer endpoint
+/// address), one of `libc::AF_INET` / `libc::AF_INET6`. The inner family is
+/// irrelevant to the encap overhead (the WG record wraps the raw inner IP
+/// packet whole), so unlike `wg_tcp_mss` no inner-family argument is needed.
+pub(crate) fn wg_inner_mtu(outer_family: i32, outer_mtu: usize) -> usize {
+    let outer_overhead = match outer_family {
+        x if x == libc::AF_INET => WG_OVERHEAD_V4,
+        x if x == libc::AF_INET6 => WG_OVERHEAD_V6,
+        _ => return 0,
+    };
+    outer_mtu
+        .checked_sub(outer_overhead + WG_MAX_PADDING)
+        .unwrap_or(0)
+}
+
 #[cfg(test)]
 mod mss_tests {
     use super::*;
@@ -180,5 +211,29 @@ mod mss_tests {
         // constants used by the framing code.
         assert_eq!(WG_OVERHEAD_V4, 60);
         assert_eq!(WG_OVERHEAD_V6, 80);
+    }
+
+    #[test]
+    fn wg_inner_mtu_v4_outer_pad_aware() {
+        // #2330: inner MTU = outer_mtu - WG_OVERHEAD_V4(60) - max_pad(15).
+        assert_eq!(wg_inner_mtu(libc::AF_INET, 1500), 1425);
+        assert_eq!(wg_inner_mtu(libc::AF_INET, 1400), 1325);
+    }
+
+    #[test]
+    fn wg_inner_mtu_v6_outer_pad_aware() {
+        // WG_OVERHEAD_V6 = 80. 1500 - 80 - 15 = 1405.
+        assert_eq!(wg_inner_mtu(libc::AF_INET6, 1500), 1405);
+    }
+
+    #[test]
+    fn wg_inner_mtu_under_minimum_returns_zero() {
+        // Too small to carry any inner payload -> 0 (fail-open).
+        assert_eq!(wg_inner_mtu(libc::AF_INET, 50), 0);
+    }
+
+    #[test]
+    fn wg_inner_mtu_unknown_family_returns_zero() {
+        assert_eq!(wg_inner_mtu(99, 1500), 0);
     }
 }

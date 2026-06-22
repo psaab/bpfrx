@@ -123,11 +123,18 @@ pub(in crate::afxdp) static WG_DECAP_ECN_ILLEGAL_DROPS: AtomicU64 = AtomicU64::n
 /// or a non-TCP inner (UDP/ICMP/ESP) with no segmentation lever.
 ///
 /// PMTUD (ICMP Frag-Needed / PTB) signalling back to the inner source is
-/// intentionally NOT generated here: the post-transform PMTUD plumbing
-/// is owned by #2330 (and inner TCP-segment sizing by #2329). This site
-/// scopes to stop EMITTING the oversized DF outer (drop + count); the
-/// PTB signal is deferred to #2330 so the two changes do not duplicate
-/// the same plumbing.
+/// NOT generated at THIS site — it lives in the TX dispatcher
+/// (`tx/dispatch/mod.rs`, #2330). For the case where a PTB is owed (the
+/// inner is IPv4 DF or IPv6), the dispatcher's PRE-build
+/// `post_transform_inner_mtu` decision fires first, builds the inner-source
+/// PTB advertising the GRE inner MTU (the SAME `native_gre_inner_mtu` value
+/// this guard's `tunnel_outer_mtu - outer_ip - gre` math reduces to), sets
+/// `mtu_signalled`, and SKIPS the encap build — so this counter is NOT
+/// bumped in that case (no double-drop / double-count). This drop+bump now
+/// fires only for the residual case where no PTB is owed but the outer is
+/// still oversized: a non-DF IPv4 inner (downstream-fragmentable, so #2301/
+/// #2330 keep `Forward` to preserve pre-#2301 behaviour) whose encapped
+/// outer nonetheless exceeds the DF-set transport MTU.
 pub(in crate::afxdp) static GRE_ENCAP_DF_OVERSIZE_DROPS: AtomicU64 = AtomicU64::new(0);
 
 /// Read the inner IP packet's DSCP+ECN byte for outer-header

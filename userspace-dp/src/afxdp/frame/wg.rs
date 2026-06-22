@@ -110,6 +110,16 @@ pub(super) fn wg_encap_frame(
         // #1865: the promised "follow-up" counter store — same
         // `encap_mtu_drops` counter as the control thread's symmetric
         // guard (the plan's both-guards requirement).
+        //
+        // #2330: when a PTB is OWED (inner IPv4 DF or IPv6), the TX
+        // dispatcher's pre-build `post_transform_inner_mtu` decision fires
+        // BEFORE this builder is called (advertising the WG inner MTU =
+        // `wg::mss::wg_inner_mtu`, the inverse of `wg_encapped_size`),
+        // `mtu_signalled` skips the encap build, and this site is never
+        // reached for that case — so the PTB and this drop counter never
+        // both fire. This guard remains the backstop for a non-DF IPv4
+        // inner (kept `Forward` to preserve fragmentable behaviour) whose
+        // encapped outer still exceeds the MTU.
         crate::afxdp::wg::counters::WgCounters::bump(&engine.counters().encap_mtu_drops);
         return None;
     }
