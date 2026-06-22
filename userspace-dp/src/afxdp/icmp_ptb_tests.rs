@@ -313,6 +313,110 @@ fn inbound_icmp_error_is_suppressed() {
     );
 }
 
+/// #2314: rewrite the IPv4 destination of a built inbound frame (and fix
+/// the IP header checksum) so it heads to `dst`. The egress-MTU decision
+/// and `ptb_reply_suppressed` both read the destination off the frame.
+fn set_v4_dst(frame: &mut [u8], l3: usize, dst: Ipv4Addr) {
+    frame[l3 + 16..l3 + 20].copy_from_slice(&dst.octets());
+    frame[l3 + 10..l3 + 12].copy_from_slice(&[0, 0]);
+    let csum = checksum16(&frame[l3..l3 + 20]);
+    frame[l3 + 10..l3 + 12].copy_from_slice(&csum.to_be_bytes());
+}
+
+/// #2314: rewrite the IPv6 destination of a built inbound frame.
+fn set_v6_dst(frame: &mut [u8], l3: usize, dst: Ipv6Addr) {
+    frame[l3 + 24..l3 + 40].copy_from_slice(&dst.octets());
+}
+
+/// #2314: an oversized DF IPv4 datagram destined to a 224.0.0.0/4
+/// multicast address must NOT generate a PTB (RFC 1812 §4.3.2.7) — a
+/// multicast flood must not be amplified into an ICMP backscatter storm.
+/// The original is still dropped by the caller (decision still fires).
+#[test]
+fn ptb_suppressed_for_v4_multicast_dst() {
+    let (mut frame, meta) = inbound_v4_udp(1500, true);
+    let l3 = meta.l3_offset as usize;
+    set_v4_dst(&mut frame, l3, Ipv4Addr::new(239, 1, 2, 3));
+    assert!(
+        ptb_reply_suppressed(&frame, meta, l3),
+        "IPv4 multicast destination must suppress the PTB"
+    );
+}
+
+/// #2314: an oversized DF IPv4 datagram destined to the limited
+/// broadcast 255.255.255.255 must NOT generate a PTB.
+#[test]
+fn ptb_suppressed_for_v4_limited_broadcast_dst() {
+    let (mut frame, meta) = inbound_v4_udp(1500, true);
+    let l3 = meta.l3_offset as usize;
+    set_v4_dst(&mut frame, l3, Ipv4Addr::new(255, 255, 255, 255));
+    assert!(
+        ptb_reply_suppressed(&frame, meta, l3),
+        "IPv4 limited broadcast destination must suppress the PTB"
+    );
+}
+
+/// #2314: an oversized IPv6 datagram destined to ff00::/8 multicast must
+/// NOT generate a Packet-Too-Big (RFC 4443 §2.4(e)).
+#[test]
+fn ptb_suppressed_for_v6_multicast_dst() {
+    let (mut frame, meta) = inbound_v6_udp(1300);
+    let l3 = meta.l3_offset as usize;
+    set_v6_dst(&mut frame, l3, "ff02::1".parse().expect("v6 mcast"));
+    assert!(
+        ptb_reply_suppressed(&frame, meta, l3),
+        "IPv6 multicast destination must suppress the PTB"
+    );
+}
+
+/// #2314 fail-closed contract: an unknown / unexpected addr_family (e.g.
+/// 0, or a non-IP family) must be treated as "could not classify" and
+/// suppress the error — the documented fail-closed posture. Fails if the
+/// predicate's default arm is reverted to `false` (fail open).
+#[test]
+fn dest_predicate_fails_closed_on_unknown_family() {
+    // A plain IPv4 unicast packet body — only the addr_family argument is
+    // bogus, proving the suppression comes from the family arm, not the
+    // bytes (those bytes classify as unicast under AF_INET).
+    let (frame, meta) = inbound_v4_udp(64, true);
+    let l3 = meta.l3_offset as usize;
+    let packet = &frame[l3..];
+    assert!(
+        dest_is_multicast_or_broadcast(0, packet),
+        "addr_family 0 (unknown) must fail closed -> suppress"
+    );
+    assert!(
+        dest_is_multicast_or_broadcast(libc::AF_UNIX as u8, packet),
+        "a non-IP addr_family must fail closed -> suppress"
+    );
+    // Sanity: the same bytes under AF_INET are NOT suppressed (unicast),
+    // so the suppression above is the family arm, not the destination.
+    assert!(
+        !dest_is_multicast_or_broadcast(libc::AF_INET as u8, packet),
+        "the same unicast bytes under AF_INET must NOT be suppressed"
+    );
+}
+
+/// #2314 fail-on-revert: a NORMAL unicast destination must STILL generate
+/// the PTB. If the multicast/broadcast guard is reverted this test still
+/// passes; it pairs with the suppression tests above so that reverting the
+/// guard turns those three red.
+#[test]
+fn ptb_still_generated_for_v4_unicast_dst() {
+    let (frame, meta) = inbound_v4_udp(1500, true);
+    let l3 = meta.l3_offset as usize;
+    // The default destination 172.16.80.200 is plain unicast.
+    assert!(
+        !ptb_reply_suppressed(&frame, meta, l3),
+        "a unicast destination must NOT suppress the PTB"
+    );
+    let fwd = forwarding_with_egress(1400);
+    assert!(
+        build_frag_needed_v4(&frame, meta, PTB_IFINDEX, &fwd, 1400).is_some(),
+        "unicast PTB must build"
+    );
+}
+
 #[test]
 fn no_primary_address_fails_closed() {
     // Egress has no primary v4 -> the builder returns None (caller silently
