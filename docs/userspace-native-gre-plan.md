@@ -169,10 +169,40 @@ When the forwarding resolution selects a tunnel endpoint:
 2. compute outer route using the configured outer transport routing-instance
 3. resolve outer next-hop MAC on the physical egress interface
 4. prepend outer IPv4/IPv6 + GRE header in Rust
+4a. enforce the outer MTU before emitting (see "Outer MTU / DF guard")
 5. transmit the final encapsulated packet through the physical NIC AF_XDP TX path
 
 This replaces the current “mark as `MissingNeighbor` and hand to kernel
 slow-path because tunnel AF_XDP TX does not exist”.
+
+#### Outer MTU / DF guard (#2331)
+
+`encapsulate_native_gre_frame` (userspace-dp/src/afxdp/gre.rs) writes
+the IPv4 outer with `DF=1` (#1440), and the IPv6 outer cannot be
+fragmented in-path either. So once the full outer datagram is sized —
+`outer IP + GRE header (incl. the optional 4-byte key) + inner packet`
+(the `gre_encapped_outer_len` helper; the L2 eth/VLAN header is NOT part
+of the MTU budget) — the builder compares it against the resolved
+transport/egress MTU via `tunnel_outer_mtu` (forwarding/mod.rs, the
+#2300 SSOT used by the inner MSS clamp and `native_gre_inner_mtu`: real
+transport ifindex → stored-resolution egress → endpoint logical ifindex,
+`unwrap_or(1500)`). If the outer exceeds that MTU the frame is **not
+emitted**: it would be a downstream blackhole (NIC/router drop, no PMTUD
+signal back to the inner source). The drop bumps
+`GRE_ENCAP_DF_OVERSIZE_DROPS`, surfaced as the Prometheus counter
+`xpf_userspace_gre_encap_df_oversize_drops_total`.
+
+A nonzero counter flags inner flows whose encapped size exceeds the
+tunnel path MTU — typically a missing/too-high inner MSS clamp
+(`native_gre_tcp_mss`), or a non-TCP inner (UDP/ICMP/ESP) with no
+segmentation lever. PMTUD (ICMP Frag-Needed / Packet-Too-Big) signalling
+back to the inner source is **deferred to #2330** (the post-transform
+PMTUD plumbing; inner TCP-segment sizing is #2329). This site scopes to
+drop+count only, mirroring the deliberate `!uses_native_tunnel`
+exclusion in the plain-forward PTB path (tx/dispatch/mod.rs, #2301):
+the source-frame-vs-egress-MTU check there would produce a false PTB for
+tunnel encap because the correct inner-source PTB must be derived from
+the inner MTU after subtracting tunnel overhead.
 
 ### 4. Session Model
 
