@@ -1,5 +1,81 @@
 # Action Log
 
+## 2026-06-22 — #2345 review folds (comment accuracy + MissingNeighbor tests)
+
+- **Timestamp**: 2026-06-22 PDT
+- **Action**: Folded three review items on PR #2353. (1) Corrected the
+  MissingNeighbor policy-tuple comment in poll_descriptor/mod.rs: it
+  claimed "DNAT/static-DNAT/NPTv6/NAT64 all set rewrite_dst" — false for
+  NAT64, which populates NEITHER nptv6_nat NOR pre_routing_dnat at that
+  site, so decision.nat.rewrite_dst is None and policy_dst_ip correctly
+  falls back to flow.dst_ip (synthetic IPv6), the intended NAT64
+  exclusion. (2) Corrected the tests.rs #2345 block header that listed
+  NAT64 among the translated-dst-matching types; it now states the NAT64
+  synthetic-IPv6 exclusion. (3) Added 5 MissingNeighbor (neighbor-ABSENT)
+  cold-path tests — the prior tests all installed the next-hop neighbor
+  and exercised only the ForwardCandidate site, leaving the separate
+  MissingNeighbor policy gate uncovered. NO behavior change (the
+  coordinator-confirmed Copilot "NAT64 default-deny at MissingNeighbor"
+  HIGH is a FALSE POSITIVE; verified the fallback is correct).
+- **Validation**: cargo build --release clean. New + existing #2345 tests
+  green (12 policy_inbound_* + reverse-key); 5x stable. Fail-on-revert
+  verified: reverting the MissingNeighbor decision.nat.rewrite_dst
+  fallback to unconditional flow.dst_ip/flow.forward_key.dst_port fails
+  all 4 DNAT/NPTv6 MissingNeighbor tests (the NAT64 MissingNeighbor test
+  correctly stays green under that mutation — it already expects the
+  synthetic-V6 fallback; its guard is the opposite mutation, feeding
+  extracted V4, which would default-deny). Full bin suite: 2433 passed, 1
+  pre-existing unrelated concurrency flake (worker_queue
+  concurrent_recovery_processes_each_command_exactly_once — passes 5/5 in
+  isolation). New tests:
+  policy_inbound_dnat_missing_neighbor_permits_on_translated_dst,
+  policy_inbound_dnat_missing_neighbor_denies_when_only_original_dst_permitted,
+  policy_inbound_nptv6_missing_neighbor_permits_on_translated_dst,
+  policy_inbound_nptv6_missing_neighbor_denies_when_only_external_prefix_permitted,
+  policy_inbound_nat64_missing_neighbor_permits_on_synthetic_v6_not_default_deny.
+- **File(s)**: userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/tests.rs, _Log.md
+
+## 2026-06-22 — #2345 inbound destination-translation policy tuple
+
+- **Timestamp**: 2026-06-22 PDT
+- **Action**: Fixed the HIGH/MED security-policy-correctness gap where the
+  inbound security-policy lookup was evaluated against the ORIGINAL
+  (pre-translation) destination tuple for DNAT / static-DNAT / inbound
+  NPTv6, instead of the POST-translation (real/internal) destination —
+  contradicting Junos/SRX semantics (inbound destination translation
+  precedes the policy lookup) and the documented twice-NAT contract.
+  Diagnosis confirmed against current code: the destination ZONE was
+  already correct (derived from `resolution.egress_ifindex`, which is
+  computed from `effective_resolution_target`), so only the address/port
+  half of the policy-match tuple was wrong. Fix: compute `policy_dst_ip`
+  (= `effective_resolution_target`) and `policy_dst_port` (= the DNAT
+  `rewrite_dst_port`, else the original port) once on the session-miss
+  path and feed them to `evaluate_policy_result_with_len` at BOTH the
+  `ForwardCandidate` and `MissingNeighbor` policy-eval sites (the
+  MissingNeighbor site reconstructs the same tuple from the merged
+  `decision.nat`, since the miss-block locals are out of scope there).
+  NAT64 is DELIBERATELY EXCLUDED (design fork resolved in-scope): it is a
+  cross-family translation (V6 src, V4 dst) and the policy matcher
+  requires same-family src+dst, so the extracted IPv4 dst would match no
+  rule and break ALL NAT64 connectivity — NAT64 keeps matching on the
+  synthetic IPv6 dst. Session reversal is preserved (the change touches
+  only the policy lookup, not session keys).
+- **Validation**: `cargo build --release` clean; targeted suites green
+  (nat 379, dnat 40, npt 24, nat64 81, policy 97, poll_descriptor 19, 0
+  failures); 8 new tests 5x stable. New tests (afxdp/tests.rs):
+  policy_inbound_dnat_matches_translated_destination_permit,
+  policy_inbound_dnat_denies_when_only_original_dst_permitted,
+  policy_inbound_dnat_matches_translated_destination_port,
+  policy_inbound_nptv6_matches_translated_destination_permit,
+  policy_inbound_nptv6_denies_when_only_external_prefix_permitted,
+  policy_inbound_nat64_matches_synthetic_v6_destination_permit,
+  policy_inbound_nat64_denies_on_synthetic_v6_deny_rule,
+  inbound_dnat_reverse_session_key_uses_public_facing_tuple.
+- **File(s)**: userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/tests.rs, docs/next-features/twice-nat.md,
+  _Log.md
+
 ## 2026-06-22 — #2344 non-first-fragment SessionFlow gate
 
 - **Timestamp**: 2026-06-22 PDT

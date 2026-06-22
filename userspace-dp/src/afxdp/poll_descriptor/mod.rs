@@ -752,6 +752,46 @@ pub(super) fn poll_binding_process_descriptor(
                                     None => resolution_target,
                                 }
                             };
+                        // #2345: Junos evaluates the inbound security policy
+                        // against the POST-translation destination tuple. For
+                        // the SAME-FAMILY destination translations that happen
+                        // BEFORE the route/zone lookup — DNAT, static-DNAT, and
+                        // inbound NPTv6 — the policy must match on the translated
+                        // (real/internal) destination address + port, in the
+                        // zone derived from that translated destination, NOT the
+                        // original public/virtual destination. The egress zone
+                        // (`to_zone_id`) is already derived from
+                        // `effective_resolution_target`, so the zone is correct;
+                        // these bindings carry the translated address + port into
+                        // the policy-match call so the address/port match also
+                        // runs on the post-translation tuple. Only port-based
+                        // DNAT carries a destination-port rewrite; static-DNAT
+                        // and NPTv6 preserve the L4 port, so the original port
+                        // flows through for those.
+                        //
+                        // NAT64 is DELIBERATELY EXCLUDED here. NAT64 is a
+                        // cross-family translation: the translated destination is
+                        // IPv4 while the flow source stays IPv6. xpf's policy
+                        // matcher (`policy.rs` `evaluate_policy`) requires the
+                        // source and destination to be the SAME family — a mixed
+                        // (V6 src, V4 dst) tuple matches no rule and falls to
+                        // default-deny. Feeding the extracted IPv4 destination
+                        // here would therefore break ALL NAT64 connectivity, not
+                        // fix it. NAT64 keeps its historical behavior (policy
+                        // matched on the synthetic IPv6 destination, the only
+                        // same-family tuple available at this site). Making NAT64
+                        // policy match the real IPv4 server is a larger,
+                        // separate design change (cross-family policy matching);
+                        // see `docs/next-features/twice-nat.md` and #2345.
+                        let policy_dst_ip = if nat64_match.is_some() {
+                            flow.dst_ip
+                        } else {
+                            effective_resolution_target
+                        };
+                        let policy_dst_port = pre_routing_dnat
+                            .as_ref()
+                            .and_then(|d| d.rewrite_dst_port)
+                            .unwrap_or(flow.forward_key.dst_port);
                         let input_filter_eval = evaluate_non_pbr_input_filter(
                             worker_ctx.forwarding,
                             Some(flow),
@@ -1315,15 +1355,20 @@ pub(super) fn poll_binding_process_descriptor(
                                 };
                                 (tag, t)
                             };
+                            // #2345: match on the POST-translation destination
+                            // tuple (translated dst addr + port) in the
+                            // translated-dst zone. `policy_dst_ip` /
+                            // `policy_dst_port` collapse to the original dst when
+                            // no inbound destination translation applies.
                             let policy_result = evaluate_policy_result_with_len(
                                 &worker_ctx.forwarding.policy,
                                 from_zone_id,
                                 to_zone_id,
                                 flow.src_ip,
-                                flow.dst_ip,
+                                policy_dst_ip,
                                 flow.forward_key.protocol,
                                 flow.forward_key.src_port,
-                                flow.forward_key.dst_port,
+                                policy_dst_port,
                                 desc.len as u64,
                             );
                             // #1620: cold-path latency histogram post-eval record.
@@ -2585,15 +2630,49 @@ pub(super) fn poll_binding_process_descriptor(
                                     };
                                     (tag, t)
                                 };
+                                // #2345: MissingNeighbor cold path must match
+                                // the SAME post-translation destination tuple as
+                                // the ForwardCandidate path above so a denied
+                                // (or permitted) verdict is identical whether or
+                                // not the next-hop neighbor is already resolved.
+                                // The session-miss block's `effective_resolution_target`
+                                // is out of scope here, so reconstruct the
+                                // post-translation dst tuple from the merged
+                                // `decision.nat`:
+                                //   - DNAT / static-DNAT / inbound NPTv6 each
+                                //     populate `decision.nat.rewrite_dst` (set at
+                                //     the decision build as `nptv6_nat.or(
+                                //     pre_routing_dnat)`), so the translated
+                                //     internal dst is used; only port-based DNAT
+                                //     also sets `rewrite_dst_port`.
+                                //   - NAT64 populates NEITHER `nptv6_nat` NOR
+                                //     `pre_routing_dnat`, so `decision.nat
+                                //     .rewrite_dst` is None here and the tuple
+                                //     falls back to `flow.dst_ip` (the synthetic
+                                //     IPv6 dst). That is the INTENDED NAT64
+                                //     exclusion — cross-family policy matching is
+                                //     not supported (see the long comment at the
+                                //     ForwardCandidate policy-tuple binding), and
+                                //     this fallback keeps the MissingNeighbor
+                                //     verdict identical to the ForwardCandidate
+                                //     path for NAT64.
+                                // Both halves fall back to the original dst/port
+                                // when no inbound destination translation applies.
+                                let policy_dst_ip =
+                                    decision.nat.rewrite_dst.unwrap_or(flow.dst_ip);
+                                let policy_dst_port = decision
+                                    .nat
+                                    .rewrite_dst_port
+                                    .unwrap_or(flow.forward_key.dst_port);
                                 let policy_result = evaluate_policy_result_with_len(
                                     &worker_ctx.forwarding.policy,
                                     from_zone_id,
                                     to_zone_id,
                                     flow.src_ip,
-                                    flow.dst_ip,
+                                    policy_dst_ip,
                                     flow.forward_key.protocol,
                                     flow.forward_key.src_port,
-                                    flow.forward_key.dst_port,
+                                    policy_dst_port,
                                     desc.len as u64,
                                 );
                                 if cp_sample_tag {

@@ -38,6 +38,49 @@ Document and validate one supported order for combined NAT:
 
 This should be the documented behavior for all dataplanes that claim Twice NAT support.
 
+#### Implemented (#2345): inbound destination-translation policy tuple
+
+As of #2345 the userspace AF_XDP dataplane evaluates the inbound
+security policy against the POST-translation destination tuple for the
+SAME-FAMILY inbound destination translations that happen before the
+route/zone lookup:
+
+- **DNAT / static-DNAT** — policy matches on the translated internal
+  destination address, and on the translated destination **port** for
+  port-based DNAT (e.g. public `VIP:443` DNAT'd to internal `B:8443` is
+  matched as `B:8443`, not `VIP:443`).
+- **inbound NPTv6** — policy matches on the translated internal IPv6
+  prefix destination, not the external/public prefix.
+
+The destination **zone** was already correct before #2345: it is derived
+from the translated destination (the resolution's `egress_ifindex`), so
+only the address/port half of the tuple needed correcting. This matches
+Junos/SRX semantics, where inbound destination translation precedes the
+security-policy lookup and the policy is matched on the real internal
+destination in the destination zone. Implementation: `policy_dst_ip` /
+`policy_dst_port` in `userspace-dp/src/afxdp/poll_descriptor/mod.rs`,
+used in both the `ForwardCandidate` and `MissingNeighbor` policy-eval
+sites. Session reversal is unaffected — the policy-tuple change touches
+only the policy lookup, not the installed session keys, so the reverse
+session is still keyed off the public-facing wire tuple (DNAT reverse
+source = the internal host with the translated port; reverse dst = the
+original external client).
+
+**NAT64 is excluded from this post-translation matching, by design.**
+NAT64 is a cross-family translation: the translated destination is IPv4
+while the flow source remains IPv6. xpf's policy matcher
+(`policy.rs::evaluate_policy`) requires the source and destination of the
+match to be the SAME address family — a mixed `(V6 src, V4 dst)` tuple
+matches no rule and falls to default-deny. Feeding the extracted IPv4
+destination into the policy match would therefore break ALL NAT64
+connectivity rather than fix it. NAT64 keeps its historical behavior:
+the policy is matched on the synthetic IPv6 destination (the only
+same-family tuple available at the policy-eval site), so NAT64 security
+policy must be written against the synthetic IPv6 destination prefix.
+Making NAT64 policy match the real IPv4 server is a larger, separate
+design change (cross-family policy matching) and is intentionally NOT
+part of #2345.
+
 ### 2. Add end-to-end coverage
 Add explicit tests for:
 
