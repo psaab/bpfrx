@@ -142,6 +142,7 @@ pub(super) fn build_local_time_exceeded_request(
     _dynamic_neighbors: &Arc<ShardedNeighborMap>,
     _ha_state: &BTreeMap<i32, HAGroupRuntime>,
     _now_secs: u64,
+    counters: &mut BatchCounters,
 ) -> Option<PendingForwardRequest> {
     if !matches!(packet_ttl_would_expire(frame, meta), Some(true)) {
         return None;
@@ -171,14 +172,24 @@ pub(super) fn build_local_time_exceeded_request(
     }?;
 
     let now_ns = monotonic_nanos();
-    let cos = resolve_cos_tx_selection_at(
-        forwarding,
-        ingress_ident.ifindex,
-        meta,
-        Some(&flow.forward_key),
-        now_ns,
-    );
-    if cos.drop {
+    // #2238: classify the GENERATED ICMP/ICMPv6 error by its OWN egress
+    // 5-tuple + the resolved egress interface (`target_ifindex`, which
+    // accounts for `bind_ifindex`), NOT the triggering inbound packet's
+    // tuple/ingress. Pre-#2238 this called
+    // `resolve_cos_tx_selection_at(.., meta, flow.forward_key, ..)` — the
+    // trigger — on `ingress_ident.ifindex`, so an output filter matching the
+    // generated ICMP tuple never fired, and an output filter matching the
+    // original TCP/UDP flow could wrongly drop the ICMP error. A parse
+    // failure of our own built bytes fails CLOSED (drop + dedicated
+    // counter, §6.2).
+    let verdict = classify_generated_reply(forwarding, target_ifindex, &prebuilt_frame, now_ns);
+    if verdict.drop {
+        counters.touched = true;
+        if verdict.parse_error {
+            counters.generated_reply_classify_parse_errors += 1;
+        } else {
+            counters.time_exceeded_output_filter_drops += 1;
+        }
         return None;
     }
     Some(PendingForwardRequest {
@@ -206,8 +217,8 @@ pub(super) fn build_local_time_exceeded_request(
         expected_ports: None,
         flow_key: Some(flow.forward_key.clone()),
         nat64_reverse: None,
-        cos_queue_id: cos.queue_id,
-        dscp_rewrite: cos.dscp_rewrite,
+        cos_queue_id: verdict.cos_queue_id,
+        dscp_rewrite: verdict.dscp_rewrite,
         cos_tx_selection_resolved: true,
     })
 }

@@ -1270,6 +1270,15 @@ pub(crate) struct BindingLiveSnapshot {
     pub(crate) policy_reject_sent: u64,
     /// #2089: policy-`reject` replies suppressed by TX-frame budget.
     pub(crate) policy_reject_reply_budget_drops: u64,
+    /// #2238: locally-generated replies dropped by an OUTPUT firewall filter
+    /// (terminal discard/reject or three-color policer) on the egress
+    /// interface, classified by the reply's OWN egress tuple. Per-leg.
+    pub(crate) time_exceeded_output_filter_drops: u64,
+    pub(crate) policy_reject_output_filter_drops: u64,
+    pub(crate) syn_cookie_output_filter_drops: u64,
+    /// #2238: fail-closed drops — a generated reply's own bytes could not be
+    /// re-parsed for output classification (§6.2; builder/parser logic bug).
+    pub(crate) generated_reply_classify_parse_errors: u64,
     pub(crate) snat_packets: u64,
     pub(crate) dnat_packets: u64,
     /// #2161: cumulative NAT64 translations snapshotted from BindingLiveState.

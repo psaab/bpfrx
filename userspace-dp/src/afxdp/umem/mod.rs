@@ -375,6 +375,19 @@ pub(in crate::afxdp) struct BindingLiveState {
     /// #2089: policy-`reject` replies suppressed due to TX-frame budget
     /// exhaustion (the packet is still dropped — fail-closed).
     pub(super) policy_reject_reply_budget_drops: AtomicU64,
+    /// #2238: locally-generated replies dropped by an OUTPUT firewall filter
+    /// terminal `discard`/`reject` (or three-color policer) on the egress
+    /// interface, now that the reply is classified by its OWN egress tuple.
+    /// Per-leg so an operator-installed output filter that suppresses a
+    /// generated control frame is attributable.
+    pub(super) time_exceeded_output_filter_drops: AtomicU64,
+    pub(super) policy_reject_output_filter_drops: AtomicU64,
+    pub(super) syn_cookie_output_filter_drops: AtomicU64,
+    /// #2238: fail-CLOSED drops — a generated reply's own bytes could not be
+    /// re-parsed for output classification (§6.2). A builder/parser logic
+    /// bug; a non-zero value is never silent (the reply is dropped, not
+    /// leaked past the egress filter).
+    pub(super) generated_reply_classify_parse_errors: AtomicU64,
     pub(super) snat_packets: AtomicU64,
     pub(super) dnat_packets: AtomicU64,
     /// #2161: cumulative NAT64 (v6<->v4) translations on this binding,
@@ -762,6 +775,10 @@ impl BindingLiveState {
             syn_cookie_bypass: AtomicU64::new(0),
             policy_reject_sent: AtomicU64::new(0),
             policy_reject_reply_budget_drops: AtomicU64::new(0),
+            time_exceeded_output_filter_drops: AtomicU64::new(0),
+            policy_reject_output_filter_drops: AtomicU64::new(0),
+            syn_cookie_output_filter_drops: AtomicU64::new(0),
+            generated_reply_classify_parse_errors: AtomicU64::new(0),
             snat_packets: AtomicU64::new(0),
             dnat_packets: AtomicU64::new(0),
             nat64_translations: AtomicU64::new(0),

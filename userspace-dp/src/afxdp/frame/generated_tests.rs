@@ -1,0 +1,174 @@
+// Tests for afxdp/frame/generated.rs (#2238) — the bytes->key parser for
+// locally-generated reply frames. Loaded as a sibling submodule via
+// `#[path = "generated_tests.rs"]`.
+
+use super::*;
+
+/// Build an untagged IPv4 frame with the given protocol, ToS byte, and L4
+/// ports (ports ignored for ICMP). Returns the full Ethernet frame bytes.
+fn v4_frame(protocol: u8, tos: u8, src_port: u16, dst_port: u16, l4_extra: &[u8]) -> Vec<u8> {
+    let mut frame = Vec::new();
+    // L2: dst, src MAC, EtherType IPv4.
+    frame.extend_from_slice(&[0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
+    frame.extend_from_slice(&[0x02, 0x00, 0x00, 0x00, 0x00, 0x02]);
+    frame.extend_from_slice(&0x0800u16.to_be_bytes());
+    let l3 = frame.len();
+    let l4 = vec_l4(protocol, src_port, dst_port, l4_extra);
+    let total_len = (20 + l4.len()) as u16;
+    frame.push(0x45);
+    frame.push(tos);
+    frame.extend_from_slice(&total_len.to_be_bytes());
+    frame.extend_from_slice(&[0x00, 0x00, 0x40, 0x00, 64, protocol, 0x00, 0x00]);
+    frame.extend_from_slice(&Ipv4Addr::new(172, 16, 80, 8).octets());
+    frame.extend_from_slice(&Ipv4Addr::new(198, 51, 100, 20).octets());
+    let csum = checksum16(&frame[l3..l3 + 20]);
+    frame[l3 + 10..l3 + 12].copy_from_slice(&csum.to_be_bytes());
+    frame.extend_from_slice(&l4);
+    frame
+}
+
+fn vec_l4(protocol: u8, src_port: u16, dst_port: u16, extra: &[u8]) -> Vec<u8> {
+    match protocol {
+        PROTO_TCP => {
+            let mut l4 = Vec::new();
+            l4.extend_from_slice(&src_port.to_be_bytes());
+            l4.extend_from_slice(&dst_port.to_be_bytes());
+            l4.extend_from_slice(&[0; 4]); // seq
+            l4.extend_from_slice(&[0; 4]); // ack
+            l4.extend_from_slice(&[0x50, 0x04, 0xfa, 0xf0]); // off / RST / win
+            l4.extend_from_slice(&[0; 4]); // csum + urg
+            l4.extend_from_slice(extra);
+            l4
+        }
+        PROTO_UDP => {
+            let mut l4 = Vec::new();
+            l4.extend_from_slice(&src_port.to_be_bytes());
+            l4.extend_from_slice(&dst_port.to_be_bytes());
+            l4.extend_from_slice(&[0; 4]); // len + csum
+            l4.extend_from_slice(extra);
+            l4
+        }
+        _ => {
+            // ICMP-ish: type/code/csum + 4 bytes + extra.
+            let mut l4 = vec![11, 0, 0, 0, 0, 0, 0, 0];
+            l4.extend_from_slice(extra);
+            l4
+        }
+    }
+}
+
+fn v6_frame(next_header: u8, traffic_class: u8, src_port: u16, dst_port: u16) -> Vec<u8> {
+    let mut frame = Vec::new();
+    frame.extend_from_slice(&[0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
+    frame.extend_from_slice(&[0x02, 0x00, 0x00, 0x00, 0x00, 0x02]);
+    frame.extend_from_slice(&0x86ddu16.to_be_bytes());
+    let l4 = vec_l4(next_header, src_port, dst_port, &[]);
+    let payload_len = l4.len() as u16;
+    // version=6, tc spans byte0[3:0]<<4 | byte1[7:4].
+    let b0 = 0x60 | (traffic_class >> 4);
+    let b1 = (traffic_class & 0x0f) << 4;
+    frame.push(b0);
+    frame.push(b1);
+    frame.extend_from_slice(&[0x00, 0x00]); // flow label rest
+    frame.extend_from_slice(&payload_len.to_be_bytes());
+    frame.push(next_header);
+    frame.push(64); // hop limit
+    frame.extend_from_slice(&"2001:559:8585:80::8".parse::<Ipv6Addr>().unwrap().octets());
+    frame.extend_from_slice(&"2001:db8::20".parse::<Ipv6Addr>().unwrap().octets());
+    frame.extend_from_slice(&l4);
+    frame
+}
+
+#[test]
+fn parses_v4_tcp_reply_tuple_and_dscp() {
+    // ToS 0xb8 => DSCP 46 (EF).
+    let frame = v4_frame(PROTO_TCP, 0xb8, 5201, 49152, &[]);
+    let (key, meta) = generated_reply_session_key(&frame).expect("v4 tcp parse");
+    assert_eq!(key.addr_family, libc::AF_INET as u8);
+    assert_eq!(key.protocol, PROTO_TCP);
+    assert_eq!(key.src_ip, IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8)));
+    assert_eq!(key.dst_ip, IpAddr::V4(Ipv4Addr::new(198, 51, 100, 20)));
+    assert_eq!(key.src_port, 5201);
+    assert_eq!(key.dst_port, 49152);
+    assert_eq!(meta.dscp, 46, "DSCP is the top 6 bits of the ToS byte");
+    assert_eq!(meta.protocol, PROTO_TCP);
+    assert_eq!(meta.addr_family, libc::AF_INET as u8);
+    assert_eq!(meta.flow_src_port, 5201);
+    assert_eq!(meta.flow_dst_port, 49152);
+    assert_eq!(meta.l3_offset, 14);
+    assert_eq!(meta.l4_offset, 34);
+}
+
+#[test]
+fn parses_v4_icmp_reply_with_zero_ports() {
+    let frame = v4_frame(PROTO_ICMP, 0x00, 0, 0, &[]);
+    let (key, meta) = generated_reply_session_key(&frame).expect("v4 icmp parse");
+    assert_eq!(key.protocol, PROTO_ICMP);
+    assert_eq!(key.src_port, 0, "ICMP carries no L4 ports");
+    assert_eq!(key.dst_port, 0);
+    assert_eq!(meta.flow_src_port, 0);
+    assert_eq!(meta.flow_dst_port, 0);
+}
+
+#[test]
+fn parses_v6_icmp6_reply_traffic_class_dscp() {
+    // tc 0xb8 => DSCP 46.
+    let frame = v6_frame(PROTO_ICMPV6, 0xb8, 0, 0);
+    let (key, meta) = generated_reply_session_key(&frame).expect("v6 icmp6 parse");
+    assert_eq!(key.addr_family, libc::AF_INET6 as u8);
+    assert_eq!(key.protocol, PROTO_ICMPV6);
+    assert_eq!(key.src_ip, IpAddr::V6("2001:559:8585:80::8".parse().unwrap()));
+    assert_eq!(key.dst_ip, IpAddr::V6("2001:db8::20".parse().unwrap()));
+    assert_eq!(key.src_port, 0);
+    assert_eq!(meta.dscp, 46, "DSCP is the top 6 bits of the v6 traffic class");
+    assert_eq!(meta.addr_family, libc::AF_INET6 as u8);
+}
+
+#[test]
+fn parses_v6_tcp_reply_ports() {
+    let frame = v6_frame(PROTO_TCP, 0x00, 443, 33333);
+    let (key, _meta) = generated_reply_session_key(&frame).expect("v6 tcp parse");
+    assert_eq!(key.protocol, PROTO_TCP);
+    assert_eq!(key.src_port, 443);
+    assert_eq!(key.dst_port, 33333);
+}
+
+#[test]
+fn truncated_frame_fails_closed_none() {
+    // Only the L2 header + EtherType, no L3 — must not parse.
+    let frame = vec![
+        0x02, 0x00, 0x00, 0x00, 0x00, 0x01, 0x02, 0x00, 0x00, 0x00, 0x00, 0x02, 0x08, 0x00,
+    ];
+    assert!(generated_reply_session_key(&frame).is_none());
+}
+
+#[test]
+fn truncated_v4_header_fails_closed_none() {
+    let mut frame = v4_frame(PROTO_TCP, 0x00, 5201, 49152, &[]);
+    // Chop the IP header mid-way.
+    frame.truncate(14 + 10);
+    assert!(generated_reply_session_key(&frame).is_none());
+}
+
+#[test]
+fn unknown_l3_version_fails_closed_none() {
+    let mut frame = v4_frame(PROTO_TCP, 0x00, 5201, 49152, &[]);
+    // Corrupt the IP version nibble to 5 (unknown).
+    frame[14] = 0x55;
+    assert!(generated_reply_session_key(&frame).is_none());
+}
+
+#[test]
+fn parses_vlan_tagged_reply() {
+    // Build a tagged frame: insert an 802.1Q tag after the MACs.
+    let untagged = v4_frame(PROTO_TCP, 0x00, 5201, 49152, &[]);
+    let mut frame = Vec::new();
+    frame.extend_from_slice(&untagged[0..12]); // MACs
+    frame.extend_from_slice(&0x8100u16.to_be_bytes());
+    frame.extend_from_slice(&100u16.to_be_bytes()); // VID 100
+    frame.extend_from_slice(&untagged[12..]); // EtherType + L3 onward
+    let (key, meta) = generated_reply_session_key(&frame).expect("tagged v4 tcp parse");
+    assert_eq!(key.protocol, PROTO_TCP);
+    assert_eq!(key.src_port, 5201);
+    assert_eq!(meta.l3_offset, 18, "VLAN tag pushes L3 to offset 18");
+}

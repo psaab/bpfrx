@@ -2451,3 +2451,262 @@ fn enqueue_cos_item_stamps_enqueue_ns_at_admission() {
         None => panic!("admitted item must be at the queue front"),
     }
 }
+
+// ---------------------------------------------------------------------------
+// #2238: classify_generated_reply — output classification of a host-generated
+// reply by its OWN egress tuple, fail-CLOSED on a parse failure (§6.2).
+// ---------------------------------------------------------------------------
+
+/// Build a minimal untagged IPv4 frame on egress ifindex 202's address pair
+/// for the given protocol, with TCP/UDP ports (ignored for ICMP). DSCP via
+/// the ToS byte.
+fn generated_v4_frame(protocol: u8, tos: u8, src_port: u16, dst_port: u16) -> Vec<u8> {
+    let mut frame = Vec::new();
+    frame.extend_from_slice(&[0x02, 0xbf, 0x72, 0x00, 0x80, 0x08]); // dst mac
+    frame.extend_from_slice(&[0x02, 0x00, 0x00, 0x00, 0x00, 0x02]); // src mac
+    frame.extend_from_slice(&0x0800u16.to_be_bytes());
+    let l3 = frame.len();
+    let l4: Vec<u8> = match protocol {
+        PROTO_TCP => {
+            let mut v = Vec::new();
+            v.extend_from_slice(&src_port.to_be_bytes());
+            v.extend_from_slice(&dst_port.to_be_bytes());
+            v.extend_from_slice(&[0; 12]); // seq/ack/off-flags/win/csum/urg
+            v
+        }
+        PROTO_UDP => {
+            let mut v = Vec::new();
+            v.extend_from_slice(&src_port.to_be_bytes());
+            v.extend_from_slice(&dst_port.to_be_bytes());
+            v.extend_from_slice(&[0; 4]);
+            v
+        }
+        _ => vec![11, 0, 0, 0, 0, 0, 0, 0], // ICMP Time Exceeded
+    };
+    let total_len = (20 + l4.len()) as u16;
+    frame.push(0x45);
+    frame.push(tos);
+    frame.extend_from_slice(&total_len.to_be_bytes());
+    frame.extend_from_slice(&[0x00, 0x00, 0x40, 0x00, 64, protocol, 0x00, 0x00]);
+    frame.extend_from_slice(&Ipv4Addr::new(172, 16, 80, 8).octets());
+    frame.extend_from_slice(&Ipv4Addr::new(198, 51, 100, 20).octets());
+    let csum = checksum16(&frame[l3..l3 + 20]);
+    frame[l3 + 10..l3 + 12].copy_from_slice(&csum.to_be_bytes());
+    frame.extend_from_slice(&l4);
+    frame
+}
+
+fn forwarding_with_v4_output_filter(filter_name: &str, term: FirewallTermSnapshot) -> ForwardingState {
+    let snapshot = ConfigSnapshot {
+        interfaces: vec![InterfaceSnapshot {
+            name: "reth0.0".into(),
+            ifindex: 202,
+            hardware_addr: "02:bf:72:00:80:08".into(),
+            filter_output_v4: filter_name.into(),
+            ..Default::default()
+        }],
+        filters: vec![FirewallFilterSnapshot {
+            name: filter_name.into(),
+            family: "inet".into(),
+            terms: vec![term],
+        }],
+        ..Default::default()
+    };
+    build_forwarding_state(&snapshot)
+}
+
+#[test]
+fn classify_generated_reply_drops_icmp_on_terminal_discard() {
+    // Output filter `then discard` for `protocol icmp` drops a generated
+    // ICMP Time Exceeded reply.
+    let forwarding = forwarding_with_v4_output_filter(
+        "drop-icmp",
+        FirewallTermSnapshot {
+            name: "drop-icmp".into(),
+            action: "discard".into(),
+            protocols: vec!["icmp".into()],
+            ..Default::default()
+        },
+    );
+    let frame = generated_v4_frame(PROTO_ICMP, 0x00, 0, 0);
+    let verdict = classify_generated_reply(&forwarding, 202, &frame, 0);
+    assert!(verdict.drop, "generated ICMP reply must be dropped by `then discard`");
+    assert!(!verdict.parse_error);
+}
+
+#[test]
+fn classify_generated_reply_ignores_trigger_protocol_filter() {
+    // The discriminating test: a filter discarding TCP does NOT drop a
+    // generated ICMP reply (proves classify-by-generated-tuple, not trigger).
+    let forwarding = forwarding_with_v4_output_filter(
+        "drop-tcp",
+        FirewallTermSnapshot {
+            name: "drop-tcp".into(),
+            action: "discard".into(),
+            protocols: vec!["tcp".into()],
+            ..Default::default()
+        },
+    );
+    let frame = generated_v4_frame(PROTO_ICMP, 0x00, 0, 0);
+    let verdict = classify_generated_reply(&forwarding, 202, &frame, 0);
+    assert!(!verdict.drop, "a TCP-matching filter must not drop the generated ICMP reply");
+    assert!(!verdict.parse_error);
+}
+
+#[test]
+fn classify_generated_reply_assigns_forwarding_class_queue() {
+    // `then forwarding-class iperf-a` on the egress output filter routes the
+    // generated RST to the queue mapped from that forwarding class.
+    let snapshot = ConfigSnapshot {
+        interfaces: vec![InterfaceSnapshot {
+            name: "reth0.0".into(),
+            ifindex: 202,
+            hardware_addr: "02:bf:72:00:80:08".into(),
+            filter_output_v4: "fc-tcp".into(),
+            cos_shaping_rate_bytes_per_sec: 10_000_000,
+            cos_shaping_burst_bytes: 256_000,
+            cos_scheduler_map: "wan-map".into(),
+            ..Default::default()
+        }],
+        filters: vec![FirewallFilterSnapshot {
+            name: "fc-tcp".into(),
+            family: "inet".into(),
+            terms: vec![FirewallTermSnapshot {
+                name: "fc-rst".into(),
+                action: "accept".into(),
+                protocols: vec!["tcp".into()],
+                forwarding_class: "iperf-a".into(),
+                ..Default::default()
+            }],
+        }],
+        class_of_service: Some(ClassOfServiceSnapshot {
+            forwarding_classes: vec![
+                CoSForwardingClassSnapshot { name: "best-effort".into(), queue: 0 },
+                CoSForwardingClassSnapshot { name: "iperf-a".into(), queue: 4 },
+            ],
+            schedulers: vec![
+                CoSSchedulerSnapshot {
+                    name: "be".into(),
+                    transmit_rate_bytes: 4_000_000,
+                    transmit_rate_exact: false,
+                    priority: "low".into(),
+                    buffer_size_bytes: 128_000,
+                    buffer_size_percent: 0.0,
+                    surplus_sharing: false,
+                    equal_flow_enforcement: false,
+                    equal_flow_target_policy: String::new(),
+                    codel_target_ns: 0,
+                },
+                CoSSchedulerSnapshot {
+                    name: "a".into(),
+                    transmit_rate_bytes: 6_000_000,
+                    transmit_rate_exact: false,
+                    priority: "low".into(),
+                    buffer_size_bytes: 64_000,
+                    buffer_size_percent: 0.0,
+                    surplus_sharing: false,
+                    equal_flow_enforcement: false,
+                    equal_flow_target_policy: String::new(),
+                    codel_target_ns: 0,
+                },
+            ],
+            scheduler_maps: vec![CoSSchedulerMapSnapshot {
+                name: "wan-map".into(),
+                entries: vec![
+                    CoSSchedulerMapEntrySnapshot {
+                        forwarding_class: "best-effort".into(),
+                        scheduler: "be".into(),
+                    },
+                    CoSSchedulerMapEntrySnapshot {
+                        forwarding_class: "iperf-a".into(),
+                        scheduler: "a".into(),
+                    },
+                ],
+            }],
+            dscp_classifiers: vec![],
+            ieee8021_classifiers: vec![],
+            dscp_rewrite_rules: vec![],
+        }),
+        ..Default::default()
+    };
+    let forwarding = build_forwarding_state(&snapshot);
+    let frame = generated_v4_frame(PROTO_TCP, 0x00, 80, 49152);
+    let verdict = classify_generated_reply(&forwarding, 202, &frame, 0);
+    assert!(!verdict.drop);
+    assert_eq!(verdict.cos_queue_id, Some(4), "generated RST routes to the iperf-a queue");
+}
+
+#[test]
+fn classify_generated_reply_fails_closed_on_parse_failure() {
+    // §6.2: a truncated "generated" frame cannot be parsed → fail CLOSED
+    // (drop + parse_error), never leak past an output discard.
+    let forwarding = forwarding_with_v4_output_filter(
+        "drop-icmp",
+        FirewallTermSnapshot {
+            name: "drop-icmp".into(),
+            action: "discard".into(),
+            protocols: vec!["icmp".into()],
+            ..Default::default()
+        },
+    );
+    // L2 + EtherType only — no L3.
+    let frame = vec![
+        0x02, 0xbf, 0x72, 0x00, 0x80, 0x08, 0x02, 0x00, 0x00, 0x00, 0x00, 0x02, 0x08, 0x00,
+    ];
+    let verdict = classify_generated_reply(&forwarding, 202, &frame, 0);
+    assert!(verdict.drop, "parse failure must fail CLOSED (drop)");
+    assert!(verdict.parse_error, "parse failure must set parse_error so the caller counts it");
+    assert_eq!(verdict.cos_queue_id, None);
+}
+
+#[test]
+fn classify_generated_reply_counterfactual_trigger_keying_would_misverdict() {
+    // Counter-factual pin (engineering-style "Test strength"): reconstruct
+    // the PRE-#2238 call — classify on the TRIGGER tuple (UDP, the inbound
+    // flow) — and show it produces the WRONG verdict for the same fixtures.
+    // The egress output filter discards ICMP; the generated reply is ICMP.
+    let forwarding = forwarding_with_v4_output_filter(
+        "drop-icmp",
+        FirewallTermSnapshot {
+            name: "drop-icmp".into(),
+            action: "discard".into(),
+            protocols: vec!["icmp".into()],
+            ..Default::default()
+        },
+    );
+    let frame = generated_v4_frame(PROTO_ICMP, 0x00, 0, 0);
+
+    // Correct (#2238): classify the GENERATED ICMP bytes → drop.
+    let correct = classify_generated_reply(&forwarding, 202, &frame, 0);
+    assert!(correct.drop, "the generated ICMP reply must be dropped");
+
+    // Pre-fix: classify on the TRIGGER tuple (a UDP flow) → NOT dropped,
+    // because the `protocol icmp` discard term never matches UDP. This is
+    // the exact bug (#2238): the reply leaks past the operator's ICMP
+    // discard filter.
+    let trigger_key = SessionKey {
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_UDP,
+        src_ip: IpAddr::V4(Ipv4Addr::new(198, 51, 100, 20)),
+        dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8)),
+        src_port: 49152,
+        dst_port: 53,
+    };
+    let pre_fix = resolve_cos_tx_selection_at(
+        &forwarding,
+        202,
+        UserspaceDpMeta {
+            ingress_ifindex: 5,
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_UDP,
+            pkt_len: 60,
+            ..Default::default()
+        },
+        Some(&trigger_key),
+        0,
+    );
+    assert!(
+        !pre_fix.drop,
+        "trigger-keyed classification would WRONGLY admit the reply (the #2238 bug)"
+    );
+}

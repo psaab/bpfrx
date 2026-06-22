@@ -1,5 +1,50 @@
 # Action Log
 
+## 2026-06-21 — #2238 classify locally-generated replies by their own egress tuple (Path B)
+
+- **Timestamp**: 2026-06-21
+- **Action**: Implemented the converged Path B plan
+  (docs/research/2238-reply-classification/plan.md, r3). Locally-generated
+  control replies (ICMP/ICMPv6 Time Exceeded, policy-`reject` TCP RST /
+  ICMP-unreachable, SYN-cookie SYN-ACK/ACK-RST) are now classified for
+  output firewall filter / CoS forwarding-class / DSCP rewrite by the
+  GENERATED frame's OWN egress 5-tuple + egress interface, not the
+  triggering inbound packet's tuple. New `generated_reply_session_key()`
+  parser (frame/generated.rs) re-parses the built reply bytes into a
+  `(SessionKey, ForwardPacketMeta)`; new `classify_generated_reply()`
+  (tx/cos_classify.rs) runs the runtime-counted output classifier on that
+  tuple. Wired into all three generators (icmp.rs Time Exceeded — threaded
+  through the 3 poll-descriptor call sites, also corrects the egress
+  ifindex to the resolved `target_ifindex`; reject_reply.rs;
+  cookie_reply.rs). §6.2 fail-CLOSED: a parse failure of the generated
+  bytes drops the reply (never leak past an output `discard`) + a dedicated
+  counter. Two-tier counters
+  (time_exceeded/policy_reject/syn_cookie_output_filter_drops +
+  generated_reply_classify_parse_errors) wired BatchCounters ->
+  BindingLiveState -> snapshot -> protocol/binding.rs serde -> Go
+  protocol.go -> operator `show` status. Regenerated
+  protocol_wire_v1.json. Scope-fenced OUT (named follow-ups): output-
+  direction port-mirror of generated replies; embedded-ICMP NAT-reversal
+  sibling.
+- **File(s)**: userspace-dp/src/afxdp/frame/generated.rs,
+  userspace-dp/src/afxdp/frame/generated_tests.rs,
+  userspace-dp/src/afxdp/frame/mod.rs,
+  userspace-dp/src/afxdp/frame/README.md,
+  userspace-dp/src/afxdp/tx/cos_classify.rs,
+  userspace-dp/src/afxdp/tx/cos_classify_tests.rs,
+  userspace-dp/src/afxdp/tx/mod.rs,
+  userspace-dp/src/afxdp/icmp.rs,
+  userspace-dp/src/afxdp/mod.rs,
+  userspace-dp/src/afxdp/poll_descriptor/{mod,reject_reply,cookie_reply,flow_cache_hit}.rs,
+  userspace-dp/src/afxdp/umem/{mod,snapshot}.rs,
+  userspace-dp/src/afxdp/worker/mod.rs,
+  userspace-dp/src/afxdp/coordinator/refresh_bindings.rs,
+  userspace-dp/src/afxdp/tests.rs,
+  userspace-dp/src/protocol/binding.rs,
+  userspace-dp/tests/fixtures/protocol_wire_v1.json,
+  pkg/dataplane/userspace/protocol.go,
+  pkg/dataplane/userspace/format/status.go
+
 ## 2026-06-21 — #2315 GRE decap-side RFC 6040 §4.2 ECN combine (+ WG doc-scope)
 
 - **Timestamp**: 2026-06-21 23:30 PDT

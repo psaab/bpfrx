@@ -96,6 +96,18 @@ impl BindingLiveState {
             policy_reject_reply_budget_drops: self
                 .policy_reject_reply_budget_drops
                 .load(Ordering::Relaxed),
+            time_exceeded_output_filter_drops: self
+                .time_exceeded_output_filter_drops
+                .load(Ordering::Relaxed),
+            policy_reject_output_filter_drops: self
+                .policy_reject_output_filter_drops
+                .load(Ordering::Relaxed),
+            syn_cookie_output_filter_drops: self
+                .syn_cookie_output_filter_drops
+                .load(Ordering::Relaxed),
+            generated_reply_classify_parse_errors: self
+                .generated_reply_classify_parse_errors
+                .load(Ordering::Relaxed),
             snat_packets: self.snat_packets.load(Ordering::Relaxed),
             dnat_packets: self.dnat_packets.load(Ordering::Relaxed),
             nat64_translations: self.nat64_translations.load(Ordering::Relaxed),

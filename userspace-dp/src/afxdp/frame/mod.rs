@@ -2,10 +2,16 @@ use super::*;
 
 mod byte_writes;
 mod checksum;
+mod generated;
 mod headers;
 mod inspect;
 mod tcp;
 mod wg;
+
+// #2238: parse a locally-generated reply frame back into its own egress
+// classification key. Re-exported at `pub(in crate::afxdp)` so the shared
+// classifier in `tx/cos_classify.rs` (a sibling afxdp module) can reach it.
+pub(in crate::afxdp) use generated::generated_reply_session_key;
 
 // #1440 consolidated outer-header serializers. Re-exported at
 // `frame::write_eth_header`, `frame::write_eth_header_slice`, and
