@@ -1,14 +1,16 @@
 # #1434 — Multi-Tunnel WireGuard: Go config-model refactor for N peers per tunnel
 
-**Status: REV v1.1 (research, plan-of-action only — NO code, NO PR, NO production source touched)**
+**Status: REV v1.2 (research, plan-of-action only — NO code, NO PR, NO production source touched)**
 
-Plan-of-action only. Claude SMR r1 (hostile) has run — see
-`claude-smr-plan-r1.md`; its MAJOR-1 (B2 PSK-ordering self-catch, §6.3),
-MINOR-1/2/3 and NIT-2 are folded into this revision. Codex + AGY hostile
-plan-reviews are in flight; their round files (`codex-plan-r<N>.md`,
-`agy-plan-r<N>.md`) and verdicts are appended per round and the header bumped.
-Every load-bearing claim is verified against `origin/master` at HEAD
-`cf9ccd3ac` and the pinned snow 0.10.0 source.
+Plan-of-action only. Claude SMR r1 (hostile, `claude-smr-plan-r1.md`) AND Codex
+r1 (hostile, `codex-plan-r1.md`) have run; both converged on the central
+finding — the WG dataplane is multi-peer on RX/decap but SINGLE-peer on the
+whole EGRESS machinery (encap, control-thread TUN egress + roaming, keepalive
+timers) via `first_peer_pubkey` (§5.0.1). SMR MAJOR-1 (PSK self-catch, §6.3),
+MINOR-1/2/3, NIT-2 and the egress re-scope are folded. AGY hostile review
+in flight (prior run infra-timed-out, retried). Every load-bearing claim is
+verified against `origin/master` at HEAD `cf9ccd3ac` and the pinned snow
+0.10.0 source.
 
 This plan covers the **multi-PEER-per-tunnel** axis of #1434. It is distinct
 from the prior `research/1434-wireguard-multitunnel` plan, which covered the
@@ -278,11 +280,86 @@ layer.
 
 ## 5. Implementation plan (Path A) — file-by-file, no code yet
 
-> Increment split: **B1 = the multi-peer slice** (no PSK), **B2 = per-peer PSK**
-> (gated separately because of the responder snow ordering, §6). B1 is the
-> driveable-now deliverable; B2 can ride in the same PR ONLY if §6.3 resolves
-> cleanly, else B2 splits to a follow-on. Both defer the live interop lab to
-> #1703.
+> **Increment split (REVISED after the SMR hot-path audit, §5.0).** The naive
+> "B1 = config slice, lab-free" framing was too coarse: the WG dataplane is
+> already multi-peer on RX/decap but single-peer on TX/encap. The honest split:
+> - **B1a — config + RX (decap) multi-peer + status:** the Go config slice,
+>   wire DTO slice, build-path loop feeding the engine N peers, the per-peer
+>   status row, commit-time validators. With this, INBOUND from N peers is
+>   already correctly demuxed + AllowedIPs-gated by the existing engine
+>   (RX/decap is already multi-peer). `make test` + `cargo test`; lab-free.
+> - **B1b — TX (encap) cryptokey routing:** the encap path must select the peer
+>   by the inner-destination AllowedIPs LPM (today it uses the single scalar
+>   peer). New engine encap-peer-selection + `frame/wg.rs` change. Hot-path-
+>   adjacent; SHOULD be validated with real two-peer traffic — lab-RECOMMENDED.
+> - **B2 — per-peer PSK:** §6 (snow ordering RESOLVED via `set_psk`). Engine
+>   field + plumbing + secret hygiene. May ride B1; split on heavy hygiene.
+>
+> The live multi-peer handshake interop (Ubiquiti etc.) stays #1703.
+
+### 5.0 Hot-path audit — RX is multi-peer, TX is NOT (the real scope split)
+
+Verified at HEAD:
+- **RX / decap is already multi-peer.** `try_decap` demuxes by the per-session
+  `receiver_index` and gates the inner src-IP against THAT peer's AllowedIPs;
+  the engine doc states the AllowedIPs LPM is used "ONLY for inbound src-IP
+  gate" (engine.rs:6, :138). So N inbound peers on one listen port already
+  resolve correctly — B1a just has to FEED the engine N peers
+  (`populate_wg_engines` loop). No encap-path change for inbound.
+- **TX / encap is single-peer.** Routing resolves a frame to ONE
+  `tunnel_endpoint_id` (one WG interface), not to a specific peer
+  (`forwarding/mod.rs:270-273`, :739-744). The encap path then calls
+  `engine.try_encap(&endpoint.wg_peer_pubkey, ...)` (`frame/wg.rs:108`) and
+  uses the SCALAR `endpoint.wg_endpoint` as the outer destination + family
+  (frame/wg.rs:64, :80, :142). There is NO inner-destination → peer
+  AllowedIPs lookup on the OUTBOUND side. So with N peers, the encap path has
+  no way to pick which peer to send a given inner packet to — it would always
+  encap toward peer[0]. The AllowedIPs LPM (`allowed_ips.rs:101` `lookup →
+  peer_index`) EXISTS but is only wired to RX today.
+- **B1b is therefore a genuine new mechanism, not config widening.** The encap
+  caller must: LPM-lookup the inner dst → `peer_index` → that peer's pubkey +
+  endpoint, then `try_encap(&that_peer_pubkey, ...)` to that peer's endpoint.
+  This needs a small engine API (expose an encap-side dst→peer lookup, e.g.
+  `peer_for_dest(inner_dst) -> Option<(pubkey, endpoint)>` over the existing
+  PeerTable+LPM) + the `frame/wg.rs` rewrite. It is hot-path-adjacent (the WG
+  transit encap site, per-packet for WG egress). Validate with real two-peer
+  traffic: a packet to peer-X's AllowedIPs reaches X, a packet to peer-Y's
+  reaches Y. That is best proven on the loss cluster → **B1b is lab-RECOMMENDED**
+  (not strictly lab-blocked — a Rust integration test that drives
+  `wg_encap_frame` with a two-peer engine and asserts the chosen
+  pubkey/endpoint per inner-dst gives high confidence without the cluster; the
+  lab is the belt-and-braces for line-rate + real handshake).
+
+**Driveable-now without the lab: B1a** (config + RX + status + validators).
+**Lab-recommended: B1b** (TX cryptokey routing). **B2** (PSK) rides whichever
+PR fits given secret hygiene.
+
+#### 5.0.1 Full single-peer-site inventory (Codex + SMR convergent — the egress machinery is single-peer)
+
+Beyond `populate_wg_engines`, the egress/timer/control machinery selects a
+SINGLE peer via `engine.first_peer_pubkey()` (engine.rs:443-444 = `peers.first()`).
+The decode/decap RX path is the ONLY genuinely multi-peer-ready path. The
+complete inventory of single-peer assumptions B1b must generalize:
+
+| Site | File:line | What it assumes | B1b action |
+|------|-----------|-----------------|-----------|
+| Encap peer selection | `frame/wg.rs:108` `try_encap(&endpoint.wg_peer_pubkey,…)` + scalar endpoint :64/:80/:142 | one peer / one outer endpoint | LPM `inner_dst → peer` then encap to that peer |
+| WG control thread egress | `coordinator/wg_control.rs:303` `first_peer_pubkey()` | TUN-read egress + re-init drive peer[0] only | per-peer egress (route inner via LPM to the right peer's session) + per-peer endpoint roaming |
+| Endpoint roaming | `wg_control.rs:305-311` `effective_endpoint` | one learned endpoint | per-peer `effective_endpoint` (engine `Peer` already has per-peer endpoint state) |
+| Keepalive/rekey timers | `wg/timers.rs:250` `first_peer_pubkey()`; timers.rs:107 "Per-ENGINE (single peer in S2a); per-peer generalization rides with #1434/S6" | only peer[0] gets persistent-keepalive + T-timer servicing | iterate ALL peers each timer tick (the per-peer T6/T7/T8 atomics already exist on `Peer`) |
+| Status row | `coordinator/status.rs:707-717` scalar `endpoint.wg_peer_pubkey` | one peer per row | per-peer status (§5.8) |
+| Live reconcile | `populate_wg_engines` rebuilds engine on identity change; `reconcile_peers` is only called from `WgEngine::new` (engine.rs:389) in production | a per-peer add/remove = full engine rebuild (drops sessions) | acceptable for B1 (a config change re-handshakes, TAI64N-seeded); NOTE it, do not wire live in-place reconcile unless session-preservation across peer add is required (S5) |
+
+**Honest consequence:** "multi-peer" is NOT just RX + a config slice. The
+egress side (encap + control-thread TUN egress + endpoint roaming + keepalive
+timers) is uniformly single-peer via `first_peer_pubkey`. B1b is therefore a
+real dataplane generalization touching the WG control thread + timer module +
+encap frame builder — each per-packet/per-tick for WG. The `Peer` struct
+already holds the per-peer state these need (per-peer session, endpoint,
+T6/T7/T8 atomics, AllowedIPs via the PeerTable LPM), so the work is "iterate
+peers / LPM-select peer" rather than new per-peer state — but it is genuine
+hot-path-adjacent code. **This is why B1b is lab-RECOMMENDED, not lab-free.**
+The timers.rs comment already names #1434 as the owner of this generalization.
 
 ### 5.1 Go config types — `pkg/config/types_routing.go`
 - Add `WgPeerConfig` struct (§4 Path A). Add `WgPeers []WgPeerConfig` to
@@ -311,9 +388,14 @@ layer.
   `WgPeerConfig` (read pubkey from the instance identity arg; allowed-ips/
   endpoint/keepalive[/preshared-key] from children) and APPEND to `tc.WgPeers`.
 - `parseTunnelWireguard` `case "peer"` appends per instance (handle BOTH AST
-  shapes: hierarchical `peer X { ... }` and flat
-  `set ... peer X allowed-ips ...` — the dual-AST gotcha; mirror the existing
-  vrrp-group/address handling).
+  shapes: hierarchical `peer X { ... }` and flat `set ... peer X allowed-ips
+  ...` — the dual-AST gotcha). **Concrete model:** mirror the proven
+  `vrrp-group` named-instance handling — `namedInstances(node.FindChildren(
+  "peer"))` collapses both AST shapes into one instance list (see
+  `compiler_iface*.go` ~L341-358 `namedInstances(addrInst.node.FindChildren(
+  "vrrp-group"))`), then read the pubkey from the instance identity and the
+  leaves from its children. `vrrp-group` is `args:1` with a child block and is
+  the closest existing analog (a repeatable instance under an interface unit).
 - Honour the existing silent-bounds → typed-leaf-reject migration for
   keepalive (schema validator already enforces 0..65535).
 
@@ -397,7 +479,7 @@ userspace-dp/`, worktrees excluded):
   Verified: the status row is one-peer-shaped AND reads the scalar snapshot
   fields B1 deletes, so it is a forced migration site, not an optional display
   improvement. See §5.8 "Status row is a MANDATORY migration site". The
-  renderer (`FormatWireguardStatus`) + Go `WgTunnelStatus` mirror
+  renderer (`FormatWireguardStatus` in `wgfmt.go`) + Go `WgTunnelStatus` mirror
   (`protocol.go:752`) are widened to per-peer in B1.
 - `logWgEndpointSetTransitionLocked` / its summary (`tunnels.go:212`) formats
   only `ep.WgListenPort` (tunnel-level) — unaffected.
@@ -413,6 +495,18 @@ userspace-dp/`, worktrees excluded):
 - `wg.rs:87-94` `wg_identity_unchanged` — compare the peer slices
   (order-stable, since the Go builder sorts by pubkey). If the slice differs,
   rebuild (engine seeds TAI64N high-water as today).
+- **(B1b) `frame/wg.rs:44-142` `wg_encap_frame`** — replace the scalar
+  `endpoint.wg_peer_pubkey` / `endpoint.wg_endpoint` reads with an
+  inner-destination → peer selection (engine LPM lookup over the PeerTable),
+  then `try_encap(&selected_peer_pubkey, ...)` toward the selected peer's
+  endpoint + that endpoint's outer family. This is the encap migration AND the
+  new cryptokey-routing mechanism (§5.0). It is ALSO a migration site (it reads
+  the removed scalar) — so B1a, if shipped before B1b, must keep the encap path
+  compiling: B1a can either retain `WgPeers[0]`'s pubkey/endpoint at the encap
+  site as an interim (single-peer encap, RX multi-peer) or B1a+B1b ship
+  together. Recommend B1a+B1b in ONE PR so "multi-peer" is end-to-end (in AND
+  out) in a single reviewed change; the encap test is a Rust integration test
+  (lab-recommended, not lab-blocked — §5.0).
 - Confirm `endpoint.wg_local_privkey` / `wg_listen_port` paths unchanged.
 - NO engine, NO reconcile_peers, NO PeerTable change for B1.
 
@@ -424,7 +518,7 @@ SCALAR `endpoint.wg_peer_pubkey` / `endpoint.wg_endpoint` and
 snapshot fields, so this code WILL NOT COMPILE unless updated. The
 `WgTunnelStatus` struct (`protocol/snapshot.rs` + Go mirror
 `protocol.go:752`, scalar `PeerPubkeyHex`/`PeerEndpoint`) and the
-`FormatWireguardStatus` renderer are ALL one-peer-shaped. B1 must reshape the
+`FormatWireguardStatus` renderer (`pkg/dataplane/userspace/wgfmt.go:33-38`, scalar `t.PeerPubkeyHex`/`t.PeerEndpoint` per row) are ALL one-peer-shaped. B1 must reshape the
 status row to per-peer (e.g. `WgTunnelStatus { ..., peers: Vec<WgPeerStatus> }`
 where `WgPeerStatus` carries `pubkey_hex`, `endpoint`, `has_confirmed_session`,
 per-peer handshake/rekey counters) and update the Go mirror + renderer to
@@ -549,14 +643,21 @@ does); split B2 only if the secret-hygiene review (R3) proves non-trivial.
   test (no kernel WG) and is in scope; the LIVE kernel-WG / Ubiquiti interop
   stays in #1703.
 
-### 7.4 No smoke / no lab for B1
-B1 is config-model + wire + build-path: pure Go tests + Rust unit/round-trip
-tests. It does NOT touch the verifier-gated shim, the hot path, or the
-forwarding datapath beyond feeding the already-multi-peer engine more peers.
-`make test` + `cargo test` are the gates. A loss-cluster smoke is OPTIONAL
-confidence (a dual-peer config commits + the engine builds) but NOT required —
-and the live multi-peer handshake VERIFICATION is explicitly the #1703 lab.
-(Contrast Axis A, which DOES need the lab.)
+### 7.4 Lab gating per sub-increment (corrected by §5.0)
+- **B1a (config + RX + status): no smoke / no lab.** Config-model + wire +
+  build-path + per-peer status; RX/decap is already multi-peer so inbound is
+  exercised by feeding the engine N peers. Does NOT touch the verifier-gated
+  shim or `make generate`. `make test` + `cargo test` + CLI render test are the
+  gates.
+- **B1b (TX encap cryptokey routing): lab-RECOMMENDED.** The encap peer
+  selection is hot-path-adjacent. A Rust integration test that drives
+  `wg_encap_frame` with a two-peer engine and asserts the chosen
+  pubkey/endpoint per inner-dst gives high confidence WITHOUT the cluster; a
+  loss-cluster two-peer traffic run is the line-rate/real-handshake
+  belt-and-braces (recommend, not block). NO `make generate` (the shim/listen
+  port is unchanged — Axis A's shim work is NOT in play).
+- The live multi-peer handshake VERIFICATION (Ubiquiti / kernel-WG) is
+  explicitly the #1703 lab. (Contrast Axis A, which DOES need shim + lab.)
 
 ---
 
@@ -606,13 +707,47 @@ not node-scoped). No `pkg/cluster` code change expected — confirm in round 1.
   the plan stays the minimal generic stanza.
 
 ## 10. Disposition / recommendation
-**Driveable-now slice (PLAN-READY candidate): Increment B1** — the Go
-config-model multi-peer slice (types + schema named-instance + compiler loop +
-wire DTO slice + Rust build-path loop + fixture regen + Go/Rust tests). No
-shim, no hot-path, no lab. One normal quad-reviewed PR. This is the headline
-#1434 deliverable for the multi-peer axis.
+**PLAN-READY** (B1 as a whole; the increment scope is corrected by the §5.0 /
+§5.0.1 hot-path audit, which is the substantive output of this review).
 
-**B2 (per-peer PSK):** in scope per directive. §6.3 RESOLVED — snow 0.10.0
+> Headline correction vs the parent framing: this is NOT "just a Go config
+> slice". The Go config model IS the operator-facing blocker, but the dataplane
+> is multi-peer only on RX/decap; the entire EGRESS machinery (encap peer
+> selection, the WG control-thread TUN egress + endpoint roaming, and the
+> keepalive/rekey timers) is single-peer via `first_peer_pubkey`
+> (§5.0.1 table). A faithful "configure N peers per WG interface" feature must
+> generalize that egress machinery. The config slice unblocks the operator
+> surface; B1b finishes the dataplane.
+
+- **B1a (driveable-now, lab-free) — config + RX multi-peer + status, egress
+  pinned to peer[0] as an explicit INTERIM.** Go config slice (Path A) + schema
+  named-instance (`peer <pubkey>`, vrrp-group model) + compiler loop +
+  commit-time validators (dup-pubkey / bad-hex / zero-peer / mixed-family all
+  REJECT) + wire DTO slice + build-path loop feeding the engine N peers +
+  per-peer status row (Rust+Go+renderer) + fixture regen. RX/decap is ALREADY
+  multi-peer, so inbound-from-N-peers works. **This is a PARTIAL feature:
+  inbound from N peers works, outbound still goes to peer[0]
+  (`first_peer_pubkey`).** Honest, useful for "many spokes initiate to one
+  hub" (the spokes drive egress; the hub mostly responds on the session the
+  spoke established — verify this covers the common topology before shipping
+  B1a alone). Gated by `make test` + `cargo test` + CLI render test. No shim,
+  no `make generate`, no lab. **Only ship B1a standalone if a partial
+  (RX-multi/TX-peer[0]) feature is explicitly acceptable; otherwise B1a is the
+  first commit of the B1a+B1b PR, not a release.**
+
+- **B1b (lab-RECOMMENDED) — egress generalization.** Encap peer selection by
+  inner-dst AllowedIPs LPM (`frame/wg.rs` + a small engine lookup) + WG
+  control-thread per-peer TUN egress & endpoint roaming
+  (`coordinator/wg_control.rs`) + per-peer keepalive/rekey timers
+  (`wg/timers.rs`, iterate all peers). The `Peer` struct already holds the
+  per-peer state; the work is "LPM-select / iterate peers", but it is genuine
+  hot-path-adjacent code. Rust two-peer integration tests give high confidence;
+  the loss cluster two-peer traffic + keepalive run is the
+  line-rate/real-behavior belt-and-braces. **Recommend B1a+B1b in ONE PR** so
+  "multi-peer" is end-to-end (in AND out, with per-peer keepalive); split only
+  if the egress change wants its own perf pass.
+
+- **B2 (per-peer PSK):** in scope per directive. §6.3 RESOLVED — snow 0.10.0
 `set_psk` mid-handshake lets the responder pick the peer's PSK after
 `get_remote_static`, so there is NO snow-ordering blocker (the draft's
 rebuild-and-re-read fallback was unnecessary; SMR MAJOR-1 self-catch). B2 adds
@@ -626,18 +761,37 @@ Increment 2 / lab); live multi-peer handshake + Ubiquiti interop (#1703);
 full Junos `wireguard` S6 grammar; per-peer MSS/DSCP.
 
 ## 11. Verification plan (what `/engineer` must produce)
-1. `make test` green incl. new single+dual-peer compile, dup/bad-key reject,
-   snapshot-builder HA-determinism, HA config-sync round-trip tests.
-2. `cargo test` green incl. snapshot dual-peer round-trip, `populate_wg_engines`
-   two-peer PeerTable, `wg_identity_unchanged` slice cases (+ B2 PSK unit test
-   if in scope).
-3. Regenerated `protocol_wire_v1.json` with a dual-peer WG row; Rust
-   round-trip test passes against it.
-4. `TunnelConfig.String()` redacts privkey AND (if B2) PSK — assert no secret
-   in the formatted output (a test that fails if redaction is removed).
-5. Doc updates: `docs/config-schema.md` (the `peer <pubkey>` named-instance +
-   typed leaves), any WG operator/protocol doc, `pkg/dataplane/userspace`
-   README if it documents the WG snapshot shape, and `_Log.md`.
-6. Quad review (Codex + AGY + Claude SMR + Copilot) on the implementation PR;
-   merge on 4-of-4 (Copilot-infra exception per project rules).
-7. Live multi-peer handshake remains the #1703 lab — NOT a B1 merge gate.
+1. **B1a — `make test` green** incl. new single+dual-peer compile, dup-pubkey /
+   bad-key / zero-peer / mixed-family REJECT, snapshot-builder HA-determinism
+   (two builds byte-identical), HA config-sync round-trip (dual-peer text
+   survives forward+reverse sync). Migrate `pkg/{config,dataplane/userspace,
+   daemon}` tests off the scalar fields.
+2. **B1a — `cargo test` green** incl. snapshot dual-peer round-trip,
+   `populate_wg_engines` two-peer PeerTable, `wg_identity_unchanged` slice
+   cases, per-peer status row (`wg_tunnel_statuses` emits N rows).
+3. **B1a — regenerated `protocol_wire_v1.json`** with a dual-peer WG row whose
+   source peers are AUTHORED out of pubkey-sort order but appear SORTED in the
+   golden (exercises the §5.4 sort-by-pubkey determinism). Rust round-trip
+   passes via `XPF_PROTOCOL_WIRE_REGEN=1` then commit.
+4. **B1b — `cargo test` green** incl. a `wg_encap_frame` two-peer integration
+   test: inner pkt to peer-X's AllowedIPs encaps to X's pubkey+endpoint, inner
+   to peer-Y's encaps to Y; a timer-tick test asserting BOTH peers get
+   keepalive servicing (not just `first_peer_pubkey`).
+5. **B1b — loss-cluster two-peer traffic + keepalive run (lab-recommended)**:
+   two peers on one WG interface, traffic both directions to each peer's
+   AllowedIPs, per-peer keepalive observed. NOT strictly a merge gate if the
+   integration tests + parent review are strong, but recommended belt-and-braces.
+6. `TunnelConfig.String()` redacts privkey AND (if B2) PSK — a test that FAILS
+   if the redaction is removed (per the durability-test-must-fail-if-effect-
+   removed lesson).
+7. Doc updates: `docs/config-schema.md` (the `peer <pubkey>` named-instance +
+   typed leaves), the WG operator/protocol doc, `pkg/dataplane/userspace`
+   README if it documents the WG snapshot shape, and `_Log.md`. Note the
+   single-peer→multi-peer egress generalization in the WG design doc.
+8. Quad review (Codex + AGY + Claude SMR + Copilot) on the implementation PR;
+   merge on 4-of-4 (Copilot-infra exception per project rules). Any change
+   touching the WG control thread / timers / encap is hot-path-adjacent —
+   re-confirm no per-packet allocation regression (engineering-style hot-path
+   rules).
+9. Live multi-peer handshake against kernel-WG / Ubiquiti remains the #1703 lab
+   — NOT a B1 merge gate.
