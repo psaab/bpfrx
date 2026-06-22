@@ -452,8 +452,10 @@ fn rfc6040_combine_masks_high_bits() {
     );
 }
 
-/// Validate an IPv4 header checksum: the one's-complement sum over the
-/// 20-byte header (including the checksum field) must be 0xFFFF.
+/// Validate an IPv4 header checksum. The folded one's-complement sum
+/// over the full header (including the checksum field) is 0xFFFF for a
+/// valid header; `checksum16` returns the one's-complement of that
+/// folded sum, so a valid header verifies as 0.
 fn ipv4_header_checksum_ok(packet: &[u8]) -> bool {
     let ihl = usize::from(packet[0] & 0x0f) * 4;
     crate::afxdp::frame::checksum16(&packet[..ihl]) == 0

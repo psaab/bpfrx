@@ -189,19 +189,23 @@ pub(in crate::afxdp) enum DecapEcn {
 /// | inner \ outer | Not-ECT(00) | ECT0(10) | ECT1(01) | CE(11) |
 /// |---------------|-------------|----------|----------|--------|
 /// | Not-ECT(00)   | Keep        | Keep     | Keep     | Drop   |
-/// | ECT(0)(10)    | Keep        | Keep     | SetCe*   | SetCe  |
+/// | ECT(0)(10)    | Keep        | Keep     | Keep*    | SetCe  |
 /// | ECT(1)(01)    | Keep        | Keep     | Keep     | SetCe  |
 /// | CE(11)        | Keep        | Keep     | Keep     | Keep   |
 ///
-/// The only state changes are: outer CE upgrades any ECN-capable,
-/// non-CE inner to CE (the loss-free congestion signal this whole
-/// feature exists for); and the §4.2 "MAY" case outer=ECT(1) over
-/// inner=ECT(0) is taken as the upgrade-to-ECT(1) variant (* — matches
-/// Linux's `__INET_ECN_decapsulate`). The illegal outer=CE / inner=
-/// Not-ECT cell is a Drop. Every other cell keeps the inner verbatim
-/// (so a Not-ECT or already-CE inner is never touched, and the inner
-/// DSCP — which is authoritative at decap — is never copied from the
-/// outer).
+/// The only state change is: outer CE upgrades any ECN-capable, non-CE
+/// inner to CE (the loss-free congestion signal this whole feature
+/// exists for). The illegal outer=CE / inner=Not-ECT cell is a Drop.
+/// Every other cell keeps the inner verbatim (so a Not-ECT or already-CE
+/// inner is never touched, and the inner DSCP — which is authoritative
+/// at decap — is never copied from the outer).
+///
+/// (* the §4.2 "MAY" cell — outer=ECT(1) over inner=ECT(0) — leaves the
+/// receiver free to either keep the inner ECT(0) or upgrade it to
+/// ECT(1); neither carries a congestion mark. We take the simpler
+/// conformant choice and Keep the inner ECT(0). Linux's
+/// `__INET_ECN_decapsulate` upgrades to ECT(1) instead; both are RFC
+/// 6040 conformant.)
 ///
 /// `inner_ecn` and `outer_ecn` are the 2-bit ECN values (low 2 bits).
 #[inline]
@@ -220,13 +224,14 @@ pub(in crate::afxdp) fn decap_ecn_combine(inner_ecn: u8, outer_ecn: u8) -> Decap
         (CE, _) => DecapEcn::Keep,
         // ECN-capable, non-CE inner: outer CE upgrades it to CE.
         (_, CE) => DecapEcn::SetCe,
-        // §4.2 MAY: outer ECT(1) over inner ECT(0) → ECT(1) (upgrade
-        // variant). Implemented as SetCe? No — ECT(1) is not CE; this is
-        // an ECT-codepoint change, NOT a congestion mark. Handled by the
-        // dedicated SetEct1 path below would over-complicate the type;
-        // since ECT(1)→ECT(0) carries no congestion semantics and RFC
-        // 6040 leaves it a MAY, take the simpler compliant choice: Keep
-        // the inner ECT(0). (Linux upgrades; both are conformant.)
+        // §4.2 MAY: outer=ECT(1) over inner=ECT(0). RFC 6040 leaves this
+        // cell a MAY — the receiver may keep the inner ECT(0) or upgrade
+        // it to ECT(1); neither is a congestion mark. We take the simpler
+        // conformant choice and Keep the inner ECT(0). (Linux's
+        // `__INET_ECN_decapsulate` upgrades to ECT(1); both are
+        // conformant. A codepoint upgrade would need a distinct SetEct1
+        // outcome variant, which carries no congestion semantics and is
+        // not worth the type complexity.)
         (ECT_0, ECT_1) => DecapEcn::Keep,
         // All remaining non-CE outer values leave an ECN-capable inner
         // unchanged.
