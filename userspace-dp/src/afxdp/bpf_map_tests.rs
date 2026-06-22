@@ -105,7 +105,9 @@ fn degraded_path_reason_names_cover_retained_shim_actions() {
 // forward clock step only changes the wall clock, so a wall-clock revert
 // would flip `fresh` to false and fail `heartbeat_fresh_survives_*`.
 
-const HB_STALE_NS: u64 = 5_000_000_000; // mirrors HEARTBEAT_STALE_AFTER (5s)
+// Derived from the production threshold so the tests can never drift from
+// it if HEARTBEAT_STALE_AFTER ever changes (was a hard-coded 5_000_000_000).
+const HB_STALE_NS: u64 = HEARTBEAT_STALE_AFTER.as_nanos() as u64;
 
 #[test]
 fn heartbeat_fresh_mono_recent_is_fresh() {

@@ -171,5 +171,8 @@ pub(in crate::afxdp) fn heartbeat_fresh_mono(last_heartbeat_ns: u64, now_mono_ns
         return false;
     }
     let age_ns = now_mono_ns.saturating_sub(last_heartbeat_ns);
-    age_ns <= HEARTBEAT_STALE_AFTER.as_nanos() as u64
+    // Compare in the u128 domain so the threshold can never be silently
+    // truncated by an `as u64` cast (HEARTBEAT_STALE_AFTER is 5s today, far
+    // below u64::MAX ns, but this keeps the bound exact if it ever grows).
+    u128::from(age_ns) <= HEARTBEAT_STALE_AFTER.as_nanos()
 }
