@@ -7415,6 +7415,105 @@ fn native_gre_decap_tagged_ingress_yields_self_consistent_frame_meta() {
     assert_eq!(decap.meta.addr_family, libc::AF_INET as u8);
 }
 
+/// #2327 fail-on-revert: a GRE (proto-47) frame whose outer tuple/key
+/// match ONLY a non-GRE (here: WireGuard) tunnel row must NOT be
+/// decapsulated as GRE. Pre-#2327 `match_tunnel_endpoint` scanned
+/// `tunnel_endpoints.values()` ignoring `mode`, so any row whose outer
+/// tuple lined up was decapped as GRE. We mutate the built state so the
+/// ONLY endpoint that carries the matching outer tuple is mode
+/// "wireguard" — the GRE decap must return `None` (no match / drop),
+/// never decap the WireGuard endpoint's traffic as GRE. If the
+/// kind-segregation in `match_tunnel_endpoint` / the build-side
+/// `gre_decap_index` is reverted, this row reappears and the assert
+/// fires.
+#[test]
+fn gre_decap_does_not_match_wireguard_row_with_same_outer_tuple() {
+    let mut forwarding = build_forwarding_state(&gre_to_self_snapshot());
+    // Flip the single (GRE) endpoint to WireGuard while keeping the
+    // exact outer tuple/key the inbound frame matches, and drop it from
+    // the kind-segregated decap index (as the WG build path would).
+    let id = 824u16;
+    if let Some(ep) = forwarding.tunnel_endpoints.get_mut(&id) {
+        ep.mode = "wireguard".to_string();
+    }
+    forwarding.gre_decap_index.clear();
+
+    let inner = build_gre_inner_icmp_packet_v4();
+    let frame = build_gre_to_self_outer_frame_v4(80, &inner);
+    let meta = gre_to_self_outer_meta(80, frame.len());
+    assert!(
+        try_native_gre_decap_from_frame(&frame, meta, &forwarding).is_none(),
+        "a GRE frame matching only a WireGuard row must NOT decap as GRE"
+    );
+}
+
+/// #2327 fail-on-revert (defense-in-depth pin): even if the build-side
+/// index were wrong and surfaced a non-GRE endpoint id for the inbound
+/// tuple, the per-candidate `tunnel_mode_kind` re-check in
+/// `match_tunnel_endpoint` must reject it. Here the decap index DOES
+/// point at the endpoint, but the endpoint's mode is non-GRE — the
+/// match must still be `None`.
+#[test]
+fn gre_decap_rejects_non_gre_candidate_even_if_indexed() {
+    let mut forwarding = build_forwarding_state(&gre_to_self_snapshot());
+    let id = 824u16;
+    if let Some(ep) = forwarding.tunnel_endpoints.get_mut(&id) {
+        ep.mode = "wireguard".to_string();
+    }
+    // Index intentionally left pointing at the now-WireGuard endpoint to
+    // exercise the per-candidate kind re-check.
+    let inner = build_gre_inner_icmp_packet_v4();
+    let frame = build_gre_to_self_outer_frame_v4(80, &inner);
+    let meta = gre_to_self_outer_meta(80, frame.len());
+    assert!(
+        try_native_gre_decap_from_frame(&frame, meta, &forwarding).is_none(),
+        "the per-candidate kind re-check must reject a non-GRE endpoint \
+         even when the decap index lists it"
+    );
+}
+
+/// #2327 fail-on-revert: a genuine GRE frame matching a GRE-mode row
+/// still decaps (the kind-segregation must not break the happy path).
+/// Complements the existing
+/// `native_gre_decap_tagged_ingress_yields_self_consistent_frame_meta`.
+#[test]
+fn gre_decap_still_matches_genuine_gre_row() {
+    let forwarding = build_forwarding_state(&gre_to_self_snapshot());
+    let inner = build_gre_inner_icmp_packet_v4();
+    let frame = build_gre_to_self_outer_frame_v4(80, &inner);
+    let meta = gre_to_self_outer_meta(80, frame.len());
+    let decap = try_native_gre_decap_from_frame(&frame, meta, &forwarding)
+        .expect("a genuine GRE frame matching a GRE row must still decap");
+    assert_eq!(
+        &decap.frame[decap.meta.l3_offset as usize..],
+        &inner[..],
+        "decapped inner packet must be byte-identical"
+    );
+}
+
+/// #2327 fail-on-revert: the egress encap dispatcher must FAIL CLOSED on
+/// an unknown tunnel mode — a row whose mode is neither GRE nor
+/// WireGuard must NOT be silently GRE-encapsulated (the pre-#2327
+/// `_ => GRE` fail-open default). `tunnel_mode_kind` classifies it as
+/// `Unknown`; the dispatcher drops (`None`). Asserted at the kind layer
+/// (the dispatch's `match` arms) so the test pins the fail-closed
+/// contract without standing up a full forwarded-frame fixture.
+#[test]
+fn unknown_tunnel_mode_classifies_as_unknown_not_gre() {
+    use crate::afxdp::{tunnel_mode_kind, TunnelKind};
+    assert_eq!(tunnel_mode_kind("gre"), TunnelKind::Gre);
+    assert_eq!(tunnel_mode_kind("ip6gre"), TunnelKind::Gre);
+    assert_eq!(tunnel_mode_kind("wireguard"), TunnelKind::WireGuard);
+    // Any unrecognized / future / malformed mode must NOT map to GRE.
+    for bad in ["", "ipip", "vxlan", "GRE", "wireguard ", "gre6", "geneve"] {
+        assert_eq!(
+            tunnel_mode_kind(bad),
+            TunnelKind::Unknown,
+            "mode {bad:?} must classify Unknown (fail closed), never GRE"
+        );
+    }
+}
+
 /// #1902 fixture: inner TCP SYN L3 packet (no Ethernet header — it is
 /// the flagless-GRE proto-0x0800 payload) 10.255.0.2 -> `dst`. With
 /// `dst` on the reth1.0 connected subnet the decap-INBOUND forward

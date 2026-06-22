@@ -10297,3 +10297,22 @@ top.
   userspace-dp/src/afxdp/icmp_ptb.rs,
   userspace-dp/src/afxdp/icmp_ptb_tests.rs,
   userspace-dp/src/afxdp/README.md, _Log.md
+
+- **Timestamp**: 2026-06-22
+  **Action**: #2327 — GRE decap kind-segregation + fail-closed egress
+  encap dispatch + O(N) decap-scan fix. `match_tunnel_endpoint`
+  (gre.rs) now resolves via a new kind-segregated, outer-tuple-keyed
+  `gre_decap_index` (GRE-mode rows only) instead of scanning all
+  tunnel_endpoints; a GRE frame can no longer decap against a WireGuard
+  or other non-GRE row. Egress dispatcher (frame/mod.rs) matches on a
+  typed `TunnelKind` and DROPS unknown/missing modes (was `_ => GRE`
+  fail-open). Added `TunnelKind` + `tunnel_mode_kind` in
+  forwarding_build/tunnels.rs; index populated in
+  populate_tunnel_endpoints. 4 fail-on-revert tests.
+  **File(s)**: userspace-dp/src/afxdp/gre.rs,
+  userspace-dp/src/afxdp/frame/mod.rs,
+  userspace-dp/src/afxdp/forwarding_build/tunnels.rs,
+  userspace-dp/src/afxdp/forwarding_build/mod.rs,
+  userspace-dp/src/afxdp/types/forwarding.rs,
+  userspace-dp/src/afxdp/tests.rs, docs/userspace-native-gre-plan.md,
+  _Log.md

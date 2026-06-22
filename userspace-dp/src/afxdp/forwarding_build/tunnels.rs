@@ -94,9 +94,52 @@ pub(super) fn populate_tunnel_endpoints(
         state
             .tunnel_endpoint_by_ifindex
             .insert(endpoint.ifindex, endpoint.id);
+        // #2327: kind-segregated decap index — only GRE-mode endpoints
+        // are indexed for the GRE (proto-47) decap fast path. A
+        // WireGuard or any non-GRE row is intentionally NOT indexed, so
+        // a received GRE frame can never be decapped against it even if
+        // the outer tuple/key collide. Keyed by the endpoint's own
+        // (outer_family, source, destination); the decap lookup queries
+        // with the received frame's mirrored (addr_family, outer_dst,
+        // outer_src).
+        if tunnel_mode_kind(&endpoint.mode) == TunnelKind::Gre {
+            state
+                .gre_decap_index
+                .entry((outer_family, source, destination))
+                .or_default()
+                .push(endpoint.id);
+        }
         if is_wireguard {
             state.has_wg_tunnels = true;
         }
+    }
+}
+
+/// #2327: the typed kind of a tunnel-endpoint `mode` string. Centralizes
+/// the kind classification that the decap index, the egress encap
+/// dispatcher, and the GRE supervision paths all rely on, so a future
+/// tunnel kind is added in exactly one place and the egress dispatcher's
+/// fail-closed `_ =>` arm cannot silently treat it as GRE.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(in crate::afxdp) enum TunnelKind {
+    /// `gre` / `ip6gre` — native GRE encapsulation/decapsulation.
+    Gre,
+    /// `wireguard` — WireGuard engine encap/decap.
+    WireGuard,
+    /// Any unrecognized / future / malformed mode string. The egress
+    /// dispatcher MUST fail closed (drop) on this rather than default to
+    /// GRE encap (the pre-#2327 fail-open behavior).
+    Unknown,
+}
+
+/// Classify a tunnel-endpoint `mode` string into a `TunnelKind`. Mirrors
+/// the canonical GRE-kind test used across the supervision paths
+/// (`mode == "gre" || mode == "ip6gre"`).
+pub(in crate::afxdp) fn tunnel_mode_kind(mode: &str) -> TunnelKind {
+    match mode {
+        "gre" | "ip6gre" => TunnelKind::Gre,
+        "wireguard" => TunnelKind::WireGuard,
+        _ => TunnelKind::Unknown,
     }
 }
 

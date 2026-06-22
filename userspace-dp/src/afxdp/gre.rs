@@ -374,6 +374,22 @@ fn gre_inner_family_and_proto(proto: u16) -> Option<(u8, u16)> {
     }
 }
 
+/// Match a received GRE (proto-47) outer tuple to a GRE-mode tunnel
+/// endpoint.
+///
+/// #2327 (kind-segregation + O(N) fix): the lookup goes through
+/// `gre_decap_index`, which only contains `mode == "gre"` / `"ip6gre"`
+/// endpoints — so a GRE frame is NEVER decapped against a WireGuard or
+/// any other non-GRE row even if the outer tuple/key happen to collide.
+/// The index is keyed by the endpoint's own
+/// `(outer_family, source, destination)`; a received frame mirrors it as
+/// `(addr_family, outer_dst, outer_src)`. Each bucket is a small
+/// candidate list so a duplicate outer tuple (a keyed and an unkeyed
+/// endpoint, or distinct logical ifindexes) is disambiguated by the GRE
+/// key here rather than resolved non-deterministically by a first-match
+/// scan over the entire table. Defense-in-depth: each candidate's
+/// `mode` is re-checked via `tunnel_mode_kind` so a future build-side
+/// indexing bug can never surface a non-GRE row on this path.
 fn match_tunnel_endpoint(
     forwarding: &ForwardingState,
     outer_family: i32,
@@ -382,16 +398,28 @@ fn match_tunnel_endpoint(
     key: u32,
     key_present: bool,
 ) -> Option<&TunnelEndpoint> {
-    forwarding.tunnel_endpoints.values().find(|endpoint| {
-        endpoint.outer_family == outer_family
-            && endpoint.source == outer_dst
-            && endpoint.destination == outer_src
-            && if endpoint.key == 0 {
-                !key_present || key == 0
-            } else {
-                key_present && endpoint.key == key
-            }
-    })
+    let candidates = forwarding
+        .gre_decap_index
+        .get(&(outer_family, outer_dst, outer_src))?;
+    for id in candidates {
+        let Some(endpoint) = forwarding.tunnel_endpoints.get(id) else {
+            continue;
+        };
+        // Kind re-check (defense in depth): only GRE-mode rows decap as
+        // GRE, regardless of what the index claims.
+        if tunnel_mode_kind(&endpoint.mode) != TunnelKind::Gre {
+            continue;
+        }
+        let key_ok = if endpoint.key == 0 {
+            !key_present || key == 0
+        } else {
+            key_present && endpoint.key == key
+        };
+        if key_ok {
+            return Some(endpoint);
+        }
+    }
+    None
 }
 
 fn parse_inner_protocol_and_offsets(packet: &[u8], addr_family: u8) -> Option<(u8, u16, u16)> {

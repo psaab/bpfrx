@@ -22,6 +22,20 @@ pub(in crate::afxdp) struct ForwardingState {
     pub(in crate::afxdp) routes_v6: FastMap<String, Vec<RouteEntryV6>>,
     pub(in crate::afxdp) tunnel_endpoints: FastMap<u16, TunnelEndpoint>,
     pub(in crate::afxdp) tunnel_endpoint_by_ifindex: FastMap<i32, u16>,
+    /// #2327: kind-segregated, outer-tuple-keyed index for the GRE
+    /// decap fast path. Keyed by the OUTER tuple as seen FROM THE
+    /// ENDPOINT's perspective — `(outer_family, endpoint.source,
+    /// endpoint.destination)` — so a received GRE frame is matched with
+    /// `(meta.addr_family, outer_dst, outer_src)`. Only `mode == "gre"`
+    /// / `"ip6gre"` endpoints are indexed (kind-segregation): a GRE
+    /// (proto-47) packet can NEVER be decapped against a WireGuard or
+    /// any non-GRE row even if its outer tuple/key collide. Each bucket
+    /// is a `Vec<u16>` of endpoint IDs so a duplicate outer tuple
+    /// (keyed vs unkeyed, or different logical ifindex) is disambiguated
+    /// by the GRE key at lookup rather than resolved non-deterministically
+    /// by a first-match scan. Replaces the per-packet O(N)
+    /// `tunnel_endpoints.values().find(...)` scan (agy #4).
+    pub(in crate::afxdp) gre_decap_index: FastMap<(i32, IpAddr, IpAddr), Vec<u16>>,
     /// WireGuard engines keyed by tunnel_endpoint_id (#1432 S2a). One
     /// per `mode == "wireguard"` endpoint. Shared (`Arc`) so workers
     /// hold the engine across a forwarding-state ArcSwap; engine

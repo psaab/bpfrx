@@ -45,6 +45,10 @@ pub(in crate::afxdp) use interfaces::{pick_interface_v4, pick_interface_v6};
 // tombstone-respawn coherence check + defer-branch prune. (The
 // `WgRowIdentity` type itself is only named inside `tunnels`.)
 pub(in crate::afxdp) use tunnels::hydrate_wg_identity;
+// #2327: typed tunnel-kind classifier shared with the GRE decap path
+// (`gre.rs`) and the egress encap dispatcher (`frame/mod.rs`) so the
+// kind-segregation and fail-closed `_ =>` arm have one source of truth.
+pub(in crate::afxdp) use tunnels::{tunnel_mode_kind, TunnelKind};
 
 // Plain (private) `use` for orchestrator-local symbols. NOT a
 // `pub(super) use` of a `pub(super)` item — that triggers E0364
