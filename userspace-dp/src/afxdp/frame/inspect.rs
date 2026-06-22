@@ -325,7 +325,11 @@ pub(in crate::afxdp) fn is_non_first_fragment(packet: &[u8], addr_family: u8) ->
 ///   - IPv6: multicast ff00::/8 (first byte 0xff). IPv6 has no broadcast.
 ///
 /// Returns `true` when an ICMP error MUST be suppressed for this trigger
-/// destination. Fails closed (`true`) on a too-short packet slice.
+/// destination. Fails closed (`true`) on a too-short packet slice and on
+/// an unknown/unexpected `addr_family`: a destination we cannot classify
+/// must suppress the error rather than risk emitting backscatter for a
+/// packet whose family (and therefore whose group/broadcast bits) we did
+/// not parse.
 #[inline]
 pub(in crate::afxdp) fn dest_is_multicast_or_broadcast(addr_family: u8, packet: &[u8]) -> bool {
     match addr_family as i32 {
@@ -344,7 +348,11 @@ pub(in crate::afxdp) fn dest_is_multicast_or_broadcast(addr_family: u8, packet: 
             // multicast (link-local-all-nodes, solicited-node, etc.).
             dst[0] == 0xff
         }
-        _ => false,
+        // Unknown family — fail closed (suppress). The error generators
+        // never call this for a non-IP family in practice (their own
+        // family dispatch rejects first), but the predicate's contract is
+        // "suppress on anything we could not classify."
+        _ => true,
     }
 }
 

@@ -1,5 +1,24 @@
 # Action Log
 
+## 2026-06-22 — #2314 review fold: dest predicate fails closed on unknown family
+
+- **Timestamp**: 2026-06-22 PDT
+- **Action**: Copilot review of PR #2323 — `dest_is_multicast_or_broadcast`
+  documented "fails closed" but its default (unknown `addr_family`) arm
+  returned `false` (fail OPEN). Flipped the default arm to `true` so an
+  unclassifiable destination family suppresses the ICMP error (the safer
+  posture — never emit backscatter for a packet whose family we did not
+  parse) and updated the doc comment to spell out the unknown-family
+  fail-closed behaviour. In practice the error generators never call this
+  for a non-IP family (their own family dispatch rejects first), so this
+  is contract-hardening, not a behaviour change on the live paths. Added
+  `dest_predicate_fails_closed_on_unknown_family` (fails if reverted to
+  `false`): addr_family 0 and AF_UNIX suppress, while the same unicast
+  bytes under AF_INET do NOT. `cargo build --release` clean; icmp/ptb/
+  reject/multicast/suppress tests green 5x.
+- **File(s)**: userspace-dp/src/afxdp/frame/inspect.rs,
+  userspace-dp/src/afxdp/icmp_ptb_tests.rs
+
 ## 2026-06-22 — #2314 suppress ICMP/ICMPv6 errors for multicast/broadcast triggers
 
 - **Timestamp**: 2026-06-22 PDT

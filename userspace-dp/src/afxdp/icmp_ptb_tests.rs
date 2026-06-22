@@ -369,6 +369,34 @@ fn ptb_suppressed_for_v6_multicast_dst() {
     );
 }
 
+/// #2314 fail-closed contract: an unknown / unexpected addr_family (e.g.
+/// 0, or a non-IP family) must be treated as "could not classify" and
+/// suppress the error — the documented fail-closed posture. Fails if the
+/// predicate's default arm is reverted to `false` (fail open).
+#[test]
+fn dest_predicate_fails_closed_on_unknown_family() {
+    // A plain IPv4 unicast packet body — only the addr_family argument is
+    // bogus, proving the suppression comes from the family arm, not the
+    // bytes (those bytes classify as unicast under AF_INET).
+    let (frame, meta) = inbound_v4_udp(64, true);
+    let l3 = meta.l3_offset as usize;
+    let packet = &frame[l3..];
+    assert!(
+        dest_is_multicast_or_broadcast(0, packet),
+        "addr_family 0 (unknown) must fail closed -> suppress"
+    );
+    assert!(
+        dest_is_multicast_or_broadcast(libc::AF_UNIX as u8, packet),
+        "a non-IP addr_family must fail closed -> suppress"
+    );
+    // Sanity: the same bytes under AF_INET are NOT suppressed (unicast),
+    // so the suppression above is the family arm, not the destination.
+    assert!(
+        !dest_is_multicast_or_broadcast(libc::AF_INET as u8, packet),
+        "the same unicast bytes under AF_INET must NOT be suppressed"
+    );
+}
+
 /// #2314 fail-on-revert: a NORMAL unicast destination must STILL generate
 /// the PTB. If the multicast/broadcast guard is reverted this test still
 /// passes; it pairs with the suppression tests above so that reverting the
