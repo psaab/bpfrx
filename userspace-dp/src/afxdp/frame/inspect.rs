@@ -497,10 +497,64 @@ pub(in crate::afxdp) fn forward_tuple_mismatch_reason(
     ))
 }
 
+/// #2344: resolve the L3-relative slice the way the SessionFlow frame
+/// parsers do (prefer `meta.l3_offset` when it points at a frame byte
+/// whose IP-version nibble matches `addr_family`, else fall back to
+/// `frame_l3_offset`) and run the family-aware non-first-fragment
+/// predicate over it. Returns `true` only when the packet is positively
+/// identified as a non-first fragment; an unresolvable/too-short frame
+/// returns `false` (the downstream parser length guards reject it).
+fn frame_is_non_first_fragment(frame: &[u8], meta: UserspaceDpMeta) -> bool {
+    let expected_version = match meta.addr_family as i32 {
+        libc::AF_INET => 4u8,
+        libc::AF_INET6 => 6u8,
+        _ => return false,
+    };
+    let l3 = match meta.l3_offset {
+        14 | 18
+            if frame
+                .get(meta.l3_offset as usize)
+                .is_some_and(|byte| (byte >> 4) == expected_version) =>
+        {
+            meta.l3_offset as usize
+        }
+        _ => match frame_l3_offset(frame) {
+            Some(off) => off,
+            None => return false,
+        },
+    };
+    // Only flag a fragment when the byte at the resolved L3 offset is a
+    // real IP header whose version matches the metadata family. Without
+    // this the predicate would read the fragment-offset bytes out of a
+    // garbage/non-IP frame whose flow tuple is carried entirely in
+    // metadata (e.g. the meta-led ICMP fixtures), spuriously suppressing
+    // a legitimate flow. The downstream parsers already re-derive L3,
+    // so this only guards the early-exit decision.
+    if frame.get(l3).is_none_or(|byte| (byte >> 4) != expected_version) {
+        return false;
+    }
+    match frame.get(l3..) {
+        Some(slice) => is_non_first_fragment(slice, meta.addr_family),
+        None => false,
+    }
+}
+
 pub(in crate::afxdp) fn parse_session_flow_from_bytes(
     frame: &[u8],
     meta: UserspaceDpMeta,
 ) -> Option<SessionFlow> {
+    // #2344: a non-first IP fragment carries no L4 header. Refuse to build
+    // any ported SessionFlow for it — this is the single chokepoint that
+    // also defeats the meta fast path below (the XDP shim does NOT gate
+    // non-first fragments, so `meta.flow_*_port` may hold payload bytes
+    // read at the post-IP-header offset). Returning `None` makes the
+    // fragment flowless: it follows the route-based, session-less forward
+    // path instead of polluting policy / flow-cache / session indexes.
+    // Composes with #1852 (NAT leaves gated on the same predicate) and
+    // #2293-era screen fragment classification.
+    if frame_is_non_first_fragment(frame, meta) {
+        return None;
+    }
     let meta_flow = parse_session_flow_from_meta(meta);
     // Fast path: for TCP/UDP with complete metadata tuple, use meta directly
     // without parsing the frame. This avoids extra L3/L4 parsing for the
@@ -541,6 +595,11 @@ pub(in crate::afxdp) fn parse_session_flow_from_bytes(
             if frame.len() < l3 + 20 || frame.len() < l4 {
                 return None;
             }
+            // #2344: same non-first-fragment gate as the frame parsers —
+            // this meta-offset fallback must not fabricate ports either.
+            if ipv4_is_non_first_fragment(&frame[l3..]) {
+                return None;
+            }
             let src_ip = IpAddr::V4(Ipv4Addr::new(
                 frame[l3 + 12],
                 frame[l3 + 13],
@@ -569,6 +628,10 @@ pub(in crate::afxdp) fn parse_session_flow_from_bytes(
         }
         libc::AF_INET6 => {
             if frame.len() < l3 + 40 || frame.len() < l4 {
+                return None;
+            }
+            // #2344: same non-first-fragment gate as the frame parsers.
+            if ipv6_is_non_first_fragment(&frame[l3..]) {
                 return None;
             }
             let src_ip = IpAddr::V6(Ipv6Addr::from(
@@ -712,6 +775,15 @@ pub(in crate::afxdp) fn parse_session_flow_from_frame(
             if frame.len() < l3 + 40 || frame.len() < l4 {
                 return None;
             }
+            // #2344: a non-first IPv6 fragment (Fragment Header type 44
+            // with a non-zero offset) carries NO L4 header. Refuse to
+            // synthesize a ported SessionFlow for it; return `None` so the
+            // fragment is flowless and follows the route-based forward
+            // path. Same predicate #1852 uses for the NAT leaves, walked
+            // over the L3-relative slice.
+            if ipv6_is_non_first_fragment(&frame[l3..]) {
+                return None;
+            }
             let src_ip = IpAddr::V6(Ipv6Addr::from(
                 <[u8; 16]>::try_from(&frame[l3 + 8..l3 + 24]).ok()?,
             ));
@@ -791,6 +863,17 @@ pub(in crate::afxdp) fn parse_ipv4_session_flow_from_frame(
         return None;
     }
     let protocol = frame[l3 + 9];
+    // #2344: a non-first IPv4 fragment carries NO L4 header — its
+    // post-IP-header bytes are payload, not TCP/UDP ports. Refuse to
+    // synthesize a ported SessionFlow for it. Returning `None` makes the
+    // fragment flowless: it follows the route-based, session-less forward
+    // path (the existing pre-#1913 "no flow tuple" behavior) instead of
+    // polluting policy / flow-cache / session indexes with fake ports.
+    // Mirrors #1852, which gates the NAT rewrite leaves on the same
+    // `ipv4_is_non_first_fragment` predicate over the L3-relative slice.
+    if ipv4_is_non_first_fragment(&frame[l3..]) {
+        return None;
+    }
     let parsed_l4 = l3 + ihl;
     let l4 = if meta.l4_offset > meta.l3_offset && meta.l4_offset as usize == parsed_l4 {
         meta.l4_offset as usize

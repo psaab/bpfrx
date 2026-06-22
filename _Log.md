@@ -1,5 +1,39 @@
 # Action Log
 
+## 2026-06-22 — #2344 non-first-fragment SessionFlow gate
+
+- **Timestamp**: 2026-06-22 PDT
+- **Action**: Fixed the HIGH parsing/correctness gap where non-first IP
+  fragments were admitted to the SessionFlow parsers. A non-first fragment
+  carries no L4 header — its post-IP-header bytes are payload — but
+  `parse_ipv4_session_flow_from_frame`, the IPv6 branch of
+  `parse_session_flow_from_frame`, and the meta-offset fallback in
+  `parse_session_flow_from_bytes` all called `parse_flow_ports` with no
+  fragment-offset guard, reading payload bytes as TCP/UDP ports. That fake
+  tuple drove policy eval, the flow cache, and the session/reverse indexes.
+  #1852 had gated only the NAT rewrite leaves and explicitly deferred this
+  forwarding/session-path question. Fix: each session-flow parser now reuses
+  the existing `ipv4_is_non_first_fragment` / `ipv6_is_non_first_fragment`
+  predicates and returns `None` for a non-first fragment.
+  `parse_session_flow_from_bytes` runs a single top-of-function chokepoint
+  (`frame_is_non_first_fragment`) so the meta fast path cannot admit a
+  fragment either (the XDP shim does NOT gate fragments, so `meta.flow_*_port`
+  can carry payload bytes). The chokepoint requires the byte at the resolved
+  L3 offset to be a real IP header of the metadata family before reading the
+  fragment-offset bits, so a non-IP frame whose tuple lives only in metadata
+  is not spuriously suppressed. Fragment model: xpf does NOT reassemble; a
+  flowless (`None`) packet follows the existing route-based, session-less
+  forward path (the pre-#1913 "no flow tuple" branch in `poll_descriptor`),
+  so fragments forward statelessly per route without policy-on-fake-ports.
+  GRE decap inherits this (flow `None` → `(0,0)` ports, no synthesis).
+  Composes with #2293-era screen fragment classification.
+- **File(s)**: userspace-dp/src/afxdp/frame/inspect.rs,
+  userspace-dp/src/afxdp/frame/prop_tests/inspect.rs,
+  userspace-dp/src/afxdp/frame/README.md, _Log.md
+- **Validation**: cargo build --release clean; new fragment pins pass 5x;
+  full userspace-dp test suite green (one unrelated pre-existing worker_queue
+  concurrency flake, passes 3/3 in isolation).
+
 ## 2026-06-22 — #2347 DHCP-relay ifindex-drift listener rebind
 
 - **Timestamp**: 2026-06-22 PDT

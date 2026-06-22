@@ -446,3 +446,202 @@ fn pin_af_constants() {
     assert_eq!(AF4 as i32, libc::AF_INET);
     assert_eq!(AF6 as i32, libc::AF_INET6);
 }
+
+// === #2344: non-first-fragment SessionFlow gate ===
+//
+// A non-first IP fragment carries NO L4 header — its post-IP-header
+// bytes are payload, not TCP/UDP ports. The SessionFlow parsers MUST
+// NOT fabricate a ported flow from such a packet; they return `None`
+// so the fragment is flowless and follows the route-based, session-less
+// forward path (composing with #1852's NAT-leaf gate and the #2293-era
+// screen fragment classification). These pins fail if the gate is
+// reverted, because the parser would then synthesize a flow carrying
+// payload bytes as ports.
+
+use super::strategies::{ExtHdr, PacketSpec, build_valid_frame};
+
+/// A baseline TCP/IPv4 spec with a distinct port pair. The fragment
+/// tests mutate the built frame's fragment-offset field and assert the
+/// parsers refuse to produce a flow.
+fn ipv4_tcp_spec() -> PacketSpec {
+    PacketSpec {
+        v6: false,
+        src4: 0x0a00_0001,
+        dst4: 0x0a00_0002,
+        src6: [0; 16],
+        dst6: [0; 16],
+        protocol: PROTO_TCP,
+        src_port: 0x1234,
+        dst_port: 0x5678,
+        vlan_id: 0,
+        vlan_present: false,
+        pcp: 0,
+        ttl: 64,
+        ihl: 20,
+        ext: Vec::new(),
+        payload_len: 16,
+        payload_seed: 0xABCD,
+        udp_zero_csum: false,
+        tcp_flags: 0x10,
+        tcp_opt_len: 0,
+        seq: 1,
+    }
+}
+
+/// Zero the tuple/offset fields so `parse_session_flow_from_bytes` is
+/// forced down the frame-led path (the meta fast path requires a
+/// complete TCP/UDP tuple). This isolates the per-parser gate.
+fn frame_led_meta(meta: UserspaceDpMeta) -> UserspaceDpMeta {
+    let mut m = meta;
+    m.flow_src_addr = [0; 16];
+    m.flow_dst_addr = [0; 16];
+    m.flow_src_port = 0;
+    m.flow_dst_port = 0;
+    m.l3_offset = 0;
+    m.l4_offset = 0;
+    m
+}
+
+/// IPv4 non-first fragment (frag-offset != 0) must NOT parse into a
+/// ported SessionFlow on the frame-led path.
+#[test]
+fn pin_ipv4_non_first_fragment_no_session_flow_frame_led() {
+    let pkt = build_valid_frame(&ipv4_tcp_spec());
+    // Control: the unmodified frame parses to the expected ported flow.
+    let blank = frame_led_meta(pkt.meta);
+    let control = parse_session_flow_from_bytes(&pkt.frame, blank).expect("control flow");
+    assert_eq!(control, pkt.session_flow());
+
+    // Set IPv4 fragment offset = 1 (8-byte units) in bytes l3+6..l3+8.
+    // IPv4 frag_off layout: HIGH 3 bits are flags (Reserved/DF/MF), LOW
+    // 13 bits are the fragment offset (`& 0x1FFF`, per
+    // ipv4_is_non_first_fragment). 0x0001 -> offset 1, no flags.
+    let mut frag = pkt.frame.clone();
+    let off = u16::from_be_bytes([frag[pkt.l3 + 6], frag[pkt.l3 + 7]]) | 0x0001;
+    frag[pkt.l3 + 6..pkt.l3 + 8].copy_from_slice(&off.to_be_bytes());
+    assert!(
+        ipv4_is_non_first_fragment(&frag[pkt.l3..]),
+        "fragment offset must be non-zero for this pin"
+    );
+
+    assert_eq!(
+        parse_session_flow_from_bytes(&frag, frame_led_meta(pkt.meta)),
+        None,
+        "non-first IPv4 fragment must not fabricate a ported flow"
+    );
+    // Direct frame parser (GRE decap calls this) is gated too.
+    assert_eq!(
+        parse_ipv4_session_flow_from_frame(&frag, frame_led_meta(pkt.meta)),
+        None,
+        "parse_ipv4_session_flow_from_frame must gate the non-first fragment"
+    );
+    assert_eq!(
+        parse_session_flow_from_frame(&frag, frame_led_meta(pkt.meta)),
+        None,
+        "parse_session_flow_from_frame must gate the non-first fragment"
+    );
+}
+
+/// The meta fast path must NOT bypass the gate. The XDP shim does not
+/// gate non-first fragments, so meta can arrive with payload bytes in
+/// `flow_*_port`. The chokepoint in `parse_session_flow_from_bytes`
+/// must reject the fragment before consulting that meta tuple.
+#[test]
+fn pin_ipv4_non_first_fragment_no_session_flow_meta_fast_path() {
+    let pkt = build_valid_frame(&ipv4_tcp_spec());
+    // pkt.meta carries a complete TCP tuple -> meta fast path would fire.
+    let mut frag = pkt.frame.clone();
+    let off = u16::from_be_bytes([frag[pkt.l3 + 6], frag[pkt.l3 + 7]]) | 0x0001;
+    frag[pkt.l3 + 6..pkt.l3 + 8].copy_from_slice(&off.to_be_bytes());
+
+    assert_eq!(
+        parse_session_flow_from_bytes(&frag, pkt.meta),
+        None,
+        "meta fast path must not admit a non-first IPv4 fragment"
+    );
+}
+
+/// First / atomic fragment (offset 0, MF possibly set) still carries
+/// the real L4 header -> parses normally. Guards against an over-broad
+/// gate that drops legitimate first fragments.
+#[test]
+fn pin_ipv4_first_fragment_offset_zero_still_parses() {
+    let pkt = build_valid_frame(&ipv4_tcp_spec());
+    let mut frag = pkt.frame.clone();
+    // Set MF (one of the HIGH 3 flag bits, 0x2000) but keep the LOW 13
+    // offset bits 0 -> this is a FIRST fragment.
+    let off = u16::from_be_bytes([frag[pkt.l3 + 6], frag[pkt.l3 + 7]]) | 0x2000;
+    frag[pkt.l3 + 6..pkt.l3 + 8].copy_from_slice(&off.to_be_bytes());
+    assert!(
+        !ipv4_is_non_first_fragment(&frag[pkt.l3..]),
+        "MF-set, offset-0 is a FIRST fragment"
+    );
+    let flow = parse_session_flow_from_bytes(&frag, frame_led_meta(pkt.meta))
+        .expect("first fragment still parses");
+    assert_eq!(flow, pkt.session_flow());
+}
+
+/// IPv6 non-first fragment (Fragment Header type 44, offset != 0) must
+/// NOT parse into a ported SessionFlow.
+#[test]
+fn pin_ipv6_non_first_fragment_no_session_flow() {
+    let mut spec = ipv4_tcp_spec();
+    spec.v6 = true;
+    spec.src6 = [0x20, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+    spec.dst6 = [0x20, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
+    spec.ext = vec![ExtHdr::Fragment];
+    let pkt = build_valid_frame(&spec);
+
+    // Control: with offset 0 the fragment header is a first fragment and
+    // the flow parses normally.
+    let blank = frame_led_meta(pkt.meta);
+    let control = parse_session_flow_from_bytes(&pkt.frame, blank).expect("v6 control flow");
+    assert_eq!(control, pkt.session_flow());
+
+    // Fragment header sits at l3+40; its offset field is bytes 2..4 of
+    // the header. Mask 0xFFF8 (upper 13 bits) is the offset; set offset
+    // = 1 (8-octet units) -> byte 3 = 0x08.
+    let mut frag = pkt.frame.clone();
+    let fh = pkt.l3 + 40;
+    let foff = u16::from_be_bytes([frag[fh + 2], frag[fh + 3]]) | 0x0008;
+    frag[fh + 2..fh + 4].copy_from_slice(&foff.to_be_bytes());
+    assert!(
+        ipv6_is_non_first_fragment(&frag[pkt.l3..]),
+        "v6 fragment offset must be non-zero for this pin"
+    );
+
+    assert_eq!(
+        parse_session_flow_from_bytes(&frag, frame_led_meta(pkt.meta)),
+        None,
+        "non-first IPv6 fragment must not fabricate a ported flow"
+    );
+    assert_eq!(
+        parse_session_flow_from_frame(&frag, frame_led_meta(pkt.meta)),
+        None,
+        "parse_session_flow_from_frame must gate the non-first IPv6 fragment"
+    );
+}
+
+/// IPv6 first fragment (Fragment Header present, offset 0) still parses
+/// — the L4 header is in this fragment.
+#[test]
+fn pin_ipv6_first_fragment_offset_zero_still_parses() {
+    let mut spec = ipv4_tcp_spec();
+    spec.v6 = true;
+    spec.src6 = [0x20, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+    spec.dst6 = [0x20, 0x01, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2];
+    spec.ext = vec![ExtHdr::Fragment];
+    let pkt = build_valid_frame(&spec);
+    // Set MF (low bit 0x0001) but keep offset bits 0 -> FIRST fragment.
+    let mut frag = pkt.frame.clone();
+    let fh = pkt.l3 + 40;
+    let foff = u16::from_be_bytes([frag[fh + 2], frag[fh + 3]]) | 0x0001;
+    frag[fh + 2..fh + 4].copy_from_slice(&foff.to_be_bytes());
+    assert!(
+        !ipv6_is_non_first_fragment(&frag[pkt.l3..]),
+        "MF-set, offset-0 IPv6 fragment is a FIRST fragment"
+    );
+    let flow = parse_session_flow_from_bytes(&frag, frame_led_meta(pkt.meta))
+        .expect("v6 first fragment still parses");
+    assert_eq!(flow, pkt.session_flow());
+}
