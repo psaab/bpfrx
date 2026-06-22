@@ -10705,3 +10705,17 @@ top.
   - **File(s)**: pkg/dhcprelay/relay.go, pkg/dhcprelay/relay_test.go,
     pkg/dhcprelay/README.md, pkg/daemon/daemon_apply.go, pkg/daemon/daemon_run.go,
     pkg/daemon/daemon_dhcprelay_reconcile_test.go, _Log.md
+
+- **Timestamp**: 2026-06-22T23:27Z
+  - **Action**: #2346 — QinQ tracker-vs-runtime accuracy fix (doc-only, outcome B).
+    Verified ground truth: config parses flexible-vlan-tagging/encapsulation/
+    inner-vlan-id into InnerVlanID (compiler_interfaces.go:74,299) but
+    InnerVlanID has ZERO consumers (parse-only); networkd creates no
+    stacked-VLAN .netdev; AF_XDP shim parse_l2 strips exactly one tag
+    (lib.rs:1091, if not while) → double-tagged frame's inner TPID hits the
+    `_` dispatch arm → pass_non_ip_l2_direct() = XDP_PASS to kernel
+    (lib.rs:375), never delivered to XSK. No silent misparse on the transit
+    path. Corrected feature-gaps.md:439 Done→Partial; corrected frame/README.md
+    "shim drops double-tagged" → "XDP_PASSes to kernel". Filed feature
+    follow-up #2354 for real QinQ transit build.
+  - **File(s)**: docs/feature-gaps.md, userspace-dp/src/afxdp/frame/README.md, _Log.md
