@@ -75,6 +75,9 @@ pub(super) fn wg_encap_frame(
     let inner_packet = inner_frame.get(inner_l3..)?;
     let inner_len = crate::afxdp::gre::packet_trimmed_len(inner_packet, inner_meta.addr_family)?;
     let inner_packet = &inner_packet[..inner_len];
+    // #2303: copy the inner DSCP+ECN onto the outer header (uniform
+    // DSCP model + RFC 6040 ECN ingress copy) instead of hardcoding 0.
+    let outer_tos = crate::afxdp::gre::inner_tos_byte(inner_packet, inner_meta.addr_family);
 
     // Outer family follows the peer endpoint address.
     let outer_v6 = peer_endpoint.is_ipv6();
@@ -150,7 +153,7 @@ pub(super) fn wg_encap_frame(
                 src,
                 dst,
                 PROTO_UDP,
-                /* tos */ 0,
+                outer_tos,
                 endpoint.ttl,
                 total_len,
             )?;
@@ -171,7 +174,7 @@ pub(super) fn wg_encap_frame(
                 src,
                 dst,
                 PROTO_UDP,
-                /* traffic_class */ 0,
+                outer_tos,
                 /* flow_label */ 0,
                 endpoint.ttl,
                 payload_len,

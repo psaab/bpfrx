@@ -156,9 +156,14 @@ pub(super) fn emit_screen_drop_event(
 /// Emit a screen ALARM event — a `ScreenDrop`-kind event that did NOT drop
 /// the packet (#2234 scan-table-pressure). It shares the screen event frame
 /// so it surfaces alongside other screen activity, but the RT_FLOW action is
-/// PERMIT (the flow forwards), so downstream stats / syslog / dashboards do
-/// NOT count it as a deny/drop. The `reason` maps to a dedicated `screen_id`
-/// bit; the 5-tuple is the source that forced an eviction.
+/// PERMIT (the flow forwards). The Go consumers classify the screen event by
+/// BOTH kind AND action (#2298): a screen event with action=PERMIT is counted
+/// as a screen ALARM (not a screen drop) and logged at NOTICE severity (not
+/// ERROR), so downstream stats / syslog / dashboards do NOT treat it as a
+/// deny/drop. See `pkg/dataplane/userspace/eventstream.go`
+/// (`recordDataplaneEvent`) and `pkg/logging/ringbuf.go` (`eventSeverity`).
+/// The `reason` maps to a dedicated `screen_id` bit; the 5-tuple is the source
+/// that forced an eviction.
 #[inline]
 pub(super) fn emit_screen_alarm_event(
     event_stream: Option<&EventStreamWorkerHandle>,
@@ -231,6 +236,8 @@ pub(super) fn screen_parse_error_info(
         ip_ihl: 5,
         ip_frag_off: 0,
         ip_total_len: 0,
+        ip_payload_len: 0,
+        frag_data_off: 0,
     }
 }
 
@@ -478,6 +485,8 @@ mod tests {
             ip_ihl: 5,
             ip_frag_off: 0,
             ip_total_len: 60,
+            ip_payload_len: 0,
+            frag_data_off: 0,
         };
 
         emit_screen_drop_event(Some(&handle), &pkt, test_meta(), 11, "land-attack", 456);
@@ -521,6 +530,8 @@ mod tests {
             ip_ihl: 5,
             ip_frag_off: 0,
             ip_total_len: 60,
+            ip_payload_len: 0,
+            frag_data_off: 0,
         };
 
         emit_screen_alarm_event(Some(&handle), &pkt, test_meta(), 2, "scan-table-pressure", 789);
@@ -560,6 +571,8 @@ mod tests {
             ip_ihl: 5,
             ip_frag_off: 0x2000,
             ip_total_len: 60,
+            ip_payload_len: 0,
+            frag_data_off: 0,
         };
 
         emit_screen_drop_event(Some(&handle), &pkt, test_meta(), 11, "icmp-fragment", 456);

@@ -115,8 +115,9 @@ proptest! {
     /// P-I4: a synthesized valid packet parses back to exactly the
     /// tuple it was built from — with consistent metadata AND with the
     /// metadata tuple/offsets zeroed (frame-led fallback agreement).
-    /// v6 ext chains up to 6 headers (the inspect walk's loop bound;
-    /// the >6 behavior is pinned separately below).
+    /// v6 ext chains up to 6 headers, well within the inspect walk's
+    /// `MAX_IPV6_EXT_HEADERS` (8) loop bound; the fail-closed
+    /// over-bound behavior is pinned separately below (#2292).
     #[test]
     fn parse_valid_round_trip(pkt in arb_parse_packet(6)) {
         let expected = pkt.session_flow();
@@ -212,32 +213,58 @@ fn v6_frame_with_n_hbh(n: usize) -> Vec<u8> {
     build_valid_frame(&spec).frame
 }
 
-/// Walk-bound pin: a chain of exactly 6 ext headers resolves to the
-/// true L4 offset via the post-loop `Some(offset)`; a chain of 7
-/// returns the offset of the SEVENTH extension header (current,
-/// deliberate bound at inspect.rs:50 — six iterations, then surrender
-/// the current offset). P-I4 therefore only feeds chains ≤ 6.
+/// #2292 walk-bound pin (fail-CLOSED): the forwarding walkers resolve a
+/// chain of up to `MAX_IPV6_EXT_HEADERS - 1` (7) extension headers (the
+/// `MAX_IPV6_EXT_HEADERS`-th loop iteration consumes the terminal L4),
+/// and FAIL CLOSED on `MAX_IPV6_EXT_HEADERS` (8) or more — both
+/// `packet_rel_l4_offset` and `packet_rel_l4_offset_and_protocol`
+/// return `None` instead of surrendering the offset of an unconsumed
+/// extension header with a fake `proto == 0`.
+///
+/// This matches the screen path (`screen/extract.rs`, `for _ in 0..8`,
+/// which `Err`s when the 8th iteration is still on an ext header), so
+/// screen and forwarding agree on the same over-bound chain. The
+/// pre-#2292 forwarding walkers used 6 iterations and a post-loop
+/// `Some(offset)` that surrendered the unconsumed ext-header offset.
+///
+/// Fail-on-revert: against the old 6-iteration surrender-open shape the
+/// 7-header case returns `None` (bound too low) AND the 8-header case
+/// returns `Some(..)` / `proto == 0` — both assertions flip.
 #[test]
-fn pin_ext_walk_six_header_bound() {
-    let six = v6_frame_with_n_hbh(6);
+fn pin_ext_walk_bound_fail_closed() {
+    let resolvable = MAX_IPV6_EXT_HEADERS - 1;
+    let max = v6_frame_with_n_hbh(resolvable);
     assert_eq!(
-        packet_rel_l4_offset(&six[14..], AF6),
-        Some(40 + 6 * 8),
-        "6-header chain must resolve to the real L4 offset"
-    );
-    let seven = v6_frame_with_n_hbh(7);
-    assert_eq!(
-        packet_rel_l4_offset(&seven[14..], AF6),
-        Some(40 + 6 * 8),
-        "7-header chain currently stops at the 7th ext header (loop bound)"
+        packet_rel_l4_offset(&max[14..], AF6),
+        Some(40 + resolvable * 8),
+        "a {resolvable}-header chain must resolve to the real L4 offset"
     );
     let (rel, proto) =
-        packet_rel_l4_offset_and_protocol(&seven[14..], AF6).expect("walk result");
-    assert_eq!(rel, 40 + 6 * 8);
-    assert_eq!(
-        proto, 0,
-        "post-bound 'protocol' is the unconsumed ext header type (hop-by-hop)"
-    );
+        packet_rel_l4_offset_and_protocol(&max[14..], AF6).expect("walk result at bound");
+    assert_eq!(rel, 40 + resolvable * 8);
+    assert_eq!(proto, PROTO_TCP, "terminal protocol at the bound is the real L4");
+
+    // At/over the bound the walk is still on an extension header when it
+    // runs out of iterations → fail CLOSED (None), never a surrendered
+    // offset with a fake proto=0.
+    for n in [MAX_IPV6_EXT_HEADERS, MAX_IPV6_EXT_HEADERS + 1] {
+        let over = v6_frame_with_n_hbh(n);
+        assert_eq!(
+            packet_rel_l4_offset(&over[14..], AF6),
+            None,
+            "an {n}-header chain must fail CLOSED (None), not surrender the offset"
+        );
+        assert_eq!(
+            packet_rel_l4_offset_and_protocol(&over[14..], AF6),
+            None,
+            "_and_protocol must also fail CLOSED on {n} headers — no fake proto=0 surrender"
+        );
+        assert_eq!(
+            frame_l4_offset(&over, AF6),
+            None,
+            "frame_l4_offset must fail CLOSED on the {n}-header chain"
+        );
+    }
 }
 
 /// Deterministic arm-execution guarantee for the v6 ext-header walk:

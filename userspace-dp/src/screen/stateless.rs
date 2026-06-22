@@ -103,17 +103,51 @@ pub(super) fn check_tcp_flag_screens(
 /// `offset_bytes + ip_total_len <= 65535` while the reassembled total
 /// overflows by up to 40 bytes. Operators concerned about this should
 /// also enable the `ip-source-route` screen, which drops any IPv4
-/// packet with `ihl > 5`. IPv4 only — IPv6 ping-of-death would need
-/// reassembled-length tracking across NEXTHDR_FRAGMENT and is not
-/// covered by the BPF reference either.
+/// packet with `ihl > 5`.
+///
+/// #2293: the IPv6 path applies the same per-fragment oversize formula.
+/// The dataplane does not reassemble, so for an IPv6 fragment we size
+/// the reassembled end-byte this fragment implies:
+///
+/// ```text
+///   offset_bytes = (frag_off & 0xFFF8) >> 3 << 3 == frag_off & 0xFFF8
+///   frag_data    = ip_payload_len - frag_data_off   // L4/data bytes
+///   if offset_bytes + frag_data > 65535 -> drop
+/// ```
+///
+/// `frag_off & 0xFFF8` is already the byte offset (the IPv6 fragment
+/// offset field is the upper 13 bits and counts 8-byte units, so masking
+/// the low 3 bits yields the offset directly in bytes). `frag_data_off`
+/// is the payload-region bytes consumed by extension headers up to and
+/// including the fragment header (captured in `extract.rs`), so
+/// `ip_payload_len - frag_data_off` is this fragment's data contribution.
+/// A maximal-offset last fragment that pushes the reassembled datagram
+/// past the 65535 IPv6-payload ceiling is dropped — the IPv6 analogue of
+/// the classic ping-of-death. Like the IPv4 path this fires on ANY IPv6
+/// protocol, only for fragments, and inherits the same per-fragment
+/// (non-reassembling) approximation limit.
 #[inline]
 pub(super) fn check_ping_of_death(
     profile: &ScreenProfile,
     pkt: &ScreenPacketInfo,
 ) -> Option<&'static str> {
-    if profile.ping_death && pkt.addr_family == libc::AF_INET as u8 && pkt.is_fragment {
+    if !profile.ping_death || !pkt.is_fragment {
+        return None;
+    }
+    if pkt.addr_family == libc::AF_INET as u8 {
         let offset_bytes = ((pkt.ip_frag_off & 0x1FFF) as u32) << 3;
         if offset_bytes + pkt.ip_total_len as u32 > 65535 {
+            return Some("ping-of-death");
+        }
+    } else if pkt.addr_family == libc::AF_INET6 as u8 {
+        // IPv6 fragment offset is the upper 13 bits (8-byte units) of the
+        // fragment header's frag_off field; `& 0xFFF8` is the byte offset.
+        let offset_bytes = (pkt.ip_frag_off & 0xFFF8) as u32;
+        // This fragment's data bytes = payload_len minus the ext-header
+        // bytes preceding the fragment data. saturating_sub guards a
+        // hostile payload_len shorter than the headers actually walked.
+        let frag_data = pkt.ip_payload_len.saturating_sub(pkt.frag_data_off) as u32;
+        if offset_bytes + frag_data > 65535 {
             return Some("ping-of-death");
         }
     }

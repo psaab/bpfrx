@@ -700,17 +700,37 @@ pub(super) fn poll_binding_process_descriptor(
                         // If dst is IPv6 matching a NAT64 prefix, extract IPv4
                         // dest and allocate an IPv4 SNAT address. Route lookup
                         // must use the IPv4 destination.
-                        let nat64_match = if pre_routing_dnat.is_none() && nptv6_inbound.is_none() {
+                        //
+                        // #2291: tri-state lookup. The pre-fix code collapsed
+                        // "prefix matched but no source pool" into "no match"
+                        // (a bare Option whose None meant both), so a matched-
+                        // but-unallocatable destination fell through to IPv6
+                        // route lookup on the SYNTHETIC NAT64 address — a
+                        // fail-OPEN that could leak it upstream on a default
+                        // IPv6 route. Now MatchUnavailable fails CLOSED (drop +
+                        // counter); only NoPrefixMatch continues IPv6 routing.
+                        let nat64_match = if pre_routing_dnat.is_none()
+                            && nptv6_inbound.is_none()
+                        {
                             if let IpAddr::V6(dst_v6) = resolution_target {
-                                worker_ctx
-                                    .forwarding
-                                    .nat64
-                                    .match_ipv6_dest(dst_v6)
-                                    .and_then(|(idx, dst_v4)| {
-                                        let snat_v4 =
-                                            worker_ctx.forwarding.nat64.allocate_v4_source(idx)?;
-                                        Some((idx, dst_v4, snat_v4, dst_v6))
-                                    })
+                                match worker_ctx.forwarding.nat64.classify_ipv6_dest(dst_v6) {
+                                    crate::nat64::Nat64Match::NoPrefixMatch => None,
+                                    crate::nat64::Nat64Match::MatchReady {
+                                        prefix_idx,
+                                        dst_v4,
+                                        snat_v4,
+                                        dst_v6,
+                                    } => Some((prefix_idx, dst_v4, snat_v4, dst_v6)),
+                                    crate::nat64::Nat64Match::MatchUnavailable => {
+                                        // Fail closed: a NAT64 prefix matched
+                                        // but the source pool is empty/exhausted.
+                                        // Drop rather than route the synthetic
+                                        // IPv6 destination as ordinary IPv6.
+                                        telemetry.counters.nat64_no_source_pool += 1;
+                                        binding.scratch.scratch_recycle.push(desc.addr);
+                                        continue;
+                                    }
+                                }
                             } else {
                                 None
                             }

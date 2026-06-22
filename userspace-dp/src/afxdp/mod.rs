@@ -429,6 +429,12 @@ pub(in crate::afxdp) struct BatchCounters {
     // #2161: per-translation NAT64 (v6<->v4) tally, batched like snat/dnat
     // and flushed to BindingLiveState.nat64_translations.
     nat64_translations: u64,
+    // #2291: fail-closed drop counter — a NAT64 prefix matched but no IPv4
+    // source could be allocated (empty/exhausted pool), so the synthetic
+    // IPv6 destination was DROPPED rather than route-looked-up as ordinary
+    // IPv6 (the pre-fix fail-open). Flushed to
+    // BindingLiveState.nat64_no_source_pool.
+    nat64_no_source_pool: u64,
     // #1187: 8 disposition-path counters added to eliminate per-packet
     // MESI thrash on BindingLiveState atomics during DDoS / config-
     // reload windows. See docs/pr/1187-telemetry-double-buffer/plan.md
@@ -525,6 +531,11 @@ impl BatchCounters {
             live.nat64_translations
                 .fetch_add(self.nat64_translations, Ordering::Relaxed);
             self.nat64_translations = 0;
+        }
+        if self.nat64_no_source_pool != 0 {
+            live.nat64_no_source_pool
+                .fetch_add(self.nat64_no_source_pool, Ordering::Relaxed);
+            self.nat64_no_source_pool = 0;
         }
         // #1187 disposition-path counters
         if self.screen_drops != 0 {

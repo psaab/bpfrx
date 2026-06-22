@@ -380,6 +380,12 @@ pub(in crate::afxdp) struct BindingLiveState {
     /// #2161: cumulative NAT64 (v6<->v4) translations on this binding,
     /// surfaced as the `NAT64 translations` operator counter.
     pub(super) nat64_translations: AtomicU64,
+    /// #2291: cumulative fail-closed NAT64 drops — a NAT64 prefix matched but
+    /// no IPv4 source could be allocated (empty/exhausted pool). Surfaced as
+    /// the `NAT64 no-source-pool drops` operator counter; a non-zero value
+    /// flags a misconfigured/exhausted source pool that would otherwise have
+    /// leaked the synthetic IPv6 destination upstream (the pre-fix fail-open).
+    pub(super) nat64_no_source_pool: AtomicU64,
     pub(super) slow_path_packets: AtomicU64,
     pub(super) slow_path_bytes: AtomicU64,
     pub(super) slow_path_local_delivery_packets: AtomicU64,
@@ -759,6 +765,7 @@ impl BindingLiveState {
             snat_packets: AtomicU64::new(0),
             dnat_packets: AtomicU64::new(0),
             nat64_translations: AtomicU64::new(0),
+            nat64_no_source_pool: AtomicU64::new(0),
             slow_path_packets: AtomicU64::new(0),
             slow_path_bytes: AtomicU64::new(0),
             slow_path_local_delivery_packets: AtomicU64::new(0),

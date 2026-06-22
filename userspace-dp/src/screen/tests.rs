@@ -50,6 +50,8 @@ fn tcp_pkt(src: IpAddr, dst: IpAddr, src_port: u16, dst_port: u16, flags: u8) ->
         ip_ihl: 5,
         ip_frag_off: 0,
         ip_total_len: 60,
+        ip_payload_len: 0,
+        frag_data_off: 0,
     }
 }
 
@@ -78,6 +80,8 @@ fn icmp_pkt(src: IpAddr, dst: IpAddr, pkt_len: u16) -> ScreenPacketInfo {
         ip_ihl: 5,
         ip_frag_off: 0,
         ip_total_len: pkt_len,
+        ip_payload_len: 0,
+        frag_data_off: 0,
     }
 }
 
@@ -102,6 +106,8 @@ fn udp_pkt(src: IpAddr, dst: IpAddr) -> ScreenPacketInfo {
         ip_ihl: 5,
         ip_frag_off: 0,
         ip_total_len: 100,
+        ip_payload_len: 0,
+        frag_data_off: 0,
     }
 }
 
@@ -399,6 +405,8 @@ fn ipv4_fragment(
         ip_ihl: 5,
         ip_frag_off: frag_off,
         ip_total_len,
+        ip_payload_len: 0,
+        frag_data_off: 0,
     }
 }
 
@@ -498,6 +506,153 @@ fn normal_ping_passes() {
     assert_eq!(state.check_packet("trust", &pkt, 1), ScreenVerdict::Pass);
 }
 
+/// Build a `ScreenPacketInfo` for an IPv6 fragment the way `extract.rs`
+/// would populate it: `frag_units` is the IPv6 fragment offset in 8-byte
+/// units (top 13 bits of the fragment-header frag_off field), `more`
+/// sets the M bit, `payload_len` is the IPv6 base-header payload-length
+/// field (bytes after the 40-byte fixed header), and `frag_data_off` is
+/// the payload-region bytes consumed by extension headers up to and
+/// including the 8-byte fragment header (8 when the fragment header is
+/// the only/first ext header). Used by the #2293 IPv6 ping-of-death
+/// tests.
+fn ipv6_fragment(
+    src: IpAddr,
+    dst: IpAddr,
+    protocol: u8,
+    frag_units: u16,
+    more: bool,
+    payload_len: u16,
+    frag_data_off: u16,
+) -> ScreenPacketInfo {
+    // IPv6 fragment frag_off field: offset(13) | reserved(2) | M(1).
+    let frag_off = ((frag_units & 0x1FFF) << 3) | (more as u16);
+    let is_first = more && (frag_units & 0x1FFF) == 0;
+    ScreenPacketInfo {
+        addr_family: libc::AF_INET6 as u8,
+        protocol,
+        tcp_flags: 0,
+        src_ip: src,
+        dst_ip: dst,
+        src_port: 0,
+        dst_port: 0,
+        tcp_seq: 0,
+        tcp_ack: 0,
+        tcp_mss: 0,
+        pkt_len: payload_len.saturating_add(40),
+        is_fragment: (frag_off & 0xFFF8) != 0 || more,
+        is_first_fragment: is_first,
+        ip_ihl: 5,
+        ip_frag_off: frag_off,
+        ip_total_len: 0,
+        ip_payload_len: payload_len,
+        frag_data_off,
+    }
+}
+
+#[test]
+fn ping_of_death_v6_oversized_fragment_drops() {
+    // #2293: IPv6 ping-of-death — a fragment whose reassembled
+    // contribution exceeds the 65535-byte IPv6-payload limit must DROP,
+    // mirroring the IPv4 per-fragment formula. Last fragment at offset
+    // 8191 units = 65528 bytes, payload_len=68 with a single 8-byte
+    // fragment header (frag_data_off=8) -> frag_data=60:
+    // 65528 + 60 = 65588 > 65535 -> ping-of-death. Pre-#2293 the v6
+    // family never reached the oversize check (IPv4-only gate).
+    let mut state = make_state("trust", default_profile());
+    let pkt = ipv6_fragment(
+        IpAddr::V6("2001:db8::1".parse::<Ipv6Addr>().unwrap()),
+        IpAddr::V6("2001:db8::2".parse::<Ipv6Addr>().unwrap()),
+        PROTO_ICMPV6,
+        8191, // 8191 * 8 = 65528 bytes
+        false,
+        68, // payload_len; frag_data = 68 - 8 = 60
+        8,
+    );
+    assert_eq!(
+        state.check_packet("trust", &pkt, 1),
+        ScreenVerdict::Drop("ping-of-death")
+    );
+}
+
+#[test]
+fn ping_of_death_v6_oversized_fragment_any_proto_drops() {
+    // #2293: like the IPv4 path, the IPv6 check fires for ANY protocol,
+    // not just ICMPv6. A UDP fragment that overflows the reassembly
+    // ceiling must DROP. (Disable the UDP-flood screen so only
+    // ping-of-death can fire.)
+    let mut profile = default_profile();
+    profile.udp_flood_threshold = 0;
+    let mut state = make_state("trust", profile);
+    let pkt = ipv6_fragment(
+        IpAddr::V6("2001:db8::1".parse::<Ipv6Addr>().unwrap()),
+        IpAddr::V6("2001:db8::2".parse::<Ipv6Addr>().unwrap()),
+        PROTO_UDP,
+        8190, // 8190 * 8 = 65520 bytes
+        false,
+        108, // frag_data = 108 - 8 = 100; 65520 + 100 = 65620 > 65535
+        8,
+    );
+    assert_eq!(
+        state.check_packet("trust", &pkt, 1),
+        ScreenVerdict::Drop("ping-of-death")
+    );
+}
+
+#[test]
+fn ping_of_death_v6_in_bounds_fragment_passes() {
+    // Control: an IPv6 fragment whose offset + data stays within the
+    // 65535 ceiling must NOT be flagged. UDP with udp-flood disabled so
+    // neither icmp-fragment nor a flood screen masks the outcome.
+    let mut profile = default_profile();
+    profile.udp_flood_threshold = 0;
+    let mut state = make_state("trust", profile);
+    let pkt = ipv6_fragment(
+        IpAddr::V6("2001:db8::1".parse::<Ipv6Addr>().unwrap()),
+        IpAddr::V6("2001:db8::2".parse::<Ipv6Addr>().unwrap()),
+        PROTO_UDP,
+        100,   // 100 * 8 = 800 bytes
+        false, // mid-chain fragment
+        1488,  // frag_data = 1488 - 8 = 1480; 800 + 1480 = 2280 <= 65535
+        8,
+    );
+    assert_eq!(state.check_packet("trust", &pkt, 1), ScreenVerdict::Pass);
+}
+
+#[test]
+fn ping_of_death_v6_non_fragment_passes() {
+    // Control: a normal (unfragmented) ICMPv6 echo must NOT be flagged —
+    // the check only applies to fragments.
+    let mut state = make_state("trust", default_profile());
+    let pkt = icmp_pkt(
+        IpAddr::V6("2001:db8::1".parse::<Ipv6Addr>().unwrap()),
+        IpAddr::V6("2001:db8::2".parse::<Ipv6Addr>().unwrap()),
+        84,
+    );
+    assert_eq!(state.check_packet("trust", &pkt, 1), ScreenVerdict::Pass);
+}
+
+#[test]
+fn ping_of_death_v6_disabled_profile_passes() {
+    // Fail-on-revert guard: with ping_death OFF, even an oversize v6
+    // fragment must PASS (the check must be gated on the profile flag,
+    // not always-on). Disable udp-flood so only ping-of-death could
+    // possibly fire.
+    let mut profile = default_profile();
+    profile.ping_death = false;
+    profile.udp_flood_threshold = 0;
+    let mut state = make_state("trust", profile);
+    let pkt = ipv6_fragment(
+        IpAddr::V6("2001:db8::1".parse::<Ipv6Addr>().unwrap()),
+        IpAddr::V6("2001:db8::2".parse::<Ipv6Addr>().unwrap()),
+        PROTO_UDP,
+        8191,
+        false,
+        68,
+        8,
+    );
+    assert_eq!(state.check_packet("trust", &pkt, 1), ScreenVerdict::Pass);
+}
+
 // ================================================================
 // Teardrop
 // ================================================================
@@ -522,6 +677,8 @@ fn teardrop_drops() {
         ip_ihl: 5,
         ip_frag_off: 0x0001 | 0x2000, // offset=1 (non-first frag), MF=1
         ip_total_len: 24,             // 20 byte header + 4 byte payload (< 8)
+        ip_payload_len: 0,
+        frag_data_off: 0,
     };
     assert_eq!(
         state.check_packet("trust", &pkt, 1),
@@ -553,6 +710,8 @@ fn teardrop_first_fragment_passes() {
         ip_ihl: 5,
         ip_frag_off: 0x2000, // offset=0 (first frag), MF=1
         ip_total_len: 24,
+        ip_payload_len: 0,
+        frag_data_off: 0,
     };
     // First fragment (offset=0) — teardrop only triggers on non-first
     // However no_flag check will trigger first since tcp_flags=0
