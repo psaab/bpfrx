@@ -158,6 +158,29 @@ below). Changes touching this path must pass `make test-failover`.
   yet created), the relay retries resolving the interface + giaddr on a
   bounded, `ctx`-cancelable interval instead of dying permanently. The
   interface is re-looked-up every attempt (no stale cached index).
+- **ifindex-drift detection (#2347).** `SO_BINDTODEVICE` pins the client
+  listener to the interface's kernel **ifindex** at `bind(2)`. If the
+  interface is deleted+recreated or renamed at runtime under unchanged config
+  (VLAN delete/recreate, tunnel rebuild, device reset) it gets a NEW ifindex
+  and the kernel stops delivering DHCP client requests to the stale-bound
+  socket — the relay goes permanently **deaf** on that segment until a daemon
+  restart. (Note: the raw-L2 reply path is unaffected — it re-resolves the
+  ifindex per send; only the listener is at risk.) Each per-interface relay is
+  now a **supervisor**: `runRelay` runs one `runRelaySession` under a child
+  context and rebuilds it when the session tears down due to drift.
+  `runRelaySession` captures the live ifindex when it opens the listener and
+  runs a periodic (`ifindexCheckInterval`, 5s) watcher that re-resolves the
+  name to the live ifindex; on a real, differing index it records drift and
+  cancels the **session** context, reusing the existing #1915 close-on-cancel
+  + `WaitGroup` teardown (no new teardown path, no `EADDRINUSE` — the stale
+  socket is fully closed before the rebind, no `Stop()`-hang risk). The probe
+  is **tolerant**: a resolve failure is treated as "no drift" so a transient
+  netlink hiccup or mid-rename window never tears down a working listener, and
+  it is **idempotent** (unchanged ifindex => no rebind). A failed baseline
+  capture (`boundIfindex==0`) adopts the first real reading as the baseline
+  rather than triggering a spurious rebind. Drift detection is per-interface,
+  so a rebind on one segment never drops relays on the others. This mirrors
+  the #2294 VRRP instance-restart-on-ifindex-drift fix for the relay listener.
 
 ## Gotchas
 

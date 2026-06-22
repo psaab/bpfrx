@@ -391,6 +391,11 @@ func testManager(factory packetConnFactory) *Manager {
 		return net.IPv4(10, 0, 0, 254), nil
 	}
 	m.retryInterval = time.Millisecond
+	// Default to a stable ifindex with the #2347 drift watcher effectively off
+	// (a long interval) so pre-existing lifecycle tests see no extra churn.
+	// Drift tests override resolveIfindex + ifindexCheck.
+	m.resolveIfindex = func(ifaceName string) (int, error) { return 100, nil }
+	m.ifindexCheck = time.Hour
 	// Default to a no-op fake L2 sender so lifecycle tests do not depend on
 	// CAP_NET_RAW or a real NIC (#2076). Individual tests override m.newL2.
 	m.newL2 = func(ifaceName string) (l2Replier, error) {
@@ -828,5 +833,197 @@ func TestL2Sender_CloseIdempotent(t *testing.T) {
 	}
 	if err := s.Close(); err != nil {
 		t.Errorf("second Close = %v, want nil (idempotent)", err)
+	}
+}
+
+// --- #2347 ifindex-drift detection ---
+
+// driftResolver returns an ifindexResolver backed by an atomic value (so a test
+// can flip the live ifindex mid-flight) plus an atomic error toggle (so a test
+// can simulate a transient resolve failure). It also counts calls.
+func driftResolver(initial int) (ifindexResolver, *atomic.Int64, *atomic.Bool, *atomic.Int64) {
+	idx := &atomic.Int64{}
+	idx.Store(int64(initial))
+	failing := &atomic.Bool{}
+	calls := &atomic.Int64{}
+	r := func(ifaceName string) (int, error) {
+		calls.Add(1)
+		if failing.Load() {
+			return 0, errors.New("transient resolve failure")
+		}
+		return int(idx.Load()), nil
+	}
+	return r, idx, failing, calls
+}
+
+// TestRunRelay_IfindexDrift_RebindsListener proves the #2347 fix: when the
+// interface's live ifindex changes under unchanged config, the relay tears down
+// the stale-bound session and rebinds a fresh client listener to the new
+// ifindex. Asserted by construction via the factory call count: the first
+// session opens 2 conns (client+server); after drift the supervisor rebuilds,
+// opening 2 more — 4 total — and the rebuilt client listener still carries the
+// SO_BINDTODEVICE ifaceName invariant.
+func TestRunRelay_IfindexDrift_RebindsListener(t *testing.T) {
+	factory, getCalls := recordingFactory()
+	m := testManager(factory)
+	defer m.Stop()
+
+	resolve, liveIdx, _, _ := driftResolver(100)
+	m.resolveIfindex = resolve
+	m.ifindexCheck = 5 * time.Millisecond
+
+	m.Apply(context.Background(), singleInterfaceConfig())
+	waitRelays(t, m, 1, 2*time.Second)
+	waitCalls(t, getCalls, 2, 2*time.Second) // gen-1 client + server
+
+	// Interface deleted+recreated -> new kernel ifindex.
+	liveIdx.Store(200)
+
+	// The drift watcher must cancel the session and the supervisor must rebuild,
+	// producing 2 more factory calls (gen-2 client + server).
+	calls := waitCalls(t, getCalls, 4, 2*time.Second)
+
+	// The rebound client listener (a :67 call after the first two) must keep the
+	// per-interface SO_BINDTODEVICE ifaceName.
+	clientListeners := 0
+	for _, c := range calls {
+		if c.bindAddr.Port == relayPort {
+			clientListeners++
+			if c.ifaceName != "ge-0-0-0" {
+				t.Errorf("rebound client listener lost BINDTODEVICE ifaceName: %+v", c)
+			}
+		}
+	}
+	if clientListeners < 2 {
+		t.Errorf("expected >=2 client listeners (original + rebind), got %d", clientListeners)
+	}
+}
+
+// TestRunRelay_IfindexStable_NoRebind proves idempotency: with the live ifindex
+// never changing, the drift watcher fires repeatedly but never restarts the
+// session. The factory is called exactly twice (one session) for the lifetime.
+func TestRunRelay_IfindexStable_NoRebind(t *testing.T) {
+	factory, getCalls := recordingFactory()
+	m := testManager(factory)
+	defer m.Stop()
+
+	resolve, _, _, calls := driftResolver(100)
+	m.resolveIfindex = resolve
+	m.ifindexCheck = 2 * time.Millisecond
+
+	m.Apply(context.Background(), singleInterfaceConfig())
+	waitRelays(t, m, 1, 2*time.Second)
+	waitCalls(t, getCalls, 2, 2*time.Second)
+
+	// Let the watcher tick many times against a stable ifindex.
+	deadline := time.Now().Add(200 * time.Millisecond)
+	for time.Now().Before(deadline) && calls.Load() < 10 {
+		time.Sleep(2 * time.Millisecond)
+	}
+	if calls.Load() < 5 {
+		t.Fatalf("drift watcher did not run enough to be meaningful (%d resolves)", calls.Load())
+	}
+
+	// No rebind: still exactly the original 2 factory calls.
+	if got := len(getCalls()); got != 2 {
+		t.Errorf("stable ifindex must NOT rebind: got %d factory calls, want 2", got)
+	}
+}
+
+// TestRunRelay_IfindexResolveFailure_KeepsListener proves the tolerant-resolve
+// invariant: a transient ifindex resolve failure must NOT tear down a working
+// listener (no rebind, no socket close), mirroring #2294's tolerant probe.
+func TestRunRelay_IfindexResolveFailure_KeepsListener(t *testing.T) {
+	client := newFakeConn()
+	server := newFakeConn()
+	factory, getCalls := recordingFactory(client, server)
+	m := testManager(factory)
+	defer m.Stop()
+
+	resolve, _, failing, calls := driftResolver(100)
+	m.resolveIfindex = resolve
+	m.ifindexCheck = 2 * time.Millisecond
+
+	m.Apply(context.Background(), singleInterfaceConfig())
+	waitRelays(t, m, 1, 2*time.Second)
+	waitCalls(t, getCalls, 2, 2*time.Second)
+
+	// Resolver now fails on every tick.
+	failing.Store(true)
+
+	// Let it fail many times.
+	deadline := time.Now().Add(200 * time.Millisecond)
+	base := calls.Load()
+	for time.Now().Before(deadline) && calls.Load() < base+10 {
+		time.Sleep(2 * time.Millisecond)
+	}
+
+	// The working session must be intact: no rebind (still 2 factory calls) and
+	// the gen-1 conns must NOT be closed.
+	if got := len(getCalls()); got != 2 {
+		t.Errorf("resolve failure must NOT rebind: got %d factory calls, want 2", got)
+	}
+	if client.isClosed() || server.isClosed() {
+		t.Error("resolve failure must NOT tear down the working listener")
+	}
+}
+
+// TestRunRelay_IfindexDrift_StopStillBounded proves a #1915 non-regression: even
+// after a drift rebind, Stop() returns under a bounded timeout (the supervisor
+// observes ctx cancellation and the close-on-cancel + WaitGroup join still
+// unblock the rebuilt session's blocking ReadFrom).
+func TestRunRelay_IfindexDrift_StopStillBounded(t *testing.T) {
+	factory, getCalls := recordingFactory()
+	m := testManager(factory)
+
+	resolve, liveIdx, _, _ := driftResolver(100)
+	m.resolveIfindex = resolve
+	m.ifindexCheck = 5 * time.Millisecond
+
+	m.Apply(context.Background(), singleInterfaceConfig())
+	waitRelays(t, m, 1, 2*time.Second)
+	waitCalls(t, getCalls, 2, 2*time.Second)
+
+	liveIdx.Store(200) // force a rebind
+	waitCalls(t, getCalls, 4, 2*time.Second)
+
+	done := make(chan struct{})
+	go func() { m.Stop(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Stop() after ifindex-drift rebind did not return within 2s (#1915 regression)")
+	}
+}
+
+// TestRunRelay_DegradedBaseline_AdoptsFirstRealIfindex proves that a failed
+// baseline capture at bind (boundIfindex==0) does NOT cause a spurious rebind:
+// the first real resolve is adopted as the baseline, and only a subsequent
+// change triggers a rebind.
+func TestRunRelay_DegradedBaseline_AdoptsFirstRealIfindex(t *testing.T) {
+	factory, getCalls := recordingFactory()
+	m := testManager(factory)
+	defer m.Stop()
+
+	// First resolve (the bind-time baseline capture) fails; later resolves
+	// return a stable real index.
+	var first atomic.Bool
+	first.Store(true)
+	m.resolveIfindex = func(ifaceName string) (int, error) {
+		if first.Swap(false) {
+			return 0, errors.New("baseline capture failed")
+		}
+		return 300, nil
+	}
+	m.ifindexCheck = 2 * time.Millisecond
+
+	m.Apply(context.Background(), singleInterfaceConfig())
+	waitRelays(t, m, 1, 2*time.Second)
+	waitCalls(t, getCalls, 2, 2*time.Second)
+
+	// Watcher adopts 300 as baseline then sees 300 forever -> no rebind.
+	time.Sleep(150 * time.Millisecond)
+	if got := len(getCalls()); got != 2 {
+		t.Errorf("degraded baseline must adopt first real ifindex, not rebind: got %d calls, want 2", got)
 	}
 }

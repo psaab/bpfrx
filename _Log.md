@@ -1,5 +1,36 @@
 # Action Log
 
+## 2026-06-22 — #2347 DHCP-relay ifindex-drift listener rebind
+
+- **Timestamp**: 2026-06-22 PDT
+- **Action**: Fixed the HIGH availability gap (sibling of #2294, for the relay
+  listener) where the DHCP relay's per-interface client listener stays bound to
+  a STALE kernel ifindex after the interface is deleted+recreated/renamed under
+  unchanged config. `SO_BINDTODEVICE` pins the listener to the ifindex at
+  `bind(2)`; on drift the kernel stops delivering DHCP requests and the relay
+  goes permanently DEAF until daemon restart. The relay had no periodic
+  reconcile (only `Apply`-on-config at boot), so rather than wire the HA-only
+  daemon loop I made each per-interface relay a self-contained SUPERVISOR:
+  `runRelay` now runs one `runRelaySession` under a child context and rebuilds
+  it on drift. `runRelaySession` captures the live ifindex at listener open and
+  runs a periodic (5s, `ifindexCheckInterval`) tolerant `name→ifindex` watcher;
+  on a real differing index it records drift and cancels the SESSION context,
+  reusing the existing #1915 close-on-cancel + WaitGroup teardown (no new
+  teardown path, no EADDRINUSE, no Stop()-hang). Tolerant (resolve failure =
+  no drift), idempotent (unchanged index = no rebind), degraded-baseline-safe
+  (failed capture adopts the first real reading), per-interface (a rebind never
+  drops other segments). Added `resolveIfindex` (ifindexResolver) +
+  `ifindexCheck` seams + `defaultIfindexResolver`. Mirrors the #2294 VRRP fix.
+- **File(s)**: pkg/dhcprelay/relay.go, pkg/dhcprelay/relay_test.go,
+  pkg/dhcprelay/README.md, _Log.md
+- **Validation**: `go build ./...` clean; `go test ./pkg/dhcprelay/...
+  ./pkg/daemon/...` green; 5 new fail-on-revert tests
+  (TestRunRelay_IfindexDrift_RebindsListener / _IfindexStable_NoRebind /
+  _IfindexResolveFailure_KeepsListener / _IfindexDrift_StopStillBounded /
+  TestRunRelay_DegradedBaseline_AdoptsFirstRealIfindex) green 5x under -race;
+  `go test -race ./pkg/dhcprelay/` clean. Live relay-ifindex-change
+  verification is lab-bound (deferred — code + unit tests are the deliverable).
+
 ## 2026-06-22 — #2294 VRRP ifindex-drift restart (rebind on stale socket)
 
 - **Timestamp**: 2026-06-22 PDT

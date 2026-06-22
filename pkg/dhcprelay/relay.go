@@ -35,6 +35,19 @@ const clientPort = 68
 // retry loop is ctx-cancelable so Stop() unwinds it promptly.
 const startupRetryInterval = 5 * time.Second
 
+// ifindexCheckInterval is how often a running relay re-resolves its interface
+// name to the live kernel ifindex and compares it against the ifindex its
+// client listener was SO_BINDTODEVICE-bound to at socket creation (#2347). The
+// listener socket pins to the interface's ifindex at bind(2); if the interface
+// is deleted+recreated or renamed under unchanged config it gets a NEW ifindex
+// and the kernel stops delivering DHCP client requests to the stale-bound
+// listener (the relay goes deaf on that segment). On drift the relay tears down
+// the current session and rebinds to the new ifindex. This mirrors the #2294
+// VRRP reconcile probe. 5s matches the VRRP/daemon reconcile cadence closely
+// enough to bound the deaf window without a tight netlink loop; the resolve is
+// a cheap name->ifindex lookup and idempotent (unchanged ifindex => no action).
+const ifindexCheckInterval = 5 * time.Second
+
 // option82 is the DHCP Relay Agent Information option (RFC 3046).
 const option82 = dhcpv4.OptionRelayAgentInformation
 
@@ -111,6 +124,15 @@ type packetConnFactory func(ctx context.Context, ifaceName string,
 // not-yet-addressed one. It is a seam so the retry behavior is testable.
 type ifaceResolver func(ifaceName string) (net.IP, error)
 
+// ifindexResolver resolves an interface name to its current kernel ifindex
+// (#2347). It is a separate seam from ifaceResolver so the drift detector can
+// observe ifindex churn independently of giaddr addressing, and so lifecycle
+// tests can drive an ifindex change without root/netlink. A non-nil error means
+// "unresolvable right now" — the caller MUST treat that as "no drift" and keep
+// the existing listener (a transient netlink hiccup or a mid-rename window must
+// NOT tear down a working relay), mirroring the tolerant #2294 VRRP probe.
+type ifindexResolver func(ifaceName string) (int, error)
+
 // Manager manages per-interface DHCP relay goroutines.
 type Manager struct {
 	mu     sync.Mutex
@@ -120,6 +142,12 @@ type Manager struct {
 	newConn       packetConnFactory
 	resolveGIAddr ifaceResolver
 	retryInterval time.Duration
+
+	// resolveIfindex resolves the interface name to its live kernel ifindex for
+	// the #2347 drift detector; ifindexCheck is how often runRelay re-checks.
+	// Both are seams so lifecycle tests drive a deterministic ifindex change.
+	resolveIfindex ifindexResolver
+	ifindexCheck   time.Duration
 	// newL2 opens the raw-L2 unicast sender for an interface (#2076). It is
 	// a seam so tests can inject a fake or force open failure. The default
 	// returns (nil, err) → fail-soft to the broadcast path; the production
@@ -135,11 +163,13 @@ type l2SenderFactory func(ifaceName string) (l2Replier, error)
 // NewManager creates a new DHCP relay Manager.
 func NewManager() *Manager {
 	return &Manager{
-		relays:        make(map[string]*interfaceRelay),
-		newConn:       defaultPacketConnFactory,
-		resolveGIAddr: defaultIfaceResolver,
-		retryInterval: startupRetryInterval,
-		newL2:         defaultL2SenderFactory,
+		relays:         make(map[string]*interfaceRelay),
+		newConn:        defaultPacketConnFactory,
+		resolveGIAddr:  defaultIfaceResolver,
+		retryInterval:  startupRetryInterval,
+		resolveIfindex: defaultIfindexResolver,
+		ifindexCheck:   ifindexCheckInterval,
+		newL2:          defaultL2SenderFactory,
 	}
 }
 
@@ -199,6 +229,18 @@ func defaultIfaceResolver(ifaceName string) (net.IP, error) {
 		return nil, fmt.Errorf("interface lookup: %w", err)
 	}
 	return interfaceIPv4(iface)
+}
+
+// defaultIfindexResolver resolves an interface name to its live kernel ifindex
+// (#2347). It deliberately does NOT require an address (unlike
+// defaultIfaceResolver): ifindex drift must be observable even during a window
+// where the recreated interface has not yet been re-addressed.
+func defaultIfindexResolver(ifaceName string) (int, error) {
+	iface, err := net.InterfaceByName(ifaceName)
+	if err != nil {
+		return 0, fmt.Errorf("interface lookup: %w", err)
+	}
+	return iface.Index, nil
 }
 
 // Apply starts relay goroutines according to the provided configuration.
@@ -308,13 +350,55 @@ func (m *Manager) Stop() {
 	}
 }
 
-// runRelay is the main loop for a single interface relay. It resolves the
-// interface giaddr (with bounded ctx-cancelable retry for boot races), opens a
-// client-facing listener on 0.0.0.0:67 bound to the interface and a server
-// conn bound to giaddr, then relays client requests to the configured servers
-// and forwards server responses back to clients.
+// runRelay is the per-interface supervisor. It runs one relay SESSION (resolve
+// giaddr, open listener + server conn + raw-L2 sender, relay packets) under a
+// child context, and rebuilds the session when it exits because the interface's
+// kernel ifindex drifted away from the ifindex the client listener was bound to
+// (#2347). It returns only when the manager context is cancelled (Stop()), at
+// which point ir.done closes and Stop()'s join completes.
 //
-// Lifecycle invariants (see docs/research/1915-relay-socket-lifecycle/plan.md):
+// Why a supervisor loop: the client listener binds SO_BINDTODEVICE once at
+// bind(2), pinning it to the interface's then-current ifindex. If the interface
+// is deleted+recreated/renamed under unchanged config the kernel stops
+// delivering to the stale-bound socket and the relay goes permanently deaf
+// until daemon restart. Detecting drift and rebinding restores delivery without
+// dropping relays on other interfaces (each interface has its own supervisor).
+// This mirrors the #2294 VRRP instance-restart-on-ifindex-drift fix.
+func (m *Manager) runRelay(ctx context.Context, cancel context.CancelFunc,
+	ir *interfaceRelay, servers []*net.UDPAddr) {
+	// cancel is the manager-level cancel for this interface (invoked by Stop()).
+	// We do not need it here beyond observing ctx.Done(); keep the signature
+	// stable for Apply's call site.
+	_ = cancel
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		// runRelaySession returns drift=true ONLY when it tore down because the
+		// live ifindex moved; in that case rebuild immediately (rebind to the
+		// new ifindex). Any other return (Stop/one-sided exit/listen failure)
+		// is terminal for this supervisor unless the manager ctx is still live
+		// AND the cause was not drift — in which case we fall through to the
+		// ctx.Err() guard at the top and exit.
+		drift := m.runRelaySession(ctx, ir, servers)
+		if !drift {
+			return
+		}
+		if ctx.Err() != nil {
+			return
+		}
+		slog.Info("dhcp-relay: interface ifindex changed, rebinding listener",
+			"interface", ir.ifaceName)
+	}
+}
+
+// runRelaySession runs a single relay session and returns drift=true iff it tore
+// down because the interface's live ifindex differs from the ifindex the client
+// listener was bound to (#2347). On any other exit (Stop, one-sided socket
+// close, fatal listen failure) it returns drift=false and the supervisor exits.
+//
+// Lifecycle invariants (see docs/research/1915-relay-socket-lifecycle/plan.md),
+// preserved intact under a per-session child context:
 //   - Both conns are net.PacketConn (ReadFrom/WriteTo) — no *net.UDPConn
 //     assertion — which keeps the factory mockable.
 //   - A close-on-cancel watcher is started LAST (after both conns exist) and
@@ -322,39 +406,67 @@ func (m *Manager) Stop() {
 //   - Both loops cancel the shared ctx on exit BEFORE the runner joins, so a
 //     one-sided exit cannot hang wg.Wait(). The main loop runs in an inner
 //     func whose `defer cancel()` fires before the outer wg.Wait().
-func (m *Manager) runRelay(ctx context.Context, cancel context.CancelFunc,
-	ir *interfaceRelay, servers []*net.UDPAddr) {
+//   - The #2347 drift watcher cancels this SAME session ctx, so a drift teardown
+//     reuses the existing close-on-cancel + WaitGroup join — no new teardown
+//     path, no EADDRINUSE (the old socket is fully closed before rebind), no
+//     Stop()-hang risk.
+func (m *Manager) runRelaySession(ctx context.Context,
+	ir *interfaceRelay, servers []*net.UDPAddr) (drift bool) {
 	ifaceName := ir.ifaceName
+
+	// Per-session context. Either the manager ctx (Stop), a loop's exit
+	// (cross-cancel), or the drift watcher cancels it.
+	sctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	// driftDetected is set by the watcher under no lock other than its own
+	// happens-before with wg.Wait(): the watcher writes it then the session
+	// returns after wg.Wait() joins the watcher, so the read below is safe.
+	var driftDetected atomic.Bool
 
 	// Axis C1: resolve giaddr with bounded, ctx-cancelable retry. Re-resolve
 	// the interface every attempt so a dynamic interface recreated under the
 	// same name (new Index) is picked up, and so a not-yet-created interface
 	// does not permanently kill the relay.
-	giaddr, ok := m.resolveGIAddrWithRetry(ctx, ifaceName)
+	giaddr, ok := m.resolveGIAddrWithRetry(sctx, ifaceName)
 	if !ok {
-		return // ctx cancelled during retry; nothing created yet.
+		return false // ctx cancelled during retry; nothing created yet.
+	}
+
+	// #2347: capture the interface's live ifindex at the moment we open the
+	// client listener. SO_BINDTODEVICE inside the factory binds the socket to
+	// this ifindex; the drift watcher compares against this baseline. A resolve
+	// failure here is non-fatal — we proceed with boundIfindex=0 (an impossible
+	// real ifindex) so the FIRST successful watcher resolve that returns a real
+	// index is NOT mistaken for drift; the watcher only fires when it can read a
+	// real index that differs from a real captured baseline.
+	boundIfindex, ierr := m.resolveIfindex(ifaceName)
+	if ierr != nil {
+		slog.Warn("dhcp-relay: could not capture bound ifindex (drift detection degraded)",
+			"interface", ifaceName, "err", ierr)
+		boundIfindex = 0
 	}
 
 	// Client-facing listener: 0.0.0.0:67, REUSEPORT (coexist with other
 	// interfaces), SO_BINDTODEVICE (per-interface isolation under REUSEPORT),
 	// SO_BROADCAST (deliver broadcast OFFER/ACK to 255.255.255.255:68).
-	conn, err := m.newConn(ctx, ifaceName, true, true,
+	conn, err := m.newConn(sctx, ifaceName, true, true,
 		&net.UDPAddr{IP: net.IPv4zero, Port: relayPort})
 	if err != nil {
 		slog.Error("dhcp-relay: listen failed",
 			"interface", ifaceName, "err", err)
-		return
+		return false
 	}
 	defer conn.Close()
 
 	// Server conn: bound to giaddr ephemeral port. No REUSEPORT, no
 	// BINDTODEVICE (unique port), no broadcast.
-	serverConn, err := m.newConn(ctx, "", false, false,
+	serverConn, err := m.newConn(sctx, "", false, false,
 		&net.UDPAddr{IP: giaddr, Port: 0})
 	if err != nil {
 		slog.Error("dhcp-relay: server conn failed",
 			"interface", ifaceName, "err", err)
-		return
+		return false
 	}
 	defer serverConn.Close()
 
@@ -385,13 +497,13 @@ func (m *Manager) runRelay(ctx context.Context, cancel context.CancelFunc,
 	}()
 
 	slog.Info("dhcp-relay: listening",
-		"interface", ifaceName, "giaddr", giaddr,
+		"interface", ifaceName, "giaddr", giaddr, "ifindex", boundIfindex,
 		"always_broadcast", ir.alwaysBroadcast, "raw_l2", l2 != nil)
 
 	// Both the cancel watcher and the server-response goroutine are tracked by
 	// the WaitGroup so the runner's wg.Wait() is a true join of every spawned
-	// goroutine — runRelay does not return (and ir.done does not close) until
-	// the watcher's two Close() calls have completed.
+	// goroutine — runRelaySession does not return until the watcher's two
+	// Close() calls have completed.
 	var wg sync.WaitGroup
 
 	// Cancel watcher — started LAST, after BOTH conns exist. Closing both is
@@ -400,10 +512,57 @@ func (m *Manager) runRelay(ctx context.Context, cancel context.CancelFunc,
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		<-ctx.Done()
+		<-sctx.Done()
 		_ = conn.Close()
 		_ = serverConn.Close()
 	}()
+
+	// #2347 ifindex-drift watcher. Periodically re-resolve the interface name
+	// to its live ifindex and compare against the baseline captured at bind. On
+	// a real, differing index it records drift and cancels THIS session ctx,
+	// which trips the close-on-cancel watcher above (clean teardown) and makes
+	// runRelay rebuild bound to the new ifindex. A resolve FAILURE is treated
+	// as "no drift" (tolerant) so a transient netlink hiccup / mid-rename window
+	// never tears down a working listener. Disabled when ifindexCheck<=0 or no
+	// resolver, and a degraded baseline (boundIfindex==0) means we only treat a
+	// later real index as drift if the baseline was real — see the guard below.
+	if m.ifindexCheck > 0 && m.resolveIfindex != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ticker := time.NewTicker(m.ifindexCheck)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-sctx.Done():
+					return
+				case <-ticker.C:
+					live, lerr := m.resolveIfindex(ifaceName)
+					if lerr != nil {
+						// Tolerant: keep the listener; this is not drift.
+						slog.Debug("dhcp-relay: ifindex re-resolve failed, keeping listener",
+							"interface", ifaceName, "err", lerr)
+						continue
+					}
+					// Only a real baseline can be compared. boundIfindex==0
+					// (degraded capture) adopts the first real reading as the
+					// baseline rather than treating it as drift.
+					if boundIfindex == 0 {
+						boundIfindex = live
+						continue
+					}
+					if live != boundIfindex {
+						slog.Info("dhcp-relay: detected ifindex drift",
+							"interface", ifaceName,
+							"old_ifindex", boundIfindex, "new_ifindex", live)
+						driftDetected.Store(true)
+						cancel()
+						return
+					}
+				}
+			}
+		}()
+	}
 
 	// Track the server-response goroutine so the runner joins it. Its exit
 	// cancels the shared ctx (cross-cancellation) so the watcher closes both
@@ -412,7 +571,7 @@ func (m *Manager) runRelay(ctx context.Context, cancel context.CancelFunc,
 	go func() {
 		defer wg.Done()
 		defer cancel()
-		handleServerResponses(ctx, serverConn, conn, ir, l2, giaddr)
+		handleServerResponses(sctx, serverConn, conn, ir, l2, giaddr)
 	}()
 
 	// Main read loop in its OWN func scope so its `defer cancel()` fires on
@@ -427,8 +586,8 @@ func (m *Manager) runRelay(ctx context.Context, cancel context.CancelFunc,
 				// Exit ONLY on cancel or socket-close; a transient read error
 				// is logged and the loop continues (a single bad datagram must
 				// not kill the relay). Returning on ErrClosed too prevents a
-				// hot-spin if the socket is closed while ctx.Err() is still nil.
-				if ctx.Err() != nil || errors.Is(err, net.ErrClosed) {
+				// hot-spin if the socket is closed while sctx.Err() is still nil.
+				if sctx.Err() != nil || errors.Is(err, net.ErrClosed) {
 					return
 				}
 				slog.Warn("dhcp-relay: read error",
@@ -493,6 +652,10 @@ func (m *Manager) runRelay(ctx context.Context, cancel context.CancelFunc,
 	// Safe now: the inner func's defer cancel() has fired, so the watcher has
 	// closed both conns and the response goroutine's ReadFrom is unblocked.
 	wg.Wait()
+
+	// The drift watcher (joined above) is the only writer of driftDetected; its
+	// store happens-before this read through wg.Wait().
+	return driftDetected.Load()
 }
 
 // resolveGIAddrWithRetry resolves the interface giaddr, retrying on a bounded
