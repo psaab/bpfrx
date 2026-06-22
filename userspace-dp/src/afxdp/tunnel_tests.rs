@@ -379,6 +379,205 @@ fn inner_tos_byte_reads_ipv4_and_ipv6() {
     );
 }
 
+// --- #2315 RFC 6040 §4.2 decap-side ECN combine -----------------------
+
+use super::super::gre::{
+    apply_decap_ecn_combine, decap_ecn_combine, DecapEcn, GRE_DECAP_ECN_ILLEGAL_DROPS,
+};
+
+// 2-bit ECN codepoints (low 2 bits of the DiffServ octet).
+const NOT_ECT: u8 = 0b00;
+const ECT_1: u8 = 0b01;
+const ECT_0: u8 = 0b10;
+const CE: u8 = 0b11;
+
+#[test]
+fn rfc6040_combine_table_is_exact() {
+    // The full 4×4 RFC 6040 §4.2 decapsulation table. Rows = arriving
+    // inner ECN; columns = arriving outer ECN. Every cell is asserted
+    // so a future edit that flips one entry fails here.
+    use DecapEcn::*;
+    let table: [[(u8, DecapEcn); 4]; 4] = [
+        // inner Not-ECT: outer CE is the illegal combo (Drop); else Keep.
+        [
+            (NOT_ECT, Keep),
+            (ECT_0, Keep),
+            (ECT_1, Keep),
+            (CE, Drop),
+        ],
+        // inner ECT(0): outer CE → SetCe; outer ECT(1) → Keep (MAY,
+        // compliant); else Keep.
+        [
+            (NOT_ECT, Keep),
+            (ECT_0, Keep),
+            (ECT_1, Keep),
+            (CE, SetCe),
+        ],
+        // inner ECT(1): outer CE → SetCe; else Keep.
+        [
+            (NOT_ECT, Keep),
+            (ECT_0, Keep),
+            (ECT_1, Keep),
+            (CE, SetCe),
+        ],
+        // inner CE: already the strongest signal — always Keep.
+        [(NOT_ECT, Keep), (ECT_0, Keep), (ECT_1, Keep), (CE, Keep)],
+    ];
+    let inner_codes = [NOT_ECT, ECT_0, ECT_1, CE];
+    for (row, inner) in inner_codes.iter().enumerate() {
+        for (outer, expect) in table[row].iter() {
+            assert_eq!(
+                decap_ecn_combine(*inner, *outer),
+                *expect,
+                "RFC 6040 §4.2 cell inner={inner:#04b} outer={outer:#04b} \
+                 must be {expect:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn rfc6040_combine_masks_high_bits() {
+    // High DSCP bits in the byte must not leak into the ECN decision —
+    // only the low 2 bits matter.
+    assert_eq!(
+        decap_ecn_combine(0xFC | ECT_0, 0xFC | CE),
+        DecapEcn::SetCe,
+        "DSCP bits must be masked off before the combine"
+    );
+    assert_eq!(
+        decap_ecn_combine(0xFC | NOT_ECT, 0xFC | CE),
+        DecapEcn::Drop,
+        "DSCP bits must not turn the illegal combo into a keep"
+    );
+}
+
+/// Validate an IPv4 header checksum: the one's-complement sum over the
+/// 20-byte header (including the checksum field) must be 0xFFFF.
+fn ipv4_header_checksum_ok(packet: &[u8]) -> bool {
+    let ihl = usize::from(packet[0] & 0x0f) * 4;
+    crate::afxdp::frame::checksum16(&packet[..ihl]) == 0
+}
+
+#[test]
+fn apply_decap_combine_sets_ipv4_ce_and_recomputes_checksum() {
+    // Inner IPv4, ECT(0), valid checksum. Outer CE → inner must become
+    // CE and the IPv4 header checksum must stay valid after the TOS
+    // byte changed.
+    let before = GRE_DECAP_ECN_ILLEGAL_DROPS.load(Ordering::Relaxed);
+    let mut inner = inner_ipv4_with_tos((0u8 << 2) | ECT_0); // DSCP 0, ECT(0)
+    // Seed a correct checksum for the starting header.
+    inner[10] = 0;
+    inner[11] = 0;
+    let cs = crate::afxdp::frame::checksum16(&inner[..20]);
+    inner[10..12].copy_from_slice(&cs.to_be_bytes());
+    assert!(ipv4_header_checksum_ok(&inner), "fixture must start valid");
+
+    let forward = apply_decap_ecn_combine(&mut inner, libc::AF_INET as u8, CE);
+    assert!(forward, "ECT inner + outer CE forwards (after CE upgrade)");
+    assert_eq!(inner[1] & 0x03, CE, "inner ECN must be upgraded to CE");
+    assert_eq!(inner[1] >> 2, 0, "inner DSCP must be untouched (was 0)");
+    assert!(
+        ipv4_header_checksum_ok(&inner),
+        "IPv4 header checksum must be recomputed after the TOS change"
+    );
+    assert_eq!(
+        GRE_DECAP_ECN_ILLEGAL_DROPS.load(Ordering::Relaxed),
+        before,
+        "a legal upgrade must not bump the illegal-drop counter"
+    );
+}
+
+#[test]
+fn apply_decap_combine_preserves_dscp_on_ce_upgrade() {
+    // EF (DSCP 46) + ECT(1), outer CE → DSCP stays 46, ECN becomes CE.
+    let mut inner = inner_ipv4_with_tos((46u8 << 2) | ECT_1);
+    inner[10] = 0;
+    inner[11] = 0;
+    let cs = crate::afxdp::frame::checksum16(&inner[..20]);
+    inner[10..12].copy_from_slice(&cs.to_be_bytes());
+
+    assert!(apply_decap_ecn_combine(&mut inner, libc::AF_INET as u8, CE));
+    assert_eq!(inner[1] >> 2, 46, "DSCP (EF) must survive the CE upgrade");
+    assert_eq!(inner[1] & 0x03, CE);
+    assert!(ipv4_header_checksum_ok(&inner));
+}
+
+#[test]
+fn apply_decap_combine_drops_illegal_ipv4_combo_and_counts() {
+    // Inner Not-ECT + outer CE → drop + counter bump.
+    let before = GRE_DECAP_ECN_ILLEGAL_DROPS.load(Ordering::Relaxed);
+    let mut inner = inner_ipv4_with_tos((34u8 << 2) | NOT_ECT); // AF41, Not-ECT
+    let forward = apply_decap_ecn_combine(&mut inner, libc::AF_INET as u8, CE);
+    assert!(!forward, "outer CE over a Not-ECT inner must DROP (§4.2)");
+    assert_eq!(
+        GRE_DECAP_ECN_ILLEGAL_DROPS.load(Ordering::Relaxed),
+        before + 1,
+        "the illegal-combo drop must bump the counter"
+    );
+}
+
+#[test]
+fn apply_decap_combine_keeps_inner_when_outer_not_congested() {
+    // Outer Not-ECT must never touch the inner (no checksum change, no
+    // ECN change), even for an ECN-capable inner.
+    let mut inner = inner_ipv4_with_tos((10u8 << 2) | ECT_0);
+    inner[10] = 0;
+    inner[11] = 0;
+    let cs = crate::afxdp::frame::checksum16(&inner[..20]);
+    inner[10..12].copy_from_slice(&cs.to_be_bytes());
+    let snapshot = inner.clone();
+
+    assert!(apply_decap_ecn_combine(&mut inner, libc::AF_INET as u8, NOT_ECT));
+    assert_eq!(
+        inner, snapshot,
+        "outer Not-ECT must leave the inner byte-for-byte unchanged"
+    );
+}
+
+#[test]
+fn apply_decap_combine_sets_ipv6_ce_without_checksum() {
+    // Inner IPv6 with DSCP 0 + ECT(0). The Traffic Class spans the low
+    // nibble of octet 0 and the high nibble of octet 1; ECN is the low 2
+    // bits of TC = bits 4-5 of octet 1. Start: version 6 + TC high
+    // nibble 0 (octet0 = 0x60); ECN(ECT0) in octet1 high nibble
+    // (octet1 = ECT_0 << 4 = 0x20).
+    let mut v6 = vec![0u8; 40];
+    v6[0] = 0x60; // version 6, TC high nibble = 0 (DSCP top bits 0)
+    v6[1] = ECT_0 << 4; // ECN = ECT(0) in the high nibble of octet 1
+    let snapshot_octet0 = v6[0];
+
+    assert!(apply_decap_ecn_combine(&mut v6, libc::AF_INET6 as u8, CE));
+    // ECN = (octet1 >> 4) & 0x03 must be CE.
+    assert_eq!((v6[1] >> 4) & 0x03, CE, "inner IPv6 ECN must become CE");
+    assert_eq!(
+        v6[0], snapshot_octet0,
+        "octet 0 (version + DSCP high bits) untouched"
+    );
+}
+
+#[test]
+fn apply_decap_combine_drops_illegal_ipv6_combo_and_counts() {
+    let before = GRE_DECAP_ECN_ILLEGAL_DROPS.load(Ordering::Relaxed);
+    let mut v6 = vec![0u8; 40];
+    v6[0] = 0x60;
+    v6[1] = (NOT_ECT) << 4; // inner Not-ECT
+    assert!(!apply_decap_ecn_combine(&mut v6, libc::AF_INET6 as u8, CE));
+    assert_eq!(
+        GRE_DECAP_ECN_ILLEGAL_DROPS.load(Ordering::Relaxed),
+        before + 1
+    );
+}
+
+#[test]
+fn apply_decap_combine_short_packet_forwards_unchanged() {
+    // Too short to hold the TOS byte: forward, never panic, no counter.
+    let before = GRE_DECAP_ECN_ILLEGAL_DROPS.load(Ordering::Relaxed);
+    let mut tiny = vec![0x45u8]; // 1 byte
+    assert!(apply_decap_ecn_combine(&mut tiny, libc::AF_INET as u8, CE));
+    assert_eq!(GRE_DECAP_ECN_ILLEGAL_DROPS.load(Ordering::Relaxed), before);
+}
+
 // --- #2299 WG SYN MSS clamp uses the WG-overhead formula --------------
 
 #[test]

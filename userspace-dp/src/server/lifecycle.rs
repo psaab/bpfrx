@@ -115,6 +115,7 @@ pub(crate) fn run() -> Result<(), String> {
             dnat_publish_errors_total: 0,
             nat_reverse_key_shared_displacements_total: 0,
             worker_command_queue_poison_recoveries: 0,
+            gre_decap_ecn_illegal_drops_total: 0,
             dynamic_neighbor_keys: Vec::new(),
             neighbor_resolver_queue_depth: 0,
             neighbor_resolver_enqueue_drops_total: 0,

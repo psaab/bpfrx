@@ -233,6 +233,17 @@ pub(crate) struct ProcessStatus {
     /// Additive / defaulted for backward compatibility.
     #[serde(rename = "worker_command_queue_poison_recoveries", default)]
     pub worker_command_queue_poison_recoveries: u64,
+    /// #2315: GRE-decap frames dropped by the RFC 6040 §4.2 decap-side
+    /// ECN combine because the outer header carried a CE mark over an
+    /// inner packet that was Not-ECT (the illegal combination — a
+    /// congested router CE-marked a packet whose endpoints never
+    /// negotiated ECN). RFC 6040 mandates a drop here rather than
+    /// silently clearing the bogus CE. Surfaced as the Prometheus
+    /// counter `xpf_userspace_gre_decap_ecn_illegal_drops_total`;
+    /// nonzero flags a misbehaving tunnel ingress on a congested path.
+    /// Additive / defaulted for backward compatibility.
+    #[serde(rename = "gre_decap_ecn_illegal_drops_total", default)]
+    pub gre_decap_ecn_illegal_drops_total: u64,
     /// #1782 cold-start capture instrumentation. Debug dump of every key
     /// present in the userspace `dynamic_neighbors` mirror, rendered as
     /// `"ifindex ip"` strings. The capture harness greps this at the

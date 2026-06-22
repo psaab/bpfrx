@@ -783,6 +783,15 @@ type ProcessStatus struct {
 	// Omitempty-free on the Rust side (always serialized); plain decode
 	// here defaults to 0 for older helpers.
 	WorkerCommandQueuePoisonRecoveries uint64 `json:"worker_command_queue_poison_recoveries,omitempty"`
+	// #2315: GRE-decap frames dropped by the RFC 6040 §4.2 decap-side ECN
+	// combine because the outer header carried a CE mark over an inner
+	// packet that was Not-ECT (the illegal combination — a congested
+	// router CE-marked a packet whose endpoints never negotiated ECN).
+	// RFC 6040 mandates a drop here rather than silently clearing the
+	// bogus CE. Surfaced as
+	// xpf_userspace_gre_decap_ecn_illegal_drops_total. Omitempty for wire
+	// compat with older helpers (defaults to 0).
+	GreDecapEcnIllegalDropsTotal uint64 `json:"gre_decap_ecn_illegal_drops_total,omitempty"`
 	// #1769: on-demand neighbor-resolver telemetry. The resolver fires
 	// when a MissingNeighbor negative-cache fast-fail nudges a wedged dst
 	// (single-key RTM_GETNEIGH + epoch-guarded cache or probe-on-stale).
