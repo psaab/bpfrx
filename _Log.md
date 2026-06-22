@@ -1,5 +1,32 @@
 # Action Log
 
+## 2026-06-22 — #2321 round 2: bound L4 port read by IP-declared length
+
+- **Timestamp**: 2026-06-22 PDT
+- **Action**: Fold Copilot's follow-up on PR #2322. The round-1 fix made
+  `generated_l4_ports` return `None` when the 4 port bytes were absent, but it
+  bounded the read by the BACKING SLICE length only, not by the IP-declared
+  length (`pkt_len` = IPv4 total_len / IPv6 40+payload_len, each clamped to the
+  slice). A corrupted/short total_len/payload_len that ends BEFORE the L4
+  header while the buffer still has trailing bytes would read those slack bytes
+  and return bogus ports instead of failing closed — exactly what the doc
+  comment claimed it prevented. Now `generated_l4_ports` takes `pkt_len` and
+  returns `None` for TCP/UDP when `rel_l4 + 4 > pkt_len` (read bounded by
+  `min(pkt_len, slice_len)` = `pkt_len`, since `pkt_len <= packet.len()` by
+  construction). Both call sites pass the already-computed `pkt_len`.
+  ICMP/ICMPv6 unchanged (no ports).
+- **File(s)**: userspace-dp/src/afxdp/frame/generated.rs,
+  userspace-dp/src/afxdp/frame/generated_tests.rs, _Log.md
+- **Tests**: added `v4_tcp_declared_len_short_of_ports_fails_closed_none`,
+  `v4_udp_declared_len_short_of_ports_fails_closed_none`,
+  `v6_tcp_declared_len_short_of_ports_fails_closed_none`,
+  `v6_udp_declared_len_short_of_ports_fails_closed_none` — each corrupts
+  total_len/payload_len to end before the L4 header while keeping the full
+  backing buffer (asserts the buffer retains the trailing port bytes), so they
+  FAIL if the bound is reverted to slice-only (verified: 0/4 with the bound
+  neutered). `cargo build --release` clean; `generated` (17 tests) +
+  `cos_classify` green, 5x flake-free.
+
 ## 2026-06-22 — #2321 generated-reply parser fail-closed (§6.2)
 
 - **Timestamp**: 2026-06-22 PDT
