@@ -430,6 +430,35 @@ func twoInterfaceConfig() *config.DHCPRelayConfig {
 	}
 }
 
+// relayConfig builds a single-group relay config from explicit interfaces,
+// server IPs, and the always-broadcast flag — the inputs the #2348 reconcile
+// keys on (interface set + spec). It lets the reconcile tests express
+// add/remove/change directly.
+func relayConfig(servers []string, alwaysBroadcast bool, ifaces ...string) *config.DHCPRelayConfig {
+	return &config.DHCPRelayConfig{
+		ServerGroups: map[string]*config.DHCPRelayServerGroup{
+			"sg": {Name: "sg", Servers: servers},
+		},
+		Groups: map[string]*config.DHCPRelayGroup{
+			"g": {
+				Name:              "g",
+				Interfaces:        ifaces,
+				ActiveServerGroup: "sg",
+				AlwaysBroadcast:   alwaysBroadcast,
+			},
+		},
+	}
+}
+
+// statsIfaces returns the set of interface names with a running relay.
+func statsIfaces(m *Manager) map[string]bool {
+	out := map[string]bool{}
+	for _, s := range m.Stats() {
+		out[s.Interface] = true
+	}
+	return out
+}
+
 // waitRelays blocks until the manager reports n relays or the deadline passes.
 func waitRelays(t *testing.T, m *Manager, n int, d time.Duration) {
 	t.Helper()
@@ -539,7 +568,13 @@ func TestStop_BoundedNoPackets(t *testing.T) {
 
 // TestApply_Reapply_DoesNotHang calls Apply twice; the second Stops gen-1 and
 // must return bounded with gen-1 conns closed.
-func TestApply_Reapply_DoesNotHang(t *testing.T) {
+// TestApply_Reapply_Idempotent proves that re-applying the SAME config does
+// NOT churn a healthy relay (#2348): Apply now diffs desired-vs-running per
+// interface, so an unchanged interface keeps its existing session — the gen-1
+// conns stay OPEN and the factory is not called a second time. (Pre-#2348 Apply
+// tore everything down and rebuilt on every call, dropping every relay even
+// when nothing changed.) The re-Apply must also return promptly (no hang).
+func TestApply_Reapply_Idempotent(t *testing.T) {
 	gen1Client := newFakeConn()
 	gen1Server := newFakeConn()
 	factory, getCalls := recordingFactory(gen1Client, gen1Server)
@@ -556,10 +591,185 @@ func TestApply_Reapply_DoesNotHang(t *testing.T) {
 	select {
 	case <-done:
 	case <-time.After(2 * time.Second):
-		t.Fatal("second Apply() hung — Stop() inside Apply did not return")
+		t.Fatal("second Apply() hung")
+	}
+
+	// No churn: the unchanged relay keeps its gen-1 conns and the factory is
+	// not re-invoked. Give any (erroneous) restart a brief window to manifest.
+	time.Sleep(50 * time.Millisecond)
+	if gen1Client.isClosed() || gen1Server.isClosed() {
+		t.Error("idempotent re-apply must NOT close gen-1 conns (no churn)")
+	}
+	if got := len(getCalls()); got != 2 {
+		t.Errorf("idempotent re-apply must not reopen sockets: factory calls = %d, want 2", got)
+	}
+	if n := len(m.Stats()); n != 1 {
+		t.Errorf("relay count after idempotent re-apply = %d, want 1", n)
+	}
+}
+
+// TestApply_AddInterface_DayTwo proves a relay group added on a day-2 commit
+// starts its listener (#2348): a first Apply with one interface, then a second
+// Apply with two interfaces, must leave the original relay running AND start a
+// listener for the newly added interface. Fails (only one relay) if Apply does
+// not start the added interface.
+func TestApply_AddInterface_DayTwo(t *testing.T) {
+	factory, _ := recordingFactory()
+	m := testManager(factory)
+	defer m.Stop()
+
+	m.Apply(context.Background(), relayConfig([]string{"192.0.2.1"}, false, "ge-0-0-0"))
+	waitRelays(t, m, 1, 2*time.Second)
+
+	m.Apply(context.Background(), relayConfig([]string{"192.0.2.1"}, false, "ge-0-0-0", "ge-0-0-1"))
+	waitRelays(t, m, 2, 2*time.Second)
+
+	ifaces := statsIfaces(m)
+	if !ifaces["ge-0-0-0"] || !ifaces["ge-0-0-1"] {
+		t.Errorf("day-2 add must run both interfaces, got %v", ifaces)
+	}
+}
+
+// TestApply_RemoveInterface_StopsRelay proves a relay whose interface is no
+// longer in the config is stopped on the next Apply (#2348), and that the stop
+// is BOUNDED (reuses the ir.cancel()+<-ir.done teardown — Apply returns
+// promptly even though the removed relay's conns block in ReadFrom). The
+// remaining interface's relay stays up and its conns stay open (no collateral
+// churn).
+func TestApply_RemoveInterface_StopsRelay(t *testing.T) {
+	// Conns are handed out sequentially: iface order in the desired map is
+	// non-deterministic, so use blocking fakes for all four and assert via
+	// Stats() + total-closed accounting rather than a specific conn.
+	factory, _ := recordingFactory()
+	m := testManager(factory)
+	defer m.Stop()
+
+	m.Apply(context.Background(), relayConfig([]string{"192.0.2.1"}, false, "ge-0-0-0", "ge-0-0-1"))
+	waitRelays(t, m, 2, 2*time.Second)
+
+	done := make(chan struct{})
+	go func() {
+		m.Apply(context.Background(), relayConfig([]string{"192.0.2.1"}, false, "ge-0-0-0"))
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Apply removing an interface hung — bounded Stop teardown not reused")
+	}
+
+	// Give the removed relay's teardown a beat, then assert exactly the kept
+	// interface remains.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(m.Stats()) == 1 {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	ifaces := statsIfaces(m)
+	if len(ifaces) != 1 || !ifaces["ge-0-0-0"] {
+		t.Errorf("after removing ge-0-0-1, expected only ge-0-0-0, got %v", ifaces)
+	}
+}
+
+// TestApply_NilConfig_StopsAll proves that applying a nil relay config (the
+// `forwarding-options dhcp-relay` block deleted on a day-2 commit) stops every
+// running relay (#2348). Bounded (the blocking fake conns must not hang Apply).
+func TestApply_NilConfig_StopsAll(t *testing.T) {
+	factory, _ := recordingFactory()
+	m := testManager(factory)
+	defer m.Stop()
+
+	m.Apply(context.Background(), twoInterfaceConfig())
+	waitRelays(t, m, 2, 2*time.Second)
+
+	done := make(chan struct{})
+	go func() { m.Apply(context.Background(), nil); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Apply(nil) hung")
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(m.Stats()) == 0 {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if n := len(m.Stats()); n != 0 {
+		t.Errorf("Apply(nil) must stop all relays, %d still running", n)
+	}
+}
+
+// TestApply_ChangedServers_Restarts proves a group whose server set changed on
+// a day-2 commit is RESTARTED (#2348): the old session is torn down (its conns
+// closed) and a fresh listener is opened. The interface count is unchanged, but
+// the gen-1 conns must be closed (restart) — distinguishing a restart from the
+// idempotent no-churn path.
+func TestApply_ChangedServers_Restarts(t *testing.T) {
+	gen1Client := newFakeConn()
+	gen1Server := newFakeConn()
+	factory, getCalls := recordingFactory(gen1Client, gen1Server)
+	m := testManager(factory)
+	defer m.Stop()
+
+	m.Apply(context.Background(), relayConfig([]string{"192.0.2.1"}, false, "ge-0-0-0"))
+	waitRelays(t, m, 1, 2*time.Second)
+	waitCalls(t, getCalls, 2, 2*time.Second)
+
+	// Change the server set: must restart the relay.
+	m.Apply(context.Background(), relayConfig([]string{"192.0.2.99"}, false, "ge-0-0-0"))
+
+	// The gen-1 conns must close (old session torn down).
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if gen1Client.isClosed() && gen1Server.isClosed() {
+			break
+		}
+		time.Sleep(time.Millisecond)
 	}
 	if !gen1Client.isClosed() || !gen1Server.isClosed() {
-		t.Error("gen-1 conns must be closed after reapply")
+		t.Error("server-set change must tear down the old session (gen-1 conns closed)")
+	}
+	// A fresh listener (2 more factory calls) opens for the new spec, and the
+	// relay stays present.
+	waitCalls(t, getCalls, 4, 2*time.Second)
+	if n := len(m.Stats()); n != 1 {
+		t.Errorf("relay count after server change = %d, want 1", n)
+	}
+}
+
+// TestApply_ChangedBroadcast_Restarts proves a group whose always-broadcast
+// flag flipped is restarted (#2348) — the spec equality must include
+// alwaysBroadcast, not just the server set.
+func TestApply_ChangedBroadcast_Restarts(t *testing.T) {
+	gen1Client := newFakeConn()
+	gen1Server := newFakeConn()
+	factory, getCalls := recordingFactory(gen1Client, gen1Server)
+	m := testManager(factory)
+	defer m.Stop()
+
+	m.Apply(context.Background(), relayConfig([]string{"192.0.2.1"}, false, "ge-0-0-0"))
+	waitRelays(t, m, 1, 2*time.Second)
+	waitCalls(t, getCalls, 2, 2*time.Second)
+
+	m.Apply(context.Background(), relayConfig([]string{"192.0.2.1"}, true, "ge-0-0-0"))
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if gen1Client.isClosed() && gen1Server.isClosed() {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if !gen1Client.isClosed() || !gen1Server.isClosed() {
+		t.Error("always-broadcast flip must restart the relay (gen-1 conns closed)")
+	}
+	waitCalls(t, getCalls, 4, 2*time.Second)
+	if n := len(m.Stats()); n != 1 {
+		t.Errorf("relay count after broadcast flip = %d, want 1", n)
 	}
 }
 
