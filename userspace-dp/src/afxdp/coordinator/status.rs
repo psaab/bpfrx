@@ -181,6 +181,18 @@ impl super::Coordinator {
         crate::afxdp::worker_queue::WORKER_COMMAND_QUEUE_POISON_RECOVERIES.load(Ordering::Relaxed)
     }
 
+    /// #2315: GRE-decap frames dropped by the RFC 6040 §4.2 decap-side
+    /// ECN combine because the outer header carried a CE mark over an
+    /// inner packet that was Not-ECT (the illegal combination — a
+    /// congested router CE-marked a packet whose endpoints never
+    /// negotiated ECN). RFC 6040 mandates a drop here. Surfaced as
+    /// `xpf_userspace_gre_decap_ecn_illegal_drops_total`; a nonzero
+    /// value flags a misbehaving tunnel ingress (it copied ECT onto the
+    /// outer for un-ECN-marked inner traffic) on a congested path.
+    pub fn gre_decap_ecn_illegal_drops_total(&self) -> u64 {
+        crate::afxdp::gre::GRE_DECAP_ECN_ILLEGAL_DROPS.load(Ordering::Relaxed)
+    }
+
     /// #1782: debug dump of every key currently present in the userspace
     /// `dynamic_neighbors` mirror, as `(ifindex, ip)` pairs. The
     /// cold-start capture harness reads this at the pre-connect t0'

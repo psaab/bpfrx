@@ -818,6 +818,19 @@ func newCollector(srv *Server) *xpfCollector {
 				"occurred (#1807, extends #1790).",
 			nil, nil,
 		),
+		userspaceGreDecapEcnIllegalDrops: prometheus.NewDesc(
+			"xpf_userspace_gre_decap_ecn_illegal_drops_total",
+			"GRE-decap frames dropped by the RFC 6040 4.2 decap-side ECN "+
+				"combine because the outer header carried a CE (congestion "+
+				"experienced) mark over an inner packet that was Not-ECT "+
+				"(the illegal combination: a congested router CE-marked a "+
+				"packet whose endpoints never negotiated ECN). RFC 6040 "+
+				"mandates dropping this rather than silently clearing the "+
+				"bogus CE. A nonzero value flags a misbehaving tunnel "+
+				"ingress that ECT-marked the outer for un-ECN inner "+
+				"traffic on a congested path (#2315).",
+			nil, nil,
+		),
 		userspaceFlowCacheActiveFlows: prometheus.NewDesc(
 			"xpf_userspace_flow_cache_active_flows",
 			"Aggregate active userspace flow-cache entries across bindings.",

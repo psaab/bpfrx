@@ -77,6 +77,91 @@
   NoSession/rekey request edges (engine-wide today). Parent runs the
   batched iperf smoke before merge.
 
+## 2026-06-21 — #2238 classify locally-generated replies by their own egress tuple (Path B)
+
+- **Timestamp**: 2026-06-21
+- **Action**: Implemented the converged Path B plan
+  (docs/research/2238-reply-classification/plan.md, r3). Locally-generated
+  control replies (ICMP/ICMPv6 Time Exceeded, policy-`reject` TCP RST /
+  ICMP-unreachable, SYN-cookie SYN-ACK/ACK-RST) are now classified for
+  output firewall filter / CoS forwarding-class / DSCP rewrite by the
+  GENERATED frame's OWN egress 5-tuple + egress interface, not the
+  triggering inbound packet's tuple. New `generated_reply_session_key()`
+  parser (frame/generated.rs) re-parses the built reply bytes into a
+  `(SessionKey, ForwardPacketMeta)`; new `classify_generated_reply()`
+  (tx/cos_classify.rs) runs the runtime-counted output classifier on that
+  tuple. Wired into all three generators (icmp.rs Time Exceeded — threaded
+  through the 3 poll-descriptor call sites, also corrects the egress
+  ifindex to the resolved `target_ifindex`; reject_reply.rs;
+  cookie_reply.rs). §6.2 fail-CLOSED: a parse failure of the generated
+  bytes drops the reply (never leak past an output `discard`) + a dedicated
+  counter. Two-tier counters
+  (time_exceeded/policy_reject/syn_cookie_output_filter_drops +
+  generated_reply_classify_parse_errors) wired BatchCounters ->
+  BindingLiveState -> snapshot -> protocol/binding.rs serde -> Go
+  protocol.go -> operator `show` status. Regenerated
+  protocol_wire_v1.json. Scope-fenced OUT (named follow-ups): output-
+  direction port-mirror of generated replies; embedded-ICMP NAT-reversal
+  sibling.
+- **File(s)**: userspace-dp/src/afxdp/frame/generated.rs,
+  userspace-dp/src/afxdp/frame/generated_tests.rs,
+  userspace-dp/src/afxdp/frame/mod.rs,
+  userspace-dp/src/afxdp/frame/README.md,
+  userspace-dp/src/afxdp/tx/cos_classify.rs,
+  userspace-dp/src/afxdp/tx/cos_classify_tests.rs,
+  userspace-dp/src/afxdp/tx/mod.rs,
+  userspace-dp/src/afxdp/icmp.rs,
+  userspace-dp/src/afxdp/mod.rs,
+  userspace-dp/src/afxdp/poll_descriptor/{mod,reject_reply,cookie_reply,flow_cache_hit}.rs,
+  userspace-dp/src/afxdp/umem/{mod,snapshot}.rs,
+  userspace-dp/src/afxdp/worker/mod.rs,
+  userspace-dp/src/afxdp/coordinator/refresh_bindings.rs,
+  userspace-dp/src/afxdp/tests.rs,
+  userspace-dp/src/protocol/binding.rs,
+  userspace-dp/tests/fixtures/protocol_wire_v1.json,
+  pkg/dataplane/userspace/protocol.go,
+  pkg/dataplane/userspace/format/status.go
+
+## 2026-06-21 — #2315 GRE decap-side RFC 6040 §4.2 ECN combine (+ WG doc-scope)
+
+- **Timestamp**: 2026-06-21 23:30 PDT
+- **Action**: #2315 — implemented the DECAP-side RFC 6040 §4.2 ECN
+  combine for the GRE decap path (the encap-side #2303 only COPIED inner
+  ECN to the outer; the doc over-claimed it was "reflected at decap"
+  with no decap combine present). Added `outer_ecn_bits`,
+  `decap_ecn_combine` (pure §4.2 table → `DecapEcn::{Keep,SetCe,Drop}`),
+  and `apply_decap_ecn_combine` (in-place inner ECN mutate + IPv4
+  inner-header-checksum recompute; IPv6 needs none) in `gre.rs`, wired
+  into `try_native_gre_decap_from_frame`: an outer CE upgrades an
+  ECN-capable inner to CE; the illegal outer-CE/inner-Not-ECT combo is
+  DROPPED (`GRE_DECAP_ECN_ILLEGAL_DROPS` atomic → status →
+  `xpf_userspace_gre_decap_ecn_illegal_drops_total` Prometheus counter).
+  WG decap combine DEFERRED to follow-up #2317 (the control thread reads
+  WG records from a plain `UdpSocket::recv_from`, so the kernel strips
+  the outer IP/ECN before userspace — needs IP_RECVTOS/recvmsg). Scoped
+  the #2303 doc/comment over-claim to encap-copy-only. Tests: full RFC
+  6040 §4.2 table, apply-combine (CE upgrade + checksum validity, DSCP
+  preservation, illegal-combo drop+count, IPv6, short-packet, no-op when
+  outer not congested) + end-to-end GRE-decap CE-propagation/drop/no-op,
+  fail-on-revert, protocol round-trip + wire-fixture regen, Go metric
+  emit/assert. cargo build+test green; `go build ./...` + Go api/dp
+  tests green.
+- **File(s)**: userspace-dp/src/afxdp/gre.rs,
+  userspace-dp/src/afxdp/coordinator/status.rs,
+  userspace-dp/src/afxdp/wg/dscp.rs,
+  userspace-dp/src/protocol/control.rs,
+  userspace-dp/src/protocol/tests.rs,
+  userspace-dp/src/server/lifecycle.rs,
+  userspace-dp/src/server/helpers.rs,
+  userspace-dp/src/afxdp/tunnel_tests.rs,
+  userspace-dp/src/afxdp/frame/tests.rs,
+  userspace-dp/tests/fixtures/protocol_wire_v1.json,
+  pkg/dataplane/userspace/protocol.go, pkg/api/metrics.go,
+  pkg/api/metrics_descriptors.go, pkg/api/metrics_userspace.go,
+  pkg/api/metrics_test.go, pkg/api/metrics_descriptor_coverage_test.go,
+  docs/wireguard-interop.md, docs/pr/2315-wg-gre-decap-ecn/plan.md,
+  _Log.md
+
 ## 2026-06-21 — #2312 io_uring_write follow-ups (test-quality + docs)
 
 - **Timestamp**: 2026-06-21 23:00 PDT

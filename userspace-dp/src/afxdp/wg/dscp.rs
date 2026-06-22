@@ -10,10 +10,19 @@
 //!
 //! NOTE (#2303): the production WG/GRE encap path does NOT use this
 //! helper for outer-header DSCP/ECN. It copies the FULL inner TOS byte
-//! (DSCP + ECN) via `crate::afxdp::gre::inner_tos_byte`, so ECN
-//! propagates per RFC 6040 normal-mode ingress. This helper remains for
-//! the DSCP-only case (a config-set DSCP value with no inner-packet ECN
-//! to carry).
+//! (DSCP + ECN) via `crate::afxdp::gre::inner_tos_byte`, so the inner
+//! ECN is COPIED to the outer per RFC 6040 normal-mode ingress. This
+//! helper remains for the DSCP-only case (a config-set DSCP value with
+//! no inner-packet ECN to carry).
+//!
+//! NOTE (#2315): the complementary DECAP-side RFC 6040 §4.2 ECN
+//! *combine* (outer ECN → inner ECN — the half that reflects a CE mark
+//! back to the inner endpoints) is implemented for the GRE decap path
+//! only (`crate::afxdp::gre::apply_decap_ecn_combine`). The WG decap
+//! path reads transport records from a plain `UdpSocket::recv_from`, so
+//! the kernel strips the outer IP header (and its ECN) before userspace
+//! sees the datagram; the WG decap combine is a tracked follow-up
+//! (#2317) gated on `IP_RECVTOS`/`IPV6_RECVTCLASS` + `recvmsg`.
 
 /// Build the outer IPv4 TOS / IPv6 Traffic Class byte from a
 /// 6-bit DSCP value. ECN bits are cleared (use

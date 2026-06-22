@@ -245,7 +245,12 @@ type xpfCollector struct {
 	// helper worker panic poisoned a command queue and it was recovered
 	// (committed-prefix + clear_poison policy) instead of going deaf.
 	userspaceWorkerCommandQueuePoisonRecoveries *prometheus.Desc
-	userspaceFlowCacheActiveFlows               *prometheus.Desc
+	// #2315: GRE-decap RFC 6040 §4.2 illegal-combination drops (outer CE
+	// over a Not-ECT inner) — nonzero flags a misbehaving tunnel ingress
+	// that ECT-marked the outer for un-ECN inner traffic on a congested
+	// path.
+	userspaceGreDecapEcnIllegalDrops *prometheus.Desc
+	userspaceFlowCacheActiveFlows    *prometheus.Desc
 	userspaceFlowCacheCapacity                  *prometheus.Desc
 	// #1379: daemon-side userspace event-stream transport counters.
 	userspaceEventStreamFramesTotal          *prometheus.Desc
@@ -531,6 +536,7 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.userspaceDnatPublishErrors
 	ch <- c.userspaceNatReverseKeySharedDisplacements
 	ch <- c.userspaceWorkerCommandQueuePoisonRecoveries
+	ch <- c.userspaceGreDecapEcnIllegalDrops
 	ch <- c.userspaceFlowCacheActiveFlows
 	ch <- c.userspaceFlowCacheCapacity
 	ch <- c.userspaceEventStreamFramesTotal

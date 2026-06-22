@@ -565,6 +565,123 @@ fn native_gre_decap_maps_inner_packet_to_logical_tunnel_ingress() {
     assert_eq!(&packet.frame[30..34], &[10, 255, 192, 42]);
 }
 
+/// #2315: build an inner IPv4 ICMP frame, set its TOS byte, and
+/// recompute the inner IPv4 header checksum so it stays valid. The IPv4
+/// header is at inner[14..34]; the TOS byte is inner[15]; the checksum
+/// is inner[24..26].
+fn inner_v4_frame_with_tos(src: Ipv4Addr, dst: Ipv4Addr, ttl: u8, tos: u8) -> Vec<u8> {
+    let mut inner = build_icmp_echo_frame_v4(src, dst, ttl);
+    inner[15] = tos;
+    inner[24] = 0;
+    inner[25] = 0;
+    let cs = checksum16(&inner[14..34]);
+    inner[24..26].copy_from_slice(&cs.to_be_bytes());
+    inner
+}
+
+/// #2315: overwrite the outer IPv6 ECN field (low 2 bits of the Traffic
+/// Class) on a built GRE frame. The IPv6 header starts at frame[14];
+/// TC = (octet0<<4)|(octet1>>4); ECN is bits 4-5 of octet 1.
+fn set_outer_ipv6_ecn(frame: &mut [u8], ecn: u8) {
+    frame[15] = (frame[15] & 0xCF) | ((ecn & 0x03) << 4);
+}
+
+#[test]
+fn native_gre_decap_combines_outer_ce_into_inner_ecn() {
+    // #2315 RFC 6040 §4.2: an outer CE over an ECN-capable inner must
+    // upgrade the inner ECN to CE at decap, and the inner IPv4 header
+    // checksum must remain valid after the TOS change.
+    let state = build_forwarding_state(&native_gre_snapshot(true));
+    // Inner DSCP EF (46) + ECT(0) (0b10).
+    let inner_tos = (46u8 << 2) | 0b10;
+    let inner = inner_v4_frame_with_tos(
+        Ipv4Addr::new(10, 255, 192, 41),
+        Ipv4Addr::new(10, 255, 192, 42),
+        63,
+        inner_tos,
+    );
+    let mut outer = build_ipv6_gre_frame(
+        &inner[14..],
+        "2602:ffd3:0:2::7".parse().unwrap(),
+        "2001:559:8585:80::8".parse().unwrap(),
+        None,
+    );
+    set_outer_ipv6_ecn(&mut outer, 0b11); // outer CE
+
+    let packet = try_native_gre_decap_from_frame(&outer, native_gre_outer_meta(), &state)
+        .expect("decap must forward (legal CE upgrade)");
+    // Inner emerges in the synthetic frame at offset 14 (eth) + 1 (TOS).
+    let inner_tos_out = packet.frame[15];
+    assert_eq!(inner_tos_out & 0x03, 0b11, "inner ECN must be upgraded to CE");
+    assert_eq!(inner_tos_out >> 2, 46, "inner DSCP (EF) must be preserved");
+    // Fail-on-revert: the CE bit MUST be set — the pre-#2315 copy-only
+    // path could never produce this (it never touched the inner ECN).
+    assert_ne!(inner_tos_out & 0x03, 0b10, "ECN must change from ECT(0)");
+    // Inner IPv4 header checksum (synthetic frame[14..34]) must be valid.
+    assert_eq!(
+        checksum16(&packet.frame[14..34]),
+        0,
+        "inner IPv4 header checksum must be recomputed after the CE upgrade"
+    );
+}
+
+#[test]
+fn native_gre_decap_drops_illegal_outer_ce_over_not_ect_inner() {
+    // #2315 RFC 6040 §4.2: outer CE over a Not-ECT inner is the illegal
+    // combination — decap must DROP (return None).
+    let state = build_forwarding_state(&native_gre_snapshot(true));
+    let inner = inner_v4_frame_with_tos(
+        Ipv4Addr::new(10, 255, 192, 41),
+        Ipv4Addr::new(10, 255, 192, 42),
+        63,
+        (46u8 << 2) | 0b00, // Not-ECT
+    );
+    let mut outer = build_ipv6_gre_frame(
+        &inner[14..],
+        "2602:ffd3:0:2::7".parse().unwrap(),
+        "2001:559:8585:80::8".parse().unwrap(),
+        None,
+    );
+    set_outer_ipv6_ecn(&mut outer, 0b11); // outer CE
+
+    assert!(
+        try_native_gre_decap_from_frame(&outer, native_gre_outer_meta(), &state).is_none(),
+        "outer CE over a Not-ECT inner must be dropped (§4.2)"
+    );
+}
+
+#[test]
+fn native_gre_decap_leaves_inner_unchanged_when_outer_not_congested() {
+    // Outer Not-ECT must leave the inner ECN/DSCP and checksum exactly
+    // as they arrived (no spurious mutation on the common case).
+    let state = build_forwarding_state(&native_gre_snapshot(true));
+    let inner_tos = (10u8 << 2) | 0b01; // DSCP 10 + ECT(1)
+    let inner = inner_v4_frame_with_tos(
+        Ipv4Addr::new(10, 255, 192, 41),
+        Ipv4Addr::new(10, 255, 192, 42),
+        63,
+        inner_tos,
+    );
+    let outer = build_ipv6_gre_frame(
+        &inner[14..],
+        "2602:ffd3:0:2::7".parse().unwrap(),
+        "2001:559:8585:80::8".parse().unwrap(),
+        None,
+    );
+    // build_ipv6_gre_frame writes outer TC = 0 (Not-ECT) — no mutation.
+    let packet = try_native_gre_decap_from_frame(&outer, native_gre_outer_meta(), &state)
+        .expect("decap forwards");
+    assert_eq!(
+        packet.frame[15], inner_tos,
+        "outer Not-ECT must leave the inner TOS byte verbatim"
+    );
+    assert_eq!(
+        checksum16(&packet.frame[14..34]),
+        0,
+        "inner checksum unchanged and valid"
+    );
+}
+
 #[test]
 fn build_forwarded_frame_from_frame_encapsulates_native_gre() {
     let state = build_forwarding_state(&native_gre_snapshot(true));
