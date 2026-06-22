@@ -335,6 +335,15 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
         let mut fallback_to_slow_path = false;
         let mut copied_source_frame = false;
         let mut retained_source_frame = false;
+        // #2301: a locally-generated ICMP Frag-Needed / Packet-Too-Big to
+        // send back out the ingress interface when the forwarded frame
+        // exceeds the egress MTU and the TCP-segmentation path did not
+        // handle it. Built inside the `target_binding` borrow (it needs
+        // only `source_frame`/`meta`/`ingress_ident`/`forwarding`) and
+        // enqueued onto `ingress_binding` in the finalizer once that
+        // borrow ends. `mtu_signalled` suppresses the oversized build.
+        let mut ptb_reply: Option<Vec<u8>> = None;
+        let mut mtu_signalled = false;
         let mut flow_key = request.flow_key.take();
         {
             let tcp_segmentation_needed = forwarded_tcp_may_need_segmentation(
@@ -475,6 +484,80 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
                 // Always use copy path with NAT64-specific frame builder.
                 let is_nat64 = request.decision.nat.nat64;
                 let uses_native_tunnel = request.decision.resolution.tunnel_endpoint_id != 0;
+
+                // #2301: egress-MTU decision for forwarded frames the TCP
+                // segmentation path did not handle (non-TCP, TCP seg-miss,
+                // non-segmentable TCP). For NAT64 and native-tunnel encap
+                // the on-wire L3 size differs from `source_frame` (header
+                // grow/shrink), and the built frame still hits the
+                // `copy_frame_is_oversized` descriptor-capacity backstop —
+                // skip the source-frame MTU check for them to avoid a false
+                // PTB. When the L3 payload exceeds the egress MTU and the
+                // sender forbade fragmentation (IPv4 DF) or it is IPv6,
+                // generate a Frag-Needed / Packet-Too-Big back to the
+                // sender so PMTUD converges, and drop the original instead
+                // of forwarding it into a silent MTU drop.
+                if !is_nat64 && !uses_native_tunnel {
+                    let mtu = forwarded_egress_mtu(&request.decision, forwarding);
+                    let ptb_meta: UserspaceDpMeta = request.meta.into();
+                    let l3 = frame_l3_offset(source_frame).or_else(|| {
+                        match request.meta.l3_offset {
+                            14 | 18 => Some(request.meta.l3_offset as usize),
+                            _ => None,
+                        }
+                    });
+                    if let Some(l3) = l3 {
+                        if let EgressMtuDecision::EmitPacketTooBig { next_hop_mtu } =
+                            forwarded_egress_mtu_decision(
+                                source_frame,
+                                l3,
+                                request.meta.addr_family,
+                                mtu,
+                            )
+                        {
+                            // RFC 792 / RFC 4443 suppression: never reply to
+                            // a non-first fragment or an inbound ICMP error.
+                            if !ptb_reply_suppressed(source_frame, ptb_meta, l3) {
+                                ptb_reply = match request.meta.addr_family as i32 {
+                                    libc::AF_INET => build_frag_needed_v4(
+                                        source_frame,
+                                        ptb_meta,
+                                        ingress_ident.ifindex,
+                                        forwarding,
+                                        next_hop_mtu,
+                                    ),
+                                    libc::AF_INET6 => build_packet_too_big_v6(
+                                        source_frame,
+                                        ptb_meta,
+                                        ingress_ident.ifindex,
+                                        forwarding,
+                                        next_hop_mtu as u32,
+                                    ),
+                                    _ => None,
+                                };
+                            }
+                            // Drop the oversized original regardless of
+                            // whether the PTB could be built (a suppressed
+                            // or unbuildable PTB must not fall through to
+                            // forward the MTU-violating frame). `ptb_reply`
+                            // being None here is the fail-closed silent drop.
+                            mtu_signalled = true;
+                            record_exception(
+                                recent_exceptions,
+                                ingress_ident,
+                                "egress_mtu_exceeded",
+                                source_frame.len() as u32,
+                                Some(request.meta.into()),
+                                None,
+                                forwarding,
+                            );
+                        }
+                    }
+                }
+                // Skip the oversized-frame build/forward entirely when an
+                // egress-MTU PTB was signalled; the finalizer enqueues
+                // `ptb_reply` (if any) and recycles the ingress descriptor.
+                if !mtu_signalled {
                 // #1598 secondary fix: gate on `shared_exact` policy
                 // (not on `shared_queue_lease.is_some()`), see the
                 // doc comment on `request_runs_under_shared_exact_policy`
@@ -959,6 +1042,7 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
                         }
                     }
                 }
+                } // close `if !mtu_signalled` (#2301 egress-MTU PTB)
             }
             if target_binding.tx_pipeline.pending_tx_prepared.len() >= TX_BATCH_SIZE
                 || target_binding.tx_pipeline.pending_tx_local.len() >= TX_BATCH_SIZE
@@ -982,6 +1066,39 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
                 binding_lookup,
                 post_recycles,
             );
+        }
+        // #2301: enqueue the egress-MTU PTB back out the ingress interface
+        // now that the `target_binding` borrow has ended. The reply is L2-
+        // reflected (dst = inbound src), so it leaves via `ingress_binding`.
+        // The oversized original is dropped: `mtu_signalled` left
+        // `retained_source_frame` false, so the recycle below returns its
+        // descriptor to the fill ring. A None `ptb_reply` (suppressed or
+        // unbuildable) is the fail-closed silent drop.
+        if let Some(ptb_bytes) = ptb_reply.take() {
+            let ptb_len = ptb_bytes.len();
+            ingress_binding
+                .tx_pipeline
+                .pending_tx_local
+                .push_back(TxRequest {
+                    bytes: ptb_bytes,
+                    expected_ports: None,
+                    expected_addr_family: request.meta.addr_family,
+                    expected_protocol: request.meta.protocol,
+                    flow_key: None,
+                    egress_ifindex: ingress_ident.ifindex,
+                    cos_queue_id: None,
+                    dscp_rewrite: None,
+                    mirror_clone: false,
+                    enqueue_ns: 0,
+                });
+            bound_pending_tx_local(ingress_binding);
+            dbg.enqueue_ok += 1;
+            dbg.enqueue_copy += 1;
+            ingress_binding.tx_counters.pending_copy_tx_packets += 1;
+            dbg.tx_bytes_total += ptb_len as u64;
+            if (ptb_len as u32) > dbg.tx_max_frame {
+                dbg.tx_max_frame = ptb_len as u32;
+            }
         }
         if build_failed {
             handle_forward_build_failure(
@@ -1119,6 +1236,21 @@ fn record_forwarded_tcp_segmentation_miss(
             source_frame.len(),
         );
     }
+}
+
+/// Resolve the egress interface MTU for a forwarding decision, preferring
+/// the egress ifindex and falling back to the tx ifindex (the same lookup
+/// `forwarded_tcp_may_need_segmentation` performs). Returns `0` when no
+/// egress entry is known, which the MTU decision treats as "no MTU known →
+/// forward unchanged".
+#[inline(always)]
+fn forwarded_egress_mtu(decision: &SessionDecision, forwarding: &ForwardingState) -> usize {
+    forwarding
+        .egress
+        .get(&decision.resolution.egress_ifindex)
+        .or_else(|| forwarding.egress.get(&decision.resolution.tx_ifindex))
+        .map(|egress| egress.mtu)
+        .unwrap_or(0)
 }
 
 #[inline(always)]
