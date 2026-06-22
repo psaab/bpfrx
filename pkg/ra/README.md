@@ -148,7 +148,15 @@ best-effort).
 - `WithdrawInterfaces(names []string)` — `ra.go`. Graceful goodbye + stop
   by interface name.
 - `WithdrawOnce(configs []*config.RAInterfaceConfig)` — `ra.go`.
-  Goodbye-only (no burst, no link toggle); skips busy interfaces.
+  Goodbye-only (no burst, no link toggle); skips busy interfaces. The
+  busy-check and the claim-and-hold tombstone install are performed
+  ATOMICALLY under `m.mu` by `claimWithdrawOnceLocked` (#2272): holding the
+  lock across BOTH closes the check-and-act window in which a concurrent
+  `Apply`/`WithdrawOnce` could otherwise start a competing sender between
+  the check and the claim (two owners on one link, or a sender racing the
+  goodbye — the #2033 blackhole class). The tombstone is then HELD across
+  the goodbye emit, so the busy state — and thus the mutual exclusion —
+  extends over the whole operation, not just the install instant.
 - `Clear() error` — `ra.go`. Hard stop (no goodbye) of every sender.
 - `Status()` — `ra.go`. Per-interface `SenderInfo`. A running sender has
   `State == "active"`; an interface whose sender is tearing down /
@@ -174,6 +182,15 @@ best-effort).
   or shutting down. It is emitted by the per-interface owner goroutine as
   its last write (see the shutdown contract above) so a normal RA can
   never follow it on the wire.
+- Prefix lifetimes are clamped to satisfy RFC 4861 §4.6.2 (#2271):
+  `buildRA` (`sender.go`) clamps each PrefixInformation's preferred
+  lifetime DOWN to its valid lifetime (`if prefLife > validLife`). A pair
+  where preferred > valid is malformed and a conforming host (RFC 4862
+  §5.5.3) ignores the prefix, so an operator that types
+  `preferred-lifetime` larger than `valid-lifetime` (or a 0-defaulted
+  valid life paired with a large explicit preferred life) would otherwise
+  silently lose SLAAC on every host. The clamp is never the reverse —
+  extending validity would advertise a longer-lived prefix than configured.
 - IPv6 NODAD is set on the per-instance NDP socket so it doesn't fight
   the kernel's own duplicate-address detection on the link-local
   address.

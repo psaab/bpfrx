@@ -108,26 +108,37 @@ const (
 	screenSynCookie       = 1 << 14
 	screenSessionLimitSrc = 1 << 15
 	screenSessionLimitDst = 1 << 16
+	// Bits 17-19 mirror the userspace-dp screen reason flags added after the
+	// original eBPF parity set (kept in lockstep with dataplane.ScreenFlagNames;
+	// the cross-package count is asserted by TestRawEventContractMatchesDataplaneEvent):
+	// ICMP fragment, IP malformed (#2146 fail-closed parse), and scan-table
+	// pressure (#2234 bounded-eviction operator alarm — not a packet drop).
+	screenICMPFragment      = 1 << 17
+	screenIPMalformed       = 1 << 18
+	screenScanTablePressure = 1 << 19
 )
 
 var screenFlagNames = map[uint32]string{
-	screenSynFlood:        "SYN flood",
-	screenICMPFlood:       "ICMP flood",
-	screenUDPFlood:        "UDP flood",
-	screenPortScan:        "port scan",
-	screenIPSweep:         "IP sweep",
-	screenLandAttack:      "LAND attack",
-	screenPingOfDeath:     "ping of death",
-	screenTearDrop:        "tear drop",
-	screenTCPSynFin:       "TCP SYN+FIN",
-	screenTCPNoFlag:       "TCP no-flag",
-	screenTCPFinNoAck:     "TCP FIN-no-ACK",
-	screenWinNuke:         "WinNuke",
-	screenIPSourceRoute:   "IP source-route",
-	screenSynFrag:         "SYN fragment",
-	screenSynCookie:       "SYN cookie",
-	screenSessionLimitSrc: "session limit (source)",
-	screenSessionLimitDst: "session limit (destination)",
+	screenSynFlood:          "SYN flood",
+	screenICMPFlood:         "ICMP flood",
+	screenUDPFlood:          "UDP flood",
+	screenPortScan:          "port scan",
+	screenIPSweep:           "IP sweep",
+	screenLandAttack:        "LAND attack",
+	screenPingOfDeath:       "ping of death",
+	screenTearDrop:          "tear drop",
+	screenTCPSynFin:         "TCP SYN+FIN",
+	screenTCPNoFlag:         "TCP no-flag",
+	screenTCPFinNoAck:       "TCP FIN-no-ACK",
+	screenWinNuke:           "WinNuke",
+	screenIPSourceRoute:     "IP source-route",
+	screenSynFrag:           "SYN fragment",
+	screenSynCookie:         "SYN cookie",
+	screenSessionLimitSrc:   "session limit (source)",
+	screenSessionLimitDst:   "session limit (destination)",
+	screenICMPFragment:      "ICMP fragment",
+	screenIPMalformed:       "IP malformed",
+	screenScanTablePressure: "scan-table pressure",
 }
 
 // EventReader reads events from an EventSource.

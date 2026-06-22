@@ -269,6 +269,100 @@ func TestBuildRA_LifetimeAndMTU(t *testing.T) {
 	}
 }
 
+// TestBuildRA_PrefLifeClampedToValidLife is the #2271 regression. RFC 4861
+// §4.6.2 requires PreferredLifetime <= ValidLifetime; buildRA must clamp the
+// preferred lifetime down to the valid lifetime so a misconfigured (or
+// 0-defaulted) pair never advertises a malformed PrefixInformation that
+// conforming hosts (RFC 4862 §5.5.3) ignore.
+//
+// The matrix exercises: ordered pairs (no-op), the inverted pair that triggers
+// the clamp, 0-config (defaults), a mix of an explicit valid life with an
+// over-large preferred life, equal lifetimes, and the "infinite" (max-int)
+// endpoints in both positions.
+func TestBuildRA_PrefLifeClampedToValidLife(t *testing.T) {
+	const infinite = 4294967295 // 0xffffffff: largest lifetime an operator can express
+	cases := []struct {
+		name      string
+		valid     int // pfx.ValidLifetime config
+		preferred int // pfx.PreferredLife config
+		wantValid int // expected advertised valid lifetime (seconds)
+		wantPref  int // expected advertised preferred lifetime (seconds)
+	}{
+		{"ordered_no_clamp", 86400, 14400, 86400, 14400},
+		{"inverted_clamps_pref_down", 100, 200, 100, 100},
+		{"equal_no_clamp", 3600, 3600, 3600, 3600},
+		{"both_zero_uses_defaults", 0, 0, defaultValidLifetime, defaultPreferredLifetime},
+		// valid=0 -> default valid (2592000), explicit pref below the default
+		// valid: no clamp. defaultPreferredLifetime (604800) <= 2592000.
+		{"valid_default_pref_explicit_ok", 0, 1000, defaultValidLifetime, 1000},
+		// valid=0 -> default valid (2592000), explicit pref ABOVE the default
+		// valid would be malformed -> clamp down to the default valid life.
+		{"valid_default_pref_over_clamps", 0, defaultValidLifetime + 1, defaultValidLifetime, defaultValidLifetime},
+		// pref=0 -> default preferred (604800); valid explicitly smaller ->
+		// the defaulted preferred life must be clamped down to the valid life.
+		{"pref_default_over_valid_clamps", 100, 0, 100, 100},
+		// Infinite valid life: any preferred life (even infinite) is <= it.
+		{"infinite_valid_finite_pref", infinite, 14400, infinite, 14400},
+		{"infinite_both_equal", infinite, infinite, infinite, infinite},
+		// Infinite preferred life but finite valid life: clamp the preferred
+		// life all the way down to the finite valid life.
+		{"infinite_pref_finite_valid_clamps", 86400, infinite, 86400, 86400},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			s := &sender{
+				cfg: &config.RAInterfaceConfig{
+					Interface: "trust0",
+					Prefixes: []*config.RAPrefix{
+						{
+							Prefix:        "2001:db8::/64",
+							OnLink:        true,
+							Autonomous:    true,
+							ValidLifetime: tc.valid,
+							PreferredLife: tc.preferred,
+						},
+					},
+				},
+				iface: &net.Interface{
+					Name:         "trust0",
+					HardwareAddr: net.HardwareAddr{0x00, 0x11, 0x22, 0x33, 0x44, 0x55},
+				},
+			}
+
+			ra := s.buildRA()
+
+			var pi *ndp.PrefixInformation
+			for _, opt := range ra.Options {
+				if p, ok := opt.(*ndp.PrefixInformation); ok {
+					pi = p
+					break
+				}
+			}
+			if pi == nil {
+				t.Fatal("missing prefix information option")
+			}
+
+			wantValid := time.Duration(tc.wantValid) * time.Second
+			wantPref := time.Duration(tc.wantPref) * time.Second
+			if pi.ValidLifetime != wantValid {
+				t.Errorf("ValidLifetime = %v, want %v", pi.ValidLifetime, wantValid)
+			}
+			if pi.PreferredLifetime != wantPref {
+				t.Errorf("PreferredLifetime = %v, want %v", pi.PreferredLifetime, wantPref)
+			}
+
+			// The RFC 4861 §4.6.2 invariant itself: preferred MUST NOT exceed
+			// valid. This is the fail-on-revert pin — if the clamp is removed,
+			// inverted/over-large cases advertise pref > valid and fail here.
+			if pi.PreferredLifetime > pi.ValidLifetime {
+				t.Errorf("RFC 4861 §4.6.2 violated: PreferredLifetime (%v) > ValidLifetime (%v)",
+					pi.PreferredLifetime, pi.ValidLifetime)
+			}
+		})
+	}
+}
+
 func TestBuildRA_MultipleInterfaces(t *testing.T) {
 	m := New()
 	// Verify manager starts empty.

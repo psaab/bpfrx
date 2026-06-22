@@ -9432,6 +9432,35 @@ top.
   pkg/dhcpserver/lease_sync_test.go, pkg/dhcpserver/README.md, _Log.md
 
 - **Timestamp**: 2026-06-21
+  **Action**: #2271 + #2272 — pkg/ra RA lifetime clamp + WithdrawOnce
+  check-and-act atomicity (ONE PR closing both). #2271 (LOW, real bug):
+  buildRA (sender.go) constructed PrefixInformation without enforcing RFC
+  4861 §4.6.2 (preferred-lifetime <= valid-lifetime); a misconfigured or
+  0-defaulted pair could advertise pref > valid, which conforming hosts
+  (RFC 4862 §5.5.3) ignore — silently dropping SLAAC on every host. Fix:
+  clamp prefLife DOWN to validLife after the existing default-fill
+  (`if prefLife > validLife { prefLife = validLife }`), never the reverse.
+  Matrix unit test (ordered/inverted/equal/both-zero/default-mixes/infinite
+  endpoints) asserts the advertised values AND the §4.6.2 invariant;
+  fail-on-revert verified (removing the clamp fails 4 cases). #2272 (MEDIUM):
+  the check-and-act race the issue describes was already structurally closed
+  by #2033's claim-and-hold tombstone (WithdrawOnce holds m.mu across the
+  interfaceBusy check AND the tombstone install). Extracted that atomic
+  step into claimWithdrawOnceLocked with a hard contract comment so it
+  cannot drift back to the pre-#2033 split-lock shape, and added the missing
+  -race regression: TestWithdrawOnceVsApplySingleOwner (concurrent Apply/
+  WithdrawOnce/Withdraw on one iface, peak live-conn <=1 + no normal RA after
+  a goodbye per conn) and TestWithdrawOnceHoldsTombstoneDuringGoodbye
+  (deterministic: a concurrent Apply defers for the whole goodbye window).
+  REVERT-PROOF: temporarily reverting WithdrawOnce to the pre-#2033
+  check-then-act shape (drop lock between check and act, start a REAL
+  sender) made BOTH -race tests fail (peak=2 conns; normal RA lifetime=30m
+  after a goodbye; Apply started a live sender during the goodbye) across 3
+  runs; restored. go build ./... + go vet ./pkg/ra/... + go test ./pkg/ra/
+  + go test -race ./pkg/ra/ all green; -race -count=5 no flake. Did NOT
+  merge — parent runs test-failover (RA withdraw fires on failover).
+  **File(s)**: pkg/ra/sender.go, pkg/ra/ra.go, pkg/ra/ra_test.go,
+  pkg/ra/serialize_test.go, pkg/ra/README.md, _Log.md
   **Action**: #2268 — round-trip IA_TA lease type symmetrically in the DHCP
   HA lease-sync pre-seed writer. Follow-up to #2267 (#2262), which fixed the
   READ path to distinguish all three Kea v6 lease kinds (keaLeaseTypeToString:
@@ -9640,3 +9669,17 @@ top.
   fails on clean origin/master too). README documents the contract.
   **File(s)**: pkg/logging/syslog.go, pkg/logging/syslog_resilience_test.go,
   pkg/logging/README.md, _Log.md
+  **Action**: #2282 grpcapi input-validation hardening — Complete RPC
+  negative-Pos slice-panic guard + ShowNAT int32 port-pool overflow clamp.
+  Complete now rejects req.Pos < 0 with codes.InvalidArgument before
+  slicing line[:pos] (int(-1)<len passed → line[:-1] panic). GetNATPoolStats
+  computes (portHigh-portLow+1)*len(addresses) in int64 and saturates to
+  int32 via new clampInt32 helper before the int32 proto fields (bare cast
+  wrapped negative for ~40k-address pools). Table tests cover Pos
+  {MinInt32,-1,0,mid,len,len+1,MaxInt32} and an int32-overflowing pool;
+  both are fail-on-revert (reverting the guard panics the test; reverting
+  the clamp makes TotalPorts go negative). 5x no flake; go vet clean.
+  **File(s)**: pkg/grpcapi/server_cluster.go,
+  pkg/grpcapi/server_nat.go,
+  pkg/grpcapi/server_input_validation_test.go,
+  pkg/grpcapi/README.md, _Log.md
