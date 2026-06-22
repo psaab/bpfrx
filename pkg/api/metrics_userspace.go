@@ -521,6 +521,15 @@ func (c *xpfCollector) emitUserspaceDynamicBufferMetrics(ch chan<- prometheus.Me
 		float64(status.WorkerCommandQueuePoisonRecoveries),
 	)
 
+	// #2315: GRE-decap RFC 6040 4.2 illegal-combination drops (outer CE
+	// over a Not-ECT inner). Emitted unconditionally so a 0 is a real
+	// "no illegal combinations seen" signal rather than an absent series.
+	ch <- prometheus.MustNewConstMetric(
+		c.userspaceGreDecapEcnIllegalDrops,
+		prometheus.CounterValue,
+		float64(status.GreDecapEcnIllegalDropsTotal),
+	)
+
 	var activeFlows, flowCapacity uint64
 	for _, b := range status.Bindings {
 		activeFlows += uint64(b.ActiveFlowCount)

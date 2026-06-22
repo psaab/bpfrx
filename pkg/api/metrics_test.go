@@ -824,6 +824,12 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 			nil,
 			nil,
 		),
+		userspaceGreDecapEcnIllegalDrops: prometheus.NewDesc(
+			"xpf_userspace_gre_decap_ecn_illegal_drops_total",
+			"gre decap rfc6040 illegal-combo drops",
+			nil,
+			nil,
+		),
 		userspaceFlowCacheActiveFlows: prometheus.NewDesc(
 			"xpf_userspace_flow_cache_active_flows",
 			"flow-cache active flows",
@@ -855,6 +861,9 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 		NatReverseKeySharedDisplacementsTotal: 4,
 		// #1807: poison-recovery counter emitted unconditionally.
 		WorkerCommandQueuePoisonRecoveries: 2,
+		// #2315: GRE-decap RFC 6040 §4.2 illegal-combo drop counter
+		// emitted unconditionally.
+		GreDecapEcnIllegalDropsTotal: 3,
 		// #1861: install-refusal trio emitted unconditionally.
 		SessionCreateDrops:             9,
 		SessionInstallAdmissionRefused: 8,
@@ -889,9 +898,10 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 		got = append(got, m)
 	}
 	// 10 pre-#1861 metrics + the #1861 install-refusal trio + the #2244
-	// dnat_table reverse-NAT publish-error counter = 14.
-	if len(got) != 14 {
-		t.Fatalf("emitUserspaceDynamicBufferMetrics: want 14 metrics, got %d", len(got))
+	// dnat_table reverse-NAT publish-error counter (= 14) + the #2315
+	// gre_decap_ecn_illegal_drops_total counter = 15.
+	if len(got) != 15 {
+		t.Fatalf("emitUserspaceDynamicBufferMetrics: want 15 metrics, got %d", len(got))
 	}
 
 	assertGaugeClose(t, got, c.userspaceSessionTableEntries, nil, 77)
@@ -908,6 +918,9 @@ func TestEmitUserspaceDynamicBufferMetrics(t *testing.T) {
 	assertCounterClose(t, got, c.userspaceNatReverseKeySharedDisplacements, nil, 4)
 	// #1807: poison-recovery counter emitted unconditionally.
 	assertCounterClose(t, got, c.userspaceWorkerCommandQueuePoisonRecoveries, nil, 2)
+	// #2315: GRE-decap RFC 6040 §4.2 illegal-combo drop counter emitted
+	// unconditionally.
+	assertCounterClose(t, got, c.userspaceGreDecapEcnIllegalDrops, nil, 3)
 	// #1861: install-refusal trio emitted unconditionally.
 	assertCounterClose(t, got, c.userspaceSessionCreateDrops, nil, 9)
 	assertCounterClose(t, got, c.userspaceSessionInstallAdmissionRefused, nil, 8)

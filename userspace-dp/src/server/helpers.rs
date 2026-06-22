@@ -82,6 +82,11 @@ pub(crate) fn refresh_status(state: &mut ServerState) {
     // panic poisoned a command queue and it was recovered.
     state.status.worker_command_queue_poison_recoveries =
         state.afxdp.worker_command_queue_poison_recoveries_total();
+    // #2315: GRE-decap RFC 6040 §4.2 illegal-combination drops (outer CE
+    // over a Not-ECT inner). Nonzero = a misbehaving tunnel ingress
+    // ECT-marked the outer for un-ECN inner traffic on a congested path.
+    state.status.gre_decap_ecn_illegal_drops_total =
+        state.afxdp.gre_decap_ecn_illegal_drops_total();
     // The per-key dynamic_neighbors dump is a high-cardinality
     // (ifindex,ip)-labelled debug surface used only by the #1782 cold-start
     // capture. Gate it behind XPF_DEBUG_NEIGHBOR_KEYS so it is OFF by default:
