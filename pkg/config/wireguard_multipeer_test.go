@@ -208,6 +208,58 @@ interfaces {
 	}
 }
 
+// The same pubkey in different hex CASE is the SAME peer and must be
+// rejected as a duplicate (the pubkey is lowercased at parse so the
+// dedup, the wire bytes, and the lowercase-hex contract all agree).
+// FAIL-ON-REVERT: without the parse-time ToLower, `AA..`/`aa..` both
+// survive and orphan a peer in the engine's release-build reconcile.
+func TestWireguardDuplicatePubkeyCaseInsensitive(t *testing.T) {
+	upper := strings.ToUpper(wgKeyB)
+	src := `
+interfaces {
+    wg0 {
+        tunnel {
+            mode wireguard;
+            wireguard {
+                listen-port 51820;
+                private-key ` + wgKeyA + `;
+                peer ` + wgKeyB + ` { allowed-ips 10.1.0.0/16; }
+                peer ` + upper + ` { allowed-ips 10.2.0.0/16; }
+            }
+        }
+    }
+}`
+	tree, perrs := NewParser(src).Parse()
+	if len(perrs) > 0 {
+		t.Fatalf("Parse: %v", perrs)
+	}
+	_, err := CompileConfig(tree)
+	if err == nil {
+		t.Fatal("same pubkey in different case must be a duplicate commit error")
+	}
+	if !strings.Contains(err.Error(), "duplicate peer public key") {
+		t.Errorf("error = %q, want duplicate-pubkey message", err)
+	}
+}
+
+// The compiler lowercases the peer pubkey so the wire bytes are
+// canonical regardless of authored case.
+func TestWireguardPubkeyLowercasedAtParse(t *testing.T) {
+	cfg, err := compileSet(t, []string{
+		"set interfaces wg0 tunnel mode wireguard",
+		"set interfaces wg0 tunnel wireguard listen-port 51820",
+		"set interfaces wg0 tunnel wireguard private-key " + wgKeyA,
+		"set interfaces wg0 tunnel wireguard peer " + strings.ToUpper(wgKeyB) + " allowed-ips 10.1.0.0/16",
+	})
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	tc := wgTunnel(t, cfg, "wg0")
+	if len(tc.WgPeers) != 1 || tc.WgPeers[0].PublicKeyHex != wgKeyB {
+		t.Fatalf("pubkey not lowercased: %v", tc.WgPeers)
+	}
+}
+
 // A WG tunnel with no peer is a hard commit reject (no dynamic peer
 // learning — a peerless WG tunnel can never handshake).
 func TestWireguardZeroPeerRejected(t *testing.T) {

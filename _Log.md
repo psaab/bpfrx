@@ -1,5 +1,34 @@
 # Action Log
 
+## 2026-06-22 — #1434 review round 1 (NEEDS-MINOR fold)
+
+- **Timestamp**: 2026-06-22 PDT
+- **Action**: PR #2320 review (quad, verdict NEEDS-MINOR, no MAJOR; the
+  #1961 no-transit risk verified fully mitigated). Folded the two code
+  MINORs + the migration-gap note: (1) Copilot #1 — lowercase the peer
+  pubkey at parse (`strings.ToLower` in `parseTunnelWireguardPeer`) so the
+  dup-pubkey dedup, the wire bytes, and the documented "64-char lowercase
+  hex" contract all agree; `AA..`/`aa..` now collide at commit instead of
+  orphaning a peer in the engine's release-build reconcile (where the dup
+  `debug_assert` is compiled out). Added `TestWireguardDuplicatePubkeyCase
+  Insensitive` (fail-on-revert) + `TestWireguardPubkeyLowercasedAtParse`.
+  (2) Copilot #3 — `Peer.preshared_key` is now `RwLock<Zeroizing<[u8;32]>>`
+  so the engine-resident PSK copy is wiped on drop / rotation, matching
+  the wire+runtime copies (was a plain `[u8;32]`). (3) Documented the
+  pre-#1434 `peer { public-key <k>; }` → `peer <k> { }` syntax-migration
+  gap in docs/config-schema.md (no auto-migration; an old-form config
+  reloads to a lenient load-time warning, fail-safe per #1960, but loses
+  its peer until re-authored — bounded: WG experimental, interop deferred
+  to #1703).
+- **File(s)**: pkg/config/{compiler_interfaces.go, wireguard_multipeer_test.go},
+  userspace-dp/src/afxdp/wg/peer.rs, docs/config-schema.md.
+- **Validation**: `go test ./pkg/config/` green incl. the two new case
+  tests (5x); `cargo build --release` clean; wg-domain Rust suite
+  177/177 (the lone `install_session_serializes_with_reconcile_removal`
+  miss is the documented pre-existing reconcile-race flake — isolated
+  PASS=5/FAIL=1, unrelated to this change). PSK roundtrip + LPM tests
+  pass deterministically.
+
 ## 2026-06-22 — #1434 multi-PEER WireGuard per interface (B1a + B1b + B2)
 
 - **Timestamp**: 2026-06-22 PDT

@@ -90,8 +90,11 @@ pub(crate) struct Peer {
     /// (semantically identical to the all-zero key in Noise IKpsk2).
     /// Interior-mutable so a config commit that reuses the peer Arc can
     /// rotate the PSK in place (same rationale as `endpoint`). SECRET:
-    /// redacted in the manual Debug impl below; never logged.
-    pub(crate) preshared_key: RwLock<[u8; 32]>,
+    /// `Zeroizing` so the key material is wiped on drop (matching the
+    /// engine local privkey + the runtime/wire copies); redacted in the
+    /// manual Debug impl below; never logged. A PSK rotation drops the
+    /// old `Zeroizing` value, wiping the superseded key.
+    pub(crate) preshared_key: RwLock<zeroize::Zeroizing<[u8; 32]>>,
 }
 
 impl std::fmt::Debug for Peer {
@@ -101,7 +104,7 @@ impl std::fmt::Debug for Peer {
         let psk_set = self
             .preshared_key
             .read()
-            .map(|k| *k != [0u8; 32])
+            .map(|k| **k != [0u8; 32])
             .unwrap_or(false);
         f.debug_struct("Peer")
             .field("pubkey", &self.pubkey)
@@ -132,7 +135,7 @@ impl Peer {
             t8_last_attempt_ns: AtomicU64::new(0),
             current: RwLock::new(None),
             previous: RwLock::new(None),
-            preshared_key: RwLock::new(preshared_key),
+            preshared_key: RwLock::new(zeroize::Zeroizing::new(preshared_key)),
         }
     }
 
@@ -197,7 +200,9 @@ impl Peer {
         *self.endpoint.write().unwrap() = endpoint;
         self.persistent_keepalive
             .store(persistent_keepalive, Ordering::Relaxed);
-        *self.preshared_key.write().unwrap() = preshared_key;
+        // Drop the old Zeroizing value (wipes the superseded key) and
+        // store the new one wrapped so it is wiped on its own drop.
+        *self.preshared_key.write().unwrap() = zeroize::Zeroizing::new(preshared_key);
     }
 
     /// Snapshot the current endpoint. Slow path only.
@@ -207,9 +212,12 @@ impl Peer {
     }
 
     /// Snapshot the current preshared key (#1434 B2). Slow path only —
-    /// consumed by the handshake builders. 32 zero bytes = no PSK.
+    /// consumed by the handshake builders. 32 zero bytes = no PSK. The
+    /// returned copy is plain `[u8;32]` (the caller hands it straight to
+    /// snow's `psk`/`set_psk`); the engine-resident master copy stays
+    /// `Zeroizing` and is wiped on drop / rotation.
     pub(crate) fn preshared_key(&self) -> [u8; 32] {
-        *self.preshared_key.read().unwrap()
+        **self.preshared_key.read().unwrap()
     }
 
     /// Snapshot the current persistent-keepalive interval. Slow path.

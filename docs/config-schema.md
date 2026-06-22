@@ -240,7 +240,20 @@ reserved for whole-dataplane selection where a rewrite shim
   (`lenientWireguardPeers`) downgrades these to warnings so an
   already-persisted or peer-synced config still boots (#1960). The
   compiler sorts `WgPeers` by pubkey at the snapshot-builder boundary so
-  both HA nodes serialize byte-identical snapshots. (b) **firewall**:
+  both HA nodes serialize byte-identical snapshots. The pubkey is
+  lowercased at parse so the canonical form drives the dedup key, the
+  wire bytes, and the documented "64-char lowercase hex" contract
+  together (a `AA..`/`aa..` pair collides at commit instead of orphaning
+  a peer in the engine's release-build reconcile). **Syntax-migration
+  note:** the pre-#1434 leaf form `peer { public-key <key>; ... }`
+  (#1432 S2a) is NOT auto-migrated to the named-instance form `peer
+  <key> { ... }`. There is no production persisted old-form WG config
+  (WG was experimental and live interop is deferred to #1703), but an
+  old-form config reloaded leniently parses the literal token
+  `public-key` as a bogus peer name, fails the hex validator, and
+  downgrades to a load-time warning — fail-safe (no brick, #1960), but
+  the tunnel silently loses its real peer until re-authored in the new
+  syntax. (b) **firewall**:
   the `then forwarding-class`
   tree-based cross-ref for both families (dangling references reject at
   commit; same-commit definition + reference passes; `best-effort` is

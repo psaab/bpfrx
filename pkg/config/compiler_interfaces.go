@@ -714,8 +714,17 @@ func parseTunnelWireguard(tc *TunnelConfig, wgNode *Node) {
 // key; allowed-ips/endpoint/persistent-keepalive/preshared-key are the
 // instance's children. Both AST shapes are already collapsed by the
 // namedInstances caller, so `peerNode.Children` are the leaves.
+//
+// The pubkey is lowercased here so the canonical form drives EVERYTHING
+// downstream at once: the dup-pubkey dedup in validateWireguardPeers
+// (so `AA..` and `aa..` collide instead of both surviving and orphaning
+// a peer in the engine's release-build reconcile, where the dup
+// debug_assert is compiled out), the wire bytes the Rust hex decoder
+// consumes, and the "64-char lowercase hex" contract the status row
+// documents. A non-hex key (operator typo) survives unchanged and the
+// commit-time hex validator rejects it.
 func parseTunnelWireguardPeer(pubkey string, peerNode *Node) WgPeerConfig {
-	peer := WgPeerConfig{PublicKeyHex: pubkey}
+	peer := WgPeerConfig{PublicKeyHex: strings.ToLower(pubkey)}
 	for _, prop := range peerNode.Children {
 		switch prop.Name() {
 		case "allowed-ips":
