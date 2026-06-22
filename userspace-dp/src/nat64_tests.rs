@@ -1838,3 +1838,328 @@ fn nat64_unsupported_icmpv6_type_still_dropped() {
         "unmappable ICMPv6 type must be dropped"
     );
 }
+
+// ===========================================================================
+// #2290: IPv6 extension-header walk in the v6->v4 translator.
+//
+// Pre-fix the translator read packet[6] as the L4 protocol and assumed L4 at
+// byte 40, so any packet carrying a Hop-by-Hop / Routing / Dest-Opts / AH /
+// Fragment header before its transport header was dropped as "unsupported
+// protocol". These tests are FAIL-ON-REVERT: each builds a valid v6 packet
+// with an extension header before TCP/UDP and asserts it TRANSLATES (not
+// dropped). Reverting the fix (fixed offset 40 + raw next-header) reads the
+// ext-header type as the L4 protocol -> `expect("translate")` panics.
+// ===========================================================================
+
+/// Build an IPv6 packet carrying ONE extension header (`ext_type`, given
+/// option bytes) before the terminal L4 (`l4_proto`, `l4` bytes). The ext
+/// header is `Type-Length-Optiondata` per RFC 8200: byte 0 = next-header
+/// (the L4 proto), byte 1 = Hdr Ext Len in 8-octet units NOT counting the
+/// first 8 octets. `ext_payload` is the option data AFTER the 2-byte
+/// type/len; its length must make the ext header a multiple of 8 octets.
+fn build_v6_with_ext_then_l4(
+    src: Ipv6Addr,
+    dst: Ipv6Addr,
+    ext_type: u8,
+    ext_payload: &[u8],
+    l4_proto: u8,
+    hl: u8,
+    l4: &[u8],
+) -> Vec<u8> {
+    // ext header = [next_header, hdr_ext_len, ext_payload...]
+    let ext_len_bytes = 2 + ext_payload.len();
+    assert_eq!(ext_len_bytes % 8, 0, "ext header must be a multiple of 8");
+    let hdr_ext_len = (ext_len_bytes / 8 - 1) as u8;
+    let mut p = vec![0u8; 40 + ext_len_bytes + l4.len()];
+    p[0] = 0x60;
+    // IPv6 payload_len covers ext header + L4.
+    p[4..6].copy_from_slice(&((ext_len_bytes + l4.len()) as u16).to_be_bytes());
+    p[6] = ext_type; // first next-header points at the ext header
+    p[7] = hl;
+    p[8..24].copy_from_slice(&src.octets());
+    p[24..40].copy_from_slice(&dst.octets());
+    // Extension header.
+    p[40] = l4_proto; // ext's next-header = terminal L4
+    p[41] = hdr_ext_len;
+    p[42..42 + ext_payload.len()].copy_from_slice(ext_payload);
+    // L4.
+    let l4_off = 40 + ext_len_bytes;
+    p[l4_off..l4_off + l4.len()].copy_from_slice(l4);
+    p
+}
+
+#[test]
+fn ipv6_l4_offset_walks_dest_opts_then_tcp() {
+    // Dest-Opts (60) 8 bytes, then TCP at offset 48.
+    let src: Ipv6Addr = "2001:db8::1".parse().unwrap();
+    let dst: Ipv6Addr = "64:ff9b::0808:0808".parse().unwrap();
+    let pkt = build_v6_with_ext_then_l4(src, dst, 60, &[0u8; 6], PROTO_TCP, 64, &[0u8; 20]);
+    let (off, proto) = ipv6_l4_offset_and_protocol(&pkt).expect("walk must find L4");
+    assert_eq!(off, 48, "TCP starts after the 8-byte Dest-Opts header");
+    assert_eq!(proto, PROTO_TCP);
+}
+
+#[test]
+fn ipv6_l4_offset_walks_hop_by_hop_then_udp() {
+    let src: Ipv6Addr = "2001:db8::1".parse().unwrap();
+    let dst: Ipv6Addr = "64:ff9b::0808:0808".parse().unwrap();
+    let pkt = build_v6_with_ext_then_l4(src, dst, 0, &[0u8; 6], PROTO_UDP, 64, &[0u8; 8]);
+    let (off, proto) = ipv6_l4_offset_and_protocol(&pkt).expect("walk must find L4");
+    assert_eq!(off, 48);
+    assert_eq!(proto, PROTO_UDP);
+}
+
+#[test]
+fn translate_v6_to_v4_tcp_behind_dest_opts() {
+    // FAIL-ON-REVERT: a Dest-Opts header before TCP. Pre-fix this read
+    // next_header=60 (Dest-Opts) as the protocol -> `_ => return None` drop.
+    let src_v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+    let dst_v6: Ipv6Addr = "64:ff9b::c633:6432".parse().unwrap();
+    let snat_v4 = Ipv4Addr::new(198, 51, 100, 1);
+    let dst_v4 = Ipv4Addr::new(198, 51, 100, 50);
+
+    // Minimal TCP header (20 bytes) + 5-byte payload, ports 12345 -> 80.
+    let mut tcp = vec![0u8; 25];
+    tcp[0..2].copy_from_slice(&12345u16.to_be_bytes());
+    tcp[2..4].copy_from_slice(&80u16.to_be_bytes());
+    tcp[12] = 0x50; // data offset 5
+    tcp[13] = 0x02; // SYN
+    tcp[20..25].copy_from_slice(b"hello");
+
+    let ipv6_pkt =
+        build_v6_with_ext_then_l4(src_v6, dst_v6, 60, &[0u8; 6], PROTO_TCP, 64, &tcp);
+    let v4 = translate_v6_to_v4(&ipv6_pkt, snat_v4, dst_v4, false)
+        .expect("TCP behind Dest-Opts must translate, not drop");
+
+    assert_eq!(v4[0], 0x45);
+    assert_eq!(v4[9], PROTO_TCP, "protocol must be the terminal L4, not 60");
+    assert_eq!(&v4[12..16], &snat_v4.octets());
+    assert_eq!(&v4[16..20], &dst_v4.octets());
+    // The ext header is stripped: IPv4 length = 20 + 25 (NOT 20 + 8 + 25).
+    assert_eq!(v4.len(), 20 + 25, "Dest-Opts header stripped from output");
+    // TCP ports preserved at the IPv4 L4 offset.
+    assert_eq!(u16::from_be_bytes([v4[20], v4[21]]), 12345);
+    assert_eq!(u16::from_be_bytes([v4[22], v4[23]]), 80);
+    assert_eq!(checksum16(&v4[..20]), 0, "IPv4 header checksum valid");
+}
+
+#[test]
+fn translate_v6_to_v4_udp_behind_hop_by_hop() {
+    // FAIL-ON-REVERT: UDP behind a Hop-by-Hop (0) header.
+    let src_v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+    let dst_v6: Ipv6Addr = "64:ff9b::0808:0808".parse().unwrap();
+    let snat_v4 = Ipv4Addr::new(198, 51, 100, 1);
+    let dst_v4 = Ipv4Addr::new(8, 8, 8, 8);
+
+    let mut udp = vec![0u8; 8 + 4];
+    udp[0..2].copy_from_slice(&5353u16.to_be_bytes());
+    udp[2..4].copy_from_slice(&53u16.to_be_bytes());
+    udp[4..6].copy_from_slice(&(12u16).to_be_bytes()); // UDP length
+    udp[8..12].copy_from_slice(b"data");
+
+    let ipv6_pkt = build_v6_with_ext_then_l4(src_v6, dst_v6, 0, &[0u8; 6], PROTO_UDP, 64, &udp);
+    let v4 = translate_v6_to_v4(&ipv6_pkt, snat_v4, dst_v4, false)
+        .expect("UDP behind Hop-by-Hop must translate, not drop");
+
+    assert_eq!(v4[9], PROTO_UDP, "protocol must be the terminal L4, not 0");
+    assert_eq!(v4.len(), 20 + 12, "Hop-by-Hop header stripped");
+    assert_eq!(u16::from_be_bytes([v4[20], v4[21]]), 5353);
+    assert_eq!(u16::from_be_bytes([v4[22], v4[23]]), 53);
+}
+
+#[test]
+fn translate_v6_to_v4_non_first_fragment_dropped() {
+    // A non-first fragment carries no L4 header. The walker must NOT read its
+    // payload bytes as a transport header — fail closed (drop).
+    let src_v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+    let dst_v6: Ipv6Addr = "64:ff9b::0808:0808".parse().unwrap();
+    let snat_v4 = Ipv4Addr::new(198, 51, 100, 1);
+    let dst_v4 = Ipv4Addr::new(8, 8, 8, 8);
+
+    // Fragment header (44), 8 bytes: next-header=TCP, frag-offset != 0.
+    // bytes: [nh, reserved, frag_off_hi, frag_off_lo|flags, id(4)].
+    // Set fragment offset to 0x0010 (>0) in the upper 13 bits.
+    let mut frag = vec![0u8; 8 + 16]; // frag header + 16 "payload" bytes
+    frag[0] = PROTO_TCP; // next-header
+    frag[2..4].copy_from_slice(&0x0010u16.to_be_bytes()); // frag offset != 0
+    let mut pkt = vec![0u8; 40 + frag.len()];
+    pkt[0] = 0x60;
+    pkt[4..6].copy_from_slice(&(frag.len() as u16).to_be_bytes());
+    pkt[6] = 44; // first next-header = Fragment
+    pkt[7] = 64;
+    pkt[8..24].copy_from_slice(&src_v6.octets());
+    pkt[24..40].copy_from_slice(&dst_v6.octets());
+    pkt[40..].copy_from_slice(&frag);
+
+    assert!(
+        ipv6_is_non_first_fragment(&pkt),
+        "predicate must flag the non-first fragment"
+    );
+    assert!(
+        translate_v6_to_v4(&pkt, snat_v4, dst_v4, false).is_none(),
+        "non-first fragment must be dropped, not translated from payload bytes"
+    );
+}
+
+#[test]
+fn translate_v6_to_v4_first_fragment_still_translates() {
+    // A FIRST fragment (offset 0) carries the real L4 header and must still
+    // translate — the non-first-fragment guard must not over-reject.
+    let src_v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+    let dst_v6: Ipv6Addr = "64:ff9b::0808:0808".parse().unwrap();
+    let snat_v4 = Ipv4Addr::new(198, 51, 100, 1);
+    let dst_v4 = Ipv4Addr::new(8, 8, 8, 8);
+
+    let mut udp = vec![0u8; 8];
+    udp[0..2].copy_from_slice(&1111u16.to_be_bytes());
+    udp[2..4].copy_from_slice(&2222u16.to_be_bytes());
+    udp[4..6].copy_from_slice(&8u16.to_be_bytes());
+
+    // Fragment header with offset 0 (first fragment), MF can be set.
+    let mut frag = vec![0u8; 8 + udp.len()];
+    frag[0] = PROTO_UDP;
+    frag[2..4].copy_from_slice(&0x0001u16.to_be_bytes()); // offset 0, MF=1
+    frag[8..].copy_from_slice(&udp);
+    let mut pkt = vec![0u8; 40 + frag.len()];
+    pkt[0] = 0x60;
+    pkt[4..6].copy_from_slice(&(frag.len() as u16).to_be_bytes());
+    pkt[6] = 44;
+    pkt[7] = 64;
+    pkt[8..24].copy_from_slice(&src_v6.octets());
+    pkt[24..40].copy_from_slice(&dst_v6.octets());
+    pkt[40..].copy_from_slice(&frag);
+
+    assert!(!ipv6_is_non_first_fragment(&pkt), "first fragment is not non-first");
+    let v4 = translate_v6_to_v4(&pkt, snat_v4, dst_v4, false)
+        .expect("first fragment must translate");
+    assert_eq!(v4[9], PROTO_UDP);
+    assert_eq!(u16::from_be_bytes([v4[20], v4[21]]), 1111);
+}
+
+#[test]
+fn nat64_v6_to_v4_time_exceeded_quoting_ext_headered_tcp_translates() {
+    // FAIL-ON-REVERT (#2290 embedded path): an ICMPv6 Time-Exceeded whose
+    // quoted original packet carries a Dest-Opts header before TCP. Pre-fix
+    // the embedded translator read quote[6]=60 as the protocol and dropped
+    // the whole error -> PMTUD/traceroute blackhole. Now it walks the quoted
+    // ext-header chain and translates the embedded packet.
+    let client_v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+    let dst_v6: Ipv6Addr = "64:ff9b::0808:0808".parse().unwrap();
+    let snat_v4 = Ipv4Addr::new(198, 51, 100, 1);
+    let dst_v4 = Ipv4Addr::new(8, 8, 8, 8);
+
+    // Quoted original = v6 packet with Dest-Opts then 8 bytes of TCP.
+    let inner_l4 = [0x30u8, 0x39, 0x00, 0x50, 0x09, 0x08, 0x07, 0x06];
+    let embedded =
+        build_v6_with_ext_then_l4(client_v6, dst_v6, 60, &[0u8; 6], PROTO_TCP, 1, &inner_l4);
+    let icmp = build_icmpv6_error(3, 0, [0, 0, 0, 0], &embedded);
+    let hop_v6: Ipv6Addr = "2001:db8:ffff::1".parse().unwrap();
+    let mut v6_pkt = build_v6_with_l4(hop_v6, client_v6, PROTO_ICMPV6_C, 64, &icmp);
+    v6_pkt[42..44].copy_from_slice(&[0, 0]);
+    let s = checksum16_ipv6_pseudo(hop_v6, client_v6, PROTO_ICMPV6_C, &v6_pkt[40..]);
+    v6_pkt[42..44].copy_from_slice(&s.to_be_bytes());
+
+    let v4 = translate_v6_to_v4(&v6_pkt, snat_v4, dst_v4, false)
+        .expect("ICMPv6 error quoting ext-headered TCP must translate, not drop");
+    assert_eq!(v4[20], 11, "outer ICMPv4 Time Exceeded type");
+    assert_eq!(checksum16(&v4[..20]), 0);
+    // Embedded translated IPv4 header starts at v4[28] (20 outer IP + 8 ICMP).
+    let emb = &v4[28..];
+    assert_eq!(emb[9], PROTO_TCP, "embedded protocol = TCP, ext header stripped");
+    assert_eq!(&emb[12..16], &dst_v4.octets(), "embedded src mapped to dst_v4");
+    assert_eq!(&emb[16..20], &snat_v4.octets(), "embedded dst mapped to snat_v4");
+    assert_eq!(checksum16(&emb[..20]), 0, "embedded IPv4 header checksum valid");
+}
+
+#[test]
+fn nat64_v6_to_v4_ext_header_path_unaffects_plain_tcp() {
+    // Regression: a PLAIN TCP packet (no ext header) must still translate
+    // byte-identically after the walk was added — the walk returns offset 40
+    // for a packet whose first next-header is already the L4.
+    let src_v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+    let dst_v6: Ipv6Addr = "64:ff9b::c633:6432".parse().unwrap();
+    let pkt = make_ipv6_tcp_packet(src_v6, dst_v6, 12345, 80, b"hello");
+    let (off, proto) = ipv6_l4_offset_and_protocol(&pkt).expect("plain walk");
+    assert_eq!(off, 40, "no ext header -> L4 at byte 40");
+    assert_eq!(proto, PROTO_TCP);
+    let v4 = translate_v6_to_v4(
+        &pkt,
+        Ipv4Addr::new(198, 51, 100, 1),
+        Ipv4Addr::new(198, 51, 100, 50),
+        false,
+    )
+    .expect("plain TCP translate");
+    assert_eq!(v4.len(), 45, "plain TCP length unchanged (20 + 25)");
+    assert_eq!(v4[9], PROTO_TCP);
+}
+
+// ===========================================================================
+// #2291: fail-closed tri-state NAT64 lookup. A matched prefix with no usable
+// source pool must drop, not fall through to IPv6 routing on the synthetic
+// destination.
+// ===========================================================================
+
+#[test]
+fn classify_no_prefix_match_continues_ipv6_routing() {
+    let state = Nat64State::from_snapshots(&[well_known_prefix()]);
+    let dst: Ipv6Addr = "2001:db8::1".parse().unwrap(); // not the NAT64 prefix
+    assert_eq!(state.classify_ipv6_dest(dst), Nat64Match::NoPrefixMatch);
+}
+
+#[test]
+fn classify_match_ready_when_pool_has_source() {
+    let state = Nat64State::from_snapshots(&[well_known_prefix()]);
+    let dst: Ipv6Addr = "64:ff9b::c633:6432".parse().unwrap(); // ::198.51.100.50
+    match state.classify_ipv6_dest(dst) {
+        Nat64Match::MatchReady {
+            prefix_idx,
+            dst_v4,
+            snat_v4,
+            dst_v6,
+        } => {
+            assert_eq!(prefix_idx, 0);
+            assert_eq!(dst_v4, Ipv4Addr::new(198, 51, 100, 50));
+            assert!(
+                snat_v4 == Ipv4Addr::new(198, 51, 100, 1)
+                    || snat_v4 == Ipv4Addr::new(198, 51, 100, 2),
+                "snat from configured pool"
+            );
+            assert_eq!(dst_v6, dst);
+        }
+        other => panic!("expected MatchReady, got {other:?}"),
+    }
+}
+
+#[test]
+fn classify_match_unavailable_on_empty_pool_fails_closed() {
+    // The exact #2291 wire state: a configured NAT64 prefix with an empty
+    // (no-source) pool. The lookup MUST report MatchUnavailable so the caller
+    // drops, NOT NoPrefixMatch (which would continue IPv6 routing on the
+    // synthetic destination — the pre-fix fail-open).
+    let state = Nat64State::from_snapshots(&[NAT64RuleSnapshot {
+        name: "no-pool".to_string(),
+        prefix: "64:ff9b::/96".to_string(),
+        pool_addresses: vec![],
+        no_v6_frag_header: false,
+    }]);
+    let dst: Ipv6Addr = "64:ff9b::0808:0808".parse().unwrap();
+
+    // Sanity: the prefix DOES match, and the source allocation DOES fail.
+    assert!(state.match_ipv6_dest(dst).is_some(), "prefix must match");
+    assert!(state.allocate_v4_source(0).is_none(), "empty pool yields no source");
+
+    let result = state.classify_ipv6_dest(dst);
+    assert_eq!(
+        result,
+        Nat64Match::MatchUnavailable,
+        "empty-pool match must fail closed (drop), not fall through to IPv6 routing"
+    );
+    // Counter-factual: the pre-fix chain collapsed this to None ==
+    // NoPrefixMatch, which the caller treats as "route as IPv6". Assert the
+    // new result is NOT that fail-open value.
+    assert_ne!(
+        result,
+        Nat64Match::NoPrefixMatch,
+        "must NOT be treated as no-match (would IPv6-route the synthetic dest)"
+    );
+}
