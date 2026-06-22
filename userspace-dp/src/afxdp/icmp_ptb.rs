@@ -118,8 +118,11 @@ fn ipv4_df_set(packet: &[u8]) -> bool {
 
 /// RFC error-suppression gate shared by the PTB path. Mirrors the reject
 /// path: never reply to a non-first fragment (no transport header to quote
-/// / key) or to an inbound ICMP/ICMPv6 *error* message (avoid error loops
-/// and amplification). Returns true when a PTB MUST be suppressed.
+/// / key), to a trigger packet whose destination was multicast/broadcast
+/// (RFC 1812 §4.3.2.7 / RFC 4443 §2.4(e), #2314 — a multicast flood must
+/// not be amplified into an ICMP-error backscatter storm), or to an
+/// inbound ICMP/ICMPv6 *error* message (avoid error loops and
+/// amplification). Returns true when a PTB MUST be suppressed.
 #[inline]
 pub(in crate::afxdp) fn ptb_reply_suppressed(
     frame: &[u8],
@@ -130,6 +133,11 @@ pub(in crate::afxdp) fn ptb_reply_suppressed(
         return true;
     };
     if is_non_first_fragment(packet, meta.addr_family) {
+        return true;
+    }
+    // #2314: never generate a PTB in reply to a datagram whose IP
+    // destination was multicast or broadcast.
+    if dest_is_multicast_or_broadcast(meta.addr_family, packet) {
         return true;
     }
     if matches!(meta.protocol, PROTO_ICMP | PROTO_ICMPV6) {

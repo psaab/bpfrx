@@ -61,14 +61,15 @@ pub(super) fn can_generate_icmp_error_reply(frame: &[u8], meta: UserspaceDpMeta)
                 return false;
             }
             let src = Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]);
-            let dst = Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
-            // (d) bad source / (c) group or broadcast destination.
+            // (d) bad source / (c) group or broadcast destination. The
+            // destination test routes through the shared #2314 predicate
+            // so the PTB, reject, and Time Exceeded paths agree on what a
+            // multicast/broadcast destination is.
             if src.is_unspecified()
                 || src.is_loopback()
                 || src.is_multicast()
                 || src.is_broadcast()
-                || dst.is_multicast()
-                || dst.is_broadcast()
+                || dest_is_multicast_or_broadcast(meta.addr_family, packet)
             {
                 return false;
             }
@@ -81,16 +82,13 @@ pub(super) fn can_generate_icmp_error_reply(frame: &[u8], meta: UserspaceDpMeta)
                 Ok(addr) => addr,
                 Err(_) => return false,
             });
-            let dst = Ipv6Addr::from(match <[u8; 16]>::try_from(&packet[24..40]) {
-                Ok(addr) => addr,
-                Err(_) => return false,
-            });
             // (d) bad source / (c) multicast destination. IPv6 has no
-            // broadcast; multicast covers the group case.
+            // broadcast; multicast (ff00::/8) covers the group case. The
+            // destination test routes through the shared #2314 predicate.
             if src.is_unspecified()
                 || src.is_loopback()
                 || src.is_multicast()
-                || dst.is_multicast()
+                || dest_is_multicast_or_broadcast(meta.addr_family, packet)
             {
                 return false;
             }
@@ -674,5 +672,118 @@ mod tests {
             build_local_icmp_error_v4(&frame, meta, ICMP_IFINDEX, &fwd, 11, 0).expect("v4 error");
         assert_eq!(&out[12..14], &[0x81, 0x00]);
         assert_eq!(&out[14..16], &50u16.to_be_bytes(), "egress VID 50 fallback");
+    }
+
+    /// #2314: rewrite the IPv4 destination of an `inbound_v4` frame
+    /// (offset depends on the L2 tag) and fix the IP-header checksum.
+    fn set_inbound_v4_dst(frame: &mut [u8], meta: UserspaceDpMeta, dst: Ipv4Addr) {
+        let l3 = meta.l3_offset as usize;
+        frame[l3 + 16..l3 + 20].copy_from_slice(&dst.octets());
+        frame[l3 + 10..l3 + 12].copy_from_slice(&[0, 0]);
+        let csum = checksum16(&frame[l3..l3 + 20]);
+        frame[l3 + 10..l3 + 12].copy_from_slice(&csum.to_be_bytes());
+    }
+
+    /// Build an inbound IPv6 UDP frame (untagged) destined to `dst`, with
+    /// `l4_offset` set so `can_generate_icmp_error_reply` can locate the
+    /// transport header.
+    fn inbound_v6_to(dst: Ipv6Addr) -> (Vec<u8>, UserspaceDpMeta) {
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]); // firewall NIC
+        frame.extend_from_slice(&[0x00, 0x25, 0x90, 0x12, 0x34, 0x56]); // sender
+        frame.extend_from_slice(&0x86ddu16.to_be_bytes());
+        let l3 = frame.len();
+        frame.push(0x60); // version 6
+        frame.extend_from_slice(&[0x00, 0x00, 0x00]); // TC/flow
+        frame.extend_from_slice(&8u16.to_be_bytes()); // payload = 8 (UDP hdr)
+        frame.push(17); // next header UDP
+        frame.push(64); // hop limit
+        frame.extend_from_slice(&"2001:559:8585:bf01::20".parse::<Ipv6Addr>().unwrap().octets());
+        frame.extend_from_slice(&dst.octets());
+        let l4 = frame.len();
+        frame.extend_from_slice(&49152u16.to_be_bytes());
+        frame.extend_from_slice(&5201u16.to_be_bytes());
+        frame.extend_from_slice(&8u16.to_be_bytes());
+        frame.extend_from_slice(&0u16.to_be_bytes());
+        let meta = UserspaceDpMeta {
+            ingress_ifindex: ICMP_IFINDEX as u32,
+            l3_offset: l3 as u16,
+            l4_offset: l4 as u16,
+            addr_family: libc::AF_INET6 as u8,
+            protocol: 17,
+            ..UserspaceDpMeta::default()
+        };
+        (frame, meta)
+    }
+
+    /// #2314 reject/time-exceeded path: a trigger packet whose IPv4
+    /// destination is multicast (224.0.0.0/4) must suppress the locally
+    /// generated ICMP error (`can_generate_icmp_error_reply` returns false,
+    /// so `build_reject_icmp_unreachable` returns None). RFC 1812 §4.3.2.7.
+    #[test]
+    fn reject_suppressed_for_v4_multicast_dst() {
+        let (mut frame, meta) = inbound_v4(InL2::Untagged);
+        set_inbound_v4_dst(&mut frame, meta, Ipv4Addr::new(239, 1, 2, 3));
+        assert!(
+            !can_generate_icmp_error_reply(&frame, meta),
+            "IPv4 multicast destination must suppress the reply"
+        );
+        let fwd = forwarding_with_egress(0);
+        assert!(
+            build_reject_icmp_unreachable(&frame, meta, ICMP_IFINDEX, &fwd).is_none(),
+            "reject unreachable must not build for a multicast destination"
+        );
+    }
+
+    /// #2314: an IPv4 trigger destined to the limited broadcast
+    /// 255.255.255.255 must suppress the reply.
+    #[test]
+    fn reject_suppressed_for_v4_limited_broadcast_dst() {
+        let (mut frame, meta) = inbound_v4(InL2::Untagged);
+        set_inbound_v4_dst(&mut frame, meta, Ipv4Addr::new(255, 255, 255, 255));
+        assert!(
+            !can_generate_icmp_error_reply(&frame, meta),
+            "IPv4 limited broadcast destination must suppress the reply"
+        );
+    }
+
+    /// #2314: an IPv6 trigger destined to ff00::/8 multicast must suppress
+    /// the reply (RFC 4443 §2.4(e)).
+    #[test]
+    fn reject_suppressed_for_v6_multicast_dst() {
+        let (frame, meta) = inbound_v6_to("ff02::1".parse().expect("v6 mcast"));
+        assert!(
+            !can_generate_icmp_error_reply(&frame, meta),
+            "IPv6 multicast destination must suppress the reply"
+        );
+        let fwd = forwarding_with_egress(0);
+        assert!(
+            build_reject_icmp_unreachable(&frame, meta, ICMP_IFINDEX, &fwd).is_none(),
+            "reject unreachable must not build for an IPv6 multicast destination"
+        );
+    }
+
+    /// #2314 fail-on-revert: a NORMAL unicast destination must STILL allow
+    /// the reply. Pairs with the suppression tests so reverting the gate
+    /// turns those red while this one stays green.
+    #[test]
+    fn reject_still_allowed_for_unicast_dst() {
+        // IPv4 default destination 172.16.80.200 is plain unicast.
+        let (frame4, meta4) = inbound_v4(InL2::Untagged);
+        assert!(
+            can_generate_icmp_error_reply(&frame4, meta4),
+            "a unicast IPv4 destination must allow the reply"
+        );
+        let fwd = forwarding_with_egress(0);
+        assert!(
+            build_reject_icmp_unreachable(&frame4, meta4, ICMP_IFINDEX, &fwd).is_some(),
+            "reject unreachable must build for a unicast destination"
+        );
+        // IPv6 global unicast destination.
+        let (frame6, meta6) = inbound_v6_to("2001:559:8585:80::200".parse().expect("v6 ucast"));
+        assert!(
+            can_generate_icmp_error_reply(&frame6, meta6),
+            "a unicast IPv6 destination must allow the reply"
+        );
     }
 }

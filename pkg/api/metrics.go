@@ -255,7 +255,7 @@ type xpfCollector struct {
 	// inner) — the WG sibling of the GRE counter above.
 	userspaceWgDecapEcnIllegalDrops *prometheus.Desc
 	userspaceFlowCacheActiveFlows   *prometheus.Desc
-	userspaceFlowCacheCapacity                  *prometheus.Desc
+	userspaceFlowCacheCapacity      *prometheus.Desc
 	// #1379: daemon-side userspace event-stream transport counters.
 	userspaceEventStreamFramesTotal          *prometheus.Desc
 	userspaceEventStreamProducerFramesTotal  *prometheus.Desc

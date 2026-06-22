@@ -82,8 +82,16 @@ sync.
   `icmp.rs`'s reflected-error shape (L2 reflect + ingress-sourced outer
   IP + quoted inbound packet) but sets the MTU field; reuses the shared
   header/checksum helpers and the RFC error-suppression gate
-  (`reject_icmp_reply_suppressed`, `is_non_first_fragment`). Kept
-  separate from `icmp.rs` so the diff stays additive.
+  (`reject_icmp_reply_suppressed`, `is_non_first_fragment`,
+  `dest_is_multicast_or_broadcast`). Kept separate from `icmp.rs` so the
+  diff stays additive. #2314: the PTB gate (`ptb_reply_suppressed`) now
+  also drops PTBs triggered by a multicast/broadcast-destined datagram
+  (RFC 1812 §4.3.2.7 / RFC 4443 §2.4(e)), sharing the
+  `dest_is_multicast_or_broadcast` predicate (`frame/inspect.rs`) with
+  `icmp.rs`'s `can_generate_icmp_error_reply` so the PTB, reject, and
+  Time Exceeded paths agree. No new counter: a suppressed PTB is folded
+  into the existing fail-closed silent-drop path (the oversized original
+  is still dropped via `mtu_signalled`).
 - `cos/` — Class-of-Service scheduler: token-bucket admission, MQFQ
   active-bucket selection, fair-share lease (#1229 Phase 6 v8). See
   `docs/per-5-tuple/state.md` for the architectural ceiling.

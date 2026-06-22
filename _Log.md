@@ -49,6 +49,104 @@
   worker_queue concurrent_recovery (no ECN/WG refs, fails 1/3 in
   isolation, on master too). Live loss-cluster smoke deferred to parent.
 
+## 2026-06-22 — #2321 round 2: bound L4 port read by IP-declared length
+
+- **Timestamp**: 2026-06-22 PDT
+- **Action**: Fold Copilot's follow-up on PR #2322. The round-1 fix made
+  `generated_l4_ports` return `None` when the 4 port bytes were absent, but it
+  bounded the read by the BACKING SLICE length only, not by the IP-declared
+  length (`pkt_len` = IPv4 total_len / IPv6 40+payload_len, each clamped to the
+  slice). A corrupted/short total_len/payload_len that ends BEFORE the L4
+  header while the buffer still has trailing bytes would read those slack bytes
+  and return bogus ports instead of failing closed — exactly what the doc
+  comment claimed it prevented. Now `generated_l4_ports` takes `pkt_len` and
+  returns `None` for TCP/UDP when `rel_l4 + 4 > pkt_len` (read bounded by
+  `min(pkt_len, slice_len)` = `pkt_len`, since `pkt_len <= packet.len()` by
+  construction). Both call sites pass the already-computed `pkt_len`.
+  ICMP/ICMPv6 unchanged (no ports).
+- **File(s)**: userspace-dp/src/afxdp/frame/generated.rs,
+  userspace-dp/src/afxdp/frame/generated_tests.rs, _Log.md
+- **Tests**: added `v4_tcp_declared_len_short_of_ports_fails_closed_none`,
+  `v4_udp_declared_len_short_of_ports_fails_closed_none`,
+  `v6_tcp_declared_len_short_of_ports_fails_closed_none`,
+  `v6_udp_declared_len_short_of_ports_fails_closed_none` — each corrupts
+  total_len/payload_len to end before the L4 header while keeping the full
+  backing buffer (asserts the buffer retains the trailing port bytes), so they
+  FAIL if the bound is reverted to slice-only (verified: 0/4 with the bound
+  neutered). `cargo build --release` clean; `generated` (17 tests) +
+  `cos_classify` green, 5x flake-free.
+
+## 2026-06-22 — #2321 generated-reply parser fail-closed (§6.2)
+
+- **Timestamp**: 2026-06-22 PDT
+- **Action**: Make `parse_generated_v4`/`parse_generated_v6` fail CLOSED
+  when a locally-generated TCP/UDP reply is truncated before its 4 L4 port
+  bytes. `generated_l4_ports` now returns `Option<(u16,u16)>` — `None` for a
+  TCP/UDP frame whose ports cannot be read at the computed L4 offset, rather
+  than the old `(0,0)` substitution that misclassified the reply past an
+  output-filter `discard`. Both parsers propagate the `None` with `?`, so the
+  caller (`classify_generated_reply` in `tx/cos_classify.rs`) drops the reply
+  and bumps `generated_reply_classify_parse_errors`. ICMP/ICMPv6 (no transport
+  ports) still return `(0,0)` unchanged; well-formed TCP/UDP replies are
+  unaffected. Defense-in-depth — generated replies are well-formed by
+  construction. Copilot flagged this on PR #2319.
+- **File(s)**: userspace-dp/src/afxdp/frame/generated.rs,
+  userspace-dp/src/afxdp/frame/generated_tests.rs, _Log.md
+- **Tests**: added `truncated_v4_tcp_ports_fails_closed_none`,
+  `truncated_v4_udp_ports_fails_closed_none`,
+  `truncated_v6_tcp_ports_fails_closed_none`,
+  `truncated_v6_udp_ports_fails_closed_none` (fail-on-revert — they pass with
+  `(0,0)` substitution if the guard is removed) and `parses_v4_udp_reply_ports`
+  (well-formed regression guard). `cargo build --release` clean;
+  `cargo test --release -- generated parse_generated cos_classify` green.
+
+## 2026-06-22 — #2314 review fold: dest predicate fails closed on unknown family
+
+- **Timestamp**: 2026-06-22 PDT
+- **Action**: Copilot review of PR #2323 — `dest_is_multicast_or_broadcast`
+  documented "fails closed" but its default (unknown `addr_family`) arm
+  returned `false` (fail OPEN). Flipped the default arm to `true` so an
+  unclassifiable destination family suppresses the ICMP error (the safer
+  posture — never emit backscatter for a packet whose family we did not
+  parse) and updated the doc comment to spell out the unknown-family
+  fail-closed behaviour. In practice the error generators never call this
+  for a non-IP family (their own family dispatch rejects first), so this
+  is contract-hardening, not a behaviour change on the live paths. Added
+  `dest_predicate_fails_closed_on_unknown_family` (fails if reverted to
+  `false`): addr_family 0 and AF_UNIX suppress, while the same unicast
+  bytes under AF_INET do NOT. `cargo build --release` clean; icmp/ptb/
+  reject/multicast/suppress tests green 5x.
+- **File(s)**: userspace-dp/src/afxdp/frame/inspect.rs,
+  userspace-dp/src/afxdp/icmp_ptb_tests.rs
+
+## 2026-06-22 — #2314 suppress ICMP/ICMPv6 errors for multicast/broadcast triggers
+
+- **Timestamp**: 2026-06-22 PDT
+- **Action**: RFC 1812 §4.3.2.7 / RFC 4443 §2.4(e) — a locally generated
+  ICMP/ICMPv6 error MUST NOT be originated when the triggering packet's
+  IP destination was multicast or broadcast (a multicast flood otherwise
+  amplifies into an ICMP-error backscatter storm). Added a shared cheap
+  predicate `dest_is_multicast_or_broadcast(addr_family, packet)` in
+  `frame/inspect.rs` (IPv4 224.0.0.0/4 + 255.255.255.255 via
+  `Ipv4Addr::is_multicast`/`is_broadcast`; IPv6 ff00::/8 via the leading
+  0xff byte; too-short slice fails closed). Gated the #2310/#2301 PTB
+  generation site by adding the predicate to `ptb_reply_suppressed`
+  (`icmp_ptb.rs`) — this was the real gap. Routed the reject /
+  Time Exceeded path's destination test in
+  `can_generate_icmp_error_reply` (`icmp.rs`) through the same predicate
+  (it already inline-suppressed multicast/broadcast; now DRY). No new
+  counter: a suppressed reply folds into the existing fail-closed
+  silent-drop path (the oversized/rejected original is still dropped).
+  Tests: 8 fail-on-revert unit tests (PTB + reject/time-exceeded) for
+  IPv4 multicast, IPv4 limited-broadcast, IPv6 multicast suppression plus
+  unicast-still-generated; verified 6 go red when the guards are reverted,
+  5x flake-free, `cargo build --release` clean. No Go/wire change.
+- **File(s)**: userspace-dp/src/afxdp/frame/inspect.rs,
+  userspace-dp/src/afxdp/frame/mod.rs, userspace-dp/src/afxdp/icmp.rs,
+  userspace-dp/src/afxdp/icmp_ptb.rs,
+  userspace-dp/src/afxdp/icmp_ptb_tests.rs,
+  userspace-dp/src/afxdp/README.md
+
 ## 2026-06-22 — #1434 review round 1 (NEEDS-MINOR fold)
 
 - **Timestamp**: 2026-06-22 PDT

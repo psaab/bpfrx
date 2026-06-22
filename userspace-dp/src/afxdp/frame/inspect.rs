@@ -310,6 +310,52 @@ pub(in crate::afxdp) fn is_non_first_fragment(packet: &[u8], addr_family: u8) ->
     }
 }
 
+/// #2314: RFC 1812 §4.3.2.7 / RFC 4443 §2.4(e) — a router MUST NOT
+/// originate an ICMP/ICMPv6 *error* in reply to a datagram whose IP
+/// destination was a broadcast or multicast address. Reading the
+/// destination straight off the L3-relative packet slice keeps this
+/// cheap on the (cold-ish) error-generation arms: a single octet test
+/// for the common cases.
+///
+///   - IPv4: multicast 224.0.0.0/4 (first octet 224..=239) OR the
+///     limited broadcast 255.255.255.255. Subnet/directed broadcasts
+///     require per-interface mask knowledge that is not available at the
+///     generation site, so they are not detectable here — the limited
+///     broadcast and the multicast block are the cases this gate covers.
+///   - IPv6: multicast ff00::/8 (first byte 0xff). IPv6 has no broadcast.
+///
+/// Returns `true` when an ICMP error MUST be suppressed for this trigger
+/// destination. Fails closed (`true`) on a too-short packet slice and on
+/// an unknown/unexpected `addr_family`: a destination we cannot classify
+/// must suppress the error rather than risk emitting backscatter for a
+/// packet whose family (and therefore whose group/broadcast bits) we did
+/// not parse.
+#[inline]
+pub(in crate::afxdp) fn dest_is_multicast_or_broadcast(addr_family: u8, packet: &[u8]) -> bool {
+    match addr_family as i32 {
+        libc::AF_INET => {
+            let Some(dst) = packet.get(16..20) else {
+                return true;
+            };
+            let dst = Ipv4Addr::new(dst[0], dst[1], dst[2], dst[3]);
+            dst.is_multicast() || dst.is_broadcast()
+        }
+        libc::AF_INET6 => {
+            let Some(dst) = packet.get(24..40) else {
+                return true;
+            };
+            // ff00::/8 — the leading byte alone identifies all IPv6
+            // multicast (link-local-all-nodes, solicited-node, etc.).
+            dst[0] == 0xff
+        }
+        // Unknown family — fail closed (suppress). The error generators
+        // never call this for a non-IP family in practice (their own
+        // family dispatch rejects first), but the predicate's contract is
+        // "suppress on anything we could not classify."
+        _ => true,
+    }
+}
+
 pub(in crate::afxdp) fn metadata_tuple_complete(meta: UserspaceDpMeta, flow: &SessionFlow) -> bool {
     if flow.src_ip.is_unspecified() || flow.dst_ip.is_unspecified() {
         return false;
