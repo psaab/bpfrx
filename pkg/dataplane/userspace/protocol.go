@@ -989,6 +989,7 @@ type EventStreamStatus struct {
 	SeqGaps           uint64 `json:"seq_gaps,omitempty"`
 	PolicyDenyEvents  uint64 `json:"policy_deny_events,omitempty"`
 	ScreenDropEvents  uint64 `json:"screen_drop_events,omitempty"`
+	ScreenAlarmEvents uint64 `json:"screen_alarm_events,omitempty"`
 	FilterLogEvents   uint64 `json:"filter_log_events,omitempty"`
 	PolicyDenyDrops   uint64 `json:"policy_deny_drops,omitempty"`
 	ScreenDropDrops   uint64 `json:"screen_drop_drops,omitempty"`
