@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -81,6 +82,34 @@ type l2Replier interface {
 	Close() error
 }
 
+// relaySpec is the immutable per-interface configuration that determines a
+// relay session's behavior. Apply (#2348) keys the desired set by interface
+// name and compares the running relay's spec against the desired spec to
+// decide start (added), stop (removed), or restart (changed). Two specs are
+// equal iff their server set (order-significant: the relay forwards to servers
+// in config order) and alwaysBroadcast flag match — a change in either is a
+// behavior change that requires a fresh session.
+type relaySpec struct {
+	servers         []string // server IPs in config order
+	alwaysBroadcast bool
+}
+
+// equal reports whether two specs would produce an identical relay session.
+func (s relaySpec) equal(o relaySpec) bool {
+	if s.alwaysBroadcast != o.alwaysBroadcast {
+		return false
+	}
+	if len(s.servers) != len(o.servers) {
+		return false
+	}
+	for i := range s.servers {
+		if s.servers[i] != o.servers[i] {
+			return false
+		}
+	}
+	return true
+}
+
 // interfaceRelay represents a relay goroutine bound to one interface.
 type interfaceRelay struct {
 	ifaceName        string
@@ -88,6 +117,12 @@ type interfaceRelay struct {
 	done             chan struct{}
 	requestsRelayed  atomic.Uint64
 	repliesForwarded atomic.Uint64
+
+	// spec is the desired-config snapshot this relay was started with. Apply
+	// (#2348) compares it against the new desired spec to detect a changed
+	// group (servers / always-broadcast) that requires a restart. Set once at
+	// start; read-only thereafter (Apply holds m.mu while reading it).
+	spec relaySpec
 
 	// alwaysBroadcast forces every reply to broadcast (overrides
 	// always-broadcast). Set once at start; read-only thereafter.
@@ -243,19 +278,43 @@ func defaultIfindexResolver(ifaceName string) (int, error) {
 	return iface.Index, nil
 }
 
-// Apply starts relay goroutines according to the provided configuration.
-// It stops any previously running relays before starting new ones.
-func (m *Manager) Apply(ctx context.Context, cfg *config.DHCPRelayConfig) {
-	m.Stop()
+// desiredRelay is one entry in the desired relay set computed from config: the
+// interface to bind, the originating group (for logging), and the per-interface
+// spec (servers + always-broadcast). Server addresses are resolved at the
+// desired-set build so a relay started from this entry never re-parses config.
+type desiredRelay struct {
+	ifaceName string
+	groupName string
+	spec      relaySpec
+	servers   []*net.UDPAddr
+}
 
+// computeDesired builds the desired per-interface relay set from config. It
+// mirrors the validation the previous Apply did inline (skip unknown/empty
+// server groups, skip invalid server IPs, skip an interface that already has a
+// desired entry — first group wins, matching the pre-#2348 dedup) but produces
+// data instead of starting goroutines, so Apply can diff it against the running
+// set. The returned map is keyed by interface name.
+func computeDesired(cfg *config.DHCPRelayConfig) map[string]desiredRelay {
+	desired := make(map[string]desiredRelay)
 	if cfg == nil {
-		return
+		return desired
 	}
-
-	m.mu.Lock()
-	defer m.mu.Unlock()
-
-	for _, group := range cfg.Groups {
+	// Iterate groups in a DETERMINISTIC (sorted-by-name) order. cfg.Groups is a
+	// map, and the "interface already mapped, skipping" dedup below is
+	// first-group-wins — so a random map-iteration order would make an
+	// interface that appears in multiple groups resolve to a nondeterministic
+	// group across Apply calls. That both picks a nondeterministic server set
+	// AND defeats the day-2 idempotency diff (a re-Apply of the SAME config
+	// could compute a different relaySpec and spuriously restart the relay).
+	// Sorting the group names makes first-wins stable and the diff idempotent.
+	groupNames := make([]string, 0, len(cfg.Groups))
+	for name := range cfg.Groups {
+		groupNames = append(groupNames, name)
+	}
+	sort.Strings(groupNames)
+	for _, gname := range groupNames {
+		group := cfg.Groups[gname]
 		sgName := group.ActiveServerGroup
 		sg, ok := cfg.ServerGroups[sgName]
 		if !ok {
@@ -269,7 +328,11 @@ func (m *Manager) Apply(ctx context.Context, cfg *config.DHCPRelayConfig) {
 			continue
 		}
 
-		// Resolve server addresses once at apply time.
+		// Resolve server addresses once. Keep the validated string list in
+		// lockstep with serverAddrs so the spec's equality compares exactly the
+		// servers the relay will use (a server dropped for being invalid must
+		// not count as "changed" forever).
+		serverIPs := make([]string, 0, len(sg.Servers))
 		serverAddrs := make([]*net.UDPAddr, 0, len(sg.Servers))
 		for _, s := range sg.Servers {
 			ip := net.ParseIP(s)
@@ -278,6 +341,7 @@ func (m *Manager) Apply(ctx context.Context, cfg *config.DHCPRelayConfig) {
 					"group", group.Name, "server", s)
 				continue
 			}
+			serverIPs = append(serverIPs, s)
 			serverAddrs = append(serverAddrs, &net.UDPAddr{IP: ip, Port: relayPort})
 		}
 		if len(serverAddrs) == 0 {
@@ -285,31 +349,125 @@ func (m *Manager) Apply(ctx context.Context, cfg *config.DHCPRelayConfig) {
 		}
 
 		for _, ifaceName := range group.Interfaces {
-			if _, exists := m.relays[ifaceName]; exists {
-				slog.Warn("dhcp-relay: interface already has relay, skipping",
+			if _, exists := desired[ifaceName]; exists {
+				slog.Warn("dhcp-relay: interface already mapped, skipping",
 					"interface", ifaceName, "group", group.Name)
 				continue
 			}
-
-			rctx, cancel := context.WithCancel(ctx)
-			ir := &interfaceRelay{
-				ifaceName:       ifaceName,
-				cancel:          cancel,
-				done:            make(chan struct{}),
-				alwaysBroadcast: group.AlwaysBroadcast,
+			desired[ifaceName] = desiredRelay{
+				ifaceName: ifaceName,
+				groupName: group.Name,
+				spec: relaySpec{
+					servers:         serverIPs,
+					alwaysBroadcast: group.AlwaysBroadcast,
+				},
+				servers: serverAddrs,
 			}
-			m.relays[ifaceName] = ir
-
-			go func(relay *interfaceRelay, servers []*net.UDPAddr) {
-				defer close(relay.done)
-				m.runRelay(rctx, cancel, relay, servers)
-			}(ir, serverAddrs)
-
-			slog.Info("dhcp-relay: started",
-				"interface", ifaceName,
-				"group", group.Name,
-				"servers", sg.Servers)
 		}
+	}
+	return desired
+}
+
+// Apply reconciles the running per-interface relays to match the provided
+// configuration (#2348). It is called at boot AND on every day-2 commit
+// (pkg/daemon/daemon_apply.go), so it must diff desired-vs-running rather than
+// tearing everything down:
+//
+//   - interface in desired but not running  -> start a new relay
+//   - interface running but not desired      -> stop it (bounded teardown)
+//   - interface in both, spec changed         -> stop then start (restart)
+//   - interface in both, spec unchanged       -> leave running (no churn)
+//
+// A nil cfg stops all relays (relay configuration removed). Stop-then-start of
+// a changed/removed interface reuses the same ir.cancel()+<-ir.done teardown as
+// Stop(): the per-interface supervisor (#2347 runRelay) and socket lifecycle
+// (#1915 close-on-cancel + WaitGroup join) fully close the old listener before
+// the replacement binds, so a restart never races EADDRINUSE and never hangs.
+func (m *Manager) Apply(ctx context.Context, cfg *config.DHCPRelayConfig) {
+	desired := computeDesired(cfg)
+
+	// Phase 1 (under lock): decide which running relays to stop and which
+	// desired relays to start, mutating m.relays to the post-reconcile set.
+	// We collect the relays to stop and start them OUTSIDE the lock so the
+	// bounded <-ir.done join does not hold m.mu (Stats()/concurrent Apply
+	// would otherwise block on a teardown).
+	m.mu.Lock()
+
+	var toStop []*interfaceRelay // removed or changed: tear down
+	// Remove relays that are no longer desired, or whose spec changed. A
+	// changed relay is removed here and re-added in the start loop below.
+	for name, ir := range m.relays {
+		d, want := desired[name]
+		if !want {
+			toStop = append(toStop, ir)
+			delete(m.relays, name)
+			slog.Info("dhcp-relay: stopping (interface removed from config)",
+				"interface", name)
+			continue
+		}
+		if !ir.spec.equal(d.spec) {
+			toStop = append(toStop, ir)
+			delete(m.relays, name)
+			slog.Info("dhcp-relay: restarting (config changed)",
+				"interface", name,
+				"old_servers", ir.spec.servers, "new_servers", d.spec.servers,
+				"old_always_broadcast", ir.spec.alwaysBroadcast,
+				"new_always_broadcast", d.spec.alwaysBroadcast)
+		}
+	}
+
+	// Start relays that are desired but not currently running (newly added,
+	// plus the ones just removed for a spec change). Record each ir in
+	// m.relays before releasing the lock so a concurrent Apply observes the
+	// new set; the goroutine is launched after the lock is dropped is fine —
+	// the supervisor only reads its own ir + the manager seams.
+	var toStart []struct {
+		ir      *interfaceRelay
+		rctx    context.Context
+		servers []*net.UDPAddr
+		group   string
+	}
+	for name, d := range desired {
+		if _, running := m.relays[name]; running {
+			continue
+		}
+		rctx, cancel := context.WithCancel(ctx)
+		ir := &interfaceRelay{
+			ifaceName:       d.ifaceName,
+			cancel:          cancel,
+			done:            make(chan struct{}),
+			spec:            d.spec,
+			alwaysBroadcast: d.spec.alwaysBroadcast,
+		}
+		m.relays[name] = ir
+		toStart = append(toStart, struct {
+			ir      *interfaceRelay
+			rctx    context.Context
+			servers []*net.UDPAddr
+			group   string
+		}{ir, rctx, d.servers, d.groupName})
+	}
+	m.mu.Unlock()
+
+	// Phase 2 (outside lock): tear down removed/changed relays. For a changed
+	// interface this completes BEFORE the replacement's listener binds below,
+	// so the old SO_BINDTODEVICE socket is fully closed (no EADDRINUSE).
+	for _, ir := range toStop {
+		ir.cancel()
+		<-ir.done
+	}
+
+	// Phase 3 (outside lock): launch the new/restarted relays.
+	for _, s := range toStart {
+		go func(relay *interfaceRelay, rctx context.Context, servers []*net.UDPAddr) {
+			defer close(relay.done)
+			m.runRelay(rctx, relay.cancel, relay, servers)
+		}(s.ir, s.rctx, s.servers)
+
+		slog.Info("dhcp-relay: started",
+			"interface", s.ir.ifaceName,
+			"group", s.group,
+			"servers", s.ir.spec.servers)
 	}
 }
 

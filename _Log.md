@@ -10567,3 +10567,31 @@ top.
     No NAT64 doc documents L4-checksum sentinel handling; inline comment is the
     contract.
   - **File(s)**: userspace-dp/src/nat64.rs, userspace-dp/src/nat64_tests.rs, _Log.md
+
+- **Timestamp**: 2026-06-22
+  - **Action**: #2348 DHCP relay day-2 reconcile. (1) Wired the relay into the
+    commit-apply pipeline: new `daemon.reconcileDHCPRelay` called from
+    `applyConfigLocked` (step 16c, after reconcileFlowExporters), forwarding
+    `cfg.ForwardingOptions.DHCPRelay` to the Manager on `d.daemonCtx`. The boot
+    site now always creates the Manager (was gated on a non-nil relay config) so
+    a relay added day-2 can start. (2) Made `Manager.Apply` a true per-interface
+    reconcile instead of stop-all/rebuild-all: `computeDesired` builds the
+    desired set keyed by interface (spec = resolved server list + always-
+    broadcast); Apply diffs vs the running `relays` map — start added, stop
+    removed (and nil cfg stops all), restart changed (spec inequality), leave
+    unchanged (idempotent, no churn). Stop/restart reuse the #2347 supervisor +
+    #1915 close-on-cancel teardown; old listener fully closes before the
+    replacement binds (no EADDRINUSE); teardown joins run outside m.mu (no
+    Stats()/Apply stall).
+  - **Validation**: go build ./... clean; go test ./pkg/dhcprelay/...
+    ./pkg/daemon/... green; -race ./pkg/dhcprelay green; new tests 5x stable.
+    New Manager tests: TestApply_Reapply_Idempotent (rewritten from the old
+    stop-all assertion), TestApply_AddInterface_DayTwo,
+    TestApply_RemoveInterface_StopsRelay, TestApply_NilConfig_StopsAll,
+    TestApply_ChangedServers_Restarts, TestApply_ChangedBroadcast_Restarts. New
+    daemon-seam tests: TestReconcileDHCPRelayNilManagerNoop,
+    TestReconcileDHCPRelayRemoveStopsAll, TestReconcileDHCPRelayAddStartsRelay.
+    Live day-2 relay reconcile is lab-bound (deferred).
+  - **File(s)**: pkg/dhcprelay/relay.go, pkg/dhcprelay/relay_test.go,
+    pkg/dhcprelay/README.md, pkg/daemon/daemon_apply.go, pkg/daemon/daemon_run.go,
+    pkg/daemon/daemon_dhcprelay_reconcile_test.go, _Log.md

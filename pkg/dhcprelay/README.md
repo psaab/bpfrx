@@ -8,8 +8,10 @@ to the interface name.
 
 - `Manager` — `relay.go`.
 - `NewManager()` — `relay.go`.
-- `Apply(ctx context.Context, cfg *config.DHCPRelayConfig)` — `relay.go`. Starts/stops per-interface relay
-  goroutines.
+- `Apply(ctx context.Context, cfg *config.DHCPRelayConfig)` — `relay.go`.
+  Reconciles per-interface relay goroutines to the desired config (start
+  added, stop removed, restart changed, leave unchanged). Called at boot
+  AND on every day-2 commit (#2348). A nil `cfg` stops all relays.
 - `Stats()` — `relay.go`. Per-interface counters.
 - `RelayStats` — `relay.go`.
 
@@ -153,11 +155,33 @@ below). Changes touching this path must pass `make test-failover`.
   a true join with no packet-dependent wait and no goroutine leak across
   `Apply`/`Stop` cycles. Both loops cancel the shared context on exit so a
   one-sided error cannot wedge the join.
-- **Startup readiness retry.** `Apply` runs once at daemon boot. If an
-  interface is not yet ready (no IPv4 address, or a dynamic VLAN/tunnel not
-  yet created), the relay retries resolving the interface + giaddr on a
-  bounded, `ctx`-cancelable interval instead of dying permanently. The
-  interface is re-looked-up every attempt (no stale cached index).
+- **Day-2 reconcile (#2348).** `Apply` is invoked at boot (`daemon_run.go`)
+  AND on every commit through `daemon.reconcileDHCPRelay` in the
+  `applyConfigLocked` pipeline (`daemon_apply.go`, step 16c) — the relay
+  Manager is created at boot regardless of whether a relay was configured
+  then, so a relay added later starts and a relay removed later stops.
+  `Apply` diffs the desired set (`computeDesired`) against the running
+  `relays` map **per interface** and:
+  - starts an interface present in desired but not running;
+  - stops (bounded `cancel()`+`<-done`) an interface running but no longer
+    desired (or when the whole block is deleted: a nil `cfg` stops all);
+  - restarts an interface whose **spec changed** — a `relaySpec` is the
+    resolved server list (config order) plus the `always-broadcast` flag;
+    a change in either tears the old session down and binds a fresh one;
+  - leaves an unchanged interface's session running untouched (idempotent —
+    a no-op commit causes **no churn**, no socket reopen).
+  The stop/restart teardown reuses the same `Stop()` mechanism (the #2347
+  supervisor + #1915 close-on-cancel + `WaitGroup` join), and the old
+  listener is fully closed before any replacement binds, so a restart never
+  races `EADDRINUSE` and never hangs. The teardown joins run **outside**
+  `m.mu` so a blocked relay's `<-done` does not stall `Stats()` or a
+  concurrent `Apply`.
+- **Startup readiness retry.** When `Apply` starts a relay (boot or a day-2
+  add) and the interface is not yet ready (no IPv4 address, or a dynamic
+  VLAN/tunnel not yet created), the relay retries resolving the interface +
+  giaddr on a bounded, `ctx`-cancelable interval instead of dying
+  permanently. The interface is re-looked-up every attempt (no stale cached
+  index).
 - **ifindex-drift detection (#2347).** `SO_BINDTODEVICE` pins the client
   listener to the interface's kernel **ifindex** at `bind(2)`. If the
   interface is deleted+recreated or renamed at runtime under unchanged config

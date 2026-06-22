@@ -960,9 +960,14 @@ func (d *Daemon) Run(ctx context.Context) error {
 		slog.Info("event-options engine started", "policies", len(cfg.EventOptions))
 	}
 
-	// Start DHCP relay if configured.
-	if cfg := d.store.ActiveConfig(); cfg != nil && cfg.ForwardingOptions.DHCPRelay != nil {
-		d.dhcpRelay = dhcprelay.NewManager()
+	// Start DHCP relay. The Manager is always created (not gated on a
+	// non-nil relay config) so the apply pipeline (reconcileDHCPRelay,
+	// #2348) can start a relay added on a day-2 commit and stop one
+	// removed — Apply diffs desired-vs-running and a nil config stops all
+	// relays. The relay goroutines bind to d.daemonCtx (== ctx here) so
+	// they outlive each apply call and are torn down only at daemon stop.
+	d.dhcpRelay = dhcprelay.NewManager()
+	if cfg := d.store.ActiveConfig(); cfg != nil {
 		d.dhcpRelay.Apply(ctx, cfg.ForwardingOptions.DHCPRelay)
 	}
 
