@@ -107,6 +107,29 @@ pub(in crate::afxdp) static GRE_DECAP_ECN_ILLEGAL_DROPS: AtomicU64 = AtomicU64::
 /// WG ingress / congested path CE-marked the outer of a Not-ECT inner.
 pub(in crate::afxdp) static WG_DECAP_ECN_ILLEGAL_DROPS: AtomicU64 = AtomicU64::new(0);
 
+/// #2331: count of native-GRE encap frames DROPPED because the fully
+/// built outer datagram (outer IP + GRE header[+key] + inner packet)
+/// exceeded the resolved transport/egress MTU while the IPv4 outer
+/// carries DF=1 (the only outer the native encap builder emits — see
+/// `encapsulate_native_gre_frame`). A DF-set outer larger than the path
+/// MTU cannot be fragmented downstream and would be silently dropped by
+/// the egress NIC or an intermediate router with no PMTUD signal back to
+/// the inner source — a blackhole for every inner flow whose encapped
+/// size exceeds the path MTU. We refuse to EMIT that frame (drop +
+/// bump). Surfaced via `coordinator/status.rs` as
+/// `xpf_userspace_gre_encap_df_oversize_drops_total`. A nonzero value
+/// flags inner flows whose encapped size exceeds the tunnel path MTU —
+/// most often a missing/too-high inner MSS clamp (`native_gre_tcp_mss`)
+/// or a non-TCP inner (UDP/ICMP/ESP) with no segmentation lever.
+///
+/// PMTUD (ICMP Frag-Needed / PTB) signalling back to the inner source is
+/// intentionally NOT generated here: the post-transform PMTUD plumbing
+/// is owned by #2330 (and inner TCP-segment sizing by #2329). This site
+/// scopes to stop EMITTING the oversized DF outer (drop + count); the
+/// PTB signal is deferred to #2330 so the two changes do not duplicate
+/// the same plumbing.
+pub(in crate::afxdp) static GRE_ENCAP_DF_OVERSIZE_DROPS: AtomicU64 = AtomicU64::new(0);
+
 /// Read the inner IP packet's DSCP+ECN byte for outer-header
 /// propagation on tunnel encap (#2303). Returns the full 8-bit
 /// TOS / Traffic-Class value (DSCP in the high 6 bits, ECN in the
@@ -646,6 +669,24 @@ pub(super) fn try_native_gre_decap_from_frame(
     })
 }
 
+/// #2331: the built native-GRE OUTER L3 datagram length for an
+/// `inner_len`-byte inner packet — outer IP header + GRE header (incl.
+/// the optional 4-byte key, already folded into `gre_len`) + inner. The
+/// L2 Ethernet/VLAN header is deliberately EXCLUDED: the MTU budget is
+/// the L3 payload limit, and this matches `native_gre_inner_mtu`
+/// (forwarding/mod.rs), which subtracts exactly `outer_ip + gre` from
+/// the transport MTU to derive the inner allowance. Pulled out so the
+/// MTU arithmetic is unit-testable in isolation (mirrors wg.rs's
+/// `wg_encapped_size`).
+#[inline]
+pub(in crate::afxdp) fn gre_encapped_outer_len(
+    outer_ip_len: usize,
+    gre_len: usize,
+    inner_len: usize,
+) -> usize {
+    outer_ip_len + gre_len + inner_len
+}
+
 pub(super) fn encapsulate_native_gre_frame(
     inner_frame: &[u8],
     inner_meta: impl Into<ForwardPacketMeta>,
@@ -688,6 +729,28 @@ pub(super) fn encapsulate_native_gre_frame(
         libc::AF_INET6 => 40,
         _ => return None,
     };
+
+    // #2331: refuse to EMIT an oversized DF-set outer. The IPv4 outer
+    // this builder writes always carries DF=1 (#1440), and the IPv6
+    // outer cannot be fragmented in-path either — so an outer L3
+    // datagram larger than the transport/egress MTU is a downstream
+    // blackhole (NIC/router drop, no PMTUD back to the inner source).
+    // Compare the built outer L3 length (outer IP + GRE[+key] + inner;
+    // the L2 eth/VLAN header is NOT part of the MTU budget) against the
+    // SAME resolved outer MTU the rest of the tunnel path uses
+    // (`tunnel_outer_mtu`, #2300 SSOT — the real transport ifindex, not
+    // the logical tunnel ifindex). The 4-byte GRE key, when present, is
+    // already folded into `gre_len`, so a key-present endpoint's extra
+    // 4 bytes are counted. Drop + bump rather than emit; PMTUD/PTB
+    // signalling from this site is deferred to #2330 (see the
+    // GRE_ENCAP_DF_OVERSIZE_DROPS doc comment).
+    let outer_l3_len = gre_encapped_outer_len(outer_ip_len, gre_len, inner_packet.len());
+    let outer_mtu = tunnel_outer_mtu(forwarding, decision, endpoint);
+    if outer_l3_len > outer_mtu {
+        GRE_ENCAP_DF_OVERSIZE_DROPS.fetch_add(1, Ordering::Relaxed);
+        return None;
+    }
+
     let frame_len = outer_eth_len + outer_ip_len + gre_len + inner_packet.len();
     let mut out = vec![0u8; frame_len];
     write_eth_header_slice(
