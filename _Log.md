@@ -1,5 +1,26 @@
 # Action Log
 
+## 2026-06-21 — #2293 IPv6 ping-of-death screen (was IPv4-only)
+
+- **Timestamp**: 2026-06-21
+- **Action**: Implemented IPv6 ping-of-death detection in the
+  `ping-death` screen, which was silently IPv4-only. Added two fields to
+  `ScreenPacketInfo` (`ip_payload_len` — the IPv6 base-header payload
+  length; `frag_data_off` — payload-region bytes consumed by ext headers
+  up to and including the fragment header) populated in `extract.rs`.
+  `check_ping_of_death` now applies the per-fragment oversize formula to
+  AF_INET6: `offset_bytes (frag_off & 0xFFF8) + (ip_payload_len -
+  frag_data_off) > 65535 -> drop`, mirroring the v4 path and firing for
+  any IPv6 protocol on fragments only. Removed the "IPv6 ... not covered"
+  doc note. Added 5 tests (oversize ICMPv6 + UDP drop, in-bounds pass,
+  non-fragment pass, profile-disabled pass) plus an `ipv6_fragment`
+  fixture helper.
+- **File(s)**: userspace-dp/src/screen/packet.rs,
+  userspace-dp/src/screen/extract.rs,
+  userspace-dp/src/screen/stateless.rs,
+  userspace-dp/src/screen/tests.rs,
+  userspace-dp/src/afxdp/event_emit.rs (ScreenPacketInfo field additions)
+
 ## 2026-06-21 — #2292 IPv6 forwarding ext-walker fail-closed at bound (parity with screen)
 
 - **Timestamp**: 2026-06-21

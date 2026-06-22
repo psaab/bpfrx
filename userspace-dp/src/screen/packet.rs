@@ -41,6 +41,18 @@ pub(crate) struct ScreenPacketInfo {
     pub ip_ihl: u8,        // IPv4 IHL field (header length in 32-bit words)
     pub ip_frag_off: u16,  // raw frag_off field (network byte order already parsed)
     pub ip_total_len: u16, // IPv4 total length
+    /// #2293: IPv6 payload-length field (bytes 4-5 of the base header),
+    /// i.e. the length of everything after the 40-byte fixed header
+    /// (extension headers + L4 + data). 0 for IPv4 / when not parsed.
+    /// Used by the IPv6 ping-of-death check together with `frag_data_off`.
+    pub ip_payload_len: u16,
+    /// #2293: for an IPv6 fragment, the number of payload-region bytes
+    /// (after the 40-byte base header) that precede THIS fragment's data
+    /// — i.e. the extension headers up to and including the 8-byte
+    /// fragment header. `ip_payload_len - frag_data_off` is therefore the
+    /// L4/data bytes this fragment contributes to the reassembled
+    /// datagram. 0 when there is no fragment header.
+    pub frag_data_off: u16,
 }
 
 /// Screen profile configuration for a zone. Mirrors the BPF `screen_config`.

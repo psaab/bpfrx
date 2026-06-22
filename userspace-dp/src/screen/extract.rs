@@ -46,6 +46,8 @@ pub(crate) fn extract_screen_info(
         ip_ihl: 5,
         ip_frag_off: 0,
         ip_total_len: 0,
+        ip_payload_len: 0,
+        frag_data_off: 0,
     };
 
     let mut tcp_offset: Option<usize> = None;
@@ -80,6 +82,12 @@ pub(crate) fn extract_screen_info(
         if l3_offset + 40 > frame.len() {
             return Err(ScreenParseError::TruncatedIpv6ExtChain);
         }
+        // #2293: IPv6 payload-length field (bytes 4-5 of the 40-byte base
+        // header) — the length of everything after the base header
+        // (extension headers + L4 + data). The ping-of-death check uses
+        // it with `frag_data_off` to size a fragment's contribution to
+        // the reassembled datagram.
+        info.ip_payload_len = u16::from_be_bytes([frame[l3_offset + 4], frame[l3_offset + 5]]);
         const NEXTHDR_HOP: u8 = 0;
         const NEXTHDR_ROUTING: u8 = 43;
         const NEXTHDR_FRAGMENT: u8 = 44;
@@ -128,6 +136,19 @@ pub(crate) fn extract_screen_info(
                     info.ip_frag_off = frag_off;
                     info.is_fragment = (frag_off & 0x1) != 0 || (frag_off & 0xFFF8) != 0;
                     info.is_first_fragment = (frag_off & 0x1) != 0 && (frag_off & 0xFFF8) == 0;
+                    // #2293: payload-region bytes that precede THIS
+                    // fragment's data — every extension header up to and
+                    // including this 8-byte fragment header. `offset + 8`
+                    // is the frame position of the fragment payload;
+                    // subtract the base-header end (`l3_offset + 40`) to
+                    // get the payload-region offset of the fragment data.
+                    // `ip_payload_len - frag_data_off` is then the L4/data
+                    // bytes this fragment carries. Saturating: a hostile
+                    // chain whose declared payload_len is smaller than the
+                    // headers we walked yields 0 contribution, never an
+                    // underflow.
+                    info.frag_data_off =
+                        ((offset + 8).saturating_sub(l3_offset + 40)) as u16;
                     if frame[offset] == PROTO_TCP {
                         tcp_offset = Some(offset + 8);
                     }
