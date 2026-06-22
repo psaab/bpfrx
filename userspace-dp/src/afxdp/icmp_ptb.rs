@@ -137,8 +137,12 @@ pub(in crate::afxdp) fn forwarded_egress_mtu_decision(
 ///     bytes SMALLER. The advertised value is floored at the per-family
 ///     minimum by `forwarded_egress_mtu_decision`.
 ///
-/// Returns 0 (fail-open — never invent a too-small MTU) when no MTU is
-/// resolvable, the endpoint row is missing, or the tunnel kind is unknown.
+/// Returns 0 (fail-open — never invent a too-small MTU) when the endpoint
+/// row is missing, the tunnel kind is unknown, or the computed inner MTU is
+/// below the usable minimum (the per-kind inner-MTU helper returns 0). Note:
+/// the outer/transport MTU itself always resolves — `tunnel_outer_mtu` falls
+/// back to 1500 — so a 0 return reflects a missing/unknown endpoint or an
+/// unusably-small inner budget, never an unresolved outer MTU.
 /// `egress_mtu` is the already-resolved physical egress-interface MTU
 /// (`forwarded_egress_mtu`); used only for the NAT64 arm (the tunnel arms
 /// re-resolve the transport MTU via the SSOT helpers).
