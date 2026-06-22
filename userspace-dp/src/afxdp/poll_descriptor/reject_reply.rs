@@ -226,6 +226,110 @@ mod tests {
         assert_ne!(tcp_flags & 0x04, 0, "RST flag must be set");
     }
 
+    /// #2238: a generated reject reply matching an OUTPUT filter `then
+    /// discard` (keyed on the reply's own tuple) is NOT enqueued, and the
+    /// dedicated `policy_reject_output_filter_drops` counter increments.
+    /// Uses a non-TCP (ICMP) trigger so the generated reply is an ICMP
+    /// unreachable, and the egress output filter discards `protocol icmp`.
+    #[test]
+    fn reject_reply_dropped_by_egress_output_filter() {
+        use super::cookie_reply::SYN_COOKIE_REPLY_PENDING_RESERVE;
+        // Inbound ICMP echo (a query, not an error) on ifindex 5 → the
+        // reject path builds an ICMP unreachable, which the egress output
+        // filter discards.
+        let client = std::net::Ipv4Addr::new(10, 0, 61, 102);
+        let server = std::net::Ipv4Addr::new(1, 1, 1, 1);
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
+        frame.extend_from_slice(&[0x36, 0xe4, 0x2b, 0xd5, 0x39, 0xe6]);
+        frame.extend_from_slice(&0x0800u16.to_be_bytes());
+        let l3 = frame.len();
+        frame.extend_from_slice(&[0x45, 0x00, 0x00, 0x1c, 0x00, 0x00, 0x40, 0x00, 64, PROTO_ICMP, 0, 0]);
+        frame.extend_from_slice(&client.octets());
+        frame.extend_from_slice(&server.octets());
+        let _ = l3; // inbound IP csum not validated by the builders
+        frame.extend_from_slice(&[8, 0, 0, 0, 0x12, 0x34, 0, 1]); // ICMP echo
+        let meta = UserspaceDpMeta {
+            ingress_ifindex: 5,
+            l3_offset: 14,
+            l4_offset: 34,
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_ICMP,
+            pkt_len: (frame.len() - 14) as u16,
+            ..UserspaceDpMeta::default()
+        };
+        let flow = SessionFlow {
+            src_ip: std::net::IpAddr::V4(client),
+            dst_ip: std::net::IpAddr::V4(server),
+            forward_key: SessionKey {
+                addr_family: libc::AF_INET as u8,
+                protocol: PROTO_ICMP,
+                src_ip: std::net::IpAddr::V4(client),
+                dst_ip: std::net::IpAddr::V4(server),
+                src_port: 0x1234,
+                dst_port: 0,
+            },
+        };
+        let filter_state = crate::filter::parse_filter_state(
+            &[crate::FirewallFilterSnapshot {
+                name: "drop-icmp".into(),
+                family: "inet".into(),
+                terms: vec![crate::FirewallTermSnapshot {
+                    name: "drop-icmp".into(),
+                    action: "discard".into(),
+                    protocols: vec!["icmp".into()],
+                    ..Default::default()
+                }],
+            }],
+            &[],
+            &[crate::InterfaceSnapshot {
+                name: "ge-0/0/1.0".into(),
+                ifindex: 5,
+                filter_output_v4: "drop-icmp".into(),
+                ..Default::default()
+            }],
+            "",
+            "",
+        );
+        let mut forwarding = ForwardingState {
+            filter_state,
+            tx_selection_enabled_v4: true,
+            ..ForwardingState::default()
+        };
+        forwarding.egress.insert(
+            5,
+            EgressInterface {
+                bind_ifindex: 5,
+                vlan_id: 0,
+                mtu: 1500,
+                src_mac: [0x02, 0xbf, 0x72, 0x00, 0x61, 0x01],
+                zone_id: 0,
+                redundancy_group: 0,
+                primary_v4: Some(std::net::Ipv4Addr::new(10, 0, 61, 1)),
+                primary_v6: None,
+            },
+        );
+        let mut pipeline = tx_pipeline(
+            SYN_COOKIE_REPLY_PENDING_RESERVE * 2,
+            SYN_COOKIE_REPLY_PENDING_RESERVE + 1,
+        );
+        let mut counters = BatchCounters::default();
+        let sent = enqueue_policy_reject_reply(
+            &mut pipeline,
+            &forwarding,
+            5,
+            &frame,
+            meta,
+            &flow,
+            &mut counters,
+        );
+        assert!(!sent, "reject reply dropped by egress output filter must not enqueue");
+        assert_eq!(counters.policy_reject_sent, 0);
+        assert_eq!(counters.policy_reject_output_filter_drops, 1);
+        assert_eq!(counters.generated_reply_classify_parse_errors, 0);
+        assert!(pipeline.pending_tx_local.is_empty());
+    }
+
     #[test]
     fn reject_inbound_rst_is_not_answered() {
         use super::cookie_reply::SYN_COOKIE_REPLY_PENDING_RESERVE;

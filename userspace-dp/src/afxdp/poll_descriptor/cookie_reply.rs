@@ -241,6 +241,66 @@ mod tests {
         )));
     }
 
+    /// #2238: a generated SYN-cookie reply matching an egress OUTPUT filter
+    /// `then discard` (keyed on the reply's own TCP tuple) is NOT enqueued,
+    /// and the dedicated `syn_cookie_output_filter_drops` counter increments.
+    #[test]
+    fn syn_cookie_reply_dropped_by_egress_output_filter() {
+        let (frame, meta, flow) = tcp_v4_syn_frame();
+        let mut pipeline = tx_pipeline(
+            SYN_COOKIE_REPLY_PENDING_RESERVE * 2,
+            SYN_COOKIE_REPLY_PENDING_RESERVE + 1,
+            0,
+        );
+        // Output filter on ifindex 5 discards TCP — the generated SYN-ACK is
+        // TCP, so it is dropped.
+        let filter_state = crate::filter::parse_filter_state(
+            &[crate::FirewallFilterSnapshot {
+                name: "drop-tcp".into(),
+                family: "inet".into(),
+                terms: vec![crate::FirewallTermSnapshot {
+                    name: "drop-tcp".into(),
+                    action: "discard".into(),
+                    protocols: vec!["tcp".into()],
+                    ..Default::default()
+                }],
+            }],
+            &[],
+            &[crate::InterfaceSnapshot {
+                name: "ge-0/0/1.0".into(),
+                ifindex: 5,
+                filter_output_v4: "drop-tcp".into(),
+                ..Default::default()
+            }],
+            "",
+            "",
+        );
+        let forwarding = ForwardingState {
+            filter_state,
+            tx_selection_enabled_v4: true,
+            ..ForwardingState::default()
+        };
+        let mut counters = BatchCounters::default();
+        let sent = enqueue_syn_cookie_reply(
+            &mut pipeline,
+            &forwarding,
+            5,
+            &frame,
+            meta,
+            Some(&flow),
+            SynCookieReply::SynAck(SynCookieChallenge {
+                cookie_isn: 0xaabb_ccdd,
+                peer_mss: 1460,
+            }),
+            &mut counters,
+        );
+        assert!(!sent, "SYN-cookie reply dropped by egress output filter must not enqueue");
+        assert_eq!(counters.syn_cookie_syn_ack_sent, 0);
+        assert_eq!(counters.syn_cookie_output_filter_drops, 1);
+        assert_eq!(counters.generated_reply_classify_parse_errors, 0);
+        assert!(pipeline.pending_tx_local.is_empty());
+    }
+
     #[test]
     fn syn_cookie_reply_enqueues_host_generated_frame_without_transit_policy_metadata() {
         let (frame, meta, flow) = tcp_v4_syn_frame();
