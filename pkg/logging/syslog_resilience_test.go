@@ -161,9 +161,9 @@ func TestReconnectCooldownRateLimitsDials(t *testing.T) {
 		return nil, errors.New("connection refused")
 	}
 
-	// First dial (in the helper) counts as dial #1 and seeds lastDialFailure
-	// only on subsequent reconnects; construct the client with a broken conn
-	// so the first Send triggers the reconnect path.
+	// First dial (in the helper) counts as dial #1 and seeds
+	// lastReconnectFailure only on subsequent reconnects; construct the client
+	// with a broken conn so the first Send triggers the reconnect path.
 	c := &SyslogClient{
 		hostname:          "test",
 		remoteAddr:        "203.0.113.1:514",
@@ -204,6 +204,120 @@ func TestReconnectCooldownRateLimitsDials(t *testing.T) {
 	if int(atomic.LoadInt32(&dialCount)) >= 2*sends {
 		t.Fatalf("reconnect thrash: dials %d not rate-limited vs %d sends",
 			dialCount, 2*sends)
+	}
+}
+
+// TestAcceptThenResetRateLimitsDials is the #2302 fix-on-revert proof: an
+// accept-then-reset target lets every DIAL succeed but every WRITE fail
+// (overloaded collector, half-open server, TLS app-layer drop). Before the fix
+// lastDialFailure was set only on a dial ERROR and cleared on dial SUCCESS, so
+// the cooldown never engaged and every log message drove a fresh connect +
+// teardown — a dial storm. With the fix a dial-success-then-write-failure arms
+// the cooldown, so dials are capped to roughly one per cooldown window.
+//
+// Reverting the fix (gating only on a failed dial / clearing the clock on dial
+// success) makes dialCount == sends, which trips this test.
+func TestAcceptThenResetRateLimitsDials(t *testing.T) {
+	var dialCount int32
+	var nowMu sync.Mutex
+	now := time.Unix(0, 0)
+	clock := func() time.Time {
+		nowMu.Lock()
+		defer nowMu.Unlock()
+		return now
+	}
+	advance := func(d time.Duration) {
+		nowMu.Lock()
+		now = now.Add(d)
+		nowMu.Unlock()
+	}
+
+	// Every dial SUCCEEDS (handshake completes) but hands back a conn whose
+	// Write always fails immediately — the accept-then-reset signature.
+	dial := func() (net.Conn, error) {
+		atomic.AddInt32(&dialCount, 1)
+		return &alwaysFailConn{}, nil
+	}
+
+	c := &SyslogClient{
+		hostname:          "test",
+		remoteAddr:        "203.0.113.20:514",
+		protocol:          "tcp",
+		Facility:          FacilityLocal0,
+		writeTimeout:      defaultWriteTimeout,
+		reconnectCooldown: time.Second,
+		dialFn:            dial,
+		nowFn:             clock,
+		conn:              &alwaysFailConn{}, // first writeMsg fails → reconnect
+	}
+
+	const sends = 50
+	for i := 0; i < sends; i++ {
+		_ = c.Send(SyslogInfo, "accept-then-reset target")
+	}
+
+	// All sends at t=0: only the FIRST should have dialed (the retry-write
+	// failed, arming the cooldown); the rest fail fast inside the window.
+	if d := atomic.LoadInt32(&dialCount); d != 1 {
+		t.Fatalf("accept-then-reset dial storm not throttled: expected 1 dial "+
+			"within the cooldown window across %d sends, got %d (#2302)", sends, d)
+	}
+	if c.DroppedCooldown() == 0 {
+		t.Errorf("expected cooldown drops to be counted, got %d", c.DroppedCooldown())
+	}
+
+	// Advance past the cooldown: exactly one more dial may occur.
+	advance(time.Second + time.Millisecond)
+	for i := 0; i < sends; i++ {
+		_ = c.Send(SyslogInfo, "accept-then-reset target round 2")
+	}
+	if d := atomic.LoadInt32(&dialCount); d != 2 {
+		t.Fatalf("expected 2 total dials after one cooldown window, got %d", d)
+	}
+
+	// Sanity: dials (2) are far fewer than the total sends (2*sends).
+	if int(atomic.LoadInt32(&dialCount)) >= 2*sends {
+		t.Fatalf("dial storm: dials %d not rate-limited vs %d sends", dialCount, 2*sends)
+	}
+}
+
+// TestAcceptThenRecoverClearsCooldown asserts the fix preserves the legitimate
+// recovery path: a single broken-pipe error whose reconnect lands a HEALTHY conn
+// must succeed AND leave the cooldown clear, so an immediately-following failure
+// can reconnect at once (not blocked by a stale cooldown). This is the
+// counter-factual to the dial-storm test — a recovered conn must not be
+// penalized by the #2302 cooldown arming.
+func TestAcceptThenRecoverClearsCooldown(t *testing.T) {
+	var dialCount int32
+	healthy := &recordingConn{}
+	c := &SyslogClient{
+		hostname:          "test",
+		remoteAddr:        "203.0.113.21:514",
+		protocol:          "tcp",
+		Facility:          FacilityLocal0,
+		writeTimeout:      defaultWriteTimeout,
+		reconnectCooldown: time.Second,
+		conn:              &alwaysFailConn{}, // first write fails → reconnect
+		dialFn: func() (net.Conn, error) {
+			atomic.AddInt32(&dialCount, 1)
+			return healthy, nil // dial lands a healthy conn → retry-write succeeds
+		},
+	}
+
+	if err := c.Send(SyslogInfo, "broken pipe then recover"); err != nil {
+		t.Fatalf("expected reconnect+retry to succeed, got %v", err)
+	}
+	if d := atomic.LoadInt32(&dialCount); d != 1 {
+		t.Fatalf("expected exactly 1 reconnect dial, got %d", d)
+	}
+	// Full recovery must clear the cooldown clock.
+	if !c.lastReconnectFailure.IsZero() {
+		t.Fatalf("a fully recovered reconnect (dial + retry-write) must clear the " +
+			"cooldown clock, but lastReconnectFailure is set")
+	}
+	if c.DroppedWrites() != 0 || c.DroppedDials() != 0 || c.DroppedCooldown() != 0 {
+		t.Fatalf("successful recovery must not count a drop: w=%d d=%d c=%d",
+			c.DroppedWrites(), c.DroppedDials(), c.DroppedCooldown())
 	}
 }
 
