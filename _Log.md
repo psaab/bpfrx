@@ -1,5 +1,54 @@
 # Action Log
 
+## 2026-06-22 — #2317 WG decap RFC 6040 §4.2 ECN combine
+
+- **Timestamp**: 2026-06-22 PDT
+- **Action**: Implemented the WireGuard DECAP-side RFC 6040 §4.2 ECN
+  combine (outer ECN → inner ECN), completing the half #2315 deferred for
+  the WG path. The WG control thread reads transport records from a kernel
+  `UdpSocket`, which strips the outer IP header (and its ECN) before
+  userspace — so the recv loop now uses `recvmsg` (libc, no new crate)
+  with `IP_RECVTOS` (v4 / v4-mapped) and `IPV6_RECVTCLASS` (v6) enabled at
+  bind. The outer DS byte arrives as an `IP_TOS`/`IPV6_TCLASS` cmsg;
+  `parse_outer_ecn_from_cmsg` walks the control chain (libc CMSG_* macros)
+  and extracts ECN = ds & 0x03. The captured `Option<u8>` outer ECN is
+  threaded `wg_recvmsg → dispatch_inbound → WG_TYPE_DATA arm`, where after
+  `engine.try_decap` produces the inner IP packet it is folded in via the
+  SHARED `gre::apply_decap_ecn_combine` (refactored to take the per-family
+  drop counter by `&AtomicU64`) BEFORE `tun.write_all`. Illegal outer-CE /
+  inner-Not-ECT drops bump a new WG sibling counter
+  `WG_DECAP_ECN_ILLEGAL_DROPS`, wired end-to-end (status.rs → control.rs
+  ProcessStatus → helpers.rs → Go protocol.go → Prometheus
+  `xpf_userspace_wg_decap_ecn_illegal_drops_total`). recvmsg cmsg is
+  best-effort: no cmsg ⇒ combine skipped (pre-#2317 behavior), never fatal.
+  Live ECN-propagation verification is lab-deferred to #1703-class interop.
+- **File(s)**: userspace-dp/src/afxdp/gre.rs (counter + shared
+  apply signature), userspace-dp/src/afxdp/coordinator/wg_control.rs
+  (set_recv_tos_options, wg_recvmsg, parse_outer_ecn_from_cmsg,
+  sockaddr_storage_to_socketaddr, dispatch_inbound combine, tests),
+  userspace-dp/src/afxdp/coordinator/status.rs,
+  userspace-dp/src/protocol/control.rs,
+  userspace-dp/src/protocol/tests.rs,
+  userspace-dp/src/server/{helpers.rs,lifecycle.rs},
+  userspace-dp/src/afxdp/tunnel_tests.rs (counter-arg + flake-harden),
+  userspace-dp/src/afxdp/wg/dscp.rs (doc),
+  userspace-dp/tests/fixtures/protocol_wire_v1.json (regen, +1 key),
+  pkg/dataplane/userspace/protocol.go, pkg/api/{metrics.go,
+  metrics_descriptors.go,metrics_userspace.go,metrics_test.go,
+  metrics_descriptor_coverage_test.go}, docs/wireguard-interop.md.
+- **Validation**: `cargo build --release` clean; targeted
+  `cargo test --release -- wg ecn decap recvmsg tclass` 229/0; new tests
+  (cmsg_parse_v4_ip_tos_extracts_ecn, cmsg_parse_v6_tclass_extracts_ecn,
+  cmsg_parse_ignores_unrelated_cmsg, cmsg_parse_empty_control_yields_none,
+  wg_apply_combine_sets_ipv4_ce_and_recomputes_checksum,
+  wg_apply_combine_drops_illegal_combo_and_counts,
+  process_status_wg_decap_ecn_illegal_drops_roundtrip) 5x green after
+  flake-hardening the shared-global counter asserts onto test-local
+  atomics. `go build ./...` + `go test ./pkg/api/...
+  ./pkg/dataplane/userspace/...` green. Pre-existing unrelated flake:
+  worker_queue concurrent_recovery (no ECN/WG refs, fails 1/3 in
+  isolation, on master too). Live loss-cluster smoke deferred to parent.
+
 ## 2026-06-22 — #1434 review round 1 (NEEDS-MINOR fold)
 
 - **Timestamp**: 2026-06-22 PDT

@@ -191,6 +191,35 @@ fn process_status_gre_decap_ecn_illegal_drops_roundtrip() {
     assert_eq!(legacy.gre_decap_ecn_illegal_drops_total, 0);
 }
 
+// #2317: round-trip + backward-compat pin for the WG-decap RFC 6040
+// §4.2 illegal-combination drop counter. The wire key feeds
+// pkg/dataplane/userspace/protocol.go and the Prometheus counter
+// `xpf_userspace_wg_decap_ecn_illegal_drops_total`.
+#[test]
+fn process_status_wg_decap_ecn_illegal_drops_roundtrip() {
+    let status = ProcessStatus {
+        wg_decap_ecn_illegal_drops_total: 7,
+        ..Default::default()
+    };
+    let value: serde_json::Value =
+        serde_json::to_value(&status).expect("serialize ProcessStatus to Value");
+    assert_eq!(value["wg_decap_ecn_illegal_drops_total"], 7);
+    let back: ProcessStatus = serde_json::from_value(value).expect("deserialize ProcessStatus");
+    assert_eq!(back.wg_decap_ecn_illegal_drops_total, 7);
+
+    // Pre-#2317 payload (key absent) must decode with a zero default.
+    let mut legacy_value =
+        serde_json::to_value(ProcessStatus::default()).expect("serialize default ProcessStatus");
+    legacy_value
+        .as_object_mut()
+        .expect("ProcessStatus serializes to an object")
+        .remove("wg_decap_ecn_illegal_drops_total")
+        .expect("new key present before strip");
+    let legacy: ProcessStatus =
+        serde_json::from_value(legacy_value).expect("pre-#2317 payload decodes");
+    assert_eq!(legacy.wg_decap_ecn_illegal_drops_total, 0);
+}
+
 // #1760 W3': round-trip + backward-compat pin for the shared-map NAT
 // reverse-key displacement counter. The wire key feeds
 // pkg/dataplane/userspace/protocol.go and the Prometheus counter
