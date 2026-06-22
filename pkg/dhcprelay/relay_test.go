@@ -975,6 +975,12 @@ func TestRunRelay_IfindexResolveFailure_KeepsListener(t *testing.T) {
 func TestRunRelay_IfindexDrift_StopStillBounded(t *testing.T) {
 	factory, getCalls := recordingFactory()
 	m := testManager(factory)
+	// Clean up on an early t.Fatal (waitRelays/waitCalls timeout) before the
+	// explicit timed Stop below. Stop() is idempotent (it empties m.relays
+	// under lock), so the later explicit Stop is unaffected and this defer is
+	// a no-op on the happy path — it just prevents leaked relay goroutines
+	// from interfering with subsequent tests on an early failure.
+	defer m.Stop()
 
 	resolve, liveIdx, _, _ := driftResolver(100)
 	m.resolveIfindex = resolve

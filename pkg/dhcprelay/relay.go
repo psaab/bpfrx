@@ -377,9 +377,8 @@ func (m *Manager) runRelay(ctx context.Context, cancel context.CancelFunc,
 		// runRelaySession returns drift=true ONLY when it tore down because the
 		// live ifindex moved; in that case rebuild immediately (rebind to the
 		// new ifindex). Any other return (Stop/one-sided exit/listen failure)
-		// is terminal for this supervisor unless the manager ctx is still live
-		// AND the cause was not drift — in which case we fall through to the
-		// ctx.Err() guard at the top and exit.
+		// is drift=false and terminal for this supervisor — we return right
+		// here, ending the per-interface goroutine.
 		drift := m.runRelaySession(ctx, ir, servers)
 		if !drift {
 			return
@@ -440,11 +439,19 @@ func (m *Manager) runRelaySession(ctx context.Context,
 	// real ifindex) so the FIRST successful watcher resolve that returns a real
 	// index is NOT mistaken for drift; the watcher only fires when it can read a
 	// real index that differs from a real captured baseline.
-	boundIfindex, ierr := m.resolveIfindex(ifaceName)
-	if ierr != nil {
-		slog.Warn("dhcp-relay: could not capture bound ifindex (drift detection degraded)",
-			"interface", ifaceName, "err", ierr)
-		boundIfindex = 0
+	// Guard the resolver the same way the drift watcher does (`m.resolveIfindex
+	// != nil`): a Manager constructed without a resolver disables drift
+	// detection entirely, so the baseline capture must not call a nil resolver
+	// (it would panic at session startup). nil resolver → degraded baseline 0.
+	var boundIfindex int
+	if m.resolveIfindex != nil {
+		idx, ierr := m.resolveIfindex(ifaceName)
+		if ierr != nil {
+			slog.Warn("dhcp-relay: could not capture bound ifindex (drift detection degraded)",
+				"interface", ifaceName, "err", ierr)
+		} else {
+			boundIfindex = idx
+		}
 	}
 
 	// Client-facing listener: 0.0.0.0:67, REUSEPORT (coexist with other
