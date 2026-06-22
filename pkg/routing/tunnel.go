@@ -1132,17 +1132,43 @@ const (
 	wgPadWorst   = 15
 )
 
+// wgDefaultOuterMTU is the assumed underlay (outer-link) MTU used to
+// derive the wgN inner MTU when the operator has not set an explicit
+// `mtu` on the tunnel (#2300). It mirrors the Rust control-thread
+// fallback (coordinator/wg_control.rs WG_DEFAULT_OUTER_MTU) so both
+// sides share ONE outer-MTU model. The control thread is additionally
+// handed the REAL resolved underlay-egress MTU at spawn, and the
+// transit-egress encap reads the real egress MTU per packet, so on a
+// non-1500 underlay the Rust guard is authoritative even when this
+// Go-side default cannot see the route. An operator who must lower the
+// wgN MTU for a sub-1500 underlay (PPPoE 1492, cloud overlays ~1450)
+// sets `set interfaces wgN unit U family inet mtu <n>` — that override
+// wins (see wgTunMTUForEndpoint).
+const wgDefaultOuterMTU = 1500
+
 // wgTunMTUForEndpoint computes the inner (wgN) MTU cap (#1432 S2a, AGY
 // Hazard A / H2). The kernel must never hand the WG control thread a
 // plaintext packet that, once encapped with the worst-case overhead
 // plus §5.4.6 pad, exceeds the outer MTU and forces outer IP
 // fragmentation. The overhead depends on the outer IP family (the WG
-// peer endpoint address): IPv6-outer is 20 bytes larger. The outer MTU
-// is assumed to be a standard 1500 (S2a single-tunnel); the control
-// thread also enforces an exact pad-aware guard (wg_control.rs), so this
-// is the first line, not the only one.
+// peer endpoint address): IPv6-outer is 20 bytes larger.
+//
+// #2300 MTU model: an operator-set `tc.MTU > 0` is the inner wgN MTU
+// directly (the supported sub-1500 / jumbo path — it is the owning
+// interface's `mtu` statement, carried by collectAppliedTunnels). With
+// no operator MTU the cap derives from `wgDefaultOuterMTU` minus the
+// family overhead. The control thread enforces an exact pad-aware guard
+// against the REAL underlay-egress MTU (wg_control.rs), so this is the
+// first line, not the only one — and on a non-1500 underlay the Rust
+// guard catches what this default-derived value over-permits.
 func wgTunMTUForEndpoint(tc *config.TunnelConfig) int {
-	const outerMTU = 1500
+	// Operator override: a configured `mtu` on the tunnel interface is
+	// the inner wgN MTU. This is the divergence #2300 closes — the prior
+	// code ignored tc.MTU entirely and always derived from 1500, so a
+	// lowered-underlay deployment could not set a smaller wgN MTU.
+	if tc.MTU > 0 {
+		return tc.MTU
+	}
 	// A configured v4 endpoint uses the v4 overhead; a v6 endpoint (or a
 	// responder-only/roaming endpoint with no configured address, which
 	// the Rust control thread may LEARN as v6 — Codex r4 MAJOR) uses the
@@ -1156,7 +1182,7 @@ func wgTunMTUForEndpoint(tc *config.TunnelConfig) int {
 			}
 		}
 	}
-	return outerMTU - overhead - wgPadWorst
+	return wgDefaultOuterMTU - overhead - wgPadWorst
 }
 
 // applyWireguardTunLocked creates (or reuses) the persistent wgN TUN

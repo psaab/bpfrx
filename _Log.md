@@ -1,5 +1,36 @@
 # Action Log
 
+## 2026-06-21 — #2299/#2300/#2303 WG MSS clamp + outer-MTU SSOT + tunnel DSCP/ECN
+
+- **Timestamp**: 2026-06-21
+- **Action**: Three related WireGuard/encap correctness fixes.
+  - **#2299**: wired `wg::mss::wg_tcp_mss` (previously zero production
+    callers) into the SYN MSS-clamp path. Added
+    `forwarding::tunnel_tcp_mss` dispatcher: WG endpoints use the
+    WG-overhead-aware MSS, non-WG/plain-forward keep `native_gre_tcp_mss`
+    bit-for-bit. `frame/build/mod.rs` now calls the dispatcher. Fixes the
+    "handshake+ping pass, bulk TCP stalls at 0 bytes" blackhole (peer's
+    full-MSS data dropped at `encap_mtu_drops` because the GRE-shaped MSS
+    was ~36–60 bytes too high).
+  - **#2300**: unified the outer-MTU model. Dropped the
+    `WG_OUTER_MTU = 1500` hardcode in `coordinator/wg_control.rs`
+    (renamed to `WG_DEFAULT_OUTER_MTU`, now last-resort fallback only).
+    The control thread is handed the REAL underlay-egress MTU resolved at
+    spawn (`Coordinator::resolve_wg_outer_mtu` route-looks-up the peer
+    endpoint in the endpoint's transport table); the guard predicate is
+    extracted to `wg_inner_fits_outer_mtu`. Go: `wgTunMTUForEndpoint` now
+    honors an operator-set `tc.MTU` (it was ignored before — the actual
+    sub-1500-underlay bug) and derives from `wgDefaultOuterMTU` otherwise.
+  - **#2303**: GRE + WG encap copy the inner DSCP+ECN onto the outer
+    header (uniform DSCP / RFC 6040 ECN) via new `gre::inner_tos_byte`,
+    instead of hardcoding outer TOS/traffic-class to 0.
+- **File(s)**: userspace-dp/src/afxdp/forwarding/mod.rs,
+  frame/build/mod.rs, gre.rs, frame/wg.rs, wg/dscp.rs,
+  coordinator/wg_control.rs, coordinator/tunnel_supervision.rs,
+  tunnel_tests.rs; pkg/routing/tunnel.go,
+  pkg/routing/tunnel_reconcile_test.go; docs/wireguard-interop.md;
+  docs/pr/2299-2300-2303-wg-mtu-ecn/plan.md.
+
 ## 2026-06-21 — #2258 VRRP localIP/localIPv6 lazy-resolve race (run-loop write vs receiver reads)
 
 - **Timestamp**: 2026-06-21

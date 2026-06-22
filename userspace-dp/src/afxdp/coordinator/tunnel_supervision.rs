@@ -648,7 +648,47 @@ impl super::Coordinator {
     /// failing spawn is retried no faster than `WG_SPAWN_BACKOFF_NS`.
     /// Socket bind + TUN open happen INSIDE the spawned aux thread —
     /// never on the control-socket thread (#1866 plan §7).
+    /// #2300: resolve the real OUTER (underlay) MTU the encapped WG UDP
+    /// datagram egresses on, so the control-thread MTU guard uses the
+    /// same source as the transit-egress guard (frame/wg.rs) instead of
+    /// the old `WG_OUTER_MTU = 1500` hardcode. Route-look-up the peer
+    /// endpoint IP in the endpoint's transport table and read that
+    /// egress interface's MTU; fall back to `WG_DEFAULT_OUTER_MTU` when
+    /// the endpoint is unconfigured (initiator-less / learn-only) or no
+    /// route resolves yet.
+    fn resolve_wg_outer_mtu(&self, id: u16) -> usize {
+        let Some(endpoint) = self.forwarding.tunnel_endpoints.get(&id) else {
+            return crate::afxdp::coordinator::wg_control::WG_DEFAULT_OUTER_MTU;
+        };
+        let Some(peer) = endpoint.wg_endpoint else {
+            // No configured endpoint to route toward (responder-only /
+            // endpoint learned at runtime). Use the default; the
+            // transit-egress guard still applies the real egress MTU for
+            // routed WG, and the per-peer learned-endpoint case is the
+            // documented follow-up.
+            return crate::afxdp::coordinator::wg_control::WG_DEFAULT_OUTER_MTU;
+        };
+        let table = if endpoint.transport_table.is_empty() {
+            None
+        } else {
+            Some(endpoint.transport_table.as_str())
+        };
+        let resolution = lookup_forwarding_resolution_in_table_with_dynamic(
+            &self.forwarding,
+            self.dynamic_neighbors_ref(),
+            peer.ip(),
+            table,
+        );
+        self.forwarding
+            .egress
+            .get(&resolution.egress_ifindex)
+            .map(|e| e.mtu)
+            .filter(|m| *m > 0)
+            .unwrap_or(crate::afxdp::coordinator::wg_control::WG_DEFAULT_OUTER_MTU)
+    }
+
     fn spawn_one_wg_control_thread(&mut self, id: u16) {
+        let outer_mtu = self.resolve_wg_outer_mtu(id);
         let Some(endpoint) = self.forwarding.tunnel_endpoints.get(&id) else {
             return;
         };
@@ -686,6 +726,7 @@ impl super::Coordinator {
                     engine,
                     listen_port,
                     peer_endpoint,
+                    outer_mtu,
                     recent_exceptions,
                     stop_clone,
                 );
