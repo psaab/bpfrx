@@ -17,6 +17,115 @@ pub(super) fn packet_ttl_would_expire(frame: &[u8], meta: UserspaceDpMeta) -> Op
     }
 }
 
+/// RFC 1812 §4.3.2.7 / RFC 792 / RFC 4443 §2.4 ICMP-error generation
+/// suppression gate. An ICMP/ICMPv6 error message MUST NOT be generated
+/// in response to a triggering datagram that is any of the following.
+/// All callers that originate a *new* ICMP error (Time Exceeded, reject
+/// Destination Unreachable) route through this single predicate so the
+/// two generators enforce one contract (engineering-style §3, one source
+/// of truth) — the #2237 fix found the Time Exceeded path missing the
+/// guards the reject path already had.
+///
+/// Suppressed when the triggering packet is:
+///   (a) itself an ICMP/ICMPv6 *error* message — prevents error storms
+///       and amplification loops (RFC 1812 §4.3.2.7(c), RFC 4443 §2.4(e));
+///   (b) a non-first IP fragment (fragment offset != 0) — only the first
+///       fragment carries transport context that an error can quote
+///       (RFC 1812 §4.3.2.7(d), RFC 4443 §2.4(f));
+///   (c) destined to an L3 multicast/broadcast address (v4 multicast,
+///       directed/limited broadcast 255.255.255.255; v6 ff00::/8) OR sent
+///       to an L2 broadcast/multicast (low bit of the destination MAC)
+///       (RFC 1812 §4.3.2.7(a)/(b), RFC 4443 §2.4(e.3));
+///   (d) sourced from a non-unique address (0.0.0.0/unspecified,
+///       loopback, or a multicast/broadcast source) — there is no unique
+///       host to reply to (RFC 1812 §4.3.2.7(e), RFC 4443 §2.4(e.6)).
+///
+/// An unparseable frame (no L3 offset, short header, missing L4 type for
+/// an ICMP trigger) fails closed — the generator returns `None`.
+///
+/// This is a small set of branchless field reads on the hot TTL-expiry
+/// path; no allocation.
+pub(super) fn can_generate_icmp_error_reply(frame: &[u8], meta: UserspaceDpMeta) -> bool {
+    let l3 = match meta.l3_offset {
+        14 | 18 => meta.l3_offset as usize,
+        _ => match frame_l3_offset(frame) {
+            Some(off) => off,
+            None => return false,
+        },
+    };
+    let Some(packet) = frame.get(l3..) else {
+        return false;
+    };
+
+    // (b) Non-first fragments carry no transport header to quote/key.
+    if is_non_first_fragment(packet, meta.addr_family) {
+        return false;
+    }
+
+    // (a) Never reply to an inbound ICMP/ICMPv6 error message. Reuse the
+    //     reject path's (broader) ICMP-error classification.
+    if matches!(meta.protocol, PROTO_ICMP | PROTO_ICMPV6) {
+        let Some(&icmp_type) = frame.get(meta.l4_offset as usize) else {
+            return false; // unparseable ICMP trigger: fail closed.
+        };
+        if reject_icmp_reply_suppressed(meta.protocol, icmp_type) {
+            return false;
+        }
+    }
+
+    // (c)/(d) L3 source/destination uniqueness + scope. The trigger's
+    // src/dst sit at fixed offsets in the (already non-fragmented) IP
+    // header.
+    match meta.addr_family as i32 {
+        libc::AF_INET => {
+            if packet.len() < 20 {
+                return false;
+            }
+            let src = Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]);
+            let dst = Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
+            // (c) multicast / broadcast / limited-broadcast destination.
+            if dst.is_multicast() || dst.is_broadcast() {
+                return false;
+            }
+            // (d) unspecified / loopback / multicast / broadcast source.
+            if src.is_unspecified()
+                || src.is_loopback()
+                || src.is_multicast()
+                || src.is_broadcast()
+            {
+                return false;
+            }
+        }
+        libc::AF_INET6 => {
+            if packet.len() < 40 {
+                return false;
+            }
+            let src = Ipv6Addr::from(<[u8; 16]>::try_from(&packet[8..24]).expect("16 bytes"));
+            let dst = Ipv6Addr::from(<[u8; 16]>::try_from(&packet[24..40]).expect("16 bytes"));
+            // (c) multicast destination (ff00::/8).
+            if dst.is_multicast() {
+                return false;
+            }
+            // (d) unspecified / loopback / multicast source.
+            if src.is_unspecified() || src.is_loopback() || src.is_multicast() {
+                return false;
+            }
+        }
+        _ => return false,
+    }
+
+    // (c) L2 broadcast/multicast destination (low bit of the destination
+    //     MAC, IEEE 802 group bit). A unicast L3 destination delivered to
+    //     a group MAC still must not elicit an error.
+    if let Some(&dst_mac0) = frame.first()
+        && (dst_mac0 & 0x01) != 0
+    {
+        return false;
+    }
+
+    true
+}
+
 pub(super) fn build_local_time_exceeded_request(
     frame: &[u8],
     desc: XdpDesc,
@@ -29,6 +138,15 @@ pub(super) fn build_local_time_exceeded_request(
     _now_secs: u64,
 ) -> Option<PendingForwardRequest> {
     if !matches!(packet_ttl_would_expire(frame, meta), Some(true)) {
+        return None;
+    }
+
+    // #2237: RFC 1812 §4.3.2.7 / RFC 4443 §2.4 — suppress Time Exceeded
+    // for ICMP-error triggers (error storms), non-first fragments,
+    // multicast/broadcast destinations, and non-unique sources. The
+    // reject Destination Unreachable path already honored a subset of
+    // these via build_reject_icmp_unreachable; this shares the guard.
+    if !can_generate_icmp_error_reply(frame, meta) {
         return None;
     }
 
@@ -322,33 +440,22 @@ pub(super) fn reject_icmp_reply_suppressed(protocol: u8, icmp_type: u8) -> bool 
 /// ICMPv4 type 3 code 13, or ICMPv6 type 1 code 1 — the codes the
 /// retired eBPF reject path used ("matching Junos reject behavior").
 ///
-/// Returns `None` (caller fail-closes to a silent drop) when:
-///   - the inbound is an ICMP/ICMPv6 *error* message
-///     ([`reject_icmp_reply_suppressed`]),
-///   - the inbound is a non-first fragment (no transport header to key),
-///   - the ingress interface has no primary address of the inbound
-///     family, or the frame is otherwise unparseable.
+/// Returns `None` (caller fail-closes to a silent drop) when the shared
+/// [`can_generate_icmp_error_reply`] gate (RFC 1812 §4.3.2.7 /
+/// RFC 4443 §2.4) refuses — inbound ICMP/ICMPv6 error, non-first
+/// fragment, multicast/broadcast destination (L3 or L2), or non-unique
+/// source — or when the ingress interface has no primary address of the
+/// inbound family / the frame is otherwise unparseable. #2237 unified
+/// this gate with the Time Exceeded path; previously the reject path
+/// guarded only the fragment + ICMP-error subset.
 pub(super) fn build_reject_icmp_unreachable(
     frame: &[u8],
     meta: UserspaceDpMeta,
     ingress_ifindex: i32,
     forwarding: &ForwardingState,
 ) -> Option<Vec<u8>> {
-    let l3 = match meta.l3_offset {
-        14 | 18 => meta.l3_offset as usize,
-        _ => frame_l3_offset(frame)?,
-    };
-    let packet = frame.get(l3..)?;
-    // Never reply to a non-first fragment (no L4 header to quote/key).
-    if is_non_first_fragment(packet, meta.addr_family) {
+    if !can_generate_icmp_error_reply(frame, meta) {
         return None;
-    }
-    // Suppress replies to inbound ICMP/ICMPv6 error messages.
-    if matches!(meta.protocol, PROTO_ICMP | PROTO_ICMPV6) {
-        let icmp_type = *frame.get(meta.l4_offset as usize)?;
-        if reject_icmp_reply_suppressed(meta.protocol, icmp_type) {
-            return None;
-        }
     }
     match meta.addr_family as i32 {
         // ICMPv4 Destination Unreachable, code 13 (communication

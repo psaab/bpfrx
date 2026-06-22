@@ -64,6 +64,18 @@ sync.
   active-bucket selection, fair-share lease (#1229 Phase 6 v8). See
   `docs/per-5-tuple/state.md` for the architectural ceiling.
 - `forwarding/` — FIB lookup, next-hop selection, VLAN/GRE encap.
+- `icmp.rs` — locally-generated ICMP/ICMPv6 error builders: TTL/hop-limit
+  expiry Time Exceeded (`build_local_time_exceeded_request`) and the
+  #2089 policy-`reject` Destination Unreachable
+  (`build_reject_icmp_unreachable`). Both originate a *new* ICMP error and
+  share one RFC 1812 §4.3.2.7 / RFC 4443 §2.4 suppression gate,
+  `can_generate_icmp_error_reply` (#2237): never reply to an inbound
+  ICMP/ICMPv6 error (storm/amplification), a non-first IP fragment
+  (no transport context), a multicast/broadcast destination (L3 or L2),
+  or a non-unique source (unspecified/loopback/multicast/broadcast) —
+  one source of truth so the two generators cannot drift. The reflected
+  error carries the inbound VLAN TCI verbatim (see the `frame/` note
+  above).
 - `event_emit.rs` — fixed-size, non-blocking RT_FLOW event producers
   for userspace policy-deny, screen-drop, logged PBR filter hits, and
   non-PBR input/output/lo0 filter logs. Output filter-log identity is

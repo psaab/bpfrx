@@ -9802,3 +9802,28 @@ top.
   pkg/dataplane/userspace/format/status_test.go,
   pkg/api/metrics_userspace.go,
   userspace-dp/src/afxdp/event_emit.rs, _Log.md
+
+- **Timestamp**: 2026-06-21
+  **Action**: #2237 (HIGH) — RFC error-suppression guards on the
+  locally-generated ICMP Time Exceeded path. The Time Exceeded generator
+  only checked TTL — it lacked the RFC 1812 §4.3.2.7 / RFC 4443 §2.4
+  guards the reject path already had. Added a single shared gate
+  `can_generate_icmp_error_reply(frame, meta)` in `icmp.rs` that
+  suppresses an ICMP error when the trigger is itself an ICMP/ICMPv6
+  error (storm/amplification), a non-first IP fragment, sent to an L3
+  multicast/broadcast or an L2 group MAC, or sourced from a non-unique
+  address (unspecified/loopback/multicast/broadcast). Both
+  `build_local_time_exceeded_request` and `build_reject_icmp_unreachable`
+  now route through this one predicate (one source of truth — the reject
+  path previously guarded only the fragment + ICMP-error subset). Hot
+  path: cheap branchless field reads, no per-packet allocation; normal
+  TTL>1 forwarding untouched. Tests (13 new, all fail-on-revert): TTL=1
+  ICMP-error trigger (v4+v6), non-first fragment (v4+v6),
+  multicast/broadcast dest (v4+v6), L2 group MAC with unicast L3 dest,
+  unspecified/loopback/multicast source produce NO Time Exceeded; normal
+  unicast UDP/TCP DOES (echo-query counterfactuals). Fail-on-revert
+  proven: removing the guard fails all 13 suppression tests; the 2
+  positive tests stay green.
+  **File(s)**: userspace-dp/src/afxdp/icmp.rs,
+  userspace-dp/src/afxdp/mod.rs, userspace-dp/src/afxdp/tests.rs,
+  userspace-dp/src/afxdp/README.md, _Log.md

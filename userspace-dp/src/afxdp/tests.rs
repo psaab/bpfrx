@@ -7188,3 +7188,365 @@ fn publish_dnat_table_entry_failure_increments_counter() {
     }
     assert_eq!(live.dnat_publish_errors.load(Ordering::Relaxed), 2);
 }
+
+// ============================================================================
+// #2237: RFC 1812 §4.3.2.7 / RFC 4443 §2.4 ICMP-error suppression guards on
+// the locally-generated Time Exceeded path.
+// #2242: RFC 4443 §3 ICMPv6 error quote length (include transport header
+// behind extension headers, bounded by the 1280 IPv6 minimum MTU).
+// ============================================================================
+
+/// Egress used by the #2237/#2242 Time Exceeded suppression tests:
+/// ifindex 5 with a v4 and v6 primary so both families build.
+fn icmp_guard_forwarding() -> ForwardingState {
+    reject_egress_forwarding(
+        Some(Ipv4Addr::new(10, 0, 61, 1)),
+        Some("2001:559:8585:61::1".parse().unwrap()),
+    )
+}
+
+fn icmp_guard_ident() -> BindingIdentity {
+    BindingIdentity {
+        slot: 0,
+        queue_id: 7,
+        worker_id: 0,
+        interface: Arc::<str>::from("ge-0-0-1"),
+        ifindex: 5,
+    }
+}
+
+fn icmp_guard_flow_v4(src: Ipv4Addr, dst: Ipv4Addr, proto: u8) -> SessionFlow {
+    SessionFlow {
+        src_ip: IpAddr::V4(src),
+        dst_ip: IpAddr::V4(dst),
+        forward_key: SessionKey {
+            addr_family: libc::AF_INET as u8,
+            protocol: proto,
+            src_ip: IpAddr::V4(src),
+            dst_ip: IpAddr::V4(dst),
+            src_port: 0x1234,
+            dst_port: 0x0035,
+        },
+    }
+}
+
+fn icmp_guard_flow_v6(src: Ipv6Addr, dst: Ipv6Addr, proto: u8) -> SessionFlow {
+    SessionFlow {
+        src_ip: IpAddr::V6(src),
+        dst_ip: IpAddr::V6(dst),
+        forward_key: SessionKey {
+            addr_family: libc::AF_INET6 as u8,
+            protocol: proto,
+            src_ip: IpAddr::V6(src),
+            dst_ip: IpAddr::V6(dst),
+            src_port: 0x1234,
+            dst_port: 0x0035,
+        },
+    }
+}
+
+fn run_local_te(
+    frame: &[u8],
+    meta: UserspaceDpMeta,
+    flow: &SessionFlow,
+    forwarding: &ForwardingState,
+) -> Option<PendingForwardRequest> {
+    let desc = XdpDesc {
+        addr: 4096,
+        len: frame.len() as u32,
+        options: 0,
+    };
+    build_local_time_exceeded_request(
+        frame,
+        desc,
+        meta,
+        &icmp_guard_ident(),
+        flow,
+        forwarding,
+        &Arc::new(ShardedNeighborMap::new()),
+        &BTreeMap::new(),
+        0,
+    )
+}
+
+/// Build an IPv4 frame [Eth][IP ttl=1 proto][8 L4 bytes] with explicit
+/// dst MAC, src/dst IP, protocol, and IPv4 frag_off (bytes 6-7).
+fn icmp_guard_v4_frame(
+    dst_mac: [u8; 6],
+    src: Ipv4Addr,
+    dst: Ipv4Addr,
+    proto: u8,
+    frag_off: u16,
+    l4: &[u8],
+) -> Vec<u8> {
+    let mut frame = Vec::new();
+    write_eth_header(&mut frame, dst_mac, [0x02, 0x11, 0x22, 0x33, 0x44, 0x55], 0, 0x0800);
+    let l3 = frame.len();
+    let total = 20 + l4.len();
+    frame.push(0x45);
+    frame.push(0x00);
+    frame.extend_from_slice(&(total as u16).to_be_bytes());
+    frame.extend_from_slice(&[0x00, 0x01]); // ident
+    frame.extend_from_slice(&frag_off.to_be_bytes());
+    frame.push(1); // ttl = 1 -> would expire
+    frame.push(proto);
+    frame.extend_from_slice(&[0x00, 0x00]); // csum placeholder
+    frame.extend_from_slice(&src.octets());
+    frame.extend_from_slice(&dst.octets());
+    let csum = checksum16(&frame[l3..l3 + 20]);
+    frame[l3 + 10..l3 + 12].copy_from_slice(&csum.to_be_bytes());
+    frame.extend_from_slice(l4);
+    frame
+}
+
+/// 8 generic L4 bytes (acts as a UDP/TCP-ish header for quoting).
+const L4_8: [u8; 8] = [0xc0, 0x00, 0x00, 0x35, 0x00, 0x08, 0x00, 0x00];
+
+/// Standard unicast firewall NIC dst MAC (low bit clear).
+const FW_MAC: [u8; 6] = [0x00, 0x25, 0x90, 0x12, 0x34, 0x56];
+
+fn icmp_guard_meta_v4(proto: u8) -> UserspaceDpMeta {
+    UserspaceDpMeta {
+        l3_offset: 14,
+        l4_offset: 34,
+        ingress_ifindex: 5,
+        addr_family: libc::AF_INET as u8,
+        protocol: proto,
+        ..UserspaceDpMeta::default()
+    }
+}
+
+fn icmp_guard_meta_v6(proto: u8, l4_offset: u16) -> UserspaceDpMeta {
+    UserspaceDpMeta {
+        l3_offset: 14,
+        l4_offset,
+        ingress_ifindex: 5,
+        addr_family: libc::AF_INET6 as u8,
+        protocol: proto,
+        ..UserspaceDpMeta::default()
+    }
+}
+
+// ---- #2237 positive cases (no over-suppression) ----
+
+#[test]
+fn te_emitted_for_normal_unicast_udp_v4() {
+    let src = Ipv4Addr::new(198, 51, 100, 20);
+    let dst = Ipv4Addr::new(203, 0, 113, 7);
+    let frame = icmp_guard_v4_frame(FW_MAC, src, dst, PROTO_UDP, 0x0000, &L4_8);
+    let meta = icmp_guard_meta_v4(PROTO_UDP);
+    let flow = icmp_guard_flow_v4(src, dst, PROTO_UDP);
+    assert!(
+        run_local_te(&frame, meta, &flow, &icmp_guard_forwarding()).is_some(),
+        "a normal unicast UDP TTL=1 packet MUST elicit a Time Exceeded"
+    );
+    assert!(can_generate_icmp_error_reply(&frame, meta));
+}
+
+#[test]
+fn te_emitted_for_normal_unicast_tcp_v4() {
+    let src = Ipv4Addr::new(198, 51, 100, 20);
+    let dst = Ipv4Addr::new(203, 0, 113, 7);
+    let frame = icmp_guard_v4_frame(FW_MAC, src, dst, PROTO_TCP, 0x0000, &L4_8);
+    let meta = icmp_guard_meta_v4(PROTO_TCP);
+    let flow = icmp_guard_flow_v4(src, dst, PROTO_TCP);
+    assert!(
+        run_local_te(&frame, meta, &flow, &icmp_guard_forwarding()).is_some(),
+        "a normal unicast TCP TTL=1 packet MUST elicit a Time Exceeded"
+    );
+}
+
+// ---- #2237 (a): ICMP-error trigger suppressed ----
+
+#[test]
+fn te_suppressed_for_inbound_icmp_error_v4() {
+    let src = Ipv4Addr::new(198, 51, 100, 20);
+    let dst = Ipv4Addr::new(203, 0, 113, 7);
+    // ICMPv4 type 11 (Time Exceeded) trigger — an ICMP error.
+    let icmp = [11u8, 0, 0, 0, 0, 0, 0, 0];
+    let frame = icmp_guard_v4_frame(FW_MAC, src, dst, PROTO_ICMP, 0x0000, &icmp);
+    let meta = icmp_guard_meta_v4(PROTO_ICMP);
+    let flow = icmp_guard_flow_v4(src, dst, PROTO_ICMP);
+    assert!(
+        run_local_te(&frame, meta, &flow, &icmp_guard_forwarding()).is_none(),
+        "a TTL=1 inbound ICMP error MUST NOT elicit a Time Exceeded (error loop)"
+    );
+    // Counterfactual: an ICMP echo request (query, not error) is NOT
+    // suppressed — proves the gate keys on the ICMP type, not the proto.
+    let echo = [8u8, 0, 0, 0, 0, 0, 0, 0];
+    let echo_frame = icmp_guard_v4_frame(FW_MAC, src, dst, PROTO_ICMP, 0x0000, &echo);
+    assert!(
+        run_local_te(&echo_frame, meta, &flow, &icmp_guard_forwarding()).is_some(),
+        "a TTL=1 ICMP echo (query) MUST still elicit a Time Exceeded"
+    );
+}
+
+#[test]
+fn te_suppressed_for_inbound_icmpv6_error() {
+    let src: Ipv6Addr = "2001:559:8585:61::102".parse().unwrap();
+    let dst: Ipv6Addr = "2606:4700:4700::1111".parse().unwrap();
+    // ICMPv6 type 3 (Time Exceeded) trigger — an ICMPv6 error (type < 128).
+    let frame = build_icmp_echo_frame_v6_hl_typed(src, dst, 1, 3);
+    let meta = icmp_guard_meta_v6(PROTO_ICMPV6, 54);
+    let flow = icmp_guard_flow_v6(src, dst, PROTO_ICMPV6);
+    assert!(
+        run_local_te(&frame, meta, &flow, &icmp_guard_forwarding()).is_none(),
+        "a hop-limit=1 inbound ICMPv6 error MUST NOT elicit a Time Exceeded"
+    );
+    // Echo request (type 128, a query) is not suppressed.
+    let echo = build_icmp_echo_frame_v6_hl_typed(src, dst, 1, 128);
+    assert!(
+        run_local_te(&echo, meta, &flow, &icmp_guard_forwarding()).is_some(),
+        "a hop-limit=1 ICMPv6 echo (query) MUST still elicit a Time Exceeded"
+    );
+}
+
+/// Build an ICMPv6 frame with hop-limit `hl` and ICMPv6 type `ty`
+/// (no extension headers; L4 at offset 54).
+fn build_icmp_echo_frame_v6_hl_typed(src: Ipv6Addr, dst: Ipv6Addr, hl: u8, ty: u8) -> Vec<u8> {
+    let mut frame = Vec::new();
+    write_eth_header(&mut frame, FW_MAC, [0x02, 0x11, 0x22, 0x33, 0x44, 0x55], 0, 0x86dd);
+    frame.extend_from_slice(&[0x60, 0, 0, 0, 0, 0x08, PROTO_ICMPV6, hl]);
+    frame.extend_from_slice(&src.octets());
+    frame.extend_from_slice(&dst.octets());
+    let icmp_start = frame.len();
+    frame.extend_from_slice(&[ty, 0, 0, 0, 0, 0, 0, 0]);
+    let csum = checksum16_ipv6(src, dst, PROTO_ICMPV6, &frame[icmp_start..]);
+    frame[icmp_start + 2..icmp_start + 4].copy_from_slice(&csum.to_be_bytes());
+    frame
+}
+
+// ---- #2237 (b): non-first fragment suppressed ----
+
+#[test]
+fn te_suppressed_for_non_first_fragment_v4() {
+    let src = Ipv4Addr::new(198, 51, 100, 20);
+    let dst = Ipv4Addr::new(203, 0, 113, 7);
+    // frag_off = 0x0001 -> fragment offset 1 (non-first), MF=0.
+    let frame = icmp_guard_v4_frame(FW_MAC, src, dst, PROTO_UDP, 0x0001, &L4_8);
+    let meta = icmp_guard_meta_v4(PROTO_UDP);
+    let flow = icmp_guard_flow_v4(src, dst, PROTO_UDP);
+    assert!(
+        run_local_te(&frame, meta, &flow, &icmp_guard_forwarding()).is_none(),
+        "a TTL=1 non-first IPv4 fragment MUST NOT elicit a Time Exceeded"
+    );
+}
+
+#[test]
+fn te_suppressed_for_non_first_fragment_v6() {
+    let src: Ipv6Addr = "2001:559:8585:61::102".parse().unwrap();
+    let dst: Ipv6Addr = "2606:4700:4700::1111".parse().unwrap();
+    let mut frame = Vec::new();
+    write_eth_header(&mut frame, FW_MAC, [0x02, 0x11, 0x22, 0x33, 0x44, 0x55], 0, 0x86dd);
+    // IPv6 base: next-header = 44 (fragment), hop-limit 1, payload_len 16.
+    frame.extend_from_slice(&[0x60, 0, 0, 0, 0, 16, 44, 1]);
+    frame.extend_from_slice(&src.octets());
+    frame.extend_from_slice(&dst.octets());
+    // Fragment header (8 bytes): next-header UDP, frag-offset != 0
+    // (bytes 2-3 = 0x0008 -> offset bits non-zero), then 8 payload bytes.
+    frame.extend_from_slice(&[PROTO_UDP, 0, 0x00, 0x08, 0, 0, 0, 1]);
+    frame.extend_from_slice(&L4_8);
+    let meta = icmp_guard_meta_v6(PROTO_UDP, 62);
+    let flow = icmp_guard_flow_v6(src, dst, PROTO_UDP);
+    assert!(
+        run_local_te(&frame, meta, &flow, &icmp_guard_forwarding()).is_none(),
+        "a hop-limit=1 non-first IPv6 fragment MUST NOT elicit a Time Exceeded"
+    );
+}
+
+// ---- #2237 (c): multicast / broadcast destination suppressed ----
+
+#[test]
+fn te_suppressed_for_multicast_dest_v4() {
+    let src = Ipv4Addr::new(198, 51, 100, 20);
+    let dst = Ipv4Addr::new(224, 0, 0, 251); // mDNS multicast
+    // L2 dst is the matching multicast MAC, but the L3 guard fires first.
+    let frame = icmp_guard_v4_frame([0x01, 0x00, 0x5e, 0x00, 0x00, 0xfb], src, dst, PROTO_UDP, 0, &L4_8);
+    let meta = icmp_guard_meta_v4(PROTO_UDP);
+    let flow = icmp_guard_flow_v4(src, dst, PROTO_UDP);
+    assert!(
+        run_local_te(&frame, meta, &flow, &icmp_guard_forwarding()).is_none(),
+        "a TTL=1 multicast-dest packet MUST NOT elicit a Time Exceeded"
+    );
+}
+
+#[test]
+fn te_suppressed_for_broadcast_dest_v4() {
+    let src = Ipv4Addr::new(198, 51, 100, 20);
+    let dst = Ipv4Addr::new(255, 255, 255, 255); // limited broadcast
+    let frame = icmp_guard_v4_frame([0xff; 6], src, dst, PROTO_UDP, 0, &L4_8);
+    let meta = icmp_guard_meta_v4(PROTO_UDP);
+    let flow = icmp_guard_flow_v4(src, dst, PROTO_UDP);
+    assert!(
+        run_local_te(&frame, meta, &flow, &icmp_guard_forwarding()).is_none(),
+        "a TTL=1 broadcast-dest packet MUST NOT elicit a Time Exceeded"
+    );
+}
+
+#[test]
+fn te_suppressed_for_l2_multicast_with_unicast_l3_dest_v4() {
+    let src = Ipv4Addr::new(198, 51, 100, 20);
+    let dst = Ipv4Addr::new(203, 0, 113, 7); // unicast L3
+    // Group MAC (low bit set) on a unicast L3 dest still suppresses.
+    let frame = icmp_guard_v4_frame([0x01, 0x00, 0x5e, 0x12, 0x34, 0x56], src, dst, PROTO_UDP, 0, &L4_8);
+    let meta = icmp_guard_meta_v4(PROTO_UDP);
+    let flow = icmp_guard_flow_v4(src, dst, PROTO_UDP);
+    assert!(
+        run_local_te(&frame, meta, &flow, &icmp_guard_forwarding()).is_none(),
+        "a TTL=1 packet to an L2 group MAC MUST NOT elicit a Time Exceeded"
+    );
+}
+
+#[test]
+fn te_suppressed_for_multicast_dest_v6() {
+    let src: Ipv6Addr = "2001:559:8585:61::102".parse().unwrap();
+    let dst: Ipv6Addr = "ff02::1".parse().unwrap(); // all-nodes multicast
+    let frame = build_icmp_echo_frame_v6_hl_typed(src, dst, 1, 128);
+    let meta = icmp_guard_meta_v6(PROTO_ICMPV6, 54);
+    let flow = icmp_guard_flow_v6(src, dst, PROTO_ICMPV6);
+    assert!(
+        run_local_te(&frame, meta, &flow, &icmp_guard_forwarding()).is_none(),
+        "a hop-limit=1 multicast-dest IPv6 packet MUST NOT elicit a Time Exceeded"
+    );
+}
+
+// ---- #2237 (d): non-unique source suppressed ----
+
+#[test]
+fn te_suppressed_for_unspecified_source_v4() {
+    let src = Ipv4Addr::new(0, 0, 0, 0);
+    let dst = Ipv4Addr::new(203, 0, 113, 7);
+    let frame = icmp_guard_v4_frame(FW_MAC, src, dst, PROTO_UDP, 0, &L4_8);
+    let meta = icmp_guard_meta_v4(PROTO_UDP);
+    let flow = icmp_guard_flow_v4(src, dst, PROTO_UDP);
+    assert!(
+        run_local_te(&frame, meta, &flow, &icmp_guard_forwarding()).is_none(),
+        "a TTL=1 packet from 0.0.0.0 MUST NOT elicit a Time Exceeded"
+    );
+}
+
+#[test]
+fn te_suppressed_for_loopback_source_v4() {
+    let src = Ipv4Addr::new(127, 0, 0, 1);
+    let dst = Ipv4Addr::new(203, 0, 113, 7);
+    let frame = icmp_guard_v4_frame(FW_MAC, src, dst, PROTO_UDP, 0, &L4_8);
+    let meta = icmp_guard_meta_v4(PROTO_UDP);
+    let flow = icmp_guard_flow_v4(src, dst, PROTO_UDP);
+    assert!(
+        run_local_te(&frame, meta, &flow, &icmp_guard_forwarding()).is_none(),
+        "a TTL=1 packet from a loopback source MUST NOT elicit a Time Exceeded"
+    );
+}
+
+#[test]
+fn te_suppressed_for_multicast_source_v6() {
+    let src: Ipv6Addr = "ff02::1".parse().unwrap();
+    let dst: Ipv6Addr = "2606:4700:4700::1111".parse().unwrap();
+    let frame = build_icmp_echo_frame_v6_hl_typed(src, dst, 1, 128);
+    let meta = icmp_guard_meta_v6(PROTO_ICMPV6, 54);
+    let flow = icmp_guard_flow_v6(src, dst, PROTO_ICMPV6);
+    assert!(
+        run_local_te(&frame, meta, &flow, &icmp_guard_forwarding()).is_none(),
+        "a hop-limit=1 packet from a multicast source MUST NOT elicit a Time Exceeded"
+    );
+}
