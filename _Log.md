@@ -1,5 +1,45 @@
 # Action Log
 
+## 2026-06-22 — #2345 inbound destination-translation policy tuple
+
+- **Timestamp**: 2026-06-22 PDT
+- **Action**: Fixed the HIGH/MED security-policy-correctness gap where the
+  inbound security-policy lookup was evaluated against the ORIGINAL
+  (pre-translation) destination tuple for DNAT / static-DNAT / inbound
+  NPTv6, instead of the POST-translation (real/internal) destination —
+  contradicting Junos/SRX semantics (inbound destination translation
+  precedes the policy lookup) and the documented twice-NAT contract.
+  Diagnosis confirmed against current code: the destination ZONE was
+  already correct (derived from `resolution.egress_ifindex`, which is
+  computed from `effective_resolution_target`), so only the address/port
+  half of the policy-match tuple was wrong. Fix: compute `policy_dst_ip`
+  (= `effective_resolution_target`) and `policy_dst_port` (= the DNAT
+  `rewrite_dst_port`, else the original port) once on the session-miss
+  path and feed them to `evaluate_policy_result_with_len` at BOTH the
+  `ForwardCandidate` and `MissingNeighbor` policy-eval sites (the
+  MissingNeighbor site reconstructs the same tuple from the merged
+  `decision.nat`, since the miss-block locals are out of scope there).
+  NAT64 is DELIBERATELY EXCLUDED (design fork resolved in-scope): it is a
+  cross-family translation (V6 src, V4 dst) and the policy matcher
+  requires same-family src+dst, so the extracted IPv4 dst would match no
+  rule and break ALL NAT64 connectivity — NAT64 keeps matching on the
+  synthetic IPv6 dst. Session reversal is preserved (the change touches
+  only the policy lookup, not session keys).
+- **Validation**: `cargo build --release` clean; targeted suites green
+  (nat 379, dnat 40, npt 24, nat64 81, policy 97, poll_descriptor 19, 0
+  failures); 8 new tests 5x stable. New tests (afxdp/tests.rs):
+  policy_inbound_dnat_matches_translated_destination_permit,
+  policy_inbound_dnat_denies_when_only_original_dst_permitted,
+  policy_inbound_dnat_matches_translated_destination_port,
+  policy_inbound_nptv6_matches_translated_destination_permit,
+  policy_inbound_nptv6_denies_when_only_external_prefix_permitted,
+  policy_inbound_nat64_matches_synthetic_v6_destination_permit,
+  policy_inbound_nat64_denies_on_synthetic_v6_deny_rule,
+  inbound_dnat_reverse_session_key_uses_public_facing_tuple.
+- **File(s)**: userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/src/afxdp/tests.rs, docs/next-features/twice-nat.md,
+  _Log.md
+
 ## 2026-06-22 — #2344 non-first-fragment SessionFlow gate
 
 - **Timestamp**: 2026-06-22 PDT
