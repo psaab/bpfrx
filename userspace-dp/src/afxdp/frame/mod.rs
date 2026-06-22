@@ -279,13 +279,25 @@ pub(super) fn build_forwarded_frame_from_frame(
         // The endpoint is already fetched for the GRE builder; the
         // `mode` match reads a &str already in hand — no new branch on
         // the plain-forward fast path (#1432 §4.4).
-        let mode = forwarding
+        //
+        // #2327: dispatch on the TYPED kind and FAIL CLOSED on an
+        // unknown/missing mode. The pre-#2327 `_ => GRE` arm silently
+        // GRE-encapsulated any unrecognized or future tunnel mode (a
+        // fail-OPEN default in a security appliance). An endpoint id
+        // that resolves to no row, or to a row whose mode is neither
+        // GRE nor WireGuard, is now DROPPED (`None`) rather than emitted
+        // as GRE.
+        let kind = forwarding
             .tunnel_endpoints
             .get(&decision.resolution.tunnel_endpoint_id)
-            .map(|e| e.mode.as_str());
-        return match mode {
-            Some("wireguard") => wg::wg_encap_frame(&out, meta, decision, forwarding),
-            _ => encapsulate_native_gre_frame(&out, meta, decision, forwarding),
+            .map(|e| tunnel_mode_kind(&e.mode));
+        return match kind {
+            Some(TunnelKind::WireGuard) => wg::wg_encap_frame(&out, meta, decision, forwarding),
+            Some(TunnelKind::Gre) => {
+                encapsulate_native_gre_frame(&out, meta, decision, forwarding)
+            }
+            // Unknown mode or missing endpoint row: fail closed.
+            Some(TunnelKind::Unknown) | None => None,
         };
     }
     Some(out)

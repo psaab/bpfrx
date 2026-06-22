@@ -227,6 +227,35 @@ Required behavior:
 
 Without that, the same HA parity gap reappears in another form.
 
+### 6a. Tunnel-Kind Segregation & Fail-Closed Dispatch (#2327)
+
+`state.tunnel_endpoints` is a MIXED-KIND table: GRE/`ip6gre` and
+WireGuard rows coexist (and future kinds may be added). Two invariants
+keep that table from crossing security boundaries:
+
+- **GRE decap is kind-segregated.** `match_tunnel_endpoint`
+  (`afxdp/gre.rs`) resolves a received proto-47 outer tuple ONLY through
+  `state.gre_decap_index` — a per-build index that contains ONLY
+  `mode == "gre"`/`"ip6gre"` endpoints, keyed by the endpoint's own
+  `(outer_family, source, destination)` and queried with the frame's
+  mirrored `(addr_family, outer_dst, outer_src)`. A GRE frame whose
+  outer tuple/key happen to collide with a WireGuard (or any non-GRE)
+  row is NEVER decapsulated as GRE — it finds no GRE candidate and is
+  dropped / falls through. The candidate list per bucket disambiguates a
+  duplicate outer tuple by GRE key instead of a non-deterministic
+  first-match scan, and replaces the former per-packet O(N)
+  `tunnel_endpoints.values().find(...)` linear scan (agy #4). A
+  per-candidate `tunnel_mode_kind` re-check is kept as defense in depth.
+- **Egress encap fails closed on an unknown mode.** The egress
+  dispatcher (`afxdp/frame/mod.rs`) matches on the typed `TunnelKind`
+  (`afxdp/forwarding_build/tunnels.rs::tunnel_mode_kind`): `WireGuard` →
+  WG encap, `Gre` → native GRE encap, and `Unknown`/missing-row → DROP.
+  The pre-#2327 `_ => GRE` arm fail-OPEN-encapsulated any unrecognized
+  or future mode as GRE; that is now a drop, matching the appliance's
+  fail-closed parser doctrine. Add a new tunnel kind in exactly one
+  place — `tunnel_mode_kind` — and the dispatcher will keep failing
+  closed until the new arm is added deliberately.
+
 ## Policy-Based Routing Without A Tunnel Netdevice
 
 This is the most important control-plane question.
