@@ -21,9 +21,9 @@ therefore staged by capability, not by vendor.
 | S7 | Type-3 CookieReply + MAC2 generation/verification + IPv6 outer encap + DSCP/ECN | **DSCP/ECN encap DONE (#2303)** — inner DSCP+ECN copied onto the outer header (uniform DSCP + RFC 6040 ECN ingress copy). RFC 6040 §4.2 decap-side ECN *combine* shipped for GRE (#2315) AND WG (#2317) — WG captures the outer ECN via `recvmsg` + `IP_RECVTOS`/`IPV6_RECVTCLASS` cmsg and folds it into the decrypted inner via the shared `apply_decap_ecn_combine` (live ECN-propagation verification lab-deferred to #1703-class interop). CookieReply/MAC2 still pending |
 | S8 | HA RG WG-session migration | pending |
 
-## Tunnel MTU + MSS + DSCP/ECN model (#2299 / #2300 / #2303)
+## Tunnel MTU + MSS + DSCP/ECN model (#2299 / #2300 / #2303 / #2329)
 
-These three correctness fixes share the encap sites and the tunnel-MTU
+These correctness fixes share the encap sites and the tunnel-MTU
 model. They apply to BOTH WireGuard and (for DSCP/ECN) GRE.
 
 ### MSS clamp (#2299)
@@ -37,6 +37,51 @@ the GRE value (~36–60 bytes too high), so the peer sent full-MSS data
 segments that the WG encap MTU guard then silently dropped at
 `encap_mtu_drops` — the classic "handshake + ping pass, bulk TCP stalls
 at zero bytes" failure.
+
+### TCP-segmentation egress is mode-aware on BOTH axes (#2329)
+The fallback TCP-segmentation egress builder
+(`frame/tcp_segmentation.rs::segment_forwarded_tcp_frames_from_frame`)
+re-segments an oversized forwarded TCP flow when the sender ignores the
+advertised MSS, the session predates the clamp, or a middlebox injects
+larger segments. Before #2329 it was tunnel-mode-BLIND in two places —
+both effectively hardcoded to GRE:
+
+1. **Inner-L3 MTU math.** It sized every tunnel's segments with the GRE
+   inner-MTU formula (`native_gre_inner_mtu`). For a WireGuard endpoint
+   that budget is ~36–60 bytes too large, so the oversized WG-bound
+   segments were built and then dropped at the WG encap MTU guard
+   (`encap_mtu_drops`) — the same blackhole #2299 closed for the SYN
+   path, re-opened for the segmentation fallback.
+2. **Encap dispatch.** It unconditionally called
+   `encapsulate_native_gre_frame` for any `tunnel_endpoint_id != 0`, so a
+   WireGuard tunnel's segmented TCP went out **GRE-encapsulated** (wrong
+   protocol on the wire; for an inet WG endpoint it even built a
+   degenerate `0.0.0.0→0.0.0.0` outer) — a mis-encapsulation, worse than
+   the MTU drop.
+
+Both axes now dispatch on the typed `TunnelKind` (the #2327 classifier,
+`forwarding_build/tunnels.rs::tunnel_mode_kind`) and reuse the existing
+SSOT helpers — no parallel overhead math:
+
+- MTU: `Gre` → `native_gre_inner_mtu`; `WireGuard` →
+  `wg::mss::wg_inner_mtu(outer_family, outer_mtu)` (the pad-aware inverse
+  of `wg_encapped_size`, the same helper #2330's post-transform PMTUD
+  uses); `Unknown`/missing → 0 budget → drop. A tunnel budget is NOT
+  floored to 1280 (that floor stays on the plain-forward path only): a
+  small-outer-MTU tunnel has a genuinely smaller inner budget, and
+  flooring it would re-introduce the oversized-then-dropped blackhole.
+- Encap: `Gre` → `encapsulate_native_gre_frame`; `WireGuard` →
+  `frame/wg.rs::wg_encap_frame` (the same builder the normal egress path
+  uses — it pulls the live noise session from `forwarding.wg_engines`
+  itself, so the segmentation site needs no extra keystate); `Unknown`/
+  missing → drop (fail closed, mirroring the #2327 build-egress
+  dispatch in `frame/mod.rs`).
+
+After #2329 the segmentation path, the normal egress path (#2327), the
+SYN MSS clamp (#2299, `tunnel_tcp_mss`), the encap MTU guards
+(#2331/#1865), and the post-transform PMTUD (#2330) are ALL mode-aware
+and share `native_gre_inner_mtu` / `wg::mss::wg_inner_mtu` /
+`TunnelKind`.
 
 ### Outer MTU SSOT (#2300)
 There is now ONE outer-MTU model. The transit-egress encap
