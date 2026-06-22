@@ -85,6 +85,27 @@ inspect or rewrite a packet sitting in a UMEM frame.
   `packet_rel_l4_offset_and_protocol` so MSS clamping reaches
   ext-headered v6 SYNs (the shared helper is left unchanged — GRE decap
   and tunnel local-origin read it to forward fragmented inner packets).
+- **Non-first fragments build NO ported SessionFlow (#2344)**: #1852
+  gated only the NAT rewrite leaves; the generic session-flow parsers
+  (`parse_session_flow_from_bytes` / `parse_session_flow_from_frame` /
+  `parse_ipv4_session_flow_from_frame`) still called `parse_flow_ports`
+  on a non-first fragment, reading payload bytes as TCP/UDP ports and
+  feeding that fake tuple to policy eval, the flow cache, and the
+  session/reverse indexes. The parsers now reuse the same
+  `is_non_first_fragment` / `ipv4_is_non_first_fragment` /
+  `ipv6_is_non_first_fragment` predicates and return `None` for a
+  non-first fragment. `parse_session_flow_from_bytes` runs the check
+  ONCE at the top (`frame_is_non_first_fragment`) as the single
+  chokepoint, so the meta fast path cannot admit a fragment either — the
+  XDP shim does NOT gate fragments, so `meta.flow_*_port` may carry
+  payload bytes stamped at the post-IP offset. A flowless (`None`)
+  packet follows the existing route-based, session-less forward path
+  (the pre-#1913 "no flow tuple" behavior in `poll_descriptor`), so xpf
+  forwards fragments statelessly per route without policy-on-fake-ports.
+  GRE decap (`gre.rs`) inherits this automatically: with `flow == None`
+  it stamps `(0, 0)` ports instead of synthesizing them. Composes with
+  the #2293-era screen fragment classification (`extract_screen_info`),
+  which independently sees and screens non-first fragments.
 - **TCP inspection helpers are ext-header-aware (#2148)**: the read-only
   diagnostic/telemetry helpers `frame_has_tcp_rst`,
   `extract_tcp_flags_and_window`, and `extract_tcp_window` (`tcp.rs`) all
