@@ -1,5 +1,29 @@
 # Action Log
 
+## 2026-06-22 — #2321 generated-reply parser fail-closed (§6.2)
+
+- **Timestamp**: 2026-06-22 PDT
+- **Action**: Make `parse_generated_v4`/`parse_generated_v6` fail CLOSED
+  when a locally-generated TCP/UDP reply is truncated before its 4 L4 port
+  bytes. `generated_l4_ports` now returns `Option<(u16,u16)>` — `None` for a
+  TCP/UDP frame whose ports cannot be read at the computed L4 offset, rather
+  than the old `(0,0)` substitution that misclassified the reply past an
+  output-filter `discard`. Both parsers propagate the `None` with `?`, so the
+  caller (`classify_generated_reply` in `tx/cos_classify.rs`) drops the reply
+  and bumps `generated_reply_classify_parse_errors`. ICMP/ICMPv6 (no transport
+  ports) still return `(0,0)` unchanged; well-formed TCP/UDP replies are
+  unaffected. Defense-in-depth — generated replies are well-formed by
+  construction. Copilot flagged this on PR #2319.
+- **File(s)**: userspace-dp/src/afxdp/frame/generated.rs,
+  userspace-dp/src/afxdp/frame/generated_tests.rs, _Log.md
+- **Tests**: added `truncated_v4_tcp_ports_fails_closed_none`,
+  `truncated_v4_udp_ports_fails_closed_none`,
+  `truncated_v6_tcp_ports_fails_closed_none`,
+  `truncated_v6_udp_ports_fails_closed_none` (fail-on-revert — they pass with
+  `(0,0)` substitution if the guard is removed) and `parses_v4_udp_reply_ports`
+  (well-formed regression guard). `cargo build --release` clean;
+  `cargo test --release -- generated parse_generated cos_classify` green.
+
 ## 2026-06-22 — #1434 review round 1 (NEEDS-MINOR fold)
 
 - **Timestamp**: 2026-06-22 PDT

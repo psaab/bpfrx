@@ -35,7 +35,8 @@ use super::*;
 /// `(SessionKey, ForwardPacketMeta)`.
 ///
 /// Returns `None` on any parse failure (truncated header, unknown family,
-/// over-bound IPv6 extension chain). The caller MUST fail CLOSED on `None`
+/// over-bound IPv6 extension chain, or a TCP/UDP reply truncated before its 4
+/// L4 port bytes). The caller MUST fail CLOSED on `None`
 /// (#2238 §6.2): an output-filter terminal `discard`/`reject` is a security
 /// boundary, so a reply whose own bytes cannot be classified is DROPPED, not
 /// leaked past the filter. The bytes are our own, so `None` is a logic bug —
@@ -83,7 +84,12 @@ fn parse_generated_v4(packet: &[u8], l3_offset: usize) -> Option<(SessionKey, Fo
     // byte counter.
     let total_len = u16::from_be_bytes([packet[2], packet[3]]) as usize;
     let pkt_len = total_len.clamp(ihl, packet.len());
-    let (src_port, dst_port) = generated_l4_ports(packet, ihl, protocol);
+    // §6.2 fail-CLOSED: a TCP/UDP generated reply MUST carry its 4 port bytes
+    // at the L4 offset (`ihl`). A frame truncated before the ports yields
+    // `None` here, so the caller drops the reply (and bumps
+    // `generated_reply_classify_parse_errors`) rather than misclassifying it
+    // with substituted (0,0) ports past an output `discard`.
+    let (src_port, dst_port) = generated_l4_ports(packet, ihl, protocol)?;
     finish_generated_key(
         libc::AF_INET as u8,
         protocol,
@@ -113,7 +119,9 @@ fn parse_generated_v6(packet: &[u8], l3_offset: usize) -> Option<(SessionKey, Fo
     // Walk the extension-header chain to the L4 protocol + offset (bounded,
     // fail-closed at the bound — same contract as the forwarding walkers).
     let (rel_l4, protocol) = packet_rel_l4_offset_and_protocol(packet, libc::AF_INET6 as u8)?;
-    let (src_port, dst_port) = generated_l4_ports(packet, rel_l4, protocol);
+    // §6.2 fail-CLOSED: see parse_generated_v4 — a TCP/UDP reply truncated
+    // before its 4 port bytes drops rather than misclassifies with (0,0).
+    let (src_port, dst_port) = generated_l4_ports(packet, rel_l4, protocol)?;
     finish_generated_key(
         libc::AF_INET6 as u8,
         protocol,
@@ -130,18 +138,23 @@ fn parse_generated_v6(packet: &[u8], l3_offset: usize) -> Option<(SessionKey, Fo
 
 /// L4 ports for the generated frame: real ports for TCP/UDP, 0/0 for
 /// ICMP/ICMPv6 (no transport ports) and anything else.
-fn generated_l4_ports(packet: &[u8], rel_l4: usize, protocol: u8) -> (u16, u16) {
+///
+/// §6.2 fail-CLOSED: for TCP/UDP this returns `None` when the frame is
+/// truncated before the 4 port bytes at `rel_l4` (a clamped total_len too
+/// short to reach the L4 header, or the frame physically chopped). The
+/// callers propagate that `None` so a generated reply whose ports cannot be
+/// read is DROPPED, never misclassified with substituted (0,0) ports past an
+/// output-filter `discard`. ICMP/ICMPv6 (and anything else) legitimately have
+/// no transport ports and return `(0, 0)` unchanged.
+fn generated_l4_ports(packet: &[u8], rel_l4: usize, protocol: u8) -> Option<(u16, u16)> {
     match protocol {
-        PROTO_TCP | PROTO_UDP => packet
-            .get(rel_l4..rel_l4 + 4)
-            .map(|b| {
-                (
-                    u16::from_be_bytes([b[0], b[1]]),
-                    u16::from_be_bytes([b[2], b[3]]),
-                )
-            })
-            .unwrap_or((0, 0)),
-        _ => (0, 0),
+        PROTO_TCP | PROTO_UDP => packet.get(rel_l4..rel_l4 + 4).map(|b| {
+            (
+                u16::from_be_bytes([b[0], b[1]]),
+                u16::from_be_bytes([b[2], b[3]]),
+            )
+        }),
+        _ => Some((0, 0)),
     }
 }
 
