@@ -17,7 +17,7 @@ therefore staged by capability, not by vendor.
 | S4 | Non-zero pre-shared key (PSK) plumbing | pending |
 | S5 | Persistent-keepalive + REKEY/REJECT-AFTER timers + endpoint roaming + empty-record (keepalive/key-confirm) handling + TAI64N disk persistence | **timers + keepalives DONE (#1888/#1889)** — full whitepaper §6.1 timer machine (REKEY_AFTER_TIME 120s initiator-only, 165s receive horizon, REJECT_AFTER_TIME 180s per-use + expiry teardown, 5s/90s retry discipline, 10s passive + configured persistent keepalives, post-msg2 key-confirmation keepalive) on a blocking-poll(2) control loop; design of record `docs/research/1888-wg-timers/plan.md`. Authenticated-datagram endpoint LEARNING shipped in S2a/#1888 (keepalives now count); engine-level roam API + TAI64N disk persistence remain pending |
 | S6 | Junos config surface (grammar + compiler + snapshot population, base64↔hex keys) | pending |
-| S7 | Type-3 CookieReply + MAC2 generation/verification + IPv6 outer encap + DSCP/ECN | **DSCP/ECN DONE (#2303)** — inner DSCP+ECN copied onto the outer header (uniform DSCP + RFC 6040 ECN ingress); CookieReply/MAC2 still pending |
+| S7 | Type-3 CookieReply + MAC2 generation/verification + IPv6 outer encap + DSCP/ECN | **DSCP/ECN encap DONE (#2303)** — inner DSCP+ECN copied onto the outer header (uniform DSCP + RFC 6040 ECN ingress copy). GRE decap-side RFC 6040 §4.2 ECN *combine* shipped in #2315; **WG decap-side combine still pending (#2317)** — blocked on `IP_RECVTOS`/`recvmsg` recv-loop changes. CookieReply/MAC2 still pending |
 | S8 | HA RG WG-session migration | pending |
 
 ## Tunnel MTU + MSS + DSCP/ECN model (#2299 / #2300 / #2303)
@@ -59,15 +59,35 @@ the route at the tunnel-manager layer, so a non-1500 underlay relies on
 either the operator `mtu` statement or the Rust egress guard as the
 authoritative backstop.
 
-### DSCP/ECN propagation (#2303)
-GRE and WG encap copy the inner packet's full TOS / IPv6 Traffic-Class
-byte (DSCP 6 bits + ECN 2 bits) onto the outer header via
-`gre::inner_tos_byte`, instead of hardcoding 0. This is the uniform DSCP
-model (RFC 2983) — per-hop QoS classification survives the tunnel — plus
-RFC 6040 normal-mode ECN ingress (inner ECN copied to outer), so a CE
-mark applied by a congested router on the outer path is reflected to the
-inner endpoints at decap. `wg::dscp::tos_from_dscp` (which clears ECN)
-is retained for the DSCP-only case but is NOT the encap reader.
+### DSCP/ECN propagation (#2303 encap, #2315 GRE decap)
+
+**Encap (#2303).** GRE and WG encap copy the inner packet's full TOS /
+IPv6 Traffic-Class byte (DSCP 6 bits + ECN 2 bits) onto the outer header
+via `gre::inner_tos_byte`, instead of hardcoding 0. This is the uniform
+DSCP model (RFC 2983) — per-hop QoS classification survives the tunnel —
+plus the RFC 6040 normal-mode ECN ingress COPY (inner ECN → outer ECN).
+`wg::dscp::tos_from_dscp` (which clears ECN) is retained for the
+DSCP-only case but is NOT the encap reader.
+
+**Decap (#2315).** The RFC 6040 §4.2 decap-side ECN *combine* (outer ECN
+→ inner ECN) — the half that actually reflects a CE mark applied by a
+congested router on the outer path back to the inner endpoints — is
+implemented for the **GRE decap path only**
+(`gre::apply_decap_ecn_combine`, wired into
+`try_native_gre_decap_from_frame`): an outer CE upgrades an ECN-capable
+inner to CE; the illegal outer-CE / inner-Not-ECT combination is dropped
+(`xpf_userspace_gre_decap_ecn_illegal_drops_total`); the inner DSCP is
+authoritative at decap and is never copied from the outer. DSCP is not
+copied back at decap.
+
+> **WireGuard decap is NOT yet combined (#2317).** The WG control thread
+> reads transport records from a plain `UdpSocket::recv_from`, so the
+> kernel has already stripped the outer IP header before the datagram
+> reaches userspace — the outer ECN is gone at that layer. Recovering it
+> needs `IP_RECVTOS` / `IPV6_RECVTCLASS` + a `recvmsg` control-message
+> recv loop, then combining into the inner before the `tun.write_all`.
+> Tracked as a follow-up; do NOT read the encap-copy as "ECN is
+> reflected at WG decap".
 
 ## What S1 delivers
 

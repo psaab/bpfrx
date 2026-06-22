@@ -82,6 +82,18 @@ pub(in crate::afxdp) fn packet_trimmed_len(packet: &[u8], addr_family: u8) -> Op
     }
 }
 
+/// #2315: count of GRE-decap frames DROPPED because the outer header
+/// carried a CE mark over an inner packet that was Not-ECT — the
+/// "illegal" RFC 6040 §4.2 combination (a congested router CE-marked a
+/// packet whose endpoints never negotiated ECN). Surfaced via
+/// `coordinator/status.rs` as
+/// `xpf_userspace_gre_decap_ecn_illegal_drops_total`. A nonzero value
+/// means a misbehaving/misconfigured tunnel ingress copied ECT onto the
+/// outer for traffic the inner endpoints did not mark, then the path
+/// congested. RFC 6040 mandates a drop here (the alternative — clearing
+/// the bogus CE — would silently hide the protocol violation).
+pub(in crate::afxdp) static GRE_DECAP_ECN_ILLEGAL_DROPS: AtomicU64 = AtomicU64::new(0);
+
 /// Read the inner IP packet's DSCP+ECN byte for outer-header
 /// propagation on tunnel encap (#2303). Returns the full 8-bit
 /// TOS / Traffic-Class value (DSCP in the high 6 bits, ECN in the
@@ -91,11 +103,14 @@ pub(in crate::afxdp) fn packet_trimmed_len(packet: &[u8], addr_family: u8) -> Op
 ///   - DSCP: uniform model (RFC 2983 §3) — the inner DSCP is mirrored
 ///     onto the outer so per-hop QoS classification survives the
 ///     tunnel.
-///   - ECN: RFC 6040 normal-mode ingress — the inner ECN is copied to
-///     the outer ECN field, so a CE mark applied by a congested router
-///     on the OUTER path can be reflected back to the inner endpoints
-///     at decap (loss-free congestion signalling instead of a fallback
-///     to loss-based control).
+///   - ECN: RFC 6040 normal-mode ingress — the inner ECN is COPIED to
+///     the outer ECN field at ENCAP, so a CE mark applied by a
+///     congested router on the OUTER path can later be combined back
+///     into the inner ECN at DECAP (loss-free congestion signalling
+///     instead of a fallback to loss-based control). The complementary
+///     DECAP-side combine (outer ECN → inner ECN) is `decap_ecn_combine`
+///     below, wired into `try_native_gre_decap_from_frame` (#2315). This
+///     function is ENCAP-only — it just reads the byte to copy.
 ///
 /// Reading the WHOLE byte (rather than masking to DSCP and re-shifting,
 /// the `wg::dscp::tos_from_dscp` shape that clears ECN) is what makes
@@ -123,6 +138,192 @@ pub(in crate::afxdp) fn inner_tos_byte(packet: &[u8], addr_family: u8) -> u8 {
         }
         _ => 0,
     }
+}
+
+/// Extract the 2-bit ECN field from an IP TOS / Traffic-Class byte.
+/// ECN occupies the low 2 bits of the DiffServ octet:
+///   00 = Not-ECT, 10 = ECT(0), 01 = ECT(1), 11 = CE.
+#[inline]
+fn ecn_of_tos(tos: u8) -> u8 {
+    tos & 0x03
+}
+
+/// Read the OUTER IP header's 2-bit ECN field for the RFC 6040 §4.2
+/// decap combine. `frame` is the full received frame; `meta.l3_offset`
+/// is the outer IP header start; `meta.addr_family` is the OUTER family.
+/// Returns `None` when the outer header is truncated (caller then skips
+/// the combine — a malformed outer never mutates the inner).
+#[inline]
+fn outer_ecn_bits(frame: &[u8], meta: UserspaceDpMeta) -> Option<u8> {
+    let l3 = meta.l3_offset as usize;
+    match meta.addr_family as i32 {
+        // IPv4: TOS/DiffServ is octet 1 of the outer header.
+        libc::AF_INET => Some(ecn_of_tos(*frame.get(l3 + 1)?)),
+        // IPv6: Traffic Class spans the low nibble of octet 0 and the
+        // high nibble of octet 1; ECN is its low 2 bits — i.e. bits 2-3
+        // of octet 1. TC = (b0 << 4) | (b1 >> 4); ECN = TC & 0x03 =
+        // (b1 >> 4) & 0x03.
+        libc::AF_INET6 => Some((*frame.get(l3 + 1)? >> 4) & 0x03),
+        _ => None,
+    }
+}
+
+/// RFC 6040 §4.2 decapsulation outcome for a single (inner, outer) ECN
+/// pair.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::afxdp) enum DecapEcn {
+    /// Leave the inner ECN field unchanged.
+    Keep,
+    /// Upgrade the inner ECN to CE (congestion experienced).
+    SetCe,
+    /// Illegal combination (outer CE over a Not-ECT inner) — drop the
+    /// packet per RFC 6040 §4.2.
+    Drop,
+}
+
+/// RFC 6040 §4.2 ECN combine. Given the ARRIVING inner ECN and the
+/// ARRIVING outer ECN, decide how the inner ECN must change at decap.
+///
+/// Table (rows = inner, columns = outer):
+///
+/// | inner \ outer | Not-ECT(00) | ECT0(10) | ECT1(01) | CE(11) |
+/// |---------------|-------------|----------|----------|--------|
+/// | Not-ECT(00)   | Keep        | Keep     | Keep     | Drop   |
+/// | ECT(0)(10)    | Keep        | Keep     | Keep*    | SetCe  |
+/// | ECT(1)(01)    | Keep        | Keep     | Keep     | SetCe  |
+/// | CE(11)        | Keep        | Keep     | Keep     | Keep   |
+///
+/// The only state change is: outer CE upgrades any ECN-capable, non-CE
+/// inner to CE (the loss-free congestion signal this whole feature
+/// exists for). The illegal outer=CE / inner=Not-ECT cell is a Drop.
+/// Every other cell keeps the inner verbatim (so a Not-ECT or already-CE
+/// inner is never touched, and the inner DSCP — which is authoritative
+/// at decap — is never copied from the outer).
+///
+/// (* the §4.2 "MAY" cell — outer=ECT(1) over inner=ECT(0) — leaves the
+/// receiver free to either keep the inner ECT(0) or upgrade it to
+/// ECT(1); neither carries a congestion mark. We take the simpler
+/// conformant choice and Keep the inner ECT(0). Linux's
+/// `__INET_ECN_decapsulate` upgrades to ECT(1) instead; both are RFC
+/// 6040 conformant.)
+///
+/// `inner_ecn` and `outer_ecn` are the 2-bit ECN values (low 2 bits).
+#[inline]
+pub(in crate::afxdp) fn decap_ecn_combine(inner_ecn: u8, outer_ecn: u8) -> DecapEcn {
+    const NOT_ECT: u8 = 0b00;
+    const ECT_1: u8 = 0b01;
+    const ECT_0: u8 = 0b10;
+    const CE: u8 = 0b11;
+    match (inner_ecn & 0x03, outer_ecn & 0x03) {
+        // Not-ECT inner: never carries a congestion mark. Outer CE is
+        // the illegal combination — drop. Any other outer is ignored
+        // (a Not-ECT endpoint cannot consume an ECN signal).
+        (NOT_ECT, CE) => DecapEcn::Drop,
+        (NOT_ECT, _) => DecapEcn::Keep,
+        // CE inner already carries the strongest signal — nothing to do.
+        (CE, _) => DecapEcn::Keep,
+        // ECN-capable, non-CE inner: outer CE upgrades it to CE.
+        (_, CE) => DecapEcn::SetCe,
+        // §4.2 MAY: outer=ECT(1) over inner=ECT(0). RFC 6040 leaves this
+        // cell a MAY — the receiver may keep the inner ECT(0) or upgrade
+        // it to ECT(1); neither is a congestion mark. We take the simpler
+        // conformant choice and Keep the inner ECT(0). (Linux's
+        // `__INET_ECN_decapsulate` upgrades to ECT(1); both are
+        // conformant. A codepoint upgrade would need a distinct SetEct1
+        // outcome variant, which carries no congestion semantics and is
+        // not worth the type complexity.)
+        (ECT_0, ECT_1) => DecapEcn::Keep,
+        // All remaining non-CE outer values leave an ECN-capable inner
+        // unchanged.
+        _ => DecapEcn::Keep,
+    }
+}
+
+/// Apply the RFC 6040 §4.2 decap ECN combine IN PLACE to the inner IP
+/// packet. `inner_packet` is the inner IP datagram (L2 already
+/// stripped); `inner_family` is the inner family; `outer_ecn` is the
+/// 2-bit outer ECN read from the (now-stripped) outer header.
+///
+/// Returns `true` to FORWARD (possibly after setting the inner CE bit)
+/// and `false` to DROP (the illegal outer-CE / inner-Not-ECT combo, per
+/// §4.2; the drop counter is bumped here).
+///
+/// When the inner ECN is upgraded to CE on an IPv4 inner, the IPv4
+/// header checksum is recomputed (the TOS byte is covered by the IPv4
+/// header checksum but NOT by the L4 checksum). IPv6 inners have no IP
+/// header checksum, and the IPv6 Traffic Class is not covered by the L4
+/// pseudo-header, so no checksum work is needed.
+#[inline]
+pub(in crate::afxdp) fn apply_decap_ecn_combine(
+    inner_packet: &mut [u8],
+    inner_family: u8,
+    outer_ecn: u8,
+) -> bool {
+    match inner_family as i32 {
+        libc::AF_INET => {
+            // IPv4 TOS is octet 1; ECN is its low 2 bits.
+            let Some(&tos) = inner_packet.get(1) else {
+                // Too short to hold the byte — forward unchanged
+                // (consistent with the encap-side short-packet fallback).
+                return true;
+            };
+            match decap_ecn_combine(ecn_of_tos(tos), outer_ecn) {
+                DecapEcn::Keep => true,
+                DecapEcn::Drop => {
+                    GRE_DECAP_ECN_ILLEGAL_DROPS.fetch_add(1, Ordering::Relaxed);
+                    false
+                }
+                DecapEcn::SetCe => {
+                    // Set ECN = CE (low 2 bits) without disturbing DSCP.
+                    inner_packet[1] = (tos & 0xFC) | 0x03;
+                    recompute_ipv4_header_checksum(inner_packet);
+                    true
+                }
+            }
+        }
+        libc::AF_INET6 => {
+            // IPv6 ECN is bits 2-3 of octet 1 (low 2 bits of the
+            // Traffic Class). Need octets 0 and 1 to read/write it.
+            let Some(&b1) = inner_packet.get(1) else {
+                return true;
+            };
+            let inner_ecn = (b1 >> 4) & 0x03;
+            match decap_ecn_combine(inner_ecn, outer_ecn) {
+                DecapEcn::Keep => true,
+                DecapEcn::Drop => {
+                    GRE_DECAP_ECN_ILLEGAL_DROPS.fetch_add(1, Ordering::Relaxed);
+                    false
+                }
+                DecapEcn::SetCe => {
+                    // CE = 0b11 in the ECN slot = bits 2-3 of octet 1.
+                    // Clear the existing ECN nibble-bits then set CE.
+                    inner_packet[1] = (b1 & 0xCF) | (0x03 << 4);
+                    // IPv6: no header checksum; TC not in the L4
+                    // pseudo-header — nothing else to recompute.
+                    true
+                }
+            }
+        }
+        _ => true,
+    }
+}
+
+/// Recompute the IPv4 header checksum in place. `packet` starts at the
+/// IPv4 header. The header length is taken from IHL (octet 0 low nibble,
+/// in 32-bit words). A short or malformed header leaves the packet
+/// unchanged. Used after the decap ECN combine mutates the TOS byte.
+#[inline]
+fn recompute_ipv4_header_checksum(packet: &mut [u8]) {
+    let Some(&b0) = packet.first() else { return };
+    let ihl = usize::from(b0 & 0x0f) * 4;
+    if ihl < 20 || packet.len() < ihl {
+        return;
+    }
+    // Zero the checksum field (octets 10-11) before recomputing.
+    packet[10] = 0;
+    packet[11] = 0;
+    let cs = checksum16(&packet[..ihl]);
+    packet[10..12].copy_from_slice(&cs.to_be_bytes());
 }
 
 fn gre_inner_family_and_proto(proto: u16) -> Option<(u8, u16)> {
@@ -290,6 +491,23 @@ pub(super) fn try_native_gre_decap_from_frame(
     let mut synthetic = vec![0u8; 14 + inner_packet.len()];
     synthetic[12..14].copy_from_slice(&inner_eth_proto.to_be_bytes());
     synthetic[14..].copy_from_slice(inner_packet);
+
+    // #2315: RFC 6040 §4.2 decap-side ECN combine. The outer ECN (read
+    // from the still-present outer IP header in `frame` at
+    // `meta.l3_offset`) is combined into the inner ECN: an outer CE
+    // upgrades an ECN-capable inner to CE so a congestion mark applied
+    // on the OUTER path is reflected to the inner endpoints; the illegal
+    // outer-CE / inner-Not-ECT combination is dropped. Mutates the
+    // synthetic inner in place (octet `14 + 1` for the inner TOS) and
+    // recomputes the inner IPv4 header checksum when CE is set. Skipped
+    // when the outer header is truncated (`outer_ecn_bits` → None).
+    if let Some(outer_ecn) = outer_ecn_bits(frame, meta)
+        && !apply_decap_ecn_combine(&mut synthetic[14..], inner_family, outer_ecn)
+    {
+        // Illegal RFC 6040 §4.2 combination — drop (counter bumped in
+        // apply_decap_ecn_combine).
+        return None;
+    }
 
     let flow = parse_session_flow_from_frame(
         &synthetic,
