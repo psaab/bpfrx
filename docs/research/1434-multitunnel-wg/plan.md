@@ -461,14 +461,17 @@ The timers.rs comment already names #1434 as the owner of this generalization.
   catch-all peer); optionally WARN. Document the longest-prefix-match decap
   routing semantics.
 
-### 5.6 Open design decisions to lock in round 1
-- (a) Schema identity-as-arg (`peer <pubkey> {}`) vs pubkey-as-child. Recommend
-  identity-as-arg.
-- (b) Outer-family derivation with mixed-endpoint peers (§5.4). Recommend:
-  tunnel shares one family; commit-reject mixed; derive from first endpoint or
-  add an explicit `family` hint.
-- (c) Zero-peer reject vs allow.
-- (d) PSK in B1 or split to B2 (§6.3 gates this).
+### 5.6 Design decisions — LOCKED by the review rounds
+- (a) **Schema = identity-as-arg** (`peer <pubkey> { allowed-ips … }`), modeled
+  on `vrrp-group` (`namedInstances` dual-AST). LOCKED.
+- (b) **Outer-family: one family per WG interface; mixed peer-endpoint family =
+  commit REJECT** (one UDP socket = one outer family). Family derived from the
+  peer(s) that declare an endpoint; they must agree. LOCKED (§5.5).
+- (c) **Zero-peer = commit REJECT** (xpf has no dynamic peer learning; a
+  peerless WG tunnel can never handshake). LOCKED (§5.5, SMR MINOR-3).
+- (d) **PSK (B2): may ride the B1 PR** — §6.3 RESOLVED via snow `set_psk`, no
+  ordering blocker; split to a follow-on ONLY if the secret-hygiene review (R3)
+  proves heavy. LOCKED disposition (§10).
 
 ### 5.7 Migration sweep (callers of the removed scalar fields)
 Confirmed readers to migrate, scoped to the main checkout at HEAD cf9ccd3ac
