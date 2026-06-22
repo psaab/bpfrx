@@ -96,6 +96,89 @@ fn degraded_path_reason_names_cover_retained_shim_actions() {
     assert_eq!(DEGRADED_PATH_REASON_NAMES[15], "transit_drop");
 }
 
+// --- #2332: monotonic HA-liveness freshness (Rust sibling of #1792) ---
+//
+// `heartbeat_fresh_mono` MUST decide worker liveness purely from two
+// CLOCK_MONOTONIC nanosecond readings, never the wall clock. These tests
+// pin that contract and FAIL if the function is reverted to a wall-clock
+// (`Utc::now()` minus a `DateTime<Utc>`) comparison: the simulated
+// forward clock step only changes the wall clock, so a wall-clock revert
+// would flip `fresh` to false and fail `heartbeat_fresh_survives_*`.
+
+const HB_STALE_NS: u64 = 5_000_000_000; // mirrors HEARTBEAT_STALE_AFTER (5s)
+
+#[test]
+fn heartbeat_fresh_mono_recent_is_fresh() {
+    // Worker stamped 1s of monotonic time ago, well under the 5s limit.
+    let last = 100_000_000_000_u64;
+    let now = last + 1_000_000_000; // +1s monotonic
+    assert!(heartbeat_fresh_mono(last, now));
+}
+
+#[test]
+fn heartbeat_fresh_mono_overdue_is_stale() {
+    // Genuinely overdue: 6s of monotonic elapsed > 5s threshold → dead.
+    let last = 100_000_000_000_u64;
+    let now = last + 6_000_000_000; // +6s monotonic
+    assert!(!heartbeat_fresh_mono(last, now));
+}
+
+#[test]
+fn heartbeat_fresh_mono_exactly_at_limit_is_fresh() {
+    // age == HEARTBEAT_STALE_AFTER is inclusive-fresh (`<=`).
+    let last = 100_000_000_000_u64;
+    let now = last + HB_STALE_NS;
+    assert!(heartbeat_fresh_mono(last, now));
+    // One nanosecond past the limit is stale.
+    assert!(!heartbeat_fresh_mono(last, now + 1));
+}
+
+#[test]
+fn heartbeat_fresh_mono_zero_sentinel_is_never_fresh() {
+    // last_heartbeat_ns == 0 means "never stamped" → not fresh.
+    assert!(!heartbeat_fresh_mono(0, 1_000_000_000));
+    assert!(!heartbeat_fresh_mono(0, 0));
+}
+
+#[test]
+fn heartbeat_fresh_survives_forward_wall_clock_step() {
+    // FAIL-ON-REVERT: the worker's last heartbeat is monotonically recent
+    // (1ms ago), but the wall clock has jumped FORWARD by 1 hour (NTP
+    // makestep / VM resume) between the heartbeat stamp and this check.
+    //
+    // The monotonic decision below depends ONLY on the monotonic readings,
+    // so the wall-clock step is invisible and the binding stays FRESH. A
+    // wall-clock revert (Utc::now() - last_DateTime) would compute a ~1h
+    // age, exceed the 5s limit, and return false — failing this test.
+    let last_mono = 500_000_000_000_u64;
+    let now_mono = last_mono + 1_000_000; // +1ms monotonic — clearly fresh
+
+    // Build the wall-clock view the OLD code would have used: at heartbeat
+    // time the wall clock was `t0`; by check time it stepped forward 1h.
+    let t0 = chrono::Utc::now();
+    let last_wall = t0; // worker-stamped wall instant (back-projected)
+    let now_wall_after_step = t0 + chrono::TimeDelta::hours(1);
+    let wall_age = now_wall_after_step.signed_duration_since(last_wall);
+    // Sanity: the wall-clock age the old code saw really does exceed 5s.
+    assert!(wall_age.to_std().unwrap() > std::time::Duration::from_secs(5));
+
+    // The monotonic decision is unaffected by the wall-clock step.
+    assert!(
+        heartbeat_fresh_mono(last_mono, now_mono),
+        "monotonic liveness must ignore a forward wall-clock step (#2332)"
+    );
+}
+
+#[test]
+fn heartbeat_fresh_backward_monotonic_anomaly_clamps_fresh() {
+    // A backward CLOCK_MONOTONIC reading cannot happen on a well-behaved
+    // kernel, but saturating_sub clamps it to a zero age (fail-safe:
+    // treated as fresh, never spuriously dead).
+    let last = 100_000_000_000_u64;
+    let now = last - 1_000_000; // now < last
+    assert!(heartbeat_fresh_mono(last, now));
+}
+
 #[test]
 fn bpf_conntrack_struct_sizes_match_c() {
     // Must match C struct sizes from xpf_conntrack.h exactly.

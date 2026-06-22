@@ -1387,6 +1387,13 @@ pub(crate) struct BindingLiveSnapshot {
     pub(crate) dbg_cos_queue_overflow: u64,
     pub(crate) rx_fill_ring_empty_descs: u64,
     pub(crate) last_heartbeat: Option<chrono::DateTime<Utc>>,
+    /// Monotonic-clock freshness verdict for `last_heartbeat`, computed at
+    /// snapshot time in the CLOCK_MONOTONIC domain (see
+    /// `bpf_map::heartbeat_fresh_mono`). The wall-clock `last_heartbeat`
+    /// above is for operator display only; this bool is the load-bearing
+    /// HA-liveness decision and is immune to clock steps (#2332, the Rust
+    /// sibling of #1792).
+    pub(crate) heartbeat_fresh: bool,
     pub(crate) last_error: String,
     // #709: owner-profile telemetry snapshot. Fixed-size arrays (no
     // `Vec`) to keep the snapshot allocation-free on the hot path;
