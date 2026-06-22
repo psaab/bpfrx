@@ -10442,3 +10442,24 @@ top.
 - **File(s)**: userspace-dp/src/afxdp/frame/tcp_segmentation.rs,
   userspace-dp/src/afxdp/frame/README.md,
   docs/wireguard-interop.md
+
+## 2026-06-22 — #2332 HA-liveness monotonic heartbeat (Rust sibling of #1792)
+
+- **Timestamp**: 2026-06-22
+- **Action**: Convert userspace-dp worker-liveness freshness from wall-clock
+  (`Utc::now()`) to CLOCK_MONOTONIC. Replaced `heartbeat_fresh(Option<DateTime<Utc>>)`
+  with `heartbeat_fresh_mono(last_heartbeat_ns, now_mono_ns)` (both CLOCK_MONOTONIC
+  ns from the SAME process). Freshness verdict now computed at snapshot time and
+  carried on `BindingLiveSnapshot.heartbeat_fresh`; `refresh_bindings` gates
+  `binding.ready` on it. `last_heartbeat: DateTime<Utc>` retained for operator
+  display only. Clock model: PROCESS-LOCAL receiver-stamped monotonic (worker
+  stamps its own slot, coordinator reads in-process) — no cross-process boundary,
+  so no serialized-clock-domain reshape needed.
+- **File(s)**: userspace-dp/src/afxdp/bpf_map/ha.rs,
+  userspace-dp/src/afxdp/umem/snapshot.rs,
+  userspace-dp/src/afxdp/worker/mod.rs,
+  userspace-dp/src/afxdp/coordinator/refresh_bindings.rs,
+  userspace-dp/src/afxdp/bpf_map_tests.rs, userspace-dp/src/afxdp/README.md
+- **Validation**: cargo build --release clean; 6 new fail-on-revert tests green
+  (5x stable); revert-simulation (wall-clock body) confirmed to FAIL the
+  forward-step + recent tests; full ha/heartbeat/coordinator suite (449) green.
