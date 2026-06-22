@@ -1,5 +1,56 @@
 # Action Log
 
+## 2026-06-22 — #2321 round 2: bound L4 port read by IP-declared length
+
+- **Timestamp**: 2026-06-22 PDT
+- **Action**: Fold Copilot's follow-up on PR #2322. The round-1 fix made
+  `generated_l4_ports` return `None` when the 4 port bytes were absent, but it
+  bounded the read by the BACKING SLICE length only, not by the IP-declared
+  length (`pkt_len` = IPv4 total_len / IPv6 40+payload_len, each clamped to the
+  slice). A corrupted/short total_len/payload_len that ends BEFORE the L4
+  header while the buffer still has trailing bytes would read those slack bytes
+  and return bogus ports instead of failing closed — exactly what the doc
+  comment claimed it prevented. Now `generated_l4_ports` takes `pkt_len` and
+  returns `None` for TCP/UDP when `rel_l4 + 4 > pkt_len` (read bounded by
+  `min(pkt_len, slice_len)` = `pkt_len`, since `pkt_len <= packet.len()` by
+  construction). Both call sites pass the already-computed `pkt_len`.
+  ICMP/ICMPv6 unchanged (no ports).
+- **File(s)**: userspace-dp/src/afxdp/frame/generated.rs,
+  userspace-dp/src/afxdp/frame/generated_tests.rs, _Log.md
+- **Tests**: added `v4_tcp_declared_len_short_of_ports_fails_closed_none`,
+  `v4_udp_declared_len_short_of_ports_fails_closed_none`,
+  `v6_tcp_declared_len_short_of_ports_fails_closed_none`,
+  `v6_udp_declared_len_short_of_ports_fails_closed_none` — each corrupts
+  total_len/payload_len to end before the L4 header while keeping the full
+  backing buffer (asserts the buffer retains the trailing port bytes), so they
+  FAIL if the bound is reverted to slice-only (verified: 0/4 with the bound
+  neutered). `cargo build --release` clean; `generated` (17 tests) +
+  `cos_classify` green, 5x flake-free.
+
+## 2026-06-22 — #2321 generated-reply parser fail-closed (§6.2)
+
+- **Timestamp**: 2026-06-22 PDT
+- **Action**: Make `parse_generated_v4`/`parse_generated_v6` fail CLOSED
+  when a locally-generated TCP/UDP reply is truncated before its 4 L4 port
+  bytes. `generated_l4_ports` now returns `Option<(u16,u16)>` — `None` for a
+  TCP/UDP frame whose ports cannot be read at the computed L4 offset, rather
+  than the old `(0,0)` substitution that misclassified the reply past an
+  output-filter `discard`. Both parsers propagate the `None` with `?`, so the
+  caller (`classify_generated_reply` in `tx/cos_classify.rs`) drops the reply
+  and bumps `generated_reply_classify_parse_errors`. ICMP/ICMPv6 (no transport
+  ports) still return `(0,0)` unchanged; well-formed TCP/UDP replies are
+  unaffected. Defense-in-depth — generated replies are well-formed by
+  construction. Copilot flagged this on PR #2319.
+- **File(s)**: userspace-dp/src/afxdp/frame/generated.rs,
+  userspace-dp/src/afxdp/frame/generated_tests.rs, _Log.md
+- **Tests**: added `truncated_v4_tcp_ports_fails_closed_none`,
+  `truncated_v4_udp_ports_fails_closed_none`,
+  `truncated_v6_tcp_ports_fails_closed_none`,
+  `truncated_v6_udp_ports_fails_closed_none` (fail-on-revert — they pass with
+  `(0,0)` substitution if the guard is removed) and `parses_v4_udp_reply_ports`
+  (well-formed regression guard). `cargo build --release` clean;
+  `cargo test --release -- generated parse_generated cos_classify` green.
+
 ## 2026-06-22 — #2314 review fold: dest predicate fails closed on unknown family
 
 - **Timestamp**: 2026-06-22 PDT

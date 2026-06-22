@@ -151,6 +151,136 @@ fn truncated_v4_header_fails_closed_none() {
 }
 
 #[test]
+fn truncated_v4_tcp_ports_fails_closed_none() {
+    // #2321 §6.2: a TCP generated reply whose frame is chopped before the 4
+    // L4 port bytes MUST drop (None), not misclassify with (0,0) ports.
+    // L2(14) + IP(20) puts the TCP ports at offset 34..38; keep the full IP
+    // header (so the IHL/length checks pass) but lose 2 of the 4 port bytes.
+    let mut frame = v4_frame(PROTO_TCP, 0x00, 5201, 49152, &[]);
+    frame.truncate(14 + 20 + 2);
+    assert!(
+        generated_reply_session_key(&frame).is_none(),
+        "truncated v4 TCP reply must fail closed (no (0,0)-port misclassify)"
+    );
+}
+
+#[test]
+fn truncated_v4_udp_ports_fails_closed_none() {
+    // #2321 §6.2: same for UDP — missing port bytes must drop, not default.
+    let mut frame = v4_frame(PROTO_UDP, 0x00, 5201, 49152, &[]);
+    frame.truncate(14 + 20 + 2);
+    assert!(
+        generated_reply_session_key(&frame).is_none(),
+        "truncated v4 UDP reply must fail closed (no (0,0)-port misclassify)"
+    );
+}
+
+#[test]
+fn truncated_v6_tcp_ports_fails_closed_none() {
+    // #2321 §6.2: L2(14) + IPv6(40) puts TCP ports at offset 54..58; keep the
+    // full IPv6 header but lose 2 of the 4 port bytes — must fail closed.
+    let mut frame = v6_frame(PROTO_TCP, 0x00, 443, 33333);
+    frame.truncate(14 + 40 + 2);
+    assert!(
+        generated_reply_session_key(&frame).is_none(),
+        "truncated v6 TCP reply must fail closed (no (0,0)-port misclassify)"
+    );
+}
+
+#[test]
+fn truncated_v6_udp_ports_fails_closed_none() {
+    // #2321 §6.2: same for UDP over IPv6.
+    let mut frame = v6_frame(PROTO_UDP, 0x00, 443, 33333);
+    frame.truncate(14 + 40 + 2);
+    assert!(
+        generated_reply_session_key(&frame).is_none(),
+        "truncated v6 UDP reply must fail closed (no (0,0)-port misclassify)"
+    );
+}
+
+#[test]
+fn v4_tcp_declared_len_short_of_ports_fails_closed_none() {
+    // #2321 (Copilot follow-up): the IPv4 total_len is corrupted to end at
+    // the IP header (20) — BEFORE the TCP ports at ihl(20)..24 — while the
+    // backing buffer KEEPS the full TCP header (trailing slack present).
+    // Bounding the port read by the slice alone would read those trailing
+    // bytes and return bogus ports; the pkt_len bound must drop instead.
+    let mut frame = v4_frame(PROTO_TCP, 0x00, 5201, 49152, &[]);
+    let l3 = 14;
+    // total_len = 20 (IP header only, no L4 declared). Buffer still holds the
+    // 20-byte TCP header after it.
+    frame[l3 + 2..l3 + 4].copy_from_slice(&20u16.to_be_bytes());
+    assert!(
+        frame.len() > l3 + 24,
+        "buffer must retain trailing port bytes for this to be a real regression"
+    );
+    assert!(
+        generated_reply_session_key(&frame).is_none(),
+        "v4 TCP with total_len short of the ports must fail closed, not read slack bytes"
+    );
+}
+
+#[test]
+fn v4_udp_declared_len_short_of_ports_fails_closed_none() {
+    // #2321: same, UDP. total_len ends before the UDP ports while the
+    // backing buffer retains them.
+    let mut frame = v4_frame(PROTO_UDP, 0x00, 5201, 49152, &[]);
+    let l3 = 14;
+    frame[l3 + 2..l3 + 4].copy_from_slice(&20u16.to_be_bytes());
+    assert!(frame.len() > l3 + 24);
+    assert!(
+        generated_reply_session_key(&frame).is_none(),
+        "v4 UDP with total_len short of the ports must fail closed"
+    );
+}
+
+#[test]
+fn v6_tcp_declared_len_short_of_ports_fails_closed_none() {
+    // #2321: the IPv6 payload_len is corrupted to 0 — so the declared packet
+    // ends at the fixed IPv6 header (40), BEFORE the TCP ports at 40..44 —
+    // while the backing buffer KEEPS the full TCP header. The pkt_len bound
+    // must drop instead of reading the trailing slack bytes.
+    let mut frame = v6_frame(PROTO_TCP, 0x00, 443, 33333);
+    let l3 = 14;
+    // payload_len bytes are at IPv6 header offset 4..6.
+    frame[l3 + 4..l3 + 6].copy_from_slice(&0u16.to_be_bytes());
+    assert!(
+        frame.len() > l3 + 44,
+        "buffer must retain trailing port bytes for this to be a real regression"
+    );
+    assert!(
+        generated_reply_session_key(&frame).is_none(),
+        "v6 TCP with payload_len short of the ports must fail closed, not read slack bytes"
+    );
+}
+
+#[test]
+fn v6_udp_declared_len_short_of_ports_fails_closed_none() {
+    // #2321: same, UDP over IPv6.
+    let mut frame = v6_frame(PROTO_UDP, 0x00, 443, 33333);
+    let l3 = 14;
+    frame[l3 + 4..l3 + 6].copy_from_slice(&0u16.to_be_bytes());
+    assert!(frame.len() > l3 + 44);
+    assert!(
+        generated_reply_session_key(&frame).is_none(),
+        "v6 UDP with payload_len short of the ports must fail closed"
+    );
+}
+
+#[test]
+fn parses_v4_udp_reply_ports() {
+    // #2321: a WELL-FORMED UDP reply still parses with its real ports — the
+    // fail-closed guard must not regress correct frames.
+    let frame = v4_frame(PROTO_UDP, 0x00, 53, 40000, &[]);
+    let (key, meta) = generated_reply_session_key(&frame).expect("v4 udp parse");
+    assert_eq!(key.protocol, PROTO_UDP);
+    assert_eq!(key.src_port, 53);
+    assert_eq!(key.dst_port, 40000);
+    assert_eq!(meta.flow_src_port, 53);
+    assert_eq!(meta.flow_dst_port, 40000);
+}
+
+#[test]
 fn unknown_l3_version_fails_closed_none() {
     let mut frame = v4_frame(PROTO_TCP, 0x00, 5201, 49152, &[]);
     // Corrupt the IP version nibble to 5 (unknown).
