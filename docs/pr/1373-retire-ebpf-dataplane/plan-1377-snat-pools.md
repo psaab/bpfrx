@@ -128,6 +128,12 @@ The retained backends do not share an address-persistent selector today:
   selection, while using DPDK-local port counters; and
 - current AF_XDP userspace uses the userspace-v1 SHA-256 selector above.
 
+> Historical note (2026-06-22, #2349): the AF_XDP userspace selector was later
+> changed from SHA-256 to a seeded non-cryptographic FxHash (userspace-v2). This
+> plan records the original #1377 design and is intentionally NOT rewritten; for
+> the current selector contract see `docs/userspace-dataplane-gaps.md` (Source
+> NAT pool mode).
+
 The #1377 follow-up therefore treats userspace-v1 as the AF_XDP contract and
 does not promise new-flow pool-address parity across eBPF, DPDK, and userspace
 rollback. Mixed-backend tests must separate:

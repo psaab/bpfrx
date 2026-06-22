@@ -10736,3 +10736,23 @@ top.
     golden-vector fixtures (v1→v2) and added a determinism+stability test.
   - **File(s)**: userspace-dp/src/nat/allocator.rs, userspace-dp/src/nat/tests.rs,
     docs/userspace-dataplane-gaps.md, _Log.md
+
+- **Timestamp**: 2026-06-22T00:30Z
+  - **Action**: #2349 — Copilot doc folds on PR #2356. (1) Reworded the
+    stability-test comment: the test proves the SELECTOR
+    (`sticky_pool_index`) is a pure deterministic function with no
+    shared/mutable hasher state — distinct from the separate lease cache
+    (`persistent_by_source`), which DOES memoize the chosen address. Dropped
+    the misleading "address-persistence is computed live, not cached" phrasing.
+    (2) Doc-drift reconcile: updated LIVING docs that named SHA-256 as the
+    CURRENT SNAT address-persistent selector → userspace-v2 seeded FxHash with
+    a pointer to docs/userspace-dataplane-gaps.md as the SSOT
+    (userspace-dataplane-architecture.md L352; feature-coverage.md L14,L141).
+    Left feature-coverage.md L167 (#1385 "added v1" is accurate history). Left
+    the HISTORICAL plan docs/pr/1373.../plan-1377-snat-pools.md original text
+    intact and added a dated one-line note pointing to the v2 change/gaps doc.
+    Did NOT touch unrelated SHA-256 hits (image SHA256SUMS, IPsec ESP auth,
+    SNMPv3, the server/helpers.rs snapshot binding-plan key which legitimately
+    still uses SHA-256).
+  - **File(s)**: userspace-dp/src/nat/tests.rs, docs/userspace-dataplane-architecture.md,
+    docs/feature-coverage.md, docs/pr/1373-retire-ebpf-dataplane/plan-1377-snat-pools.md, _Log.md

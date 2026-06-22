@@ -2807,8 +2807,11 @@ fn pool_snat_address_persistent_sticky_index_is_deterministic_and_stable() {
             }
 
             // Interleaving other sources does not perturb this one's slot —
-            // proves there is no shared/accumulating allocator state behind the
-            // hash (address-persistence is computed live, not cached).
+            // proves the SELECTOR (sticky_pool_index) is a pure deterministic
+            // function with no shared/mutable hasher state, so the same source
+            // always hashes to the same slot. This is distinct from the
+            // separate lease cache (persistent_by_source), which memoizes the
+            // chosen address; the hash itself caches nothing.
             for other in sources {
                 let _ = sticky_pool_index(other.parse().unwrap(), pool_len);
             }
