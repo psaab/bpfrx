@@ -1,5 +1,29 @@
 # Action Log
 
+## 2026-06-21 — #2312 io_uring_write follow-ups (test-quality + docs)
+
+- **Timestamp**: 2026-06-21 23:00 PDT
+- **Action**: #2312 — strengthened `stale_cqe_is_not_misattributed` so it
+  genuinely fails on revert of the #2297 user_data CQE-match. Switched it
+  to a two-chunk 8-byte write (real results 4+4) and added two stale-CQE
+  sources: a pre-seeded one (exercises `drain_stale`) and one injected
+  ahead of the real CQE during the wait (`with_stale_on_wait` — exercises
+  the reap-loop user_data match). FakeRing now records `accepted_bytes`
+  (sum of res for matched completions) so the test asserts the exact
+  applied total (8), not just the unit `WriteOutcome::Done`. Fail-on-revert
+  verified: reverting `reap_matching` to reap the head CQE unconditionally
+  makes the test fail (push_calls left:1 right:2); restored after proof.
+  Also reconciled docs: dropped the unused `keep` param from `drain_stale`
+  and rewrote its docstring to describe the unconditional full drain (and
+  why it is safe), and softened the module + `write_all` "never returns
+  while an SQE is in flight" claims to acknowledge the `MAX_WAIT_RETRIES`
+  ceiling. No behaviour change to the write loop; the #2297 EINTR-retry /
+  user_data match / buffer-lifetime guarantees are intact.
+- **Validation**: cargo build --release clean; io_uring_write (8),
+  state_writer (4), slowpath (2) green; strengthened test 5x green;
+  go build ./... clean.
+- **File(s)**: userspace-dp/src/io_uring_write.rs, _Log.md
+
 ## 2026-06-21 — #2237/#2242 ICMP error-generation RFC suppression + v6 quote length
 
 - **Timestamp**: 2026-06-21
