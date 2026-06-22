@@ -1067,6 +1067,31 @@ struct WgRecv {
     outer_ecn: Option<u8>,
 }
 
+/// #2334: 256-byte recvmsg control buffer, over-aligned to 8 bytes so the
+/// `cmsghdr` header-field reads the `CMSG_*` macros perform through a
+/// `*const cmsghdr` pointing into this storage are naturally aligned.
+///
+/// A bare `[u8; N]` has alignment 1; `cmsghdr` (containing a `size_t`
+/// `cmsg_len` plus two `c_int`s on LP64) has alignment 8. `CMSG_FIRSTHDR`
+/// returns the buffer base and `parse_outer_ecn_from_cmsg` then reads the
+/// multi-byte `cmsg_len` / `cmsg_level` / `cmsg_type` fields through that
+/// pointer — an unaligned dereference (UB in Rust, a SIGBUS / alignment-
+/// trap risk on strict-alignment targets such as ARMv8) unless the base
+/// is `cmsghdr`-aligned. `align(8)` covers `align_of::<cmsghdr>()`; the
+/// static assertion below fails to compile if that ever regresses.
+#[repr(C, align(8))]
+struct CmsgBuf([u8; 256]);
+
+// Fail-on-revert sentinel: the control buffer MUST be at least as aligned
+// as `cmsghdr`, or the header-field reads in `parse_outer_ecn_from_cmsg`
+// become unaligned dereferences (#2334). A future change that drops the
+// `#[repr(align(8))]` (or replaces the wrapper with a bare `[u8; N]`)
+// breaks compilation here rather than reintroducing latent UB.
+const _: () = assert!(
+    std::mem::align_of::<CmsgBuf>() >= std::mem::align_of::<libc::cmsghdr>(),
+    "CmsgBuf must be at least cmsghdr-aligned (see #2334)"
+);
+
 /// #2317: receive one WG datagram via `recvmsg`, capturing the outer IP
 /// TOS / Traffic Class from the ancillary `IP_RECVTOS` /
 /// `IPV6_RECVTCLASS` control message. Replaces `recv_from` so the outer
@@ -1075,13 +1100,15 @@ struct WgRecv {
 ///
 /// The cmsg buffer is a fixed 256-byte stack array (a single TOS cmsg is
 /// ~16-20 bytes; 256 covers both the v4 and v6 TOS cmsgs with margin and
-/// never allocates on the hot path). `MSG_TRUNC`/`MSG_CTRUNC` are not
-/// requested — the data buffer is the loop's 64 KiB scratch (max IP
-/// datagram) so transport records never truncate, and a truncated cmsg
-/// only loses the (best-effort) ECN, not the datagram.
+/// never allocates on the hot path). It is wrapped in the 8-byte-aligned
+/// `CmsgBuf` so the `cmsghdr` header-field reads are aligned (#2334).
+/// `MSG_TRUNC`/`MSG_CTRUNC` are not requested — the data buffer is the
+/// loop's 64 KiB scratch (max IP datagram) so transport records never
+/// truncate, and a truncated cmsg only loses the (best-effort) ECN, not
+/// the datagram.
 fn wg_recvmsg(socket: &UdpSocket, buf: &mut [u8]) -> io::Result<WgRecv> {
     let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
-    let mut cmsg_space = [0u8; 256];
+    let mut cmsg_space = CmsgBuf([0u8; 256]);
     let mut iov = libc::iovec {
         iov_base: buf.as_mut_ptr() as *mut libc::c_void,
         iov_len: buf.len(),
@@ -1091,8 +1118,8 @@ fn wg_recvmsg(socket: &UdpSocket, buf: &mut [u8]) -> io::Result<WgRecv> {
     msg.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
     msg.msg_iov = &mut iov;
     msg.msg_iovlen = 1;
-    msg.msg_control = cmsg_space.as_mut_ptr() as *mut libc::c_void;
-    msg.msg_controllen = cmsg_space.len() as _;
+    msg.msg_control = cmsg_space.0.as_mut_ptr() as *mut libc::c_void;
+    msg.msg_controllen = cmsg_space.0.len() as _;
 
     let n = unsafe { libc::recvmsg(socket.as_raw_fd(), &mut msg, 0) };
     if n < 0 {
@@ -1130,9 +1157,13 @@ fn wg_recvmsg(socket: &UdpSocket, buf: &mut [u8]) -> io::Result<WgRecv> {
 /// truncated cmsg).
 fn parse_outer_ecn_from_cmsg(msg: &libc::msghdr) -> Option<u8> {
     // SAFETY: `msg` is a fully-initialized msghdr returned by recvmsg
-    // (msg_control / msg_controllen describe a valid buffer). CMSG_*
-    // macros walk it; we only read aligned payload bytes within
-    // `cmsg_len`.
+    // (msg_control / msg_controllen describe a valid buffer). The control
+    // buffer is the 8-byte-aligned `CmsgBuf` (#2334), so the `cmsghdr`
+    // base CMSG_FIRSTHDR/CMSG_NXTHDR return — and therefore the multi-byte
+    // `cmsg_len` / `cmsg_level` / `cmsg_type` header-field reads below —
+    // are naturally aligned (cmsghdr has alignment 8 on LP64). The single
+    // payload byte at CMSG_DATA is read only after the `cmsg_len` guard
+    // confirms it lies within the cmsg.
     unsafe {
         let mut cmsg = libc::CMSG_FIRSTHDR(msg);
         while !cmsg.is_null() {
@@ -1777,10 +1808,15 @@ mod tests {
     fn parse_ecn_with_cmsg(level: libc::c_int, ctype: libc::c_int, ds: u8) -> Option<u8> {
         unsafe {
             // CMSG_SPACE(1) bytes hold a header + 1 padded payload byte.
+            // Back the control buffer with the same 8-byte-aligned `CmsgBuf`
+            // the production recv path uses (#2334) so the synthetic cmsg
+            // header-field writes/reads here are aligned exactly as in
+            // `wg_recvmsg` — a bare `vec![0u8; _]` would be align-1.
             let space = libc::CMSG_SPACE(1) as usize;
-            let mut buf = vec![0u8; space];
+            assert!(space <= 256, "CMSG_SPACE(1) exceeds CmsgBuf storage");
+            let mut buf = CmsgBuf([0u8; 256]);
             let mut msg: libc::msghdr = std::mem::zeroed();
-            msg.msg_control = buf.as_mut_ptr() as *mut libc::c_void;
+            msg.msg_control = buf.0.as_mut_ptr() as *mut libc::c_void;
             msg.msg_controllen = space as _;
             let cmsg = libc::CMSG_FIRSTHDR(&msg);
             assert!(!cmsg.is_null(), "CMSG_FIRSTHDR null");

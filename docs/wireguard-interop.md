@@ -145,7 +145,14 @@ DSCP is not copied back at decap.
   real WG peer CE-marking the outer → CE on the inner) is lab-bound,
   deferred to the #1703-class interop validation; the code path and unit
   tests (cmsg parse for v4/v6, the §4.2 combine reuse, CE upgrade + IPv4
-  checksum, illegal-combo drop+count) are in tree.
+  checksum, illegal-combo drop+count) are in tree. The `recvmsg` control
+  buffer is the 8-byte-aligned `CmsgBuf([u8; 256])` newtype (#2334) so the
+  `cmsghdr` header-field reads the `CMSG_*` macros perform are naturally
+  aligned (a bare `[u8; N]` is align-1; reading `cmsg_len`/`cmsg_level`/
+  `cmsg_type` through an under-aligned `*const cmsghdr` is UB and a SIGBUS
+  risk on strict-alignment targets such as ARMv8). A compile-time
+  `align_of::<CmsgBuf>() >= align_of::<cmsghdr>()` assertion is the
+  fail-on-revert sentinel.
 
 ## What S1 delivers
 
