@@ -393,13 +393,12 @@ userspace-dp/`, worktrees excluded):
 - The `show security wireguard` CLI renderer reads from the DATAPLANE STATUS
   (`pkg/cli/cli_show_security_wireguard.go` → `provider.Status()` →
   `dpuserspace.FormatWireguardStatus`), NOT the config scalar.
-  **CLI-peer-cardinality confirm (SMR MINOR-1, round-1 deliverable):** verify
-  the status row (`coordinator/status.rs`) + `FormatWireguardStatus` already
-  iterate N peers per tunnel. If they render only ONE peer, multi-peer is
-  configurable + forwarding but INVISIBLE in the CLI — do NOT ship B1 claiming
-  "operator can configure N peers" if the operator cannot SEE them: either
-  widen the status/renderer in B1, or file a tight follow-on and say so in the
-  PR.
+  **CLI-peer-cardinality — RESOLVED to MANDATORY B1 scope (was SMR MINOR-1).**
+  Verified: the status row is one-peer-shaped AND reads the scalar snapshot
+  fields B1 deletes, so it is a forced migration site, not an optional display
+  improvement. See §5.8 "Status row is a MANDATORY migration site". The
+  renderer (`FormatWireguardStatus`) + Go `WgTunnelStatus` mirror
+  (`protocol.go:752`) are widened to per-peer in B1.
 - `logWgEndpointSetTransitionLocked` / its summary (`tunnels.go:212`) formats
   only `ep.WgListenPort` (tunnel-level) — unaffected.
 - `pkg/daemon/daemon_run.go:141` is a COMMENT, not a read — unaffected.
@@ -416,6 +415,25 @@ userspace-dp/`, worktrees excluded):
   rebuild (engine seeds TAI64N high-water as today).
 - Confirm `endpoint.wg_local_privkey` / `wg_listen_port` paths unchanged.
 - NO engine, NO reconcile_peers, NO PeerTable change for B1.
+
+**Status row is a MANDATORY migration site (escalated from SMR MINOR-1 —
+verified, NOT optional).** `coordinator/status.rs:655-717`
+(`wg_tunnel_statuses`) builds a `WgTunnelStatus` per ENDPOINT, reading the
+SCALAR `endpoint.wg_peer_pubkey` / `endpoint.wg_endpoint` and
+`peer_has_confirmed_session(&endpoint.wg_peer_pubkey)`. B1 removes those scalar
+snapshot fields, so this code WILL NOT COMPILE unless updated. The
+`WgTunnelStatus` struct (`protocol/snapshot.rs` + Go mirror
+`protocol.go:752`, scalar `PeerPubkeyHex`/`PeerEndpoint`) and the
+`FormatWireguardStatus` renderer are ALL one-peer-shaped. B1 must reshape the
+status row to per-peer (e.g. `WgTunnelStatus { ..., peers: Vec<WgPeerStatus> }`
+where `WgPeerStatus` carries `pubkey_hex`, `endpoint`, `has_confirmed_session`,
+per-peer handshake/rekey counters) and update the Go mirror + renderer to
+iterate. This is REAL B1 scope (Rust status + Go protocol + Go renderer + the
+`show security wireguard` golden output), not a follow-on. It does NOT need the
+lab — it is config/telemetry plumbing, gated by `cargo test` + `make test` +
+the existing CLI render test. The engine already exposes per-peer state
+(`peer_has_confirmed_session` is per-pubkey; the engine iterates its
+PeerTable), so the data is available — only the status DTO is too narrow.
 
 ---
 
