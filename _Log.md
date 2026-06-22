@@ -1,5 +1,33 @@
 # Action Log
 
+## 2026-06-22 — #2314 suppress ICMP/ICMPv6 errors for multicast/broadcast triggers
+
+- **Timestamp**: 2026-06-22 PDT
+- **Action**: RFC 1812 §4.3.2.7 / RFC 4443 §2.4(e) — a locally generated
+  ICMP/ICMPv6 error MUST NOT be originated when the triggering packet's
+  IP destination was multicast or broadcast (a multicast flood otherwise
+  amplifies into an ICMP-error backscatter storm). Added a shared cheap
+  predicate `dest_is_multicast_or_broadcast(addr_family, packet)` in
+  `frame/inspect.rs` (IPv4 224.0.0.0/4 + 255.255.255.255 via
+  `Ipv4Addr::is_multicast`/`is_broadcast`; IPv6 ff00::/8 via the leading
+  0xff byte; too-short slice fails closed). Gated the #2310/#2301 PTB
+  generation site by adding the predicate to `ptb_reply_suppressed`
+  (`icmp_ptb.rs`) — this was the real gap. Routed the reject /
+  Time Exceeded path's destination test in
+  `can_generate_icmp_error_reply` (`icmp.rs`) through the same predicate
+  (it already inline-suppressed multicast/broadcast; now DRY). No new
+  counter: a suppressed reply folds into the existing fail-closed
+  silent-drop path (the oversized/rejected original is still dropped).
+  Tests: 8 fail-on-revert unit tests (PTB + reject/time-exceeded) for
+  IPv4 multicast, IPv4 limited-broadcast, IPv6 multicast suppression plus
+  unicast-still-generated; verified 6 go red when the guards are reverted,
+  5x flake-free, `cargo build --release` clean. No Go/wire change.
+- **File(s)**: userspace-dp/src/afxdp/frame/inspect.rs,
+  userspace-dp/src/afxdp/frame/mod.rs, userspace-dp/src/afxdp/icmp.rs,
+  userspace-dp/src/afxdp/icmp_ptb.rs,
+  userspace-dp/src/afxdp/icmp_ptb_tests.rs,
+  userspace-dp/src/afxdp/README.md
+
 ## 2026-06-22 — #1434 review round 1 (NEEDS-MINOR fold)
 
 - **Timestamp**: 2026-06-22 PDT

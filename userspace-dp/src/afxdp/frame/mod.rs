@@ -53,9 +53,9 @@ pub(in crate::afxdp) use checksum::{
 // cos/queue_service.rs, so they go out at `pub(in crate::afxdp)`. The
 // rest stay at `pub(super)` (afxdp-only callers in sibling files).
 pub(in crate::afxdp) use inspect::{
-    authoritative_forward_ports, decode_frame_summary, forward_tuple_mismatch_reason,
-    ipv4_is_non_first_fragment, ipv6_is_non_first_fragment, is_non_first_fragment,
-    parse_session_flow, try_parse_metadata,
+    authoritative_forward_ports, decode_frame_summary, dest_is_multicast_or_broadcast,
+    forward_tuple_mismatch_reason, ipv4_is_non_first_fragment, ipv6_is_non_first_fragment,
+    is_non_first_fragment, parse_session_flow, try_parse_metadata,
 };
 pub(super) use inspect::{
     MAX_IPV6_EXT_HEADERS, frame_l3_offset, frame_l4_offset, live_frame_ports, live_frame_ports_bytes,
