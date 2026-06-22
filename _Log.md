@@ -10274,3 +10274,26 @@ top.
   pkg/dataplane/userspace/format/status_test.go,
   pkg/api/metrics_userspace.go,
   userspace-dp/src/afxdp/event_emit.rs, _Log.md
+
+- **Timestamp**: 2026-06-22
+  **Action**: #2325 — add the L2 (link-layer) destination broadcast/multicast
+  suppression gate to the PTB / Frag-Needed generation path so it has the same
+  L2+L3 suppression the reject / Time-Exceeded path already had. RFC 1812
+  §4.3.2.7 / RFC 4443 §2.4(e): an ICMP error MUST NOT be generated for a
+  datagram delivered as a link-layer broadcast/multicast. Before, a frame with
+  a UNICAST L3 dst but a multicast/broadcast L2 dst MAC still triggered a PTB.
+  Extracted the inline L2 test from `can_generate_icmp_error_reply` (icmp.rs)
+  into a shared `l2_dst_is_group_or_broadcast(eth_dst: &[u8;6])` helper in
+  frame/inspect.rs (IEEE I/G group bit = low bit of first MAC octet; all-FF
+  broadcast is a group address) and call it from BOTH the reject/TE path and
+  `ptb_reply_suppressed` (icmp_ptb.rs). The PTB site already had the full
+  trigger ethernet frame (`source_frame`), so no plumbing was needed — the L2
+  dst is the first 6 frame bytes. Added fail-on-revert tests (PTB suppressed
+  for L2 multicast v4/v6 + L2 broadcast, still generated for unicast L2/L3,
+  plus a direct helper unit test). Build clean; targeted tests 5x green;
+  verified the suppression tests turn red when the gate is removed.
+  **File(s)**: userspace-dp/src/afxdp/frame/inspect.rs,
+  userspace-dp/src/afxdp/frame/mod.rs, userspace-dp/src/afxdp/icmp.rs,
+  userspace-dp/src/afxdp/icmp_ptb.rs,
+  userspace-dp/src/afxdp/icmp_ptb_tests.rs,
+  userspace-dp/src/afxdp/README.md, _Log.md

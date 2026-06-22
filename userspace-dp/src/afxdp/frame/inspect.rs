@@ -356,6 +356,28 @@ pub(in crate::afxdp) fn dest_is_multicast_or_broadcast(addr_family: u8, packet: 
     }
 }
 
+/// #2325: RFC 1812 §4.3.2.7 / RFC 4443 §2.4(e) — a router MUST NOT
+/// originate an ICMP/ICMPv6 *error* in reply to a datagram that was
+/// delivered as a link-layer (L2) broadcast or multicast. The IEEE 802
+/// group (I/G) bit is the low bit of the first MAC octet; the all-ones
+/// MAC (broadcast) is a special case of group, so a single bit test on
+/// the first destination-MAC octet covers both. This is the L2 sibling
+/// of [`dest_is_multicast_or_broadcast`] (the L3 destination test) and
+/// is shared by the reject / Time-Exceeded path
+/// (`can_generate_icmp_error_reply`) and the PTB path
+/// (`ptb_reply_suppressed`) so both apply the same L2+L3 suppression.
+///
+/// Takes the trigger frame's 6-byte destination MAC. Returns `true` when
+/// the L2 destination is group/broadcast and the ICMP error MUST be
+/// suppressed.
+#[inline]
+pub(in crate::afxdp) fn l2_dst_is_group_or_broadcast(eth_dst: &[u8; 6]) -> bool {
+    // The low bit of the first MAC octet is the I/G (group) bit; the
+    // all-ones MAC is broadcast (a group address). A single bit test
+    // catches both.
+    (eth_dst[0] & 0x01) != 0
+}
+
 pub(in crate::afxdp) fn metadata_tuple_complete(meta: UserspaceDpMeta, flow: &SessionFlow) -> bool {
     if flow.src_ip.is_unspecified() || flow.dst_ip.is_unspecified() {
         return false;

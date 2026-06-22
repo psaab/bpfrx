@@ -417,6 +417,98 @@ fn ptb_still_generated_for_v4_unicast_dst() {
     );
 }
 
+/// #2325: rewrite the link-layer (L2) destination MAC of a built frame so
+/// the trigger is delivered to a group/broadcast MAC. The PTB L2 gate
+/// reads the destination off the first 6 frame bytes.
+fn set_l2_dst(frame: &mut [u8], mac: [u8; 6]) {
+    frame[0..6].copy_from_slice(&mac);
+}
+
+/// #2325: a frame with a UNICAST L3 destination but a MULTICAST L2
+/// destination MAC (the group I/G bit set) must NOT generate a PTB
+/// (RFC 1812 §4.3.2.7 / RFC 4443 §2.4(e) — a datagram delivered as a
+/// link-layer multicast must not produce an ICMP error). Fails if the
+/// L2 gate is reverted (the L3 destination here is plain unicast, so the
+/// #2314 L3 gate alone would let this through).
+#[test]
+fn ptb_suppressed_for_l2_multicast_dst() {
+    let (mut frame, meta) = inbound_v4_udp(1500, true);
+    let l3 = meta.l3_offset as usize;
+    // 01:00:5e:... is the IPv4-multicast MAC range; the low bit of the
+    // first octet (0x01) is the IEEE group bit.
+    set_l2_dst(&mut frame, [0x01, 0x00, 0x5e, 0x01, 0x02, 0x03]);
+    assert!(
+        ptb_reply_suppressed(&frame, meta, l3),
+        "L2 multicast (group bit) destination must suppress the PTB"
+    );
+}
+
+/// #2325: a frame delivered to the L2 broadcast MAC (all-FF) must NOT
+/// generate a PTB even though its L3 destination is unicast. Fails if the
+/// L2 gate is reverted.
+#[test]
+fn ptb_suppressed_for_l2_broadcast_dst() {
+    let (mut frame, meta) = inbound_v4_udp(1500, true);
+    let l3 = meta.l3_offset as usize;
+    set_l2_dst(&mut frame, [0xff, 0xff, 0xff, 0xff, 0xff, 0xff]);
+    assert!(
+        ptb_reply_suppressed(&frame, meta, l3),
+        "L2 broadcast destination must suppress the PTB"
+    );
+}
+
+/// #2325: the same gate on IPv6 — a unicast L3 destination delivered to a
+/// multicast L2 MAC (e.g. 33:33:... IPv6-multicast range) must suppress.
+#[test]
+fn ptb_suppressed_for_l2_multicast_dst_v6() {
+    let (mut frame, meta) = inbound_v6_udp(1300);
+    let l3 = meta.l3_offset as usize;
+    set_l2_dst(&mut frame, [0x33, 0x33, 0x00, 0x00, 0x00, 0x01]);
+    assert!(
+        ptb_reply_suppressed(&frame, meta, l3),
+        "L2 multicast (33:33:..) destination must suppress the IPv6 PTB"
+    );
+}
+
+/// #2325 fail-on-revert pair: a UNICAST L3 destination delivered to a
+/// UNICAST L2 MAC must STILL generate the PTB. Pairs with the L2
+/// suppression tests above so reverting the L2 gate turns those red while
+/// this one stays green (proving the suppression is the L2 gate, not the
+/// frame bytes).
+#[test]
+fn ptb_still_generated_for_l2_unicast_dst() {
+    let (mut frame, meta) = inbound_v4_udp(1500, true);
+    let l3 = meta.l3_offset as usize;
+    // A plain unicast MAC: low bit of the first octet clear.
+    set_l2_dst(&mut frame, [0x02, 0xbf, 0x72, 0x00, 0x00, 0x09]);
+    assert!(
+        !ptb_reply_suppressed(&frame, meta, l3),
+        "unicast L2 + unicast L3 destination must NOT suppress the PTB"
+    );
+    let fwd = forwarding_with_egress(1400);
+    assert!(
+        build_frag_needed_v4(&frame, meta, PTB_IFINDEX, &fwd, 1400).is_some(),
+        "unicast L2/L3 PTB must build"
+    );
+}
+
+/// #2325: direct unit test of the shared `l2_dst_is_group_or_broadcast`
+/// helper — the IEEE group (I/G) bit is the low bit of the first octet;
+/// broadcast (all-FF) is a group address. Unicast MACs (even bit clear)
+/// are not group/broadcast. Fails if the helper's bit test is reverted.
+#[test]
+fn l2_dst_group_broadcast_helper() {
+    // Unicast: low bit of first octet clear.
+    assert!(!l2_dst_is_group_or_broadcast(&[0x02, 0xbf, 0x72, 0x00, 0x00, 0x01]));
+    assert!(!l2_dst_is_group_or_broadcast(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]));
+    // IPv4 multicast MAC range (01:00:5e:..): group bit set.
+    assert!(l2_dst_is_group_or_broadcast(&[0x01, 0x00, 0x5e, 0x01, 0x02, 0x03]));
+    // IPv6 multicast MAC range (33:33:..): group bit set (0x33 & 0x01).
+    assert!(l2_dst_is_group_or_broadcast(&[0x33, 0x33, 0x00, 0x00, 0x00, 0x01]));
+    // Broadcast (all-FF): a group address.
+    assert!(l2_dst_is_group_or_broadcast(&[0xff, 0xff, 0xff, 0xff, 0xff, 0xff]));
+}
+
 #[test]
 fn no_primary_address_fails_closed() {
     // Egress has no primary v4 -> the builder returns None (caller silently
