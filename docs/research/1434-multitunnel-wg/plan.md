@@ -52,8 +52,11 @@ genuinely different work axes:
   single interface terminating multiple site-to-site peers. All peers share
   ONE listen port, so the shim steering problem of Axis A **does not apply**.
   The blocker is purely the Go config model: `TunnelConfig` holds ONE scalar
-  peer. **This is what this plan addresses, and it is driveable now without
-  the shim or the lab.** The Rust engine already supports N peers natively.
+  peer. **This is what this plan addresses.** The Rust engine peer TABLE
+  already supports N peers natively (RX/decap is multi-peer); the egress
+  machinery is single-peer and is generalized in B1b (§5.0/§5.0.1). The
+  config + RX slice (B1a) is driveable now without the shim or the lab; the
+  egress completion (B1b) is lab-recommended but still shim-free.
 
 The user directive for this research is Axis B. Axis A stays deferred to the
 prior plan / lab. The interop LAB (live multi-peer handshake against a real
@@ -77,14 +80,22 @@ The Rust WG engine is **already fully multi-peer** (verified at HEAD):
   and documents "the Go control plane is supposed to reject duplicate pubkeys
   at config validation" (engine.rs:541-553) — a contract THIS plan must honour.
 
-The ONLY place that collapses this to one peer is the build path:
-`populate_wg_engines` (`userspace-dp/src/afxdp/forwarding_build/wg.rs:48-72`)
-constructs exactly one `WgPeerConfig` from the scalar snapshot fields and does
-`peers: vec![peer]`. The scalar snapshot fields, in turn, come from the scalar
-Go `TunnelConfig` and the scalar Go→Rust wire DTO.
+The peer-TABLE collapse to one peer is the build path: `populate_wg_engines`
+(`userspace-dp/src/afxdp/forwarding_build/wg.rs:48-72`) constructs exactly one
+`WgPeerConfig` from the scalar snapshot fields and does `peers: vec![peer]`. The
+scalar snapshot fields, in turn, come from the scalar Go `TunnelConfig` and the
+scalar Go→Rust wire DTO. **But that is only the RX-feeding collapse** — the
+EGRESS paths additionally collapse to peer[0] via `first_peer_pubkey`
+independently of the table (§5.0.1), so widening the build path alone does NOT
+make TX multi-peer.
 
-So Axis B is a clean "widen the pipe" change: Go config slice → wire slice →
-Rust build-path slice → `peers: Vec<...>` (which the engine already wants).
+So the RX half of Axis B is a clean "widen the pipe" change: Go config slice →
+wire slice → Rust build-path slice → `peers: Vec<...>` (which the engine
+already wants). The TX/egress half is NOT a pure widen — the encap + control
+thread + timers select a single peer via `first_peer_pubkey` and must be
+generalized (§5.0/§5.0.1). The hostile review's central output is making this
+RX-vs-TX asymmetry explicit; do not let the "engine already multi-peer" framing
+hide the egress work.
 
 ---
 
@@ -94,9 +105,11 @@ Rust build-path slice → `peers: Vec<...>` (which the engine already wants).
 real-world topologies. Today an operator can terminate exactly one peer per WG
 interface — an arbitrary ceiling on an otherwise complete, wire-compliant WG
 subsystem (snow IKpsk2, MAC1/MAC2 cookie, Tai64N, AllowedIPs cryptokey
-routing, MSS clamp, DSCP). The marginal code is moderate (a Go slice + schema
-named-instance + compiler loop + wire DTO + a one-line Rust build-path change),
-but it removes a real product limitation and unlocks the engine capability
+routing, MSS clamp, DSCP). The marginal code is moderate for the RX/config
+slice (a Go slice + schema named-instance + compiler loop + wire DTO + the Rust
+build-path loop + per-peer status) and larger for the egress generalization
+(encap LPM + per-peer control-thread egress + per-peer keepalive timers,
+§5.0.1). It removes a real product limitation and unlocks the engine capability
 that is already paid for.
 
 **PSK gap (orthogonal but in scope per directive).** The engine hardcodes
@@ -186,21 +199,27 @@ String`, `wg_keepalive_secs: u16`). `wg_local_privkey_hex` is
 `skip_serializing` (privkey hygiene, #1432 S2a) — the slice change MUST
 preserve that.
 
-### 3.5 Rust build path (collapses to one peer — the single change point)
+### 3.5 Rust build path (the RX-feeding collapse point)
 
 `userspace-dp/src/afxdp/forwarding_build/wg.rs:48-72` —
 `populate_wg_engines` builds `peers: vec![peer]` from the scalar endpoint
-fields. This is the ONE Rust line that must iterate a peer slice instead.
-`wg_identity_unchanged` (wg.rs:87-94) compares the scalar fields for engine
-reuse and must compare the slice instead (order-stable or order-insensitive —
-§5.4).
+fields. Widening THIS to a loop makes the engine peer TABLE multi-peer (and so
+RX/decap multi-peer). `wg_identity_unchanged` (wg.rs:87-94) compares the scalar
+fields for engine reuse and must compare the slice instead (order-stable since
+the Go builder sorts by pubkey — §5.4). **This is necessary but NOT sufficient
+for TX** — see §5.0.1 for the egress sites that also collapse to peer[0].
 
-### 3.6 Rust engine (already multi-peer — NO engine change needed)
+### 3.6 Rust engine peer TABLE (already multi-peer — table needs no change)
 
-Confirmed in §1.2. The engine API surface (`WgEngineConfig.peers: Vec<...>`,
-`reconcile_peers`, `PeerTable`) needs NO change for Axis B. The only Rust
-edits are (a) the build-path loop, (b) the snapshot DTO widening, (c)
-`wg_identity_unchanged` slice comparison.
+Confirmed in §1.2. The engine peer-table API (`WgEngineConfig.peers: Vec<...>`,
+`reconcile_peers`, `PeerTable` + AllowedIPs LPM) needs NO change to HOLD N
+peers. The table-feeding Rust edits are (a) the build-path loop, (b) the
+snapshot DTO widening, (c) `wg_identity_unchanged` slice comparison. **However**
+B1b adds a small engine method to EXPOSE an encap-side `inner_dst → peer`
+lookup over the existing PeerTable+LPM (today the LPM is wired to RX only), and
+the timer/control-thread egress paths must iterate peers instead of
+`first_peer_pubkey` (§5.0.1). So "engine untouched" holds for the TABLE but not
+for the egress-selection surface.
 
 ### 3.7 Wire fixture
 
@@ -485,7 +504,7 @@ userspace-dp/`, worktrees excluded):
   only `ep.WgListenPort` (tunnel-level) — unaffected.
 - `pkg/daemon/daemon_run.go:141` is a COMMENT, not a read — unaffected.
 
-### 5.8 Rust changes (minimal — engine untouched)
+### 5.8 Rust changes (B1a table-feeding + status; B1b egress — see §5.0.1)
 - `userspace-dp/src/protocol/snapshot.rs:341-374` — replace scalar WG peer
   fields on `TunnelEndpointSnapshot` with `wg_peers: Vec<TunnelWgPeerSnapshot>`
   (new serde struct mirroring the Go wire DTO; keep `wg_listen_port`/
