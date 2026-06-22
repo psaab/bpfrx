@@ -305,3 +305,259 @@ func TestUpdateInstances_NewKeyFailureNoPhantom(t *testing.T) {
 		t.Fatal("RGVRRPReady(1) should be true after the retry created the instance")
 	}
 }
+
+// seedRunningInstance installs an already-"running" instance for the given key
+// bound to the supplied ifindex. The instance's stopped channel is left open
+// so the stub stopInstance (which only records) does not block; the real run()
+// goroutine is never started in these no-network tests.
+func seedRunningInstance(m *Manager, key instanceKey, cfg Instance, ifindex int) *vrrpInstance {
+	vi := newInstance(cfg, &net.Interface{Name: cfg.Interface, Index: ifindex}, m.eventCh, nil)
+	m.mu.Lock()
+	m.instances[key] = vi
+	m.mu.Unlock()
+	return vi
+}
+
+// TestUpdateInstances_IfindexChange_RestartsRebind asserts the #2294 fix: when
+// a running instance's member interface keeps the SAME xpf config but its
+// kernel ifindex changes (netdev delete+recreate / rename), the reconcile path
+// detects the drift and restarts the instance — stopping the stale-bound old
+// one and starting a fresh instance bound to the NEW ifindex. Without the fix
+// the byte-identical config hits the "No change" continue and the instance
+// keeps its socket bound to the dead ifindex → permanent VRRP silence. This
+// test FAILS if the ifindex-drift detection is reverted (no restart occurs).
+func TestUpdateInstances_IfindexChange_RestartsRebind(t *testing.T) {
+	m, rec := newTestManagerNoNetwork()
+	defer stopManagerForTest(m)
+
+	// resolveIface returns whatever ifindex the test currently advertises.
+	var liveIndex atomic.Int64
+	liveIndex.Store(7)
+	m.resolveIface = func(name string) (*net.Interface, error) {
+		return &net.Interface{Name: name, Index: int(liveIndex.Load())}, nil
+	}
+
+	key := instanceKey{iface: "reth0.50", groupID: 101}
+	cfg := Instance{
+		Interface:        "reth0.50",
+		GroupID:          101,
+		Priority:         200,
+		Preempt:          true,
+		VirtualAddresses: []string{"172.16.50.1/24"},
+	}
+	orig := seedRunningInstance(m, key, cfg, 7) // bound to ifindex 7
+
+	// The netdev was deleted+recreated under the same name → new ifindex 9,
+	// while the desired config is byte-identical.
+	liveIndex.Store(9)
+	desired := []*Instance{{
+		Interface:        "reth0.50",
+		GroupID:          101,
+		Priority:         200,
+		Preempt:          true,
+		VirtualAddresses: []string{"172.16.50.1/24"}, // UNCHANGED config
+	}}
+	if err := m.UpdateInstances(desired); err != nil {
+		t.Fatalf("UpdateInstances: %v", err)
+	}
+
+	open, run, stop := rec.snapshot()
+	if open != 1 || run != 1 || stop != 1 {
+		t.Fatalf("ifindex drift must restart: open=%d run=%d stop=%d, want 1/1/1", open, run, stop)
+	}
+
+	m.mu.RLock()
+	got, ok := m.instances[key]
+	n := len(m.instances)
+	m.mu.RUnlock()
+	if !ok || n != 1 {
+		t.Fatalf("expected exactly 1 instance for the key, ok=%v n=%d", ok, n)
+	}
+	if got == orig {
+		t.Fatal("instance was not replaced — stale ifindex socket kept (bug)")
+	}
+	if got.iface.Index != 9 {
+		t.Fatalf("replacement bound to ifindex %d, want 9 (new live ifindex)", got.iface.Index)
+	}
+
+	rec.mu.Lock()
+	stoppedOld := len(rec.stopped) == 1 && rec.stopped[0] == orig
+	rec.mu.Unlock()
+	if !stoppedOld {
+		t.Fatal("the stopped instance was not the original (build-before-teardown ordering wrong)")
+	}
+
+	// Restart must preserve the configured priority/preempt/VIPs.
+	if got.cfg.Priority != 200 || !got.cfg.Preempt {
+		t.Fatalf("restart lost config: priority=%d preempt=%v, want 200/true", got.cfg.Priority, got.cfg.Preempt)
+	}
+	if !vipsEqual(got.cfg.VirtualAddresses, cfg.VirtualAddresses) {
+		t.Fatalf("restart lost VIPs: %v, want %v", got.cfg.VirtualAddresses, cfg.VirtualAddresses)
+	}
+}
+
+// TestUpdateInstances_IfindexUnchanged_NoRestart asserts the idempotence half
+// of #2294: a reconcile pass where the resolved ifindex matches the bound
+// ifindex and the config is unchanged must NOT restart the instance (no socket
+// churn, no spurious failover). This is the steady-state every-2s reconcile
+// case; a regression here would restart-storm every RG.
+func TestUpdateInstances_IfindexUnchanged_NoRestart(t *testing.T) {
+	m, rec := newTestManagerNoNetwork()
+	defer stopManagerForTest(m)
+
+	// Live ifindex stays equal to the bound one.
+	m.resolveIface = func(name string) (*net.Interface, error) {
+		return &net.Interface{Name: name, Index: 5}, nil
+	}
+
+	key := instanceKey{iface: "reth0.50", groupID: 101}
+	cfg := Instance{
+		Interface:        "reth0.50",
+		GroupID:          101,
+		Priority:         200,
+		Preempt:          true,
+		VirtualAddresses: []string{"172.16.50.1/24"},
+	}
+	orig := seedRunningInstance(m, key, cfg, 5)
+
+	desired := []*Instance{{
+		Interface:        "reth0.50",
+		GroupID:          101,
+		Priority:         200,
+		Preempt:          true,
+		VirtualAddresses: []string{"172.16.50.1/24"},
+	}}
+
+	// Drive the reconcile several times — must remain a no-op every time.
+	for i := 0; i < 3; i++ {
+		if err := m.UpdateInstances(desired); err != nil {
+			t.Fatalf("UpdateInstances pass %d: %v", i, err)
+		}
+	}
+
+	open, run, stop := rec.snapshot()
+	if open != 0 || run != 0 || stop != 0 {
+		t.Fatalf("unchanged ifindex must NOT restart: open=%d run=%d stop=%d, want 0/0/0", open, run, stop)
+	}
+	m.mu.RLock()
+	got := m.instances[key]
+	m.mu.RUnlock()
+	if got != orig {
+		t.Fatal("instance was replaced despite unchanged ifindex+config (idempotence broken)")
+	}
+}
+
+// TestUpdateInstances_IfindexUnchanged_PriorityOnlyStaysInPlace asserts that a
+// priority-only delta with an UNCHANGED ifindex still takes the cheap in-place
+// updateConfig path (no restart) — the #2294 ifindex check must not turn a
+// priority bump into a socket-churning restart. Guards against over-triggering.
+func TestUpdateInstances_IfindexUnchanged_PriorityOnlyStaysInPlace(t *testing.T) {
+	m, rec := newTestManagerNoNetwork()
+	defer stopManagerForTest(m)
+
+	m.resolveIface = func(name string) (*net.Interface, error) {
+		return &net.Interface{Name: name, Index: 5}, nil
+	}
+
+	key := instanceKey{iface: "reth0.50", groupID: 101}
+	orig := seedRunningInstance(m, key, Instance{
+		Interface:        "reth0.50",
+		GroupID:          101,
+		Priority:         200,
+		Preempt:          true,
+		VirtualAddresses: []string{"172.16.50.1/24"},
+	}, 5)
+
+	desired := []*Instance{{
+		Interface:        "reth0.50",
+		GroupID:          101,
+		Priority:         150, // priority changed, VIPs + ifindex unchanged
+		Preempt:          true,
+		VirtualAddresses: []string{"172.16.50.1/24"},
+	}}
+	if err := m.UpdateInstances(desired); err != nil {
+		t.Fatalf("UpdateInstances: %v", err)
+	}
+
+	open, run, stop := rec.snapshot()
+	if open != 0 || run != 0 || stop != 0 {
+		t.Fatalf("priority-only delta must stay in-place: open=%d run=%d stop=%d, want 0/0/0", open, run, stop)
+	}
+	m.mu.RLock()
+	got := m.instances[key]
+	m.mu.RUnlock()
+	if got != orig {
+		t.Fatal("priority-only delta replaced the instance (should be in-place)")
+	}
+	if got.cfg.Priority != 150 {
+		t.Fatalf("in-place update did not apply priority: got %d, want 150", got.cfg.Priority)
+	}
+}
+
+// TestUpdateInstances_IfindexChange_TransientResolveFailKeepsOld asserts that a
+// resolve failure during the reconcile does NOT churn the instance: the old
+// (possibly stale-bound) instance is kept until the interface resolves again,
+// matching the build-before-teardown tolerance (#2156) and avoiding dropping
+// the RG out of election on a transient netlink hiccup.
+func TestUpdateInstances_IfindexChange_TransientResolveFailKeepsOld(t *testing.T) {
+	m, rec := newTestManagerNoNetwork()
+	defer stopManagerForTest(m)
+
+	resolveErr := atomic.Bool{}
+	resolveErr.Store(true)
+	m.resolveIface = func(name string) (*net.Interface, error) {
+		if resolveErr.Load() {
+			return nil, errSocketOpenFailed
+		}
+		return &net.Interface{Name: name, Index: 9}, nil
+	}
+
+	key := instanceKey{iface: "reth0.50", groupID: 101}
+	cfg := Instance{
+		Interface:        "reth0.50",
+		GroupID:          101,
+		Priority:         200,
+		Preempt:          true,
+		VirtualAddresses: []string{"172.16.50.1/24"},
+	}
+	orig := seedRunningInstance(m, key, cfg, 7)
+
+	desired := []*Instance{{
+		Interface:        "reth0.50",
+		GroupID:          101,
+		Priority:         200,
+		Preempt:          true,
+		VirtualAddresses: []string{"172.16.50.1/24"},
+	}}
+
+	// Pass 1: resolve fails — keep the old instance, no restart.
+	if err := m.UpdateInstances(desired); err != nil {
+		t.Fatalf("UpdateInstances pass 1: %v", err)
+	}
+	open, run, stop := rec.snapshot()
+	if open != 0 || run != 0 || stop != 0 {
+		t.Fatalf("resolve failure must keep old instance: open=%d run=%d stop=%d, want 0/0/0", open, run, stop)
+	}
+	m.mu.RLock()
+	if m.instances[key] != orig {
+		m.mu.RUnlock()
+		t.Fatal("pass 1: old instance orphaned on transient resolve failure")
+	}
+	m.mu.RUnlock()
+
+	// Pass 2: resolve returns the NEW ifindex — the drift restart fires.
+	resolveErr.Store(false)
+	if err := m.UpdateInstances(desired); err != nil {
+		t.Fatalf("UpdateInstances pass 2: %v", err)
+	}
+	open, run, stop = rec.snapshot()
+	if open != 1 || run != 1 || stop != 1 {
+		t.Fatalf("pass 2 ifindex drift must restart: open=%d run=%d stop=%d, want 1/1/1", open, run, stop)
+	}
+	m.mu.RLock()
+	got := m.instances[key]
+	m.mu.RUnlock()
+	if got == orig || got.iface.Index != 9 {
+		t.Fatalf("pass 2: not rebound to new ifindex (same=%v index=%d)", got == orig, got.iface.Index)
+	}
+}
