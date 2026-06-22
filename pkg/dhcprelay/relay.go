@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"sort"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -299,7 +300,21 @@ func computeDesired(cfg *config.DHCPRelayConfig) map[string]desiredRelay {
 	if cfg == nil {
 		return desired
 	}
-	for _, group := range cfg.Groups {
+	// Iterate groups in a DETERMINISTIC (sorted-by-name) order. cfg.Groups is a
+	// map, and the "interface already mapped, skipping" dedup below is
+	// first-group-wins — so a random map-iteration order would make an
+	// interface that appears in multiple groups resolve to a nondeterministic
+	// group across Apply calls. That both picks a nondeterministic server set
+	// AND defeats the day-2 idempotency diff (a re-Apply of the SAME config
+	// could compute a different relaySpec and spuriously restart the relay).
+	// Sorting the group names makes first-wins stable and the diff idempotent.
+	groupNames := make([]string, 0, len(cfg.Groups))
+	for name := range cfg.Groups {
+		groupNames = append(groupNames, name)
+	}
+	sort.Strings(groupNames)
+	for _, gname := range groupNames {
+		group := cfg.Groups[gname]
 		sgName := group.ActiveServerGroup
 		sg, ok := cfg.ServerGroups[sgName]
 		if !ok {

@@ -966,8 +966,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// removed — Apply diffs desired-vs-running and a nil config stops all
 	// relays. The relay goroutines bind to d.daemonCtx (== ctx here) so
 	// they outlive each apply call and are torn down only at daemon stop.
+	d.dhcpRelay = dhcprelay.NewManager()
 	if cfg := d.store.ActiveConfig(); cfg != nil {
-		d.dhcpRelay = dhcprelay.NewManager()
 		d.dhcpRelay.Apply(ctx, cfg.ForwardingOptions.DHCPRelay)
 	}
 
