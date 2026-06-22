@@ -1401,7 +1401,14 @@ fn recompute_l4_checksum_after_nat64_v6_to_v4(packet: &mut [u8], protocol: u8) -
             }
             l4[6..8].copy_from_slice(&[0, 0]);
             let sum = checksum16_ipv4_pseudo(src, dst, protocol, l4);
-            l4[6..8].copy_from_slice(&sum.to_be_bytes());
+            // RFC 768 / RFC 1624: in IPv4 UDP a checksum field of 0x0000 is the
+            // reserved "no checksum present" sentinel. A genuinely computed
+            // checksum of zero MUST be transmitted as 0xFFFF (all-ones) so the
+            // receiver still validates it. `checksum16_ipv4_pseudo` returns the
+            // final one's-complement value, so a 0x0000 here is a real computed
+            // checksum, not an internal sentinel. Mirrors the v4->v6 UDP arm.
+            let final_sum = if sum == 0 { 0xFFFF } else { sum };
+            l4[6..8].copy_from_slice(&final_sum.to_be_bytes());
         }
         PROTO_ICMP => {
             if l4.len() < 4 {
