@@ -2636,14 +2636,28 @@ pub(super) fn poll_binding_process_descriptor(
                                 // (or permitted) verdict is identical whether or
                                 // not the next-hop neighbor is already resolved.
                                 // The session-miss block's `effective_resolution_target`
-                                // is out of scope here, but the merged
-                                // `decision.nat` carries the same inbound
-                                // destination translation (DNAT/static-DNAT/
-                                // NPTv6/NAT64 all set `rewrite_dst`; only
-                                // port-based DNAT sets `rewrite_dst_port`), so
-                                // reconstruct the post-translation dst tuple from
-                                // it. Falls back to the original dst when no
-                                // inbound destination translation applies.
+                                // is out of scope here, so reconstruct the
+                                // post-translation dst tuple from the merged
+                                // `decision.nat`:
+                                //   - DNAT / static-DNAT / inbound NPTv6 each
+                                //     populate `decision.nat.rewrite_dst` (set at
+                                //     the decision build as `nptv6_nat.or(
+                                //     pre_routing_dnat)`), so the translated
+                                //     internal dst is used; only port-based DNAT
+                                //     also sets `rewrite_dst_port`.
+                                //   - NAT64 populates NEITHER `nptv6_nat` NOR
+                                //     `pre_routing_dnat`, so `decision.nat
+                                //     .rewrite_dst` is None here and the tuple
+                                //     falls back to `flow.dst_ip` (the synthetic
+                                //     IPv6 dst). That is the INTENDED NAT64
+                                //     exclusion — cross-family policy matching is
+                                //     not supported (see the long comment at the
+                                //     ForwardCandidate policy-tuple binding), and
+                                //     this fallback keeps the MissingNeighbor
+                                //     verdict identical to the ForwardCandidate
+                                //     path for NAT64.
+                                // Both halves fall back to the original dst/port
+                                // when no inbound destination translation applies.
                                 let policy_dst_ip =
                                     decision.nat.rewrite_dst.unwrap_or(flow.dst_ip);
                                 let policy_dst_port = decision
