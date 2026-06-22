@@ -348,11 +348,15 @@ the NAT module applies it:
 - **SNAT (pool mode):** Rewrite source IP to a configured source pool address
   and allocate a source port from the pool range. By default, pool address
   selection is round-robin within the packet address family. With global source
-  NAT `address-persistent`, the userspace dataplane hashes a domain tag,
-  address family, and canonical source IP bytes with SHA-256 to choose a stable
-  pool index. This is sticky within the current pool size and order; changing
-  either can remap existing source IPs to different pool addresses.
-  This is intentionally documented as a userspace-v1 algorithm, not
+  NAT `address-persistent`, the userspace dataplane hashes a domain-tag seed,
+  address family, and canonical source IP bytes with a seeded non-cryptographic
+  FxHash (`rustc_hash`) to choose a stable pool index (userspace-v2; #2349
+  replaced the prior SHA-256 selector — this is load distribution, not a
+  security primitive). See `docs/userspace-dataplane-gaps.md` (Source NAT pool
+  mode) for the authoritative algorithm/contract. This is sticky within the
+  current pool size and order; changing either can remap existing source IPs to
+  different pool addresses.
+  This is intentionally documented as a userspace-only algorithm, not
   mixed-backend new-flow parity: legacy eBPF uses C-word IPv4
   modulo and IPv6 lane-XOR selection (DPDK retired #1525). Active synced sessions carry the chosen
   translated tuple, but new allocations after backend rollback may choose a

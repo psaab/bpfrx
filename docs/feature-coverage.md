@@ -11,7 +11,7 @@ the userspace dataplane admission boundary is in
 - **Zone-based policies** with stateful inspection, address books,
   application matching (multi-term apps), global policies, filtered
   session clearing.
-- **NAT**: source (interface + pool, userspace-v1 address-persistent),
+- **NAT**: source (interface + pool, userspace-v2 address-persistent),
   destination (with hit counters), static 1:1, NAT64, NPTv6 (RFC 6296
   stateless prefix translation).
 - **Dual-stack**: IPv4 + IPv6, DHCPv4/v6 clients, embedded Router
@@ -138,7 +138,7 @@ The exact admission boundary is documented in
 | Stateful forwarding | Yes |
 | Zone + global policies | Yes |
 | Application matching | Yes |
-| Source NAT (interface + pool) | Interface and pool mode yes; userspace `address-persistent` uses a documented userspace-v1 hash. Non-HA per-pool `persistent-nat` lease reuse and pool exhaustion counters are implemented in helper-local runtime state; HA/restart persistence and cross-backend new-flow parity remain outside the current contract |
+| Source NAT (interface + pool) | Interface and pool mode yes; userspace `address-persistent` uses a documented userspace-v2 seeded FxHash selector (#2349 replaced the prior SHA-256; see `docs/userspace-dataplane-gaps.md` for the authoritative algorithm/contract). Non-HA per-pool `persistent-nat` lease reuse and pool exhaustion counters are implemented in helper-local runtime state; HA/restart persistence and cross-backend new-flow parity remain outside the current contract |
 | Destination NAT | Yes |
 | Static NAT (1:1) | Yes |
 | NAT64 (IPv6↔IPv4) | Yes; translates ICMP echo AND error messages (Destination-Unreachable, Time-Exceeded, Packet-Too-Big↔Fragmentation-Needed with MTU adjustment, Parameter-Problem) per RFC 7915 §4.2/§5.2, including the embedded quoted packet — so PMTUD and traceroute work across the boundary (#2219) |

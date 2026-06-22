@@ -23,8 +23,8 @@
 
 use super::source::SourceNatFlowKey;
 use rustc_hash::FxHashMap;
-use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
+use std::hash::Hasher;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -718,25 +718,44 @@ fn allocator_capacity(num_addresses: usize, port_low: u16, port_high: u16) -> us
         .min(usize::MAX as u64) as usize
 }
 
+/// Map a source IP to a sticky pool-address slot for `address-persistent`
+/// SNAT.
+///
+/// This is a load-distribution hash, not a security primitive: it only needs
+/// to be deterministic (same source IP → same slot for a given pool size),
+/// well-distributed across the pool, and cheap. It runs on the SNAT
+/// *allocation* path (first flow for an address-persistent source), so under
+/// connection churn a crypto hash is wasted work. We use a seeded FxHash
+/// (`rustc_hash`, already a dependency for the allocator's hash maps) instead
+/// of SHA-256 (#2349).
+///
+/// Stability scope: the mapping is computed live and is never persisted to
+/// disk or synced across HA — `persistent_by_source` is an in-memory map — so
+/// the only contract is same-source→same-slot within a process lifetime, and
+/// identical results across nodes running the same binary. The `-v2` seed is a
+/// hash-quality salt, not a cross-restart stability guarantee. Swapping the
+/// hash (SHA-256 → FxHash) changes which pool address a given source lands on;
+/// that is safe because existing sessions keep their already-allocated address
+/// and only new flows pick up the new mapping.
 pub(super) fn sticky_pool_index(src_ip: IpAddr, pool_len: usize) -> usize {
     if pool_len <= 1 {
         return 0;
     }
 
-    let mut hasher = Sha256::new();
-    hasher.update(b"xpf-userspace-snat-address-persistent-v1");
+    let mut hasher = rustc_hash::FxHasher::default();
+    // Seed with a fixed salt so the distribution does not key purely on the
+    // raw IP bytes (FxHash of a small contiguous run can correlate adjacent
+    // addresses).
+    hasher.write(b"xpf-userspace-snat-address-persistent-v2");
     match src_ip {
         IpAddr::V4(addr) => {
-            hasher.update([4]);
-            hasher.update(addr.octets());
+            hasher.write_u8(4);
+            hasher.write(&addr.octets());
         }
         IpAddr::V6(addr) => {
-            hasher.update([6]);
-            hasher.update(addr.octets());
+            hasher.write_u8(6);
+            hasher.write(&addr.octets());
         }
     }
-    let digest = hasher.finalize();
-    let mut first = [0u8; 8];
-    first.copy_from_slice(&digest[..8]);
-    (u64::from_be_bytes(first) % pool_len as u64) as usize
+    (hasher.finish() % pool_len as u64) as usize
 }
