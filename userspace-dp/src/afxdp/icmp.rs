@@ -342,12 +342,12 @@ pub(super) fn build_local_time_exceeded_v6(
 
 /// Build a local-origin ICMPv6 error message of the given type/code,
 /// reflecting L2 (MAC swap + ingress VLAN), sourcing the outer IP from
-/// the ingress interface primary v6, and quoting the inbound packet up
-/// to 48 bytes (well under the RFC 4443 minimum-MTU cap). The ICMPv6
-/// checksum (`checksum16_ipv6`) is computed over the pseudo-header and
-/// is type-agnostic, so this is shared by the Time Exceeded builder
-/// (type 3) and the #2089 reject Destination Unreachable builder
-/// (type 1, code 1).
+/// the ingress interface primary v6, and quoting as much of the inbound
+/// packet as fits under the RFC 4443 §3 minimum-MTU cap (1280 bytes; see
+/// #2242). The ICMPv6 checksum (`checksum16_ipv6`) is computed over the
+/// pseudo-header and is type-agnostic, so this is shared by the Time
+/// Exceeded builder (type 3) and the #2089 reject Destination
+/// Unreachable builder (type 1, code 1).
 pub(super) fn build_local_icmp_error_v6(
     frame: &[u8],
     meta: UserspaceDpMeta,
@@ -371,7 +371,18 @@ pub(super) fn build_local_icmp_error_v6(
     let dst_ip = Ipv6Addr::from(<[u8; 16]>::try_from(packet.get(8..24)?).ok()?);
     let payload_len = u16::from_be_bytes([packet[4], packet[5]]) as usize;
     let packet_len = (40 + payload_len).min(packet.len());
-    let quoted_len = packet_len.min(48);
+    // #2242: RFC 4443 §3 — include as much of the invoking packet as
+    // possible without the ICMPv6 error message exceeding the IPv6
+    // minimum MTU (1280). The ICMPv6 packet is the outer IPv6 header (40)
+    // + ICMPv6 header (8) + quoted bytes, so the quote is capped at
+    // 1280 - 40 - 8 = 1232 and bounded by the actual invoking packet
+    // length. The previous fixed 48-byte quote (40-byte IPv6 base header
+    // + only 8 bytes) omitted the transport header whenever IPv6
+    // extension headers pushed it past byte 48, so the receiver could not
+    // demux the error back to a socket. The UMEM frame is 4096 bytes, so
+    // the 1232-byte cap never overruns the TX buffer.
+    const ICMPV6_QUOTE_MAX: usize = 1280 - 40 - 8;
+    let quoted_len = packet_len.min(ICMPV6_QUOTE_MAX);
     // #2149: preserve the inbound tag (TPID + PCP + DEI + VID) on the
     // reflected error; fall back to the egress configured VID when
     // ingress was untagged. See the v4 builder for the rationale.

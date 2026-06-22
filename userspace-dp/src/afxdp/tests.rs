@@ -7550,3 +7550,117 @@ fn te_suppressed_for_multicast_source_v6() {
         "a hop-limit=1 packet from a multicast source MUST NOT elicit a Time Exceeded"
     );
 }
+
+// ---- #2242: ICMPv6 error quote length includes transport header behind
+//      extension headers, bounded by the 1280 IPv6 minimum MTU. ----
+
+#[test]
+fn icmpv6_error_quotes_transport_header_behind_ext_headers() {
+    let src: Ipv6Addr = "2001:559:8585:61::102".parse().unwrap();
+    let dst: Ipv6Addr = "2606:4700:4700::1111".parse().unwrap();
+    // Build an inbound IPv6 packet: base header (next-header = 60,
+    // Destination Options) + a 56-byte (7*8) dest-options ext header
+    // (pushing the transport header well past byte 48) + an 8-byte TCP-ish
+    // header carrying a recognizable marker.
+    let ext_len_units: usize = 6; // hdr-ext-len = 6 -> (6+1)*8 = 56 bytes
+    let ext_bytes = (ext_len_units + 1) * 8;
+    let marker = [0xDEu8, 0xAD, 0xBE, 0xEF, 0x00, 0x50, 0x01, 0xBB];
+    let payload_len = ext_bytes + marker.len();
+
+    let mut frame = Vec::new();
+    write_eth_header(&mut frame, FW_MAC, [0x02, 0x11, 0x22, 0x33, 0x44, 0x55], 0, 0x86dd);
+    let l3 = frame.len();
+    frame.extend_from_slice(&[0x60, 0, 0, 0]);
+    frame.extend_from_slice(&(payload_len as u16).to_be_bytes());
+    frame.push(60); // next-header = Destination Options
+    frame.push(1); // hop-limit 1 -> expires
+    frame.extend_from_slice(&src.octets());
+    frame.extend_from_slice(&dst.octets());
+    // Destination Options ext header: next-header = TCP, hdr-ext-len.
+    frame.push(PROTO_TCP);
+    frame.push(ext_len_units as u8);
+    frame.resize(frame.len() + (ext_bytes - 2), 0); // pad-1/pad-N filler
+    let transport_off = frame.len();
+    frame.extend_from_slice(&marker);
+
+    // L4 offset (post-ext-header) is past byte 48 of the L3 payload.
+    assert!(
+        transport_off - l3 > 48,
+        "test setup: transport header must start past byte 48"
+    );
+    let meta = icmp_guard_meta_v6(PROTO_TCP, transport_off as u16);
+    let flow = icmp_guard_flow_v6(src, dst, PROTO_TCP);
+
+    let req = run_local_te(&frame, meta, &flow, &icmp_guard_forwarding())
+        .expect("ext-header IPv6 TTL=1 packet must elicit a Time Exceeded");
+    let PendingForwardFrame::Prebuilt(out) = &req.frame else {
+        panic!("expected a prebuilt Time Exceeded frame");
+    };
+
+    // Locate the start of the quoted invoking packet in the generated
+    // error: Eth (14, untagged) + outer IPv6 (40) + ICMPv6 header (8).
+    let quote_start = 14 + 40 + 8;
+    let quoted = &out[quote_start..];
+    // The whole invoking packet (40 base + ext + marker) is < 1232, so
+    // it must be quoted in full — including the transport marker.
+    let inbound_l3 = &frame[l3..];
+    assert!(
+        quoted.len() >= inbound_l3.len(),
+        "quote ({} B) must include the full invoking packet ({} B) — \
+         the fixed-48 quote omitted everything past byte 48",
+        quoted.len(),
+        inbound_l3.len()
+    );
+    // The transport marker (the 8 bytes at transport_off) must appear in
+    // the quote at the expected offset.
+    let marker_in_quote = &quoted[(transport_off - l3)..(transport_off - l3) + marker.len()];
+    assert_eq!(
+        marker_in_quote, &marker,
+        "the quoted invoking packet must include the transport header behind the ext headers"
+    );
+    // RFC 4443 §3: the ICMPv6 packet (outer IPv6 onward) must not exceed
+    // the 1280 minimum MTU.
+    let icmpv6_packet_len = out.len() - 14; // strip Ethernet
+    assert!(
+        icmpv6_packet_len <= 1280,
+        "ICMPv6 error packet ({icmpv6_packet_len} B) must not exceed the 1280 minimum MTU"
+    );
+}
+
+#[test]
+fn icmpv6_error_quote_capped_at_min_mtu() {
+    let src: Ipv6Addr = "2001:559:8585:61::102".parse().unwrap();
+    let dst: Ipv6Addr = "2606:4700:4700::1111".parse().unwrap();
+    // Build an oversized inbound IPv6 packet (> 1280 after L3) so the
+    // quote must be clamped to the minimum-MTU cap, not the packet length.
+    let big_payload = vec![0x41u8; 1600];
+    let payload_len = big_payload.len();
+    let mut frame = Vec::new();
+    write_eth_header(&mut frame, FW_MAC, [0x02, 0x11, 0x22, 0x33, 0x44, 0x55], 0, 0x86dd);
+    frame.extend_from_slice(&[0x60, 0, 0, 0]);
+    frame.extend_from_slice(&(payload_len as u16).to_be_bytes());
+    frame.push(PROTO_UDP);
+    frame.push(1);
+    frame.extend_from_slice(&src.octets());
+    frame.extend_from_slice(&dst.octets());
+    frame.extend_from_slice(&big_payload);
+
+    let meta = icmp_guard_meta_v6(PROTO_UDP, 54);
+    let flow = icmp_guard_flow_v6(src, dst, PROTO_UDP);
+    let req = run_local_te(&frame, meta, &flow, &icmp_guard_forwarding())
+        .expect("oversized IPv6 TTL=1 packet must elicit a Time Exceeded");
+    let PendingForwardFrame::Prebuilt(out) = &req.frame else {
+        panic!("expected a prebuilt Time Exceeded frame");
+    };
+    let icmpv6_packet_len = out.len() - 14;
+    assert!(
+        icmpv6_packet_len <= 1280,
+        "ICMPv6 error packet ({icmpv6_packet_len} B) must be clamped to the 1280 minimum MTU"
+    );
+    // And it must be close to the cap (the quote is the dominant term):
+    // outer IPv6 (40) + ICMPv6 (8) + 1232 = 1280.
+    assert_eq!(
+        icmpv6_packet_len, 1280,
+        "the quote must fill up to exactly the 1280 cap for an oversized invoking packet"
+    );
+}

@@ -9827,3 +9827,22 @@ top.
   **File(s)**: userspace-dp/src/afxdp/icmp.rs,
   userspace-dp/src/afxdp/mod.rs, userspace-dp/src/afxdp/tests.rs,
   userspace-dp/src/afxdp/README.md, _Log.md
+- **Timestamp**: 2026-06-21
+  **Action**: #2242 (LOW) — RFC 4443 §3 quote length on the
+  locally-generated ICMPv6 error builder. `build_local_icmp_error_v6`
+  quoted a fixed 48 bytes (40-byte IPv6 base header + only 8), which
+  omitted the transport header whenever IPv6 extension headers pushed it
+  past byte 48 — so the receiver could not demux the error back to a
+  socket (broken PMTUD/traceroute diagnostics). Now quotes up to the
+  RFC 4443 §3 minimum-MTU cap: `1280 - 40 - 8 = 1232` bytes, bounded by
+  the actual invoking packet length. The IPv4 builder keeps the RFC 792
+  minimum (IHL + 8) — correct for v4. The UMEM frame is 4096 B so the
+  larger quote never overruns the TX buffer. Tests (2 new,
+  fail-on-revert): an ICMPv6 error for a packet with a 56-byte
+  Destination-Options ext header asserts the quote includes the transport
+  marker behind the ext headers (and the whole ICMPv6 packet stays under
+  1280); an oversized invoking packet asserts the quote clamps to exactly
+  the 1280 cap. Reverting to the fixed-48 quote fails both.
+  **File(s)**: userspace-dp/src/afxdp/icmp.rs,
+  userspace-dp/src/afxdp/tests.rs, userspace-dp/src/afxdp/README.md,
+  _Log.md

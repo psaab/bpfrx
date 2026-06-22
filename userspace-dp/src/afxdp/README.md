@@ -73,9 +73,13 @@ sync.
   ICMP/ICMPv6 error (storm/amplification), a non-first IP fragment
   (no transport context), a multicast/broadcast destination (L3 or L2),
   or a non-unique source (unspecified/loopback/multicast/broadcast) —
-  one source of truth so the two generators cannot drift. The reflected
-  error carries the inbound VLAN TCI verbatim (see the `frame/` note
-  above).
+  one source of truth so the two generators cannot drift. The ICMPv6
+  builder quotes as much of the invoking packet as fits under the
+  RFC 4443 §3 minimum-MTU cap (1280 = 40 IPv6 + 8 ICMPv6 + 1232 quote)
+  so the transport header is included even behind extension headers
+  (#2242, was a fixed 48 bytes). The IPv4 builder quotes the RFC 792
+  minimum (IHL + 8). The reflected error carries the inbound VLAN TCI
+  verbatim (see the `frame/` note above).
 - `event_emit.rs` — fixed-size, non-blocking RT_FLOW event producers
   for userspace policy-deny, screen-drop, logged PBR filter hits, and
   non-PBR input/output/lo0 filter logs. Output filter-log identity is
