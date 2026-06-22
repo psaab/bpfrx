@@ -1009,28 +1009,48 @@ fn wg_send_to(
 /// v6 peers. Best-effort: a failure is logged via the return value being
 /// ignored by the caller — the combine is simply skipped when no cmsg
 /// arrives, which is the pre-#2317 behavior, so this is never fatal.
+/// #2317: enable outer-TOS ancillary delivery (`IP_RECVTOS` /
+/// `IPV6_RECVTCLASS`) on a WG UDP socket so the decap ECN combine can see
+/// the outer DS byte the kernel UDP stack otherwise strips. Best-effort:
+/// a kernel that rejects the sockopt (very old, or a restricted sandbox)
+/// simply delivers no TOS cmsg and the combine is skipped (outer_ecn =
+/// None). A failure is logged once here — this runs only at socket
+/// creation, never on the packet path — so an operator can see why ECN
+/// propagation is inactive.
 fn set_recv_tos_options(fd: i32, socket_is_v6: bool) {
     let on: libc::c_int = 1;
     // IP_RECVTOS — outer IPv4 TOS (also delivered for v4-mapped peers on
     // the dual-stack socket).
-    unsafe {
+    let rc = unsafe {
         libc::setsockopt(
             fd,
             libc::IPPROTO_IP,
             libc::IP_RECVTOS,
             &on as *const _ as *const libc::c_void,
             std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if rc != 0 {
+        eprintln!(
+            "xpf-wg: IP_RECVTOS not enabled (fd {fd}): {} — decap ECN combine inactive for v4",
+            io::Error::last_os_error()
         );
     }
     if socket_is_v6 {
         // IPV6_RECVTCLASS — outer IPv6 Traffic Class for native v6 peers.
-        unsafe {
+        let rc6 = unsafe {
             libc::setsockopt(
                 fd,
                 libc::IPPROTO_IPV6,
                 libc::IPV6_RECVTCLASS,
                 &on as *const _ as *const libc::c_void,
                 std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if rc6 != 0 {
+            eprintln!(
+                "xpf-wg: IPV6_RECVTCLASS not enabled (fd {fd}): {} — decap ECN combine inactive for v6",
+                io::Error::last_os_error()
             );
         }
     }
@@ -1081,7 +1101,16 @@ fn wg_recvmsg(socket: &UdpSocket, buf: &mut [u8]) -> io::Result<WgRecv> {
     let len = n as usize;
     let from = sockaddr_storage_to_socketaddr(&storage, msg.msg_namelen)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "recvmsg bad sockaddr"))?;
-    let outer_ecn = parse_outer_ecn_from_cmsg(&msg);
+    // If the kernel truncated the ancillary data (MSG_CTRUNC), the cmsg
+    // chain may be incomplete — don't trust it for the best-effort ECN.
+    // The 256-byte control buffer is sized so this never triggers for a
+    // single ~20-byte TOS cmsg, but skip defensively rather than walk a
+    // partial chain (worst case: the decap combine is skipped this once).
+    let outer_ecn = if msg.msg_flags & libc::MSG_CTRUNC != 0 {
+        None
+    } else {
+        parse_outer_ecn_from_cmsg(&msg)
+    };
     Ok(WgRecv {
         len,
         from,
@@ -1113,11 +1142,14 @@ fn parse_outer_ecn_from_cmsg(msg: &libc::msghdr) -> Option<u8> {
             let is_v6_tclass = level == libc::IPPROTO_IPV6 && ctype == libc::IPV6_TCLASS;
             if is_v4_tos || is_v6_tclass {
                 let data = libc::CMSG_DATA(cmsg);
-                // cmsg_len includes the header; payload length is the
-                // remainder. Require at least one byte of payload.
-                let payload_len =
-                    (*cmsg).cmsg_len as usize - (libc::CMSG_DATA(cmsg) as usize - cmsg as usize);
-                if payload_len >= 1 {
+                // cmsg_len includes the header; the payload starts at
+                // CMSG_DATA. Guard with `>=` against a malformed/truncated
+                // cmsg_len shorter than the header offset (a raw
+                // subtraction would underflow the unsigned length): require
+                // cmsg_len to cover the header plus at least one payload
+                // byte before reading the DS byte.
+                let data_off = data as usize - cmsg as usize;
+                if (*cmsg).cmsg_len as usize >= data_off + 1 {
                     let ds = *data;
                     return Some(ds & 0x03);
                 }
