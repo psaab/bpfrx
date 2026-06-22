@@ -118,17 +118,32 @@ fn ipv4_df_set(packet: &[u8]) -> bool {
 
 /// RFC error-suppression gate shared by the PTB path. Mirrors the reject
 /// path: never reply to a non-first fragment (no transport header to quote
-/// / key), to a trigger packet whose destination was multicast/broadcast
-/// (RFC 1812 §4.3.2.7 / RFC 4443 §2.4(e), #2314 — a multicast flood must
-/// not be amplified into an ICMP-error backscatter storm), or to an
-/// inbound ICMP/ICMPv6 *error* message (avoid error loops and
-/// amplification). Returns true when a PTB MUST be suppressed.
+/// / key), to a trigger frame whose link-layer (L2) destination was
+/// group/broadcast (RFC 1812 §4.3.2.7 / RFC 4443 §2.4(e), #2325 — a
+/// datagram delivered as an L2 broadcast/multicast must not generate an
+/// error), to a trigger packet whose IP (L3) destination was
+/// multicast/broadcast (#2314 — a multicast flood must not be amplified
+/// into an ICMP-error backscatter storm), or to an inbound ICMP/ICMPv6
+/// *error* message (avoid error loops and amplification). Returns true
+/// when a PTB MUST be suppressed.
 #[inline]
 pub(in crate::afxdp) fn ptb_reply_suppressed(
     frame: &[u8],
     meta: UserspaceDpMeta,
     l3_offset: usize,
 ) -> bool {
+    // #2325: never generate a PTB in reply to a datagram delivered as an
+    // L2 broadcast/multicast frame. This gives the PTB path the same L2
+    // suppression that the reject / Time-Exceeded path
+    // (`can_generate_icmp_error_reply`) has. `frame` is the full trigger
+    // ethernet frame (the same slice the PTB builders read the reflected
+    // destination MAC from), so the L2 dst is the first 6 bytes.
+    if let Some(eth_dst) = frame.get(0..6)
+        && let Ok(eth_dst) = <&[u8; 6]>::try_from(eth_dst)
+        && l2_dst_is_group_or_broadcast(eth_dst)
+    {
+        return true;
+    }
     let Some(packet) = frame.get(l3_offset..) else {
         return true;
     };

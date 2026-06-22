@@ -41,11 +41,13 @@ pub(super) fn can_generate_icmp_error_reply(frame: &[u8], meta: UserspaceDpMeta)
     };
 
     // (c) L2 destination: never reply to a broadcast/multicast frame.
-    // The low bit of the first MAC octet is the I/G (group) bit; the
-    // all-ones MAC is broadcast (a special case of group). frame[0]
-    // exists because frame_l3_offset/the 14|18 match imply >= 14 bytes.
-    if let Some(&l2_dst0) = frame.first()
-        && (l2_dst0 & 0x01) != 0
+    // The destination MAC is the first 6 frame bytes (present because
+    // frame_l3_offset / the 14|18 match imply >= 14 bytes). Routes
+    // through the shared #2325 predicate so the PTB and reject/TE paths
+    // agree on the L2 group/broadcast test.
+    if let Some(eth_dst) = frame.get(0..6)
+        && let Ok(eth_dst) = <&[u8; 6]>::try_from(eth_dst)
+        && l2_dst_is_group_or_broadcast(eth_dst)
     {
         return false;
     }

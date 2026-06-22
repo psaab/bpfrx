@@ -89,9 +89,15 @@ sync.
   (RFC 1812 §4.3.2.7 / RFC 4443 §2.4(e)), sharing the
   `dest_is_multicast_or_broadcast` predicate (`frame/inspect.rs`) with
   `icmp.rs`'s `can_generate_icmp_error_reply` so the PTB, reject, and
-  Time Exceeded paths agree. No new counter: a suppressed PTB is folded
-  into the existing fail-closed silent-drop path (the oversized original
-  is still dropped via `mtu_signalled`).
+  Time Exceeded paths agree on the L3 destination test. #2325: the same
+  gate now also drops PTBs triggered by a datagram delivered as a
+  link-layer (L2) broadcast/multicast frame, giving the PTB path the same
+  L2+L3 suppression the reject / Time-Exceeded path already had — both
+  call the shared `l2_dst_is_group_or_broadcast` predicate
+  (`frame/inspect.rs`, the IEEE I/G group bit on the destination MAC's
+  first octet; all-FF broadcast is a group address). No new counter: a
+  suppressed PTB is folded into the existing fail-closed silent-drop path
+  (the oversized original is still dropped via `mtu_signalled`).
 - `cos/` — Class-of-Service scheduler: token-bucket admission, MQFQ
   active-bucket selection, fair-share lease (#1229 Phase 6 v8). See
   `docs/per-5-tuple/state.md` for the architectural ceiling.
