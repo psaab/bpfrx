@@ -1,5 +1,22 @@
 # Action Log
 
+## 2026-06-21 — #2237/#2242 ICMP error-generation RFC suppression + v6 quote length
+
+- **Timestamp**: 2026-06-21
+- **Action**: #2237 — added shared RFC 1812 §4.3.2.7 / RFC 4443 §2.4
+  suppression gate `can_generate_icmp_error_reply(frame, meta)` covering
+  (a) inbound ICMP/ICMPv6 *error* triggers, (b) non-first IP fragments,
+  (c) L2/L3 broadcast/multicast destinations, (d) bogus IP sources
+  (unspecified/loopback/multicast/broadcast). Wired it into the
+  generation call site `build_local_time_exceeded_request()` (after the
+  TTL gate) AND `build_reject_icmp_unreachable()` (replacing the prior
+  narrower inline non-first-fragment + icmp-error checks). #2242 — the
+  ICMPv6 error builder now quotes up to 1232 bytes (1280 - 40 outer IPv6
+  - 8 ICMPv6 header), bounded by packet length, so the transport header
+  is included even behind IPv6 extension headers (was a fixed 48-byte
+  cap). Hot path: cheap field reads, no per-packet alloc; fast path
+  (normal TTL) untouched — the gate runs only after TTL <= 1.
+- **File(s)**: userspace-dp/src/afxdp/icmp.rs
 ## 2026-06-21 — #2299/#2300/#2303 WG MSS clamp + outer-MTU SSOT + tunnel DSCP/ECN
 
 - **Timestamp**: 2026-06-21

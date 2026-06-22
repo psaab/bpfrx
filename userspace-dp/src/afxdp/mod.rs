@@ -160,7 +160,7 @@ use self::icmp_ptb::{
 #[cfg(test)]
 use self::icmp::{
     build_local_time_exceeded_v4, build_local_time_exceeded_v6, build_reject_icmp_unreachable,
-    packet_ttl_would_expire, reject_icmp_reply_suppressed,
+    can_generate_icmp_error_reply, packet_ttl_would_expire, reject_icmp_reply_suppressed,
 };
 #[cfg(test)]
 use self::icmp_embed::{

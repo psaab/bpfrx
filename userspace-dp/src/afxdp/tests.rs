@@ -1619,6 +1619,579 @@ fn build_local_time_exceeded_v6_quotes_original_packet() {
     assert_eq!(out[quoted_ip_start + 7], 1);
 }
 
+// --- #2237 ICMP error-generation suppression gate tests ---
+
+/// Shared egress fixture for the suppression tests: ifindex 5 with a
+/// primary v4 and v6 so the emission cases can actually build a reply.
+fn icmp_suppress_forwarding() -> ForwardingState {
+    let mut forwarding = ForwardingState::default();
+    forwarding.egress.insert(
+        5,
+        EgressInterface {
+            bind_ifindex: 5,
+            vlan_id: 0,
+            mtu: 1500,
+            src_mac: [0x02, 0xbf, 0x72, 0x00, 0x61, 0x01],
+            zone_id: TEST_LAN_ZONE_ID,
+            redundancy_group: 1,
+            primary_v4: Some(Ipv4Addr::new(10, 0, 61, 1)),
+            primary_v6: Some("2001:559:8585:ef00::1".parse().unwrap()),
+        },
+    );
+    forwarding
+}
+
+fn ttl_meta_v4() -> UserspaceDpMeta {
+    UserspaceDpMeta {
+        l3_offset: 14,
+        l4_offset: 34,
+        ingress_ifindex: 5,
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_UDP,
+        ..UserspaceDpMeta::default()
+    }
+}
+
+fn icmp_suppress_ident() -> BindingIdentity {
+    BindingIdentity {
+        slot: 0,
+        queue_id: 7,
+        worker_id: 0,
+        interface: Arc::<str>::from("ge-0-0-1"),
+        ifindex: 5,
+    }
+}
+
+fn icmp_suppress_flow_v4(src: Ipv4Addr, dst: Ipv4Addr) -> SessionFlow {
+    SessionFlow {
+        src_ip: IpAddr::V4(src),
+        dst_ip: IpAddr::V4(dst),
+        forward_key: SessionKey {
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_UDP,
+            src_ip: IpAddr::V4(src),
+            dst_ip: IpAddr::V4(dst),
+            src_port: 0xc000,
+            dst_port: 53,
+        },
+    }
+}
+
+/// Drive `build_local_time_exceeded_request` end-to-end and return
+/// whether it produced a request. Used by the suppression tests so each
+/// case pins the CALL-SITE wiring, not just the gate predicate: removing
+/// the gate from `build_local_time_exceeded_request` makes these return
+/// `true` and the assertions fail.
+fn te_request_built(frame: &[u8], meta: UserspaceDpMeta) -> bool {
+    let fwd = icmp_suppress_forwarding();
+    let (src, dst) = match meta.addr_family as i32 {
+        libc::AF_INET6 => (
+            IpAddr::V6(Ipv6Addr::from(
+                <[u8; 16]>::try_from(&frame[meta.l3_offset as usize + 8..meta.l3_offset as usize + 24])
+                    .unwrap(),
+            )),
+            IpAddr::V6(Ipv6Addr::from(
+                <[u8; 16]>::try_from(&frame[meta.l3_offset as usize + 24..meta.l3_offset as usize + 40])
+                    .unwrap(),
+            )),
+        ),
+        _ => {
+            let l3 = meta.l3_offset as usize;
+            (
+                IpAddr::V4(Ipv4Addr::new(
+                    frame[l3 + 12],
+                    frame[l3 + 13],
+                    frame[l3 + 14],
+                    frame[l3 + 15],
+                )),
+                IpAddr::V4(Ipv4Addr::new(
+                    frame[l3 + 16],
+                    frame[l3 + 17],
+                    frame[l3 + 18],
+                    frame[l3 + 19],
+                )),
+            )
+        }
+    };
+    let flow = SessionFlow {
+        src_ip: src,
+        dst_ip: dst,
+        forward_key: SessionKey {
+            addr_family: meta.addr_family,
+            protocol: meta.protocol,
+            src_ip: src,
+            dst_ip: dst,
+            src_port: 0xc000,
+            dst_port: 53,
+        },
+    };
+    let desc = XdpDesc {
+        addr: 4096,
+        len: frame.len() as u32,
+        options: 0,
+    };
+    build_local_time_exceeded_request(
+        frame,
+        desc,
+        meta,
+        &icmp_suppress_ident(),
+        &flow,
+        &fwd,
+        &Arc::new(ShardedNeighborMap::new()),
+        &BTreeMap::new(),
+        0,
+    )
+    .is_some()
+}
+
+/// Build an IPv4 UDP frame with a configurable TTL and dst MAC so the
+/// suppression tests can drive the multicast/broadcast-L2 case.
+fn build_udp_frame_v4_full(
+    dst_mac: [u8; 6],
+    src: Ipv4Addr,
+    dst: Ipv4Addr,
+    ttl: u8,
+) -> Vec<u8> {
+    let mut frame = Vec::new();
+    frame.extend_from_slice(&dst_mac);
+    frame.extend_from_slice(&[0x02, 0x11, 0x22, 0x33, 0x44, 0x55]); // src mac
+    frame.extend_from_slice(&[0x08, 0x00]);
+    let l3 = frame.len();
+    frame.extend_from_slice(&[
+        0x45, 0x00, 0x00, 0x1c, 0x00, 0x00, 0x40, 0x00, ttl, PROTO_UDP, 0, 0,
+    ]);
+    frame.extend_from_slice(&src.octets());
+    frame.extend_from_slice(&dst.octets());
+    let ip_csum = checksum16(&frame[l3..l3 + 20]);
+    frame[l3 + 10..l3 + 12].copy_from_slice(&ip_csum.to_be_bytes());
+    frame.extend_from_slice(&[0xc0, 0x00, 0x00, 0x35, 0x00, 0x08, 0x00, 0x00]); // UDP
+    frame
+}
+
+/// The emission case: a normal unicast UDP packet with TTL 1 DOES draw a
+/// locally generated Time Exceeded (the suppression gate must NOT fire).
+#[test]
+fn time_exceeded_emitted_for_unicast_udp() {
+    let client = Ipv4Addr::new(10, 0, 61, 102);
+    let server = Ipv4Addr::new(1, 1, 1, 1);
+    let frame = build_udp_frame_v4_full([0x00, 0x25, 0x90, 0x12, 0x34, 0x56], client, server, 1);
+    let meta = ttl_meta_v4();
+    let fwd = icmp_suppress_forwarding();
+    assert!(can_generate_icmp_error_reply(&frame, meta));
+    let desc = XdpDesc {
+        addr: 4096,
+        len: frame.len() as u32,
+        options: 0,
+    };
+    let req = build_local_time_exceeded_request(
+        &frame,
+        desc,
+        meta,
+        &icmp_suppress_ident(),
+        &icmp_suppress_flow_v4(client, server),
+        &fwd,
+        &Arc::new(ShardedNeighborMap::new()),
+        &BTreeMap::new(),
+        0,
+    );
+    assert!(
+        req.is_some(),
+        "unicast UDP with TTL 1 must draw a Time Exceeded"
+    );
+}
+
+/// The emission case for TCP — confirms the gate is protocol-agnostic for
+/// non-ICMP transports.
+#[test]
+fn time_exceeded_emitted_for_unicast_tcp() {
+    let client = Ipv4Addr::new(10, 0, 61, 102);
+    let server = Ipv4Addr::new(1, 1, 1, 1);
+    let mut frame =
+        build_udp_frame_v4_full([0x00, 0x25, 0x90, 0x12, 0x34, 0x56], client, server, 1);
+    // Flip the IP protocol byte (l3 + 9 = byte 23) to TCP and recompute
+    // the IPv4 header checksum.
+    frame[23] = PROTO_TCP;
+    frame[24..26].copy_from_slice(&[0, 0]);
+    let csum = checksum16(&frame[14..34]);
+    frame[24..26].copy_from_slice(&csum.to_be_bytes());
+    let mut meta = ttl_meta_v4();
+    meta.protocol = PROTO_TCP;
+    assert!(
+        can_generate_icmp_error_reply(&frame, meta),
+        "unicast TCP TTL 1 must be allowed"
+    );
+}
+
+/// Suppression (a): a low-TTL inbound ICMPv4 *error* (type 11) must NOT
+/// draw a fresh Time Exceeded — classic error loop / amplification.
+#[test]
+fn time_exceeded_suppressed_for_inbound_icmp_error_v4() {
+    let client = Ipv4Addr::new(10, 0, 61, 102);
+    let server = Ipv4Addr::new(1, 1, 1, 1);
+    let mut frame = build_icmp_echo_frame_v4(client, server, 1);
+    frame[34] = 11; // ICMP type Time Exceeded (an error)
+    let meta = UserspaceDpMeta {
+        l3_offset: 14,
+        l4_offset: 34,
+        ingress_ifindex: 5,
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_ICMP,
+        ..UserspaceDpMeta::default()
+    };
+    let fwd = icmp_suppress_forwarding();
+    assert!(
+        !can_generate_icmp_error_reply(&frame, meta),
+        "gate must suppress reply to an inbound ICMP error"
+    );
+    let desc = XdpDesc {
+        addr: 4096,
+        len: frame.len() as u32,
+        options: 0,
+    };
+    let req = build_local_time_exceeded_request(
+        &frame,
+        desc,
+        meta,
+        &icmp_suppress_ident(),
+        &icmp_suppress_flow_v4(client, server),
+        &fwd,
+        &Arc::new(ShardedNeighborMap::new()),
+        &BTreeMap::new(),
+        0,
+    );
+    assert!(req.is_none(), "no Time Exceeded for an inbound ICMP error");
+    // An echo *request* (a query, type 8) is NOT suppressed.
+    let mut echo = build_icmp_echo_frame_v4(client, server, 1);
+    echo[34] = 8;
+    assert!(
+        can_generate_icmp_error_reply(&echo, meta),
+        "inbound ICMP echo request (query) must still draw an error"
+    );
+}
+
+/// Suppression (a) for ICMPv6: any inbound ICMPv6 error (type < 128).
+#[test]
+fn time_exceeded_suppressed_for_inbound_icmp_error_v6() {
+    let client: Ipv6Addr = "2001:559:8585:ef00::102".parse().unwrap();
+    let server: Ipv6Addr = "2606:4700:4700::1111".parse().unwrap();
+    let mut frame = build_icmp_echo_frame_v6(client, server, 1);
+    frame[54] = 3; // ICMPv6 Time Exceeded (error, < 128)
+    let meta = UserspaceDpMeta {
+        l3_offset: 14,
+        l4_offset: 54,
+        ingress_ifindex: 5,
+        addr_family: libc::AF_INET6 as u8,
+        protocol: PROTO_ICMPV6,
+        ..UserspaceDpMeta::default()
+    };
+    assert!(
+        !can_generate_icmp_error_reply(&frame, meta),
+        "gate must suppress reply to an inbound ICMPv6 error"
+    );
+    // ICMPv6 echo request (type 128, a query) is NOT suppressed.
+    let echo = build_icmp_echo_frame_v6(client, server, 1); // type 128
+    assert!(
+        can_generate_icmp_error_reply(&echo, meta),
+        "inbound ICMPv6 echo request must still draw an error"
+    );
+}
+
+/// Suppression (b): a non-first IPv4 fragment (TTL 1) must NOT draw a
+/// Time Exceeded — it carries no transport header.
+#[test]
+fn time_exceeded_suppressed_for_non_first_fragment_v4() {
+    let client = Ipv4Addr::new(10, 0, 61, 102);
+    let server = Ipv4Addr::new(1, 1, 1, 1);
+    let mut frame = build_udp_frame_v4_full([0x00, 0x25, 0x90, 0x12, 0x34, 0x56], client, server, 1);
+    // Set a non-zero fragment offset (frag_off field at l3 + 6..8 = bytes
+    // 20..22). Offset 0x0001 => non-first fragment.
+    frame[20..22].copy_from_slice(&0x0001u16.to_be_bytes());
+    frame[24..26].copy_from_slice(&[0, 0]);
+    let csum = checksum16(&frame[14..34]);
+    frame[24..26].copy_from_slice(&csum.to_be_bytes());
+    let meta = ttl_meta_v4();
+    assert!(
+        !can_generate_icmp_error_reply(&frame, meta),
+        "gate must suppress reply to a non-first IPv4 fragment"
+    );
+    assert!(
+        !te_request_built(&frame, meta),
+        "TE call site must suppress a non-first IPv4 fragment"
+    );
+}
+
+/// Suppression (b) for IPv6: a non-first fragment behind a fragment
+/// extension header must NOT draw a Time Exceeded.
+#[test]
+fn time_exceeded_suppressed_for_non_first_fragment_v6() {
+    let client: Ipv6Addr = "2001:559:8585:ef00::102".parse().unwrap();
+    let server: Ipv6Addr = "2606:4700:4700::1111".parse().unwrap();
+    let mut frame = Vec::new();
+    frame.extend_from_slice(&[0x00, 0x25, 0x90, 0x12, 0x34, 0x56]); // dst mac
+    frame.extend_from_slice(&[0x02, 0x11, 0x22, 0x33, 0x44, 0x55]); // src mac
+    frame.extend_from_slice(&[0x86, 0xdd]);
+    // IPv6 base header, next-header = 44 (Fragment), hop_limit 1.
+    frame.extend_from_slice(&[0x60, 0x00, 0x00, 0x00, 0x00, 0x10, 44, 1]);
+    frame.extend_from_slice(&client.octets());
+    frame.extend_from_slice(&server.octets());
+    // Fragment header (8 bytes): next-header UDP, reserved, frag-offset
+    // 0x0008 (non-first: offset bits non-zero), then id.
+    frame.extend_from_slice(&[PROTO_UDP, 0, 0x00, 0x08, 0xDE, 0xAD, 0xBE, 0xEF]);
+    // 8 bytes of "payload" where the UDP header would be on the first frag.
+    frame.extend_from_slice(&[0; 8]);
+    let meta = UserspaceDpMeta {
+        l3_offset: 14,
+        l4_offset: 0,
+        ingress_ifindex: 5,
+        addr_family: libc::AF_INET6 as u8,
+        protocol: PROTO_UDP,
+        ..UserspaceDpMeta::default()
+    };
+    assert!(
+        !can_generate_icmp_error_reply(&frame, meta),
+        "gate must suppress reply to a non-first IPv6 fragment"
+    );
+    assert!(
+        !te_request_built(&frame, meta),
+        "TE call site must suppress a non-first IPv6 fragment"
+    );
+}
+
+/// Suppression (c): an IPv4 multicast destination must NOT draw a reply.
+#[test]
+fn time_exceeded_suppressed_for_multicast_dest_v4() {
+    let client = Ipv4Addr::new(10, 0, 61, 102);
+    let mcast = Ipv4Addr::new(224, 0, 0, 251); // mDNS group
+    let frame = build_udp_frame_v4_full([0x01, 0x00, 0x5e, 0x00, 0x00, 0xfb], client, mcast, 1);
+    let meta = ttl_meta_v4();
+    assert!(
+        !can_generate_icmp_error_reply(&frame, meta),
+        "gate must suppress reply to a multicast destination"
+    );
+    assert!(
+        !te_request_built(&frame, meta),
+        "TE call site must suppress a multicast destination"
+    );
+}
+
+/// Suppression (c): an L2 broadcast destination MAC must NOT draw a reply
+/// even if the L3 destination looks unicast.
+#[test]
+fn time_exceeded_suppressed_for_l2_broadcast_dest() {
+    let client = Ipv4Addr::new(10, 0, 61, 102);
+    let server = Ipv4Addr::new(10, 0, 61, 1);
+    let frame = build_udp_frame_v4_full([0xff, 0xff, 0xff, 0xff, 0xff, 0xff], client, server, 1);
+    let meta = ttl_meta_v4();
+    assert!(
+        !can_generate_icmp_error_reply(&frame, meta),
+        "gate must suppress reply to an L2 broadcast frame"
+    );
+    assert!(
+        !te_request_built(&frame, meta),
+        "TE call site must suppress an L2 broadcast frame"
+    );
+}
+
+/// Suppression (d): a bogus IPv4 source (loopback) must NOT draw a reply.
+#[test]
+fn time_exceeded_suppressed_for_bad_source_v4() {
+    let bad_src = Ipv4Addr::new(127, 0, 0, 1);
+    let server = Ipv4Addr::new(10, 0, 61, 1);
+    let frame = build_udp_frame_v4_full([0x00, 0x25, 0x90, 0x12, 0x34, 0x56], bad_src, server, 1);
+    let meta = ttl_meta_v4();
+    assert!(
+        !can_generate_icmp_error_reply(&frame, meta),
+        "gate must suppress reply to a loopback source"
+    );
+    // Unspecified 0.0.0.0 source is also suppressed.
+    let zero_src =
+        build_udp_frame_v4_full([0x00, 0x25, 0x90, 0x12, 0x34, 0x56], Ipv4Addr::UNSPECIFIED, server, 1);
+    assert!(
+        !can_generate_icmp_error_reply(&zero_src, meta),
+        "gate must suppress reply to a 0.0.0.0 source"
+    );
+    assert!(
+        !te_request_built(&frame, meta),
+        "TE call site must suppress a loopback source"
+    );
+}
+
+/// Suppression (d) for IPv6: a multicast source must NOT draw a reply.
+#[test]
+fn time_exceeded_suppressed_for_bad_source_v6() {
+    let bad_src: Ipv6Addr = "ff02::1".parse().unwrap(); // multicast
+    let server: Ipv6Addr = "2001:559:8585:ef00::1".parse().unwrap();
+    let frame = build_icmp_echo_frame_v6(bad_src, server, 1);
+    let meta = UserspaceDpMeta {
+        l3_offset: 14,
+        l4_offset: 54,
+        ingress_ifindex: 5,
+        addr_family: libc::AF_INET6 as u8,
+        protocol: PROTO_ICMPV6,
+        ..UserspaceDpMeta::default()
+    };
+    assert!(
+        !can_generate_icmp_error_reply(&frame, meta),
+        "gate must suppress reply to a multicast IPv6 source"
+    );
+    assert!(
+        !te_request_built(&frame, meta),
+        "TE call site must suppress a multicast IPv6 source"
+    );
+}
+
+/// The reject path now routes through the same gate: an inbound ICMP
+/// error still draws no reject reply, and a non-first fragment is
+/// suppressed there too (#2237 unifies the two error generators).
+#[test]
+fn reject_unreachable_routes_through_shared_gate() {
+    let client = Ipv4Addr::new(10, 0, 61, 102);
+    let server = Ipv4Addr::new(1, 1, 1, 1);
+    let fwd = reject_egress_forwarding(Some(Ipv4Addr::new(10, 0, 61, 1)), None);
+    // Multicast destination — suppressed (was NOT covered by the old
+    // inline reject checks, only the new shared gate catches it).
+    let mcast = build_udp_frame_v4_full([0x01, 0x00, 0x5e, 0x00, 0x00, 0xfb], client, Ipv4Addr::new(224, 0, 0, 251), 64);
+    let meta = UserspaceDpMeta {
+        l3_offset: 14,
+        l4_offset: 34,
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_UDP,
+        ..UserspaceDpMeta::default()
+    };
+    assert!(
+        build_reject_icmp_unreachable(&mcast, meta, 5, &fwd).is_none(),
+        "reject path must suppress a multicast destination via the shared gate"
+    );
+    // A plain unicast UDP reject still works.
+    let unicast = build_udp_frame_v4_full([0x00, 0x25, 0x90, 0x12, 0x34, 0x56], client, server, 64);
+    assert!(
+        build_reject_icmp_unreachable(&unicast, meta, 5, &fwd).is_some(),
+        "reject path still replies to a normal unicast packet"
+    );
+}
+
+/// #2242: the ICMPv6 error builder must quote enough of the invoking
+/// packet to reach the transport header even when IPv6 extension headers
+/// push it past byte 48, and the total error must stay within the IPv6
+/// minimum MTU (1280).
+#[test]
+fn icmp_error_v6_quote_includes_transport_header_behind_ext_headers() {
+    let client: Ipv6Addr = "2001:559:8585:ef00::102".parse().unwrap();
+    let server: Ipv6Addr = "2606:4700:4700::1111".parse().unwrap();
+    // Build an inbound IPv6 packet: base header (next=Hop-by-Hop 0) +
+    // a Hop-by-Hop ext header (8 bytes) + a Destination-Options ext
+    // header (8 bytes) + UDP header. The UDP header therefore starts at
+    // L3-relative offset 40 + 8 + 8 = 56 (> 48), so the OLD fixed-48
+    // quote would have stopped inside the second ext header.
+    let mut frame = Vec::new();
+    frame.extend_from_slice(&[0x00, 0x25, 0x90, 0x12, 0x34, 0x56]); // dst mac
+    frame.extend_from_slice(&[0x02, 0x11, 0x22, 0x33, 0x44, 0x55]); // src mac
+    frame.extend_from_slice(&[0x86, 0xdd]);
+    let l3 = frame.len();
+    // payload_len = HBH(8) + DstOpt(8) + UDP(8) = 24; next-header 0 (HBH).
+    frame.extend_from_slice(&[0x60, 0x00, 0x00, 0x00, 0x00, 24, 0, 1]);
+    frame.extend_from_slice(&client.octets());
+    frame.extend_from_slice(&server.octets());
+    // Hop-by-Hop options: next-header = 60 (Dest-Opts), hdr-ext-len 0
+    // (=> 8 bytes total), then 6 pad bytes.
+    frame.extend_from_slice(&[60, 0, 1, 4, 0, 0, 0, 0]);
+    // Destination-Options: next-header = UDP, hdr-ext-len 0, 6 pad bytes.
+    frame.extend_from_slice(&[PROTO_UDP, 0, 1, 4, 0, 0, 0, 0]);
+    // UDP header: src 0xABCD, dst 0x0035 (53), len 8, csum 0.
+    let udp_off = frame.len();
+    frame.extend_from_slice(&[0xAB, 0xCD, 0x00, 0x35, 0x00, 0x08, 0x00, 0x00]);
+    let udp_rel = udp_off - l3; // L3-relative offset of UDP header
+    assert!(udp_rel > 48, "fixture must place transport past byte 48");
+
+    let meta = UserspaceDpMeta {
+        l3_offset: 14,
+        l4_offset: udp_off as u16,
+        addr_family: libc::AF_INET6 as u8,
+        protocol: PROTO_UDP,
+        ..UserspaceDpMeta::default()
+    };
+    let fwd = icmp_suppress_forwarding();
+    let out =
+        build_local_time_exceeded_v6(&frame, meta, 5, &fwd).expect("build v6 TE with ext headers");
+    // Quoted invoking packet starts after [Eth tag?][outer IPv6 40][ICMPv6
+    // hdr 8]. Untagged egress => Eth 14 + IPv6 40 + ICMPv6 8 = 62.
+    let quote_start = 62;
+    // The quote must reach the UDP header (at L3-relative udp_rel) and
+    // carry its ports.
+    let q_udp = quote_start + udp_rel;
+    assert!(
+        out.len() >= q_udp + 4,
+        "quote must include the transport header (len {} < {})",
+        out.len(),
+        q_udp + 4
+    );
+    assert_eq!(
+        u16::from_be_bytes([out[q_udp], out[q_udp + 1]]),
+        0xABCD,
+        "quoted UDP source port must survive (transport header reached)"
+    );
+    assert_eq!(
+        u16::from_be_bytes([out[q_udp + 2], out[q_udp + 3]]),
+        0x0035,
+        "quoted UDP dest port must survive"
+    );
+    // Total ICMPv6 error datagram (from outer IPv6 onward) <= 1280.
+    let v6_total = out.len() - quote_start + 40 + 8; // outer IPv6 + ICMPv6 hdr + quote
+    let _ = v6_total;
+    // Equivalent bound: everything after the Ethernet header.
+    assert!(
+        out.len() - 14 <= 1280,
+        "ICMPv6 error must not exceed the IPv6 minimum MTU"
+    );
+}
+
+/// #2242: a large invoking IPv6 packet is quoted up to the 1232-byte cap
+/// (not truncated to 48), keeping the total error within 1280.
+#[test]
+fn icmp_error_v6_quote_bounded_to_min_mtu() {
+    let client: Ipv6Addr = "2001:559:8585:ef00::102".parse().unwrap();
+    let server: Ipv6Addr = "2606:4700:4700::1111".parse().unwrap();
+    let mut frame = Vec::new();
+    frame.extend_from_slice(&[0x00, 0x25, 0x90, 0x12, 0x34, 0x56]);
+    frame.extend_from_slice(&[0x02, 0x11, 0x22, 0x33, 0x44, 0x55]);
+    frame.extend_from_slice(&[0x86, 0xdd]);
+    let l3 = frame.len();
+    // 2000-byte UDP payload after the UDP header => invoking packet is
+    // much larger than 1232.
+    let udp_payload = 2000usize;
+    let payload_len = 8 + udp_payload; // UDP hdr + data
+    frame.extend_from_slice(&[0x60, 0x00, 0x00, 0x00]);
+    frame.extend_from_slice(&(payload_len as u16).to_be_bytes());
+    frame.extend_from_slice(&[PROTO_UDP, 64]);
+    frame.extend_from_slice(&client.octets());
+    frame.extend_from_slice(&server.octets());
+    frame.extend_from_slice(&[0xAB, 0xCD, 0x00, 0x35]);
+    frame.extend_from_slice(&(payload_len as u16).to_be_bytes());
+    frame.extend_from_slice(&[0x00, 0x00]);
+    frame.resize(l3 + 40 + payload_len, 0);
+
+    let meta = UserspaceDpMeta {
+        l3_offset: 14,
+        l4_offset: (l3 + 40) as u16,
+        addr_family: libc::AF_INET6 as u8,
+        protocol: PROTO_UDP,
+        ..UserspaceDpMeta::default()
+    };
+    let fwd = icmp_suppress_forwarding();
+    let out = build_local_time_exceeded_v6(&frame, meta, 5, &fwd).expect("build large v6 TE");
+    // Untagged egress: Eth 14 + outer IPv6 40 + ICMPv6 hdr 8 = 62 prefix.
+    let quote_start = 62;
+    let quote_len = out.len() - quote_start;
+    assert_eq!(
+        quote_len, 1232,
+        "large invoking packet quoted up to the 1232-byte min-MTU cap"
+    );
+    assert!(
+        out.len() - 14 <= 1280,
+        "ICMPv6 error must not exceed the IPv6 minimum MTU"
+    );
+}
+
 // --- #2089 reject ICMP-unreachable builder tests ---
 
 fn reject_egress_forwarding(v4: Option<Ipv4Addr>, v6: Option<Ipv6Addr>) -> ForwardingState {

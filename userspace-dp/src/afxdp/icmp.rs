@@ -2,6 +2,121 @@ use super::*;
 
 pub(super) const FABRIC_INGRESS_FLAG: u8 = 0x80;
 
+/// RFC 1812 §4.3.2.7 / RFC 792 / RFC 4443 §2.4 error-suppression gate
+/// for LOCALLY GENERATED ICMP/ICMPv6 error messages (Time Exceeded,
+/// Destination Unreachable). A router MUST NOT originate an ICMP error
+/// in response to:
+///
+///   (a) an ICMP/ICMPv6 *error* message (prevents error loops /
+///       amplification) — ICMPv4 types {3,4,5,11,12}, all ICMPv6 < 128
+///       (the ICMPv6 error range). ICMP *query* types (echo, etc.) are
+///       NOT suppressed.
+///   (b) a non-first IP fragment (no transport context to quote/key —
+///       RFC 1812 §4.3.2.7 "a fragment other than the first").
+///   (c) a packet whose IP destination is multicast/broadcast (L3), or
+///       whose L2 destination is broadcast/multicast — never reply to a
+///       group/broadcast solicitation.
+///   (d) a packet whose IP source is the unspecified address, loopback,
+///       multicast, or (v4) broadcast — there is no legitimate unicast
+///       host to send the error to.
+///
+/// Returns `true` when an ICMP error reply MAY be generated, `false`
+/// when it MUST be suppressed (the caller fail-closes to a silent drop).
+/// Hot-path: cheap field reads only, no allocation; the fragment walk is
+/// the same bounded extension-header loop already used on every packet.
+///
+/// `protocol`/`icmp_type`/fragment status are read from the inbound
+/// frame; the L4/ICMP-type read uses `meta.l4_offset`, which the shim
+/// fills for ICMP, matching [`build_reject_icmp_unreachable`].
+pub(super) fn can_generate_icmp_error_reply(frame: &[u8], meta: UserspaceDpMeta) -> bool {
+    let l3 = match meta.l3_offset {
+        14 | 18 => meta.l3_offset as usize,
+        _ => match frame_l3_offset(frame) {
+            Some(off) => off,
+            None => return false,
+        },
+    };
+    let Some(packet) = frame.get(l3..) else {
+        return false;
+    };
+
+    // (c) L2 destination: never reply to a broadcast/multicast frame.
+    // The low bit of the first MAC octet is the I/G (group) bit; the
+    // all-ones MAC is broadcast (a special case of group). frame[0]
+    // exists because frame_l3_offset/the 14|18 match imply >= 14 bytes.
+    if let Some(&l2_dst0) = frame.first()
+        && (l2_dst0 & 0x01) != 0
+    {
+        return false;
+    }
+
+    // (b) non-first fragment: no transport header to quote/key.
+    if is_non_first_fragment(packet, meta.addr_family) {
+        return false;
+    }
+
+    match meta.addr_family as i32 {
+        libc::AF_INET => {
+            if packet.len() < 20 {
+                return false;
+            }
+            let src = Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]);
+            let dst = Ipv4Addr::new(packet[16], packet[17], packet[18], packet[19]);
+            // (d) bad source / (c) group or broadcast destination.
+            if src.is_unspecified()
+                || src.is_loopback()
+                || src.is_multicast()
+                || src.is_broadcast()
+                || dst.is_multicast()
+                || dst.is_broadcast()
+            {
+                return false;
+            }
+        }
+        libc::AF_INET6 => {
+            if packet.len() < 40 {
+                return false;
+            }
+            let src = Ipv6Addr::from(match <[u8; 16]>::try_from(&packet[8..24]) {
+                Ok(addr) => addr,
+                Err(_) => return false,
+            });
+            let dst = Ipv6Addr::from(match <[u8; 16]>::try_from(&packet[24..40]) {
+                Ok(addr) => addr,
+                Err(_) => return false,
+            });
+            // (d) bad source / (c) multicast destination. IPv6 has no
+            // broadcast; multicast covers the group case.
+            if src.is_unspecified()
+                || src.is_loopback()
+                || src.is_multicast()
+                || dst.is_multicast()
+            {
+                return false;
+            }
+        }
+        _ => return false,
+    }
+
+    // (a) never reply to an inbound ICMP/ICMPv6 error message.
+    if matches!(meta.protocol, PROTO_ICMP | PROTO_ICMPV6) {
+        let l4 = meta.l4_offset as usize;
+        // A zero/invalid l4_offset means we could not locate the ICMP
+        // header — fail closed rather than reading a stale type byte.
+        if l4 <= l3 {
+            return false;
+        }
+        let Some(&icmp_type) = frame.get(l4) else {
+            return false;
+        };
+        if reject_icmp_reply_suppressed(meta.protocol, icmp_type) {
+            return false;
+        }
+    }
+
+    true
+}
+
 pub(super) fn packet_ttl_would_expire(frame: &[u8], meta: UserspaceDpMeta) -> Option<bool> {
     if (meta.meta_flags & FABRIC_INGRESS_FLAG) != 0 {
         return Some(false);
@@ -29,6 +144,13 @@ pub(super) fn build_local_time_exceeded_request(
     _now_secs: u64,
 ) -> Option<PendingForwardRequest> {
     if !matches!(packet_ttl_would_expire(frame, meta), Some(true)) {
+        return None;
+    }
+    // #2237: RFC 1812 §4.3.2.7 / RFC 4443 §2.4 suppression — do not
+    // originate a Time Exceeded in reply to an ICMP error, a non-first
+    // fragment, a group/broadcast destination, or a bogus source. The
+    // sibling reject path enforces the same contract via this gate.
+    if !can_generate_icmp_error_reply(frame, meta) {
         return None;
     }
 
@@ -225,8 +347,11 @@ pub(super) fn build_local_time_exceeded_v6(
 /// Build a local-origin ICMPv6 error message of the given type/code,
 /// reflecting L2 (MAC swap + ingress VLAN), sourcing the outer IP from
 /// the ingress interface primary v6, and quoting the inbound packet up
-/// to 48 bytes (well under the RFC 4443 minimum-MTU cap). The ICMPv6
-/// checksum (`checksum16_ipv6`) is computed over the pseudo-header and
+/// to the RFC 4443 minimum-MTU cap (1280 - 40 outer IPv6 - 8 ICMPv6 =
+/// 1232 bytes, #2242), bounded by the invoking-packet length — so the
+/// quote reaches the transport header even behind IPv6 extension
+/// headers. The ICMPv6 checksum (`checksum16_ipv6`) is computed over
+/// the pseudo-header and
 /// is type-agnostic, so this is shared by the Time Exceeded builder
 /// (type 3) and the #2089 reject Destination Unreachable builder
 /// (type 1, code 1).
@@ -253,7 +378,20 @@ pub(super) fn build_local_icmp_error_v6(
     let dst_ip = Ipv6Addr::from(<[u8; 16]>::try_from(packet.get(8..24)?).ok()?);
     let payload_len = u16::from_be_bytes([packet[4], packet[5]]) as usize;
     let packet_len = (40 + payload_len).min(packet.len());
-    let quoted_len = packet_len.min(48);
+    // #2242: RFC 4443 §2.4(c)/§3.1 — include as much of the invoking
+    // packet as possible without the ICMPv6 error exceeding the IPv6
+    // minimum MTU (1280). The total error datagram is
+    //   40 (outer IPv6) + 8 (ICMPv6 header) + quoted_len <= 1280,
+    // so quote up to 1280 - 40 - 8 = 1232 bytes. The previous fixed
+    // 48-byte cap stopped just past the IPv6 base header and omitted the
+    // transport header whenever extension headers pushed it past byte 48,
+    // breaking PMTUD/traceroute diagnostics and receiver-side
+    // error<->socket demux. Bounded by the actual invoking-packet length.
+    const ICMP6_MIN_MTU: usize = 1280;
+    const OUTER_V6_LEN: usize = 40;
+    const ICMP6_HDR_LEN: usize = 8;
+    const MAX_V6_QUOTE: usize = ICMP6_MIN_MTU - OUTER_V6_LEN - ICMP6_HDR_LEN; // 1232
+    let quoted_len = packet_len.min(MAX_V6_QUOTE);
     // #2149: preserve the inbound tag (TPID + PCP + DEI + VID) on the
     // reflected error; fall back to the egress configured VID when
     // ingress was untagged. See the v4 builder for the rationale.
@@ -322,33 +460,27 @@ pub(super) fn reject_icmp_reply_suppressed(protocol: u8, icmp_type: u8) -> bool 
 /// ICMPv4 type 3 code 13, or ICMPv6 type 1 code 1 — the codes the
 /// retired eBPF reject path used ("matching Junos reject behavior").
 ///
-/// Returns `None` (caller fail-closes to a silent drop) when:
+/// Returns `None` (caller fail-closes to a silent drop) when the shared
+/// [`can_generate_icmp_error_reply`] gate (#2237) suppresses the reply:
 ///   - the inbound is an ICMP/ICMPv6 *error* message
 ///     ([`reject_icmp_reply_suppressed`]),
 ///   - the inbound is a non-first fragment (no transport header to key),
-///   - the ingress interface has no primary address of the inbound
-///     family, or the frame is otherwise unparseable.
+///   - the inbound L2/L3 destination is broadcast/multicast, or its IP
+///     source is unspecified/loopback/multicast/broadcast,
+/// or when the ingress interface has no primary address of the inbound
+/// family, or the frame is otherwise unparseable.
 pub(super) fn build_reject_icmp_unreachable(
     frame: &[u8],
     meta: UserspaceDpMeta,
     ingress_ifindex: i32,
     forwarding: &ForwardingState,
 ) -> Option<Vec<u8>> {
-    let l3 = match meta.l3_offset {
-        14 | 18 => meta.l3_offset as usize,
-        _ => frame_l3_offset(frame)?,
-    };
-    let packet = frame.get(l3..)?;
-    // Never reply to a non-first fragment (no L4 header to quote/key).
-    if is_non_first_fragment(packet, meta.addr_family) {
+    // #2237: shared RFC 1812 §4.3.2.7 / RFC 4443 §2.4 suppression gate.
+    // Subsumes the prior inline non-first-fragment and inbound-ICMP-error
+    // checks and additionally suppresses group/broadcast destinations and
+    // bogus sources — the same contract the Time Exceeded path now uses.
+    if !can_generate_icmp_error_reply(frame, meta) {
         return None;
-    }
-    // Suppress replies to inbound ICMP/ICMPv6 error messages.
-    if matches!(meta.protocol, PROTO_ICMP | PROTO_ICMPV6) {
-        let icmp_type = *frame.get(meta.l4_offset as usize)?;
-        if reject_icmp_reply_suppressed(meta.protocol, icmp_type) {
-            return None;
-        }
     }
     match meta.addr_family as i32 {
         // ICMPv4 Destination Unreachable, code 13 (communication
