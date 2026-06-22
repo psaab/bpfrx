@@ -804,6 +804,76 @@ pub(super) fn native_gre_tcp_mss(
     u16::try_from(max_mss).unwrap_or_default()
 }
 
+/// Resolve the real outer-link (transport) MTU for a tunnel endpoint —
+/// the egress interface the OUTER encapped datagram leaves on, NOT the
+/// tunnel device. Same resolution chain as `native_gre_inner_mtu`
+/// (#2300 SSOT): transport ifindex → stored resolution egress →
+/// endpoint logical ifindex; `unwrap_or(1500)` only when every lookup
+/// misses. Used by the WireGuard MSS clamp (#2299) so the advertised
+/// inner MSS matches the encap MTU guard.
+pub(super) fn tunnel_outer_mtu(
+    forwarding: &ForwardingState,
+    decision: &SessionDecision,
+    endpoint: &TunnelEndpoint,
+) -> usize {
+    let transport_ifindex = resolve_ingress_logical_ifindex(
+        forwarding,
+        decision.resolution.tx_ifindex,
+        decision.resolution.tx_vlan_id,
+    )
+    .unwrap_or(decision.resolution.tx_ifindex);
+    forwarding
+        .egress
+        .get(&transport_ifindex)
+        .or_else(|| forwarding.egress.get(&decision.resolution.egress_ifindex))
+        .or_else(|| forwarding.egress.get(&endpoint.logical_ifindex))
+        .map(|egress| egress.mtu)
+        .filter(|m| *m > 0)
+        .unwrap_or(1500)
+}
+
+/// Dispatch the per-tunnel TCP MSS clamp by tunnel kind (#2299).
+///
+/// For a `mode == "wireguard"` endpoint the GRE MSS formula
+/// (`native_gre_tcp_mss`) is ~36-60 bytes too high — it ignores
+/// UDP(8) + WG data header(16) + Poly1305 tag(16) + §5.4.6 padding(≤15).
+/// A SYN clamped with the GRE value lets the peer send full-MSS data
+/// segments that the WG encap MTU guard then silently drops
+/// (`encap_mtu_drops`). Route WG-bound SYNs through `wg::mss::wg_tcp_mss`
+/// instead, derived from the SAME outer MTU the encap guard reads.
+///
+/// Non-WG endpoints (and the plain-forward path, `tunnel_endpoint_id ==
+/// 0`) keep the GRE formula bit-for-bit. No new branch on the
+/// plain-forward fast path: the `tunnel_endpoint_id == 0` early-out
+/// short-circuits before the endpoint lookup, exactly as
+/// `native_gre_tcp_mss` does today.
+pub(super) fn tunnel_tcp_mss(
+    forwarding: &ForwardingState,
+    decision: &SessionDecision,
+    addr_family: u8,
+) -> u16 {
+    if decision.resolution.tunnel_endpoint_id == 0 {
+        return 0;
+    }
+    let Some(endpoint) = forwarding
+        .tunnel_endpoints
+        .get(&decision.resolution.tunnel_endpoint_id)
+    else {
+        return 0;
+    };
+    if endpoint.mode == "wireguard" {
+        // outer family from the endpoint; inner family from the packet
+        // being forwarded; outer MTU from the real egress interface.
+        let outer_mtu = tunnel_outer_mtu(forwarding, decision, endpoint);
+        return crate::afxdp::wg::mss::wg_tcp_mss(
+            endpoint.outer_family,
+            addr_family as i32,
+            outer_mtu,
+        );
+    }
+    native_gre_tcp_mss(forwarding, decision, addr_family)
+}
+
 // #989: clamp_tcp_mss / clamp_tcp_mss_frame relocated to `frame/tcp.rs`.
 
 #[allow(dead_code)]

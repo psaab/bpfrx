@@ -56,12 +56,17 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, UdpSocket};
 use std::os::fd::AsRawFd;
 
-/// Outer MTU assumed for the WG transport path (S2a single-tunnel;
-/// matches the Go-side wgN MTU cap in pkg/routing/tunnel.go). The exact
-/// pad-aware guard below drops any inner packet whose encapped size
-/// would exceed this, mirroring the transit-egress guard in
-/// frame/wg.rs (plan §4.3, §7 — the guard must hold in BOTH directions).
-const WG_OUTER_MTU: usize = 1500;
+/// Fallback outer (underlay) MTU for the WG transport path when the
+/// real egress MTU cannot be resolved at spawn (#2300). The control
+/// thread is now handed the resolved underlay-egress MTU
+/// (`resolve_wg_outer_mtu` in tunnel_supervision.rs), so this constant
+/// is ONLY the last-resort default for an unconfigured / unroutable
+/// endpoint — it is no longer the hardcoded outer MTU. The exact
+/// pad-aware guard in `encap_and_send` drops any inner packet whose
+/// encapped size would exceed the threaded value, mirroring the
+/// transit-egress guard in frame/wg.rs (plan §4.3, §7 — the guard must
+/// hold in BOTH directions, against the SAME MTU model).
+pub(super) const WG_DEFAULT_OUTER_MTU: usize = 1500;
 
 /// Round `n` up to the nearest multiple of 16 (WG §5.4.6 pad).
 #[inline]
@@ -75,6 +80,16 @@ const fn pad_to_16(n: usize) -> usize {
 fn wg_encapped_size(inner_len: usize, outer_v6: bool) -> usize {
     let outer_ip_len = if outer_v6 { 40 } else { 20 };
     WG_DATA_HEADER_LEN + pad_to_16(inner_len) + POLY1305_TAG_LEN + outer_ip_len + 8
+}
+
+/// Whether an `inner_len`-byte inner packet fits the outer MTU once
+/// WG-encapped. The single guard predicate the control-thread egress
+/// uses, against the THREADED `outer_mtu` (#2300) — extracted so the
+/// "real underlay MTU, not a 1500 constant" behavior is unit-testable
+/// without a live socket.
+#[inline]
+fn wg_inner_fits_outer_mtu(inner_len: usize, outer_v6: bool, outer_mtu: usize) -> bool {
+    wg_encapped_size(inner_len, outer_v6) <= outer_mtu
 }
 
 /// Socket/TUN read budget per poll tick — drains a bounded burst before
@@ -109,6 +124,7 @@ pub(super) fn wg_control_loop(
     engine: Arc<crate::afxdp::wg::WgEngine>,
     listen_port: u16,
     peer_endpoint: Option<SocketAddr>,
+    outer_mtu: usize,
     recent_exceptions: Arc<Mutex<VecDeque<ExceptionStatus>>>,
     stop: Arc<AtomicBool>,
 ) {
@@ -169,6 +185,7 @@ pub(super) fn wg_control_loop(
         socket_is_v6,
         tun,
         peer_endpoint,
+        outer_mtu,
         &recent_exceptions,
         &stop,
     );
@@ -297,6 +314,7 @@ fn run_wg_control_loop(
     socket_is_v6: bool,
     mut tun: std::fs::File,
     peer_endpoint: Option<SocketAddr>,
+    outer_mtu: usize,
     recent_exceptions: &Arc<Mutex<VecDeque<ExceptionStatus>>>,
     stop: &AtomicBool,
 ) {
@@ -445,6 +463,7 @@ fn run_wg_control_loop(
                             ep,
                             &tun_buf[..len],
                             &mut encap_buf,
+                            outer_mtu,
                             tunnel_name,
                             recent_exceptions,
                         );
@@ -1081,15 +1100,18 @@ fn encap_and_send(
     endpoint: SocketAddr,
     inner_ip: &[u8],
     out: &mut [u8],
+    outer_mtu: usize,
     tunnel_name: &str,
     recent_exceptions: &Arc<Mutex<VecDeque<ExceptionStatus>>>,
 ) {
     // Exact pad-aware MTU guard (plan §4.3 / AGY H1) — symmetric with the
-    // transit-egress guard in frame/wg.rs. Drop oversize inner rather
-    // than emitting an outer datagram the kernel must fragment. The wgN
-    // TUN MTU (Go-side) is the first line; this is defense-in-depth for a
-    // mis-set MTU or a jumbo inner read off the TUN.
-    if wg_encapped_size(inner_ip.len(), endpoint.is_ipv6()) > WG_OUTER_MTU {
+    // transit-egress guard in frame/wg.rs, AND against the SAME MTU model
+    // (#2300): `outer_mtu` is the real underlay-egress MTU resolved at
+    // spawn, not the old `WG_OUTER_MTU = 1500` hardcode. Drop oversize
+    // inner rather than emitting an outer datagram the kernel must
+    // fragment. The wgN TUN MTU (Go-side) is the first line; this is
+    // defense-in-depth for a mis-set MTU or a jumbo inner read off the TUN.
+    if !wg_inner_fits_outer_mtu(inner_ip.len(), endpoint.is_ipv6(), outer_mtu) {
         // #1865: the #1736 v4-mapped blackhole class — full-MSS inner
         // packets silently vanishing here moved ZERO bytes of forward
         // TCP while pings passed. Now release-visible.
@@ -1098,7 +1120,7 @@ fn encap_and_send(
             "WG[{}]: drop oversize inner {} (encapped > {})",
             tunnel_name,
             inner_ip.len(),
-            WG_OUTER_MTU
+            outer_mtu
         );
         return;
     }
@@ -1255,6 +1277,7 @@ mod tests {
                 false,
                 tun,
                 None,
+                WG_DEFAULT_OUTER_MTU,
                 &exceptions,
                 &stop,
             );
@@ -1403,9 +1426,29 @@ mod tests {
     #[test]
     fn encapped_size_v4_vs_v6_window() {
         // inner 1409 pads to 1424: v4 outer = 1484 (fits), v6 = 1504 (drops).
-        assert!(wg_encapped_size(1409, false) <= WG_OUTER_MTU);
-        assert!(wg_encapped_size(1409, true) > WG_OUTER_MTU);
+        assert!(wg_encapped_size(1409, false) <= WG_DEFAULT_OUTER_MTU);
+        assert!(wg_encapped_size(1409, true) > WG_DEFAULT_OUTER_MTU);
         // inner 1408 fits either way (the pre-fix observable cutoff).
-        assert!(wg_encapped_size(1408, true) <= WG_OUTER_MTU);
+        assert!(wg_encapped_size(1408, true) <= WG_DEFAULT_OUTER_MTU);
+    }
+
+    /// #2300: the egress guard uses the THREADED outer MTU, not the
+    /// 1500 constant. A 1409-byte inner (v4 outer, encapped 1484) fits a
+    /// 1500 link but MUST be dropped on a 1450 underlay (PPPoE-class) —
+    /// the topology-dependent bug the old hardcode created.
+    #[test]
+    fn guard_uses_threaded_outer_mtu_not_constant() {
+        // 1500 link: 1409 fits.
+        assert!(wg_inner_fits_outer_mtu(1409, false, 1500));
+        // 1450 link: 1484 > 1450, dropped. Fail-on-revert: a hardcoded
+        // 1500 guard would have let this through and forced the underlay
+        // to fragment or drop.
+        assert!(!wg_inner_fits_outer_mtu(1409, false, 1450));
+        // 1492 link (PPPoE): 1484 still fits.
+        assert!(wg_inner_fits_outer_mtu(1409, false, 1492));
+        // Jumbo 9000 link: a 5000-byte inner (encapped ~5044) fits —
+        // the old constant would have capped this at 1500.
+        assert!(wg_inner_fits_outer_mtu(5000, false, 9000));
+        assert!(!wg_inner_fits_outer_mtu(5000, false, 1500));
     }
 }

@@ -278,3 +278,173 @@ fn drain_survives_einval_write_and_thread_keeps_draining() {
         "the rejected delivery is recorded as an exception"
     );
 }
+
+// --- #2303 GRE outer-header DSCP/ECN propagation ----------------------
+
+/// Build a minimal well-formed inner IPv4 packet (20-byte header, no
+/// L4 payload beyond the header) with the given TOS byte (DSCP high 6
+/// bits + ECN low 2 bits) so the encap site has a real inner to copy.
+fn inner_ipv4_with_tos(tos: u8) -> Vec<u8> {
+    let mut pkt = vec![0u8; 20];
+    pkt[0] = 0x45; // version 4, IHL 5
+    pkt[1] = tos; // DSCP + ECN
+    pkt[2..4].copy_from_slice(&20u16.to_be_bytes()); // total length
+    pkt[8] = 64; // TTL (> 1 so the build-path decrement guard passes)
+    pkt[9] = PROTO_TCP;
+    pkt[12..16].copy_from_slice(&[10, 0, 0, 1]); // src
+    pkt[16..20].copy_from_slice(&[10, 0, 0, 2]); // dst
+    pkt
+}
+
+/// Resolution that points the gre1881 fixture endpoint (id=1, logical
+/// ifindex 362, IPv6 outer) at itself with both MACs resolved, so
+/// `encapsulate_native_gre_frame` builds a full frame (the #1873 R-C
+/// gate requires egress_ifindex == endpoint.logical_ifindex).
+fn gre_encap_resolution() -> ForwardingResolution {
+    ForwardingResolution {
+        disposition: ForwardingDisposition::ForwardCandidate,
+        local_ifindex: 12,
+        egress_ifindex: 362,
+        tx_ifindex: 12,
+        tunnel_endpoint_id: 1,
+        next_hop: Some(IpAddr::V6("2001:559:8585:80::1".parse().unwrap())),
+        neighbor_mac: Some([0x00, 0x11, 0x22, 0x33, 0x44, 0x55]),
+        src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x50, 0x08]),
+        tx_vlan_id: 80,
+    }
+}
+
+#[test]
+fn gre_encap_copies_inner_dscp_ecn_to_outer_ipv6_traffic_class() {
+    // #2303: the outer IPv6 Traffic Class must carry the inner DSCP+ECN,
+    // not the pre-fix hardcoded 0. Inner TOS = EF (DSCP 46) + ECT(1)
+    // (ECN 0b01) = (46 << 2) | 1 = 0xB9.
+    let inner_tos = (46u8 << 2) | 0x01;
+    let inner = inner_ipv4_with_tos(inner_tos);
+    let inner_frame = wrap_raw_ip_packet_for_tunnel(&inner, libc::AF_INET as u8);
+
+    let state = gre1881_state();
+    let decision = SessionDecision {
+        resolution: gre_encap_resolution(),
+        nat: NatDecision::default(),
+    };
+    let mut meta = ForwardPacketMeta::default();
+    meta.addr_family = libc::AF_INET as u8;
+    meta.protocol = PROTO_TCP;
+    meta.l3_offset = 14;
+
+    let out = encapsulate_native_gre_frame(&inner_frame, meta, &decision, &state)
+        .expect("gre encap must build a frame");
+
+    // Outer is IPv6 (fixture outer_family inet6). With a VLAN-80 tag the
+    // L2 header is 18 bytes; the IPv6 Traffic Class spans the low nibble
+    // of octet 0 and the high nibble of octet 1: TC = (b0 << 4) | (b1 >> 4).
+    let ip = &out[18..];
+    let outer_tc = (ip[0] << 4) | (ip[1] >> 4);
+    assert_eq!(
+        outer_tc, inner_tos,
+        "outer IPv6 Traffic Class must equal the inner TOS (DSCP+ECN); \
+         pre-#2303 this was hardcoded 0"
+    );
+    // Fail-on-revert sharpener: the byte must be non-zero (the exact
+    // failure the hardcoded-0 path produced).
+    assert_ne!(outer_tc, 0, "stripped DSCP/ECN regression");
+}
+
+#[test]
+fn inner_tos_byte_reads_ipv4_and_ipv6() {
+    // IPv4: TOS is octet 1.
+    let v4 = inner_ipv4_with_tos(0xB9);
+    assert_eq!(
+        crate::afxdp::gre::inner_tos_byte(&v4, libc::AF_INET as u8),
+        0xB9
+    );
+
+    // IPv6: TC spans the low nibble of octet 0 and high nibble of octet 1.
+    // Encode TC = 0xB9: octet0 low nibble = 0xB, octet1 high nibble = 0x9.
+    let mut v6 = vec![0u8; 40];
+    v6[0] = 0x60 | 0x0B; // version 6 + TC high nibble
+    v6[1] = 0x90; // TC low nibble in the high nibble of octet 1
+    assert_eq!(
+        crate::afxdp::gre::inner_tos_byte(&v6, libc::AF_INET6 as u8),
+        0xB9
+    );
+
+    // Too-short / unknown family fall back to 0, never panic.
+    assert_eq!(crate::afxdp::gre::inner_tos_byte(&[], libc::AF_INET as u8), 0);
+    assert_eq!(
+        crate::afxdp::gre::inner_tos_byte(&v4, 99u8),
+        0,
+        "unknown family yields 0"
+    );
+}
+
+// --- #2299 WG SYN MSS clamp uses the WG-overhead formula --------------
+
+#[test]
+fn tunnel_tcp_mss_wireguard_uses_wg_overhead_not_gre() {
+    // The gre1881 fixture endpoint is IPv6-outer with a 1500-byte
+    // transport (reth0.80). Resolve the MSS for an inner IPv4 segment
+    // under GRE mode, then flip the SAME endpoint to wireguard and
+    // re-resolve: the WG value MUST be strictly smaller (the WG record +
+    // UDP + §5.4.6 padding overhead the GRE formula ignores) and MUST
+    // equal the standalone wg_tcp_mss() computed from the same outer
+    // family / inner family / outer MTU.
+    let mut state = gre1881_state();
+    let decision = SessionDecision {
+        resolution: gre_encap_resolution(),
+        nat: NatDecision::default(),
+    };
+    let inner_family = libc::AF_INET as u8;
+
+    let gre_mss = tunnel_tcp_mss(&state, &decision, inner_family);
+    assert!(gre_mss > 0, "GRE branch must produce a clamp value");
+
+    state
+        .tunnel_endpoints
+        .get_mut(&1)
+        .expect("fixture endpoint")
+        .mode = "wireguard".to_string();
+
+    let wg_mss = tunnel_tcp_mss(&state, &decision, inner_family);
+    assert!(wg_mss > 0, "WG branch must produce a clamp value");
+
+    // The WG overhead (UDP 8 + WG hdr 16 + tag 16 + pad ≤15) is larger
+    // than the GRE overhead (4/8), so the WG-clamped MSS is smaller.
+    assert!(
+        wg_mss < gre_mss,
+        "WG MSS ({wg_mss}) must be smaller than GRE MSS ({gre_mss}); \
+         pre-#2299 both went through native_gre_tcp_mss and matched"
+    );
+
+    // Cross-check against the canonical WG formula with the same inputs.
+    let endpoint = state.tunnel_endpoints.get(&1).unwrap();
+    let outer_mtu =
+        tunnel_outer_mtu(&state, &decision, endpoint);
+    let expected = crate::afxdp::wg::mss::wg_tcp_mss(
+        endpoint.outer_family,
+        inner_family as i32,
+        outer_mtu,
+    );
+    assert_eq!(
+        wg_mss, expected,
+        "tunnel_tcp_mss must route WG endpoints through wg_tcp_mss"
+    );
+}
+
+#[test]
+fn tunnel_tcp_mss_gre_unchanged_for_gre_endpoint() {
+    // Fail-on-revert guard: a GRE endpoint must keep the exact GRE
+    // formula value (the dispatcher must not regress GRE).
+    let state = gre1881_state();
+    let decision = SessionDecision {
+        resolution: gre_encap_resolution(),
+        nat: NatDecision::default(),
+    };
+    let inner_family = libc::AF_INET as u8;
+    assert_eq!(
+        tunnel_tcp_mss(&state, &decision, inner_family),
+        native_gre_tcp_mss(&state, &decision, inner_family),
+        "GRE endpoint must take the GRE branch bit-for-bit"
+    );
+}

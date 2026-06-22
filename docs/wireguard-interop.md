@@ -17,8 +17,57 @@ therefore staged by capability, not by vendor.
 | S4 | Non-zero pre-shared key (PSK) plumbing | pending |
 | S5 | Persistent-keepalive + REKEY/REJECT-AFTER timers + endpoint roaming + empty-record (keepalive/key-confirm) handling + TAI64N disk persistence | **timers + keepalives DONE (#1888/#1889)** — full whitepaper §6.1 timer machine (REKEY_AFTER_TIME 120s initiator-only, 165s receive horizon, REJECT_AFTER_TIME 180s per-use + expiry teardown, 5s/90s retry discipline, 10s passive + configured persistent keepalives, post-msg2 key-confirmation keepalive) on a blocking-poll(2) control loop; design of record `docs/research/1888-wg-timers/plan.md`. Authenticated-datagram endpoint LEARNING shipped in S2a/#1888 (keepalives now count); engine-level roam API + TAI64N disk persistence remain pending |
 | S6 | Junos config surface (grammar + compiler + snapshot population, base64↔hex keys) | pending |
-| S7 | Type-3 CookieReply + MAC2 generation/verification + IPv6 outer encap + DSCP/ECN | pending |
+| S7 | Type-3 CookieReply + MAC2 generation/verification + IPv6 outer encap + DSCP/ECN | **DSCP/ECN DONE (#2303)** — inner DSCP+ECN copied onto the outer header (uniform DSCP + RFC 6040 ECN ingress); CookieReply/MAC2 still pending |
 | S8 | HA RG WG-session migration | pending |
+
+## Tunnel MTU + MSS + DSCP/ECN model (#2299 / #2300 / #2303)
+
+These three correctness fixes share the encap sites and the tunnel-MTU
+model. They apply to BOTH WireGuard and (for DSCP/ECN) GRE.
+
+### MSS clamp (#2299)
+A WG-bound TCP SYN's MSS is clamped via the WireGuard overhead, not the
+GRE formula. `forwarding::tunnel_tcp_mss` dispatches by endpoint mode:
+`wireguard` → `wg::mss::wg_tcp_mss(outer_family, inner_family,
+outer_mtu)` (accounts for outer IP + UDP(8) + WG data header(16) +
+Poly1305 tag(16) + §5.4.6 padding(≤15)); everything else keeps
+`native_gre_tcp_mss` bit-for-bit. Before #2299 a WG SYN was clamped with
+the GRE value (~36–60 bytes too high), so the peer sent full-MSS data
+segments that the WG encap MTU guard then silently dropped at
+`encap_mtu_drops` — the classic "handshake + ping pass, bulk TCP stalls
+at zero bytes" failure.
+
+### Outer MTU SSOT (#2300)
+There is now ONE outer-MTU model. The transit-egress encap
+(`frame/wg.rs`) and the control-thread egress (`coordinator/wg_control.rs`)
+both gate against the REAL underlay-egress interface MTU, not a hardcoded
+1500. The control thread is handed the resolved underlay MTU at spawn
+(`Coordinator::resolve_wg_outer_mtu` route-looks-up the peer endpoint in
+the endpoint's transport table). `WG_DEFAULT_OUTER_MTU` (1500) is now
+ONLY the last-resort fallback for an unconfigured/unroutable endpoint.
+On the Go side, `wgTunMTUForEndpoint` honors an operator-set `mtu` on the
+tunnel interface (the supported sub-1500 / jumbo override — PPPoE 1492,
+cloud overlays ~1450); with no operator MTU it derives the wgN inner MTU
+from `wgDefaultOuterMTU` minus the family overhead. The pre-#2300 code
+ignored `tc.MTU` entirely and always derived from 1500, so a
+lowered-underlay deployment could not set a smaller wgN MTU.
+
+Residual / follow-up: the per-peer LEARNED-endpoint roam case still uses
+the spawn-time outer MTU on the control thread (the transit-egress path
+already reads the real per-packet egress MTU); the Go default cannot see
+the route at the tunnel-manager layer, so a non-1500 underlay relies on
+either the operator `mtu` statement or the Rust egress guard as the
+authoritative backstop.
+
+### DSCP/ECN propagation (#2303)
+GRE and WG encap copy the inner packet's full TOS / IPv6 Traffic-Class
+byte (DSCP 6 bits + ECN 2 bits) onto the outer header via
+`gre::inner_tos_byte`, instead of hardcoding 0. This is the uniform DSCP
+model (RFC 2983) — per-hop QoS classification survives the tunnel — plus
+RFC 6040 normal-mode ECN ingress (inner ECN copied to outer), so a CE
+mark applied by a congested router on the outer path is reflected to the
+inner endpoints at decap. `wg::dscp::tos_from_dscp` (which clears ECN)
+is retained for the DSCP-only case but is NOT the encap reader.
 
 ## What S1 delivers
 
