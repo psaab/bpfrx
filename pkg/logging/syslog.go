@@ -35,6 +35,7 @@ const (
 const (
 	SyslogError   = 3
 	SyslogWarning = 4
+	SyslogNotice  = 5
 	SyslogInfo    = 6
 )
 

@@ -1615,3 +1615,93 @@ func TestEventSocketPathRemoved(t *testing.T) {
 		t.Fatal("socket file not cleaned up")
 	}
 }
+
+// TestRecordDataplaneEventScreenAlarmNotDrop is the #2298 regression: the
+// scan-table-pressure saturation alarm (#2234) is a screen event with
+// action=PERMIT (the packet forwards). It must be counted as a screen ALARM,
+// NOT a screen drop — otherwise the alarm inflates ScreenDropEvents under
+// exactly the condition it fires, masking real screen drops. A real screen
+// drop (action=DENY/REJECT) must still bump ScreenDropEvents.
+//
+// Fail-on-revert: if recordDataplaneEvent reverts to classifying by frame
+// type alone, the permit alarm would land in ScreenDropEvents and both the
+// "alarm != drop" and "alarm is counted" assertions below would fail.
+func TestRecordDataplaneEventScreenAlarmNotDrop(t *testing.T) {
+	cases := []struct {
+		name        string
+		action      uint8
+		wantDrop    uint64
+		wantAlarm   uint64
+	}{
+		{"permit_alarm", dataplane.ActionPermit, 0, 1},
+		{"deny_drop", dataplane.ActionDeny, 1, 0},
+		{"reject_drop", dataplane.ActionReject, 1, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			es := &EventStream{}
+			es.recordDataplaneEvent(EventFrameTypeScreenDrop, tc.action)
+			if got := es.ScreenDropEvents.Load(); got != tc.wantDrop {
+				t.Fatalf("ScreenDropEvents = %d, want %d (action=%d)",
+					got, tc.wantDrop, tc.action)
+			}
+			if got := es.ScreenAlarmEvents.Load(); got != tc.wantAlarm {
+				t.Fatalf("ScreenAlarmEvents = %d, want %d (action=%d)",
+					got, tc.wantAlarm, tc.action)
+			}
+		})
+	}
+}
+
+// TestRecordDataplaneEventNonScreenIgnoresAction confirms the action gate is
+// scoped to screen events: a policy-deny/filter-log event is counted by type
+// regardless of action.
+func TestRecordDataplaneEventNonScreenIgnoresAction(t *testing.T) {
+	es := &EventStream{}
+	es.recordDataplaneEvent(EventFrameTypePolicyDeny, dataplane.ActionPermit)
+	es.recordDataplaneEvent(EventFrameTypeFilterLog, dataplane.ActionPermit)
+	if got := es.PolicyDenyEvents.Load(); got != 1 {
+		t.Fatalf("PolicyDenyEvents = %d, want 1", got)
+	}
+	if got := es.FilterLogEvents.Load(); got != 1 {
+		t.Fatalf("FilterLogEvents = %d, want 1", got)
+	}
+	if got := es.ScreenAlarmEvents.Load(); got != 0 {
+		t.Fatalf("ScreenAlarmEvents = %d, want 0", got)
+	}
+}
+
+// TestDataplaneEventActionFromPayload verifies the action byte is read from the
+// canonical wire offset (54) and that a truncated payload reports ActionDeny so
+// it is never misclassified as a permit alarm (#2298).
+func TestDataplaneEventActionFromPayload(t *testing.T) {
+	permit := buildTypedDataplaneEventV4Payload(
+		dataplane.EventTypeScreenDrop,
+		dataplane.ActionPermit,
+		6,          // proto
+		1234, 5678, // ports
+		[4]byte{10, 0, 0, 1}, [4]byte{10, 0, 0, 2},
+		[4]byte{}, 0,
+		1, 0, // zones
+		0, 0, 0, 0,
+		19, // SCREEN_SCAN_TABLE_PRESSURE reason bit (1<<19, #2234)
+		0,
+	)
+	if got := dataplaneEventAction(permit); got != dataplane.ActionPermit {
+		t.Fatalf("dataplaneEventAction(permit) = %d, want %d", got, dataplane.ActionPermit)
+	}
+	deny := buildTypedDataplaneEventV4Payload(
+		dataplane.EventTypeScreenDrop,
+		dataplane.ActionDeny,
+		6, 1234, 5678,
+		[4]byte{10, 0, 0, 1}, [4]byte{10, 0, 0, 2},
+		[4]byte{}, 0, 1, 0, 0, 0, 0, 0, 0, 0,
+	)
+	if got := dataplaneEventAction(deny); got != dataplane.ActionDeny {
+		t.Fatalf("dataplaneEventAction(deny) = %d, want %d", got, dataplane.ActionDeny)
+	}
+	// Truncated payload (<= offset 54) must default to ActionDeny.
+	if got := dataplaneEventAction([]byte{4, 6}); got != dataplane.ActionDeny {
+		t.Fatalf("dataplaneEventAction(truncated) = %d, want %d", got, dataplane.ActionDeny)
+	}
+}

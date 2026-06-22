@@ -419,8 +419,8 @@ func FormatStatusSummary(status userspace.ProcessStatus) string {
 			es.FramesRead, es.FramesWritten, es.DecodeErrors, es.SeqGaps)
 		fmt.Fprintf(&b, "  Event stream producer:     sent=%d dropped=%d\n",
 			status.EventStreamSent, status.EventStreamDropped)
-		fmt.Fprintf(&b, "  Event stream events:       policy_deny=%d screen_drop=%d filter_log=%d unknown_drops=%d\n",
-			es.PolicyDenyEvents, es.ScreenDropEvents, es.FilterLogEvents, es.UnknownFrameDrops)
+		fmt.Fprintf(&b, "  Event stream events:       policy_deny=%d screen_drop=%d screen_alarm=%d filter_log=%d unknown_drops=%d\n",
+			es.PolicyDenyEvents, es.ScreenDropEvents, es.ScreenAlarmEvents, es.FilterLogEvents, es.UnknownFrameDrops)
 		fmt.Fprintf(&b, "  Event stream drops:        policy_deny=%d screen_drop=%d filter_log=%d\n",
 			es.PolicyDenyDrops, es.ScreenDropDrops, es.FilterLogDrops)
 	}
