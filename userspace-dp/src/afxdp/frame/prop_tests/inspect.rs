@@ -513,7 +513,9 @@ fn pin_ipv4_non_first_fragment_no_session_flow_frame_led() {
     assert_eq!(control, pkt.session_flow());
 
     // Set IPv4 fragment offset = 1 (8-byte units) in bytes l3+6..l3+8.
-    // High 13 bits are the offset; low 3 are flags. 0x0001 -> offset 1.
+    // IPv4 frag_off layout: HIGH 3 bits are flags (Reserved/DF/MF), LOW
+    // 13 bits are the fragment offset (`& 0x1FFF`, per
+    // ipv4_is_non_first_fragment). 0x0001 -> offset 1, no flags.
     let mut frag = pkt.frame.clone();
     let off = u16::from_be_bytes([frag[pkt.l3 + 6], frag[pkt.l3 + 7]]) | 0x0001;
     frag[pkt.l3 + 6..pkt.l3 + 8].copy_from_slice(&off.to_be_bytes());
@@ -566,7 +568,8 @@ fn pin_ipv4_non_first_fragment_no_session_flow_meta_fast_path() {
 fn pin_ipv4_first_fragment_offset_zero_still_parses() {
     let pkt = build_valid_frame(&ipv4_tcp_spec());
     let mut frag = pkt.frame.clone();
-    // Set MF (bit 0x2000) but keep offset 0 -> this is a FIRST fragment.
+    // Set MF (one of the HIGH 3 flag bits, 0x2000) but keep the LOW 13
+    // offset bits 0 -> this is a FIRST fragment.
     let off = u16::from_be_bytes([frag[pkt.l3 + 6], frag[pkt.l3 + 7]]) | 0x2000;
     frag[pkt.l3 + 6..pkt.l3 + 8].copy_from_slice(&off.to_be_bytes());
     assert!(
