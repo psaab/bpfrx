@@ -12,6 +12,8 @@ inspect or rewrite a packet sitting in a UMEM frame.
 | `byte_writes.rs` | In-place IP and L4 port rewrites (`write_ipv4_dst`, `write_ipv4_src`, `write_ipv6_dst`, `write_ipv6_src`, `write_l4_dst_port`, `write_l4_src_port`). |
 | `checksum.rs` | IPv4 header + L4 checksum incremental adjust + recompute. Owns the `checksum16_*` family, the `ChecksumFamily` enum, and the two zero-checksum predicates (`l4_udp_checksum_optional` — RFC 768 received-0 skip, IPv4 UDP only (#1840); `adjust_zero_checksum_illegal` — computed-0 → 0xFFFF canonicalization, v4 UDP / v6 UDP+ICMPv6 (#1839)). The v6 adjusters/recompute take a caller-supplied `rel_l4` (ext-aware offset, #1838). |
 | `inspect.rs` | Read-only parsers / matchers used by screen, policy, conntrack hot paths. |
+| `generated.rs` | #2238: `generated_reply_session_key()` — parse a LOCALLY-GENERATED reply frame (Time Exceeded / policy-reject RST/ICMP-unreachable / SYN-cookie SYN-ACK/ACK-RST) back into its OWN egress `(SessionKey, ForwardPacketMeta)` so the output classifier (`tx::classify_generated_reply`) keys on the reply's real tuple, not the trigger's. Reuses `frame_l3_offset` + the bounded v6 ext-header walk (one wire parser). Cold path only; `None` on a parse failure → caller fails CLOSED. |
+| `generated_tests.rs` | Co-located unit tests for `generated.rs`. |
 | `tcp.rs` | TCP-specific inspection + mutation kernels (#989) — flags, MSS clamp, header munging. |
 | `tcp_segmentation.rs` | TCP segmentation kernels for forwarded over-MSS frames; re-exported from `mod.rs`. The `#[cold]` annotation is on the TX-side wrapper in `tx/tcp_segmentation.rs` that calls into these kernels, not on the kernels themselves. |
 | `tests.rs` | Co-located unit tests; relocated out of `mod.rs` in #1046 Phase 1. |
