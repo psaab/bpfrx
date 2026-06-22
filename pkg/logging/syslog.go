@@ -8,7 +8,26 @@ import (
 	"net"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
+)
+
+// Resilience defaults for the stream (TCP/TLS) transports. These bound the
+// time the dataplane event hot-path can spend inside a single Send and rate-
+// limit reconnect attempts so a down server cannot drive a fresh 5s-timeout
+// dial on every event. UDP is connectionless and never blocks on Write, so
+// these do not apply to it.
+const (
+	// defaultWriteTimeout caps how long a single conn.Write may block before
+	// it is treated as a write failure (message dropped, reconnect armed).
+	// Generous enough that a healthy server is never affected; short enough
+	// that a hung server cannot stall the event reader.
+	defaultWriteTimeout = 4 * time.Second
+	// defaultReconnectCooldown is the minimum interval between dial attempts
+	// after a dial failure. Within the window, a stream Send that needs a
+	// reconnect fails fast (drops) instead of dialing — preventing a
+	// thundering herd of 5s dials against a down server.
+	defaultReconnectCooldown = 1 * time.Second
 )
 
 // Syslog severity levels (RFC 3164).
@@ -50,6 +69,37 @@ type SyslogClient struct {
 	MinSeverity int    // 0 = no filter, else SyslogError(3)/SyslogWarning(4)/SyslogInfo(6)
 	Format      string // "sd-syslog" for RFC 5424, "structured" for Junos RT_FLOW, "" for RFC 3164
 	Categories  uint8  // bitmask of allowed event categories (0 = all)
+
+	// Stream-transport resilience (TCP/TLS). All guarded by mu except the
+	// atomic counters, which are observability only.
+	writeTimeout      time.Duration // per-Write deadline; 0 disables (UDP)
+	reconnectCooldown time.Duration // min interval between dial attempts
+	lastDialFailure   time.Time     // when the last dial failed (mu-guarded)
+	lastDropLog       time.Time     // rate-limit for the drop warning (mu-guarded)
+
+	droppedWrites   atomic.Uint64 // messages dropped on a write timeout/error
+	droppedCooldown atomic.Uint64 // messages dropped because reconnect was in cooldown
+
+	// Seams for deterministic testing. nil → real implementations.
+	nowFn  func() time.Time          // clock source (default time.Now)
+	dialFn func() (net.Conn, error)  // dial override (default s.dial)
+}
+
+// now returns the client's clock (overridable in tests).
+func (s *SyslogClient) now() time.Time {
+	if s.nowFn != nil {
+		return s.nowFn()
+	}
+	return time.Now()
+}
+
+// dialConn dials a new connection via the test seam if set, else the real
+// protocol dialer.
+func (s *SyslogClient) dialConn() (net.Conn, error) {
+	if s.dialFn != nil {
+		return s.dialFn()
+	}
+	return s.dial()
 }
 
 // Category bitmask constants for event filtering.
@@ -86,12 +136,14 @@ func NewSyslogClientTransport(host string, port int, sourceAddr, protocol string
 	}
 
 	c := &SyslogClient{
-		hostname:   hostname,
-		remoteAddr: remoteAddr,
-		sourceAddr: sourceAddr,
-		protocol:   protocol,
-		tlsConfig:  tlsCfg,
-		Facility:   FacilityLocal0,
+		hostname:          hostname,
+		remoteAddr:        remoteAddr,
+		sourceAddr:        sourceAddr,
+		protocol:          protocol,
+		tlsConfig:         tlsCfg,
+		Facility:          FacilityLocal0,
+		writeTimeout:      defaultWriteTimeout,
+		reconnectCooldown: defaultReconnectCooldown,
 	}
 
 	conn, err := c.dial()
@@ -156,19 +208,65 @@ func (s *SyslogClient) dialTLS() (net.Conn, error) {
 	return dialer.DialContext(context.Background(), "tcp", s.remoteAddr)
 }
 
-// reconnect attempts to re-establish the connection. Called with mu held.
+// reconnect attempts to re-establish the connection, subject to a cooldown so
+// a down server cannot drive a fresh dial on every event. Called with mu held.
+//
+// Returns errReconnectCooldown without dialing if the previous dial failed
+// within reconnectCooldown; the caller drops the message and continues. The
+// event hot-path therefore never spends more than one dial's worth of time per
+// cooldown window on a dead target.
 func (s *SyslogClient) reconnect() error {
+	if s.reconnectCooldown > 0 && !s.lastDialFailure.IsZero() {
+		if s.now().Sub(s.lastDialFailure) < s.reconnectCooldown {
+			return errReconnectCooldown
+		}
+	}
 	if s.conn != nil {
 		s.conn.Close()
 		s.conn = nil
 	}
-	conn, err := s.dial()
+	conn, err := s.dialConn()
 	if err != nil {
+		s.lastDialFailure = s.now()
 		return err
 	}
+	s.lastDialFailure = time.Time{}
 	s.conn = conn
 	return nil
 }
+
+// errReconnectCooldown signals that a reconnect was suppressed by the cooldown
+// window; the message is dropped (fail-fast) rather than blocking on a dial.
+var errReconnectCooldown = fmt.Errorf("syslog reconnect in cooldown")
+
+// noteDrop bumps the appropriate drop counter and emits a rate-limited warning
+// so a flapping target cannot spam the log on the event hot-path. Called with
+// mu held.
+func (s *SyslogClient) noteDrop(cooldown bool, err error) {
+	if cooldown {
+		s.droppedCooldown.Add(1)
+	} else {
+		s.droppedWrites.Add(1)
+	}
+	now := s.now()
+	if s.lastDropLog.IsZero() || now.Sub(s.lastDropLog) >= time.Second {
+		s.lastDropLog = now
+		slog.Warn("syslog message dropped",
+			"addr", s.remoteAddr,
+			"cooldown", cooldown,
+			"dropped_writes", s.droppedWrites.Load(),
+			"dropped_cooldown", s.droppedCooldown.Load(),
+			"err", err)
+	}
+}
+
+// DroppedWrites reports the count of messages dropped on a write timeout or
+// write error (observability).
+func (s *SyslogClient) DroppedWrites() uint64 { return s.droppedWrites.Load() }
+
+// DroppedCooldown reports the count of messages dropped because a reconnect was
+// suppressed by the cooldown window (observability).
+func (s *SyslogClient) DroppedCooldown() uint64 { return s.droppedCooldown.Load() }
 
 // Send sends a syslog message with the given severity.
 // For TCP/TLS, uses RFC 6587 octet-counting framing.
@@ -190,13 +288,21 @@ func (s *SyslogClient) Send(severity int, msg string) error {
 	defer s.mu.Unlock()
 
 	if err := s.writeMsg(line); err != nil {
-		// For stream protocols, attempt one reconnect
+		// For stream protocols, attempt one cooldown-gated reconnect. UDP
+		// never blocks or needs reconnect, so it just returns the error.
 		if s.protocol != "udp" {
 			slog.Debug("syslog send failed, reconnecting", "addr", s.remoteAddr, "err", err)
 			if rerr := s.reconnect(); rerr != nil {
+				// Cooldown or dial failure: drop and continue. The event
+				// reader must make forward progress regardless.
+				s.noteDrop(rerr == errReconnectCooldown, err)
 				return fmt.Errorf("syslog reconnect %s: %w", s.remoteAddr, rerr)
 			}
-			return s.writeMsg(line)
+			if werr := s.writeMsg(line); werr != nil {
+				s.noteDrop(false, werr)
+				return werr
+			}
+			return nil
 		}
 		return err
 	}
@@ -214,7 +320,22 @@ func (s *SyslogClient) writeMsg(line string) error {
 	}
 	// TCP/TLS: RFC 6587 octet-counting: "<length> <message>"
 	framed := fmt.Sprintf("%d %s", len(line), line)
-	_, err := s.conn.Write([]byte(framed))
+	return s.streamWrite([]byte(framed))
+}
+
+// streamWrite writes to a TCP/TLS conn with a bounded write deadline so a
+// hung/congested server cannot block the dataplane event reader indefinitely.
+// A deadline expiry surfaces as a timeout error (os.ErrDeadlineExceeded);
+// callers treat it as a write failure and drop the message. Called with mu
+// held; conn is non-nil.
+func (s *SyslogClient) streamWrite(b []byte) error {
+	if s.writeTimeout > 0 {
+		// Best-effort: if SetWriteDeadline is unsupported by the conn it
+		// returns an error we ignore (the Write still proceeds, just
+		// without the bound). Real TCP/TLS conns always support it.
+		_ = s.conn.SetWriteDeadline(s.now().Add(s.writeTimeout))
+	}
+	_, err := s.conn.Write(b)
 	return err
 }
 
@@ -229,9 +350,14 @@ func (s *SyslogClient) SendBinary(data []byte) error {
 		if s.protocol != "udp" {
 			slog.Debug("syslog binary send failed, reconnecting", "addr", s.remoteAddr, "err", err)
 			if rerr := s.reconnect(); rerr != nil {
+				s.noteDrop(rerr == errReconnectCooldown, err)
 				return fmt.Errorf("syslog reconnect %s: %w", s.remoteAddr, rerr)
 			}
-			return s.writeBinaryMsg(data)
+			if werr := s.writeBinaryMsg(data); werr != nil {
+				s.noteDrop(false, werr)
+				return werr
+			}
+			return nil
 		}
 		return err
 	}
@@ -243,8 +369,11 @@ func (s *SyslogClient) writeBinaryMsg(data []byte) error {
 	if s.conn == nil {
 		return fmt.Errorf("syslog connection closed")
 	}
-	_, err := s.conn.Write(data)
-	return err
+	if s.protocol == "udp" {
+		_, err := s.conn.Write(data)
+		return err
+	}
+	return s.streamWrite(data)
 }
 
 // ShouldSend returns true if the event severity passes this client's filter.

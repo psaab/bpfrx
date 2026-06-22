@@ -9646,6 +9646,29 @@ top.
   userspace-dp/src/session/README.md, _Log.md
 
 - **Timestamp**: 2026-06-21
+  **Action**: #2283 — syslog stream-transport resilience on the shared
+  dataplane event hot-path. Two fixes in pkg/logging: (1) per-write deadline
+  (`SetWriteDeadline(now + writeTimeout)`, default 4s) on every TCP/TLS
+  `conn.Write` via a new `streamWrite` helper so a hung/congested syslog
+  server can no longer block the event reader indefinitely — a deadline
+  expiry drops the message (counted) and the reader continues; (2) reconnect
+  cooldown (default 1s) gating `reconnect()` — a write failure attempts one
+  reconnect, but if the previous dial failed inside the window the reconnect
+  is skipped and the send fails fast (drop), preventing a thundering herd of
+  5s-timeout dials against a down server. UDP is exempt (connectionless,
+  never blocks). Added `nowFn`/`dialFn` test seams + `droppedWrites`/
+  `droppedCooldown` atomic counters (DroppedWrites()/DroppedCooldown()
+  accessors) + rate-limited (≤1/s) drop warning. New tests in
+  syslog_resilience_test.go with deterministic fakes (deadline-honouring
+  conn, always-fail conn, controllable clock) and NO sleeps: hang test
+  fails-on-revert if the deadline is removed; cooldown test fails-on-revert
+  (50 dials vs 1) if the cooldown gate is removed; healthy-path test proves
+  every message is delivered with no deadline-induced drop and a single dial.
+  go build/vet green; pkg/logging -race 5x no flake (only the pre-existing,
+  unrelated TestRawEventContractMatchesDataplaneEvent screen-flag mismatch
+  fails on clean origin/master too). README documents the contract.
+  **File(s)**: pkg/logging/syslog.go, pkg/logging/syslog_resilience_test.go,
+  pkg/logging/README.md, _Log.md
   **Action**: #2282 grpcapi input-validation hardening — Complete RPC
   negative-Pos slice-panic guard + ShowNAT int32 port-pool overflow clamp.
   Complete now rejects req.Pos < 0 with codes.InvalidArgument before

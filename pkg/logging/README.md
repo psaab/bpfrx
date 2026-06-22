@@ -35,6 +35,39 @@ reports.
 - Never put `slog.Info` inside per-session, per-packet, or per-poll-tick
   loops.
 
+## Syslog stream-transport resilience (#2283)
+
+`SyslogClient.Send` / `SendBinary` are reached on the SHARED dataplane
+event hot-path (EventStream reader → `EventReader.ProcessRawEvent` →
+`logEvent` → `SyslogClient.Send`). The event reader runs that path
+inline, so a syslog client must never block or thrash on a bad target.
+Two bounds enforce that for the stream transports (TCP/TLS); UDP is
+connectionless and exempt:
+
+- **Per-write deadline.** Every TCP/TLS `conn.Write` is preceded by
+  `SetWriteDeadline(now + writeTimeout)` (default
+  `defaultWriteTimeout`, 4s). A slow/hung/congested server surfaces as
+  `os.ErrDeadlineExceeded`; the message is dropped (counted, not
+  retried-in-place) and the reader continues. Without this a hung
+  server stalls the entire event reader indefinitely.
+- **Reconnect cooldown.** A write failure on a stream transport
+  attempts one reconnect, gated by `reconnectCooldown` (default
+  `defaultReconnectCooldown`, 1s). If the previous dial failed inside
+  the window, the reconnect is skipped and the send fails fast (drop) —
+  so a down server cannot drive a fresh 5s-timeout dial on every event
+  (thundering herd). `lastDialFailure` is cleared on a successful dial.
+
+Drops are observable via `DroppedWrites()` (write timeout/error) and
+`DroppedCooldown()` (reconnect suppressed by cooldown); the drop
+warning is rate-limited to ≤1/s so a flapping target cannot spam the
+log from the hot-path (CLAUDE.md logging rules).
+
+Tests (`syslog_resilience_test.go`) use deterministic fakes — a
+deadline-honouring conn, an always-fail conn, a controllable clock, and
+a dial seam (`dialFn`/`nowFn`) — with no sleeps. The hang test fails if
+the write deadline is removed; the cooldown test fails if the cooldown
+gate is removed.
+
 ## Gotchas
 
 - The binary RT_FLOW format used by Junos session logging is custom; it
