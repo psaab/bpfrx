@@ -254,7 +254,13 @@ type xpfCollector struct {
 	// captured via recvmsg IP_RECVTOS/IPV6_RECVTCLASS, over a Not-ECT
 	// inner) — the WG sibling of the GRE counter above.
 	userspaceWgDecapEcnIllegalDrops *prometheus.Desc
-	userspaceFlowCacheActiveFlows   *prometheus.Desc
+	// #2331: native-GRE encap frames dropped because the fully built outer
+	// datagram exceeded the resolved transport/egress MTU while the IPv4
+	// outer carries DF=1 (the only outer the native builder emits). A
+	// DF-set oversized outer cannot be fragmented downstream and would
+	// silently blackhole every inner flow with no PMTUD signal.
+	userspaceGreEncapDfOversizeDrops *prometheus.Desc
+	userspaceFlowCacheActiveFlows    *prometheus.Desc
 	userspaceFlowCacheCapacity      *prometheus.Desc
 	// #1379: daemon-side userspace event-stream transport counters.
 	userspaceEventStreamFramesTotal          *prometheus.Desc
@@ -542,6 +548,7 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.userspaceWorkerCommandQueuePoisonRecoveries
 	ch <- c.userspaceGreDecapEcnIllegalDrops
 	ch <- c.userspaceWgDecapEcnIllegalDrops
+	ch <- c.userspaceGreEncapDfOversizeDrops
 	ch <- c.userspaceFlowCacheActiveFlows
 	ch <- c.userspaceFlowCacheCapacity
 	ch <- c.userspaceEventStreamFramesTotal

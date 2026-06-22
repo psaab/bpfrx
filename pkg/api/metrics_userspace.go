@@ -544,6 +544,16 @@ func (c *xpfCollector) emitUserspaceDynamicBufferMetrics(ch chan<- prometheus.Me
 		float64(status.WgDecapEcnIllegalDropsTotal),
 	)
 
+	// #2331: native-GRE encap DF-set oversized-outer drops. Emitted
+	// unconditionally so a 0 is a real "no oversized DF outers refused"
+	// signal rather than an absent series. Nonzero flags inner flows whose
+	// encapped size exceeds the tunnel path MTU.
+	ch <- prometheus.MustNewConstMetric(
+		c.userspaceGreEncapDfOversizeDrops,
+		prometheus.CounterValue,
+		float64(status.GreEncapDfOversizeDropsTotal),
+	)
+
 	var activeFlows, flowCapacity uint64
 	for _, b := range status.Bindings {
 		activeFlows += uint64(b.ActiveFlowCount)

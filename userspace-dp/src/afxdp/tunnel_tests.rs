@@ -351,6 +351,168 @@ fn gre_encap_copies_inner_dscp_ecn_to_outer_ipv6_traffic_class() {
     assert_ne!(outer_tc, 0, "stripped DSCP/ECN regression");
 }
 
+/// Build a valid IPv4 inner packet of exactly `total` bytes (>= 20),
+/// with the IPv4 total-length field set to `total` so
+/// `packet_trimmed_len` keeps the whole buffer (no trim).
+fn inner_ipv4_of_len(total: usize) -> Vec<u8> {
+    assert!(total >= 20 && total <= u16::MAX as usize);
+    let mut pkt = vec![0u8; total];
+    pkt[0] = 0x45; // version 4, IHL 5
+    pkt[1] = 0; // TOS
+    pkt[2..4].copy_from_slice(&(total as u16).to_be_bytes()); // total length
+    pkt[8] = 64; // TTL
+    pkt[9] = PROTO_TCP;
+    pkt[12..16].copy_from_slice(&[10, 0, 0, 1]); // src
+    pkt[16..20].copy_from_slice(&[10, 0, 0, 2]); // dst
+    pkt
+}
+
+// --- #2331 native-GRE encap DF-set oversized-outer MTU guard -----------
+
+use super::super::gre::{gre_encapped_outer_len, GRE_ENCAP_DF_OVERSIZE_DROPS};
+
+/// The pure outer-L3 arithmetic must fold in the GRE key bytes (already
+/// part of `gre_len`) and EXCLUDE the L2 header. Fail-on-revert: if the
+/// helper ever starts counting eth/VLAN, or drops the key term, the
+/// expected sums below diverge.
+#[test]
+fn gre_encapped_outer_len_is_outer_l3_only() {
+    // IPv6 outer (40) + GRE no-key (4) + 1000 inner = 1044.
+    assert_eq!(gre_encapped_outer_len(40, 4, 1000), 1044);
+    // IPv4 outer (20) + GRE with key (8) + 1000 inner = 1028; the 4-byte
+    // key adds exactly 4 vs the no-key (20 + 4 + 1000 = 1024) case.
+    assert_eq!(gre_encapped_outer_len(20, 8, 1000), 1028);
+    assert_eq!(gre_encapped_outer_len(20, 4, 1000), 1024);
+}
+
+#[test]
+fn gre_encap_drops_oversized_df_outer_and_bumps_counter() {
+    // The gre1881 fixture is IPv6-outer (40-byte outer IP), no key
+    // (gre_len 4), 1500-byte transport MTU. Discover the resolved outer
+    // MTU, then size the inner so the built outer L3 (40 + 4 + inner)
+    // exceeds it by one byte — the DF-set / un-fragmentable oversized
+    // case the builder must refuse.
+    let state = gre1881_state();
+    let decision = SessionDecision {
+        resolution: gre_encap_resolution(),
+        nat: NatDecision::default(),
+    };
+    let endpoint = state.tunnel_endpoints.get(&1).expect("fixture endpoint");
+    let outer_mtu = tunnel_outer_mtu(&state, &decision, endpoint);
+    assert!(outer_mtu > 64, "fixture outer MTU should be ~1500");
+
+    // outer L3 = 40 (IPv6) + 4 (GRE no-key) + inner_len; pick inner_len so
+    // the outer is exactly outer_mtu + 1.
+    let inner_len = outer_mtu + 1 - (40 + 4);
+    let inner = inner_ipv4_of_len(inner_len);
+    let inner_frame = wrap_raw_ip_packet_for_tunnel(&inner, libc::AF_INET as u8);
+    let mut meta = ForwardPacketMeta::default();
+    meta.addr_family = libc::AF_INET as u8;
+    meta.protocol = PROTO_TCP;
+    meta.l3_offset = 14;
+
+    let before = GRE_ENCAP_DF_OVERSIZE_DROPS.load(Ordering::Relaxed);
+    let out = encapsulate_native_gre_frame(&inner_frame, meta, &decision, &state);
+
+    assert!(
+        out.is_none(),
+        "an outer datagram larger than the transport MTU must NOT be \
+         emitted (DF-set / un-fragmentable blackhole) — pre-#2331 it was"
+    );
+    // `>=` not `== before + 1`: GRE_ENCAP_DF_OVERSIZE_DROPS is a
+    // process-global static and the other oversize tests (key-present)
+    // may bump it between the snapshots when tests run in parallel.
+    assert!(
+        GRE_ENCAP_DF_OVERSIZE_DROPS.load(Ordering::Relaxed) >= before + 1,
+        "the oversized-DF-outer drop must advance the counter"
+    );
+}
+
+#[test]
+fn gre_encap_emits_when_outer_within_mtu() {
+    // Same fixture, but size the inner so the outer L3 is exactly at the
+    // MTU — the legitimate in-MTU case must still build a frame.
+    let state = gre1881_state();
+    let decision = SessionDecision {
+        resolution: gre_encap_resolution(),
+        nat: NatDecision::default(),
+    };
+    let endpoint = state.tunnel_endpoints.get(&1).expect("fixture endpoint");
+    let outer_mtu = tunnel_outer_mtu(&state, &decision, endpoint);
+
+    let inner_len = outer_mtu - (40 + 4); // outer L3 == outer_mtu exactly
+    let inner = inner_ipv4_of_len(inner_len);
+    let inner_frame = wrap_raw_ip_packet_for_tunnel(&inner, libc::AF_INET as u8);
+    let mut meta = ForwardPacketMeta::default();
+    meta.addr_family = libc::AF_INET as u8;
+    meta.protocol = PROTO_TCP;
+    meta.l3_offset = 14;
+
+    let out = encapsulate_native_gre_frame(&inner_frame, meta, &decision, &state);
+
+    // The Some(_) return is the fail-on-revert signal here: an outer
+    // exactly AT the MTU must still build a frame (the guard is strictly
+    // `>`, not `>=`). We do NOT assert the global drop counter is
+    // unchanged — it is a process-global static shared with the parallel
+    // oversize tests, which would race a `== before` check.
+    assert!(
+        out.is_some(),
+        "an outer exactly AT the transport MTU must still be emitted"
+    );
+}
+
+#[test]
+fn gre_encap_mtu_accounts_for_4byte_key() {
+    // Boundary test: pick an inner_len so the NO-key outer (gre_len 4) is
+    // exactly at the MTU, then flip the endpoint to key-present (gre_len
+    // 8). The extra 4 key bytes push the same inner one over the MTU —
+    // proving the key is folded into the MTU math (#2331 / issue's
+    // key-present requirement). No-key: emits. Key-present: drops.
+    let mut state = gre1881_state();
+    let decision = SessionDecision {
+        resolution: gre_encap_resolution(),
+        nat: NatDecision::default(),
+    };
+    let endpoint = state.tunnel_endpoints.get(&1).expect("fixture endpoint");
+    let outer_mtu = tunnel_outer_mtu(&state, &decision, endpoint);
+
+    // outer L3 (no key) = 40 + 4 + inner_len == outer_mtu exactly.
+    let inner_len = outer_mtu - (40 + 4);
+    let inner = inner_ipv4_of_len(inner_len);
+    let inner_frame = wrap_raw_ip_packet_for_tunnel(&inner, libc::AF_INET as u8);
+    let mut meta = ForwardPacketMeta::default();
+    meta.addr_family = libc::AF_INET as u8;
+    meta.protocol = PROTO_TCP;
+    meta.l3_offset = 14;
+
+    // No key: at the MTU, must emit.
+    assert!(
+        encapsulate_native_gre_frame(&inner_frame, meta, &decision, &state).is_some(),
+        "no-key outer exactly at MTU must emit"
+    );
+
+    // Flip the endpoint to key-present: the +4 key bytes tip it oversize.
+    state
+        .tunnel_endpoints
+        .get_mut(&1)
+        .expect("fixture endpoint")
+        .key = 0x1234_5678;
+
+    let before = GRE_ENCAP_DF_OVERSIZE_DROPS.load(Ordering::Relaxed);
+    let out = encapsulate_native_gre_frame(&inner_frame, meta, &decision, &state);
+    assert!(
+        out.is_none(),
+        "with a 4-byte GRE key the same inner exceeds the MTU and must \
+         be dropped — the key bytes MUST be counted in the MTU math"
+    );
+    // `>=`: process-global static, parallel-test-safe (see the sibling
+    // oversize test's note).
+    assert!(
+        GRE_ENCAP_DF_OVERSIZE_DROPS.load(Ordering::Relaxed) >= before + 1,
+        "key-present oversize must advance the counter"
+    );
+}
+
 #[test]
 fn inner_tos_byte_reads_ipv4_and_ipv6() {
     // IPv4: TOS is octet 1.

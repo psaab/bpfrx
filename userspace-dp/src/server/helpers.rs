@@ -93,6 +93,12 @@ pub(crate) fn refresh_status(state: &mut ServerState) {
     // un-ECN inner traffic on a congested path.
     state.status.wg_decap_ecn_illegal_drops_total =
         state.afxdp.wg_decap_ecn_illegal_drops_total();
+    // #2331: native-GRE encap DF-set oversized-outer drops. Nonzero =
+    // inner flows whose encapped size exceeds the tunnel path MTU; the
+    // builder refused to emit the un-fragmentable DF outer (blackhole)
+    // rather than silently dropping it downstream.
+    state.status.gre_encap_df_oversize_drops_total =
+        state.afxdp.gre_encap_df_oversize_drops_total();
     // The per-key dynamic_neighbors dump is a high-cardinality
     // (ifindex,ip)-labelled debug surface used only by the #1782 cold-start
     // capture. Gate it behind XPF_DEBUG_NEIGHBOR_KEYS so it is OFF by default:

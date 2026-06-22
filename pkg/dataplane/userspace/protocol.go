@@ -817,6 +817,16 @@ type ProcessStatus struct {
 	// xpf_userspace_wg_decap_ecn_illegal_drops_total. Omitempty for wire
 	// compat with older helpers (defaults to 0).
 	WgDecapEcnIllegalDropsTotal uint64 `json:"wg_decap_ecn_illegal_drops_total,omitempty"`
+	// #2331: native-GRE encap frames dropped because the fully built outer
+	// datagram (outer IP + GRE[+key] + inner) exceeded the resolved
+	// transport/egress MTU while the IPv4 outer carries DF=1 (the only
+	// outer the native encap builder emits). A DF-set oversized outer
+	// cannot be fragmented downstream and would silently blackhole every
+	// inner flow with no PMTUD signal — so the builder refuses to emit it.
+	// Surfaced as xpf_userspace_gre_encap_df_oversize_drops_total. PMTUD /
+	// PTB signalling is deferred to #2330. Omitempty for wire compat with
+	// older helpers (defaults to 0).
+	GreEncapDfOversizeDropsTotal uint64 `json:"gre_encap_df_oversize_drops_total,omitempty"`
 	// #1769: on-demand neighbor-resolver telemetry. The resolver fires
 	// when a MissingNeighbor negative-cache fast-fail nudges a wedged dst
 	// (single-key RTM_GETNEIGH + epoch-guarded cache or probe-on-stale).

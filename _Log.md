@@ -10316,3 +10316,31 @@ top.
   userspace-dp/src/afxdp/types/forwarding.rs,
   userspace-dp/src/afxdp/tests.rs, docs/userspace-native-gre-plan.md,
   _Log.md
+
+- **Timestamp**: 2026-06-22
+  **Action**: #2331 — native GRE encap outer-MTU / DF-set oversize guard.
+  `encapsulate_native_gre_frame` (gre.rs) now sizes the full outer
+  datagram (outer IP + GRE[+key] + inner via the new
+  `gre_encapped_outer_len` helper, L2 excluded) and compares it against
+  the resolved transport MTU (`tunnel_outer_mtu`, #2300 SSOT) BEFORE
+  allocating/emitting. An outer larger than the MTU is NOT emitted (the
+  IPv4 outer is DF=1 / IPv6 cannot be in-path fragmented → downstream
+  blackhole, no PMTUD); it is dropped and bumps the new
+  `GRE_ENCAP_DF_OVERSIZE_DROPS` static, wired through status.rs →
+  server/helpers.rs+lifecycle.rs → ProcessStatus
+  (gre_encap_df_oversize_drops_total) → Go protocol.go + metrics
+  (xpf_userspace_gre_encap_df_oversize_drops_total). PMTUD/PTB
+  signalling DEFERRED to #2330 (matches the deliberate
+  !uses_native_tunnel exclusion in the #2301 dispatch PTB path). 5
+  fail-on-revert Rust tests + Go metric assertions; protocol_wire_v1.json
+  regenerated (1 new key).
+  **File(s)**: userspace-dp/src/afxdp/gre.rs,
+  userspace-dp/src/afxdp/coordinator/status.rs,
+  userspace-dp/src/server/helpers.rs, userspace-dp/src/server/lifecycle.rs,
+  userspace-dp/src/protocol/control.rs, userspace-dp/src/protocol/tests.rs,
+  userspace-dp/src/afxdp/tunnel_tests.rs,
+  userspace-dp/tests/fixtures/protocol_wire_v1.json,
+  pkg/dataplane/userspace/protocol.go, pkg/api/metrics.go,
+  pkg/api/metrics_descriptors.go, pkg/api/metrics_userspace.go,
+  pkg/api/metrics_test.go, pkg/api/metrics_descriptor_coverage_test.go,
+  docs/userspace-native-gre-plan.md, _Log.md

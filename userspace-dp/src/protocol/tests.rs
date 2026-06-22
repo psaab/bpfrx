@@ -220,6 +220,35 @@ fn process_status_wg_decap_ecn_illegal_drops_roundtrip() {
     assert_eq!(legacy.wg_decap_ecn_illegal_drops_total, 0);
 }
 
+// #2331: round-trip + backward-compat pin for the native-GRE encap
+// DF-set oversized-outer drop counter. The wire key feeds
+// pkg/dataplane/userspace/protocol.go and the Prometheus counter
+// `xpf_userspace_gre_encap_df_oversize_drops_total`.
+#[test]
+fn process_status_gre_encap_df_oversize_drops_roundtrip() {
+    let status = ProcessStatus {
+        gre_encap_df_oversize_drops_total: 9,
+        ..Default::default()
+    };
+    let value: serde_json::Value =
+        serde_json::to_value(&status).expect("serialize ProcessStatus to Value");
+    assert_eq!(value["gre_encap_df_oversize_drops_total"], 9);
+    let back: ProcessStatus = serde_json::from_value(value).expect("deserialize ProcessStatus");
+    assert_eq!(back.gre_encap_df_oversize_drops_total, 9);
+
+    // Pre-#2331 payload (key absent) must decode with a zero default.
+    let mut legacy_value =
+        serde_json::to_value(ProcessStatus::default()).expect("serialize default ProcessStatus");
+    legacy_value
+        .as_object_mut()
+        .expect("ProcessStatus serializes to an object")
+        .remove("gre_encap_df_oversize_drops_total")
+        .expect("new key present before strip");
+    let legacy: ProcessStatus =
+        serde_json::from_value(legacy_value).expect("pre-#2331 payload decodes");
+    assert_eq!(legacy.gre_encap_df_oversize_drops_total, 0);
+}
+
 // #1760 W3': round-trip + backward-compat pin for the shared-map NAT
 // reverse-key displacement counter. The wire key feeds
 // pkg/dataplane/userspace/protocol.go and the Prometheus counter

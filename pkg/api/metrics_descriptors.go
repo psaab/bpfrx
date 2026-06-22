@@ -848,6 +848,25 @@ func newCollector(srv *Server) *xpfCollector {
 				"congested path (#2317).",
 			nil, nil,
 		),
+		userspaceGreEncapDfOversizeDrops: prometheus.NewDesc(
+			"xpf_userspace_gre_encap_df_oversize_drops_total",
+			"Native-GRE encap frames dropped because the fully built "+
+				"outer datagram (outer IP + GRE header, including the "+
+				"optional 4-byte key, + inner packet) exceeded the "+
+				"resolved transport/egress MTU while the IPv4 outer "+
+				"carries DF=1 (the only outer the native encap builder "+
+				"emits; the IPv6 outer cannot be fragmented in-path "+
+				"either). A DF-set oversized outer cannot be fragmented "+
+				"downstream and would silently blackhole every inner flow "+
+				"over the tunnel with no PMTUD signal back to the inner "+
+				"source, so the builder refuses to emit it. A nonzero "+
+				"value flags inner flows whose encapped size exceeds the "+
+				"tunnel path MTU (typically a missing or too-high inner "+
+				"MSS clamp, or a non-TCP inner with no segmentation "+
+				"lever). PMTUD/PTB signalling is deferred to #2330 "+
+				"(#2331).",
+			nil, nil,
+		),
 		userspaceFlowCacheActiveFlows: prometheus.NewDesc(
 			"xpf_userspace_flow_cache_active_flows",
 			"Aggregate active userspace flow-cache entries across bindings.",

@@ -204,6 +204,21 @@ impl super::Coordinator {
         crate::afxdp::gre::WG_DECAP_ECN_ILLEGAL_DROPS.load(Ordering::Relaxed)
     }
 
+    /// #2331: native-GRE encap frames dropped because the fully built
+    /// outer datagram exceeded the resolved transport/egress MTU while
+    /// the IPv4 outer carries DF=1 (the only outer the native builder
+    /// emits). A DF-set oversized outer cannot be fragmented downstream
+    /// and would silently blackhole every inner flow over the tunnel
+    /// with no PMTUD signal — so the builder refuses to emit it. Surfaced
+    /// as `xpf_userspace_gre_encap_df_oversize_drops_total`; a nonzero
+    /// value flags inner flows whose encapped size exceeds the tunnel
+    /// path MTU (a missing/too-high inner MSS clamp, or a non-TCP inner
+    /// with no segmentation lever). PMTUD/PTB signalling is deferred to
+    /// #2330.
+    pub fn gre_encap_df_oversize_drops_total(&self) -> u64 {
+        crate::afxdp::gre::GRE_ENCAP_DF_OVERSIZE_DROPS.load(Ordering::Relaxed)
+    }
+
     /// #1782: debug dump of every key currently present in the userspace
     /// `dynamic_neighbors` mirror, as `(ifindex, ip)` pairs. The
     /// cold-start capture harness reads this at the pre-connect t0'

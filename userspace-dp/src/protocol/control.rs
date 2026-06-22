@@ -255,6 +255,19 @@ pub(crate) struct ProcessStatus {
     /// for backward compatibility.
     #[serde(rename = "wg_decap_ecn_illegal_drops_total", default)]
     pub wg_decap_ecn_illegal_drops_total: u64,
+    /// #2331: native-GRE encap frames DROPPED because the fully built
+    /// outer datagram (outer IP + GRE[+key] + inner) exceeded the
+    /// resolved transport/egress MTU while the IPv4 outer carries DF=1
+    /// (the only outer the native encap builder emits). A DF-set
+    /// oversized outer cannot be fragmented downstream and would
+    /// silently blackhole every inner flow with no PMTUD signal — so the
+    /// builder refuses to emit it. Surfaced as the Prometheus counter
+    /// `xpf_userspace_gre_encap_df_oversize_drops_total`; nonzero flags
+    /// inner flows whose encapped size exceeds the tunnel path MTU.
+    /// PMTUD/PTB signalling is deferred to #2330. Additive / defaulted
+    /// for backward compatibility.
+    #[serde(rename = "gre_encap_df_oversize_drops_total", default)]
+    pub gre_encap_df_oversize_drops_total: u64,
     /// #1782 cold-start capture instrumentation. Debug dump of every key
     /// present in the userspace `dynamic_neighbors` mirror, rendered as
     /// `"ifindex ip"` strings. The capture harness greps this at the
