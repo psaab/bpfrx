@@ -13,10 +13,11 @@ import (
 // skipped). A per-handler atomic flag cannot make that distinction and would
 // silently drop legitimate forwarding under concurrent logging.
 //
-// This runs only on the slog path (warnings / state transitions, plus the
-// ≤1/s rate-limited drop warning), never per-packet or per-session, so the
-// runtime.Stack cost is acceptable. The buffer is small because only the
-// header line is needed.
+// This runs on the slog path (Handle) once per forwarded record, but ONLY when
+// at least one syslog client is configured: SyslogSlogHandler.Handle returns
+// before calling goID on the common no-client path (#2295). It never runs
+// per-packet or per-session, so the runtime.Stack cost is acceptable. The
+// buffer is small because only the header line is needed.
 func goID() uint64 {
 	var buf [64]byte
 	n := runtime.Stack(buf[:], false)

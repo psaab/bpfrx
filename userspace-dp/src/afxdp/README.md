@@ -60,6 +60,30 @@ sync.
     `handle_forward_build_failure` reinjects the frame to the slow path;
     the two oversized sites set `build_failed=true` only (the frame is
     undeliverable — drop-and-recycle, no reinject).
+    **Egress-MTU PTB (#2301):** for a forwarded frame the TCP-segmentation
+    path did NOT handle (non-TCP, TCP seg-miss, non-segmentable TCP) the
+    dispatcher makes an egress-MTU decision (`icmp_ptb.rs`,
+    `forwarded_egress_mtu_decision`) BEFORE building the oversized frame.
+    When the L3 payload exceeds the egress MTU and the sender forbade
+    fragmentation (IPv4 DF) or it is IPv6, it generates an ICMP
+    Frag-Needed (v4 type 3 code 4, next-hop MTU per RFC 1191) / Packet
+    Too Big (v6 type 2, MTU per RFC 4443) back out the ingress interface
+    and drops the oversized original (`mtu_signalled` keeps
+    `retained_source_frame` false → the finalizer recycles the ingress
+    descriptor; a suppressed/unbuildable reply is the fail-closed silent
+    drop). NAT64 / native-tunnel encap are skipped (their on-wire L3 size
+    differs from the source frame; the descriptor-capacity oversized
+    backstop still applies). The reply is built inside the
+    `target_binding` borrow and enqueued onto `ingress_binding` once that
+    borrow ends.
+- `icmp_ptb.rs` — #2301 PMTUD error generators for the generic
+  forwarder: the egress-MTU decision plus the ICMPv4 Frag-Needed /
+  ICMPv6 Packet-Too-Big builders (MTU in the body). Mirrors
+  `icmp.rs`'s reflected-error shape (L2 reflect + ingress-sourced outer
+  IP + quoted inbound packet) but sets the MTU field; reuses the shared
+  header/checksum helpers and the RFC error-suppression gate
+  (`reject_icmp_reply_suppressed`, `is_non_first_fragment`). Kept
+  separate from `icmp.rs` so the diff stays additive.
 - `cos/` — Class-of-Service scheduler: token-bucket admission, MQFQ
   active-bucket selection, fair-share lease (#1229 Phase 6 v8). See
   `docs/per-5-tuple/state.md` for the architectural ceiling.

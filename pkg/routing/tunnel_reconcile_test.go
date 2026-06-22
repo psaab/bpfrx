@@ -349,6 +349,47 @@ func wgTC(addrs ...string) *config.TunnelConfig {
 	return &config.TunnelConfig{Name: "wg0", Mode: "wireguard", Addresses: addrs}
 }
 
+// #2300: the wgN inner MTU model.
+//   - operator-set tc.MTU wins (the sub-1500 / jumbo override path);
+//   - with no operator MTU, derive from wgDefaultOuterMTU minus the
+//     family overhead (v4 endpoint → v4 overhead; v6 / responder-only →
+//     v6 overhead).
+func TestWgTunMTUForEndpointModel(t *testing.T) {
+	// Operator override wins over the family-derived default.
+	tc := wgTC()
+	tc.MTU = 1380
+	if got := wgTunMTUForEndpoint(tc); got != 1380 {
+		t.Fatalf("operator MTU override: got %d, want 1380 (pre-#2300 this "+
+			"was ignored and always derived from 1500)", got)
+	}
+
+	// Sub-1500 operator override (PPPoE-class underlay): honored verbatim.
+	tc.MTU = 1400
+	if got := wgTunMTUForEndpoint(tc); got != 1400 {
+		t.Fatalf("sub-1500 operator MTU: got %d, want 1400", got)
+	}
+
+	// No operator MTU, v4 endpoint → v4 overhead (60) + pad (15).
+	v4 := wgTC()
+	v4.WgEndpoint = "203.0.113.5:51820"
+	if got, want := wgTunMTUForEndpoint(v4), wgDefaultOuterMTU-wgOverheadV4-wgPadWorst; got != want {
+		t.Fatalf("v4 endpoint default: got %d, want %d", got, want)
+	}
+
+	// No operator MTU, v6 endpoint → v6 overhead (80) + pad (15).
+	v6 := wgTC()
+	v6.WgEndpoint = "[2001:db8::1]:51820"
+	if got, want := wgTunMTUForEndpoint(v6), wgDefaultOuterMTU-wgOverheadV6-wgPadWorst; got != want {
+		t.Fatalf("v6 endpoint default: got %d, want %d", got, want)
+	}
+
+	// No operator MTU, responder-only (no endpoint) → conservative v6.
+	none := wgTC()
+	if got, want := wgTunMTUForEndpoint(none), wgDefaultOuterMTU-wgOverheadV6-wgPadWorst; got != want {
+		t.Fatalf("responder-only default: got %d, want %d", got, want)
+	}
+}
+
 // A CONFIGURED fe80 on the persistent wgN TUN, later removed from
 // config, must be reconciled away (pre-#1905 it leaked forever via the
 // nil applied-set sentinel) — while the kernel's autoconf fe80 on the

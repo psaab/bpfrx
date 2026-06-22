@@ -5,11 +5,19 @@
 //! the same placement on the GRE encap). The outer IP TOS byte
 //! holds DSCP in the high 6 bits and ECN in the low 2 bits.
 //!
-//! Conversion is `dscp << 2`. ECN is **cleared** by this PR; RFC
-//! 6040 (ECN propagation across tunnels) is a tracked follow-up.
+//! Conversion is `dscp << 2`. This helper CLEARS the ECN bits and is
+//! used only where the source is a 6-bit DSCP value (no ECN context).
+//!
+//! NOTE (#2303): the production WG/GRE encap path does NOT use this
+//! helper for outer-header DSCP/ECN. It copies the FULL inner TOS byte
+//! (DSCP + ECN) via `crate::afxdp::gre::inner_tos_byte`, so ECN
+//! propagates per RFC 6040 normal-mode ingress. This helper remains for
+//! the DSCP-only case (a config-set DSCP value with no inner-packet ECN
+//! to carry).
 
 /// Build the outer IPv4 TOS / IPv6 Traffic Class byte from a
-/// 6-bit DSCP value. ECN bits are cleared.
+/// 6-bit DSCP value. ECN bits are cleared (use
+/// `gre::inner_tos_byte` when an inner ECN must propagate, #2303).
 #[inline]
 pub(crate) fn tos_from_dscp(dscp: u8) -> u8 {
     // Defensive mask: callers should pass 6-bit values, but a

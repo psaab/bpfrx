@@ -149,6 +149,7 @@ func FormatStatusSummary(status userspace.ProcessStatus) string {
 	var snatPackets uint64
 	var dnatPackets uint64
 	var nat64Translations uint64
+	var nat64NoSourcePool uint64
 	var txPackets uint64
 	var txBytes uint64
 	var txErrors uint64
@@ -241,6 +242,7 @@ func FormatStatusSummary(status userspace.ProcessStatus) string {
 		snatPackets += binding.SNATPackets
 		dnatPackets += binding.DNATPackets
 		nat64Translations += binding.Nat64Translations
+		nat64NoSourcePool += binding.Nat64NoSourcePool
 		txPackets += binding.TXPackets
 		txBytes += binding.TXBytes
 		txErrors += binding.TXErrors
@@ -419,8 +421,8 @@ func FormatStatusSummary(status userspace.ProcessStatus) string {
 			es.FramesRead, es.FramesWritten, es.DecodeErrors, es.SeqGaps)
 		fmt.Fprintf(&b, "  Event stream producer:     sent=%d dropped=%d\n",
 			status.EventStreamSent, status.EventStreamDropped)
-		fmt.Fprintf(&b, "  Event stream events:       policy_deny=%d screen_drop=%d filter_log=%d unknown_drops=%d\n",
-			es.PolicyDenyEvents, es.ScreenDropEvents, es.FilterLogEvents, es.UnknownFrameDrops)
+		fmt.Fprintf(&b, "  Event stream events:       policy_deny=%d screen_drop=%d screen_alarm=%d filter_log=%d unknown_drops=%d\n",
+			es.PolicyDenyEvents, es.ScreenDropEvents, es.ScreenAlarmEvents, es.FilterLogEvents, es.UnknownFrameDrops)
 		fmt.Fprintf(&b, "  Event stream drops:        policy_deny=%d screen_drop=%d filter_log=%d\n",
 			es.PolicyDenyDrops, es.ScreenDropDrops, es.FilterLogDrops)
 	}
@@ -438,6 +440,7 @@ func FormatStatusSummary(status userspace.ProcessStatus) string {
 	fmt.Fprintf(&b, "  SNAT packets:              %d\n", snatPackets)
 	fmt.Fprintf(&b, "  DNAT packets:              %d\n", dnatPackets)
 	fmt.Fprintf(&b, "  NAT64 translations:        %d\n", nat64Translations)
+	fmt.Fprintf(&b, "  NAT64 no-source-pool drops:%d\n", nat64NoSourcePool)
 	if len(status.SourceNATPools) > 0 {
 		rows := append([]userspace.SourceNATPoolStatus(nil), status.SourceNATPools...)
 		sort.Slice(rows, func(i, j int) bool {

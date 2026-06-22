@@ -95,6 +95,42 @@ pub(crate) struct Nat64ReverseInfo {
     pub(crate) orig_dst_v6: Ipv6Addr,
 }
 
+/// Tri-state result of a NAT64 destination lookup (#2291).
+///
+/// The pre-fix lookup collapsed "prefix matched but no source could be
+/// allocated" into "no NAT64 match" (a bare `Option<...>` whose `None`
+/// meant both), so a matched-but-unallocatable destination fell through to
+/// ordinary IPv6 route lookup on the SYNTHETIC NAT64 destination
+/// (`64:ff9b::a.b.c.d`). With a permissive default IPv6 route present, that
+/// silently leaked untranslated synthetic-destination traffic upstream — a
+/// fail-OPEN at the NAT64 boundary.
+///
+/// Splitting the result into three states lets the caller fail CLOSED on the
+/// unallocatable case (drop + counter) while still routing genuinely
+/// non-matching IPv6 normally. Consistent with the project's fail-closed
+/// family (#2124/#2142/#2173/#2175).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Nat64Match {
+    /// The destination does not match any configured NAT64 prefix — continue
+    /// ordinary IPv6 route lookup. This is the ONLY arm that routes as IPv6.
+    NoPrefixMatch,
+    /// A prefix matched AND a source IPv4 was allocated — translate.
+    MatchReady {
+        /// Index of the matched NAT64 prefix in `prefixes`.
+        prefix_idx: usize,
+        /// IPv4 destination extracted from the synthetic NAT64 address.
+        dst_v4: Ipv4Addr,
+        /// Allocated IPv4 SNAT source from the matched prefix's pool.
+        snat_v4: Ipv4Addr,
+        /// Original synthetic IPv6 destination (kept for the reverse path).
+        dst_v6: Ipv6Addr,
+    },
+    /// A prefix matched but NO IPv4 source could be allocated (empty /
+    /// exhausted pool — a legitimate wire state the Go side emits for a
+    /// no-source-pool rule). The packet MUST be dropped, not routed as IPv6.
+    MatchUnavailable,
+}
+
 /// Parse a NAT64 source-pool IPv4 address that may carry a canonical host
 /// mask (`x.x.x.x/32`). Address-range expansion stamps `/32` on every pool
 /// IP and `Ipv4Addr::from_str` rejects CIDR, so the mask is stripped before
@@ -240,6 +276,31 @@ impl Nat64State {
             }
         }
         None
+    }
+
+    /// Tri-state NAT64 destination lookup (#2291).
+    ///
+    /// Returns [`Nat64Match::NoPrefixMatch`] when `dst` matches no configured
+    /// prefix (the caller continues IPv6 routing), [`Nat64Match::MatchReady`]
+    /// when a prefix matched and a source IPv4 was allocated (translate), or
+    /// [`Nat64Match::MatchUnavailable`] when a prefix matched but the pool
+    /// could not yield a source (caller MUST drop, never route the synthetic
+    /// IPv6 destination upstream). This is the fail-closed replacement for the
+    /// `match_ipv6_dest(...).and_then(allocate_v4_source)` chain that
+    /// collapsed the unallocatable case into "no match".
+    pub(crate) fn classify_ipv6_dest(&self, dst: Ipv6Addr) -> Nat64Match {
+        match self.match_ipv6_dest(dst) {
+            None => Nat64Match::NoPrefixMatch,
+            Some((prefix_idx, dst_v4)) => match self.allocate_v4_source(prefix_idx) {
+                Some(snat_v4) => Nat64Match::MatchReady {
+                    prefix_idx,
+                    dst_v4,
+                    snat_v4,
+                    dst_v6: dst,
+                },
+                None => Nat64Match::MatchUnavailable,
+            },
+        }
     }
 
     /// Round-robin allocation of an IPv4 source address from the pool.
@@ -419,6 +480,129 @@ pub(crate) fn translate_v6_to_v4(
     Some(out)
 }
 
+/// Walk the IPv6 extension-header chain of an L3-relative IPv6 packet to find
+/// the terminal transport header (#2290).
+///
+/// Returns `(l4_offset, l4_protocol)` where `l4_offset` is the byte offset of
+/// the real transport header (TCP/UDP/ICMPv6/...) measured from the start of
+/// the IPv6 header, and `l4_protocol` is its protocol number. Walks
+/// Hop-by-Hop (0), Routing (43), Destination Options (60), AH (51), and
+/// Fragment (44) headers, bounded to 6 iterations (RFC 8200 §4.1 — a
+/// fixed-order chain rarely exceeds a handful). No-Next-Header (59) and a
+/// chain that runs off the end of the packet return `None`.
+///
+/// This is the NAT64 translator's own bounded walk; it deliberately does NOT
+/// reach into `crate::afxdp` (which itself depends on `crate::nat64`). It
+/// mirrors `afxdp::frame::inspect::packet_rel_l4_offset_and_protocol`; the
+/// unification onto a single shared walker is tracked separately (#2292) and
+/// is not a prerequisite for this fix.
+///
+/// The returned offset is only the START of the L4 header; the caller is
+/// responsible for the non-first-fragment check (a non-first fragment carries
+/// NO L4 header at this offset — its bytes are payload).
+fn ipv6_l4_offset_and_protocol(packet: &[u8]) -> Option<(usize, u8)> {
+    if packet.len() < 40 {
+        return None;
+    }
+    let mut protocol = packet[6];
+    let mut offset = 40usize;
+    for _ in 0..6 {
+        match protocol {
+            // Hop-by-Hop / Routing / Destination Options: length in 8-byte
+            // units, NOT counting the first 8 bytes (RFC 8200).
+            0 | 43 | 60 => {
+                let opt = packet.get(offset..offset + 2)?;
+                protocol = opt[0];
+                offset = offset.checked_add((usize::from(opt[1]) + 1) * 8)?;
+                if packet.len() < offset {
+                    return None;
+                }
+            }
+            // Authentication Header: length in 4-byte units, "minus 2"
+            // (RFC 4302 §2.2).
+            51 => {
+                let opt = packet.get(offset..offset + 2)?;
+                protocol = opt[0];
+                offset = offset.checked_add((usize::from(opt[1]) + 2) * 4)?;
+                if packet.len() < offset {
+                    return None;
+                }
+            }
+            // Fragment header: fixed 8 bytes.
+            44 => {
+                let frag = packet.get(offset..offset + 8)?;
+                protocol = frag[0];
+                offset = offset.checked_add(8)?;
+                if packet.len() < offset {
+                    return None;
+                }
+            }
+            // No Next Header — no transport to translate.
+            59 => return None,
+            // Terminal: a real upper-layer protocol.
+            _ => return Some((offset, protocol)),
+        }
+    }
+    Some((offset, protocol))
+}
+
+/// Is this L3-relative IPv6 packet a NON-first fragment (#2290)?
+///
+/// Walks the (bounded) extension-header chain looking for a Fragment header
+/// (44). Returns `true` iff a fragment header is present AND its fragment
+/// offset (upper 13 bits of bytes 2-3, mask `0xFFF8`, RFC 8200 §4.5) is
+/// non-zero. A non-first fragment carries no L4 header, so its payload bytes
+/// must NOT be read as L4 — the translators fail closed on it. First/atomic
+/// fragments (offset 0) and packets without a fragment header return `false`.
+/// Mirrors `afxdp::frame::inspect::ipv6_is_non_first_fragment`.
+fn ipv6_is_non_first_fragment(packet: &[u8]) -> bool {
+    if packet.len() < 40 {
+        return false;
+    }
+    let mut protocol = packet[6];
+    let mut offset = 40usize;
+    for _ in 0..6 {
+        match protocol {
+            0 | 43 | 60 => {
+                let Some(opt) = packet.get(offset..offset + 2) else {
+                    return false;
+                };
+                protocol = opt[0];
+                let Some(next) = offset.checked_add((usize::from(opt[1]) + 1) * 8) else {
+                    return false;
+                };
+                offset = next;
+                if packet.len() < offset {
+                    return false;
+                }
+            }
+            51 => {
+                let Some(opt) = packet.get(offset..offset + 2) else {
+                    return false;
+                };
+                protocol = opt[0];
+                let Some(next) = offset.checked_add((usize::from(opt[1]) + 2) * 4) else {
+                    return false;
+                };
+                offset = next;
+                if packet.len() < offset {
+                    return false;
+                }
+            }
+            44 => {
+                let Some(frag) = packet.get(offset..offset + 8) else {
+                    return false;
+                };
+                let frag_off = u16::from_be_bytes([frag[2], frag[3]]) & 0xFFF8;
+                return frag_off != 0;
+            }
+            59 => return false,
+            _ => return false,
+        }
+    }
+    false
+}
+
 /// Allocation-free IPv6→IPv4 translation: write the translated IPv4 L3 packet
 /// directly into `dst` and return the number of bytes written (#2211).
 ///
@@ -445,21 +629,43 @@ pub(crate) fn write_v6_to_v4_into(
     // stateless translation, not RFC 6040 tunnel encapsulation).
     let traffic_class = ((packet[0] & 0x0f) << 4) | (packet[1] >> 4);
     let payload_len = u16::from_be_bytes([packet[4], packet[5]]) as usize;
-    let next_header = packet[6];
     let hop_limit = packet[7];
 
     if hop_limit <= 1 {
         return None; // TTL expired
     }
 
-    // Map protocol.
-    let ipv4_protocol = match next_header {
+    // #2290: walk the IPv6 extension-header chain to learn the terminal L4
+    // offset and protocol instead of assuming L4 at byte 40 / reading the
+    // raw next-header. A packet carrying Hop-by-Hop / Routing / Dest-Opts /
+    // AH / Fragment before its transport header was previously dropped as
+    // "unsupported protocol" even though it is legal RFC 8200 input.
+    let (l4_offset, l4_protocol) = ipv6_l4_offset_and_protocol(packet)?;
+
+    // A non-first fragment has NO L4 header at `l4_offset` — its bytes are
+    // payload. Reading them as a transport header (and translating) would
+    // corrupt the datagram, so fail closed (drop).
+    if ipv6_is_non_first_fragment(packet) {
+        return None;
+    }
+
+    // Map protocol from the terminal L4, not the raw next-header.
+    let ipv4_protocol = match l4_protocol {
         PROTO_ICMPV6 => PROTO_ICMP,
-        PROTO_TCP | PROTO_UDP => next_header,
+        PROTO_TCP | PROTO_UDP => l4_protocol,
         _ => return None, // Unsupported protocol
     };
 
-    let l4_payload = packet.get(40..40 + payload_len)?;
+    // The L4 region starts at the walked offset and ends at the IPv6
+    // payload boundary (`40 + payload_len`). The ext-header bytes between
+    // byte 40 and `l4_offset` are stripped by NAT64: RFC 7915 §5.1 maps the
+    // IPv6 packet to an IPv4 packet carrying only the transport payload,
+    // dropping the (non-translatable) IPv6 extension headers.
+    let l4_end = 40usize.checked_add(payload_len)?;
+    if l4_offset > l4_end {
+        return None; // ext-header chain overran the advertised payload
+    }
+    let l4_payload = packet.get(l4_offset..l4_end)?;
     let new_ttl = hop_limit - 1;
 
     // The L4 length is normally unchanged, but an ICMP *error* message embeds
@@ -499,7 +705,7 @@ pub(crate) fn write_v6_to_v4_into(
     out[16..20].copy_from_slice(&dst_v4.octets());
 
     // Translate the L4 region into the output and learn its final length.
-    let l4_len = if next_header == PROTO_ICMPV6 {
+    let l4_len = if l4_protocol == PROTO_ICMPV6 {
         // The embedded (quoted) original packet is the RETURN-direction packet:
         // its addresses are the outer error's addresses swapped, so v6->v4 the
         // embedded src maps to `dst_v4` and the embedded dst maps to `snat_v4`.
@@ -1013,23 +1219,43 @@ fn translate_embedded_v6_to_v4(
     let quote_in = &embedded[..embedded.len().min(MAX_EMBEDDED_LEN)];
 
     let payload_len = u16::from_be_bytes([quote_in[4], quote_in[5]]) as usize;
-    let next_header = quote_in[6];
     let hop_limit = quote_in[7];
     let traffic_class = ((quote_in[0] & 0x0f) << 4) | (quote_in[1] >> 4);
 
-    // Map protocol (same set the outer translator supports). An embedded packet
-    // carrying an unsupported protocol can't be faithfully translated -> drop.
-    let ipv4_protocol = match next_header {
+    // #2290: walk the quoted IPv6 packet's extension-header chain to find the
+    // terminal L4 offset/protocol rather than assuming L4 at byte 40. The
+    // quote is frequently truncated (often to 8 bytes of L4), so the walk may
+    // run off the end of `quote_in`; in that case `ipv6_l4_offset_and_protocol`
+    // returns `None` and we fail closed — the same drop the outer translator
+    // takes — rather than misreading ext-header bytes as a transport header.
+    let (l4_offset, l4_protocol) = ipv6_l4_offset_and_protocol(quote_in)?;
+
+    // A non-first fragment carries no L4 header — its bytes are payload. Do
+    // not read them as L4 (drop), matching the outer translator (#2290).
+    if ipv6_is_non_first_fragment(quote_in) {
+        return None;
+    }
+
+    // Map protocol (same set the outer translator supports) from the terminal
+    // L4. An embedded packet carrying an unsupported protocol can't be
+    // faithfully translated -> drop.
+    let ipv4_protocol = match l4_protocol {
         PROTO_ICMPV6 => PROTO_ICMP,
-        PROTO_TCP | PROTO_UDP => next_header,
+        PROTO_TCP | PROTO_UDP => l4_protocol,
         _ => return None,
     };
 
-    // The quoted L4 is whatever bytes are present after the IPv6 header, capped
-    // by both the IPv6 payload_len field and the bytes actually quoted.
-    let avail_l4 = quote_in.len() - 40;
-    let l4_len = payload_len.min(avail_l4);
-    let l4 = quote_in.get(40..40 + l4_len)?;
+    // The quoted L4 starts at the walked offset and runs to the end of the
+    // advertised IPv6 payload (`40 + payload_len`), capped by the bytes
+    // actually quoted. The IPv6 extension headers between byte 40 and
+    // `l4_offset` are stripped, mirroring the outer translation.
+    let payload_end = 40usize.checked_add(payload_len)?;
+    let quoted_end = payload_end.min(quote_in.len());
+    if l4_offset > quoted_end {
+        return None; // ext-header chain overran the quoted bytes
+    }
+    let l4 = quote_in.get(l4_offset..quoted_end)?;
+    let l4_len = l4.len();
 
     let total = 20 + l4_len;
     let out = dst.get_mut(..total)?;
@@ -1049,7 +1275,7 @@ fn translate_embedded_v6_to_v4(
     // quoted v4 packet is internally consistent (the quoted L4 checksum is left
     // as-is — it is not validated by a receiver). Only the leading type/code are
     // touched; a fuller embedded-ICMP translation is unnecessary for the quote.
-    if next_header == PROTO_ICMPV6 && l4_len >= 2 {
+    if l4_protocol == PROTO_ICMPV6 && l4_len >= 2 {
         if let Some((t, c)) = embedded_icmpv6_type_to_icmpv4(out[20]) {
             out[20] = t;
             out[21] = c;

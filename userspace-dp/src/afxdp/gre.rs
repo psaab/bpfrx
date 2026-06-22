@@ -82,6 +82,49 @@ pub(in crate::afxdp) fn packet_trimmed_len(packet: &[u8], addr_family: u8) -> Op
     }
 }
 
+/// Read the inner IP packet's DSCP+ECN byte for outer-header
+/// propagation on tunnel encap (#2303). Returns the full 8-bit
+/// TOS / Traffic-Class value (DSCP in the high 6 bits, ECN in the
+/// low 2 bits) so the encap site can copy it verbatim onto the
+/// outer header:
+///
+///   - DSCP: uniform model (RFC 2983 §3) — the inner DSCP is mirrored
+///     onto the outer so per-hop QoS classification survives the
+///     tunnel.
+///   - ECN: RFC 6040 normal-mode ingress — the inner ECN is copied to
+///     the outer ECN field, so a CE mark applied by a congested router
+///     on the OUTER path can be reflected back to the inner endpoints
+///     at decap (loss-free congestion signalling instead of a fallback
+///     to loss-based control).
+///
+/// Reading the WHOLE byte (rather than masking to DSCP and re-shifting,
+/// the `wg::dscp::tos_from_dscp` shape that clears ECN) is what makes
+/// this RFC-6040-compliant: ECN must propagate, not be zeroed.
+///
+/// `packet` is the inner IP packet (L2 already stripped); `addr_family`
+/// is the inner family. Returns `0` (the pre-#2303 behavior) when the
+/// packet is too short to hold the byte, so a malformed inner never
+/// produces an out-of-bounds read — it just falls back to a zero outer
+/// TOS.
+#[inline]
+pub(in crate::afxdp) fn inner_tos_byte(packet: &[u8], addr_family: u8) -> u8 {
+    match addr_family as i32 {
+        libc::AF_INET => {
+            // IPv4 TOS / DiffServ byte is octet 1.
+            packet.get(1).copied().unwrap_or(0)
+        }
+        libc::AF_INET6 => {
+            // IPv6 Traffic Class spans the low nibble of octet 0 and
+            // the high nibble of octet 1: TC = (b0 << 4) | (b1 >> 4).
+            match (packet.first(), packet.get(1)) {
+                (Some(&b0), Some(&b1)) => (b0 << 4) | (b1 >> 4),
+                _ => 0,
+            }
+        }
+        _ => 0,
+    }
+}
+
 fn gre_inner_family_and_proto(proto: u16) -> Option<(u8, u16)> {
     match proto {
         GRE_PROTO_IPV4 => Some((libc::AF_INET as u8, 0x0800)),
@@ -146,6 +189,18 @@ fn parse_inner_protocol_and_offsets(packet: &[u8], addr_family: u8) -> Option<(u
             // Use the extension-header-aware helper to get both the final L4
             // protocol and the correct offset. packet[6] may be an extension
             // header type, not the actual L4 protocol.
+            //
+            // #2292: `packet_rel_l4_offset_and_protocol` now fails CLOSED
+            // (returns `None`) when the ext-header chain is still on an
+            // extension header at the `MAX_IPV6_EXT_HEADERS` bound, so a
+            // surrendered `protocol == 0` (unconsumed Hop-by-Hop) can no
+            // longer reach this match. The `_` arm below additionally
+            // DROPS any leftover ext-header / no-next-header sentinel
+            // (Hop-by-Hop 0, Routing 43, AH 51, No-Next 59, Dest-Opts 60)
+            // rather than forwarding it with the ext-header offset used as
+            // a fake L4/payload offset — defense in depth so this caller
+            // never forwards a packet whose L4 protocol it could not
+            // resolve.
             let (l4_off, protocol) = packet_rel_l4_offset_and_protocol(packet, addr_family)?;
             let rel_l4 = l4_off as u16;
             let payload_offset = match protocol {
@@ -162,6 +217,10 @@ fn parse_inner_protocol_and_offsets(packet: &[u8], addr_family: u8) -> Option<(u
                 }
                 PROTO_UDP => rel_l4 + 8,
                 PROTO_ICMPV6 => rel_l4 + 8,
+                // #2292: an unresolved/extension-header protocol is a drop,
+                // not a forward. 0/43/51/59/60 are IPv6 ext-header or
+                // no-next-header sentinels, never a real inner L4.
+                0 | 43 | 51 | 59 | 60 => return None,
                 _ => rel_l4,
             };
             Some((protocol, rel_l4, payload_offset))
@@ -327,6 +386,9 @@ pub(super) fn encapsulate_native_gre_frame(
     let inner_packet = inner_frame.get(inner_l3..)?.to_vec();
     let inner_len = packet_trimmed_len(&inner_packet, inner_meta.addr_family)?;
     let inner_packet = &inner_packet[..inner_len];
+    // #2303: copy the inner DSCP+ECN onto the outer header (uniform
+    // DSCP model + RFC 6040 ECN ingress copy) instead of hardcoding 0.
+    let outer_tos = inner_tos_byte(inner_packet, inner_meta.addr_family);
 
     let key_words = if endpoint.key != 0 { 1 } else { 0 };
     let gre_len = 4 + key_words * 4;
@@ -392,7 +454,7 @@ pub(super) fn encapsulate_native_gre_frame(
                 src,
                 dst,
                 PROTO_GRE,
-                /* tos */ 0,
+                outer_tos,
                 endpoint.ttl,
                 total_len,
             )?;
@@ -413,7 +475,7 @@ pub(super) fn encapsulate_native_gre_frame(
                 src,
                 dst,
                 PROTO_GRE,
-                /* traffic_class */ 0,
+                outer_tos,
                 /* flow_label */ 0,
                 endpoint.ttl,
                 payload_len,

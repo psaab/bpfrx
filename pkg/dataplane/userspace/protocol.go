@@ -989,6 +989,7 @@ type EventStreamStatus struct {
 	SeqGaps           uint64 `json:"seq_gaps,omitempty"`
 	PolicyDenyEvents  uint64 `json:"policy_deny_events,omitempty"`
 	ScreenDropEvents  uint64 `json:"screen_drop_events,omitempty"`
+	ScreenAlarmEvents uint64 `json:"screen_alarm_events,omitempty"`
 	FilterLogEvents   uint64 `json:"filter_log_events,omitempty"`
 	PolicyDenyDrops   uint64 `json:"policy_deny_drops,omitempty"`
 	ScreenDropDrops   uint64 `json:"screen_drop_drops,omitempty"`
@@ -1513,6 +1514,11 @@ type BindingStatus struct {
 	// the Rust serde `default` keep cross-version wire safety (#1961-class:
 	// an older helper omits the field, Go reads 0 rather than failing decode).
 	Nat64Translations              uint64 `json:"nat64_translations,omitempty"`
+	// #2291: fail-closed NAT64 drops — a prefix matched but no IPv4 source
+	// could be allocated (empty/exhausted pool), so the synthetic IPv6
+	// destination was dropped rather than route-looked-up as IPv6. omitempty +
+	// Rust serde `default` keep the same cross-version wire safety.
+	Nat64NoSourcePool              uint64 `json:"nat64_no_source_pool,omitempty"`
 	SlowPathPackets                uint64 `json:"slow_path_packets,omitempty"`
 	SlowPathBytes                  uint64 `json:"slow_path_bytes,omitempty"`
 	SlowPathLocalDeliveryPackets   uint64 `json:"slow_path_local_delivery_packets,omitempty"`

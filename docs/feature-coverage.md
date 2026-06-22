@@ -28,6 +28,14 @@ the userspace dataplane admission boundary is in
 
 - **TCP MSS clamping** in the userspace AF_XDP dataplane (all-tcp,
   ipsec-vpn, and GRE gre-in/gre-out).
+- **Path MTU Discovery** on the forwarding path: a forwarded frame that
+  exceeds the egress interface MTU and is not transparently TCP-segmented
+  (UDP, ICMP, ESP, GRE, TCP seg-miss) triggers an ICMPv4 Fragmentation
+  Needed (type 3 code 4, next-hop MTU) for IPv4 DF / ICMPv6 Packet Too
+  Big (type 2, MTU) for IPv6 back to the sender, instead of a silent MTU
+  drop (#2301). RFC 792/4443 suppression applies (no reply to inbound
+  ICMP errors or non-first fragments). NAT64 already translates
+  PTB↔Frag-Needed across the boundary (#2219).
 - **ALG control**, allow-dns-reply, allow-embedded-icmp.
 - **Configurable timeouts** (per-application inactivity).
 - **Session management**: filtered clearing, idle time tracking, brief
