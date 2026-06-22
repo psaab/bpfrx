@@ -10463,3 +10463,15 @@ top.
 - **Validation**: cargo build --release clean; 6 new fail-on-revert tests green
   (5x stable); revert-simulation (wall-clock body) confirmed to FAIL the
   forward-step + recent tests; full ha/heartbeat/coordinator suite (449) green.
+
+- **Timestamp**: 2026-06-22
+  - **Action**: #2333 NAT64 v6->v4 UDP checksum 0x0000->0xFFFF map (RFC 768/1624).
+    Mirrored the existing v4->v6 UDP arm: after folding the recomputed IPv4 UDP
+    checksum in recompute_l4_checksum_after_nat64_v6_to_v4 (PROTO_UDP), a
+    computed 0x0000 is now written as 0xFFFF so receivers still validate it
+    (0x0000 = "no checksum present" sentinel). TCP path untouched (TCP cksum 0
+    is valid). Added 3 fail-on-revert tests (zero->0xFFFF, non-zero unchanged,
+    TCP not remapped). No wire field -> no protocol_wire_v1.json / Go change.
+    No NAT64 doc documents L4-checksum sentinel handling; inline comment is the
+    contract.
+  - **File(s)**: userspace-dp/src/nat64.rs, userspace-dp/src/nat64_tests.rs, _Log.md

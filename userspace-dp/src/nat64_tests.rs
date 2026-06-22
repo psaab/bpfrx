@@ -2163,3 +2163,129 @@ fn classify_match_unavailable_on_empty_pool_fails_closed() {
         "must NOT be treated as no-match (would IPv6-route the synthetic dest)"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #2333: NAT64 v6->v4 UDP checksum 0x0000 -> 0xFFFF mapping (RFC 768/1624).
+//
+// In IPv4 UDP, a checksum field of 0x0000 is the reserved "no checksum
+// present" sentinel; the receiver skips validation. A genuinely COMPUTED
+// checksum of zero MUST be transmitted as 0xFFFF (all-ones). The v6->v4
+// translation arm previously wrote the raw fold, so a datagram whose computed
+// checksum folds to 0 was emitted as 0x0000 -> silent integrity loss. These
+// tests fail if the 0->0xFFFF map is reverted.
+// ---------------------------------------------------------------------------
+
+/// Build a minimal IPv4 + UDP packet (no Ethernet) suitable for feeding to
+/// `recompute_l4_checksum_after_nat64_v6_to_v4`. The 20-byte IPv4 header
+/// carries only the fields the recompute path reads (src/dst at 12..20); the
+/// UDP body is `payload`. The UDP checksum field (l4[6..8]) is left zeroed.
+fn build_v4_udp_for_recompute(src: Ipv4Addr, dst: Ipv4Addr, payload: &[u8]) -> Vec<u8> {
+    let udp_len = 8 + payload.len();
+    let mut pkt = vec![0u8; 20 + udp_len];
+    pkt[0] = 0x45;
+    pkt[9] = PROTO_UDP;
+    pkt[12..16].copy_from_slice(&src.octets());
+    pkt[16..20].copy_from_slice(&dst.octets());
+    // UDP header: src port, dst port, length, checksum(=0).
+    pkt[20..22].copy_from_slice(&1234u16.to_be_bytes());
+    pkt[22..24].copy_from_slice(&53u16.to_be_bytes());
+    pkt[24..26].copy_from_slice(&(udp_len as u16).to_be_bytes());
+    pkt[28..28 + payload.len()].copy_from_slice(payload);
+    pkt
+}
+
+#[test]
+fn v6_to_v4_udp_computed_zero_checksum_written_as_0xffff() {
+    let src = Ipv4Addr::new(198, 51, 100, 1);
+    let dst = Ipv4Addr::new(8, 8, 8, 8);
+
+    // Search for a 2-byte payload whose recomputed IPv4 UDP checksum folds to
+    // exactly 0x0000. The translated datagram must NOT be written as 0x0000;
+    // it must become the all-ones sentinel 0xFFFF.
+    let mut found = None;
+    for b in 0u16..=0xffff {
+        let payload = b.to_be_bytes();
+        let mut pkt = build_v4_udp_for_recompute(src, dst, &payload);
+        let l4 = &pkt[20..];
+        let raw = checksum16_ipv4_pseudo(src, dst, PROTO_UDP, l4);
+        if raw == 0 {
+            // Now run the production recompute path and assert the wire value.
+            recompute_l4_checksum_after_nat64_v6_to_v4(&mut pkt, PROTO_UDP)
+                .expect("recompute");
+            let on_wire = u16::from_be_bytes([pkt[26], pkt[27]]);
+            assert_eq!(
+                on_wire, 0xFFFF,
+                "computed UDP checksum of 0x0000 must be transmitted as 0xFFFF \
+                 (RFC 768/1624), not 0x0000"
+            );
+            found = Some(b);
+            break;
+        }
+    }
+    assert!(
+        found.is_some(),
+        "expected to find a payload yielding a zero-folding UDP checksum"
+    );
+}
+
+#[test]
+fn v6_to_v4_udp_nonzero_checksum_written_unchanged() {
+    let src = Ipv4Addr::new(198, 51, 100, 1);
+    let dst = Ipv4Addr::new(8, 8, 8, 8);
+    let payload = b"\x01\x02\x03\x04";
+    let mut pkt = build_v4_udp_for_recompute(src, dst, payload);
+
+    let expected = checksum16_ipv4_pseudo(src, dst, PROTO_UDP, &pkt[20..]);
+    assert_ne!(expected, 0, "test payload must not fold to zero");
+
+    recompute_l4_checksum_after_nat64_v6_to_v4(&mut pkt, PROTO_UDP).expect("recompute");
+    let on_wire = u16::from_be_bytes([pkt[26], pkt[27]]);
+    assert_eq!(
+        on_wire, expected,
+        "a normal non-zero UDP checksum must be written verbatim (no remap)"
+    );
+}
+
+#[test]
+fn v6_to_v4_tcp_checksum_not_remapped() {
+    // TCP checksum 0 is a normal valid value and MUST NOT be remapped to
+    // 0xFFFF. Build an IPv4 + TCP packet and confirm the recompute path writes
+    // the raw fold even if it is 0x0000.
+    let src = Ipv4Addr::new(198, 51, 100, 1);
+    let dst = Ipv4Addr::new(8, 8, 8, 8);
+
+    // 20-byte minimal TCP header; search for a sequence number that folds the
+    // computed TCP checksum to 0x0000 so we exercise the "0 stays 0" path.
+    let mut found = None;
+    for seq in 0u32..=0x000f_ffff {
+        let mut tcp = vec![0u8; 20];
+        tcp[0..2].copy_from_slice(&1234u16.to_be_bytes());
+        tcp[2..4].copy_from_slice(&80u16.to_be_bytes());
+        tcp[4..8].copy_from_slice(&seq.to_be_bytes());
+        tcp[12] = 0x50; // data offset = 5 (20 bytes), no flags
+        let raw = checksum16_ipv4_pseudo(src, dst, PROTO_TCP, &tcp);
+        if raw == 0 {
+            let mut pkt = vec![0u8; 20 + tcp.len()];
+            pkt[0] = 0x45;
+            pkt[9] = PROTO_TCP;
+            pkt[12..16].copy_from_slice(&src.octets());
+            pkt[16..20].copy_from_slice(&dst.octets());
+            pkt[20..].copy_from_slice(&tcp);
+            recompute_l4_checksum_after_nat64_v6_to_v4(&mut pkt, PROTO_TCP)
+                .expect("recompute");
+            // TCP checksum field is at l4[16..18] -> pkt[36..38].
+            let on_wire = u16::from_be_bytes([pkt[36], pkt[37]]);
+            assert_eq!(
+                on_wire, 0x0000,
+                "TCP checksum of 0x0000 is valid and must be written as 0x0000, \
+                 not remapped to 0xFFFF (the UDP-only RFC 768 rule must not leak)"
+            );
+            found = Some(seq);
+            break;
+        }
+    }
+    assert!(
+        found.is_some(),
+        "expected to find a TCP header that folds the checksum to zero"
+    );
+}
