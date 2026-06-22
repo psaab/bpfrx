@@ -3,6 +3,7 @@ package logging
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net"
@@ -77,8 +78,18 @@ type SyslogClient struct {
 	lastDialFailure   time.Time     // when the last dial failed (mu-guarded)
 	lastDropLog       time.Time     // rate-limit for the drop warning (mu-guarded)
 
-	droppedWrites   atomic.Uint64 // messages dropped on a write timeout/error
-	droppedCooldown atomic.Uint64 // messages dropped because reconnect was in cooldown
+	// droppedWrites counts messages dropped because the write itself failed:
+	// a write timeout (SetWriteDeadline expiry) or a write error
+	// (ECONNRESET/EPIPE) on the stream conn. It does NOT count reconnect dial
+	// failures — those are droppedDials (#2287).
+	droppedWrites atomic.Uint64
+	// droppedDials counts messages dropped because the post-write-failure
+	// reconnect dial itself failed (the message could not be re-sent because
+	// the new connection could not be established).
+	droppedDials atomic.Uint64
+	// droppedCooldown counts messages dropped because a needed reconnect was
+	// suppressed by the cooldown window (fail-fast, no dial attempted).
+	droppedCooldown atomic.Uint64
 
 	// Seams for deterministic testing. nil → real implementations.
 	nowFn  func() time.Time          // clock source (default time.Now)
@@ -239,30 +250,96 @@ func (s *SyslogClient) reconnect() error {
 // window; the message is dropped (fail-fast) rather than blocking on a dial.
 var errReconnectCooldown = fmt.Errorf("syslog reconnect in cooldown")
 
-// noteDrop bumps the appropriate drop counter and emits a rate-limited warning
-// so a flapping target cannot spam the log on the event hot-path. Called with
-// mu held.
-func (s *SyslogClient) noteDrop(cooldown bool, err error) {
-	if cooldown {
+// dropReason classifies why a message was dropped, for the counter and the
+// rate-limited warning.
+type dropReason int
+
+const (
+	dropWrite    dropReason = iota // write timeout or write error
+	dropDial                       // post-write-failure reconnect dial failed
+	dropCooldown                   // reconnect suppressed by the cooldown window
+)
+
+// pendingDropWarn carries the fields for a rate-limited drop warning that MUST
+// be emitted AFTER s.mu is released. Emitting slog.Warn while holding s.mu is a
+// re-entrancy hazard: slog.Default() is the SyslogSlogHandler, whose Handle
+// calls back into SyslogClient.Send for this same client, which re-locks s.mu
+// (sync.Mutex is non-reentrant) → self-deadlock on the dataplane event reader
+// goroutine (#2287). Capturing the snapshot under the lock and emitting after
+// the deferred Unlock keeps the ≤1/s rate-limit intact while removing the hazard.
+type pendingDropWarn struct {
+	reason          dropReason
+	err             error
+	droppedWrites   uint64
+	droppedDials    uint64
+	droppedCooldown uint64
+}
+
+// noteDrop bumps the appropriate drop counter and, subject to the ≤1/s gate,
+// returns a snapshot describing a warning the CALLER must emit after releasing
+// s.mu (see pendingDropWarn). It returns nil when the rate-limit gate swallows
+// the warning. Called with mu held; emits NO slog itself.
+func (s *SyslogClient) noteDrop(reason dropReason, err error) *pendingDropWarn {
+	switch reason {
+	case dropCooldown:
 		s.droppedCooldown.Add(1)
-	} else {
+	case dropDial:
+		s.droppedDials.Add(1)
+	default:
 		s.droppedWrites.Add(1)
 	}
 	now := s.now()
-	if s.lastDropLog.IsZero() || now.Sub(s.lastDropLog) >= time.Second {
-		s.lastDropLog = now
-		slog.Warn("syslog message dropped",
-			"addr", s.remoteAddr,
-			"cooldown", cooldown,
-			"dropped_writes", s.droppedWrites.Load(),
-			"dropped_cooldown", s.droppedCooldown.Load(),
-			"err", err)
+	if !s.lastDropLog.IsZero() && now.Sub(s.lastDropLog) < time.Second {
+		return nil
+	}
+	s.lastDropLog = now
+	return &pendingDropWarn{
+		reason:          reason,
+		err:             err,
+		droppedWrites:   s.droppedWrites.Load(),
+		droppedDials:    s.droppedDials.Load(),
+		droppedCooldown: s.droppedCooldown.Load(),
 	}
 }
 
-// DroppedWrites reports the count of messages dropped on a write timeout or
-// write error (observability).
+// emitDropWarn emits the rate-limited drop warning. It MUST be called with s.mu
+// NOT held (typically via a defer ordered to run after the Unlock) so the
+// slog.Warn cannot re-enter SyslogClient.Send under the lock (#2287). A nil
+// receiver (rate-limited) is a no-op.
+func (w *pendingDropWarn) emit(remoteAddr string) {
+	if w == nil {
+		return
+	}
+	slog.Warn("syslog message dropped",
+		"addr", remoteAddr,
+		"reason", w.reason.String(),
+		"dropped_writes", w.droppedWrites,
+		"dropped_dials", w.droppedDials,
+		"dropped_cooldown", w.droppedCooldown,
+		"err", w.err)
+}
+
+// String renders the drop reason for the warning attribute.
+func (r dropReason) String() string {
+	switch r {
+	case dropDial:
+		return "dial"
+	case dropCooldown:
+		return "cooldown"
+	default:
+		return "write"
+	}
+}
+
+// DroppedWrites reports the count of messages dropped because the write itself
+// failed — a write timeout (SetWriteDeadline expiry) or a write error
+// (ECONNRESET/EPIPE). Reconnect dial failures are counted separately by
+// DroppedDials, not here (#2287). Observability only.
 func (s *SyslogClient) DroppedWrites() uint64 { return s.droppedWrites.Load() }
+
+// DroppedDials reports the count of messages dropped because the
+// post-write-failure reconnect dial failed (observability).
+func (s *SyslogClient) DroppedDials() uint64 { return s.droppedDials.Load() }
 
 // DroppedCooldown reports the count of messages dropped because a reconnect was
 // suppressed by the cooldown window (observability).
@@ -284,6 +361,13 @@ func (s *SyslogClient) Send(severity int, msg string) error {
 		line = fmt.Sprintf("<%d>%s %s xpf: %s", priority, ts, s.hostname, msg)
 	}
 
+	// pendingWarn is captured under s.mu by noteDrop and emitted AFTER the
+	// deferred Unlock — emitting slog.Warn under s.mu re-enters this same
+	// client's Send and self-deadlocks (#2287). Defers run LIFO, so this
+	// emit-defer (registered first) runs after the Unlock-defer.
+	var pendingWarn *pendingDropWarn
+	defer func() { pendingWarn.emit(s.remoteAddr) }()
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -291,15 +375,27 @@ func (s *SyslogClient) Send(severity int, msg string) error {
 		// For stream protocols, attempt one cooldown-gated reconnect. UDP
 		// never blocks or needs reconnect, so it just returns the error.
 		if s.protocol != "udp" {
+			// A write-deadline TIMEOUT was already bounded by the deadline;
+			// do NOT reconnect+retry (that would re-arm another writeTimeout,
+			// doubling the worst-case stall on the event reader, #2287). Drop
+			// and return. Only a genuine connection error reconnects.
+			if isTimeout(err) {
+				pendingWarn = s.noteDrop(dropWrite, err)
+				return err
+			}
 			slog.Debug("syslog send failed, reconnecting", "addr", s.remoteAddr, "err", err)
 			if rerr := s.reconnect(); rerr != nil {
 				// Cooldown or dial failure: drop and continue. The event
 				// reader must make forward progress regardless.
-				s.noteDrop(rerr == errReconnectCooldown, err)
+				if rerr == errReconnectCooldown {
+					pendingWarn = s.noteDrop(dropCooldown, err)
+				} else {
+					pendingWarn = s.noteDrop(dropDial, rerr)
+				}
 				return fmt.Errorf("syslog reconnect %s: %w", s.remoteAddr, rerr)
 			}
 			if werr := s.writeMsg(line); werr != nil {
-				s.noteDrop(false, werr)
+				pendingWarn = s.noteDrop(dropWrite, werr)
 				return werr
 			}
 			return nil
@@ -307,6 +403,15 @@ func (s *SyslogClient) Send(severity int, msg string) error {
 		return err
 	}
 	return nil
+}
+
+// isTimeout reports whether err is a network timeout (e.g. a SetWriteDeadline
+// expiry surfaces as os.ErrDeadlineExceeded, which satisfies net.Error with
+// Timeout()==true). A timeout is already bounded by the deadline, so the stream
+// Send path drops it rather than reconnect+retrying (#2287).
+func isTimeout(err error) bool {
+	var ne net.Error
+	return errors.As(err, &ne) && ne.Timeout()
 }
 
 // writeMsg writes the framed message to the connection. Called with mu held.
@@ -343,18 +448,32 @@ func (s *SyslogClient) streamWrite(b []byte) error {
 // (contains its own length at offset [3:5]), so no additional framing is added.
 // On write failure for TCP/TLS, attempts one reconnect.
 func (s *SyslogClient) SendBinary(data []byte) error {
+	// See Send: the drop warning is emitted after the deferred Unlock to avoid
+	// the slog re-entrancy self-deadlock (#2287).
+	var pendingWarn *pendingDropWarn
+	defer func() { pendingWarn.emit(s.remoteAddr) }()
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if err := s.writeBinaryMsg(data); err != nil {
 		if s.protocol != "udp" {
+			// Write-deadline timeout: already bounded — drop, don't retry (#2287).
+			if isTimeout(err) {
+				pendingWarn = s.noteDrop(dropWrite, err)
+				return err
+			}
 			slog.Debug("syslog binary send failed, reconnecting", "addr", s.remoteAddr, "err", err)
 			if rerr := s.reconnect(); rerr != nil {
-				s.noteDrop(rerr == errReconnectCooldown, err)
+				if rerr == errReconnectCooldown {
+					pendingWarn = s.noteDrop(dropCooldown, err)
+				} else {
+					pendingWarn = s.noteDrop(dropDial, rerr)
+				}
 				return fmt.Errorf("syslog reconnect %s: %w", s.remoteAddr, rerr)
 			}
 			if werr := s.writeBinaryMsg(data); werr != nil {
-				s.noteDrop(false, werr)
+				pendingWarn = s.noteDrop(dropWrite, werr)
 				return werr
 			}
 			return nil

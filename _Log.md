@@ -9687,3 +9687,33 @@ top.
 ## 2026-06-21 — #2288 CLI completion panic guard + monitor match filter
 - **Action**: salvaged + committed the #2288 engineer worktree after a 529 death
 - **File(s)**: pkg/cli/completion.go, completion_panic_test.go, monitor.go, monitor_match_test.go
+- **Timestamp**: 2026-06-21
+  **Action**: #2287 syslog re-entrant deadlock fix (regression from #2285).
+  Three fixes in pkg/logging. (1) Deadlock: noteDrop no longer emits
+  slog.Warn while holding s.mu — it captures a pendingDropWarn snapshot
+  under the lock; Send/SendBinary emit it via a defer ordered to run AFTER
+  the s.mu Unlock. slog.Default() is the SyslogSlogHandler whose Handle
+  calls the same client's Send, so an under-lock slog.Warn re-locked the
+  non-reentrant s.mu and self-deadlocked the dataplane event reader.
+  Defense-in-depth: SyslogSlogHandler.Handle now carries a per-goroutine
+  re-entrancy guard (sync.Map of goroutine IDs, shared across
+  WithAttrs/WithGroup derivatives) that skips re-forwarding a record
+  already being forwarded on this goroutine; base-handler (stderr)
+  forwarding stays unconditional. (2) 2x bound: a stream write that fails
+  with a timeout (net.Error.Timeout) is now dropped+returned without
+  reconnect+retry (the deadline already bounded it); only genuine
+  connection errors reconnect. (3) Counter doc: split droppedDials out of
+  droppedWrites so DroppedWrites is exactly "write timeout or write error"
+  as documented; dial failures count as DroppedDials. New regression tests
+  (syslog_reentrancy_test.go) include a self-referential failing client
+  asserting Send returns within a bound (fail-on-revert: hangs if the warn
+  goes back under s.mu or the guard is removed) and a timeout-drop test
+  asserting 0 dials (fail-on-revert: sees a dial if timeout reconnects).
+  Validation: go build ./... clean; go vet ./pkg/logging clean; go test
+  -race ./pkg/logging green; 5x no flake on the new tests; consumers
+  (pkg/daemon, pkg/dataplane/userspace) -race green. Pre-existing,
+  unrelated: pkg/fsatomic TestNoDirectOsWriteFile flags
+  pkg/dataplane/proxyarp.go (not touched here).
+  **File(s)**: pkg/logging/syslog.go, pkg/logging/slog_handler.go,
+  pkg/logging/goid.go, pkg/logging/syslog_reentrancy_test.go,
+  pkg/logging/README.md, _Log.md
