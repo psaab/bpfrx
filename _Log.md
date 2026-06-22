@@ -1,5 +1,32 @@
 # Action Log
 
+## 2026-06-21 — #2297 io_uring EINTR retry + CQE match-by-user_data (slow path / state writer)
+
+- **Timestamp**: 2026-06-21
+- **Action**: Fixed two io_uring defects in the slow-path TUN reinjector
+  (`write_packet_io_uring`) and the state writer (`write_all_with_ring`).
+  Both pushed one Write SQE, called `submit_and_wait(1)`, then reaped one
+  CQE. The io-uring crate does not retry EINTR, so a signal during the wait
+  returned Err with the SQE already submitted and the CQE unreaped:
+  (a) the next write on the reused ring reaped the leftover CQE and applied
+  the prior write's byte count to the new buffer's offset (silent
+  truncation / OOB offset); (b) an io-wq-punted write could read the
+  caller's buffer after it was dropped (UAF). Fix factors both sites onto a
+  shared write loop in a new `io_uring_write` module that: retries the wait
+  on EINTR/error (never abandoning an in-flight SQE; the crate recomputes
+  to_submit from the now-empty SQ so the retry is wait-only, bounded by a
+  retry ceiling), tags each submission with a distinct monotonic user_data
+  and matches the CQE by it (draining/discarding stale CQEs), and returns
+  only after the matching CQE is reaped so the buffer outlives every kernel
+  reference. Fast forwarding path untouched. Retry/drain logic exercised via
+  a `RingPort` trait seam (io_uring is unavailable in the build sandbox):
+  EINTR-retry full-count, stale-CQE-skip, short/negative-result errors,
+  positioned multi-chunk. Validated: release build clean; io_uring_write
+  8/8, state_writer 4/4, slowpath 2/2; `go build ./...` clean.
+- **File(s)**: userspace-dp/src/io_uring_write.rs (new),
+  userspace-dp/src/main.rs, userspace-dp/src/slowpath.rs,
+  userspace-dp/src/state_writer.rs, _Log.md
+
 ## 2026-06-21 — #2295 + #2302 pkg/logging syslog follow-ups
 
 - **Timestamp**: 2026-06-21
