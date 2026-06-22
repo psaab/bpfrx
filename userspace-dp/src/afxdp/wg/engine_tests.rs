@@ -102,6 +102,7 @@ fn install_session_same_peer_same_local_index_is_collision() {
             endpoint: None,
             persistent_keepalive: 0,
             allowed_ips: vec![ipnet::IpNet::from_str("10.0.0.0/24").unwrap()],
+            preshared_key: [0u8; 32],
         }],
     });
     let peer_engine = WgEngine::new(WgEngineConfig {
@@ -112,6 +113,7 @@ fn install_session_same_peer_same_local_index_is_collision() {
             endpoint: None,
             persistent_keepalive: 0,
             allowed_ips: vec![ipnet::IpNet::from_str("10.0.0.0/24").unwrap()],
+            preshared_key: [0u8; 32],
         }],
     });
     let s1 = make_session_for(&engine, peer_pub, &peer_engine, 0xaaaa_0001, 2);
@@ -150,6 +152,7 @@ fn install_session_fresh_index_rekey_preserves_previous_demux() {
             endpoint: None,
             persistent_keepalive: 0,
             allowed_ips: vec![ipnet::IpNet::from_str("10.0.0.0/24").unwrap()],
+            preshared_key: [0u8; 32],
         }],
     });
     let peer_engine = WgEngine::new(WgEngineConfig {
@@ -160,6 +163,7 @@ fn install_session_fresh_index_rekey_preserves_previous_demux() {
             endpoint: None,
             persistent_keepalive: 0,
             allowed_ips: vec![ipnet::IpNet::from_str("10.0.0.0/24").unwrap()],
+            preshared_key: [0u8; 32],
         }],
     });
     let s1 = make_session_for(&engine, peer_pub, &peer_engine, 0xaaaa_0001, 2);
@@ -191,6 +195,7 @@ fn install_session_second_rekey_evicts_dropped_session() {
             endpoint: None,
             persistent_keepalive: 0,
             allowed_ips: vec![ipnet::IpNet::from_str("10.0.0.0/24").unwrap()],
+            preshared_key: [0u8; 32],
         }],
     });
     let peer_engine = WgEngine::new(WgEngineConfig {
@@ -201,6 +206,7 @@ fn install_session_second_rekey_evicts_dropped_session() {
             endpoint: None,
             persistent_keepalive: 0,
             allowed_ips: vec![ipnet::IpNet::from_str("10.0.0.0/24").unwrap()],
+            preshared_key: [0u8; 32],
         }],
     });
     let s1 = make_session_for(&engine, peer_pub, &peer_engine, 0xaaaa_0001, 2);
@@ -236,12 +242,14 @@ fn install_session_rejects_local_index_collision_across_peers() {
                 endpoint: None,
                 persistent_keepalive: 0,
                 allowed_ips: vec![ipnet::IpNet::from_str("10.0.0.0/24").unwrap()],
+                preshared_key: [0u8; 32],
             },
             WgPeerConfig {
                 pubkey: peer_b_pub,
                 endpoint: None,
                 persistent_keepalive: 0,
                 allowed_ips: vec![ipnet::IpNet::from_str("10.0.0.0/24").unwrap()],
+                preshared_key: [0u8; 32],
             },
         ],
     });
@@ -253,6 +261,7 @@ fn install_session_rejects_local_index_collision_across_peers() {
             endpoint: None,
             persistent_keepalive: 0,
             allowed_ips: vec![ipnet::IpNet::from_str("10.0.0.0/24").unwrap()],
+            preshared_key: [0u8; 32],
         }],
     });
     let peer_b_engine = WgEngine::new(WgEngineConfig {
@@ -263,6 +272,7 @@ fn install_session_rejects_local_index_collision_across_peers() {
             endpoint: None,
             persistent_keepalive: 0,
             allowed_ips: vec![ipnet::IpNet::from_str("10.0.0.0/24").unwrap()],
+            preshared_key: [0u8; 32],
         }],
     });
     let sa = make_session_for(&engine, peer_a_pub, &peer_a_engine, 0x1234_5678, 2);
@@ -292,6 +302,7 @@ fn encap_rejects_after_message_limit() {
             endpoint: None,
             persistent_keepalive: 0,
             allowed_ips: vec![ipnet::IpNet::from_str("10.0.0.0/24").unwrap()],
+            preshared_key: [0u8; 32],
         }],
     });
     let resp = WgEngine::new(WgEngineConfig {
@@ -302,6 +313,7 @@ fn encap_rejects_after_message_limit() {
             endpoint: None,
             persistent_keepalive: 0,
             allowed_ips: vec![ipnet::IpNet::from_str("10.0.0.0/24").unwrap()],
+            preshared_key: [0u8; 32],
         }],
     });
     let mut init_hs = engine.build_initiator_handshake(&peer_pub).unwrap();
@@ -353,6 +365,7 @@ fn reconcile_peers_drains_dropped_peer_sessions_from_demux() {
             endpoint: None,
             persistent_keepalive: 0,
             allowed_ips: vec![ipnet::IpNet::from_str("10.0.0.0/24").unwrap()],
+            preshared_key: [0u8; 32],
         }],
     });
     let peer_engine = WgEngine::new(WgEngineConfig {
@@ -363,6 +376,7 @@ fn reconcile_peers_drains_dropped_peer_sessions_from_demux() {
             endpoint: None,
             persistent_keepalive: 0,
             allowed_ips: vec![ipnet::IpNet::from_str("10.0.0.0/24").unwrap()],
+            preshared_key: [0u8; 32],
         }],
     });
     // Install two sessions on the peer (current + previous).
@@ -411,12 +425,14 @@ fn reconcile_peers_leaves_kept_peer_sessions_intact() {
                 endpoint: None,
                 persistent_keepalive: 0,
                 allowed_ips: vec![ipnet::IpNet::from_str("10.0.0.0/24").unwrap()],
+                preshared_key: [0u8; 32],
             },
             WgPeerConfig {
                 pubkey: peer_b_pub,
                 endpoint: None,
                 persistent_keepalive: 0,
                 allowed_ips: vec![ipnet::IpNet::from_str("10.0.1.0/24").unwrap()],
+                preshared_key: [0u8; 32],
             },
         ],
     });
@@ -428,6 +444,7 @@ fn reconcile_peers_leaves_kept_peer_sessions_intact() {
             endpoint: None,
             persistent_keepalive: 0,
             allowed_ips: vec![ipnet::IpNet::from_str("10.0.0.0/24").unwrap()],
+            preshared_key: [0u8; 32],
         }],
     });
     let peer_b_engine = WgEngine::new(WgEngineConfig {
@@ -438,6 +455,7 @@ fn reconcile_peers_leaves_kept_peer_sessions_intact() {
             endpoint: None,
             persistent_keepalive: 0,
             allowed_ips: vec![ipnet::IpNet::from_str("10.0.1.0/24").unwrap()],
+            preshared_key: [0u8; 32],
         }],
     });
     let s_a = make_session_for(&engine, peer_a_pub, &peer_a_engine, 0xaaaa_0001, 2);
@@ -450,6 +468,7 @@ fn reconcile_peers_leaves_kept_peer_sessions_intact() {
         endpoint: None,
         persistent_keepalive: 0,
         allowed_ips: vec![ipnet::IpNet::from_str("10.0.1.0/24").unwrap()],
+        preshared_key: [0u8; 32],
     }]);
     let by_index = engine.sessions_by_local_index.read().unwrap();
     assert!(
@@ -492,6 +511,7 @@ fn reconcile_peers_snapshot_is_atomic_under_concurrent_load() {
             endpoint: None,
             persistent_keepalive: 0,
             allowed_ips: vec![ipnet::IpNet::from_str("10.0.0.0/24").unwrap()],
+            preshared_key: [0u8; 32],
         }],
     }));
     let stop = Arc::new(AtomicBool::new(false));
@@ -501,12 +521,14 @@ fn reconcile_peers_snapshot_is_atomic_under_concurrent_load() {
             endpoint: None,
             persistent_keepalive: 0,
             allowed_ips: vec![ipnet::IpNet::from_str("10.0.1.0/24").unwrap()],
+            preshared_key: [0u8; 32],
         },
         WgPeerConfig {
             pubkey: peer_c_pub,
             endpoint: None,
             persistent_keepalive: 0,
             allowed_ips: vec![ipnet::IpNet::from_str("10.0.2.0/24").unwrap()],
+            preshared_key: [0u8; 32],
         },
     ];
     let config_orig = vec![WgPeerConfig {
@@ -514,6 +536,7 @@ fn reconcile_peers_snapshot_is_atomic_under_concurrent_load() {
         endpoint: None,
         persistent_keepalive: 0,
         allowed_ips: vec![ipnet::IpNet::from_str("10.0.0.0/24").unwrap()],
+        preshared_key: [0u8; 32],
     }];
     let writer = {
         let engine = engine.clone();
@@ -607,6 +630,7 @@ fn install_session_serializes_with_reconcile_removal() {
             endpoint: None,
             persistent_keepalive: 0,
             allowed_ips: vec![ipnet::IpNet::from_str("10.0.0.0/24").unwrap()],
+            preshared_key: [0u8; 32],
         }],
     }));
     let peer_engine = WgEngine::new(WgEngineConfig {
@@ -617,6 +641,7 @@ fn install_session_serializes_with_reconcile_removal() {
             endpoint: None,
             persistent_keepalive: 0,
             allowed_ips: vec![ipnet::IpNet::from_str("10.0.0.0/24").unwrap()],
+            preshared_key: [0u8; 32],
         }],
     });
     let cfg_with_peer = vec![WgPeerConfig {
@@ -624,6 +649,7 @@ fn install_session_serializes_with_reconcile_removal() {
         endpoint: None,
         persistent_keepalive: 0,
         allowed_ips: vec![ipnet::IpNet::from_str("10.0.0.0/24").unwrap()],
+        preshared_key: [0u8; 32],
     }];
     // Pre-build a batch of sessions off the hot path. Each one
     // gets a fresh local_index so installs never collide on the
@@ -766,6 +792,7 @@ fn encap_padded_plaintext_overflow_leaves_counter_and_buffer_untouched() {
             endpoint: None,
             persistent_keepalive: 0,
             allowed_ips: vec![ipnet::IpNet::from_str("10.0.0.0/24").unwrap()],
+            preshared_key: [0u8; 32],
         }],
     });
     let peer_engine = WgEngine::new(WgEngineConfig {
@@ -776,6 +803,7 @@ fn encap_padded_plaintext_overflow_leaves_counter_and_buffer_untouched() {
             endpoint: None,
             persistent_keepalive: 0,
             allowed_ips: vec![ipnet::IpNet::from_str("10.0.0.0/24").unwrap()],
+            preshared_key: [0u8; 32],
         }],
     });
     let session = make_session_for(&engine, peer_pub, &peer_engine, 0xdead_0001, 2);
@@ -812,4 +840,133 @@ fn session_tx_counter(engine: &WgEngine, pubkey: &[u8; 32]) -> u64 {
     let peer = table.peers[idx as usize].clone();
     let cur = peer.current.read().unwrap().clone().unwrap();
     cur.tx_counter.load(Ordering::Relaxed)
+}
+
+// === #1434 multi-peer tests ===
+
+/// #1434 B1b: the encap-side cryptokey-routing lookup must select the
+/// peer whose AllowedIPs cover the inner DESTINATION (longest-prefix
+/// match), returning that peer's pubkey + endpoint. A dst no peer claims
+/// returns None (the frame is dropped — nowhere to send it).
+#[test]
+fn peer_for_dest_lpm_selects_owning_peer() {
+    let (local_priv, _local_pub) = keypair();
+    let (_a_priv, a_pub) = keypair();
+    let (_b_priv, b_pub) = keypair();
+    let a_ep: std::net::SocketAddr = "203.0.113.1:51820".parse().unwrap();
+    let b_ep: std::net::SocketAddr = "198.51.100.7:51820".parse().unwrap();
+    let engine = WgEngine::new(WgEngineConfig {
+        local_private_key: local_priv,
+        listen_port: 51820,
+        peers: vec![
+            WgPeerConfig {
+                pubkey: a_pub,
+                endpoint: Some(a_ep),
+                persistent_keepalive: 0,
+                allowed_ips: vec![ipnet::IpNet::from_str("10.1.0.0/16").unwrap()],
+                preshared_key: [0u8; 32],
+            },
+            WgPeerConfig {
+                pubkey: b_pub,
+                endpoint: Some(b_ep),
+                persistent_keepalive: 0,
+                // A more-specific /24 inside A would still resolve to B for
+                // that /24 (global LPM), proving longest-prefix wins.
+                allowed_ips: vec![
+                    ipnet::IpNet::from_str("10.2.0.0/16").unwrap(),
+                    ipnet::IpNet::from_str("10.1.5.0/24").unwrap(),
+                ],
+                preshared_key: [0u8; 32],
+            },
+        ],
+    });
+    // 10.1.9.9 → A's /16.
+    let (pk, ep) = engine
+        .peer_for_dest("10.1.9.9".parse().unwrap())
+        .expect("A covers 10.1.9.9");
+    assert_eq!(pk, a_pub, "10.1.9.9 routes to peer A");
+    assert_eq!(ep, Some(a_ep));
+    // 10.2.3.4 → B's /16.
+    let (pk, ep) = engine
+        .peer_for_dest("10.2.3.4".parse().unwrap())
+        .expect("B covers 10.2.3.4");
+    assert_eq!(pk, b_pub, "10.2.3.4 routes to peer B");
+    assert_eq!(ep, Some(b_ep));
+    // 10.1.5.7 → B's MORE-SPECIFIC /24 even though A's /16 also covers it.
+    let (pk, _ep) = engine
+        .peer_for_dest("10.1.5.7".parse().unwrap())
+        .expect("B's /24 covers 10.1.5.7");
+    assert_eq!(pk, b_pub, "longest-prefix /24 wins over the covering /16");
+    // 192.0.2.1 → no peer.
+    assert!(
+        engine.peer_for_dest("192.0.2.1".parse().unwrap()).is_none(),
+        "an unclaimed dst selects no peer"
+    );
+}
+
+/// #1434 B2: a per-peer preshared key must round-trip through a real
+/// handshake — matching PSKs complete, a mismatched PSK fails the AEAD
+/// in msg2. Exercises the initiator (build-time PSK) and responder
+/// (set_psk-after-msg1) paths together.
+#[test]
+fn per_peer_psk_handshake_roundtrip() {
+    let (init_priv, init_pub) = keypair();
+    let (resp_priv, resp_pub) = keypair();
+    let psk = [0x5au8; 32];
+
+    let make = |local_priv, peer_pub, peer_psk: [u8; 32]| {
+        WgEngine::new(WgEngineConfig {
+            local_private_key: local_priv,
+            listen_port: 51820,
+            peers: vec![WgPeerConfig {
+                pubkey: peer_pub,
+                endpoint: None,
+                persistent_keepalive: 0,
+                allowed_ips: vec![ipnet::IpNet::from_str("10.0.0.0/24").unwrap()],
+                preshared_key: peer_psk,
+            }],
+        })
+    };
+
+    // Matching PSK on both sides → full handshake completes.
+    {
+        let init = make(init_priv, resp_pub, psk);
+        let resp = make(resp_priv, init_pub, psk);
+        let mut init_hs = init.build_initiator_handshake(&resp_pub).unwrap();
+        let mut msg1 = [0u8; 1024];
+        let mut sink = [0u8; 1024];
+        let n1 = init_hs.write_message(&[], &mut msg1).unwrap();
+        // Responder side: build, read msg1, set the peer's PSK, write msg2.
+        let mut resp_hs = resp.build_responder_handshake().unwrap();
+        resp_hs.read_message(&msg1[..n1], &mut sink).unwrap();
+        let rs = resp_hs.get_remote_static().unwrap();
+        assert_eq!(rs, init_pub, "responder recovers the initiator pubkey");
+        resp_hs.set_psk(2, &psk).unwrap();
+        let mut msg2 = [0u8; 1024];
+        let n2 = resp_hs.write_message(&[], &mut msg2).unwrap();
+        // Initiator reads msg2 (PSK was set at build via build_initiator).
+        init_hs
+            .read_message(&msg2[..n2], &mut sink)
+            .expect("matching PSK must complete the handshake");
+        assert!(init_hs.is_handshake_finished());
+    }
+
+    // Mismatched PSK (initiator zero, responder real) → msg2 AEAD fails.
+    {
+        let init = make(init_priv, resp_pub, [0u8; 32]); // no PSK
+        let resp = make(resp_priv, init_pub, psk); // real PSK
+        let mut init_hs = init.build_initiator_handshake(&resp_pub).unwrap();
+        let mut msg1 = [0u8; 1024];
+        let mut sink = [0u8; 1024];
+        let n1 = init_hs.write_message(&[], &mut msg1).unwrap();
+        let mut resp_hs = resp.build_responder_handshake().unwrap();
+        resp_hs.read_message(&msg1[..n1], &mut sink).unwrap();
+        resp_hs.set_psk(2, &psk).unwrap();
+        let mut msg2 = [0u8; 1024];
+        let n2 = resp_hs.write_message(&[], &mut msg2).unwrap();
+        assert!(
+            init_hs.read_message(&msg2[..n2], &mut sink).is_err(),
+            "a PSK mismatch must fail the msg2 AEAD"
+        );
+    }
 }

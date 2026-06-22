@@ -371,14 +371,20 @@ func TestWgTunMTUForEndpointModel(t *testing.T) {
 
 	// No operator MTU, v4 endpoint → v4 overhead (60) + pad (15).
 	v4 := wgTC()
-	v4.WgEndpoint = "203.0.113.5:51820"
+	v4.WgPeers = []config.WgPeerConfig{{
+		PublicKeyHex: "b02020202020202020202020202020202020202020202020202020202020202b",
+		Endpoint:     "203.0.113.5:51820",
+	}}
 	if got, want := wgTunMTUForEndpoint(v4), wgDefaultOuterMTU-wgOverheadV4-wgPadWorst; got != want {
 		t.Fatalf("v4 endpoint default: got %d, want %d", got, want)
 	}
 
 	// No operator MTU, v6 endpoint → v6 overhead (80) + pad (15).
 	v6 := wgTC()
-	v6.WgEndpoint = "[2001:db8::1]:51820"
+	v6.WgPeers = []config.WgPeerConfig{{
+		PublicKeyHex: "b02020202020202020202020202020202020202020202020202020202020202b",
+		Endpoint:     "[2001:db8::1]:51820",
+	}}
 	if got, want := wgTunMTUForEndpoint(v6), wgDefaultOuterMTU-wgOverheadV6-wgPadWorst; got != want {
 		t.Fatalf("v6 endpoint default: got %d, want %d", got, want)
 	}

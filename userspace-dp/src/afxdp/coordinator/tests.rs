@@ -2156,9 +2156,12 @@ fn wg1866_snapshot(id: u16, ifindex: i32, name: &str, port: u16, privkey: &str) 
             mode: "wireguard".to_string(),
             wg_listen_port: port,
             wg_local_privkey_hex: privkey.to_string(),
-            wg_peer_pubkey_hex: WG1866_PUBKEY.to_string(),
-            wg_allowed_ips: vec!["10.77.0.0/24".to_string()],
-            wg_endpoint: "127.0.0.1:9".to_string(),
+            wg_peers: vec![crate::protocol::snapshot::TunnelWgPeerSnapshot {
+                wg_peer_pubkey_hex: WG1866_PUBKEY.to_string(),
+                wg_allowed_ips: vec!["10.77.0.0/24".to_string()],
+                wg_endpoint: "127.0.0.1:9".to_string(),
+                ..Default::default()
+            }],
             ..Default::default()
         }],
         ..Default::default()

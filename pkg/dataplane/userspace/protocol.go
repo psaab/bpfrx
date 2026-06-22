@@ -329,19 +329,36 @@ type TunnelEndpointSnapshot struct {
 	// WgLocalPrivkeyHex is the local static X25519 private key as
 	// hex (64 chars). Control-plane-internal; never logged.
 	WgLocalPrivkeyHex string `json:"wg_local_privkey_hex,omitempty"`
-	// WgPeerPubkeyHex is the peer's static X25519 public key as
-	// hex. The engine uses THIS, not AllowedIPs LPM, to choose the
-	// encryption peer on egress — see plan §"Engine keying".
+	// WgPeers is the ordered per-peer set (#1434 multi-peer),
+	// sorted by pubkey at the snapshot-builder boundary for HA
+	// determinism. Replaces the scalar Wg{PeerPubkeyHex,AllowedIPs,
+	// Endpoint,KeepaliveSecs} fields. The Rust side feeds the engine
+	// peer table from this slice; RX/decap demuxes by receiver_index
+	// across all peers, and TX/encap selects the peer by inner-dst
+	// AllowedIPs LPM (#1434 B1b).
+	WgPeers []TunnelWgPeerWire `json:"wg_peers,omitempty"`
+}
+
+// TunnelWgPeerWire is one WireGuard peer on the Go→Rust wire (#1434).
+// Mirrors the Rust TunnelWgPeerSnapshot (snapshot.rs). Keep json tags
+// identical on BOTH sides (feedback_wire_protocol_both_sides).
+type TunnelWgPeerWire struct {
+	// WgPeerPubkeyHex is the peer's static X25519 public key as hex.
 	WgPeerPubkeyHex string `json:"wg_peer_pubkey_hex,omitempty"`
-	// WgAllowedIPs is the peer's AllowedIPs as CIDR strings. Only
-	// consulted on the decap path (inner src-IP gate).
+	// WgAllowedIPs is the peer's AllowedIPs as CIDR strings.
 	WgAllowedIPs []string `json:"wg_allowed_ips,omitempty"`
-	// WgEndpoint is the optional peer endpoint (IP:port). Empty
-	// for responder-only.
+	// WgEndpoint is the optional peer endpoint (IP:port). Empty for
+	// responder-only.
 	WgEndpoint string `json:"wg_endpoint,omitempty"`
-	// WgKeepaliveSecs is the optional persistent-keepalive
-	// interval. 0 means disabled.
+	// WgKeepaliveSecs is the optional persistent-keepalive interval.
+	// 0 means disabled.
 	WgKeepaliveSecs uint16 `json:"wg_keepalive_secs,omitempty"`
+	// WgPresharedKeyHex is the optional per-peer preshared key as hex
+	// (#1434 B2). Empty = zero PSK. SECRET: like wg_local_privkey_hex
+	// it is delivered on the control socket (the engine needs it) but
+	// MUST never reach an on-disk state snapshot or a log — the Rust
+	// side marks the matching field skip_serializing.
+	WgPresharedKeyHex string `json:"wg_preshared_key_hex,omitempty"`
 }
 
 type SourceNATRuleSnapshot struct {
@@ -836,6 +853,22 @@ type ProcessStatus struct {
 	WgTunnels []WgTunnelStatus `json:"wg_tunnels,omitempty"`
 }
 
+// WgPeerStatus mirrors the Rust WgPeerStatus in
+// userspace-dp/src/protocol/control.rs (#1434 multi-peer) — keep json
+// tags identical on BOTH sides.
+type WgPeerStatus struct {
+	// PeerPubkeyHex is the peer static public key, 64-char lowercase hex
+	// (same rendering as the config-side wg_peer_pubkey_hex; note
+	// `wg show` renders base64 — xpf surfaces are uniformly hex).
+	PeerPubkeyHex string `json:"peer_pubkey_hex,omitempty"`
+	// PeerEndpoint is the configured-or-learned endpoint (empty for a
+	// responder-only peer with no learned endpoint yet).
+	PeerEndpoint string `json:"peer_endpoint,omitempty"`
+	// SessionConfirmed is whether this peer holds a confirmed
+	// (egress-usable) transport session.
+	SessionConfirmed bool `json:"session_confirmed,omitempty"`
+}
+
 // WgTunnelStatus mirrors the Rust WgTunnelStatus in
 // userspace-dp/src/protocol/control.rs — keep json tags identical on
 // BOTH sides (feedback_wire_protocol_both_sides). Counter semantics
@@ -848,10 +881,6 @@ type WgTunnelStatus struct {
 	Tunnel           string `json:"tunnel,omitempty"`
 	TunnelEndpointID uint16 `json:"tunnel_endpoint_id,omitempty"`
 	ListenPort       uint16 `json:"listen_port,omitempty"`
-	// PeerPubkeyHex is the peer static public key, 64-char lowercase
-	// hex (same rendering as the config-side wg_peer_pubkey_hex; note
-	// `wg show` renders base64 — xpf surfaces are uniformly hex).
-	PeerPubkeyHex string `json:"peer_pubkey_hex,omitempty"`
 	// LocalPubkeyHex is OUR local static public key, 64-char lowercase
 	// hex (#1434 Increment 1) — the key an operator hands to the peer.
 	// Derived once by the helper from the local private key at engine
@@ -862,10 +891,11 @@ type WgTunnelStatus struct {
 	// omitempty keeps a pre-#1434 helper payload (field absent) decoding
 	// to "".
 	LocalPubkeyHex string `json:"local_pubkey_hex,omitempty"`
-	// PeerEndpoint is the CONFIGURED endpoint (empty for a
-	// responder-only peer; the learned endpoint is not surfaced yet).
-	PeerEndpoint     string `json:"peer_endpoint,omitempty"`
-	SessionConfirmed bool   `json:"session_confirmed,omitempty"`
+	// Peers carries the per-peer rows (#1434 multi-peer): pubkey,
+	// endpoint, and confirmed-session per configured peer. Replaces the
+	// scalar PeerPubkeyHex/PeerEndpoint/SessionConfirmed. The counters
+	// below remain tunnel-level (per-engine).
+	Peers []WgPeerStatus `json:"peers,omitempty"`
 	// LastHandshakeUnixSecs is wall-clock epoch seconds of the most
 	// recent handshake completion (either role); 0 = never (epoch 0 is
 	// unreachable, so the in-band sentinel is unambiguous).

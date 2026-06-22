@@ -42,7 +42,9 @@ func TestStableTunnelEndpointIDNeverZero(t *testing.T) {
 func TestTunnelEndpointIDCollisionFailsCommit(t *testing.T) {
 	tree := buildTree(t, []string{
 		"set interfaces wg1408 unit 0 tunnel mode wireguard",
+		"set interfaces wg1408 unit 0 tunnel wireguard peer aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa allowed-ips 10.0.0.0/24",
 		"set interfaces wg78 unit 0 tunnel mode wireguard",
+		"set interfaces wg78 unit 0 tunnel wireguard peer aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa allowed-ips 10.0.0.0/24",
 	})
 	_, err := CompileConfig(tree)
 	if err == nil {
@@ -61,7 +63,9 @@ func TestTunnelEndpointIDCollisionFailsCommit(t *testing.T) {
 func TestTunnelEndpointIDCollisionLenientWarns(t *testing.T) {
 	tree := buildTree(t, []string{
 		"set interfaces wg1408 unit 0 tunnel mode wireguard",
+		"set interfaces wg1408 unit 0 tunnel wireguard peer aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa allowed-ips 10.0.0.0/24",
 		"set interfaces wg78 unit 0 tunnel mode wireguard",
+		"set interfaces wg78 unit 0 tunnel wireguard peer aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa allowed-ips 10.0.0.0/24",
 	})
 	cfg, err := CompileConfigLenient(tree)
 	if err != nil {
@@ -86,7 +90,9 @@ func TestTunnelEndpointIDCollisionLenientWarns(t *testing.T) {
 func TestTunnelEndpointIDCollisionAcrossGroupsIsSymmetric(t *testing.T) {
 	tree := buildTree(t, []string{
 		"set groups node1 interfaces wg1408 unit 0 tunnel mode wireguard",
+		"set groups node1 interfaces wg1408 unit 0 tunnel wireguard peer aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa allowed-ips 10.0.0.0/24",
 		"set interfaces wg78 unit 0 tunnel mode wireguard",
+		"set interfaces wg78 unit 0 tunnel wireguard peer aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa allowed-ips 10.0.0.0/24",
 		// No apply-groups: node0's EFFECTIVE config never contains
 		// wg1408 — the union check must still reject.
 	})
@@ -111,9 +117,11 @@ func TestTunnelEndpointIDNoFalsePositiveOnNonEmittedWGUnit(t *testing.T) {
 	}
 	tree := buildTree(t, []string{
 		"set interfaces wg0 tunnel mode wireguard",
+		"set interfaces wg0 tunnel wireguard peer aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa allowed-ips 10.0.0.0/24",
 		"set interfaces wg0 unit 0 family inet address 10.70.0.1/30",
 		"set interfaces wg0 unit 1 family inet address 10.70.0.5/30",
 		"set interfaces wg341 tunnel mode wireguard",
+		"set interfaces wg341 tunnel wireguard peer aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa allowed-ips 10.0.0.0/24",
 	})
 	cfg, err := CompileConfig(tree)
 	if err != nil {
@@ -134,8 +142,10 @@ func TestTunnelEndpointIDNoFalsePositiveOnNonEmittedWGUnit(t *testing.T) {
 func TestTunnelEndpointIDLeadingZeroUnitStillCollides(t *testing.T) {
 	tree := buildTree(t, []string{
 		"set interfaces wg0 tunnel mode wireguard",
+		"set interfaces wg0 tunnel wireguard peer aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa allowed-ips 10.0.0.0/24",
 		"set interfaces wg0 unit 01 family inet address 10.70.0.1/30",
 		"set interfaces wg341 tunnel mode wireguard",
+		"set interfaces wg341 tunnel wireguard peer aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa allowed-ips 10.0.0.0/24",
 	})
 	_, err := CompileConfig(tree)
 	if err == nil {
@@ -162,8 +172,10 @@ func TestTunnelEndpointIDOverflowOnlyUnitHashesBareRef(t *testing.T) {
 	}
 	tree := buildTree(t, []string{
 		"set interfaces wg0 tunnel mode wireguard",
+		"set interfaces wg0 tunnel wireguard peer aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa allowed-ips 10.0.0.0/24",
 		"set interfaces wg0 unit 99999999999999999999999999999999999999 family inet address 10.70.2.1/30",
 		"set interfaces wg34524 unit 0 tunnel mode wireguard",
+		"set interfaces wg34524 unit 0 tunnel wireguard peer aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa allowed-ips 10.0.0.0/24",
 	})
 	if _, err := CompileConfig(tree); err == nil {
 		t.Fatalf("CompileConfig accepted a builder-emitted collision hidden behind an overflow-only unit spelling (wg0 emits bare ref, collides with wg34524.0)")
@@ -177,7 +189,9 @@ func TestTunnelEndpointIDOverflowOnlyUnitHashesBareRef(t *testing.T) {
 func TestTunnelEndpointIDUnitLevelLeadingZeroStillCollides(t *testing.T) {
 	tree := buildTree(t, []string{
 		"set interfaces wg0 unit 01 tunnel mode wireguard",
+		"set interfaces wg0 unit 01 tunnel wireguard peer aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa allowed-ips 10.0.0.0/24",
 		"set interfaces wg341 tunnel mode wireguard",
+		"set interfaces wg341 tunnel wireguard peer aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa allowed-ips 10.0.0.0/24",
 	})
 	_, err := CompileConfig(tree)
 	if err == nil {
@@ -204,8 +218,10 @@ func TestTunnelEndpointIDDuplicateUnitSpellingLastWins(t *testing.T) {
 	// emitted) must NOT reject the commit.
 	tree := buildTree(t, []string{
 		"set interfaces wg1408 unit 00 tunnel mode wireguard",
+		"set interfaces wg1408 unit 00 tunnel wireguard peer aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa allowed-ips 10.0.0.0/24",
 		"set interfaces wg1408 unit 0 family inet address 10.70.3.1/30",
 		"set interfaces wg78 unit 0 tunnel mode wireguard",
+		"set interfaces wg78 unit 0 tunnel wireguard peer aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa allowed-ips 10.0.0.0/24",
 	})
 	if _, err := CompileConfig(tree); err != nil {
 		t.Fatalf("CompileConfig rejected a collision on a ref whose tunnel lives only on an overwritten duplicate unit instance: %v", err)
@@ -215,7 +231,9 @@ func TestTunnelEndpointIDDuplicateUnitSpellingLastWins(t *testing.T) {
 	tree = buildTree(t, []string{
 		"set interfaces wg1408 unit 00 family inet address 10.70.3.1/30",
 		"set interfaces wg1408 unit 0 tunnel mode wireguard",
+		"set interfaces wg1408 unit 0 tunnel wireguard peer aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa allowed-ips 10.0.0.0/24",
 		"set interfaces wg78 unit 0 tunnel mode wireguard",
+		"set interfaces wg78 unit 0 tunnel wireguard peer aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa allowed-ips 10.0.0.0/24",
 	})
 	if _, err := CompileConfig(tree); err == nil {
 		t.Fatalf("CompileConfig accepted a real collision whose tunnel lives on the last duplicate unit instance (wg1408.0 vs wg78.0)")
@@ -227,9 +245,11 @@ func TestTunnelEndpointIDDuplicateUnitSpellingLastWins(t *testing.T) {
 func TestTunnelEndpointIDCollisionOnEmittedWGUnitStillRejected(t *testing.T) {
 	tree := buildTree(t, []string{
 		"set interfaces wg1408 tunnel mode wireguard",
+		"set interfaces wg1408 tunnel wireguard peer aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa allowed-ips 10.0.0.0/24",
 		"set interfaces wg1408 unit 0 family inet address 10.70.1.1/30",
 		"set interfaces wg1408 unit 1 family inet address 10.70.1.5/30",
 		"set interfaces wg78 unit 0 tunnel mode wireguard",
+		"set interfaces wg78 unit 0 tunnel wireguard peer aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa allowed-ips 10.0.0.0/24",
 	})
 	if _, err := CompileConfig(tree); err == nil {
 		t.Fatalf("CompileConfig accepted a collision on the emitted lowest unit ref (wg1408.0 vs wg78.0)")
@@ -241,6 +261,7 @@ func TestTunnelEndpointIDCollisionOnEmittedWGUnitStillRejected(t *testing.T) {
 func TestTunnelEndpointIDNoFalsePositive(t *testing.T) {
 	tree := buildTree(t, []string{
 		"set interfaces wg0 unit 0 tunnel mode wireguard",
+		"set interfaces wg0 unit 0 tunnel wireguard peer aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa allowed-ips 10.0.0.0/24",
 		"set groups node0 interfaces gr-0/0/0 unit 0 tunnel mode gre",
 		"set groups node0 interfaces gr-0/0/0 unit 0 tunnel source 10.0.0.1",
 		"set groups node0 interfaces gr-0/0/0 unit 0 tunnel destination 10.0.0.2",
@@ -276,8 +297,10 @@ func TestTunnelEndpointIDWildcardApplyGroupsCollisionRejected(t *testing.T) {
 	}
 	tree := buildTree(t, []string{
 		"set groups wgtun interfaces <*> unit 0 tunnel mode wireguard",
+		"set groups wgtun interfaces <*> unit 0 tunnel wireguard peer aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa allowed-ips 10.0.0.0/24",
 		"set interfaces wg78 apply-groups wgtun",
 		"set interfaces wg1408 unit 0 tunnel mode wireguard",
+		"set interfaces wg1408 unit 0 tunnel wireguard peer aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa allowed-ips 10.0.0.0/24",
 	})
 	_, err := CompileConfig(tree)
 	if err == nil {
@@ -295,8 +318,10 @@ func TestTunnelEndpointIDWildcardApplyGroupsCollisionRejected(t *testing.T) {
 func TestTunnelEndpointIDWildcardApplyGroupsCollisionLenientWarns(t *testing.T) {
 	tree := buildTree(t, []string{
 		"set groups wgtun interfaces <*> unit 0 tunnel mode wireguard",
+		"set groups wgtun interfaces <*> unit 0 tunnel wireguard peer aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa allowed-ips 10.0.0.0/24",
 		"set interfaces wg78 apply-groups wgtun",
 		"set interfaces wg1408 unit 0 tunnel mode wireguard",
+		"set interfaces wg1408 unit 0 tunnel wireguard peer aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa allowed-ips 10.0.0.0/24",
 	})
 	cfg, err := CompileConfigLenient(tree)
 	if err != nil {
@@ -318,8 +343,10 @@ func TestTunnelEndpointIDWildcardApplyGroupsCollisionLenientWarns(t *testing.T) 
 func TestTunnelEndpointIDWildcardApplyGroupsCollisionSymmetric(t *testing.T) {
 	tree := buildTree(t, []string{
 		"set groups wgtun interfaces <*> unit 0 tunnel mode wireguard",
+		"set groups wgtun interfaces <*> unit 0 tunnel wireguard peer aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa allowed-ips 10.0.0.0/24",
 		"set interfaces wg78 apply-groups wgtun",
 		"set interfaces wg1408 unit 0 tunnel mode wireguard",
+		"set interfaces wg1408 unit 0 tunnel wireguard peer aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa allowed-ips 10.0.0.0/24",
 	})
 	if _, err := CompileConfigForNode(tree, 0); err == nil {
 		t.Fatalf("node0 compile accepted a wildcard-apply-groups collision")
@@ -342,7 +369,9 @@ func TestTunnelEndpointIDView1PresenceUnionPreserved(t *testing.T) {
 		// to empty for this group, so only View 1's presence union can
 		// reject — proving View 1 was not narrowed.
 		"set groups node1 interfaces wg1408 unit 0 tunnel mode wireguard",
+		"set groups node1 interfaces wg1408 unit 0 tunnel wireguard peer aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa allowed-ips 10.0.0.0/24",
 		"set interfaces wg78 unit 0 tunnel mode wireguard",
+		"set interfaces wg78 unit 0 tunnel wireguard peer aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa allowed-ips 10.0.0.0/24",
 	})
 	if _, err := CompileConfigForNode(tree, 0); err == nil {
 		t.Fatalf("node0 compile accepted a collision hidden in un-applied groups node1 (View 1 was narrowed?)")
@@ -369,6 +398,7 @@ func TestTunnelEndpointIDDefectBIncompleteGREStillRejects(t *testing.T) {
 		// registers it (presence-only). It folds onto the real wg29715.0.
 		"set interfaces gr-0/0/0 unit 0 tunnel mode gre",
 		"set interfaces wg29715 unit 0 tunnel mode wireguard",
+		"set interfaces wg29715 unit 0 tunnel wireguard peer aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa allowed-ips 10.0.0.0/24",
 	})
 	if _, err := CompileConfig(tree); err == nil {
 		t.Fatalf("Defect B residual changed: incomplete-GRE phantom no longer rejects (View 1 was narrowed?)")
@@ -381,6 +411,7 @@ func TestTunnelEndpointIDDefectBIncompleteGREStillRejects(t *testing.T) {
 func TestTunnelEndpointIDWildcardApplyGroupsSingleInterfaceClean(t *testing.T) {
 	tree := buildTree(t, []string{
 		"set groups wgtun interfaces <*> unit 0 tunnel mode wireguard",
+		"set groups wgtun interfaces <*> unit 0 tunnel wireguard peer aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa allowed-ips 10.0.0.0/24",
 		"set interfaces wg78 apply-groups wgtun",
 	})
 	cfg, err := CompileConfig(tree)
@@ -403,6 +434,7 @@ func TestTunnelEndpointIDWildcardApplyGroupsSingleInterfaceClean(t *testing.T) {
 func TestTunnelEndpointIDNonFatalUndefinedPeerGroup(t *testing.T) {
 	tree := buildTree(t, []string{
 		"set groups node0 interfaces wg0 unit 0 tunnel mode wireguard",
+		"set groups node0 interfaces wg0 unit 0 tunnel wireguard peer aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa allowed-ips 10.0.0.0/24",
 		`set apply-groups "${node}"`,
 	})
 	if _, err := CompileConfig(tree); err != nil {
@@ -421,8 +453,10 @@ func TestTunnelEndpointIDNonFatalUndefinedPeerGroup(t *testing.T) {
 func TestTunnelEndpointIDGateTerminatesNoRecursion(t *testing.T) {
 	tree := buildTree(t, []string{
 		"set groups wgtun interfaces <*> unit 0 tunnel mode wireguard",
+		"set groups wgtun interfaces <*> unit 0 tunnel wireguard peer aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa allowed-ips 10.0.0.0/24",
 		"set interfaces wg78 apply-groups wgtun",
 		"set interfaces wg1408 unit 0 tunnel mode wireguard",
+		"set interfaces wg1408 unit 0 tunnel wireguard peer aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa allowed-ips 10.0.0.0/24",
 		"set groups node0 interfaces gr-0/0/0 unit 0 tunnel mode gre",
 		`set apply-groups "${node}"`,
 	})

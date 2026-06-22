@@ -17,7 +17,6 @@ use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
-#[derive(Debug)]
 pub(crate) struct Peer {
     pub(crate) pubkey: [u8; 32],
     /// Optional outbound endpoint. `None` means responder-only.
@@ -87,6 +86,32 @@ pub(crate) struct Peer {
     /// in-flight ciphertexts decrypt successfully. Same lock
     /// discipline as `current`.
     pub(crate) previous: RwLock<Option<Arc<WgSession>>>,
+    /// Per-peer preshared key (#1434 B2). 32 zero bytes = no PSK
+    /// (semantically identical to the all-zero key in Noise IKpsk2).
+    /// Interior-mutable so a config commit that reuses the peer Arc can
+    /// rotate the PSK in place (same rationale as `endpoint`). SECRET:
+    /// redacted in the manual Debug impl below; never logged.
+    pub(crate) preshared_key: RwLock<[u8; 32]>,
+}
+
+impl std::fmt::Debug for Peer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Redact the preshared key. The pubkey/endpoint/keepalive are
+        // not secret and are useful for triage.
+        let psk_set = self
+            .preshared_key
+            .read()
+            .map(|k| *k != [0u8; 32])
+            .unwrap_or(false);
+        f.debug_struct("Peer")
+            .field("pubkey", &self.pubkey)
+            .field("endpoint", &self.endpoint)
+            .field("persistent_keepalive", &self.persistent_keepalive)
+            .field("preshared_key", &if psk_set { "<redacted>" } else { "<unset>" })
+            .field("current", &self.current)
+            .field("previous", &self.previous)
+            .finish()
+    }
 }
 
 impl Peer {
@@ -94,6 +119,7 @@ impl Peer {
         pubkey: [u8; 32],
         endpoint: Option<SocketAddr>,
         persistent_keepalive: u16,
+        preshared_key: [u8; 32],
     ) -> Self {
         Self {
             pubkey,
@@ -106,6 +132,7 @@ impl Peer {
             t8_last_attempt_ns: AtomicU64::new(0),
             current: RwLock::new(None),
             previous: RwLock::new(None),
+            preshared_key: RwLock::new(preshared_key),
         }
     }
 
@@ -161,16 +188,28 @@ impl Peer {
     /// reuses an existing peer Arc (same pubkey). Keeping the peer
     /// Arc alive preserves the (current, previous) session pair across
     /// the commit; only the operator-facing fields shift.
-    pub(crate) fn update_config(&self, endpoint: Option<SocketAddr>, persistent_keepalive: u16) {
+    pub(crate) fn update_config(
+        &self,
+        endpoint: Option<SocketAddr>,
+        persistent_keepalive: u16,
+        preshared_key: [u8; 32],
+    ) {
         *self.endpoint.write().unwrap() = endpoint;
         self.persistent_keepalive
             .store(persistent_keepalive, Ordering::Relaxed);
+        *self.preshared_key.write().unwrap() = preshared_key;
     }
 
     /// Snapshot the current endpoint. Slow path only.
     #[allow(dead_code)] // Consumed by integration PR + tests.
     pub(crate) fn endpoint(&self) -> Option<SocketAddr> {
         *self.endpoint.read().unwrap()
+    }
+
+    /// Snapshot the current preshared key (#1434 B2). Slow path only —
+    /// consumed by the handshake builders. 32 zero bytes = no PSK.
+    pub(crate) fn preshared_key(&self) -> [u8; 32] {
+        *self.preshared_key.read().unwrap()
     }
 
     /// Snapshot the current persistent-keepalive interval. Slow path.

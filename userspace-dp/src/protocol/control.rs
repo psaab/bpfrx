@@ -460,6 +460,27 @@ impl From<crate::slowpath::SlowPathStatus> for SlowPathStatus {
     }
 }
 
+/// #1434: one WG PEER's telemetry row inside a `WgTunnelStatus`. The
+/// Go mirror is `WgPeerStatus` in `pkg/dataplane/userspace/protocol.go`
+/// — keep json tags identical on both sides. Fields are serde-defaulted
+/// for mixed-version compat.
+#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+pub(crate) struct WgPeerStatus {
+    /// Peer static public key, 64-char lowercase hex (same rendering as
+    /// the config-side `wg_peer_pubkey_hex`). Public by definition.
+    /// NOTE: `wg show` renders base64; xpf surfaces are uniformly hex.
+    #[serde(rename = "peer_pubkey_hex", default)]
+    pub peer_pubkey_hex: String,
+    /// Configured-or-learned peer endpoint (empty for a responder-only
+    /// peer with no learned endpoint yet).
+    #[serde(rename = "peer_endpoint", default)]
+    pub peer_endpoint: String,
+    /// Whether this peer currently holds a CONFIRMED (egress-usable)
+    /// transport session.
+    #[serde(rename = "session_confirmed", default)]
+    pub session_confirmed: bool,
+}
+
 /// #1865: one WG tunnel's telemetry row inside `ProcessStatus`.
 /// Counter semantics, lifetime, and the reserved-reason list live in
 /// `afxdp/wg/counters.rs` (the single source of truth this mirrors);
@@ -480,12 +501,6 @@ pub(crate) struct WgTunnelStatus {
     pub tunnel_endpoint_id: u16,
     #[serde(rename = "listen_port", default)]
     pub listen_port: u16,
-    /// Peer static public key, 64-char lowercase hex (the same
-    /// rendering as the config-side `wg_peer_pubkey_hex`). Public by
-    /// definition. NOTE: `wg show` renders base64; xpf surfaces are
-    /// uniformly hex.
-    #[serde(rename = "peer_pubkey_hex", default)]
-    pub peer_pubkey_hex: String,
     /// Our LOCAL static public key, 64-char lowercase hex (#1434
     /// Increment 1). This is the key an operator must hand to the peer
     /// to configure us — derived once from the local private key at
@@ -496,16 +511,12 @@ pub(crate) struct WgTunnelStatus {
     /// payload (key absent) decoding to "".
     #[serde(rename = "local_pubkey_hex", default)]
     pub local_pubkey_hex: String,
-    /// Configured peer endpoint (empty for a responder-only peer).
-    /// The control thread's LEARNED endpoint is thread-local and not
-    /// surfaced in this revision.
-    #[serde(rename = "peer_endpoint", default)]
-    pub peer_endpoint: String,
-    /// Whether the peer currently holds a CONFIRMED (egress-usable)
-    /// transport session. The liveness signal — see
-    /// `last_handshake_unix_secs` for why completion alone is not.
-    #[serde(rename = "session_confirmed", default)]
-    pub session_confirmed: bool,
+    /// Per-peer rows (#1434 multi-peer). Replaces the scalar
+    /// peer_pubkey_hex / peer_endpoint / session_confirmed fields with
+    /// one row per configured peer. The COUNTERS below remain
+    /// tunnel-level (per-engine), as they were pre-#1434.
+    #[serde(rename = "peers", default)]
+    pub peers: Vec<WgPeerStatus>,
     /// Wall-clock epoch seconds of the most recent handshake
     /// completion (either role). 0 = never (epoch 0 is unreachable, so
     /// the sentinel is unambiguous without Option plumbing). Converted

@@ -29,12 +29,14 @@ func TestShowTextWireguardTopics(t *testing.T) {
 			Manager: dataplane.New(),
 			status: dpuserspace.ProcessStatus{
 				WgTunnels: []dpuserspace.WgTunnelStatus{{
-					Tunnel:                "wg0",
-					TunnelEndpointID:      2,
-					ListenPort:            51820,
-					PeerPubkeyHex:         strings.Repeat("cd", 32),
-					PeerEndpoint:          "198.51.100.7:51820",
-					SessionConfirmed:      true,
+					Tunnel:           "wg0",
+					TunnelEndpointID: 2,
+					ListenPort:       51820,
+					Peers: []dpuserspace.WgPeerStatus{{
+						PeerPubkeyHex:    strings.Repeat("cd", 32),
+						PeerEndpoint:     "198.51.100.7:51820",
+						SessionConfirmed: true,
+					}},
 					HsRxDropsMac1Mismatch: 4,
 					EncapMtuDrops:         9,
 					DecapPackets:          11,
@@ -121,7 +123,9 @@ func TestShowTextWireguardPublicKeyTopic(t *testing.T) {
 					TunnelEndpointID: 3,
 					ListenPort:       51820,
 					LocalPubkeyHex:   strings.Repeat("cd", 32),
-					PeerPubkeyHex:    strings.Repeat("ab", 32),
+					Peers: []dpuserspace.WgPeerStatus{{
+						PeerPubkeyHex: strings.Repeat("ab", 32),
+					}},
 				}},
 			},
 		},

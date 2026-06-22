@@ -125,6 +125,28 @@ pub(in crate::afxdp) fn inner_tos_byte(packet: &[u8], addr_family: u8) -> u8 {
     }
 }
 
+/// Parse the inner IP packet's DESTINATION address (#1434 B1b). Used by
+/// the WG transit-encap path to LPM-select the egress peer by inner-dst.
+/// `packet` is the inner IP packet (L2 stripped); `addr_family` is the
+/// inner family. Returns `None` when the packet is too short — a
+/// malformed inner produces no peer selection and the frame is dropped.
+#[inline]
+pub(in crate::afxdp) fn inner_dst_ip(packet: &[u8], addr_family: u8) -> Option<IpAddr> {
+    match addr_family as i32 {
+        libc::AF_INET => {
+            // IPv4 destination address is octets 16..20.
+            let b: [u8; 4] = packet.get(16..20)?.try_into().ok()?;
+            Some(IpAddr::V4(std::net::Ipv4Addr::from(b)))
+        }
+        libc::AF_INET6 => {
+            // IPv6 destination address is octets 24..40.
+            let b: [u8; 16] = packet.get(24..40)?.try_into().ok()?;
+            Some(IpAddr::V6(std::net::Ipv6Addr::from(b)))
+        }
+        _ => None,
+    }
+}
+
 fn gre_inner_family_and_proto(proto: u16) -> Option<(u8, u16)> {
     match proto {
         GRE_PROTO_IPV4 => Some((libc::AF_INET as u8, 0x0800)),

@@ -225,7 +225,23 @@ reserved for whole-dataplane selection where a rewrite shim
   inner-vlan-id, family inet/inet6 `address` CIDR key slots, vrrp-group
   priority / advertise-interval / virtual-address, tunnel
   source/destination/ttl/key, wireguard listen-port /
-  persistent-keepalive); (b) **firewall**: the `then forwarding-class`
+  persistent-keepalive). The WireGuard `peer` node is a NAMED-INSTANCE
+  container keyed by the peer public key (#1434 multi-peer):
+  `set interfaces <wg> tunnel wireguard peer <public-key>
+  { allowed-ips <cidr>; endpoint <ip:port>; persistent-keepalive <s>;
+  preshared-key <hex>; }`. A WG interface may terminate N peers on one
+  listen port; the pubkey is the instance identity (modeled on
+  `vrrp-group <id>`, dual-AST via `namedInstances`). A commit-time gate
+  (`validateWireguardPeersStrict`, `compiler_validate_wireguard.go`)
+  hard-rejects a WG tunnel with zero peers, a duplicate or malformed
+  (non-64-hex) peer pubkey, a malformed preshared-key, or
+  endpoint-bearing peers that disagree on outer transport family (one
+  UDP socket = one outer family); the tolerant load / peer-sync path
+  (`lenientWireguardPeers`) downgrades these to warnings so an
+  already-persisted or peer-synced config still boots (#1960). The
+  compiler sorts `WgPeers` by pubkey at the snapshot-builder boundary so
+  both HA nodes serialize byte-identical snapshots. (b) **firewall**:
+  the `then forwarding-class`
   tree-based cross-ref for both families (dangling references reject at
   commit; same-commit definition + reference passes; `best-effort` is
   always resolvable; the other Junos default classes are deliberately NOT

@@ -738,11 +738,30 @@ impl super::Coordinator {
                     .map(|dt| dt.timestamp().max(0) as u64)
                     .unwrap_or(0)
             };
+            // #1434 multi-peer: one status row per configured peer. The
+            // endpoint is read from the ENGINE table (so a runtime-learned
+            // endpoint surfaces, not just the configured one), and the
+            // confirmed-session flag is per-peer.
+            let engine_endpoints: std::collections::HashMap<[u8; 32], Option<std::net::SocketAddr>> =
+                engine.peer_endpoints().into_iter().collect();
+            let peers = endpoint
+                .wg_peers
+                .iter()
+                .map(|p| crate::protocol::WgPeerStatus {
+                    peer_pubkey_hex: crate::afxdp::wg::encode_wg_key_hex(&p.pubkey),
+                    peer_endpoint: engine_endpoints
+                        .get(&p.pubkey)
+                        .copied()
+                        .flatten()
+                        .map(|ep| ep.to_string())
+                        .unwrap_or_default(),
+                    session_confirmed: engine.peer_has_confirmed_session(&p.pubkey),
+                })
+                .collect();
             out.push(crate::protocol::WgTunnelStatus {
                 tunnel,
                 tunnel_endpoint_id: id,
                 listen_port: endpoint.wg_listen_port,
-                peer_pubkey_hex: crate::afxdp::wg::encode_wg_key_hex(&endpoint.wg_peer_pubkey),
                 // #1434 Increment 1: surface our local static public key
                 // (the key an operator hands to the peer). Sourced from
                 // the engine, not the snapshot — the snapshot redacts the
@@ -750,11 +769,7 @@ impl super::Coordinator {
                 // key derived at engine construction is the only place to
                 // read it. Hex string on the wire (MEMORY #1961).
                 local_pubkey_hex: crate::afxdp::wg::encode_wg_key_hex(&engine.local_public_key()),
-                peer_endpoint: endpoint
-                    .wg_endpoint
-                    .map(|ep| ep.to_string())
-                    .unwrap_or_default(),
-                session_confirmed: engine.peer_has_confirmed_session(&endpoint.wg_peer_pubkey),
+                peers,
                 last_handshake_unix_secs,
                 hs_initiations_created: c.hs_initiations_created.load(Ordering::Relaxed),
                 hs_initiation_build_failures: c

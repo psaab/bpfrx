@@ -350,7 +350,10 @@ impl WgEngine {
     ///     symmetric state on a failed read, so we put the borrowed
     ///     `HandshakeState` back and keep waiting for a valid (or
     ///     retransmitted) response.
-    fn consume_response_inner(&self, msg: &[u8]) -> Result<u32, HandshakeError> {
+    fn consume_response_inner(
+        &self,
+        msg: &[u8],
+    ) -> Result<([u8; WG_KEY_LEN], u32), HandshakeError> {
         let parsed = handshake::parse_response(msg, &self.local_public_key)?;
         let local_index = parsed.receiver_index;
 
@@ -413,7 +416,7 @@ impl WgEngine {
         // the reconcile_lock we already hold (install_session_locked must NOT
         // re-take it).
         let result = match self.install_session_locked(&peer_pubkey, session) {
-            Ok(()) => Ok(local_index),
+            Ok(()) => Ok((peer_pubkey, local_index)),
             Err(InstallSessionError::UnknownPeer) => Err(HandshakeError::UnknownPeer),
             Err(InstallSessionError::LocalIndexCollision) => Err(HandshakeError::Internal),
         };
@@ -475,8 +478,21 @@ impl WgEngine {
             pk.copy_from_slice(rs);
             pk
         };
-        if self.peer_arc(&peer_pubkey).is_none() {
+        let Some(peer) = self.peer_arc(&peer_pubkey) else {
             return Err(HandshakeError::UnknownInitiator);
+        };
+
+        // #1434 B2: the responder learns the peer only AFTER reading
+        // msg1, but the PSK is mixed during the msg2 WRITE (the Psk(2)
+        // token sits at the end of the IKpsk2 second message). So set
+        // the identified peer's PSK now, before write_message(msg2),
+        // overriding the zero PSK the builder pre-set. A peer with no
+        // configured PSK keeps the zero key (pre-#1434 behavior). snow
+        // 0.10.0 exposes HandshakeState::set_psk for exactly this
+        // "identify peer, then pick PSK" responder ordering.
+        let psk = peer.preshared_key();
+        if state.set_psk(2, &psk).is_err() {
+            return Err(HandshakeError::Crypto);
         }
 
         // Hold reconcile_lock across reserve → build msg2 → install so a
@@ -584,13 +600,16 @@ impl WgEngine {
     /// Initiator path: consume a framed WG type-2 response. Counted:
     /// Ok → `hs_completions_initiator` + completion stamp; Err →
     /// per-reason `hs_rx_drops_*`.
-    pub(crate) fn consume_response(&self, msg: &[u8]) -> Result<u32, HandshakeError> {
+    pub(crate) fn consume_response(
+        &self,
+        msg: &[u8],
+    ) -> Result<([u8; WG_KEY_LEN], u32), HandshakeError> {
         match self.consume_response_inner(msg) {
-            Ok(idx) => {
+            Ok(result) => {
                 super::counters::WgCounters::bump(&self.counters.hs_completions_initiator);
                 self.counters
                     .record_handshake_complete(super::counters::monotonic_now_ns());
-                Ok(idx)
+                Ok(result)
             }
             Err(e) => Err(self.counters.count_handshake_rx_err(e)),
         }

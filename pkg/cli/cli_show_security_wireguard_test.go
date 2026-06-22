@@ -47,7 +47,9 @@ func TestHandleShowSecurityWireguardPublicKeyDispatch(t *testing.T) {
 					TunnelEndpointID: 3,
 					ListenPort:       51820,
 					LocalPubkeyHex:   strings.Repeat("cd", 32),
-					PeerPubkeyHex:    strings.Repeat("ab", 32),
+					Peers: []dpuserspace.WgPeerStatus{{
+						PeerPubkeyHex: strings.Repeat("ab", 32),
+					}},
 				}},
 			},
 		},

@@ -85,10 +85,12 @@ func TestCollectAppliedTunnelsKeepsWireguardWithoutSource(t *testing.T) {
 	cfg.Interfaces.Interfaces = map[string]*config.InterfaceConfig{
 		"wg0": {
 			Tunnel: &config.TunnelConfig{
-				Name:            "wg0",
-				Mode:            "wireguard",
-				WgListenPort:    51820,
-				WgPeerPubkeyHex: "b0202020202020202020202020202020202020202020202020202020202020b2",
+				Name:         "wg0",
+				Mode:         "wireguard",
+				WgListenPort: 51820,
+				WgPeers: []config.WgPeerConfig{{
+					PublicKeyHex: "b0202020202020202020202020202020202020202020202020202020202020b2",
+				}},
 			},
 		},
 	}

@@ -1173,14 +1173,13 @@ func wgTunMTUForEndpoint(tc *config.TunnelConfig) int {
 	// responder-only/roaming endpoint with no configured address, which
 	// the Rust control thread may LEARN as v6 — Codex r4 MAJOR) uses the
 	// larger v6 overhead so the kernel never hands the control thread an
-	// inner packet that the v6-aware encap guard would then drop.
+	// inner packet that the v6-aware encap guard would then drop. With
+	// multi-peer (#1434) the outer family is a TUNNEL-level property (one
+	// UDP socket); WgOuterFamilyV6 resolves it from the peer(s) that
+	// declare an endpoint (validateWireguardPeers rejects mixed-family).
 	overhead := wgOverheadV6
-	if tc.WgEndpoint != "" {
-		if host, _, err := net.SplitHostPort(tc.WgEndpoint); err == nil {
-			if ip := net.ParseIP(host); ip != nil && ip.To4() != nil {
-				overhead = wgOverheadV4
-			}
-		}
+	if !tc.WgOuterFamilyV6() && tc.WgHasEndpoint() {
+		overhead = wgOverheadV4
 	}
 	return wgDefaultOuterMTU - overhead - wgPadWorst
 }

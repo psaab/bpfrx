@@ -55,6 +55,7 @@ fn established_pair(
             endpoint: None,
             persistent_keepalive: 0,
             allowed_ips: init_allowed_for_resp,
+            preshared_key: [0u8; 32],
         }],
     });
     let resp_engine = WgEngine::new(WgEngineConfig {
@@ -65,6 +66,7 @@ fn established_pair(
             endpoint: None,
             persistent_keepalive: 0,
             allowed_ips: resp_allowed_for_init,
+            preshared_key: [0u8; 32],
         }],
     });
 
@@ -244,12 +246,14 @@ fn cryptokey_routing_overlapping_allowed_ips() {
                 endpoint: None,
                 persistent_keepalive: 0,
                 allowed_ips: vec!["10.0.0.0/24".parse().unwrap()],
+                preshared_key: [0u8; 32],
             },
             WgPeerConfig {
                 pubkey: peer_b_pub,
                 endpoint: None,
                 persistent_keepalive: 0,
                 allowed_ips: vec!["10.0.0.0/24".parse().unwrap()],
+                preshared_key: [0u8; 32],
             },
         ],
     });
@@ -262,6 +266,7 @@ fn cryptokey_routing_overlapping_allowed_ips() {
             endpoint: None,
             persistent_keepalive: 0,
             allowed_ips: vec!["10.0.0.0/24".parse().unwrap()],
+            preshared_key: [0u8; 32],
         }],
     });
     let resp_b = WgEngine::new(WgEngineConfig {
@@ -272,6 +277,7 @@ fn cryptokey_routing_overlapping_allowed_ips() {
             endpoint: None,
             persistent_keepalive: 0,
             allowed_ips: vec!["10.0.0.0/24".parse().unwrap()],
+            preshared_key: [0u8; 32],
         }],
     });
 
@@ -534,12 +540,14 @@ fn decap_lpm_rejects_spoofed_source_inside_more_specific_peer_prefix() {
                 endpoint: None,
                 persistent_keepalive: 0,
                 allowed_ips: vec!["10.0.0.0/8".parse().unwrap()],
+                preshared_key: [0u8; 32],
             },
             WgPeerConfig {
                 pubkey: peer_b_pub,
                 endpoint: None,
                 persistent_keepalive: 0,
                 allowed_ips: vec!["10.1.1.0/24".parse().unwrap()],
+                preshared_key: [0u8; 32],
             },
         ],
     });
@@ -552,6 +560,7 @@ fn decap_lpm_rejects_spoofed_source_inside_more_specific_peer_prefix() {
             endpoint: None,
             persistent_keepalive: 0,
             allowed_ips: vec!["10.0.0.0/8".parse().unwrap()],
+            preshared_key: [0u8; 32],
         }],
     });
     let _resp_b = WgEngine::new(WgEngineConfig {
@@ -562,6 +571,7 @@ fn decap_lpm_rejects_spoofed_source_inside_more_specific_peer_prefix() {
             endpoint: None,
             persistent_keepalive: 0,
             allowed_ips: vec!["10.1.1.0/24".parse().unwrap()],
+            preshared_key: [0u8; 32],
         }],
     });
 
@@ -847,6 +857,7 @@ fn handshake_prologue_is_required_for_authentication() {
             endpoint: None,
             persistent_keepalive: 0,
             allowed_ips: vec!["10.0.0.0/24".parse().unwrap()],
+            preshared_key: [0u8; 32],
         }],
     });
     let mut init_hs = init_engine.build_initiator_handshake(&resp_pub).unwrap();
@@ -885,6 +896,7 @@ fn handshake_prologue_is_required_for_authentication() {
             endpoint: None,
             persistent_keepalive: 0,
             allowed_ips: vec!["10.0.0.0/24".parse().unwrap()],
+            preshared_key: [0u8; 32],
         }],
     });
     let mut init_hs2 = init_engine.build_initiator_handshake(&resp_pub).unwrap();
@@ -923,6 +935,7 @@ fn responder_session_blocks_encap_until_initiator_data_authenticated() {
             endpoint: None,
             persistent_keepalive: 0,
             allowed_ips: vec!["10.0.0.0/24".parse().unwrap()],
+            preshared_key: [0u8; 32],
         }],
     });
     let resp_engine = WgEngine::new(WgEngineConfig {
@@ -933,6 +946,7 @@ fn responder_session_blocks_encap_until_initiator_data_authenticated() {
             endpoint: None,
             persistent_keepalive: 0,
             allowed_ips: vec!["10.0.0.0/24".parse().unwrap()],
+            preshared_key: [0u8; 32],
         }],
     });
 
@@ -1043,6 +1057,7 @@ fn reconcile_peers_updates_endpoint_and_keepalive_for_existing_peer() {
             endpoint: Some(SocketAddr::from(([192, 0, 2, 1], 51820))),
             persistent_keepalive: 25,
             allowed_ips: vec!["10.0.0.0/24".parse().unwrap()],
+            preshared_key: [0u8; 32],
         }],
     });
 
@@ -1063,6 +1078,7 @@ fn reconcile_peers_updates_endpoint_and_keepalive_for_existing_peer() {
         endpoint: Some(SocketAddr::from(([198, 51, 100, 7], 51900))),
         persistent_keepalive: 60,
         allowed_ips: vec!["10.0.0.0/24".parse().unwrap()],
+        preshared_key: [0u8; 32],
     }]);
 
     let table = engine.table_for_test();
@@ -1085,6 +1101,7 @@ fn reconcile_peers_updates_endpoint_and_keepalive_for_existing_peer() {
         endpoint: None,
         persistent_keepalive: 0,
         allowed_ips: vec!["10.0.0.0/24".parse().unwrap()],
+        preshared_key: [0u8; 32],
     }]);
     let table = engine.table_for_test();
     let idx = *table.peer_index_by_pubkey.get(&peer_pub).unwrap();
@@ -1166,7 +1183,10 @@ fn tunnel_endpoint_snapshot_private_key_is_skipped_and_redacted() {
 
     let snap = TunnelEndpointSnapshot {
         wg_local_privkey_hex: "deadbeef".repeat(8), // 64 hex chars = "private key"
-        wg_peer_pubkey_hex: "abc123".to_string(),
+        wg_peers: vec![crate::protocol::snapshot::TunnelWgPeerSnapshot {
+            wg_peer_pubkey_hex: "abc123".to_string(),
+            ..Default::default()
+        }],
         wg_listen_port: 51820,
         ..Default::default()
     };
@@ -1323,6 +1343,7 @@ fn established_pair_responder_confirmation_flips_via_decap_path() {
             endpoint: None,
             persistent_keepalive: 0,
             allowed_ips: vec!["10.0.0.0/24".parse().unwrap()],
+            preshared_key: [0u8; 32],
         }],
     });
     let resp_engine = WgEngine::new(WgEngineConfig {
@@ -1333,6 +1354,7 @@ fn established_pair_responder_confirmation_flips_via_decap_path() {
             endpoint: None,
             persistent_keepalive: 0,
             allowed_ips: vec!["10.0.0.0/24".parse().unwrap()],
+            preshared_key: [0u8; 32],
         }],
     });
 
@@ -1426,6 +1448,7 @@ mod framed_handshake {
                 endpoint: None,
                 persistent_keepalive: 0,
                 allowed_ips: any_v4.clone(),
+                preshared_key: [0u8; 32],
             }],
         });
         let resp = WgEngine::new(WgEngineConfig {
@@ -1436,6 +1459,7 @@ mod framed_handshake {
                 endpoint: None,
                 persistent_keepalive: 0,
                 allowed_ips: any_v4,
+                preshared_key: [0u8; 32],
             }],
         });
         (init, resp, init_pub, resp_pub)
@@ -1479,7 +1503,7 @@ mod framed_handshake {
         assert_eq!(resp.pending_count(), 0, "responder completes synchronously");
 
         // 3. Initiator consumes msg2, installs its session.
-        let installed_idx = init.consume_response(&msg2).unwrap();
+        let (_peer, installed_idx) = init.consume_response(&msg2).unwrap();
         assert_eq!(installed_idx, init_idx);
         assert_eq!(init.pending_count(), 0, "initiator handshake promoted");
 
@@ -1525,6 +1549,7 @@ mod framed_handshake {
                 endpoint: None,
                 persistent_keepalive: 0,
                 allowed_ips: vec!["0.0.0.0/0".parse().unwrap()],
+                preshared_key: [0u8; 32],
             }],
         });
         let mut msg2 = [0u8; WG_MSG_RESPONSE_LEN];
@@ -1551,6 +1576,7 @@ mod framed_handshake {
                 endpoint: None,
                 persistent_keepalive: 0,
                 allowed_ips: vec!["0.0.0.0/0".parse().unwrap()],
+                preshared_key: [0u8; 32],
             }],
         });
         // A stranger initiator that targets the real responder pubkey.
@@ -1563,6 +1589,7 @@ mod framed_handshake {
                 endpoint: None,
                 persistent_keepalive: 0,
                 allowed_ips: vec!["0.0.0.0/0".parse().unwrap()],
+                preshared_key: [0u8; 32],
             }],
         });
         let mut msg1 = [0u8; WG_MSG_INIT_LEN];
@@ -1624,7 +1651,7 @@ mod framed_handshake {
         // it (its reservation survived).
         let mut msg2_b = [0u8; WG_MSG_RESPONSE_LEN];
         resp.consume_initiation_create_response(&msg1_b, &mut msg2_b).unwrap();
-        assert_eq!(init.consume_response(&msg2_b).unwrap(), idx_b);
+        assert_eq!(init.consume_response(&msg2_b).unwrap().1, idx_b);
 
         // A response to the FIRST (aborted) handshake has no reservation.
         // Build it by having a fresh responder answer msg1_a, then feeding
@@ -1762,6 +1789,7 @@ mod framed_handshake {
             endpoint: None,
             persistent_keepalive: 0,
             allowed_ips: vec!["0.0.0.0/0".parse().unwrap()],
+            preshared_key: [0u8; 32],
         }]);
         let mut msg1b = [0u8; WG_MSG_INIT_LEN];
         init.create_initiation(&resp_pub, &mut msg1b).unwrap();
@@ -1840,6 +1868,7 @@ mod framed_handshake {
             endpoint: None,
             persistent_keepalive: 0,
             allowed_ips: vec!["0.0.0.0/0".parse().unwrap()],
+            preshared_key: [0u8; 32],
         }];
         let init = StdArc::new(WgEngine::new(WgEngineConfig {
             local_private_key: init_priv,
@@ -1908,6 +1937,7 @@ mod framed_handshake {
                 endpoint: None,
                 persistent_keepalive: 0,
                 allowed_ips: any_v4.clone(),
+                preshared_key: [0u8; 32],
             }],
         }));
         let resp = StdArc::new(WgEngine::new(WgEngineConfig {
@@ -1918,6 +1948,7 @@ mod framed_handshake {
                 endpoint: None,
                 persistent_keepalive: 0,
                 allowed_ips: any_v4,
+                preshared_key: [0u8; 32],
             }],
         }));
 
@@ -1965,6 +1996,7 @@ mod framed_handshake {
                     endpoint: None,
                     persistent_keepalive: 0,
                     allowed_ips: vec!["0.0.0.0/0".parse().unwrap()],
+                    preshared_key: [0u8; 32],
                 }];
                 let mut flip = false;
                 while !stop.load(AOrd::Relaxed) {
@@ -2070,6 +2102,7 @@ fn wg_no_session_encap_triggers_single_init_per_interval() {
             endpoint: None,
             persistent_keepalive: 0,
             allowed_ips: vec!["10.0.0.0/24".parse().unwrap()],
+            preshared_key: [0u8; 32],
         }],
     });
     let _ = init_pub;
@@ -2118,6 +2151,7 @@ fn wg_first_peer_pubkey_and_confirmed_session_helpers() {
             endpoint: None,
             persistent_keepalive: 0,
             allowed_ips: vec![],
+            preshared_key: [0u8; 32],
         }],
     });
     assert!(!no_session.peer_has_confirmed_session(&resp_pub));
@@ -2138,6 +2172,7 @@ fn wg_tai64n_high_water_seed_round_trips_across_engines() {
             endpoint: None,
             persistent_keepalive: 0,
             allowed_ips: vec![],
+            preshared_key: [0u8; 32],
         }],
     });
     // Drive an initiation so the clock advances past its initial state.
@@ -2153,6 +2188,7 @@ fn wg_tai64n_high_water_seed_round_trips_across_engines() {
             endpoint: None,
             persistent_keepalive: 0,
             allowed_ips: vec![],
+            preshared_key: [0u8; 32],
         }],
     });
     fresh.seed_tai64n_high_water(hw);
@@ -2327,6 +2363,7 @@ mod telemetry_counters {
                 endpoint: None,
                 persistent_keepalive: 0,
                 allowed_ips: vec!["0.0.0.0/0".parse().unwrap()],
+                preshared_key: [0u8; 32],
             }],
         });
         let mut msg2 = [0u8; crate::afxdp::wg::WG_MSG_RESPONSE_LEN];
@@ -2471,6 +2508,7 @@ mod telemetry_counters {
             endpoint: None,
             persistent_keepalive: 0,
             allowed_ips: vec!["0.0.0.0/0".parse().unwrap()],
+            preshared_key: [0u8; 32],
         }]);
         assert_eq!(
             init.counters().hs_initiations_created.load(Ordering::Relaxed),
@@ -2516,6 +2554,7 @@ mod telemetry_counters {
                 endpoint: None,
                 persistent_keepalive: 0,
                 allowed_ips: any_v4.clone(),
+                preshared_key: [0u8; 32],
             }],
         });
         let resp = WgEngine::new(WgEngineConfig {
@@ -2526,6 +2565,7 @@ mod telemetry_counters {
                 endpoint: None,
                 persistent_keepalive: 0,
                 allowed_ips: any_v4,
+                preshared_key: [0u8; 32],
             }],
         });
         (init, resp, init_pub, resp_pub)
@@ -2992,6 +3032,7 @@ mod s5_timer_tests {
                 endpoint: None,
                 persistent_keepalive: 0,
                 allowed_ips: vec!["10.0.1.0/24".parse().unwrap()],
+                preshared_key: [0u8; 32],
             }],
         });
         let resp = WgEngine::new(WgEngineConfig {
@@ -3002,6 +3043,7 @@ mod s5_timer_tests {
                 endpoint: None,
                 persistent_keepalive: 0,
                 allowed_ips: vec!["10.0.0.0/24".parse().unwrap()],
+                preshared_key: [0u8; 32],
             }],
         });
         let mut msg1 = [0u8; 1024];
@@ -3047,6 +3089,7 @@ mod s5_timer_tests {
                 endpoint: None,
                 persistent_keepalive: 0,
                 allowed_ips: vec!["10.0.1.0/24".parse().unwrap()],
+                preshared_key: [0u8; 32],
             }],
         });
         let resp = WgEngine::new(WgEngineConfig {
@@ -3057,6 +3100,7 @@ mod s5_timer_tests {
                 endpoint: None,
                 persistent_keepalive: 0,
                 allowed_ips: vec!["10.0.0.0/24".parse().unwrap()],
+                preshared_key: [0u8; 32],
             }],
         });
         init.set_mock_now_ns(7_000 * SEC);

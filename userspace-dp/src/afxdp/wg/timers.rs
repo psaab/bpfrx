@@ -246,11 +246,26 @@ impl WgEngine {
     /// requires sending is emitted and no deadline is armed for it
     /// (AGY r3 G1(b)).
     pub(crate) fn timer_pass(&self, now_ns: u64, endpoint_known: bool) -> TimerActions {
-        let mut actions = TimerActions::idle();
         let Some(pubkey) = self.first_peer_pubkey() else {
-            return actions;
+            return TimerActions::idle();
         };
-        let Some(peer) = self.peer_arc(&pubkey) else {
+        self.timer_pass_for_peer(&pubkey, now_ns, endpoint_known)
+    }
+
+    /// One pure timer decision pass for a SPECIFIC peer (#1434
+    /// multi-peer). The control loop calls this once per peer per tick,
+    /// supplying that peer's `endpoint_known` (the learned/configured
+    /// endpoint is per-peer control-thread-local state the engine cannot
+    /// see). `timer_pass` is the single-peer wrapper retained for the
+    /// pre-#1434 callers/tests.
+    pub(crate) fn timer_pass_for_peer(
+        &self,
+        pubkey: &[u8; 32],
+        now_ns: u64,
+        endpoint_known: bool,
+    ) -> TimerActions {
+        let mut actions = TimerActions::idle();
+        let Some(peer) = self.peer_arc(pubkey) else {
             return actions;
         };
         if !endpoint_known {
@@ -294,7 +309,7 @@ impl WgEngine {
                 .max(peer.t8_last_attempt_ns.load(Ordering::Relaxed));
             let due = anchor.saturating_add(interval_ns);
             if now_ns >= due {
-                if self.peer_has_usable_session(&pubkey, now_ns) {
+                if self.peer_has_usable_session(pubkey, now_ns) {
                     // Persistent wins over a simultaneous passive
                     // action — one keepalive satisfies both.
                     actions.send_keepalive = Some(KeepaliveKind::Persistent);

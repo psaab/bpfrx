@@ -1048,11 +1048,8 @@
     "source": "",
     "transport_table": "",
     "ttl": 0,
-    "wg_allowed_ips": [],
-    "wg_endpoint": "",
-    "wg_keepalive_secs": 0,
     "wg_listen_port": 0,
-    "wg_peer_pubkey_hex": "",
+    "wg_peers": [],
     "zone": ""
   },
   "userspace_capabilities": {

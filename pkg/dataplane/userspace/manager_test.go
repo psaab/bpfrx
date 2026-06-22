@@ -5746,10 +5746,12 @@ func TestBuildTunnelEndpointSnapshotsPopulatesWireGuard(t *testing.T) {
 				Mode:              "wireguard",
 				WgListenPort:      51820,
 				WgLocalPrivkeyHex: privHex,
-				WgPeerPubkeyHex:   peerHex,
-				WgAllowedIPs:      []string{"10.0.0.0/24", "10.0.1.0/24"},
-				WgEndpoint:        "203.0.113.1:51820",
-				WgKeepaliveSecs:   25,
+				WgPeers: []config.WgPeerConfig{{
+					PublicKeyHex:  peerHex,
+					AllowedIPs:    []string{"10.0.0.0/24", "10.0.1.0/24"},
+					Endpoint:      "203.0.113.1:51820",
+					KeepaliveSecs: 25,
+				}},
 			},
 		},
 	}
@@ -5769,17 +5771,21 @@ func TestBuildTunnelEndpointSnapshotsPopulatesWireGuard(t *testing.T) {
 	if e.WgLocalPrivkeyHex != privHex {
 		t.Fatalf("wg_local_privkey_hex not populated")
 	}
-	if e.WgPeerPubkeyHex != peerHex {
-		t.Fatalf("wg_peer_pubkey_hex = %q, want %q", e.WgPeerPubkeyHex, peerHex)
+	if len(e.WgPeers) != 1 {
+		t.Fatalf("wg_peers = %v, want 1 peer", e.WgPeers)
 	}
-	if len(e.WgAllowedIPs) != 2 {
-		t.Fatalf("wg_allowed_ips = %v, want 2 entries", e.WgAllowedIPs)
+	p := e.WgPeers[0]
+	if p.WgPeerPubkeyHex != peerHex {
+		t.Fatalf("wg_peers[0].wg_peer_pubkey_hex = %q, want %q", p.WgPeerPubkeyHex, peerHex)
 	}
-	if e.WgEndpoint != "203.0.113.1:51820" {
-		t.Fatalf("wg_endpoint = %q", e.WgEndpoint)
+	if len(p.WgAllowedIPs) != 2 {
+		t.Fatalf("wg_peers[0].wg_allowed_ips = %v, want 2 entries", p.WgAllowedIPs)
 	}
-	if e.WgKeepaliveSecs != 25 {
-		t.Fatalf("wg_keepalive_secs = %d, want 25", e.WgKeepaliveSecs)
+	if p.WgEndpoint != "203.0.113.1:51820" {
+		t.Fatalf("wg_peers[0].wg_endpoint = %q", p.WgEndpoint)
+	}
+	if p.WgKeepaliveSecs != 25 {
+		t.Fatalf("wg_peers[0].wg_keepalive_secs = %d, want 25", p.WgKeepaliveSecs)
 	}
 	// IPv4 peer endpoint -> inet outer family.
 	if e.OuterFamily != "inet" {
@@ -5819,7 +5825,9 @@ func TestTunnelEndpointSnapshotPrivkeyControlChannelContract(t *testing.T) {
 		ID:                1,
 		Mode:              "wireguard",
 		WgLocalPrivkeyHex: privHex,
-		WgPeerPubkeyHex:   "b02020202020202020202020202020202020202020202020202020202020202b",
+		WgPeers: []TunnelWgPeerWire{{
+			WgPeerPubkeyHex: "b02020202020202020202020202020202020202020202020202020202020202b",
+		}},
 	}
 	b, err := json.Marshal(withKey)
 	if err != nil {
