@@ -1,5 +1,42 @@
 # Action Log
 
+## 2026-06-21 — #2295 + #2302 pkg/logging syslog follow-ups
+
+- **Timestamp**: 2026-06-21
+- **Action**: Two pkg/logging follow-ups from the #2287/#2289 review.
+  - #2295: `SyslogSlogHandler.Handle` now snapshots the client set FIRST
+    and returns before the re-entrancy guard when `len(clients)==0`, so
+    `goID()` (`runtime.Stack` + `ParseUint`) never runs on the common
+    no-syslog-client path. Added a `goIDFn` package seam so a test can
+    assert the no-client path makes zero `goID` calls. Corrected the
+    `goid.go` doc comment (runs once per forwarded record when clients
+    are present) and renamed the stale `emitDropWarn` reference in
+    `syslog.go` to the actual method name `emit`. The #2287 guard
+    (base.Handle unconditional, guard wraps forwarding when clients
+    present) is unchanged.
+  - #2302: the reconnect cooldown was bypassed when the TCP/TLS dial
+    succeeds but the subsequent Write fails (accept-then-reset
+    collector / half-open server / TLS app-layer drop). `lastDialFailure`
+    was set only on a dial ERROR and cleared on dial SUCCESS → the
+    cooldown stayed permanently disengaged and every log message drove a
+    fresh connect+teardown (a dial storm). Renamed the field to
+    `lastReconnectFailure` and arm it from BOTH failure modes — a failed
+    dial (in `reconnect`) and a dial-success-then-retry-write-failure
+    (via `armReconnectCooldown` in the Send/SendBinary retry-write path).
+    Cleared only on a fully successful reconnect (dial AND retry-write),
+    so the legit single-broken-pipe recovery path and the #2287
+    timeout-drop behavior are preserved.
+  - Tests: `TestHandleNoClientsSkipsGoID` /
+    `TestHandleWithClientsStillCallsGoID` (#2295),
+    `TestAcceptThenResetRateLimitsDials` /
+    `TestAcceptThenRecoverClearsCooldown` (#2302). Deterministic fakes,
+    fake clock, no sleeps, `-race` clean, 5x no flake. Fail-on-revert
+    verified for both fixes (100 goID calls / 50-dial storm when
+    reverted).
+- **File(s)**: pkg/logging/slog_handler.go, pkg/logging/goid.go,
+  pkg/logging/syslog.go, pkg/logging/syslog_reentrancy_test.go,
+  pkg/logging/syslog_resilience_test.go, pkg/logging/README.md
+
 ## 2026-06-21 — #2258 VRRP localIP/localIPv6 lazy-resolve race (run-loop write vs receiver reads)
 
 - **Timestamp**: 2026-06-21
