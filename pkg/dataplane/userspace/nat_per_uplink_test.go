@@ -335,3 +335,64 @@ func srcCounterID(s []SourceNATRuleSnapshot) uint32 {
 	}
 	return s[0].CounterID
 }
+
+// TestBuildDestinationNATSnapshotsNonTCPUDP is the Go half of #2396(a)/(b):
+// the snapshot builder must carry a non-TCP/UDP protocol (GRE/ICMP) verbatim
+// and emit an IP-only rule with an empty protocol + zero port (so the Rust
+// table keys it under the protocol wildcard). The Rust side then honors these
+// rather than dropping them (see nat::tests::dnat_protocol_gre_translates /
+// dnat_ip_only_covers_all_protocols_incl_icmp). This test FAILS if the builder
+// rewrites/drops the protocol or the IP-only shape regresses.
+func TestBuildDestinationNATSnapshotsNonTCPUDP(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Security.NAT.Destination = &config.DestinationNATConfig{
+		Pools: map[string]*config.NATPool{
+			"dp": {Name: "dp", Address: "10.0.0.9"},
+		},
+		RuleSets: []*config.NATRuleSet{
+			{Name: "rs", FromZone: "untrust", Rules: []*config.NATRule{
+				{
+					Name: "gre-dnat",
+					Match: config.NATMatch{
+						DestinationAddress: "203.0.113.10",
+						Protocol:           "gre",
+					},
+					Then: config.NATThen{Type: config.NATDestination, PoolName: "dp"},
+				},
+				{
+					Name: "icmp-dnat",
+					Match: config.NATMatch{
+						DestinationAddress: "203.0.113.11",
+						Protocol:           "icmp",
+					},
+					Then: config.NATThen{Type: config.NATDestination, PoolName: "dp"},
+				},
+				{
+					// IP-only: no protocol, no application, no port.
+					Name: "ip-only-dnat",
+					Match: config.NATMatch{
+						DestinationAddress: "203.0.113.12",
+					},
+					Then: config.NATThen{Type: config.NATDestination, PoolName: "dp"},
+				},
+			}},
+		},
+	}
+
+	snaps := buildDestinationNATSnapshots(cfg, nil)
+	byName := map[string]DestinationNATRuleSnapshot{}
+	for _, s := range snaps {
+		byName[s.Name] = s
+	}
+
+	if got, ok := byName["gre-dnat"]; !ok || got.Protocol != "gre" {
+		t.Fatalf("gre-dnat protocol = %q (present=%v), want gre carried verbatim", got.Protocol, ok)
+	}
+	if got, ok := byName["icmp-dnat"]; !ok || got.Protocol != "icmp" {
+		t.Fatalf("icmp-dnat protocol = %q (present=%v), want icmp carried verbatim", got.Protocol, ok)
+	}
+	if got, ok := byName["ip-only-dnat"]; !ok || got.Protocol != "" || got.DestinationPort != 0 {
+		t.Fatalf("ip-only-dnat = {proto=%q port=%d present=%v}, want {proto=\"\" port=0} (wildcard shape)",
+			got.Protocol, got.DestinationPort, ok)
+	}
+}

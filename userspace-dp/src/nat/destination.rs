@@ -10,6 +10,16 @@ use std::sync::Arc;
 
 pub(super) use crate::ip_proto::{PROTO_TCP, PROTO_UDP};
 
+/// #2396: protocol-wildcard sentinel for an IP-only / any-protocol DNAT rule
+/// (Junos `match destination-address <ip>` with no application and no port).
+/// Such a rule translates traffic to the destination REGARDLESS of L4
+/// protocol, including ICMP/ICMPv6/GRE. We key it under protocol 0 and have
+/// `lookup_with_counter` fall back to it after the concrete-protocol lookup
+/// misses. Real forwarded packets never carry protocol 0 (HOPOPT is an
+/// extension-header, not a transport), so reserving 0 as the table-side
+/// wildcard cannot collide with an exact-protocol entry.
+pub(crate) const PROTO_ANY: u8 = 0;
+
 #[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 pub(crate) struct DnatKey {
     pub protocol: u8,
@@ -93,20 +103,45 @@ impl DnatTable {
                 Ok(ip) => ip,
                 Err(_) => continue,
             };
-            // Determine protocol(s) to insert entries for.
-            let protos: Vec<u8> = match snap.protocol.as_str() {
-                "tcp" => vec![PROTO_TCP],
-                "udp" => vec![PROTO_UDP],
+            // Determine the protocol key to insert this entry under.
+            //
+            // #2396: previously only `"tcp"`/`"udp"`/`""` were recognized and
+            // everything else hit `_ => continue` — a GRE/ICMP/ICMPv6 DNAT
+            // rule compiled and committed but was SILENTLY DROPPED here, never
+            // reaching the dataplane (fail-open: configured translation
+            // absent). And an IP-only rule (`""` + no port) expanded to
+            // TCP+UDP only, so an IP-only DNAT did NOT cover ICMP/GRE despite
+            // the closeout doc claiming "IP-only DNAT works for ICMP via
+            // wildcard lookup".
+            //
+            // Now:
+            //  - a concrete protocol token resolves through the shared SSOT
+            //    (`proto_number`, mirrors Go's `appid.ProtocolNumber`) to a
+            //    single keyed entry covering exactly that protocol.
+            //  - `""` + a destination port is still a port-based rule and
+            //    defaults to TCP (the Go builder already rewrites `""`->`"tcp"`
+            //    for a non-zero port; we keep the fallback for robustness).
+            //  - `""` + NO port is a true IP-only / any-protocol DNAT: it is
+            //    keyed under the protocol WILDCARD (`PROTO_ANY = 0`), and the
+            //    lookup falls back to that wildcard so it covers ALL protocols
+            //    INCLUDING ICMP/ICMPv6/GRE — honoring the doc.
+            //
+            // An unresolvable token still drops the entry, but the Go commit
+            // gate rejects an unresolvable DNAT protocol before it can reach
+            // the wire (#2396), so this `continue` is a defense-in-depth tail,
+            // not the operator-facing failure mode.
+            let proto: u8 = match snap.protocol.as_str() {
                 "" => {
                     if snap.destination_port != 0 {
-                        // Port-based rule with no explicit protocol: default TCP
-                        vec![PROTO_TCP]
+                        PROTO_TCP
                     } else {
-                        // No protocol, no port: expand to both TCP and UDP
-                        vec![PROTO_TCP, PROTO_UDP]
+                        PROTO_ANY
                     }
                 }
-                _ => continue,
+                token => match crate::ip_proto::proto_number(token) {
+                    Some(p) => p,
+                    None => continue,
+                },
             };
             let hit_counter = nat_counters.rule_counter(snap.counter_id);
             // #2394 (Copilot fold): parse the source-address constraint once per
@@ -148,7 +183,7 @@ impl DnatTable {
                     },
                 }
             }
-            for proto in protos {
+            {
                 Self::insert_entry(
                     table.entries.entry(DnatKey {
                         protocol: proto,
@@ -180,6 +215,10 @@ impl DnatTable {
     ///
     /// 1. Exact match: `(protocol, dst_ip, dst_port)`
     /// 2. Wildcard port fallback: `(protocol, dst_ip, 0)`
+    /// 3. #2396 protocol-wildcard fallback: `(PROTO_ANY, dst_ip, 0)` — an
+    ///    IP-only / any-protocol DNAT rule that covers ALL L4 protocols
+    ///    (incl. ICMP/ICMPv6/GRE). Tried last so a concrete-protocol or
+    ///    concrete-port rule always wins over the catch-all.
     ///
     /// Returns just the decision; existing callers/tests keep their
     /// `Option<NatDecision>` shape. The cold path uses
@@ -223,6 +262,25 @@ impl DnatTable {
                 self.match_entries(
                     self.entries.get(&DnatKey {
                         protocol,
+                        dst_ip,
+                        dst_port: 0,
+                    }),
+                    src_ip,
+                    ingress_zone,
+                )
+            })
+            .or_else(|| {
+                // #2396: protocol-wildcard, IP-only DNAT — matches any L4
+                // protocol (ICMP/ICMPv6/GRE/...) to this destination. Only
+                // reached when no concrete (protocol, port) entry matched, so
+                // a specific rule always wins. A real packet never carries
+                // protocol PROTO_ANY (0), so when the inbound `protocol` IS 0
+                // this `or_else` would re-probe the same key — harmless (it
+                // just repeats the wildcard lookup) and never double-counts
+                // because only one entry can match.
+                self.match_entries(
+                    self.entries.get(&DnatKey {
+                        protocol: PROTO_ANY,
                         dst_ip,
                         dst_port: 0,
                     }),
