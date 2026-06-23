@@ -1593,3 +1593,79 @@ func validateDHCPStaticBindingsStrict(cfg *Config) error {
 	}
 	return check(cfg.System.DHCPServer.DHCPv6LocalServer, "dhcpv6-local-server", true)
 }
+
+// validateDestinationNATAddressesStrict (#2396(c)) hard-rejects a
+// destination-NAT rule whose `match destination-address` resolves to NO
+// parseable host IP — i.e. the rule HAS a destination match (singular or
+// bracket-list) but EVERY configured token fails to parse as a bare IP after
+// any CIDR mask is stripped.
+//
+// The DNAT snapshot builder (buildDestinationNATSnapshots, #2395) strips the
+// CIDR suffix from each destination and SKIPS any token where
+// `net.ParseIP(stripped) == nil`; the Rust DNAT table (DnatTable::from_snapshots)
+// independently `continue`s on a destination it cannot parse. So a rule whose
+// destinations are all malformed emits NO table entry and silently translates
+// NOTHING — it compiled and committed, but is inert, with no operator feedback.
+// This is the #2396(c) silent-drop. Surfacing it at commit / commit-check turns
+// a fat-fingered "the only destination is a typo" into a visible error.
+//
+// Acceptance MUST match the builder's exactly: a token is "good" iff, after
+// stripping a trailing `/mask`, the remainder parses with net.ParseIP. A rule
+// with NO destination match at all is out of scope (it never reaches the
+// builder's per-destination loop). A rule with at least one good destination is
+// fine even if others are malformed (the builder emits entries for the good
+// ones and skips the rest — partial, but not a silent total no-op).
+//
+// Reported deterministically: rule-sets are walked in sorted name order and
+// rules in their configured order, so the first-reported offender is stable.
+// The caller downgrades the error to a warning on the tolerant load / peer-sync
+// path (#1960 no-brick): a config persisted before this gate existed still
+// boots, and the dataplane drops the inert rule on its own.
+func validateDestinationNATAddressesStrict(cfg *Config) error {
+	if cfg == nil || cfg.Security.NAT.Destination == nil {
+		return nil
+	}
+	rulesets := append([]*NATRuleSet(nil), cfg.Security.NAT.Destination.RuleSets...)
+	sort.SliceStable(rulesets, func(i, j int) bool {
+		if rulesets[i] == nil || rulesets[j] == nil {
+			return rulesets[i] != nil
+		}
+		return rulesets[i].Name < rulesets[j].Name
+	})
+	for _, rs := range rulesets {
+		if rs == nil {
+			continue
+		}
+		for _, rule := range rs.Rules {
+			if rule == nil {
+				continue
+			}
+			// Mirror the builder's destination-address gathering: prefer the
+			// bracket-list form, fall back to the singular match value.
+			destAddrs := append([]string(nil), rule.Match.DestinationAddresses...)
+			if len(destAddrs) == 0 && rule.Match.DestinationAddress != "" {
+				destAddrs = append(destAddrs, rule.Match.DestinationAddress)
+			}
+			if len(destAddrs) == 0 {
+				// No destination match at all — out of scope.
+				continue
+			}
+			anyGood := false
+			for _, raw := range destAddrs {
+				ipPart := natCIDRIPPart(raw)
+				if ipPart != "" && net.ParseIP(ipPart) != nil {
+					anyGood = true
+					break
+				}
+			}
+			if !anyGood {
+				return fmt.Errorf(
+					"destination-nat rule-set %q rule %q: no valid destination-address "+
+						"(every match destination-address is malformed: %s); "+
+						"the rule would commit but never translate any traffic",
+					rs.Name, rule.Name, strings.Join(destAddrs, ", "))
+			}
+		}
+	}
+	return nil
+}
