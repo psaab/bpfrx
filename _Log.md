@@ -11969,3 +11969,42 @@ top.
   — accurate even when the per-device write failed (drop hazard is then MORE
   acute, so the warning is deliberately NOT suppressed). Tests/build green.
 - **File(s)**: userspace-dp/src/slowpath.rs, pkg/networkd/networkd.go, _Log.md
+
+- **Timestamp**: 2026-06-23
+- **Action**: #2440 — reconcile fail-open partial-apply fix (codex review-033
+  033-01, HIGH). apply_snapshot published the new forwarding view
+  (coord.forwarding, shared_validation, ha.forwarding, ha.fabrics) and bumped
+  validation.snapshot_installed/config_generation BEFORE opening the mandatory
+  BPF map FDs (xsk/heartbeat/sessions), and the orchestrator tore down the
+  running workers before apply_snapshot ran. A snapshot with a missing/
+  unopenable required pin therefore: tore down old workers -> published a NEWER
+  generation -> aborted bring-up at FD-open -> left the helper advertising a
+  data-plane view backed by NO workers (fail-open on a security appliance).
+  Fix (correct ordering): extracted snapshot::preflight_map_fds which checks
+  the required pin strings AND opens ALL mandatory + optional map FDs; the
+  orchestrator (reconcile/mod.rs) now runs it BEFORE tear_down and before any
+  publish. On any mandatory missing-pin / FD-open failure it returns None with
+  last_reconcile_stage + per-binding last_error set, and reconcile aborts with
+  NO teardown and NO publish — prior generation stays published, prior workers
+  keep running. apply_snapshot now receives the already-secured FDs (dropped its
+  now-unused bindings param). Smaller-but-correct shape chosen over a big
+  refactor: the FDs depend on nothing in teardown, so hoisting the open ahead of
+  teardown fully closes the window without restructuring the phase pipeline.
+  Test seam: bpf_map::pin sentinel pin paths (TEST_MAP_PIN_OK / TEST_MAP_PIN_FAIL,
+  #[cfg(test)]) short-circuit bpf_obj_get from any thread (the control-socket
+  handler runs on a spawned thread, so a thread-local hook was insufficient).
+  Three regression tests in coordinator/tests.rs assert the prior generation
+  stays published on session-FD failure and on missing-session-pin, plus a
+  positive control that a fully-openable snapshot DOES advance the generation
+  (no over-gating). Fail-on-revert proven: a scratch publish-before-open ordering
+  made both fail-open tests fail (config_generation advanced 7->8 / 11->12).
+  Also fixed main_tests::apply_snapshot_same_plan_preserves_persistent_snat_lease_state
+  which relied on the old fail-open publish (empty map_pins) — now wires the
+  sentinel-OK pins. Full Rust suite green single-threaded (2600 bin tests +
+  helpers); coordinator tests 94/94 stable 5x parallel.
+- **File(s)**: userspace-dp/src/afxdp/coordinator/reconcile/mod.rs,
+  userspace-dp/src/afxdp/coordinator/reconcile/snapshot.rs,
+  userspace-dp/src/afxdp/bpf_map/pin.rs,
+  userspace-dp/src/afxdp/coordinator/tests.rs,
+  userspace-dp/src/main_tests.rs,
+  docs/userspace-dataplane-architecture.md, _Log.md
