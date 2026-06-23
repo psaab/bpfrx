@@ -614,6 +614,17 @@ io_uring helps a lot, but not in the way people often mean.
 
 1. **Slow-path reinjection**
 - write host-bound/exception packets to TUN/TAP with batched SQEs
+- a TUN/TAP fd is packet-oriented: one `write()` (or one io_uring write
+  submission) is exactly one L3 packet, never a byte stream. The slow-path
+  writers (`write_packet_sync` and the non-positioned io_uring `write_all`
+  in `userspace-dp/src/{slowpath,io_uring_write}.rs`) are therefore
+  whole-packet-atomic (#2407): `EINTR` retries the WHOLE packet from offset
+  0; a short count (`0 < n < len`) DROPS the packet (counted as a slow-path
+  drop + write error) instead of resubmitting `bytes[n..]`. Resubmitting the
+  remainder would make the kernel read the leftover bytes as a SECOND,
+  malformed packet — corrupting the device stream. Only the positioned
+  (state-writer / regular-file) io_uring path is a true byte stream and may
+  resume from `offset + n`.
 
 2. **Session sync transport**
 - replace blocking write/read goroutines with batched async I/O

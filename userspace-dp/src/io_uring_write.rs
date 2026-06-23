@@ -188,7 +188,21 @@ pub(crate) fn write_all(
         if res == 0 {
             return Err(format!("{label} io_uring short write: 0"));
         }
-        offset += res as usize;
+        let n = res as usize;
+        // A non-positioned (stream-mode) write targets a packet-oriented fd:
+        // the TUN slow path (#2407). One submission is one L3 packet. A short
+        // CQE count must NOT resubmit the remainder — re-writing `data[n..]`
+        // would inject the leftover bytes as a SECOND, malformed packet. Treat
+        // a partial as an unsendable packet and drop it (Err); the caller
+        // counts the drop. Positioned writes (a regular file — the state
+        // writer) are a true byte stream and DO resume from `offset + n`.
+        if !positioned && n < data.len() {
+            return Err(format!(
+                "{label} io_uring short write on packet fd: wrote {n} of {} bytes (packet dropped)",
+                data.len()
+            ));
+        }
+        offset += n;
         // Advance the tag so the next submission's CQE cannot be confused with
         // this one's (and a leftover CQE from this one cannot be reused).
         tag = tag.wrapping_add(1);
@@ -428,13 +442,70 @@ mod tests {
         assert_eq!(ring.push_calls, 1);
     }
 
+    /// Positioned (regular-file / state-writer) stream write: a short count
+    /// legitimately resumes from `offset + n` because a file IS a byte stream.
     #[test]
-    fn short_write_advances_and_resubmits() {
+    fn positioned_short_write_advances_and_resubmits() {
         // First completion reports 2 of 4 bytes; second reports the remaining 2.
         let mut ring = FakeRing::new(vec![Ok(()), Ok(())], vec![2, 2]);
-        let out = write_all(&mut ring, &[0u8; 4], false, "test").unwrap();
+        let out = write_all(&mut ring, &[0u8; 4], true, "state").unwrap();
         assert_eq!(out, WriteOutcome::Done);
         assert_eq!(ring.push_calls, 2);
+    }
+
+    /// #2407 fail-on-revert: a non-positioned (TUN, packet-oriented) write that
+    /// reports a SHORT count must NOT resubmit the remainder — doing so would
+    /// inject `data[n..]` as a second corrupt packet. It must return Err after
+    /// exactly ONE push, never a second `data[n..]` write.
+    ///
+    /// If the packet-fd guard is reverted (the loop resumes from `offset + n`
+    /// for non-positioned writes), the fake materialises the SECOND CQE (4),
+    /// `push_calls` becomes 2, and the call returns Ok — both asserts fail.
+    #[test]
+    fn packet_short_write_drops_no_remainder_resubmit() {
+        // Script a second successful wait + a second result so a (buggy)
+        // resubmit WOULD succeed and complete — proving the guard, not a lack of
+        // script, is what stops the corrupting remainder write.
+        let mut ring = FakeRing::new(vec![Ok(()), Ok(())], vec![2, 2]);
+        let err = write_all(&mut ring, &[0u8; 4], false, "slow-path").unwrap_err();
+        assert!(
+            err.contains("short write on packet fd"),
+            "partial packet write must be a drop, got: {err}"
+        );
+        assert_eq!(
+            ring.push_calls, 1,
+            "a packet-fd short write must NOT resubmit the remainder (corruption)"
+        );
+        // Only the first (partial) CQE may have been accepted; the corrupting
+        // second chunk's bytes must never be applied.
+        assert_eq!(
+            ring.accepted_bytes(),
+            2,
+            "no remainder bytes may be written after a partial packet write"
+        );
+    }
+
+    /// A non-positioned FULL write still succeeds in one push (no regression).
+    #[test]
+    fn packet_full_write_succeeds() {
+        let mut ring = FakeRing::new(vec![Ok(())], vec![4]);
+        let out = write_all(&mut ring, &[0u8; 4], false, "slow-path").unwrap();
+        assert_eq!(out, WriteOutcome::Done);
+        assert_eq!(ring.push_calls, 1);
+    }
+
+    /// #2407: EINTR on a packet write retries the WAIT (not a re-push) and then
+    /// reaps the full count — the whole packet is written with one submission.
+    #[test]
+    fn packet_eintr_retries_whole_no_corruption() {
+        let mut ring = FakeRing::new(vec![eintr(), Ok(())], vec![4]);
+        let out = write_all(&mut ring, &[0u8; 4], false, "slow-path").unwrap();
+        assert_eq!(out, WriteOutcome::Done);
+        assert_eq!(
+            ring.push_calls, 1,
+            "EINTR retry must be wait-only, never a remainder re-push"
+        );
+        assert_eq!(ring.accepted_bytes(), 4);
     }
 
     /// The core #2297 regression: an EINTR on the wait must NOT abandon the SQE
@@ -493,7 +564,12 @@ mod tests {
             // Defended by the reap-loop user_data match (surfaces during the
             // first wait, ahead of the real CQE).
             .with_stale_on_wait(vec![Some(stale()), None]);
-        let out = write_all(&mut ring, &[0u8; 8], false, "test").unwrap();
+        // Positioned (file/state-writer) write: a short count legitimately
+        // resumes from offset+n, so the two-chunk resume here exercises the
+        // stale-CQE defences across both pushes. (A non-positioned/TUN partial
+        // would drop at the first chunk — that's the #2407 packet semantics,
+        // covered by `packet_short_write_drops_no_remainder_resubmit`.)
+        let out = write_all(&mut ring, &[0u8; 8], true, "test").unwrap();
         assert_eq!(out, WriteOutcome::Done);
         // A misattributed stale CQE (res=9999) would overshoot offset and finish
         // in ONE push; the correct path needs TWO.

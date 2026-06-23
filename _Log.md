@@ -11847,3 +11847,55 @@ top.
   clobbers base+0 → test fails). Build clean; xsk_ffi tests 7 passed 5x.
 - **File(s)**: userspace-dp/src/xsk_ffi.rs, userspace-dp/README.md,
   _Log.md
+
+- **Timestamp**: 2026-06-23
+- **Action**: #2407 — make slow-path TUN writes whole-packet-atomic
+  (sync + io_uring). A TUN/TAP fd is packet-oriented: one write() (or one
+  io_uring write submission) is exactly one L3 packet, never a byte
+  stream. Both slow-path writers retried a SHORT count by resubmitting
+  the REMAINING bytes (stream semantics) — which makes the kernel read
+  the leftover bytes as a SECOND, malformed packet, corrupting the device
+  stream. SYNC (`write_packet_sync`, userspace-dp/src/slowpath.rs): was a
+  `while written < len { write(ptr+written, len-written) }` loop. Now
+  extracted to `write_packet_atomic(len, writer)` (a closure seam so the
+  short-count/EINTR behaviour is unit-testable): always writes the WHOLE
+  packet from offset 0; EINTR retries the whole packet; a partial
+  (0<n<len) or zero count returns Err (the caller already counts that as
+  a dropped packet + write error); other errno → Err. IO_URING
+  (`write_all`, userspace-dp/src/io_uring_write.rs): the loop is SHARED
+  with the positioned state-writer (a regular file IS a byte stream and
+  legitimately resumes). Added a `!positioned` guard: for the
+  non-positioned TUN path a short CQE count (`n < data.len()`) returns
+  Err (drop) instead of resubmitting `data[n..]`; positioned writes keep
+  the multi-chunk resume. EINTR retry was already wait-only (no re-push)
+  so it stays whole-packet by construction. No new drop counter — the
+  existing slow_path_worker Err arm already increments
+  dropped_packets/dropped_bytes/write_errors. Tests (fail-on-revert,
+  verified by temporary revert): io_uring
+  packet_short_write_drops_no_remainder_resubmit (one push, Err, no
+  remainder bytes accepted), packet_full_write_succeeds,
+  packet_eintr_retries_whole_no_corruption,
+  positioned_short_write_advances_and_resubmits (file resume preserved);
+  sync sync_short_write_drops_no_remainder (exactly one full-length
+  write, never bytes[n..]), sync_full_write_succeeds_single_call,
+  sync_eintr_retries_whole_packet, sync_zero_write_drops,
+  sync_hard_error_drops. Repointed the pre-existing
+  stale_cqe_is_not_misattributed test to positioned=true (its two-chunk
+  resume is now only valid for the file path). Build clean; full
+  userspace-dp suite 2587+46+62 green; new tests 5x stable.
+- **File(s)**: userspace-dp/src/slowpath.rs,
+  userspace-dp/src/io_uring_write.rs,
+  docs/xdp-io-uring-userspace-dataplane.md, _Log.md
+
+- **Timestamp**: 2026-06-23
+- **Action**: #2407 Copilot doc-fold (PR #2437) — corrected the
+  `write_packet_atomic` writer-seam doc comment in slowpath.rs. It said
+  the writer returns "<0 negated via errno", but `libc::write` returns
+  `-1` on error with `errno` set SEPARATELY (not a negated-errno value),
+  which is exactly what the seam and tests model (`-1` + an explicit
+  `set_errno`). Reworded to: non-negative byte count on success, or `-1`
+  on error with errno set separately, and noted that
+  `write_packet_atomic` reads errno via `io::Error::last_os_error()` to
+  split EINTR (retry-whole) from a hard error (drop). Comment-only — no
+  code change; cargo build --release clean.
+- **File(s)**: userspace-dp/src/slowpath.rs, _Log.md
