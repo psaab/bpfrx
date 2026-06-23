@@ -2955,3 +2955,70 @@ fn reconcile_all_mandatory_maps_open_advances_published_generation() {
     );
     assert_eq!((**coordinator.shared_validation.load()).config_generation, 2);
 }
+
+/// #2440 (Copilot follow-up): the snapshot-integrity rejection leg in
+/// `apply_snapshot` (`build_forwarding_state...` -> Err) must record
+/// `last_reconcile_stage = "snapshot_integrity_error"` so the failure is
+/// observable via status. Previously that leg only `eprintln!`d and
+/// returned None, leaving `last_reconcile_stage` at its prior value.
+///
+/// Seam: a NAT64 rule with an empty prefix trips
+/// `Nat64State::try_from_snapshots` (Nat64UnparseableRule). That path is
+/// NOT checked by the top-of-reconcile policy preflight (which only
+/// parses the policy/address-book state), so it reaches the
+/// `apply_snapshot` integrity Err arm. Map pins are sentinel-OK so the
+/// map-FD preflight passes and the integrity check is what fires.
+///
+/// Scope note: unlike the address-book policy preflight (which runs
+/// before `tear_down`), this NAT64 integrity check fires INSIDE
+/// `apply_snapshot` — after `tear_down` (`stop_inner`) has already reset
+/// both `coord.validation` and `shared_validation` to default. That
+/// post-teardown integrity-reject ordering is pre-existing and is NOT
+/// what this fold changes, so this test asserts ONLY the observable
+/// stage (the fold's subject). It does not assert generation
+/// preservation for this leg.
+///
+/// Fail-on-revert: drop the `coord.last_reconcile_stage = ...` line in
+/// the Err arm and this asserts against the stale "start" value.
+#[test]
+fn reconcile_snapshot_integrity_error_sets_observable_stage() {
+    let mut coordinator = Coordinator::new();
+    let prior = ValidationState {
+        snapshot_installed: true,
+        config_generation: 20,
+        fib_generation: 7,
+    };
+    coordinator.validation = prior;
+    coordinator.shared_validation.store(Arc::new(prior));
+
+    let mut bindings: Vec<BindingStatus> = Vec::new();
+
+    // Sentinel-OK mandatory pins (preflight passes) + a NAT64 rule with
+    // an empty prefix (integrity Err in build_forwarding_state).
+    let mut snap = fail_open_snapshot(21);
+    snap.map_pins.sessions = format!("{TEST_MAP_PIN_OK}sessions");
+    snap.nat64_rules = vec![crate::protocol::NAT64RuleSnapshot {
+        name: "bad-nat64".to_string(),
+        prefix: String::new(),
+        ..Default::default()
+    }];
+
+    coordinator.reconcile(Some(&snap), &mut bindings, 64);
+
+    assert_eq!(
+        coordinator.last_reconcile_stage, "snapshot_integrity_error",
+        "integrity-error leg must record an observable stage, got {:?}",
+        coordinator.last_reconcile_stage
+    );
+    // The integrity leg rejects the new snapshot before it can publish a
+    // newer generation: the new generation 21 is never installed.
+    assert_ne!(
+        coordinator.validation.config_generation, 21,
+        "integrity reject must not advance to the rejected generation"
+    );
+    assert_ne!(
+        (**coordinator.shared_validation.load()).config_generation,
+        21,
+        "integrity reject must not publish the rejected generation"
+    );
+}

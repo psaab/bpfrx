@@ -12008,3 +12008,31 @@ top.
   userspace-dp/src/afxdp/coordinator/tests.rs,
   userspace-dp/src/main_tests.rs,
   docs/userspace-dataplane-architecture.md, _Log.md
+
+- **Timestamp**: 2026-06-23
+- **Action**: #2440 PR #2483 Copilot follow-up fold (MINOR observability). The
+  snapshot-integrity rejection leg in apply_snapshot
+  (build_forwarding_state... -> Err) only eprintln!'d and returned None without
+  setting coord.last_reconcile_stage, so the field retained a stale value and
+  the #1606 address-book / NAT64 / NPTv6 integrity fault was NOT observable via
+  status (status.rs reads last_reconcile_stage). The mod.rs:159 comment claiming
+  "last_reconcile_stage + per-binding last_error already set inside
+  apply_snapshot on the integrity-error leg" was therefore inaccurate. Fix: set
+  coord.last_reconcile_stage = "snapshot_integrity_error" in the Err arm before
+  return None (matches the preflight_map_fds descriptive-stage pattern); reworded
+  the mod.rs comment to be accurate (stage set; no per-binding signal for an
+  address-book/NAT64 integrity fault; rejects before publish). Added regression
+  test reconcile_snapshot_integrity_error_sets_observable_stage (NAT64
+  empty-prefix rule trips Nat64UnparseableRule — a path the top-of-reconcile
+  policy preflight does NOT check, so it reaches the apply_snapshot integrity Err
+  arm; map pins sentinel-OK so the map preflight passes). Fail-on-revert proven:
+  dropping the stage line makes the test assert "stopped" != "snapshot_integrity_error".
+  Scope note: this integrity leg fires INSIDE apply_snapshot, AFTER tear_down has
+  reset coord.validation + shared_validation, so the test asserts only the stage
+  (the fold subject) + that the rejected generation is never installed; the
+  post-teardown integrity-reject ordering is pre-existing and out of scope.
+  Skipped the trivial sentinel-literal-consolidation style nit. Build clean;
+  coordinator suite 95/95; SNAT lease test green.
+- **File(s)**: userspace-dp/src/afxdp/coordinator/reconcile/snapshot.rs,
+  userspace-dp/src/afxdp/coordinator/reconcile/mod.rs,
+  userspace-dp/src/afxdp/coordinator/tests.rs, _Log.md

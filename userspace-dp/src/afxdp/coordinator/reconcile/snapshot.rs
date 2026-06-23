@@ -172,6 +172,12 @@ pub(super) fn apply_snapshot(
     ) {
         Ok(fwd) => fwd,
         Err(err) => {
+            // #2440 (Copilot follow-up): record the stage so the
+            // integrity failure is observable via status.rs
+            // (last_reconcile_stage), matching the descriptive-stage
+            // pattern the preflight_map_fds legs use. Without this the
+            // field retained a stale value from a prior reconcile.
+            coord.last_reconcile_stage = "snapshot_integrity_error".to_string();
             eprintln!(
                 "xpf-userspace-dp: snapshot integrity error during reconcile: {} — keeping previous forwarding state",
                 err

@@ -154,8 +154,12 @@ impl Coordinator {
             &mut preserved.synced_sessions,
             fds,
         ) else {
-            // last_reconcile_stage + per-binding last_error already set
-            // inside apply_snapshot on the integrity-error leg.
+            // last_reconcile_stage set inside apply_snapshot on the
+            // integrity-error leg ("snapshot_integrity_error"). That leg
+            // rejects the snapshot before any publish, so the prior
+            // forwarding generation stays published. It does NOT touch
+            // per-binding last_error — there is no per-binding signal
+            // for an address-book integrity fault.
             return;
         };
         bringup::bring_up_workers(
