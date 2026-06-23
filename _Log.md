@@ -1,5 +1,31 @@
 # Action Log
 
+## 2026-06-23 — #2369 ARP fixed-header validation before neighbor learning
+
+- **Timestamp**: 2026-06-23 PDT
+- **Action**: Security fix (MED, neighbor-cache poisoning). `classify_arp`
+  learned an ARP sender (`sender_mac`/`sender_ip`) from any EtherType-ARP
+  opcode-2 frame with a >=28-byte body, reading the sender at the fixed
+  Ethernet/IPv4 offsets (`l3+8..14` / `l3+14..18`) WITHOUT validating the
+  ARP fixed header. A crafted opcode-2 ARP with htype!=1 / ptype!=0x0800 /
+  hlen!=6 / plen!=4 was parsed at those wrong-for-its-type offsets and the
+  attacker-chosen bytes learned into both `dynamic_neighbors` and the
+  kernel neighbor table — an on-link poisoning primitive (RFC 826: an ARP
+  packet MUST be interpreted per its type/length fields). Fix: before the
+  sender read, require htype==1, ptype==0x0800, hlen==6, plen==4; any
+  mismatch returns `OtherArp` (recycled, never learned), mirroring the
+  #2368 NDP NA fail-closed style. The existing 28-byte body-length guard
+  already bounds the fixed-offset reads (truncated ARP -> NotArp, no
+  panic). Only opcode-2 replies are ever learned (requests classify
+  `OtherArp`). No change to ifindex keying (left for #2370). Tests
+  (fail-on-revert): htype/ptype/hlen/plen each not-learned (verified flips
+  to Reply/poison if the check is removed) + valid Ethernet/IPv4 reply
+  still learns + truncated ARP does not panic. cargo build --release
+  clean; new tests green and 5x stable.
+- **File(s)**: userspace-dp/src/afxdp/parser.rs,
+  userspace-dp/src/afxdp/parser_tests.rs,
+  userspace-dp/src/afxdp/README.md, _Log.md
+
 ## 2026-06-23 — #2398 PR #2420 Copilot fold: symmetric v6/destination SNAT test coverage
 
 - **Timestamp**: 2026-06-23 PDT

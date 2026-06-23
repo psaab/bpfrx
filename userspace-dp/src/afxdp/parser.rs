@@ -26,6 +26,17 @@ const ICMPV6_NA_HDR_LEN: usize = 24;
 const NEXT_HEADER_ICMPV6: u8 = 58;
 const ICMPV6_TYPE_NA: u8 = 136;
 const ARP_OP_REPLY: u16 = 2;
+/// ARP hardware type for Ethernet (RFC 826 / IANA). The fixed-offset
+/// read of the sender hardware address is only meaningful when the
+/// hardware type is Ethernet.
+const ARP_HTYPE_ETHERNET: u16 = 1;
+/// ARP protocol type for IPv4 (EtherType 0x0800). The fixed-offset read
+/// of the sender protocol address is only meaningful for IPv4.
+const ARP_PTYPE_IPV4: u16 = 0x0800;
+/// ARP hardware address length for Ethernet (6-byte MAC).
+const ARP_HLEN_ETHERNET: u8 = 6;
+/// ARP protocol address length for IPv4 (4-byte address).
+const ARP_PLEN_IPV4: u8 = 4;
 const NDP_OPT_TARGET_LL: u8 = 2;
 /// RFC 4861 §7.1.2: every NDP message MUST be sent with an IPv6 Hop
 /// Limit of 255 so a receiver can reject any NDP packet whose hop
@@ -82,9 +93,12 @@ pub(super) struct ArpReply {
 pub(super) enum ArpClassification {
     /// Frame is not ARP (or is too short to classify).
     NotArp,
-    /// Frame is ARP but not a reply (e.g. request, RARP, gratuitous
-    /// announcement). Caller should recycle the frame — ARP does not
-    /// transit the firewall — but skip neighbor learning.
+    /// Frame is ARP but not a learnable Ethernet/IPv4 reply (e.g. a
+    /// request, RARP, gratuitous announcement, or — per #2369 — an
+    /// opcode-2 ARP whose fixed header is not Ethernet/IPv4:
+    /// htype!=1, ptype!=0x0800, hlen!=6, or plen!=4). Caller should
+    /// recycle the frame — ARP does not transit the firewall — but skip
+    /// neighbor learning.
     OtherArp,
     /// Frame is an ARP reply with a parsed `(sender_mac, sender_ip)`.
     Reply(ArpReply),
@@ -108,6 +122,28 @@ pub(super) fn classify_arp(raw_frame: &[u8]) -> ArpClassification {
     }
     if raw_frame.len() < l3_start + ARP_BODY_LEN {
         return ArpClassification::NotArp;
+    }
+    // #2369: validate the ARP fixed header BEFORE reading the sender
+    // hardware/protocol addresses. The sender MAC (l3+8..14) and sender IP
+    // (l3+14..18) sit at offsets that are only correct for Ethernet/IPv4
+    // ARP — i.e. when htype==1, ptype==0x0800, hlen==6, plen==4. A crafted
+    // opcode-2 ARP declaring a different hardware/protocol type or length
+    // would otherwise be parsed at these fixed offsets and the resulting
+    // attacker-chosen bytes learned as a MAC->IP binding into both the
+    // userspace `dynamic_neighbors` cache and the kernel neighbor table
+    // (RFC 826: an ARP packet MUST be interpreted per its type/length
+    // fields). Fail closed: any mismatch is treated as a non-learnable ARP
+    // (recycled, never learned), mirroring the #2368 NDP fail-closed style.
+    let htype = u16::from_be_bytes([raw_frame[l3_start], raw_frame[l3_start + 1]]);
+    let ptype = u16::from_be_bytes([raw_frame[l3_start + 2], raw_frame[l3_start + 3]]);
+    let hlen = raw_frame[l3_start + 4];
+    let plen = raw_frame[l3_start + 5];
+    if htype != ARP_HTYPE_ETHERNET
+        || ptype != ARP_PTYPE_IPV4
+        || hlen != ARP_HLEN_ETHERNET
+        || plen != ARP_PLEN_IPV4
+    {
+        return ArpClassification::OtherArp;
     }
     let opcode = u16::from_be_bytes([raw_frame[l3_start + 6], raw_frame[l3_start + 7]]);
     if opcode != ARP_OP_REPLY {
