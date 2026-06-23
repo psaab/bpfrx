@@ -1,5 +1,24 @@
 package dataplane
 
+import "unsafe"
+
+// ConntrackSessionValueSize / ConntrackSessionValueSizeV6 are the on-map
+// conntrack ABI value sizes (bytes) for the shared `sessions` / `sessions_v6`
+// BPF HASH maps. They EXCLUDE the sync-only Generation field — they mirror the
+// C `struct session_value` / `session_value_v6` (bpf/headers/xpf_conntrack.h)
+// and the Rust `BpfSessionValueV4` / `BpfSessionValueV6` (size-asserted at
+// 128 / 176 in userspace-dp/src/afxdp/bpf_map_tests.rs).
+//
+// This is the SINGLE source of truth for the map value_size: the production
+// registration (loader_userspace_shim.go) and every test fixture that creates a
+// `sessions` map MUST use these constants, NOT sizeOf[SessionValue] (which is
+// 8 bytes larger and would over-size the map → OOB copy into the helper's
+// smaller lookup buffer, #2360).
+var (
+	ConntrackSessionValueSize   = uint32(unsafe.Sizeof(bpfSessionValue{}))
+	ConntrackSessionValueSizeV6 = uint32(unsafe.Sizeof(bpfSessionValueV6{}))
+)
+
 // On-map conntrack ABI types (#2360).
 //
 // The shared kernel-visible `sessions` / `sessions_v6` BPF HASH maps store the

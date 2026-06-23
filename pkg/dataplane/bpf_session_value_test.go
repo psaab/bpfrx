@@ -29,6 +29,14 @@ func TestBPFSessionValueMatchesConntrackABI(t *testing.T) {
 		t.Fatalf("sizeof(bpfSessionValueV6) = %d, want %d (C struct session_value_v6 / Rust BpfSessionValueV6)",
 			got, conntrackValueSizeV6)
 	}
+	// The exported SSOT constants (used by production registration AND test
+	// fixtures) must equal the literal C/Rust contract.
+	if ConntrackSessionValueSize != conntrackValueSizeV4 {
+		t.Fatalf("ConntrackSessionValueSize = %d, want %d", ConntrackSessionValueSize, conntrackValueSizeV4)
+	}
+	if ConntrackSessionValueSizeV6 != conntrackValueSizeV6 {
+		t.Fatalf("ConntrackSessionValueSizeV6 = %d, want %d", ConntrackSessionValueSizeV6, conntrackValueSizeV6)
+	}
 }
 
 // TestSessionValueCarriesSyncOnlyGeneration confirms SessionValue is exactly 8

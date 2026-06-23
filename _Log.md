@@ -1,5 +1,28 @@
 # Action Log
 
+## 2026-06-22 — #2360 Copilot fold: SSOT const for conntrack map size
+
+- **Timestamp**: 2026-06-22 PDT
+- **Action**: Folded a Copilot consistency finding on PR #2365. Four test
+  fixtures in pkg/dataplane/userspace/manager_test.go created the
+  `sessions`/`sessions_v6` maps with ValueSize =
+  sizeof(SessionValue)/SessionValueV6 (136/184) — the OLD over-sized
+  value. After the production fix, the Manager's lookup copies the
+  registered 136/184 into the 128/176 bpfSessionValue buffer → the exact
+  #2360 OOB, reintroduced in test setup (latent: only manifests on a
+  BPF-privileged host). Collapsed the size to one SSOT: exported
+  `dataplane.ConntrackSessionValueSize` / `ConntrackSessionValueSizeV6`
+  (= unsafe.Sizeof(bpfSessionValue{}) / V6, the on-map C/Rust ABI,
+  excludes sync-only Generation). Production registration
+  (loader_userspace_shim.go) and the 4 fixture sites now both derive from
+  these constants. Repo-wide grep confirmed no other map-creation site
+  uses sizeof(SessionValue). Added a parity assertion that the exported
+  consts == the literal 128/176.
+- **File(s)**: pkg/dataplane/bpf_session_value.go (exported consts),
+  pkg/dataplane/loader_userspace_shim.go (registration via consts),
+  pkg/dataplane/userspace/manager_test.go (4 fixture sites),
+  pkg/dataplane/bpf_session_value_test.go (const == literal assertion).
+
 ## 2026-06-22 — #2360 conntrack map registration ABI fix (sync-only Generation)
 
 - **Timestamp**: 2026-06-22 PDT
