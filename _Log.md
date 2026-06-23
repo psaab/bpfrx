@@ -12036,3 +12036,37 @@ top.
 - **File(s)**: userspace-dp/src/afxdp/coordinator/reconcile/snapshot.rs,
   userspace-dp/src/afxdp/coordinator/reconcile/mod.rs,
   userspace-dp/src/afxdp/coordinator/tests.rs, _Log.md
+
+## 2026-06-23 — #2444 optional conntrack/dnat map open fail-closed (review-033 033-23)
+- **Timestamp**: 2026-06-23 16:45
+- **Action**: Fixed #2444 (MEDIUM). In `preflight_map_fds` the 4 optional
+  map opens (conntrack_v4/v6, dnat_table/_v6) used
+  `OwnedFd::open_bpf_map(&pin).ok()`, which conflated "pin empty → feature
+  absent" with "pin present but open failed". A present-but-unopenable
+  configured map (permission / pin mismatch / corruption) was swallowed and
+  the helper ran degraded (lost session zone/iface visibility; broken
+  embedded-ICMP NAT reversal → PMTUD/traceroute breakage) with no readiness
+  signal. Replaced each `.ok()` with a new `open_optional_map` helper that
+  mirrors the #2440 mandatory-map pattern: empty pin → Ok(None) (silent, the
+  common anti-over-gate case); present + open Ok → Ok(Some(fd)); present +
+  open Err → set `last_reconcile_stage = "open_<map>_map_failed:<err>"` +
+  per-registered-binding `last_error`, return Err(()) so the caller aborts
+  the reconcile BEFORE teardown/publish (keeps prior generation + workers
+  live, the #2440 invariant). Updated the stale "non-fatal / normal
+  forwarding unaffected" comments and the doc-comment claim that optional
+  maps "never gate the reconcile".
+- **Tests**: added 4 fail-on-revert tests in coordinator/tests.rs using the
+  TEST_MAP_PIN_OK/FAIL sentinel seam: present-conntrack-fail and
+  present-dnat-fail (abort + prior generation preserved + stage +
+  last_error), empty-optional-pins (anti-over-gate: generation advances),
+  present-optional-open-OK (positive control). Proved fail-on-revert:
+  restoring `.ok()` for conntrack_v4 makes the present-fail test FAIL
+  (reconcile wrongly spawns workers=1, generation advances). Restored fix.
+- **Validation**: cargo build --release clean (pre-existing warnings only);
+  reconcile suite 18/18 across 5 runs.
+- **Doc**: docs/userspace-dataplane-architecture.md reconcile/preflight
+  section — documented mandatory vs optional, empty-vs-present fail-closed,
+  + the new test names.
+- **File(s)**: userspace-dp/src/afxdp/coordinator/reconcile/snapshot.rs,
+  userspace-dp/src/afxdp/coordinator/tests.rs,
+  docs/userspace-dataplane-architecture.md, _Log.md
