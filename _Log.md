@@ -1,5 +1,33 @@
 # Action Log
 
+## 2026-06-22 — #2360 conntrack map registration ABI fix (sync-only Generation)
+
+- **Timestamp**: 2026-06-22 PDT
+- **Action**: Fixed an 8-byte stack OOB write (#2360, HIGH). The shared
+  `sessions`/`sessions_v6` BPF HASH maps were registered with
+  `sizeOf[SessionValue]()`/`sizeOf[SessionValueV6]()` (136/184 bytes), but
+  `SessionValue` ends with `Generation uint64` — sync-only #2170 HA
+  metadata that is intentionally NOT in the BPF C conntrack struct. The
+  on-map C/Rust layout is 128/176 (Rust `BpfSessionValueV4/V6`, asserted in
+  bpf_map_tests.rs; C `struct session_value` in xpf_conntrack.h). The
+  over-sized registration made the kernel copy value_size (136/184) into the
+  Rust helper's 128/176-byte lookup buffer on every `bpf_map_lookup_elem` —
+  an 8-byte OOB write (latent: trailing bytes usually zero). Fix: dedicated
+  on-map ABI types `bpfSessionValue`/`bpfSessionValueV6` (no Generation),
+  register the maps at their size, and project all map I/O through
+  `toBPF()`/`sessionValue()` at the boundary. Generation stays in
+  `SessionValue` (in-memory + sync wire, pkg/cluster/sync_protocol.go's own
+  byte codec) — only the map registration size changed; HA sync unaffected.
+  Added parity guards (Go: registered size == 128/176 and != sizeOf[
+  SessionValue], ABI-type size asserts, round-trip drops Generation; Rust
+  asserts retained).
+- **File(s)**: pkg/dataplane/bpf_session_value.go (new ABI types +
+  converters), pkg/dataplane/bpf_session_value_test.go (new parity guards),
+  pkg/dataplane/loader_userspace_shim.go (registration size),
+  pkg/dataplane/maps_session.go (boundary conversion at all map I/O),
+  pkg/dataplane/types.go (Generation cross-reference comment),
+  docs/sync-protocol.md (#2360 ABI section).
+
 ## 2026-06-22 — #2345 review folds (comment accuracy + MissingNeighbor tests)
 
 - **Timestamp**: 2026-06-22 PDT
