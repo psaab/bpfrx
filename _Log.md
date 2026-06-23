@@ -11606,3 +11606,27 @@ top.
   pkg/dataplane/userspace/format/status.go, pkg/api/metrics_userspace.go,
   pkg/api/metrics_test.go, pkg/api/metrics_descriptor_coverage_test.go,
   docs/session-sync-design.md
+
+- **Timestamp**: 2026-06-23
+- **Action**: #2367 — add the bad-source-address suppression to the PTB
+  (Frag-Needed / Packet-Too-Big) generation gate. `ptb_reply_suppressed`
+  checked only L2/L3 destination + non-first fragment + inbound-ICMP-error,
+  never the trigger packet's IP SOURCE — so an oversized DF datagram with a
+  forbidden source (0.0.0.0/127.0.0.1/multicast/255.255.255.255 for v4,
+  ::/::1/ff00::/8 for v6) made the firewall emit a PTB addressed to that
+  source: spoofable ICMP backscatter (RFC 1812 §4.3.2.7 / RFC 4443 §2.4(e)).
+  Extracted the reject/TE gate's inlined source check into a shared
+  `source_is_invalid_for_icmp_error` predicate (frame/inspect.rs) and called
+  it from BOTH `ptb_reply_suppressed` and `can_generate_icmp_error_reply`,
+  so the PTB, reject, and Time-Exceeded paths share ONE bad-source set
+  (closes the forkable per-error-type suppression contract). v4 + v6.
+  Fail-on-revert tests: v4/v6 bad-source backscatter suppression (red if the
+  source call is removed), v4/v6 unicast anti-over-suppress (PMTUD still
+  works), shared-predicate consistency + fail-closed on unknown family.
+  cargo build --release clean; targeted tests green; new tests stable 5x;
+  reject-gate tests still green after refactor.
+- **File(s)**: userspace-dp/src/afxdp/frame/inspect.rs,
+  userspace-dp/src/afxdp/frame/mod.rs, userspace-dp/src/afxdp/icmp.rs,
+  userspace-dp/src/afxdp/icmp_ptb.rs,
+  userspace-dp/src/afxdp/icmp_ptb_tests.rs,
+  userspace-dp/src/afxdp/README.md

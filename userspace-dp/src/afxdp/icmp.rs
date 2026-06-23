@@ -62,15 +62,11 @@ pub(super) fn can_generate_icmp_error_reply(frame: &[u8], meta: UserspaceDpMeta)
             if packet.len() < 20 {
                 return false;
             }
-            let src = Ipv4Addr::new(packet[12], packet[13], packet[14], packet[15]);
-            // (d) bad source / (c) group or broadcast destination. The
-            // destination test routes through the shared #2314 predicate
-            // so the PTB, reject, and Time Exceeded paths agree on what a
-            // multicast/broadcast destination is.
-            if src.is_unspecified()
-                || src.is_loopback()
-                || src.is_multicast()
-                || src.is_broadcast()
+            // (d) bad source / (c) group or broadcast destination. Both
+            // tests route through the shared predicates (#2367 source,
+            // #2314 destination) so the PTB, reject, and Time Exceeded
+            // paths agree on the disallowed source/destination sets.
+            if source_is_invalid_for_icmp_error(meta.addr_family, packet)
                 || dest_is_multicast_or_broadcast(meta.addr_family, packet)
             {
                 return false;
@@ -80,16 +76,11 @@ pub(super) fn can_generate_icmp_error_reply(frame: &[u8], meta: UserspaceDpMeta)
             if packet.len() < 40 {
                 return false;
             }
-            let src = Ipv6Addr::from(match <[u8; 16]>::try_from(&packet[8..24]) {
-                Ok(addr) => addr,
-                Err(_) => return false,
-            });
             // (d) bad source / (c) multicast destination. IPv6 has no
-            // broadcast; multicast (ff00::/8) covers the group case. The
-            // destination test routes through the shared #2314 predicate.
-            if src.is_unspecified()
-                || src.is_loopback()
-                || src.is_multicast()
+            // broadcast; multicast (ff00::/8) covers the group case. Both
+            // tests route through the shared predicates (#2367 source,
+            // #2314 destination).
+            if source_is_invalid_for_icmp_error(meta.addr_family, packet)
                 || dest_is_multicast_or_broadcast(meta.addr_family, packet)
             {
                 return false;

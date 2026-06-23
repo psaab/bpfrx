@@ -187,7 +187,17 @@ sync.
   L2+L3 suppression the reject / Time-Exceeded path already had — both
   call the shared `l2_dst_is_group_or_broadcast` predicate
   (`frame/inspect.rs`, the IEEE I/G group bit on the destination MAC's
-  first octet; all-FF broadcast is a group address). No new counter: a
+  first octet; all-FF broadcast is a group address). #2367: the gate now
+  also drops PTBs triggered by a datagram whose IP SOURCE is not a single
+  unicast host (unspecified, loopback, multicast, or — for IPv4 —
+  broadcast). The PTB is addressed to the trigger's source, so a forbidden
+  source would emit spoofable ICMP backscatter; this is the L3-SOURCE half
+  of RFC 1812 §4.3.2.7 / RFC 4443 §2.4(e). Both `ptb_reply_suppressed` and
+  `can_generate_icmp_error_reply` now call the shared
+  `source_is_invalid_for_icmp_error` predicate (`frame/inspect.rs`), so the
+  PTB, reject, and Time-Exceeded paths apply ONE bad-source set (the
+  reject gate's inlined source check was refactored to call it, closing
+  the forkable per-error-type suppression contract). No new counter: a
   suppressed PTB is folded into the existing fail-closed silent-drop path
   (the oversized original is still dropped via `mtu_signalled`). #2328: a
   PTB that IS generated is now classified by its OWN egress 5-tuple through

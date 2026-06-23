@@ -551,6 +551,53 @@ pub(in crate::afxdp) fn dest_is_multicast_or_broadcast(addr_family: u8, packet: 
     }
 }
 
+/// #2367: RFC 1812 §4.3.2.7 / RFC 4443 §2.4(e) — a router MUST NOT
+/// originate an ICMP/ICMPv6 *error* in response to a datagram whose IP
+/// SOURCE address does not uniquely identify a single host. A locally
+/// generated error is addressed to the trigger packet's source, so a
+/// forbidden source (unspecified, loopback, multicast, or — for IPv4 —
+/// broadcast) would produce spoofable ICMP backscatter aimed at an
+/// address that is not a legitimate unicast host. This is the L3-SOURCE
+/// sibling of [`dest_is_multicast_or_broadcast`] (the L3-destination
+/// test) and [`l2_dst_is_group_or_broadcast`] (the L2 test); it is shared
+/// by the reject / Time-Exceeded path (`can_generate_icmp_error_reply`)
+/// and the PTB path (`ptb_reply_suppressed`) so every locally generated
+/// ICMP error applies the SAME bad-source gate.
+///
+/// `packet` is the L3 (IP-header-first) slice of the trigger frame.
+/// Returns `true` when the source is forbidden and the ICMP error MUST be
+/// suppressed. A too-short or unknown-family slice fails closed
+/// (suppress).
+#[inline]
+pub(in crate::afxdp) fn source_is_invalid_for_icmp_error(addr_family: u8, packet: &[u8]) -> bool {
+    match addr_family as i32 {
+        libc::AF_INET => {
+            // IPv4 source is header bytes 12..16.
+            let Some(src) = packet.get(12..16) else {
+                return true;
+            };
+            let src = Ipv4Addr::new(src[0], src[1], src[2], src[3]);
+            src.is_unspecified() || src.is_loopback() || src.is_multicast() || src.is_broadcast()
+        }
+        libc::AF_INET6 => {
+            // IPv6 source is header bytes 8..24. IPv6 has no broadcast;
+            // multicast (ff00::/8) covers the group case.
+            let Some(src) = packet.get(8..24) else {
+                return true;
+            };
+            let src = Ipv6Addr::from(match <[u8; 16]>::try_from(src) {
+                Ok(addr) => addr,
+                Err(_) => return true,
+            });
+            src.is_unspecified() || src.is_loopback() || src.is_multicast()
+        }
+        // Unknown family — fail closed (suppress). Mirrors the
+        // destination predicate's "suppress on anything we could not
+        // classify" contract.
+        _ => true,
+    }
+}
+
 /// #2325: RFC 1812 §4.3.2.7 / RFC 4443 §2.4(e) — a router MUST NOT
 /// originate an ICMP/ICMPv6 *error* in reply to a datagram that was
 /// delivered as a link-layer (L2) broadcast or multicast. The IEEE 802

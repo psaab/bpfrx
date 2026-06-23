@@ -64,8 +64,9 @@ pub(in crate::afxdp) use inspect::{
     authoritative_forward_ports, decode_frame_summary, dest_is_multicast_or_broadcast,
     forward_tuple_mismatch_reason, ipv4_is_any_fragment, ipv4_is_non_first_fragment,
     ipv6_is_any_fragment, ipv6_is_non_first_fragment, is_any_fragment, is_non_first_fragment,
-    l2_dst_is_group_or_broadcast, parse_session_flow, term_match_extra_from_frame,
-    term_match_extra_from_frame_fwd, term_match_extra_from_meta, try_parse_metadata,
+    l2_dst_is_group_or_broadcast, parse_session_flow, source_is_invalid_for_icmp_error,
+    term_match_extra_from_frame, term_match_extra_from_frame_fwd, term_match_extra_from_meta,
+    try_parse_metadata,
 };
 
 // #989: TCP-specific inspection + mutation kernels relocated from

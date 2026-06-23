@@ -236,6 +236,16 @@ pub(in crate::afxdp) fn ptb_reply_suppressed(
     if is_non_first_fragment(packet, meta.addr_family) {
         return true;
     }
+    // #2367: never generate a PTB in reply to a datagram whose IP SOURCE
+    // is not a single unicast host (unspecified, loopback, multicast, or
+    // — for IPv4 — broadcast). The PTB is addressed to the trigger's
+    // source, so a forbidden source would produce spoofable ICMP
+    // backscatter. Routes through the shared predicate so the PTB,
+    // reject, and Time-Exceeded paths agree on the bad-source set
+    // (RFC 1812 §4.3.2.7 / RFC 4443 §2.4(e)).
+    if source_is_invalid_for_icmp_error(meta.addr_family, packet) {
+        return true;
+    }
     // #2314: never generate a PTB in reply to a datagram whose IP
     // destination was multicast or broadcast.
     if dest_is_multicast_or_broadcast(meta.addr_family, packet) {
