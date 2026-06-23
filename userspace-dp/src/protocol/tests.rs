@@ -1682,6 +1682,32 @@ fn process_status_event_stream_fields_wire_keys_1642() {
     assert_eq!(value["event_stream_write_stalls"], 17u64);
 }
 
+#[test]
+fn process_status_replay_evictions_wire_key_2382() {
+    let status = ProcessStatus {
+        event_stream_replay_evictions: 9,
+        ..Default::default()
+    };
+    let value: serde_json::Value =
+        serde_json::to_value(&status).expect("serialize ProcessStatus");
+    // #2382: the replay-buffer eviction telemetry-loss counter must survive
+    // the wire under its exact key so the Go status adapter and Prometheus
+    // collector can surface it.
+    assert_eq!(value["event_stream_replay_evictions"], 9u64);
+
+    // Round-trip with the key absent (legacy helper) must default to 0, not
+    // fail to decode (#[serde(default)]).
+    let mut legacy = serde_json::to_value(ProcessStatus::default())
+        .expect("serialize default ProcessStatus");
+    legacy
+        .as_object_mut()
+        .expect("object")
+        .remove("event_stream_replay_evictions");
+    let decoded: ProcessStatus =
+        serde_json::from_value(legacy).expect("decode legacy ProcessStatus");
+    assert_eq!(decoded.event_stream_replay_evictions, 0);
+}
+
 // #1863 Step-0: round-trip + omitempty pin for the per-worker v8
 // lease claim-flow vectors. The wire keys feed
 // pkg/dataplane/userspace/protocol.go and the Prometheus counters

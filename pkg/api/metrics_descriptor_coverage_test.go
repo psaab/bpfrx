@@ -316,8 +316,11 @@ func populatedCoverageStatus() dpuserspace.ProcessStatus {
 			PolicyDenyDrops: 1, ScreenDropDrops: 4, FilterLogDrops: 9,
 			UnknownFrameDrops: 3,
 		},
-		EventStreamSent:               101,
-		EventStreamDropped:            7,
+		EventStreamSent:    101,
+		EventStreamDropped: 7,
+		// #2382: replay-buffer eviction telemetry-loss counter — surfaced under
+		// the producer-frames metric with the "replay_evicted" label.
+		EventStreamReplayEvictions:    3,
 		NeighborWarmDropsTotal:        2,
 		NeighborWarmDisconnectedTotal: 0,
 		// #1782 cold-start capture instrumentation: drive all three new

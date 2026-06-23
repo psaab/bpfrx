@@ -11576,3 +11576,33 @@ top.
   pkg/api/metrics.go, pkg/api/metrics_descriptors.go, pkg/api/metrics_userspace.go,
   pkg/api/metrics_descriptor_coverage_test.go,
   docs/userspace-dataplane-architecture.md
+
+## #2382 — count RT_FLOW replay-buffer eviction as telemetry loss (codex review-030 finding 2)
+
+- **Timestamp**: 2026-06-23
+- **Action**: Added a distinct telemetry-loss counter for replay-buffer
+  eviction. The event-stream replay buffer (`REPLAY_BUFFER_CAPACITY` = 4096)
+  evicts the oldest accepted-and-enqueued frame when it wraps before the daemon
+  ACKs; that frame was already counted in `event_stream_sent` at enqueue, so its
+  silent loss was invisible to operators. Split the buffer-full eviction into a
+  new `evict_replay_frame` (increments `frames_replay_evicted`) distinct from
+  `pop_replay_frame` (ACK-trim + shutdown drain — acknowledged removal, NOT a
+  loss, must NOT count). Exposed end-to-end mirroring #2381/#2375: Rust atomic →
+  EventStreamStats.replay_evictions → ProcessStatus.event_stream_replay_evictions
+  (serde rename + default) → Go ProcessStatus.EventStreamReplayEvictions
+  (omitempty, matching tag) → Prometheus
+  `xpf_userspace_event_stream_producer_frames_total{outcome="replay_evicted"}`
+  + `show` status line. Regenerated protocol_wire_v1.json (one new key:
+  event_stream_replay_evictions). Tests: Rust eviction-counts (fail-on-revert),
+  ack-trim-does-not-count, stats-surface, ProcessStatus wire-key + serde-default
+  round-trip; Go Parity1642 decode + missing-key-defaults-0 + Prometheus
+  replay_evicted/write_stalled label assertions. Doc: docs/session-sync-design.md.
+- **File(s)**: userspace-dp/src/event_stream/mod.rs,
+  userspace-dp/src/event_stream/tests.rs, userspace-dp/src/server/helpers.rs,
+  userspace-dp/src/server/lifecycle.rs, userspace-dp/src/protocol/control.rs,
+  userspace-dp/src/protocol/tests.rs,
+  userspace-dp/tests/fixtures/protocol_wire_v1.json,
+  pkg/dataplane/userspace/protocol.go, pkg/dataplane/userspace/protocol_test.go,
+  pkg/dataplane/userspace/format/status.go, pkg/api/metrics_userspace.go,
+  pkg/api/metrics_test.go, pkg/api/metrics_descriptor_coverage_test.go,
+  docs/session-sync-design.md

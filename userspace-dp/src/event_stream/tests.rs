@@ -309,6 +309,105 @@ fn dataplane_event_budget_releases_when_replay_eviction_drops_frame() {
     release_replay_dataplane_event_queue_budget(&shared, &mut replay_buf);
 }
 
+// #2382: replay-buffer eviction (buffer wrapped at capacity before ACK) is a
+// real telemetry loss and must be counted; ACK-trim (acknowledged-frame
+// removal) is NOT a loss and must NOT bump the eviction counter. These tests
+// fail if the increment is removed or moved into the shared pop path.
+
+#[test]
+fn replay_buffer_eviction_counts_telemetry_loss_2382() {
+    let shared = Arc::new(EventStreamShared::new());
+    let mut replay_buf: VecDeque<EventFrame> = VecDeque::with_capacity(REPLAY_BUFFER_CAPACITY);
+
+    // Fill the replay buffer exactly to capacity — no eviction yet.
+    for seq in 1..=REPLAY_BUFFER_CAPACITY as u64 {
+        push_replay_frame(&shared, &mut replay_buf, EventFrame::encode_drain_complete(seq));
+    }
+    assert_eq!(replay_buf.len(), REPLAY_BUFFER_CAPACITY);
+    assert_eq!(
+        shared.frames_replay_evicted.load(Ordering::Relaxed),
+        0,
+        "filling to capacity must not evict anything"
+    );
+
+    // Push N more frames past capacity: each wraps the buffer and evicts the
+    // oldest unACKed frame. The counter must go 0 -> N. This assertion FAILS
+    // (stays 0) if the eviction increment in `evict_replay_frame` is removed.
+    let overflow = 5u64;
+    for seq in 0..overflow {
+        push_replay_frame(
+            &shared,
+            &mut replay_buf,
+            EventFrame::encode_drain_complete(REPLAY_BUFFER_CAPACITY as u64 + 1 + seq),
+        );
+    }
+    assert_eq!(replay_buf.len(), REPLAY_BUFFER_CAPACITY);
+    assert_eq!(
+        shared.frames_replay_evicted.load(Ordering::Relaxed),
+        overflow,
+        "each buffer-full wrap must count exactly one replay eviction"
+    );
+    // And the surviving window starts past the evicted prefix.
+    assert_eq!(replay_buf.front().map(|f| f.seq), Some(overflow + 1));
+}
+
+#[test]
+fn ack_trim_does_not_count_as_replay_eviction_2382() {
+    let shared = Arc::new(EventStreamShared::new());
+    let mut replay_buf: VecDeque<EventFrame> = VecDeque::new();
+
+    // Buffer well under capacity so no wrap occurs.
+    for seq in 1..=10u64 {
+        push_replay_frame(&shared, &mut replay_buf, EventFrame::encode_drain_complete(seq));
+    }
+    assert_eq!(shared.frames_replay_evicted.load(Ordering::Relaxed), 0);
+
+    // Simulate the MSG_ACK trim path: acked_seq = 5 removes the first 5 frames
+    // via `pop_replay_frame`. Those frames were DELIVERED (acknowledged), not
+    // lost — the eviction counter must stay 0.
+    let acked_seq = 5u64;
+    while let Some(front) = replay_buf.front() {
+        if front.seq <= acked_seq {
+            pop_replay_frame(&shared, &mut replay_buf);
+        } else {
+            break;
+        }
+    }
+    assert_eq!(replay_buf.len(), 5);
+    assert_eq!(replay_buf.front().unwrap().seq, 6);
+    assert_eq!(
+        shared.frames_replay_evicted.load(Ordering::Relaxed),
+        0,
+        "ACK-trim is acknowledged removal, not a telemetry loss — must not \
+         bump the replay-eviction counter"
+    );
+
+    // Shutdown drain (release_replay_dataplane_event_queue_budget → pop) also
+    // must not count as eviction.
+    release_replay_dataplane_event_queue_budget(&shared, &mut replay_buf);
+    assert_eq!(replay_buf.len(), 0);
+    assert_eq!(
+        shared.frames_replay_evicted.load(Ordering::Relaxed),
+        0,
+        "shutdown drain must not bump the replay-eviction counter"
+    );
+}
+
+#[test]
+fn replay_evictions_surface_in_event_stream_stats_2382() {
+    let sender = EventStreamSender {
+        tx: mpsc::sync_channel(1).0,
+        shared: Arc::new(EventStreamShared::new()),
+        io_thread: None,
+        stop: Arc::new(AtomicBool::new(false)),
+    };
+    sender
+        .shared
+        .frames_replay_evicted
+        .store(42, Ordering::Relaxed);
+    assert_eq!(sender.stats().replay_evictions, 42);
+}
+
 // #2381: the write-backlog cap converts a wedged daemon reader from
 // unbounded helper heap growth into bounded, counted telemetry loss at the
 // already-bounded mpsc channel. These tests fail if the cap is removed or the

@@ -753,6 +753,7 @@
     "event_stream_acked": 0,
     "event_stream_connected": false,
     "event_stream_dropped": 0,
+    "event_stream_replay_evictions": 0,
     "event_stream_sent": 0,
     "event_stream_seq": 0,
     "event_stream_write_stalls": 0,

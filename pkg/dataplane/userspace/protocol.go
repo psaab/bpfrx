@@ -435,9 +435,9 @@ type DestinationNATRuleSnapshot struct {
 	// normalized (trim + lower-case) on both sides before resolution, and an
 	// unresolvable token is rejected at commit by
 	// validateDestinationNATProtocolStrict.
-	Protocol           string   `json:"protocol,omitempty"`
-	PoolAddress        string   `json:"pool_address"`
-	PoolPort           uint16   `json:"pool_port,omitempty"`
+	Protocol    string `json:"protocol,omitempty"`
+	PoolAddress string `json:"pool_address"`
+	PoolPort    uint16 `json:"pool_port,omitempty"`
 	// CounterID is the compiler-assigned per-rule translation hit counter ID
 	// (stable key-derived hash, non-zero; 0 means "no counter"). All expanded
 	// (protocol, port) tuples of the same DNAT rule share one counter ID so
@@ -755,9 +755,9 @@ type ProcessStatus struct {
 	// *EventStreamStatus above carries different, Go-populated counters
 	// (frames_read, decode_errors) the Rust helper never emits. JSON tags
 	// MUST match Rust serde rename(...) exactly.
-	EventStreamConnected bool                      `json:"event_stream_connected,omitempty"`
-	EventStreamSeq       uint64                    `json:"event_stream_seq,omitempty"`
-	EventStreamAcked     uint64                    `json:"event_stream_acked,omitempty"`
+	EventStreamConnected bool   `json:"event_stream_connected,omitempty"`
+	EventStreamSeq       uint64 `json:"event_stream_seq,omitempty"`
+	EventStreamAcked     uint64 `json:"event_stream_acked,omitempty"`
 	// EventStreamWriteStalls counts I/O cycles in which the helper's
 	// event-stream socket-write backlog hit its cap and the helper stopped
 	// draining the bounded channel because the daemon reader was wedged
@@ -766,8 +766,18 @@ type ProcessStatus struct {
 	// is not draining the socket; the forwarding plane is unaffected. JSON tag
 	// MUST match the Rust serde rename(...) exactly.
 	EventStreamWriteStalls uint64 `json:"event_stream_write_stalls,omitempty"`
-	CoSInterfaces        []CoSInterfaceStatus      `json:"cos_interfaces,omitempty"`
-	PolicyRuleCounters   []PolicyRuleCounterStatus `json:"policy_rule_counters,omitempty"`
+	// EventStreamReplayEvictions counts accepted RT_FLOW / dataplane-telemetry
+	// frames the helper evicted from its replay buffer when the buffer wrapped
+	// at capacity before the daemon ACKed them (#2382). These frames were
+	// already counted in EventStreamSent at enqueue but are permanently lost
+	// after reconnect, so a growing value means telemetry was dropped via
+	// replay-buffer eviction (a disconnected or non-ACKing daemon let the
+	// window wrap). It is distinct from ACK-trim (acknowledged-frame removal,
+	// which is NOT a loss and is NOT counted here). JSON tag MUST match the
+	// Rust serde rename(...) exactly.
+	EventStreamReplayEvictions uint64                    `json:"event_stream_replay_evictions,omitempty"`
+	CoSInterfaces              []CoSInterfaceStatus      `json:"cos_interfaces,omitempty"`
+	PolicyRuleCounters         []PolicyRuleCounterStatus `json:"policy_rule_counters,omitempty"`
 	// NATRuleCounters carries the userspace dataplane's per-rule SNAT/DNAT/
 	// static-NAT translation hit counters keyed by the compiler-assigned
 	// counter ID (#2218). The Go control plane mirrors these into the legacy
