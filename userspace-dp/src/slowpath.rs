@@ -407,7 +407,57 @@ pub(crate) fn open_tun(name: &str) -> Result<(std::fs::File, String), String> {
     // reverse route still points at the real egress interface. Disable
     // per-device rp_filter so the kernel accepts those packets.
     set_ipv4_sysctl(&actual_name, "rp_filter", "0")?;
+    // The kernel computes the effective rp_filter for a packet as
+    // max(conf/all/rp_filter, conf/<dev>/rp_filter) (see
+    // Documentation/networking/ip-sysctl.rst). So the per-device 0 we just
+    // wrote is IGNORED if conf/all/rp_filter is non-zero (strict=1 / loose=2,
+    // a common Debian/Ubuntu default) — every slow-path reinjected IPv4 packet
+    // would then be silently dropped as a reverse-path failure (#2378). We do
+    // NOT mutate the host-global conf/all knob here (the helper owns no
+    // host-global sysctls); instead emit a one-time, operator-visible warning
+    // at TUN bringup. This is bringup-only, never per-packet.
+    let all_rpf = read_all_rp_filter(ALL_RP_FILTER_PATH);
+    if let Some(line) = rp_filter_all_warning(&actual_name, all_rpf) {
+        eprintln!("{line}");
+    }
     Ok((tun, actual_name))
+}
+
+/// Production default path to the host-global IPv4 reverse-path-filter sysctl.
+/// `read_all_rp_filter` takes the path as a parameter, so tests pass their own
+/// temp-file path directly; this constant is only the live-`/proc` default that
+/// `open_tun` reads.
+const ALL_RP_FILTER_PATH: &str = "/proc/sys/net/ipv4/conf/all/rp_filter";
+
+/// Read the integer value of `conf/all/rp_filter` from `path`. Returns `None`
+/// if the file is missing or unparsable (treated as "cannot determine, do not
+/// warn") so a read failure never produces a spurious warning.
+fn read_all_rp_filter(path: &str) -> Option<i32> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    raw.trim().parse::<i32>().ok()
+}
+
+/// Decide whether to warn that a non-zero conf/all/rp_filter will drop
+/// slow-path reinjection.
+///
+/// The kernel uses max(conf/all/rp_filter, conf/<dev>/rp_filter), so a non-zero
+/// conf/all/rp_filter defeats reverse-path acceptance on the slow-path TUN
+/// regardless of the per-device value. The message states the hazard from the
+/// all-knob directly (it does NOT assert that the per-device 0 was written), so
+/// it is accurate whether or not the per-device write succeeded. Returns
+/// `Some(warning_line)` when `all_rpf` is a known non-zero value, `None` when
+/// it is 0 or unknown. Seamed (takes the already-read value) so it is
+/// unit-testable without touching live /proc.
+fn rp_filter_all_warning(dev: &str, all_rpf: Option<i32>) -> Option<String> {
+    match all_rpf {
+        Some(v) if v != 0 => Some(format!(
+            "xpf-ha: WARNING net.ipv4.conf.all.rp_filter={v} is non-zero; the \
+             kernel uses max(all,dev) so slow-path reinjected IPv4 packets on \
+             TUN {dev} will be SILENTLY DROPPED until \
+             'sysctl -w net.ipv4.conf.all.rp_filter=0' is set (#2378)"
+        )),
+        _ => None,
+    }
 }
 
 fn set_if_up(name: &str) -> Result<(), String> {
@@ -538,6 +588,59 @@ impl IfReq {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #2378 fail-on-revert: when conf/all/rp_filter is strict (1) or loose (2),
+    /// the per-device rp_filter=0 we write on the slow-path TUN is overridden by
+    /// the kernel's max(all, dev) rule, so reinjected IPv4 packets are dropped.
+    /// `rp_filter_all_warning` MUST return a warning in that case. If the check
+    /// is removed (helper always returns None), these assertions fail.
+    #[test]
+    fn rp_filter_all_warning_fires_on_strict_and_loose() {
+        let strict = rp_filter_all_warning("xpf-usp0", Some(1));
+        assert!(strict.is_some(), "all=1 (strict) must warn");
+        assert!(strict.unwrap().contains("rp_filter"));
+
+        let loose = rp_filter_all_warning("xpf-usp0", Some(2));
+        assert!(loose.is_some(), "all=2 (loose) must warn");
+        let msg = loose.unwrap();
+        assert!(msg.contains("xpf-usp0"), "warning names the device");
+        assert!(msg.contains("=2"), "warning reports the offending value");
+    }
+
+    /// When conf/all/rp_filter is 0 (or unknown/unparsable) the per-device 0 is
+    /// effective, so the helper must stay quiet — no spurious operator warning.
+    #[test]
+    fn rp_filter_all_warning_quiet_when_zero_or_unknown() {
+        assert!(
+            rp_filter_all_warning("xpf-usp0", Some(0)).is_none(),
+            "all=0 must not warn"
+        );
+        assert!(
+            rp_filter_all_warning("xpf-usp0", None).is_none(),
+            "unknown all value must not warn"
+        );
+    }
+
+    /// The file-reading seam parses the sysctl value and tolerates trailing
+    /// whitespace; a missing or garbage file yields None (do-not-warn).
+    #[test]
+    fn read_all_rp_filter_parses_and_tolerates_missing() {
+        let dir = std::env::temp_dir().join(format!("xpf-rpf-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let ok = dir.join("all_rp_filter");
+        std::fs::write(&ok, "1\n").unwrap();
+        assert_eq!(read_all_rp_filter(ok.to_str().unwrap()), Some(1));
+
+        std::fs::write(&ok, "  2  ").unwrap();
+        assert_eq!(read_all_rp_filter(ok.to_str().unwrap()), Some(2));
+
+        let missing = dir.join("does-not-exist");
+        assert_eq!(read_all_rp_filter(missing.to_str().unwrap()), None);
+
+        std::fs::write(&ok, "garbage").unwrap();
+        assert_eq!(read_all_rp_filter(ok.to_str().unwrap()), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[test]
     fn rate_limiter_refills_after_window() {

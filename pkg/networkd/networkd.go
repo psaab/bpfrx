@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -243,14 +244,27 @@ func (m *Manager) Apply(interfaces []InterfaceConfig) error {
 	return nil
 }
 
+// procSysNetRoot is the root of the IPv4 sysctl tree. It is a package var
+// (not a const) so tests can point the slow-path rp_filter handling at a
+// temp-file fixture instead of the live /proc.
+var procSysNetRoot = "/proc/sys/net/ipv4"
+
 // restoreSlowPathRPFilter re-disables rp_filter on the userspace dataplane's
 // slow-path TUN device after a networkctl reload. networkd resets sysctls to
 // defaults (rp_filter=2) on all interfaces during reload, which breaks
 // locally-originated traffic delivery via the TUN (the kernel drops packets
 // whose source route doesn't point at the TUN interface).
+//
+// The kernel computes the effective rp_filter for a packet as
+// max(conf/all/rp_filter, conf/<dev>/rp_filter), so the per-device 0 we write
+// here is ignored if conf/all/rp_filter is non-zero (a common Debian/Ubuntu
+// default). We do NOT mutate the host-global conf/all knob — instead, when it
+// is non-zero, we emit a one-time operator-visible warning that slow-path
+// reinjection will be dropped until it is lowered (#2378). This runs only on
+// the reload/clear path, never per-packet.
 func restoreSlowPathRPFilter() {
 	const tunName = "xpf-usp0"
-	path := fmt.Sprintf("/proc/sys/net/ipv4/conf/%s/rp_filter", tunName)
+	path := fmt.Sprintf("%s/conf/%s/rp_filter", procSysNetRoot, tunName)
 	// BestEffortKernelKnob (#1894): procfs has no rename, so the
 	// fsatomic writers are impossible here by construction — the direct
 	// write is correct, not an oversight.
@@ -261,6 +275,33 @@ func restoreSlowPathRPFilter() {
 		}
 		slog.Warn("failed to restore rp_filter on slow-path TUN", "path", path, "err", err)
 	}
+	warnIfAllRPFilterOverrides(tunName)
+}
+
+// warnIfAllRPFilterOverrides emits a loud warning when net.ipv4.conf.all.rp_filter
+// is non-zero. The kernel uses max(conf/all/rp_filter, conf/<dev>/rp_filter), so
+// a non-zero conf/all knob silently drops slow-path reinjected IPv4 packets
+// regardless of the per-device value (#2378). The message states the hazard from
+// the all-knob directly and does NOT assert that the per-device write above
+// succeeded — so it stays accurate when the per-device write failed (in which
+// case the drop hazard is in fact MORE acute, and suppressing the warning would
+// hide a still-relevant signal). A missing or unparsable conf/all/rp_filter is
+// treated as "cannot determine" and stays quiet so a read failure never produces
+// a spurious warning.
+func warnIfAllRPFilterOverrides(tunName string) {
+	allPath := fmt.Sprintf("%s/conf/all/rp_filter", procSysNetRoot)
+	raw, err := os.ReadFile(allPath)
+	if err != nil {
+		return
+	}
+	val, err := strconv.Atoi(strings.TrimSpace(string(raw)))
+	if err != nil || val == 0 {
+		return
+	}
+	slog.Warn("net.ipv4.conf.all.rp_filter is non-zero; kernel uses max(all,dev) "+
+		"so slow-path reinjected IPv4 packets will be SILENTLY DROPPED until "+
+		"'sysctl -w net.ipv4.conf.all.rp_filter=0' is set",
+		"tun", tunName, "all_rp_filter", val, "issue", 2378)
 }
 
 // Clear removes all xpf-managed networkd files and reloads.

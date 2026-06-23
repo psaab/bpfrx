@@ -457,6 +457,21 @@ A TUN device (`xpf-usp0`) for packets that need kernel processing:
     snapshot MTU different from the live TUN's creation MTU, the reconcile
     path emits a one-shot (per distinct value) `xpf-ha:` warning so the
     stale-until-restart window is diagnosable rather than silent.
+- **Reverse-path filter (#2378):** reinjected IPv4 replies arrive on the
+  TUN but their reverse route still points at the real egress interface,
+  so `open_tun` writes `conf/<dev>/rp_filter=0`. The kernel, however, uses
+  the **maximum** of `conf/all/rp_filter` and `conf/<dev>/rp_filter`, so a
+  non-zero `net.ipv4.conf.all.rp_filter` (strict=1 / loose=2 — a common
+  Debian/Ubuntu default) overrides the per-device 0 and silently drops
+  every reinjected IPv4 packet. The helper does NOT own host-global
+  sysctls, so it does NOT mutate `conf/all/rp_filter`; instead `open_tun`
+  reads `conf/all/rp_filter` once at bringup and emits a loud `xpf-ha:`
+  warning (`rp_filter_all_warning`) when it is non-zero, instructing the
+  operator to `sysctl -w net.ipv4.conf.all.rp_filter=0`. The Go reload
+  path (`networkd.restoreSlowPathRPFilter`) re-asserts the per-device 0
+  after a `networkctl reload` and mirrors the same `conf/all` warning
+  (`warnIfAllRPFilterOverrides`). Both checks are bringup/reload-only,
+  never per-packet.
 
 ### 3. Go Manager (`pkg/dataplane/userspace/manager.go`)
 

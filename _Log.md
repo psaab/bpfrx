@@ -11944,3 +11944,28 @@ top.
   userspace-dp/src/afxdp/coordinator/mod.rs,
   userspace-dp/src/afxdp/coordinator/reconcile/snapshot.rs,
   docs/userspace-dataplane-architecture.md, _Log.md
+
+- **Timestamp**: 2026-06-23
+- **Action**: #2378 — slow-path TUN rp_filter conf/all override warning.
+  Per-device rp_filter=0 on the slow-path TUN is overridden by the kernel
+  (effective = max(conf/all, conf/<dev>)), so a non-zero
+  net.ipv4.conf.all.rp_filter silently drops reinjected IPv4 packets.
+  Design fork resolved to the WARNING path: the helper owns no host-global
+  sysctls (grep conf/all userspace-dp/src → none), so it does NOT mutate
+  conf/all/rp_filter; it reads it once at bringup and emits a loud xpf-ha:
+  warning. Mirrored on the Go reload path (warnIfAllRPFilterOverrides).
+  Seamed helpers (rp_filter_all_warning / read_all_rp_filter; procSysNetRoot
+  package var) with fail-on-revert unit tests on both sides.
+- **File(s)**: userspace-dp/src/slowpath.rs, pkg/networkd/networkd.go,
+  pkg/networkd/rpfilter_test.go, docs/userspace-dataplane-architecture.md,
+  _Log.md
+
+- **Timestamp**: 2026-06-23
+- **Action**: #2378 PR #2459 review folds — (1) corrected the ALL_RP_FILTER_PATH
+  doc comment (read_all_rp_filter takes the path as a parameter; the constant is
+  only the production default, not a test substitution seam). (2) Reworded both
+  the Rust eprintln! and the Go slog.Warn so the message states the all-knob
+  hazard directly and no longer asserts the per-device rp_filter=0 was written
+  — accurate even when the per-device write failed (drop hazard is then MORE
+  acute, so the warning is deliberately NOT suppressed). Tests/build green.
+- **File(s)**: userspace-dp/src/slowpath.rs, pkg/networkd/networkd.go, _Log.md
