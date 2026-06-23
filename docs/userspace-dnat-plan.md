@@ -348,3 +348,39 @@ Two robustness fixes (the DNAT sibling of #2398 SNAT):
    any" from "scoped rule, zero entries parsed -> match none". A scoped rule
    whose entries all fail to parse matches nothing rather than reverting to
    match-any. A mix of valid + garbage entries keeps the valid prefixes.
+
+## 11. Multiple destination-addresses (#2395)
+
+Junos DNAT `match destination-address [ A B C ]` publishes the SAME
+translation for several external destinations. The compiler already parsed the
+full list into `rule.Match.DestinationAddresses` (with `DestinationAddress`
+mirroring the first element), but `buildDestinationNATSnapshots` iterated only
+the singular `DestinationAddress`. The rule therefore collapsed to its FIRST
+destination — traffic to B and C was forwarded untranslated (configured
+translation silently not applied; HIGH).
+
+The DNAT table is keyed by exact destination IP (`DnatKey.dst_ip`,
+`nat/destination.rs`), so the natural fix is **one snapshot entry per
+destination** sharing the rule's pool/port/counter — no wire change (the
+existing scalar `destination_address` field is reused; `protocol_wire_v1.json`
+is unchanged).
+
+- `buildDestinationNATSnapshots` (`nat.go`) now builds `destAddrs` from
+  `rule.Match.DestinationAddresses` with a singular `DestinationAddress`
+  fallback (mirrors the #2394 source-address idiom), then emits one
+  `DestinationNATRuleSnapshot` per destination inside the existing
+  app-term/port loop. Each destination has its CIDR suffix stripped (DNAT
+  matches exact host IPs) and is validated with `net.ParseIP`.
+- **Fail-closed on all-malformed** — a destination that is empty or not a bare
+  host IP is skipped. If a rule has destinations but EVERY one is malformed, no
+  snapshot row is emitted, so the rule matches NOTHING rather than broadening
+  to match-any. (The Rust `from_snapshots` also `continue`s on a destination it
+  cannot `IpAddr::parse`, so the fail-closed posture holds on both sides.)
+- **Composition with #2394** — the per-destination loop is nested inside the
+  source-constraint setup, so every emitted per-destination snapshot carries
+  the same `SourceAddresses`. A source-scoped multi-destination DNAT fires for
+  each destination only when the source also matches; neither constraint is
+  regressed.
+
+The rewrite target (translated destination/port from the pool) is unchanged —
+only the MATCH set grows from one destination to all configured destinations.

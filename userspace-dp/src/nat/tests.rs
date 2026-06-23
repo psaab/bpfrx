@@ -1136,6 +1136,135 @@ fn dnat_source_scoped_mixed_valid_and_malformed_keeps_valid() {
 }
 
 #[test]
+fn dnat_multiple_destinations_each_fire() {
+    // #2395: a DNAT rule with `match destination-address [ A B C ]` is emitted
+    // by the Go builder as ONE snapshot per destination sharing the rule's
+    // pool/port/counter. The dataplane keys DNAT by exact dst_ip, so each
+    // destination must install its own table entry and translate. Before #2395
+    // only the FIRST destination got a snapshot, so traffic to B and C was
+    // forwarded untranslated. FAIL-ON-REVERT: with the collapse bug only the
+    // first lookup returns Some — the B and C lookups assert Some here.
+    let dests = ["203.0.113.20", "203.0.113.21", "203.0.113.22"];
+    let snaps: Vec<DestinationNATRuleSnapshot> = dests
+        .iter()
+        .map(|d| DestinationNATRuleSnapshot {
+            name: "multi-dnat".to_string(),
+            destination_address: d.to_string(),
+            destination_port: 443,
+            protocol: "tcp".to_string(),
+            pool_address: "10.0.0.5".to_string(),
+            pool_port: 8443,
+            ..DestinationNATRuleSnapshot::default()
+        })
+        .collect();
+    let table = DnatTable::from_snapshots(&snaps, &crate::nat::NatCounterStore::default());
+    for d in dests {
+        let got = table.lookup(
+            PROTO_TCP,
+            "198.51.100.1".parse().unwrap(),
+            d.parse().unwrap(),
+            443,
+            "",
+        );
+        assert_eq!(
+            got.and_then(|dec| dec.rewrite_dst),
+            Some("10.0.0.5".parse().unwrap()),
+            "destination {d} of a multi-dest DNAT must be translated (collapse bug drops B/C)"
+        );
+        assert_eq!(
+            got.unwrap().rewrite_dst_port,
+            Some(8443),
+            "destination {d} must rewrite the port to the shared pool port"
+        );
+    }
+}
+
+#[test]
+fn dnat_multiple_destinations_v6_each_fire() {
+    // #2395 IPv6 sibling: every v6 destination in the bracket list translates.
+    let dests = ["2001:db8:beef::10", "2001:db8:beef::11"];
+    let snaps: Vec<DestinationNATRuleSnapshot> = dests
+        .iter()
+        .map(|d| DestinationNATRuleSnapshot {
+            name: "multi-dnat-v6".to_string(),
+            destination_address: d.to_string(),
+            destination_port: 443,
+            protocol: "tcp".to_string(),
+            pool_address: "2001:db8:dead::5".to_string(),
+            pool_port: 0,
+            ..DestinationNATRuleSnapshot::default()
+        })
+        .collect();
+    let table = DnatTable::from_snapshots(&snaps, &crate::nat::NatCounterStore::default());
+    for d in dests {
+        let got = table.lookup(
+            PROTO_TCP,
+            "2001:db8:aaaa::1".parse().unwrap(),
+            d.parse().unwrap(),
+            443,
+            "",
+        );
+        assert_eq!(
+            got.and_then(|dec| dec.rewrite_dst),
+            Some("2001:db8:dead::5".parse().unwrap()),
+            "v6 destination {d} of a multi-dest DNAT must be translated"
+        );
+    }
+}
+
+#[test]
+fn dnat_multiple_destinations_compose_with_source_scope() {
+    // #2395 + #2394: a multi-destination DNAT that is ALSO source-scoped must
+    // fire for each destination ONLY when the source matches. Each per-dest
+    // snapshot carries the same source constraint (the Go builder shares
+    // sourceAddrs across the destination loop). FAIL-ON-REVERT for both: a
+    // dropped destination (collapse) loses B; a dropped source constraint
+    // (#2394) fires for the wrong source.
+    let dests = ["203.0.113.30", "203.0.113.31"];
+    let snaps: Vec<DestinationNATRuleSnapshot> = dests
+        .iter()
+        .map(|d| DestinationNATRuleSnapshot {
+            name: "multi-scoped".to_string(),
+            destination_address: d.to_string(),
+            destination_port: 80,
+            protocol: "tcp".to_string(),
+            pool_address: "10.0.0.5".to_string(),
+            pool_port: 8080,
+            source_addresses: vec!["198.51.100.0/24".to_string()],
+            ..DestinationNATRuleSnapshot::default()
+        })
+        .collect();
+    let table = DnatTable::from_snapshots(&snaps, &crate::nat::NatCounterStore::default());
+    for d in dests {
+        // In-scope source -> both destinations translate.
+        assert!(
+            table
+                .lookup(
+                    PROTO_TCP,
+                    "198.51.100.7".parse().unwrap(),
+                    d.parse().unwrap(),
+                    80,
+                    "",
+                )
+                .is_some(),
+            "in-scope source must DNAT destination {d}"
+        );
+        // Out-of-scope source -> no translation for any destination.
+        assert_eq!(
+            table.lookup(
+                PROTO_TCP,
+                "203.0.113.250".parse().unwrap(),
+                d.parse().unwrap(),
+                80,
+                "",
+            ),
+            None,
+            "out-of-scope source must NOT DNAT destination {d} (#2394 not regressed)"
+        );
+    }
+}
+
+#[test]
 fn dnat_port_aware_reverse() {
     // DNAT: rewrite dst to internal, rewrite dst_port from 80 to 8080
     let decision = NatDecision {
