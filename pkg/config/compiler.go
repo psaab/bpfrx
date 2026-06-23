@@ -942,6 +942,27 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		}
 	}
 
+	// #2396(a)/(3) destination-NAT match-protocol gate. The DNAT `match
+	// protocol <token>` reaches the wire VERBATIM (nodeVal -> rule.Match.Protocol
+	// -> snapshot, with no validation), and the Rust DNAT table drops a token
+	// ip_proto::proto_number cannot resolve (the dataplane backstop). So an
+	// unresolvable `match protocol` (a typo, or a junos-* alias the DNAT path
+	// does not pre-resolve) committed cleanly and then silently translated
+	// nothing — the #2396 silent-drop class. Strict on commit / commit-check
+	// (hard-reject); lenient on load / peer-sync (downgrade to a warning so a
+	// config persisted before this gate existed still boots — #1960 no-brick;
+	// the dataplane drops the inert rule on its own). Shares the
+	// lenientDestNATAddresses flag (same #2396 DNAT silent-drop doctrine). Runs
+	// after the address gate so a malformed-destination error wins first.
+	if err := validateDestinationNATProtocolStrict(cfg); err != nil {
+		if opts.lenientDestNATAddresses {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("destination-nat protocol (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
 	// #2243 DHCP-server static (fixed/reserved) host bindings. Strict on
 	// commit / commit-check (hard-reject a fixed-address that is malformed,
 	// family-mismatched, outside the enclosing pool subnet, or duplicates

@@ -1669,3 +1669,92 @@ func validateDestinationNATAddressesStrict(cfg *Config) error {
 	}
 	return nil
 }
+
+// dnatProtocolResolvable reports whether a DNAT `match protocol` token is one
+// the userspace dataplane can resolve. It is the Go mirror of the Rust
+// ip_proto::proto_number SSOT (userspace-dp/src/ip_proto.rs): the DNAT path
+// emits the token VERBATIM (no junos-* pre-resolution), and proto_number
+// accepts ONLY bare protocol names and a 0-255 number — NOT junos-* aliases
+// (those are resolved by the application path, never the raw match-protocol
+// path). Normalization (trim + lower-case) matches proto_number exactly, so
+// the commit gate and the dataplane agree on the accepted set.
+//
+// This is deliberately a TIGHTER set than filterProtocolResolvable /
+// appid.ProtocolNumber (which add junos-* aliases for the filter/application
+// paths): a junos-* token in a DNAT match-protocol would resolve in those
+// supersets but be DROPPED by proto_number, so accepting it here would
+// re-introduce the #2396 silent drop. Empty ("" = any protocol) is the IP-only
+// wildcard and is always resolvable.
+func dnatProtocolResolvable(token string) bool {
+	switch strings.ToLower(strings.TrimSpace(token)) {
+	case "",
+		"tcp", "udp",
+		"icmp", "icmp6", "icmpv6",
+		"gre", "ospf", "ipip",
+		"egp", "igmp", "pim",
+		"ah", "esp", "sctp", "vrrp":
+		return true
+	default:
+		if n, err := strconv.Atoi(strings.TrimSpace(token)); err == nil && n >= 0 && n < 256 {
+			return true
+		}
+		return false
+	}
+}
+
+// DNATProtocolResolvable exposes dnatProtocolResolvable for a cross-package
+// drift-guard test that asserts this acceptance set agrees with the Rust
+// proto_number SSOT (the two INLINE copies cannot drift silently). TEST seam,
+// not a runtime coupling.
+func DNATProtocolResolvable(token string) bool {
+	return dnatProtocolResolvable(token)
+}
+
+// validateDestinationNATProtocolStrict (#2396 (a)/(3)) hard-rejects a DNAT rule
+// whose `match protocol <token>` is not resolvable by the dataplane
+// (dnatProtocolResolvable / proto_number). The token reaches the snapshot
+// verbatim and the Rust table drops an unresolvable one with no apply failure,
+// so an operator typo (`match protocol grre`) or a junos-* alias the DNAT path
+// does not pre-resolve committed cleanly and silently translated nothing.
+//
+// Only the raw `match protocol` token is gated here. A protocol that comes from
+// a resolved `match application` is validated separately by
+// validateApplicationSpecsStrict (the application's own `protocol` leaf), so it
+// is not re-checked. Rule-sets are walked in sorted name order and rules in
+// configured order for a deterministic first-reported offender. The caller
+// downgrades the error to a warning on the tolerant load / peer-sync path
+// (#1960 no-brick).
+func validateDestinationNATProtocolStrict(cfg *Config) error {
+	if cfg == nil || cfg.Security.NAT.Destination == nil {
+		return nil
+	}
+	rulesets := append([]*NATRuleSet(nil), cfg.Security.NAT.Destination.RuleSets...)
+	sort.SliceStable(rulesets, func(i, j int) bool {
+		if rulesets[i] == nil || rulesets[j] == nil {
+			return rulesets[i] != nil
+		}
+		return rulesets[i].Name < rulesets[j].Name
+	})
+	for _, rs := range rulesets {
+		if rs == nil {
+			continue
+		}
+		for _, rule := range rs.Rules {
+			if rule == nil {
+				continue
+			}
+			// The raw match-protocol token is only emitted when the rule has no
+			// application override (the builder prefers app terms). But gating it
+			// regardless is correct: an unresolvable token can never be a valid
+			// DNAT protocol, application override or not.
+			if !dnatProtocolResolvable(rule.Match.Protocol) {
+				return fmt.Errorf(
+					"destination-nat rule-set %q rule %q: match protocol %q is not a "+
+						"resolvable protocol (known name or 0-255 number); the rule would "+
+						"commit but never translate any traffic",
+					rs.Name, rule.Name, rule.Match.Protocol)
+			}
+		}
+	}
+	return nil
+}
