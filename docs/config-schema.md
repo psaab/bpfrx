@@ -491,6 +491,48 @@ reserved for whole-dataplane selection where a rewrite shim
   `reservations` render, **dotted/uppercase MAC canonicalization**,
   no-binding omits the key).
 
+### #2401 — Security-policy undefined-zone references (commit fail-closed)
+
+A `set security policies from-zone <a> to-zone <b> { policy ... }` stanza
+whose `from-zone` or `to-zone` names a security zone the configuration
+never defines (a typo, or a zone deleted out from under the policy) was
+historically only a `ValidateConfig` **warning** — the commit succeeded.
+The rule was compiled and KEPT, but the userspace dataplane resolves the
+unknown zone name to no zone-id and so never indexes the rule into its
+zone-pair lookup table (`userspace-dp/src/policy.rs` logs `"policy rule
+references unknown zone(s) ... (rule kept, but not indexed)"`). At match
+time the zone pair has no indexed rule, so evaluation falls through to
+`state.default_action`: under a **permit** default this is a silent
+fail-OPEN (a deny rule the operator wrote against a mistyped zone does
+nothing); under a deny default it blackholes with no operator signal
+beyond a stderr line. Junos rejects an undefined zone reference at commit.
+
+**`validatePolicyZoneReferencesStrict`** (`compiler_validate_strict.go`)
+restores that fail-CLOSED parity. It hard-rejects any zone-pair policy
+whose from/to-zone is not a defined `security zones security-zone` and is
+not one of the reserved special tokens **`any`** (Junos wildcard zone),
+**`junos-host`** (reserved self-traffic context), or the empty token (see
+`policyZoneSpecialTokens`). Global policies (`security policies global { }`)
+are NOT iterated — they live in `cfg.Security.GlobalPolicies` with no
+from/to-zone strings and map to the `junos-global` sentinel only when the
+dataplane snapshot is built, so they cannot name an undefined zone.
+
+**Strict/lenient split (flag `lenientPolicyZoneRefs`):** strict on the
+commit / commit-check path (`CompileConfig` — hard-reject), downgraded to
+a `cfg.Warnings` entry on the tolerant load / peer-sync paths
+(`CompileConfigLenient` / `CompileConfigForNodeLenient`) so an
+already-persisted or peer-synced config carrying a stale zone reference
+still BOOTS (#1960 fail-closed-on-load doctrine) — the dataplane drops the
+unindexed rule on its own, so a leniently-loaded bad config is inert. The
+gate runs AFTER `validatePolicyMatchAddressesStrict`, mirroring the sibling
+fail-open validators, so a structural CoS/policer/device-map error and a
+bad match-address still win the first-error slot.
+Regression coverage: `pkg/config/policy_zone_ref_test.go`
+(`TestPolicyUndefinedZoneFailsCommit` — the fail-on-revert guard for both
+an undefined from-zone and to-zone, `TestPolicySpecialZoneTokensCommit` —
+`any`/`junos-host`/global anti-over-reject, `TestPolicyDefinedZonesCommit`,
+`TestPolicyUndefinedZoneLenientDowngradesToWarning`).
+
 ### #2053 — Config secret redaction at JSON/YAML marshal time
 
 The compiled `*config.Config` carries every operator secret verbatim in

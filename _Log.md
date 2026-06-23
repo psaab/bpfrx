@@ -11104,3 +11104,26 @@ top.
     userspace-dp/src/filter/tests.rs,
     userspace-dp/src/afxdp/tx/cos_classify_tests.rs,
     userspace-dp/src/filter/README.md, docs/feature-gaps.md, _Log.md
+
+- **Timestamp**: 2026-06-23
+  - **Action**: #2401 fail-CLOSED security fix — security-policy rules
+    referencing an UNDEFINED security zone are now HARD-REJECTED at commit
+    (Junos parity), closing a silent policy fail-OPEN. Previously such a
+    `from-zone`/`to-zone` was only a `ValidateConfig` warning: the commit
+    succeeded, the rule was compiled and KEPT, but the userspace dataplane
+    resolved the unknown zone name to no zone-id and never indexed the rule
+    into its zone-pair lookup (`userspace-dp/src/policy.rs` "rule kept, but
+    not indexed"), so the zone pair fell through to `state.default_action`
+    — fail-OPEN under a permit default. New strict validator
+    `validatePolicyZoneReferencesStrict` (mirrors
+    `validatePolicyMatchAddressesStrict`): strict on commit/commit-check,
+    downgraded to a warning on the tolerant load/peer-sync paths via the new
+    `lenientPolicyZoneRefs` flag (#1960 no-brick). Special tokens `any`,
+    `junos-host`, and the empty token are exempt; global policies are not
+    iterated. Pre-existing test fixtures that built policies without
+    defining their zones were completed with the missing zone definitions.
+  - **File(s)**: pkg/config/compiler.go,
+    pkg/config/compiler_validate_strict.go,
+    pkg/config/policy_zone_ref_test.go (new),
+    pkg/dataplane/userspace/nested_app_set_policy_test.go,
+    docs/config-schema.md, _Log.md (+ pkg/config test fixtures)

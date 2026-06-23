@@ -377,6 +377,23 @@ type compileOpts struct {
 	// reconcile is dup-pubkey-safe, so a leniently-loaded bad config is
 	// inert. Same doctrine as lenientNATHostMask.
 	lenientWireguardPeers bool
+	// lenientPolicyZoneRefs (#2401) downgrades the security-policy
+	// zone-pair reference gate (validatePolicyZoneReferencesStrict) from a
+	// hard compile error to a cfg.Warnings entry. The strict commit /
+	// commit-check path hard-rejects a `from-zone`/`to-zone` policy stanza
+	// that names a security zone the config never defines. Such a rule is
+	// compiled and kept, but the dataplane resolves its from/to zone name to
+	// no zone-id and so never indexes it into the zone-pair lookup
+	// (userspace-dp/src/policy.rs unknown-zone branch — "rule kept, but not
+	// indexed"); the zone pair then falls through to the default action,
+	// silently failing OPEN under a permit default (or blackholing under a
+	// deny default). ValidateConfig only WARNED on this, so the commit
+	// succeeded with an unenforceable rule. The tolerant load / peer-sync
+	// paths downgrade to a warning so an already-persisted or peer-synced
+	// config carrying a stale zone reference still BOOTS (#1960 no-brick) —
+	// the dataplane drops the unindexed rule independently, so a leniently-
+	// loaded bad config is inert. Same doctrine as lenientPolicyMatchAddress.
+	lenientPolicyZoneRefs bool
 }
 
 // CompileConfig converts a parsed ConfigTree AST into a typed Config struct.
@@ -420,6 +437,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientRibGroupRefs:                true,
 		lenientDHCPStaticBindings:          true,
 		lenientWireguardPeers:              true,
+		lenientPolicyZoneRefs:              true,
 	})
 }
 
@@ -514,6 +532,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientRibGroupRefs:                true,
 		lenientDHCPStaticBindings:          true,
 		lenientWireguardPeers:              true,
+		lenientPolicyZoneRefs:              true,
 	})
 }
 
@@ -857,6 +876,28 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		if opts.lenientPolicyMatchAddress {
 			cfg.Warnings = append(cfg.Warnings,
 				fmt.Sprintf("policy match-address (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
+	// #2401 security-policy zone-pair reference fail-open gate. Strict on
+	// commit / commit-check (hard-reject a `from-zone`/`to-zone` policy
+	// stanza naming an undefined security zone — such a rule was only warned,
+	// then compiled and KEPT, but the dataplane never indexes it into the
+	// zone-pair lookup so the pair falls through to the default action,
+	// failing OPEN under a permit default); lenient on load / peer-sync
+	// (warn so an already-persisted or peer-synced config with a stale zone
+	// reference still boots — #1960 no-brick; the dataplane drops the
+	// unindexed rule on its own, so a leniently-loaded bad config is inert).
+	// Exempts the `any` / `junos-host` / empty special tokens and does not
+	// touch global policies. Runs AFTER the policy match-address gate so a
+	// structural CoS/policer/device-map error and a bad match-address still
+	// win the first-error slot before a zone-reference error.
+	if err := validatePolicyZoneReferencesStrict(cfg); err != nil {
+		if opts.lenientPolicyZoneRefs {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("policy zone reference (downgraded to warning on tolerant path): %v", err))
 		} else {
 			return nil, err
 		}
