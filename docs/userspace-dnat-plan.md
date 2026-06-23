@@ -285,7 +285,32 @@ Initial implementation: use the existing per-binding `dnat_packets` counter (alr
 
 1. **SNAT overwrite bug (existing)**: Current code at `afxdp.rs:2449` overwrites any pre-routing DNAT decision when SNAT matches. The `merge()` fix resolves this for both static NAT and new DNAT.
 
-2. **ICMP DNAT**: ICMP has no ports. Port-matching DNAT doesn't apply to ICMP. IP-only DNAT (port=0) works for ICMP via wildcard lookup.
+2. **ICMP / non-TCP-UDP DNAT** (corrected #2396): ICMP has no ports, so
+   port-matching DNAT doesn't apply to it. An IP-only DNAT (no protocol, no
+   port) now genuinely covers ALL L4 protocols including ICMP/ICMPv6/GRE: the
+   builder emits it with an empty `protocol` and zero port, and the Rust table
+   keys it under a protocol WILDCARD sentinel, with
+   `DnatTable::lookup_with_counter` falling back to that wildcard after the
+   concrete-protocol and wildcard-port lookups miss. A DNAT rule that names a
+   concrete non-TCP/UDP protocol (`protocol gre`, `application junos-icmp-all`,
+   ...) resolves through `ip_proto::proto_number` (mirrors the Go SSOT
+   `appid.ProtocolNumber`) and installs a protocol-scoped entry. The token is
+   normalized (trim + lower-case) on both sides, and an unresolvable
+   `match protocol` token is hard-rejected at commit by
+   `validateDestinationNATProtocolStrict` (lenient-warn on tolerant load)
+   rather than silently dropped.
+
+   The wildcard sentinel is `PROTO_ANY = 256` — `DnatKey.protocol` is a `u16`
+   so the sentinel sits OUTSIDE the 0-255 IANA range and is DISTINCT from every
+   real protocol, including protocol `0` (HOPOPT). The first cut used
+   `PROTO_ANY = 0`, which COLLIDED with HOPOPT: a `protocol 0` DNAT would have
+   keyed under the wildcard and broadened to match every protocol. With the u16
+   key, `protocol 0` is a normal exact match and only `""` (no protocol, no
+   port) uses the wildcard. Before #2396 the Rust builder recognized only
+   `tcp`/`udp`/`""` and SILENTLY DROPPED everything else (`_ => continue`), and
+   `""`+port-0 expanded to TCP+UDP only — so a GRE/ICMP DNAT committed but never
+   reached the dataplane, and an IP-only DNAT did NOT cover ICMP, contradicting
+   the original claim here.
 
 3. **Session key stability**: Forward session key uses the ORIGINAL 5-tuple (pre-DNAT). The translation is carried in `NatDecision`. Matches static NAT pattern.
 

@@ -394,6 +394,23 @@ type compileOpts struct {
 	// the dataplane drops the unindexed rule independently, so a leniently-
 	// loaded bad config is inert. Same doctrine as lenientPolicyMatchAddress.
 	lenientPolicyZoneRefs bool
+	// lenientDestNATAddresses (#2396) downgrades the destination-NAT
+	// destination-address gate (validateDestinationNATAddressesStrict) from a
+	// hard compile error to a cfg.Warnings entry. The strict commit /
+	// commit-check path hard-rejects a DNAT rule whose `match
+	// destination-address` resolves to NO parseable host IP at all — every
+	// configured destination is malformed/empty. The Go snapshot builder skips
+	// each unparseable destination (#2395) and the Rust DNAT table `continue`s
+	// on a destination it cannot parse, so such a rule emits NO table entry and
+	// silently translates NOTHING — an operator who fat-fingered the only
+	// destination gets a committed-but-inert rule with no feedback (the #2396
+	// (c) silent-drop). Hard-rejecting it at commit makes the mistake visible.
+	// The tolerant load / peer-sync paths downgrade to a warning so an
+	// already-persisted or peer-synced config carrying a bad destination still
+	// BOOTS (#1960 no-brick) — the dataplane drops the rule independently, so a
+	// leniently-loaded bad config is inert. Same doctrine as
+	// lenientPolicyZoneRefs / lenientNATHostMask.
+	lenientDestNATAddresses bool
 }
 
 // CompileConfig converts a parsed ConfigTree AST into a typed Config struct.
@@ -438,6 +455,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientDHCPStaticBindings:          true,
 		lenientWireguardPeers:              true,
 		lenientPolicyZoneRefs:              true,
+		lenientDestNATAddresses:            true,
 	})
 }
 
@@ -533,6 +551,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientDHCPStaticBindings:          true,
 		lenientWireguardPeers:              true,
 		lenientPolicyZoneRefs:              true,
+		lenientDestNATAddresses:            true,
 	})
 }
 
@@ -898,6 +917,47 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		if opts.lenientPolicyZoneRefs {
 			cfg.Warnings = append(cfg.Warnings,
 				fmt.Sprintf("policy zone reference (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
+	// #2396(c) destination-NAT destination-address gate. Strict on commit /
+	// commit-check (hard-reject a DNAT rule whose `match destination-address`
+	// resolves to NO parseable host IP — every configured destination is
+	// empty/malformed); lenient on load / peer-sync (downgrade to a warning so
+	// an already-persisted or peer-synced config still boots — #1960 no-brick;
+	// the snapshot builder skips each bad destination and the Rust DNAT table
+	// drops the rule on its own, so a leniently-loaded bad config is inert).
+	// Without this gate such a rule committed cleanly and then silently
+	// translated nothing — the operator had no feedback that the only
+	// destination address was a typo. Runs AFTER the policy gates so a
+	// structural/policy error still wins the first-error slot.
+	if err := validateDestinationNATAddressesStrict(cfg); err != nil {
+		if opts.lenientDestNATAddresses {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("destination-nat address (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
+	// #2396(a)/(3) destination-NAT match-protocol gate. The DNAT `match
+	// protocol <token>` reaches the wire VERBATIM (nodeVal -> rule.Match.Protocol
+	// -> snapshot, with no validation), and the Rust DNAT table drops a token
+	// ip_proto::proto_number cannot resolve (the dataplane backstop). So an
+	// unresolvable `match protocol` (a typo, or a junos-* alias the DNAT path
+	// does not pre-resolve) committed cleanly and then silently translated
+	// nothing — the #2396 silent-drop class. Strict on commit / commit-check
+	// (hard-reject); lenient on load / peer-sync (downgrade to a warning so a
+	// config persisted before this gate existed still boots — #1960 no-brick;
+	// the dataplane drops the inert rule on its own). Shares the
+	// lenientDestNATAddresses flag (same #2396 DNAT silent-drop doctrine). Runs
+	// after the address gate so a malformed-destination error wins first.
+	if err := validateDestinationNATProtocolStrict(cfg); err != nil {
+		if opts.lenientDestNATAddresses {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("destination-nat protocol (downgraded to warning on tolerant path): %v", err))
 		} else {
 			return nil, err
 		}

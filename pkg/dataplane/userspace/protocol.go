@@ -421,7 +421,21 @@ type DestinationNATRuleSnapshot struct {
 	SourceAddresses    []string `json:"source_addresses,omitempty"`
 	DestinationAddress string   `json:"destination_address"`
 	DestinationPort    uint16   `json:"destination_port,omitempty"`
-	Protocol           string   `json:"protocol,omitempty"` // "tcp", "udp", or ""
+	// Protocol is the Junos config protocol token the DNAT rule matches:
+	// "tcp", "udp", "icmp", "icmp6"/"icmpv6", "gre", another known name, a
+	// bare 0-255 number, or "" (any). #2396: the Rust DNAT table resolves the
+	// token through the shared SSOT (ip_proto::proto_number, which mirrors
+	// appid.ProtocolNumber) so a non-TCP/UDP DNAT (e.g. GRE/ICMP) is honored
+	// rather than silently dropped. A concrete number maps to its exact IANA
+	// value — INCLUDING "0" (HOPOPT), which is a normal exact match, NOT the
+	// wildcard. Only "" with no destination port is the IP-only / any-protocol
+	// rule; the Rust table keys it under a wildcard sentinel (PROTO_ANY = 256,
+	// outside the 0-255 protocol range, so it never aliases protocol 0) so it
+	// covers ALL L4 protocols including ICMP/ICMPv6/GRE. The token is
+	// normalized (trim + lower-case) on both sides before resolution, and an
+	// unresolvable token is rejected at commit by
+	// validateDestinationNATProtocolStrict.
+	Protocol           string   `json:"protocol,omitempty"`
 	PoolAddress        string   `json:"pool_address"`
 	PoolPort           uint16   `json:"pool_port,omitempty"`
 	// CounterID is the compiler-assigned per-rule translation hit counter ID

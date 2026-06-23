@@ -11240,3 +11240,63 @@ top.
   - **File(s)**: pkg/dataplane/userspace/nat.go,
     pkg/dataplane/userspace/nat_per_uplink_test.go,
     userspace-dp/src/nat/tests.rs, docs/userspace-dnat-plan.md, _Log.md
+
+## 2026-06-23 — #2396 DNAT silent drops: non-TCP/UDP, IP-only ICMP, all-invalid-address
+
+- **Timestamp**: 2026-06-23 PDT
+- **Action**: Fixed three DNAT silent-drop fail patterns (HIGH). (a) Rust DNAT
+    builder recognized only tcp/udp/"" and SILENTLY DROPPED every other
+    protocol (`_ => continue`) — a `protocol gre`/`icmp6` or `application
+    junos-icmp-all` DNAT committed but never reached the dataplane. Now resolves
+    the protocol token through a new `ip_proto::proto_number` (mirrors the Go
+    SSOT `appid.ProtocolNumber`) and installs a protocol-scoped entry. (b) An
+    IP-only DNAT (`""` + port 0) expanded to TCP+UDP only, so it did NOT cover
+    ICMP despite the closeout-doc claim. Now keyed under a protocol WILDCARD
+    (`PROTO_ANY = 0`) with a wildcard fallback in `lookup_with_counter` so it
+    covers ALL L4 incl. ICMP/ICMPv6/GRE; a concrete (protocol,port) rule still
+    wins (wildcard is last-resort). (c) An all-invalid destination-address DNAT
+    rule was fail-closed at runtime (#2395) but gave the operator NO feedback;
+    added `validateDestinationNATAddressesStrict` (strict commit / lenient load,
+    #1960 no-brick) that hard-rejects a rule whose every destination-address is
+    unparseable. No wire field added/renamed (the `protocol` string already
+    carried the right value from Go; Rust now honors it) — wire fixture
+    unchanged. Composes with #2394 (source-scope) + #2395 (multi-dest).
+- **File(s)**: userspace-dp/src/ip_proto.rs,
+    userspace-dp/src/nat/destination.rs, userspace-dp/src/nat/tests.rs,
+    pkg/config/compiler.go, pkg/config/compiler_validate_strict.go,
+    pkg/config/compiler_dnat_address_test.go,
+    pkg/dataplane/userspace/protocol.go,
+    pkg/dataplane/userspace/nat_per_uplink_test.go,
+    docs/userspace-dnat-plan.md, _Log.md
+
+## 2026-06-23 — #2396 PR #2418 Copilot fold: proto normalize, PROTO_ANY=256 (no HOPOPT collision), unresolvable-proto commit gate
+
+- **Timestamp**: 2026-06-23 PDT
+- **Action**: Folded three Copilot findings on PR #2418 — all VERIFIED
+    live-reachable (DNAT `match protocol` and `application protocol` reach the
+    wire VERBATIM via nodeVal; neither is validated before the gate).
+    (1) NORMALIZATION: `ip_proto::proto_number` now trims + lower-cases before
+    matching so `GRE`/` icmp ` resolve like `gre`/`icmp` (was: mixed-case token
+    resolved in Go, dropped in Rust → silent miss). (2) PROTO_ANY COLLISION:
+    the IP-only wildcard sentinel was protocol 0, which collides with HOPOPT (a
+    real protocol in the SSOT) — a `protocol 0` DNAT would have broadened to
+    match-all. Changed `DnatKey.protocol` to u16 and `PROTO_ANY = 256` (outside
+    0-255), so HOPOPT is a normal exact match and only `""`+port-0 uses the
+    wildcard. lookup widens the inbound u8 protocol to u16. Fixed the
+    tests.rs assertion (proto_number("0") => Some(0u8)/HOPOPT, NOT PROTO_ANY)
+    and the protocol.go doc. (3) UNRESOLVABLE-PROTOCOL SILENT DROP + false
+    comment: added `validateDestinationNATProtocolStrict` (strict-on-commit,
+    lenient-warn-on-load, shares lenientDestNATAddresses) that hard-rejects a
+    DNAT `match protocol` token `dnatProtocolResolvable` cannot resolve;
+    `dnatProtocolResolvable` is the Go mirror of `proto_number` (bare names +
+    0-255 number, normalized, NO junos-* aliases since the raw DNAT path does
+    not pre-resolve them) with a `DNATProtocolResolvable` test seam. Corrected
+    the destination.rs comment (the gate is on the commit path; the Rust
+    `continue` is the tolerant-load backstop). No wire change — the key
+    re-representation is internal to Rust; the wire `protocol` STRING is
+    unchanged (protocol_wire_v1.json regen = no-op, confirmed).
+- **File(s)**: userspace-dp/src/ip_proto.rs,
+    userspace-dp/src/nat/destination.rs, userspace-dp/src/nat/tests.rs,
+    pkg/config/compiler.go, pkg/config/compiler_validate_strict.go,
+    pkg/config/compiler_dnat_protocol_test.go,
+    pkg/dataplane/userspace/protocol.go, docs/userspace-dnat-plan.md, _Log.md
