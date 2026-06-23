@@ -509,6 +509,173 @@ fn l2_dst_group_broadcast_helper() {
     assert!(l2_dst_is_group_or_broadcast(&[0xff, 0xff, 0xff, 0xff, 0xff, 0xff]));
 }
 
+// === #2367: bad-source suppression (spoofable backscatter) ===
+//
+// The PTB is addressed to the trigger packet's SOURCE address. A trigger
+// whose source is not a single unicast host (unspecified, loopback,
+// multicast, or — for IPv4 — broadcast) would make the firewall emit a
+// PTB to a forbidden address: spoofable ICMP backscatter. RFC 1812
+// §4.3.2.7 / RFC 4443 §2.4(e). The reject / Time-Exceeded gate already
+// enforces this; these tests prove the PTB gate now does too and that the
+// two share the SAME bad-source set. Each suppression test FAILS (the PTB
+// is generated) if the `source_is_invalid_for_icmp_error` call in
+// `ptb_reply_suppressed` is removed.
+
+/// Rewrite the IPv4 SOURCE of a built inbound frame (and fix the IP header
+/// checksum). The PTB builder reflects this as the reply destination.
+fn set_v4_src(frame: &mut [u8], l3: usize, src: Ipv4Addr) {
+    frame[l3 + 12..l3 + 16].copy_from_slice(&src.octets());
+    frame[l3 + 10..l3 + 12].copy_from_slice(&[0, 0]);
+    let csum = checksum16(&frame[l3..l3 + 20]);
+    frame[l3 + 10..l3 + 12].copy_from_slice(&csum.to_be_bytes());
+}
+
+/// Rewrite the IPv6 SOURCE of a built inbound frame.
+fn set_v6_src(frame: &mut [u8], l3: usize, src: Ipv6Addr) {
+    frame[l3 + 8..l3 + 24].copy_from_slice(&src.octets());
+}
+
+/// #2367 fail-on-revert (backscatter): an oversized DF IPv4 datagram whose
+/// SOURCE is one of the forbidden addresses (0.0.0.0, 127.0.0.1,
+/// 224.0.0.1 multicast, 255.255.255.255 broadcast) must NOT generate a PTB
+/// — otherwise the firewall emits spoofable ICMP backscatter to that
+/// source. Mirrors the reject/TE gate's IPv4 bad-source set exactly.
+#[test]
+fn ptb_suppressed_for_v4_bad_source_backscatter() {
+    for bad in [
+        Ipv4Addr::new(0, 0, 0, 0),         // unspecified
+        Ipv4Addr::new(127, 0, 0, 1),       // loopback
+        Ipv4Addr::new(224, 0, 0, 1),       // multicast
+        Ipv4Addr::new(255, 255, 255, 255), // limited broadcast
+    ] {
+        let (mut frame, meta) = inbound_v4_udp(1500, true);
+        let l3 = meta.l3_offset as usize;
+        set_v4_src(&mut frame, l3, bad);
+        assert!(
+            ptb_reply_suppressed(&frame, meta, l3),
+            "IPv4 forbidden source {bad} must suppress the PTB (backscatter)"
+        );
+    }
+}
+
+/// #2367 fail-on-revert (backscatter): an oversized IPv6 datagram whose
+/// SOURCE is forbidden (::, ::1, ff02::1 multicast) must NOT generate a
+/// Packet-Too-Big. Mirrors the reject/TE gate's IPv6 bad-source set.
+#[test]
+fn ptb_suppressed_for_v6_bad_source_backscatter() {
+    for bad in ["::", "::1", "ff02::1"] {
+        let (mut frame, meta) = inbound_v6_udp(1300);
+        let l3 = meta.l3_offset as usize;
+        set_v6_src(&mut frame, l3, bad.parse().expect("v6 src"));
+        assert!(
+            ptb_reply_suppressed(&frame, meta, l3),
+            "IPv6 forbidden source {bad} must suppress the PTB (backscatter)"
+        );
+    }
+}
+
+/// #2367 anti-over-suppress (PMTUD must still work): an oversized DF IPv4
+/// datagram from a NORMAL unicast source must STILL generate the PTB.
+/// Pairs with the suppression test above: reverting the source gate turns
+/// that one red while this stays green (the suppression is the source
+/// gate, not the frame bytes).
+#[test]
+fn ptb_still_generated_for_v4_unicast_source() {
+    let (mut frame, meta) = inbound_v4_udp(1500, true);
+    let l3 = meta.l3_offset as usize;
+    // Plain unicast source, distinct from the default to be explicit.
+    set_v4_src(&mut frame, l3, Ipv4Addr::new(203, 0, 113, 7));
+    assert!(
+        !ptb_reply_suppressed(&frame, meta, l3),
+        "a unicast source must NOT suppress the PTB (PMTUD)"
+    );
+    let fwd = forwarding_with_egress(1400);
+    let out = build_frag_needed_v4(&frame, meta, PTB_IFINDEX, &fwd, 1400)
+        .expect("unicast-source PTB must build");
+    // The PTB is addressed back to the (unicast) source.
+    assert_eq!(
+        &out[30..34],
+        &Ipv4Addr::new(203, 0, 113, 7).octets(),
+        "PTB dst = unicast trigger source"
+    );
+}
+
+/// #2367 anti-over-suppress: an oversized IPv6 datagram from a normal
+/// unicast source must STILL generate the Packet-Too-Big.
+#[test]
+fn ptb_still_generated_for_v6_unicast_source() {
+    let (frame, meta) = inbound_v6_udp(1300);
+    let l3 = meta.l3_offset as usize;
+    // The default source 2001:559:8585:bf01::20 is unicast.
+    assert!(
+        !ptb_reply_suppressed(&frame, meta, l3),
+        "a unicast IPv6 source must NOT suppress the PTB (PMTUD)"
+    );
+    let fwd = forwarding_with_egress(1280);
+    assert!(
+        build_packet_too_big_v6(&frame, meta, PTB_IFINDEX, &fwd, 1280).is_some(),
+        "unicast-source IPv6 PTB must build"
+    );
+}
+
+/// #2367 direct unit test of the shared `source_is_invalid_for_icmp_error`
+/// predicate, plus its fail-closed contract on an unknown family. This is
+/// the SAME predicate the reject / Time-Exceeded gate
+/// (`can_generate_icmp_error_reply`) calls, so the PTB and reject paths
+/// suppress an identical source set.
+#[test]
+fn source_predicate_matches_reject_set_and_fails_closed() {
+    // IPv4 forbidden sources -> invalid.
+    for bad in [
+        Ipv4Addr::new(0, 0, 0, 0),
+        Ipv4Addr::new(127, 0, 0, 1),
+        Ipv4Addr::new(224, 0, 0, 1),
+        Ipv4Addr::new(255, 255, 255, 255),
+    ] {
+        let (mut frame, meta) = inbound_v4_udp(64, true);
+        let l3 = meta.l3_offset as usize;
+        set_v4_src(&mut frame, l3, bad);
+        assert!(
+            source_is_invalid_for_icmp_error(libc::AF_INET as u8, &frame[l3..]),
+            "IPv4 {bad} must be an invalid ICMP-error source"
+        );
+    }
+    // IPv4 unicast -> valid.
+    let (frame, meta) = inbound_v4_udp(64, true);
+    let l3 = meta.l3_offset as usize;
+    assert!(
+        !source_is_invalid_for_icmp_error(libc::AF_INET as u8, &frame[l3..]),
+        "IPv4 unicast source must be valid"
+    );
+    // IPv6 forbidden sources -> invalid.
+    for bad in ["::", "::1", "ff02::1"] {
+        let (mut frame, meta) = inbound_v6_udp(64);
+        let l3 = meta.l3_offset as usize;
+        set_v6_src(&mut frame, l3, bad.parse().expect("v6 src"));
+        assert!(
+            source_is_invalid_for_icmp_error(libc::AF_INET6 as u8, &frame[l3..]),
+            "IPv6 {bad} must be an invalid ICMP-error source"
+        );
+    }
+    // IPv6 unicast -> valid.
+    let (frame6, meta6) = inbound_v6_udp(64);
+    let l36 = meta6.l3_offset as usize;
+    assert!(
+        !source_is_invalid_for_icmp_error(libc::AF_INET6 as u8, &frame6[l36..]),
+        "IPv6 unicast source must be valid"
+    );
+    // Fail-closed: an unknown / non-IP family is treated as invalid
+    // (suppress). Fails if the default arm is reverted to `false`.
+    assert!(
+        source_is_invalid_for_icmp_error(0, &frame[l3..]),
+        "unknown addr_family must fail closed -> invalid source"
+    );
+    assert!(
+        source_is_invalid_for_icmp_error(libc::AF_UNIX as u8, &frame[l3..]),
+        "non-IP addr_family must fail closed -> invalid source"
+    );
+}
+
 #[test]
 fn no_primary_address_fails_closed() {
     // Egress has no primary v4 -> the builder returns None (caller silently
