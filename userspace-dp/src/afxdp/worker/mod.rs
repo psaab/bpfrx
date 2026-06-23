@@ -387,7 +387,16 @@ impl BindingWorker {
         // Safety: `BindingWorker` declares `xsk` before `umem`, so Rust drops
         // the socket/ring handles before the UMEM. That satisfies the UMEM
         // lifetime/drop-order contract enforced by `open_binding_worker_rings`.
-        let (user, rx, tx, bind_mode, bind_flags, actual_bind_strategy, device) = unsafe {
+        let (
+            user,
+            rx,
+            tx,
+            bind_mode,
+            bind_flags,
+            actual_bind_strategy,
+            device,
+            uninserted_fill_frames,
+        ) = unsafe {
             open_binding_worker_rings(
                 &mut worker_umem,
                 &info,
@@ -400,6 +409,11 @@ impl BindingWorker {
             )
         }
         .map_err(|err| format!("configure AF_XDP rings: {err}"))?;
+        // #2374: the bringup prime may not place every fill frame on a
+        // transiently-full ring. The uninserted suffix is seeded into
+        // `pending_fill_frames` below so the steady-state drain retries it —
+        // those UMEM frames are accounted, never leaked.
+        let pending_fill_frames: VecDeque<u64> = uninserted_fill_frames.into_iter().collect();
 
         let user_fd = user.as_raw_fd();
         live.set_bound(user_fd);
@@ -449,7 +463,7 @@ impl BindingWorker {
                 pending_tx_local: VecDeque::new(),
                 max_pending_tx,
                 outstanding_tx: 0,
-                pending_fill_frames: VecDeque::new(),
+                pending_fill_frames,
                 in_flight_prepared_recycles: FastMap::default(),
                 // #812: pre-allocate the submit-timestamp sidecar once,
                 // sized to the binding's total UMEM frame count so every
