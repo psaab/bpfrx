@@ -377,11 +377,14 @@ fn ptb_suppressed_for_v4_directed_broadcast_dst() {
         ptb_reply_suppressed(&frame, meta, l3, &fwd),
         "IPv4 subnet-directed broadcast must suppress the PTB"
     );
-    assert!(
-        build_frag_needed_v4(&frame, meta, PTB_IFINDEX, &fwd, 1400).is_none()
-            || ptb_reply_suppressed(&frame, meta, l3, &fwd),
-        "directed-broadcast PTB must be gated by the suppression predicate"
-    );
+    // Note: `build_frag_needed_v4` does NOT itself consult the
+    // suppression gate (it would happily build a frame for a directed
+    // broadcast). The dispatch path (`tx/dispatch/mod.rs`) only calls the
+    // builder behind `if !ptb_reply_suppressed(..)`, so the gate above IS
+    // the call-site invariant — asserting `build_frag_needed_v4(..)
+    // .is_none()` here would be WRONG (the builder builds; the gate is
+    // what stops the send). The gate assertion fails on a stubbed-false
+    // `dest_is_directed_broadcast`, which is the regression we guard.
 }
 
 /// #2411 anti-over-suppress: a normal unicast HOST inside the same

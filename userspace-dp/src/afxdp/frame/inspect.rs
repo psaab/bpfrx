@@ -589,11 +589,16 @@ pub(in crate::afxdp) fn dest_is_directed_broadcast(
         return true;
     };
     let dst = Ipv4Addr::new(dst[0], dst[1], dst[2], dst[3]);
-    forwarding.connected_v4.iter().any(|entry| {
-        entry.prefix.prefix_len() < 31
-            && entry.prefix.contains(dst)
-            && entry.prefix.directed_broadcast() == dst
-    })
+    // `directed_broadcast() == dst` already implies the prefix contains
+    // dst: a directed broadcast is `network | !mask`, so `dst & mask ==
+    // network` (the host bits are all-ones and masked off) — i.e.
+    // `contains(dst)` is necessarily true. The explicit `contains` check
+    // would be redundant, so only the broadcast-equality and the
+    // prefix-length guard remain.
+    forwarding
+        .connected_v4
+        .iter()
+        .any(|entry| entry.prefix.prefix_len() < 31 && entry.prefix.directed_broadcast() == dst)
 }
 
 /// #2367: RFC 1812 §4.3.2.7 / RFC 4443 §2.4(e) — a router MUST NOT

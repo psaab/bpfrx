@@ -11758,3 +11758,28 @@ top.
   userspace-dp/src/afxdp/tests.rs,
   userspace-dp/src/afxdp/tx/dispatch/mod.rs,
   userspace-dp/src/afxdp/README.md, _Log.md
+
+- **Timestamp**: 2026-06-23
+- **Action**: #2411 PR #2434 review folds (test-fidelity + cleanup, no
+  production behavior change). (1) tests.rs
+  time_exceeded_emitted_for_unicast_udp passed &ForwardingState::default()
+  to the gate while building `fwd` just below — changed to &fwd so the
+  assertion exercises the real connected-route forwarding state (unicast,
+  so still passes). (2) icmp_ptb_tests.rs
+  ptb_suppressed_for_v4_directed_broadcast_dst had a VACUOUS second
+  assertion (`build_frag_needed_v4(..).is_none() || ptb_reply_suppressed(..)`
+  — the OR'd suppressed check was already asserted true above, so always
+  passed). Removed it: build_frag_needed_v4 does NOT consult the gate (it
+  builds a frame regardless); the dispatch path calls it only behind
+  `if !ptb_reply_suppressed(..)`, so the gate assertion above IS the real
+  non-vacuous fail-on-revert invariant — asserting .is_none() on the
+  builder would be wrong. Added a comment explaining why. (3) inspect.rs
+  dest_is_directed_broadcast dropped the redundant `entry.prefix
+  .contains(dst) &&` — `directed_broadcast() == dst` already implies
+  containment (dst & mask == network when host bits are all-ones). Build
+  clean; icmp/icmp_ptb/prefix/broadcast/directed tests green (161
+  passed); the 2 suppression tests still FAIL on a stubbed-false gate;
+  new tests 5x stable.
+- **File(s)**: userspace-dp/src/afxdp/frame/inspect.rs,
+  userspace-dp/src/afxdp/icmp_ptb_tests.rs,
+  userspace-dp/src/afxdp/tests.rs, _Log.md

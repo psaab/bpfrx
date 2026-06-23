@@ -1876,7 +1876,7 @@ fn time_exceeded_emitted_for_unicast_udp() {
     let frame = build_udp_frame_v4_full([0x00, 0x25, 0x90, 0x12, 0x34, 0x56], client, server, 1);
     let meta = ttl_meta_v4();
     let fwd = icmp_suppress_forwarding();
-    assert!(can_generate_icmp_error_reply(&frame, meta, &ForwardingState::default()));
+    assert!(can_generate_icmp_error_reply(&frame, meta, &fwd));
     let desc = XdpDesc {
         addr: 4096,
         len: frame.len() as u32,
