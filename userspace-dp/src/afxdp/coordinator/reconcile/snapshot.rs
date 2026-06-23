@@ -94,7 +94,10 @@ pub(super) fn apply_snapshot(
         coord.last_slow_path_status = slow_path.status();
         Some(slow_path)
     } else {
-        match SlowPathReinjector::new(DEFAULT_SLOW_PATH_TUN) {
+        // #2408: size the slow-path TUN to the largest configured
+        // data-interface MTU so reinjected jumbo frames are not dropped on
+        // the TUN egress (default kernel TUN MTU is 1500).
+        match SlowPathReinjector::new(DEFAULT_SLOW_PATH_TUN, snapshot.slow_path_mtu()) {
             Ok(reinjector) => {
                 coord.last_slow_path_status = reinjector.status();
                 Some(Arc::new(reinjector))
