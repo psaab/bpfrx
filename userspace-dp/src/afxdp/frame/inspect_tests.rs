@@ -249,3 +249,43 @@ fn declared_end_helpers_clamp_to_slice_and_floor() {
     let frame3 = v6_frame(PROTO_TCP, 1000, &FAKE_PORTS);
     assert_eq!(ipv6_declared_l3_end(&frame3, 14), Some(frame3.len()));
 }
+
+// ---- clamp-panic safety (Copilot fold): ihl declares more than the slice ----
+
+#[test]
+fn ipv4_declared_end_oversized_ihl_truncated_buffer_returns_none_no_panic() {
+    // IHL nibble = 15 => declared IPv4 header = 60 bytes, but the buffer
+    // holds only l3 + 20 (eth + minimal IPv4 header, no options present).
+    // Without the `frame.len() < l3 + ihl` guard, `clamp(min = l3+60,
+    // max = l3+20)` has min > max and PANICS. Must fail closed (None).
+    let mut frame = v4_frame(PROTO_TCP, 20, &[]); // eth(14) + IPv4(20), no L4
+    assert_eq!(frame.len(), 14 + 20);
+    frame[14] = 0x4f; // version 4, IHL = 15 (60-byte header claimed)
+    // A panic here (clamp min > max) is a test FAILURE.
+    assert_eq!(
+        ipv4_declared_l3_end(&frame, 14),
+        None,
+        "oversized IHL on a truncated buffer must fail closed, not panic"
+    );
+}
+
+#[test]
+fn meta_fast_path_oversized_ihl_truncated_buffer_no_panic() {
+    // Reachable from the meta-driven caller, which does NOT validate ihl
+    // against the slice. Same crafted frame; must not panic and must yield
+    // no ports (None).
+    let mut frame = v4_frame(PROTO_TCP, 20, &[]);
+    frame[14] = 0x4f; // IHL = 15
+    let meta = ForwardPacketMeta {
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_TCP,
+        l3_offset: 14,
+        l4_offset: 14 + 20,
+        ..ForwardPacketMeta::default()
+    };
+    assert_eq!(
+        live_frame_ports_from_meta_bytes(&frame, meta),
+        None,
+        "meta fast path must not panic on an oversized IHL truncated frame"
+    );
+}

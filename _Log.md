@@ -1,5 +1,30 @@
 # Action Log
 
+## 2026-06-22 — #2361 Copilot fold: clamp-panic guard in ipv4_declared_l3_end
+
+- **Timestamp**: 2026-06-22 PDT
+- **Action**: Folded a Copilot finding on PR #2366 — a real panic/DoS in
+  the #2361 helper. `ipv4_declared_l3_end` guarded only `frame.len() >=
+  l3+20` and `ihl >= 20`, then did `clamp(l3+ihl, frame.len())`. IPv4 IHL
+  can be 21..=60 (options), and the meta-driven callers
+  (`live_frame_ports_from_meta_bytes` / meta-offset fallback) do NOT
+  validate ihl against the slice. A crafted frame with IHL nibble = 15
+  (60-byte header) in a buffer truncated to l3+20 yields `clamp(min=l3+60,
+  max=l3+20)` → min > max → `Ord::clamp` panics → attacker-reachable
+  parser DoS. Fix: add `frame.len() < l3 + ihl` to the guard before the
+  clamp so `min <= max` is guaranteed (fail closed when the buffer does
+  not hold the declared IHL header). Behavior otherwise identical.
+  Verified the IPv6 helper is already safe (its clamp floor l3+40 ==
+  its guard `frame.len() >= l3+40`, so min <= max). Verified the sibling
+  `generated.rs::parse_generated_v4` is ALSO already safe — line 74
+  `if ihl < 20 || packet.len() < ihl` precedes its
+  `total_len.clamp(ihl, packet.len())`, and v6's floor 40 is guarded — so
+  generated.rs needed NO change. Added 2 fail-on-revert tests (direct
+  helper + meta-fast-path caller) that PANIC when the guard is removed;
+  both confirmed to fail (clamp panic) on revert, pass with the guard.
+- **File(s)**: userspace-dp/src/afxdp/frame/inspect.rs (guard),
+  userspace-dp/src/afxdp/frame/inspect_tests.rs (2 tests).
+
 ## 2026-06-22 — #2361 live frame parser: bound L4 ports by IP-declared length
 
 - **Timestamp**: 2026-06-22 PDT

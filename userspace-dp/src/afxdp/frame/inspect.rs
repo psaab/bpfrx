@@ -410,7 +410,14 @@ pub(in crate::afxdp) fn ipv4_declared_l3_end(frame: &[u8], l3: usize) -> Option<
         return None;
     }
     let ihl = usize::from(frame[l3] & 0x0f) * 4;
-    if ihl < 20 {
+    // Fail closed when the buffer does not even hold the declared IHL
+    // header (ihl can be 21..=60 with IPv4 options, but the meta-driven
+    // callers do NOT validate ihl against the slice). This guard is also a
+    // PANIC SAFETY invariant: the `clamp` below requires `min <= max`, i.e.
+    // `l3 + ihl <= frame.len()`. Without this guard a crafted frame with
+    // IHL nibble = 15 (60 bytes) in a buffer truncated to l3+20 would give
+    // `clamp(min = l3+60, max = l3+20)` -> `min > max` -> panic (DoS).
+    if ihl < 20 || frame.len() < l3 + ihl {
         return None;
     }
     let total_len = u16::from_be_bytes([frame[l3 + 2], frame[l3 + 3]]) as usize;
