@@ -81,6 +81,19 @@ logging rules, not these specific hot-path constants.
 - Generic-XDP fallback consumes UMEM frames permanently on mlx5; the
   XDP shim redirects `XDP_PASS` to a cpumap stage that frees the frame
   immediately.
+- Producer-ring writers (`WriteTx` / `WriteFill` in
+  `userspace-dp/src/xsk_ffi.rs`) are **append-safe across multiple
+  `insert()` calls on one reservation**: each `insert()` writes at
+  `base_idx + written + n` and is bounded by the *remaining*
+  reservation (`reserved - written`), so a second `insert()` appends
+  after the first instead of overwriting it, and `commit()`/`Drop`
+  submit the accumulated `written` count over distinct, initialized
+  slots. libxdp masks the slot index against the ring size, so the
+  unwrapped sum is correct. (Fixed in #2383 — the prior `base_idx + n`
+  indexing was latent because every callsite did exactly one `insert()`
+  per reservation; the #2374 fill-ring suffix retry re-`reserve`s a
+  fresh `WriteFill` per NAPI iteration rather than re-inserting, so it
+  never tripped the hazard.)
 - `HEARTBEAT_GRACE_PERIOD_NS = 6 s` is defined in
   `userspace-dp/src/afxdp/mod.rs` but currently `#[allow(dead_code)]`
   — reserved for future XDP-shim heartbeat gating logic. Workers
