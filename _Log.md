@@ -1,5 +1,23 @@
 # Action Log
 
+## 2026-06-23 — #2381 PR #2413 doc-accuracy folds (cap arithmetic + bound)
+
+- **Timestamp**: 2026-06-23 PDT
+- **Action**: Two doc-comment corrections on PR #2413 (no code/behavior
+  change). (1) The `WRITE_BACKLOG_MAX_BYTES` rationale wrongly claimed 16 MiB
+  ≈ 2× a fully-drained channel. `EventFrame::data` is a fixed `[u8; 256]`
+  (codec.rs), so an 8192-frame channel is ≤ 8192×256 ≈ 2 MiB of bytes, making
+  16 MiB ≈ 8× the worst-case channel drain — corrected the comment to the real
+  arithmetic. (2) Clarified that the cap is tested at the top of the drain loop
+  before the in-flight frame is appended, so the effective bound is `cap + one
+  max EventFrame` (≤ 256 B), not a strict 16 MiB; the bounded overshoot is
+  accepted. Adjusted the matching wording in the event_stream README and
+  docs/session-sync-design.md ("hard-capped at 16 MiB" → cap + one-frame
+  bound). Logic unchanged; existing tests still pass; `cargo build --release`
+  clean.
+- **File(s)**: userspace-dp/src/event_stream/mod.rs,
+  userspace-dp/src/event_stream/README.md, docs/session-sync-design.md, _Log.md
+
 ## 2026-06-23 — #2381 bound event-stream write backlog (stalled-consumer OOM)
 
 - **Timestamp**: 2026-06-23 PDT

@@ -56,9 +56,19 @@ const REPLAY_BUFFER_CAPACITY: usize = 4096;
 /// the existing `frames_dropped` / per-kind `queue_full` counters) instead of
 /// silently relocating bytes into one unbounded buffer.
 ///
-/// 16 MiB ≈ 2× the worst-case fully-drained 8192-frame channel of maximum
-/// session-open frames, so a transient burst is absorbed losslessly while a
-/// persistently stalled consumer is bounded.
+/// `EventFrame::data` is a fixed `[u8; 256]` (see codec.rs), so a fully
+/// drained `CHANNEL_CAPACITY` (8192) channel is at most 8192 × 256 ≈ 2 MiB of
+/// bytes. 16 MiB is therefore ≈ 8× that worst-case channel drain — generous
+/// headroom so transient bursts (plus any in-flight replay/partial-write
+/// remainder) are absorbed losslessly, while a persistently stalled consumer
+/// stays bounded.
+///
+/// The cap is checked at the top of the drain loop, before the in-flight frame
+/// is appended, so `write_buf` can reach at most `WRITE_BACKLOG_MAX_BYTES` plus
+/// one already-pulled max `EventFrame` (≤ 256 B) before the drain halts — i.e.
+/// the bound is `cap + one frame`, not a strict 16 MiB. The overshoot is
+/// bounded and accepted (simpler than a pre-reserve check); memory is bounded
+/// either way.
 const WRITE_BACKLOG_MAX_BYTES: usize = 16 * 1024 * 1024;
 
 /// Upper bound for explicit lossless queueing operations such as full

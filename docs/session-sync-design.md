@@ -548,8 +548,12 @@ remainder for the next cycle. Daemon detects gaps via sequence numbers and can
 request a full reconciliation.
 
 The bounded channel is the ONLY backpressure surface. The write backlog is
-hard-capped at `WRITE_BACKLOG_MAX_BYTES` (16 MiB, `drain_channel_into_write_buf`
-in `event_stream/mod.rs`, #2381): a wedged daemon that keeps the socket open
+capped at `WRITE_BACKLOG_MAX_BYTES` (16 MiB ≈ 8× a fully-drained 8192×256 B
+channel, since `EventFrame` is a fixed `[u8; 256]`; `drain_channel_into_write_buf`
+in `event_stream/mod.rs`, #2381). The cap is tested at the top of the drain
+loop, so the effective bound is `cap + one max EventFrame` (≤ 256 B) — the
+in-flight frame already pulled can carry `write_buf` just past 16 MiB before the
+drain halts; the overshoot is bounded and accepted. A wedged daemon that keeps the socket open
 but stops reading (writes perpetually `WouldBlock`) would otherwise let the
 I/O thread migrate the whole channel into the heap-backed `write_buf` every
 cycle while the channel refills from `try_send`, growing `write_buf` without
