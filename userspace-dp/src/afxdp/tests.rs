@@ -7492,6 +7492,234 @@ fn gre_decap_still_matches_genuine_gre_row() {
     );
 }
 
+// ====================================================================
+// #2376: GRE decap inner-L4 minimum-header bounds (UDP/ICMP/ICMPv6).
+//
+// The inner-protocol parser length-validated inner TCP but advanced the
+// UDP/ICMP/ICMPv6 payload offset by 8 with NO minimum-header bounds
+// check. The inner is trimmed to its IP-declared total length before the
+// parse, so an inner whose declared length ends before its L4 header
+// (e.g. IPv4 total_len = ihl + 2, proto = UDP) survived and stamped a
+// synthetic `protocol`/`l4_offset`/`payload_offset` from bytes that are
+// not a real L4 header — `payload_offset` even pointed past the packet
+// end. The fix fails CLOSED (no decap) when the inner cannot contain the
+// claimed 8-byte L4 minimum header. These tests pin that contract and
+// the anti-over-reject happy path. They drive
+// `try_native_gre_decap_from_frame` directly so the assertion is on the
+// decap chokepoint, not a downstream consumer.
+// ====================================================================
+
+/// Build a flagless-GRE OUTER frame (peer 203.0.113.9 -> local
+/// 172.16.80.8, the `gre_to_self_snapshot` tunnel tuple) carrying an
+/// arbitrary `inner` packet under the GRE inner proto `gre_inner_proto`
+/// (0x0800 = IPv4 inner, 0x86dd = IPv6 inner). The outer IP total length
+/// is taken from the actual byte counts so a deliberately short inner
+/// still produces a well-formed OUTER — the truncation is purely in the
+/// inner, which is what the #2376 guard inspects. Untagged underlay
+/// (L3 at 14).
+fn build_gre_to_self_outer_frame_with_inner(gre_inner_proto: u16, inner: &[u8]) -> Vec<u8> {
+    let mut frame = Vec::new();
+    write_eth_header(
+        &mut frame,
+        [0x02, 0xbf, 0x72, 0x00, 0x80, 0x08],
+        [0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5],
+        0,
+        0x0800,
+    );
+    let l3 = frame.len();
+    let total = (20 + 4 + inner.len()) as u16;
+    frame.extend_from_slice(&[0x45, 0x00]);
+    frame.extend_from_slice(&total.to_be_bytes());
+    frame.extend_from_slice(&[
+        0x00, 0x01, 0x00, 0x00, 64, PROTO_GRE, 0x00, 0x00, 203, 0, 113, 9, 172, 16, 80, 8,
+    ]);
+    let ip_sum = checksum16(&frame[l3..l3 + 20]);
+    frame[l3 + 10] = (ip_sum >> 8) as u8;
+    frame[l3 + 11] = ip_sum as u8;
+    // Flagless GRE header: flags/version = 0, protocol = gre_inner_proto.
+    frame.extend_from_slice(&[0x00, 0x00]);
+    frame.extend_from_slice(&gre_inner_proto.to_be_bytes());
+    frame.extend_from_slice(inner);
+    frame
+}
+
+/// IPv4 inner with `protocol` and `total_len` set to `ihl + l4_bytes`
+/// (ihl = 20). `l4_bytes` is how many bytes of L4 follow the IP header in
+/// the IP-declared length; the physical packet is padded to the declared
+/// length so `packet_trimmed_len` returns `total_len` (the truncation
+/// being tested is "declared length too short for the L4 header", not a
+/// short physical buffer).
+fn build_gre_inner_v4(protocol: u8, l4_bytes: usize) -> Vec<u8> {
+    let total = 20 + l4_bytes;
+    let mut packet = vec![
+        0x45,
+        0x00,
+        (total >> 8) as u8,
+        total as u8,
+        0x00,
+        0x01,
+        0x00,
+        0x00,
+        64,
+        protocol,
+        0x00,
+        0x00,
+        10,
+        255,
+        0,
+        2,
+        10,
+        255,
+        0,
+        1,
+    ];
+    let ip_sum = checksum16(&packet[0..20]);
+    packet[10] = (ip_sum >> 8) as u8;
+    packet[11] = ip_sum as u8;
+    packet.extend(std::iter::repeat(0u8).take(l4_bytes));
+    packet
+}
+
+/// IPv6 inner with the given next-header `protocol`, `payload_len`
+/// L4 bytes after the 40-byte fixed header. Physical buffer padded to the
+/// declared length so the truncation is in the IP-declared length, not
+/// the buffer.
+fn build_gre_inner_v6(protocol: u8, payload_len: usize) -> Vec<u8> {
+    let mut packet = vec![0x60, 0x00, 0x00, 0x00];
+    packet.extend_from_slice(&(payload_len as u16).to_be_bytes());
+    packet.push(protocol);
+    packet.push(64); // hop limit
+    // src 2001:db8::2, dst 2001:db8::1
+    packet.extend_from_slice(&[
+        0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2,
+    ]);
+    packet.extend_from_slice(&[
+        0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1,
+    ]);
+    packet.extend(std::iter::repeat(0u8).take(payload_len));
+    packet
+}
+
+/// A GRE packet whose IPv4 inner declares UDP but its IP-declared length
+/// ends before the 8-byte UDP header (total_len = ihl + 2). Pre-#2376
+/// this stamped `protocol = UDP`, `l4_offset = ihl`, and
+/// `payload_offset = ihl + 8` (past the packet end) from non-L4 bytes.
+/// The guard must now drop (decap returns `None`). FAILS if the
+/// `packet.len() >= ihl + 8` guard is removed.
+#[test]
+fn gre_decap_drops_truncated_udp_inner_v4() {
+    let forwarding = build_forwarding_state(&gre_to_self_snapshot());
+    let inner = build_gre_inner_v4(PROTO_UDP, 2); // only 2 of 8 UDP bytes declared
+    let frame = build_gre_to_self_outer_frame_with_inner(0x0800, &inner);
+    let meta = gre_to_self_outer_meta(0, frame.len());
+    assert!(
+        try_native_gre_decap_from_frame(&frame, meta, &forwarding).is_none(),
+        "a GRE inner declaring UDP but shorter than the 8-byte UDP \
+         header must fail closed (no decap), not stamp synthetic ports \
+         from out-of-bounds bytes"
+    );
+}
+
+/// Same as above for an IPv4 ICMP inner shorter than its 8-byte header.
+#[test]
+fn gre_decap_drops_truncated_icmp_inner_v4() {
+    let forwarding = build_forwarding_state(&gre_to_self_snapshot());
+    let inner = build_gre_inner_v4(PROTO_ICMP, 3); // only 3 of 8 ICMP bytes declared
+    let frame = build_gre_to_self_outer_frame_with_inner(0x0800, &inner);
+    let meta = gre_to_self_outer_meta(0, frame.len());
+    assert!(
+        try_native_gre_decap_from_frame(&frame, meta, &forwarding).is_none(),
+        "a GRE inner declaring ICMP but shorter than the 8-byte ICMP \
+         header must fail closed (no decap)"
+    );
+}
+
+/// IPv6 inner declaring UDP but with payload_len < 8 (the UDP header does
+/// not fit). FAILS if the IPv6 `packet.len() >= l4 + 8` guard is removed.
+#[test]
+fn gre_decap_drops_truncated_udp_inner_v6() {
+    let forwarding = build_forwarding_state(&gre_to_self_snapshot());
+    let inner = build_gre_inner_v6(PROTO_UDP, 4); // 4 of 8 UDP bytes
+    let frame = build_gre_to_self_outer_frame_with_inner(0x86dd, &inner);
+    let meta = gre_to_self_outer_meta(0, frame.len());
+    assert!(
+        try_native_gre_decap_from_frame(&frame, meta, &forwarding).is_none(),
+        "an IPv6 GRE inner declaring UDP shorter than the 8-byte UDP \
+         header must fail closed (no decap)"
+    );
+}
+
+/// IPv6 inner declaring ICMPv6 but with payload_len < 8.
+#[test]
+fn gre_decap_drops_truncated_icmpv6_inner_v6() {
+    let forwarding = build_forwarding_state(&gre_to_self_snapshot());
+    let inner = build_gre_inner_v6(PROTO_ICMPV6, 7); // 7 of 8 ICMPv6 bytes
+    let frame = build_gre_to_self_outer_frame_with_inner(0x86dd, &inner);
+    let meta = gre_to_self_outer_meta(0, frame.len());
+    assert!(
+        try_native_gre_decap_from_frame(&frame, meta, &forwarding).is_none(),
+        "an IPv6 GRE inner declaring ICMPv6 shorter than the 8-byte \
+         header must fail closed (no decap)"
+    );
+}
+
+/// #2376 anti-over-reject: a WELL-FORMED GRE-tunneled UDP inner (full
+/// 8-byte UDP header + payload) still decaps and stamps the correct
+/// ports / L4 offset. Guards the happy path against an over-strict
+/// length check. The synthetic inner meta's `l4_offset` is `14 + ihl`
+/// (eth + IP header) and the stamped ports come from the real UDP header.
+#[test]
+fn gre_decap_well_formed_udp_inner_v4_still_decaps_with_ports() {
+    let forwarding = build_forwarding_state(&gre_to_self_snapshot());
+    let mut inner = build_gre_inner_v4(PROTO_UDP, 8 + 4); // full UDP header + 4B payload
+    // src port 0x1234, dst port 0x5678, length 16, checksum 0 (unchecked).
+    inner[20..28].copy_from_slice(&[0x12, 0x34, 0x56, 0x78, 0x00, 0x10, 0x00, 0x00]);
+    let frame = build_gre_to_self_outer_frame_with_inner(0x0800, &inner);
+    let meta = gre_to_self_outer_meta(0, frame.len());
+    let decap = try_native_gre_decap_from_frame(&frame, meta, &forwarding)
+        .expect("a well-formed GRE-tunneled UDP inner must still decap");
+    assert_eq!(decap.meta.protocol, PROTO_UDP);
+    assert_eq!(decap.meta.l4_offset, 14 + 20, "inner L4 at eth+IP header");
+    assert_eq!(decap.meta.flow_src_port, 0x1234, "stamped UDP src port");
+    assert_eq!(decap.meta.flow_dst_port, 0x5678, "stamped UDP dst port");
+    assert_eq!(
+        &decap.frame[decap.meta.l3_offset as usize..],
+        &inner[..],
+        "synthetic frame and inner meta must stay self-consistent"
+    );
+}
+
+/// #2376 anti-over-reject: a well-formed GRE-tunneled ICMP echo inner
+/// still decaps (mirrors `build_gre_inner_icmp_packet_v4`, full 8-byte
+/// ICMP header). Complements the existing self-consistency tests.
+#[test]
+fn gre_decap_well_formed_icmp_inner_v4_still_decaps() {
+    let forwarding = build_forwarding_state(&gre_to_self_snapshot());
+    let inner = build_gre_inner_icmp_packet_v4();
+    let frame = build_gre_to_self_outer_frame_with_inner(0x0800, &inner);
+    let meta = gre_to_self_outer_meta(0, frame.len());
+    let decap = try_native_gre_decap_from_frame(&frame, meta, &forwarding)
+        .expect("a well-formed GRE-tunneled ICMP inner must still decap");
+    assert_eq!(decap.meta.protocol, PROTO_ICMP);
+    assert_eq!(decap.meta.l4_offset, 14 + 20);
+}
+
+/// #2376 composition / no-regression: the pre-existing TCP guard must
+/// still drop a GRE inner declaring TCP but shorter than the 20-byte TCP
+/// header — the UDP/ICMP fix must not weaken the TCP path.
+#[test]
+fn gre_decap_drops_truncated_tcp_inner_v4_no_regression() {
+    let forwarding = build_forwarding_state(&gre_to_self_snapshot());
+    let inner = build_gre_inner_v4(PROTO_TCP, 10); // 10 of 20 TCP bytes
+    let frame = build_gre_to_self_outer_frame_with_inner(0x0800, &inner);
+    let meta = gre_to_self_outer_meta(0, frame.len());
+    assert!(
+        try_native_gre_decap_from_frame(&frame, meta, &forwarding).is_none(),
+        "the existing TCP minimum-header guard must still drop a short \
+         TCP inner (the #2376 UDP/ICMP fix must not regress TCP)"
+    );
+}
+
 /// #2327 fail-on-revert: the egress encap dispatcher must FAIL CLOSED on
 /// an unknown tunnel mode — a row whose mode is neither GRE nor
 /// WireGuard must NOT be silently GRE-encapsulated (the pre-#2327

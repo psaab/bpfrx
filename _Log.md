@@ -11655,3 +11655,25 @@ top.
   still clean.
 - **File(s)**: userspace-dp/src/afxdp/forwarding/mod.rs (doc comment),
   userspace-dp/src/afxdp/forwarding/README.md
+
+- **Timestamp**: 2026-06-23
+- **Action**: #2376 — GRE decap inner-L4 minimum-header bounds. The
+  inner-protocol parser (parse_inner_protocol_and_offsets, afxdp/gre.rs)
+  length-validated inner TCP but advanced UDP/ICMP (IPv4) and
+  UDP/ICMPv6 (IPv6) by 8 bytes with NO bounds check. The inner is
+  trimmed to its IP-declared length before the parse, so a short inner
+  (e.g. total_len = ihl + 2, proto UDP) survived and stamped
+  protocol/l4_offset/payload_offset (payload_offset past the packet end)
+  from bytes that are not a real L4 header — fed into the synthetic inner
+  meta (gre.rs stamp site) and reinjected into the worker pipeline. Fix:
+  require packet.len() >= ihl+8 (v4 UDP/ICMP) and >= rel_l4+8 (v6
+  UDP/ICMPv6), return None (fail closed) otherwise; mirrors the existing
+  TCP guard, which is untouched. Distinct from #2361 (that hardened the
+  live frame parser's port fabrication; this is the synthetic-inner
+  metadata stamped by the decap stage). 7 fail-on-revert tests added
+  (4 truncated-drop UDP/ICMP/UDPv6/ICMPv6 + 2 well-formed happy-path with
+  port assertions + 1 TCP no-regression); verified the 4 drop tests FAIL
+  when the guard is reverted. Full unittest suite 2564 passed.
+- **File(s)**: userspace-dp/src/afxdp/gre.rs,
+  userspace-dp/src/afxdp/tests.rs, docs/userspace-native-gre-plan.md,
+  _Log.md
