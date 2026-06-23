@@ -11886,3 +11886,16 @@ top.
 - **File(s)**: userspace-dp/src/slowpath.rs,
   userspace-dp/src/io_uring_write.rs,
   docs/xdp-io-uring-userspace-dataplane.md, _Log.md
+
+- **Timestamp**: 2026-06-23
+- **Action**: #2407 Copilot doc-fold (PR #2437) — corrected the
+  `write_packet_atomic` writer-seam doc comment in slowpath.rs. It said
+  the writer returns "<0 negated via errno", but `libc::write` returns
+  `-1` on error with `errno` set SEPARATELY (not a negated-errno value),
+  which is exactly what the seam and tests model (`-1` + an explicit
+  `set_errno`). Reworded to: non-negative byte count on success, or `-1`
+  on error with errno set separately, and noted that
+  `write_packet_atomic` reads errno via `io::Error::last_os_error()` to
+  split EINTR (retry-whole) from a hard error (drop). Comment-only — no
+  code change; cargo build --release clean.
+- **File(s)**: userspace-dp/src/slowpath.rs, _Log.md

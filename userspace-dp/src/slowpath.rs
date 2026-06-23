@@ -312,9 +312,13 @@ fn write_packet_sync(fd: i32, bytes: &[u8]) -> Result<(), String> {
 ///     caller counts as a dropped packet + write error).
 ///   * `rc == 0` or `rc < 0` (any other errno, incl. `EAGAIN`) — `Err` (drop).
 ///
-/// `writer(len)` performs one `write(fd, buf, len)` and returns its raw result
-/// (mirrors `libc::write`: `>=0` byte count, `<0` negated via `errno`). It is a
-/// seam so the short-count / EINTR behaviour is unit-testable without a real fd.
+/// `writer(len)` performs one `write(fd, buf, len)` and returns its raw result,
+/// mirroring `libc::write`: a non-negative byte count on success, or `-1` on
+/// error with `errno` set separately (the unit-test seam sets `errno`
+/// explicitly). On a `-1` return `write_packet_atomic` reads `errno` via
+/// `io::Error::last_os_error()` to distinguish `EINTR` (retry the whole packet)
+/// from a hard error (drop). It is a seam so the short-count / EINTR behaviour
+/// is unit-testable without a real fd.
 fn write_packet_atomic<F>(len: usize, mut writer: F) -> Result<(), String>
 where
     F: FnMut(usize) -> isize,
