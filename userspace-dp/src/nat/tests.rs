@@ -185,6 +185,132 @@ fn snat_all_malformed_destination_match_fails_closed_v4() {
     );
 }
 
+/// #2398 (v6 destination): a SNAT rule with a non-empty but ALL-malformed v6
+/// destination match set must match NOTHING. The fail-closed logic
+/// (`destination_constrained` + `nets_match_v6`) is identical to the v4
+/// destination path, so without this test a v6-destination-only regression
+/// (e.g. `nets_match_v6` reverted to empty=match-any) would slip through. This
+/// test FAILS (SNAT fires) if the v6 destination fail-closed path reverts.
+#[test]
+fn snat_all_malformed_destination_match_fails_closed_v6() {
+    let rules = parse_source_nat_rules(&[SourceNATRuleSnapshot {
+        name: "snat-dst-typo6".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        // Source is valid (match any in zone), v6 destination is all garbage.
+        source_addresses: vec!["::/0".to_string()],
+        destination_addresses: vec!["bogus6".to_string(), "2001:db8::/999".to_string()],
+        interface_mode: true,
+        ..SourceNATRuleSnapshot::default()
+    }]);
+    let decision = match_source_nat(
+        &rules,
+        "lan",
+        "wan",
+        "2001:559:8585:ef00::100".parse().expect("src"),
+        "2001:559:8585:80::200".parse().expect("dst"),
+        None,
+        Some("2001:559:8585:80::8".parse().expect("egress")),
+    );
+    assert_eq!(
+        decision, None,
+        "all-malformed SNAT v6 destination match must fail closed (#2398)"
+    );
+}
+
+/// #2398: a bare host v4 destination match IP (no `/prefix`) correctly scopes
+/// the SNAT on the DESTINATION path — symmetric with the source bare-IP
+/// fallback. Only traffic to the configured destination host is translated.
+#[test]
+fn snat_bare_host_destination_match_scopes_v4() {
+    let rules = parse_source_nat_rules(&[SourceNATRuleSnapshot {
+        name: "snat-bare-dst".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        destination_addresses: vec!["172.16.80.200".to_string()],
+        interface_mode: true,
+        ..SourceNATRuleSnapshot::default()
+    }]);
+    // Traffic to the configured destination host is translated.
+    let hit = match_source_nat(
+        &rules,
+        "lan",
+        "wan",
+        "10.0.61.102".parse().expect("src"),
+        "172.16.80.200".parse().expect("dst"),
+        Some("172.16.80.8".parse().expect("egress")),
+        None,
+    );
+    assert_eq!(
+        hit,
+        Some(NatDecision {
+            rewrite_src: Some("172.16.80.8".parse().expect("snat")),
+            rewrite_dst: None,
+            ..NatDecision::default()
+        }),
+        "bare-host SNAT destination must translate traffic to the configured host (#2398)"
+    );
+    // Traffic to a different destination is NOT translated (scope held).
+    let miss = match_source_nat(
+        &rules,
+        "lan",
+        "wan",
+        "10.0.61.102".parse().expect("src"),
+        "172.16.80.201".parse().expect("other dst"),
+        Some("172.16.80.8".parse().expect("egress")),
+        None,
+    );
+    assert_eq!(
+        miss, None,
+        "bare-host SNAT destination must NOT translate traffic to a different host"
+    );
+}
+
+/// #2398 (v6): bare host v6 destination match scopes the SNAT on the
+/// destination path.
+#[test]
+fn snat_bare_host_destination_match_scopes_v6() {
+    let rules = parse_source_nat_rules(&[SourceNATRuleSnapshot {
+        name: "snat-bare-dst6".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        destination_addresses: vec!["2001:559:8585:80::200".to_string()],
+        interface_mode: true,
+        ..SourceNATRuleSnapshot::default()
+    }]);
+    let hit = match_source_nat(
+        &rules,
+        "lan",
+        "wan",
+        "2001:559:8585:ef00::100".parse().expect("src"),
+        "2001:559:8585:80::200".parse().expect("dst"),
+        None,
+        Some("2001:559:8585:80::8".parse().expect("egress")),
+    );
+    assert_eq!(
+        hit,
+        Some(NatDecision {
+            rewrite_src: Some("2001:559:8585:80::8".parse().expect("snat")),
+            rewrite_dst: None,
+            ..NatDecision::default()
+        }),
+        "bare-host v6 SNAT destination must translate traffic to the configured host (#2398)"
+    );
+    let miss = match_source_nat(
+        &rules,
+        "lan",
+        "wan",
+        "2001:559:8585:ef00::100".parse().expect("src"),
+        "2001:559:8585:80::201".parse().expect("other dst"),
+        None,
+        Some("2001:559:8585:80::8".parse().expect("egress")),
+    );
+    assert_eq!(
+        miss, None,
+        "bare-host v6 SNAT destination must NOT translate traffic to a different host"
+    );
+}
+
 /// #2398: a bare host match IP (no `/prefix`) correctly scopes the SNAT. Junos
 /// carries `match source-address 10.0.61.102` verbatim; `IpNet::from_str`
 /// rejects a bare IP, so without the bare-IP /32 fallback this rule would have
