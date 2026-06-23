@@ -37,8 +37,14 @@ use std::sync::Arc;
 /// and the orchestrator aborts WITHOUT teardown or publish — the prior
 /// generation stays published and the prior workers keep running.
 ///
-/// The optional maps (conntrack v4/v6, dnat tables) are best-effort:
-/// they never gate the reconcile, matching the historical behavior.
+/// The optional maps (conntrack v4/v6, dnat tables) are configured
+/// per-feature: an EMPTY pin means the feature is absent (silent `None`,
+/// the common case), but a PRESENT pin is the signal the feature IS
+/// configured, so a present pin that fails to open is fatal — it aborts
+/// the reconcile via the same fail-closed path as a mandatory map (#2444,
+/// codex review-033 033-23). This prevents the helper from running
+/// degraded (lost session zone/iface visibility; broken embedded-ICMP NAT
+/// reversal → PMTUD/traceroute breakage) with no readiness signal.
 pub(super) fn preflight_map_fds(
     coord: &mut Coordinator,
     snapshot: &ConfigSnapshot,
@@ -107,32 +113,57 @@ pub(super) fn preflight_map_fds(
             return None;
         }
     };
-    // Open BPF conntrack maps (sessions, sessions_v6) so the helper can
-    // publish session entries that "show security flow session" reads.
-    // Non-fatal: if the maps don't exist, session display will lack
-    // zone/interface info.
-    let conntrack_v4_fd = if !snapshot.map_pins.conntrack_v4.is_empty() {
-        OwnedFd::open_bpf_map(&snapshot.map_pins.conntrack_v4).ok()
-    } else {
-        None
+    // #2444: Open the optional BPF maps (conntrack v4/v6, dnat tables)
+    // with the same EMPTY-vs-PRESENT discipline as the mandatory maps.
+    // The pin string IS the "feature configured" signal:
+    //   - empty pin  -> feature absent -> None (the common case; many
+    //     deploys carry no conntrack/dnat pins). Returns None silently;
+    //     it never gates the reconcile.
+    //   - present pin + open Ok  -> Some(fd).
+    //   - present pin + open Err -> the feature WAS configured but its
+    //     map cannot be opened (permission / pin mismatch / corruption).
+    //     Running degraded would silently lose session zone/interface
+    //     visibility (conntrack) or break embedded-ICMP NAT reversal —
+    //     PMTUD / traceroute breakage (dnat) — with NO readiness signal.
+    //     So fail closed exactly like the mandatory maps: record a
+    //     descriptive stage + per-binding last_error and return None to
+    //     abort BEFORE teardown/publish (#2440 invariant: prior
+    //     generation + workers stay live).
+    let conntrack_v4_fd = match open_optional_map(
+        coord,
+        bindings,
+        &snapshot.map_pins.conntrack_v4,
+        "conntrack_v4",
+    ) {
+        Ok(fd) => fd,
+        Err(()) => return None,
     };
-    let conntrack_v6_fd = if !snapshot.map_pins.conntrack_v6.is_empty() {
-        OwnedFd::open_bpf_map(&snapshot.map_pins.conntrack_v6).ok()
-    } else {
-        None
+    let conntrack_v6_fd = match open_optional_map(
+        coord,
+        bindings,
+        &snapshot.map_pins.conntrack_v6,
+        "conntrack_v6",
+    ) {
+        Ok(fd) => fd,
+        Err(()) => return None,
     };
-    // Open dnat_table BPF map for embedded ICMP NAT reversal support.
-    // Non-fatal: if the map doesn't exist, embedded ICMP won't work
-    // but normal forwarding is unaffected.
-    let dnat_table_fd = if !snapshot.map_pins.dnat_table.is_empty() {
-        OwnedFd::open_bpf_map(&snapshot.map_pins.dnat_table).ok()
-    } else {
-        None
+    let dnat_table_fd = match open_optional_map(
+        coord,
+        bindings,
+        &snapshot.map_pins.dnat_table,
+        "dnat_table",
+    ) {
+        Ok(fd) => fd,
+        Err(()) => return None,
     };
-    let dnat_table_v6_fd = if !snapshot.map_pins.dnat_table_v6.is_empty() {
-        OwnedFd::open_bpf_map(&snapshot.map_pins.dnat_table_v6).ok()
-    } else {
-        None
+    let dnat_table_v6_fd = match open_optional_map(
+        coord,
+        bindings,
+        &snapshot.map_pins.dnat_table_v6,
+        "dnat_table_v6",
+    ) {
+        Ok(fd) => fd,
+        Err(()) => return None,
     };
     let dnat_fds = DnatTableFds {
         v4: dnat_table_fd.as_ref().map(|f| f.fd),
@@ -148,6 +179,41 @@ pub(super) fn preflight_map_fds(
         dnat_table_v6_fd,
         dnat_fds,
     })
+}
+
+/// #2444: open an OPTIONAL BPF map pin with empty-vs-present discipline.
+///
+/// - empty pin -> `Ok(None)` (feature genuinely absent; no gating). This
+///   is the anti-over-gate path: the overwhelmingly common deploy has no
+///   conntrack/dnat pins and must reconcile normally.
+/// - present pin + open Ok -> `Ok(Some(fd))`.
+/// - present pin + open Err -> the feature was configured but its map is
+///   unopenable. Set `coord.last_reconcile_stage =
+///   "open_{name}_map_failed:{err}"` + per-registered-binding
+///   `last_error`, then return `Err(())` so the caller aborts the
+///   reconcile BEFORE teardown/publish (fail closed, mirroring the
+///   mandatory maps in `preflight_map_fds`).
+fn open_optional_map(
+    coord: &mut Coordinator,
+    bindings: &mut [BindingStatus],
+    pin: &str,
+    name: &str,
+) -> Result<Option<OwnedFd>, ()> {
+    if pin.is_empty() {
+        return Ok(None);
+    }
+    match OwnedFd::open_bpf_map(pin) {
+        Ok(fd) => Ok(Some(fd)),
+        Err(err) => {
+            coord.last_reconcile_stage = format!("open_{name}_map_failed:{err}");
+            for binding in bindings.iter_mut() {
+                if binding.registered {
+                    binding.last_error = format!("open {name} map: {err}");
+                }
+            }
+            Err(())
+        }
+    }
 }
 
 pub(super) fn apply_snapshot(

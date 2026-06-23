@@ -178,20 +178,43 @@ mandatory BPF map FDs**:
   down the prior workers or publishing a newer generation. The previous
   (stale-but-correct) forwarding generation stays published and the
   prior workers keep running.
-- Only once all mandatory FDs are in hand does the orchestrator tear
-  down + rebuild + publish. The optional maps (conntrack v4/v6, dnat
-  tables) remain best-effort and never gate the reconcile.
+- The optional maps (conntrack v4/v6, dnat tables) are opened in the same
+  preflight with an **empty-vs-present** discipline (codex review-033
+  finding 033-23, #2444). The pin string IS the "feature configured"
+  signal:
+  - An **empty** pin means the feature is genuinely absent — the common
+    case, since many deploys carry no conntrack/dnat pins. It yields
+    `None` silently and never gates the reconcile (the anti-over-gate
+    case).
+  - A **present** pin that fails to open means the feature WAS configured
+    but its map is unopenable (permission / pin mismatch / corruption).
+    That is fatal: it aborts the reconcile via the same fail-closed path
+    as a mandatory map (`open_<map>_map_failed:<err>` stage +
+    per-binding `last_error`, return before teardown/publish). Running
+    degraded would otherwise silently lose session zone/interface
+    visibility (conntrack) or break embedded-ICMP NAT reversal —
+    PMTUD/traceroute breakage (dnat) — with no readiness signal.
+- Only once all mandatory FDs **and** every present-and-configured
+  optional FD are in hand does the orchestrator tear down + rebuild +
+  publish.
 
 This closes a fail-open partial-apply window (codex review-033 finding
 033-01): previously the FD open happened *after* teardown + publish, so
 a snapshot with an unopenable required pin tore down the workers,
 published a newer generation, then aborted bring-up — leaving the helper
 advertising a data-plane view backed by no running workers. On a
-security appliance that is fail-open. Regression coverage lives in
-`coordinator/tests.rs`
+security appliance that is fail-open. Finding 033-23 (#2444) extended the
+same fail-closed treatment to a present-but-unopenable optional map (the
+prior `.ok()` swallowed the error and ran degraded). Regression coverage
+lives in `coordinator/tests.rs`
 (`reconcile_mandatory_map_open_failure_keeps_prior_generation_published`,
 `reconcile_missing_session_pin_keeps_prior_generation_published`,
-`reconcile_all_mandatory_maps_open_advances_published_generation`) using
+`reconcile_all_mandatory_maps_open_advances_published_generation`;
+optional-map: `reconcile_present_conntrack_pin_open_failure_keeps_prior_generation`,
+`reconcile_present_dnat_pin_open_failure_keeps_prior_generation`,
+`reconcile_empty_optional_pins_advance_published_generation` — the
+anti-over-gate control —, and
+`reconcile_present_optional_pins_open_ok_advance_generation`) using
 the `bpf_map::pin` sentinel-path test seam (`TEST_MAP_PIN_OK` /
 `TEST_MAP_PIN_FAIL`) so the ordering is exercised without real bpffs
 pins.
