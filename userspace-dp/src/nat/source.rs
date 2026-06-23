@@ -11,7 +11,7 @@ use super::allocator::{
 use super::{NatCounterStore, NatDecision, NatRuleCounter};
 use crate::SourceNATRuleSnapshot;
 use crate::prefix::{PrefixV4, PrefixV6};
-use ipnet::IpNet;
+use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use rustc_hash::FxHashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::Arc;
@@ -116,6 +116,17 @@ pub(crate) struct SourceNatRule {
     pub(crate) source_v6: Vec<PrefixV6>,
     pub(crate) destination_v4: Vec<PrefixV4>,
     pub(crate) destination_v6: Vec<PrefixV6>,
+    /// #2398: whether the rule carried a `match source-address` constraint at
+    /// all (snapshot source list non-empty), independent of how many entries
+    /// parsed. `false` = unscoped source -> match any source (unchanged
+    /// behavior). `true` but BOTH `source_v4`/`source_v6` empty (every
+    /// configured prefix failed to parse) => match NOTHING (fail closed), never
+    /// the pre-#2398 collapse-to-match-any fail-open broadening.
+    pub(crate) source_constrained: bool,
+    /// #2398: whether the rule carried a `match destination-address`
+    /// constraint at all. Same fail-closed semantics as `source_constrained`,
+    /// for the destination match set.
+    pub(crate) destination_constrained: bool,
     pub(crate) interface_mode: bool,
     pub(crate) off: bool,
     pub(crate) pool_name: String,
@@ -171,10 +182,12 @@ impl SourceNatRule {
         }
         match (src_ip, dst_ip) {
             (IpAddr::V4(src), IpAddr::V4(dst)) => {
-                nets_match_v4(&self.source_v4, src) && nets_match_v4(&self.destination_v4, dst)
+                nets_match_v4(self.source_constrained, &self.source_v4, src)
+                    && nets_match_v4(self.destination_constrained, &self.destination_v4, dst)
             }
             (IpAddr::V6(src), IpAddr::V6(dst)) => {
-                nets_match_v6(&self.source_v6, src) && nets_match_v6(&self.destination_v6, dst)
+                nets_match_v6(self.source_constrained, &self.source_v6, src)
+                    && nets_match_v6(self.destination_constrained, &self.destination_v6, dst)
             }
             _ => false,
         }
@@ -231,19 +244,27 @@ pub(crate) fn parse_source_nat_rules_with_previous(
             hit_counter: nat_counters.rule_counter(snap.counter_id),
             ..SourceNatRule::default()
         };
+        // #2398: record whether each match set was scoped at all (snapshot list
+        // non-empty), independent of how many prefixes parse. These flags drive
+        // the fail-closed distinction in `nets_match_*`: a rule that WAS scoped
+        // but whose configured prefixes ALL fail to parse must match NOTHING,
+        // not collapse to match-any (the pre-#2398 fail-open broadening). An
+        // unscoped (empty) set keeps "match any" (anti-over-restrict).
+        rule.source_constrained = !snap.source_addresses.is_empty();
+        rule.destination_constrained = !snap.destination_addresses.is_empty();
+        // #2398: parse each match prefix as a CIDR, falling back to a bare host
+        // IP -> /32 (v4) or /128 (v6). Junos carries source/destination-address
+        // verbatim and the Go compiler does NOT normalize it, so a bare host
+        // reaches the wire with no `/prefix`; `IpNet::from_str` REQUIRES
+        // `addr/prefix` and rejects a bare IP. Without the fallback a bare-host
+        // match would skip its only entry, leave the list empty, and (pre-#2398)
+        // silently match ANY address — the exact fail-open this fix closes (and
+        // the same bare-IP live bug fixed for DNAT in #2394).
         for prefix in &snap.source_addresses {
-            match prefix.parse::<IpNet>() {
-                Ok(IpNet::V4(net)) => rule.source_v4.push(PrefixV4::from_net(net)),
-                Ok(IpNet::V6(net)) => rule.source_v6.push(PrefixV6::from_net(net)),
-                Err(_) => {}
-            }
+            parse_match_prefix(prefix, &mut rule.source_v4, &mut rule.source_v6);
         }
         for prefix in &snap.destination_addresses {
-            match prefix.parse::<IpNet>() {
-                Ok(IpNet::V4(net)) => rule.destination_v4.push(PrefixV4::from_net(net)),
-                Ok(IpNet::V6(net)) => rule.destination_v6.push(PrefixV6::from_net(net)),
-                Err(_) => {}
-            }
+            parse_match_prefix(prefix, &mut rule.destination_v4, &mut rule.destination_v6);
         }
         // Parse pool addresses and port range for pool-mode SNAT.
         let mut invalid_pool_address = false;
@@ -624,10 +645,56 @@ pub(crate) fn match_source_nat_result_for_tuple(
     SourceNatLookup::NoMatch
 }
 
-fn nets_match_v4(nets: &[PrefixV4], ip: Ipv4Addr) -> bool {
-    nets.is_empty() || nets.iter().any(|net| net.contains(ip))
+/// #2398: parse one match prefix into the family-appropriate prefix vec. A CIDR
+/// (`10.0.0.0/24`) is parsed directly; a bare host IP (`10.0.0.5`) — which
+/// `IpNet::from_str` rejects — falls back to a /32 (v4) or /128 (v6). A prefix
+/// that parses as neither is dropped (it narrows the match rather than widening
+/// it); the `*_constrained` flag, set from the snapshot list being non-empty,
+/// makes an all-malformed set fail closed in `nets_match_*`.
+fn parse_match_prefix(prefix: &str, v4: &mut Vec<PrefixV4>, v6: &mut Vec<PrefixV6>) {
+    match prefix.parse::<IpNet>() {
+        Ok(IpNet::V4(net)) => v4.push(PrefixV4::from_net(net)),
+        Ok(IpNet::V6(net)) => v6.push(PrefixV6::from_net(net)),
+        Err(_) => match prefix.parse::<IpAddr>() {
+            Ok(IpAddr::V4(addr)) => {
+                if let Ok(net) = Ipv4Net::new(addr, 32) {
+                    v4.push(PrefixV4::from_net(net));
+                }
+            }
+            Ok(IpAddr::V6(addr)) => {
+                if let Ok(net) = Ipv6Net::new(addr, 128) {
+                    v6.push(PrefixV6::from_net(net));
+                }
+            }
+            Err(_) => {}
+        },
+    }
 }
 
-fn nets_match_v6(nets: &[PrefixV6], ip: Ipv6Addr) -> bool {
-    nets.is_empty() || nets.iter().any(|net| net.contains(ip))
+/// #2398: match a v4 IP against a rule's match set.
+///
+/// - `constrained == false` (unscoped match set): match any IP (unchanged).
+/// - `constrained == true` but `nets` empty (every configured prefix failed to
+///   parse): match NOTHING — fail closed, never the pre-#2398 collapse to
+///   match-any fail-open broadening.
+/// - otherwise: the IP must fall in one of the parsed prefixes.
+fn nets_match_v4(constrained: bool, nets: &[PrefixV4], ip: Ipv4Addr) -> bool {
+    if !constrained {
+        return true;
+    }
+    if nets.is_empty() {
+        return false;
+    }
+    nets.iter().any(|net| net.contains(ip))
+}
+
+/// #2398: match a v6 IP against a rule's match set. See `nets_match_v4`.
+fn nets_match_v6(constrained: bool, nets: &[PrefixV6], ip: Ipv6Addr) -> bool {
+    if !constrained {
+        return true;
+    }
+    if nets.is_empty() {
+        return false;
+    }
+    nets.iter().any(|net| net.contains(ip))
 }
