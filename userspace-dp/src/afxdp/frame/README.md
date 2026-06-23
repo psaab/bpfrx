@@ -106,6 +106,32 @@ inspect or rewrite a packet sitting in a UMEM frame.
   it stamps `(0, 0)` ports instead of synthesizing them. Composes with
   the #2293-era screen fragment classification (`extract_screen_info`),
   which independently sees and screens non-first fragments.
+- **L4 ports are bounded by the IP-DECLARED packet length (#2361)**: the
+  live ingress parsers (`parse_ipv4_session_flow_from_frame`, the IPv6 arm
+  of `parse_session_flow_from_frame`, the meta-offset fallback in
+  `parse_session_flow_from_bytes`, and the meta fast-path readers
+  `live_frame_ports_from_meta_bytes` / `live_frame_ports_bytes`) read the
+  L4 ports via `parse_flow_ports(frame, l4, proto, declared_end)`, where
+  `declared_end` is `ipv4_declared_l3_end` (`l3 + total_len`) /
+  `ipv6_declared_l3_end` (`l3 + 40 + payload_len`), each CLAMPED to the
+  backing slice. The 4 port bytes (2 ident bytes for ICMP) MUST lie inside
+  `declared_end` — a frame whose `total_len` / `payload_len` declares a
+  short datagram but carries trailing slack (NIC zero-pad on a sub-60-byte
+  frame, or attacker-supplied bytes) returns `None` rather than reading the
+  out-of-datagram bytes as ports. Before #2361 the read was bounded only by
+  the slice (and the fragment gate), so out-of-packet padding could spell a
+  TCP/UDP port pair that then drove port-based policy, firewall-filter
+  matching, CoS queue selection, and session installation. A `None` result
+  is flowless (the same route-based, session-less forward path #2344 uses).
+  This MIRRORS the sibling generated-reply parser, which already enforced
+  the identical bound as a fail-closed security invariant
+  (`generated.rs::generated_l4_ports`, clamping to
+  `total_len` / `40+payload_len` before extracting ports, #2238/#2321) — so
+  the live ingress path and the generated path now treat an out-of-IP-bound
+  L4 identically. The meta fast path is gated too: the XDP shim stamps
+  `meta.l4_offset` but does NOT enforce the IP-declared bound, so the meta
+  readers re-derive `declared_end` from the L3 header in the frame before
+  reading ports (mirroring #2357's meta-fast-path chokepoint concern).
 - **TCP inspection helpers are ext-header-aware (#2148)**: the read-only
   diagnostic/telemetry helpers `frame_has_tcp_rst`,
   `extract_tcp_flags_and_window`, and `extract_tcp_window` (`tcp.rs`) all

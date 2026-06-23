@@ -1,5 +1,35 @@
 # Action Log
 
+## 2026-06-22 — #2361 live frame parser: bound L4 ports by IP-declared length
+
+- **Timestamp**: 2026-06-22 PDT
+- **Action**: Fixed a HIGH input-validation gap (#2361). The live AF_XDP
+  frame parser read L4 ports bounded only by the backing slice (and the
+  fragment gate), never by the IPv4 `total_len` / IPv6 `payload_len`. A
+  frame declaring a short datagram but carrying trailing slack (NIC
+  zero-pad or attacker bytes) could have its ports read from out-of-packet
+  bytes → bogus tuple drives policy / firewall-filter / CoS / session
+  install. Added `ipv4_declared_l3_end` / `ipv6_declared_l3_end` /
+  `declared_l3_end` helpers (clamp `l3+total_len` / `l3+40+payload_len` to
+  the slice) and a `declared_end` parameter on `parse_flow_ports`: TCP/UDP
+  (4 bytes) and ICMP ident (2 bytes at +4) must lie within `declared_end`,
+  else `None` (flowless / route-based forward, consistent with #2344).
+  Updated all live callers — the v4/v6 frame-led parsers, the meta-offset
+  fallback in `parse_session_flow_from_bytes`, and the meta fast-path
+  readers `live_frame_ports_from_meta_bytes` / `live_frame_ports_bytes`
+  (re-derive `declared_end` from the frame's L3 header; the XDP shim does
+  NOT enforce the bound). Mirrors the sibling generated-reply parser's
+  fail-closed `generated_l4_ports` bound (#2238/#2321) so both paths treat
+  an out-of-IP-bound L4 identically. Added 11 fail-on-revert unit tests
+  (v4/v6, frame-led + meta fallback + meta fast path + helper clamp truth +
+  anti-over-gate well-formed cases); 7 fail when the bound is reverted to
+  slice-only. cargo build --release clean; full suite green (one unrelated
+  pre-existing worker_queue concurrency flake, passes 3/3 in isolation).
+- **File(s)**: userspace-dp/src/afxdp/frame/inspect.rs (helpers + bound +
+  all callers + test module decl), userspace-dp/src/afxdp/frame/inspect_tests.rs
+  (new), userspace-dp/src/afxdp/frame/prop_tests/inspect.rs (arity),
+  userspace-dp/src/afxdp/frame/README.md (invariant).
+
 ## 2026-06-22 — #2360 Copilot fold: SSOT const for conntrack map size
 
 - **Timestamp**: 2026-06-22 PDT

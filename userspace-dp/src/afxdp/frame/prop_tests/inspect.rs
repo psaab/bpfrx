@@ -18,7 +18,7 @@ fn call_all_parsers(frame: &[u8], meta: UserspaceDpMeta, l4_probe: usize) {
     let _ = frame_l4_offset(frame, meta.addr_family);
     let _ = packet_rel_l4_offset(frame, meta.addr_family);
     let _ = packet_rel_l4_offset_and_protocol(frame, meta.addr_family);
-    let _ = parse_flow_ports(frame, l4_probe, meta.protocol);
+    let _ = parse_flow_ports(frame, l4_probe, meta.protocol, frame.len());
     let _ = parse_session_flow_from_bytes(frame, meta);
     let _ = parse_session_flow_from_frame(frame, meta);
     let _ = parse_ipv4_session_flow_from_frame(frame, meta);

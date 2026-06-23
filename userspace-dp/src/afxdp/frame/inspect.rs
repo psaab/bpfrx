@@ -388,21 +388,105 @@ pub(in crate::afxdp) fn metadata_tuple_complete(meta: UserspaceDpMeta, flow: &Se
     }
 }
 
+/// The frame-relative byte offset at which the IPv4 datagram ENDS, as
+/// declared by the IP header `total_len` (bytes [l3+2..l3+4]), clamped to
+/// `[l3 + ihl, frame.len()]`.
+///
+/// #2361 fail-CLOSED: the L4 port read MUST be bounded by the IP-DECLARED
+/// packet end, not merely the backing slice. A frame whose `total_len`
+/// declares a short datagram but carries trailing slack (NIC zero-pad on a
+/// sub-60-byte frame, or attacker-supplied bytes) would otherwise have its
+/// "ports" read from out-of-datagram bytes. We clamp to the slice so a
+/// truncated capture (slice shorter than `total_len`) also fails closed
+/// (the read still cannot exceed what is present). Mirrors the
+/// `total_len.clamp(ihl, packet.len())` bound the sibling generated-reply
+/// parser enforces (`generated.rs::parse_generated_v4`).
+///
+/// Returns `None` when the IPv4 header itself is truncated/malformed
+/// (caller already validated `frame.len() >= l3 + 20` and `ihl >= 20`, so
+/// this is belt-and-suspenders for stray callers).
+pub(in crate::afxdp) fn ipv4_declared_l3_end(frame: &[u8], l3: usize) -> Option<usize> {
+    if frame.len() < l3 + 20 {
+        return None;
+    }
+    let ihl = usize::from(frame[l3] & 0x0f) * 4;
+    if ihl < 20 {
+        return None;
+    }
+    let total_len = u16::from_be_bytes([frame[l3 + 2], frame[l3 + 3]]) as usize;
+    Some(l3.saturating_add(total_len).clamp(l3 + ihl, frame.len()))
+}
+
+/// The frame-relative byte offset at which the IPv6 datagram ENDS, as
+/// declared by the fixed-header `payload_len` (bytes [l3+4..l3+6]), clamped
+/// to `[l3 + 40, frame.len()]`.
+///
+/// #2361 fail-CLOSED counterpart of [`ipv4_declared_l3_end`]: the IPv6
+/// packet end is `l3 + 40 + payload_len`. Mirrors the
+/// `(40 + payload_len).clamp(40, packet.len())` bound in
+/// `generated.rs::parse_generated_v6`.
+pub(in crate::afxdp) fn ipv6_declared_l3_end(frame: &[u8], l3: usize) -> Option<usize> {
+    if frame.len() < l3 + 40 {
+        return None;
+    }
+    let payload_len = u16::from_be_bytes([frame[l3 + 4], frame[l3 + 5]]) as usize;
+    Some(
+        l3.saturating_add(40)
+            .saturating_add(payload_len)
+            .clamp(l3 + 40, frame.len()),
+    )
+}
+
+/// IP-declared datagram end for either family, given the L3 offset and the
+/// address family. `None` for an unknown family or a truncated L3 header.
+pub(in crate::afxdp) fn declared_l3_end(frame: &[u8], l3: usize, addr_family: u8) -> Option<usize> {
+    match addr_family as i32 {
+        libc::AF_INET => ipv4_declared_l3_end(frame, l3),
+        libc::AF_INET6 => ipv6_declared_l3_end(frame, l3),
+        _ => None,
+    }
+}
+
+/// Read the L4 ports at `l4`, bounded by BOTH the backing slice AND the
+/// IP-DECLARED packet end (`declared_end`, the slice-clamped
+/// `ipv4_declared_l3_end` / `ipv6_declared_l3_end`).
+///
+/// #2361 fail-CLOSED: TCP/UDP need 4 port bytes at `[l4, l4+4)`; ICMP/ICMPv6
+/// read the 2 identifier bytes at `[l4+4, l4+6)`. The read MUST lie entirely
+/// within `declared_end`. When the IP header declares a datagram that ends
+/// BEFORE the L4 ports — even though the backing buffer still holds trailing
+/// slack/padding bytes — this returns `None` rather than synthesizing ports
+/// from out-of-datagram bytes. The caller treats `None` as flowless (the
+/// packet follows the route-based, session-less forward path, consistent with
+/// the #2344 non-first-fragment handling), so out-of-packet bytes never drive
+/// policy / firewall-filter / CoS / session installation. This is the same
+/// invariant the sibling generated-reply parser enforces via
+/// `generated.rs::generated_l4_ports`.
 pub(in crate::afxdp) fn parse_flow_ports(
     frame: &[u8],
     l4: usize,
     protocol: u8,
+    declared_end: usize,
 ) -> Option<(u16, u16)> {
     match protocol {
         PROTO_TCP | PROTO_UDP => {
-            let bytes = frame.get(l4..l4 + 4)?;
+            let end = l4.checked_add(4)?;
+            if end > declared_end {
+                return None;
+            }
+            let bytes = frame.get(l4..end)?;
             Some((
                 u16::from_be_bytes([bytes[0], bytes[1]]),
                 u16::from_be_bytes([bytes[2], bytes[3]]),
             ))
         }
         PROTO_ICMP | PROTO_ICMPV6 => {
-            let bytes = frame.get(l4 + 4..l4 + 6)?;
+            let ident_start = l4.checked_add(4)?;
+            let ident_end = l4.checked_add(6)?;
+            if ident_end > declared_end {
+                return None;
+            }
+            let bytes = frame.get(ident_start..ident_end)?;
             let ident = u16::from_be_bytes([bytes[0], bytes[1]]);
             Some((ident, 0))
         }
@@ -460,8 +544,18 @@ pub(in crate::afxdp) fn live_frame_ports_from_meta_bytes(
         return None;
     }
     let l4 = meta.l4_offset as usize;
+    // #2361: bound the meta-stamped L4 read by the IP-declared packet end,
+    // not just the slice. The XDP shim stamps `meta.l4_offset` but does NOT
+    // enforce that the L4 header lies inside the IP-declared datagram, so a
+    // frame with a short total_len/payload_len + trailing slack could have
+    // its ports read past the datagram. We re-derive the declared end from
+    // the L3 header in the frame (using `meta.l3_offset`). If the meta
+    // offsets are unusable, fall through to the byte-led parser, which
+    // re-derives both L3 and the declared end from the frame.
     if l4 != 0
-        && let Some(ports) = parse_flow_ports(frame, l4, meta.protocol)
+        && let Some(declared_end) =
+            declared_l3_end(frame, meta.l3_offset as usize, meta.addr_family)
+        && let Some(ports) = parse_flow_ports(frame, l4, meta.protocol, declared_end)
     {
         return Some(ports);
     }
@@ -476,8 +570,12 @@ pub(in crate::afxdp) fn live_frame_ports_bytes(
     if !matches!(protocol, PROTO_TCP | PROTO_UDP) {
         return None;
     }
+    let l3 = frame_l3_offset(frame)?;
     let l4 = frame_l4_offset(frame, addr_family)?;
-    parse_flow_ports(frame, l4, protocol)
+    // #2361: bound by the IP-declared packet end (re-derived from the frame),
+    // not just the backing slice.
+    let declared_end = declared_l3_end(frame, l3, addr_family)?;
+    parse_flow_ports(frame, l4, protocol, declared_end)
 }
 
 pub(in crate::afxdp) fn forward_tuple_mismatch_reason(
@@ -612,7 +710,9 @@ pub(in crate::afxdp) fn parse_session_flow_from_bytes(
                 frame[l3 + 18],
                 frame[l3 + 19],
             ));
-            let (src_port, dst_port) = parse_flow_ports(frame, l4, meta.protocol)?;
+            // #2361: bound by the IP-declared packet end, not just the slice.
+            let declared_end = ipv4_declared_l3_end(frame, l3)?;
+            let (src_port, dst_port) = parse_flow_ports(frame, l4, meta.protocol, declared_end)?;
             Some(SessionFlow {
                 src_ip,
                 dst_ip,
@@ -640,7 +740,9 @@ pub(in crate::afxdp) fn parse_session_flow_from_bytes(
             let dst_ip = IpAddr::V6(Ipv6Addr::from(
                 <[u8; 16]>::try_from(&frame[l3 + 24..l3 + 40]).ok()?,
             ));
-            let (src_port, dst_port) = parse_flow_ports(frame, l4, meta.protocol)?;
+            // #2361: bound by the IP-declared packet end, not just the slice.
+            let declared_end = ipv6_declared_l3_end(frame, l3)?;
+            let (src_port, dst_port) = parse_flow_ports(frame, l4, meta.protocol, declared_end)?;
             Some(SessionFlow {
                 src_ip,
                 dst_ip,
@@ -790,7 +892,10 @@ pub(in crate::afxdp) fn parse_session_flow_from_frame(
             let dst_ip = IpAddr::V6(Ipv6Addr::from(
                 <[u8; 16]>::try_from(&frame[l3 + 24..l3 + 40]).ok()?,
             ));
-            let (src_port, dst_port) = parse_flow_ports(frame, l4, meta.protocol)?;
+            // #2361: bound the L4 port read by the IP-declared packet end
+            // (l3 + 40 + payload_len, slice-clamped), not just the slice.
+            let declared_end = ipv6_declared_l3_end(frame, l3)?;
+            let (src_port, dst_port) = parse_flow_ports(frame, l4, meta.protocol, declared_end)?;
             Some(SessionFlow {
                 src_ip,
                 dst_ip,
@@ -895,7 +1000,12 @@ pub(in crate::afxdp) fn parse_ipv4_session_flow_from_frame(
         frame[l3 + 18],
         frame[l3 + 19],
     ));
-    let (src_port, dst_port) = parse_flow_ports(frame, l4, protocol)?;
+    // #2361: bound the L4 port read by the IP-declared packet end
+    // (l3 + total_len, slice-clamped), not just the slice. A short total_len
+    // with trailing slack/padding must NOT yield ports from out-of-datagram
+    // bytes.
+    let declared_end = ipv4_declared_l3_end(frame, l3)?;
+    let (src_port, dst_port) = parse_flow_ports(frame, l4, protocol, declared_end)?;
     Some(SessionFlow {
         src_ip,
         dst_ip,
@@ -1004,3 +1114,7 @@ pub(in crate::afxdp) fn try_parse_metadata(area: &MmapArea, desc: XdpDesc) -> Op
     }
     Some(meta)
 }
+
+#[cfg(test)]
+#[path = "inspect_tests.rs"]
+mod inspect_iplen_tests;
