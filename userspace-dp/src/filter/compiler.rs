@@ -377,7 +377,25 @@ fn parse_term(
         "accept" => FilterAction::Accept,
         "reject" => FilterAction::Reject,
         "discard" => FilterAction::Discard,
-        _ => FilterAction::Accept,
+        // #2399 (032-16): an EMPTY action is the legitimate "no terminating
+        // action" case — the term carries only modifiers (count/log/
+        // forwarding-class/...) and falls through to the next term, so it must
+        // NOT short-circuit to a terminating decision here (Accept preserves
+        // today's fall-through semantics). A NON-EMPTY but unrecognized action
+        // string, however, can only arrive from a mixed-version snapshot (the
+        // Go commit gate validateFilterActionsStrict now rejects an unknown
+        // `then` token before it is ever persisted). For a FIREWALL FILTER an
+        // unknown terminating action must fail CLOSED, never silently permit —
+        // map it to Discard rather than Accept.
+        "" => FilterAction::Accept,
+        other => {
+            eprintln!(
+                "xpf-filter: term {:?} carries an unknown action {:?}; \
+                 failing closed (discard) — snapshot/version drift",
+                snap.name, other
+            );
+            FilterAction::Discard
+        }
     };
     let dscp_rewrite = snap.dscp_rewrite.map(|value| value & 0x3f);
 

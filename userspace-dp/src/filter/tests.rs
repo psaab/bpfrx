@@ -3407,3 +3407,85 @@ fn non_first_fragment_still_matches_is_fragment() {
         "a non-first fragment IS a fragment — is-fragment must still match (#2362 fold A)"
     );
 }
+
+// #2399 (032-16): a snapshot/version-drift term carrying a NON-EMPTY but
+// unrecognized action string must fail CLOSED (discard), never silently permit.
+// The Go commit gate (validateFilterActionsStrict) rejects an unknown `then`
+// token before it can be persisted, so a non-empty unknown action can only
+// reach the dataplane via a mixed-version snapshot — and for a firewall filter
+// that must deny, not accept. MUST FAIL if parse_term's non-empty arm reverts
+// to FilterAction::Accept.
+#[test]
+fn unknown_nonempty_action_fails_closed_discard() {
+    let state = make_filter_state(
+        &[FirewallFilterSnapshot {
+            name: "drift".into(),
+            family: "inet".into(),
+            terms: vec![FirewallTermSnapshot {
+                name: "future-action".into(),
+                protocols: vec!["tcp".into()],
+                // An action a future/peer version understands but this one does
+                // not. Today's code silently treated this as Accept.
+                action: "future-permit".into(),
+                ..Default::default()
+            }],
+        }],
+        &[],
+    );
+    let r = evaluate_filter(
+        &state,
+        "inet:drift",
+        v4(10, 0, 0, 1),
+        v4(10, 0, 0, 2),
+        PROTO_TCP,
+        12345,
+        80,
+        0,
+        TermMatchExtra::default(),
+    );
+    assert_eq!(
+        r.action,
+        FilterAction::Discard,
+        "an unknown non-empty filter action must fail closed (discard), not accept"
+    );
+}
+
+// An EMPTY action is the legitimate "no terminating action" case: the term
+// carries only modifiers and falls through to the next term. It must remain
+// Accept (today's fall-through semantics) so a valid `then count`-only term is
+// not turned into a deny. MUST FAIL if the empty-string arm is folded into the
+// fail-closed default.
+#[test]
+fn empty_action_falls_through_to_accept() {
+    let state = make_filter_state(
+        &[FirewallFilterSnapshot {
+            name: "fallthrough".into(),
+            family: "inet".into(),
+            terms: vec![FirewallTermSnapshot {
+                name: "count-only".into(),
+                protocols: vec!["tcp".into()],
+                count: "c1".into(),
+                // No terminating action — empty string.
+                action: String::new(),
+                ..Default::default()
+            }],
+        }],
+        &[],
+    );
+    let r = evaluate_filter(
+        &state,
+        "inet:fallthrough",
+        v4(10, 0, 0, 1),
+        v4(10, 0, 0, 2),
+        PROTO_TCP,
+        12345,
+        80,
+        0,
+        TermMatchExtra::default(),
+    );
+    assert_eq!(
+        r.action,
+        FilterAction::Accept,
+        "an empty (no terminating) action must keep fall-through accept semantics"
+    );
+}
