@@ -81,10 +81,12 @@ pub(crate) struct FilterTerm {
     pub(crate) dest_v4: Vec<PrefixV4>,
     pub(crate) dest_v6: Vec<PrefixV6>,
     // #2400 (032-18): fail-closed flags for the source/destination ADDRESS
-    // match sets. `*_addr_constrained` is true when the term carried a
-    // NON-EMPTY configured address list in the snapshot — regardless of how
-    // many entries survived parsing. The matcher in `engine/matching.rs` uses
-    // it to tell apart an UNSCOPED term (constrained == false → match any
+    // match sets. `*_addr_constrained` is true when the term has at least one
+    // REAL match entry (`addr_is_real` in compiler.rs — EXCLUDING the empty
+    // string and the literal `any`), regardless of how many entries survived
+    // parsing. An explicit `from { source-address any; }` therefore stays
+    // UNCONSTRAINED (match-any). The matcher in `engine/matching.rs` uses the
+    // flag to tell apart an UNSCOPED term (constrained == false → match any
     // address) from a SCOPED term whose entries ALL failed to parse
     // (constrained == true but both prefix vecs empty for that family → match
     // NOTHING, fail closed). Without this flag an all-malformed address list

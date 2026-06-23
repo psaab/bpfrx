@@ -356,13 +356,14 @@ fn parse_term(
     for addr in &snap.destination_addresses {
         parse_address(addr, &mut dest_v4, &mut dest_v6);
     }
-    // #2400 (032-18): a term whose `from { source-address / destination-address }`
-    // stanza is non-empty in the snapshot is ADDRESS-CONSTRAINED. `addr_is_real`
-    // ignores the "any"/empty placeholders that `parse_address` already drops,
-    // so an explicit `from { source-address any; }` stays unconstrained (matches
-    // any) rather than degrading to fail-closed. When the term is constrained
-    // but every real entry failed to parse, the per-family vecs are empty and
-    // the matcher fails closed (see engine/matching.rs).
+    // #2400 (032-18): a term is ADDRESS-CONSTRAINED when it has at least one
+    // REAL `from { source-address / destination-address }` entry — `addr_is_real`
+    // EXCLUDES the empty string and the literal `any` (the placeholders
+    // `parse_address` already drops), so an explicit `from { source-address
+    // any; }` stays UNCONSTRAINED (match-any) rather than degrading to
+    // fail-closed. When the term is constrained but every real entry failed to
+    // parse, the per-family vecs are empty and the matcher fails closed (see
+    // engine/matching.rs).
     let source_addr_constrained = snap.source_addresses.iter().any(|a| addr_is_real(a));
     let dest_addr_constrained = snap.destination_addresses.iter().any(|a| addr_is_real(a));
     let protocols: Vec<u8> = snap

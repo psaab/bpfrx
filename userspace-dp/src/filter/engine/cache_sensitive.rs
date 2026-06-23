@@ -307,3 +307,95 @@ pub(crate) fn interface_output_filter_has_per_packet_l4_match(
     };
     filter.is_some_and(|filter| filter.has_per_packet_l4_match_terms)
 }
+
+#[cfg(test)]
+mod cache_sensitive_2400_tests {
+    use super::super::super::*;
+
+    // Compile a single-term filter from one snapshot and return its sole term.
+    fn term_from(snap: FirewallTermSnapshot) -> FilterTerm {
+        let state = parse_filter_state(
+            &[FirewallFilterSnapshot {
+                name: "f".into(),
+                family: "inet".into(),
+                terms: vec![snap],
+            }],
+            &[],
+            &[],
+            "",
+            "",
+        );
+        state
+            .filters
+            .get("inet:f")
+            .expect("filter compiled")
+            .terms
+            .first()
+            .expect("one term")
+            .clone()
+    }
+
+    /// #2400 (hostile reviewer MINOR): the unscoped <-> all-malformed ADDRESS
+    /// flip changes match semantics (match-any vs fail-closed) WITHOUT changing
+    /// any parsed vec/matcher — both leave `source_v4`/`source_v6` empty. The
+    /// ONLY difference is `source_addr_constrained`. `filter_term_semantics_match`
+    /// MUST report them as NOT equal so a flow-cache rebuild invalidates the
+    /// stale match-any verdict. REVERT (dropping the `*_constrained` comparisons
+    /// from `filter_term_semantics_match`) makes this assert FAIL.
+    #[test]
+    fn unscoped_vs_all_malformed_source_address_is_not_cache_equal() {
+        let unscoped = term_from(FirewallTermSnapshot {
+            name: "t".into(),
+            action: "discard".into(),
+            ..Default::default()
+        });
+        let all_malformed = term_from(FirewallTermSnapshot {
+            name: "t".into(),
+            source_addresses: vec!["not-an-ip".into()],
+            action: "discard".into(),
+            ..Default::default()
+        });
+        // Precondition: the parsed match state is otherwise identical — the only
+        // distinguishing bit is the constrained flag.
+        assert!(unscoped.source_v4.is_empty() && unscoped.source_v6.is_empty());
+        assert!(all_malformed.source_v4.is_empty() && all_malformed.source_v6.is_empty());
+        assert!(!unscoped.source_addr_constrained);
+        assert!(all_malformed.source_addr_constrained);
+
+        assert!(
+            !super::filter_term_semantics_match(&unscoped, &all_malformed),
+            "unscoped vs all-malformed address must NOT be cache-equal \
+             (the *_constrained flip must invalidate cached verdicts)"
+        );
+        // A term compared with itself stays equal (no spurious invalidation).
+        assert!(super::filter_term_semantics_match(&unscoped, &unscoped));
+        assert!(super::filter_term_semantics_match(&all_malformed, &all_malformed));
+    }
+
+    /// Same flip for the PORT match set: unscoped (PortMatcher::Any,
+    /// unconstrained) vs all-malformed (PortMatcher::Any, constrained) — the
+    /// matcher is byte-identical, only `source_port_constrained` differs.
+    #[test]
+    fn unscoped_vs_all_malformed_source_port_is_not_cache_equal() {
+        let unscoped = term_from(FirewallTermSnapshot {
+            name: "t".into(),
+            action: "discard".into(),
+            ..Default::default()
+        });
+        let all_malformed = term_from(FirewallTermSnapshot {
+            name: "t".into(),
+            source_ports: vec!["70000".into()], // out of range -> no parsed range
+            action: "discard".into(),
+            ..Default::default()
+        });
+        assert_eq!(unscoped.source_ports, PortMatcher::Any);
+        assert_eq!(all_malformed.source_ports, PortMatcher::Any);
+        assert!(!unscoped.source_port_constrained);
+        assert!(all_malformed.source_port_constrained);
+
+        assert!(
+            !super::filter_term_semantics_match(&unscoped, &all_malformed),
+            "unscoped vs all-malformed port must NOT be cache-equal"
+        );
+    }
+}

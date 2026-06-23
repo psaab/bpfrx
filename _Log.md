@@ -11419,3 +11419,34 @@ top.
     userspace-dp/src/filter/engine/matching.rs,
     userspace-dp/src/filter/engine/cache_sensitive.rs,
     userspace-dp/src/filter/tests.rs, userspace-dp/src/filter/README.md, _Log.md
+
+- **Timestamp**: 2026-06-23
+- **Action**: #2400 PR #2422 fold round (pre-merge; hostile reviewer MERGE-READY
+    — doc-accuracy + test-coverage, NO production logic change).
+    (1) Corrected the `*_addr_constrained` doc comments (mod.rs, compiler.rs) that
+    inaccurately said "true when the configured address list is NON-EMPTY": the
+    actual logic is `addr_is_real` — constrained when the term has at least one
+    REAL match entry EXCLUDING ""/"any", so an explicit `source-address any`
+    stays UNCONSTRAINED (match-any). README wording was already accurate.
+    (2) Added `term_2400_all_malformed_destination_address_fails_closed_v6` — the
+    inet6 destination-address fail-closed case was missing (only had v6 source +
+    v4 dest). Test set is now v4 src+dst AND v6 src+dst (the earlier log claim is
+    now accurate).
+    (3) Added two cache-sensitivity flip tests in cache_sensitive.rs
+    (cache_sensitive_2400_tests): `unscoped_vs_all_malformed_source_address_is_not_cache_equal`
+    and `..._source_port_is_not_cache_equal` — assert filter_term_semantics_match
+    reports NOT-equal across the unscoped↔all-malformed flip (parsed vecs/matcher
+    identical, only the *_constrained flag differs), pinning that a cached verdict
+    is invalidated. Both build the FilterTerm via parse_filter_state from
+    snapshots that differ only in scope.
+    All 3 new tests fail-on-revert proven: reverting nets_match_v6 to fail-open
+    fails the v6-dest test; dropping the *_constrained comparisons from
+    filter_term_semantics_match fails both flip tests. Total #2400 tests now 13
+    (11 matcher fail-closed/scope tests + 2 cache-sensitivity flip tests). cargo
+    build --release + cargo test -- filter / cache_sensitive_2400 green, 5x
+    stable; go build + go test ./pkg/config ./pkg/dataplane
+    ./pkg/dataplane/userspace green; protocol_wire_v1.json unchanged.
+- **File(s)**: userspace-dp/src/filter/mod.rs,
+    userspace-dp/src/filter/compiler.rs,
+    userspace-dp/src/filter/engine/cache_sensitive.rs,
+    userspace-dp/src/filter/tests.rs, _Log.md

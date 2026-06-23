@@ -3609,6 +3609,43 @@ fn term_2400_all_malformed_source_address_fails_closed_v6() {
     );
 }
 
+/// v6 sibling of the destination-address fail-closed test: all-malformed
+/// destination-address in an inet6 filter must match nothing (fail closed).
+/// REVERT of the v6 dest fail-closed path makes the term broaden to match-any
+/// -> Discard, failing this assert.
+#[test]
+fn term_2400_all_malformed_destination_address_fails_closed_v6() {
+    let state = make_filter_state(
+        &[FirewallFilterSnapshot {
+            name: "scoped-discard6".into(),
+            family: "inet6".into(),
+            terms: vec![FirewallTermSnapshot {
+                name: "drop-bad-dst6".into(),
+                destination_addresses: vec!["plugh".into(), "fe80::/200".into()],
+                action: "discard".into(),
+                ..Default::default()
+            }],
+        }],
+        &[],
+    );
+    let result = evaluate_filter(
+        &state,
+        "inet6:scoped-discard6",
+        IpAddr::V6("2001:db8::10".parse().unwrap()),
+        IpAddr::V6("2001:db8::200".parse().unwrap()),
+        PROTO_TCP,
+        12345,
+        443,
+        0,
+        TermMatchExtra::default(),
+    );
+    assert_eq!(
+        result.action,
+        FilterAction::Accept,
+        "all-malformed inet6 destination-address must fail CLOSED"
+    );
+}
+
 /// All-malformed source-port set -> fail closed.
 #[test]
 fn term_2400_all_malformed_source_port_fails_closed() {
