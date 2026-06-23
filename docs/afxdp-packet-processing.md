@@ -112,6 +112,33 @@ zero-copy.
 **Single-queue processing**: One worker thread handles one (ifindex, queue_id)
 pair; all RX, TX, fill ring management, and session lookups are serialized.
 
+### 2a. Bringup fill-ring prime: partial-insert recovery (#2374)
+
+At socket bringup the worker constructor pops every non-reserved UMEM frame
+into `initial_fill_frames` and primes the RX fill ring with all of them via
+`prime_fill_ring_offsets()` (`userspace-dp/src/afxdp/bind.rs`). Two failure
+modes are handled:
+
+- **Total failure** (`inserted == 0` on a non-empty prime): fatal. The socket
+  would run with no RX descriptors, so the bind fails closed
+  (`fill_prime_is_total_failure`).
+- **Partial insert** (`0 < inserted < N`, e.g. a transiently-full ring during
+  rebind / shared-UMEM group churn): the prime first retries the un-inserted
+  suffix across the NAPI-trigger loop (each `recvmsg`/`poll`/`sendto` lets the
+  kernel consume fill entries and free ring slots). Any suffix the ring still
+  has not accepted is **returned** (`defer_uninserted_fill_suffix`) and threaded
+  back through `open_binding_worker_rings` into the worker's
+  `pending_fill_frames` queue. The steady-state `drain_pending_fill()` loop then
+  retries exactly those offsets.
+
+Before #2374 the prime errored only on `inserted == 0` and silently accepted a
+partial insert: the `(N - inserted)` un-inserted frames were dropped from every
+local pool (`pending_fill_frames` started empty), permanently shrinking RX
+capacity and starving the fill ring. The recovery mirrors the steady-state
+suffix recovery in `tx::rings::drain_pending_fill` (which already pushes a
+partial-insert suffix back onto `pending_fill_frames`) so bringup and the
+running loop handle a short fill-ring insert identically.
+
 ## 3. Current Mitigation: nftables RST Suppression
 
 Since the root cause is kernel-emitted RSTs for SNAT addresses the kernel

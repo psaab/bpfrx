@@ -1,5 +1,31 @@
 # Action Log
 
+## 2026-06-23 — #2374 AF_XDP bringup fill-ring partial-prime recovery
+
+- **Timestamp**: 2026-06-23 PDT
+- **Action**: Correctness fix (MED). The bringup fill-ring prime
+  (`prime_fill_ring_offsets`, `userspace-dp/src/afxdp/bind.rs`) errored only
+  on `inserted == 0` (total failure) and silently accepted a partial insert
+  (`0 < inserted < N`). The `(N - inserted)` un-inserted UMEM frames were
+  dropped from every local pool (the worker started with an empty
+  `pending_fill_frames`), permanently shrinking RX capacity / starving the
+  fill ring on a transiently-full ring at bind/rebind. Fix: retry the
+  un-inserted suffix across the existing NAPI-trigger loop, then RETURN the
+  remaining suffix (`defer_uninserted_fill_suffix`) and thread it through
+  `try_open_bind` / `open_binding_worker_rings` into the worker's
+  `pending_fill_frames` so `drain_pending_fill()` retries it — mirroring the
+  steady-state suffix recovery in `tx::rings::drain_pending_fill`. Total
+  failure still fails closed (`fill_prime_is_total_failure`). Extracted two
+  pure helpers so the recovery + fail-closed decisions are unit-testable
+  without a bound DeviceQueue. Tests assert: partial insert defers the exact
+  un-inserted suffix (none leaked) and FAILS if the recovery is reverted to
+  dropping the suffix; full insert defers nothing; `inserted == 0` still
+  errors. cargo build --release clean; new tests 5x stable; fail-on-revert
+  verified.
+- **File(s)**: userspace-dp/src/afxdp/bind.rs,
+  userspace-dp/src/afxdp/worker/mod.rs,
+  docs/afxdp-packet-processing.md, _Log.md
+
 ## 2026-06-23 — #2393 embedded-ICMP-NAT match adds ICMPv4 Redirect/Source-Quench
 
 - **Timestamp**: 2026-06-23 PDT

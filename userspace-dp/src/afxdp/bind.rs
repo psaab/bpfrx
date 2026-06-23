@@ -114,6 +114,10 @@ pub(super) unsafe fn open_binding_worker_rings(
         u16,
         AfXdpBindStrategy,
         DeviceQueue,
+        // #2374: fill-ring suffix the bringup prime could not place — the
+        // caller stashes this in `pending_fill_frames` so it is retried by
+        // the steady-state drain rather than leaked.
+        Vec<u64>,
     ),
     Box<dyn std::error::Error + Send + Sync>,
 > {
@@ -134,8 +138,17 @@ pub(super) unsafe fn open_binding_worker_rings(
                 poll_mode,
                 pre_bind_fill_offsets,
             ) {
-                Ok((user, rx, tx, bind_mode, actual_flags, device)) => {
-                    return Ok((user, rx, tx, bind_mode, actual_flags, strategy, device));
+                Ok((user, rx, tx, bind_mode, actual_flags, device, uninserted_fill)) => {
+                    return Ok((
+                        user,
+                        rx,
+                        tx,
+                        bind_mode,
+                        actual_flags,
+                        strategy,
+                        device,
+                        uninserted_fill,
+                    ));
                 }
                 Err(err) => {
                     last_err = Some(err);
@@ -226,24 +239,71 @@ pub(super) fn describe_bind_flags(flags: u16) -> &'static str {
     }
 }
 
+/// Bringup fill-ring total-failure predicate (#2374).
+///
+/// A *total* failure (the very first reserve placed zero frames into a
+/// non-empty fill request) is fatal: the socket would run with no RX
+/// descriptors at all, so the bind must fail closed. An empty request
+/// (`total == 0`) is not a failure. Extracted as a pure helper so the
+/// fail-closed decision is unit-testable without a bound `DeviceQueue`.
+pub(super) fn fill_prime_is_total_failure(total: usize, inserted_first: usize) -> bool {
+    total > 0 && inserted_first == 0
+}
+
+/// Bringup fill-ring partial-insert suffix recovery (#2374).
+///
+/// Given the offsets handed to the bringup prime and the total number the fill
+/// ring eventually accepted (after retries), return the un-inserted suffix the
+/// caller MUST defer into the worker's `pending_fill_frames` queue. Returning
+/// the suffix (rather than dropping it) is what prevents the UMEM frame leak:
+/// the steady-state `tx::rings::drain_pending_fill` loop then retries exactly
+/// these offsets. A full insert returns an empty `Vec`. Pure helper so the
+/// recovery is unit-testable without a bound `DeviceQueue`.
+pub(super) fn defer_uninserted_fill_suffix(offsets: &[u64], inserted_total: usize) -> Vec<u64> {
+    let inserted_total = inserted_total.min(offsets.len());
+    offsets[inserted_total..].to_vec()
+}
+
+/// Prime the RX fill ring with `offsets` at socket bringup.
+///
+/// Returns the suffix of `offsets` that could NOT be inserted into the fill
+/// ring (empty `Vec` when all `offsets.len()` frames were placed). The caller
+/// MUST hand that suffix to the worker's `pending_fill_frames` queue so the
+/// steady-state `drain_pending_fill` loop retries it — otherwise those UMEM
+/// frame addresses are leaked from every local pool, permanently shrinking RX
+/// capacity (#2374).
+///
+/// A *total* failure (`inserted == 0` on the very first reserve) is fatal and
+/// returns `Err` so the bind fails closed rather than running with no RX
+/// descriptors. A *partial* insert is recovered: this matches the steady-state
+/// suffix recovery in `tx::rings::drain_pending_fill` (push the un-inserted
+/// suffix back for retry) rather than silently dropping it.
 pub(super) fn prime_fill_ring_offsets(
     device: &mut DeviceQueue,
     offsets: &[u64],
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let inserted = {
-        let mut fill = device.fill(offsets.len() as u32);
+) -> Result<Vec<u64>, Box<dyn std::error::Error + Send + Sync>> {
+    // `remaining` is the slice index of the first not-yet-inserted offset.
+    // We retry the insert across the NAPI-trigger loop below: each NAPI kick
+    // lets the kernel consume fill-ring entries and post RX WQEs, which frees
+    // ring slots so a transiently-full ring can accept the suffix on a later
+    // iteration without leaking frames.
+    let total = offsets.len();
+    let mut remaining: usize = {
+        let mut fill = device.fill(total as u32);
         let inserted = fill.insert(offsets.iter().copied());
         fill.commit();
-        inserted
+        inserted as usize
     };
     eprintln!(
         "prime_fill_ring: inserted={}/{} fill_pending={}",
-        inserted,
-        offsets.len(),
+        remaining,
+        total,
         device.pending()
     );
-    if inserted == 0 {
-        return Err(format!("prefill fill ring inserted 0/{}", offsets.len()).into());
+    // A total failure on the first reserve means the ring rejected everything;
+    // fail closed (no RX descriptors at all). Do NOT regress this behavior.
+    if fill_prime_is_total_failure(total, remaining) {
+        return Err(format!("prefill fill ring inserted 0/{}", total).into());
     }
     // Trigger NAPI to consume fill ring entries and post RX WQEs.
     // mlx5 zero-copy processes the fill ring during RX NAPI poll.
@@ -278,9 +338,32 @@ pub(super) fn prime_fill_ring_offsets(
                 0,
             );
         }
+        // After NAPI has had a chance to drain the ring, retry inserting the
+        // un-inserted suffix. This recovers a transiently-full fill ring at
+        // bringup the same way the steady-state drain does.
+        if remaining < total {
+            let suffix = &offsets[remaining..];
+            let inserted = {
+                let mut fill = device.fill(suffix.len() as u32);
+                let inserted = fill.insert(suffix.iter().copied());
+                fill.commit();
+                inserted as usize
+            };
+            remaining += inserted;
+        }
         std::thread::yield_now();
     }
-    Ok(())
+    if remaining < total {
+        eprintln!(
+            "prime_fill_ring: partial prime — {} of {} frames not placed, deferring suffix to pending_fill_frames",
+            total - remaining,
+            total
+        );
+    }
+    // Return the un-inserted suffix (frames the ring still has not accepted).
+    // The worker constructor stashes these in `pending_fill_frames` so the
+    // running loop's `drain_pending_fill` retries them — never leaked.
+    Ok(defer_uninserted_fill_suffix(offsets, remaining))
 }
 
 pub(super) fn bind_strategy_for_driver(driver: Option<&str>) -> AfXdpBindStrategy {
@@ -364,7 +447,7 @@ fn try_open_bind(
     poll_mode: crate::PollMode,
     pre_bind_fill_offsets: Option<&[u64]>,
 ) -> Result<
-    (User, RingRx, RingTx, XskBindMode, u16, DeviceQueue),
+    (User, RingRx, RingTx, XskBindMode, u16, DeviceQueue, Vec<u64>),
     Box<dyn std::error::Error + Send + Sync>,
 > {
     for attempt in 0..BIND_RETRY_ATTEMPTS {
@@ -393,9 +476,13 @@ fn try_open_bind(
                 // Prime the fill ring AFTER bind — libxdp already binds
                 // the socket during create_shared. Post-bind fill ring
                 // priming triggers NAPI to consume entries and post WQEs.
-                if let Some(offsets) = pre_bind_fill_offsets {
-                    prime_fill_ring_offsets(&mut device, offsets)?;
-                }
+                // Any suffix the ring could not accept is returned so the
+                // worker stashes it in `pending_fill_frames` (#2374) instead
+                // of leaking the UMEM frames.
+                let uninserted_fill = match pre_bind_fill_offsets {
+                    Some(offsets) => prime_fill_ring_offsets(&mut device, offsets)?,
+                    None => Vec::new(),
+                };
 
                 let bind_mode = query_bound_xsk_mode(user_fd).unwrap_or(XskBindMode::Copy);
                 if socket_role.requires_zerocopy() && !bind_mode.is_zerocopy() {
@@ -416,7 +503,7 @@ fn try_open_bind(
                     bind_flags,
                 );
 
-                return Ok((user, rx, tx, bind_mode, bind_flags, device));
+                return Ok((user, rx, tx, bind_mode, bind_flags, device, uninserted_fill));
             }
             Err(err) => {
                 let msg = err.to_string();
@@ -500,5 +587,76 @@ fn set_busy_poll_opts(fd: c_int, poll_mode: crate::PollMode) {
             (&budget as *const c_int).cast::<c_void>(),
             core::mem::size_of::<c_int>() as libc::socklen_t,
         );
+    }
+}
+
+#[cfg(test)]
+mod fill_prime_tests {
+    use super::{defer_uninserted_fill_suffix, fill_prime_is_total_failure};
+
+    // #2374: a partial bringup prime (inserted < N) MUST recover the
+    // un-inserted suffix so the worker can stash it in pending_fill_frames.
+    // If the recovery is removed (e.g. revert to dropping the suffix), the
+    // returned Vec would be empty and the (N - inserted) frames would leak —
+    // this test asserts the suffix is the EXACT tail and FAILS on that revert.
+    #[test]
+    fn partial_prime_recovers_uninserted_suffix_not_leaked() {
+        let offsets: Vec<u64> = vec![0, 4096, 8192, 12288, 16384];
+        // Ring accepted only the first 3; the remaining 2 must be deferred.
+        let inserted = 3;
+        let suffix = defer_uninserted_fill_suffix(&offsets, inserted);
+        assert_eq!(
+            suffix,
+            vec![12288, 16384],
+            "partial bringup prime must defer the exact un-inserted suffix \
+             (else the (N - inserted) UMEM frames leak — #2374)"
+        );
+        // No frame is lost: inserted-count + deferred-count == total.
+        assert_eq!(
+            inserted + suffix.len(),
+            offsets.len(),
+            "every bringup fill frame must be either inserted or deferred — none dropped"
+        );
+        // A partial insert is NOT a total failure (must not fail closed).
+        assert!(
+            !fill_prime_is_total_failure(offsets.len(), inserted),
+            "a partial insert must be recovered, not treated as a fatal bind failure"
+        );
+    }
+
+    // No regression: a full insert defers nothing and is not a failure.
+    #[test]
+    fn full_prime_defers_nothing() {
+        let offsets: Vec<u64> = vec![0, 4096, 8192, 12288];
+        let inserted = offsets.len();
+        let suffix = defer_uninserted_fill_suffix(&offsets, inserted);
+        assert!(
+            suffix.is_empty(),
+            "a full insert must defer nothing (no spurious pending_fill_frames)"
+        );
+        assert!(!fill_prime_is_total_failure(offsets.len(), inserted));
+        // Defensive: an over-count (inserted reported > total) still defers
+        // nothing and never panics (min() clamp).
+        assert!(defer_uninserted_fill_suffix(&offsets, inserted + 10).is_empty());
+    }
+
+    // No regression: a total failure (inserted == 0 on a non-empty request)
+    // must still be classified as fatal so the bind fails closed.
+    #[test]
+    fn zero_insert_is_total_failure() {
+        let offsets: Vec<u64> = vec![0, 4096, 8192];
+        assert!(
+            fill_prime_is_total_failure(offsets.len(), 0),
+            "inserted == 0 on a non-empty prime must remain a fatal bind failure (fail closed)"
+        );
+        // An empty prime request is a no-op, not a failure.
+        assert!(
+            !fill_prime_is_total_failure(0, 0),
+            "an empty fill request must not be treated as a failure"
+        );
+        // Even when total-failure errors out upstream, the suffix helper for a
+        // zero insert would be the whole set (nothing accepted) — proving the
+        // recovery path would otherwise carry all frames.
+        assert_eq!(defer_uninserted_fill_suffix(&offsets, 0), offsets);
     }
 }
