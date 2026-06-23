@@ -76,8 +76,13 @@ pub(crate) struct DestinationNATRuleSnapshot {
     /// `source-address` restricts which source IPs the destination translation
     /// applies to; before #2394 the Go snapshot dropped it, so the helper built
     /// a destination-only entry that DNAT'd traffic from ANY source (fail-open).
-    /// Each entry is a CIDR prefix (a bare host IP parses as /32 or /128). An
-    /// empty vec = match any source (unscoped DNAT, unchanged behavior).
+    /// Each entry is either a CIDR prefix (`198.51.100.0/24`) or a bare host IP
+    /// (`198.51.100.42`); the Go compiler carries the value verbatim. The DNAT
+    /// table parser (`nat/destination.rs`) tries `IpNet` first and falls back to
+    /// a bare `IpAddr` -> /32 or /128, since `IpNet::from_str` rejects a bare IP.
+    /// An empty vec = unscoped DNAT (match any source, unchanged behavior). A
+    /// non-empty list whose entries ALL fail to parse fails CLOSED (matches no
+    /// source) rather than reverting to match-any.
     #[serde(rename = "source_addresses", default)]
     pub source_addresses: Vec<String>,
     #[serde(rename = "destination_address", default)]

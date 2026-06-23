@@ -410,9 +410,14 @@ type DestinationNATRuleSnapshot struct {
 	// IPs the destination translation applies to; before #2394 the constraint
 	// was parsed but DROPPED at this snapshot boundary, so the dataplane
 	// installed a destination-only entry that DNAT'd traffic from ANY source
-	// (a fail-open security broadening). Each entry is a CIDR prefix (a bare
-	// host IP is normalized to /32 or /128 by the Rust IpNet parser). An empty
-	// slice means "match any source" — the unscoped DNAT behavior is unchanged.
+	// (a fail-open security broadening). Each entry is either a CIDR prefix
+	// (e.g. 198.51.100.0/24) or a bare host IP (e.g. 198.51.100.42); the
+	// compiler carries the configured value verbatim (no CIDR normalization).
+	// The Rust DNAT parser tries IpNet first and falls back to a bare IP -> /32
+	// or /128, since IpNet rejects a bare IP. An empty slice means "match any
+	// source" (unscoped DNAT, unchanged behavior); a non-empty slice whose
+	// entries all fail to parse fails CLOSED (matches no source) on the Rust
+	// side rather than reverting to match-any.
 	SourceAddresses    []string `json:"source_addresses,omitempty"`
 	DestinationAddress string   `json:"destination_address"`
 	DestinationPort    uint16   `json:"destination_port,omitempty"`

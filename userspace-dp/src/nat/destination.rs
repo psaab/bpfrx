@@ -3,7 +3,7 @@
 use super::{NatCounterStore, NatDecision, NatRuleCounter};
 use crate::DestinationNATRuleSnapshot;
 use crate::prefix::{PrefixV4, PrefixV6};
-use ipnet::IpNet;
+use ipnet::{IpNet, Ipv4Net, Ipv6Net};
 use rustc_hash::FxHashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -26,11 +26,16 @@ pub(crate) struct DnatValue {
 #[derive(Clone, Debug)]
 struct DnatEntry {
     from_zone: Box<str>,
-    /// #2394: DNAT `match source-address` constraint. Empty (both vecs) means
-    /// "match any source" — the unscoped DNAT behavior. A non-empty list means
-    /// the entry only fires when the packet source IP falls in one of these
-    /// prefixes; before #2394 the constraint was dropped at the snapshot
-    /// boundary, so the entry DNAT'd traffic from any source (fail-open).
+    /// #2394: whether the DNAT rule was scoped to a `match source-address` at
+    /// all (snapshot list non-empty). This is independent of how many entries
+    /// PARSED: it stays true even when every source entry was unparseable, so
+    /// `source_matches` can fail closed (match nothing) for a scoped rule whose
+    /// entries all failed rather than silently reverting to match-any (the
+    /// #2394 fail-open). `false` = unscoped rule -> match any source (unchanged
+    /// behavior).
+    source_constrained: bool,
+    /// #2394: parsed source-address prefixes (CIDR or bare-host /32 /128). A
+    /// packet source must fall in one of these for the entry to fire.
     source_v4: Vec<PrefixV4>,
     source_v6: Vec<PrefixV6>,
     value: DnatValue,
@@ -40,15 +45,25 @@ struct DnatEntry {
 
 impl DnatEntry {
     /// #2394: does the packet source IP satisfy this entry's source-address
-    /// constraint? An entry with no source prefixes matches any source.
+    /// constraint?
+    ///
+    /// - Unscoped rule (`source_constrained == false`): match any source.
+    /// - Scoped rule whose entries ALL failed to parse (constrained but both
+    ///   prefix vecs empty): match NOTHING — fail closed, never fall back to
+    ///   match-any (the #2394 fail-open). This is the DNAT sibling of #2398.
+    /// - Otherwise: the packet source must fall in one of the parsed prefixes
+    ///   of its own address family.
     fn source_matches(&self, src_ip: IpAddr) -> bool {
+        if !self.source_constrained {
+            return true;
+        }
+        if self.source_v4.is_empty() && self.source_v6.is_empty() {
+            // Scoped but no entry parsed -> fail closed.
+            return false;
+        }
         match src_ip {
-            IpAddr::V4(v4) => {
-                self.source_v4.is_empty() || self.source_v4.iter().any(|net| net.contains(v4))
-            }
-            IpAddr::V6(v6) => {
-                self.source_v6.is_empty() || self.source_v6.iter().any(|net| net.contains(v6))
-            }
+            IpAddr::V4(v4) => self.source_v4.iter().any(|net| net.contains(v4)),
+            IpAddr::V6(v6) => self.source_v6.iter().any(|net| net.contains(v6)),
         }
     }
 }
@@ -94,17 +109,43 @@ impl DnatTable {
                 _ => continue,
             };
             let hit_counter = nat_counters.rule_counter(snap.counter_id);
-            // #2394: parse the source-address constraint once per rule. A prefix
-            // that fails to parse is skipped (matches the SNAT builder), so a
-            // malformed prefix narrows the match rather than silently widening
-            // it. An empty source list keeps "match any source".
+            // #2394 (Copilot fold): parse the source-address constraint once per
+            // rule. Each entry may be a CIDR prefix (`198.51.100.0/24`) OR a bare
+            // host IP (`198.51.100.42`) — Junos carries source-address verbatim
+            // and the Go compiler does NOT normalize it, so a bare host reaches
+            // the wire with no `/prefix`. `IpNet::from_str` REQUIRES `addr/prefix`
+            // form and rejects a bare IP, so we fall back to parsing a bare
+            // `IpAddr` -> /32 (v4) or /128 (v6). Without this fallback a bare-host
+            // source-scoped DNAT would skip its only entry, leave the source
+            // lists empty, and silently match ANY source — the exact #2394
+            // fail-open reintroduced for bare-IP sources.
+            //
+            // `source_constrained` records whether the rule HAD a source
+            // constraint at all (snapshot list non-empty), independent of how
+            // many entries parsed. It drives the fail-closed distinction in
+            // `source_matches`: a rule that WAS scoped but whose entries ALL
+            // failed to parse must match NOTHING, not everything.
+            let source_constrained = !snap.source_addresses.is_empty();
             let mut source_v4: Vec<PrefixV4> = Vec::new();
             let mut source_v6: Vec<PrefixV6> = Vec::new();
             for prefix in &snap.source_addresses {
                 match prefix.parse::<IpNet>() {
                     Ok(IpNet::V4(net)) => source_v4.push(PrefixV4::from_net(net)),
                     Ok(IpNet::V6(net)) => source_v6.push(PrefixV6::from_net(net)),
-                    Err(_) => {}
+                    // Bare host IP fallback -> /32 or /128.
+                    Err(_) => match prefix.parse::<IpAddr>() {
+                        Ok(IpAddr::V4(v4)) => {
+                            if let Ok(net) = Ipv4Net::new(v4, 32) {
+                                source_v4.push(PrefixV4::from_net(net));
+                            }
+                        }
+                        Ok(IpAddr::V6(v6)) => {
+                            if let Ok(net) = Ipv6Net::new(v6, 128) {
+                                source_v6.push(PrefixV6::from_net(net));
+                            }
+                        }
+                        Err(_) => {}
+                    },
                 }
             }
             for proto in protos {
@@ -116,6 +157,7 @@ impl DnatTable {
                     }),
                     DnatEntry {
                         from_zone: snap.from_zone.clone().into_boxed_str(),
+                        source_constrained,
                         source_v4: source_v4.clone(),
                         source_v6: source_v6.clone(),
                         value: DnatValue {
@@ -243,9 +285,13 @@ impl DnatTable {
         // source-scoped DNAT rules in the same from-zone with the same
         // (proto, dst, port) are NOT the same entry — both must be retained so
         // each fires only for its configured source. Keying dedup on zone alone
-        // would drop one and silently broaden/narrow the other.
+        // would drop one and silently broaden/narrow the other. `source_constrained`
+        // is part of the key so an UNSCOPED rule (match-any) and a fully-malformed
+        // SCOPED rule (fail-closed) — both with empty prefix vecs — never collapse
+        // onto each other.
         if let Some(existing) = entries.iter_mut().find(|existing| {
             existing.from_zone == entry.from_zone
+                && existing.source_constrained == entry.source_constrained
                 && existing.source_v4 == entry.source_v4
                 && existing.source_v6 == entry.source_v6
         }) {

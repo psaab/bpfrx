@@ -958,6 +958,183 @@ fn dnat_two_source_scoped_rules_same_dest_each_fire_for_own_source() {
     );
 }
 
+// --- #2394 Copilot fold: bare-host source + all-malformed fail-closed ---
+
+#[test]
+fn dnat_source_scoped_bare_host_ip_v4_matches_only_that_host() {
+    // The Go compiler carries `match source-address 198.51.100.42` (NO /prefix)
+    // verbatim. `IpNet::from_str` rejects a bare IP, so without the bare-host
+    // fallback this entry is skipped, the source list is empty, and the DNAT
+    // matches ANY source — the #2394 fail-open. FAIL-ON-REVERT: removing the
+    // bare-IP fallback makes the wrong-source lookup return Some.
+    let table = DnatTable::from_snapshots(
+        &[DestinationNATRuleSnapshot {
+            name: "bare-host".to_string(),
+            destination_address: "203.0.113.10".to_string(),
+            destination_port: 80,
+            protocol: "tcp".to_string(),
+            pool_address: "192.168.1.10".to_string(),
+            pool_port: 8080,
+            source_addresses: vec!["198.51.100.42".to_string()],
+            ..DestinationNATRuleSnapshot::default()
+        }],
+        &crate::nat::NatCounterStore::default(),
+    );
+    // The exact configured host -> DNAT fires.
+    assert!(
+        table
+            .lookup(
+                PROTO_TCP,
+                "198.51.100.42".parse().unwrap(),
+                "203.0.113.10".parse().unwrap(),
+                80,
+                "",
+            )
+            .is_some(),
+        "bare-host source-scoped DNAT must fire for the configured host"
+    );
+    // A different host -> must NOT be DNAT'd.
+    assert_eq!(
+        table.lookup(
+            PROTO_TCP,
+            "198.51.100.43".parse().unwrap(),
+            "203.0.113.10".parse().unwrap(),
+            80,
+            "",
+        ),
+        None,
+        "bare-host source-scoped DNAT must NOT fire for a different host (fail-open)"
+    );
+}
+
+#[test]
+fn dnat_source_scoped_bare_host_ip_v6_matches_only_that_host() {
+    let table = DnatTable::from_snapshots(
+        &[DestinationNATRuleSnapshot {
+            name: "bare-host-v6".to_string(),
+            destination_address: "2001:db8::1".to_string(),
+            destination_port: 443,
+            protocol: "tcp".to_string(),
+            pool_address: "fd00::1".to_string(),
+            pool_port: 8443,
+            source_addresses: vec!["2001:db8:aaaa::99".to_string()],
+            ..DestinationNATRuleSnapshot::default()
+        }],
+        &crate::nat::NatCounterStore::default(),
+    );
+    assert!(
+        table
+            .lookup(
+                PROTO_TCP,
+                "2001:db8:aaaa::99".parse().unwrap(),
+                "2001:db8::1".parse().unwrap(),
+                443,
+                "",
+            )
+            .is_some(),
+        "bare-host v6 source-scoped DNAT must fire for the configured host"
+    );
+    assert_eq!(
+        table.lookup(
+            PROTO_TCP,
+            "2001:db8:aaaa::98".parse().unwrap(),
+            "2001:db8::1".parse().unwrap(),
+            443,
+            "",
+        ),
+        None,
+        "bare-host v6 source-scoped DNAT must NOT fire for a different host (fail-open)"
+    );
+}
+
+#[test]
+fn dnat_source_scoped_all_malformed_fails_closed() {
+    // A rule that WAS scoped (source_addresses non-empty) but every entry is
+    // unparseable must match NOTHING — never silently revert to match-any.
+    // FAIL-ON-REVERT: reverting `source_matches` to the old empty-list=match-any
+    // form makes this lookup return Some (the all-malformed fail-open).
+    let table = DnatTable::from_snapshots(
+        &[DestinationNATRuleSnapshot {
+            name: "all-malformed".to_string(),
+            destination_address: "203.0.113.10".to_string(),
+            destination_port: 80,
+            protocol: "tcp".to_string(),
+            pool_address: "192.168.1.10".to_string(),
+            pool_port: 8080,
+            source_addresses: vec!["not-an-ip".to_string(), "999.999.0.0/16".to_string()],
+            ..DestinationNATRuleSnapshot::default()
+        }],
+        &crate::nat::NatCounterStore::default(),
+    );
+    for src in ["198.51.100.1", "203.0.113.250", "10.9.9.9"] {
+        assert_eq!(
+            table.lookup(
+                PROTO_TCP,
+                src.parse().unwrap(),
+                "203.0.113.10".parse().unwrap(),
+                80,
+                "",
+            ),
+            None,
+            "scoped DNAT with all-unparseable sources must match NOTHING (src={src})"
+        );
+    }
+    // v6 source too -> still no match.
+    assert_eq!(
+        table.lookup(
+            PROTO_TCP,
+            "2001:db8::1".parse().unwrap(),
+            "203.0.113.10".parse().unwrap(),
+            80,
+            "",
+        ),
+        None,
+        "scoped DNAT with all-unparseable sources must match NOTHING for v6 too"
+    );
+}
+
+#[test]
+fn dnat_source_scoped_mixed_valid_and_malformed_keeps_valid() {
+    // A scoped rule with one valid prefix and one garbage entry must still
+    // enforce the valid prefix (garbage is dropped, not fail-open to any).
+    let table = DnatTable::from_snapshots(
+        &[DestinationNATRuleSnapshot {
+            name: "mixed".to_string(),
+            destination_address: "203.0.113.10".to_string(),
+            destination_port: 80,
+            protocol: "tcp".to_string(),
+            pool_address: "192.168.1.10".to_string(),
+            pool_port: 8080,
+            source_addresses: vec!["10.1.0.0/16".to_string(), "garbage".to_string()],
+            ..DestinationNATRuleSnapshot::default()
+        }],
+        &crate::nat::NatCounterStore::default(),
+    );
+    assert!(
+        table
+            .lookup(
+                PROTO_TCP,
+                "10.1.5.5".parse().unwrap(),
+                "203.0.113.10".parse().unwrap(),
+                80,
+                "",
+            )
+            .is_some(),
+        "the valid prefix must still match"
+    );
+    assert_eq!(
+        table.lookup(
+            PROTO_TCP,
+            "10.2.5.5".parse().unwrap(),
+            "203.0.113.10".parse().unwrap(),
+            80,
+            "",
+        ),
+        None,
+        "a source outside the valid prefix must not be DNAT'd despite the garbage entry"
+    );
+}
+
 #[test]
 fn dnat_port_aware_reverse() {
     // DNAT: rewrite dst to internal, rewrite dst_port from 80 to 8080
