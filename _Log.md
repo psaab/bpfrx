@@ -11346,3 +11346,24 @@ top.
     pkg/config/compiler.go, pkg/config/compiler_validate_strict.go,
     pkg/config/compiler_dnat_protocol_test.go,
     pkg/dataplane/userspace/protocol.go, docs/userspace-dnat-plan.md, _Log.md
+
+- **Timestamp**: 2026-06-23
+- **Action**: #2399 — firewall-filter fail-open fixes (codex 032-16 / 032-17).
+    (032-16, REAL) An unknown/misspelled `then` action was silently DROPPED by
+    `compileFilterThen` (no default arm), leaving `Action == ""`, which BOTH
+    the dataplane compiler and the Rust `parse_term` map to ACCEPT — a
+    fail-open permit, commit reported SUCCESS. Fixed fail-CLOSED: capture the
+    unknown token on `FirewallFilterTerm.UnknownActions` and reject it at
+    commit via `validateFilterActionsStrict` (strict/lenient split,
+    `lenientFilterActions`, #1960 no-brick). Rust defense-in-depth: a
+    non-empty unrecognized action now fails to `Discard` (empty string keeps
+    fall-through `Accept`). (032-17, ALREADY-HANDLED by #2175) an unresolvable
+    `from protocol` alias is already rejected at commit by
+    `validateFilterProtocolsStrict`; no new code, documented for completeness.
+    Tests fail-on-revert verified on both sides (Go gate removed → 3 reject
+    tests fail; Rust arm reverted to Accept → discard test fails); 5x stable.
+- **File(s)**: pkg/config/types_system.go, pkg/config/compiler_firewall.go,
+    pkg/config/compiler_validate_strict.go, pkg/config/compiler.go,
+    pkg/config/compiler_filter_action_test.go,
+    userspace-dp/src/filter/compiler.rs, userspace-dp/src/filter/tests.rs,
+    docs/config-schema.md, _Log.md
