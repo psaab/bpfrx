@@ -356,6 +356,16 @@ fn parse_term(
     for addr in &snap.destination_addresses {
         parse_address(addr, &mut dest_v4, &mut dest_v6);
     }
+    // #2400 (032-18): a term is ADDRESS-CONSTRAINED when it has at least one
+    // REAL `from { source-address / destination-address }` entry — `addr_is_real`
+    // EXCLUDES the empty string and the literal `any` (the placeholders
+    // `parse_address` already drops), so an explicit `from { source-address
+    // any; }` stays UNCONSTRAINED (match-any) rather than degrading to
+    // fail-closed. When the term is constrained but every real entry failed to
+    // parse, the per-family vecs are empty and the matcher fails closed (see
+    // engine/matching.rs).
+    let source_addr_constrained = snap.source_addresses.iter().any(|a| addr_is_real(a));
+    let dest_addr_constrained = snap.destination_addresses.iter().any(|a| addr_is_real(a));
     let protocols: Vec<u8> = snap
         .protocols
         .iter()
@@ -373,6 +383,14 @@ fn parse_term(
         .filter_map(|p| parse_port_spec(p))
         .flatten()
         .collect();
+    // #2400 (032-19): mirror of the address constraint for the port match sets.
+    // `port_is_real` ignores the empty-string placeholder (which `parse_port_spec`
+    // treats as "no port range") so an empty entry never trips fail-closed. A
+    // constrained port set whose entries ALL failed to parse yields zero ranges
+    // -> `PortMatcher::Any`; the `*_port_constrained` flag lets the matcher tell
+    // that apart from a genuinely unscoped term and fail closed.
+    let source_port_constrained = snap.source_ports.iter().any(|p| port_is_real(p));
+    let dest_port_constrained = snap.destination_ports.iter().any(|p| port_is_real(p));
     let action = match snap.action.as_str() {
         "accept" => FilterAction::Accept,
         "reject" => FilterAction::Reject,
@@ -406,10 +424,14 @@ fn parse_term(
         source_v6,
         dest_v4,
         dest_v6,
+        source_addr_constrained,
+        dest_addr_constrained,
         protocol_bitmap: build_u8_match_bitmap(&protocols),
         protocol_match_enabled: !protocols.is_empty(),
         source_ports: build_port_matcher(source_ports),
         dest_ports: build_port_matcher(dest_ports),
+        source_port_constrained,
+        dest_port_constrained,
         dscp_bitmap: build_u6_match_bitmap(&snap.dscp_values),
         dscp_match_enabled: !snap.dscp_values.is_empty(),
         // #2362 per-packet L4 match conditions. A zero tcp_flags mask means
@@ -431,6 +453,24 @@ fn parse_term(
         dscp_rewrite,
         counter: Arc::new(FilterTermCounter::default()),
     }
+}
+
+/// #2400: whether an address entry imposes a real scope. `parse_address` drops
+/// the empty string and the literal `any` as "no constraint" placeholders, so
+/// they must NOT make a term address-constrained (otherwise `from {
+/// source-address any; }` would fail closed). Every other entry — valid OR
+/// malformed — is a real scope; an all-malformed list is exactly the fail-open
+/// case #2400 closes.
+fn addr_is_real(entry: &str) -> bool {
+    !entry.is_empty() && entry != "any"
+}
+
+/// #2400: whether a port entry imposes a real scope. `parse_port_spec` treats
+/// the empty string as "no port range", so an empty placeholder must NOT make a
+/// term port-constrained. Every other entry — valid OR malformed — is a real
+/// scope.
+fn port_is_real(entry: &str) -> bool {
+    !entry.is_empty()
 }
 
 fn parse_address(prefix: &str, out_v4: &mut Vec<PrefixV4>, out_v6: &mut Vec<PrefixV6>) {

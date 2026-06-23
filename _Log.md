@@ -11388,3 +11388,65 @@ top.
 - **File(s)**: pkg/config/types_system.go, pkg/config/compiler_firewall.go,
     pkg/config/compiler_validate_strict.go,
     pkg/config/compiler_filter_action_test.go, docs/config-schema.md, _Log.md
+
+- **Timestamp**: 2026-06-23
+- **Action**: #2400 — fail-close all-malformed firewall-filter address/port
+    match sets (codex 032-18 addresses, 032-19 ports). A filter term whose
+    `source-address` / `destination-address` / `source-port` /
+    `destination-port` set was non-empty in the config but whose entries ALL
+    failed to parse degraded to match-ANY on that dimension (empty parsed list =
+    no constraint) — a `discard` term scoped to typo'd addresses became
+    discard-all (fail-OPEN broadening). Mirror of the #2398 (SNAT) / #2394
+    (DNAT) `*_constrained` fix. Added `source_addr_constrained` /
+    `dest_addr_constrained` / `source_port_constrained` / `dest_port_constrained`
+    to FilterTerm, DERIVED at compile time from the snapshot list holding a real
+    entry (`addr_is_real` skips ""/"any"; `port_is_real` skips ""). Matcher
+    helpers `nets_match_v4`/`nets_match_v6`/`port_match` (engine/matching.rs):
+    unconstrained → match any; constrained but parsed set empty → match NOTHING
+    (fail closed); else parsed prefix/range. Bare-host address already handled by
+    parse_address's bare-IP /32//128 fallback (kept). Flags also added to
+    filter_term_semantics_match (cache_sensitive.rs) so the unscoped↔all-
+    malformed flip is caught on flow-cache rebuild. NO new wire field
+    (protocol_wire_v1.json unchanged). 10 new fail-on-revert tests (all-malformed
+    src/dst address v4+v6, all-malformed src/dst port, bare-host scope,
+    valid-unscoped-matches-all, valid-scoped-matches-only-its-scope, compose with
+    #2362 tcp-flags + #2399 action, partial-malformed keeps valid scope) —
+    revert-proven: reverting the matcher to fail-open fails 6 of them.
+    cargo build --release + cargo test -- filter (133) green, 5x stable; go build
+    + go test ./pkg/config ./pkg/dataplane ./pkg/dataplane/userspace green.
+- **File(s)**: userspace-dp/src/filter/mod.rs,
+    userspace-dp/src/filter/compiler.rs,
+    userspace-dp/src/filter/engine/matching.rs,
+    userspace-dp/src/filter/engine/cache_sensitive.rs,
+    userspace-dp/src/filter/tests.rs, userspace-dp/src/filter/README.md, _Log.md
+
+- **Timestamp**: 2026-06-23
+- **Action**: #2400 PR #2422 fold round (pre-merge; hostile reviewer MERGE-READY
+    — doc-accuracy + test-coverage, NO production logic change).
+    (1) Corrected the `*_addr_constrained` doc comments (mod.rs, compiler.rs) that
+    inaccurately said "true when the configured address list is NON-EMPTY": the
+    actual logic is `addr_is_real` — constrained when the term has at least one
+    REAL match entry EXCLUDING ""/"any", so an explicit `source-address any`
+    stays UNCONSTRAINED (match-any). README wording was already accurate.
+    (2) Added `term_2400_all_malformed_destination_address_fails_closed_v6` — the
+    inet6 destination-address fail-closed case was missing (only had v6 source +
+    v4 dest). Test set is now v4 src+dst AND v6 src+dst (the earlier log claim is
+    now accurate).
+    (3) Added two cache-sensitivity flip tests in cache_sensitive.rs
+    (cache_sensitive_2400_tests): `unscoped_vs_all_malformed_source_address_is_not_cache_equal`
+    and `..._source_port_is_not_cache_equal` — assert filter_term_semantics_match
+    reports NOT-equal across the unscoped↔all-malformed flip (parsed vecs/matcher
+    identical, only the *_constrained flag differs), pinning that a cached verdict
+    is invalidated. Both build the FilterTerm via parse_filter_state from
+    snapshots that differ only in scope.
+    All 3 new tests fail-on-revert proven: reverting nets_match_v6 to fail-open
+    fails the v6-dest test; dropping the *_constrained comparisons from
+    filter_term_semantics_match fails both flip tests. Total #2400 tests now 13
+    (11 matcher fail-closed/scope tests + 2 cache-sensitivity flip tests). cargo
+    build --release + cargo test -- filter / cache_sensitive_2400 green, 5x
+    stable; go build + go test ./pkg/config ./pkg/dataplane
+    ./pkg/dataplane/userspace green; protocol_wire_v1.json unchanged.
+- **File(s)**: userspace-dp/src/filter/mod.rs,
+    userspace-dp/src/filter/compiler.rs,
+    userspace-dp/src/filter/engine/cache_sensitive.rs,
+    userspace-dp/src/filter/tests.rs, _Log.md

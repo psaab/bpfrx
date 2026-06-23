@@ -80,10 +80,36 @@ pub(crate) struct FilterTerm {
     pub(crate) source_v6: Vec<PrefixV6>,
     pub(crate) dest_v4: Vec<PrefixV4>,
     pub(crate) dest_v6: Vec<PrefixV6>,
+    // #2400 (032-18): fail-closed flags for the source/destination ADDRESS
+    // match sets. `*_addr_constrained` is true when the term has at least one
+    // REAL match entry (`addr_is_real` in compiler.rs — EXCLUDING the empty
+    // string and the literal `any`), regardless of how many entries survived
+    // parsing. An explicit `from { source-address any; }` therefore stays
+    // UNCONSTRAINED (match-any). The matcher in `engine/matching.rs` uses the
+    // flag to tell apart an UNSCOPED term (constrained == false → match any
+    // address) from a SCOPED term whose entries ALL failed to parse
+    // (constrained == true but both prefix vecs empty for that family → match
+    // NOTHING, fail closed). Without this flag an all-malformed address list
+    // collapses to the empty-list "match any" fail-open broadening (a `discard`
+    // term scoped to typo'd addresses would become discard-all). Mirrors the
+    // #2398/#2394 NAT `*_constrained` pattern.
+    pub(crate) source_addr_constrained: bool,
+    pub(crate) dest_addr_constrained: bool,
     pub(crate) protocol_bitmap: [u64; 4],
     pub(crate) protocol_match_enabled: bool,
     pub(crate) source_ports: PortMatcher,
     pub(crate) dest_ports: PortMatcher,
+    // #2400 (032-19): fail-closed flags for the source/destination PORT match
+    // sets. Same shape as the address flags above. A `PortMatcher::Any` arises
+    // from BOTH the legitimate unscoped case (no port configured) AND the
+    // all-malformed case (every configured port spec failed to parse), so the
+    // matcher cannot distinguish them from the `PortMatcher` alone. When
+    // `*_port_constrained` is true but the matcher is `PortMatcher::Any`, the
+    // term had a port list that ALL failed to parse → match NOTHING (fail
+    // closed). A valid scoped term yields a non-`Any` matcher and matches its
+    // ports as before.
+    pub(crate) source_port_constrained: bool,
+    pub(crate) dest_port_constrained: bool,
     pub(crate) dscp_bitmap: u64,
     pub(crate) dscp_match_enabled: bool,
     // Per-packet L4 match conditions (#2362). NOT in SessionKey, so a filter

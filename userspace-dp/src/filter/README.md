@@ -185,6 +185,40 @@ modifiers, applied after a match has succeeded. They do not
 participate in match-time key lookup and are out of scope for the
 cache-key contract.
 
+### All-malformed match sets fail CLOSED (#2400)
+
+A term's `source-address` / `destination-address` / `source-port` /
+`destination-port` match set restricts which traffic the term's action applies
+to. The Rust compiler drops any entry that fails to parse
+(`parse_address` skips an unparseable prefix; `parse_port_spec` returns `None`).
+Historically an EMPTY parsed list meant "no constraint → match any", so a term
+whose match set was non-empty in the config but whose entries ALL failed to
+parse (every address typo'd, every port out of range) silently broadened to
+match-ANY on that dimension — a `discard` term scoped to bad addresses became
+discard-all (fail-OPEN filter broadening, codex 032-18 / 032-19).
+
+`FilterTerm` now carries four derived flags —
+`source_addr_constrained` / `dest_addr_constrained` /
+`source_port_constrained` / `dest_port_constrained` — set at compile time when
+the snapshot list held at least one REAL entry (`addr_is_real` ignores the empty
+string and the literal `any`; `port_is_real` ignores the empty string). The
+matcher (`engine/matching.rs` `nets_match_v4` / `nets_match_v6` / `port_match`)
+then distinguishes:
+
+- unconstrained (no real entry) → match any (unchanged unscoped behavior);
+- constrained but the parsed set is empty for this packet's family (all entries
+  failed to parse) → match NOTHING (fail closed);
+- otherwise → the IP/port must fall in a parsed prefix/range.
+
+This mirrors the NAT `*_constrained` fail-closed pattern (#2398 SNAT, #2394
+DNAT). A bare-host address (`203.0.113.7`, no `/32`) is handled by
+`parse_address`'s bare-IP fallback (`IpNet::parse` rejects a bare IP). The flags
+are DERIVED from the existing snapshot lists, so there is NO new wire field
+(`protocol_wire_v1.json` is unchanged). The flags are also compared in
+`filter_term_semantics_match` (`engine/cache_sensitive.rs`) because the
+unscoped↔all-malformed transition flips match semantics WITHOUT changing the
+parsed vecs/matcher, so a flow-cache rebuild must catch it.
+
 ### Path (b) runbook — cache-sensitive
 
 Adding a per-packet match field that is NOT in the cache key
