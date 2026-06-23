@@ -1,5 +1,34 @@
 # Action Log
 
+## 2026-06-23 — #2398 SNAT all-malformed match prefixes fail-closed (SNAT sibling of #2394)
+
+- **Timestamp**: 2026-06-23 PDT
+- **Action**: Closed the SNAT fail-open broadening reported in #2398
+  (HIGH). A source-NAT rule's source/destination match prefixes were
+  parsed with `Err(_) => {}` (malformed entries silently dropped) and
+  matched with `nets.is_empty() || ...` (empty list = match any). So a
+  rule whose configured match prefixes ALL failed to parse degraded from
+  "match these prefixes" to "match ANY address" — silently translating
+  all traffic in the zone pair (fail-open NAT broadening). Mirrored the
+  just-merged #2394 DNAT fix exactly: (1) added
+  `SourceNatRule.source_constrained` / `destination_constrained` flags,
+  set at decode from the snapshot match list being non-empty (NO wire
+  field — derived; `protocol_wire_v1.json` unchanged, confirmed). (2)
+  Rewrote `nets_match_v4`/`nets_match_v6` to be fail-closed: unconstrained
+  -> match any (unchanged, anti-over-restrict); constrained but all
+  prefixes failed to parse -> match NOTHING; else prefix match. (3) Added
+  a bare-host IP -> /32 (v4) / /128 (v6) fallback in a shared
+  `parse_match_prefix` helper (Junos carries `match source-address`
+  verbatim; `IpNet::from_str` rejects a bare IP — same live bug #2394
+  fixed for DNAT). Applied to BOTH the source AND destination match sets.
+  Fail-on-revert verified: reverting the fail-closed path makes the 3
+  all-malformed tests FAIL; removing the bare-IP fallback makes the 2
+  bare-host tests FAIL. go build + go test ./pkg/config ./pkg/dataplane
+  green; cargo build --release + cargo test --release green; 8 new tests
+  5x stable.
+- **File(s)**: userspace-dp/src/nat/source.rs,
+  userspace-dp/src/nat/tests.rs, userspace-dp/src/FEATURES.md, _Log.md
+
 ## 2026-06-23 — #2394 PR #2415 Copilot fold: DNAT bare-host source + all-malformed fail-closed
 
 - **Timestamp**: 2026-06-23 PDT

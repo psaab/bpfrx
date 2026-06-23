@@ -95,6 +95,304 @@ fn off_rule_short_circuits_translation() {
     );
 }
 
+// === #2398: SNAT all-malformed match prefixes must fail CLOSED, not match-any ===
+
+/// #2398 fail-on-revert: a SNAT rule whose configured source match set is
+/// non-empty but whose entries ALL fail to parse must match NOTHING. Before
+/// #2398 the empty parsed list collapsed to "match any source", so the SNAT
+/// silently translated all traffic in the zone pair (fail-open broadening).
+/// This test FAILS (SNAT fires) if the constrained flag / fail-closed path is
+/// reverted to `nets.is_empty() || ...`.
+#[test]
+fn snat_all_malformed_source_match_fails_closed_v4() {
+    let rules = parse_source_nat_rules(&[SourceNATRuleSnapshot {
+        name: "snat-typo".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        // Every prefix is garbage / unparseable — operator typo.
+        source_addresses: vec!["not-an-ip".to_string(), "10.0.0.0/99".to_string()],
+        interface_mode: true,
+        ..SourceNATRuleSnapshot::default()
+    }]);
+    let decision = match_source_nat(
+        &rules,
+        "lan",
+        "wan",
+        "10.0.61.102".parse().expect("src"),
+        "172.16.80.200".parse().expect("dst"),
+        Some("172.16.80.8".parse().expect("egress")),
+        None,
+    );
+    assert_eq!(
+        decision, None,
+        "all-malformed SNAT source match must NOT translate (fail closed) — \
+         got a translation, which is the #2398 match-any fail-open"
+    );
+}
+
+/// #2398 fail-on-revert (v6): same as above for an IPv6 SNAT rule.
+#[test]
+fn snat_all_malformed_source_match_fails_closed_v6() {
+    let rules = parse_source_nat_rules(&[SourceNATRuleSnapshot {
+        name: "snat6-typo".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec!["::/999".to_string(), "garbage".to_string()],
+        interface_mode: true,
+        ..SourceNATRuleSnapshot::default()
+    }]);
+    let decision = match_source_nat(
+        &rules,
+        "lan",
+        "wan",
+        "2001:559:8585:ef00::100".parse().expect("src"),
+        "2001:559:8585:80::200".parse().expect("dst"),
+        None,
+        Some("2001:559:8585:80::8".parse().expect("egress")),
+    );
+    assert_eq!(
+        decision, None,
+        "all-malformed SNAT v6 source match must fail closed (#2398)"
+    );
+}
+
+/// #2398: a malformed DESTINATION match set (non-empty, all-garbage) must also
+/// fail closed — the destination side gets the same constrained-flag treatment.
+#[test]
+fn snat_all_malformed_destination_match_fails_closed_v4() {
+    let rules = parse_source_nat_rules(&[SourceNATRuleSnapshot {
+        name: "snat-dst-typo".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        // Source is valid (match any in zone), destination is all garbage.
+        source_addresses: vec!["0.0.0.0/0".to_string()],
+        destination_addresses: vec!["bogus".to_string(), "1.2.3.4/40".to_string()],
+        interface_mode: true,
+        ..SourceNATRuleSnapshot::default()
+    }]);
+    let decision = match_source_nat(
+        &rules,
+        "lan",
+        "wan",
+        "10.0.61.102".parse().expect("src"),
+        "172.16.80.200".parse().expect("dst"),
+        Some("172.16.80.8".parse().expect("egress")),
+        None,
+    );
+    assert_eq!(
+        decision, None,
+        "all-malformed SNAT destination match must fail closed (#2398)"
+    );
+}
+
+/// #2398: a bare host match IP (no `/prefix`) correctly scopes the SNAT. Junos
+/// carries `match source-address 10.0.61.102` verbatim; `IpNet::from_str`
+/// rejects a bare IP, so without the bare-IP /32 fallback this rule would have
+/// an empty parsed list and (after the fail-closed fix) match NOTHING. With the
+/// fallback it matches exactly the host and only the host.
+#[test]
+fn snat_bare_host_source_match_scopes_v4() {
+    let rules = parse_source_nat_rules(&[SourceNATRuleSnapshot {
+        name: "snat-bare".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec!["10.0.61.102".to_string()],
+        interface_mode: true,
+        ..SourceNATRuleSnapshot::default()
+    }]);
+    // Configured host is translated.
+    let hit = match_source_nat(
+        &rules,
+        "lan",
+        "wan",
+        "10.0.61.102".parse().expect("src"),
+        "172.16.80.200".parse().expect("dst"),
+        Some("172.16.80.8".parse().expect("egress")),
+        None,
+    );
+    assert_eq!(
+        hit,
+        Some(NatDecision {
+            rewrite_src: Some("172.16.80.8".parse().expect("snat")),
+            rewrite_dst: None,
+            ..NatDecision::default()
+        }),
+        "bare-host SNAT source must translate the configured host (#2398 fallback)"
+    );
+    // A different host is NOT translated (scope held, not match-any).
+    let miss = match_source_nat(
+        &rules,
+        "lan",
+        "wan",
+        "10.0.61.200".parse().expect("other src"),
+        "172.16.80.200".parse().expect("dst"),
+        Some("172.16.80.8".parse().expect("egress")),
+        None,
+    );
+    assert_eq!(
+        miss, None,
+        "bare-host SNAT must NOT translate a different source (no over-broadening)"
+    );
+}
+
+/// #2398 (v6): bare host IPv6 match scopes the SNAT.
+#[test]
+fn snat_bare_host_source_match_scopes_v6() {
+    let rules = parse_source_nat_rules(&[SourceNATRuleSnapshot {
+        name: "snat-bare6".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec!["2001:559:8585:ef00::100".to_string()],
+        interface_mode: true,
+        ..SourceNATRuleSnapshot::default()
+    }]);
+    let hit = match_source_nat(
+        &rules,
+        "lan",
+        "wan",
+        "2001:559:8585:ef00::100".parse().expect("src"),
+        "2001:559:8585:80::200".parse().expect("dst"),
+        None,
+        Some("2001:559:8585:80::8".parse().expect("egress")),
+    );
+    assert_eq!(
+        hit,
+        Some(NatDecision {
+            rewrite_src: Some("2001:559:8585:80::8".parse().expect("snat")),
+            rewrite_dst: None,
+            ..NatDecision::default()
+        }),
+        "bare-host v6 SNAT source must translate the configured host (#2398)"
+    );
+    let miss = match_source_nat(
+        &rules,
+        "lan",
+        "wan",
+        "2001:559:8585:ef00::200".parse().expect("other src"),
+        "2001:559:8585:80::200".parse().expect("dst"),
+        None,
+        Some("2001:559:8585:80::8".parse().expect("egress")),
+    );
+    assert_eq!(miss, None, "bare-host v6 SNAT must not translate a different source");
+}
+
+/// #2398 anti-over-restrict: a valid UNSCOPED SNAT (empty match set) still
+/// translates all sources. This is the behavior we must NOT break while making
+/// the all-malformed case fail closed.
+#[test]
+fn snat_unscoped_still_translates_all_sources() {
+    let rules = parse_source_nat_rules(&[SourceNATRuleSnapshot {
+        name: "snat-any".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        // No source/destination match prefixes — unconstrained.
+        interface_mode: true,
+        ..SourceNATRuleSnapshot::default()
+    }]);
+    for src in ["10.0.61.5", "192.0.2.7", "10.0.99.250"] {
+        let decision = match_source_nat(
+            &rules,
+            "lan",
+            "wan",
+            src.parse().expect("src"),
+            "172.16.80.200".parse().expect("dst"),
+            Some("172.16.80.8".parse().expect("egress")),
+            None,
+        );
+        assert_eq!(
+            decision,
+            Some(NatDecision {
+                rewrite_src: Some("172.16.80.8".parse().expect("snat")),
+                rewrite_dst: None,
+                ..NatDecision::default()
+            }),
+            "unscoped SNAT must translate every source (anti-over-restrict, #2398) — {src}"
+        );
+    }
+}
+
+/// #2398 anti-over-restrict: a valid SCOPED SNAT translates only matching
+/// traffic — the configured subnet is translated, an out-of-subnet source is
+/// not.
+#[test]
+fn snat_valid_scoped_translates_only_matching() {
+    let rules = parse_source_nat_rules(&[SourceNATRuleSnapshot {
+        name: "snat-scoped".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec!["10.0.61.0/24".to_string()],
+        interface_mode: true,
+        ..SourceNATRuleSnapshot::default()
+    }]);
+    let hit = match_source_nat(
+        &rules,
+        "lan",
+        "wan",
+        "10.0.61.50".parse().expect("in-subnet"),
+        "172.16.80.200".parse().expect("dst"),
+        Some("172.16.80.8".parse().expect("egress")),
+        None,
+    );
+    assert!(hit.is_some(), "in-subnet source must be translated");
+    let miss = match_source_nat(
+        &rules,
+        "lan",
+        "wan",
+        "10.0.62.50".parse().expect("out-of-subnet"),
+        "172.16.80.200".parse().expect("dst"),
+        Some("172.16.80.8".parse().expect("egress")),
+        None,
+    );
+    assert_eq!(miss, None, "out-of-subnet source must NOT be translated");
+}
+
+/// #2398: a MIXED valid+malformed source match set keeps the valid entries and
+/// drops only the garbage — the match narrows to the valid prefix rather than
+/// failing closed entirely or broadening to match-any.
+#[test]
+fn snat_mixed_valid_and_malformed_keeps_valid() {
+    let rules = parse_source_nat_rules(&[SourceNATRuleSnapshot {
+        name: "snat-mixed".to_string(),
+        from_zone: "lan".to_string(),
+        to_zone: "wan".to_string(),
+        source_addresses: vec![
+            "garbage".to_string(),
+            "10.0.61.0/24".to_string(),
+            "10.0.0.0/99".to_string(),
+        ],
+        interface_mode: true,
+        ..SourceNATRuleSnapshot::default()
+    }]);
+    // Valid prefix still matches.
+    let hit = match_source_nat(
+        &rules,
+        "lan",
+        "wan",
+        "10.0.61.7".parse().expect("in valid subnet"),
+        "172.16.80.200".parse().expect("dst"),
+        Some("172.16.80.8".parse().expect("egress")),
+        None,
+    );
+    assert!(
+        hit.is_some(),
+        "mixed match set must keep the valid prefix and translate it (#2398)"
+    );
+    // Out-of-prefix source is not translated (no match-any leak from the garbage).
+    let miss = match_source_nat(
+        &rules,
+        "lan",
+        "wan",
+        "10.0.62.7".parse().expect("out of valid subnet"),
+        "172.16.80.200".parse().expect("dst"),
+        Some("172.16.80.8".parse().expect("egress")),
+        None,
+    );
+    assert_eq!(
+        miss, None,
+        "mixed match set must NOT broaden to match-any from the dropped garbage (#2398)"
+    );
+}
+
 #[test]
 fn reverse_decision_turns_snat_into_reply_dnat() {
     let decision = NatDecision {
