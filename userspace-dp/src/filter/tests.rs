@@ -48,6 +48,10 @@ fn basic_accept_discard() {
                     routing_instance: String::new(),
                     forwarding_class: String::new(),
                     dscp_rewrite: None,
+                    tcp_flags: None,
+                    is_fragment: false,
+                    icmp_type: None,
+                    icmp_code: None,
                 },
                 FirewallTermSnapshot {
                     name: "allow-all".into(),
@@ -64,6 +68,10 @@ fn basic_accept_discard() {
                     routing_instance: String::new(),
                     forwarding_class: String::new(),
                     dscp_rewrite: None,
+                    tcp_flags: None,
+                    is_fragment: false,
+                    icmp_type: None,
+                    icmp_code: None,
                 },
             ],
         }],
@@ -79,6 +87,7 @@ fn basic_accept_discard() {
         12345,
         22,
         0,
+        TermMatchExtra::default(),
     );
     assert_eq!(result.action, FilterAction::Discard);
 
@@ -92,6 +101,7 @@ fn basic_accept_discard() {
         12345,
         80,
         0,
+        TermMatchExtra::default(),
     );
     assert_eq!(result.action, FilterAction::Accept);
 }
@@ -128,6 +138,7 @@ fn interface_filter_log_match_returns_filter_and_term_identity() {
         49152,
         443,
         0,
+        TermMatchExtra::default(),
         true,
     )
     .expect("logged input filter hit");
@@ -170,6 +181,7 @@ fn interface_filter_log_match_skips_pbr_terms_without_double_emit() {
         49152,
         443,
         0,
+        TermMatchExtra::default(),
         true,
     );
 
@@ -197,6 +209,10 @@ fn port_range_matching() {
                 routing_instance: String::new(),
                 forwarding_class: String::new(),
                 dscp_rewrite: None,
+                tcp_flags: None,
+                is_fragment: false,
+                icmp_type: None,
+                icmp_code: None,
             }],
         }],
         &[],
@@ -211,6 +227,7 @@ fn port_range_matching() {
         54321,
         2000,
         0,
+        TermMatchExtra::default(),
     );
     assert_eq!(result.action, FilterAction::Discard);
 
@@ -224,6 +241,7 @@ fn port_range_matching() {
         54321,
         80,
         0,
+        TermMatchExtra::default(),
     );
     assert_eq!(result.action, FilterAction::Accept);
 }
@@ -249,6 +267,10 @@ fn protocol_matching() {
                 routing_instance: String::new(),
                 forwarding_class: String::new(),
                 dscp_rewrite: None,
+                tcp_flags: None,
+                is_fragment: false,
+                icmp_type: None,
+                icmp_code: None,
             }],
         }],
         &[],
@@ -263,6 +285,7 @@ fn protocol_matching() {
         0,
         0,
         0,
+        TermMatchExtra::default(),
     );
     assert_eq!(result.action, FilterAction::Discard);
 
@@ -276,6 +299,7 @@ fn protocol_matching() {
         1234,
         80,
         0,
+        TermMatchExtra::default(),
     );
     assert_eq!(result.action, FilterAction::Accept);
 }
@@ -301,6 +325,10 @@ fn dscp_rewrite_action() {
                 routing_instance: String::new(),
                 forwarding_class: String::new(),
                 dscp_rewrite: Some(46), // EF
+                tcp_flags: None,
+                is_fragment: false,
+                icmp_type: None,
+                icmp_code: None,
             }],
         }],
         &[],
@@ -314,6 +342,7 @@ fn dscp_rewrite_action() {
         54321,
         5060,
         0,
+        TermMatchExtra::default(),
     );
     assert_eq!(result.action, FilterAction::Accept);
     assert_eq!(result.dscp_rewrite, Some(46));
@@ -340,6 +369,10 @@ fn dscp_rewrite_action_allows_default_zero() {
                 routing_instance: String::new(),
                 forwarding_class: String::new(),
                 dscp_rewrite: Some(0),
+                tcp_flags: None,
+                is_fragment: false,
+                icmp_type: None,
+                icmp_code: None,
             }],
         }],
         &[],
@@ -353,6 +386,7 @@ fn dscp_rewrite_action_allows_default_zero() {
         54321,
         5060,
         0,
+        TermMatchExtra::default(),
     );
     assert_eq!(result.action, FilterAction::Accept);
     assert_eq!(result.dscp_rewrite, Some(0));
@@ -1181,6 +1215,10 @@ fn multiple_terms_first_match_wins() {
                     routing_instance: String::new(),
                     forwarding_class: String::new(),
                     dscp_rewrite: None,
+                    tcp_flags: None,
+                    is_fragment: false,
+                    icmp_type: None,
+                    icmp_code: None,
                 },
                 FirewallTermSnapshot {
                     name: "deny-all-udp".into(),
@@ -1197,6 +1235,10 @@ fn multiple_terms_first_match_wins() {
                     routing_instance: String::new(),
                     forwarding_class: String::new(),
                     dscp_rewrite: None,
+                    tcp_flags: None,
+                    is_fragment: false,
+                    icmp_type: None,
+                    icmp_code: None,
                 },
             ],
         }],
@@ -1212,6 +1254,7 @@ fn multiple_terms_first_match_wins() {
         12345,
         53,
         0,
+        TermMatchExtra::default(),
     );
     assert_eq!(result.action, FilterAction::Accept);
 
@@ -1225,6 +1268,7 @@ fn multiple_terms_first_match_wins() {
         12345,
         1234,
         0,
+        TermMatchExtra::default(),
     );
     assert_eq!(result.action, FilterAction::Discard);
 }
@@ -1250,6 +1294,10 @@ fn source_dest_address_matching() {
                 routing_instance: String::new(),
                 forwarding_class: String::new(),
                 dscp_rewrite: None,
+                tcp_flags: None,
+                is_fragment: false,
+                icmp_type: None,
+                icmp_code: None,
             }],
         }],
         &[],
@@ -1264,6 +1312,7 @@ fn source_dest_address_matching() {
         1234,
         80,
         0,
+        TermMatchExtra::default(),
     );
     assert_eq!(result.action, FilterAction::Discard);
 
@@ -1277,6 +1326,7 @@ fn source_dest_address_matching() {
         1234,
         80,
         0,
+        TermMatchExtra::default(),
     );
     assert_eq!(result.action, FilterAction::Accept);
 }
@@ -1353,6 +1403,7 @@ fn interface_filter_assignment() {
         1234,
         80,
         0,
+        TermMatchExtra::default(),
     );
     assert_eq!(result.action, FilterAction::Discard);
 
@@ -1367,6 +1418,7 @@ fn interface_filter_assignment() {
         1234,
         80,
         0,
+        TermMatchExtra::default(),
     );
     assert_eq!(result.action, FilterAction::Accept);
 
@@ -1380,6 +1432,7 @@ fn interface_filter_assignment() {
         1234,
         5201,
         0,
+        TermMatchExtra::default(),
     );
     assert_eq!(result.forwarding_class.as_ref(), "bandwidth-10mb");
 }
@@ -1521,6 +1574,7 @@ fn interface_filter_routing_instance_counted_returns_matching_override() {
         12345,
         5201,
         0,
+        TermMatchExtra::default(),
         1500,
     );
     assert_eq!(routing_instance, Some("sfmix"));
@@ -1566,6 +1620,7 @@ fn interface_output_filter_counted_records_term_hits() {
         40000,
         5201,
         0,
+        TermMatchExtra::default(),
         1514,
     );
     assert_eq!(result.forwarding_class.as_ref(), "iperf-a");
@@ -1614,6 +1669,7 @@ fn interface_output_filter_without_count_does_not_record_term_hits() {
         40000,
         5201,
         0,
+        TermMatchExtra::default(),
         1514,
     );
     assert_eq!(result.forwarding_class.as_ref(), "iperf-a");
@@ -1662,6 +1718,7 @@ fn lo0_filter_evaluation() {
         12345,
         22,
         0,
+        TermMatchExtra::default(),
     );
     assert_eq!(result.action, FilterAction::Accept);
 
@@ -1675,6 +1732,7 @@ fn lo0_filter_evaluation() {
         12345,
         80,
         0,
+        TermMatchExtra::default(),
     );
     assert_eq!(result.action, FilterAction::Discard);
 }
@@ -1712,6 +1770,7 @@ fn dscp_match_in_term() {
         1234,
         5060,
         46,
+        TermMatchExtra::default(),
     );
     assert_eq!(result.action, FilterAction::Accept);
 
@@ -1725,6 +1784,7 @@ fn dscp_match_in_term() {
         1234,
         5060,
         0,
+        TermMatchExtra::default(),
     );
     assert_eq!(result.action, FilterAction::Discard);
 }
@@ -2036,6 +2096,7 @@ fn evaluate_filter_returns_reject_action() {
         40000,
         23,
         0,
+        TermMatchExtra::default(),
     );
     assert_eq!(result.action, FilterAction::Reject);
 }
@@ -2066,6 +2127,7 @@ fn evaluate_filter_missing_key_returns_default_accept() {
         1234,
         80,
         0,
+        TermMatchExtra::default(),
     );
     assert_eq!(result.action, FilterAction::Accept);
     assert_eq!(result, FilterResult::default());
@@ -2090,13 +2152,17 @@ fn evaluate_filter_empty_filter_returns_default_accept() {
         1234,
         80,
         0,
+        TermMatchExtra::default(),
     );
     // A compiled-but-empty filter must fall through to the full default,
     // distinguishable from the missing-key path: the filter exists with zero
     // terms, so a compiler bug that dropped empty filters would also surface
     // here.
     assert_eq!(result, FilterResult::default());
-    let filter = state.filters.get("inet:empty").expect("empty filter compiled");
+    let filter = state
+        .filters
+        .get("inet:empty")
+        .expect("empty filter compiled");
     assert!(filter.terms.is_empty());
 }
 
@@ -2126,6 +2192,7 @@ fn evaluate_filter_mixed_address_family_returns_default_accept() {
         1234,
         80,
         0,
+        TermMatchExtra::default(),
     );
     // The default arm must produce the full default result, not just an Accept
     // action with leftover rewrite/routing/forwarding-class fields.
@@ -2165,6 +2232,7 @@ fn evaluate_filter_ipv6_matches_term() {
         40000,
         443,
         0,
+        TermMatchExtra::default(),
     );
     assert_eq!(denied.action, FilterAction::Discard);
     // Out-of-prefix source falls through to the accept term.
@@ -2177,6 +2245,7 @@ fn evaluate_filter_ipv6_matches_term() {
         40000,
         443,
         0,
+        TermMatchExtra::default(),
     );
     assert_eq!(allowed.action, FilterAction::Accept);
 }
@@ -2216,6 +2285,7 @@ fn evaluate_lo0_filter_ipv6_path() {
         40000,
         22,
         0,
+        TermMatchExtra::default(),
     );
     assert_eq!(accepted.action, FilterAction::Accept);
     let discarded = evaluate_lo0_filter(
@@ -2227,6 +2297,7 @@ fn evaluate_lo0_filter_ipv6_path() {
         40000,
         80,
         0,
+        TermMatchExtra::default(),
     );
     assert_eq!(discarded.action, FilterAction::Discard);
 }
@@ -2266,6 +2337,7 @@ fn evaluate_interface_filter_ipv6_input_path() {
         49152,
         443,
         0,
+        TermMatchExtra::default(),
     );
     assert_eq!(result.action, FilterAction::Discard);
 }
@@ -2297,6 +2369,7 @@ fn evaluate_filter_counted_increments_term_counter() {
         40000,
         80,
         0,
+        TermMatchExtra::default(),
         1400,
     );
     assert_eq!(result.action, FilterAction::Accept);
@@ -2315,6 +2388,7 @@ fn evaluate_filter_counted_increments_term_counter() {
         40000,
         443,
         0,
+        TermMatchExtra::default(),
         1400,
     );
     assert_eq!(miss.action, FilterAction::Accept);
@@ -2348,6 +2422,7 @@ fn evaluate_filter_counted_increments_term_counter_ipv6() {
         40000,
         80,
         0,
+        TermMatchExtra::default(),
         1500,
     );
     assert_eq!(result.action, FilterAction::Accept);
@@ -2409,6 +2484,7 @@ fn interface_filter_non_routing_counted_defers_pbr_term() {
         40000,
         5201,
         0,
+        TermMatchExtra::default(),
         1400,
     );
     assert_eq!(pbr.action, FilterAction::Accept);
@@ -2428,6 +2504,7 @@ fn interface_filter_non_routing_counted_defers_pbr_term() {
         40000,
         53,
         0,
+        TermMatchExtra::default(),
         500,
     );
     assert_eq!(plain.action, FilterAction::Discard);
@@ -2650,20 +2727,508 @@ fn cached_and_runtime_tx_selection_agree_on_plain_term() {
     let runtime = evaluate_filter_ref_tx_selection_runtime_counted(
         filter, src, dst, PROTO_TCP, 40000, 5201, 0, 0, 1,
     );
-    let cached = evaluate_filter_ref_tx_selection_cached(filter, src, dst, PROTO_TCP, 40000, 5201, 0);
+    let cached =
+        evaluate_filter_ref_tx_selection_cached(filter, src, dst, PROTO_TCP, 40000, 5201, 0);
 
     // A term with no three-color policer must yield identical action,
     // forwarding-class, DSCP rewrite, and log-match identity on both paths.
     assert_eq!(runtime.action, cached.action);
     assert_eq!(runtime.action, FilterAction::Accept);
-    assert_eq!(
-        runtime.forwarding_class,
-        cached.forwarding_class.as_deref()
-    );
+    assert_eq!(runtime.forwarding_class, cached.forwarding_class.as_deref());
     assert_eq!(runtime.forwarding_class, Some("iperf-a"));
     assert_eq!(runtime.dscp_rewrite, cached.dscp_rewrite);
     assert_eq!(runtime.dscp_rewrite, Some(46));
     assert_eq!(runtime.log_match, cached.log_match);
     assert!(runtime.log_match.is_some());
     assert!(!runtime.policer_drop);
+}
+
+// ===========================================================================
+// #2362 per-packet L4 match conditions (tcp-flags / is-fragment / icmp-type /
+// icmp-code). These were parsed by the Go compiler but dropped on the wire and
+// absent from the Rust matcher, so a term matched broader than authored. The
+// tests below exercise the runtime match predicate directly: a packet matching
+// the condition triggers the term action; one that does not (wrong flags / not
+// a fragment / wrong icmp-type / wrong protocol) falls through to the default.
+// ===========================================================================
+
+// Build a one-term filter carrying explicit per-packet conditions, then a
+// trailing accept-all term so a non-match is observably Accept.
+fn per_packet_filter(
+    family: &str,
+    proto: &str,
+    tcp_flags: Option<u8>,
+    is_fragment: bool,
+    icmp_type: Option<u8>,
+    icmp_code: Option<u8>,
+) -> Vec<FirewallFilterSnapshot> {
+    vec![FirewallFilterSnapshot {
+        name: "pp".into(),
+        family: family.into(),
+        terms: vec![
+            FirewallTermSnapshot {
+                name: "match".into(),
+                protocols: if proto.is_empty() {
+                    vec![]
+                } else {
+                    vec![proto.into()]
+                },
+                action: "discard".into(),
+                tcp_flags,
+                is_fragment,
+                icmp_type,
+                icmp_code,
+                ..Default::default()
+            },
+            FirewallTermSnapshot {
+                name: "rest".into(),
+                action: "accept".into(),
+                ..Default::default()
+            },
+        ],
+    }]
+}
+
+fn v4(a: u8, b: u8, c: u8, d: u8) -> IpAddr {
+    IpAddr::V4(Ipv4Addr::new(a, b, c, d))
+}
+
+fn extra_tcp(flags: u8) -> TermMatchExtra {
+    TermMatchExtra {
+        tcp_flags: flags,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn tcp_flags_term_matches_syn_only() {
+    // tcp-flags syn then discard: SYN(0x02) is dropped, a pure ACK forwards.
+    let state = make_filter_state(
+        &per_packet_filter("inet", "tcp", Some(0x02), false, None, None),
+        &[],
+    );
+    let syn = evaluate_filter(
+        &state,
+        "inet:pp",
+        v4(10, 0, 0, 1),
+        v4(10, 0, 0, 2),
+        PROTO_TCP,
+        1000,
+        22,
+        0,
+        extra_tcp(0x02),
+    );
+    assert_eq!(
+        syn.action,
+        FilterAction::Discard,
+        "SYN must match tcp-flags syn"
+    );
+    let ack = evaluate_filter(
+        &state,
+        "inet:pp",
+        v4(10, 0, 0, 1),
+        v4(10, 0, 0, 2),
+        PROTO_TCP,
+        1000,
+        22,
+        0,
+        extra_tcp(0x10),
+    );
+    assert_eq!(
+        ack.action,
+        FilterAction::Accept,
+        "pure ACK must NOT match tcp-flags syn"
+    );
+    // SYN+ACK has SYN set -> still matches (Junos `tcp-flags syn` semantics).
+    let synack = evaluate_filter(
+        &state,
+        "inet:pp",
+        v4(10, 0, 0, 1),
+        v4(10, 0, 0, 2),
+        PROTO_TCP,
+        1000,
+        22,
+        0,
+        extra_tcp(0x12),
+    );
+    assert_eq!(
+        synack.action,
+        FilterAction::Discard,
+        "SYN+ACK has SYN set -> matches"
+    );
+}
+
+#[test]
+fn tcp_flags_term_requires_all_listed_flags() {
+    // tcp-flags (syn & ack) folded to mask 0x12: only a segment with BOTH set matches.
+    let state = make_filter_state(
+        &per_packet_filter("inet", "tcp", Some(0x12), false, None, None),
+        &[],
+    );
+    let synack = evaluate_filter(
+        &state,
+        "inet:pp",
+        v4(10, 0, 0, 1),
+        v4(10, 0, 0, 2),
+        PROTO_TCP,
+        1000,
+        80,
+        0,
+        extra_tcp(0x12),
+    );
+    assert_eq!(synack.action, FilterAction::Discard);
+    let syn = evaluate_filter(
+        &state,
+        "inet:pp",
+        v4(10, 0, 0, 1),
+        v4(10, 0, 0, 2),
+        PROTO_TCP,
+        1000,
+        80,
+        0,
+        extra_tcp(0x02),
+    );
+    assert_eq!(
+        syn.action,
+        FilterAction::Accept,
+        "SYN alone lacks ACK -> no match"
+    );
+}
+
+#[test]
+fn tcp_flags_term_does_not_match_non_tcp() {
+    // A tcp-flags term must never match a UDP packet even if the (meaningless)
+    // tcp_flags byte happens to carry the bits.
+    let state = make_filter_state(
+        &per_packet_filter("inet", "", Some(0x02), false, None, None),
+        &[],
+    );
+    let udp = evaluate_filter(
+        &state,
+        "inet:pp",
+        v4(10, 0, 0, 1),
+        v4(10, 0, 0, 2),
+        PROTO_UDP,
+        1000,
+        53,
+        0,
+        extra_tcp(0x02),
+    );
+    assert_eq!(
+        udp.action,
+        FilterAction::Accept,
+        "UDP must not match a tcp-flags term"
+    );
+}
+
+#[test]
+fn is_fragment_term_spares_non_fragments() {
+    let state = make_filter_state(&per_packet_filter("inet", "", None, true, None, None), &[]);
+    let frag = TermMatchExtra {
+        is_fragment: true,
+        ..Default::default()
+    };
+    let dropped = evaluate_filter(
+        &state,
+        "inet:pp",
+        v4(10, 0, 0, 1),
+        v4(10, 0, 0, 2),
+        PROTO_UDP,
+        1000,
+        53,
+        0,
+        frag,
+    );
+    assert_eq!(
+        dropped.action,
+        FilterAction::Discard,
+        "a fragment must match is-fragment"
+    );
+    let whole = evaluate_filter(
+        &state,
+        "inet:pp",
+        v4(10, 0, 0, 1),
+        v4(10, 0, 0, 2),
+        PROTO_UDP,
+        1000,
+        53,
+        0,
+        TermMatchExtra::default(),
+    );
+    assert_eq!(
+        whole.action,
+        FilterAction::Accept,
+        "a non-fragment must NOT match is-fragment"
+    );
+}
+
+#[test]
+fn icmp_type_term_matches_only_that_type_v4() {
+    // icmp-type 8 (echo-request) then discard must NOT collapse to drop-all-ICMP.
+    let state = make_filter_state(
+        &per_packet_filter("inet", "icmp", None, false, Some(8), None),
+        &[],
+    );
+    let echo = TermMatchExtra {
+        icmp_type: 8,
+        ..Default::default()
+    };
+    let drop = evaluate_filter(
+        &state,
+        "inet:pp",
+        v4(10, 0, 0, 1),
+        v4(10, 0, 0, 2),
+        PROTO_ICMP,
+        0,
+        0,
+        0,
+        echo,
+    );
+    assert_eq!(
+        drop.action,
+        FilterAction::Discard,
+        "echo-request must match icmp-type 8"
+    );
+    let reply = TermMatchExtra {
+        icmp_type: 0,
+        ..Default::default()
+    };
+    let pass = evaluate_filter(
+        &state,
+        "inet:pp",
+        v4(10, 0, 0, 1),
+        v4(10, 0, 0, 2),
+        PROTO_ICMP,
+        0,
+        0,
+        0,
+        reply,
+    );
+    assert_eq!(
+        pass.action,
+        FilterAction::Accept,
+        "echo-reply (type 0) must NOT match icmp-type 8"
+    );
+}
+
+#[test]
+fn icmp_type_term_matches_icmpv6() {
+    // icmp-type 128 (ICMPv6 echo-request) on an inet6 filter.
+    let state = make_filter_state(
+        &per_packet_filter("inet6", "icmpv6", None, false, Some(128), None),
+        &[],
+    );
+    let v6 = |s: &str| IpAddr::V6(s.parse::<Ipv6Addr>().unwrap());
+    let echo = TermMatchExtra {
+        icmp_type: 128,
+        ..Default::default()
+    };
+    let drop = evaluate_filter(
+        &state,
+        "inet6:pp",
+        v6("2001:db8::1"),
+        v6("2001:db8::2"),
+        PROTO_ICMPV6,
+        0,
+        0,
+        0,
+        echo,
+    );
+    assert_eq!(drop.action, FilterAction::Discard);
+    let na = TermMatchExtra {
+        icmp_type: 136,
+        ..Default::default()
+    };
+    let pass = evaluate_filter(
+        &state,
+        "inet6:pp",
+        v6("2001:db8::1"),
+        v6("2001:db8::2"),
+        PROTO_ICMPV6,
+        0,
+        0,
+        0,
+        na,
+    );
+    assert_eq!(
+        pass.action,
+        FilterAction::Accept,
+        "neighbor-advert (136) must NOT match icmp-type 128"
+    );
+}
+
+#[test]
+fn icmp_code_term_narrows_within_type() {
+    // icmp-type 3 code 4 (frag-needed) — code 0 must not match.
+    let state = make_filter_state(
+        &per_packet_filter("inet", "icmp", None, false, Some(3), Some(4)),
+        &[],
+    );
+    let frag_needed = TermMatchExtra {
+        icmp_type: 3,
+        icmp_code: 4,
+        ..Default::default()
+    };
+    let drop = evaluate_filter(
+        &state,
+        "inet:pp",
+        v4(10, 0, 0, 1),
+        v4(10, 0, 0, 2),
+        PROTO_ICMP,
+        0,
+        0,
+        0,
+        frag_needed,
+    );
+    assert_eq!(drop.action, FilterAction::Discard);
+    let net_unreach = TermMatchExtra {
+        icmp_type: 3,
+        icmp_code: 0,
+        ..Default::default()
+    };
+    let pass = evaluate_filter(
+        &state,
+        "inet:pp",
+        v4(10, 0, 0, 1),
+        v4(10, 0, 0, 2),
+        PROTO_ICMP,
+        0,
+        0,
+        0,
+        net_unreach,
+    );
+    assert_eq!(
+        pass.action,
+        FilterAction::Accept,
+        "code 0 must NOT match icmp-code 4"
+    );
+}
+
+#[test]
+fn icmp_term_does_not_match_non_icmp() {
+    let state = make_filter_state(
+        &per_packet_filter("inet", "", None, false, Some(8), None),
+        &[],
+    );
+    // A TCP packet whose byte happens to equal 8 must not match an icmp-type term.
+    let tcp = TermMatchExtra {
+        tcp_flags: 0x02,
+        icmp_type: 8,
+        ..Default::default()
+    };
+    let pass = evaluate_filter(
+        &state,
+        "inet:pp",
+        v4(10, 0, 0, 1),
+        v4(10, 0, 0, 2),
+        PROTO_TCP,
+        1000,
+        80,
+        0,
+        tcp,
+    );
+    assert_eq!(
+        pass.action,
+        FilterAction::Accept,
+        "TCP must not match an icmp-type term"
+    );
+}
+
+#[test]
+fn per_packet_match_action_applies_with_count() {
+    // The term action AND its count side-effect apply on a per-packet match.
+    let filters = vec![FirewallFilterSnapshot {
+        name: "c".into(),
+        family: "inet".into(),
+        terms: vec![FirewallTermSnapshot {
+            name: "syn".into(),
+            protocols: vec!["tcp".into()],
+            action: "discard".into(),
+            count: "syns".into(),
+            tcp_flags: Some(0x02),
+            ..Default::default()
+        }],
+    }];
+    let state = make_filter_state(&filters, &[]);
+    let r = evaluate_filter_counted(
+        &state,
+        "inet:c",
+        v4(10, 0, 0, 1),
+        v4(10, 0, 0, 2),
+        PROTO_TCP,
+        1000,
+        22,
+        0,
+        extra_tcp(0x02),
+        1500,
+    );
+    assert_eq!(r.action, FilterAction::Discard);
+    let filter = state.filters.get("inet:c").expect("filter");
+    assert_eq!(filter.terms[0].counter.packets.load(Ordering::Relaxed), 1);
+    assert_eq!(filter.terms[0].counter.bytes.load(Ordering::Relaxed), 1500);
+    // A non-matching ACK must NOT bump the counter.
+    let _ = evaluate_filter_counted(
+        &state,
+        "inet:c",
+        v4(10, 0, 0, 1),
+        v4(10, 0, 0, 2),
+        PROTO_TCP,
+        1000,
+        22,
+        0,
+        extra_tcp(0x10),
+        1500,
+    );
+    assert_eq!(filter.terms[0].counter.packets.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn per_packet_match_marks_filter_cache_sensitive() {
+    // A filter carrying any per-packet L4 match term must be flagged so the
+    // flow-cache declines (path (b), #1431/#2362) and the on-session re-eval
+    // gate fires.
+    let filters = per_packet_filter("inet", "tcp", Some(0x02), false, None, None);
+    let interfaces = [crate::InterfaceSnapshot {
+        ifindex: 7,
+        filter_input_v4: "pp".into(),
+        ..Default::default()
+    }];
+    let state = parse_filter_state(&filters, &[], &interfaces, "", "");
+    assert!(
+        state.iface_filter_v4_has_per_packet_l4_match.contains(&7),
+        "interface input filter with a tcp-flags term must be marked per-packet-L4 cache-sensitive"
+    );
+    assert!(interface_input_filter_has_per_packet_l4_match(
+        &state, 7, false
+    ));
+    let filter = state.iface_filter_v4_fast.get(&7).expect("filter");
+    assert!(filter.has_per_packet_l4_match_terms);
+}
+
+// #2362 / #1961-class wire round-trip: a Go-encoded FirewallTermSnapshot with
+// the new fields must decode into the Rust DTO with the same values. Guards the
+// one-sided-field decode-failure (whole-snapshot abort -> no transit) class.
+#[test]
+fn firewall_term_snapshot_per_packet_fields_round_trip() {
+    let json = r#"{
+        "name": "syn-only",
+        "protocols": ["tcp"],
+        "action": "discard",
+        "tcp_flags": 2,
+        "is_fragment": true,
+        "icmp_type": 8,
+        "icmp_code": 0
+    }"#;
+    let term: FirewallTermSnapshot = serde_json::from_str(json).expect("decode");
+    assert_eq!(term.tcp_flags, Some(2));
+    assert!(term.is_fragment);
+    assert_eq!(term.icmp_type, Some(8));
+    assert_eq!(term.icmp_code, Some(0));
+    // Absent fields default to None/false (forward/backward compatibility).
+    let minimal: FirewallTermSnapshot =
+        serde_json::from_str(r#"{"name":"x","action":"accept"}"#).expect("decode minimal");
+    assert_eq!(minimal.tcp_flags, None);
+    assert!(!minimal.is_fragment);
+    assert_eq!(minimal.icmp_type, None);
+    assert_eq!(minimal.icmp_code, None);
 }
