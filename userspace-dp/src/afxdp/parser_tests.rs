@@ -77,7 +77,69 @@ fn classify_arp_rejects_short_frame() {
     assert_eq!(classify_arp(&f), ArpClassification::NotArp);
 }
 
+/// Compute the RFC 4443 ICMPv6 checksum over the message at
+/// `l4_start..packet_end` using the IPv6 pseudo-header taken from the
+/// IPv6 base header at `l3_start`. The on-wire checksum field
+/// (`l4_start + 2..l4_start + 4`) is treated as zero for the
+/// computation. Used by the test builders to stamp a VALID checksum so
+/// the #2368 §7.1.2 validation accepts a legitimate NA.
+fn compute_icmpv6_checksum(frame: &[u8], l3_start: usize, l4_start: usize, packet_end: usize) -> u16 {
+    let mut sum: u32 = 0;
+    let add = |sum: &mut u32, bytes: &[u8]| {
+        let mut i = 0;
+        while i + 1 < bytes.len() {
+            *sum += u16::from_be_bytes([bytes[i], bytes[i + 1]]) as u32;
+            i += 2;
+        }
+        if i < bytes.len() {
+            *sum += (bytes[i] as u32) << 8;
+        }
+    };
+    // pseudo-header: src(16) + dst(16) + len(32) + [0,0,0,58]
+    add(&mut sum, &frame[l3_start + 8..l3_start + 24]);
+    add(&mut sum, &frame[l3_start + 24..l3_start + 40]);
+    let icmp_len = (packet_end - l4_start) as u32;
+    add(&mut sum, &icmp_len.to_be_bytes());
+    add(&mut sum, &[0, 0, 0, NEXT_HEADER_ICMPV6]);
+    // ICMPv6 message with the checksum field zeroed.
+    let mut icmp = frame[l4_start..packet_end].to_vec();
+    icmp[2] = 0;
+    icmp[3] = 0;
+    add(&mut sum, &icmp);
+    while (sum >> 16) != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+/// Stamp a valid ICMPv6 checksum into `frame` in place (l4 at `l4_start`,
+/// declared packet end at `packet_end`, IPv6 base header at `l3_start`).
+fn stamp_icmpv6_checksum(frame: &mut [u8], l3_start: usize, l4_start: usize, packet_end: usize) {
+    let csum = compute_icmpv6_checksum(frame, l3_start, l4_start, packet_end);
+    frame[l4_start + 2..l4_start + 4].copy_from_slice(&csum.to_be_bytes());
+}
+
 fn build_eth_ndp_na(vlan: bool, with_tlla: bool) -> Vec<u8> {
+    build_eth_ndp_na_full(vlan, with_tlla, 255, 0, false)
+}
+
+/// Full NDP NA builder with explicit RFC 4861 §7.1.2 knobs (#2368).
+///
+///  - `hop_limit`        — IPv6 Hop Limit byte (255 required by §7.1.2).
+///  - `code`             — ICMPv6 Code byte (0 required by §7.1.2).
+///  - `target_multicast` — when true the Target Address is ff02::1
+///    (multicast) instead of the default unicast fe80::abcd:ef01:0:42.
+///
+/// Always stamps a VALID ICMPv6 checksum over the declared packet so a
+/// well-formed frame is accepted; rejection tests that need a bad
+/// checksum corrupt the field after building.
+fn build_eth_ndp_na_full(
+    vlan: bool,
+    with_tlla: bool,
+    hop_limit: u8,
+    code: u8,
+    target_multicast: bool,
+) -> Vec<u8> {
     let mut f = Vec::new();
     f.extend_from_slice(&[0x00, 0x11, 0x22, 0x33, 0x44, 0x55]);
     f.extend_from_slice(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
@@ -86,34 +148,44 @@ fn build_eth_ndp_na(vlan: bool, with_tlla: bool) -> Vec<u8> {
     }
     // ethertype IPv6
     f.extend_from_slice(&[0x86, 0xdd]);
+    let l3_start = if vlan { 18 } else { 14 };
     // IPv6 header (40 bytes): version=6, payload-len=24+8 if TLLA else 24,
-    // next-header=58 ICMPv6, hop-limit=255
+    // next-header=58 ICMPv6
     let payload_len = if with_tlla { 32u16 } else { 24u16 };
     f.extend_from_slice(&[0x60, 0x00, 0x00, 0x00]); // ver+tc+flow
     f.extend_from_slice(&payload_len.to_be_bytes());
     f.push(NEXT_HEADER_ICMPV6); // next header
-    f.push(255); // hop limit
-                 // src ip
+    f.push(hop_limit); // hop limit
+                       // src ip
     f.extend_from_slice(&[
         0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0xab, 0xcd, 0xef, 0x01, 0x00, 0x00, 0x00, 0x01,
     ]);
     // dst ip
     f.extend_from_slice(&[0xff; 16]);
-    // ICMPv6 NA: type=136, code=0, checksum=0xffff, flags=0, target=fe80::abcd:ef01:0:42
+    let l4_start = l3_start + 40;
+    // ICMPv6 NA: type=136, code, checksum(placeholder), flags=0, target
     f.push(ICMPV6_TYPE_NA);
-    f.push(0); // code
-    f.extend_from_slice(&[0xff, 0xff]); // checksum
+    f.push(code); // code
+    f.extend_from_slice(&[0x00, 0x00]); // checksum placeholder (stamped below)
     f.extend_from_slice(&[0; 4]); // flags
-                                  // target address
-    f.extend_from_slice(&[
-        0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0xab, 0xcd, 0xef, 0x01, 0x00, 0x00, 0x00, 0x42,
-    ]);
+    if target_multicast {
+        // ff02::1 — all-nodes multicast: an invalid Target Address.
+        f.extend_from_slice(&[
+            0xff, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x00, 0x00, 0x00, 0x01,
+        ]);
+    } else {
+        f.extend_from_slice(&[
+            0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0xab, 0xcd, 0xef, 0x01, 0x00, 0x00, 0x00, 0x42,
+        ]);
+    }
     if with_tlla {
         // option type=2 (TLLA), len=1 (×8 = 8 bytes), MAC
         f.push(NDP_OPT_TARGET_LL);
         f.push(1);
         f.extend_from_slice(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
     }
+    let packet_end = l3_start + 40 + payload_len as usize;
+    stamp_icmpv6_checksum(&mut f, l3_start, l4_start, packet_end);
     f
 }
 
@@ -320,7 +392,7 @@ fn build_ndp_na_with_ext_chain(ext_chain: &[u8]) -> Vec<u8> {
     let mut na = Vec::new();
     na.push(ICMPV6_TYPE_NA);
     na.push(0); // code
-    na.extend_from_slice(&[0xff, 0xff]); // checksum
+    na.extend_from_slice(&[0x00, 0x00]); // checksum placeholder (stamped below)
     na.extend_from_slice(&[0u8; 4]); // flags
     na.extend_from_slice(&[
         0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0xab, 0xcd, 0xef, 0x01, 0x00, 0x00, 0x00, 0x42,
@@ -343,7 +415,13 @@ fn build_ndp_na_with_ext_chain(ext_chain: &[u8]) -> Vec<u8> {
     f.extend_from_slice(&[0xff; 16]); // dst
 
     f.extend_from_slice(&ext_block);
+    let l4_start = f.len();
     f.extend_from_slice(&na);
+    // ext chain sits between the base IPv6 header (l3=14) and the NA;
+    // the NA's L4 start is wherever the chain ends. The declared packet
+    // end is l3 + 40 + payload_len = end of frame here.
+    let packet_end = f.len();
+    stamp_icmpv6_checksum(&mut f, 14, l4_start, packet_end);
     f
 }
 
@@ -410,4 +488,118 @@ fn parse_ndp_na_truncated_ext_chain_no_panic() {
     // Truncate inside the ICMPv6 NA body (keep base + HBH + a few bytes).
     f.truncate(14 + 40 + 8 + 4);
     assert!(parse_ndp_neighbor_advert(&f).is_none());
+}
+
+// ---------------------------------------------------------------------------
+// #2368 — RFC 4861 §7.1.2 NA validation + payload_len-bounded option walk.
+//
+// These are fail-on-revert security tests: each MUST fail (the neighbor
+// cache is poisoned) if the corresponding validity check is removed, and
+// the valid-NA test MUST fail if the validation is too strict.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn parse_ndp_na_2368_valid_na_still_learns() {
+    // Anti-over-reject: a well-formed NA (hop-limit 255, code 0, valid
+    // ICMPv6 checksum, TLLA within payload_len) MUST still learn the MAC.
+    // Fails if the §7.1.2 validation is too strict (e.g. checksum logic
+    // inverted) → legitimate IPv6 neighbor resolution would break.
+    let f = build_eth_ndp_na_full(false, true, 255, 0, false);
+    let r = parse_ndp_neighbor_advert(&f).expect("valid NA must still parse");
+    assert_eq!(r.target_mac, Some([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]));
+}
+
+#[test]
+fn parse_ndp_na_2368_valid_na_vlan_still_learns() {
+    // Same anti-over-reject check on a VLAN-tagged NA (l3 at 18).
+    let f = build_eth_ndp_na_full(true, true, 255, 0, false);
+    let r = parse_ndp_neighbor_advert(&f).expect("valid VLAN NA must still parse");
+    assert_eq!(r.target_mac, Some([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]));
+}
+
+#[test]
+fn parse_ndp_na_2368_rejects_hop_limit_below_255() {
+    // RFC 4861 §7.1.2: an NA with Hop Limit < 255 was forwarded by a
+    // router and is therefore off-link — MUST NOT be learned. Fails (the
+    // cache is poisoned by an off-link impersonator) if the hop-limit
+    // gate is removed.
+    let f = build_eth_ndp_na_full(false, true, 254, 0, false);
+    assert!(
+        parse_ndp_neighbor_advert(&f).is_none(),
+        "NA with hop-limit 254 must not be learned"
+    );
+}
+
+#[test]
+fn parse_ndp_na_2368_rejects_nonzero_code() {
+    // RFC 4861 §7.1.2: ICMPv6 Code MUST be 0. Fails if the code gate is
+    // removed.
+    let f = build_eth_ndp_na_full(false, true, 255, 1, false);
+    assert!(
+        parse_ndp_neighbor_advert(&f).is_none(),
+        "NA with ICMPv6 code 1 must not be learned"
+    );
+}
+
+#[test]
+fn parse_ndp_na_2368_rejects_bad_checksum() {
+    // RFC 4443: a valid ICMPv6 checksum is required. Corrupt the stamped
+    // checksum and confirm the NA is rejected. Fails if the checksum
+    // validation is removed.
+    let mut f = build_eth_ndp_na_full(false, true, 255, 0, false);
+    let l4_start = 14 + 40;
+    // Flip the checksum field so it no longer matches the message.
+    f[l4_start + 2] ^= 0xff;
+    f[l4_start + 3] ^= 0xff;
+    assert!(
+        parse_ndp_neighbor_advert(&f).is_none(),
+        "NA with a bad ICMPv6 checksum must not be learned"
+    );
+}
+
+#[test]
+fn parse_ndp_na_2368_rejects_multicast_target() {
+    // RFC 4861 §7.1.2: the Target Address MUST NOT be multicast. Fails if
+    // the multicast-target gate is removed.
+    let f = build_eth_ndp_na_full(false, true, 255, 0, true);
+    assert!(
+        parse_ndp_neighbor_advert(&f).is_none(),
+        "NA with a multicast Target Address must not be learned"
+    );
+}
+
+#[test]
+fn parse_ndp_na_2368_tlla_past_payload_len_not_read() {
+    // #2368 (B): a frame declares payload_len covering ONLY the fixed NA
+    // header (24 bytes, no TLLA), then appends a forged TLLA option in
+    // the Ethernet trailer beyond `40 + payload_len`. The option walk
+    // MUST be bounded by the IPv6-declared packet end, not raw_frame.len(),
+    // so the trailer TLLA is NOT read as a link-layer address.
+    //
+    // Fails (the trailer MAC is learned) if the walk bound reverts to
+    // frame.len().
+    let mut f = build_eth_ndp_na_full(false, false, 255, 0, false); // no TLLA, payload_len=24
+    // The stamped checksum already covers exactly l4..l3+40+24. Append a
+    // forged TLLA option as pure Ethernet trailer (outside payload_len).
+    f.push(NDP_OPT_TARGET_LL);
+    f.push(1);
+    f.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef, 0x00, 0x01]); // attacker MAC
+    let r = parse_ndp_neighbor_advert(&f).expect("base NA (no in-bounds TLLA) still parses");
+    assert_eq!(
+        r.target_mac, None,
+        "a TLLA option in the trailer beyond payload_len must not be learned"
+    );
+}
+
+#[test]
+fn parse_ndp_na_2368_rejects_payload_len_overrunning_frame() {
+    // A declared payload_len longer than the actual frame must be
+    // rejected (packet_end > raw_frame.len()), never read OOB.
+    let mut f = build_eth_ndp_na_full(false, true, 255, 0, false);
+    // Inflate payload_len well past the real frame length.
+    f[14 + 4..14 + 6].copy_from_slice(&0xffffu16.to_be_bytes());
+    assert!(
+        parse_ndp_neighbor_advert(&f).is_none(),
+        "NA whose declared payload_len overruns the frame must be rejected"
+    );
 }
