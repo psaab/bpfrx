@@ -35,11 +35,20 @@ pub(crate) const PROTO_SCTP: u8 = 132;
 /// `junos-*` aliases are NOT handled here: the Go compiler resolves an
 /// `application junos-foo` to its numeric protocol before building the
 /// snapshot, so the wire `protocol` is already a bare name or number. Returns
-/// `None` for an unrecognized token (the DNAT builder treats that as "drop the
-/// entry" — but the Go side never emits one, since the commit gate rejects an
-/// unresolvable protocol first).
+/// `None` for an unrecognized token; the DNAT commit gate
+/// (validateDestinationNATProtocolStrict, #2396) rejects an unresolvable DNAT
+/// protocol so an inert rule never reaches the wire, and the dataplane drops
+/// any that slip through a tolerant load.
+///
+/// #2396 (Copilot fold): the token is trimmed and lower-cased before matching.
+/// DNAT `match protocol` and an `application`'s `protocol` reach the wire
+/// VERBATIM from the parser (`nodeVal`) — neither the parser nor the snapshot
+/// builder normalizes — so a config `protocol GRE` or `protocol " icmp "`
+/// would otherwise resolve to nothing here and be silently dropped. The Go
+/// commit gate normalizes the same way (strings.TrimSpace + ToLower) before
+/// validating, so the two views agree on the accepted set after normalization.
 pub(crate) fn proto_number(name: &str) -> Option<u8> {
-    match name {
+    match name.trim().to_ascii_lowercase().as_str() {
         "tcp" => Some(PROTO_TCP),
         "udp" => Some(PROTO_UDP),
         "icmp" => Some(PROTO_ICMP),

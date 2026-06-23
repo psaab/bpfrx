@@ -4148,8 +4148,79 @@ fn proto_number_resolver_matches_known_tokens() {
     assert_eq!(proto_number("gre"), Some(PROTO_GRE));
     // Bare numeric protocol number.
     assert_eq!(proto_number("47"), Some(PROTO_GRE));
-    assert_eq!(proto_number("0"), Some(PROTO_ANY));
+    // #2396 (Copilot fold): "0" is HOPOPT — a REAL, exact protocol number, NOT
+    // the wildcard. The wildcard sentinel (PROTO_ANY = 256) is u16 and outside
+    // proto_number's u8 range, so it can never be returned here.
+    assert_eq!(proto_number("0"), Some(0u8));
+    assert_eq!(u16::from(0u8) != PROTO_ANY, true, "HOPOPT must differ from PROTO_ANY");
     // Unresolvable token.
     assert_eq!(proto_number("bogus"), None);
     assert_eq!(proto_number("256"), None);
+}
+
+/// #2396 (Copilot fold, item 1): the resolver normalizes (trim + lower-case)
+/// so a mixed-case or whitespace-padded protocol token from the verbatim
+/// parser path resolves to the SAME number as the canonical lower-case token —
+/// rather than failing and being silently dropped while the Go side accepts it.
+#[test]
+fn proto_number_normalizes_case_and_whitespace() {
+    use crate::ip_proto::proto_number;
+    assert_eq!(proto_number(" GRE "), proto_number("gre"));
+    assert_eq!(proto_number("GRE"), Some(PROTO_GRE));
+    assert_eq!(proto_number("Icmp"), Some(PROTO_ICMP));
+    assert_eq!(proto_number("  TCP"), Some(PROTO_TCP));
+    assert_eq!(proto_number("ICMP6"), Some(PROTO_ICMPV6));
+    assert_eq!(proto_number(" 47 "), Some(PROTO_GRE));
+}
+
+/// #2396 (Copilot fold, item 2): a DNAT rule with `protocol "0"` (HOPOPT) is a
+/// DISTINCT exact match — it must NOT alias the IP-only wildcard. A separate
+/// IP-only ("") rule on the SAME destination still matches every OTHER
+/// protocol via the wildcard, but the HOPOPT rule owns protocol 0 exactly.
+#[test]
+fn dnat_protocol_zero_hopopt_is_distinct_from_wildcard() {
+    use crate::ip_proto::PROTO_TCP as P_TCP;
+    let table = DnatTable::from_snapshots(
+        &[
+            // IP-only catch-all -> pool A (every protocol EXCEPT an exact match)
+            DestinationNATRuleSnapshot {
+                name: "catch-all".to_string(),
+                destination_address: "203.0.113.10".to_string(),
+                destination_port: 0,
+                protocol: "".to_string(),
+                pool_address: "192.168.1.10".to_string(),
+                ..DestinationNATRuleSnapshot::default()
+            },
+            // Exact HOPOPT (protocol 0) -> pool B
+            DestinationNATRuleSnapshot {
+                name: "hopopt".to_string(),
+                destination_address: "203.0.113.10".to_string(),
+                destination_port: 0,
+                protocol: "0".to_string(),
+                pool_address: "192.168.1.20".to_string(),
+                ..DestinationNATRuleSnapshot::default()
+            },
+        ],
+        &crate::nat::NatCounterStore::default(),
+    );
+    let src: IpAddr = "198.51.100.1".parse().unwrap();
+    let dst: IpAddr = "203.0.113.10".parse().unwrap();
+    // Protocol 0 (HOPOPT) -> the exact HOPOPT rule (pool B), NOT the wildcard.
+    assert_eq!(
+        table.lookup(0u8, src, dst, 0, ""),
+        Some(NatDecision {
+            rewrite_dst: Some("192.168.1.20".parse().unwrap()),
+            ..NatDecision::default()
+        }),
+        "protocol 0 (HOPOPT) must hit its exact rule, not the IP-only wildcard"
+    );
+    // Any OTHER protocol (TCP) -> the IP-only wildcard catch-all (pool A).
+    assert_eq!(
+        table.lookup(P_TCP, src, dst, 80, ""),
+        Some(NatDecision {
+            rewrite_dst: Some("192.168.1.10".parse().unwrap()),
+            ..NatDecision::default()
+        }),
+        "a non-HOPOPT protocol must still fall through to the IP-only wildcard"
+    );
 }
