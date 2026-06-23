@@ -158,6 +158,44 @@ Each worker thread is pinned to a CPU and processes all packets from
 its assigned RSS queues. Workers are independent — no locks on the
 forwarding hot path.
 
+#### Reconcile Ordering Invariant (#2440)
+
+`Coordinator::reconcile` (`coordinator/reconcile/mod.rs`) applies a new
+config snapshot in phases: preflight → teardown → reset → apply/publish
+→ bringup. The load-bearing invariant is **fail-closed ordering of the
+mandatory BPF map FDs**:
+
+- The mandatory map pins — `xsk`, `heartbeat`, `sessions` — are the real
+  correctness boundary: a worker cannot serve traffic without them. They
+  are opened in `snapshot::preflight_map_fds` **before** `tear_down`
+  stops the running workers and **before** `apply_snapshot` publishes a
+  newer forwarding view (`coord.forwarding`, `shared_validation`,
+  `ha.forwarding`, `ha.fabrics`) or advances
+  `validation.snapshot_installed` / `config_generation`.
+- If any mandatory pin is missing or its FD fails to open, the reconcile
+  aborts in the preflight: it sets `last_reconcile_stage` +
+  per-registered-binding `last_error`, and returns **without** tearing
+  down the prior workers or publishing a newer generation. The previous
+  (stale-but-correct) forwarding generation stays published and the
+  prior workers keep running.
+- Only once all mandatory FDs are in hand does the orchestrator tear
+  down + rebuild + publish. The optional maps (conntrack v4/v6, dnat
+  tables) remain best-effort and never gate the reconcile.
+
+This closes a fail-open partial-apply window (codex review-033 finding
+033-01): previously the FD open happened *after* teardown + publish, so
+a snapshot with an unopenable required pin tore down the workers,
+published a newer generation, then aborted bring-up — leaving the helper
+advertising a data-plane view backed by no running workers. On a
+security appliance that is fail-open. Regression coverage lives in
+`coordinator/tests.rs`
+(`reconcile_mandatory_map_open_failure_keeps_prior_generation_published`,
+`reconcile_missing_session_pin_keeps_prior_generation_published`,
+`reconcile_all_mandatory_maps_open_advances_published_generation`) using
+the `bpf_map::pin` sentinel-path test seam (`TEST_MAP_PIN_OK` /
+`TEST_MAP_PIN_FAIL`) so the ordering is exercised without real bpffs
+pins.
+
 #### Per-Packet Processing Pipeline
 
 ```

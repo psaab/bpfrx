@@ -1174,6 +1174,21 @@ fn persistent_snat_apply_snapshot(generation: u64) -> ConfigSnapshot {
             forwarding_supported: true,
             ..UserspaceCapabilities::default()
         },
+        // #2440: the reconcile preflight now opens the mandatory map
+        // FDs (xsk/heartbeat/sessions) BEFORE publishing the forwarding
+        // state, so a snapshot with empty mandatory pins aborts before
+        // the SNAT state this test inspects is published. Wire the
+        // mandatory pins to the bpf_map::pin test sentinel (resolves to
+        // a dummy fd without bpffs) so the apply proceeds to publish.
+        // Sentinel literal mirrors `TEST_MAP_PIN_OK` in
+        // userspace-dp/src/afxdp/bpf_map/pin.rs (the const is
+        // afxdp-scoped, not reachable from this crate-root test module).
+        map_pins: MapPins {
+            xsk: "test-map-pin-ok://xsk".to_string(),
+            heartbeat: "test-map-pin-ok://heartbeat".to_string(),
+            sessions: "test-map-pin-ok://sessions".to_string(),
+            ..MapPins::default()
+        },
         source_nat_rules: vec![SourceNATRuleSnapshot {
             name: "persistent-snat".to_string(),
             from_zone: "lan".to_string(),

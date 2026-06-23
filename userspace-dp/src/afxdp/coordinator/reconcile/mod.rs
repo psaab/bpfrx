@@ -105,6 +105,34 @@ impl Coordinator {
                 return;
             }
         }
+        // #2440 fail-open partial-apply fix: open the mandatory BPF map
+        // FDs (xsk/heartbeat/sessions) — the real correctness boundary —
+        // BEFORE `tear_down` stops the running workers and BEFORE
+        // `apply_snapshot` publishes a newer forwarding generation. If
+        // any mandatory pin is missing or its FD fails to open, abort
+        // HERE: the prior workers keep running and the prior forwarding
+        // generation stays published. Previously the FD open happened
+        // AFTER teardown + publish, so a snapshot with an unopenable
+        // required pin tore down the workers, published a newer
+        // `snapshot_installed` generation, then aborted bring-up —
+        // leaving the helper advertising a data-plane view backed by no
+        // workers (fail-open on a security appliance).
+        //
+        // `preflight_map_fds` only opens FDs and writes
+        // `last_reconcile_stage` / per-binding `last_error` on failure;
+        // it mutates no published state, so returning here is safe.
+        let preflight_fds = if let Some(snap) = snapshot {
+            match snapshot::preflight_map_fds(self, snap, bindings) {
+                Some(fds) => Some(fds),
+                None => {
+                    // last_reconcile_stage + per-binding last_error set
+                    // inside preflight_map_fds. No teardown, no publish.
+                    return;
+                }
+            }
+        } else {
+            None
+        };
         let mut preserved = teardown::tear_down(self);
         reset::reset_binding_counters(bindings);
         let Some(snapshot) = snapshot else {
@@ -114,17 +142,24 @@ impl Coordinator {
             self.last_reconcile_stage = "no_snapshot".to_string();
             return;
         };
+        // SAFETY: preflight_fds is Some whenever snapshot is Some (both
+        // gated on the same `snapshot` Option above).
+        let fds = preflight_fds.expect("preflight_map_fds ran for a Some snapshot");
         let Some(fds) = snapshot::apply_snapshot(
             self,
             snapshot,
-            bindings,
             preserved.slow_path,
             &preserved.tunnel_owners,
             preserved.snapshot_was_installed,
             &mut preserved.synced_sessions,
+            fds,
         ) else {
-            // last_reconcile_stage + per-binding last_error already set
-            // inside apply_snapshot on the missing-pin/open-failed legs.
+            // last_reconcile_stage set inside apply_snapshot on the
+            // integrity-error leg ("snapshot_integrity_error"). That leg
+            // rejects the snapshot before any publish, so the prior
+            // forwarding generation stays published. It does NOT touch
+            // per-binding last_error — there is no per-binding signal
+            // for an address-book integrity fault.
             return;
         };
         bringup::bring_up_workers(

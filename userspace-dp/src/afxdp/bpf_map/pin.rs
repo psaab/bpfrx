@@ -21,8 +21,35 @@ pub(in crate::afxdp) struct OwnedFd {
     pub(in crate::afxdp) fd: c_int,
 }
 
+/// #2440 test seam: pin paths beginning with this prefix are resolved
+/// WITHOUT touching bpffs, so the reconcile-preflight ordering can be
+/// exercised from any thread (the control-socket handler runs on a
+/// spawned thread, ruling out a thread-local hook). A path of
+/// [`TEST_MAP_PIN_OK`] yields a harmless dummy fd; one of
+/// [`TEST_MAP_PIN_FAIL`] yields an `ENOENT` open failure. The prefix is
+/// not a valid bpffs path, so production callers never collide with it.
+#[cfg(test)]
+pub(in crate::afxdp) const TEST_MAP_PIN_OK: &str = "test-map-pin-ok://";
+#[cfg(test)]
+pub(in crate::afxdp) const TEST_MAP_PIN_FAIL: &str = "test-map-pin-fail://";
+
 impl OwnedFd {
     pub(in crate::afxdp) fn open_bpf_map(path: &str) -> io::Result<Self> {
+        // #2440 test seam: sentinel pin paths short-circuit the real
+        // `bpf_obj_get` so the preflight ordering is testable without
+        // bpffs. Production builds compile this branch out entirely.
+        #[cfg(test)]
+        {
+            if let Some(rest) = path.strip_prefix(TEST_MAP_PIN_FAIL) {
+                let _ = rest;
+                return Err(io::Error::from_raw_os_error(libc::ENOENT));
+            }
+            if path.starts_with(TEST_MAP_PIN_OK) {
+                // fd = -1: never a real map; `Drop`'s close(-1) is a
+                // harmless EBADF no-op.
+                return Ok(Self { fd: -1 });
+            }
+        }
         let path = CString::new(path)
             .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "invalid map path"))?;
         let fd = unsafe { libbpf_sys::bpf_obj_get(path.as_ptr()) };
