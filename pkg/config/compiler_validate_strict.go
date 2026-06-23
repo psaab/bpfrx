@@ -1223,8 +1223,9 @@ func validateFilterActionsStrict(cfg *Config) error {
 				}
 				return fmt.Errorf(
 					"firewall family %s filter %q term %q: unknown `then` action %q "+
-						"(use accept/reject/discard or a modifier such as count/log/"+
-						"forwarding-class/loss-priority/dscp/policer/routing-instance)",
+						"(use accept/reject/discard/next-term or a modifier such as "+
+						"count/log/syslog/forwarding-class/loss-priority/dscp/"+
+						"traffic-class/policer/routing-instance)",
 					family, name, term.Name, term.UnknownActions[0])
 			}
 		}

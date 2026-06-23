@@ -80,6 +80,13 @@ func TestFilterAction_ValidActions_Commit(t *testing.T) {
 		// A term with only modifiers and no terminating action is valid Junos
 		// (fall-through); it must NOT be flagged as an unknown action.
 		"count c1 log",
+		// #2399 fold: standard Junos reject message-types and explicit
+		// next-term fall-through. Master committed these; the over-reject
+		// default arm must not reject them.
+		"reject tcp-reset",
+		"reject administratively-prohibited",
+		"reject port-unreachable",
+		"next term",
 	} {
 		t.Run(strings.ReplaceAll(then, " ", "_"), func(t *testing.T) {
 			tree := flatTreeFromSets(t, filterWithThen(then)...)
@@ -150,5 +157,56 @@ func TestFilterAction_CompileCapturesUnknownToken(t *testing.T) {
 	// a non-empty unknown) are required.
 	if term.Action != "" {
 		t.Fatalf("expected Action to stay \"\" for an unknown token, got %q", term.Action)
+	}
+}
+
+// #2399 fold: `then reject <message-type>` commits as a plain reject and
+// captures the type for fidelity. MUST FAIL if the over-reject default-arm is
+// restored (it would route tcp-reset to UnknownActions and reject the commit).
+func TestFilterAction_RejectMessageType_CommitsAndCaptures(t *testing.T) {
+	tree := flatTreeFromSets(t, filterWithThen("reject tcp-reset")...)
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("then reject tcp-reset must commit, got %v", err)
+	}
+	term := cfg.Firewall.FiltersInet["f1"].Terms[0]
+	if term.Action != "reject" {
+		t.Fatalf("expected Action reject, got %q", term.Action)
+	}
+	if term.RejectMessageType != "tcp-reset" {
+		t.Fatalf("expected RejectMessageType tcp-reset, got %q", term.RejectMessageType)
+	}
+	if len(term.UnknownActions) != 0 {
+		t.Fatalf("reject tcp-reset must not be flagged unknown, got %v", term.UnknownActions)
+	}
+}
+
+// `then next term` (explicit fall-through) commits cleanly and marks NextTerm.
+func TestFilterAction_NextTerm_CommitsAndMarks(t *testing.T) {
+	tree := flatTreeFromSets(t, filterWithThen("next term")...)
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("then next term must commit, got %v", err)
+	}
+	term := cfg.Firewall.FiltersInet["f1"].Terms[0]
+	if !term.NextTerm {
+		t.Fatal("expected NextTerm to be set for then next term")
+	}
+	if len(term.UnknownActions) != 0 {
+		t.Fatalf("next term must not be flagged unknown, got %v", term.UnknownActions)
+	}
+	// Fall-through keeps Action == "" (no terminating action).
+	if term.Action != "" {
+		t.Fatalf("next term must keep Action \"\", got %q", term.Action)
+	}
+}
+
+// A genuine typo AFTER reject (an unrecognized message-type) must still be
+// rejected at commit — the fidelity acceptance is gated to the KNOWN
+// message-types only, so a fat-finger does not slip through.
+func TestFilterAction_UnknownRejectMessageType_RejectsAtCommit(t *testing.T) {
+	tree := flatTreeFromSets(t, filterWithThen("reject blorp")...)
+	if _, err := CompileConfig(tree); err == nil {
+		t.Fatal("expected commit to reject `then reject blorp` (unknown message-type)")
 	}
 }

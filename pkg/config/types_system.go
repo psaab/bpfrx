@@ -831,6 +831,17 @@ type FirewallFilterTerm struct {
 	// load path downgrades it to a warning (#1960 no-brick). Populated by
 	// compileFilterThen.
 	UnknownActions    []string
+	// RejectMessageType is the optional message-type after `then reject`
+	// (e.g. tcp-reset, administratively-prohibited, port-unreachable). Junos
+	// accepts `then reject <message-type>` and the term acts as a plain reject;
+	// this captures the type for config fidelity. The dataplane does not act on
+	// it today (FilterAction::Reject only). An unknown token after `reject` is
+	// a typo and is NOT stored here — it is flagged via UnknownActions.
+	RejectMessageType string
+	// NextTerm records `then next term` / `then next-term` — an explicit
+	// fall-through to the next term (a no-op terminating-wise; Action stays "").
+	// It is a recognized, valid construct, not an unknown action.
+	NextTerm          bool
 	RoutingInstance   string          // routing-instance name (policy-based routing)
 	Log               bool
 	Count             string           // counter name

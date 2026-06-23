@@ -379,6 +379,30 @@ func compileFilterFrom(node *Node, term *FirewallFilterTerm) {
 	}
 }
 
+// rejectMessageTypes is the set of message-types Junos accepts after
+// `then reject <type>` (RFC 792 ICMP-unreachable codes plus tcp-reset). A term
+// with one of these still acts as a plain reject — the dataplane does not act
+// on the message-type today (#2399 fold) — but the type is recognized so a real
+// Juniper config import (`then reject tcp-reset`) commits cleanly instead of
+// being flagged as an unknown action. A token NOT in this set after `reject` is
+// a typo and is still flagged.
+var rejectMessageTypes = map[string]bool{
+	"administratively-prohibited": true,
+	"bad-host-tos":                true,
+	"bad-network-tos":             true,
+	"host-prohibited":             true,
+	"host-unreachable":            true,
+	"network-prohibited":          true,
+	"network-unreachable":         true,
+	"port-unreachable":            true,
+	"precedence-cutoff":           true,
+	"precedence-violation":        true,
+	"protocol-unreachable":        true,
+	"source-host-isolated":        true,
+	"source-route-failed":         true,
+	"tcp-reset":                   true,
+}
+
 func compileFilterThen(node *Node, term *FirewallFilterTerm) {
 	// Handle leaf form: "then discard;" or "then accept;" produces
 	// Keys=["then", "discard"] with IsLeaf=true and no children. A leaf can
@@ -402,8 +426,25 @@ func compileFilterThen(node *Node, term *FirewallFilterTerm) {
 				term.Action = "accept"
 			case "reject":
 				term.Action = "reject"
+				// Junos `then reject <message-type>`: the term is a plain
+				// reject; capture a KNOWN message-type for fidelity. Only
+				// consume the following token if it is a recognized type — a
+				// typo (e.g. `reject blorp`) must fall through to the default
+				// arm and be flagged, not silently swallowed as the reject arg.
+				if i+1 < len(keys) && rejectMessageTypes[keys[i+1]] {
+					i++
+					term.RejectMessageType = keys[i]
+				}
 			case "discard":
 				term.Action = "discard"
+			case "next":
+				// `then next term` / bare `then next` — explicit fall-through
+				// to the next term (a no-op terminating-wise). Consume an
+				// optional "term" token.
+				term.NextTerm = true
+				if i+1 < len(keys) && keys[i+1] == "term" {
+					i++
+				}
 			case "log":
 				term.Log = true
 			case "syslog":
@@ -449,8 +490,30 @@ func compileFilterThen(node *Node, term *FirewallFilterTerm) {
 			term.Action = "accept"
 		case "reject":
 			term.Action = "reject"
+			// `then reject <message-type>` — capture a KNOWN type for fidelity;
+			// a typo after reject is flagged (see leaf-form note above). The
+			// message-type is the second key (block form) or a single child.
+			if len(child.Keys) >= 2 && rejectMessageTypes[child.Keys[1]] {
+				term.RejectMessageType = child.Keys[1]
+			} else if len(child.Keys) >= 2 {
+				// Unknown token after reject — a typo. Flag it.
+				term.UnknownActions = append(term.UnknownActions, "reject "+child.Keys[1])
+			} else {
+				for _, mt := range child.Children {
+					if len(mt.Keys) >= 1 {
+						if rejectMessageTypes[mt.Keys[0]] {
+							term.RejectMessageType = mt.Keys[0]
+						} else {
+							term.UnknownActions = append(term.UnknownActions, "reject "+mt.Keys[0])
+						}
+					}
+				}
+			}
 		case "discard":
 			term.Action = "discard"
+		case "next":
+			// `then next term` / bare `then next` — explicit fall-through.
+			term.NextTerm = true
 		case "log":
 			term.Log = true
 		case "syslog":
