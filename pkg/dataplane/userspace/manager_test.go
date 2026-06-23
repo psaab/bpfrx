@@ -611,9 +611,13 @@ func injectShimMap(t *testing.T, bpfShim *dataplane.Manager, name string, m *ebp
 func injectSessionMaps(t *testing.T, m *Manager) {
 	t.Helper()
 	sessionsMap, err := ebpf.NewMap(&ebpf.MapSpec{
-		Type:       ebpf.Hash,
-		KeySize:    uint32(unsafe.Sizeof(dataplane.SessionKey{})),
-		ValueSize:  uint32(unsafe.Sizeof(dataplane.SessionValue{})),
+		Type:    ebpf.Hash,
+		KeySize: uint32(unsafe.Sizeof(dataplane.SessionKey{})),
+		// On-map conntrack ABI size (excludes sync-only Generation) — must
+		// match the production registration, else the Manager's lookup copies
+		// the registered value_size into the smaller bpfSessionValue buffer
+		// (the #2360 OOB). Derive from the shared SSOT constant.
+		ValueSize:  dataplane.ConntrackSessionValueSize,
 		MaxEntries: 1024,
 	})
 	if err != nil {
@@ -624,7 +628,7 @@ func injectSessionMaps(t *testing.T, m *Manager) {
 	sessionsMapV6, err := ebpf.NewMap(&ebpf.MapSpec{
 		Type:       ebpf.Hash,
 		KeySize:    uint32(unsafe.Sizeof(dataplane.SessionKeyV6{})),
-		ValueSize:  uint32(unsafe.Sizeof(dataplane.SessionValueV6{})),
+		ValueSize:  dataplane.ConntrackSessionValueSizeV6,
 		MaxEntries: 1024,
 	})
 	if err != nil {
@@ -1165,9 +1169,13 @@ func TestSetClusterSyncedSessionV4SkipsReverseHelperMirror(t *testing.T) {
 	m.proc = &exec.Cmd{}
 	m.cfg.ControlSocket = controlSock
 	sessionsMap, err := ebpf.NewMap(&ebpf.MapSpec{
-		Type:       ebpf.Hash,
-		KeySize:    uint32(unsafe.Sizeof(dataplane.SessionKey{})),
-		ValueSize:  uint32(unsafe.Sizeof(dataplane.SessionValue{})),
+		Type:    ebpf.Hash,
+		KeySize: uint32(unsafe.Sizeof(dataplane.SessionKey{})),
+		// On-map conntrack ABI size (excludes sync-only Generation) — must
+		// match the production registration, else the Manager's lookup copies
+		// the registered value_size into the smaller bpfSessionValue buffer
+		// (the #2360 OOB). Derive from the shared SSOT constant.
+		ValueSize:  dataplane.ConntrackSessionValueSize,
 		MaxEntries: 1024,
 	})
 	if err != nil {
@@ -1178,7 +1186,7 @@ func TestSetClusterSyncedSessionV4SkipsReverseHelperMirror(t *testing.T) {
 	sessionsMapV6, err := ebpf.NewMap(&ebpf.MapSpec{
 		Type:       ebpf.Hash,
 		KeySize:    uint32(unsafe.Sizeof(dataplane.SessionKeyV6{})),
-		ValueSize:  uint32(unsafe.Sizeof(dataplane.SessionValueV6{})),
+		ValueSize:  dataplane.ConntrackSessionValueSizeV6,
 		MaxEntries: 1024,
 	})
 	if err != nil {

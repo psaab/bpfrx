@@ -175,6 +175,33 @@ belt-and-suspenders for helper-originated deletes; the Go cluster apply layer is
 authoritative. A mixed-version cluster degrades to exact pre-#2170 behavior for
 any pair where either end lacks a generation.
 
+### Generation is sync-only — it MUST NOT inflate the BPF map (#2360)
+
+The install `Generation` lives in three places: the in-memory `SessionValue` /
+`SessionValueV6` (Go) and `SyncedSessionEntry` (Rust), and the sync wire (the
+length-gated trailing 8 bytes above). It is deliberately **absent** from the BPF
+C conntrack struct (`struct session_value` / `struct session_value_v6` in
+`bpf/headers/xpf_conntrack.h`), so the kernel-visible `sessions` / `sessions_v6`
+HASH maps are 128 / 176 bytes per value — the same layout the Rust helper
+mirrors as `BpfSessionValueV4` / `BpfSessionValueV6` (size-asserted at
+`userspace-dp/src/afxdp/bpf_map_tests.rs`).
+
+Because `SessionValue` carries the extra trailing `Generation uint64`, it is
+136 / 184 bytes — 8 bytes larger than the on-map layout. The Go map
+registration therefore must use the dedicated on-map ABI types
+`bpfSessionValue` / `bpfSessionValueV6` (`pkg/dataplane/bpf_session_value.go`),
+which mirror the C struct exactly without `Generation`, and all map I/O
+(`SetSessionV4/V6`, `GetSessionV4/V6`, iterate/batch in
+`pkg/dataplane/maps_session.go`) projects through `toBPF()` / `sessionValue()`
+at the boundary. Registering at `sizeOf[SessionValue]` instead would make the
+kernel `value_size` 8 bytes larger than the Rust helper's lookup buffer, so a
+`bpf_map_lookup_elem` would copy `value_size` bytes into the smaller buffer — an
+8-byte out-of-bounds write (latent because the trailing bytes are usually zero).
+The parity guards `TestSessionMapRegisteredAtConntrackABISize` /
+`TestBPFSessionValueMatchesConntrackABI` (Go) and the Rust size asserts pin the
+128 / 176 contract on both sides. **A new sync-only field must be added to the
+sync codec and the in-memory structs — never to the on-map ABI types.**
+
 ### Generation-map bounds and overflow (#2198 F1)
 
 Both the sender echo maps (`genSentV4/V6`) and the receiver stored-generation

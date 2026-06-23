@@ -30,10 +30,10 @@ func (m *Manager) IterateSessions(fn func(SessionKey, SessionValue) bool) error 
 	}
 
 	var key SessionKey
-	var val SessionValue
+	var val bpfSessionValue
 	iter := sm.Iterate()
 	for iter.Next(&key, &val) {
-		if !fn(key, val) {
+		if !fn(key, val.sessionValue()) {
 			break
 		}
 	}
@@ -55,7 +55,7 @@ func (m *Manager) SetSessionV4(key SessionKey, val SessionValue) error {
 	if !ok {
 		return fmt.Errorf("sessions map not found")
 	}
-	return sm.Update(key, val, ebpf.UpdateAny)
+	return sm.Update(key, val.toBPF(), ebpf.UpdateAny)
 }
 
 // GetSessionV4 looks up a single v4 session entry by key.
@@ -64,11 +64,11 @@ func (m *Manager) GetSessionV4(key SessionKey) (SessionValue, error) {
 	if !ok {
 		return SessionValue{}, fmt.Errorf("sessions map not found")
 	}
-	var val SessionValue
+	var val bpfSessionValue
 	if err := sm.Lookup(key, &val); err != nil {
 		return SessionValue{}, err
 	}
-	return val, nil
+	return val.sessionValue(), nil
 }
 
 // GetSessionV6 looks up a single v6 session entry by key.
@@ -77,11 +77,11 @@ func (m *Manager) GetSessionV6(key SessionKeyV6) (SessionValueV6, error) {
 	if !ok {
 		return SessionValueV6{}, fmt.Errorf("sessions_v6 map not found")
 	}
-	var val SessionValueV6
+	var val bpfSessionValueV6
 	if err := sm.Lookup(key, &val); err != nil {
 		return SessionValueV6{}, err
 	}
-	return val, nil
+	return val.sessionValue(), nil
 }
 
 // IterateSessionsV6 iterates all IPv6 session entries, calling fn for each.
@@ -92,10 +92,10 @@ func (m *Manager) IterateSessionsV6(fn func(SessionKeyV6, SessionValueV6) bool) 
 	}
 
 	var key SessionKeyV6
-	var val SessionValueV6
+	var val bpfSessionValueV6
 	iter := sm.Iterate()
 	for iter.Next(&key, &val) {
-		if !fn(key, val) {
+		if !fn(key, val.sessionValue()) {
 			break
 		}
 	}
@@ -126,7 +126,7 @@ func (m *Manager) IterateSessionsFrom(cursorKey *SessionKey, fn func(SessionKey,
 	}
 
 	for {
-		var val SessionValue
+		var val bpfSessionValue
 		if err := sm.Lookup(nextKey, &val); err != nil {
 			// Entry may have been deleted between NextKey and Lookup; skip.
 			var next SessionKey
@@ -139,7 +139,7 @@ func (m *Manager) IterateSessionsFrom(cursorKey *SessionKey, fn func(SessionKey,
 			nextKey = next
 			continue
 		}
-		if !fn(nextKey, val) {
+		if !fn(nextKey, val.sessionValue()) {
 			return nil
 		}
 		var next SessionKey
@@ -176,7 +176,7 @@ func (m *Manager) IterateSessionsV6From(cursorKey *SessionKeyV6, fn func(Session
 	}
 
 	for {
-		var val SessionValueV6
+		var val bpfSessionValueV6
 		if err := sm.Lookup(nextKey, &val); err != nil {
 			var next SessionKeyV6
 			if err := sm.NextKey(nextKey, &next); err != nil {
@@ -188,7 +188,7 @@ func (m *Manager) IterateSessionsV6From(cursorKey *SessionKeyV6, fn func(Session
 			nextKey = next
 			continue
 		}
-		if !fn(nextKey, val) {
+		if !fn(nextKey, val.sessionValue()) {
 			return nil
 		}
 		var next SessionKeyV6
@@ -213,13 +213,13 @@ func (m *Manager) BatchIterateSessions(fn func(SessionKey, SessionValue) bool) e
 
 	const batchSize = 256
 	keys := make([]SessionKey, batchSize)
-	vals := make([]SessionValue, batchSize)
+	vals := make([]bpfSessionValue, batchSize)
 	var cursor ebpf.MapBatchCursor
 
 	for {
 		n, err := sm.BatchLookup(&cursor, keys, vals, nil)
 		for i := 0; i < n; i++ {
-			if !fn(keys[i], vals[i]) {
+			if !fn(keys[i], vals[i].sessionValue()) {
 				return nil
 			}
 		}
@@ -242,13 +242,13 @@ func (m *Manager) BatchIterateSessionsV6(fn func(SessionKeyV6, SessionValueV6) b
 
 	const batchSize = 256
 	keys := make([]SessionKeyV6, batchSize)
-	vals := make([]SessionValueV6, batchSize)
+	vals := make([]bpfSessionValueV6, batchSize)
 	var cursor ebpf.MapBatchCursor
 
 	for {
 		n, err := sm.BatchLookup(&cursor, keys, vals, nil)
 		for i := 0; i < n; i++ {
-			if !fn(keys[i], vals[i]) {
+			if !fn(keys[i], vals[i].sessionValue()) {
 				return nil
 			}
 		}
@@ -301,7 +301,7 @@ func (m *Manager) SetSessionV6(key SessionKeyV6, val SessionValueV6) error {
 	if !ok {
 		return fmt.Errorf("sessions_v6 map not found")
 	}
-	return sm.Update(key, val, ebpf.UpdateAny)
+	return sm.Update(key, val.toBPF(), ebpf.UpdateAny)
 }
 
 // SessionCount returns the number of active IPv4 and IPv6 sessions.
@@ -309,7 +309,7 @@ func (m *Manager) SetSessionV6(key SessionKeyV6, val SessionValueV6) error {
 func (m *Manager) SessionCount() (v4, v6 int) {
 	if sm, ok := m.maps["sessions"]; ok {
 		var key SessionKey
-		var val SessionValue
+		var val bpfSessionValue
 		iter := sm.Iterate()
 		for iter.Next(&key, &val) {
 			if val.IsReverse == 0 {
@@ -319,7 +319,7 @@ func (m *Manager) SessionCount() (v4, v6 int) {
 	}
 	if sm, ok := m.maps["sessions_v6"]; ok {
 		var key SessionKeyV6
-		var val SessionValueV6
+		var val bpfSessionValueV6
 		iter := sm.Iterate()
 		for iter.Next(&key, &val) {
 			if val.IsReverse == 0 {
