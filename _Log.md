@@ -1,5 +1,35 @@
 # Action Log
 
+## 2026-06-23 — #2393 embedded-ICMP-NAT match adds ICMPv4 Redirect/Source-Quench
+
+- **Timestamp**: 2026-06-23 PDT
+- **Action**: Correctness fix (LOW). The embedded-ICMP-NAT reversal gate
+  `is_icmp_error` (`userspace-dp/src/afxdp/icmp.rs`) matched ICMPv4 types
+  3/11/12 but omitted type 5 (Redirect) and type 4 (Source Quench), which
+  also quote an inner IP header + 8 bytes (RFC 792). Transit ICMP
+  forwarding is type-agnostic in the same-family path (no link-scope drop —
+  confirmed: the only type-4/5 drop is the NAT64 cross-family path,
+  `nat64.rs`, where they have no IPv6 analogue per RFC 7915), so a NAT44
+  transit Redirect/Source-Quench was forwarded with its quoted inner
+  addresses left at the post-SNAT value (mismatched at the host). Fix:
+  broaden the ICMPv4 arm to 3/4/5/11/12, matching the reject-suppression
+  guard `reject_icmp_reply_suppressed` and Linux netfilter conntrack's
+  `icmp_error`. All five share the 8-byte ICMP header layout, so the quoted
+  IP starts at `l4+8` and the type-agnostic parser/builders need no
+  per-type change; the three gate sites share this SSOT predicate. Updated
+  the now-stale "different (and broader) set" comment on the reject guard
+  (the ICMPv4 sets are now identical; only the ICMPv6 arms still differ).
+  Added an end-to-end fail-on-revert test
+  (`embedded_icmp_nat_match_translates_redirect_v4`: installs the SNAT
+  session, flips a TE frame to a Redirect, asserts both outer dst and
+  embedded inner src are reversed to the client) — verified it FAILS when
+  the v4 arm is reverted to 3/11/12 — plus extended the `is_icmp_error`
+  unit test to assert types 4/5. Targeted suite (icmp/nat64/embedded/
+  redirect) 237 passed; new tests 5x green.
+- **File(s)**: userspace-dp/src/afxdp/icmp.rs,
+  userspace-dp/src/afxdp/tests.rs, docs/userspace-icmp-te-debugging.md,
+  _Log.md
+
 ## 2026-06-23 — #2369 ARP fixed-header validation before neighbor learning
 
 - **Timestamp**: 2026-06-23 PDT

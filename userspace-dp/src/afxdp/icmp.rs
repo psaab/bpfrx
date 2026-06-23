@@ -446,12 +446,18 @@ pub(super) fn build_local_icmp_error_v6(
 /// #2089 reject-action ICMP-error suppression guard, matching the
 /// retired eBPF `send_icmp_unreach_*` dispatch verbatim: never generate
 /// a Destination Unreachable in reply to an inbound ICMP/ICMPv6 *error*
-/// message (RFC 792 / RFC 4443). This is intentionally a different (and
-/// broader) set than [`is_icmp_error`], which the embedded-ICMP-NAT path
-/// uses — the reject guard suppresses ICMPv4 types {3,4,5,11,12} and ALL
-/// ICMPv6 types < 128 (the ICMPv6 error range). ICMP *query* types (echo
-/// request/reply, etc.) are NOT suppressed: a rejected echo gets an
-/// unreachable, matching Junos.
+/// message (RFC 792 / RFC 4443). The reject guard suppresses ICMPv4 types
+/// {3,4,5,11,12} and ALL ICMPv6 types < 128 (the ICMPv6 error range). ICMP
+/// *query* types (echo request/reply, etc.) are NOT suppressed: a rejected
+/// echo gets an unreachable, matching Junos.
+///
+/// #2393: the ICMPv4 set here now matches [`is_icmp_error`]
+/// ({3,4,5,11,12}) — both follow the full RFC 792 quoted-datagram error
+/// set. The two predicates remain separate because their ICMPv6 arms still
+/// differ: this guard suppresses the entire ICMPv6 error range (`< 128`,
+/// which includes types beyond the embedded-NAT set), while
+/// [`is_icmp_error`] enumerates only the ICMPv6 errors that quote a
+/// translatable inner packet (1/2/3/4).
 ///
 /// Returns true when a reject reply MUST be suppressed for this inbound
 /// ICMP/ICMPv6 message.
@@ -502,10 +508,35 @@ pub(super) fn build_reject_icmp_unreachable(
 }
 
 /// Returns true if the protocol and ICMP type indicate an ICMP error message
-/// (Destination Unreachable, Time Exceeded, Parameter Problem, Packet Too Big).
+/// that quotes the offending datagram (an inner IP header + at least the
+/// first 8 bytes of its transport header), which the embedded-ICMP-NAT
+/// reversal path must translate back to the pre-NAT tuple.
+///
+/// #2393: the ICMPv4 arm matches the full RFC 792 error set that carries a
+/// quoted datagram — Destination Unreachable (3), Source Quench (4),
+/// Redirect (5), Time Exceeded (11), Parameter Problem (12) — so that a
+/// NAT44 transit Redirect / Source Quench has its embedded inner addresses
+/// rewritten just like types 3/11/12. All five share the same 8-byte ICMP
+/// header layout (the type-specific word — Redirect's gateway address,
+/// Source Quench / Dest-Unreachable's unused word — occupies bytes 4..8),
+/// so the quoted IP header begins at `l4 + 8` for every one of them and the
+/// type-agnostic embedded parser/builders need no per-type handling. This
+/// now matches the broader [`reject_icmp_reply_suppressed`] set and Linux
+/// netfilter conntrack's related-ICMP `icmp_error` (3/4/5/11/12).
+///
+/// Type 4 (Source Quench) is deprecated (RFC 6633) and type 5 (Redirect)
+/// is normally link-scoped, so in practice a NATed transit instance is
+/// rare; including them is a correctness/parity completion, not a hot path.
+/// Note these two are still dropped (not mistranslated) on the NAT64
+/// cross-family path — they have no IPv6 analogue (RFC 7915, see
+/// `nat64.rs`); this set governs only same-family embedded-NAT reversal.
+///
+/// The ICMPv6 arm is the full ICMPv6 error range that carries a quoted
+/// packet: Destination Unreachable (1), Packet Too Big (2), Time Exceeded
+/// (3), Parameter Problem (4).
 pub(super) fn is_icmp_error(protocol: u8, icmp_type: u8) -> bool {
     match protocol {
-        PROTO_ICMP => matches!(icmp_type, 3 | 11 | 12),
+        PROTO_ICMP => matches!(icmp_type, 3 | 4 | 5 | 11 | 12),
         PROTO_ICMPV6 => matches!(icmp_type, 1 | 2 | 3 | 4),
         _ => false,
     }
