@@ -381,9 +381,22 @@ func compileFilterFrom(node *Node, term *FirewallFilterTerm) {
 
 func compileFilterThen(node *Node, term *FirewallFilterTerm) {
 	// Handle leaf form: "then discard;" or "then accept;" produces
-	// Keys=["then", "discard"] with IsLeaf=true and no children.
+	// Keys=["then", "discard"] with IsLeaf=true and no children. A leaf can
+	// also carry an argument-bearing modifier, e.g. "then forwarding-class be"
+	// → Keys=["then","forwarding-class","be"], so the keyword consumes its
+	// following token rather than treating it as a separate action.
 	if node.IsLeaf && len(node.Keys) >= 2 {
-		for _, k := range node.Keys[1:] {
+		keys := node.Keys[1:]
+		for i := 0; i < len(keys); i++ {
+			k := keys[i]
+			arg := func() string {
+				// Consume the modifier's argument if present.
+				if i+1 < len(keys) {
+					i++
+					return keys[i]
+				}
+				return ""
+			}
 			switch k {
 			case "accept":
 				term.Action = "accept"
@@ -395,6 +408,36 @@ func compileFilterThen(node *Node, term *FirewallFilterTerm) {
 				term.Log = true
 			case "syslog":
 				term.Log = true
+			case "routing-instance":
+				if v := arg(); v != "" {
+					term.RoutingInstance = v
+				}
+			case "count":
+				if v := arg(); v != "" {
+					term.Count = v
+				}
+			case "forwarding-class":
+				if v := arg(); v != "" {
+					term.ForwardingClass = v
+				}
+			case "loss-priority":
+				if v := arg(); v != "" {
+					term.LossPriority = v
+				}
+			case "dscp", "traffic-class":
+				if v := arg(); v != "" {
+					term.DSCPRewrite = v
+				}
+			case "policer":
+				if v := arg(); v != "" {
+					term.Policer = v
+				}
+			default:
+				// #2399 (032-16): an unrecognized `then` token must NOT be
+				// silently dropped — it would default to ACCEPT in the
+				// dataplane (fail-open). Record it so the strict commit gate
+				// (validateFilterActionsStrict) can reject the operator's typo.
+				term.UnknownActions = append(term.UnknownActions, k)
 			}
 		}
 		return
@@ -434,6 +477,10 @@ func compileFilterThen(node *Node, term *FirewallFilterTerm) {
 			if len(child.Keys) >= 2 {
 				term.Policer = child.Keys[1]
 			}
+		default:
+			// #2399 (032-16): see leaf-form note above — record the unknown
+			// `then` token for the strict commit gate instead of dropping it.
+			term.UnknownActions = append(term.UnknownActions, child.Name())
 		}
 	}
 }

@@ -1179,6 +1179,63 @@ func validateFilterProtocolsStrict(cfg *Config) error {
 	return check("inet6", cfg.Firewall.FiltersInet6)
 }
 
+// validateFilterActionsStrict hard-rejects any firewall-filter term whose
+// `then` block carries a token that is neither a recognized terminating action
+// (accept/reject/discard) nor a recognized modifier (count/log/syslog/
+// forwarding-class/loss-priority/dscp/traffic-class/policer/routing-instance)
+// — #2399 finding 032-16.
+//
+// Before this gate, compileFilterThen silently DROPPED an unrecognized or
+// misspelled `then` token. The term's Action stayed "", which the dataplane
+// compiler (pkg/dataplane/compiler_filter.go) and the Rust filter
+// (userspace-dp/src/filter/compiler.rs parse_term) BOTH map to
+// FilterAction::Accept — a fail-open permit. An operator who typed `then
+// frobnicate` (or a future action a peer node understands) got an ACCEPT for a
+// filter term they intended to deny. In Junos an unknown filter action is a
+// commit error, so the safe behavior is fail-CLOSED: refuse the commit and
+// name the offending token rather than silently permit.
+//
+// The walk is deterministic (filters sorted by name, terms in config order)
+// so the first-reported error is stable across runs, matching
+// validateFilterProtocolsStrict. On the tolerant load / peer-sync path the
+// caller downgrades the returned error to a warning (#1960 no-brick); the
+// dataplane still has no representation for the unknown token, so the
+// leniently-loaded term defaults to accept independently — but the operator
+// never reaches that state through a commit.
+func validateFilterActionsStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	check := func(family string, filters map[string]*FirewallFilter) error {
+		names := make([]string, 0, len(filters))
+		for name := range filters {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			filter := filters[name]
+			if filter == nil {
+				continue
+			}
+			for _, term := range filter.Terms {
+				if term == nil || len(term.UnknownActions) == 0 {
+					continue
+				}
+				return fmt.Errorf(
+					"firewall family %s filter %q term %q: unknown `then` action %q "+
+						"(use accept/reject/discard or a modifier such as count/log/"+
+						"forwarding-class/loss-priority/dscp/policer/routing-instance)",
+					family, name, term.Name, term.UnknownActions[0])
+			}
+		}
+		return nil
+	}
+	if err := check("inet", cfg.Firewall.FiltersInet); err != nil {
+		return err
+	}
+	return check("inet6", cfg.Firewall.FiltersInet6)
+}
+
 // filterProtocolResolvable reports whether a `from protocol <token>` is
 // representable: it INLINE-mirrors the acceptance set of
 // appid.ProtocolNumber's ok==true result (the #2124/#2175 SSOT). pkg/config
