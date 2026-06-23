@@ -1,5 +1,60 @@
 # Action Log
 
+## 2026-06-22 — #2361 Copilot fold: clamp-panic guard in ipv4_declared_l3_end
+
+- **Timestamp**: 2026-06-22 PDT
+- **Action**: Folded a Copilot finding on PR #2366 — a real panic/DoS in
+  the #2361 helper. `ipv4_declared_l3_end` guarded only `frame.len() >=
+  l3+20` and `ihl >= 20`, then did `clamp(l3+ihl, frame.len())`. IPv4 IHL
+  can be 21..=60 (options), and the meta-driven callers
+  (`live_frame_ports_from_meta_bytes` / meta-offset fallback) do NOT
+  validate ihl against the slice. A crafted frame with IHL nibble = 15
+  (60-byte header) in a buffer truncated to l3+20 yields `clamp(min=l3+60,
+  max=l3+20)` → min > max → `Ord::clamp` panics → attacker-reachable
+  parser DoS. Fix: add `frame.len() < l3 + ihl` to the guard before the
+  clamp so `min <= max` is guaranteed (fail closed when the buffer does
+  not hold the declared IHL header). Behavior otherwise identical.
+  Verified the IPv6 helper is already safe (its clamp floor l3+40 ==
+  its guard `frame.len() >= l3+40`, so min <= max). Verified the sibling
+  `generated.rs::parse_generated_v4` is ALSO already safe — line 74
+  `if ihl < 20 || packet.len() < ihl` precedes its
+  `total_len.clamp(ihl, packet.len())`, and v6's floor 40 is guarded — so
+  generated.rs needed NO change. Added 2 fail-on-revert tests (direct
+  helper + meta-fast-path caller) that PANIC when the guard is removed;
+  both confirmed to fail (clamp panic) on revert, pass with the guard.
+- **File(s)**: userspace-dp/src/afxdp/frame/inspect.rs (guard),
+  userspace-dp/src/afxdp/frame/inspect_tests.rs (2 tests).
+
+## 2026-06-22 — #2361 live frame parser: bound L4 ports by IP-declared length
+
+- **Timestamp**: 2026-06-22 PDT
+- **Action**: Fixed a HIGH input-validation gap (#2361). The live AF_XDP
+  frame parser read L4 ports bounded only by the backing slice (and the
+  fragment gate), never by the IPv4 `total_len` / IPv6 `payload_len`. A
+  frame declaring a short datagram but carrying trailing slack (NIC
+  zero-pad or attacker bytes) could have its ports read from out-of-packet
+  bytes → bogus tuple drives policy / firewall-filter / CoS / session
+  install. Added `ipv4_declared_l3_end` / `ipv6_declared_l3_end` /
+  `declared_l3_end` helpers (clamp `l3+total_len` / `l3+40+payload_len` to
+  the slice) and a `declared_end` parameter on `parse_flow_ports`: TCP/UDP
+  (4 bytes) and ICMP ident (2 bytes at +4) must lie within `declared_end`,
+  else `None` (flowless / route-based forward, consistent with #2344).
+  Updated all live callers — the v4/v6 frame-led parsers, the meta-offset
+  fallback in `parse_session_flow_from_bytes`, and the meta fast-path
+  readers `live_frame_ports_from_meta_bytes` / `live_frame_ports_bytes`
+  (re-derive `declared_end` from the frame's L3 header; the XDP shim does
+  NOT enforce the bound). Mirrors the sibling generated-reply parser's
+  fail-closed `generated_l4_ports` bound (#2238/#2321) so both paths treat
+  an out-of-IP-bound L4 identically. Added 11 fail-on-revert unit tests
+  (v4/v6, frame-led + meta fallback + meta fast path + helper clamp truth +
+  anti-over-gate well-formed cases); 7 fail when the bound is reverted to
+  slice-only. cargo build --release clean; full suite green (one unrelated
+  pre-existing worker_queue concurrency flake, passes 3/3 in isolation).
+- **File(s)**: userspace-dp/src/afxdp/frame/inspect.rs (helpers + bound +
+  all callers + test module decl), userspace-dp/src/afxdp/frame/inspect_tests.rs
+  (new), userspace-dp/src/afxdp/frame/prop_tests/inspect.rs (arity),
+  userspace-dp/src/afxdp/frame/README.md (invariant).
+
 ## 2026-06-22 — #2360 Copilot fold: SSOT const for conntrack map size
 
 - **Timestamp**: 2026-06-22 PDT
