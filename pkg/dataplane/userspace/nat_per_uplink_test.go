@@ -194,6 +194,141 @@ func TestBuildDestinationNATSnapshotsCarriesSourceAddress(t *testing.T) {
 	}
 }
 
+// TestBuildDestinationNATSnapshotsMultiDestination is the Go half of the #2395
+// collapse fix: a DNAT rule with `match destination-address [ A B C ]` MUST
+// install a table entry for EVERY published destination, not just the first.
+// Before #2395 the builder iterated only the singular DestinationAddress (the
+// first list element), so traffic to B and C was forwarded untranslated. This
+// test FAILS if the per-destination loop is removed (only one entry emitted).
+func TestBuildDestinationNATSnapshotsMultiDestination(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Security.NAT.Destination = &config.DestinationNATConfig{
+		Pools: map[string]*config.NATPool{
+			"dp4": {Name: "dp4", Address: "10.0.0.5"},
+			"dp6": {Name: "dp6", Address: "2001:db8:dead::5"},
+		},
+		RuleSets: []*config.NATRuleSet{
+			{Name: "multi", FromZone: "untrust", Rules: []*config.NATRule{
+				{
+					// Bracket list (v4): all three destinations must DNAT.
+					Name: "multi-dnat",
+					Match: config.NATMatch{
+						DestinationAddresses: []string{
+							"203.0.113.20",
+							"203.0.113.21/32", // CIDR suffix must be stripped
+							"203.0.113.22",
+						},
+						DestinationAddress: "203.0.113.20", // compiler mirrors first
+						Protocol:           "tcp",
+						DestinationPort:    443,
+					},
+					Then: config.NATThen{Type: config.NATDestination, PoolName: "dp4"},
+				},
+				{
+					// Bracket list combined with a source-address scope (#2394):
+					// both source AND each destination must be carried.
+					Name: "multi-dnat-scoped",
+					Match: config.NATMatch{
+						SourceAddresses: []string{"198.51.100.0/24"},
+						SourceAddress:   "198.51.100.0/24",
+						DestinationAddresses: []string{
+							"203.0.113.30",
+							"203.0.113.31",
+						},
+						DestinationAddress: "203.0.113.30",
+						Protocol:           "tcp",
+						DestinationPort:    80,
+					},
+					Then: config.NATThen{Type: config.NATDestination, PoolName: "dp4"},
+				},
+				{
+					// Single destination (non-bracket) must still work.
+					Name: "single-dnat",
+					Match: config.NATMatch{
+						DestinationAddress: "203.0.113.40",
+						Protocol:           "tcp",
+						DestinationPort:    8080,
+					},
+					Then: config.NATThen{Type: config.NATDestination, PoolName: "dp4"},
+				},
+				{
+					// IPv6 bracket list.
+					Name: "multi-dnat-v6",
+					Match: config.NATMatch{
+						DestinationAddresses: []string{
+							"2001:db8:beef::10",
+							"2001:db8:beef::11/128",
+						},
+						DestinationAddress: "2001:db8:beef::10",
+						Protocol:           "tcp",
+						DestinationPort:    443,
+					},
+					Then: config.NATThen{Type: config.NATDestination, PoolName: "dp6"},
+				},
+				{
+					// All-malformed destination set => fail-closed (no entry),
+					// must NOT broaden to match-any.
+					Name: "bad-dnat",
+					Match: config.NATMatch{
+						DestinationAddresses: []string{"not-an-ip", "also/bad"},
+						DestinationAddress:   "not-an-ip",
+						Protocol:             "tcp",
+						DestinationPort:      9999,
+					},
+					Then: config.NATThen{Type: config.NATDestination, PoolName: "dp4"},
+				},
+			}},
+		},
+	}
+
+	snaps := buildDestinationNATSnapshots(cfg, nil)
+
+	// Collect destination addresses emitted per rule name.
+	dstByName := map[string][]string{}
+	srcByName := map[string][]string{}
+	for _, s := range snaps {
+		dstByName[s.Name] = append(dstByName[s.Name], s.DestinationAddress)
+		srcByName[s.Name] = s.SourceAddresses
+	}
+
+	hasAll := func(got []string, want ...string) bool {
+		set := map[string]bool{}
+		for _, g := range got {
+			set[g] = true
+		}
+		for _, w := range want {
+			if !set[w] {
+				return false
+			}
+		}
+		return len(got) == len(want)
+	}
+
+	// All three v4 destinations must be installed (collapse bug => only first).
+	if got := dstByName["multi-dnat"]; !hasAll(got, "203.0.113.20", "203.0.113.21", "203.0.113.22") {
+		t.Fatalf("multi-dnat destinations = %+v, want all three (collapse bug installs only the first)", got)
+	}
+	// Source-scoped multi-dest: both destinations + the source constraint.
+	if got := dstByName["multi-dnat-scoped"]; !hasAll(got, "203.0.113.30", "203.0.113.31") {
+		t.Fatalf("multi-dnat-scoped destinations = %+v, want both", got)
+	}
+	if got := srcByName["multi-dnat-scoped"]; len(got) != 1 || got[0] != "198.51.100.0/24" {
+		t.Fatalf("multi-dnat-scoped SourceAddresses = %+v, want #2394 source constraint preserved", got)
+	}
+	// Single destination still works.
+	if got := dstByName["single-dnat"]; !hasAll(got, "203.0.113.40") {
+		t.Fatalf("single-dnat destinations = %+v, want single entry", got)
+	}
+	// IPv6 bracket list.
+	if got := dstByName["multi-dnat-v6"]; !hasAll(got, "2001:db8:beef::10", "2001:db8:beef::11") {
+		t.Fatalf("multi-dnat-v6 destinations = %+v, want both v6 entries (CIDR stripped)", got)
+	}
+	// All-malformed => fail-closed (no snapshot rows at all).
+	if got := dstByName["bad-dnat"]; len(got) != 0 {
+		t.Fatalf("bad-dnat destinations = %+v, want NONE (all-malformed fails closed, not match-any)", got)
+	}
+}
+
 func srcCounterID(s []SourceNATRuleSnapshot) uint32 {
 	if len(s) == 0 {
 		return 0

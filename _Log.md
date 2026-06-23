@@ -11217,3 +11217,26 @@ top.
   - **File(s)**: pkg/config/compiler_validate_warn.go,
     pkg/config/parser_ast_test.go, pkg/config/policy_zone_ref_test.go,
     _Log.md
+
+- **Timestamp**: 2026-06-23
+  - **Action**: #2395 fix DNAT multiple destination-addresses collapse.
+    buildDestinationNATSnapshots iterated only the singular
+    rule.Match.DestinationAddress (first list element), so a rule with
+    `match destination-address [ A B C ]` installed a DNAT table entry only
+    for A — traffic to B and C was forwarded untranslated (HIGH). Fix: build
+    destAddrs from rule.Match.DestinationAddresses with a singular fallback
+    (mirrors the #2394 source-address idiom) and emit one
+    DestinationNATRuleSnapshot per destination sharing the rule's
+    pool/port/counter. The DNAT table is keyed by exact dst_ip, so per-entry
+    is the natural shape — NO wire change (reuse the existing scalar
+    destination_address; protocol_wire_v1.json unchanged). Per-destination
+    CIDR-strip + net.ParseIP validation; all-malformed destination set emits
+    no rows => matches nothing (fail-closed, not match-any). Source-constraint
+    setup wraps the destination loop so each per-dest snapshot carries the
+    same SourceAddresses (#2394 composition preserved). Added Go test
+    TestBuildDestinationNATSnapshotsMultiDestination (fail-on-revert: collapse
+    to destAddrs[:1] fails) and Rust dnat_multiple_destinations_each_fire /
+    _v6_each_fire / _compose_with_source_scope.
+  - **File(s)**: pkg/dataplane/userspace/nat.go,
+    pkg/dataplane/userspace/nat_per_uplink_test.go,
+    userspace-dp/src/nat/tests.rs, docs/userspace-dnat-plan.md, _Log.md

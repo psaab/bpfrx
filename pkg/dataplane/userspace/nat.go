@@ -2,6 +2,7 @@ package userspace
 
 import (
 	"log/slog"
+	"net"
 	"strconv"
 	"strings"
 
@@ -206,7 +207,19 @@ func buildDestinationNATSnapshots(cfg *config.Config, natCounterIDs map[string]u
 			if !ok || pool == nil || pool.Address == "" {
 				continue
 			}
-			if rule.Match.DestinationAddress == "" {
+			// #2395: a DNAT rule may publish multiple destination addresses
+			// (`match destination-address [ A B C ]`). The DNAT table is keyed
+			// by exact destination IP, so each configured destination needs its
+			// OWN snapshot entry sharing the rule's pool/counter id. Iterating
+			// only the singular `DestinationAddress` (the first list element)
+			// collapsed the rule to its first destination and silently dropped
+			// translation for B and C. Mirror the source-address idiom: prefer
+			// the bracket-list form, fall back to the singular match value.
+			destAddrs := append([]string(nil), rule.Match.DestinationAddresses...)
+			if len(destAddrs) == 0 && rule.Match.DestinationAddress != "" {
+				destAddrs = append(destAddrs, rule.Match.DestinationAddress)
+			}
+			if len(destAddrs) == 0 {
 				continue
 			}
 
@@ -276,28 +289,47 @@ func buildDestinationNATSnapshots(cfg *config.Config, natCounterIDs map[string]u
 						proto = "tcp" // default for port-based DNAT
 					}
 
-					// Strip the destination address CIDR suffix for the snapshot
-					// (DNAT matches exact host IPs).
-					dstAddr := rule.Match.DestinationAddress
-					if idx := strings.IndexByte(dstAddr, '/'); idx != -1 {
-						dstAddr = dstAddr[:idx]
-					}
 					poolAddr := pool.Address
 					if idx := strings.IndexByte(poolAddr, '/'); idx != -1 {
 						poolAddr = poolAddr[:idx]
 					}
 
-					out = append(out, DestinationNATRuleSnapshot{
-						Name:               rule.Name,
-						FromZone:           rs.FromZone,
-						SourceAddresses:    sourceAddrs,
-						DestinationAddress: dstAddr,
-						DestinationPort:    dstPort,
-						Protocol:           proto,
-						PoolAddress:        poolAddr,
-						PoolPort:           poolPort,
-						CounterID:          ruleCounterID,
-					})
+					// #2395: emit one snapshot per configured destination so a
+					// bracket-list DNAT installs a table entry for EVERY
+					// published destination, not just the first. Strip any CIDR
+					// suffix (DNAT matches exact host IPs) and skip a malformed
+					// destination — if a rule has destinations but ALL are
+					// malformed, no entry is emitted, so the rule matches NOTHING
+					// (fail-closed) rather than broadening to match-any.
+					for _, rawDst := range destAddrs {
+						dstAddr := rawDst
+						if idx := strings.IndexByte(dstAddr, '/'); idx != -1 {
+							dstAddr = dstAddr[:idx]
+						}
+						if dstAddr == "" {
+							continue
+						}
+						// Reject anything that is not a bare host IP — the Rust
+						// table parses `destination_address` with `IpAddr::parse`
+						// and would `continue` (drop) a non-IP entry; skipping
+						// here keeps the Go and Rust views aligned and avoids
+						// emitting dead snapshot rows.
+						if net.ParseIP(dstAddr) == nil {
+							continue
+						}
+
+						out = append(out, DestinationNATRuleSnapshot{
+							Name:               rule.Name,
+							FromZone:           rs.FromZone,
+							SourceAddresses:    sourceAddrs,
+							DestinationAddress: dstAddr,
+							DestinationPort:    dstPort,
+							Protocol:           proto,
+							PoolAddress:        poolAddr,
+							PoolPort:           poolPort,
+							CounterID:          ruleCounterID,
+						})
+					}
 				}
 			}
 		}
