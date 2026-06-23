@@ -458,6 +458,15 @@ pub(crate) struct ProcessStatus {
     /// unaffected.
     #[serde(rename = "event_stream_write_stalls", default)]
     pub event_stream_write_stalls: u64,
+    /// Accepted RT_FLOW / dataplane-telemetry frames evicted from the helper's
+    /// replay buffer when it wrapped at capacity before the daemon ACKed them
+    /// (#2382). These were counted in `event_stream_sent` at enqueue but are
+    /// permanently lost after reconnect. A non-zero, growing value means
+    /// telemetry was dropped via replay-buffer eviction (a disconnected or
+    /// non-ACKing daemon let the window wrap). Distinct from ACK-trim, which
+    /// is normal acknowledged-frame removal and is NOT counted here.
+    #[serde(rename = "event_stream_replay_evictions", default)]
+    pub event_stream_replay_evictions: u64,
     /// Monotonic timestamp (secs) of the last HA flow cache flush (#312).
     #[serde(rename = "last_cache_flush_at", default)]
     pub last_cache_flush_at: u64,

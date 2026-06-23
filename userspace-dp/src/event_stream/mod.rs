@@ -95,6 +95,13 @@ pub(crate) struct EventStreamStats {
     /// channel because the consumer is not draining the socket — the dataplane
     /// is unaffected.
     pub(crate) write_stalls: u64,
+    /// Count of accepted frames evicted from the replay buffer on wrap before
+    /// the daemon ACKed them (#2382). These were counted as `sent` but are
+    /// permanently lost; a non-zero, growing value means RT_FLOW / dataplane
+    /// telemetry was dropped via replay-buffer eviction (a daemon that
+    /// disconnected or withheld ACKs long enough for the window to wrap).
+    /// ACK-trim does NOT increment this — only the buffer-full eviction.
+    pub(crate) replay_evictions: u64,
     #[allow(dead_code)] // stats field for future reporting
     pub(crate) replayed: u64,
     #[allow(dead_code)] // producer-call-site wiring will surface these fields
@@ -116,6 +123,13 @@ struct EventStreamShared {
     /// I/O cycles in which `write_buf` hit `WRITE_BACKLOG_MAX_BYTES` and the
     /// channel drain was halted (stalled consumer signal, #2381).
     frames_write_stalled: AtomicU64,
+    /// Accepted-and-enqueued frames evicted from the replay buffer when it
+    /// wrapped at `REPLAY_BUFFER_CAPACITY` before the daemon ACKed them
+    /// (#2382). These frames were counted in `frames_sent` at enqueue but are
+    /// unrecoverable after reconnect — a real telemetry loss. Distinct from
+    /// ACK-trim (frames removed because they were acknowledged, which is NOT a
+    /// loss): only the buffer-full eviction path increments this.
+    frames_replay_evicted: AtomicU64,
     frames_replayed: AtomicU64,
     dataplane_event_counters: DataplaneEventCounters,
     #[allow(dead_code)] // consumed by producer call sites once they are wired
@@ -144,6 +158,7 @@ impl EventStreamShared {
             frames_sent: AtomicU64::new(0),
             frames_dropped: AtomicU64::new(0),
             frames_write_stalled: AtomicU64::new(0),
+            frames_replay_evicted: AtomicU64::new(0),
             frames_replayed: AtomicU64::new(0),
             dataplane_event_counters: DataplaneEventCounters::new(),
             dataplane_event_limiter: DataplaneEventRateLimiter::new(config),
@@ -214,6 +229,7 @@ impl EventStreamSender {
             sent: self.shared.frames_sent.load(Ordering::Relaxed),
             dropped: self.shared.frames_dropped.load(Ordering::Relaxed),
             write_stalls: self.shared.frames_write_stalled.load(Ordering::Relaxed),
+            replay_evictions: self.shared.frames_replay_evicted.load(Ordering::Relaxed),
             replayed: self.shared.frames_replayed.load(Ordering::Relaxed),
             dataplane_events: self.shared.dataplane_event_counters.snapshot(),
         }
@@ -843,11 +859,37 @@ fn push_replay_frame(
     frame: EventFrame,
 ) {
     if replay_buf.len() >= REPLAY_BUFFER_CAPACITY {
-        pop_replay_frame(shared, replay_buf);
+        // Buffer-full eviction: the oldest accepted-and-enqueued frame is
+        // dropped before the daemon ACKed it. It was already counted in
+        // `frames_sent`, so it must be counted as a telemetry loss here
+        // (#2382). This is distinct from ACK-trim / shutdown drain, which
+        // remove frames via `pop_replay_frame` WITHOUT bumping the eviction
+        // counter (an ACKed frame is delivered, not lost).
+        evict_replay_frame(shared, replay_buf);
     }
     replay_buf.push_back(frame);
 }
 
+/// Evict the oldest replay frame because the buffer wrapped at capacity. This
+/// is the ONLY telemetry-loss removal path: it increments
+/// `frames_replay_evicted` (#2382) in addition to releasing the queue budget.
+fn evict_replay_frame(
+    shared: &Arc<EventStreamShared>,
+    replay_buf: &mut VecDeque<EventFrame>,
+) -> Option<EventFrame> {
+    let frame = pop_replay_frame(shared, replay_buf);
+    if frame.is_some() {
+        shared
+            .frames_replay_evicted
+            .fetch_add(1, Ordering::Relaxed);
+    }
+    frame
+}
+
+/// Remove the oldest replay frame and release its queue budget WITHOUT
+/// counting it as an eviction. Used by ACK-trim (the frame was acknowledged —
+/// delivered, not lost) and shutdown drain. The buffer-full loss path is
+/// `evict_replay_frame`.
 fn pop_replay_frame(
     shared: &Arc<EventStreamShared>,
     replay_buf: &mut VecDeque<EventFrame>,
