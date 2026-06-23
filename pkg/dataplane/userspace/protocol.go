@@ -403,13 +403,22 @@ type StaticNATRuleSnapshot struct {
 // userspace dataplane. Each snapshot is one (protocol, destination IP, destination port)
 // tuple. The Go builder handles multi-port and protocol expansion.
 type DestinationNATRuleSnapshot struct {
-	Name               string `json:"name"`
-	FromZone           string `json:"from_zone,omitempty"`
-	DestinationAddress string `json:"destination_address"`
-	DestinationPort    uint16 `json:"destination_port,omitempty"`
-	Protocol           string `json:"protocol,omitempty"` // "tcp", "udp", or ""
-	PoolAddress        string `json:"pool_address"`
-	PoolPort           uint16 `json:"pool_port,omitempty"`
+	Name     string `json:"name"`
+	FromZone string `json:"from_zone,omitempty"`
+	// SourceAddresses carries the DNAT rule's `match source-address`
+	// constraint (#2394). Junos DNAT `source-address` restricts which source
+	// IPs the destination translation applies to; before #2394 the constraint
+	// was parsed but DROPPED at this snapshot boundary, so the dataplane
+	// installed a destination-only entry that DNAT'd traffic from ANY source
+	// (a fail-open security broadening). Each entry is a CIDR prefix (a bare
+	// host IP is normalized to /32 or /128 by the Rust IpNet parser). An empty
+	// slice means "match any source" — the unscoped DNAT behavior is unchanged.
+	SourceAddresses    []string `json:"source_addresses,omitempty"`
+	DestinationAddress string   `json:"destination_address"`
+	DestinationPort    uint16   `json:"destination_port,omitempty"`
+	Protocol           string   `json:"protocol,omitempty"` // "tcp", "udp", or ""
+	PoolAddress        string   `json:"pool_address"`
+	PoolPort           uint16   `json:"pool_port,omitempty"`
 	// CounterID is the compiler-assigned per-rule translation hit counter ID
 	// (stable key-derived hash, non-zero; 0 means "no counter"). All expanded
 	// (protocol, port) tuples of the same DNAT rule share one counter ID so

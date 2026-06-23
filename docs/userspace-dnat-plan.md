@@ -294,3 +294,35 @@ Initial implementation: use the existing per-binding `dnat_packets` counter (alr
 5. **Backward compatibility**: New `destination_nat_rules` JSON field defaults to empty array. Old binaries ignore it (serde `default`).
 
 6. **Checksum ordering**: Port rewriting must happen AFTER IP rewriting. Both are independent incremental updates to the L4 checksum.
+
+## 10. Source-address constraint (#2394)
+
+Junos DNAT `match source-address` restricts which source IPs the destination
+translation applies to. The original DNAT implementation parsed the constraint
+into the typed rule but dropped it at the Go->Rust snapshot boundary, so the
+helper installed a destination-only entry that DNAT'd traffic from ANY source —
+a fail-open that published the internal service to sources the operator scoped
+out.
+
+#2394 carries the constraint end to end:
+
+- `DestinationNATRuleSnapshot.SourceAddresses` (Go, `protocol.go`) /
+  `source_addresses` (Rust, `protocol/nat.rs`) — a new wire field
+  (`json:"source_addresses,omitempty"`, serde `default`). Old binaries ignore
+  it; an absent/empty list means "match any source" so unscoped DNAT is
+  unchanged. The default-specimen wire fixture (`protocol_wire_v1.json`) was
+  regenerated.
+- `buildDestinationNATSnapshots` (`nat.go`) populates the field from
+  `rule.Match.SourceAddresses` with a singular `SourceAddress` fallback,
+  mirroring the SNAT builder.
+- `DnatEntry.source_v4/source_v6` (`nat/destination.rs`) hold the parsed
+  prefixes; `DnatEntry::source_matches(src_ip)` returns true when the prefix
+  list is empty (match any) or any prefix contains the packet source. The
+  lookup now takes `src_ip` and filters on both zone and source. The
+  per-key dedup keys on `(from_zone, source_v4, source_v6)` so two distinct
+  source-scoped rules on the same destination both survive.
+- The session-miss caller (`afxdp/poll_descriptor/mod.rs`) passes
+  `flow.forward_key.src_ip`.
+
+A malformed source prefix is skipped (matches the SNAT builder), narrowing the
+match rather than silently widening it.

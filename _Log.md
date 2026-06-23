@@ -1,5 +1,40 @@
 # Action Log
 
+## 2026-06-23 — #2394 DNAT source-address constraint enforced end-to-end (fail-open fix)
+
+- **Timestamp**: 2026-06-23 PDT
+- **Action**: Fixed a HIGH fail-open: a destination-NAT rule scoped to
+  `match source-address` lost its source constraint at the Go->Rust
+  snapshot boundary, so the DNAT became destination-only and fired for
+  ANY source (publishing the internal service to sources the operator
+  scoped out). Root cause: `DestinationNATRuleSnapshot` had no source
+  field, `buildDestinationNATSnapshots` (nat.go) never emitted one, and
+  the Rust `DnatTable` filtered only by ingress zone. Fix carries the
+  constraint end to end: added `SourceAddresses`/`source_addresses` wire
+  field on BOTH Go and Rust sides (serde default, omitempty; old binaries
+  ignore it; empty = match any so unscoped DNAT is unchanged), populated
+  it in the Go builder (bracket-list + singular fallback, mirroring SNAT),
+  added `source_v4`/`source_v6` prefixes + `source_matches()` to the Rust
+  `DnatEntry`, threaded `src_ip` through `lookup`/`lookup_with_counter` and
+  the session-miss caller (poll_descriptor passes
+  `flow.forward_key.src_ip`), and keyed the per-key dedup on
+  `(from_zone, source_v4, source_v6)` so two source-scoped rules on the
+  same destination both survive. Regenerated protocol_wire_v1.json.
+  Fail-on-revert tests: Rust dnat_source_scoped_matches_only_configured_
+  source_{v4,v6} + dnat_two_source_scoped_rules_same_dest_each_fire_for_own_
+  source (all FAIL when source matching is bypassed — verified) +
+  dnat_unscoped_matches_any_source (anti-over-restrict); Go
+  TestBuildDestinationNATSnapshotsCarriesSourceAddress. go build/test +
+  cargo build --release + cargo test green; new tests 5x stable.
+- **File(s)**: pkg/dataplane/userspace/protocol.go,
+  pkg/dataplane/userspace/nat.go,
+  pkg/dataplane/userspace/nat_per_uplink_test.go,
+  userspace-dp/src/protocol/nat.rs, userspace-dp/src/nat/destination.rs,
+  userspace-dp/src/nat/tests.rs, userspace-dp/src/afxdp/tests.rs,
+  userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/tests/fixtures/protocol_wire_v1.json,
+  userspace-dp/src/FEATURES.md, docs/userspace-dnat-plan.md, _Log.md
+
 ## 2026-06-23 — #2381 PR #2413 doc-accuracy folds (cap arithmetic + bound)
 
 - **Timestamp**: 2026-06-23 PDT

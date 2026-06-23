@@ -433,7 +433,8 @@
     "name": "",
     "pool_address": "",
     "pool_port": 0,
-    "protocol": ""
+    "protocol": "",
+    "source_addresses": []
   },
   "exception_status": {
     "addr_family": 0,

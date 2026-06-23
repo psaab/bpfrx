@@ -655,6 +655,7 @@ pub(super) fn poll_binding_process_descriptor(
                         let dnat_decision = if !worker_ctx.forwarding.dnat_table.is_empty() {
                             worker_ctx.forwarding.dnat_table.lookup_with_counter(
                                 meta.protocol,
+                                flow.forward_key.src_ip,
                                 resolution_target,
                                 flow.forward_key.dst_port,
                                 ingress_zone_name,

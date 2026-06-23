@@ -2,6 +2,8 @@
 
 use super::{NatCounterStore, NatDecision, NatRuleCounter};
 use crate::DestinationNATRuleSnapshot;
+use crate::prefix::{PrefixV4, PrefixV6};
+use ipnet::IpNet;
 use rustc_hash::FxHashMap;
 use std::net::IpAddr;
 use std::sync::Arc;
@@ -24,9 +26,31 @@ pub(crate) struct DnatValue {
 #[derive(Clone, Debug)]
 struct DnatEntry {
     from_zone: Box<str>,
+    /// #2394: DNAT `match source-address` constraint. Empty (both vecs) means
+    /// "match any source" — the unscoped DNAT behavior. A non-empty list means
+    /// the entry only fires when the packet source IP falls in one of these
+    /// prefixes; before #2394 the constraint was dropped at the snapshot
+    /// boundary, so the entry DNAT'd traffic from any source (fail-open).
+    source_v4: Vec<PrefixV4>,
+    source_v6: Vec<PrefixV6>,
     value: DnatValue,
     /// #2218: per-rule translation hit counter (None for counter_id 0).
     hit_counter: Option<Arc<NatRuleCounter>>,
+}
+
+impl DnatEntry {
+    /// #2394: does the packet source IP satisfy this entry's source-address
+    /// constraint? An entry with no source prefixes matches any source.
+    fn source_matches(&self, src_ip: IpAddr) -> bool {
+        match src_ip {
+            IpAddr::V4(v4) => {
+                self.source_v4.is_empty() || self.source_v4.iter().any(|net| net.contains(v4))
+            }
+            IpAddr::V6(v6) => {
+                self.source_v6.is_empty() || self.source_v6.iter().any(|net| net.contains(v6))
+            }
+        }
+    }
 }
 
 /// Destination NAT lookup table.
@@ -70,6 +94,19 @@ impl DnatTable {
                 _ => continue,
             };
             let hit_counter = nat_counters.rule_counter(snap.counter_id);
+            // #2394: parse the source-address constraint once per rule. A prefix
+            // that fails to parse is skipped (matches the SNAT builder), so a
+            // malformed prefix narrows the match rather than silently widening
+            // it. An empty source list keeps "match any source".
+            let mut source_v4: Vec<PrefixV4> = Vec::new();
+            let mut source_v6: Vec<PrefixV6> = Vec::new();
+            for prefix in &snap.source_addresses {
+                match prefix.parse::<IpNet>() {
+                    Ok(IpNet::V4(net)) => source_v4.push(PrefixV4::from_net(net)),
+                    Ok(IpNet::V6(net)) => source_v6.push(PrefixV6::from_net(net)),
+                    Err(_) => {}
+                }
+            }
             for proto in protos {
                 Self::insert_entry(
                     table.entries.entry(DnatKey {
@@ -79,6 +116,8 @@ impl DnatTable {
                     }),
                     DnatEntry {
                         from_zone: snap.from_zone.clone().into_boxed_str(),
+                        source_v4: source_v4.clone(),
+                        source_v6: source_v6.clone(),
                         value: DnatValue {
                             new_dst_ip: pool_ip,
                             new_dst_port: if snap.pool_port != 0 {
@@ -109,11 +148,12 @@ impl DnatTable {
     pub(crate) fn lookup(
         &self,
         protocol: u8,
+        src_ip: IpAddr,
         dst_ip: IpAddr,
         dst_port: u16,
         ingress_zone: &str,
     ) -> Option<NatDecision> {
-        self.lookup_with_counter(protocol, dst_ip, dst_port, ingress_zone)
+        self.lookup_with_counter(protocol, src_ip, dst_ip, dst_port, ingress_zone)
             .map(|(decision, _)| decision)
     }
 
@@ -122,6 +162,7 @@ impl DnatTable {
     pub(crate) fn lookup_with_counter(
         &self,
         protocol: u8,
+        src_ip: IpAddr,
         dst_ip: IpAddr,
         dst_port: u16,
         ingress_zone: &str,
@@ -133,6 +174,7 @@ impl DnatTable {
                     dst_ip,
                     dst_port,
                 }),
+                src_ip,
                 ingress_zone,
             )
             .or_else(|| {
@@ -142,6 +184,7 @@ impl DnatTable {
                         dst_ip,
                         dst_port: 0,
                     }),
+                    src_ip,
                     ingress_zone,
                 )
             })?;
@@ -166,17 +209,27 @@ impl DnatTable {
     fn match_entries(
         &self,
         entries: Option<&Vec<DnatEntry>>,
+        src_ip: IpAddr,
         ingress_zone: &str,
     ) -> Option<(DnatValue, Option<Arc<NatRuleCounter>>)> {
         let entries = entries?;
+        // #2394: an entry only fires when BOTH its zone and its source-address
+        // constraint match. Zone-specific entries still win over zone-wildcard
+        // entries, but within each tier the source-address constraint must hold
+        // — an entry whose source does not contain the packet's source IP is
+        // skipped (no fail-open to the wrong source).
         entries
             .iter()
-            .find(|entry| !entry.from_zone.is_empty() && entry.from_zone.as_ref() == ingress_zone)
+            .find(|entry| {
+                !entry.from_zone.is_empty()
+                    && entry.from_zone.as_ref() == ingress_zone
+                    && entry.source_matches(src_ip)
+            })
             .map(|entry| (entry.value, entry.hit_counter.clone()))
             .or_else(|| {
                 entries
                     .iter()
-                    .find(|entry| entry.from_zone.is_empty())
+                    .find(|entry| entry.from_zone.is_empty() && entry.source_matches(src_ip))
                     .map(|entry| (entry.value, entry.hit_counter.clone()))
             })
     }
@@ -186,10 +239,16 @@ impl DnatTable {
         entry: DnatEntry,
     ) {
         let entries = slot.or_default();
-        if let Some(existing) = entries
-            .iter_mut()
-            .find(|existing| existing.from_zone == entry.from_zone)
-        {
+        // #2394: dedup on (from_zone, source constraint). Two distinct
+        // source-scoped DNAT rules in the same from-zone with the same
+        // (proto, dst, port) are NOT the same entry — both must be retained so
+        // each fires only for its configured source. Keying dedup on zone alone
+        // would drop one and silently broaden/narrow the other.
+        if let Some(existing) = entries.iter_mut().find(|existing| {
+            existing.from_zone == entry.from_zone
+                && existing.source_v4 == entry.source_v4
+                && existing.source_v6 == entry.source_v6
+        }) {
             *existing = entry;
             return;
         }

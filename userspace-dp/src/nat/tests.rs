@@ -558,7 +558,13 @@ fn dnat_basic_lookup_tcp() {
         }],
         &crate::nat::NatCounterStore::default(),
     );
-    let decision = table.lookup(PROTO_TCP, "203.0.113.10".parse().unwrap(), 80, "");
+    let decision = table.lookup(
+        PROTO_TCP,
+        "198.51.100.1".parse().unwrap(),
+        "203.0.113.10".parse().unwrap(),
+        80,
+        "",
+    );
     assert_eq!(
         decision,
         Some(NatDecision {
@@ -586,7 +592,13 @@ fn dnat_wildcard_port_fallback() {
         &crate::nat::NatCounterStore::default(),
     );
     // Any port should match via wildcard
-    let decision = table.lookup(PROTO_TCP, "203.0.113.10".parse().unwrap(), 12345, "");
+    let decision = table.lookup(
+        PROTO_TCP,
+        "198.51.100.1".parse().unwrap(),
+        "203.0.113.10".parse().unwrap(),
+        12345,
+        "",
+    );
     assert!(decision.is_some());
     let d = decision.unwrap();
     assert_eq!(d.rewrite_dst, Some("192.168.1.10".parse().unwrap()));
@@ -612,12 +624,24 @@ fn dnat_protocol_specificity() {
     );
     assert!(
         table
-            .lookup(PROTO_TCP, "203.0.113.10".parse().unwrap(), 80, "")
+            .lookup(
+                PROTO_TCP,
+                "198.51.100.1".parse().unwrap(),
+                "203.0.113.10".parse().unwrap(),
+                80,
+                ""
+            )
             .is_some()
     );
     assert!(
         table
-            .lookup(PROTO_UDP, "203.0.113.10".parse().unwrap(), 80, "")
+            .lookup(
+                PROTO_UDP,
+                "198.51.100.1".parse().unwrap(),
+                "203.0.113.10".parse().unwrap(),
+                80,
+                ""
+            )
             .is_none()
     );
 }
@@ -637,7 +661,13 @@ fn dnat_ipv6_lookup() {
         }],
         &crate::nat::NatCounterStore::default(),
     );
-    let decision = table.lookup(PROTO_TCP, "2001:db8::1".parse().unwrap(), 443, "");
+    let decision = table.lookup(
+        PROTO_TCP,
+        "2001:db8:ffff::1".parse().unwrap(),
+        "2001:db8::1".parse().unwrap(),
+        443,
+        "",
+    );
     assert_eq!(
         decision,
         Some(NatDecision {
@@ -675,9 +705,21 @@ fn dnat_multiple_entries() {
         ],
         &crate::nat::NatCounterStore::default(),
     );
-    let http = table.lookup(PROTO_TCP, "203.0.113.10".parse().unwrap(), 80, "");
+    let http = table.lookup(
+        PROTO_TCP,
+        "198.51.100.1".parse().unwrap(),
+        "203.0.113.10".parse().unwrap(),
+        80,
+        "",
+    );
     assert_eq!(http.unwrap().rewrite_dst_port, Some(8080));
-    let https = table.lookup(PROTO_TCP, "203.0.113.10".parse().unwrap(), 443, "");
+    let https = table.lookup(
+        PROTO_TCP,
+        "198.51.100.1".parse().unwrap(),
+        "203.0.113.10".parse().unwrap(),
+        443,
+        "",
+    );
     assert_eq!(https.unwrap().rewrite_dst_port, Some(8443));
 }
 
@@ -699,14 +741,220 @@ fn dnat_no_match_returns_none() {
     // Different IP
     assert!(
         table
-            .lookup(PROTO_TCP, "203.0.113.99".parse().unwrap(), 80, "")
+            .lookup(
+                PROTO_TCP,
+                "198.51.100.1".parse().unwrap(),
+                "203.0.113.99".parse().unwrap(),
+                80,
+                ""
+            )
             .is_none()
     );
     // Different port (no wildcard entry)
     assert!(
         table
-            .lookup(PROTO_TCP, "203.0.113.10".parse().unwrap(), 443, "")
+            .lookup(
+                PROTO_TCP,
+                "198.51.100.1".parse().unwrap(),
+                "203.0.113.10".parse().unwrap(),
+                443,
+                ""
+            )
             .is_none()
+    );
+}
+
+// --- #2394: DNAT source-address constraint ---
+//
+// A DNAT rule scoped to `match source-address <X>` MUST fire only for packets
+// whose source IP falls in X. Before #2394 the source constraint was dropped at
+// the Go->Rust snapshot boundary, so the DNAT became destination-only and fired
+// for ANY source — a fail-open that published the internal service to sources
+// the operator scoped out. These tests fail (DNAT fires for the wrong source)
+// if the source constraint is ever dropped again.
+
+#[test]
+fn dnat_source_scoped_matches_only_configured_source_v4() {
+    let table = DnatTable::from_snapshots(
+        &[DestinationNATRuleSnapshot {
+            name: "scoped-web".to_string(),
+            destination_address: "203.0.113.10".to_string(),
+            destination_port: 80,
+            protocol: "tcp".to_string(),
+            pool_address: "192.168.1.10".to_string(),
+            pool_port: 8080,
+            // Only sources in 198.51.100.0/24 may be DNAT'd.
+            source_addresses: vec!["198.51.100.0/24".to_string()],
+            ..DestinationNATRuleSnapshot::default()
+        }],
+        &crate::nat::NatCounterStore::default(),
+    );
+    // Matching source -> DNAT fires.
+    let hit = table.lookup(
+        PROTO_TCP,
+        "198.51.100.42".parse().unwrap(),
+        "203.0.113.10".parse().unwrap(),
+        80,
+        "",
+    );
+    assert_eq!(
+        hit,
+        Some(NatDecision {
+            rewrite_dst: Some("192.168.1.10".parse().unwrap()),
+            rewrite_dst_port: Some(8080),
+            ..NatDecision::default()
+        }),
+        "DNAT must fire for a source inside the configured source-address prefix"
+    );
+    // FAIL-ON-REVERT: a source OUTSIDE the configured prefix must NOT be DNAT'd.
+    // If the source constraint is dropped this returns Some -> fail-open.
+    let miss = table.lookup(
+        PROTO_TCP,
+        "203.0.113.200".parse().unwrap(),
+        "203.0.113.10".parse().unwrap(),
+        80,
+        "",
+    );
+    assert_eq!(
+        miss, None,
+        "DNAT must NOT fire for a source outside the configured source-address (fail-open)"
+    );
+}
+
+#[test]
+fn dnat_source_scoped_matches_only_configured_source_v6() {
+    let table = DnatTable::from_snapshots(
+        &[DestinationNATRuleSnapshot {
+            name: "scoped-web-v6".to_string(),
+            destination_address: "2001:db8::1".to_string(),
+            destination_port: 443,
+            protocol: "tcp".to_string(),
+            pool_address: "fd00::1".to_string(),
+            pool_port: 8443,
+            source_addresses: vec!["2001:db8:aaaa::/48".to_string()],
+            ..DestinationNATRuleSnapshot::default()
+        }],
+        &crate::nat::NatCounterStore::default(),
+    );
+    // Matching v6 source -> DNAT fires.
+    let hit = table.lookup(
+        PROTO_TCP,
+        "2001:db8:aaaa::99".parse().unwrap(),
+        "2001:db8::1".parse().unwrap(),
+        443,
+        "",
+    );
+    assert!(
+        hit.is_some(),
+        "v6 DNAT must fire for a source inside the configured prefix"
+    );
+    // FAIL-ON-REVERT: non-matching v6 source must NOT be DNAT'd.
+    let miss = table.lookup(
+        PROTO_TCP,
+        "2001:db8:bbbb::99".parse().unwrap(),
+        "2001:db8::1".parse().unwrap(),
+        443,
+        "",
+    );
+    assert_eq!(
+        miss, None,
+        "v6 DNAT must NOT fire for a source outside the configured prefix (fail-open)"
+    );
+}
+
+#[test]
+fn dnat_unscoped_matches_any_source() {
+    // ANTI-OVER-RESTRICT: a DNAT rule with no source-address still DNATs every
+    // source (the empty-source = match-any behavior must be preserved).
+    let table = DnatTable::from_snapshots(
+        &[DestinationNATRuleSnapshot {
+            name: "open-web".to_string(),
+            destination_address: "203.0.113.10".to_string(),
+            destination_port: 80,
+            protocol: "tcp".to_string(),
+            pool_address: "192.168.1.10".to_string(),
+            pool_port: 8080,
+            source_addresses: vec![],
+            ..DestinationNATRuleSnapshot::default()
+        }],
+        &crate::nat::NatCounterStore::default(),
+    );
+    for src in ["198.51.100.1", "203.0.113.250", "10.9.9.9"] {
+        let d = table.lookup(
+            PROTO_TCP,
+            src.parse().unwrap(),
+            "203.0.113.10".parse().unwrap(),
+            80,
+            "",
+        );
+        assert!(
+            d.is_some(),
+            "unscoped DNAT must fire for every source (src={src})"
+        );
+    }
+}
+
+#[test]
+fn dnat_two_source_scoped_rules_same_dest_each_fire_for_own_source() {
+    // Two source-scoped rules on the same (proto, dst, port) but different
+    // source prefixes and pools. Each must fire only for its own source — the
+    // dedup must not collapse them onto one entry.
+    let table = DnatTable::from_snapshots(
+        &[
+            DestinationNATRuleSnapshot {
+                name: "from-a".to_string(),
+                destination_address: "203.0.113.10".to_string(),
+                destination_port: 80,
+                protocol: "tcp".to_string(),
+                pool_address: "192.168.1.10".to_string(),
+                pool_port: 8080,
+                source_addresses: vec!["10.1.0.0/16".to_string()],
+                ..DestinationNATRuleSnapshot::default()
+            },
+            DestinationNATRuleSnapshot {
+                name: "from-b".to_string(),
+                destination_address: "203.0.113.10".to_string(),
+                destination_port: 80,
+                protocol: "tcp".to_string(),
+                pool_address: "192.168.2.20".to_string(),
+                pool_port: 9090,
+                source_addresses: vec!["10.2.0.0/16".to_string()],
+                ..DestinationNATRuleSnapshot::default()
+            },
+        ],
+        &crate::nat::NatCounterStore::default(),
+    );
+    let a = table
+        .lookup(
+            PROTO_TCP,
+            "10.1.5.5".parse().unwrap(),
+            "203.0.113.10".parse().unwrap(),
+            80,
+            "",
+        )
+        .expect("source A must match rule from-a");
+    assert_eq!(a.rewrite_dst, Some("192.168.1.10".parse().unwrap()));
+    let b = table
+        .lookup(
+            PROTO_TCP,
+            "10.2.5.5".parse().unwrap(),
+            "203.0.113.10".parse().unwrap(),
+            80,
+            "",
+        )
+        .expect("source B must match rule from-b");
+    assert_eq!(b.rewrite_dst, Some("192.168.2.20".parse().unwrap()));
+    // A third source matches neither -> no DNAT.
+    assert_eq!(
+        table.lookup(
+            PROTO_TCP,
+            "10.3.5.5".parse().unwrap(),
+            "203.0.113.10".parse().unwrap(),
+            80,
+            "",
+        ),
+        None,
+        "a source outside both scoped prefixes must not be DNAT'd"
     );
 }
 
@@ -780,12 +1028,24 @@ fn dnat_empty_protocol_expands_to_both() {
     // Both TCP and UDP should match
     assert!(
         table
-            .lookup(PROTO_TCP, "203.0.113.10".parse().unwrap(), 53, "")
+            .lookup(
+                PROTO_TCP,
+                "198.51.100.1".parse().unwrap(),
+                "203.0.113.10".parse().unwrap(),
+                53,
+                ""
+            )
             .is_some()
     );
     assert!(
         table
-            .lookup(PROTO_UDP, "203.0.113.10".parse().unwrap(), 53, "")
+            .lookup(
+                PROTO_UDP,
+                "198.51.100.1".parse().unwrap(),
+                "203.0.113.10".parse().unwrap(),
+                53,
+                ""
+            )
             .is_some()
     );
 }
@@ -807,7 +1067,13 @@ fn dnat_same_port_no_port_rewrite() {
         &crate::nat::NatCounterStore::default(),
     );
     let decision = table
-        .lookup(PROTO_TCP, "203.0.113.10".parse().unwrap(), 80, "")
+        .lookup(
+            PROTO_TCP,
+            "198.51.100.1".parse().unwrap(),
+            "203.0.113.10".parse().unwrap(),
+            80,
+            "",
+        )
         .unwrap();
     assert_eq!(decision.rewrite_dst, Some("192.168.1.10".parse().unwrap()));
     // Same port: no rewrite needed
@@ -877,13 +1143,25 @@ fn dnat_exact_port_beats_wildcard() {
     );
     // Exact match should win over wildcard
     let decision = table
-        .lookup(PROTO_TCP, "203.0.113.10".parse().unwrap(), 80, "")
+        .lookup(
+            PROTO_TCP,
+            "198.51.100.1".parse().unwrap(),
+            "203.0.113.10".parse().unwrap(),
+            80,
+            "",
+        )
         .unwrap();
     assert_eq!(decision.rewrite_dst, Some("192.168.1.10".parse().unwrap()));
     assert_eq!(decision.rewrite_dst_port, Some(8080));
     // Non-matching port should fall through to wildcard
     let decision = table
-        .lookup(PROTO_TCP, "203.0.113.10".parse().unwrap(), 443, "")
+        .lookup(
+            PROTO_TCP,
+            "198.51.100.1".parse().unwrap(),
+            "203.0.113.10".parse().unwrap(),
+            443,
+            "",
+        )
         .unwrap();
     assert_eq!(decision.rewrite_dst, Some("192.168.1.100".parse().unwrap()));
     assert_eq!(decision.rewrite_dst_port, None);
@@ -918,7 +1196,13 @@ fn dnat_prefers_exact_from_zone_over_any_zone() {
         &crate::nat::NatCounterStore::default(),
     );
     let decision = table
-        .lookup(PROTO_TCP, "203.0.113.10".parse().unwrap(), 443, "wan")
+        .lookup(
+            PROTO_TCP,
+            "198.51.100.1".parse().unwrap(),
+            "203.0.113.10".parse().unwrap(),
+            443,
+            "wan",
+        )
         .unwrap();
     assert_eq!(decision.rewrite_dst, Some("192.168.1.10".parse().unwrap()));
     assert_eq!(decision.rewrite_dst_port, Some(8443));
@@ -953,7 +1237,13 @@ fn dnat_zone_mismatch_falls_back_to_any_zone_rule() {
         &crate::nat::NatCounterStore::default(),
     );
     let decision = table
-        .lookup(PROTO_TCP, "203.0.113.10".parse().unwrap(), 443, "dmz")
+        .lookup(
+            PROTO_TCP,
+            "198.51.100.1".parse().unwrap(),
+            "203.0.113.10".parse().unwrap(),
+            443,
+            "dmz",
+        )
         .unwrap();
     assert_eq!(decision.rewrite_dst, Some("192.168.1.200".parse().unwrap()));
     assert_eq!(decision.rewrite_dst_port, Some(9443));
@@ -977,7 +1267,13 @@ fn dnat_zone_mismatch_without_wildcard_returns_none() {
     );
     assert!(
         table
-            .lookup(PROTO_TCP, "203.0.113.10".parse().unwrap(), 443, "dmz")
+            .lookup(
+                PROTO_TCP,
+                "198.51.100.1".parse().unwrap(),
+                "203.0.113.10".parse().unwrap(),
+                443,
+                "dmz"
+            )
             .is_none()
     );
 }
@@ -1012,7 +1308,13 @@ fn dnat_duplicate_same_zone_last_rule_wins() {
         &crate::nat::NatCounterStore::default(),
     );
     let decision = table
-        .lookup(PROTO_TCP, "203.0.113.10".parse().unwrap(), 443, "wan")
+        .lookup(
+            PROTO_TCP,
+            "198.51.100.1".parse().unwrap(),
+            "203.0.113.10".parse().unwrap(),
+            443,
+            "wan",
+        )
         .unwrap();
     assert_eq!(decision.rewrite_dst, Some("192.168.1.102".parse().unwrap()));
     assert_eq!(decision.rewrite_dst_port, Some(9443));
@@ -1046,7 +1348,13 @@ fn dnat_duplicate_any_zone_last_rule_wins() {
         &crate::nat::NatCounterStore::default(),
     );
     let decision = table
-        .lookup(PROTO_TCP, "203.0.113.10".parse().unwrap(), 443, "wan")
+        .lookup(
+            PROTO_TCP,
+            "198.51.100.1".parse().unwrap(),
+            "203.0.113.10".parse().unwrap(),
+            443,
+            "wan",
+        )
         .unwrap();
     assert_eq!(decision.rewrite_dst, Some("192.168.1.102".parse().unwrap()));
     assert_eq!(decision.rewrite_dst_port, Some(9443));
@@ -3174,8 +3482,14 @@ fn nat_counter_store_stable_ids_survive_reorder_and_removal() {
     // different order. reconcile retains both; each rule reads its OWN count.
     store.reconcile_ids(&[ID_B, ID_A]);
     let snaps = store.snapshots();
-    let a_pkts = snaps.iter().find(|s| s.counter_id == ID_A).map(|s| s.packets);
-    let b_pkts = snaps.iter().find(|s| s.counter_id == ID_B).map(|s| s.packets);
+    let a_pkts = snaps
+        .iter()
+        .find(|s| s.counter_id == ID_A)
+        .map(|s| s.packets);
+    let b_pkts = snaps
+        .iter()
+        .find(|s| s.counter_id == ID_B)
+        .map(|s| s.packets);
     assert_eq!(a_pkts, Some(5), "rule A keeps its count across reorder");
     assert_eq!(b_pkts, Some(3), "rule B keeps its count across reorder");
 
@@ -3194,8 +3508,15 @@ fn nat_counter_store_stable_ids_survive_reorder_and_removal() {
     c.add(10);
     store.reconcile_ids(&[ID_B, ID_C]);
     let snaps = store.snapshots();
-    let c_pkts = snaps.iter().find(|s| s.counter_id == ID_C).map(|s| s.packets);
-    assert_eq!(c_pkts, Some(1), "re-added rule C starts from its own count, not A's");
+    let c_pkts = snaps
+        .iter()
+        .find(|s| s.counter_id == ID_C)
+        .map(|s| s.packets);
+    assert_eq!(
+        c_pkts,
+        Some(1),
+        "re-added rule C starts from its own count, not A's"
+    );
     assert!(
         snaps.iter().all(|s| s.counter_id != ID_A),
         "removed rule A's id never reappears"
@@ -3276,6 +3597,7 @@ fn parsed_nat_rules_share_store_counters() {
             name: "dnat-counted".to_string(),
             counter_id: 33,
             from_zone: "untrust".to_string(),
+            source_addresses: vec![],
             destination_address: "203.0.113.20".to_string(),
             destination_port: 443,
             protocol: "tcp".to_string(),
@@ -3285,7 +3607,13 @@ fn parsed_nat_rules_share_store_counters() {
         &store,
     );
     let (_d, dnat_counter) = dnat_tbl
-        .lookup_with_counter(PROTO_TCP, "203.0.113.20".parse().unwrap(), 443, "untrust")
+        .lookup_with_counter(
+            PROTO_TCP,
+            "198.51.100.1".parse().unwrap(),
+            "203.0.113.20".parse().unwrap(),
+            443,
+            "untrust",
+        )
         .expect("dnat match");
     assert!(
         std::sync::Arc::ptr_eq(

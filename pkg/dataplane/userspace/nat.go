@@ -210,6 +210,17 @@ func buildDestinationNATSnapshots(cfg *config.Config, natCounterIDs map[string]u
 				continue
 			}
 
+			// #2394: carry the DNAT `match source-address` constraint into the
+			// snapshot. Junos DNAT source-address restricts which sources the
+			// destination translation fires for; dropping it published the
+			// internal service to every source in the from-zone (fail-open).
+			// Mirror the SNAT builder: prefer the bracket-list form, fall back
+			// to the singular match value. An empty result = match any source.
+			sourceAddrs := append([]string(nil), rule.Match.SourceAddresses...)
+			if len(sourceAddrs) == 0 && rule.Match.SourceAddress != "" {
+				sourceAddrs = append(sourceAddrs, rule.Match.SourceAddress)
+			}
+
 			// Resolve application match to protocol+ports if specified.
 			type appTerm struct {
 				proto string
@@ -279,6 +290,7 @@ func buildDestinationNATSnapshots(cfg *config.Config, natCounterIDs map[string]u
 					out = append(out, DestinationNATRuleSnapshot{
 						Name:               rule.Name,
 						FromZone:           rs.FromZone,
+						SourceAddresses:    sourceAddrs,
 						DestinationAddress: dstAddr,
 						DestinationPort:    dstPort,
 						Protocol:           proto,

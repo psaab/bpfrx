@@ -129,6 +129,71 @@ func TestBuildNATSnapshotsStampCounterID(t *testing.T) {
 	}
 }
 
+// TestBuildDestinationNATSnapshotsCarriesSourceAddress is the Go half of the
+// #2394 fail-open fix: a DNAT rule scoped to `match source-address` MUST carry
+// that constraint into the snapshot so the Rust dataplane can enforce it. Before
+// #2394 the compiler parsed source-address but dropped it here, leaving a
+// destination-only entry that DNAT'd traffic from any source (fail-open). This
+// test FAILS if the carry-through is removed.
+func TestBuildDestinationNATSnapshotsCarriesSourceAddress(t *testing.T) {
+	cfg := &config.Config{}
+	cfg.Security.NAT.Destination = &config.DestinationNATConfig{
+		Pools: map[string]*config.NATPool{"dp": {Name: "dp", Address: "10.0.0.5"}},
+		RuleSets: []*config.NATRuleSet{
+			{Name: "scoped", FromZone: "untrust", Rules: []*config.NATRule{
+				{
+					Name: "scoped-dnat",
+					Match: config.NATMatch{
+						SourceAddresses:    []string{"198.51.100.0/24", "203.0.113.7/32"},
+						DestinationAddress: "203.0.113.20",
+						Protocol:           "tcp",
+						DestinationPort:    443,
+					},
+					Then: config.NATThen{Type: config.NATDestination, PoolName: "dp"},
+				},
+				{
+					// Singular SourceAddress (non-bracket form) must also carry.
+					Name: "scoped-dnat-singular",
+					Match: config.NATMatch{
+						SourceAddress:      "10.1.0.0/16",
+						DestinationAddress: "203.0.113.21",
+						Protocol:           "tcp",
+						DestinationPort:    80,
+					},
+					Then: config.NATThen{Type: config.NATDestination, PoolName: "dp"},
+				},
+				{
+					// Unscoped DNAT (no source) must stay empty = match any.
+					Name: "open-dnat",
+					Match: config.NATMatch{
+						DestinationAddress: "203.0.113.22",
+						Protocol:           "tcp",
+						DestinationPort:    8080,
+					},
+					Then: config.NATThen{Type: config.NATDestination, PoolName: "dp"},
+				},
+			}},
+		},
+	}
+
+	snaps := buildDestinationNATSnapshots(cfg, nil)
+	byName := map[string][]string{}
+	for _, s := range snaps {
+		byName[s.Name] = s.SourceAddresses
+	}
+
+	if got := byName["scoped-dnat"]; len(got) != 2 ||
+		got[0] != "198.51.100.0/24" || got[1] != "203.0.113.7/32" {
+		t.Fatalf("scoped-dnat SourceAddresses = %+v, want bracket list carried (fail-open if dropped)", got)
+	}
+	if got := byName["scoped-dnat-singular"]; len(got) != 1 || got[0] != "10.1.0.0/16" {
+		t.Fatalf("scoped-dnat-singular SourceAddresses = %+v, want singular source carried", got)
+	}
+	if got := byName["open-dnat"]; len(got) != 0 {
+		t.Fatalf("open-dnat SourceAddresses = %+v, want empty (unscoped DNAT = match any source)", got)
+	}
+}
+
 func srcCounterID(s []SourceNATRuleSnapshot) uint32 {
 	if len(s) == 0 {
 		return 0
