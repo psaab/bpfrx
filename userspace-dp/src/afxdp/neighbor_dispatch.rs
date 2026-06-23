@@ -224,11 +224,17 @@ pub(super) fn retry_pending_neigh(
             binding.tx_pipeline.pending_fill_frames.push_back(pkt.addr);
             continue;
         };
+        // #2362 fold B: this is the ARP/NDP-resolved retransmit of a real
+        // buffered transit frame — build the fragment-safe per-packet match
+        // inputs from that frame so an output filter's tcp-flags / is-fragment /
+        // icmp-type term matches the same packet it would on the immediate path.
+        let cos_extra = crate::afxdp::frame::term_match_extra_from_frame(source_frame, pkt.meta);
         let cos = resolve_cos_tx_selection_at(
             forwarding,
             decision.resolution.egress_ifindex,
             pkt.meta,
             pkt.flow_key.as_ref(),
+            cos_extra,
             now_ns,
         );
         if cos.drop {
@@ -542,19 +548,22 @@ mod mirror_tests {
 
         let next_hop = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1));
         let meta = pending_neighbor_meta(original_frame.len());
-        push_pending(&mut bindings[0], PendingNeighPacket {
-            addr: 0,
-            desc: XdpDesc {
+        push_pending(
+            &mut bindings[0],
+            PendingNeighPacket {
                 addr: 0,
-                len: original_frame.len() as u32,
-                options: 0,
+                desc: XdpDesc {
+                    addr: 0,
+                    len: original_frame.len() as u32,
+                    options: 0,
+                },
+                meta,
+                decision: resolved_neighbor_decision(next_hop),
+                flow_key: Some(test_session_key(12345, 443)),
+                queued_ns: 0,
+                probe_attempts: 0,
             },
-            meta,
-            decision: resolved_neighbor_decision(next_hop),
-            flow_key: Some(test_session_key(12345, 443)),
-            queued_ns: 0,
-            probe_attempts: 0,
-        });
+        );
 
         let mut forwarding = ForwardingState::default();
         forwarding.neighbors.insert(
@@ -661,20 +670,23 @@ mod mirror_tests {
 
         let next_hop = IpAddr::V4(Ipv4Addr::new(172, 16, 80, 137));
         let meta = pending_neighbor_meta(original_frame.len());
-        push_pending(&mut bindings[0], PendingNeighPacket {
-            addr: 0,
-            desc: XdpDesc {
+        push_pending(
+            &mut bindings[0],
+            PendingNeighPacket {
                 addr: 0,
-                len: original_frame.len() as u32,
-                options: 0,
+                desc: XdpDesc {
+                    addr: 0,
+                    len: original_frame.len() as u32,
+                    options: 0,
+                },
+                meta,
+                decision: resolved_neighbor_decision(next_hop),
+                flow_key: Some(test_session_key(12345, 443)),
+                queued_ns: 0,
+                // All probes already fired; the dst never resolved.
+                probe_attempts: PROBE_SCHEDULE_NS.len() as u8,
             },
-            meta,
-            decision: resolved_neighbor_decision(next_hop),
-            flow_key: Some(test_session_key(12345, 443)),
-            queued_ns: 0,
-            // All probes already fired; the dst never resolved.
-            probe_attempts: PROBE_SCHEDULE_NS.len() as u8,
-        });
+        );
 
         // No neighbor for `next_hop` anywhere → unresolved. Use the
         // compile-time fallback timeout (default ForwardingState leaves
@@ -789,19 +801,22 @@ mod mirror_tests {
         // the real dispatch path with the correct sum + bucket.
         let queued_ns = 1_000_000u64;
         let dwell_ns = 500_000_000u64; // 500 ms
-        push_pending(&mut bindings[0], PendingNeighPacket {
-            addr: 0,
-            desc: XdpDesc {
+        push_pending(
+            &mut bindings[0],
+            PendingNeighPacket {
                 addr: 0,
-                len: original_frame.len() as u32,
-                options: 0,
+                desc: XdpDesc {
+                    addr: 0,
+                    len: original_frame.len() as u32,
+                    options: 0,
+                },
+                meta,
+                decision: resolved_neighbor_decision(next_hop),
+                flow_key: Some(test_session_key(12345, 443)),
+                queued_ns,
+                probe_attempts: 0,
             },
-            meta,
-            decision: resolved_neighbor_decision(next_hop),
-            flow_key: Some(test_session_key(12345, 443)),
-            queued_ns,
-            probe_attempts: 0,
-        });
+        );
 
         let mut forwarding = ForwardingState::default();
         // Neighbor IS resolved now → the retry sweep dispatches it and
@@ -883,19 +898,22 @@ mod mirror_tests {
 
         let next_hop = IpAddr::V4(Ipv4Addr::new(172, 16, 80, 138));
         let meta = pending_neighbor_meta(original_frame.len());
-        push_pending(&mut bindings[0], PendingNeighPacket {
-            addr: 0,
-            desc: XdpDesc {
+        push_pending(
+            &mut bindings[0],
+            PendingNeighPacket {
                 addr: 0,
-                len: original_frame.len() as u32,
-                options: 0,
+                desc: XdpDesc {
+                    addr: 0,
+                    len: original_frame.len() as u32,
+                    options: 0,
+                },
+                meta,
+                decision: resolved_neighbor_decision(next_hop),
+                flow_key: Some(test_session_key(12345, 443)),
+                queued_ns: 0,
+                probe_attempts: PROBE_SCHEDULE_NS.len() as u8,
             },
-            meta,
-            decision: resolved_neighbor_decision(next_hop),
-            flow_key: Some(test_session_key(12345, 443)),
-            queued_ns: 0,
-            probe_attempts: PROBE_SCHEDULE_NS.len() as u8,
-        });
+        );
 
         // No neighbor anywhere → never resolves → timeout drop.
         let forwarding = ForwardingState::default();
@@ -1097,7 +1115,10 @@ mod pending_admission_tests {
     /// how much room remains.
     #[test]
     fn first_packet_buffers_siblings_duplicate_drop() {
-        assert_eq!(pending_neigh_admission(false, 0), PendingNeighAdmission::Buffer);
+        assert_eq!(
+            pending_neigh_admission(false, 0),
+            PendingNeighAdmission::Buffer
+        );
         assert_eq!(
             pending_neigh_admission(true, 1),
             PendingNeighAdmission::DuplicateDrop

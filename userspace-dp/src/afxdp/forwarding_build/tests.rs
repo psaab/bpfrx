@@ -5,6 +5,7 @@
 // tests;` in forwarding_build/mod.rs (no `#[path]` attribute).
 
 use super::*;
+use crate::filter::TermMatchExtra;
 use crate::filter::evaluate_filter_ref_tx_selection_runtime_counted;
 use crate::{
     ClassOfServiceSnapshot, CoSDSCPClassifierEntrySnapshot, CoSDSCPClassifierSnapshot,
@@ -94,6 +95,7 @@ fn forwarding_state_refresh_preserves_three_color_runtime_state() {
         12345,
         5000,
         0,
+        TermMatchExtra::default(),
         100,
         0,
     );
@@ -108,6 +110,7 @@ fn forwarding_state_refresh_preserves_three_color_runtime_state() {
         12345,
         5000,
         0,
+        TermMatchExtra::default(),
         51,
         0,
     );

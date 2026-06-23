@@ -481,6 +481,7 @@ fn three_color_runtime_ids_and_miss_path_counters_are_stable() {
         12345,
         5000,
         0,
+        TermMatchExtra::default(),
         100,
         0,
     );
@@ -494,6 +495,7 @@ fn three_color_runtime_ids_and_miss_path_counters_are_stable() {
         12345,
         5000,
         0,
+        TermMatchExtra::default(),
         51,
         0,
     );
@@ -592,6 +594,7 @@ fn equivalent_snapshot_refresh_preserves_three_color_state_and_counters() {
         12345,
         5000,
         0,
+        TermMatchExtra::default(),
         100,
         0,
     );
@@ -622,6 +625,7 @@ fn equivalent_snapshot_refresh_preserves_three_color_state_and_counters() {
         12345,
         5000,
         0,
+        TermMatchExtra::default(),
         51,
         0,
     );
@@ -676,6 +680,7 @@ fn three_color_adding_lower_sorted_policer_does_not_reset_existing_runtime() {
         12345,
         5000,
         0,
+        TermMatchExtra::default(),
         100,
         0,
     );
@@ -716,6 +721,7 @@ fn three_color_adding_lower_sorted_policer_does_not_reset_existing_runtime() {
         12345,
         5000,
         0,
+        TermMatchExtra::default(),
         51,
         0,
     );
@@ -772,6 +778,7 @@ fn three_color_compatible_refresh_observes_old_runtime_mutations_after_rebuild()
         12345,
         5000,
         0,
+        TermMatchExtra::default(),
         100,
         0,
     );
@@ -786,6 +793,7 @@ fn three_color_compatible_refresh_observes_old_runtime_mutations_after_rebuild()
         12345,
         5000,
         0,
+        TermMatchExtra::default(),
         51,
         0,
     );
@@ -837,6 +845,7 @@ fn changed_snapshot_shape_resets_three_color_runtime_state() {
         12345,
         5000,
         0,
+        TermMatchExtra::default(),
         100,
         0,
     );
@@ -860,6 +869,7 @@ fn changed_snapshot_shape_resets_three_color_runtime_state() {
         12345,
         5000,
         0,
+        TermMatchExtra::default(),
         200,
         0,
     );
@@ -1054,6 +1064,7 @@ fn unsupported_three_color_snapshots_fail_closed_in_rust_compiler() {
             12345,
             5000,
             0,
+            TermMatchExtra::default(),
             1,
             0,
         );
@@ -1104,6 +1115,7 @@ fn three_color_empty_then_action_uses_default_discard() {
         12345,
         5000,
         0,
+        TermMatchExtra::default(),
         100,
         0,
     );
@@ -1115,6 +1127,7 @@ fn three_color_empty_then_action_uses_default_discard() {
         12345,
         5000,
         0,
+        TermMatchExtra::default(),
         51,
         0,
     );
@@ -2565,6 +2578,7 @@ fn interface_filter_tx_selection_wrappers_dispatch_and_default() {
         40000,
         5201,
         0,
+        TermMatchExtra::default(),
         1400,
     );
     assert_eq!(input.action, FilterAction::Accept);
@@ -2580,6 +2594,7 @@ fn interface_filter_tx_selection_wrappers_dispatch_and_default() {
         40000,
         5202,
         0,
+        TermMatchExtra::default(),
         1400,
     );
     assert_eq!(output.action, FilterAction::Accept);
@@ -2596,6 +2611,7 @@ fn interface_filter_tx_selection_wrappers_dispatch_and_default() {
         40000,
         5201,
         0,
+        TermMatchExtra::default(),
         1400,
     );
     assert_eq!(none_in.action, FilterAction::Accept);
@@ -2725,7 +2741,16 @@ fn cached_and_runtime_tx_selection_agree_on_plain_term() {
     let dst = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
 
     let runtime = evaluate_filter_ref_tx_selection_runtime_counted(
-        filter, src, dst, PROTO_TCP, 40000, 5201, 0, 0, 1,
+        filter,
+        src,
+        dst,
+        PROTO_TCP,
+        40000,
+        5201,
+        0,
+        TermMatchExtra::default(),
+        0,
+        1,
     );
     let cached =
         evaluate_filter_ref_tx_selection_cached(filter, src, dst, PROTO_TCP, 40000, 5201, 0);

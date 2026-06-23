@@ -6,6 +6,7 @@
 use super::*;
 use crate::afxdp::tx::test_support::*;
 use crate::afxdp::types::SharedCoSExactBacklog;
+use crate::filter::TermMatchExtra;
 use crate::{
     ClassOfServiceSnapshot, CoSDSCPClassifierEntrySnapshot, CoSDSCPClassifierSnapshot,
     CoSForwardingClassSnapshot, CoSIEEE8021ClassifierEntrySnapshot, CoSIEEE8021ClassifierSnapshot,
@@ -30,7 +31,7 @@ fn resolve_cos_queue_idx_rejects_explicit_queue_miss() {
             surplus_weight: 1,
             buffer_bytes: COS_MIN_BURST_BYTES,
             dscp_rewrite: None,
-        codel_target_ns: 0,
+            codel_target_ns: 0,
         }],
     );
 
@@ -55,7 +56,7 @@ fn enqueue_exact_queue_publishes_shared_backlog_slot() {
             surplus_weight: 1,
             buffer_bytes: 4_000_000,
             dscp_rewrite: None,
-        codel_target_ns: 0,
+            codel_target_ns: 0,
         }],
     );
     let mut fast_interfaces = test_cos_fast_interfaces(
@@ -272,7 +273,7 @@ fn cos_queue_accepts_prepared_when_queue_is_prepared_only() {
             surplus_weight: 1,
             buffer_bytes: COS_MIN_BURST_BYTES,
             dscp_rewrite: None,
-        codel_target_ns: 0,
+            codel_target_ns: 0,
         }],
     );
     root.queues[0]
@@ -321,7 +322,7 @@ fn demote_prepared_cos_queue_to_local_recycles_frames_and_blocks_prepared_append
             surplus_weight: 1,
             buffer_bytes: COS_MIN_BURST_BYTES,
             dscp_rewrite: None,
-        codel_target_ns: 0,
+            codel_target_ns: 0,
         }],
     );
     root.queues[0]
@@ -422,7 +423,7 @@ fn demote_prepared_cos_queue_to_local_preserves_mqfq_frontier() {
             surplus_weight: 1,
             buffer_bytes: 128 * 1024,
             dscp_rewrite: None,
-        codel_target_ns: 0,
+            codel_target_ns: 0,
         }],
     );
     let queue = &mut root.queues[0];
@@ -578,7 +579,7 @@ fn demote_prepared_cos_queue_to_local_skips_non_exact_queue() {
             surplus_weight: 1,
             buffer_bytes: COS_MIN_BURST_BYTES,
             dscp_rewrite: None,
-        codel_target_ns: 0,
+            codel_target_ns: 0,
         }],
     );
     root.queues[0]
@@ -690,7 +691,7 @@ fn resolve_cos_queue_id_prefers_egress_output_filter_forwarding_class() {
                     surplus_sharing: false,
                     equal_flow_enforcement: false,
                     equal_flow_target_policy: String::new(),
-                codel_target_ns: 0,
+                    codel_target_ns: 0,
                 },
                 CoSSchedulerSnapshot {
                     name: "ef-sched".into(),
@@ -702,7 +703,7 @@ fn resolve_cos_queue_id_prefers_egress_output_filter_forwarding_class() {
                     surplus_sharing: false,
                     equal_flow_enforcement: false,
                     equal_flow_target_policy: String::new(),
-                codel_target_ns: 0,
+                    codel_target_ns: 0,
                 },
             ],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {
@@ -797,7 +798,7 @@ fn resolve_cos_queue_id_uses_reverse_output_source_port_filter() {
                     surplus_sharing: false,
                     equal_flow_enforcement: false,
                     equal_flow_target_policy: String::new(),
-                codel_target_ns: 0,
+                    codel_target_ns: 0,
                 },
                 CoSSchedulerSnapshot {
                     name: "scheduler-iperf-a".into(),
@@ -809,7 +810,7 @@ fn resolve_cos_queue_id_uses_reverse_output_source_port_filter() {
                     surplus_sharing: false,
                     equal_flow_enforcement: false,
                     equal_flow_target_policy: String::new(),
-                codel_target_ns: 0,
+                    codel_target_ns: 0,
                 },
             ],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {
@@ -949,7 +950,7 @@ fn resolve_cached_cos_tx_selection_prefers_egress_output_filter_and_keeps_counte
                     surplus_sharing: false,
                     equal_flow_enforcement: false,
                     equal_flow_target_policy: String::new(),
-                codel_target_ns: 0,
+                    codel_target_ns: 0,
                 },
                 CoSSchedulerSnapshot {
                     name: "ef-sched".into(),
@@ -961,7 +962,7 @@ fn resolve_cached_cos_tx_selection_prefers_egress_output_filter_and_keeps_counte
                     surplus_sharing: false,
                     equal_flow_enforcement: false,
                     equal_flow_target_policy: String::new(),
-                codel_target_ns: 0,
+                    codel_target_ns: 0,
                 },
             ],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {
@@ -1070,7 +1071,7 @@ fn resolve_cos_queue_id_uses_ingress_input_filter_when_no_output_filter_exists()
                     surplus_sharing: false,
                     equal_flow_enforcement: false,
                     equal_flow_target_policy: String::new(),
-                codel_target_ns: 0,
+                    codel_target_ns: 0,
                 },
                 CoSSchedulerSnapshot {
                     name: "ef-sched".into(),
@@ -1082,7 +1083,7 @@ fn resolve_cos_queue_id_uses_ingress_input_filter_when_no_output_filter_exists()
                     surplus_sharing: false,
                     equal_flow_enforcement: false,
                     equal_flow_target_policy: String::new(),
-                codel_target_ns: 0,
+                    codel_target_ns: 0,
                 },
             ],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {
@@ -1187,7 +1188,7 @@ fn resolve_cached_cos_tx_selection_uses_ingress_input_filter_when_no_output_exis
                     surplus_sharing: false,
                     equal_flow_enforcement: false,
                     equal_flow_target_policy: String::new(),
-                codel_target_ns: 0,
+                    codel_target_ns: 0,
                 },
                 CoSSchedulerSnapshot {
                     name: "ef-sched".into(),
@@ -1199,7 +1200,7 @@ fn resolve_cached_cos_tx_selection_uses_ingress_input_filter_when_no_output_exis
                     surplus_sharing: false,
                     equal_flow_enforcement: false,
                     equal_flow_target_policy: String::new(),
-                codel_target_ns: 0,
+                    codel_target_ns: 0,
                 },
             ],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {
@@ -1288,7 +1289,7 @@ fn resolve_cached_cos_tx_selection_keeps_counter_only_output_filter_hits() {
                 surplus_sharing: false,
                 equal_flow_enforcement: false,
                 equal_flow_target_policy: String::new(),
-            codel_target_ns: 0,
+                codel_target_ns: 0,
             }],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {
                 name: "wan-map".into(),
@@ -1370,7 +1371,7 @@ fn resolve_cos_tx_selection_counts_counter_only_output_filter_hits() {
                 surplus_sharing: false,
                 equal_flow_enforcement: false,
                 equal_flow_target_policy: String::new(),
-            codel_target_ns: 0,
+                codel_target_ns: 0,
             }],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {
                 name: "wan-map".into(),
@@ -1403,6 +1404,7 @@ fn resolve_cos_tx_selection_counts_counter_only_output_filter_hits() {
             src_port: 12345,
             dst_port: 443,
         }),
+        TermMatchExtra::default(),
     );
 
     assert_eq!(selection.queue_id, Some(0));
@@ -1463,6 +1465,7 @@ fn resolve_cos_tx_selection_drops_terminal_output_filter_without_log() {
             src_port: 12345,
             dst_port: 443,
         }),
+        TermMatchExtra::default(),
     );
 
     assert!(selection.drop);
@@ -1515,6 +1518,7 @@ fn resolve_cos_tx_selection_drops_reject_output_filter_without_log() {
             src_port: 12345,
             dst_port: 443,
         }),
+        TermMatchExtra::default(),
     );
 
     assert!(selection.drop);
@@ -1583,7 +1587,7 @@ fn resolve_cos_tx_selection_uses_ingress_filter_dscp_rewrite_when_no_output_filt
                     surplus_sharing: false,
                     equal_flow_enforcement: false,
                     equal_flow_target_policy: String::new(),
-                codel_target_ns: 0,
+                    codel_target_ns: 0,
                 },
                 CoSSchedulerSnapshot {
                     name: "ef-sched".into(),
@@ -1595,7 +1599,7 @@ fn resolve_cos_tx_selection_uses_ingress_filter_dscp_rewrite_when_no_output_filt
                     surplus_sharing: false,
                     equal_flow_enforcement: false,
                     equal_flow_target_policy: String::new(),
-                codel_target_ns: 0,
+                    codel_target_ns: 0,
                 },
             ],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {
@@ -1634,6 +1638,7 @@ fn resolve_cos_tx_selection_uses_ingress_filter_dscp_rewrite_when_no_output_filt
             src_port: 12345,
             dst_port: 443,
         }),
+        TermMatchExtra::default(),
     );
 
     assert_eq!(selection.queue_id, Some(1));
@@ -1694,7 +1699,7 @@ fn resolve_cos_tx_selection_skips_ingress_filter_without_tx_selection_effects() 
                 surplus_sharing: false,
                 equal_flow_enforcement: false,
                 equal_flow_target_policy: String::new(),
-            codel_target_ns: 0,
+                codel_target_ns: 0,
             }],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {
                 name: "wan-map".into(),
@@ -1727,6 +1732,7 @@ fn resolve_cos_tx_selection_skips_ingress_filter_without_tx_selection_effects() 
             src_port: 12345,
             dst_port: 443,
         }),
+        TermMatchExtra::default(),
     );
 
     assert_eq!(selection.queue_id, Some(7));
@@ -1793,6 +1799,7 @@ fn resolve_cos_tx_selection_returns_none_when_no_cos_or_tx_selection_filters_exi
             src_port: 12345,
             dst_port: 443,
         }),
+        TermMatchExtra::default(),
     );
 
     assert_eq!(selection.queue_id, None);
@@ -1839,7 +1846,7 @@ fn resolve_cos_queue_id_falls_back_to_default_queue_without_filter_match() {
                 surplus_sharing: false,
                 equal_flow_enforcement: false,
                 equal_flow_target_policy: String::new(),
-            codel_target_ns: 0,
+                codel_target_ns: 0,
             }],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {
                 name: "wan-map".into(),
@@ -1924,7 +1931,7 @@ fn resolve_cos_queue_id_uses_dscp_classifier_when_filters_do_not_set_class() {
                     surplus_sharing: false,
                     equal_flow_enforcement: false,
                     equal_flow_target_policy: String::new(),
-                codel_target_ns: 0,
+                    codel_target_ns: 0,
                 },
                 CoSSchedulerSnapshot {
                     name: "voice-sched".into(),
@@ -1936,7 +1943,7 @@ fn resolve_cos_queue_id_uses_dscp_classifier_when_filters_do_not_set_class() {
                     surplus_sharing: false,
                     equal_flow_enforcement: false,
                     equal_flow_target_policy: String::new(),
-                codel_target_ns: 0,
+                    codel_target_ns: 0,
                 },
             ],
         }),
@@ -2022,7 +2029,7 @@ fn resolve_cos_queue_id_uses_ieee8021_classifier_when_filters_do_not_set_class()
                     surplus_sharing: false,
                     equal_flow_enforcement: false,
                     equal_flow_target_policy: String::new(),
-                codel_target_ns: 0,
+                    codel_target_ns: 0,
                 },
                 CoSSchedulerSnapshot {
                     name: "voice-sched".into(),
@@ -2034,7 +2041,7 @@ fn resolve_cos_queue_id_uses_ieee8021_classifier_when_filters_do_not_set_class()
                     surplus_sharing: false,
                     equal_flow_enforcement: false,
                     equal_flow_target_policy: String::new(),
-                codel_target_ns: 0,
+                    codel_target_ns: 0,
                 },
             ],
             ..Default::default()
@@ -2122,7 +2129,7 @@ fn resolve_cos_queue_id_does_not_use_ieee8021_classifier_for_untagged_packets() 
                     surplus_sharing: false,
                     equal_flow_enforcement: false,
                     equal_flow_target_policy: String::new(),
-                codel_target_ns: 0,
+                    codel_target_ns: 0,
                 },
                 CoSSchedulerSnapshot {
                     name: "bulk-sched".into(),
@@ -2134,7 +2141,7 @@ fn resolve_cos_queue_id_does_not_use_ieee8021_classifier_for_untagged_packets() 
                     surplus_sharing: false,
                     equal_flow_enforcement: false,
                     equal_flow_target_policy: String::new(),
-                codel_target_ns: 0,
+                    codel_target_ns: 0,
                 },
             ],
             ..Default::default()
@@ -2249,7 +2256,7 @@ fn resolve_cos_queue_id_preserves_ingress_classification_when_output_filter_has_
                     surplus_sharing: false,
                     equal_flow_enforcement: false,
                     equal_flow_target_policy: String::new(),
-                codel_target_ns: 0,
+                    codel_target_ns: 0,
                 },
                 CoSSchedulerSnapshot {
                     name: "ef-sched".into(),
@@ -2261,7 +2268,7 @@ fn resolve_cos_queue_id_preserves_ingress_classification_when_output_filter_has_
                     surplus_sharing: false,
                     equal_flow_enforcement: false,
                     equal_flow_target_policy: String::new(),
-                codel_target_ns: 0,
+                    codel_target_ns: 0,
                 },
             ],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {
@@ -2352,7 +2359,7 @@ fn resolve_cos_tx_selection_preserves_output_filter_dscp_rewrite_without_forward
                 surplus_sharing: false,
                 equal_flow_enforcement: false,
                 equal_flow_target_policy: String::new(),
-            codel_target_ns: 0,
+                codel_target_ns: 0,
             }],
             scheduler_maps: vec![CoSSchedulerMapSnapshot {
                 name: "wan-map".into(),
@@ -2384,6 +2391,7 @@ fn resolve_cos_tx_selection_preserves_output_filter_dscp_rewrite_without_forward
             src_port: 12345,
             dst_port: 443,
         }),
+        TermMatchExtra::default(),
     );
 
     assert_eq!(selection.queue_id, Some(7));
@@ -2496,7 +2504,10 @@ fn generated_v4_frame(protocol: u8, tos: u8, src_port: u16, dst_port: u16) -> Ve
     frame
 }
 
-fn forwarding_with_v4_output_filter(filter_name: &str, term: FirewallTermSnapshot) -> ForwardingState {
+fn forwarding_with_v4_output_filter(
+    filter_name: &str,
+    term: FirewallTermSnapshot,
+) -> ForwardingState {
     let snapshot = ConfigSnapshot {
         interfaces: vec![InterfaceSnapshot {
             name: "reth0.0".into(),
@@ -2530,7 +2541,10 @@ fn classify_generated_reply_drops_icmp_on_terminal_discard() {
     );
     let frame = generated_v4_frame(PROTO_ICMP, 0x00, 0, 0);
     let verdict = classify_generated_reply(&forwarding, 202, &frame, 0);
-    assert!(verdict.drop, "generated ICMP reply must be dropped by `then discard`");
+    assert!(
+        verdict.drop,
+        "generated ICMP reply must be dropped by `then discard`"
+    );
     assert!(!verdict.parse_error);
 }
 
@@ -2549,7 +2563,10 @@ fn classify_generated_reply_ignores_trigger_protocol_filter() {
     );
     let frame = generated_v4_frame(PROTO_ICMP, 0x00, 0, 0);
     let verdict = classify_generated_reply(&forwarding, 202, &frame, 0);
-    assert!(!verdict.drop, "a TCP-matching filter must not drop the generated ICMP reply");
+    assert!(
+        !verdict.drop,
+        "a TCP-matching filter must not drop the generated ICMP reply"
+    );
     assert!(!verdict.parse_error);
 }
 
@@ -2581,8 +2598,14 @@ fn classify_generated_reply_assigns_forwarding_class_queue() {
         }],
         class_of_service: Some(ClassOfServiceSnapshot {
             forwarding_classes: vec![
-                CoSForwardingClassSnapshot { name: "best-effort".into(), queue: 0 },
-                CoSForwardingClassSnapshot { name: "iperf-a".into(), queue: 4 },
+                CoSForwardingClassSnapshot {
+                    name: "best-effort".into(),
+                    queue: 0,
+                },
+                CoSForwardingClassSnapshot {
+                    name: "iperf-a".into(),
+                    queue: 4,
+                },
             ],
             schedulers: vec![
                 CoSSchedulerSnapshot {
@@ -2633,7 +2656,11 @@ fn classify_generated_reply_assigns_forwarding_class_queue() {
     let frame = generated_v4_frame(PROTO_TCP, 0x00, 80, 49152);
     let verdict = classify_generated_reply(&forwarding, 202, &frame, 0);
     assert!(!verdict.drop);
-    assert_eq!(verdict.cos_queue_id, Some(4), "generated RST routes to the iperf-a queue");
+    assert_eq!(
+        verdict.cos_queue_id,
+        Some(4),
+        "generated RST routes to the iperf-a queue"
+    );
 }
 
 #[test]
@@ -2655,7 +2682,10 @@ fn classify_generated_reply_fails_closed_on_parse_failure() {
     ];
     let verdict = classify_generated_reply(&forwarding, 202, &frame, 0);
     assert!(verdict.drop, "parse failure must fail CLOSED (drop)");
-    assert!(verdict.parse_error, "parse failure must set parse_error so the caller counts it");
+    assert!(
+        verdict.parse_error,
+        "parse failure must set parse_error so the caller counts it"
+    );
     assert_eq!(verdict.cos_queue_id, None);
 }
 
@@ -2703,6 +2733,7 @@ fn classify_generated_reply_counterfactual_trigger_keying_would_misverdict() {
             ..Default::default()
         },
         Some(&trigger_key),
+        TermMatchExtra::default(),
         0,
     );
     assert!(
@@ -2796,8 +2827,14 @@ fn classify_post_transform_inner_ptb_drops_on_terminal_discard() {
         "PTB advertises the inner MTU"
     );
     let verdict = classify_generated_reply(&forwarding, 202, &ptb, 0);
-    assert!(verdict.drop, "post-transform PTB must honor the output discard filter");
-    assert!(!verdict.parse_error, "a well-formed PTB must NOT fail as a parse error");
+    assert!(
+        verdict.drop,
+        "post-transform PTB must honor the output discard filter"
+    );
+    assert!(
+        !verdict.parse_error,
+        "a well-formed PTB must NOT fail as a parse error"
+    );
 }
 
 #[test]
@@ -2816,6 +2853,148 @@ fn classify_post_transform_inner_ptb_admitted_without_filter() {
     );
     let ptb = post_transform_inner_frag_needed_ptb(1325); // WG inner MTU
     let verdict = classify_generated_reply(&forwarding, 202, &ptb, 0);
-    assert!(!verdict.drop, "a TCP-only discard must not drop the ICMP PTB");
+    assert!(
+        !verdict.drop,
+        "a TCP-only discard must not drop the ICMP PTB"
+    );
     assert!(!verdict.parse_error);
+}
+
+// #2362 fold B: the TX-selection / CoS leg must honor a per-packet L4 match
+// condition. A `from { tcp-flags syn } then forwarding-class ef` output filter
+// selects the EF queue ONLY for a packet whose tcp_flags carry SYN; a non-SYN
+// packet of the same 5-tuple falls through to the interface default queue. This
+// fails if the TX-selection path reverts to TermMatchExtra::default() (the SYN
+// term would never match → no EF selection on any packet → silent under-match).
+#[test]
+fn resolve_cos_tx_selection_honors_tcp_flags_per_packet_match() {
+    let snapshot = ConfigSnapshot {
+        interfaces: vec![InterfaceSnapshot {
+            name: "reth0.0".into(),
+            ifindex: 202,
+            hardware_addr: "02:bf:72:00:80:08".into(),
+            filter_output_v4: "wan-syn-ef".into(),
+            cos_scheduler_map: "wan-map".into(),
+            ..Default::default()
+        }],
+        filters: vec![FirewallFilterSnapshot {
+            name: "wan-syn-ef".into(),
+            family: "inet".into(),
+            terms: vec![FirewallTermSnapshot {
+                name: "syn-ef".into(),
+                protocols: vec!["tcp".into()],
+                action: "accept".into(),
+                forwarding_class: "expedited-forwarding".into(),
+                tcp_flags: Some(0x02), // SYN
+                ..Default::default()
+            }],
+        }],
+        class_of_service: Some(ClassOfServiceSnapshot {
+            forwarding_classes: vec![
+                CoSForwardingClassSnapshot {
+                    name: "best-effort".into(),
+                    queue: 0,
+                },
+                CoSForwardingClassSnapshot {
+                    name: "expedited-forwarding".into(),
+                    queue: 1,
+                },
+            ],
+            schedulers: vec![
+                CoSSchedulerSnapshot {
+                    name: "be-sched".into(),
+                    transmit_rate_bytes: 4_000_000,
+                    transmit_rate_exact: false,
+                    priority: "low".into(),
+                    buffer_size_bytes: 128_000,
+                    buffer_size_percent: 0.0,
+                    surplus_sharing: false,
+                    equal_flow_enforcement: false,
+                    equal_flow_target_policy: String::new(),
+                    codel_target_ns: 0,
+                },
+                CoSSchedulerSnapshot {
+                    name: "ef-sched".into(),
+                    transmit_rate_bytes: 6_000_000,
+                    transmit_rate_exact: false,
+                    priority: "strict-high".into(),
+                    buffer_size_bytes: 64_000,
+                    buffer_size_percent: 0.0,
+                    surplus_sharing: false,
+                    equal_flow_enforcement: false,
+                    equal_flow_target_policy: String::new(),
+                    codel_target_ns: 0,
+                },
+            ],
+            scheduler_maps: vec![CoSSchedulerMapSnapshot {
+                name: "wan-map".into(),
+                entries: vec![
+                    CoSSchedulerMapEntrySnapshot {
+                        forwarding_class: "best-effort".into(),
+                        scheduler: "be-sched".into(),
+                    },
+                    CoSSchedulerMapEntrySnapshot {
+                        forwarding_class: "expedited-forwarding".into(),
+                        scheduler: "ef-sched".into(),
+                    },
+                ],
+            }],
+            dscp_classifiers: vec![],
+            ieee8021_classifiers: vec![],
+            dscp_rewrite_rules: vec![],
+        }),
+        ..Default::default()
+    };
+
+    let forwarding = build_forwarding_state(&snapshot);
+    let key = SessionKey {
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_TCP,
+        src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 61, 100)),
+        dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+        src_port: 12345,
+        dst_port: 443,
+    };
+    let meta = || UserspaceDpMeta {
+        ingress_ifindex: 5,
+        addr_family: libc::AF_INET as u8,
+        pkt_len: 1514,
+        protocol: PROTO_TCP,
+        ..Default::default()
+    };
+
+    // SYN packet -> tcp-flags term matches -> EF (queue 1).
+    let syn = resolve_cos_tx_selection(
+        &forwarding,
+        202,
+        meta(),
+        Some(&key),
+        TermMatchExtra {
+            tcp_flags: 0x02,
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        syn.queue_id,
+        Some(1),
+        "SYN must select the EF forwarding-class queue"
+    );
+
+    // Pure-ACK packet -> tcp-flags term does NOT match -> interface default queue
+    // (queue 0), NOT EF.
+    let ack = resolve_cos_tx_selection(
+        &forwarding,
+        202,
+        meta(),
+        Some(&key),
+        TermMatchExtra {
+            tcp_flags: 0x10,
+            ..Default::default()
+        },
+    );
+    assert_ne!(
+        ack.queue_id,
+        Some(1),
+        "a non-SYN packet must NOT be classified into the SYN-gated EF queue (#2362 fold B)"
+    );
 }

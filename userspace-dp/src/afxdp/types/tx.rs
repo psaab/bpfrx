@@ -85,6 +85,14 @@ pub(in crate::afxdp) struct PendingForwardRequest {
     pub(in crate::afxdp) cos_queue_id: Option<u8>,
     pub(in crate::afxdp) dscp_rewrite: Option<u8>,
     pub(in crate::afxdp) cos_tx_selection_resolved: bool,
+    /// #2362 fold B: the per-packet L4 firewall-filter match inputs (tcp-flags
+    /// / is-fragment / icmp-type / icmp-code), captured from the live frame at
+    /// request-build time. The deferred TX-selection / CoS path
+    /// (resolve_pending_forward_cos_tx_selection) runs after the UMEM frame may
+    /// have been recycled, so it cannot re-read the frame — it consumes this
+    /// snapshot. Built fragment-safe (a non-first fragment zeroes the
+    /// L4-derived fields). Default for non-frame-derived requests.
+    pub(in crate::afxdp) filter_match_extra: crate::filter::TermMatchExtra,
 }
 
 pub(in crate::afxdp) struct PreparedTxRequest {
@@ -198,4 +206,3 @@ pub(in crate::afxdp) struct LocalTunnelTxPlan {
     pub(in crate::afxdp) session_entry: SyncedSessionEntry,
     pub(in crate::afxdp) reverse_session_entry: Option<SyncedSessionEntry>,
 }
-

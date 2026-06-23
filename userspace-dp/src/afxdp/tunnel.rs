@@ -362,11 +362,17 @@ pub(super) fn build_local_origin_tunnel_tx_request(
         monotonic_nanos() / 1_000_000_000,
     );
     let now_ns = monotonic_nanos();
+    // #2362 fold B: local tunnel-origin path — the inner-frame L3/L4 offsets in
+    // `meta` describe the pre-encap packet, so use the meta-only extra
+    // (tcp_flags authoritative; is-fragment / icmp-type under-match on this rare
+    // local path rather than risk mis-parsing inner offsets).
+    let cos_extra = crate::afxdp::frame::term_match_extra_from_meta(meta.into());
     let cos = resolve_cos_tx_selection_at(
         forwarding,
         decision.resolution.egress_ifindex,
         meta,
         Some(&session_entry.key),
+        cos_extra,
         now_ns,
     );
     if cos.drop {

@@ -10952,3 +10952,55 @@ top.
     userspace-dp/src/afxdp/worker/loop_body/mod.rs,
     userspace-dp/tests/fixtures/protocol_wire_v1.json,
     userspace-dp/src/filter/README.md, docs/feature-gaps.md, _Log.md
+
+- **Timestamp**: 2026-06-22 (review folds)
+  - **Action**: #2362 PR #2373 review folds A + B (hostile reviewer + Copilot).
+    FOLD A (security, #2344 class): term_match_extra_from_frame read tcp_flags /
+    icmp_type / icmp_code from meta/l4_offset for ANY packet — but a NON-FIRST
+    fragment has no L4 header there (payload bytes), so a crafted fragment whose
+    payload byte == a filter icmp-type (or payload-derived meta.tcp_flags)
+    spuriously matched, contradicting the matching.rs doc contract. Fix: gate the
+    L4-derived inputs on the EXISTING is_non_first_fragment predicate (reused, not
+    re-written) — force tcp_flags=icmp_type=icmp_code=0 for a non-first fragment
+    while KEEPING is_fragment=is_any_fragment (a non-first fragment IS a fragment;
+    is-fragment reads only the L3 header). FOLD B (CoS/TX-selection leg): the
+    tx_selection.rs v4/v6 evaluators hardcoded TermMatchExtra::default(), so
+    `from { tcp-flags syn } then forwarding-class X` reached the CoS path and
+    never matched the per-packet condition (silent under-match — the same bug on
+    the CoS leg). Fix: thread real TermMatchExtra through
+    resolve_cos_tx_selection/_at/_internal -> the tx_selection evaluators, built
+    from the live frame at forward_request.rs (transit), classify_generated_reply
+    (own bytes), neighbor_dispatch (buffered transit frame), inject (control
+    frame); meta-only extra at the no-frame paths (resolve_cos_queue_id, tunnel
+    local-origin, generated ICMP-PTB). Added PendingForwardRequest.filter_match_extra
+    so the DEFERRED dispatch recompute consumes the build-time snapshot (UMEM frame
+    may be recycled). The flow-cache decline (FOLD already shipped) keeps the
+    precomputed TX descriptor from being built for per-packet-L4 filters, so the
+    cached tx_selection path (cache_sensitive.rs Default) is unreachable for them.
+    Added two ForwardPacketMeta builders (term_match_extra_from_frame_fwd,
+    term_match_extra_from_meta) in inspect.rs. Tests: FOLD A — non-first ICMP/TCP
+    fragment suppresses icmp-type/tcp-flags but keeps is-fragment; first fragment
+    keeps L4 fields (frame/tests.rs). FOLD B — `tcp-flags syn then
+    forwarding-class ef` selects EF queue only for SYN, not pure-ACK
+    (cos_classify_tests.rs). cargo build --release clean; filter/tcp_flags/
+    fragment/icmp/tx_selection/cos suites green; new tests 5x; protocol_wire_v1.json
+    UNCHANGED (filter_match_extra is internal, not serialized). Two pre-existing
+    full-suite concurrency flakes (umem tx_latency_hist, worker_queue
+    concurrent_recovery) pass in isolation — untouched code.
+  - **File(s)**: userspace-dp/src/afxdp/frame/inspect.rs,
+    userspace-dp/src/afxdp/frame/mod.rs,
+    userspace-dp/src/afxdp/frame/tests.rs,
+    userspace-dp/src/filter/engine/tx_selection.rs,
+    userspace-dp/src/afxdp/tx/cos_classify.rs,
+    userspace-dp/src/afxdp/tx/cos_classify_tests.rs,
+    userspace-dp/src/afxdp/tx/dispatch/cos.rs,
+    userspace-dp/src/afxdp/tx/dispatch/dispatch_tests.rs,
+    userspace-dp/src/afxdp/types/tx.rs,
+    userspace-dp/src/afxdp/forward_request.rs,
+    userspace-dp/src/afxdp/neighbor_dispatch.rs,
+    userspace-dp/src/afxdp/tunnel.rs, userspace-dp/src/afxdp/icmp.rs,
+    userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+    userspace-dp/src/afxdp/coordinator/inject.rs,
+    userspace-dp/src/afxdp/forwarding_build/tests.rs,
+    userspace-dp/src/filter/tests.rs, userspace-dp/src/filter/README.md,
+    docs/feature-gaps.md, _Log.md

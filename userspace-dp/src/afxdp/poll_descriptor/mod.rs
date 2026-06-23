@@ -1260,6 +1260,13 @@ pub(super) fn poll_binding_process_descriptor(
                                             icmp_decision.resolution.egress_ifindex,
                                             meta,
                                             Some(&flow.forward_key),
+                                            // #2362 fold B: generated ICMP error
+                                            // reply — meta-only extra (tcp_flags
+                                            // authoritative; no per-packet frame
+                                            // re-read for this synthesized frame).
+                                            crate::afxdp::frame::term_match_extra_from_meta(
+                                                meta.into(),
+                                            ),
                                             now_ns,
                                         );
                                         if !cos.drop {
@@ -1288,6 +1295,11 @@ pub(super) fn poll_binding_process_descriptor(
                                                     cos_queue_id: cos.queue_id,
                                                     dscp_rewrite: cos.dscp_rewrite,
                                                     cos_tx_selection_resolved: true,
+                                                    // #2362 fold B: resolved
+                                                    // above; deferred recompute
+                                                    // not taken.
+                                                    filter_match_extra:
+                                                        crate::filter::TermMatchExtra::default(),
                                                 },
                                             );
                                             recycle_now = false;

@@ -155,6 +155,12 @@ pub(super) fn build_live_forward_request_from_frame(
                 decision.resolution.egress_ifindex,
                 meta,
                 tx_selection_flow.map(|flow| &flow.forward_key),
+                // #2362 fold B: build the fragment-safe per-packet match inputs
+                // from the live frame so a `from { tcp-flags ... } then
+                // forwarding-class X` (or is-fragment / icmp-type) output filter
+                // selects the class on exactly the authored packets on the
+                // TX-selection / CoS leg, not every packet of the flow.
+                crate::afxdp::frame::term_match_extra_from_frame(frame, meta),
                 now_ns,
             )
         });
@@ -204,5 +210,9 @@ pub(super) fn build_live_forward_request_from_frame(
         cos_queue_id: cos.queue_id,
         dscp_rewrite: cos.dscp_rewrite,
         cos_tx_selection_resolved: true,
+        // #2362 fold B: snapshot the fragment-safe per-packet match inputs so a
+        // later deferred TX-selection recompute keeps the same verdict even
+        // after the UMEM frame is recycled.
+        filter_match_extra: crate::afxdp::frame::term_match_extra_from_frame(frame, meta),
     })
 }

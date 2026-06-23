@@ -218,11 +218,17 @@ impl super::Coordinator {
                         stamp_injected_packet_tuple(&mut tx_meta, frame.len(), tuple, egress)?;
                         let now_ns = monotonic_nanos();
                         let cos_flow = parse_session_flow_from_meta(tx_meta);
+                        // #2362 fold B: classify the injected control packet on
+                        // its own stamped tuple — the frame + stamped meta give
+                        // the fragment-safe per-packet match inputs.
+                        let cos_extra =
+                            crate::afxdp::frame::term_match_extra_from_frame(&frame, tx_meta);
                         let cos = resolve_cos_tx_selection_at(
                             &self.forwarding,
                             resolution.egress_ifindex,
                             tx_meta,
                             cos_flow.as_ref().map(|flow| &flow.forward_key),
+                            cos_extra,
                             now_ns,
                         );
                         if cos.drop {

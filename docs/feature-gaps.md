@@ -391,7 +391,18 @@ matcher (`filter::engine::matching::per_packet_l4_matches`). Because none of
 these are part of the 5-tuple `SessionKey`, a filter carrying any of them is
 cache-sensitive (path (b) of the #1431 runbook): the flow-cache declines, the
 on-session decision is re-evaluated per packet, and a config rotation purges the
-affected sessions. Semantics: `tcp-flags <list>` requires ALL listed flags set
+affected sessions. This holds on BOTH the input/output forwarding-filter leg and
+the CoS / TX-selection leg (`from { tcp-flags syn; } then forwarding-class X`):
+the TX-selection evaluators thread the same per-packet inputs, so a CoS action
+gated on a per-packet condition selects the class only on the matching packets
+of a flow, not all of them (the flow-cache decline keeps the precomputed
+TX-selection descriptor from being built for such filters). Fragment safety: the
+match inputs are built fragment-safe — a NON-FIRST fragment carries no L4 header
+at the post-IP offset (its bytes are payload), so the tcp-flags / icmp-type /
+icmp-code inputs are forced to 0 for it (those terms fail closed) while the
+L3-derived `is-fragment` bit stays true; this prevents a crafted fragment whose
+payload byte equals a filter's `icmp-type` from spuriously matching (the #2344
+non-first-fragment class). Semantics: `tcp-flags <list>` requires ALL listed flags set
 (a non-TCP packet never matches); `is-fragment` matches any IP fragment (IPv4 MF
 set OR non-zero offset; IPv6 fragment header present); `icmp-type`/`icmp-code`
 match the ICMP/ICMPv6 type/code bytes (a non-ICMP packet never matches).

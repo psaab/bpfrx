@@ -220,6 +220,12 @@ pub(super) fn build_local_time_exceeded_request(
         cos_queue_id: verdict.cos_queue_id,
         dscp_rewrite: verdict.dscp_rewrite,
         cos_tx_selection_resolved: true,
+        // #2362 fold B: TX-selection already resolved above via
+        // classify_generated_reply (which read the prebuilt frame), so the
+        // deferred recompute path is never taken for this request — Default is
+        // unused. The prebuilt frame was moved into `frame`, so it cannot be
+        // re-read here regardless.
+        filter_match_extra: crate::filter::TermMatchExtra::default(),
     })
 }
 
@@ -496,14 +502,10 @@ pub(super) fn build_reject_icmp_unreachable(
     match meta.addr_family as i32 {
         // ICMPv4 Destination Unreachable, code 13 (communication
         // administratively prohibited).
-        libc::AF_INET => {
-            build_local_icmp_error_v4(frame, meta, ingress_ifindex, forwarding, 3, 13)
-        }
+        libc::AF_INET => build_local_icmp_error_v4(frame, meta, ingress_ifindex, forwarding, 3, 13),
         // ICMPv6 Destination Unreachable, code 1 (communication with
         // destination administratively prohibited).
-        libc::AF_INET6 => {
-            build_local_icmp_error_v6(frame, meta, ingress_ifindex, forwarding, 1, 1)
-        }
+        libc::AF_INET6 => build_local_icmp_error_v6(frame, meta, ingress_ifindex, forwarding, 1, 1),
         _ => None,
     }
 }
@@ -625,7 +627,11 @@ mod tests {
         let out =
             build_local_icmp_error_v4(&frame, meta, ICMP_IFINDEX, &fwd, 11, 0).expect("v4 error");
 
-        assert_eq!(&out[12..14], &[0x81, 0x00], "reflected frame must carry an 802.1Q TPID");
+        assert_eq!(
+            &out[12..14],
+            &[0x81, 0x00],
+            "reflected frame must carry an 802.1Q TPID"
+        );
         assert_eq!(
             &out[14..16],
             &[0xA0, 0x00],
@@ -648,7 +654,11 @@ mod tests {
         let out =
             build_local_icmp_error_v4(&frame, meta, ICMP_IFINDEX, &fwd, 11, 0).expect("v4 error");
         assert_eq!(&out[12..14], &[0x81, 0x00]);
-        assert_eq!(&out[14..16], &100u16.to_be_bytes(), "VID 100 preserved, PCP 0");
+        assert_eq!(
+            &out[14..16],
+            &100u16.to_be_bytes(),
+            "VID 100 preserved, PCP 0"
+        );
         assert_eq!(out[18], 0x45);
     }
 
@@ -660,7 +670,11 @@ mod tests {
         let fwd = forwarding_with_egress(0);
         let out =
             build_local_icmp_error_v4(&frame, meta, ICMP_IFINDEX, &fwd, 11, 0).expect("v4 error");
-        assert_eq!(&out[12..14], &[0x08, 0x00], "EtherType IPv4 at byte 12 (untagged)");
+        assert_eq!(
+            &out[12..14],
+            &[0x08, 0x00],
+            "EtherType IPv4 at byte 12 (untagged)"
+        );
         assert_eq!(out[14], 0x45, "IPv4 outer header starts at offset 14");
     }
 
@@ -700,7 +714,12 @@ mod tests {
         frame.extend_from_slice(&8u16.to_be_bytes()); // payload = 8 (UDP hdr)
         frame.push(17); // next header UDP
         frame.push(64); // hop limit
-        frame.extend_from_slice(&"2001:559:8585:bf01::20".parse::<Ipv6Addr>().unwrap().octets());
+        frame.extend_from_slice(
+            &"2001:559:8585:bf01::20"
+                .parse::<Ipv6Addr>()
+                .unwrap()
+                .octets(),
+        );
         frame.extend_from_slice(&dst.octets());
         let l4 = frame.len();
         frame.extend_from_slice(&49152u16.to_be_bytes());
