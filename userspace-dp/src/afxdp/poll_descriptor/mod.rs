@@ -3332,12 +3332,36 @@ pub(super) fn poll_binding_process_descriptor(
                                             .fetch_add(1, Ordering::Relaxed);
                                     }
                                     PendingNeighAdmission::Buffer => {
+                                        // #2357: when this buffered packet is
+                                        // later flushed by retry_pending_neigh,
+                                        // its stored flow_key drives
+                                        // resolve_cos_tx_selection_at (egress
+                                        // queue / DSCP / output-filter). A
+                                        // non-first IP fragment carries no L4
+                                        // header, so refuse to synthesize a
+                                        // ported tuple from metadata for it —
+                                        // store `None` so the flush selects the
+                                        // interface default queue with no
+                                        // port-filter eval. `flow` is already
+                                        // `None` for a fragment (#2344); the
+                                        // gate only suppresses the meta
+                                        // fallback, leaving legitimate flowless
+                                        // TCP/UDP packets (real L4 header) their
+                                        // meta-derived ports. `raw_frame` is the
+                                        // UMEM slice for `desc`; this branch is
+                                        // only reached when
+                                        // `owned_packet_frame.is_none()`, so it
+                                        // describes the packet `meta` refers to.
                                         let pending_flow_key = flow
                                             .as_ref()
                                             .map(|flow| flow.forward_key.clone())
                                             .or_else(|| {
-                                                parse_session_flow_from_meta(meta)
-                                                    .map(|flow| flow.forward_key)
+                                                if frame_is_non_first_fragment(raw_frame, meta) {
+                                                    None
+                                                } else {
+                                                    parse_session_flow_from_meta(meta)
+                                                        .map(|flow| flow.forward_key)
+                                                }
                                             });
                                         binding.pending_neigh.insert(
                                             pending_key,

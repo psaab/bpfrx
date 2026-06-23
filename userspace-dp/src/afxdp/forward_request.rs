@@ -81,17 +81,33 @@ pub(super) fn build_live_forward_request_from_frame(
     } else {
         resolve_tx_binding_ifindex(forwarding, decision.resolution.egress_ifindex)
     };
+    // #2357: a forwarded non-first IP fragment carries no L4 header — its
+    // post-IP-header bytes are payload, not ports. #2344 already made it
+    // flowless on the policy/session path (`flow` is `None` here), but the
+    // TX-CoS / fabric-queue selection below re-derives a ported tuple from
+    // metadata/frame independently of that gate. Compute the non-first-
+    // fragment predicate ONCE and suppress port synthesis for it so all
+    // fragments of one datagram land on the interface default queue / a
+    // fragment-stable (port-less) fabric hash and never hit a port-matching
+    // output-filter term. The gate fires ONLY for an actual non-first
+    // fragment with no real flow — a legitimate flowless TCP/UDP packet
+    // (real L4 header, `flow` None) keeps its meta/frame-derived ports.
+    let non_first_fragment = flow.is_none() && frame_is_non_first_fragment(frame, meta);
     // Prefer session flow ports (set by conntrack, immune to DMA races),
     // then live frame ports (lazy — only parsed if session ports unavailable),
     // then metadata as last resort.
-    let expected_ports = hints
-        .expected_ports
-        .or_else(|| authoritative_forward_ports(frame, meta, flow));
+    let expected_ports = if non_first_fragment {
+        None
+    } else {
+        hints
+            .expected_ports
+            .or_else(|| authoritative_forward_ports(frame, meta, flow))
+    };
     let target_binding_index = hints.target_binding_index.or_else(|| {
         if decision.resolution.disposition == ForwardingDisposition::FabricRedirect {
             binding_lookup.fabric_target_index(
                 target_ifindex,
-                fabric_queue_hash(flow, expected_ports, meta),
+                fabric_queue_hash(flow, expected_ports, meta, non_first_fragment),
             )
         } else {
             binding_lookup.target_index(
@@ -114,6 +130,14 @@ pub(super) fn build_live_forward_request_from_frame(
     let fallback_flow;
     let tx_selection_flow = if flow.is_some() {
         flow
+    } else if non_first_fragment {
+        // #2357: do NOT synthesize a ported tuple from metadata for a
+        // non-first fragment. A `None` flow_key drives
+        // `resolve_cos_tx_selection_at` to the interface default queue with
+        // NO output-filter (port) evaluation (tx/cos_classify.rs early
+        // `None` arm) — so a fragment is never misclassified by, or
+        // spuriously dropped by, a port-matching terminal filter term.
+        None
     } else {
         fallback_flow = parse_session_flow_from_meta(meta);
         fallback_flow.as_ref()

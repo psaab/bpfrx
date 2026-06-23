@@ -58,8 +58,9 @@ pub(in crate::afxdp) use inspect::{
     is_non_first_fragment, l2_dst_is_group_or_broadcast, parse_session_flow, try_parse_metadata,
 };
 pub(super) use inspect::{
-    MAX_IPV6_EXT_HEADERS, frame_l3_offset, frame_l4_offset, live_frame_ports, live_frame_ports_bytes,
-    live_frame_ports_from_meta_bytes, metadata_tuple_complete, packet_rel_l4_offset,
+    MAX_IPV6_EXT_HEADERS, frame_is_non_first_fragment, frame_l3_offset, frame_l4_offset,
+    live_frame_ports, live_frame_ports_bytes, live_frame_ports_from_meta_bytes,
+    metadata_tuple_complete, packet_rel_l4_offset,
     packet_rel_l4_offset_and_protocol, parse_flow_ports, parse_ipv4_session_flow_from_frame,
     parse_packet_destination_from_frame, parse_session_flow_from_bytes,
     parse_session_flow_from_frame, parse_session_flow_from_meta,

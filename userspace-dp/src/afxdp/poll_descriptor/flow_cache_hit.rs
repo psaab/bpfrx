@@ -209,7 +209,10 @@ pub(super) fn stage_flow_cache_hit(
                 if cached_decision.resolution.disposition == ForwardingDisposition::FabricRedirect {
                     worker_ctx.binding_lookup.fabric_target_index(
                         target_ifindex,
-                        fabric_queue_hash(Some(flow), expected_ports, meta),
+                        // #2357: a flow-cache hit is a real established
+                        // session (never a flowless fragment), so the
+                        // non-first-fragment gate is `false` here.
+                        fabric_queue_hash(Some(flow), expected_ports, meta, false),
                     )
                 } else {
                     worker_ctx.binding_lookup.target_index(
