@@ -1,5 +1,77 @@
 # Action Log
 
+## 2026-06-23 — #2394 PR #2415 Copilot fold: DNAT bare-host source + all-malformed fail-closed
+
+- **Timestamp**: 2026-06-23 PDT
+- **Action**: Closed two residual fail-open holes in the #2394 DNAT
+  source-address parse (Copilot caught; verified live). (1) BARE-HOST
+  SOURCE: the Go compiler carries `match source-address` verbatim with no
+  CIDR normalization (`compiler_nat.go` `child.Name()`/`m.Keys[1:]`), so a
+  bare host IP (`198.51.100.42`, no `/prefix`) reaches the wire. The first
+  cut parsed only via `IpNet::from_str`, which REQUIRES `addr/prefix` and
+  rejects a bare IP — so a bare-host source-scoped DNAT skipped its only
+  entry, left the prefix lists empty, and matched ANY source (the #2394
+  fail-open reintroduced for bare IPs — LIVE). Fix: fall back to a bare
+  `IpAddr` -> /32 (v4) or /128 (v6) in the `nat/destination.rs` parse loop.
+  (2) ALL-MALFORMED: added `DnatEntry.source_constrained` (true when the
+  snapshot source list is non-empty, independent of parse success) so
+  `source_matches` distinguishes unscoped (-> match any) from scoped-but-
+  zero-entries-parsed (-> match NOTHING, fail closed) instead of reverting
+  to match-any. Dedup key extended with `source_constrained` so an unscoped
+  rule never collapses onto a fully-malformed scoped rule. Corrected the now-
+  accurate doc comments (protocol/nat.rs, protocol.go) that wrongly claimed
+  `IpNet` parses a bare IP as /32//128. No new wire field —
+  `source_constrained` is derived at decode from `source_addresses` non-
+  empty; `protocol_wire_v1.json` UNCHANGED. This is the DNAT sibling of the
+  #2398 SNAT robustness. Fail-on-revert tests:
+  `dnat_source_scoped_bare_host_ip_v4/v6_matches_only_that_host` (FAIL if the
+  bare-IP fallback is removed — verified) and
+  `dnat_source_scoped_all_malformed_fails_closed` (FAIL if it reverts to
+  match-any — verified) + `dnat_source_scoped_mixed_valid_and_malformed_keeps_valid`.
+  Verified the Go compiler DOES emit bare IPs (hole (b) was live). go
+  build/test + cargo build --release + cargo test green (the unrelated
+  `concurrent_recovery_*` worker-queue test is a pre-existing parallel flake
+  — passes in isolation); new tests 5x stable.
+- **File(s)**: userspace-dp/src/nat/destination.rs,
+  userspace-dp/src/nat/tests.rs, userspace-dp/src/protocol/nat.rs,
+  pkg/dataplane/userspace/protocol.go, userspace-dp/src/FEATURES.md,
+  docs/userspace-dnat-plan.md, _Log.md
+
+## 2026-06-23 — #2394 DNAT source-address constraint enforced end-to-end (fail-open fix)
+
+- **Timestamp**: 2026-06-23 PDT
+- **Action**: Fixed a HIGH fail-open: a destination-NAT rule scoped to
+  `match source-address` lost its source constraint at the Go->Rust
+  snapshot boundary, so the DNAT became destination-only and fired for
+  ANY source (publishing the internal service to sources the operator
+  scoped out). Root cause: `DestinationNATRuleSnapshot` had no source
+  field, `buildDestinationNATSnapshots` (nat.go) never emitted one, and
+  the Rust `DnatTable` filtered only by ingress zone. Fix carries the
+  constraint end to end: added `SourceAddresses`/`source_addresses` wire
+  field on BOTH Go and Rust sides (serde default, omitempty; old binaries
+  ignore it; empty = match any so unscoped DNAT is unchanged), populated
+  it in the Go builder (bracket-list + singular fallback, mirroring SNAT),
+  added `source_v4`/`source_v6` prefixes + `source_matches()` to the Rust
+  `DnatEntry`, threaded `src_ip` through `lookup`/`lookup_with_counter` and
+  the session-miss caller (poll_descriptor passes
+  `flow.forward_key.src_ip`), and keyed the per-key dedup on
+  `(from_zone, source_v4, source_v6)` so two source-scoped rules on the
+  same destination both survive. Regenerated protocol_wire_v1.json.
+  Fail-on-revert tests: Rust dnat_source_scoped_matches_only_configured_
+  source_{v4,v6} + dnat_two_source_scoped_rules_same_dest_each_fire_for_own_
+  source (all FAIL when source matching is bypassed — verified) +
+  dnat_unscoped_matches_any_source (anti-over-restrict); Go
+  TestBuildDestinationNATSnapshotsCarriesSourceAddress. go build/test +
+  cargo build --release + cargo test green; new tests 5x stable.
+- **File(s)**: pkg/dataplane/userspace/protocol.go,
+  pkg/dataplane/userspace/nat.go,
+  pkg/dataplane/userspace/nat_per_uplink_test.go,
+  userspace-dp/src/protocol/nat.rs, userspace-dp/src/nat/destination.rs,
+  userspace-dp/src/nat/tests.rs, userspace-dp/src/afxdp/tests.rs,
+  userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+  userspace-dp/tests/fixtures/protocol_wire_v1.json,
+  userspace-dp/src/FEATURES.md, docs/userspace-dnat-plan.md, _Log.md
+
 ## 2026-06-23 — #2381 PR #2413 doc-accuracy folds (cap arithmetic + bound)
 
 - **Timestamp**: 2026-06-23 PDT

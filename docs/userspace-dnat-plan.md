@@ -294,3 +294,57 @@ Initial implementation: use the existing per-binding `dnat_packets` counter (alr
 5. **Backward compatibility**: New `destination_nat_rules` JSON field defaults to empty array. Old binaries ignore it (serde `default`).
 
 6. **Checksum ordering**: Port rewriting must happen AFTER IP rewriting. Both are independent incremental updates to the L4 checksum.
+
+## 10. Source-address constraint (#2394)
+
+Junos DNAT `match source-address` restricts which source IPs the destination
+translation applies to. The original DNAT implementation parsed the constraint
+into the typed rule but dropped it at the Go->Rust snapshot boundary, so the
+helper installed a destination-only entry that DNAT'd traffic from ANY source —
+a fail-open that published the internal service to sources the operator scoped
+out.
+
+#2394 carries the constraint end to end:
+
+- `DestinationNATRuleSnapshot.SourceAddresses` (Go, `protocol.go`) /
+  `source_addresses` (Rust, `protocol/nat.rs`) — a new wire field
+  (`json:"source_addresses,omitempty"`, serde `default`). Old binaries ignore
+  it; an absent/empty list means "match any source" so unscoped DNAT is
+  unchanged. The default-specimen wire fixture (`protocol_wire_v1.json`) was
+  regenerated.
+- `buildDestinationNATSnapshots` (`nat.go`) populates the field from
+  `rule.Match.SourceAddresses` with a singular `SourceAddress` fallback,
+  mirroring the SNAT builder.
+- `DnatEntry.{source_constrained, source_v4, source_v6}`
+  (`nat/destination.rs`) hold whether the rule was scoped and the parsed
+  prefixes. `DnatEntry::source_matches(src_ip)` returns: unscoped
+  (`source_constrained == false`) -> match any; scoped but all entries
+  unparseable (both prefix vecs empty) -> match NOTHING (fail closed); else
+  the packet source must fall in a parsed prefix of its own family. The lookup
+  takes `src_ip` and filters on both zone and source. The per-key dedup keys on
+  `(from_zone, source_constrained, source_v4, source_v6)` so two distinct
+  source-scoped rules on the same destination both survive (and an unscoped
+  rule never collapses onto a fully-malformed scoped rule).
+- The session-miss caller (`afxdp/poll_descriptor/mod.rs`) passes
+  `flow.forward_key.src_ip`.
+
+### Bare-host source + all-malformed (Copilot fold)
+
+Junos carries `match source-address` verbatim and the Go compiler does NOT
+normalize it, so a bare host (`set ... match source-address 198.51.100.42`,
+no `/prefix`) reaches the wire without a mask. `IpNet::from_str` REQUIRES
+`addr/prefix` form and rejects a bare IP. The first cut skipped any entry that
+failed `IpNet` parse, so a bare-host source-scoped DNAT left its prefix lists
+empty and matched ANY source — the #2394 fail-open reintroduced for bare IPs.
+
+Two robustness fixes (the DNAT sibling of #2398 SNAT):
+
+1. **Bare-IP fallback** — each source entry is parsed as `IpNet`; on failure it
+   falls back to a bare `IpAddr` -> /32 (v4) or /128 (v6). So `198.51.100.42`
+   matches only that host and the doc claim ("a bare host parses as /32/128")
+   is now true.
+2. **All-malformed -> fail-closed** — `source_constrained` (set when the
+   snapshot source list is non-empty) distinguishes "unscoped rule -> match
+   any" from "scoped rule, zero entries parsed -> match none". A scoped rule
+   whose entries all fail to parse matches nothing rather than reverting to
+   match-any. A mix of valid + garbage entries keeps the valid prefixes.

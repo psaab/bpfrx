@@ -403,13 +403,27 @@ type StaticNATRuleSnapshot struct {
 // userspace dataplane. Each snapshot is one (protocol, destination IP, destination port)
 // tuple. The Go builder handles multi-port and protocol expansion.
 type DestinationNATRuleSnapshot struct {
-	Name               string `json:"name"`
-	FromZone           string `json:"from_zone,omitempty"`
-	DestinationAddress string `json:"destination_address"`
-	DestinationPort    uint16 `json:"destination_port,omitempty"`
-	Protocol           string `json:"protocol,omitempty"` // "tcp", "udp", or ""
-	PoolAddress        string `json:"pool_address"`
-	PoolPort           uint16 `json:"pool_port,omitempty"`
+	Name     string `json:"name"`
+	FromZone string `json:"from_zone,omitempty"`
+	// SourceAddresses carries the DNAT rule's `match source-address`
+	// constraint (#2394). Junos DNAT `source-address` restricts which source
+	// IPs the destination translation applies to; before #2394 the constraint
+	// was parsed but DROPPED at this snapshot boundary, so the dataplane
+	// installed a destination-only entry that DNAT'd traffic from ANY source
+	// (a fail-open security broadening). Each entry is either a CIDR prefix
+	// (e.g. 198.51.100.0/24) or a bare host IP (e.g. 198.51.100.42); the
+	// compiler carries the configured value verbatim (no CIDR normalization).
+	// The Rust DNAT parser tries IpNet first and falls back to a bare IP -> /32
+	// or /128, since IpNet rejects a bare IP. An empty slice means "match any
+	// source" (unscoped DNAT, unchanged behavior); a non-empty slice whose
+	// entries all fail to parse fails CLOSED (matches no source) on the Rust
+	// side rather than reverting to match-any.
+	SourceAddresses    []string `json:"source_addresses,omitempty"`
+	DestinationAddress string   `json:"destination_address"`
+	DestinationPort    uint16   `json:"destination_port,omitempty"`
+	Protocol           string   `json:"protocol,omitempty"` // "tcp", "udp", or ""
+	PoolAddress        string   `json:"pool_address"`
+	PoolPort           uint16   `json:"pool_port,omitempty"`
 	// CounterID is the compiler-assigned per-rule translation hit counter ID
 	// (stable key-derived hash, non-zero; 0 means "no counter"). All expanded
 	// (protocol, port) tuples of the same DNAT rule share one counter ID so

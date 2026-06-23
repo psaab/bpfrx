@@ -72,6 +72,19 @@ pub(crate) struct DestinationNATRuleSnapshot {
     pub counter_id: u32,
     #[serde(rename = "from_zone", default)]
     pub from_zone: String,
+    /// #2394: the DNAT rule's `match source-address` constraint. Junos DNAT
+    /// `source-address` restricts which source IPs the destination translation
+    /// applies to; before #2394 the Go snapshot dropped it, so the helper built
+    /// a destination-only entry that DNAT'd traffic from ANY source (fail-open).
+    /// Each entry is either a CIDR prefix (`198.51.100.0/24`) or a bare host IP
+    /// (`198.51.100.42`); the Go compiler carries the value verbatim. The DNAT
+    /// table parser (`nat/destination.rs`) tries `IpNet` first and falls back to
+    /// a bare `IpAddr` -> /32 or /128, since `IpNet::from_str` rejects a bare IP.
+    /// An empty vec = unscoped DNAT (match any source, unchanged behavior). A
+    /// non-empty list whose entries ALL fail to parse fails CLOSED (matches no
+    /// source) rather than reverting to match-any.
+    #[serde(rename = "source_addresses", default)]
+    pub source_addresses: Vec<String>,
     #[serde(rename = "destination_address", default)]
     pub destination_address: String,
     #[serde(rename = "destination_port", default)]

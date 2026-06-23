@@ -1057,6 +1057,7 @@ fn post_dnat_source_nat_matches_translated_destination() {
         counter_id: 0,
         name: "web-dnat".to_string(),
         from_zone: "wan".to_string(),
+        source_addresses: vec![],
         destination_address: "172.16.80.8".to_string(),
         destination_port: 443,
         protocol: "tcp".to_string(),
@@ -1096,7 +1097,7 @@ fn post_dnat_source_nat_matches_translated_destination() {
     };
     let dnat = state
         .dnat_table
-        .lookup(PROTO_TCP, flow.dst_ip, 443, "wan")
+        .lookup(PROTO_TCP, flow.src_ip, flow.dst_ip, 443, "wan")
         .expect("dnat");
     assert_eq!(
         dnat.rewrite_dst,
@@ -8031,6 +8032,7 @@ fn inbound_dnat_snapshot(policy: PolicyRuleSnapshot) -> ConfigSnapshot {
         counter_id: 0,
         name: "web-dnat".to_string(),
         from_zone: "wan".to_string(),
+        source_addresses: vec![],
         destination_address: "172.16.80.8".to_string(),
         destination_port: 443,
         protocol: "tcp".to_string(),
