@@ -154,10 +154,10 @@ exactly one of these two classes:
 | `destination_ports` | yes (TCP/UDP); ICMP-zero | `dst_port` is 0 for ICMP |
 | `dscp_values` / `dscp_bitmap` (+ `dscp_match_enabled`) | NO — cache-sensitive | see #1430 pattern below |
 | (future) `tos_match` / ECN bits (non-DSCP TOS) | NO — cache-sensitive | TOS lower bits and ECN vary per packet |
-| (future) `tcp_flags_match` | NO — cache-sensitive | TCP flags vary per packet |
-| (future) `is_fragment` / fragment offset / MF | NO — cache-sensitive | only first fragment carries L4 |
+| `tcp_flags_mask` (#2362) | NO — cache-sensitive | required-bits mask over the TCP flags byte; TCP flags vary per packet. Threaded via `TermMatchExtra` (path (b)) |
+| `is_fragment` (#2362) | NO — cache-sensitive | Junos `is-fragment`: matches ANY fragment (IPv4 MF set OR offset != 0; IPv6 fragment header present). Computed by `is_any_fragment` |
 | (future) `ihl_match` / IP options | NO — cache-sensitive | IHL varies per packet |
-| (future) `icmp_type_match` / `icmp_code_match` | NO — cache-sensitive (today) | could be promoted to cache-key by adding (type, code) to `SessionKey` for ICMP |
+| `icmp_type` / `icmp_code` (#2362) | NO — cache-sensitive | exact match on the ICMP/ICMPv6 type/code byte; non-ICMP packets never match. Could later be promoted to cache-key by adding (type, code) to `SessionKey` |
 | (future) `flex_match` | NO — cache-sensitive | byte-offset match, fully per-packet |
 
 Fields like `action`, `count`, `log`, `policer`, `routing_instance`,

@@ -379,6 +379,29 @@ the commit-check gate INLINE-mirrors the `appid.ProtocolNumber` acceptance set
 (it cannot import `appid` — an import cycle); a `pkg/appid` drift-guard test
 pins the two together so the duplicated table cannot diverge silently.
 
+The per-packet L4 match conditions — `tcp-flags`, `is-fragment`, `icmp-type`,
+`icmp-code` — are wired end-to-end to the userspace dataplane (#2362). Earlier
+they were parsed into `config.FirewallFilterTerm` and counted in this list but
+silently DROPPED on the snapshot wire, so a term like `from { tcp-flags syn; }
+then discard` matched broader than authored (discard-all-TCP). They are now
+serialized as explicit `FirewallTermSnapshot` wire fields
+(`tcp_flags`/`is_fragment`/`icmp_type`/`icmp_code`, mirrored in
+`userspace-dp/src/protocol/security.rs`) and evaluated per packet by the Rust
+matcher (`filter::engine::matching::per_packet_l4_matches`). Because none of
+these are part of the 5-tuple `SessionKey`, a filter carrying any of them is
+cache-sensitive (path (b) of the #1431 runbook): the flow-cache declines, the
+on-session decision is re-evaluated per packet, and a config rotation purges the
+affected sessions. Semantics: `tcp-flags <list>` requires ALL listed flags set
+(a non-TCP packet never matches); `is-fragment` matches any IP fragment (IPv4 MF
+set OR non-zero offset; IPv6 fragment header present); `icmp-type`/`icmp-code`
+match the ICMP/ICMPv6 type/code bytes (a non-ICMP packet never matches).
+Limitation: the parser produces a flat flag-name list, so the richer Junos
+`tcp-flags "(syn & !ack)"` expression grammar (negation/disjunction/aliases like
+`tcp-established`) is not representable — only a conjunction of named flags is
+supported; an unrecognized token yields no constraint rather than a match-all.
+Named `icmp-type`/`icmp-code` aliases (e.g. `echo-request`) are likewise not
+parsed — numeric values only.
+
 | Feature | Junos Config Path | Description | Priority | Status |
 |---------|-------------------|-------------|----------|--------|
 | **Policer (Rate Limiting)** | `firewall policer ... bandwidth-limit N burst-size-limit N` | Token-bucket rate limiter applied to filter terms or interfaces. Single-rate two-color, three-color policers. | High | Partial for #1373: legacy eBPF/~~DPDK~~ (DPDK retired #1525) token-bucket policer support existed; userspace supports the admitted filter path and the color-blind `then discard` three-color slice. #1375 is closed; unsupported color-aware/non-drop behavior and broader Junos parity remain production/future parity work, not active #1373 source-removal blockers. |

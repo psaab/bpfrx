@@ -10897,3 +10897,58 @@ top.
     userspace-dp/src/afxdp/poll_descriptor/mod.rs,
     userspace-dp/src/afxdp/tests.rs, docs/feature-gaps.md,
     docs/cos-validation-notes.md, _Log.md
+
+- **Timestamp**: 2026-06-22
+  - **Action**: #2362 — wire the 4 dropped firewall-filter per-packet L4 match
+    terms (tcp-flags / is-fragment / icmp-type / icmp-code) end-to-end to the
+    userspace dataplane. ALL FOUR were parsed by the Go compiler into
+    config.FirewallFilterTerm and claimed in feature-gaps.md, but DROPPED on the
+    Go->Rust snapshot wire and absent from the Rust matcher, so a term like
+    `from { tcp-flags syn; } then discard` silently matched ALL TCP (broader than
+    authored — security-relevant). Fix: added explicit wire fields
+    (tcp_flags:Option<u8> required-bits mask, is_fragment:bool, icmp_type/code:
+    Option<u8>) to FirewallTermSnapshot on BOTH sides with matching serde tags;
+    Go filters.go folds the parsed flag-name list to a mask (tcpFlagsMask) and
+    serializes the rest; Rust runtime FilterTerm carries the 4 fields, evaluated
+    per packet in engine::matching::per_packet_l4_matches (non-TCP never matches
+    tcp-flags; non-ICMP never matches icmp-type/code; is-fragment uses the new
+    is_any_fragment predicate = IPv4 MF|offset, IPv6 frag header). Threaded a
+    Copy TermMatchExtra (built once per packet at the cold filter-eval call sites
+    from frame+meta) through eval.rs/matching.rs; cached/tx-selection paths pass
+    Default (unreachable for these filters due to the cache decline). Cache-
+    sensitivity (path b, #1431): new has_per_packet_l4_match_terms aggregate +
+    iface_filter_v{4,6}_has_per_packet_l4_match sets + flow-cache decline gate
+    (flow_cache.rs) + on-session re-eval gate + config-rotation purge (folded
+    into the existing dscp purge). Regenerated protocol_wire_v1.json. Tests:
+    Go snapshot+mask-helper (filters_per_packet_match_2362_test.go); Rust match-
+    eval per term (v4+v6, match/no-match/wrong-proto), count side-effect, cache-
+    sensitive flag, wire round-trip, flow-cache decline (input+output), and
+    is_any_fragment truth tables. go build+test green; cargo build --release +
+    full test suite (2468) green; new tests 5x stable. Docs: filter/README.md
+    (future->implemented rows), feature-gaps.md (#2362 wiring + grammar limits).
+    Limitation noted: parser yields a flat flag list, so the richer
+    `(syn & !ack)` expression grammar and named icmp-type aliases are out of
+    scope (parser limitation, not dataplane).
+  - **File(s)**: pkg/dataplane/userspace/protocol.go,
+    pkg/dataplane/userspace/filters.go,
+    pkg/dataplane/userspace/filters_per_packet_match_2362_test.go,
+    userspace-dp/src/protocol/security.rs, userspace-dp/src/filter/mod.rs,
+    userspace-dp/src/filter/compiler.rs,
+    userspace-dp/src/filter/engine/mod.rs,
+    userspace-dp/src/filter/engine/matching.rs,
+    userspace-dp/src/filter/engine/eval.rs,
+    userspace-dp/src/filter/engine/cache_sensitive.rs,
+    userspace-dp/src/filter/engine/tx_selection.rs,
+    userspace-dp/src/filter/tests.rs,
+    userspace-dp/src/afxdp/frame/inspect.rs,
+    userspace-dp/src/afxdp/frame/mod.rs,
+    userspace-dp/src/afxdp/frame/tests.rs,
+    userspace-dp/src/afxdp/flow_cache.rs,
+    userspace-dp/src/afxdp/flow_cache_tests.rs,
+    userspace-dp/src/afxdp/poll_descriptor/filter.rs,
+    userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+    userspace-dp/src/afxdp/forwarding/mod.rs,
+    userspace-dp/src/afxdp/session_glue/tests.rs,
+    userspace-dp/src/afxdp/worker/loop_body/mod.rs,
+    userspace-dp/tests/fixtures/protocol_wire_v1.json,
+    userspace-dp/src/filter/README.md, docs/feature-gaps.md, _Log.md
