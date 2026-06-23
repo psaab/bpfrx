@@ -1225,6 +1225,12 @@ func (c *xpfCollector) emitUserspaceEventStream(ch chan<- prometheus.Metric, sta
 		prometheus.CounterValue, float64(status.EventStreamSent), "sent")
 	ch <- prometheus.MustNewConstMetric(c.userspaceEventStreamProducerFramesTotal,
 		prometheus.CounterValue, float64(status.EventStreamDropped), "dropped")
+	// #2381: I/O cycles in which the helper hit the write-backlog cap and
+	// stopped draining the bounded channel (stalled daemon reader). Surfaced
+	// under the producer metric with a distinct "write_stalled" label so a
+	// wedged consumer is observable instead of silently OOMing the helper.
+	ch <- prometheus.MustNewConstMetric(c.userspaceEventStreamProducerFramesTotal,
+		prometheus.CounterValue, float64(status.EventStreamWriteStalls), "write_stalled")
 	ch <- prometheus.MustNewConstMetric(c.userspaceEventStreamDecodeErrorsTotal,
 		prometheus.CounterValue, float64(es.DecodeErrors))
 	ch <- prometheus.MustNewConstMetric(c.userspaceEventStreamSequenceGapsTotal,

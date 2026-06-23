@@ -538,11 +538,30 @@ SessionClose payload is minimal:
 **Ack**: Daemon sends Ack frames with the highest consumed sequence number.
 Helper can discard events up to that sequence from its replay buffer.
 
-**Backpressure**: Helper uses non-blocking writes. If the socket buffer is
-full, events are buffered in a bounded ring (reuse existing
-`MAX_PENDING_SESSION_DELTAS` = 4096 per binding). If the ring overflows,
-oldest events are dropped and a counter incremented. Daemon detects gaps via
-sequence numbers and can request a full reconciliation.
+**Backpressure**: Helper uses non-blocking writes. Workers enqueue events with
+a non-blocking `try_send` into a bounded mpsc channel (`CHANNEL_CAPACITY` =
+8192); a full channel drops the newest event and increments
+`event_stream_dropped` (per-kind RT_FLOW telemetry also bumps its `queue_full`
+counter). The I/O thread drains the channel into a pending socket-write
+backlog (`write_buf`) and writes non-blocking; on `WouldBlock` it keeps the
+remainder for the next cycle. Daemon detects gaps via sequence numbers and can
+request a full reconciliation.
+
+The bounded channel is the ONLY backpressure surface. The write backlog is
+hard-capped at `WRITE_BACKLOG_MAX_BYTES` (16 MiB, `drain_channel_into_write_buf`
+in `event_stream/mod.rs`, #2381): a wedged daemon that keeps the socket open
+but stops reading (writes perpetually `WouldBlock`) would otherwise let the
+I/O thread migrate the whole channel into the heap-backed `write_buf` every
+cycle while the channel refills from `try_send`, growing `write_buf` without
+bound → helper OOM / allocator pressure on the **forwarding plane**. Once the
+backlog hits the cap the drain halts, leaving frames in the bounded channel so
+producers shed (newest-first, counted) there instead; each capped pass
+increments `event_stream_write_stalls`
+(`xpf_userspace_event_stream_producer_frames_total{result="write_stalled"}`).
+Oldest queued + replay frames are preserved so RT_FLOW stays current. **Core
+invariant: the data plane never stalls because a telemetry consumer is slow —
+a stuck consumer degrades telemetry (bounded, counted loss + a stall
+counter + eventual keepalive-driven reconnect/FullResync), never forwarding.**
 
 **Pause/Resume**: Daemon sends Pause to stop event emission (used during
 demotion prep). Helper buffers events during pause. Daemon sends Resume to

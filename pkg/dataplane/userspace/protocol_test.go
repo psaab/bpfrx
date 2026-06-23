@@ -1390,7 +1390,8 @@ func TestProcessStatusEventStreamFieldsParity1642(t *testing.T) {
 		"event_stream_seq": 4242,
 		"event_stream_acked": 4200,
 		"event_stream_sent": 5000,
-		"event_stream_dropped": 3
+		"event_stream_dropped": 3,
+		"event_stream_write_stalls": 17
 	}`
 	var got ProcessStatus
 	if err := json.Unmarshal([]byte(rustJSON), &got); err != nil {
@@ -1408,6 +1409,11 @@ func TestProcessStatusEventStreamFieldsParity1642(t *testing.T) {
 	// Sanity: the previously-matching fields still decode.
 	if got.EventStreamSent != 5000 || got.EventStreamDropped != 3 {
 		t.Errorf("event_stream_sent/dropped regressed: sent=%d dropped=%d", got.EventStreamSent, got.EventStreamDropped)
+	}
+	// #2381: the stalled-consumer backlog counter must decode under its exact
+	// wire key so a wedged daemon reader is observable in status/metrics.
+	if got.EventStreamWriteStalls != 17 {
+		t.Errorf("event_stream_write_stalls dropped: got %d, want 17", got.EventStreamWriteStalls)
 	}
 
 	raw, _ := json.Marshal(&ProcessStatus{EventStreamConnected: true, EventStreamSeq: 1, EventStreamAcked: 1})

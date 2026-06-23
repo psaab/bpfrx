@@ -730,6 +730,14 @@ type ProcessStatus struct {
 	EventStreamConnected bool                      `json:"event_stream_connected,omitempty"`
 	EventStreamSeq       uint64                    `json:"event_stream_seq,omitempty"`
 	EventStreamAcked     uint64                    `json:"event_stream_acked,omitempty"`
+	// EventStreamWriteStalls counts I/O cycles in which the helper's
+	// event-stream socket-write backlog hit its cap and the helper stopped
+	// draining the bounded channel because the daemon reader was wedged
+	// (#2381). A growing value means dataplane telemetry is being shed at the
+	// bounded channel (counted via EventStreamDropped) because this consumer
+	// is not draining the socket; the forwarding plane is unaffected. JSON tag
+	// MUST match the Rust serde rename(...) exactly.
+	EventStreamWriteStalls uint64 `json:"event_stream_write_stalls,omitempty"`
 	CoSInterfaces        []CoSInterfaceStatus      `json:"cos_interfaces,omitempty"`
 	PolicyRuleCounters   []PolicyRuleCounterStatus `json:"policy_rule_counters,omitempty"`
 	// NATRuleCounters carries the userspace dataplane's per-rule SNAT/DNAT/
