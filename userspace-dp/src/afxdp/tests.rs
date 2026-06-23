@@ -1127,13 +1127,19 @@ fn post_dnat_source_nat_matches_translated_destination() {
 
 #[test]
 fn is_icmp_error_identifies_v4_types() {
-    // ICMPv4 error types
+    // ICMPv4 error types that quote the offending datagram (RFC 792).
     assert!(is_icmp_error(PROTO_ICMP, 3)); // Destination Unreachable
+    // #2393: Source Quench (4) and Redirect (5) also quote an inner IP
+    // header + 8 bytes at l4+8 and must have their embedded inner
+    // translated on NAT44 transit, matching the reject/netfilter set.
+    assert!(is_icmp_error(PROTO_ICMP, 4)); // Source Quench (deprecated, RFC 6633)
+    assert!(is_icmp_error(PROTO_ICMP, 5)); // Redirect
     assert!(is_icmp_error(PROTO_ICMP, 11)); // Time Exceeded
     assert!(is_icmp_error(PROTO_ICMP, 12)); // Parameter Problem
-    // Non-error types
+    // Non-error (query) types
     assert!(!is_icmp_error(PROTO_ICMP, 0)); // Echo Reply
     assert!(!is_icmp_error(PROTO_ICMP, 8)); // Echo Request
+    assert!(!is_icmp_error(PROTO_ICMP, 13)); // Timestamp Request
 }
 
 #[test]
@@ -3716,6 +3722,166 @@ fn embedded_icmp_nat_match_uses_shared_nat_session_for_ipv4() {
     assert_eq!(
         icmp_match.resolution.neighbor_mac,
         Some([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff])
+    );
+}
+
+/// Rewrite the outer ICMPv4 type byte (frame[l4_offset]) to `new_type`
+/// and recompute the outer ICMP checksum, leaving the 8-byte ICMP header
+/// length unchanged. ICMPv4 Redirect (5) and Source Quench (4) share the
+/// 3/11/12 header layout — the type-specific word (Redirect's gateway
+/// address) occupies bytes 4..8 where Time Exceeded carries its unused
+/// word — so an existing type-11 frame becomes a valid type-5/4 frame by
+/// flipping the type byte and refreshing the checksum.
+fn rewrite_outer_icmpv4_type(frame: &mut [u8], l4_offset: usize, new_type: u8) {
+    frame[l4_offset] = new_type;
+    frame[l4_offset + 2] = 0;
+    frame[l4_offset + 3] = 0;
+    let csum = checksum16(&frame[l4_offset..]);
+    frame[l4_offset + 2..l4_offset + 4].copy_from_slice(&csum.to_be_bytes());
+}
+
+/// #2393: a NAT44-transit ICMPv4 Redirect (type 5) — like Time Exceeded
+/// (11) / Dest Unreachable (3) — quotes the offending datagram and MUST
+/// have its embedded inner addresses translated back to the pre-NAT
+/// tuple. Before #2393 the embedded-NAT `is_icmp_error` arm omitted 5, so
+/// the match returned None and the quoted inner kept the post-SNAT
+/// address (mismatched at the host). This test installs the SNAT session,
+/// flips an otherwise-identical TE frame to a Redirect, and asserts the
+/// match + reversed-frame build rewrite the embedded src to the client.
+#[test]
+fn embedded_icmp_nat_match_translates_redirect_v4() {
+    let router_ip = Ipv4Addr::new(10, 0, 0, 1);
+    let snat_ip = Ipv4Addr::new(172, 16, 80, 8);
+    let client_ip = Ipv4Addr::new(10, 0, 61, 102);
+    let server_ip = Ipv4Addr::new(1, 1, 1, 1);
+    let snat_port: u16 = 40000;
+    let client_port: u16 = 12345;
+
+    // ICMPv4 Redirect (5) carrying the SNAT'd inner tuple, then flip from
+    // the shared type-11 builder to type 5. Unlike Time Exceeded (whose
+    // bytes 4..8 are an unused word), a Redirect carries the better-gateway
+    // address there; set a distinctive non-zero sentinel so the test
+    // exercises a realistic Redirect AND can prove the embedded-NAT rewrite
+    // (at l4+8) leaves the gateway field (l4+4..8) untouched. Set the
+    // gateway BEFORE `rewrite_outer_icmpv4_type`, which recomputes the ICMP
+    // checksum over the whole header so the frame stays valid.
+    const REDIRECT_GATEWAY: [u8; 4] = [192, 0, 2, 1]; // RFC 5737 TEST-NET-1
+    let mut frame =
+        build_icmp_te_frame_v4(router_ip, snat_ip, server_ip, snat_port, 80, PROTO_TCP);
+    frame[38..42].copy_from_slice(&REDIRECT_GATEWAY); // ICMP bytes 4..8 = gateway
+    rewrite_outer_icmpv4_type(&mut frame, 34, 5);
+    assert_eq!(frame[34], 5, "outer ICMP type must be Redirect");
+    assert_eq!(&frame[38..42], &REDIRECT_GATEWAY, "gateway set in input frame");
+
+    let meta = UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+        l3_offset: 14,
+        l4_offset: 34,
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_ICMP,
+        ..UserspaceDpMeta::default()
+    };
+
+    let mut sessions = SessionTable::new();
+    let forwarding = build_forwarding_state(&nat_snapshot());
+    let neighbors = Arc::new(ShardedNeighborMap::new());
+    learn_dynamic_neighbor(
+        &forwarding,
+        &neighbors,
+        24,
+        0,
+        IpAddr::V4(client_ip),
+        [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
+    );
+    let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
+    let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
+
+    // Forward-NAT session: client:port -> server:80, SNAT to snat_ip:snat_port.
+    assert!(sessions.install_with_protocol(
+        SessionKey {
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_TCP,
+            src_ip: IpAddr::V4(client_ip),
+            dst_ip: IpAddr::V4(server_ip),
+            src_port: client_port,
+            dst_port: 80,
+        },
+        SessionDecision {
+            resolution: ForwardingResolution {
+                disposition: ForwardingDisposition::ForwardCandidate,
+                local_ifindex: 0,
+                egress_ifindex: 24,
+                tx_ifindex: 24,
+                tunnel_endpoint_id: 0,
+                next_hop: Some(IpAddr::V4(client_ip)),
+                neighbor_mac: Some([0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]),
+                src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x50, 0x08]),
+                tx_vlan_id: 0,
+            },
+            nat: NatDecision {
+                rewrite_src: Some(IpAddr::V4(snat_ip)),
+                rewrite_dst: None,
+                rewrite_src_port: Some(snat_port),
+                rewrite_dst_port: None,
+                nat64: false,
+                nptv6: false,
+            },
+        },
+        SessionMetadata {
+            ingress_zone: TEST_LAN_ZONE_ID,
+            egress_zone: TEST_WAN_ZONE_ID,
+            owner_rg_id: 0,
+            fabric_ingress: false,
+            is_reverse: false,
+            nat64_reverse: None,
+        },
+        1_000_000,
+        PROTO_TCP,
+        0,
+    ));
+
+    let icmp_match = try_embedded_icmp_nat_match_from_frame(
+        &frame,
+        meta,
+        &mut sessions,
+        &forwarding,
+        &neighbors,
+        &shared_sessions,
+        &shared_nat_sessions,
+        &shared_forward_wire_sessions,
+        1_000_000,
+    )
+    .expect("#2393: NAT44 Redirect must match the embedded session for reversal");
+
+    assert_eq!(icmp_match.original_src, IpAddr::V4(client_ip));
+    assert_eq!(icmp_match.original_src_port, client_port);
+
+    // Build the reversed frame and confirm BOTH the outer dst and the
+    // embedded inner src are translated back to the pre-NAT client.
+    let result = build_nat_reversed_icmp_error_v4(&frame, meta, &icmp_match)
+        .expect("#2393: reversed Redirect frame must build");
+    assert_eq!(result[34], 5, "reversed frame stays a Redirect");
+    let outer_dst = Ipv4Addr::new(result[30], result[31], result[32], result[33]);
+    assert_eq!(outer_dst, client_ip, "outer dst restored to client");
+    // Embedded IP starts at eth(14) + outer IP(20) + ICMP(8) = 42; src at +12.
+    let embedded_src = Ipv4Addr::new(result[54], result[55], result[56], result[57]);
+    assert_eq!(
+        embedded_src, client_ip,
+        "embedded inner src must be translated from SNAT addr back to client"
+    );
+    // The Redirect-specific invariant: the gateway-address field (ICMP
+    // bytes 4..8 = frame offset 38..42, before the quoted IP at l4+8=42)
+    // must survive the embedded-NAT rewrite byte-for-byte. The rewrite
+    // touches only the quoted inner packet at l4+8 and the outer IP — never
+    // the type-specific header word. This assertion FAILS if the rewrite is
+    // ever changed to write into l4+4..8.
+    assert_eq!(
+        &result[38..42],
+        &REDIRECT_GATEWAY,
+        "Redirect gateway address must be preserved through embedded-NAT rewrite"
     );
 }
 

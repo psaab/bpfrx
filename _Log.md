@@ -1,5 +1,54 @@
 # Action Log
 
+## 2026-06-23 — #2393 embedded-ICMP-NAT match adds ICMPv4 Redirect/Source-Quench
+
+- **Timestamp**: 2026-06-23 PDT
+- **Action**: Correctness fix (LOW). The embedded-ICMP-NAT reversal gate
+  `is_icmp_error` (`userspace-dp/src/afxdp/icmp.rs`) matched ICMPv4 types
+  3/11/12 but omitted type 5 (Redirect) and type 4 (Source Quench), which
+  also quote an inner IP header + 8 bytes (RFC 792). Transit ICMP
+  forwarding is type-agnostic in the same-family path (no link-scope drop —
+  confirmed: the only type-4/5 drop is the NAT64 cross-family path,
+  `nat64.rs`, where they have no IPv6 analogue per RFC 7915), so a NAT44
+  transit Redirect/Source-Quench was forwarded with its quoted inner
+  addresses left at the post-SNAT value (mismatched at the host). Fix:
+  broaden the ICMPv4 arm to 3/4/5/11/12, matching the reject-suppression
+  guard `reject_icmp_reply_suppressed` and Linux netfilter conntrack's
+  `icmp_error`. All five share the 8-byte ICMP header layout, so the quoted
+  IP starts at `l4+8` and the type-agnostic parser/builders need no
+  per-type change; the three gate sites share this SSOT predicate. Updated
+  the now-stale "different (and broader) set" comment on the reject guard
+  (the ICMPv4 sets are now identical; only the ICMPv6 arms still differ).
+  Added an end-to-end fail-on-revert test
+  (`embedded_icmp_nat_match_translates_redirect_v4`: installs the SNAT
+  session, flips a TE frame to a Redirect, asserts both outer dst and
+  embedded inner src are reversed to the client) — verified it FAILS when
+  the v4 arm is reverted to 3/11/12 — plus extended the `is_icmp_error`
+  unit test to assert types 4/5. Targeted suite (icmp/nat64/embedded/
+  redirect) 237 passed; new tests 5x green.
+- **File(s)**: userspace-dp/src/afxdp/icmp.rs,
+  userspace-dp/src/afxdp/tests.rs, docs/userspace-icmp-te-debugging.md,
+  _Log.md
+
+## 2026-06-23 — #2393 Copilot fold: assert Redirect gateway preserved (test-only)
+
+- **Timestamp**: 2026-06-23 PDT
+- **Action**: Test strengthening (no code change) on PR #2432. The new
+  `embedded_icmp_nat_match_translates_redirect_v4` crafted the Redirect by
+  flipping only the type byte, leaving the Redirect gateway-address field
+  (ICMP header bytes 4..8) all-zero (inherited from the Time-Exceeded
+  template's unused word) — an unrealistic Redirect that also did not prove
+  the rewrite leaves the gateway field alone. Set the gateway to a non-zero
+  sentinel (192.0.2.1, RFC 5737 TEST-NET-1) before recomputing the ICMP
+  checksum, and added an assertion that the gateway field
+  (`result[38..42]`) is preserved byte-for-byte through the embedded-NAT
+  reversal — proving the rewrite touches only the quoted inner packet at
+  l4+8 and the outer IP, never the type-specific header word at l4+4..8.
+  Verified the new assertion FAILS when a temporary clobber of the output
+  gateway byte is injected. Targeted suite (icmp/embedded/redirect) 5x
+  green; build clean.
+- **File(s)**: userspace-dp/src/afxdp/tests.rs, _Log.md
+
 ## 2026-06-23 — #2369 ARP fixed-header validation before neighbor learning
 
 - **Timestamp**: 2026-06-23 PDT

@@ -23,6 +23,37 @@ ICMP Time Exceeded (type 11) from intermediate routers arrives at the firewall's
 5. Recompute all checksums (outer IP, outer ICMP, embedded IP)
 6. Forward the rewritten ICMP error to the original client
 
+### Which ICMP error types are reversed (`is_icmp_error`)
+
+The embedded-NAT reversal only runs for ICMP messages that quote the
+offending datagram (an inner IP header + at least the first 8 bytes of its
+transport header). `is_icmp_error` (`userspace-dp/src/afxdp/icmp.rs`) is the
+single source of truth for that set, shared by all three gate sites
+(`icmp_embed/mod.rs`, `icmp_embed/session_match.rs`,
+`poll_descriptor/mod.rs`):
+
+- **ICMPv4**: types **3** (Dest Unreachable), **4** (Source Quench),
+  **5** (Redirect), **11** (Time Exceeded), **12** (Parameter Problem).
+  All five share the RFC 792 8-byte ICMP header layout — the type-specific
+  word (Redirect's gateway address; the unused word on the others) occupies
+  bytes 4..8 — so the quoted IP header always begins at `l4 + 8` and the
+  type-agnostic parser/builders need no per-type handling.
+- **ICMPv6**: types **1** (Dest Unreachable), **2** (Packet Too Big),
+  **3** (Time Exceeded), **4** (Parameter Problem).
+
+**#2393** added ICMPv4 types 4 and 5. Before that the set was 3/11/12, so a
+NAT44-transit Redirect (5) or Source Quench (4) was forwarded with its
+quoted inner addresses left at the post-SNAT value (mismatched at the
+host). Type 4 is deprecated (RFC 6633) and type 5 is normally link-scoped,
+so a NATed transit instance is rare — but ICMP transit forwarding is
+type-agnostic (no link-scope drop in the same-family path), so they *can*
+reach this path. The set now matches the reject-suppression guard
+(`reject_icmp_reply_suppressed`) and Linux netfilter conntrack's related-
+ICMP `icmp_error` (3/4/5/11/12). Note this governs only **same-family**
+embedded-NAT reversal; on the **NAT64** cross-family path Source Quench /
+Redirect have no IPv6 analogue and are still dropped, not mistranslated
+(RFC 7915, `nat64.rs`).
+
 ## What's Implemented (commit `d892376`)
 
 ### NAT Reversal Logic — WORKING (unit tested)
