@@ -447,6 +447,16 @@ A TUN device (`xpf-usp0`) for packets that need kernel processing:
   (> 1500 bytes on a jumbo-frame topology) is silently dropped on the TUN
   egress. A failed `SIOCSIFMTU` is non-fatal: it is logged and recorded in
   `last_error`, and the TUN stays usable for frames up to its current MTU.
+  - **Set once at creation:** the MTU is programmed when the worker opens
+    the TUN (first apply, i.e. `apply_snapshot`'s `preserved_slow_path ==
+    None` branch). Later reconciles preserve the running reinjector and do
+    NOT re-open the device, so a config MTU INCREASE applied while the daemon
+    is running does NOT reprogram the live TUN until the slow path is
+    recreated — a process restart, or the slow path going inactive->active.
+    First-boot jumbo configs are fully covered. When a later reconcile sees a
+    snapshot MTU different from the live TUN's creation MTU, the reconcile
+    path emits a one-shot (per distinct value) `xpf-ha:` warning so the
+    stale-until-restart window is diagnosable rather than silent.
 
 ### 3. Go Manager (`pkg/dataplane/userspace/manager.go`)
 

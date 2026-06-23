@@ -167,6 +167,12 @@ pub struct SlowPathReinjector {
     tx: SyncSender<PacketRequest>,
     limiter: Mutex<RateLimiter>,
     status: Arc<SharedStatus>,
+    /// MTU the slow-path TUN was programmed with at creation (#2408). The TUN
+    /// MTU is set once when the worker opens the device; a later config MTU
+    /// change is NOT applied to the live TUN (the reinjector is preserved
+    /// across reconciles), so the reconcile path compares this against the
+    /// new snapshot MTU to warn the operator (see `apply_snapshot`).
+    mtu: i32,
 }
 
 impl SlowPathReinjector {
@@ -192,7 +198,13 @@ impl SlowPathReinjector {
                 DEFAULT_RATE_LIMIT_BYTES_PER_SEC,
             )),
             status,
+            mtu,
         })
+    }
+
+    /// The MTU the slow-path TUN was programmed with at creation (#2408).
+    pub fn mtu(&self) -> i32 {
+        self.mtu
     }
 
     pub fn enqueue(&self, bytes: Vec<u8>) -> Result<EnqueueOutcome, String> {
@@ -442,6 +454,10 @@ fn set_if_mtu(name: &str, mtu: i32) -> Result<(), String> {
     if mtu <= 0 {
         return Err(format!("invalid MTU {mtu} for {name}"));
     }
+    // Build the ifreq BEFORE opening the socket so an invalid-name early
+    // return does not leak the control-socket fd (Copilot #2439).
+    let mut ifr = IfReq::new(name, 0)?;
+    ifr.ifru.mtu = mtu as libc::c_int;
     let sock = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
     if sock < 0 {
         return Err(format!(
@@ -449,8 +465,6 @@ fn set_if_mtu(name: &str, mtu: i32) -> Result<(), String> {
             io::Error::last_os_error()
         ));
     }
-    let mut ifr = IfReq::new(name, 0)?;
-    ifr.ifru.mtu = mtu as libc::c_int;
     let set_rc = unsafe { libc::ioctl(sock, libc::SIOCSIFMTU, &ifr) };
     let close_rc = unsafe { libc::close(sock) };
     if set_rc < 0 {

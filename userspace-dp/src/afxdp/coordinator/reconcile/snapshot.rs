@@ -91,6 +91,23 @@ pub(super) fn apply_snapshot(
         .forwarding
         .store(Arc::new(coord.forwarding.clone()));
     coord.slow_path = if let Some(slow_path) = preserved_slow_path {
+        // #2408: the live TUN keeps the MTU it was created with — the
+        // preserved reinjector is NOT re-opened, so a config MTU increase
+        // applied after the daemon is running does not reprogram the running
+        // TUN until the slow path is recreated (process restart, or the slow
+        // path going inactive->active). First-boot jumbo configs ARE covered
+        // (they hit the else branch below). Warn once per distinct value so a
+        // steady-state reconcile loop does not flood.
+        let desired_mtu = snapshot.slow_path_mtu();
+        if desired_mtu != slow_path.mtu() && desired_mtu != coord.last_slow_path_mtu_warned {
+            eprintln!(
+                "xpf-ha: slow-path TUN MTU stays {} (config now wants {}); the live TUN is not reprogrammed until the slow path is recreated (xpfd restart). Reinjected frames larger than {} will drop on the slow path until then.",
+                slow_path.mtu(),
+                desired_mtu,
+                slow_path.mtu()
+            );
+            coord.last_slow_path_mtu_warned = desired_mtu;
+        }
         coord.last_slow_path_status = slow_path.status();
         Some(slow_path)
     } else {

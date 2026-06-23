@@ -11921,3 +11921,26 @@ top.
   userspace-dp/src/protocol/snapshot.rs,
   userspace-dp/src/afxdp/coordinator/reconcile/snapshot.rs,
   docs/userspace-dataplane-architecture.md, _Log.md
+
+- **Timestamp**: 2026-06-23
+- **Action**: #2408 review folds (PR #2439). FOLD 1 (reviewer MINOR — doc
+  claim was wrong): the runtime-MTU-change limitation was undocumented.
+  (a) Added an explicit note to docs/userspace-dataplane-architecture.md:
+  the slow-path TUN MTU is set ONCE at creation (apply_snapshot's
+  preserved_slow_path==None branch); a later config MTU increase does NOT
+  reprogram the live TUN until the slow path is recreated (xpfd restart /
+  inactive->active). First-boot jumbo configs ARE covered. (b) Turned the
+  silent footgun diagnosable: SlowPathReinjector now stores its creation
+  `mtu` + exposes `mtu()`; the preserved-reinjector reconcile path compares
+  snapshot.slow_path_mtu() against it and emits ONE `xpf-ha:` eprintln
+  warning per distinct desired value (Coordinator.last_slow_path_mtu_warned
+  rate-limiter) — observability only, no behavior change. FOLD 2 (Copilot
+  trivial robustness): set_if_mtu opened the control socket BEFORE
+  IfReq::new, leaking the fd on an invalid-name early return — reordered to
+  build the ifreq first (set_if_up left alone to keep the diff scoped).
+  cargo build --release clean (no new warnings from this code); 7
+  slow_path_mtu/set_if_mtu tests green 5x.
+- **File(s)**: userspace-dp/src/slowpath.rs,
+  userspace-dp/src/afxdp/coordinator/mod.rs,
+  userspace-dp/src/afxdp/coordinator/reconcile/snapshot.rs,
+  docs/userspace-dataplane-architecture.md, _Log.md
