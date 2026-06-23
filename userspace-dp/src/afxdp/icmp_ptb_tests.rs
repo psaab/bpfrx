@@ -117,7 +117,7 @@ fn oversized_v4_df_udp_emits_frag_needed() {
     assert_eq!(next_hop_mtu, 1400, "advertised MTU must equal the egress MTU");
 
     assert!(
-        !ptb_reply_suppressed(&frame, meta, l3),
+        !ptb_reply_suppressed(&frame, meta, l3, &ForwardingState::default()),
         "a plain UDP frame must not be suppressed"
     );
 
@@ -262,7 +262,7 @@ fn non_first_fragment_v4_is_suppressed() {
     };
     frame[l3 + 10..l3 + 12].copy_from_slice(&ip_csum.to_be_bytes());
     assert!(
-        ptb_reply_suppressed(&frame, meta, l3),
+        ptb_reply_suppressed(&frame, meta, l3, &ForwardingState::default()),
         "non-first fragment must be suppressed"
     );
 }
@@ -296,7 +296,7 @@ fn inbound_icmp_error_is_suppressed() {
         ..UserspaceDpMeta::default()
     };
     assert!(
-        ptb_reply_suppressed(&frame, meta, l3),
+        ptb_reply_suppressed(&frame, meta, l3, &ForwardingState::default()),
         "inbound ICMP error must be suppressed"
     );
     // Counter-factual: an inbound ICMP *echo request* (query, type 8) is
@@ -308,7 +308,7 @@ fn inbound_icmp_error_is_suppressed() {
         ..meta
     };
     assert!(
-        !ptb_reply_suppressed(&echo, echo_meta, l3),
+        !ptb_reply_suppressed(&echo, echo_meta, l3, &ForwardingState::default()),
         "an inbound ICMP echo request is a query, not suppressed"
     );
 }
@@ -338,7 +338,7 @@ fn ptb_suppressed_for_v4_multicast_dst() {
     let l3 = meta.l3_offset as usize;
     set_v4_dst(&mut frame, l3, Ipv4Addr::new(239, 1, 2, 3));
     assert!(
-        ptb_reply_suppressed(&frame, meta, l3),
+        ptb_reply_suppressed(&frame, meta, l3, &ForwardingState::default()),
         "IPv4 multicast destination must suppress the PTB"
     );
 }
@@ -351,8 +351,59 @@ fn ptb_suppressed_for_v4_limited_broadcast_dst() {
     let l3 = meta.l3_offset as usize;
     set_v4_dst(&mut frame, l3, Ipv4Addr::new(255, 255, 255, 255));
     assert!(
-        ptb_reply_suppressed(&frame, meta, l3),
+        ptb_reply_suppressed(&frame, meta, l3, &ForwardingState::default()),
         "IPv4 limited broadcast destination must suppress the PTB"
+    );
+}
+
+/// #2411: an oversized DF IPv4 datagram destined to a SUBNET-DIRECTED
+/// broadcast (all-ones host of a connected prefix, e.g. 10.0.1.255 for
+/// 10.0.1.0/24) must NOT generate a PTB (RFC 1812 §4.3.2.7). The
+/// directed broadcast is a plain unicast to the limited-broadcast test,
+/// so this exercises the connected-prefix lookup. Fails (PTB built) if
+/// the `dest_is_directed_broadcast` check is removed.
+#[test]
+fn ptb_suppressed_for_v4_directed_broadcast_dst() {
+    let (mut frame, meta) = inbound_v4_udp(1500, true);
+    let l3 = meta.l3_offset as usize;
+    set_v4_dst(&mut frame, l3, Ipv4Addr::new(10, 0, 1, 255));
+    let mut fwd = forwarding_with_egress(1400);
+    fwd.connected_v4.push(ConnectedRouteV4 {
+        prefix: crate::prefix::PrefixV4::from_net("10.0.1.0/24".parse().expect("cidr")),
+        ifindex: PTB_IFINDEX,
+        tunnel_endpoint_id: 0,
+    });
+    assert!(
+        ptb_reply_suppressed(&frame, meta, l3, &fwd),
+        "IPv4 subnet-directed broadcast must suppress the PTB"
+    );
+    // Note: `build_frag_needed_v4` does NOT itself consult the
+    // suppression gate (it would happily build a frame for a directed
+    // broadcast). The dispatch path (`tx/dispatch/mod.rs`) only calls the
+    // builder behind `if !ptb_reply_suppressed(..)`, so the gate above IS
+    // the call-site invariant — asserting `build_frag_needed_v4(..)
+    // .is_none()` here would be WRONG (the builder builds; the gate is
+    // what stops the send). The gate assertion fails on a stubbed-false
+    // `dest_is_directed_broadcast`, which is the regression we guard.
+}
+
+/// #2411 anti-over-suppress: a normal unicast HOST inside the same
+/// connected subnet must STILL generate the PTB; only the all-ones host
+/// is the directed broadcast.
+#[test]
+fn ptb_still_generated_for_unicast_in_connected_subnet() {
+    let (mut frame, meta) = inbound_v4_udp(1500, true);
+    let l3 = meta.l3_offset as usize;
+    set_v4_dst(&mut frame, l3, Ipv4Addr::new(10, 0, 1, 42));
+    let mut fwd = forwarding_with_egress(1400);
+    fwd.connected_v4.push(ConnectedRouteV4 {
+        prefix: crate::prefix::PrefixV4::from_net("10.0.1.0/24".parse().expect("cidr")),
+        ifindex: PTB_IFINDEX,
+        tunnel_endpoint_id: 0,
+    });
+    assert!(
+        !ptb_reply_suppressed(&frame, meta, l3, &fwd),
+        "a unicast host inside a connected subnet must NOT suppress the PTB"
     );
 }
 
@@ -364,7 +415,7 @@ fn ptb_suppressed_for_v6_multicast_dst() {
     let l3 = meta.l3_offset as usize;
     set_v6_dst(&mut frame, l3, "ff02::1".parse().expect("v6 mcast"));
     assert!(
-        ptb_reply_suppressed(&frame, meta, l3),
+        ptb_reply_suppressed(&frame, meta, l3, &ForwardingState::default()),
         "IPv6 multicast destination must suppress the PTB"
     );
 }
@@ -407,7 +458,7 @@ fn ptb_still_generated_for_v4_unicast_dst() {
     let l3 = meta.l3_offset as usize;
     // The default destination 172.16.80.200 is plain unicast.
     assert!(
-        !ptb_reply_suppressed(&frame, meta, l3),
+        !ptb_reply_suppressed(&frame, meta, l3, &ForwardingState::default()),
         "a unicast destination must NOT suppress the PTB"
     );
     let fwd = forwarding_with_egress(1400);
@@ -438,7 +489,7 @@ fn ptb_suppressed_for_l2_multicast_dst() {
     // first octet (0x01) is the IEEE group bit.
     set_l2_dst(&mut frame, [0x01, 0x00, 0x5e, 0x01, 0x02, 0x03]);
     assert!(
-        ptb_reply_suppressed(&frame, meta, l3),
+        ptb_reply_suppressed(&frame, meta, l3, &ForwardingState::default()),
         "L2 multicast (group bit) destination must suppress the PTB"
     );
 }
@@ -452,7 +503,7 @@ fn ptb_suppressed_for_l2_broadcast_dst() {
     let l3 = meta.l3_offset as usize;
     set_l2_dst(&mut frame, [0xff, 0xff, 0xff, 0xff, 0xff, 0xff]);
     assert!(
-        ptb_reply_suppressed(&frame, meta, l3),
+        ptb_reply_suppressed(&frame, meta, l3, &ForwardingState::default()),
         "L2 broadcast destination must suppress the PTB"
     );
 }
@@ -465,7 +516,7 @@ fn ptb_suppressed_for_l2_multicast_dst_v6() {
     let l3 = meta.l3_offset as usize;
     set_l2_dst(&mut frame, [0x33, 0x33, 0x00, 0x00, 0x00, 0x01]);
     assert!(
-        ptb_reply_suppressed(&frame, meta, l3),
+        ptb_reply_suppressed(&frame, meta, l3, &ForwardingState::default()),
         "L2 multicast (33:33:..) destination must suppress the IPv6 PTB"
     );
 }
@@ -482,7 +533,7 @@ fn ptb_still_generated_for_l2_unicast_dst() {
     // A plain unicast MAC: low bit of the first octet clear.
     set_l2_dst(&mut frame, [0x02, 0xbf, 0x72, 0x00, 0x00, 0x09]);
     assert!(
-        !ptb_reply_suppressed(&frame, meta, l3),
+        !ptb_reply_suppressed(&frame, meta, l3, &ForwardingState::default()),
         "unicast L2 + unicast L3 destination must NOT suppress the PTB"
     );
     let fwd = forwarding_with_egress(1400);
@@ -552,7 +603,7 @@ fn ptb_suppressed_for_v4_bad_source_backscatter() {
         let l3 = meta.l3_offset as usize;
         set_v4_src(&mut frame, l3, bad);
         assert!(
-            ptb_reply_suppressed(&frame, meta, l3),
+            ptb_reply_suppressed(&frame, meta, l3, &ForwardingState::default()),
             "IPv4 forbidden source {bad} must suppress the PTB (backscatter)"
         );
     }
@@ -568,7 +619,7 @@ fn ptb_suppressed_for_v6_bad_source_backscatter() {
         let l3 = meta.l3_offset as usize;
         set_v6_src(&mut frame, l3, bad.parse().expect("v6 src"));
         assert!(
-            ptb_reply_suppressed(&frame, meta, l3),
+            ptb_reply_suppressed(&frame, meta, l3, &ForwardingState::default()),
             "IPv6 forbidden source {bad} must suppress the PTB (backscatter)"
         );
     }
@@ -586,7 +637,7 @@ fn ptb_still_generated_for_v4_unicast_source() {
     // Plain unicast source, distinct from the default to be explicit.
     set_v4_src(&mut frame, l3, Ipv4Addr::new(203, 0, 113, 7));
     assert!(
-        !ptb_reply_suppressed(&frame, meta, l3),
+        !ptb_reply_suppressed(&frame, meta, l3, &ForwardingState::default()),
         "a unicast source must NOT suppress the PTB (PMTUD)"
     );
     let fwd = forwarding_with_egress(1400);
@@ -608,7 +659,7 @@ fn ptb_still_generated_for_v6_unicast_source() {
     let l3 = meta.l3_offset as usize;
     // The default source 2001:559:8585:bf01::20 is unicast.
     assert!(
-        !ptb_reply_suppressed(&frame, meta, l3),
+        !ptb_reply_suppressed(&frame, meta, l3, &ForwardingState::default()),
         "a unicast IPv6 source must NOT suppress the PTB (PMTUD)"
     );
     let fwd = forwarding_with_egress(1280);
@@ -872,7 +923,7 @@ fn post_transform_gre_oversized_v4_df_emits_inner_ptb() {
         other => panic!("expected EmitPacketTooBig, got {other:?}"),
     };
     assert_eq!(next_hop_mtu, 1376, "advertised MTU = GRE inner MTU, not transport MTU");
-    assert!(!ptb_reply_suppressed(&frame, meta, l3));
+    assert!(!ptb_reply_suppressed(&frame, meta, l3, &ForwardingState::default()));
     let out = build_frag_needed_v4(&frame, meta, PTB_IFINDEX, &fwd, next_hop_mtu)
         .expect("inner-source frag-needed must build");
     let icmp = 14 + 20;

@@ -212,11 +212,19 @@ fn ipv4_df_set(packet: &[u8]) -> bool {
 /// into an ICMP-error backscatter storm), or to an inbound ICMP/ICMPv6
 /// *error* message (avoid error loops and amplification). Returns true
 /// when a PTB MUST be suppressed.
+///
+/// `forwarding` supplies the connected-route table for the #2411 IPv4
+/// directed-broadcast check (RFC 1812 §4.3.2.7): a PTB to the all-ones
+/// host of a connected subnet (e.g. `10.0.1.255` for `10.0.1.0/24`) is a
+/// subnet-directed broadcast and must be suppressed. v4-only; the table
+/// scan is a cold-path lookup that runs only when a PTB is about to be
+/// generated.
 #[inline]
 pub(in crate::afxdp) fn ptb_reply_suppressed(
     frame: &[u8],
     meta: UserspaceDpMeta,
     l3_offset: usize,
+    forwarding: &ForwardingState,
 ) -> bool {
     // #2325: never generate a PTB in reply to a datagram delivered as an
     // L2 broadcast/multicast frame. This gives the PTB path the same L2
@@ -249,6 +257,13 @@ pub(in crate::afxdp) fn ptb_reply_suppressed(
     // #2314: never generate a PTB in reply to a datagram whose IP
     // destination was multicast or broadcast.
     if dest_is_multicast_or_broadcast(meta.addr_family, packet) {
+        return true;
+    }
+    // #2411: never generate a PTB in reply to an IPv4 subnet-directed
+    // broadcast (all-ones host of a connected prefix). v4-only — IPv6
+    // has no broadcast and `dest_is_directed_broadcast` reads the v4
+    // destination octets, so it is gated on AF_INET.
+    if meta.addr_family as i32 == libc::AF_INET && dest_is_directed_broadcast(forwarding, packet) {
         return true;
     }
     if matches!(meta.protocol, PROTO_ICMP | PROTO_ICMPV6) {

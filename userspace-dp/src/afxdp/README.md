@@ -210,7 +210,27 @@ sync.
   `None`/`None`). An output-filter drop lands on `ptb_output_filter_drops`;
   a parse failure of the built bytes fails CLOSED on
   `generated_reply_classify_parse_errors` (§6.2), never leaking the PTB
-  past an output `discard`.
+  past an output `discard`. #2411: the gate now ALSO drops ICMP errors
+  (reject, Time-Exceeded, and PTB) triggered by an IPv4 datagram destined
+  to a *subnet-directed* broadcast — the all-ones host of a configured
+  connected prefix, e.g. `10.0.1.255` for a connected `10.0.1.0/24`. RFC
+  1812 §4.3.2.7 forbids originating an ICMP error to any broadcast,
+  directed broadcasts included; but a directed broadcast is a plain
+  unicast to the limited-broadcast (`255.255.255.255`) / multicast tests,
+  so recognizing it needs the configured subnet MASK. The new shared
+  `dest_is_directed_broadcast` predicate (`frame/inspect.rs`) reuses the
+  forwarding state's connected-route table (`connected_v4`, the SAME rows
+  the FIB lookup scans — no new infrastructure) and suppresses when the
+  destination equals `network | !mask` of a connected prefix shorter than
+  /31 (a /31 has no broadcast per RFC 3021 and a /32's all-ones host is
+  the host itself, so both are skipped to avoid mis-suppressing a
+  legitimate unicast). `can_generate_icmp_error_reply` and
+  `ptb_reply_suppressed` both take `&ForwardingState` and call it (v4-only
+  — IPv6 has no broadcast), so the reject, Time-Exceeded, and PTB paths
+  apply ONE directed-broadcast gate. The lookup is a COLD-path scan: it
+  runs only when an ICMP error is about to be generated, never on the
+  per-packet fast path. No new counter — a suppressed error folds into
+  the existing fail-closed silent drop.
 - `cos/` — Class-of-Service scheduler: token-bucket admission, MQFQ
   active-bucket selection, fair-share lease (#1229 Phase 6 v8). See
   `docs/per-5-tuple/state.md` for the architectural ceiling.

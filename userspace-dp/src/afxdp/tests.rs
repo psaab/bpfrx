@@ -1876,7 +1876,7 @@ fn time_exceeded_emitted_for_unicast_udp() {
     let frame = build_udp_frame_v4_full([0x00, 0x25, 0x90, 0x12, 0x34, 0x56], client, server, 1);
     let meta = ttl_meta_v4();
     let fwd = icmp_suppress_forwarding();
-    assert!(can_generate_icmp_error_reply(&frame, meta));
+    assert!(can_generate_icmp_error_reply(&frame, meta, &fwd));
     let desc = XdpDesc {
         addr: 4096,
         len: frame.len() as u32,
@@ -1917,7 +1917,7 @@ fn time_exceeded_emitted_for_unicast_tcp() {
     let mut meta = ttl_meta_v4();
     meta.protocol = PROTO_TCP;
     assert!(
-        can_generate_icmp_error_reply(&frame, meta),
+        can_generate_icmp_error_reply(&frame, meta, &ForwardingState::default()),
         "unicast TCP TTL 1 must be allowed"
     );
 }
@@ -1940,7 +1940,7 @@ fn time_exceeded_suppressed_for_inbound_icmp_error_v4() {
     };
     let fwd = icmp_suppress_forwarding();
     assert!(
-        !can_generate_icmp_error_reply(&frame, meta),
+        !can_generate_icmp_error_reply(&frame, meta, &ForwardingState::default()),
         "gate must suppress reply to an inbound ICMP error"
     );
     let desc = XdpDesc {
@@ -1965,7 +1965,7 @@ fn time_exceeded_suppressed_for_inbound_icmp_error_v4() {
     let mut echo = build_icmp_echo_frame_v4(client, server, 1);
     echo[34] = 8;
     assert!(
-        can_generate_icmp_error_reply(&echo, meta),
+        can_generate_icmp_error_reply(&echo, meta, &ForwardingState::default()),
         "inbound ICMP echo request (query) must still draw an error"
     );
 }
@@ -1986,13 +1986,13 @@ fn time_exceeded_suppressed_for_inbound_icmp_error_v6() {
         ..UserspaceDpMeta::default()
     };
     assert!(
-        !can_generate_icmp_error_reply(&frame, meta),
+        !can_generate_icmp_error_reply(&frame, meta, &ForwardingState::default()),
         "gate must suppress reply to an inbound ICMPv6 error"
     );
     // ICMPv6 echo request (type 128, a query) is NOT suppressed.
     let echo = build_icmp_echo_frame_v6(client, server, 1); // type 128
     assert!(
-        can_generate_icmp_error_reply(&echo, meta),
+        can_generate_icmp_error_reply(&echo, meta, &ForwardingState::default()),
         "inbound ICMPv6 echo request must still draw an error"
     );
 }
@@ -2012,7 +2012,7 @@ fn time_exceeded_suppressed_for_non_first_fragment_v4() {
     frame[24..26].copy_from_slice(&csum.to_be_bytes());
     let meta = ttl_meta_v4();
     assert!(
-        !can_generate_icmp_error_reply(&frame, meta),
+        !can_generate_icmp_error_reply(&frame, meta, &ForwardingState::default()),
         "gate must suppress reply to a non-first IPv4 fragment"
     );
     assert!(
@@ -2049,7 +2049,7 @@ fn time_exceeded_suppressed_for_non_first_fragment_v6() {
         ..UserspaceDpMeta::default()
     };
     assert!(
-        !can_generate_icmp_error_reply(&frame, meta),
+        !can_generate_icmp_error_reply(&frame, meta, &ForwardingState::default()),
         "gate must suppress reply to a non-first IPv6 fragment"
     );
     assert!(
@@ -2066,7 +2066,7 @@ fn time_exceeded_suppressed_for_multicast_dest_v4() {
     let frame = build_udp_frame_v4_full([0x01, 0x00, 0x5e, 0x00, 0x00, 0xfb], client, mcast, 1);
     let meta = ttl_meta_v4();
     assert!(
-        !can_generate_icmp_error_reply(&frame, meta),
+        !can_generate_icmp_error_reply(&frame, meta, &ForwardingState::default()),
         "gate must suppress reply to a multicast destination"
     );
     assert!(
@@ -2084,7 +2084,7 @@ fn time_exceeded_suppressed_for_l2_broadcast_dest() {
     let frame = build_udp_frame_v4_full([0xff, 0xff, 0xff, 0xff, 0xff, 0xff], client, server, 1);
     let meta = ttl_meta_v4();
     assert!(
-        !can_generate_icmp_error_reply(&frame, meta),
+        !can_generate_icmp_error_reply(&frame, meta, &ForwardingState::default()),
         "gate must suppress reply to an L2 broadcast frame"
     );
     assert!(
@@ -2101,14 +2101,14 @@ fn time_exceeded_suppressed_for_bad_source_v4() {
     let frame = build_udp_frame_v4_full([0x00, 0x25, 0x90, 0x12, 0x34, 0x56], bad_src, server, 1);
     let meta = ttl_meta_v4();
     assert!(
-        !can_generate_icmp_error_reply(&frame, meta),
+        !can_generate_icmp_error_reply(&frame, meta, &ForwardingState::default()),
         "gate must suppress reply to a loopback source"
     );
     // Unspecified 0.0.0.0 source is also suppressed.
     let zero_src =
         build_udp_frame_v4_full([0x00, 0x25, 0x90, 0x12, 0x34, 0x56], Ipv4Addr::UNSPECIFIED, server, 1);
     assert!(
-        !can_generate_icmp_error_reply(&zero_src, meta),
+        !can_generate_icmp_error_reply(&zero_src, meta, &ForwardingState::default()),
         "gate must suppress reply to a 0.0.0.0 source"
     );
     assert!(
@@ -2132,7 +2132,7 @@ fn time_exceeded_suppressed_for_bad_source_v6() {
         ..UserspaceDpMeta::default()
     };
     assert!(
-        !can_generate_icmp_error_reply(&frame, meta),
+        !can_generate_icmp_error_reply(&frame, meta, &ForwardingState::default()),
         "gate must suppress reply to a multicast IPv6 source"
     );
     assert!(

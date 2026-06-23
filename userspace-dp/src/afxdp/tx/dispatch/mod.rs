@@ -548,7 +548,7 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
                         {
                             // RFC 792 / RFC 4443 suppression: never reply to
                             // a non-first fragment or an inbound ICMP error.
-                            if !ptb_reply_suppressed(source_frame, ptb_meta, l3) {
+                            if !ptb_reply_suppressed(source_frame, ptb_meta, l3, forwarding) {
                                 ptb_reply = match request.meta.addr_family as i32 {
                                     libc::AF_INET => build_frag_needed_v4(
                                         source_frame,
