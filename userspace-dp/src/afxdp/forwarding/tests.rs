@@ -2324,3 +2324,75 @@ fn outer_neighbor_ifindex_missing_endpoint_falls_back_to_egress_ifindex() {
     resolution.egress_ifindex = 777;
     assert_eq!(outer_neighbor_ifindex(&state, None, &resolution), 777);
 }
+
+// --- is_ipsec_traffic recognition (#2385) ---------------------------------
+//
+// Host-terminated IPsec must be steered to the kernel XFRM slow path. The
+// recognition predicate must cover ESP (proto 50), AH (proto 51), and IKE /
+// NAT-T (UDP 500/4500). AH (#2385) is the regression guard: it was omitted,
+// so AH-protected SAs fell through to ordinary transit forwarding and were
+// dropped. The dst_port argument is ignored for the protocol-number arms, so
+// these cases hold for both IPv4 and IPv6 (the protocol number is the only
+// input, taken from meta.protocol regardless of L3 family).
+
+#[test]
+fn is_ipsec_traffic_recognizes_ah_proto_51() {
+    // FAIL-ON-REVERT: AH (proto 51) must be recognized as IPsec passthrough,
+    // exactly like ESP. If PROTO_AH is removed from is_ipsec_traffic this
+    // assertion fails. AH carries no transport port, so dst_port is
+    // irrelevant — assert across a representative spread of ports.
+    assert_eq!(PROTO_AH, 51, "AH protocol number");
+    for port in [0u16, 80, 443, 500, 4500, 65535] {
+        assert!(
+            is_ipsec_traffic(PROTO_AH, port),
+            "AH (proto 51) must be IPsec-passthrough regardless of port \
+             (port={port})"
+        );
+    }
+}
+
+#[test]
+fn is_ipsec_traffic_recognizes_esp_and_ike() {
+    // No-regression: ESP (proto 50) and IKE/NAT-T (UDP 500/4500) must still
+    // be recognized.
+    assert_eq!(PROTO_ESP, 50, "ESP protocol number");
+    for port in [0u16, 443, 500, 4500, 65535] {
+        assert!(
+            is_ipsec_traffic(PROTO_ESP, port),
+            "ESP (proto 50) must be IPsec-passthrough regardless of port \
+             (port={port})"
+        );
+    }
+    assert!(
+        is_ipsec_traffic(PROTO_UDP, 500),
+        "IKE on UDP/500 must be IPsec-passthrough"
+    );
+    assert!(
+        is_ipsec_traffic(PROTO_UDP, 4500),
+        "NAT-T on UDP/4500 must be IPsec-passthrough"
+    );
+}
+
+#[test]
+fn is_ipsec_traffic_rejects_non_ipsec() {
+    // No over-match: ordinary transit protocols must NOT be classified as
+    // IPsec passthrough.
+    assert!(
+        !is_ipsec_traffic(PROTO_TCP, 443),
+        "TCP/443 is not IPsec passthrough"
+    );
+    assert!(
+        !is_ipsec_traffic(PROTO_UDP, 53),
+        "UDP/53 (DNS) is not IPsec passthrough"
+    );
+    assert!(
+        !is_ipsec_traffic(PROTO_UDP, 4499),
+        "UDP near-miss port is not IPsec passthrough"
+    );
+    // GRE (proto 47) sits between UDP(17) and ESP(50)/AH(51) — guard the
+    // protocol boundary so the predicate does not widen to a range check.
+    assert!(
+        !is_ipsec_traffic(PROTO_GRE, 0),
+        "GRE (proto 47) is not IPsec passthrough"
+    );
+}

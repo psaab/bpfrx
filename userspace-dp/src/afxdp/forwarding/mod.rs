@@ -912,11 +912,22 @@ impl IcmpTeRateLimiter {
     }
 }
 
-/// Returns true if the packet is IPsec traffic (ESP protocol 50 or IKE UDP
-/// ports 500/4500) that should be passed to the kernel for XFRM processing.
+/// Returns true if the packet is IPsec traffic (ESP protocol 50, AH protocol
+/// 51, or IKE UDP ports 500/4500) that should be passed to the kernel for
+/// XFRM processing.
+///
+/// AH (Authentication Header, proto 51) is a configurable host-terminated
+/// IPsec protocol (`set security ipsec proposal ... protocol ah`,
+/// pkg/config/schema_security.go). Like ESP it carries no transport port, so
+/// only the protocol-number arm applies. Both ESP and AH cover IPv4 and IPv6
+/// — the recognition is purely on `meta.protocol`, which is the L4 protocol
+/// number extracted from the IPv4 protocol field or the IPv6 next-header
+/// chain, so v4 and v6 are handled identically.
 #[inline]
 pub(super) fn is_ipsec_traffic(protocol: u8, dst_port: u16) -> bool {
-    protocol == PROTO_ESP || (protocol == PROTO_UDP && (dst_port == 500 || dst_port == 4500))
+    protocol == PROTO_ESP
+        || protocol == PROTO_AH
+        || (protocol == PROTO_UDP && (dst_port == 500 || dst_port == 4500))
 }
 
 #[cfg(test)]

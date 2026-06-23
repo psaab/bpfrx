@@ -36,3 +36,23 @@ slow-path-injected.
   and encode the L2 header.
 - Has no cross-binding back-edges — the per-worker hot path stays
   on its own UMEM.
+
+## Host-terminated IPsec passthrough
+
+`is_ipsec_traffic(protocol, dst_port)` recognizes packets destined for
+the local kernel XFRM stack so the IPsec passthrough stage
+(`poll_stages::stage_ipsec_passthrough_check`) reinjects them via the
+slow-path TUN device instead of running them through ordinary transit
+forwarding. The recognized set is:
+
+- ESP — protocol 50 (`PROTO_ESP`)
+- AH — protocol 51 (`PROTO_AH`)
+- IKE / NAT-T — UDP destination port 500 or 4500
+
+ESP and AH carry no transport port, so only the protocol-number arm
+applies to them. The predicate keys solely on `meta.protocol`, which is
+the L4 protocol number taken from the IPv4 protocol field or the IPv6
+next-header chain, so IPv4 and IPv6 are handled identically. AH was
+omitted before #2385, which silently broke host-terminated AH SAs
+(configurable via `set security ipsec proposal ... protocol ah`); the
+AH arm is regression-guarded in `tests.rs`.

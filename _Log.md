@@ -11630,3 +11630,15 @@ top.
   userspace-dp/src/afxdp/icmp_ptb.rs,
   userspace-dp/src/afxdp/icmp_ptb_tests.rs,
   userspace-dp/src/afxdp/README.md
+
+- **Timestamp**: 2026-06-23
+- **Action**: #2385 — add AH (proto 51) to IPsec passthrough recognition.
+  `is_ipsec_traffic` matched ESP (50) + IKE/NAT-T (UDP 500/4500) but omitted
+  AH (51), so host-terminated AH SAs fell through to transit forwarding and
+  were dropped. Added `PROTO_AH` arm (mirrors ESP; no port, v4+v6 identical),
+  imported `PROTO_AH` into afxdp/mod.rs, added 3 fail-on-revert unit tests,
+  and documented the passthrough set in the forwarding README.
+- **File(s)**: userspace-dp/src/afxdp/forwarding/mod.rs,
+  userspace-dp/src/afxdp/mod.rs,
+  userspace-dp/src/afxdp/forwarding/tests.rs,
+  userspace-dp/src/afxdp/forwarding/README.md

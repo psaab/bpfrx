@@ -318,7 +318,7 @@ const DEFAULT_SLOW_PATH_TUN: &str = "xpf-usp0";
 const LOCAL_TUNNEL_DELIVERY_QUEUE_DEPTH: usize = 4096;
 const HA_WATCHDOG_STALE_AFTER_SECS: u64 = 10;
 const FABRIC_ZONE_MAC_MAGIC: u8 = 0xfe;
-use crate::ip_proto::{PROTO_ESP, PROTO_GRE, PROTO_ICMP, PROTO_ICMPV6, PROTO_TCP, PROTO_UDP};
+use crate::ip_proto::{PROTO_AH, PROTO_ESP, PROTO_GRE, PROTO_ICMP, PROTO_ICMPV6, PROTO_TCP, PROTO_UDP};
 // #2151: TCP flag bits now live in the shared crate::tcp_flags SSOT.
 // Re-exported here under the historical TCP_FLAG_* spellings (and made
 // visible to `super::*` consumers: event_emit, tx/tcp_segmentation,
