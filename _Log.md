@@ -1,5 +1,69 @@
 # Action Log
 
+## 2026-06-23 — #2381 PR #2413 doc-accuracy folds (cap arithmetic + bound)
+
+- **Timestamp**: 2026-06-23 PDT
+- **Action**: Two doc-comment corrections on PR #2413 (no code/behavior
+  change). (1) The `WRITE_BACKLOG_MAX_BYTES` rationale wrongly claimed 16 MiB
+  ≈ 2× a fully-drained channel. `EventFrame::data` is a fixed `[u8; 256]`
+  (codec.rs), so an 8192-frame channel is ≤ 8192×256 ≈ 2 MiB of bytes, making
+  16 MiB ≈ 8× the worst-case channel drain — corrected the comment to the real
+  arithmetic. (2) Clarified that the cap is tested at the top of the drain loop
+  before the in-flight frame is appended, so the effective bound is `cap + one
+  max EventFrame` (≤ 256 B), not a strict 16 MiB; the bounded overshoot is
+  accepted. Adjusted the matching wording in the event_stream README and
+  docs/session-sync-design.md ("hard-capped at 16 MiB" → cap + one-frame
+  bound). Logic unchanged; existing tests still pass; `cargo build --release`
+  clean.
+- **File(s)**: userspace-dp/src/event_stream/mod.rs,
+  userspace-dp/src/event_stream/README.md, docs/session-sync-design.md, _Log.md
+
+## 2026-06-23 — #2381 bound event-stream write backlog (stalled-consumer OOM)
+
+- **Timestamp**: 2026-06-23 PDT
+- **Action**: Fixed an unbounded heap-growth / resource-exhaustion bug in the
+  event-stream I/O thread (#2381, HIGH). The connected loop drained the entire
+  bounded mpsc channel (8192) into a heap `write_buf: Vec<u8>` every cycle; a
+  wedged daemon (socket open, not reading → socket `write` returns
+  `WouldBlock`) kept `write_buf` intact while the channel refilled from worker
+  `try_send`, so the I/O thread relocated bytes into one unbounded buffer until
+  OOM / allocator pressure perturbed the forwarding plane. Fix: extracted the
+  drain into `drain_channel_into_write_buf()` and hard-capped `write_buf` at
+  `WRITE_BACKLOG_MAX_BYTES` (16 MiB). At the cap the drain halts, leaving frames
+  in the bounded channel — which becomes the real backpressure surface
+  (newest producer events shed via `try_send`, counted in `frames_dropped` /
+  per-kind `queue_full`; oldest queued + replay frames preserved so RT_FLOW
+  stays current). Each capped pass bumps a new `frames_write_stalled` counter,
+  surfaced on the wire as `event_stream_write_stalls` (Rust ProcessStatus +
+  Go ProcessStatus, JSON tag parity) and as Prometheus
+  `xpf_userspace_event_stream_producer_frames_total{result="write_stalled"}` +
+  `show ... ` status line. The producer path was already non-blocking
+  (`try_send`); no producer change needed. Cap does not apply while paused
+  (paused frames go only to the already-bounded replay buffer). Core invariant
+  preserved: the data plane never stalls on a slow telemetry consumer.
+- **Validation**: `cargo build --release` clean; event_stream + protocol Rust
+  suites green; 5 new fail-on-revert tests
+  (`write_backlog_cap_halts_drain_and_counts_stall`,
+  `write_backlog_stall_makes_channel_the_backpressure_surface`,
+  `paused_drain_ignores_backlog_cap_and_never_stalls`,
+  `stalled_consumer_does_not_grow_backlog_unbounded_end_to_end`,
+  `keeping_up_consumer_sees_full_fidelity_and_no_stalls`) run 5x; mutation test
+  (neuter the cap) fails 3 of them as expected. Go
+  `pkg/dataplane/userspace` + `pkg/api` tests green; wire parity test extended;
+  `protocol_wire_v1.json` regenerated (XPF_PROTOCOL_WIRE_REGEN=1).
+- **File(s)**: userspace-dp/src/event_stream/mod.rs,
+  userspace-dp/src/event_stream/tests.rs,
+  userspace-dp/src/event_stream/README.md,
+  userspace-dp/src/protocol/control.rs,
+  userspace-dp/src/protocol/tests.rs,
+  userspace-dp/src/server/helpers.rs,
+  userspace-dp/src/server/lifecycle.rs,
+  userspace-dp/tests/fixtures/protocol_wire_v1.json,
+  pkg/dataplane/userspace/protocol.go,
+  pkg/dataplane/userspace/protocol_test.go,
+  pkg/dataplane/userspace/format/status.go,
+  pkg/api/metrics_userspace.go, docs/session-sync-design.md, _Log.md
+
 ## 2026-06-22 — #2361 Copilot fold: clamp-panic guard in ipv4_declared_l3_end
 
 - **Timestamp**: 2026-06-22 PDT

@@ -443,6 +443,12 @@ pub(crate) struct ProcessStatus {
     pub event_stream_sent: u64,
     #[serde(rename = "event_stream_dropped", default)]
     pub event_stream_dropped: u64,
+    /// I/O cycles in which the event-stream socket-write backlog hit its cap
+    /// and the helper stopped draining the channel (stalled daemon reader,
+    /// #2381). Growing → telemetry shed at the bounded channel; dataplane
+    /// unaffected.
+    #[serde(rename = "event_stream_write_stalls", default)]
+    pub event_stream_write_stalls: u64,
     /// Monotonic timestamp (secs) of the last HA flow cache flush (#312).
     #[serde(rename = "last_cache_flush_at", default)]
     pub last_cache_flush_at: u64,

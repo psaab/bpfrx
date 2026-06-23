@@ -175,6 +175,7 @@ pub(crate) fn run() -> Result<(), String> {
             event_stream_acked: 0,
             event_stream_sent: 0,
             event_stream_dropped: 0,
+            event_stream_write_stalls: 0,
             last_cache_flush_at: 0,
         },
         snapshot: None,
