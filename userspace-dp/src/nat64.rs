@@ -938,6 +938,12 @@ fn map_icmpv4_error_to_icmpv6(icmpv4_type: u8, icmpv4_code: u8) -> Option<(u8, u
                 1 => (ICMPV6_DEST_UNREACHABLE, 0), // host unreachable -> no route
                 2 => (ICMPV6_PARAMETER_PROBLEM, 1), // protocol unreachable ->
                 //  parameter problem, unrecognized Next Header
+                14 => (ICMPV6_PARAMETER_PROBLEM, 1), // host precedence violation ->
+                //  parameter problem (RFC 7915 4.2: set Type 4, Code 1, Pointer
+                //  to the IPv6 Traffic Class octet). Like code 2 above, the
+                //  Parameter-Problem pointer is left zeroed by the caller rather
+                //  than remapped — see translate_icmpv4_message_to_icmpv6, which
+                //  writes a zeroed rest-of-header word for all non-PTB errors.
                 3 => (ICMPV6_DEST_UNREACHABLE, 4), // port unreachable -> port unreachable
                 5 => (ICMPV6_DEST_UNREACHABLE, 0), // source route failed -> no route
                 6 => (ICMPV6_DEST_UNREACHABLE, 0), // dest network unknown -> no route

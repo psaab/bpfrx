@@ -1660,6 +1660,44 @@ fn nat64_v4_to_v6_dest_unreachable_port_maps() {
     assert_eq!(&emb[40..48], &inner_l4, "embedded quoted L4 preserved");
 }
 
+#[test]
+fn nat64_v4_to_v6_dest_unreachable_host_precedence_violation_maps() {
+    // ICMPv4 Dest-Unreachable / Host-Precedence-Violation (3/14) -> ICMPv6
+    // Parameter Problem (4/1) per RFC 7915 4.2. Code 14 was previously absent
+    // from the code map and hit the `_ => return None` catch-all, so the
+    // packet was silently dropped at the NAT64 boundary instead of translated.
+    // This test fails (the translate returns None) if code 14 is removed from
+    // map_icmpv4_error_to_icmpv6.
+    let client_v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+    let server_v6: Ipv6Addr = "64:ff9b::c000:0205".parse().unwrap();
+    let pool_v4 = Ipv4Addr::new(198, 51, 100, 1);
+    let server_v4 = Ipv4Addr::new(192, 0, 2, 5);
+
+    let inner_l4 = [0x30u8, 0x39, 0x00, 0x50, 0xca, 0xfe, 0xba, 0xbe];
+    let embedded = build_v4_with_l4(pool_v4, server_v4, PROTO_TCP, 60, &inner_l4);
+    let icmp = build_icmpv4_error(3, 14, [0, 0, 0, 0], &embedded);
+    let v4_pkt = build_v4_with_l4(server_v4, pool_v4, PROTO_ICMP_C, 64, &icmp);
+
+    let v6 = translate_v4_to_v6(&v4_pkt, server_v6, client_v6)
+        .expect("ICMPv4 Host-Precedence-Violation (3/14) must translate, not drop");
+    assert_eq!(v6[40], 4, "ICMPv6 Parameter Problem type (RFC 7915 4.2)");
+    assert_eq!(v6[41], 1, "ICMPv6 Parameter Problem code 1");
+    // Rest-of-header (pointer) word is zeroed by the translator, like code 2.
+    assert_eq!(
+        &v6[44..48],
+        &[0, 0, 0, 0],
+        "Parameter-Problem pointer left zeroed (not remapped)"
+    );
+    let s6 = Ipv6Addr::from(<[u8; 16]>::try_from(&v6[8..24]).unwrap());
+    let d6 = Ipv6Addr::from(<[u8; 16]>::try_from(&v6[24..40]).unwrap());
+    assert_eq!(checksum16_ipv6_pseudo(s6, d6, PROTO_ICMPV6_C, &v6[40..]), 0);
+    let emb = &v6[48..];
+    assert_eq!(&emb[8..24], &client_v6.octets());
+    assert_eq!(&emb[24..40], &server_v6.octets());
+    assert_eq!(emb[6], PROTO_TCP, "embedded protocol preserved");
+    assert_eq!(&emb[40..48], &inner_l4, "embedded quoted L4 preserved");
+}
+
 // === v6 -> v4 forward direction =============================================
 
 #[test]

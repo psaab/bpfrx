@@ -1,5 +1,30 @@
 # Action Log
 
+## 2026-06-23 — #2405 NAT64 ICMPv4 dest-unreach code 14 mapped (RFC 7915 §4.2)
+
+- **Timestamp**: 2026-06-23 PDT
+- **Action**: Correctness fix (LOW-MED). `map_icmpv4_error_to_icmpv6`
+  (`userspace-dp/src/nat64.rs`) omitted ICMPv4 Destination-Unreachable
+  code 14 (host precedence violation) from its type-3 code sub-map, so a
+  v4→v6 dest-unreachable with code 14 hit `_ => return None` and was
+  silently dropped at the NAT64 boundary instead of translated. Per RFC
+  7915 §4.2 (codes with no direct ICMPv6 analogue → ICMPv6 Parameter
+  Problem), code 14 maps to ICMPv6 Type 4 (Parameter Problem) Code 1 —
+  mirroring the existing code-2 (protocol unreachable) arm; the
+  Parameter-Problem pointer is left zeroed by the translator (consistent
+  with code 2, which is also not remapped). With this arm, all RFC 7915
+  §4.2 type-3 codes (0–3, 5–15) are handled; code 4 (Fragmentation-Needed)
+  remains routed separately to Packet-Too-Big by the caller — no other
+  omissions found.
+- **Tests**: added `nat64_v4_to_v6_dest_unreachable_host_precedence_violation_maps`
+  (fail-on-revert: panics "must translate, not drop" if the code-14 arm is
+  removed — verified); port-unreachable test
+  (`nat64_v4_to_v6_dest_unreachable_port_maps`) covers the no-regression
+  case. Both green 5x.
+- **File(s)**: `userspace-dp/src/nat64.rs`,
+  `userspace-dp/src/nat64_tests.rs`, `userspace-dp/src/FEATURES.md`,
+  `_Log.md`.
+
 ## 2026-06-23 — #2393 embedded-ICMP-NAT match adds ICMPv4 Redirect/Source-Quench
 
 - **Timestamp**: 2026-06-23 PDT
