@@ -1391,7 +1391,8 @@ func TestProcessStatusEventStreamFieldsParity1642(t *testing.T) {
 		"event_stream_acked": 4200,
 		"event_stream_sent": 5000,
 		"event_stream_dropped": 3,
-		"event_stream_write_stalls": 17
+		"event_stream_write_stalls": 17,
+		"event_stream_replay_evictions": 9
 	}`
 	var got ProcessStatus
 	if err := json.Unmarshal([]byte(rustJSON), &got); err != nil {
@@ -1414,6 +1415,21 @@ func TestProcessStatusEventStreamFieldsParity1642(t *testing.T) {
 	// wire key so a wedged daemon reader is observable in status/metrics.
 	if got.EventStreamWriteStalls != 17 {
 		t.Errorf("event_stream_write_stalls dropped: got %d, want 17", got.EventStreamWriteStalls)
+	}
+	// #2382: the replay-buffer eviction telemetry-loss counter must decode
+	// under its exact wire key so a daemon that let the replay window wrap
+	// (dropping accepted RT_FLOW frames) is observable in status/metrics.
+	if got.EventStreamReplayEvictions != 9 {
+		t.Errorf("event_stream_replay_evictions dropped: got %d, want 9", got.EventStreamReplayEvictions)
+	}
+	// #2382: a legacy helper that omits the key must decode to 0, not error
+	// (omitempty + Go zero-value default).
+	var legacy ProcessStatus
+	if err := json.Unmarshal([]byte(`{"event_stream_sent": 1}`), &legacy); err != nil {
+		t.Fatalf("unmarshal legacy ProcessStatus (no replay key): %v", err)
+	}
+	if legacy.EventStreamReplayEvictions != 0 {
+		t.Errorf("missing event_stream_replay_evictions must default to 0, got %d", legacy.EventStreamReplayEvictions)
 	}
 
 	raw, _ := json.Marshal(&ProcessStatus{EventStreamConnected: true, EventStreamSeq: 1, EventStreamAcked: 1})

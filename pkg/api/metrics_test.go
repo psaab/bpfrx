@@ -426,8 +426,10 @@ func TestEmitUserspaceEventStreamMetrics(t *testing.T) {
 		userspaceEventStreamUnknownDropsTotal:    mkNoLabel("xpf_userspace_event_stream_unknown_frame_drops_total"),
 	}
 	status := dpuserspace.ProcessStatus{
-		EventStreamSent:    101,
-		EventStreamDropped: 7,
+		EventStreamSent:            101,
+		EventStreamDropped:         7,
+		EventStreamWriteStalls:     13,
+		EventStreamReplayEvictions: 4,
 		EventStream: &dpuserspace.EventStreamStatus{
 			FramesRead:        11,
 			FramesWritten:     7,
@@ -455,6 +457,10 @@ func TestEmitUserspaceEventStreamMetrics(t *testing.T) {
 	assertCounterClose(t, got, c.userspaceEventStreamFramesTotal, map[string]string{"direction": "written"}, 7)
 	assertCounterClose(t, got, c.userspaceEventStreamProducerFramesTotal, map[string]string{"outcome": "sent"}, 101)
 	assertCounterClose(t, got, c.userspaceEventStreamProducerFramesTotal, map[string]string{"outcome": "dropped"}, 7)
+	// #2381 / #2382: the stalled-consumer and replay-eviction telemetry-loss
+	// counters surface under distinct outcome labels on the same metric.
+	assertCounterClose(t, got, c.userspaceEventStreamProducerFramesTotal, map[string]string{"outcome": "write_stalled"}, 13)
+	assertCounterClose(t, got, c.userspaceEventStreamProducerFramesTotal, map[string]string{"outcome": "replay_evicted"}, 4)
 	assertCounterClose(t, got, c.userspaceEventStreamDecodeErrorsTotal, nil, 2)
 	assertCounterClose(t, got, c.userspaceEventStreamSequenceGapsTotal, nil, 3)
 	assertCounterClose(t, got, c.userspaceEventStreamDataplaneEventsTotal, map[string]string{"type": "policy_deny"}, 5)

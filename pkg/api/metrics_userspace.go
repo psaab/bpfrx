@@ -1236,6 +1236,14 @@ func (c *xpfCollector) emitUserspaceEventStream(ch chan<- prometheus.Metric, sta
 	// wedged consumer is observable instead of silently OOMing the helper.
 	ch <- prometheus.MustNewConstMetric(c.userspaceEventStreamProducerFramesTotal,
 		prometheus.CounterValue, float64(status.EventStreamWriteStalls), "write_stalled")
+	// #2382: accepted RT_FLOW / dataplane-telemetry frames evicted from the
+	// helper's replay buffer when it wrapped at capacity before the daemon
+	// ACKed them. These were counted under the "sent" label at enqueue but are
+	// permanently lost — a real telemetry-loss signal. Surfaced under the
+	// producer metric with a distinct "replay_evicted" label so the loss is
+	// observable (it is NOT ACK-trim, which is normal acknowledged removal).
+	ch <- prometheus.MustNewConstMetric(c.userspaceEventStreamProducerFramesTotal,
+		prometheus.CounterValue, float64(status.EventStreamReplayEvictions), "replay_evicted")
 	ch <- prometheus.MustNewConstMetric(c.userspaceEventStreamDecodeErrorsTotal,
 		prometheus.CounterValue, float64(es.DecodeErrors))
 	ch <- prometheus.MustNewConstMetric(c.userspaceEventStreamSequenceGapsTotal,

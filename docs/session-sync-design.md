@@ -589,6 +589,21 @@ be lost across a second reconnect. HA backup nodes ACK and ignore session
 events because they are permanent non-owners, while transient primary readiness
 gaps withhold ACK for replay.
 
+**Replay-buffer eviction loss (#2382)**: the replay buffer is bounded at
+`REPLAY_BUFFER_CAPACITY` (4096). If the daemon disconnects or withholds ACKs
+long enough for the buffer to wrap, the oldest accepted-and-enqueued frame is
+evicted to make room. That frame was already counted in `event_stream_sent` at
+enqueue, but is unrecoverable after reconnect — a real telemetry loss (exactly
+the storm / daemon-restart path operators inspect for deny/drop/log audit
+completeness). The buffer-full eviction path (`evict_replay_frame` in
+`event_stream/mod.rs`) increments `event_stream_replay_evictions`, surfaced as
+`xpf_userspace_event_stream_producer_frames_total{outcome="replay_evicted"}`
+and in `show ... | display` status (`Event stream producer: ... replay_evictions=N`).
+This is **distinct from ACK-trim** (`pop_replay_frame` via the MSG_ACK handler),
+which removes acknowledged frames that WERE delivered — ACK-trim and shutdown
+drain do NOT bump the eviction counter, so a growing `replay_evictions` value is
+an unambiguous accepted-telemetry-loss signal, not normal acknowledged removal.
+
 ### Integration with Existing Code
 
 **Rust side** (`userspace-dp/src/main.rs`):
