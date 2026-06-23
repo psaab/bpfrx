@@ -29,6 +29,33 @@ sync.
     which the control plane can read as a hung worker and turn into a
     spurious VRRP failover / route withdrawal.
 - `worker/` — the per-worker poll loop (`mod.rs` runs the dispatch).
+- `parser.rs` — pure control-plane parsers (#947) for the two L2/L3
+  learning shapes that drive the dynamic-neighbor cache: ARP replies
+  (`classify_arp`) and IPv6 Neighbor Advertisements
+  (`parse_ndp_neighbor_advert`). The poll-stage learn site
+  (`poll_stages.rs::stage_link_layer_classify`) inserts the parsed
+  `(ifindex, ip) -> mac` binding into `dynamic_neighbors` AND the kernel
+  neighbor table, so these parsers are a MAC->IP write primitive — they
+  MUST fail closed on untrusted input.
+  - **NA validation (`#2368`, RFC 4861 §7.1.2 / RFC 4443):** before an
+    NA learns a Target Link-Layer Address, `parse_ndp_neighbor_advert`
+    enforces the §7.1.2 MUSTs — IPv6 Hop Limit == 255 (the off-link
+    impersonation gate: a lower hop limit means a router forwarded the
+    packet, so it did not originate on-link), ICMPv6 Code == 0, ICMP
+    length >= 24, Target Address not multicast, and a valid ICMPv6
+    checksum (computed over the IPv6 pseudo-header via the shared
+    `frame::checksum16_*` accumulator). Any failure → `None` (no learn),
+    so a spoofed/off-link NA cannot poison the cache.
+  - **payload_len-bounded option walk (`#2368` B, #2361 class):** the
+    NDP option walk (locating the TLLA) is bounded by the IPv6-declared
+    packet end (`l3 + 40 + payload_len`, rejected if it overruns the
+    frame), NOT the raw Ethernet frame length. A short NA whose declared
+    payload covers only the fixed header cannot smuggle a forged TLLA in
+    the L2 trailer/padding — trailing slack is never read as a
+    link-layer address.
+  - **NS scope:** there is NO Neighbor Solicitation learning path in the
+    userspace dataplane (NS is never parsed or learned), so #2368 is
+    NA-only; there is no sibling NS gap to close here.
 - `poll_stages.rs` — sibling of `worker/`, not inside it. Holds the
   per-packet pipeline stages extracted in #946 Phase 1. The screen and
   SYN-cookie stages decide the L3 offset (14 vs 18) on tag PRESENCE

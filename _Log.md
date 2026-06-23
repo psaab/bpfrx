@@ -11450,3 +11450,32 @@ top.
     userspace-dp/src/filter/compiler.rs,
     userspace-dp/src/filter/engine/cache_sensitive.rs,
     userspace-dp/src/filter/tests.rs, _Log.md
+
+- **Timestamp**: 2026-06-23
+- **Action**: #2368 (HIGH) — NDP NA neighbor-cache poisoning. Added RFC
+    4861 §7.1.2 validation to `parse_ndp_neighbor_advert` and bounded the
+    NDP option walk by the IPv6-declared packet end. (A) Before learning a
+    Target Link-Layer Address, the parser now requires IPv6 Hop Limit ==
+    255 (off-link impersonation gate), ICMPv6 Code == 0, ICMP length >=
+    24, Target Address not multicast, and a valid ICMPv6 checksum
+    (recomputed over the IPv6 pseudo-header via the shared
+    `frame::checksum16_add_bytes`/`checksum16_finish` accumulator). Any
+    failure returns None (no learn), so a spoofed/off-link NA can no
+    longer poison the dynamic-neighbor cache or the kernel neighbor table.
+    (B) The option walk is now bounded by `l3 + 40 + payload_len` (clamped
+    to the slice; rejected if it overruns the frame) instead of
+    `raw_frame.len()`, so a forged TLLA in the Ethernet trailer/padding
+    beyond the declared payload is never read. NS shares no learning path
+    (NS is never parsed/learned in the userspace dataplane) → NA-only fix.
+    Scoped to validation; does NOT touch the #2370 ifindex keying at the
+    learn site (the learn site already only learns on a Some(target_mac),
+    so all checks live in the parser). 8 new fail-on-revert tests
+    (hop-limit<255, code!=0, bad checksum, multicast target, TLLA past
+    payload_len, payload_len overrun, valid-NA-still-learns untagged +
+    VLAN). Reverting the hop-limit gate and the option-walk bound both
+    proven to fail the corresponding tests. cargo build --release clean;
+    parser tests 25/25 green, 5x stable; targeted suite (ndp/neighbor/na/
+    parser/poll_stages) 729 green.
+- **File(s)**: userspace-dp/src/afxdp/parser.rs,
+    userspace-dp/src/afxdp/parser_tests.rs,
+    userspace-dp/src/afxdp/README.md, _Log.md
