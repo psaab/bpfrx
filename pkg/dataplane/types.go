@@ -63,6 +63,13 @@ type SessionValue struct {
 	// replacement that was re-synced with a newer generation. A value of 0
 	// means "unknown / legacy peer" and falls back to unconditional
 	// delete (rolling-upgrade safe).
+	//
+	// Because this field is sync-only, the BPF conntrack maps are NOT
+	// registered at sizeof(SessionValue): they use the dedicated on-map ABI
+	// type bpfSessionValue (bpf_session_value.go), which omits Generation and
+	// matches the C/Rust 128-byte layout. Registering at sizeof(SessionValue)
+	// would over-size value_size by 8 bytes and OOB-write the Rust helper's
+	// lookup buffer (#2360). Do NOT mirror Generation into the BPF map.
 	Generation uint64
 }
 

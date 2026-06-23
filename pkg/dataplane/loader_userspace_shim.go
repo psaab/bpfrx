@@ -274,8 +274,14 @@ func closeUniqueMaps(maps map[string]*ebpf.Map) {
 
 func userspaceShimSharedMapSpecs() []*ebpf.MapSpec {
 	return []*ebpf.MapSpec{
-		hashMapSpec("sessions", sizeOf[SessionKey](), sizeOf[SessionValue](), userspaceShimMaxSessions, unix.BPF_F_NO_PREALLOC),
-		hashMapSpec("sessions_v6", sizeOf[SessionKeyV6](), sizeOf[SessionValueV6](), userspaceShimMaxSessions, unix.BPF_F_NO_PREALLOC),
+		// Register the conntrack maps at the on-map C/Rust ABI size
+		// (bpfSessionValue/bpfSessionValueV6), NOT sizeOf[SessionValue].
+		// SessionValue carries the sync-only Generation field (#2170) which
+		// is intentionally absent from the BPF C struct; using its size would
+		// inflate value_size by 8 bytes and cause an OOB copy into the Rust
+		// helper's smaller lookup buffer (#2360).
+		hashMapSpec("sessions", sizeOf[SessionKey](), sizeOf[bpfSessionValue](), userspaceShimMaxSessions, unix.BPF_F_NO_PREALLOC),
+		hashMapSpec("sessions_v6", sizeOf[SessionKeyV6](), sizeOf[bpfSessionValueV6](), userspaceShimMaxSessions, unix.BPF_F_NO_PREALLOC),
 		hashMapSpec("dnat_table", sizeOf[DNATKey](), sizeOf[DNATValue](), userspaceShimMaxSessions, unix.BPF_F_NO_PREALLOC),
 		hashMapSpec("dnat_table_v6", sizeOf[DNATKeyV6](), sizeOf[DNATValueV6](), userspaceShimMaxSessions, unix.BPF_F_NO_PREALLOC),
 		arrayMapSpec("fib_gen_map", sizeOf[uint32](), 1),
@@ -364,4 +370,3 @@ func ensureUserspaceMapPinned(name string, m *ebpf.Map, path string) error {
 	}
 	return nil
 }
-
