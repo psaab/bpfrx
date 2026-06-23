@@ -556,6 +556,14 @@ at commit. `compileFilterThen` now records the unrecognized token on
 the family / filter / term / offending token. Note that an EMPTY action
 (`Action == ""`) is the legitimate "no terminating action" case (a term
 with only modifiers falls through to the next term) and is NOT flagged.
+Two more VALID Junos constructs are recognized so a real config import is
+NOT over-rejected: `then reject <message-type>` (the standard ICMP-unreachable
+codes plus `tcp-reset`) commits as a plain reject and captures the type on
+`FirewallFilterTerm.RejectMessageType` for fidelity — the dataplane acts only
+on `FilterAction::Reject` today, so the type is compile-time-only (no wire
+field); and `then next term` / `then next` (explicit fall-through) commits as
+a no-op, marked `FirewallFilterTerm.NextTerm`. A token after `reject` that is
+NOT a known message-type is still a typo and IS flagged.
 Defense-in-depth in the Rust filter: a NON-EMPTY unrecognized action (only
 reachable via a mixed-version snapshot now that commit rejects it) fails
 CLOSED to `Discard`, never `Accept`; the empty string keeps the
@@ -580,8 +588,11 @@ Regression coverage: `pkg/config/compiler_filter_action_test.go`
 (`TestFilterAction_UnknownAction_RejectsAtCommit` and the
 misspelled/inet6 variants — fail-on-revert guards,
 `TestFilterAction_ValidActions_Commit` — anti-over-reject across every
-terminating action and modifier + a modifier-only fall-through term,
-`TestFilterAction_Unknown_LenientWarns`,
+terminating action and modifier + a modifier-only fall-through term + the
+reject message-types + `next term`, `TestFilterAction_RejectMessageType_-
+CommitsAndCaptures`, `TestFilterAction_NextTerm_CommitsAndMarks`,
+`TestFilterAction_UnknownRejectMessageType_RejectsAtCommit` — a typo after
+reject still rejects, `TestFilterAction_Unknown_LenientWarns`,
 `TestFilterAction_CompileCapturesUnknownToken`) and, on the Rust side,
 `userspace-dp/src/filter/tests.rs`
 (`unknown_nonempty_action_fails_closed_discard`,

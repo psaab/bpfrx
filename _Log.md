@@ -11367,3 +11367,24 @@ top.
     pkg/config/compiler_filter_action_test.go,
     userspace-dp/src/filter/compiler.rs, userspace-dp/src/filter/tests.rs,
     docs/config-schema.md, _Log.md
+
+- **Timestamp**: 2026-06-23
+- **Action**: #2399 PR #2421 review folds (anti-over-reject + message accuracy).
+    FOLD 1 (hostile MINOR — real over-reject): the #2399 default-arm wrongly
+    rejected VALID Junos `then reject <message-type>` (tcp-reset,
+    administratively-prohibited, the ICMP-unreachable family) and
+    `then next term`, both of which master committed. compileFilterThen now
+    recognizes the standard reject message-types (commit as plain reject,
+    capture on FirewallFilterTerm.RejectMessageType for fidelity — compile-time
+    only, no wire field since the dataplane acts only on FilterAction::Reject)
+    and `then next term`/`next` (fall-through, FirewallFilterTerm.NextTerm). A
+    typo AFTER reject (unknown message-type) still flags → still rejects. FOLD 2
+    (Copilot): the strict error message now lists syslog + traffic-class +
+    next-term (was omitting them). Tests: reject-message-types/next-term commit
+    cleanly (anti-over-reject), RejectMessageType captured, `reject blorp` still
+    rejects, existing typo-reject fail-on-revert tests unchanged. Rust untouched
+    (folds are Go compile-time only). go build + go test ./pkg/config
+    ./pkg/dataplane ./pkg/dataplane/userspace green; TestFilterAction 5x stable.
+- **File(s)**: pkg/config/types_system.go, pkg/config/compiler_firewall.go,
+    pkg/config/compiler_validate_strict.go,
+    pkg/config/compiler_filter_action_test.go, docs/config-schema.md, _Log.md
