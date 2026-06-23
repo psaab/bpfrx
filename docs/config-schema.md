@@ -533,6 +533,71 @@ an undefined from-zone and to-zone, `TestPolicySpecialZoneTokensCommit` —
 `any`/`junos-host`/global anti-over-reject, `TestPolicyDefinedZonesCommit`,
 `TestPolicyUndefinedZoneLenientDowngradesToWarning`).
 
+### #2399 — firewall-filter unknown `then` action + unsupported `from protocol` (commit fail-closed)
+
+Two fail-OPEN behaviors in the firewall-filter compiler, both now rejected
+at commit (the firewall-FILTER analog of the #2401 policy fail-closed
+pattern). Provenance: codex review-032 findings 032-16 / 032-17.
+
+**(032-16) Unknown `then` action → silent ACCEPT.** A filter term whose
+`then` block carries a token that is neither a recognized terminating
+action (`accept`/`reject`/`discard`) nor a recognized modifier
+(`count`/`log`/`syslog`/`forwarding-class`/`loss-priority`/`dscp`/
+`traffic-class`/`policer`/`routing-instance`) was historically DROPPED by
+`compileFilterThen` (no default arm). The term's `Action` stayed `""`,
+which the dataplane compiler (`pkg/dataplane/compiler_filter.go`) and the
+Rust filter (`userspace-dp/src/filter/compiler.rs` `parse_term`) both map
+to `FilterAction::Accept` — a term the operator meant to DENY (a misspelled
+`then accpet`, or a newer action a peer node understands) silently became a
+PERMIT, and commit reported SUCCESS. Junos rejects an unknown filter action
+at commit. `compileFilterThen` now records the unrecognized token on
+`FirewallFilterTerm.UnknownActions`, and **`validateFilterActionsStrict`**
+(`compiler_validate_strict.go`) hard-rejects any term carrying one, naming
+the family / filter / term / offending token. Note that an EMPTY action
+(`Action == ""`) is the legitimate "no terminating action" case (a term
+with only modifiers falls through to the next term) and is NOT flagged.
+Two more VALID Junos constructs are recognized so a real config import is
+NOT over-rejected: `then reject <message-type>` (the standard ICMP-unreachable
+codes plus `tcp-reset`) commits as a plain reject and captures the type on
+`FirewallFilterTerm.RejectMessageType` for fidelity — the dataplane acts only
+on `FilterAction::Reject` today, so the type is compile-time-only (no wire
+field); and `then next term` / `then next` (explicit fall-through) commits as
+a no-op, marked `FirewallFilterTerm.NextTerm`. A token after `reject` that is
+NOT a known message-type is still a typo and IS flagged.
+Defense-in-depth in the Rust filter: a NON-EMPTY unrecognized action (only
+reachable via a mixed-version snapshot now that commit rejects it) fails
+CLOSED to `Discard`, never `Accept`; the empty string keeps the
+fall-through `Accept` semantics.
+
+**(032-17) Unsupported `from protocol` alias → dropped constraint.**
+Already handled by #2175 — **`validateFilterProtocolsStrict`** rejects a
+`from protocol <token>` that the centralized `appid.ProtocolNumber` SSOT
+cannot resolve (a name, a `junos-*` alias, or a 0..255 number). Without the
+gate an unresolvable alias was silently dropped from the protocol set, so
+the term matched ALL protocols. Documented here for completeness; no new
+code in #2399.
+
+**Strict/lenient split (flag `lenientFilterActions`, sibling of
+`lenientFilterProtocols`):** strict on the commit / commit-check path
+(`CompileConfig` — hard-reject), downgraded to a `cfg.Warnings` entry on
+the tolerant load / peer-sync paths (`CompileConfigLenient` /
+`CompileConfigForNodeLenient`) so an already-persisted or peer-synced
+config carrying an unknown action still BOOTS (#1960 fail-closed-on-load
+doctrine). The gate runs immediately after `validateFilterProtocolsStrict`.
+Regression coverage: `pkg/config/compiler_filter_action_test.go`
+(`TestFilterAction_UnknownAction_RejectsAtCommit` and the
+misspelled/inet6 variants — fail-on-revert guards,
+`TestFilterAction_ValidActions_Commit` — anti-over-reject across every
+terminating action and modifier + a modifier-only fall-through term + the
+reject message-types + `next term`, `TestFilterAction_RejectMessageType_-
+CommitsAndCaptures`, `TestFilterAction_NextTerm_CommitsAndMarks`,
+`TestFilterAction_UnknownRejectMessageType_RejectsAtCommit` — a typo after
+reject still rejects, `TestFilterAction_Unknown_LenientWarns`,
+`TestFilterAction_CompileCapturesUnknownToken`) and, on the Rust side,
+`userspace-dp/src/filter/tests.rs`
+(`unknown_nonempty_action_fails_closed_discard`,
+`empty_action_falls_through_to_accept`).
+
 ### #2053 — Config secret redaction at JSON/YAML marshal time
 
 The compiled `*config.Config` carries every operator secret verbatim in

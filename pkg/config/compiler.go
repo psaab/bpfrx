@@ -290,6 +290,18 @@ type compileOpts struct {
 	// constraint, never silently "protocol 0"). Same doctrine as
 	// lenientApplicationSpecs.
 	lenientFilterProtocols bool
+	// lenientFilterActions (#2399 finding 032-16) downgrades the
+	// firewall-filter `then` action gate (validateFilterActionsStrict) from a
+	// hard compile error to a cfg.Warnings entry. The strict commit /
+	// commit-check path hard-rejects a term whose `then` block carries a token
+	// that is neither a recognized terminating action (accept/reject/discard)
+	// nor a recognized modifier. Before this gate such a token was silently
+	// DROPPED at compile, leaving Action == "" which the dataplane compiler and
+	// the Rust filter both map to ACCEPT (a fail-open permit). The tolerant
+	// load / peer-sync paths downgrade to a warning so an already-persisted or
+	// peer-synced config carrying an unknown action still BOOTS (#1960
+	// no-brick). Same doctrine as lenientFilterProtocols.
+	lenientFilterActions bool
 	// lenientNPTv6 (#2240) downgrades the NPTv6 (RFC 6296) validation gate
 	// (validateNPTv6Strict) from a hard compile error to a cfg.Warnings entry.
 	// The strict commit / commit-check path hard-rejects an NPTv6 static-NAT
@@ -448,6 +460,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientRoutingExportRef:            true,
 		lenientApplicationSpecs:            true,
 		lenientFilterProtocols:             true,
+		lenientFilterActions:               true,
 		lenientNPTv6:                       true,
 		lenientFirewallRefs:                true,
 		lenientApplicationSetMembers:       true,
@@ -544,6 +557,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientRoutingExportRef:            true,
 		lenientApplicationSpecs:            true,
 		lenientFilterProtocols:             true,
+		lenientFilterActions:               true,
 		lenientNPTv6:                       true,
 		lenientFirewallRefs:                true,
 		lenientApplicationSetMembers:       true,
@@ -1025,6 +1039,26 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		if opts.lenientFilterProtocols {
 			cfg.Warnings = append(cfg.Warnings,
 				fmt.Sprintf("firewall filter protocol (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
+	// #2399 (032-16) firewall-filter `then` action fail-open gate. Strict on
+	// commit / commit-check (hard-reject a term whose `then` block carries a
+	// token that is neither a recognized terminating action nor a recognized
+	// modifier). Before this gate such a token was silently DROPPED by
+	// compileFilterThen, leaving Action == "", which the dataplane compiler and
+	// the Rust filter (parse_term) both map to ACCEPT — a fail-open permit for
+	// a term the operator meant to deny. Lenient on load / peer-sync (warn so
+	// an already-persisted or peer-synced config carrying an unknown action
+	// still BOOTS — #1960 no-brick). Runs on the fully-compiled *Config so the
+	// typed term list (with UnknownActions populated by compileFilterThen) is
+	// available.
+	if err := validateFilterActionsStrict(cfg); err != nil {
+		if opts.lenientFilterActions {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("firewall filter action (downgraded to warning on tolerant path): %v", err))
 		} else {
 			return nil, err
 		}

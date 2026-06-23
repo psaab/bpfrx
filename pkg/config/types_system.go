@@ -822,6 +822,26 @@ type FirewallFilterTerm struct {
 	TCPFlags          []string        // TCP flags: "syn", "ack", "fin", "rst", "psh", "urg"
 	IsFragment        bool            // match IP fragments
 	Action            string          // "accept", "reject", "discard", ""
+	// UnknownActions records `then` tokens that are neither a recognized
+	// terminating action nor a recognized modifier (#2399 finding 032-16).
+	// An unknown or misspelled action would otherwise be silently dropped
+	// during compile and default to ACCEPT in BOTH the dataplane compiler and
+	// the Rust filter (a fail-open permit). validateFilterActionsStrict
+	// hard-rejects any term carrying an entry here at commit; the tolerant
+	// load path downgrades it to a warning (#1960 no-brick). Populated by
+	// compileFilterThen.
+	UnknownActions    []string
+	// RejectMessageType is the optional message-type after `then reject`
+	// (e.g. tcp-reset, administratively-prohibited, port-unreachable). Junos
+	// accepts `then reject <message-type>` and the term acts as a plain reject;
+	// this captures the type for config fidelity. The dataplane does not act on
+	// it today (FilterAction::Reject only). An unknown token after `reject` is
+	// a typo and is NOT stored here — it is flagged via UnknownActions.
+	RejectMessageType string
+	// NextTerm records `then next term` / `then next-term` — an explicit
+	// fall-through to the next term (a no-op terminating-wise; Action stays "").
+	// It is a recognized, valid construct, not an unknown action.
+	NextTerm          bool
 	RoutingInstance   string          // routing-instance name (policy-based routing)
 	Log               bool
 	Count             string           // counter name
