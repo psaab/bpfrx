@@ -31,6 +31,8 @@ func TestNestedApplicationSetPolicyMatch(t *testing.T) {
 		"set applications application-set child application app2",
 		"set applications application-set parent application app1",
 		"set applications application-set parent application-set child",
+		"set security zones security-zone trust",
+		"set security zones security-zone untrust",
 		"set security policies from-zone trust to-zone untrust policy allow-parent match source-address any",
 		"set security policies from-zone trust to-zone untrust policy allow-parent match destination-address any",
 		"set security policies from-zone trust to-zone untrust policy allow-parent match application parent",

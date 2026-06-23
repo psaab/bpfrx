@@ -846,6 +846,86 @@ func validatePolicyMatchAddressesStrict(cfg *Config) error {
 	return nil
 }
 
+// policyZoneSpecialTokens is the set of reserved from-zone/to-zone tokens
+// that name a context rather than an operator-defined security zone, and so
+// must be exempt from the "zone must be defined" gate
+// (validatePolicyZoneReferencesStrict, #2401):
+//
+//   - ""            — an empty token: a zone-pair with no name compiles to no
+//     usable rule and is not an undefined-zone reference per se; leave it to
+//     the structural compiler rather than reporting a confusing `""` error.
+//   - "any"         — Junos wildcard zone (`from-zone any`/`to-zone any`); the
+//     dataplane treats it as match-any, never a named zone-id lookup.
+//   - "junos-host"  — Junos reserved self-traffic zone (host-inbound / host-
+//     outbound policy context); it is never declared as a `security zone`.
+//
+// Global policies (`security policies global { ... }`) are not validated here:
+// they live in cfg.Security.GlobalPolicies with no from/to-zone strings and
+// are mapped to the `junos-global` sentinel only when the dataplane snapshot is
+// built (see pkg/dataplane/userspace/policies.go), so they cannot reference an
+// undefined zone.
+var policyZoneSpecialTokens = map[string]struct{}{
+	"":           {},
+	"any":        {},
+	"junos-host": {},
+}
+
+// validatePolicyZoneReferencesStrict hard-rejects a security policy zone-pair
+// (`from-zone <a> to-zone <b> { policy ... }`) whose from-zone or to-zone names
+// a security zone the configuration never defines (#2401).
+//
+// Such a stanza is compiled and the rules are KEPT, but the userspace
+// dataplane resolves the unknown zone name to no zone-id and therefore never
+// indexes the rule into its zone-pair lookup table (userspace-dp/src/policy.rs:
+// the unknown-zone branch logs "policy rule references unknown zone(s) ...
+// (rule kept, but not indexed)"). At match time the zone pair has no indexed
+// rule, so evaluation falls through to `state.default_action`: under a permit
+// default this is a silent fail-OPEN (a deny rule the operator wrote against a
+// mistyped/uncreated zone does nothing); under a deny default it blackholes
+// with no operator-visible signal beyond a stderr line. Junos rejects an
+// undefined zone reference at commit; this validator restores that fail-CLOSED
+// parity.
+//
+// ValidateConfig already surfaced this as a warning only (commit succeeded with
+// an unenforceable rule). This is the strict commit / commit-check gate;
+// CompileConfigLenient downgrades it back to a warning (lenientPolicyZoneRefs)
+// so an already-persisted or peer-synced config carrying a stale zone reference
+// still boots — the dataplane drops the unindexed rule on its own, so a
+// leniently-loaded bad config is inert.
+//
+// Special zone tokens (`any`, `junos-host`, the empty token) are exempt; global
+// policies are not iterated (see policyZoneSpecialTokens). Iteration is in
+// cfg.Security.Policies order, which is deterministic (built in config order by
+// compileSecurityPolicies), so the first-reported error is stable.
+func validatePolicyZoneReferencesStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	defined := func(zone string) bool {
+		if _, special := policyZoneSpecialTokens[zone]; special {
+			return true
+		}
+		_, ok := cfg.Security.Zones[zone]
+		return ok
+	}
+	for _, zpp := range cfg.Security.Policies {
+		if zpp == nil {
+			continue
+		}
+		if !defined(zpp.FromZone) {
+			return fmt.Errorf(
+				"security policy from-zone %q to-zone %q references undefined from-zone %q; define `set security zones security-zone %s` in the same commit or the rule is silently never matched (zone-pair falls through to the default policy)",
+				zpp.FromZone, zpp.ToZone, zpp.FromZone, zpp.FromZone)
+		}
+		if !defined(zpp.ToZone) {
+			return fmt.Errorf(
+				"security policy from-zone %q to-zone %q references undefined to-zone %q; define `set security zones security-zone %s` in the same commit or the rule is silently never matched (zone-pair falls through to the default policy)",
+				zpp.FromZone, zpp.ToZone, zpp.ToZone, zpp.ToZone)
+		}
+	}
+	return nil
+}
+
 // validateApplicationSpecsStrict hard-rejects a user-defined application
 // (`set applications application <name> ...`) whose destination-port /
 // source-port is malformed (not a valid numeric port, port range, or known

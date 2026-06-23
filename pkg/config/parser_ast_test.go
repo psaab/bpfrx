@@ -56,6 +56,10 @@ func TestBracketList(t *testing.T) {
 	// references; this test only asserts bracket-list parsing yields
 	// three tokens.
 	input := `security {
+    zones {
+        security-zone trust;
+        security-zone untrust;
+    }
     address-book {
         global {
             address server1 10.0.0.1/32;
@@ -560,6 +564,18 @@ func TestDeletePath(t *testing.T) {
 	if err := tree.DeletePath(path); err == nil {
 		t.Error("deleting nonexistent path should return error")
 	}
+	// Deleting the untrust zone above orphaned the `from-zone trust to-zone
+	// untrust` policy; that reference is now undefined and is rejected at
+	// commit (#2401 fail-closed). Remove the orphaned policy so the final
+	// compile exercises the deletion mechanics this test asserts (zone counts
+	// + zone contents), not the undefined-zone gate.
+	path, errDel := ParseSetCommand("delete security policies from-zone trust to-zone untrust")
+	if errDel != nil {
+		t.Fatalf("ParseSetCommand(delete orphaned zone-pair policy): %v", errDel)
+	}
+	if err := tree.DeletePath(path); err != nil {
+		t.Fatalf("delete orphaned zone-pair policy: %v", err)
+	}
 	cfg, err := CompileConfig(tree)
 	if err != nil {
 		t.Fatalf("CompileConfig after deletions: %v", err)
@@ -577,7 +593,7 @@ func TestDeletePath(t *testing.T) {
 
 func TestInsertBeforeAfter(t *testing.T) {
 	tree := &ConfigTree{}
-	setCommands := []string{"set security policies from-zone trust to-zone untrust policy first match source-address any", "set security policies from-zone trust to-zone untrust policy first then permit", "set security policies from-zone trust to-zone untrust policy second match source-address any", "set security policies from-zone trust to-zone untrust policy second then permit", "set security policies from-zone trust to-zone untrust policy third match source-address any", "set security policies from-zone trust to-zone untrust policy third then permit"}
+	setCommands := []string{"set security zones security-zone trust", "set security zones security-zone untrust", "set security policies from-zone trust to-zone untrust policy first match source-address any", "set security policies from-zone trust to-zone untrust policy first then permit", "set security policies from-zone trust to-zone untrust policy second match source-address any", "set security policies from-zone trust to-zone untrust policy second then permit", "set security policies from-zone trust to-zone untrust policy third match source-address any", "set security policies from-zone trust to-zone untrust policy third then permit"}
 	for _, cmd := range setCommands {
 		path, err := ParseSetCommand(cmd)
 		if err != nil {
@@ -3912,7 +3928,7 @@ func TestInactiveApplyGroupsNotInheritedInDisplay(t *testing.T) {
 }
 
 func TestApplyGroupsWildcard(t *testing.T) {
-	setCommands := []string{"set security policies from-zone trust to-zone untrust policy allow-all match source-address any", "set security policies from-zone trust to-zone untrust policy allow-all match destination-address any", "set security policies from-zone trust to-zone untrust policy allow-all match application any", "set security policies from-zone trust to-zone untrust policy allow-all then permit", "set security policies from-zone dmz to-zone untrust policy dmz-out match source-address any", "set security policies from-zone dmz to-zone untrust policy dmz-out match destination-address any", "set security policies from-zone dmz to-zone untrust policy dmz-out match application any", "set security policies from-zone dmz to-zone untrust policy dmz-out then permit", "set groups default-deny-template security policies from-zone <*> to-zone <*> policy default-deny then log session-init", "set apply-groups default-deny-template"}
+	setCommands := []string{"set security zones security-zone trust", "set security zones security-zone untrust", "set security zones security-zone dmz", "set security policies from-zone trust to-zone untrust policy allow-all match source-address any", "set security policies from-zone trust to-zone untrust policy allow-all match destination-address any", "set security policies from-zone trust to-zone untrust policy allow-all match application any", "set security policies from-zone trust to-zone untrust policy allow-all then permit", "set security policies from-zone dmz to-zone untrust policy dmz-out match source-address any", "set security policies from-zone dmz to-zone untrust policy dmz-out match destination-address any", "set security policies from-zone dmz to-zone untrust policy dmz-out match application any", "set security policies from-zone dmz to-zone untrust policy dmz-out then permit", "set groups default-deny-template security policies from-zone <*> to-zone <*> policy default-deny then log session-init", "set apply-groups default-deny-template"}
 	tree := &ConfigTree{}
 	for _, cmd := range setCommands {
 		path, err := ParseSetCommand(cmd)

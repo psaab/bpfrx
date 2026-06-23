@@ -246,6 +246,7 @@ func TestInactive_JSONMarker(t *testing.T) {
 
 func TestInactive_CompileExcludesPolicy(t *testing.T) {
 	withInactive := mustParse(t, `security {
+    zones { security-zone trust; security-zone untrust; }
     policies {
         from-zone trust to-zone untrust {
             inactive: policy parked {
@@ -273,6 +274,7 @@ func TestInactive_CompileExcludesPolicy(t *testing.T) {
 
 	// The compiled output must equal the active-only equivalent config.
 	activeOnly := mustParse(t, `security {
+    zones { security-zone trust; security-zone untrust; }
     policies {
         from-zone trust to-zone untrust {
             policy live {
@@ -296,6 +298,7 @@ func TestInactive_CompileExcludesPolicy(t *testing.T) {
 // — the caller's tree must retain the inactive node for display/persistence.
 func TestInactive_CompileDoesNotMutateInput(t *testing.T) {
 	tree := mustParse(t, `security {
+    zones { security-zone trust; security-zone untrust; }
     policies {
         from-zone trust to-zone untrust {
             inactive: policy parked {
@@ -406,6 +409,7 @@ func TestInactive_JSONStructOmitemptyForActive(t *testing.T) {
 func TestInactive_UpgradeEquivalence(t *testing.T) {
 	// New behavior: parsed `inactive:` -> Inactive flag -> stripped.
 	newForm := mustParse(t, `security {
+    zones { security-zone trust; security-zone untrust; }
     policies {
         from-zone trust to-zone untrust {
             inactive: policy parked { then { deny; } }
@@ -420,19 +424,27 @@ func TestInactive_UpgradeEquivalence(t *testing.T) {
 	// Old behavior simulated: the mangled node with Keys[0]=="inactive:"
 	// that no compiler walk matched -> excluded all the same.
 	oldForm := &ConfigTree{Children: []*Node{{
-		Keys: []string{"security"}, Children: []*Node{{
-			Keys: []string{"policies"}, Children: []*Node{{
-				Keys: []string{"from-zone", "trust", "to-zone", "untrust"},
-				Children: []*Node{{
-					Keys: []string{"inactive:", "policy", "parked"},
+		Keys: []string{"security"}, Children: []*Node{
+			{
+				Keys: []string{"zones"}, Children: []*Node{
+					{Keys: []string{"security-zone", "trust"}},
+					{Keys: []string{"security-zone", "untrust"}},
+				},
+			},
+			{
+				Keys: []string{"policies"}, Children: []*Node{{
+					Keys: []string{"from-zone", "trust", "to-zone", "untrust"},
 					Children: []*Node{{
-						Keys: []string{"then"}, Children: []*Node{{
-							Keys: []string{"deny"}, IsLeaf: true,
+						Keys: []string{"inactive:", "policy", "parked"},
+						Children: []*Node{{
+							Keys: []string{"then"}, Children: []*Node{{
+								Keys: []string{"deny"}, IsLeaf: true,
+							}},
 						}},
 					}},
 				}},
-			}},
-		}},
+			},
+		},
 	}}}
 	cfgOld, err := CompileConfig(oldForm)
 	if err != nil {
@@ -478,6 +490,8 @@ func TestInactive_DualASTFlatSet(t *testing.T) {
 	// ALWAYS ParseSetCommand+SetPath for flat-set, never NewParser).
 	tree := &ConfigTree{}
 	for _, cmd := range []string{
+		"set security zones security-zone trust",
+		"set security zones security-zone untrust",
 		"set security policies from-zone trust to-zone untrust policy p1 then permit",
 	} {
 		path, err := ParseSetCommand(cmd)
@@ -545,6 +559,7 @@ func TestInactive_FormatSetRoundTripsDeactivate(t *testing.T) {
     inactive: name-server 9.9.9.9;
 }
 security {
+    zones { security-zone trust; security-zone untrust; }
     policies {
         from-zone trust to-zone untrust {
             inactive: policy parked { then { deny; } }
@@ -610,6 +625,7 @@ security {
 
 func TestInactive_HABothNodesExcludeSame(t *testing.T) {
 	tree := mustParse(t, `security {
+    zones { security-zone trust; security-zone untrust; }
     policies {
         from-zone trust to-zone untrust {
             inactive: policy parked { then { deny; } }

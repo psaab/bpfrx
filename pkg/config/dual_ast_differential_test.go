@@ -222,6 +222,10 @@ var dualASTCases = []dualASTCase{
 	{
 		name: "security-policies",
 		hier: `security {
+    zones {
+        security-zone trust;
+        security-zone untrust;
+    }
     policies {
         from-zone trust to-zone untrust {
             policy allow-web {
