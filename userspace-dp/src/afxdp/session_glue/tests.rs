@@ -73,6 +73,7 @@ fn empty_filter(name: &str, family: &str) -> Arc<Filter> {
         has_log_terms: false,
         has_terminal_action_terms: false,
         has_dscp_match_terms: false,
+        has_per_packet_l4_match_terms: false,
         has_three_color_policer_terms: false,
     })
 }
@@ -901,9 +902,8 @@ fn lookup_forward_nat_across_scopes_returns_shared_canonical_reverse_entry() {
         .expect("shared nat lock")
         .insert(canonical_reply.clone(), entry.clone());
 
-    let hit =
-        lookup_forward_nat_across_scopes(&sessions, &shared_nat_sessions, &canonical_reply)
-            .expect("shared canonical reverse hit");
+    let hit = lookup_forward_nat_across_scopes(&sessions, &shared_nat_sessions, &canonical_reply)
+        .expect("shared canonical reverse hit");
     assert_eq!(hit.key, entry.key);
     assert_eq!(hit.decision, entry.decision);
     assert_eq!(hit.metadata, entry.metadata);
@@ -956,8 +956,7 @@ fn publish_and_remove_shared_session_tracks_forward_wire_alias() {
         &entry.key,
     );
     assert!(
-        lookup_shared_forward_wire_match(&shared_forward_wire_sessions, &translated_key)
-            .is_none()
+        lookup_shared_forward_wire_match(&shared_forward_wire_sessions, &translated_key).is_none()
     );
 }
 
@@ -1064,9 +1063,7 @@ fn publish_and_remove_shared_session_tracks_owner_rg_indexes() {
     assert!(
         nat_index
             .get(&entry.metadata.owner_rg_id)
-            .is_some_and(
-                |keys| keys.contains(&reverse_wire) && keys.contains(&reverse_canonical)
-            )
+            .is_some_and(|keys| keys.contains(&reverse_wire) && keys.contains(&reverse_canonical))
     );
     drop(nat_index);
 
@@ -1388,8 +1385,7 @@ fn resolve_flow_session_decision_promotes_translated_shared_hit_on_active_fabric
 }
 
 #[test]
-fn resolve_flow_session_decision_promotes_local_synced_translated_hit_on_active_fabric_ingress()
-{
+fn resolve_flow_session_decision_promotes_local_synced_translated_hit_on_active_fabric_ingress() {
     let mut sessions = SessionTable::new();
     let key = test_key();
     let decision = SessionDecision {
@@ -1473,7 +1469,7 @@ fn resolve_flow_session_decision_promotes_local_synced_translated_hit_on_active_
 
 #[test]
 fn resolve_flow_session_decision_keeps_translated_shared_hit_transient_on_inactive_fabric_ingress()
- {
+{
     let mut sessions = SessionTable::new();
     let key = test_key();
     let decision = SessionDecision {
@@ -3146,7 +3142,14 @@ fn synthesized_synced_reverse_entry_uses_fabric_redirect_when_client_rg_inactive
     assert_eq!(reverse.decision.resolution.egress_ifindex, 21);
     assert_eq!(
         reverse.decision.resolution.src_mac,
-        Some([0x02, 0xbf, 0x72, FABRIC_ZONE_MAC_MAGIC, 0x00, TEST_WAN_ZONE_ID as u8])
+        Some([
+            0x02,
+            0xbf,
+            0x72,
+            FABRIC_ZONE_MAC_MAGIC,
+            0x00,
+            TEST_WAN_ZONE_ID as u8
+        ])
     );
     assert_eq!(reverse.metadata.owner_rg_id, 2);
     assert!(reverse.metadata.is_reverse);
@@ -3179,7 +3182,14 @@ fn session_hit_ha_inactive_uses_zone_encoded_fabric_redirect() {
     assert_eq!(redirected.tx_ifindex, 21);
     assert_eq!(
         redirected.src_mac,
-        Some([0x02, 0xbf, 0x72, FABRIC_ZONE_MAC_MAGIC, 0x00, TEST_SFMIX_ZONE_ID as u8])
+        Some([
+            0x02,
+            0xbf,
+            0x72,
+            FABRIC_ZONE_MAC_MAGIC,
+            0x00,
+            TEST_SFMIX_ZONE_ID as u8
+        ])
     );
 }
 
@@ -3568,8 +3578,7 @@ fn reverse_prewarm_index_tracks_split_reverse_owner_rg_candidate() {
 }
 
 #[test]
-fn reverse_session_from_split_owner_fabric_redirect_uses_fabric_return_when_client_rg_inactive()
-{
+fn reverse_session_from_split_owner_fabric_redirect_uses_fabric_return_when_client_rg_inactive() {
     let forwarding = test_forwarding_state_split_rgs();
     let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
     let ha_state = BTreeMap::from([(2, inactive_ha_runtime(1))]);
@@ -3894,9 +3903,7 @@ fn apply_worker_commands_dispatch_order_pin_with_demote_dedup() {
 
     {
         let mut pending = commands.lock().expect("commands lock");
-        pending.push_back(WorkerCommand::DemoteOwnerRGS {
-            owner_rgs: vec![5],
-        });
+        pending.push_back(WorkerCommand::DemoteOwnerRGS { owner_rgs: vec![5] });
         pending.push_back(WorkerCommand::UpsertSynced(synced_entry.clone()));
         pending.push_back(WorkerCommand::DemoteOwnerRGS {
             owner_rgs: vec![5, 5], // duplicate within the same command
@@ -3905,13 +3912,9 @@ fn apply_worker_commands_dispatch_order_pin_with_demote_dedup() {
             sequence: 7,
             owner_rgs: vec![5],
         });
-        pending.push_back(WorkerCommand::DemoteOwnerRGS {
-            owner_rgs: vec![7],
-        });
+        pending.push_back(WorkerCommand::DemoteOwnerRGS { owner_rgs: vec![7] });
         pending.push_back(WorkerCommand::EnqueueShapedLocal(shaped_req));
-        pending.push_back(WorkerCommand::RefreshOwnerRGS {
-            owner_rgs: vec![5],
-        });
+        pending.push_back(WorkerCommand::RefreshOwnerRGS { owner_rgs: vec![5] });
         pending.push_back(WorkerCommand::VacateAllSharedExactSlots);
     }
 
@@ -3972,8 +3975,14 @@ fn apply_worker_commands_dispatch_order_pin_with_demote_dedup() {
         .iter()
         .filter(|k| **k == key_rg7)
         .count();
-    assert_eq!(rg5_count, 1, "key_rg5 must appear exactly once in cancelled_keys");
-    assert_eq!(rg7_count, 1, "key_rg7 must appear exactly once in cancelled_keys");
+    assert_eq!(
+        rg5_count, 1,
+        "key_rg5 must appear exactly once in cancelled_keys"
+    );
+    assert_eq!(
+        rg7_count, 1,
+        "key_rg7 must appear exactly once in cancelled_keys"
+    );
     // Nothing else got cancelled.
     assert_eq!(results.cancelled_keys.len(), 2);
 
@@ -4080,10 +4089,10 @@ fn replicate_session_upsert_delivers_to_poisoned_queue() {
     for (worker_id, queue) in queues.iter().enumerate() {
         let pending = queue.lock().expect("queue unpoisoned after replicate");
         assert!(
-            pending
-                .iter()
-                .any(|command| matches!(command, WorkerCommand::UpsertSynced(replica)
-                    if replica.key == entry.key)),
+            pending.iter().any(
+                |command| matches!(command, WorkerCommand::UpsertSynced(replica)
+                    if replica.key == entry.key)
+            ),
             "worker {worker_id} missing UpsertSynced replica"
         );
     }
@@ -4103,10 +4112,10 @@ fn replicate_session_delete_delivers_to_poisoned_queue() {
     for (worker_id, queue) in queues.iter().enumerate() {
         let pending = queue.lock().expect("queue unpoisoned after replicate");
         assert!(
-            pending
-                .iter()
-                .any(|command| matches!(command, WorkerCommand::DeleteSynced(deleted)
-                    if deleted == &key)),
+            pending.iter().any(
+                |command| matches!(command, WorkerCommand::DeleteSynced(deleted)
+                    if deleted == &key)
+            ),
             "worker {worker_id} missing DeleteSynced"
         );
     }
@@ -4394,8 +4403,7 @@ fn shared_nat_displacement_counter_counts_collisions_not_republishes() {
     let mut promoted_canonical = w3_forward_entry(130, 40_005, snat_ip);
     promoted_canonical.origin = SessionOrigin::SharedPromote;
     let mut promoted_alias = promoted_canonical.clone();
-    promoted_alias.key =
-        forward_wire_key(&promoted_canonical.key, promoted_canonical.decision.nat);
+    promoted_alias.key = forward_wire_key(&promoted_canonical.key, promoted_canonical.decision.nat);
     let promote_map = Arc::new(Mutex::new(FastMap::default()));
     let before_promote = NAT_REVERSE_KEY_SHARED_DISPLACEMENTS.load(Ordering::Relaxed);
     for entry in [
@@ -4417,7 +4425,6 @@ fn shared_nat_displacement_counter_counts_collisions_not_republishes() {
         "SharedPromote canonical<->alias churn must not count (either order)"
     );
 }
-
 
 #[test]
 fn nat_reverse_key_warn_throttle_claims_once_per_window() {

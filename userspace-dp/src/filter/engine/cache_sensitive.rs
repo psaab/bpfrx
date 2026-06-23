@@ -44,7 +44,16 @@ fn evaluate_filter_ref_tx_selection_cached_v4(
     dscp: u8,
 ) -> CachedTxSelectionFilterResult {
     for term in &filter.terms {
-        if !term_matches_v4(term, src_ip, dst_ip, protocol, src_port, dst_port, dscp) {
+        if !term_matches_v4(
+            term,
+            src_ip,
+            dst_ip,
+            protocol,
+            src_port,
+            dst_port,
+            dscp,
+            TermMatchExtra::default(),
+        ) {
             continue;
         }
         return CachedTxSelectionFilterResult {
@@ -72,7 +81,16 @@ fn evaluate_filter_ref_tx_selection_cached_v6(
     dscp: u8,
 ) -> CachedTxSelectionFilterResult {
     for term in &filter.terms {
-        if !term_matches_v6(term, src_ip, dst_ip, protocol, src_port, dst_port, dscp) {
+        if !term_matches_v6(
+            term,
+            src_ip,
+            dst_ip,
+            protocol,
+            src_port,
+            dst_port,
+            dscp,
+            TermMatchExtra::default(),
+        ) {
             continue;
         }
         return CachedTxSelectionFilterResult {
@@ -113,6 +131,10 @@ fn filter_term_semantics_match(old: &FilterTerm, new: &FilterTerm) -> bool {
         && old.dest_ports == new.dest_ports
         && old.dscp_bitmap == new.dscp_bitmap
         && old.dscp_match_enabled == new.dscp_match_enabled
+        && old.tcp_flags_mask == new.tcp_flags_mask
+        && old.is_fragment == new.is_fragment
+        && old.icmp_type == new.icmp_type
+        && old.icmp_code == new.icmp_code
         && old.action == new.action
         && old.count == new.count
         && old.has_count == new.has_count
@@ -133,6 +155,7 @@ fn dscp_sensitive_filter_semantics_match(old: &Filter, new: &Filter) -> bool {
         && old.has_log_terms == new.has_log_terms
         && old.has_terminal_action_terms == new.has_terminal_action_terms
         && old.has_dscp_match_terms == new.has_dscp_match_terms
+        && old.has_per_packet_l4_match_terms == new.has_per_packet_l4_match_terms
         && old.has_three_color_policer_terms == new.has_three_color_policer_terms
         && old.terms.len() == new.terms.len()
         && old
@@ -197,4 +220,81 @@ pub(crate) fn interface_output_filter_has_dscp_match(
         state.iface_filter_out_v4_fast.get(&ifindex)
     };
     filter.is_some_and(|filter| filter.has_dscp_match_terms)
+}
+
+// ---------------------------------------------------------------------------
+// #2362 per-packet L4 match (tcp-flags / is-fragment / icmp-type / icmp-code).
+// These vary per packet within a 5-tuple flow exactly like DSCP, so they get
+// the same cache-coherency treatment: a flow-cache decline (flow_cache.rs), a
+// per-packet re-evaluation on session hit (poll_descriptor/filter.rs), and a
+// config-rotation purge (worker/loop_body) when the per-packet-L4 filter set
+// changes. The structural equality test reuses dscp_sensitive_filter_semantics_match
+// (which now also compares the per-packet term fields).
+// ---------------------------------------------------------------------------
+
+fn input_per_packet_l4_filter_family_changed(
+    old_filters: &rustc_hash::FxHashMap<i32, Arc<Filter>>,
+    new_filters: &rustc_hash::FxHashMap<i32, Arc<Filter>>,
+) -> bool {
+    old_filters
+        .iter()
+        .filter(|(_, filter)| filter.has_per_packet_l4_match_terms)
+        .any(|(ifindex, old)| {
+            new_filters
+                .get(ifindex)
+                .is_none_or(|new| !dscp_sensitive_filter_semantics_match(old, new))
+        })
+        || new_filters
+            .iter()
+            .filter(|(_, filter)| filter.has_per_packet_l4_match_terms)
+            .any(|(ifindex, new)| {
+                old_filters
+                    .get(ifindex)
+                    .is_none_or(|old| !dscp_sensitive_filter_semantics_match(old, new))
+            })
+}
+
+pub(crate) fn input_per_packet_l4_filter_families_changed(
+    old: &FilterState,
+    new: &FilterState,
+) -> (bool, bool) {
+    (
+        input_per_packet_l4_filter_family_changed(
+            &old.iface_filter_v4_fast,
+            &new.iface_filter_v4_fast,
+        ),
+        input_per_packet_l4_filter_family_changed(
+            &old.iface_filter_v6_fast,
+            &new.iface_filter_v6_fast,
+        ),
+    )
+}
+
+pub(crate) fn interface_input_filter_has_per_packet_l4_match(
+    state: &FilterState,
+    ifindex: i32,
+    is_v6: bool,
+) -> bool {
+    if is_v6 {
+        state
+            .iface_filter_v6_has_per_packet_l4_match
+            .contains(&ifindex)
+    } else {
+        state
+            .iface_filter_v4_has_per_packet_l4_match
+            .contains(&ifindex)
+    }
+}
+
+pub(crate) fn interface_output_filter_has_per_packet_l4_match(
+    state: &FilterState,
+    ifindex: i32,
+    is_v6: bool,
+) -> bool {
+    let filter = if is_v6 {
+        state.iface_filter_out_v6_fast.get(&ifindex)
+    } else {
+        state.iface_filter_out_v4_fast.get(&ifindex)
+    };
+    filter.is_some_and(|filter| filter.has_per_packet_l4_match_terms)
 }

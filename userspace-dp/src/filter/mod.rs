@@ -86,6 +86,22 @@ pub(crate) struct FilterTerm {
     pub(crate) dest_ports: PortMatcher,
     pub(crate) dscp_bitmap: u64,
     pub(crate) dscp_match_enabled: bool,
+    // Per-packet L4 match conditions (#2362). NOT in SessionKey, so a filter
+    // carrying any of these is cache-sensitive (path (b) per the #1431
+    // invariant above): the flow-cache must decline insertion and the
+    // change-detection / re-eval / rotation-purge machinery in
+    // cache_sensitive.rs must treat them like dscp.
+    //
+    // tcp_flags_mask: required-bits mask over the TCP flags byte. A TCP packet
+    // matches when (flags & mask) == mask. None = no constraint. Only TCP can
+    // match a term that sets this.
+    pub(crate) tcp_flags_mask: Option<u8>,
+    // is_fragment: matches any IP fragment.
+    pub(crate) is_fragment: bool,
+    // icmp_type / icmp_code: exact match on the ICMP/ICMPv6 type/code byte.
+    // None = no constraint. Only ICMP/ICMPv6 can match a term that sets these.
+    pub(crate) icmp_type: Option<u8>,
+    pub(crate) icmp_code: Option<u8>,
     pub(crate) action: FilterAction,
     pub(crate) count: String,
     pub(crate) has_count: bool,
@@ -96,6 +112,52 @@ pub(crate) struct FilterTerm {
     pub(crate) forwarding_class: Arc<str>,
     pub(crate) dscp_rewrite: Option<u8>,
     pub(crate) counter: Arc<FilterTermCounter>,
+}
+
+impl FilterTerm {
+    /// Whether this term carries any per-packet L4 match condition (#2362)
+    /// that is not part of the 5-tuple SessionKey: tcp-flags, is-fragment,
+    /// icmp-type, or icmp-code. A filter with such a term is cache-sensitive
+    /// (the flow-cache must decline insertion — see `flow_cache.rs`).
+    #[inline]
+    pub(crate) fn has_per_packet_l4_match(&self) -> bool {
+        self.tcp_flags_mask.is_some()
+            || self.is_fragment
+            || self.icmp_type.is_some()
+            || self.icmp_code.is_some()
+    }
+}
+
+/// Per-packet match inputs that are NOT in the 5-tuple (#2362). Computed once
+/// per packet at each evaluate call site (the only place that has the frame
+/// bytes) and threaded into the term predicate. `Default` (all-absent,
+/// `l4_present = false`) makes every L4 per-packet condition fail to match, so
+/// callers that cannot cheaply compute these (cached/TX-selection rebuild
+/// paths, which never carry an L4-match term because the flow-cache declines
+/// for such filters) stay behavior-compatible AND fail closed.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct TermMatchExtra {
+    /// Raw TCP flags byte (only meaningful when protocol == TCP and
+    /// `l4_present`).
+    pub(crate) tcp_flags: u8,
+    /// Whether the packet is an IP fragment (any fragment). L3-derived — valid
+    /// regardless of `l4_present` (every fragment carries the IP header).
+    pub(crate) is_fragment: bool,
+    /// ICMP/ICMPv6 type byte (only meaningful when protocol is ICMP/ICMPv6 and
+    /// `l4_present`).
+    pub(crate) icmp_type: u8,
+    /// ICMP/ICMPv6 code byte (only meaningful when protocol is ICMP/ICMPv6 and
+    /// `l4_present`).
+    pub(crate) icmp_code: u8,
+    /// #2362 fold A (Copilot): whether a real L4 header is present at
+    /// `l4_offset`. FALSE for a NON-FIRST fragment (its post-IP bytes are
+    /// payload, not an L4 header) and for any other no-L4 case. The matcher
+    /// gates the tcp-flags / icmp-type / icmp-code constraints on this flag —
+    /// NOT on the byte values — because 0 is a VALID icmp-type (echo-reply) and
+    /// a VALID icmp-code, so a zeroed byte would still spuriously match
+    /// `icmp-type 0` / `icmp-code 0`. `is_fragment` is L3-derived and is NOT
+    /// gated by this flag.
+    pub(crate) l4_present: bool,
 }
 
 /// Inclusive port range.
@@ -141,6 +203,10 @@ pub(crate) struct Filter {
     pub(crate) has_log_terms: bool,
     pub(crate) has_terminal_action_terms: bool,
     pub(crate) has_dscp_match_terms: bool,
+    /// Any term carries a per-packet L4 match (tcp-flags / is-fragment /
+    /// icmp-type / icmp-code) — #2362. Cache-sensitive like
+    /// `has_dscp_match_terms`: the flow-cache must decline for these filters.
+    pub(crate) has_per_packet_l4_match_terms: bool,
     pub(crate) has_three_color_policer_terms: bool,
 }
 
@@ -447,6 +513,9 @@ pub(crate) struct FilterState {
     pub(crate) iface_filter_v4_affects_route_lookup: rustc_hash::FxHashSet<i32>,
     /// Per-interface inet input filters with DSCP match terms.
     pub(crate) iface_filter_v4_has_dscp_match: rustc_hash::FxHashSet<i32>,
+    /// Per-interface inet input filters with per-packet L4 match terms (#2362:
+    /// tcp-flags / is-fragment / icmp-type / icmp-code). Cache-sensitive.
+    pub(crate) iface_filter_v4_has_per_packet_l4_match: rustc_hash::FxHashSet<i32>,
     /// Per-interface (ifindex) input filter key for inet6.
     pub(crate) iface_filter_v6: rustc_hash::FxHashMap<i32, String>,
     /// Direct per-interface inet6 filter reference for packet hot-path evaluation.
@@ -461,6 +530,8 @@ pub(crate) struct FilterState {
     pub(crate) iface_filter_v6_affects_route_lookup: rustc_hash::FxHashSet<i32>,
     /// Per-interface inet6 input filters with DSCP match terms.
     pub(crate) iface_filter_v6_has_dscp_match: rustc_hash::FxHashSet<i32>,
+    /// Per-interface inet6 input filters with per-packet L4 match terms (#2362).
+    pub(crate) iface_filter_v6_has_per_packet_l4_match: rustc_hash::FxHashSet<i32>,
     /// Per-interface (ifindex) output filter key for inet.
     pub(crate) iface_filter_out_v4: rustc_hash::FxHashMap<i32, String>,
     /// Direct per-interface inet output filter reference for packet hot-path evaluation.

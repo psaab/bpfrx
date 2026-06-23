@@ -156,12 +156,16 @@ fn cache_hit_accumulates_observed_bytes() {
         config_generation: 5,
         fib_generation: 3,
     };
-    assert!(cache
-        .lookup_counted(&key, lookup, 0, &rg_epochs, 1500)
-        .is_some());
-    assert!(cache
-        .lookup_counted(&key, lookup, 0, &rg_epochs, 900)
-        .is_some());
+    assert!(
+        cache
+            .lookup_counted(&key, lookup, 0, &rg_epochs, 1500)
+            .is_some()
+    );
+    assert!(
+        cache
+            .lookup_counted(&key, lookup, 0, &rg_epochs, 900)
+            .is_some()
+    );
 
     let (_active_count, rows, _cos_counts, _truncated) = cache.active_flow_debug_entries(8);
     assert_eq!(rows.len(), 1);
@@ -743,6 +747,106 @@ fn from_forward_decision_skips_cache_for_dscp_matched_input_filter() {
     );
 }
 
+// #2362: a per-packet L4 (tcp-flags / is-fragment / icmp-type / icmp-code)
+// input filter must decline the flow-cache for the same reason DSCP does —
+// the condition varies per packet within a 5-tuple flow.
+#[test]
+fn from_forward_decision_skips_cache_for_per_packet_l4_input_filter() {
+    let rg_epochs = default_rg_epochs();
+    let (flow, meta, validation, decision, mut forwarding, ha_state) = make_v4_round_trip_inputs();
+    forwarding.filter_state = crate::filter::parse_filter_state(
+        &[FirewallFilterSnapshot {
+            name: "lan-drop-syn".into(),
+            family: "inet".into(),
+            terms: vec![FirewallTermSnapshot {
+                name: "drop-syn".into(),
+                protocols: vec!["tcp".into()],
+                action: "discard".into(),
+                tcp_flags: Some(0x02),
+                ..Default::default()
+            }],
+        }],
+        &[],
+        &[InterfaceSnapshot {
+            name: "reth1.0".into(),
+            ifindex: meta.ingress_ifindex as i32,
+            filter_input_v4: "lan-drop-syn".into(),
+            ..Default::default()
+        }],
+        "",
+        "",
+    );
+
+    let entry = FlowCacheEntry::from_forward_decision(
+        &flow,
+        meta,
+        validation,
+        decision,
+        1,
+        Some(TEST_TRUST_ZONE_ID),
+        Some(7),
+        None,
+        &forwarding,
+        &ha_state,
+        false,
+        &rg_epochs,
+    );
+
+    assert!(
+        entry.is_none(),
+        "tcp-flags-matched input filters depend on per-packet state outside \
+         the flow-cache key (#2362)",
+    );
+}
+
+#[test]
+fn from_forward_decision_skips_cache_for_per_packet_l4_output_filter() {
+    let rg_epochs = default_rg_epochs();
+    let (flow, meta, validation, decision, mut forwarding, ha_state) = make_v4_round_trip_inputs();
+    forwarding.filter_state = crate::filter::parse_filter_state(
+        &[FirewallFilterSnapshot {
+            name: "wan-drop-frag".into(),
+            family: "inet".into(),
+            terms: vec![FirewallTermSnapshot {
+                name: "drop-frag".into(),
+                action: "discard".into(),
+                is_fragment: true,
+                ..Default::default()
+            }],
+        }],
+        &[],
+        &[InterfaceSnapshot {
+            name: "reth0.0".into(),
+            ifindex: decision.resolution.egress_ifindex,
+            filter_output_v4: "wan-drop-frag".into(),
+            ..Default::default()
+        }],
+        "",
+        "",
+    );
+
+    let entry = FlowCacheEntry::from_forward_decision(
+        &flow,
+        meta,
+        validation,
+        decision,
+        1,
+        Some(TEST_TRUST_ZONE_ID),
+        Some(7),
+        None,
+        &forwarding,
+        &ha_state,
+        false,
+        &rg_epochs,
+    );
+
+    assert!(
+        entry.is_none(),
+        "is-fragment-matched output filters depend on per-packet state outside \
+         the flow-cache key (#2362)",
+    );
+}
+
 // ============================================================
 // #1431 cache-invariant runbook reference tests
 //
@@ -1024,16 +1128,17 @@ fn from_forward_decision_matching_family_returns_some() {
     // entry. Companion to the negative tests below so a future
     // refactor that breaks the constructor is obviously the cause and
     // not an unrelated input change.
-    let (flow, meta, validation, decision, forwarding, ha_state) =
-        make_v4_round_trip_inputs();
+    let (flow, meta, validation, decision, forwarding, ha_state) = make_v4_round_trip_inputs();
     let entry = try_build_entry(&flow, meta, validation, decision, &forwarding, &ha_state);
-    assert!(entry.is_some(), "matching-family v4 NAT should be cacheable");
+    assert!(
+        entry.is_some(),
+        "matching-family v4 NAT should be cacheable"
+    );
 }
 
 #[test]
 fn from_forward_decision_preserves_input_filter_log_for_cached_hits() {
-    let (flow, meta, validation, decision, forwarding, ha_state) =
-        make_v4_round_trip_inputs();
+    let (flow, meta, validation, decision, forwarding, ha_state) = make_v4_round_trip_inputs();
     let rg_epochs = default_rg_epochs();
     let input_log = CachedInputFilterLog {
         log_match: crate::filter::FilterLogMatch {
@@ -1084,8 +1189,7 @@ fn from_forward_decision_preserves_input_filter_log_for_cached_hits() {
 #[test]
 #[should_panic(expected = "RewriteDescriptor af-mismatch")]
 fn from_forward_decision_rejects_v6_rewrite_src_on_v4_meta_debug() {
-    let (flow, meta, validation, mut decision, forwarding, ha_state) =
-        make_v4_round_trip_inputs();
+    let (flow, meta, validation, mut decision, forwarding, ha_state) = make_v4_round_trip_inputs();
     decision.nat.rewrite_src = Some(IpAddr::V6(std::net::Ipv6Addr::new(
         0x2001, 0xdb8, 0, 0, 0, 0, 0, 1,
     )));
@@ -1096,8 +1200,7 @@ fn from_forward_decision_rejects_v6_rewrite_src_on_v4_meta_debug() {
 #[cfg(not(debug_assertions))]
 #[test]
 fn from_forward_decision_rejects_v6_rewrite_src_on_v4_meta_release() {
-    let (flow, meta, validation, mut decision, forwarding, ha_state) =
-        make_v4_round_trip_inputs();
+    let (flow, meta, validation, mut decision, forwarding, ha_state) = make_v4_round_trip_inputs();
     decision.nat.rewrite_src = Some(IpAddr::V6(std::net::Ipv6Addr::new(
         0x2001, 0xdb8, 0, 0, 0, 0, 0, 1,
     )));
@@ -1112,8 +1215,7 @@ fn from_forward_decision_rejects_v6_rewrite_src_on_v4_meta_release() {
 #[test]
 #[should_panic(expected = "RewriteDescriptor af-mismatch")]
 fn from_forward_decision_rejects_v4_rewrite_dst_on_v6_meta_debug() {
-    let (flow, meta, validation, mut decision, forwarding, ha_state) =
-        make_v6_round_trip_inputs();
+    let (flow, meta, validation, mut decision, forwarding, ha_state) = make_v6_round_trip_inputs();
     decision.nat.rewrite_dst = Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 7)));
     let _ = try_build_entry(&flow, meta, validation, decision, &forwarding, &ha_state);
 }
@@ -1121,8 +1223,7 @@ fn from_forward_decision_rejects_v4_rewrite_dst_on_v6_meta_debug() {
 #[cfg(not(debug_assertions))]
 #[test]
 fn from_forward_decision_rejects_v4_rewrite_dst_on_v6_meta_release() {
-    let (flow, meta, validation, mut decision, forwarding, ha_state) =
-        make_v6_round_trip_inputs();
+    let (flow, meta, validation, mut decision, forwarding, ha_state) = make_v6_round_trip_inputs();
     decision.nat.rewrite_dst = Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 7)));
     let entry = try_build_entry(&flow, meta, validation, decision, &forwarding, &ha_state);
     assert!(
@@ -1142,8 +1243,7 @@ fn from_forward_decision_rejects_v4_rewrite_dst_on_v6_meta_release() {
 #[test]
 #[should_panic(expected = "RewriteDescriptor af-mismatch")]
 fn from_forward_decision_rejects_v6_rewrite_dst_on_v4_meta_debug() {
-    let (flow, meta, validation, mut decision, forwarding, ha_state) =
-        make_v4_round_trip_inputs();
+    let (flow, meta, validation, mut decision, forwarding, ha_state) = make_v4_round_trip_inputs();
     decision.nat.rewrite_dst = Some(IpAddr::V6(std::net::Ipv6Addr::new(
         0x2001, 0xdb8, 0, 0, 0, 0, 0, 4,
     )));
@@ -1153,8 +1253,7 @@ fn from_forward_decision_rejects_v6_rewrite_dst_on_v4_meta_debug() {
 #[cfg(not(debug_assertions))]
 #[test]
 fn from_forward_decision_rejects_v6_rewrite_dst_on_v4_meta_release() {
-    let (flow, meta, validation, mut decision, forwarding, ha_state) =
-        make_v4_round_trip_inputs();
+    let (flow, meta, validation, mut decision, forwarding, ha_state) = make_v4_round_trip_inputs();
     decision.nat.rewrite_dst = Some(IpAddr::V6(std::net::Ipv6Addr::new(
         0x2001, 0xdb8, 0, 0, 0, 0, 0, 4,
     )));
@@ -1169,8 +1268,7 @@ fn from_forward_decision_rejects_v6_rewrite_dst_on_v4_meta_release() {
 #[test]
 #[should_panic(expected = "RewriteDescriptor af-mismatch")]
 fn from_forward_decision_rejects_v4_rewrite_src_on_v6_meta_debug() {
-    let (flow, meta, validation, mut decision, forwarding, ha_state) =
-        make_v6_round_trip_inputs();
+    let (flow, meta, validation, mut decision, forwarding, ha_state) = make_v6_round_trip_inputs();
     decision.nat.rewrite_src = Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 8)));
     let _ = try_build_entry(&flow, meta, validation, decision, &forwarding, &ha_state);
 }
@@ -1178,8 +1276,7 @@ fn from_forward_decision_rejects_v4_rewrite_src_on_v6_meta_debug() {
 #[cfg(not(debug_assertions))]
 #[test]
 fn from_forward_decision_rejects_v4_rewrite_src_on_v6_meta_release() {
-    let (flow, meta, validation, mut decision, forwarding, ha_state) =
-        make_v6_round_trip_inputs();
+    let (flow, meta, validation, mut decision, forwarding, ha_state) = make_v6_round_trip_inputs();
     decision.nat.rewrite_src = Some(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 8)));
     let entry = try_build_entry(&flow, meta, validation, decision, &forwarding, &ha_state);
     assert!(
@@ -1852,7 +1949,7 @@ fn count_active_flows_handles_epoch_wraparound() {
     // tick_advance_epoch skips 0 (sentinel), so the sequence near the
     // top is: MAX-1 → MAX → 1 → 2 (not 0).
     cache.current_epoch = u16::MAX - 1;
-    cache.tick_advance_epoch();  // u16::MAX
+    cache.tick_advance_epoch(); // u16::MAX
     let lookup = FlowCacheLookup {
         ingress_ifindex: 7,
         config_generation: 1,
@@ -1860,8 +1957,8 @@ fn count_active_flows_handles_epoch_wraparound() {
     };
     assert!(cache.lookup(&key, lookup, 0, &rg_epochs).is_some());
     // Now wrap: u16::MAX → wrapping_add(1) = 0, skipped → 1 → 2.
-    cache.tick_advance_epoch();  // skips 0, becomes 1
-    cache.tick_advance_epoch();  // 2
+    cache.tick_advance_epoch(); // skips 0, becomes 1
+    cache.tick_advance_epoch(); // 2
     // last_used_epoch was u16::MAX; current is 2; wrapping_sub
     // gives 2 - u16::MAX wrapping = 3. Within 10-epoch window → active.
     assert_eq!(cache.count_active_flows(), 1);
@@ -1874,7 +1971,10 @@ fn tick_advance_epoch_skips_zero_sentinel() {
     let mut cache = FlowCache::new();
     cache.current_epoch = u16::MAX;
     cache.tick_advance_epoch(); // would be 0 without the skip
-    assert_ne!(cache.current_epoch, 0, "epoch 0 is reserved sentinel and must never be produced by tick_advance_epoch");
+    assert_ne!(
+        cache.current_epoch, 0,
+        "epoch 0 is reserved sentinel and must never be produced by tick_advance_epoch"
+    );
     assert_eq!(cache.current_epoch, 1);
 }
 
@@ -1904,7 +2004,11 @@ fn count_active_flows_entry_at_epoch_max_not_confused_with_sentinel() {
     assert!(cache.lookup(&key, lookup, 0, &rg_epochs).is_some());
     // stamp is u16::MAX, not 0 → survives the sentinel check
     cache.tick_advance_epoch(); // skips 0 → 1
-    assert_eq!(cache.count_active_flows(), 1, "entry at epoch MAX must be active after 1-tick advance");
+    assert_eq!(
+        cache.count_active_flows(),
+        1,
+        "entry at epoch MAX must be active after 1-tick advance"
+    );
 }
 
 // ----------------------------------------------------------------
@@ -2043,7 +2147,10 @@ fn issue_1741_window_boundary_counts_age_9_clamps_age_10() {
         .map(|entry| entry.last_used_epoch)
         .next()
         .expect("entry still cached (clamp must not evict)");
-    assert_eq!(stamp_after_expiry, 0, "expired stamp must be sentinel-cleared");
+    assert_eq!(
+        stamp_after_expiry, 0,
+        "expired stamp must be sentinel-cleared"
+    );
 }
 
 /// A clamped entry is not evicted: a later fast-path hit re-stamps it,
@@ -2054,9 +2161,11 @@ fn issue_1741_clamped_entry_recoverable_by_hit() {
     let rg_epochs = default_rg_epochs();
     let (mut cache, key, lookup) = issue_1741_stamp_and_lookup();
     cache.insert(make_entry(key.clone(), issue_1741_stamp(), 1));
-    assert!(cache
-        .lookup_counted(&key, lookup, 0, &rg_epochs, 1500)
-        .is_some());
+    assert!(
+        cache
+            .lookup_counted(&key, lookup, 0, &rg_epochs, 1500)
+            .is_some()
+    );
     // Age out + clamp.
     for _ in 0..(ACTIVE_WINDOW_EPOCHS + 2) {
         cache.tick_advance_epoch();
@@ -2068,7 +2177,10 @@ fn issue_1741_clamped_entry_recoverable_by_hit() {
     let hit = cache
         .lookup_counted(&key, lookup, 0, &rg_epochs, 900)
         .expect("clamped entry must still be a cache hit");
-    assert_eq!(hit.observed_bytes, 2400, "observed_bytes preserved across clamp");
+    assert_eq!(
+        hit.observed_bytes, 2400,
+        "observed_bytes preserved across clamp"
+    );
     let (active, rows, _, _) = cache.active_flow_debug_entries(8);
     assert_eq!(active, 1, "re-hit entry counts as active again");
     assert_eq!(rows.len(), 1);

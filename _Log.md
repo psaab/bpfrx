@@ -10897,3 +10897,146 @@ top.
     userspace-dp/src/afxdp/poll_descriptor/mod.rs,
     userspace-dp/src/afxdp/tests.rs, docs/feature-gaps.md,
     docs/cos-validation-notes.md, _Log.md
+
+- **Timestamp**: 2026-06-22
+  - **Action**: #2362 — wire the 4 dropped firewall-filter per-packet L4 match
+    terms (tcp-flags / is-fragment / icmp-type / icmp-code) end-to-end to the
+    userspace dataplane. ALL FOUR were parsed by the Go compiler into
+    config.FirewallFilterTerm and claimed in feature-gaps.md, but DROPPED on the
+    Go->Rust snapshot wire and absent from the Rust matcher, so a term like
+    `from { tcp-flags syn; } then discard` silently matched ALL TCP (broader than
+    authored — security-relevant). Fix: added explicit wire fields
+    (tcp_flags:Option<u8> required-bits mask, is_fragment:bool, icmp_type/code:
+    Option<u8>) to FirewallTermSnapshot on BOTH sides with matching serde tags;
+    Go filters.go folds the parsed flag-name list to a mask (tcpFlagsMask) and
+    serializes the rest; Rust runtime FilterTerm carries the 4 fields, evaluated
+    per packet in engine::matching::per_packet_l4_matches (non-TCP never matches
+    tcp-flags; non-ICMP never matches icmp-type/code; is-fragment uses the new
+    is_any_fragment predicate = IPv4 MF|offset, IPv6 frag header). Threaded a
+    Copy TermMatchExtra (built once per packet at the cold filter-eval call sites
+    from frame+meta) through eval.rs/matching.rs; cached/tx-selection paths pass
+    Default (unreachable for these filters due to the cache decline). Cache-
+    sensitivity (path b, #1431): new has_per_packet_l4_match_terms aggregate +
+    iface_filter_v{4,6}_has_per_packet_l4_match sets + flow-cache decline gate
+    (flow_cache.rs) + on-session re-eval gate + config-rotation purge (folded
+    into the existing dscp purge). Regenerated protocol_wire_v1.json. Tests:
+    Go snapshot+mask-helper (filters_per_packet_match_2362_test.go); Rust match-
+    eval per term (v4+v6, match/no-match/wrong-proto), count side-effect, cache-
+    sensitive flag, wire round-trip, flow-cache decline (input+output), and
+    is_any_fragment truth tables. go build+test green; cargo build --release +
+    full test suite (2468) green; new tests 5x stable. Docs: filter/README.md
+    (future->implemented rows), feature-gaps.md (#2362 wiring + grammar limits).
+    Limitation noted: parser yields a flat flag list, so the richer
+    `(syn & !ack)` expression grammar and named icmp-type aliases are out of
+    scope (parser limitation, not dataplane).
+  - **File(s)**: pkg/dataplane/userspace/protocol.go,
+    pkg/dataplane/userspace/filters.go,
+    pkg/dataplane/userspace/filters_per_packet_match_2362_test.go,
+    userspace-dp/src/protocol/security.rs, userspace-dp/src/filter/mod.rs,
+    userspace-dp/src/filter/compiler.rs,
+    userspace-dp/src/filter/engine/mod.rs,
+    userspace-dp/src/filter/engine/matching.rs,
+    userspace-dp/src/filter/engine/eval.rs,
+    userspace-dp/src/filter/engine/cache_sensitive.rs,
+    userspace-dp/src/filter/engine/tx_selection.rs,
+    userspace-dp/src/filter/tests.rs,
+    userspace-dp/src/afxdp/frame/inspect.rs,
+    userspace-dp/src/afxdp/frame/mod.rs,
+    userspace-dp/src/afxdp/frame/tests.rs,
+    userspace-dp/src/afxdp/flow_cache.rs,
+    userspace-dp/src/afxdp/flow_cache_tests.rs,
+    userspace-dp/src/afxdp/poll_descriptor/filter.rs,
+    userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+    userspace-dp/src/afxdp/forwarding/mod.rs,
+    userspace-dp/src/afxdp/session_glue/tests.rs,
+    userspace-dp/src/afxdp/worker/loop_body/mod.rs,
+    userspace-dp/tests/fixtures/protocol_wire_v1.json,
+    userspace-dp/src/filter/README.md, docs/feature-gaps.md, _Log.md
+
+- **Timestamp**: 2026-06-22 (review folds)
+  - **Action**: #2362 PR #2373 review folds A + B (hostile reviewer + Copilot).
+    FOLD A (security, #2344 class): term_match_extra_from_frame read tcp_flags /
+    icmp_type / icmp_code from meta/l4_offset for ANY packet — but a NON-FIRST
+    fragment has no L4 header there (payload bytes), so a crafted fragment whose
+    payload byte == a filter icmp-type (or payload-derived meta.tcp_flags)
+    spuriously matched, contradicting the matching.rs doc contract. Fix: gate the
+    L4-derived inputs on the EXISTING is_non_first_fragment predicate (reused, not
+    re-written) — force tcp_flags=icmp_type=icmp_code=0 for a non-first fragment
+    while KEEPING is_fragment=is_any_fragment (a non-first fragment IS a fragment;
+    is-fragment reads only the L3 header). FOLD B (CoS/TX-selection leg): the
+    tx_selection.rs v4/v6 evaluators hardcoded TermMatchExtra::default(), so
+    `from { tcp-flags syn } then forwarding-class X` reached the CoS path and
+    never matched the per-packet condition (silent under-match — the same bug on
+    the CoS leg). Fix: thread real TermMatchExtra through
+    resolve_cos_tx_selection/_at/_internal -> the tx_selection evaluators, built
+    from the live frame at forward_request.rs (transit), classify_generated_reply
+    (own bytes), neighbor_dispatch (buffered transit frame), inject (control
+    frame); meta-only extra at the no-frame paths (resolve_cos_queue_id, tunnel
+    local-origin, generated ICMP-PTB). Added PendingForwardRequest.filter_match_extra
+    so the DEFERRED dispatch recompute consumes the build-time snapshot (UMEM frame
+    may be recycled). The flow-cache decline (FOLD already shipped) keeps the
+    precomputed TX descriptor from being built for per-packet-L4 filters, so the
+    cached tx_selection path (cache_sensitive.rs Default) is unreachable for them.
+    Added two ForwardPacketMeta builders (term_match_extra_from_frame_fwd,
+    term_match_extra_from_meta) in inspect.rs. Tests: FOLD A — non-first ICMP/TCP
+    fragment suppresses icmp-type/tcp-flags but keeps is-fragment; first fragment
+    keeps L4 fields (frame/tests.rs). FOLD B — `tcp-flags syn then
+    forwarding-class ef` selects EF queue only for SYN, not pure-ACK
+    (cos_classify_tests.rs). cargo build --release clean; filter/tcp_flags/
+    fragment/icmp/tx_selection/cos suites green; new tests 5x; protocol_wire_v1.json
+    UNCHANGED (filter_match_extra is internal, not serialized). Two pre-existing
+    full-suite concurrency flakes (umem tx_latency_hist, worker_queue
+    concurrent_recovery) pass in isolation — untouched code.
+  - **File(s)**: userspace-dp/src/afxdp/frame/inspect.rs,
+    userspace-dp/src/afxdp/frame/mod.rs,
+    userspace-dp/src/afxdp/frame/tests.rs,
+    userspace-dp/src/filter/engine/tx_selection.rs,
+    userspace-dp/src/afxdp/tx/cos_classify.rs,
+    userspace-dp/src/afxdp/tx/cos_classify_tests.rs,
+    userspace-dp/src/afxdp/tx/dispatch/cos.rs,
+    userspace-dp/src/afxdp/tx/dispatch/dispatch_tests.rs,
+    userspace-dp/src/afxdp/types/tx.rs,
+    userspace-dp/src/afxdp/forward_request.rs,
+    userspace-dp/src/afxdp/neighbor_dispatch.rs,
+    userspace-dp/src/afxdp/tunnel.rs, userspace-dp/src/afxdp/icmp.rs,
+    userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+    userspace-dp/src/afxdp/coordinator/inject.rs,
+    userspace-dp/src/afxdp/forwarding_build/tests.rs,
+    userspace-dp/src/filter/tests.rs, userspace-dp/src/filter/README.md,
+    docs/feature-gaps.md, _Log.md
+
+- **Timestamp**: 2026-06-22 (fold A correction)
+  - **Action**: #2362 PR #2373 — Copilot caught that FOLD A's "force the L4
+    byte to 0 for a non-first fragment" guard was insufficient: 0 is a VALID
+    icmp-type (echo-reply) and a VALID icmp-code, so a non-first fragment with
+    forced icmp_type=0 STILL spuriously matched `from { icmp-type 0 }` /
+    `from { icmp-code 0 }` — the matching.rs contract was still violated.
+    (tcp-flags was fine: a real term has a non-zero mask and (0 & mask)==mask is
+    false.) Fix: replace the value-sentinel with an explicit l4_present:bool on
+    TermMatchExtra — true normally, FALSE for a non-first fragment (set in both
+    term_match_extra_from_frame and term_match_extra_from_frame_fwd via
+    is_non_first_fragment) and the meta-only builder sets it TRUE (synthetic
+    packets have an L4 header, never fragments). per_packet_l4_matches now
+    requires extra.l4_present for the tcp-flags AND icmp-type AND icmp-code
+    constraints (return false if !l4_present); is_fragment stays UNGATED
+    (L3-derived). Default(l4_present=false) fails closed — safe for the
+    cached/tx-rebuild Default paths (unreachable for L4 filters anyway). Kept the
+    byte-zeroing as defense-in-depth. Updated existing test extras that represent
+    real packets to set l4_present:true (extra_tcp helper + icmp literals + the
+    FOLD B SYN/ACK). New fail-on-revert tests: a non-first fragment (l4_present
+    false, byte 0, is_fragment true) does NOT match `icmp-type 0` NOR
+    `icmp-code 0` but STILL matches `is-fragment`; a real echo-reply (type 0,
+    l4_present true) DOES match `icmp-type 0` (anti-over-gate). Builder tests now
+    assert l4_present false (non-first) / true (first). cargo build --release
+    clean; filter/icmp/fragment/tcp_flags/matching/tx_selection/cos suites green;
+    full suite green (no failures this run); new tests 5x; protocol_wire_v1.json
+    UNCHANGED (l4_present is internal). matching.rs doc + feature-gaps.md +
+    filter/README.md updated to describe the l4_present gate (not the byte
+    sentinel).
+  - **File(s)**: userspace-dp/src/filter/mod.rs,
+    userspace-dp/src/filter/engine/matching.rs,
+    userspace-dp/src/afxdp/frame/inspect.rs,
+    userspace-dp/src/afxdp/frame/tests.rs,
+    userspace-dp/src/filter/tests.rs,
+    userspace-dp/src/afxdp/tx/cos_classify_tests.rs,
+    userspace-dp/src/filter/README.md, docs/feature-gaps.md, _Log.md

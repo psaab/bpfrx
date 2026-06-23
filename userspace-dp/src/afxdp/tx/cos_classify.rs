@@ -75,7 +75,12 @@ pub(in crate::afxdp) fn classify_generated_reply(
             filter_log: None,
         };
     };
-    let selection = resolve_cos_tx_selection_at(forwarding, egress_ifindex, meta, Some(&key), now_ns);
+    // #2362 fold B: classify the generated reply on its OWN bytes — build the
+    // fragment-safe per-packet match inputs from the reply frame so a
+    // tcp-flags / icmp-type output-filter term matches the reply correctly.
+    let extra = crate::afxdp::frame::term_match_extra_from_frame_fwd(frame, meta);
+    let selection =
+        resolve_cos_tx_selection_at(forwarding, egress_ifindex, meta, Some(&key), extra, now_ns);
     GeneratedReplyVerdict {
         drop: selection.drop,
         parse_error: false,
@@ -235,7 +240,12 @@ pub(in crate::afxdp) fn resolve_cos_queue_id(
     meta: impl Into<ForwardPacketMeta>,
     flow_key: Option<&SessionKey>,
 ) -> Option<u8> {
-    resolve_cos_tx_selection(forwarding, egress_ifindex, meta, flow_key).queue_id
+    // #2362 fold B: no frame at this queue-id-only entry; the meta-only extra
+    // covers tcp-flags (authoritative in meta) and under-matches is-fragment /
+    // icmp-type (acceptable — this path selects a queue, not a security verdict).
+    let meta = meta.into();
+    let extra = crate::afxdp::frame::term_match_extra_from_meta(meta);
+    resolve_cos_tx_selection(forwarding, egress_ifindex, meta, flow_key, extra).queue_id
 }
 
 pub(in crate::afxdp) fn resolve_cos_tx_selection(
@@ -243,8 +253,9 @@ pub(in crate::afxdp) fn resolve_cos_tx_selection(
     egress_ifindex: i32,
     meta: impl Into<ForwardPacketMeta>,
     flow_key: Option<&SessionKey>,
+    extra: crate::filter::TermMatchExtra,
 ) -> CoSTxSelection {
-    resolve_cos_tx_selection_internal(forwarding, egress_ifindex, meta, flow_key, None)
+    resolve_cos_tx_selection_internal(forwarding, egress_ifindex, meta, flow_key, extra, None)
 }
 
 pub(in crate::afxdp) fn resolve_cos_tx_selection_at(
@@ -252,9 +263,17 @@ pub(in crate::afxdp) fn resolve_cos_tx_selection_at(
     egress_ifindex: i32,
     meta: impl Into<ForwardPacketMeta>,
     flow_key: Option<&SessionKey>,
+    extra: crate::filter::TermMatchExtra,
     now_ns: u64,
 ) -> CoSTxSelection {
-    resolve_cos_tx_selection_internal(forwarding, egress_ifindex, meta, flow_key, Some(now_ns))
+    resolve_cos_tx_selection_internal(
+        forwarding,
+        egress_ifindex,
+        meta,
+        flow_key,
+        extra,
+        Some(now_ns),
+    )
 }
 
 fn resolve_cos_tx_selection_internal(
@@ -262,6 +281,7 @@ fn resolve_cos_tx_selection_internal(
     egress_ifindex: i32,
     meta: impl Into<ForwardPacketMeta>,
     flow_key: Option<&SessionKey>,
+    extra: crate::filter::TermMatchExtra,
     now_ns: Option<u64>,
 ) -> CoSTxSelection {
     let meta = meta.into();
@@ -367,6 +387,7 @@ fn resolve_cos_tx_selection_internal(
                 flow_key.src_port,
                 flow_key.dst_port,
                 meta.dscp,
+                extra,
                 meta.pkt_len as u64,
                 now_ns,
             )
@@ -379,6 +400,7 @@ fn resolve_cos_tx_selection_internal(
                 flow_key.src_port,
                 flow_key.dst_port,
                 meta.dscp,
+                extra,
                 meta.pkt_len as u64,
             )
         }
@@ -402,6 +424,7 @@ fn resolve_cos_tx_selection_internal(
                 flow_key.src_port,
                 flow_key.dst_port,
                 meta.dscp,
+                extra,
                 meta.pkt_len as u64,
                 now_ns,
             )
@@ -414,6 +437,7 @@ fn resolve_cos_tx_selection_internal(
                 flow_key.src_port,
                 flow_key.dst_port,
                 meta.dscp,
+                extra,
                 meta.pkt_len as u64,
             )
         };

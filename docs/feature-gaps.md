@@ -379,6 +379,45 @@ the commit-check gate INLINE-mirrors the `appid.ProtocolNumber` acceptance set
 (it cannot import `appid` — an import cycle); a `pkg/appid` drift-guard test
 pins the two together so the duplicated table cannot diverge silently.
 
+The per-packet L4 match conditions — `tcp-flags`, `is-fragment`, `icmp-type`,
+`icmp-code` — are wired end-to-end to the userspace dataplane (#2362). Earlier
+they were parsed into `config.FirewallFilterTerm` and counted in this list but
+silently DROPPED on the snapshot wire, so a term like `from { tcp-flags syn; }
+then discard` matched broader than authored (discard-all-TCP). They are now
+serialized as explicit `FirewallTermSnapshot` wire fields
+(`tcp_flags`/`is_fragment`/`icmp_type`/`icmp_code`, mirrored in
+`userspace-dp/src/protocol/security.rs`) and evaluated per packet by the Rust
+matcher (`filter::engine::matching::per_packet_l4_matches`). Because none of
+these are part of the 5-tuple `SessionKey`, a filter carrying any of them is
+cache-sensitive (path (b) of the #1431 runbook): the flow-cache declines, the
+on-session decision is re-evaluated per packet, and a config rotation purges the
+affected sessions. This holds on BOTH the input/output forwarding-filter leg and
+the CoS / TX-selection leg (`from { tcp-flags syn; } then forwarding-class X`):
+the TX-selection evaluators thread the same per-packet inputs, so a CoS action
+gated on a per-packet condition selects the class only on the matching packets
+of a flow, not all of them (the flow-cache decline keeps the precomputed
+TX-selection descriptor from being built for such filters). Fragment safety: the
+match inputs are built fragment-safe — a NON-FIRST fragment carries no L4 header
+at the post-IP offset (its bytes are payload), so the per-packet match inputs
+carry an explicit `l4_present = false` flag for it and the matcher gates the
+tcp-flags / icmp-type / icmp-code constraints on that flag (NOT on the byte
+value). Keying off the value alone is insufficient: 0 is a VALID icmp-type
+(echo-reply) and a VALID icmp-code, so a zeroed byte would still spuriously match
+`from { icmp-type 0 }` / `from { icmp-code 0 }`. The L3-derived `is-fragment` bit
+is NOT gated by `l4_present` and stays true (a non-first fragment IS a fragment).
+This prevents a crafted fragment whose payload byte equals a filter's
+`icmp-type`/`icmp-code` from spuriously matching (the #2344 non-first-fragment
+class). Semantics: `tcp-flags <list>` requires ALL listed flags set
+(a non-TCP packet never matches); `is-fragment` matches any IP fragment (IPv4 MF
+set OR non-zero offset; IPv6 fragment header present); `icmp-type`/`icmp-code`
+match the ICMP/ICMPv6 type/code bytes (a non-ICMP packet never matches).
+Limitation: the parser produces a flat flag-name list, so the richer Junos
+`tcp-flags "(syn & !ack)"` expression grammar (negation/disjunction/aliases like
+`tcp-established`) is not representable — only a conjunction of named flags is
+supported; an unrecognized token yields no constraint rather than a match-all.
+Named `icmp-type`/`icmp-code` aliases (e.g. `echo-request`) are likewise not
+parsed — numeric values only.
+
 | Feature | Junos Config Path | Description | Priority | Status |
 |---------|-------------------|-------------|----------|--------|
 | **Policer (Rate Limiting)** | `firewall policer ... bandwidth-limit N burst-size-limit N` | Token-bucket rate limiter applied to filter terms or interfaces. Single-rate two-color, three-color policers. | High | Partial for #1373: legacy eBPF/~~DPDK~~ (DPDK retired #1525) token-bucket policer support existed; userspace supports the admitted filter path and the color-blind `then discard` three-color slice. #1375 is closed; unsupported color-aware/non-drop behavior and broader Junos parity remain production/future parity work, not active #1373 source-removal blockers. |

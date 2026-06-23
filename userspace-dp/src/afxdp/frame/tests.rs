@@ -6,8 +6,8 @@ use super::super::test_fixtures::*;
 use super::*;
 use crate::event_stream::DataplaneEventRateLimitConfig;
 use crate::event_stream::codec::DataplaneEventKind;
-use crate::{FirewallFilterSnapshot, FirewallTermSnapshot, ThreeColorPolicerSnapshot};
 use crate::test_zone_ids::*;
+use crate::{FirewallFilterSnapshot, FirewallTermSnapshot, ThreeColorPolicerSnapshot};
 
 fn active_ha_runtime(now_secs: u64) -> HAGroupRuntime {
     HAGroupRuntime {
@@ -48,12 +48,7 @@ fn build_icmp_echo_frame_v4(src: Ipv4Addr, dst: Ipv4Addr, ttl: u8) -> Vec<u8> {
     frame
 }
 
-fn build_icmp_echo_frame_v4_vlan(
-    src: Ipv4Addr,
-    dst: Ipv4Addr,
-    ttl: u8,
-    vlan_id: u16,
-) -> Vec<u8> {
+fn build_icmp_echo_frame_v4_vlan(src: Ipv4Addr, dst: Ipv4Addr, ttl: u8, vlan_id: u16) -> Vec<u8> {
     let mut frame = Vec::new();
     write_eth_header(
         &mut frame,
@@ -134,8 +129,7 @@ fn trim_l3_payload_uses_frame_length_metadata_relative_to_l3_offset_without_pars
 }
 
 #[test]
-fn trim_l3_payload_uses_vlan_frame_length_metadata_relative_to_l3_offset_without_parsing_header()
- {
+fn trim_l3_payload_uses_vlan_frame_length_metadata_relative_to_l3_offset_without_parsing_header() {
     let mut frame = build_icmp_echo_frame_v4_vlan(
         Ipv4Addr::new(10, 0, 0, 1),
         Ipv4Addr::new(10, 0, 0, 2),
@@ -492,7 +486,7 @@ fn ingress_filter_routing_instance_steers_flow_into_native_gre_table() {
         },
     );
     let override_table =
-        ingress_route_table_override(&state, meta, &flow, None, Some(&event_handle), 99);
+        ingress_route_table_override(&state, &[], meta, &flow, None, Some(&event_handle), 99);
     assert_eq!(override_table.as_deref(), Some("sfmix.inet.0"));
     let filter_event = event_rx
         .try_recv()
@@ -612,7 +606,11 @@ fn native_gre_decap_combines_outer_ce_into_inner_ecn() {
         .expect("decap must forward (legal CE upgrade)");
     // Inner emerges in the synthetic frame at offset 14 (eth) + 1 (TOS).
     let inner_tos_out = packet.frame[15];
-    assert_eq!(inner_tos_out & 0x03, 0b11, "inner ECN must be upgraded to CE");
+    assert_eq!(
+        inner_tos_out & 0x03,
+        0b11,
+        "inner ECN must be upgraded to CE"
+    );
     assert_eq!(inner_tos_out >> 2, 46, "inner DSCP (EF) must be preserved");
     // Fail-on-revert: the CE bit MUST be set — the pre-#2315 copy-only
     // path could never produce this (it never touched the inner ECN).
@@ -747,10 +745,7 @@ fn local_origin_tunnel_tx_request_encapsulates_raw_ip_for_active_owner() {
     let state = build_forwarding_state(&native_gre_snapshot(true));
     // #1881: the loop now loads HA state once per iteration and
     // passes the map down — the builder takes &BTreeMap directly.
-    let ha_state = BTreeMap::from([(
-        1,
-        active_ha_runtime(monotonic_nanos() / 1_000_000_000),
-    )]);
+    let ha_state = BTreeMap::from([(1, active_ha_runtime(monotonic_nanos() / 1_000_000_000))]);
     let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
     let packet = build_icmp_echo_frame_v4(
         Ipv4Addr::new(10, 255, 192, 42),
@@ -778,10 +773,7 @@ fn local_origin_tunnel_tx_request_encapsulates_raw_ip_for_active_owner() {
 #[test]
 fn local_origin_tunnel_tx_request_rejects_inactive_owner() {
     let state = build_forwarding_state(&native_gre_snapshot(true));
-    let ha_state = BTreeMap::from([(
-        1,
-        inactive_ha_runtime(monotonic_nanos() / 1_000_000_000),
-    )]);
+    let ha_state = BTreeMap::from([(1, inactive_ha_runtime(monotonic_nanos() / 1_000_000_000))]);
     let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
     let packet = build_icmp_echo_frame_v4(
         Ipv4Addr::new(10, 255, 192, 42),
@@ -922,14 +914,7 @@ fn build_forwarded_frame_from_frame_recomputes_tcp_checksum_for_native_gre_snat(
         ..UserspaceDpMeta::default()
     };
     let decision = SessionDecision {
-        resolution: lookup_forwarding_resolution_v4(
-            &state,
-            None,
-            dst_ip,
-            "sfmix.inet.0",
-            0,
-            true,
-        ),
+        resolution: lookup_forwarding_resolution_v4(&state, None, dst_ip, "sfmix.inet.0", 0, true),
         nat: NatDecision {
             rewrite_src: Some(IpAddr::V4(snat_ip)),
             ..NatDecision::default()
@@ -1026,14 +1011,7 @@ fn build_forwarded_frame_from_frame_clamps_tcp_mss_for_native_gre() {
         ..UserspaceDpMeta::default()
     };
     let decision = SessionDecision {
-        resolution: lookup_forwarding_resolution_v4(
-            &state,
-            None,
-            dst_ip,
-            "sfmix.inet.0",
-            0,
-            true,
-        ),
+        resolution: lookup_forwarding_resolution_v4(&state, None, dst_ip, "sfmix.inet.0", 0, true),
         nat: NatDecision::default(),
     };
     let built = build_forwarded_frame_from_frame(
@@ -1121,20 +1099,11 @@ fn syn_cookie_syn_ack_builder_swaps_tuple_and_preserves_vlan() {
     frame.extend_from_slice(&443u16.to_be_bytes());
     frame.extend_from_slice(&0x0102_0304u32.to_be_bytes());
     frame.extend_from_slice(&0u32.to_be_bytes());
-    frame.extend_from_slice(&[
-        0x50,
-        TCP_FLAG_SYN,
-        0x20,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-        0x00,
-    ]);
+    frame.extend_from_slice(&[0x50, TCP_FLAG_SYN, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00]);
     recompute_l4_checksum_ipv4(&mut frame[18..], 20, PROTO_TCP, false).expect("tcp sum");
 
-    let out = build_syn_cookie_syn_ack_frame(&frame, 0xaabb_ccdd, 1460)
-        .expect("syn-cookie syn-ack");
+    let out =
+        build_syn_cookie_syn_ack_frame(&frame, 0xaabb_ccdd, 1460).expect("syn-cookie syn-ack");
 
     assert_eq!(&out[0..6], &[0x02, 0x00, 0x00, 0x00, 0x00, 0x01]);
     assert_eq!(&out[6..12], &[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
@@ -1163,18 +1132,10 @@ fn syn_cookie_syn_ack_builder_swaps_tuple_and_preserves_vlan() {
 fn syn_cookie_ipv4_syn_ack_builder_pads_to_ethernet_minimum() {
     let client = Ipv4Addr::new(192, 0, 2, 10);
     let server = Ipv4Addr::new(198, 51, 100, 20);
-    let frame = build_ipv4_tcp_frame(
-        client,
-        server,
-        49152,
-        443,
-        0x0102_0304,
-        0,
-        TCP_FLAG_SYN,
-    );
+    let frame = build_ipv4_tcp_frame(client, server, 49152, 443, 0x0102_0304, 0, TCP_FLAG_SYN);
 
-    let out = build_syn_cookie_syn_ack_frame(&frame, 0xaabb_ccdd, 1460)
-        .expect("syn-cookie syn-ack");
+    let out =
+        build_syn_cookie_syn_ack_frame(&frame, 0xaabb_ccdd, 1460).expect("syn-cookie syn-ack");
 
     assert_eq!(out.len(), 60);
     assert_eq!(u16::from_be_bytes([out[16], out[17]]), 44);
@@ -1188,15 +1149,7 @@ fn syn_cookie_ipv4_syn_ack_builder_pads_to_ethernet_minimum() {
 fn syn_cookie_ipv4_rst_builder_pads_to_ethernet_minimum() {
     let client = Ipv4Addr::new(192, 0, 2, 10);
     let server = Ipv4Addr::new(198, 51, 100, 20);
-    let frame = build_ipv4_tcp_frame(
-        client,
-        server,
-        49152,
-        443,
-        0x1111_2222,
-        0x3333_4444,
-        0x10,
-    );
+    let frame = build_ipv4_tcp_frame(client, server, 49152, 443, 0x1111_2222, 0x3333_4444, 0x10);
 
     let out = build_syn_cookie_ack_rst_frame(&frame).expect("syn-cookie rst");
 
@@ -1230,8 +1183,7 @@ fn syn_cookie_vlan_ipv4_rst_builder_pads_to_ethernet_minimum() {
         0x0800,
     );
     frame.extend_from_slice(&[
-        0x45, 0x00, 0x00, 0x28, 0x00, 0x01, 0x00, 0x00,
-        64, PROTO_TCP, 0x00, 0x00,
+        0x45, 0x00, 0x00, 0x28, 0x00, 0x01, 0x00, 0x00, 64, PROTO_TCP, 0x00, 0x00,
     ]);
     frame.extend_from_slice(&client.octets());
     frame.extend_from_slice(&server.octets());
@@ -1241,11 +1193,8 @@ fn syn_cookie_vlan_ipv4_rst_builder_pads_to_ethernet_minimum() {
     frame.extend_from_slice(&443u16.to_be_bytes());
     frame.extend_from_slice(&0x1111_2222u32.to_be_bytes());
     frame.extend_from_slice(&0x3333_4444u32.to_be_bytes());
-    frame.extend_from_slice(&[
-        0x50, 0x10, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00,
-    ]);
-    recompute_l4_checksum_ipv4(&mut frame[18..], 20, PROTO_TCP, false)
-        .expect("tcp sum");
+    frame.extend_from_slice(&[0x50, 0x10, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00]);
+    recompute_l4_checksum_ipv4(&mut frame[18..], 20, PROTO_TCP, false).expect("tcp sum");
 
     let out = build_syn_cookie_ack_rst_frame(&frame).expect("syn-cookie rst");
 
@@ -1323,10 +1272,10 @@ fn icmpv6_checksum_ok(packet: &[u8]) -> bool {
 #[test]
 fn apply_nat_ipv4_recomputes_tcp_checksum() {
     let mut packet = vec![
-        0x45, 0x00, 0x00, 0x30, 0x00, 0x01, 0x00, 0x00, 64, PROTO_TCP, 0x00, 0x00, 10, 0, 61,
-        102, 172, 16, 80, 200, 0x9c, 0x40, 0x14, 0x51, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
-        0x00, 0x01, 0x50, 0x18, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, b't', b'e', b's', b't', b'd',
-        b'a', b't', b'a',
+        0x45, 0x00, 0x00, 0x30, 0x00, 0x01, 0x00, 0x00, 64, PROTO_TCP, 0x00, 0x00, 10, 0, 61, 102,
+        172, 16, 80, 200, 0x9c, 0x40, 0x14, 0x51, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+        0x50, 0x18, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, b't', b'e', b's', b't', b'd', b'a', b't',
+        b'a',
     ];
     let ip_sum = checksum16(&packet[..20]);
     packet[10] = (ip_sum >> 8) as u8;
@@ -1363,8 +1312,8 @@ fn extract_l3_packet_with_nat_rewrites_reverse_snat_reply_v4() {
     frame.extend_from_slice(&[
         0x45, 0x00, 0x00, 0x30, 0x00, 0x01, 0x00, 0x00, 63, PROTO_TCP, 0x00, 0x00, 172, 16, 80,
         200, 172, 16, 80, 8, 0x14, 0x51, 0x9c, 0x40, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00,
-        0x01, 0x50, 0x10, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, b't', b'e', b's', b't', b'd',
-        b'a', b't', b'a',
+        0x01, 0x50, 0x10, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, b't', b'e', b's', b't', b'd', b'a',
+        b't', b'a',
     ]);
     let ip_sum = checksum16(&frame[18..38]);
     frame[28] = (ip_sum >> 8) as u8;
@@ -1411,9 +1360,9 @@ fn extract_l3_packet_with_nat_rewrites_reverse_snat_reply_v6() {
     frame.extend_from_slice(&src_ip.octets());
     frame.extend_from_slice(&dst_ip.octets());
     frame.extend_from_slice(&[
-        0x14, 0x51, 0x95, 0x2c, 0x31, 0x96, 0xc8, 0x32, 0x08, 0xf0, 0x5a, 0xc6, 0x50, 0x10,
-        0x00, 0x40, 0x00, 0x00, 0x00, 0x00, b't', b'e', b's', b't', b'd', b'a', b't', b'a',
-        b't', b'e', b's', b't',
+        0x14, 0x51, 0x95, 0x2c, 0x31, 0x96, 0xc8, 0x32, 0x08, 0xf0, 0x5a, 0xc6, 0x50, 0x10, 0x00,
+        0x40, 0x00, 0x00, 0x00, 0x00, b't', b'e', b's', b't', b'd', b'a', b't', b'a', b't', b'e',
+        b's', b't',
     ]);
     recompute_l4_checksum_ipv6(&mut frame[18..], 40, PROTO_TCP).expect("tcp sum");
 
@@ -1459,10 +1408,10 @@ fn build_forwarded_frame_keeps_tcp_checksum_valid_after_snat() {
         0x0800,
     );
     frame.extend_from_slice(&[
-        0x45, 0x00, 0x00, 0x30, 0x00, 0x01, 0x00, 0x00, 64, PROTO_TCP, 0x00, 0x00, 10, 0, 61,
-        102, 172, 16, 80, 200, 0x9c, 0x40, 0x14, 0x51, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
-        0x00, 0x01, 0x50, 0x18, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, b't', b'e', b's', b't', b'd',
-        b'a', b't', b'a',
+        0x45, 0x00, 0x00, 0x30, 0x00, 0x01, 0x00, 0x00, 64, PROTO_TCP, 0x00, 0x00, 10, 0, 61, 102,
+        172, 16, 80, 200, 0x9c, 0x40, 0x14, 0x51, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01,
+        0x50, 0x18, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, b't', b'e', b's', b't', b'd', b'a', b't',
+        b'a',
     ]);
     let ip_sum = checksum16(&frame[14..34]);
     frame[24] = (ip_sum >> 8) as u8;
@@ -1582,7 +1531,9 @@ fn rewrite_forwarded_frame_in_place_keeps_icmpv6_checksum_valid_after_snat() {
         None,
     )
     .expect("in-place v6 forward");
-    let out = area.slice(rewrite_result.offset as usize, rewrite_result.len as usize).expect("rewritten frame");
+    let out = area
+        .slice(rewrite_result.offset as usize, rewrite_result.len as usize)
+        .expect("rewritten frame");
     assert_eq!(&out[0..6], &[0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]);
     assert_eq!(&out[6..12], &[0x02, 0xbf, 0x72, 0x00, 0x80, 0x08]);
     assert_eq!(out[25], 63);
@@ -1864,7 +1815,9 @@ fn rewrite_forwarded_frame_in_place_keeps_icmpv6_echo_identifier_and_sequence() 
         None,
     )
     .expect("in-place v6 echo forward");
-    let out = area.slice(rewrite_result.offset as usize, rewrite_result.len as usize).expect("rewritten frame");
+    let out = area
+        .slice(rewrite_result.offset as usize, rewrite_result.len as usize)
+        .expect("rewritten frame");
 
     let packet = &out[18..];
     assert_eq!(packet[40], 128);
@@ -1904,8 +1857,8 @@ fn enforce_expected_ports_repairs_ipv6_tcp_ports_and_checksum() {
     frame.extend_from_slice(&dst_ip.octets());
     frame.extend_from_slice(&[
         0x04, 0x01, 0x14, 0x51, // wrong src port 1025 -> 5201
-        0x31, 0x96, 0xc8, 0x32, 0x08, 0xf0, 0x5a, 0xc6, 0x50, 0x18, 0x00, 0x40, 0x00, 0x00,
-        0x00, 0x00, b't', b'e', b's', b't', b'd', b'a', b't', b'a', b't', b'e', b's', b't',
+        0x31, 0x96, 0xc8, 0x32, 0x08, 0xf0, 0x5a, 0xc6, 0x50, 0x18, 0x00, 0x40, 0x00, 0x00, 0x00,
+        0x00, b't', b'e', b's', b't', b'd', b'a', b't', b'a', b't', b'e', b's', b't',
     ]);
     recompute_l4_checksum_ipv6(&mut frame[18..], 40, PROTO_TCP).expect("initial checksum");
     assert!(tcp_checksum_ok_ipv6(&frame[18..]));
@@ -1942,14 +1895,13 @@ fn enforce_expected_ports_repairs_ipv4_tcp_ports_and_checksum() {
     frame.extend_from_slice(&dst_ip.octets());
     frame.extend_from_slice(&[
         0x04, 0x01, 0x14, 0x51, // wrong src port 1025 -> 54688
-        0x31, 0x96, 0xc8, 0x32, 0x08, 0xf0, 0x5a, 0xc6, 0x50, 0x18, 0x00, 0x40, 0x00, 0x00,
-        0x00, 0x00, b't', b'e', b's', b't', b'd', b'a', b't', b'a',
+        0x31, 0x96, 0xc8, 0x32, 0x08, 0xf0, 0x5a, 0xc6, 0x50, 0x18, 0x00, 0x40, 0x00, 0x00, 0x00,
+        0x00, b't', b'e', b's', b't', b'd', b'a', b't', b'a',
     ]);
     let ip_sum = checksum16(&frame[18..38]);
     frame[28] = (ip_sum >> 8) as u8;
     frame[29] = ip_sum as u8;
-    recompute_l4_checksum_ipv4(&mut frame[18..], 20, PROTO_TCP, true)
-        .expect("initial checksum");
+    recompute_l4_checksum_ipv4(&mut frame[18..], 20, PROTO_TCP, true).expect("initial checksum");
     assert!(tcp_checksum_ok_ipv4(&frame[18..]));
 
     let repaired = enforce_expected_ports(
@@ -2037,7 +1989,9 @@ fn rewrite_forwarded_frame_in_place_keeps_ipv6_tcp_ports_after_vlan_snat() {
         Some((54688, 5201)),
     )
     .expect("rewrite in place");
-    let out = area.slice(rewrite_result.offset as usize, rewrite_result.len as usize).expect("rewritten frame");
+    let out = area
+        .slice(rewrite_result.offset as usize, rewrite_result.len as usize)
+        .expect("rewritten frame");
     assert_eq!(u16::from_be_bytes([out[12], out[13]]), 0x8100);
     assert_eq!(u16::from_be_bytes([out[14], out[15]]) & 0x0fff, 80);
     assert_eq!(u16::from_be_bytes([out[16], out[17]]), 0x86dd);
@@ -2237,8 +2191,8 @@ fn build_live_forward_request_prefers_session_flow_ports_over_frame() {
     frame.extend_from_slice(&frame_src_port.to_be_bytes());
     frame.extend_from_slice(&frame_dst_port.to_be_bytes());
     frame.extend_from_slice(&[
-        0x31, 0x96, 0xc8, 0x32, 0x08, 0xf0, 0x5a, 0xc6, 0x50, 0x18, 0x00, 0x40, 0x00, 0x00,
-        0x00, 0x00, b't', b'e', b's', b't', b'd', b'a', b't', b'a', b't', b'e', b's', b't',
+        0x31, 0x96, 0xc8, 0x32, 0x08, 0xf0, 0x5a, 0xc6, 0x50, 0x18, 0x00, 0x40, 0x00, 0x00, 0x00,
+        0x00, b't', b'e', b's', b't', b'd', b'a', b't', b'a', b't', b'e', b's', b't',
     ]);
     recompute_l4_checksum_ipv6(&mut frame[14..], 40, PROTO_TCP).expect("tcp sum");
 
@@ -2354,8 +2308,8 @@ fn build_live_forward_request_uses_live_frame_ports_when_no_session_flow() {
     frame.extend_from_slice(&real_src_port.to_be_bytes());
     frame.extend_from_slice(&real_dst_port.to_be_bytes());
     frame.extend_from_slice(&[
-        0x31, 0x96, 0xc8, 0x32, 0x08, 0xf0, 0x5a, 0xc6, 0x50, 0x18, 0x00, 0x40, 0x00, 0x00,
-        0x00, 0x00, b't', b'e', b's', b't', b'd', b'a', b't', b'a', b't', b'e', b's', b't',
+        0x31, 0x96, 0xc8, 0x32, 0x08, 0xf0, 0x5a, 0xc6, 0x50, 0x18, 0x00, 0x40, 0x00, 0x00, 0x00,
+        0x00, b't', b'e', b's', b't', b'd', b'a', b't', b'a', b't', b'e', b's', b't',
     ]);
     recompute_l4_checksum_ipv6(&mut frame[14..], 40, PROTO_TCP).expect("tcp sum");
 
@@ -2513,9 +2467,9 @@ fn build_live_forward_request_meters_non_l4_metadata_flow() {
             ieee8021_queue_by_pcp: [u8::MAX; 8],
             queue_by_forwarding_class: FastMap::default(),
             queues: Vec::new(),
-        oversubscription_policy: CoSOversubscriptionPolicy::Proportional,
-        oversubscription_guarantee_fraction: 0.0,
-        priority_low_min_share_bytes: 0,
+            oversubscription_policy: CoSOversubscriptionPolicy::Proportional,
+            oversubscription_guarantee_fraction: 0.0,
+            priority_low_min_share_bytes: 0,
         },
     );
     let decision = SessionDecision {
@@ -2559,7 +2513,10 @@ fn build_live_forward_request_meters_non_l4_metadata_flow() {
         0,
     );
 
-    assert!(req.is_none(), "red-drop policer should reject non-L4 metadata flow");
+    assert!(
+        req.is_none(),
+        "red-drop policer should reject non-L4 metadata flow"
+    );
     let status = forwarding.filter_state.three_color_policer_statuses();
     assert_eq!(status[0].red_packets, 1);
     assert_eq!(status[0].drop_packets, 1);
@@ -3123,8 +3080,8 @@ fn build_forwarded_frame_into_keeps_ipv6_ports_when_frame_and_metadata_disagree(
     frame.extend_from_slice(&real_src_port.to_be_bytes());
     frame.extend_from_slice(&real_dst_port.to_be_bytes());
     frame.extend_from_slice(&[
-        0x31, 0x96, 0xc8, 0x32, 0x08, 0xf0, 0x5a, 0xc6, 0x50, 0x18, 0x00, 0x40, 0x00, 0x00,
-        0x00, 0x00, b't', b'e', b's', b't', b'd', b'a', b't', b'a', b't', b'e', b's', b't',
+        0x31, 0x96, 0xc8, 0x32, 0x08, 0xf0, 0x5a, 0xc6, 0x50, 0x18, 0x00, 0x40, 0x00, 0x00, 0x00,
+        0x00, b't', b'e', b's', b't', b'd', b'a', b't', b'a', b't', b'e', b's', b't',
     ]);
     recompute_l4_checksum_ipv6(&mut frame[14..], 40, PROTO_TCP).expect("tcp sum");
 
@@ -3201,8 +3158,8 @@ fn build_forwarded_frame_into_prefers_expected_ipv6_ports_over_wrong_live_ports(
     frame.extend_from_slice(&real_src_port.to_be_bytes());
     frame.extend_from_slice(&real_dst_port.to_be_bytes());
     frame.extend_from_slice(&[
-        0x31, 0x96, 0xc8, 0x32, 0x08, 0xf0, 0x5a, 0xc6, 0x50, 0x18, 0x00, 0x40, 0x00, 0x00,
-        0x00, 0x00, b't', b'e', b's', b't', b'd', b'a', b't', b'a', b't', b'e', b's', b't',
+        0x31, 0x96, 0xc8, 0x32, 0x08, 0xf0, 0x5a, 0xc6, 0x50, 0x18, 0x00, 0x40, 0x00, 0x00, 0x00,
+        0x00, b't', b'e', b's', b't', b'd', b'a', b't', b'a', b't', b'e', b's', b't',
     ]);
     recompute_l4_checksum_ipv6(&mut frame[14..], 40, PROTO_TCP).expect("tcp sum");
 
@@ -3280,8 +3237,8 @@ fn build_forwarded_frame_into_repairs_wrong_ipv6_frame_ports_from_expected_tuple
     frame.extend_from_slice(&wrong_src_port.to_be_bytes());
     frame.extend_from_slice(&dst_port.to_be_bytes());
     frame.extend_from_slice(&[
-        0x31, 0x96, 0xc8, 0x32, 0x08, 0xf0, 0x5a, 0xc6, 0x50, 0x18, 0x00, 0x40, 0x00, 0x00,
-        0x00, 0x00, b't', b'e', b's', b't', b'd', b'a', b't', b'a', b't', b'e', b's', b't',
+        0x31, 0x96, 0xc8, 0x32, 0x08, 0xf0, 0x5a, 0xc6, 0x50, 0x18, 0x00, 0x40, 0x00, 0x00, 0x00,
+        0x00, b't', b'e', b's', b't', b'd', b'a', b't', b'a', b't', b'e', b's', b't',
     ]);
     recompute_l4_checksum_ipv6(&mut frame[14..], 40, PROTO_TCP).expect("tcp sum");
 
@@ -3362,8 +3319,8 @@ fn build_forwarded_frame_into_ignores_wrong_ipv4_offsets() {
     frame.extend_from_slice(&real_src_port.to_be_bytes());
     frame.extend_from_slice(&real_dst_port.to_be_bytes());
     frame.extend_from_slice(&[
-        0x31, 0x96, 0xc8, 0x32, 0x08, 0xf0, 0x5a, 0xc6, 0x50, 0x18, 0x00, 0x40, 0x00, 0x00,
-        0x00, 0x00, b't', b'e', b's', b't', b'd', b'a', b't', b'a',
+        0x31, 0x96, 0xc8, 0x32, 0x08, 0xf0, 0x5a, 0xc6, 0x50, 0x18, 0x00, 0x40, 0x00, 0x00, 0x00,
+        0x00, b't', b'e', b's', b't', b'd', b'a', b't', b'a',
     ]);
     let ip_sum = checksum16(&frame[14..34]);
     frame[24] = (ip_sum >> 8) as u8;
@@ -3580,8 +3537,8 @@ fn segment_forwarded_tcp_frames_repairs_ipv6_tcp_ports_when_metadata_disagrees()
     frame.extend_from_slice(&src_port.to_be_bytes());
     frame.extend_from_slice(&dst_port.to_be_bytes());
     frame.extend_from_slice(&[
-        0x31, 0x96, 0xc8, 0x32, 0x08, 0xf0, 0x5a, 0xc6, 0x50, 0x18, 0x00, 0x40, 0x00, 0x00,
-        0x00, 0x00,
+        0x31, 0x96, 0xc8, 0x32, 0x08, 0xf0, 0x5a, 0xc6, 0x50, 0x18, 0x00, 0x40, 0x00, 0x00, 0x00,
+        0x00,
     ]);
     frame.extend((0..tcp_payload_len).map(|i| (i & 0xff) as u8));
     recompute_l4_checksum_ipv6(&mut frame[14..], 40, PROTO_TCP).expect("tcp sum");
@@ -3684,8 +3641,8 @@ fn segment_forwarded_tcp_frames_prefers_expected_ipv6_ports_over_wrong_live_port
     frame.extend_from_slice(&src_port.to_be_bytes());
     frame.extend_from_slice(&dst_port.to_be_bytes());
     frame.extend_from_slice(&[
-        0x31, 0x96, 0xc8, 0x32, 0x08, 0xf0, 0x5a, 0xc6, 0x50, 0x18, 0x00, 0x40, 0x00, 0x00,
-        0x00, 0x00,
+        0x31, 0x96, 0xc8, 0x32, 0x08, 0xf0, 0x5a, 0xc6, 0x50, 0x18, 0x00, 0x40, 0x00, 0x00, 0x00,
+        0x00,
     ]);
     frame.extend((0..tcp_payload_len).map(|i| (i & 0xff) as u8));
     recompute_l4_checksum_ipv6(&mut frame[14..], 40, PROTO_TCP).expect("tcp sum");
@@ -3789,8 +3746,8 @@ fn segment_forwarded_tcp_frames_repairs_wrong_ipv6_frame_ports_from_expected_tup
     frame.extend_from_slice(&wrong_src_port.to_be_bytes());
     frame.extend_from_slice(&dst_port.to_be_bytes());
     frame.extend_from_slice(&[
-        0x31, 0x96, 0xc8, 0x32, 0x08, 0xf0, 0x5a, 0xc6, 0x50, 0x18, 0x00, 0x40, 0x00, 0x00,
-        0x00, 0x00,
+        0x31, 0x96, 0xc8, 0x32, 0x08, 0xf0, 0x5a, 0xc6, 0x50, 0x18, 0x00, 0x40, 0x00, 0x00, 0x00,
+        0x00,
     ]);
     frame.extend((0..tcp_payload_len).map(|i| (i & 0xff) as u8));
     recompute_l4_checksum_ipv6(&mut frame[14..], 40, PROTO_TCP).expect("tcp sum");
@@ -3885,8 +3842,8 @@ fn authoritative_forward_ports_prefers_flow_tuple_when_frame_ports_mismatch() {
     frame.extend_from_slice(&wrong_src_port.to_be_bytes());
     frame.extend_from_slice(&dst_port.to_be_bytes());
     frame.extend_from_slice(&[
-        0x31, 0x96, 0xc8, 0x32, 0x08, 0xf0, 0x5a, 0xc6, 0x50, 0x18, 0x00, 0x40, 0x00, 0x00,
-        0x00, 0x00, b't', b'e', b's', b't', b'd', b'a', b't', b'a', b't', b'e', b's', b't',
+        0x31, 0x96, 0xc8, 0x32, 0x08, 0xf0, 0x5a, 0xc6, 0x50, 0x18, 0x00, 0x40, 0x00, 0x00, 0x00,
+        0x00, b't', b'e', b's', b't', b'd', b'a', b't', b'a', b't', b'e', b's', b't',
     ]);
     recompute_l4_checksum_ipv6(&mut frame[14..], 40, PROTO_TCP).expect("tcp sum");
 
@@ -3946,8 +3903,8 @@ fn authoritative_forward_ports_prefers_frame_tuple_over_metadata_when_flow_missi
     frame.extend_from_slice(&frame_src_port.to_be_bytes());
     frame.extend_from_slice(&dst_port.to_be_bytes());
     frame.extend_from_slice(&[
-        0x31, 0x96, 0xc8, 0x32, 0x08, 0xf0, 0x5a, 0xc6, 0x50, 0x18, 0x00, 0x40, 0x00, 0x00,
-        0x00, 0x00, b't', b'e', b's', b't', b'd', b'a', b't', b'a',
+        0x31, 0x96, 0xc8, 0x32, 0x08, 0xf0, 0x5a, 0xc6, 0x50, 0x18, 0x00, 0x40, 0x00, 0x00, 0x00,
+        0x00, b't', b'e', b's', b't', b'd', b'a', b't', b'a',
     ]);
     let ip_csum = checksum16(&frame[14..34]);
     frame[24..26].copy_from_slice(&ip_csum.to_be_bytes());
@@ -4040,8 +3997,8 @@ fn parse_session_flow_prefers_metadata_tuple_when_frame_ports_mismatch() {
     frame.extend_from_slice(&wrong_src_port.to_be_bytes());
     frame.extend_from_slice(&dst_port.to_be_bytes());
     frame.extend_from_slice(&[
-        0x31, 0x96, 0xc8, 0x32, 0x08, 0xf0, 0x5a, 0xc6, 0x50, 0x18, 0x00, 0x40, 0x00, 0x00,
-        0x00, 0x00, b't', b'e', b's', b't', b'd', b'a', b't', b'a', b't', b'e', b's', b't',
+        0x31, 0x96, 0xc8, 0x32, 0x08, 0xf0, 0x5a, 0xc6, 0x50, 0x18, 0x00, 0x40, 0x00, 0x00, 0x00,
+        0x00, b't', b'e', b's', b't', b'd', b'a', b't', b'a', b't', b'e', b's', b't',
     ]);
     recompute_l4_checksum_ipv6(&mut frame[14..], 40, PROTO_TCP).expect("tcp sum");
 
@@ -4249,8 +4206,8 @@ fn segment_forwarded_tcp_frames_keeps_ipv4_snat_inside_native_gre() {
     frame.extend_from_slice(&src_port.to_be_bytes());
     frame.extend_from_slice(&dst_port.to_be_bytes());
     frame.extend_from_slice(&[
-        0x52, 0x04, 0xc1, 0xa3, 0x73, 0x7f, 0x63, 0x1c, 0x80, 0x10, 0x00, 0x3f, 0x00, 0x00,
-        0x00, 0x00, 0x01, 0x01, 0x08, 0x0a, 0x91, 0x9b, 0x0d, 0x5f, 0xd3, 0x53, 0x0f, 0x7f,
+        0x52, 0x04, 0xc1, 0xa3, 0x73, 0x7f, 0x63, 0x1c, 0x80, 0x10, 0x00, 0x3f, 0x00, 0x00, 0x00,
+        0x00, 0x01, 0x01, 0x08, 0x0a, 0x91, 0x9b, 0x0d, 0x5f, 0xd3, 0x53, 0x0f, 0x7f,
     ]);
     frame.extend((0..tcp_payload_len).map(|i| (i & 0xff) as u8));
     let ip_sum = checksum16(&frame[14..34]);
@@ -4276,14 +4233,7 @@ fn segment_forwarded_tcp_frames_keeps_ipv4_snat_inside_native_gre() {
     };
     let state = build_forwarding_state(&native_gre_snapshot(true));
     let decision = SessionDecision {
-        resolution: lookup_forwarding_resolution_v4(
-            &state,
-            None,
-            dst_ip,
-            "sfmix.inet.0",
-            0,
-            true,
-        ),
+        resolution: lookup_forwarding_resolution_v4(&state, None, dst_ip, "sfmix.inet.0", 0, true),
         nat: NatDecision {
             rewrite_src: Some(IpAddr::V4(snat_ip)),
             ..NatDecision::default()
@@ -4425,10 +4375,18 @@ fn build_oversized_tcp_frame_for_ttl_gate(
                 PROTO_TCP,
                 ttl, // hop-limit field at IP-header offset 7
             ]);
-            frame
-                .extend_from_slice(&"2001:559:8585:ef00::102".parse::<Ipv6Addr>().unwrap().octets());
-            frame
-                .extend_from_slice(&"2001:559:8585:80::200".parse::<Ipv6Addr>().unwrap().octets());
+            frame.extend_from_slice(
+                &"2001:559:8585:ef00::102"
+                    .parse::<Ipv6Addr>()
+                    .unwrap()
+                    .octets(),
+            );
+            frame.extend_from_slice(
+                &"2001:559:8585:80::200"
+                    .parse::<Ipv6Addr>()
+                    .unwrap()
+                    .octets(),
+            );
             (54usize, 40usize)
         }
         _ => unreachable!(),
@@ -4507,8 +4465,7 @@ fn segment_forwarded_tcp_frames_keeps_fabric_ingress_low_ttl_both_families() {
         ("v4", libc::AF_INET, 8usize),
         ("v6", libc::AF_INET6, 7usize),
     ] {
-        let (frame, mut meta, decision, forwarding) =
-            build_oversized_tcp_frame_for_ttl_gate(af, 1);
+        let (frame, mut meta, decision, forwarding) = build_oversized_tcp_frame_for_ttl_gate(af, 1);
         meta.meta_flags = 0x80; // FABRIC_INGRESS_FLAG — peer already decremented
 
         let segments = segment_forwarded_tcp_frames_from_frame(
@@ -4552,10 +4509,14 @@ fn segment_forwarded_tcp_frames_keeps_fabric_ingress_low_ttl_both_families() {
 #[test]
 fn segment_forwarded_tcp_frames_drops_non_fabric_low_ttl_both_families() {
     for (label, af) in [("v4", libc::AF_INET), ("v6", libc::AF_INET6)] {
-        let (frame, meta, decision, forwarding) =
-            build_oversized_tcp_frame_for_ttl_gate(af, 1);
+        let (frame, meta, decision, forwarding) = build_oversized_tcp_frame_for_ttl_gate(af, 1);
         // meta_flags defaults to 0 (NOT fabric-ingress).
-        assert_eq!(meta.meta_flags & 0x80, 0, "[{}] expected non-fabric meta", label);
+        assert_eq!(
+            meta.meta_flags & 0x80,
+            0,
+            "[{}] expected non-fabric meta",
+            label
+        );
 
         let result = segment_forwarded_tcp_frames_from_frame(
             &frame,
@@ -4584,8 +4545,7 @@ fn segment_forwarded_tcp_frames_decrements_non_fabric_healthy_ttl_both_families(
         ("v4", libc::AF_INET, 8usize),
         ("v6", libc::AF_INET6, 7usize),
     ] {
-        let (frame, meta, decision, forwarding) =
-            build_oversized_tcp_frame_for_ttl_gate(af, 64);
+        let (frame, meta, decision, forwarding) = build_oversized_tcp_frame_for_ttl_gate(af, 64);
 
         let segments = segment_forwarded_tcp_frames_from_frame(
             &frame,
@@ -4620,10 +4580,10 @@ fn rewrite_forwarded_frame_in_place_keeps_tcp_checksum_valid_after_vlan_snat() {
         0x0800,
     );
     frame.extend_from_slice(&[
-        0x45, 0x00, 0x00, 0x30, 0x00, 0x01, 0x00, 0x00, 64, PROTO_TCP, 0x00, 0x00, 10, 0, 61,
-        102, 172, 16, 80, 200, 0x9c, 0x40, 0x14, 0x51, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
-        0x00, 0x00, 0x50, 0x02, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, b't', b'e', b's', b't', b'd',
-        b'a', b't', b'a',
+        0x45, 0x00, 0x00, 0x30, 0x00, 0x01, 0x00, 0x00, 64, PROTO_TCP, 0x00, 0x00, 10, 0, 61, 102,
+        172, 16, 80, 200, 0x9c, 0x40, 0x14, 0x51, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+        0x50, 0x02, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, b't', b'e', b's', b't', b'd', b'a', b't',
+        b'a',
     ]);
     let ip_sum = checksum16(&frame[14..34]);
     frame[24] = (ip_sum >> 8) as u8;
@@ -4675,7 +4635,9 @@ fn rewrite_forwarded_frame_in_place_keeps_tcp_checksum_valid_after_vlan_snat() {
     )
     .expect("rewrite in place");
 
-    let out = area.slice(rewrite_result.offset as usize, rewrite_result.len as usize).expect("rewritten frame");
+    let out = area
+        .slice(rewrite_result.offset as usize, rewrite_result.len as usize)
+        .expect("rewritten frame");
     assert_eq!(u16::from_be_bytes([out[12], out[13]]), 0x8100);
     assert_eq!(u16::from_be_bytes([out[14], out[15]]) & 0x0fff, 80);
     assert_eq!(u16::from_be_bytes([out[16], out[17]]), 0x0800);
@@ -4750,7 +4712,9 @@ fn rewrite_forwarded_frame_in_place_keeps_tcp_checksum_valid_after_vlan_dnat() {
     )
     .expect("rewrite in place");
 
-    let out = area.slice(rewrite_result.offset as usize, rewrite_result.len as usize).expect("rewritten frame");
+    let out = area
+        .slice(rewrite_result.offset as usize, rewrite_result.len as usize)
+        .expect("rewritten frame");
     assert_eq!(u16::from_be_bytes([out[12], out[13]]), 0x0800);
     assert_eq!(&out[30..34], &[10, 0, 61, 102]);
     assert_eq!(out[22], 63);
@@ -4762,10 +4726,10 @@ fn rewrite_forwarded_frame_in_place_applies_nat_for_fabric_redirect_when_enabled
     let mut frame = Vec::new();
     write_eth_header(&mut frame, [0xaa; 6], [0xbb; 6], 0, 0x0800);
     frame.extend_from_slice(&[
-        0x45, 0x00, 0x00, 0x30, 0x00, 0x01, 0x00, 0x00, 64, PROTO_TCP, 0x00, 0x00, 10, 0, 61,
-        102, 172, 16, 80, 200, 0x9c, 0x40, 0x14, 0x51, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
-        0x00, 0x00, 0x50, 0x10, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, b't', b'e', b's', b't',
-        b'd', b'a', b't', b'a',
+        0x45, 0x00, 0x00, 0x30, 0x00, 0x01, 0x00, 0x00, 64, PROTO_TCP, 0x00, 0x00, 10, 0, 61, 102,
+        172, 16, 80, 200, 0x9c, 0x40, 0x14, 0x51, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+        0x50, 0x10, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, b't', b'e', b's', b't', b'd', b'a', b't',
+        b'a',
     ]);
     let ip_sum = checksum16(&frame[14..34]);
     frame[24] = (ip_sum >> 8) as u8;
@@ -4816,7 +4780,9 @@ fn rewrite_forwarded_frame_in_place_applies_nat_for_fabric_redirect_when_enabled
     )
     .expect("rewrite in place");
 
-    let out = area.slice(rewrite_result.offset as usize, rewrite_result.len as usize).expect("rewritten frame");
+    let out = area
+        .slice(rewrite_result.offset as usize, rewrite_result.len as usize)
+        .expect("rewritten frame");
     assert_eq!(&out[0..6], &[0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]);
     assert_eq!(&out[6..12], &[0x02, 0xbf, 0x72, 0xff, 0x00, 0x01]);
     assert_eq!(&out[26..30], &[172, 16, 80, 8]);
@@ -4837,10 +4803,10 @@ fn rewrite_forwarded_frame_in_place_skips_nat_for_fabric_redirect_when_disabled(
     let mut frame = Vec::new();
     write_eth_header(&mut frame, [0xaa; 6], [0xbb; 6], 0, 0x0800);
     frame.extend_from_slice(&[
-        0x45, 0x00, 0x00, 0x30, 0x00, 0x01, 0x00, 0x00, 64, PROTO_TCP, 0x00, 0x00, 10, 0, 61,
-        102, 172, 16, 80, 200, 0x9c, 0x40, 0x14, 0x51, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
-        0x00, 0x00, 0x50, 0x10, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, b't', b'e', b's', b't',
-        b'd', b'a', b't', b'a',
+        0x45, 0x00, 0x00, 0x30, 0x00, 0x01, 0x00, 0x00, 64, PROTO_TCP, 0x00, 0x00, 10, 0, 61, 102,
+        172, 16, 80, 200, 0x9c, 0x40, 0x14, 0x51, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+        0x50, 0x10, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, b't', b'e', b's', b't', b'd', b'a', b't',
+        b'a',
     ]);
     let ip_sum = checksum16(&frame[14..34]);
     frame[24] = (ip_sum >> 8) as u8;
@@ -4890,7 +4856,9 @@ fn rewrite_forwarded_frame_in_place_skips_nat_for_fabric_redirect_when_disabled(
     )
     .expect("rewrite in place");
 
-    let out = area.slice(rewrite_result.offset as usize, rewrite_result.len as usize).expect("rewritten frame");
+    let out = area
+        .slice(rewrite_result.offset as usize, rewrite_result.len as usize)
+        .expect("rewritten frame");
     // Source IP MUST be the original 10.0.61.102, not the SNAT'd
     // 198.51.100.99. This validates that apply_nat=false is
     // correctly threaded through the dispatch into rewrite_apply_v4.
@@ -4921,12 +4889,12 @@ fn rewrite_forwarded_frame_in_place_skips_ttl_when_fabric_ingress_flag_set() {
     // the IP header total_len matches the actual constructed
     // frame (Codex impl review round-1 caught a 0x0030 mismatch).
     let v4_header: Vec<u8> = vec![
-        0x45, 0x00, 0x00, 0x2c, 0x00, 0x01, 0x00, 0x00, 64, PROTO_TCP, 0x00, 0x00, 10, 0, 61,
-        102, 172, 16, 80, 200,
+        0x45, 0x00, 0x00, 0x2c, 0x00, 0x01, 0x00, 0x00, 64, PROTO_TCP, 0x00, 0x00, 10, 0, 61, 102,
+        172, 16, 80, 200,
     ];
     let v4_payload: Vec<u8> = vec![
-        0x9c, 0x40, 0x14, 0x51, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x50, 0x10,
-        0x20, 0x00, 0x00, 0x00, 0x00, 0x00, b't', b'e', b's', b't',
+        0x9c, 0x40, 0x14, 0x51, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x50, 0x10, 0x20,
+        0x00, 0x00, 0x00, 0x00, 0x00, b't', b'e', b's', b't',
     ];
     let v6_header: Vec<u8> = vec![
         0x60, 0x00, 0x00, 0x00, 0x00, 0x14, PROTO_TCP, 64, // src 2001:db8::1
@@ -4935,8 +4903,8 @@ fn rewrite_forwarded_frame_in_place_skips_ttl_when_fabric_ingress_flag_set() {
         0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0x02, 0x00,
     ];
     let v6_payload: Vec<u8> = vec![
-        0x9c, 0x40, 0x14, 0x51, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x50, 0x10,
-        0x20, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x9c, 0x40, 0x14, 0x51, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x50, 0x10, 0x20,
+        0x00, 0x00, 0x00, 0x00, 0x00,
     ];
     for (label, addr_family, ether_type, ip_header, ip_payload, ttl_rel_offset, src_ip) in [
         (
@@ -4966,8 +4934,7 @@ fn rewrite_forwarded_frame_in_place_skips_ttl_when_fabric_ingress_flag_set() {
             let ip_sum = checksum16(&frame[14..14 + ip_header.len()]);
             frame[24] = (ip_sum >> 8) as u8;
             frame[25] = ip_sum as u8;
-            recompute_l4_checksum_ipv4(&mut frame[14..], 20, PROTO_TCP, false)
-                .expect("v4 tcp sum");
+            recompute_l4_checksum_ipv4(&mut frame[14..], 20, PROTO_TCP, false).expect("v4 tcp sum");
         } else {
             recompute_l4_checksum_ipv6(&mut frame[14..], 40, PROTO_TCP).expect("v6 tcp sum");
         }
@@ -5014,7 +4981,9 @@ fn rewrite_forwarded_frame_in_place_skips_ttl_when_fabric_ingress_flag_set() {
         )
         .unwrap_or_else(|| panic!("[{}] rewrite_in_place returned None", label));
 
-        let out = area.slice(rewrite_result.offset as usize, rewrite_result.len as usize).expect("rewritten frame");
+        let out = area
+            .slice(rewrite_result.offset as usize, rewrite_result.len as usize)
+            .expect("rewritten frame");
         let post_ttl = out[14 + ttl_rel_offset];
         assert_eq!(
             pre_ttl, post_ttl,
@@ -5037,8 +5006,7 @@ fn test_descriptor(
     RewriteDescriptor {
         dst_mac: decision.resolution.neighbor_mac.unwrap_or([0; 6]),
         src_mac: decision.resolution.src_mac.unwrap_or([0; 6]),
-        fabric_redirect: decision.resolution.disposition
-            == ForwardingDisposition::FabricRedirect,
+        fabric_redirect: decision.resolution.disposition == ForwardingDisposition::FabricRedirect,
         tx_vlan_id: vlan_id,
         ether_type,
         rewrite_src_ip: decision.nat.rewrite_src,
@@ -5137,7 +5105,9 @@ fn apply_descriptor_ipv4_no_nat_ttl_and_checksum() {
     )
     .expect("descriptor rewrite");
 
-    let out = area.slice(rewrite_result.offset as usize, rewrite_result.len as usize).expect("out");
+    let out = area
+        .slice(rewrite_result.offset as usize, rewrite_result.len as usize)
+        .expect("out");
     // Ethernet header
     assert_eq!(&out[0..6], &[0x00, 0x11, 0x22, 0x33, 0x44, 0x55]);
     assert_eq!(&out[6..12], &[0x02, 0xbf, 0x72, 0x00, 0x50, 0x08]);
@@ -5161,8 +5131,8 @@ fn apply_descriptor_ipv4_snat_with_vlan() {
         102, // src = 10.0.61.102
         172, 16, 80, 200, // dst = 172.16.80.200
         0x9c, 0x40, 0x14, 0x51, // src_port=40000 dst_port=5201
-        0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x50, 0x10, 0x20, 0x00, 0x00, 0x00,
-        0x00, 0x00, b't', b'e', b's', b't', b'd', b'a', b't', b'a',
+        0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x50, 0x10, 0x20, 0x00, 0x00, 0x00, 0x00,
+        0x00, b't', b'e', b's', b't', b'd', b'a', b't', b'a',
     ]);
     let ip_sum = checksum16(&frame[14..34]);
     frame[24] = (ip_sum >> 8) as u8;
@@ -5229,8 +5199,13 @@ fn apply_descriptor_ipv4_snat_with_vlan() {
     .expect("descriptor snat rewrite");
 
     assert_eq!(rewrite_result.offset, rx_addr - 4);
-    assert_eq!(rewrite_result.l2_rewrite, InPlaceL2Rewrite::VlanPushDescriptor);
-    let out = area.slice(rewrite_result.offset as usize, rewrite_result.len as usize).expect("out");
+    assert_eq!(
+        rewrite_result.l2_rewrite,
+        InPlaceL2Rewrite::VlanPushDescriptor
+    );
+    let out = area
+        .slice(rewrite_result.offset as usize, rewrite_result.len as usize)
+        .expect("out");
     // VLAN tag added
     assert_eq!(u16::from_be_bytes([out[12], out[13]]), 0x8100);
     assert_eq!(u16::from_be_bytes([out[14], out[15]]) & 0x0fff, 80);
@@ -5251,10 +5226,10 @@ fn apply_descriptor_fabric_redirect_skips_nat_when_flag_is_false() {
     let mut frame = Vec::new();
     write_eth_header(&mut frame, [0xaa; 6], [0xbb; 6], 0, 0x0800);
     frame.extend_from_slice(&[
-        0x45, 0x00, 0x00, 0x30, 0x00, 0x01, 0x00, 0x00, 64, PROTO_TCP, 0x00, 0x00, 10, 0, 61,
-        102, 172, 16, 80, 200, 0x9c, 0x40, 0x14, 0x51, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00,
-        0x00, 0x00, 0x50, 0x10, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, b't', b'e', b's', b't',
-        b'd', b'a', b't', b'a',
+        0x45, 0x00, 0x00, 0x30, 0x00, 0x01, 0x00, 0x00, 64, PROTO_TCP, 0x00, 0x00, 10, 0, 61, 102,
+        172, 16, 80, 200, 0x9c, 0x40, 0x14, 0x51, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00,
+        0x50, 0x10, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00, b't', b'e', b's', b't', b'd', b'a', b't',
+        b'a',
     ]);
     let ip_sum = checksum16(&frame[14..34]);
     frame[24] = (ip_sum >> 8) as u8;
@@ -5320,7 +5295,9 @@ fn apply_descriptor_fabric_redirect_skips_nat_when_flag_is_false() {
     )
     .expect("descriptor fabric rewrite");
 
-    let out = area.slice(rewrite_result.offset as usize, rewrite_result.len as usize).expect("out");
+    let out = area
+        .slice(rewrite_result.offset as usize, rewrite_result.len as usize)
+        .expect("out");
     assert_eq!(&out[0..6], &[0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]);
     assert_eq!(&out[6..12], &[0x02, 0xbf, 0x72, 0xff, 0x00, 0x01]);
     assert_eq!(&out[26..30], &[10, 0, 61, 102]);
@@ -5340,8 +5317,8 @@ fn apply_descriptor_ipv4_dnat_removes_vlan() {
         200, // src
         172, 16, 80, 8, // dst (pre-DNAT)
         0x14, 0x51, 0x9c, 0x40, // src_port=5201 dst_port=40000
-        0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x02, 0x50, 0x10, 0x20, 0x00, 0x00, 0x00,
-        0x00, 0x00, b't', b'e', b's', b't', b'd', b'a', b't', b'a',
+        0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x02, 0x50, 0x10, 0x20, 0x00, 0x00, 0x00, 0x00,
+        0x00, b't', b'e', b's', b't', b'd', b'a', b't', b'a',
     ]);
     let ip_sum = checksum16(&frame[18..38]);
     frame[28] = (ip_sum >> 8) as u8;
@@ -5406,8 +5383,13 @@ fn apply_descriptor_ipv4_dnat_removes_vlan() {
     .expect("descriptor dnat rewrite");
 
     assert_eq!(rewrite_result.offset, 4);
-    assert_eq!(rewrite_result.l2_rewrite, InPlaceL2Rewrite::VlanPopDescriptor);
-    let out = area.slice(rewrite_result.offset as usize, rewrite_result.len as usize).expect("out");
+    assert_eq!(
+        rewrite_result.l2_rewrite,
+        InPlaceL2Rewrite::VlanPopDescriptor
+    );
+    let out = area
+        .slice(rewrite_result.offset as usize, rewrite_result.len as usize)
+        .expect("out");
     // No VLAN
     assert_eq!(u16::from_be_bytes([out[12], out[13]]), 0x0800);
     // DNAT applied
@@ -5499,7 +5481,9 @@ fn apply_descriptor_ipv6_no_nat_hop_limit() {
     )
     .expect("descriptor ipv6 rewrite");
 
-    let out = area.slice(rewrite_result.offset as usize, rewrite_result.len as usize).expect("out");
+    let out = area
+        .slice(rewrite_result.offset as usize, rewrite_result.len as usize)
+        .expect("out");
     assert_eq!(&out[0..6], &[0x00, 0x11, 0x22, 0x33, 0x44, 0x55]);
     assert_eq!(u16::from_be_bytes([out[12], out[13]]), 0x86dd);
     // Hop limit decremented
@@ -5521,8 +5505,8 @@ fn apply_descriptor_returns_none_on_port_mismatch() {
     let mut frame = Vec::new();
     write_eth_header(&mut frame, [0xaa; 6], [0xbb; 6], 0, 0x0800);
     frame.extend_from_slice(&[
-        0x45, 0x00, 0x00, 0x28, 0x00, 0x01, 0x00, 0x00, 64, PROTO_TCP, 0x00, 0x00, 10, 0, 1,
-        102, 172, 16, 80, 200, 0x9c, 0x40, 0x01, 0xbb, // src=40000 dst=443
+        0x45, 0x00, 0x00, 0x28, 0x00, 0x01, 0x00, 0x00, 64, PROTO_TCP, 0x00, 0x00, 10, 0, 1, 102,
+        172, 16, 80, 200, 0x9c, 0x40, 0x01, 0xbb, // src=40000 dst=443
         0, 0, 0, 1, 0, 0, 0, 0, 0x50, 0x10, 0x20, 0x00, 0x00, 0x00, 0x00, 0x00,
     ]);
     let ip_sum = checksum16(&frame[14..34]);
@@ -5652,9 +5636,7 @@ fn apply_dscp_rewrite_to_ipv6_frame_updates_traffic_class() {
         58, 64, // next header + hop limit
     ]);
     frame.extend_from_slice(&Ipv6Addr::LOCALHOST.octets());
-    frame.extend_from_slice(
-        &Ipv6Addr::new(0x2001, 0x559, 0x8585, 0x80, 0, 0, 0, 0x200).octets(),
-    );
+    frame.extend_from_slice(&Ipv6Addr::new(0x2001, 0x559, 0x8585, 0x80, 0, 0, 0, 0x200).octets());
     frame.extend_from_slice(&[128, 0, 0, 0, 0, 1, 0, 1]);
 
     let l3 = frame_l3_offset(&frame).expect("l3");
@@ -5710,7 +5692,10 @@ fn adjust_l4_checksum_port_v4_skip_v6_no_skip() {
         adjust_l4_checksum_port(&mut p6, 0, PROTO_UDP, ChecksumFamily::V6, 0x1234, 0x4321),
         Some(())
     );
-    assert_eq!(p4, p6, "non-zero stored checksum: families behave identically");
+    assert_eq!(
+        p4, p6,
+        "non-zero stored checksum: families behave identically"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -5765,11 +5750,19 @@ fn frag_v6_packet(protocol: u8, frag_off: Option<u16>, payload: &[u8]) -> Vec<u8
 #[test]
 fn ipv4_non_first_fragment_predicate_truth_table() {
     // offset 0, MF=0 (atomic) and MF=1 (first) -> first/atomic, false.
-    assert!(!ipv4_is_non_first_fragment(&frag_v4_packet(PROTO_TCP, 0x0000, &[0; 8])));
-    assert!(!ipv4_is_non_first_fragment(&frag_v4_packet(PROTO_TCP, 0x2000, &[0; 8])));
+    assert!(!ipv4_is_non_first_fragment(&frag_v4_packet(
+        PROTO_TCP, 0x0000, &[0; 8]
+    )));
+    assert!(!ipv4_is_non_first_fragment(&frag_v4_packet(
+        PROTO_TCP, 0x2000, &[0; 8]
+    )));
     // offset != 0 -> non-first (with and without MF).
-    assert!(ipv4_is_non_first_fragment(&frag_v4_packet(PROTO_TCP, 0x0001, &[0; 8])));
-    assert!(ipv4_is_non_first_fragment(&frag_v4_packet(PROTO_TCP, 0x2001, &[0; 8])));
+    assert!(ipv4_is_non_first_fragment(&frag_v4_packet(
+        PROTO_TCP, 0x0001, &[0; 8]
+    )));
+    assert!(ipv4_is_non_first_fragment(&frag_v4_packet(
+        PROTO_TCP, 0x2001, &[0; 8]
+    )));
     // too-short slice -> false (length guards reject separately).
     assert!(!ipv4_is_non_first_fragment(&[0x45, 0x00, 0x00]));
 }
@@ -5777,13 +5770,170 @@ fn ipv4_non_first_fragment_predicate_truth_table() {
 #[test]
 fn ipv6_non_first_fragment_predicate_truth_table() {
     // No fragment header -> false.
-    assert!(!ipv6_is_non_first_fragment(&frag_v6_packet(PROTO_TCP, None, &[0; 8])));
+    assert!(!ipv6_is_non_first_fragment(&frag_v6_packet(
+        PROTO_TCP, None, &[0; 8]
+    )));
     // Fragment header, offset 0 (first/atomic) with MF=0 and MF=1 -> false.
-    assert!(!ipv6_is_non_first_fragment(&frag_v6_packet(PROTO_TCP, Some(0x0000), &[0; 8])));
-    assert!(!ipv6_is_non_first_fragment(&frag_v6_packet(PROTO_TCP, Some(0x0001), &[0; 8])));
+    assert!(!ipv6_is_non_first_fragment(&frag_v6_packet(
+        PROTO_TCP,
+        Some(0x0000),
+        &[0; 8]
+    )));
+    assert!(!ipv6_is_non_first_fragment(&frag_v6_packet(
+        PROTO_TCP,
+        Some(0x0001),
+        &[0; 8]
+    )));
     // Fragment header, offset bits set -> non-first.
-    assert!(ipv6_is_non_first_fragment(&frag_v6_packet(PROTO_TCP, Some(0x0008), &[0; 8])));
-    assert!(ipv6_is_non_first_fragment(&frag_v6_packet(PROTO_TCP, Some(0xABC8), &[0; 8])));
+    assert!(ipv6_is_non_first_fragment(&frag_v6_packet(
+        PROTO_TCP,
+        Some(0x0008),
+        &[0; 8]
+    )));
+    assert!(ipv6_is_non_first_fragment(&frag_v6_packet(
+        PROTO_TCP,
+        Some(0xABC8),
+        &[0; 8]
+    )));
+}
+
+// #2362: Junos `is-fragment` matches ANY fragment (first OR non-first), unlike
+// the non-first predicate above. The MF bit (0x2000) alone (offset 0) means a
+// FIRST fragment, which must match.
+#[test]
+fn ipv4_any_fragment_predicate_truth_table() {
+    // Unfragmented datagram (MF=0, offset=0) -> not a fragment.
+    assert!(!ipv4_is_any_fragment(&frag_v4_packet(
+        PROTO_TCP, 0x0000, &[0; 8]
+    )));
+    // DF set only (0x4000) -> still not a fragment.
+    assert!(!ipv4_is_any_fragment(&frag_v4_packet(
+        PROTO_TCP, 0x4000, &[0; 8]
+    )));
+    // First fragment (MF=1, offset=0) -> IS a fragment.
+    assert!(ipv4_is_any_fragment(&frag_v4_packet(
+        PROTO_TCP, 0x2000, &[0; 8]
+    )));
+    // Middle/last fragment (offset != 0) -> IS a fragment, MF set or not.
+    assert!(ipv4_is_any_fragment(&frag_v4_packet(
+        PROTO_TCP, 0x0001, &[0; 8]
+    )));
+    assert!(ipv4_is_any_fragment(&frag_v4_packet(
+        PROTO_TCP, 0x2001, &[0; 8]
+    )));
+    // Too-short slice -> false.
+    assert!(!ipv4_is_any_fragment(&[0x45, 0x00, 0x00]));
+}
+
+#[test]
+fn ipv6_any_fragment_predicate_truth_table() {
+    // No fragment header -> not a fragment.
+    assert!(!ipv6_is_any_fragment(&frag_v6_packet(
+        PROTO_TCP, None, &[0; 8]
+    )));
+    // Fragment header present, first fragment (offset 0, M=1) -> IS a fragment.
+    assert!(ipv6_is_any_fragment(&frag_v6_packet(
+        PROTO_TCP,
+        Some(0x0001),
+        &[0; 8]
+    )));
+    // Fragment header present, offset 0, M=0 (atomic-ish) -> still a fragment
+    // header is present, so Junos is-fragment matches.
+    assert!(ipv6_is_any_fragment(&frag_v6_packet(
+        PROTO_TCP,
+        Some(0x0000),
+        &[0; 8]
+    )));
+    // Middle/last fragment -> IS a fragment.
+    assert!(ipv6_is_any_fragment(&frag_v6_packet(
+        PROTO_TCP,
+        Some(0x0008),
+        &[0; 8]
+    )));
+}
+
+// #2362 fold A (the #2344 non-first-fragment class): term_match_extra_from_frame
+// must NOT read L4-derived match inputs from a non-first fragment — its bytes
+// at l4_offset are payload, not a real L4 header. is_fragment (L3-only) MUST
+// still be set. These fail if the non-first-fragment gate is removed.
+#[test]
+fn term_extra_non_first_icmp_fragment_suppresses_icmp_type_keeps_is_fragment() {
+    // Non-first ICMP fragment (offset != 0) whose payload byte at l4_offset == 8
+    // (would spuriously match `icmp-type 8` without the gate).
+    let frag = frag_v4_packet(PROTO_ICMP, 0x0001, &[8, 0, 0, 0, 0, 0, 0, 0]);
+    let mut frame = vec![0u8; 14];
+    frame.extend_from_slice(&frag);
+    let meta = UserspaceDpMeta {
+        l3_offset: 14,
+        l4_offset: 34,
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_ICMP,
+        ..UserspaceDpMeta::default()
+    };
+    let extra = term_match_extra_from_frame(&frame, meta);
+    assert_eq!(
+        extra.icmp_type, 0,
+        "non-first fragment payload byte must NOT leak as icmp_type"
+    );
+    assert_eq!(extra.icmp_code, 0);
+    assert_eq!(extra.tcp_flags, 0);
+    assert!(
+        !extra.l4_present,
+        "non-first fragment has no L4 header → l4_present must be false (the matcher gates on this, not the byte value)"
+    );
+    assert!(
+        extra.is_fragment,
+        "a non-first fragment IS a fragment (is-fragment must match)"
+    );
+}
+
+#[test]
+fn term_extra_non_first_tcp_fragment_suppresses_tcp_flags() {
+    // Non-first TCP fragment with meta.tcp_flags carrying SYN (payload-derived).
+    let frag = frag_v4_packet(PROTO_TCP, 0x0001, &[0; 8]);
+    let mut frame = vec![0u8; 14];
+    frame.extend_from_slice(&frag);
+    let meta = UserspaceDpMeta {
+        l3_offset: 14,
+        l4_offset: 34,
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_TCP,
+        tcp_flags: 0x02, // SYN — would spuriously match `tcp-flags syn`
+        ..UserspaceDpMeta::default()
+    };
+    let extra = term_match_extra_from_frame(&frame, meta);
+    assert_eq!(
+        extra.tcp_flags, 0,
+        "non-first fragment must NOT expose payload-derived tcp_flags"
+    );
+    assert!(!extra.l4_present, "non-first fragment → l4_present false");
+    assert!(extra.is_fragment);
+}
+
+#[test]
+fn term_extra_first_fragment_keeps_l4_fields() {
+    // A FIRST fragment (offset 0, MF=1) carries the real L4 header — keep the
+    // L4 fields AND mark is_fragment.
+    let frag = frag_v4_packet(PROTO_ICMP, 0x2000, &[8, 0, 0, 0, 0, 0, 0, 0]);
+    let mut frame = vec![0u8; 14];
+    frame.extend_from_slice(&frag);
+    let meta = UserspaceDpMeta {
+        l3_offset: 14,
+        l4_offset: 34,
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_ICMP,
+        ..UserspaceDpMeta::default()
+    };
+    let extra = term_match_extra_from_frame(&frame, meta);
+    assert_eq!(
+        extra.icmp_type, 8,
+        "first fragment carries the real ICMP type"
+    );
+    assert!(
+        extra.l4_present,
+        "first fragment carries the real L4 header → l4_present true"
+    );
+    assert!(extra.is_fragment, "first fragment IS a fragment");
 }
 
 #[test]
@@ -5815,7 +5965,10 @@ fn apply_nat_ipv6_non_first_fragment_rewrites_ip_only() {
         ..NatDecision::default()
     };
     // rel_l4 = 48 (40 base + 8 fragment header).
-    assert_eq!(apply_nat_ipv6(&mut frag, 48, PROTO_TCP, nat, true), Some(()));
+    assert_eq!(
+        apply_nat_ipv6(&mut frag, 48, PROTO_TCP, nat, true),
+        Some(())
+    );
     assert_eq!(&frag[24..40], &new_dst.octets());
     assert_eq!(&frag[48..], &payload);
 }
@@ -5835,7 +5988,10 @@ fn enforce_expected_ports_skips_non_first_fragment() {
     )
     .expect("enforce");
     assert!(!repaired);
-    assert_eq!(frame, before, "non-first fragment payload must be untouched");
+    assert_eq!(
+        frame, before,
+        "non-first fragment payload must be untouched"
+    );
 }
 
 #[test]
@@ -5862,7 +6018,10 @@ fn clamp_tcp_mss_clamps_ext_headered_v6_syn() {
     let plen = (p.len() - 40) as u16;
     p[4..6].copy_from_slice(&plen.to_be_bytes());
 
-    assert!(super::tcp::clamp_tcp_mss(&mut p, 1400), "ext-headered v6 SYN must clamp");
+    assert!(
+        super::tcp::clamp_tcp_mss(&mut p, 1400),
+        "ext-headered v6 SYN must clamp"
+    );
     let mss = u16::from_be_bytes([p[48 + 22], p[48 + 23]]);
     assert_eq!(mss, 1400);
 }
@@ -5972,10 +6131,7 @@ fn local_origin_tunnel_tx_request_follows_supplied_state_destination() {
     let mut snapshot_new = native_gre_snapshot(true);
     snapshot_new.tunnel_endpoints[0].destination = "2602:ffd3:0:2::9".to_string();
     let state_new = build_forwarding_state(&snapshot_new);
-    let ha_state = BTreeMap::from([(
-        1,
-        active_ha_runtime(monotonic_nanos() / 1_000_000_000),
-    )]);
+    let ha_state = BTreeMap::from([(1, active_ha_runtime(monotonic_nanos() / 1_000_000_000))]);
     let dynamic_neighbors = Arc::new(ShardedNeighborMap::new());
     let packet = build_icmp_echo_frame_v4(
         Ipv4Addr::new(10, 255, 192, 42),
@@ -5983,13 +6139,23 @@ fn local_origin_tunnel_tx_request_follows_supplied_state_destination() {
         64,
     );
     // Outer IPv6 destination: eth(14) + vlan(4) + 24 = offset 42..58.
-    let plan_old =
-        build_local_origin_tunnel_tx_request(&packet[14..], 1, &state_old, &ha_state, &dynamic_neighbors)
-            .expect("old-state plan");
+    let plan_old = build_local_origin_tunnel_tx_request(
+        &packet[14..],
+        1,
+        &state_old,
+        &ha_state,
+        &dynamic_neighbors,
+    )
+    .expect("old-state plan");
     assert_eq!(plan_old.tx_request.bytes[57], 0x07, "old outer destination");
-    let plan_new =
-        build_local_origin_tunnel_tx_request(&packet[14..], 1, &state_new, &ha_state, &dynamic_neighbors)
-            .expect("new-state plan");
+    let plan_new = build_local_origin_tunnel_tx_request(
+        &packet[14..],
+        1,
+        &state_new,
+        &ha_state,
+        &dynamic_neighbors,
+    )
+    .expect("new-state plan");
     assert_eq!(
         plan_new.tx_request.bytes[57], 0x09,
         "destination edit reaches the encap as soon as the thread \

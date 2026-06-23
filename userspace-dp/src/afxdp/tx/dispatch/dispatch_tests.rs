@@ -89,6 +89,7 @@ fn test_pending_forward_request(
         cos_queue_id: None,
         dscp_rewrite: None,
         cos_tx_selection_resolved,
+        filter_match_extra: crate::filter::TermMatchExtra::default(),
     }
 }
 
@@ -123,6 +124,7 @@ fn test_live_forward_request_for_frame(
         cos_queue_id: None,
         dscp_rewrite: None,
         cos_tx_selection_resolved: true,
+        filter_match_extra: crate::filter::TermMatchExtra::default(),
     }
 }
 
@@ -970,7 +972,10 @@ fn enqueue_failure_conserves_free_frames_across_many_forwards() {
         "every ingress descriptor must be recycled exactly once — no leak, \
          no double-recycle"
     );
-    assert_eq!(dbg.build_fail as usize, N, "every forward hit build failure");
+    assert_eq!(
+        dbg.build_fail as usize, N,
+        "every forward hit build failure"
+    );
     assert_eq!(
         bindings[0].live.slow_path_drops.load(Ordering::Relaxed) as usize,
         N,
@@ -1056,7 +1061,12 @@ fn run_ptb_dispatch(egress_mtu: usize) -> (Vec<BindingWorker>, DebugPollCounters
 /// the fail-on-revert tests can assert the generated-reply drop counters.
 fn run_ptb_dispatch_with_forwarding(
     forwarding: ForwardingState,
-) -> (Vec<BindingWorker>, DebugPollCounters, BatchCounters, Vec<String>) {
+) -> (
+    Vec<BindingWorker>,
+    DebugPollCounters,
+    BatchCounters,
+    Vec<String>,
+) {
     let mut bindings = vec![
         BindingWorker::new_for_mirror_test(0, 0, 11, 0),
         BindingWorker::new_for_mirror_test(1, 0, 22, 0),
@@ -1064,14 +1074,9 @@ fn run_ptb_dispatch_with_forwarding(
     // 1600-byte L3 payload -> 1614-byte frame. Fits a 4096 UMEM frame but
     // exceeds a 1400 egress MTU.
     let frame = large_udp_v4_df_frame(1600);
-    unsafe {
-        bindings[0]
-            .umem
-            .area()
-            .slice_mut_unchecked(0, frame.len())
-    }
-    .expect("ingress frame")
-    .copy_from_slice(&frame);
+    unsafe { bindings[0].umem.area().slice_mut_unchecked(0, frame.len()) }
+        .expect("ingress frame")
+        .copy_from_slice(&frame);
 
     let lookup = WorkerBindingLookup::from_bindings(&bindings);
     let mirror_targets = MirrorTargetMap::default();
@@ -1140,9 +1145,16 @@ fn oversized_forward_emits_ptb_and_drops_original() {
         "exactly one ICMP Frag-Needed must be enqueued on the ingress binding"
     );
     let reply = &ingress_tx[0];
-    assert_eq!(reply.egress_ifindex, 11, "PTB leaves via the ingress interface");
+    assert_eq!(
+        reply.egress_ifindex, 11,
+        "PTB leaves via the ingress interface"
+    );
     let b = &reply.bytes;
-    assert_eq!(&b[0..6], &[0x00, 0x25, 0x90, 0x12, 0x34, 0x56], "reflected to the sender");
+    assert_eq!(
+        &b[0..6],
+        &[0x00, 0x25, 0x90, 0x12, 0x34, 0x56],
+        "reflected to the sender"
+    );
     assert_eq!(&b[12..14], &[0x08, 0x00], "IPv4 reply");
     assert_eq!(b[14], 0x45);
     assert_eq!(b[23], PROTO_ICMP, "outer ICMP");
@@ -1200,7 +1212,10 @@ fn in_mtu_forward_emits_no_ptb_counterfactual() {
     // proving the in-MTU fast path is untouched.
     let egress_tx = bindings[1].tx_pipeline.pending_tx_local.len()
         + bindings[1].tx_pipeline.pending_tx_prepared.len();
-    assert_eq!(egress_tx, 1, "in-MTU frame must forward to the egress binding");
+    assert_eq!(
+        egress_tx, 1,
+        "in-MTU frame must forward to the egress binding"
+    );
 }
 
 /// #2328: build a v4 output firewall filter on the PTB egress interface
@@ -1244,8 +1259,8 @@ fn forwarding_for_ptb_with_output_term(
 /// enqueued and this assertion fails.
 #[test]
 fn ptb_dropped_by_egress_output_filter_discard() {
-    let (bindings, _dbg, counters, reasons) = run_ptb_dispatch_with_forwarding(
-        forwarding_for_ptb_with_output_term(
+    let (bindings, _dbg, counters, reasons) =
+        run_ptb_dispatch_with_forwarding(forwarding_for_ptb_with_output_term(
             1400,
             crate::FirewallTermSnapshot {
                 name: "drop-icmp".into(),
@@ -1253,8 +1268,7 @@ fn ptb_dropped_by_egress_output_filter_discard() {
                 protocols: vec!["icmp".into()],
                 ..Default::default()
             },
-        ),
-    );
+        ));
     // The generated PTB was DROPPED (not enqueued) by the output `discard`.
     assert_eq!(
         bindings[0].tx_pipeline.pending_tx_local.len(),
@@ -1281,8 +1295,8 @@ fn ptb_dropped_by_egress_output_filter_discard() {
 /// Exceeded `ignores_trigger_matching_output_filter` test.
 #[test]
 fn ptb_ignores_trigger_matching_output_filter() {
-    let (bindings, _dbg, counters, _reasons) = run_ptb_dispatch_with_forwarding(
-        forwarding_for_ptb_with_output_term(
+    let (bindings, _dbg, counters, _reasons) =
+        run_ptb_dispatch_with_forwarding(forwarding_for_ptb_with_output_term(
             1400,
             crate::FirewallTermSnapshot {
                 name: "drop-udp".into(),
@@ -1290,8 +1304,7 @@ fn ptb_ignores_trigger_matching_output_filter() {
                 protocols: vec!["udp".into()],
                 ..Default::default()
             },
-        ),
-    );
+        ));
     assert_eq!(
         bindings[0].tx_pipeline.pending_tx_local.len(),
         1,
@@ -1308,8 +1321,8 @@ fn ptb_ignores_trigger_matching_output_filter() {
 /// `dscp_rewrite: None` makes the asserted rewrite disappear.
 #[test]
 fn ptb_dscp_rewrite_comes_from_classifier_not_none() {
-    let (bindings, _dbg, counters, _reasons) = run_ptb_dispatch_with_forwarding(
-        forwarding_for_ptb_with_output_term(
+    let (bindings, _dbg, counters, _reasons) =
+        run_ptb_dispatch_with_forwarding(forwarding_for_ptb_with_output_term(
             1400,
             crate::FirewallTermSnapshot {
                 name: "mark-icmp".into(),
@@ -1318,8 +1331,7 @@ fn ptb_dscp_rewrite_comes_from_classifier_not_none() {
                 dscp_rewrite: Some(46),
                 ..Default::default()
             },
-        ),
-    );
+        ));
     let ptb = &bindings[0].tx_pipeline.pending_tx_local;
     assert_eq!(ptb.len(), 1, "PTB accepted (then accept) and enqueued");
     assert_eq!(
@@ -1345,7 +1357,10 @@ fn ptb_parse_failure_fails_closed_with_parse_error_verdict() {
     // reject them, exactly the canary a malformed PTB builder would hit.
     let malformed: Vec<u8> = vec![0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff];
     let verdict = classify_generated_reply(&forwarding, 11, &malformed, 1);
-    assert!(verdict.drop, "unparseable generated bytes must fail CLOSED (drop)");
+    assert!(
+        verdict.drop,
+        "unparseable generated bytes must fail CLOSED (drop)"
+    );
     assert!(
         verdict.parse_error,
         "the drop must be attributed as a parse error so the PTB path bumps generated_reply_classify_parse_errors"

@@ -20,8 +20,8 @@ pub(in crate::afxdp) use generated::generated_reply_session_key;
 // paths. The previous in-place definitions in this file were
 // moved verbatim into headers.rs.
 pub(in crate::afxdp) use headers::{
-    eth_header_len, write_eth_header, write_eth_header_slice, write_eth_header_tagged,
-    write_ipv4_header, write_ipv6_header, write_udp_header, TxVlanTag, TPID_8021AD, TPID_8021Q,
+    TPID_8021AD, TPID_8021Q, TxVlanTag, eth_header_len, write_eth_header, write_eth_header_slice,
+    write_eth_header_tagged, write_ipv4_header, write_ipv6_header, write_udp_header,
 };
 
 use byte_writes::{
@@ -35,8 +35,8 @@ use byte_writes::{
 // pulled in via a non-pub `use` to avoid a glob re-export at a
 // wider visibility than its own.
 use checksum::{
-    adjust_l4_checksum_ipv6_addr_bytes, adjust_zero_checksum_illegal, checksum_family_of,
-    l4_udp_checksum_optional, ChecksumFamily,
+    ChecksumFamily, adjust_l4_checksum_ipv6_addr_bytes, adjust_zero_checksum_illegal,
+    checksum_family_of, l4_udp_checksum_optional,
 };
 pub(in crate::afxdp) use checksum::{
     adjust_ipv4_header_checksum, adjust_l4_checksum_ipv4, adjust_l4_checksum_ipv4_dst,
@@ -52,19 +52,20 @@ pub(in crate::afxdp) use checksum::{
 // reached for from afxdp.rs / tx/transmit.rs / tx/dispatch.rs /
 // cos/queue_service.rs, so they go out at `pub(in crate::afxdp)`. The
 // rest stay at `pub(super)` (afxdp-only callers in sibling files).
-pub(in crate::afxdp) use inspect::{
-    authoritative_forward_ports, decode_frame_summary, dest_is_multicast_or_broadcast,
-    forward_tuple_mismatch_reason, ipv4_is_non_first_fragment, ipv6_is_non_first_fragment,
-    is_non_first_fragment, l2_dst_is_group_or_broadcast, parse_session_flow, try_parse_metadata,
-};
 pub(super) use inspect::{
     MAX_IPV6_EXT_HEADERS, frame_is_non_first_fragment, frame_l3_offset, frame_l4_offset,
     live_frame_ports, live_frame_ports_bytes, live_frame_ports_from_meta_bytes,
-    metadata_tuple_complete, packet_rel_l4_offset,
-    packet_rel_l4_offset_and_protocol, parse_flow_ports, parse_ipv4_session_flow_from_frame,
-    parse_packet_destination_from_frame, parse_session_flow_from_bytes,
-    parse_session_flow_from_frame, parse_session_flow_from_meta,
+    metadata_tuple_complete, packet_rel_l4_offset, packet_rel_l4_offset_and_protocol,
+    parse_flow_ports, parse_ipv4_session_flow_from_frame, parse_packet_destination_from_frame,
+    parse_session_flow_from_bytes, parse_session_flow_from_frame, parse_session_flow_from_meta,
     parse_zone_encoded_fabric_ingress, parse_zone_encoded_fabric_ingress_from_frame,
+};
+pub(in crate::afxdp) use inspect::{
+    authoritative_forward_ports, decode_frame_summary, dest_is_multicast_or_broadcast,
+    forward_tuple_mismatch_reason, ipv4_is_any_fragment, ipv4_is_non_first_fragment,
+    ipv6_is_any_fragment, ipv6_is_non_first_fragment, is_any_fragment, is_non_first_fragment,
+    l2_dst_is_group_or_broadcast, parse_session_flow, term_match_extra_from_frame,
+    term_match_extra_from_frame_fwd, term_match_extra_from_meta, try_parse_metadata,
 };
 
 // #989: TCP-specific inspection + mutation kernels relocated from
@@ -131,10 +132,6 @@ pub(in crate::afxdp) fn v6_rel_l4_offset(
     }
 }
 
-
-
-
-
 pub(in crate::afxdp) fn apply_dscp_rewrite_to_frame(frame: &mut [u8], dscp: u8) -> Option<()> {
     let dscp = dscp & 0x3f;
     let l3 = frame_l3_offset(frame)?;
@@ -173,13 +170,6 @@ pub(in crate::afxdp) fn apply_dscp_rewrite_to_frame(frame: &mut [u8], dscp: u8) 
         _ => None,
     }
 }
-
-
-
-
-
-
-
 
 pub(super) fn build_injected_packet(
     req: &InjectPacketRequest,
@@ -294,17 +284,13 @@ pub(super) fn build_forwarded_frame_from_frame(
             .map(|e| tunnel_mode_kind(&e.mode));
         return match kind {
             Some(TunnelKind::WireGuard) => wg::wg_encap_frame(&out, meta, decision, forwarding),
-            Some(TunnelKind::Gre) => {
-                encapsulate_native_gre_frame(&out, meta, decision, forwarding)
-            }
+            Some(TunnelKind::Gre) => encapsulate_native_gre_frame(&out, meta, decision, forwarding),
             // Unknown mode or missing endpoint row: fail closed.
             Some(TunnelKind::Unknown) | None => None,
         };
     }
     Some(out)
 }
-
-
 
 #[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn build_forwarded_frame(
@@ -318,7 +304,6 @@ pub(super) fn build_forwarded_frame(
     let frame = area.slice(desc.addr as usize, desc.len as usize)?;
     build_forwarded_frame_from_frame(frame, meta, decision, forwarding, false, expected_ports)
 }
-
 
 #[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn build_forwarded_frame_into(
@@ -438,8 +423,7 @@ fn rewrite_prepare_eth_from_parts(
     };
     let eth_len = if params.vlan_id > 0 { 18usize } else { 14usize };
     let frame_len = eth_len.checked_add(payload_len)?;
-    let (tx_offset, l2_rewrite) =
-        classify_in_place_l2_rewrite(desc.addr, l3, eth_len, frame_len)?;
+    let (tx_offset, l2_rewrite) = classify_in_place_l2_rewrite(desc.addr, l3, eth_len, frame_len)?;
 
     if matches!(
         l2_rewrite,
@@ -776,7 +760,6 @@ fn trim_l3_payload<'a>(raw_payload: &'a [u8], meta: impl Into<ForwardPacketMeta>
         _ => raw_payload,
     }
 }
-
 
 /// `non_first_fragment` (#1852): when true, the L4-offset bytes are
 /// PAYLOAD (a non-first fragment has no L4 header). The IP-address

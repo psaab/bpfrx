@@ -25,9 +25,10 @@ pub(crate) fn evaluate_filter(
     src_port: u16,
     dst_port: u16,
     dscp: u8,
+    extra: TermMatchExtra,
 ) -> FilterResult {
     evaluate_filter_counted(
-        state, filter_key, src_ip, dst_ip, protocol, src_port, dst_port, dscp, 0,
+        state, filter_key, src_ip, dst_ip, protocol, src_port, dst_port, dscp, extra, 0,
     )
 }
 
@@ -40,6 +41,7 @@ pub(crate) fn evaluate_filter_counted(
     src_port: u16,
     dst_port: u16,
     dscp: u8,
+    extra: TermMatchExtra,
     packet_bytes: u64,
 ) -> FilterResult {
     let Some(filter) = state.filters.get(filter_key) else {
@@ -53,6 +55,7 @@ pub(crate) fn evaluate_filter_counted(
         src_port,
         dst_port,
         dscp,
+        extra,
         packet_bytes,
     )
 }
@@ -66,6 +69,7 @@ pub(super) fn evaluate_filter_ref_counted(
     src_port: u16,
     dst_port: u16,
     dscp: u8,
+    extra: TermMatchExtra,
     packet_bytes: u64,
 ) -> FilterResult {
     match (src_ip, dst_ip) {
@@ -77,6 +81,7 @@ pub(super) fn evaluate_filter_ref_counted(
             src_port,
             dst_port,
             dscp,
+            extra,
             packet_bytes,
         ),
         (IpAddr::V6(src), IpAddr::V6(dst)) => evaluate_filter_ref_counted_v6(
@@ -87,6 +92,7 @@ pub(super) fn evaluate_filter_ref_counted(
             src_port,
             dst_port,
             dscp,
+            extra,
             packet_bytes,
         ),
         _ => FilterResult::default(),
@@ -102,10 +108,13 @@ fn evaluate_filter_ref_counted_v4(
     src_port: u16,
     dst_port: u16,
     dscp: u8,
+    extra: TermMatchExtra,
     packet_bytes: u64,
 ) -> FilterResult {
     for term in &filter.terms {
-        if !term_matches_v4(term, src_ip, dst_ip, protocol, src_port, dst_port, dscp) {
+        if !term_matches_v4(
+            term, src_ip, dst_ip, protocol, src_port, dst_port, dscp, extra,
+        ) {
             continue;
         }
         if term.has_count {
@@ -133,10 +142,13 @@ fn evaluate_filter_ref_counted_v6(
     src_port: u16,
     dst_port: u16,
     dscp: u8,
+    extra: TermMatchExtra,
     packet_bytes: u64,
 ) -> FilterResult {
     for term in &filter.terms {
-        if !term_matches_v6(term, src_ip, dst_ip, protocol, src_port, dst_port, dscp) {
+        if !term_matches_v6(
+            term, src_ip, dst_ip, protocol, src_port, dst_port, dscp, extra,
+        ) {
             continue;
         }
         if term.has_count {
@@ -164,6 +176,7 @@ fn evaluate_filter_ref_non_routing_counted(
     src_port: u16,
     dst_port: u16,
     dscp: u8,
+    extra: TermMatchExtra,
     packet_bytes: u64,
 ) -> FilterResult {
     match (src_ip, dst_ip) {
@@ -175,6 +188,7 @@ fn evaluate_filter_ref_non_routing_counted(
             src_port,
             dst_port,
             dscp,
+            extra,
             packet_bytes,
         ),
         (IpAddr::V6(src), IpAddr::V6(dst)) => evaluate_filter_ref_non_routing_counted_v6(
@@ -185,6 +199,7 @@ fn evaluate_filter_ref_non_routing_counted(
             src_port,
             dst_port,
             dscp,
+            extra,
             packet_bytes,
         ),
         _ => FilterResult::default(),
@@ -200,10 +215,13 @@ fn evaluate_filter_ref_non_routing_counted_v4(
     src_port: u16,
     dst_port: u16,
     dscp: u8,
+    extra: TermMatchExtra,
     packet_bytes: u64,
 ) -> FilterResult {
     for term in &filter.terms {
-        if !term_matches_v4(term, src_ip, dst_ip, protocol, src_port, dst_port, dscp) {
+        if !term_matches_v4(
+            term, src_ip, dst_ip, protocol, src_port, dst_port, dscp, extra,
+        ) {
             continue;
         }
         if !term.routing_instance.is_empty() {
@@ -234,10 +252,13 @@ fn evaluate_filter_ref_non_routing_counted_v6(
     src_port: u16,
     dst_port: u16,
     dscp: u8,
+    extra: TermMatchExtra,
     packet_bytes: u64,
 ) -> FilterResult {
     for term in &filter.terms {
-        if !term_matches_v6(term, src_ip, dst_ip, protocol, src_port, dst_port, dscp) {
+        if !term_matches_v6(
+            term, src_ip, dst_ip, protocol, src_port, dst_port, dscp, extra,
+        ) {
             continue;
         }
         if !term.routing_instance.is_empty() {
@@ -277,10 +298,13 @@ fn evaluate_filter_ref_routing_instance_counted_v4<'a>(
     src_port: u16,
     dst_port: u16,
     dscp: u8,
+    extra: TermMatchExtra,
     packet_bytes: u64,
 ) -> Option<FilterRoutingInstanceResult<'a>> {
     for term in &filter.terms {
-        if !term_matches_v4(term, src_ip, dst_ip, protocol, src_port, dst_port, dscp) {
+        if !term_matches_v4(
+            term, src_ip, dst_ip, protocol, src_port, dst_port, dscp, extra,
+        ) {
             continue;
         }
         if term.has_count {
@@ -308,10 +332,13 @@ fn evaluate_filter_ref_routing_instance_counted_v6<'a>(
     src_port: u16,
     dst_port: u16,
     dscp: u8,
+    extra: TermMatchExtra,
     packet_bytes: u64,
 ) -> Option<FilterRoutingInstanceResult<'a>> {
     for term in &filter.terms {
-        if !term_matches_v6(term, src_ip, dst_ip, protocol, src_port, dst_port, dscp) {
+        if !term_matches_v6(
+            term, src_ip, dst_ip, protocol, src_port, dst_port, dscp, extra,
+        ) {
             continue;
         }
         if term.has_count {
@@ -341,9 +368,10 @@ pub(crate) fn evaluate_lo0_filter(
     src_port: u16,
     dst_port: u16,
     dscp: u8,
+    extra: TermMatchExtra,
 ) -> FilterResult {
     evaluate_lo0_filter_counted(
-        state, is_v6, src_ip, dst_ip, protocol, src_port, dst_port, dscp, 0,
+        state, is_v6, src_ip, dst_ip, protocol, src_port, dst_port, dscp, extra, 0,
     )
 }
 
@@ -356,6 +384,7 @@ pub(crate) fn evaluate_lo0_filter_counted(
     src_port: u16,
     dst_port: u16,
     dscp: u8,
+    extra: TermMatchExtra,
     packet_bytes: u64,
 ) -> FilterResult {
     let filter = if is_v6 {
@@ -374,6 +403,7 @@ pub(crate) fn evaluate_lo0_filter_counted(
         src_port,
         dst_port,
         dscp,
+        extra,
         packet_bytes,
     )
 }
@@ -387,6 +417,7 @@ pub(crate) fn evaluate_lo0_filter_log_match(
     src_port: u16,
     dst_port: u16,
     dscp: u8,
+    extra: TermMatchExtra,
 ) -> Option<FilterLogMatch> {
     let filter = if is_v6 {
         state.lo0_filter_v6_fast.as_deref()
@@ -394,7 +425,7 @@ pub(crate) fn evaluate_lo0_filter_log_match(
         state.lo0_filter_v4_fast.as_deref()
     }?;
     evaluate_filter_ref_log_match(
-        filter, src_ip, dst_ip, protocol, src_port, dst_port, dscp, false,
+        filter, src_ip, dst_ip, protocol, src_port, dst_port, dscp, extra, false,
     )
 }
 
@@ -409,9 +440,10 @@ pub(crate) fn evaluate_interface_filter(
     src_port: u16,
     dst_port: u16,
     dscp: u8,
+    extra: TermMatchExtra,
 ) -> FilterResult {
     evaluate_interface_filter_counted(
-        state, ifindex, is_v6, src_ip, dst_ip, protocol, src_port, dst_port, dscp, 0,
+        state, ifindex, is_v6, src_ip, dst_ip, protocol, src_port, dst_port, dscp, extra, 0,
     )
 }
 
@@ -425,6 +457,7 @@ pub(crate) fn evaluate_interface_filter_counted(
     src_port: u16,
     dst_port: u16,
     dscp: u8,
+    extra: TermMatchExtra,
     packet_bytes: u64,
 ) -> FilterResult {
     let filter = if is_v6 {
@@ -443,6 +476,7 @@ pub(crate) fn evaluate_interface_filter_counted(
         src_port,
         dst_port,
         dscp,
+        extra,
         packet_bytes,
     )
 }
@@ -457,6 +491,7 @@ pub(crate) fn evaluate_interface_filter_non_routing_counted(
     src_port: u16,
     dst_port: u16,
     dscp: u8,
+    extra: TermMatchExtra,
     packet_bytes: u64,
 ) -> FilterResult {
     let filter = if is_v6 {
@@ -475,6 +510,7 @@ pub(crate) fn evaluate_interface_filter_non_routing_counted(
         src_port,
         dst_port,
         dscp,
+        extra,
         packet_bytes,
     )
 }
@@ -489,6 +525,7 @@ pub(crate) fn evaluate_interface_filter_log_match(
     src_port: u16,
     dst_port: u16,
     dscp: u8,
+    extra: TermMatchExtra,
     skip_routing_instance: bool,
 ) -> Option<FilterLogMatch> {
     let filter = if is_v6 {
@@ -504,6 +541,7 @@ pub(crate) fn evaluate_interface_filter_log_match(
         src_port,
         dst_port,
         dscp,
+        extra,
         skip_routing_instance,
     )
 }
@@ -518,6 +556,7 @@ pub(crate) fn evaluate_interface_filter_routing_instance_counted<'a>(
     src_port: u16,
     dst_port: u16,
     dscp: u8,
+    extra: TermMatchExtra,
     packet_bytes: u64,
 ) -> Option<&'a str> {
     evaluate_interface_filter_routing_instance_event_counted(
@@ -530,6 +569,7 @@ pub(crate) fn evaluate_interface_filter_routing_instance_counted<'a>(
         src_port,
         dst_port,
         dscp,
+        extra,
         packet_bytes,
     )
     .map(|result| result.routing_instance)
@@ -545,6 +585,7 @@ pub(crate) fn evaluate_interface_filter_routing_instance_event_counted<'a>(
     src_port: u16,
     dst_port: u16,
     dscp: u8,
+    extra: TermMatchExtra,
     packet_bytes: u64,
 ) -> Option<FilterRoutingInstanceResult<'a>> {
     let filter = if is_v6 {
@@ -564,6 +605,7 @@ pub(crate) fn evaluate_interface_filter_routing_instance_event_counted<'a>(
             src_port,
             dst_port,
             dscp,
+            extra,
             packet_bytes,
         ),
         (IpAddr::V6(src), IpAddr::V6(dst)) => evaluate_filter_ref_routing_instance_counted_v6(
@@ -574,6 +616,7 @@ pub(crate) fn evaluate_interface_filter_routing_instance_event_counted<'a>(
             src_port,
             dst_port,
             dscp,
+            extra,
             packet_bytes,
         ),
         _ => None,
@@ -588,15 +631,17 @@ fn evaluate_filter_ref_log_match(
     src_port: u16,
     dst_port: u16,
     dscp: u8,
+    extra: TermMatchExtra,
     skip_routing_instance: bool,
 ) -> Option<FilterLogMatch> {
     if !filter.has_log_terms {
         return None;
     }
-    let first_matching_term = filter
-        .terms
-        .iter()
-        .find(|term| term_matches(term, src_ip, dst_ip, protocol, src_port, dst_port, dscp))?;
+    let first_matching_term = filter.terms.iter().find(|term| {
+        term_matches(
+            term, src_ip, dst_ip, protocol, src_port, dst_port, dscp, extra,
+        )
+    })?;
     if skip_routing_instance && !first_matching_term.routing_instance.is_empty() {
         return None;
     }
@@ -614,9 +659,10 @@ pub(crate) fn evaluate_interface_output_filter(
     src_port: u16,
     dst_port: u16,
     dscp: u8,
+    extra: TermMatchExtra,
 ) -> FilterResult {
     evaluate_interface_output_filter_counted(
-        state, ifindex, is_v6, src_ip, dst_ip, protocol, src_port, dst_port, dscp, 0,
+        state, ifindex, is_v6, src_ip, dst_ip, protocol, src_port, dst_port, dscp, extra, 0,
     )
 }
 
@@ -630,6 +676,7 @@ pub(crate) fn evaluate_interface_output_filter_counted(
     src_port: u16,
     dst_port: u16,
     dscp: u8,
+    extra: TermMatchExtra,
     packet_bytes: u64,
 ) -> FilterResult {
     let filter = if is_v6 {
@@ -654,6 +701,7 @@ pub(crate) fn evaluate_interface_output_filter_counted(
         src_port,
         dst_port,
         dscp,
+        extra,
         packet_bytes,
     )
 }

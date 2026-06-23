@@ -490,13 +490,17 @@
     "dscp_rewrite": null,
     "dscp_values": [],
     "forwarding_class": "",
+    "icmp_code": null,
+    "icmp_type": null,
+    "is_fragment": false,
     "log": false,
     "name": "",
     "policer": "",
     "protocols": [],
     "routing_instance": "",
     "source_addresses": [],
-    "source_ports": []
+    "source_ports": [],
+    "tcp_flags": null
   },
   "flow_export_snapshot": {
     "active_timeout": 0,

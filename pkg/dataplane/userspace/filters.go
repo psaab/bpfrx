@@ -107,9 +107,62 @@ func buildFilterTermSnapshots(filter *config.FirewallFilter, cfg *config.Config)
 				snap.DSCPRewrite = &rewrite
 			}
 		}
+		// Per-packet L4 match conditions (#2362). Previously parsed but
+		// dropped on the wire — wire them through so the dataplane matches
+		// exactly what the operator authored.
+		if mask, ok := tcpFlagsMask(term.TCPFlags); ok {
+			m := mask
+			snap.TCPFlags = &m
+		}
+		snap.IsFragment = term.IsFragment
+		// The typed config uses -1 for "not set"; only serialize a valid
+		// in-range byte. Junos icmp-type/icmp-code are 0..255.
+		if term.ICMPType >= 0 && term.ICMPType <= 255 {
+			t := uint8(term.ICMPType)
+			snap.ICMPType = &t
+		}
+		if term.ICMPCode >= 0 && term.ICMPCode <= 255 {
+			c := uint8(term.ICMPCode)
+			snap.ICMPCode = &c
+		}
 		terms = append(terms, snap)
 	}
 	return terms
+}
+
+// tcpFlagsBits maps Junos TCP-flag names to their bit value in the TCP flags
+// byte. Junos also accepts aliases (e.g. `syn`, `ack`); only the literal flag
+// names the firewall-filter compiler emits as a flat list are supported here —
+// the parser does not produce the richer `(syn & !ack)` expression grammar, so
+// no negation/disjunction is representable (a parser limitation, tracked
+// separately). Bit order matches userspace-dp/src/tcp_flags.rs.
+var tcpFlagsBits = map[string]uint8{
+	"fin": 0x01,
+	"syn": 0x02,
+	"rst": 0x04,
+	"psh": 0x08,
+	"ack": 0x10,
+	"urg": 0x20,
+}
+
+// tcpFlagsMask folds a parsed flag-name list into a required-bits mask. A TCP
+// packet matches the term when (flags & mask) == mask (all listed flags set).
+// Returns ok=false when the list is empty or contains no recognized flag name,
+// so the wire field stays nil (no tcp-flags constraint) rather than a 0 mask
+// that would match every packet.
+func tcpFlagsMask(flags []string) (uint8, bool) {
+	var mask uint8
+	matched := false
+	for _, f := range flags {
+		if bit, ok := tcpFlagsBits[strings.ToLower(strings.TrimSpace(f))]; ok {
+			mask |= bit
+			matched = true
+		}
+	}
+	if !matched {
+		return 0, false
+	}
+	return mask, true
 }
 
 func buildPolicerSnapshots(cfg *config.Config) []PolicerSnapshot {

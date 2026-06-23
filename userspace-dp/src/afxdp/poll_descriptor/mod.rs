@@ -426,6 +426,7 @@ pub(super) fn poll_binding_process_descriptor(
                         if let Some(input_filter_eval) =
                             evaluate_dscp_sensitive_input_filter_on_session_hit(
                                 worker_ctx.forwarding,
+                                packet_frame,
                                 Some(flow),
                                 meta,
                                 Some(resolved.metadata.ingress_zone),
@@ -449,6 +450,10 @@ pub(super) fn poll_binding_process_descriptor(
                             == ForwardingDisposition::LocalDelivery
                             && apply_lo0_filter_action(
                                 worker_ctx.forwarding,
+                                crate::afxdp::frame::term_match_extra_from_frame(
+                                    packet_frame,
+                                    meta,
+                                ),
                                 worker_ctx.event_stream,
                                 Some(flow),
                                 meta,
@@ -712,9 +717,7 @@ pub(super) fn poll_binding_process_descriptor(
                         // fail-OPEN that could leak it upstream on a default
                         // IPv6 route. Now MatchUnavailable fails CLOSED (drop +
                         // counter); only NoPrefixMatch continues IPv6 routing.
-                        let nat64_match = if pre_routing_dnat.is_none()
-                            && nptv6_inbound.is_none()
-                        {
+                        let nat64_match = if pre_routing_dnat.is_none() && nptv6_inbound.is_none() {
                             if let IpAddr::V6(dst_v6) = resolution_target {
                                 match worker_ctx.forwarding.nat64.classify_ipv6_dest(dst_v6) {
                                     crate::nat64::Nat64Match::NoPrefixMatch => None,
@@ -794,6 +797,7 @@ pub(super) fn poll_binding_process_descriptor(
                             .unwrap_or(flow.forward_key.dst_port);
                         let input_filter_eval = evaluate_non_pbr_input_filter(
                             worker_ctx.forwarding,
+                            crate::afxdp::frame::term_match_extra_from_frame(packet_frame, meta),
                             Some(flow),
                             meta,
                             ingress_zone_override,
@@ -813,6 +817,7 @@ pub(super) fn poll_binding_process_descriptor(
                         }
                         let route_table_override = ingress_route_table_override(
                             worker_ctx.forwarding,
+                            packet_frame,
                             meta,
                             flow,
                             ingress_zone_override,
@@ -924,7 +929,11 @@ pub(super) fn poll_binding_process_descriptor(
                         // (#2146 Err), fall back to a meta+flow info so the
                         // scan/sweep tuple and any drop event still carry
                         // the offending 5-tuple.
-                        let l3_off = if meta.ingress_vlan_present != 0 { 18 } else { 14 };
+                        let l3_off = if meta.ingress_vlan_present != 0 {
+                            18
+                        } else {
+                            14
+                        };
                         let screen_pkt = extract_screen_info(
                             packet_frame,
                             meta.addr_family,
@@ -1098,6 +1107,10 @@ pub(super) fn poll_binding_process_descriptor(
                         if resolution.disposition == ForwardingDisposition::LocalDelivery
                             && apply_lo0_filter_action(
                                 worker_ctx.forwarding,
+                                crate::afxdp::frame::term_match_extra_from_frame(
+                                    packet_frame,
+                                    meta,
+                                ),
                                 worker_ctx.event_stream,
                                 Some(flow),
                                 meta,
@@ -1247,6 +1260,13 @@ pub(super) fn poll_binding_process_descriptor(
                                             icmp_decision.resolution.egress_ifindex,
                                             meta,
                                             Some(&flow.forward_key),
+                                            // #2362 fold B: generated ICMP error
+                                            // reply — meta-only extra (tcp_flags
+                                            // authoritative; no per-packet frame
+                                            // re-read for this synthesized frame).
+                                            crate::afxdp::frame::term_match_extra_from_meta(
+                                                meta.into(),
+                                            ),
                                             now_ns,
                                         );
                                         if !cos.drop {
@@ -1275,6 +1295,11 @@ pub(super) fn poll_binding_process_descriptor(
                                                     cos_queue_id: cos.queue_id,
                                                     dscp_rewrite: cos.dscp_rewrite,
                                                     cos_tx_selection_resolved: true,
+                                                    // #2362 fold B: resolved
+                                                    // above; deferred recompute
+                                                    // not taken.
+                                                    filter_match_extra:
+                                                        crate::filter::TermMatchExtra::default(),
                                                 },
                                             );
                                             recycle_now = false;
@@ -2407,6 +2432,14 @@ pub(super) fn poll_binding_process_descriptor(
                         None,
                         None,
                     ) {
+                        // #2362: capture the per-packet L4 match inputs from the
+                        // frame BEFORE `owned_packet_frame.take()` below moves the
+                        // backing buffer out — the flow-cache log-only evaluation
+                        // further down would otherwise borrow `packet_frame`
+                        // after the take. TermMatchExtra is a small Copy value
+                        // holding no borrow.
+                        let filter_match_extra =
+                            crate::afxdp::frame::term_match_extra_from_frame(packet_frame, meta);
                         request.frame = owned_packet_frame
                             .take()
                             .map(PendingForwardFrame::Owned)
@@ -2486,6 +2519,7 @@ pub(super) fn poll_binding_process_descriptor(
                                 request_target_binding_index,
                                 evaluate_non_pbr_input_filter_log_only(
                                     worker_ctx.forwarding,
+                                    filter_match_extra,
                                     Some(flow),
                                     meta,
                                     ingress_zone_override,
@@ -2658,8 +2692,7 @@ pub(super) fn poll_binding_process_descriptor(
                                 //     path for NAT64.
                                 // Both halves fall back to the original dst/port
                                 // when no inbound destination translation applies.
-                                let policy_dst_ip =
-                                    decision.nat.rewrite_dst.unwrap_or(flow.dst_ip);
+                                let policy_dst_ip = decision.nat.rewrite_dst.unwrap_or(flow.dst_ip);
                                 let policy_dst_port = decision
                                     .nat
                                     .rewrite_dst_port

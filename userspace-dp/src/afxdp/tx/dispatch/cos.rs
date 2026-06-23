@@ -138,11 +138,15 @@ pub(super) fn resolve_pending_forward_cos_tx_selection(
     request: &PendingForwardRequest,
     now_ns: u64,
 ) -> CoSTxSelection {
+    // #2362 fold B: the deferred forward request runs after the UMEM frame may
+    // have been recycled, so it consumes the per-packet match inputs snapshotted
+    // at build time from the live frame rather than re-reading the frame.
     resolve_cos_tx_selection_at(
         forwarding,
         request.decision.resolution.egress_ifindex,
         request.meta,
         request.flow_key.as_ref(),
+        request.filter_match_extra,
         now_ns,
     )
 }

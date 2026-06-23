@@ -310,6 +310,201 @@ pub(in crate::afxdp) fn is_non_first_fragment(packet: &[u8], addr_family: u8) ->
     }
 }
 
+/// #2362: is this L3-relative IPv4 packet ANY fragment? Junos `is-fragment`
+/// matches a datagram that is part of a fragmented packet — the FIRST fragment
+/// (MF=1, offset=0), a MIDDLE/LAST fragment (offset != 0), but NOT an
+/// unfragmented datagram (MF=0, offset=0). The MF bit is 0x2000 and the
+/// fragment-offset field is the low 13 bits, so the combined test on the
+/// `frag_off` field (IPv4 header bytes 6-7) is `(value & 0x3FFF) != 0`. The DF
+/// bit (0x4000) and the reserved bit (0x8000) are intentionally excluded. A
+/// too-short slice returns `false`.
+#[inline]
+pub(in crate::afxdp) fn ipv4_is_any_fragment(packet: &[u8]) -> bool {
+    packet.len() >= 8 && (u16::from_be_bytes([packet[6], packet[7]]) & 0x3FFF) != 0
+}
+
+/// #2362: is this L3-relative IPv6 packet ANY fragment? IPv6 carries
+/// fragmentation in a Fragment extension header (next-header 44). Junos
+/// `is-fragment` matches any datagram that carries a fragment header, including
+/// the first fragment (offset 0, M=1). Walks the extension-header chain
+/// (bounded by `MAX_IPV6_EXT_HEADERS`) and returns `true` as soon as a fragment
+/// header is found. Packets with no fragment header return `false`.
+#[inline]
+pub(in crate::afxdp) fn ipv6_is_any_fragment(packet: &[u8]) -> bool {
+    if packet.len() < 40 {
+        return false;
+    }
+    let mut protocol = packet[6];
+    let mut offset = 40usize;
+    for _ in 0..MAX_IPV6_EXT_HEADERS {
+        match protocol {
+            0 | 43 | 60 => {
+                let Some(opt) = packet.get(offset..offset + 2) else {
+                    return false;
+                };
+                protocol = opt[0];
+                let Some(next) = offset.checked_add((usize::from(opt[1]) + 1) * 8) else {
+                    return false;
+                };
+                offset = next;
+                if packet.len() < offset {
+                    return false;
+                }
+            }
+            51 => {
+                let Some(opt) = packet.get(offset..offset + 2) else {
+                    return false;
+                };
+                protocol = opt[0];
+                let Some(next) = offset.checked_add((usize::from(opt[1]) + 2) * 4) else {
+                    return false;
+                };
+                offset = next;
+                if packet.len() < offset {
+                    return false;
+                }
+            }
+            44 => return true,
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// #2362: family-dispatched ANY-fragment predicate over the L3-relative packet
+/// slice. Used by the firewall-filter `is-fragment` match condition.
+#[inline]
+pub(in crate::afxdp) fn is_any_fragment(packet: &[u8], addr_family: u8) -> bool {
+    match addr_family as i32 {
+        libc::AF_INET => ipv4_is_any_fragment(packet),
+        libc::AF_INET6 => ipv6_is_any_fragment(packet),
+        _ => false,
+    }
+}
+
+/// #2362: build the per-packet L4 match inputs (tcp-flags / is-fragment /
+/// icmp-type / icmp-code) consumed by the firewall-filter term predicate, from
+/// the live frame + metadata. The fragment bit is read from the L3-relative
+/// packet slice (`meta.l3_offset`); `tcp_flags` comes from `meta`, and the
+/// ICMP/ICMPv6 type/code bytes from `meta.l4_offset`. Only the cold
+/// filter-evaluation path calls this, and only when an interface carries a
+/// per-packet-L4 (or DSCP) match filter, so the parse cost stays off the hot
+/// path. A non-ICMP protocol yields (0, 0) for type/code — the matcher already
+/// guards those against the protocol, so the values are never consulted.
+///
+/// #2362 fold A (the #2344 non-first-fragment class): a NON-FIRST fragment
+/// carries NO L4 header at `l4_offset` — those bytes are payload, and
+/// `meta.protocol` / `meta.tcp_flags` are derived from the IP header / shim
+/// stamping, not a real L4 header. Reading them would let a crafted fragment
+/// whose payload byte equals a filter's `icmp-type` (or whose payload-derived
+/// `tcp_flags` carries the masked bits) spuriously match. So when the packet is
+/// a non-first fragment, force `tcp_flags = icmp_type = icmp_code = 0` — those
+/// L4 terms must NOT match (matching the `per_packet_l4_matches` doc contract).
+/// `is_fragment` is KEPT true (a non-first fragment IS a fragment; the
+/// `is-fragment` term reads only the L3 header, which is present on every
+/// fragment). Reuses the existing `is_non_first_fragment` predicate (#2344).
+#[inline]
+pub(in crate::afxdp) fn term_match_extra_from_frame(
+    frame: &[u8],
+    meta: UserspaceDpMeta,
+) -> crate::filter::TermMatchExtra {
+    use crate::ip_proto::{PROTO_ICMP, PROTO_ICMPV6};
+    let l3_packet = frame.get(meta.l3_offset as usize..);
+    let is_fragment = l3_packet.is_some_and(|packet| is_any_fragment(packet, meta.addr_family));
+    // A non-first fragment has no L4 header at `l4_offset` (its bytes are
+    // payload) — suppress every L4-derived match input so those terms fail
+    // closed. The is-fragment bit above stays as-is (L3-only).
+    let non_first_fragment =
+        l3_packet.is_some_and(|packet| is_non_first_fragment(packet, meta.addr_family));
+    let (tcp_flags, icmp_type, icmp_code) = if non_first_fragment {
+        (0, 0, 0)
+    } else if matches!(meta.protocol, PROTO_ICMP | PROTO_ICMPV6) {
+        let l4 = meta.l4_offset as usize;
+        (
+            meta.tcp_flags,
+            frame.get(l4).copied().unwrap_or(0),
+            frame.get(l4.wrapping_add(1)).copied().unwrap_or(0),
+        )
+    } else {
+        (meta.tcp_flags, 0, 0)
+    };
+    crate::filter::TermMatchExtra {
+        tcp_flags,
+        is_fragment,
+        icmp_type,
+        icmp_code,
+        // The L4 header is absent only on a non-first fragment. The matcher
+        // gates tcp-flags / icmp-type / icmp-code on this (a zeroed icmp byte
+        // is otherwise a valid icmp-type 0 / icmp-code 0 match).
+        l4_present: !non_first_fragment,
+    }
+}
+
+/// #2362 fold B: the `ForwardPacketMeta` flavor of `term_match_extra_from_frame`,
+/// for the TX-selection / CoS classification path (`tx/cos_classify.rs`), which
+/// carries a `ForwardPacketMeta` rather than the full `UserspaceDpMeta`. Same
+/// fragment-safe contract: a non-first fragment forces the L4-derived fields to
+/// 0 (its bytes are payload) while keeping the L3-only `is_fragment` bit. The
+/// CoS path already routes a non-first fragment to the default queue with no
+/// flow_key (#2357), so in practice this builder is invoked on first/atomic
+/// packets — the gate is defense-in-depth and keeps the two builders identical.
+#[inline]
+pub(in crate::afxdp) fn term_match_extra_from_frame_fwd(
+    frame: &[u8],
+    meta: ForwardPacketMeta,
+) -> crate::filter::TermMatchExtra {
+    use crate::ip_proto::{PROTO_ICMP, PROTO_ICMPV6};
+    let l3_packet = frame.get(meta.l3_offset as usize..);
+    let is_fragment = l3_packet.is_some_and(|packet| is_any_fragment(packet, meta.addr_family));
+    let non_first_fragment =
+        l3_packet.is_some_and(|packet| is_non_first_fragment(packet, meta.addr_family));
+    let (tcp_flags, icmp_type, icmp_code) = if non_first_fragment {
+        (0, 0, 0)
+    } else if matches!(meta.protocol, PROTO_ICMP | PROTO_ICMPV6) {
+        let l4 = meta.l4_offset as usize;
+        (
+            meta.tcp_flags,
+            frame.get(l4).copied().unwrap_or(0),
+            frame.get(l4.wrapping_add(1)).copied().unwrap_or(0),
+        )
+    } else {
+        (meta.tcp_flags, 0, 0)
+    };
+    crate::filter::TermMatchExtra {
+        tcp_flags,
+        is_fragment,
+        icmp_type,
+        icmp_code,
+        l4_present: !non_first_fragment,
+    }
+}
+
+/// #2362 fold B: build the per-packet match inputs from metadata ALONE, for the
+/// rare TX-selection callers that have no contiguous ingress frame slice
+/// (locally-generated replies whose tuple is re-derived, ARP/NDP-deferred
+/// forwards, control-plane injects). `tcp_flags` is taken from the
+/// shim-stamped `meta` (authoritative on the forwarding path); `is_fragment`
+/// and `icmp_type`/`icmp_code` cannot be read without the frame, so they are
+/// 0/false — a CoS-action filter term keyed on is-fragment or icmp-type on one
+/// of these non-transit paths under-matches rather than mis-matches. The common
+/// `tcp-flags` CoS term is fully covered.
+#[inline]
+pub(in crate::afxdp) fn term_match_extra_from_meta(
+    meta: ForwardPacketMeta,
+) -> crate::filter::TermMatchExtra {
+    crate::filter::TermMatchExtra {
+        tcp_flags: meta.tcp_flags,
+        is_fragment: false,
+        icmp_type: 0,
+        icmp_code: 0,
+        // TRUE: these synthetic / locally-stamped packets carry a real L4
+        // header and are never IP fragments, so a legit tcp-flags match keeps
+        // working. The 0 icmp bytes are an under-match (frame unavailable), NOT
+        // an absent-L4 signal.
+        l4_present: true,
+    }
+}
+
 /// #2314: RFC 1812 §4.3.2.7 / RFC 4443 §2.4(e) — a router MUST NOT
 /// originate an ICMP/ICMPv6 *error* in reply to a datagram whose IP
 /// destination was a broadcast or multicast address. Reading the
@@ -635,7 +830,10 @@ pub(in crate::afxdp) fn frame_is_non_first_fragment(frame: &[u8], meta: Userspac
     // metadata (e.g. the meta-led ICMP fixtures), spuriously suppressing
     // a legitimate flow. The downstream parsers already re-derive L3,
     // so this only guards the early-exit decision.
-    if frame.get(l3).is_none_or(|byte| (byte >> 4) != expected_version) {
+    if frame
+        .get(l3)
+        .is_none_or(|byte| (byte >> 4) != expected_version)
+    {
         return false;
     }
     match frame.get(l3..) {
@@ -1101,7 +1299,10 @@ pub(in crate::afxdp) fn parse_packet_destination_from_frame(
     }
 }
 
-pub(in crate::afxdp) fn try_parse_metadata(area: &MmapArea, desc: XdpDesc) -> Option<UserspaceDpMeta> {
+pub(in crate::afxdp) fn try_parse_metadata(
+    area: &MmapArea,
+    desc: XdpDesc,
+) -> Option<UserspaceDpMeta> {
     let meta_len = std::mem::size_of::<UserspaceDpMeta>();
     if (desc.addr as usize) < meta_len {
         return None;

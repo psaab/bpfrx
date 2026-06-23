@@ -490,6 +490,25 @@ type FirewallTermSnapshot struct {
 	RoutingInstance string        `json:"routing_instance,omitempty"`
 	ForwardingClass string        `json:"forwarding_class,omitempty"`
 	DSCPRewrite     *uint8        `json:"dscp_rewrite,omitempty"`
+	// Per-packet L4 match conditions (#2362). These are parsed by the Junos
+	// firewall-filter compiler but were previously dropped on the wire, so a
+	// term like `from { tcp-flags syn; }` silently matched broader than
+	// authored. They are NOT part of the 5-tuple SessionKey, so a filter
+	// carrying any of them is cache-sensitive (flow-cache must decline — see
+	// the #1431 invariant in userspace-dp/src/filter/mod.rs).
+	//
+	// TCPFlags is a required-bits mask over the TCP flags byte (FIN=0x01,
+	// SYN=0x02, RST=0x04, PSH=0x08, ACK=0x10, URG=0x20): a TCP packet matches
+	// when (flags & mask) == mask. Nil = no tcp-flags constraint. A non-TCP
+	// packet never matches a term that sets this.
+	TCPFlags *uint8 `json:"tcp_flags,omitempty"`
+	// IsFragment matches any IP fragment (IPv4 MF set OR non-zero offset; IPv6
+	// fragment extension header present). False = no fragment constraint.
+	IsFragment bool `json:"is_fragment,omitempty"`
+	// ICMPType / ICMPCode match the ICMP/ICMPv6 type and code bytes. Nil = no
+	// constraint. A non-ICMP(v6) packet never matches a term that sets these.
+	ICMPType *uint8 `json:"icmp_type,omitempty"`
+	ICMPCode *uint8 `json:"icmp_code,omitempty"`
 }
 
 type PolicerSnapshot struct {
