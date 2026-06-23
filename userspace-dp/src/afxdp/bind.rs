@@ -282,6 +282,13 @@ pub(super) fn prime_fill_ring_offsets(
     device: &mut DeviceQueue,
     offsets: &[u64],
 ) -> Result<Vec<u64>, Box<dyn std::error::Error + Send + Sync>> {
+    // An empty prime request is a no-op (not a total failure — see
+    // `fill_prime_is_total_failure`). Return the empty deferred suffix without
+    // entering the fixed 20-iteration NAPI-trigger loop below, which would
+    // otherwise burn 20 recvmsg/poll/sendto syscalls at bringup for no frames.
+    if offsets.is_empty() {
+        return Ok(Vec::new());
+    }
     // `remaining` is the slice index of the first not-yet-inserted offset.
     // We retry the insert across the NAPI-trigger loop below: each NAPI kick
     // lets the kernel consume fill-ring entries and post RX WQEs, which frees
@@ -649,10 +656,17 @@ mod fill_prime_tests {
             fill_prime_is_total_failure(offsets.len(), 0),
             "inserted == 0 on a non-empty prime must remain a fatal bind failure (fail closed)"
         );
-        // An empty prime request is a no-op, not a failure.
+        // An empty prime request is a no-op, not a failure. The empty-offsets
+        // early return in `prime_fill_ring_offsets` yields exactly this: no
+        // total failure AND an empty deferred suffix (and skips the NAPI loop).
         assert!(
             !fill_prime_is_total_failure(0, 0),
             "an empty fill request must not be treated as a failure"
+        );
+        let empty: Vec<u64> = Vec::new();
+        assert!(
+            defer_uninserted_fill_suffix(&empty, 0).is_empty(),
+            "an empty prime defers nothing"
         );
         // Even when total-failure errors out upstream, the suffix helper for a
         // zero insert would be the whole set (nothing accepted) — proving the

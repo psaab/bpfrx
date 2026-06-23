@@ -26,6 +26,21 @@
   userspace-dp/src/afxdp/worker/mod.rs,
   docs/afxdp-packet-processing.md, _Log.md
 
+## 2026-06-23 — #2374 follow-up: skip NAPI loop on empty fill prime (Copilot)
+
+- **Timestamp**: 2026-06-23 PDT
+- **Action**: Bringup-efficiency fold (no behavior change). Copilot noted
+  `prime_fill_ring_offsets` ran the fixed 20-iteration NAPI-trigger loop
+  (recvmsg/poll/sendto/yield) even when called with an EMPTY offsets slice —
+  20 wasted syscalls at bringup for a no-op. Added an early
+  `if offsets.is_empty() { return Ok(Vec::new()); }` at the top, preserving
+  the "empty prime is a no-op, not a total failure" semantics (consistent
+  with `fill_prime_is_total_failure(0, 0) == false`). Extended
+  `zero_insert_is_total_failure` to assert the empty-prime defers nothing.
+  cargo build --release clean; fill_prime tests green and 5x stable; the
+  inserted==0-on-non-empty total-failure path is unchanged (still fatal).
+- **File(s)**: userspace-dp/src/afxdp/bind.rs, _Log.md
+
 ## 2026-06-23 — #2393 embedded-ICMP-NAT match adds ICMPv4 Redirect/Source-Quench
 
 - **Timestamp**: 2026-06-23 PDT
