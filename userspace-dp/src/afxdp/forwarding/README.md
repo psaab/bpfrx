@@ -50,9 +50,24 @@ forwarding. The recognized set is:
 - IKE / NAT-T — UDP destination port 500 or 4500
 
 ESP and AH carry no transport port, so only the protocol-number arm
-applies to them. The predicate keys solely on `meta.protocol`, which is
-the L4 protocol number taken from the IPv4 protocol field or the IPv6
-next-header chain, so IPv4 and IPv6 are handled identically. AH was
-omitted before #2385, which silently broke host-terminated AH SAs
-(configurable via `set security ipsec proposal ... protocol ah`); the
-AH arm is regression-guarded in `tests.rs`.
+applies to them. The predicate keys solely on `meta.protocol` and is
+therefore family-symmetric in form — but `meta.protocol == PROTO_AH`
+(51) only ever occurs for **IPv4 AH**. The XDP shim's IPv6 parser
+treats AH as an extension header and walks THROUGH it (the
+`NEXTHDR_AUTH` arm in `userspace-xdp/src/lib.rs`), setting
+`meta.protocol` to AH's inner next-header rather than 51. So the AH arm
+is a **v4-only backstop**; it never fires for IPv6 AH. ESP (proto 50)
+is parsed as a terminal protocol on both families, so ESP is recognized
+for v4 and v6 alike.
+
+This is not a functional gap. IPv6 host-terminated AH-to-self still
+reaches the kernel XFRM stack via the shim's `is_local_destination`
+shunt, which fires for any local-destination packet *before* the
+userspace dataplane runs this predicate; transit AH (v4 or v6) takes
+ordinary forwarding. AH was omitted entirely before #2385, which
+silently broke host-terminated **IPv4** AH SAs (configurable via
+`set security ipsec proposal ... protocol ah`); the AH arm is
+regression-guarded in `tests.rs`. Giving this predicate true IPv6 AH
+coverage would require the shim to surface an "AH present" signal
+instead of walking past the header — out of scope here, and
+unnecessary given the local-dest shunt.

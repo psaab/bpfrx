@@ -919,10 +919,24 @@ impl IcmpTeRateLimiter {
 /// AH (Authentication Header, proto 51) is a configurable host-terminated
 /// IPsec protocol (`set security ipsec proposal ... protocol ah`,
 /// pkg/config/schema_security.go). Like ESP it carries no transport port, so
-/// only the protocol-number arm applies. Both ESP and AH cover IPv4 and IPv6
-/// — the recognition is purely on `meta.protocol`, which is the L4 protocol
-/// number extracted from the IPv4 protocol field or the IPv6 next-header
-/// chain, so v4 and v6 are handled identically.
+/// only the protocol-number arm applies.
+///
+/// The predicate is family-symmetric — it keys solely on `meta.protocol` —
+/// but in practice `meta.protocol == PROTO_AH` only ever occurs for **IPv4
+/// AH**. The XDP shim's IPv6 parser treats AH as an extension header and
+/// walks THROUGH it (`NEXTHDR_AUTH` arm in `userspace-xdp/src/lib.rs`),
+/// setting `meta.protocol` to AH's inner next-header rather than 51. So the
+/// `PROTO_AH` arm is a v4-only backstop; it never fires for IPv6 AH.
+///
+/// This is not a functional gap. IPv6 host-terminated AH-to-self still
+/// reaches the kernel XFRM stack via the shim's `is_local_destination`
+/// shunt, which fires for any local-destination packet *before* the
+/// userspace dataplane runs this predicate; transit AH (v4 or v6) takes
+/// ordinary forwarding. ESP (proto 50) is parsed as a terminal protocol on
+/// both families, so ESP is recognized here for v4 and v6 alike. Giving this
+/// predicate true IPv6 AH coverage would require the shim to surface an
+/// "AH present" signal instead of walking past the header — out of scope
+/// here, and unnecessary given the local-dest shunt.
 #[inline]
 pub(super) fn is_ipsec_traffic(protocol: u8, dst_port: u16) -> bool {
     protocol == PROTO_ESP

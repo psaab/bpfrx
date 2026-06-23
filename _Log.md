@@ -11642,3 +11642,16 @@ top.
   userspace-dp/src/afxdp/mod.rs,
   userspace-dp/src/afxdp/forwarding/tests.rs,
   userspace-dp/src/afxdp/forwarding/README.md
+
+- **Timestamp**: 2026-06-23
+- **Action**: #2385 doc-accuracy fold (PR #2430 review). Corrected the
+  is_ipsec_traffic comment + forwarding/README.md overclaim that the AH
+  passthrough arm handles "v4 and v6 identically". The XDP shim's IPv6
+  parser walks THROUGH the AH ext-header (NEXTHDR_AUTH, userspace-xdp/
+  src/lib.rs), so meta.protocol is never 51 for v6 AH — the PROTO_AH arm
+  is a v4-only backstop. Docs now note v6 AH-to-self reaches kernel XFRM
+  via the shim's is_local_destination shunt (before userspace), so there
+  is no functional gap. Comment-only / doc-only; no code change, build
+  still clean.
+- **File(s)**: userspace-dp/src/afxdp/forwarding/mod.rs (doc comment),
+  userspace-dp/src/afxdp/forwarding/README.md
