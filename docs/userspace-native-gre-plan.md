@@ -313,6 +313,41 @@ keep that table from crossing security boundaries:
   place — `tunnel_mode_kind` — and the dispatcher will keep failing
   closed until the new arm is added deliberately.
 
+### 6b. Inner-L4 Minimum-Header Bounds On Decap (#2376)
+
+`parse_inner_protocol_and_offsets` (`afxdp/gre.rs`) builds the synthetic
+inner metadata (`protocol`, `l4_offset`, `payload_offset`) for the
+decapsulated inner. The inner is first trimmed to its IP-declared total
+length (`packet_trimmed_len`), so an inner whose declared length ends
+before its L4 header survives to the parse.
+
+Inner TCP was always length-validated (the IHL + 20-byte TCP-header
+check). UDP, ICMP, and ICMPv6, however, advanced the payload offset by 8
+unconditionally — with NO check that the inner actually contained the
+8-byte L4 minimum header (RFC 768 UDP, RFC 792 ICMP, RFC 4443 ICMPv6).
+A malformed inner (e.g. IPv4 `total_len = ihl + 2`, `protocol = UDP`)
+therefore left decap with internally inconsistent metadata: `protocol`
+claiming UDP/ICMP while `l4_offset`/`payload_offset` were derived from —
+and pointed past — bytes that are not a real L4 header. Decap is a
+trusted chokepoint that reinjects the synthetic frame into the worker
+pipeline (`poll_descriptor`), so every downstream consumer of
+`meta.protocol`/`l4_offset`/`payload_offset` (policy, logging, slow-path,
+generated-reply) then operated on a packet shape that should have failed
+closed.
+
+The fix mirrors the TCP guard for the other three protocols: IPv4 UDP/
+ICMP require `packet.len() >= ihl + 8`, IPv6 UDP/ICMPv6 require
+`packet.len() >= rel_l4 + 8`, and `parse_inner_protocol_and_offsets`
+returns `None` (no decap / drop) otherwise. A well-formed GRE-tunneled
+UDP/ICMP inner still decaps and stamps correct ports (anti-over-reject).
+
+This is **distinct from #2361**: #2361 hardened the live frame parser
+(`parse_session_flow_from_frame`) so it no longer fabricates ports from
+bytes past the IP-declared length, so a *ported SessionFlow* is no longer
+produced from a short inner. #2376 is narrower — the synthetic inner
+*metadata* (`protocol`/`l4_offset`/`payload_offset`) stamped by the GRE
+decap stage itself, which #2361 did not touch.
+
 ## Policy-Based Routing Without A Tunnel Netdevice
 
 This is the most important control-plane question.

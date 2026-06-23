@@ -475,8 +475,23 @@ fn parse_inner_protocol_and_offsets(packet: &[u8], addr_family: u8) -> Option<(u
                     }
                     l4_offset + tcp_len as u16
                 }
-                PROTO_UDP => l4_offset + 8,
-                PROTO_ICMP => l4_offset + 8,
+                // #2376: UDP (RFC 768) and ICMP (RFC 792) both have an
+                // 8-byte minimum header. The inner packet was already
+                // trimmed to its IP-declared total length
+                // (`packet_trimmed_len`), so a short inner (e.g.
+                // total_len = ihl + 2) survives to here. Unlike TCP
+                // above, these arms previously advanced the payload
+                // offset by 8 with NO bounds check, stamping
+                // `l4_offset`/`payload_offset` from bytes that are not a
+                // real L4 header and pointing `payload_offset` past the
+                // packet end. Fail CLOSED (drop / no decap) when the
+                // inner cannot contain the claimed L4 header.
+                PROTO_UDP | PROTO_ICMP => {
+                    if packet.len() < ihl + 8 {
+                        return None;
+                    }
+                    l4_offset + 8
+                }
                 _ => l4_offset,
             };
             Some((protocol, l4_offset, payload_offset))
@@ -514,8 +529,21 @@ fn parse_inner_protocol_and_offsets(packet: &[u8], addr_family: u8) -> Option<(u
                     }
                     rel_l4 + tcp_len as u16
                 }
-                PROTO_UDP => rel_l4 + 8,
-                PROTO_ICMPV6 => rel_l4 + 8,
+                // #2376: mirror the IPv4 UDP/ICMP guard for the IPv6
+                // inner. UDP (RFC 768) and ICMPv6 (RFC 4443) both have
+                // an 8-byte minimum header. `rel_l4` is the offset of
+                // the resolved L4 header within the (already
+                // IP-declared-length-trimmed) inner packet; if the
+                // packet ends before that header is complete, the
+                // previous `rel_l4 + 8` stamped a payload offset past
+                // the packet end from non-L4 bytes. Fail CLOSED.
+                PROTO_UDP | PROTO_ICMPV6 => {
+                    let l4 = rel_l4 as usize;
+                    if packet.len() < l4 + 8 {
+                        return None;
+                    }
+                    rel_l4 + 8
+                }
                 // #2292: an unresolved/extension-header protocol is a drop,
                 // not a forward. 0/43/51/59/60 are IPv6 ext-header or
                 // no-next-header sentinels, never a real inner L4.
