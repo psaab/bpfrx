@@ -56,6 +56,19 @@ sync.
   - **NS scope:** there is NO Neighbor Solicitation learning path in the
     userspace dataplane (NS is never parsed or learned), so #2368 is
     NA-only; there is no sibling NS gap to close here.
+  - **ARP fixed-header validation (`#2369`, RFC 826):** the sender MAC
+    (`l3+8..14`) and sender IP (`l3+14..18`) sit at offsets that are only
+    correct for Ethernet/IPv4 ARP. Before reading them, `classify_arp`
+    now requires htype==1 (Ethernet), ptype==0x0800 (IPv4), hlen==6, and
+    plen==4 (in addition to opcode==2 reply and a fully-present 28-byte
+    body). A crafted opcode-2 ARP declaring a different hardware/protocol
+    type or length would otherwise be read at the fixed Ethernet/IPv4
+    offsets and the attacker-chosen bytes learned as a MAC->IP binding —
+    an on-link neighbor-cache/kernel-table poisoning primitive. Any
+    mismatch → `OtherArp` (recycled, never learned), the ARP sibling of
+    the #2368 NA fail-closed discipline. Only opcode-2 replies are ever
+    learned; ARP requests (opcode 1) classify `OtherArp` and never write
+    the cache.
 - `poll_stages.rs` — sibling of `worker/`, not inside it. Holds the
   per-packet pipeline stages extracted in #946 Phase 1. The screen and
   SYN-cookie stages decide the L3 offset (14 vs 18) on tag PRESENCE

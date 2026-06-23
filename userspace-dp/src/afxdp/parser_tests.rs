@@ -77,6 +77,94 @@ fn classify_arp_rejects_short_frame() {
     assert_eq!(classify_arp(&f), ArpClassification::NotArp);
 }
 
+// #2369 fail-on-revert: a crafted opcode-2 ARP whose fixed header is not
+// Ethernet/IPv4 (htype!=1, ptype!=0x0800, hlen!=6, or plen!=4) must NOT
+// be learned — its sender bytes would otherwise be read at the
+// Ethernet/IPv4 fixed offsets and poison the neighbor cache. Each of
+// these MUST flip to `Reply` (poison) if the corresponding header check
+// is removed from `classify_arp`.
+
+#[test]
+fn classify_arp_rejects_non_ethernet_htype() {
+    let mut f = build_eth_arp_reply(false);
+    // htype is at l3_start (offset 14) for an untagged frame. Flip 1 -> 0xfe.
+    f[14] = 0x00;
+    f[15] = 0xfe;
+    assert_eq!(
+        classify_arp(&f),
+        ArpClassification::OtherArp,
+        "opcode-2 ARP with htype!=1 must not be learned (neighbor-cache poison)"
+    );
+}
+
+#[test]
+fn classify_arp_rejects_non_ipv4_ptype() {
+    let mut f = build_eth_arp_reply(false);
+    // ptype is at l3_start+2 (offset 16). Flip 0x0800 -> 0x86dd (IPv6).
+    f[16] = 0x86;
+    f[17] = 0xdd;
+    assert_eq!(
+        classify_arp(&f),
+        ArpClassification::OtherArp,
+        "opcode-2 ARP with ptype!=0x0800 must not be learned"
+    );
+}
+
+#[test]
+fn classify_arp_rejects_bad_hlen() {
+    let mut f = build_eth_arp_reply(false);
+    // hlen is at l3_start+4 (offset 18). Flip 6 -> 8.
+    f[18] = 8;
+    assert_eq!(
+        classify_arp(&f),
+        ArpClassification::OtherArp,
+        "opcode-2 ARP with hlen!=6 must not read sender at the Ethernet offset"
+    );
+}
+
+#[test]
+fn classify_arp_rejects_bad_plen() {
+    let mut f = build_eth_arp_reply(false);
+    // plen is at l3_start+5 (offset 19). Flip 4 -> 16.
+    f[19] = 16;
+    assert_eq!(
+        classify_arp(&f),
+        ArpClassification::OtherArp,
+        "opcode-2 ARP with plen!=4 must not read sender at the IPv4 offset"
+    );
+}
+
+#[test]
+fn classify_arp_valid_reply_still_learns_after_validation() {
+    // Anti-over-reject: a well-formed Ethernet/IPv4 opcode-2 ARP reply
+    // must STILL learn after the #2369 field checks — IPv4 neighbor
+    // resolution depends on this path. Pins that the validation does not
+    // regress legitimate ARP learning.
+    let f = build_eth_arp_reply(false);
+    match classify_arp(&f) {
+        ArpClassification::Reply(r) => {
+            assert_eq!(r.sender_mac, [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
+            assert_eq!(r.sender_ip, IpAddr::V4(Ipv4Addr::new(10, 0, 0, 42)));
+        }
+        other => panic!("expected Reply (valid ARP must still learn), got {:?}", other),
+    }
+}
+
+#[test]
+fn classify_arp_truncated_body_does_not_panic() {
+    // A frame with the ARP EtherType but a body shorter than 28 bytes
+    // must classify without an out-of-bounds read/panic. Build a valid
+    // reply and truncate into the ARP body at every length below the
+    // full 28-byte body.
+    let full = build_eth_arp_reply(false);
+    for cut in 14..full.len() {
+        let truncated = &full[..cut];
+        // Must not panic; a too-short body is NotArp (the len guard fires
+        // before any fixed-offset field read).
+        let _ = classify_arp(truncated);
+    }
+}
+
 /// Compute the RFC 4443 ICMPv6 checksum over the message at
 /// `l4_start..packet_end` using the IPv6 pseudo-header taken from the
 /// IPv6 base header at `l3_start`. The on-wire checksum field
