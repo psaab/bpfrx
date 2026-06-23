@@ -5852,6 +5852,81 @@ fn ipv6_any_fragment_predicate_truth_table() {
     )));
 }
 
+// #2362 fold A (the #2344 non-first-fragment class): term_match_extra_from_frame
+// must NOT read L4-derived match inputs from a non-first fragment — its bytes
+// at l4_offset are payload, not a real L4 header. is_fragment (L3-only) MUST
+// still be set. These fail if the non-first-fragment gate is removed.
+#[test]
+fn term_extra_non_first_icmp_fragment_suppresses_icmp_type_keeps_is_fragment() {
+    // Non-first ICMP fragment (offset != 0) whose payload byte at l4_offset == 8
+    // (would spuriously match `icmp-type 8` without the gate).
+    let frag = frag_v4_packet(PROTO_ICMP, 0x0001, &[8, 0, 0, 0, 0, 0, 0, 0]);
+    let mut frame = vec![0u8; 14];
+    frame.extend_from_slice(&frag);
+    let meta = UserspaceDpMeta {
+        l3_offset: 14,
+        l4_offset: 34,
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_ICMP,
+        ..UserspaceDpMeta::default()
+    };
+    let extra = term_match_extra_from_frame(&frame, meta);
+    assert_eq!(
+        extra.icmp_type, 0,
+        "non-first fragment payload byte must NOT leak as icmp_type"
+    );
+    assert_eq!(extra.icmp_code, 0);
+    assert_eq!(extra.tcp_flags, 0);
+    assert!(
+        extra.is_fragment,
+        "a non-first fragment IS a fragment (is-fragment must match)"
+    );
+}
+
+#[test]
+fn term_extra_non_first_tcp_fragment_suppresses_tcp_flags() {
+    // Non-first TCP fragment with meta.tcp_flags carrying SYN (payload-derived).
+    let frag = frag_v4_packet(PROTO_TCP, 0x0001, &[0; 8]);
+    let mut frame = vec![0u8; 14];
+    frame.extend_from_slice(&frag);
+    let meta = UserspaceDpMeta {
+        l3_offset: 14,
+        l4_offset: 34,
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_TCP,
+        tcp_flags: 0x02, // SYN — would spuriously match `tcp-flags syn`
+        ..UserspaceDpMeta::default()
+    };
+    let extra = term_match_extra_from_frame(&frame, meta);
+    assert_eq!(
+        extra.tcp_flags, 0,
+        "non-first fragment must NOT expose payload-derived tcp_flags"
+    );
+    assert!(extra.is_fragment);
+}
+
+#[test]
+fn term_extra_first_fragment_keeps_l4_fields() {
+    // A FIRST fragment (offset 0, MF=1) carries the real L4 header — keep the
+    // L4 fields AND mark is_fragment.
+    let frag = frag_v4_packet(PROTO_ICMP, 0x2000, &[8, 0, 0, 0, 0, 0, 0, 0]);
+    let mut frame = vec![0u8; 14];
+    frame.extend_from_slice(&frag);
+    let meta = UserspaceDpMeta {
+        l3_offset: 14,
+        l4_offset: 34,
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_ICMP,
+        ..UserspaceDpMeta::default()
+    };
+    let extra = term_match_extra_from_frame(&frame, meta);
+    assert_eq!(
+        extra.icmp_type, 8,
+        "first fragment carries the real ICMP type"
+    );
+    assert!(extra.is_fragment, "first fragment IS a fragment");
+}
+
 #[test]
 fn apply_nat_ipv4_non_first_fragment_rewrites_ip_only() {
     // Payload bytes occupy the post-IP offset where the buggy code would
