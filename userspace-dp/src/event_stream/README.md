@@ -60,6 +60,27 @@ cluster-scoped.
   (see `protocol.rs`). Use `push_delta_lossless()` only when
   correctness requires every frame and the producer can tolerate
   back-pressure.
+- **Write-backlog cap (#2381).** The bounded mpsc channel
+  (`CHANNEL_CAPACITY`) is the ONLY intended backpressure surface. The
+  I/O thread's pending socket-write backlog (`write_buf`) is hard-capped
+  at `WRITE_BACKLOG_MAX_BYTES` (16 MiB) in
+  `drain_channel_into_write_buf()`. A wedged daemon (socket open but not
+  reading → `write_buf` writes return `WouldBlock`) would otherwise let
+  the I/O thread migrate the whole channel into the heap-backed
+  `write_buf` every cycle; the channel refills from worker `try_send`,
+  the thread drains it again, and `write_buf` grows without bound →
+  helper OOM / allocator pressure on the **forwarding plane**. Once the
+  backlog reaches the cap the drain STOPS pulling from the channel, the
+  channel becomes the real backpressure surface (newest producer events
+  shed via `try_send`, counted in `frames_dropped` / per-kind
+  `queue_full`; oldest queued + replay frames are preserved so RT_FLOW
+  stays current), and each capped pass bumps `frames_write_stalled`
+  (wire key `event_stream_write_stalls`, Prometheus
+  `xpf_userspace_event_stream_producer_frames_total{result="write_stalled"}`).
+  The cap does not apply while paused — paused frames go only to the
+  already-bounded replay buffer, never to `write_buf`. **Invariant: the
+  data plane never stalls because a telemetry consumer is slow; a stuck
+  consumer degrades telemetry (counted drops), nothing else.**
 - RT_FLOW dataplane telemetry producers must use
   `try_emit_dataplane_event_at()`, not hand-rolled `try_send()`
   wrappers. The API applies the per-kind/per-ingress-zone limiter

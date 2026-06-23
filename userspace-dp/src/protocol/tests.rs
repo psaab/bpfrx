@@ -1633,6 +1633,7 @@ fn process_status_event_stream_fields_wire_keys_1642() {
         event_stream_connected: true,
         event_stream_seq: 4242,
         event_stream_acked: 4200,
+        event_stream_write_stalls: 17,
         ..Default::default()
     };
     let value: serde_json::Value =
@@ -1640,6 +1641,9 @@ fn process_status_event_stream_fields_wire_keys_1642() {
     assert_eq!(value["event_stream_connected"], true);
     assert_eq!(value["event_stream_seq"], 4242u64);
     assert_eq!(value["event_stream_acked"], 4200u64);
+    // #2381: stalled-consumer backlog counter must survive the wire under its
+    // exact key so the Go status adapter can surface it.
+    assert_eq!(value["event_stream_write_stalls"], 17u64);
 }
 
 // #1863 Step-0: round-trip + omitempty pin for the per-worker v8

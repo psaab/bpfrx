@@ -42,6 +42,25 @@ const CHANNEL_CAPACITY: usize = 8192;
 /// Maximum frames retained for replay after disconnect.
 const REPLAY_BUFFER_CAPACITY: usize = 4096;
 
+/// Hard cap on the I/O thread's pending socket-write backlog (`write_buf`).
+///
+/// The bounded mpsc channel (`CHANNEL_CAPACITY`) is the only intended
+/// backpressure surface. Without this cap a wedged daemon (socket open but
+/// not reading → `write_buf` writes return `WouldBlock`) lets the I/O thread
+/// migrate the entire channel into the heap-backed `write_buf` every cycle;
+/// the channel then refills from worker `try_send`, the I/O thread drains it
+/// again, and `write_buf` grows without bound → helper OOM / allocator
+/// pressure on the forwarding plane (#2381). Once the backlog reaches this
+/// cap the I/O thread stops pulling frames out of the channel, so the bounded
+/// channel becomes the real backpressure surface and `try_send` drops (with
+/// the existing `frames_dropped` / per-kind `queue_full` counters) instead of
+/// silently relocating bytes into one unbounded buffer.
+///
+/// 16 MiB ≈ 2× the worst-case fully-drained 8192-frame channel of maximum
+/// session-open frames, so a transient burst is absorbed losslessly while a
+/// persistently stalled consumer is bounded.
+const WRITE_BACKLOG_MAX_BYTES: usize = 16 * 1024 * 1024;
+
 /// Upper bound for explicit lossless queueing operations such as full
 /// session export on connect. Normal packet-path delta export remains
 /// non-blocking via `try_send`.
@@ -59,6 +78,13 @@ pub(crate) struct EventStreamStats {
     pub(crate) acked_seq: u64,
     pub(crate) sent: u64,
     pub(crate) dropped: u64,
+    /// Count of I/O cycles in which the pending socket-write backlog reached
+    /// `WRITE_BACKLOG_MAX_BYTES` and the I/O thread therefore stopped pulling
+    /// frames from the channel (a wedged/stalled daemon reader, #2381). A
+    /// non-zero, growing value means telemetry is being shed at the bounded
+    /// channel because the consumer is not draining the socket — the dataplane
+    /// is unaffected.
+    pub(crate) write_stalls: u64,
     #[allow(dead_code)] // stats field for future reporting
     pub(crate) replayed: u64,
     #[allow(dead_code)] // producer-call-site wiring will surface these fields
@@ -77,6 +103,9 @@ struct EventStreamShared {
     /// Counters.
     frames_sent: AtomicU64,
     frames_dropped: AtomicU64,
+    /// I/O cycles in which `write_buf` hit `WRITE_BACKLOG_MAX_BYTES` and the
+    /// channel drain was halted (stalled consumer signal, #2381).
+    frames_write_stalled: AtomicU64,
     frames_replayed: AtomicU64,
     dataplane_event_counters: DataplaneEventCounters,
     #[allow(dead_code)] // consumed by producer call sites once they are wired
@@ -104,6 +133,7 @@ impl EventStreamShared {
             connected: AtomicBool::new(false),
             frames_sent: AtomicU64::new(0),
             frames_dropped: AtomicU64::new(0),
+            frames_write_stalled: AtomicU64::new(0),
             frames_replayed: AtomicU64::new(0),
             dataplane_event_counters: DataplaneEventCounters::new(),
             dataplane_event_limiter: DataplaneEventRateLimiter::new(config),
@@ -173,6 +203,7 @@ impl EventStreamSender {
             acked_seq: self.shared.acked_seq.load(Ordering::Relaxed),
             sent: self.shared.frames_sent.load(Ordering::Relaxed),
             dropped: self.shared.frames_dropped.load(Ordering::Relaxed),
+            write_stalls: self.shared.frames_write_stalled.load(Ordering::Relaxed),
             replayed: self.shared.frames_replayed.load(Ordering::Relaxed),
             dataplane_events: self.shared.dataplane_event_counters.snapshot(),
         }
@@ -479,24 +510,12 @@ fn run_connected_loop(
         }
 
         let paused = shared.paused.load(Ordering::Acquire);
-        let mut drained_any = false;
 
-        // Drain channel into replay buffer + write buffer. Dataplane telemetry
-        // keeps its producer budget while retained for replay; release only
-        // when the frame is ACKed or definitively dropped.
-        loop {
-            match rx.try_recv() {
-                Ok(frame) => {
-                    drained_any = true;
-                    if !paused {
-                        write_buf.extend_from_slice(frame.as_bytes());
-                    }
-                    push_replay_frame(shared, replay_buf, frame);
-                }
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => return false,
-            }
+        let drain = drain_channel_into_write_buf(rx, shared, replay_buf, &mut write_buf, paused);
+        if drain.disconnected {
+            return false;
         }
+        let drained_any = drain.drained_any;
 
         // Write buffered frames to socket
         if !write_buf.is_empty() {
@@ -729,6 +748,82 @@ fn drain_remaining(rx: &mpsc::Receiver<EventFrame>, shared: &Arc<EventStreamShar
 fn release_dataplane_event_queue_budget(shared: &Arc<EventStreamShared>, frame: &EventFrame) {
     if let Some(kind) = frame.dataplane_event_kind() {
         shared.dataplane_event_queue.release(kind);
+    }
+}
+
+/// Outcome of one channel-drain pass in the connected loop.
+struct DrainOutcome {
+    /// At least one frame was pulled from the channel this pass.
+    drained_any: bool,
+    /// The channel sender side was dropped (helper shutting down).
+    disconnected: bool,
+    /// The write backlog hit `WRITE_BACKLOG_MAX_BYTES` and the drain was
+    /// halted before emptying the channel (stalled-consumer signal). Exposed
+    /// for tests; the loop relies on the side-effect counter.
+    #[cfg_attr(not(test), allow(dead_code))]
+    stalled: bool,
+}
+
+/// Drain the bounded channel into `replay_buf` and (when not paused) into the
+/// pending socket-write backlog `write_buf`.
+///
+/// The drain halts once `write_buf` reaches `WRITE_BACKLOG_MAX_BYTES` (#2381).
+/// Without that cap a wedged daemon (socket open but not reading → the socket
+/// `write` returns `WouldBlock`) lets this loop migrate the entire bounded
+/// channel into the heap-backed `write_buf` every cycle; the channel then
+/// refills from worker `try_send`, the loop drains it again, and `write_buf`
+/// grows without bound → helper OOM / allocator pressure on the forwarding
+/// plane. Halting the drain leaves the frames in the bounded channel, which
+/// becomes the real backpressure surface: worker `try_send` then fails and
+/// increments the existing `frames_dropped` / per-kind `queue_full` counters
+/// (oldest queued/replay frames are preserved; newest producer events are
+/// shed — keeping RT_FLOW current). Each pass that hits the cap bumps
+/// `frames_write_stalled` so a wedged consumer is observable rather than a
+/// silent OOM.
+///
+/// The cap does not apply while paused: paused frames are consumed into the
+/// already-bounded replay buffer only, never into `write_buf`, so they cannot
+/// grow the backlog.
+fn drain_channel_into_write_buf(
+    rx: &mpsc::Receiver<EventFrame>,
+    shared: &Arc<EventStreamShared>,
+    replay_buf: &mut VecDeque<EventFrame>,
+    write_buf: &mut Vec<u8>,
+    paused: bool,
+) -> DrainOutcome {
+    let mut drained_any = false;
+    loop {
+        if !paused && write_buf.len() >= WRITE_BACKLOG_MAX_BYTES {
+            shared.frames_write_stalled.fetch_add(1, Ordering::Relaxed);
+            return DrainOutcome {
+                drained_any,
+                disconnected: false,
+                stalled: true,
+            };
+        }
+        match rx.try_recv() {
+            Ok(frame) => {
+                drained_any = true;
+                if !paused {
+                    write_buf.extend_from_slice(frame.as_bytes());
+                }
+                push_replay_frame(shared, replay_buf, frame);
+            }
+            Err(TryRecvError::Empty) => {
+                return DrainOutcome {
+                    drained_any,
+                    disconnected: false,
+                    stalled: false,
+                };
+            }
+            Err(TryRecvError::Disconnected) => {
+                return DrainOutcome {
+                    drained_any,
+                    disconnected: true,
+                    stalled: false,
+                };
+            }
+        }
     }
 }
 

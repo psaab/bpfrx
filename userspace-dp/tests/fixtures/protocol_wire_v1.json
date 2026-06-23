@@ -754,6 +754,7 @@
     "event_stream_dropped": 0,
     "event_stream_sent": 0,
     "event_stream_seq": 0,
+    "event_stream_write_stalls": 0,
     "fabrics": [],
     "filter_term_counters": [],
     "flow_cache_capacity": 0,

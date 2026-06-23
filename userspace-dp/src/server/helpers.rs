@@ -278,6 +278,7 @@ pub(crate) fn refresh_status(state: &mut ServerState) {
         state.status.event_stream_acked = es_stats.acked_seq;
         state.status.event_stream_sent = es_stats.sent;
         state.status.event_stream_dropped = es_stats.dropped;
+        state.status.event_stream_write_stalls = es_stats.write_stalls;
     }
     state.status.last_cache_flush_at = state.afxdp.last_cache_flush_at();
 }
