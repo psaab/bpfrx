@@ -666,3 +666,57 @@ pub(super) fn static_nat_snapshot() -> ConfigSnapshot {
         ..Default::default()
     }
 }
+
+/// Compute the RFC 4443 ICMPv6 checksum over the IPv6 pseudo-header
+/// (src + dst + upper-layer length + next-header 58) plus the ICMPv6
+/// message (`l4_start..packet_end`, checksum field treated as zero).
+/// One-shot 16-bit one's-complement fold. Shared by the parser tests
+/// (#2368 NDP NA frames) and the poll_stages neighbor-keying tests
+/// (#2370) so the stamping logic has a single source of truth.
+pub(super) fn compute_icmpv6_checksum(
+    frame: &[u8],
+    l3_start: usize,
+    l4_start: usize,
+    packet_end: usize,
+) -> u16 {
+    const NEXT_HEADER_ICMPV6: u8 = 58;
+    let mut sum: u32 = 0;
+    let add = |sum: &mut u32, bytes: &[u8]| {
+        let mut i = 0;
+        while i + 1 < bytes.len() {
+            *sum += u16::from_be_bytes([bytes[i], bytes[i + 1]]) as u32;
+            i += 2;
+        }
+        if i < bytes.len() {
+            *sum += (bytes[i] as u32) << 8;
+        }
+    };
+    // pseudo-header: src(16) + dst(16) + len(32) + [0,0,0,58]
+    add(&mut sum, &frame[l3_start + 8..l3_start + 24]);
+    add(&mut sum, &frame[l3_start + 24..l3_start + 40]);
+    let icmp_len = (packet_end - l4_start) as u32;
+    add(&mut sum, &icmp_len.to_be_bytes());
+    add(&mut sum, &[0, 0, 0, NEXT_HEADER_ICMPV6]);
+    // ICMPv6 message with the checksum field zeroed.
+    let mut icmp = frame[l4_start..packet_end].to_vec();
+    icmp[2] = 0;
+    icmp[3] = 0;
+    add(&mut sum, &icmp);
+    while (sum >> 16) != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+/// Stamp a valid ICMPv6 checksum into `frame` in place (IPv6 base header
+/// at `l3_start`, ICMPv6 message at `l4_start`, declared packet end at
+/// `packet_end`). See [`compute_icmpv6_checksum`].
+pub(super) fn stamp_icmpv6_checksum(
+    frame: &mut [u8],
+    l3_start: usize,
+    l4_start: usize,
+    packet_end: usize,
+) {
+    let csum = compute_icmpv6_checksum(frame, l3_start, l4_start, packet_end);
+    frame[l4_start + 2..l4_start + 4].copy_from_slice(&csum.to_be_bytes());
+}

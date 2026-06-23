@@ -165,47 +165,10 @@ fn classify_arp_truncated_body_does_not_panic() {
     }
 }
 
-/// Compute the RFC 4443 ICMPv6 checksum over the message at
-/// `l4_start..packet_end` using the IPv6 pseudo-header taken from the
-/// IPv6 base header at `l3_start`. The on-wire checksum field
-/// (`l4_start + 2..l4_start + 4`) is treated as zero for the
-/// computation. Used by the test builders to stamp a VALID checksum so
-/// the #2368 §7.1.2 validation accepts a legitimate NA.
-fn compute_icmpv6_checksum(frame: &[u8], l3_start: usize, l4_start: usize, packet_end: usize) -> u16 {
-    let mut sum: u32 = 0;
-    let add = |sum: &mut u32, bytes: &[u8]| {
-        let mut i = 0;
-        while i + 1 < bytes.len() {
-            *sum += u16::from_be_bytes([bytes[i], bytes[i + 1]]) as u32;
-            i += 2;
-        }
-        if i < bytes.len() {
-            *sum += (bytes[i] as u32) << 8;
-        }
-    };
-    // pseudo-header: src(16) + dst(16) + len(32) + [0,0,0,58]
-    add(&mut sum, &frame[l3_start + 8..l3_start + 24]);
-    add(&mut sum, &frame[l3_start + 24..l3_start + 40]);
-    let icmp_len = (packet_end - l4_start) as u32;
-    add(&mut sum, &icmp_len.to_be_bytes());
-    add(&mut sum, &[0, 0, 0, NEXT_HEADER_ICMPV6]);
-    // ICMPv6 message with the checksum field zeroed.
-    let mut icmp = frame[l4_start..packet_end].to_vec();
-    icmp[2] = 0;
-    icmp[3] = 0;
-    add(&mut sum, &icmp);
-    while (sum >> 16) != 0 {
-        sum = (sum & 0xffff) + (sum >> 16);
-    }
-    !(sum as u16)
-}
-
-/// Stamp a valid ICMPv6 checksum into `frame` in place (l4 at `l4_start`,
-/// declared packet end at `packet_end`, IPv6 base header at `l3_start`).
-fn stamp_icmpv6_checksum(frame: &mut [u8], l3_start: usize, l4_start: usize, packet_end: usize) {
-    let csum = compute_icmpv6_checksum(frame, l3_start, l4_start, packet_end);
-    frame[l4_start + 2..l4_start + 4].copy_from_slice(&csum.to_be_bytes());
-}
+// ICMPv6 checksum stamping is shared with the poll_stages #2370 tests via
+// `afxdp::test_fixtures::stamp_icmpv6_checksum` (single source of truth so
+// the pseudo-header / fold logic cannot drift between the two test sites).
+use super::super::test_fixtures::stamp_icmpv6_checksum;
 
 fn build_eth_ndp_na(vlan: bool, with_tlla: bool) -> Vec<u8> {
     build_eth_ndp_na_full(vlan, with_tlla, 255, 0, false)

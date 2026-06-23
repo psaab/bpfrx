@@ -37,6 +37,25 @@ sync.
   `(ifindex, ip) -> mac` binding into `dynamic_neighbors` AND the kernel
   neighbor table, so these parsers are a MAC->IP write primitive — they
   MUST fail closed on untrusted input.
+  - **Logical-ifindex keying (`#2370`):** the `ifindex` in that
+    `(ifindex, ip)` key is the LOGICAL (L3) ifindex, NOT the physical
+    ingress port. For a frame arriving on a VLAN sub-interface,
+    `meta.ingress_ifindex` is the parent/bind port and
+    `meta.ingress_vlan_id` selects the logical interface;
+    `stage_link_layer_classify` resolves `(parent, vlan) -> logical` once
+    via `resolve_ingress_logical_ifindex` and keys BOTH the
+    `dynamic_neighbors` insert and `add_kernel_neighbor` under it. This
+    matches the forwarder, which looks up neighbors by the connected-route
+    (logical) ifindex (`lookup_neighbor_entry`; routes are stored under
+    `iface.ifindex` in `forwarding_build/interfaces.rs`). Keying the
+    insert by the physical parent (the pre-#2370 bug) made the just-learned
+    entry invisible to the lookup on VLAN sub-interfaces → an avoidable
+    MissingNeighbor cold-path probe and first-packet latency. Untagged
+    interfaces resolve physical == logical (unchanged); a physical port
+    with no matching logical sub-interface falls back to the physical
+    ifindex (no drop). Two VLANs on one physical port resolve to distinct
+    logical ifindexes, so a same-IP-different-subnet neighbor never
+    collides in the cache.
   - **NA validation (`#2368`, RFC 4861 §7.1.2 / RFC 4443):** before an
     NA learns a Target Link-Layer Address, `parse_ndp_neighbor_advert`
     enforces the §7.1.2 MUSTs — IPv6 Hop Limit == 255 (the off-link

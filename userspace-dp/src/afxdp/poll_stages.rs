@@ -75,21 +75,49 @@ pub(super) fn stage_link_layer_classify(
     meta: UserspaceDpMeta,
     worker_ctx: &WorkerContext,
 ) -> StageOutcome<()> {
+    // #2370: learn dynamic neighbors under the LOGICAL (L3) ifindex,
+    // not the physical/parent ingress ifindex. The forwarder looks up
+    // dynamic neighbors keyed by the connected-route ifindex, which is
+    // the logical VLAN sub-interface (see `lookup_neighbor_entry` and
+    // `forwarding_build/interfaces.rs` `ConnectedRouteV4/V6 { ifindex:
+    // iface.ifindex }`). For an ARP/NDP frame arriving on a VLAN
+    // sub-interface, `meta.ingress_ifindex` is the parent/bind ifindex
+    // and `meta.ingress_vlan_id` selects the logical interface;
+    // resolving (parent, vlan) -> logical makes the insert key match the
+    // lookup key, so the just-learned entry is found instead of falling
+    // through to the MissingNeighbor cold path. The SAME logical ifindex
+    // keys `add_kernel_neighbor` too (already correct before this fix).
+    // For untagged / non-VLAN interfaces the mapping resolves
+    // physical == logical, so behavior is unchanged; if no logical
+    // interface matches we fall back to the physical ifindex rather than
+    // dropping the learned neighbor. Two VLANs sharing a physical port
+    // resolve to distinct logical ifindexes (distinct (parent, vlan)
+    // keys), so a same-IP-different-subnet neighbor never collides.
+    //
+    // The resolve is computed ONLY inside the ARP-reply / NDP-NA learn
+    // arms below, NOT at the top of the stage. This stage runs per-packet
+    // for ALL ingress traffic (before the flow-cache fast path), so the
+    // overwhelming majority of packets (every non-ARP/non-NDP frame,
+    // including flow-cache hits) must skip the FastMap lookup entirely —
+    // they pay zero resolve cost, matching the pre-#2370 data path.
+    let learn_ifindex = || {
+        resolve_ingress_logical_ifindex(
+            worker_ctx.forwarding,
+            meta.ingress_ifindex as i32,
+            meta.ingress_vlan_id,
+        )
+        .unwrap_or(meta.ingress_ifindex as i32)
+    };
     match parser::classify_arp(raw_frame) {
         parser::ArpClassification::Reply(arp) => {
+            let ifindex = learn_ifindex();
             worker_ctx.dynamic_neighbors.insert(
-                (meta.ingress_ifindex as i32, arp.sender_ip),
+                (ifindex, arp.sender_ip),
                 NeighborEntry {
                     mac: arp.sender_mac,
                 },
             );
-            let neigh_ifindex = resolve_ingress_logical_ifindex(
-                worker_ctx.forwarding,
-                meta.ingress_ifindex as i32,
-                meta.ingress_vlan_id,
-            )
-            .unwrap_or(meta.ingress_ifindex as i32);
-            add_kernel_neighbor(neigh_ifindex, arp.sender_ip, arp.sender_mac);
+            add_kernel_neighbor(ifindex, arp.sender_ip, arp.sender_mac);
             return StageOutcome::RecycleAndContinue;
         }
         parser::ArpClassification::OtherArp => {
@@ -100,17 +128,11 @@ pub(super) fn stage_link_layer_classify(
     if let Some(na) = parser::parse_ndp_neighbor_advert(raw_frame)
         && let Some(mac) = na.target_mac
     {
-        worker_ctx.dynamic_neighbors.insert(
-            (meta.ingress_ifindex as i32, na.target_ip),
-            NeighborEntry { mac },
-        );
-        let neigh_ifindex = resolve_ingress_logical_ifindex(
-            worker_ctx.forwarding,
-            meta.ingress_ifindex as i32,
-            meta.ingress_vlan_id,
-        )
-        .unwrap_or(meta.ingress_ifindex as i32);
-        add_kernel_neighbor(neigh_ifindex, na.target_ip, mac);
+        let ifindex = learn_ifindex();
+        worker_ctx
+            .dynamic_neighbors
+            .insert((ifindex, na.target_ip), NeighborEntry { mac });
+        add_kernel_neighbor(ifindex, na.target_ip, mac);
     }
     StageOutcome::Continue(())
 }
@@ -177,9 +199,7 @@ pub(super) fn stage_parse_flow_and_learn(
     worker_ctx: &WorkerContext,
 ) -> Option<SessionFlow> {
     let flow = parse_session_flow_from_bytes(packet_frame, meta);
-    if learn_from_live_frame
-        && let Some(flow) = flow.as_ref()
-    {
+    if learn_from_live_frame && let Some(flow) = flow.as_ref() {
         learn_dynamic_neighbor_from_packet(
             area,
             desc,
@@ -281,7 +301,11 @@ pub(super) fn stage_screen_check(
     // #2145 misclassification. `ingress_vlan_present` is the
     // tag-presence signal the shim already sets (mirrors the CoS path
     // in tx/cos_classify.rs).
-    let l3_off = if meta.ingress_vlan_present != 0 { 18 } else { 14 };
+    let l3_off = if meta.ingress_vlan_present != 0 {
+        18
+    } else {
+        14
+    };
     let screen_pkt = match extract_screen_info(
         packet_frame,
         meta.addr_family,
@@ -408,7 +432,11 @@ pub(super) fn stage_screen_syn_cookie_ack_on_session_miss(
     // See `stage_screen_check`: decide L3 offset on tag PRESENCE, not
     // VID > 0, so a priority-tagged VID-0 cookie ACK is parsed at the
     // correct offset (18) instead of mis-reading the tag bytes (#2145).
-    let l3_off = if meta.ingress_vlan_present != 0 { 18 } else { 14 };
+    let l3_off = if meta.ingress_vlan_present != 0 {
+        18
+    } else {
+        14
+    };
     let screen_pkt = match extract_screen_info(
         packet_frame,
         meta.addr_family,
@@ -745,7 +773,7 @@ mod tests {
             peer_worker_commands: &peer_worker_commands,
             dnat_fds: &dnat_fds,
             rg_epochs: &rg_epochs,
-        cold_path_sample_mask: 0xff,
+            cold_path_sample_mask: 0xff,
         };
 
         let client = Ipv4Addr::new(192, 0, 2, 10);
@@ -782,19 +810,11 @@ mod tests {
             other => panic!("expected SYN-cookie challenge, got {other:?}"),
         };
 
-        let invalid_ack_frame = tcp_v4_frame(
-            client,
-            server,
-            49152,
-            443,
-            TCP_FLAG_ACK,
-            2,
-            0xdead_beef,
-        );
+        let invalid_ack_frame =
+            tcp_v4_frame(client, server, 49152, 443, TCP_FLAG_ACK, 2, 0xdead_beef);
         let invalid_ack_meta = tcp_v4_meta(&invalid_ack_frame, TCP_FLAG_ACK);
-        let invalid_ack_flow =
-            parse_session_flow_from_bytes(&invalid_ack_frame, invalid_ack_meta)
-                .expect("session flow from invalid ACK");
+        let invalid_ack_flow = parse_session_flow_from_bytes(&invalid_ack_frame, invalid_ack_meta)
+            .expect("session flow from invalid ACK");
         let mut invalid_counters = BatchCounters::default();
 
         assert!(matches!(
@@ -1046,8 +1066,7 @@ mod tests {
             // field at 38+8=46.
             f[51] = TCP_FLAG_ACK;
             f[46..50].copy_from_slice(&challenge.cookie_isn.wrapping_add(1).to_be_bytes());
-            recompute_l4_checksum_ipv4(&mut f[18..], 20, PROTO_TCP, false)
-                .expect("tcp checksum");
+            recompute_l4_checksum_ipv4(&mut f[18..], 20, PROTO_TCP, false).expect("tcp checksum");
             f
         };
         let ack_meta = tcp_v4_syn_meta_with_l2(&ack_frame, Vlan::PriorityTagged);
@@ -1084,5 +1103,348 @@ mod tests {
             counters.syn_cookie_ack_valid, 1,
             "the tagged cookie ACK must validate exactly once"
         );
+    }
+
+    // ===================================================================
+    // #2370 — learned dynamic neighbors must be keyed by the LOGICAL
+    // (L3 / VLAN sub-interface) ifindex the forwarder looks them up by,
+    // not the physical/parent ingress ifindex they arrived on.
+    // ===================================================================
+
+    /// Build a `WorkerContext` over the supplied forwarding state and a
+    /// fresh empty dynamic-neighbor map, returning the map so the test
+    /// can assert the key the stage inserted under.
+    ///
+    /// The boxed values are intentionally `Box::leak`'d to obtain the
+    /// `&'static` borrows the `WorkerContext<'a>` shape requires, instead
+    /// of threading a dozen owned locals through every call site. The
+    /// leak is NOT one-shot: a single test binary runs many tests in one
+    /// process, so each `neighbor_learn_ctx` call adds a small, bounded
+    /// allocation that persists for the test-binary lifetime. This is
+    /// test-only and the per-call footprint is tiny (a handful of empty
+    /// maps + the context struct), so the accumulation is harmless.
+    fn neighbor_learn_ctx(
+        forwarding: &'static ForwardingState,
+    ) -> (&'static WorkerContext<'static>, Arc<ShardedNeighborMap>) {
+        let dynamic_neighbors = Arc::new(ShardedNeighborMap::default());
+        let ident = Box::leak(Box::new(BindingIdentity {
+            slot: 0,
+            queue_id: 0,
+            worker_id: 0,
+            interface: Arc::<str>::from("ge-0-0-0"),
+            ifindex: 11,
+        }));
+        let binding_lookup = Box::leak(Box::new(WorkerBindingLookup::default()));
+        let mirror_targets = Box::leak(Box::new(MirrorTargetMap::default()));
+        let ha_state = Box::leak(Box::new(BTreeMap::new()));
+        let dynamic_neighbors_ref =
+            Box::leak(Box::new(dynamic_neighbors.clone())) as &'static Arc<_>;
+        let shared_sessions = Box::leak(Box::new(Arc::new(Mutex::new(FastMap::default()))));
+        let shared_nat_sessions = Box::leak(Box::new(Arc::new(Mutex::new(FastMap::default()))));
+        let shared_forward_wire_sessions =
+            Box::leak(Box::new(Arc::new(Mutex::new(FastMap::default()))));
+        let shared_owner_rg_indexes = Box::leak(Box::new(SharedSessionOwnerRgIndexes::default()));
+        let local_tunnel_deliveries =
+            Box::leak(Box::new(Arc::new(ArcSwap::from_pointee(BTreeMap::new()))));
+        let recent_exceptions = Box::leak(Box::new(Arc::new(Mutex::new(VecDeque::new()))));
+        let last_resolution = Box::leak(Box::new(Arc::new(Mutex::new(None))));
+        let peer_worker_commands = Box::leak(Box::new(Vec::new()));
+        let dnat_fds = Box::leak(Box::new(DnatTableFds::default()));
+        let rg_epochs = Box::leak(Box::new(std::array::from_fn(|_| AtomicU32::new(0))));
+        let ctx = Box::leak(Box::new(WorkerContext {
+            ident,
+            binding_lookup,
+            mirror_targets,
+            forwarding,
+            ha_state,
+            dynamic_neighbors: dynamic_neighbors_ref,
+            neighbor_resolver: None,
+            shared_sessions,
+            shared_nat_sessions,
+            shared_forward_wire_sessions,
+            shared_owner_rg_indexes,
+            slow_path: None,
+            event_stream: None,
+            local_tunnel_deliveries,
+            recent_exceptions,
+            last_resolution,
+            peer_worker_commands,
+            dnat_fds,
+            rg_epochs,
+            cold_path_sample_mask: 0xff,
+        }));
+        (ctx, dynamic_neighbors)
+    }
+
+    /// ARP reply frame (untagged) with a configurable sender IP. The
+    /// stage classifies it as `Reply` and learns `(learn_ifindex,
+    /// sender_ip) -> sender_mac`.
+    fn arp_reply_frame(sender_ip: Ipv4Addr, sender_mac: [u8; 6]) -> Vec<u8> {
+        let mut f = Vec::new();
+        f.extend_from_slice(&[0x00, 0x11, 0x22, 0x33, 0x44, 0x55]); // dst
+        f.extend_from_slice(&sender_mac); // src
+        f.extend_from_slice(&[0x08, 0x06]); // ethertype ARP
+        // htype=1, ptype=0x0800, hlen=6, plen=4, op=2 (reply)
+        f.extend_from_slice(&[0x00, 0x01, 0x08, 0x00, 0x06, 0x04, 0x00, 0x02]);
+        f.extend_from_slice(&sender_mac); // sender mac
+        f.extend_from_slice(&sender_ip.octets()); // sender ip
+        f.extend_from_slice(&[0x00; 6]); // target mac
+        f.extend_from_slice(&[10, 0, 0, 1]); // target ip
+        f
+    }
+
+    /// Meta for a frame arriving on physical ifindex `parent` with the
+    /// given `vlan` (0 = untagged). Only the fields the link-layer stage
+    /// reads (`ingress_ifindex`, `ingress_vlan_id`) matter here.
+    fn link_layer_meta(parent: u32, vlan: u16) -> UserspaceDpMeta {
+        UserspaceDpMeta {
+            magic: USERSPACE_META_MAGIC,
+            version: USERSPACE_META_VERSION,
+            length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+            ingress_ifindex: parent,
+            ingress_vlan_id: vlan,
+            ingress_vlan_present: (vlan != 0) as u8,
+            l3_offset: 14,
+            ..UserspaceDpMeta::default()
+        }
+    }
+
+    /// #2370 fail-on-revert (ARP, VLAN sub-interface). The `nat_snapshot`
+    /// fixture defines `reth0.80` as logical ifindex 12 on parent
+    /// ifindex 11 / VLAN 80. An ARP reply arriving on (parent=11,
+    /// vlan=80) MUST be learned under the LOGICAL ifindex 12 — the key
+    /// the forwarder's connected-route lookup uses — NOT the physical
+    /// ifindex 11. If the insert reverts to `meta.ingress_ifindex` the
+    /// entry lands under (11, ip), `lookup_neighbor_entry` (which probes
+    /// the logical ifindex 12) misses, and these asserts fail.
+    #[test]
+    fn arp_learns_vlan_neighbor_under_logical_ifindex_2370() {
+        let forwarding: &'static ForwardingState = Box::leak(Box::new(build_forwarding_state(
+            &super::super::test_fixtures::nat_snapshot(),
+        )));
+        let (ctx, neighbors) = neighbor_learn_ctx(forwarding);
+
+        let sender_ip = Ipv4Addr::new(172, 16, 80, 9);
+        let sender_mac = [0xde, 0xad, 0xbe, 0xef, 0x00, 0x09];
+        let frame = arp_reply_frame(sender_ip, sender_mac);
+        let meta = link_layer_meta(11, 80);
+
+        // Sanity: the fixture really maps (parent=11, vlan=80) -> 12.
+        assert_eq!(
+            resolve_ingress_logical_ifindex(forwarding, 11, 80),
+            Some(12),
+            "fixture must map parent ifindex 11 / VLAN 80 to logical 12"
+        );
+
+        let outcome = stage_link_layer_classify(&frame, meta, ctx);
+        assert!(matches!(outcome, StageOutcome::RecycleAndContinue));
+
+        // The forwarder looks up by the logical (route egress) ifindex.
+        let found = lookup_neighbor_entry(
+            forwarding,
+            Some(&neighbors),
+            12, // logical ifindex (reth0.80)
+            IpAddr::V4(sender_ip),
+        );
+        assert_eq!(
+            found.map(|e| e.mac),
+            Some(sender_mac),
+            "ARP learned on a VLAN sub-interface must be found by the \
+             forwarder's LOGICAL-ifindex (12) lookup (#2370); a physical \
+             ifindex (11) key would miss here"
+        );
+        // And it must NOT have landed under the physical/parent ifindex.
+        assert!(
+            neighbors.get(&(11, IpAddr::V4(sender_ip))).is_none(),
+            "the learned entry must not be keyed by the physical/parent \
+             ifindex 11 (the bug); only the logical ifindex 12"
+        );
+    }
+
+    /// #2370 — a non-VLAN (physical == logical) ARP neighbor still
+    /// learns under the interface ifindex unchanged. `reth1.0` in the
+    /// fixture has ifindex 24 and no parent (untagged), so
+    /// `resolve_ingress_logical_ifindex(24, 0)` resolves to 24 and the
+    /// learn key equals the lookup key.
+    #[test]
+    fn arp_learns_untagged_neighbor_under_same_ifindex_2370() {
+        let forwarding: &'static ForwardingState = Box::leak(Box::new(build_forwarding_state(
+            &super::super::test_fixtures::nat_snapshot(),
+        )));
+        let (ctx, neighbors) = neighbor_learn_ctx(forwarding);
+
+        let sender_ip = Ipv4Addr::new(10, 0, 61, 50);
+        let sender_mac = [0xde, 0xad, 0xbe, 0xef, 0x00, 0x18];
+        let frame = arp_reply_frame(sender_ip, sender_mac);
+        let meta = link_layer_meta(24, 0);
+
+        let outcome = stage_link_layer_classify(&frame, meta, ctx);
+        assert!(matches!(outcome, StageOutcome::RecycleAndContinue));
+
+        let found = lookup_neighbor_entry(forwarding, Some(&neighbors), 24, IpAddr::V4(sender_ip));
+        assert_eq!(
+            found.map(|e| e.mac),
+            Some(sender_mac),
+            "untagged ARP must learn under the (logical==physical) ifindex 24"
+        );
+    }
+
+    /// #2370 multi-VLAN no-collision. Two VLAN sub-interfaces (VID 80 and
+    /// VID 50) share ONE physical parent (ifindex 11) but own distinct
+    /// logical ifindexes (12 and 13) in different subnets. The SAME
+    /// neighbor IP learned on each VLAN must land under DISTINCT keys
+    /// (12, ip) and (13, ip) — proving the logical-ifindex key keeps
+    /// them apart. Keying by the shared physical ifindex would collapse
+    /// both into (11, ip) and the second learn would overwrite the
+    /// first, corrupting one VLAN's neighbor entry.
+    #[test]
+    fn arp_two_vlans_same_ip_distinct_logical_keys_2370() {
+        let forwarding: &'static ForwardingState =
+            Box::leak(Box::new(build_forwarding_state(&two_vlan_snapshot())));
+        let (ctx, neighbors) = neighbor_learn_ctx(forwarding);
+
+        assert_eq!(
+            resolve_ingress_logical_ifindex(forwarding, 11, 80),
+            Some(12),
+            "parent 11 / VLAN 80 -> logical 12"
+        );
+        assert_eq!(
+            resolve_ingress_logical_ifindex(forwarding, 11, 50),
+            Some(13),
+            "parent 11 / VLAN 50 -> logical 13"
+        );
+
+        let ip = Ipv4Addr::new(172, 16, 0, 99);
+        let mac_v80 = [0x02, 0x00, 0x00, 0x00, 0x00, 0x80];
+        let mac_v50 = [0x02, 0x00, 0x00, 0x00, 0x00, 0x50];
+
+        // Same physical port (11), same neighbor IP, different VLANs.
+        let _ =
+            stage_link_layer_classify(&arp_reply_frame(ip, mac_v80), link_layer_meta(11, 80), ctx);
+        let _ =
+            stage_link_layer_classify(&arp_reply_frame(ip, mac_v50), link_layer_meta(11, 50), ctx);
+
+        assert_eq!(
+            neighbors.get(&(12, IpAddr::V4(ip))).map(|e| e.mac),
+            Some(mac_v80),
+            "VLAN-80 neighbor must be keyed by logical ifindex 12"
+        );
+        assert_eq!(
+            neighbors.get(&(13, IpAddr::V4(ip))).map(|e| e.mac),
+            Some(mac_v50),
+            "VLAN-50 neighbor must be keyed by logical ifindex 13 — a \
+             physical-ifindex key would collide both into (11, ip)"
+        );
+        assert!(
+            neighbors.get(&(11, IpAddr::V4(ip))).is_none(),
+            "neither learn may land under the shared physical ifindex 11"
+        );
+    }
+
+    /// #2370 NDP variant. A valid Neighbor Advertisement (hop-limit 255,
+    /// code 0, valid ICMPv6 checksum, TLLA option) arriving on a VLAN
+    /// sub-interface must learn its target under the LOGICAL ifindex too.
+    /// Shares the exact `learn_ifindex` computation with the ARP path.
+    #[test]
+    fn ndp_learns_vlan_neighbor_under_logical_ifindex_2370() {
+        let forwarding: &'static ForwardingState = Box::leak(Box::new(build_forwarding_state(
+            &super::super::test_fixtures::nat_snapshot(),
+        )));
+        let (ctx, neighbors) = neighbor_learn_ctx(forwarding);
+
+        let (frame, target_ip, target_mac) = ndp_na_frame();
+        // Frame is built untagged; the meta declares VLAN 80 on parent
+        // 11 (the shim conveys the VLAN out-of-band in meta, not in the
+        // already-stripped L2 header for the learn-key decision).
+        let meta = link_layer_meta(11, 80);
+
+        let outcome = stage_link_layer_classify(&frame, meta, ctx);
+        assert!(matches!(outcome, StageOutcome::Continue(())));
+
+        let found = lookup_neighbor_entry(forwarding, Some(&neighbors), 12, target_ip);
+        assert_eq!(
+            found.map(|e| e.mac),
+            Some(target_mac),
+            "NDP NA learned on a VLAN sub-interface must be found by the \
+             forwarder's LOGICAL-ifindex (12) lookup (#2370)"
+        );
+        assert!(
+            neighbors.get(&(11, target_ip)).is_none(),
+            "the NDP entry must not be keyed by the physical ifindex 11"
+        );
+    }
+
+    /// A `nat_snapshot`-shaped config with TWO VLAN sub-interfaces on the
+    /// same physical parent (ifindex 11): `reth0.80` (logical 12, VID 80)
+    /// and `reth0.50` (logical 13, VID 50), in different subnets.
+    fn two_vlan_snapshot() -> crate::ConfigSnapshot {
+        let mut snap = super::super::test_fixtures::nat_snapshot();
+        // Existing reth0.80 already has ifindex 12, parent 11, VID 80.
+        snap.interfaces.push(crate::InterfaceSnapshot {
+            name: "reth0.50".to_string(),
+            zone: "wan".to_string(),
+            linux_name: "ge-0-0-0.50".to_string(),
+            ifindex: 13,
+            parent_ifindex: 11,
+            redundancy_group: 1,
+            vlan_id: 50,
+            hardware_addr: "02:bf:72:00:50:08".to_string(),
+            addresses: vec![crate::InterfaceAddressSnapshot {
+                family: "inet".to_string(),
+                address: "172.16.50.8/24".to_string(),
+                scope: 0,
+            }],
+            ..Default::default()
+        });
+        snap
+    }
+
+    /// Build a minimal but VALID untagged IPv6 Neighbor Advertisement
+    /// (hop-limit 255, code 0, TLLA option, correct ICMPv6 checksum) and
+    /// return `(frame, target_ip, target_mac)`. Mirrors the parser-test
+    /// builder; the checksum is stamped so the strict #2368 NA parser
+    /// accepts it.
+    fn ndp_na_frame() -> (Vec<u8>, IpAddr, [u8; 6]) {
+        const NEXT_HEADER_ICMPV6: u8 = 58;
+        const ICMPV6_TYPE_NA: u8 = 136;
+        const NDP_OPT_TARGET_LL: u8 = 2;
+        let target_mac = [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff];
+        let mut f = Vec::new();
+        f.extend_from_slice(&[0x00, 0x11, 0x22, 0x33, 0x44, 0x55]); // dst
+        f.extend_from_slice(&target_mac); // src
+        f.extend_from_slice(&[0x86, 0xdd]); // ethertype IPv6
+        let l3_start = 14usize;
+        let payload_len = 32u16; // NA(24) + TLLA(8)
+        f.extend_from_slice(&[0x60, 0x00, 0x00, 0x00]);
+        f.extend_from_slice(&payload_len.to_be_bytes());
+        f.push(NEXT_HEADER_ICMPV6);
+        f.push(255); // hop limit (required)
+        // src ip fe80::abcd:ef01:0:1
+        f.extend_from_slice(&[
+            0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0xab, 0xcd, 0xef, 0x01, 0x00, 0x00, 0x00, 0x01,
+        ]);
+        // dst ip (all-ff placeholder; not validated for unicast target)
+        f.extend_from_slice(&[0xff; 16]);
+        let l4_start = l3_start + 40;
+        f.push(ICMPV6_TYPE_NA);
+        f.push(0); // code
+        f.extend_from_slice(&[0x00, 0x00]); // checksum placeholder
+        f.extend_from_slice(&[0; 4]); // flags
+        // target fe80::abcd:ef01:0:42
+        let target_bytes = [
+            0xfe, 0x80, 0, 0, 0, 0, 0, 0, 0xab, 0xcd, 0xef, 0x01, 0x00, 0x00, 0x00, 0x42,
+        ];
+        f.extend_from_slice(&target_bytes);
+        // TLLA option
+        f.push(NDP_OPT_TARGET_LL);
+        f.push(1);
+        f.extend_from_slice(&target_mac);
+        let packet_end = l3_start + 40 + payload_len as usize;
+        // Shared stamper (single source of truth, also used by the #2368
+        // parser tests) — the strict NA parser requires a valid checksum.
+        super::super::test_fixtures::stamp_icmpv6_checksum(
+            &mut f, l3_start, l4_start, packet_end,
+        );
+        (f, IpAddr::V6(Ipv6Addr::from(target_bytes)), target_mac)
     }
 }

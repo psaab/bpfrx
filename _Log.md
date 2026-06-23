@@ -11505,3 +11505,53 @@ top.
 - **File(s)**: userspace-dp/src/afxdp/parser.rs,
     userspace-dp/src/afxdp/parser_tests.rs,
     userspace-dp/src/afxdp/README.md, _Log.md
+- **Timestamp**: 2026-06-23 06:39
+- **Action**: #2370 — key learned ARP/NDP dynamic neighbors by the LOGICAL
+    (VLAN sub-interface) ifindex, not the physical/parent ingress ifindex.
+    `stage_link_layer_classify` inserted dynamic neighbors under
+    `meta.ingress_ifindex` (physical) while the forwarder
+    (`lookup_neighbor_entry`) probes them by the connected-route LOGICAL
+    ifindex (`forwarding_build/interfaces.rs` stores routes under
+    `iface.ifindex`). On a VLAN sub-interface physical != logical, so the
+    just-learned entry was missed → MissingNeighbor cold path + first-packet
+    latency until the kernel neighbor resolved (kernel entry was already keyed
+    correctly via `add_kernel_neighbor`, which used the logical ifindex). Fix:
+    hoist `resolve_ingress_logical_ifindex(parent, vlan)` to the top of the
+    stage and key BOTH the `dynamic_neighbors.insert` and `add_kernel_neighbor`
+    under that single `learn_ifindex`. Untagged interfaces resolve
+    physical==logical (unchanged); unmatched physical port falls back to the
+    physical ifindex (no drop); two VLANs on one parent get distinct logical
+    keys (no same-IP collision). 4 new tests in poll_stages: VLAN ARP learns
+    under logical 12 (fail-on-revert), untagged learns under 24 unchanged, two
+    VLANs same-IP distinct logical keys (12 vs 13, no collapse to 11), valid
+    NDP NA VLAN learns under logical 12. Revert-to-physical proven to FAIL the
+    3 VLAN tests while the untagged one stays green. cargo build --release
+    clean; 6 poll_stages tests green, 5x stable; neighbor/forwarding suites
+    273 green, no regression.
+- **File(s)**: userspace-dp/src/afxdp/poll_stages.rs,
+    userspace-dp/src/afxdp/README.md, _Log.md
+- **Timestamp**: 2026-06-23 07:20
+- **Action**: #2370 review fold (PR #2425) — three reviewer items.
+    (1) PRIMARY hot-path: `stage_link_layer_classify` runs per-packet for
+    ALL ingress traffic (before the flow-cache fast path). The #2370 fix
+    initially computed `resolve_ingress_logical_ifindex` UNCONDITIONALLY at
+    the top, so every non-ARP/non-NDP packet (the overwhelming majority,
+    incl. flow-cache hits) paid an avoidable FastMap lookup. Moved the
+    resolve into a `learn_ifindex` closure called ONLY inside the ARP-reply
+    and NDP-NA learn arms — a non-ARP/non-NDP packet (classify_arp ==
+    NotArp, parse_ndp_neighbor_advert == None) never invokes it, restoring
+    the pre-#2370 zero-cost data path. Learn-path result is identical (same
+    logical key); the VLAN fail-on-revert tests still prove it (3 fail on
+    revert, untagged green). (2) Test drift: factored the duplicated
+    ICMPv6 checksum stamper into one shared
+    `afxdp::test_fixtures::{compute_icmpv6_checksum, stamp_icmpv6_checksum}`
+    and switched both parser_tests.rs (#2368 NA frames) and poll_stages.rs
+    (#2370 NDP frame) to it. (3) Doc fix: `neighbor_learn_ctx` `Box::leak`
+    comment corrected — the leak is NOT one-shot; it accumulates (bounded,
+    test-only) across the many tests in one test-binary process.
+    cargo build --release clean; poll_stages 6/6, parser 31/31, combined
+    neighbor/dynamic/ifindex/vlan/poll_stages/forwarding 300 green; 5x
+    stable. No wire change.
+- **File(s)**: userspace-dp/src/afxdp/poll_stages.rs,
+    userspace-dp/src/afxdp/parser_tests.rs,
+    userspace-dp/src/afxdp/test_fixtures.rs, _Log.md
