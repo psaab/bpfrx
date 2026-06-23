@@ -1,16 +1,25 @@
 //! #1328 Phase 2 — snapshot apply phase.
 //!
-//! Pure code motion from the middle of the pre-#1328 monolithic
-//! `Coordinator::reconcile` body (lines 400–528 of the old
-//! `mod.rs`): install validation/forwarding state, re-arm slow
-//! path, publish HA-fabrics snapshot, then open the required BPF
-//! map FDs (xsk/heartbeat/sessions) plus the optional ones
-//! (conntrack v4/v6, dnat tables).
+//! Originally pure code motion from the middle of the pre-#1328
+//! monolithic `Coordinator::reconcile` body: install
+//! validation/forwarding state, re-arm slow path, publish HA-fabrics
+//! snapshot, then open the required BPF map FDs.
 //!
-//! On any missing-pin or open-failure, sets `last_reconcile_stage`
-//! plus per-registered-binding `last_error` (matching the
-//! pre-#1328 messages verbatim) and returns `None`. The orchestrator
-//! bails on `None`.
+//! #2440 ordering invariant: the mandatory BPF map FDs
+//! (xsk/heartbeat/sessions) — the real correctness boundary — are now
+//! opened by [`preflight_map_fds`], which the orchestrator
+//! (`reconcile/mod.rs`) runs BEFORE worker teardown and BEFORE any
+//! publish. `apply_snapshot` therefore receives the already-secured
+//! FDs and only runs once bring-up is guaranteed possible. A
+//! mandatory-FD failure aborts in the preflight WITHOUT tearing down
+//! the prior workers or publishing a newer forwarding generation, so a
+//! snapshot whose required pins are missing/unopenable can never strand
+//! the helper advertising a data-plane view backed by no workers
+//! (fail-open partial apply). On any missing-pin or open-failure
+//! `preflight_map_fds` sets `last_reconcile_stage` plus
+//! per-registered-binding `last_error` (matching the pre-#1328 messages
+//! verbatim) and returns `None`; the orchestrator bails before
+//! `tear_down`.
 use super::ReconcileSnapshotFds;
 // Re-use afxdp scope (coordinator/mod.rs uses the same pattern).
 use super::super::super::*;
@@ -18,14 +27,137 @@ use super::super::Coordinator;
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-pub(super) fn apply_snapshot(
+/// #2440: open the mandatory + optional BPF map FDs and surface any
+/// missing-pin / open-failure BEFORE the orchestrator tears down the
+/// current workers or `apply_snapshot` publishes a newer forwarding
+/// generation. The mandatory map open (xsk/heartbeat/sessions) is the
+/// real correctness boundary: if any of the three is missing or fails
+/// to open, this returns `None` after setting `last_reconcile_stage` +
+/// per-registered-binding `last_error` (verbatim pre-#1328 messages),
+/// and the orchestrator aborts WITHOUT teardown or publish — the prior
+/// generation stays published and the prior workers keep running.
+///
+/// The optional maps (conntrack v4/v6, dnat tables) are best-effort:
+/// they never gate the reconcile, matching the historical behavior.
+pub(super) fn preflight_map_fds(
     coord: &mut Coordinator,
     snapshot: &ConfigSnapshot,
     bindings: &mut [BindingStatus],
+) -> Option<ReconcileSnapshotFds> {
+    if snapshot.map_pins.xsk.is_empty() {
+        coord.last_reconcile_stage = "missing_xsk_pin".to_string();
+        for binding in bindings.iter_mut() {
+            if binding.registered {
+                binding.last_error = "missing XSK map pin path".to_string();
+            }
+        }
+        return None;
+    }
+    if snapshot.map_pins.heartbeat.is_empty() {
+        coord.last_reconcile_stage = "missing_heartbeat_pin".to_string();
+        for binding in bindings.iter_mut() {
+            if binding.registered {
+                binding.last_error = "missing heartbeat map pin path".to_string();
+            }
+        }
+        return None;
+    }
+    if snapshot.map_pins.sessions.is_empty() {
+        coord.last_reconcile_stage = "missing_session_pin".to_string();
+        for binding in bindings.iter_mut() {
+            if binding.registered {
+                binding.last_error = "missing session map pin path".to_string();
+            }
+        }
+        return None;
+    }
+    let map_fd = match OwnedFd::open_bpf_map(&snapshot.map_pins.xsk) {
+        Ok(fd) => fd,
+        Err(err) => {
+            coord.last_reconcile_stage = format!("open_xsk_map_failed:{err}");
+            for binding in bindings.iter_mut() {
+                if binding.registered {
+                    binding.last_error = format!("open XSK map: {err}");
+                }
+            }
+            return None;
+        }
+    };
+    let heartbeat_map_fd = match OwnedFd::open_bpf_map(&snapshot.map_pins.heartbeat) {
+        Ok(fd) => fd,
+        Err(err) => {
+            coord.last_reconcile_stage = format!("open_heartbeat_map_failed:{err}");
+            for binding in bindings.iter_mut() {
+                if binding.registered {
+                    binding.last_error = format!("open heartbeat map: {err}");
+                }
+            }
+            return None;
+        }
+    };
+    let session_map_fd = match OwnedFd::open_bpf_map(&snapshot.map_pins.sessions) {
+        Ok(fd) => fd,
+        Err(err) => {
+            coord.last_reconcile_stage = format!("open_session_map_failed:{err}");
+            for binding in bindings.iter_mut() {
+                if binding.registered {
+                    binding.last_error = format!("open session map: {err}");
+                }
+            }
+            return None;
+        }
+    };
+    // Open BPF conntrack maps (sessions, sessions_v6) so the helper can
+    // publish session entries that "show security flow session" reads.
+    // Non-fatal: if the maps don't exist, session display will lack
+    // zone/interface info.
+    let conntrack_v4_fd = if !snapshot.map_pins.conntrack_v4.is_empty() {
+        OwnedFd::open_bpf_map(&snapshot.map_pins.conntrack_v4).ok()
+    } else {
+        None
+    };
+    let conntrack_v6_fd = if !snapshot.map_pins.conntrack_v6.is_empty() {
+        OwnedFd::open_bpf_map(&snapshot.map_pins.conntrack_v6).ok()
+    } else {
+        None
+    };
+    // Open dnat_table BPF map for embedded ICMP NAT reversal support.
+    // Non-fatal: if the map doesn't exist, embedded ICMP won't work
+    // but normal forwarding is unaffected.
+    let dnat_table_fd = if !snapshot.map_pins.dnat_table.is_empty() {
+        OwnedFd::open_bpf_map(&snapshot.map_pins.dnat_table).ok()
+    } else {
+        None
+    };
+    let dnat_table_v6_fd = if !snapshot.map_pins.dnat_table_v6.is_empty() {
+        OwnedFd::open_bpf_map(&snapshot.map_pins.dnat_table_v6).ok()
+    } else {
+        None
+    };
+    let dnat_fds = DnatTableFds {
+        v4: dnat_table_fd.as_ref().map(|f| f.fd),
+        v6: dnat_table_v6_fd.as_ref().map(|f| f.fd),
+    };
+    Some(ReconcileSnapshotFds {
+        map_fd,
+        heartbeat_map_fd,
+        session_map_fd,
+        conntrack_v4_fd,
+        conntrack_v6_fd,
+        dnat_table_fd,
+        dnat_table_v6_fd,
+        dnat_fds,
+    })
+}
+
+pub(super) fn apply_snapshot(
+    coord: &mut Coordinator,
+    snapshot: &ConfigSnapshot,
     preserved_slow_path: Option<Arc<SlowPathReinjector>>,
     prior_tunnel_owners: &[(u16, String)],
     snapshot_was_installed: bool,
     preserved_synced_sessions: &mut Vec<SyncedSessionEntry>,
+    fds: ReconcileSnapshotFds,
 ) -> Option<ReconcileSnapshotFds> {
     // #1606: preflight policy build BEFORE any side-effecting
     // mutation. Surfaces address-book integrity errors (id=0,
@@ -135,108 +267,10 @@ pub(super) fn apply_snapshot(
         .ha
         .fabrics
         .store(Arc::new(coord.forwarding.fabrics.clone()));
-    if snapshot.map_pins.xsk.is_empty() {
-        coord.last_reconcile_stage = "missing_xsk_pin".to_string();
-        for binding in bindings.iter_mut() {
-            if binding.registered {
-                binding.last_error = "missing XSK map pin path".to_string();
-            }
-        }
-        return None;
-    }
-    if snapshot.map_pins.heartbeat.is_empty() {
-        coord.last_reconcile_stage = "missing_heartbeat_pin".to_string();
-        for binding in bindings.iter_mut() {
-            if binding.registered {
-                binding.last_error = "missing heartbeat map pin path".to_string();
-            }
-        }
-        return None;
-    }
-    if snapshot.map_pins.sessions.is_empty() {
-        coord.last_reconcile_stage = "missing_session_pin".to_string();
-        for binding in bindings.iter_mut() {
-            if binding.registered {
-                binding.last_error = "missing session map pin path".to_string();
-            }
-        }
-        return None;
-    }
-    let map_fd = match OwnedFd::open_bpf_map(&snapshot.map_pins.xsk) {
-        Ok(fd) => fd,
-        Err(err) => {
-            coord.last_reconcile_stage = format!("open_xsk_map_failed:{err}");
-            for binding in bindings.iter_mut() {
-                if binding.registered {
-                    binding.last_error = format!("open XSK map: {err}");
-                }
-            }
-            return None;
-        }
-    };
-    let heartbeat_map_fd = match OwnedFd::open_bpf_map(&snapshot.map_pins.heartbeat) {
-        Ok(fd) => fd,
-        Err(err) => {
-            coord.last_reconcile_stage = format!("open_heartbeat_map_failed:{err}");
-            for binding in bindings.iter_mut() {
-                if binding.registered {
-                    binding.last_error = format!("open heartbeat map: {err}");
-                }
-            }
-            return None;
-        }
-    };
-    let session_map_fd = match OwnedFd::open_bpf_map(&snapshot.map_pins.sessions) {
-        Ok(fd) => fd,
-        Err(err) => {
-            coord.last_reconcile_stage = format!("open_session_map_failed:{err}");
-            for binding in bindings.iter_mut() {
-                if binding.registered {
-                    binding.last_error = format!("open session map: {err}");
-                }
-            }
-            return None;
-        }
-    };
-    // Open BPF conntrack maps (sessions, sessions_v6) so the helper can
-    // publish session entries that "show security flow session" reads.
-    // Non-fatal: if the maps don't exist, session display will lack
-    // zone/interface info.
-    let conntrack_v4_fd = if !snapshot.map_pins.conntrack_v4.is_empty() {
-        OwnedFd::open_bpf_map(&snapshot.map_pins.conntrack_v4).ok()
-    } else {
-        None
-    };
-    let conntrack_v6_fd = if !snapshot.map_pins.conntrack_v6.is_empty() {
-        OwnedFd::open_bpf_map(&snapshot.map_pins.conntrack_v6).ok()
-    } else {
-        None
-    };
-    // Open dnat_table BPF map for embedded ICMP NAT reversal support.
-    // Non-fatal: if the map doesn't exist, embedded ICMP won't work
-    // but normal forwarding is unaffected.
-    let dnat_table_fd = if !snapshot.map_pins.dnat_table.is_empty() {
-        OwnedFd::open_bpf_map(&snapshot.map_pins.dnat_table).ok()
-    } else {
-        None
-    };
-    let dnat_table_v6_fd = if !snapshot.map_pins.dnat_table_v6.is_empty() {
-        OwnedFd::open_bpf_map(&snapshot.map_pins.dnat_table_v6).ok()
-    } else {
-        None
-    };
-    let dnat_fds = DnatTableFds {
-        v4: dnat_table_fd.as_ref().map(|f| f.fd),
-        v6: dnat_table_v6_fd.as_ref().map(|f| f.fd),
-    };
-    Some(ReconcileSnapshotFds {
-        map_fd,
-        heartbeat_map_fd,
-        session_map_fd,
-        conntrack_v4_fd,
-        conntrack_v6_fd,
-        dnat_table_fd,
-        dnat_table_v6_fd,
-        dnat_fds,
-    })
+    // #2440: the mandatory + optional map FDs were already opened by
+    // `preflight_map_fds` BEFORE teardown/publish. By the time we get
+    // here bring-up is guaranteed possible, so the publish above is
+    // never stranded behind an FD-open failure. Hand the secured FDs to
+    // the bring-up phase.
+    Some(fds)
 }

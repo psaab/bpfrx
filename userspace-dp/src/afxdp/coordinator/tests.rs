@@ -2770,3 +2770,188 @@ fn gre1881_stop_inner_clears_and_sweep_creates_nothing() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// #2440 — reconcile must NOT publish a newer forwarding generation (or tear
+// down the prior workers) when a mandatory BPF map FD fails to open. The
+// mandatory map open (xsk/heartbeat/sessions) is the real correctness
+// boundary, so it runs in a PREFLIGHT before teardown/publish.
+// ---------------------------------------------------------------------------
+
+/// Build a minimal snapshot whose three mandatory map pins are populated
+/// with sentinel paths (see `bpf_map::pin`): xsk + heartbeat resolve to
+/// dummy fds, while `sessions` is forced to fail its open. This isolates
+/// the failure to the third mandatory open without any real bpffs pins.
+/// `generation` is the new generation the reconcile would publish if it
+/// ran to completion.
+fn fail_open_snapshot(generation: u64) -> ConfigSnapshot {
+    ConfigSnapshot {
+        generation,
+        map_pins: crate::protocol::snapshot::MapPins {
+            xsk: format!("{TEST_MAP_PIN_OK}xsk"),
+            heartbeat: format!("{TEST_MAP_PIN_OK}heartbeat"),
+            sessions: format!("{TEST_MAP_PIN_FAIL}sessions"),
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+/// fail-on-revert regression: with `map_pins.sessions` unopenable, the
+/// reconcile must abort in the preflight — leaving the previously
+/// published generation intact and NOT advancing `snapshot_installed`
+/// / `config_generation`. The xsk + heartbeat opens are forced to
+/// "succeed" (dummy fds) so the failure is isolated to the session map,
+/// exercising the third mandatory open specifically.
+///
+/// Fail-on-revert proof: if the fix is reverted so publish happens
+/// before the open (the pre-#2440 order), the reconcile stamps the new
+/// generation into `validation` + `shared_validation` BEFORE the session
+/// open fails, and every assertion below that the prior generation
+/// survives will fail.
+#[test]
+fn reconcile_mandatory_map_open_failure_keeps_prior_generation_published() {
+    let mut coordinator = Coordinator::new();
+
+    // Seed a prior, successfully-published forwarding generation. This
+    // stands in for "stale-but-correct state backed by running workers".
+    let prior = ValidationState {
+        snapshot_installed: true,
+        config_generation: 7,
+        fib_generation: 3,
+    };
+    coordinator.validation = prior;
+    coordinator.shared_validation.store(Arc::new(prior));
+
+    let mut bindings: Vec<BindingStatus> = vec![BindingStatus {
+        slot: 1,
+        worker_id: 0,
+        queue_id: 0,
+        interface: "ge-0-0-0".into(),
+        ifindex: 10,
+        registered: true,
+        bound: true,
+        ready: true,
+        ..BindingStatus::default()
+    }];
+
+    // `fail_open_snapshot` wires xsk + heartbeat to "succeed" (dummy
+    // fds) and `sessions` to fail its open, so the failure is isolated
+    // to the third mandatory open. The optional maps (conntrack/dnat)
+    // are empty so they are never opened.
+    coordinator.reconcile(Some(&fail_open_snapshot(8)), &mut bindings, 64);
+
+    // The reconcile aborted at the session-map open.
+    assert!(
+        coordinator
+            .last_reconcile_stage
+            .starts_with("open_session_map_failed:"),
+        "expected abort at session-map open, got {:?}",
+        coordinator.last_reconcile_stage
+    );
+
+    // FAIL-ON-REVERT CORE: the prior generation is still the published
+    // one. A pre-#2440 publish-before-open would have advanced these to
+    // generation 8 before the session open failed.
+    assert_eq!(
+        coordinator.validation.config_generation, 7,
+        "config_generation must NOT advance on a mandatory-FD failure"
+    );
+    assert_eq!(
+        coordinator.validation.fib_generation, 3,
+        "fib_generation must NOT advance on a mandatory-FD failure"
+    );
+    assert!(
+        coordinator.validation.snapshot_installed,
+        "snapshot_installed must stay at its prior value"
+    );
+    let shared = **coordinator.shared_validation.load();
+    assert_eq!(
+        shared.config_generation, 7,
+        "shared_validation (the worker-visible view) must still hold the prior generation"
+    );
+    assert_eq!(shared, prior, "shared_validation must equal the prior published state");
+
+    // The registered binding records the open failure for the operator.
+    assert!(
+        bindings[0].last_error.starts_with("open session map:"),
+        "expected per-binding last_error to record the session-map open failure, got {:?}",
+        bindings[0].last_error
+    );
+
+    // No workers were brought up (the abort precedes bring-up).
+    assert!(
+        coordinator.workers.live.is_empty(),
+        "no workers should be live after an aborted reconcile"
+    );
+}
+
+/// A missing (empty) mandatory pin string must abort in the preflight
+/// the same way an unopenable FD does — before any publish.
+#[test]
+fn reconcile_missing_session_pin_keeps_prior_generation_published() {
+    let mut coordinator = Coordinator::new();
+    let prior = ValidationState {
+        snapshot_installed: true,
+        config_generation: 11,
+        fib_generation: 5,
+    };
+    coordinator.validation = prior;
+    coordinator.shared_validation.store(Arc::new(prior));
+
+    let mut bindings: Vec<BindingStatus> = vec![BindingStatus {
+        slot: 1,
+        interface: "ge-0-0-0".into(),
+        ifindex: 10,
+        registered: true,
+        ..BindingStatus::default()
+    }];
+
+    // Mandatory xsk + heartbeat present, sessions deliberately empty.
+    let mut snap = fail_open_snapshot(12);
+    snap.map_pins.sessions = String::new();
+
+    coordinator.reconcile(Some(&snap), &mut bindings, 64);
+
+    assert_eq!(
+        coordinator.last_reconcile_stage, "missing_session_pin",
+        "expected abort at the missing-session-pin guard"
+    );
+    assert_eq!(coordinator.validation.config_generation, 11);
+    assert_eq!((**coordinator.shared_validation.load()).config_generation, 11);
+    assert_eq!(
+        bindings[0].last_error, "missing session map pin path",
+        "expected per-binding last_error for the missing session pin"
+    );
+}
+
+/// Positive control: when all mandatory pins open, the reconcile
+/// proceeds past the preflight and DOES advance the published
+/// generation (proving the preflight is not over-gating legitimate
+/// applies). Bring-up itself is exercised by the broader reconcile
+/// fixtures; here we only assert the publish happened.
+#[test]
+fn reconcile_all_mandatory_maps_open_advances_published_generation() {
+    let mut coordinator = Coordinator::new();
+    let prior = ValidationState {
+        snapshot_installed: true,
+        config_generation: 1,
+        fib_generation: 0,
+    };
+    coordinator.validation = prior;
+    coordinator.shared_validation.store(Arc::new(prior));
+
+    let mut bindings: Vec<BindingStatus> = Vec::new();
+
+    // All three mandatory pins resolve to dummy fds (sentinel-OK), so
+    // the preflight passes and the reconcile proceeds to publish.
+    let mut snap = fail_open_snapshot(2);
+    snap.map_pins.sessions = format!("{TEST_MAP_PIN_OK}sessions");
+    coordinator.reconcile(Some(&snap), &mut bindings, 64);
+
+    assert_eq!(
+        coordinator.validation.config_generation, 2,
+        "a fully-openable snapshot must advance the published generation"
+    );
+    assert_eq!((**coordinator.shared_validation.load()).config_generation, 2);
+}
