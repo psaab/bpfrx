@@ -121,6 +121,27 @@ pub(crate) struct FirewallTermSnapshot {
     pub forwarding_class: String,
     #[serde(rename = "dscp_rewrite", default)]
     pub dscp_rewrite: Option<u8>,
+    // Per-packet L4 match conditions (#2362). Mirror of the Go
+    // FirewallTermSnapshot fields. These are NOT in SessionKey, so a filter
+    // carrying any of them is cache-sensitive — see the #1431 invariant above
+    // and the path-(b) wiring in afxdp/flow_cache.rs.
+    //
+    // tcp_flags is a required-bits mask over the TCP flags byte (FIN=0x01,
+    // SYN=0x02, RST=0x04, PSH=0x08, ACK=0x10, URG=0x20): a TCP packet matches
+    // when (flags & mask) == mask. None = no constraint; a non-TCP packet
+    // never matches a term that sets it.
+    #[serde(rename = "tcp_flags", default)]
+    pub tcp_flags: Option<u8>,
+    // is_fragment matches any IP fragment (IPv4 MF set OR non-zero offset;
+    // IPv6 fragment extension header present).
+    #[serde(rename = "is_fragment", default)]
+    pub is_fragment: bool,
+    // icmp_type / icmp_code match the ICMP/ICMPv6 type and code bytes. None =
+    // no constraint; a non-ICMP(v6) packet never matches a term that sets them.
+    #[serde(rename = "icmp_type", default)]
+    pub icmp_type: Option<u8>,
+    #[serde(rename = "icmp_code", default)]
+    pub icmp_code: Option<u8>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -323,5 +344,3 @@ pub(crate) struct ThreeColorPolicerStatus {
     #[serde(rename = "drop_bytes", default)]
     pub drop_bytes: u64,
 }
-
-

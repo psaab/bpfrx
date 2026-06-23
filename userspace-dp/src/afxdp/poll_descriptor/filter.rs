@@ -39,6 +39,8 @@
 // side-effect ordering, counter increments, or allocation sites change.
 
 use super::*;
+use crate::afxdp::frame::term_match_extra_from_frame;
+use crate::filter::TermMatchExtra;
 
 #[inline]
 pub(super) fn filter_log_ingress_zone_id(
@@ -83,6 +85,7 @@ pub(super) struct NonPbrInputFilterEval {
 #[inline(never)]
 pub(super) fn evaluate_non_pbr_input_filter(
     forwarding: &ForwardingState,
+    extra: TermMatchExtra,
     flow: Option<&SessionFlow>,
     meta: UserspaceDpMeta,
     ingress_zone_override: Option<u16>,
@@ -110,6 +113,7 @@ pub(super) fn evaluate_non_pbr_input_filter(
         flow.forward_key.src_port,
         flow.forward_key.dst_port,
         meta.dscp,
+        extra,
         meta.pkt_len as u64,
     );
     let ingress_zone_id =
@@ -127,6 +131,7 @@ pub(super) fn evaluate_non_pbr_input_filter(
 #[inline(never)]
 pub(super) fn evaluate_non_pbr_input_filter_log_only(
     forwarding: &ForwardingState,
+    extra: TermMatchExtra,
     flow: Option<&SessionFlow>,
     meta: UserspaceDpMeta,
     ingress_zone_override: Option<u16>,
@@ -151,6 +156,7 @@ pub(super) fn evaluate_non_pbr_input_filter_log_only(
         flow.forward_key.src_port,
         flow.forward_key.dst_port,
         meta.dscp,
+        extra,
         true,
     )?;
     Some(CachedInputFilterLog {
@@ -167,6 +173,7 @@ pub(super) fn evaluate_non_pbr_input_filter_log_only(
 #[inline]
 pub(super) fn evaluate_dscp_sensitive_input_filter_on_session_hit(
     forwarding: &ForwardingState,
+    frame: &[u8],
     flow: Option<&SessionFlow>,
     meta: UserspaceDpMeta,
     ingress_zone_override: Option<u16>,
@@ -179,15 +186,28 @@ pub(super) fn evaluate_dscp_sensitive_input_filter_on_session_hit(
     )
     .unwrap_or(meta.ingress_ifindex as i32);
     let is_v6 = matches!(flow.dst_ip, IpAddr::V6(_));
+    // #2362: re-evaluate on a session hit whenever the interface input filter
+    // carries EITHER a DSCP match term OR a per-packet L4 match term
+    // (tcp-flags / is-fragment / icmp-type / icmp-code). Both classes vary per
+    // packet within a flow, so the first-packet decision must not be replayed.
+    // The extra-build stays AFTER this gate so the common no-such-filter case
+    // pays only two FxHashSet lookups (this function is #[inline] on the hot
+    // session-hit path).
     if !crate::filter::interface_input_filter_has_dscp_match(
+        &forwarding.filter_state,
+        ingress_ifindex,
+        is_v6,
+    ) && !crate::filter::interface_input_filter_has_per_packet_l4_match(
         &forwarding.filter_state,
         ingress_ifindex,
         is_v6,
     ) {
         return None;
     }
+    let extra = term_match_extra_from_frame(frame, meta);
     Some(evaluate_non_pbr_input_filter(
         forwarding,
+        extra,
         Some(flow),
         meta,
         ingress_zone_override,
@@ -288,6 +308,7 @@ fn emit_cached_output_filter_log_tail(
 #[inline(never)]
 pub(super) fn apply_lo0_filter_action(
     forwarding: &ForwardingState,
+    extra: TermMatchExtra,
     event_stream: Option<&crate::event_stream::EventStreamWorkerHandle>,
     flow: Option<&SessionFlow>,
     meta: UserspaceDpMeta,
@@ -307,6 +328,7 @@ pub(super) fn apply_lo0_filter_action(
         flow.forward_key.src_port,
         flow.forward_key.dst_port,
         meta.dscp,
+        extra,
         meta.pkt_len as u64,
     );
     if let Some(log_match) = result.log_match {

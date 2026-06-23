@@ -105,10 +105,9 @@ pub(crate) fn parse_filter_state_with_three_color_preserving(
             affects_route_lookup: terms.iter().any(|term| !term.routing_instance.is_empty()),
             has_counter_terms: terms.iter().any(|term| term.has_count),
             has_log_terms: terms.iter().any(|term| term.log),
-            has_terminal_action_terms: terms
-                .iter()
-                .any(|term| term.action != FilterAction::Accept),
+            has_terminal_action_terms: terms.iter().any(|term| term.action != FilterAction::Accept),
             has_dscp_match_terms: terms.iter().any(|term| term.dscp_match_enabled),
+            has_per_packet_l4_match_terms: terms.iter().any(|term| term.has_per_packet_l4_match()),
             has_three_color_policer_terms: terms
                 .iter()
                 .any(|term| term.three_color_policer.is_some()),
@@ -141,6 +140,11 @@ pub(crate) fn parse_filter_state_with_three_color_preserving(
                 }
                 if filter.has_dscp_match_terms {
                     state.iface_filter_v4_has_dscp_match.insert(iface.ifindex);
+                }
+                if filter.has_per_packet_l4_match_terms {
+                    state
+                        .iface_filter_v4_has_per_packet_l4_match
+                        .insert(iface.ifindex);
                 }
                 state
                     .iface_filter_v4_fast
@@ -189,6 +193,11 @@ pub(crate) fn parse_filter_state_with_three_color_preserving(
                 }
                 if filter.has_dscp_match_terms {
                     state.iface_filter_v6_has_dscp_match.insert(iface.ifindex);
+                }
+                if filter.has_per_packet_l4_match_terms {
+                    state
+                        .iface_filter_v6_has_per_packet_l4_match
+                        .insert(iface.ifindex);
                 }
                 state
                     .iface_filter_v6_fast
@@ -281,11 +290,7 @@ pub(crate) fn three_color_policer_runtime_id(name: &str) -> u32 {
         hash ^= u32::from(*byte);
         hash = hash.wrapping_mul(FNV_PRIME);
     }
-    if hash == 0 {
-        1
-    } else {
-        hash
-    }
+    if hash == 0 { 1 } else { hash }
 }
 
 fn build_three_color_policer_state(
@@ -389,6 +394,14 @@ fn parse_term(
         dest_ports: build_port_matcher(dest_ports),
         dscp_bitmap: build_u6_match_bitmap(&snap.dscp_values),
         dscp_match_enabled: !snap.dscp_values.is_empty(),
+        // #2362 per-packet L4 match conditions. A zero tcp_flags mask means
+        // "no constraint" (would match every packet), so fold it to None — the
+        // Go side already omits a 0 mask; this is a guard against a
+        // hand-crafted snapshot.
+        tcp_flags_mask: snap.tcp_flags.filter(|&m| m != 0),
+        is_fragment: snap.is_fragment,
+        icmp_type: snap.icmp_type,
+        icmp_code: snap.icmp_code,
         action,
         count: snap.count.clone(),
         has_count: !snap.count.is_empty(),

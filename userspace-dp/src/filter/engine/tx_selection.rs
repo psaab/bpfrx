@@ -118,7 +118,16 @@ fn evaluate_filter_ref_tx_selection_counted_v4<'a>(
     now_ns: Option<u64>,
 ) -> TxSelectionFilterResult<'a> {
     for term in &filter.terms {
-        if !term_matches_v4(term, src_ip, dst_ip, protocol, src_port, dst_port, dscp) {
+        if !term_matches_v4(
+            term,
+            src_ip,
+            dst_ip,
+            protocol,
+            src_port,
+            dst_port,
+            dscp,
+            TermMatchExtra::default(),
+        ) {
             continue;
         }
         if term.has_count {
@@ -150,7 +159,16 @@ fn evaluate_filter_ref_tx_selection_counted_v6<'a>(
     now_ns: Option<u64>,
 ) -> TxSelectionFilterResult<'a> {
     for term in &filter.terms {
-        if !term_matches_v6(term, src_ip, dst_ip, protocol, src_port, dst_port, dscp) {
+        if !term_matches_v6(
+            term,
+            src_ip,
+            dst_ip,
+            protocol,
+            src_port,
+            dst_port,
+            dscp,
+            TermMatchExtra::default(),
+        ) {
             continue;
         }
         if term.has_count {

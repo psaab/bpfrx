@@ -76,8 +76,7 @@ pub(crate) fn worker_loop(
     // Worker calls publish_from_local() each ~1s tick alongside the
     // runtime_atomics.publish(). Coordinator status path reads via
     // snapshot() at each /metrics scrape.
-    cold_path_atomics:
-        Arc<crate::afxdp::cold_path_hist::WorkerColdPathAtomics>,
+    cold_path_atomics: Arc<crate::afxdp::cold_path_hist::WorkerColdPathAtomics>,
 ) {
     // #1776: one-shot setup moved verbatim to setup.rs. The returned
     // WorkerLoopSetup is destructured into the same-named locals so
@@ -193,13 +192,11 @@ pub(crate) fn worker_loop(
                 refresh_worker_cos_queue_lease_runtime_counters(&mut wr_counters, &bindings);
                 wr_counters.session_table_entries = sessions.len() as u64;
                 wr_counters.max_sessions = sessions.max_sessions() as u64;
-                wr_counters.nat_reverse_key_collisions =
-                    sessions.nat_reverse_key_collisions();
+                wr_counters.nat_reverse_key_collisions = sessions.nat_reverse_key_collisions();
                 // #1861: install-refusal trio from the worker's
                 // SessionTable (create_drops was write-only before).
                 wr_counters.session_create_drops = sessions.create_drops();
-                wr_counters.session_install_admission_refused =
-                    sessions.admission_refused();
+                wr_counters.session_install_admission_refused = sessions.admission_refused();
                 wr_counters.session_install_partial = sessions.install_partial();
                 // #1760 W1: durable artifact for the reverse-key-collision
                 // watch. The in-process counters reset on every restart
@@ -229,9 +226,7 @@ pub(crate) fn worker_loop(
                              events (>=1 means a real collision occurred; not a \
                              pair census — standing collisions against an \
                              already-unindexed session are not counted)",
-                            worker_id,
-                            wr_counters.nat_reverse_key_collisions,
-                            shared_displacements,
+                            worker_id, wr_counters.nat_reverse_key_collisions, shared_displacements,
                         );
                         wr_prev_nat_collisions = wr_counters.nat_reverse_key_collisions;
                         wr_prev_shared_displacements = shared_displacements;
@@ -252,21 +247,18 @@ pub(crate) fn worker_loop(
                     let mut merged = cph::WorkerColdPathCounters::default();
                     for binding in bindings.iter() {
                         let src = &binding.cold_path;
-                        merged.sample_phase = merged
-                            .sample_phase
-                            .saturating_add(src.sample_phase);
+                        merged.sample_phase = merged.sample_phase.saturating_add(src.sample_phase);
                         merged.wrapper_underflow_count = merged
                             .wrapper_underflow_count
                             .saturating_add(src.wrapper_underflow_count);
                         for slot in 0..cph::POLICY_COLD_PATH_ZONE_PAIR_SLOTS {
-                            merged.sum_ns[slot] = merged.sum_ns[slot]
-                                .saturating_add(src.sum_ns[slot]);
-                            merged.samples[slot] = merged.samples[slot]
-                                .saturating_add(src.samples[slot]);
+                            merged.sum_ns[slot] =
+                                merged.sum_ns[slot].saturating_add(src.sum_ns[slot]);
+                            merged.samples[slot] =
+                                merged.samples[slot].saturating_add(src.samples[slot]);
                             for b in 0..cph::POLICY_COLD_PATH_HIST_BUCKETS {
-                                merged.buckets[slot][b] = merged.buckets
-                                    [slot][b]
-                                    .saturating_add(src.buckets[slot][b]);
+                                merged.buckets[slot][b] =
+                                    merged.buckets[slot][b].saturating_add(src.buckets[slot][b]);
                             }
                             // first_key + builder_collision cross-binding merge.
                             if merged.first_key[slot] == 0 {
@@ -285,8 +277,7 @@ pub(crate) fn worker_loop(
                     // not yet installed).
                     if let Some(first) = bindings.first() {
                         merged.ns_per_tsc_q32 = first.cold_path.ns_per_tsc_q32;
-                        merged.wrapper_ns_baseline =
-                            first.cold_path.wrapper_ns_baseline;
+                        merged.wrapper_ns_baseline = first.cold_path.wrapper_ns_baseline;
                         merged.clock_source = first.cold_path.clock_source;
                     }
                     cold_path_atomics.publish_from_local(&merged);
@@ -307,11 +298,24 @@ pub(crate) fn worker_loop(
             // Compare BEFORE assignment — needs both old and new.
             let cos_changed =
                 cos_runtime_config_changed(forwarding.as_ref(), new_forwarding.as_ref());
-            let (purge_input_dscp_v4, purge_input_dscp_v6) =
+            let (dscp_changed_v4, dscp_changed_v6) =
                 crate::filter::input_dscp_filter_families_changed(
                     &forwarding.filter_state,
                     &new_forwarding.filter_state,
                 );
+            // #2362: a per-packet-L4 (tcp-flags / is-fragment / icmp-type /
+            // icmp-code) input filter rotation has the same revalidation
+            // requirement as a DSCP filter rotation — established sessions whose
+            // first packet was admitted under the old term set must be purged so
+            // the new term is re-evaluated. Fold the two change-sets into one
+            // purge per family.
+            let (per_packet_changed_v4, per_packet_changed_v6) =
+                crate::filter::input_per_packet_l4_filter_families_changed(
+                    &forwarding.filter_state,
+                    &new_forwarding.filter_state,
+                );
+            let purge_input_dscp_v4 = dscp_changed_v4 || per_packet_changed_v4;
+            let purge_input_dscp_v6 = dscp_changed_v6 || per_packet_changed_v6;
 
             // Use NEW values for dependent state updates (forwarding-site
             // ordering — old `forwarding` is stale once rotated).
@@ -355,9 +359,7 @@ pub(crate) fn worker_loop(
                     // (new == None) keeps its stale local data harmlessly
                     // — it is unmapped, never sampled, and gets zeroed
                     // when next reassigned.
-                    if new_pair.is_some()
-                        && new_pair != old_inverse.get(slot).copied().flatten()
-                    {
+                    if new_pair.is_some() && new_pair != old_inverse.get(slot).copied().flatten() {
                         for binding in bindings.iter_mut() {
                             binding.cold_path.zero_slot(slot);
                         }

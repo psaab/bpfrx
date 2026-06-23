@@ -1013,6 +1013,7 @@ pub(super) fn lookup_forwarding_resolution_inner(
 
 pub(super) fn ingress_route_table_override(
     forwarding: &ForwardingState,
+    frame: &[u8],
     meta: UserspaceDpMeta,
     flow: &SessionFlow,
     ingress_zone_override: Option<u16>,
@@ -1033,6 +1034,11 @@ pub(super) fn ingress_route_table_override(
     ) {
         return None;
     }
+    // #2362: PBR terms may carry per-packet L4 match conditions (tcp-flags /
+    // is-fragment / icmp-type / icmp-code); build the extra inputs so a
+    // `from { tcp-flags ...; } then routing-instance ...` term matches exactly
+    // the authored packets.
+    let extra = crate::afxdp::frame::term_match_extra_from_frame(frame, meta);
     let routing_result = crate::filter::evaluate_interface_filter_routing_instance_event_counted(
         &forwarding.filter_state,
         ingress_ifindex,
@@ -1043,6 +1049,7 @@ pub(super) fn ingress_route_table_override(
         flow.forward_key.src_port,
         flow.forward_key.dst_port,
         meta.dscp,
+        extra,
         meta.pkt_len as u64,
     )?;
     if routing_result.log {

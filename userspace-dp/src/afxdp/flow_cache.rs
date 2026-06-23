@@ -316,6 +316,26 @@ impl FlowCacheEntry {
         ) {
             return None;
         }
+        // #2362: same coherency hazard for per-packet L4 match terms
+        // (tcp-flags / is-fragment / icmp-type / icmp-code). They are not in
+        // the 5-tuple flow-cache key and vary per packet within a flow, so a
+        // cached first-packet decision must not be replayed. Decline the cache
+        // whenever the ingress input filter or the resolved egress output
+        // filter carries such a term.
+        if crate::filter::interface_input_filter_has_per_packet_l4_match(
+            &forwarding.filter_state,
+            ingress_ifindex,
+            is_v6,
+        ) {
+            return None;
+        }
+        if crate::filter::interface_output_filter_has_per_packet_l4_match(
+            &forwarding.filter_state,
+            decision.resolution.egress_ifindex,
+            is_v6,
+        ) {
+            return None;
+        }
         // Keep cache invalidation tied to the flow owner RG, not the current
         // fabric parent ifindex. During split-RG operation a live flow can
         // temporarily resolve to FabricRedirect, but failback must still evict
