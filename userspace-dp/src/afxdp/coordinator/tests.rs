@@ -3022,3 +3022,218 @@ fn reconcile_snapshot_integrity_error_sets_observable_stage() {
         "integrity reject must not publish the rejected generation"
     );
 }
+
+// ---------------------------------------------------------------------------
+// #2444 — an OPTIONAL map (conntrack v4/v6, dnat tables) whose pin is
+// PRESENT but fails to open must fail closed exactly like a mandatory map:
+// abort the reconcile in the preflight BEFORE teardown/publish, keeping the
+// prior generation + workers live. An EMPTY pin (feature genuinely absent)
+// must still reconcile normally — the anti-over-gate control.
+// ---------------------------------------------------------------------------
+
+/// Build a snapshot whose three mandatory pins are sentinel-OK (so the
+/// mandatory preflight passes) and `generation` is the new generation the
+/// reconcile would publish if it ran to completion. Optional pins are left
+/// empty by the caller unless explicitly set.
+fn mandatory_ok_snapshot(generation: u64) -> ConfigSnapshot {
+    ConfigSnapshot {
+        generation,
+        map_pins: crate::protocol::snapshot::MapPins {
+            xsk: format!("{TEST_MAP_PIN_OK}xsk"),
+            heartbeat: format!("{TEST_MAP_PIN_OK}heartbeat"),
+            sessions: format!("{TEST_MAP_PIN_OK}sessions"),
+            ..Default::default()
+        },
+        ..Default::default()
+    }
+}
+
+/// fail-on-revert: a PRESENT conntrack_v4 pin that fails to open must
+/// abort the reconcile in the preflight, leaving the prior published
+/// generation intact and recording an observable
+/// `open_conntrack_v4_map_failed:` stage.
+///
+/// Fail-on-revert proof: restoring the pre-#2444
+/// `open_bpf_map(...).ok()` swallows the open error -> the optional map
+/// silently becomes `None`, the reconcile proceeds, and `config_generation`
+/// wrongly advances to the new generation. Every assertion below that the
+/// prior generation survives then fails.
+#[test]
+fn reconcile_present_conntrack_pin_open_failure_keeps_prior_generation() {
+    let mut coordinator = Coordinator::new();
+    let prior = ValidationState {
+        snapshot_installed: true,
+        config_generation: 30,
+        fib_generation: 9,
+    };
+    coordinator.validation = prior;
+    coordinator.shared_validation.store(Arc::new(prior));
+
+    let mut bindings: Vec<BindingStatus> = vec![BindingStatus {
+        slot: 1,
+        interface: "ge-0-0-0".into(),
+        ifindex: 10,
+        registered: true,
+        ..BindingStatus::default()
+    }];
+
+    // Mandatory pins OK; conntrack_v4 pin PRESENT but forced to fail open.
+    let mut snap = mandatory_ok_snapshot(31);
+    snap.map_pins.conntrack_v4 = format!("{TEST_MAP_PIN_FAIL}conntrack_v4");
+
+    coordinator.reconcile(Some(&snap), &mut bindings, 64);
+
+    assert!(
+        coordinator
+            .last_reconcile_stage
+            .starts_with("open_conntrack_v4_map_failed:"),
+        "expected abort at the conntrack_v4 open, got {:?}",
+        coordinator.last_reconcile_stage
+    );
+
+    // FAIL-ON-REVERT CORE: the prior generation is still published.
+    assert_eq!(
+        coordinator.validation.config_generation, 30,
+        "config_generation must NOT advance on a present-but-unopenable optional map"
+    );
+    assert_eq!(coordinator.validation.fib_generation, 9);
+    assert_eq!(
+        (**coordinator.shared_validation.load()).config_generation,
+        30,
+        "shared_validation must still hold the prior generation"
+    );
+    assert!(
+        bindings[0]
+            .last_error
+            .starts_with("open conntrack_v4 map:"),
+        "expected per-binding last_error for the conntrack_v4 open failure, got {:?}",
+        bindings[0].last_error
+    );
+    assert!(
+        coordinator.workers.live.is_empty(),
+        "no workers should be live after an aborted reconcile"
+    );
+}
+
+/// fail-on-revert: same fail-closed behavior for a PRESENT dnat_table pin
+/// that fails to open (embedded-ICMP NAT reversal feature configured but
+/// unopenable -> must block, not run degraded).
+#[test]
+fn reconcile_present_dnat_pin_open_failure_keeps_prior_generation() {
+    let mut coordinator = Coordinator::new();
+    let prior = ValidationState {
+        snapshot_installed: true,
+        config_generation: 40,
+        fib_generation: 12,
+    };
+    coordinator.validation = prior;
+    coordinator.shared_validation.store(Arc::new(prior));
+
+    let mut bindings: Vec<BindingStatus> = vec![BindingStatus {
+        slot: 1,
+        interface: "ge-0-0-0".into(),
+        ifindex: 10,
+        registered: true,
+        ..BindingStatus::default()
+    }];
+
+    // Mandatory + conntrack pins OK; dnat_table pin PRESENT but fails open.
+    let mut snap = mandatory_ok_snapshot(41);
+    snap.map_pins.dnat_table = format!("{TEST_MAP_PIN_FAIL}dnat_table");
+
+    coordinator.reconcile(Some(&snap), &mut bindings, 64);
+
+    assert!(
+        coordinator
+            .last_reconcile_stage
+            .starts_with("open_dnat_table_map_failed:"),
+        "expected abort at the dnat_table open, got {:?}",
+        coordinator.last_reconcile_stage
+    );
+    assert_eq!(
+        coordinator.validation.config_generation, 40,
+        "config_generation must NOT advance on a present-but-unopenable dnat map"
+    );
+    assert_eq!(
+        (**coordinator.shared_validation.load()).config_generation,
+        40
+    );
+    assert!(
+        bindings[0].last_error.starts_with("open dnat_table map:"),
+        "expected per-binding last_error for the dnat_table open failure, got {:?}",
+        bindings[0].last_error
+    );
+}
+
+/// ANTI-OVER-GATE control: when the optional conntrack/dnat pins are EMPTY
+/// (feature genuinely absent — the common deploy), the reconcile must NOT
+/// be gated: the preflight returns `None` silently for each empty pin and
+/// the reconcile proceeds to publish the new generation. This guards
+/// against the fix being too aggressive (treating "feature absent" as a
+/// failure).
+#[test]
+fn reconcile_empty_optional_pins_advance_published_generation() {
+    let mut coordinator = Coordinator::new();
+    let prior = ValidationState {
+        snapshot_installed: true,
+        config_generation: 50,
+        fib_generation: 0,
+    };
+    coordinator.validation = prior;
+    coordinator.shared_validation.store(Arc::new(prior));
+
+    let mut bindings: Vec<BindingStatus> = Vec::new();
+
+    // Mandatory pins OK; ALL optional pins left empty (the default).
+    let snap = mandatory_ok_snapshot(51);
+    assert!(snap.map_pins.conntrack_v4.is_empty());
+    assert!(snap.map_pins.conntrack_v6.is_empty());
+    assert!(snap.map_pins.dnat_table.is_empty());
+    assert!(snap.map_pins.dnat_table_v6.is_empty());
+
+    coordinator.reconcile(Some(&snap), &mut bindings, 64);
+
+    assert_eq!(
+        coordinator.validation.config_generation, 51,
+        "empty optional pins must NOT gate the reconcile (anti-over-gate)"
+    );
+    assert_eq!(
+        (**coordinator.shared_validation.load()).config_generation,
+        51
+    );
+}
+
+/// Positive control: PRESENT optional pins that OPEN OK must reconcile
+/// normally and advance the published generation (the fix accepts a
+/// healthy configured map).
+#[test]
+fn reconcile_present_optional_pins_open_ok_advance_generation() {
+    let mut coordinator = Coordinator::new();
+    let prior = ValidationState {
+        snapshot_installed: true,
+        config_generation: 60,
+        fib_generation: 0,
+    };
+    coordinator.validation = prior;
+    coordinator.shared_validation.store(Arc::new(prior));
+
+    let mut bindings: Vec<BindingStatus> = Vec::new();
+
+    // Mandatory + all optional pins sentinel-OK (present + openable).
+    let mut snap = mandatory_ok_snapshot(61);
+    snap.map_pins.conntrack_v4 = format!("{TEST_MAP_PIN_OK}conntrack_v4");
+    snap.map_pins.conntrack_v6 = format!("{TEST_MAP_PIN_OK}conntrack_v6");
+    snap.map_pins.dnat_table = format!("{TEST_MAP_PIN_OK}dnat_table");
+    snap.map_pins.dnat_table_v6 = format!("{TEST_MAP_PIN_OK}dnat_table_v6");
+
+    coordinator.reconcile(Some(&snap), &mut bindings, 64);
+
+    assert_eq!(
+        coordinator.validation.config_generation, 61,
+        "present + openable optional maps must reconcile normally"
+    );
+    assert_eq!(
+        (**coordinator.shared_validation.load()).config_generation,
+        61
+    );
+}
