@@ -290,24 +290,58 @@ fn slow_path_worker(name: &str, rx: Receiver<PacketRequest>, status: Arc<SharedS
 }
 
 fn write_packet_sync(fd: i32, bytes: &[u8]) -> Result<(), String> {
-    let mut written = 0usize;
-    while written < bytes.len() {
-        let rc = unsafe {
-            libc::write(
-                fd,
-                bytes.as_ptr().add(written).cast::<libc::c_void>(),
-                bytes.len() - written,
-            )
-        };
+    write_packet_atomic(bytes.len(), |buf_len| {
+        // SAFETY: `bytes` is a valid slice for `buf_len` bytes; `fd` is the TUN
+        // fd owned by the worker. Always writes from offset 0 — a TUN write is
+        // one packet, never a partial-offset resubmit.
+        unsafe { libc::write(fd, bytes.as_ptr().cast::<libc::c_void>(), buf_len) }
+    })
+}
+
+/// Write one whole packet to a packet-oriented fd (the TUN device).
+///
+/// A TUN/TAP fd is datagram-like: each successful `write()` injects exactly one
+/// L3 packet. There is no byte-stream resume — re-writing a "remainder" after a
+/// short count would inject the leftover bytes as a SECOND, malformed packet
+/// (#2407). So this never advances an offset:
+///
+///   * `EINTR` — the write never started; retry the WHOLE packet.
+///   * full count (`rc == len`) — success.
+///   * partial (`0 < rc < len`) — the packet is unsendable as written and a
+///     resubmit would corrupt the stream; DROP it (return `Err`, which the
+///     caller counts as a dropped packet + write error).
+///   * `rc == 0` or `rc < 0` (any other errno, incl. `EAGAIN`) — `Err` (drop).
+///
+/// `writer(len)` performs one `write(fd, buf, len)` and returns its raw result
+/// (mirrors `libc::write`: `>=0` byte count, `<0` negated via `errno`). It is a
+/// seam so the short-count / EINTR behaviour is unit-testable without a real fd.
+fn write_packet_atomic<F>(len: usize, mut writer: F) -> Result<(), String>
+where
+    F: FnMut(usize) -> isize,
+{
+    loop {
+        let rc = writer(len);
         if rc < 0 {
-            return Err(format!("slow-path write: {}", io::Error::last_os_error()));
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::Interrupted {
+                // The write was interrupted before transferring any bytes;
+                // retry the whole packet from offset 0.
+                continue;
+            }
+            return Err(format!("slow-path write: {err}"));
         }
-        if rc == 0 {
-            return Err("slow-path write returned 0".to_string());
+        let n = rc as usize;
+        if n == len {
+            return Ok(());
         }
-        written += rc as usize;
+        // A short or zero count on a packet device: the packet cannot be
+        // resumed (re-writing bytes[n..] would inject a corrupt packet), so
+        // drop it. This is unexpected for a valid TUN write; dropping avoids
+        // corrupting the device stream.
+        return Err(format!(
+            "slow-path short write on packet fd: wrote {n} of {len} bytes (packet dropped)"
+        ));
     }
-    Ok(())
 }
 
 fn write_packet_io_uring(ring: &mut IoUring, fd: i32, bytes: &[u8]) -> Result<(), String> {
@@ -458,5 +492,99 @@ mod tests {
         assert_eq!(snap.mode, "io_uring");
         assert_eq!(snap.device_name, "xpf-usp0");
         assert_eq!(snap.last_error, "none");
+    }
+
+    /// A normal full write succeeds in a single `write()` call (no regression).
+    #[test]
+    fn sync_full_write_succeeds_single_call() {
+        let len = 100usize;
+        let mut calls = 0usize;
+        let res = write_packet_atomic(len, |buf_len| {
+            calls += 1;
+            assert_eq!(buf_len, len, "writer must always be handed the full packet");
+            buf_len as isize
+        });
+        assert!(res.is_ok());
+        assert_eq!(calls, 1, "a full write must not loop");
+    }
+
+    /// #2407 fail-on-revert: a short count (0 < n < len) on the packet fd MUST
+    /// drop the packet (Err) — it must NOT issue a follow-up write of the
+    /// remaining bytes. The writer is invoked exactly once and always with the
+    /// FULL length; there is never a `write(bytes[n..])` of length `len - n`.
+    ///
+    /// If the stream-style remainder loop were restored, the writer would be
+    /// called a SECOND time with `len - n` to finish the packet — corrupting the
+    /// TUN. This asserts call count == 1 and that the one call used the full
+    /// length, so a remainder resubmit fails the test.
+    #[test]
+    fn sync_short_write_drops_no_remainder() {
+        let len = 100usize;
+        let mut observed_lens = Vec::new();
+        let res = write_packet_atomic(len, |buf_len| {
+            observed_lens.push(buf_len);
+            40 // partial: 40 of 100
+        });
+        let err = res.unwrap_err();
+        assert!(
+            err.contains("short write on packet fd"),
+            "partial packet write must be a drop, got: {err}"
+        );
+        assert_eq!(
+            observed_lens,
+            vec![len],
+            "a partial write must NOT trigger a remainder write — exactly one \
+             full-length write, never a write of bytes[n..]"
+        );
+    }
+
+    /// EINTR retries the WHOLE packet (offset 0), never a partial offset.
+    #[test]
+    fn sync_eintr_retries_whole_packet() {
+        let len = 100usize;
+        let mut observed_lens = Vec::new();
+        let mut first = true;
+        let res = write_packet_atomic(len, |buf_len| {
+            observed_lens.push(buf_len);
+            if first {
+                first = false;
+                // Simulate write() returning -1 with errno = EINTR.
+                set_errno(libc::EINTR);
+                -1
+            } else {
+                buf_len as isize
+            }
+        });
+        assert!(res.is_ok(), "EINTR must retry, not fail");
+        assert_eq!(
+            observed_lens,
+            vec![len, len],
+            "EINTR retry must re-issue the WHOLE packet, never bytes[n..]"
+        );
+    }
+
+    /// A zero count is treated as a short write and dropped (no infinite loop).
+    #[test]
+    fn sync_zero_write_drops() {
+        let res = write_packet_atomic(100, |_| 0);
+        assert!(res.unwrap_err().contains("short write on packet fd"));
+    }
+
+    /// A hard error (non-EINTR negative) drops the packet.
+    #[test]
+    fn sync_hard_error_drops() {
+        let res = write_packet_atomic(100, |_| {
+            set_errno(libc::EIO);
+            -1
+        });
+        assert!(res.unwrap_err().contains("slow-path write"));
+    }
+
+    /// Set the thread-local errno so the seam can simulate `libc::write`'s
+    /// errno reporting. `io::Error::last_os_error()` reads this.
+    fn set_errno(e: libc::c_int) {
+        unsafe {
+            *libc::__errno_location() = e;
+        }
     }
 }
