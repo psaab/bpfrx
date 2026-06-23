@@ -11824,3 +11824,26 @@ top.
 - **File(s)**: userspace-dp/src/afxdp/frame/inspect.rs,
   userspace-dp/src/afxdp/icmp_ptb_tests.rs,
   userspace-dp/src/afxdp/tests.rs, _Log.md
+
+- **Timestamp**: 2026-06-23
+- **Action**: #2383 — make AF_XDP producer-ring writers append-safe.
+  `WriteTx::insert` / `WriteFill::insert` (userspace-dp/src/xsk_ffi.rs)
+  wrote at `base_idx + n` ignoring `self.written`, so a SECOND insert()
+  on the same reservation would overwrite the slots the first wrote
+  (restart at base+0) while `written` summed across calls — commit()
+  would then submit a descriptor count over partly-uninitialized slots.
+  The bound check `n >= self.reserved` likewise ignored `written`, so a
+  second call could exceed the remaining reservation. LATENT: every
+  current callsite (afxdp/tx/transmit/write.rs, afxdp/tx/rings.rs,
+  afxdp/bind.rs) does exactly one insert per reservation; #2374's
+  fill-ring suffix retry re-`reserve`s a fresh WriteFill per NAPI
+  iteration (device.fill(suffix.len()) + commit) rather than
+  re-inserting, so it does NOT trip the hazard. FIX: index at
+  `base_idx + written + n` (libxdp masks against the ring size) and
+  bound each call by `reserved.saturating_sub(written)`; advance
+  `written` by the count inserted. Single-insert (written==0) behavior
+  unchanged. Added 6 unit tests incl. two-insert append fail-on-revert
+  for both WriteTx and WriteFill (revert to base+n → second insert
+  clobbers base+0 → test fails). Build clean; xsk_ffi tests 7 passed 5x.
+- **File(s)**: userspace-dp/src/xsk_ffi.rs, userspace-dp/README.md,
+  _Log.md
