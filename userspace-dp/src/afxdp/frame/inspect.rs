@@ -551,6 +551,51 @@ pub(in crate::afxdp) fn dest_is_multicast_or_broadcast(addr_family: u8, packet: 
     }
 }
 
+/// #2411: RFC 1812 §4.3.2.7 — a router MUST NOT originate an ICMP error
+/// in reply to a datagram whose IP destination is a *directed* (subnet)
+/// broadcast, e.g. `10.0.1.255` for a connected `10.0.1.0/24`. Unlike
+/// the limited broadcast (`255.255.255.255`, caught by
+/// [`dest_is_multicast_or_broadcast`]'s `is_broadcast()`), a directed
+/// broadcast is a normal unicast address to the L3 destination test —
+/// recognizing it requires the configured subnet MASK, which only the
+/// forwarding state's connected-route table carries. This is the
+/// per-interface-prefix sibling of [`dest_is_multicast_or_broadcast`]
+/// (L3 group/limited-broadcast), [`l2_dst_is_group_or_broadcast`] (L2),
+/// and [`source_is_invalid_for_icmp_error`] (L3 source); it is shared by
+/// the reject / Time-Exceeded path (`can_generate_icmp_error_reply`) and
+/// the PTB path (`ptb_reply_suppressed`) so every locally generated ICMP
+/// error applies the SAME directed-broadcast gate.
+///
+/// IPv4-only: IPv6 has no broadcast (the v6 caller never invokes this).
+/// `packet` is the L3 (IP-header-first) slice. Returns `true` when the
+/// destination is the all-ones host address of a connected prefix and
+/// the ICMP error MUST be suppressed. A too-short slice fails closed
+/// (suppress). The connected table is reused from the forwarding path
+/// (no new infrastructure); the scan is the same `connected_v4.iter()`
+/// the FIB lookup already does, on a cold (error-generation) path only.
+///
+/// Prefixes shorter than /31 are the only ones with a meaningful
+/// directed broadcast: a /31 (RFC 3021) has no broadcast and a /32's
+/// host-all-ones value equals the host itself, so both are skipped to
+/// avoid mis-suppressing a legitimate unicast to a /32 connected host.
+#[inline]
+pub(in crate::afxdp) fn dest_is_directed_broadcast(
+    forwarding: &ForwardingState,
+    packet: &[u8],
+) -> bool {
+    let Some(dst) = packet.get(16..20) else {
+        // Fail closed: a destination we cannot read must suppress the
+        // error rather than risk directed-broadcast backscatter.
+        return true;
+    };
+    let dst = Ipv4Addr::new(dst[0], dst[1], dst[2], dst[3]);
+    forwarding.connected_v4.iter().any(|entry| {
+        entry.prefix.prefix_len() < 31
+            && entry.prefix.contains(dst)
+            && entry.prefix.directed_broadcast() == dst
+    })
+}
+
 /// #2367: RFC 1812 §4.3.2.7 / RFC 4443 §2.4(e) — a router MUST NOT
 /// originate an ICMP/ICMPv6 *error* in response to a datagram whose IP
 /// SOURCE address does not uniquely identify a single host. A locally

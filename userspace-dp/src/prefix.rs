@@ -30,6 +30,17 @@ impl PrefixV4 {
     pub(crate) fn addr(&self) -> Ipv4Addr {
         Ipv4Addr::from(self.network)
     }
+
+    /// The IPv4 subnet-directed broadcast address of this prefix: the
+    /// network address with an all-ones host part (`network | !mask`).
+    /// RFC 1812 §4.3.2.7 — a router MUST NOT originate an ICMP error to a
+    /// directed broadcast. For /31 (RFC 3021 point-to-point, no broadcast)
+    /// and /32 (`network | !mask` == the host itself) the host-all-ones
+    /// value is not a real broadcast; callers guard those prefix lengths
+    /// before comparing (see `dest_is_directed_broadcast`).
+    pub(crate) fn directed_broadcast(&self) -> Ipv4Addr {
+        Ipv4Addr::from(self.network | !self.mask)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

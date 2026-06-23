@@ -28,7 +28,18 @@ pub(super) const FABRIC_INGRESS_FLAG: u8 = 0x80;
 /// `protocol`/`icmp_type`/fragment status are read from the inbound
 /// frame; the L4/ICMP-type read uses `meta.l4_offset`, which the shim
 /// fills for ICMP, matching [`build_reject_icmp_unreachable`].
-pub(super) fn can_generate_icmp_error_reply(frame: &[u8], meta: UserspaceDpMeta) -> bool {
+///
+/// `forwarding` supplies the connected-route table for the #2411
+/// directed-broadcast check (RFC 1812 §4.3.2.7): an IPv4 destination
+/// that is the all-ones host address of a configured connected subnet
+/// (e.g. `10.0.1.255` for `10.0.1.0/24`) is a subnet-directed broadcast
+/// and must also suppress the error. This is a cold-path lookup only —
+/// the gate runs solely when an error is about to be generated.
+pub(super) fn can_generate_icmp_error_reply(
+    frame: &[u8],
+    meta: UserspaceDpMeta,
+    forwarding: &ForwardingState,
+) -> bool {
     let l3 = match meta.l3_offset {
         14 | 18 => meta.l3_offset as usize,
         _ => match frame_l3_offset(frame) {
@@ -66,8 +77,12 @@ pub(super) fn can_generate_icmp_error_reply(frame: &[u8], meta: UserspaceDpMeta)
             // tests route through the shared predicates (#2367 source,
             // #2314 destination) so the PTB, reject, and Time Exceeded
             // paths agree on the disallowed source/destination sets.
+            // #2411: also suppress for an IPv4 subnet-directed broadcast
+            // (all-ones host of a connected prefix) — invisible to the
+            // limited-broadcast test, needs the connected subnet mask.
             if source_is_invalid_for_icmp_error(meta.addr_family, packet)
                 || dest_is_multicast_or_broadcast(meta.addr_family, packet)
+                || dest_is_directed_broadcast(forwarding, packet)
             {
                 return false;
             }
@@ -142,7 +157,7 @@ pub(super) fn build_local_time_exceeded_request(
     // originate a Time Exceeded in reply to an ICMP error, a non-first
     // fragment, a group/broadcast destination, or a bogus source. The
     // sibling reject path enforces the same contract via this gate.
-    if !can_generate_icmp_error_reply(frame, meta) {
+    if !can_generate_icmp_error_reply(frame, meta, forwarding) {
         return None;
     }
 
@@ -493,7 +508,7 @@ pub(super) fn build_reject_icmp_unreachable(
     // Subsumes the prior inline non-first-fragment and inbound-ICMP-error
     // checks and additionally suppresses group/broadcast destinations and
     // bogus sources — the same contract the Time Exceeded path now uses.
-    if !can_generate_icmp_error_reply(frame, meta) {
+    if !can_generate_icmp_error_reply(frame, meta, forwarding) {
         return None;
     }
     match meta.addr_family as i32 {
@@ -768,7 +783,7 @@ mod tests {
         let (mut frame, meta) = inbound_v4(InL2::Untagged);
         set_inbound_v4_dst(&mut frame, meta, Ipv4Addr::new(239, 1, 2, 3));
         assert!(
-            !can_generate_icmp_error_reply(&frame, meta),
+            !can_generate_icmp_error_reply(&frame, meta, &forwarding_with_egress(0)),
             "IPv4 multicast destination must suppress the reply"
         );
         let fwd = forwarding_with_egress(0);
@@ -785,8 +800,71 @@ mod tests {
         let (mut frame, meta) = inbound_v4(InL2::Untagged);
         set_inbound_v4_dst(&mut frame, meta, Ipv4Addr::new(255, 255, 255, 255));
         assert!(
-            !can_generate_icmp_error_reply(&frame, meta),
+            !can_generate_icmp_error_reply(&frame, meta, &forwarding_with_egress(0)),
             "IPv4 limited broadcast destination must suppress the reply"
+        );
+    }
+
+    /// #2411: a `ForwardingState` whose connected v4 table holds a single
+    /// connected prefix, so the directed-broadcast gate has a subnet mask
+    /// to test the trigger destination against.
+    fn forwarding_with_connected_v4(cidr: &str) -> ForwardingState {
+        let mut state = forwarding_with_egress(0);
+        state.connected_v4.push(ConnectedRouteV4 {
+            prefix: crate::prefix::PrefixV4::from_net(cidr.parse().expect("cidr")),
+            ifindex: ICMP_IFINDEX,
+            tunnel_endpoint_id: 0,
+        });
+        state
+    }
+
+    /// #2411: an IPv4 trigger destined to a SUBNET-DIRECTED broadcast
+    /// (the all-ones host of a configured connected prefix, e.g.
+    /// 10.0.1.255 for 10.0.1.0/24) must suppress the locally generated
+    /// ICMP error (RFC 1812 §4.3.2.7) even though it is a plain unicast
+    /// address to the limited-broadcast / multicast tests. Fails (error
+    /// generated) if the `dest_is_directed_broadcast` check is removed.
+    #[test]
+    fn reject_suppressed_for_v4_directed_broadcast_dst() {
+        let (mut frame, meta) = inbound_v4(InL2::Untagged);
+        set_inbound_v4_dst(&mut frame, meta, Ipv4Addr::new(10, 0, 1, 255));
+        let fwd = forwarding_with_connected_v4("10.0.1.0/24");
+        assert!(
+            !can_generate_icmp_error_reply(&frame, meta, &fwd),
+            "IPv4 subnet-directed broadcast must suppress the reply"
+        );
+        assert!(
+            build_reject_icmp_unreachable(&frame, meta, ICMP_IFINDEX, &fwd).is_none(),
+            "reject unreachable must not build for a directed broadcast"
+        );
+    }
+
+    /// #2411 anti-over-suppress: a normal unicast HOST inside the same
+    /// connected subnet (10.0.1.42 in 10.0.1.0/24) must STILL generate
+    /// the error — only the all-ones host is the directed broadcast.
+    #[test]
+    fn reject_still_allowed_for_unicast_in_connected_subnet() {
+        let (mut frame, meta) = inbound_v4(InL2::Untagged);
+        set_inbound_v4_dst(&mut frame, meta, Ipv4Addr::new(10, 0, 1, 42));
+        let fwd = forwarding_with_connected_v4("10.0.1.0/24");
+        assert!(
+            can_generate_icmp_error_reply(&frame, meta, &fwd),
+            "a unicast host inside a connected subnet must allow the reply"
+        );
+    }
+
+    /// #2411 fail-on-revert guard for the prefix-length skip: the .255
+    /// host of a /32 connected prefix is the host itself, NOT a directed
+    /// broadcast, so a normal unicast to a /32 host must NOT be
+    /// suppressed (the `prefix_len() < 31` guard keeps it allowed).
+    #[test]
+    fn reject_still_allowed_for_v4_host_route_all_ones_octet() {
+        let (mut frame, meta) = inbound_v4(InL2::Untagged);
+        set_inbound_v4_dst(&mut frame, meta, Ipv4Addr::new(10, 0, 1, 255));
+        let fwd = forwarding_with_connected_v4("10.0.1.255/32");
+        assert!(
+            can_generate_icmp_error_reply(&frame, meta, &fwd),
+            "a /32 connected host must not be treated as a directed broadcast"
         );
     }
 
@@ -796,7 +874,7 @@ mod tests {
     fn reject_suppressed_for_v6_multicast_dst() {
         let (frame, meta) = inbound_v6_to("ff02::1".parse().expect("v6 mcast"));
         assert!(
-            !can_generate_icmp_error_reply(&frame, meta),
+            !can_generate_icmp_error_reply(&frame, meta, &forwarding_with_egress(0)),
             "IPv6 multicast destination must suppress the reply"
         );
         let fwd = forwarding_with_egress(0);
@@ -814,7 +892,7 @@ mod tests {
         // IPv4 default destination 172.16.80.200 is plain unicast.
         let (frame4, meta4) = inbound_v4(InL2::Untagged);
         assert!(
-            can_generate_icmp_error_reply(&frame4, meta4),
+            can_generate_icmp_error_reply(&frame4, meta4, &forwarding_with_egress(0)),
             "a unicast IPv4 destination must allow the reply"
         );
         let fwd = forwarding_with_egress(0);
@@ -825,7 +903,7 @@ mod tests {
         // IPv6 global unicast destination.
         let (frame6, meta6) = inbound_v6_to("2001:559:8585:80::200".parse().expect("v6 ucast"));
         assert!(
-            can_generate_icmp_error_reply(&frame6, meta6),
+            can_generate_icmp_error_reply(&frame6, meta6, &forwarding_with_egress(0)),
             "a unicast IPv6 destination must allow the reply"
         );
     }
