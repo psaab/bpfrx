@@ -11388,3 +11388,34 @@ top.
 - **File(s)**: pkg/config/types_system.go, pkg/config/compiler_firewall.go,
     pkg/config/compiler_validate_strict.go,
     pkg/config/compiler_filter_action_test.go, docs/config-schema.md, _Log.md
+
+- **Timestamp**: 2026-06-23
+- **Action**: #2400 — fail-close all-malformed firewall-filter address/port
+    match sets (codex 032-18 addresses, 032-19 ports). A filter term whose
+    `source-address` / `destination-address` / `source-port` /
+    `destination-port` set was non-empty in the config but whose entries ALL
+    failed to parse degraded to match-ANY on that dimension (empty parsed list =
+    no constraint) — a `discard` term scoped to typo'd addresses became
+    discard-all (fail-OPEN broadening). Mirror of the #2398 (SNAT) / #2394
+    (DNAT) `*_constrained` fix. Added `source_addr_constrained` /
+    `dest_addr_constrained` / `source_port_constrained` / `dest_port_constrained`
+    to FilterTerm, DERIVED at compile time from the snapshot list holding a real
+    entry (`addr_is_real` skips ""/"any"; `port_is_real` skips ""). Matcher
+    helpers `nets_match_v4`/`nets_match_v6`/`port_match` (engine/matching.rs):
+    unconstrained → match any; constrained but parsed set empty → match NOTHING
+    (fail closed); else parsed prefix/range. Bare-host address already handled by
+    parse_address's bare-IP /32//128 fallback (kept). Flags also added to
+    filter_term_semantics_match (cache_sensitive.rs) so the unscoped↔all-
+    malformed flip is caught on flow-cache rebuild. NO new wire field
+    (protocol_wire_v1.json unchanged). 10 new fail-on-revert tests (all-malformed
+    src/dst address v4+v6, all-malformed src/dst port, bare-host scope,
+    valid-unscoped-matches-all, valid-scoped-matches-only-its-scope, compose with
+    #2362 tcp-flags + #2399 action, partial-malformed keeps valid scope) —
+    revert-proven: reverting the matcher to fail-open fails 6 of them.
+    cargo build --release + cargo test -- filter (133) green, 5x stable; go build
+    + go test ./pkg/config ./pkg/dataplane ./pkg/dataplane/userspace green.
+- **File(s)**: userspace-dp/src/filter/mod.rs,
+    userspace-dp/src/filter/compiler.rs,
+    userspace-dp/src/filter/engine/matching.rs,
+    userspace-dp/src/filter/engine/cache_sensitive.rs,
+    userspace-dp/src/filter/tests.rs, userspace-dp/src/filter/README.md, _Log.md

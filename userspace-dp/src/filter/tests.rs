@@ -3489,3 +3489,465 @@ fn empty_action_falls_through_to_accept() {
         "an empty (no terminating) action must keep fall-through accept semantics"
     );
 }
+
+// ============================================================
+// #2400 (codex 032-18 / 032-19): all-malformed firewall-filter
+// addresses/ports must FAIL CLOSED (match nothing), never degrade to
+// match-any (fail-open filter broadening). A `discard` term scoped to
+// an all-malformed address/port set must NOT become discard-all.
+//
+// The fail-on-revert pivot: the filter's implicit (no-term-match) action
+// is Accept (see evaluate_filter docstring). So a single `discard` term
+// scoped to bad addresses/ports yields Accept when the term correctly
+// matches NOTHING, and Discard if it wrongly broadens to match-any.
+// ============================================================
+
+/// One `discard` term scoped to an all-malformed source-address list. The fix
+/// makes the term match nothing -> the packet falls through to implicit Accept.
+/// REVERT (empty parsed list -> match-any) makes the term match every packet ->
+/// Discard, failing this assert.
+#[test]
+fn term_2400_all_malformed_source_address_fails_closed_v4() {
+    let state = make_filter_state(
+        &[FirewallFilterSnapshot {
+            name: "scoped-discard".into(),
+            family: "inet".into(),
+            terms: vec![FirewallTermSnapshot {
+                name: "drop-bad-src".into(),
+                // Every entry is unparseable as an IP/CIDR.
+                source_addresses: vec!["not-an-ip".into(), "10.0.0.0/99".into()],
+                action: "discard".into(),
+                ..Default::default()
+            }],
+        }],
+        &[],
+    );
+    let result = evaluate_filter(
+        &state,
+        "inet:scoped-discard",
+        IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)),
+        IpAddr::V4(Ipv4Addr::new(198, 51, 100, 9)),
+        PROTO_TCP,
+        12345,
+        443,
+        0,
+        TermMatchExtra::default(),
+    );
+    assert_eq!(
+        result.action,
+        FilterAction::Accept,
+        "all-malformed source-address must fail CLOSED (term matches nothing -> \
+         implicit accept); a match-any regression would Discard"
+    );
+}
+
+/// Same for destination-address.
+#[test]
+fn term_2400_all_malformed_destination_address_fails_closed_v4() {
+    let state = make_filter_state(
+        &[FirewallFilterSnapshot {
+            name: "scoped-discard".into(),
+            family: "inet".into(),
+            terms: vec![FirewallTermSnapshot {
+                name: "drop-bad-dst".into(),
+                destination_addresses: vec!["garbage".into(), "999.1.2.3".into()],
+                action: "discard".into(),
+                ..Default::default()
+            }],
+        }],
+        &[],
+    );
+    let result = evaluate_filter(
+        &state,
+        "inet:scoped-discard",
+        IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)),
+        IpAddr::V4(Ipv4Addr::new(198, 51, 100, 9)),
+        PROTO_TCP,
+        12345,
+        443,
+        0,
+        TermMatchExtra::default(),
+    );
+    assert_eq!(
+        result.action,
+        FilterAction::Accept,
+        "all-malformed destination-address must fail CLOSED"
+    );
+}
+
+/// v6 sibling: all-malformed source-address in an inet6 filter.
+#[test]
+fn term_2400_all_malformed_source_address_fails_closed_v6() {
+    let state = make_filter_state(
+        &[FirewallFilterSnapshot {
+            name: "scoped-discard6".into(),
+            family: "inet6".into(),
+            terms: vec![FirewallTermSnapshot {
+                name: "drop-bad-src6".into(),
+                source_addresses: vec!["xyzzy".into(), "2001:db8::/200".into()],
+                action: "discard".into(),
+                ..Default::default()
+            }],
+        }],
+        &[],
+    );
+    let result = evaluate_filter(
+        &state,
+        "inet6:scoped-discard6",
+        IpAddr::V6("2001:db8::10".parse().unwrap()),
+        IpAddr::V6("2001:db8::200".parse().unwrap()),
+        PROTO_TCP,
+        12345,
+        443,
+        0,
+        TermMatchExtra::default(),
+    );
+    assert_eq!(
+        result.action,
+        FilterAction::Accept,
+        "all-malformed inet6 source-address must fail CLOSED"
+    );
+}
+
+/// All-malformed source-port set -> fail closed.
+#[test]
+fn term_2400_all_malformed_source_port_fails_closed() {
+    let state = make_filter_state(
+        &[FirewallFilterSnapshot {
+            name: "scoped-discard".into(),
+            family: "inet".into(),
+            terms: vec![FirewallTermSnapshot {
+                name: "drop-bad-sport".into(),
+                // Unparseable port specs: a name not in the table, an out-of-range
+                // number, and an inverted range.
+                source_ports: vec!["nonsense".into(), "70000".into(), "100-50".into()],
+                action: "discard".into(),
+                ..Default::default()
+            }],
+        }],
+        &[],
+    );
+    let result = evaluate_filter(
+        &state,
+        "inet:scoped-discard",
+        IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)),
+        IpAddr::V4(Ipv4Addr::new(198, 51, 100, 9)),
+        PROTO_TCP,
+        40000,
+        443,
+        0,
+        TermMatchExtra::default(),
+    );
+    assert_eq!(
+        result.action,
+        FilterAction::Accept,
+        "all-malformed source-port must fail CLOSED (term matches nothing); a \
+         PortMatcher::Any regression would Discard"
+    );
+}
+
+/// All-malformed destination-port set -> fail closed.
+#[test]
+fn term_2400_all_malformed_destination_port_fails_closed() {
+    let state = make_filter_state(
+        &[FirewallFilterSnapshot {
+            name: "scoped-discard".into(),
+            family: "inet".into(),
+            terms: vec![FirewallTermSnapshot {
+                name: "drop-bad-dport".into(),
+                destination_ports: vec!["bogus".into(), "0".into()],
+                action: "discard".into(),
+                ..Default::default()
+            }],
+        }],
+        &[],
+    );
+    let result = evaluate_filter(
+        &state,
+        "inet:scoped-discard",
+        IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)),
+        IpAddr::V4(Ipv4Addr::new(198, 51, 100, 9)),
+        PROTO_TCP,
+        40000,
+        443,
+        0,
+        TermMatchExtra::default(),
+    );
+    assert_eq!(
+        result.action,
+        FilterAction::Accept,
+        "all-malformed destination-port must fail CLOSED"
+    );
+}
+
+/// A bare-host match address (no /prefix) scopes correctly: the matching host
+/// hits the term, a different host does not (anti-over-restrict + anti-fail-open
+/// at once). IpNet::parse rejects a bare IP, so this exercises the bare-IP
+/// fallback to /32.
+#[test]
+fn term_2400_bare_host_source_address_scopes_correctly() {
+    let state = make_filter_state(
+        &[FirewallFilterSnapshot {
+            name: "scoped-discard".into(),
+            family: "inet".into(),
+            terms: vec![FirewallTermSnapshot {
+                name: "drop-one-host".into(),
+                source_addresses: vec!["203.0.113.7".into()], // bare host, no /32
+                action: "discard".into(),
+                ..Default::default()
+            }],
+        }],
+        &[],
+    );
+    // The configured host is dropped.
+    let hit = evaluate_filter(
+        &state,
+        "inet:scoped-discard",
+        IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)),
+        IpAddr::V4(Ipv4Addr::new(198, 51, 100, 9)),
+        PROTO_TCP,
+        12345,
+        443,
+        0,
+        TermMatchExtra::default(),
+    );
+    assert_eq!(
+        hit.action,
+        FilterAction::Discard,
+        "bare-host source-address must match the configured host (bare-IP /32 fallback)"
+    );
+    // A different host is NOT dropped (falls through to implicit accept).
+    let miss = evaluate_filter(
+        &state,
+        "inet:scoped-discard",
+        IpAddr::V4(Ipv4Addr::new(203, 0, 113, 8)),
+        IpAddr::V4(Ipv4Addr::new(198, 51, 100, 9)),
+        PROTO_TCP,
+        12345,
+        443,
+        0,
+        TermMatchExtra::default(),
+    );
+    assert_eq!(
+        miss.action,
+        FilterAction::Accept,
+        "a non-configured host must NOT match the bare-host-scoped term"
+    );
+}
+
+/// Anti-over-restrict: a VALID UNSCOPED discard term (no address/port) still
+/// matches everything. The constrained flags must not narrow a genuinely
+/// unscoped term.
+#[test]
+fn term_2400_valid_unscoped_term_still_matches_all() {
+    let state = make_filter_state(
+        &[FirewallFilterSnapshot {
+            name: "unscoped".into(),
+            family: "inet".into(),
+            terms: vec![FirewallTermSnapshot {
+                name: "drop-all".into(),
+                // no source/destination addresses, no ports.
+                action: "discard".into(),
+                ..Default::default()
+            }],
+        }],
+        &[],
+    );
+    let result = evaluate_filter(
+        &state,
+        "inet:unscoped",
+        IpAddr::V4(Ipv4Addr::new(203, 0, 113, 7)),
+        IpAddr::V4(Ipv4Addr::new(198, 51, 100, 9)),
+        PROTO_TCP,
+        12345,
+        443,
+        0,
+        TermMatchExtra::default(),
+    );
+    assert_eq!(
+        result.action,
+        FilterAction::Discard,
+        "a valid unscoped term must still match all traffic (no over-restriction)"
+    );
+}
+
+/// Anti-over-restrict: a VALID SCOPED term matches only its address and port,
+/// and falls through (accept) for everything else.
+#[test]
+fn term_2400_valid_scoped_term_matches_only_its_scope() {
+    let state = make_filter_state(
+        &[FirewallFilterSnapshot {
+            name: "scoped".into(),
+            family: "inet".into(),
+            terms: vec![FirewallTermSnapshot {
+                name: "drop-net-port".into(),
+                source_addresses: vec!["203.0.113.0/24".into()],
+                protocols: vec!["tcp".into()],
+                destination_ports: vec!["443".into()],
+                action: "discard".into(),
+                ..Default::default()
+            }],
+        }],
+        &[],
+    );
+    // In-scope: matches -> discard.
+    let in_scope = evaluate_filter(
+        &state,
+        "inet:scoped",
+        IpAddr::V4(Ipv4Addr::new(203, 0, 113, 50)),
+        IpAddr::V4(Ipv4Addr::new(198, 51, 100, 9)),
+        PROTO_TCP,
+        12345,
+        443,
+        0,
+        TermMatchExtra::default(),
+    );
+    assert_eq!(in_scope.action, FilterAction::Discard, "in-scope must match");
+    // Wrong port: out of scope -> accept.
+    let wrong_port = evaluate_filter(
+        &state,
+        "inet:scoped",
+        IpAddr::V4(Ipv4Addr::new(203, 0, 113, 50)),
+        IpAddr::V4(Ipv4Addr::new(198, 51, 100, 9)),
+        PROTO_TCP,
+        12345,
+        80,
+        0,
+        TermMatchExtra::default(),
+    );
+    assert_eq!(
+        wrong_port.action,
+        FilterAction::Accept,
+        "a valid scoped term must NOT match a packet outside its port scope"
+    );
+    // Wrong source: out of scope -> accept.
+    let wrong_src = evaluate_filter(
+        &state,
+        "inet:scoped",
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+        IpAddr::V4(Ipv4Addr::new(198, 51, 100, 9)),
+        PROTO_TCP,
+        12345,
+        443,
+        0,
+        TermMatchExtra::default(),
+    );
+    assert_eq!(
+        wrong_src.action,
+        FilterAction::Accept,
+        "a valid scoped term must NOT match a packet outside its address scope"
+    );
+}
+
+/// Composition with #2362 (tcp-flags) and #2399 (action) intact: a term that
+/// mixes a VALID scope with a tcp-flags constraint matches only the in-scope
+/// SYN packet, and an all-malformed address with the same tcp-flags still fails
+/// closed (does not broaden to match-any-SYN).
+#[test]
+fn term_2400_composes_with_2362_tcp_flags() {
+    // Valid scope + tcp-flags syn -> matches the in-scope SYN.
+    let state = make_filter_state(
+        &[FirewallFilterSnapshot {
+            name: "syn-scoped".into(),
+            family: "inet".into(),
+            terms: vec![FirewallTermSnapshot {
+                name: "drop-syn-from-net".into(),
+                source_addresses: vec!["203.0.113.0/24".into()],
+                tcp_flags: Some(0x02), // SYN
+                action: "discard".into(),
+                ..Default::default()
+            }],
+        }],
+        &[],
+    );
+    let syn_extra = TermMatchExtra {
+        tcp_flags: 0x02,
+        l4_present: true,
+        ..Default::default()
+    };
+    let in_scope_syn = evaluate_filter(
+        &state,
+        "inet:syn-scoped",
+        IpAddr::V4(Ipv4Addr::new(203, 0, 113, 50)),
+        IpAddr::V4(Ipv4Addr::new(198, 51, 100, 9)),
+        PROTO_TCP,
+        12345,
+        443,
+        0,
+        syn_extra,
+    );
+    assert_eq!(
+        in_scope_syn.action,
+        FilterAction::Discard,
+        "valid scope + tcp-flags must still match the in-scope SYN (#2362 intact)"
+    );
+
+    // All-malformed address + the same tcp-flags -> fail closed even for a SYN.
+    let bad_state = make_filter_state(
+        &[FirewallFilterSnapshot {
+            name: "syn-bad".into(),
+            family: "inet".into(),
+            terms: vec![FirewallTermSnapshot {
+                name: "drop-syn-bad-src".into(),
+                source_addresses: vec!["not-an-ip".into()],
+                tcp_flags: Some(0x02),
+                action: "discard".into(),
+                ..Default::default()
+            }],
+        }],
+        &[],
+    );
+    let bad_syn = evaluate_filter(
+        &bad_state,
+        "inet:syn-bad",
+        IpAddr::V4(Ipv4Addr::new(203, 0, 113, 50)),
+        IpAddr::V4(Ipv4Addr::new(198, 51, 100, 9)),
+        PROTO_TCP,
+        12345,
+        443,
+        0,
+        syn_extra,
+    );
+    assert_eq!(
+        bad_syn.action,
+        FilterAction::Accept,
+        "all-malformed address + tcp-flags must fail CLOSED, not broaden to match-any-SYN"
+    );
+}
+
+/// A term mixing one VALID and one malformed address keeps the valid scope
+/// (the malformed entry is dropped, the term stays constrained and matches the
+/// valid prefix only). This guards against an over-correction that would fail
+/// the whole term closed when ANY entry is bad.
+#[test]
+fn term_2400_partial_malformed_address_keeps_valid_scope() {
+    let state = make_filter_state(
+        &[FirewallFilterSnapshot {
+            name: "partial".into(),
+            family: "inet".into(),
+            terms: vec![FirewallTermSnapshot {
+                name: "drop-mixed".into(),
+                source_addresses: vec!["203.0.113.0/24".into(), "garbage".into()],
+                action: "discard".into(),
+                ..Default::default()
+            }],
+        }],
+        &[],
+    );
+    let in_valid = evaluate_filter(
+        &state,
+        "inet:partial",
+        IpAddr::V4(Ipv4Addr::new(203, 0, 113, 50)),
+        IpAddr::V4(Ipv4Addr::new(198, 51, 100, 9)),
+        PROTO_TCP,
+        12345,
+        443,
+        0,
+        TermMatchExtra::default(),
+    );
+    assert_eq!(
+        in_valid.action,
+        FilterAction::Discard,
+        "the surviving valid prefix must still match (partial-malformed != all-malformed)"
+    );
+}

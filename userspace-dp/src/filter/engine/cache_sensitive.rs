@@ -125,10 +125,19 @@ fn filter_term_semantics_match(old: &FilterTerm, new: &FilterTerm) -> bool {
         && old.source_v6 == new.source_v6
         && old.dest_v4 == new.dest_v4
         && old.dest_v6 == new.dest_v6
+        // #2400: the *_constrained flags change match semantics (fail-closed vs
+        // match-any) WITHOUT changing the parsed vecs/matcher in the
+        // unscoped<->all-malformed transition (both leave empty vecs /
+        // PortMatcher::Any), so they MUST be compared here or a flow-cache
+        // rebuild would keep stale match-any decisions.
+        && old.source_addr_constrained == new.source_addr_constrained
+        && old.dest_addr_constrained == new.dest_addr_constrained
         && old.protocol_bitmap == new.protocol_bitmap
         && old.protocol_match_enabled == new.protocol_match_enabled
         && old.source_ports == new.source_ports
         && old.dest_ports == new.dest_ports
+        && old.source_port_constrained == new.source_port_constrained
+        && old.dest_port_constrained == new.dest_port_constrained
         && old.dscp_bitmap == new.dscp_bitmap
         && old.dscp_match_enabled == new.dscp_match_enabled
         && old.tcp_flags_mask == new.tcp_flags_mask

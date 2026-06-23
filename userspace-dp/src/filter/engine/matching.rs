@@ -100,16 +100,16 @@ pub(super) fn term_matches_v4(
     {
         return false;
     }
-    if !term.source_v4.is_empty() && !term.source_v4.iter().any(|net| net.contains(src_ip)) {
+    if !nets_match_v4(term.source_addr_constrained, &term.source_v4, src_ip) {
         return false;
     }
-    if !term.dest_v4.is_empty() && !term.dest_v4.iter().any(|net| net.contains(dst_ip)) {
+    if !nets_match_v4(term.dest_addr_constrained, &term.dest_v4, dst_ip) {
         return false;
     }
-    if !term.source_ports.matches(src_port) {
+    if !port_match(term.source_port_constrained, &term.source_ports, src_port) {
         return false;
     }
-    if !term.dest_ports.matches(dst_port) {
+    if !port_match(term.dest_port_constrained, &term.dest_ports, dst_port) {
         return false;
     }
     if term.dscp_match_enabled && (term.dscp_bitmap & (1u64 << dscp)) == 0 {
@@ -119,6 +119,58 @@ pub(super) fn term_matches_v4(
         return false;
     }
     true
+}
+
+/// #2400 (032-18): match a v4 IP against a filter term's address set with
+/// fail-closed semantics for an all-malformed list.
+///
+/// - `constrained == false` (the term carried no real source/dest address):
+///   match any IP — unchanged unscoped behavior.
+/// - `constrained == true` but `nets` empty (every configured prefix failed to
+///   parse for this family): match NOTHING — fail closed, never the pre-#2400
+///   collapse to the empty-list match-any fail-open broadening.
+/// - otherwise: the IP must fall in one of the parsed prefixes.
+///
+/// Mirrors `nat::source::nets_match_v4` (#2398).
+#[inline(always)]
+fn nets_match_v4(constrained: bool, nets: &[PrefixV4], ip: Ipv4Addr) -> bool {
+    if !constrained {
+        return true;
+    }
+    if nets.is_empty() {
+        return false;
+    }
+    nets.iter().any(|net| net.contains(ip))
+}
+
+/// #2400 (032-18): v6 sibling of `nets_match_v4`.
+#[inline(always)]
+fn nets_match_v6(constrained: bool, nets: &[PrefixV6], ip: Ipv6Addr) -> bool {
+    if !constrained {
+        return true;
+    }
+    if nets.is_empty() {
+        return false;
+    }
+    nets.iter().any(|net| net.contains(ip))
+}
+
+/// #2400 (032-19): match a port against a filter term's port matcher with
+/// fail-closed semantics for an all-malformed list.
+///
+/// - `constrained == false` (the term carried no real port spec): the matcher
+///   is `PortMatcher::Any` and matches any port — unchanged unscoped behavior.
+/// - `constrained == true` but the matcher is `PortMatcher::Any` (every
+///   configured port spec failed to parse, leaving zero ranges): match NOTHING
+///   — fail closed.
+/// - otherwise: the matcher's own range/set logic applies.
+#[inline(always)]
+fn port_match(constrained: bool, matcher: &PortMatcher, port: u16) -> bool {
+    if constrained && matches!(matcher, PortMatcher::Any) {
+        // Constrained but no range survived parsing -> fail closed.
+        return false;
+    }
+    matcher.matches(port)
 }
 
 #[inline(always)]
@@ -138,16 +190,16 @@ pub(super) fn term_matches_v6(
     {
         return false;
     }
-    if !term.source_v6.is_empty() && !term.source_v6.iter().any(|net| net.contains(src_ip)) {
+    if !nets_match_v6(term.source_addr_constrained, &term.source_v6, src_ip) {
         return false;
     }
-    if !term.dest_v6.is_empty() && !term.dest_v6.iter().any(|net| net.contains(dst_ip)) {
+    if !nets_match_v6(term.dest_addr_constrained, &term.dest_v6, dst_ip) {
         return false;
     }
-    if !term.source_ports.matches(src_port) {
+    if !port_match(term.source_port_constrained, &term.source_ports, src_port) {
         return false;
     }
-    if !term.dest_ports.matches(dst_port) {
+    if !port_match(term.dest_port_constrained, &term.dest_ports, dst_port) {
         return false;
     }
     if term.dscp_match_enabled && (term.dscp_bitmap & (1u64 << dscp)) == 0 {
