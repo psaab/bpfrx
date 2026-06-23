@@ -168,6 +168,24 @@ User-based policy enforcement integrating with directory services. Not implement
 
 xpf has SNAT (interface + pool, address-persistent, source-nat off bypass), DNAT (with pools, hit counters, source-address-name match, protocol-only match, port rewriting, multi-port matching), static 1:1, NAT64, and exemption rules. These are additional NAT features from the vSRX.
 
+> **NAT64 inbound policy matches the SYNTHETIC IPv6 destination, not the
+> real internal IPv4 host (#2358).** For inbound NAT64 flows the security
+> policy is evaluated against the synthetic IPv6 destination the v6 client
+> sent to (the NAT64-prefixed address), NOT the real internal IPv4 server
+> the traffic is translated to. This is because `policy.rs::evaluate_policy`
+> requires the source and destination to be the same address family — a
+> `(V6 src, V4 dst)` tuple matches no rule and would default-deny, which
+> would break all NAT64. Same-family DNAT/static-DNAT/NPTv6 *do* match the
+> translated destination tuple (#2345), but NAT64 is excluded by that
+> same-family constraint. **Operator impact:** write NAT64 inbound security
+> policy against the synthetic IPv6 destination *prefix*, not the real IPv4
+> host address/zone. This diverges from Junos/SRX, where inbound
+> destination translation precedes the policy lookup so the policy matches
+> the real internal destination. Cross-family policy matching (match the
+> v6 source zone against the extracted IPv4 host + its zone) is the
+> separate design change tracked in **#2358**; this is a documented
+> behavior, not a deny regression.
+
 | Feature | Junos Config Path | Description | Priority | Status |
 |---------|-------------------|-------------|----------|--------|
 | **Proxy ARP for NAT** | `security nat proxy-arp interface ... address ...` | Auto-reply ARP for NAT pool addresses on same subnet as ingress interface. Required when SNAT pool, DNAT, or static-NAT external addresses are on same L2 segment. | High | **Done** -- Proxy ARP neighbor entries (NTF_PROXY) for NAT addresses with GARP on addition, AND the per-interface `net.ipv4.conf.<if>.proxy_arp` sysctl is enabled so the kernel actually answers the ARP (#2160). The kernel has two ARP-proxy paths: the pneigh (NTF_PROXY) reply branch, which answers only when the target routes out a *different* interface and does not consult the sysctl; and the `arp_fwd_proxy` path, gated by the per-interface `proxy_arp` sysctl. Whether the sysctl is load-bearing is therefore route-topology dependent (a same-L2-subnet external address is answered by neither path until the sysctl is on -- the #2160 case); enabling it guarantees a reply. Note: with the default `medium_id=0`, `proxy_arp=1` makes the kernel answer ARP on that interface for ANY target routed out a different interface -- broader than Junos `proxy-arp` (which proxies only listed addresses); per-address (v4-only) narrowing is **deferred** in #2197 item 3 (PLAN-DEFER, lab characterization pending -- dropping the sysctl would re-break the same-L2 #2160 case). IPv6 addresses get a real proxy-NDP pneigh install (#2197 item 1, see Proxy NDP row). The reconcile is also re-asserted by an always-on 30s ticker so a non-commit kernel link cycle (HA RETH flap, `programRethMAC`) self-heals without an operator re-commit (#2197 item 2). Config: `set security nat proxy-arp interface <iface> address <addr>` with range support. |

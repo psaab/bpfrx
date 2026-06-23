@@ -909,3 +909,52 @@ landing silently.
 - #728 — VLAN-aware L3 offset + threshold tune (resolved the dormant-marker symptom)
 - #754 — rate-aware per-flow ECN threshold (this section)
 - #712 — CPU pinning + IRQ isolation (Option A measured no-op on this lab; see "CPU pinning layout for the loss lab")
+
+## TX-CoS / fabric-queue selection on non-first IP fragments (#2357)
+
+A non-first IP fragment (IPv4 fragment-offset != 0; IPv6 Fragment Header
+type 44 with offset != 0) carries **no L4 header** — the bytes at the
+post-IP-header offset are payload, not TCP/UDP ports. #2344 already makes
+such a fragment *flowless* on the policy/session path
+(`parse_session_flow_from_bytes` returns `None`), so it forwards
+route-based with no policy/NAT/session.
+
+The TX-side CoS queue / fabric-queue / output-filter selection re-derives
+a tuple from metadata independently of that gate. Before #2357 a forwarded
+non-first fragment therefore got its egress queue, DSCP rewrite, fabric
+target binding, and output-filter verdict computed from payload bytes
+interpreted as ports — different fragments of one datagram could land on
+different queues (reordering / reassembly stress), and a port-matching
+terminal output-filter term could spuriously `discard` a fragment.
+
+#2357 gates the meta fallback at the TX-CoS sites:
+
+- `forward_request.rs::build_live_forward_request_from_frame` — when the
+  gated `flow` is `None` AND `frame_is_non_first_fragment(frame, meta)`
+  (the #2344 family-aware predicate), the TX path passes `flow_key = None`
+  to `resolve_cos_tx_selection_at` (→ interface `default_queue`, no
+  output-filter / port evaluation) and `expected_ports = None`, and
+  `fabric_queue_hash` is called with `non_first_fragment = true` so it
+  hashes a fragment-stable **3-tuple** (protocol + L3 src/dst from
+  metadata, which the XDP shim copies from the IP header present on every
+  fragment) with **no ports** — every fragment of one datagram selects the
+  same fabric target binding.
+- `poll_descriptor/mod.rs` pending-neigh buffering — a buffered fragment
+  stores `flow_key = None` so the later `retry_pending_neigh` flush also
+  selects the default queue with no port-filter eval.
+
+The gate fires **only** for an actual non-first fragment. A legitimate
+flowless TCP/UDP packet (real L4 header, no session yet) still gets its
+meta/frame-derived ports and full CoS/filter selection — the gate is the
+`frame_is_non_first_fragment` predicate, not a blanket "every `None` flow
+→ default queue". `coordinator/inject.rs` (emit-on-wire control-plane
+packets) is unaffected: it stamps a validated real tuple and is never
+reached by a forwarded payload-ported fragment.
+
+Regression tests live in `userspace-dp/src/afxdp/tests.rs`
+(`non_first_fragment_v4_not_dropped_by_port_matching_output_filter`,
+`non_first_fragment_v6_not_dropped_by_port_matching_output_filter`,
+`flowless_non_fragmented_tcp_still_hits_port_matching_output_filter`,
+`fabric_queue_hash_non_first_fragment_is_port_independent_3tuple`,
+`pending_neigh_fragment_buffers_no_flow_key`) and fail if the gate is
+reverted.
