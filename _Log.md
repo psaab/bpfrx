@@ -10756,3 +10756,38 @@ top.
     still uses SHA-256).
   - **File(s)**: userspace-dp/src/nat/tests.rs, docs/userspace-dataplane-architecture.md,
     docs/feature-coverage.md, docs/pr/1373-retire-ebpf-dataplane/plan-1377-snat-pools.md, _Log.md
+
+- **Timestamp**: 2026-06-22T01:30Z
+  - **Action**: #2357 — gate forwarded non-first IP fragments out of the
+    payload-derived TX-CoS / fabric-queue / output-filter path (Option 1,
+    the issue's minimal fix). A non-first fragment has no L4 header; #2344
+    already makes it flowless, but the TX-side selection re-derived a ported
+    tuple from metadata independently. Exposed `frame_is_non_first_fragment`
+    as `pub(in crate::afxdp)`. In
+    `build_live_forward_request_from_frame`, computed
+    `non_first_fragment = flow.is_none() && frame_is_non_first_fragment(...)`
+    ONCE and: forced `expected_ports = None`, set `tx_selection_flow = None`
+    (→ default queue, no output-filter port eval), and passed
+    `non_first_fragment` to `fabric_queue_hash`. Added a `non_first_fragment`
+    param to `fabric_queue_hash` — when set it hashes a fragment-stable
+    3-tuple (proto + meta L3 src/dst, no ports). Updated the flow-cache-hit
+    call site (always `false` — a cache hit is a real session). Gated the
+    poll_descriptor pending-neigh buffer-admission so a buffered fragment
+    stores `flow_key = None`. Left `coordinator/inject.rs:220` unchanged
+    (emit-on-wire control-plane packets carry a validated tuple; not reached
+    by a payload-ported fragment). Caution honored: the gate is the
+    fragment predicate, NOT "every None flow" — legit flowless TCP/UDP keeps
+    its meta ports. Added 5 fail-on-revert tests (v4 + v6 not-dropped,
+    legit-flowless still-dropped, fabric-hash port-independence, pending-neigh
+    no-flow-key). Also added the #2358 NAT64 cross-family policy-matching
+    note to docs/feature-gaps.md (doc accuracy only; #2358 stays open) and a
+    TX-CoS fragment section to docs/cos-validation-notes.md. cargo build +
+    cos/frag/fabric/tx_selection/inject tests green; new tests 5x.
+  - **File(s)**: userspace-dp/src/afxdp/frame/inspect.rs,
+    userspace-dp/src/afxdp/frame/mod.rs,
+    userspace-dp/src/afxdp/forward_request.rs,
+    userspace-dp/src/afxdp/worker/mod.rs,
+    userspace-dp/src/afxdp/poll_descriptor/flow_cache_hit.rs,
+    userspace-dp/src/afxdp/poll_descriptor/mod.rs,
+    userspace-dp/src/afxdp/tests.rs, docs/feature-gaps.md,
+    docs/cos-validation-notes.md, _Log.md

@@ -504,7 +504,7 @@ pub(in crate::afxdp) fn forward_tuple_mismatch_reason(
 /// predicate over it. Returns `true` only when the packet is positively
 /// identified as a non-first fragment; an unresolvable/too-short frame
 /// returns `false` (the downstream parser length guards reject it).
-fn frame_is_non_first_fragment(frame: &[u8], meta: UserspaceDpMeta) -> bool {
+pub(in crate::afxdp) fn frame_is_non_first_fragment(frame: &[u8], meta: UserspaceDpMeta) -> bool {
     let expected_version = match meta.addr_family as i32 {
         libc::AF_INET => 4u8,
         libc::AF_INET6 => 6u8,

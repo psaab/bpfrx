@@ -240,6 +240,7 @@ pub(crate) fn fabric_queue_hash(
     flow: Option<&SessionFlow>,
     expected_ports: Option<(u16, u16)>,
     meta: UserspaceDpMeta,
+    non_first_fragment: bool,
 ) -> u64 {
     fn mix(seed: &mut u64, value: u64) {
         *seed ^= value
@@ -249,6 +250,47 @@ pub(crate) fn fabric_queue_hash(
     }
 
     let mut seed = meta.protocol as u64;
+    // #2357: a non-first IP fragment has no L4 header — `meta.flow_*_port`
+    // and `expected_ports` describe payload bytes, not real ports. Hash a
+    // fragment-stable 3-tuple (protocol + L3 src/dst from metadata, which the
+    // XDP shim copies from the IP header that IS present on every fragment)
+    // and OMIT the ports, so every fragment of one datagram selects the same
+    // fabric target binding (no cross-chassis reordering). `flow` is `None`
+    // for a fragment (#2344), so the ported `flow`/`expected_ports` branches
+    // below never run for it.
+    if non_first_fragment {
+        match meta.addr_family as i32 {
+            libc::AF_INET => {
+                mix(
+                    &mut seed,
+                    u32::from_be_bytes([
+                        meta.flow_src_addr[0],
+                        meta.flow_src_addr[1],
+                        meta.flow_src_addr[2],
+                        meta.flow_src_addr[3],
+                    ]) as u64,
+                );
+                mix(
+                    &mut seed,
+                    u32::from_be_bytes([
+                        meta.flow_dst_addr[0],
+                        meta.flow_dst_addr[1],
+                        meta.flow_dst_addr[2],
+                        meta.flow_dst_addr[3],
+                    ]) as u64,
+                );
+            }
+            _ => {
+                for chunk in meta.flow_src_addr.chunks_exact(8) {
+                    mix(&mut seed, u64::from_be_bytes(chunk.try_into().unwrap()));
+                }
+                for chunk in meta.flow_dst_addr.chunks_exact(8) {
+                    mix(&mut seed, u64::from_be_bytes(chunk.try_into().unwrap()));
+                }
+            }
+        }
+        return seed;
+    }
     if let Some(flow) = flow {
         match flow.src_ip {
             IpAddr::V4(ip) => mix(&mut seed, u32::from(ip) as u64),
