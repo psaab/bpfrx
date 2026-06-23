@@ -130,19 +130,34 @@ impl FilterTerm {
 
 /// Per-packet match inputs that are NOT in the 5-tuple (#2362). Computed once
 /// per packet at each evaluate call site (the only place that has the frame
-/// bytes) and threaded into the term predicate. `Default` (all-absent) makes
-/// every per-packet condition a no-op, so callers that cannot cheaply compute
-/// these (e.g. some log-only diagnostic paths) stay behavior-compatible.
+/// bytes) and threaded into the term predicate. `Default` (all-absent,
+/// `l4_present = false`) makes every L4 per-packet condition fail to match, so
+/// callers that cannot cheaply compute these (cached/TX-selection rebuild
+/// paths, which never carry an L4-match term because the flow-cache declines
+/// for such filters) stay behavior-compatible AND fail closed.
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) struct TermMatchExtra {
-    /// Raw TCP flags byte (only meaningful when protocol == TCP).
+    /// Raw TCP flags byte (only meaningful when protocol == TCP and
+    /// `l4_present`).
     pub(crate) tcp_flags: u8,
-    /// Whether the packet is an IP fragment (any fragment).
+    /// Whether the packet is an IP fragment (any fragment). L3-derived — valid
+    /// regardless of `l4_present` (every fragment carries the IP header).
     pub(crate) is_fragment: bool,
-    /// ICMP/ICMPv6 type byte (only meaningful when protocol is ICMP/ICMPv6).
+    /// ICMP/ICMPv6 type byte (only meaningful when protocol is ICMP/ICMPv6 and
+    /// `l4_present`).
     pub(crate) icmp_type: u8,
-    /// ICMP/ICMPv6 code byte (only meaningful when protocol is ICMP/ICMPv6).
+    /// ICMP/ICMPv6 code byte (only meaningful when protocol is ICMP/ICMPv6 and
+    /// `l4_present`).
     pub(crate) icmp_code: u8,
+    /// #2362 fold A (Copilot): whether a real L4 header is present at
+    /// `l4_offset`. FALSE for a NON-FIRST fragment (its post-IP bytes are
+    /// payload, not an L4 header) and for any other no-L4 case. The matcher
+    /// gates the tcp-flags / icmp-type / icmp-code constraints on this flag —
+    /// NOT on the byte values — because 0 is a VALID icmp-type (echo-reply) and
+    /// a VALID icmp-code, so a zeroed byte would still spuriously match
+    /// `icmp-type 0` / `icmp-code 0`. `is_fragment` is L3-derived and is NOT
+    /// gated by this flag.
+    pub(crate) l4_present: bool,
 }
 
 /// Inclusive port range.

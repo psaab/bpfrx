@@ -433,6 +433,10 @@ pub(in crate::afxdp) fn term_match_extra_from_frame(
         is_fragment,
         icmp_type,
         icmp_code,
+        // The L4 header is absent only on a non-first fragment. The matcher
+        // gates tcp-flags / icmp-type / icmp-code on this (a zeroed icmp byte
+        // is otherwise a valid icmp-type 0 / icmp-code 0 match).
+        l4_present: !non_first_fragment,
     }
 }
 
@@ -471,6 +475,7 @@ pub(in crate::afxdp) fn term_match_extra_from_frame_fwd(
         is_fragment,
         icmp_type,
         icmp_code,
+        l4_present: !non_first_fragment,
     }
 }
 
@@ -492,6 +497,11 @@ pub(in crate::afxdp) fn term_match_extra_from_meta(
         is_fragment: false,
         icmp_type: 0,
         icmp_code: 0,
+        // TRUE: these synthetic / locally-stamped packets carry a real L4
+        // header and are never IP fragments, so a legit tcp-flags match keeps
+        // working. The 0 icmp bytes are an under-match (frame unavailable), NOT
+        // an absent-L4 signal.
+        l4_present: true,
     }
 }
 

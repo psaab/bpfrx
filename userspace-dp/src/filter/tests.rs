@@ -2821,6 +2821,9 @@ fn v4(a: u8, b: u8, c: u8, d: u8) -> IpAddr {
 fn extra_tcp(flags: u8) -> TermMatchExtra {
     TermMatchExtra {
         tcp_flags: flags,
+        // A real (first/atomic) TCP segment has an L4 header — the matcher
+        // gates tcp-flags on l4_present (#2362 fold A).
+        l4_present: true,
         ..Default::default()
     }
 }
@@ -2996,6 +2999,7 @@ fn icmp_type_term_matches_only_that_type_v4() {
     );
     let echo = TermMatchExtra {
         icmp_type: 8,
+        l4_present: true,
         ..Default::default()
     };
     let drop = evaluate_filter(
@@ -3016,6 +3020,7 @@ fn icmp_type_term_matches_only_that_type_v4() {
     );
     let reply = TermMatchExtra {
         icmp_type: 0,
+        l4_present: true,
         ..Default::default()
     };
     let pass = evaluate_filter(
@@ -3046,6 +3051,7 @@ fn icmp_type_term_matches_icmpv6() {
     let v6 = |s: &str| IpAddr::V6(s.parse::<Ipv6Addr>().unwrap());
     let echo = TermMatchExtra {
         icmp_type: 128,
+        l4_present: true,
         ..Default::default()
     };
     let drop = evaluate_filter(
@@ -3062,6 +3068,7 @@ fn icmp_type_term_matches_icmpv6() {
     assert_eq!(drop.action, FilterAction::Discard);
     let na = TermMatchExtra {
         icmp_type: 136,
+        l4_present: true,
         ..Default::default()
     };
     let pass = evaluate_filter(
@@ -3092,6 +3099,7 @@ fn icmp_code_term_narrows_within_type() {
     let frag_needed = TermMatchExtra {
         icmp_type: 3,
         icmp_code: 4,
+        l4_present: true,
         ..Default::default()
     };
     let drop = evaluate_filter(
@@ -3109,6 +3117,7 @@ fn icmp_code_term_narrows_within_type() {
     let net_unreach = TermMatchExtra {
         icmp_type: 3,
         icmp_code: 0,
+        l4_present: true,
         ..Default::default()
     };
     let pass = evaluate_filter(
@@ -3136,9 +3145,11 @@ fn icmp_term_does_not_match_non_icmp() {
         &[],
     );
     // A TCP packet whose byte happens to equal 8 must not match an icmp-type term.
+    // l4_present: true so this proves the PROTOCOL gate, not the l4-absence gate.
     let tcp = TermMatchExtra {
         tcp_flags: 0x02,
         icmp_type: 8,
+        l4_present: true,
         ..Default::default()
     };
     let pass = evaluate_filter(
@@ -3256,4 +3267,143 @@ fn firewall_term_snapshot_per_packet_fields_round_trip() {
     assert!(!minimal.is_fragment);
     assert_eq!(minimal.icmp_type, None);
     assert_eq!(minimal.icmp_code, None);
+}
+
+// #2362 fold A (Copilot): the L4-present gate. Forcing the icmp byte to 0 for a
+// non-first fragment is NOT sufficient, because 0 is a valid icmp-type
+// (echo-reply) and a valid icmp-code — a value-only check would still match
+// `from { icmp-type 0 }` / `from { icmp-code 0 }`. The matcher MUST key off
+// extra.l4_present (false for a non-first fragment) so those terms fail closed,
+// while is-fragment (L3-derived) STILL matches. These fail if the gate reverts
+// to the value-0 sentinel.
+#[test]
+fn non_first_fragment_does_not_match_icmp_type_zero() {
+    let state = make_filter_state(
+        &per_packet_filter("inet", "icmp", None, false, Some(0), None),
+        &[],
+    );
+    // What term_match_extra_from_frame produces for a non-first ICMP fragment:
+    // l4_present false, icmp bytes forced 0, is_fragment true.
+    let frag = TermMatchExtra {
+        l4_present: false,
+        icmp_type: 0,
+        is_fragment: true,
+        ..Default::default()
+    };
+    let r = evaluate_filter(
+        &state,
+        "inet:pp",
+        v4(10, 0, 0, 1),
+        v4(10, 0, 0, 2),
+        PROTO_ICMP,
+        0,
+        0,
+        0,
+        frag,
+    );
+    assert_eq!(
+        r.action,
+        FilterAction::Accept,
+        "a non-first fragment (no L4 header) must NOT match `icmp-type 0` (#2362 fold A)"
+    );
+    // Anti-over-gate: a real echo-reply (type 0, l4_present) DOES match.
+    let echo_reply = TermMatchExtra {
+        l4_present: true,
+        icmp_type: 0,
+        ..Default::default()
+    };
+    let r2 = evaluate_filter(
+        &state,
+        "inet:pp",
+        v4(10, 0, 0, 1),
+        v4(10, 0, 0, 2),
+        PROTO_ICMP,
+        0,
+        0,
+        0,
+        echo_reply,
+    );
+    assert_eq!(
+        r2.action,
+        FilterAction::Discard,
+        "a real echo-reply (icmp-type 0, L4 present) MUST match `icmp-type 0`"
+    );
+}
+
+#[test]
+fn non_first_fragment_does_not_match_icmp_code_zero() {
+    let state = make_filter_state(
+        &per_packet_filter("inet", "icmp", None, false, None, Some(0)),
+        &[],
+    );
+    let frag = TermMatchExtra {
+        l4_present: false,
+        icmp_code: 0,
+        is_fragment: true,
+        ..Default::default()
+    };
+    let r = evaluate_filter(
+        &state,
+        "inet:pp",
+        v4(10, 0, 0, 1),
+        v4(10, 0, 0, 2),
+        PROTO_ICMP,
+        0,
+        0,
+        0,
+        frag,
+    );
+    assert_eq!(
+        r.action,
+        FilterAction::Accept,
+        "a non-first fragment must NOT match `icmp-code 0` (#2362 fold A)"
+    );
+    let real = TermMatchExtra {
+        l4_present: true,
+        icmp_code: 0,
+        ..Default::default()
+    };
+    let r2 = evaluate_filter(
+        &state,
+        "inet:pp",
+        v4(10, 0, 0, 1),
+        v4(10, 0, 0, 2),
+        PROTO_ICMP,
+        0,
+        0,
+        0,
+        real,
+    );
+    assert_eq!(
+        r2.action,
+        FilterAction::Discard,
+        "a real ICMP packet with code 0 (L4 present) MUST match `icmp-code 0`"
+    );
+}
+
+#[test]
+fn non_first_fragment_still_matches_is_fragment() {
+    // The is-fragment term is L3-derived and NOT gated by l4_present.
+    let state = make_filter_state(&per_packet_filter("inet", "", None, true, None, None), &[]);
+    let frag = TermMatchExtra {
+        l4_present: false,
+        is_fragment: true,
+        ..Default::default()
+    };
+    let r = evaluate_filter(
+        &state,
+        "inet:pp",
+        v4(10, 0, 0, 1),
+        v4(10, 0, 0, 2),
+        PROTO_ICMP,
+        0,
+        0,
+        0,
+        frag,
+    );
+    assert_eq!(
+        r.action,
+        FilterAction::Discard,
+        "a non-first fragment IS a fragment — is-fragment must still match (#2362 fold A)"
+    );
 }

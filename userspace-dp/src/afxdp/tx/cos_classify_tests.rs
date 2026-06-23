@@ -2971,6 +2971,7 @@ fn resolve_cos_tx_selection_honors_tcp_flags_per_packet_match() {
         Some(&key),
         TermMatchExtra {
             tcp_flags: 0x02,
+            l4_present: true,
             ..Default::default()
         },
     );
@@ -2989,6 +2990,7 @@ fn resolve_cos_tx_selection_honors_tcp_flags_per_packet_match() {
         Some(&key),
         TermMatchExtra {
             tcp_flags: 0x10,
+            l4_present: true,
             ..Default::default()
         },
     );

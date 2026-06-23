@@ -5878,6 +5878,10 @@ fn term_extra_non_first_icmp_fragment_suppresses_icmp_type_keeps_is_fragment() {
     assert_eq!(extra.icmp_code, 0);
     assert_eq!(extra.tcp_flags, 0);
     assert!(
+        !extra.l4_present,
+        "non-first fragment has no L4 header → l4_present must be false (the matcher gates on this, not the byte value)"
+    );
+    assert!(
         extra.is_fragment,
         "a non-first fragment IS a fragment (is-fragment must match)"
     );
@@ -5902,6 +5906,7 @@ fn term_extra_non_first_tcp_fragment_suppresses_tcp_flags() {
         extra.tcp_flags, 0,
         "non-first fragment must NOT expose payload-derived tcp_flags"
     );
+    assert!(!extra.l4_present, "non-first fragment → l4_present false");
     assert!(extra.is_fragment);
 }
 
@@ -5923,6 +5928,10 @@ fn term_extra_first_fragment_keeps_l4_fields() {
     assert_eq!(
         extra.icmp_type, 8,
         "first fragment carries the real ICMP type"
+    );
+    assert!(
+        extra.l4_present,
+        "first fragment carries the real L4 header → l4_present true"
     );
     assert!(extra.is_fragment, "first fragment IS a fragment");
 }

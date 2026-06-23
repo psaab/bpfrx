@@ -164,9 +164,14 @@ The `tcp_flags_mask` / `is_fragment` / `icmp_type` / `icmp_code` inputs are
 carried in a small `TermMatchExtra` built once per packet at the filter-eval
 call sites (`term_match_extra_from_frame` and its `ForwardPacketMeta` /
 meta-only variants). The builder is fragment-safe: for a NON-FIRST fragment
-(no L4 header at `l4_offset` — its bytes are payload) the L4-derived inputs
-(`tcp_flags` / `icmp_type` / `icmp_code`) are forced to 0 so those terms fail
-closed, while the L3-derived `is_fragment` bit stays true. This applies on the
+(no L4 header at `l4_offset` — its bytes are payload) it sets an explicit
+`l4_present = false`, and the matcher (`per_packet_l4_matches`) gates the
+tcp-flags / icmp-type / icmp-code constraints on that flag — NOT on the byte
+value, because 0 is a valid `icmp-type` (echo-reply) and a valid `icmp-code`, so
+a zeroed byte would still match `from { icmp-type 0 }` / `from { icmp-code 0 }`.
+The L4 byte fields are also zeroed (defense-in-depth) but the gate is the flag.
+The L3-derived `is_fragment` bit is NOT gated by `l4_present` and stays true
+(a non-first fragment IS a fragment). This applies on the
 CoS / TX-selection leg too (`tx/cos_classify.rs`): the TX-selection evaluators
 thread the same `TermMatchExtra`, and the deferred path snapshots it on
 `PendingForwardRequest.filter_match_extra` because the UMEM frame may be

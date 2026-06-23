@@ -11004,3 +11004,39 @@ top.
     userspace-dp/src/afxdp/forwarding_build/tests.rs,
     userspace-dp/src/filter/tests.rs, userspace-dp/src/filter/README.md,
     docs/feature-gaps.md, _Log.md
+
+- **Timestamp**: 2026-06-22 (fold A correction)
+  - **Action**: #2362 PR #2373 — Copilot caught that FOLD A's "force the L4
+    byte to 0 for a non-first fragment" guard was insufficient: 0 is a VALID
+    icmp-type (echo-reply) and a VALID icmp-code, so a non-first fragment with
+    forced icmp_type=0 STILL spuriously matched `from { icmp-type 0 }` /
+    `from { icmp-code 0 }` — the matching.rs contract was still violated.
+    (tcp-flags was fine: a real term has a non-zero mask and (0 & mask)==mask is
+    false.) Fix: replace the value-sentinel with an explicit l4_present:bool on
+    TermMatchExtra — true normally, FALSE for a non-first fragment (set in both
+    term_match_extra_from_frame and term_match_extra_from_frame_fwd via
+    is_non_first_fragment) and the meta-only builder sets it TRUE (synthetic
+    packets have an L4 header, never fragments). per_packet_l4_matches now
+    requires extra.l4_present for the tcp-flags AND icmp-type AND icmp-code
+    constraints (return false if !l4_present); is_fragment stays UNGATED
+    (L3-derived). Default(l4_present=false) fails closed — safe for the
+    cached/tx-rebuild Default paths (unreachable for L4 filters anyway). Kept the
+    byte-zeroing as defense-in-depth. Updated existing test extras that represent
+    real packets to set l4_present:true (extra_tcp helper + icmp literals + the
+    FOLD B SYN/ACK). New fail-on-revert tests: a non-first fragment (l4_present
+    false, byte 0, is_fragment true) does NOT match `icmp-type 0` NOR
+    `icmp-code 0` but STILL matches `is-fragment`; a real echo-reply (type 0,
+    l4_present true) DOES match `icmp-type 0` (anti-over-gate). Builder tests now
+    assert l4_present false (non-first) / true (first). cargo build --release
+    clean; filter/icmp/fragment/tcp_flags/matching/tx_selection/cos suites green;
+    full suite green (no failures this run); new tests 5x; protocol_wire_v1.json
+    UNCHANGED (l4_present is internal). matching.rs doc + feature-gaps.md +
+    filter/README.md updated to describe the l4_present gate (not the byte
+    sentinel).
+  - **File(s)**: userspace-dp/src/filter/mod.rs,
+    userspace-dp/src/filter/engine/matching.rs,
+    userspace-dp/src/afxdp/frame/inspect.rs,
+    userspace-dp/src/afxdp/frame/tests.rs,
+    userspace-dp/src/filter/tests.rs,
+    userspace-dp/src/afxdp/tx/cos_classify_tests.rs,
+    userspace-dp/src/filter/README.md, docs/feature-gaps.md, _Log.md

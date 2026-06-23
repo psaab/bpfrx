@@ -398,11 +398,16 @@ gated on a per-packet condition selects the class only on the matching packets
 of a flow, not all of them (the flow-cache decline keeps the precomputed
 TX-selection descriptor from being built for such filters). Fragment safety: the
 match inputs are built fragment-safe — a NON-FIRST fragment carries no L4 header
-at the post-IP offset (its bytes are payload), so the tcp-flags / icmp-type /
-icmp-code inputs are forced to 0 for it (those terms fail closed) while the
-L3-derived `is-fragment` bit stays true; this prevents a crafted fragment whose
-payload byte equals a filter's `icmp-type` from spuriously matching (the #2344
-non-first-fragment class). Semantics: `tcp-flags <list>` requires ALL listed flags set
+at the post-IP offset (its bytes are payload), so the per-packet match inputs
+carry an explicit `l4_present = false` flag for it and the matcher gates the
+tcp-flags / icmp-type / icmp-code constraints on that flag (NOT on the byte
+value). Keying off the value alone is insufficient: 0 is a VALID icmp-type
+(echo-reply) and a VALID icmp-code, so a zeroed byte would still spuriously match
+`from { icmp-type 0 }` / `from { icmp-code 0 }`. The L3-derived `is-fragment` bit
+is NOT gated by `l4_present` and stays true (a non-first fragment IS a fragment).
+This prevents a crafted fragment whose payload byte equals a filter's
+`icmp-type`/`icmp-code` from spuriously matching (the #2344 non-first-fragment
+class). Semantics: `tcp-flags <list>` requires ALL listed flags set
 (a non-TCP packet never matches); `is-fragment` matches any IP fragment (IPv4 MF
 set OR non-zero offset; IPv6 fragment header present); `icmp-type`/`icmp-code`
 match the ICMP/ICMPv6 type/code bytes (a non-ICMP packet never matches).

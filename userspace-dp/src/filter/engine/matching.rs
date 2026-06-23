@@ -17,12 +17,24 @@ use crate::ip_proto::{PROTO_ICMP, PROTO_ICMPV6, PROTO_TCP};
 /// icmp-type term against a TCP packet) fails closed — the term must NOT match,
 /// matching Junos semantics where `from tcp-flags ...` implies the TCP
 /// protocol family. Empty (`None` / false) conditions are no-ops.
+///
+/// #2362 fold A (Copilot): every L4-header-derived constraint (tcp-flags,
+/// icmp-type, icmp-code) additionally requires `extra.l4_present`. A NON-FIRST
+/// fragment carries no L4 header at `l4_offset` (its bytes are payload), so
+/// `l4_present` is false for it and those terms MUST NOT match. Keying off the
+/// byte VALUE alone is insufficient: 0 is a valid icmp-type (echo-reply) and a
+/// valid icmp-code, so a zeroed byte on a non-first fragment would still
+/// spuriously match `from { icmp-type 0 }` / `from { icmp-code 0 }`. The
+/// `is-fragment` constraint is L3-derived (every fragment carries the IP
+/// header) and is therefore NOT gated by `l4_present` — a non-first fragment
+/// still matches `from { is-fragment }`.
 #[inline(always)]
 fn per_packet_l4_matches(term: &FilterTerm, protocol: u8, extra: TermMatchExtra) -> bool {
     if let Some(mask) = term.tcp_flags_mask {
-        // A tcp-flags constraint only matches TCP segments. A non-TCP packet
-        // (or a non-first fragment with no L4 header) never matches.
-        if protocol != PROTO_TCP || (extra.tcp_flags & mask) != mask {
+        // A tcp-flags constraint only matches a TCP segment that actually has
+        // an L4 header. A non-TCP packet, or a non-first fragment (no L4
+        // header), never matches.
+        if !extra.l4_present || protocol != PROTO_TCP || (extra.tcp_flags & mask) != mask {
             return false;
         }
     }
@@ -31,12 +43,16 @@ fn per_packet_l4_matches(term: &FilterTerm, protocol: u8, extra: TermMatchExtra)
     }
     let is_icmp = protocol == PROTO_ICMP || protocol == PROTO_ICMPV6;
     if let Some(want_type) = term.icmp_type {
-        if !is_icmp || extra.icmp_type != want_type {
+        // Gate on l4_present, NOT just the value: icmp-type 0 (echo-reply) is a
+        // real term, so a non-first fragment with a forced-0 type byte must NOT
+        // match it.
+        if !extra.l4_present || !is_icmp || extra.icmp_type != want_type {
             return false;
         }
     }
     if let Some(want_code) = term.icmp_code {
-        if !is_icmp || extra.icmp_code != want_code {
+        // icmp-code 0 is the most common code — same l4_present gate.
+        if !extra.l4_present || !is_icmp || extra.icmp_code != want_code {
             return false;
         }
     }
