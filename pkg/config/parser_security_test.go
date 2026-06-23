@@ -2218,6 +2218,10 @@ func TestPolicyReject(t *testing.T) {
 
 func TestPolicyDenyAll(t *testing.T) {
 	input := `security {
+    zones {
+        security-zone trust;
+        security-zone untrust;
+    }
     policies {
         default-policy deny-all;
         from-zone trust to-zone untrust {
@@ -2875,7 +2879,7 @@ func TestNATSourceSetSyntax(t *testing.T) {
 
 func TestPolicySetSyntax(t *testing.T) {
 	tree := &ConfigTree{}
-	for _, cmd := range []string{"set security policies from-zone trust to-zone untrust policy allow-all match source-address any", "set security policies from-zone trust to-zone untrust policy allow-all match destination-address any", "set security policies from-zone trust to-zone untrust policy allow-all match application any", "set security policies from-zone trust to-zone untrust policy allow-all then permit", "set security policies from-zone trust to-zone untrust policy allow-all then log session-init", "set security policies from-zone trust to-zone untrust policy allow-all then count"} {
+	for _, cmd := range []string{"set security zones security-zone trust", "set security zones security-zone untrust", "set security policies from-zone trust to-zone untrust policy allow-all match source-address any", "set security policies from-zone trust to-zone untrust policy allow-all match destination-address any", "set security policies from-zone trust to-zone untrust policy allow-all match application any", "set security policies from-zone trust to-zone untrust policy allow-all then permit", "set security policies from-zone trust to-zone untrust policy allow-all then log session-init", "set security policies from-zone trust to-zone untrust policy allow-all then count"} {
 		if err := tree.SetPath(strings.Fields(cmd)[1:]); err != nil {
 			t.Fatalf("SetPath(%q): %v", cmd, err)
 		}
@@ -2917,7 +2921,7 @@ func TestPolicyMatchSingleLineSetSyntax(t *testing.T) {
 	// TestPolicyMatchSingleLineSetSyntax verifies that multiple match criteria on
 	// a single set line become siblings under match, not nested children.
 	// e.g. "set ... match destination-address any source-address any application any"
-	for _, cmd := range []string{"set security policies from-zone lan to-zone wan policy allow-ps match destination-address any source-address any application any", "set security policies from-zone lan to-zone wan policy allow-ps then permit"} {
+	for _, cmd := range []string{"set security zones security-zone lan", "set security zones security-zone wan", "set security policies from-zone lan to-zone wan policy allow-ps match destination-address any source-address any application any", "set security policies from-zone lan to-zone wan policy allow-ps then permit"} {
 		if err := tree.SetPath(strings.Fields(cmd)[1:]); err != nil {
 			t.Fatalf("SetPath(%q): %v", cmd, err)
 		}
@@ -4868,6 +4872,8 @@ func TestAddressBookDescriptionResolvesInPolicy(t *testing.T) {
 		"set security address-book global address h2 192.168.2.0/24",
 		"set security address-book global address h2 description web-server",
 		"set security address-book global address plain 10.0.0.0/8",
+		"set security zones security-zone trust",
+		"set security zones security-zone untrust",
 		"set security policies from-zone trust to-zone untrust policy p1 match source-address h2",
 		"set security policies from-zone trust to-zone untrust policy p1 match destination-address plain",
 		"set security policies from-zone trust to-zone untrust policy p1 match application any",
