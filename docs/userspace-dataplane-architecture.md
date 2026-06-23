@@ -439,6 +439,24 @@ A TUN device (`xpf-usp0`) for packets that need kernel processing:
 - Rate-limited: 2000 pps, 16 MB/s (prevents flooding kernel)
 - Async writes via io_uring (non-blocking on worker thread)
 - Bounded channel (256 depth) between enqueue and writer thread
+- **TUN MTU (#2408):** the kernel creates the TUN at the default 1500 MTU.
+  `slow_path_worker` programs it via `SIOCSIFMTU` (`set_if_mtu`) to the
+  largest configured data-interface MTU — `ConfigSnapshot::slow_path_mtu()`,
+  the max of the per-interface MTUs the control plane carries in the
+  snapshot, clamped to a 1500 floor. Without this a reinjected jumbo frame
+  (> 1500 bytes on a jumbo-frame topology) is silently dropped on the TUN
+  egress. A failed `SIOCSIFMTU` is non-fatal: it is logged and recorded in
+  `last_error`, and the TUN stays usable for frames up to its current MTU.
+  - **Set once at creation:** the MTU is programmed when the worker opens
+    the TUN (first apply, i.e. `apply_snapshot`'s `preserved_slow_path ==
+    None` branch). Later reconciles preserve the running reinjector and do
+    NOT re-open the device, so a config MTU INCREASE applied while the daemon
+    is running does NOT reprogram the live TUN until the slow path is
+    recreated — a process restart, or the slow path going inactive->active.
+    First-boot jumbo configs are fully covered. When a later reconcile sees a
+    snapshot MTU different from the live TUN's creation MTU, the reconcile
+    path emits a one-shot (per distinct value) `xpf-ha:` warning so the
+    stale-until-restart window is diagnosable rather than silent.
 
 ### 3. Go Manager (`pkg/dataplane/userspace/manager.go`)
 

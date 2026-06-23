@@ -167,17 +167,29 @@ pub struct SlowPathReinjector {
     tx: SyncSender<PacketRequest>,
     limiter: Mutex<RateLimiter>,
     status: Arc<SharedStatus>,
+    /// MTU the slow-path TUN was programmed with at creation (#2408). The TUN
+    /// MTU is set once when the worker opens the device; a later config MTU
+    /// change is NOT applied to the live TUN (the reinjector is preserved
+    /// across reconciles), so the reconcile path compares this against the
+    /// new snapshot MTU to warn the operator (see `apply_snapshot`).
+    mtu: i32,
 }
 
 impl SlowPathReinjector {
-    pub fn new(name: &str) -> Result<Self, String> {
+    /// Create the slow-path reinjector and spawn its worker.
+    ///
+    /// `mtu` is the MTU (in bytes) to program on the slow-path TUN device so
+    /// that reinjected frames up to the largest configured data-interface MTU
+    /// are not dropped on the TUN egress (#2408). The caller sources it from
+    /// the config snapshot (`ConfigSnapshot::slow_path_mtu`), never hardcoded.
+    pub fn new(name: &str, mtu: i32) -> Result<Self, String> {
         let status = Arc::new(SharedStatus::new());
         let (tx, rx) = mpsc::sync_channel(DEFAULT_QUEUE_DEPTH);
         let thread_status = status.clone();
         let name = name.to_string();
         thread::Builder::new()
             .name("xpf-slowpath".to_string())
-            .spawn(move || slow_path_worker(&name, rx, thread_status))
+            .spawn(move || slow_path_worker(&name, mtu, rx, thread_status))
             .map_err(|e| format!("spawn slow-path worker: {e}"))?;
         Ok(Self {
             tx,
@@ -186,7 +198,13 @@ impl SlowPathReinjector {
                 DEFAULT_RATE_LIMIT_BYTES_PER_SEC,
             )),
             status,
+            mtu,
         })
+    }
+
+    /// The MTU the slow-path TUN was programmed with at creation (#2408).
+    pub fn mtu(&self) -> i32 {
+        self.mtu
     }
 
     pub fn enqueue(&self, bytes: Vec<u8>) -> Result<EnqueueOutcome, String> {
@@ -238,7 +256,7 @@ impl SlowPathReinjector {
     }
 }
 
-fn slow_path_worker(name: &str, rx: Receiver<PacketRequest>, status: Arc<SharedStatus>) {
+fn slow_path_worker(name: &str, mtu: i32, rx: Receiver<PacketRequest>, status: Arc<SharedStatus>) {
     let (tun, actual_name) = match open_tun(name) {
         Ok(v) => v,
         Err(err) => {
@@ -247,6 +265,17 @@ fn slow_path_worker(name: &str, rx: Receiver<PacketRequest>, status: Arc<SharedS
             return;
         }
     };
+    // #2408: the kernel creates the TUN at the default 1500 MTU. Raise it to
+    // the largest configured data-interface MTU so reinjected jumbo frames are
+    // not silently dropped on the TUN egress. A failure here is non-fatal: the
+    // TUN is still usable for <=1500 frames, so log and continue rather than
+    // tearing down the whole slow path.
+    if let Err(err) = set_if_mtu(&actual_name, mtu) {
+        eprintln!(
+            "xpf-slowpath: set MTU {mtu} on {actual_name}: {err} (slow-path jumbo frames may drop)"
+        );
+        status.set_last_error(err);
+    }
     status.set_device_name(&actual_name);
     status.active.store(true, Ordering::Relaxed);
 
@@ -416,6 +445,45 @@ fn set_if_up(name: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Program the MTU on a TUN device via `SIOCSIFMTU` (#2408).
+///
+/// `mtu` must be > 0; a non-positive value is a programming error and is
+/// rejected without touching the device. Returns `Err` (caller logs and
+/// continues) on socket/ioctl failure.
+fn set_if_mtu(name: &str, mtu: i32) -> Result<(), String> {
+    if mtu <= 0 {
+        return Err(format!("invalid MTU {mtu} for {name}"));
+    }
+    // Build the ifreq BEFORE opening the socket so an invalid-name early
+    // return does not leak the control-socket fd (Copilot #2439).
+    let mut ifr = IfReq::new(name, 0)?;
+    ifr.ifru.mtu = mtu as libc::c_int;
+    let sock = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0) };
+    if sock < 0 {
+        return Err(format!(
+            "open control socket: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    let set_rc = unsafe { libc::ioctl(sock, libc::SIOCSIFMTU, &ifr) };
+    let close_rc = unsafe { libc::close(sock) };
+    if set_rc < 0 {
+        return Err(format!(
+            "SIOCSIFMTU {} mtu={}: {}",
+            name,
+            mtu,
+            io::Error::last_os_error()
+        ));
+    }
+    if close_rc < 0 {
+        return Err(format!(
+            "close control socket: {}",
+            io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
 fn set_ipv4_sysctl(iface: &str, key: &str, value: &str) -> Result<(), String> {
     let path = format!("/proc/sys/net/ipv4/conf/{iface}/{key}");
     std::fs::write(&path, value).map_err(|e| format!("write {path}: {e}"))
@@ -426,7 +494,7 @@ union Ifru {
     flags: libc::c_short,
     _addr: libc::sockaddr,
     _ifindex: libc::c_int,
-    _mtu: libc::c_int,
+    mtu: libc::c_int,
 }
 
 #[repr(C)]
@@ -590,5 +658,31 @@ mod tests {
         unsafe {
             *libc::__errno_location() = e;
         }
+    }
+
+    /// #2408: `set_if_mtu` rejects a non-positive MTU before touching any
+    /// device (defensive — the caller sources a clamped value, but a 0/neg
+    /// MTU must never be programmed). FAILS if the `mtu <= 0` guard is dropped
+    /// (the call would then open a socket and attempt the ioctl).
+    #[test]
+    fn set_if_mtu_rejects_nonpositive() {
+        assert!(set_if_mtu("xpf-usp0", 0)
+            .unwrap_err()
+            .contains("invalid MTU"));
+        assert!(set_if_mtu("xpf-usp0", -1)
+            .unwrap_err()
+            .contains("invalid MTU"));
+    }
+
+    /// #2408: the MTU is written into the `ifru.mtu` arm of the ifreq union
+    /// that `SIOCSIFMTU` reads. FAILS if the value is not stored (e.g. the
+    /// assignment is removed) — the union would carry 0, not 9000.
+    #[test]
+    fn ifreq_carries_mtu_value() {
+        let mut ifr = IfReq::new("xpf-usp0", 0).unwrap();
+        ifr.ifru.mtu = 9000;
+        // SAFETY: we just wrote the `mtu` arm, so reading it back is defined.
+        assert_eq!(unsafe { ifr.ifru.mtu }, 9000);
+        assert_eq!(ifr.name_string(), "xpf-usp0");
     }
 }

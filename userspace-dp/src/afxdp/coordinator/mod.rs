@@ -185,6 +185,11 @@ pub struct Coordinator {
     /// and is removed only when the endpoint leaves the desired set.
     pub(crate) wg_control_threads: BTreeMap<u16, WgControlEntry>,
     pub(crate) last_slow_path_status: SlowPathStatus,
+    /// #2408: the last snapshot slow-path MTU we warned about when it differed
+    /// from the live (preserved) reinjector's creation MTU. Rate-limits the
+    /// "TUN MTU won't change until slow-path recreate" warning to once per
+    /// distinct value so a steady-state reconcile loop does not flood.
+    pub(crate) last_slow_path_mtu_warned: i32,
     pub(in crate::afxdp) ha: HaState,
     pub(crate) cos: SharedCoSState,
     pub(crate) shared_validation: Arc<ArcSwap<ValidationState>>,
@@ -228,6 +233,7 @@ impl Coordinator {
             tunnel_sources: BTreeMap::new(),
             wg_control_threads: BTreeMap::new(),
             last_slow_path_status: SlowPathStatus::default(),
+            last_slow_path_mtu_warned: 0,
             ha: HaState::new(),
             cos: SharedCoSState::new(),
             shared_validation: Arc::new(ArcSwap::from_pointee(ValidationState::default())),

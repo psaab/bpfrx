@@ -11899,3 +11899,48 @@ top.
   split EINTR (retry-whole) from a hard error (drop). Comment-only — no
   code change; cargo build --release clean.
 - **File(s)**: userspace-dp/src/slowpath.rs, _Log.md
+
+- **Timestamp**: 2026-06-23
+- **Action**: #2408 slow-path TUN MTU (PR fix/2408-tun-mtu) — the slow-path
+  TUN (`xpf-usp0`) was created without `SIOCSIFMTU`, so it defaulted to
+  1500 and silently dropped reinjected frames > 1500 on jumbo-frame
+  topologies. Added `set_if_mtu` (SIOCSIFMTU ioctl) in slowpath.rs, called
+  from `slow_path_worker` after `open_tun`; threaded an `mtu: i32` through
+  `SlowPathReinjector::new`. The value is sourced from a new testable
+  helper `ConfigSnapshot::slow_path_mtu()` (max of the per-interface MTUs
+  in the snapshot, clamped to a 1500 floor, ignoring non-positive). Call
+  site `apply_snapshot` passes `snapshot.slow_path_mtu()`. `open_tun` left
+  unchanged (shared by tunnel/WG attach paths that must NOT re-MTU a
+  pre-created device). A failed SIOCSIFMTU is non-fatal: logged +
+  last_error, TUN stays usable for <=current-MTU frames. Fail-on-revert
+  tests: 6 helper tests (largest-wins, single-source, 1500 floor,
+  empty/zero fallback, ignore non-positive) + set_if_mtu non-positive
+  reject + ifreq mtu-arm carry. cargo build --release clean; new tests 5x
+  green; mutation check max->min fails 2 tests.
+- **File(s)**: userspace-dp/src/slowpath.rs,
+  userspace-dp/src/protocol/snapshot.rs,
+  userspace-dp/src/afxdp/coordinator/reconcile/snapshot.rs,
+  docs/userspace-dataplane-architecture.md, _Log.md
+
+- **Timestamp**: 2026-06-23
+- **Action**: #2408 review folds (PR #2439). FOLD 1 (reviewer MINOR — doc
+  claim was wrong): the runtime-MTU-change limitation was undocumented.
+  (a) Added an explicit note to docs/userspace-dataplane-architecture.md:
+  the slow-path TUN MTU is set ONCE at creation (apply_snapshot's
+  preserved_slow_path==None branch); a later config MTU increase does NOT
+  reprogram the live TUN until the slow path is recreated (xpfd restart /
+  inactive->active). First-boot jumbo configs ARE covered. (b) Turned the
+  silent footgun diagnosable: SlowPathReinjector now stores its creation
+  `mtu` + exposes `mtu()`; the preserved-reinjector reconcile path compares
+  snapshot.slow_path_mtu() against it and emits ONE `xpf-ha:` eprintln
+  warning per distinct desired value (Coordinator.last_slow_path_mtu_warned
+  rate-limiter) — observability only, no behavior change. FOLD 2 (Copilot
+  trivial robustness): set_if_mtu opened the control socket BEFORE
+  IfReq::new, leaking the fd on an invalid-name early return — reordered to
+  build the ifreq first (set_if_up left alone to keep the diff scoped).
+  cargo build --release clean (no new warnings from this code); 7
+  slow_path_mtu/set_if_mtu tests green 5x.
+- **File(s)**: userspace-dp/src/slowpath.rs,
+  userspace-dp/src/afxdp/coordinator/mod.rs,
+  userspace-dp/src/afxdp/coordinator/reconcile/snapshot.rs,
+  docs/userspace-dataplane-architecture.md, _Log.md

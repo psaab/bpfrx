@@ -291,6 +291,33 @@ pub(crate) struct ConfigSnapshot {
     pub cold_path_sample_mask: Option<u64>,
 }
 
+/// Default MTU floor for the slow-path TUN (#2408). The kernel creates a TUN
+/// at 1500 by default; never set it below that even if the snapshot carries
+/// no usable interface MTU.
+pub(crate) const SLOW_PATH_MTU_FLOOR: i32 = 1500;
+
+impl ConfigSnapshot {
+    /// MTU to program on the slow-path TUN (#2408).
+    ///
+    /// Firewall-local and exception packets are reinjected through the
+    /// slow-path TUN device, which the kernel creates at the default 1500
+    /// MTU. On a jumbo-frame topology a reinjected frame larger than 1500
+    /// is silently dropped on the TUN egress. The TUN must therefore accept
+    /// any frame the dataplane handles, so size it to the LARGEST configured
+    /// data-interface MTU (clamped to a 1500 floor so we never shrink the
+    /// kernel default). Sourced from the per-interface MTU the control plane
+    /// already carries in the snapshot — never hardcoded.
+    pub(crate) fn slow_path_mtu(&self) -> i32 {
+        self.interfaces
+            .iter()
+            .map(|iface| iface.mtu)
+            .filter(|mtu| *mtu > 0)
+            .max()
+            .unwrap_or(SLOW_PATH_MTU_FLOOR)
+            .max(SLOW_PATH_MTU_FLOOR)
+    }
+}
+
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub(crate) struct MirrorConfigSnapshot {
@@ -567,5 +594,75 @@ mod wg_snapshot_tests {
         };
         let dbg = format!("{snap:?}");
         assert!(!dbg.contains("deadbeef"), "Debug must redact the private key: {dbg}");
+    }
+}
+
+#[cfg(test)]
+mod slow_path_mtu_tests {
+    use super::*;
+
+    fn iface(mtu: i32) -> InterfaceSnapshot {
+        InterfaceSnapshot {
+            mtu,
+            ..Default::default()
+        }
+    }
+
+    // #2408: the slow-path TUN MTU must track the LARGEST configured
+    // data-interface MTU so reinjected jumbo frames are not dropped. This
+    // FAILS if the helper hardcodes 1500 / does not pick the max.
+    #[test]
+    fn picks_largest_interface_mtu_for_jumbo() {
+        let snap = ConfigSnapshot {
+            interfaces: vec![iface(1500), iface(9000), iface(1400)],
+            ..Default::default()
+        };
+        assert_eq!(snap.slow_path_mtu(), 9000);
+    }
+
+    // The value is SOURCED from the interface MTU, not the 1500 default — a
+    // single configured interface at 8000 must propagate.
+    #[test]
+    fn sources_value_from_single_interface() {
+        let snap = ConfigSnapshot {
+            interfaces: vec![iface(8000)],
+            ..Default::default()
+        };
+        assert_eq!(snap.slow_path_mtu(), 8000);
+    }
+
+    // Never shrink below the kernel default TUN MTU (1500 floor), even if
+    // some interface carries a smaller MTU.
+    #[test]
+    fn never_below_1500_floor() {
+        let snap = ConfigSnapshot {
+            interfaces: vec![iface(1280), iface(576)],
+            ..Default::default()
+        };
+        assert_eq!(snap.slow_path_mtu(), SLOW_PATH_MTU_FLOOR);
+        assert_eq!(SLOW_PATH_MTU_FLOOR, 1500);
+    }
+
+    // No interfaces / no usable MTU -> the 1500 floor, never 0.
+    #[test]
+    fn empty_or_zero_mtu_falls_back_to_floor() {
+        let empty = ConfigSnapshot::default();
+        assert_eq!(empty.slow_path_mtu(), SLOW_PATH_MTU_FLOOR);
+
+        let zeros = ConfigSnapshot {
+            interfaces: vec![iface(0), iface(-1)],
+            ..Default::default()
+        };
+        assert_eq!(zeros.slow_path_mtu(), SLOW_PATH_MTU_FLOOR);
+    }
+
+    // Non-positive (0 / negative) MTUs are ignored; the largest positive wins.
+    #[test]
+    fn ignores_nonpositive_mtus() {
+        let snap = ConfigSnapshot {
+            interfaces: vec![iface(0), iface(9216), iface(-9), iface(1500)],
+            ..Default::default()
+        };
+        assert_eq!(snap.slow_path_mtu(), 9216);
     }
 }
