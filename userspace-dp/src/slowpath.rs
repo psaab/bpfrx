@@ -423,8 +423,10 @@ pub(crate) fn open_tun(name: &str) -> Result<(std::fs::File, String), String> {
     Ok((tun, actual_name))
 }
 
-/// Path to the host-global IPv4 reverse-path-filter sysctl. Split out as a
-/// constant so tests can substitute a temp-file path.
+/// Production default path to the host-global IPv4 reverse-path-filter sysctl.
+/// `read_all_rp_filter` takes the path as a parameter, so tests pass their own
+/// temp-file path directly; this constant is only the live-`/proc` default that
+/// `open_tun` reads.
 const ALL_RP_FILTER_PATH: &str = "/proc/sys/net/ipv4/conf/all/rp_filter";
 
 /// Read the integer value of `conf/all/rp_filter` from `path`. Returns `None`
@@ -435,21 +437,24 @@ fn read_all_rp_filter(path: &str) -> Option<i32> {
     raw.trim().parse::<i32>().ok()
 }
 
-/// Decide whether to warn about an ineffective per-device rp_filter=0.
+/// Decide whether to warn that a non-zero conf/all/rp_filter will drop
+/// slow-path reinjection.
 ///
-/// The kernel uses max(conf/all/rp_filter, conf/<dev>/rp_filter), so when
-/// conf/all/rp_filter is non-zero the per-device 0 is overridden and slow-path
-/// reinjection is dropped. Returns `Some(warning_line)` when `all_rpf` is a
-/// known non-zero value, `None` when it is 0 or unknown. Seamed (takes the
-/// already-read value) so it is unit-testable without touching live /proc.
+/// The kernel uses max(conf/all/rp_filter, conf/<dev>/rp_filter), so a non-zero
+/// conf/all/rp_filter defeats reverse-path acceptance on the slow-path TUN
+/// regardless of the per-device value. The message states the hazard from the
+/// all-knob directly (it does NOT assert that the per-device 0 was written), so
+/// it is accurate whether or not the per-device write succeeded. Returns
+/// `Some(warning_line)` when `all_rpf` is a known non-zero value, `None` when
+/// it is 0 or unknown. Seamed (takes the already-read value) so it is
+/// unit-testable without touching live /proc.
 fn rp_filter_all_warning(dev: &str, all_rpf: Option<i32>) -> Option<String> {
     match all_rpf {
         Some(v) if v != 0 => Some(format!(
-            "xpf-ha: WARNING net.ipv4.conf.all.rp_filter={v} overrides the \
-             per-device rp_filter=0 on slow-path TUN {dev}; the kernel uses \
-             max(all,dev) so slow-path reinjected IPv4 packets will be SILENTLY \
-             DROPPED until 'sysctl -w net.ipv4.conf.all.rp_filter=0' is set \
-             (#2378)"
+            "xpf-ha: WARNING net.ipv4.conf.all.rp_filter={v} is non-zero; the \
+             kernel uses max(all,dev) so slow-path reinjected IPv4 packets on \
+             TUN {dev} will be SILENTLY DROPPED until \
+             'sysctl -w net.ipv4.conf.all.rp_filter=0' is set (#2378)"
         )),
         _ => None,
     }

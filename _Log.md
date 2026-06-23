@@ -11959,3 +11959,13 @@ top.
 - **File(s)**: userspace-dp/src/slowpath.rs, pkg/networkd/networkd.go,
   pkg/networkd/rpfilter_test.go, docs/userspace-dataplane-architecture.md,
   _Log.md
+
+- **Timestamp**: 2026-06-23
+- **Action**: #2378 PR #2459 review folds — (1) corrected the ALL_RP_FILTER_PATH
+  doc comment (read_all_rp_filter takes the path as a parameter; the constant is
+  only the production default, not a test substitution seam). (2) Reworded both
+  the Rust eprintln! and the Go slog.Warn so the message states the all-knob
+  hazard directly and no longer asserts the per-device rp_filter=0 was written
+  — accurate even when the per-device write failed (drop hazard is then MORE
+  acute, so the warning is deliberately NOT suppressed). Tests/build green.
+- **File(s)**: userspace-dp/src/slowpath.rs, pkg/networkd/networkd.go, _Log.md

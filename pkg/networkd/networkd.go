@@ -279,10 +279,15 @@ func restoreSlowPathRPFilter() {
 }
 
 // warnIfAllRPFilterOverrides emits a loud warning when net.ipv4.conf.all.rp_filter
-// is non-zero, which overrides the per-device 0 set above (kernel uses
-// max(all, dev)) and silently drops slow-path reinjected IPv4 packets (#2378).
-// A missing or unparsable conf/all/rp_filter is treated as "cannot determine"
-// and stays quiet so a read failure never produces a spurious warning.
+// is non-zero. The kernel uses max(conf/all/rp_filter, conf/<dev>/rp_filter), so
+// a non-zero conf/all knob silently drops slow-path reinjected IPv4 packets
+// regardless of the per-device value (#2378). The message states the hazard from
+// the all-knob directly and does NOT assert that the per-device write above
+// succeeded — so it stays accurate when the per-device write failed (in which
+// case the drop hazard is in fact MORE acute, and suppressing the warning would
+// hide a still-relevant signal). A missing or unparsable conf/all/rp_filter is
+// treated as "cannot determine" and stays quiet so a read failure never produces
+// a spurious warning.
 func warnIfAllRPFilterOverrides(tunName string) {
 	allPath := fmt.Sprintf("%s/conf/all/rp_filter", procSysNetRoot)
 	raw, err := os.ReadFile(allPath)
@@ -293,8 +298,8 @@ func warnIfAllRPFilterOverrides(tunName string) {
 	if err != nil || val == 0 {
 		return
 	}
-	slog.Warn("net.ipv4.conf.all.rp_filter overrides per-device rp_filter=0 on "+
-		"slow-path TUN; reinjected IPv4 packets will be SILENTLY DROPPED until "+
+	slog.Warn("net.ipv4.conf.all.rp_filter is non-zero; kernel uses max(all,dev) "+
+		"so slow-path reinjected IPv4 packets will be SILENTLY DROPPED until "+
 		"'sysctl -w net.ipv4.conf.all.rp_filter=0' is set",
 		"tun", tunName, "all_rp_filter", val, "issue", 2378)
 }
