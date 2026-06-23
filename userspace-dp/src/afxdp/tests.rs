@@ -3758,11 +3758,20 @@ fn embedded_icmp_nat_match_translates_redirect_v4() {
     let client_port: u16 = 12345;
 
     // ICMPv4 Redirect (5) carrying the SNAT'd inner tuple, then flip from
-    // the shared type-11 builder to type 5.
+    // the shared type-11 builder to type 5. Unlike Time Exceeded (whose
+    // bytes 4..8 are an unused word), a Redirect carries the better-gateway
+    // address there; set a distinctive non-zero sentinel so the test
+    // exercises a realistic Redirect AND can prove the embedded-NAT rewrite
+    // (at l4+8) leaves the gateway field (l4+4..8) untouched. Set the
+    // gateway BEFORE `rewrite_outer_icmpv4_type`, which recomputes the ICMP
+    // checksum over the whole header so the frame stays valid.
+    const REDIRECT_GATEWAY: [u8; 4] = [192, 0, 2, 1]; // RFC 5737 TEST-NET-1
     let mut frame =
         build_icmp_te_frame_v4(router_ip, snat_ip, server_ip, snat_port, 80, PROTO_TCP);
+    frame[38..42].copy_from_slice(&REDIRECT_GATEWAY); // ICMP bytes 4..8 = gateway
     rewrite_outer_icmpv4_type(&mut frame, 34, 5);
     assert_eq!(frame[34], 5, "outer ICMP type must be Redirect");
+    assert_eq!(&frame[38..42], &REDIRECT_GATEWAY, "gateway set in input frame");
 
     let meta = UserspaceDpMeta {
         magic: USERSPACE_META_MAGIC,
@@ -3862,6 +3871,17 @@ fn embedded_icmp_nat_match_translates_redirect_v4() {
     assert_eq!(
         embedded_src, client_ip,
         "embedded inner src must be translated from SNAT addr back to client"
+    );
+    // The Redirect-specific invariant: the gateway-address field (ICMP
+    // bytes 4..8 = frame offset 38..42, before the quoted IP at l4+8=42)
+    // must survive the embedded-NAT rewrite byte-for-byte. The rewrite
+    // touches only the quoted inner packet at l4+8 and the outer IP — never
+    // the type-specific header word. This assertion FAILS if the rewrite is
+    // ever changed to write into l4+4..8.
+    assert_eq!(
+        &result[38..42],
+        &REDIRECT_GATEWAY,
+        "Redirect gateway address must be preserved through embedded-NAT rewrite"
     );
 }
 

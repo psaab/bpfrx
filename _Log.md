@@ -30,6 +30,25 @@
   userspace-dp/src/afxdp/tests.rs, docs/userspace-icmp-te-debugging.md,
   _Log.md
 
+## 2026-06-23 — #2393 Copilot fold: assert Redirect gateway preserved (test-only)
+
+- **Timestamp**: 2026-06-23 PDT
+- **Action**: Test strengthening (no code change) on PR #2432. The new
+  `embedded_icmp_nat_match_translates_redirect_v4` crafted the Redirect by
+  flipping only the type byte, leaving the Redirect gateway-address field
+  (ICMP header bytes 4..8) all-zero (inherited from the Time-Exceeded
+  template's unused word) — an unrealistic Redirect that also did not prove
+  the rewrite leaves the gateway field alone. Set the gateway to a non-zero
+  sentinel (192.0.2.1, RFC 5737 TEST-NET-1) before recomputing the ICMP
+  checksum, and added an assertion that the gateway field
+  (`result[38..42]`) is preserved byte-for-byte through the embedded-NAT
+  reversal — proving the rewrite touches only the quoted inner packet at
+  l4+8 and the outer IP, never the type-specific header word at l4+4..8.
+  Verified the new assertion FAILS when a temporary clobber of the output
+  gateway byte is injected. Targeted suite (icmp/embedded/redirect) 5x
+  green; build clean.
+- **File(s)**: userspace-dp/src/afxdp/tests.rs, _Log.md
+
 ## 2026-06-23 — #2369 ARP fixed-header validation before neighbor learning
 
 - **Timestamp**: 2026-06-23 PDT
