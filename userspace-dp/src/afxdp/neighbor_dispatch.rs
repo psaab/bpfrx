@@ -62,8 +62,9 @@ pub(super) enum PendingNeighAdmission {
     /// each unresolved hop pins at most one UMEM frame).
     DuplicateDrop,
     /// New key but the map is at `MAX_PENDING_NEIGH` distinct hops →
-    /// capacity drop (counted nowhere per the #1782 split; the
-    /// duplicate counter must not conflate this case).
+    /// capacity drop (counted SEPARATELY in `pending_neigh_capacity_drops`
+    /// per the #2375 split; the duplicate counter must not conflate this
+    /// case).
     CapacityDrop,
 }
 
@@ -78,6 +79,37 @@ pub(super) fn pending_neigh_admission(already_pending: bool, len: usize) -> Pend
         PendingNeighAdmission::Buffer
     } else {
         PendingNeighAdmission::CapacityDrop
+    }
+}
+
+/// #2375: record the per-binding drop counter for a non-buffered
+/// `pending_neigh` admission decision. Extracted (behavior-identical to
+/// the inline `fetch_add`s) so the two drop counters are a tested
+/// side-effect rather than an inline branch — a unit test FAILS if
+/// either increment is removed. `Buffer` is not a drop, so it is a
+/// no-op here (the caller does the insert). The two drop cases are kept
+/// SEPARATE per the #1782/#2375 split:
+///   - `DuplicateDrop` (`pending_neigh_duplicate_drops`) — the key was
+///     already pending: normal cold-start sibling coalescing.
+///   - `CapacityDrop` (`pending_neigh_capacity_drops`) — a NEW distinct
+///     hop refused because the map is at `MAX_PENDING_NEIGH`:
+///     distinct-hop neighbor exhaustion (the scan/upstream-outage
+///     failure mode).
+#[inline]
+pub(super) fn record_pending_neigh_admission_drop(
+    live: &BindingLiveState,
+    admission: PendingNeighAdmission,
+) {
+    match admission {
+        PendingNeighAdmission::DuplicateDrop => {
+            live.pending_neigh_duplicate_drops
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        PendingNeighAdmission::CapacityDrop => {
+            live.pending_neigh_capacity_drops
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        PendingNeighAdmission::Buffer => {}
     }
 }
 
@@ -1148,5 +1180,59 @@ mod pending_admission_tests {
             pending_neigh_admission(false, MAX_PENDING_NEIGH),
             PendingNeighAdmission::CapacityDrop
         );
+    }
+
+    /// #2375 fail-on-revert: the capacity-drop branch increments
+    /// `pending_neigh_capacity_drops` and ONLY that counter, kept
+    /// distinct from `pending_neigh_duplicate_drops`. This test drives
+    /// the same `record_pending_neigh_admission_drop` helper the poll
+    /// loop calls, so deleting the capacity increment (the original
+    /// silent `CapacityDrop => {}` bug) fails here. Buffer is a no-op.
+    #[test]
+    fn record_drop_counts_capacity_separately() {
+        use super::record_pending_neigh_admission_drop;
+        use crate::afxdp::umem::BindingLiveState;
+        use std::sync::atomic::Ordering;
+
+        let live = BindingLiveState::new();
+        assert_eq!(live.pending_neigh_capacity_drops.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            live.pending_neigh_duplicate_drops.load(Ordering::Relaxed),
+            0
+        );
+
+        // Buffer is not a drop — neither counter moves.
+        record_pending_neigh_admission_drop(&live, PendingNeighAdmission::Buffer);
+        assert_eq!(live.pending_neigh_capacity_drops.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            live.pending_neigh_duplicate_drops.load(Ordering::Relaxed),
+            0
+        );
+
+        // A capacity drop bumps ONLY the capacity counter.
+        record_pending_neigh_admission_drop(&live, PendingNeighAdmission::CapacityDrop);
+        assert_eq!(live.pending_neigh_capacity_drops.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            live.pending_neigh_duplicate_drops.load(Ordering::Relaxed),
+            0,
+            "capacity drop must not be conflated with the duplicate counter"
+        );
+
+        // Three more distinct-hop capacity drops → exactly 4 total
+        // (mirrors the issue's MAX_PENDING_NEIGH-then-one-more scenario
+        // repeated; the increment is per refused new key).
+        for _ in 0..3 {
+            record_pending_neigh_admission_drop(&live, PendingNeighAdmission::CapacityDrop);
+        }
+        assert_eq!(live.pending_neigh_capacity_drops.load(Ordering::Relaxed), 4);
+
+        // A duplicate drop bumps ONLY the duplicate counter, leaving the
+        // capacity counter narrow.
+        record_pending_neigh_admission_drop(&live, PendingNeighAdmission::DuplicateDrop);
+        assert_eq!(
+            live.pending_neigh_duplicate_drops.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(live.pending_neigh_capacity_drops.load(Ordering::Relaxed), 4);
     }
 }

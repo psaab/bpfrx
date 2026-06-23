@@ -1534,6 +1534,62 @@ func TestProcessStatusNeighborPhase3CountersRoundTrip(t *testing.T) {
 	}
 }
 
+// #2375: wire pin for the pending_neigh distinct-hop capacity-drop
+// counter. Mirrors the Rust
+// process_status_pending_neigh_capacity_drops_roundtrip test — a rename
+// or a one-sided add fails a test instead of silently decoding zero
+// (#1961 one-sided-field risk). The duplicate counter must stay a
+// SEPARATE wire key (the #1782/#2375 split).
+func TestProcessStatusPendingNeighCapacityDropsRoundTrip(t *testing.T) {
+	in := ProcessStatus{
+		PendingNeighCapacityDropsTotal:  9,
+		PendingNeighDuplicateDropsTotal: 4,
+	}
+	raw, err := json.Marshal(&in)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var obj map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		t.Fatalf("unmarshal obj: %v", err)
+	}
+	for _, key := range []string{
+		"pending_neigh_capacity_drops_total",
+		"pending_neigh_duplicate_drops_total",
+	} {
+		if _, ok := obj[key]; !ok {
+			t.Fatalf("wire key %q missing from ProcessStatus JSON: %s", key, string(raw))
+		}
+	}
+
+	var back ProcessStatus
+	if err := json.Unmarshal(raw, &back); err != nil {
+		t.Fatalf("unmarshal ProcessStatus: %v", err)
+	}
+	if back.PendingNeighCapacityDropsTotal != in.PendingNeighCapacityDropsTotal {
+		t.Fatalf("capacity round-trip mismatch: got %d, want %d",
+			back.PendingNeighCapacityDropsTotal, in.PendingNeighCapacityDropsTotal)
+	}
+	if back.PendingNeighDuplicateDropsTotal != in.PendingNeighDuplicateDropsTotal {
+		t.Fatalf("duplicate round-trip mismatch: got %d, want %d",
+			back.PendingNeighDuplicateDropsTotal, in.PendingNeighDuplicateDropsTotal)
+	}
+
+	// Pre-#2375 helper payload (key absent) must decode to zero.
+	var legacy ProcessStatus
+	if err := json.Unmarshal([]byte(`{"pending_neigh_duplicate_drops_total":7}`), &legacy); err != nil {
+		t.Fatalf("unmarshal legacy ProcessStatus: %v", err)
+	}
+	if legacy.PendingNeighCapacityDropsTotal != 0 {
+		t.Fatalf("legacy decode must zero-default capacity field: %d",
+			legacy.PendingNeighCapacityDropsTotal)
+	}
+	if legacy.PendingNeighDuplicateDropsTotal != 7 {
+		t.Fatalf("legacy duplicate field decode = %d, want 7",
+			legacy.PendingNeighDuplicateDropsTotal)
+	}
+}
+
 // #1829 Phase 1: wire pin for the sojourn telemetry trio on
 // CoSQueueStatus. Mirrors the Rust cos_queue_status_sojourn_roundtrip_1829
 // test — a rename on either side fails a test instead of silently

@@ -1253,6 +1253,11 @@ func newCollector(srv *Server) *xpfCollector {
 			"GRE-decapped MissingNeighbor packets refused pending_neigh admission: the buffered descriptor would pair the un-decapped OUTER UMEM frame with the post-decap INNER meta, and the neighbor-resolution retry would TX a mis-rewritten outer packet (#1902).",
 			nil, nil,
 		),
+		pendingNeighCapacityDropsTotal: prometheus.NewDesc(
+			"xpf_userspace_pending_neigh_capacity_drops_total",
+			"MissingNeighbor packets for a NEW distinct (egress_ifindex, next_hop) dropped because the per-binding pending_neigh map is at MAX_PENDING_NEIGH distinct unresolved hops — distinct-hop neighbor exhaustion (a scan or upstream outage hitting many cold next hops). Counted separately from xpf_userspace_pending_neigh_duplicate_drops_total, which is normal cold-start coalescing of siblings for an already-pending hop (#2375).",
+			nil, nil,
+		),
 		dynamicNeighborPresent: prometheus.NewDesc(
 			"xpf_userspace_dynamic_neighbor_present",
 			"Per-key presence gauge (always 1) dumped from the helper userspace dynamic_neighbors mirror so the cold-start capture harness can grep the pre-connect t0' next-hop membership (the H2 absence fingerprint) (#1782). DEBUG-ONLY: gated behind the helper's XPF_DEBUG_NEIGHBOR_KEYS env var and absent by default — an absent metric family means the dump is disabled, NOT that dynamic_neighbors is empty.",

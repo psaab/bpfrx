@@ -363,7 +363,12 @@ type xpfCollector struct {
 	// #1902: decap-refusal gate at pending_neigh admission (frame/meta
 	// pairing defect class — see also #1885/#1873).
 	pendingNeighDecapDropsTotal *prometheus.Desc
-	dynamicNeighborPresent      *prometheus.Desc
+	// #2375: distinct-hop capacity-drop gate at pending_neigh admission —
+	// a NEW unresolved hop refused because the per-binding map is at
+	// MAX_PENDING_NEIGH (the scan/upstream-outage failure mode). Kept
+	// separate from pendingNeighDuplicateDropsTotal.
+	pendingNeighCapacityDropsTotal *prometheus.Desc
+	dynamicNeighborPresent         *prometheus.Desc
 	// #1769: on-demand neighbor-resolver telemetry — the operator-visible
 	// signal for the MissingNeighbor stuck-state.
 	neighborResolverQueueDepth        *prometheus.Desc
@@ -618,6 +623,7 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.negNeighFastFailTotal
 	ch <- c.pendingNeighDuplicateDropsTotal
 	ch <- c.pendingNeighDecapDropsTotal
+	ch <- c.pendingNeighCapacityDropsTotal
 	ch <- c.dynamicNeighborPresent
 	ch <- c.neighborResolverQueueDepth
 	ch <- c.neighborResolverEnqueueDropsTotal

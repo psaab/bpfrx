@@ -64,6 +64,12 @@ pub(crate) fn refresh_status(state: &mut ServerState) {
     // outer-frame/inner-meta pairing must never reach the in-place
     // retry TX path).
     state.status.pending_neigh_decap_drops_total = state.afxdp.pending_neigh_decap_drops_total();
+    // #2375: distinct-hop capacity-drop gate at pending_neigh admission
+    // (a NEW unresolved hop refused because the map is at
+    // MAX_PENDING_NEIGH) — the scan/upstream-outage failure mode, kept
+    // separate from the duplicate-drop counter.
+    state.status.pending_neigh_capacity_drops_total =
+        state.afxdp.pending_neigh_capacity_drops_total();
     // #1789: total failed USERSPACE_SESSIONS BPF-map publishes
     // (per-binding worker-poll sites + shared no-binding sites). The
     // cause-side signal for rising XDP-shim NO_SESSION fallbacks.

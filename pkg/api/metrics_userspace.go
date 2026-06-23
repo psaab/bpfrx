@@ -191,6 +191,11 @@ func (c *xpfCollector) emitNeighborColdStartCapture(ch chan<- prometheus.Metric,
 		prometheus.CounterValue,
 		float64(status.PendingNeighDecapDropsTotal),
 	)
+	ch <- prometheus.MustNewConstMetric(
+		c.pendingNeighCapacityDropsTotal,
+		prometheus.CounterValue,
+		float64(status.PendingNeighCapacityDropsTotal),
+	)
 	for _, key := range status.DynamicNeighborKeys {
 		// Each key is rendered "ifindex ip" by the helper. Split on the
 		// single space into the two gauge labels; skip a malformed entry

@@ -529,6 +529,18 @@ pub(in crate::afxdp) struct BindingLiveState {
     /// `Coordinator::pending_neigh_decap_drops_total()` (Prometheus
     /// `xpf_userspace_pending_neigh_decap_drops_total`).
     pub(super) pending_neigh_decap_drops: AtomicU64,
+    /// #2375: per-binding count of `pending_neigh` admissions REFUSED
+    /// because the map already holds `MAX_PENDING_NEIGH` distinct
+    /// unresolved `(egress_ifindex, next_hop)` hops — the capacity-drop
+    /// case (a NEW distinct hop the worker cannot accept). Distinct from
+    /// `pending_neigh_duplicate_drops` (the key was already pending —
+    /// normal cold-start coalescing): a rising capacity counter means
+    /// the worker is refusing NEW unresolved destinations (distinct-hop
+    /// neighbor exhaustion / possible scan or upstream outage). The
+    /// refused packet is recycled exactly like the duplicate case.
+    /// Surfaced via `Coordinator::pending_neigh_capacity_drops_total()`
+    /// (Prometheus `xpf_userspace_pending_neigh_capacity_drops_total`).
+    pub(super) pending_neigh_capacity_drops: AtomicU64,
     /// #1771 §2.6: distinct unresolved `(egress_ifindex, next_hop)` keys
     /// currently buffered in this binding's `pending_neigh` map (gauge —
     /// post-#1779 §2.2 the map holds at most ONE representative packet
@@ -823,6 +835,7 @@ impl BindingLiveState {
             neg_neigh_fast_fail: AtomicU64::new(0),
             pending_neigh_duplicate_drops: AtomicU64::new(0),
             pending_neigh_decap_drops: AtomicU64::new(0),
+            pending_neigh_capacity_drops: AtomicU64::new(0),
             pending_neigh_keys: AtomicU64::new(0),
             neg_neigh_keys: AtomicU64::new(0),
             session_publish_errors: AtomicU64::new(0),
