@@ -126,13 +126,24 @@ func ValidateConfig(cfg *Config) []string {
 		}
 	}
 
-	// Validate policies
+	// Validate policies. Exempt the reserved special-zone tokens (`any`,
+	// `junos-host`, the empty token) via the SAME policyZoneSpecialTokens set
+	// the strict gate (validatePolicyZoneReferencesStrict, #2401) uses — a
+	// single source of truth so a config that legitimately references
+	// `junos-host` (or carries an empty token) does not draw a spurious
+	// "zone not defined" warning while the strict path correctly accepts it.
+	policyZoneDefined := func(zone string) bool {
+		if _, special := policyZoneSpecialTokens[zone]; special {
+			return true
+		}
+		return zones[zone]
+	}
 	for _, zpp := range cfg.Security.Policies {
-		if zpp.FromZone != "any" && !zones[zpp.FromZone] {
+		if !policyZoneDefined(zpp.FromZone) {
 			warnings = append(warnings, fmt.Sprintf(
 				"policy from-zone %q: zone not defined", zpp.FromZone))
 		}
-		if zpp.ToZone != "any" && !zones[zpp.ToZone] {
+		if !policyZoneDefined(zpp.ToZone) {
 			warnings = append(warnings, fmt.Sprintf(
 				"policy to-zone %q: zone not defined", zpp.ToZone))
 		}

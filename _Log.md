@@ -11127,3 +11127,21 @@ top.
     pkg/config/policy_zone_ref_test.go (new),
     pkg/dataplane/userspace/nested_app_set_policy_test.go,
     docs/config-schema.md, _Log.md (+ pkg/config test fixtures)
+
+- **Timestamp**: 2026-06-23
+  - **Action**: #2401 Copilot review folds (PR #2414). (1) Consistency
+    fix: the pre-existing ValidateConfig warn-validator
+    (compiler_validate_warn.go) only exempted "any" from the policy
+    "zone not defined" warning, while the strict gate exempts
+    policyZoneSpecialTokens = {"", "any", "junos-host"}. A valid config
+    using `to-zone junos-host` therefore committed cleanly but still drew
+    a spurious warning. Made the warn path share the SAME
+    policyZoneSpecialTokens membership set (single source of truth) so
+    junos-host / "" produce NEITHER a reject NOR a warning. (2) Test nit:
+    the new deletion path in parser_ast_test.go ignored the
+    ParseSetCommand error; now checks it and t.Fatalf's fail-fast. Added
+    TestPolicyJunosHostNoWarningOrReject (fail-on-revert: narrowing the
+    warn exemption back to just "any" makes it fail).
+  - **File(s)**: pkg/config/compiler_validate_warn.go,
+    pkg/config/parser_ast_test.go, pkg/config/policy_zone_ref_test.go,
+    _Log.md

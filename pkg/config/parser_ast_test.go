@@ -569,7 +569,10 @@ func TestDeletePath(t *testing.T) {
 	// commit (#2401 fail-closed). Remove the orphaned policy so the final
 	// compile exercises the deletion mechanics this test asserts (zone counts
 	// + zone contents), not the undefined-zone gate.
-	path, _ = ParseSetCommand("delete security policies from-zone trust to-zone untrust")
+	path, errDel := ParseSetCommand("delete security policies from-zone trust to-zone untrust")
+	if errDel != nil {
+		t.Fatalf("ParseSetCommand(delete orphaned zone-pair policy): %v", errDel)
+	}
 	if err := tree.DeletePath(path); err != nil {
 		t.Fatalf("delete orphaned zone-pair policy: %v", err)
 	}

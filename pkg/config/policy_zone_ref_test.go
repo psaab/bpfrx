@@ -91,6 +91,33 @@ func TestPolicySpecialZoneTokensCommit(t *testing.T) {
 	}
 }
 
+// TestPolicyJunosHostNoWarningOrReject asserts the strict gate and the
+// ValidateConfig warn pass agree on the special-zone exemption set (#2401
+// consistency fold): a policy referencing the reserved `junos-host` self-traffic
+// zone produces NEITHER a hard commit reject NOR a spurious
+// "policy to-zone \"junos-host\": zone not defined" warning. Before the fix the
+// warn validator only exempted `any`, so junos-host drew a confusing warning
+// even though the strict path correctly accepted it. This is the fail-on-revert
+// guard for the warn/strict divergence: narrowing the warn exemption back to
+// just `any` makes the spurious-warning assertion fail.
+func TestPolicyJunosHostNoWarningOrReject(t *testing.T) {
+	tree := buildTree(t, []string{
+		"set security zones security-zone trust",
+		"set security policies from-zone trust to-zone junos-host policy host match source-address any",
+		"set security policies from-zone trust to-zone junos-host policy host match application any",
+		"set security policies from-zone trust to-zone junos-host policy host then permit",
+	})
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("strict commit rejected a junos-host policy: %v", err)
+	}
+	for _, w := range ValidateConfig(cfg) {
+		if strings.Contains(w, "junos-host") && strings.Contains(w, "zone not defined") {
+			t.Fatalf("ValidateConfig emitted a spurious junos-host zone-not-defined warning: %q", w)
+		}
+	}
+}
+
 // TestPolicyDefinedZonesCommit asserts that a wholly normal policy with every
 // referenced zone defined commits cleanly (#2401).
 func TestPolicyDefinedZonesCommit(t *testing.T) {
