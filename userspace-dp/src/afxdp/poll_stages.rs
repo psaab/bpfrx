@@ -85,7 +85,7 @@ pub(super) fn stage_link_layer_classify(
     // and `meta.ingress_vlan_id` selects the logical interface;
     // resolving (parent, vlan) -> logical makes the insert key match the
     // lookup key, so the just-learned entry is found instead of falling
-    // through to the MissingNeighbor cold path. The SAME `learn_ifindex`
+    // through to the MissingNeighbor cold path. The SAME logical ifindex
     // keys `add_kernel_neighbor` too (already correct before this fix).
     // For untagged / non-VLAN interfaces the mapping resolves
     // physical == logical, so behavior is unchanged; if no logical
@@ -93,21 +93,31 @@ pub(super) fn stage_link_layer_classify(
     // dropping the learned neighbor. Two VLANs sharing a physical port
     // resolve to distinct logical ifindexes (distinct (parent, vlan)
     // keys), so a same-IP-different-subnet neighbor never collides.
-    let learn_ifindex = resolve_ingress_logical_ifindex(
-        worker_ctx.forwarding,
-        meta.ingress_ifindex as i32,
-        meta.ingress_vlan_id,
-    )
-    .unwrap_or(meta.ingress_ifindex as i32);
+    //
+    // The resolve is computed ONLY inside the ARP-reply / NDP-NA learn
+    // arms below, NOT at the top of the stage. This stage runs per-packet
+    // for ALL ingress traffic (before the flow-cache fast path), so the
+    // overwhelming majority of packets (every non-ARP/non-NDP frame,
+    // including flow-cache hits) must skip the FastMap lookup entirely —
+    // they pay zero resolve cost, matching the pre-#2370 data path.
+    let learn_ifindex = || {
+        resolve_ingress_logical_ifindex(
+            worker_ctx.forwarding,
+            meta.ingress_ifindex as i32,
+            meta.ingress_vlan_id,
+        )
+        .unwrap_or(meta.ingress_ifindex as i32)
+    };
     match parser::classify_arp(raw_frame) {
         parser::ArpClassification::Reply(arp) => {
+            let ifindex = learn_ifindex();
             worker_ctx.dynamic_neighbors.insert(
-                (learn_ifindex, arp.sender_ip),
+                (ifindex, arp.sender_ip),
                 NeighborEntry {
                     mac: arp.sender_mac,
                 },
             );
-            add_kernel_neighbor(learn_ifindex, arp.sender_ip, arp.sender_mac);
+            add_kernel_neighbor(ifindex, arp.sender_ip, arp.sender_mac);
             return StageOutcome::RecycleAndContinue;
         }
         parser::ArpClassification::OtherArp => {
@@ -118,10 +128,11 @@ pub(super) fn stage_link_layer_classify(
     if let Some(na) = parser::parse_ndp_neighbor_advert(raw_frame)
         && let Some(mac) = na.target_mac
     {
+        let ifindex = learn_ifindex();
         worker_ctx
             .dynamic_neighbors
-            .insert((learn_ifindex, na.target_ip), NeighborEntry { mac });
-        add_kernel_neighbor(learn_ifindex, na.target_ip, mac);
+            .insert((ifindex, na.target_ip), NeighborEntry { mac });
+        add_kernel_neighbor(ifindex, na.target_ip, mac);
     }
     StageOutcome::Continue(())
 }
@@ -1102,10 +1113,16 @@ mod tests {
 
     /// Build a `WorkerContext` over the supplied forwarding state and a
     /// fresh empty dynamic-neighbor map, returning the map so the test
-    /// can assert the key the stage inserted under. The boxed values are
-    /// leaked: each test runs once and the process exits, so this trades
-    /// a tiny one-shot leak for a borrow-friendly `'static` context that
-    /// avoids threading a dozen owned locals through every call site.
+    /// can assert the key the stage inserted under.
+    ///
+    /// The boxed values are intentionally `Box::leak`'d to obtain the
+    /// `&'static` borrows the `WorkerContext<'a>` shape requires, instead
+    /// of threading a dozen owned locals through every call site. The
+    /// leak is NOT one-shot: a single test binary runs many tests in one
+    /// process, so each `neighbor_learn_ctx` call adds a small, bounded
+    /// allocation that persists for the test-binary lifetime. This is
+    /// test-only and the per-call footprint is tiny (a handful of empty
+    /// maps + the context struct), so the accumulation is harmless.
     fn neighbor_learn_ctx(
         forwarding: &'static ForwardingState,
     ) -> (&'static WorkerContext<'static>, Arc<ShardedNeighborMap>) {
@@ -1423,45 +1440,11 @@ mod tests {
         f.push(1);
         f.extend_from_slice(&target_mac);
         let packet_end = l3_start + 40 + payload_len as usize;
-        let csum = compute_icmpv6_checksum_local(&f, l3_start, l4_start, packet_end);
-        f[l4_start + 2..l4_start + 4].copy_from_slice(&csum.to_be_bytes());
+        // Shared stamper (single source of truth, also used by the #2368
+        // parser tests) — the strict NA parser requires a valid checksum.
+        super::super::test_fixtures::stamp_icmpv6_checksum(
+            &mut f, l3_start, l4_start, packet_end,
+        );
         (f, IpAddr::V6(Ipv6Addr::from(target_bytes)), target_mac)
-    }
-
-    /// One's-complement ICMPv6 checksum over the IPv6 pseudo-header +
-    /// the ICMPv6 message (`l4_start..packet_end`). Local copy mirroring
-    /// the parser-test stamper so the strict NA parser accepts the frame.
-    fn compute_icmpv6_checksum_local(
-        frame: &[u8],
-        l3_start: usize,
-        l4_start: usize,
-        packet_end: usize,
-    ) -> u16 {
-        let mut sum: u32 = 0;
-        let mut add = |bytes: &[u8]| {
-            let mut i = 0;
-            while i + 1 < bytes.len() {
-                sum += u16::from_be_bytes([bytes[i], bytes[i + 1]]) as u32;
-                i += 2;
-            }
-            if i < bytes.len() {
-                sum += (bytes[i] as u32) << 8;
-            }
-        };
-        // Pseudo-header: src(16) + dst(16) + upper-len(4) + zeros(3) + nh(1).
-        add(&frame[l3_start + 8..l3_start + 24]); // src
-        add(&frame[l3_start + 24..l3_start + 40]); // dst
-        let upper_len = (packet_end - l4_start) as u32;
-        add(&upper_len.to_be_bytes());
-        add(&[0, 0, 0, 58]);
-        // ICMPv6 message with checksum field zeroed.
-        let mut icmp = frame[l4_start..packet_end].to_vec();
-        icmp[2] = 0;
-        icmp[3] = 0;
-        add(&icmp);
-        while (sum >> 16) != 0 {
-            sum = (sum & 0xffff) + (sum >> 16);
-        }
-        !(sum as u16)
     }
 }
