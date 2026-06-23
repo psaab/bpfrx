@@ -11555,3 +11555,24 @@ top.
 - **File(s)**: userspace-dp/src/afxdp/poll_stages.rs,
     userspace-dp/src/afxdp/parser_tests.rs,
     userspace-dp/src/afxdp/test_fixtures.rs, _Log.md
+
+## 2026-06-23 — #2375 pending_neigh capacity-drop counter (recover + finish)
+- **Timestamp**: 2026-06-23
+- **Action**: Recovered a prior agent's uncommitted end-to-end wiring for
+  the silent `pending_neigh` CapacityDrop counter (#2375). Finished the gaps:
+  extracted `record_pending_neigh_admission_drop` helper (neighbor_dispatch.rs)
+  so the duplicate AND capacity increments are a unit-tested side-effect
+  (fail-on-revert); fixed the stale "counted nowhere" comments; regenerated
+  protocol_wire_v1.json (one new key); added Rust + Go ProcessStatus
+  round-trip parity tests (#serde(default), #1961 one-sided guard) and a
+  Rust fail-on-revert test; updated docs/userspace-dataplane-architecture.md.
+- **File(s)**: userspace-dp/src/afxdp/neighbor_dispatch.rs,
+  userspace-dp/src/afxdp/poll_descriptor/mod.rs, userspace-dp/src/afxdp/mod.rs,
+  userspace-dp/src/afxdp/umem/mod.rs, userspace-dp/src/afxdp/coordinator/status.rs,
+  userspace-dp/src/protocol/control.rs, userspace-dp/src/protocol/tests.rs,
+  userspace-dp/src/server/helpers.rs, userspace-dp/src/server/lifecycle.rs,
+  userspace-dp/tests/fixtures/protocol_wire_v1.json,
+  pkg/dataplane/userspace/protocol.go, pkg/dataplane/userspace/protocol_test.go,
+  pkg/api/metrics.go, pkg/api/metrics_descriptors.go, pkg/api/metrics_userspace.go,
+  pkg/api/metrics_descriptor_coverage_test.go,
+  docs/userspace-dataplane-architecture.md

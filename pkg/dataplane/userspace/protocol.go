@@ -810,8 +810,15 @@ type ProcessStatus struct {
 	// admission — buffering the outer UMEM frame with the post-decap
 	// inner meta would retry-TX a mis-rewritten outer packet once the
 	// neighbor resolves.
-	PendingNeighDecapDropsTotal uint64   `json:"pending_neigh_decap_drops_total,omitempty"`
-	DynamicNeighborKeys         []string `json:"dynamic_neighbor_keys,omitempty"`
+	PendingNeighDecapDropsTotal uint64 `json:"pending_neigh_decap_drops_total,omitempty"`
+	// #2375: MissingNeighbor packets for a NEW distinct (egress_ifindex,
+	// next_hop) refused because pending_neigh is at MAX_PENDING_NEIGH
+	// distinct hops (distinct-hop neighbor exhaustion — the
+	// scan/upstream-outage failure mode). Separate from
+	// PendingNeighDuplicateDropsTotal (the key was already pending —
+	// normal cold-start coalescing).
+	PendingNeighCapacityDropsTotal uint64   `json:"pending_neigh_capacity_drops_total,omitempty"`
+	DynamicNeighborKeys            []string `json:"dynamic_neighbor_keys,omitempty"`
 	// #1789: total failed USERSPACE_SESSIONS BPF-map publishes (per-binding
 	// worker-poll sites summed with the shared no-binding sites: HA upsert,
 	// session-glue worker publish, post-reconcile replay, activation/reverse

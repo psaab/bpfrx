@@ -3346,7 +3346,8 @@ pub(super) fn poll_binding_process_descriptor(
                                 // H5 sibling drop (key already pending — the
                                 // first packet drove the kernel probe); the
                                 // CapacityDrop branch is a distinct
-                                // condition, counted nowhere here. #1771
+                                // condition, counted SEPARATELY (#2375) in
+                                // pending_neigh_capacity_drops. #1771
                                 // §2.4: the decision is the pure
                                 // `pending_neigh_admission` helper so
                                 // invariant N1's "at most one buffered
@@ -3355,16 +3356,20 @@ pub(super) fn poll_binding_process_descriptor(
                                 // iff the key is absent AND there is room,
                                 // otherwise `recycle_now` stays true and
                                 // the frame is recycled.
-                                match pending_neigh_admission(
+                                let admission = pending_neigh_admission(
                                     binding.pending_neigh.contains_key(&pending_key),
                                     binding.pending_neigh.len(),
-                                ) {
-                                    PendingNeighAdmission::DuplicateDrop => {
-                                        binding
-                                            .live
-                                            .pending_neigh_duplicate_drops
-                                            .fetch_add(1, Ordering::Relaxed);
-                                    }
+                                );
+                                // #2375: record the drop counters via the
+                                // extracted helper so both the duplicate and
+                                // the capacity case are a unit-tested
+                                // side-effect (the test fails if either
+                                // increment is removed). Buffer is a no-op
+                                // here — the buffering insert stays inline
+                                // below.
+                                record_pending_neigh_admission_drop(&binding.live, admission);
+                                match admission {
+                                    PendingNeighAdmission::DuplicateDrop => {}
                                     PendingNeighAdmission::Buffer => {
                                         // #2357: when this buffered packet is
                                         // later flushed by retry_pending_neigh,
@@ -3411,7 +3416,17 @@ pub(super) fn poll_binding_process_descriptor(
                                         );
                                         recycle_now = false;
                                     }
-                                    PendingNeighAdmission::CapacityDrop => {}
+                                    PendingNeighAdmission::CapacityDrop => {
+                                        // #2375: a NEW distinct hop refused
+                                        // because pending_neigh is at
+                                        // MAX_PENDING_NEIGH (distinct-hop
+                                        // neighbor exhaustion — the
+                                        // scan/upstream-outage failure mode).
+                                        // The counter increment is the helper
+                                        // call above; the frame is recycled
+                                        // exactly like the duplicate branch
+                                        // (recycle_now stays true).
+                                    }
                                 }
                             }
                             if cfg!(feature = "debug-log") {

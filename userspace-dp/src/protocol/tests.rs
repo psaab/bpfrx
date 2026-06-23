@@ -131,6 +131,42 @@ fn process_status_neighbor_phase3_counters_roundtrip() {
     assert_eq!(legacy.neg_neigh_keys, 0);
 }
 
+// #2375: round-trip + backward-compat pin for the pending_neigh
+// distinct-hop capacity-drop counter. The wire key feeds
+// pkg/dataplane/userspace/protocol.go and the Prometheus counter
+// `xpf_userspace_pending_neigh_capacity_drops_total`. Kept distinct
+// from `pending_neigh_duplicate_drops_total` so a rename or a one-sided
+// add fails a test instead of silently decoding zero (#1961 risk).
+#[test]
+fn process_status_pending_neigh_capacity_drops_roundtrip() {
+    let status = ProcessStatus {
+        pending_neigh_capacity_drops_total: 9,
+        pending_neigh_duplicate_drops_total: 4,
+        ..Default::default()
+    };
+    let value: serde_json::Value =
+        serde_json::to_value(&status).expect("serialize ProcessStatus to Value");
+    assert_eq!(value["pending_neigh_capacity_drops_total"], 9);
+    // The duplicate counter must stay a SEPARATE wire key, not conflated.
+    assert_eq!(value["pending_neigh_duplicate_drops_total"], 4);
+    let back: ProcessStatus = serde_json::from_value(value).expect("deserialize ProcessStatus");
+    assert_eq!(back.pending_neigh_capacity_drops_total, 9);
+    assert_eq!(back.pending_neigh_duplicate_drops_total, 4);
+
+    // Pre-#2375 payload (key absent) must decode with a zero default
+    // (#[serde(default)] backward-compat with an older daemon).
+    let mut legacy_value =
+        serde_json::to_value(ProcessStatus::default()).expect("serialize default ProcessStatus");
+    legacy_value
+        .as_object_mut()
+        .expect("ProcessStatus serializes to an object")
+        .remove("pending_neigh_capacity_drops_total")
+        .expect("new key present before strip");
+    let legacy: ProcessStatus =
+        serde_json::from_value(legacy_value).expect("pre-#2375 payload decodes");
+    assert_eq!(legacy.pending_neigh_capacity_drops_total, 0);
+}
+
 // #1807: round-trip + backward-compat pin for the worker-command-queue
 // poison-recovery counter. The wire key feeds
 // pkg/dataplane/userspace/protocol.go and the Prometheus counter

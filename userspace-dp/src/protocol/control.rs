@@ -188,6 +188,15 @@ pub(crate) struct ProcessStatus {
     /// packet). Additive / defaulted for backward compatibility.
     #[serde(rename = "pending_neigh_decap_drops_total", default)]
     pub pending_neigh_decap_drops_total: u64,
+    /// #2375: MissingNeighbor packets for a NEW distinct
+    /// `(egress_ifindex, next_hop)` refused because `pending_neigh` is at
+    /// `MAX_PENDING_NEIGH` distinct hops (distinct-hop neighbor
+    /// exhaustion — the scan/upstream-outage failure mode). Kept distinct
+    /// from `pending_neigh_duplicate_drops_total` (the key was already
+    /// pending — normal cold-start coalescing). Additive / defaulted for
+    /// backward compatibility with older daemons.
+    #[serde(rename = "pending_neigh_capacity_drops_total", default)]
+    pub pending_neigh_capacity_drops_total: u64,
     /// #1789: total failed USERSPACE_SESSIONS BPF-map publishes
     /// (per-binding worker-poll sites summed with the shared no-binding
     /// sites: HA upsert, session-glue worker publish, post-reconcile

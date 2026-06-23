@@ -327,7 +327,9 @@ func populatedCoverageStatus() dpuserspace.ProcessStatus {
 		PendingNeighDuplicateDropsTotal: 4,
 		// #1902: decap-refusal gate counter (always emits).
 		PendingNeighDecapDropsTotal: 2,
-		DynamicNeighborKeys:         []string{"7 10.0.61.1", "9 172.16.80.200"},
+		// #2375: distinct-hop capacity-drop counter (always emits).
+		PendingNeighCapacityDropsTotal: 5,
+		DynamicNeighborKeys:            []string{"7 10.0.61.1", "9 172.16.80.200"},
 		// #1789: failed USERSPACE_SESSIONS publish counter (always emits).
 		SessionPublishErrorsTotal: 5,
 		// #2244: failed dnat_table reverse-NAT publish counter (always
@@ -510,6 +512,7 @@ func TestCollectorDescriptorCoverage(t *testing.T) {
 		"xpf_userspace_worker_cos_queue_lease_undergrant_total",            // #1782 Step-1 (ii) per-cause
 		"xpf_userspace_pending_neigh_duplicate_drops_total",                // #1782 cold-start H5
 		"xpf_userspace_pending_neigh_decap_drops_total",                    // #1902 decap-refusal gate
+		"xpf_userspace_pending_neigh_capacity_drops_total",                 // #2375 distinct-hop exhaustion
 		"xpf_userspace_dynamic_neighbor_present",                           // #1782 cold-start H2 dump
 		"xpf_userspace_session_publish_errors_total",                       // #1789 publish failures
 		"xpf_userspace_dnat_publish_errors_total",                          // #2244 dnat_table reverse-NAT publish failures

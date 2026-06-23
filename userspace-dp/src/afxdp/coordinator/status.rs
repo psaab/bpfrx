@@ -72,6 +72,22 @@ impl super::Coordinator {
             .sum()
     }
 
+    /// #2375: sum of per-binding `pending_neigh_capacity_drops` across
+    /// every `BindingLiveState`. Counts MissingNeighbor packets for a
+    /// NEW distinct `(egress_ifindex, next_hop)` refused because
+    /// `pending_neigh` is at `MAX_PENDING_NEIGH` distinct hops — the
+    /// distinct-hop exhaustion / scan failure mode. Kept separate from
+    /// `pending_neigh_duplicate_drops_total` (normal cold-start
+    /// coalescing). Surfaced as
+    /// `xpf_userspace_pending_neigh_capacity_drops_total`.
+    pub fn pending_neigh_capacity_drops_total(&self) -> u64 {
+        self.workers
+            .live
+            .values()
+            .map(|live| live.pending_neigh_capacity_drops.load(Ordering::Relaxed))
+            .sum()
+    }
+
     /// #1771 §2.6: distinct unresolved `(egress_ifindex, next_hop)` keys
     /// currently buffered across every binding's `pending_neigh` map
     /// (gauge). Each per-binding value is a `len()` snapshot published

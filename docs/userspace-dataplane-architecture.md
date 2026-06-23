@@ -202,6 +202,26 @@ in `neighbor_dispatch.rs`). A hop that never resolves within the pending
 timeout is negatively cached for 3 s (`neg_neigh.rs`), and subsequent
 cold packets to it fast-fail at the buffer site.
 
+`pending_neigh_admission` returns one of three outcomes, each counted
+separately so an operator can tell normal cold-start coalescing from an
+exhaustion/attack mode (`record_pending_neigh_admission_drop`,
+`neighbor_dispatch.rs`):
+
+- **Buffer** — key absent, room available: this becomes the
+  representative driving the probe/dwell clock (no drop counter).
+- **DuplicateDrop** (`pending_neigh_duplicate_drops_total`) — the key is
+  already pending: normal cold-start sibling coalescing (the first
+  packet already drove the kernel probe).
+- **CapacityDrop** (`pending_neigh_capacity_drops_total`, #2375) — a NEW
+  distinct `(egress_ifindex, next_hop)` refused because the map is at
+  `MAX_PENDING_NEIGH` (4096) distinct unresolved hops: distinct-hop
+  neighbor exhaustion — the scan / upstream-outage failure mode. Before
+  #2375 this case was silent (`CapacityDrop => {}`, counted nowhere);
+  exposing it lets operators distinguish "a packet is already probing
+  this destination" (duplicate) from "the worker is refusing NEW
+  unresolved destinations" (capacity). The refused frame is recycled
+  exactly like the duplicate case.
+
 **Pairing contract (#1902, sibling of #1885/#1873):** an entry's
 `desc`/`meta`/`decision` must all describe the SAME UMEM frame, because
 `retry_pending_neigh` resumes the flow via an in-place UMEM rewrite +

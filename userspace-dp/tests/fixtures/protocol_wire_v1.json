@@ -807,6 +807,7 @@
     "neighbor_resolver_queue_depth": 0,
     "neighbor_warm_disconnected_total": 0,
     "neighbor_warm_drops_total": 0,
+    "pending_neigh_capacity_drops_total": 0,
     "pending_neigh_decap_drops_total": 0,
     "pending_neigh_duplicate_drops_total": 0,
     "pid": 0,
