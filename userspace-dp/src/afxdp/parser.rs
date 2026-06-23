@@ -27,6 +27,13 @@ const NEXT_HEADER_ICMPV6: u8 = 58;
 const ICMPV6_TYPE_NA: u8 = 136;
 const ARP_OP_REPLY: u16 = 2;
 const NDP_OPT_TARGET_LL: u8 = 2;
+/// RFC 4861 §7.1.2: every NDP message MUST be sent with an IPv6 Hop
+/// Limit of 255 so a receiver can reject any NDP packet whose hop
+/// limit is lower — such a packet was necessarily forwarded by a
+/// router and therefore did not originate on-link. An off-link or
+/// spoofed-but-routed NA cannot satisfy this without a router
+/// decrementing the field.
+const NDP_REQUIRED_HOP_LIMIT: u8 = 255;
 
 /// Resolve the L3-header offset and the EtherType. Handles untagged
 /// and single-tagged frames carrying either an 802.1Q (0x8100) or an
@@ -176,19 +183,71 @@ pub(super) fn parse_ndp_neighbor_advert(raw_frame: &[u8]) -> Option<NdpNeighborA
     {
         return None;
     }
+
+    // #2368 (B): bound the whole NDP parse — header AND option walk — by
+    // the IPv6-declared packet end, not the raw frame length. A
+    // minimum-size Ethernet frame can declare a payload covering only
+    // the fixed NA header and then place a forged TLLA option in the
+    // L2 padding/trailer beyond `40 + payload_len`. Reading that trailer
+    // as an option would learn an attacker-chosen MAC from bytes the
+    // sender never accounted for in the IP length. Compute the declared
+    // end (mirrors the #2361 declared-end discipline) and reject if it
+    // overruns the frame or is too short to even hold the NA header.
+    let payload_len = u16::from_be_bytes([raw_frame[l3_start + 4], raw_frame[l3_start + 5]]) as usize;
+    let packet_end = l3_start.checked_add(IPV6_HDR_LEN)?.checked_add(payload_len)?;
+    if packet_end > raw_frame.len() || packet_end < l4_start + ICMPV6_NA_HDR_LEN {
+        return None;
+    }
+
+    // #2368 (A): RFC 4861 §7.1.2 NA validity MUSTs. Without these an
+    // off-link/spoofed NA poisons the dynamic-neighbor cache and the
+    // kernel neighbor table (this is a control-plane MAC->IP learning
+    // path). Fail-closed: any failed check learns nothing.
+    //
+    //  - Hop Limit MUST be 255 (the off-link-impersonation gate).
+    //  - ICMPv6 Code MUST be 0.
+    //  - ICMP length (here `packet_end - l4_start`) MUST be >= 24, which
+    //    `packet_end` already guarantees above.
+    //  - Target Address MUST NOT be multicast (a multicast target is
+    //    never a unicast neighbor to learn).
+    //  - The ICMPv6 checksum (RFC 4443, computed over the IPv6
+    //    pseudo-header + the ICMPv6 message) MUST be valid.
+    if raw_frame[l3_start + 7] != NDP_REQUIRED_HOP_LIMIT {
+        return None;
+    }
+    if raw_frame[l4_start + 1] != 0 {
+        return None;
+    }
     let target_bytes: [u8; 16] =
         <[u8; 16]>::try_from(&raw_frame[l4_start + 8..l4_start + 24]).ok()?;
+    if target_bytes[0] == 0xff {
+        // ff00::/8 is the IPv6 multicast range.
+        return None;
+    }
     let target_ip = IpAddr::V6(Ipv6Addr::from(target_bytes));
-    // Walk the NDP options for a Target Link-Layer Address (type 2).
+
+    // ICMPv6 checksum over the IPv6 pseudo-header + the ICMPv6 message
+    // (`l4_start..packet_end`). A valid packet sums (including its own
+    // checksum field) to zero in 16-bit one's complement, i.e. the
+    // recomputed value is 0x0000. Reuse the shared one's-complement
+    // accumulator (#2211) so this matches every other checksum site.
+    if !icmpv6_checksum_valid(raw_frame, l3_start, l4_start, packet_end) {
+        return None;
+    }
+
+    // Walk the NDP options for a Target Link-Layer Address (type 2),
+    // strictly within the IPv6-declared packet end (#2368 B). An option
+    // whose declared length overruns `packet_end` is rejected (stop the
+    // walk) rather than read out of the declared packet.
     let mut target_mac: Option<[u8; 6]> = None;
     let mut opt_off = l4_start + ICMPV6_NA_HDR_LEN;
-    while opt_off + 2 <= raw_frame.len() {
+    while opt_off + 2 <= packet_end {
         let opt_type = raw_frame[opt_off];
         let opt_len = raw_frame[opt_off + 1] as usize * 8;
-        if opt_len == 0 {
+        if opt_len == 0 || opt_off + opt_len > packet_end {
             break;
         }
-        if opt_type == NDP_OPT_TARGET_LL && opt_len >= 8 && opt_off + 8 <= raw_frame.len() {
+        if opt_type == NDP_OPT_TARGET_LL && opt_len >= 8 {
             target_mac = Some([
                 raw_frame[opt_off + 2],
                 raw_frame[opt_off + 3],
@@ -205,6 +264,38 @@ pub(super) fn parse_ndp_neighbor_advert(raw_frame: &[u8]) -> Option<NdpNeighborA
         target_ip,
         target_mac,
     })
+}
+
+/// Validate the ICMPv6 checksum (RFC 4443 §2.3) of a Neighbor
+/// Advertisement. The checksum is computed over the IPv6 pseudo-header
+/// (source + destination address from the IPv6 header, the upper-layer
+/// packet length, and the next-header value 58) followed by the entire
+/// ICMPv6 message (`l4_start..packet_end`, which includes the checksum
+/// field itself). For a valid packet the one's-complement sum folds to
+/// zero, so the recomputed checksum is 0x0000.
+///
+/// Reuses the shared `frame` one's-complement accumulator (#2211) so the
+/// arithmetic is bit-identical to the NAT64 / forwarding checksum paths
+/// and benefits from the same AVX2 fast path.
+#[inline(always)]
+fn icmpv6_checksum_valid(
+    raw_frame: &[u8],
+    l3_start: usize,
+    l4_start: usize,
+    packet_end: usize,
+) -> bool {
+    let icmp = &raw_frame[l4_start..packet_end];
+    let mut sum: u32 = 0;
+    // IPv6 pseudo-header: src (16) + dst (16).
+    sum = super::frame::checksum16_add_bytes(sum, &raw_frame[l3_start + 8..l3_start + 24]);
+    sum = super::frame::checksum16_add_bytes(sum, &raw_frame[l3_start + 24..l3_start + 40]);
+    // Upper-layer packet length (32-bit) — the ICMPv6 message length.
+    sum = super::frame::checksum16_add_bytes(sum, &(icmp.len() as u32).to_be_bytes());
+    // Three zero bytes + next-header (58).
+    sum = super::frame::checksum16_add_bytes(sum, &[0, 0, 0, NEXT_HEADER_ICMPV6]);
+    // The ICMPv6 message itself (the on-wire checksum field included).
+    sum = super::frame::checksum16_add_bytes(sum, icmp);
+    super::frame::checksum16_finish(sum) == 0
 }
 
 #[cfg(test)]
