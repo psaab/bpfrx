@@ -2121,3 +2121,105 @@ func validateDestinationNATProtocolStrict(cfg *Config) error {
 	}
 	return nil
 }
+
+// validateRouteFilterMatchTypesStrict gates the two route-filter match-types
+// that the FRR prefix-list backend cannot render losslessly (#2525):
+//
+//   - "through <prefix2>" has NO FRR equivalent. Junos "through" matches the
+//     base prefix, prefix2, and only the prefixes on the direct radix-tree
+//     path between them — not every prefix of intermediate length. FRR
+//     prefix-lists express only length ranges (ge/le), so any rendering would
+//     change the match set. Reject it loudly rather than silently degrade.
+//
+//   - "prefix-length-range /low-/high" maps to FRR "ge low le high", but only
+//     when the bounds are well-formed. Reject a malformed, inverted, out-of-
+//     family-range, or below-base range so the operator fixes it instead of
+//     getting the pre-#2525 silent open-ended "le maxLen" fall-through.
+//
+// Strict on commit / commit-check (hard reject so the unsupported / malformed
+// match-type is operator-visible); the compiler downgrades this to a warning on
+// the tolerant load / peer-sync path (#1960) so an already-persisted or
+// peer-synced config still boots — the renderer then skips the offending entry
+// (match-nothing, fail-closed). Runs on the fully-compiled *Config.
+func validateRouteFilterMatchTypesStrict(cfg *Config) error {
+	if cfg == nil || cfg.PolicyOptions.PolicyStatements == nil {
+		return nil
+	}
+	// Deterministic first-error: iterate policy-statements by sorted name.
+	names := make([]string, 0, len(cfg.PolicyOptions.PolicyStatements))
+	for name := range cfg.PolicyOptions.PolicyStatements {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		ps := cfg.PolicyOptions.PolicyStatements[name]
+		if ps == nil {
+			continue
+		}
+		for _, term := range ps.Terms {
+			if term == nil {
+				continue
+			}
+			for _, rf := range term.RouteFilters {
+				if rf == nil {
+					continue
+				}
+				switch rf.MatchType {
+				case "through":
+					return fmt.Errorf(
+						"policy-statement %q term %q route-filter %q through %q: the "+
+							"`through` match-type is not supported by the FRR routing "+
+							"backend — it matches a two-prefix containment path that has "+
+							"no lossless prefix-list (ge/le) equivalent. Use "+
+							"`prefix-length-range /<low>-/<high>`, `upto /<n>`, or "+
+							"`orlonger` instead",
+						name, term.Name, rf.Prefix, rf.ThroughPrefix)
+				case "prefix-length-range":
+					if err := validatePrefixLengthRange(rf); err != nil {
+						return fmt.Errorf(
+							"policy-statement %q term %q route-filter %q prefix-length-range: %v",
+							name, term.Name, rf.Prefix, err)
+					}
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// validatePrefixLengthRange enforces the semantic constraints on a
+// prefix-length-range route-filter (#2525): both bounds parsed (non-zero), the
+// per-family max not exceeded, low<=high, and low at least the base prefix
+// length (Junos requires the range to be no less specific than the base).
+func validatePrefixLengthRange(rf *RouteFilter) error {
+	if rf.RangeLow == 0 || rf.RangeHigh == 0 {
+		return fmt.Errorf(
+			"malformed range (expected /<low>-/<high> with both lengths in 1..%d, e.g. /16-/24)",
+			128)
+	}
+	maxLen := 32
+	if strings.Contains(rf.Prefix, ":") {
+		maxLen = 128
+	}
+	if rf.RangeLow > maxLen || rf.RangeHigh > maxLen {
+		return fmt.Errorf(
+			"range /%d-/%d exceeds the address-family maximum /%d",
+			rf.RangeLow, rf.RangeHigh, maxLen)
+	}
+	if rf.RangeLow > rf.RangeHigh {
+		return fmt.Errorf(
+			"inverted range /%d-/%d (low must be <= high)",
+			rf.RangeLow, rf.RangeHigh)
+	}
+	// The base prefix length floors the range: Junos rejects a range whose low
+	// bound is less specific than the base prefix itself.
+	if _, ipnet, err := net.ParseCIDR(rf.Prefix); err == nil {
+		baseLen, _ := ipnet.Mask.Size()
+		if rf.RangeLow < baseLen {
+			return fmt.Errorf(
+				"range low /%d is less specific than the base prefix /%d",
+				rf.RangeLow, baseLen)
+		}
+	}
+	return nil
+}

@@ -313,13 +313,17 @@ func parseCIDRStrict(raw, example string) (net.IP, error) {
 // tokens (the prefix AND the match-type — Keys[1:3]); the validator must
 // therefore accept a match-type keyword as well as a CIDR prefix.
 //
-// exact/longer/orlonger/upto are the rendered match-types (pkg/frr
-// policy_render.go). prefix-length-range and through are ADMITTED but
-// not yet rendered (a separate deferred follow-up). They are admitted
-// rather than rejected because they commit fine today (there was no
-// validator before #2105), so rejecting them would be a grammar
-// regression breaking configs already on the wire; their default render
-// (le 32 / le 128) is FRR-valid even at a max-length prefix.
+// exact/longer/orlonger/upto/prefix-length-range are the rendered
+// match-types (pkg/frr policy_render.go). `through` is ADMITTED as a
+// grammar token here but REJECTED at commit by
+// validateRouteFilterMatchTypesStrict (#2525): FRR prefix-lists express
+// only length ranges (ge/le) and cannot represent the two-prefix
+// containment path of Junos `through`. It stays in this set so the
+// commit-check reaches the semantic gate (which emits an actionable
+// "unsupported match-type" error) rather than failing earlier with a
+// generic "not a valid prefix" message. `prefix-length-range` is
+// admitted AND rendered (`ge low le high`); its /low-/high bounds are
+// semantically validated by validateRouteFilterMatchTypesStrict.
 var routeFilterMatchTypes = map[string]bool{
 	"exact":               true,
 	"longer":              true,
