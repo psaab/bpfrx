@@ -588,6 +588,86 @@ func TestPreSeedMemfile6_RoundTrip_PreservesIATA(t *testing.T) {
 	}
 }
 
+// Test (#2386): the v6 memfile pre-seed must emit the lease hardware address in
+// the canonical Kea `hwaddr` column. SyncLease.HWAddress is populated for v6
+// leases read from the active peer (keaLeaseToSync sets it for both families),
+// but writeMemfile6 previously hardcoded the hwaddr column empty, so standby
+// takeover stripped the MAC from every IPv6 lease (lost hwaddr-based logging,
+// reservation matching, and operator visibility — DHCPv6 keys on DUID so the
+// lease itself still worked).
+//
+// The Kea v6 memfile CSV is POSITIONAL; the hwaddr column is field 13 (1-based)
+// in keaMemfileHeader6. This test asserts (a) the per-lease column count matches
+// the header exactly so the fix cannot shift any column, and (b) the populated
+// HWAddress lands in the hwaddr slot.
+//
+// Fail-on-revert: reverting writeMemfile6 to the empty-hwaddr writer makes the
+// hwaddr-column assertion fail (the field would read back empty).
+func TestPreSeedMemfile6_EmitsHWAddress(t *testing.T) {
+	localNow := time.Unix(1_700_000_000, 0)
+	dir := t.TempDir()
+	memfile := filepath.Join(dir, "kea-leases6.csv")
+	m := New()
+	m.SetLeaseSyncSeamsForTesting(nil, "", filepath.Join(dir, "missing.sock"), "", memfile)
+
+	const wantHW = "aa:bb:cc:dd:ee:f6"
+	in := []SyncLease{
+		{Family: 6, Address: "2001:db8::abc", DUID: "00:01:00:0a", IAID: 7,
+			LeaseType: "IA_NA", HWAddress: wantHW, SubnetID: 1, Remaining: 1200,
+			State: keaStateDefault},
+	}
+	if err := m.PreSeedMemfile6(in, localNow); err != nil {
+		t.Fatalf("PreSeedMemfile6: %v", err)
+	}
+
+	raw, err := os.ReadFile(memfile)
+	if err != nil {
+		t.Fatalf("read pre-seeded memfile: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(string(raw)), "\n")
+	if len(lines) < 2 {
+		t.Fatalf("pre-seeded memfile has no lease row:\n%s", raw)
+	}
+
+	// Positional integrity: the lease row must have exactly as many columns as
+	// the header, so the inserted hwaddr field cannot off-by-one any column.
+	headerCols := strings.Split(keaMemfileHeader6, ",")
+	hwIdx := -1
+	for i, name := range headerCols {
+		if name == "hwaddr" {
+			hwIdx = i
+			break
+		}
+	}
+	if hwIdx < 0 {
+		t.Fatalf("hwaddr column not found in header %q", keaMemfileHeader6)
+	}
+	// hwaddr is field 13 (1-based) per the canonical Kea v6 header.
+	if hwIdx != 12 {
+		t.Fatalf("hwaddr column index = %d, want 12 (field 13); header drifted: %q", hwIdx, keaMemfileHeader6)
+	}
+
+	var sawRow bool
+	for _, line := range lines[1:] {
+		if !strings.HasPrefix(line, "2001:db8::abc,") {
+			continue
+		}
+		cols := strings.Split(line, ",")
+		if len(cols) != len(headerCols) {
+			t.Fatalf("lease row column count = %d, header has %d (positional drift): %q",
+				len(cols), len(headerCols), line)
+		}
+		if cols[hwIdx] != wantHW {
+			t.Errorf("hwaddr column (field %d) = %q, want %q (#2386 strip regression): %q",
+				hwIdx+1, cols[hwIdx], wantHW, line)
+		}
+		sawRow = true
+	}
+	if !sawRow {
+		t.Fatalf("lease row not found in pre-seeded memfile:\n%s", raw)
+	}
+}
+
 // Test (#2268): the lease-type read↔write mapping is a single total inverse —
 // keaLeaseTypeToString and stringToKeaLeaseType must agree on every value so the
 // pair can never drift to re-introduce an asymmetric downgrade. Every numeric

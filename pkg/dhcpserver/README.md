@@ -514,7 +514,13 @@ This package owns the KEA side of #2239 cross-chassis DHCP-server lease sync
   cannot drift to re-introduce the #2268 IA_TA downgrade. Only IA_PD carries a
   delegated `prefix_len`; IA_NA and IA_TA are full `/128` address bindings, so
   their `prefix_len` column is 128. An unknown lease-type string falls back to
-  IA_NA (logged), never silently mis-typed.
+  IA_NA (logged), never silently mis-typed. The v6 pre-seed also emits the
+  lease hardware address in the canonical `hwaddr` column (field 13 of
+  `keaMemfileHeader6`), matching the v4 writer — `SyncLease.HWAddress` is
+  populated for v6 leases (`keaLeaseToSync` sets it for both families), so a
+  takeover no longer strips the MAC from every IPv6 lease (#2386). DHCPv6 keys
+  on DUID so the lease itself was never lost, but the empty column dropped
+  hwaddr-based logging / reservation matching / operator visibility.
 - `WaitControlSocket{4,6}(ctx, within)` — bounded readiness wait before the
   post-start seed.
 
