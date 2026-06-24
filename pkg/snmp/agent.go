@@ -7,10 +7,14 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/fsatomic"
 )
 
 // SNMP v2c PDU types.
@@ -43,7 +47,28 @@ const (
 	snmpVersion2c = 1 // version field: 0 = v1, 1 = v2c
 
 	maxPacketSize = 4096
+
+	// usmTimeWindow is the RFC 3414 §3.2 timeliness window in seconds: an
+	// authenticated request whose msgAuthoritativeEngineTime differs from
+	// the authoritative engine's own time by more than this is rejected as
+	// outside the time window (and is therefore not replayable beyond it).
+	usmTimeWindow = 150
+
+	// engineBootsMax is the RFC 3414 ceiling for msgAuthoritativeEngineBoots
+	// (2^31 - 1). When our boots counter reaches it, the engine ID must be
+	// reconfigured; until then every authenticated request is rejected as
+	// not-in-time-window per §3.2.
+	engineBootsMax = 2147483647
 )
+
+// defaultEngineBootsPath is the on-disk location of the persisted SNMPv3
+// engineBoots counter. It is loaded and incremented once at agent
+// construction so (engineBoots, engineTime) is monotonic across daemon
+// restarts per RFC 3414 — a manager that caches our authoritative boots/time
+// keeps working over a restart, and a request captured before a restart no
+// longer validates (the boots value advanced). /var/lib/xpf is the persistent
+// runtime-state root shared with the other xpf subsystems.
+const defaultEngineBootsPath = "/var/lib/xpf/snmp-engineboots"
 
 // tagCounter32 is the ASN.1 application tag for Counter32.
 const tagCounter32 = 0x41
@@ -132,6 +157,12 @@ type Agent struct {
 	engineBoots int    // SNMPv3 engine boots counter (immutable after initEngine)
 	lastPacket  []byte // raw packet for v3 auth verification
 
+	// engineBootsPath is the persistence seam for the engineBoots counter
+	// (RFC 3414 monotonicity across restarts). Empty means the default
+	// path; tests inject a temp file to assert the load/increment/persist
+	// cycle. Set before initEngine runs (NewAgent / NewAgentWithBootsPath).
+	engineBootsPath string
+
 	// cfgMu guards the live authorization/identity configuration (cfg) and
 	// the derived USM user table (v3Users). The request-serving goroutine
 	// reads both under RLock; UpdateConfig swaps both under Lock so a commit
@@ -144,11 +175,26 @@ type Agent struct {
 	v3Users map[string]*usmUser // SNMPv3 USM users (keyed by name)
 }
 
-// NewAgent creates a new SNMP agent with the given configuration.
+// NewAgent creates a new SNMP agent with the given configuration. The
+// SNMPv3 engineBoots counter is loaded from defaultEngineBootsPath,
+// incremented, and persisted so (engineBoots, engineTime) advances
+// monotonically across daemon restarts (RFC 3414).
 func NewAgent(cfg *config.SNMPConfig) *Agent {
+	return NewAgentWithBootsPath(cfg, defaultEngineBootsPath)
+}
+
+// NewAgentWithBootsPath is NewAgent with an explicit engineBoots persistence
+// path. It is the seam used by tests to drive the load/increment/persist
+// cycle against a temp file; production code uses NewAgent. An empty path
+// falls back to defaultEngineBootsPath.
+func NewAgentWithBootsPath(cfg *config.SNMPConfig, bootsPath string) *Agent {
+	if bootsPath == "" {
+		bootsPath = defaultEngineBootsPath
+	}
 	a := &Agent{
-		cfg:       cfg,
-		startTime: time.Now(),
+		cfg:             cfg,
+		startTime:       time.Now(),
+		engineBootsPath: bootsPath,
 	}
 	a.initEngine()
 	a.initV3Users()
@@ -209,12 +255,76 @@ func (a *Agent) initEngine() {
 	// RFC 3411 format: enterprise(4) + text(3) = 0x80 | len, enterprise OID, format byte, text.
 	// Simplified: use 0x80 0x00 0x00 0x00 0x01 (enterprise=1) + 0x04 (text) + hostname bytes.
 	a.engineID = append([]byte{0x80, 0x00, 0x01, 0x86, 0xa3, 0x04}, []byte(hostname)...)
-	a.engineBoots = 1
+	a.engineBoots = a.loadAndIncrementEngineBoots()
+}
+
+// loadAndIncrementEngineBoots reads the persisted engineBoots counter, returns
+// it incremented by one, and writes the new value back so the next start
+// advances again. On first boot (file missing) it starts at 1. engineTime then
+// counts from THIS boot (a.startTime), so (engineBoots, engineTime) is the
+// monotonically-advancing authoritative pair RFC 3414 requires for replay
+// protection across restarts.
+//
+// A read/parse failure or a value at/over the RFC ceiling restarts the count
+// at 1 rather than refusing to serve — the timeliness check (which rejects a
+// stale boots/time on its own) is the replay backstop, and a corrupt counter
+// must not wedge the agent. A write failure is logged and ignored: the agent
+// still serves with the in-memory boots for this run; only cross-restart
+// monotonicity is lost until the next successful write.
+func (a *Agent) loadAndIncrementEngineBoots() int {
+	prev := 0
+	if data, err := os.ReadFile(a.engineBootsPath); err == nil {
+		if n, perr := strconv.Atoi(strings.TrimSpace(string(data))); perr == nil && n > 0 && n < engineBootsMax {
+			prev = n
+		} else {
+			slog.Warn("SNMP: engineBoots state unreadable, restarting count", "path", a.engineBootsPath)
+		}
+	} else if !os.IsNotExist(err) {
+		slog.Warn("SNMP: engineBoots state read error, restarting count", "path", a.engineBootsPath, "err", err)
+	}
+
+	boots := prev + 1
+	if boots < 1 || boots >= engineBootsMax {
+		boots = 1
+	}
+
+	if err := fsatomic.MkdirAllDurable(filepath.Dir(a.engineBootsPath), 0o755); err != nil {
+		slog.Warn("SNMP: engineBoots state dir create failed", "path", a.engineBootsPath, "err", err)
+	}
+	if err := fsatomic.WriteFileDurable(a.engineBootsPath, []byte(strconv.Itoa(boots)+"\n"), 0o644); err != nil {
+		slog.Warn("SNMP: engineBoots state persist failed", "path", a.engineBootsPath, "err", err)
+	}
+	return boots
 }
 
 // engineTime returns the number of seconds since agent start.
 func (a *Agent) engineTime() int {
 	return int(time.Since(a.startTime).Seconds())
+}
+
+// checkTimeliness applies the RFC 3414 §3.2 timeliness window for the agent
+// acting as the authoritative engine. It compares an incoming authenticated
+// request's msgAuthoritativeEngineBoots/Time against the agent's own clock and
+// returns true when the request is within the window (and may be accepted).
+//
+// Per §3.2 step 7, the request is NOT in the time window if our boots counter
+// has reached the ceiling, if the request's boots differs from ours, or if the
+// request's time differs from ours by more than usmTimeWindow seconds. A
+// replayed request fails the time test once usmTimeWindow has elapsed (or fails
+// the boots test immediately after a restart bumped our boots), which is the
+// replay protection the bare HMAC check lacked.
+func (a *Agent) checkTimeliness(reqBoots, reqTime int) bool {
+	if a.engineBoots >= engineBootsMax {
+		return false
+	}
+	if reqBoots != a.engineBoots {
+		return false
+	}
+	diff := a.engineTime() - reqTime
+	if diff < 0 {
+		diff = -diff
+	}
+	return diff <= usmTimeWindow
 }
 
 // SetIfDataFn sets the callback for retrieving interface data.
