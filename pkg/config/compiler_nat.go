@@ -153,6 +153,33 @@ func isNAT64PoolHostAddress(addr string) (host bool, parsed bool) {
 	return addr[slash+1:] == "32", true
 }
 
+// nptv6PrefixHasHostBits reports whether the CIDR text `cidr` carries any
+// bit set beyond its prefix length — i.e. the raw address is not equal to
+// its own network (masked) address. `parsed` is the *net.IPNet returned by
+// net.ParseCIDR(cidr) (its .IP is already masked); the comparison parses the
+// raw IP part of the original text and re-masks it under the same mask. The
+// second return value is false when the raw IP cannot be parsed (the caller
+// has already proven cidr parses via ParseCIDR, so this is defensive only).
+// #2380: net.ParseCIDR silently masks, so this surfaces the discarded bits.
+func nptv6PrefixHasHostBits(cidr string, parsed *net.IPNet) (host bool, ok bool) {
+	if parsed == nil {
+		return false, false
+	}
+	raw := net.ParseIP(natCIDRIPPart(cidr))
+	if raw == nil {
+		return false, false
+	}
+	// Mask the raw address with the prefix's mask and compare to the raw
+	// address. If they differ, host/subnet bits were set beyond the prefix.
+	masked := raw.Mask(parsed.Mask)
+	if masked == nil {
+		// Mask width does not match the address family — should not happen
+		// for an IPv6 prefix that already parsed, but treat as no host bits.
+		return false, true
+	}
+	return !masked.Equal(raw), true
+}
+
 // validateNATHostMaskStrict is the #2173 strict-vs-lenient gate that
 // rejects a static-NAT match/prefix or a NAT64 source-pool address whose
 // mask is not a host route (/32 for v4, /128 for v6; a bare address is a
@@ -417,6 +444,36 @@ func validateNPTv6Strict(cfg *Config, lenient bool) ([]string, error) {
 				if err := emit(fmt.Sprintf(
 					"security nat static rule-set %q rule %q nptv6 prefixes must be IPv6 (match %q, nptv6-prefix %q)",
 					rs.Name, rule.Name, rule.Match, rule.Then)); err != nil {
+					return nil, err
+				}
+				continue
+			}
+
+			// #2380: host-bits-zero strictness. net.ParseCIDR masks the
+			// address to the prefix length silently, so a prefix with bits
+			// set beyond the prefix length (e.g. 2001:db8:1:2::/48) parses
+			// as a DIFFERENT prefix (2001:db8:1::/48) than the operator
+			// wrote, and the Rust parse_prefix (nptv6.rs) discards the extra
+			// words identically. Both planes agree on the masked result, so
+			// there is no traffic-correctness bug — but the operator gets a
+			// rule that does not match what they typed, with no feedback.
+			// Junos rejects host bits set on a prefix; mirror that here. This
+			// is the same class as isHostMaskAddress for static-NAT host
+			// masks. The masked network address is extNet.IP / intNet.IP; the
+			// raw address is the IP part of the original CIDR text. A mismatch
+			// means host/subnet bits were set.
+			if host, ok := nptv6PrefixHasHostBits(rule.Match, extNet); ok && host {
+				if err := emit(fmt.Sprintf(
+					"security nat static rule-set %q rule %q match destination-address %q has host bits set beyond the /%d prefix (Junos rejects this; write the masked prefix explicitly)",
+					rs.Name, rule.Name, rule.Match, extOnes)); err != nil {
+					return nil, err
+				}
+				continue
+			}
+			if host, ok := nptv6PrefixHasHostBits(rule.Then, intNet); ok && host {
+				if err := emit(fmt.Sprintf(
+					"security nat static rule-set %q rule %q then static-nat nptv6-prefix %q has host bits set beyond the /%d prefix (Junos rejects this; write the masked prefix explicitly)",
+					rs.Name, rule.Name, rule.Then, intOnes)); err != nil {
 					return nil, err
 				}
 				continue

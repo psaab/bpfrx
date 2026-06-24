@@ -32,6 +32,32 @@ fn parse_prefix_unsupported_length() {
     assert!(parse_prefix("2001:db8:1:2:3:4::/96").is_none());
 }
 
+// #2380: a /48 prefix with the 4th word set carries host/subnet bits the
+// parser silently discards. The Go commit gate rejects this, so in a debug
+// build the helper-side debug_assert is a fail-on-revert tripwire that aborts
+// if the Go gate is ever weakened. Release builds keep the historical masking
+// behavior (the extra word is dropped), so this test only asserts the panic
+// when debug assertions are compiled in.
+#[test]
+#[cfg(debug_assertions)]
+#[should_panic(expected = "host bits set")]
+fn parse_prefix_48_host_bits_panics_in_debug() {
+    let _ = parse_prefix("2001:db8:1:2::/48");
+}
+
+// In a release build (debug_assert compiled out) the parser keeps masking:
+// the 4th word is dropped, yielding the same prefix as a clean /48.
+#[test]
+#[cfg(not(debug_assertions))]
+fn parse_prefix_48_host_bits_masked_in_release() {
+    let (prefix, words) = parse_prefix("2001:db8:1:2::/48").unwrap();
+    assert_eq!(words, 3);
+    assert_eq!(prefix[0], 0x2001);
+    assert_eq!(prefix[1], 0x0db8);
+    assert_eq!(prefix[2], 0x0001);
+    assert_eq!(prefix[3], 0);
+}
+
 #[test]
 fn compute_adjustment_simple() {
     // Internal: fd00:1::/48, External: 2001:db8:1::/48
