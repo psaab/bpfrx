@@ -22,9 +22,15 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::ip_proto::{
-    PROTO_GRE, PROTO_ICMP, PROTO_ICMPV6, PROTO_IPIP, PROTO_OSPF, PROTO_TCP, PROTO_UDP,
-};
+use crate::ip_proto::proto_number;
+use crate::policy::SnapshotIntegrityError;
+// #2505: the production code resolves all protocol tokens through
+// `proto_number`; the bare `PROTO_*` consts are now only referenced by the
+// filter unit tests (asserting a term resolved to the right IANA number), so
+// re-export them under `super::*` for tests only — exposing them
+// unconditionally would warn as unused in the non-test build.
+#[cfg(test)]
+use crate::ip_proto::{PROTO_ICMP, PROTO_ICMPV6, PROTO_TCP, PROTO_UDP};
 
 /// Result of evaluating a filter term.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

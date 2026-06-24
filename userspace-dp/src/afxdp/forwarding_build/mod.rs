@@ -260,7 +260,11 @@ pub(super) fn build_forwarding_state_with_policy_counters_and_previous(
         let (slot_map, _slots_to_zero) = ColdPathSlotMap::build(prev_map, &pairs);
         state.cold_path_slot_map = std::sync::Arc::new(slot_map);
     }
-    // Build filter state from snapshot
+    // Build filter state from snapshot. #2505: this is fallible — an
+    // unresolvable `from protocol` token raises a SnapshotIntegrityError that
+    // propagates here, aborting the reconcile preflight (before teardown /
+    // publish) so the prior good filter state stays live rather than
+    // installing a fail-wide match-all term.
     state.filter_state = crate::filter::parse_filter_state_with_three_color_preserving(
         &snapshot.filters,
         &snapshot.policers,
@@ -269,7 +273,7 @@ pub(super) fn build_forwarding_state_with_policy_counters_and_previous(
         &snapshot.flow.lo0_filter_input_v4,
         &snapshot.flow.lo0_filter_input_v6,
         previous.map(|state| &state.filter_state),
-    );
+    )?;
     state.cos = build_cos_state(snapshot);
     let has_cos_interfaces = !state.cos.interfaces.is_empty();
     state.tx_selection_enabled_v4 = has_cos_interfaces

@@ -69,6 +69,28 @@ pub(crate) enum SnapshotIntegrityError {
         second_rule: String,
         direction: &'static str,
     },
+    /// #2505: a firewall-filter term carried a NON-EMPTY `from protocol` list
+    /// with at least one token that `ip_proto::proto_number` cannot resolve.
+    /// The pre-fix compiler used a stale local `parse_protocol` (recognizing
+    /// only tcp/udp/icmp/icmpv6/gre/ospf/ipip + bare numeric, no
+    /// trim/lowercase) and `filter_map`-dropped anything else. A named
+    /// protocol the Go commit gate accepts (esp/ah/sctp/vrrp/igmp/pim/egp +
+    /// the junos-* aliases) — or a mixed-case / whitespace token the Go gate
+    /// normalizes — was silently dropped. When ALL tokens drop, the term's
+    /// protocol list collapses to empty, `protocol_match_enabled` becomes
+    /// false, and the term matches EVERY protocol: a `from protocol esp; then
+    /// discard` term that should drop only ESP instead discards ALL traffic
+    /// (fail-WIDE). Rejecting the whole snapshot (the preflight keeps the
+    /// previous good state) is the fail-closed backstop; the Go gate
+    /// (`filterProtocolResolvable`, #2175/#2505) is the primary defense, so a
+    /// gate-passing config never reaches this arm in normal operation — it
+    /// guards against version/snapshot drift. An EMPTY input protocol list is
+    /// the legitimate "no protocol constraint" case and is NOT an error.
+    UnrepresentableFilterProtocol {
+        filter: String,
+        term: String,
+        token: String,
+    },
 }
 
 impl std::fmt::Display for SnapshotIntegrityError {
@@ -106,6 +128,15 @@ impl std::fmt::Display for SnapshotIntegrityError {
                 f,
                 "nptv6 rules {:?} and {:?} have overlapping {} prefixes — refusing nondeterministic first-match resolution",
                 first_rule, second_rule, direction
+            ),
+            Self::UnrepresentableFilterProtocol {
+                filter,
+                term,
+                token,
+            } => write!(
+                f,
+                "firewall filter {:?} term {:?} has an unresolvable protocol token {:?} — refusing to fail wide by dropping it (which would make the term match every protocol)",
+                filter, term, token
             ),
         }
     }
