@@ -264,13 +264,17 @@ func TestTunnelAnchorReuseUsesExistingLink(t *testing.T) {
 func TestXfrmAlreadyExistsSingleLookup(t *testing.T) {
 	ops := newFakeLinkOps()
 	// config.XFRMIfNameAndID maps "st0.1" -> ("xfrm1", id). Seed that.
-	ifName, _ := config.XFRMIfNameAndID("st0.1")
+	ifName, ifID := config.XFRMIfNameAndID("st0.1")
 	if ifName == "" {
 		t.Fatalf("XFRMIfNameAndID returned empty name for st0.1")
 	}
 	const wantIndex = 7
+	// Seed the existing link with the MATCHING Ifid so the adopt path's
+	// if_id verification (recreate-on-mismatch) keeps it and exercises the
+	// single-lookup reuse branch under test.
 	ops.links[ifName] = &netlink.Xfrmi{
 		LinkAttrs: netlink.LinkAttrs{Name: ifName, Index: wantIndex},
+		Ifid:      ifID,
 	}
 	// Make any SECOND LinkByName for this name fail — under the old
 	// double-lookup code this would feed nil to LinkSetUp and panic. The
@@ -472,6 +476,62 @@ func TestXfrmApplyChangedIfIDRecreates(t *testing.T) {
 	}
 	if _, ok := ops.links[otherName]; !ok {
 		t.Errorf("unrelated xfrmi %q missing from kernel after recreate", otherName)
+	}
+}
+
+// TestXfrmAdoptStaleIfIDRecreates: on adopt-on-restart (in-memory
+// tracking lost, but a kernel xfrmi with the same name survives), the
+// adopted link's ACTUAL Ifid must be verified against the desired one.
+// A kernel xfrmi with the right NAME but a WRONG Ifid must be deleted
+// and recreated with the correct if_id — never silently re-tracked.
+//
+// FAIL-ON-REVERT: without the Ifid check the wrong-if_id kernel link is
+// adopted as-is (0 LinkDel / 0 LinkAdd, tracked if_id stored as desired
+// while the kernel link keeps the stale Ifid). The assertions below for
+// exactly 1 LinkDel + 1 LinkAdd and a kernel link carrying the desired
+// Ifid then fail.
+func TestXfrmAdoptStaleIfIDRecreates(t *testing.T) {
+	ops := newFakeLinkOps()
+	ifName, wantID := config.XFRMIfNameAndID("st0.0")
+	if ifName == "" || wantID == 0 {
+		t.Fatalf("XFRMIfNameAndID returned name=%q id=%d for st0.0", ifName, wantID)
+	}
+	// Seed a kernel xfrmi with the SAME name but a DIFFERENT (stale) Ifid,
+	// and leave xm.xfrmis empty so Apply takes the adopt-on-restart path.
+	staleID := wantID + 1
+	ops.links[ifName] = &netlink.Xfrmi{
+		LinkAttrs: netlink.LinkAttrs{Name: ifName, Index: 11},
+		Ifid:      staleID,
+	}
+
+	xm := &xfrmManager{ops: ops}
+	if err := xm.Apply(xfrmVPNs("st0.0")); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	if len(ops.delNames) != 1 || ops.delNames[0] != ifName {
+		t.Errorf("stale-if_id adopt issued LinkDel %v, want exactly [%q] "+
+			"(wrong-Ifid kernel link must be recreated, not adopted)",
+			ops.delNames, ifName)
+	}
+	if ops.addCount != 1 {
+		t.Errorf("stale-if_id adopt issued %d LinkAdd, want exactly 1", ops.addCount)
+	}
+	if got := xm.xfrmis[ifName]; got != wantID {
+		t.Errorf("tracked if_id %d after recreate, want desired %d", got, wantID)
+	}
+	// The kernel link must now carry the DESIRED Ifid, not the stale one.
+	link, ok := ops.links[ifName]
+	if !ok {
+		t.Fatalf("xfrmi %q missing from kernel after recreate", ifName)
+	}
+	xi, ok := link.(*netlink.Xfrmi)
+	if !ok {
+		t.Fatalf("kernel link %q is %T, want *netlink.Xfrmi", ifName, link)
+	}
+	if xi.Ifid != wantID {
+		t.Errorf("recreated kernel xfrmi has Ifid %d, want desired %d "+
+			"(stale link was adopted without recreate)", xi.Ifid, wantID)
 	}
 }
 

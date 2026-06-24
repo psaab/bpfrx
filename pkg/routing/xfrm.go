@@ -96,17 +96,32 @@ func (x *xfrmManager) Apply(vpns map[string]*config.IPsecVPN) error {
 		// interface is unchanged (commit no-op) or survived a daemon
 		// restart that lost in-memory tracking but not the kernel link.
 		if link, err := x.ops.LinkByName(ifName); err == nil {
-			if upErr := x.ops.LinkSetUp(link); upErr != nil {
-				slog.Warn("failed to bring up existing xfrmi",
-					"name", ifName, "err", upErr)
-			}
-			if tracked {
-				slog.Debug("xfrmi unchanged, reused", "name", ifName, "if_id", ifID)
+			// Verify the adopted kernel link's ACTUAL if_id matches the
+			// desired one before re-tracking it. A kernel xfrmi with the
+			// same NAME but a stale Ifid (e.g. a daemon restart after the
+			// VPN's derived if_id changed, or a leftover from an aborted
+			// recreate) must NOT be silently adopted — Ifid is immutable in
+			// place, so a mismatch requires delete+recreate. On match (or a
+			// non-xfrmi link of that name, which should not happen) keep the
+			// existing adopt behavior.
+			if xi, ok := link.(*netlink.Xfrmi); ok && xi.Ifid != ifID {
+				slog.Info("xfrmi has stale if_id, recreating",
+					"name", ifName, "have", xi.Ifid, "want", ifID)
+				x.deleteLocked(ifName)
+				// Fall through to the LinkAdd create path below.
 			} else {
-				slog.Info("xfrmi adopted", "name", ifName, "if_id", ifID)
+				if upErr := x.ops.LinkSetUp(link); upErr != nil {
+					slog.Warn("failed to bring up existing xfrmi",
+						"name", ifName, "err", upErr)
+				}
+				if tracked {
+					slog.Debug("xfrmi unchanged, reused", "name", ifName, "if_id", ifID)
+				} else {
+					slog.Info("xfrmi adopted", "name", ifName, "if_id", ifID)
+				}
+				x.xfrmis[ifName] = ifID
+				continue
 			}
-			x.xfrmis[ifName] = ifID
-			continue
 		}
 
 		xfrmi := &netlink.Xfrmi{
