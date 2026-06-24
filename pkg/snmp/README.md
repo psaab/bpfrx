@@ -23,6 +23,50 @@ struct; SET requests (`pduSetRequest`, 0xa3) are gated on it:
 SNMPv3 SET requests are uniformly refused with `notWritable` (the USM users
 in this config carry no read-write authorization).
 
+## SNMPv3 USM timeliness and replay protection (RFC 3414 §3.2)
+
+Authenticating a request proves the sender holds the user's key; it does
+**not** prove the message is fresh. Without a timeliness check an on-path
+attacker can replay a captured authenticated PDU verbatim. The agent enforces
+the RFC 3414 §3.2 timeliness window as the authoritative engine:
+
+- After `verifyAuth` succeeds, `checkTimeliness(reqBoots, reqTime)` compares the
+  request's `msgAuthoritativeEngineBoots`/`msgAuthoritativeEngineTime` against
+  the agent's own `engineBoots`/`engineTime()`. A request is in the window only
+  when our boots counter is below the RFC ceiling (`2147483647`), the request's
+  boots equals ours, and the request's time is within ±150 seconds of ours.
+- A request outside the window gets an **authenticated** Report PDU carrying
+  `usmStatsNotInTimeWindows` (`1.3.6.1.6.3.15.1.1.2.0`) plus the agent's current
+  boots/time, never a data response. A manager whose cached boots/time drifted
+  (the legitimate case, e.g. after our restart bumped boots) reads the report
+  and resynchronizes; a replay simply gets nothing useful.
+- The engineID discovery handshake (empty `userName` →
+  `usmStatsUnknownEngineIDs`, `1.3.6.1.6.3.15.1.1.4.0`) is unaffected: a manager
+  still learns our engineID and current boots/time before its first
+  authenticated request, so a freshly-discovered, timely request is accepted.
+
+### engineBoots persistence
+
+`engineBoots` is loaded, incremented, and persisted once at agent construction
+so `(engineBoots, engineTime)` is monotonic across daemon restarts, as RFC 3414
+requires of an authoritative engine:
+
+- State file: `/var/lib/xpf/snmp-engineboots` (a single decimal integer). The
+  path is injectable via `NewAgentWithBootsPath` — the test seam used to assert
+  the load/increment/persist cycle without touching real state.
+- First boot (file missing): `engineBoots` starts at `1` and the file is
+  created. Each subsequent start reads the prior value, increments it, and
+  persists the new value (1 → 2 → 3 …). `engineTime()` then counts from *this*
+  boot (`startTime`), so the pair advances monotonically.
+- A corrupt/unreadable counter or a value at the RFC ceiling restarts the count
+  at `1` rather than wedging the agent — the timeliness check is the replay
+  backstop, so a lost counter degrades resynchronization, not security. A write
+  failure is logged and ignored; the agent serves with the in-memory boots for
+  this run and only cross-restart monotonicity is lost until the next write.
+- The persist uses `fsatomic.WriteFileDurable` (fsync-on-write); the directory
+  is created with `fsatomic.MkdirAllDurable`. This is slow-path (once per start),
+  so per-write durability is affordable.
+
 ## Live reconfigure (commit-time reconcile)
 
 The agent is created once at daemon startup and keeps serving on UDP/161.
