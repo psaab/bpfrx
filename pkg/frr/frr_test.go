@@ -3831,3 +3831,93 @@ func TestGeneratePolicyOptionsMatchTypesRegression(t *testing.T) {
 		}
 	}
 }
+
+// --- #2489: a VRF-scoped BGP neighbor with BFD must render its top-level
+// `bfd { peer <addr> }` line WITH the matching `vrf <name>` suffix.
+// FRR's bfdd is a single daemon; a `peer <addr>` line with no vrf is
+// created in the DEFAULT VRF and never associates with the VRF-bound BGP
+// session, so the BFD session stays DOWN and sub-second failover never
+// works for VRF BGP peers. The `bfd` block is rendered once per BGP
+// instance (manager.go calls generateProtocols per-instance), so the
+// in-scope vrfName is correct for every peer in the block.
+
+func bgpWithBFDPeer(addr string) *config.BGPConfig {
+	return &config.BGPConfig{
+		LocalAS:  65001,
+		RouterID: "1.1.1.1",
+		Neighbors: []*config.BGPNeighbor{
+			{Address: addr, PeerAS: 65002, BFD: true},
+		},
+	}
+}
+
+// TestGenerateProtocols_BFDPeerVRFSuffix is the fail-on-revert guard:
+// removing the vrf suffix from the bfd peer line (the bug) makes
+// `peer 10.1.1.2 vrf vrf-1` collapse to `peer 10.1.1.2` → this test
+// fails.
+func TestGenerateProtocols_BFDPeerVRFSuffix(t *testing.T) {
+	m := New()
+	bgp := bgpWithBFDPeer("10.1.1.2")
+	got := m.generateProtocols(nil, nil, bgp, nil, nil, "vrf-1", 0, nil)
+
+	if !strings.Contains(got, " peer 10.1.1.2 vrf vrf-1\n") {
+		t.Errorf("VRF-scoped BFD peer must carry `vrf vrf-1` suffix, got:\n%s", got)
+	}
+	// The unqualified default-VRF line must NOT appear for a VRF peer —
+	// that is exactly the bug (peer lands in the default VRF).
+	if strings.Contains(got, " peer 10.1.1.2\n") {
+		t.Errorf("VRF-scoped BFD peer must NOT render an unqualified `peer` line (lands in default VRF), got:\n%s", got)
+	}
+	// The router stanza and in-router neighbor bfd must stay VRF-correct.
+	if !strings.Contains(got, "router bgp 65001 vrf vrf-1\n") {
+		t.Errorf("router bgp must carry vrf suffix, got:\n%s", got)
+	}
+	if !strings.Contains(got, " neighbor 10.1.1.2 bfd\n") {
+		t.Errorf("in-router neighbor bfd line missing, got:\n%s", got)
+	}
+}
+
+// TestGenerateProtocols_BFDPeerDefaultNoVRFSuffix proves the default
+// instance (vrfName == "") still renders a bare `peer <addr>` line with
+// NO spurious vrf suffix — the fix must not regress default-VRF BFD.
+func TestGenerateProtocols_BFDPeerDefaultNoVRFSuffix(t *testing.T) {
+	m := New()
+	bgp := bgpWithBFDPeer("10.0.0.9")
+	got := m.generateProtocols(nil, nil, bgp, nil, nil, "", 0, nil)
+
+	if !strings.Contains(got, " peer 10.0.0.9\n") {
+		t.Errorf("default-instance BFD peer must render bare `peer` line, got:\n%s", got)
+	}
+	if strings.Contains(got, "peer 10.0.0.9 vrf") {
+		t.Errorf("default-instance BFD peer must NOT carry a vrf suffix, got:\n%s", got)
+	}
+}
+
+// TestGenerateProtocols_BFDPeerMixedInstances renders a default-instance
+// BGP and a VRF-instance BGP through the same per-instance path manager.go
+// uses, and verifies each instance's bfd peer line carries the VRF of the
+// instance it belongs to (none for default, `vrf vrf-blue` for the VRF
+// instance) — the per-instance bfd-block invariant that makes a single
+// in-scope vrfName correct.
+func TestGenerateProtocols_BFDPeerMixedInstances(t *testing.T) {
+	m := New()
+	var b strings.Builder
+	// Default instance peer.
+	b.WriteString(m.generateProtocols(nil, nil, bgpWithBFDPeer("10.0.0.1"), nil, nil, "", 0, nil))
+	// VRF instance peer.
+	b.WriteString(m.generateProtocols(nil, nil, bgpWithBFDPeer("10.2.2.2"), nil, nil, "vrf-blue", 0, nil))
+	got := b.String()
+
+	if !strings.Contains(got, " peer 10.0.0.1\n") {
+		t.Errorf("default-instance peer must be unqualified, got:\n%s", got)
+	}
+	if strings.Contains(got, "peer 10.0.0.1 vrf") {
+		t.Errorf("default-instance peer must NOT carry a vrf suffix, got:\n%s", got)
+	}
+	if !strings.Contains(got, " peer 10.2.2.2 vrf vrf-blue\n") {
+		t.Errorf("VRF-instance peer must carry `vrf vrf-blue`, got:\n%s", got)
+	}
+	if strings.Contains(got, " peer 10.2.2.2\n") {
+		t.Errorf("VRF-instance peer must NOT render an unqualified line, got:\n%s", got)
+	}
+}
