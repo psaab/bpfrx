@@ -288,6 +288,26 @@ const (
 	GlobalCtrMax                 = 41
 )
 
+// CurrentSessions returns the live local-forwarding session count derived
+// from the monotonic create/close counters as a saturating (floored-at-0)
+// unsigned subtraction.
+//
+// #2428: callers historically computed `sessNew - sessClosed` directly.
+// On the secondary/standby node the close counter could legitimately race
+// ahead of the create counter for a brief window (and, before the dataplane
+// balance fix, structurally — peer-synced sessions were reaped without ever
+// being create-counted on the node that did not create them locally). A raw
+// u64 subtraction wraps to ~1.8e19 in that case. The dataplane balance fix
+// (only local-origin expiries bump session_expires) is the primary fix; this
+// floor is the defense-in-depth backstop so the displayed gauge can never
+// surface a wrapped value if a future imbalance reappears.
+func CurrentSessions(sessNew, sessClosed uint64) uint64 {
+	if sessClosed >= sessNew {
+		return 0
+	}
+	return sessNew - sessClosed
+}
+
 // Host-inbound-traffic service flags (bitmap in zone_config.host_inbound_flags).
 const (
 	HostInboundSSH             = 1 << 0

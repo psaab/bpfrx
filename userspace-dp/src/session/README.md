@@ -186,6 +186,30 @@ the known active/active `owner_rg_id == 0` under-retention residual
 observable — a `==0` entry for a standby RG path on an otherwise-active
 node ages and is re-derived on promotion via the reverse-synced prewarm).
 
+## "Current sessions" gauge accounting (#2428)
+
+The `session_creates` / `session_expires` BindingLiveState counters feed
+the Go-side `show security flow statistics` "Current sessions" gauge,
+which Go derives as `dataplane.CurrentSessions(session_creates,
+session_expires)` — a **local-forwarding** gauge.
+
+`session_creates` is incremented ONLY on the local poll-descriptor install
+paths (`SessionOrigin::{ForwardFlow, ReverseFlow, LocalMiss,
+MissingNeighborSeed}`). Peer-synced entries (`SessionOrigin::{SyncImport,
+SharedMaterialize, WorkerLocalImport}`) are installed via the HA sync path
+(`upsert_synced_with_origin` / `WorkerCommand::UpsertLocal`) and NEVER
+touch `session_creates`.
+
+The expire pass therefore must only count **non-peer-synced** expiries in
+`session_expires`, otherwise the standby — which reaps synced sessions but
+creates none locally — drives `session_expires` past `session_creates`,
+wrapping the unsigned Go subtraction to ~1.8e19. `worker_loop`'s
+`count_local_session_expiries` filters `expire_stale_entries_ha`'s
+returned origins to local-only before the `fetch_add`. The standby thus
+reports `Current sessions: 0`. The Go-side `CurrentSessions` saturating
+floor (clamp at 0) is the defense-in-depth backstop against any future
+imbalance.
+
 ## Corruption contract (#1855)
 
 A `key_to_handle` mapping that points at a vacant or reused slab slot is

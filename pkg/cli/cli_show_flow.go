@@ -949,7 +949,7 @@ func (c *CLI) showFlowStatistics() error {
 	cacheInval := readCounter(dataplane.GlobalCtrFlowCacheInvalidate)
 
 	fmt.Println("Flow statistics:")
-	fmt.Printf("  %-30s %d\n", "Current sessions:", sessNew-sessClosed)
+	fmt.Printf("  %-30s %d\n", "Current sessions:", dataplane.CurrentSessions(sessNew, sessClosed))
 	fmt.Printf("  %-30s %d\n", "Sessions created:", sessNew)
 	fmt.Printf("  %-30s %d\n", "Sessions closed:", sessClosed)
 	fmt.Println()
