@@ -6162,3 +6162,123 @@ fn local_origin_tunnel_tx_request_follows_supplied_state_destination() {
          loads the rotated state"
     );
 }
+
+// #2443: inject packet-length bound + u16 wire-length backstop tests.
+
+fn inject_test_egress(vlan_id: u16) -> EgressInterface {
+    EgressInterface {
+        bind_ifindex: 5,
+        vlan_id,
+        mtu: 1500,
+        src_mac: [0x02, 0xbf, 0x72, 0x00, 0x80, 0x08],
+        zone_id: 0,
+        redundancy_group: 0,
+        primary_v4: None,
+        primary_v6: None,
+    }
+}
+
+fn inject_req(packet_length: u32) -> InjectPacketRequest {
+    InjectPacketRequest {
+        packet_length,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn inject_ipv4_normal_length_builds() {
+    let egress = inject_test_egress(0);
+    let frame = build_injected_ipv4(
+        &inject_req(128),
+        [0xde, 0xad, 0xbe, 0xef, 0x00, 0x01],
+        Ipv4Addr::new(172, 16, 80, 8),
+        Ipv4Addr::new(172, 16, 80, 200),
+        4660,
+        &egress,
+    )
+    .expect("normal injected IPv4 frame builds");
+    // Eth(14) + IPv4(20) + ICMP(8) + payload >= 16.
+    assert!(frame.len() >= 14 + 20 + 8 + 16);
+    // The on-wire IPv4 total-length field must equal the actual L3 length
+    // (frame minus the 14-byte eth header). This is the consistency
+    // invariant the `as u16` wrap would violate.
+    let wire_total = u16::from_be_bytes([frame[16], frame[17]]) as usize;
+    assert_eq!(wire_total, frame.len() - 14, "IPv4 total-length consistent");
+}
+
+#[test]
+fn inject_ipv4_at_max_builds_and_is_bounded() {
+    let egress = inject_test_egress(0);
+    let frame = build_injected_ipv4(
+        &inject_req(crate::afxdp::MAX_INJECT_PACKET_LENGTH),
+        [0xde, 0xad, 0xbe, 0xef, 0x00, 0x01],
+        Ipv4Addr::new(172, 16, 80, 8),
+        Ipv4Addr::new(172, 16, 80, 200),
+        4660,
+        &egress,
+    )
+    .expect("at-max injected IPv4 frame builds");
+    assert!(frame.len() <= crate::afxdp::MAX_INJECT_PACKET_LENGTH as usize);
+    let wire_total = u16::from_be_bytes([frame[16], frame[17]]) as usize;
+    assert_eq!(wire_total, frame.len() - 14, "IPv4 total-length consistent at max");
+}
+
+#[test]
+fn inject_ipv4_giant_length_clamped_no_wire_wrap() {
+    // A length far above the maximum (and above u16) must NOT produce a
+    // huge buffer and must NOT write a wrapped wire length. With the
+    // #2443 fix the builder clamps target_len to MAX_INJECT_PACKET_LENGTH
+    // and writes a consistent total-length. Fail-on-revert: removing the
+    // `.min(MAX_INJECT_PACKET_LENGTH)` clamp lets target_len reach
+    // 100_000, payload_len > u16, and the `u16::try_from` backstop then
+    // returns Err (so this `.expect` panics) — OR, if `as u16` is also
+    // restored, the wire field wraps and the consistency assert below
+    // fails. Either revert is caught.
+    let egress = inject_test_egress(0);
+    let frame = build_injected_ipv4(
+        &inject_req(100_000),
+        [0xde, 0xad, 0xbe, 0xef, 0x00, 0x01],
+        Ipv4Addr::new(172, 16, 80, 8),
+        Ipv4Addr::new(172, 16, 80, 200),
+        4660,
+        &egress,
+    )
+    .expect("giant length must be clamped, not rejected by the builder");
+    assert!(
+        frame.len() <= crate::afxdp::MAX_INJECT_PACKET_LENGTH as usize,
+        "giant injected frame must be bounded by MAX_INJECT_PACKET_LENGTH, got {}",
+        frame.len()
+    );
+    let wire_total = u16::from_be_bytes([frame[16], frame[17]]) as usize;
+    assert_eq!(
+        wire_total,
+        frame.len() - 14,
+        "IPv4 total-length must match the bounded frame (no u16 wrap)"
+    );
+}
+
+#[test]
+fn inject_ipv6_giant_length_clamped_no_wire_wrap() {
+    let egress = inject_test_egress(0);
+    let frame = build_injected_ipv6(
+        &inject_req(100_000),
+        [0xde, 0xad, 0xbe, 0xef, 0x00, 0x01],
+        Ipv6Addr::new(0x2001, 0x559, 0x8585, 0x80, 0, 0, 0, 8),
+        Ipv6Addr::new(0x2001, 0x559, 0x8585, 0x80, 0, 0, 0, 0x200),
+        4660,
+        &egress,
+    )
+    .expect("giant length must be clamped, not rejected by the builder");
+    assert!(
+        frame.len() <= crate::afxdp::MAX_INJECT_PACKET_LENGTH as usize,
+        "giant injected IPv6 frame must be bounded, got {}",
+        frame.len()
+    );
+    // IPv6 payload-length field is at eth(14) + 4..6.
+    let wire_plen = u16::from_be_bytes([frame[18], frame[19]]) as usize;
+    assert_eq!(
+        wire_plen,
+        frame.len() - 14 - 40,
+        "IPv6 payload-length must match the bounded frame (no u16 wrap)"
+    );
+}

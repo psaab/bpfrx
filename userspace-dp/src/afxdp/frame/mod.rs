@@ -1227,13 +1227,29 @@ pub(super) fn build_injected_ipv4(
 ) -> Result<Vec<u8>, String> {
     let eth_len = if egress.vlan_id > 0 { 18 } else { 14 };
     let min_total = eth_len + 20 + 8 + 16;
-    let target_len = req.packet_length.max(min_total as u32) as usize;
+    // #2443: clamp target_len to the inject maximum so a bypassed length
+    // bound cannot pre-allocate a huge buffer here. The reject path in
+    // `inject_test_packet` rejects an over-max request before reaching
+    // this builder; this clamp is defense in depth.
+    let target_len = req
+        .packet_length
+        .max(min_total as u32)
+        .min(crate::afxdp::MAX_INJECT_PACKET_LENGTH) as usize;
     let payload_len = target_len.saturating_sub(eth_len + 20 + 8);
+
+    // #2443: never emit a wrapped wire length. The IPv4 total-length
+    // field is u16; if 20 + 8 + payload_len cannot be represented, REJECT
+    // the build rather than truncating to a wrong on-wire length.
+    let total_len = u16::try_from(20 + 8 + payload_len).map_err(|_| {
+        format!(
+            "injected IPv4 total length {} exceeds u16",
+            20 + 8 + payload_len
+        )
+    })?;
 
     let mut frame = Vec::with_capacity(target_len);
     write_eth_header(&mut frame, dst_mac, egress.src_mac, egress.vlan_id, 0x0800);
 
-    let total_len = (20 + 8 + payload_len) as u16;
     let ip_start = frame.len();
     frame.extend_from_slice(&[
         0x45,
@@ -1278,12 +1294,21 @@ pub(super) fn build_injected_ipv6(
 ) -> Result<Vec<u8>, String> {
     let eth_len = if egress.vlan_id > 0 { 18 } else { 14 };
     let min_total = eth_len + 40 + 8 + 16;
-    let target_len = req.packet_length.max(min_total as u32) as usize;
+    // #2443: clamp target_len to the inject maximum (defense in depth;
+    // the request is rejected up front in `inject_test_packet`).
+    let target_len = req
+        .packet_length
+        .max(min_total as u32)
+        .min(crate::afxdp::MAX_INJECT_PACKET_LENGTH) as usize;
     let payload_len = target_len.saturating_sub(eth_len + 40 + 8);
+
+    // #2443: the IPv6 payload-length field is u16; REJECT rather than
+    // emit a wrapped on-wire length.
+    let plen = u16::try_from(8 + payload_len)
+        .map_err(|_| format!("injected IPv6 payload length {} exceeds u16", 8 + payload_len))?;
 
     let mut frame = Vec::with_capacity(target_len);
     write_eth_header(&mut frame, dst_mac, egress.src_mac, egress.vlan_id, 0x86dd);
-    let plen = (8 + payload_len) as u16;
     frame.extend_from_slice(&[
         0x60,
         0x00,

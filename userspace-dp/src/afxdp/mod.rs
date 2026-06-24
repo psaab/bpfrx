@@ -198,6 +198,15 @@ const UMEM_FRAME_SIZE: u32 = 4096;
 /// indexing the wrong slot.
 const UMEM_FRAME_SHIFT: u32 = 12;
 const _: () = assert!(1u32 << UMEM_FRAME_SHIFT == UMEM_FRAME_SIZE);
+/// #2443: upper bound on the operator/API-supplied `inject-packet`
+/// length. An injected packet is emitted as a single unfragmented frame
+/// that must fit in one UMEM frame on the TX path, so the egress
+/// single-frame ceiling (`UMEM_FRAME_SIZE`) is the binding constraint.
+/// It is also well within the u16 range of the IPv4 total-length / IPv6
+/// payload-length wire fields, so the on-wire length can never wrap. A
+/// request above this is REJECTED (not clamped) — see
+/// `Coordinator::inject_test_packet` and the frame builders.
+const MAX_INJECT_PACKET_LENGTH: u32 = UMEM_FRAME_SIZE;
 const UMEM_HEADROOM: u32 = 256;
 // #920: batch sizes lowered from 256 to 64 to keep the per-batch
 // working set within typical 32 KB L1d (~10-14 KB at 64 packets:
