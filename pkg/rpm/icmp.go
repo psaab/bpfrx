@@ -49,6 +49,30 @@ type probeSockOpts struct {
 	Mark       uint32
 }
 
+// applyVRFBind applies the per-test VRF/path pin to a raw socket fd:
+// SO_BINDTODEVICE for the egress device and SO_MARK for the probe
+// fwmark. It is the single source of truth for the bind so the probe
+// DATA socket (realICMPListen / probeDialer) and the hostname-resolution
+// DNS socket (resolveProbeTarget's bound resolver, #2614) pin to exactly
+// the same scope — a hostname target in a VRF therefore resolves through
+// the VRF's DNS instead of the process-default table. A zero device and
+// zero mark is a no-op (default-context probe, unchanged).
+func applyVRFBind(fd int, device string, mark uint32) error {
+	if device != "" {
+		if err := unix.SetsockoptString(fd, unix.SOL_SOCKET,
+			unix.SO_BINDTODEVICE, device); err != nil {
+			return err
+		}
+	}
+	if mark != 0 {
+		if err := unix.SetsockoptInt(fd, unix.SOL_SOCKET,
+			unix.SO_MARK, int(mark)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // icmpListenFunc opens an ICMP packet socket. network is "ip4:icmp" or
 // "ip6:ipv6-icmp"; laddr is the optional source address. Production
 // uses realICMPListen (raw socket via net.ListenConfig with the socket
@@ -62,17 +86,7 @@ func realICMPListen(network, laddr string, opts probeSockOpts) (net.PacketConn, 
 		Control: func(_, _ string, c syscall.RawConn) error {
 			var cerr error
 			err := c.Control(func(fd uintptr) {
-				if opts.BindDevice != "" {
-					cerr = unix.SetsockoptString(int(fd), unix.SOL_SOCKET,
-						unix.SO_BINDTODEVICE, opts.BindDevice)
-					if cerr != nil {
-						return
-					}
-				}
-				if opts.Mark != 0 {
-					cerr = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET,
-						unix.SO_MARK, int(opts.Mark))
-				}
+				cerr = applyVRFBind(int(fd), opts.BindDevice, opts.Mark)
 			})
 			if err != nil {
 				return err
@@ -113,7 +127,7 @@ func (m *Manager) probeICMP(ctx context.Context, test *config.RPMTest, opts prob
 	if resolve == nil {
 		resolve = resolveProbeTarget
 	}
-	dstAddr, err := resolve(test.Target)
+	dstAddr, err := resolve(test.Target, opts)
 	if err != nil {
 		return 0, err
 	}
@@ -240,22 +254,83 @@ func (m *Manager) probeICMP(ctx context.Context, test *config.RPMTest, opts prob
 }
 
 // resolveProbeTarget parses or resolves the test target into an address,
-// preserving the IPv6 link-local zone (#2494). net.ParseIP rejects a
-// zoned literal (`fe80::1%ge-0-0-3`), so a zoned target falls through to
-// net.ResolveIPAddr, which parses the scope id into IPAddr.Zone — the
-// zone must survive to the send path so a link-local echo is steered to
-// the right link. A plain IP literal short-circuits ParseIP (no DNS, no
-// zone); a hostname resolves through net.ResolveIPAddr.
-func resolveProbeTarget(target string) (*net.IPAddr, error) {
+// preserving the IPv6 link-local zone (#2494) and resolving a hostname
+// IN THE PROBE'S VRF/path SCOPE (#2614).
+//
+// A plain IP literal short-circuits ParseIP (no DNS, no zone). A zoned
+// literal (`fe80::1%ge-0-0-3`) is rejected by net.ParseIP, so it falls
+// through to the resolver, which parses the scope id into IPAddr.Zone —
+// the zone must survive to the send path so a link-local echo is steered
+// to the right link.
+//
+// A hostname is resolved through a net.Resolver. When the test carries a
+// scope (opts.BindDevice / opts.Mark — set for routing-instance /
+// destination-interface / next-hop tests), the resolver uses PreferGo
+// (the pure-Go DNS client) with a Dial whose Control applies the SAME
+// applyVRFBind (SO_BINDTODEVICE + SO_MARK) the probe DATA socket uses, so
+// the DNS query egresses the probe's VRF and hits the VRF's DNS servers
+// instead of the process-default table. Without this, a hostname target
+// inside an isolated VRF resolved through the main table / default DNS —
+// wrong address, or a resolution failure when DNS is reachable only
+// inside the VRF (#2614). An unscoped test (no device, no mark) uses the
+// default resolver, bit-identical to the pre-#2614 net.ResolveIPAddr
+// path.
+func resolveProbeTarget(target string, opts probeSockOpts) (*net.IPAddr, error) {
 	if target == "" {
 		return nil, fmt.Errorf("no target specified")
 	}
 	if ip := net.ParseIP(target); ip != nil {
 		return &net.IPAddr{IP: ip}, nil
 	}
-	addr, err := net.ResolveIPAddr("ip", target)
+	ips, err := resolverForOpts(opts).LookupIPAddr(context.Background(), target)
 	if err != nil {
 		return nil, fmt.Errorf("resolve target %q: %w", target, err)
 	}
-	return addr, nil
+	if len(ips) == 0 {
+		return nil, fmt.Errorf("resolve target %q: no addresses", target)
+	}
+	// Preserve net.ResolveIPAddr("ip", ...) semantics: first address,
+	// carrying any IPv6 zone the resolver populated.
+	return &net.IPAddr{IP: ips[0].IP, Zone: ips[0].Zone}, nil
+}
+
+// resolverForOpts selects the DNS resolver for a probe (#2614): the
+// default resolver for an unscoped probe (no device, no mark —
+// bit-identical to the pre-#2614 process-default lookup), or a
+// VRF/path-bound resolver when the probe carries a scope. Split out so a
+// unit test can assert the scoped probe gets a bound resolver and the
+// unscoped probe gets the default — the live VRF DNS query is lab-bound,
+// so this selection is the gate.
+func resolverForOpts(opts probeSockOpts) *net.Resolver {
+	if opts.BindDevice != "" || opts.Mark != 0 {
+		return vrfBoundResolver(opts)
+	}
+	return net.DefaultResolver
+}
+
+// vrfBoundResolver builds a net.Resolver that issues DNS queries from a
+// socket pinned to the probe's VRF/path scope (#2614). PreferGo selects
+// the pure-Go DNS client so the Dial hook is honored (the cgo resolver
+// path ignores it); the Dialer's Control applies the same applyVRFBind
+// (SO_BINDTODEVICE / SO_MARK) as the probe DATA socket, so the query
+// leaves the VRF and resolves against the VRF's DNS.
+func vrfBoundResolver(opts probeSockOpts) *net.Resolver {
+	return &net.Resolver{
+		PreferGo: true,
+		Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
+			d := net.Dialer{
+				Control: func(_, _ string, c syscall.RawConn) error {
+					var cerr error
+					err := c.Control(func(fd uintptr) {
+						cerr = applyVRFBind(int(fd), opts.BindDevice, opts.Mark)
+					})
+					if err != nil {
+						return err
+					}
+					return cerr
+				},
+			}
+			return d.DialContext(ctx, network, address)
+		},
+	}
 }

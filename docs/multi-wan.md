@@ -67,33 +67,45 @@ set services rpm probe WAN test wan-a thresholds successive-loss 3
   a persisted/peer-synced config still boots (#1960 no-brick); the
   runtime dialer guard then returns the same setup error, so the test
   holds state (below) rather than measuring the wrong path.
-- **Scoped tests require an IP-literal target (#2493).** A *scoped*
-  test — one with `routing-instance`, `destination-interface`, or
-  `next-hop` set — binds its probe **data** socket to a specific VRF /
-  egress device (`SO_BINDTODEVICE`) or path (`SO_MARK`). Hostname
-  resolution, however, runs through the process-default resolver /
-  table / source: the bind is applied in the per-connection `Control`
-  hook, which fires **after** name resolution, so DNS escapes the
-  configured scope. With split-horizon / per-WAN DNS that turns
-  path-health into a resolver-context test (false PASS/FAIL feeding
-  ip-monitoring failover). Therefore a **hostname target on a scoped
-  test is rejected at commit** (strict commit / commit-check;
-  `validateRPMScopedHostnameStrict`). An **IP-literal** target on a
-  scoped test is fine (no resolution), and a **hostname on an
-  *unscoped*** (default-context) test is fine (it resolves in the same
-  context it probes — today's behavior, no regression). On the tolerant
-  load / peer-sync path the rejection is downgraded to a warning so a
-  persisted/peer-synced config still boots (#1960 no-brick); the runtime
-  prober then returns the probe-setup error for the same combination, so
-  a leniently-loaded scoped-hostname test **holds state** rather than
-  actuating routes off a mis-scoped measurement.
-  - *Deferred:* a **VRF-aware resolver** — binding the DNS socket to the
-    scope device and using the routing-instance's resolv context — would
-    let a scoped hostname resolve in-context and lift this restriction.
-    That is a larger feature (per-instance resolver wiring); the
-    injectable `Manager.resolveTarget` seam (`pkg/rpm`) is the slot where
-    it drops in. Until then the safe increment is the commit reject
-    above. Tracked as the #2493 follow-up.
+- **Scoped tests resolve their hostname in-scope (#2493 → #2614).** A
+  *scoped* test — one with `routing-instance`, `destination-interface`,
+  or `next-hop` set — binds its probe **data** socket to a specific VRF /
+  egress device (`SO_BINDTODEVICE`) or path (`SO_MARK`). Originally
+  (#2493) a **hostname** target on a scoped test was *rejected at commit*
+  because hostname resolution ran through the process-default resolver
+  (the data-socket bind is applied in the per-connection `Control` hook,
+  which fires **after** name resolution), so DNS escaped the configured
+  scope — with split-horizon / per-WAN DNS the probe measured resolver
+  context, not path health.
+  - **#2614 lifts that restriction with a VRF-bound resolver.** The
+    runtime now resolves a scoped hostname **inside the probe's
+    VRF/path scope**: it builds a `net.Resolver{PreferGo: true}` whose
+    `Dial` applies the *same* `applyVRFBind` (`SO_BINDTODEVICE` +
+    `SO_MARK`) the probe data socket uses, so the DNS query egresses the
+    VRF and hits the VRF's DNS servers. icmp-ping resolves through
+    `rpm.resolveProbeTarget(target, opts)`; tcp-ping / http-get set the
+    dialer's `Resolver` (`probeDialer.Resolver = vrfBoundResolver(opts)`)
+    so the dialer's own name lookup is bound too. A hostname inside an
+    isolated VRF therefore resolves correctly instead of through the
+    main table / default DNS (or failing when DNS is reachable only
+    inside the VRF). `applyVRFBind` is the single source of truth for the
+    pin, shared by the data socket and the DNS socket.
+  - The **#2493 commit gate (`validateRPMScopedHostnameStrict`) is
+    removed** — a scoped hostname is now a legitimate configuration on
+    both the strict and tolerant paths. An **IP-literal** target on a
+    scoped test still short-circuits DNS entirely (no resolver consulted),
+    and a hostname on an **unscoped** test uses the process-default
+    resolver unchanged. `PreferGo` is required: the cgo resolver path
+    ignores the `Dial` hook, so the bind would be silently dropped.
+  - *Lab-bound verify.* The end-to-end "scoped hostname resolves through
+    VRF DNS" path needs a multi-VRF DNS lab; the gate in CI is the
+    construction/seam test (`pkg/rpm`
+    `TestVRFBoundResolverIsBuiltForScope` /
+    `TestScopedHostnameResolvesInScope`): a scoped probe gets a bound
+    (`PreferGo` + `Dial`) resolver and the probe's `BindDevice`/`Mark`
+    reach the resolver, while an unscoped probe keeps the default
+    resolver. Reverting to the unbound `net.ResolveIPAddr` path turns
+    those tests red.
 - **IPv6 link-local targets need a scope (#2494).** A link-local target
   (`fe80::/10`) is unprobeable without an egress link: the kernel cannot
   pick the link, so the ICMP echo goes nowhere. The scope can come from
