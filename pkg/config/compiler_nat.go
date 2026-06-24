@@ -573,28 +573,42 @@ func compileNAT64(node *Node, sec *SecurityConfig) error {
 }
 
 // parseZoneList extracts zone names from a from/to node.
-// Handles multiple AST shapes:
-//   - Hierarchical bracket list: Keys=["from","zone","A","B","C"] → ["A","B","C"]
-//   - SetPath single: child zone node with value → ["A"]
-//   - SetPath multiple: multiple zone children → ["A","B"]
-//   - SetPath bracket-expanded: zone child with orphan leaf children → ["A","B"]
+// Handles every AST shape the parser can produce for `from zone ...`:
+//   - `from` carries the list inline: Keys=["from","zone","A","B","C"] → ["A","B","C"]
+//   - Unified bracket list (#2419): one "zone" child with the whole list
+//     collapsed onto its Keys — Keys=["zone","A","B","C"] → ["A","B","C"].
+//     This is the shape flat-set `set ... from zone [ A B C ]` now produces;
+//     before #2419 it split into a "zone" child plus orphan leaf children, and
+//     reading only nodeVal here silently dropped every zone but the first
+//     (FAIL-OPEN static NAT — the dropped zone's whole rule-set vanished).
+//   - Hierarchical / legacy block: multiple "zone" children, each
+//     Keys=["zone","A"] (from `from { zone A; zone B; }` or repeated
+//     `set ... from zone A` / `from zone B` set commands).
+//
+// For each "zone" child we accumulate Keys[1:] AND any orphan leaf children,
+// mirroring firewallMatchValues (compiler_firewall.go) — the #2419 contract for
+// reading a multi-value leaf across both AST shapes.
 func parseZoneList(node *Node) []string {
-	// Hierarchical: all zone names inline in Keys
+	// `from` carries the zone list inline on its own Keys.
 	if len(node.Keys) >= 3 && node.Keys[1] == "zone" {
 		return node.Keys[2:]
 	}
-	// SetPath: iterate all "zone" children (multiple set commands create siblings)
 	var zones []string
 	for _, child := range node.Children {
-		if child.Name() == "zone" {
-			if v := nodeVal(child); v != "" {
-				zones = append(zones, v)
+		if child.Name() != "zone" {
+			continue
+		}
+		// Unified bracket list / single value: every token after "zone".
+		for _, k := range child.Keys[1:] {
+			if k != "" {
+				zones = append(zones, k)
 			}
-			// Also collect orphan leaf children (bracket-expanded extra zone names)
-			for _, grandchild := range child.Children {
-				if grandchild.IsLeaf && len(grandchild.Keys) >= 1 {
-					zones = append(zones, grandchild.Keys[0])
-				}
+		}
+		// Legacy bracket-expanded orphan leaf children (defensive — older
+		// trees that still split the list into child leaves).
+		for _, grandchild := range child.Children {
+			if grandchild.IsLeaf && len(grandchild.Keys) >= 1 && grandchild.Keys[0] != "" {
+				zones = append(zones, grandchild.Keys[0])
 			}
 		}
 	}
@@ -1146,6 +1160,33 @@ func compileNATDestination(node *Node, sec *SecurityConfig) error {
 //   - Set syntax range: destination-port 20000 { to 30000; } (args=1 consumes low, "to N" is child)
 func parseDNATPortList(m *Node) []int {
 	var ports []int
+	// Unified single-leaf shape (#2419): both the hierarchical parser and
+	// the flat-set SetPath now collapse a bracket list or a `low to high`
+	// range onto the node's own keys, with NO children:
+	//   destination-port [ 80 443 ]        → Keys=[destination-port 80 443]
+	//   destination-port 20000 to 20003     → Keys=[destination-port 20000 to 20003]
+	// Parse the trailing key tokens directly. A `to` token between two
+	// numbers is a range; everything else is an individual port.
+	if len(m.Children) == 0 && len(m.Keys) >= 2 {
+		vals := m.Keys[1:]
+		for i := 0; i < len(vals); i++ {
+			low, err := strconv.Atoi(vals[i])
+			if err != nil {
+				continue
+			}
+			if i+2 < len(vals) && vals[i+1] == "to" {
+				if high, err2 := strconv.Atoi(vals[i+2]); err2 == nil && high >= low {
+					for p := low; p <= high; p++ {
+						ports = append(ports, p)
+					}
+					i += 2
+					continue
+				}
+			}
+			ports = append(ports, low)
+		}
+		return ports
+	}
 	if len(m.Children) > 0 {
 		// Check for set-syntax port range: Keys=["destination-port","20000"] + child "to 30000"
 		if len(m.Keys) >= 2 {

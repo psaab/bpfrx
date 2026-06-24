@@ -788,6 +788,88 @@ services {
     }
 }`,
 	},
+	{
+		// #2419 fold: static-NAT `from zone` is a multi-value leaf
+		// (schema_security.go zone, multi:true). A bracketed multi-zone
+		// list `from zone [ trust dmz ]` collapses onto the zone leaf's
+		// Keys in flat-set replay; reading only nodeVal in parseZoneList
+		// kept "trust" and dropped "dmz" → ONE StaticNATRuleSet instead of
+		// two (FAIL-OPEN: the dmz rule-set vanished). With the parseZoneList
+		// Keys[1:] fix both shapes compile to TWO StaticNATRuleSets.
+		name: "security-nat-static-multi-zone",
+		hier: `security {
+    nat {
+        static {
+            rule-set rs {
+                from zone [ trust dmz ];
+                rule one-to-one {
+                    match {
+                        destination-address 203.0.113.6/32;
+                    }
+                    then {
+                        static-nat {
+                            prefix {
+                                10.0.1.6/32;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}`,
+	},
+	{
+		// #2419 sibling: WireGuard peer allowed-ips is multi:true. A
+		// bracketed `allowed-ips [ a b ]` collapses onto the leaf's Keys;
+		// reading only nodeVal dropped every prefix but the first. The
+		// Keys[1:] fix in parseTunnelWireguardPeer carries both.
+		name: "interfaces-wireguard-allowed-ips-multi",
+		hier: `interfaces {
+    wg0 {
+        unit 0 {
+            family inet {
+                address 10.10.0.1/24;
+            }
+            tunnel {
+                wireguard {
+                    listen-port 51820;
+                    private-key 0011223344556677889900112233445566778899001122334455667788990011;
+                    peer aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899 {
+                        allowed-ips [ 10.0.0.0/24 192.168.5.0/24 ];
+                        endpoint 198.51.100.1:51820;
+                    }
+                }
+            }
+        }
+    }
+}`,
+	},
+	{
+		// #2419 fold: system domain-search is a multi-value leaf
+		// (schema_system.go domain-search, multi:true). A bracketed
+		// `domain-search [ a b c ]` collapses every value onto the leaf
+		// Keys in flat-set replay; the compileSystem reader formerly read
+		// only Keys[1] + orphan children, so #2419's collapse dropped every
+		// domain but the first. firewallMatchValues now carries all three.
+		name: "system-domain-search-multi",
+		hier: `system {
+    host-name fw;
+    domain-search [ a.example.com b.example.com c.example.com ];
+}`,
+	},
+	{
+		// #2419 sibling: system name-server is multi:true with the
+		// identical reader pattern. A bracketed `name-server [ ip ip ip ]`
+		// collapses onto the leaf Keys; reading only Keys[1] dropped every
+		// server but the first (broken DNS resolver drop-in). Both AST
+		// shapes must compile to the same server list.
+		name: "system-name-server-multi",
+		hier: `system {
+    host-name fw;
+    name-server [ 8.8.8.8 9.9.9.9 1.1.1.1 ];
+}`,
+	},
 }
 
 // TestDualASTDifferential is the harness entry point. See the file

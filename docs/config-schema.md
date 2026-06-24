@@ -53,6 +53,73 @@ The live config-mode completers — `pkg/cli` `completeConfigWithDesc` and
 only supplies the config-mode TOP-LEVEL keywords (`set`/`delete`/`commit`/
 `load`/...) plus the retained `set system dataplane` description overlay.
 
+## Multi-value leaves and bracketed lists (the dual-AST contract)
+
+A `multi: true` leaf with `children: nil` (e.g. `from protocol`,
+`from source-address`, `from destination-port`) accepts a Junos bracketed
+list value:
+
+```
+from protocol [ tcp udp icmp ];                     # hierarchical block
+set ... from protocol [ tcp udp icmp ]              # flat-set command
+```
+
+The **lexer strips the brackets** (`lexer.go` `[`/`]` cases just advance and
+recurse), so by the time either parser sees the tokens the list value is
+flat: `protocol tcp udp icmp`. Both AST shapes MUST converge on a single
+leaf whose Keys carry every value:
+
+```
+Keys=[protocol tcp udp icmp]   IsLeaf=true   (no children)
+```
+
+- The **hierarchical** parser already does this — `parseKeys` appends every
+  identifier on the line to one node's Keys.
+- The **flat-set** path (`ParseSetCommand` → `SetPath`) had a dual-AST gap
+  (#2419): the schema-walk consumed only `args` tokens onto the node key
+  (`Keys=[protocol tcp]`) and split the tail into an ORPHAN child leaf
+  (`Keys=[udp icmp]`), so the compiler — reading the node key only — dropped
+  every list member after the first. `SetPath` now, for a
+  `children == nil && multi` leaf, ABSORBS every following non-sibling token
+  onto the node's own Keys (`ast_edit.go`), emitting the same single leaf as
+  the hierarchical parser. The `low to high` range spelling
+  (`destination-port 20000 to 20003`) is absorbed identically (none of
+  `20000`/`to`/`20003` is a sibling keyword), matching the hierarchical
+  `Keys=[destination-port 20000 to 20003]`.
+
+**Compiler contract for multi-value leaves.** Because both shapes now deliver
+the values on `child.Keys[1:]` (with the hierarchical-block-with-children
+shape still possible for nested forms), a compiler reading a multi-value leaf
+MUST read BOTH `child.Keys[1:]` AND `child.Children` and ACCUMULATE — never
+read only `child.Keys[1]`. `firewallMatchValues` (`compiler_firewall.go`) is
+the canonical helper; `parseDNATPortList` (`compiler_nat.go`) and
+`descriptionText` (`compiler_security.go`) parse the unified single-leaf
+shape directly off the node keys. `parseZoneList` (`compiler_nat.go`, the
+static/source/destination-NAT `from`/`to` zone reader) and the WireGuard
+peer `allowed-ips` reader (`parseTunnelWireguardPeer`,
+`compiler_interfaces.go`) also follow the contract — both were silently
+dropping all but the first bracketed value before the #2419 fold (static-NAT
+`from zone [ trust dmz ]` lost the `dmz` rule-set entirely, FAIL-OPEN NAT).
+Reading only `Keys[1]` silently drops all but the first list value — the
+#2419 bug class. The flat-set bracket list is pinned to the hierarchical
+shape by `TestFlatSetBracketListMatchesHierarchical` in
+`pkg/config/parser_bracket_list_2419_test.go`; the static-NAT multi-zone and
+allowed-ips folds are covered by the `security-nat-static-multi-zone` and
+`interfaces-wireguard-allowed-ips-multi` dual-AST fixtures plus
+`TestWireguardAllowedIPsBracketList{FlatSet,Hierarchical}`.
+
+The `system domain-search` and `system name-server` readers
+(`compileSystem`, `compiler_system.go`) are also contract-compliant via
+`firewallMatchValues`. Both are `multi:true`; before the second #2419 fold
+they read only `child.Keys[1]` plus orphan leaf children. That orphan-children
+path worked on flat-set BEFORE #2419 (the bracket split into child leaves), so
+#2419's collapse onto `Keys[1:]` (no children) silently dropped every value but
+the first — a #2419 regression (search domains lost; the DNS resolver drop-in
+written from `name-server` lost every server but the first). Fail-on-revert
+covered by `TestSystemDomainSearchBracketList{FlatSet,Hierarchical}` and
+`TestSystemNameServer{BracketListFlatSet,BlockListHierarchical}` in
+`pkg/config/system_multileaf_test.go`.
+
 ## How to add a config-mode typed leaf
 
 Edit the leaf's `schemaNode` in `setSchema` (in the domain's

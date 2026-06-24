@@ -32,15 +32,18 @@ func compileSystem(node *Node, sys *SystemConfig) error {
 				sys.DomainName = child.Keys[1]
 			}
 		case "domain-search":
-			// Block: domain-search { dom1; dom2; } or leaf: domain-search dom
-			if len(child.Keys) >= 2 {
-				sys.DomainSearch = append(sys.DomainSearch, child.Keys[1])
-			}
-			for _, d := range child.Children {
-				if len(d.Keys) >= 1 {
-					sys.DomainSearch = append(sys.DomainSearch, d.Keys[0])
-				}
-			}
+			// Multi-value leaf (schema_system.go domain-search, multi:true).
+			// Handles every AST shape via the #2545 multi-leaf SSOT helper:
+			//   - bracket list  `domain-search [ a b ]` collapses every value
+			//     onto child.Keys[1:] with no children (#2419);
+			//   - hierarchical block `domain-search { a; b; }` carries one
+			//     leaf child per value;
+			//   - single `domain-search a`.
+			// Reading only child.Keys[1] + children kept the first domain and
+			// silently dropped the rest of a flat-set bracket list once #2419
+			// collapsed it onto Keys (the orphan children this loop relied on
+			// vanished) — a #2419 regression for flat-set domain-search.
+			sys.DomainSearch = append(sys.DomainSearch, firewallMatchValues(child)...)
 		case "time-zone":
 			if len(child.Keys) >= 2 {
 				sys.TimeZone = child.Keys[1]
@@ -48,15 +51,14 @@ func compileSystem(node *Node, sys *SystemConfig) error {
 		case "no-redirects":
 			sys.NoRedirects = true
 		case "name-server":
-			// Block: name-server { IP1; IP2; } or leaf: name-server IP
-			if len(child.Keys) >= 2 {
-				sys.NameServers = append(sys.NameServers, child.Keys[1])
-			}
-			for _, ns := range child.Children {
-				if len(ns.Keys) >= 1 {
-					sys.NameServers = append(sys.NameServers, ns.Keys[0])
-				}
-			}
+			// Multi-value leaf (schema_system.go name-server, multi:true).
+			// Same #2419 collapse as domain-search above: a flat-set bracket
+			// list `name-server [ 8.8.8.8 9.9.9.9 ]` now lands every server on
+			// child.Keys[1:] with no children, so reading only child.Keys[1] +
+			// children dropped every server but the first (broken DNS config).
+			// firewallMatchValues unifies bracket / hierarchical block / single
+			// shapes.
+			sys.NameServers = append(sys.NameServers, firewallMatchValues(child)...)
 		case "ntp":
 			for _, ntpChild := range child.FindChildren("server") {
 				if len(ntpChild.Keys) >= 2 {

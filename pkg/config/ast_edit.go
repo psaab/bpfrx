@@ -235,36 +235,68 @@ func (t *ConfigTree) SetPath(path []string) error {
 		}
 
 		// More tokens follow. If the schema says this is a multi-value leaf
-		// with no children AND the next token is a known sibling keyword,
-		// add it as a leaf and continue at the same level so remaining
-		// tokens become siblings (e.g. "match" children:
-		// destination-address any source-address any application any).
-		// If the next token is NOT a known sibling, the remaining tokens
-		// are trailing values for this leaf (e.g. "destination-port 20000 to 20003").
+		// with no children, the remaining tokens are either sibling
+		// statements at this level or trailing VALUE tokens belonging to
+		// this leaf.
+		//
+		// (a) Next token is a known sibling keyword: emit this leaf and
+		//     continue at the same level so remaining tokens become
+		//     siblings (e.g. "match" children: destination-address any
+		//     source-address any application any).
+		//
+		// (b) Next token is NOT a sibling: it is a trailing value for this
+		//     same leaf. This is the flat-set bracket-list case (#2419):
+		//     `set ... from protocol [ tcp udp icmp ]` arrives bracket-
+		//     stripped as path [..., protocol, tcp, udp, icmp]. The
+		//     hierarchical parser yields a SINGLE leaf
+		//     Keys=[protocol tcp udp icmp]; the flat-set path must match
+		//     that shape. Consume every following non-sibling token onto
+		//     this node's keys and emit one leaf — never split the tail
+		//     into an orphan child Keys=[udp icmp], which dropped all but
+		//     the first list value at the compiler. A mid-key spelling like
+		//     `destination-port 20000 to 20003` is handled the same way:
+		//     none of "20000", "to", "20003" are siblings, so all land on
+		//     the one leaf.
 		if childSchema.children == nil && childSchema.multi && i < len(path) {
 			nextToken := path[i]
 			_, nextIsSibling := schema.children[nextToken]
 			if !nextIsSibling && schema.wildcard != nil {
 				nextIsSibling = true
 			}
-			if nextIsSibling {
-				// Dedup: skip if exact leaf already exists.
-				dup := false
-				for _, n := range *current {
-					if n.IsLeaf && keysEqual(n.Keys, nodeKeys) {
-						dup = true
+			if !nextIsSibling {
+				// Trailing values for this leaf: absorb every following
+				// token that is not a sibling keyword so the flat-set list
+				// collapses onto one node, matching the hierarchical AST.
+				// (case (b) only runs when schema.wildcard == nil — the
+				// wildcard check above forces nextIsSibling=true otherwise.)
+				nodeKeys = append([]string(nil), nodeKeys...)
+				for i < len(path) {
+					if _, sib := schema.children[path[i]]; sib {
 						break
 					}
+					nodeKeys = append(nodeKeys, path[i])
+					i++
 				}
-				if !dup {
-					*current = append(*current, &Node{
-						Keys:   append([]string(nil), nodeKeys...),
-						IsLeaf: true,
-					})
-				}
-				// Don't descend — continue at same level for next sibling.
-				continue
 			}
+			// Dedup: skip if exact leaf already exists.
+			dup := false
+			for _, n := range *current {
+				if n.IsLeaf && keysEqual(n.Keys, nodeKeys) {
+					dup = true
+					break
+				}
+			}
+			if !dup {
+				*current = append(*current, &Node{
+					Keys:   append([]string(nil), nodeKeys...),
+					IsLeaf: true,
+				})
+			}
+			if i >= len(path) {
+				return nil
+			}
+			// Don't descend — continue at same level for next sibling.
+			continue
 		}
 
 		// This is a container (or a leaf with trailing value tokens).
