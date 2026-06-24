@@ -16,9 +16,11 @@
 package flowexport
 
 import (
+	"log/slog"
 	"net"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -515,7 +517,16 @@ func BuildSamplingZones(cfg *config.Config, zoneIDs map[string]uint16) map[uint1
 		}
 		var dir SamplingDir
 		for _, ifaceRef := range zone.Interfaces {
-			physName, unitNum := parseIfaceRef(ifaceRef)
+			physName, unitNum, ok := parseIfaceRef(ifaceRef)
+			if !ok {
+				// A malformed unit suffix (non-numeric, signed, empty, or
+				// trailing junk) used to be silently coerced to the wrong
+				// unit (or unit 0). Warn once and skip rather than enable
+				// sampling on a bogus unit (#2463).
+				slog.Warn("flowexport: skipping malformed sampling-interface reference",
+					"zone", zoneName, "interface", ifaceRef)
+				continue
+			}
 			ifCfg, ok := cfg.Interfaces.Interfaces[physName]
 			if !ok {
 				continue
@@ -591,20 +602,40 @@ func (ec *ExportConfig) counter() *atomic.Uint64 {
 	return ec.sampleCounter
 }
 
-// parseIfaceRef splits "eth0.0" into ("eth0", 0).
-func parseIfaceRef(ref string) (string, int) {
-	for i := len(ref) - 1; i >= 0; i-- {
-		if ref[i] == '.' {
-			unitNum := 0
-			for _, c := range ref[i+1:] {
-				if c >= '0' && c <= '9' {
-					unitNum = unitNum*10 + int(c-'0')
-				}
-			}
-			return ref[:i], unitNum
-		}
+// parseIfaceRef splits an interface reference into its physical name and
+// logical unit, returning ok=false for a malformed unit suffix.
+//
+// A bare reference with no dot (e.g. "ge-0/0/0", "enp6s0") is a legitimate
+// config form and maps to the implicit unit 0 — the parser stores zone
+// interface tokens verbatim and a unit-less reference is valid Junos
+// grammar, so it returns (ref, 0, true).
+//
+// A reference WITH a dot splits on the FINAL dot and the suffix after it
+// must be a clean decimal unit number parsed by strconv.Atoi. Anything
+// strconv.Atoi rejects — a non-numeric suffix ("foo"), trailing junk
+// ("1abc2"), an empty suffix ("ge-0/0/0."), a sign or leading/trailing
+// space ("-1", " 1") — returns ok=false so the caller can warn and skip
+// rather than silently sample the wrong unit. The previous
+// digit-accumulation scan accepted all of these: "1abc2" became unit 12,
+// "foo" became unit 0, "-1" became unit 1.
+func parseIfaceRef(ref string) (name string, unit int, ok bool) {
+	dot := strings.LastIndexByte(ref, '.')
+	if dot < 0 {
+		// No unit suffix — implicit unit 0 (valid bare-name form).
+		return ref, 0, true
 	}
-	return ref, 0
+	suffix := ref[dot+1:]
+	// Reject an empty suffix and any leading sign or space up front:
+	// strconv.Atoi would accept "+1"/"-1" and return a signed value, but a
+	// Junos unit number is an unsigned decimal with no sign or whitespace.
+	if suffix == "" || suffix[0] < '0' || suffix[0] > '9' {
+		return ref[:dot], 0, false
+	}
+	u, err := strconv.Atoi(suffix)
+	if err != nil || u < 0 {
+		return ref[:dot], 0, false
+	}
+	return ref[:dot], u, true
 }
 
 // FlowRecord holds the data for a single flow, shared by the NetFlow v9

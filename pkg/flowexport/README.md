@@ -289,6 +289,19 @@ moment any caller sampled off the copy (#2224).
 - Two batches are maintained inside `flowBatch` (`v4` and `v6`, split
   by family, not by zone — `transport.go`). Both flush on a 100 ms
   ticker or on shutdown.
+- `BuildSamplingZones` resolves a zone's interface references
+  (`parseIfaceRef`, `manager.go`) into (physical-name, unit) pairs to
+  decide which zones have sampling enabled. The unit suffix is parsed
+  strictly (#2463): a bare reference with no dot is the implicit unit 0
+  (a legitimate config form), but a reference WITH a dot must carry a
+  clean unsigned decimal unit after the FINAL dot — `strconv.Atoi`, no
+  sign, space, empty suffix, or trailing junk. A malformed reference
+  (`ge-0/0/0.1abc2`, `ge-0/0/0.foo`, `ge-0/0/0.-1`, `ge-0/0/0.`) is
+  WARNED once and SKIPPED, not silently coerced. The previous
+  digit-accumulation scan accepted them all — `1abc2` became unit 12,
+  `foo` and an empty suffix became unit 0, `-1` became unit 1 — so
+  sampling could be enabled on the wrong unit or silently on unit 0,
+  diverging from the operator's interface list.
 - `ExportSessionClose` builds the flow record synchronously from the
   event-reader callback. The export goroutine (started in `Run(ctx)`)
   is what actually transmits and refreshes templates; record assembly
