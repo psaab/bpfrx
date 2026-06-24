@@ -71,6 +71,32 @@ the RFC 3414 §3.2 timeliness window as the authoritative engine:
   still learns our engineID and current boots/time before its first
   authenticated request, so a freshly-discovered, timely request is accepted.
 
+### Privacy (encryption) IV: RFC 3826 §3.1.2.1
+
+For an `authPriv` request the scopedPDU is encrypted; the agent must rebuild the
+exact IV the manager used. Per RFC 3826 §3.1.2.1 the AES-128-CFB IV is
+`authoritativeEngineBoots(4) || authoritativeEngineTime(4) || privParams(8)`,
+where boots/time are the values **carried in the message** — the boots/time the
+sender learned about us via discovery, not our local clock at receive time.
+
+- **Request decrypt** uses the RECEIVED `reqBoots`/`reqTime`
+  (`msgAuthoritativeEngineBoots`/`...Time` from the request USM parameters),
+  threaded `handleV3Packet → decryptPDU → decryptAES128`. `checkTimeliness`
+  runs first and (for an authenticated request) bounds `reqBoots == engineBoots`
+  and `reqTime` within ±150 s, but `reqTime` can still differ from the agent's
+  *current* `engineTime()` by up to the window. Building the IV from the local
+  clock instead (the #2640 bug) corrupted the CFB keystream and silently dropped
+  every encrypted query made while the manager's cached time drifted from ours —
+  the normal steady state under clock advance.
+- **Response encrypt** uses the agent's *current* `engineBoots`/`engineTime()`
+  (`encryptPDU → encryptAES128`), and the same values are written into the
+  response's `msgAuthoritativeEngineBoots`/`...Time`. We are the authoritative
+  engine for our own reply, so the IV and the header boots/time agree by
+  construction and a manager decrypts the response using the boots/time it reads
+  from our header. This path is unchanged by the #2640 fix.
+- DES (`decryptDES`/`encryptDES`, RFC 3414 §8) derives its IV from `privParams`
+  XOR the pre-IV salt alone, so boots/time do not enter the DES IV.
+
 ### engineBoots persistence
 
 `engineBoots` is loaded, incremented, and persisted once at agent construction

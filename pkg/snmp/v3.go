@@ -271,7 +271,7 @@ func (a *Agent) handleV3Packet(msgBody []byte) []byte {
 			slog.Debug("SNMPv3: failed to decode encrypted PDU")
 			return nil
 		}
-		decrypted := a.decryptPDU(user, privParams, encData)
+		decrypted := a.decryptPDU(user, privParams, encData, reqBoots, reqTime)
 		if decrypted == nil {
 			slog.Debug("SNMPv3: decryption failed", "user", userName)
 			return nil
@@ -667,7 +667,19 @@ func advancePastTLV(data []byte, expectTag byte) (consumed int, ok bool) {
 }
 
 // decryptPDU decrypts an encrypted scopedPDU using the user's privacy key.
-func (a *Agent) decryptPDU(user *usmUser, privParams, encData []byte) []byte {
+//
+// boots/time are the msgAuthoritativeEngineBoots/Time carried in the request's
+// USM parameters (reqBoots/reqTime) — NOT our local clock. RFC 3826 §3.1.2.1
+// requires the AES-128-CFB IV to be built from the authoritative engine
+// boots/time AS CARRIED IN THE MESSAGE: that is the value the sender used to
+// derive the IV when it encrypted, having learned our boots/time via discovery.
+// checkTimeliness has already run and (for an authenticated request) bounded
+// reqBoots == a.engineBoots and reqTime within ±150s of a.engineTime(), but
+// reqTime can still differ from our CURRENT engineTime() by up to the window —
+// so using the local clock here would build the wrong IV and silently corrupt
+// the plaintext. DES derives its IV from privParams alone, so boots/time are
+// unused for DES.
+func (a *Agent) decryptPDU(user *usmUser, privParams, encData []byte, boots, time int) []byte {
 	if user.privKey == nil {
 		return nil
 	}
@@ -675,7 +687,7 @@ func (a *Agent) decryptPDU(user *usmUser, privParams, encData []byte) []byte {
 	case "des":
 		return decryptDES(user.privKey, privParams, encData)
 	case "aes128":
-		return decryptAES128(user.privKey, privParams, encData, a.engineBoots, a.engineTime())
+		return decryptAES128(user.privKey, privParams, encData, boots, time)
 	default:
 		return nil
 	}
