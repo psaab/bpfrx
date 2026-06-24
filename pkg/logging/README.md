@@ -132,6 +132,20 @@ if `Handle` runs the re-entrancy guard before the client check.
   syslog delivery as the legacy eBPF ring-buffer events do.
   `DecodeRawEventRecord` is decode-only and must not be used as a
   replacement for the full reader path when audit delivery matters.
+- **Event time is DECISION time, not receive time (#2465/#2470/#2511).**
+  The on-wire RT_FLOW frame carries an absolute Unix-nanosecond timestamp
+  in its first 8 bytes (LE u64), stamped by the userspace-dp producer at
+  the instant the forwarding decision was made. Both the live reader path
+  (`ProcessRawEvent` → `logEvent`) and the decode-only
+  `DecodeRawEventRecord` set `EventRecord.Time` from that wire value via
+  the shared `eventTimeFromWire` guard: a nonzero timestamp that fits an
+  `int64` wins; a zero/absent stamp (old-format frame or synthesized
+  event) or one that would overflow `int64` falls back to `time.Now()`
+  (daemon receive time). Before #2511 `logEvent` always used `time.Now()`,
+  so the production logging path recorded receive time even though
+  `DecodeRawEventRecord` already honored the wire stamp — under helper
+  backlog or reconnect that drifted from the decision instant. Keep the two
+  paths on the single `eventTimeFromWire` SSOT.
 - `pkg/dataplane/userspace/eventstream_test.go` owns the deterministic
   local syslog harness for userspace RT_FLOW policy-deny, screen-drop, and
   filter-log frames. It sends raw event-stream frames through
