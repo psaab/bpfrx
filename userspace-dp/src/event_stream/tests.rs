@@ -254,6 +254,109 @@ fn test_emit_session_close_rt_flow_ignores_open_delta() {
 }
 
 #[test]
+fn test_emit_session_close_rt_flow_accounts_under_session_close_kind() {
+    // #2512 fail-on-revert: a SESSION_CLOSE RT_FLOW frame must travel the same
+    // per-kind budget path as deny/screen/filter — NOT a bare unaccounted
+    // `try_send`. With an UNLIMITED limiter but a tiny queue capacity, a
+    // close burst beyond the per-kind queue budget must increment the
+    // SessionClose `dropped`/`queue_full` counters (and the generic
+    // frames_dropped), and the accepted prefix must be counted under
+    // SessionClose `sent`. If a reviewer reverts the emit path back to
+    // `self.try_send(frame)`, no SessionClose counter ever moves and the
+    // dropped close is silent — this test fails.
+    //
+    // capacity 4 → max_total_queued = 4/2 = 2; per-kind budget = ceil(2/5) = 1.
+    let (handle, _rx) = test_worker_handle(
+        4,
+        DataplaneEventRateLimitConfig {
+            events_per_second: 0, // unlimited: isolate the queue-budget gate
+            burst: 0,
+        },
+    );
+    let delta = test_close_delta(crate::session::SessionDeltaKind::Close);
+
+    // Emit 4 closes; the per-kind budget admits 1, the rest are queue-full.
+    // (`_rx` is never drained, so the budget is never released.)
+    for _ in 0..4 {
+        handle.emit_session_close_rt_flow(&delta);
+    }
+
+    let stats = handle.dataplane_event_stats();
+    assert_eq!(stats.session_close.sent, 1, "one close fits the per-kind budget");
+    assert_eq!(
+        stats.session_close.queue_full, 3,
+        "three closes shed by the per-kind queue budget"
+    );
+    assert_eq!(
+        stats.session_close.dropped, 3,
+        "queue-full drops roll into the SessionClose dropped total"
+    );
+    // The bare-try_send revert leaves every other kind at zero AND moves no
+    // SessionClose counter; assert the close kind owns the accounting.
+    assert_eq!(stats.policy_deny.sent, 0);
+    assert_eq!(stats.policy_deny.dropped, 0);
+}
+
+#[test]
+fn test_emit_session_close_rt_flow_rate_limited_is_counted() {
+    // #2512 fail-on-revert: a SESSION_CLOSE burst beyond the per-(kind,zone)
+    // rate-limiter token budget must be counted as a SessionClose
+    // `rate_limited` drop. Session-table closes can be bursty at GC time;
+    // this proves the limiter is actually applied to type-14 (a bare
+    // try_send would never rate-limit and this counter would stay 0).
+    let (handle, rx) = test_worker_handle(
+        64, // large channel/budget so the limiter, not the queue, is the gate
+        DataplaneEventRateLimitConfig {
+            events_per_second: 1_000,
+            burst: 2, // only 2 closes allowed in the instantaneous burst
+        },
+    );
+    let delta = test_close_delta(crate::session::SessionDeltaKind::Close);
+
+    for _ in 0..5 {
+        handle.emit_session_close_rt_flow(&delta);
+    }
+
+    let stats = handle.dataplane_event_stats();
+    assert_eq!(stats.session_close.sent, 2, "burst of 2 closes admitted");
+    assert_eq!(
+        stats.session_close.rate_limited, 3,
+        "the 3 closes past the burst are rate-limited, not silently sent"
+    );
+    assert_eq!(stats.session_close.dropped, 3);
+    // Exactly the admitted prefix reached the channel.
+    let frames: Vec<EventFrame> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+    assert_eq!(frames.len(), 2);
+}
+
+#[test]
+fn test_emit_session_create_rt_flow_accounts_under_session_create_kind() {
+    // #2512: the SESSION_CREATE (type 15) sibling of the close path also
+    // rides the per-kind budget under DataplaneEventKind::SessionCreate.
+    let (handle, _rx) = test_worker_handle(
+        4, // per-kind budget = 1
+        DataplaneEventRateLimitConfig {
+            events_per_second: 0,
+            burst: 0,
+        },
+    );
+    let mut delta = test_close_delta(crate::session::SessionDeltaKind::Open);
+    delta.metadata.log_session_init = true;
+
+    for _ in 0..3 {
+        handle.emit_session_create_rt_flow(&delta);
+    }
+
+    let stats = handle.dataplane_event_stats();
+    assert_eq!(stats.session_create.sent, 1);
+    assert_eq!(stats.session_create.queue_full, 2);
+    assert_eq!(stats.session_create.dropped, 2);
+    // Must not steal the close kind's budget/counters.
+    assert_eq!(stats.session_close.sent, 0);
+    assert_eq!(stats.session_close.dropped, 0);
+}
+
+#[test]
 fn test_sequence_monotonicity() {
     let shared = Arc::new(EventStreamShared::new());
     let handles: Vec<_> = (0..4)

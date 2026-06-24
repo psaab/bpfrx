@@ -117,6 +117,16 @@ pub(crate) enum DataplaneEventKind {
     PolicyDeny,
     ScreenDrop,
     FilterLog,
+    // #2512: RT_FLOW SESSION_CLOSE (type 14) and SESSION_CREATE (type 15)
+    // are now first-class dataplane-event kinds so they ride the SAME
+    // per-kind rate limiter, queue budget, and sent/dropped counters as
+    // deny/screen/filter. Before #2512 they used a bare `try_send` side
+    // channel around the producer's backpressure model. The queue-budget
+    // release path on the I/O thread keys frames by their msg_type byte, so
+    // both kinds MUST round-trip through `from_msg_type` to balance the
+    // per-kind budget acquired at emit time.
+    SessionClose,
+    SessionCreate,
 }
 
 impl DataplaneEventKind {
@@ -125,6 +135,8 @@ impl DataplaneEventKind {
             Self::PolicyDeny => MSG_POLICY_DENY,
             Self::ScreenDrop => MSG_SCREEN_DROP,
             Self::FilterLog => MSG_FILTER_LOG,
+            Self::SessionClose => MSG_SESSION_CLOSE_RT_FLOW,
+            Self::SessionCreate => MSG_SESSION_CREATE_RT_FLOW,
         }
     }
 
@@ -133,6 +145,8 @@ impl DataplaneEventKind {
             MSG_POLICY_DENY => Some(Self::PolicyDeny),
             MSG_SCREEN_DROP => Some(Self::ScreenDrop),
             MSG_FILTER_LOG => Some(Self::FilterLog),
+            MSG_SESSION_CLOSE_RT_FLOW => Some(Self::SessionClose),
+            MSG_SESSION_CREATE_RT_FLOW => Some(Self::SessionCreate),
             _ => None,
         }
     }
@@ -142,9 +156,19 @@ impl DataplaneEventKind {
             Self::PolicyDeny => RT_FLOW_EVENT_POLICY_DENY,
             Self::ScreenDrop => RT_FLOW_EVENT_SCREEN_DROP,
             Self::FilterLog => RT_FLOW_EVENT_FILTER_LOG,
+            Self::SessionClose => RT_FLOW_EVENT_SESSION_CLOSE,
+            Self::SessionCreate => RT_FLOW_EVENT_SESSION_OPEN,
         }
     }
 
+    // NOTE: from_rt_flow_event_type deliberately does NOT map the
+    // SessionClose/SessionCreate event-type bytes. It backs
+    // `decode_dataplane_event`, the deny/screen/filter payload decoder used
+    // by the Go-parity tests; session-close/create frames have a different
+    // 136-byte payload layout (their own encoders) and are never fed to that
+    // decoder. The budget RELEASE path on the I/O thread keys frames by their
+    // msg_type byte via `from_msg_type` above, so SessionClose/SessionCreate
+    // round-trip the per-kind queue budget correctly without this mapping.
     fn from_rt_flow_event_type(event_type: u8) -> Option<Self> {
         match event_type {
             RT_FLOW_EVENT_POLICY_DENY => Some(Self::PolicyDeny),
@@ -634,6 +658,19 @@ impl EventFrame {
             DataplaneEventKind::PolicyDeny => event.policy_id,
             DataplaneEventKind::ScreenDrop => event.screen_id,
             DataplaneEventKind::FilterLog => event.filter_id,
+            // #2512: SESSION_CLOSE / SESSION_CREATE share the per-kind budget
+            // accounting but NOT this generic deny/screen/filter payload
+            // encoder — they have their own `encode_session_close_rt_flow` /
+            // `encode_session_create_rt_flow` builders with a distinct 136-byte
+            // layout (no DataplaneEventPayload is ever constructed for them).
+            DataplaneEventKind::SessionClose | DataplaneEventKind::SessionCreate => {
+                debug_assert!(
+                    false,
+                    "encode_dataplane_event called with a session-close/create kind; \
+                     use the dedicated RT_FLOW encoders"
+                );
+                0
+            }
         };
 
         buf[base..base + 8].copy_from_slice(&event.timestamp_ns.to_le_bytes());

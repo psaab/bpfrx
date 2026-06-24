@@ -13,6 +13,7 @@ pub(crate) mod codec;
 mod producer;
 
 pub(crate) use codec::{EventFrame, close_flags};
+use codec::DataplaneEventKind;
 #[allow(unused_imports)] // public API for later policy/screen/filter producer wiring
 pub(crate) use producer::{
     DataplaneEventDropReason, DataplaneEventEmitOutcome, DataplaneEventRateLimitConfig,
@@ -475,7 +476,6 @@ impl EventStreamWorkerHandle {
             return;
         }
         let nat = &delta.decision.nat;
-        let seq = self.next_seq();
         // #2465: convert the monotonic creation / last-seen instants on the
         // close delta to absolute wall-clock values for the wire. The session
         // table uses CLOCK_MONOTONIC, but the flow record needs an absolute
@@ -488,30 +488,45 @@ impl EventStreamWorkerHandle {
             monotonic_ns_to_unix_secs(delta.created_ns, now_mono_ns, now_unix_ns);
         let close_unix_ns =
             monotonic_ns_to_unix_ns(delta.last_seen_ns, now_mono_ns, now_unix_ns);
-        let frame = EventFrame::encode_session_close_rt_flow(
-            seq,
-            delta.key.addr_family,
-            delta.key.protocol,
-            delta.key.src_ip,
-            delta.key.dst_ip,
-            delta.key.src_port,
-            delta.key.dst_port,
-            nat.rewrite_src,
-            nat.rewrite_dst,
-            nat.rewrite_src_port.unwrap_or(0),
-            nat.rewrite_dst_port.unwrap_or(0),
+        // #2512: route through the per-kind rate limiter + queue budget +
+        // sent/dropped counters instead of a bare `try_send`. The same mono
+        // clock reading anchors the limiter so a dropped close is counted
+        // under DataplaneEventKind::SessionClose. The frame is encoded only
+        // after the budget passes (seq supplied by the budget path), so a
+        // rate-limited / budget-exhausted close never burns a sequence
+        // number. A dropped close loses only one flow-export record — the
+        // separate type-2 HA close delta (`push_delta`) is untouched.
+        self.try_emit_dataplane_frame(
+            DataplaneEventKind::SessionClose,
             delta.metadata.ingress_zone,
-            delta.metadata.egress_zone,
-            delta.metadata.owner_rg_id as i16,
-            // #2508: per-policy RT_FLOW SYSLOG gate byte. The frame is sent
-            // unconditionally (the Go NetFlow/IPFIX exporter accounts every
-            // close), but this bit tells the Go logEvent path whether to ALSO
-            // emit the per-policy RT_FLOW_SESSION_CLOSE syslog record.
-            delta.metadata.log_session_close,
-            created_unix_secs,
-            close_unix_ns,
+            now_mono_ns,
+            |seq| {
+                EventFrame::encode_session_close_rt_flow(
+                    seq,
+                    delta.key.addr_family,
+                    delta.key.protocol,
+                    delta.key.src_ip,
+                    delta.key.dst_ip,
+                    delta.key.src_port,
+                    delta.key.dst_port,
+                    nat.rewrite_src,
+                    nat.rewrite_dst,
+                    nat.rewrite_src_port.unwrap_or(0),
+                    nat.rewrite_dst_port.unwrap_or(0),
+                    delta.metadata.ingress_zone,
+                    delta.metadata.egress_zone,
+                    delta.metadata.owner_rg_id as i16,
+                    // #2508: per-policy RT_FLOW SYSLOG gate byte. The frame is
+                    // sent unconditionally (the Go NetFlow/IPFIX exporter
+                    // accounts every close), but this bit tells the Go
+                    // logEvent path whether to ALSO emit the per-policy
+                    // RT_FLOW_SESSION_CLOSE syslog record.
+                    delta.metadata.log_session_close,
+                    created_unix_secs,
+                    close_unix_ns,
+                )
+            },
         );
-        self.try_send(frame);
     }
 
     /// #2508: emit an RT_FLOW SESSION_CREATE frame (type 15) for a session
@@ -526,23 +541,35 @@ impl EventStreamWorkerHandle {
             return;
         }
         let nat = &delta.decision.nat;
-        let seq = self.next_seq();
-        let frame = EventFrame::encode_session_create_rt_flow(
-            seq,
-            delta.key.addr_family,
-            delta.key.protocol,
-            delta.key.src_ip,
-            delta.key.dst_ip,
-            delta.key.src_port,
-            delta.key.dst_port,
-            nat.rewrite_src,
-            nat.rewrite_dst,
-            nat.rewrite_src_port.unwrap_or(0),
-            nat.rewrite_dst_port.unwrap_or(0),
+        // #2512: same per-kind budget path as the close frame (see
+        // emit_session_close_rt_flow). SESSION_CREATE is producer-gated by
+        // the caller (only emitted for `log session-init` policies), but it
+        // still rides the shared dataplane-event channel so it MUST honor the
+        // same limiter / budget / counters under
+        // DataplaneEventKind::SessionCreate rather than a bare `try_send`.
+        let (now_mono_ns, _) = read_mono_and_wall_clocks();
+        self.try_emit_dataplane_frame(
+            DataplaneEventKind::SessionCreate,
             delta.metadata.ingress_zone,
-            delta.metadata.egress_zone,
+            now_mono_ns,
+            |seq| {
+                EventFrame::encode_session_create_rt_flow(
+                    seq,
+                    delta.key.addr_family,
+                    delta.key.protocol,
+                    delta.key.src_ip,
+                    delta.key.dst_ip,
+                    delta.key.src_port,
+                    delta.key.dst_port,
+                    nat.rewrite_src,
+                    nat.rewrite_dst,
+                    nat.rewrite_src_port.unwrap_or(0),
+                    nat.rewrite_dst_port.unwrap_or(0),
+                    delta.metadata.ingress_zone,
+                    delta.metadata.egress_zone,
+                )
+            },
         );
-        self.try_send(frame);
     }
 }
 

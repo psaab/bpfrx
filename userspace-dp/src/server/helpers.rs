@@ -294,6 +294,16 @@ pub(crate) fn refresh_status(state: &mut ServerState) {
         state.status.event_stream_dropped = es_stats.dropped;
         state.status.event_stream_write_stalls = es_stats.write_stalls;
         state.status.event_stream_replay_evictions = es_stats.replay_evictions;
+        // #2512: surface the per-kind SESSION_CLOSE / SESSION_CREATE
+        // producer-side sent/dropped counters so a rate-limited or
+        // budget-shed close/create is observable in `show` / Prometheus.
+        state.status.event_stream_session_close_sent = es_stats.dataplane_events.session_close.sent;
+        state.status.event_stream_session_close_dropped =
+            es_stats.dataplane_events.session_close.dropped;
+        state.status.event_stream_session_create_sent =
+            es_stats.dataplane_events.session_create.sent;
+        state.status.event_stream_session_create_dropped =
+            es_stats.dataplane_events.session_create.dropped;
     }
     state.status.last_cache_flush_at = state.afxdp.last_cache_flush_at();
 }

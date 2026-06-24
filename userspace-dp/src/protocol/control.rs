@@ -484,6 +484,24 @@ pub(crate) struct ProcessStatus {
     /// is normal acknowledged-frame removal and is NOT counted here.
     #[serde(rename = "event_stream_replay_evictions", default)]
     pub event_stream_replay_evictions: u64,
+    /// #2512: per-kind producer-side accounting for the RT_FLOW SESSION_CLOSE
+    /// (type 14) and SESSION_CREATE (type 15) frames. Before #2512 these used
+    /// a bare `try_send` that did not pass through the per-kind rate limiter,
+    /// queue budget, or sent/dropped counters, so a dropped close/create was
+    /// invisible. `_sent` is frames accepted onto the event channel; `_dropped`
+    /// sums rate-limited + queue-full + disconnected drops for that kind. A
+    /// dropped SESSION_CLOSE loses only one flow-export/syslog record — the
+    /// type-2 HA session-sync close delta rides a separate frame and is never
+    /// rate-limited (`push_delta`), so the consumer session state self-heals
+    /// via the 1s session sweep.
+    #[serde(rename = "event_stream_session_close_sent", default)]
+    pub event_stream_session_close_sent: u64,
+    #[serde(rename = "event_stream_session_close_dropped", default)]
+    pub event_stream_session_close_dropped: u64,
+    #[serde(rename = "event_stream_session_create_sent", default)]
+    pub event_stream_session_create_sent: u64,
+    #[serde(rename = "event_stream_session_create_dropped", default)]
+    pub event_stream_session_create_dropped: u64,
     /// Monotonic timestamp (secs) of the last HA flow cache flush (#312).
     #[serde(rename = "last_cache_flush_at", default)]
     pub last_cache_flush_at: u64,

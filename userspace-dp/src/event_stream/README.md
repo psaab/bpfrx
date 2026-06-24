@@ -60,11 +60,22 @@ periodic ACK from the daemon.
   `estimateSessionDuration(SessionPkts)` heuristic only when it is 0 (an
   explicit-delete / HA-purge close that carried no creation instant). The
   byte/packet **volume** counters remain 0 pending the per-session
-  accounting follow-up #2501 — only the timing is real. Unlike the deny/
-  screen/filter frames, the close frame is NOT rate-limited (a dropped
-  close loses one flow-export record; it is bounded by session churn, not
-  attacker-controlled), so it is sent with the lossy `try_send` path
-  directly rather than through the `producer.rs` rate limiter.
+  accounting follow-up #2501 — only the timing is real. (#2512) the close
+  frame now rides the SAME per-kind rate limiter + queue budget +
+  sent/dropped counters as the deny/screen/filter frames, under
+  `DataplaneEventKind::SessionClose`, via
+  `EventStreamWorkerHandle::try_emit_dataplane_frame` — NOT a bare
+  unaccounted `try_send`. It stays telemetry-lossy by design: a dropped
+  close loses exactly one flow-export/syslog record. That is safe because
+  the type-2 `MSG_SESSION_CLOSE` HA session-sync delta is a SEPARATE frame
+  (`push_delta`) that is never rate-limited, so consumer session state
+  self-heals through the daemon's 1s session sweep; the lossy budget bounds
+  a GC-time close storm instead of letting it consume channel / replay
+  capacity outside the producer's backpressure model. A shed close is
+  counted under the SessionClose `sent`/`dropped` counters surfaced in
+  `ProcessStatus.event_stream_session_close_{sent,dropped}` (and the
+  `xpf_userspace_event_stream_producer_frames_total{outcome="session_close_*"}`
+  Prometheus series).
   (#2508) per-policy RT_FLOW SYSLOG logging: the admitting policy's
   `then log session-init` / `session-close` selection is stamped onto the
   session metadata at install. A close ALWAYS emits the type-14 frame
@@ -77,7 +88,9 @@ periodic ACK from the daemon.
   ONLY when the admitting policy requested `then log session-init`, carries
   the same 136-byte payload with the event-type byte set to SESSION_OPEN
   (1, rendered as RT_FLOW_SESSION_CREATE on the Go side), and always sets
-  the gate byte. Both frames ride the lossy `try_send` path.
+  the gate byte. (#2512) like the close frame, the create frame rides the
+  per-kind budget path under `DataplaneEventKind::SessionCreate` (counters
+  `event_stream_session_create_{sent,dropped}`), not a bare `try_send`.
   `MSG_FILTER_LOG` intentionally reuses the RT_FLOW `reason` byte as
   a filter-log source discriminator (`pbr`, `input`, `output`,
   `cached-output`, or `lo0`). Close events still interpret that byte as
@@ -91,7 +104,14 @@ periodic ACK from the daemon.
   disconnected outcomes per event type. Dataplane telemetry can occupy
   only a bounded share of the shared event-stream channel, and each
   event type has its own in-flight cap so one deny/drop/log storm cannot
-  monopolize queue capacity.
+  monopolize queue capacity. (#2512) the kind set is `PolicyDeny`,
+  `ScreenDrop`, `FilterLog`, `SessionClose`, `SessionCreate` (5). The two
+  RT_FLOW session frames (types 14/15) carry their own payload layout, so
+  they enter the budget via `try_emit_dataplane_frame(kind, zone, now,
+  encode)` (a generalization of `try_emit_dataplane_event_at` that accepts
+  a caller-supplied frame encoder); the I/O-thread budget release keys each
+  frame by its `msg_type` byte through `DataplaneEventKind::from_msg_type`,
+  so all five kinds balance their per-kind reservation.
 - `codec_tests.rs`, `producer_tests.rs`, `tests.rs` — co-located.
 
 ## Why push
@@ -142,8 +162,11 @@ cluster-scoped.
   data plane never stalls because a telemetry consumer is slow; a stuck
   consumer degrades telemetry (counted drops), nothing else.**
 - RT_FLOW dataplane telemetry producers must use
-  `try_emit_dataplane_event_at()`, not hand-rolled `try_send()`
-  wrappers. The API applies the per-kind/per-ingress-zone limiter
+  `try_emit_dataplane_event_at()` (or, for a producer that builds its own
+  frame layout such as the session-close/create frames,
+  `try_emit_dataplane_frame()`), not hand-rolled `try_send()`
+  wrappers (#2512 removed the last two bare-`try_send` producers). The API
+  applies the per-kind/per-ingress-zone limiter
   before sequence allocation, increments the generic producer drop
   counter for rate-limited events, and records per-event loss reason
   counters for later status surfacing. It also enforces the telemetry
