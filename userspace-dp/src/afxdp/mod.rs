@@ -99,6 +99,12 @@ mod sharded_neighbor;
 #[path = "cos/mod.rs"]
 mod cos;
 mod session_glue;
+// #2442: re-export the owner-RG export walk + its chunkable candidate collector
+// so the worker loop's loss-of-sync resync path and the session-module resync
+// test can reach them without naming the private `session_glue` module.
+pub(crate) use session_glue::{
+    export_forward_sessions_for_owner_rgs, forward_export_candidates_for_owner_rgs,
+};
 #[path = "shared_ops.rs"]
 mod shared_ops;
 #[path = "shared_umem.rs"]

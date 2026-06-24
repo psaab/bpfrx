@@ -313,6 +313,59 @@ all userspace sessions owned by the demoting RGs. This is not the same thing as
 the steady-state delta drain. It is an explicit republish step used to reduce
 handoff loss.
 
+### Delta-ring overflow → loss-of-sync resync (#2442)
+
+Each worker buffers session open/close deltas in an in-worker ring
+(`SessionTable.deltas`, capped at `MAX_SESSION_DELTAS = 4096`). The worker loop
+drains it 256 at a time. Under a churn burst (failover storm, SYN-cookie
+admission flood) the ring can fill faster than the drain catches up, and
+`push_delta` drops the overflowing delta — an HA-relevant open/close event the
+downstream session-sync consumer will never see.
+
+Pre-#2442 this only bumped a `delta_drops` counter, so the peer/session view
+silently diverged from the table truth with no consumer-visible "rescan"
+contract. The fix turns a drop into an explicit **loss-of-sync** signal:
+
+- `push_delta` latches `delta_loss_pending` the moment it drops (alongside the
+  existing `delta_drops` count). It is a single bool, not a count.
+- The worker loop reads-and-clears it once per drain cycle via
+  `take_delta_loss()`. A `true` result means the incremental stream went lossy.
+- On loss the worker re-emits an Open delta for **every owned forward session**
+  (the same table-truth set the `ExportOwnerRGSessions` command walks) so the
+  consumer re-derives a complete snapshot instead of diverging.
+
+**Drain-as-you-export (bounded against the ring).** A worker can own up to
+`DEFAULT_MAX_SESSIONS = 131072` forward sessions — 32× the 4096-slot delta
+ring. A naive "drain the backlog, then push all N" would overflow the ring at
+delta 4097, drop sessions 4097..N, re-latch the loss, and storm a fresh resync
+every cycle (the peer would never receive a complete snapshot, and `delta_drops`
+would climb without bound). The resync therefore **interleaves the drain**:
+
+1. drain+flush the existing backlog so the ring starts empty;
+2. collect the export candidates once
+   (`forward_export_candidates_for_owner_rgs`, the filter half of the export
+   walk — it pushes nothing);
+3. emit them in chunks of `RESYNC_EXPORT_CHUNK = 2048` (comfortably under the
+   4096 cap), and drain+flush each chunk to the peer **before** emitting the
+   next.
+
+Because the ring is empty before every chunk and a chunk is smaller than the
+cap, `push_delta` never overflows during a resync. The complete snapshot ships
+in chunks regardless of session count, and the loss latch is not spuriously
+re-armed by the export itself. (The single-shot `ExportOwnerRGSessions` command
+path keeps pushing the whole candidate set at once — its caller drains against a
+15 s export-ack budget — so only the worker-loop resync needs the chunked path.)
+
+**Debounce / composition with the sync state machine.** The signal is a single
+bool cleared on read, so a burst that drops N deltas before the worker reads it
+raises **exactly one** resync (one episode → one trigger); a *genuinely new*
+drop after the resync completes re-arms a new episode on a later cycle. The
+resync is entirely worker-local — it re-uses the same per-worker delta ring and
+`flush_session_deltas` plumbing the steady-state drain already uses, so it needs
+**no control-socket round-trip** and cannot deadlock or starve normal
+incremental sync (the control-socket contention rules in CLAUDE.md). It runs at
+most once per worker poll tick and only when an overflow actually occurred.
+
 ## Clock Synchronization
 
 At connection setup, both sides exchange monotonic timestamps with `ClockSync`.

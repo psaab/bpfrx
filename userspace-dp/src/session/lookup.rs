@@ -162,6 +162,21 @@ impl SessionTable {
             .map(|entry| (entry.decision, entry.metadata.clone(), entry.origin))
     }
 
+    /// #2442: every owner-RG id that currently indexes at least one session in
+    /// this worker's table. Used by the loss-of-sync resync path to export ALL
+    /// owned forward sessions (the same RG set
+    /// `export_forward_sessions_for_owner_rgs` would walk) without needing the
+    /// coordinator's RG runtime view — the table's own `owner_rg_sessions`
+    /// index is the ground truth for what this worker owns. Empty sets are
+    /// skipped (an owner RG can transiently hold a now-empty index entry).
+    pub fn all_owner_rg_ids(&self) -> Vec<i32> {
+        self.owner_rg_sessions
+            .iter()
+            .filter(|(_, set)| !set.is_empty())
+            .map(|(rg, _)| *rg)
+            .collect()
+    }
+
     pub fn owner_rg_session_keys(&self, owner_rgs: &[i32]) -> Vec<SessionKey> {
         // #964 Step 1: handles → keys via the slab. Each session is
         // in at most one owner-RG set, so total iteration is

@@ -760,6 +760,85 @@ pub(crate) fn worker_loop(
             )));
             last_cos_status_ns = loop_now_ns;
         }
+        // #2442: loss-of-sync resync. If `push_delta` dropped any delta since
+        // the last drain, the in-worker session-delta ring overflowed and the
+        // downstream session-sync consumer missed HA-relevant open/close
+        // events — its view may have silently diverged from the table truth.
+        // Re-emit an open delta for every owned forward session (the same
+        // table-truth walk `ExportOwnerRGSessions` performs) so the peer
+        // re-derives a complete snapshot.
+        //
+        // DRAIN-AS-YOU-EXPORT: a worker can own up to DEFAULT_MAX_SESSIONS
+        // (131072) forward sessions — 32× the 4096-slot delta ring. A naive
+        // "drain then push all N" overflows the ring at delta 4097, drops
+        // sessions 4097..N, re-latches the loss, and never converges (a
+        // permanent per-cycle resync storm). Instead, collect the candidates
+        // once, then emit them in ring-sized chunks, draining+flushing each
+        // chunk to the peer before emitting the next. The ring is empty before
+        // every chunk and a chunk is < cap, so push_delta NEVER overflows
+        // during a resync — the complete snapshot ships and the latch is not
+        // spuriously re-armed. A genuinely new drop after the resync still
+        // re-arms a fresh episode on a later cycle.
+        if sessions.take_delta_loss() {
+            // Emit at most this many open deltas before draining. Comfortably
+            // under MAX_SESSION_DELTAS (4096) so a freshly-emptied ring never
+            // overflows mid-chunk.
+            const RESYNC_EXPORT_CHUNK: usize = 2048;
+            // Flush whatever is queued in the ring to the peer (shared with the
+            // pre-export backlog drain and each chunk's post-emit drain).
+            macro_rules! drain_and_flush_all {
+                () => {
+                    while sessions.has_pending_deltas() {
+                        let deltas = sessions.drain_deltas(256);
+                        purge_queued_flows_for_closed_deltas(
+                            &mut bindings,
+                            &binding_lookup,
+                            &mut shared_recycles,
+                            &deltas,
+                        );
+                        if let Some(binding) = bindings.first() {
+                            let ident = binding.identity();
+                            flush_session_deltas(
+                                &ident,
+                                &binding.live,
+                                binding.bpf_maps.session_map_fd,
+                                conntrack_v4_fd,
+                                conntrack_v6_fd,
+                                &deltas,
+                                &shared_sessions,
+                                &shared_nat_sessions,
+                                &shared_forward_wire_sessions,
+                                &shared_owner_rg_indexes,
+                                &recent_session_deltas,
+                                &peer_worker_commands,
+                                &event_stream,
+                                forwarding.as_ref(),
+                            );
+                        }
+                    }
+                };
+            }
+            // Drain the existing backlog so the ring starts empty.
+            drain_and_flush_all!();
+            let owner_rgs = sessions.all_owner_rg_ids();
+            if !owner_rgs.is_empty() {
+                let candidates =
+                    crate::afxdp::forward_export_candidates_for_owner_rgs(&sessions, &owner_rgs);
+                for chunk in candidates.chunks(RESYNC_EXPORT_CHUNK) {
+                    for (key, decision, metadata, origin) in chunk.iter().cloned() {
+                        sessions.emit_open_delta_with_origin(key, decision, metadata, origin, true);
+                    }
+                    // Ship this chunk and empty the ring before the next chunk,
+                    // so the next batch of emits cannot overflow.
+                    drain_and_flush_all!();
+                }
+            }
+            // The export drained to empty without overflowing, so any latch set
+            // during this resync was a genuinely-new local drop, not the export
+            // re-flooding itself. Clearing it here is unnecessary (drain-as-you-
+            // export does not drop), but the chunked loop guarantees no
+            // spurious re-arm regardless.
+        }
         if !exported_sequences.is_empty() {
             while sessions.has_pending_deltas() {
                 let deltas = sessions.drain_deltas(256);
