@@ -548,7 +548,20 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 				if n.PrefixLimitInet > 0 {
 					fmt.Fprintf(&b, "  neighbor %s maximum-prefix %d\n", n.Address, n.PrefixLimitInet)
 				}
-				if rm := bgpEffectiveExport(n, globalExport); rm != "" {
+				// Outbound filter. Emit ONLY for a defined policy-statement,
+				// the same guard the inbound path uses (#2539, sibling of the
+				// #2490 inbound guard below). globalExport is already
+				// restricted to defined policy-statements (bare protocol
+				// tokens take the redistribute path via the #2473
+				// classification above), but a per-neighbor n.Export — now
+				// parseable as of #2490 — can carry a bare token or an
+				// undefined ref that slipped the strict validator on the
+				// lenient load/HA-sync path. Without the guard that renders a
+				// dangling `route-map out` = FRR permit-all OUTBOUND (the
+				// entire table advertised to the peer). Bare tokens stay on
+				// the redistribute path (never reach here as a defined name),
+				// so the #2473 bare-token→redistribute behavior is unchanged.
+				if rm := bgpEffectiveExport(n, globalExport); rm != "" && isDefinedPolicyStatement(rm, policyOptions) {
 					fmt.Fprintf(&b, "  neighbor %s route-map %s out\n", n.Address, rm)
 				}
 				// Inbound filter (#2490). Emit ONLY for a defined
@@ -576,7 +589,8 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 				if n.PrefixLimitInet6 > 0 {
 					fmt.Fprintf(&b, "  neighbor %s maximum-prefix %d\n", n.Address, n.PrefixLimitInet6)
 				}
-				if rm := bgpEffectiveExport(n, globalExport); rm != "" {
+				// Outbound filter (#2539) — see the ipv4 block above.
+				if rm := bgpEffectiveExport(n, globalExport); rm != "" && isDefinedPolicyStatement(rm, policyOptions) {
 					fmt.Fprintf(&b, "  neighbor %s route-map %s out\n", n.Address, rm)
 				}
 				// Inbound filter (#2490) — see the ipv4 block above.

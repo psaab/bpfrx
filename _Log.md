@@ -12816,3 +12816,29 @@ top.
   render → BGPImport* render tests fail; removing the neighbor import strict
   validation → BGPNeighborImportTypoRejected/ProtocolTokenRejected fail. No
   Rust changed.
+
+## 2026-06-24 — #2490 review folds (incl. #2539 export-guard sibling)
+- **Timestamp**: 2026-06-24
+- **Action**: Four review folds on PR #2538.
+  (1, SUBSTANTIVE/#2539) Added isDefinedPolicyStatement guard to BOTH export
+  route-map-out emit sites (ipv4+ipv6), mirroring the #2490 import guard — an
+  undefined per-neighbor export (now parseable as of #2490) on the lenient/
+  HA-sync path no longer renders a dangling route-map out = FRR permit-all
+  OUTBOUND. Bare tokens still take the redistribute path (#2473
+  classification); only undefined policy-statement refs skip. New
+  fail-on-revert render test TestGenerateProtocols_BGPExportUndefinedNoDangling;
+  fixed pre-existing TestBGPAddressFamily to define its export policy-statement
+  (it relied on the now-removed dangling render).
+  (2,3) Made checkPolicyRef direction-aware via a hint param: import failures
+  now say "fix the import name", export/forwarding-table say "fix the export
+  name".
+  (4) Updated BGPNeighbor Import/Export field comments: group default +
+  per-neighbor override, last-wins (most-specific).
+- **File(s)**: pkg/frr/policy_render.go, pkg/frr/frr_test.go,
+  pkg/config/compiler_validate_strict.go, pkg/config/types_routing.go,
+  pkg/frr/README.md
+- **Validation**: go build ./... OK; go test ./pkg/frr/ ./pkg/config/ PASS;
+  gofmt clean; go vet clean. Fail-on-revert PROVEN for the export guard
+  (removing the isDefinedPolicyStatement check → dangling route-map out
+  reappears → TestGenerateProtocols_BGPExportUndefinedNoDangling fails). No
+  Rust changed.

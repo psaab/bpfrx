@@ -524,6 +524,35 @@ func TestGenerateProtocols_BGPImportUndefinedNoDangling(t *testing.T) {
 	}
 }
 
+// TestGenerateProtocols_BGPExportUndefinedNoDangling is the #2539 sibling of
+// the #2490 inbound guard: the OUTBOUND render path must also skip an
+// undefined per-neighbor export ref rather than emit a dangling
+// `route-map <token> out`. A per-neighbor export is parseable as of #2490; on
+// the lenient load/HA-sync path the strict reject is downgraded to a warning,
+// so an undefined ref can reach the renderer. A dangling `route-map out`
+// resolves to PERMIT-ALL in FRR — the entire table advertised to the peer.
+// Fail-on-revert: dropping the isDefinedPolicyStatement guard on the export
+// emit sites makes the dangling out-line appear. Bare protocol tokens still
+// take the redistribute path (the #2473 classification), so this guard only
+// affects undefined policy-statement refs.
+func TestGenerateProtocols_BGPExportUndefinedNoDangling(t *testing.T) {
+	m := New()
+	// nil policyOptions: no policy-statements defined, so the per-neighbor
+	// export ref is undefined (simulates a lenient load that bypassed strict
+	// validation).
+	bgp := &config.BGPConfig{
+		LocalAS:  65001,
+		RouterID: "1.1.1.1",
+		Neighbors: []*config.BGPNeighbor{
+			{Address: "10.0.2.1", PeerAS: 65002, FamilyInet: true, Export: []string{"undefined-policy"}},
+		},
+	}
+	got := m.generateProtocols(nil, nil, bgp, nil, nil, "", 0, nil)
+	if strings.Contains(got, "route-map undefined-policy out") {
+		t.Errorf("LEAK: undefined export ref must not render a dangling route-map out (permit-all outbound), got:\n%s", got)
+	}
+}
+
 // TestGenerateProtocols_OSPFExportPolicyStatement covers the #2144
 // render path: an OSPF `export` that names a defined policy-statement (not
 // a bare protocol token) is expanded by resolveRedistribute into one
@@ -1057,6 +1086,17 @@ func TestGeneratePolicyOptionsRouteMapAttributes(t *testing.T) {
 func TestBGPAddressFamily(t *testing.T) {
 	m := New()
 
+	// to_BV-FIREHOUSE must be a DEFINED policy-statement so the export
+	// route-map out is emitted: an undefined ref is now skipped to avoid a
+	// dangling permit-all route-map (#2539, sibling of the #2490 import guard).
+	po := &config.PolicyOptionsConfig{
+		PolicyStatements: map[string]*config.PolicyStatement{
+			"to_BV-FIREHOUSE": {
+				Name:  "to_BV-FIREHOUSE",
+				Terms: []*config.PolicyTerm{{Name: "t1", Action: "accept"}},
+			},
+		},
+	}
 	bgp := &config.BGPConfig{
 		LocalAS: 64701,
 		Neighbors: []*config.BGPNeighbor{
@@ -1075,7 +1115,7 @@ func TestBGPAddressFamily(t *testing.T) {
 		},
 	}
 
-	got := m.generateProtocols(nil, nil, bgp, nil, nil, "", 0, nil)
+	got := m.generateProtocols(nil, nil, bgp, nil, nil, "", 0, po)
 
 	checks := []string{
 		"router bgp 64701",

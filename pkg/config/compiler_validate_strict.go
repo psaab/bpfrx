@@ -687,15 +687,21 @@ func validateRoutingExportReferencesStrict(cfg *Config) error {
 		return nil
 	}
 
-	// checkPolicyRef validates an export list that renders directly as a
+	// checkPolicyRef validates a reference that renders directly as a
 	// route-map / ECMP policy name: only a defined policy-statement is valid.
-	checkPolicyRef := func(detail, name string) error {
+	// hint is the trailing remediation text — direction-aware so an import
+	// failure does not say "fix the export name" (Copilot review, #2490).
+	checkPolicyRef := func(detail, name, hint string) error {
 		if name == "" || defined(name) {
 			return nil
 		}
 		return fmt.Errorf("%s references undefined policy-statement %q; %s",
-			detail, name, "define the policy-statement or fix the export name")
+			detail, name, hint)
 	}
+	const (
+		hintExport = "define the policy-statement or fix the export name"
+		hintImport = "define the policy-statement or fix the import name"
+	)
 
 	checkProtocols := func(scope string, ospf *OSPFConfig, ospfv3 *OSPFv3Config, bgp *BGPConfig, rip *RIPConfig, isis *ISISConfig) error {
 		if ospf != nil {
@@ -732,7 +738,7 @@ func validateRoutingExportReferencesStrict(cfg *Config) error {
 			// direction). #2490.
 			for _, e := range bgp.Import {
 				detail := fmt.Sprintf("%sprotocols bgp import", scope)
-				if err := checkPolicyRef(detail, e); err != nil {
+				if err := checkPolicyRef(detail, e, hintImport); err != nil {
 					return err
 				}
 			}
@@ -754,7 +760,7 @@ func validateRoutingExportReferencesStrict(cfg *Config) error {
 					if n.GroupName != "" {
 						detail = fmt.Sprintf("%sprotocols bgp group %s neighbor %s export", scope, n.GroupName, n.Address)
 					}
-					if err := checkPolicyRef(detail, e); err != nil {
+					if err := checkPolicyRef(detail, e, hintExport); err != nil {
 						return err
 					}
 				}
@@ -763,7 +769,7 @@ func validateRoutingExportReferencesStrict(cfg *Config) error {
 					if n.GroupName != "" {
 						detail = fmt.Sprintf("%sprotocols bgp group %s neighbor %s import", scope, n.GroupName, n.Address)
 					}
-					if err := checkPolicyRef(detail, e); err != nil {
+					if err := checkPolicyRef(detail, e, hintImport); err != nil {
 						return err
 					}
 				}
@@ -794,6 +800,7 @@ func validateRoutingExportReferencesStrict(cfg *Config) error {
 	if err := checkPolicyRef(
 		"routing-options forwarding-table export",
 		cfg.RoutingOptions.ForwardingTableExport,
+		hintExport,
 	); err != nil {
 		return fmt.Errorf("%s (the expected ECMP / consistent-hash "+
 			"load-balancing would be silently disabled)", err)

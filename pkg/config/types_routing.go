@@ -293,8 +293,8 @@ type BGPNeighbor struct {
 	PeerAS               uint32
 	Description          string
 	MultihopTTL          int      // 0 = directly connected
-	Export               []string // per-group export policies (route-map out)
-	Import               []string // per-group import policies (route-map in); #2490
+	Export               []string // export policies (route-map out): group default + per-neighbor override; last wins (most-specific)
+	Import               []string // import policies (route-map in): group default + per-neighbor override; last wins (most-specific); #2490
 	FamilyInet           bool     // activate under address-family ipv4 unicast
 	FamilyInet6          bool     // activate under address-family ipv6 unicast
 	GroupName            string   // BGP group name (for display)

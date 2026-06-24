@@ -145,6 +145,14 @@ move or rename the markers — they're literal strings.
   redistribute verb, not per-neighbor, emitted once under `router bgp`.
   `resolveRedistribute` is still called on the BGP export path, but ONLY
   for bare tokens — never for a policy-statement name (that was the leak).
+  Both `route-map out` emit sites (ipv4 + ipv6 AF) are guarded by
+  `isDefinedPolicyStatement` (#2539, sibling of the #2490 inbound guard):
+  `globalExport` is already restricted to defined policy-statements, but a
+  per-neighbor `export` (parseable as of #2490) can carry a bare token or an
+  undefined ref that slipped the strict validator on the lenient load/HA-sync
+  path. The guard skips it (fail-closed) instead of emitting a dangling
+  `route-map out` = FRR permit-all OUTBOUND. Bare tokens never reach here as a
+  defined name, so the bare-token→redistribute path is unchanged.
 - **`protocols bgp ... import <policy>` renders inbound `route-map in`
   (#2490).** BGP neighbors/groups now carry an `Import []string` symmetric
   to `Export`. A global `protocols bgp import`, a group `import`, and a
