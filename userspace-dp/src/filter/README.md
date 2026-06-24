@@ -44,9 +44,14 @@ Mirrors the BPF firewall-filter pipeline in userspace.
   matched `then policer ...` name in the filter result. Routing-instance
   evaluation can also return log/action/filter/term metadata so AF_XDP
   can emit PBR RT_FLOW filter-log events without re-evaluating the term
-  or allocating on the packet path. No-count helper evaluation returns the
-  first logged non-PBR input or lo0 match while skipping routing-instance
-  terms to avoid double-emitting PBR logs. TX-selection evaluation meters
+  or allocating on the packet path. The routing-instance result also
+  carries an accumulated `log_match` (#2619) so a fall-through
+  `then { log; next term; }` term ahead of the routing-instance term is
+  not dropped from the PBR RT_FLOW path. The no-count log-only helper
+  (`evaluate_filter_ref_log_match`) accumulates the LATEST matched logging
+  term — sharing the full evaluator's semantics (#2618) instead of
+  returning on the first one — while still skipping routing-instance terms
+  so PBR logs are emitted only on the PBR path. TX-selection evaluation meters
   three-color policers, carries output filter-log identity through live
   forwarding and cached flow-cache hits, and preserves terminal
   `discard`/`reject` actions so output filters cannot log deny while
@@ -89,6 +94,21 @@ Mirrors the BPF firewall-filter pipeline in userspace.
   each carry `then count` the cached rebuild path records only the last
   (a pre-existing structural limit; the uncached full-eval path counts
   every term).
+
+  **Fall-through log action follows the terminal verdict (#2616).** A
+  matched fall-through logging term records its identity
+  (`filter_id`/`term_id`) into the accumulated `log_match`, but its
+  `action` field holds the Accept PLACEHOLDER the compiler assigns an
+  empty/`next term` action — NOT the verdict the packet receives. Every
+  evaluator entry point (`evaluate_filter_ref_counted_v4/v6`, the
+  `_non_routing_` variants, the routing-instance evaluators, and the
+  log-only helper) now normalizes the stored `log_match.action` to the
+  FINAL terminal action before returning. A `then { log; next term; }`
+  term ahead of a terminal `discard`/`reject` therefore logs DENY, not
+  permit — the RT_FLOW record no longer lies about the action while the
+  dataplane denies the packet. For a terminating logging term
+  `term.action` already equals the final verdict, so normalization is a
+  no-op there.
 - `policer.rs` — token-bucket implementation plus the #1375 RFC
   2697/2698 three-color meter core. Token math is integer-only:
   the legacy token bucket keeps its bits/sec constructor contract, and

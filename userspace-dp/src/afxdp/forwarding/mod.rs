@@ -1119,7 +1119,12 @@ pub(super) fn ingress_route_table_override(
         extra,
         meta.pkt_len as u64,
     )?;
-    if routing_result.log {
+    // #2619: emit the accumulated log_match — it captures fall-through
+    // `then { log; next term; }` terms ahead of the routing-instance term that
+    // the PBR path previously dropped, AND the routing-instance term's own log
+    // (latest matched wins). Its action is already normalized to the verdict the
+    // packet receives (#2616). Falls back to nothing when no matched term logged.
+    if let Some(log_match) = routing_result.log_match {
         let ingress_zone_id = ingress_zone_override
             .filter(|id| forwarding.zone_id_to_name.contains_key(id))
             .or_else(|| forwarding.ifindex_to_zone_id.get(&ingress_ifindex).copied())
@@ -1136,9 +1141,9 @@ pub(super) fn ingress_route_table_override(
             meta,
             ingress_zone_id,
             0,
-            routing_result.filter_id,
-            routing_result.term_id,
-            routing_result.action,
+            log_match.filter_id,
+            log_match.term_id,
+            log_match.action,
             FilterLogSource::Pbr,
             // #2520: AppID via the hot-path app_catalog.lookup.
             resolve_flow_app_id(&forwarding.app_catalog, flow),

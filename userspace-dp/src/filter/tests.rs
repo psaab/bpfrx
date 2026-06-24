@@ -5124,3 +5124,344 @@ fn fallthrough_tx_selection_applies_forwarding_class_then_discards() {
     let filter = state.filters.get("inet:tx-ft").expect("filter");
     assert_eq!(filter.terms[0].counter.packets.load(Ordering::Relaxed), 1);
 }
+
+// ---------------------------------------------------------------------------
+// #2616: a fall-through `then { log; next term; }` term followed by a terminal
+// discard/reject must report the FINAL verdict (deny) in its RT_FLOW log action,
+// not the Accept placeholder the fall-through term carries. Pre-fix the
+// log_match action was term.action (Accept) — the event lied "permit" while the
+// packet was denied. These FAIL on master (assert Discard/Reject, master
+// returns Accept on log_match.action) and pass with normalize_log_match_action.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn fallthrough_log_action_follows_terminal_discard() {
+    let state = make_filter_state(
+        &[FirewallFilterSnapshot {
+            name: "lt".into(),
+            family: "inet".into(),
+            terms: vec![
+                FirewallTermSnapshot {
+                    name: "log-first".into(),
+                    protocols: vec!["tcp".into()],
+                    destination_ports: vec!["443".into()],
+                    action: String::new(),
+                    next_term: true,
+                    log: true,
+                    ..Default::default()
+                },
+                FirewallTermSnapshot {
+                    name: "deny-web".into(),
+                    protocols: vec!["tcp".into()],
+                    destination_ports: vec!["443".into()],
+                    action: "discard".into(),
+                    ..Default::default()
+                },
+            ],
+        }],
+        &[],
+    );
+    let r = evaluate_filter(
+        &state,
+        "inet:lt",
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+        PROTO_TCP,
+        40000,
+        443,
+        0,
+        TermMatchExtra::default(),
+    );
+    assert_eq!(r.action, FilterAction::Discard);
+    let lm = r.log_match.expect("fall-through log term must emit a log_match");
+    // Identity is the fall-through logging term (term 0), but the action must be
+    // the terminal verdict, NOT the Accept placeholder.
+    assert_eq!(lm.term_id, 0);
+    assert_eq!(
+        lm.action,
+        FilterAction::Discard,
+        "RT_FLOW log action must follow the terminal verdict (#2616)"
+    );
+}
+
+#[test]
+fn fallthrough_log_action_follows_terminal_reject() {
+    let state = make_filter_state(
+        &[FirewallFilterSnapshot {
+            name: "lr".into(),
+            family: "inet6".into(),
+            terms: vec![
+                FirewallTermSnapshot {
+                    name: "log-first".into(),
+                    protocols: vec!["tcp".into()],
+                    destination_ports: vec!["443".into()],
+                    action: String::new(),
+                    next_term: true,
+                    log: true,
+                    ..Default::default()
+                },
+                FirewallTermSnapshot {
+                    name: "reject-web".into(),
+                    protocols: vec!["tcp".into()],
+                    destination_ports: vec!["443".into()],
+                    action: "reject".into(),
+                    ..Default::default()
+                },
+            ],
+        }],
+        &[],
+    );
+    let r = evaluate_filter(
+        &state,
+        "inet6:lr",
+        IpAddr::V6("2001:db8::1".parse().unwrap()),
+        IpAddr::V6("2001:db8::2".parse().unwrap()),
+        PROTO_TCP,
+        40000,
+        443,
+        0,
+        TermMatchExtra::default(),
+    );
+    assert_eq!(r.action, FilterAction::Reject);
+    let lm = r.log_match.expect("fall-through log term must emit a log_match");
+    assert_eq!(
+        lm.action,
+        FilterAction::Reject,
+        "RT_FLOW log action must follow the terminal reject (#2616)"
+    );
+}
+
+#[test]
+fn fallthrough_log_action_terminating_log_term_unchanged() {
+    // Regression guard: a terminating logging term still reports its OWN action
+    // (here Accept) — normalization is a no-op because term.action == acc.action.
+    let state = make_filter_state(
+        &[FirewallFilterSnapshot {
+            name: "la".into(),
+            family: "inet".into(),
+            terms: vec![FirewallTermSnapshot {
+                name: "log-accept".into(),
+                protocols: vec!["tcp".into()],
+                destination_ports: vec!["443".into()],
+                action: "accept".into(),
+                log: true,
+                ..Default::default()
+            }],
+        }],
+        &[],
+    );
+    let r = evaluate_filter(
+        &state,
+        "inet:la",
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+        PROTO_TCP,
+        40000,
+        443,
+        0,
+        TermMatchExtra::default(),
+    );
+    assert_eq!(r.action, FilterAction::Accept);
+    assert_eq!(r.log_match.expect("log_match").action, FilterAction::Accept);
+}
+
+// ---------------------------------------------------------------------------
+// #2618: the log-only helper (evaluate_interface_filter_log_match) must share
+// the full evaluator's latest-matched-logging-term semantics. With two matched
+// `then { log; next term; }` terms, both the full evaluator and the log-only
+// helper must point at the SECOND term, and (with a terminal discard) both must
+// report the terminal action. Pre-fix the log-only helper returned the FIRST
+// term and the placeholder Accept.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn log_only_helper_matches_full_evaluator_latest_term_and_action() {
+    let state = make_filter_state_with_interfaces(
+        &[FirewallFilterSnapshot {
+            name: "two-log".into(),
+            family: "inet".into(),
+            terms: vec![
+                FirewallTermSnapshot {
+                    name: "log-a".into(),
+                    protocols: vec!["tcp".into()],
+                    destination_ports: vec!["443".into()],
+                    action: String::new(),
+                    next_term: true,
+                    log: true,
+                    ..Default::default()
+                },
+                FirewallTermSnapshot {
+                    name: "log-b".into(),
+                    protocols: vec!["tcp".into()],
+                    destination_ports: vec!["443".into()],
+                    action: String::new(),
+                    next_term: true,
+                    log: true,
+                    ..Default::default()
+                },
+                FirewallTermSnapshot {
+                    name: "deny-web".into(),
+                    protocols: vec!["tcp".into()],
+                    destination_ports: vec!["443".into()],
+                    action: "discard".into(),
+                    ..Default::default()
+                },
+            ],
+        }],
+        &[crate::InterfaceSnapshot {
+            ifindex: 7,
+            filter_input_v4: "two-log".into(),
+            ..Default::default()
+        }],
+    );
+    let src = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 10));
+    let dst = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 20));
+
+    let full = evaluate_interface_filter_counted(
+        &state,
+        7,
+        false,
+        src,
+        dst,
+        PROTO_TCP,
+        49152,
+        443,
+        0,
+        TermMatchExtra::default(),
+        0,
+    );
+    let full_lm = full.log_match.expect("full evaluator log_match");
+
+    let log_only = evaluate_interface_filter_log_match(
+        &state,
+        7,
+        false,
+        src,
+        dst,
+        PROTO_TCP,
+        49152,
+        443,
+        0,
+        TermMatchExtra::default(),
+        true,
+    )
+    .expect("log-only helper log_match");
+
+    // Latest-matched: term 1 (log-b), not the first matched logging term.
+    assert_eq!(full_lm.term_id, 1);
+    assert_eq!(log_only.term_id, full_lm.term_id);
+    assert_eq!(log_only.filter_id, full_lm.filter_id);
+    // Both report the terminal verdict (discard), not the placeholder Accept.
+    assert_eq!(full.action, FilterAction::Discard);
+    assert_eq!(full_lm.action, FilterAction::Discard);
+    assert_eq!(log_only.action, FilterAction::Discard);
+}
+
+// ---------------------------------------------------------------------------
+// #2619: the PBR (routing-instance) evaluator must preserve a fall-through
+// `then { log; next term; }` term's log metadata seen BEFORE the
+// routing-instance term. Pre-fix FilterRoutingInstanceResult carried only the
+// routing-instance term's log; the earlier fall-through log was dropped.
+// The accumulated log_match.action is normalized to the routing-instance term's
+// own action (the verdict the packet receives on the PBR path, #2616).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn pbr_evaluator_preserves_fallthrough_log_before_routing_instance() {
+    let state = make_filter_state_with_interfaces(
+        &[FirewallFilterSnapshot {
+            name: "pbr-log".into(),
+            family: "inet".into(),
+            terms: vec![
+                FirewallTermSnapshot {
+                    name: "audit-pbr".into(),
+                    protocols: vec!["tcp".into()],
+                    destination_ports: vec!["5201".into()],
+                    action: String::new(),
+                    next_term: true,
+                    log: true,
+                    ..Default::default()
+                },
+                FirewallTermSnapshot {
+                    name: "steer-blue".into(),
+                    protocols: vec!["tcp".into()],
+                    destination_ports: vec!["5201".into()],
+                    action: "accept".into(),
+                    routing_instance: "blue".into(),
+                    ..Default::default()
+                },
+            ],
+        }],
+        &[crate::InterfaceSnapshot {
+            ifindex: 12,
+            filter_input_v4: "pbr-log".into(),
+            ..Default::default()
+        }],
+    );
+    let result = evaluate_interface_filter_routing_instance_event_counted(
+        &state,
+        12,
+        false,
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+        PROTO_TCP,
+        40000,
+        5201,
+        0,
+        TermMatchExtra::default(),
+        1400,
+    )
+    .expect("routing-instance override");
+    assert_eq!(result.routing_instance, "blue");
+    let lm = result
+        .log_match
+        .expect("fall-through log before routing-instance must be preserved (#2619)");
+    // Identity is the fall-through audit term (term 0).
+    assert_eq!(lm.term_id, 0);
+    // Action follows the routing-instance term's verdict (Accept here).
+    assert_eq!(lm.action, FilterAction::Accept);
+}
+
+#[test]
+fn pbr_evaluator_log_on_routing_instance_term_itself() {
+    // The routing-instance term carries `then log` directly (no fall-through
+    // term ahead). log_match must point at it (latest matched wins).
+    let state = make_filter_state_with_interfaces(
+        &[FirewallFilterSnapshot {
+            name: "pbr-self-log".into(),
+            family: "inet".into(),
+            terms: vec![FirewallTermSnapshot {
+                name: "steer-and-log".into(),
+                protocols: vec!["tcp".into()],
+                destination_ports: vec!["5201".into()],
+                action: "accept".into(),
+                log: true,
+                routing_instance: "green".into(),
+                ..Default::default()
+            }],
+        }],
+        &[crate::InterfaceSnapshot {
+            ifindex: 13,
+            filter_input_v4: "pbr-self-log".into(),
+            ..Default::default()
+        }],
+    );
+    let result = evaluate_interface_filter_routing_instance_event_counted(
+        &state,
+        13,
+        false,
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+        PROTO_TCP,
+        40000,
+        5201,
+        0,
+        TermMatchExtra::default(),
+        1400,
+    )
+    .expect("routing-instance override");
+    assert_eq!(result.routing_instance, "green");
+    let lm = result.log_match.expect("routing-instance term log");
+    assert_eq!(lm.term_id, 0);
+    assert_eq!(lm.action, FilterAction::Accept);
+}
