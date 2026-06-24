@@ -2034,6 +2034,284 @@ fn translate_v6_to_v4_first_fragment_still_translates() {
         .expect("first fragment must translate");
     assert_eq!(v4[9], PROTO_UDP);
     assert_eq!(u16::from_be_bytes([v4[20], v4[21]]), 1111);
+    // #2488 FAIL-ON-REVERT: a real first fragment (IPv6 Fragment Header offset
+    // 0, M=1) must translate to IPv4 with MF=1 and offset 0 — derived from THE
+    // PACKET (RFC 7915 §5), NOT the no-v6-frag-header config. Master emits the
+    // atomic 0x4000 (DF=1, MF=0) here, which delivers a truncated first
+    // fragment as if it were a complete datagram.
+    assert_eq!(
+        ipv4_frag_word(&v4),
+        0x2000,
+        "first fragment must set MF=1, DF=0, offset=0 (RFC 7915 §5), not atomic"
+    );
+    // Identification = low 16 bits of the IPv6 Fragment Header id (0 here).
+    assert_eq!(ipv4_identification(&v4), 0, "ID = low16 of the v6 Fragment id");
+    assert_eq!(checksum16(&v4[..20]), 0, "IPv4 header checksum must verify");
+}
+
+// ---------------------------------------------------------------------------
+// #2488: RFC 7915 fragment translation. The IPv4 fragmentation fields (and, in
+// the v4->v6 direction, the presence of an IPv6 Fragment Header) must be
+// derived from THE PACKET, not the no-v6-frag-header config. Non-first
+// fragments are dropped both directions (the round-robin SNAT pool and
+// port-keyed sessions cannot consistently map a port-less fragment to its
+// datagram) — only first/atomic fragments translate.
+// ---------------------------------------------------------------------------
+
+/// Build a v6 packet carrying a Fragment Header (next-header 44) wrapping a
+/// complete UDP datagram (valid v6 UDP checksum), with the given fragment
+/// offset (8-byte units), M flag and 32-bit Identification.
+fn make_ipv6_frag_udp(
+    src: Ipv6Addr,
+    dst: Ipv6Addr,
+    sport: u16,
+    dport: u16,
+    data: &[u8],
+    offset_units: u16,
+    more: bool,
+    frag_id: u32,
+) -> Vec<u8> {
+    let udp_len = 8 + data.len();
+    let mut udp = vec![0u8; udp_len];
+    udp[0..2].copy_from_slice(&sport.to_be_bytes());
+    udp[2..4].copy_from_slice(&dport.to_be_bytes());
+    udp[4..6].copy_from_slice(&(udp_len as u16).to_be_bytes());
+    udp[8..].copy_from_slice(data);
+    let csum = checksum16_ipv6_pseudo(src, dst, PROTO_UDP, &udp);
+    let csum = if csum == 0 { 0xFFFF } else { csum };
+    udp[6..8].copy_from_slice(&csum.to_be_bytes());
+
+    let mut frag = vec![0u8; 8 + udp_len];
+    frag[0] = PROTO_UDP;
+    let word = (offset_units << 3) | u16::from(more);
+    frag[2..4].copy_from_slice(&word.to_be_bytes());
+    frag[4..8].copy_from_slice(&frag_id.to_be_bytes());
+    frag[8..].copy_from_slice(&udp);
+
+    let mut pkt = vec![0u8; 40 + frag.len()];
+    pkt[0] = 0x60;
+    pkt[4..6].copy_from_slice(&(frag.len() as u16).to_be_bytes());
+    pkt[6] = 44;
+    pkt[7] = 64;
+    pkt[8..24].copy_from_slice(&src.octets());
+    pkt[24..40].copy_from_slice(&dst.octets());
+    pkt[40..].copy_from_slice(&frag);
+    pkt
+}
+
+/// Build a v4 UDP packet with explicit fragmentation fields (MF flag, 13-bit
+/// offset in 8-byte units, 16-bit Identification), valid checksums.
+fn make_ipv4_frag_udp(
+    src: Ipv4Addr,
+    dst: Ipv4Addr,
+    sport: u16,
+    dport: u16,
+    data: &[u8],
+    offset_units: u16,
+    more: bool,
+    ident: u16,
+) -> Vec<u8> {
+    let udp_len = 8 + data.len();
+    let total = 20 + udp_len;
+    let mut pkt = vec![0u8; total];
+    pkt[0] = 0x45;
+    pkt[2..4].copy_from_slice(&(total as u16).to_be_bytes());
+    pkt[4..6].copy_from_slice(&ident.to_be_bytes());
+    let word = (offset_units & 0x1FFF) | if more { 0x2000 } else { 0 };
+    pkt[6..8].copy_from_slice(&word.to_be_bytes());
+    pkt[8] = 64;
+    pkt[9] = PROTO_UDP;
+    pkt[12..16].copy_from_slice(&src.octets());
+    pkt[16..20].copy_from_slice(&dst.octets());
+    pkt[20..22].copy_from_slice(&sport.to_be_bytes());
+    pkt[22..24].copy_from_slice(&dport.to_be_bytes());
+    pkt[24..26].copy_from_slice(&(udp_len as u16).to_be_bytes());
+    pkt[28..28 + data.len()].copy_from_slice(data);
+    let csum = checksum16_ipv4_pseudo(src, dst, PROTO_UDP, &pkt[20..]);
+    let csum = if csum == 0 { 0xFFFF } else { csum };
+    pkt[26..28].copy_from_slice(&csum.to_be_bytes());
+    let ip = checksum16(&pkt[..20]);
+    pkt[10..12].copy_from_slice(&ip.to_be_bytes());
+    pkt
+}
+
+#[test]
+fn nat64_v6_to_v4_first_fragment_mf_and_id_from_packet() {
+    // FAIL-ON-REVERT: a v6 first fragment (Fragment Header offset 0, M=1) must
+    // become IPv4 MF=1, offset 0, DF=0, Identification = low16 of the v6
+    // Fragment id — derived from THE PACKET (RFC 7915 §5), NOT no-v6-frag-header.
+    let src_v6: Ipv6Addr = "2001:db8::1".parse().unwrap();
+    let dst_v6: Ipv6Addr = "64:ff9b::c000:0201".parse().unwrap();
+    let snat_v4 = Ipv4Addr::new(198, 51, 100, 1);
+    let dst_v4 = Ipv4Addr::new(192, 0, 2, 1);
+
+    let pkt = make_ipv6_frag_udp(src_v6, dst_v6, 5000, 6000, b"hello-frag", 0, true, 0xDEAD_BEEF);
+
+    // The config value MUST be ignored for a real fragment: try both.
+    for cfg in [false, true] {
+        let v4 = translate_v6_to_v4(&pkt, snat_v4, dst_v4, cfg)
+            .unwrap_or_else(|| panic!("first fragment must translate (cfg={cfg})"));
+        assert_eq!(
+            ipv4_frag_word(&v4),
+            0x2000,
+            "MF=1, DF=0, offset=0 from the packet (cfg={cfg}); master emits atomic 0x4000"
+        );
+        assert_eq!(
+            ipv4_identification(&v4),
+            0xBEEF,
+            "ID = low 16 bits of the v6 Fragment id (cfg={cfg})"
+        );
+        assert_eq!(v4[9], PROTO_UDP, "protocol UDP (cfg={cfg})");
+        assert_eq!(checksum16(&v4[..20]), 0, "IPv4 header checksum verifies (cfg={cfg})");
+        // L4 fully present here -> incremental adjust must equal a from-scratch
+        // v4 UDP checksum (verify == 0 over pseudo + L4 incl. checksum field).
+        assert_eq!(
+            checksum16_ipv4_pseudo(snat_v4, dst_v4, PROTO_UDP, &v4[20..]),
+            0,
+            "translated v4 UDP fragment checksum verifies (cfg={cfg})"
+        );
+    }
+}
+
+#[test]
+fn nat64_v6_to_v4_atomic_fragment_header_df_clear_id_from_packet() {
+    // An IPv6 atomic fragment (Fragment Header present, offset 0, M=0) is whole
+    // but fragmentable: RFC 7915 §5.1.1 -> IPv4 DF=0, MF=0, offset 0, and the
+    // Identification copied from the Fragment Header (low 16 bits), regardless
+    // of the no-v6-frag-header config.
+    let src_v6: Ipv6Addr = "2001:db8::2".parse().unwrap();
+    let dst_v6: Ipv6Addr = "64:ff9b::c000:0202".parse().unwrap();
+    let snat_v4 = Ipv4Addr::new(198, 51, 100, 2);
+    let dst_v4 = Ipv4Addr::new(192, 0, 2, 2);
+
+    let pkt = make_ipv6_frag_udp(src_v6, dst_v6, 7000, 8000, b"atomic", 0, false, 0x0000_1234);
+    let v4 = translate_v6_to_v4(&pkt, snat_v4, dst_v4, false).expect("translate");
+    assert_eq!(ipv4_frag_word(&v4), 0x0000, "atomic fragment -> DF=0, MF=0, offset=0");
+    assert_eq!(ipv4_identification(&v4), 0x1234, "ID from the Fragment Header");
+    assert_eq!(checksum16(&v4[..20]), 0);
+}
+
+#[test]
+fn nat64_v6_to_v4_unfragmented_keeps_config_df_policy() {
+    // NO-REGRESSION: a packet with NO Fragment Header keeps the option-gated
+    // atomic DF policy (DF=1 default, DF=0 + generated id with the option).
+    let src_v6: Ipv6Addr = "2001:db8::3".parse().unwrap();
+    let dst_v6: Ipv6Addr = "64:ff9b::c000:0203".parse().unwrap();
+    let snat_v4 = Ipv4Addr::new(198, 51, 100, 3);
+    let dst_v4 = Ipv4Addr::new(192, 0, 2, 3);
+    let pkt = make_ipv6_tcp_packet(src_v6, dst_v6, 1234, 80, b"plain");
+
+    let df = translate_v6_to_v4(&pkt, snat_v4, dst_v4, false).expect("translate");
+    assert_eq!(ipv4_frag_word(&df), 0x4000, "default atomic DF=1");
+    assert_eq!(ipv4_identification(&df), 0, "atomic id=0");
+
+    let nodf = translate_v6_to_v4(&pkt, snat_v4, dst_v4, true).expect("translate");
+    assert_eq!(ipv4_frag_word(&nodf), 0x0000, "no-v6-frag-header clears DF");
+    assert_ne!(ipv4_identification(&nodf), 0, "fragmentable -> non-zero generated id");
+}
+
+#[test]
+fn nat64_v4_to_v6_first_fragment_inserts_fragment_header() {
+    // FAIL-ON-REVERT: a v4 first fragment (MF=1, offset 0) must become an IPv6
+    // packet WITH a Fragment Header (next-header 44): offset copied, M mapped,
+    // Identification = v4 id zero-extended, payload-length += 8. Master emits a
+    // plain 40-byte IPv6 header with NO Fragment Header.
+    let src_v6: Ipv6Addr = "64:ff9b::c000:0204".parse().unwrap();
+    let dst_v6: Ipv6Addr = "2001:db8::4".parse().unwrap();
+    let v4_src = Ipv4Addr::new(192, 0, 2, 4);
+    let v4_dst = Ipv4Addr::new(198, 51, 100, 4);
+
+    let data = b"v4-frag-payload";
+    let pkt = make_ipv4_frag_udp(v4_src, v4_dst, 4444, 5555, data, 0, true, 0x4321);
+    let v6 = translate_v4_to_v6(&pkt, src_v6, dst_v6).expect("translate");
+
+    assert_eq!(v6[6], 44, "base IPv6 next-header must point at the Fragment Header");
+    assert_eq!(v6[40], PROTO_UDP, "Fragment Header next-header = UDP");
+    let frag_word = u16::from_be_bytes([v6[42], v6[43]]);
+    assert_eq!(frag_word & 0x0001, 0x0001, "M flag mapped from IPv4 MF");
+    assert_eq!(frag_word >> 3, 0, "fragment offset 0 copied");
+    assert_eq!(
+        u32::from_be_bytes([v6[44], v6[45], v6[46], v6[47]]),
+        0x0000_4321,
+        "Identification = v4 id zero-extended to 32 bits"
+    );
+    let udp_len = 8 + data.len();
+    assert_eq!(
+        u16::from_be_bytes([v6[4], v6[5]]) as usize,
+        8 + udp_len,
+        "payload-length includes the 8-byte Fragment Header"
+    );
+    assert_eq!(u16::from_be_bytes([v6[48], v6[49]]), 4444, "UDP src port at L4 offset 48");
+    // L4 fully present -> incremental adjust equals a from-scratch v6 recompute.
+    assert_eq!(
+        checksum16_ipv6_pseudo(src_v6, dst_v6, PROTO_UDP, &v6[48..]),
+        0,
+        "translated v6 UDP fragment checksum verifies"
+    );
+}
+
+#[test]
+fn nat64_v4_to_v6_unfragmented_has_no_fragment_header() {
+    // NO-REGRESSION: an unfragmented v4 packet (MF=0, offset 0) stays a plain
+    // IPv6 packet with NO Fragment Header — byte-identical to pre-#2488.
+    let src_v6: Ipv6Addr = "64:ff9b::c000:0205".parse().unwrap();
+    let dst_v6: Ipv6Addr = "2001:db8::5".parse().unwrap();
+    let v4_src = Ipv4Addr::new(192, 0, 2, 5);
+    let v4_dst = Ipv4Addr::new(198, 51, 100, 5);
+
+    let pkt = make_ipv4_frag_udp(v4_src, v4_dst, 4000, 5000, b"plain-reply", 0, false, 0x9999);
+    let v6 = translate_v4_to_v6(&pkt, src_v6, dst_v6).expect("translate");
+    assert_eq!(v6[6], PROTO_UDP, "base next-header = UDP, no Fragment Header");
+    assert_eq!(u16::from_be_bytes([v6[48 - 8], v6[48 - 7]]), 4000, "UDP at L4 offset 40");
+    assert_eq!(checksum16_ipv6_pseudo(src_v6, dst_v6, PROTO_UDP, &v6[40..]), 0);
+}
+
+#[test]
+fn nat64_v4_to_v6_non_first_fragment_dropped() {
+    // A non-first v4 fragment (offset > 0) carries no L4 header and is dropped,
+    // symmetric with the v6->v4 non-first-fragment drop.
+    let src_v6: Ipv6Addr = "64:ff9b::c000:0206".parse().unwrap();
+    let dst_v6: Ipv6Addr = "2001:db8::6".parse().unwrap();
+    let v4_src = Ipv4Addr::new(192, 0, 2, 6);
+    let v4_dst = Ipv4Addr::new(198, 51, 100, 6);
+    let pkt = make_ipv4_frag_udp(v4_src, v4_dst, 1, 2, &[0u8; 16], 0x0002, true, 0x1111);
+    assert!(
+        translate_v4_to_v6(&pkt, src_v6, dst_v6).is_none(),
+        "non-first v4 fragment must be dropped"
+    );
+}
+
+#[test]
+fn nat64_v4_to_v6_udp_fragment_zero_checksum_dropped() {
+    // RFC 7915 §4.5: a v4 UDP fragment with checksum 0 cannot be translated
+    // (the mandatory v6 UDP checksum cannot be computed from one fragment).
+    let src_v6: Ipv6Addr = "64:ff9b::c000:0207".parse().unwrap();
+    let dst_v6: Ipv6Addr = "2001:db8::7".parse().unwrap();
+    let v4_src = Ipv4Addr::new(192, 0, 2, 7);
+    let v4_dst = Ipv4Addr::new(198, 51, 100, 7);
+    let mut pkt = make_ipv4_frag_udp(v4_src, v4_dst, 3, 4, b"data", 0, true, 0x2222);
+    pkt[26..28].copy_from_slice(&[0, 0]); // zero the UDP checksum
+    let ip = checksum16(&pkt[..20]);
+    pkt[10..12].copy_from_slice(&ip.to_be_bytes());
+    assert!(
+        translate_v4_to_v6(&pkt, src_v6, dst_v6).is_none(),
+        "v4 UDP fragment with zero checksum must be dropped"
+    );
+}
+
+#[test]
+fn nat64_v6_to_v4_non_first_fragment_still_dropped() {
+    // NO-REGRESSION of the #2290 drop: a v6 non-first fragment is still dropped
+    // (offset > 0, no L4 header).
+    let src_v6: Ipv6Addr = "2001:db8::8".parse().unwrap();
+    let dst_v6: Ipv6Addr = "64:ff9b::c000:0208".parse().unwrap();
+    let snat_v4 = Ipv4Addr::new(198, 51, 100, 8);
+    let dst_v4 = Ipv4Addr::new(192, 0, 2, 8);
+    let pkt = make_ipv6_frag_udp(src_v6, dst_v6, 9, 10, &[0u8; 16], 0x0040, false, 0x3333);
+    assert!(
+        translate_v6_to_v4(&pkt, snat_v4, dst_v4, false).is_none(),
+        "v6 non-first fragment must be dropped"
+    );
 }
 
 #[test]
