@@ -465,7 +465,10 @@ func IsUsableIPsecEndpoint(s string) bool {
 // single-label gateway object name), and every dot-separated label must
 // be a syntactically valid host label (1-63 chars, alphanumeric with
 // internal hyphens, no leading/trailing hyphen). Total length is capped
-// at 253. No regexp — a manual byte scan keeps it allocation-free.
+// at 253. A single trailing dot is accepted as the absolute-root marker
+// of a fully qualified domain name ("vpn.example.com." — Junos accepts
+// it); "..", a leading/interior empty label, and a bare "." are still
+// rejected. No regexp — a manual byte scan keeps it allocation-free.
 //
 // The single-label-hostname limitation (a bare `vpnpeer` resolvable via
 // the system resolver is rejected) is intentional and documented: define
@@ -477,6 +480,20 @@ func isPlausibleHostname(s string) bool {
 	}
 	if !strings.Contains(s, ".") {
 		return false
+	}
+	// A single trailing dot is the absolute-root marker of a fully
+	// qualified domain name (e.g. "vpn.example.com."); Junos accepts it.
+	// Strip exactly one terminal dot so the label scan below treats it as
+	// a valid absolute FQDN rather than a name with an empty last label.
+	// A name that is only dots ("."), ends in ".." (empty last label), or
+	// has a leading/interior empty label is NOT made valid by this: after
+	// stripping one trailing dot the scan still rejects "", a trailing
+	// dot, or any "..".
+	if strings.HasSuffix(s, ".") {
+		s = s[:len(s)-1]
+		if len(s) == 0 {
+			return false // name was just "."
+		}
 	}
 	labelLen := 0
 	for i := 0; i < len(s); i++ {
