@@ -12367,3 +12367,24 @@ top.
 - **File(s)**: pkg/flowexport/manager.go,
   pkg/flowexport/instance_isolation_test.go,
   pkg/daemon/daemon_flowexport_session_close_test.go, _Log.md
+
+- **Timestamp**: 2026-06-23
+- **Action**: #2450 (HIGH, agy review-033 finding 2) — chown the HA DHCP
+  memfile pre-seed to the Kea runtime user. On takeover the standby pre-seeds
+  /var/lib/kea/kea-leases{4,6}.csv as ROOT 0640 with no chown; distro Kea runs
+  as unprivileged _kea (Debian/Ubuntu) or kea (RHEL) and opens the memfile RW
+  at startup, so a root-owned file → Kea EACCES → fails to start → DHCP outage
+  on failover. Fix: resolveKeaOwner() looks up _kea then kea via os/user
+  (cached behind sync.Once), and writeMemfileAtomic installs the file via
+  fsatomic.WithOwner so the chown rides the temp fd and the FINAL renamed inode
+  is _kea-owned atomically (no post-rename root window, no orphaned root temp).
+  Covers BOTH families. Robustness: absent Kea user → one warning, write
+  without owner, takeover NOT aborted. Seams: keaOwnerLookup (fake uid/gid) +
+  writeMemfileFile (owner recorder) so tests run unprivileged. Fail-on-revert
+  proven (drop the owner → chown assertions fail). Build/vet/gofmt clean;
+  go test ./pkg/dhcpserver/ green. The pre-existing pkg/fsatomic canary failure
+  (dataplane/proxyarp.go direct os.WriteFile) is unrelated — present on clean
+  origin/master.
+- **File(s)**: pkg/dhcpserver/lease_sync.go, pkg/dhcpserver/dhcpserver.go,
+  pkg/dhcpserver/test_seams.go, pkg/dhcpserver/lease_sync_test.go,
+  pkg/dhcpserver/README.md, _Log.md
