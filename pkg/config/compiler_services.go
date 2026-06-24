@@ -1368,8 +1368,25 @@ func compileSamplingFamily(node *Node) *SamplingFamily {
 		return sf
 	}
 
+	// Precedence for the per-family flow-server source-address.
+	// Junos accepts `source-address` at TWO hierarchies under
+	// `output`: directly under `output` (the per-output default that
+	// every flow-server inherits) and nested inside an individual
+	// flow-server (the per-collector override). SamplingFamily carries
+	// ONE per-family SourceAddress (manager.go applies fam.SourceAddress
+	// to every collector), so we resolve precedence here: a
+	// flow-server-nested source-address wins over the output-level
+	// default. Tracked separately so the result is independent of the
+	// order the children appear in the AST (#2605).
+	var outputLevelSrc, flowServerSrc string
+
 	for _, child := range outputNode.Children {
 		switch child.Name() {
+		case "source-address":
+			// Output-level default: the source-address sibling of
+			// flow-server under `output { ... }`. Standard Junos
+			// hierarchy — previously dropped silently (#2605).
+			outputLevelSrc = nodeVal(child)
 		case "flow-server":
 			fsAddr := nodeVal(child)
 			if fsAddr != "" {
@@ -1417,7 +1434,9 @@ func compileSamplingFamily(node *Node) *SamplingFamily {
 							}
 						}
 					case "source-address":
-						sf.SourceAddress = nodeVal(prop)
+						// Per-collector override (flow-server-nested);
+						// wins over the output-level default below.
+						flowServerSrc = nodeVal(prop)
 					}
 				}
 				sf.FlowServers = append(sf.FlowServers, fs)
@@ -1434,6 +1453,23 @@ func compileSamplingFamily(node *Node) *SamplingFamily {
 				}
 			}
 		}
+	}
+
+	// Resolve the flow-server source-address precedence: a
+	// flow-server-nested value (more specific) wins over the
+	// output-level default; the output-level value is the fallback.
+	if flowServerSrc != "" {
+		sf.SourceAddress = flowServerSrc
+	} else if outputLevelSrc != "" {
+		sf.SourceAddress = outputLevelSrc
+	}
+
+	// The output-level source-address is also the default bind for
+	// inline-jflow exports when the inline-jflow block did not set its
+	// own (manager.go falls back to InlineJflowSourceAddress when
+	// SourceAddress is empty, but inline-jflow uses a distinct field).
+	if sf.InlineJflow && sf.InlineJflowSourceAddress == "" && outputLevelSrc != "" {
+		sf.InlineJflowSourceAddress = outputLevelSrc
 	}
 
 	return sf
