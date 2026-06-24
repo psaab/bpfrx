@@ -161,6 +161,22 @@ if `Handle` runs the re-entrancy guard before the client check.
   Junos. The omission is scoped to the close event type only — POLICY_DENY,
   SCREEN_DROP, and FILTER_LOG (the genuine deny/reject paths) still render
   `action`. Golden coverage: `session_close_format_test.go`.
+- **SESSION_OPEN log lines carry no `action` (#2593).** Sibling of #2513
+  on the adjacent event: a session open (`RT_FLOW_SESSION_CREATE`) is a
+  permit-and-create event, not a forwarding decision, so it has no
+  permit/deny/reject action — the userspace-dp producer writes the wire
+  action byte as 0 for a create
+  (`encode_session_create_rt_flow`), identical to the close path. Byte 0
+  maps to "deny" via `actionName`, so the standard (plain) formatter used
+  to render `RT_FLOW SESSION_OPEN ... action=deny ...`, which misread a
+  successful permit-and-open as a drop. Both create renderers now omit
+  action: the standard line (`formatSyslogMsg`, keyed on
+  `Type == "SESSION_OPEN"` — `eventTypeName(eventTypeSessionOpen)`) drops
+  the `action=` field and keeps `proto/policy/zone`; the structured line
+  (`formatStructuredMsg` `RT_FLOW_SESSION_CREATE`) never carried one. The
+  omission is scoped to the open event type only — POLICY_DENY,
+  SCREEN_DROP, and FILTER_LOG (the genuine deny/reject paths) still render
+  `action`. Golden coverage: `session_create_format_test.go`.
 - `pkg/dataplane/userspace/eventstream_test.go` owns the deterministic
   local syslog harness for userspace RT_FLOW policy-deny, screen-drop, and
   filter-log frames. It sends raw event-stream frames through
