@@ -277,6 +277,23 @@ pub(crate) struct ProcessStatus {
     /// for backward compatibility.
     #[serde(rename = "gre_encap_df_oversize_drops_total", default)]
     pub gre_encap_df_oversize_drops_total: u64,
+    /// #2472: locally-generated ICMP Time Exceeded / PTB / `reject` replies
+    /// dropped because the per-reason token bucket was empty. Each reason has
+    /// an independent global-per-reason bucket (Linux `icmp_msgs_per_sec`
+    /// model, default 1000/s + 1000 burst) so an error-amplification /
+    /// reflection flood (low-TTL stream, oversized-DF flood, rejected-flow
+    /// flood, or a routing loop) cannot drive unbounded generated-error
+    /// emission. Surfaced as the Prometheus counters
+    /// `xpf_userspace_time_exceeded_rate_limited_total`,
+    /// `xpf_userspace_packet_too_big_rate_limited_total`, and
+    /// `xpf_userspace_reject_rate_limited_total`. Additive / defaulted for
+    /// backward compatibility.
+    #[serde(rename = "time_exceeded_rate_limited_total", default)]
+    pub time_exceeded_rate_limited_total: u64,
+    #[serde(rename = "packet_too_big_rate_limited_total", default)]
+    pub packet_too_big_rate_limited_total: u64,
+    #[serde(rename = "reject_rate_limited_total", default)]
+    pub reject_rate_limited_total: u64,
     /// #1782 cold-start capture instrumentation. Debug dump of every key
     /// present in the userspace `dynamic_neighbors` mirror, rendered as
     /// `"ifindex ip"` strings. The capture harness greps this at the
