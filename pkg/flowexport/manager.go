@@ -659,6 +659,15 @@ type FlowRecord struct {
 	SrcMask   uint8
 	DstMask   uint8
 	IsIPv6    bool
+	// #2526: post-NAT (translated) tuple — RFC 5103 / RFC 8158. These are
+	// ALWAYS populated by ExportSessionClose: when the flow carried no NAT
+	// the converter copies the pre-NAT tuple here (post == pre), matching
+	// Junos/vSRX behaviour where the post-NAT IPFIX/NetFlow fields are
+	// non-optional template fields present in every record.
+	NATSrcIP   net.IP
+	NATDstIP   net.IP
+	NATSrcPort uint16
+	NATDstPort uint16
 }
 
 // SessionCloseData holds parsed session data for flow export.
@@ -669,6 +678,15 @@ type SessionCloseData struct {
 	DstPort  uint16
 	Protocol uint8
 	IsIPv6   bool
+	// #2526: post-NAT translated tuple parsed from the SESSION_CLOSE event's
+	// NATSrcAddr/NATDstAddr by the daemon callback. A nil/unspecified NAT IP
+	// (or zero port) means the dataplane reported no translation for that
+	// half of the tuple; ExportSessionClose then falls back to the pre-NAT
+	// value so the exported post-NAT field equals the pre-NAT field.
+	NATSrcIP   net.IP
+	NATDstIP   net.IP
+	NATSrcPort uint16
+	NATDstPort uint16
 }
 
 // flowStartTime resolves the flow record StartTime for a session-close event.
@@ -696,6 +714,48 @@ func flowStartTime(rec logging.EventRecord, proto uint8) (time.Time, bool) {
 		return created, false
 	}
 	return rec.Time.Add(-estimateSessionDuration(rec.SessionPkts, proto)), true
+}
+
+// resolvePostNAT returns the post-NAT tuple for a flow record, falling back
+// to the pre-NAT 5-tuple for any half the dataplane did not translate
+// (#2526). The post-NAT IPFIX/NetFlow fields are non-optional template
+// fields, so every record MUST carry them; when no NAT applied we export
+// post == pre (Junos/vSRX behaviour) rather than zeros, so a collector
+// always sees a usable translated tuple and a NAT'd flow is distinguishable
+// from a non-NAT'd flow by post != pre.
+//
+// A NAT IP is treated as "absent" when it is nil or the unspecified address
+// (the dataplane fills 0.0.0.0 / :: when it has no translation to report); a
+// NAT port is treated as absent when zero. The address and port fall back
+// independently so a flow with only address translation (or only port
+// translation) reports the translated half and the pre-NAT other half.
+func resolvePostNAT(srcIP, dstIP net.IP, srcPort, dstPort uint16,
+	natSrcIP, natDstIP net.IP, natSrcPort, natDstPort uint16,
+) (rSrcIP, rDstIP net.IP, rSrcPort, rDstPort uint16) {
+	rSrcIP = srcIP
+	if !natIPAbsent(natSrcIP) {
+		rSrcIP = natSrcIP
+	}
+	rDstIP = dstIP
+	if !natIPAbsent(natDstIP) {
+		rDstIP = natDstIP
+	}
+	rSrcPort = srcPort
+	if natSrcPort != 0 {
+		rSrcPort = natSrcPort
+	}
+	rDstPort = dstPort
+	if natDstPort != 0 {
+		rDstPort = natDstPort
+	}
+	return
+}
+
+// natIPAbsent reports whether a parsed NAT IP carries no usable translation:
+// nil, or the unspecified address (0.0.0.0 / ::), which the dataplane emits
+// when the flow was not address-translated on that half.
+func natIPAbsent(ip net.IP) bool {
+	return ip == nil || ip.IsUnspecified()
 }
 
 // estimateSessionDuration provides a rough duration estimate based on packet count.

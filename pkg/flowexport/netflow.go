@@ -34,6 +34,16 @@ const (
 	fieldIPv6DstMask   = 30
 	fieldDirection     = 61
 	fieldIPv4Ident     = 54
+	// RFC 5103 / RFC 8158 post-NAT (translated) tuple. NetFlow v9 templates
+	// carry the same IANA element type IDs as IPFIX (#2526). IPv4 addresses
+	// 225/226 (4B), transport ports 227/228 (2B, family-agnostic), IPv6
+	// addresses 281/282 (16B).
+	fieldPostNatSrcIPv4   = 225
+	fieldPostNatDstIPv4   = 226
+	fieldPostNapatSrcPort = 227
+	fieldPostNapatDstPort = 228
+	fieldPostNatSrcIPv6   = 281
+	fieldPostNatDstIPv6   = 282
 )
 
 // Template IDs for IPv4 and IPv6.
@@ -77,6 +87,11 @@ var (
 		{fieldLastSwitched, 4},
 		{fieldSrcMask, 1},
 		{fieldDstMask, 1},
+		// #2526: post-NAT (translated) tuple, appended last.
+		{fieldPostNatSrcIPv4, 4},
+		{fieldPostNatDstIPv4, 4},
+		{fieldPostNapatSrcPort, 2},
+		{fieldPostNapatDstPort, 2},
 	}
 	netflowTemplateFieldsV4NoDir = []templateField{
 		{fieldIPv4SrcAddr, 4},
@@ -94,6 +109,11 @@ var (
 		{fieldLastSwitched, 4},
 		{fieldSrcMask, 1},
 		{fieldDstMask, 1},
+		// #2526: post-NAT (translated) tuple, appended last.
+		{fieldPostNatSrcIPv4, 4},
+		{fieldPostNatDstIPv4, 4},
+		{fieldPostNapatSrcPort, 2},
+		{fieldPostNapatDstPort, 2},
 	}
 	netflowTemplateFieldsV6 = []templateField{
 		{fieldIPv6SrcAddr, 16},
@@ -112,6 +132,11 @@ var (
 		{fieldLastSwitched, 4},
 		{fieldIPv6SrcMask, 1},
 		{fieldIPv6DstMask, 1},
+		// #2526: post-NAT (translated) tuple, appended last (v6 addrs 16B).
+		{fieldPostNatSrcIPv6, 16},
+		{fieldPostNatDstIPv6, 16},
+		{fieldPostNapatSrcPort, 2},
+		{fieldPostNapatDstPort, 2},
 	}
 	netflowTemplateFieldsV6NoDir = []templateField{
 		{fieldIPv6SrcAddr, 16},
@@ -129,6 +154,11 @@ var (
 		{fieldLastSwitched, 4},
 		{fieldIPv6SrcMask, 1},
 		{fieldIPv6DstMask, 1},
+		// #2526: post-NAT (translated) tuple, appended last (v6 addrs 16B).
+		{fieldPostNatSrcIPv6, 16},
+		{fieldPostNatDstIPv6, 16},
+		{fieldPostNapatSrcPort, 2},
+		{fieldPostNapatDstPort, 2},
 	}
 )
 
@@ -335,6 +365,23 @@ func encodeRecordV4(b []byte, off int, r FlowRecord, bootTime time.Time,
 	off++
 	b[off] = r.DstMask
 	off++
+	// #2526: post-NAT (translated) tuple — 225/226/227/228.
+	natSrc4 := r.NATSrcIP.To4()
+	natDst4 := r.NATDstIP.To4()
+	if natSrc4 == nil {
+		natSrc4 = net.IPv4zero.To4()
+	}
+	if natDst4 == nil {
+		natDst4 = net.IPv4zero.To4()
+	}
+	copy(b[off:off+4], natSrc4)
+	off += 4
+	copy(b[off:off+4], natDst4)
+	off += 4
+	binary.BigEndian.PutUint16(b[off:off+2], r.NATSrcPort)
+	off += 2
+	binary.BigEndian.PutUint16(b[off:off+2], r.NATDstPort)
+	off += 2
 	return startOff + recSize
 }
 
@@ -384,6 +431,23 @@ func encodeRecordV6(b []byte, off int, r FlowRecord, bootTime time.Time,
 	off++
 	b[off] = r.DstMask
 	off++
+	// #2526: post-NAT (translated) tuple — 281/282 (16B) + 227/228 (2B).
+	natSrc16 := r.NATSrcIP.To16()
+	natDst16 := r.NATDstIP.To16()
+	if natSrc16 == nil {
+		natSrc16 = net.IPv6zero
+	}
+	if natDst16 == nil {
+		natDst16 = net.IPv6zero
+	}
+	copy(b[off:off+16], natSrc16)
+	off += 16
+	copy(b[off:off+16], natDst16)
+	off += 16
+	binary.BigEndian.PutUint16(b[off:off+2], r.NATSrcPort)
+	off += 2
+	binary.BigEndian.PutUint16(b[off:off+2], r.NATDstPort)
+	off += 2
 	return startOff + recSize
 }
 
@@ -486,17 +550,27 @@ func (e *Exporter) ExportSessionClose(rec logging.EventRecord, evt SessionCloseD
 	if usedEstimate {
 		e.estimatedDurations.Add(1)
 	}
+	// #2526: resolve the post-NAT tuple with pre-NAT fallback so every
+	// exported record carries the RFC 5103 post-NAT fields (post == pre when
+	// the flow was not translated).
+	natSrcIP, natDstIP, natSrcPort, natDstPort := resolvePostNAT(
+		evt.SrcIP, evt.DstIP, evt.SrcPort, evt.DstPort,
+		evt.NATSrcIP, evt.NATDstIP, evt.NATSrcPort, evt.NATDstPort)
 	fr := FlowRecord{
-		SrcIP:     evt.SrcIP,
-		DstIP:     evt.DstIP,
-		SrcPort:   evt.SrcPort,
-		DstPort:   evt.DstPort,
-		Protocol:  evt.Protocol,
-		Packets:   rec.SessionPkts,
-		Bytes:     rec.SessionBytes,
-		StartTime: startTime,
-		EndTime:   rec.Time,
-		IsIPv6:    evt.IsIPv6,
+		SrcIP:      evt.SrcIP,
+		DstIP:      evt.DstIP,
+		SrcPort:    evt.SrcPort,
+		DstPort:    evt.DstPort,
+		Protocol:   evt.Protocol,
+		Packets:    rec.SessionPkts,
+		Bytes:      rec.SessionBytes,
+		StartTime:  startTime,
+		EndTime:    rec.Time,
+		IsIPv6:     evt.IsIPv6,
+		NATSrcIP:   natSrcIP,
+		NATDstIP:   natDstIP,
+		NATSrcPort: natSrcPort,
+		NATDstPort: natDstPort,
 	}
 
 	e.batch.add(fr)

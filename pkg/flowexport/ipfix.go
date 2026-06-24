@@ -30,6 +30,17 @@ const (
 	ipfixApplicationId            = 95
 	ipfixFlowStartMilliseconds    = 152
 	ipfixFlowEndMilliseconds      = 153
+	// RFC 5103 post-NAT (translated) tuple elements. IPv4 addresses 225/226
+	// (ipv4Address, 4B); transport ports 227/228 (unsigned16, 2B), which are
+	// family-agnostic and reused for IPv6. IPv6 addresses 281/282
+	// (ipv6Address, 16B) per RFC 8158. Confirmed against the IANA "IP Flow
+	// Information Export (IPFIX) Entities" registry (#2526).
+	ipfixPostNatSourceIPv4Address      = 225
+	ipfixPostNatDestinationIPv4Address = 226
+	ipfixPostNapatSourceTransportPort  = 227
+	ipfixPostNapatDestTransportPort    = 228
+	ipfixPostNatSourceIPv6Address      = 281
+	ipfixPostNatDestinationIPv6Address = 282
 )
 
 // IPFIX Set IDs (RFC 7011 Section 3.3.2).
@@ -67,6 +78,11 @@ var ipfixTemplateV4 = []ipfixField{
 	{ipfixOctetDeltaCount, 8},
 	{ipfixFlowStartMilliseconds, 8},
 	{ipfixFlowEndMilliseconds, 8},
+	// #2526: post-NAT (translated) tuple, appended last.
+	{ipfixPostNatSourceIPv4Address, 4},
+	{ipfixPostNatDestinationIPv4Address, 4},
+	{ipfixPostNapatSourceTransportPort, 2},
+	{ipfixPostNapatDestTransportPort, 2},
 }
 
 // ipfixTemplateV6 defines the IPv6 IPFIX template fields.
@@ -85,15 +101,44 @@ var ipfixTemplateV6 = []ipfixField{
 	{ipfixOctetDeltaCount, 8},
 	{ipfixFlowStartMilliseconds, 8},
 	{ipfixFlowEndMilliseconds, 8},
+	// #2526: post-NAT (translated) tuple, appended last. v6 addresses use the
+	// 16-byte RFC 8158 elements; ports reuse the family-agnostic 227/228.
+	{ipfixPostNatSourceIPv6Address, 16},
+	{ipfixPostNatDestinationIPv6Address, 16},
+	{ipfixPostNapatSourceTransportPort, 2},
+	{ipfixPostNapatDestTransportPort, 2},
 }
 
 // ipfixRecordSizeV4 is the byte size of a single IPv4 IPFIX data record.
-// 4+4+2+2+1+1+2+1+4+4+8+8+8+8 = 57
-const ipfixRecordSizeV4 = 57
+// pre-NAT 5-tuple + meta + counters + timestamps = 57; #2526 post-NAT tuple
+// (4+4+2+2) = 12 → 69.
+// 4+4+2+2+1+1+2+1+4+4+8+8+8+8 + 4+4+2+2 = 69
+const ipfixRecordSizeV4 = 69
 
 // ipfixRecordSizeV6 is the byte size of a single IPv6 IPFIX data record.
-// 16+16+2+2+1+1+2+1+4+4+8+8+8+8 = 81
-const ipfixRecordSizeV6 = 81
+// pre-NAT body = 81; #2526 post-NAT tuple (16+16+2+2) = 36 → 117.
+// 16+16+2+2+1+1+2+1+4+4+8+8+8+8 + 16+16+2+2 = 117
+const ipfixRecordSizeV6 = 117
+
+// ipfixRecordSizeV4 / V6 must equal the sum of their template field lengths.
+// A drift between the template (what the collector parses) and the encoder
+// (record size) corrupts every record — pin it at build time (#2526).
+var _ = func() struct{} {
+	sum := func(fs []ipfixField) int {
+		n := 0
+		for _, f := range fs {
+			n += int(f.length)
+		}
+		return n
+	}
+	if sum(ipfixTemplateV4) != ipfixRecordSizeV4 {
+		panic("ipfixRecordSizeV4 != sum(ipfixTemplateV4)")
+	}
+	if sum(ipfixTemplateV6) != ipfixRecordSizeV6 {
+		panic("ipfixRecordSizeV6 != sum(ipfixTemplateV6)")
+	}
+	return struct{}{}
+}()
 
 // ipfixHeader is the 16-byte IPFIX message header (RFC 7011 Section 3.1).
 type ipfixHeader struct {
@@ -238,6 +283,23 @@ func encodeIPFIXRecordV4(b []byte, off int, r FlowRecord) int {
 	off += 8
 	binary.BigEndian.PutUint64(b[off:off+8], uint64(r.EndTime.UnixMilli()))
 	off += 8
+	// #2526: post-NAT (translated) tuple — 225/226/227/228.
+	natSrc4 := r.NATSrcIP.To4()
+	natDst4 := r.NATDstIP.To4()
+	if natSrc4 == nil {
+		natSrc4 = net.IPv4zero.To4()
+	}
+	if natDst4 == nil {
+		natDst4 = net.IPv4zero.To4()
+	}
+	copy(b[off:off+4], natSrc4)
+	off += 4
+	copy(b[off:off+4], natDst4)
+	off += 4
+	binary.BigEndian.PutUint16(b[off:off+2], r.NATSrcPort)
+	off += 2
+	binary.BigEndian.PutUint16(b[off:off+2], r.NATDstPort)
+	off += 2
 	return off
 }
 
@@ -278,6 +340,23 @@ func encodeIPFIXRecordV6(b []byte, off int, r FlowRecord) int {
 	off += 8
 	binary.BigEndian.PutUint64(b[off:off+8], uint64(r.EndTime.UnixMilli()))
 	off += 8
+	// #2526: post-NAT (translated) tuple — 281/282 (16B) + 227/228 (2B).
+	natSrc16 := r.NATSrcIP.To16()
+	natDst16 := r.NATDstIP.To16()
+	if natSrc16 == nil {
+		natSrc16 = net.IPv6zero
+	}
+	if natDst16 == nil {
+		natDst16 = net.IPv6zero
+	}
+	copy(b[off:off+16], natSrc16)
+	off += 16
+	copy(b[off:off+16], natDst16)
+	off += 16
+	binary.BigEndian.PutUint16(b[off:off+2], r.NATSrcPort)
+	off += 2
+	binary.BigEndian.PutUint16(b[off:off+2], r.NATDstPort)
+	off += 2
 	return off
 }
 
@@ -351,17 +430,27 @@ func (e *IPFIXExporter) ExportSessionClose(rec logging.EventRecord, evt SessionC
 	if usedEstimate {
 		e.estimatedDurations.Add(1)
 	}
+	// #2526: resolve the post-NAT tuple with pre-NAT fallback so every
+	// exported record carries the RFC 5103 / RFC 8158 post-NAT fields
+	// (post == pre when the flow was not translated).
+	natSrcIP, natDstIP, natSrcPort, natDstPort := resolvePostNAT(
+		evt.SrcIP, evt.DstIP, evt.SrcPort, evt.DstPort,
+		evt.NATSrcIP, evt.NATDstIP, evt.NATSrcPort, evt.NATDstPort)
 	fr := FlowRecord{
-		SrcIP:     evt.SrcIP,
-		DstIP:     evt.DstIP,
-		SrcPort:   evt.SrcPort,
-		DstPort:   evt.DstPort,
-		Protocol:  evt.Protocol,
-		Packets:   rec.SessionPkts,
-		Bytes:     rec.SessionBytes,
-		StartTime: startTime,
-		EndTime:   rec.Time,
-		IsIPv6:    evt.IsIPv6,
+		SrcIP:      evt.SrcIP,
+		DstIP:      evt.DstIP,
+		SrcPort:    evt.SrcPort,
+		DstPort:    evt.DstPort,
+		Protocol:   evt.Protocol,
+		Packets:    rec.SessionPkts,
+		Bytes:      rec.SessionBytes,
+		StartTime:  startTime,
+		EndTime:    rec.Time,
+		IsIPv6:     evt.IsIPv6,
+		NATSrcIP:   natSrcIP,
+		NATDstIP:   natDstIP,
+		NATSrcPort: natSrcPort,
+		NATDstPort: natDstPort,
 	}
 
 	e.batch.add(fr)

@@ -59,6 +59,52 @@ bumps a per-exporter `EstimatedDurations()` counter so operators can see
 how often the heuristic is still in play. The byte/packet **volume**
 counters remain 0 pending #2501 — only the timing is now real.
 
+**#2526 — the exporters now carry the post-NAT (translated) tuple.**
+Before #2526 both the NetFlow v9 and IPFIX templates/encoders exported
+only the pre-NAT 5-tuple, so a collector saw the private endpoint of a
+NAT'd flow but never the public translated address/port — no NAT
+correlation for security audit / compliance / forensics. The
+SESSION_CLOSE `logging.EventRecord` already carried the translated tuple
+(`NATSrcAddr`/`NATDstAddr`); the daemon callbacks
+(`daemon_flowexport.go`) now parse it into `SessionCloseData.NAT{Src,Dst}{IP,Port}`
+and `ExportSessionClose` resolves the post-NAT tuple (`resolvePostNAT`,
+`manager.go`) onto `FlowRecord.NAT{Src,Dst}{IP,Port}`.
+
+The exported elements (IANA "IPFIX Entities" registry, RFC 5103 /
+RFC 8158) are appended LAST in every template:
+
+| Element | ID | Type | Bytes | Family |
+|---|---|---|---|---|
+| postNATSourceIPv4Address | 225 | ipv4Address | 4 | v4 |
+| postNATDestinationIPv4Address | 226 | ipv4Address | 4 | v4 |
+| postNAPTSourceTransportPort | 227 | unsigned16 | 2 | both |
+| postNAPTDestinationTransportPort | 228 | unsigned16 | 2 | both |
+| postNATSourceIPv6Address | 281 | ipv6Address | 16 | v6 |
+| postNATDestinationIPv6Address | 282 | ipv6Address | 16 | v6 |
+
+NetFlow v9 reuses the same IANA element type IDs in its template
+FlowSet. The IPv4 IPFIX record grows 57→69 bytes, the IPv6 record 81→117
+bytes; the NetFlow v9 record sizes derive from the template via
+`recordSize` (4-byte padded), so they grow automatically. An init-time
+assertion in `ipfix.go` pins `ipfixRecordSizeV4/V6` to the sum of their
+template field lengths so a template/encoder length drift fails the
+process at startup (a mismatch would corrupt every record). Golden
+byte-level encoder tests (`postnat_test.go`) pin the field offsets/values
+and the template/encoder length agreement for v4 and v6 on both exporters.
+
+**Zero-NAT decision: post == pre (Junos/vSRX behaviour).** The post-NAT
+elements are non-optional template fields, so every record of a template
+MUST carry them — they cannot be conditionally omitted per-record without
+a second template. When a flow was not translated (the dataplane reports
+the unspecified address `0.0.0.0` / `::` and port 0 for that half), the
+converter copies the pre-NAT value into the post-NAT field so the
+collector always receives a usable tuple, matching Junos/vSRX (which
+always emits the post-NAT fields). The address and port halves fall back
+independently, so an address-only or port-only translation reports the
+translated half and the pre-NAT other half. A collector distinguishes a
+NAT'd flow from a non-NAT'd flow by post != pre. Volume counters remain 0
+pending #2501.
+
 ## File layout
 
 The package is split by responsibility (#1988):

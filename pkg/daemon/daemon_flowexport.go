@@ -363,6 +363,12 @@ func (d *Daemon) flowExportCallback(rec logging.EventRecord, raw []byte) {
 		Protocol: parseProtocol(rec.Protocol),
 	}
 	sd.SrcIP, sd.DstIP, sd.IsIPv6 = parseAddrPair(rec.SrcAddr, rec.DstAddr)
+	// #2526: parse the post-NAT translated tuple; the exporter falls back to
+	// the pre-NAT tuple for any half that is absent/unspecified.
+	sd.NATSrcIP = parseHost(rec.NATSrcAddr)
+	sd.NATDstIP = parseHost(rec.NATDstAddr)
+	sd.NATSrcPort = parseSrcPort(rec.NATSrcAddr)
+	sd.NATDstPort = parseSrcPort(rec.NATDstAddr)
 
 	i := 0
 	for i < len(b.groups) {
@@ -399,6 +405,12 @@ func (d *Daemon) ipfixExportCallback(rec logging.EventRecord, raw []byte) {
 		Protocol: parseProtocol(rec.Protocol),
 	}
 	sd.SrcIP, sd.DstIP, sd.IsIPv6 = parseAddrPair(rec.SrcAddr, rec.DstAddr)
+	// #2526: parse the post-NAT translated tuple; the exporter falls back to
+	// the pre-NAT tuple for any half that is absent/unspecified.
+	sd.NATSrcIP = parseHost(rec.NATSrcAddr)
+	sd.NATDstIP = parseHost(rec.NATDstAddr)
+	sd.NATSrcPort = parseSrcPort(rec.NATSrcAddr)
+	sd.NATDstPort = parseSrcPort(rec.NATDstAddr)
 
 	i := 0
 	for i < len(b.groups) {
