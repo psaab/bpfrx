@@ -3,6 +3,7 @@ package userspace
 import (
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -180,5 +181,57 @@ func TestInjectPacketEmitOnWireRejectsLegacyRemoteRequestMetadata(t *testing.T) 
 	}
 	if !strings.Contains(err.Error(), "request requires tuple metadata version") {
 		t.Fatalf("error = %v, want request tuple metadata failure", err)
+	}
+}
+
+// #2443: packet-length bound — over-max is rejected (not clamped); a
+// length at or below the maximum, and the default, are accepted.
+
+func TestBuildInjectPacketRequestRejectsOverMaxPacketLength(t *testing.T) {
+	_, err := BuildInjectPacketRequest(7, "valid", map[string]string{
+		"packet-length": "100000",
+	}, ProcessStatus{})
+	if err == nil {
+		t.Fatal("BuildInjectPacketRequest accepted an over-max packet-length")
+	}
+	if !strings.Contains(err.Error(), "exceeds maximum") {
+		t.Fatalf("error = %v, want exceeds-maximum failure", err)
+	}
+}
+
+func TestBuildInjectPacketRequestAcceptsPacketLengthAtMax(t *testing.T) {
+	req, err := BuildInjectPacketRequest(7, "valid", map[string]string{
+		"packet-length": strconv.Itoa(MaxInjectPacketLength),
+	}, ProcessStatus{})
+	if err != nil {
+		t.Fatalf("BuildInjectPacketRequest at max: %v", err)
+	}
+	if req.PacketLength != MaxInjectPacketLength {
+		t.Fatalf("PacketLength = %d, want %d", req.PacketLength, MaxInjectPacketLength)
+	}
+}
+
+func TestBuildInjectPacketRequestDefaultLengthAccepted(t *testing.T) {
+	req, err := BuildInjectPacketRequest(7, "valid", map[string]string{}, ProcessStatus{})
+	if err != nil {
+		t.Fatalf("BuildInjectPacketRequest default: %v", err)
+	}
+	if req.PacketLength != 128 {
+		t.Fatalf("default PacketLength = %d, want 128", req.PacketLength)
+	}
+	if req.PacketLength > MaxInjectPacketLength {
+		t.Fatalf("default PacketLength %d exceeds max %d", req.PacketLength, MaxInjectPacketLength)
+	}
+}
+
+func TestBuildInjectPacketRequestRejectsMalformedPacketLength(t *testing.T) {
+	_, err := BuildInjectPacketRequest(7, "valid", map[string]string{
+		"packet-length": "notanumber",
+	}, ProcessStatus{})
+	if err == nil {
+		t.Fatal("BuildInjectPacketRequest accepted a non-numeric packet-length")
+	}
+	if !strings.Contains(err.Error(), "invalid packet-length") {
+		t.Fatalf("error = %v, want invalid packet-length failure", err)
 	}
 }
