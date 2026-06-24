@@ -24,8 +24,16 @@ and resolves session display names from the dataplane's assigned `app_id`.
   the matched `app_id` on each new session.
 - `ResolveSessionName(appNames map[uint16]string, cfg *config.Config, proto uint8, dstPort uint16, appID uint16) string` —
   `runtime.go`. Lookup order: dataplane `app_id` (authoritative from
-  BPF) → exact `(proto, dstPort)` match → narrow built-in fallback
-  (`junos-http`, `junos-ssh`, …). When AppID is **enabled** in
+  BPF) → user-configured app tuple match (`resolveTupleFallback` →
+  `matchTuple`) → narrow built-in fallback (`junos-http`, `junos-ssh`,
+  …). Tuple matching requires the configured protocol to match; if the
+  app also sets a `destination-port` (single or `lo-hi` range), the port
+  must match too. A **protocol-only** custom app — one with a `protocol`
+  but no `destination-port`, e.g. a user-defined GRE/ESP/AH application —
+  matches on protocol alone (#2548; before that fix `matchTuple`
+  rejected an empty port, so protocol-only apps never matched and their
+  sessions reported `UNKNOWN`). An app with neither protocol nor port is
+  never a match-all. When AppID is **enabled** in
   `services.application-identification` and the dataplane has not
   assigned an `app_id` for the session (`appID == 0`), the function
   returns `UNKNOWN` rather than guessing from port heuristics. Used
