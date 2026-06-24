@@ -149,6 +149,17 @@ pub(crate) struct FilterTerm {
     pub(crate) icmp_type: Option<u8>,
     pub(crate) icmp_code: Option<u8>,
     pub(crate) action: FilterAction,
+    // #2544: fall-through. When true, this term carries NO terminating action
+    // (an explicit `then next term` OR a modifier-only term). On a MATCH the
+    // evaluator applies the term's modifiers (count, log, forwarding-class,
+    // policer, dscp) and then CONTINUES to the next term instead of returning —
+    // Junos fall-through semantics. `action` is left as Accept (the historical
+    // empty-action mapping) but is never returned for a matched fall-through
+    // term; it only takes effect as the default if NO later term terminates and
+    // no term matched (handled by the trailing default). A term with a
+    // terminating action (accept/reject/discard) has this false and returns on
+    // match as before.
+    pub(crate) continue_term: bool,
     pub(crate) count: String,
     pub(crate) has_count: bool,
     pub(crate) log: bool,

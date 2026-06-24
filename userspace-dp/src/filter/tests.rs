@@ -47,6 +47,7 @@ fn basic_accept_discard() {
                     destination_ports: vec!["22".into()],
                     dscp_values: vec![],
                     action: "discard".into(),
+                    next_term: false,
                     count: String::new(),
                     log: false,
                     policer: String::new(),
@@ -71,6 +72,7 @@ fn basic_accept_discard() {
                     destination_ports: vec![],
                     dscp_values: vec![],
                     action: "accept".into(),
+                    next_term: false,
                     count: String::new(),
                     log: false,
                     policer: String::new(),
@@ -276,6 +278,7 @@ fn port_range_matching() {
                 destination_ports: vec!["1024-65535".into()],
                 dscp_values: vec![],
                 action: "discard".into(),
+                next_term: false,
                 count: String::new(),
                 log: false,
                 policer: String::new(),
@@ -338,6 +341,7 @@ fn protocol_matching() {
                 destination_ports: vec![],
                 dscp_values: vec![],
                 action: "discard".into(),
+                next_term: false,
                 count: String::new(),
                 log: false,
                 policer: String::new(),
@@ -400,6 +404,7 @@ fn dscp_rewrite_action() {
                 destination_ports: vec!["5060".into()],
                 dscp_values: vec![],
                 action: "accept".into(),
+                next_term: false,
                 count: String::new(),
                 log: false,
                 policer: String::new(),
@@ -448,6 +453,7 @@ fn dscp_rewrite_action_allows_default_zero() {
                 destination_ports: vec!["5060".into()],
                 dscp_values: vec![],
                 action: "accept".into(),
+                next_term: false,
                 count: String::new(),
                 log: false,
                 policer: String::new(),
@@ -1311,6 +1317,7 @@ fn multiple_terms_first_match_wins() {
                     destination_ports: vec!["53".into()],
                     dscp_values: vec![],
                     action: "accept".into(),
+                    next_term: false,
                     count: String::new(),
                     log: false,
                     policer: String::new(),
@@ -1335,6 +1342,7 @@ fn multiple_terms_first_match_wins() {
                     destination_ports: vec![],
                     dscp_values: vec![],
                     action: "discard".into(),
+                    next_term: false,
                     count: String::new(),
                     log: false,
                     policer: String::new(),
@@ -1398,6 +1406,7 @@ fn source_dest_address_matching() {
                 destination_ports: vec![],
                 dscp_values: vec![],
                 action: "discard".into(),
+                next_term: false,
                 count: String::new(),
                 log: false,
                 policer: String::new(),
@@ -4761,4 +4770,268 @@ fn except_v4_list_does_not_constrain_v6_packet() {
         TermMatchExtra::default(),
     );
     assert_eq!(r.action, FilterAction::Discard);
+}
+
+// ---------------------------------------------------------------------------
+// #2544: firewall-filter fall-through. A term whose `then` carries NO
+// terminating action — either an explicit `then next term` (Action == "",
+// next_term == true) OR a modifier-only term (only count/log/forwarding-class/
+// policer/dscp) — must APPLY its modifiers and FALL THROUGH to the next term
+// (Junos), instead of terminating as Accept and short-circuiting the loop.
+//
+// Pre-fix (master): the empty action compiled to FilterAction::Accept and the
+// evaluator returned on the first match, so a packet matching a fall-through
+// term was ACCEPTED at that term and a later `discard` term was never reached.
+// These tests FAIL on master (assert Discard, master returns Accept) and pass
+// with continue_term wired through.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn fallthrough_explicit_next_term_reaches_later_discard() {
+    let state = make_filter_state(
+        &[FirewallFilterSnapshot {
+            name: "ft".into(),
+            family: "inet".into(),
+            terms: vec![
+                // term1: matches the test 5-tuple, `then next term` (no
+                // terminating action) -> must fall through.
+                FirewallTermSnapshot {
+                    name: "count-then-next".into(),
+                    protocols: vec!["tcp".into()],
+                    destination_ports: vec!["80".into()],
+                    action: String::new(),
+                    next_term: true,
+                    count: "ft-hits".into(),
+                    ..Default::default()
+                },
+                // term2: same match, discards.
+                FirewallTermSnapshot {
+                    name: "drop-web".into(),
+                    protocols: vec!["tcp".into()],
+                    destination_ports: vec!["80".into()],
+                    action: "discard".into(),
+                    ..Default::default()
+                },
+            ],
+        }],
+        &[],
+    );
+    let r = evaluate_filter_counted(
+        &state,
+        "inet:ft",
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+        PROTO_TCP,
+        40000,
+        80,
+        0,
+        TermMatchExtra::default(),
+        1400,
+    );
+    // Fell through term1 (Accept on master) and was discarded by term2.
+    assert_eq!(r.action, FilterAction::Discard);
+    // Modifier (count) on the fall-through term still applied.
+    let filter = state.filters.get("inet:ft").expect("filter");
+    assert_eq!(filter.terms[0].counter.packets.load(Ordering::Relaxed), 1);
+    assert_eq!(filter.terms[0].counter.bytes.load(Ordering::Relaxed), 1400);
+}
+
+#[test]
+fn fallthrough_modifier_only_term_reaches_later_discard() {
+    // A modifier-only term: empty action, NO explicit next_term flag set on the
+    // snapshot. The compiler still treats an empty terminating action as
+    // fall-through (continue_term true), matching Junos implicit fall-through.
+    let state = make_filter_state(
+        &[FirewallFilterSnapshot {
+            name: "mo".into(),
+            family: "inet".into(),
+            terms: vec![
+                FirewallTermSnapshot {
+                    name: "count-only".into(),
+                    protocols: vec!["tcp".into()],
+                    destination_ports: vec!["80".into()],
+                    action: String::new(),
+                    next_term: false, // modifier-only, no explicit `next term`
+                    count: "mo-hits".into(),
+                    ..Default::default()
+                },
+                FirewallTermSnapshot {
+                    name: "drop-web".into(),
+                    protocols: vec!["tcp".into()],
+                    destination_ports: vec!["80".into()],
+                    action: "discard".into(),
+                    ..Default::default()
+                },
+            ],
+        }],
+        &[],
+    );
+    // Confirm the compiler marked term0 as fall-through.
+    let filter = state.filters.get("inet:mo").expect("filter");
+    assert!(
+        filter.terms[0].continue_term,
+        "modifier-only term must compile to a fall-through term"
+    );
+    let r = evaluate_filter_counted(
+        &state,
+        "inet:mo",
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+        PROTO_TCP,
+        40000,
+        80,
+        0,
+        TermMatchExtra::default(),
+        1400,
+    );
+    assert_eq!(r.action, FilterAction::Discard);
+    assert_eq!(filter.terms[0].counter.packets.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn fallthrough_terminal_term_still_returns_immediately() {
+    // A terminating term (accept) must NOT over-continue: a matching accept term
+    // returns Accept even though a later discard term also matches.
+    let state = make_filter_state(
+        &[FirewallFilterSnapshot {
+            name: "term".into(),
+            family: "inet".into(),
+            terms: vec![
+                FirewallTermSnapshot {
+                    name: "accept-web".into(),
+                    protocols: vec!["tcp".into()],
+                    destination_ports: vec!["80".into()],
+                    action: "accept".into(),
+                    ..Default::default()
+                },
+                FirewallTermSnapshot {
+                    name: "drop-web".into(),
+                    protocols: vec!["tcp".into()],
+                    destination_ports: vec!["80".into()],
+                    action: "discard".into(),
+                    ..Default::default()
+                },
+            ],
+        }],
+        &[],
+    );
+    let r = evaluate_filter(
+        &state,
+        "inet:term",
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+        PROTO_TCP,
+        40000,
+        80,
+        0,
+        TermMatchExtra::default(),
+    );
+    assert_eq!(r.action, FilterAction::Accept);
+}
+
+#[test]
+fn fallthrough_no_later_match_uses_default_accept_with_modifiers() {
+    // term1 matches and falls through (count); term2 does NOT match. With no
+    // terminating term reached, the implicit default Accept applies, but the
+    // fall-through modifier (count) still fired.
+    let state = make_filter_state(
+        &[FirewallFilterSnapshot {
+            name: "ftd".into(),
+            family: "inet".into(),
+            terms: vec![
+                FirewallTermSnapshot {
+                    name: "count-next".into(),
+                    protocols: vec!["tcp".into()],
+                    destination_ports: vec!["80".into()],
+                    action: String::new(),
+                    next_term: true,
+                    count: "ftd-hits".into(),
+                    ..Default::default()
+                },
+                FirewallTermSnapshot {
+                    name: "drop-telnet".into(),
+                    protocols: vec!["tcp".into()],
+                    destination_ports: vec!["23".into()],
+                    action: "discard".into(),
+                    ..Default::default()
+                },
+            ],
+        }],
+        &[],
+    );
+    let r = evaluate_filter_counted(
+        &state,
+        "inet:ftd",
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+        PROTO_TCP,
+        40000,
+        80,
+        0,
+        TermMatchExtra::default(),
+        1400,
+    );
+    assert_eq!(r.action, FilterAction::Accept);
+    let filter = state.filters.get("inet:ftd").expect("filter");
+    assert_eq!(filter.terms[0].counter.packets.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn fallthrough_tx_selection_applies_forwarding_class_then_discards() {
+    // TX-selection path: a fall-through term sets a forwarding-class and falls
+    // through; a later term discards. The forwarding-class modifier is applied
+    // (accumulated) AND the terminal discard is honored.
+    let ifaces = vec![crate::InterfaceSnapshot {
+        name: "reth0.80".into(),
+        ifindex: 7,
+        filter_output_v4: "tx-ft".into(),
+        ..Default::default()
+    }];
+    let state = parse_filter_state(
+        &[FirewallFilterSnapshot {
+            name: "tx-ft".into(),
+            family: "inet".into(),
+            terms: vec![
+                FirewallTermSnapshot {
+                    name: "fc-next".into(),
+                    protocols: vec!["tcp".into()],
+                    destination_ports: vec!["80".into()],
+                    action: String::new(),
+                    next_term: true,
+                    forwarding_class: "expedited".into(),
+                    count: "tx-ft-hits".into(),
+                    ..Default::default()
+                },
+                FirewallTermSnapshot {
+                    name: "drop-web".into(),
+                    protocols: vec!["tcp".into()],
+                    destination_ports: vec!["80".into()],
+                    action: "discard".into(),
+                    ..Default::default()
+                },
+            ],
+        }],
+        &[],
+        &ifaces,
+        "",
+        "",
+    )
+    .expect("filter state compiles");
+    let result = evaluate_interface_output_filter_tx_selection_counted(
+        &state,
+        7,
+        false,
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)),
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2)),
+        PROTO_TCP,
+        40000,
+        80,
+        0,
+        TermMatchExtra::default(),
+        1514,
+    );
+    assert_eq!(result.action, FilterAction::Discard);
+    assert_eq!(result.forwarding_class, Some("expedited"));
+    let filter = state.filters.get("inet:tx-ft").expect("filter");
+    assert_eq!(filter.terms[0].counter.packets.load(Ordering::Relaxed), 1);
 }

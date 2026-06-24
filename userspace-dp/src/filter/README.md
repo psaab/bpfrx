@@ -58,6 +58,37 @@ Mirrors the BPF firewall-filter pipeline in userspace.
   three-color policer runtime shape, not by compiler-positional filter
   IDs, before deciding whether existing sessions need a conservative
   packet-family purge.
+
+  **Fall-through terms (`then next term` / modifier-only) (#2544).**
+  "First-match-wins" applies only to TERMINATING terms. A term whose
+  `then` carries NO terminating action — an explicit `then next term`
+  OR a modifier-only term (only `count`/`log`/`forwarding-class`/
+  `policer`/`dscp`) — must APPLY its modifiers and FALL THROUGH to the
+  next term, per Junos semantics. The Go control plane records this:
+  `buildFirewallFilterSnapshots` sets the wire field `next_term` true
+  for a term with `NextTerm` OR an empty `Action` (a routing-instance
+  PBR term is excluded — it takes its own routing decision). The Rust
+  compiler maps `next_term` (or a belt-and-suspenders empty action) to
+  `FilterTerm.continue_term`. Every per-term eval loop (`eval.rs`
+  standard/non-routing/routing-instance/log-match, `tx_selection.rs`
+  live, `cache_sensitive.rs` cached TX-selection) now: on a MATCH,
+  applies the term's modifiers (count/policer side effects fire, and
+  forwarding-class/dscp-rewrite/log/routing-instance accumulate into the
+  running result, latest matched term winning per scalar, `log` and
+  policer-drop OR'd); then, if `continue_term`, CONTINUES to the next
+  term instead of returning. A matched TERMINATING term sets the result
+  action and returns. If no term terminates, the accumulated modifiers
+  ride the implicit default Accept. Before #2544 the empty action
+  compiled to `FilterAction::Accept` and the loop returned on first
+  match, so a packet matching a fall-through term was ACCEPTED there and
+  a later `discard` was never reached. `continue_term` is compared in
+  `filter_term_semantics_match` (it flips terminate-vs-fall-through
+  without changing the parsed match vecs, so a flow-cache rebuild must
+  catch a `then next term` toggle). The cached TX-selection result holds
+  a single `counter` Arc, so when multiple matched fall-through terms
+  each carry `then count` the cached rebuild path records only the last
+  (a pre-existing structural limit; the uncached full-eval path counts
+  every term).
 - `policer.rs` — token-bucket implementation plus the #1375 RFC
   2697/2698 three-color meter core. Token math is integer-only:
   the legacy token bucket keeps its bits/sec constructor contract, and

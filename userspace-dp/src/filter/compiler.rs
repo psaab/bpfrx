@@ -454,14 +454,17 @@ fn parse_term(
         "accept" => FilterAction::Accept,
         "reject" => FilterAction::Reject,
         "discard" => FilterAction::Discard,
-        // #2399 (032-16): an EMPTY action is the legitimate "no terminating
-        // action" case — the term carries only modifiers (count/log/
-        // forwarding-class/...) and falls through to the next term, so it must
-        // NOT short-circuit to a terminating decision here (Accept preserves
-        // today's fall-through semantics). A NON-EMPTY but unrecognized action
-        // string, however, can only arrive from a mixed-version snapshot (the
-        // Go commit gate validateFilterActionsStrict now rejects an unknown
-        // `then` token before it is ever persisted). For a FIREWALL FILTER an
+        // #2399 (032-16) / #2544: an EMPTY action is the legitimate "no
+        // terminating action" case — the term carries only modifiers
+        // (count/log/forwarding-class/policer/dscp) and falls through to the
+        // next term. Map it to Accept as a PLACEHOLDER (the action field is
+        // never returned for a matched fall-through term — see continue_term
+        // below), but the real semantic is carried by FilterTerm.continue_term:
+        // the evaluator applies the modifiers and CONTINUES rather than
+        // short-circuiting to a terminating decision. A NON-EMPTY but
+        // unrecognized action string can only arrive from a mixed-version
+        // snapshot (the Go commit gate validateFilterActionsStrict rejects an
+        // unknown `then` token before it is persisted). For a FIREWALL FILTER an
         // unknown terminating action must fail CLOSED, never silently permit —
         // map it to Discard rather than Accept.
         "" => FilterAction::Accept,
@@ -508,6 +511,16 @@ fn parse_term(
         icmp_type: snap.icmp_type,
         icmp_code: snap.icmp_code,
         action,
+        // #2544: this term falls through (applies modifiers, continues to the
+        // next term) when it carries no terminating action. The Go control
+        // plane sets next_term for both the explicit `then next term` and the
+        // modifier-only case. We OR in `snap.action.is_empty()` as a belt-and-
+        // suspenders guard so an older Go control plane that omits next_term but
+        // sends an empty-action modifier-only term still falls through instead
+        // of terminating as Accept. A routing-instance (PBR) term takes its own
+        // routing decision and is NOT a fall-through even with an empty action.
+        continue_term: (snap.next_term || snap.action.is_empty())
+            && snap.routing_instance.is_empty(),
         count: snap.count.clone(),
         has_count: !snap.count.is_empty(),
         log: snap.log,
