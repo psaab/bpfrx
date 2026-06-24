@@ -158,6 +158,21 @@ authorization surface: every request is dropped because no community matches.
 
 - Maximum response packet size is 4096 bytes. GETBULK may legitimately
   require multiple responses.
+- **GETBULK response size is bounded (RFC 3416 §4.2.3).** The agent caps
+  `maxRepetitions` at 100 (defense in depth) *and* bounds the fully-encoded
+  response to an effective maximum size. For v3 that effective size is
+  `min(request msgMaxSize, 4096)` with `msgMaxSize` clamped up to the RFC
+  484-byte floor (a bogus/tiny advertised value cannot starve the response);
+  v2c carries no per-request `msgMaxSize` on the wire, so the effective size is
+  the local 4096-byte maximum. During expansion the response is built and then
+  trimmed: trailing varbinds are dropped until the encoded message (including
+  the v3 USM/scopedPDU and any auth/priv overhead) fits. Trimming — not
+  `tooBig` — is the normal outcome; the manager continues the walk with a
+  follow-up GETBULK from the last returned OID. `tooBig` (with an empty varbind
+  list) is returned only in the pathological case where not even a single
+  varbind fits. This prevents emitting an oversized UDP datagram that the peer
+  or the network would fragment or drop. See `effectiveMaxSize` / `trimToFit`
+  in `agent.go`.
 - Traps fire immediately on link-state change — they aren't queued, so
   back-to-back link flaps produce back-to-back traps.
 - Don't add a third BER library to this package. The hand-coded encoder
