@@ -12721,3 +12721,30 @@ top.
   PROVEN (removing the validatePreIDDefaultPolicyLogWarnings call → warning
   absent → TestPreIDDefaultPolicyLogWarnsInert + InitOnlyWarns fail). No Rust
   changed.
+
+## 2026-06-24 — #2473 global BGP export rendered as redistribute (route leak)
+
+- **Timestamp**: 2026-06-24
+- **Action**: Fix #2473 (MED-HIGH route leak). A Junos global `protocols
+  bgp export <policy>` was routed through `resolveRedistribute()`, emitting
+  `redistribute <proto> route-map ...` under `router bgp` — actively
+  announcing the OSPF/connected RIB into BGP (failure mode 1, leak), and
+  silently dropping a prefix/community-only export with no `from protocol`
+  (failure mode 2). Now rendered as a peer-level `neighbor <X> route-map
+  <name> out` per neighbor/address-family, referencing the route-map
+  `generatePolicyOptions` already emits. Coexistence: a per-neighbor export
+  overrides the global default for that neighbor (Junos most-specific-wins;
+  one route-map out per neighbor/AF). Neighbors with no explicit family are
+  routed into ipv4-unicast when a global export is set (FRR default-activate)
+  so the default reaches every peer. `redistribute` retained strictly for
+  OSPF/OSPFv3/RIP/IS-IS.
+- **File(s)**: pkg/frr/policy_render.go (new helpers `lastNonEmpty`,
+  `bgpEffectiveExport`; BGP export render rewrite), pkg/frr/frr_test.go
+  (rewrote TestGenerateProtocols_BGPExport→BGPExportNoLeak,
+  BGPExportRouteMap; added BGPExportPrefixOnly, BGPExportCoexistence;
+  removed the redistribute-encoding MixedBareAndRouteMap), pkg/frr/README.md
+  (#2473 bullet + #2144 bullet refinement).
+- **Validation**: go build ./... OK; go test ./pkg/frr/ ./pkg/config/ PASS;
+  gofmt clean; go vet ./pkg/frr/ clean. Fail-on-revert PROVEN: re-inserting
+  the `resolveRedistribute` loop → `redistribute ospf route-map leak-ospf`
+  reappears → TestGenerateProtocols_BGPExportNoLeak fails. No Rust changed.
