@@ -162,15 +162,25 @@ func buildAppCatalogSnapshot(cfg *config.Config) []AppCatalogEntrySnapshot {
 
 // buildFlowExportSnapshot constructs the FlowExportSnapshot wire field.
 //
-// #2130: the userspace dataplane does NOT emit flow records — flow export
-// is owned entirely by the Go control plane (pkg/flowexport), driven by
-// SESSION_CLOSE events. The Rust FlowExporter that once consumed this
+// #2130: the userspace dataplane does NOT build/format the NetFlow/IPFIX
+// flow records itself — flow export is owned entirely by the Go control
+// plane (pkg/flowexport). The Rust FlowExporter that once consumed this
 // snapshot was dead code (never wired into the forwarding path) and was
 // removed; the helper now deserializes this field and ignores it. The
 // field (and this builder) are retained as a documented-reserved wire
 // contract so the #1977 decode-safety coercion tests
 // (flow_wire_coerce_test.go, protocol/tests.rs) keep guarding the path and
 // no cross-language wire break is introduced.
+//
+// #2460: the session-close records that drive flow export ARE now produced
+// in userspace mode. On every session close the helper emits a SESSION_CLOSE
+// RT_FLOW frame (EventFrameTypeSessionClose, type 14) on the raw
+// dataplane-event channel; the daemon decodes it into a
+// logging.EventRecord{Type:"SESSION_CLOSE"} via eventReader.ProcessRawEvent,
+// which fires the NetFlow/IPFIX flowExportCallback / ipfixExportCallback
+// (daemon_flowexport.go). The record carries the real 5-tuple, NAT tuple,
+// zones, and protocol; byte/packet volume counters and session duration are
+// reported as 0 pending the userspace per-session accounting work in #2501.
 func buildFlowExportSnapshot(cfg *config.Config) *FlowExportSnapshot {
 	if cfg == nil || cfg.Services.FlowMonitoring == nil {
 		return nil

@@ -770,6 +770,104 @@ func TestEventStreamDataplaneEventRawCallbackPreferred(t *testing.T) {
 	}
 }
 
+// TestEventStreamSessionCloseRTFlowRoutesToRawCallback proves the #2460
+// EventFrameTypeSessionClose (type 14) frame is accepted by the event-stream
+// frame dispatcher and routed to the raw dataplane-event callback (the path
+// the daemon wires to eventReader.ProcessRawEvent so the NetFlow/IPFIX
+// session-close exporters fire). It further feeds the decoded payload through
+// a real EventReader and asserts a single Type=="SESSION_CLOSE" record with
+// the correct tuple results — closing the helper-emit -> Go-decode loop.
+//
+// Fail-on-revert: drop EventFrameTypeSessionClose from the dispatcher switch
+// (the type-14 case) and the frame is treated as unknown and dropped, so the
+// raw callback never fires.
+func TestEventStreamSessionCloseRTFlowRoutesToRawCallback(t *testing.T) {
+	dir := t.TempDir()
+	sockPath := filepath.Join(dir, "test-events.sock")
+
+	es := NewEventStream(sockPath)
+	reader := logging.NewEventReader(nil, logging.NewEventBuffer(8))
+	rawSeen := make(chan logging.EventRecord, 4)
+	es.SetOnRawDataplaneEvent(func(_ uint64, payload []byte) {
+		if !reader.ProcessRawEvent(payload) {
+			return
+		}
+		rec, ok := logging.DecodeRawEventRecord(payload)
+		if ok {
+			rawSeen <- rec
+		}
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	es.Start(ctx)
+	defer es.Close()
+
+	waitCtx, waitCancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer waitCancel()
+	var conn net.Conn
+	for conn == nil {
+		var err error
+		conn, err = net.Dial("unix", sockPath)
+		if err == nil {
+			break
+		}
+		select {
+		case <-waitCtx.Done():
+			t.Fatalf("dial: %v", err)
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	defer conn.Close()
+	for !es.IsConnected() {
+		select {
+		case <-waitCtx.Done():
+			t.Fatal("event stream did not become connected")
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+
+	// 136-byte dataplane.Event payload, EventType = SESSION_CLOSE (2),
+	// mirroring the Rust encode_session_close_rt_flow layout.
+	payload := buildTypedDataplaneEventV4Payload(
+		dataplane.EventTypeSessionClose,
+		dataplane.ActionDeny, // inert for a close
+		6,                    // TCP
+		12345, 443,
+		[4]byte{10, 0, 1, 102}, [4]byte{172, 16, 80, 200},
+		[4]byte{172, 16, 80, 8},
+		40000,
+		2, 3,
+		0, 0, 0, 0,
+		0, // close reason none
+		0,
+	)
+	if err := writeFrame(conn, EventFrameTypeSessionClose, 11, payload); err != nil {
+		t.Fatalf("write session-close frame: %v", err)
+	}
+
+	select {
+	case rec := <-rawSeen:
+		if rec.Type != "SESSION_CLOSE" {
+			t.Fatalf("Type = %q, want SESSION_CLOSE", rec.Type)
+		}
+		if rec.SrcAddr != "10.0.1.102:12345" || rec.DstAddr != "172.16.80.200:443" {
+			t.Fatalf("tuple = %s -> %s, want 10.0.1.102:12345 -> 172.16.80.200:443",
+				rec.SrcAddr, rec.DstAddr)
+		}
+		if rec.SessionPkts != 0 || rec.SessionBytes != 0 {
+			t.Fatalf("counters = (%d,%d), want (0,0) pending #2501",
+				rec.SessionPkts, rec.SessionBytes)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("session-close RT_FLOW frame did not reach the raw callback")
+	}
+
+	if got := es.SessionCloseEvents.Load(); got != 1 {
+		t.Fatalf("SessionCloseEvents = %d, want 1", got)
+	}
+}
+
 func TestEventStreamRawDataplaneEventsFeedSyslogFanout(t *testing.T) {
 	pc, err := net.ListenPacket("udp", "127.0.0.1:0")
 	if err != nil {
@@ -1628,10 +1726,10 @@ func TestEventSocketPathRemoved(t *testing.T) {
 // "alarm != drop" and "alarm is counted" assertions below would fail.
 func TestRecordDataplaneEventScreenAlarmNotDrop(t *testing.T) {
 	cases := []struct {
-		name        string
-		action      uint8
-		wantDrop    uint64
-		wantAlarm   uint64
+		name      string
+		action    uint8
+		wantDrop  uint64
+		wantAlarm uint64
 	}{
 		{"permit_alarm", dataplane.ActionPermit, 0, 1},
 		{"deny_drop", dataplane.ActionDeny, 1, 0},
