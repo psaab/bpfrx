@@ -264,6 +264,50 @@ pub(super) fn defer_uninserted_fill_suffix(offsets: &[u64], inserted_total: usiz
     offsets[inserted_total..].to_vec()
 }
 
+/// Upper bound on bringup NAPI-trigger iterations in `prime_fill_ring_offsets`.
+///
+/// mlx5 zero-copy consumes the fill ring during RX NAPI poll, so we kick NAPI
+/// (recvmsg/poll/sendto) to make the kernel post RX WQEs. A transiently-full
+/// ring may need several kicks before it accepts the deferred suffix; this caps
+/// the retries so a persistently-rejecting ring still falls through to the
+/// deferred-suffix path instead of spinning.
+pub(super) const FILL_PRIME_MAX_ITERS: usize = 20;
+
+/// Drive the bringup fill-ring NAPI-trigger loop (#2481).
+///
+/// Runs `iter` (one NAPI kick + deferred-suffix retry, returning the
+/// post-iteration `remaining` count) at most `FILL_PRIME_MAX_ITERS` times,
+/// starting from `initial_remaining`. Stops as soon as the ring is fully primed
+/// (`remaining == total`) — but only AFTER at least one iteration, so the NAPI
+/// kick that posts the RX WQEs always fires even when the initial fill already
+/// placed every frame. Returns the final `remaining`.
+///
+/// Before #2481 the loop ran the full `FILL_PRIME_MAX_ITERS` unconditionally:
+/// a fully-successful prime still burned 19 wasted recvmsg/poll/sendto + 1ms
+/// poll iterations (~20ms/queue × up to 16 queues ≈ ~320ms avoidable serial
+/// bringup latency). The early-out cuts that tail while preserving the >=1 NAPI
+/// trigger and the up-to-cap retry for a partial prime. Extracted as a pure
+/// driver so the early-out is unit-testable without a bound `DeviceQueue`.
+pub(super) fn drive_fill_prime_loop(
+    initial_remaining: usize,
+    total: usize,
+    mut iter: impl FnMut(usize) -> usize,
+) -> usize {
+    let mut remaining = initial_remaining;
+    for _ in 0..FILL_PRIME_MAX_ITERS {
+        // Always run at least one iteration: the NAPI kick that posts the RX
+        // WQEs must fire even if the initial fill already primed the ring.
+        remaining = iter(remaining);
+        // Early-out once fully primed (#2481) — the break is at the END of the
+        // iteration so the post-work `remaining` is read; a partial prime
+        // (remaining < total) keeps retrying up to the cap.
+        if remaining == total {
+            break;
+        }
+    }
+    remaining
+}
+
 /// Prime the RX fill ring with `offsets` at socket bringup.
 ///
 /// Returns the suffix of `offsets` that could NOT be inserted into the fill
@@ -284,8 +328,8 @@ pub(super) fn prime_fill_ring_offsets(
 ) -> Result<Vec<u64>, Box<dyn std::error::Error + Send + Sync>> {
     // An empty prime request is a no-op (not a total failure — see
     // `fill_prime_is_total_failure`). Return the empty deferred suffix without
-    // entering the fixed 20-iteration NAPI-trigger loop below, which would
-    // otherwise burn 20 recvmsg/poll/sendto syscalls at bringup for no frames.
+    // entering the NAPI-trigger loop below (which always runs at least one
+    // iteration), avoiding a wasted recvmsg/poll/sendto at bringup for no frames.
     if offsets.is_empty() {
         return Ok(Vec::new());
     }
@@ -318,7 +362,7 @@ pub(super) fn prime_fill_ring_offsets(
     // path (if SO_BUSY_POLL is set) and drives NAPI processing.
     // Also use poll(POLLIN) and sendto() as belt-and-suspenders.
     let fd = device.as_raw_fd();
-    for _ in 0..20 {
+    remaining = drive_fill_prime_loop(remaining, total, |remaining| {
         // recvmsg with MSG_DONTWAIT triggers xsk_recvmsg → busy-poll
         let mut iov = libc::iovec {
             iov_base: core::ptr::null_mut(),
@@ -348,6 +392,7 @@ pub(super) fn prime_fill_ring_offsets(
         // After NAPI has had a chance to drain the ring, retry inserting the
         // un-inserted suffix. This recovers a transiently-full fill ring at
         // bringup the same way the steady-state drain does.
+        let mut remaining = remaining;
         if remaining < total {
             let suffix = &offsets[remaining..];
             let inserted = {
@@ -359,7 +404,8 @@ pub(super) fn prime_fill_ring_offsets(
             remaining += inserted;
         }
         std::thread::yield_now();
-    }
+        remaining
+    });
     if remaining < total {
         eprintln!(
             "prime_fill_ring: partial prime — {} of {} frames not placed, deferring suffix to pending_fill_frames",
@@ -599,7 +645,11 @@ fn set_busy_poll_opts(fd: c_int, poll_mode: crate::PollMode) {
 
 #[cfg(test)]
 mod fill_prime_tests {
-    use super::{defer_uninserted_fill_suffix, fill_prime_is_total_failure};
+    use super::{
+        defer_uninserted_fill_suffix, drive_fill_prime_loop, fill_prime_is_total_failure,
+        FILL_PRIME_MAX_ITERS,
+    };
+    use std::cell::Cell;
 
     // #2374: a partial bringup prime (inserted < N) MUST recover the
     // un-inserted suffix so the worker can stash it in pending_fill_frames.
@@ -672,5 +722,77 @@ mod fill_prime_tests {
         // zero insert would be the whole set (nothing accepted) — proving the
         // recovery path would otherwise carry all frames.
         assert_eq!(defer_uninserted_fill_suffix(&offsets, 0), offsets);
+    }
+
+    // #2481: when the initial fill already primed the whole ring
+    // (initial_remaining == total), the NAPI-trigger loop must run EXACTLY ONE
+    // iteration — one kick to post the RX WQEs, then break. If the early-out is
+    // reverted (loop runs the full cap unconditionally), this asserts 1 != 20
+    // and FAILS. This is the fail-on-revert guard for the avoidable ~320ms
+    // bringup latency the early-out removes.
+    #[test]
+    fn already_primed_runs_exactly_one_iteration() {
+        let total = 8;
+        let calls = Cell::new(0usize);
+        let final_remaining = drive_fill_prime_loop(total, total, |remaining| {
+            calls.set(calls.get() + 1);
+            // Ring is already full: nothing to retry, remaining stays at total.
+            remaining
+        });
+        assert_eq!(
+            calls.get(),
+            1,
+            "an already-primed ring must run exactly ONE NAPI-trigger iteration \
+             (>=1 to post RX WQEs, then early-out) — not the full {} cap (#2481)",
+            FILL_PRIME_MAX_ITERS
+        );
+        assert_eq!(final_remaining, total);
+    }
+
+    // #2481: a ring that completes after a few retries must break as soon as it
+    // is fully primed — not run the remaining cap iterations. Mocks a ring that
+    // accepts one more frame per kick until full.
+    #[test]
+    fn stops_as_soon_as_fully_primed() {
+        let total = 5;
+        let calls = Cell::new(0usize);
+        // Start with 2 of 5 placed; each kick lets the kernel free one slot.
+        let final_remaining = drive_fill_prime_loop(2, total, |remaining| {
+            calls.set(calls.get() + 1);
+            (remaining + 1).min(total)
+        });
+        // 2 -> 3 -> 4 -> 5: three iterations reach total, then break.
+        assert_eq!(
+            calls.get(),
+            3,
+            "the loop must stop the iteration it reaches full, not spin to the cap"
+        );
+        assert_eq!(final_remaining, total);
+    }
+
+    // #2481: a persistently-rejecting ring (remaining < total forever) must run
+    // the full cap — the early-out must NOT short-circuit a partial prime, or
+    // the ring would be left under-primed (RX drops). Also confirms the final
+    // remaining is carried out so the caller defers the un-inserted suffix.
+    #[test]
+    fn partial_prime_runs_full_cap_and_never_underprimes() {
+        let total = 6;
+        let calls = Cell::new(0usize);
+        // Ring never accepts more than the initial 4 — stuck below total.
+        let final_remaining = drive_fill_prime_loop(4, total, |remaining| {
+            calls.set(calls.get() + 1);
+            remaining // no progress
+        });
+        assert_eq!(
+            calls.get(),
+            FILL_PRIME_MAX_ITERS,
+            "a partial prime that never completes must retry up to the full cap \
+             (no premature break that leaves the ring under-primed)"
+        );
+        assert_eq!(
+            final_remaining, 4,
+            "the final remaining must be returned so the caller defers the \
+             un-inserted suffix to pending_fill_frames (no leak)"
+        );
     }
 }
