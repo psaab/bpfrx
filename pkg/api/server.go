@@ -25,6 +25,7 @@ import (
 	"github.com/psaab/xpf/pkg/dhcpserver"
 	"github.com/psaab/xpf/pkg/eventengine"
 	"github.com/psaab/xpf/pkg/feeds"
+	"github.com/psaab/xpf/pkg/flowexport"
 	"github.com/psaab/xpf/pkg/frr"
 	"github.com/psaab/xpf/pkg/fsatomic"
 	"github.com/psaab/xpf/pkg/ipmon"
@@ -125,6 +126,15 @@ type Config struct {
 	// api package does not import the manager type. Optional; if nil (or it
 	// returns nil), the family is omitted.
 	DDNSStatsFn func() *dhcpserver.DDNSStats
+	// FlowCollectorHealthFn surfaces per-collector NetFlow v9 / IPFIX
+	// write-health for the xpf_flow_export_collector_* metric family and
+	// the /flow-exporters status endpoint (#2464). Flow export is
+	// forensics/compliance data; a collector going silently unreachable
+	// (every failed UDP write was debug-logged and dropped) is a
+	// production concern, so the per-collector attempt/failure counters and
+	// last-error/last-success state are surfaced here. Optional; if nil (or
+	// it returns nil), the family is omitted.
+	FlowCollectorHealthFn func() []flowexport.ExporterCollectorHealth
 }
 
 // Server is the HTTP API server.
@@ -151,6 +161,7 @@ type Server struct {
 	rpmPinFailedFn          func() float64
 	feedsFn                 func() map[string]feeds.FeedInfo
 	ddnsStatsFn             func() *dhcpserver.DDNSStats
+	flowCollectorHealthFn   func() []flowexport.ExporterCollectorHealth
 	startTime               time.Time
 }
 
@@ -177,6 +188,7 @@ func NewServer(cfg Config) *Server {
 		rpmPinFailedFn:          cfg.RPMPinFailedFn,
 		feedsFn:                 cfg.FeedsFn,
 		ddnsStatsFn:             cfg.DDNSStatsFn,
+		flowCollectorHealthFn:   cfg.FlowCollectorHealthFn,
 		startTime:               time.Now(),
 	}
 
@@ -231,6 +243,9 @@ func NewServer(cfg Config) *Server {
 
 	// Session zone-pair summary
 	mux.HandleFunc("GET /api/v1/security/sessions/summary/zone-pairs", s.sessionZonePairHandler)
+
+	// Flow-export collector health (#2464)
+	mux.HandleFunc("GET /api/v1/services/flow-exporters", s.flowExportersHandler)
 
 	// System info
 	mux.HandleFunc("GET /api/v1/system/info", s.systemInfoHandler)

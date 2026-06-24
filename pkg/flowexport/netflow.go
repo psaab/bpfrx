@@ -493,6 +493,13 @@ func (e *Exporter) Stats() (flows, packets uint64) {
 	return e.exportedFlows.Load(), e.exportedPkts.Load()
 }
 
+// CollectorHealth returns a per-collector write-health snapshot (#2464):
+// write attempts/failures, last error and the last success/failure
+// timestamps for every collector this exporter writes to.
+func (e *Exporter) CollectorHealth() []CollectorHealth {
+	return e.conns.health()
+}
+
 // Close shuts down all collector connections.
 func (e *Exporter) Close() {
 	e.conns.close()

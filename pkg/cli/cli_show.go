@@ -131,6 +131,9 @@ func (c *CLI) handleShow(args []string) error {
 		return c.showFirewallFilters()
 
 	case "flow-monitoring":
+		if len(args) > 1 && args[1] == "statistics" {
+			return c.showFlowMonitoringStatistics()
+		}
 		return c.showFlowMonitoring()
 
 	case "log":

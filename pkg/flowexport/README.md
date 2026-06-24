@@ -59,6 +59,40 @@ The package is split by responsibility (#1988):
   earlier in the loop before returning — no descriptor leak on partial
   failure.
 
+## Per-collector write-health (#2464)
+
+Flow export is forensics/compliance data; a collector going unreachable
+used to be invisible — every failed UDP write in `writeAll` was
+`slog.Debug`-logged and dropped while the exporter kept counting
+"exported", so an operator got no warning that records were being lost.
+Each `collectorConn` now tracks `WriteAttempts`, `WriteFailures`,
+`LastError`/`LastErrorTime`, `LastFailureTime`, `LastSuccessTime`, and a
+`Healthy` flag (atomic counters + a mutex-guarded snapshot, race-safe
+against a concurrent status reader). The export DATA path is unchanged:
+writes are still attempted to every collector and failures are still
+non-fatal — this is additive observability.
+
+`writeAll` emits a state-change log ONLY on the
+unhealthy↔healthy edge (a `slog.Warn` when a healthy collector first
+fails, a `slog.Info` when it recovers), never once per failed write —
+`writeAll` runs on the 100ms batch ticker plus each template refresh, so
+a per-write warn would flood the journal (project logging rule: no
+Warn/Info in a per-tick loop). The per-write `slog.Debug` line is kept
+for deep tracing.
+
+The snapshot is surfaced through `Exporter.CollectorHealth()` /
+`IPFIXExporter.CollectorHealth()` → `Daemon.FlowCollectorHealth()`
+(annotated with protocol / instance / template via
+`ExporterCollectorHealth`) on four surfaces:
+- **Prometheus** — `xpf_flow_export_collector_{write_attempts_total,
+  write_failures_total,healthy,last_success_timestamp_seconds,
+  last_failure_timestamp_seconds}`, labeled `{protocol,collector}`
+  (emitted before the dataplane gate — exporters are control-plane).
+- **REST** — `GET /api/v1/services/flow-exporters`.
+- **gRPC / CLI show** — `show flow-monitoring statistics` (gRPC ShowText
+  topic `flow-monitoring-statistics`; both the remote `cli` binary and
+  the in-daemon interactive CLI).
+
 ## Entry points
 
 NetFlow v9:

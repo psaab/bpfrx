@@ -261,7 +261,7 @@ type xpfCollector struct {
 	// silently blackhole every inner flow with no PMTUD signal.
 	userspaceGreEncapDfOversizeDrops *prometheus.Desc
 	userspaceFlowCacheActiveFlows    *prometheus.Desc
-	userspaceFlowCacheCapacity      *prometheus.Desc
+	userspaceFlowCacheCapacity       *prometheus.Desc
 	// #1379: daemon-side userspace event-stream transport counters.
 	userspaceEventStreamFramesTotal          *prometheus.Desc
 	userspaceEventStreamProducerFramesTotal  *prometheus.Desc
@@ -413,6 +413,17 @@ type xpfCollector struct {
 	wgKeepalivesSentTotal                   *prometheus.Desc
 	wgSessionsExpiredTotal                  *prometheus.Desc
 	wgHandshakeAttemptsAbortedTotal         *prometheus.Desc
+
+	// #2464: per-collector NetFlow v9 / IPFIX write-health. A flow-export
+	// collector that goes unreachable used to be invisible (every failed
+	// UDP write was debug-logged and dropped while the exporter kept
+	// counting "exported"). Labels: protocol {netflow-v9,ipfix} and the
+	// collector address (bounded — one per configured flow-server).
+	flowExportCollectorWriteAttemptsTotal *prometheus.Desc
+	flowExportCollectorWriteFailuresTotal *prometheus.Desc
+	flowExportCollectorHealthy            *prometheus.Desc
+	flowExportCollectorLastSuccessSeconds *prometheus.Desc
+	flowExportCollectorLastFailureSeconds *prometheus.Desc
 }
 
 func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
@@ -659,6 +670,11 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.wgKeepalivesSentTotal
 	ch <- c.wgSessionsExpiredTotal
 	ch <- c.wgHandshakeAttemptsAbortedTotal
+	ch <- c.flowExportCollectorWriteAttemptsTotal
+	ch <- c.flowExportCollectorWriteFailuresTotal
+	ch <- c.flowExportCollectorHealthy
+	ch <- c.flowExportCollectorLastSuccessSeconds
+	ch <- c.flowExportCollectorLastFailureSeconds
 }
 
 func (c *xpfCollector) Collect(ch chan<- prometheus.Metric) {
@@ -708,6 +724,12 @@ func (c *xpfCollector) Collect(ch chan<- prometheus.Metric) {
 				prometheus.GaugeValue, stale, name)
 		}
 	}
+
+	// #2464: per-collector flow-export write-health is a control-plane
+	// signal — the exporters run independent of the dataplane — so emit it
+	// BEFORE the dataplane gate. A collector that has gone unreachable must
+	// stay visible even when the dataplane is not loaded.
+	c.collectFlowExportMetrics(ch)
 
 	dp := c.srv.dp
 	if dp == nil || !dp.IsLoaded() {

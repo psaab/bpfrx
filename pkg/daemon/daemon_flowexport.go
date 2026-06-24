@@ -416,3 +416,39 @@ func (d *Daemon) ipfixExportCallback(rec logging.EventRecord, raw []byte) {
 		i = j
 	}
 }
+
+// FlowCollectorHealth returns the per-collector write-health for every
+// running NetFlow v9 and IPFIX exporter group (#2464). The slice is
+// empty when no flow export is configured. Safe to call concurrently
+// with reconcile and the export-flush goroutines: it reads the live
+// bundles lock-free and each exporter's health() snapshot is mutex/atomic
+// guarded. The returned type lives in pkg/flowexport so pkg/api and
+// pkg/grpcapi (which cannot import pkg/daemon) can name it.
+func (d *Daemon) FlowCollectorHealth() []flowexport.ExporterCollectorHealth {
+	var out []flowexport.ExporterCollectorHealth
+	if b := d.flowBundle.Load(); b != nil {
+		for _, g := range b.groups {
+			for _, h := range g.exp.CollectorHealth() {
+				out = append(out, flowexport.ExporterCollectorHealth{
+					Protocol:        "netflow-v9",
+					Instance:        g.ec.InstanceName,
+					Template:        g.ec.TemplateName,
+					CollectorHealth: h,
+				})
+			}
+		}
+	}
+	if b := d.ipfixBundlePtr.Load(); b != nil {
+		for _, g := range b.groups {
+			for _, h := range g.exp.CollectorHealth() {
+				out = append(out, flowexport.ExporterCollectorHealth{
+					Protocol:        "ipfix",
+					Instance:        g.ec.InstanceName,
+					Template:        g.ec.TemplateName,
+					CollectorHealth: h,
+				})
+			}
+		}
+	}
+	return out
+}

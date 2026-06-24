@@ -1444,5 +1444,32 @@ func newCollector(srv *Server) *xpfCollector {
 			"Pending WireGuard handshake reservations released by the REKEY_ATTEMPT_TIME (90s) give-up — a stale msg2 after this cannot complete the abandoned handshake (#1888 S5).",
 			[]string{"tunnel"}, nil,
 		),
+
+		// #2464: per-collector flow-export write-health.
+		flowExportCollectorWriteAttemptsTotal: prometheus.NewDesc(
+			"xpf_flow_export_collector_write_attempts_total",
+			"Total NetFlow v9 / IPFIX UDP write attempts per collector.",
+			[]string{"protocol", "collector"}, nil,
+		),
+		flowExportCollectorWriteFailuresTotal: prometheus.NewDesc(
+			"xpf_flow_export_collector_write_failures_total",
+			"Total NetFlow v9 / IPFIX UDP write failures per collector (a climbing value while attempts climb means the collector is unreachable and flow records are being silently dropped).",
+			[]string{"protocol", "collector"}, nil,
+		),
+		flowExportCollectorHealthy: prometheus.NewDesc(
+			"xpf_flow_export_collector_healthy",
+			"1 when the last write to this flow-export collector succeeded, 0 when the last write failed.",
+			[]string{"protocol", "collector"}, nil,
+		),
+		flowExportCollectorLastSuccessSeconds: prometheus.NewDesc(
+			"xpf_flow_export_collector_last_success_timestamp_seconds",
+			"Unix timestamp of the last successful write to this flow-export collector (0 if none yet).",
+			[]string{"protocol", "collector"}, nil,
+		),
+		flowExportCollectorLastFailureSeconds: prometheus.NewDesc(
+			"xpf_flow_export_collector_last_failure_timestamp_seconds",
+			"Unix timestamp of the last failed write to this flow-export collector (0 if none yet).",
+			[]string{"protocol", "collector"}, nil,
+		),
 	}
 }

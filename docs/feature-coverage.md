@@ -98,7 +98,10 @@ the userspace dataplane admission boundary is in
 
 - **Syslog**: facility/severity/category filtering, structured RT_FLOW
   format, TCP/TLS transport, event mode local file.
-- **NetFlow v9**: 1-in-N sampling.
+- **NetFlow v9 / IPFIX**: 1-in-N sampling, per-collector write-health
+  (`show flow-monitoring statistics`, REST `/api/v1/services/flow-exporters`,
+  `xpf_flow_export_collector_*` Prometheus metrics — a collector going
+  unreachable surfaces write_failures + a state-change warn, #2464).
 - **Prometheus metrics** (`/metrics` endpoint).
 - **SNMP**: system + ifTable MIB.
 - **RPM probes**, dynamic address feeds.

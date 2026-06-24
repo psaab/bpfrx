@@ -225,6 +225,11 @@ func (c *ctl) handleShow(args []string) error {
 		return c.showText("firewall")
 
 	case "flow-monitoring":
+		// #2464: `show flow-monitoring statistics` renders per-collector
+		// write-health; bare `show flow-monitoring` renders configuration.
+		if len(args) > 1 && args[1] == "statistics" {
+			return c.showText("flow-monitoring-statistics")
+		}
 		return c.showText("flow-monitoring")
 
 	case "log":

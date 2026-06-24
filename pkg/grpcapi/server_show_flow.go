@@ -41,6 +41,52 @@ func (s *Server) showFlowMonitoring(cfg *config.Config, buf *strings.Builder) {
 	}
 }
 
+// showFlowMonitoringStatistics renders per-collector NetFlow v9 / IPFIX
+// write-health (#2464): for every running exporter collector, its write
+// attempt/failure counters, the current reachability, and the last
+// success / failure timestamps. Before this, a collector going
+// unreachable was invisible — every failed UDP write was debug-logged and
+// dropped while the exporter kept counting "exported", so an operator got
+// no warning that forensics/compliance flow data was being silently lost.
+func (s *Server) showFlowMonitoringStatistics(buf *strings.Builder) {
+	if s.flowCollectorHealthFn == nil {
+		buf.WriteString("No flow export configured\n")
+		return
+	}
+	health := s.flowCollectorHealthFn()
+	if len(health) == 0 {
+		buf.WriteString("No flow export configured\n")
+		return
+	}
+	buf.WriteString("Flow export collector statistics:\n")
+	for _, h := range health {
+		state := "up"
+		if !h.Healthy {
+			state = "DOWN"
+		}
+		fmt.Fprintf(buf, "  Collector %s (%s)", h.Address, h.Protocol)
+		if h.Instance != "" {
+			fmt.Fprintf(buf, " instance %s", h.Instance)
+		}
+		if h.Template != "" {
+			fmt.Fprintf(buf, " template %s", h.Template)
+		}
+		buf.WriteString("\n")
+		fmt.Fprintf(buf, "    State:          %s\n", state)
+		fmt.Fprintf(buf, "    Write attempts: %d\n", h.WriteAttempts)
+		fmt.Fprintf(buf, "    Write failures: %d\n", h.WriteFailures)
+		if !h.LastSuccessTime.IsZero() {
+			fmt.Fprintf(buf, "    Last success:   %s\n", h.LastSuccessTime.Format("2006-01-02 15:04:05"))
+		}
+		if !h.LastFailureTime.IsZero() {
+			fmt.Fprintf(buf, "    Last failure:   %s\n", h.LastFailureTime.Format("2006-01-02 15:04:05"))
+		}
+		if h.LastError != "" {
+			fmt.Fprintf(buf, "    Last error:     %s\n", h.LastError)
+		}
+	}
+}
+
 // showFlowTimeouts renders TCP/UDP/ICMP session timeouts and assorted
 // flow toggles (allow-dns-reply, embedded ICMP, GRE acceleration,
 // power mode).
