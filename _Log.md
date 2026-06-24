@@ -12548,3 +12548,25 @@ top.
   logging,daemon} green; cargo build --release green; cargo test policy +
   codec + wire-invariant green (1 pre-existing flaky concurrency test
   unrelated). gofmt/vet clean.
+
+## 2026-06-23 — #2508 Copilot fold: scope per-policy gate to er.source==nil
+
+- **Timestamp**: 2026-06-23
+- **Action**: Fix real over-suppression caught in review (PR #2531). The
+  per-policy SYSLOG gate in pkg/logging/ringbuf.go fired for ALL
+  SESSION_OPEN/CLOSE events keyed on byte-135==0. But only the userspace-dp
+  event-stream path (ProcessRawEvent, er.source==nil) sets the per-policy log
+  bit. The SECOND runtime EventReader (pkg/daemon/daemon_run.go, non-nil
+  source) feeds SESSION events whose gate byte defaults to 0, so the gate
+  would have UNCONDITIONALLY suppressed all of its session logs. Added
+  `er.source == nil` to the gate condition so it narrows ONLY the userspace
+  path; rewrote the comment to state the scope. Source-based readers are
+  never gated.
+- **File(s)**: pkg/logging/ringbuf.go (gate condition + comment),
+  pkg/logging/per_policy_log_test.go (NEW
+  TestPerPolicyLogGate_SourceReaderNotGated fail-on-revert + nopEventSource
+  fake)
+- **Validation**: fail-on-revert PROVEN (removing `er.source == nil` →
+  source-path SESSION_OPEN/CLOSE wrongly suppressed → test fails; restored →
+  pass). go build ./... ; go test pkg/{logging,daemon,dataplane/userspace}
+  green; gofmt/vet clean (pre-existing syslog.go drift untouched).

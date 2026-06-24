@@ -508,8 +508,17 @@ func (er *EventReader) logEvent(data []byte) {
 	// (those frames are unconditionally logged); session opens are
 	// producer-gated in the helper, so a SESSION_CREATE frame that reaches
 	// here always has the bit set.
+	//
+	// This gate is SCOPED to the userspace-dp event-stream path
+	// (`er.source == nil`, i.e. records fed via ProcessRawEvent) — the ONLY
+	// producer that sets the per-policy log bit. A source-based EventReader
+	// (`er.source != nil`, the kernel/ring-buffer reader created at
+	// pkg/daemon/daemon_run.go) does NOT carry the per-policy bit (the byte
+	// defaults to 0), so it must NEVER be gated by this check or its session
+	// logs would be unconditionally suppressed.
 	suppressSyslogLog := false
-	if (evt.EventType == eventTypeSessionClose || evt.EventType == eventTypeSessionOpen) &&
+	if er.source == nil &&
+		(evt.EventType == eventTypeSessionClose || evt.EventType == eventTypeSessionOpen) &&
 		len(data) > rawEventLogSyslogOffset &&
 		data[rawEventLogSyslogOffset] == 0 {
 		suppressSyslogLog = true

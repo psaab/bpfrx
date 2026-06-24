@@ -101,6 +101,47 @@ func TestPerPolicyLogGate_OpenSuppressedWhenFlagUnset(t *testing.T) {
 	}
 }
 
+// nopEventSource is a non-nil EventSource that never yields events. It exists
+// solely to construct an EventReader whose `source != nil`, exercising the
+// source-based (kernel/ring-buffer) reader path.
+type nopEventSource struct{}
+
+func (nopEventSource) ReadEvent() ([]byte, error) { return nil, nil }
+func (nopEventSource) Close() error               { return nil }
+
+// TestPerPolicyLogGate_SourceReaderNotGated is the #2508 over-suppression
+// fail-on-revert guard. The per-policy SYSLOG gate must apply ONLY to the
+// userspace-dp event-stream path (er.source == nil), the only producer that
+// sets the per-policy log bit. A source-based EventReader (er.source != nil,
+// created at pkg/daemon/daemon_run.go) feeds SESSION events whose gate byte is
+// 0 by default; those events MUST still be logged. Removing the
+// `er.source == nil` guard from the gate makes these events wrongly suppressed
+// and this test fails.
+func TestPerPolicyLogGate_SourceReaderNotGated(t *testing.T) {
+	for _, et := range []struct {
+		name string
+		typ  uint8
+	}{
+		{"SESSION_CLOSE", eventTypeSessionClose},
+		{"SESSION_OPEN", eventTypeSessionOpen},
+	} {
+		t.Run(et.name, func(t *testing.T) {
+			buffer := NewEventBuffer(16)
+			// source != nil: the gate must not fire for this reader.
+			reader := NewEventReader(nopEventSource{}, buffer)
+
+			// gate byte 0 (a source-based event never sets the per-policy bit).
+			if ok := reader.ProcessRawEvent(rawSessionFrame(et.typ, 0)); !ok {
+				t.Fatalf("ProcessRawEvent returned false")
+			}
+			if got := len(buffer.Latest(16)); got != 1 {
+				t.Fatalf("source-based %s with gate=0: buffer count = %d, want 1 "+
+					"(source readers must never be gated by the per-policy bit)", et.name, got)
+			}
+		})
+	}
+}
+
 func TestPerPolicyLogGate_OpenLoggedWhenFlagSet(t *testing.T) {
 	reader, buffer, _ := newGatedReader(t)
 
