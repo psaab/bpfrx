@@ -23,6 +23,32 @@ struct; SET requests (`pduSetRequest`, 0xa3) are gated on it:
 SNMPv3 SET requests are uniformly refused with `notWritable` (the USM users
 in this config carry no read-write authorization).
 
+## SNMPv3 contexts (RFC 3412 §4.1, RFC 3413 §3)
+
+The agent serves a single MIB view in the **default context** (empty
+`contextName`). It does NOT model per-VRF / per-routing-instance context
+views. The scopedPDU `contextEngineID` and `contextName` are decoded and the
+`contextName` is honored when dispatching the request:
+
+- **Default context** (empty `contextName`): served exactly as before —
+  Get / GetNext / GetBulk return the real MIB objects. No behavior change.
+- **Non-default context** (any non-empty `contextName`): there is no MIB view
+  for that context, so per RFC 3413 the request yields no matching objects.
+  Rather than leaking default-context data (an information-exposure /
+  operator-confusion bug, #2611), the agent returns the **empty-view**
+  exceptions: `noSuchInstance` for every Get varbind and `endOfMibView` for
+  every GetNext / GetBulk varbind. SET is refused with `notWritable` as in any
+  context. This is fail-closed: a manager addressing an unknown context never
+  receives default-context values.
+- The response **echoes the requested `contextName`** back in the scopedPDU
+  (empty for the default context), so the manager sees the response is bound to
+  the context it addressed. `contextEngineID` in the response is our own engine
+  ID (we are the authoritative engine).
+
+This is the empty-view route (RFC 3413), chosen over an `authorizationError` /
+`snmpUnknownContexts` report because it is the standard, simplest result for a
+single-context agent and needs no new error-counter MIB objects.
+
 ## SNMPv3 USM timeliness and replay protection (RFC 3414 §3.2)
 
 Authenticating a request proves the sender holds the user's key; it does

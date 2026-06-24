@@ -298,17 +298,35 @@ func (a *Agent) handleV3Packet(msgBody []byte) []byte {
 		slog.Debug("SNMPv3: failed to decode contextEngineID")
 		return nil
 	}
-	_, scopedRest, err = berDecodeOctetString(scopedRest) // contextName
+	contextName, scopedRest, err := berDecodeOctetString(scopedRest) // contextName
 	if err != nil {
 		slog.Debug("SNMPv3: failed to decode contextName")
 		return nil
 	}
+
+	// Context gating (RFC 3412 §4.1, RFC 3413 §3). This agent serves a single
+	// MIB view in the default context (empty contextName). It does NOT model
+	// per-VRF/routing-instance context views, so a request naming a non-default
+	// context must NOT be answered with default-context data — that would be an
+	// information-exposure / operator-confusion bug (#2611). Per RFC 3413, an
+	// unknown context yields no matching MIB objects: Get/GetNext/GetBulk return
+	// the empty-view exceptions (noSuchInstance / endOfMibView) for every
+	// varbind, and Set is refused. The requested contextName is echoed back in
+	// the response so the manager sees which context it addressed. The empty
+	// (default) context continues to be served exactly as before.
+	defaultContext := len(contextName) == 0
+	echoContext := contextName
 
 	// Decode PDU.
 	pduTag, pduBody, err := berDecodeHeader(scopedRest)
 	if err != nil {
 		slog.Debug("SNMPv3: failed to decode PDU")
 		return nil
+	}
+
+	if !defaultContext {
+		slog.Debug("SNMPv3: non-default context not served, returning empty view",
+			"user", userName, "context", string(contextName))
 	}
 
 	var respVarbinds []varbind
@@ -322,6 +340,10 @@ func (a *Agent) handleV3Packet(msgBody []byte) []byte {
 			return nil
 		}
 		for _, oid := range oids {
+			if !defaultContext {
+				respVarbinds = append(respVarbinds, varbind{oid: oid, tag: tagNoSuchInstance})
+				continue
+			}
 			val, valTag := a.getOIDValue(oid)
 			if val == nil {
 				respVarbinds = append(respVarbinds, varbind{oid: oid, tag: tagNoSuchInstance})
@@ -337,6 +359,10 @@ func (a *Agent) handleV3Packet(msgBody []byte) []byte {
 			return nil
 		}
 		for _, oid := range oids {
+			if !defaultContext {
+				respVarbinds = append(respVarbinds, varbind{oid: oid, tag: tagEndOfMibView})
+				continue
+			}
 			nextOID := a.findNextOID(oid)
 			if nextOID == nil {
 				respVarbinds = append(respVarbinds, varbind{oid: oid, tag: tagEndOfMibView})
@@ -361,6 +387,15 @@ func (a *Agent) handleV3Packet(msgBody []byte) []byte {
 		}
 		if maxRepetitions > 100 {
 			maxRepetitions = 100
+		}
+		if !defaultContext {
+			// Non-default context: no MIB view exists, so every requested OID
+			// yields endOfMibView. One varbind per OID matches what a manager
+			// expects from an empty view and avoids walking the default MIB.
+			for _, oid := range oids {
+				respVarbinds = append(respVarbinds, varbind{oid: oid, tag: tagEndOfMibView})
+			}
+			break
 		}
 		for i := 0; i < nonRepeaters && i < len(oids); i++ {
 			nextOID := a.findNextOID(oids[i])
@@ -402,14 +437,14 @@ func (a *Agent) handleV3Packet(msgBody []byte) []byte {
 		if len(oids) > 0 {
 			errIdx = 1
 		}
-		return a.buildV3Response(msgID, msgFlags, user, requestID, errNotWritable, errIdx, respVarbinds)
+		return a.buildV3Response(msgID, msgFlags, user, echoContext, requestID, errNotWritable, errIdx, respVarbinds)
 
 	default:
 		slog.Debug("SNMPv3: unsupported PDU type", "type", pduTag)
 		return nil
 	}
 
-	return a.buildV3Response(msgID, msgFlags, user, requestID, errNoError, 0, respVarbinds)
+	return a.buildV3Response(msgID, msgFlags, user, echoContext, requestID, errNoError, 0, respVarbinds)
 }
 
 // verifyAuth checks the HMAC authentication of a v3 message.
@@ -859,9 +894,15 @@ func (a *Agent) buildReportPDU(statsOID []int) []byte {
 	return berEncodeTLV(0xa8, pduBody) // Report PDU tag
 }
 
-// buildV3Response builds an authenticated (and optionally encrypted) SNMPv3 response.
+// buildV3Response builds an authenticated (and optionally encrypted) SNMPv3
+// response. contextName is the contextName echoed back into the scopedPDU; it
+// is the value decoded from the request (empty for the default context), so the
+// manager sees the response is bound to the context it addressed (RFC 3412
+// §4.1). The agent serves data only in the default (empty) context — non-default
+// contexts are gated to an empty view by the caller — but the response still
+// echoes the requested contextName.
 func (a *Agent) buildV3Response(msgID int, reqFlags byte, user *usmUser,
-	requestID, errorStatus, errorIndex int, vbs []varbind) []byte {
+	contextName []byte, requestID, errorStatus, errorIndex int, vbs []varbind) []byte {
 
 	// Build varbind list.
 	var vbListBytes []byte
@@ -884,9 +925,10 @@ func (a *Agent) buildV3Response(msgID int, reqFlags byte, user *usmUser,
 	pduBody = append(pduBody, vbListEncoded...)
 	responsePDU := berEncodeTLV(pduGetResponse, pduBody)
 
-	// Build scopedPDU.
+	// Build scopedPDU. contextEngineID is our engineID (we are the authoritative
+	// engine); contextName echoes the requested context (empty = default).
 	scopedBody := berEncodeTLV(tagOctetString, a.engineID)
-	scopedBody = append(scopedBody, berEncodeTLV(tagOctetString, nil)...) // contextName
+	scopedBody = append(scopedBody, berEncodeTLV(tagOctetString, contextName)...) // contextName
 	scopedBody = append(scopedBody, responsePDU...)
 	scopedPDU := berEncodeTLV(tagSequence, scopedBody)
 
