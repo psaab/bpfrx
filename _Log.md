@@ -1,5 +1,39 @@
 # Action Log
 
+## 2026-06-24 — #2606 fix: DHCP relay silently dropped DHCPNAK server responses
+
+- **Timestamp**: 2026-06-24
+- **Action**: #2606 (agy review-041 finding 041-06) — `handleServerResponses`
+  in pkg/dhcprelay/relay.go accepted only `DHCPOFFER`/`DHCPACK` server replies
+  and `continue`'d on everything else, silently dropping `DHCPNAK`. Per RFC
+  2131 §4.3.2 a server sends NAK to reject a client REQUEST; the client must
+  receive it to abandon negotiation and restart with DISCOVER. Dropping it at
+  the relay made clients hang until their retransmission timeout. FIX: (1)
+  added `dhcpv4.MessageTypeNak` to the accepted server-response set (switch
+  over msgType). (2) Added a NAK-first branch in `deliverReply` that FORCE-
+  broadcasts the NAK to 255.255.255.255:68 ahead of the #2076 destination
+  matrix. Rationale: a NAK carries no binding (yiaddr==0) so there is no
+  address to raw-L2/UDP unicast to, and force-broadcasting prevents a server
+  that erroneously echoes a stale ciaddr from steering the matrix into a UDP
+  unicast to an address the client does not own. New counter
+  `RepliesBroadcastNak` (atomic + RelayStats field + `show ... dhcp-relay`
+  column in pkg/cli/cli_show_services.go) records the NAK-broadcast reason.
+  giaddr/xid/chaddr handling is unchanged (the existing reply path zeroes
+  giaddr for the last hop and copies the rest verbatim). Tests:
+  TestDeliverReply_Nak_AlwaysBroadcast (flag-clear, flag-set, and stale-ciaddr
+  defense-in-depth cases — all broadcast, never L2, never ciaddr-unicast) and
+  TestHandleServerResponses_NakForwarded (end-to-end: a NAK fed through the
+  server conn IS written to the client conn at broadcast). Validation: gofmt
+  -w clean, go vet ./pkg/dhcprelay/... clean (pre-existing cli.go:441
+  unreachable-code vet note is unrelated), go test ./pkg/dhcprelay/...
+  ./pkg/cli/... PASS. Fail-on-revert PROVEN: removing MessageTypeNak from the
+  accepted set makes TestHandleServerResponses_NakForwarded red (0 writes,
+  want 1). Live relay verify is lab-bound; the unit tests are the gate. Doc:
+  pkg/dhcprelay/README.md (relayed-types table + reply matrix + NAK section +
+  counter list).
+- **File(s)**: pkg/dhcprelay/relay.go, pkg/dhcprelay/delivery_test.go,
+  pkg/cli/cli_show_services.go, pkg/dhcprelay/README.md, _Log.md
+
 ## 2026-06-24 — #2593 fix: SESSION_OPEN standard RT_FLOW line rendered `action=deny`
 
 - **Timestamp**: 2026-06-24
