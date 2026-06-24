@@ -61,20 +61,22 @@ func TestProbeICMPLinkLocalSendsWithExplicitZone(t *testing.T) {
 	}
 }
 
-// TestProbeICMPLinkLocalDefaultsZoneToBindDevice confirms a bare
-// link-local target with no %zone defaults the send zone to the resolved
-// egress device (opts.BindDevice — the same kernel ifname the data socket
-// binds via SO_BINDTODEVICE), derived from destination-interface.
-func TestProbeICMPLinkLocalDefaultsZoneToBindDevice(t *testing.T) {
+// TestProbeICMPLinkLocalDefaultsZoneToDestInterface confirms a bare
+// link-local target with no %zone defaults the send zone to the egress
+// device derived from destination-interface (via
+// routing.ResolveProbeInterface: slashes->dashes, RETH->member) — the
+// same kernel ifname the data socket binds via SO_BINDTODEVICE. The zone
+// is taken from destination-interface specifically, NOT from
+// opts.BindDevice (which may carry the routing-instance VRF fallback).
+func TestProbeICMPLinkLocalDefaultsZoneToDestInterface(t *testing.T) {
 	target := net.ParseIP("fe80::1")
 	m, conn := newFakeManager(func(b []byte, _ net.Addr) []fakeReply {
 		return []fakeReply{echoReply(t, b, true, false, target)}
 	})
 	test := &config.RPMTest{Name: "t", Target: "fe80::1", DestinationInterface: "ge-0/0/3"}
-	// opts.BindDevice mirrors what probeOpts derives from
-	// destination-interface (kernel ifname, slashes->dashes).
-	opts := probeSockOpts{BindDevice: "ge-0-0-3"}
-	if _, err := m.probeICMP(context.Background(), test, opts); err != nil {
+	// Pass NO BindDevice in opts — the zone must come from
+	// destination-interface, not from opts.BindDevice.
+	if _, err := m.probeICMP(context.Background(), test, probeSockOpts{}); err != nil {
 		t.Fatalf("probeICMP link-local default zone: %v", err)
 	}
 	dst, ok := conn.sentAddr[0].(*net.IPAddr)
@@ -82,7 +84,33 @@ func TestProbeICMPLinkLocalDefaultsZoneToBindDevice(t *testing.T) {
 		t.Fatalf("send addr type = %T, want *net.IPAddr", conn.sentAddr[0])
 	}
 	if dst.Zone != "ge-0-0-3" {
-		t.Fatalf("send zone = %q, want ge-0-0-3 (defaulted from BindDevice)", dst.Zone)
+		t.Fatalf("send zone = %q, want ge-0-0-3 (derived from destination-interface)", dst.Zone)
+	}
+}
+
+// TestProbeICMPLinkLocalRoutingInstanceOnlyHeld is the hostile-reviewer
+// case (#2494 fold): a routing-instance-only link-local test (no %zone,
+// no destination-interface) is rejected by the strict commit gate but can
+// reach the runtime on the lenient load / peer-sync path. probeOpts would
+// set opts.BindDevice = "vrf-<ri>" for it, but a VRF device is NOT an
+// egress link for fe80:: . The prober must HOLD with ErrProbeSetup (and
+// send nothing), NOT send to the VRF "zone" and count the failure as path
+// loss — that would defeat the #1960 hold-state doctrine for this combo.
+func TestProbeICMPLinkLocalRoutingInstanceOnlyHeld(t *testing.T) {
+	m, conn := newFakeManager(nil)
+	test := &config.RPMTest{Name: "t", Target: "fe80::1", RoutingInstance: "ISP-B"}
+	// opts mirrors what probeOpts derives for a routing-instance-only test:
+	// BindDevice = vrfDeviceName("ISP-B") = "vrf-ISP-B".
+	opts := probeSockOpts{BindDevice: "vrf-ISP-B"}
+	_, err := m.probeICMP(context.Background(), test, opts)
+	if err == nil {
+		t.Fatal("probeICMP routing-instance-only link-local returned nil error, want ErrProbeSetup")
+	}
+	if !errors.Is(err, ErrProbeSetup) {
+		t.Fatalf("err = %v, want ErrProbeSetup (must HOLD, not send to a VRF zone as path loss)", err)
+	}
+	if len(conn.sent) != 0 {
+		t.Fatalf("sent %d packets, want 0 (a VRF is not an egress link for fe80::)", len(conn.sent))
 	}
 }
 

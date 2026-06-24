@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/routing"
 	"golang.org/x/net/icmp"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/net/ipv6"
@@ -124,21 +125,32 @@ func (m *Manager) probeICMP(ctx context.Context, test *config.RPMTest, opts prob
 	// kernel cannot pick the egress link — the echo goes to the wrong
 	// link or fails. Honor an explicit `%zone` from the target literal
 	// (normalize Junos slash form to the kernel name); otherwise default
-	// the zone to the resolved egress device the data socket binds via
-	// SO_BINDTODEVICE (opts.BindDevice — already the kernel ifname). The
-	// commit-time gate (validateRPMLinkLocalZoneStrict) rejects a bare
-	// link-local with neither a zone nor a destination-interface, so by
-	// the time a probe runs one of the two is present (or the test was
-	// loaded leniently and HOLDS via the same missing-zone error below).
+	// the zone to the egress device derived from destination-interface
+	// (the same routing.ResolveProbeInterface mapping probeOpts uses for
+	// SO_BINDTODEVICE — RETH → physical member, slashes → dashes). NOTE:
+	// we deliberately do NOT fall back to opts.BindDevice here — that can
+	// hold the routing-instance VRF device ("vrf-<ri>") from probeOpts,
+	// which is NOT an egress link for fe80:: . A routing-instance-only
+	// link-local (no destination-interface, no %zone) is rejected by the
+	// strict commit gate (validateRPMLinkLocalZoneStrict), but can still
+	// reach here on the lenient load / peer-sync path; defaulting it to
+	// "vrf-<ri>" would let it SEND (counted as path loss) instead of
+	// HOLDING state, breaking the #1960 hold-state doctrine. Only a real
+	// destination-interface satisfies the link-local scope; with neither
+	// we fail closed with ErrProbeSetup so the test HOLDS.
 	if isV6 && dst.IsLinkLocalUnicast() {
 		if zone != "" {
 			zone = config.LinuxIfName(zone)
 		} else {
-			zone = opts.BindDevice
+			m.mu.RLock()
+			rethMap := m.rethMap
+			m.mu.RUnlock()
+			zone = routing.ResolveProbeInterface(test.DestinationInterface, rethMap)
 		}
 		if zone == "" {
 			return 0, fmt.Errorf("%w: icmp link-local target %s needs a zone "+
-				"(%%zone or destination-interface)", ErrProbeSetup, dst)
+				"(%%zone or destination-interface; a routing-instance VRF is not an egress link)",
+				ErrProbeSetup, dst)
 		}
 	}
 
