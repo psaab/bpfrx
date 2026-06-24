@@ -325,22 +325,44 @@ func TestGenerateProtocols_ISIS(t *testing.T) {
 	}
 }
 
-func TestGenerateProtocols_BGPExport(t *testing.T) {
+// TestGenerateProtocols_BGPExportNoLeak is the #2473 route-leak guard. A
+// Junos global `protocols bgp export <policy>` whose policy carries `from
+// protocol ospf` (or connected/static) MUST render as a peer-level
+// `neighbor <X> route-map <name> out` — NOT as `redistribute ospf
+// route-map ...` under `router bgp`. The old code routed bgp.Export
+// through resolveRedistribute, which emitted `redistribute ospf` and
+// actively ANNOUNCED the OSPF/connected RIB into BGP (internal subnets
+// leaked to external peers). Fail-on-revert: reverting to
+// resolveRedistribute makes `redistribute ospf` reappear → this test
+// fails.
+func TestGenerateProtocols_BGPExportNoLeak(t *testing.T) {
 	m := New()
+	po := &config.PolicyOptionsConfig{
+		PolicyStatements: map[string]*config.PolicyStatement{
+			"leak-ospf": {
+				Name: "leak-ospf",
+				Terms: []*config.PolicyTerm{
+					{Name: "t1", FromProtocols: []string{"ospf"}, Action: "accept"},
+				},
+			},
+		},
+	}
 	bgp := &config.BGPConfig{
 		LocalAS:  65001,
 		RouterID: "1.1.1.1",
-		Export:   []string{"connected", "static"},
+		Export:   []string{"leak-ospf"},
 		Neighbors: []*config.BGPNeighbor{
 			{Address: "10.0.2.1", PeerAS: 65002},
 		},
 	}
-	got := m.generateProtocols(nil, nil, bgp, nil, nil, "", 0, nil)
-	if !strings.Contains(got, "redistribute connected\n") {
-		t.Errorf("missing redistribute connected, got:\n%s", got)
+	got := m.generateProtocols(nil, nil, bgp, nil, nil, "", 0, po)
+	// The global export is applied as a peer-level default route-map out.
+	if !strings.Contains(got, "neighbor 10.0.2.1 route-map leak-ospf out\n") {
+		t.Errorf("missing peer-level route-map out for global export, got:\n%s", got)
 	}
-	if !strings.Contains(got, "redistribute static\n") {
-		t.Errorf("missing redistribute static, got:\n%s", got)
+	// The leak: a from-protocol global export must NOT emit redistribute.
+	if strings.Contains(got, "redistribute ospf") {
+		t.Errorf("ROUTE LEAK: global BGP export must not emit redistribute, got:\n%s", got)
 	}
 }
 
@@ -2007,6 +2029,12 @@ func TestGenerateProtocols_OSPFExportRouteMap(t *testing.T) {
 	}
 }
 
+// TestGenerateProtocols_BGPExportRouteMap covers the #2473 corrected
+// contract: a global `protocols bgp export <policy>` is applied to each
+// peer as `neighbor <X> route-map <policy> out`. The route-map itself is
+// rendered by generatePolicyOptions (verified separately); here we assert
+// the BGP render references it as a peer-level export, never as
+// `redistribute`.
 func TestGenerateProtocols_BGPExportRouteMap(t *testing.T) {
 	m := New()
 	po := &config.PolicyOptionsConfig{
@@ -2029,41 +2057,84 @@ func TestGenerateProtocols_BGPExportRouteMap(t *testing.T) {
 		},
 	}
 	got := m.generateProtocols(nil, nil, bgp, nil, nil, "", 0, po)
-	if !strings.Contains(got, "redistribute connected route-map bgp-export\n") {
-		t.Errorf("missing connected route-map, got:\n%s", got)
+	if !strings.Contains(got, "neighbor 10.0.2.1 route-map bgp-export out\n") {
+		t.Errorf("missing peer-level route-map out, got:\n%s", got)
 	}
-	if !strings.Contains(got, "redistribute static route-map bgp-export\n") {
-		t.Errorf("missing static route-map, got:\n%s", got)
+	if strings.Contains(got, "redistribute") {
+		t.Errorf("global BGP export must not emit redistribute, got:\n%s", got)
 	}
 }
 
-func TestGenerateProtocols_MixedBareAndRouteMap(t *testing.T) {
+// TestGenerateProtocols_BGPExportPrefixOnly covers #2473 failure mode 2: a
+// global export filtering on prefix/community with NO `from protocol` was
+// SILENTLY DROPPED (resolveRedistribute returned ""), so the operator's
+// advertise filter was never applied. It must now render as a working
+// peer-level `route-map out`.
+func TestGenerateProtocols_BGPExportPrefixOnly(t *testing.T) {
 	m := New()
 	po := &config.PolicyOptionsConfig{
 		PolicyStatements: map[string]*config.PolicyStatement{
-			"filter-connected": {
-				Name: "filter-connected",
+			"adv-filter": {
+				Name: "adv-filter",
 				Terms: []*config.PolicyTerm{
-					{Name: "t1", FromProtocols: []string{"direct"}, Action: "accept"},
+					// No FromProtocols — matches by community only.
+					{Name: "t1", FromCommunity: "no-export", Action: "reject"},
 				},
+				DefaultAction: "accept",
 			},
 		},
 	}
 	bgp := &config.BGPConfig{
 		LocalAS: 65001,
-		Export:  []string{"filter-connected", "static"},
+		Export:  []string{"adv-filter"},
 		Neighbors: []*config.BGPNeighbor{
 			{Address: "10.0.2.1", PeerAS: 65002},
 		},
 	}
 	got := m.generateProtocols(nil, nil, bgp, nil, nil, "", 0, po)
-	// Policy-based export should use route-map
-	if !strings.Contains(got, "redistribute connected route-map filter-connected\n") {
-		t.Errorf("missing route-map, got:\n%s", got)
+	if !strings.Contains(got, "neighbor 10.0.2.1 route-map adv-filter out\n") {
+		t.Errorf("prefix/community-only global export must apply as route-map out (was silently dropped), got:\n%s", got)
 	}
-	// Bare protocol should be plain redistribute
-	if !strings.Contains(got, "redistribute static\n") {
-		t.Errorf("missing bare redistribute static, got:\n%s", got)
+	if strings.Contains(got, "redistribute") {
+		t.Errorf("global BGP export must not emit redistribute, got:\n%s", got)
+	}
+}
+
+// TestGenerateProtocols_BGPExportCoexistence covers the #2473 coexistence
+// semantics (Junos most-specific-wins): a neighbor with its OWN export
+// overrides the global default for that neighbor, while a neighbor without
+// one inherits the global default. FRR accepts a single `route-map out`
+// per neighbor/AF, so exactly one is emitted per peer — never two
+// competing route-maps for one peer.
+func TestGenerateProtocols_BGPExportCoexistence(t *testing.T) {
+	m := New()
+	po := &config.PolicyOptionsConfig{
+		PolicyStatements: map[string]*config.PolicyStatement{
+			"global-default": {Name: "global-default", Terms: []*config.PolicyTerm{{Name: "t1", FromProtocols: []string{"static"}, Action: "accept"}}},
+			"peer-specific":  {Name: "peer-specific", Terms: []*config.PolicyTerm{{Name: "t1", FromProtocols: []string{"static"}, Action: "accept"}}},
+		},
+	}
+	bgp := &config.BGPConfig{
+		LocalAS: 65001,
+		Export:  []string{"global-default"},
+		Neighbors: []*config.BGPNeighbor{
+			// Inherits the global default.
+			{Address: "10.0.2.1", PeerAS: 65002, FamilyInet: true},
+			// Overrides the global default with its own export.
+			{Address: "10.0.2.2", PeerAS: 65003, FamilyInet: true, Export: []string{"peer-specific"}},
+		},
+	}
+	got := m.generateProtocols(nil, nil, bgp, nil, nil, "", 0, po)
+	if !strings.Contains(got, "neighbor 10.0.2.1 route-map global-default out\n") {
+		t.Errorf("neighbor without own export must inherit global default, got:\n%s", got)
+	}
+	if !strings.Contains(got, "neighbor 10.0.2.2 route-map peer-specific out\n") {
+		t.Errorf("neighbor with own export must override global default, got:\n%s", got)
+	}
+	// The overriding neighbor must NOT also get the global default
+	// (one route-map out per neighbor/AF).
+	if strings.Contains(got, "neighbor 10.0.2.2 route-map global-default out\n") {
+		t.Errorf("neighbor with own export must not also receive global default, got:\n%s", got)
 	}
 }
 

@@ -153,6 +153,36 @@ func (m *Manager) resolveRedistribute(export string, po *config.PolicyOptionsCon
 	return ""
 }
 
+// lastNonEmpty returns the last non-empty string in the slice, or "".
+// Used to pick the effective global BGP default export: when an operator
+// lists multiple `protocols bgp export` policies, FRR accepts only one
+// `route-map <name> out` per neighbor/address-family, and Junos set-style
+// accumulation means a later statement is the more-specific intent — so
+// the last entry wins.
+func lastNonEmpty(ss []string) string {
+	for i := len(ss) - 1; i >= 0; i-- {
+		if ss[i] != "" {
+			return ss[i]
+		}
+	}
+	return ""
+}
+
+// bgpEffectiveExport resolves the single peer-level export route-map name
+// for a BGP neighbor/address-family, applying Junos most-specific-wins:
+// the neighbor's own `export` (group/neighbor level) overrides the global
+// `protocols bgp export` default. FRR takes exactly one `route-map out`
+// per neighbor/AF, so we never emit two competing route-maps for one
+// peer; the neighbor's own policy, when present, is the one rendered.
+// Returns "" when neither the neighbor nor the global default sets an
+// export (no `route-map out` line is emitted).
+func bgpEffectiveExport(n *config.BGPNeighbor, globalExport string) string {
+	if rm := lastNonEmpty(n.Export); rm != "" {
+		return rm
+	}
+	return globalExport
+}
+
 // bfdProfile holds a unique BFD profile (interval + multiplier).
 type bfdProfile struct {
 	interval   int
@@ -362,14 +392,35 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 				fmt.Fprintf(&b, " neighbor %s remove-private-AS\n", n.Address)
 			}
 		}
-		for _, export := range bgp.Export {
-			b.WriteString(m.resolveRedistribute(export, policyOptions))
-		}
+		// A Junos global `protocols bgp export <policy>` is a DEFAULT
+		// export policy applied to every BGP peer, i.e. a peer-level
+		// `route-map <name> out` per neighbor/address-family — NOT
+		// protocol redistribution. It MUST NOT be routed through
+		// resolveRedistribute: doing so emitted `redistribute ospf
+		// route-map ...` under `router bgp`, which actively ANNOUNCES all
+		// OSPF/connected routes into BGP (route leak, #2473 failure mode
+		// 1), and for a prefix/community-only policy with no `from
+		// protocol` it returned "" and SILENTLY DROPPED the operator's
+		// advertise filter (#2473 failure mode 2). The route-map for the
+		// policy is already emitted by generatePolicyOptions, so applying
+		// it as `route-map out` filters what is advertised to peers
+		// without leaking the internal RIB into BGP.
+		//
+		// Coexistence (Junos most-specific-wins): a per-neighbor export
+		// overrides the global default for that neighbor. FRR accepts a
+		// single `route-map <name> out` per neighbor/AF, so we emit
+		// exactly one — the neighbor's own export when present, otherwise
+		// the global default. bgpEffectiveExport() encodes this choice.
+		globalExport := lastNonEmpty(bgp.Export)
 
-		// Address-family blocks for neighbors with family declarations
+		// Address-family blocks for neighbors with family declarations.
+		// When a global default export exists it must reach EVERY peer,
+		// including neighbors with no explicit `family` (FRR default-
+		// activates those under ipv4 unicast), so route them into the
+		// ipv4 set in that case.
 		var inet4Neighbors, inet6Neighbors []*config.BGPNeighbor
 		for _, n := range bgp.Neighbors {
-			if n.FamilyInet {
+			if n.FamilyInet || (globalExport != "" && !n.FamilyInet6) {
 				inet4Neighbors = append(inet4Neighbors, n)
 			}
 			if n.FamilyInet6 {
@@ -393,8 +444,8 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 				if n.PrefixLimitInet > 0 {
 					fmt.Fprintf(&b, "  neighbor %s maximum-prefix %d\n", n.Address, n.PrefixLimitInet)
 				}
-				for _, exp := range n.Export {
-					fmt.Fprintf(&b, "  neighbor %s route-map %s out\n", n.Address, exp)
+				if rm := bgpEffectiveExport(n, globalExport); rm != "" {
+					fmt.Fprintf(&b, "  neighbor %s route-map %s out\n", n.Address, rm)
 				}
 			}
 			b.WriteString(" exit-address-family\n")
@@ -412,8 +463,8 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 				if n.PrefixLimitInet6 > 0 {
 					fmt.Fprintf(&b, "  neighbor %s maximum-prefix %d\n", n.Address, n.PrefixLimitInet6)
 				}
-				for _, exp := range n.Export {
-					fmt.Fprintf(&b, "  neighbor %s route-map %s out\n", n.Address, exp)
+				if rm := bgpEffectiveExport(n, globalExport); rm != "" {
+					fmt.Fprintf(&b, "  neighbor %s route-map %s out\n", n.Address, rm)
 				}
 			}
 			b.WriteString(" exit-address-family\n")

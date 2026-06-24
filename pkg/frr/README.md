@@ -85,7 +85,9 @@ move or rename the markers — they're literal strings.
   `export` (OSPF/OSPFv3/BGP/IS-IS), a RIP `redistribute`, a BGP
   group/neighbor `export`, and a `routing-options forwarding-table export`
   are checked against the defined policy-statement set (and, for the
-  redistribute-backed exports, the known protocol tokens
+  redistribute-backed exports — OSPF/OSPFv3/RIP/IS-IS; BGP exports render
+  as peer-level `route-map out`, not redistribute, see #2473 below — the
+  known protocol tokens
   `connected`/`direct`/`static`/`kernel`/`ospf`/`bgp`/`rip`/`isis`) by
   `validateRoutingExportReferencesStrict` in `pkg/config/compiler.go`.
   Strict on commit/commit-check; lenient (warn) on load/HA-sync (#1960).
@@ -102,6 +104,30 @@ move or rename the markers — they're literal strings.
   the FRR-invalid `redistribute direct`, failing the reload) — matching the
   policy-term `FromProtocols` normalization and keeping the commit gate's
   acceptance of `direct` honest.
+- **A global `protocols bgp export <policy>` renders as a peer-level
+  `route-map <name> out`, NOT `redistribute` (#2473).** In Junos a global
+  BGP export is a DEFAULT export policy applied to every peer (a
+  group/global default), not protocol redistribution. The old render
+  routed `bgp.Export` through `resolveRedistribute`, which produced
+  `redistribute ospf route-map ...` under `router bgp` — actively
+  ANNOUNCING the OSPF/connected RIB into BGP (route leak: internal subnets
+  advertised to external peers, failure mode 1) — and for a
+  prefix/community-only policy with no `from protocol` returned `""`,
+  SILENTLY DROPPING the operator's advertise filter (failure mode 2).
+  `generateProtocols` now applies the global export as a peer-level
+  `neighbor <X> route-map <name> out` per neighbor/address-family
+  (`bgpEffectiveExport` + `lastNonEmpty` helpers), referencing the same
+  route-map `generatePolicyOptions` already emits for the policy. Neighbors
+  with no explicit `family` are routed into the ipv4-unicast block when a
+  global export is set (FRR default-activates them there) so the default
+  reaches every peer. **Coexistence (Junos most-specific-wins):** a
+  per-neighbor (group/neighbor) `export` OVERRIDES the global default for
+  that neighbor — FRR accepts a single `route-map out` per neighbor/AF, so
+  exactly one is emitted (the neighbor's own when present, else the global
+  default); the two never compete on one peer. `redistribute` is now
+  reserved strictly for OSPF/OSPFv3/RIP/IS-IS `export`/`redistribute`,
+  which ARE genuine FRR redistribution. `resolveRedistribute` is no longer
+  called on the BGP export path.
 - **`resolveRedistribute` never emits an invalid `redistribute <name>`
   line (#2223).** FRR's `redistribute` requires a source-protocol token
   (`connected`/`static`/`ospf`/`bgp`/`rip`/`isis`/`kernel`); a bare
