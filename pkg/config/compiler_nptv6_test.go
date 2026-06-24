@@ -127,6 +127,88 @@ func TestNPTv6RejectsUnsupportedLength(t *testing.T) {
 	}
 }
 
+// TestNPTv6RejectsHostBitsInMatch is the #2380 FAIL-ON-REVERT proof for the
+// match (external) prefix. net.ParseCIDR silently masks, so pre-fix
+// `2001:db8:1:2::/48` compiled as the DIFFERENT prefix `2001:db8:1::/48` with
+// no operator feedback. The host-bits gate now rejects it at commit.
+func TestNPTv6RejectsHostBitsInMatch(t *testing.T) {
+	tree := buildTree(t, nptv6Set([3]string{"r1", "2001:db8:1:2::/48", "fd00:1::/48"}))
+	_, err := CompileConfig(tree)
+	if err == nil {
+		t.Fatal("NPTv6 match prefix with host bits set beyond /48 must be rejected")
+	}
+	if !strings.Contains(err.Error(), "host bits set") ||
+		!strings.Contains(err.Error(), "match destination-address") {
+		t.Fatalf("error must flag host bits set on the match prefix, got: %v", err)
+	}
+}
+
+// TestNPTv6RejectsHostBitsInThen is the #2380 FAIL-ON-REVERT proof for the
+// then (internal) prefix. The match prefix is clean so only the then side
+// trips the gate.
+func TestNPTv6RejectsHostBitsInThen(t *testing.T) {
+	tree := buildTree(t, nptv6Set([3]string{"r1", "2001:db8:1::/48", "fd00:0:0:2::/48"}))
+	_, err := CompileConfig(tree)
+	if err == nil {
+		t.Fatal("NPTv6 nptv6-prefix with host bits set beyond /48 must be rejected")
+	}
+	if !strings.Contains(err.Error(), "host bits set") ||
+		!strings.Contains(err.Error(), "nptv6-prefix") {
+		t.Fatalf("error must flag host bits set on the nptv6-prefix, got: %v", err)
+	}
+}
+
+// TestNPTv6RejectsHostBitsIn64 covers the /64 case: the 4th word is part of
+// the prefix at /64, so a bit must be set in the 5th word (or beyond) to be a
+// host bit.
+func TestNPTv6RejectsHostBitsIn64(t *testing.T) {
+	tree := buildTree(t, nptv6Set([3]string{"r1", "2001:db8:1:2:3::/64", "fd00:1:2:3::/64"}))
+	_, err := CompileConfig(tree)
+	if err == nil {
+		t.Fatal("NPTv6 /64 prefix with host bits set beyond /64 must be rejected")
+	}
+	if !strings.Contains(err.Error(), "host bits set") {
+		t.Fatalf("error must flag host bits set, got: %v", err)
+	}
+}
+
+// TestNPTv6CleanPrefixHasNoHostBits is the control: a masked /48 and /64 with
+// no host bits must still compile cleanly (the gate must not over-reject).
+func TestNPTv6CleanPrefixHasNoHostBits(t *testing.T) {
+	cfg, err := CompileConfig(buildTree(t, nptv6Set(
+		[3]string{"r1", "2001:db8:1::/48", "fd00:1::/48"},
+		[3]string{"r2", "2001:db8:2:3::/64", "fd00:2:3::/64"},
+	)))
+	if err != nil {
+		t.Fatalf("clean NPTv6 prefixes must compile, got: %v", err)
+	}
+	for _, w := range cfg.Warnings {
+		if strings.Contains(w, "host bits") {
+			t.Fatalf("clean NPTv6 config must not warn about host bits, got: %q", w)
+		}
+	}
+}
+
+// TestNPTv6HostBitsLenientWarns: under lenient load the host-bits violation is
+// surfaced as a warning (not a hard error), matching the existing #2240/#2241
+// strict/lenient routing (the helper independently rejects the snapshot).
+func TestNPTv6HostBitsLenientWarns(t *testing.T) {
+	tree := buildTree(t, nptv6Set([3]string{"r1", "2001:db8:1:2::/48", "fd00:1::/48"}))
+	cfg, err := CompileConfigLenient(tree)
+	if err != nil {
+		t.Fatalf("lenient compile must NOT fail on host-bits violation, got: %v", err)
+	}
+	found := false
+	for _, w := range cfg.Warnings {
+		if strings.Contains(w, "host bits set") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("lenient compile must warn about host bits, got warnings: %v", cfg.Warnings)
+	}
+}
+
 func TestNPTv6RejectsNonIPv6(t *testing.T) {
 	// An IPv4 prefix in the match slot. ParseCIDR accepts it; the family check
 	// must reject it as non-IPv6.
@@ -172,13 +254,19 @@ func TestNPTv6IPv4MappedFamilyParity(t *testing.T) {
 	// parse_prefix.
 	lines := nptv6Set([3]string{"mapped", "::ffff:1.2.3.4/48", "fd00:1::/48"})
 
-	// Strict compile must NOT reject on the "must be IPv6" family ground.
+	// Strict compile must NOT reject on the "must be IPv6" family ground. Note
+	// that ::ffff:1.2.3.4 carries the embedded IPv4 in word 5, which IS a host
+	// bit beyond /48, so the #2380 host-bits gate legitimately rejects this
+	// rule at commit — that rejection is correct and intended. The parity
+	// invariant under test is narrower: the FAMILY classification must reach
+	// the same v6 verdict as Rust, i.e. the rejection (if any) must NOT be the
+	// "must be IPv6" family error. A To4() regression would fire the family
+	// gate instead, which this asserts against.
 	if _, err := CompileConfig(buildTree(t, lines)); err != nil {
 		if strings.Contains(err.Error(), "must be IPv6") {
 			t.Fatalf("IPv4-mapped IPv6 NPTv6 prefix must be classified as IPv6 (parity with Rust "+
 				"Ipv6Addr::from_str), not rejected by the To4()-based family gate; got: %v", err)
 		}
-		t.Fatalf("unexpected strict rejection of IPv4-mapped IPv6 NPTv6 rule: %v", err)
 	}
 
 	// Lenient compile must NOT emit the family ("must be IPv6") warning either —
