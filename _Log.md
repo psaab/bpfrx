@@ -1,5 +1,43 @@
 # Action Log
 
+## 2026-06-24 — #2624 fix: MQFQ V_min cadence persists across drain calls
+
+- **Timestamp**: 2026-06-24
+- **Action**: agy review-041 finding 041-01 (LOW, performance). The MQFQ
+  cross-worker V_min sync cadence (`V_MIN_READ_CADENCE = 8`, gating the
+  expensive `participating_v_min_snapshot` peer-slot scan) was defeated
+  because `v_min_pop_count` was a `let mut = 0u32` re-initialized at the
+  top of BOTH `drain_exact_*_to_scratch_flow_fair` fns. Each drain's
+  first pop hit `pop_count == 1`, bypassing the cadence gate and running
+  a full peer-slot Acquire-load scan on every drain call — under
+  low/medium load (many small drains) the scan ran continuously,
+  generating cross-core cache-line ping-pong.
+  - FIX: moved the counter to `VMinQueueState::v_min_pop_count` (persists
+    across drain calls). The cadence is now counted over POPS THAT
+    ACTUALLY PROCEED: a throttled drain breaks WITHOUT advancing the
+    counter (`candidate = persisted+1`; persist only after the gate
+    passes), so the next drain re-checks at the same cadence position —
+    this preserves the #941 hard-cap retry semantics
+    (`vmin_prepared_drain_arms_hard_cap_after_repeated_throttle` stays
+    green). Both flow-fair drains share the one counter; single-writer
+    (owning worker), no atomics — same model as `consecutive_v_min_skips`.
+  - TEST: `vmin_cadence_persists_across_small_drain_calls` drives 17
+    one-pop drains with a participating peer (within lag → gate passes
+    each pop) and asserts the snapshot ran exactly 3 times (pops 1, 8,
+    16) via a new `#[cfg(test)]` `SharedCoSQueueVtimeFloor::snapshot_calls`
+    counter. Fail-on-revert: restoring the per-call `let mut = 0u32`
+    makes it 17 snapshots → red (proven both directions).
+  - Validation: `cargo build --release` green; full
+    `cargo test --release --bin xpf-userspace-dp` 2710 passed, only the
+    known `concurrent_recovery_processes_each_command_exactly_once` flake
+    failed (passes in isolation).
+- **File(s)**: userspace-dp/src/afxdp/cos/queue_service/drain.rs,
+  userspace-dp/src/afxdp/types/cos.rs,
+  userspace-dp/src/afxdp/types/shared_cos_lease/vtime.rs,
+  userspace-dp/src/afxdp/cos/queue_ops/v_min_tests.rs,
+  userspace-dp/src/afxdp/cos/builders.rs (+ test struct-literal sites),
+  userspace-dp/src/afxdp/cos/README.md, docs/fairness-regimes.md
+
 ## 2026-06-24 — #2616/#2618/#2619 fix: firewall-filter fall-through log metadata
 
 - **Timestamp**: 2026-06-24

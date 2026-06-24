@@ -1260,3 +1260,89 @@ fn vmin_local_hard_cap_suspension_carries_into_prepared_drain() {
         "Prepared drain must consume exactly one queue-level suspension slot",
     );
 }
+
+/// #2624: the V_min cadence (`participating_v_min_snapshot`, the
+/// expensive Acquire-load peer-slot scan) must be honored ACROSS many
+/// small drain calls — not re-armed on the first pop of every call.
+///
+/// `v_min_pop_count` persists on `queue.v_min`, so popping one item per
+/// drain call across 17 calls runs the snapshot only at pops 1, 8, 16
+/// (3 times), not once per call. fail-on-revert: restoring the old
+/// per-call `let mut v_min_pop_count = 0u32;` re-arms the mandatory
+/// first-pop snapshot every call → 17 snapshots → assertion fails.
+#[test]
+fn vmin_cadence_persists_across_small_drain_calls() {
+    let umem = MmapArea::new(2 * 1024 * 1024).expect("umem");
+    let mut root = test_cos_runtime_with_queues(
+        10_000_000_000 / 8,
+        vec![CoSQueueConfig {
+            queue_id: 0,
+            forwarding_class: "iperf-c".into(),
+            priority: 5,
+            transmit_rate_bytes: 10_000_000_000 / 8,
+            guarantee_enabled: true,
+            exact: true,
+            surplus_sharing: false,
+            equal_flow_enforcement: false,
+            equal_flow_target_policy: EqualFlowTargetPolicy::Slowest,
+            surplus_weight: 1,
+            buffer_bytes: COS_MIN_BURST_BYTES,
+            dscp_rewrite: None,
+            codel_target_ns: 0,
+        }],
+    );
+    let queue = &mut root.queues[0];
+    let floor = attach_test_vtime_floor(queue, 4, 1);
+    // A peer participates with a HIGH v_min and the local queue_vtime
+    // sits at 0, so the lag check always passes (continue == true) and
+    // every cadence pop reaches the snapshot — isolating the cadence
+    // counter, not the throttle decision.
+    floor.slots[0].publish(u64::MAX - 1);
+    test_flow_fair_state_mut(queue).queue_vtime = 0;
+
+    const PKT: usize = 1500;
+    const CALLS: usize = 17;
+    // One free TX frame and a budget of exactly one packet per call →
+    // each drain pops exactly one item, modelling the many-small-drains
+    // regime under low/medium load where the defect bites.
+    let mut scratch: Vec<(u64, TxRequest)> = Vec::new();
+    for _ in 0..CALLS {
+        cos_queue_push_back(queue, test_cos_item(PKT));
+    }
+
+    for call in 0..CALLS {
+        scratch.clear();
+        let mut free_tx: VecDeque<u64> = VecDeque::new();
+        // Distinct UMEM offset per call so the frame copy succeeds.
+        free_tx.push_back((call as u64) * 2048);
+        let _ = drain_exact_local_items_to_scratch_flow_fair(
+            queue,
+            &mut free_tx,
+            &mut scratch,
+            &umem,
+            PKT as u64,
+            PKT as u64,
+            None,
+        );
+        assert_eq!(
+            scratch.len(),
+            1,
+            "each small drain call should pop exactly one item (call {call})",
+        );
+    }
+
+    // Persistent counter advanced once per pop across all calls.
+    assert_eq!(
+        queue.v_min.v_min_pop_count, CALLS as u32,
+        "v_min_pop_count must persist and count every pop across drain calls",
+    );
+    // Snapshot ran only at pops 1, 8, 16 — three times, NOT once per call.
+    let snapshots = floor
+        .snapshot_calls
+        .load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(
+        snapshots, 3,
+        "V_min snapshot must run at the cadence (pops 1, 8, 16) across {CALLS} small \
+         drains, not once per call; got {snapshots}",
+    );
+}

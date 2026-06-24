@@ -92,6 +92,24 @@ mod.rs for further file-level breakdown.
   binding is the same worker that owns the queue's
   `FlowFairState`; therefore `observed_bps` updates and reads do not
   need atomic synchronization.
+- **V_min cadence persists across drain calls (#2624).** The
+  cross-worker V_min sync (`cos_queue_v_min_continue` → the expensive
+  `participating_v_min_snapshot` Acquire-load scan of every peer
+  worker's slot) is rate-limited to the first proceeding pop and every
+  `V_MIN_READ_CADENCE`-th pop thereafter. The cadence counter
+  (`VMinQueueState::v_min_pop_count`) lives on the per-queue runtime, NOT
+  as a `let mut = 0` local re-initialized at the top of each
+  `drain_exact_*_to_scratch_flow_fair` call: under low/medium load the
+  queue is drained in many small batches, so a per-call reset re-armed
+  the mandatory first-pop full scan on EVERY drain, generating continuous
+  cross-core cache-line ping-pong and defeating the cadence. It is
+  counted over POPS THAT ACTUALLY PROCEED — a throttled drain breaks
+  WITHOUT advancing it, so the next drain re-checks at the same cadence
+  position (preserving the #941 hard-cap retry semantics). Both flow-fair
+  drains (Local + Prepared) for a queue run on that queue's single owner
+  worker and share the one counter, so it is a plain `u32` with no
+  atomics — the same single-writer model as the sibling
+  `consecutive_v_min_skips` / `v_min_suspended_remaining` fields.
 - Prepared CoS items may carry frames from another binding in the same
   shared-UMEM group. Queue overflow, capacity rejection, local
   demotion, cross-binding copy, and runtime reset must thread the
