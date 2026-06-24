@@ -331,7 +331,7 @@ xpf has static routes, generate/aggregate routes, ECMP, VRFs, GRE tunnels, IPIP 
 
 | Feature | Junos Config Path | Description | Priority | Status |
 |---------|-------------------|-------------|----------|--------|
-| **BFD** | `protocols ospf area ... interface ... bfd-liveness-detection ...` | Bidirectional Forwarding Detection for sub-second failure detection on routing adjacencies. FRR supports BFD natively. | High | **Done** -- OSPF BFD with interval/multiplier via FRR profiles, IS-IS BFD support with optional interval/multiplier, BGP BFD multiplier configurable. |
+| **BFD** | `protocols ospf area ... interface ... bfd-liveness-detection ...` | Bidirectional Forwarding Detection for sub-second failure detection on routing adjacencies. FRR supports BFD natively. | High | **Done** -- OSPF (v2) and OSPFv3 (`protocols ospf3 area ... interface ... bfd-liveness-detection`, renders `ipv6 ospf6 bfd`, #2474) BFD with interval/multiplier via FRR profiles, IS-IS BFD support with optional interval/multiplier, BGP BFD multiplier configurable. |
 | **BGP Import Policy** | `protocols bgp ... import <policy>` | Inbound route filtering on a BGP peer (`route-map ... in`). | Medium | **Done (#2490)** — `Import []string` parsed at global/group/neighbor scope (symmetric to `export`), rendered `neighbor <X> route-map <name> in` per neighbor/AF (`bgpEffectiveImport` + `lastNonEmpty`, most-specific-wins). Import has NO redistribute equivalent, so a ref MUST be a defined policy-statement: an undefined/bare-token ref is rejected at commit (lenient-warn on load/peer-sync) and SKIPPED at render (`isDefinedPolicyStatement` guard), never emitting a dangling `route-map in` (the #2473 permit-all leak, inbound side). The same `isDefinedPolicyStatement` guard was added to BOTH `route-map out` emit sites (#2539) so a per-neighbor export — newly parseable as of #2490 — cannot leak permit-all OUTBOUND on the lenient path either. Before #2490 the `import` clause parsed to nothing — a silent no-op. |
 | **Graceful Restart** | `routing-options graceful-restart` | Non-stop routing during control plane restart. Keep forwarding while protocols reconverge. FRR supports GR. | Medium | Missing (FRR has GR but xpf doesn't configure it) |
 | **Aggregate Routes** | `routing-options aggregate route ...` | Aggregate (summary) routes with policy control, different from generate routes in contributing route behavior | Medium | Partial (generate routes implemented but aggregate semantics differ) |
@@ -789,7 +789,8 @@ evidence, not as active eBPF source-removal blockers.
   blockers.
 
 ### BFD (Tier 1) -- DONE
-- OSPF BFD with interval/multiplier via FRR profiles
+- OSPF (v2) BFD with interval/multiplier via FRR profiles
+- OSPFv3 BFD with interval/multiplier via FRR profiles (renders `ipv6 ospf6 bfd`, #2474)
 - IS-IS BFD support with optional interval/multiplier
 - BGP BFD multiplier configurable (was hardcoded to 3)
 

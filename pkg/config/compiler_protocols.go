@@ -535,6 +535,24 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 								iface.Cost = n
 							}
 						}
+					case "bfd-liveness-detection":
+						iface.BFD = true
+						for _, bc := range prop.Children {
+							switch bc.Name() {
+							case "minimum-interval":
+								if v := nodeVal(bc); v != "" {
+									if n, err := strconv.Atoi(v); err == nil {
+										iface.BFDInterval = n
+									}
+								}
+							case "multiplier":
+								if v := nodeVal(bc); v != "" {
+									if n, err := strconv.Atoi(v); err == nil {
+										iface.BFDMultiplier = n
+									}
+								}
+							}
+						}
 					}
 				}
 				area.Interfaces = append(area.Interfaces, iface)

@@ -154,6 +154,10 @@ var schemaProtocols = &schemaNode{desc: "Protocols configuration", children: map
 			"interface": {desc: "Interface", args: 1, valueHint: ValueHintInterfaceName, placeholder: "<interface-name>", children: map[string]*schemaNode{
 				"passive": {desc: "Passive interface", children: nil},
 				"cost":    {desc: "Interface cost", args: 1, placeholder: "<cost>", children: nil},
+				"bfd-liveness-detection": {desc: "BFD liveness detection", children: map[string]*schemaNode{
+					"minimum-interval": {desc: "Minimum interval", args: 1, placeholder: "<milliseconds>", children: nil},
+					"multiplier":       {desc: "Multiplier", args: 1, placeholder: "<multiplier>", children: nil},
+				}},
 			}},
 		}},
 	}},
@@ -462,6 +466,10 @@ var schemaRoutingInstances = &schemaNode{desc: "Routing instance configuration",
 				"interface": {desc: "Interface", args: 1, valueHint: ValueHintInterfaceName, placeholder: "<interface-name>", children: map[string]*schemaNode{
 					"passive": {desc: "Passive interface", children: nil},
 					"cost":    {desc: "Interface cost", args: 1, placeholder: "<cost>", children: nil},
+					"bfd-liveness-detection": {desc: "BFD liveness detection", children: map[string]*schemaNode{
+						"minimum-interval": {desc: "Minimum interval", args: 1, placeholder: "<milliseconds>", children: nil},
+						"multiplier":       {desc: "Multiplier", args: 1, placeholder: "<multiplier>", children: nil},
+					}},
 				}},
 			}},
 		}},
