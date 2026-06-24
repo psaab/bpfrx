@@ -32,13 +32,22 @@ pub(crate) const PROTO_SCTP: u8 = 132;
 /// mirrors the Go SSOT `appid.ProtocolNumber` (the table the commit-time gate
 /// validates against) so the two views agree on the accepted set.
 ///
-/// `junos-*` aliases are NOT handled here: the Go compiler resolves an
-/// `application junos-foo` to its numeric protocol before building the
-/// snapshot, so the wire `protocol` is already a bare name or number. Returns
-/// `None` for an unrecognized token; the DNAT commit gate
-/// (validateDestinationNATProtocolStrict, #2396) rejects an unresolvable DNAT
-/// protocol so an inert rule never reaches the wire, and the dataplane drops
-/// any that slip through a tolerant load.
+/// The specific `junos-*` protocol aliases the Go SSOT resolves
+/// (`appid.ProtocolNumber`) are handled here too (#2505): a firewall
+/// filter's `from protocol <token>` reaches the wire VERBATIM from the
+/// parser (`compileFilterFrom` assigns `term.Protocol = nodeVal` with no
+/// alias resolution), so a config `from protocol junos-gre` arrives as the
+/// literal alias string. The Go filter commit gate
+/// (`filterProtocolResolvable`, #2175/#2505) accepts exactly the
+/// `appid.ProtocolNumber` set, so this resolver must accept the same aliases
+/// or a gate-passing filter would silently lose its protocol constraint in
+/// the dataplane (the #2505 fail-wide bug). An UNKNOWN `junos-foobar` is NOT
+/// accepted (consistent with the gate, which rejects it). Returns `None` for
+/// an unrecognized token; the DNAT commit gate
+/// (validateDestinationNATProtocolStrict, #2396) and the filter commit gate
+/// reject an unresolvable protocol so an inert rule never reaches the wire,
+/// and the dataplane fails closed (rejecting the snapshot) on any that slip
+/// through a tolerant load.
 ///
 /// #2396 (Copilot fold): the token is trimmed and lower-cased before matching.
 /// DNAT `match protocol` and an `application`'s `protocol` reach the wire
@@ -49,13 +58,13 @@ pub(crate) const PROTO_SCTP: u8 = 132;
 /// validating, so the two views agree on the accepted set after normalization.
 pub(crate) fn proto_number(name: &str) -> Option<u8> {
     match name.trim().to_ascii_lowercase().as_str() {
-        "tcp" => Some(PROTO_TCP),
-        "udp" => Some(PROTO_UDP),
-        "icmp" => Some(PROTO_ICMP),
-        "icmp6" | "icmpv6" => Some(PROTO_ICMPV6),
-        "gre" => Some(PROTO_GRE),
-        "ospf" => Some(PROTO_OSPF),
-        "ipip" => Some(PROTO_IPIP),
+        "tcp" | "junos-tcp-any" => Some(PROTO_TCP),
+        "udp" | "junos-udp-any" => Some(PROTO_UDP),
+        "icmp" | "junos-icmp-all" | "junos-ping" => Some(PROTO_ICMP),
+        "icmp6" | "icmpv6" | "junos-icmp6-all" | "junos-pingv6" => Some(PROTO_ICMPV6),
+        "gre" | "junos-gre" => Some(PROTO_GRE),
+        "ospf" | "junos-ospf" => Some(PROTO_OSPF),
+        "ipip" | "junos-ip-in-ip" | "junos-ipip" => Some(PROTO_IPIP),
         "egp" => Some(PROTO_EGP),
         "igmp" => Some(PROTO_IGMP),
         "pim" => Some(PROTO_PIM),
