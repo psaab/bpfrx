@@ -167,6 +167,13 @@ load/peer-sync compile paths.
   VLAN sub-interfaces (the kernel's raw IP doesn't reliably receive
   multicast on VLANs).
 - IPv6: separate raw socket; hop limit set to 255 per RFC.
+- The AF_PACKET capture fd is created `SOCK_RAW|SOCK_CLOEXEC` so it is set
+  close-on-exec atomically at creation (#2476). A raw `unix.Socket` does NOT
+  inherit CLOEXEC the way Go `net` sockets do, so without this the raw VRRP
+  capture fd would leak into every child the daemon execs (frr-reload.py,
+  swanctl, dhcp helpers) — an fd leak and a security boundary (a child could
+  read raw VRRP frames). The OR-into-type form avoids the fork race a separate
+  `fcntl(FD_CLOEXEC)` would open.
 
 ### Receiver goroutine model
 
