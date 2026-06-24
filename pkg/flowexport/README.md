@@ -32,10 +32,32 @@ the RT_FLOW frame is additive, not a replacement, so HA session sync is
 unaffected. The record carries the real 5-tuple, NAT translated tuple,
 zones, and protocol; the byte/packet volume counters are 0 because the
 AF_XDP forwarding path does not yet maintain per-session accounting — that
-is the follow-up tracked in **#2501**. The exported flow duration is
-derived from the packet count (`estimateSessionDuration(SessionPkts)`),
-not the close record's `created`/`ElapsedTime` field, so it is also 0
-until #2501 populates the counters.
+is the follow-up tracked in **#2501**.
+
+**#2465 — the exported flow StartTime is now the real session-creation
+time, not a packet-count guess.** Before #2465 the NetFlow v9 / IPFIX
+session-close exporters set the flow `StartTime` to
+`EndTime - estimateSessionDuration(packet_count)` — a heuristic
+(100ms·pkts for TCP, 50ms·pkts otherwise) that systematically mis-timed
+flows (long idle sessions exported as very short; high-rate bursts
+exported as long), degrading billing / audit / DDoS-reconstruction /
+duration analytics. The SESSION_CLOSE RT_FLOW frame now carries the
+session's real creation instant in the `created` wire field (offset 108,
+absolute Unix **seconds**, little-endian u32) and the close instant in
+`timestamp_ns` (offset 0, absolute Unix **nanoseconds**, little-endian
+u64). The dataplane stamps the creation instant once at session install
+(monotonic `CLOCK_MONOTONIC`), and the helper converts it to wall-clock
+at emit time. The Go decoder surfaces `created` as
+`logging.EventRecord.Created`; `flowStartTime` (manager.go) sets
+`StartTime = time.Unix(Created, 0)` directly when it is non-zero (clamped
+to the EndTime on clock skew). `estimateSessionDuration` is retained ONLY
+as the fallback when `Created == 0` — an old-format frame, or a
+synthesized close from a path that carried no creation instant (the
+explicit clear-session / NAT-remap delete glue and the HA tunnel-remap
+purge, which do not have the originating entry in hand). Each fallback
+bumps a per-exporter `EstimatedDurations()` counter so operators can see
+how often the heuristic is still in play. The byte/packet **volume**
+counters remain 0 pending #2501 — only the timing is now real.
 
 ## File layout
 

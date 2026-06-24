@@ -146,6 +146,9 @@ impl SessionTable {
                 origin,
                 install_epoch: epoch,
                 last_seen_ns: now_ns,
+                // #2465: stamp the creation instant once at install. Never
+                // re-stamped, so the close delta reports the true session age.
+                created_ns: now_ns,
                 expires_after_ns: session_timeout_ns(protocol, tcp_flags, &self.timeouts),
                 closing: matches!(protocol, PROTO_TCP) && is_closing(tcp_flags),
                 wheel_tick: 0,
@@ -185,6 +188,12 @@ impl SessionTable {
                 metadata,
                 origin,
                 fabric_redirect_sync: false,
+                // #2465: an Open delta carries the install instant. The
+                // SESSION_CREATE RT_FLOW frame does not report a duration, so
+                // these are informational here, but keeping them consistent
+                // with the entry avoids a 0/unknown asymmetry.
+                created_ns: now_ns,
+                last_seen_ns: now_ns,
             });
         }
         true
@@ -252,6 +261,12 @@ impl SessionTable {
                 origin,
                 install_epoch: epoch,
                 last_seen_ns: now_ns,
+                // #2465: a re-imported synced entry stamps its creation instant
+                // to the import time. The peer's original creation time is not
+                // carried on the HA session-sync delta, so this best-effort
+                // stamp is the local re-import time; the local close that
+                // follows reports age from here.
+                created_ns: now_ns,
                 expires_after_ns: session_timeout_ns(protocol, tcp_flags, &self.timeouts),
                 closing: matches!(protocol, PROTO_TCP) && is_closing(tcp_flags),
                 wheel_tick: 0,
@@ -295,6 +310,10 @@ impl SessionTable {
             metadata,
             origin,
             fabric_redirect_sync,
+            // #2465: an explicit Open-delta emit (no entry in hand). The
+            // SESSION_CREATE frame reports no duration, so 0/unknown is fine.
+            created_ns: 0,
+            last_seen_ns: 0,
         });
     }
 
@@ -308,6 +327,11 @@ impl SessionTable {
         if metadata.is_reverse {
             return;
         }
+        // #2465: this explicit-close API (clear-session / NAT-remap delete
+        // glue) does not carry the originating entry's creation instant — the
+        // caller has typically already removed the entry. Emit 0/unknown so the
+        // exporter falls back to the packet-count estimate. The dominant close
+        // path (idle/age expiry in session/expire.rs) carries real timestamps.
         self.push_delta(SessionDelta {
             kind: SessionDeltaKind::Close,
             key,
@@ -315,6 +339,8 @@ impl SessionTable {
             metadata,
             origin,
             fabric_redirect_sync: false,
+            created_ns: 0,
+            last_seen_ns: 0,
         });
     }
 

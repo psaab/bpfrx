@@ -190,6 +190,15 @@ struct SessionEntry {
     origin: SessionOrigin,
     install_epoch: u64,
     last_seen_ns: u64,
+    /// #2465: monotonic (`CLOCK_MONOTONIC`) nanosecond timestamp at which this
+    /// entry was first installed. Unlike `last_seen_ns` it is write-once: it is
+    /// NOT re-stamped by `touch`/`update_session`/`refresh_for_ha_transition`,
+    /// so it preserves the true session age across the lifetime of the entry.
+    /// Carried into the close `SessionDelta` so the RT_FLOW SESSION_CLOSE frame
+    /// reports a real flow StartTime (`#2465`) instead of the packet-count
+    /// heuristic. A re-import (`upsert_synced`) or a fresh install stamps it to
+    /// the install `now_ns`.
+    created_ns: u64,
     expires_after_ns: u64,
     closing: bool,
     /// #965: absolute wheel tick at which this session is scheduled to
@@ -747,6 +756,14 @@ impl SessionTable {
             // moved into the delta below.
             let (sip, dip) = (key.src_ip, key.dst_ip);
             self.session_limit_inc(sip, dip);
+            // #2465: a promote keeps the original entry's write-once
+            // created_ns (the update block above does not touch it); pair it
+            // with the refresh instant as last_seen. Informational on an Open
+            // delta (the SESSION_CREATE frame reports no duration).
+            let created_ns = self
+                .entry_by_key(key)
+                .map(|e| e.created_ns)
+                .unwrap_or(now_ns);
             self.push_delta(SessionDelta {
                 kind: SessionDeltaKind::Open,
                 key: key.clone(),
@@ -754,6 +771,8 @@ impl SessionTable {
                 metadata,
                 origin,
                 fabric_redirect_sync: false,
+                created_ns,
+                last_seen_ns: now_ns,
             });
         }
         true

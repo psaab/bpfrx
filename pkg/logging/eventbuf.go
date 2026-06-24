@@ -29,6 +29,7 @@ type EventRecord struct {
 	InZoneName      string // resolved zone name
 	OutZoneName     string // resolved zone name
 	ElapsedTime     uint32 // seconds since session creation (for CLOSE)
+	Created         uint32 // #2465: absolute session-creation Unix seconds (for CLOSE); 0 = unknown (exporter falls back to the packet-count estimate)
 	PolicyName      string // resolved policy name (e.g. "allow-everything")
 	RevSessionPkts  uint64 // packets from server (for SESSION_CLOSE)
 	RevSessionBytes uint64 // bytes from server (for SESSION_CLOSE)

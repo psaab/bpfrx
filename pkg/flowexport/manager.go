@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/psaab/xpf/pkg/config"
+	"github.com/psaab/xpf/pkg/logging"
 )
 
 // SamplingDir tracks per-zone sampling direction flags.
@@ -668,6 +669,33 @@ type SessionCloseData struct {
 	DstPort  uint16
 	Protocol uint8
 	IsIPv6   bool
+}
+
+// flowStartTime resolves the flow record StartTime for a session-close event.
+//
+// #2465: when the close event carries a real session-creation timestamp
+// (rec.Created, absolute Unix seconds stamped by the dataplane at session
+// install), the StartTime is that exact instant — an accurate flow age for
+// billing / audit / DDoS reconstruction / duration analytics. Only when the
+// timestamp is absent (0 — an old-format frame or a synthesized close that
+// carried no creation instant, e.g. the explicit clear-session / HA-purge
+// paths) does it fall back to the legacy packet-count heuristic
+// (estimateSessionDuration), subtracting the estimate from the record EndTime.
+//
+// The bool return reports whether the heuristic fallback was used, so callers
+// can bump an "estimated-duration-used" counter for operator visibility.
+func flowStartTime(rec logging.EventRecord, proto uint8) (time.Time, bool) {
+	if rec.Created > 0 {
+		created := time.Unix(int64(rec.Created), 0)
+		// Guard against a created stamp at or after the close time (clock skew
+		// across the monotonic→wall conversion): clamp to the EndTime so the
+		// flow never reports a negative duration.
+		if created.After(rec.Time) {
+			return rec.Time, false
+		}
+		return created, false
+	}
+	return rec.Time.Add(-estimateSessionDuration(rec.SessionPkts, proto)), true
 }
 
 // estimateSessionDuration provides a rough duration estimate based on packet count.

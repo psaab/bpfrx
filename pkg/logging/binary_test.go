@@ -357,6 +357,48 @@ func TestDecodeRawEventRecordRejectsShortRecord(t *testing.T) {
 	}
 }
 
+// TestDecodeRawEventCarriesCreatedStamp is the #2465 cross-language layout
+// check for the SESSION_CLOSE frame: the Rust encoder
+// (event_stream/codec.rs::encode_session_close_rt_flow) writes the absolute
+// session-creation Unix SECONDS at offset 108 as a LITTLE-endian u32 and the
+// close instant at offset 0 as a LITTLE-endian u64. This test builds a frame
+// at those exact offsets/endianness and asserts DecodeRawEventRecord surfaces
+// them into EventRecord.Created (and the close timestamp into rec.Time). A
+// one-sided field — Rust writes offset 108 but Go reads a different offset or
+// endianness — would corrupt the StartTime; this pins the contract.
+func TestDecodeRawEventCarriesCreatedStamp(t *testing.T) {
+	const (
+		createdSecs = uint32(1_700_000_000)
+		closeNS     = uint64(1_700_000_300_000_000_000) // 300s later, in ns
+	)
+	data := make([]byte, rawEventWireSize)
+	// offset 0: timestamp_ns (LE u64) — the close instant (record EndTime).
+	binary.LittleEndian.PutUint64(data[0:8], closeNS)
+	data[40], data[41] = 0x30, 0x39 // src port 12345 (BE)
+	data[42], data[43] = 0x01, 0xbb // dst port 443 (BE)
+	data[52] = eventTypeSessionClose
+	data[53] = 6 // TCP
+	data[55] = addrFamilyInet
+	copy(data[8:12], net.ParseIP("10.0.1.102").To4())
+	copy(data[24:28], net.ParseIP("172.16.80.200").To4())
+	// offset 108: created (LE u32) Unix seconds — the #2465 field.
+	binary.LittleEndian.PutUint32(data[108:112], createdSecs)
+
+	rec, ok := DecodeRawEventRecord(data)
+	if !ok {
+		t.Fatal("DecodeRawEventRecord rejected a valid SESSION_CLOSE frame")
+	}
+	if rec.Type != "SESSION_CLOSE" {
+		t.Fatalf("Type = %q, want SESSION_CLOSE", rec.Type)
+	}
+	if rec.Created != createdSecs {
+		t.Fatalf("rec.Created = %d, want %d (offset 108 LE u32)", rec.Created, createdSecs)
+	}
+	if !rec.Time.Equal(time.Unix(0, int64(closeNS))) {
+		t.Fatalf("rec.Time = %v, want %v (offset 0 LE u64)", rec.Time, time.Unix(0, int64(closeNS)))
+	}
+}
+
 func TestProcessRawEventRejectsShortRecord(t *testing.T) {
 	tests := []struct {
 		name      string

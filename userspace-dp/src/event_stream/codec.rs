@@ -419,16 +419,23 @@ impl EventFrame {
     /// counter, so writing owner RG there would corrupt the counter. Owner
     /// RG is carried for session sync on the type-2 HA close delta instead.
     ///
-    /// The byte/packet counters (offsets 56/64/112/120) and the
-    /// session-creation timestamp (offset 108) are written as 0: the
+    /// The byte/packet counters (offsets 56/64/112/120) are written as 0: the
     /// userspace AF_XDP forwarding path does not yet maintain per-session
-    /// byte/packet accounting nor a wall-clock creation stamp. That
-    /// accounting is the follow-up tracked in #2501; until it lands these
-    /// stay 0, so the flow record carries an accurate tuple but zero volume.
-    /// The exporters' duration is derived from the packet count today
-    /// (`estimateSessionDuration(SessionPkts)` in pkg/flowexport), NOT from
-    /// the `created` stamp — so with 0 packets the reported duration is also
-    /// 0 (and will become real once #2501 populates the counters).
+    /// byte/packet accounting. That accounting is the follow-up tracked in
+    /// #2501; until it lands these stay 0, so the flow record carries an
+    /// accurate tuple but zero volume.
+    ///
+    /// #2465: the session-creation stamp (offset 108, `created`, Unix seconds)
+    /// and the record timestamp (offset 0, `timestamp_ns`, Unix nanoseconds =
+    /// the close/last-seen instant) ARE now populated from the real session
+    /// timestamps. `created_unix_secs` is the absolute wall-clock second at
+    /// which the session was installed (converted by the caller from the
+    /// monotonic `created_ns`); `close_unix_ns` is the absolute wall-clock
+    /// close instant (from the monotonic `last_seen_ns`). The Go exporters use
+    /// `created` as the flow StartTime directly; only when it is 0 (an old
+    /// frame or a synthesized close that carried no creation instant) do they
+    /// fall back to the packet-count `estimateSessionDuration` heuristic.
+    /// A `created_unix_secs` of 0 keeps the legacy fallback behavior.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn encode_session_close_rt_flow(
         seq: u64,
@@ -446,17 +453,18 @@ impl EventFrame {
         egress_zone_id: u16,
         owner_rg_id: i16,
         log_syslog: bool,
+        created_unix_secs: u32,
+        close_unix_ns: u64,
     ) -> Self {
         let mut buf = [0u8; 256];
         let base = FRAME_HEADER_SIZE;
         let wire_af = rt_flow_addr_family(addr_family, src_ip);
 
-        // [0:8] timestamp_ns — 0 (the Go side stamps time.Now() when the
-        // wire timestamp is 0, which is the record's EndTime). The flow
-        // exporters compute the flow StartTime by subtracting a packet-count
-        // estimate (estimateSessionDuration(SessionPkts)), not from the
-        // `created` stamp at offset 108 — so duration is 0 until #2501
-        // populates the counters.
+        // [0:8] timestamp_ns — #2465: the absolute wall-clock close instant
+        // (LITTLE-endian u64, matching the Go binary.LittleEndian.Uint64 read
+        // in logEvent/DecodeRawEventRecord). This is the record's EndTime. When
+        // 0 the Go side stamps time.Now() instead (the legacy behavior).
+        buf[base..base + 8].copy_from_slice(&close_unix_ns.to_le_bytes());
         // [8:24] src ip, [24:40] dst ip (16-byte slots, v4 left-aligned).
         write_ip_16(&mut buf, base + 8, src_ip);
         write_ip_16(&mut buf, base + 24, dst_ip);
@@ -486,8 +494,11 @@ impl EventFrame {
         // [104:106] nat src port, [106:108] nat dst port — BIG-endian.
         buf[base + 104..base + 106].copy_from_slice(&nat_src_port.to_be_bytes());
         buf[base + 106..base + 108].copy_from_slice(&nat_dst_port.to_be_bytes());
-        // [108:112] created — 0 (#2501). Note the exporters ignore this
-        // field for duration; duration tracks the packet count (see above).
+        // [108:112] created — #2465: absolute wall-clock Unix SECONDS at which
+        // the session was installed (LITTLE-endian u32, matching the Go
+        // binary.LittleEndian.Uint32 read). The exporters use this as the flow
+        // StartTime; 0 means "unknown" and triggers the packet-count fallback.
+        buf[base + 108..base + 112].copy_from_slice(&created_unix_secs.to_le_bytes());
         // [112:120] rev packets, [120:128] rev bytes — 0 (#2501).
         // [128:132] ingress ifindex — 0 (per-close ifindex not threaded).
         // [132:134] application id — 0.

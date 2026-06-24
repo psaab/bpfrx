@@ -99,6 +99,8 @@ fn test_close_delta(kind: crate::session::SessionDeltaKind) -> crate::session::S
         },
         origin: SessionOrigin::ForwardFlow,
         fabric_redirect_sync: false,
+        created_ns: 0,
+        last_seen_ns: 0,
     }
 }
 
@@ -143,6 +145,95 @@ fn test_emit_session_close_rt_flow_pairs_with_ha_delta() {
     assert_eq!(p[52], 2, "RT_FLOW event type must be SESSION_CLOSE (2)");
     assert_eq!(&p[8..12], &[10, 0, 1, 102]);
     assert_eq!(&p[24..28], &[172, 16, 80, 200]);
+}
+
+#[test]
+fn test_monotonic_ns_to_unix_conversions() {
+    // #2465: pure-function contract for the monotonic→wall-clock conversion
+    // used by emit_session_close_rt_flow. Anchored against a (mono, wall)
+    // reference, a creation instant 30s in the monotonic past maps to a
+    // wall-clock time 30s before the wall reference.
+    let now_mono = 1_000_000_000_000u64; // 1000s monotonic
+    let now_unix = 1_700_000_000_000_000_000u64; // 1.7e9 s in ns
+    let created_mono = now_mono - 30 * NS_PER_SEC; // 30s ago
+    let created_ns_abs = monotonic_ns_to_unix_ns(created_mono, now_mono, now_unix);
+    assert_eq!(created_ns_abs, now_unix - 30 * NS_PER_SEC);
+    assert_eq!(
+        monotonic_ns_to_unix_secs(created_mono, now_mono, now_unix),
+        1_700_000_000 - 30
+    );
+
+    // 0 / unknown inputs map to 0 (→ the Go-side packet-count fallback).
+    assert_eq!(monotonic_ns_to_unix_ns(0, now_mono, now_unix), 0);
+    assert_eq!(monotonic_ns_to_unix_secs(0, now_mono, now_unix), 0);
+    assert_eq!(monotonic_ns_to_unix_ns(created_mono, 0, now_unix), 0);
+    assert_eq!(monotonic_ns_to_unix_ns(created_mono, now_mono, 0), 0);
+
+    // A monotonic value slightly AHEAD of the reference (cross-CPU read skew)
+    // clamps to the present, never the future.
+    let ahead = now_mono + 5 * NS_PER_SEC;
+    assert_eq!(monotonic_ns_to_unix_ns(ahead, now_mono, now_unix), now_unix);
+}
+
+#[test]
+fn test_emit_session_close_rt_flow_carries_real_created_stamp() {
+    // #2465 fail-on-revert: a close delta with a real (non-zero) created_ns
+    // must produce a non-zero `created` (offset 108) and `timestamp_ns`
+    // (offset 0) on the RT_FLOW frame. If the producer drops the created_ns →
+    // wire conversion (or the encoder reverts to writing 0), these stay 0 and
+    // the flow exporter falls back to the packet-count heuristic StartTime —
+    // exactly the #2465 bug. A monotonic created_ns ~60s in the past must land
+    // ~60s before the close timestamp on the wire.
+    let (handle, rx) = test_worker_handle(
+        8,
+        DataplaneEventRateLimitConfig {
+            events_per_second: 0,
+            burst: 0,
+        },
+    );
+    // Anchor the delta's monotonic timestamps to the live CLOCK_MONOTONIC so
+    // the conversion against the emit-time reading yields a plausible age.
+    let (now_mono, _now_wall) = read_mono_and_wall_clocks();
+    let mut delta = test_close_delta(crate::session::SessionDeltaKind::Close);
+    delta.created_ns = now_mono.saturating_sub(60 * NS_PER_SEC);
+    delta.last_seen_ns = now_mono;
+
+    handle.emit_session_close_rt_flow(&delta);
+    let frame = rx.try_recv().expect("RT_FLOW close frame");
+    let p = &frame.data[FRAME_HEADER_SIZE..frame.len as usize];
+
+    let created_secs = u32::from_le_bytes(p[108..112].try_into().unwrap());
+    let ts_ns = u64::from_le_bytes(p[0..8].try_into().unwrap());
+    assert!(created_secs > 0, "created stamp must be populated (not the #2465 zero)");
+    assert!(ts_ns > 0, "record timestamp must be populated");
+    // created is ~60s before the close timestamp (allow a few seconds of GC /
+    // scheduling slack on top of the 60s age).
+    let ts_secs = ts_ns / NS_PER_SEC;
+    let delta_secs = ts_secs.saturating_sub(created_secs as u64);
+    assert!(
+        (58..=65).contains(&delta_secs),
+        "expected ~60s session age on the wire, got {delta_secs}s (created={created_secs}, close_secs={ts_secs})"
+    );
+}
+
+#[test]
+fn test_emit_session_close_rt_flow_zero_created_stays_zero() {
+    // #2465: a close delta with an UNKNOWN (0) created_ns must keep the wire
+    // created/timestamp fields 0 so the Go exporter falls back to the
+    // packet-count estimate (the explicit-delete / HA-purge close paths).
+    let (handle, rx) = test_worker_handle(
+        8,
+        DataplaneEventRateLimitConfig {
+            events_per_second: 0,
+            burst: 0,
+        },
+    );
+    let delta = test_close_delta(crate::session::SessionDeltaKind::Close); // created_ns == 0
+    handle.emit_session_close_rt_flow(&delta);
+    let frame = rx.try_recv().expect("RT_FLOW close frame");
+    let p = &frame.data[FRAME_HEADER_SIZE..frame.len as usize];
+    assert_eq!(u32::from_le_bytes(p[108..112].try_into().unwrap()), 0);
+    assert_eq!(u64::from_le_bytes(p[0..8].try_into().unwrap()), 0);
 }
 
 #[test]
