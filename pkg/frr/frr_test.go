@@ -403,6 +403,127 @@ func TestGenerateProtocols_BGPExportNoLeak(t *testing.T) {
 	}
 }
 
+// TestGenerateProtocols_BGPImport is the #2490 inbound-filter render. A
+// neighbor `import <policy-statement>` MUST render `neighbor X route-map
+// <policy> in`, and the route-map it references must actually be emitted by
+// generatePolicyOptions (the policy-statement is defined). Fail-on-revert:
+// removing the `route-map in` render makes the in-line disappear → this test
+// fails.
+func TestGenerateProtocols_BGPImport(t *testing.T) {
+	m := New()
+	po := &config.PolicyOptionsConfig{
+		PolicyStatements: map[string]*config.PolicyStatement{
+			"IMPORT-FILTER": {
+				Name: "IMPORT-FILTER",
+				Terms: []*config.PolicyTerm{
+					{Name: "t1", Action: "accept"},
+				},
+			},
+		},
+	}
+	bgp := &config.BGPConfig{
+		LocalAS:  65001,
+		RouterID: "1.1.1.1",
+		Neighbors: []*config.BGPNeighbor{
+			{Address: "10.0.2.1", PeerAS: 65002, Import: []string{"IMPORT-FILTER"}},
+		},
+	}
+	got := m.generateProtocols(nil, nil, bgp, nil, nil, "", 0, po)
+	if !strings.Contains(got, "neighbor 10.0.2.1 route-map IMPORT-FILTER in\n") {
+		t.Errorf("missing peer-level route-map in for import, got:\n%s", got)
+	}
+	// The referenced route-map must actually be emitted (defining block).
+	full := m.generatePolicyOptions(po)
+	if !strings.Contains(full, "route-map IMPORT-FILTER permit") {
+		t.Errorf("import policy-statement not rendered as a route-map, got:\n%s", full)
+	}
+}
+
+// TestGenerateProtocols_BGPImportAndExport proves import and export on the
+// same neighbor render independently — both `route-map ... in` AND
+// `route-map ... out` are emitted. Fail-on-revert (import side): dropping the
+// import render leaves only the out line → this test fails.
+func TestGenerateProtocols_BGPImportAndExport(t *testing.T) {
+	m := New()
+	po := &config.PolicyOptionsConfig{
+		PolicyStatements: map[string]*config.PolicyStatement{
+			"IN":  {Name: "IN", Terms: []*config.PolicyTerm{{Name: "t", Action: "accept"}}},
+			"OUT": {Name: "OUT", Terms: []*config.PolicyTerm{{Name: "t", Action: "accept"}}},
+		},
+	}
+	bgp := &config.BGPConfig{
+		LocalAS:  65001,
+		RouterID: "1.1.1.1",
+		Neighbors: []*config.BGPNeighbor{
+			{Address: "10.0.2.1", PeerAS: 65002, Import: []string{"IN"}, Export: []string{"OUT"}},
+		},
+	}
+	got := m.generateProtocols(nil, nil, bgp, nil, nil, "", 0, po)
+	if !strings.Contains(got, "neighbor 10.0.2.1 route-map IN in\n") {
+		t.Errorf("missing route-map IN in, got:\n%s", got)
+	}
+	if !strings.Contains(got, "neighbor 10.0.2.1 route-map OUT out\n") {
+		t.Errorf("missing route-map OUT out, got:\n%s", got)
+	}
+}
+
+// TestGenerateProtocols_BGPImportMostSpecificWins proves Junos most-specific-
+// wins: a per-neighbor import overrides the inherited group import, and FRR
+// gets exactly ONE `route-map in`. The compiler appends the per-neighbor
+// import after the inherited group import; bgpEffectiveImport (lastNonEmpty)
+// picks the neighbor's.
+func TestGenerateProtocols_BGPImportMostSpecificWins(t *testing.T) {
+	m := New()
+	po := &config.PolicyOptionsConfig{
+		PolicyStatements: map[string]*config.PolicyStatement{
+			"GROUP-IMPORT": {Name: "GROUP-IMPORT", Terms: []*config.PolicyTerm{{Name: "t", Action: "accept"}}},
+			"NEIGH-IMPORT": {Name: "NEIGH-IMPORT", Terms: []*config.PolicyTerm{{Name: "t", Action: "accept"}}},
+		},
+	}
+	bgp := &config.BGPConfig{
+		LocalAS:  65001,
+		RouterID: "1.1.1.1",
+		Neighbors: []*config.BGPNeighbor{
+			// Inherited group import first, neighbor override appended last.
+			{Address: "10.0.2.1", PeerAS: 65002, Import: []string{"GROUP-IMPORT", "NEIGH-IMPORT"}},
+		},
+	}
+	got := m.generateProtocols(nil, nil, bgp, nil, nil, "", 0, po)
+	if !strings.Contains(got, "neighbor 10.0.2.1 route-map NEIGH-IMPORT in\n") {
+		t.Errorf("most-specific import (NEIGH-IMPORT) not selected, got:\n%s", got)
+	}
+	if strings.Contains(got, "route-map GROUP-IMPORT in") {
+		t.Errorf("overridden group import must not render, got:\n%s", got)
+	}
+	if strings.Count(got, "route-map NEIGH-IMPORT in") != 1 {
+		t.Errorf("expected exactly one route-map in, got:\n%s", got)
+	}
+}
+
+// TestGenerateProtocols_BGPImportUndefinedNoDangling is the #2490 application
+// of the #2473 lesson on the INBOUND direction. An import ref that is NOT a
+// defined policy-statement (a bare token, or a name that slipped the strict
+// validator on a lenient load/HA-sync path) must NEVER render a dangling
+// `route-map <token> in` — FRR resolves an undefined route-map to PERMIT-ALL,
+// silently accepting every inbound advertisement. Fail-on-revert: dropping
+// the isDefinedPolicyStatement guard makes the dangling in-line appear.
+func TestGenerateProtocols_BGPImportUndefinedNoDangling(t *testing.T) {
+	m := New()
+	// nil policyOptions: no policy-statements defined, so the import ref is
+	// undefined (simulates a lenient load that bypassed strict validation).
+	bgp := &config.BGPConfig{
+		LocalAS:  65001,
+		RouterID: "1.1.1.1",
+		Neighbors: []*config.BGPNeighbor{
+			{Address: "10.0.2.1", PeerAS: 65002, FamilyInet: true, Import: []string{"undefined-policy"}},
+		},
+	}
+	got := m.generateProtocols(nil, nil, bgp, nil, nil, "", 0, nil)
+	if strings.Contains(got, "route-map undefined-policy in") {
+		t.Errorf("LEAK: undefined import ref must not render a dangling route-map in (permit-all inbound), got:\n%s", got)
+	}
+}
+
 // TestGenerateProtocols_OSPFExportPolicyStatement covers the #2144
 // render path: an OSPF `export` that names a defined policy-statement (not
 // a bare protocol token) is expanded by resolveRedistribute into one
