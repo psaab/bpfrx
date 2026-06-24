@@ -353,6 +353,22 @@ type compileOpts struct {
 	// nothing for that collector rather than the wrong template. Same
 	// doctrine as lenientLogProfileStreamRef.
 	lenientFlowServerTemplateRef bool
+	// lenientSamplingInstanceConflicts (#2462) downgrades the
+	// multi-sampling-instance conflict gate
+	// (validateSamplingInstanceConflictsStrict) from a hard compile error to
+	// a cfg.Warnings entry. Two `forwarding-options sampling instance` blocks
+	// that each export the SAME (export-version, address-family) pair are
+	// genuinely ambiguous — there is no per-interface sampling-instance
+	// selector, so a flow of that family cannot be attributed to one instance
+	// — and were previously silently flattened into one global policy (one
+	// map-order-dependent rate, one merged collector set; flows from instance
+	// A reaching instance B's collectors). The strict commit / commit-check
+	// path hard-rejects so the operator sees it; the tolerant load / peer-sync
+	// paths warn so an already-persisted or peer-synced config still BOOTS
+	// (#1960) — the resolver still emits both instances' independent
+	// ExportConfigs, so eligible flows duplicate to both instances rather than
+	// bricking the load. Same doctrine as lenientFlowServerTemplateRef.
+	lenientSamplingInstanceConflicts bool
 	// lenientApplicationSetMembers (#2217 Finding B) downgrades the
 	// application-set member cross-reference gate
 	// (validateApplicationSetMembersStrict) from a hard compile error to a
@@ -483,6 +499,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientNPTv6:                       true,
 		lenientFirewallRefs:                true,
 		lenientFlowServerTemplateRef:       true,
+		lenientSamplingInstanceConflicts:   true,
 		lenientApplicationSetMembers:       true,
 		lenientRibGroupRefs:                true,
 		lenientDHCPStaticBindings:          true,
@@ -581,6 +598,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientNPTv6:                       true,
 		lenientFirewallRefs:                true,
 		lenientFlowServerTemplateRef:       true,
+		lenientSamplingInstanceConflicts:   true,
 		lenientApplicationSetMembers:       true,
 		lenientRibGroupRefs:                true,
 		lenientDHCPStaticBindings:          true,
@@ -1259,6 +1277,27 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		if opts.lenientFlowServerTemplateRef {
 			cfg.Warnings = append(cfg.Warnings,
 				fmt.Sprintf("flow-server template reference (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
+	// #2462: multi-sampling-instance conflict. Two `forwarding-options
+	// sampling instance` blocks that each export the same (export-version,
+	// address-family) pair are genuinely ambiguous — there is no per-interface
+	// sampling-instance selector, so the runtime cannot attribute a flow of
+	// that family to one instance — and were previously silently flattened
+	// into one global policy (first-nonzero map-order rate, merged collectors;
+	// flows crossing from one instance's policy to another's collectors).
+	// Strict on commit / commit-check (hard reject so the operator sees it);
+	// lenient on load / peer-sync (warn so an already-persisted or peer-synced
+	// config still boots — #1960; the resolver emits both instances'
+	// independent ExportConfigs, duplicating eligible flows rather than
+	// bricking). Mirrors validateFlowServerTemplateReferencesStrict.
+	if err := validateSamplingInstanceConflictsStrict(cfg); err != nil {
+		if opts.lenientSamplingInstanceConflicts {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("sampling instance conflict (downgraded to warning on tolerant path): %v", err))
 		} else {
 			return nil, err
 		}
