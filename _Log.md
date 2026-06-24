@@ -12070,3 +12070,59 @@ top.
 - **File(s)**: userspace-dp/src/afxdp/coordinator/reconcile/snapshot.rs,
   userspace-dp/src/afxdp/coordinator/tests.rs,
   docs/userspace-dataplane-architecture.md, _Log.md
+
+## 2026-06-23 — #2484 snapshot-integrity preflight hoist (completes #2440/#2444 trilogy)
+
+- **Timestamp**: 2026-06-23
+- **Action**: Closed the last reconcile fail-open window — snapshot
+  INTEGRITY faults. #2440 hoisted mandatory map-FD opens before tear_down;
+  #2444 did the same for present-but-unopenable optional maps. #2484
+  remained: build_forwarding_state_with_policy_counters_and_previous can
+  return Err (Nat64UnparseableRule, NPTv6 / static-NAT integrity faults)
+  reachable only inside apply_snapshot — which ran AFTER tear_down stopped
+  the workers and stop_inner reset coord.validation / shared_validation, so
+  the helper was left torn down with no forwarding + no workers (it only
+  set last_reconcile_stage="snapshot_integrity_error" and returned None,
+  PR #2483). The top-of-reconcile policy preflight runs before teardown but
+  only parses policy/address-book state, missing the NAT64/NPTv6 integrity
+  set.
+- **Fix (build-once-reuse, mirrors #2440 hoist)**: added
+  snapshot::build_reconcile_forwarding(coord, snap) which runs the SAME
+  full build apply_snapshot used, in the pre-teardown preflight stage of
+  reconcile/mod.rs (right after preflight_map_fds). On Err it sets
+  last_reconcile_stage="snapshot_integrity_error" and returns Err(()) so
+  the orchestrator aborts BEFORE teardown/publish — prior generation +
+  workers stay live. On Ok the built ForwardingState is stashed on the new
+  ReconcileSnapshotFds::forwarding field; apply_snapshot REUSES it via
+  std::mem::take instead of rebuilding (no second build on the success
+  path, no double-insert of per-rule counter handles into the live
+  policy/nat counter stores). The build MUST precede teardown because it
+  reads Some(&coord.forwarding) as its "previous" arg, which stop_inner
+  defaults to empty. bringup destructure updated to ignore forwarding.
+  apply_snapshot's integrity Err arm is removed; its Option return is kept
+  for signature stability (always Some now, else arm defensively dead).
+- **Tests**: upgraded the #2483 test
+  reconcile_snapshot_integrity_error_sets_observable_stage ->
+  reconcile_snapshot_integrity_error_preserves_prior_generation_and_state.
+  Seeds a prior generation (config 20 / fib 7 / installed) AND a sentinel
+  live worker (workers.live[0]), feeds a NAT64 empty-prefix rule (sentinel-
+  OK map pins so the map-FD preflight passes), then asserts: prior
+  config/fib generation preserved, snapshot_installed still true,
+  shared_validation == prior, rejected generation 21 never published, AND
+  the seeded worker survives (workers.live.len()==1, contains slot 0).
+  Proved fail-on-revert: temporarily moved the integrity build back inside
+  apply_snapshot (post-teardown) + skipped the preflight build — the
+  generation-preservation assertion FAILED (stop_inner defaulted it to 0).
+  Restored the fix.
+- **Validation**: cargo build --release clean (pre-existing warnings only);
+  reconcile suite 18/18; coordinator suite 99/99 across 5 runs.
+- **Doc**: docs/userspace-dataplane-architecture.md — Reconcile Ordering
+  Invariant section retitled #2440/#2444/#2484, added the integrity-build
+  bullet (build-once-reuse + before-teardown rationale), the "all mandatory
+  validation before teardown/publish" completion note, and the new test in
+  the regression list.
+- **File(s)**: userspace-dp/src/afxdp/coordinator/reconcile/mod.rs,
+  userspace-dp/src/afxdp/coordinator/reconcile/snapshot.rs,
+  userspace-dp/src/afxdp/coordinator/reconcile/bringup.rs,
+  userspace-dp/src/afxdp/coordinator/tests.rs,
+  docs/userspace-dataplane-architecture.md, _Log.md
