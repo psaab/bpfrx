@@ -30,20 +30,108 @@ pub(super) fn monotonic_timestamp_to_datetime(
 /// Used for ARP/NDP solicitations that must bypass XSK (because the
 /// XSK fill ring may not be bootstrapped on the egress interface).
 
+/// Which kind of probe socket was opened. The two paths differ in how
+/// the kernel treats the ICMP header we hand it, so the send-buffer
+/// construction is keyed off this (see [`build_icmp4_echo`] /
+/// [`build_icmp6_echo`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum ProbeSockKind {
+    /// `SOCK_RAW` (primary; needs CAP_NET_RAW). The kernel does NOT touch
+    /// the ICMP header — the application owns id + checksum.
+    Raw,
+    /// `SOCK_DGRAM` unprivileged "ping" socket (fallback; gated by
+    /// `net.ipv4.ping_group_range`, no CAP_NET_RAW). The kernel REWRITES
+    /// the ICMP Echo `id` to the socket's bound port and RECOMPUTES the
+    /// checksum — the ping-socket contract.
+    Dgram,
+}
+
+/// Select a probe socket for one address family: try `SOCK_RAW` first
+/// (the privileged primary path), and on creation failure fall back to a
+/// `SOCK_DGRAM` unprivileged ICMP "ping" socket. Returns the open fd and
+/// the chosen kind, or `None` when BOTH fail.
+///
+/// The raw socket needs CAP_NET_RAW; under a rootless / unprivileged-
+/// container / dropped-privilege runtime (the #1958 substrate) that
+/// capability is absent and `socket(SOCK_RAW)` fails with EPERM/EACCES.
+/// The DGRAM ping socket is creatable without CAP_NET_RAW when the
+/// process GID is inside `net.ipv4.ping_group_range`, so it recovers
+/// neighbor probing in those runtimes. Root deployments always take the
+/// raw path, unchanged.
+///
+/// `mk(sock_type)` creates a socket of the given type for the family the
+/// caller has already fixed (`AF_INET`/`AF_INET6`), returning the fd or a
+/// negative value on failure. Injected so the fallback selection is
+/// unit-testable without manipulating process capabilities.
+pub(super) fn select_probe_socket(
+    mk: impl Fn(c_int) -> c_int,
+) -> Option<(c_int, ProbeSockKind)> {
+    let raw = mk(libc::SOCK_RAW);
+    if raw >= 0 {
+        return Some((raw, ProbeSockKind::Raw));
+    }
+    let dgram = mk(libc::SOCK_DGRAM);
+    if dgram >= 0 {
+        return Some((dgram, ProbeSockKind::Dgram));
+    }
+    None
+}
+
+/// Build the 8-byte ICMPv4 Echo-Request message for a probe send.
+///
+/// The buffer is the ICMP message ONLY — never an IP header. (Sending a
+/// raw-style buffer that began with an IP header through a DGRAM ping
+/// socket was the original EINVAL: the kernel read the IP version nibble
+/// `0x45` as the ICMP type and rejected it via `ping_supported()`.)
+///
+/// - `Raw`: the kernel does not compute the ICMP checksum for a raw
+///   `IPPROTO_ICMP` socket, so embed the precomputed checksum `0xf7ff`
+///   for {type=8, code=0, id=0, seq=0}.
+/// - `Dgram`: the ping socket overwrites `id` with the bound port and
+///   recomputes the checksum, so leave both zero. This makes the DGRAM
+///   buffer byte-distinct from the raw buffer, reflecting the real
+///   semantic difference.
+fn build_icmp4_echo(kind: ProbeSockKind) -> [u8; 8] {
+    match kind {
+        // type=8, code=0, checksum=0xf7ff, id=0, seq=0
+        ProbeSockKind::Raw => [8, 0, 0xf7, 0xff, 0, 0, 0, 0],
+        // type=8, code=0, checksum=0 (kernel fills), id=0 (kernel fills)
+        ProbeSockKind::Dgram => [8, 0, 0, 0, 0, 0, 0, 0],
+    }
+}
+
+/// Build the 8-byte ICMPv6 Echo-Request message. ICMPv6 checksum is always
+/// kernel-computed (raw via the `IPV6_CHECKSUM` offset sockopt; DGRAM ping
+/// sockets intrinsically), so the body is identical for both kinds: type=128,
+/// code=0, and a zero checksum the kernel overwrites.
+fn build_icmp6_echo(_kind: ProbeSockKind) -> [u8; 8] {
+    [128, 0, 0, 0, 0, 0, 0, 0]
+}
+
 /// Trigger kernel ARP/NDP resolution by sending an ICMP echo via a
-/// DGRAM socket bound to the egress interface. The kernel's own ARP
+/// kernel socket bound to the egress interface. The kernel's own ARP
 /// stack handles VLAN tagging correctly. No fork/exec overhead.
+///
+/// Primary path: `SOCK_RAW` (needs CAP_NET_RAW — held when xpfd runs as
+/// root, the default). Fallback: an unprivileged `SOCK_DGRAM` ICMP ping
+/// socket (no CAP_NET_RAW, gated by `net.ipv4.ping_group_range`) so
+/// neighbor probing still works under the rootless/container substrate
+/// (#1958, #2482). Either way the egress packet drives the kernel to
+/// ARP/NDP-resolve the next-hop — the echo's reply is irrelevant.
 pub(super) fn trigger_kernel_arp_probe(iface_name: &str, target: IpAddr) {
+    let name_c = std::ffi::CString::new(iface_name).unwrap_or_default();
     match target {
         IpAddr::V4(v4) => {
-            // SOCK_RAW ICMP echo — triggers kernel ARP on the bound
-            // interface. SOCK_DGRAM IPPROTO_ICMP fails with EINVAL on
-            // sendto so we use SOCK_RAW directly.
-            let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_RAW, libc::IPPROTO_ICMP) };
-            if fd < 0 {
+            let Some((fd, kind)) = select_probe_socket(|sock_type| unsafe {
+                libc::socket(libc::AF_INET, sock_type, libc::IPPROTO_ICMP)
+            }) else {
                 return;
-            }
-            let name_c = std::ffi::CString::new(iface_name).unwrap_or_default();
+            };
+            // Best-effort: SO_BINDTODEVICE itself needs CAP_NET_RAW, so on
+            // the DGRAM fallback it is typically a no-op (EPERM, ignored).
+            // The destination route still selects the correct egress
+            // interface for a directly-connected next-hop, so resolution
+            // proceeds regardless.
             unsafe {
                 libc::setsockopt(
                     fd,
@@ -53,8 +141,7 @@ pub(super) fn trigger_kernel_arp_probe(iface_name: &str, target: IpAddr) {
                     name_c.to_bytes_with_nul().len() as libc::socklen_t,
                 );
             }
-            // ICMP echo request: type=8, code=0, checksum=0xf7ff
-            let icmp: [u8; 8] = [8, 0, 0xf7, 0xff, 0, 0, 0, 0];
+            let icmp = build_icmp4_echo(kind);
             let mut sa: libc::sockaddr_in = unsafe { core::mem::zeroed() };
             sa.sin_family = libc::AF_INET as u16;
             sa.sin_addr.s_addr = u32::from_ne_bytes(v4.octets());
@@ -62,7 +149,7 @@ pub(super) fn trigger_kernel_arp_probe(iface_name: &str, target: IpAddr) {
                 libc::sendto(
                     fd,
                     icmp.as_ptr() as *const libc::c_void,
-                    8,
+                    icmp.len(),
                     libc::MSG_DONTWAIT,
                     &sa as *const libc::sockaddr_in as *const libc::sockaddr,
                     core::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
@@ -71,12 +158,11 @@ pub(super) fn trigger_kernel_arp_probe(iface_name: &str, target: IpAddr) {
             }
         }
         IpAddr::V6(v6) => {
-            // ICMPv6 echo via SOCK_RAW (DGRAM sendto fails with EINVAL)
-            let fd = unsafe { libc::socket(libc::AF_INET6, libc::SOCK_RAW, libc::IPPROTO_ICMPV6) };
-            if fd < 0 {
+            let Some((fd, kind)) = select_probe_socket(|sock_type| unsafe {
+                libc::socket(libc::AF_INET6, sock_type, libc::IPPROTO_ICMPV6)
+            }) else {
                 return;
-            }
-            let name_c = std::ffi::CString::new(iface_name).unwrap_or_default();
+            };
             unsafe {
                 libc::setsockopt(
                     fd,
@@ -86,27 +172,31 @@ pub(super) fn trigger_kernel_arp_probe(iface_name: &str, target: IpAddr) {
                     name_c.to_bytes_with_nul().len() as libc::socklen_t,
                 );
             }
+            // IPV6_CHECKSUM (auto-compute the ICMPv6 checksum at offset 2)
+            // applies to RAW sockets only; a DGRAM ping6 socket computes
+            // the checksum intrinsically and rejects this sockopt, so set
+            // it only on the raw path.
+            if kind == ProbeSockKind::Raw {
+                let offset: c_int = 2;
+                unsafe {
+                    libc::setsockopt(
+                        fd,
+                        libc::IPPROTO_ICMPV6,
+                        libc::IPV6_CHECKSUM,
+                        &offset as *const c_int as *const libc::c_void,
+                        core::mem::size_of::<c_int>() as libc::socklen_t,
+                    );
+                }
+            }
+            let icmp6 = build_icmp6_echo(kind);
             let mut sa6: libc::sockaddr_in6 = unsafe { core::mem::zeroed() };
             sa6.sin6_family = libc::AF_INET6 as u16;
             sa6.sin6_addr.s6_addr = v6.octets();
-            // ICMPv6 echo request: type=128, code=0, checksum=0 (kernel fills)
-            let icmp6 = [128u8, 0, 0, 0, 0, 0, 0, 0];
-            // Tell kernel to auto-compute ICMPv6 checksum at offset 2
-            let offset: c_int = 2;
-            unsafe {
-                libc::setsockopt(
-                    fd,
-                    libc::IPPROTO_ICMPV6,
-                    libc::IPV6_CHECKSUM,
-                    &offset as *const c_int as *const libc::c_void,
-                    core::mem::size_of::<c_int>() as libc::socklen_t,
-                );
-            }
             unsafe {
                 libc::sendto(
                     fd,
                     icmp6.as_ptr() as *const libc::c_void,
-                    8,
+                    icmp6.len(),
                     libc::MSG_DONTWAIT,
                     &sa6 as *const libc::sockaddr_in6 as *const libc::sockaddr,
                     core::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
@@ -1084,6 +1174,104 @@ mod pin_tests {
         assert!(allowed_cpus.contains(&new_worker_1));
         assert_ne!(old_worker_0, new_worker_0);
         assert_ne!(old_worker_1, new_worker_1);
+    }
+}
+
+#[cfg(test)]
+mod probe_socket_tests {
+    use super::{build_icmp4_echo, build_icmp6_echo, select_probe_socket, ProbeSockKind};
+    use std::cell::RefCell;
+
+    /// The raw socket is the primary path: when raw creation succeeds the
+    /// DGRAM fallback must NEVER be attempted.
+    #[test]
+    fn prefers_raw_and_never_tries_dgram_when_raw_succeeds() {
+        let attempts = RefCell::new(Vec::new());
+        let sel = select_probe_socket(|sock_type| {
+            attempts.borrow_mut().push(sock_type);
+            42 // pretend raw fd
+        });
+        assert_eq!(sel, Some((42, ProbeSockKind::Raw)));
+        assert_eq!(
+            *attempts.borrow(),
+            vec![libc::SOCK_RAW],
+            "DGRAM must not be attempted once raw succeeds",
+        );
+    }
+
+    /// FAIL-ON-REVERT: this is the core of the #2482 fix. On raw-creation
+    /// failure the selector MUST try `SOCK_DGRAM` and return the DGRAM fd.
+    /// Pre-fix (master) `trigger_kernel_arp_probe` returned immediately on
+    /// `fd < 0` with no fallback — there is no `select_probe_socket` and no
+    /// DGRAM attempt, so this assertion (and the recorded
+    /// `[SOCK_RAW, SOCK_DGRAM]` attempt order) cannot hold. Deleting the
+    /// fallback arm regresses this test.
+    #[test]
+    fn falls_back_to_dgram_when_raw_creation_fails() {
+        let attempts = RefCell::new(Vec::new());
+        let sel = select_probe_socket(|sock_type| {
+            attempts.borrow_mut().push(sock_type);
+            if sock_type == libc::SOCK_RAW {
+                -1 // EPERM/EACCES: no CAP_NET_RAW
+            } else {
+                7 // DGRAM ping socket fd
+            }
+        });
+        assert_eq!(sel, Some((7, ProbeSockKind::Dgram)));
+        assert_eq!(
+            *attempts.borrow(),
+            vec![libc::SOCK_RAW, libc::SOCK_DGRAM],
+            "raw must be tried first, then DGRAM",
+        );
+    }
+
+    /// Both creation attempts failing yields `None` (probe is skipped, as
+    /// the pre-fix code did on raw failure).
+    #[test]
+    fn returns_none_when_both_socket_types_fail() {
+        let attempts = RefCell::new(Vec::new());
+        let sel = select_probe_socket(|sock_type| {
+            attempts.borrow_mut().push(sock_type);
+            -1
+        });
+        assert_eq!(sel, None);
+        assert_eq!(*attempts.borrow(), vec![libc::SOCK_RAW, libc::SOCK_DGRAM]);
+    }
+
+    /// The DGRAM send buffer is the ICMP message ONLY (8 bytes, no 20-byte
+    /// IP header) with a valid Echo-Request type/code, and is byte-distinct
+    /// from the raw buffer (raw carries the precomputed checksum; the DGRAM
+    /// ping socket has the kernel recompute it, so checksum bytes are zero).
+    /// Sending a raw-style buffer (leading IP header) through a DGRAM ping
+    /// socket was the original EINVAL.
+    #[test]
+    fn dgram_v4_buffer_is_icmp_only_and_distinct_from_raw() {
+        let raw = build_icmp4_echo(ProbeSockKind::Raw);
+        let dgram = build_icmp4_echo(ProbeSockKind::Dgram);
+        // ICMP-only: exactly 8 bytes, no IP header prepended.
+        assert_eq!(dgram.len(), 8);
+        // Echo Request type=8, code=0.
+        assert_eq!(dgram[0], 8, "ICMP type must be Echo Request (8)");
+        assert_eq!(dgram[1], 0, "ICMP code must be 0");
+        // First byte is NOT an IPv4 version/IHL nibble (0x45) — proves no
+        // IP header, the prior-EINVAL trap.
+        assert_ne!(dgram[0], 0x45);
+        // DGRAM leaves the checksum for the kernel; raw carries 0xf7ff.
+        assert_eq!(&dgram[2..4], &[0, 0], "kernel recomputes csum for ping socket");
+        assert_eq!(&raw[2..4], &[0xf7, 0xff], "raw must carry a valid csum");
+        assert_ne!(raw, dgram, "DGRAM buffer must be distinct from raw");
+    }
+
+    /// ICMPv6 Echo Request is type=128, code=0; checksum is always kernel-
+    /// computed so the body is the same for both kinds.
+    #[test]
+    fn v6_buffer_is_icmpv6_echo_request() {
+        let raw = build_icmp6_echo(ProbeSockKind::Raw);
+        let dgram = build_icmp6_echo(ProbeSockKind::Dgram);
+        assert_eq!(dgram.len(), 8);
+        assert_eq!(dgram[0], 128, "ICMPv6 type must be Echo Request (128)");
+        assert_eq!(dgram[1], 0, "ICMPv6 code must be 0");
+        assert_eq!(raw, dgram);
     }
 }
 

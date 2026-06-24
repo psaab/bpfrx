@@ -119,6 +119,13 @@ Same issue for IPv6: `socket(AF_INET6, SOCK_DGRAM, IPPROTO_ICMPV6)`.
 **Fix:** Use `SOCK_RAW` directly for both IPv4 and IPv6. Set
 `IPV6_CHECKSUM` sockopt for ICMPv6 auto-checksum. (`fd53f19`, `2f818e8`)
 
+The original EINVAL was NOT inherent to DGRAM ping sockets — it came
+from sending a **raw-style buffer (leading IP header)** through the
+DGRAM socket: the kernel read the IPv4 version/IHL nibble `0x45` as the
+ICMP type and rejected it via `ping_supported()`. The correct DGRAM
+send is the ICMP message ONLY (no IP header), which is exactly the
+shape the raw path already uses. See the `SOCK_DGRAM` fallback below.
+
 ```rust
 // IPv4: SOCK_RAW IPPROTO_ICMP + SO_BINDTODEVICE
 let fd = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
@@ -131,6 +138,47 @@ setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, iface_name);
 setsockopt(fd, IPPROTO_ICMPV6, IPV6_CHECKSUM, &2); // offset 2
 sendto(fd, icmpv6_echo, target_addr);
 ```
+
+### 5b. SOCK_DGRAM Ping-Socket Fallback for Rootless / No-CAP_NET_RAW (#2482)
+
+**Context:** `SOCK_RAW` requires CAP_NET_RAW. xpfd runs as root by
+default (held for AF_XDP/BPF), so the raw path is always taken in
+production. But under the rootless / unprivileged-container /
+dropped-privilege substrate tracked by #1958, raw-socket creation
+fails with EPERM/EACCES and `trigger_kernel_arp_probe()` previously
+returned silently — neighbor discovery stalled, leading to forwarding
+drops.
+
+**Fix:** `select_probe_socket()` tries `SOCK_RAW` first; on creation
+failure it falls back to an unprivileged **`SOCK_DGRAM` ICMP ping
+socket** (`IPPROTO_ICMP` / `IPPROTO_ICMPV6`). The ping socket is
+creatable without CAP_NET_RAW when the process GID is inside
+`net.ipv4.ping_group_range` (operator-tunable; on a locked-down host
+where the range is empty, the fallback is itself best-effort and the
+probe is skipped as before).
+
+DGRAM ping-socket send semantics (differ from raw — getting them wrong
+was the original EINVAL):
+
+- **Buffer is the ICMP message only**, never an IP header — same 8-byte
+  Echo Request the raw path sends (`build_icmp4_echo` / `build_icmp6_echo`).
+- **The kernel rewrites the ICMP Echo `id`** to the socket's bound port
+  (the ping-socket contract) and **recomputes the checksum**, so the v4
+  DGRAM buffer leaves both zero (byte-distinct from the raw buffer's
+  precomputed `0xf7ff`). Do NOT rely on a self-chosen id.
+- **`IPV6_CHECKSUM` is a RAW-only sockopt** — a DGRAM ping6 socket
+  computes the checksum intrinsically, so the offset sockopt is set on
+  the raw path only.
+- **`SO_BINDTODEVICE` itself needs CAP_NET_RAW**, so on the DGRAM
+  fallback it is typically a no-op (EPERM, ignored, best-effort). The
+  destination route still selects the correct egress interface for a
+  directly-connected next-hop, so resolution proceeds regardless.
+
+The goal is only to drive the kernel to ARP/NDP-resolve the next-hop;
+any egress to an unresolved neighbor triggers resolution, so the echo's
+reply is irrelevant. The selection seam is unit-tested
+(`probe_socket_tests` in `neighbor.rs`) without manipulating process
+capabilities: a raw failure must produce a DGRAM attempt + selection.
 
 ### 6. Buffer Retry Not Running on Empty RX
 
