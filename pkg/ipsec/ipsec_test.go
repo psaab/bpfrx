@@ -162,9 +162,12 @@ func TestBuildESPProposal(t *testing.T) {
 			"aes256",
 		},
 		{
-			"gcm-no-auth",
+			// #2392: EC DH group 20 must render the strongSwan ECP keyword
+			// ecp384, NOT the invalid modp384 this case pinned before the
+			// formatDHGroup fix.
+			"gcm-no-auth-ecp",
 			&config.IPsecProposal{EncryptionAlg: "aes256gcm128", AuthAlg: "hmac-sha512", DHGroup: 20},
-			"aes256gcm128-modp384",
+			"aes256gcm128-ecp384",
 		},
 	}
 	for _, tt := range tests {

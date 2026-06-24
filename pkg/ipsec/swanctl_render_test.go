@@ -1,6 +1,7 @@
 package ipsec
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -142,6 +143,131 @@ func TestBuildIKEProposalFromIKE_JunosGCMSuffixAndPRF(t *testing.T) {
 				t.Errorf("buildIKEProposalFromIKE(%q) = %q, want %q", tt.prop.EncryptionAlg, got, tt.want)
 			}
 		})
+	}
+}
+
+// TestFormatDHGroup_ECPandMODP is the #2392 regression: elliptic-curve DH
+// groups must render their strongSwan ECP/curve keyword (group 19 ->
+// ecp256, 20 -> ecp384, 21 -> ecp521, 31 -> curve25519), NOT modp<bits>.
+// Pre-#2392 every builder formatted the suffix as fmt.Sprintf("modp%d",
+// dhGroupBits(group)), so group 19/20 emitted the strongSwan-invalid
+// tokens modp256/modp384 and the whole proposal was rejected at swanctl
+// load. MODP groups (e.g. 14 -> modp2048) must keep rendering modp<bits>.
+//
+// Fail-on-revert: reverting formatDHGroup to fmt.Sprintf("modp%d",
+// dhGroupBits(group)) makes group 19 render "modp256" instead of
+// "ecp256", which fails the ecp* assertions below. The trailing
+// counter-factual block reconstructs the pre-fix formula and proves it
+// produces the invalid token, so the test is not tautological.
+func TestFormatDHGroup_ECPandMODP(t *testing.T) {
+	tests := []struct {
+		group int
+		want  string
+	}{
+		// MODP groups — unchanged pre-#2392 behaviour.
+		{1, "modp768"},
+		{2, "modp1024"},
+		{5, "modp1536"},
+		{14, "modp2048"},
+		{15, "modp3072"},
+		{16, "modp4096"},
+		// Elliptic-curve (ECP) groups — the #2392 fix.
+		{19, "ecp256"},
+		{20, "ecp384"},
+		{21, "ecp521"},
+		{25, "ecp192"},
+		{26, "ecp224"},
+		// Brainpool ECP groups.
+		{27, "ecp224bp"},
+		{28, "ecp256bp"},
+		{29, "ecp384bp"},
+		{30, "ecp512bp"},
+		// Montgomery curves.
+		{31, "curve25519"},
+		{32, "curve448"},
+	}
+	for _, tt := range tests {
+		if got := formatDHGroup(tt.group); got != tt.want {
+			t.Errorf("formatDHGroup(%d) = %q, want %q", tt.group, got, tt.want)
+		}
+	}
+
+	// Counter-factual: the pre-#2392 formula renders the strongSwan-invalid
+	// modp<bits> token for the EC groups. This proves the fix is load-bearing
+	// (the old code WOULD fail the assertions above) rather than a tautology.
+	for _, g := range []int{19, 20} {
+		old := fmt.Sprintf("modp%d", dhGroupBits(g))
+		if got := formatDHGroup(g); got == old {
+			t.Errorf("formatDHGroup(%d) = %q still matches the pre-#2392 invalid token %q",
+				g, got, old)
+		}
+	}
+}
+
+// TestProposalBuilders_ECPGroupAcrossAllSites asserts that ALL FOUR
+// proposal render sites route the DH-group suffix through formatDHGroup,
+// so EC groups 19/20/21/31 emit ecp256/ecp384/ecp521/curve25519 (not
+// modp<bits>) and MODP group 14 still emits modp2048 (no regression):
+//
+//  1. buildIKEProposalFromIKE  (IKE proposal object path)
+//  2. buildIKEProposal         (legacy IPsec-proposal-as-IKE path)
+//  3. buildESPProposal         (ESP / Phase-2 path)
+//  4. resolveESPSettings PFS fallback (undefined-proposal #2073 fallback)
+func TestProposalBuilders_ECPGroupAcrossAllSites(t *testing.T) {
+	type groupCase struct {
+		group  int
+		suffix string
+	}
+	groupCases := []groupCase{
+		{14, "modp2048"}, // MODP no-regression
+		{19, "ecp256"},
+		{20, "ecp384"},
+		{21, "ecp521"},
+		{31, "curve25519"},
+	}
+
+	for _, gc := range groupCases {
+		// Site 1: buildIKEProposalFromIKE.
+		if got, want := buildIKEProposalFromIKE(
+			&config.IKEProposal{EncryptionAlg: "aes-256-cbc", AuthAlg: "sha-256", DHGroup: gc.group}),
+			"aes256-sha256-"+gc.suffix; got != want {
+			t.Errorf("buildIKEProposalFromIKE(group %d) = %q, want %q", gc.group, got, want)
+		}
+
+		// Site 2: buildIKEProposal.
+		if got, want := buildIKEProposal(
+			&config.IPsecProposal{EncryptionAlg: "aes-256-cbc", AuthAlg: "hmac-sha-256", DHGroup: gc.group}),
+			"aes256-sha256-"+gc.suffix; got != want {
+			t.Errorf("buildIKEProposal(group %d) = %q, want %q", gc.group, got, want)
+		}
+
+		// Site 3: buildESPProposal (DH group via the proposal field).
+		if got, want := buildESPProposal(
+			&config.IPsecProposal{EncryptionAlg: "aes-256-cbc", AuthAlg: "hmac-sha-256", DHGroup: gc.group}, 0),
+			"aes256-sha256-"+gc.suffix; got != want {
+			t.Errorf("buildESPProposal(DHGroup %d) = %q, want %q", gc.group, got, want)
+		}
+
+		// Site 3b: buildESPProposal with the PFS group override.
+		if got, want := buildESPProposal(
+			&config.IPsecProposal{EncryptionAlg: "aes-256-cbc", AuthAlg: "hmac-sha-256"}, gc.group),
+			"aes256-sha256-"+gc.suffix; got != want {
+			t.Errorf("buildESPProposal(pfs %d) = %q, want %q", gc.group, got, want)
+		}
+
+		// Site 4: resolveESPSettings PFS fallback. The IPsec policy resolves
+		// but names a proposal that does not exist, so the #2073 fallback
+		// carries the configured PFS group onto a conservative proposal.
+		cfg := &config.IPsecConfig{
+			Policies: map[string]*config.IPsecPolicyDef{
+				"pol1": {Name: "pol1", PFSGroup: gc.group, Proposals: "missing-prop"},
+			},
+		}
+		vpn := &config.IPsecVPN{IPsecPolicy: "pol1"}
+		if got, _ := resolveESPSettings(cfg, vpn); got != "aes256-sha256-"+gc.suffix {
+			t.Errorf("resolveESPSettings PFS fallback (group %d) = %q, want %q",
+				gc.group, got, "aes256-sha256-"+gc.suffix)
+		}
 	}
 }
 
