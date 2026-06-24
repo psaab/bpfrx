@@ -26,7 +26,7 @@ which makes each domain unit-testable with a fake (see `rules_test.go`'s
 | `routes.go` | `routeReader` | kernel routing-table reads (`routeLister`) |
 | `routeformat.go` | free fns | Junos `show route` formatters |
 | `tunnel.go` | `tunnelManager` | GRE/IPIP tunnels + keepalive goroutines; own `mu` |
-| `xfrm.go` | `xfrmManager` | XFRM/IPsec interface lifecycle; own `mu` |
+| `xfrm.go` | `xfrmManager` | XFRM/IPsec interface lifecycle; own `mu` + tracked `name→if_id` set. `Apply` reconciles **differentially** against the tracked set (keep unchanged / create new / delete removed / recreate on `if_id` change) — it does NOT clear-all-then-rebuild, so an unrelated config commit leaves active xfrmi interfaces untouched (#2546) |
 | `rules.go` | `nextTableManager` / `ribGroupManager` / `pbrManager` | policy-routing ip-rule reconcilers (`ruleOps`, stateless) |
 | `probe_pin.go` | `probePinManager` | RPM probe next-hop pin reconciler (#1827): fwmark rules in band 50-99 + pinned host routes in reserved tables 7000-7049 (`probePinOps`, stateless). `Apply` returns per-test install failures (keyed by TestKey) and rolls back the fwmark rule when the pinned route fails (best-effort — a failed rollback is swept by the next band clear; the pin reports failed either way); callers thread the failed map into `pkg/rpm` so affected tests hold state instead of probing unpinned (#1895) |
 | `bond.go` | `bondManager` | bond device lifecycle; own `mu` |
@@ -36,6 +36,29 @@ which makes each domain unit-testable with a fake (see `rules_test.go`'s
 The tunnel domain depends on the VRF domain (`tunnelManager.vrfBinder`)
 to bind tunnel interfaces to a routing-instance VRF;
 `BindInterfaceToVRF` takes no lock, so there is no lock-ordering cycle.
+
+### XFRM interface reconcile (#2546)
+
+`xfrmManager.Apply` is called by `pkg/daemon` on **every** config commit
+(not only IPsec changes) so xfrmi devices for deleted VPNs are torn
+down. It therefore reconciles the desired xfrmi set (`name→if_id`
+derived from each VPN's `bind-interface` via
+`config.XFRMIfNameAndID`) against the tracked set instead of clearing
+all and rebuilding:
+
+- **keep** an interface untouched when it is still desired with the same
+  `if_id` — no `LinkDel`/`LinkAdd`, so active tunnel traffic and routing
+  bound to the interface survive an unrelated commit;
+- **create** a newly-desired interface (also adopts a kernel link that
+  outlived in-memory tracking, e.g. across a daemon restart);
+- **delete** an interface whose VPN was removed;
+- **recreate** (delete+create) an interface whose name is unchanged but
+  whose desired `if_id` differs — `Ifid` is set at xfrmi creation and is
+  not mutable in place.
+
+A no-op commit (identical VPN set) issues zero `LinkDel` and zero
+`LinkAdd`. `Clear()` (shutdown / full teardown) still deletes every
+tracked interface.
 
 ## Entry points
 

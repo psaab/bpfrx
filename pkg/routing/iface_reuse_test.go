@@ -67,6 +67,7 @@ type fakeLinkOps struct {
 	setUpLinks []netlink.Link
 	addrLinks  []netlink.Link
 	delNames   []string
+	addCount   int // cumulative successful LinkAdd calls
 	noMaster   []string
 	mtuSet     map[string][]int
 	addrDels   map[string][]string
@@ -110,6 +111,7 @@ func (f *fakeLinkOps) LinkAdd(l netlink.Link) error {
 		return errors.New("file exists")
 	}
 	f.links[l.Attrs().Name] = l
+	f.addCount++
 	return nil
 }
 
@@ -262,13 +264,17 @@ func TestTunnelAnchorReuseUsesExistingLink(t *testing.T) {
 func TestXfrmAlreadyExistsSingleLookup(t *testing.T) {
 	ops := newFakeLinkOps()
 	// config.XFRMIfNameAndID maps "st0.1" -> ("xfrm1", id). Seed that.
-	ifName, _ := config.XFRMIfNameAndID("st0.1")
+	ifName, ifID := config.XFRMIfNameAndID("st0.1")
 	if ifName == "" {
 		t.Fatalf("XFRMIfNameAndID returned empty name for st0.1")
 	}
 	const wantIndex = 7
+	// Seed the existing link with the MATCHING Ifid so the adopt path's
+	// if_id verification (recreate-on-mismatch) keeps it and exercises the
+	// single-lookup reuse branch under test.
 	ops.links[ifName] = &netlink.Xfrmi{
 		LinkAttrs: netlink.LinkAttrs{Name: ifName, Index: wantIndex},
+		Ifid:      ifID,
 	}
 	// Make any SECOND LinkByName for this name fail — under the old
 	// double-lookup code this would feed nil to LinkSetUp and panic. The
@@ -295,5 +301,255 @@ func TestXfrmAlreadyExistsSingleLookup(t *testing.T) {
 	}
 	if got := ops.setUpLinks[0].Attrs().Index; got != wantIndex {
 		t.Errorf("LinkSetUp ran against index %d, want existing %d", got, wantIndex)
+	}
+}
+
+// xfrmVPNs is a small helper to build the VPN map keyed by name.
+func xfrmVPNs(binds ...string) map[string]*config.IPsecVPN {
+	m := make(map[string]*config.IPsecVPN, len(binds))
+	for _, b := range binds {
+		name := "v" + b
+		m[name] = &config.IPsecVPN{Name: name, BindInterface: b}
+	}
+	return m
+}
+
+// TestXfrmApplyUnchangedCommitNoChurn is the core #2546 regression: a
+// second Apply with the IDENTICAL VPN set must issue ZERO LinkDel and
+// ZERO LinkAdd — an unrelated config commit (ApplyXfrmi runs on every
+// commit) must not tear down and rebuild active IPsec xfrmi interfaces.
+//
+// FAIL-ON-REVERT: the pre-#2546 Apply called clearLocked() first, which
+// LinkDel'd every tracked xfrmi and then recreated it. Under that code
+// this test would observe N LinkDel + N LinkAdd on the second Apply and
+// fail at the zero-churn assertions below.
+func TestXfrmApplyUnchangedCommitNoChurn(t *testing.T) {
+	ops := newFakeLinkOps()
+	xm := &xfrmManager{ops: ops}
+	vpns := xfrmVPNs("st0.0", "st1.0", "st2.5")
+
+	// First apply creates all three.
+	if err := xm.Apply(vpns); err != nil {
+		t.Fatalf("first Apply: %v", err)
+	}
+	if len(ops.delNames) != 0 {
+		t.Fatalf("first Apply issued %d LinkDel, want 0", len(ops.delNames))
+	}
+	if len(xm.xfrmis) != 3 {
+		t.Fatalf("after first Apply tracked %d xfrmis, want 3", len(xm.xfrmis))
+	}
+	createdLinks := len(ops.links)
+	if createdLinks != 3 {
+		t.Fatalf("after first Apply kernel has %d links, want 3", createdLinks)
+	}
+
+	// Snapshot the recorders, then apply the SAME set again.
+	delsBefore := len(ops.delNames)
+	// Count LinkAdd via kernel link mutations: re-add of an existing name
+	// would overwrite the map entry (count stays the same) — so assert via
+	// a dedicated LinkAdd recorder below instead. We reset link count.
+	if err := xm.Apply(vpns); err != nil {
+		t.Fatalf("second Apply: %v", err)
+	}
+
+	if got := len(ops.delNames) - delsBefore; got != 0 {
+		t.Errorf("second Apply (identical VPNs) issued %d LinkDel, want 0 "+
+			"(#2546: unrelated commit must not tear down active xfrmi)", got)
+	}
+	if ops.addCount != 3 {
+		t.Errorf("second Apply issued %d cumulative LinkAdd, want 3 (all from the "+
+			"first Apply, none on the no-op commit)", ops.addCount)
+	}
+	if len(xm.xfrmis) != 3 {
+		t.Errorf("after second Apply tracked %d xfrmis, want 3", len(xm.xfrmis))
+	}
+}
+
+// TestXfrmApplyAddVPN: adding one VPN creates exactly one new xfrmi; the
+// pre-existing ones are not touched (no LinkDel, no re-LinkAdd).
+func TestXfrmApplyAddVPN(t *testing.T) {
+	ops := newFakeLinkOps()
+	xm := &xfrmManager{ops: ops}
+
+	if err := xm.Apply(xfrmVPNs("st0.0", "st1.0")); err != nil {
+		t.Fatalf("first Apply: %v", err)
+	}
+	addsBefore := ops.addCount
+	delsBefore := len(ops.delNames)
+
+	if err := xm.Apply(xfrmVPNs("st0.0", "st1.0", "st2.0")); err != nil {
+		t.Fatalf("second Apply: %v", err)
+	}
+
+	if got := ops.addCount - addsBefore; got != 1 {
+		t.Errorf("adding one VPN issued %d LinkAdd, want exactly 1", got)
+	}
+	if got := len(ops.delNames) - delsBefore; got != 0 {
+		t.Errorf("adding a VPN issued %d LinkDel, want 0 (existing untouched)", got)
+	}
+	wantName, _ := config.XFRMIfNameAndID("st2.0")
+	if _, ok := xm.xfrmis[wantName]; !ok {
+		t.Errorf("new xfrmi %q not tracked after add", wantName)
+	}
+	if len(xm.xfrmis) != 3 {
+		t.Errorf("tracked %d xfrmis after add, want 3", len(xm.xfrmis))
+	}
+}
+
+// TestXfrmApplyRemoveVPN: removing one VPN deletes exactly that xfrmi;
+// the others are not touched.
+func TestXfrmApplyRemoveVPN(t *testing.T) {
+	ops := newFakeLinkOps()
+	xm := &xfrmManager{ops: ops}
+
+	if err := xm.Apply(xfrmVPNs("st0.0", "st1.0", "st2.0")); err != nil {
+		t.Fatalf("first Apply: %v", err)
+	}
+	addsBefore := ops.addCount
+
+	if err := xm.Apply(xfrmVPNs("st0.0", "st2.0")); err != nil {
+		t.Fatalf("second Apply: %v", err)
+	}
+
+	removedName, _ := config.XFRMIfNameAndID("st1.0")
+	if len(ops.delNames) != 1 || ops.delNames[0] != removedName {
+		t.Errorf("removing a VPN issued LinkDel %v, want exactly [%q]",
+			ops.delNames, removedName)
+	}
+	if got := ops.addCount - addsBefore; got != 0 {
+		t.Errorf("removing a VPN issued %d LinkAdd, want 0", got)
+	}
+	if _, ok := xm.xfrmis[removedName]; ok {
+		t.Errorf("removed xfrmi %q still tracked", removedName)
+	}
+	if len(xm.xfrmis) != 2 {
+		t.Errorf("tracked %d xfrmis after remove, want 2", len(xm.xfrmis))
+	}
+	// The survivors must still be present in the kernel (never deleted).
+	for _, b := range []string{"st0.0", "st2.0"} {
+		n, _ := config.XFRMIfNameAndID(b)
+		if _, ok := ops.links[n]; !ok {
+			t.Errorf("survivor xfrmi %q was deleted from the kernel", n)
+		}
+	}
+}
+
+// TestXfrmApplyChangedIfIDRecreates: when a name maps to a different
+// if_id than the tracked one, ONLY that xfrmi is delete+recreated; the
+// others are untouched. (if_id is set at xfrmi creation and is not
+// mutable in place, so a params change requires delete+create.)
+func TestXfrmApplyChangedIfIDRecreates(t *testing.T) {
+	ops := newFakeLinkOps()
+	xm := &xfrmManager{ops: ops}
+
+	if err := xm.Apply(xfrmVPNs("st0.0", "st1.0")); err != nil {
+		t.Fatalf("first Apply: %v", err)
+	}
+	name, oldID := config.XFRMIfNameAndID("st1.0")
+	otherName, _ := config.XFRMIfNameAndID("st0.0")
+	addsBefore := ops.addCount
+
+	// Force a params change for the SAME interface name: rewrite the
+	// tracked if_id so the reconcile sees a mismatch and must recreate.
+	newID := oldID + 1
+	xm.xfrmis[name] = newID
+
+	if err := xm.Apply(xfrmVPNs("st0.0", "st1.0")); err != nil {
+		t.Fatalf("second Apply: %v", err)
+	}
+
+	if len(ops.delNames) != 1 || ops.delNames[0] != name {
+		t.Errorf("changed-if_id recreate issued LinkDel %v, want exactly [%q]",
+			ops.delNames, name)
+	}
+	if got := ops.addCount - addsBefore; got != 1 {
+		t.Errorf("changed-if_id recreate issued %d LinkAdd, want exactly 1", got)
+	}
+	if got := xm.xfrmis[name]; got != oldID {
+		t.Errorf("recreated xfrmi tracked if_id %d, want desired %d", got, oldID)
+	}
+	// The unrelated interface must not have been touched.
+	for _, d := range ops.delNames {
+		if d == otherName {
+			t.Errorf("unrelated xfrmi %q was deleted during recreate", otherName)
+		}
+	}
+	if _, ok := ops.links[otherName]; !ok {
+		t.Errorf("unrelated xfrmi %q missing from kernel after recreate", otherName)
+	}
+}
+
+// TestXfrmAdoptStaleIfIDRecreates: on adopt-on-restart (in-memory
+// tracking lost, but a kernel xfrmi with the same name survives), the
+// adopted link's ACTUAL Ifid must be verified against the desired one.
+// A kernel xfrmi with the right NAME but a WRONG Ifid must be deleted
+// and recreated with the correct if_id — never silently re-tracked.
+//
+// FAIL-ON-REVERT: without the Ifid check the wrong-if_id kernel link is
+// adopted as-is (0 LinkDel / 0 LinkAdd, tracked if_id stored as desired
+// while the kernel link keeps the stale Ifid). The assertions below for
+// exactly 1 LinkDel + 1 LinkAdd and a kernel link carrying the desired
+// Ifid then fail.
+func TestXfrmAdoptStaleIfIDRecreates(t *testing.T) {
+	ops := newFakeLinkOps()
+	ifName, wantID := config.XFRMIfNameAndID("st0.0")
+	if ifName == "" || wantID == 0 {
+		t.Fatalf("XFRMIfNameAndID returned name=%q id=%d for st0.0", ifName, wantID)
+	}
+	// Seed a kernel xfrmi with the SAME name but a DIFFERENT (stale) Ifid,
+	// and leave xm.xfrmis empty so Apply takes the adopt-on-restart path.
+	staleID := wantID + 1
+	ops.links[ifName] = &netlink.Xfrmi{
+		LinkAttrs: netlink.LinkAttrs{Name: ifName, Index: 11},
+		Ifid:      staleID,
+	}
+
+	xm := &xfrmManager{ops: ops}
+	if err := xm.Apply(xfrmVPNs("st0.0")); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+
+	if len(ops.delNames) != 1 || ops.delNames[0] != ifName {
+		t.Errorf("stale-if_id adopt issued LinkDel %v, want exactly [%q] "+
+			"(wrong-Ifid kernel link must be recreated, not adopted)",
+			ops.delNames, ifName)
+	}
+	if ops.addCount != 1 {
+		t.Errorf("stale-if_id adopt issued %d LinkAdd, want exactly 1", ops.addCount)
+	}
+	if got := xm.xfrmis[ifName]; got != wantID {
+		t.Errorf("tracked if_id %d after recreate, want desired %d", got, wantID)
+	}
+	// The kernel link must now carry the DESIRED Ifid, not the stale one.
+	link, ok := ops.links[ifName]
+	if !ok {
+		t.Fatalf("xfrmi %q missing from kernel after recreate", ifName)
+	}
+	xi, ok := link.(*netlink.Xfrmi)
+	if !ok {
+		t.Fatalf("kernel link %q is %T, want *netlink.Xfrmi", ifName, link)
+	}
+	if xi.Ifid != wantID {
+		t.Errorf("recreated kernel xfrmi has Ifid %d, want desired %d "+
+			"(stale link was adopted without recreate)", xi.Ifid, wantID)
+	}
+}
+
+// TestXfrmClearStillDeletesAll: Clear (shutdown/full teardown) must
+// still LinkDel every tracked xfrmi.
+func TestXfrmClearStillDeletesAll(t *testing.T) {
+	ops := newFakeLinkOps()
+	xm := &xfrmManager{ops: ops}
+	if err := xm.Apply(xfrmVPNs("st0.0", "st1.0")); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if err := xm.Clear(); err != nil {
+		t.Fatalf("Clear: %v", err)
+	}
+	if len(ops.delNames) != 2 {
+		t.Errorf("Clear issued %d LinkDel, want 2", len(ops.delNames))
+	}
+	if len(xm.xfrmis) != 0 {
+		t.Errorf("Clear left %d tracked xfrmis, want 0", len(xm.xfrmis))
 	}
 }
