@@ -9,7 +9,7 @@ import (
 	"syscall"
 )
 
-const InjectPacketUsage = "request chassis cluster data-plane userspace inject-packet slot <N> <valid|fib-mismatch|metadata-parse-error> [destination-ip <ip>] [emit-on-wire true source-ip <ip> [source-port <port>] [destination-port <port>] [protocol <icmp|icmpv6>]]"
+const InjectPacketUsage = "request chassis cluster data-plane userspace inject-packet slot <N> <valid|fib-mismatch|metadata-parse-error> [packet-length <bytes>] [destination-ip <ip>] [emit-on-wire true source-ip <ip> [source-port <port>] [destination-port <port>] [protocol <icmp|icmpv6>]]"
 const injectPacketTargetExtraPrefix = "xpf-inject-extra:"
 
 func ParseInjectPacketCommand(args []string) (slot uint32, mode string, extra map[string]string, err error) {
@@ -84,6 +84,22 @@ func BuildInjectPacketRequest(slot uint32, mode string, extra map[string]string,
 		req.FIBGeneration = 0
 	default:
 		return InjectPacketRequest{}, fmt.Errorf("unknown inject mode %q", mode)
+	}
+	// #2443: honor an optional operator-supplied packet-length override,
+	// but bound it. An over-max value is REJECTED (not clamped) so an
+	// API misuse / DoS attempt surfaces as an error rather than being
+	// silently masked — clamping a malicious large value to the max
+	// would still hide the misuse.
+	if text := extra["packet-length"]; text != "" {
+		n, err := strconv.ParseUint(text, 10, 32)
+		if err != nil {
+			return InjectPacketRequest{}, fmt.Errorf("invalid packet-length %q: %w", text, err)
+		}
+		req.PacketLength = uint32(n)
+	}
+	if req.PacketLength > MaxInjectPacketLength {
+		return InjectPacketRequest{}, fmt.Errorf(
+			"inject packet-length %d exceeds maximum %d", req.PacketLength, MaxInjectPacketLength)
 	}
 	if req.EmitOnWire {
 		if !req.MetadataValid {

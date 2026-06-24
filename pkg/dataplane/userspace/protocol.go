@@ -11,6 +11,19 @@ const (
 	ProtocolVersion                  = 3
 	InjectPacketTupleProtocolVersion = 1
 	TypeUserspace                    = "userspace"
+
+	// MaxInjectPacketLength bounds the operator/API-supplied packet
+	// length for the `request inject-packet` control RPC (#2443). An
+	// injected packet is always emitted as a single unfragmented frame
+	// that must fit in one AF_XDP UMEM frame on the TX path
+	// (UMEM_FRAME_SIZE = 4096 in userspace-dp), and 4096 is also well
+	// within the u16 range of the IPv4 total-length / IPv6 payload-length
+	// wire fields, so the on-wire length can never wrap. The bound is the
+	// smaller of "u16-representable" and "max single egress frame"; the
+	// UMEM frame ceiling is the binding constraint. A length above this is
+	// REJECTED (not clamped) so an API misuse / DoS attempt surfaces as an
+	// error rather than being silently masked.
+	MaxInjectPacketLength = 4096
 )
 
 type ControlRequest struct {

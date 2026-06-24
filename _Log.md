@@ -12126,3 +12126,52 @@ top.
   userspace-dp/src/afxdp/coordinator/reconcile/bringup.rs,
   userspace-dp/src/afxdp/coordinator/tests.rs,
   docs/userspace-dataplane-architecture.md, _Log.md
+
+## 2026-06-23 — #2443 inject packet-length bound + u16 wire-length backstop
+
+- **Timestamp**: 2026-06-23
+- **Action**: Bound the operator/API-supplied `inject-packet` length in
+  both planes and add a u16 wire-length backstop (codex review-033 finding
+  033-08; HIGH). The packet-injection API previously set a Go default
+  (~128) but never validated a supplied PacketLength against a maximum, and
+  the Rust handler clamped only a minimum (`.max(64)`); the frame builders
+  then `Vec::with_capacity(target_len)` and wrote the IPv4 total-length /
+  IPv6 payload-length wire fields with an unchecked `as u16` that wraps
+  above 65535 while the buffer stays huge — a control-plane DoS plus a
+  malformed-frame generator.
+- **Chosen max**: 4096 = `UMEM_FRAME_SIZE`. An injected packet is a single
+  unfragmented frame that must fit in one UMEM frame on the AF_XDP TX path
+  (the TX stage already rejects frames > UMEM frame capacity), so the
+  egress single-frame ceiling is the binding constraint; 4096 is also well
+  within u16 so the wire length can never wrap. Picked the smaller of
+  "u16-representable" and "max single egress frame".
+- **Decision**: REJECT, not clamp. Clamping a malicious large value down to
+  the max would still mask the API misuse, so over-max returns an error
+  (Go `BuildInjectPacketRequest`; Rust `Coordinator::check_inject_packet_length`,
+  hoisted to run before any state lookup/alloc). The frame builders are the
+  defense-in-depth backstop: they clamp `target_len` to the max AND use
+  `u16::try_from` for the wire length, returning Err rather than emitting a
+  wrapped field if the bound were ever bypassed.
+- **Tests (fail-on-revert, all verified)**: Rust coordinator
+  `inject_length_tests` (over-max / giant rejected, at-max / small / 0 ok —
+  fails if the bound is neutered); Rust frame
+  `inject_ipv4_*`/`inject_ipv6_giant_*` (normal/at-max build with a
+  consistent wire length; giant length is clamped, not huge, and the wire
+  field matches the bounded frame — fails if the clamp is removed or
+  `as u16` restored); Go `inject_test.go` (over-max / malformed rejected,
+  at-max / default accepted — fails if the Go guard is removed).
+- **Validation**: cargo build --release clean (pre-existing warnings only);
+  29 inject Rust tests pass 5x (0 failed); `go test
+  ./pkg/dataplane/userspace/ ./pkg/cmdtree/` ok; `go build ./...` ok;
+  gofmt clean. Fail-on-revert confirmed by neutering each guard.
+- **Doc**: coordinator README inject.rs row documents the bound + reject +
+  backstop. cmdtree exposes a `packet-length` completion for valid /
+  fib-mismatch modes (max 4096, over-max rejected).
+- **File(s)**: pkg/dataplane/userspace/protocol.go,
+  pkg/dataplane/userspace/inject.go,
+  pkg/dataplane/userspace/inject_test.go, pkg/cmdtree/tree.go,
+  userspace-dp/src/afxdp/mod.rs,
+  userspace-dp/src/afxdp/coordinator/inject.rs,
+  userspace-dp/src/afxdp/frame/mod.rs,
+  userspace-dp/src/afxdp/frame/tests.rs,
+  userspace-dp/src/afxdp/coordinator/README.md, _Log.md

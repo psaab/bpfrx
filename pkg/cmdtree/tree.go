@@ -830,6 +830,7 @@ var OperationalTree = map[string]*Node{
 								return out
 							}, Children: map[string]*Node{
 								"valid": {Desc: "Inject a valid packet using the current snapshot generations", Children: map[string]*Node{
+									"packet-length":    {Desc: "Optional packet length in bytes (max 4096; over-max is rejected)"},
 									"destination-ip":   {Desc: "Optional destination IP used for forwarding resolution"},
 									"emit-on-wire":     {Desc: "Emit a resolved synthetic packet on the egress interface"},
 									"source-ip":        {Desc: "Source IP required when emitting on wire"},
@@ -838,6 +839,7 @@ var OperationalTree = map[string]*Node{
 									"protocol":         {Desc: "Tuple protocol for emitted packet"},
 								}},
 								"fib-mismatch": {Desc: "Inject a packet with a mismatched FIB generation", Children: map[string]*Node{
+									"packet-length":    {Desc: "Optional packet length in bytes (max 4096; over-max is rejected)"},
 									"destination-ip":   {Desc: "Optional destination IP used for forwarding resolution"},
 									"emit-on-wire":     {Desc: "Emit a resolved synthetic packet on the egress interface"},
 									"source-ip":        {Desc: "Source IP required when emitting on wire"},

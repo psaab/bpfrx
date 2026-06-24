@@ -110,6 +110,15 @@ pub(super) fn stamp_injected_packet_tuple(
 /// never touched.
 impl super::Coordinator {
     pub fn inject_test_packet(&mut self, req: InjectPacketRequest) -> Result<(), String> {
+        // #2443: bound the operator/API-supplied packet length up front,
+        // before touching any binding/live state or allocating. An
+        // injected packet is emitted as a single unfragmented frame that
+        // must fit in one UMEM frame on the TX path, and the limit keeps
+        // the IPv4 total-length / IPv6 payload-length wire fields within
+        // u16. Keep the 64-byte minimum (applied below), but REJECT (do
+        // not clamp) a value above the maximum so an API misuse / DoS
+        // attempt surfaces as an error rather than being silently masked.
+        Self::check_inject_packet_length(req.packet_length)?;
         let binding = self
             .workers
             .identities
@@ -276,5 +285,54 @@ impl super::Coordinator {
             &self.forwarding,
         );
         Ok(())
+    }
+
+    /// #2443: reject an inject request whose packet length exceeds the
+    /// maximum. Extracted as a pure associated function so the bound is
+    /// unit-testable without standing up a full coordinator with bound
+    /// workers. Over-max is REJECTED, not clamped.
+    pub(super) fn check_inject_packet_length(packet_length: u32) -> Result<(), String> {
+        if packet_length > crate::afxdp::MAX_INJECT_PACKET_LENGTH {
+            return Err(format!(
+                "inject packet_length {} exceeds maximum {}",
+                packet_length,
+                crate::afxdp::MAX_INJECT_PACKET_LENGTH
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod inject_length_tests {
+    use super::super::Coordinator;
+
+    #[test]
+    fn over_max_packet_length_is_rejected() {
+        // Fail-on-revert: restoring the old `.max(64)` min-only clamp
+        // (i.e. dropping this bound) makes this assertion fail.
+        let err = Coordinator::check_inject_packet_length(
+            crate::afxdp::MAX_INJECT_PACKET_LENGTH + 1,
+        )
+        .expect_err("over-max inject length must be rejected");
+        assert!(err.contains("exceeds maximum"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn giant_packet_length_is_rejected() {
+        assert!(Coordinator::check_inject_packet_length(1_000_000).is_err());
+    }
+
+    #[test]
+    fn at_max_packet_length_is_accepted() {
+        assert!(
+            Coordinator::check_inject_packet_length(crate::afxdp::MAX_INJECT_PACKET_LENGTH).is_ok()
+        );
+    }
+
+    #[test]
+    fn small_packet_length_is_accepted() {
+        assert!(Coordinator::check_inject_packet_length(128).is_ok());
+        assert!(Coordinator::check_inject_packet_length(0).is_ok());
     }
 }
