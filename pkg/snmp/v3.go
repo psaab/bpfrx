@@ -146,7 +146,7 @@ func (a *Agent) handleV3Packet(msgBody []byte) []byte {
 		slog.Debug("SNMPv3: failed to decode msgID")
 		return nil
 	}
-	_, rest, err = berDecodeInteger(rest) // msgMaxSize
+	msgMaxSize, rest, err := berDecodeInteger(rest) // msgMaxSize
 	if err != nil {
 		slog.Debug("SNMPv3: failed to decode msgMaxSize")
 		return nil
@@ -419,6 +419,23 @@ func (a *Agent) handleV3Packet(msgBody []byte) []byte {
 				currentOID = nextOID
 			}
 		}
+
+		// Bound the response to the effective maximum size (RFC 3416 §4.2.3):
+		// the smaller of the manager's advertised msgMaxSize and our own
+		// maxPacketSize, with msgMaxSize clamped up to the RFC floor. Trim
+		// trailing varbinds until the fully-encoded message (USM + scopedPDU,
+		// including any auth/priv overhead) fits; the manager continues the
+		// walk from the last returned OID. Only if nothing fits do we return
+		// tooBig with an empty varbind list rather than emit an oversized
+		// datagram.
+		maxSize := effectiveMaxSize(msgMaxSize)
+		resp, ok := trimToFit(respVarbinds, maxSize, func(vbs []varbind) []byte {
+			return a.buildV3Response(msgID, msgFlags, user, echoContext, requestID, errNoError, 0, vbs)
+		})
+		if !ok {
+			return a.buildV3Response(msgID, msgFlags, user, echoContext, requestID, errTooBig, 0, nil)
+		}
+		return resp
 
 	case pduSetRequest:
 		// The agent exposes no writable objects; refuse SET with notWritable
