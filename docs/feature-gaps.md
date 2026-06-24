@@ -446,6 +446,37 @@ supported; an unrecognized token yields no constraint rather than a match-all.
 Named `icmp-type`/`icmp-code` aliases (e.g. `echo-request`) are likewise not
 parsed — numeric values only.
 
+`from source-prefix-list <name>` / `destination-prefix-list <name>` (with the
+optional `except` modifier) is wired end-to-end to the userspace dataplane
+(#2506). Earlier the references were parsed into `config.FirewallFilterTerm`,
+counted in this list, and pinned by tests, but the userspace snapshot builder
+DROPPED them entirely — a term scoped by a prefix-list reached the dataplane
+with NO source/destination address constraint, so e.g. `from
+source-prefix-list mgmt except; then discard` became discard-ALL (fail-open for
+accept/PBR, fail-closed for discard/reject — action-dependent). The Go snapshot
+builder now RESOLVES each reference to its explicit CIDRs via
+`cfg.PolicyOptions.PrefixLists` and merges them into the term's address set
+(`resolvePrefixListAddrs`, `pkg/dataplane/userspace/filters.go`). The `except`
+inversion is carried as the per-direction wire flags
+`source_except`/`destination_except` on `FirewallTermSnapshot` (mirrored in
+`userspace-dp/src/protocol/security.rs` with `serde(default)` for #1961 wire
+parity); the Rust matcher evaluates `(addr ∈ prefixes) XOR except`
+(`filter::engine::matching::nets_match_v4`/`nets_match_v6`). An UNDEFINED
+prefix-list reference is now **rejected at commit with a clear error** naming
+the family/filter/term/prefix-list (`validateFirewallPrefixListReferencesStrict`,
+lenient warn-only on the load / peer-sync path so a persisted/synced config
+still boots — #1960), mirroring the `then policer` / `then routing-instance`
+gates (#2217). Junos semantics: a plain prefix-list reference OR's its prefixes
+with any literal `source-address`/`destination-address` entries; `except` means
+"match every address NOT in the list". Scope (this PR): the two clean cases —
+positive prefix-lists (with or without literal addresses) and an `except`
+prefix-list as the SOLE address source for the direction — are wired through.
+The MIXED case (literal/positive addresses AND an `except` prefix-list in the
+SAME direction of ONE term) has no single boolean-inversion representation; the
+`except` modifier is dropped (prefixes fold into the positive set — the
+under-broad, fail-safe reading) with a warning, and the structured mixed case
+is a documented follow-up.
+
 | Feature | Junos Config Path | Description | Priority | Status |
 |---------|-------------------|-------------|----------|--------|
 | **Policer (Rate Limiting)** | `firewall policer ... bandwidth-limit N burst-size-limit N` | Token-bucket rate limiter applied to filter terms or interfaces. Single-rate two-color, three-color policers. | High | Partial for #1373: legacy eBPF/~~DPDK~~ (DPDK retired #1525) token-bucket policer support existed; userspace supports the admitted filter path and the color-blind `then discard` three-color slice. #1375 is closed; unsupported color-aware/non-drop behavior and broader Junos parity remain production/future parity work, not active #1373 source-removal blockers. |

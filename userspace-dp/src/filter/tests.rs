@@ -36,6 +36,8 @@ fn basic_accept_discard() {
             terms: vec![
                 FirewallTermSnapshot {
                     name: "deny-ssh".into(),
+                    source_except: false,
+                    destination_except: false,
                     destination_addresses: vec![],
                     source_addresses: vec![],
                     protocols: vec!["tcp".into()],
@@ -56,6 +58,8 @@ fn basic_accept_discard() {
                 },
                 FirewallTermSnapshot {
                     name: "allow-all".into(),
+                    source_except: false,
+                    destination_except: false,
                     destination_addresses: vec![],
                     source_addresses: vec![],
                     protocols: vec![],
@@ -197,6 +201,8 @@ fn port_range_matching() {
             family: "inet".into(),
             terms: vec![FirewallTermSnapshot {
                 name: "high-ports".into(),
+                source_except: false,
+                destination_except: false,
                 destination_addresses: vec![],
                 source_addresses: vec![],
                 protocols: vec!["tcp".into()],
@@ -255,6 +261,8 @@ fn protocol_matching() {
             family: "inet".into(),
             terms: vec![FirewallTermSnapshot {
                 name: "deny-icmp".into(),
+                source_except: false,
+                destination_except: false,
                 destination_addresses: vec![],
                 source_addresses: vec![],
                 protocols: vec!["icmp".into()],
@@ -313,6 +321,8 @@ fn dscp_rewrite_action() {
             family: "inet".into(),
             terms: vec![FirewallTermSnapshot {
                 name: "mark-ef".into(),
+                source_except: false,
+                destination_except: false,
                 destination_addresses: vec![],
                 source_addresses: vec![],
                 protocols: vec!["udp".into()],
@@ -357,6 +367,8 @@ fn dscp_rewrite_action_allows_default_zero() {
             family: "inet".into(),
             terms: vec![FirewallTermSnapshot {
                 name: "mark-default".into(),
+                source_except: false,
+                destination_except: false,
                 destination_addresses: vec![],
                 source_addresses: vec![],
                 protocols: vec!["udp".into()],
@@ -1216,6 +1228,8 @@ fn multiple_terms_first_match_wins() {
             terms: vec![
                 FirewallTermSnapshot {
                     name: "allow-dns".into(),
+                    source_except: false,
+                    destination_except: false,
                     destination_addresses: vec![],
                     source_addresses: vec![],
                     protocols: vec!["udp".into()],
@@ -1236,6 +1250,8 @@ fn multiple_terms_first_match_wins() {
                 },
                 FirewallTermSnapshot {
                     name: "deny-all-udp".into(),
+                    source_except: false,
+                    destination_except: false,
                     destination_addresses: vec![],
                     source_addresses: vec![],
                     protocols: vec!["udp".into()],
@@ -1295,6 +1311,8 @@ fn source_dest_address_matching() {
             family: "inet".into(),
             terms: vec![FirewallTermSnapshot {
                 name: "deny-from-subnet".into(),
+                source_except: false,
+                destination_except: false,
                 source_addresses: vec!["192.168.1.0/24".into()],
                 destination_addresses: vec!["10.0.0.0/8".into()],
                 protocols: vec![],
@@ -4262,4 +4280,185 @@ fn protocol_2505_esp_discard_fixture_scopes_only_esp() {
         FilterAction::Accept,
         "TCP must NOT be discarded by a `from protocol esp` term — fail-wide regression (#2505)"
     );
+}
+
+// === #2506: source/destination-prefix-list expansion + `except` inversion ===
+//
+// The Go control plane resolves a `from source-prefix-list NAME [except]`
+// reference to explicit CIDRs and sets the per-direction `source_except` /
+// `destination_except` flag. These tests pin the Rust matcher half: a positive
+// prefix set scopes the term to those prefixes; an `except` set inverts the
+// membership so the term matches every address NOT in the set. They fail on a
+// matcher that ignores the except flag (the inverted term would match the
+// listed prefixes instead of excluding them — exactly the dropped-scope bug).
+
+#[test]
+fn prefix_list_positive_scopes_term_to_listed_addrs() {
+    let state = make_filter_state(
+        &[FirewallFilterSnapshot {
+            name: "f".into(),
+            family: "inet".into(),
+            terms: vec![
+                FirewallTermSnapshot {
+                    name: "scoped-discard".into(),
+                    source_addresses: vec!["10.0.0.0/24".into()],
+                    action: "discard".into(),
+                    ..Default::default()
+                },
+                FirewallTermSnapshot {
+                    name: "default-accept".into(),
+                    action: "accept".into(),
+                    ..Default::default()
+                },
+            ],
+        }],
+        &[],
+    );
+    // A source IN the prefix is discarded.
+    let r = evaluate_filter(
+        &state,
+        "inet:f",
+        IpAddr::V4(Ipv4Addr::new(10, 0, 0, 5)),
+        IpAddr::V4(Ipv4Addr::new(192, 168, 0, 1)),
+        PROTO_TCP,
+        1000,
+        80,
+        0,
+        TermMatchExtra::default(),
+    );
+    assert_eq!(
+        r.action,
+        FilterAction::Discard,
+        "in-prefix source must hit the scoped discard"
+    );
+    // A source OUT of the prefix falls through to accept.
+    let r = evaluate_filter(
+        &state,
+        "inet:f",
+        IpAddr::V4(Ipv4Addr::new(172, 16, 0, 5)),
+        IpAddr::V4(Ipv4Addr::new(192, 168, 0, 1)),
+        PROTO_TCP,
+        1000,
+        80,
+        0,
+        TermMatchExtra::default(),
+    );
+    assert_eq!(
+        r.action,
+        FilterAction::Accept,
+        "out-of-prefix source must NOT hit the scoped discard"
+    );
+}
+
+#[test]
+fn prefix_list_except_inverts_membership() {
+    // `from destination-prefix-list internal except; then discard` — discard
+    // everything EXCEPT destinations in 10.0.0.0/8.
+    let state = make_filter_state(
+        &[FirewallFilterSnapshot {
+            name: "f".into(),
+            family: "inet".into(),
+            terms: vec![
+                FirewallTermSnapshot {
+                    name: "except-discard".into(),
+                    destination_addresses: vec!["10.0.0.0/8".into()],
+                    destination_except: true,
+                    action: "discard".into(),
+                    ..Default::default()
+                },
+                FirewallTermSnapshot {
+                    name: "default-accept".into(),
+                    action: "accept".into(),
+                    ..Default::default()
+                },
+            ],
+        }],
+        &[],
+    );
+    // A dest IN the except list is NOT discarded (falls through to accept).
+    let r = evaluate_filter(
+        &state,
+        "inet:f",
+        IpAddr::V4(Ipv4Addr::new(192, 168, 0, 1)),
+        IpAddr::V4(Ipv4Addr::new(10, 1, 2, 3)),
+        PROTO_TCP,
+        1000,
+        80,
+        0,
+        TermMatchExtra::default(),
+    );
+    assert_eq!(
+        r.action,
+        FilterAction::Accept,
+        "a dest INSIDE the except list must be EXCLUDED from the discard (#2506) — \
+         a matcher ignoring `except` would wrongly discard it"
+    );
+    // A dest OUTSIDE the except list IS discarded.
+    let r = evaluate_filter(
+        &state,
+        "inet:f",
+        IpAddr::V4(Ipv4Addr::new(192, 168, 0, 1)),
+        IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)),
+        PROTO_TCP,
+        1000,
+        80,
+        0,
+        TermMatchExtra::default(),
+    );
+    assert_eq!(
+        r.action,
+        FilterAction::Discard,
+        "a dest OUTSIDE the except list must be discarded (match-all-except)"
+    );
+}
+
+#[test]
+fn prefix_list_except_inverts_membership_v6() {
+    let state = make_filter_state(
+        &[FirewallFilterSnapshot {
+            name: "f6".into(),
+            family: "inet6".into(),
+            terms: vec![
+                FirewallTermSnapshot {
+                    name: "except-discard".into(),
+                    source_addresses: vec!["2001:db8::/32".into()],
+                    source_except: true,
+                    action: "discard".into(),
+                    ..Default::default()
+                },
+                FirewallTermSnapshot {
+                    name: "default-accept".into(),
+                    action: "accept".into(),
+                    ..Default::default()
+                },
+            ],
+        }],
+        &[],
+    );
+    // Source inside the except set -> accepted (excluded from discard).
+    let r = evaluate_filter(
+        &state,
+        "inet6:f6",
+        "2001:db8::1".parse().unwrap(),
+        "2001:db8::2".parse().unwrap(),
+        PROTO_TCP,
+        1000,
+        80,
+        0,
+        TermMatchExtra::default(),
+    );
+    assert_eq!(r.action, FilterAction::Accept);
+    // Source outside the except set -> discarded.
+    let r = evaluate_filter(
+        &state,
+        "inet6:f6",
+        "2001:dead::1".parse().unwrap(),
+        "2001:db8::2".parse().unwrap(),
+        PROTO_TCP,
+        1000,
+        80,
+        0,
+        TermMatchExtra::default(),
+    );
+    assert_eq!(r.action, FilterAction::Discard);
 }

@@ -487,6 +487,7 @@
     "action": "",
     "count": "",
     "destination_addresses": [],
+    "destination_except": false,
     "destination_ports": [],
     "dscp_rewrite": null,
     "dscp_values": [],
@@ -500,6 +501,7 @@
     "protocols": [],
     "routing_instance": "",
     "source_addresses": [],
+    "source_except": false,
     "source_ports": [],
     "tcp_flags": null
   },

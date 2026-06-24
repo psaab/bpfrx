@@ -12444,3 +12444,36 @@ top.
   userspace-dp/src/afxdp/poll_descriptor/reject_reply.rs,
   userspace-dp/src/afxdp/poll_descriptor/cookie_reply.rs,
   userspace-dp/src/afxdp/frame/tests.rs, userspace-dp/src/afxdp/tests.rs, _Log.md
+
+- **Timestamp**: 2026-06-23
+- **Action**: #2506 — firewall-filter source/destination-prefix-list (with
+  `except`) wired end-to-end to the userspace dataplane. Were parsed/typed/
+  tested but DROPPED by the snapshot builder, so a prefix-list-scoped term
+  reached Rust with NO address constraint (fail-open/closed, action-dependent).
+  Go: `resolvePrefixListAddrs` (filters.go) resolves each ref via
+  cfg.PolicyOptions.PrefixLists, OR's positive prefixes into the address set,
+  and sets per-direction `SourceExcept`/`DestExcept` for an `except` prefix-list
+  that is the sole address source; mixed literal+except in one direction folds
+  to a positive set + warning (documented follow-up). New wire flags on
+  FirewallTermSnapshot (Go+Rust, serde(default) #1961 parity). Rust matcher
+  `nets_match_v4`/`v6` now evaluate `(addr ∈ prefixes) XOR except`; fail-closed
+  all-malformed guard (#2400) still wins. New strict commit gate
+  `validateFirewallPrefixListReferencesStrict` rejects an undefined ref
+  (lenient warn on load/peer-sync, #1960). except flags compared in
+  cache_sensitive.rs. Wire fixture regenerated. Fail-on-revert PROVEN x3 (drop
+  snapshot expansion → Go snapshot tests FAIL; drop except XOR → Rust except
+  tests FAIL; drop strict gate → undefined-ref tests FAIL). go build/vet clean,
+  Go config+userspace tests green, cargo build/test green (one pre-existing
+  flaky worker_queue test, untouched, passes isolated).
+- **File(s)**: pkg/dataplane/userspace/filters.go,
+  pkg/dataplane/userspace/protocol.go, pkg/config/compiler.go,
+  pkg/config/compiler_validate_strict.go,
+  pkg/dataplane/userspace/filters_prefix_list_2506_test.go,
+  pkg/config/compiler_prefix_list_ref_2506_test.go,
+  pkg/dataplane/userspace/protocol_null_collections_2214_test.go,
+  userspace-dp/src/protocol/security.rs, userspace-dp/src/filter/mod.rs,
+  userspace-dp/src/filter/compiler.rs,
+  userspace-dp/src/filter/engine/matching.rs,
+  userspace-dp/src/filter/engine/cache_sensitive.rs,
+  userspace-dp/src/filter/tests.rs, userspace-dp/src/filter/README.md,
+  userspace-dp/tests/fixtures/protocol_wire_v1.json, docs/feature-gaps.md, _Log.md

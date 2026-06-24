@@ -241,6 +241,43 @@ are DERIVED from the existing snapshot lists, so there is NO new wire field
 unscoped↔all-malformed transition flips match semantics WITHOUT changing the
 parsed vecs/matcher, so a flow-cache rebuild must catch it.
 
+### Prefix-list expansion + `except` inversion (#2506)
+
+`from source-prefix-list <name>` / `destination-prefix-list <name>` (with the
+optional `except` modifier) is resolved in the GO control plane before the
+snapshot is emitted, not in Rust. The Go snapshot builder
+(`resolvePrefixListAddrs`, `pkg/dataplane/userspace/filters.go`) looks each
+reference up in `cfg.PolicyOptions.PrefixLists` and merges the resolved CIDRs
+into the term's `source_addresses` / `destination_addresses` list — so the Rust
+compiler sees them exactly like literal `from source-address` entries (no
+prefix-list concept exists Rust-side). Before #2506 these references were
+silently dropped, leaving the term with no address scope (action-dependent
+fail-open / fail-closed).
+
+The `except` modifier ("match every address NOT in the list") is the one piece
+that cannot be expressed by the address vectors alone, so it travels as two
+per-direction wire flags on `FirewallTermSnapshot` — `source_except` /
+`destination_except` (Go `pkg/dataplane/userspace/protocol.go`, Rust
+`protocol/security.rs` with `serde(default)` for #1961 wire parity). They map to
+`FilterTerm.source_except` / `dest_except`, and the matcher
+(`engine/matching.rs` `nets_match_v4` / `nets_match_v6`) evaluates
+`nets.iter().any(contains) ^ except`. The fail-closed all-malformed guard (#2400
+above) still wins: a CONSTRAINED term whose prefix vec is empty matches NOTHING
+even when `except` is set (a typo'd `except` prefix-list must not silently invert
+into match-all). The except flags are compared in `filter_term_semantics_match`
+(`engine/cache_sensitive.rs`) — they flip the address decision without changing
+the parsed vecs, so a flow-cache rebuild must catch a toggle.
+
+Go-side scope: a plain prefix-list OR's into the positive set (with any literal
+addresses); an `except` prefix-list sets the inversion flag ONLY when it is the
+sole address source for the direction. The mixed literal/positive + `except`
+case in one direction folds `except` away to a positive set (under-broad,
+fail-safe) with a warning — there is no single boolean-inversion representation
+for "match A but not B"; splitting into two terms is the operator workaround,
+and the structured form is a documented follow-up. An undefined prefix-list
+reference is rejected at commit by `validateFirewallPrefixListReferencesStrict`
+(Go), so the Rust side never has to reason about a dangling name.
+
 ### Path (b) runbook — cache-sensitive
 
 Adding a per-packet match field that is NOT in the cache key

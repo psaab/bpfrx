@@ -106,6 +106,15 @@ pub(crate) struct FilterTerm {
     // #2398/#2394 NAT `*_constrained` pattern.
     pub(crate) source_addr_constrained: bool,
     pub(crate) dest_addr_constrained: bool,
+    // #2506: invert the source/destination address membership test. When true,
+    // the term matches every address NOT in the source/dest prefix set (Junos
+    // `from source-prefix-list NAME except` / `destination-prefix-list NAME
+    // except`). The matcher in engine/matching.rs evaluates
+    // `(addr ∈ prefixes) XOR except`. Only meaningful when the direction is
+    // `*_addr_constrained` (an UNCONSTRAINED term matches any address
+    // regardless of the except flag — there is no prefix set to invert).
+    pub(crate) source_except: bool,
+    pub(crate) dest_except: bool,
     pub(crate) protocol_bitmap: [u64; 4],
     pub(crate) protocol_match_enabled: bool,
     pub(crate) source_ports: PortMatcher,

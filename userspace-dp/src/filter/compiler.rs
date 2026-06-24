@@ -471,6 +471,12 @@ fn parse_term(
         dest_v6,
         source_addr_constrained,
         dest_addr_constrained,
+        // #2506: carry the per-direction `except` inversion flag from the
+        // snapshot. The Go control plane only sets it when the address set is an
+        // `except` prefix-list (the inversion is meaningful only against a
+        // non-empty constrained set; see resolvePrefixListAddrs).
+        source_except: snap.source_except,
+        dest_except: snap.destination_except,
         protocol_bitmap: build_u8_match_bitmap(&protocols),
         protocol_match_enabled: !protocols.is_empty(),
         source_ports: build_port_matcher(source_ports),

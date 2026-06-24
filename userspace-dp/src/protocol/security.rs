@@ -99,6 +99,16 @@ pub(crate) struct FirewallTermSnapshot {
     pub source_addresses: Vec<String>,
     #[serde(rename = "destination_addresses", default)]
     pub destination_addresses: Vec<String>,
+    // #2506: invert the source/destination address match. When true, the term
+    // matches every address NOT in source_addresses / destination_addresses
+    // (Junos `from source-prefix-list NAME except` / `destination-prefix-list
+    // NAME except`). The matcher evaluates `(addr ∈ prefixes) XOR except`.
+    // serde(default) keeps wire parity with an older Go control plane that omits
+    // the field (#1961).
+    #[serde(rename = "source_except", default)]
+    pub source_except: bool,
+    #[serde(rename = "destination_except", default)]
+    pub destination_except: bool,
     #[serde(default)]
     pub protocols: Vec<String>,
     #[serde(rename = "source_ports", default)]

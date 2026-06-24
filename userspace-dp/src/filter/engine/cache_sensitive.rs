@@ -132,6 +132,11 @@ fn filter_term_semantics_match(old: &FilterTerm, new: &FilterTerm) -> bool {
         // rebuild would keep stale match-any decisions.
         && old.source_addr_constrained == new.source_addr_constrained
         && old.dest_addr_constrained == new.dest_addr_constrained
+        // #2506: the except inversion flips the address decision without
+        // changing the parsed prefix vecs, so it must be compared here too — a
+        // snapshot toggling `except` on/off otherwise keeps stale decisions.
+        && old.source_except == new.source_except
+        && old.dest_except == new.dest_except
         && old.protocol_bitmap == new.protocol_bitmap
         && old.protocol_match_enabled == new.protocol_match_enabled
         && old.source_ports == new.source_ports
