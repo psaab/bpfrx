@@ -139,10 +139,10 @@ func TestSessionCloseRawEventDrivesFlowExport(t *testing.T) {
 	if !d.reconcileFlowExporters(flowIPFIXConfigPorts("127.0.0.1", v9Port, ipfixPort)) {
 		t.Fatal("flow + ipfix exporters must start")
 	}
-	if b := d.flowBundle.Load(); b == nil || b.exp == nil {
+	if b := d.flowBundle.Load(); b == nil || b.firstExp() == nil {
 		t.Fatal("v9 exporter must be live")
 	}
-	if b := d.ipfixBundlePtr.Load(); b == nil || b.exp == nil {
+	if b := d.ipfixBundlePtr.Load(); b == nil || b.firstExp() == nil {
 		t.Fatal("ipfix exporter must be live")
 	}
 	// The two real export callbacks are registered exactly once.
@@ -193,10 +193,10 @@ func TestSessionCloseRawEventDrivesFlowExport(t *testing.T) {
 	// Both REAL exporters export a flow record for the close — proving the
 	// SESSION_CLOSE-derived FlowRecord reaches both production export paths
 	// (Stats.flows counts data records, not templates).
-	if got := waitFlows(t, d.flowExporter.Stats); got < 1 {
+	if got := waitFlows(t, d.flowBundle.Load().firstExp().Stats); got < 1 {
 		t.Fatalf("NetFlow v9 exporter exported %d flows after the SESSION_CLOSE, want >= 1", got)
 	}
-	if got := waitFlows(t, d.ipfixExporter.Stats); got < 1 {
+	if got := waitFlows(t, d.ipfixBundlePtr.Load().firstExp().Stats); got < 1 {
 		t.Fatalf("IPFIX exporter exported %d flows after the SESSION_CLOSE, want >= 1", got)
 	}
 

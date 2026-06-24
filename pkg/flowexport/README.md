@@ -79,7 +79,13 @@ IPFIX:
 - `IPFIXExporter.ExportSessionClose(rec, evt)` — emit one record.
 
 Shared:
-- `ExportConfig` — `manager.go`. Resolved per-collector config.
+- `ExportConfig` — `manager.go`. Resolved per-template-group config: the
+  collectors that referenced one template, that template's timeouts /
+  field options, plus the family-shared sampling state (#2461 — see
+  "Per-flow-server template binding" below).
+- `ResolveV9TemplateGroups(...) []*ExportConfig` /
+  `ResolveIPFIXTemplateGroups(...)` — `manager.go`. The per-template-group
+  resolvers the daemon uses (#2461).
 - `BuildExportConfig(svc *config.ServicesConfig, fo *config.ForwardingOptionsConfig) *ExportConfig` — `manager.go`.
   Returns nil (no v9 exporter) unless BOTH `forwarding-options sampling`
   has a flow-server AND `services flow-monitoring version9` is configured
@@ -130,6 +136,57 @@ Resolution order for one flow-server (`resolveFlowServerVersion`):
    datagram stream rather than the pre-#2136 double-export. To send v9 to
    such a collector, pin it explicitly with a per-server `version9`
    selector.
+
+## Per-flow-server template binding (#2461)
+
+After #2136 routes each flow-server to the right *version*, #2461 routes
+it to the right *template*. Junos binds each flow-server to one template
+under its version; before #2461 the resolver ignored that reference
+entirely — it built ONE export config from the FIRST Go-map-iteration
+template and broadcast it (timeouts, `flow-dir` export-extension) to every
+collector of the version. A collector that asked for a specific template
+silently received whichever the map yielded first, and that choice flipped
+across process restarts (map order is not an operator contract).
+
+The resolver now groups collectors by the template they referenced and
+emits one `*ExportConfig` per group:
+
+- **`ResolveV9TemplateGroups` / `ResolveIPFIXTemplateGroups`** (`manager.go`)
+  return `[]*ExportConfig`, one per referenced template. The group key is
+  `(version, template_name)`; **source-address is a deterministic sort
+  tiebreak, NOT part of the grouping key** — collectors that share a
+  template but pin different source-addresses share ONE group and each
+  still receives its own source-pinned UDP connection (via
+  `dialCollectors`). Each group carries the timeouts / `V9TemplateOpts` of
+  the template its collectors referenced. A collector that referenced no
+  template lands in the default (`TemplateName == ""`) group, which inherits
+  the lone template's parameters when exactly one is configured (the common
+  single-template case — unchanged) and otherwise the built-in defaults.
+- **Determinism.** Groups are sorted by template name and each group's
+  collectors by address, so process restarts produce identical exporter
+  wiring — the map-iteration nondeterminism is gone.
+- **Validation.** A flow-server referencing an UNDEFINED template is
+  hard-rejected at commit / commit-check by
+  `validateFlowServerTemplateReferencesStrict` (`pkg/config`). The tolerant
+  load / peer-sync path downgrades it to a warning (#1960) and the resolver
+  DROPS that group, so a leniently-loaded bad config exports nothing for
+  that collector rather than the wrong template.
+- **Shared sampling.** 1-in-N sampling is a forwarding-options-instance
+  property, not a per-template one, so all groups of a family share ONE
+  `sampleCounter` (a pointer). The daemon evaluates `ShouldExport` exactly
+  once per SESSION_CLOSE and fans the record out to every group.
+- `BuildExportConfig` / `BuildIPFIXExportConfig` (singular) are retained
+  for single-aggregate callers and now return the first resolved group.
+
+### Daemon wiring (one exporter per group)
+
+`reconcileFlowExporters` now starts **N exporters per family** — one per
+template group — instead of a single exporter. `d.flowExporters` /
+`d.ipfixExporters` are slices; the atomic `flowBundle` / `ipfixBundlePtr`
+carry the group set; the once-registered session-close callback makes the
+shared sampling decision on `groups[0]` and exports to every group. The
+per-family config-hash gate, transient-create-failure retry (no hash
+recorded), and shutdown teardown all operate over the slice.
 
 ## Callers
 

@@ -2189,7 +2189,19 @@ func TestEventOptions(t *testing.T) {
 }
 
 func TestInlineJflowSourceAddress(t *testing.T) {
-	input := `forwarding-options {
+	// services flow-monitoring defines ipv4-template so the per-flow-server
+	// template reference resolves (#2461 strict gate); the test's purpose
+	// is the inline-jflow source-address parse + the template-ref field.
+	input := `services {
+    flow-monitoring {
+        version9 {
+            template ipv4-template {
+                flow-active-timeout 60;
+            }
+        }
+    }
+}
+forwarding-options {
     sampling {
         instance jflow-inst {
             input {

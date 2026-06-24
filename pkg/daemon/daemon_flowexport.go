@@ -44,32 +44,66 @@ import (
 	"github.com/psaab/xpf/pkg/logging"
 )
 
-// exporterBundle is the immutable (exporter, resolved-config) pair the
-// NetFlow v9 session-close callback reads via d.flowBundle. A nil exp
-// means "no v9 exporter configured".
-type exporterBundle struct {
+// v9Group is one running NetFlow v9 template-group exporter and its
+// resolved config (#2461). One flow-server template => one group => one
+// exporter, so a collector receives exactly the template it referenced.
+type v9Group struct {
 	exp *flowexport.Exporter
 	ec  *flowexport.ExportConfig
 }
 
-// ipfixBundle is the IPFIX equivalent of exporterBundle.
-type ipfixBundle struct {
+// ipfixGroup is the IPFIX equivalent of v9Group.
+type ipfixGroup struct {
 	exp *flowexport.IPFIXExporter
 	ec  *flowexport.ExportConfig
 }
 
-// flowExportConfigHash hashes the resolved *ExportConfig (Collectors,
-// timeouts, SamplingZones, SamplingRate, V9TemplateOpts). The
-// unexported atomic.Uint64 sampleCounter is invisible to json.Marshal,
-// and Go marshals map[uint16]SamplingDir keys in sorted numeric order,
-// so the encoding is deterministic. A nil ec hashes to a distinct
-// sentinel so "configured -> removed" registers as a real change.
-func flowExportConfigHash(ec *flowexport.ExportConfig) [32]byte {
-	if ec == nil {
+// exporterBundle is the immutable per-family set of NetFlow v9 template-
+// group exporters the session-close callback reads via d.flowBundle. An
+// empty groups slice means "no v9 exporter configured". The groups share
+// one ExportConfig.sampleCounter, so the callback evaluates ShouldExport
+// (the shared 1-in-N counter + sampling zones) EXACTLY ONCE and fans the
+// record out to every group (#2461).
+type exporterBundle struct {
+	groups []v9Group
+}
+
+// ipfixBundle is the IPFIX equivalent of exporterBundle.
+type ipfixBundle struct {
+	groups []ipfixGroup
+}
+
+// firstExp returns the first running v9 group exporter, or nil when no v9
+// exporter is configured. A test/inspection convenience over b.groups.
+func (b *exporterBundle) firstExp() *flowexport.Exporter {
+	if b == nil || len(b.groups) == 0 {
+		return nil
+	}
+	return b.groups[0].exp
+}
+
+// firstExp returns the first running IPFIX group exporter, or nil.
+func (b *ipfixBundle) firstExp() *flowexport.IPFIXExporter {
+	if b == nil || len(b.groups) == 0 {
+		return nil
+	}
+	return b.groups[0].exp
+}
+
+// flowExportConfigHash hashes the resolved per-family template groups
+// ([]*ExportConfig: Collectors, TemplateName, timeouts, SamplingZones,
+// SamplingRate, V9TemplateOpts). The unexported atomic.Uint64 sampleCounter
+// is invisible to json.Marshal, and Go marshals map[uint16]SamplingDir keys
+// in sorted numeric order, so the encoding is deterministic — provided the
+// resolver returns the groups in a stable order (it sorts by template name;
+// #2461). An empty slice hashes to a distinct sentinel so "configured ->
+// removed" registers as a real change.
+func flowExportConfigHash(ecs []*flowexport.ExportConfig) [32]byte {
+	if len(ecs) == 0 {
 		// Distinct, stable sentinel for the unconfigured state.
 		return sha256.Sum256([]byte("flowexport:nil"))
 	}
-	data, err := json.Marshal(ec)
+	data, err := json.Marshal(ecs)
 	if err != nil {
 		// Marshal of plain structs cannot realistically fail; fall back
 		// to a zero hash (forces re-apply) rather than silently skip.
@@ -78,29 +112,37 @@ func flowExportConfigHash(ec *flowexport.ExportConfig) [32]byte {
 	return sha256.Sum256(data)
 }
 
-// buildFlowExportConfig resolves the NetFlow v9 export config from the
-// committed config, filling per-zone sampling directions. Returns nil
-// when flow export is not configured.
-func (d *Daemon) buildFlowExportConfig(cfg *config.Config) *flowexport.ExportConfig {
-	ec := flowexport.BuildExportConfig(&cfg.Services, &cfg.ForwardingOptions)
-	if ec == nil {
+// buildFlowExportConfigs resolves the NetFlow v9 export config from the
+// committed config into one ExportConfig per per-flow-server template group
+// (#2461), filling per-zone sampling directions on each. Returns nil when
+// flow export is not configured.
+func (d *Daemon) buildFlowExportConfigs(cfg *config.Config) []*flowexport.ExportConfig {
+	ecs := flowexport.ResolveV9TemplateGroups(&cfg.Services, &cfg.ForwardingOptions)
+	if len(ecs) == 0 {
 		return nil
 	}
 	zoneIDs := buildZoneIDs(cfg)
-	ec.SamplingZones = flowexport.BuildSamplingZones(cfg, zoneIDs)
-	return ec
+	zones := flowexport.BuildSamplingZones(cfg, zoneIDs)
+	for _, ec := range ecs {
+		ec.SamplingZones = zones
+	}
+	return ecs
 }
 
-// buildIPFIXExportConfig resolves the IPFIX export config from the
-// committed config. Returns nil when IPFIX export is not configured.
-func (d *Daemon) buildIPFIXExportConfig(cfg *config.Config) *flowexport.ExportConfig {
-	ec := flowexport.BuildIPFIXExportConfig(&cfg.Services, &cfg.ForwardingOptions)
-	if ec == nil {
+// buildIPFIXExportConfigs resolves the IPFIX export config from the
+// committed config into one ExportConfig per template group. Returns nil
+// when IPFIX export is not configured.
+func (d *Daemon) buildIPFIXExportConfigs(cfg *config.Config) []*flowexport.ExportConfig {
+	ecs := flowexport.ResolveIPFIXTemplateGroups(&cfg.Services, &cfg.ForwardingOptions)
+	if len(ecs) == 0 {
 		return nil
 	}
 	zoneIDs := buildZoneIDs(cfg)
-	ec.SamplingZones = flowexport.BuildSamplingZones(cfg, zoneIDs)
-	return ec
+	zones := flowexport.BuildSamplingZones(cfg, zoneIDs)
+	for _, ec := range ecs {
+		ec.SamplingZones = zones
+	}
+	return ecs
 }
 
 // reconcileFlowExporters reconciles BOTH the NetFlow v9 and IPFIX
@@ -121,33 +163,34 @@ func (d *Daemon) reconcileFlowExporters(cfg *config.Config) bool {
 	return v9 || ipfix
 }
 
-// reconcileV9Exporter reconciles only the NetFlow v9 exporter.
+// reconcileV9Exporter reconciles the NetFlow v9 template-group exporters
+// (one per per-flow-server template, #2461).
 func (d *Daemon) reconcileV9Exporter(cfg *config.Config) bool {
 	d.flowReconMu.Lock()
 	defer d.flowReconMu.Unlock()
 
-	ec := d.buildFlowExportConfig(cfg)
-	h := flowExportConfigHash(ec)
+	ecs := d.buildFlowExportConfigs(cfg)
+	h := flowExportConfigHash(ecs)
 	if d.flowHashSet && h == d.flowHash {
-		return false // gated: healthy exporter keeps running
+		return false // gated: healthy exporters keep running
 	}
 
-	wasRunning := d.flowExporter != nil
+	wasRunning := len(d.flowExporters) > 0
 
-	// Stop the old exporter (if any). The session-close callback reads
+	// Stop the old exporters (if any). The session-close callback reads
 	// the bundle lock-free; we publish the new bundle as one atomic
-	// pointer, so a concurrent read sees either the old or new pair.
+	// pointer, so a concurrent read sees either the old or new set.
 	if d.flowCancel != nil {
 		d.flowCancel()
 		d.flowWg.Wait()
-		if d.flowExporter != nil {
-			d.flowExporter.Close()
+		for _, exp := range d.flowExporters {
+			exp.Close()
 		}
-		d.flowExporter = nil
+		d.flowExporters = nil
 		d.flowCancel = nil
 	}
 
-	if ec == nil {
+	if len(ecs) == 0 {
 		d.flowBundle.Store(&exporterBundle{})
 		d.flowHash, d.flowHashSet = h, true
 		if !wasRunning {
@@ -159,70 +202,81 @@ func (d *Daemon) reconcileV9Exporter(cfg *config.Config) bool {
 		return true
 	}
 
-	exp, err := flowexport.NewExporter(ec)
-	if err != nil {
-		slog.Warn("failed to create flow exporter", "err", err)
-		// Do NOT record the hash on a create failure: NewExporter ->
-		// dialCollectors can fail transiently (a pinned source-address
-		// bind before the source interface is up, transient collector
-		// DNS). Leaving flowHashSet false means the NEXT commit (even an
-		// identical one) retries instead of being hash-gated into a
-		// permanently-dead exporter. NewExporter is cheap, so the retry
-		// is safe; the gate re-arms on the first successful start.
-		d.flowBundle.Store(&exporterBundle{})
-		d.flowHashSet = false
-		return true
+	flowCtx, cancel := context.WithCancel(d.daemonCtx)
+	groups := make([]v9Group, 0, len(ecs))
+	exps := make([]*flowexport.Exporter, 0, len(ecs))
+	for _, ec := range ecs {
+		exp, err := flowexport.NewExporter(ec)
+		if err != nil {
+			slog.Warn("failed to create flow exporter", "template", ec.TemplateName, "err", err)
+			// Roll back the group exporters started so far and do NOT
+			// record the hash: NewExporter -> dialCollectors can fail
+			// transiently (a pinned source-address bind before the source
+			// interface is up, transient collector DNS). Leaving
+			// flowHashSet false means the NEXT commit (even an identical
+			// one) retries instead of being hash-gated into a permanently-
+			// dead family. NewExporter is cheap, so the retry is safe; the
+			// gate re-arms on the first fully-successful start.
+			cancel()
+			for _, e := range exps {
+				e.Close()
+			}
+			d.flowBundle.Store(&exporterBundle{})
+			d.flowHashSet = false
+			return true
+		}
+		exps = append(exps, exp)
+		groups = append(groups, v9Group{exp: exp, ec: ec})
 	}
 
-	flowCtx, cancel := context.WithCancel(d.daemonCtx)
-	d.flowExporter = exp
+	d.flowExporters = exps
 	d.flowCancel = cancel
-	d.flowBundle.Store(&exporterBundle{exp: exp, ec: ec})
+	d.flowBundle.Store(&exporterBundle{groups: groups})
 
 	d.flowCBOnce.Do(func() {
 		d.eventReader.AddCallback(d.flowExportCallback)
 	})
 
-	d.flowWg.Add(1)
-	go func() {
-		defer d.flowWg.Done()
-		exp.Run(flowCtx)
-	}()
+	for _, exp := range exps {
+		d.flowWg.Add(1)
+		go func(e *flowexport.Exporter) {
+			defer d.flowWg.Done()
+			e.Run(flowCtx)
+		}(exp)
+	}
 
 	d.flowHash, d.flowHashSet = h, true
 	slog.Info("NetFlow v9 exporter reconciled",
-		"collectors", len(ec.Collectors),
-		"active_timeout", ec.FlowActiveTimeout,
-		"inactive_timeout", ec.FlowInactiveTimeout,
-		"sampling_zones", len(ec.SamplingZones),
-		"sampling_rate", ec.SamplingRate)
+		"template_groups", len(ecs),
+		"sampling_zones", len(ecs[0].SamplingZones),
+		"sampling_rate", ecs[0].SamplingRate)
 	return true
 }
 
-// reconcileIPFIXExporter reconciles only the IPFIX exporter.
+// reconcileIPFIXExporter reconciles the IPFIX template-group exporters.
 func (d *Daemon) reconcileIPFIXExporter(cfg *config.Config) bool {
 	d.ipfixReconMu.Lock()
 	defer d.ipfixReconMu.Unlock()
 
-	ec := d.buildIPFIXExportConfig(cfg)
-	h := flowExportConfigHash(ec)
+	ecs := d.buildIPFIXExportConfigs(cfg)
+	h := flowExportConfigHash(ecs)
 	if d.ipfixHashSet && h == d.ipfixHash {
 		return false
 	}
 
-	wasRunning := d.ipfixExporter != nil
+	wasRunning := len(d.ipfixExporters) > 0
 
 	if d.ipfixCancel != nil {
 		d.ipfixCancel()
 		d.ipfixWg.Wait()
-		if d.ipfixExporter != nil {
-			d.ipfixExporter.Close()
+		for _, exp := range d.ipfixExporters {
+			exp.Close()
 		}
-		d.ipfixExporter = nil
+		d.ipfixExporters = nil
 		d.ipfixCancel = nil
 	}
 
-	if ec == nil {
+	if len(ecs) == 0 {
 		d.ipfixBundlePtr.Store(&ipfixBundle{})
 		d.ipfixHash, d.ipfixHashSet = h, true
 		if !wasRunning {
@@ -232,55 +286,69 @@ func (d *Daemon) reconcileIPFIXExporter(cfg *config.Config) bool {
 		return true
 	}
 
-	exp, err := flowexport.NewIPFIXExporter(ec)
-	if err != nil {
-		slog.Warn("failed to create IPFIX exporter", "err", err)
-		// Do NOT record the hash on a create failure (see the v9 path):
-		// leaving ipfixHashSet false lets the next commit retry instead
-		// of being gated into a permanently-dead exporter.
-		d.ipfixBundlePtr.Store(&ipfixBundle{})
-		d.ipfixHashSet = false
-		return true
+	ipfixCtx, cancel := context.WithCancel(d.daemonCtx)
+	groups := make([]ipfixGroup, 0, len(ecs))
+	exps := make([]*flowexport.IPFIXExporter, 0, len(ecs))
+	for _, ec := range ecs {
+		exp, err := flowexport.NewIPFIXExporter(ec)
+		if err != nil {
+			slog.Warn("failed to create IPFIX exporter", "template", ec.TemplateName, "err", err)
+			// Roll back and do NOT record the hash (see the v9 path).
+			cancel()
+			for _, e := range exps {
+				e.Close()
+			}
+			d.ipfixBundlePtr.Store(&ipfixBundle{})
+			d.ipfixHashSet = false
+			return true
+		}
+		exps = append(exps, exp)
+		groups = append(groups, ipfixGroup{exp: exp, ec: ec})
 	}
 
-	ipfixCtx, cancel := context.WithCancel(d.daemonCtx)
-	d.ipfixExporter = exp
+	d.ipfixExporters = exps
 	d.ipfixCancel = cancel
-	d.ipfixBundlePtr.Store(&ipfixBundle{exp: exp, ec: ec})
+	d.ipfixBundlePtr.Store(&ipfixBundle{groups: groups})
 
 	d.ipfixCBOnce.Do(func() {
 		d.eventReader.AddCallback(d.ipfixExportCallback)
 	})
 
-	d.ipfixWg.Add(1)
-	go func() {
-		defer d.ipfixWg.Done()
-		exp.Run(ipfixCtx)
-	}()
+	for _, exp := range exps {
+		d.ipfixWg.Add(1)
+		go func(e *flowexport.IPFIXExporter) {
+			defer d.ipfixWg.Done()
+			e.Run(ipfixCtx)
+		}(exp)
+	}
 
 	d.ipfixHash, d.ipfixHashSet = h, true
 	slog.Info("IPFIX exporter reconciled",
-		"collectors", len(ec.Collectors),
-		"active_timeout", ec.FlowActiveTimeout,
-		"inactive_timeout", ec.FlowInactiveTimeout,
-		"sampling_zones", len(ec.SamplingZones),
-		"sampling_rate", ec.SamplingRate)
+		"template_groups", len(ecs),
+		"sampling_zones", len(ecs[0].SamplingZones),
+		"sampling_rate", ecs[0].SamplingRate)
 	return true
 }
 
 // flowExportCallback is the single, stable NetFlow v9 session-close
 // handler registered on the EventReader exactly once. It reads the live
-// (exporter, config) pair lock-free from the atomic bundle, so reconcile
-// can swap the exporter without ever touching the callback list.
+// set of template-group exporters lock-free from the atomic bundle, so
+// reconcile can swap the exporters without ever touching the callback list.
+//
+// #2461: the family's groups share one ShouldExport state (the 1-in-N
+// counter + sampling zones), so the sampling decision is made EXACTLY ONCE
+// (on groups[0]) and the record is fanned out to every group — each group
+// encodes with the template its collectors referenced. Deciding per group
+// would over-increment the shared counter and corrupt the 1-in-N cadence.
 func (d *Daemon) flowExportCallback(rec logging.EventRecord, raw []byte) {
 	if rec.Type != "SESSION_CLOSE" {
 		return
 	}
 	b := d.flowBundle.Load()
-	if b == nil || b.exp == nil || b.ec == nil {
+	if b == nil || len(b.groups) == 0 {
 		return
 	}
-	if !b.ec.ShouldExport(rec.InZone, rec.OutZone) {
+	if !b.groups[0].ec.ShouldExport(rec.InZone, rec.OutZone) {
 		return
 	}
 	sd := flowexport.SessionCloseData{
@@ -289,7 +357,9 @@ func (d *Daemon) flowExportCallback(rec logging.EventRecord, raw []byte) {
 		Protocol: parseProtocol(rec.Protocol),
 	}
 	sd.SrcIP, sd.DstIP, sd.IsIPv6 = parseAddrPair(rec.SrcAddr, rec.DstAddr)
-	b.exp.ExportSessionClose(rec, sd)
+	for _, g := range b.groups {
+		g.exp.ExportSessionClose(rec, sd)
+	}
 }
 
 // ipfixExportCallback is the IPFIX equivalent of flowExportCallback.
@@ -298,10 +368,10 @@ func (d *Daemon) ipfixExportCallback(rec logging.EventRecord, raw []byte) {
 		return
 	}
 	b := d.ipfixBundlePtr.Load()
-	if b == nil || b.exp == nil || b.ec == nil {
+	if b == nil || len(b.groups) == 0 {
 		return
 	}
-	if !b.ec.ShouldExport(rec.InZone, rec.OutZone) {
+	if !b.groups[0].ec.ShouldExport(rec.InZone, rec.OutZone) {
 		return
 	}
 	sd := flowexport.SessionCloseData{
@@ -310,5 +380,7 @@ func (d *Daemon) ipfixExportCallback(rec logging.EventRecord, raw []byte) {
 		Protocol: parseProtocol(rec.Protocol),
 	}
 	sd.SrcIP, sd.DstIP, sd.IsIPv6 = parseAddrPair(rec.SrcAddr, rec.DstAddr)
-	b.exp.ExportSessionClose(rec, sd)
+	for _, g := range b.groups {
+		g.exp.ExportSessionClose(rec, sd)
+	}
 }

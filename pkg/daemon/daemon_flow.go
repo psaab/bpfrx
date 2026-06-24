@@ -150,10 +150,10 @@ func (d *Daemon) stopFlowExporter() {
 		d.flowCancel()
 	}
 	d.flowWg.Wait()
-	if d.flowExporter != nil {
-		d.flowExporter.Close()
-		d.flowExporter = nil
+	for _, exp := range d.flowExporters {
+		exp.Close()
 	}
+	d.flowExporters = nil
 	d.flowCancel = nil
 	d.flowBundle.Store(&exporterBundle{})
 }
@@ -166,10 +166,10 @@ func (d *Daemon) stopIPFIXExporter() {
 		d.ipfixCancel()
 	}
 	d.ipfixWg.Wait()
-	if d.ipfixExporter != nil {
-		d.ipfixExporter.Close()
-		d.ipfixExporter = nil
+	for _, exp := range d.ipfixExporters {
+		exp.Close()
 	}
+	d.ipfixExporters = nil
 	d.ipfixCancel = nil
 	d.ipfixBundlePtr.Store(&ipfixBundle{})
 }
