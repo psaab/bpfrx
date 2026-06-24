@@ -115,6 +115,66 @@ fn basic_accept_discard() {
     assert_eq!(result.action, FilterAction::Accept);
 }
 
+/// #2521: `then reject` compiles to `FilterAction::Reject` and stays DISTINCT
+/// from `then discard` (`FilterAction::Discard`). The dataplane uses this
+/// distinction to synthesize an active reply for reject while keeping discard a
+/// silent drop. Fail-on-revert: if the compiler collapses `reject` to
+/// `Discard` (the historical silent-drop behavior), this asserts fail.
+#[test]
+fn reject_action_compiles_distinct_from_discard() {
+    let state = make_filter_state(
+        &[FirewallFilterSnapshot {
+            name: "reject-filter".into(),
+            family: "inet".into(),
+            terms: vec![
+                FirewallTermSnapshot {
+                    name: "reject-ssh".into(),
+                    protocols: vec!["tcp".into()],
+                    destination_ports: vec!["22".into()],
+                    action: "reject".into(),
+                    ..Default::default()
+                },
+                FirewallTermSnapshot {
+                    name: "discard-telnet".into(),
+                    protocols: vec!["tcp".into()],
+                    destination_ports: vec!["23".into()],
+                    action: "discard".into(),
+                    ..Default::default()
+                },
+            ],
+        }],
+        &[],
+    );
+    let reject = evaluate_filter(
+        &state,
+        "inet:reject-filter",
+        IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1)),
+        IpAddr::V4(Ipv4Addr::new(10, 0, 1, 2)),
+        PROTO_TCP,
+        12345,
+        22,
+        0,
+        TermMatchExtra::default(),
+    );
+    assert_eq!(
+        reject.action,
+        FilterAction::Reject,
+        "`then reject` must compile to FilterAction::Reject, not collapse to Discard"
+    );
+    let discard = evaluate_filter(
+        &state,
+        "inet:reject-filter",
+        IpAddr::V4(Ipv4Addr::new(10, 0, 1, 1)),
+        IpAddr::V4(Ipv4Addr::new(10, 0, 1, 2)),
+        PROTO_TCP,
+        12345,
+        23,
+        0,
+        TermMatchExtra::default(),
+    );
+    assert_eq!(discard.action, FilterAction::Discard);
+}
+
 #[test]
 fn interface_filter_log_match_returns_filter_and_term_identity() {
     let state = make_filter_state_with_interfaces(
