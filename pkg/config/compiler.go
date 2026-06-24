@@ -489,6 +489,20 @@ type compileOpts struct {
 	// state rather than actuating routes off a wildcard measurement.
 	// Same doctrine as lenientDestNATAddresses / lenientNATHostMask.
 	lenientRPMSourceAddress bool
+	// lenientRPMScopedHostname (#2493) downgrades the scoped-hostname RPM
+	// gate (validateRPMScopedHostnameStrict) from a hard compile error to
+	// a cfg.Warnings entry. A scoped test (routing-instance /
+	// destination-interface / next-hop) binds its DATA socket to a
+	// specific VRF/egress device, but hostname resolution escapes that
+	// scope through the process-default resolver (the bind is applied
+	// AFTER name resolution), so the probe measures resolver context
+	// instead of path health — a false PASS/FAIL into ip-monitoring
+	// failover. Strict on commit / commit-check (hard reject); lenient on
+	// load / peer-sync (warn — #1960 no-brick; the runtime executeProbe
+	// guard returns ErrProbeSetup for the same combination, so the
+	// leniently-loaded test HOLDS state rather than actuating off a
+	// mis-scoped measurement). Same doctrine as lenientRPMSourceAddress.
+	lenientRPMScopedHostname bool
 }
 
 // CompileConfig converts a parsed ConfigTree AST into a typed Config struct.
@@ -539,6 +553,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientPolicyZoneRefs:              true,
 		lenientDestNATAddresses:            true,
 		lenientRPMSourceAddress:            true,
+		lenientRPMScopedHostname:           true,
 	})
 }
 
@@ -640,6 +655,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientPolicyZoneRefs:              true,
 		lenientDestNATAddresses:            true,
 		lenientRPMSourceAddress:            true,
+		lenientRPMScopedHostname:           true,
 	})
 }
 
@@ -1434,6 +1450,29 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		if opts.lenientRPMSourceAddress {
 			cfg.Warnings = append(cfg.Warnings,
 				fmt.Sprintf("rpm source-address (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
+	// #2493: scoped RPM hostname gate. A scoped test (routing-instance /
+	// destination-interface / next-hop) binds its probe DATA socket to a
+	// specific VRF/egress device, but hostname resolution escapes that
+	// scope through the process-default resolver (the SO_BINDTODEVICE bind
+	// is applied per-connection, AFTER name resolution). With split-horizon
+	// DNS the probe then measures resolver context, not path health, and
+	// publishes a false PASS/FAIL into ip-monitoring failover. IP-literal
+	// targets (no resolution) and hostname targets on UNSCOPED tests are
+	// unaffected. Strict on commit / commit-check (hard reject so the
+	// operator must use an IP literal); lenient on load / peer-sync (warn —
+	// #1960; the runtime executeProbe guard returns ErrProbeSetup for the
+	// same combination, so the leniently-loaded test HOLDS state instead of
+	// actuating off a mis-scoped measurement). The full VRF-aware resolver
+	// is deferred (docs/multi-wan.md).
+	if err := validateRPMScopedHostnameStrict(cfg); err != nil {
+		if opts.lenientRPMScopedHostname {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("rpm scoped hostname (downgraded to warning on tolerant path): %v", err))
 		} else {
 			return nil, err
 		}

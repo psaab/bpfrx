@@ -108,7 +108,11 @@ var ErrProbeSetup = errors.New("probe setup failed")
 // probeICMP sends one ICMP (or ICMPv6) echo request to the test target
 // and waits for the matching reply. Returns the measured RTT.
 func (m *Manager) probeICMP(ctx context.Context, test *config.RPMTest, opts probeSockOpts) (time.Duration, error) {
-	dst, err := resolveProbeTarget(test.Target)
+	resolve := m.resolveTarget
+	if resolve == nil {
+		resolve = resolveProbeTarget
+	}
+	dst, err := resolve(test.Target)
 	if err != nil {
 		return 0, err
 	}

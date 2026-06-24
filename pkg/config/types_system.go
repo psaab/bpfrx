@@ -585,6 +585,23 @@ type RPMTest struct {
 	DestPort             int    // for tcp-ping
 }
 
+// IsScoped reports whether the test's probe DATA socket is bound to a
+// specific VRF / egress device / next-hop path — i.e. probeOpts would set
+// SO_BINDTODEVICE (from destination-interface, or the routing-instance VRF
+// device) or SO_MARK (from a next-hop pin). A scoped test measures a
+// SPECIFIC path, so a hostname target must resolve in that path's context;
+// the process-default resolver does not, since name resolution happens
+// before the per-connection bind (#2493). Kept here as the single source
+// of truth so the commit-time gate (validateRPMScopedHostnameStrict) and
+// the runtime guard (rpm.Manager.executeProbe) agree on what "scoped"
+// means.
+func (t *RPMTest) IsScoped() bool {
+	if t == nil {
+		return false
+	}
+	return t.DestinationInterface != "" || t.RoutingInstance != "" || t.NextHop != ""
+}
+
 func (t *RPMTest) EffectiveProbeType() string {
 	if t == nil || t.ProbeType == "" {
 		return DefaultRPMProbeType
@@ -830,7 +847,7 @@ type FirewallFilterTerm struct {
 	// hard-rejects any term carrying an entry here at commit; the tolerant
 	// load path downgrades it to a warning (#1960 no-brick). Populated by
 	// compileFilterThen.
-	UnknownActions    []string
+	UnknownActions []string
 	// RejectMessageType is the optional message-type after `then reject`
 	// (e.g. tcp-reset, administratively-prohibited, port-unreachable). Junos
 	// accepts `then reject <message-type>` and the term acts as a plain reject;
@@ -841,15 +858,15 @@ type FirewallFilterTerm struct {
 	// NextTerm records `then next term` / `then next-term` — an explicit
 	// fall-through to the next term (a no-op terminating-wise; Action stays "").
 	// It is a recognized, valid construct, not an unknown action.
-	NextTerm          bool
-	RoutingInstance   string          // routing-instance name (policy-based routing)
-	Log               bool
-	Count             string           // counter name
-	ForwardingClass   string           // forwarding-class name
-	LossPriority      string           // loss-priority (low, medium-low, medium-high, high)
-	DSCPRewrite       string           // then dscp <value> — rewrite DSCP/traffic-class
-	Policer           string           // then policer <name> — reference to policer definition
-	FlexMatch         *FlexMatchConfig // flexible-match-range configuration
+	NextTerm        bool
+	RoutingInstance string // routing-instance name (policy-based routing)
+	Log             bool
+	Count           string           // counter name
+	ForwardingClass string           // forwarding-class name
+	LossPriority    string           // loss-priority (low, medium-low, medium-high, high)
+	DSCPRewrite     string           // then dscp <value> — rewrite DSCP/traffic-class
+	Policer         string           // then policer <name> — reference to policer definition
+	FlexMatch       *FlexMatchConfig // flexible-match-range configuration
 }
 
 // FlexMatchConfig defines a flexible byte-offset match condition.

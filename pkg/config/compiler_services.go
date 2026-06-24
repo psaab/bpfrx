@@ -122,6 +122,59 @@ func validateRPMSourceAddressStrict(cfg *Config) error {
 	return nil
 }
 
+// validateRPMScopedHostnameStrict rejects a HOSTNAME target on a SCOPED
+// RPM test (#2493). A scoped test (routing-instance, destination-interface,
+// or next-hop pin) binds its probe DATA socket to a specific VRF / egress
+// device (SO_BINDTODEVICE) or path (SO_MARK), but hostname resolution runs
+// through the process-default resolver / table / source: the bind is
+// applied in the per-connection Control hook, which fires AFTER name
+// resolution. With split-horizon / per-WAN DNS the probe then measures
+// resolver context, not path health, and can publish a false PASS/FAIL
+// into event-options / ip-monitoring failover.
+//
+// An IP-literal target needs no resolution and is unaffected. A hostname
+// on an UNSCOPED (default-context) test resolves in the same context it
+// probes and is allowed (today's behavior, no regression). The full fix —
+// a VRF-aware resolver binding the DNS socket to the scope device and
+// using the instance's resolv context — is a larger feature, deferred and
+// recorded in docs/multi-wan.md; until then the safe, shippable increment
+// is to refuse the silently-wrong combination at commit so an operator
+// cannot configure a scoped hostname probe that lies about path health.
+//
+// Strict on commit / commit-check (hard reject so the typo is
+// operator-visible); lenient on load / peer-sync (warn — #1960 no-brick;
+// the runtime executeProbe guard returns ErrProbeSetup for the same
+// combination, so a leniently-loaded test HOLDS state instead of actuating
+// routes off a mis-scoped measurement). Mirrors
+// validateRPMSourceAddressStrict.
+func validateRPMScopedHostnameStrict(cfg *Config) error {
+	if cfg == nil || cfg.Services.RPM == nil {
+		return nil
+	}
+	for _, probe := range cfg.Services.RPM.Probes {
+		if probe == nil {
+			continue
+		}
+		for _, test := range probe.Tests {
+			if test == nil || !test.IsScoped() {
+				continue
+			}
+			// Empty target is caught by validateRPMTest; an IP-literal
+			// target needs no DNS, so neither leaks the scope.
+			if test.Target == "" || net.ParseIP(test.Target) != nil {
+				continue
+			}
+			return fmt.Errorf(
+				"services rpm probe %q test %q: target %q is a hostname on a scoped test "+
+					"(routing-instance/destination-interface/next-hop); DNS is not VRF/device-scoped, "+
+					"so the probe would resolve out-of-context and measure resolver health instead of "+
+					"path health — use an IP-literal target",
+				probe.Name, test.Name, test.Target)
+		}
+	}
+	return nil
+}
+
 // validateRPMProbePinsStrict enforces the probe-pin band invariants
 // (#1827 PR-1a): at most ProbeTableCount next-hop-pinned tests (one
 // reserved kernel table each), and no routing-instance table ID may

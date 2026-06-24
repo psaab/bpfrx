@@ -12973,3 +12973,18 @@ top.
   **File(s)**: pkg/config/compiler.go, pkg/config/compiler_services.go,
   pkg/config/compiler_rpm_source_2492_test.go, pkg/rpm/rpm.go,
   pkg/rpm/probe_dialer_2492_test.go, docs/multi-wan.md, _Log.md
+
+- **Timestamp**: 2026-06-24
+  **Action**: #2493 — reject hostname target on a SCOPED RPM test at commit
+  (DNS escapes the configured VRF/device scope); add resolver seam +
+  runtime hold-state guard. New `(*RPMTest).IsScoped()` SSOT predicate
+  (routing-instance/destination-interface/next-hop), strict validator
+  `validateRPMScopedHostnameStrict` (strict reject / lenient warn, #2492
+  mirror), `rpm.Manager.resolveTarget` injectable resolver seam,
+  `scopedHostnameError` executeProbe guard (ErrProbeSetup hold-state).
+  Deferred full VRF-aware resolver documented in docs/multi-wan.md.
+  **File(s)**: pkg/config/types_system.go, pkg/config/compiler.go,
+  pkg/config/compiler_services.go,
+  pkg/config/compiler_rpm_scoped_hostname_2493_test.go, pkg/rpm/rpm.go,
+  pkg/rpm/icmp.go, pkg/rpm/scoped_hostname_2493_test.go, docs/multi-wan.md,
+  _Log.md
