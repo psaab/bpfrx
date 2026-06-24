@@ -131,6 +131,14 @@ Remaining limitations:
   fail-closed until downstream loss-priority behavior is wired. Color-aware
   mode also stays fail-closed until inherited packet color is carried through
   trusted metadata.
+- Firewall-filter `then loss-priority <level>` (#2507) is likewise NOT wired:
+  it carries no `FirewallTermSnapshot` field and there is no per-packet
+  loss-priority consumer here (`apply_term_three_color_policer` always meters at
+  `PacketColor::Green`). The Go control plane emits a commit WARNING that the
+  action is accepted-but-inert (`validateFilterLossPriorityWarnings` in
+  `pkg/config/compiler_validate_warn.go`) rather than silently committing a
+  QoS no-op. Wiring a real per-packet loss-priority action onto the egress
+  CoS/drop-profile path is a follow-up.
 - Traffic-level integration, failover, and performance evidence remain
   production-hardening follow-ups for #1375, not active feature-gap blockers.
 

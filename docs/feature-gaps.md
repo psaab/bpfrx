@@ -33,14 +33,14 @@ Last updated: 2026-05-24
 | Routing Enhancements | 10 | 3 | 0 | 13 |
 | VPN Enhancements | 9 | 0 | 0 | 9 |
 | HA Enhancements | 0 | 2 | 0 | 2 |
-| Firewall Filter Enhancements | 2 | 0 | 0 | 2 |
+| Firewall Filter Enhancements | 2 | 1 | 0 | 3 |
 | QoS / Class of Service | 2 | 4 | 0 | 6 |
 | Multi-Tenancy | 4 | 0 | 0 | 4 |
 | Management & Automation | 12 | 2 | 0 | 14 |
 | Interface Enhancements | 1 | 1 | 0 | 2 |
 | System Enhancements | 5 | 0 | 0 | 5 |
 | Miscellaneous | 6 | 0 | 0 | 6 |
-| **TOTAL** | **119** | **18** | **0** | **137** |
+| **TOTAL** | **119** | **19** | **0** | **138** |
 
 **Implementation status key:**
 - **Fully Missing**: No config parsing or runtime support
@@ -387,7 +387,7 @@ xpf has a broad chassis cluster implementation with redundancy groups, RETH (VRR
 
 ## 17. Firewall Filter Enhancements
 
-xpf has firewall filters with source/dest addresses, prefix-lists (with except), DSCP, protocol, dest/source ports, ICMP type/code, TCP flags, fragment match, actions (accept/reject/discard), routing-instance, log, count, forwarding-class, loss-priority, DSCP rewrite, and IPv6 traffic-class matching.
+xpf has firewall filters with source/dest addresses, prefix-lists (with except), DSCP, protocol, dest/source ports, ICMP type/code, TCP flags, fragment match, actions (accept/reject/discard), routing-instance, log, count, forwarding-class, loss-priority (parse-only/inert — see below), DSCP rewrite, and IPv6 traffic-class matching.
 
 Filter `then reject` is now an **active** reject on the input and lo0
 (host-bound) paths (#2521): it synthesizes a TCP RST (TCP) or ICMP/ICMPv6
@@ -510,8 +510,26 @@ fail-OPEN for a `discard`/`reject` term (traffic the operator meant to drop via
 `except` is no longer dropped). Splitting into two terms is the operator
 workaround; the structured mixed case is a documented follow-up.
 
+**Firewall-filter `then loss-priority` is PARTIAL (parse-only, inert-with-warning, #2507).**
+`then loss-priority <low|medium-low|medium-high|high>` is parsed and stored on
+the term (`config.FirewallFilterTerm.LossPriority`) but is NOT carried on the
+snapshot wire (`FirewallTermSnapshot` has no loss-priority field) and the
+userspace dataplane has no per-packet loss-priority consumer: the three-color
+policer always meters at `PacketColor::Green` (`apply_term_three_color_policer`)
+and color-aware mode stays fail-closed until inherited packet color is carried
+through trusted metadata (`userspace-dp/src/filter/README.md`). So the action
+commits but does nothing. To avoid a silent QoS no-op, the commit now emits a
+WARN-only message naming the family/filter/term
+(`validateFilterLossPriorityWarnings`, `pkg/config/compiler_validate_warn.go`),
+mirroring the existing CoS classifier/rewrite loss-priority warnings. It is a
+warning, never a reject — loss-priority is valid Junos and a hard reject would
+brick a config that was previously accepted. Wiring an actual per-packet
+loss-priority action onto the egress CoS/drop-profile path is the follow-up;
+until then the action is documented as inert.
+
 | Feature | Junos Config Path | Description | Priority | Status |
 |---------|-------------------|-------------|----------|--------|
+| **Filter loss-priority action** | `firewall filter ... term ... then loss-priority <level>` | Mark a packet's packet-loss-priority for downstream drop-profile / congestion behavior | Low | Partial (#2507): parsed and stored, but NOT wired to the snapshot wire and inert in the userspace dataplane (no per-packet loss-priority consumer; three-color policer meters at green only). Commit emits a WARN naming the filter/term that the action is accepted-but-inert. |
 | **Policer (Rate Limiting)** | `firewall policer ... bandwidth-limit N burst-size-limit N` | Token-bucket rate limiter applied to filter terms or interfaces. Single-rate two-color, three-color policers. | High | Partial for #1373: legacy eBPF/~~DPDK~~ (DPDK retired #1525) token-bucket policer support existed; userspace supports the admitted filter path and the color-blind `then discard` three-color slice. #1375 is closed; unsupported color-aware/non-drop behavior and broader Junos parity remain production/future parity work, not active #1373 source-removal blockers. |
 | **Three-Color Policer** | `firewall three-color-policer ...` | RFC 2697/2698 metering with green/yellow/red marking based on CIR/CBS/EBS or CIR/PIR | Medium | Legacy eBPF/~~DPDK~~ (DPDK retired #1525) done; userspace AF_XDP supports color-blind `then discard` with compatible snapshot continuity. #1375 is closed; remaining color-aware/non-drop action parity plus integration, failover, and performance hardening are production/future parity work, not active #1373 source-removal blockers. |
 | **Interface Policer** | `firewall policer ... logical-interface-policer` | Aggregate rate limiting across all protocol families on a logical interface | Low | Missing |

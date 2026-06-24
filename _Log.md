@@ -12603,3 +12603,26 @@ top.
   fail-on-revert PROVEN twice (RejectReplySource::Filter→Policy fails the
   counter test; compiler reject→Discard fails reject_action_compiles_distinct);
   `then discard` still silent (no reply) confirmed; go build ./pkg/dataplane/userspace OK.
+
+## #2507 — firewall-filter `then loss-priority` accepted-but-inert warning (2026-06-24)
+- **Action**: Add commit WARNING for firewall-filter `then loss-priority`
+  (parsed/stored but no snapshot field, no dataplane consumer → silent QoS
+  no-op). Determined the WARN path (not wire path): grep of userspace-dp shows
+  the only packet "color" is the three-color policer's internally-metered color
+  consumed by `treatment_for`; `apply_term_three_color_policer` hardcodes
+  `PacketColor::Green` and color-aware mode is fail-closed per the filter
+  README — there is NO per-packet loss-priority consumer to wire into. Honest
+  scoped fix = warn, mark feature partial (same principle as #2486 ipsec-vpn).
+- **File(s)**:
+  - pkg/config/compiler_validate_warn.go — `validateFilterLossPriorityWarnings`
+    (WARN-only, once per filter/term, sorted-deterministic, both inet/inet6),
+    wired into ValidateConfig; added `sort` import.
+  - pkg/config/compiler_filter_loss_priority_2507_test.go — new tests
+    (warns-inert, commit-succeeds/no-reject, no-false-positive).
+  - docs/feature-gaps.md — new "Filter loss-priority action" PARTIAL row +
+    paragraph; summary counts 2|0|0|2 → 2|1|0|3, TOTAL 18→19 / 137→138.
+  - userspace-dp/src/filter/README.md — document the inert + commit-warning.
+- **Validation**: go build ./... OK; go test ./pkg/config/ ./pkg/dataplane/userspace/
+  PASS; gofmt clean; go vet ./pkg/config/ clean; fail-on-revert PROVEN
+  (removing the validateFilterLossPriorityWarnings call → warning absent →
+  TestFilterLossPriorityWarnsInert fails). No Rust code changed (README only).
