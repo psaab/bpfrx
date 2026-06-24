@@ -53,6 +53,15 @@ pub(in crate::afxdp) struct ReconcileSnapshotFds {
     pub(super) dnat_table_fd: Option<OwnedFd>,
     pub(super) dnat_table_v6_fd: Option<OwnedFd>,
     pub(super) dnat_fds: DnatTableFds,
+    /// #2484: the fully-built forwarding state, produced in the
+    /// pre-teardown preflight so a snapshot INTEGRITY fault aborts the
+    /// reconcile BEFORE `tear_down` stops the workers and resets
+    /// `coord.forwarding` / `coord.validation`. `apply_snapshot` REUSES
+    /// this rather than rebuilding — the build reads `Some(&coord.forwarding)`
+    /// as the "previous" arg, which teardown defaults to empty, so it MUST
+    /// happen before teardown. Building once also avoids re-inserting
+    /// per-rule counter handles into the live counter stores twice.
+    pub(super) forwarding: ForwardingState,
 }
 
 impl Coordinator {
@@ -122,14 +131,43 @@ impl Coordinator {
         // `last_reconcile_stage` / per-binding `last_error` on failure;
         // it mutates no published state, so returning here is safe.
         let preflight_fds = if let Some(snap) = snapshot {
-            match snapshot::preflight_map_fds(self, snap, bindings) {
-                Some(fds) => Some(fds),
+            let mut fds = match snapshot::preflight_map_fds(self, snap, bindings) {
+                Some(fds) => fds,
                 None => {
                     // last_reconcile_stage + per-binding last_error set
                     // inside preflight_map_fds. No teardown, no publish.
                     return;
                 }
+            };
+            // #2484 fail-open partial-apply fix (completes the #2440/#2444
+            // trilogy): build the full forwarding state HERE, BEFORE
+            // `tear_down`. The top-of-reconcile policy preflight above only
+            // parses policy/address-book state, so snapshot INTEGRITY faults
+            // reachable only inside the full build (e.g. Nat64UnparseableRule,
+            // NPTv6/static-NAT integrity faults) used to surface inside
+            // `apply_snapshot` — AFTER teardown stopped the workers and reset
+            // `coord.validation` / `shared_validation`, stranding the helper
+            // with no forwarding and no workers (residual fail-open). Building
+            // here aborts on such a fault with the prior generation + workers
+            // still live, mirroring the map-FD hoist #2440 added.
+            //
+            // This is the SAME call `apply_snapshot` made; the result is
+            // stashed on `fds.forwarding` and reused there (build-once), so we
+            // do NOT pay a second build on the success path nor re-insert
+            // per-rule counter handles into the live stores twice. The build
+            // reads `Some(&self.forwarding)` as its "previous" arg, which
+            // `tear_down` defaults to empty — another reason it MUST run
+            // before teardown.
+            match snapshot::build_reconcile_forwarding(self, snap) {
+                Ok(forwarding) => fds.forwarding = forwarding,
+                Err(()) => {
+                    // last_reconcile_stage = "snapshot_integrity_error" set
+                    // inside build_reconcile_forwarding. No teardown, no
+                    // publish: prior generation + workers stay live.
+                    return;
+                }
             }
+            Some(fds)
         } else {
             None
         };
@@ -145,6 +183,13 @@ impl Coordinator {
         // SAFETY: preflight_fds is Some whenever snapshot is Some (both
         // gated on the same `snapshot` Option above).
         let fds = preflight_fds.expect("preflight_map_fds ran for a Some snapshot");
+        // #2484: `apply_snapshot` no longer rebuilds the forwarding state
+        // or rejects on an integrity fault — that build (and its integrity
+        // check) was hoisted into the pre-teardown preflight above
+        // (`build_reconcile_forwarding`), so by the time we reach here the
+        // build has already succeeded and `apply_snapshot` reuses
+        // `fds.forwarding`. The `Option` return is retained for signature
+        // stability; the `else` arm is now defensively unreachable.
         let Some(fds) = snapshot::apply_snapshot(
             self,
             snapshot,
@@ -154,12 +199,6 @@ impl Coordinator {
             &mut preserved.synced_sessions,
             fds,
         ) else {
-            // last_reconcile_stage set inside apply_snapshot on the
-            // integrity-error leg ("snapshot_integrity_error"). That leg
-            // rejects the snapshot before any publish, so the prior
-            // forwarding generation stays published. It does NOT touch
-            // per-binding last_error — there is no per-binding signal
-            // for an address-book integrity fault.
             return;
         };
         bringup::bring_up_workers(

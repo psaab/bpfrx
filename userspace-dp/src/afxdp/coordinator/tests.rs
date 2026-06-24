@@ -2956,32 +2956,34 @@ fn reconcile_all_mandatory_maps_open_advances_published_generation() {
     assert_eq!((**coordinator.shared_validation.load()).config_generation, 2);
 }
 
-/// #2440 (Copilot follow-up): the snapshot-integrity rejection leg in
-/// `apply_snapshot` (`build_forwarding_state...` -> Err) must record
-/// `last_reconcile_stage = "snapshot_integrity_error"` so the failure is
-/// observable via status. Previously that leg only `eprintln!`d and
-/// returned None, leaving `last_reconcile_stage` at its prior value.
+/// #2484 (completes the #2440/#2444 fail-open trilogy): a snapshot
+/// INTEGRITY fault must abort the reconcile BEFORE `tear_down`, keeping
+/// the prior generation published AND the prior workers/state live — not
+/// merely record an observable stage post-teardown.
 ///
 /// Seam: a NAT64 rule with an empty prefix trips
 /// `Nat64State::try_from_snapshots` (Nat64UnparseableRule). That path is
-/// NOT checked by the top-of-reconcile policy preflight (which only
-/// parses the policy/address-book state), so it reaches the
-/// `apply_snapshot` integrity Err arm. Map pins are sentinel-OK so the
-/// map-FD preflight passes and the integrity check is what fires.
+/// NOT checked by the top-of-reconcile policy preflight (which only parses
+/// the policy/address-book state), so before #2484 it reached the
+/// `apply_snapshot` integrity Err arm — which ran AFTER `tear_down`
+/// (`stop_inner`) had already reset `coord.validation`,
+/// `shared_validation`, `snapshot_installed`, and stopped the workers.
+/// #2484 hoists the full forwarding build into the pre-teardown preflight
+/// (`build_reconcile_forwarding`), so the fault is now detected with the
+/// prior state still live. Map pins are sentinel-OK so the map-FD preflight
+/// passes and the integrity check is what fires.
 ///
-/// Scope note: unlike the address-book policy preflight (which runs
-/// before `tear_down`), this NAT64 integrity check fires INSIDE
-/// `apply_snapshot` — after `tear_down` (`stop_inner`) has already reset
-/// both `coord.validation` and `shared_validation` to default. That
-/// post-teardown integrity-reject ordering is pre-existing and is NOT
-/// what this fold changes, so this test asserts ONLY the observable
-/// stage (the fold's subject). It does not assert generation
-/// preservation for this leg.
-///
-/// Fail-on-revert: drop the `coord.last_reconcile_stage = ...` line in
-/// the Err arm and this asserts against the stale "start" value.
+/// Fail-on-revert: this is the KEY difference from the pre-#2484 test
+/// (which asserted only the stage + non-installation, because the check was
+/// post-teardown). With the fix reverted — integrity build back inside
+/// `apply_snapshot`, after `tear_down` — `stop_inner` resets
+/// `coord.validation` (config_generation -> 0, snapshot_installed -> false)
+/// and `shared_validation` to default, so EVERY preservation assertion
+/// below fails. The stage assertion alone is NOT revert-sensitive (both the
+/// old post-teardown leg and the new pre-teardown leg set it); the
+/// preservation assertions are.
 #[test]
-fn reconcile_snapshot_integrity_error_sets_observable_stage() {
+fn reconcile_snapshot_integrity_error_preserves_prior_generation_and_state() {
     let mut coordinator = Coordinator::new();
     let prior = ValidationState {
         snapshot_installed: true,
@@ -2990,6 +2992,15 @@ fn reconcile_snapshot_integrity_error_sets_observable_stage() {
     };
     coordinator.validation = prior;
     coordinator.shared_validation.store(Arc::new(prior));
+
+    // Seed a sentinel live worker. `tear_down` -> `stop_inner` ->
+    // `workers.stop_and_clear` would empty `workers.live`; if the integrity
+    // fault is (correctly) detected before teardown, this entry survives.
+    // This is the direct "prior workers are NOT torn down" proof.
+    coordinator
+        .workers
+        .live
+        .insert(0, std::sync::Arc::new(BindingLiveState::new()));
 
     let mut bindings: Vec<BindingStatus> = Vec::new();
 
@@ -3010,16 +3021,43 @@ fn reconcile_snapshot_integrity_error_sets_observable_stage() {
         "integrity-error leg must record an observable stage, got {:?}",
         coordinator.last_reconcile_stage
     );
-    // The integrity leg rejects the new snapshot before it can publish a
-    // newer generation: the new generation 21 is never installed.
-    assert_ne!(
-        coordinator.validation.config_generation, 21,
-        "integrity reject must not advance to the rejected generation"
+
+    // FAIL-ON-REVERT CORE: the prior generation is still the published one,
+    // proving the integrity fault aborted BEFORE `tear_down`. A pre-#2484
+    // post-teardown reject would have run `stop_inner`, defaulting these.
+    assert_eq!(
+        coordinator.validation.config_generation, 20,
+        "integrity reject must PRESERVE the prior generation (not tear down)"
     );
-    assert_ne!(
-        (**coordinator.shared_validation.load()).config_generation,
-        21,
-        "integrity reject must not publish the rejected generation"
+    assert_eq!(
+        coordinator.validation.fib_generation, 7,
+        "integrity reject must PRESERVE the prior fib generation"
+    );
+    assert!(
+        coordinator.validation.snapshot_installed,
+        "integrity reject must keep snapshot_installed (stop_inner would clear it)"
+    );
+    let shared = **coordinator.shared_validation.load();
+    assert_eq!(
+        shared, prior,
+        "shared_validation (worker-visible view) must still hold the prior published state"
+    );
+    // The rejected generation is never published anywhere.
+    assert_ne!(coordinator.validation.config_generation, 21);
+    assert_ne!(shared.config_generation, 21);
+
+    // FAIL-ON-REVERT (worker preservation): the seeded prior worker is
+    // still present — `tear_down`/`stop_inner`/`stop_and_clear` was never
+    // reached. A pre-#2484 post-teardown reject would have emptied
+    // `workers.live` before the integrity fault was detected.
+    assert_eq!(
+        coordinator.workers.live.len(),
+        1,
+        "integrity reject must PRESERVE the prior workers (not tear them down)"
+    );
+    assert!(
+        coordinator.workers.live.contains_key(&0),
+        "the seeded prior worker (slot 0) must survive an integrity-faulted reconcile"
     );
 }
 

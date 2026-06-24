@@ -35,6 +35,10 @@ pub(super) fn bring_up_workers(
         dnat_table_fd,
         dnat_table_v6_fd,
         dnat_fds,
+        // #2484: forwarding was consumed by apply_snapshot (built in the
+        // pre-teardown preflight, moved into coord.forwarding); bring-up
+        // reads coord.forwarding, not this field.
+        forwarding: _,
     } = fds;
     let ring_entries = ring_entries.max(64).min(u32::MAX as usize) as u32;
     let mut workers: BTreeMap<u32, Vec<BindingPlan>> = BTreeMap::new();

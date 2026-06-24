@@ -178,7 +178,53 @@ pub(super) fn preflight_map_fds(
         dnat_table_fd,
         dnat_table_v6_fd,
         dnat_fds,
+        // #2484: filled in by `build_reconcile_forwarding`, which the
+        // orchestrator runs right after this (still before teardown). A
+        // default placeholder until then; the orchestrator never reads it
+        // before assigning the real build result.
+        forwarding: ForwardingState::default(),
     })
+}
+
+/// #2484: build the full forwarding state for `snapshot` BEFORE the
+/// orchestrator tears down the running workers. This is the SAME call
+/// `apply_snapshot` previously made internally — hoisted ahead of
+/// `tear_down` so a snapshot INTEGRITY fault (Nat64UnparseableRule,
+/// NPTv6 / static-NAT / address-book integrity faults reachable only
+/// inside the full build, NOT caught by the top-of-reconcile policy
+/// preflight) aborts the reconcile while the prior generation + workers
+/// are still live, instead of surfacing post-teardown.
+///
+/// On success returns the built `ForwardingState` for the orchestrator to
+/// stash on `ReconcileSnapshotFds::forwarding` (build-once, reused by
+/// `apply_snapshot`). On an integrity error sets
+/// `coord.last_reconcile_stage = "snapshot_integrity_error"` (matching the
+/// descriptive-stage pattern) and returns `Err(())`; the orchestrator
+/// aborts WITHOUT teardown or publish.
+///
+/// MUST run before `tear_down`: it reads `Some(&coord.forwarding)` as the
+/// build's "previous" arg (WG engine reuse, NAT counter carry-over, cold-
+/// path slot map carry-over), which `stop_inner(false)` defaults to empty.
+pub(super) fn build_reconcile_forwarding(
+    coord: &mut Coordinator,
+    snapshot: &ConfigSnapshot,
+) -> Result<ForwardingState, ()> {
+    match build_forwarding_state_with_policy_counters_and_previous(
+        snapshot,
+        &coord.policy_counters,
+        &coord.nat_counters,
+        Some(&coord.forwarding),
+    ) {
+        Ok(fwd) => Ok(fwd),
+        Err(err) => {
+            coord.last_reconcile_stage = "snapshot_integrity_error".to_string();
+            eprintln!(
+                "xpf-userspace-dp: snapshot integrity error during reconcile preflight: {} — keeping previous forwarding state + workers",
+                err
+            );
+            Err(())
+        }
+    }
 }
 
 /// #2444: open an OPTIONAL BPF map pin with empty-vs-present discipline.
@@ -225,32 +271,22 @@ pub(super) fn apply_snapshot(
     preserved_synced_sessions: &mut Vec<SyncedSessionEntry>,
     fds: ReconcileSnapshotFds,
 ) -> Option<ReconcileSnapshotFds> {
-    // #1606: preflight policy build BEFORE any side-effecting
-    // mutation. Surfaces address-book integrity errors (id=0,
-    // duplicate ids, unknown rule references) before
-    // ValidationState, policy_counters, or coord.forwarding is
-    // mutated.
-    let new_forwarding = match build_forwarding_state_with_policy_counters_and_previous(
-        snapshot,
-        &coord.policy_counters,
-        &coord.nat_counters,
-        Some(&coord.forwarding),
-    ) {
-        Ok(fwd) => fwd,
-        Err(err) => {
-            // #2440 (Copilot follow-up): record the stage so the
-            // integrity failure is observable via status.rs
-            // (last_reconcile_stage), matching the descriptive-stage
-            // pattern the preflight_map_fds legs use. Without this the
-            // field retained a stale value from a prior reconcile.
-            coord.last_reconcile_stage = "snapshot_integrity_error".to_string();
-            eprintln!(
-                "xpf-userspace-dp: snapshot integrity error during reconcile: {} — keeping previous forwarding state",
-                err
-            );
-            return None;
-        }
-    };
+    // #2484: the forwarding state was already built in the pre-teardown
+    // preflight (`build_reconcile_forwarding`) and stashed on
+    // `fds.forwarding`. REUSE it here rather than rebuilding — build-once,
+    // and (critically) the integrity check that this build performs now
+    // happens BEFORE `tear_down`, so an integrity-faulted snapshot aborts
+    // the reconcile while the prior generation + workers are still live
+    // instead of stranding the helper post-teardown. By the time control
+    // reaches `apply_snapshot` the build has already succeeded; there is no
+    // longer an integrity Err arm here.
+    //
+    // The previous #1606 preflight policy-build (and the #2440 Copilot
+    // follow-up that stamped `last_reconcile_stage` on its Err arm) moved
+    // into `build_reconcile_forwarding` in the orchestrator's pre-teardown
+    // stage.
+    let mut fds = fds;
+    let new_forwarding = std::mem::take(&mut fds.forwarding);
 
     coord.validation = ValidationState {
         snapshot_installed: true,

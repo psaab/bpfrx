@@ -158,7 +158,7 @@ Each worker thread is pinned to a CPU and processes all packets from
 its assigned RSS queues. Workers are independent — no locks on the
 forwarding hot path.
 
-#### Reconcile Ordering Invariant (#2440)
+#### Reconcile Ordering Invariant (#2440 / #2444 / #2484)
 
 `Coordinator::reconcile` (`coordinator/reconcile/mod.rs`) applies a new
 config snapshot in phases: preflight → teardown → reset → apply/publish
@@ -194,9 +194,30 @@ mandatory BPF map FDs**:
     degraded would otherwise silently lose session zone/interface
     visibility (conntrack) or break embedded-ICMP NAT reversal —
     PMTUD/traceroute breakage (dnat) — with no readiness signal.
-- Only once all mandatory FDs **and** every present-and-configured
-  optional FD are in hand does the orchestrator tear down + rebuild +
-  publish.
+- The **full forwarding-state build** runs in the same preflight, also
+  **before** `tear_down` (#2484). The top-of-reconcile policy preflight
+  only parses the policy/address-book state, so snapshot INTEGRITY faults
+  reachable only inside the full build — `Nat64UnparseableRule`, NPTv6 /
+  static-NAT integrity faults from
+  `build_forwarding_state_with_policy_counters_and_previous` — used to
+  surface *inside* `apply_snapshot`, after teardown had already stopped the
+  workers and reset `coord.validation` / `shared_validation`. They are now
+  detected by `snapshot::build_reconcile_forwarding` in the preflight: on
+  an integrity `Err` the reconcile sets
+  `last_reconcile_stage = "snapshot_integrity_error"` and aborts before
+  teardown/publish, so the prior generation + workers stay live. The built
+  state is stashed on `ReconcileSnapshotFds::forwarding` and **reused** by
+  `apply_snapshot` (build-once — no second build on the success path, and
+  no double-insert of per-rule counter handles into the live counter
+  stores). The build reads `Some(&coord.forwarding)` as its "previous"
+  arg, which `tear_down` defaults to empty — another reason it MUST run
+  before teardown.
+- Only once all mandatory FDs, every present-and-configured optional FD,
+  **and** the integrity-validated forwarding state are in hand does the
+  orchestrator tear down + rebuild + publish. This completes the
+  "all mandatory validation before teardown/publish" invariant across the
+  #2440 (map-FD) / #2444 (optional-map) / #2484 (snapshot-integrity)
+  trilogy.
 
 This closes a fail-open partial-apply window (codex review-033 finding
 033-01): previously the FD open happened *after* teardown + publish, so
@@ -205,8 +226,10 @@ published a newer generation, then aborted bring-up — leaving the helper
 advertising a data-plane view backed by no running workers. On a
 security appliance that is fail-open. Finding 033-23 (#2444) extended the
 same fail-closed treatment to a present-but-unopenable optional map (the
-prior `.ok()` swallowed the error and ran degraded). Regression coverage
-lives in `coordinator/tests.rs`
+prior `.ok()` swallowed the error and ran degraded). #2484 closed the last
+window — a snapshot-integrity fault detected only inside the full
+forwarding build, which previously surfaced *after* teardown. Regression
+coverage lives in `coordinator/tests.rs`
 (`reconcile_mandatory_map_open_failure_keeps_prior_generation_published`,
 `reconcile_missing_session_pin_keeps_prior_generation_published`,
 `reconcile_all_mandatory_maps_open_advances_published_generation`;
@@ -214,10 +237,16 @@ optional-map: `reconcile_present_conntrack_pin_open_failure_keeps_prior_generati
 `reconcile_present_dnat_pin_open_failure_keeps_prior_generation`,
 `reconcile_empty_optional_pins_advance_published_generation` — the
 anti-over-gate control —, and
-`reconcile_present_optional_pins_open_ok_advance_generation`) using
-the `bpf_map::pin` sentinel-path test seam (`TEST_MAP_PIN_OK` /
-`TEST_MAP_PIN_FAIL`) so the ordering is exercised without real bpffs
-pins.
+`reconcile_present_optional_pins_open_ok_advance_generation`;
+snapshot-integrity:
+`reconcile_snapshot_integrity_error_preserves_prior_generation_and_state`,
+which seeds a prior generation + a sentinel live worker, feeds a
+NAT64-unparseable rule, and asserts BOTH the prior generation and the
+prior worker survive — fail-on-revert: moving the integrity build back
+inside `apply_snapshot` post-teardown makes the preservation assertions
+fail) using the `bpf_map::pin` sentinel-path test seam
+(`TEST_MAP_PIN_OK` / `TEST_MAP_PIN_FAIL`) so the ordering is exercised
+without real bpffs pins.
 
 #### Per-Packet Processing Pipeline
 
