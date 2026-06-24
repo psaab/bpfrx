@@ -1,5 +1,43 @@
 # Action Log
 
+## 2026-06-23 — #2461 flowexport per-flow-server template binding
+
+- **Timestamp**: 2026-06-23 PDT
+- **Action**: Correctness fix (HIGH, codex review-034 finding 2).
+  Per-flow-server NetFlow v9 / IPFIX template references were parsed and
+  stored (`FlowServer.Version9Template` / `VersionIPFIXTemplate`) but never
+  used: `BuildExportConfig` / `BuildIPFIXExportConfig` built ONE export
+  config from the FIRST Go-map-iteration template and broadcast it to every
+  collector, so a collector silently received a template (timeouts /
+  `flow-dir` extension) it never requested and the choice flipped across
+  process restarts. Fix: new `ResolveV9TemplateGroups` /
+  `ResolveIPFIXTemplateGroups` group collectors by referenced template and
+  emit one `*ExportConfig` per `(template, source-address)` group, each
+  carrying its template's parameters, sorted deterministically (template
+  name asc, address asc). All groups of a family share one `sampleCounter`
+  (now a pointer) so 1-in-N sampling stays global. The daemon
+  (`reconcileFlowExporters`) now runs N exporters per family (one per group)
+  — `flowExporters`/`ipfixExporters` slices, the atomic bundle carries the
+  group set, the once-registered callback decides `ShouldExport` on
+  `groups[0]` and fans out. A flow-server referencing an UNDEFINED template
+  is hard-rejected at commit by `validateFlowServerTemplateReferencesStrict`
+  (strict commit / commit-check, lenient warn on load/peer-sync per #1960;
+  the resolver drops an undefined-template group on the lenient path). The
+  single-template / no-reference DEFAULT case is unchanged (inherits the
+  lone template; `BuildExportConfig` singular returns the aggregate group).
+- **File(s)**: pkg/flowexport/manager.go (resolver + grouping + shared
+  counter), pkg/flowexport/template_group_test.go (new — fail-on-revert
+  binding, determinism, shared-counter, no-regression default),
+  pkg/config/compiler.go (lenient flag + dispatch),
+  pkg/config/compiler_validate_strict.go (new strict gate),
+  pkg/config/flowserver_template_ref_test.go (new — strict/lenient gate),
+  pkg/config/parser_ast_test.go (define template so existing fixture passes
+  the new gate), pkg/daemon/daemon.go + daemon_flow.go + daemon_flowexport.go
+  (N-exporters-per-family wiring), pkg/daemon test updates, README.md.
+- **Validation**: `go build ./...`, `go test ./pkg/flowexport/ ./pkg/config/
+  ./pkg/daemon/` green, `go vet` clean, gofmt clean; binding + determinism
+  + shared-counter tests pass `-race -count=5`.
+
 ## 2026-06-23 — #2374 AF_XDP bringup fill-ring partial-prime recovery
 
 - **Timestamp**: 2026-06-23 PDT

@@ -164,10 +164,13 @@ type Daemon struct {
 	// otherwise cached flow routes stay pinned to pre-failover paths.
 	// Mutated only in actuateRouteOverlayLocked under applySem.
 	pendingFIBBump bool
-	flowExporter   *flowexport.Exporter
+	// #2461: one exporter per per-flow-server template group, so a
+	// collector receives the template it referenced (was a single exporter
+	// using the first map-iteration template for every collector).
+	flowExporters  []*flowexport.Exporter
 	flowCancel     context.CancelFunc
 	flowWg         sync.WaitGroup
-	ipfixExporter  *flowexport.IPFIXExporter
+	ipfixExporters []*flowexport.IPFIXExporter
 	ipfixCancel    context.CancelFunc
 	ipfixWg        sync.WaitGroup
 	// #2075 flowexport reconcile state. The bundle pointers carry the

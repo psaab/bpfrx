@@ -17,7 +17,9 @@ package flowexport
 
 import (
 	"net"
+	"sort"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -30,22 +32,50 @@ type SamplingDir struct {
 	Output bool
 }
 
-// ExportConfig holds the resolved NetFlow export configuration.
+// ExportConfig holds the resolved NetFlow export configuration for a
+// single template group: the collectors that referenced one template (or
+// the default-template collectors that referenced none), the timeouts and
+// v9 field options resolved from THAT template, plus the family-wide
+// sampling state.
+//
+// #2461: before this change a single ExportConfig was built per family
+// from the FIRST Go-map-iteration template and broadcast to every
+// collector, so a per-flow-server template reference was silently ignored
+// and the chosen template flipped across restarts. The resolver now emits
+// one ExportConfig per (template, source-address) group (see
+// ResolveV9TemplateGroups / ResolveIPFIXTemplateGroups). The daemon runs
+// one exporter per group; the groups of a family share one sampleCounter
+// (pointer below) so 1-in-N sampling stays global across the family rather
+// than restarting the modulo cadence per template.
 type ExportConfig struct {
 	Collectors          []CollectorConfig
+	TemplateName        string // referenced template ("" = default group)
 	FlowActiveTimeout   time.Duration
 	FlowInactiveTimeout time.Duration
 	TemplateRefreshRate time.Duration
 	SamplingZones       map[uint16]SamplingDir // zone ID -> sampling directions
 	SamplingRate        int                    // 1-in-N sampling (0 = export all)
 	V9TemplateOpts      V9TemplateOptions      // optional v9 template field control
-	sampleCounter       atomic.Uint64          // monotonic counter for 1-in-N
+	// sampleCounter is the monotonic 1-in-N counter. It is a POINTER so all
+	// ExportConfig groups of one family share a single counter (the
+	// sampling rate is a forwarding-options-instance property, not a
+	// per-template one). A nil pointer is lazily allocated on first use so
+	// a hand-built ExportConfig (tests, the singular Build* helpers) still
+	// samples correctly. json.Marshal skips the unexported field, so the
+	// reconcile config-hash is unaffected.
+	sampleCounter *atomic.Uint64
+	counterOnce   sync.Once
 }
 
 // CollectorConfig defines a single NetFlow collector destination.
 type CollectorConfig struct {
 	Address       string // "host:port"
 	SourceAddress string // local bind address (empty = auto)
+	// Template is the per-flow-server template the collector referenced
+	// ("" = none → default group). It is the grouping key for #2461 and is
+	// NOT serialized into the dialed connection; it only steers which
+	// ExportConfig (template context) the collector is placed under.
+	Template string `json:"-"`
 }
 
 // resolveFlowServerVersion returns the export protocol a single
@@ -130,9 +160,14 @@ func collectVersionCollectors(fo *config.ForwardingOptionsConfig, version string
 				if srcAddr == "" {
 					srcAddr = fam.InlineJflowSourceAddress
 				}
+				tmpl := fs.Version9Template
+				if version == config.FlowServerVersionIPFIX {
+					tmpl = fs.VersionIPFIXTemplate
+				}
 				collectors = append(collectors, CollectorConfig{
 					Address:       addr,
 					SourceAddress: srcAddr,
+					Template:      tmpl,
 				})
 			}
 		}
@@ -155,87 +190,187 @@ func dedupeCollectors(collectors []CollectorConfig) []CollectorConfig {
 	return deduped
 }
 
-// BuildExportConfig resolves config types into an ExportConfig.
-// Returns nil if no flow export is configured.
-func BuildExportConfig(svc *config.ServicesConfig, fo *config.ForwardingOptionsConfig) *ExportConfig {
+// templateContext is the resolved per-template export parameters (the
+// timeouts and the v9 field options) carried into every ExportConfig built
+// for the collectors that referenced that template. #2461.
+type templateContext struct {
+	activeTimeout   time.Duration
+	inactiveTimeout time.Duration
+	refreshRate     time.Duration
+	v9opts          V9TemplateOptions
+}
+
+// defaultTemplateContext is the timeout/refresh fallback used for a
+// collector that referenced no template and when a referenced template
+// name has no matching definition that overrides a field.
+func defaultTemplateContext() templateContext {
+	return templateContext{
+		activeTimeout:   60 * time.Second,
+		inactiveTimeout: 15 * time.Second,
+		refreshRate:     60 * time.Second,
+	}
+}
+
+// v9TemplateContext resolves one NetFlow v9 template definition into a
+// templateContext. A zero/absent field keeps the default.
+func v9TemplateContext(tmpl *config.NetFlowV9Template) templateContext {
+	tc := defaultTemplateContext()
+	if tmpl == nil {
+		return tc
+	}
+	if tmpl.FlowActiveTimeout > 0 {
+		tc.activeTimeout = time.Duration(tmpl.FlowActiveTimeout) * time.Second
+	}
+	if tmpl.FlowInactiveTimeout > 0 {
+		tc.inactiveTimeout = time.Duration(tmpl.FlowInactiveTimeout) * time.Second
+	}
+	if tmpl.TemplateRefreshRate > 0 {
+		tc.refreshRate = time.Duration(tmpl.TemplateRefreshRate) * time.Second
+	}
+	for _, ext := range tmpl.ExportExtensions {
+		if ext == "flow-dir" {
+			tc.v9opts.IncludeFlowDir = true
+		}
+	}
+	return tc
+}
+
+// ipfixTemplateContext resolves one IPFIX template definition into a
+// templateContext (IPFIX has no v9 field options).
+func ipfixTemplateContext(tmpl *config.NetFlowIPFIXTemplate) templateContext {
+	tc := defaultTemplateContext()
+	if tmpl == nil {
+		return tc
+	}
+	if tmpl.FlowActiveTimeout > 0 {
+		tc.activeTimeout = time.Duration(tmpl.FlowActiveTimeout) * time.Second
+	}
+	if tmpl.FlowInactiveTimeout > 0 {
+		tc.inactiveTimeout = time.Duration(tmpl.FlowInactiveTimeout) * time.Second
+	}
+	if tmpl.TemplateRefreshRate > 0 {
+		tc.refreshRate = time.Duration(tmpl.TemplateRefreshRate) * time.Second
+	}
+	return tc
+}
+
+// samplingRate returns the global 1-in-N sampling rate (the first sampling
+// instance's input rate), shared by every template group of both families.
+func samplingRate(fo *config.ForwardingOptionsConfig) int {
+	for _, inst := range fo.Sampling.Instances {
+		if inst.InputRate > 0 {
+			return inst.InputRate
+		}
+	}
+	return 0
+}
+
+// groupCollectorsByTemplate partitions the deduplicated collector list into
+// one slice per referenced template name, returning the group keys sorted
+// deterministically. The empty-string key holds collectors that referenced
+// no template (the default group). Determinism (#2461): the group order and
+// the per-group collector order are stable across process restarts, killing
+// the Go-map-iteration nondeterminism that let a collector silently flip
+// between templates.
+func groupCollectorsByTemplate(collectors []CollectorConfig) ([]string, map[string][]CollectorConfig) {
+	groups := make(map[string][]CollectorConfig)
+	for _, c := range collectors {
+		groups[c.Template] = append(groups[c.Template], c)
+	}
+	keys := make([]string, 0, len(groups))
+	for k := range groups {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, k := range keys {
+		cs := groups[k]
+		sort.Slice(cs, func(i, j int) bool {
+			if cs[i].Address != cs[j].Address {
+				return cs[i].Address < cs[j].Address
+			}
+			return cs[i].SourceAddress < cs[j].SourceAddress
+		})
+		groups[k] = cs
+	}
+	return keys, groups
+}
+
+// ResolveV9TemplateGroups resolves the NetFlow v9 export configuration into
+// one ExportConfig per referenced template (#2461). Each group carries the
+// timeouts / field options of the template its collectors actually
+// referenced, instead of broadcasting the first map-iteration template to
+// every collector. A collector referencing no template lands in the default
+// group, which uses the lone configured template's parameters when there is
+// exactly one (the common single-template case, unchanged behavior), else
+// the built-in defaults. A collector referencing a template that is not
+// defined is DROPPED (the strict commit-time gate
+// validateFlowServerTemplateReferencesStrict rejects it on commit; this is
+// the lenient-load backstop — export nothing for that collector rather than
+// the wrong template). All groups share one sampleCounter so 1-in-N
+// sampling stays global. Returns nil when no v9 export is configured.
+func ResolveV9TemplateGroups(svc *config.ServicesConfig, fo *config.ForwardingOptionsConfig) []*ExportConfig {
 	if fo == nil || fo.Sampling == nil || len(fo.Sampling.Instances) == 0 {
 		return nil
 	}
 	// #2129: a NetFlow v9 exporter must only start when `services
-	// flow-monitoring version9` is configured. This mirrors the
-	// VersionIPFIX guard in BuildIPFIXExportConfig below. Without it an
-	// IPFIX-only operator (or one with sampling+flow-server but no
-	// flow-monitoring stanza at all) received an unrequested v9 datagram
-	// stream at the collector. NOTE: this fixes only the *unrequested* v9
-	// stream; a flow-server configured with BOTH version9 and
-	// version-ipfix still double-exports to one collector (each version
-	// passes its own gate) — that per-flow-server version-binding fix is
-	// deferred to a follow-up.
+	// flow-monitoring version9` is configured.
 	if svc == nil || svc.FlowMonitoring == nil || svc.FlowMonitoring.Version9 == nil {
 		return nil
 	}
 
-	// Collect template timeouts from services config
-	activeTimeout := 60 * time.Second
-	inactiveTimeout := 15 * time.Second
-	refreshRate := 60 * time.Second
-
-	// The guard above guarantees svc.FlowMonitoring.Version9 != nil.
-	var v9opts V9TemplateOptions
-	for _, tmpl := range svc.FlowMonitoring.Version9.Templates {
-		if tmpl.FlowActiveTimeout > 0 {
-			activeTimeout = time.Duration(tmpl.FlowActiveTimeout) * time.Second
-		}
-		if tmpl.FlowInactiveTimeout > 0 {
-			inactiveTimeout = time.Duration(tmpl.FlowInactiveTimeout) * time.Second
-		}
-		if tmpl.TemplateRefreshRate > 0 {
-			refreshRate = time.Duration(tmpl.TemplateRefreshRate) * time.Second
-		}
-		for _, ext := range tmpl.ExportExtensions {
-			switch ext {
-			case "flow-dir":
-				v9opts.IncludeFlowDir = true
-			}
-		}
-		break // use first template
-	}
-
-	ec := &ExportConfig{
-		FlowActiveTimeout:   activeTimeout,
-		FlowInactiveTimeout: inactiveTimeout,
-		TemplateRefreshRate: refreshRate,
-		V9TemplateOpts:      v9opts,
-	}
-
-	// Use the first sampling instance's input rate as the global sampling rate
-	for _, inst := range fo.Sampling.Instances {
-		if inst.InputRate > 0 {
-			ec.SamplingRate = inst.InputRate
-			break
-		}
-	}
-
-	// Collect only the flow-servers bound to NetFlow v9. A server is
-	// bound to v9 by an explicit per-server selector, or — when it has
-	// no per-server selector — by inheriting v9 only if IPFIX is not
-	// also configured (IPFIX wins the unbound precedence). This is the
-	// #2136 per-flow-server version binding: it skips servers resolved
-	// to IPFIX so a collector configured under both versions receives
-	// exactly one datagram stream, not two.
 	hasIPFIX := svc.FlowMonitoring.VersionIPFIX != nil
-	ec.Collectors = collectVersionCollectors(fo, config.FlowServerVersion9, true, hasIPFIX)
-
-	if len(ec.Collectors) == 0 {
+	// #2136 per-flow-server version binding: collect only the flow-servers
+	// bound to NetFlow v9 so a collector under both versions gets one stream.
+	collectors := collectVersionCollectors(fo, config.FlowServerVersion9, true, hasIPFIX)
+	if len(collectors) == 0 {
 		return nil
 	}
 
-	return ec
+	defined := svc.FlowMonitoring.Version9.Templates
+	// defaultCtx: when exactly one template is defined, an unreferenced
+	// collector inherits it (preserves the pre-#2461 single-template case);
+	// with zero or multiple templates it uses the built-in defaults.
+	defaultCtx := defaultTemplateContext()
+	if len(defined) == 1 {
+		for _, tmpl := range defined {
+			defaultCtx = v9TemplateContext(tmpl)
+		}
+	}
+
+	rate := samplingRate(fo)
+	shared := &atomic.Uint64{}
+	keys, groups := groupCollectorsByTemplate(collectors)
+
+	var out []*ExportConfig
+	for _, name := range keys {
+		ctx := defaultCtx
+		if name != "" {
+			tmpl, ok := defined[name]
+			if !ok {
+				// Undefined reference: drop (the strict gate rejects on
+				// commit; lenient load exports nothing for these collectors).
+				continue
+			}
+			ctx = v9TemplateContext(tmpl)
+		}
+		out = append(out, &ExportConfig{
+			Collectors:          groups[name],
+			TemplateName:        name,
+			FlowActiveTimeout:   ctx.activeTimeout,
+			FlowInactiveTimeout: ctx.inactiveTimeout,
+			TemplateRefreshRate: ctx.refreshRate,
+			V9TemplateOpts:      ctx.v9opts,
+			SamplingRate:        rate,
+			sampleCounter:       shared,
+		})
+	}
+	return out
 }
 
-// BuildIPFIXExportConfig resolves IPFIX config into an ExportConfig.
-// Falls back to v9 collectors/sampling if no IPFIX-specific overrides.
-func BuildIPFIXExportConfig(svc *config.ServicesConfig, fo *config.ForwardingOptionsConfig) *ExportConfig {
+// ResolveIPFIXTemplateGroups is the IPFIX equivalent of
+// ResolveV9TemplateGroups (#2461). Returns nil when no IPFIX export is
+// configured.
+func ResolveIPFIXTemplateGroups(svc *config.ServicesConfig, fo *config.ForwardingOptionsConfig) []*ExportConfig {
 	if fo == nil || fo.Sampling == nil || len(fo.Sampling.Instances) == 0 {
 		return nil
 	}
@@ -243,50 +378,68 @@ func BuildIPFIXExportConfig(svc *config.ServicesConfig, fo *config.ForwardingOpt
 		return nil
 	}
 
-	activeTimeout := 60 * time.Second
-	inactiveTimeout := 15 * time.Second
-	refreshRate := 60 * time.Second
-
-	for _, tmpl := range svc.FlowMonitoring.VersionIPFIX.Templates {
-		if tmpl.FlowActiveTimeout > 0 {
-			activeTimeout = time.Duration(tmpl.FlowActiveTimeout) * time.Second
-		}
-		if tmpl.FlowInactiveTimeout > 0 {
-			inactiveTimeout = time.Duration(tmpl.FlowInactiveTimeout) * time.Second
-		}
-		if tmpl.TemplateRefreshRate > 0 {
-			refreshRate = time.Duration(tmpl.TemplateRefreshRate) * time.Second
-		}
-		break // use first template
-	}
-
-	ec := &ExportConfig{
-		FlowActiveTimeout:   activeTimeout,
-		FlowInactiveTimeout: inactiveTimeout,
-		TemplateRefreshRate: refreshRate,
-	}
-
-	// Same sampling rate as v9 (shared forwarding-options sampling).
-	for _, inst := range fo.Sampling.Instances {
-		if inst.InputRate > 0 {
-			ec.SamplingRate = inst.InputRate
-			break
-		}
-	}
-
-	// Collect only the flow-servers bound to IPFIX (#2136). A server is
-	// bound to IPFIX by an explicit per-server selector, or — when it
-	// has no per-server selector — by inheriting IPFIX (which wins the
-	// unbound precedence whenever IPFIX is configured). The v9 builder
-	// skips exactly these servers, so no collector is double-exported.
 	hasV9 := svc.FlowMonitoring.Version9 != nil
-	ec.Collectors = collectVersionCollectors(fo, config.FlowServerVersionIPFIX, hasV9, true)
-
-	if len(ec.Collectors) == 0 {
+	collectors := collectVersionCollectors(fo, config.FlowServerVersionIPFIX, hasV9, true)
+	if len(collectors) == 0 {
 		return nil
 	}
 
-	return ec
+	defined := svc.FlowMonitoring.VersionIPFIX.Templates
+	defaultCtx := defaultTemplateContext()
+	if len(defined) == 1 {
+		for _, tmpl := range defined {
+			defaultCtx = ipfixTemplateContext(tmpl)
+		}
+	}
+
+	rate := samplingRate(fo)
+	shared := &atomic.Uint64{}
+	keys, groups := groupCollectorsByTemplate(collectors)
+
+	var out []*ExportConfig
+	for _, name := range keys {
+		ctx := defaultCtx
+		if name != "" {
+			tmpl, ok := defined[name]
+			if !ok {
+				continue
+			}
+			ctx = ipfixTemplateContext(tmpl)
+		}
+		out = append(out, &ExportConfig{
+			Collectors:          groups[name],
+			TemplateName:        name,
+			FlowActiveTimeout:   ctx.activeTimeout,
+			FlowInactiveTimeout: ctx.inactiveTimeout,
+			TemplateRefreshRate: ctx.refreshRate,
+			SamplingRate:        rate,
+			sampleCounter:       shared,
+		})
+	}
+	return out
+}
+
+// BuildExportConfig resolves config types into a single NetFlow v9
+// ExportConfig. It returns the FIRST template group (deterministically the
+// default/empty-template group, else the lowest template name) and is
+// retained for callers that want a single aggregate config; the daemon uses
+// ResolveV9TemplateGroups so each collector gets its referenced template
+// (#2461). Returns nil if no flow export is configured.
+func BuildExportConfig(svc *config.ServicesConfig, fo *config.ForwardingOptionsConfig) *ExportConfig {
+	groups := ResolveV9TemplateGroups(svc, fo)
+	if len(groups) == 0 {
+		return nil
+	}
+	return groups[0]
+}
+
+// BuildIPFIXExportConfig is the IPFIX equivalent of BuildExportConfig.
+func BuildIPFIXExportConfig(svc *config.ServicesConfig, fo *config.ForwardingOptionsConfig) *ExportConfig {
+	groups := ResolveIPFIXTemplateGroups(svc, fo)
+	if len(groups) == 0 {
+		return nil
+	}
+	return groups[0]
 }
 
 // BuildSamplingZones builds a map of zone ID to sampling direction flags.
@@ -345,10 +498,22 @@ func (ec *ExportConfig) ShouldExport(inZone, outZone uint16) bool {
 	}
 	// Apply 1-in-N sampling rate
 	if ec.SamplingRate > 1 {
-		n := ec.sampleCounter.Add(1)
+		n := ec.counter().Add(1)
 		return n%uint64(ec.SamplingRate) == 0
 	}
 	return true
+}
+
+// counter returns the shared 1-in-N counter, lazily allocating a private
+// one for a hand-built ExportConfig that the resolver did not wire. The
+// sync.Once converges a concurrent first-call race on a single counter.
+func (ec *ExportConfig) counter() *atomic.Uint64 {
+	ec.counterOnce.Do(func() {
+		if ec.sampleCounter == nil {
+			ec.sampleCounter = &atomic.Uint64{}
+		}
+	})
+	return ec.sampleCounter
 }
 
 // parseIfaceRef splits "eth0.0" into ("eth0", 0).
@@ -413,5 +578,5 @@ func estimateSessionDuration(pkts uint64, proto uint8) time.Duration {
 }
 
 func collectorKey(c CollectorConfig) string {
-	return c.Address + "\x00" + c.SourceAddress
+	return c.Address + "\x00" + c.SourceAddress + "\x00" + c.Template
 }
