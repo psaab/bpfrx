@@ -26,6 +26,10 @@ func newTestManagerNoNetwork() (*Manager, *lifecycleRecorder) {
 
 	m.linkState = func(string) (bool, error) { return true, nil }
 	m.subscribeLinks = func(ch chan<- netlink.LinkUpdate, done <-chan struct{}) error { return nil }
+	// Stub the #2528 addr-watcher subscription so UpdateInstances never opens
+	// a real netlink address socket. Returning nil leaves the watcher
+	// subscribed-but-silent (no events), matching the link-watcher stub above.
+	m.subscribeAddrs = func(ch chan<- netlink.AddrUpdate, done <-chan struct{}) error { return nil }
 
 	// resolveIface returns a synthetic interface; failures are injected via
 	// openInstanceSocket so we exercise the socket-open arm of the bug.

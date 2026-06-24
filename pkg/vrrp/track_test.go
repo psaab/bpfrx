@@ -143,6 +143,7 @@ func TestUpdateInstances_TrackFieldChangeInPlace(t *testing.T) {
 	m.subscribeLinks = func(ch chan<- netlink.LinkUpdate, done <-chan struct{}) error {
 		return nil // never sends — seeding is what's under test
 	}
+	m.subscribeAddrs = func(ch chan<- netlink.AddrUpdate, done <-chan struct{}) error { return nil }
 
 	vi := newInstance(Instance{
 		Interface: "eth0",
@@ -199,6 +200,7 @@ func TestLinkWatcher_Singleton(t *testing.T) {
 	m.subscribeLinks = func(ch chan<- netlink.LinkUpdate, done <-chan struct{}) error {
 		return nil // never sends
 	}
+	m.subscribeAddrs = func(ch chan<- netlink.AddrUpdate, done <-chan struct{}) error { return nil }
 
 	desired := []*Instance{{
 		Interface:         "no-such-iface-xyz0", // creation skipped; watcher still latches
@@ -368,6 +370,7 @@ func TestUpdateInstances_NoTrackNoWatcher(t *testing.T) {
 		t.Error("watcher must not start without tracked instances")
 		return nil
 	}
+	m.subscribeAddrs = func(ch chan<- netlink.AddrUpdate, done <-chan struct{}) error { return nil }
 	desired := []*Instance{{
 		Interface: "no-such-iface-xyz0",
 		GroupID:   101,

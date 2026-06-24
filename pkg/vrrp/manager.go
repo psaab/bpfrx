@@ -47,6 +47,18 @@ type Manager struct {
 	linkState      func(name string) (bool, error)
 	subscribeLinks func(ch chan<- netlink.LinkUpdate, done <-chan struct{}) error
 
+	// Source-address watcher (#2528): ONE singleton goroutine subscribing to
+	// netlink ADDRESS updates so an instance's cached advert source
+	// (localIP/localIPv6) is re-resolved when the interface's address changes
+	// — closes the stale-source split-brain window opened by the RETH MAC
+	// reprogram cycle. Distinct latch from the link-watcher; both share
+	// m.watcherStop for cancellation. subscribeAddrs defaults to
+	// netlink.AddrSubscribe and is injectable so unit tests need no real
+	// netlink.
+	addrWatcherRunning bool // guarded by mu — singleton latch
+	addrWatcherStarts  int  // guarded by mu — observability/test seam
+	subscribeAddrs     func(ch chan<- netlink.AddrUpdate, done <-chan struct{}) error
+
 	// Injectable instance-lifecycle seams (#2156). Unit tests must not
 	// require real raw sockets or a live run() goroutine to exercise the
 	// build-before-teardown ordering in UpdateInstances. Production
@@ -78,6 +90,7 @@ func NewManager() *Manager {
 		watcherStop:        make(chan struct{}),
 		linkState:          netlinkLinkState,
 		subscribeLinks:     netlink.LinkSubscribe,
+		subscribeAddrs:     netlink.AddrSubscribe,
 		resolveIface:       net.InterfaceByName,
 		openInstanceSocket: func(vi *vrrpInstance) error { return vi.openSocket() },
 		runInstance:        func(vi *vrrpInstance) { go vi.run() },
@@ -219,6 +232,11 @@ func (m *Manager) UpdateInstances(desired []*Instance) error {
 		if inst.TrackInterface != "" {
 			m.ensureLinkWatcherLocked()
 		}
+		// Lazily start the singleton address watcher once ANY instance
+		// exists (#2528). Every VRRP interface needs its advert source
+		// re-resolved when its address changes — not just tracked ones — so
+		// this is ungated. Idempotent under m.mu.
+		m.ensureAddrWatcherLocked()
 	}
 
 	// Remove instances no longer desired.

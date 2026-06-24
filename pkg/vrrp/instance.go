@@ -131,6 +131,22 @@ type vrrpInstance struct {
 	// onEventDrop is called when an event is dropped due to a full eventCh.
 	// Set by the manager to trigger immediate reconciliation.
 	onEventDrop func()
+
+	// addrsFn, when non-nil, overrides interface address enumeration. Unit
+	// tests inject it to simulate an address change without a real kernel
+	// interface (#2528). Production leaves it nil and interfaceAddrs() queries
+	// vi.iface.Addrs() live on every resolve.
+	addrsFn func() ([]net.Addr, error)
+}
+
+// interfaceAddrs returns the interface's current addresses, via the test seam
+// when set, else live from the kernel. Re-queried on every resolve so the
+// addr-watcher (#2528) always sees the CURRENT address set.
+func (vi *vrrpInstance) interfaceAddrs() ([]net.Addr, error) {
+	if vi.addrsFn != nil {
+		return vi.addrsFn()
+	}
+	return vi.iface.Addrs()
 }
 
 func newInstance(cfg Instance, iface *net.Interface, eventCh chan<- VRRPEvent, onEventDrop func()) *vrrpInstance {
@@ -189,6 +205,84 @@ func (vi *vrrpInstance) setLocalIPv6(ip net.IP) {
 	vi.localIPv6.Store(&ip)
 }
 
+// vipAddrSet returns the configured virtual addresses (prefix stripped) as a
+// set. Used to EXCLUDE VIPs when selecting our own advert source: during
+// split-brain both nodes hold the VIP, so sending from it would make the peer
+// filter our adverts as self-sent. cfg.VirtualAddresses is set once at
+// newInstance and never mutated in place (VIP changes go through a full
+// instance rebuild), so reading it without the lock is safe — the same
+// pattern the sendPacket() lazy resolve already relies on.
+func (vi *vrrpInstance) vipAddrSet() map[string]bool {
+	s := make(map[string]bool, len(vi.cfg.VirtualAddresses))
+	for _, vip := range vi.cfg.VirtualAddresses {
+		addr := vip
+		if idx := strings.Index(addr, "/"); idx >= 0 {
+			addr = addr[:idx]
+		}
+		s[addr] = true
+	}
+	return s
+}
+
+// resolveLocalIPv4 deterministically selects our IPv4 advert source: the
+// lowest non-VIP IPv4 currently assigned to the interface, or nil if none.
+// Deterministic (lowest) selection — mirroring resolveIPv6LinkLocal — keeps
+// the source STABLE across unrelated secondary-address churn so the
+// addr-watcher re-resolve (#2528) never flips the advert source on an event
+// for some other address on the same interface. (Member interfaces normally
+// carry exactly one non-VIP primary IPv4, so this is a no-op in practice; the
+// determinism only matters for the multi-address edge.)
+func (vi *vrrpInstance) resolveLocalIPv4(vipSet map[string]bool) net.IP {
+	addrs, err := vi.interfaceAddrs()
+	if err != nil {
+		return nil
+	}
+	var candidates []net.IP
+	for _, a := range addrs {
+		ipNet, ok := a.(*net.IPNet)
+		if !ok {
+			continue
+		}
+		ip4 := ipNet.IP.To4()
+		if ip4 == nil || vipSet[ip4.String()] {
+			continue
+		}
+		candidates = append(candidates, ip4)
+	}
+	if len(candidates) == 0 {
+		return nil
+	}
+	sort.Slice(candidates, func(i, j int) bool {
+		return bytes.Compare(candidates[i], candidates[j]) < 0
+	})
+	return candidates[0]
+}
+
+// reresolveLocalAddrs recomputes localIP and localIPv6 from the interface's
+// CURRENT kernel addresses and stores them atomically. Called once at
+// openSocket() and again from the manager addr-watcher whenever an address is
+// added/removed on this instance's interface (#2528).
+//
+// Before #2528 the cached source was resolved exactly once and never
+// invalidated: if the interface's IPv4 or link-local IPv6 changed during
+// operation — most acutely the RETH MAC reprogram cycle (programRethMAC does
+// link DOWN -> set MAC -> UP, which flushes ALL kernel addresses; networkd
+// KeepConfiguration=static restores them but with a 30ms-1s timing window
+// against the next 30ms advert) — the instance kept sending from a stale
+// source. The kernel then silently rejects the advert (source no longer on
+// the interface) AND incoming self-adverts fail self-filtering in
+// handleMasterRx -> false master conflict / split-brain. Re-resolving on every
+// address event closes that window. A nil result (address transiently absent)
+// is stored as nil so the sendPacket()/sendPacketIPv6() lazy path re-resolves
+// on the next advert. The atomic setLocalIP/setLocalIPv6 stores make this
+// addr-watcher-goroutine write race-clean against the receiver/run-loop reads
+// (#2258).
+func (vi *vrrpInstance) reresolveLocalAddrs() {
+	vipSet := vi.vipAddrSet()
+	vi.setLocalIP(vi.resolveLocalIPv4(vipSet))
+	vi.setLocalIPv6(vi.resolveIPv6LinkLocal(vipSet))
+}
+
 // openSocket creates the per-instance raw socket bound to the interface.
 func (vi *vrrpInstance) openSocket() error {
 	isVLAN := strings.Contains(vi.cfg.Interface, ".")
@@ -219,33 +313,22 @@ func (vi *vrrpInstance) openSocket() error {
 	// We must skip VIP addresses because during split-brain both nodes
 	// have the VIP — using it as source would cause the peer to filter
 	// our adverts as "self-sent" (matching its own VIP).
-	vipSet := make(map[string]bool, len(vi.cfg.VirtualAddresses))
 	hasIPv6VIPs := false
 	for _, vip := range vi.cfg.VirtualAddresses {
 		addr := vip
 		if idx := strings.Index(addr, "/"); idx >= 0 {
 			addr = addr[:idx]
 		}
-		vipSet[addr] = true
 		if ip := net.ParseIP(addr); ip != nil && ip.To4() == nil {
 			hasIPv6VIPs = true
 		}
 	}
-	addrs, _ := vi.iface.Addrs()
-	for _, a := range addrs {
-		ipNet, ok := a.(*net.IPNet)
-		if !ok {
-			continue
-		}
-		ip4 := ipNet.IP.To4()
-		if ip4 != nil && !vipSet[ip4.String()] {
-			vi.setLocalIP(ip4)
-		}
-	}
-	// Deterministic IPv6 link-local selection: sort candidates and
-	// pick the lowest address. This ensures the same source address
-	// is used even when the interface has multiple link-locals.
-	vi.setLocalIPv6(vi.resolveIPv6LinkLocal(vipSet))
+	// Resolve our IPv4 + (deterministic, lowest) link-local IPv6 advert
+	// source from the interface's current addresses. The manager addr-watcher
+	// re-runs reresolveLocalAddrs on every address change so a source flushed
+	// by the RETH MAC reprogram cycle is picked up rather than cached stale
+	// (#2528).
+	vi.reresolveLocalAddrs()
 
 	// Open IPv6 raw socket if any VIPs are IPv6.
 	if hasIPv6VIPs {
@@ -1165,28 +1248,14 @@ func (vi *vrrpInstance) sendPacket(pkt *VRRPPacket, isIPv6 bool) error {
 
 	srcIP := vi.getLocalIP()
 	if srcIP == nil {
-		// Lazy resolve: interface may not have had an address at socket open time.
-		// Skip VIPs — must send from primary/base address. The atomic
+		// Lazy resolve: the interface may not have had an address at socket
+		// open time, or the addr-watcher invalidated a flushed source (#2528).
+		// Skip VIPs — must send from the primary/base address. The atomic
 		// setLocalIP makes this run-loop write race-clean against the
 		// receiver-goroutine reads (#2258).
-		vipSet := make(map[string]bool, len(vi.cfg.VirtualAddresses))
-		for _, vip := range vi.cfg.VirtualAddresses {
-			addr := vip
-			if idx := strings.Index(addr, "/"); idx >= 0 {
-				addr = addr[:idx]
-			}
-			vipSet[addr] = true
-		}
-		if addrs, err := vi.iface.Addrs(); err == nil {
-			for _, a := range addrs {
-				if ipNet, ok := a.(*net.IPNet); ok && ipNet.IP.To4() != nil {
-					if !vipSet[ipNet.IP.To4().String()] {
-						srcIP = ipNet.IP.To4()
-						vi.setLocalIP(srcIP)
-						break
-					}
-				}
-			}
+		srcIP = vi.resolveLocalIPv4(vi.vipAddrSet())
+		if srcIP != nil {
+			vi.setLocalIP(srcIP)
 		}
 		if srcIP == nil {
 			return fmt.Errorf("no IPv4 address on %s", vi.cfg.Interface)
@@ -1239,15 +1308,7 @@ func (vi *vrrpInstance) sendPacketIPv6(pkt *VRRPPacket) error {
 		// link-local at openSocket() time (e.g. DAD still running). The
 		// atomic setLocalIPv6 makes this run-loop write race-clean against
 		// the receiver-goroutine reads (#2258).
-		vipSet := make(map[string]bool, len(vi.cfg.VirtualAddresses))
-		for _, vip := range vi.cfg.VirtualAddresses {
-			addr := vip
-			if idx := strings.Index(addr, "/"); idx >= 0 {
-				addr = addr[:idx]
-			}
-			vipSet[addr] = true
-		}
-		resolved := vi.resolveIPv6LinkLocal(vipSet)
+		resolved := vi.resolveIPv6LinkLocal(vi.vipAddrSet())
 		if resolved != nil {
 			vi.setLocalIPv6(resolved)
 			srcIP = resolved
@@ -1466,7 +1527,7 @@ func (vi *vrrpInstance) sendGARP(force bool) {
 // address is always chosen regardless of kernel enumeration order,
 // even when multiple link-locals exist (e.g. after MAC changes).
 func (vi *vrrpInstance) resolveIPv6LinkLocal(vipSet map[string]bool) net.IP {
-	addrs, err := vi.iface.Addrs()
+	addrs, err := vi.interfaceAddrs()
 	if err != nil {
 		return nil
 	}

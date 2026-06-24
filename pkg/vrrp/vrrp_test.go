@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/psaab/xpf/pkg/config"
+	"github.com/vishvananda/netlink"
 )
 
 // --- Collection tests ---
@@ -589,6 +590,12 @@ func TestUpdateInstances_PreservesSyncHoldForExistingInstances(t *testing.T) {
 	// assertion.
 	m.resolveIface = func(name string) (*net.Interface, error) {
 		return &net.Interface{Name: name, Index: 0}, nil
+	}
+	// Fail the #2528 addr-watcher subscribe so runAddrWatcher returns
+	// immediately instead of leaking a goroutine (this test never Stops the
+	// manager). The address watcher is irrelevant to the sync-hold assertion.
+	m.subscribeAddrs = func(ch chan<- netlink.AddrUpdate, done <-chan struct{}) error {
+		return errAddrSubscribeDisabled
 	}
 
 	vi := newInstance(Instance{
@@ -1291,8 +1298,8 @@ func buildEthFrame(t *testing.T, vlanID int, srcIP, dstIP net.IP, vrrpPkt *VRRPP
 	totalLen := 20 + len(vrrpData)
 	ipHdr[2] = byte(totalLen >> 8)
 	ipHdr[3] = byte(totalLen)
-	ipHdr[8] = 255      // TTL
-	ipHdr[9] = 112      // protocol = VRRP
+	ipHdr[8] = 255 // TTL
+	ipHdr[9] = 112 // protocol = VRRP
 	copy(ipHdr[12:16], srcIP.To4())
 	copy(ipHdr[16:20], dstIP.To4())
 
@@ -1309,9 +1316,9 @@ func buildEthFrame(t *testing.T, vlanID int, srcIP, dstIP net.IP, vrrpPkt *VRRPP
 
 	if vlanID > 0 {
 		// 802.1Q: ethertype 0x8100 + VLAN tag (2 bytes) + real ethertype 0x0800
-		frame = append(frame, 0x81, 0x00)                       // TPID
-		frame = append(frame, byte(vlanID>>8), byte(vlanID))     // TCI (PCP=0, DEI=0, VID)
-		frame = append(frame, 0x08, 0x00)                        // real ethertype
+		frame = append(frame, 0x81, 0x00)                    // TPID
+		frame = append(frame, byte(vlanID>>8), byte(vlanID)) // TCI (PCP=0, DEI=0, VID)
+		frame = append(frame, 0x08, 0x00)                    // real ethertype
 	} else {
 		frame = append(frame, 0x08, 0x00) // ethertype IPv4
 	}
@@ -1524,10 +1531,10 @@ func buildEthIPv6Frame(t *testing.T, vlanID int, srcIP, dstIP net.IP, vrrpPkt *V
 
 	// Build IPv6 header (40 bytes, no extension headers).
 	ip6Hdr := make([]byte, 40)
-	ip6Hdr[0] = 0x60                                          // version 6
+	ip6Hdr[0] = 0x60                                               // version 6
 	binary.BigEndian.PutUint16(ip6Hdr[4:6], uint16(len(vrrpData))) // payload length
-	ip6Hdr[6] = 112                                            // next header = VRRP
-	ip6Hdr[7] = 255                                            // hop limit
+	ip6Hdr[6] = 112                                                // next header = VRRP
+	ip6Hdr[7] = 255                                                // hop limit
 	copy(ip6Hdr[8:24], srcIP.To16())
 	copy(ip6Hdr[24:40], dstIP.To16())
 
@@ -2079,9 +2086,9 @@ func TestEmitEvent_DropSilentDuringShutdown(t *testing.T) {
 func TestSendPacketIPv6_NilLocalIPv6_ReturnsError(t *testing.T) {
 	eventCh := make(chan VRRPEvent, 16)
 	vi := newInstance(Instance{
-		Interface: "lo",
-		GroupID:   42,
-		Priority:  200,
+		Interface:        "lo",
+		GroupID:          42,
+		Priority:         200,
 		VirtualAddresses: []string{"2001:db8::1/128"},
 	}, &net.Interface{Name: "lo", Index: 1}, eventCh, nil)
 	// localIPv6 is nil and interface has no link-local → should error.
@@ -2110,9 +2117,9 @@ func TestSendPacketIPv6_NilLocalIPv6_ReturnsError(t *testing.T) {
 func TestSendPacketIPv6_WithLocalIPv6_SendsPacket(t *testing.T) {
 	eventCh := make(chan VRRPEvent, 16)
 	vi := newInstance(Instance{
-		Interface: "lo",
-		GroupID:   42,
-		Priority:  200,
+		Interface:        "lo",
+		GroupID:          42,
+		Priority:         200,
 		VirtualAddresses: []string{"2001:db8::1/128"},
 	}, &net.Interface{Name: "lo", Index: 1}, eventCh, nil)
 	vi.setLocalIPv6(net.ParseIP("fe80::1"))
