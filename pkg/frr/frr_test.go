@@ -467,6 +467,93 @@ func TestGenerateProtocols_BGPImportAndExport(t *testing.T) {
 	}
 }
 
+// TestGeneratePolicyOptions_MultiTermOnMatchNext proves a multi-term policy
+// whose early term is NON-TERMINATING (set clauses, no `then accept`/`reject`)
+// renders `on-match next` so FRR keeps evaluating the later terms (#2451).
+//
+// Junos evaluates terms sequentially and falls through a term that carries
+// only modifications; FRR otherwise stops at the first matching permit
+// sequence after running its set clauses, silently truncating the policy.
+//
+// Fail-on-revert: if the `on-match next` emission is removed, term 1 (community
+// set) becomes terminating in FRR and term 2 (local-preference + accept) never
+// runs — the "both terms apply" assertion below fails.
+func TestGeneratePolicyOptions_MultiTermOnMatchNext(t *testing.T) {
+	m := New()
+	po := &config.PolicyOptionsConfig{
+		PolicyStatements: map[string]*config.PolicyStatement{
+			"MULTI": {
+				Name: "MULTI",
+				Terms: []*config.PolicyTerm{
+					// Term 1: set community, NO accept → non-terminating,
+					// must emit on-match next.
+					{Name: "t1", Community: "65000:100"},
+					// Term 2: set local-preference + accept → terminating
+					// permit, NO on-match next.
+					{Name: "t2", LocalPreference: 200, Action: "accept"},
+				},
+				DefaultAction: "reject",
+			},
+		},
+	}
+	got := m.generatePolicyOptions(po)
+
+	// Both set clauses must render.
+	if !strings.Contains(got, " set community 65000:100\n") {
+		t.Errorf("term 1 community set missing, got:\n%s", got)
+	}
+	if !strings.Contains(got, " set local-preference 200\n") {
+		t.Errorf("term 2 local-preference set missing, got:\n%s", got)
+	}
+
+	// Term 1 (non-terminating) MUST carry on-match next so FRR falls through
+	// to term 2 — without it both set clauses do not both apply.
+	idxComm := strings.Index(got, " set community 65000:100\n")
+	idxLP := strings.Index(got, " set local-preference 200\n")
+	idxOMN := strings.Index(got, " on-match next\n")
+	if idxOMN < 0 {
+		t.Fatalf("term 1 must emit on-match next so both terms apply, got:\n%s", got)
+	}
+	// on-match next belongs to term 1: it appears after term 1's set and
+	// before term 2's set (the sequences render in term order).
+	if !(idxComm < idxOMN && idxOMN < idxLP) {
+		t.Errorf("on-match next must sit between term 1 (community) and term 2 (local-preference) so the non-terminating term 1 falls through; comm=%d omn=%d lp=%d, got:\n%s",
+			idxComm, idxOMN, idxLP, got)
+	}
+
+	// Regression guard: the terminating accept term (term 2) must NOT get its
+	// own on-match next — exactly one on-match next in this policy.
+	if n := strings.Count(got, " on-match next\n"); n != 1 {
+		t.Errorf("expected exactly one on-match next (term 1 only), got %d:\n%s", n, got)
+	}
+}
+
+// TestGeneratePolicyOptions_TerminatingTermNoOnMatchNext proves a terminating
+// term (then accept) does NOT get on-match next — FRR stops, matching Junos
+// accept semantics (#2451 regression guard). A single-term accept policy is
+// unchanged from pre-#2451 output.
+func TestGeneratePolicyOptions_TerminatingTermNoOnMatchNext(t *testing.T) {
+	m := New()
+	po := &config.PolicyOptionsConfig{
+		PolicyStatements: map[string]*config.PolicyStatement{
+			"ACCEPT-ONE": {
+				Name: "ACCEPT-ONE",
+				Terms: []*config.PolicyTerm{
+					{Name: "t1", LocalPreference: 150, Action: "accept"},
+				},
+				DefaultAction: "reject",
+			},
+		},
+	}
+	got := m.generatePolicyOptions(po)
+	if !strings.Contains(got, " set local-preference 150\n") {
+		t.Errorf("accept term set clause missing, got:\n%s", got)
+	}
+	if strings.Contains(got, "on-match next") {
+		t.Errorf("terminating accept term must NOT emit on-match next, got:\n%s", got)
+	}
+}
+
 // TestGenerateProtocols_BGPImportMostSpecificWins proves Junos most-specific-
 // wins: a per-neighbor import overrides the inherited group import, and FRR
 // gets exactly ONE `route-map in`. The compiler appends the per-neighbor

@@ -841,6 +841,34 @@ func (m *Manager) generatePolicyOptions(po *config.PolicyOptionsConfig) string {
 			}
 			fmt.Fprintf(&b, "route-map %s %s %d\n", name, action, seq)
 
+			// Junos evaluates a policy's terms sequentially and a term that
+			// carries NO terminating action (no `then accept`/`then reject`,
+			// i.e. term.Action == "") APPLIES its modifications and FALLS
+			// THROUGH to the next term. FRR, by contrast, stops a route-map
+			// after the first sequence whose match clauses pass and that is a
+			// `permit` — once the `set` clauses run the route-map evaluation
+			// ends. Without an explicit continuation a Junos policy whose early
+			// terms do non-terminating set work (community add, local-preference,
+			// ...) and rely on a later term to accept/reject is silently
+			// TRUNCATED — the later terms never execute (#2451).
+			//
+			// FRR's `on-match next` makes a permit sequence run its `set`
+			// clauses and then CONTINUE evaluating the following sequences,
+			// which is exactly Junos fall-through. We emit it for every
+			// non-terminating term (rendered as `permit` above). A terminating
+			// term — `then accept` (permit, stop) or `then reject` (deny, stop)
+			// — must NOT get `on-match next`, so its FRR semantics match Junos
+			// terminating semantics. The `on-match next` line is written after
+			// the term's match/set clauses, immediately before `exit`, below.
+			//
+			// `on-match next` only fires on a MATCHED sequence: if a term's
+			// match clauses fail, FRR moves to the next sequence regardless, so
+			// emitting it on a non-terminating term never changes the behavior
+			// of a non-matching term. Falling off the end of all terms still
+			// hits the policy's default-action sequence (emitted after this
+			// loop), preserving the overall default behavior.
+			nonTerminating := term.Action != "accept" && term.Action != "reject"
+
 			// Generate an inline prefix-list for route-filters
 			if len(term.RouteFilters) > 0 {
 				plName := name + "-" + term.Name
@@ -1207,6 +1235,12 @@ func (m *Manager) generatePolicyOptions(po *config.PolicyOptionsConfig) string {
 			}
 			if term.Origin != "" {
 				fmt.Fprintf(&b, " set origin %s\n", term.Origin)
+			}
+
+			// Non-terminating term: fall through to the next sequence after
+			// running this term's set clauses (Junos fall-through; #2451).
+			if nonTerminating {
+				b.WriteString(" on-match next\n")
 			}
 
 			b.WriteString("exit\n")
