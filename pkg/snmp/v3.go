@@ -196,12 +196,12 @@ func (a *Agent) handleV3Packet(msgBody []byte) []byte {
 		slog.Debug("SNMPv3: failed to decode engineID")
 		return nil
 	}
-	_, usmRest, err = berDecodeInteger(usmRest) // engineBoots
+	reqBoots, usmRest, err := berDecodeInteger(usmRest) // engineBoots
 	if err != nil {
 		slog.Debug("SNMPv3: failed to decode engineBoots")
 		return nil
 	}
-	_, usmRest, err = berDecodeInteger(usmRest) // engineTime
+	reqTime, usmRest, err := berDecodeInteger(usmRest) // engineTime
 	if err != nil {
 		slog.Debug("SNMPv3: failed to decode engineTime")
 		return nil
@@ -246,6 +246,20 @@ func (a *Agent) handleV3Packet(msgBody []byte) []byte {
 		if !a.verifyAuth(user, authParams) {
 			slog.Debug("SNMPv3: authentication failed", "user", userName)
 			return nil
+		}
+
+		// USM timeliness window (RFC 3414 §3.2). Authentication proves the
+		// sender holds the key; the time window proves the message is fresh.
+		// Without it an on-path attacker can replay a captured authenticated
+		// PDU. As the authoritative engine we check the request's boots/time
+		// against our own clock and reply with usmStatsNotInTimeWindows on a
+		// stale/future/wrong-boots request, which also lets a manager whose
+		// cached boots/time drifted (e.g. across our restart) resynchronize.
+		if !a.checkTimeliness(reqBoots, reqTime) {
+			slog.Debug("SNMPv3: not in time window",
+				"user", userName, "req_boots", reqBoots, "req_time", reqTime,
+				"our_boots", a.engineBoots, "our_time", a.engineTime())
+			return a.buildV3TimelinessReport(msgID, msgFlags, user)
 		}
 	}
 
@@ -770,6 +784,79 @@ func (a *Agent) buildV3Discovery(msgID int) []byte {
 	msgBody = append(msgBody, usmOctet...)
 	msgBody = append(msgBody, scopedPDU...)
 	return berEncodeTLV(tagSequence, msgBody)
+}
+
+// usmStatsNotInTimeWindows is the RFC 3414 §3.2 / §5 report OID
+// (1.3.6.1.6.3.15.1.1.2.0) the authoritative engine returns when an
+// authenticated request falls outside the timeliness window.
+var usmStatsNotInTimeWindows = []int{1, 3, 6, 1, 6, 3, 15, 1, 1, 2, 0}
+
+// buildV3TimelinessReport builds an authenticated Report PDU carrying
+// usmStatsNotInTimeWindows and the agent's CURRENT engineBoots/engineTime, so a
+// manager whose cached authoritative boots/time is stale (the legitimate
+// not-in-time-window case, e.g. after our restart bumped engineBoots) can
+// resynchronize and retry. The report is authenticated (RFC 3414 §3.2 requires
+// the not-in-time-window report be sent at the request's security level) but
+// never encrypted — it carries no MIB data. A replayed request gets this report
+// instead of a data response, so the replay yields nothing useful.
+func (a *Agent) buildV3TimelinessReport(msgID int, reqFlags byte, user *usmUser) []byte {
+	reportPDU := a.buildReportPDU(usmStatsNotInTimeWindows)
+
+	scopedBody := berEncodeTLV(tagOctetString, a.engineID)
+	scopedBody = append(scopedBody, berEncodeTLV(tagOctetString, nil)...) // contextName
+	scopedBody = append(scopedBody, reportPDU...)
+	scopedPDU := berEncodeTLV(tagSequence, scopedBody)
+
+	// Reports are sent authNoPriv (no encryption) regardless of the request's
+	// priv flag — they carry no sensitive MIB data.
+	respFlags := reqFlags & msgFlagAuth
+
+	truncLen := authTruncLen(user.authProto)
+	var authPlaceholder []byte
+	if respFlags&msgFlagAuth != 0 && user.authKey != nil {
+		authPlaceholder = make([]byte, truncLen)
+	}
+
+	usmFields := berEncodeTLV(tagOctetString, a.engineID)
+	usmFields = append(usmFields, berEncodeIntegerTLV(a.engineBoots)...)
+	usmFields = append(usmFields, berEncodeIntegerTLV(a.engineTime())...)
+	usmFields = append(usmFields, berEncodeTLV(tagOctetString, []byte(user.name))...)
+	usmFields = append(usmFields, berEncodeTLV(tagOctetString, authPlaceholder)...)
+	usmFields = append(usmFields, berEncodeTLV(tagOctetString, nil)...) // privParams
+	usmOctet := berEncodeTLV(tagOctetString, berEncodeTLV(tagSequence, usmFields))
+
+	hdr := berEncodeIntegerTLV(msgID)
+	hdr = append(hdr, berEncodeIntegerTLV(maxPacketSize)...)
+	hdr = append(hdr, berEncodeTLV(tagOctetString, []byte{respFlags | msgFlagReport})...)
+	hdr = append(hdr, berEncodeIntegerTLV(usmSecurityModel)...)
+	hdrSeq := berEncodeTLV(tagSequence, hdr)
+
+	msgBody := berEncodeIntegerTLV(snmpVersion3)
+	msgBody = append(msgBody, hdrSeq...)
+	msgBody = append(msgBody, usmOctet...)
+	msgBody = append(msgBody, scopedPDU...)
+	wholeMsg := berEncodeTLV(tagSequence, msgBody)
+
+	if respFlags&msgFlagAuth != 0 && user.authKey != nil {
+		if authMAC := computeAuth(user, wholeMsg); authMAC != nil {
+			insertAuthMAC(wholeMsg, authMAC, truncLen)
+		}
+	}
+	return wholeMsg
+}
+
+// buildReportPDU encodes a Report PDU (tag 0xa8) with a single varbind whose
+// OID is the supplied usmStats counter and whose value is Counter32(0). The
+// varbind value is informational — the OID identifies the error to the manager.
+func (a *Agent) buildReportPDU(statsOID []int) []byte {
+	vb := berEncodeTLV(tagObjectIdentifier, berEncodeOID(statsOID))
+	vb = append(vb, berEncodeTLV(tagCounter32, berEncodeCounter32(0))...)
+	vbList := berEncodeTLV(tagSequence, berEncodeTLV(tagSequence, vb))
+	pduBody := berEncodeIntegerTLV(0) // request-id
+	pduBody = append(pduBody, berEncodeIntegerTLV(0)...)
+	pduBody = append(pduBody, berEncodeIntegerTLV(0)...)
+	pduBody = append(pduBody, vbList...)
+	return berEncodeTLV(0xa8, pduBody) // Report PDU tag
 }
 
 // buildV3Response builds an authenticated (and optionally encrypted) SNMPv3 response.
