@@ -294,8 +294,10 @@ fn policy_action_to_rt_flow(action: PolicyAction) -> u8 {
         // #2089: the policy-deny path now synthesizes a TCP RST / ICMP
         // unreachable for `reject` (poll_descriptor reject_reply), so the
         // RT_FLOW action reports reject, matching the wire behavior and
-        // Junos. (Filter reject — filter_action_to_rt_flow below — is
-        // still a silent drop and stays mapped to deny.)
+        // Junos. (#2521: filter reject — filter_action_to_rt_flow below —
+        // now ALSO synthesizes an active reject reply (RST/ICMP) and maps
+        // to RT_FLOW_ACTION_REJECT, same as policy reject; filter DISCARD
+        // remains the silent-drop → deny case.)
         PolicyAction::Reject => RT_FLOW_ACTION_REJECT,
     }
 }
