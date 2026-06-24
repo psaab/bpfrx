@@ -866,6 +866,34 @@ func TestEventStreamSessionCloseRTFlowRoutesToRawCallback(t *testing.T) {
 	if got := es.SessionCloseEvents.Load(); got != 1 {
 		t.Fatalf("SessionCloseEvents = %d, want 1", got)
 	}
+
+	// #2510: the public Status() DTO must surface the close counter so
+	// operators can observe session-close RT_FLOW volume via CLI/REST/
+	// gRPC/Prometheus. Fails on master, where Status() omitted it.
+	if st := es.Status(); st.SessionCloseEvents != 1 {
+		t.Fatalf("Status().SessionCloseEvents = %d, want 1", st.SessionCloseEvents)
+	}
+}
+
+// TestEventStreamSessionCloseDropSurfacedInStatus proves #2510: a dropped
+// session-close frame increments SessionCloseDrops AND that drop is visible
+// through the public Status() DTO. On master Status() omitted the close
+// drop counter, so this assertion fails.
+func TestEventStreamSessionCloseDropSurfacedInStatus(t *testing.T) {
+	es := NewEventStream("")
+	es.recordDataplaneEventDrop(EventFrameTypeSessionClose)
+	es.recordDataplaneEventDrop(EventFrameTypeSessionCreate)
+
+	if got := es.SessionCloseDrops.Load(); got != 1 {
+		t.Fatalf("SessionCloseDrops = %d, want 1", got)
+	}
+	st := es.Status()
+	if st.SessionCloseDrops != 1 {
+		t.Fatalf("Status().SessionCloseDrops = %d, want 1", st.SessionCloseDrops)
+	}
+	if st.SessionCreateDrops != 1 {
+		t.Fatalf("Status().SessionCreateDrops = %d, want 1", st.SessionCreateDrops)
+	}
 }
 
 func TestEventStreamRawDataplaneEventsFeedSyslogFanout(t *testing.T) {
