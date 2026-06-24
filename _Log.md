@@ -1,5 +1,24 @@
 # Action Log
 
+## 2026-06-24 — #2643 fix: FRR community-lists with regex members render `expanded`
+
+- **Timestamp**: 2026-06-24
+- **Action**: agy review-044 finding 044-02 (HIGH). `generatePolicyOptions`
+  always rendered named BGP community members as
+  `bgp community-list standard`. FRR standard community-lists reject
+  regex/wildcard members (`65000:*`, `.*`) at config load, failing the
+  whole `frr-reload` of the managed section. FIX: detect regex
+  metacharacters (`communityMemberIsRegex`, chars `* . + ? ^ $ [ ] ( ) | \`)
+  per member; if ANY member of a definition is regex, render the WHOLE
+  definition as `bgp community-list expanded <name>` (FRR forbids the same
+  name being both standard and expanded). Literal-only definitions stay
+  `standard`. Added render test (standard/expanded/mixed +
+  fail-on-revert: no regex on a standard line, no name as both kinds).
+- **File(s)**: pkg/frr/policy_render.go, pkg/frr/frr_test.go,
+  pkg/frr/README.md, _Log.md
+- **Validation**: `go test ./pkg/frr/...` green; gofmt clean; go vet clean;
+  fail-on-revert proven (force-standard → FRR-invalid assertions fire).
+
 ## 2026-06-24 — #2624 fix: MQFQ V_min cadence persists across drain calls
 
 - **Timestamp**: 2026-06-24

@@ -251,6 +251,29 @@ move or rename the markers — they're literal strings.
   warned to add a `from protocol <proto>` (or use a bare protocol token).
   This is the load-bearing invariant: a single unresolvable export can never
   poison the entire managed-section reload.
+- **Community-lists: `standard` vs `expanded` is per-DEFINITION (#2643).**
+  An FRR `standard` community-list accepts ONLY literal community values
+  (`ASN:VALUE`, or a well-known name such as `no-export` /
+  `no-advertise` / `internet` / `local-AS`); it REJECTS any POSIX-regex /
+  wildcard member (`65000:*`, `.*`, `65001:1..`) at config load, and a
+  single rejected line fails the whole `frr-reload` of the managed
+  section, leaving the routing daemon stale/unconfigured for the entire
+  commit. An `expanded` community-list accepts a POSIX regex per member.
+  `generatePolicyOptions` therefore inspects every member of a named
+  community definition: a member containing any of
+  `* . + ? ^ $ [ ] ( ) | \` (`communityMemberIsRegex`) is regex; a plain
+  `digits:digits` or well-known name is literal. If ANY member is regex,
+  the WHOLE definition renders as `bgp community-list expanded <name> …`;
+  otherwise it stays `bgp community-list standard <name> …`. FRR forbids
+  the same list NAME from being declared both standard and expanded, so a
+  MIXED literal+regex definition CANNOT be split across the two kinds —
+  it is rendered entirely as `expanded` (a literal like `65000:100` is a
+  valid regex that matches itself, so it is safe in an expanded list).
+  Members are written as-is (the wildcard `65000:*` becomes the FRR regex
+  verbatim, matching Junos intent); FRR matches community regexes
+  unanchored, which is the desired wildcard behavior. This is the same
+  fail-closed-the-whole-reload class as the route-filter `ge`/`le`
+  bounds above (#1880).
 - `vtysh -c` is run synchronously in batch mode for state queries. There
   is no streaming; long output is buffered.
 - All `vtysh` and `frr-reload.py` shell-outs route through the
