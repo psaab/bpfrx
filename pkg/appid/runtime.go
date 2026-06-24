@@ -151,8 +151,16 @@ func matchTuple(proto uint8, dstPort uint16, appProto, appPort string) bool {
 	if pn, ok := protocolNumber(appProto); !ok || pn != proto {
 		return false
 	}
+	// #2548: a custom application configured with a protocol but no
+	// destination-port is PROTOCOL-ONLY (e.g. user-defined GRE/ESP/AH). The
+	// protocol match above is the whole constraint, so it matches here instead
+	// of being rejected — previously this returned false, so a protocol-only
+	// app could never tuple-match and its sessions reported UNKNOWN. The
+	// appProto=="" guard above still rejects an unconstrained app from
+	// match-all; a port-only/port-ranged app (appPort != "") below still
+	// requires BOTH the protocol and the port to match (unchanged).
 	if appPort == "" {
-		return false
+		return true
 	}
 	if strings.Contains(appPort, "-") {
 		parts := strings.SplitN(appPort, "-", 2)

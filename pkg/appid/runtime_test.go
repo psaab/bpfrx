@@ -159,6 +159,76 @@ func TestResolveSessionNameFallbackWhenDisabled(t *testing.T) {
 	}
 }
 
+// TestMatchTupleProtocolOnly is the #2548 fail-on-revert guard. A custom app
+// configured with a protocol but NO destination-port (e.g. user-defined
+// GRE/ESP/AH) must tuple-match on protocol alone. Before the fix, matchTuple
+// returned false on appPort=="", so the protocol-only app never matched and
+// its sessions reported UNKNOWN. Reverting the empty-appPort short-circuit to
+// `return false` fails the protocol-only-matches assertion below.
+func TestMatchTupleProtocolOnly(t *testing.T) {
+	const greProto = 47
+
+	// Protocol-only app matches a session of its protocol regardless of port.
+	if !matchTuple(greProto, 0, "gre", "") {
+		t.Error("protocol-only GRE app must match a GRE session (proto match alone) — got no match")
+	}
+	if !matchTuple(greProto, 1234, "gre", "") {
+		t.Error("protocol-only GRE app must match regardless of dstPort — got no match")
+	}
+	// Protocol-only app does NOT match a different protocol.
+	if matchTuple(6 /*tcp*/, 0, "gre", "") {
+		t.Error("protocol-only GRE app must NOT match a TCP session")
+	}
+	// Numeric protocol token, protocol-only.
+	if !matchTuple(greProto, 0, "47", "") {
+		t.Error("protocol-only numeric-protocol app must match its protocol")
+	}
+	// Port-based app still requires BOTH protocol AND port — no regression.
+	if !matchTuple(6, 8443, "tcp", "8443") {
+		t.Error("port-based app must match on protocol+port")
+	}
+	if matchTuple(6, 9999, "tcp", "8443") {
+		t.Error("port-based app must NOT match on protocol-match/port-mismatch")
+	}
+	if matchTuple(17 /*udp*/, 8443, "tcp", "8443") {
+		t.Error("port-based app must NOT match on port-match/protocol-mismatch")
+	}
+	// Port-range app unchanged.
+	if !matchTuple(6, 8444, "tcp", "8443-8445") {
+		t.Error("port-range app must match a dstPort inside the range")
+	}
+	if matchTuple(6, 8500, "tcp", "8443-8445") {
+		t.Error("port-range app must NOT match a dstPort outside the range")
+	}
+	// Empty appProto must NOT match-all.
+	if matchTuple(47, 0, "", "") {
+		t.Error("app with empty protocol must NOT match-all")
+	}
+}
+
+// TestResolveSessionNameProtocolOnlyApp proves the protocol-only fix flows
+// through resolveTupleFallback so the session reports the configured app name
+// rather than UNKNOWN. (#2548)
+func TestResolveSessionNameProtocolOnlyApp(t *testing.T) {
+	cfg := &config.Config{
+		Applications: config.ApplicationsConfig{
+			Applications: map[string]*config.Application{
+				"custom-gre": {Name: "custom-gre", Protocol: "gre"},
+			},
+		},
+	}
+
+	// AppID disabled → tuple fallback. A GRE session (proto 47) names the app.
+	got := ResolveSessionName(nil, cfg, 47, 0, 0)
+	if got != "custom-gre" {
+		t.Fatalf("ResolveSessionName(GRE) = %q, want custom-gre (protocol-only app)", got)
+	}
+	// A non-GRE session must not pick up the protocol-only GRE app.
+	if got := ResolveSessionName(nil, cfg, 6, 80, 0); got == "custom-gre" {
+		t.Fatalf("ResolveSessionName(TCP/80) = %q, must not match protocol-only GRE app", got)
+	}
+}
+
 func TestSessionMatchesUnknown(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Services.ApplicationIdentification = true
