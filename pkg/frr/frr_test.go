@@ -67,6 +67,44 @@ func TestGenerateStaticRoute_Preference(t *testing.T) {
 	}
 }
 
+// TestGenerateStaticRoute_LinkLocalInferredScope proves the #2452 fix end to
+// end at the renderer: an unqualified link-local next-hop whose interface was
+// resolved by inference (passed via ipv6NextHopInterfaces) renders WITH the
+// interface scope, which FRR requires for link-local statics. Fail-on-revert:
+// if inference returns "" (no synthetic fe80::/64 candidate), the map lookup
+// yields no interface and FRR gets a scopeless `ipv6 route ::/0 fe80::1`.
+func TestGenerateStaticRoute_LinkLocalInferredScope(t *testing.T) {
+	m := New()
+	sr := &config.StaticRoute{
+		Destination: "::/0",
+		NextHops:    []config.NextHopEntry{{Address: "fe80::1"}},
+	}
+	nhIfaces := map[string]map[string]string{"": {"fe80::1": "ge-0-0-3.50"}}
+	got := m.generateStaticRoute(sr, "", nil, nhIfaces)
+	want := "ipv6 route ::/0 fe80::1 ge-0-0-3.50\n"
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+// TestGenerateStaticRoute_LinkLocalExplicitQualifier confirms an explicit
+// interface qualifier on the next-hop renders directly (operator
+// disambiguated) regardless of the inference map.
+func TestGenerateStaticRoute_LinkLocalExplicitQualifier(t *testing.T) {
+	m := New()
+	sr := &config.StaticRoute{
+		Destination: "::/0",
+		NextHops:    []config.NextHopEntry{{Address: "fe80::1", Interface: "ge-0-0-4.0"}},
+	}
+	// Even with a (wrong) inference entry, the explicit qualifier wins.
+	nhIfaces := map[string]map[string]string{"": {"fe80::1": "ge-0-0-3.50"}}
+	got := m.generateStaticRoute(sr, "", nil, nhIfaces)
+	want := "ipv6 route ::/0 fe80::1 ge-0-0-4\n"
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
 func TestGenerateStaticRoute_VRF(t *testing.T) {
 	m := New()
 	sr := &config.StaticRoute{

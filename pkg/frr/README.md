@@ -77,7 +77,32 @@ move or rename the markers — they're literal strings.
   `Name` keep the historical `vrf-<name>` rendering.
 - IPv6 next-hops without an explicit interface require `IPv6NextHopInterfaces`
   for link-local resolution — link-local addresses alone are ambiguous to
-  FRR.
+  FRR. The map is built by `inferIPv6StaticNextHopInterfaces`
+  (`pkg/daemon/daemon_run.go`); `generateStaticRoute` uses an explicit
+  `NextHopEntry.Interface` first and falls back to this map only for an
+  unqualified next-hop.
+- **Link-local (`fe80::/64`) static next-hops (#2452).** A link-local
+  next-hop is interface-scoped and FRR rejects `ipv6 route <dst> fe80::x`
+  without a trailing `<iface>`. Link-local addresses are never declared
+  under `unit.Addresses` (the kernel auto-assigns them), so
+  `inferIPv6StaticNextHopInterfaces` adds a synthetic `fe80::/64` candidate
+  per IPv6-capable logical interface. Disambiguation rule for an
+  **unqualified** link-local next-hop: (1) if the operator wrote
+  `qualified-next-hop fe80::x interface <if>` / `next-hop fe80::x interface
+  <if>` the explicit interface is used directly and inference is skipped;
+  (2) otherwise it resolves only when exactly ONE IPv6-capable interface is
+  in scope (the single defensible answer); (3) with multiple IPv6
+  interfaces and no qualifier the next-hop is genuinely ambiguous — the
+  inference refuses to guess (leaves it unresolved) rather than route to the
+  wrong link, and the operator must add an interface qualifier.
+- **VRRP-VIP-only subnets (#2452 secondary).** A bondless-RETH member that
+  carries only a VRRP virtual address (no matching `unit.Addresses` entry)
+  also contributes its VIP subnet as a connected prefix, so a static
+  next-hop inside the VIP subnet resolves to that member interface. The VIP
+  is read from `VRRPGroup.VirtualAddresses` (the `unit.VRRPGroups` map
+  VALUE, a CIDR string — the same field `pkg/vrrp` feeds to
+  `netlink.ParseAddr`); the map KEY is `"<CIDR>_grp<id>"`
+  (`compiler_interfaces.go`) and is deliberately NOT parsed as an address.
 - In cluster mode the package emits a blackhole default at admin distance
   250 so traffic to the active fabric peer survives a brief
   active/active overlap.
