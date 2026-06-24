@@ -515,6 +515,19 @@ type compileOpts struct {
 	// actuating off a dead measurement). Same doctrine as
 	// lenientRPMScopedHostname.
 	lenientRPMLinkLocalZone bool
+	// lenientRPMHTTPGetScheme (#2495) downgrades the http-get target
+	// scheme gate (validateRPMHTTPGetSchemeStrict) from a hard compile
+	// error to a cfg.Warnings entry. An http-get target that carries a
+	// scheme other than http/https (ftp://, gopher://, …) makes
+	// http.NewRequestWithContext error before a packet is sent, so the
+	// probe never runs and publishes a permanent FAIL into event-options
+	// / ip-monitoring failover. Strict on commit / commit-check (hard
+	// reject so the bad scheme is operator-visible); lenient on load /
+	// peer-sync (warn — #1960 no-brick; the runtime canonicalizeHTTPTarget
+	// guard returns the same error for the bad scheme, so the
+	// leniently-loaded test HOLDS state rather than actuating off a probe
+	// that can never run). Same doctrine as lenientRPMLinkLocalZone.
+	lenientRPMHTTPGetScheme bool
 }
 
 // CompileConfig converts a parsed ConfigTree AST into a typed Config struct.
@@ -567,6 +580,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientRPMSourceAddress:            true,
 		lenientRPMScopedHostname:           true,
 		lenientRPMLinkLocalZone:            true,
+		lenientRPMHTTPGetScheme:            true,
 	})
 }
 
@@ -670,6 +684,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientRPMSourceAddress:            true,
 		lenientRPMScopedHostname:           true,
 		lenientRPMLinkLocalZone:            true,
+		lenientRPMHTTPGetScheme:            true,
 	})
 }
 
@@ -1506,6 +1521,26 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		if opts.lenientRPMLinkLocalZone {
 			cfg.Warnings = append(cfg.Warnings,
 				fmt.Sprintf("rpm link-local zone (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
+	// #2495: http-get target scheme gate. An http-get target that carries
+	// a scheme other than http/https (ftp://, gopher://, …) makes
+	// http.NewRequestWithContext error before a packet is sent, so the
+	// probe never runs and publishes a permanent FAIL into event-options /
+	// ip-monitoring failover. A schemeless target (bare host / IP /
+	// host:port) is fine — the runtime prepends http://. Strict on commit /
+	// commit-check (hard reject so the bad scheme is operator-visible);
+	// lenient on load / peer-sync (warn — #1960; the runtime
+	// canonicalizeHTTPTarget guard returns the same error, so the
+	// leniently-loaded test HOLDS state instead of actuating off a probe
+	// that can never run).
+	if err := validateRPMHTTPGetSchemeStrict(cfg); err != nil {
+		if opts.lenientRPMHTTPGetScheme {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("rpm http-get scheme (downgraded to warning on tolerant path): %v", err))
 		} else {
 			return nil, err
 		}

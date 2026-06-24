@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"net"
+	"net/url"
 	"strconv"
 	"strings"
 )
@@ -228,6 +229,64 @@ func validateRPMLinkLocalZoneStrict(cfg *Config) error {
 						"with no scope — add an explicit %%zone (fe80::1%%ge-0/0/3) or a "+
 						"destination-interface so the probe can pick the egress link",
 					probe.Name, test.Name, test.Target)
+			}
+		}
+	}
+	return nil
+}
+
+// validateRPMHTTPGetSchemeStrict rejects an http-get RPM test whose
+// target carries an unsupported URL scheme (#2495). The runtime probe
+// canonicalizes a schemeless target (bare hostname / IP / host:port) by
+// prepending "http://", and accepts an explicit "http://" or "https://"
+// target as-is; any other scheme (ftp://, gopher://, …) is meaningless
+// for an http-get probe and makes http.NewRequestWithContext error
+// before a packet is sent — the probe never runs and publishes a
+// permanent FAIL into event-options / ip-monitoring failover. A scheme
+// is only present when the target contains the "://" separator; a bare
+// "host:port" (no "://") is NOT a scheme and is left for the runtime to
+// prefix with http://. Only the literal target is inspected (no DNS at
+// commit).
+//
+// Strict on commit / commit-check (hard reject so the operator sees the
+// bad scheme immediately); lenient on load / peer-sync (warn — #1960
+// no-brick; the runtime canonicalizeHTTPTarget guard returns the same
+// error for the bad scheme, so a leniently-loaded test HOLDS state
+// instead of actuating routes off a probe that can never run). Mirrors
+// validateRPMLinkLocalZoneStrict.
+func validateRPMHTTPGetSchemeStrict(cfg *Config) error {
+	if cfg == nil || cfg.Services.RPM == nil {
+		return nil
+	}
+	for _, probe := range cfg.Services.RPM.Probes {
+		if probe == nil {
+			continue
+		}
+		for _, test := range probe.Tests {
+			if test == nil || test.Target == "" {
+				continue
+			}
+			if test.EffectiveProbeType() != "http-get" {
+				continue
+			}
+			// A scheme is present only with the "://" separator; a bare
+			// host:port is schemeless (the runtime prepends http://).
+			if !strings.Contains(test.Target, "://") {
+				continue
+			}
+			u, err := url.Parse(test.Target)
+			if err != nil {
+				return fmt.Errorf("services rpm probe %q test %q: invalid http-get target URL %q: %w",
+					probe.Name, test.Name, test.Target, err)
+			}
+			switch u.Scheme {
+			case "http", "https":
+				// supported
+			default:
+				return fmt.Errorf(
+					"services rpm probe %q test %q: http-get target %q uses unsupported scheme %q "+
+						"(only http and https are valid for an http-get probe)",
+					probe.Name, test.Name, test.Target, u.Scheme)
 			}
 		}
 	}

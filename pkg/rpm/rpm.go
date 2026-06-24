@@ -8,7 +8,9 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"sort"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -657,15 +659,47 @@ func (m *Manager) probeTCP(ctx context.Context, test *config.RPMTest, opts probe
 	return rtt, nil
 }
 
-func (m *Manager) probeHTTP(ctx context.Context, test *config.RPMTest, opts probeSockOpts) (time.Duration, error) {
-	target := test.Target
+// canonicalizeHTTPTarget turns an http-get probe target into a fully
+// schemed URL suitable for http.NewRequestWithContext.
+//
+// A bare hostname, IP literal, or host:port (no "://" separator) gets
+// the default "http://" scheme prepended. This replaces the fragile
+// first-char heuristic (`url[0] != 'h'`) that decided whether a scheme
+// was already present by looking at the first byte: a bare hostname
+// starting with 'h' (host.example.com, h2.lan) was wrongly assumed to
+// be already-schemed, so no prefix was added and the schemeless URL was
+// rejected by http.NewRequestWithContext before any packet was sent —
+// a healthy h-host probe never ran (#2495). The "://" containment test
+// is the correct scheme detector: a bare "host:port" has no "://", so
+// it is treated as schemeless (url.Parse would otherwise mistake "host"
+// for a scheme).
+//
+// A target that already carries a scheme must be http or https; any
+// other scheme (ftp://, gopher://, …) is rejected, since only http and
+// https make sense for an http-get probe.
+func canonicalizeHTTPTarget(target string) (string, error) {
 	if target == "" {
-		return 0, fmt.Errorf("no target specified")
+		return "", fmt.Errorf("no target specified")
 	}
-	// If target doesn't look like a URL, make it one
-	url := target
-	if len(url) > 0 && url[0] != 'h' {
-		url = "http://" + target
+	if !strings.Contains(target, "://") {
+		return "http://" + target, nil
+	}
+	u, err := url.Parse(target)
+	if err != nil {
+		return "", fmt.Errorf("invalid http-get target URL %q: %w", target, err)
+	}
+	switch u.Scheme {
+	case "http", "https":
+		return target, nil
+	default:
+		return "", fmt.Errorf("unsupported http-get target scheme %q (want http or https): %q", u.Scheme, target)
+	}
+}
+
+func (m *Manager) probeHTTP(ctx context.Context, test *config.RPMTest, opts probeSockOpts) (time.Duration, error) {
+	url, err := canonicalizeHTTPTarget(test.Target)
+	if err != nil {
+		return 0, err
 	}
 
 	dialer, err := probeDialer(10*time.Second, test.SourceAddress, opts)

@@ -13013,3 +13013,18 @@ top.
   fail-on-revert test TestProbeICMPLinkLocalRoutingInstanceOnlyHeld.
   **File(s)**: pkg/rpm/icmp.go, pkg/rpm/icmp_linklocal_2494_test.go,
   _Log.md
+
+- **Timestamp**: 2026-06-24
+  **Action**: #2495 — replace http-get URL scheme first-char heuristic
+  (`url[0] != 'h'`) with proper scheme detection. Extracted
+  `canonicalizeHTTPTarget(target) (string, error)` in pkg/rpm: schemeless
+  targets (no `://`, incl. bare host:port and h-prefixed hosts) get
+  `http://` prepended; explicit http/https accepted; any other scheme
+  (ftp/gopher) rejected. Added commit-time `validateRPMHTTPGetSchemeStrict`
+  + `lenientRPMHTTPGetScheme` gate (strict reject / tolerant warn, #1960
+  doctrine) mirroring #2494. Tests prove fail-on-revert on h-prefixed bare
+  host. Doc note in docs/multi-wan.md.
+  **File(s)**: pkg/rpm/rpm.go, pkg/rpm/http_scheme_2495_test.go,
+  pkg/config/compiler.go, pkg/config/compiler_services.go,
+  pkg/config/compiler_rpm_http_scheme_2495_test.go, docs/multi-wan.md,
+  _Log.md
