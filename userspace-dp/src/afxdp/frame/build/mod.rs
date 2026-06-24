@@ -1,7 +1,7 @@
 //! Orchestrator for `build_forwarded_frame_into_from_frame`.
 //!
 //! Computes the L2 prelude (eth header write + payload memcpy +
-//! resolution of `apply_nat` / `tunnel_tcp_mss` / `force_tunnel_l4_recompute`)
+//! resolution of `apply_nat` / `selected_tcp_mss` / `force_tunnel_l4_recompute`)
 //! and dispatches to the address-family helper.
 //!
 //! Codegen contract (see docs/pr/1352-frame-build-rewrite-split/plan.md):
@@ -94,7 +94,7 @@ pub(in crate::afxdp) fn build_forwarded_frame_into_from_frame(
     // high and get the peer's full-MSS data dropped at the WG encap MTU
     // guard). Plain forwarded SYNs now clamp to `all-tcp`; GRE-decapped
     // ingress SYNs clamp to `gre-in` (was previously dead config).
-    let tunnel_tcp_mss = select_tcp_mss(forwarding, decision, &meta);
+    let selected_tcp_mss = select_tcp_mss(forwarding, decision, &meta);
     let ip_start = eth_len;
     match meta.addr_family as i32 {
         libc::AF_INET => build_forwarded_frame_into_ipv4(
@@ -104,7 +104,7 @@ pub(in crate::afxdp) fn build_forwarded_frame_into_from_frame(
             decision,
             apply_nat,
             expected_ports,
-            tunnel_tcp_mss,
+            selected_tcp_mss,
             force_tunnel_l4_recompute,
         )?,
         libc::AF_INET6 => build_forwarded_frame_into_ipv6(
@@ -114,7 +114,7 @@ pub(in crate::afxdp) fn build_forwarded_frame_into_from_frame(
             decision,
             apply_nat,
             expected_ports,
-            tunnel_tcp_mss,
+            selected_tcp_mss,
             force_tunnel_l4_recompute,
         )?,
         _ => return None,

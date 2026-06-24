@@ -9,6 +9,12 @@ pub(super) const FABRIC_INGRESS_FLAG: u8 = 0x80;
 /// unclamped — a silent full-MSS blackhole on the GRE return path.
 /// Distinct bit from `FABRIC_INGRESS_FLAG` (0x80) and the TTL-skip
 /// reuse of 0x80; 0x40 is otherwise unused in `meta_flags`.
+/// Note: the retired-eBPF header `bpf/headers/xpf_common.h` defines
+/// `META_FLAG_DNS_REPLY_FASTPATH = (1<<6) = 0x40` (the same numeric bit),
+/// but it is DEAD — never written by the AF_XDP shim and never reaches
+/// `UserspaceDpMeta.meta_flags` — so there is no runtime collision today;
+/// a future revival of that header bit must pick a different value or
+/// coordinate with this flag.
 pub(super) const GRE_DECAP_INGRESS_FLAG: u8 = 0x40;
 
 /// RFC 1812 §4.3.2.7 / RFC 792 / RFC 4443 §2.4 error-suppression gate

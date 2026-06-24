@@ -940,11 +940,13 @@ func compileFlow(node *Node, sec *SecurityConfig) error {
 		for _, opt := range mssNode.Children {
 			switch opt.Name() {
 			case "ipsec-vpn":
-				// #2486: rejected at commit by validateTCPMSSRanges (no
-				// IPsec context in the userspace forward path). In lenient
-				// load/peer-sync contexts the value is intentionally NOT
-				// assigned — it cannot be enforced, so it stays unset rather
-				// than becoming dead config.
+				// #2486: strict commit rejects this via
+				// validateTCPMSSRanges (no IPsec context in the userspace
+				// forward path). In lenient load/peer-sync contexts the
+				// value IS retained on the typed config below, so `show`
+				// output and config round-trip preserve it — but it is
+				// NEVER serialized to the dataplane wire (flow.go drops it)
+				// and NEVER enforced (no dataplane consumer reads it).
 				if v := parseMSSValue(opt); v > 0 {
 					sec.Flow.TCPMSSIPsecVPN = v
 				}

@@ -875,8 +875,10 @@ pub(super) fn tunnel_tcp_mss(
 }
 
 /// #2486: select the per-packet TCP MSS clamp value by forwarding
-/// context. All four Junos `security flow tcp-mss` contexts are resolved
-/// here at frame-build time so an accepted clamp is actually enforced
+/// context. The three enforceable `security flow tcp-mss` contexts
+/// (all-tcp, gre-in, gre-out/WG) are resolved here at frame-build time so
+/// an accepted clamp is actually enforced; `ipsec-vpn` is rejected at
+/// commit and never reaches this path
 /// (previously only tunnel egress clamped — `all-tcp` / `gre-in` were
 /// dead config and `gre-in` produced a silent full-MSS blackhole on the
 /// GRE return path).
