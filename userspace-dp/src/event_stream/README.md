@@ -15,13 +15,31 @@ periodic ACK from the daemon.
   `MSG_SESSION_UPDATE`, `MSG_ACK`, `MSG_PAUSE`, `MSG_RESUME`,
   `MSG_DRAIN_REQUEST`, `MSG_DRAIN_COMPLETE`, `MSG_FULL_RESYNC`,
   `MSG_KEEPALIVE` (1..10), plus RT_FLOW dataplane telemetry frames
-  `MSG_POLICY_DENY`, `MSG_SCREEN_DROP`, and `MSG_FILTER_LOG` (11..13).
+  `MSG_POLICY_DENY`, `MSG_SCREEN_DROP`, and `MSG_FILTER_LOG` (11..13),
+  and (#2460) `MSG_SESSION_CLOSE_RT_FLOW` (14).
   The telemetry frame payload is not a userspace-specific schema: it is
   the same 136-byte `dataplane.Event` layout consumed by the Go ringbuf
   logger, including AF values 2/10 and big-endian L4 ports. Userspace
   telemetry may also populate the non-session metadata slots used by
   the Go adapter for action, rule ID, term ID, reason, owner RG,
   ingress ifindex, and application ID.
+  `MSG_SESSION_CLOSE_RT_FLOW` (14) carries that same 136-byte payload
+  with the event-type byte set to RT_FLOW SESSION_CLOSE (2). It is
+  emitted once per session close (via `emit_session_close_rt_flow`,
+  paired 1:1 with — and ADDITIVE to — the unchanged minimal type-2
+  `MSG_SESSION_CLOSE` HA session-sync delta), and is what drives the Go
+  NetFlow v9 / IPFIX session-close exporters in userspace mode (they only
+  fire on a `Type == "SESSION_CLOSE"` record; before #2460 none was
+  produced). It carries the real 5-tuple, NAT tuple, zones, and protocol;
+  the byte/packet counters and the session-creation stamp are 0 pending the
+  per-session accounting follow-up #2501. The exporter-reported flow
+  duration is derived from the packet count today
+  (`estimateSessionDuration(SessionPkts)`), not the `created` stamp, so it
+  is 0 while the counters are 0. Unlike the deny/
+  screen/filter frames, the close frame is NOT rate-limited (a dropped
+  close loses one flow-export record; it is bounded by session churn, not
+  attacker-controlled), so it is sent with the lossy `try_send` path
+  directly rather than through the `producer.rs` rate limiter.
   `MSG_FILTER_LOG` intentionally reuses the RT_FLOW `reason` byte as
   a filter-log source discriminator (`pbr`, `input`, `output`,
   `cached-output`, or `lo0`). Close events still interpret that byte as

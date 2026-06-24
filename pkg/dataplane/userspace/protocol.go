@@ -2039,6 +2039,15 @@ const (
 	EventFrameTypePolicyDeny uint8 = 11 // helper → daemon (RT_FLOW policy deny)
 	EventFrameTypeScreenDrop uint8 = 12 // helper → daemon (RT_FLOW screen drop)
 	EventFrameTypeFilterLog  uint8 = 13 // helper → daemon (RT_FLOW filter log)
+	// #2460: RT_FLOW SESSION_CLOSE on the raw dataplane-event channel,
+	// carrying the canonical 136-byte dataplane.Event payload with the
+	// event-type byte = dataplane.EventTypeSessionClose (2). Routed through
+	// the same decodeDataplaneEventPayload → eventReader.ProcessRawEvent
+	// path as the deny/screen/filter frames so the NetFlow/IPFIX
+	// session-close exporters fire. ADDITIVE to the minimal type-2
+	// EventTypeSessionClose HA session-sync delta — both are produced per
+	// close; the HA sync path is unchanged.
+	EventFrameTypeSessionClose uint8 = 14 // helper → daemon (RT_FLOW session close)
 )
 
 // Session event flag bits in the Flags byte of SessionOpen/Update/Close payloads.

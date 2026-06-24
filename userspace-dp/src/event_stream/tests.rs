@@ -47,6 +47,119 @@ fn test_dataplane_event(kind: DataplaneEventKind, ingress_zone_id: u16) -> Datap
     }
 }
 
+// #2460: build a forward Close SessionDelta for the RT_FLOW close-emit
+// pairing tests.
+#[cfg(test)]
+fn test_close_delta(kind: crate::session::SessionDeltaKind) -> crate::session::SessionDelta {
+    use crate::afxdp::{ForwardingDisposition, ForwardingResolution};
+    use crate::nat::NatDecision;
+    use crate::session::{
+        SessionDecision, SessionDelta, SessionKey, SessionMetadata, SessionOrigin,
+    };
+    SessionDelta {
+        kind,
+        key: SessionKey {
+            addr_family: libc::AF_INET as u8,
+            protocol: 6,
+            src_ip: IpAddr::V4(Ipv4Addr::new(10, 0, 1, 102)),
+            dst_ip: IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+            src_port: 12345,
+            dst_port: 443,
+        },
+        decision: SessionDecision {
+            resolution: ForwardingResolution {
+                disposition: ForwardingDisposition::ForwardCandidate,
+                local_ifindex: 2,
+                egress_ifindex: 3,
+                tx_ifindex: 3,
+                tunnel_endpoint_id: 0,
+                next_hop: None,
+                neighbor_mac: None,
+                src_mac: None,
+                tx_vlan_id: 0,
+            },
+            nat: NatDecision {
+                rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
+                rewrite_dst: None,
+                rewrite_src_port: Some(40000),
+                rewrite_dst_port: None,
+                nat64: false,
+                nptv6: false,
+            },
+        },
+        metadata: SessionMetadata {
+            ingress_zone: 1,
+            egress_zone: 2,
+            owner_rg_id: 0,
+            fabric_ingress: false,
+            is_reverse: false,
+            nat64_reverse: None,
+        },
+        origin: SessionOrigin::ForwardFlow,
+        fabric_redirect_sync: false,
+    }
+}
+
+#[test]
+fn test_emit_session_close_rt_flow_pairs_with_ha_delta() {
+    // #2460 no-double-emit contract: a single close emits exactly ONE type-2
+    // HA session-sync close delta (push_delta, unchanged) AND exactly ONE
+    // type-14 RT_FLOW SESSION_CLOSE frame (emit_session_close_rt_flow). The
+    // two are a 1:1 pair — the RT_FLOW frame is additive, it does not
+    // duplicate or replace the HA delta.
+    let (handle, rx) = test_worker_handle(
+        8,
+        DataplaneEventRateLimitConfig {
+            events_per_second: 0,
+            burst: 0,
+        },
+    );
+    let zone_map = FxHashMap::default();
+    let delta = test_close_delta(crate::session::SessionDeltaKind::Close);
+
+    // Mirror flush_session_deltas: the HA delta then the RT_FLOW frame.
+    handle.push_delta(&delta, &zone_map);
+    handle.emit_session_close_rt_flow(&delta);
+
+    let frames: Vec<EventFrame> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+    assert_eq!(frames.len(), 2, "expected exactly one HA delta + one RT_FLOW frame");
+
+    let ha = frames.iter().filter(|f| f.data[4] == codec::MSG_SESSION_CLOSE).count();
+    let rt = frames
+        .iter()
+        .filter(|f| f.data[4] == codec::MSG_SESSION_CLOSE_RT_FLOW)
+        .count();
+    assert_eq!(ha, 1, "exactly one type-2 HA close delta");
+    assert_eq!(rt, 1, "exactly one type-14 RT_FLOW close frame");
+
+    // The RT_FLOW frame carries the SESSION_CLOSE event-type byte and tuple.
+    let rt_frame = frames
+        .iter()
+        .find(|f| f.data[4] == codec::MSG_SESSION_CLOSE_RT_FLOW)
+        .unwrap();
+    let p = &rt_frame.data[FRAME_HEADER_SIZE..rt_frame.len as usize];
+    assert_eq!(p[52], 2, "RT_FLOW event type must be SESSION_CLOSE (2)");
+    assert_eq!(&p[8..12], &[10, 0, 1, 102]);
+    assert_eq!(&p[24..28], &[172, 16, 80, 200]);
+}
+
+#[test]
+fn test_emit_session_close_rt_flow_ignores_open_delta() {
+    // #2460: the RT_FLOW close emit is gated on Close — calling it for an
+    // Open delta is a no-op (guards against a future caller misusing it and
+    // injecting a bogus SESSION_CLOSE for an opening session).
+    let (handle, rx) = test_worker_handle(
+        8,
+        DataplaneEventRateLimitConfig {
+            events_per_second: 0,
+            burst: 0,
+        },
+    );
+    let delta = test_close_delta(crate::session::SessionDeltaKind::Open);
+    handle.emit_session_close_rt_flow(&delta);
+    assert!(rx.try_recv().is_err(), "Open delta must emit no RT_FLOW close frame");
+}
+
 #[test]
 fn test_sequence_monotonicity() {
     let shared = Arc::new(EventStreamShared::new());

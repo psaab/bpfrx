@@ -12205,3 +12205,78 @@ top.
   pkg/config/dual_ast_differential_test.go,
   pkg/dataplane/userspace/flow_wire_coerce_test.go,
   test/incus/xpf-test.conf, docs/feature-gaps.md, _Log.md
+- **Timestamp**: 2026-06-23
+- **Action**: #2460 (P1) — emit RT_FLOW SESSION_CLOSE on the raw
+  dataplane-event channel so NetFlow v9 / IPFIX session-close export fires
+  in userspace AF_XDP mode. Root cause: the userspace dataplane emitted a
+  session close ONLY as the minimal type-2 MSG_SESSION_CLOSE HA
+  session-sync delta (SessionDeltaInfo channel → handleEventStreamDelta),
+  never as an RT_FLOW SESSION_CLOSE EventRecord on the raw channel
+  (SetOnRawDataplaneEvent → eventReader.ProcessRawEvent) the flow
+  exporters consume — so flowExportCallback/ipfixExportCallback
+  early-returned on rec.Type != "SESSION_CLOSE" and never ran. Field
+  comparison: the type-2 delta is minimal (AF/proto/ports/IPs/ownerRG/
+  flags/zone-ids) and carries NO byte/packet counters, NAT tuple, or
+  duration, so Option B (build the record from the delta) was infeasible →
+  Option A (enrich the wire). Added MSG_SESSION_CLOSE_RT_FLOW (type 14)
+  carrying the canonical 136-byte dataplane.Event payload with the
+  event-type byte = RT_FLOW SESSION_CLOSE (2), emitted ADDITIVELY at the
+  single close-drain SSOT (flush_session_deltas) as a 1:1 pair with the
+  unchanged type-2 HA delta (no double-emit; HA session sync untouched).
+  Go side routes type 14 through the existing
+  decodeDataplaneEventPayload/ProcessRawEvent path (which already decodes a
+  136-byte SESSION_CLOSE fully). Record carries the real 5-tuple, NAT
+  tuple, zones, protocol; byte/packet counters + duration are 0 because the
+  AF_XDP forwarding path keeps no per-session accounting — deferred to
+  #2501 (P2), documented honestly in code + docs + tests (assert == 0, not
+  non-zero). Wire parity: Rust encode_session_close_rt_flow byte layout is
+  byte-identical to the Go logging.DecodeRawEventRecord/logEvent reads
+  (offsets/endianness pinned by tests on both sides); frame-type constant
+  14 pinned in Rust (test_event_frame_type_values_are_stable) AND Go
+  (TestEventFrameTypeSessionCloseConstant). Tests (fail-on-revert proven by
+  reverting the event-type byte and the Go dispatch case): Rust codec v4/v6
+  layout + frame-type stability + emit pairing (exactly one type-2 + one
+  type-14 per close) + Open-delta no-op; Go end-to-end through the real
+  NetFlow+IPFIX flowexport callbacks (exactly one SESSION_CLOSE record,
+  correct tuple, counters 0) + negative (POLICY_DENY does not hit the
+  close gate) + full frame-routing through the EventStream socket. All Rust
+  (2626) + Go (daemon/logging/flowexport/userspace) tests green; new tests
+  5x stable; protocol_wire_v1.json contract test unaffected (event-stream
+  binary protocol, not the JSON control protocol).
+- **File(s)**: userspace-dp/src/event_stream/codec.rs,
+  userspace-dp/src/event_stream/codec_tests.rs,
+  userspace-dp/src/event_stream/mod.rs,
+  userspace-dp/src/event_stream/tests.rs,
+  userspace-dp/src/event_stream/README.md,
+  userspace-dp/src/afxdp/session_delta.rs,
+  pkg/dataplane/userspace/protocol.go,
+  pkg/dataplane/userspace/eventstream.go,
+  pkg/dataplane/userspace/eventstream_test.go,
+  pkg/dataplane/userspace/flow.go,
+  pkg/daemon/daemon_flowexport_session_close_test.go,
+  pkg/flowexport/README.md, _Log.md
+- **Timestamp**: 2026-06-23
+- **Action**: #2460 (PR #2502) review folds (4): (1) codec.rs doc comment
+  no longer claims the SESSION_CLOSE RT_FLOW record carries "owner RG" —
+  owner_rg_id is intentionally NOT written (it overlaps the [56:64]
+  session-packets slot the Go decoder reads for a close); carried on the
+  type-2 HA delta instead. (2) byte[54] reworded from "inert" to: the Go
+  decoder DOES map it to EventRecord.Action and logs it for SESSION_CLOSE,
+  but a close has no action semantics so it is intentionally 0 (harmless,
+  not unread). (3) corrected the "created drives ElapsedTime" claim in
+  codec.rs + both READMEs + flow.go: the exporters derive flow duration
+  from the packet count (estimateSessionDuration(SessionPkts)), NOT the
+  `created`/ElapsedTime field, so duration is 0 today only because the
+  counters are 0 (#2501). (4) strengthened the daemon end-to-end test to
+  match its "reaches BOTH NetFlow + IPFIX callbacks" claim: it now binds
+  real UDP collectors and asserts BOTH real exporters export >= 1 flow
+  record (Stats.flows, which counts data records not templates) AND two
+  distinct SESSION_CLOSE-gated fanout callbacks each fire exactly once with
+  the correct tuple. Fail-on-revert proven (dropping either fanout
+  registration drops its count to 0). All Rust (build clean, codec +
+  session_close tests) + Go (daemon, dataplane/userspace) green; new
+  daemon tests 5x stable; gofmt clean.
+- **File(s)**: userspace-dp/src/event_stream/codec.rs,
+  userspace-dp/src/event_stream/README.md, pkg/flowexport/README.md,
+  pkg/dataplane/userspace/flow.go,
+  pkg/daemon/daemon_flowexport_session_close_test.go, _Log.md

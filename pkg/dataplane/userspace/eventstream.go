@@ -66,18 +66,20 @@ type EventStream struct {
 	drainCompleteCh chan uint64
 
 	// Stats.
-	FramesRead        atomic.Uint64
-	FramesWritten     atomic.Uint64
-	DecodeErrors      atomic.Uint64
-	SeqGaps           atomic.Uint64
-	PolicyDenyEvents  atomic.Uint64
-	ScreenDropEvents  atomic.Uint64
-	ScreenAlarmEvents atomic.Uint64 // screen event with action=PERMIT (#2298)
-	FilterLogEvents   atomic.Uint64
-	PolicyDenyDrops   atomic.Uint64
-	ScreenDropDrops   atomic.Uint64
-	FilterLogDrops    atomic.Uint64
-	UnknownFrameDrops atomic.Uint64
+	FramesRead         atomic.Uint64
+	FramesWritten      atomic.Uint64
+	DecodeErrors       atomic.Uint64
+	SeqGaps            atomic.Uint64
+	PolicyDenyEvents   atomic.Uint64
+	ScreenDropEvents   atomic.Uint64
+	ScreenAlarmEvents  atomic.Uint64 // screen event with action=PERMIT (#2298)
+	FilterLogEvents    atomic.Uint64
+	SessionCloseEvents atomic.Uint64 // #2460: RT_FLOW SESSION_CLOSE frames
+	PolicyDenyDrops    atomic.Uint64
+	ScreenDropDrops    atomic.Uint64
+	FilterLogDrops     atomic.Uint64
+	SessionCloseDrops  atomic.Uint64 // #2460
+	UnknownFrameDrops  atomic.Uint64
 }
 
 // NewEventStream creates an EventStream for the given Unix socket path.
@@ -402,7 +404,8 @@ func (es *EventStream) readLoop(ctx context.Context) {
 			// the connection alive to prevent read-deadline disconnect.
 			continue
 
-		case EventFrameTypePolicyDeny, EventFrameTypeScreenDrop, EventFrameTypeFilterLog:
+		case EventFrameTypePolicyDeny, EventFrameTypeScreenDrop, EventFrameTypeFilterLog,
+			EventFrameTypeSessionClose:
 			if !dataplaneEventPayloadMatchesFrame(typ, payload) {
 				es.DecodeErrors.Add(1)
 				es.recordDataplaneEventDrop(typ)
@@ -599,7 +602,8 @@ func (es *EventStream) flushPendingCallbackFrames() {
 			if !onFullResync() {
 				return
 			}
-		case EventFrameTypePolicyDeny, EventFrameTypeScreenDrop, EventFrameTypeFilterLog:
+		case EventFrameTypePolicyDeny, EventFrameTypeScreenDrop, EventFrameTypeFilterLog,
+			EventFrameTypeSessionClose:
 			onRawDataplaneEvent, onDataplaneEvent := es.dataplaneCallbacks()
 			if onRawDataplaneEvent == nil && onDataplaneEvent == nil {
 				return
@@ -646,6 +650,8 @@ func (es *EventStream) recordDataplaneEvent(typ, action uint8) {
 		}
 	case EventFrameTypeFilterLog:
 		es.FilterLogEvents.Add(1)
+	case EventFrameTypeSessionClose:
+		es.SessionCloseEvents.Add(1)
 	}
 }
 
@@ -657,6 +663,8 @@ func (es *EventStream) recordDataplaneEventDrop(typ uint8) {
 		es.ScreenDropDrops.Add(1)
 	case EventFrameTypeFilterLog:
 		es.FilterLogDrops.Add(1)
+	case EventFrameTypeSessionClose:
+		es.SessionCloseDrops.Add(1)
 	default:
 		es.UnknownFrameDrops.Add(1)
 	}
@@ -926,8 +934,9 @@ func decodeSessionCloseEvent(payload []byte) (SessionDeltaInfo, bool) {
 }
 
 // decodeDataplaneEventPayload decodes the canonical dataplane.Event RT_FLOW
-// payload. Userspace-dp carries these bytes over event-stream frame types 11-13,
-// but the payload itself is the same shape consumed by pkg/logging/ringbuf.go.
+// payload. Userspace-dp carries these bytes over event-stream frame types 11-14
+// (#2460 added the SESSION_CLOSE frame), but the payload itself is the same
+// shape consumed by pkg/logging/ringbuf.go.
 func decodeDataplaneEventPayload(payload []byte) (logging.EventRecord, bool) {
 	return logging.DecodeRawEventRecord(payload)
 }
@@ -944,6 +953,8 @@ func dataplaneEventPayloadMatchesFrame(typ uint8, payload []byte) bool {
 		want = dataplane.EventTypeScreenDrop
 	case EventFrameTypeFilterLog:
 		want = dataplane.EventTypeFilterLog
+	case EventFrameTypeSessionClose:
+		want = dataplane.EventTypeSessionClose
 	default:
 		return false
 	}

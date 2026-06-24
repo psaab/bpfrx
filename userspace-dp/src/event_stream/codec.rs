@@ -35,14 +35,37 @@ pub(crate) const MSG_SCREEN_DROP: u8 = 12;
 #[allow(dead_code)]
 pub(crate) const MSG_FILTER_LOG: u8 = 13;
 
+// #2460: RT_FLOW SESSION_CLOSE on the raw dataplane-event channel. This
+// frame carries the canonical 136-byte `dataplane.Event` payload (the same
+// shape the Go `logging.DecodeRawEventRecord` / `ProcessRawEvent` parser
+// consumes for the deny/screen/filter frames above) with the event-type
+// byte set to RT_FLOW SESSION_CLOSE (2). It is what drives the Go
+// NetFlow/IPFIX session-close exporters in userspace mode. It is ADDITIVE
+// to — and entirely separate from — the minimal `MSG_SESSION_CLOSE` (type
+// 2) HA session-sync delta below; the two are emitted as a pair from one
+// close, never substituting for each other.
+pub(crate) const MSG_SESSION_CLOSE_RT_FLOW: u8 = 14;
+
 #[allow(dead_code)]
 pub(crate) const SECURITY_EVENT_PAYLOAD_SIZE: usize = 136;
 
 const RT_FLOW_AF_INET: u8 = 2;
 const RT_FLOW_AF_INET6: u8 = 10;
+// #2460: SESSION_CLOSE event-type byte. Must equal the Go
+// `eventTypeSessionClose` (pkg/logging/ringbuf.go) and
+// `dataplane.EventTypeSessionClose` (pkg/dataplane/types.go) value of 2,
+// so `eventTypeName(data[52])` resolves to the literal "SESSION_CLOSE" the
+// flowexport callbacks gate on.
+const RT_FLOW_EVENT_SESSION_CLOSE: u8 = 2;
 const RT_FLOW_EVENT_POLICY_DENY: u8 = 3;
 const RT_FLOW_EVENT_SCREEN_DROP: u8 = 4;
 const RT_FLOW_EVENT_FILTER_LOG: u8 = 6;
+// #2460: SESSION_CLOSE reason byte. The HA close delta carries no
+// idle/FIN/RST/age discriminator, so the RT_FLOW close reports "none" (0).
+// A real close-reason (and the byte/packet counters + session duration this
+// frame currently reports as 0) is the per-session accounting work tracked
+// in #2501.
+const RT_FLOW_CLOSE_REASON_NONE: u8 = 0;
 // DENY/PERMIT are wire-format documentation pinned by codec_tests;
 // like REJECT below they have no non-test reader (#1826: exposed when
 // the stale module-level allow was removed).
@@ -350,6 +373,122 @@ impl EventFrame {
         EventFrame {
             data: buf,
             len: pos as u16,
+            seq,
+        }
+    }
+
+    /// #2460: Encode an RT_FLOW SESSION_CLOSE (type 14) frame.
+    ///
+    /// Unlike `encode_session_close` (the minimal type-2 HA session-sync
+    /// delta), this frame carries the canonical 136-byte `dataplane.Event`
+    /// payload — byte-identical to the layout written by
+    /// `encode_dataplane_event` and parsed by the Go
+    /// `logging.DecodeRawEventRecord` / `EventReader.logEvent`
+    /// (`pkg/logging/ringbuf.go`). With the event-type byte set to
+    /// `RT_FLOW_EVENT_SESSION_CLOSE` (2), the Go side resolves it to a
+    /// `Type == "SESSION_CLOSE"` `EventRecord`, which is exactly what the
+    /// NetFlow v9 / IPFIX session-close exporters gate on
+    /// (`daemon_flowexport.go`).
+    ///
+    /// Fields populated from the close: the real forward 5-tuple, the NAT
+    /// translated tuple (when present), ingress/egress zone IDs, and
+    /// protocol. `owner_rg_id` is accepted for symmetry with the other
+    /// frame encoders but is intentionally NOT written into this payload —
+    /// for a SESSION_CLOSE the Go decoder reads the [56:64] slot (where the
+    /// deny/screen/filter frames carry owner RG) as the session-packets
+    /// counter, so writing owner RG there would corrupt the counter. Owner
+    /// RG is carried for session sync on the type-2 HA close delta instead.
+    ///
+    /// The byte/packet counters (offsets 56/64/112/120) and the
+    /// session-creation timestamp (offset 108) are written as 0: the
+    /// userspace AF_XDP forwarding path does not yet maintain per-session
+    /// byte/packet accounting nor a wall-clock creation stamp. That
+    /// accounting is the follow-up tracked in #2501; until it lands these
+    /// stay 0, so the flow record carries an accurate tuple but zero volume.
+    /// The exporters' duration is derived from the packet count today
+    /// (`estimateSessionDuration(SessionPkts)` in pkg/flowexport), NOT from
+    /// the `created` stamp — so with 0 packets the reported duration is also
+    /// 0 (and will become real once #2501 populates the counters).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn encode_session_close_rt_flow(
+        seq: u64,
+        addr_family: u8,
+        protocol: u8,
+        src_ip: IpAddr,
+        dst_ip: IpAddr,
+        src_port: u16,
+        dst_port: u16,
+        nat_src_ip: Option<IpAddr>,
+        nat_dst_ip: Option<IpAddr>,
+        nat_src_port: u16,
+        nat_dst_port: u16,
+        ingress_zone_id: u16,
+        egress_zone_id: u16,
+        owner_rg_id: i16,
+    ) -> Self {
+        let mut buf = [0u8; 256];
+        let base = FRAME_HEADER_SIZE;
+        let wire_af = rt_flow_addr_family(addr_family, src_ip);
+
+        // [0:8] timestamp_ns — 0 (the Go side stamps time.Now() when the
+        // wire timestamp is 0, which is the record's EndTime). The flow
+        // exporters compute the flow StartTime by subtracting a packet-count
+        // estimate (estimateSessionDuration(SessionPkts)), not from the
+        // `created` stamp at offset 108 — so duration is 0 until #2501
+        // populates the counters.
+        // [8:24] src ip, [24:40] dst ip (16-byte slots, v4 left-aligned).
+        write_ip_16(&mut buf, base + 8, src_ip);
+        write_ip_16(&mut buf, base + 24, dst_ip);
+        // [40:42] src port, [42:44] dst port — BIG-endian (matches the Go
+        // `binary.BigEndian` reads in logEvent/DecodeRawEventRecord).
+        buf[base + 40..base + 42].copy_from_slice(&src_port.to_be_bytes());
+        buf[base + 42..base + 44].copy_from_slice(&dst_port.to_be_bytes());
+        // [44:48] policy_id — unused for SESSION_CLOSE.
+        // [48:50] ingress zone, [50:52] egress zone — little-endian.
+        buf[base + 48..base + 50].copy_from_slice(&ingress_zone_id.to_le_bytes());
+        buf[base + 50..base + 52].copy_from_slice(&egress_zone_id.to_le_bytes());
+        // [52] event type, [53] protocol, [54] action, [55] address family.
+        buf[base + 52] = RT_FLOW_EVENT_SESSION_CLOSE;
+        buf[base + 53] = protocol;
+        // [54] action: the Go decoder DOES map this byte to
+        // EventRecord.Action (and logs it for SESSION_CLOSE), but a session
+        // close has no permit/deny/reject action semantics, so it is
+        // intentionally 0. The flow exporters do not branch on it for a
+        // close; only the syslog/event line carries it (as "deny", the 0
+        // encoding) — harmless for a close record.
+        buf[base + 54] = 0;
+        buf[base + 55] = wire_af;
+        // [56:64] session_packets, [64:72] session_bytes — 0 (#2501).
+        // [72:88] nat src ip, [88:104] nat dst ip.
+        write_ip_opt_16(&mut buf, base + 72, nat_src_ip);
+        write_ip_opt_16(&mut buf, base + 88, nat_dst_ip);
+        // [104:106] nat src port, [106:108] nat dst port — BIG-endian.
+        buf[base + 104..base + 106].copy_from_slice(&nat_src_port.to_be_bytes());
+        buf[base + 106..base + 108].copy_from_slice(&nat_dst_port.to_be_bytes());
+        // [108:112] created — 0 (#2501). Note the exporters ignore this
+        // field for duration; duration tracks the packet count (see above).
+        // [112:120] rev packets, [120:128] rev bytes — 0 (#2501).
+        // [128:132] ingress ifindex — 0 (per-close ifindex not threaded).
+        // [132:134] application id — 0.
+        // owner_rg_id rides the [64:66] slot the deny/screen/filter frames
+        // use, but for SESSION_CLOSE the Go side reads [56:64] as the
+        // session-packets counter, so owner_rg_id is intentionally NOT
+        // written here (it would corrupt the counter slot). The HA close
+        // delta (type 2) already carries owner_rg_id for session sync.
+        let _ = owner_rg_id;
+        // [134] close reason.
+        buf[base + 134] = RT_FLOW_CLOSE_REASON_NONE;
+
+        write_header(
+            &mut buf,
+            SECURITY_EVENT_PAYLOAD_SIZE as u32,
+            MSG_SESSION_CLOSE_RT_FLOW,
+            seq,
+        );
+
+        EventFrame {
+            data: buf,
+            len: (FRAME_HEADER_SIZE + SECURITY_EVENT_PAYLOAD_SIZE) as u16,
             seq,
         }
     }

@@ -6,13 +6,36 @@ session sampling. Wired off `pkg/logging.EventReader` SESSION_CLOSE
 events in `pkg/daemon/daemon_flowexport.go`, not the conntrack GC
 delete callback. No per-packet sampling path.
 
-Flow export is **entirely control-plane**. The userspace dataplane
-(`userspace-dp`) does NOT emit flow records — it never has. Flow records
-are assembled in this package from SESSION_CLOSE events. The Rust
-dataplane carried a dead `FlowExporter` and a write-only
+Flow record *assembly* is **entirely control-plane**: the userspace
+dataplane does NOT build/format NetFlow/IPFIX records — flow records are
+assembled in this package from SESSION_CLOSE `logging.EventRecord`s. The
+Rust dataplane carried a dead `FlowExporter` and a write-only
 `flow_export_config` field that emitted nothing; both were removed in
 #2130. (The Go→Rust `flow_export` snapshot wire field is retained as
 reserved/ignored to preserve the #1977 decode-safety tests.)
+
+**#2460 — the SESSION_CLOSE events ARE now produced in userspace mode.**
+Before #2460, the userspace dataplane emitted a session close ONLY as a
+minimal `MSG_SESSION_CLOSE` (type 2) HA session-sync delta on the
+SessionDeltaInfo channel (`handleEventStreamDelta`), never as an RT_FLOW
+`SESSION_CLOSE` event on the raw dataplane-event channel that these
+exporters consume — so the NetFlow/IPFIX session-close callbacks never
+fired and userspace session-close export was silently non-functional
+(per-packet deny/screen/filter RT_FLOW export already worked). The helper
+now emits, on every session close, an ADDITIONAL RT_FLOW SESSION_CLOSE
+frame (`EventFrameTypeSessionClose`, type 14) carrying the canonical
+136-byte `dataplane.Event` payload on the raw channel. The daemon decodes
+it into a `Type:"SESSION_CLOSE"` `EventRecord` via
+`eventReader.ProcessRawEvent`, which fires the callbacks below. The type-2
+HA delta is unchanged and emitted as a 1:1 pair with the type-14 frame —
+the RT_FLOW frame is additive, not a replacement, so HA session sync is
+unaffected. The record carries the real 5-tuple, NAT translated tuple,
+zones, and protocol; the byte/packet volume counters are 0 because the
+AF_XDP forwarding path does not yet maintain per-session accounting — that
+is the follow-up tracked in **#2501**. The exported flow duration is
+derived from the packet count (`estimateSessionDuration(SessionPkts)`),
+not the close record's `created`/`ElapsedTime` field, so it is also 0
+until #2501 populates the counters.
 
 ## File layout
 

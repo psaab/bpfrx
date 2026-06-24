@@ -239,6 +239,102 @@ fn test_event_frame_type_values_are_stable() {
     assert_eq!(MSG_POLICY_DENY, 11);
     assert_eq!(MSG_SCREEN_DROP, 12);
     assert_eq!(MSG_FILTER_LOG, 13);
+    // #2460: the RT_FLOW SESSION_CLOSE frame type. Must match the Go
+    // EventFrameTypeSessionClose (pkg/dataplane/userspace/protocol.go).
+    assert_eq!(MSG_SESSION_CLOSE_RT_FLOW, 14);
+}
+
+#[test]
+fn test_encode_session_close_rt_flow_v4_wire_layout() {
+    // #2460 fail-on-revert: the RT_FLOW SESSION_CLOSE frame must carry the
+    // canonical 136-byte dataplane.Event payload with the SESSION_CLOSE
+    // event-type byte at offset 52 and the real 5-tuple/NAT/zones at the
+    // exact byte offsets the Go logging.DecodeRawEventRecord parser reads.
+    // If the encoder drops the SESSION_CLOSE event-type byte (or the type-14
+    // emit is reverted), the Go side never sees a Type=="SESSION_CLOSE"
+    // record and the NetFlow/IPFIX exporters never fire.
+    let frame = EventFrame::encode_session_close_rt_flow(
+        99,
+        libc::AF_INET as u8,
+        6, // TCP
+        IpAddr::V4(Ipv4Addr::new(10, 0, 1, 102)),
+        IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+        12345,
+        443,
+        Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
+        None,
+        40000,
+        0,
+        TEST_TRUST_ZONE_ID,
+        TEST_UNTRUST_ZONE_ID,
+        1,
+    );
+
+    assert_eq!(frame.data[4], MSG_SESSION_CLOSE_RT_FLOW);
+    assert_eq!(frame.seq, 99);
+    // Payload length in the header must be the canonical 136 bytes.
+    assert_eq!(
+        u32::from_le_bytes(frame.data[0..4].try_into().unwrap()),
+        SECURITY_EVENT_PAYLOAD_SIZE as u32
+    );
+    assert_eq!(frame.len as usize, FRAME_HEADER_SIZE + SECURITY_EVENT_PAYLOAD_SIZE);
+
+    let p = &frame.data[FRAME_HEADER_SIZE..frame.len as usize];
+    // src/dst IP (16-byte slots, v4 left-aligned).
+    assert_eq!(&p[8..12], &[10, 0, 1, 102]);
+    assert_eq!(&p[24..28], &[172, 16, 80, 200]);
+    // ports — BIG-endian.
+    assert_eq!(u16::from_be_bytes([p[40], p[41]]), 12345);
+    assert_eq!(u16::from_be_bytes([p[42], p[43]]), 443);
+    // zones — little-endian.
+    assert_eq!(u16::from_le_bytes([p[48], p[49]]), TEST_TRUST_ZONE_ID);
+    assert_eq!(u16::from_le_bytes([p[50], p[51]]), TEST_UNTRUST_ZONE_ID);
+    // event type = SESSION_CLOSE (2); protocol; address family (RT_FLOW v4).
+    assert_eq!(p[52], RT_FLOW_EVENT_SESSION_CLOSE);
+    assert_eq!(p[52], 2, "must equal the Go eventTypeSessionClose value");
+    assert_eq!(p[53], 6);
+    assert_eq!(p[55], RT_FLOW_AF_INET);
+    // NAT translated source IP/port.
+    assert_eq!(&p[72..76], &[172, 16, 80, 8]);
+    assert_eq!(u16::from_be_bytes([p[104], p[105]]), 40000);
+    // #2501: counters and created stamp are 0 until per-session accounting
+    // lands. Asserting they are 0 keeps the honest-zero contract explicit.
+    assert_eq!(u64::from_le_bytes(p[56..64].try_into().unwrap()), 0); // pkts
+    assert_eq!(u64::from_le_bytes(p[64..72].try_into().unwrap()), 0); // bytes
+    assert_eq!(u32::from_le_bytes(p[108..112].try_into().unwrap()), 0); // created
+    assert_eq!(u64::from_le_bytes(p[112..120].try_into().unwrap()), 0); // rev pkts
+    assert_eq!(u64::from_le_bytes(p[120..128].try_into().unwrap()), 0); // rev bytes
+    // close reason — none (the delta carries no idle/FIN/RST discriminator).
+    assert_eq!(p[134], RT_FLOW_CLOSE_REASON_NONE);
+}
+
+#[test]
+fn test_encode_session_close_rt_flow_v6() {
+    let frame = EventFrame::encode_session_close_rt_flow(
+        100,
+        libc::AF_INET6 as u8,
+        17, // UDP
+        IpAddr::V6(Ipv6Addr::new(0x2001, 0x559, 0x8585, 0xbf01, 0, 0, 0, 0x102)),
+        IpAddr::V6(Ipv6Addr::new(0x2001, 0x559, 0x8585, 0x80, 0, 0, 0, 0x200)),
+        5353,
+        53,
+        None,
+        None,
+        0,
+        0,
+        TEST_TRUST_ZONE_ID,
+        TEST_UNTRUST_ZONE_ID,
+        0,
+    );
+    let p = &frame.data[FRAME_HEADER_SIZE..frame.len as usize];
+    assert_eq!(p[52], RT_FLOW_EVENT_SESSION_CLOSE);
+    assert_eq!(p[55], RT_FLOW_AF_INET6);
+    assert_eq!(p[53], 17);
+    // full 16-byte v6 src address occupies [8..24].
+    assert_eq!(
+        &p[8..24],
+        &Ipv6Addr::new(0x2001, 0x559, 0x8585, 0xbf01, 0, 0, 0, 0x102).octets()
+    );
 }
 
 #[test]
