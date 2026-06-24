@@ -845,6 +845,31 @@ services {
     }
 }`,
 	},
+	{
+		// #2419 fold: system domain-search is a multi-value leaf
+		// (schema_system.go domain-search, multi:true). A bracketed
+		// `domain-search [ a b c ]` collapses every value onto the leaf
+		// Keys in flat-set replay; the compileSystem reader formerly read
+		// only Keys[1] + orphan children, so #2419's collapse dropped every
+		// domain but the first. firewallMatchValues now carries all three.
+		name: "system-domain-search-multi",
+		hier: `system {
+    host-name fw;
+    domain-search [ a.example.com b.example.com c.example.com ];
+}`,
+	},
+	{
+		// #2419 sibling: system name-server is multi:true with the
+		// identical reader pattern. A bracketed `name-server [ ip ip ip ]`
+		// collapses onto the leaf Keys; reading only Keys[1] dropped every
+		// server but the first (broken DNS resolver drop-in). Both AST
+		// shapes must compile to the same server list.
+		name: "system-name-server-multi",
+		hier: `system {
+    host-name fw;
+    name-server [ 8.8.8.8 9.9.9.9 1.1.1.1 ];
+}`,
+	},
 }
 
 // TestDualASTDifferential is the harness entry point. See the file

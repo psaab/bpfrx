@@ -108,6 +108,18 @@ allowed-ips folds are covered by the `security-nat-static-multi-zone` and
 `interfaces-wireguard-allowed-ips-multi` dual-AST fixtures plus
 `TestWireguardAllowedIPsBracketList{FlatSet,Hierarchical}`.
 
+The `system domain-search` and `system name-server` readers
+(`compileSystem`, `compiler_system.go`) are also contract-compliant via
+`firewallMatchValues`. Both are `multi:true`; before the second #2419 fold
+they read only `child.Keys[1]` plus orphan leaf children. That orphan-children
+path worked on flat-set BEFORE #2419 (the bracket split into child leaves), so
+#2419's collapse onto `Keys[1:]` (no children) silently dropped every value but
+the first — a #2419 regression (search domains lost; the DNS resolver drop-in
+written from `name-server` lost every server but the first). Fail-on-revert
+covered by `TestSystemDomainSearchBracketList{FlatSet,Hierarchical}` and
+`TestSystemNameServer{BracketListFlatSet,BlockListHierarchical}` in
+`pkg/config/system_multileaf_test.go`.
+
 ## How to add a config-mode typed leaf
 
 Edit the leaf's `schemaNode` in `setSchema` (in the domain's
