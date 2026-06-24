@@ -96,10 +96,13 @@ move or rename the markers — they're literal strings.
   inference refuses to guess (leaves it unresolved) rather than route to the
   wrong link, and the operator must add an interface qualifier.
 - **VRRP-VIP-only subnets (#2452 secondary).** A bondless-RETH member that
-  carries only a VRRP virtual address (keyed by its CIDR in
-  `unit.VRRPGroups`, with no matching `unit.Addresses` entry) also
-  contributes its VIP subnet as a connected prefix, so a static next-hop
-  inside the VIP subnet resolves to that member interface.
+  carries only a VRRP virtual address (no matching `unit.Addresses` entry)
+  also contributes its VIP subnet as a connected prefix, so a static
+  next-hop inside the VIP subnet resolves to that member interface. The VIP
+  is read from `VRRPGroup.VirtualAddresses` (the `unit.VRRPGroups` map
+  VALUE, a CIDR string — the same field `pkg/vrrp` feeds to
+  `netlink.ParseAddr`); the map KEY is `"<CIDR>_grp<id>"`
+  (`compiler_interfaces.go`) and is deliberately NOT parsed as an address.
 - In cluster mode the package emits a blackhole default at admin distance
   250 so traffic to the active fabric peer survives a brief
   active/active overlap.

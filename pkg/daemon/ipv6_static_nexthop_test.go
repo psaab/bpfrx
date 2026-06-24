@@ -229,11 +229,17 @@ func TestInferIPv6StaticNextHopInterfaces_VRRPVIPSubnet(t *testing.T) {
 				"reth0": {
 					Units: map[int]*config.InterfaceUnit{
 						50: {
-							// No real Addresses — only the VRRP VIP subnet.
+							// Bondless RETH: no real unit.Addresses — only the
+							// VRRP VIP. The map KEY mirrors the compiler shape
+							// "<CIDR>_grp<id>" (compiler_interfaces.go:351) so
+							// this test exercises the production key, not a
+							// fabricated bare CIDR. The VIP itself (the value
+							// read by the fix) is a CIDR string, matching how
+							// pkg/vrrp parses it via netlink.ParseAddr.
 							VRRPGroups: map[string]*config.VRRPGroup{
-								"2001:559:8585:50::8/64": {
+								"2001:559:8585:50::8/64_grp1": {
 									ID:               1,
-									VirtualAddresses: []string{"2001:559:8585:50::1"},
+									VirtualAddresses: []string{"2001:559:8585:50::1/64"},
 								},
 							},
 						},

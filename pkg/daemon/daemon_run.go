@@ -1822,20 +1822,26 @@ func inferIPv6StaticNextHopInterfaces(cfg *config.Config) map[string]map[string]
 				addPrefix(ipNet, false)
 			}
 			// VRRP virtual-address subnets (#2452 secondary): a bondless
-			// RETH member may carry only the VIP (keyed by its CIDR in
-			// VRRPGroups) with no matching unit.Addresses entry, so a
-			// next-hop inside the VIP subnet would otherwise fail to
-			// resolve. Add the VIP subnet as a connected prefix on the
-			// member interface.
-			for addrCIDR := range unit.VRRPGroups {
-				vip, vipNet, err := net.ParseCIDR(addrCIDR)
-				if err != nil || vip == nil || vip.To4() != nil {
+			// RETH member may carry only the VIP with no matching
+			// unit.Addresses entry, so a next-hop inside the VIP subnet
+			// would otherwise fail to resolve. The actual VIP lives in
+			// VRRPGroup.VirtualAddresses (the map VALUE) as a CIDR string
+			// (pkg/vrrp parses it with netlink.ParseAddr); the VRRPGroups
+			// map KEY is "<CIDR>_grp<id>" (compiler_interfaces.go) and is
+			// NOT a parseable address. Read the VIPs from the value and add
+			// each VIP subnet as a connected prefix on the member interface.
+			for _, vg := range unit.VRRPGroups {
+				if vg == nil {
 					continue
 				}
-				ipv6OnUnit = true
-				// Skip if a real address on this unit already covers the
-				// same prefix (avoid a duplicate identical candidate).
-				addPrefix(vipNet, false)
+				for _, vip := range vg.VirtualAddresses {
+					ip, ipNet, err := net.ParseCIDR(vip)
+					if err != nil || ip == nil || ip.To4() != nil {
+						continue
+					}
+					ipv6OnUnit = true
+					addPrefix(ipNet, false)
+				}
 			}
 			if ipv6OnUnit {
 				addPrefix(linkLocalV6Net, true)
