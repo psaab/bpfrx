@@ -621,3 +621,173 @@ func TestKeaLeaseTypeInverseTotality(t *testing.T) {
 		t.Errorf("keaLeaseTypeToString(99) ok=true, want false")
 	}
 }
+
+// ownerCall records one writeMemfileFile invocation so the chown-on-pre-seed
+// tests (#2450) can assert the resolved Kea owner reached the writer with the
+// correct final path — without needing root to perform a real fchown.
+type ownerCall struct {
+	path       string
+	uid, gid   int
+	applyOwner bool
+}
+
+// installMemfileRecorder swaps the package writeMemfileFile var for a recorder
+// that captures the owner decision AND still writes the file (plainly, no
+// chown) so any read-back in the test works. It returns the captured calls
+// slice (append-only) and a restore func.
+func installMemfileRecorder(t *testing.T) (*[]ownerCall, func()) {
+	t.Helper()
+	var calls []ownerCall
+	prev := writeMemfileFile
+	writeMemfileFile = func(path string, data []byte, perm os.FileMode, uid, gid int, applyOwner bool) error {
+		calls = append(calls, ownerCall{path: path, uid: uid, gid: gid, applyOwner: applyOwner})
+		// Write without a chown so the recorder works unprivileged; the
+		// production install path's atomic-owner behavior is exercised by
+		// fsatomic's own WithOwner tests.
+		return os.WriteFile(path, data, perm)
+	}
+	return &calls, func() { writeMemfileFile = prev }
+}
+
+// Test (#2450, HIGH): the memfile pre-seed must chown the file to the resolved
+// Kea runtime user so unprivileged Kea can open it RW on takeover; otherwise
+// Kea fails to start (EACCES) and DHCP goes dark at failover. The fake resolver
+// returns a known uid/gid (no real _kea user needed) and the recorder asserts
+// WithOwner was requested with exactly that uid/gid on the FINAL memfile path,
+// for BOTH families.
+//
+// Fail-on-revert: deleting the chown in writeMemfileAtomic (so it writes
+// without the resolved owner) makes applyOwner=false / uid/gid=0 here, failing
+// the assertions.
+func TestPreSeedMemfile_ChownsToKeaUser(t *testing.T) {
+	const wantUID, wantGID = 14242, 14243
+	localNow := time.Unix(1_700_000_000, 0)
+	dir := t.TempDir()
+	memfile4 := filepath.Join(dir, "kea-leases4.csv")
+	memfile6 := filepath.Join(dir, "kea-leases6.csv")
+
+	calls, restore := installMemfileRecorder(t)
+	defer restore()
+
+	m := New()
+	m.SetLeaseSyncSeamsForTesting(nil, "", "", memfile4, memfile6)
+	m.SetKeaOwnerLookupForTesting(func() (int, int, bool) { return wantUID, wantGID, true })
+
+	if err := m.PreSeedMemfile4([]SyncLease{
+		{Family: 4, Address: "10.0.61.42", HWAddress: "aa:bb:cc:dd:ee:42",
+			SubnetID: 3, Remaining: 900, State: keaStateDefault},
+	}, localNow); err != nil {
+		t.Fatalf("PreSeedMemfile4: %v", err)
+	}
+	if err := m.PreSeedMemfile6([]SyncLease{
+		{Family: 6, Address: "2001:db8::1", DUID: "00:01", IAID: 7,
+			LeaseType: "IA_NA", SubnetID: 1, Remaining: 1200, State: keaStateDefault},
+	}, localNow); err != nil {
+		t.Fatalf("PreSeedMemfile6: %v", err)
+	}
+
+	if len(*calls) != 2 {
+		t.Fatalf("writeMemfileFile called %d times, want 2 (v4+v6)", len(*calls))
+	}
+	wantPaths := map[string]bool{memfile4: false, memfile6: false}
+	for _, c := range *calls {
+		if !c.applyOwner {
+			t.Errorf("path %s: applyOwner=false, want chown to Kea user", c.path)
+		}
+		if c.uid != wantUID || c.gid != wantGID {
+			t.Errorf("path %s: owner = %d:%d, want %d:%d", c.path, c.uid, c.gid, wantUID, wantGID)
+		}
+		if _, ok := wantPaths[c.path]; !ok {
+			t.Errorf("unexpected pre-seed path %q", c.path)
+			continue
+		}
+		wantPaths[c.path] = true
+	}
+	for p, seen := range wantPaths {
+		if !seen {
+			t.Errorf("no pre-seed write to %s", p)
+		}
+	}
+}
+
+// Test (#2450 robustness): when NEITHER Kea user resolves (dev host / Kea not
+// installed), the pre-seed must NOT abort the takeover — it writes the file
+// without an owner override and returns nil. Aborting here would turn a
+// missing-package condition into a failed failover.
+//
+// The warning is emitted ONCE PER PROCESS from the cached owner resolution,
+// NOT per pre-seed: this test pre-seeds BOTH families and asserts exactly one
+// warning across the two pre-seeds (a stronger assertion than per-call — if
+// the warning regresses back into writeMemfileAtomic it fires twice here and
+// this fails).
+func TestPreSeedMemfile_NoKeaUser_WarnsAndSucceeds(t *testing.T) {
+	localNow := time.Unix(1_700_000_000, 0)
+	dir := t.TempDir()
+	memfile4 := filepath.Join(dir, "kea-leases4.csv")
+	memfile6 := filepath.Join(dir, "kea-leases6.csv")
+
+	calls, restore := installMemfileRecorder(t)
+	defer restore()
+
+	var warnings []string
+	m := New()
+	m.SetLeaseSyncSeamsForTesting(nil, "", "", memfile4, memfile6)
+	m.SetWarnForTesting(func(msg string, _ ...any) { warnings = append(warnings, msg) })
+	m.SetKeaOwnerLookupForTesting(func() (int, int, bool) { return 0, 0, false })
+
+	if err := m.PreSeedMemfile4([]SyncLease{
+		{Family: 4, Address: "10.0.61.7", HWAddress: "aa:bb:cc:dd:ee:07",
+			SubnetID: 3, Remaining: 600, State: keaStateDefault},
+	}, localNow); err != nil {
+		t.Fatalf("PreSeedMemfile4 must not abort when Kea user absent: %v", err)
+	}
+	if err := m.PreSeedMemfile6([]SyncLease{
+		{Family: 6, Address: "2001:db8::7", DUID: "00:09", IAID: 9,
+			LeaseType: "IA_NA", SubnetID: 1, Remaining: 600, State: keaStateDefault},
+	}, localNow); err != nil {
+		t.Fatalf("PreSeedMemfile6 must not abort when Kea user absent: %v", err)
+	}
+
+	// The v4 file was still written (takeover not aborted) and is parseable.
+	got, err := parseActiveLeases4(memfile4, localNow)
+	if err != nil {
+		t.Fatalf("parseActiveLeases4 on pre-seeded file: %v", err)
+	}
+	if len(got) != 1 || got[0].Address != "10.0.61.7" {
+		t.Fatalf("pre-seeded memfile = %+v, want the one lease", got)
+	}
+	// Both families written, neither with an owner override.
+	if len(*calls) != 2 {
+		t.Fatalf("writeMemfileFile called %d times, want 2 (v4+v6)", len(*calls))
+	}
+	for _, c := range *calls {
+		if c.applyOwner {
+			t.Errorf("path %s: applyOwner=true, want no owner override when Kea user absent", c.path)
+		}
+	}
+	// Exactly ONE warning across both pre-seeds (once per process).
+	if len(warnings) != 1 || !strings.Contains(warnings[0], "_kea") {
+		t.Errorf("warnings = %v, want exactly one mentioning the missing Kea user", warnings)
+	}
+}
+
+// Test (#2450): the Kea owner resolution is cached behind sync.Once — the
+// takeover path may pre-seed both families (and re-seed on retry) without
+// re-reading the user database each time.
+func TestResolveKeaOwner_CachedOnce(t *testing.T) {
+	m := New()
+	var lookups int
+	m.SetKeaOwnerLookupForTesting(func() (int, int, bool) {
+		lookups++
+		return 991, 992, true
+	})
+	for i := 0; i < 3; i++ {
+		uid, gid, ok := m.resolveKeaOwner()
+		if !ok || uid != 991 || gid != 992 {
+			t.Fatalf("resolveKeaOwner() = %d:%d ok=%v, want 991:992 true", uid, gid, ok)
+		}
+	}
+	if lookups != 1 {
+		t.Errorf("user lookup ran %d times, want 1 (cached)", lookups)
+	}
+}

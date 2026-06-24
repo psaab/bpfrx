@@ -165,6 +165,19 @@ type Manager struct {
 	ctrlSocket6 string
 	leaseFile4  string
 	leaseFile6  string
+
+	// Kea runtime-user resolution for the memfile pre-seed (#2450). The
+	// pre-seeded lease memfile must be chowned to the unprivileged Kea user
+	// (_kea / kea) so Kea can open it RW on takeover; otherwise it fails to
+	// start (EACCES) and DHCP goes dark. keaOwnerLookup is a test seam (nil
+	// selects the real os/user lookup); the resolution is cached behind
+	// keaOwnerOnce so the takeover path does not read /etc/passwd per
+	// pre-seed.
+	keaOwnerOnce   sync.Once
+	keaOwnerLookup func() (uid, gid int, ok bool)
+	keaOwnerUID    int
+	keaOwnerGID    int
+	keaOwnerOK     bool
 }
 
 // SetLeaseSyncEnabled toggles emission of the Kea control-socket + lease_cmds
