@@ -153,6 +153,51 @@ func (m *Manager) resolveRedistribute(export string, po *config.PolicyOptionsCon
 	return ""
 }
 
+// isDefinedPolicyStatement reports whether name resolves to a defined
+// policy-statement in policyOptions. This is the SAME predicate the
+// commit-time validator uses (checkRedist/checkPolicyRef in
+// pkg/config/compiler_validate_strict.go) to distinguish a route-map-out
+// reference from a bare redistribute protocol token. A defined
+// policy-statement renders as `route-map <name> out`; anything else (a
+// bare protocol token, or a typo that slipped past the strict validator on
+// a lenient load/HA-sync path) goes to resolveRedistribute.
+func isDefinedPolicyStatement(name string, po *config.PolicyOptionsConfig) bool {
+	if po == nil || po.PolicyStatements == nil {
+		return false
+	}
+	_, ok := po.PolicyStatements[name]
+	return ok
+}
+
+// lastNonEmpty returns the last non-empty string in the slice, or "".
+// Used to pick a neighbor's effective own export: FRR accepts only one
+// `route-map <name> out` per neighbor/address-family, and Junos set-style
+// accumulation means a later statement is the more-specific intent — so
+// the last entry wins.
+func lastNonEmpty(ss []string) string {
+	for i := len(ss) - 1; i >= 0; i-- {
+		if ss[i] != "" {
+			return ss[i]
+		}
+	}
+	return ""
+}
+
+// bgpEffectiveExport resolves the single peer-level export route-map name
+// for a BGP neighbor/address-family, applying Junos most-specific-wins:
+// the neighbor's own `export` (group/neighbor level) overrides the global
+// `protocols bgp export` default. FRR takes exactly one `route-map out`
+// per neighbor/AF, so we never emit two competing route-maps for one
+// peer; the neighbor's own policy, when present, is the one rendered.
+// Returns "" when neither the neighbor nor the global default sets an
+// export (no `route-map out` line is emitted).
+func bgpEffectiveExport(n *config.BGPNeighbor, globalExport string) string {
+	if rm := lastNonEmpty(n.Export); rm != "" {
+		return rm
+	}
+	return globalExport
+}
+
 // bfdProfile holds a unique BFD profile (interval + multiplier).
 type bfdProfile struct {
 	interval   int
@@ -362,14 +407,70 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 				fmt.Fprintf(&b, " neighbor %s remove-private-AS\n", n.Address)
 			}
 		}
-		for _, export := range bgp.Export {
-			b.WriteString(m.resolveRedistribute(export, policyOptions))
+		// A global `protocols bgp export <token>` has TWO legitimate
+		// shapes that render differently (#2473):
+		//
+		//   - A DEFINED policy-statement name → a Junos default export
+		//     policy applied to every BGP peer, i.e. a peer-level
+		//     `route-map <name> out` per neighbor/address-family. It MUST
+		//     NOT be routed through resolveRedistribute: doing so emitted
+		//     `redistribute ospf route-map ...` under `router bgp`, which
+		//     actively ANNOUNCES all OSPF/connected routes into BGP (route
+		//     leak, #2473 failure mode 1), and for a prefix/community-only
+		//     policy with no `from protocol` it returned "" and SILENTLY
+		//     DROPPED the operator's advertise filter (#2473 failure mode
+		//     2). The route-map is already emitted by generatePolicyOptions,
+		//     so `route-map out` filters advertisements without leaking the
+		//     internal RIB.
+		//
+		//   - A BARE PROTOCOL TOKEN (connected/direct/static/kernel/ospf/
+		//     bgp/rip/isis — i.e. NOT a defined policy-statement) → this
+		//     firewall's redistribution shorthand, a genuine `redistribute
+		//     <proto>`. It has NO route-map to reference, so it must keep
+		//     going through resolveRedistribute. Rendering it as
+		//     `neighbor X route-map connected out` would point at a
+		//     non-existent route-map, which FRR resolves to PERMIT-ALL —
+		//     advertising the entire table (a NEW leak). So we classify
+		//     each token by the SAME policy-statement-exists predicate the
+		//     commit-time validator uses (checkRedist/checkPolicyRef in
+		//     pkg/config) and split the two render paths.
+		//
+		// Coexistence (Junos most-specific-wins) applies ONLY among the
+		// policy-statement-name route-map-out exports: a per-neighbor
+		// export overrides the global default for that neighbor. FRR
+		// accepts a single `route-map out` per neighbor/AF, so exactly one
+		// is emitted — the neighbor's own when present, else the global
+		// default (bgpEffectiveExport). A bare-token redistribute is a
+		// GLOBAL redistribute verb, not per-neighbor, and is emitted once
+		// under `router bgp`.
+		globalExport := ""
+		for _, e := range bgp.Export {
+			if e == "" {
+				continue
+			}
+			if isDefinedPolicyStatement(e, policyOptions) {
+				// Policy-statement name → peer-level route-map out
+				// global default. Later entry wins (lastNonEmpty
+				// semantics, applied inline here).
+				globalExport = e
+			} else {
+				// Bare protocol token (or a name that slipped the
+				// validator on a lenient load/HA-sync path) → genuine
+				// redistribute. resolveRedistribute normalizes direct→
+				// connected and refuses to emit an invalid bare-name
+				// line (#2223).
+				b.WriteString(m.resolveRedistribute(e, policyOptions))
+			}
 		}
 
-		// Address-family blocks for neighbors with family declarations
+		// Address-family blocks for neighbors with family declarations.
+		// When a global default export exists it must reach EVERY peer,
+		// including neighbors with no explicit `family` (FRR default-
+		// activates those under ipv4 unicast), so route them into the
+		// ipv4 set in that case.
 		var inet4Neighbors, inet6Neighbors []*config.BGPNeighbor
 		for _, n := range bgp.Neighbors {
-			if n.FamilyInet {
+			if n.FamilyInet || (globalExport != "" && !n.FamilyInet6) {
 				inet4Neighbors = append(inet4Neighbors, n)
 			}
 			if n.FamilyInet6 {
@@ -393,8 +494,8 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 				if n.PrefixLimitInet > 0 {
 					fmt.Fprintf(&b, "  neighbor %s maximum-prefix %d\n", n.Address, n.PrefixLimitInet)
 				}
-				for _, exp := range n.Export {
-					fmt.Fprintf(&b, "  neighbor %s route-map %s out\n", n.Address, exp)
+				if rm := bgpEffectiveExport(n, globalExport); rm != "" {
+					fmt.Fprintf(&b, "  neighbor %s route-map %s out\n", n.Address, rm)
 				}
 			}
 			b.WriteString(" exit-address-family\n")
@@ -412,8 +513,8 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 				if n.PrefixLimitInet6 > 0 {
 					fmt.Fprintf(&b, "  neighbor %s maximum-prefix %d\n", n.Address, n.PrefixLimitInet6)
 				}
-				for _, exp := range n.Export {
-					fmt.Fprintf(&b, "  neighbor %s route-map %s out\n", n.Address, exp)
+				if rm := bgpEffectiveExport(n, globalExport); rm != "" {
+					fmt.Fprintf(&b, "  neighbor %s route-map %s out\n", n.Address, rm)
 				}
 			}
 			b.WriteString(" exit-address-family\n")
