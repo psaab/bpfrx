@@ -94,6 +94,36 @@ Why this helps:
 - future cache policy changes will touch one helper instead of duplicated
   packet-loop logic
 
+#### Cacheability contract: lookup and insertion are symmetric (#2363)
+
+`FlowCacheEntry::packet_eligible(meta)` is the single source of truth for
+which segments may use the flow cache:
+
+- UDP — always eligible.
+- established-TCP **pure ACK** (`tcp_flags::is_ack_only`, i.e.
+  `flags & (FIN|SYN|RST|ACK) == ACK`; PSH and URG are ignored, so a
+  **PSH+ACK data segment stays cacheable**).
+- TCP control segments (SYN, SYN-ACK, FIN, RST) — **never eligible**.
+
+Both directions of the cache must reference this predicate:
+
+- **Lookup** is gated in `poll_descriptor/mod.rs` — the fast path is
+  only entered when `FlowCacheEntry::packet_eligible(meta)` holds.
+- **Insertion** is gated by `FlowCacheEntry::should_cache`, which calls
+  `packet_eligible` first (#2363). Before #2363 only lookup was gated:
+  a control segment that produced a `ForwardCandidate` decision would
+  seed a cache entry, and a later pure-ACK on the same 5-tuple would
+  take the fast path and skip the session lookup that observes and
+  advances TCP closing state on FIN/RST. The cached decision is the
+  legitimately-computed forward decision (so this was never a policy
+  fail-open) — the harm is the skipped flag-sensitive session-state
+  observation, plus the hazard of seeding any future per-packet
+  flag-sensitive feature off the first control packet.
+
+Keeping the eligibility rule in `packet_eligible` and calling it from
+both sites means admission and lookup can never drift apart: a segment
+that cannot look up the cache also cannot populate it.
+
 ## What Is Simpler Now
 
 After the two refactors above:

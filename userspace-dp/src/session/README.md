@@ -60,6 +60,22 @@ structure.)
 Per-application overrides come from the typed config and land here as
 per-entry `expires_after_ns`.
 
+**Seconds→nanoseconds bound (#2441).** Configured TCP/UDP/ICMP timeouts
+arrive in the snapshot as `u64` seconds and are converted in
+`SessionTimeouts::from_seconds`. The conversion uses `checked_mul` and
+**saturates** at `MAX_SESSION_TIMEOUT_NS`
+(`MAX_SESSION_TIMEOUT_SECS == i64::MAX / 1e9 == 9_223_372_036` s, the same
+value as the Go `config.MaxDurationSeconds` commit gate) — it never wraps
+and never panics. A snapshot-boundary helper must do neither, and
+saturating fails toward a *longer*-lived session, the opposite of the
+wrap bug it replaces (a huge configured timeout wrapping to a tiny one →
+premature expiry). The bound is defense-in-depth: the Go commit gate
+(`ValidateInteger(0, MaxDurationSeconds)` in `schema_security.go` +
+`coerceWireSessionTimeout` build-time coercion) is the operator-facing
+reject and is load-bearing for the normal in-band config path; this
+saturation is the runtime backstop for an out-of-band snapshot or a
+future caller that bypasses the Go gate.
+
 ## GC
 
 `SESSION_GC_INTERVAL_NS = 1_000_000_000` (1 s). Single-threaded per-worker
