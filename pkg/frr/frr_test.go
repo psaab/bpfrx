@@ -3069,6 +3069,14 @@ func TestGeneratePolicyOptionsCommunityExpandedVsStandard(t *testing.T) {
 				Name:    "MIXED",
 				Members: []string{"65000:100", "65001:.*"},
 			},
+			// POSIX-ERE interval/bound braces are regex too — the member
+			// carries none of `* . + ? ^ $ [ ]`, so it relies on `{` `}`
+			// being in communityRegexChars to route to an expanded list
+			// (#2643 follow-up false-negative).
+			"BOUND": {
+				Name:    "BOUND",
+				Members: []string{"65000:1{2,3}"},
+			},
 		},
 	}
 
@@ -3085,6 +3093,8 @@ func TestGeneratePolicyOptionsCommunityExpandedVsStandard(t *testing.T) {
 		// same list name cannot be both kinds in FRR.
 		"bgp community-list expanded MIXED permit 65000:100",
 		"bgp community-list expanded MIXED permit 65001:.*",
+		// Brace-bound member must render expanded, not standard.
+		"bgp community-list expanded BOUND permit 65000:1{2,3}",
 	}
 	for _, want := range wantLines {
 		if !strings.Contains(got, want) {
@@ -3115,6 +3125,9 @@ func TestGeneratePolicyOptionsCommunityExpandedVsStandard(t *testing.T) {
 	}
 	if strings.Contains(got, "bgp community-list standard WILD ") {
 		t.Errorf("WILD list must NOT appear as standard:\n%s", got)
+	}
+	if strings.Contains(got, "bgp community-list standard BOUND ") {
+		t.Errorf("BOUND (brace-bound regex) list must NOT appear as standard:\n%s", got)
 	}
 }
 

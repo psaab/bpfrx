@@ -19,6 +19,25 @@
 - **Validation**: `go test ./pkg/frr/...` green; gofmt clean; go vet clean;
   fail-on-revert proven (force-standard → FRR-invalid assertions fire).
 
+## 2026-06-24 — #2643 review fold: add POSIX-ERE braces `{` `}` to regex set
+
+- **Timestamp**: 2026-06-24
+- **Action**: hostile-review false-negative fold. `communityRegexChars`
+  omitted the POSIX-ERE interval/bound braces `{` `}`. A Junos community
+  member is a free-form verbatim slot (no value validation), so a valid
+  bound member like `65000:1{2,3}` carries no other metachar and was
+  routed to a `standard` list → FRR rejects the brace → the #2643 bug
+  persists for that input. FIX: add `{` `}` to `communityRegexChars`
+  (→ `*.+?^$[]()|\{}`). Added a `BOUND` test case (`65000:1{2,3}` → must
+  render expanded) + brace-specific fail-on-revert. Added a README
+  caveat: expanded-list members match UNANCHORED, so a literal folded
+  into a MIXED expanded list substring-matches (only affects mixed
+  lists; literal-only stays standard/anchored).
+- **File(s)**: pkg/frr/policy_render.go, pkg/frr/frr_test.go,
+  pkg/frr/README.md, _Log.md
+- **Validation**: `go test ./pkg/frr/...` green; gofmt clean; go vet clean;
+  brace fail-on-revert proven (drop `{}` → BOUND renders standard → red).
+
 ## 2026-06-24 — #2624 fix: MQFQ V_min cadence persists across drain calls
 
 - **Timestamp**: 2026-06-24

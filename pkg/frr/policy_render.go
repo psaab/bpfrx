@@ -1035,8 +1035,12 @@ func partitionRouteFiltersByFamily(rfs []*config.RouteFilter) (v4, v6 []indexedR
 // member means it cannot be a plain literal ASN:VALUE (or well-known
 // name) and therefore requires an FRR `expanded` community-list (POSIX
 // regex) rather than a `standard` one. A standard list rejects any of
-// these at config load, failing the whole frr-reload (#2643).
-const communityRegexChars = `*.+?^$[]()|\`
+// these at config load, failing the whole frr-reload (#2643). The set
+// includes the POSIX-ERE interval/bound braces `{` `}` — a Junos
+// community member is a free-form verbatim string slot (no value
+// validation; the compiler copies it straight through), so a legitimate
+// bound operator like `65000:1{2,3}` must route to an expanded list too.
+const communityRegexChars = `*.+?^$[]()|\{}`
 
 // communityMemberIsRegex reports whether a Junos community member value
 // contains regex / wildcard metacharacters and must be rendered into an
