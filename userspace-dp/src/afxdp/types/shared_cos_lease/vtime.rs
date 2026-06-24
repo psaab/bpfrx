@@ -117,6 +117,14 @@ pub(in crate::afxdp) struct SharedCoSQueueVtimeFloor {
     /// One slot per worker. Index by the worker's
     /// 0-based id.
     pub(in crate::afxdp) slots: Box<[PaddedVtimeSlot]>,
+    /// #2624 test seam: counts how many times the expensive
+    /// `participating_v_min_snapshot` peer-slot scan actually ran.
+    /// This is the exact cost the V_MIN_READ_CADENCE filter throttles,
+    /// so tests assert the cadence (1st pop, then every Kth) is honored
+    /// ACROSS drain calls by reading this counter. Test-only; no
+    /// hot-path cost in release builds.
+    #[cfg(test)]
+    pub(in crate::afxdp) snapshot_calls: std::sync::atomic::AtomicU64,
 }
 
 impl SharedCoSQueueVtimeFloor {
@@ -125,7 +133,11 @@ impl SharedCoSQueueVtimeFloor {
             .map(|_| PaddedVtimeSlot::not_participating())
             .collect::<Vec<_>>()
             .into_boxed_slice();
-        Self { slots }
+        Self {
+            slots,
+            #[cfg(test)]
+            snapshot_calls: std::sync::atomic::AtomicU64::new(0),
+        }
     }
 
     /// Single-pass snapshot of the participating peers' V_min
@@ -159,6 +171,9 @@ impl SharedCoSQueueVtimeFloor {
         &self,
         worker_id: u32,
     ) -> (u32, Option<u64>) {
+        #[cfg(test)]
+        self.snapshot_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let mut participating = 0u32;
         let mut v_min = u64::MAX;
         for (idx, slot) in self.slots.iter().enumerate() {

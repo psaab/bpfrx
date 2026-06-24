@@ -1001,7 +1001,14 @@ the sweep exit `2`; they do not produce a false-green fairness verdict.
   early-broke because the queue's virtual time ran more than
   LAG_THRESHOLD ahead of the slowest participating peer worker's V_min
   (#917/#943). Non-zero under load confirms the cross-worker brake is
-  engaged.
+  engaged. The expensive peer-slot V_min scan that backs this brake is
+  throttled by a per-queue cadence (`V_MIN_READ_CADENCE = 8`): it runs on
+  the first proceeding pop and every 8th pop thereafter. That cadence
+  counter (`VMinQueueState::v_min_pop_count`) PERSISTS across the many
+  small drain calls a queue takes under low/medium load (#2624); a
+  per-call reset would re-arm the full scan on every drain and defeat the
+  cadence, raising cross-core coherency traffic without changing the
+  throttle decision.
 - **`xpf_userspace_binding_v_min_throttle_hard_cap_overrides_total{binding_slot=..., queue_id=..., worker_id=..., iface=...}`**
   counter (#1831): V_MIN_CONSECUTIVE_SKIP_HARD_CAP escape-hatch
   activations — after that many back-to-back throttle decisions the

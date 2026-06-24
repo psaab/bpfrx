@@ -1125,6 +1125,31 @@ pub(in crate::afxdp) struct VMinQueueState {
     /// (working-as-designed fairness brake) and the hard-cap
     /// override path (escape hatch when the brake is too tight).
     pub(in crate::afxdp) v_min_throttles_scratch: u32,
+    /// #2624: persistent V_min cadence pop counter. The cross-worker
+    /// V_min sync (`cos_queue_v_min_continue` → the expensive
+    /// `participating_v_min_snapshot` Acquire-load scan of every peer
+    /// worker's slot) is rate-limited to the first pop and every
+    /// `V_MIN_READ_CADENCE`-th pop thereafter. This counter MUST persist
+    /// across `drain_exact_*_to_scratch_flow_fair` invocations: under
+    /// low/medium load the queue is drained in many small batches, so a
+    /// per-call `let mut = 0` re-armed the mandatory `pop_count == 1`
+    /// first-pop snapshot on EVERY drain call, defeating the cadence and
+    /// generating continuous cross-core coherency traffic.
+    ///
+    /// Single-writer, no atomics: each `CoSQueueRuntime` instance is
+    /// owned and drained by exactly one worker thread (`worker_id`), the
+    /// same single-writer model the sibling `consecutive_v_min_skips` /
+    /// `v_min_suspended_remaining` fields already rely on. Both
+    /// flow-fair drain fns (Local + Prepared) for a given queue run on
+    /// that one owner worker and share this counter, so the cadence is
+    /// counted across BOTH drain entry points for the queue.
+    ///
+    /// Incremented with `wrapping_add` so the cadence stays live even
+    /// after ~4 billion pops (saturating would freeze at a value that is
+    /// neither 1 nor a multiple of the cadence and silently disable all
+    /// further sync); a single wrap-to-0 just re-runs the snapshot once
+    /// (0 is a multiple of the cadence), which is harmless.
+    pub(in crate::afxdp) v_min_pop_count: u32,
 }
 
 pub(in crate::afxdp) struct CoSQueueTelemetry {

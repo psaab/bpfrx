@@ -550,6 +550,7 @@ fn normalize_cos_queue_state_repairs_nonempty_unparked_queue_to_runnable() {
             v_min_suspended_remaining: 0,
             v_min_hard_cap_overrides_scratch: 0,
             v_min_throttles_scratch: 0,
+            v_min_pop_count: 0,
         },
         telemetry: crate::afxdp::types::CoSQueueTelemetry {
             drop_counters: CoSQueueDropCounters::default(),

@@ -242,6 +242,7 @@ fn build_worker_cos_statuses_aggregates_runtime_by_interface_and_queue() {
                     v_min_suspended_remaining: 0,
                     v_min_hard_cap_overrides_scratch: 0,
                     v_min_throttles_scratch: 0,
+                    v_min_pop_count: 0,
                 },
                 telemetry: crate::afxdp::types::CoSQueueTelemetry {
                     drop_counters,
@@ -420,6 +421,7 @@ fn build_worker_cos_statuses_sums_owner_profile_without_breaking_hist_invariant(
                 v_min_suspended_remaining: 0,
                 v_min_hard_cap_overrides_scratch: 0,
                 v_min_throttles_scratch: 0,
+                v_min_pop_count: 0,
             },
             telemetry: crate::afxdp::types::CoSQueueTelemetry {
                 drop_counters: CoSQueueDropCounters::default(),
@@ -663,6 +665,7 @@ fn build_worker_cos_statuses_owner_profile_only_surfaces_on_unambiguous_owner_lo
                     v_min_suspended_remaining: 0,
                     v_min_hard_cap_overrides_scratch: 0,
                     v_min_throttles_scratch: 0,
+                    v_min_pop_count: 0,
                 },
                 telemetry: crate::afxdp::types::CoSQueueTelemetry {
                     drop_counters: CoSQueueDropCounters::default(),
@@ -710,6 +713,7 @@ fn build_worker_cos_statuses_owner_profile_only_surfaces_on_unambiguous_owner_lo
                     v_min_suspended_remaining: 0,
                     v_min_hard_cap_overrides_scratch: 0,
                     v_min_throttles_scratch: 0,
+                    v_min_pop_count: 0,
                 },
                 telemetry: crate::afxdp::types::CoSQueueTelemetry {
                     drop_counters: CoSQueueDropCounters::default(),
@@ -757,6 +761,7 @@ fn build_worker_cos_statuses_owner_profile_only_surfaces_on_unambiguous_owner_lo
                     v_min_suspended_remaining: 0,
                     v_min_hard_cap_overrides_scratch: 0,
                     v_min_throttles_scratch: 0,
+                    v_min_pop_count: 0,
                 },
                 telemetry: crate::afxdp::types::CoSQueueTelemetry {
                     drop_counters: CoSQueueDropCounters::default(),
@@ -958,6 +963,7 @@ fn build_worker_cos_statuses_owner_profile_stays_zero_for_ambiguous_multi_exact_
                     v_min_suspended_remaining: 0,
                     v_min_hard_cap_overrides_scratch: 0,
                     v_min_throttles_scratch: 0,
+                    v_min_pop_count: 0,
                 },
                 telemetry: crate::afxdp::types::CoSQueueTelemetry {
                     drop_counters: CoSQueueDropCounters::default(),
@@ -1005,6 +1011,7 @@ fn build_worker_cos_statuses_owner_profile_stays_zero_for_ambiguous_multi_exact_
                     v_min_suspended_remaining: 0,
                     v_min_hard_cap_overrides_scratch: 0,
                     v_min_throttles_scratch: 0,
+                    v_min_pop_count: 0,
                 },
                 telemetry: crate::afxdp::types::CoSQueueTelemetry {
                     drop_counters: CoSQueueDropCounters::default(),
@@ -1165,6 +1172,7 @@ fn build_worker_cos_statuses_owner_profile_stays_zero_for_ambiguous_multi_interf
                 v_min_suspended_remaining: 0,
                 v_min_hard_cap_overrides_scratch: 0,
                 v_min_throttles_scratch: 0,
+                v_min_pop_count: 0,
             },
             telemetry: crate::afxdp::types::CoSQueueTelemetry {
                 drop_counters: CoSQueueDropCounters::default(),
@@ -1375,6 +1383,7 @@ fn build_worker_cos_statuses_surfaces_distinct_per_queue_drain_telemetry() {
                     v_min_suspended_remaining: 0,
                     v_min_hard_cap_overrides_scratch: 0,
                     v_min_throttles_scratch: 0,
+                    v_min_pop_count: 0,
                 },
                 telemetry: crate::afxdp::types::CoSQueueTelemetry {
                     drop_counters: CoSQueueDropCounters::default(),
@@ -1422,6 +1431,7 @@ fn build_worker_cos_statuses_surfaces_distinct_per_queue_drain_telemetry() {
                     v_min_suspended_remaining: 0,
                     v_min_hard_cap_overrides_scratch: 0,
                     v_min_throttles_scratch: 0,
+                    v_min_pop_count: 0,
                 },
                 telemetry: crate::afxdp::types::CoSQueueTelemetry {
                     drop_counters: CoSQueueDropCounters::default(),
@@ -2471,6 +2481,7 @@ fn active_flow_buckets_peak_is_max_not_sum_across_workers() {
                     v_min_suspended_remaining: 0,
                     v_min_hard_cap_overrides_scratch: 0,
                     v_min_throttles_scratch: 0,
+                    v_min_pop_count: 0,
                 },
                 telemetry: crate::afxdp::types::CoSQueueTelemetry {
                     drop_counters: CoSQueueDropCounters::default(),

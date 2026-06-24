@@ -185,24 +185,35 @@ pub(in crate::afxdp) fn drain_exact_local_items_to_scratch_flow_fair(
     let suspended = cos_queue_v_min_consume_suspension(queue);
     let mut remaining_root = root_budget;
     let mut remaining_secondary = secondary_budget;
-    let mut v_min_pop_count = 0u32;
     while scratch_local_tx.len() < TX_BATCH_SIZE {
         if free_tx_frames.is_empty() {
             break;
         }
-        // #917 Phase 4: V_min check on drain-batch start (pop_count
-        // transitions 0→1) and every K=8 pops thereafter. Throttle
-        // = early break out of this queue's drain. The fast worker
-        // moves on to next runnable queue (or exits the drain
-        // entirely if all queues throttle); revisits this queue
-        // next round when V_min has likely advanced.
+        // #917 Phase 4: V_min check on the first pop (pop_count == 1)
+        // and every K=8 pops thereafter. Throttle = early break out of
+        // this queue's drain. The fast worker moves on to next runnable
+        // queue (or exits the drain entirely if all queues throttle);
+        // revisits this queue next round when V_min has likely advanced.
+        //
+        // #2624: `v_min_pop_count` PERSISTS on the per-queue runtime
+        // (owner-worker single-writer) across drain calls. The cadence
+        // is counted over POPS THAT ACTUALLY PROCEED, not over drain
+        // invocations: a throttled drain breaks WITHOUT advancing the
+        // counter, so the next drain re-checks at the same cadence
+        // position (preserving the #941 hard-cap retry semantics). Only
+        // a pop that passes the gate advances the counter — so the
+        // mandatory first-pop snapshot fires once and the K=8 cadence
+        // then holds across the many small successful drains under
+        // low/medium load, instead of re-arming the full peer-slot scan
+        // on every drain invocation.
         //
         // #941 Work item D: skip the V_min check entirely when this
         // drain is suspended (hard-cap previously armed).
-        v_min_pop_count = v_min_pop_count.saturating_add(1);
-        if !suspended && !cos_queue_v_min_continue(queue, v_min_pop_count) {
+        let candidate_pop_count = queue.v_min.v_min_pop_count.wrapping_add(1);
+        if !suspended && !cos_queue_v_min_continue(queue, candidate_pop_count) {
             break;
         }
+        queue.v_min.v_min_pop_count = candidate_pop_count;
         // #1229 v7: cap-aware front/pop. target_bps was sampled
         // once at drain-batch start; same value used for every
         // pop in the batch so the eligible-set is stable.
@@ -455,17 +466,26 @@ pub(in crate::afxdp) fn drain_exact_prepared_items_to_scratch_flow_fair(
     // pops at pop_count=1, 8, 16, ... all see the same suspension
     // state. See `cos_queue_v_min_consume_suspension` doc.
     let suspended = cos_queue_v_min_consume_suspension(queue);
-    let mut v_min_pop_count = 0u32;
 
     while scratch_prepared_tx.len() < TX_BATCH_SIZE {
         // #942: V_min check on the Prepared flow-fair drain path,
-        // mirroring the Local-flow wiring. Same K=8 cadence with
-        // mandatory check at pop_count==1 (drain-batch start).
+        // mirroring the Local-flow wiring. Same K=8 cadence with a
+        // mandatory check on the first pop (pop_count == 1).
         // Skipped entirely when the drain is suspended (#941 hard-cap).
-        v_min_pop_count = v_min_pop_count.saturating_add(1);
-        if !suspended && !cos_queue_v_min_continue(queue, v_min_pop_count) {
+        //
+        // #2624: shares the SAME persistent `queue.v_min.v_min_pop_count`
+        // as the Local flow-fair drain — both run on the queue's single
+        // owner worker, so the cadence is honored across BOTH entry
+        // points and across the many small drain calls (no per-call
+        // reset that re-ran the full peer-slot scan every drain). A
+        // throttled drain breaks WITHOUT advancing the counter; only a
+        // pop that passes the gate advances it (see the Local-flow
+        // comment for the full rationale).
+        let candidate_pop_count = queue.v_min.v_min_pop_count.wrapping_add(1);
+        if !suspended && !cos_queue_v_min_continue(queue, candidate_pop_count) {
             break;
         }
+        queue.v_min.v_min_pop_count = candidate_pop_count;
         // #1763 Lever A — fused select+pop (Prepared cap-aware arm).
         // Budget break abandons without popping (1 scan); commit reuses
         // `bucket` (no re-scan). See the Local arm for the invariant.
