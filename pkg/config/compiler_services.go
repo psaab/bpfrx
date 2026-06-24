@@ -75,6 +75,53 @@ func validateRPMTest(probeName string, test *RPMTest) error {
 	return nil
 }
 
+// validateRPMSourceAddressStrict rejects a malformed RPM test
+// `source-address` (#2492). A non-empty but unparseable value silently
+// turns the tcp-ping/http-get probe dialer into a wildcard/kernel-chosen
+// source bind (net.ParseIP -> nil -> net.TCPAddr{IP:nil}), so the probe
+// measures the DEFAULT uplink instead of the source-specific path the
+// operator pinned. Because RPM feeds event-options / ip-monitoring
+// failover, that publishes PASS for the wrong uplink (or FAILs a healthy
+// source-specific path). The ICMP path already surfaces a bad source via
+// its real listen error; tcp-ping/http-get had no such backstop.
+//
+// When the target is an IP literal, the source must share its address
+// family: a v6 source can never bind a v4 destination connection (and
+// vice-versa). For a hostname target the family is unknown until DNS
+// resolves, so the family check is skipped — only the parse check
+// applies. An EMPTY source-address is legitimate (default source bind)
+// and is never rejected.
+func validateRPMSourceAddressStrict(cfg *Config) error {
+	if cfg == nil || cfg.Services.RPM == nil {
+		return nil
+	}
+	for _, probe := range cfg.Services.RPM.Probes {
+		if probe == nil {
+			continue
+		}
+		for _, test := range probe.Tests {
+			if test == nil || test.SourceAddress == "" {
+				continue
+			}
+			src := net.ParseIP(test.SourceAddress)
+			if src == nil {
+				return fmt.Errorf("services rpm probe %q test %q source-address: invalid IP address %q",
+					probe.Name, test.Name, test.SourceAddress)
+			}
+			// Family compatibility only applies to an IP-literal target;
+			// a hostname target's family is unknown at commit time.
+			if target := net.ParseIP(test.Target); target != nil {
+				if (src.To4() == nil) != (target.To4() == nil) {
+					return fmt.Errorf(
+						"services rpm probe %q test %q: source-address %q address family does not match target %q",
+						probe.Name, test.Name, test.SourceAddress, test.Target)
+				}
+			}
+		}
+	}
+	return nil
+}
+
 // validateRPMProbePinsStrict enforces the probe-pin band invariants
 // (#1827 PR-1a): at most ProbeTableCount next-hop-pinned tests (one
 // reserved kernel table each), and no routing-instance table ID may

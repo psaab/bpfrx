@@ -471,6 +471,24 @@ type compileOpts struct {
 	// leniently-loaded bad config is inert. Same doctrine as
 	// lenientPolicyZoneRefs / lenientNATHostMask.
 	lenientDestNATAddresses bool
+	// lenientRPMSourceAddress (#2492) downgrades the RPM test
+	// source-address gate (validateRPMSourceAddressStrict) from a hard
+	// compile error to a cfg.Warnings entry. The strict commit /
+	// commit-check path hard-rejects an RPM test whose `source-address`
+	// is non-empty but unparseable, or whose source address-family does
+	// not match an IP-literal target. A malformed source silently turns
+	// the tcp-ping/http-get probe dialer into a wildcard/kernel-chosen
+	// source bind (net.ParseIP -> nil -> TCPAddr{IP:nil}), so the probe
+	// measures the DEFAULT uplink instead of the pinned source path and
+	// publishes PASS/FAIL for the wrong path — and RPM feeds
+	// event-options / ip-monitoring failover. The tolerant load /
+	// peer-sync paths downgrade to a warning so an already-persisted or
+	// peer-synced config carrying a bad source still BOOTS (#1960
+	// no-brick); the runtime probeDialer guard returns ErrProbeSetup for
+	// the same malformed source, so the leniently-loaded test HOLDS
+	// state rather than actuating routes off a wildcard measurement.
+	// Same doctrine as lenientDestNATAddresses / lenientNATHostMask.
+	lenientRPMSourceAddress bool
 }
 
 // CompileConfig converts a parsed ConfigTree AST into a typed Config struct.
@@ -520,6 +538,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientWireguardPeers:              true,
 		lenientPolicyZoneRefs:              true,
 		lenientDestNATAddresses:            true,
+		lenientRPMSourceAddress:            true,
 	})
 }
 
@@ -620,6 +639,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientWireguardPeers:              true,
 		lenientPolicyZoneRefs:              true,
 		lenientDestNATAddresses:            true,
+		lenientRPMSourceAddress:            true,
 	})
 }
 
@@ -1391,6 +1411,29 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		if opts.lenientRibGroupRefs {
 			cfg.Warnings = append(cfg.Warnings,
 				fmt.Sprintf("rib-group import-rib reference (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
+	// #2492: RPM test source-address gate. A malformed `source-address`
+	// (non-empty but unparseable) silently degrades the tcp-ping/http-get
+	// probe dialer to a wildcard/kernel-chosen source bind, so the probe
+	// measures the DEFAULT uplink instead of the pinned source path —
+	// publishing PASS/FAIL for the wrong path while RPM feeds
+	// event-options / ip-monitoring failover. A v6 source with a v4
+	// IP-literal target (or vice-versa) is likewise unpinnable. Strict on
+	// commit / commit-check (hard reject so the typo is operator-visible);
+	// lenient on load / peer-sync (warn — #1960; the runtime probeDialer
+	// guard returns ErrProbeSetup for the same malformed source, so the
+	// leniently-loaded test HOLDS state instead of actuating routes off a
+	// wildcard measurement). Hostname targets skip the family check
+	// (the target family is unknown until DNS resolves). Mirrors
+	// validateRibGroupImportRibReferencesStrict.
+	if err := validateRPMSourceAddressStrict(cfg); err != nil {
+		if opts.lenientRPMSourceAddress {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("rpm source-address (downgraded to warning on tolerant path): %v", err))
 		} else {
 			return nil, err
 		}

@@ -12960,3 +12960,16 @@ top.
   (fail-on-revert proven: master fires [fail pass fail]=3, fixed fires 1).
   **File(s)**: pkg/rpm/rpm.go, pkg/rpm/transition_cycle_test.go,
   docs/multi-wan.md, _Log.md
+
+- **Timestamp**: 2026-06-24
+  **Action**: #2492 — reject malformed RPM source-address at commit +
+  defensive runtime guard. Added validateRPMSourceAddressStrict (parse
+  + IP-literal-target family-compat) gated by lenientRPMSourceAddress
+  (strict-reject on commit, warn on tolerant load/peer-sync per #1960).
+  probeDialer now returns (*net.Dialer, error): a non-empty unparseable
+  source returns ErrProbeSetup instead of wildcard-binding TCPAddr{IP:nil};
+  empty source stays the default bind. Fail-on-revert proven (strict
+  tests fail with the gate neutralized = master behavior).
+  **File(s)**: pkg/config/compiler.go, pkg/config/compiler_services.go,
+  pkg/config/compiler_rpm_source_2492_test.go, pkg/rpm/rpm.go,
+  pkg/rpm/probe_dialer_2492_test.go, docs/multi-wan.md, _Log.md
