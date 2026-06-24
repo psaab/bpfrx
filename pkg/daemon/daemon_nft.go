@@ -3,9 +3,9 @@ package daemon
 
 import (
 	"context"
-	"fmt"
 	"log/slog"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 
@@ -143,9 +143,11 @@ func nftRuleFromTerm(term *config.FirewallFilterTerm, family string, prefixLists
 		}
 	}
 
-	// Protocol matching
-	if term.Protocol != "" {
-		parts = append(parts, "meta l4proto "+term.Protocol)
+	// Protocol matching (#2545: multi-value — emit an nft set on >1).
+	if len(term.Protocols) == 1 {
+		parts = append(parts, "meta l4proto "+term.Protocols[0])
+	} else if len(term.Protocols) > 1 {
+		parts = append(parts, "meta l4proto { "+strings.Join(term.Protocols, ", ")+" }")
 	}
 
 	// Source port matching
@@ -162,25 +164,32 @@ func nftRuleFromTerm(term *config.FirewallFilterTerm, family string, prefixLists
 		parts = append(parts, "th dport { "+strings.Join(term.DestinationPorts, ", ")+" }")
 	}
 
-	// DSCP / traffic-class matching
-	if term.DSCP != "" {
-		dscp := nftDSCPValue(term.DSCP)
+	// DSCP / traffic-class matching (#2545: multi-value).
+	if len(term.DSCPs) > 0 {
+		dscpKey := "ip dscp "
 		if family == "ip6" {
-			parts = append(parts, "ip6 dscp "+dscp)
+			dscpKey = "ip6 dscp "
+		}
+		dscps := make([]string, 0, len(term.DSCPs))
+		for _, d := range term.DSCPs {
+			dscps = append(dscps, nftDSCPValue(d))
+		}
+		if len(dscps) == 1 {
+			parts = append(parts, dscpKey+dscps[0])
 		} else {
-			parts = append(parts, "ip dscp "+dscp)
+			parts = append(parts, dscpKey+"{ "+strings.Join(dscps, ", ")+" }")
 		}
 	}
 
-	// ICMP type/code matching
-	if term.ICMPType >= 0 {
+	// ICMP type/code matching (#2545: multi-value).
+	if len(term.ICMPTypes) > 0 {
 		icmpFamily := "icmp"
 		if family == "ip6" {
 			icmpFamily = "icmpv6"
 		}
-		parts = append(parts, fmt.Sprintf("%s type %d", icmpFamily, term.ICMPType))
-		if term.ICMPCode >= 0 {
-			parts = append(parts, fmt.Sprintf("%s code %d", icmpFamily, term.ICMPCode))
+		parts = append(parts, icmpFamily+" type "+nftIntSet(term.ICMPTypes))
+		if len(term.ICMPCodes) > 0 {
+			parts = append(parts, icmpFamily+" code "+nftIntSet(term.ICMPCodes))
 		}
 	}
 
@@ -213,6 +222,19 @@ func nftRuleFromTerm(term *config.FirewallFilterTerm, family string, prefixLists
 
 // nftDSCPValue converts a Junos DSCP name to the nftables symbolic name.
 // nftables accepts: cs0-cs7, af11-af43, ef, or numeric values.
+// nftIntSet renders an int slice as a single nft scalar (e.g. "8") or an nft
+// anonymous set (e.g. "{ 8, 13 }") for multi-value match criteria (#2545).
+func nftIntSet(vals []int) string {
+	if len(vals) == 1 {
+		return strconv.Itoa(vals[0])
+	}
+	strs := make([]string, len(vals))
+	for i, v := range vals {
+		strs[i] = strconv.Itoa(v)
+	}
+	return "{ " + strings.Join(strs, ", ") + " }"
+}
+
 func nftDSCPValue(name string) string {
 	// Junos and nftables use the same naming for standard DSCP values.
 	// Just pass through — nftables accepts ef, af11, af12, af13, af21,

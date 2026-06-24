@@ -391,15 +391,23 @@ func validateFilterProtocols(cfg *config.Config) error {
 				continue
 			}
 			for _, term := range filter.Terms {
-				if term == nil || term.Protocol == "" {
+				if term == nil {
 					continue
 				}
-				if _, ok := appid.ProtocolNumber(term.Protocol); !ok {
-					return fmt.Errorf(
-						"firewall family %s filter %s term %s: unknown protocol %q "+
-							"(use a protocol name such as tcp/udp/icmp/icmpv6/gre/esp/ah/"+
-							"sctp/ospf or a numeric value 0-255)",
-						family, name, term.Name, term.Protocol)
+				// #2545: protocol is multi-value. (This retired-eBPF compiler
+				// is no longer the runtime path — see pkg/dataplane/README — but
+				// it must still compile and validate every token.)
+				for _, proto := range term.Protocols {
+					if proto == "" {
+						continue
+					}
+					if _, ok := appid.ProtocolNumber(proto); !ok {
+						return fmt.Errorf(
+							"firewall family %s filter %s term %s: unknown protocol %q "+
+								"(use a protocol name such as tcp/udp/icmp/icmpv6/gre/esp/ah/"+
+								"sctp/ospf or a numeric value 0-255)",
+							family, name, term.Name, proto)
+					}
 				}
 			}
 		}
@@ -446,12 +454,15 @@ func expandFilterTerm(term *config.FirewallFilterTerm, family uint8, riTableIDs 
 		}
 	}
 
-	// DSCP match
-	if term.DSCP != "" {
+	// DSCP match (#2545: multi-value typed config; this retired-eBPF struct
+	// carries a single byte, so use the first value — this path is not the
+	// runtime enforcement path).
+	if len(term.DSCPs) > 0 {
 		base.MatchFlags |= FilterMatchDSCP
-		if val, ok := DSCPValues[strings.ToLower(term.DSCP)]; ok {
+		d := term.DSCPs[0]
+		if val, ok := DSCPValues[strings.ToLower(d)]; ok {
 			base.DSCP = val
-		} else if v, err := strconv.Atoi(term.DSCP); err == nil {
+		} else if v, err := strconv.Atoi(d); err == nil {
 			base.DSCP = uint8(v)
 		}
 	}
@@ -491,21 +502,21 @@ func expandFilterTerm(term *config.FirewallFilterTerm, family uint8, riTableIDs 
 	// unrepresentable name never reaches here; ok==false is treated
 	// defensively as "no protocol constraint" rather than the old silent
 	// "match protocol 0" surprise.
-	if term.Protocol != "" {
-		if n, ok := appid.ProtocolNumber(term.Protocol); ok {
+	if len(term.Protocols) > 0 {
+		if n, ok := appid.ProtocolNumber(term.Protocols[0]); ok {
 			base.MatchFlags |= FilterMatchProtocol
 			base.Protocol = n
 		}
 	}
 
-	// ICMP type/code
-	if term.ICMPType >= 0 {
+	// ICMP type/code (#2545: multi-value; this retired path keeps the first).
+	if len(term.ICMPTypes) > 0 && term.ICMPTypes[0] >= 0 {
 		base.MatchFlags |= FilterMatchICMPType
-		base.ICMPType = uint8(term.ICMPType)
+		base.ICMPType = uint8(term.ICMPTypes[0])
 	}
-	if term.ICMPCode >= 0 {
+	if len(term.ICMPCodes) > 0 && term.ICMPCodes[0] >= 0 {
 		base.MatchFlags |= FilterMatchICMPCode
-		base.ICMPCode = uint8(term.ICMPCode)
+		base.ICMPCode = uint8(term.ICMPCodes[0])
 	}
 
 	// TCP flags match

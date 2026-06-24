@@ -611,6 +611,47 @@ reject still rejects, `TestFilterAction_Unknown_LenientWarns`,
 (`unknown_nonempty_action_fails_closed_discard`,
 `empty_action_falls_through_to_accept`).
 
+### #2545 — firewall-filter `from protocol`/`dscp`/`icmp-type`/`icmp-code` are multi-value (match-ANY)
+
+`protocol`, `dscp`/`traffic-class`, `icmp-type`, and `icmp-code` are all
+schema-declared `multi: true` (`schema_cos.go`), and Junos accepts the
+match criterion repeated within one `from` block. Historically the typed
+term stored them as SCALARS (`Protocol string`, `DSCP string`,
+`ICMPType int`, `ICMPCode int`), and `compileFilterFrom` OVERWROTE on each
+repeated child — the LAST value won and earlier constraints were silently
+dropped. `from protocol tcp; from protocol udp` compiled to
+`Protocol == "udp"`, losing the TCP constraint with no commit error.
+
+The typed term now carries SLICES — `Protocols []string`, `DSCPs []string`,
+`ICMPTypes []int`, `ICMPCodes []int` (the existing `SourcePorts`/`TCPFlags`
+shape) — and `compileFilterFrom` APPENDS every value across both parser AST
+shapes (repeated hierarchical children, a bracket list `[ tcp udp ]`, and
+repeated flat-set commands), via the `firewallMatchValues` helper. An EMPTY
+slice means the criterion is unconstrained (matches any), exactly like the
+prior empty-string / `-1` sentinels.
+
+**Wire + dataplane.** `protocol` and `dscp` were ALREADY vectors on the
+wire (`FirewallTermSnapshot.Protocols []string` → Rust `protocol_bitmap`;
+`DSCPValues WireUint8List` → Rust `dscp_bitmap`) — the chokepoint was only
+the Go typed config, which now populates the full set. `icmp-type` /
+`icmp-code` were SCALAR on the wire (`*uint8` / `Option<u8>`, exact
+equality) and are extended to vectors: `ICMPTypes`/`ICMPCodes`
+(`WireUint8List`, JSON `icmp_types`/`icmp_codes`) on the Go side and
+`Vec<u8>` → 256-bit `icmp_type_bitmap`/`icmp_code_bitmap` set-membership on
+the Rust side (`per_packet_l4_matches`). The wire specimen
+`userspace-dp/tests/fixtures/protocol_wire_v1.json` was regenerated for the
+field rename. Match semantics: a term matches if the packet's protocol /
+dscp / icmp-type / icmp-code is IN the corresponding set (match-ANY within
+a field), AND across fields; an empty set leaves the field unconstrained
+(the `l4_present` fail-closed gate for icmp on non-first fragments is
+preserved). The retired-eBPF `pkg/dataplane/compiler_filter.go` (no longer
+the runtime path) keeps the first value of each set so it still compiles.
+Regression coverage: `pkg/config/firewall_multivalue_2545_test.go` (both
+AST shapes + bracket list, fail-on-revert), the snapshot emit test
+`pkg/dataplane/userspace/filters_multivalue_2545_test.go`, and the Rust
+matcher `icmp_type_multi_value_matches_any_in_set_2545` /
+`icmp_type_empty_set_matches_any_2545`.
+
 ### #2053 — Config secret redaction at JSON/YAML marshal time
 
 The compiled `*config.Config` carries every operator secret verbatim in

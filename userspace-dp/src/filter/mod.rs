@@ -144,10 +144,17 @@ pub(crate) struct FilterTerm {
     pub(crate) tcp_flags_mask: Option<u8>,
     // is_fragment: matches any IP fragment.
     pub(crate) is_fragment: bool,
-    // icmp_type / icmp_code: exact match on the ICMP/ICMPv6 type/code byte.
-    // None = no constraint. Only ICMP/ICMPv6 can match a term that sets these.
-    pub(crate) icmp_type: Option<u8>,
-    pub(crate) icmp_code: Option<u8>,
+    // icmp_type / icmp_code: SET membership over the ICMP/ICMPv6 type/code byte
+    // (#2545, multi-value). The bitmap is 256 bits (`[u64; 4]`); a packet's
+    // type/code byte matches when its bit is set. `*_match_enabled` is false for
+    // an unconstrained term (empty set → match any), so a term that omits the
+    // criterion matches every type/code. Only ICMP/ICMPv6 can match a term that
+    // enables these. Previously a single `Option<u8>` (exact equality) — a term
+    // with two `from icmp-type` values kept only the last.
+    pub(crate) icmp_type_bitmap: [u64; 4],
+    pub(crate) icmp_type_match_enabled: bool,
+    pub(crate) icmp_code_bitmap: [u64; 4],
+    pub(crate) icmp_code_match_enabled: bool,
     pub(crate) action: FilterAction,
     // #2544: fall-through. When true, this term carries NO terminating action
     // (an explicit `then next term` OR a modifier-only term). On a MATCH the
@@ -180,8 +187,8 @@ impl FilterTerm {
     pub(crate) fn has_per_packet_l4_match(&self) -> bool {
         self.tcp_flags_mask.is_some()
             || self.is_fragment
-            || self.icmp_type.is_some()
-            || self.icmp_code.is_some()
+            || self.icmp_type_match_enabled
+            || self.icmp_code_match_enabled
     }
 }
 

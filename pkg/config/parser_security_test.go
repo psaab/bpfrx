@@ -158,8 +158,8 @@ routing-instances {
 	if len(dscpFilter.Terms) != 3 {
 		t.Errorf("expected 3 terms, got %d", len(dscpFilter.Terms))
 	}
-	if dscpFilter.Terms[0].DSCP != "ef" {
-		t.Errorf("expected dscp ef, got %q", dscpFilter.Terms[0].DSCP)
+	if len(dscpFilter.Terms[0].DSCPs) != 1 || dscpFilter.Terms[0].DSCPs[0] != "ef" {
+		t.Errorf("expected dscp [ef], got %q", dscpFilter.Terms[0].DSCPs)
 	}
 	if dscpFilter.Terms[0].RoutingInstance != "Comcast-GigabitPro" {
 		t.Errorf("expected routing-instance Comcast-GigabitPro, got %q", dscpFilter.Terms[0].RoutingInstance)
@@ -174,8 +174,8 @@ routing-instances {
 	if len(mgmtFilter.Terms) != 2 {
 		t.Errorf("expected 2 terms, got %d", len(mgmtFilter.Terms))
 	}
-	if mgmtFilter.Terms[0].Protocol != "tcp" {
-		t.Errorf("expected protocol tcp, got %q", mgmtFilter.Terms[0].Protocol)
+	if len(mgmtFilter.Terms[0].Protocols) != 1 || mgmtFilter.Terms[0].Protocols[0] != "tcp" {
+		t.Errorf("expected protocol [tcp], got %q", mgmtFilter.Terms[0].Protocols)
 	}
 	if mgmtFilter.Terms[0].Action != "reject" {
 		t.Errorf("expected action reject, got %q", mgmtFilter.Terms[0].Action)
@@ -193,8 +193,8 @@ routing-instances {
 	if len(raFilter.Terms) != 2 {
 		t.Errorf("expected 2 terms, got %d", len(raFilter.Terms))
 	}
-	if raFilter.Terms[0].ICMPType != 134 {
-		t.Errorf("expected icmp-type 134, got %d", raFilter.Terms[0].ICMPType)
+	if len(raFilter.Terms[0].ICMPTypes) != 1 || raFilter.Terms[0].ICMPTypes[0] != 134 {
+		t.Errorf("expected icmp-type [134], got %v", raFilter.Terms[0].ICMPTypes)
 	}
 	if raFilter.Terms[0].Action != "discard" {
 		t.Errorf("expected action discard, got %q", raFilter.Terms[0].Action)
@@ -226,8 +226,8 @@ routing-instances {
 	if len(tf.Terms) != 2 {
 		t.Errorf("expected 2 terms from set commands, got %d", len(tf.Terms))
 	}
-	if tf.Terms[0].DSCP != "af43" {
-		t.Errorf("expected dscp af43, got %q", tf.Terms[0].DSCP)
+	if len(tf.Terms[0].DSCPs) != 1 || tf.Terms[0].DSCPs[0] != "af43" {
+		t.Errorf("expected dscp [af43], got %q", tf.Terms[0].DSCPs)
 	}
 }
 
@@ -317,8 +317,8 @@ func TestFirewallFilterSourcePort(t *testing.T) {
 	if len(f.Terms[0].SourcePorts) != 1 || f.Terms[0].SourcePorts[0] != "53" {
 		t.Errorf("expected source-port [53], got %v", f.Terms[0].SourcePorts)
 	}
-	if f.Terms[0].Protocol != "udp" {
-		t.Errorf("expected protocol udp, got %q", f.Terms[0].Protocol)
+	if len(f.Terms[0].Protocols) != 1 || f.Terms[0].Protocols[0] != "udp" {
+		t.Errorf("expected protocol [udp], got %q", f.Terms[0].Protocols)
 	}
 	tree2 := &ConfigTree{}
 	cmds := []string{"set firewall family inet filter test-sp term t1 from protocol tcp", "set firewall family inet filter test-sp term t1 from source-port 8080", "set firewall family inet filter test-sp term t1 then accept"}
@@ -385,8 +385,8 @@ func TestFirewallFilterPortRange(t *testing.T) {
 	if len(term.SourcePorts) != 1 || term.SourcePorts[0] != "1024-65535" {
 		t.Errorf("source-port = %v, want [1024-65535]", term.SourcePorts)
 	}
-	if term.Protocol != "tcp" {
-		t.Errorf("protocol = %q, want tcp", term.Protocol)
+	if len(term.Protocols) != 1 || term.Protocols[0] != "tcp" {
+		t.Errorf("protocol = %q, want [tcp]", term.Protocols)
 	}
 	if term.Action != "discard" {
 		t.Errorf("action = %q, want discard", term.Action)
@@ -765,8 +765,8 @@ func TestFirewallPrefixListSetSyntax(t *testing.T) {
 	if !term.SourcePrefixLists[0].Except {
 		t.Error("prefix-list should have except modifier")
 	}
-	if term.Protocol != "tcp" {
-		t.Errorf("protocol = %q, want tcp", term.Protocol)
+	if len(term.Protocols) != 1 || term.Protocols[0] != "tcp" {
+		t.Errorf("protocol = %q, want [tcp]", term.Protocols)
 	}
 	if len(term.DestinationPorts) != 1 || term.DestinationPorts[0] != "22" {
 		t.Errorf("destination-port = %v, want [22]", term.DestinationPorts)

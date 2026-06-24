@@ -27,9 +27,9 @@ func nextTermCfg(terms []*config.FirewallFilterTerm) *config.Config {
 
 func TestFilterSnapshotExplicitNextTermFallsThrough(t *testing.T) {
 	cfg := nextTermCfg([]*config.FirewallFilterTerm{
-		{Name: "count-then-next", Protocol: "tcp", NextTerm: true,
-			Count: "hits", ICMPType: -1, ICMPCode: -1, Action: ""},
-		{Name: "drop", Protocol: "tcp", ICMPType: -1, ICMPCode: -1, Action: "discard"},
+		{Name: "count-then-next", Protocols: []string{"tcp"}, NextTerm: true,
+			Count: "hits", Action: ""},
+		{Name: "drop", Protocols: []string{"tcp"}, Action: "discard"},
 	})
 	snaps := buildFirewallFilterSnapshots(cfg)
 	if len(snaps) != 1 || len(snaps[0].Terms) != 2 {
@@ -48,8 +48,8 @@ func TestFilterSnapshotModifierOnlyTermFallsThrough(t *testing.T) {
 	// treats this as an implicit fall-through, so the snapshot must still mark
 	// it.
 	cfg := nextTermCfg([]*config.FirewallFilterTerm{
-		{Name: "count-only", Protocol: "tcp", Count: "hits",
-			ICMPType: -1, ICMPCode: -1, Action: ""},
+		{Name: "count-only", Protocols: []string{"tcp"}, Count: "hits",
+			Action: ""},
 	})
 	snaps := buildFirewallFilterSnapshots(cfg)
 	if len(snaps) != 1 || len(snaps[0].Terms) != 1 {
@@ -64,8 +64,8 @@ func TestFilterSnapshotRoutingInstanceTermIsNotFallThrough(t *testing.T) {
 	// A PBR term (routing-instance) takes its own routing decision; an empty
 	// Action there must NOT be treated as a fall-through.
 	cfg := nextTermCfg([]*config.FirewallFilterTerm{
-		{Name: "pbr", Protocol: "tcp", RoutingInstance: "vrf-a",
-			ICMPType: -1, ICMPCode: -1, Action: ""},
+		{Name: "pbr", Protocols: []string{"tcp"}, RoutingInstance: "vrf-a",
+			Action: ""},
 	})
 	snaps := buildFirewallFilterSnapshots(cfg)
 	if len(snaps) != 1 || len(snaps[0].Terms) != 1 {
@@ -78,7 +78,7 @@ func TestFilterSnapshotRoutingInstanceTermIsNotFallThrough(t *testing.T) {
 
 func TestFilterSnapshotTerminatingTermNotFallThrough(t *testing.T) {
 	cfg := nextTermCfg([]*config.FirewallFilterTerm{
-		{Name: "accept-web", Protocol: "tcp", ICMPType: -1, ICMPCode: -1, Action: "accept"},
+		{Name: "accept-web", Protocols: []string{"tcp"}, Action: "accept"},
 	})
 	snaps := buildFirewallFilterSnapshots(cfg)
 	if snaps[0].Terms[0].NextTerm {

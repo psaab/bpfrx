@@ -56,8 +56,8 @@ fn basic_accept_discard() {
                     dscp_rewrite: None,
                     tcp_flags: None,
                     is_fragment: false,
-                    icmp_type: None,
-                    icmp_code: None,
+                    icmp_types: vec![],
+                    icmp_codes: vec![],
                 },
                 FirewallTermSnapshot {
                     name: "allow-all".into(),
@@ -81,8 +81,8 @@ fn basic_accept_discard() {
                     dscp_rewrite: None,
                     tcp_flags: None,
                     is_fragment: false,
-                    icmp_type: None,
-                    icmp_code: None,
+                    icmp_types: vec![],
+                    icmp_codes: vec![],
                 },
             ],
         }],
@@ -287,8 +287,8 @@ fn port_range_matching() {
                 dscp_rewrite: None,
                 tcp_flags: None,
                 is_fragment: false,
-                icmp_type: None,
-                icmp_code: None,
+                icmp_types: vec![],
+                icmp_codes: vec![],
             }],
         }],
         &[],
@@ -350,8 +350,8 @@ fn protocol_matching() {
                 dscp_rewrite: None,
                 tcp_flags: None,
                 is_fragment: false,
-                icmp_type: None,
-                icmp_code: None,
+                icmp_types: vec![],
+                icmp_codes: vec![],
             }],
         }],
         &[],
@@ -413,8 +413,8 @@ fn dscp_rewrite_action() {
                 dscp_rewrite: Some(46), // EF
                 tcp_flags: None,
                 is_fragment: false,
-                icmp_type: None,
-                icmp_code: None,
+                icmp_types: vec![],
+                icmp_codes: vec![],
             }],
         }],
         &[],
@@ -462,8 +462,8 @@ fn dscp_rewrite_action_allows_default_zero() {
                 dscp_rewrite: Some(0),
                 tcp_flags: None,
                 is_fragment: false,
-                icmp_type: None,
-                icmp_code: None,
+                icmp_types: vec![],
+                icmp_codes: vec![],
             }],
         }],
         &[],
@@ -1326,8 +1326,8 @@ fn multiple_terms_first_match_wins() {
                     dscp_rewrite: None,
                     tcp_flags: None,
                     is_fragment: false,
-                    icmp_type: None,
-                    icmp_code: None,
+                    icmp_types: vec![],
+                    icmp_codes: vec![],
                 },
                 FirewallTermSnapshot {
                     name: "deny-all-udp".into(),
@@ -1351,8 +1351,8 @@ fn multiple_terms_first_match_wins() {
                     dscp_rewrite: None,
                     tcp_flags: None,
                     is_fragment: false,
-                    icmp_type: None,
-                    icmp_code: None,
+                    icmp_types: vec![],
+                    icmp_codes: vec![],
                 },
             ],
         }],
@@ -1415,8 +1415,8 @@ fn source_dest_address_matching() {
                 dscp_rewrite: None,
                 tcp_flags: None,
                 is_fragment: false,
-                icmp_type: None,
-                icmp_code: None,
+                icmp_types: vec![],
+                icmp_codes: vec![],
             }],
         }],
         &[],
@@ -2907,8 +2907,11 @@ fn per_packet_filter(
                 action: "discard".into(),
                 tcp_flags,
                 is_fragment,
-                icmp_type,
-                icmp_code,
+                // #2545: icmp-type / icmp-code are multi-value on the wire. The
+                // helper still takes an Option for call-site brevity; map
+                // Some(v) -> single-element set, None -> empty (no constraint).
+                icmp_types: icmp_type.into_iter().collect(),
+                icmp_codes: icmp_code.into_iter().collect(),
                 ..Default::default()
             },
             FirewallTermSnapshot {
@@ -3358,21 +3361,22 @@ fn firewall_term_snapshot_per_packet_fields_round_trip() {
         "action": "discard",
         "tcp_flags": 2,
         "is_fragment": true,
-        "icmp_type": 8,
-        "icmp_code": 0
+        "icmp_types": [8, 13],
+        "icmp_codes": [0]
     }"#;
     let term: FirewallTermSnapshot = serde_json::from_str(json).expect("decode");
     assert_eq!(term.tcp_flags, Some(2));
     assert!(term.is_fragment);
-    assert_eq!(term.icmp_type, Some(8));
-    assert_eq!(term.icmp_code, Some(0));
-    // Absent fields default to None/false (forward/backward compatibility).
+    // #2545: icmp-type / icmp-code are multi-value sets on the wire.
+    assert_eq!(term.icmp_types, vec![8, 13]);
+    assert_eq!(term.icmp_codes, vec![0]);
+    // Absent fields default to empty/None/false (forward/backward compat).
     let minimal: FirewallTermSnapshot =
         serde_json::from_str(r#"{"name":"x","action":"accept"}"#).expect("decode minimal");
     assert_eq!(minimal.tcp_flags, None);
     assert!(!minimal.is_fragment);
-    assert_eq!(minimal.icmp_type, None);
-    assert_eq!(minimal.icmp_code, None);
+    assert!(minimal.icmp_types.is_empty());
+    assert!(minimal.icmp_codes.is_empty());
 }
 
 // #2362 fold A (Copilot): the L4-present gate. Forcing the icmp byte to 0 for a
@@ -3511,6 +3515,91 @@ fn non_first_fragment_still_matches_is_fragment() {
         r.action,
         FilterAction::Discard,
         "a non-first fragment IS a fragment — is-fragment must still match (#2362 fold A)"
+    );
+}
+
+// #2545: icmp-type / icmp-code are multi-value SET membership (match-ANY). A
+// term `from { icmp-type 8; icmp-type 13; } then discard` must drop a packet of
+// EITHER type, leave a third type untouched, and an empty set must match any.
+// Build a filter with a multi-element icmp-type set directly on the snapshot.
+fn icmp_type_set_filter(types: Vec<u8>) -> Vec<FirewallFilterSnapshot> {
+    vec![FirewallFilterSnapshot {
+        name: "pp".into(),
+        family: "inet".into(),
+        terms: vec![
+            FirewallTermSnapshot {
+                name: "match".into(),
+                protocols: vec!["icmp".into()],
+                action: "discard".into(),
+                icmp_types: types,
+                ..Default::default()
+            },
+            FirewallTermSnapshot {
+                name: "rest".into(),
+                action: "accept".into(),
+                ..Default::default()
+            },
+        ],
+    }]
+}
+
+#[test]
+fn icmp_type_multi_value_matches_any_in_set_2545() {
+    let state = make_filter_state(&icmp_type_set_filter(vec![8, 13]), &[]);
+    let eval = |t: u8| {
+        evaluate_filter(
+            &state,
+            "inet:pp",
+            v4(10, 0, 0, 1),
+            v4(10, 0, 0, 2),
+            PROTO_ICMP,
+            0,
+            0,
+            0,
+            TermMatchExtra {
+                icmp_type: t,
+                l4_present: true,
+                ..Default::default()
+            },
+        )
+        .action
+    };
+    // Either configured type matches (match-ANY).
+    assert_eq!(eval(8), FilterAction::Discard, "type 8 in set must drop");
+    assert_eq!(eval(13), FilterAction::Discard, "type 13 in set must drop");
+    // A third type does NOT match — the earlier value was NOT dropped by the
+    // last-write-wins scalar bug.
+    assert_eq!(
+        eval(0),
+        FilterAction::Accept,
+        "type 0 (not in {{8,13}}) must NOT match"
+    );
+}
+
+#[test]
+fn icmp_type_empty_set_matches_any_2545() {
+    // An EMPTY icmp-type set means the criterion is unconstrained: the term
+    // (protocol icmp, discard) matches any ICMP type.
+    let state = make_filter_state(&icmp_type_set_filter(vec![]), &[]);
+    let r = evaluate_filter(
+        &state,
+        "inet:pp",
+        v4(10, 0, 0, 1),
+        v4(10, 0, 0, 2),
+        PROTO_ICMP,
+        0,
+        0,
+        0,
+        TermMatchExtra {
+            icmp_type: 42,
+            l4_present: true,
+            ..Default::default()
+        },
+    );
+    assert_eq!(
+        r.action,
+        FilterAction::Discard,
+        "empty icmp-type set must leave the type unconstrained (match any)"
     );
 }
 

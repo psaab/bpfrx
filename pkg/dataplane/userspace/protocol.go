@@ -578,10 +578,14 @@ type FirewallTermSnapshot struct {
 	// IsFragment matches any IP fragment (IPv4 MF set OR non-zero offset; IPv6
 	// fragment extension header present). False = no fragment constraint.
 	IsFragment bool `json:"is_fragment,omitempty"`
-	// ICMPType / ICMPCode match the ICMP/ICMPv6 type and code bytes. Nil = no
-	// constraint. A non-ICMP(v6) packet never matches a term that sets these.
-	ICMPType *uint8 `json:"icmp_type,omitempty"`
-	ICMPCode *uint8 `json:"icmp_code,omitempty"`
+	// ICMPTypes / ICMPCodes match the ICMP/ICMPv6 type and code bytes (#2545,
+	// multi-value). An empty slice = no constraint. A non-empty slice matches if
+	// the packet's type/code byte is in the set (match-ANY). A non-ICMP(v6)
+	// packet never matches a term that sets these. Previously these were scalar
+	// (`*uint8` / a single byte): a term carrying two `from icmp-type` values
+	// kept only the last, dropping the earlier constraint.
+	ICMPTypes WireUint8List `json:"icmp_types,omitempty"`
+	ICMPCodes WireUint8List `json:"icmp_codes,omitempty"`
 }
 
 type PolicerSnapshot struct {

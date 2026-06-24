@@ -189,9 +189,7 @@ func compileFirewall(node *Node, fw *FirewallConfig) error {
 
 				for _, termInst := range namedInstances(filterInst.node.FindChildren("term")) {
 					term := &FirewallFilterTerm{
-						Name:     termInst.name,
-						ICMPType: -1,
-						ICMPCode: -1,
+						Name: termInst.name,
 					}
 
 					fromNode := termInst.node.FindChild("from")
@@ -214,17 +212,43 @@ func compileFirewall(node *Node, fw *FirewallConfig) error {
 	return nil
 }
 
+// firewallMatchValues extracts every value carried by a `from` match-criterion
+// node, across BOTH parser AST shapes (#2545):
+//
+//   - hierarchical leaf  `protocol tcp;`            → Keys=["protocol","tcp"]
+//   - bracket list       `protocol [ tcp udp ];`    → Keys=["protocol","tcp","udp"]
+//   - flat set command   `... protocol tcp` (one    → Keys=["protocol"] with a
+//     line per value, merged under one node)          child node per value
+//
+// Returning the full slice lets the caller ACCUMULATE repeated occurrences into
+// a match-ANY set instead of overwriting (the prior scalar last-write-wins bug).
+// Empty / blank tokens are skipped so an empty result means "criterion absent".
+func firewallMatchValues(child *Node) []string {
+	var vals []string
+	for _, k := range child.Keys[1:] {
+		if k != "" {
+			vals = append(vals, k)
+		}
+	}
+	for _, vn := range child.Children {
+		if len(vn.Keys) >= 1 && vn.Keys[0] != "" {
+			vals = append(vals, vn.Keys[0])
+		}
+	}
+	return vals
+}
+
 func compileFilterFrom(node *Node, term *FirewallFilterTerm) {
 	for _, child := range node.Children {
 		switch child.Name() {
 		case "dscp", "traffic-class":
-			if v := nodeVal(child); v != "" {
-				term.DSCP = v
-			}
+			// Multi-value (#2545): ACCUMULATE every value rather than
+			// overwrite. Handle BOTH AST shapes — a bracket/flat-set list
+			// carries values as child.Keys[1:] and/or child nodes, while a
+			// hierarchical leaf carries a single value via nodeVal.
+			term.DSCPs = append(term.DSCPs, firewallMatchValues(child)...)
 		case "protocol":
-			if v := nodeVal(child); v != "" {
-				term.Protocol = v
-			}
+			term.Protocols = append(term.Protocols, firewallMatchValues(child)...)
 		case "source-address":
 			// Can be a leaf with value or a block with address entries
 			if len(child.Keys) >= 2 {
@@ -286,17 +310,15 @@ func compileFilterFrom(node *Node, term *FirewallFilterTerm) {
 				}
 			}
 		case "icmp-type":
-			v := nodeVal(child)
-			if v != "" {
+			for _, v := range firewallMatchValues(child) {
 				if n, err := strconv.Atoi(v); err == nil {
-					term.ICMPType = n
+					term.ICMPTypes = append(term.ICMPTypes, n)
 				}
 			}
 		case "icmp-code":
-			v := nodeVal(child)
-			if v != "" {
+			for _, v := range firewallMatchValues(child) {
 				if n, err := strconv.Atoi(v); err == nil {
-					term.ICMPCode = n
+					term.ICMPCodes = append(term.ICMPCodes, n)
 				}
 			}
 		case "tcp-flags":

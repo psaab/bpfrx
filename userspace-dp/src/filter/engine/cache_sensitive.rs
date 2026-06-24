@@ -173,8 +173,10 @@ fn filter_term_semantics_match(old: &FilterTerm, new: &FilterTerm) -> bool {
         && old.dscp_match_enabled == new.dscp_match_enabled
         && old.tcp_flags_mask == new.tcp_flags_mask
         && old.is_fragment == new.is_fragment
-        && old.icmp_type == new.icmp_type
-        && old.icmp_code == new.icmp_code
+        && old.icmp_type_bitmap == new.icmp_type_bitmap
+        && old.icmp_type_match_enabled == new.icmp_type_match_enabled
+        && old.icmp_code_bitmap == new.icmp_code_bitmap
+        && old.icmp_code_match_enabled == new.icmp_code_match_enabled
         && old.action == new.action
         // #2544: continue_term flips a matched term between terminate-here and
         // apply-modifiers-and-fall-through WITHOUT changing the parsed match
