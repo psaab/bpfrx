@@ -799,7 +799,13 @@ the value sits in a single typed slot:
     (Rust u64 TCPSessionTimeout), `initial-timeout`, `closing-timeout`,
     `time-wait-timeout` (config-only, not wire-reaching) all
     `ValidateInteger(0, MaxDurationSeconds)` — the Duration-overflow ceiling,
-    NOT u64-max, because the helper multiplies `secs*1e9` unchecked; plus the
+    NOT u64-max. This is the operator-facing reject; it stays in lockstep with
+    the runtime saturation backstop `SessionTimeouts::from_seconds` (#2441),
+    which converts `secs → ns` with `checked_mul` and saturates at
+    `MAX_SESSION_TIMEOUT_NS` (`MAX_SESSION_TIMEOUT_SECS == MaxDurationSeconds ==
+    i64::MAX / 1e9`) so an out-of-band snapshot or future caller that bypasses
+    this gate can never wrap `secs*1e9` into a tiny premature-expiry timeout;
+    plus the
     presence flags `no-syn-check`, `no-syn-check-in-tunnel`,
     `rst-invalidate-session`, and `no-sequence-check` (#2008 M9) declared
     presence-only for completion parity. The presence flags compile into

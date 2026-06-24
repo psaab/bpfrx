@@ -111,6 +111,44 @@ pub(crate) struct WheelPopStats {
     pub(crate) aged_owner_rg_zero_active_node: usize,
 }
 
+/// #2441: largest configured session timeout (in seconds) that survives the
+/// seconds→nanoseconds conversion without overflowing `u64`. This MUST stay in
+/// lockstep with the Go commit-time gate `config.MaxDurationSeconds`
+/// (`math.MaxInt64 / 1e9 = 9_223_372_036`, schema_validators.go) and the
+/// build-time coercion `coerceWireSessionTimeout` (pkg/dataplane/userspace/
+/// flow.go). The Go side is the operator-facing reject; this const is the
+/// runtime saturation backstop so an out-of-band snapshot or a future caller
+/// that bypasses the Go gate can NEVER wrap `secs * 1_000_000_000`.
+///
+/// `i64::MAX / 1_000_000_000`. Bound to the i64 (not u64) ceiling on purpose:
+/// the wire field originates as a Go int64, and matching the Go bound exactly
+/// means a value the Go gate accepts is one this boundary leaves unchanged, and
+/// a value the Go gate would reject is one this boundary saturates rather than
+/// wraps.
+pub(crate) const MAX_SESSION_TIMEOUT_SECS: u64 = (i64::MAX / 1_000_000_000) as u64;
+
+/// Maximum representable session timeout in nanoseconds — the saturation
+/// ceiling for `from_seconds`. `MAX_SESSION_TIMEOUT_SECS * 1_000_000_000`
+/// fits in `u64` by construction.
+pub(crate) const MAX_SESSION_TIMEOUT_NS: u64 = MAX_SESSION_TIMEOUT_SECS * 1_000_000_000;
+
+const _: () = assert!(
+    MAX_SESSION_TIMEOUT_SECS.checked_mul(1_000_000_000).is_some(),
+    "MAX_SESSION_TIMEOUT_SECS * 1e9 must not overflow u64"
+);
+
+/// Convert a configured timeout in seconds to nanoseconds, SATURATING at
+/// `MAX_SESSION_TIMEOUT_NS` instead of wrapping (#2441). A snapshot boundary
+/// must never panic and must never silently shrink a huge timeout into a tiny
+/// one (the wrap bug). Saturating fails toward a longer-lived session, the
+/// opposite of premature expiry.
+#[inline]
+fn secs_to_ns_saturating(secs: u64) -> u64 {
+    secs.checked_mul(1_000_000_000)
+        .unwrap_or(MAX_SESSION_TIMEOUT_NS)
+        .min(MAX_SESSION_TIMEOUT_NS)
+}
+
 /// Configurable session timeout values (in nanoseconds).
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct SessionTimeouts {
@@ -135,17 +173,17 @@ impl SessionTimeouts {
     pub(crate) fn from_seconds(tcp_secs: u64, udp_secs: u64, icmp_secs: u64) -> Self {
         Self {
             tcp_established_ns: if tcp_secs > 0 {
-                tcp_secs * 1_000_000_000
+                secs_to_ns_saturating(tcp_secs)
             } else {
                 DEFAULT_TCP_SESSION_TIMEOUT_NS
             },
             udp_ns: if udp_secs > 0 {
-                udp_secs * 1_000_000_000
+                secs_to_ns_saturating(udp_secs)
             } else {
                 DEFAULT_UDP_SESSION_TIMEOUT_NS
             },
             icmp_ns: if icmp_secs > 0 {
-                icmp_secs * 1_000_000_000
+                secs_to_ns_saturating(icmp_secs)
             } else {
                 DEFAULT_ICMP_SESSION_TIMEOUT_NS
             },
