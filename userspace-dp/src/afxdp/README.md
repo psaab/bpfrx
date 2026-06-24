@@ -284,6 +284,42 @@ helpers. Before #1807 a single poisoned queue made the worker
 permanently deaf (poison read as "no commands") while producers
 silently dropped or, for the tunnel drain-wait, spun to timeout.
 
+## Shared-session map poison policy (#2402)
+
+The HA promotion/demotion path reads and mutates three shared-session
+maps (`Mutex<FastMap<SessionKey, SyncedSessionEntry>>` — synced, NAT, and
+forward-wire) plus their owner-RG indexes. A worker panic while holding
+one of these mutexes (contained by the #925 supervisor) poisons it, and
+the map still holds every committed insert.
+
+The old access patterns SWALLOWED that poison and lost the data:
+
+- `prewarm_reverse_synced_sessions_for_owner_rgs` used
+  `shared_sessions.lock().map(|s| { … }).unwrap_or_default()`. On a
+  poisoned lock the `.map` closure was skipped and `unwrap_or_default()`
+  substituted EMPTY `(forward_entries, reverse_entries)` — so RG
+  activation proceeded as if there were **no sessions to promote** and
+  silently dropped every active synced session at the exact moment of
+  failover (the #2402 bug).
+- `demote_shared_owner_rgs`, `publish_shared_session`,
+  `remove_shared_session`, the `lookup_shared_*` helpers,
+  `republish_bpf_session_entries_for_owner_rgs`, and the owner-RG index
+  maintenance helpers used `if let Ok(..)` / `.lock().ok()` /
+  `match .lock() { Err(_) => return }`, each of which silently SKIPPED its
+  work (a missed demotion, a dropped publish/remove, a spurious lookup
+  miss) on poison.
+
+`shared_ops::lock_shared_recover` replaces all of them with poison
+RECOVERY — `into_inner()` to keep the committed map, `clear_poison()` to
+restore the fast path, and a bump of `SHARED_SESSION_POISON_RECOVERIES`
+plus a sparse journald line so operators see the underlying worker panic.
+This mirrors the worker-command-queue policy above (`worker_queue.rs`,
+#1807): a contained panic must never void failover — promotion/demotion
+proceeds with the existing session data. The unrelated `mode`-mutex
+status reads in `state_writer.rs` / `slowpath.rs` keep
+`.lock().map(..).unwrap_or_default()` deliberately (a momentary
+default-mode status read is harmless and not on the session path).
+
 ## Hot-path constants
 
 - `RX_BATCH_SIZE = 64`

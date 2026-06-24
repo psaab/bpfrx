@@ -1,5 +1,46 @@
 use super::*;
 use std::sync::atomic::AtomicU64;
+use std::sync::MutexGuard;
+
+/// #2402: total shared-session / owner-RG-index mutex poison recoveries
+/// across every site in this module (HA promotion prewarm, demotion,
+/// publish, remove, lookups, owner-RG index maintenance). Each recovery
+/// means a worker thread panicked while holding one of the shared-session
+/// mutexes; the map still holds every committed insert, so the HA
+/// promotion/demotion path proceeds with the EXISTING sessions instead of
+/// silently treating the table as empty (which dropped all synced sessions
+/// at failover — the #2402 bug). Mirrors the worker-command-queue policy
+/// (`worker_queue::lock_recover`, #1807). Each recovery also emits a sparse
+/// journald line so operators see that a worker panicked (the root cause);
+/// the counter is kept for tests and future status wiring.
+pub(crate) static SHARED_SESSION_POISON_RECOVERIES: AtomicU64 = AtomicU64::new(0);
+
+/// Lock a shared-session (or owner-RG index) mutex, RECOVERING and
+/// clearing poison instead of swallowing it.
+///
+/// Policy (#2402, mirrors `worker_queue::lock_recover` #1807): a panic
+/// that poisoned the mutex already happened and was contained (#925
+/// worker supervisor). The guarded map still holds the committed prefix
+/// of every completed insert, so the correct recovery is to keep using
+/// that data — NOT to skip the operation (`if let Ok`) or substitute an
+/// empty table (`.lock().map(..).unwrap_or_default()`). On the HA
+/// promotion path the latter silently dropped every active synced session
+/// at the exact moment of failover. `clear_poison` restores the fast
+/// unpoisoned path for subsequent locks so the Poisoned arm stays cold.
+#[inline]
+pub(super) fn lock_shared_recover<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
+    match m.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            m.clear_poison();
+            SHARED_SESSION_POISON_RECOVERIES.fetch_add(1, Ordering::Relaxed);
+            eprintln!(
+                "xpf-ha: shared session mutex poisoned by a prior worker panic; recovering existing sessions and clearing poison"
+            );
+            poisoned.into_inner()
+        }
+    }
+}
 
 /// #1760 W3': cumulative count of shared-map NAT reverse-key displacement
 /// events — a `publish_shared_session` insert into `shared_nat_sessions`
@@ -130,7 +171,8 @@ pub(super) fn demote_shared_owner_rgs(
         return;
     }
     let mut demoted_entries = Vec::new();
-    if let Ok(mut sessions) = shared_sessions.lock() {
+    {
+        let mut sessions = lock_shared_recover(shared_sessions);
         for key in owner_rg_session_keys(&shared_owner_rg_indexes.sessions, owner_rgs) {
             if let Some(entry) = sessions.get_mut(&key) {
                 let previous = entry.clone();
@@ -148,14 +190,16 @@ pub(super) fn demote_shared_owner_rgs(
             Some(&entry),
         );
     }
-    if let Ok(mut sessions) = shared_nat_sessions.lock() {
+    {
+        let mut sessions = lock_shared_recover(shared_nat_sessions);
         for key in owner_rg_session_keys(&shared_owner_rg_indexes.nat_sessions, owner_rgs) {
             if let Some(entry) = sessions.get_mut(&key) {
                 entry.origin = SessionOrigin::SyncImport;
             }
         }
     }
-    if let Ok(mut sessions) = shared_forward_wire_sessions.lock() {
+    {
+        let mut sessions = lock_shared_recover(shared_forward_wire_sessions);
         for key in owner_rg_session_keys(&shared_owner_rg_indexes.forward_wire_sessions, owner_rgs)
         {
             if let Some(entry) = sessions.get_mut(&key) {
@@ -219,46 +263,51 @@ pub(super) fn prewarm_reverse_synced_sessions_for_owner_rgs(
             candidate_keys.push(key);
         }
     }
-    let (forward_entries, reverse_entries) = shared_sessions
-        .lock()
-        .map(|sessions| {
-            let mut forward_entries = Vec::new();
-            let mut reverse_entries = Vec::new();
-            for key in candidate_keys {
-                let Some(entry) = sessions.get(&key) else {
-                    continue;
-                };
-                if entry.metadata.is_reverse {
-                    continue;
-                }
-                let allow_reverse_prewarm = entry.origin.is_peer_synced()
-                    || matches!(entry.origin, SessionOrigin::SharedPromote);
-                let Some(reverse) = synthesized_synced_reverse_entry(
-                    forwarding,
-                    ha_state,
-                    dynamic_neighbors,
-                    entry,
-                    now_secs,
-                ) else {
-                    // Collect forward entry even if reverse can't be synthesized,
-                    // as long as the forward session belongs to an activated RG.
-                    if owner_rg_set.contains(&entry.metadata.owner_rg_id) {
-                        forward_entries.push(entry.clone());
-                    }
-                    continue;
-                };
-                if owner_rg_set.contains(&entry.metadata.owner_rg_id)
-                    || owner_rg_set.contains(&reverse.metadata.owner_rg_id)
-                {
+    // #2402: acquire the shared-session guard with poison RECOVERY. The
+    // prior `.lock().map(..).unwrap_or_default()` swallowed a poisoned
+    // lock into EMPTY (forward_entries, reverse_entries) — so if a worker
+    // had panicked while holding this mutex, RG activation proceeded as if
+    // there were NO sessions to promote and silently dropped every active
+    // synced session at the exact moment of failover. Recover the existing
+    // map and compute from it instead.
+    let (forward_entries, reverse_entries) = {
+        let sessions = lock_shared_recover(shared_sessions);
+        let mut forward_entries = Vec::new();
+        let mut reverse_entries = Vec::new();
+        for key in candidate_keys {
+            let Some(entry) = sessions.get(&key) else {
+                continue;
+            };
+            if entry.metadata.is_reverse {
+                continue;
+            }
+            let allow_reverse_prewarm = entry.origin.is_peer_synced()
+                || matches!(entry.origin, SessionOrigin::SharedPromote);
+            let Some(reverse) = synthesized_synced_reverse_entry(
+                forwarding,
+                ha_state,
+                dynamic_neighbors,
+                entry,
+                now_secs,
+            ) else {
+                // Collect forward entry even if reverse can't be synthesized,
+                // as long as the forward session belongs to an activated RG.
+                if owner_rg_set.contains(&entry.metadata.owner_rg_id) {
                     forward_entries.push(entry.clone());
-                    if allow_reverse_prewarm {
-                        reverse_entries.push(reverse);
-                    }
+                }
+                continue;
+            };
+            if owner_rg_set.contains(&entry.metadata.owner_rg_id)
+                || owner_rg_set.contains(&reverse.metadata.owner_rg_id)
+            {
+                forward_entries.push(entry.clone());
+                if allow_reverse_prewarm {
+                    reverse_entries.push(reverse);
                 }
             }
-            (forward_entries, reverse_entries)
-        })
-        .unwrap_or_default();
+        }
+        (forward_entries, reverse_entries)
+    };
     if forward_entries.is_empty() && reverse_entries.is_empty() {
         return;
     }
@@ -366,10 +415,9 @@ pub(super) fn republish_bpf_session_entries_for_owner_rgs(
     // Collect entries under the lock, then release before BPF syscalls
     // to avoid blocking concurrent session insert/remove/lookup.
     let entries: Vec<_> = {
-        let sessions = match shared_sessions.lock() {
-            Ok(s) => s,
-            Err(_) => return 0,
-        };
+        // #2402: recover a poisoned lock instead of returning 0 — a prior
+        // worker panic must not void the activation BPF-map republish.
+        let sessions = lock_shared_recover(shared_sessions);
         keys.iter()
             .filter_map(|key| {
                 sessions
@@ -404,30 +452,25 @@ pub(super) fn lookup_shared_session(
     shared_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     key: &SessionKey,
 ) -> Option<SyncedSessionEntry> {
-    shared_sessions
-        .lock()
-        .ok()
-        .and_then(|sessions| sessions.get(key).cloned())
+    // #2402: recover poison so a prior worker panic does not turn every
+    // shared-session lookup into a spurious miss.
+    lock_shared_recover(shared_sessions).get(key).cloned()
 }
 
 pub(super) fn lookup_shared_forward_nat_match(
     shared_nat_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     reply_key: &SessionKey,
 ) -> Option<SyncedSessionEntry> {
-    shared_nat_sessions
-        .lock()
-        .ok()
-        .and_then(|sessions| sessions.get(reply_key).cloned())
+    // #2402: recover poison (see lookup_shared_session).
+    lock_shared_recover(shared_nat_sessions).get(reply_key).cloned()
 }
 
 pub(super) fn lookup_shared_forward_wire_match(
     shared_forward_wire_sessions: &Arc<Mutex<FastMap<SessionKey, SyncedSessionEntry>>>,
     wire_key: &SessionKey,
 ) -> Option<SyncedSessionEntry> {
-    shared_forward_wire_sessions
-        .lock()
-        .ok()
-        .and_then(|sessions| sessions.get(wire_key).cloned())
+    // #2402: recover poison (see lookup_shared_session).
+    lock_shared_recover(shared_forward_wire_sessions).get(wire_key).cloned()
 }
 
 #[derive(Clone, Debug)]
@@ -793,7 +836,10 @@ pub(super) fn publish_shared_session(
     shared_owner_rg_indexes: &SharedSessionOwnerRgIndexes,
     entry: &SyncedSessionEntry,
 ) {
-    if let Ok(mut sessions) = shared_sessions.lock() {
+    {
+        // #2402: recover poison so a peer-sync / promote publish is never
+        // silently dropped because a worker panicked under this lock.
+        let mut sessions = lock_shared_recover(shared_sessions);
         let previous_owner_rg = sessions
             .insert(entry.key.clone(), entry.clone())
             .map(|existing| existing.metadata.owner_rg_id);
@@ -804,9 +850,8 @@ pub(super) fn publish_shared_session(
             entry.metadata.owner_rg_id,
         );
     }
-    if !entry.metadata.is_reverse
-        && let Ok(mut sessions) = shared_nat_sessions.lock()
-    {
+    if !entry.metadata.is_reverse {
+        let mut sessions = lock_shared_recover(shared_nat_sessions);
         let reverse_wire = reverse_session_key(&entry.key, entry.decision.nat);
         let displaced = sessions.insert(reverse_wire.clone(), entry.clone());
         record_shared_nat_displacement(displaced.as_ref(), entry);
@@ -830,9 +875,8 @@ pub(super) fn publish_shared_session(
             );
         }
     }
-    if !entry.metadata.is_reverse
-        && let Ok(mut sessions) = shared_forward_wire_sessions.lock()
-    {
+    if !entry.metadata.is_reverse {
+        let mut sessions = lock_shared_recover(shared_forward_wire_sessions);
         let wire_key = forward_wire_key(&entry.key, entry.decision.nat);
         if wire_key != entry.key {
             let previous_owner_rg = sessions
@@ -855,17 +899,18 @@ pub(super) fn remove_shared_session(
     shared_owner_rg_indexes: &SharedSessionOwnerRgIndexes,
     key: &SessionKey,
 ) {
-    if let Ok(mut sessions) = shared_sessions.lock()
-        && let Some(entry) = sessions.remove(key)
-    {
+    // #2402: recover poison so a delete-sync removal is never silently
+    // skipped (leaving a stale entry that would mis-route after failover)
+    // because a worker panicked under the shared-session lock.
+    let mut sessions = lock_shared_recover(shared_sessions);
+    if let Some(entry) = sessions.remove(key) {
         remove_owner_rg_index_entry(
             &shared_owner_rg_indexes.sessions,
             entry.metadata.owner_rg_id,
             key,
         );
-        if !entry.metadata.is_reverse
-            && let Ok(mut nat_sessions) = shared_nat_sessions.lock()
-        {
+        if !entry.metadata.is_reverse {
+            let mut nat_sessions = lock_shared_recover(shared_nat_sessions);
             let reverse_wire = reverse_session_key(&entry.key, entry.decision.nat);
             if let Some(removed) = nat_sessions.remove(&reverse_wire) {
                 remove_owner_rg_index_entry(
@@ -884,7 +929,9 @@ pub(super) fn remove_shared_session(
                     &reverse_canonical,
                 );
             }
-            if let Ok(mut forward_wire_sessions) = shared_forward_wire_sessions.lock() {
+            {
+                let mut forward_wire_sessions =
+                    lock_shared_recover(shared_forward_wire_sessions);
                 let wire_key = forward_wire_key(&entry.key, entry.decision.nat);
                 if wire_key != entry.key
                     && let Some(removed) = forward_wire_sessions.remove(&wire_key)
@@ -905,7 +952,10 @@ pub(super) fn owner_rg_session_keys(
     owner_rgs: &[i32],
 ) -> Vec<SessionKey> {
     let mut keys = FastSet::default();
-    if let Ok(index) = index.lock() {
+    {
+        // #2402: recover poison so the owner-RG index is not silently
+        // emptied (which hides every session from promotion/demotion).
+        let index = lock_shared_recover(index);
         for owner_rg_id in owner_rgs {
             if let Some(entries) = index.get(owner_rg_id) {
                 keys.extend(entries.iter().cloned());
@@ -920,9 +970,9 @@ pub(super) fn owner_rg_session_keys_serialized(
     index: &Arc<Mutex<OwnerRgSessionIndex>>,
     owner_rgs: &[i32],
 ) -> Vec<SessionKey> {
-    let Ok(_sessions) = sessions.lock() else {
-        return Vec::new();
-    };
+    // #2402: hold the shared-session lock (recovering poison) to serialize
+    // against concurrent insert/remove while the index is read.
+    let _sessions = lock_shared_recover(sessions);
     owner_rg_session_keys(index, owner_rgs)
 }
 
@@ -937,9 +987,9 @@ pub(super) fn refresh_reverse_prewarm_owner_rg_indexes(
         .map(|entry| reverse_prewarm_owner_rg_candidates(forwarding, dynamic_neighbors, entry));
     let next_owner_rgs = next_entry
         .map(|entry| reverse_prewarm_owner_rg_candidates(forwarding, dynamic_neighbors, entry));
-    let Ok(mut index) = index.lock() else {
-        return;
-    };
+    // #2402: recover poison so reverse-prewarm index maintenance is not
+    // skipped after a prior worker panic.
+    let mut index = lock_shared_recover(index);
     if let Some(previous_entry) = previous_entry {
         for owner_rg_id in previous_owner_rgs.unwrap_or_default() {
             remove_owner_rg_index_entry_locked(&mut index, owner_rg_id, &previous_entry.key);
@@ -996,12 +1046,12 @@ fn update_owner_rg_index(
     if owner_rg_id <= 0 {
         return;
     }
-    if let Ok(mut index) = index.lock() {
-        index
-            .entry(owner_rg_id)
-            .or_insert_with(FastSet::default)
-            .insert(key.clone());
-    }
+    // #2402: recover poison (owner-RG index maintenance).
+    let mut index = lock_shared_recover(index);
+    index
+        .entry(owner_rg_id)
+        .or_insert_with(FastSet::default)
+        .insert(key.clone());
 }
 
 fn remove_owner_rg_index_entry(
@@ -1012,9 +1062,9 @@ fn remove_owner_rg_index_entry(
     if owner_rg_id <= 0 {
         return;
     }
-    if let Ok(mut index) = index.lock() {
-        remove_owner_rg_index_entry_locked(&mut index, owner_rg_id, key);
-    }
+    // #2402: recover poison (owner-RG index maintenance).
+    let mut index = lock_shared_recover(index);
+    remove_owner_rg_index_entry_locked(&mut index, owner_rg_id, key);
 }
 
 fn remove_owner_rg_index_entry_locked(

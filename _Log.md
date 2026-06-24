@@ -13049,3 +13049,7 @@ top.
 - **Timestamp**: 2026-06-24
   - **Action**: #2377 — fix VRRP sendGARP gateway-probe target on /25+ subnets. Factored target computation into network-free helper `gatewayProbeTarget(ipNet) (net.IP, bool)` computing network+1 from masked CIDR; skip on /31//32. v4-only bug (v6 path has no .1 assumption). Added fail-on-revert table test + sendGARP-seam tests. Updated README + sendGARP docs.
   - **File(s)**: pkg/vrrp/instance.go, pkg/vrrp/instance_garp_probe_target_test.go, pkg/vrrp/README.md
+
+- **Timestamp**: 2026-06-24
+  - **Action**: #2402 — HA session promotion swallowed a poisoned shared-sessions lock and dropped ALL sessions on failover. Replaced poison-swallowing `.lock().map(..).unwrap_or_default()` / `if let Ok` / `.lock().ok()` / `match .lock() { Err=>return }` patterns across shared_ops.rs with poison-RECOVERING `lock_shared_recover` (into_inner + clear_poison + counter + sparse journald line), mirroring nat/allocator + worker_queue::lock_recover. Fixed prewarm + demote + publish + remove + 3 lookups + republish + owner-RG index helpers. Added fail-on-revert test (poison synced mutex, assert reverse companion still synthesized/published). Updated afxdp/README poison-policy section.
+  - **File(s)**: userspace-dp/src/afxdp/shared_ops.rs, userspace-dp/src/afxdp/ha_tests.rs, userspace-dp/src/afxdp/README.md
