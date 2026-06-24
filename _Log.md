@@ -12570,3 +12570,36 @@ top.
   source-path SESSION_OPEN/CLOSE wrongly suppressed → test fails; restored →
   pass). go build ./... ; go test pkg/{logging,daemon,dataplane/userspace}
   green; gofmt/vet clean (pre-existing syslog.go drift untouched).
+
+## 2026-06-24 — #2521 filter `then reject` active-reply synthesis
+
+- **Timestamp**: 2026-06-24
+- **Action**: Make firewall-filter `then reject` synthesize an active reply
+  (TCP RST / ICMP unreachable) on the input + lo0 paths instead of a silent
+  drop, reusing policy reject's machinery; add `filter_reject_sent` counter.
+- **File(s)**:
+  - userspace-dp/src/afxdp/poll_descriptor/reject_reply.rs — factor shared
+    `enqueue_reject_reply(... source)` with `RejectReplySource{Policy,Filter}`;
+    thin `enqueue_policy_reject_reply` / new `enqueue_filter_reject_reply`
+    wrappers; filter-reject unit tests (TCP RST + ICMP unreachable + counter).
+  - userspace-dp/src/afxdp/poll_descriptor/mod.rs — wire
+    `enqueue_filter_reject_reply` at the new-flow input filter,
+    DSCP/L4-sensitive session-hit re-eval, and both lo0 local-delivery sites;
+    capture lo0 action via `FilterAction` instead of bool.
+  - userspace-dp/src/afxdp/poll_descriptor/filter.rs — `apply_lo0_filter_action`
+    returns `FilterAction` (was bool) so caller can distinguish Reject/Discard.
+  - userspace-dp/src/afxdp/event_emit.rs — `filter_action_to_rt_flow` maps
+    Reject→REJECT (was DENY); test updated + discard-as-deny test added.
+  - filter_reject_sent counter chain: afxdp/mod.rs (BatchCounters + flush),
+    afxdp/umem/mod.rs (live atomic + ctor), umem/snapshot.rs, worker/mod.rs
+    (snapshot), coordinator/refresh_bindings.rs (copy + zero),
+    protocol/binding.rs (wire DTO), pkg/dataplane/userspace/protocol.go (Go DTO).
+  - userspace-dp/tests/fixtures/protocol_wire_v1.json — regenerated (new key).
+  - userspace-dp/src/filter/tests.rs — reject-distinct-from-discard compile test.
+  - userspace-dp/src/filter/README.md, docs/feature-gaps.md — document the
+    synthesis, classification parity, #2472 compose note, output-filter gap.
+- **Validation**: cargo build --release clean; targeted suites (filter,
+  reject_reply, poll_descriptor, event_emit, wire_invariant) 5/5 green;
+  fail-on-revert PROVEN twice (RejectReplySource::Filter→Policy fails the
+  counter test; compiler reject→Discard fails reject_action_compiles_distinct);
+  `then discard` still silent (no reply) confirmed; go build ./pkg/dataplane/userspace OK.

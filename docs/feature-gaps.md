@@ -389,6 +389,17 @@ xpf has a broad chassis cluster implementation with redundancy groups, RETH (VRR
 
 xpf has firewall filters with source/dest addresses, prefix-lists (with except), DSCP, protocol, dest/source ports, ICMP type/code, TCP flags, fragment match, actions (accept/reject/discard), routing-instance, log, count, forwarding-class, loss-priority, DSCP rewrite, and IPv6 traffic-class matching.
 
+Filter `then reject` is now an **active** reject on the input and lo0
+(host-bound) paths (#2521): it synthesizes a TCP RST (TCP) or ICMP/ICMPv6
+admin-prohibited unreachable (otherwise) using the SAME machinery as policy
+reject (`poll_descriptor/reject_reply.rs`), runs the generated reply through
+#2238 output-filter/CoS/DSCP classification, and counts it on
+`filter_reject_sent`. `then discard` stays a silent drop. Previously filter
+reject collapsed to a silent drop (fail-closed parity gap). REMAINING GAP:
+output-firewall-filter `then reject` realized on the TX/CoS path still
+collapses to a silent drop (the TX site lacks the descriptor context for
+reply synthesis) — tracked as a #2521 follow-up.
+
 `from protocol <name>` resolution is centralized (#2175) on the same
 `appid.ProtocolNumber` source of truth used by security-policy applications
 (#2124), so every protocol a policy accepts a firewall filter accepts too: the
