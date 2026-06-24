@@ -476,6 +476,13 @@ This package owns the KEA side of #2239 cross-chassis DHCP-server lease sync
   mis-seeded as an IA_NA address lease (#2262). A present-but-unparseable
   `lease_type` is fail-closed: the row is skipped (logged), never defaulted to
   IA_NA. An absent/empty column (old memfile, v4) stays IA_NA-equivalent.
+  The v6 owner identity (`splitV6Identity`, `"duid:DUID/IAID"`) is fail-closed
+  the same way (#2379): a present-but-unparseable IAID (non-decimal, empty,
+  oversized) returns an error and the row is skipped (logged), never silently
+  defaulted to IAID 0 — because 0 is a valid IAID, swallowing the parse error
+  would seed the peer's Kea lease DB with the wrong IAID on takeover and a
+  non-zero-IAID client could fail to renew with nothing logged. The legitimate
+  "no IAID present" form (`"duid:DUID"`) stays a clean IAID 0.
 - `SeedSyncLeases{4,6}(ctx, leases, now)` — write held peer leases into a
   just-started Kea via `lease{4,6}-add` (→ `lease{4,6}-update` on collision,
   idempotent), re-anchoring `expire = now + remaining` on the LOCAL clock.

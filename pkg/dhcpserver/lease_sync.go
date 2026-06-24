@@ -291,7 +291,17 @@ func readSyncLeasesViaMemfile(path string, family int, now time.Time) ([]SyncLea
 			}
 		}
 		if family == 6 {
-			duid, iaid := splitV6Identity(a.Identity)
+			duid, iaid, idErr := splitV6Identity(a.Identity)
+			if idErr != nil {
+				// #2379: a PRESENT but unparseable IAID would silently seed
+				// IAID 0 into the peer's Kea lease DB on takeover. Skip the
+				// lease (logged) rather than mis-seed it — fail-closed, the
+				// same posture as the unparseable lease_type / missing expire
+				// rows below.
+				slog.Warn("dhcpserver: skipping v6 memfile lease with unparseable IAID",
+					"address", a.Address, "identity", a.Identity, "error", idErr)
+				continue
+			}
 			l.DUID = duid
 			l.IAID = iaid
 			// #2262: preserve the v6 lease kind from the memfile instead of
@@ -393,16 +403,27 @@ func stringToKeaLeaseType(s string) (int, bool) {
 }
 
 // splitV6Identity inverts identity6 ("duid:DUID/IAID") back into DUID + IAID.
-func splitV6Identity(identity string) (duid string, iaid uint32) {
+//
+// The "no slash / no IAID" form ("duid:DUID") is a legitimate identity and
+// returns iaid=0 with a nil error. When the "/IAID" portion IS present it must
+// parse as a decimal uint32: a parse failure returns a non-nil error rather
+// than silently swallowing to iaid=0. Because 0 is a valid IAID, swallowing
+// would make a malformed identity indistinguishable from a real zero IAID and
+// would seed the peer's Kea lease DB with the wrong IAID on takeover, so a
+// non-zero-IAID client could fail to renew with nothing logged (#2379). The
+// callers (memfile takeover-seed loop) log+skip the lease on error, matching
+// how they already handle an unparseable lease_type / missing expire.
+func splitV6Identity(identity string) (duid string, iaid uint32, err error) {
 	s := strings.TrimPrefix(identity, "duid:")
 	if i := strings.LastIndex(s, "/"); i >= 0 {
 		duid = s[:i]
-		if v, err := strconv.ParseUint(s[i+1:], 10, 32); err == nil {
-			iaid = uint32(v)
+		v, perr := strconv.ParseUint(s[i+1:], 10, 32)
+		if perr != nil {
+			return duid, 0, fmt.Errorf("unparseable IAID %q in v6 identity %q: %w", s[i+1:], identity, perr)
 		}
-		return duid, iaid
+		return duid, uint32(v), nil
 	}
-	return s, 0
+	return s, 0, nil
 }
 
 // GetSyncLeases4 returns the active v4 leases this node is serving, preferring
