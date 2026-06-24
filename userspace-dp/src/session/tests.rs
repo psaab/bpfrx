@@ -4174,3 +4174,164 @@ fn touch_if_stale_survives_skew_that_starves_global_modulo() {
         );
     }
 }
+
+// === #2442 loss-of-sync resync tests ==========================
+//
+// `push_delta` drops a delta when the in-worker ring is at
+// MAX_SESSION_DELTAS, counting `delta_drops` but — pre-#2442 — never
+// surfacing the loss. The fix latches a loss-of-sync signal
+// (`take_delta_loss`) that the worker loop reads to force a full owner-RG
+// export so the downstream session-sync consumer rescans the table truth.
+
+/// Build a synthetic Open delta from the shared test fixtures. Used only to
+/// drive `push_delta` to the ring limit without installing real sessions.
+fn open_delta(key: SessionKey) -> SessionDelta {
+    SessionDelta {
+        kind: SessionDeltaKind::Open,
+        key,
+        decision: decision(),
+        metadata: metadata(),
+        origin: SessionOrigin::ForwardFlow,
+        fabric_redirect_sync: false,
+        created_ns: 0,
+        last_seen_ns: 0,
+    }
+}
+
+/// (a) Overflowing the ring sets the loss latch and counts the drop.
+/// FAIL-ON-REVERT: if `push_delta` stops setting `delta_loss_pending` the
+/// latch stays false and this assert goes red — the loss becomes invisible.
+#[test]
+fn delta_ring_overflow_sets_loss_signal() {
+    let mut table = SessionTable::new();
+    // Fill exactly to the cap — no drops yet.
+    for i in 0..MAX_SESSION_DELTAS {
+        table.push_delta(open_delta(make_v4_key(1, 1000 + (i as u16))));
+    }
+    assert_eq!(table.delta_drops(), 0, "filling to cap must not drop");
+    assert!(
+        !table.take_delta_loss(),
+        "no loss latched before any overflow"
+    );
+    // One more push overflows -> drop + loss latch.
+    table.push_delta(open_delta(make_v4_key(2, 2000)));
+    assert_eq!(table.delta_drops(), 1, "overflow must count one drop");
+    assert!(table.delta_loss_pending, "overflow must latch loss-of-sync");
+}
+
+/// (b) The loss is reported to the consumer via `take_delta_loss`, and a
+/// plain `drain_deltas` does NOT clear it (drain and loss are distinct
+/// signals — the consumer must learn the stream was lossy).
+#[test]
+fn drain_does_not_clear_loss_only_take_does() {
+    let mut table = SessionTable::new();
+    for i in 0..=MAX_SESSION_DELTAS {
+        table.push_delta(open_delta(make_v4_key(1, 100 + (i as u16))));
+    }
+    assert!(table.delta_loss_pending, "overflowed -> latched");
+    // Draining the surviving deltas must not swallow the loss signal.
+    let _ = table.drain_deltas(MAX_SESSION_DELTAS);
+    assert!(
+        table.delta_loss_pending,
+        "drain must not clear the loss latch"
+    );
+    assert!(
+        table.take_delta_loss(),
+        "consumer take must observe the loss"
+    );
+}
+
+/// (c) DEBOUNCE: a sustained overflow that drops many deltas before the
+/// consumer reads raises exactly ONE loss episode. A second `take` with no
+/// fresh drop in between returns false (no resync storm).
+#[test]
+fn loss_signal_debounces_a_burst_into_one_episode() {
+    let mut table = SessionTable::new();
+    // Overflow hard: push far past the cap so MANY deltas drop.
+    for i in 0..(MAX_SESSION_DELTAS * 3) {
+        table.push_delta(open_delta(make_v4_key((i % 250) as u8, (i % 1000) as u16)));
+    }
+    assert!(
+        table.delta_drops() >= (MAX_SESSION_DELTAS as u64) * 2,
+        "a 3x-cap burst drops well over a cap's worth"
+    );
+    // The whole burst collapses to one episode.
+    assert!(table.take_delta_loss(), "first take sees the episode");
+    assert!(
+        !table.take_delta_loss(),
+        "no fresh drop -> second take is silent (debounced)"
+    );
+}
+
+/// (d) After the consumer takes (models a completed resync) the signal
+/// clears; a FRESH overflow re-arms a NEW episode.
+#[test]
+fn fresh_overflow_after_take_rearms_a_new_episode() {
+    let mut table = SessionTable::new();
+    for i in 0..=MAX_SESSION_DELTAS {
+        table.push_delta(open_delta(make_v4_key(1, i as u16)));
+    }
+    assert!(table.take_delta_loss(), "episode 1 observed");
+    assert!(!table.take_delta_loss(), "cleared after take");
+    // Drain so the ring is empty again (a real resync would too), then a new
+    // burst overflows and re-arms.
+    let _ = table.drain_deltas(MAX_SESSION_DELTAS * 4);
+    for i in 0..=MAX_SESSION_DELTAS {
+        table.push_delta(open_delta(make_v4_key(2, i as u16)));
+    }
+    assert!(
+        table.take_delta_loss(),
+        "a fresh overflow re-arms a new loss episode"
+    );
+}
+
+/// RESYNC TRIGGER: the loss path re-exports owned forward sessions. Install
+/// real owned sessions, drain their open deltas (consumer is caught up),
+/// then run the same full-export walk the worker loop fires on loss and
+/// assert every owned forward session is re-emitted as a fresh Open delta —
+/// i.e. the consumer can rebuild the table truth after a lossy stream.
+#[test]
+fn loss_resync_re_exports_owned_forward_sessions() {
+    let mut table = SessionTable::new();
+    let now = 1_000_000_000u64;
+    let keys: Vec<SessionKey> = (0..5).map(|i| make_v4_key(10, 3000 + i)).collect();
+    for key in &keys {
+        assert!(table.install_with_protocol(
+            key.clone(),
+            decision(),
+            metadata(),
+            now,
+            PROTO_UDP,
+            0
+        ));
+    }
+    // Consumer drains the install open-deltas: it is now caught up.
+    let drained = table.drain_deltas(64);
+    assert_eq!(drained.len(), keys.len(), "one open delta per install");
+    assert!(!table.has_pending_deltas());
+
+    // The full-export walk the worker loop runs on loss (owner RG 1 from the
+    // shared `metadata()` fixture) re-emits an open delta per owned session.
+    let owner_rgs = table.all_owner_rg_ids();
+    assert!(
+        owner_rgs.contains(&1),
+        "owner RG 1 (the metadata fixture) is present"
+    );
+    crate::afxdp::export_forward_sessions_for_owner_rgs(&mut table, &owner_rgs);
+    let resync = table.drain_deltas(64);
+    assert_eq!(
+        resync.len(),
+        keys.len(),
+        "resync re-emits every owned forward session"
+    );
+    assert!(
+        resync.iter().all(|d| d.kind == SessionDeltaKind::Open),
+        "resync deltas are all Open (table-truth re-population)"
+    );
+    for key in &keys {
+        assert!(
+            resync.iter().any(|d| &d.key == key),
+            "owned session {key:?} re-exported on resync"
+        );
+    }
+}

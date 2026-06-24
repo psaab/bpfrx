@@ -760,6 +760,53 @@ pub(crate) fn worker_loop(
             )));
             last_cos_status_ns = loop_now_ns;
         }
+        // #2442: loss-of-sync resync. If `push_delta` dropped any delta since
+        // the last drain, the in-worker session-delta ring overflowed and the
+        // downstream session-sync consumer missed HA-relevant open/close
+        // events — its view may have silently diverged from the table truth.
+        // Re-emit an open delta for every owned forward session (the same
+        // table-truth walk `ExportOwnerRGSessions` performs) so the peer
+        // re-derives a complete snapshot. The latch is read-and-cleared, so a
+        // sustained overflow raises one resync per drain cycle, not per dropped
+        // delta. We first drain the backlog to make room, then export; the
+        // standard drain/flush block below ships the freshly-emitted deltas.
+        if sessions.take_delta_loss() {
+            // Drain (and flush) the existing backlog so the ring has headroom
+            // for the full export — otherwise the export's own pushes would
+            // immediately re-overflow and re-arm the latch.
+            while sessions.has_pending_deltas() {
+                let deltas = sessions.drain_deltas(256);
+                purge_queued_flows_for_closed_deltas(
+                    &mut bindings,
+                    &binding_lookup,
+                    &mut shared_recycles,
+                    &deltas,
+                );
+                if let Some(binding) = bindings.first() {
+                    let ident = binding.identity();
+                    flush_session_deltas(
+                        &ident,
+                        &binding.live,
+                        binding.bpf_maps.session_map_fd,
+                        conntrack_v4_fd,
+                        conntrack_v6_fd,
+                        &deltas,
+                        &shared_sessions,
+                        &shared_nat_sessions,
+                        &shared_forward_wire_sessions,
+                        &shared_owner_rg_indexes,
+                        &recent_session_deltas,
+                        &peer_worker_commands,
+                        &event_stream,
+                        forwarding.as_ref(),
+                    );
+                }
+            }
+            let owner_rgs = sessions.all_owner_rg_ids();
+            if !owner_rgs.is_empty() {
+                crate::afxdp::export_forward_sessions_for_owner_rgs(&mut sessions, &owner_rgs);
+            }
+        }
         if !exported_sequences.is_empty() {
             while sessions.has_pending_deltas() {
                 let deltas = sessions.drain_deltas(256);

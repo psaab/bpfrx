@@ -313,6 +313,40 @@ all userspace sessions owned by the demoting RGs. This is not the same thing as
 the steady-state delta drain. It is an explicit republish step used to reduce
 handoff loss.
 
+### Delta-ring overflow → loss-of-sync resync (#2442)
+
+Each worker buffers session open/close deltas in an in-worker ring
+(`SessionTable.deltas`, capped at `MAX_SESSION_DELTAS = 4096`). The worker loop
+drains it 256 at a time. Under a churn burst (failover storm, SYN-cookie
+admission flood) the ring can fill faster than the drain catches up, and
+`push_delta` drops the overflowing delta — an HA-relevant open/close event the
+downstream session-sync consumer will never see.
+
+Pre-#2442 this only bumped a `delta_drops` counter, so the peer/session view
+silently diverged from the table truth with no consumer-visible "rescan"
+contract. The fix turns a drop into an explicit **loss-of-sync** signal:
+
+- `push_delta` latches `delta_loss_pending` the moment it drops (alongside the
+  existing `delta_drops` count). It is a single bool, not a count.
+- The worker loop reads-and-clears it once per drain cycle via
+  `take_delta_loss()`. A `true` result means the incremental stream went lossy.
+- On loss the worker drains the existing backlog (to make ring headroom), then
+  re-emits an Open delta for **every owned forward session** via
+  `export_forward_sessions_for_owner_rgs(all_owner_rg_ids())` — the same
+  table-truth walk the `ExportOwnerRGSessions` command performs. Those deltas
+  flow out through the normal `flush_session_deltas` path, so the consumer
+  re-derives a complete snapshot instead of diverging.
+
+**Debounce / composition with the sync state machine.** The signal is a single
+bool cleared on read, so a burst that drops N deltas before the worker reads it
+raises **exactly one** resync (one episode → one trigger); a fresh drop after
+the clear re-arms a new episode. The resync is entirely worker-local — it
+re-uses the same per-worker delta ring and `flush_session_deltas` plumbing the
+steady-state drain already uses, so it needs **no control-socket round-trip**
+and cannot deadlock or starve normal incremental sync (the control-socket
+contention rules in CLAUDE.md). It runs at most once per worker poll tick and
+only when an overflow actually occurred.
+
 ## Clock Synchronization
 
 At connection setup, both sides exchange monotonic timestamps with `ClockSync`.

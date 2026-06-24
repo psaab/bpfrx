@@ -322,6 +322,17 @@ pub(crate) struct SessionTable {
     /// contract). Plain u64 like `create_drops`.
     install_partial: u64,
     delta_drops: u64,
+    /// #2442: loss-of-sync latch. Set true the moment `push_delta` drops a
+    /// delta because the ring is full (a HA-relevant open/close event that the
+    /// downstream session-sync consumer will NEVER see). Cleared by
+    /// `take_delta_loss`, which the worker loop calls once per drain cycle. A
+    /// true value tells the worker "the incremental stream went lossy; rescan
+    /// the table truth" — it triggers a full owner-RG export so the peer
+    /// re-derives the session view from a complete snapshot instead of
+    /// silently diverging. The latch is a single bool, so a burst that drops N
+    /// deltas before the worker reads it raises EXACTLY ONE resync (debounce by
+    /// construction — see `take_delta_loss`).
+    delta_loss_pending: bool,
     delta_drained: u64,
     /// #1760: cumulative count of NAT reverse-key displacement events on
     /// `nat_reverse_index`. Incremented whenever the per-flow secondary-
@@ -400,6 +411,7 @@ impl SessionTable {
             admission_refused: 0,
             install_partial: 0,
             delta_drops: 0,
+            delta_loss_pending: false,
             delta_drained: 0,
             nat_reverse_key_collisions: 0,
             wheel: SessionWheel::new(),
@@ -974,9 +986,41 @@ impl SessionTable {
         !self.deltas.is_empty()
     }
 
+    /// #2442: read-and-clear the loss-of-sync latch. Returns true iff
+    /// `push_delta` dropped at least one delta since the last call — i.e. the
+    /// incremental session-sync stream went lossy and the downstream consumer's
+    /// view may have silently diverged from the table truth. The worker loop
+    /// calls this once per drain cycle; a true result drives a full owner-RG
+    /// export so the peer re-derives the session view from a complete snapshot.
+    ///
+    /// DEBOUNCE: the latch is a single bool cleared here, so a burst dropping N
+    /// deltas before this read raises exactly one resync (one episode → one
+    /// trigger). A fresh drop AFTER the clear re-arms it for the next episode.
+    #[inline]
+    pub fn take_delta_loss(&mut self) -> bool {
+        let lossy = self.delta_loss_pending;
+        self.delta_loss_pending = false;
+        lossy
+    }
+
+    /// #2442: cumulative count of deltas dropped on ring overflow. Surfaced for
+    /// health/status telemetry so operators can see the loss-of-sync episodes
+    /// (each one forces a resync). Test/diagnostic accessor.
+    pub fn delta_drops(&self) -> u64 {
+        self.delta_drops
+    }
+
     fn push_delta(&mut self, delta: SessionDelta) {
         if self.deltas.len() >= MAX_SESSION_DELTAS {
             self.delta_drops = self.delta_drops.saturating_add(1);
+            // #2442: a dropped delta is a HA-relevant open/close event the
+            // downstream session-sync consumer will never observe — the
+            // incremental stream is now lossy. Latch loss-of-sync so the
+            // worker loop forces a full owner-RG export (table-truth rescan).
+            // Single bool: a burst that overflows repeatedly before the worker
+            // reads it raises exactly one resync (see `take_delta_loss`). Hot
+            // path: a plain branch + bool store, no allocation, no syscall.
+            self.delta_loss_pending = true;
             return;
         }
         self.deltas.push_back(delta);

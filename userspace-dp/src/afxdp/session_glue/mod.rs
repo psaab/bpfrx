@@ -454,7 +454,11 @@ pub(super) fn delete_terminal_filtered_session(
     );
 }
 
-pub(in crate::afxdp::session_glue) fn export_forward_sessions_for_owner_rgs(
+// #2442: widened from `pub(in crate::afxdp::session_glue)` to `pub(crate)` so
+// the worker loop's loss-of-sync resync path (`worker::loop_body`) — and the
+// session-module resync test — can re-emit owned forward sessions through the
+// same table-truth walk the `ExportOwnerRGSessions` command uses.
+pub(crate) fn export_forward_sessions_for_owner_rgs(
     sessions: &mut SessionTable,
     owner_rgs: &[i32],
 ) {
