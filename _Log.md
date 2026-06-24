@@ -1,5 +1,37 @@
 # Action Log
 
+## 2026-06-24 — #2616/#2618/#2619 fix: firewall-filter fall-through log metadata
+
+- **Timestamp**: 2026-06-24
+- **Action**: codex review-040 findings 040-01/040-03/040-05. One coherent
+  filter-evaluator log-metadata fix across the post-#2544 fall-through machinery.
+  - #2616: a fall-through `then { log; next term; }` term recorded its Accept
+    PLACEHOLDER action into `log_match`; a later terminal `discard`/`reject`
+    left the RT_FLOW log saying permit. FIX: `normalize_log_match_action` stamps
+    the accumulated `log_match.action` with the FINAL `acc.action` before every
+    evaluator returns (main v4/v6, non-routing v4/v6, log-only helper,
+    routing-instance evaluators).
+  - #2618: the log-only helper `evaluate_filter_ref_log_match` returned on the
+    FIRST matched logging fall-through term, diverging from the full evaluator's
+    latest-matched semantics. FIX: rewrite it to accumulate latest-matched +
+    normalize action to the terminal verdict.
+  - #2619: the PBR routing-instance evaluator dropped fall-through `then log`
+    metadata for terms ahead of the routing-instance term. FIX: added
+    `log_match: Option<FilterLogMatch>` to `FilterRoutingInstanceResult`,
+    accumulate latest-matched logging term (fall-through + the RI term itself),
+    normalize to the RI term's verdict; forwarding/mod.rs PBR emit now uses the
+    accumulated `log_match` instead of only the RI term's own log.
+  - Siblings #2617 (emit timing miss vs cache-hit), #2620 (counter double-count
+    across split passes), #2621 (fc/dscp/policer modifiers dropped pre-RI) are
+    DISTINCT code paths (poll_descriptor emit / counter side-effects /
+    TX-selection) — left for follow-up, not bundled.
+- **File(s)**: userspace-dp/src/filter/engine/eval.rs,
+  userspace-dp/src/filter/mod.rs, userspace-dp/src/afxdp/forwarding/mod.rs,
+  userspace-dp/src/filter/tests.rs, userspace-dp/src/filter/README.md
+- **Validation**: cargo build --release green; 6 new regression tests pass;
+  fail-on-revert proven for all three fixes; full suite 2709 pass / 1 known
+  flake (worker_queue concurrent_recovery, passes in isolation).
+
 ## 2026-06-24 — #2606 fix: DHCP relay silently dropped DHCPNAK server responses
 
 - **Timestamp**: 2026-06-24

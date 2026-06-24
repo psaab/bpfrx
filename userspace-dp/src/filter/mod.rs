@@ -655,6 +655,16 @@ pub(crate) struct FilterRoutingInstanceResult<'a> {
     pub(crate) action: FilterAction,
     pub(crate) filter_id: u32,
     pub(crate) term_id: u32,
+    // #2619: the latest-matched logging term seen while scanning for the
+    // routing-instance term — INCLUDING fall-through `then { log; next term; }`
+    // terms ahead of the routing-instance term, whose log metadata the PBR path
+    // previously dropped. `None` when no matched term carried `then log`. The
+    // action is normalized to the verdict the packet receives on the PBR path
+    // (#2616): the routing-instance term itself terminates with its own action,
+    // so a fall-through log ahead of it logs that terminal action. The legacy
+    // `log`/`action`/`filter_id`/`term_id` fields above describe ONLY the
+    // routing-instance term; emitters now prefer `log_match`.
+    pub(crate) log_match: Option<FilterLogMatch>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

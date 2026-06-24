@@ -128,10 +128,28 @@ fn evaluate_filter_ref_counted_v4(
         merge_matched_modifiers(&mut acc, filter, term);
         if !term.continue_term {
             acc.action = term.action;
+            normalize_log_match_action(&mut acc);
             return acc;
         }
     }
+    normalize_log_match_action(&mut acc);
     acc
+}
+
+/// #2616: the RT_FLOW log action must report the verdict the packet actually
+/// received, not the placeholder Accept a fall-through (`then { log; next term; }`)
+/// logging term carries in its `action` field. The accumulated `log_match`
+/// tracks the latest matched logging term's identity (filter_id/term_id), but
+/// its action is the term's own — which is the Accept placeholder for a
+/// fall-through term. Before the result leaves the evaluator, rewrite the
+/// log_match action to the final `acc.action` so a `log; next term` ahead of a
+/// terminal `discard`/`reject` logs DENY, not permit. For a terminating logging
+/// term `term.action == acc.action` already, so this is a no-op there.
+#[inline]
+fn normalize_log_match_action(acc: &mut FilterResult) {
+    if let Some(lm) = acc.log_match.as_mut() {
+        lm.action = acc.action;
+    }
 }
 
 /// #2544: merge a matched term's modifiers into the running result. Used by both
@@ -141,7 +159,9 @@ fn evaluate_filter_ref_counted_v4(
 /// term wins for each scalar modifier (Junos applies modifiers as terms are
 /// traversed); `log` is OR'd so any matched term with `then log` lights it. The
 /// log_match diagnostic tracks the latest matched logging term. The action is
-/// NOT set here — the caller sets it only for a terminating term.
+/// NOT set here — the caller sets it only for a terminating term, and
+/// `normalize_log_match_action` (#2616) rewrites the stored log_match action to
+/// the final verdict before the result is returned.
 #[inline]
 fn merge_matched_modifiers(acc: &mut FilterResult, filter: &Filter, term: &FilterTerm) {
     if term.dscp_rewrite.is_some() {
@@ -191,9 +211,11 @@ fn evaluate_filter_ref_counted_v6(
         merge_matched_modifiers(&mut acc, filter, term);
         if !term.continue_term {
             acc.action = term.action;
+            normalize_log_match_action(&mut acc);
             return acc;
         }
     }
+    normalize_log_match_action(&mut acc);
     acc
 }
 
@@ -271,9 +293,11 @@ fn evaluate_filter_ref_non_routing_counted_v4(
         acc.routing_instance = String::new();
         if !term.continue_term {
             acc.action = term.action;
+            normalize_log_match_action(&mut acc);
             return acc;
         }
     }
+    normalize_log_match_action(&mut acc);
     acc
 }
 
@@ -307,9 +331,11 @@ fn evaluate_filter_ref_non_routing_counted_v6(
         acc.routing_instance = String::new();
         if !term.continue_term {
             acc.action = term.action;
+            normalize_log_match_action(&mut acc);
             return acc;
         }
     }
+    normalize_log_match_action(&mut acc);
     acc
 }
 
@@ -334,6 +360,7 @@ fn evaluate_filter_ref_routing_instance_counted_v4<'a>(
     extra: TermMatchExtra,
     packet_bytes: u64,
 ) -> Option<FilterRoutingInstanceResult<'a>> {
+    let mut acc_log: Option<FilterLogMatch> = None;
     for term in &filter.terms {
         if !term_matches_v4(
             term, src_ip, dst_ip, protocol, src_port, dst_port, dscp, extra,
@@ -349,17 +376,35 @@ fn evaluate_filter_ref_routing_instance_counted_v4<'a>(
         // TERMINATING term without a routing-instance still halts (returns None
         // via the `?` below): once a packet is accepted/discarded there is no
         // routing-instance override to find.
+        // #2619: capture a fall-through `then log` term's log_match before we
+        // continue past it — the PBR path previously dropped these. Latest
+        // matched logging term wins, mirroring the full evaluator.
         if term.continue_term {
+            if let Some(lm) = filter_log_match(filter, term) {
+                acc_log = Some(lm);
+            }
             continue;
         }
         let routing_instance =
             (!term.routing_instance.is_empty()).then_some(term.routing_instance.as_str())?;
+        // The routing-instance term itself may also carry `then log`; latest
+        // matched wins so it supersedes any earlier fall-through log.
+        if let Some(lm) = filter_log_match(filter, term) {
+            acc_log = Some(lm);
+        }
+        // #2616: the routing-instance term is terminating on the PBR path; stamp
+        // its action onto the accumulated log_match so a fall-through log ahead
+        // of it reports the verdict the packet actually receives.
+        if let Some(lm) = acc_log.as_mut() {
+            lm.action = term.action;
+        }
         return Some(FilterRoutingInstanceResult {
             routing_instance,
             log: term.log,
             action: term.action,
             filter_id: filter.id,
             term_id: term.id,
+            log_match: acc_log,
         });
     }
     None
@@ -377,6 +422,7 @@ fn evaluate_filter_ref_routing_instance_counted_v6<'a>(
     extra: TermMatchExtra,
     packet_bytes: u64,
 ) -> Option<FilterRoutingInstanceResult<'a>> {
+    let mut acc_log: Option<FilterLogMatch> = None;
     for term in &filter.terms {
         if !term_matches_v6(
             term, src_ip, dst_ip, protocol, src_port, dst_port, dscp, extra,
@@ -387,17 +433,29 @@ fn evaluate_filter_ref_routing_instance_counted_v6<'a>(
             record_filter_counter(&term.counter, packet_bytes);
         }
         // #2544: see the v4 variant — a matched fall-through term keeps scanning.
+        // #2619: capture its log_match before continuing (latest wins).
         if term.continue_term {
+            if let Some(lm) = filter_log_match(filter, term) {
+                acc_log = Some(lm);
+            }
             continue;
         }
         let routing_instance =
             (!term.routing_instance.is_empty()).then_some(term.routing_instance.as_str())?;
+        if let Some(lm) = filter_log_match(filter, term) {
+            acc_log = Some(lm);
+        }
+        // #2616: stamp the routing-instance term's verdict onto the log_match.
+        if let Some(lm) = acc_log.as_mut() {
+            lm.action = term.action;
+        }
         return Some(FilterRoutingInstanceResult {
             routing_instance,
             log: term.log,
             action: term.action,
             filter_id: filter.id,
             term_id: term.id,
+            log_match: acc_log,
         });
     }
     None
@@ -685,11 +743,21 @@ fn evaluate_filter_ref_log_match(
     }
     // #2544: a matched fall-through term (`then next term` / modifier-only) with
     // `then log` fires its log even though evaluation continues to later terms.
-    // Walk terms: a matched logging fall-through term emits its log_match; a
-    // matched fall-through term without `log` is skipped (keep scanning for a
-    // later logging/terminating term); the first matched TERMINATING term ends
-    // the scan and emits its log_match (None when it has no `log`), matching the
-    // first-match-wins behavior for terminating terms.
+    // #2618: this log-only helper must share the FULL evaluator's
+    // latest-matched-logging-term semantics — it previously returned on the
+    // FIRST matched logging fall-through term, so two `log; next term` terms made
+    // the cached input-filter log point at a different term than live evaluation.
+    // Walk all terms: a matched logging fall-through term records its log_match
+    // and keeps scanning (latest wins); a matched fall-through term without `log`
+    // is skipped; the first matched TERMINATING term ends the scan, recording its
+    // own log_match (when it has `log`) and resolving the final verdict.
+    //
+    // #2616: the recorded log action must follow the FINAL verdict, not the
+    // Accept placeholder a fall-through logging term carries — track the terminal
+    // action and stamp it onto the accumulated log_match before returning so a
+    // `log; next term` ahead of a terminal discard/reject logs DENY, not permit.
+    let mut acc_log: Option<FilterLogMatch> = None;
+    let mut final_action = FilterAction::Accept;
     for term in &filter.terms {
         if !term_matches(
             term, src_ip, dst_ip, protocol, src_port, dst_port, dscp, extra,
@@ -697,17 +765,28 @@ fn evaluate_filter_ref_log_match(
             continue;
         }
         if term.continue_term {
-            if term.log {
-                return filter_log_match(filter, term);
+            if let Some(lm) = filter_log_match(filter, term) {
+                acc_log = Some(lm);
             }
             continue;
         }
         if skip_routing_instance && !term.routing_instance.is_empty() {
-            return None;
+            // The route-lookup-affecting PBR term is handled by the
+            // routing-instance evaluator; its log is not emitted on this path.
+            // Any earlier fall-through log_match still carries the verdict the
+            // packet receives here (default Accept on the non-PBR path).
+            break;
         }
-        return filter_log_match(filter, term);
+        final_action = term.action;
+        if let Some(lm) = filter_log_match(filter, term) {
+            acc_log = Some(lm);
+        }
+        break;
     }
-    None
+    if let Some(lm) = acc_log.as_mut() {
+        lm.action = final_action;
+    }
+    acc_log
 }
 
 /// Evaluate the per-interface output filter for a given address family.
