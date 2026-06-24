@@ -333,181 +333,7 @@ func compileInterfaces(node *Node, ifaces *InterfacesConfig) error {
 							if addrInst.node.FindChild("preferred") != nil {
 								unit.PreferredAddress = addrInst.name
 							}
-							// Parse VRRP groups under address. Handles both AST
-							// shapes (#1796): properties as child nodes
-							// (hierarchical blocks + schema-structured flat-set)
-							// AND properties packed into the instance node's
-							// Keys[2:] (legacy flat-set leaves, one leaf per
-							// `set ... vrrp-group <id> <prop> <value>` line —
-							// merged into one group instead of last-leaf-wins).
-							for _, vrrpInst := range namedInstances(addrInst.node.FindChildren("vrrp-group")) {
-								groupID, err := strconv.Atoi(vrrpInst.name)
-								if err != nil {
-									continue
-								}
-								if unit.VRRPGroups == nil {
-									unit.VRRPGroups = make(map[string]*VRRPGroup)
-								}
-								key := fmt.Sprintf("%s_grp%d", addrInst.name, groupID)
-								vg := unit.VRRPGroups[key]
-								if vg == nil {
-									vg = &VRRPGroup{
-										ID:       groupID,
-										Priority: 100, // default
-									}
-									unit.VRRPGroups[key] = vg
-								}
-								// Keys-encoded properties (flat-set leaf shape):
-								// Keys = ["vrrp-group", "<id>", prop, value, ...].
-								keys := vrrpInst.node.Keys
-								for i := 2; i < len(keys); i++ {
-									switch keys[i] {
-									case "virtual-address":
-										// Multi-value (#1813): consume every
-										// following token up to the next
-										// recognized property keyword —
-										// `vrrp-group 1 virtual-address
-										// [ a b ];` packs all addresses
-										// inline.
-										for i+1 < len(keys) && !vrrpGroupPropertyKeywords[keys[i+1]] {
-											i++
-											vg.VirtualAddresses = append(vg.VirtualAddresses, keys[i])
-										}
-									case "priority":
-										if i+1 < len(keys) {
-											i++
-											vg.Priority, _ = strconv.Atoi(keys[i])
-										}
-									case "preempt":
-										vg.Preempt = true
-									case "accept-data":
-										vg.AcceptData = true
-									case "advertise-interval":
-										if i+1 < len(keys) {
-											i++
-											vg.AdvertiseInterval, _ = strconv.Atoi(keys[i])
-										}
-									case "authentication-type":
-										if i+1 < len(keys) {
-											i++
-											vg.AuthType = keys[i]
-										}
-									case "authentication-key":
-										if i+1 < len(keys) {
-											i++
-											vg.AuthKey = Secret(keys[i])
-										}
-									case "track-interface":
-										if i+1 < len(keys) {
-											i++
-											// First-wins (#1814): duplicates in
-											// the Keys-packed spelling are
-											// rejected/warned by the AST
-											// pre-walk; keep the first here so
-											// lenient semantics are consistent
-											// with the child-node prune.
-											if vg.TrackInterface == "" {
-												vg.TrackInterface = keys[i]
-											}
-										}
-									case "track-priority-cost":
-										if i+1 < len(keys) {
-											i++
-											vg.TrackPriorityDelta, _ = parseTrackCost(keys[i])
-										}
-									}
-								}
-								// Child-node properties (hierarchical blocks and
-								// schema-structured flat-set containers).
-								// Track-interface values are gathered and applied
-								// AFTER the loop so the nested
-								// `track-interface <if> { priority-cost <n>; }`
-								// form wins over the legacy flat sibling
-								// `track-priority-cost <n>` regardless of node
-								// order (#1814 — the loop is source-order based).
-								var (
-									trackIface          string
-									trackIfaceSet       bool
-									nestedTrackCost     int
-									nestedTrackCostSet  bool
-									siblingTrackCost    int
-									siblingTrackCostSet bool
-								)
-								for _, prop := range vrrpInst.node.Children {
-									switch prop.Name() {
-									case "virtual-address":
-										// Multi-value spellings (#1813):
-										// bracketed `virtual-address [ a b ];`
-										// packs all addresses into Keys[1:]
-										// (flat-set replay may carry trailing
-										// values as children); braced block
-										// `virtual-address { a; b; }` holds
-										// one child per address. nodeVal kept
-										// only the first of each.
-										for _, k := range prop.Keys[1:] {
-											vg.VirtualAddresses = append(vg.VirtualAddresses, k)
-										}
-										for _, child := range prop.Children {
-											if v := child.Name(); v != "" {
-												vg.VirtualAddresses = append(vg.VirtualAddresses, v)
-											}
-										}
-									case "priority":
-										if v := nodeVal(prop); v != "" {
-											vg.Priority, _ = strconv.Atoi(v)
-										}
-									case "preempt":
-										vg.Preempt = true
-									case "accept-data":
-										vg.AcceptData = true
-									case "advertise-interval":
-										if v := nodeVal(prop); v != "" {
-											vg.AdvertiseInterval, _ = strconv.Atoi(v)
-										}
-									case "authentication-type":
-										vg.AuthType = nodeVal(prop)
-									case "authentication-key":
-										vg.AuthKey = Secret(nodeVal(prop))
-									case "track-interface":
-										// The interface name lives in Keys[1]
-										// (NOT nodeVal — its Children[0]
-										// fallback would misread the nested
-										// priority-cost child as the name).
-										if len(prop.Keys) >= 2 {
-											trackIface = prop.Keys[1]
-											trackIfaceSet = true
-										}
-										// Nested form (#1814): standard Junos
-										// `track-interface <if> { priority-cost <n>; }`.
-										if pc := prop.FindChild("priority-cost"); pc != nil {
-											if v := nodeVal(pc); v != "" {
-												if n, ok := parseTrackCost(v); ok {
-													nestedTrackCost = n
-													nestedTrackCostSet = true
-												}
-											}
-										}
-									case "track-priority-cost":
-										if v := nodeVal(prop); v != "" {
-											if n, ok := parseTrackCost(v); ok {
-												siblingTrackCost = n
-												siblingTrackCostSet = true
-											}
-										}
-									}
-								}
-								if trackIfaceSet {
-									vg.TrackInterface = trackIface
-								}
-								if siblingTrackCostSet {
-									vg.TrackPriorityDelta = siblingTrackCost
-								}
-								if nestedTrackCostSet {
-									// Nested wins over the legacy sibling,
-									// independent of node order.
-									vg.TrackPriorityDelta = nestedTrackCost
-								}
-							}
+							parseVRRPGroups(unit, addrInst.name, addrInst.node)
 						}
 						if dhcpNode := afNode.FindChild("dhcp"); dhcpNode != nil {
 							unit.DHCP = true
@@ -566,6 +392,10 @@ func compileInterfaces(node *Node, ifaces *InterfacesConfig) error {
 							if addrInst.node.FindChild("preferred") != nil && unit.PreferredAddress == "" {
 								unit.PreferredAddress = addrInst.name
 							}
+							// IPv6 VRRP groups (#2384): identical parse to the
+							// inet arm; the VIPs are IPv6 and the engine
+							// family-detects them at parse time.
+							parseVRRPGroups(unit, addrInst.name, addrInst.node)
 						}
 						if afNode.FindChild("dhcpv6") != nil {
 							unit.DHCPv6 = true
@@ -790,6 +620,188 @@ func parseMSSValue(node *Node) int {
 		return v
 	}
 	return 0
+}
+
+// parseVRRPGroups parses every `vrrp-group <id> { ... }` block under a
+// family inet/inet6 address into unit.VRRPGroups. Shared by both family
+// arms (#2384): the inet6 path carries IPv6 VIPs, and the native VRRP
+// engine family-detects each VIP at parse (pkg/vrrp/instance.go
+// ip.To4()==nil), so no runtime change was needed. Groups are keyed
+// `<address-CIDR>_grp<id>`, so a dual-stack unit with the same group ID
+// under both an inet AND an inet6 address yields TWO distinct map
+// entries (the v4 and v6 address strings differ) — no collision.
+// Handles both AST shapes (#1796): properties packed into the instance
+// node's Keys[2:] (legacy flat-set leaves) AND properties as child
+// nodes (hierarchical blocks + schema-structured flat-set).
+func parseVRRPGroups(unit *InterfaceUnit, addrName string, addrNode *Node) {
+	for _, vrrpInst := range namedInstances(addrNode.FindChildren("vrrp-group")) {
+		groupID, err := strconv.Atoi(vrrpInst.name)
+		if err != nil {
+			continue
+		}
+		if unit.VRRPGroups == nil {
+			unit.VRRPGroups = make(map[string]*VRRPGroup)
+		}
+		key := fmt.Sprintf("%s_grp%d", addrName, groupID)
+		vg := unit.VRRPGroups[key]
+		if vg == nil {
+			vg = &VRRPGroup{
+				ID:       groupID,
+				Priority: 100, // default
+			}
+			unit.VRRPGroups[key] = vg
+		}
+		// Keys-encoded properties (flat-set leaf shape):
+		// Keys = ["vrrp-group", "<id>", prop, value, ...].
+		keys := vrrpInst.node.Keys
+		for i := 2; i < len(keys); i++ {
+			switch keys[i] {
+			case "virtual-address":
+				// Multi-value (#1813): consume every
+				// following token up to the next
+				// recognized property keyword —
+				// `vrrp-group 1 virtual-address
+				// [ a b ];` packs all addresses
+				// inline.
+				for i+1 < len(keys) && !vrrpGroupPropertyKeywords[keys[i+1]] {
+					i++
+					vg.VirtualAddresses = append(vg.VirtualAddresses, keys[i])
+				}
+			case "priority":
+				if i+1 < len(keys) {
+					i++
+					vg.Priority, _ = strconv.Atoi(keys[i])
+				}
+			case "preempt":
+				vg.Preempt = true
+			case "accept-data":
+				vg.AcceptData = true
+			case "advertise-interval":
+				if i+1 < len(keys) {
+					i++
+					vg.AdvertiseInterval, _ = strconv.Atoi(keys[i])
+				}
+			case "authentication-type":
+				if i+1 < len(keys) {
+					i++
+					vg.AuthType = keys[i]
+				}
+			case "authentication-key":
+				if i+1 < len(keys) {
+					i++
+					vg.AuthKey = Secret(keys[i])
+				}
+			case "track-interface":
+				if i+1 < len(keys) {
+					i++
+					// First-wins (#1814): duplicates in
+					// the Keys-packed spelling are
+					// rejected/warned by the AST
+					// pre-walk; keep the first here so
+					// lenient semantics are consistent
+					// with the child-node prune.
+					if vg.TrackInterface == "" {
+						vg.TrackInterface = keys[i]
+					}
+				}
+			case "track-priority-cost":
+				if i+1 < len(keys) {
+					i++
+					vg.TrackPriorityDelta, _ = parseTrackCost(keys[i])
+				}
+			}
+		}
+		// Child-node properties (hierarchical blocks and
+		// schema-structured flat-set containers).
+		// Track-interface values are gathered and applied
+		// AFTER the loop so the nested
+		// `track-interface <if> { priority-cost <n>; }`
+		// form wins over the legacy flat sibling
+		// `track-priority-cost <n>` regardless of node
+		// order (#1814 — the loop is source-order based).
+		var (
+			trackIface          string
+			trackIfaceSet       bool
+			nestedTrackCost     int
+			nestedTrackCostSet  bool
+			siblingTrackCost    int
+			siblingTrackCostSet bool
+		)
+		for _, prop := range vrrpInst.node.Children {
+			switch prop.Name() {
+			case "virtual-address":
+				// Multi-value spellings (#1813):
+				// bracketed `virtual-address [ a b ];`
+				// packs all addresses into Keys[1:]
+				// (flat-set replay may carry trailing
+				// values as children); braced block
+				// `virtual-address { a; b; }` holds
+				// one child per address. nodeVal kept
+				// only the first of each.
+				for _, k := range prop.Keys[1:] {
+					vg.VirtualAddresses = append(vg.VirtualAddresses, k)
+				}
+				for _, child := range prop.Children {
+					if v := child.Name(); v != "" {
+						vg.VirtualAddresses = append(vg.VirtualAddresses, v)
+					}
+				}
+			case "priority":
+				if v := nodeVal(prop); v != "" {
+					vg.Priority, _ = strconv.Atoi(v)
+				}
+			case "preempt":
+				vg.Preempt = true
+			case "accept-data":
+				vg.AcceptData = true
+			case "advertise-interval":
+				if v := nodeVal(prop); v != "" {
+					vg.AdvertiseInterval, _ = strconv.Atoi(v)
+				}
+			case "authentication-type":
+				vg.AuthType = nodeVal(prop)
+			case "authentication-key":
+				vg.AuthKey = Secret(nodeVal(prop))
+			case "track-interface":
+				// The interface name lives in Keys[1]
+				// (NOT nodeVal — its Children[0]
+				// fallback would misread the nested
+				// priority-cost child as the name).
+				if len(prop.Keys) >= 2 {
+					trackIface = prop.Keys[1]
+					trackIfaceSet = true
+				}
+				// Nested form (#1814): standard Junos
+				// `track-interface <if> { priority-cost <n>; }`.
+				if pc := prop.FindChild("priority-cost"); pc != nil {
+					if v := nodeVal(pc); v != "" {
+						if n, ok := parseTrackCost(v); ok {
+							nestedTrackCost = n
+							nestedTrackCostSet = true
+						}
+					}
+				}
+			case "track-priority-cost":
+				if v := nodeVal(prop); v != "" {
+					if n, ok := parseTrackCost(v); ok {
+						siblingTrackCost = n
+						siblingTrackCostSet = true
+					}
+				}
+			}
+		}
+		if trackIfaceSet {
+			vg.TrackInterface = trackIface
+		}
+		if siblingTrackCostSet {
+			vg.TrackPriorityDelta = siblingTrackCost
+		}
+		if nestedTrackCostSet {
+			// Nested wins over the legacy sibling,
+			// independent of node order.
+			vg.TrackPriorityDelta = nestedTrackCost
+		}
+	}
 }
 
 // validateVRRPTrackInterfaceAST walks the (group-expanded) AST and

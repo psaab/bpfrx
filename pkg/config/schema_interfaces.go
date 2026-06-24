@@ -130,80 +130,9 @@ var schemaInterfaces = &schemaNode{desc: "Interface configuration", wildcard: &s
 					keyValueExamples: []string{"10.0.1.10/24"},
 					keyValidator:     ValidateIPv4CIDR,
 					children: map[string]*schemaNode{
-						"primary":   {desc: "Primary address", children: nil},
-						"preferred": {desc: "Preferred address", children: nil},
-						"vrrp-group": {desc: "VRRP group", args: 1, placeholder: "<group-id>", children: map[string]*schemaNode{
-							// xpf-DIVERGENT from Junos (bare IP): the VIP
-							// string is netlink.ParseAddr'd verbatim when
-							// the group masters (pkg/vrrp/instance.go:1076)
-							// and that parser REQUIRES a /prefix — a bare
-							// Junos-style virtual-address still gets
-							// advertised (sendAdvert strips an optional
-							// prefix, instance.go:897) but the address is
-							// never installed on the interface: a silent
-							// half-working group. VRRPConfig documents the
-							// CIDR contract (pkg/vrrp/vrrp.go:20).
-							"virtual-address": {
-								desc:          "Virtual IP address",
-								args:          1,
-								multi:         true,
-								placeholder:   "<address>",
-								valueType:     ValueCIDR,
-								valueDesc:     "Virtual IPv4 address with prefix length (e.g. 10.0.1.1/24; xpf requires the prefix, unlike Junos)",
-								valueExamples: []string{"10.0.1.1/24"},
-								validator:     ValidateIPv4CIDR,
-								children:      nil,
-							},
-							// VRRP priority is one wire byte
-							// (pkg/vrrp/instance.go:918 uint8); 0 is the
-							// "unset → default 100" compiler sentinel and
-							// also the RFC 5798 resignation value, 255 is
-							// the valid IP-owner priority (instance.go:256).
-							// Junos: 1..255 — identical.
-							"priority": {
-								desc:          "VRRP priority",
-								args:          1,
-								placeholder:   "<1..255>",
-								valueType:     ValueInteger,
-								valueDesc:     "VRRP priority (1..255; 255 = address owner)",
-								valueExamples: []string{"100", "200", "255"},
-								validator:     ValidateInteger(1, 255),
-								children:      nil,
-							},
-							"preempt":     {desc: "Allow preemption", children: nil},
-							"accept-data": {desc: "Accept packets sent to the virtual address", children: nil},
-							// Seconds. xpf-DIVERGENT from Junos (1..255 s):
-							// the value is converted seconds→ms
-							// (pkg/vrrp/vrrp.go:58) then ms→centiseconds
-							// (instance.go:915) into the 12-bit VRRPv3
-							// Max Advert Int field, so 40 s (4000 cs) is
-							// the last whole-second value that encodes;
-							// 41 s (4100 cs) overflows the 0x0FFF wire
-							// mask and aliases. 0 = unset → default 1 s
-							// (vrrp.go:55).
-							"advertise-interval": {
-								desc:          "Advertisement interval",
-								args:          1,
-								placeholder:   "<seconds>",
-								valueType:     ValueInteger,
-								valueDesc:     "Advertisement interval in seconds (1..40; VRRPv3 12-bit centisecond wire field — Junos allows up to 255)",
-								valueExamples: []string{"1", "5"},
-								validator:     ValidateInteger(1, 40),
-								children:      nil,
-							},
-							"authentication-type": {desc: "Authentication type", args: 1, placeholder: "<type>", children: nil},
-							"authentication-key":  {desc: "Authentication key", args: 1, placeholder: "<key>", children: nil},
-							// priority-cost stays untyped: the #1814 AST
-							// pre-walk in the compiler already strict-
-							// rejects out-of-range costs with curated
-							// errors (validateVRRPTrackInterfaceAST /
-							// parseTrackCost, compiler_interfaces.go:791);
-							// typing it here would shadow them.
-							"track-interface": {desc: "Interface to track", args: 1, placeholder: "<interface>", children: map[string]*schemaNode{
-								"priority-cost": {desc: "Priority cost subtracted while the tracked interface is down", args: 1, placeholder: "<1..254>", children: nil},
-							}},
-							"track-priority-cost": {desc: "Priority cost when tracked interface fails", args: 1, placeholder: "<cost>", children: nil},
-						}},
+						"primary":    {desc: "Primary address", children: nil},
+						"preferred":  {desc: "Preferred address", children: nil},
+						"vrrp-group": vrrpGroupSchemaNode(false),
 					},
 				},
 				"dhcp": {desc: "DHCP client", children: map[string]*schemaNode{
@@ -246,8 +175,9 @@ var schemaInterfaces = &schemaNode{desc: "Interface configuration", wildcard: &s
 					keyValueExamples: []string{"2001:db8::1/64"},
 					keyValidator:     ValidateIPv6CIDR,
 					children: map[string]*schemaNode{
-						"primary":   {desc: "Primary address", children: nil},
-						"preferred": {desc: "Preferred address", children: nil},
+						"primary":    {desc: "Primary address", children: nil},
+						"preferred":  {desc: "Preferred address", children: nil},
+						"vrrp-group": vrrpGroupSchemaNode(true),
 					},
 				},
 				"sampling": {desc: "Traffic sampling", children: map[string]*schemaNode{
@@ -277,6 +207,88 @@ var schemaInterfaces = &schemaNode{desc: "Interface configuration", wildcard: &s
 		}},
 	}},
 }}}
+
+// vrrpGroupSchemaNode returns the config-mode schema subtree for a
+// `vrrp-group <id> { ... }` block under a family inet/inet6 address.
+// Both families share an identical leaf set — only the virtual-address
+// validator and its value description differ by family (#2384). The
+// native VRRP engine already family-detects each VIP by parse
+// (pkg/vrrp/instance.go ip.To4()==nil), so the inet6 path needed only a
+// config surface, not a runtime change. Keeping the two trees identical
+// except for the VIP validator means completion and commit validation
+// behave the same across families.
+func vrrpGroupSchemaNode(v6 bool) *schemaNode {
+	// xpf-DIVERGENT from Junos (bare IP): the VIP string is
+	// netlink.ParseAddr'd verbatim when the group masters
+	// (pkg/vrrp/instance.go:1076) and that parser REQUIRES a /prefix — a
+	// bare Junos-style virtual-address still gets advertised (sendAdvert
+	// strips an optional prefix, instance.go:897) but the address is
+	// never installed on the interface: a silent half-working group.
+	// VRRPConfig documents the CIDR contract (pkg/vrrp/vrrp.go:20).
+	vaDesc := "Virtual IPv4 address with prefix length (e.g. 10.0.1.1/24; xpf requires the prefix, unlike Junos)"
+	vaExamples := []string{"10.0.1.1/24"}
+	vaValidator := ValidateIPv4CIDR
+	if v6 {
+		vaDesc = "Virtual IPv6 address with prefix length (e.g. 2001:db8::1/64; xpf requires the prefix, unlike Junos)"
+		vaExamples = []string{"2001:db8::1/64"}
+		vaValidator = ValidateIPv6CIDR
+	}
+	return &schemaNode{desc: "VRRP group", args: 1, placeholder: "<group-id>", children: map[string]*schemaNode{
+		"virtual-address": {
+			desc:          "Virtual IP address",
+			args:          1,
+			multi:         true,
+			placeholder:   "<address>",
+			valueType:     ValueCIDR,
+			valueDesc:     vaDesc,
+			valueExamples: vaExamples,
+			validator:     vaValidator,
+			children:      nil,
+		},
+		// VRRP priority is one wire byte (pkg/vrrp/instance.go:918
+		// uint8); 0 is the "unset → default 100" compiler sentinel and
+		// also the RFC 5798 resignation value, 255 is the valid IP-owner
+		// priority (instance.go:256). Junos: 1..255 — identical.
+		"priority": {
+			desc:          "VRRP priority",
+			args:          1,
+			placeholder:   "<1..255>",
+			valueType:     ValueInteger,
+			valueDesc:     "VRRP priority (1..255; 255 = address owner)",
+			valueExamples: []string{"100", "200", "255"},
+			validator:     ValidateInteger(1, 255),
+			children:      nil,
+		},
+		"preempt":     {desc: "Allow preemption", children: nil},
+		"accept-data": {desc: "Accept packets sent to the virtual address", children: nil},
+		// Seconds. xpf-DIVERGENT from Junos (1..255 s): the value is
+		// converted seconds→ms (pkg/vrrp/vrrp.go:58) then ms→centiseconds
+		// (instance.go:915) into the 12-bit VRRPv3 Max Advert Int field,
+		// so 40 s (4000 cs) is the last whole-second value that encodes;
+		// 41 s (4100 cs) overflows the 0x0FFF wire mask and aliases. 0 =
+		// unset → default 1 s (vrrp.go:55).
+		"advertise-interval": {
+			desc:          "Advertisement interval",
+			args:          1,
+			placeholder:   "<seconds>",
+			valueType:     ValueInteger,
+			valueDesc:     "Advertisement interval in seconds (1..40; VRRPv3 12-bit centisecond wire field — Junos allows up to 255)",
+			valueExamples: []string{"1", "5"},
+			validator:     ValidateInteger(1, 40),
+			children:      nil,
+		},
+		"authentication-type": {desc: "Authentication type", args: 1, placeholder: "<type>", children: nil},
+		"authentication-key":  {desc: "Authentication key", args: 1, placeholder: "<key>", children: nil},
+		// priority-cost stays untyped: the #1814 AST pre-walk in the
+		// compiler already strict-rejects out-of-range costs with curated
+		// errors (validateVRRPTrackInterfaceAST / parseTrackCost,
+		// compiler_interfaces.go:791); typing it here would shadow them.
+		"track-interface": {desc: "Interface to track", args: 1, placeholder: "<interface>", children: map[string]*schemaNode{
+			"priority-cost": {desc: "Priority cost subtracted while the tracked interface is down", args: 1, placeholder: "<1..254>", children: nil},
+		}},
+		"track-priority-cost": {desc: "Priority cost when tracked interface fails", args: 1, placeholder: "<cost>", children: nil},
+	}}
+}
 
 // tunnelSchemaChildren returns the config-mode schema children for the
 // `tunnel { ... }` stanza, shared between the physical-interface and

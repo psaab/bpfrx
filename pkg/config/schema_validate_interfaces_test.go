@@ -112,6 +112,25 @@ var interfacesLeafMatrix = []interfacesLeafCase{
 		reject:   []string{"10.0.1.1", "2001:db8::1/64", "asd", ""},
 	},
 	{
+		// #2384 — IPv6 vrrp-group under family inet6. Same wire byte as
+		// the inet priority; identical bounds.
+		name:     "vrrp6-priority",
+		leaf:     "priority",
+		template: "set interfaces ge-0-0-0 unit 0 family inet6 address 2001:db8::10/64 vrrp-group 1 priority %s",
+		accept:   []string{"1", "100", "200", "254", "255"},
+		reject:   []string{"0", "256", "-1", "asd", ""},
+	},
+	{
+		// #2384 — the inet6 virtual-address must be a v6 CIDR; a v4
+		// address (or bare IP) is rejected by ValidateIPv6CIDR. This is
+		// the mirror of vrrp-virtual-address with the family flipped.
+		name:     "vrrp6-virtual-address",
+		leaf:     "virtual-address",
+		template: "set interfaces ge-0-0-0 unit 0 family inet6 address 2001:db8::10/64 vrrp-group 1 virtual-address %s",
+		accept:   []string{"2001:db8::1/64", "fe80::1/64", "::1/128"},
+		reject:   []string{"2001:db8::1", "10.0.1.1/24", "::ffff:10.0.1.1/96", "asd", ""},
+	},
+	{
 		name:     "tunnel-source",
 		leaf:     "source",
 		template: "set interfaces gr-0-0-0 tunnel source %s",
