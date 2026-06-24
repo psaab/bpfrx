@@ -1757,11 +1757,23 @@ func (d *Daemon) runBootstrapExitStartup(cfg *config.Config) {
 	slog.Info("bootstrap exit: startup takeover complete; applying first config")
 }
 
+// linkLocalV6Net is the fe80::/64 prefix every IPv6-capable interface
+// carries implicitly (the kernel auto-assigns a link-local address; it is
+// never declared under unit.Addresses). It is the synthetic connected
+// prefix used to resolve an unqualified link-local static next-hop
+// (#2452) to an interface scope, which FRR requires for `ipv6 route <dst>
+// fe80::x <iface>`.
+var linkLocalV6Net = func() *net.IPNet {
+	_, n, _ := net.ParseCIDR("fe80::/64")
+	return n
+}()
+
 func inferIPv6StaticNextHopInterfaces(cfg *config.Config) map[string]map[string]string {
 	type connectedPrefix struct {
-		net    *net.IPNet
-		ifName string
-		bits   int
+		net       *net.IPNet
+		ifName    string
+		bits      int
+		linkLocal bool // synthetic fe80::/64 candidate (#2452)
 	}
 
 	var connected []connectedPrefix
@@ -1785,31 +1797,94 @@ func inferIPv6StaticNextHopInterfaces(cfg *config.Config) map[string]map[string]
 			if unitNum != 0 {
 				logical = fmt.Sprintf("%s.%d", base, unitNum)
 			}
+			// ipv6OnUnit tracks whether this logical unit participates in
+			// IPv6 at all, so it earns a synthetic fe80::/64 candidate even
+			// when it only carries a VRRP virtual address (bondless RETH,
+			// #2452 secondary / agy-13).
+			ipv6OnUnit := false
+			addPrefix := func(ipNet *net.IPNet, linkLocal bool) {
+				bits, _ := ipNet.Mask.Size()
+				prefix := connectedPrefix{
+					net:       ipNet,
+					ifName:    logical,
+					bits:      bits,
+					linkLocal: linkLocal,
+				}
+				connected = append(connected, prefix)
+				connectedByLogical[logical] = append(connectedByLogical[logical], prefix)
+			}
 			for _, addr := range unit.Addresses {
 				ip, ipNet, err := net.ParseCIDR(addr)
 				if err != nil || ip == nil || ip.To4() != nil {
 					continue
 				}
-				bits, _ := ipNet.Mask.Size()
-				prefix := connectedPrefix{
-					net:    ipNet,
-					ifName: logical,
-					bits:   bits,
+				ipv6OnUnit = true
+				addPrefix(ipNet, false)
+			}
+			// VRRP virtual-address subnets (#2452 secondary): a bondless
+			// RETH member may carry only the VIP (keyed by its CIDR in
+			// VRRPGroups) with no matching unit.Addresses entry, so a
+			// next-hop inside the VIP subnet would otherwise fail to
+			// resolve. Add the VIP subnet as a connected prefix on the
+			// member interface.
+			for addrCIDR := range unit.VRRPGroups {
+				vip, vipNet, err := net.ParseCIDR(addrCIDR)
+				if err != nil || vip == nil || vip.To4() != nil {
+					continue
 				}
-				connected = append(connected, prefix)
-				connectedByLogical[logical] = append(connectedByLogical[logical], prefix)
+				ipv6OnUnit = true
+				// Skip if a real address on this unit already covers the
+				// same prefix (avoid a duplicate identical candidate).
+				addPrefix(vipNet, false)
+			}
+			if ipv6OnUnit {
+				addPrefix(linkLocalV6Net, true)
 			}
 		}
 	}
 
+	// resolve maps an unqualified IPv6 next-hop to an interface scope by
+	// longest-prefix match against the connected/synthetic candidates.
+	//
+	// Global-unicast next-hops use the normal longest-prefix + deterministic
+	// (lexicographically-smallest interface) tie-break, ignoring the
+	// synthetic fe80::/64 candidates entirely.
+	//
+	// Link-local next-hops (#2452) are interface-scoped and inherently
+	// ambiguous: a fe80::x next-hop matches every interface's synthetic
+	// fe80::/64. We resolve such a next-hop ONLY when exactly one IPv6-
+	// capable interface is present in the candidate set (the single
+	// defensible answer). With multiple IPv6 interfaces and no explicit
+	// interface qualifier, we refuse to guess (return "") rather than route
+	// to the wrong link — the operator must qualify the next-hop with
+	// `interface <name>` (which is honoured directly by the FRR renderer and
+	// never reaches this inference path).
 	resolve := func(candidates []connectedPrefix, addr string) string {
 		ip := net.ParseIP(addr)
 		if ip == nil || ip.To4() != nil {
 			return ""
 		}
+		if ip.IsLinkLocalUnicast() {
+			llIfaces := make(map[string]struct{})
+			for _, candidate := range candidates {
+				if candidate.linkLocal {
+					llIfaces[candidate.ifName] = struct{}{}
+				}
+			}
+			if len(llIfaces) != 1 {
+				return "" // none → unresolvable; multiple → ambiguous, don't guess
+			}
+			for ifName := range llIfaces {
+				return ifName
+			}
+			return ""
+		}
 		bestIf := ""
 		bestBits := -1
 		for _, candidate := range candidates {
+			if candidate.linkLocal {
+				continue // synthetic fe80::/64 only serves link-local next-hops
+			}
 			if !candidate.net.Contains(ip) {
 				continue
 			}
