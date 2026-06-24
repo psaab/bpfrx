@@ -37,6 +37,18 @@
   userspace-dp/src/afxdp/cos/queue_ops/v_min_tests.rs,
   userspace-dp/src/afxdp/cos/builders.rs (+ test struct-literal sites),
   userspace-dp/src/afxdp/cos/README.md, docs/fairness-regimes.md
+## 2026-06-24 — #2611 fix: honor SNMPv3 scopedPDU contextName (empty-view gate)
+
+- **Timestamp**: 2026-06-24
+- **Action**: SNMPv3 scopedPDU `contextName` was decoded then discarded;
+  Get/GetNext/GetBulk served the default MIB regardless of context and the
+  response always carried an empty contextName. Now capture `contextName`,
+  gate the PDU handlers (non-default context → noSuchInstance for Get,
+  endOfMibView for GetNext/GetBulk; SET still notWritable), and echo the
+  requested contextName in the response scopedPDU. Default (empty) context is
+  unchanged. Added `pkg/snmp/v3_context_test.go` (default served, non-default
+  empty-view no-leak, contextName echo, fail-on-revert).
+- **File(s)**: pkg/snmp/v3.go, pkg/snmp/v3_context_test.go, pkg/snmp/README.md
 
 ## 2026-06-24 — #2616/#2618/#2619 fix: firewall-filter fall-through log metadata
 
