@@ -1213,7 +1213,9 @@ func (m *Manager) generatePolicyOptions(po *config.PolicyOptionsConfig) string {
 					fmt.Fprintf(&b, " set ip next-hop peer-address\n")
 					fmt.Fprintf(&b, " set ipv6 next-hop peer-address\n")
 				} else if term.NextHop == "self" {
-					// Junos "next-hop self" → FRR "set ip next-hop self" (eBGP default)
+					// Junos "next-hop self" → no FRR set-clause. eBGP already
+					// rewrites the next-hop to self by default, so FRR needs no
+					// explicit "set" here.
 				} else if strings.Contains(term.NextHop, ":") {
 					// IPv6 literal next-hop. FRR rejects "set ip next-hop" for a
 					// v6 address (whole route-map fails to parse); v6 uses the
