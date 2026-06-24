@@ -364,14 +364,28 @@ var schemaForwardingOptions = &schemaNode{desc: "Packet forwarding options", chi
 			"family": {desc: "Address family to sample", compoundKey: true, children: map[string]*schemaNode{
 				"inet": {desc: "IPv4 flow sampling", children: map[string]*schemaNode{
 					"output": {desc: "Sampling output configuration", children: map[string]*schemaNode{
-						"flow-server":  samplingFlowServerNode(),
-						"inline-jflow": {desc: "Inline flow export (jflow)", children: nil},
+						"flow-server": samplingFlowServerNode(),
+						// Per-output default source-address: the standard
+						// Junos hierarchy (`output { source-address X;
+						// flow-server Y { ... } }`), sibling of flow-server.
+						// Every flow-server under this output inherits it
+						// unless it sets its own nested source-address
+						// (compiler_services.go compileSamplingFamily, #2605).
+						"source-address": {desc: "Default source address for exported flows", args: 1, placeholder: "<address>", children: nil},
+						"inline-jflow":   {desc: "Inline flow export (jflow)", children: nil},
 					}},
 				}},
 				"inet6": {desc: "IPv6 flow sampling", children: map[string]*schemaNode{
 					"output": {desc: "Sampling output configuration", children: map[string]*schemaNode{
-						"flow-server":  samplingFlowServerNode(),
-						"inline-jflow": {desc: "Inline flow export (jflow)", children: nil},
+						"flow-server": samplingFlowServerNode(),
+						// Per-output default source-address: the standard
+						// Junos hierarchy (`output { source-address X;
+						// flow-server Y { ... } }`), sibling of flow-server.
+						// Every flow-server under this output inherits it
+						// unless it sets its own nested source-address
+						// (compiler_services.go compileSamplingFamily, #2605).
+						"source-address": {desc: "Default source address for exported flows", args: 1, placeholder: "<address>", children: nil},
+						"inline-jflow":   {desc: "Inline flow export (jflow)", children: nil},
 					}},
 				}},
 			}},

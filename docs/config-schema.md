@@ -899,6 +899,20 @@ the value sits in a single typed slot:
     single version's collector set so a collector configured under both global
     version stanzas is never double-exported (an unbound server resolves to
     IPFIX when both globals are set — see `pkg/flowexport/README.md`).
+  - `forwarding-options sampling … family <af> output source-address <addr>`
+    (#2605) — the **output-level** flow-export source-address: the standard
+    Junos hierarchy where `source-address` is a sibling of `flow-server`
+    directly under `output { ... }` (not nested inside a flow-server). It is
+    the per-output default that every flow-server in that family inherits.
+    A `source-address` nested INSIDE an individual flow-server is the
+    per-collector override and **wins** over the output-level default
+    (more-specific precedence); both resolve into the single per-family
+    `SamplingFamily.SourceAddress`, which `pkg/flowexport` applies as the
+    local bind address of every collector in that family. The output-level
+    value also seeds `inline-jflow`'s source when inline-jflow sets none. The
+    output-level form was previously dropped silently (no compile error and no
+    completion entry) — `compileSamplingFamily` only read the
+    flow-server-nested / inline-jflow-nested forms before #2605.
   - `forwarding-options allow-dataplane-sleep` (#2008 H13 Stage 1) — a
     presence-only flag (no value, `children: nil`). Previously accepted via the
     no-schema-match fall-through and silently dropped; now a typed leaf that
