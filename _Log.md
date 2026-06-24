@@ -12318,3 +12318,32 @@ top.
   userspace-dp/src/event_stream/README.md, pkg/flowexport/README.md,
   pkg/dataplane/userspace/flow.go,
   pkg/daemon/daemon_flowexport_session_close_test.go, _Log.md
+
+- **Timestamp**: 2026-06-23
+- **Action**: #2462 — sampling-instance isolation: each `forwarding-options
+  sampling instance` is now a first-class export policy with its OWN
+  collectors, OWN 1-in-N rate, and OWN sampleCounter, composing with #2461's
+  per-template grouping (grouping key gains instance identity:
+  (instance, version, template)). Killed the merged-collector walk
+  (collectVersionCollectors → per-instance collectInstanceVersionCollectors)
+  and the first-nonzero-map-order global rate (samplingRate → per-instance
+  inst.InputRate + sortedInstanceNames for restart-stable ordering). Flow→
+  instance attribution is by address family (ServesInet/ServesInet6 +
+  ServesFamily) — the only per-flow selector available (interface sampling is
+  a plain boolean; no per-interface sampling-instance selector exists). The
+  daemon callback walks contiguous per-instance group runs, applies the
+  family gate + single per-instance sampling decision, then fans to that
+  instance's groups (was: decide once on groups[0], fan to all). Added
+  validateSamplingInstanceConflictsStrict: two instances claiming the SAME
+  (version, family) are genuinely ambiguous → hard-reject on commit, warn on
+  lenient load/peer-sync (#1960, lenientSamplingInstanceConflicts). Supported:
+  single instance (no regression), instances split by family or by export
+  version. Rejected: two instances same (version,family). Fail-on-revert
+  proven for per-instance rate/counter and the strict reject. Tests run
+  -race -count=5 green; build/vet clean.
+- **File(s)**: pkg/flowexport/manager.go,
+  pkg/flowexport/instance_isolation_test.go,
+  pkg/daemon/daemon_flowexport.go, pkg/config/compiler.go,
+  pkg/config/compiler_validate_strict.go,
+  pkg/config/sampling_instance_conflict_test.go,
+  pkg/flowexport/README.md, _Log.md

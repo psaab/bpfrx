@@ -468,6 +468,146 @@ func validateFlowServerTemplateReferencesStrict(cfg *Config) error {
 	return nil
 }
 
+// flowServerExportVersion mirrors flowexport.resolveFlowServerVersion: it
+// returns the export protocol a single flow-server binds to, given the
+// per-server selector and which global `services flow-monitoring` version
+// stanzas are configured. It is duplicated here (not imported) because
+// pkg/config must not depend on pkg/flowexport. Returns "" when the server
+// resolves to no configured version. Keep in sync with
+// pkg/flowexport.resolveFlowServerVersion.
+func flowServerExportVersion(fs *FlowServer, hasV9, hasIPFIX bool) string {
+	switch fs.Version {
+	case FlowServerVersion9:
+		if hasV9 {
+			return FlowServerVersion9
+		}
+		return ""
+	case FlowServerVersionIPFIX:
+		if hasIPFIX {
+			return FlowServerVersionIPFIX
+		}
+		return ""
+	}
+	switch {
+	case hasIPFIX:
+		return FlowServerVersionIPFIX
+	case hasV9:
+		return FlowServerVersion9
+	default:
+		return ""
+	}
+}
+
+// validateSamplingInstanceConflictsStrict hard-rejects an unsupported
+// multi-sampling-instance configuration (#2462).
+//
+// The defect: multiple `forwarding-options sampling instance` blocks were
+// silently flattened into one global export policy — one rate (the first
+// nonzero InputRate in Go map order), one merged collector set, one zone
+// eligibility map. Flows from instance A could export to instance B's
+// collectors and the effective rate depended on map-iteration order.
+//
+// The fix makes each instance a first-class export policy: its own rate, its
+// own 1-in-N counter, its own collectors. A flow is attributed to an instance
+// by ADDRESS FAMILY (the only per-flow selector available — the interface
+// `family inet { sampling { input; } }` stanza is a plain boolean; there is
+// NO per-interface sampling-instance selector in the config model, so two
+// instances serving the SAME family for the SAME export version are genuinely
+// ambiguous: the runtime cannot tell which instance a given IPv4 (or IPv6)
+// flow belongs to). Rather than guess (the flatten-and-hope behavior this
+// issue reports), that combination is rejected.
+//
+// Supported: a single instance (any rate / families / collectors — the common
+// case, unchanged); multiple instances disambiguated by family (e.g. instance
+// A serves inet, instance B serves inet6) and/or by export version (an inet
+// instance bound to version9 vs an inet instance bound to version-ipfix —
+// distinct datagram streams, the flow is duplicated to both intentionally,
+// same as today's single-instance dual-version behavior).
+//
+// Rejected: two or more instances each configuring a flow-server that
+// resolves to the SAME (export-version, address-family) pair.
+//
+// Strict on commit / commit-check (hard reject so the operator sees it);
+// lenient on load / peer-sync (the call site downgrades to a warning via
+// opts.lenientSamplingInstanceConflicts so an already-persisted or
+// peer-synced config still boots — #1960; the resolver still emits both
+// instances' independent ExportConfigs, so a leniently-loaded conflicting
+// config duplicates eligible flows to both instances rather than bricking).
+func validateSamplingInstanceConflictsStrict(cfg *Config) error {
+	if cfg == nil || cfg.ForwardingOptions.Sampling == nil {
+		return nil
+	}
+	insts := cfg.ForwardingOptions.Sampling.Instances
+	if len(insts) < 2 {
+		return nil // single instance is always unambiguous
+	}
+	fm := cfg.Services.FlowMonitoring
+	hasV9 := fm != nil && fm.Version9 != nil
+	hasIPFIX := fm != nil && fm.VersionIPFIX != nil
+
+	// Deterministic instance order so the first-conflict message is stable.
+	names := make([]string, 0, len(insts))
+	for name := range insts {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+
+	// claim key "<version>\x00<family>" -> first instance that claimed it.
+	claimed := map[string]string{}
+	for _, name := range names {
+		inst := insts[name]
+		if inst == nil {
+			continue
+		}
+		fams := []struct {
+			fam    *SamplingFamily
+			family string
+		}{
+			{inst.FamilyInet, "inet"},
+			{inst.FamilyInet6, "inet6"},
+		}
+		// Collect THIS instance's distinct (version, family) claims, so the
+		// same instance binding two collectors to the same (version, family)
+		// does not self-conflict.
+		selfClaims := map[string]bool{}
+		for _, fe := range fams {
+			if fe.fam == nil {
+				continue
+			}
+			for _, fs := range fe.fam.FlowServers {
+				if fs == nil {
+					continue
+				}
+				ver := flowServerExportVersion(fs, hasV9, hasIPFIX)
+				if ver == "" {
+					continue // resolves to no configured version; exports nothing
+				}
+				selfClaims[ver+"\x00"+fe.family] = true
+			}
+		}
+		// Deterministic order over this instance's claims.
+		keys := make([]string, 0, len(selfClaims))
+		for k := range selfClaims {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		for _, key := range keys {
+			if owner, ok := claimed[key]; ok {
+				parts := strings.SplitN(key, "\x00", 2)
+				return fmt.Errorf("forwarding-options sampling instances %q and %q "+
+					"both export %s family %s flows: the runtime cannot attribute a "+
+					"flow to one instance (there is no per-interface sampling-instance "+
+					"selector — eligibility is per address family), so the two would "+
+					"silently merge. Use a single instance for this version/family, or "+
+					"separate the instances by family or export version",
+					owner, name, parts[0], parts[1])
+			}
+			claimed[key] = name
+		}
+	}
+	return nil
+}
+
 // routingRedistProtocolTokens is the set of bare protocol keywords that an
 // OSPF/OSPFv3/BGP/IS-IS `export` (or a RIP `redistribute`) accepts in lieu
 // of a named policy-statement. resolveRedistribute (pkg/frr/policy_render.go)
