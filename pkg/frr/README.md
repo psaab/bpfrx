@@ -106,6 +106,15 @@ move or rename the markers — they're literal strings.
 - In cluster mode the package emits a blackhole default at admin distance
   250 so traffic to the active fabric peer survives a brief
   active/active overlap.
+- **DHCP default routes bind the originating interface for BOTH families
+  (#2547).** `renderDHCPDefaults` (admin distance 200) emits `ip route
+  0.0.0.0/0 <gw> <iface> 200` / `ipv6 route ::/0 <gw> <iface> 200` whenever
+  the lease records an interface (`DHCPRoute.Interface != ""`, populated by
+  `collectDHCPRoutes` in `pkg/daemon/daemon_flow.go` for v4 and v6 alike),
+  falling back to the gateway-only form when it is empty. The IPv4 branch
+  previously dropped the interface — an unintended asymmetry that left the
+  kernel unable to pick the correct egress in multi-WAN / shared-gateway-IP
+  deployments (default-route conflicts / blackholing).
 - **Export references are validated at commit (#2144).** A dynamic-protocol
   `export` (OSPF/OSPFv3/BGP/IS-IS), a RIP `redistribute`, a BGP
   group/neighbor `export`, and a `routing-options forwarding-table export`

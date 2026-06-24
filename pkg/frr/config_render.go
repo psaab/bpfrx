@@ -189,7 +189,10 @@ func renderGenerateRoutes(b *strings.Builder, fc *FullConfig) {
 // renderDHCPDefaults emits DHCP-learned default routes at admin distance 200.
 // Suppressed when an explicit static default route exists for the same
 // address family so the management interface's DHCP gateway doesn't compete
-// with configured routes.
+// with configured routes. Both families bind the route to the originating
+// interface when the lease records one (dr.Interface != ""), so that in
+// multi-WAN / shared-gateway-IP deployments the kernel can pick the correct
+// egress instead of leaving an ambiguous gateway-only default.
 func renderDHCPDefaults(b *strings.Builder, fc *FullConfig) {
 	if len(fc.DHCPRoutes) == 0 {
 		return
@@ -223,7 +226,11 @@ func renderDHCPDefaults(b *strings.Builder, fc *FullConfig) {
 				fmt.Fprintf(b, "ipv6 route ::/0 %s 200\n", dr.Gateway)
 			}
 		} else {
-			fmt.Fprintf(b, "ip route 0.0.0.0/0 %s 200\n", dr.Gateway)
+			if dr.Interface != "" {
+				fmt.Fprintf(b, "ip route 0.0.0.0/0 %s %s 200\n", dr.Gateway, dr.Interface)
+			} else {
+				fmt.Fprintf(b, "ip route 0.0.0.0/0 %s 200\n", dr.Gateway)
+			}
 		}
 		wrote = true
 	}
