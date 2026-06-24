@@ -379,6 +379,95 @@ func validateLogProfileStreamReferencesStrict(cfg *Config) error {
 	return nil
 }
 
+// validateFlowServerTemplateReferencesStrict hard-rejects a per-flow-server
+// NetFlow v9 / IPFIX template reference (`version9 { template <name> }`,
+// `version9-template <name>`, `version-ipfix { template <name> }`, or
+// `version-ipfix-template <name>`) that names no template defined under the
+// matching `services flow-monitoring` version stanza (#2461).
+//
+// Without this gate the live exporter (pkg/flowexport) ignored the per-server
+// reference entirely and built one export config from the FIRST Go-map-
+// iteration template, broadcasting it to every collector of that version. A
+// collector that asked for a specific template silently received whichever
+// template the map happened to yield first, and that choice flipped across
+// process restarts (map order is not an operator contract). A reference to a
+// template that does not exist at all is the clearest form of the same defect:
+// the operator's intent (timeouts / export-extensions) is simply dropped.
+//
+// On the tolerant load / peer-sync paths the call site downgrades this to a
+// warning (opts.lenientFlowServerTemplateRef) so an already-persisted or
+// peer-synced config carrying the typo still boots (#1960 fail-closed-on-load
+// class). The resolver (ResolveV9TemplateGroups / ResolveIPFIXTemplateGroups)
+// drops a group whose referenced template is undefined, so a leniently-loaded
+// bad config exports nothing for that collector rather than the wrong
+// template. Commit / commit-check stay strict so the operator's next edit
+// fails loudly. Mirrors validateLogProfileStreamReferencesStrict.
+func validateFlowServerTemplateReferencesStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	fm := cfg.Services.FlowMonitoring
+	if cfg.ForwardingOptions.Sampling == nil {
+		return nil
+	}
+
+	v9Defined := map[string]bool{}
+	ipfixDefined := map[string]bool{}
+	if fm != nil {
+		if fm.Version9 != nil {
+			for name := range fm.Version9.Templates {
+				v9Defined[name] = true
+			}
+		}
+		if fm.VersionIPFIX != nil {
+			for name := range fm.VersionIPFIX.Templates {
+				ipfixDefined[name] = true
+			}
+		}
+	}
+
+	// Walk the sampling instances in a deterministic key order so the
+	// first-error commit-check message is stable across runs (the instance
+	// map is unordered).
+	instNames := make([]string, 0, len(cfg.ForwardingOptions.Sampling.Instances))
+	for name := range cfg.ForwardingOptions.Sampling.Instances {
+		instNames = append(instNames, name)
+	}
+	sort.Strings(instNames)
+
+	for _, instName := range instNames {
+		inst := cfg.ForwardingOptions.Sampling.Instances[instName]
+		if inst == nil {
+			continue
+		}
+		for _, fam := range []*SamplingFamily{inst.FamilyInet, inst.FamilyInet6} {
+			if fam == nil {
+				continue
+			}
+			for _, fs := range fam.FlowServers {
+				if fs == nil {
+					continue
+				}
+				if fs.Version9Template != "" && !v9Defined[fs.Version9Template] {
+					return fmt.Errorf("forwarding-options sampling instance %q "+
+						"flow-server %s references undefined version9 template %q "+
+						"(define it under services flow-monitoring version9, or fix "+
+						"the template name — the collector would otherwise receive "+
+						"an arbitrary template)", instName, fs.Address, fs.Version9Template)
+				}
+				if fs.VersionIPFIXTemplate != "" && !ipfixDefined[fs.VersionIPFIXTemplate] {
+					return fmt.Errorf("forwarding-options sampling instance %q "+
+						"flow-server %s references undefined version-ipfix template "+
+						"%q (define it under services flow-monitoring version-ipfix, "+
+						"or fix the template name — the collector would otherwise "+
+						"receive an arbitrary template)", instName, fs.Address, fs.VersionIPFIXTemplate)
+				}
+			}
+		}
+	}
+	return nil
+}
+
 // routingRedistProtocolTokens is the set of bare protocol keywords that an
 // OSPF/OSPFv3/BGP/IS-IS `export` (or a RIP `redistribute`) accepts in lieu
 // of a named policy-statement. resolveRedistribute (pkg/frr/policy_render.go)

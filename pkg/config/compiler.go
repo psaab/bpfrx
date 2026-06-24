@@ -334,6 +334,25 @@ type compileOpts struct {
 	// loaded config is no worse than before the gate. Same doctrine as
 	// lenientRoutingExportRef.
 	lenientFirewallRefs bool
+	// lenientFlowServerTemplateRef (#2461) downgrades the per-flow-server
+	// NetFlow v9 / IPFIX template cross-reference gate
+	// (validateFlowServerTemplateReferencesStrict) from a hard compile
+	// error to a cfg.Warnings entry. A flow-server `version9 { template
+	// <name> }` / `version-ipfix { template <name> }` (or the flat
+	// `version9-template` / `version-ipfix-template`) reference that names
+	// no defined `services flow-monitoring` template was previously
+	// unvalidated: the live exporter ignored the reference and silently
+	// used the first map-iteration template, so a collector received a
+	// template (timeouts / export-extensions) it never requested and the
+	// choice flipped nondeterministically across restarts. The strict
+	// commit / commit-check path hard-rejects so the typo is operator-
+	// visible; the tolerant load / peer-sync paths warn so an already-
+	// persisted or peer-synced config carrying a dangling reference still
+	// BOOTS (#1960 fail-closed-on-load class) — the resolver drops a group
+	// whose template is undefined, so a leniently-loaded config exports
+	// nothing for that collector rather than the wrong template. Same
+	// doctrine as lenientLogProfileStreamRef.
+	lenientFlowServerTemplateRef bool
 	// lenientApplicationSetMembers (#2217 Finding B) downgrades the
 	// application-set member cross-reference gate
 	// (validateApplicationSetMembersStrict) from a hard compile error to a
@@ -463,6 +482,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientFilterActions:               true,
 		lenientNPTv6:                       true,
 		lenientFirewallRefs:                true,
+		lenientFlowServerTemplateRef:       true,
 		lenientApplicationSetMembers:       true,
 		lenientRibGroupRefs:                true,
 		lenientDHCPStaticBindings:          true,
@@ -560,6 +580,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientFilterActions:               true,
 		lenientNPTv6:                       true,
 		lenientFirewallRefs:                true,
+		lenientFlowServerTemplateRef:       true,
 		lenientApplicationSetMembers:       true,
 		lenientRibGroupRefs:                true,
 		lenientDHCPStaticBindings:          true,
@@ -1216,6 +1237,28 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		if opts.lenientFirewallRefs {
 			cfg.Warnings = append(cfg.Warnings,
 				fmt.Sprintf("firewall routing-instance reference (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
+	// #2461: per-flow-server NetFlow v9 / IPFIX template cross-reference. A
+	// flow-server `version9 { template <name> }` / `version-ipfix { template
+	// <name> }` (or the flat `version9-template` / `version-ipfix-template`)
+	// naming a template not defined under `services flow-monitoring`
+	// compiled cleanly; the live exporter ignored the reference and used the
+	// first map-iteration template, so the collector silently received a
+	// template (timeouts / export-extensions) it never requested and the
+	// choice flipped across restarts. Strict on commit / commit-check (hard
+	// reject so the typo is operator-visible); lenient on load / peer-sync
+	// (warn so an already-persisted or peer-synced config still boots —
+	// #1960; the resolver drops a group with an undefined template, exporting
+	// nothing for that collector rather than the wrong template). Mirrors
+	// validateLogProfileStreamReferencesStrict.
+	if err := validateFlowServerTemplateReferencesStrict(cfg); err != nil {
+		if opts.lenientFlowServerTemplateRef {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("flow-server template reference (downgraded to warning on tolerant path): %v", err))
 		} else {
 			return nil, err
 		}
