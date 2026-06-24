@@ -38,9 +38,9 @@ func TestScopedHostnameHoldsStateAndSkipsResolver(t *testing.T) {
 				listens.Add(1)
 				return inner(network, laddr, opts)
 			}
-			m.resolveTarget = func(target string) (net.IP, error) {
+			m.resolveTarget = func(target string) (*net.IPAddr, error) {
 				resolves.Add(1)
-				return net.ParseIP("203.0.113.1"), nil
+				return &net.IPAddr{IP: net.ParseIP("203.0.113.1")}, nil
 			}
 
 			_, err := m.executeProbe(context.Background(), tc.test, "WAN/t")
@@ -70,9 +70,9 @@ func TestUnscopedHostnameUsesResolver(t *testing.T) {
 	m, conn := newFakeManager(func(b []byte, _ net.Addr) []fakeReply {
 		return []fakeReply{echoReply(t, b, false, false, target)}
 	})
-	m.resolveTarget = func(name string) (net.IP, error) {
+	m.resolveTarget = func(name string) (*net.IPAddr, error) {
 		resolves.Add(1)
-		return target, nil
+		return &net.IPAddr{IP: target}, nil
 	}
 
 	test := &config.RPMTest{Name: "t", Target: "host.example.com"} // no scope

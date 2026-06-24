@@ -112,11 +112,35 @@ func (m *Manager) probeICMP(ctx context.Context, test *config.RPMTest, opts prob
 	if resolve == nil {
 		resolve = resolveProbeTarget
 	}
-	dst, err := resolve(test.Target)
+	dstAddr, err := resolve(test.Target)
 	if err != nil {
 		return 0, err
 	}
+	dst := dstAddr.IP
+	zone := dstAddr.Zone
 	isV6 := dst.To4() == nil
+
+	// #2494: an IPv6 link-local target must carry a scope (zone) or the
+	// kernel cannot pick the egress link — the echo goes to the wrong
+	// link or fails. Honor an explicit `%zone` from the target literal
+	// (normalize Junos slash form to the kernel name); otherwise default
+	// the zone to the resolved egress device the data socket binds via
+	// SO_BINDTODEVICE (opts.BindDevice — already the kernel ifname). The
+	// commit-time gate (validateRPMLinkLocalZoneStrict) rejects a bare
+	// link-local with neither a zone nor a destination-interface, so by
+	// the time a probe runs one of the two is present (or the test was
+	// loaded leniently and HOLDS via the same missing-zone error below).
+	if isV6 && dst.IsLinkLocalUnicast() {
+		if zone != "" {
+			zone = config.LinuxIfName(zone)
+		} else {
+			zone = opts.BindDevice
+		}
+		if zone == "" {
+			return 0, fmt.Errorf("%w: icmp link-local target %s needs a zone "+
+				"(%%zone or destination-interface)", ErrProbeSetup, dst)
+		}
+	}
 
 	network := "ip4:icmp"
 	proto := icmpProtocolIPv4
@@ -155,7 +179,10 @@ func (m *Manager) probeICMP(ctx context.Context, test *config.RPMTest, opts prob
 	}
 
 	start := time.Now()
-	if _, err := conn.WriteTo(wire, &net.IPAddr{IP: dst}); err != nil {
+	// Carry the zone so a link-local destination is scoped to the right
+	// egress link (#2494). For global addresses zone is "" and this is
+	// the same &net.IPAddr{IP: dst} as before.
+	if _, err := conn.WriteTo(wire, &net.IPAddr{IP: dst, Zone: zone}); err != nil {
 		return 0, fmt.Errorf("icmp send: %w", err)
 	}
 
@@ -188,6 +215,11 @@ func (m *Manager) probeICMP(ctx context.Context, test *config.RPMTest, opts prob
 		if !ok || echo.ID != id || echo.Seq != seq {
 			continue
 		}
+		// Reply-match compares the peer IP only, not the zone (#2494):
+		// the kernel may or may not populate the reply's IPAddr.Zone, and
+		// id/seq already disambiguate this exchange. The send-side zone is
+		// the correctness fix (the echo leaves the right link); the
+		// reply-match stays zone-agnostic by design.
 		if peerIP, ok := peer.(*net.IPAddr); ok && !peerIP.IP.Equal(dst) {
 			continue
 		}
@@ -195,17 +227,23 @@ func (m *Manager) probeICMP(ctx context.Context, test *config.RPMTest, opts prob
 	}
 }
 
-// resolveProbeTarget parses or resolves the test target into an IP.
-func resolveProbeTarget(target string) (net.IP, error) {
+// resolveProbeTarget parses or resolves the test target into an address,
+// preserving the IPv6 link-local zone (#2494). net.ParseIP rejects a
+// zoned literal (`fe80::1%ge-0-0-3`), so a zoned target falls through to
+// net.ResolveIPAddr, which parses the scope id into IPAddr.Zone — the
+// zone must survive to the send path so a link-local echo is steered to
+// the right link. A plain IP literal short-circuits ParseIP (no DNS, no
+// zone); a hostname resolves through net.ResolveIPAddr.
+func resolveProbeTarget(target string) (*net.IPAddr, error) {
 	if target == "" {
 		return nil, fmt.Errorf("no target specified")
 	}
 	if ip := net.ParseIP(target); ip != nil {
-		return ip, nil
+		return &net.IPAddr{IP: ip}, nil
 	}
 	addr, err := net.ResolveIPAddr("ip", target)
 	if err != nil {
 		return nil, fmt.Errorf("resolve target %q: %w", target, err)
 	}
-	return addr.IP, nil
+	return addr, nil
 }

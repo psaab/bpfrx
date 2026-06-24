@@ -183,8 +183,9 @@ type Manager struct {
 	// only for unscoped / IP-literal probes today. It exists so a future
 	// VRF-aware resolver can be slotted in (and so a test can assert the
 	// guard short-circuits a scoped hostname before the default resolver
-	// is reached).
-	resolveTarget func(target string) (net.IP, error)
+	// is reached). Returns *net.IPAddr so the IPv6 link-local zone is
+	// preserved through to the send path (#2494).
+	resolveTarget func(target string) (*net.IPAddr, error)
 }
 
 // SetEventCallback registers a callback for RPM events.

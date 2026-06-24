@@ -503,6 +503,18 @@ type compileOpts struct {
 	// leniently-loaded test HOLDS state rather than actuating off a
 	// mis-scoped measurement). Same doctrine as lenientRPMSourceAddress.
 	lenientRPMScopedHostname bool
+	// lenientRPMLinkLocalZone (#2494) downgrades the bare-link-local RPM
+	// target gate (validateRPMLinkLocalZoneStrict) from a hard compile
+	// error to a cfg.Warnings entry. An IPv6 link-local target with no
+	// `%zone` and no destination-interface has no egress-link scope, so
+	// the kernel cannot pick the link and the probe is dead. Strict on
+	// commit / commit-check (hard reject so the gap is operator-visible);
+	// lenient on load / peer-sync (warn — #1960 no-brick; the runtime
+	// probeICMP guard returns ErrProbeSetup for the same scopeless
+	// link-local, so the leniently-loaded test HOLDS state rather than
+	// actuating off a dead measurement). Same doctrine as
+	// lenientRPMScopedHostname.
+	lenientRPMLinkLocalZone bool
 }
 
 // CompileConfig converts a parsed ConfigTree AST into a typed Config struct.
@@ -554,6 +566,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientDestNATAddresses:            true,
 		lenientRPMSourceAddress:            true,
 		lenientRPMScopedHostname:           true,
+		lenientRPMLinkLocalZone:            true,
 	})
 }
 
@@ -656,6 +669,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientDestNATAddresses:            true,
 		lenientRPMSourceAddress:            true,
 		lenientRPMScopedHostname:           true,
+		lenientRPMLinkLocalZone:            true,
 	})
 }
 
@@ -1473,6 +1487,25 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		if opts.lenientRPMScopedHostname {
 			cfg.Warnings = append(cfg.Warnings,
 				fmt.Sprintf("rpm scoped hostname (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
+	// #2494: IPv6 link-local RPM target zone gate. A link-local target
+	// (fe80::/10) needs an egress-link scope — an explicit `%zone` on the
+	// literal or a destination-interface — or the kernel cannot pick the
+	// link and the ICMP echo is dead. A bare link-local with neither is
+	// refused so the operator sees the gap at commit instead of a silently
+	// dead probe driving ip-monitoring failover. Strict on commit /
+	// commit-check (hard reject); lenient on load / peer-sync (warn —
+	// #1960; the runtime probeICMP guard returns ErrProbeSetup for the
+	// same scopeless link-local, so the leniently-loaded test HOLDS state
+	// instead of actuating off a dead measurement).
+	if err := validateRPMLinkLocalZoneStrict(cfg); err != nil {
+		if opts.lenientRPMLinkLocalZone {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("rpm link-local zone (downgraded to warning on tolerant path): %v", err))
 		} else {
 			return nil, err
 		}

@@ -94,6 +94,32 @@ set services rpm probe WAN test wan-a thresholds successive-loss 3
     injectable `Manager.resolveTarget` seam (`pkg/rpm`) is the slot where
     it drops in. Until then the safe increment is the commit reject
     above. Tracked as the #2493 follow-up.
+- **IPv6 link-local targets need a scope (#2494).** A link-local target
+  (`fe80::/10`) is unprobeable without an egress link: the kernel cannot
+  pick the link, so the ICMP echo goes nowhere. The scope can come from
+  an explicit `%zone` on the literal (`target fe80::1%ge-0/0/3`) or be
+  derived from the test's `destination-interface` — both resolve to the
+  same kernel interface name the probe data socket binds via
+  `SO_BINDTODEVICE`. A **bare link-local with neither a `%zone` nor a
+  `destination-interface` is rejected at commit**
+  (`validateRPMLinkLocalZoneStrict`); a link-local **with** either is
+  accepted. The send path preserves the zone into the ICMP destination
+  (`net.IPAddr{IP, Zone}`) so the echo leaves the right link; a bare
+  `fe80::1` with a `destination-interface` defaults its zone to that
+  device. Global IPv6 and IPv4 targets are unaffected. On the tolerant
+  load / peer-sync path the rejection is downgraded to a warning (#1960
+  no-brick); the runtime prober then returns the probe-setup error for
+  the same scopeless link-local, so it **holds state** rather than
+  actuating off a dead probe.
+  - *Honoring an explicit `%zone`:* the zone string is normalized for the
+    Junos slash form (`ge-0/0/3` → `ge-0-0-3`) but is **not** run through
+    the RETH-member translation that `destination-interface` gets — for a
+    RETH base name use `destination-interface` (fully resolved through the
+    RETH map) rather than a raw `%zone`.
+  - *Reply-match:* the echo-reply match compares the peer **IP** only, not
+    the zone (id/seq already disambiguate the exchange, and the kernel may
+    not populate the reply's zone). The send-side zone is the correctness
+    fix; the reply-match stays zone-agnostic by design.
 - Probe config re-applies on commit, gated on the rendered RPM stanza
   hash — unrelated commits never reset probe state.
 - **Environment errors never move routes**: a probe-socket setup
