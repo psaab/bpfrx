@@ -711,32 +711,44 @@ func TestPreSeedMemfile_ChownsToKeaUser(t *testing.T) {
 }
 
 // Test (#2450 robustness): when NEITHER Kea user resolves (dev host / Kea not
-// installed), the pre-seed must NOT abort the takeover — it logs a warning,
-// writes the file without an owner override, and returns nil. Aborting here
-// would turn a missing-package condition into a failed failover.
+// installed), the pre-seed must NOT abort the takeover — it writes the file
+// without an owner override and returns nil. Aborting here would turn a
+// missing-package condition into a failed failover.
+//
+// The warning is emitted ONCE PER PROCESS from the cached owner resolution,
+// NOT per pre-seed: this test pre-seeds BOTH families and asserts exactly one
+// warning across the two pre-seeds (a stronger assertion than per-call — if
+// the warning regresses back into writeMemfileAtomic it fires twice here and
+// this fails).
 func TestPreSeedMemfile_NoKeaUser_WarnsAndSucceeds(t *testing.T) {
 	localNow := time.Unix(1_700_000_000, 0)
 	dir := t.TempDir()
 	memfile4 := filepath.Join(dir, "kea-leases4.csv")
+	memfile6 := filepath.Join(dir, "kea-leases6.csv")
 
 	calls, restore := installMemfileRecorder(t)
 	defer restore()
 
 	var warnings []string
 	m := New()
-	m.SetLeaseSyncSeamsForTesting(nil, "", "", memfile4, "")
+	m.SetLeaseSyncSeamsForTesting(nil, "", "", memfile4, memfile6)
 	m.SetWarnForTesting(func(msg string, _ ...any) { warnings = append(warnings, msg) })
 	m.SetKeaOwnerLookupForTesting(func() (int, int, bool) { return 0, 0, false })
 
-	in := []SyncLease{
+	if err := m.PreSeedMemfile4([]SyncLease{
 		{Family: 4, Address: "10.0.61.7", HWAddress: "aa:bb:cc:dd:ee:07",
 			SubnetID: 3, Remaining: 600, State: keaStateDefault},
-	}
-	if err := m.PreSeedMemfile4(in, localNow); err != nil {
+	}, localNow); err != nil {
 		t.Fatalf("PreSeedMemfile4 must not abort when Kea user absent: %v", err)
 	}
+	if err := m.PreSeedMemfile6([]SyncLease{
+		{Family: 6, Address: "2001:db8::7", DUID: "00:09", IAID: 9,
+			LeaseType: "IA_NA", SubnetID: 1, Remaining: 600, State: keaStateDefault},
+	}, localNow); err != nil {
+		t.Fatalf("PreSeedMemfile6 must not abort when Kea user absent: %v", err)
+	}
 
-	// The file was still written (takeover not aborted) and is parseable.
+	// The v4 file was still written (takeover not aborted) and is parseable.
 	got, err := parseActiveLeases4(memfile4, localNow)
 	if err != nil {
 		t.Fatalf("parseActiveLeases4 on pre-seeded file: %v", err)
@@ -744,13 +756,18 @@ func TestPreSeedMemfile_NoKeaUser_WarnsAndSucceeds(t *testing.T) {
 	if len(got) != 1 || got[0].Address != "10.0.61.7" {
 		t.Fatalf("pre-seeded memfile = %+v, want the one lease", got)
 	}
-	// No owner override requested.
-	if len(*calls) != 1 || (*calls)[0].applyOwner {
-		t.Fatalf("writeMemfileFile calls = %+v, want one call with applyOwner=false", *calls)
+	// Both families written, neither with an owner override.
+	if len(*calls) != 2 {
+		t.Fatalf("writeMemfileFile called %d times, want 2 (v4+v6)", len(*calls))
 	}
-	// A clear warning fired.
+	for _, c := range *calls {
+		if c.applyOwner {
+			t.Errorf("path %s: applyOwner=true, want no owner override when Kea user absent", c.path)
+		}
+	}
+	// Exactly ONE warning across both pre-seeds (once per process).
 	if len(warnings) != 1 || !strings.Contains(warnings[0], "_kea") {
-		t.Errorf("warnings = %v, want one mentioning the missing Kea user", warnings)
+		t.Errorf("warnings = %v, want exactly one mentioning the missing Kea user", warnings)
 	}
 }
 

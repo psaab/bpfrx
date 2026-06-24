@@ -12388,3 +12388,22 @@ top.
 - **File(s)**: pkg/dhcpserver/lease_sync.go, pkg/dhcpserver/dhcpserver.go,
   pkg/dhcpserver/test_seams.go, pkg/dhcpserver/lease_sync_test.go,
   pkg/dhcpserver/README.md, _Log.md
+
+- **Timestamp**: 2026-06-23
+- **Action**: #2450 PR #2518 review folds (Copilot, 3 nits — code verdicted
+  MERGE-READY). (1) Fixed the resolveKeaOwner doc comment that named a
+  non-existent "keaOwnerCache" / "cached on first success" → now names
+  keaOwnerOnce (sync.Once) + describes once-per-process caching. (2+3) Moved
+  the absent-Kea-user warning OUT of writeMemfileAtomic (which warned on EVERY
+  pre-seed → twice per takeover for v4+v6, and again every takeover) INTO the
+  keaOwnerOnce closure in resolveKeaOwner, so it fires exactly once per process
+  on lookup failure; writeMemfileAtomic is now silent on ok=false (still writes
+  without owner + returns nil — takeover never aborts). Updated the
+  writeMemfileAtomic comment + README to accurately say "one warning is logged
+  (once per process)". Strengthened TestPreSeedMemfile_NoKeaUser_WarnsAndSucceeds
+  to pre-seed BOTH families and assert exactly ONE warning across both (catches
+  the per-call regression — verified the reverted per-call warn fails it).
+  Build/vet/gofmt clean; go test ./pkg/dhcpserver/ green; targeted tests
+  -count=5 green.
+- **File(s)**: pkg/dhcpserver/lease_sync.go, pkg/dhcpserver/lease_sync_test.go,
+  pkg/dhcpserver/README.md, _Log.md

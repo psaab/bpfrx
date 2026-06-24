@@ -713,21 +713,18 @@ func (m *Manager) writeMemfile6(path string, leases []SyncLease, now time.Time) 
 // orphaned root-owned temp survives the rename.
 //
 // ROBUSTNESS: when NEITHER Kea user exists (a dev host, or Kea simply not
-// installed) the takeover must NOT abort — chown is best-effort. We log one
-// warning and write the file without an owner override; the write itself still
-// succeeds. The daemon is root, so when the user DOES exist the chown cannot
-// fail for lack of privilege.
+// installed) the takeover must NOT abort — chown is best-effort. The file is
+// written without an owner override and the write itself still succeeds; one
+// warning is logged (once per process, in resolveKeaOwner's cached lookup —
+// not per pre-seed) so an absent-user takeover does not warn twice for v4+v6
+// or again on every subsequent takeover. The daemon is root, so when the user
+// DOES exist the chown cannot fail for lack of privilege.
 func (m *Manager) writeMemfileAtomic(path, content string) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0750); err != nil {
 		return fmt.Errorf("create %s: %w", dir, err)
 	}
 	uid, gid, ok := m.resolveKeaOwner()
-	if !ok {
-		m.warnf("dhcpserver: no %s/%s runtime user found; pre-seeding Kea memfile %s "+
-			"as root — Kea may be unable to open it (EACCES) if it runs unprivileged",
-			keaPrimaryUser, keaFallbackUser, path)
-	}
 	return writeMemfileFile(path, []byte(content), 0640, uid, gid, ok)
 }
 
@@ -754,9 +751,13 @@ const (
 // resolveKeaOwner returns the uid/gid the Kea memfile must be owned by so the
 // unprivileged Kea process can open it RW, and ok=false when neither candidate
 // user exists (chown then becomes best-effort — see writeMemfileAtomic). The
-// lookup is cached on first success so the takeover path does not hit
-// /etc/passwd per pre-seed. The resolver and the cache are seam-injectable for
-// tests (keaOwnerLookup / keaOwnerCache).
+// lookup runs exactly once per process (cached behind keaOwnerOnce, a
+// sync.Once) so the takeover path does not hit /etc/passwd per pre-seed. The
+// resolver is seam-injectable for tests (keaOwnerLookup; nil selects the real
+// os/user lookup). When the lookup FAILS, the absent-user warning is emitted
+// HERE — inside the once-guarded closure — so it fires exactly once per
+// process rather than on every pre-seed (an operator who installs the Kea
+// package mid-process restarts xpfd anyway, which re-runs the lookup).
 func (m *Manager) resolveKeaOwner() (uid, gid int, ok bool) {
 	m.keaOwnerOnce.Do(func() {
 		lookup := m.keaOwnerLookup
@@ -764,6 +765,11 @@ func (m *Manager) resolveKeaOwner() (uid, gid int, ok bool) {
 			lookup = lookupKeaOwner
 		}
 		m.keaOwnerUID, m.keaOwnerGID, m.keaOwnerOK = lookup()
+		if !m.keaOwnerOK {
+			m.warnf("dhcpserver: no %s/%s runtime user found; pre-seeding Kea "+
+				"memfiles as root — Kea may be unable to open them (EACCES) if it "+
+				"runs unprivileged", keaPrimaryUser, keaFallbackUser)
+		}
 	})
 	return m.keaOwnerUID, m.keaOwnerGID, m.keaOwnerOK
 }

@@ -494,9 +494,11 @@ This package owns the KEA side of #2239 cross-chassis DHCP-server lease sync
   chown rides on the `fsatomic` temp fd (`fsatomic.WithOwner` fchowns BEFORE
   the rename), so the FINAL renamed inode is _kea-owned atomically — no
   post-rename root-owned window and no orphaned root-owned temp. Best-effort
-  when the Kea user is absent (dev host / Kea not installed): one warning, write
-  without the owner override, **takeover is never aborted**. Both the v4 and v6
-  memfiles are covered.
+  when the Kea user is absent (dev host / Kea not installed): one warning is
+  logged (once per process, in the cached owner resolution — not per pre-seed,
+  so an absent-user takeover does not warn twice for v4+v6 or again on every
+  later takeover), the file is written without the owner override, and
+  **takeover is never aborted**. Both the v4 and v6 memfiles are covered.
   The v6 WRITE side (memfile pre-seed AND `lease6-add`) encodes the lease kind
   SYMMETRICALLY with the read side: `stringToKeaLeaseType` is the exact total
   inverse of the read path's `keaLeaseTypeToString`, so IA_NA / IA_TA / IA_PD
