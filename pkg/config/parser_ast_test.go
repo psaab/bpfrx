@@ -884,7 +884,12 @@ func TestFormatSet(t *testing.T) {
 }
 
 func TestRPMConfig(t *testing.T) {
-	input := `services {
+	input := `routing-instances {
+    att-vr {
+        instance-type forwarding;
+    }
+}
+services {
     rpm {
         probe isp-comcast {
             test icmp-check {

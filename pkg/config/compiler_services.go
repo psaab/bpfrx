@@ -293,6 +293,59 @@ func validateRPMHTTPGetSchemeStrict(cfg *Config) error {
 	return nil
 }
 
+// validateRPMRoutingInstanceStrict rejects an RPM test whose
+// `routing-instance` does not name a CONFIGURED routing instance (#2496).
+// The runtime binds the probe DATA socket to the instance's VRF device
+// via SO_BINDTODEVICE — vrfDeviceName(ri) synthesizes "vrf-<name>"
+// (pkg/rpm/rpm.go). A typo'd / nonexistent instance has no such kernel
+// device, so the bind fails with ENODEV: the probe never sends a packet
+// and the test silently HOLDS its state forever (never PASS, never FAIL),
+// so any event-options / ip-monitoring policy keyed off it gets no
+// failover signal. It fails safe (no false PASS), but the candidate
+// config should have been rejected at commit so the operator sees the
+// typo rather than a permanently dead probe.
+//
+// An EMPTY routing-instance means the default (master) context and is NOT
+// scoped to a VRF device — it is always accepted. Only a non-empty name
+// that does not match a configured instance is the error. The configured-
+// instance enumeration mirrors validateIPMonitoringStrict's preferred-route
+// routing-instance check exactly (same cfg.RoutingInstances source, same
+// empty-is-default handling, same "does not exist" error shape).
+//
+// Strict on commit / commit-check (hard reject so the typo is
+// operator-visible); lenient on load / peer-sync (warn — #1960 no-brick;
+// the runtime bind returns ENODEV for the same nonexistent instance, so a
+// leniently-loaded test HOLDS state instead of actuating routes off a dead
+// measurement). Mirrors validateRPMHTTPGetSchemeStrict.
+func validateRPMRoutingInstanceStrict(cfg *Config) error {
+	if cfg == nil || cfg.Services.RPM == nil {
+		return nil
+	}
+	instances := make(map[string]*RoutingInstanceConfig)
+	for _, ri := range cfg.RoutingInstances {
+		if ri != nil {
+			instances[ri.Name] = ri
+		}
+	}
+	for _, probe := range cfg.Services.RPM.Probes {
+		if probe == nil {
+			continue
+		}
+		for _, test := range probe.Tests {
+			if test == nil || test.RoutingInstance == "" {
+				continue
+			}
+			if _, ok := instances[test.RoutingInstance]; !ok {
+				return fmt.Errorf(
+					"services rpm probe %q test %q: routing-instance %q does not exist "+
+						"(the probe would bind a nonexistent vrf-%s device and never run)",
+					probe.Name, test.Name, test.RoutingInstance, test.RoutingInstance)
+			}
+		}
+	}
+	return nil
+}
+
 // validateRPMProbePinsStrict enforces the probe-pin band invariants
 // (#1827 PR-1a): at most ProbeTableCount next-hop-pinned tests (one
 // reserved kernel table each), and no routing-instance table ID may
