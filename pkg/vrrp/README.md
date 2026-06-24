@@ -65,6 +65,13 @@ This is the package that drives chassis-cluster failover.
   poller (`runLinkWatcher`, `runLinkPoller`, `pollTrackedLinks`,
   `applyTrackedLinkState`, `seedTrackState`, `netlinkLinkState`,
   `linkAttrsUp`).
+- `addrwatch.go` — advert-source re-resolution (#2528): the manager-side
+  singleton ADDRESS-watcher (`runAddrWatcher`, `ensureAddrWatcherLocked`,
+  `reresolveAddrFor`) that subscribes to `netlink.AddrSubscribe` and
+  re-resolves `localIP`/`localIPv6` whenever an address changes on an
+  interface a VRRP instance is bound to. Distinct from the link-watcher
+  (which handles tracked-interface priority demotion) — different latch,
+  different concern — but both share `m.watcherStop` cancellation.
 - `vrrp.go` — `Instance` config type plus `CollectInstances` /
   `CollectRethInstances` config extraction.
 
@@ -195,6 +202,42 @@ pointer means unresolved). The lazy-resolve semantics are preserved —
 the address still becomes available once it is resolvable — and the
 packet hot path stays lock-free, mirroring the `lastDropWarn` atomic.
 
+#### Source re-resolution on address change (#2528)
+
+The lazy-resolve above only fires when the cached source is **nil**
+(unresolved at socket-open). It does **not** handle a source that was
+resolved once and then **changed or removed** while the instance runs —
+the cached `localIP`/`localIPv6` stayed permanently stale. That stale
+source is doubly harmful: the kernel silently rejects an advert whose
+source is no longer on the interface (the RG goes silent), AND
+self-filtering in `handleMasterRx` misclassifies our own adverts as a
+peer's → false MASTER-MASTER conflict / split-brain. The realistic
+trigger is the **RETH MAC reprogram cycle** (`programRethMAC`: link
+DOWN → set MAC → UP flushes ALL kernel addresses; networkd
+`KeepConfiguration=static` restores them, but with a 30 ms–1 s window
+against the next 30 ms advert), plus a DAD-failed link-local re-add.
+
+The manager now runs a singleton ADDRESS-watcher (`addrwatch.go`,
+`runAddrWatcher`) subscribed via `netlink.AddrSubscribe`. On any address
+add/del whose `LinkIndex` matches an instance's bound `iface.Index`, it
+calls `reresolveLocalAddrs()`, which recomputes both sources from the
+interface's **current** addresses (`resolveLocalIPv4` picks the lowest
+non-VIP IPv4 deterministically; `resolveIPv6LinkLocal` picks the lowest
+non-VIP **link-local** — VRRP IPv6 adverts use a `fe80::` source) and
+stores them atomically. Because every add/del emits an event, the final
+address state always wins a re-resolve. A transient empty result is
+stored as `nil` so the next advert's lazy-resolve recovers it. The
+watcher filters by ifindex so churn on an unrelated interface never
+disturbs a VRRP source. The TX (`sendPacket`/`sendPacketIPv6`) and RX
+(`handleMasterRx` self-filter) paths read the SAME re-resolved value via
+`getLocalIP`/`getLocalIPv6`, so self-filtering stays consistent after a
+re-resolve. The watcher is an optimization that closes the
+stale-**non-nil** window; a subscribe failure degrades to pre-#2528
+behavior (the lazy nil-path and the 2 s reconcile still recover the
+nil-source case) rather than breaking correctness, so there is no poll
+fallback (unlike the link-watcher). The `subscribeAddrs` seam defaults to
+`netlink.AddrSubscribe` and is injectable for tests.
+
 ### AF_PACKET cBPF filter + IPv6 extension headers (#2155)
 
 The AF_PACKET receiver attaches a cBPF prefilter
@@ -266,7 +309,12 @@ dataplane reuses this Go walker, and do NOT try to consolidate them.
   from the VIP would self-filter peer adverts.
 - RETH virtual MAC per node: `02:bf:72:CC:RR:NN`. Programmed via link
   DOWN → set MAC → link UP. This bounces all kernel addresses; VIPs are
-  re-added by `ReconcileVIPs()` immediately afterwards.
+  re-added by `ReconcileVIPs()` immediately afterwards, and the advert
+  **source** (`localIP`/`localIPv6`) is re-resolved by the #2528
+  address-watcher (`addrwatch.go`) as the flushed base/link-local
+  addresses are re-added — so the instance never keeps advertising from a
+  source that the MAC cycle removed (see "Source re-resolution on address
+  change" above).
 - Bind retry on simultaneous boot avoids losing the master election to
   whichever node booted first.
 - Event channel is bounded at 256; backpressure increments an atomic
@@ -288,8 +336,11 @@ dataplane reuses this Go walker, and do NOT try to consolidate them.
   better than dropping out of election; the intended VIPs land on the
   next successful re-drive (~2s).
 - The instance-lifecycle seams (`resolveIface`, `openInstanceSocket`,
-  `runInstance`, `stopInstance`) and link seams (`linkState`,
-  `subscribeLinks`) exist so unit tests exercise the diff/lifecycle logic
-  without real netlink, raw sockets, or live goroutines. Production
-  defaults are wired in `NewManager`; do not change a seam's production
-  default without updating the matching test fakes.
+  `runInstance`, `stopInstance`), link seams (`linkState`,
+  `subscribeLinks`), the address seam (`subscribeAddrs`, #2528), and the
+  per-instance `addrsFn` interface-address seam (#2528) exist so unit
+  tests exercise the diff/lifecycle and source-resolution logic without
+  real netlink, raw sockets, or live goroutines. Production defaults are
+  wired in `NewManager` (`addrsFn` defaults to nil → live
+  `iface.Addrs()`); do not change a seam's production default without
+  updating the matching test fakes.
