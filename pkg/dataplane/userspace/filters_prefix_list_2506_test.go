@@ -61,6 +61,9 @@ func TestFilterSnapshotSourcePrefixListResolved(t *testing.T) {
 	if term.SourceExcept {
 		t.Error("source_except set for a plain (non-except) prefix-list reference")
 	}
+	if !term.SourceConstrained {
+		t.Error("source_constrained NOT set for a term with a source-prefix-list reference")
+	}
 }
 
 // Literal source-addresses are OR'd with positive prefix-list prefixes.
@@ -99,6 +102,9 @@ func TestFilterSnapshotDestPrefixListExcept(t *testing.T) {
 	if !term.DestExcept {
 		t.Fatal("destination_except NOT set for `destination-prefix-list except` — the term would match the listed prefixes instead of excluding them (#2506)")
 	}
+	if !term.DestConstrained {
+		t.Error("destination_constrained NOT set for a term with a destination-prefix-list except reference")
+	}
 }
 
 // The mixed case (literal addresses + an except prefix-list in ONE direction)
@@ -125,7 +131,8 @@ func TestFilterSnapshotMixedLiteralAndExceptFoldsPositive(t *testing.T) {
 // An undefined prefix-list reference contributes no prefixes (the strict commit
 // gate, tested separately in pkg/config, is what rejects it; here we confirm
 // the tolerant-path resolver does not crash and yields no scope from the
-// dangling ref).
+// dangling ref) — but the direction stays CONSTRAINED so the matcher fails
+// closed rather than collapsing to match-any (#2506, Copilot).
 func TestFilterSnapshotUndefinedPrefixListContributesNothing(t *testing.T) {
 	cfg := prefixListCfg(
 		[]config.PrefixListRef{{Name: "missing"}},
@@ -139,5 +146,58 @@ func TestFilterSnapshotUndefinedPrefixListContributesNothing(t *testing.T) {
 	}
 	if term.SourceExcept {
 		t.Error("source_except set for an unresolved reference")
+	}
+	if !term.SourceConstrained {
+		t.Fatal("source_constrained MUST stay true for an unresolved ref — an empty " +
+			"resolution that drops the constrained flag collapses the term to " +
+			"match-any (fail-open for accept) (#2506)")
+	}
+}
+
+// #2506 (Copilot): a DEFINED-but-EMPTY positive prefix-list (passes the strict
+// gate — it is defined) resolves to ZERO prefixes. The direction MUST stay
+// constrained so the matcher fails closed ("match sources in {}" = none).
+// Fail-on-revert: if `constrained` were derived from the resolved list length,
+// this would be false and the term would collapse to match-any.
+func TestFilterSnapshotEmptyPositivePrefixListStaysConstrained(t *testing.T) {
+	cfg := prefixListCfg(
+		[]config.PrefixListRef{{Name: "empty-list"}},
+		nil,
+		map[string][]string{"empty-list": {}}, // defined, no prefixes
+	)
+	snaps := buildFirewallFilterSnapshots(cfg)
+	term := snaps[0].Terms[0]
+	if len(term.SourceAddresses) != 0 {
+		t.Fatalf("empty prefix-list contributed %v, want none", term.SourceAddresses)
+	}
+	if term.SourceExcept {
+		t.Error("source_except set for a positive (non-except) empty prefix-list")
+	}
+	if !term.SourceConstrained {
+		t.Fatal("source_constrained MUST stay true for a defined-but-empty positive " +
+			"prefix-list — otherwise the term matches ANY source (fail-open) (#2506)")
+	}
+}
+
+// #2506 (Copilot): a DEFINED-but-EMPTY `except` prefix-list resolves to ZERO
+// prefixes. The direction stays constrained AND except — the matcher's empty
+// guard returns `except` (= match ALL), the Junos "sources NOT in {}" = all
+// semantic.
+func TestFilterSnapshotEmptyExceptPrefixListStaysConstrainedAndExcept(t *testing.T) {
+	cfg := prefixListCfg(
+		[]config.PrefixListRef{{Name: "empty-except", Except: true}},
+		nil,
+		map[string][]string{"empty-except": {}},
+	)
+	snaps := buildFirewallFilterSnapshots(cfg)
+	term := snaps[0].Terms[0]
+	if len(term.SourceAddresses) != 0 {
+		t.Fatalf("empty except prefix-list contributed %v, want none", term.SourceAddresses)
+	}
+	if !term.SourceExcept {
+		t.Fatal("source_except MUST stay set for an empty except prefix-list (match-all semantic) (#2506)")
+	}
+	if !term.SourceConstrained {
+		t.Fatal("source_constrained MUST stay true for an empty except prefix-list (#2506)")
 	}
 }

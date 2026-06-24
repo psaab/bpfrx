@@ -12477,3 +12477,34 @@ top.
   userspace-dp/src/filter/engine/cache_sensitive.rs,
   userspace-dp/src/filter/tests.rs, userspace-dp/src/filter/README.md,
   userspace-dp/tests/fixtures/protocol_wire_v1.json, docs/feature-gaps.md, _Log.md
+
+- **Timestamp**: 2026-06-23
+- **Action**: #2506 fold (PR #2530, Copilot) — fix empty-resolution fail-open.
+  `*_addr_constrained` was derived solely from the resolved address-list length,
+  so a `from source-prefix-list X` whose X is DEFINED-but-EMPTY (passes the
+  strict gate) or lenient-unresolved resolved to ZERO prefixes → constrained
+  collapsed to false → matcher `if !constrained { return true }` → match-ANY
+  (fail-open for accept, wrong scope for discard). Fix: thread EXPLICIT
+  per-direction `SourceConstrained`/`DestConstrained` wire flags (Go sets them
+  whenever the term wrote ANY scope — literal addr OR prefix-list ref —
+  regardless of resolution yield); Rust compiler OR's them into
+  source_addr_constrained/dest_addr_constrained; matcher empty guard changed
+  `return false` → `return except` so constrained+empty+positive=match-nothing
+  (fail-closed), constrained+empty+except=match-all (Junos "not in {}"=all).
+  Cross-family falls out: v4-only except list → empty v6 vec → guard returns
+  except=true → v6 "not in v4 list" matches (correct); v4-only positive →
+  guard returns false → v6 fails closed. Also folded the doc nit: mixed
+  literal+except fold is ACTION-DEPENDENT (under-broad = fail-safe for accept,
+  fail-OPEN for discard), not unconditionally fail-safe. Wire fixture
+  regenerated (source_constrained/destination_constrained keys). Fail-on-revert
+  PROVEN x2 (drop compiler constrained-OR → empty-positive tests FAIL; revert
+  empty guard to `return false` → empty-except test FAILs). go build/vet/test
+  green; cargo build + filter tests green (2 pre-existing parallel-exec flakes
+  wg-reconcile + worker_queue, both pass isolated).
+- **File(s)**: pkg/dataplane/userspace/filters.go,
+  pkg/dataplane/userspace/protocol.go,
+  pkg/dataplane/userspace/filters_prefix_list_2506_test.go,
+  userspace-dp/src/protocol/security.rs, userspace-dp/src/filter/compiler.rs,
+  userspace-dp/src/filter/engine/matching.rs,
+  userspace-dp/src/filter/tests.rs, userspace-dp/src/filter/README.md,
+  userspace-dp/tests/fixtures/protocol_wire_v1.json, docs/feature-gaps.md, _Log.md

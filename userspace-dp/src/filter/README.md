@@ -261,22 +261,47 @@ per-direction wire flags on `FirewallTermSnapshot` — `source_except` /
 `protocol/security.rs` with `serde(default)` for #1961 wire parity). They map to
 `FilterTerm.source_except` / `dest_except`, and the matcher
 (`engine/matching.rs` `nets_match_v4` / `nets_match_v6`) evaluates
-`nets.iter().any(contains) ^ except`. The fail-closed all-malformed guard (#2400
-above) still wins: a CONSTRAINED term whose prefix vec is empty matches NOTHING
-even when `except` is set (a typo'd `except` prefix-list must not silently invert
-into match-all). The except flags are compared in `filter_term_semantics_match`
-(`engine/cache_sensitive.rs`) — they flip the address decision without changing
-the parsed vecs, so a flow-cache rebuild must catch a toggle.
+`nets.iter().any(contains) ^ except`. The except flags are compared in
+`filter_term_semantics_match` (`engine/cache_sensitive.rs`) — they flip the
+address decision without changing the parsed vecs, so a flow-cache rebuild must
+catch a toggle.
+
+**Explicit `constrained` signal + empty-set semantics (#2506, Copilot).** A
+prefix-list can resolve to ZERO prefixes — a defined-but-empty list (passes the
+strict gate) or an unresolved reference on the lenient/peer-sync path. The
+empty-resolution case is exactly the address-scope-loss bug #2506 fixes, so
+"constrained" must NOT be derived from the resolved list length (an empty list
+would collapse to match-any: fail-open for `accept`, wrong scope for
+`discard`). Two explicit wire flags `source_constrained` /
+`destination_constrained` (Go sets them whenever the term wrote ANY scope —
+literal address or prefix-list ref) are OR'd into
+`FilterTerm.source_addr_constrained` / `dest_addr_constrained` in the compiler.
+The matcher's empty guard then returns `except`:
+
+- positive (`except == false`), empty vec → `false` → match NOTHING (Junos
+  `addr ∈ {}` = none; this is the #2400 all-malformed case AND the #2506
+  empty-positive case);
+- `except == true`, empty vec → `true` → match ALL (Junos `addr ∉ {}` = all);
+- `constrained == false` (no scope at all) → match any, unchanged.
+
+Cross-family falls out of this for free: a v4-only `... except` list leaves the
+v6 vec empty, and a v6 address is trivially "not in" a v4 list, so the empty
+guard's `return except` (= true for an except term) correctly matches v6 — the
+v4 list does not constrain v6. (A v4-only POSITIVE list correctly fails closed
+for v6 via the same guard returning `except` = false.)
 
 Go-side scope: a plain prefix-list OR's into the positive set (with any literal
 addresses); an `except` prefix-list sets the inversion flag ONLY when it is the
 sole address source for the direction. The mixed literal/positive + `except`
-case in one direction folds `except` away to a positive set (under-broad,
-fail-safe) with a warning — there is no single boolean-inversion representation
-for "match A but not B"; splitting into two terms is the operator workaround,
-and the structured form is a documented follow-up. An undefined prefix-list
-reference is rejected at commit by `validateFirewallPrefixListReferencesStrict`
-(Go), so the Rust side never has to reason about a dangling name.
+case in one direction folds `except` away to a positive set with a warning —
+there is no single boolean-inversion representation for "match A but not B". The
+fold is **action-dependent in safety**: under-broadening is fail-safe for
+`accept`/permit terms but fail-OPEN for a `discard`/`reject` term (traffic the
+operator meant to drop via `except` is no longer dropped). Splitting into two
+terms is the operator workaround, and the structured form is a documented
+follow-up. An undefined prefix-list reference is rejected at commit by
+`validateFirewallPrefixListReferencesStrict` (Go), so the Rust side never has to
+reason about a dangling name.
 
 ### Path (b) runbook — cache-sensitive
 

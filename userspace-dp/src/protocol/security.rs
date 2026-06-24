@@ -109,6 +109,20 @@ pub(crate) struct FirewallTermSnapshot {
     pub source_except: bool,
     #[serde(rename = "destination_except", default)]
     pub destination_except: bool,
+    // #2506 (Copilot): the term SPECIFIED a source/destination address scope
+    // (any literal address OR any prefix-list reference), INDEPENDENT of whether
+    // it resolved to any prefixes. The matcher derives "constrained" from THIS,
+    // not the resolved list length, so a `from source-prefix-list X` whose X is
+    // defined-but-empty or lenient-unresolved (empty list) does not collapse to
+    // match-ANY. A constrained direction with an empty positive set matches
+    // NOTHING (fail-closed); with `except` set, matches ALL (Junos "not in {}").
+    // serde(default) keeps wire parity with an older Go control plane that omits
+    // the field (#1961). When BOTH this and the addr list are absent/false, the
+    // direction is unconstrained (match-any) — unchanged legacy behavior.
+    #[serde(rename = "source_constrained", default)]
+    pub source_constrained: bool,
+    #[serde(rename = "destination_constrained", default)]
+    pub destination_constrained: bool,
     #[serde(default)]
     pub protocols: Vec<String>,
     #[serde(rename = "source_ports", default)]
