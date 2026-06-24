@@ -181,6 +181,45 @@ Steps 1-6 above are now the actual flow. Remaining differences from target:
 - Neighbor warmup still runs async after activation (harmless — ARP/NDP
   for next-hops, not blocking the forwarding path)
 
+### Watchdog heartbeat: map write every tick vs IPC on change/backstop (#2549)
+
+The daemon runs a per-RG watchdog heartbeat (`pkg/daemon/daemon_ha_sync.go`)
+on a 500ms ticker, writing a monotonic-seconds timestamp so a SIGKILL'd daemon
+goes stale and the peer takes over. That timestamp lands in two places with
+**different cadence requirements**, and `UpdateHAWatchdog`
+(`pkg/dataplane/userspace/manager_ha.go`) decouples them:
+
+- **Shim BPF `ha_watchdog` map write — EVERY tick (500ms), never throttled.**
+  This is the kernel-visible liveness signal the BPF ~2s stale window compares
+  against; it must stay fresh every tick. It is a cheap local map update, not a
+  socket round-trip.
+- **`update_ha_state` socket IPC — throttled.** The full HA-state JSON IPC over
+  the shared Rust-helper control socket is the expensive part. Issuing it every
+  tick is a 2/s-per-RG control-socket caller — exactly what the CLAUDE.md
+  *Control socket contention* rule forbids (">1/s … will starve session installs
+  during bulk sync"). It now fires only when:
+  1. **An RG `Active` state CHANGES** (failover/failback) — published
+     IMMEDIATELY. This is the load-bearing failover-timing path and is NEVER
+     throttled. (The authoritative active-change publish is `UpdateRGActive`'s
+     own direct `update_ha_state`; the heartbeat path also force-syncs on a
+     detected per-RG `Active` delta as defense in depth.)
+  2. **As a periodic BACKSTOP** — once the watchdog timestamp has advanced by
+     `haWatchdogIPCBackstopSecs` (3s) since the last IPC for that RG, so the
+     helper's view is refreshed well within its ~10s stale-lease window.
+
+  Per-RG throttle state (`haWatchdogIPCSynced`, under `m.mu`) records the last
+  timestamp/`Active` published per RG; the first heartbeat after startup/seed
+  has no baseline and always syncs. The baseline is recorded BEFORE the send so
+  a post-send error cannot cause a per-tick resync storm (the next ≤3s backstop
+  retries), and `UpdateRGActive` records it too so the heartbeat does not
+  redundantly re-fire right after a failover.
+
+**Threshold rationale:** 3s gives a >3x margin under the helper's ~10s
+stale-lease and drops the heartbeat's control-socket load from 2/s per RG to at
+most ~0.33/s per RG (≈6x reduction), while the kernel-level liveness (the map
+write) stays at the full 500ms cadence. Failover/failback timing is unchanged
+because state changes bypass the throttle entirely.
+
 ## What Was Eliminated
 
 These mechanisms existed before the simplification work and have been
