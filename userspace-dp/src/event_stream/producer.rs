@@ -5,7 +5,11 @@ use super::{EventFrame, EventStreamSendError, EventStreamWorkerHandle};
 use std::array;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-const DATAPLANE_EVENT_KIND_COUNT: usize = 3;
+// #2512: 5 kinds — PolicyDeny, ScreenDrop, FilterLog, SessionClose,
+// SessionCreate. SessionClose/SessionCreate were added so the RT_FLOW
+// close/create frames share the same per-kind limiter, queue budget, and
+// counters instead of a bare `try_send` side channel.
+const DATAPLANE_EVENT_KIND_COUNT: usize = 5;
 const DATAPLANE_EVENT_ZONE_BUCKETS: usize = 256;
 const DATAPLANE_EVENT_RATE_BUCKETS: usize =
     DATAPLANE_EVENT_KIND_COUNT * DATAPLANE_EVENT_ZONE_BUCKETS;
@@ -203,6 +207,10 @@ pub(crate) struct DataplaneEventStats {
     pub(crate) policy_deny: DataplaneEventKindStats,
     pub(crate) screen_drop: DataplaneEventKindStats,
     pub(crate) filter_log: DataplaneEventKindStats,
+    // #2512: per-kind sent/dropped accounting for the RT_FLOW close/create
+    // frames, previously emitted via an unaccounted bare `try_send`.
+    pub(crate) session_close: DataplaneEventKindStats,
+    pub(crate) session_create: DataplaneEventKindStats,
 }
 
 pub(super) struct DataplaneEventCounters {
@@ -240,6 +248,8 @@ impl DataplaneEventCounters {
             policy_deny: self.kind_snapshot(DataplaneEventKind::PolicyDeny),
             screen_drop: self.kind_snapshot(DataplaneEventKind::ScreenDrop),
             filter_log: self.kind_snapshot(DataplaneEventKind::FilterLog),
+            session_close: self.kind_snapshot(DataplaneEventKind::SessionClose),
+            session_create: self.kind_snapshot(DataplaneEventKind::SessionCreate),
         }
     }
 
@@ -271,10 +281,38 @@ impl EventStreamWorkerHandle {
         now_ns: u64,
     ) -> DataplaneEventEmitOutcome {
         let kind = event.kind;
+        let ingress_zone_id = event.ingress_zone_id;
+        self.try_emit_dataplane_frame(kind, ingress_zone_id, now_ns, |seq| {
+            EventFrame::encode_dataplane_event(seq, &event)
+        })
+    }
+
+    /// #2512: shared budget path for an already-shaped dataplane-event frame.
+    ///
+    /// Runs the SAME per-kind/per-ingress-zone rate limiter, queue-budget
+    /// reservation, and sent/dropped counters as `try_emit_dataplane_event_at`
+    /// but lets the caller supply its own frame encoder (the RT_FLOW
+    /// session-close/create frames have a distinct payload layout from the
+    /// generic deny/screen/filter frame). The sequence number is allocated
+    /// only AFTER the limiter and budget pass, matching the generic path, so a
+    /// rate-limited or budget-exhausted close/create never burns a seq. The
+    /// frame's msg_type byte MUST map back to `kind` via
+    /// `DataplaneEventKind::from_msg_type` so the I/O thread releases the
+    /// per-kind budget when the frame leaves the channel.
+    pub(crate) fn try_emit_dataplane_frame<F>(
+        &self,
+        kind: DataplaneEventKind,
+        ingress_zone_id: u16,
+        now_ns: u64,
+        encode: F,
+    ) -> DataplaneEventEmitOutcome
+    where
+        F: FnOnce(u64) -> EventFrame,
+    {
         if !self
             .shared
             .dataplane_event_limiter
-            .allow_at(kind, event.ingress_zone_id, now_ns)
+            .allow_at(kind, ingress_zone_id, now_ns)
         {
             self.shared
                 .dataplane_event_counters
@@ -296,7 +334,7 @@ impl EventStreamWorkerHandle {
         }
 
         let seq = self.next_seq();
-        let frame = EventFrame::encode_dataplane_event(seq, &event);
+        let frame = encode(seq);
         match self.try_send_frame(frame) {
             Ok(()) => {
                 self.shared.dataplane_event_counters.record_sent(kind);
@@ -334,6 +372,8 @@ fn kind_index(kind: DataplaneEventKind) -> usize {
         DataplaneEventKind::PolicyDeny => 0,
         DataplaneEventKind::ScreenDrop => 1,
         DataplaneEventKind::FilterLog => 2,
+        DataplaneEventKind::SessionClose => 3,
+        DataplaneEventKind::SessionCreate => 4,
     }
 }
 

@@ -1265,6 +1265,21 @@ func (c *xpfCollector) emitUserspaceEventStream(ch chan<- prometheus.Metric, sta
 	// observable (it is NOT ACK-trim, which is normal acknowledged removal).
 	ch <- prometheus.MustNewConstMetric(c.userspaceEventStreamProducerFramesTotal,
 		prometheus.CounterValue, float64(status.EventStreamReplayEvictions), "replay_evicted")
+	// #2512: per-kind producer accounting for the RT_FLOW SESSION_CLOSE
+	// (type 14) and SESSION_CREATE (type 15) frames, which now ride the same
+	// helper-side rate limiter + queue budget as deny/screen/filter instead of
+	// a bare unaccounted try_send. Surfaced under the producer metric with
+	// distinct labels so a rate-limited or budget-shed close/create is
+	// observable (a dropped close loses only a flow-export record; the type-2
+	// HA close delta is a separate, never-rate-limited frame).
+	ch <- prometheus.MustNewConstMetric(c.userspaceEventStreamProducerFramesTotal,
+		prometheus.CounterValue, float64(status.EventStreamSessionCloseSent), "session_close_sent")
+	ch <- prometheus.MustNewConstMetric(c.userspaceEventStreamProducerFramesTotal,
+		prometheus.CounterValue, float64(status.EventStreamSessionCloseDropped), "session_close_dropped")
+	ch <- prometheus.MustNewConstMetric(c.userspaceEventStreamProducerFramesTotal,
+		prometheus.CounterValue, float64(status.EventStreamSessionCreateSent), "session_create_sent")
+	ch <- prometheus.MustNewConstMetric(c.userspaceEventStreamProducerFramesTotal,
+		prometheus.CounterValue, float64(status.EventStreamSessionCreateDropped), "session_create_dropped")
 	ch <- prometheus.MustNewConstMetric(c.userspaceEventStreamDecodeErrorsTotal,
 		prometheus.CounterValue, float64(es.DecodeErrors))
 	ch <- prometheus.MustNewConstMetric(c.userspaceEventStreamSequenceGapsTotal,

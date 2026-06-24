@@ -87,7 +87,12 @@ fn dataplane_event_rate_limit_is_per_kind_and_ingress_zone() {
         events_per_second: 1,
         burst: 1,
     };
-    let (handle, _rx, shared) = test_handle(16, config);
+    // #2512: capacity 32 → total budget 16, per-kind budget ceil(16/5) = 4,
+    // enough to admit the 3 PolicyDeny frames this test queues without the
+    // undrained-channel queue-budget gate firing (the kind divisor grew from
+    // 3 to 5). This test isolates the per-(kind,zone) RATE limiter, not the
+    // queue budget.
+    let (handle, _rx, shared) = test_handle(32, config);
 
     assert_eq!(
         handle.try_emit_dataplane_event_at(test_event(DataplaneEventKind::PolicyDeny, 7), 0),

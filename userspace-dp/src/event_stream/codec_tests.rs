@@ -217,6 +217,12 @@ fn assert_dataplane_event_round_trip(event: DataplaneEventPayload, msg_type: u8)
         DataplaneEventKind::PolicyDeny => assert_eq!(decoded.policy_id, event.policy_id),
         DataplaneEventKind::ScreenDrop => assert_eq!(decoded.screen_id, event.screen_id),
         DataplaneEventKind::FilterLog => assert_eq!(decoded.filter_id, event.filter_id),
+        // #2512: this helper only exercises the generic deny/screen/filter
+        // dataplane-event payload. SESSION_CLOSE / SESSION_CREATE use their
+        // own RT_FLOW encoders and never construct a DataplaneEventPayload.
+        DataplaneEventKind::SessionClose | DataplaneEventKind::SessionCreate => {
+            unreachable!("session-close/create kinds do not use encode_dataplane_event")
+        }
     }
     assert_eq!(
         frame

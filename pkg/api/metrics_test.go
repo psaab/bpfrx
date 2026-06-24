@@ -426,10 +426,14 @@ func TestEmitUserspaceEventStreamMetrics(t *testing.T) {
 		userspaceEventStreamUnknownDropsTotal:    mkNoLabel("xpf_userspace_event_stream_unknown_frame_drops_total"),
 	}
 	status := dpuserspace.ProcessStatus{
-		EventStreamSent:            101,
-		EventStreamDropped:         7,
-		EventStreamWriteStalls:     13,
-		EventStreamReplayEvictions: 4,
+		EventStreamSent:                 101,
+		EventStreamDropped:              7,
+		EventStreamWriteStalls:          13,
+		EventStreamReplayEvictions:      4,
+		EventStreamSessionCloseSent:     90,
+		EventStreamSessionCloseDropped:  3,
+		EventStreamSessionCreateSent:    12,
+		EventStreamSessionCreateDropped: 1,
 		EventStream: &dpuserspace.EventStreamStatus{
 			FramesRead:          11,
 			FramesWritten:       7,
@@ -465,6 +469,11 @@ func TestEmitUserspaceEventStreamMetrics(t *testing.T) {
 	// counters surface under distinct outcome labels on the same metric.
 	assertCounterClose(t, got, c.userspaceEventStreamProducerFramesTotal, map[string]string{"outcome": "write_stalled"}, 13)
 	assertCounterClose(t, got, c.userspaceEventStreamProducerFramesTotal, map[string]string{"outcome": "replay_evicted"}, 4)
+	// #2512: per-kind RT_FLOW close/create producer accounting.
+	assertCounterClose(t, got, c.userspaceEventStreamProducerFramesTotal, map[string]string{"outcome": "session_close_sent"}, 90)
+	assertCounterClose(t, got, c.userspaceEventStreamProducerFramesTotal, map[string]string{"outcome": "session_close_dropped"}, 3)
+	assertCounterClose(t, got, c.userspaceEventStreamProducerFramesTotal, map[string]string{"outcome": "session_create_sent"}, 12)
+	assertCounterClose(t, got, c.userspaceEventStreamProducerFramesTotal, map[string]string{"outcome": "session_create_dropped"}, 1)
 	assertCounterClose(t, got, c.userspaceEventStreamDecodeErrorsTotal, nil, 2)
 	assertCounterClose(t, got, c.userspaceEventStreamSequenceGapsTotal, nil, 3)
 	assertCounterClose(t, got, c.userspaceEventStreamDataplaneEventsTotal, map[string]string{"type": "policy_deny"}, 5)
