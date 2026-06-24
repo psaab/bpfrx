@@ -4151,7 +4151,16 @@ fn poll_descriptor_policy_deny_path_emits_rt_flow_event() {
     assert_eq!(event.ingress_ifindex, 24);
     assert_eq!(event.src_port, 12345);
     assert_eq!(event.dst_port, 5201);
-    assert_eq!(event.timestamp_ns, 0);
+    // #2470: the poll path stamps the dataplane DECISION instant (wall-clock
+    // Unix ns) at emit time instead of 0, so the Go decoder reports decision
+    // time rather than receive time. This end-to-end check (a real
+    // CLOCK_MONOTONIC now_ns flows through the worker poll path) fails if the
+    // emitter is reverted to `timestamp_ns: 0`.
+    assert!(
+        event.timestamp_ns > 0,
+        "policy-deny event from the poll path must carry a real wall-clock \
+         timestamp, got 0"
+    );
     assert_eq!(event_handle.dataplane_event_stats().policy_deny.sent, 1);
     assert!(telemetry.dbg.policy_deny >= 1);
 }

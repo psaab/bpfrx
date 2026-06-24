@@ -83,6 +83,27 @@ pub(crate) fn monotonic_ns_to_unix_secs(mono_ns: u64, now_mono_ns: u64, now_unix
     (unix_ns / NS_PER_SEC).min(u32::MAX as u64) as u32
 }
 
+/// #2470: convert a CLOCK_MONOTONIC instant (the `now_ns`/`now_secs`-derived
+/// value the worker poll loop hands to the RT_FLOW deny/screen/filter-log
+/// emitters) to an absolute wall-clock Unix nanosecond count, taking a fresh
+/// anchored (`mono`, `wall`) reading here. This is the emission-time
+/// conversion boundary: the deny/screen/filter-log events carry the dataplane
+/// DECISION instant on the wire (offset 0, LE u64, absolute Unix ns — the same
+/// `timestamp_ns` format the SESSION_CLOSE frame uses and the Go decoder
+/// reads), so a queued/backlogged delivery on the Go side cannot skew the
+/// logged event time to consumption time. A 0 `mono_ns` (unknown) or a clock
+/// read failure maps to 0 → the Go side (`pkg/logging/ringbuf.go`) falls back
+/// to receive time, preserving the old behavior only when no real instant is
+/// available.
+///
+/// These events fire on drops / denies / log-matched packets (NOT per normal
+/// packet), so one anchored clock read per emit is acceptable; correctness
+/// (a real decision timestamp) is preferred over saving the read.
+pub(crate) fn mono_ns_to_wall_clock_unix_ns(mono_ns: u64) -> u64 {
+    let (now_mono_ns, now_unix_ns) = read_mono_and_wall_clocks();
+    monotonic_ns_to_unix_ns(mono_ns, now_mono_ns, now_unix_ns)
+}
+
 /// Interval between keepalive frames to prevent idle disconnect.
 #[allow(dead_code)] // reserved for event stream keepalive logic
 const KEEPALIVE_INTERVAL_NS: u64 = 10_000_000_000; // 10 seconds

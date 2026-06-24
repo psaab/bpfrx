@@ -107,7 +107,10 @@ pub(super) fn emit_policy_deny_event(
         application_id: 0,
         filter_id: 0,
         screen_id: 0,
-        timestamp_ns: 0,
+        // #2470: stamp the dataplane DECISION instant (wall-clock Unix ns)
+        // here at emit time so a backlogged Go-side delivery cannot skew the
+        // logged event time to consumption time. `now_ns` is CLOCK_MONOTONIC.
+        timestamp_ns: crate::event_stream::mono_ns_to_wall_clock_unix_ns(now_ns),
     };
     let _ = event_stream.try_emit_dataplane_event_at(event, now_ns);
 }
@@ -148,7 +151,9 @@ pub(super) fn emit_screen_drop_event(
         application_id: 0,
         filter_id: 0,
         screen_id: screen_reason_id(reason),
-        timestamp_ns: 0,
+        // #2470: stamp the dataplane DECISION instant (wall-clock Unix ns) at
+        // emit time. `now_ns` is CLOCK_MONOTONIC.
+        timestamp_ns: crate::event_stream::mono_ns_to_wall_clock_unix_ns(now_ns),
     };
     let _ = event_stream.try_emit_dataplane_event_at(event, now_ns);
 }
@@ -202,7 +207,9 @@ pub(super) fn emit_screen_alarm_event(
         application_id: 0,
         filter_id: 0,
         screen_id: screen_reason_id(reason),
-        timestamp_ns: 0,
+        // #2470: stamp the dataplane DECISION instant (wall-clock Unix ns) at
+        // emit time, same as the screen-drop path. `now_ns` is CLOCK_MONOTONIC.
+        timestamp_ns: crate::event_stream::mono_ns_to_wall_clock_unix_ns(now_ns),
     };
     let _ = event_stream.try_emit_dataplane_event_at(event, now_ns);
 }
@@ -281,7 +288,9 @@ pub(super) fn emit_filter_log_event(
         application_id: 0,
         filter_id,
         screen_id: 0,
-        timestamp_ns: 0,
+        // #2470: stamp the dataplane DECISION instant (wall-clock Unix ns) at
+        // emit time. `now_ns` is CLOCK_MONOTONIC.
+        timestamp_ns: crate::event_stream::mono_ns_to_wall_clock_unix_ns(now_ns),
     };
     let _ = event_stream.try_emit_dataplane_event_at(event, now_ns);
 }
@@ -362,6 +371,16 @@ mod tests {
     use crate::session::SessionKey;
     use std::net::{IpAddr, Ipv4Addr};
 
+    /// A real CLOCK_MONOTONIC reading, mirroring what the worker poll loop
+    /// hands the emitters as `now_ns`. The emitters convert this to a
+    /// wall-clock Unix ns at emit time (#2470), so a realistic monotonic
+    /// instant is required for the conversion to produce a present-day
+    /// timestamp (a tiny synthetic value like `123` converts to ~0 because it
+    /// reads as an "ancient" monotonic instant).
+    fn mono_now_ns() -> u64 {
+        crate::afxdp::neighbor::monotonic_nanos()
+    }
+
     fn test_flow() -> SessionFlow {
         let src_ip = IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10));
         let dst_ip = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 20));
@@ -416,7 +435,7 @@ mod tests {
             3,
             101,
             PolicyAction::Deny,
-            123,
+            mono_now_ns(),
         );
 
         let event = rx
@@ -435,7 +454,14 @@ mod tests {
         assert_eq!(event.owner_rg_id, 3);
         assert_eq!(event.src_port, 49152);
         assert_eq!(event.dst_port, 443);
-        assert_eq!(event.timestamp_ns, 0);
+        // #2470 fail-on-revert: the emitter stamps the dataplane DECISION
+        // instant (wall-clock Unix ns) on the wire instead of 0. Reverting
+        // `timestamp_ns` back to 0 makes the Go side fall back to RECEIVE
+        // time; this assertion fails in that case.
+        assert!(
+            event.timestamp_ns > 0,
+            "policy-deny event must carry a real wall-clock timestamp, got 0"
+        );
         assert_eq!(handle.dataplane_event_stats().policy_deny.sent, 1);
     }
 
@@ -494,7 +520,7 @@ mod tests {
             frag_data_off: 0,
         };
 
-        emit_screen_drop_event(Some(&handle), &pkt, test_meta(), 11, "land-attack", 456);
+        emit_screen_drop_event(Some(&handle), &pkt, test_meta(), 11, "land-attack", mono_now_ns());
 
         let event = rx
             .try_recv()
@@ -508,6 +534,11 @@ mod tests {
         assert_eq!(event.egress_zone_id, 0);
         assert_eq!(event.src_ip, pkt.src_ip);
         assert_eq!(event.dst_ip, pkt.dst_ip);
+        // #2470 fail-on-revert: a real decision timestamp on the wire.
+        assert!(
+            event.timestamp_ns > 0,
+            "screen-drop event must carry a real wall-clock timestamp, got 0"
+        );
         assert_eq!(handle.dataplane_event_stats().screen_drop.sent, 1);
     }
 
@@ -539,7 +570,7 @@ mod tests {
             frag_data_off: 0,
         };
 
-        emit_screen_alarm_event(Some(&handle), &pkt, test_meta(), 2, "scan-table-pressure", 789);
+        emit_screen_alarm_event(Some(&handle), &pkt, test_meta(), 2, "scan-table-pressure", mono_now_ns());
 
         let event = rx
             .try_recv()
@@ -554,6 +585,11 @@ mod tests {
         assert_eq!(event.screen_id, SCREEN_SCAN_TABLE_PRESSURE);
         assert_eq!(event.src_ip, pkt.src_ip);
         assert_eq!(event.dst_ip, pkt.dst_ip);
+        // #2470 fail-on-revert: a real decision timestamp on the wire.
+        assert!(
+            event.timestamp_ns > 0,
+            "screen-alarm event must carry a real wall-clock timestamp, got 0"
+        );
     }
 
     #[test]
@@ -580,7 +616,7 @@ mod tests {
             frag_data_off: 0,
         };
 
-        emit_screen_drop_event(Some(&handle), &pkt, test_meta(), 11, "icmp-fragment", 456);
+        emit_screen_drop_event(Some(&handle), &pkt, test_meta(), 11, "icmp-fragment", mono_now_ns());
 
         let event = rx
             .try_recv()
@@ -644,7 +680,7 @@ mod tests {
             5,
             FilterAction::Accept,
             FilterLogSource::Input,
-            789,
+            mono_now_ns(),
         );
 
         let event = rx
@@ -659,6 +695,11 @@ mod tests {
         assert_eq!(event.reason, FilterLogSource::Input.wire_reason());
         assert_eq!(event.ingress_zone_id, 7);
         assert_eq!(event.egress_zone_id, 0);
+        // #2470 fail-on-revert: a real decision timestamp on the wire.
+        assert!(
+            event.timestamp_ns > 0,
+            "filter-log event must carry a real wall-clock timestamp, got 0"
+        );
         assert_eq!(handle.dataplane_event_stats().filter_log.sent, 1);
     }
 
@@ -682,7 +723,7 @@ mod tests {
             6,
             FilterAction::Reject,
             FilterLogSource::Lo0,
-            789,
+            mono_now_ns(),
         );
 
         let event = rx
@@ -715,7 +756,7 @@ mod tests {
             6,
             FilterAction::Discard,
             FilterLogSource::Lo0,
-            789,
+            mono_now_ns(),
         );
 
         let event = rx
@@ -726,5 +767,63 @@ mod tests {
         assert_eq!(event.kind, DataplaneEventKind::FilterLog);
         assert_eq!(event.action, RT_FLOW_ACTION_DENY);
         assert_eq!(handle.dataplane_event_stats().filter_log.sent, 1);
+    }
+
+    /// #2470: two events emitted in monotonic-instant order carry
+    /// non-decreasing wall-clock timestamps on the wire. This is the timeline
+    /// correctness property the fix delivers: under queued / backlogged
+    /// Go-side delivery the logged ordering reflects the DECISION instants,
+    /// not the (possibly reordered or bunched) consumption instants.
+    #[test]
+    fn emitted_timestamps_are_non_decreasing() {
+        let (handle, rx) = unlimited_handle();
+        let flow = test_flow();
+
+        let t0 = mono_now_ns();
+        emit_policy_deny_event(
+            Some(&handle),
+            &flow,
+            test_meta(),
+            7,
+            9,
+            3,
+            101,
+            PolicyAction::Deny,
+            t0,
+        );
+        // A strictly later monotonic instant for the second event.
+        let t1 = mono_now_ns().max(t0 + 1);
+        emit_filter_log_event(
+            Some(&handle),
+            &flow,
+            test_meta(),
+            7,
+            0,
+            23,
+            5,
+            FilterAction::Accept,
+            FilterLogSource::Input,
+            t1,
+        );
+
+        let first = rx
+            .try_recv()
+            .expect("first event frame")
+            .decode_dataplane_event()
+            .expect("first event payload");
+        let second = rx
+            .try_recv()
+            .expect("second event frame")
+            .decode_dataplane_event()
+            .expect("second event payload");
+        assert!(first.timestamp_ns > 0, "first event must be stamped");
+        assert!(second.timestamp_ns > 0, "second event must be stamped");
+        assert!(
+            second.timestamp_ns >= first.timestamp_ns,
+            "events emitted in monotonic order must have non-decreasing \
+             wall-clock timestamps: first={} second={}",
+            first.timestamp_ns,
+            second.timestamp_ns
+        );
     }
 }
