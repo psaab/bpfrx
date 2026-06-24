@@ -573,7 +573,11 @@ func encodeTTL(seconds int) []byte {
 }
 
 // ParseTLVs parses LLDP TLVs from raw payload (after Ethernet header).
-// Returns nil if mandatory TLVs (Chassis ID, Port ID, TTL) are missing.
+// Returns nil if any mandatory TLV (Chassis ID, Port ID, TTL) is missing OR
+// truncated: a mandatory TLV is only counted present once its value parsed
+// into a valid identifier (non-empty Chassis/Port ID, a 2-byte TTL). A
+// truncated mandatory TLV would otherwise be accepted with an empty key and
+// poison the neighbor cache as "ifname//" with TTL 0 (#2551).
 func ParseTLVs(data []byte) *Neighbor {
 	n := &Neighbor{}
 	hasChassis, hasPort, hasTTL := false, false, false
@@ -594,24 +598,39 @@ func ParseTLVs(data []byte) *Neighbor {
 		case tlvEnd:
 			goto done
 		case tlvChassisID:
-			if len(value) >= 2 && value[0] == chassisSubtypeMACAddr && len(value) >= 7 {
-				n.ChassisID = net.HardwareAddr(value[1:7]).String()
+			// Mark the Chassis ID present ONLY when the value is long enough
+			// to yield a real identifier. A subtype byte alone (len < 2) or a
+			// MAC-subtype value short of the 6-byte address (len < 7) is a
+			// truncated TLV: leaving hasChassis false makes the terminal check
+			// reject the frame rather than caching it under an empty key
+			// (#2551).
+			if len(value) >= 2 && value[0] == chassisSubtypeMACAddr {
+				if len(value) >= 7 {
+					n.ChassisID = net.HardwareAddr(value[1:7]).String()
+					hasChassis = true
+				}
+				// MAC subtype with len 2..6 is truncated for its own subtype —
+				// do not accept it.
 			} else if len(value) >= 2 {
 				n.ChassisID = string(value[1:])
+				hasChassis = true
 			}
-			hasChassis = true
 		case tlvPortID:
-			if len(value) >= 2 && value[0] == portSubtypeIfName {
+			// Same gating as Chassis ID: a subtype byte with no identifier
+			// (len < 2) is truncated, so leave hasPort false (#2551).
+			if len(value) >= 2 {
 				n.PortID = string(value[1:])
-			} else if len(value) >= 2 {
-				n.PortID = string(value[1:])
+				hasPort = true
 			}
-			hasPort = true
 		case tlvTTL:
+			// hasTTL gates on the 2-byte PARSE succeeding, not on a non-zero
+			// value: a valid 2-byte TTL of 0 is a legitimate shutdown advert
+			// (RFC IEEE 802.1AB) and must be accepted; only a TLV shorter than
+			// 2 bytes is truncated and leaves hasTTL false (#2551).
 			if len(value) >= 2 {
 				n.TTL = int(binary.BigEndian.Uint16(value[:2]))
+				hasTTL = true
 			}
-			hasTTL = true
 		case tlvSystemName:
 			n.SystemName = string(value)
 		case tlvSystemDesc:

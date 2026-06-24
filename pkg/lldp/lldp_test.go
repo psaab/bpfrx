@@ -210,6 +210,108 @@ func TestParseTLVs_Empty(t *testing.T) {
 	}
 }
 
+// rawTLV builds a single TLV with an explicit (possibly short) value so a
+// truncated mandatory TLV can be constructed directly. tlvLen is the 9-bit
+// length field written to the header; value is the body that follows it.
+func rawTLV(tlvType int, value []byte) []byte {
+	header := uint16(tlvType&0x7f)<<9 | uint16(len(value)&0x1ff)
+	out := make([]byte, 2+len(value))
+	binary.BigEndian.PutUint16(out[:2], header)
+	copy(out[2:], value)
+	return out
+}
+
+// TestParseTLVs_TruncatedMandatory asserts that a mandatory TLV whose value is
+// too short to yield a valid identifier is treated as absent, so the frame is
+// rejected rather than cached under an empty key (#2551). Before the fix each
+// hasX flag was set unconditionally, so these frames were ACCEPTED with empty
+// ChassisID/PortID (or TTL 0) — these subtests FAIL on the pre-#2551 code,
+// proving fail-on-revert.
+func TestParseTLVs_TruncatedMandatory(t *testing.T) {
+	mac := net.HardwareAddr{0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff}
+	goodChassis := mustEncodeTLV(tlvChassisID, encodeChassisID(mac))
+	goodPort := mustEncodeTLV(tlvPortID, encodePortID("trust0"))
+	goodTTL := mustEncodeTLV(tlvTTL, encodeTTL(120))
+	end := mustEncodeTLV(tlvEnd, nil)
+
+	cases := []struct {
+		name string
+		data []byte
+	}{
+		{
+			// Chassis ID = subtype byte only (len 1), no identifier.
+			name: "chassis-id-len-1",
+			data: concat(rawTLV(tlvChassisID, []byte{chassisSubtypeMACAddr}), goodPort, goodTTL, end),
+		},
+		{
+			// Chassis ID = empty value (len 0).
+			name: "chassis-id-len-0",
+			data: concat(rawTLV(tlvChassisID, nil), goodPort, goodTTL, end),
+		},
+		{
+			// Chassis ID MAC subtype but value short of the 6-byte address
+			// (subtype + 4 of 6 MAC bytes = len 5, < 7).
+			name: "chassis-id-mac-subtype-truncated",
+			data: concat(rawTLV(tlvChassisID, []byte{chassisSubtypeMACAddr, 0xaa, 0xbb, 0xcc, 0xdd}), goodPort, goodTTL, end),
+		},
+		{
+			// Port ID = subtype byte only, no identifier.
+			name: "port-id-len-1",
+			data: concat(goodChassis, rawTLV(tlvPortID, []byte{portSubtypeIfName}), goodTTL, end),
+		},
+		{
+			// TTL value is 1 byte, can't form the 2-byte hold time.
+			name: "ttl-len-1",
+			data: concat(goodChassis, goodPort, rawTLV(tlvTTL, []byte{0x05}), end),
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			n := ParseTLVs(tc.data)
+			if n != nil {
+				t.Errorf("expected nil for truncated mandatory TLV, got neighbor "+
+					"chassis=%q port=%q ttl=%d", n.ChassisID, n.PortID, n.TTL)
+			}
+		})
+	}
+}
+
+// TestParseTLVs_ValidShutdownTTL asserts that a well-formed advert carrying a
+// 2-byte TTL of 0 (a legitimate LLDP shutdown frame) is still accepted: the
+// hasTTL gate is "the 2-byte value parsed", not "TTL != 0". A truncated TTL
+// (covered above) is rejected; a parsed 0 is not.
+func TestParseTLVs_ValidShutdownTTL(t *testing.T) {
+	mac := net.HardwareAddr{0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff}
+	data := concat(
+		mustEncodeTLV(tlvChassisID, encodeChassisID(mac)),
+		mustEncodeTLV(tlvPortID, encodePortID("trust0")),
+		mustEncodeTLV(tlvTTL, encodeTTL(0)),
+		mustEncodeTLV(tlvEnd, nil),
+	)
+	n := ParseTLVs(data)
+	if n == nil {
+		t.Fatal("expected a neighbor for a valid 2-byte TTL=0 shutdown advert, got nil")
+	}
+	if n.TTL != 0 {
+		t.Errorf("TTL: got %d, want 0", n.TTL)
+	}
+	if n.ChassisID != mac.String() {
+		t.Errorf("chassis ID: got %s, want %s", n.ChassisID, mac.String())
+	}
+	if n.PortID != "trust0" {
+		t.Errorf("port ID: got %s, want trust0", n.PortID)
+	}
+}
+
+func concat(parts ...[]byte) []byte {
+	var out []byte
+	for _, p := range parts {
+		out = append(out, p...)
+	}
+	return out
+}
+
 func TestNeighborTable(t *testing.T) {
 	m := New()
 
