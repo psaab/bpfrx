@@ -153,9 +153,24 @@ func (m *Manager) resolveRedistribute(export string, po *config.PolicyOptionsCon
 	return ""
 }
 
+// isDefinedPolicyStatement reports whether name resolves to a defined
+// policy-statement in policyOptions. This is the SAME predicate the
+// commit-time validator uses (checkRedist/checkPolicyRef in
+// pkg/config/compiler_validate_strict.go) to distinguish a route-map-out
+// reference from a bare redistribute protocol token. A defined
+// policy-statement renders as `route-map <name> out`; anything else (a
+// bare protocol token, or a typo that slipped past the strict validator on
+// a lenient load/HA-sync path) goes to resolveRedistribute.
+func isDefinedPolicyStatement(name string, po *config.PolicyOptionsConfig) bool {
+	if po == nil || po.PolicyStatements == nil {
+		return false
+	}
+	_, ok := po.PolicyStatements[name]
+	return ok
+}
+
 // lastNonEmpty returns the last non-empty string in the slice, or "".
-// Used to pick the effective global BGP default export: when an operator
-// lists multiple `protocols bgp export` policies, FRR accepts only one
+// Used to pick a neighbor's effective own export: FRR accepts only one
 // `route-map <name> out` per neighbor/address-family, and Junos set-style
 // accumulation means a later statement is the more-specific intent — so
 // the last entry wins.
@@ -392,26 +407,61 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 				fmt.Fprintf(&b, " neighbor %s remove-private-AS\n", n.Address)
 			}
 		}
-		// A Junos global `protocols bgp export <policy>` is a DEFAULT
-		// export policy applied to every BGP peer, i.e. a peer-level
-		// `route-map <name> out` per neighbor/address-family — NOT
-		// protocol redistribution. It MUST NOT be routed through
-		// resolveRedistribute: doing so emitted `redistribute ospf
-		// route-map ...` under `router bgp`, which actively ANNOUNCES all
-		// OSPF/connected routes into BGP (route leak, #2473 failure mode
-		// 1), and for a prefix/community-only policy with no `from
-		// protocol` it returned "" and SILENTLY DROPPED the operator's
-		// advertise filter (#2473 failure mode 2). The route-map for the
-		// policy is already emitted by generatePolicyOptions, so applying
-		// it as `route-map out` filters what is advertised to peers
-		// without leaking the internal RIB into BGP.
+		// A global `protocols bgp export <token>` has TWO legitimate
+		// shapes that render differently (#2473):
 		//
-		// Coexistence (Junos most-specific-wins): a per-neighbor export
-		// overrides the global default for that neighbor. FRR accepts a
-		// single `route-map <name> out` per neighbor/AF, so we emit
-		// exactly one — the neighbor's own export when present, otherwise
-		// the global default. bgpEffectiveExport() encodes this choice.
-		globalExport := lastNonEmpty(bgp.Export)
+		//   - A DEFINED policy-statement name → a Junos default export
+		//     policy applied to every BGP peer, i.e. a peer-level
+		//     `route-map <name> out` per neighbor/address-family. It MUST
+		//     NOT be routed through resolveRedistribute: doing so emitted
+		//     `redistribute ospf route-map ...` under `router bgp`, which
+		//     actively ANNOUNCES all OSPF/connected routes into BGP (route
+		//     leak, #2473 failure mode 1), and for a prefix/community-only
+		//     policy with no `from protocol` it returned "" and SILENTLY
+		//     DROPPED the operator's advertise filter (#2473 failure mode
+		//     2). The route-map is already emitted by generatePolicyOptions,
+		//     so `route-map out` filters advertisements without leaking the
+		//     internal RIB.
+		//
+		//   - A BARE PROTOCOL TOKEN (connected/direct/static/kernel/ospf/
+		//     bgp/rip/isis — i.e. NOT a defined policy-statement) → this
+		//     firewall's redistribution shorthand, a genuine `redistribute
+		//     <proto>`. It has NO route-map to reference, so it must keep
+		//     going through resolveRedistribute. Rendering it as
+		//     `neighbor X route-map connected out` would point at a
+		//     non-existent route-map, which FRR resolves to PERMIT-ALL —
+		//     advertising the entire table (a NEW leak). So we classify
+		//     each token by the SAME policy-statement-exists predicate the
+		//     commit-time validator uses (checkRedist/checkPolicyRef in
+		//     pkg/config) and split the two render paths.
+		//
+		// Coexistence (Junos most-specific-wins) applies ONLY among the
+		// policy-statement-name route-map-out exports: a per-neighbor
+		// export overrides the global default for that neighbor. FRR
+		// accepts a single `route-map out` per neighbor/AF, so exactly one
+		// is emitted — the neighbor's own when present, else the global
+		// default (bgpEffectiveExport). A bare-token redistribute is a
+		// GLOBAL redistribute verb, not per-neighbor, and is emitted once
+		// under `router bgp`.
+		globalExport := ""
+		for _, e := range bgp.Export {
+			if e == "" {
+				continue
+			}
+			if isDefinedPolicyStatement(e, policyOptions) {
+				// Policy-statement name → peer-level route-map out
+				// global default. Later entry wins (lastNonEmpty
+				// semantics, applied inline here).
+				globalExport = e
+			} else {
+				// Bare protocol token (or a name that slipped the
+				// validator on a lenient load/HA-sync path) → genuine
+				// redistribute. resolveRedistribute normalizes direct→
+				// connected and refuses to emit an invalid bare-name
+				// line (#2223).
+				b.WriteString(m.resolveRedistribute(e, policyOptions))
+			}
+		}
 
 		// Address-family blocks for neighbors with family declarations.
 		// When a global default export exists it must reach EVERY peer,

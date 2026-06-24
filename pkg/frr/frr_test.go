@@ -325,6 +325,43 @@ func TestGenerateProtocols_ISIS(t *testing.T) {
 	}
 }
 
+// TestGenerateProtocols_BGPExportBareToken is the #2473 bare-token guard.
+// A global `protocols bgp export <token>` where the token is a BARE
+// protocol keyword (connected/static/... — NOT a defined policy-statement)
+// is this firewall's redistribution shorthand and MUST render as
+// `redistribute <proto>`. It has NO route-map to reference: rendering it as
+// `neighbor X route-map connected out` would point at a non-existent
+// route-map, which FRR resolves to PERMIT-ALL → the entire BGP table is
+// advertised to the peer (a NEW leak the over-general route-map-out fix
+// would have introduced). Fail-on-revert: routing ALL bgp.Export through
+// route-map-out makes `route-map connected out` appear with no defining
+// route-map → the assert-no-dangling-route-map check below fails.
+func TestGenerateProtocols_BGPExportBareToken(t *testing.T) {
+	m := New()
+	bgp := &config.BGPConfig{
+		LocalAS:  65001,
+		RouterID: "1.1.1.1",
+		Export:   []string{"connected", "static"},
+		Neighbors: []*config.BGPNeighbor{
+			{Address: "10.0.2.1", PeerAS: 65002},
+		},
+	}
+	// nil policyOptions: no policy-statements defined, so both tokens are
+	// bare protocol keywords.
+	got := m.generateProtocols(nil, nil, bgp, nil, nil, "", 0, nil)
+	if !strings.Contains(got, "redistribute connected\n") {
+		t.Errorf("missing redistribute connected, got:\n%s", got)
+	}
+	if !strings.Contains(got, "redistribute static\n") {
+		t.Errorf("missing redistribute static, got:\n%s", got)
+	}
+	// A bare token must NEVER render a dangling route-map out (permit-all
+	// leak).
+	if strings.Contains(got, "route-map connected out") || strings.Contains(got, "route-map static out") {
+		t.Errorf("LEAK: bare protocol token must not render a dangling route-map out, got:\n%s", got)
+	}
+}
+
 // TestGenerateProtocols_BGPExportNoLeak is the #2473 route-leak guard. A
 // Junos global `protocols bgp export <policy>` whose policy carries `from
 // protocol ospf` (or connected/static) MUST render as a peer-level
@@ -2135,6 +2172,52 @@ func TestGenerateProtocols_BGPExportCoexistence(t *testing.T) {
 	// (one route-map out per neighbor/AF).
 	if strings.Contains(got, "neighbor 10.0.2.2 route-map global-default out\n") {
 		t.Errorf("neighbor with own export must not also receive global default, got:\n%s", got)
+	}
+}
+
+// TestGenerateProtocols_BGPExportMixed covers the #2473 split: a global
+// export list mixing a defined policy-statement name AND a bare protocol
+// token must render BOTH semantics — the policy-statement as a peer-level
+// `route-map out`, the bare token as a global `redistribute`. Neither must
+// leak into the other path (no `redistribute <policy>`, no dangling
+// `route-map <token> out`).
+func TestGenerateProtocols_BGPExportMixed(t *testing.T) {
+	m := New()
+	po := &config.PolicyOptionsConfig{
+		PolicyStatements: map[string]*config.PolicyStatement{
+			"adv-filter": {
+				Name:          "adv-filter",
+				Terms:         []*config.PolicyTerm{{Name: "t1", FromCommunity: "no-export", Action: "reject"}},
+				DefaultAction: "accept",
+			},
+		},
+	}
+	bgp := &config.BGPConfig{
+		LocalAS:  65001,
+		RouterID: "1.1.1.1",
+		// "adv-filter" is a policy-statement → route-map out;
+		// "static" is a bare token → redistribute.
+		Export: []string{"adv-filter", "static"},
+		Neighbors: []*config.BGPNeighbor{
+			{Address: "10.0.2.1", PeerAS: 65002},
+		},
+	}
+	got := m.generateProtocols(nil, nil, bgp, nil, nil, "", 0, po)
+	// Policy-statement → peer-level route-map out.
+	if !strings.Contains(got, "neighbor 10.0.2.1 route-map adv-filter out\n") {
+		t.Errorf("policy-statement export must render route-map out, got:\n%s", got)
+	}
+	// Bare token → global redistribute.
+	if !strings.Contains(got, "redistribute static\n") {
+		t.Errorf("bare token export must render redistribute, got:\n%s", got)
+	}
+	// No crossover: the policy-statement must NOT redistribute, and the
+	// bare token must NOT render a dangling route-map out.
+	if strings.Contains(got, "redistribute adv-filter") {
+		t.Errorf("policy-statement export must not redistribute, got:\n%s", got)
+	}
+	if strings.Contains(got, "route-map static out") {
+		t.Errorf("bare token must not render dangling route-map out, got:\n%s", got)
 	}
 }
 

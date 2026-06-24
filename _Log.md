@@ -12748,3 +12748,29 @@ top.
   gofmt clean; go vet ./pkg/frr/ clean. Fail-on-revert PROVEN: re-inserting
   the `resolveRedistribute` loop → `redistribute ospf route-map leak-ospf`
   reappears → TestGenerateProtocols_BGPExportNoLeak fails. No Rust changed.
+
+## 2026-06-24 — #2473 follow-up: bare-token vs policy-statement split (reviewer MAJOR)
+
+- **Timestamp**: 2026-06-24
+- **Action**: Fix a NEW leak the first #2473 pass introduced. Routing ALL
+  `bgp.Export` through peer-level `route-map out` broke the bare-protocol-token
+  form (`set protocols bgp export connected`): a bare token has no route-map,
+  so `neighbor X route-map connected out` referenced a non-existent route-map →
+  FRR resolves a dangling route-map-out to PERMIT-ALL → entire BGP table
+  advertised. Fix (reviewer option b, surgical): classify each export entry via
+  `isDefinedPolicyStatement` (same predicate as the commit validator
+  checkRedist/checkPolicyRef) — a DEFINED policy-statement renders peer-level
+  `route-map out` (the #2473 fix, kept); a BARE TOKEN renders `redistribute
+  <proto>` via resolveRedistribute (correct pre-PR behavior, restored).
+  Coexistence most-specific-wins applies only among policy-statement-name
+  route-map-out exports; a bare-token redistribute is global, emitted once.
+- **File(s)**: pkg/frr/policy_render.go (new `isDefinedPolicyStatement`; split
+  the bgp.Export render loop), pkg/frr/frr_test.go (restored
+  TestGenerateProtocols_BGPExportBareToken with no-dangling-route-map guard;
+  added TestGenerateProtocols_BGPExportMixed), pkg/frr/README.md (#2473 +
+  #2144 bullets updated for the split).
+- **Validation**: go build ./... OK; go test ./pkg/frr/ ./pkg/config/ PASS;
+  gofmt clean; go vet ./pkg/frr/ clean. Fail-on-revert PROVEN for the new
+  guard: routing all exports through route-map-out makes `redistribute
+  connected/static` disappear and the dangling `route-map out` leak appear →
+  BGPExportBareToken + BGPExportMixed fail. No Rust changed.
