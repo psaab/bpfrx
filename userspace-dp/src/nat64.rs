@@ -603,6 +603,67 @@ fn ipv6_is_non_first_fragment(packet: &[u8]) -> bool {
     false
 }
 
+/// Parsed IPv6 Fragment Header (next-header 44) fields, RFC 8200 §4.5.
+#[derive(Clone, Copy, Debug)]
+struct Ipv6FragInfo {
+    /// 13-bit fragment offset in 8-byte units (same unit as the IPv4
+    /// fragment-offset field, so it is copied verbatim across NAT64).
+    offset_units: u16,
+    /// The M (More Fragments) flag.
+    more: bool,
+    /// The 32-bit Identification value.
+    ident: u32,
+}
+
+/// Parse the IPv6 Fragment Header (next-header 44) if present (#2488).
+///
+/// Walks the bounded extension-header chain like `ipv6_l4_offset_and_protocol`
+/// and returns the Fragment Header's offset / M flag / Identification the
+/// FIRST time a Fragment Header is seen. Returns `None` for a packet that
+/// carries no Fragment Header (an ordinary, non-fragmented datagram), so the
+/// v6→v4 translator can fall back to its option-gated atomic-datagram framing.
+fn ipv6_fragment_header(packet: &[u8]) -> Option<Ipv6FragInfo> {
+    if packet.len() < 40 {
+        return None;
+    }
+    let mut protocol = packet[6];
+    let mut offset = 40usize;
+    for _ in 0..6 {
+        match protocol {
+            0 | 43 | 60 => {
+                let opt = packet.get(offset..offset + 2)?;
+                protocol = opt[0];
+                offset = offset.checked_add((usize::from(opt[1]) + 1) * 8)?;
+                if packet.len() < offset {
+                    return None;
+                }
+            }
+            51 => {
+                let opt = packet.get(offset..offset + 2)?;
+                protocol = opt[0];
+                offset = offset.checked_add((usize::from(opt[1]) + 2) * 4)?;
+                if packet.len() < offset {
+                    return None;
+                }
+            }
+            44 => {
+                let frag = packet.get(offset..offset + 8)?;
+                // bytes 2-3: FragmentOffset[15:3] | Res[2:1] | M[0].
+                let word = u16::from_be_bytes([frag[2], frag[3]]);
+                return Some(Ipv6FragInfo {
+                    offset_units: word >> 3,
+                    more: (word & 0x0001) != 0,
+                    ident: u32::from_be_bytes([frag[4], frag[5], frag[6], frag[7]]),
+                });
+            }
+            // No-Next-Header or a terminal upper-layer protocol: no Fragment
+            // Header on the chain.
+            _ => return None,
+        }
+    }
+    None
+}
+
 /// Allocation-free IPv6→IPv4 translation: write the translated IPv4 L3 packet
 /// directly into `dst` and return the number of bytes written (#2211).
 ///
@@ -680,21 +741,34 @@ pub(crate) fn write_v6_to_v4_into(
     // known, since an ICMP-error translation can shrink the L4).
     out[0] = 0x45; // version=4, IHL=5
     out[1] = traffic_class; // DSCP/ECN copied from IPv6 traffic class (RFC 7915 §5)
-    // DF policy is the option-gated LOCAL choice (not the size-driven RFC 7915
-    // 5.1 selection). Either way the flags+frag-offset word (bytes 6-7) and the
+    // #2488: if the IPv6 datagram carries a Fragment Header, the IPv4
+    // fragmentation fields MUST be derived from THE PACKET (RFC 7915 §5), not
+    // the local no-v6-frag-header policy — otherwise a real first fragment is
+    // mistranslated into an atomic (MF=0) datagram and a receiver accepts the
+    // truncated first fragment as a complete datagram. When no Fragment Header
+    // is present the datagram is atomic and the existing option-gated LOCAL DF
+    // policy applies. Either way the flags+frag-offset word (bytes 6-7) and the
     // Identification field (bytes 4-5) must stay mutually consistent:
-    //   * Default (DF=1, 0x4000): an *atomic* datagram (non-fragmentable).
-    //     RFC 6864 4.1 permits any ID for an atomic datagram, so leave ID=0.
-    //   * no-v6-frag-header (DF=0, 0x0000): a *fragmentable* (non-atomic)
-    //     datagram. A non-atomic datagram MUST carry a non-zero Identification
-    //     from a per-translator generator (RFC 7915 5.1 / RFC 6864 4.1) so a
-    //     downstream fragmenter does not collide distinct datagrams on a
-    //     constant ID. Pinning ID=0 here while clearing DF was the bug fixed in
-    //     #2008 H16.
-    let (frag_word, identification): (u16, u16) = if no_v6_frag_header {
-        (0x0000, next_frag_id())
-    } else {
-        (0x4000, 0)
+    //   * Atomic, default (DF=1, 0x4000): non-fragmentable. RFC 6864 4.1
+    //     permits any ID for an atomic datagram, so leave ID=0.
+    //   * Atomic, no-v6-frag-header (DF=0, 0x0000): a *fragmentable*
+    //     (non-atomic) datagram. A non-atomic datagram MUST carry a non-zero
+    //     Identification from a per-translator generator (RFC 7915 5.1 / RFC
+    //     6864 4.1) so a downstream fragmenter does not collide distinct
+    //     datagrams on a constant ID. Pinning ID=0 here while clearing DF was
+    //     the bug fixed in #2008 H16.
+    //   * Real fragment (Fragment Header present): DF=0, MF copied from the
+    //     IPv6 M flag, the 13-bit fragment offset copied verbatim (both fields
+    //     count 8-byte units), and the Identification taken from the low 16
+    //     bits of the Fragment Header's 32-bit Identification.
+    let frag_info = ipv6_fragment_header(packet);
+    let (frag_word, identification): (u16, u16) = match frag_info {
+        Some(info) => {
+            let mf = if info.more { 0x2000u16 } else { 0 };
+            (mf | (info.offset_units & 0x1FFF), (info.ident & 0xFFFF) as u16)
+        }
+        None if no_v6_frag_header => (0x0000, next_frag_id()),
+        None => (0x4000, 0),
     };
     out[4..6].copy_from_slice(&identification.to_be_bytes()); // identification
     out[6..8].copy_from_slice(&frag_word.to_be_bytes()); // flags + frag offset
@@ -727,7 +801,27 @@ pub(crate) fn write_v6_to_v4_into(
     // does not use a pseudo-header, so its checksum is recomputed inside
     // `translate_icmpv6_message_to_icmpv4`; the generic helper still rewrites it
     // identically and is a no-op for the already-correct ICMP case.
-    recompute_l4_checksum_after_nat64_v6_to_v4(&mut out[..ipv4_total_len], ipv4_protocol)?;
+    //
+    // #2488: a TCP/UDP FRAGMENT carries only part of the transport payload, so
+    // the L4 checksum cannot be recomputed from scratch (the field present in
+    // the first fragment was computed over the whole reassembled payload). Only
+    // the IP pseudo-header changed (v6→v4 addresses; the transport length and
+    // protocol number are identical), so adjust the existing checksum
+    // incrementally (RFC 1624). The verbatim-copied first-fragment L4 header
+    // still holds the original v6 checksum at this point.
+    if frag_info.is_some() && matches!(ipv4_protocol, PROTO_TCP | PROTO_UDP) {
+        let mut v6_addrs = [0u8; 32];
+        v6_addrs.copy_from_slice(&packet[8..40]);
+        adjust_l4_checksum_v6_to_v4_fragment(
+            &mut out[..ipv4_total_len],
+            ipv4_protocol,
+            &v6_addrs,
+            snat_v4,
+            dst_v4,
+        )?;
+    } else {
+        recompute_l4_checksum_after_nat64_v6_to_v4(&mut out[..ipv4_total_len], ipv4_protocol)?;
+    }
 
     // Compute IPv4 header checksum.
     let hdr_sum = checksum16(&out[..20]);
@@ -768,9 +862,12 @@ pub(crate) fn translate_v4_to_v6(
 /// Allocation-free IPv4→IPv6 translation: write the translated IPv6 L3 packet
 /// directly into `dst` and return the number of bytes written (#2211).
 ///
-/// `dst` must be at least `40 + (ipv4_total_len - ihl)` bytes; on a too-small
-/// buffer the function returns `None` without writing a partial frame.
-/// Behavior is byte-identical to the previous `Vec`-allocating translator.
+/// `dst` must be at least `40 + 8 + (ipv4_total_len - ihl)` bytes for a
+/// fragmented input (the extra 8 bytes are the inserted IPv6 Fragment Header,
+/// #2488) and `40 + (ipv4_total_len - ihl)` otherwise; on a too-small buffer
+/// the function returns `None` without writing a partial frame. Behavior on a
+/// non-fragmented input is byte-identical to the previous `Vec`-allocating
+/// translator.
 pub(crate) fn write_v4_to_v6_into(
     dst: &mut [u8],
     packet: &[u8],
@@ -817,6 +914,37 @@ pub(crate) fn write_v4_to_v6_into(
         _ => return None,
     };
 
+    // #2488: a FIRST IPv4 fragment (MF=1, offset 0) MUST become an IPv6 packet
+    // carrying a Fragment Header (next-header 44), per RFC 7915 §4. Without it
+    // the receiver treats a truncated first fragment as a complete datagram.
+    // Bytes 6-7 are [Res(1) | DF(1) | MF(1) | FragOffset(13)] in 8-byte units
+    // (the same unit as the IPv6 Fragment Header offset). Non-first fragments
+    // are dropped below.
+    let v4_frag_word = u16::from_be_bytes([packet[6], packet[7]]);
+    let v4_more = (v4_frag_word & 0x2000) != 0;
+    let v4_offset_units = v4_frag_word & 0x1FFF;
+    // A NON-first fragment (offset > 0) carries no L4 header — its bytes are
+    // payload, not a transport header. It never reaches the reverse NAT64
+    // translator anyway (no L4 ports to match the session), but fail closed
+    // here, symmetric with the v6→v4 non-first-fragment drop. Only first
+    // (offset 0, MF=1) and atomic (offset 0, MF=0) datagrams translate.
+    if v4_offset_units != 0 {
+        return None;
+    }
+    let is_fragment = v4_more;
+    let v4_ident = u16::from_be_bytes([packet[4], packet[5]]);
+    // RFC 7915 §4.5: a UDP fragment with a zero IPv4 checksum cannot be
+    // translated — the IPv6 UDP checksum is mandatory and cannot be computed
+    // from a single fragment (the full payload is unavailable). Drop it rather
+    // than emit an illegal zero-checksum IPv6 UDP datagram.
+    if is_fragment
+        && protocol == PROTO_UDP
+        && packet.get(ihl + 6..ihl + 8) == Some(&[0, 0][..])
+    {
+        return None;
+    }
+    let frag_hdr_len = if is_fragment { 8usize } else { 0 };
+
     let new_hop_limit = ttl - 1;
 
     // Build the 40-byte IPv6 header. The 8-bit traffic class straddles bytes
@@ -834,16 +962,34 @@ pub(crate) fn write_v4_to_v6_into(
     hdr[1] = (tos & 0x0f) << 4; // TC[3:0] | flow-label high nibble (0)
     hdr[2] = 0; // flow label
     hdr[3] = 0; // flow label
-    hdr[6] = next_header;
+    // A fragmented datagram chains a Fragment Header (44) after the base
+    // header; the base next-header points at it and the Fragment Header carries
+    // the real upper-layer protocol.
+    hdr[6] = if is_fragment { 44 } else { next_header };
     hdr[7] = new_hop_limit;
     hdr[8..24].copy_from_slice(&src_v6.octets());
     hdr[24..40].copy_from_slice(&dst_v6.octets());
 
+    // #2488: emit the 8-byte IPv6 Fragment Header (RFC 8200 §4.5) when the
+    // input was an IPv4 fragment. The fragment offset is copied verbatim (both
+    // count 8-byte units), the M flag mirrors IPv4 MF, and the Identification
+    // is the IPv4 16-bit Identification zero-extended to 32 bits (RFC 7915 §4).
+    if is_fragment {
+        let frag = dst.get_mut(40..48)?;
+        frag[0] = next_header;
+        frag[1] = 0; // reserved
+        let frag_word = (v4_offset_units << 3) | u16::from(v4_more);
+        frag[2..4].copy_from_slice(&frag_word.to_be_bytes());
+        frag[4..8].copy_from_slice(&u32::from(v4_ident).to_be_bytes());
+    }
+
     // Translate the L4 region into the output tail and learn its final length.
-    // `get_mut(40..)` only borrows the space actually present in `dst`; the
+    // `get_mut(l4_off..)` only borrows the space actually present in `dst`; the
     // ICMP-error path may need up to 20 bytes more than the input L4 (embedded
-    // packet growth), so the frame builder over-allocates by 20.
-    let l4_dst = dst.get_mut(40..)?;
+    // packet growth), so the frame builder over-allocates by 20. A Fragment
+    // Header shifts the L4 region 8 bytes further into the buffer.
+    let l4_off = 40 + frag_hdr_len;
+    let l4_dst = dst.get_mut(l4_off..)?;
     let l4_len = if protocol == PROTO_ICMP {
         // The embedded (quoted) original packet is the RETURN-direction packet:
         // its addresses are the outer error's addresses swapped. v4->v6 the
@@ -864,11 +1010,41 @@ pub(crate) fn write_v4_to_v6_into(
         l4_payload.len()
     };
 
-    let ipv6_total_len = 40 + l4_len;
-    dst[4..6].copy_from_slice(&(l4_len as u16).to_be_bytes());
+    let ipv6_payload_len = frag_hdr_len + l4_len;
+    let ipv6_total_len = 40 + ipv6_payload_len;
+    dst[4..6].copy_from_slice(&(ipv6_payload_len as u16).to_be_bytes());
 
     // Recompute L4 checksum (pseudo-header changes from IPv4 to IPv6).
-    recompute_l4_checksum_after_nat64_v4_to_v6(&mut dst[..ipv6_total_len], next_header)?;
+    //
+    // #2488: a TCP/UDP FRAGMENT carries only part of the transport payload, so
+    // the checksum cannot be recomputed from scratch. Only the IP pseudo-header
+    // changed (v4→v6 addresses; the transport length and protocol number are
+    // identical), so adjust the existing first-fragment checksum incrementally
+    // (RFC 1624). The non-fragment path is byte-identical to before (full
+    // recompute at the fixed offset 40). Fragmented ICMP keeps whatever
+    // `translate_icmpv4_message_to_icmpv6` produced — a degenerate edge that is
+    // moot because non-first fragments never reach this translator (no L4 ports
+    // to match the reverse NAT64 session), so a fragmented datagram never
+    // reassembles regardless.
+    if is_fragment {
+        if matches!(next_header, PROTO_TCP | PROTO_UDP) {
+            let mut v6_addrs = [0u8; 32];
+            v6_addrs[..16].copy_from_slice(&src_v6.octets());
+            v6_addrs[16..].copy_from_slice(&dst_v6.octets());
+            let mut v4_addrs = [0u8; 8];
+            v4_addrs[..4].copy_from_slice(&packet[12..16]);
+            v4_addrs[4..].copy_from_slice(&packet[16..20]);
+            adjust_l4_checksum_v4_to_v6_fragment(
+                &mut dst[..ipv6_total_len],
+                next_header,
+                l4_off,
+                &v4_addrs,
+                &v6_addrs,
+            )?;
+        }
+    } else {
+        recompute_l4_checksum_after_nat64_v4_to_v6(&mut dst[..ipv6_total_len], next_header)?;
+    }
 
     Some(ipv6_total_len)
 }
@@ -1532,6 +1708,98 @@ fn checksum16_ipv6_pseudo(src: Ipv6Addr, dst: Ipv6Addr, next_header: u8, payload
     sum = checksum16_add(sum, &[0, 0, 0, next_header]);
     sum = checksum16_add(sum, payload);
     checksum16_fold(sum)
+}
+
+/// Incremental one's-complement checksum update (RFC 1624 eqn 3): given an
+/// existing checksum `old_cksum` and a set of 16-bit words that changed from
+/// `old_bytes` to `new_bytes`, return the new checksum WITHOUT re-summing the
+/// rest of the protected data. Used for translated TCP/UDP FRAGMENTs (#2488)
+/// where the transport payload is incomplete and only the IP pseudo-header
+/// addresses differ between the v4 and v6 forms. `old_bytes` / `new_bytes` are
+/// big-endian and may be any (even) length; a trailing odd byte is padded with
+/// zero, matching the standard checksum word split.
+fn checksum16_incremental(old_cksum: u16, old_bytes: &[u8], new_bytes: &[u8]) -> u16 {
+    // HC' = ~( ~HC + sum(~m_i) + sum(m'_i) )
+    let mut sum: u32 = u32::from(!old_cksum);
+    for w in old_bytes.chunks(2) {
+        let val = u16::from_be_bytes([w[0], *w.get(1).unwrap_or(&0)]);
+        sum += u32::from(!val);
+    }
+    for w in new_bytes.chunks(2) {
+        let val = u16::from_be_bytes([w[0], *w.get(1).unwrap_or(&0)]);
+        sum += u32::from(val);
+    }
+    while (sum >> 16) != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+/// Adjust a translated v6→v4 TCP/UDP FRAGMENT's L4 checksum for the
+/// pseudo-header address change only (#2488). The L4 header at `out[20..]` was
+/// copied verbatim and still holds the IPv6-pseudo-header checksum; fold the
+/// 32-byte v6 address pair out and the 8-byte v4 address pair in. The L4 length
+/// and protocol number are identical across the translation so they cancel.
+fn adjust_l4_checksum_v6_to_v4_fragment(
+    out: &mut [u8],
+    protocol: u8,
+    v6_src_dst: &[u8; 32],
+    v4_src: Ipv4Addr,
+    v4_dst: Ipv4Addr,
+) -> Option<()> {
+    let field = match protocol {
+        PROTO_TCP => 16usize,
+        PROTO_UDP => 6,
+        _ => return Some(()),
+    };
+    let l4 = out.get_mut(20..)?;
+    let cksum = l4.get(field..field + 2)?;
+    let old = u16::from_be_bytes([cksum[0], cksum[1]]);
+    let mut v4_addrs = [0u8; 8];
+    v4_addrs[..4].copy_from_slice(&v4_src.octets());
+    v4_addrs[4..].copy_from_slice(&v4_dst.octets());
+    let updated = checksum16_incremental(old, v6_src_dst, &v4_addrs);
+    // RFC 768: a computed UDP checksum of 0x0000 is transmitted as 0xFFFF.
+    let final_sum = if protocol == PROTO_UDP && updated == 0 {
+        0xFFFF
+    } else {
+        updated
+    };
+    l4[field..field + 2].copy_from_slice(&final_sum.to_be_bytes());
+    Some(())
+}
+
+/// Adjust a translated v4→v6 TCP/UDP FRAGMENT's L4 checksum for the
+/// pseudo-header address change only (#2488). The L4 header sits at `dst[l4_off..]`
+/// (past the inserted IPv6 Fragment Header) and still holds the IPv4-pseudo-header
+/// checksum; fold the 8-byte v4 address pair out and the 32-byte v6 address pair
+/// in.
+fn adjust_l4_checksum_v4_to_v6_fragment(
+    dst: &mut [u8],
+    next_header: u8,
+    l4_off: usize,
+    v4_src_dst: &[u8; 8],
+    v6_src_dst: &[u8; 32],
+) -> Option<()> {
+    let field = match next_header {
+        PROTO_TCP => 16usize,
+        PROTO_UDP => 6,
+        _ => return Some(()),
+    };
+    let l4 = dst.get_mut(l4_off..)?;
+    let cksum = l4.get(field..field + 2)?;
+    let old = u16::from_be_bytes([cksum[0], cksum[1]]);
+    let updated = checksum16_incremental(old, v4_src_dst, v6_src_dst);
+    // UDP over IPv6: a zero checksum is illegal, so a computed 0x0000 is written
+    // as 0xFFFF. (A zero IPv4 UDP checksum was already rejected upstream for a
+    // fragment, so `old` is non-zero here.)
+    let final_sum = if next_header == PROTO_UDP && updated == 0 {
+        0xFFFF
+    } else {
+        updated
+    };
+    l4[field..field + 2].copy_from_slice(&final_sum.to_be_bytes());
+    Some(())
 }
 
 // ---------------------------------------------------------------------------
