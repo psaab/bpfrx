@@ -528,6 +528,11 @@ func (m *Manager) UpdateRGActive(rgID int, active bool) error {
 		m.rgTransitionInFlight.Store(false)
 	}
 	m.lastRGActivateTime = time.Now()
+	// UpdateRGActive is the authoritative active-change publish. Record the
+	// throttle baseline so the watchdog heartbeat path (UpdateHAWatchdog) does
+	// not immediately re-fire a redundant update_ha_state right after a failover,
+	// precisely when the control socket is busiest with takeover work.
+	m.markHAWatchdogIPCSyncedLocked()
 	if err := m.applyHelperStatusLocked(&status); err != nil {
 		return err
 	}
@@ -535,8 +540,76 @@ func (m *Manager) UpdateRGActive(rgID int, active bool) error {
 	return nil
 }
 
+// haWatchdogIPCSyncState records the last per-RG state published to the helper
+// over the update_ha_state socket IPC. It is the throttle baseline read by
+// shouldSyncHAWatchdogIPCLocked.
+type haWatchdogIPCSyncState struct {
+	timestamp uint64
+	active    bool
+}
+
+// haWatchdogIPCBackstopSecs bounds how far the watchdog timestamp (CLOCK_MONOTONIC
+// seconds) may advance between update_ha_state socket IPCs for a given RG while
+// its Active state is unchanged. The daemon heartbeat ticks every 500ms, so an
+// unthrottled UpdateHAWatchdog would issue the full JSON IPC at 2/s per RG —
+// exactly the >1/s control-socket caller CLAUDE.md warns starves session
+// installs during bulk sync. A 3s backstop drops that to at most ~0.33/s per RG
+// (a 6x reduction) while leaving a >3x margin under the helper's ~10s stale-lease
+// window, so the helper's HA view never expires from lack of a refresh. The
+// kernel-visible shim map write still happens every tick — only the JSON IPC is
+// throttled here.
+const haWatchdogIPCBackstopSecs = 3
+
+// shouldSyncHAWatchdogIPCLocked decides whether UpdateHAWatchdog must publish the
+// full HA state to the helper over the control socket this tick. It fires:
+//   - on the first heartbeat for an RG after startup/seed (no baseline yet),
+//   - IMMEDIATELY on any Active-state change (failover/failback — the throttle
+//     never blocks this; it is the load-bearing failover-timing path), or
+//   - as a periodic backstop once the watchdog timestamp has advanced past
+//     haWatchdogIPCBackstopSecs since the last IPC for that RG.
+//
+// Otherwise it returns false and the tick is satisfied by the shim map write
+// alone. Caller holds m.mu.
+func (m *Manager) shouldSyncHAWatchdogIPCLocked(rgID int, active bool, timestamp uint64) bool {
+	if m.haWatchdogIPCSynced == nil {
+		return true
+	}
+	last, ok := m.haWatchdogIPCSynced[rgID]
+	if !ok {
+		return true
+	}
+	if active != last.active {
+		return true
+	}
+	return timestamp >= last.timestamp+haWatchdogIPCBackstopSecs
+}
+
+// markHAWatchdogIPCSyncedLocked records the current per-RG watchdog timestamp and
+// Active state as the throttle baseline. syncHAStateLocked publishes the FULL
+// group set, so every group's state is recorded — this stops the remaining RGs'
+// heartbeat calls in the same tick from each re-firing the IPC. Caller holds m.mu.
+func (m *Manager) markHAWatchdogIPCSyncedLocked() {
+	if m.haWatchdogIPCSynced == nil {
+		m.haWatchdogIPCSynced = make(map[int]haWatchdogIPCSyncState, len(m.haGroups))
+	}
+	for rgID, g := range m.haGroups {
+		m.haWatchdogIPCSynced[rgID] = haWatchdogIPCSyncState{
+			timestamp: g.WatchdogTimestamp,
+			active:    g.Active,
+		}
+	}
+}
+
 func (m *Manager) UpdateHAWatchdog(rgID int, timestamp uint64) error {
-	if err := m.bpfShim.UpdateHAWatchdog(rgID, timestamp); err != nil {
+	// Fast path: write the kernel-visible watchdog timestamp to the shim map on
+	// EVERY tick. The BPF ~2s stale window relies on this, so it is never
+	// throttled. Indirected through haWatchdogMapWrite so unit tests can exercise
+	// the IPC-throttle path below without a loaded BPF map.
+	mapWrite := m.haWatchdogMapWrite
+	if mapWrite == nil {
+		mapWrite = m.bpfShim.UpdateHAWatchdog
+	}
+	if err := mapWrite(rgID, timestamp); err != nil {
 		return err
 	}
 	m.mu.Lock()
@@ -545,6 +618,20 @@ func (m *Manager) UpdateHAWatchdog(rgID int, timestamp uint64) error {
 	group.RGID = rgID
 	group.WatchdogTimestamp = timestamp
 	m.haGroups[rgID] = group
+
+	// Throttle the update_ha_state socket IPC. Nothing to send before the helper
+	// is up; the first tick after it comes up seeds the baseline and syncs.
+	if m.proc == nil || m.proc.Process == nil {
+		return nil
+	}
+	if !m.shouldSyncHAWatchdogIPCLocked(rgID, group.Active, timestamp) {
+		return nil
+	}
+	// Record the baseline BEFORE the send so a post-send applyHelperStatusLocked
+	// or transient socket error cannot trigger a per-tick resync storm: the next
+	// backstop (<= haWatchdogIPCBackstopSecs) retries, and the shim map write
+	// keeps the kernel watchdog fresh in the meantime.
+	m.markHAWatchdogIPCSyncedLocked()
 	return m.syncHAStateLocked()
 }
 

@@ -5858,3 +5858,153 @@ func TestTunnelEndpointSnapshotPrivkeyControlChannelContract(t *testing.T) {
 		t.Fatalf("empty private key must be omitted, got %s", nb)
 	}
 }
+
+// startFakeHAControlHelper starts a unix-socket helper that captures the Type of
+// every ControlRequest it receives (one request per connection, matching
+// requestDetailedLocked's fresh-dial-per-request behavior) and replies OK. The
+// returned channel buffers received request types for the test to count. Used by
+// the HA-watchdog IPC-throttle tests (#2549).
+func startFakeHAControlHelper(t *testing.T, dir string) (string, <-chan string) {
+	t.Helper()
+	controlSock := filepath.Join(dir, "control.sock")
+	ln, err := net.Listen("unix", controlSock)
+	if err != nil {
+		t.Fatalf("listen control socket: %v", err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	reqTypes := make(chan string, 256)
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			var req ControlRequest
+			if err := json.NewDecoder(conn).Decode(&req); err != nil {
+				_ = conn.Close()
+				continue
+			}
+			reqTypes <- req.Type
+			_ = json.NewEncoder(conn).Encode(ControlResponse{
+				OK:     true,
+				Status: &ProcessStatus{PID: 4321},
+			})
+			_ = conn.Close()
+		}
+	}()
+	return controlSock, reqTypes
+}
+
+// drainUpdateHAStateCount non-blockingly counts update_ha_state requests buffered
+// in ch. requestLocked is synchronous (the helper pushes the type BEFORE encoding
+// the response UpdateHAWatchdog waits on), so by the time the driving loop returns
+// every send is already in the channel.
+func drainUpdateHAStateCount(ch <-chan string) int {
+	n := 0
+	for {
+		select {
+		case typ := <-ch:
+			if typ == "update_ha_state" {
+				n++
+			}
+		default:
+			return n
+		}
+	}
+}
+
+// TestUpdateHAWatchdogThrottlesIPCButWritesMapEveryTick proves the #2549 split:
+// the kernel-visible shim watchdog MAP WRITE fires on every 500ms heartbeat tick
+// (the BPF ~2s stale window relies on it), while the update_ha_state socket IPC
+// is throttled to a periodic backstop (~once per haWatchdogIPCBackstopSecs) so it
+// stops being a >1/s control-socket caller that starves session installs.
+//
+// FAIL-ON-REVERT: master's UpdateHAWatchdog calls syncHAStateLocked
+// unconditionally — restoring that makes the IPC fire on all 20 ticks, blowing
+// the `<= 6` bound. (On unmodified master the test also fails earlier because the
+// un-seamed bpfShim.UpdateHAWatchdog errors on the missing map, short-circuiting
+// the whole call.)
+func TestUpdateHAWatchdogThrottlesIPCButWritesMapEveryTick(t *testing.T) {
+	dir := t.TempDir()
+	controlSock, reqTypes := startFakeHAControlHelper(t, dir)
+
+	proc, err := os.FindProcess(os.Getpid())
+	if err != nil {
+		t.Fatalf("FindProcess: %v", err)
+	}
+
+	m := New()
+	m.proc = &exec.Cmd{Process: proc}
+	m.cfg.ControlSocket = controlSock
+	m.clusterHA = true
+	m.haGroups[1] = HAGroupStatus{RGID: 1, Active: false}
+
+	mapWrites := 0
+	m.haWatchdogMapWrite = func(rgID int, ts uint64) error { mapWrites++; return nil }
+
+	const rgID = 1
+	const ticks = 20 // 500ms ticks over a 10s span.
+	for i := 0; i < ticks; i++ {
+		// The daemon writes CLOCK_MONOTONIC SECONDS, so tick i carries
+		// timestamp i/2 (0,0,1,1,...,9,9). post-send applyHelperStatusLocked
+		// errors without BPF maps; the IPC is already sent + counted, so the
+		// returned error is expected and ignored.
+		_ = m.UpdateHAWatchdog(rgID, uint64(i/2))
+	}
+
+	if mapWrites != ticks {
+		t.Fatalf("shim map write fired %d times over %d ticks, want every tick (kernel watchdog must stay fresh)", mapWrites, ticks)
+	}
+
+	ipc := drainUpdateHAStateCount(reqTypes)
+	// 3s backstop -> IPC at ts 0,3,6,9 = 4 sends over the 10s span.
+	if ipc < 2 {
+		t.Fatalf("update_ha_state IPC fired %d times over a 10s span — the periodic backstop never refreshed the helper (stale-lease would expire)", ipc)
+	}
+	if ipc > 6 {
+		t.Fatalf("update_ha_state IPC fired %d times over %d ticks (10s span); want throttled to ~once/%ds (<=6), not per-tick like master (=%d)", ipc, ticks, haWatchdogIPCBackstopSecs, ticks)
+	}
+}
+
+// TestUpdateHAWatchdogActiveChangeForcesImmediateIPC proves the load-bearing
+// correctness constraint of #2549: an RG Active-state change (failover/failback)
+// MUST publish the update_ha_state IPC immediately, regardless of the timestamp
+// backstop throttle. If the throttle ever swallowed a transition, failover timing
+// would regress.
+func TestUpdateHAWatchdogActiveChangeForcesImmediateIPC(t *testing.T) {
+	dir := t.TempDir()
+	controlSock, reqTypes := startFakeHAControlHelper(t, dir)
+
+	proc, err := os.FindProcess(os.Getpid())
+	if err != nil {
+		t.Fatalf("FindProcess: %v", err)
+	}
+
+	m := New()
+	m.proc = &exec.Cmd{Process: proc}
+	m.cfg.ControlSocket = controlSock
+	m.clusterHA = true
+	m.haWatchdogMapWrite = func(int, uint64) error { return nil }
+	m.haGroups[1] = HAGroupStatus{RGID: 1, Active: false}
+
+	// Tick 0 seeds the baseline + syncs; tick 1 (same second, no change) is
+	// throttled. One IPC so far.
+	_ = m.UpdateHAWatchdog(1, 0)
+	_ = m.UpdateHAWatchdog(1, 0)
+	if base := drainUpdateHAStateCount(reqTypes); base != 1 {
+		t.Fatalf("baseline IPC count = %d, want 1 (first tick syncs, second is throttled)", base)
+	}
+
+	// Flip Active WITHOUT advancing the timestamp past the backstop. The
+	// throttle MUST NOT swallow this transition.
+	m.mu.Lock()
+	g := m.haGroups[1]
+	g.Active = true
+	m.haGroups[1] = g
+	m.mu.Unlock()
+	_ = m.UpdateHAWatchdog(1, 0)
+
+	if got := drainUpdateHAStateCount(reqTypes); got != 1 {
+		t.Fatalf("Active-state change fired %d immediate IPCs, want exactly 1 — failover/failback must publish instantly despite the timestamp throttle", got)
+	}
+}

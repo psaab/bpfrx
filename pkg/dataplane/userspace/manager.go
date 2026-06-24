@@ -48,6 +48,7 @@ var ErrPersistentSourceNATProtocolIncompatible = errors.New("userspace persisten
 //     error, but its caller (handleConfigSync) logs slog.Error and returns;
 //     the store is already promoted by SyncApply, so the node stays
 //     consistent with the peer (helper disarmed, not bricked).
+//
 // Only the operator-facing commit path (commitAndApply /
 // commitConfirmedAndApply) returns the abort to the committer.
 //
@@ -171,14 +172,28 @@ type Manager struct {
 	// against the SAME *config.Config; the overlay is what makes the
 	// rebuilt snapshot's AddressBooks (and thus the content hash) shift on
 	// a feed change so the duplicate-publish gate lets the refresh through.
-	feedOverlay       map[string][]string
-	haGroups          map[int]HAGroupStatus
-	lastIngressIfaces []uint32
-	lastRSTv4         []netip.Addr
-	lastRSTv6         []netip.Addr
-	lastRSTAttempt    time.Time
-	lastRSTInstallOK  bool
-	lastSnapshotHash  [32]byte // content hash of last published snapshot (excludes volatile fields)
+	feedOverlay map[string][]string
+	haGroups    map[int]HAGroupStatus
+	// haWatchdogMapWrite writes the kernel-visible watchdog timestamp into the
+	// BPF shim's ha_watchdog map. It runs on EVERY heartbeat tick (the BPF ~2s
+	// stale window relies on this fast map write, so it is never throttled).
+	// Indirected through a field so tests can drive the IPC-throttle path in
+	// UpdateHAWatchdog without a loaded BPF map. Defaults to
+	// bpfShim.UpdateHAWatchdog (set in New()); nil-safe at the call site.
+	haWatchdogMapWrite func(rgID int, timestamp uint64) error
+	// haWatchdogIPCSynced tracks, per RG, the watchdog timestamp and Active
+	// state last published to the helper via the update_ha_state socket IPC.
+	// It throttles that IPC (see UpdateHAWatchdog): the shim map write above
+	// happens every tick, but the JSON socket round-trip fires only on an
+	// Active-state change (failover/failback — instant) or a periodic backstop
+	// comfortably under the helper's ~10s stale-lease window. Guarded by m.mu.
+	haWatchdogIPCSynced map[int]haWatchdogIPCSyncState
+	lastIngressIfaces   []uint32
+	lastRSTv4           []netip.Addr
+	lastRSTv6           []netip.Addr
+	lastRSTAttempt      time.Time
+	lastRSTInstallOK    bool
+	lastSnapshotHash    [32]byte // content hash of last published snapshot (excludes volatile fields)
 	// #1866 D3: canonical summary of the WG endpoint set in the last
 	// successfully published snapshot, for publish-boundary transition
 	// logging (logWgEndpointSetTransitionLocked).
@@ -290,9 +305,11 @@ func New() *Manager {
 	bpfShim := dataplane.New()
 	bpfShim.SelectUserspaceXDPShimEntryProgram()
 	return &Manager{
-		bpfShim:        bpfShim,
-		configuredMode: ModeUserspaceCompat,
-		haGroups:       make(map[int]HAGroupStatus),
+		bpfShim:             bpfShim,
+		configuredMode:      ModeUserspaceCompat,
+		haGroups:            make(map[int]HAGroupStatus),
+		haWatchdogMapWrite:  bpfShim.UpdateHAWatchdog,
+		haWatchdogIPCSynced: make(map[int]haWatchdogIPCSyncState),
 	}
 }
 
