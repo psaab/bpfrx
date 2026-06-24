@@ -64,8 +64,10 @@ func mssRejectStrict(t *testing.T, tree *config.ConfigTree) {
 // --- Flat shape (the issue headline: `tcp-mss gre-in 70000` typo) ---
 
 func TestTCPMSSRange_FlatShape(t *testing.T) {
-	// Valid flat values accepted.
-	for _, kind := range []string{"ipsec-vpn", "gre-in", "gre-out", "all-tcp"} {
+	// Valid flat values accepted. #2486: ipsec-vpn is excluded — it is
+	// rejected at commit regardless of the value (see
+	// TestTCPMSSIPsecVPNRejectedAtCommit).
+	for _, kind := range []string{"gre-in", "gre-out", "all-tcp"} {
 		mssAcceptStrict(t, mssFlatTree(t, "set security flow tcp-mss "+kind+" 1400"))
 	}
 	// all-tcp 1396 (docs/ha-cluster.conf value) accepted.
@@ -74,9 +76,73 @@ func TestTCPMSSRange_FlatShape(t *testing.T) {
 	mssAcceptStrict(t, mssFlatTree(t, "set security flow tcp-mss gre-in 65535"))
 	mssRejectStrict(t, mssFlatTree(t, "set security flow tcp-mss gre-in 65536"))
 
-	// The headline typo: every kind out-of-range flat is rejected.
-	for _, kind := range []string{"ipsec-vpn", "gre-in", "gre-out", "all-tcp"} {
+	// The headline typo: every enforceable kind out-of-range flat is
+	// rejected. (ipsec-vpn rejects on ANY value, not just out-of-range.)
+	for _, kind := range []string{"gre-in", "gre-out", "all-tcp"} {
 		mssRejectStrict(t, mssFlatTree(t, "set security flow tcp-mss "+kind+" 70000"))
+	}
+}
+
+// #2486: `security flow tcp-mss ipsec-vpn` is rejected at commit. There
+// is no IPsec context in the userspace forward-build path (ESP/AH/IKE is
+// local-delivered to the kernel XFRM stack; the decrypted inner packets
+// re-enter as plain traffic with no IPsec marker), so the clamp can never
+// be enforced. Strict (commit) is a hard error even for an in-range
+// value; lenient (boot/HA load) warn-loads so a legacy persisted/peer
+// config still boots.
+func TestTCPMSSIPsecVPNRejectedAtCommit(t *testing.T) {
+	// Flat, in-range value -> strict REJECT (this is the new behavior;
+	// previously this was accepted and carried as dead config).
+	flat := mssFlatTree(t, "set security flow tcp-mss ipsec-vpn 1400")
+	_, err := config.CompileConfig(flat)
+	if err == nil {
+		t.Fatal("strict commit must REJECT tcp-mss ipsec-vpn")
+	}
+	if !strings.Contains(err.Error(), "ipsec-vpn") || !strings.Contains(err.Error(), "not supported") {
+		t.Fatalf("reject error should explain ipsec-vpn is unsupported: %v", err)
+	}
+
+	// Hierarchical form rejects identically.
+	hier := mssHierTree(t, `security {
+    flow { tcp-mss { ipsec-vpn { mss 1360; } } }
+}`)
+	if _, err := config.CompileConfig(hier); err == nil {
+		t.Fatal("strict commit must REJECT hierarchical tcp-mss ipsec-vpn")
+	}
+
+	// Lenient (boot/HA) path warn-loads rather than hard-failing.
+	cfg, err := config.CompileConfigLenient(flat)
+	if err != nil {
+		t.Fatalf("lenient load of a legacy ipsec-vpn config must not hard-fail: %v", err)
+	}
+	foundWarn := false
+	for _, w := range cfg.Warnings {
+		if strings.Contains(w, "ipsec-vpn") {
+			foundWarn = true
+			break
+		}
+	}
+	if !foundWarn {
+		t.Fatalf("lenient load should warn about the ignored ipsec-vpn clamp, got: %v", cfg.Warnings)
+	}
+}
+
+// #2486: all-tcp now lands in its own TCPMSSAllTCP field and is NOT
+// fanned into IPsecVPN/GreIn/GreOut. Pins the field mapping so a revert
+// (back to the fan-out) fails.
+func TestTCPMSSAllTCPMapsToOwnField(t *testing.T) {
+	cfg, err := config.CompileConfig(mssFlatTree(t, "set security flow tcp-mss all-tcp 1400"))
+	if err != nil {
+		t.Fatalf("all-tcp 1400 must compile: %v", err)
+	}
+	if cfg.Security.Flow.TCPMSSAllTCP != 1400 {
+		t.Fatalf("all-tcp must map to TCPMSSAllTCP, got %d", cfg.Security.Flow.TCPMSSAllTCP)
+	}
+	if cfg.Security.Flow.TCPMSSGreIn != 0 || cfg.Security.Flow.TCPMSSGreOut != 0 ||
+		cfg.Security.Flow.TCPMSSIPsecVPN != 0 {
+		t.Fatalf("all-tcp must NOT fan into gre-in/gre-out/ipsec-vpn (got in=%d out=%d ipsec=%d)",
+			cfg.Security.Flow.TCPMSSGreIn, cfg.Security.Flow.TCPMSSGreOut,
+			cfg.Security.Flow.TCPMSSIPsecVPN)
 	}
 }
 
@@ -84,9 +150,10 @@ func TestTCPMSSRange_FlatShape(t *testing.T) {
 
 func TestTCPMSSRange_HierarchicalShape(t *testing.T) {
 	// Valid hierarchical accepted (matches TestTCPMSSHierarchical).
+	// #2486: ipsec-vpn dropped from the accepted set — it is rejected at
+	// commit (TestTCPMSSIPsecVPNRejectedAtCommit covers it).
 	mssAcceptStrict(t, mssHierTree(t, `security {
     flow { tcp-mss {
-        ipsec-vpn { mss 1360; }
         gre-in { mss 1360; }
         gre-out { mss 1360; }
     } }

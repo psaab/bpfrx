@@ -23,7 +23,9 @@ func assertInRange(t *testing.T, name string, v int, max int64) {
 
 func TestBuildFlowSnapshotCoercesOutOfRange_1977(t *testing.T) {
 	cfg := &config.Config{}
-	cfg.Security.Flow.TCPMSSIPsecVPN = 70000             // > u16 max
+	// #2486: TCPMSSAllTCP replaces TCPMSSIPsecVPN on the wire (ipsec-vpn is
+	// rejected at commit and never serialized). Coerce-test all-tcp here.
+	cfg.Security.Flow.TCPMSSAllTCP = 70000               // > u16 max
 	cfg.Security.Flow.TCPMSSGreIn = -5                   // < 0
 	cfg.Security.Flow.TCPMSSGreOut = math.MaxUint16 + 1  // > u16 max
 	cfg.Security.Flow.UDPSessionTimeout = -1             // < 0
@@ -31,15 +33,14 @@ func TestBuildFlowSnapshotCoercesOutOfRange_1977(t *testing.T) {
 	cfg.Security.Flow.TCPSession = &config.TCPSessionConfig{EstablishedTimeout: -7}
 
 	snap := buildFlowSnapshot(cfg)
-	assertInRange(t, "TCPMSSIPsecVPN", snap.TCPMSSIPsecVPN, math.MaxUint16)
+	assertInRange(t, "TCPMSSAllTCP", snap.TCPMSSAllTCP, math.MaxUint16)
 	assertInRange(t, "TCPMSSGreIn", snap.TCPMSSGreIn, math.MaxUint16)
 	assertInRange(t, "TCPMSSGreOut", snap.TCPMSSGreOut, math.MaxUint16)
-	assertInRange(t, "TCPMSSAllTCP", snap.TCPMSSAllTCP, math.MaxUint16)
 	assertInRange(t, "UDPSessionTimeout", snap.UDPSessionTimeout, config.MaxDurationSeconds)
 	assertInRange(t, "ICMPSessionTimeout", snap.ICMPSessionTimeout, config.MaxDurationSeconds)
 	assertInRange(t, "TCPSessionTimeout", snap.TCPSessionTimeout, config.MaxDurationSeconds)
 	// Specific coercions: out-of-range MSS -> 0; huge timeout -> MaxDurationSeconds.
-	if snap.TCPMSSIPsecVPN != 0 || snap.TCPMSSGreIn != 0 || snap.TCPMSSGreOut != 0 {
+	if snap.TCPMSSAllTCP != 0 || snap.TCPMSSGreIn != 0 || snap.TCPMSSGreOut != 0 {
 		t.Fatalf("out-of-range MSS not coerced to 0: %+v", snap)
 	}
 	if int64(snap.ICMPSessionTimeout) != config.MaxDurationSeconds {
@@ -113,7 +114,7 @@ func TestBuildFlowExportSnapshotCoercesOutOfRange_1977(t *testing.T) {
 }
 
 func TestCoerceWireHelpers_1977(t *testing.T) {
-	// u16 (covers TCPMSSAllTCP, which the builder does not populate today).
+	// u16 (covers TCPMSSAllTCP, now populated by buildFlowSnapshot, #2486).
 	for _, tc := range []struct{ in, want int }{
 		{70000, 0}, {-1, 0}, {math.MaxUint16 + 1, 0}, {math.MaxUint16, math.MaxUint16}, {0, 0}, {1400, 1400},
 	} {

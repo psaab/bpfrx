@@ -67,7 +67,8 @@ type FlowConfig struct {
 	TCPSession                 *TCPSessionConfig
 	UDPSessionTimeout          int // seconds, 0 = default (60s)
 	ICMPSessionTimeout         int // seconds, 0 = default (60s — DEFAULT_ICMP_SESSION_TIMEOUT_NS, userspace-dp/src/session/mod.rs)
-	TCPMSSIPsecVPN             int // TCP MSS clamp for IPsec VPN traffic (0 = disabled)
+	TCPMSSAllTCP               int // TCP MSS clamp for all forwarded TCP (0 = disabled) (#2486)
+	TCPMSSIPsecVPN             int // TCP MSS clamp for IPsec VPN traffic (0 = disabled) — rejected at commit (#2486: no IPsec context in the userspace forward path)
 	TCPMSSGreIn                int // TCP MSS clamp for GRE ingress traffic (0 = disabled)
 	TCPMSSGreOut               int // TCP MSS clamp for GRE egress traffic (0 = disabled)
 	AllowDNSReply              bool

@@ -1166,10 +1166,13 @@ func TestIPFIXExportExtensionsWarnUnsupportedAppID(t *testing.T) {
 }
 
 func TestALGAndFlowOptions(t *testing.T) {
+	// #2486: ipsec-vpn dropped — it is now rejected at commit (covered by
+	// TestTCPMSSIPsecVPNRejectedAtCommit). all-tcp added to exercise the
+	// dedicated TCPMSSAllTCP field.
 	input := `security {
     flow {
         tcp-mss {
-            ipsec-vpn 1350;
+            all-tcp 1360;
             gre-in 1400;
             gre-out 1380;
         }
@@ -1191,8 +1194,8 @@ func TestALGAndFlowOptions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("compile error: %v", err)
 	}
-	if cfg.Security.Flow.TCPMSSIPsecVPN != 1350 {
-		t.Errorf("tcp-mss ipsec-vpn: got %d, want 1350", cfg.Security.Flow.TCPMSSIPsecVPN)
+	if cfg.Security.Flow.TCPMSSAllTCP != 1360 {
+		t.Errorf("tcp-mss all-tcp: got %d, want 1360", cfg.Security.Flow.TCPMSSAllTCP)
 	}
 	if cfg.Security.Flow.TCPMSSGreIn != 1400 {
 		t.Errorf("tcp-mss gre-in: got %d, want 1400", cfg.Security.Flow.TCPMSSGreIn)
@@ -1213,7 +1216,7 @@ func TestALGAndFlowOptions(t *testing.T) {
 		t.Error("expected ALG FTP disable")
 	}
 	tree2 := &ConfigTree{}
-	setCommands := []string{"set security flow tcp-mss ipsec-vpn 1350", "set security flow tcp-mss gre-in 1400", "set security flow tcp-mss gre-out 1380", "set security flow allow-dns-reply", "set security flow allow-embedded-icmp", "set security alg dns disable", "set security alg ftp disable"}
+	setCommands := []string{"set security flow tcp-mss all-tcp 1360", "set security flow tcp-mss gre-in 1400", "set security flow tcp-mss gre-out 1380", "set security flow allow-dns-reply", "set security flow allow-embedded-icmp", "set security alg dns disable", "set security alg ftp disable"}
 	for _, cmd := range setCommands {
 		path, err := ParseSetCommand(cmd)
 		if err != nil {
@@ -1227,8 +1230,8 @@ func TestALGAndFlowOptions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("set-command compile error: %v", err)
 	}
-	if cfg2.Security.Flow.TCPMSSIPsecVPN != 1350 {
-		t.Errorf("set syntax: tcp-mss ipsec-vpn: got %d, want 1350", cfg2.Security.Flow.TCPMSSIPsecVPN)
+	if cfg2.Security.Flow.TCPMSSAllTCP != 1360 {
+		t.Errorf("set syntax: tcp-mss all-tcp: got %d, want 1360", cfg2.Security.Flow.TCPMSSAllTCP)
 	}
 	if cfg2.Security.Flow.TCPMSSGreIn != 1400 {
 		t.Errorf("set syntax: tcp-mss gre-in: got %d, want 1400", cfg2.Security.Flow.TCPMSSGreIn)
