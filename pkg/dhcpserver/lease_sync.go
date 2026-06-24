@@ -706,12 +706,12 @@ func (m *Manager) writeMemfile6(path string, leases []SyncLease, now time.Time) 
 		// address,duid,valid_lifetime,expire,subnet_id,pref_lifetime,
 		// lease_type,iaid,prefix_len,fqdn_fwd,fqdn_rev,hostname,hwaddr,
 		// state,user_context,hwtype,hwaddr_source,pool_id
-		fmt.Fprintf(&b, "%s,%s,%d,%d,%d,%d,%d,%d,%d,%s,%s,%s,,%d,,,,0\n",
+		fmt.Fprintf(&b, "%s,%s,%d,%d,%d,%d,%d,%d,%d,%s,%s,%s,%s,%d,,,,0\n",
 			csvField(l.Address), csvField(l.DUID),
 			rem, expire, l.SubnetID, rem,
 			leaseType, l.IAID, prefixLen,
 			boolCSV(l.FQDNFwd), boolCSV(l.FQDNRev), csvField(l.Hostname),
-			keaStateDefault)
+			csvField(l.HWAddress), keaStateDefault)
 	}
 	return m.writeMemfileAtomic(path, b.String())
 }
