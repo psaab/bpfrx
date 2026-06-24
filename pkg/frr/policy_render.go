@@ -357,13 +357,22 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 		b.WriteString("exit\n!\n")
 		for _, area := range ospfv3.Areas {
 			for _, iface := range area.Interfaces {
-				if iface.Cost > 0 || iface.Passive {
+				if iface.Cost > 0 || iface.Passive || iface.BFD {
 					fmt.Fprintf(&b, "interface %s\n", iface.Name)
 					if iface.Passive {
 						b.WriteString(" ipv6 ospf6 passive\n")
 					}
 					if iface.Cost > 0 {
 						fmt.Fprintf(&b, " ipv6 ospf6 cost %d\n", iface.Cost)
+					}
+					if iface.BFD {
+						if iface.BFDInterval > 0 || iface.BFDMultiplier > 0 {
+							profile := bfdProfileName(iface.BFDInterval, iface.BFDMultiplier)
+							bfdProfiles[profile] = bfdProfile{iface.BFDInterval, iface.BFDMultiplier}
+							fmt.Fprintf(&b, " ipv6 ospf6 bfd profile %s\n", profile)
+						} else {
+							b.WriteString(" ipv6 ospf6 bfd\n")
+						}
 					}
 					b.WriteString("exit\n!\n")
 				}

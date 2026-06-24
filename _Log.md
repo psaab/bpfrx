@@ -12927,3 +12927,14 @@ top.
 - **Fix**: Read the VIP from the map VALUE — iterate `unit.VRRPGroups` values and `net.ParseCIDR` each `vg.VirtualAddresses` entry, adding the VIP subnet as a connected prefix. Do NOT parse the key. Test rewritten to the real compiler key shape (`"<CIDR>_grp<id>_grp1"` style `2001:559:8585:50::8/64_grp1`) with `VirtualAddresses` populated as a CIDR.
 - **File(s)**: pkg/daemon/daemon_run.go (read VirtualAddresses values, not keys), pkg/daemon/ipv6_static_nexthop_test.go (production key shape + VIP-as-value), pkg/frr/README.md (correct the VRRP-VIP doc), _Log.md.
 - **Validation**: go build ./... OK; go test ./pkg/daemon/ ./pkg/frr/ PASS; gofmt clean; go vet clean. Fail-on-revert PROVEN two ways: (1) neutralizing the VirtualAddresses scan → VIP-subnet test resolves "" → fails; (2) reintroducing the OLD key-parse code against the REAL key shape → also resolves "" → fails (confirms the test now exercises a production path the old code could not satisfy). Primary link-local resolve/disambiguation untouched (reviewer-confirmed correct).
+
+## 2026-06-24 — #2474 OSPFv3 BFD parity
+- **Timestamp**: 2026-06-24
+- **Action**: Add BFD (bfd-liveness-detection) support to OSPFv3 interfaces, mirroring OSPFv2.
+- **File(s)**: pkg/config/types_routing.go (OSPFv3Interface +BFD/BFDInterval/BFDMultiplier),
+  pkg/config/compiler_protocols.go (ospf3 interface loop parses bfd-liveness-detection,
+  both AST shapes via shared compileProtocols), pkg/frr/policy_render.go (emit
+  `ipv6 ospf6 bfd` / `ipv6 ospf6 bfd profile <name>` with FRR profile dedup),
+  pkg/config/schema_routing.go (ospf3 interface bfd-liveness-detection leaf, global +
+  routing-instance), pkg/config/parser_routing_test.go + pkg/frr/frr_test.go (tests),
+  docs/feature-gaps.md (note OSPFv3 BFD done).

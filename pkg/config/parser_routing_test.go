@@ -1185,6 +1185,92 @@ func TestOSPFBFDSetSyntax(t *testing.T) {
 	}
 }
 
+// TestOSPFv3BFDHierarchical verifies the hierarchical AST shape carries
+// bfd-liveness-detection (minimum-interval + multiplier) into the compiled
+// OSPFv3Interface (#2474 — OSPFv3 BFD parity with OSPFv2).
+func TestOSPFv3BFDHierarchical(t *testing.T) {
+	input := `
+protocols {
+    ospf3 {
+        router-id 10.0.0.1;
+        area 0.0.0.0 {
+            interface trust0 {
+                cost 5;
+                bfd-liveness-detection {
+                    minimum-interval 250;
+                    multiplier 4;
+                }
+            }
+        }
+    }
+}
+`
+	parser := NewParser(input)
+	tree, errs := parser.Parse()
+	if len(errs) > 0 {
+		t.Fatalf("parse errors: %v", errs)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	ospf3 := cfg.Protocols.OSPFv3
+	if ospf3 == nil {
+		t.Fatal("OSPFv3 config is nil")
+	}
+	if len(ospf3.Areas) != 1 || len(ospf3.Areas[0].Interfaces) != 1 {
+		t.Fatalf("unexpected area/interface count: %+v", ospf3.Areas)
+	}
+	iface := ospf3.Areas[0].Interfaces[0]
+	if !iface.BFD {
+		t.Error("OSPFv3 interface BFD should be true")
+	}
+	if iface.BFDInterval != 250 {
+		t.Errorf("OSPFv3 BFDInterval: got %d, want 250", iface.BFDInterval)
+	}
+	if iface.BFDMultiplier != 4 {
+		t.Errorf("OSPFv3 BFDMultiplier: got %d, want 4", iface.BFDMultiplier)
+	}
+}
+
+// TestOSPFv3BFDSetSyntax verifies the flat-set AST shape (ParseSetCommand +
+// SetPath) carries bfd-liveness-detection into the compiled OSPFv3Interface.
+func TestOSPFv3BFDSetSyntax(t *testing.T) {
+	cmds := []string{
+		"set protocols ospf3 area 0.0.0.0 interface trust0 cost 5",
+		"set protocols ospf3 area 0.0.0.0 interface trust0 bfd-liveness-detection minimum-interval 300",
+		"set protocols ospf3 area 0.0.0.0 interface trust0 bfd-liveness-detection multiplier 3",
+	}
+	tree := &ConfigTree{}
+	for _, cmd := range cmds {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%v): %v", path, err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	ospf3 := cfg.Protocols.OSPFv3
+	if ospf3 == nil {
+		t.Fatal("OSPFv3 config is nil")
+	}
+	iface := ospf3.Areas[0].Interfaces[0]
+	if !iface.BFD {
+		t.Error("OSPFv3 interface BFD should be true")
+	}
+	if iface.BFDInterval != 300 {
+		t.Errorf("OSPFv3 BFDInterval: got %d, want 300", iface.BFDInterval)
+	}
+	if iface.BFDMultiplier != 3 {
+		t.Errorf("OSPFv3 BFDMultiplier: got %d, want 3", iface.BFDMultiplier)
+	}
+}
+
 func TestBGPBFDSetSyntax(t *testing.T) {
 	cmds := []string{"set protocols bgp local-as 65001", "set protocols bgp group external peer-as 65002", "set protocols bgp group external bfd-liveness-detection minimum-interval 200", "set protocols bgp group external neighbor 10.0.2.1", "set protocols bgp group external neighbor 10.0.3.1 bfd-liveness-detection minimum-interval 100"}
 	tree := &ConfigTree{}

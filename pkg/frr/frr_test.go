@@ -2807,6 +2807,63 @@ func TestGenerateProtocols_OSPFv3VRF(t *testing.T) {
 	}
 }
 
+// TestGenerateProtocols_OSPFv3BFD verifies an OSPFv3 interface with BFD renders
+// the FRR 10.6 ospf6d interface command `ipv6 ospf6 bfd` (bare, no profile) and
+// does NOT emit the OSPFv2 `ip ospf bfd` form (#2474).
+func TestGenerateProtocols_OSPFv3BFD(t *testing.T) {
+	m := New()
+	ospfv3 := &config.OSPFv3Config{
+		RouterID: "10.0.0.1",
+		Areas: []*config.OSPFv3Area{
+			{
+				ID: "0.0.0.0",
+				Interfaces: []*config.OSPFv3Interface{
+					{Name: "trust0", BFD: true},
+				},
+			},
+		},
+	}
+	got := m.generateProtocols(nil, ospfv3, nil, nil, nil, "", 0, nil)
+	if !strings.Contains(got, "interface trust0\n") {
+		t.Errorf("missing interface block in:\n%s", got)
+	}
+	if !strings.Contains(got, " ipv6 ospf6 bfd\n") {
+		t.Errorf("missing 'ipv6 ospf6 bfd' in:\n%s", got)
+	}
+	if strings.Contains(got, "ip ospf bfd") {
+		t.Errorf("must NOT emit OSPFv2 'ip ospf bfd' for an OSPFv3 interface in:\n%s", got)
+	}
+}
+
+// TestGenerateProtocols_OSPFv3BFDProfile verifies that an OSPFv3 interface with
+// a custom interval/multiplier renders a BFD profile reference plus the profile
+// definition, mirroring the OSPFv2 structure but with the ospf6 keyword (#2474).
+func TestGenerateProtocols_OSPFv3BFDProfile(t *testing.T) {
+	m := New()
+	ospfv3 := &config.OSPFv3Config{
+		RouterID: "10.0.0.1",
+		Areas: []*config.OSPFv3Area{
+			{
+				ID: "0.0.0.0",
+				Interfaces: []*config.OSPFv3Interface{
+					{Name: "trust0", BFD: true, BFDInterval: 300, BFDMultiplier: 3},
+				},
+			},
+		},
+	}
+	got := m.generateProtocols(nil, ospfv3, nil, nil, nil, "", 0, nil)
+	profile := bfdProfileName(300, 3)
+	if !strings.Contains(got, " ipv6 ospf6 bfd profile "+profile+"\n") {
+		t.Errorf("missing 'ipv6 ospf6 bfd profile %s' in:\n%s", profile, got)
+	}
+	if !strings.Contains(got, "profile "+profile+"\n") {
+		t.Errorf("missing BFD profile definition %q in:\n%s", profile, got)
+	}
+	if strings.Contains(got, "ip ospf bfd") {
+		t.Errorf("must NOT emit OSPFv2 'ip ospf bfd' for an OSPFv3 interface in:\n%s", got)
+	}
+}
+
 func TestGeneratePolicyOptionsCommunityListAndMetricType(t *testing.T) {
 	m := &Manager{frrConf: "/dev/null"}
 	po := &config.PolicyOptionsConfig{

@@ -164,9 +164,12 @@ type OSPFv3Area struct {
 
 // OSPFv3Interface defines an interface participating in OSPFv3.
 type OSPFv3Interface struct {
-	Name    string
-	Passive bool
-	Cost    int
+	Name          string
+	Passive       bool
+	Cost          int
+	BFD           bool // enable BFD on this interface
+	BFDInterval   int  // BFD minimum-interval in ms (0 = default)
+	BFDMultiplier int  // BFD detect-multiplier (0 = default)
 }
 
 // RIPConfig holds RIP routing configuration.
