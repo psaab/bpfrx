@@ -722,8 +722,23 @@ func validateRoutingExportReferencesStrict(cfg *Config) error {
 			if err := checkRedist(scope, "protocols bgp", bgp.Export); err != nil {
 				return err
 			}
+			// A global `protocols bgp import` renders `route-map <name> in`.
+			// Unlike export, import has NO redistribute equivalent — inbound
+			// filtering is route-map-only — so it must name a DEFINED
+			// policy-statement (no protocol-token fallback). An undefined ref
+			// would render a dangling `route-map in` that FRR resolves to
+			// PERMIT-ALL, accepting every inbound advertisement and defeating
+			// the operator's filter (#2490, the #2473 lesson on the inbound
+			// direction). #2490.
+			for _, e := range bgp.Import {
+				detail := fmt.Sprintf("%sprotocols bgp import", scope)
+				if err := checkPolicyRef(detail, e); err != nil {
+					return err
+				}
+			}
 			// A BGP group/neighbor export renders `route-map <name> out`,
-			// so it must be a defined policy-statement (no protocol-token
+			// and a group/neighbor import renders `route-map <name> in`, so
+			// both must be defined policy-statements (no protocol-token
 			// fallback). Sort neighbor addresses for a deterministic
 			// first-error message.
 			neighbors := append([]*BGPNeighbor(nil), bgp.Neighbors...)
@@ -738,6 +753,15 @@ func validateRoutingExportReferencesStrict(cfg *Config) error {
 					detail := fmt.Sprintf("%sprotocols bgp neighbor %s export", scope, n.Address)
 					if n.GroupName != "" {
 						detail = fmt.Sprintf("%sprotocols bgp group %s neighbor %s export", scope, n.GroupName, n.Address)
+					}
+					if err := checkPolicyRef(detail, e); err != nil {
+						return err
+					}
+				}
+				for _, e := range n.Import {
+					detail := fmt.Sprintf("%sprotocols bgp neighbor %s import", scope, n.Address)
+					if n.GroupName != "" {
+						detail = fmt.Sprintf("%sprotocols bgp group %s neighbor %s import", scope, n.GroupName, n.Address)
 					}
 					if err := checkPolicyRef(detail, e); err != nil {
 						return err

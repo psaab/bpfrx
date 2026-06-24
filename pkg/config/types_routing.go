@@ -284,6 +284,7 @@ type BGPConfig struct {
 	DampeningMaxSuppress int    // max suppress time in minutes (default 60)
 	Neighbors            []*BGPNeighbor
 	Export               []string // "connected", "static", "ospf", etc.
+	Import               []string // inbound filter policy-statements (route-map in); #2490
 }
 
 // BGPNeighbor defines a BGP peer.
@@ -293,6 +294,7 @@ type BGPNeighbor struct {
 	Description          string
 	MultihopTTL          int      // 0 = directly connected
 	Export               []string // per-group export policies (route-map out)
+	Import               []string // per-group import policies (route-map in); #2490
 	FamilyInet           bool     // activate under address-family ipv4 unicast
 	FamilyInet6          bool     // activate under address-family ipv6 unicast
 	GroupName            string   // BGP group name (for display)

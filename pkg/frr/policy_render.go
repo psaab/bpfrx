@@ -198,6 +198,30 @@ func bgpEffectiveExport(n *config.BGPNeighbor, globalExport string) string {
 	return globalExport
 }
 
+// bgpEffectiveImport resolves the single peer-level import route-map name
+// for a BGP neighbor/address-family, applying Junos most-specific-wins:
+// the neighbor's own `import` (group/neighbor level) overrides the global
+// `protocols bgp import` default. FRR takes exactly one `route-map in` per
+// neighbor/AF, so we never emit two competing route-maps for one peer; the
+// neighbor's own policy, when present, is the one rendered. Returns "" when
+// neither the neighbor nor the global default sets an import (no
+// `route-map in` line is emitted). Symmetric to bgpEffectiveExport (#2490).
+//
+// Unlike export, import has NO redistribute shorthand — inbound filtering is
+// route-map-only. Both the caller and the commit-time validator therefore
+// require an import ref to name a DEFINED policy-statement (so
+// generatePolicyOptions renders a real `route-map <name>`). The caller
+// guards with isDefinedPolicyStatement before emitting `route-map <name> in`
+// to avoid the #2473 dangling-route-map PERMIT-ALL leak (here on the INBOUND
+// direction: an undefined route-map in FRR resolves to permit-all, accepting
+// every advertised prefix and defeating the operator's inbound filter).
+func bgpEffectiveImport(n *config.BGPNeighbor, globalImport string) string {
+	if rm := lastNonEmpty(n.Import); rm != "" {
+		return rm
+	}
+	return globalImport
+}
+
 // bfdProfile holds a unique BFD profile (interval + multiplier).
 type bfdProfile struct {
 	interval   int
@@ -463,6 +487,28 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 			}
 		}
 
+		// Global `protocols bgp import <policy>` default (#2490). Unlike
+		// export there is NO redistribute equivalent for inbound filtering
+		// (FRR has no "redistribute in") — import is route-map-only. An
+		// import ref MUST therefore name a DEFINED policy-statement so the
+		// route-map below references a route-map that generatePolicyOptions
+		// actually emits. A bare/undefined ref is REJECTED at commit
+		// (validateRoutingExportReferencesStrict, strict) and SKIPPED here
+		// on the lenient load/HA-sync path: rendering `route-map <token> in`
+		// for a non-existent route-map would resolve to PERMIT-ALL in FRR
+		// and silently accept every inbound advertisement — the #2473
+		// dangling-route-map leak, INBOUND direction. Later defined entry
+		// wins (lastNonEmpty semantics, applied inline).
+		globalImport := ""
+		for _, e := range bgp.Import {
+			if e == "" {
+				continue
+			}
+			if isDefinedPolicyStatement(e, policyOptions) {
+				globalImport = e
+			}
+		}
+
 		// Address-family blocks for neighbors with family declarations.
 		// When a global default export exists it must reach EVERY peer,
 		// including neighbors with no explicit `family` (FRR default-
@@ -470,7 +516,15 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 		// ipv4 set in that case.
 		var inet4Neighbors, inet6Neighbors []*config.BGPNeighbor
 		for _, n := range bgp.Neighbors {
-			if n.FamilyInet || (globalExport != "" && !n.FamilyInet6) {
+			// A neighbor lands in the ipv4 (default) AF when it explicitly
+			// declares family inet, OR when a peer-level policy must reach it
+			// and it has not been pinned to inet6: a global export/import
+			// default, or its own per-neighbor export/import (FRR default-
+			// activates a family-less neighbor under ipv4 unicast). Per-
+			// neighbor import/export inclusion is #2490 (symmetric to the
+			// global-default inclusion #2473 added).
+			hasOwnPolicy := bgpEffectiveExport(n, "") != "" || bgpEffectiveImport(n, "") != ""
+			if n.FamilyInet || ((globalExport != "" || globalImport != "" || hasOwnPolicy) && !n.FamilyInet6) {
 				inet4Neighbors = append(inet4Neighbors, n)
 			}
 			if n.FamilyInet6 {
@@ -497,6 +551,15 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 				if rm := bgpEffectiveExport(n, globalExport); rm != "" {
 					fmt.Fprintf(&b, "  neighbor %s route-map %s out\n", n.Address, rm)
 				}
+				// Inbound filter (#2490). Emit ONLY for a defined
+				// policy-statement so we never point `route-map in` at a
+				// non-existent route-map (FRR permit-all). The effective
+				// import may resolve to a per-neighbor ref that slipped the
+				// validator on a lenient load/HA-sync path; the guard drops
+				// it rather than leaking the inbound filter.
+				if rm := bgpEffectiveImport(n, globalImport); rm != "" && isDefinedPolicyStatement(rm, policyOptions) {
+					fmt.Fprintf(&b, "  neighbor %s route-map %s in\n", n.Address, rm)
+				}
 			}
 			b.WriteString(" exit-address-family\n")
 		}
@@ -515,6 +578,10 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 				}
 				if rm := bgpEffectiveExport(n, globalExport); rm != "" {
 					fmt.Fprintf(&b, "  neighbor %s route-map %s out\n", n.Address, rm)
+				}
+				// Inbound filter (#2490) — see the ipv4 block above.
+				if rm := bgpEffectiveImport(n, globalImport); rm != "" && isDefinedPolicyStatement(rm, policyOptions) {
+					fmt.Fprintf(&b, "  neighbor %s route-map %s in\n", n.Address, rm)
 				}
 			}
 			b.WriteString(" exit-address-family\n")

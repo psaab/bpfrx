@@ -241,6 +241,10 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 				if len(child.Keys) >= 2 {
 					proto.BGP.Export = append(proto.BGP.Export, child.Keys[1])
 				}
+			case "import":
+				if len(child.Keys) >= 2 {
+					proto.BGP.Import = append(proto.BGP.Import, child.Keys[1])
+				}
 			}
 		}
 
@@ -249,6 +253,7 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 			var groupDesc string
 			var groupMultihop int
 			var groupExport []string
+			var groupImport []string
 			var familyInet, familyInet6 bool
 			var groupPrefixLimitInet, groupPrefixLimitInet6 int
 			var groupAuthKey string
@@ -279,6 +284,12 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 						groupExport = append(groupExport, v)
 					} else if len(child.Keys) >= 2 {
 						groupExport = append(groupExport, child.Keys[1:]...)
+					}
+				case "import":
+					if v := nodeVal(child); v != "" {
+						groupImport = append(groupImport, v)
+					} else if len(child.Keys) >= 2 {
+						groupImport = append(groupImport, child.Keys[1:]...)
 					}
 				case "family":
 					// Hierarchical: family { inet { unicast; } inet6 { unicast; } }
@@ -343,6 +354,7 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 							Description:      groupDesc,
 							MultihopTTL:      groupMultihop,
 							Export:           groupExport,
+							Import:           groupImport,
 							FamilyInet:       familyInet,
 							FamilyInet6:      familyInet6,
 							GroupName:        groupInst.name,
@@ -405,6 +417,28 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 								}
 							case "remove-private":
 								neighbor.RemovePrivateAS = true
+							case "export":
+								// Per-neighbor export override (#2490 made
+								// the per-neighbor slot parseable; group-level
+								// export is already inherited above). Appended
+								// after the inherited group export so the
+								// bgpEffectiveExport last-wins helper picks the
+								// more-specific neighbor policy.
+								if v := nodeVal(prop); v != "" {
+									neighbor.Export = append(neighbor.Export, v)
+								} else if len(prop.Keys) >= 2 {
+									neighbor.Export = append(neighbor.Export, prop.Keys[1:]...)
+								}
+							case "import":
+								// Per-neighbor import override (#2490). Appended
+								// after the inherited group import so the
+								// bgpEffectiveImport last-wins helper picks the
+								// more-specific neighbor policy.
+								if v := nodeVal(prop); v != "" {
+									neighbor.Import = append(neighbor.Import, v)
+								} else if len(prop.Keys) >= 2 {
+									neighbor.Import = append(neighbor.Import, prop.Keys[1:]...)
+								}
 							case "family":
 								if len(prop.Keys) >= 2 {
 									switch prop.Keys[1] {
