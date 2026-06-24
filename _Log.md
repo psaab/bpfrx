@@ -1,5 +1,26 @@
 # Action Log
 
+## 2026-06-24 — #2403 fix: route-map next-hop emitted v4-only `set ip next-hop` for IPv6
+
+- **Timestamp**: 2026-06-24
+- **Action**: `generatePolicyOptions` rendered `then next-hop <addr>` as an
+  unconditional `set ip next-hop <addr>` for any literal, including IPv6. FRR
+  rejects `set ip next-hop 2001:db8::1` with a syntax error that fails the
+  whole route-map parse and can brick a reload. Made the next-hop AF-aware,
+  mirroring the prefix-list path's `strings.Contains(addr, ":")` probe:
+  v6 literal → `set ipv6 next-hop global <ip>`; v4 literal → `set ip next-hop
+  <ip>`; `peer-address` → BOTH `set ip next-hop peer-address` and `set ipv6
+  next-hop peer-address` (session AF unknown at render time; FRR applies each
+  per family); `self` unchanged (emits nothing).
+- **File(s)**: pkg/frr/policy_render.go (AF-aware next-hop branch),
+  pkg/frr/frr_test.go (TestNextHopAddressFamily + extend TestNextHopPeerAddress
+  for the v6 line), pkg/frr/README.md (document next-hop AF rendering), _Log.md.
+- **Validation**: go build ./pkg/frr/... OK; go test ./pkg/frr/... PASS; gofmt
+  clean. Fail-on-revert PROVEN: reverting policy_render.go to the old
+  unconditional `set ip next-hop` makes TestNextHopAddressFamily fail (v6
+  rendered as `set ip next-hop 2001:db8::1`) and TestNextHopPeerAddress fail
+  (missing `set ipv6 next-hop peer-address`).
+
 ## 2026-06-24 — #2489 fix: VRF BGP neighbor BFD peer block omitted `vrf <name>`
 
 - **Timestamp**: 2026-06-24 PDT
