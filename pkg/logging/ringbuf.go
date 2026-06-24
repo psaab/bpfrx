@@ -852,6 +852,20 @@ func formatSyslogMsg(rec EventRecord) string {
 			rec.Type, rec.SrcAddr, rec.DstAddr, rec.Protocol,
 			rec.PolicyID, inZone, outZone, rec.SessionPkts, rec.SessionBytes)
 	}
+	if rec.Type == "SESSION_OPEN" {
+		// A session open (RT_FLOW_SESSION_CREATE) is a permit-and-create
+		// event, not a forwarding decision, so it carries no permit/deny/
+		// reject action (the wire action byte is intentionally 0 for creates;
+		// see userspace-dp encode_session_create_rt_flow). Rendering the 0
+		// byte via actionName would print action=deny and mislead incident
+		// response into reading a successful permit-and-open as a drop (#2593,
+		// the SESSION_CREATE sibling of #2513). Omit action entirely — like
+		// the structured RT_FLOW_SESSION_CREATE line, which never carried one.
+		// The standard line keeps the proto/policy/zone fields operators read.
+		return fmt.Sprintf("RT_FLOW %s src=%s dst=%s proto=%s policy=%d zone=%s->%s",
+			rec.Type, rec.SrcAddr, rec.DstAddr, rec.Protocol,
+			rec.PolicyID, inZone, outZone)
+	}
 	if rec.Type == "FILTER_LOG" {
 		source := rec.Reason
 		if source == "" {

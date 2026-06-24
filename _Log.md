@@ -1,5 +1,35 @@
 # Action Log
 
+## 2026-06-24 — #2593 fix: SESSION_OPEN standard RT_FLOW line rendered `action=deny`
+
+- **Timestamp**: 2026-06-24
+- **Action**: SESSION_CREATE sibling of #2513 (PR #2591) on the adjacent
+  event. A session open is a permit-and-create event, not a forwarding
+  decision, so userspace-dp writes the wire action byte as 0 for a create
+  (identical to the close path). Byte 0 maps to "deny" via `actionName`, so
+  the standard (plain) `formatSyslogMsg` default branch rendered
+  `RT_FLOW SESSION_OPEN ... action=deny` — misleading operators into reading
+  a successful permit-and-open as a drop. Added a standard-formatter branch
+  keyed on `Type == "SESSION_OPEN"` (what `eventTypeName(eventTypeSessionOpen)`
+  returns) that omits the `action=` field, mirroring the #2513 SESSION_CLOSE
+  branch and the structured RT_FLOW_SESSION_CREATE line (which never carried
+  an action). The branch is event-type-scoped, so POLICY_DENY / SCREEN_DROP /
+  FILTER_LOG (the genuine deny/reject paths) still render `action`. Wire
+  encoding and the `actionName` mapping are unchanged; only the create
+  wire-byte comment in codec.rs was corrected to record that both create
+  formatters omit action.
+- **File(s)**: pkg/logging/ringbuf.go (omit action= for the SESSION_OPEN
+  standard branch), pkg/logging/session_create_format_test.go (golden tests,
+  new), userspace-dp/src/event_stream/codec.rs (comment only — the create
+  wire-byte note now records the renderers omit action),
+  pkg/logging/README.md (SESSION_OPEN line-format gotcha), _Log.md.
+- **Validation**: `go test ./pkg/logging/...` PASS; gofmt clean. Rust:
+  `cargo test --release --bin xpf-userspace-dp event_stream::codec` 17/17 PASS
+  (comment-only). Fail-on-revert PROVEN: stripping the SESSION_OPEN branch
+  from `formatSyslogMsg` makes TestStandardSessionOpenOmitsAction red (line
+  shows `action=deny` again). TestStandardSessionOpenNonDenyKeyedOnType
+  confirms the change is event-type-scoped, not action==0 global.
+
 ## 2026-06-24 — #2513 fix: SESSION_CLOSE standard RT_FLOW line rendered `action=deny`
 
 - **Timestamp**: 2026-06-24

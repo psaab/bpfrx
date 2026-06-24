@@ -595,6 +595,13 @@ impl EventFrame {
         // [55] address family.
         buf[base + 52] = RT_FLOW_EVENT_SESSION_OPEN;
         buf[base + 53] = protocol;
+        // [54] action: a session open is a permit-and-create event, not a
+        // forwarding decision, so this byte is intentionally 0 (same as the
+        // close path). The Go decoder maps it into EventRecord.Action, but as
+        // of #2593 the syslog/event renderers omit action for SESSION_OPEN
+        // entirely (the standard line dropped its `action=` field; the
+        // structured RT_FLOW_SESSION_CREATE line never carried one). Do NOT
+        // rely on the 0 rendering as a value — both create formatters skip it.
         buf[base + 54] = 0;
         buf[base + 55] = wire_af;
         // [72:88] nat src ip, [88:104] nat dst ip.
