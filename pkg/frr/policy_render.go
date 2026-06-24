@@ -851,6 +851,186 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 	return b.String()
 }
 
+// renderRouteFilterEntry writes the single FRR `ip|ipv6 prefix-list`
+// entry line for one route-filter into list plName at seq slot
+// (idx+1)*5, applying the per-match-type ge/le derivation. It returns
+// emitted=true when a line was written, emitted=false when the entry was
+// skipped (a max-length `longer` empty set, a malformed prefix, an
+// out-of-range `prefix-length-range`, or an unhandled match-type) — see
+// the per-arm comments for the FRR-validity / fail-closed reasoning
+// (#2072/#2103/#2105/#2525). Family selection (the namespace `ip` vs
+// `ipv6`) is intrinsic to the prefix, so a single mixed-family
+// route-filter slice can be rendered correctly by calling this per entry.
+func renderRouteFilterEntry(b *strings.Builder, plName string, idx int, rf *config.RouteFilter) (emitted bool) {
+	isV6 := strings.Contains(rf.Prefix, ":")
+	matchStr := "le 32"
+	if isV6 {
+		matchStr = "le 128"
+	}
+	// skipEntry suppresses this route-filter's prefix-list line entirely
+	// (match-nothing for this entry) rather than emitting an FRR-invalid
+	// line. Set by the #2103 max-length "longer" guard and the #2105
+	// malformed-prefix belt below.
+	skipEntry := false
+	// #2105 render-side belt-and-suspenders: a malformed prefix must
+	// NEVER reach an FRR line. The commit-time keyValidator
+	// (ValidateRouteFilterArg) rejects these on the strict path, but the
+	// lenient-on-load path (Store.Load / SyncApply, #1960) can still feed
+	// a stored pre-gate garbage prefix to the renderer. Use the SAME
+	// net.ParseCIDR check as the commit validator so the belt's coverage
+	// matches it exactly.
+	if _, _, err := net.ParseCIDR(rf.Prefix); err != nil {
+		skipEntry = true
+	}
+	switch rf.MatchType {
+	case "exact":
+		matchStr = ""
+	case "longer":
+		// longer = strictly more specific (the prefix itself EXCLUDED).
+		// For a max-length prefix (/32 v4, /128 v6) there are no
+		// more-specifics, so "longer" is the EMPTY set — skip the entry
+		// rather than emit an FRR-invalid "ge plen+1 le maxLen" line
+		// (e.g. "ge 33 le 32"). Mirrors the upto plen>=maxLen guard
+		// (#2102) and closes #2103. Boundary: plen+1 > maxLen skips ONLY
+		// plen==maxLen — /31 still emits "ge 32 le 32".
+		parts := strings.SplitN(rf.Prefix, "/", 2)
+		if len(parts) == 2 {
+			if plen, err := strconv.Atoi(parts[1]); err == nil {
+				maxLen := 32
+				if isV6 {
+					maxLen = 128
+				}
+				if plen+1 > maxLen {
+					skipEntry = true
+				} else {
+					matchStr = fmt.Sprintf("ge %d le %d", plen+1, maxLen)
+				}
+			}
+		}
+	case "orlonger":
+		// orlonger = this prefix or any more specific (default le 32/128)
+	case "prefix-length-range":
+		// prefix-length-range /low-/high = match any route whose prefix
+		// length is in [low, high] and that falls under the base prefix.
+		// FRR expresses a bounded length range directly as "ge low le
+		// high" (#2525). validateRouteFilterMatchTypesStrict has already
+		// rejected an inverted / out-of-range / at-or-below-base range on
+		// the commit path; this arm is the lenient-path belt: it emits
+		// "ge low le high" ONLY when the bounds are present and FRR-valid,
+		// else skips (match-nothing, fail-closed) rather than fall through
+		// to the open-ended "le maxLen" default (the #2525 bug). FRR
+		// requires "len < ge-value", so RangeLow must be > baseLen.
+		maxLen := 32
+		if isV6 {
+			maxLen = 128
+		}
+		baseLen := 0
+		if _, ipnet, err := net.ParseCIDR(rf.Prefix); err == nil {
+			baseLen, _ = ipnet.Mask.Size()
+		}
+		if rf.RangeLow > baseLen && rf.RangeLow <= rf.RangeHigh && rf.RangeHigh <= maxLen {
+			matchStr = fmt.Sprintf("ge %d le %d", rf.RangeLow, rf.RangeHigh)
+		} else {
+			skipEntry = true
+		}
+	case "through":
+		// through <prefix2> has no lossless FRR equivalent: Junos
+		// "through" matches a two-prefix radix-tree containment path, not
+		// a length range. validateRouteFilterMatchTypesStrict rejects it
+		// at commit; only the tolerant load/peer-sync path can reach the
+		// renderer with it. Skip (match-nothing, fail-closed) rather than
+		// emit a wrong / open-ended line (#2525).
+		skipEntry = true
+	default:
+		// Any match-type admitted by the schema but not handled above (a
+		// future keyword, or a value that slipped past validation on a
+		// tolerant path) MUST NOT fall through to the pre-switch
+		// open-ended "le maxLen" default — that silently degrades a
+		// constrained match to an orlonger-style permit (#2525). Skip the
+		// entry instead: match-nothing is fail-closed.
+		skipEntry = true
+	case "upto":
+		// upto /N = this prefix or any more specific, but no longer than
+		// /N. FRR renders this as a bare "le N". FRR requires len <
+		// le-value, so this arm computes matchStr from scratch and never
+		// keeps an invalid value — including the inherited default le
+		// 32/128, which is itself invalid when plen == maxLen (#2102, the
+		// /32 upto /31 case). See the original generatePolicyOptions
+		// comment block for the full rule table (#2072).
+		parts := strings.SplitN(rf.Prefix, "/", 2)
+		if len(parts) == 2 {
+			if plen, err := strconv.Atoi(parts[1]); err == nil {
+				maxLen := 32
+				if strings.Contains(rf.Prefix, ":") {
+					maxLen = 128
+				}
+				switch {
+				case rf.UptoLen <= 0:
+					if plen >= maxLen {
+						matchStr = ""
+					} else {
+						matchStr = fmt.Sprintf("le %d", maxLen)
+					}
+				case plen >= maxLen:
+					matchStr = ""
+				case rf.UptoLen == plen:
+					matchStr = ""
+				case rf.UptoLen > plen && rf.UptoLen <= maxLen:
+					matchStr = fmt.Sprintf("le %d", rf.UptoLen)
+				default:
+					matchStr = fmt.Sprintf("le %d", maxLen)
+				}
+			}
+		}
+	}
+	if skipEntry {
+		// #2103/#2105: emit no prefix-list line for this entry. Its seq
+		// slot (idx+1)*5 is simply not used; gaps in seq are FRR-legal.
+		return false
+	}
+	if isV6 {
+		fmt.Fprintf(b, "ipv6 prefix-list %s seq %d permit %s", plName, (idx+1)*5, rf.Prefix)
+	} else {
+		fmt.Fprintf(b, "ip prefix-list %s seq %d permit %s", plName, (idx+1)*5, rf.Prefix)
+	}
+	if matchStr != "" {
+		fmt.Fprintf(b, " %s", matchStr)
+	}
+	b.WriteString("\n")
+	return true
+}
+
+// indexedRouteFilter carries a route-filter together with its ORIGINAL
+// index in the term's route-filter slice so the FRR prefix-list entry
+// seq slot ((idx+1)*5) stays stable when the slice is partitioned by
+// family. Holding the original index keeps a split mixed-family term's
+// per-family entries at the same seq numbers they would have had in the
+// single combined list (gaps where the other family's entries sit are
+// FRR-legal).
+type indexedRouteFilter struct {
+	idx int
+	rf  *config.RouteFilter
+}
+
+// partitionRouteFiltersByFamily splits a term's route-filters into IPv4
+// and IPv6 buckets by the prefix's family (`:` → v6), preserving each
+// entry's original index. A route-filter whose prefix is malformed
+// (fails net.ParseCIDR) is classified by the same `strings.Contains(":")`
+// heuristic the renderer already uses for the family decision — it will
+// be skipped at entry-render time anyway, so its bucket only affects
+// which (possibly empty) sequence references an undefined list,
+// preserving the existing fail-closed behavior.
+func partitionRouteFiltersByFamily(rfs []*config.RouteFilter) (v4, v6 []indexedRouteFilter) {
+	for i, rf := range rfs {
+		if strings.Contains(rf.Prefix, ":") {
+			v6 = append(v6, indexedRouteFilter{i, rf})
+		} else {
+			v4 = append(v4, indexedRouteFilter{i, rf})
+		}
+	}
+	return v4, v6
+}
+
 // generatePolicyOptions emits FRR prefix-list / route-map / community-list /
 // as-path-access-list config from the typed Junos policy-options.
 func (m *Manager) generatePolicyOptions(po *config.PolicyOptionsConfig) string {
@@ -920,7 +1100,6 @@ func (m *Manager) generatePolicyOptions(po *config.PolicyOptionsConfig) string {
 			if term.Action == "reject" {
 				action = "deny"
 			}
-			fmt.Fprintf(&b, "route-map %s %s %d\n", name, action, seq)
 
 			// Junos evaluates a policy's terms sequentially and a term that
 			// carries NO terminating action (no `then accept`/`then reject`,
@@ -950,393 +1129,227 @@ func (m *Manager) generatePolicyOptions(po *config.PolicyOptionsConfig) string {
 			// loop), preserving the overall default behavior.
 			nonTerminating := term.Action != "accept" && term.Action != "reject"
 
-			// Generate an inline prefix-list for route-filters
-			if len(term.RouteFilters) > 0 {
-				plName := name + "-" + term.Name
-				// matchV6 selects the address family of the post-loop
-				// "match ip/ipv6 address prefix-list" line. It is taken
-				// from the first EMITTED entry when there is one, else from
-				// the first route-filter with a parseable family (a
-				// #2103-skipped /32 longer still names a real family), else
-				// defaults to v4 — mirroring the term.PrefixList branch's
-				// "unknown/empty defaults to IPv4". The match line is
-				// ALWAYS emitted (see below).
-				matchV6 := false
-				matchFamilyKnown := false
-				// emitted counts the prefix-list entries actually written.
-				// A #2103-skipped (/32 longer, empty set) or #2105-malformed
-				// entry writes NO "ip prefix-list" line, so the list may end
-				// up with zero entries — and we intentionally never
-				// materialise a count==0 list (FRR treats a count==0
-				// prefix-list as PREFIX_PERMIT / match-ALL). The match line
-				// still references the (then-undefined) list name: in FRR a
-				// "match … prefix-list <name>" against a name with no
-				// "ip prefix-list <name>" lines resolves to NULL →
-				// RMAP_NOMATCH (DENY), so an all-skipped term matches
-				// NOTHING and stays fail-closed. Suppressing the match line
-				// instead would leave a bare "route-map … permit <seq>" with
-				// no match clauses, which FRR treats as match-ALL — flipping
-				// "/32 longer" from the empty set to permit-everything
-				// (Copilot #2110). This mirrors the existing
-				// term.PrefixList branch, which also emits a match line for
-				// an unknown/empty list.
-				emitted := 0
-				for i, rf := range term.RouteFilters {
-					isV6 := strings.Contains(rf.Prefix, ":")
-					matchStr := "le 32"
-					if isV6 {
-						matchStr = "le 128"
-					}
-					// skipEntry suppresses this route-filter's prefix-list
-					// line entirely (match-nothing for this entry) rather
-					// than emitting an FRR-invalid line. Set by the #2103
-					// max-length "longer" guard and the #2105 malformed-
-					// prefix belt below.
-					skipEntry := false
-					// #2105 render-side belt-and-suspenders: a malformed
-					// prefix must NEVER reach an FRR line. The commit-time
-					// keyValidator (ValidateRouteFilterArg) rejects these on
-					// the strict path, but the lenient-on-load path
-					// (Store.Load / SyncApply, #1960) can still feed a stored
-					// pre-gate garbage prefix to the renderer. Use the SAME
-					// net.ParseCIDR check as the commit validator so the
-					// belt's coverage matches it exactly: this catches a bad
-					// address (999.999.999.999/24, foo:bar/24), a missing
-					// "/", a non-numeric mask, AND an out-of-family-range mask
-					// (a v4 /40 or /99, a v6 /200) — none of which a bare
-					// mask-only Atoi would catch. A valid CIDR (any v4/v6
-					// prefix the operator could legitimately configure) is
-					// never skipped.
-					if _, _, err := net.ParseCIDR(rf.Prefix); err != nil {
-						skipEntry = true
-					} else if !matchFamilyKnown {
-						// First route-filter with a PARSEABLE prefix sets the
-						// match-line family — even if this entry is later
-						// skipped for being a max-length "longer" (a /32 longer
-						// names a real v4 family). An emitted entry overrides
-						// this below, but for an all-skipped term this is the
-						// best family signal we have. Stays v4 (the default)
-						// only when no entry is parseable.
-						matchV6 = isV6
-						matchFamilyKnown = true
-					}
-					switch rf.MatchType {
-					case "exact":
-						matchStr = ""
-					case "longer":
-						// longer = strictly more specific (the prefix itself
-						// EXCLUDED). For a max-length prefix (/32 v4, /128
-						// v6) there are no more-specifics, so "longer" is the
-						// EMPTY set — skip the entry rather than emit an
-						// FRR-invalid "ge plen+1 le maxLen" line. For /32
-						// that is "ge 33 le 32": ge 33 fails the FRR YANG
-						// range (0..32) AND ge > le, and a rejected line can
-						// fail the whole frr-reload (frr-reload.py applies
-						// the add-batch via a single vtysh -f and exits
-						// non-zero on any CMD_WARNING_CONFIG_FAILED). Mirrors
-						// the upto plen>=maxLen guard (#2102) and closes
-						// #2103. Boundary: plen+1 > maxLen skips ONLY
-						// plen==maxLen — /31 still emits "ge 32 le 32" (one
-						// legal more-specific).
-						parts := strings.SplitN(rf.Prefix, "/", 2)
-						if len(parts) == 2 {
-							if plen, err := strconv.Atoi(parts[1]); err == nil {
-								maxLen := 32
-								if isV6 {
-									maxLen = 128
-								}
-								if plen+1 > maxLen {
-									skipEntry = true
-								} else {
-									matchStr = fmt.Sprintf("ge %d le %d", plen+1, maxLen)
-								}
+			// emitTermBody renders one route-map SEQUENCE for this term: the
+			// header, this term's family-specific route-filter match line, the
+			// family-agnostic match clauses (source-protocol/community/as-path),
+			// the optional `from prefix-list` clause, the `set`/then actions,
+			// and `on-match next`/`exit`. seqFam scopes which family-specific
+			// clauses are emitted:
+			//   - ""   single (unsplit) sequence — the term has homogeneous or
+			//          no route-filters; ALL clauses emit (byte-identical to the
+			//          pre-#2607 render).
+			//   - "v4" / "v6" one half of a SPLIT mixed-family route-filter
+			//          term — only that family's route-filter entries + match
+			//          line are emitted, and `from prefix-list` is emitted only
+			//          when the referenced list's family matches seqFam.
+			//
+			// Why split rather than emit both `match ip` and `match ipv6` in
+			// ONE sequence: FRR ANDs match clauses of DIFFERENT types within a
+			// single route-map index (lib/routemap.c route_map_apply_match
+			// invokes EVERY match rule with no AF pre-filter; `match ip
+			// address` and `match ipv6 address` are different rule types). A
+			// route is exclusively v4 or v6, so a v4 route NOMATCHes the ipv6
+			// clause and a v6 route NOMATCHes the ip clause → MATCH + NOMATCH =
+			// NOMATCH AND's the index to a silent deny for BOTH families. Two
+			// SEPARATE sequences (one per family, each carrying the full term
+			// body) is the only structure where each family's routes hit a
+			// sequence they can satisfy (#2607; the same AND finding that
+			// drove #2071's single-matcher decision).
+			emitTermBody := func(seqFam string, seqNum int, rfs []indexedRouteFilter, plName string) {
+				fmt.Fprintf(&b, "route-map %s %s %d\n", name, action, seqNum)
+
+				// Inline prefix-list for this sequence's route-filters.
+				if len(term.RouteFilters) > 0 {
+					// matchV6 selects the address family of the
+					// "match ip/ipv6 address prefix-list" line. For a split
+					// sequence the family is fixed by seqFam. For a single
+					// sequence it is taken from the first EMITTED entry, else
+					// the first parseable route-filter (a #2103-skipped /32
+					// longer still names a real family), else v4 — mirroring
+					// the term.PrefixList branch's "unknown/empty defaults to
+					// IPv4". The match line is ALWAYS emitted (fail-closed
+					// against an undefined list, see below).
+					matchV6 := seqFam == "v6"
+					matchFamilyKnown := seqFam != ""
+					// emitted counts the prefix-list entries actually written.
+					// A #2103-skipped (/32 longer, empty set) or #2105-malformed
+					// entry writes NO "ip prefix-list" line, so the list may end
+					// up with zero entries — and we intentionally never
+					// materialise a count==0 list (FRR treats a count==0
+					// prefix-list as PREFIX_PERMIT / match-ALL). The match line
+					// still references the (then-undefined) list name: FRR
+					// resolves an undefined prefix-list to NULL → RMAP_NOMATCH
+					// (DENY), so an all-skipped term matches NOTHING and stays
+					// fail-closed. Suppressing the match line would leave a bare
+					// "route-map … permit <seq>" with no match clauses, which
+					// FRR treats as match-ALL — flipping "/32 longer" from the
+					// empty set to permit-everything (Copilot #2110).
+					emitted := 0
+					for _, irf := range rfs {
+						// Family hint for the single-sequence case: the first
+						// PARSEABLE route-filter sets it (even if later skipped),
+						// the first EMITTED entry overrides. For a split sequence
+						// seqFam already fixed it.
+						if seqFam == "" && !matchFamilyKnown {
+							if _, _, err := net.ParseCIDR(irf.rf.Prefix); err == nil {
+								matchV6 = strings.Contains(irf.rf.Prefix, ":")
+								matchFamilyKnown = true
 							}
 						}
-					case "orlonger":
-						// orlonger = this prefix or any more specific (default le 32/128)
-					case "prefix-length-range":
-						// prefix-length-range /low-/high = match any route
-						// whose prefix length is in [low, high] and that falls
-						// under the base prefix. FRR expresses a bounded length
-						// range directly as "ge low le high" (#2525). The
-						// compiler stores the parsed bounds in RangeLow/RangeHigh
-						// (0 when the "/lo-/hi" token was malformed) and
-						// validateRouteFilterMatchTypesStrict has already
-						// rejected an inverted / out-of-range / at-or-below-base
-						// range on the commit path. The lenient load/peer-sync
-						// path (where that strict reject is downgraded to a
-						// warning per #1960) can still feed a stored bad range
-						// here, so this arm is belt-and-suspenders: it emits
-						// "ge low le high" ONLY when the bounds are present and
-						// FRR-valid, else it skips the entry (match-nothing,
-						// fail-closed) rather than fall through to the open-ended
-						// "le maxLen" default — which would silently widen the
-						// operator's bounded constraint to an orlonger-style
-						// permit (the #2525 bug).
-						//
-						// FRR requires the `ge` value to be STRICTLY greater than
-						// the prefix length ("len < ge-value"); a `ge <= base`
-						// line is rejected and a rejected line can fail the whole
-						// frr-reload (#1880-class). So the guard re-derives the
-						// base prefix length and requires RangeLow > baseLen,
-						// mirroring the `longer` (plen+1) / `upto` guards. The
-						// prefix already passed net.ParseCIDR above (the
-						// skipEntry malformed-prefix belt), so it parses here.
-						maxLen := 32
-						if isV6 {
-							maxLen = 128
-						}
-						baseLen := 0
-						if _, ipnet, err := net.ParseCIDR(rf.Prefix); err == nil {
-							baseLen, _ = ipnet.Mask.Size()
-						}
-						if rf.RangeLow > baseLen && rf.RangeLow <= rf.RangeHigh && rf.RangeHigh <= maxLen {
-							matchStr = fmt.Sprintf("ge %d le %d", rf.RangeLow, rf.RangeHigh)
-						} else {
-							skipEntry = true
-						}
-					case "through":
-						// through <prefix2> has no lossless FRR equivalent:
-						// Junos "through" matches the base prefix, prefix2, and
-						// only the prefixes on the direct radix-tree path
-						// between them — NOT every prefix of intermediate
-						// length. FRR prefix-lists can only express length
-						// ranges (ge/le), so any rendering would change the
-						// match set. validateRouteFilterMatchTypesStrict rejects
-						// "through" at commit; only the tolerant load/peer-sync
-						// path can reach the renderer with it. Skip the entry
-						// (match-nothing, fail-closed) rather than silently
-						// emit a wrong / open-ended line (#2525).
-						skipEntry = true
-					default:
-						// Any match-type that is admitted by the schema but not
-						// handled above (a future keyword, or a value that
-						// slipped past validation on a tolerant path) MUST NOT
-						// fall through to the pre-switch open-ended "le maxLen"
-						// default — that silently degrades a constrained match
-						// to an orlonger-style permit (the #2525 fall-through
-						// bug). Skip the entry instead: match-nothing is
-						// fail-closed and the ALWAYS-emitted match line then
-						// resolves to RMAP_NOMATCH (DENY).
-						skipEntry = true
-					case "upto":
-						// upto /N = this prefix or any more specific, but no
-						// longer than /N. FRR renders this as a bare "le N":
-						// the implicit lower bound of a le clause is the
-						// prefix's own mask length, so "le N" matches the
-						// prefix itself plus every more-specific down to /N.
-						// This mirrors the orlonger case (bare "le max"), just
-						// capped at N.
-						//
-						// FRR requires len < le-value (and len < ge-value); a
-						// le/ge value <= the prefix length is REJECTED by FRR's
-						// prefix-list validator ("make sure: len < ge-value <=
-						// le-value") and an invalid line can fail the whole
-						// frr-reload. This arm therefore computes matchStr from
-						// scratch and is careful NEVER to keep an invalid value
-						// — including the inherited default le 32/128, which is
-						// itself invalid when plen == maxLen (Codex #2102 MAJOR
-						// #1, the /32 upto /31 case). The rules:
-						//   - plen >= maxLen  -> exact ("" ): a max-length host
-						//     prefix has no more-specifics, so upto anything ==
-						//     just the prefix itself. (Also dodges the invalid
-						//     "le maxLen" default.)
-						//   - UptoLen == plen -> exact ("" ): only the prefix.
-						//   - plen < UptoLen <= maxLen -> "le N" (normal case).
-						//   - else (UptoLen unset/0, < plen, or > maxLen) ->
-						//     degrade to "le maxLen" (valid here because plen <
-						//     maxLen), the orlonger-equivalent superset. Never
-						//     an invalid line. (#2072)
-						parts := strings.SplitN(rf.Prefix, "/", 2)
-						if len(parts) == 2 {
-							if plen, err := strconv.Atoi(parts[1]); err == nil {
-								maxLen := 32
-								if strings.Contains(rf.Prefix, ":") {
-									maxLen = 128
-								}
-								switch {
-								case rf.UptoLen <= 0:
-									// Unset / unparseable length (0 means unset:
-									// parseRouteFilterLen rejects "/0"). Degrade
-									// to the orlonger-equivalent superset. This
-									// MUST precede the ==plen and plen>=maxLen
-									// arms so a /0 PREFIX with an unset length is
-									// not mis-rendered as exact via the
-									// 0==plen coincidence (Codex #2102 MAJOR #2).
-									if plen >= maxLen {
-										matchStr = "" // no more-specifics possible
-									} else {
-										matchStr = fmt.Sprintf("le %d", maxLen)
-									}
-								case plen >= maxLen:
-									// Max-length host prefix: no more-specifics
-									// exist, so upto anything == the prefix
-									// itself. Exact also dodges the invalid
-									// "le maxLen" (le == plen) line (Codex #2102
-									// MAJOR #1, the /32 upto /31 case).
-									matchStr = ""
-								case rf.UptoLen == plen:
-									matchStr = "" // only the prefix itself
-								case rf.UptoLen > plen && rf.UptoLen <= maxLen:
-									matchStr = fmt.Sprintf("le %d", rf.UptoLen)
-								default:
-									// UptoLen < plen (nonzero) or > maxLen.
-									// Degrade. plen < maxLen here, so "le
-									// maxLen" is FRR-valid. Set it explicitly
-									// rather than relying on the pre-switch
-									// default.
-									matchStr = fmt.Sprintf("le %d", maxLen)
-								}
+						if renderRouteFilterEntry(&b, plName, irf.idx, irf.rf) {
+							if emitted == 0 && seqFam == "" {
+								matchV6 = strings.Contains(irf.rf.Prefix, ":")
+								matchFamilyKnown = true
 							}
+							emitted++
 						}
 					}
-					if skipEntry {
-						// #2103/#2105: emit no prefix-list line for this
-						// entry. Its seq slot (i+1)*5 is simply not used;
-						// gaps in seq are FRR-legal and keep the remaining
-						// entries' seq stable across a config edit.
-						continue
-					}
-					if isV6 {
-						fmt.Fprintf(&b, "ipv6 prefix-list %s seq %d permit %s", plName, (i+1)*5, rf.Prefix)
+					if matchV6 {
+						fmt.Fprintf(&b, " match ipv6 address prefix-list %s\n", plName)
 					} else {
-						fmt.Fprintf(&b, "ip prefix-list %s seq %d permit %s", plName, (i+1)*5, rf.Prefix)
+						fmt.Fprintf(&b, " match ip address prefix-list %s\n", plName)
 					}
-					if matchStr != "" {
-						fmt.Fprintf(&b, " %s", matchStr)
-					}
-					b.WriteString("\n")
-					if emitted == 0 {
-						// The first EMITTED entry is the most authoritative
-						// family signal; override the parseable-skipped hint.
-						matchV6 = isV6
-						matchFamilyKnown = true
-					}
-					emitted++
 				}
-				// ALWAYS emit the match line for a term that declares any
-				// route-filter. When entries were emitted it references the
-				// populated prefix-list. When ALL entries were skipped
-				// (every route-filter is a max-length "longer" empty set, or
-				// every prefix is malformed) the list name is never created,
-				// so this references an UNDEFINED prefix-list → FRR resolves
-				// it to NULL → RMAP_NOMATCH (DENY): the term matches NOTHING
-				// and stays fail-closed. Suppressing the match line here
-				// would leave a bare "route-map … permit <seq>" with no match
-				// clauses, which FRR treats as match-ALL — flipping
-				// "/32 longer" from the empty set to permit-everything
-				// (Copilot #2110). This mirrors the term.PrefixList branch,
-				// which likewise emits a match line for an unknown list.
-				// Family: the first emitted entry, else the first parseable
-				// (possibly skipped) route-filter, else v4 (the
-				// term.PrefixList "unknown/empty defaults to IPv4" default).
-				if matchV6 {
-					fmt.Fprintf(&b, " match ipv6 address prefix-list %s\n", plName)
-				} else {
-					fmt.Fprintf(&b, " match ip address prefix-list %s\n", plName)
-				}
-			}
 
-			if term.PrefixList != "" {
-				// Choose the address-family matcher from the referenced
-				// prefix-list's entries, mirroring the route-filter match
-				// branch above. FRR keeps `ip` and `ipv6`
-				// prefix-lists in independent namespaces; emitting the
-				// IPv4 `match ip address` for an IPv6 list makes the
-				// filter a silent no-op in an IPv6 routing-policy context
-				// (OSPFv3 export, BGP inet6) — issue #2071. Two matchers
-				// must NOT both appear in one route-map index: FRR ANDs
-				// match clauses (MATCH + NOMATCH = NOMATCH), so an
-				// off-family clause against the populated sibling-namespace
-				// list would deny the route. Emit exactly one matcher;
-				// any IPv6 entry selects the IPv6 matcher. A mixed
-				// (v4+v6) list therefore renders the IPv6 matcher — the
-				// same homogeneous-family limitation the route-filter path
-				// already has. Unknown/empty lists default to IPv4,
-				// byte-identical to the pre-fix render.
-				matchKW := "ip"
-				if pl := po.PrefixLists[term.PrefixList]; pl != nil {
-					for _, p := range pl.Prefixes {
-						if strings.Contains(p, ":") {
-							matchKW = "ipv6"
-							break
+				if term.PrefixList != "" {
+					// Choose the address-family matcher from the referenced
+					// prefix-list's entries, mirroring the route-filter match
+					// branch above. FRR keeps `ip` and `ipv6` prefix-lists in
+					// independent namespaces; emitting `match ip address` for an
+					// IPv6 list makes the filter a silent no-op in an IPv6
+					// routing-policy context (#2071). Emit exactly one matcher;
+					// any IPv6 entry selects the IPv6 matcher. A mixed (v4+v6)
+					// list therefore renders the IPv6 matcher — the same
+					// homogeneous-family limitation #2071 documented as a TRADE.
+					// Unknown/empty lists default to IPv4.
+					//
+					// In a SPLIT mixed-route-filter term (seqFam != "") the
+					// prefix-list match is emitted ONLY in the sequence whose
+					// family matches the list, so the off-family sequence does
+					// not pick up a `match ip/ipv6` clause that would AND-NOMATCH
+					// its own family's routes (the #2071 co-resident collision,
+					// avoided by construction here).
+					matchKW := "ip"
+					if pl := po.PrefixLists[term.PrefixList]; pl != nil {
+						for _, p := range pl.Prefixes {
+							if strings.Contains(p, ":") {
+								matchKW = "ipv6"
+								break
+							}
 						}
 					}
+					if seqFam == "" || (seqFam == "v6" && matchKW == "ipv6") || (seqFam == "v4" && matchKW == "ip") {
+						fmt.Fprintf(&b, " match %s address prefix-list %s\n", matchKW, term.PrefixList)
+					}
 				}
-				fmt.Fprintf(&b, " match %s address prefix-list %s\n", matchKW, term.PrefixList)
-			}
 
-			// Junos "from protocol [ bgp ospf static ]" matches ANY listed
-			// protocol. FRR's "match source-protocol" only accepts a single
-			// protocol per line, but repeated lines within one route-map entry
-			// are OR'd, so render one line per protocol.
-			for _, proto := range term.FromProtocols {
-				if proto == "direct" {
-					proto = "connected"
+				// Junos "from protocol [ bgp ospf static ]" matches ANY listed
+				// protocol. FRR's "match source-protocol" only accepts a single
+				// protocol per line, but repeated lines within one route-map entry
+				// are OR'd, so render one line per protocol.
+				for _, proto := range term.FromProtocols {
+					if proto == "direct" {
+						proto = "connected"
+					}
+					fmt.Fprintf(&b, " match source-protocol %s\n", proto)
 				}
-				fmt.Fprintf(&b, " match source-protocol %s\n", proto)
-			}
 
-			if term.FromCommunity != "" {
-				fmt.Fprintf(&b, " match community %s\n", term.FromCommunity)
-			}
-
-			if term.FromASPath != "" {
-				fmt.Fprintf(&b, " match as-path %s\n", term.FromASPath)
-			}
-
-			// then actions
-			if term.NextHop != "" {
-				if term.NextHop == "peer-address" {
-					// Junos "next-hop peer-address" → FRR. The session AF is not
-					// known here, so emit both forms; FRR applies each only to
-					// the matching address family of the carrying BGP session.
-					fmt.Fprintf(&b, " set ip next-hop peer-address\n")
-					fmt.Fprintf(&b, " set ipv6 next-hop peer-address\n")
-				} else if term.NextHop == "self" {
-					// Junos "next-hop self" → no FRR set-clause. eBGP already
-					// rewrites the next-hop to self by default, so FRR needs no
-					// explicit "set" here.
-				} else if strings.Contains(term.NextHop, ":") {
-					// IPv6 literal next-hop. FRR rejects "set ip next-hop" for a
-					// v6 address (whole route-map fails to parse); v6 uses the
-					// dedicated "set ipv6 next-hop global" form. Mirror the
-					// AF detection used by the prefix-list renderer above.
-					fmt.Fprintf(&b, " set ipv6 next-hop global %s\n", term.NextHop)
-				} else {
-					fmt.Fprintf(&b, " set ip next-hop %s\n", term.NextHop)
+				if term.FromCommunity != "" {
+					fmt.Fprintf(&b, " match community %s\n", term.FromCommunity)
 				}
+
+				if term.FromASPath != "" {
+					fmt.Fprintf(&b, " match as-path %s\n", term.FromASPath)
+				}
+
+				// then actions
+				if term.NextHop != "" {
+					if term.NextHop == "peer-address" {
+						// Junos "next-hop peer-address" → FRR. The session AF is not
+						// known here, so emit both forms; FRR applies each only to
+						// the matching address family of the carrying BGP session.
+						fmt.Fprintf(&b, " set ip next-hop peer-address\n")
+						fmt.Fprintf(&b, " set ipv6 next-hop peer-address\n")
+					} else if term.NextHop == "self" {
+						// Junos "next-hop self" → no FRR set-clause. eBGP already
+						// rewrites the next-hop to self by default, so FRR needs no
+						// explicit "set" here.
+					} else if strings.Contains(term.NextHop, ":") {
+						// IPv6 literal next-hop. FRR rejects "set ip next-hop" for a
+						// v6 address (whole route-map fails to parse); v6 uses the
+						// dedicated "set ipv6 next-hop global" form. Mirror the
+						// AF detection used by the prefix-list renderer above.
+						fmt.Fprintf(&b, " set ipv6 next-hop global %s\n", term.NextHop)
+					} else {
+						fmt.Fprintf(&b, " set ip next-hop %s\n", term.NextHop)
+					}
+				}
+
+				if term.LoadBalance != "" {
+					// FRR handles ECMP load balancing via forwarding-table export
+					// The route-map just needs to be a permit
+				}
+
+				if term.LocalPreference > 0 {
+					fmt.Fprintf(&b, " set local-preference %d\n", term.LocalPreference)
+				}
+				if term.Metric > 0 {
+					fmt.Fprintf(&b, " set metric %d\n", term.Metric)
+				}
+				if term.MetricType == 1 || term.MetricType == 2 {
+					fmt.Fprintf(&b, " set metric-type type-%d\n", term.MetricType)
+				}
+				if term.Community != "" {
+					fmt.Fprintf(&b, " set community %s\n", term.Community)
+				}
+				if term.Origin != "" {
+					fmt.Fprintf(&b, " set origin %s\n", term.Origin)
+				}
+
+				// Non-terminating term: fall through to the next sequence after
+				// running this term's set clauses (Junos fall-through; #2451).
+				// In a SPLIT term BOTH per-family sequences carry on-match next
+				// for a non-terminating term — each is its own permit sequence
+				// and must continue to later terms. A terminating term gets none
+				// in either half (the v4-route case stops at the v4 sequence; the
+				// v6-route case stops at the v6 sequence).
+				if nonTerminating {
+					b.WriteString(" on-match next\n")
+				}
+
+				b.WriteString("exit\n")
 			}
 
-			if term.LoadBalance != "" {
-				// FRR handles ECMP load balancing via forwarding-table export
-				// The route-map just needs to be a permit
+			// Decide single vs split. A term splits ONLY when its route-filters
+			// genuinely mix families (at least one v4 AND one v6 prefix). A
+			// homogeneous or empty route-filter set renders as today — ONE
+			// sequence, ONE plName, byte-identical output (no churn for the
+			// common case).
+			plName := name + "-" + term.Name
+			v4rf, v6rf := partitionRouteFiltersByFamily(term.RouteFilters)
+			if len(term.RouteFilters) > 0 && len(v4rf) > 0 && len(v6rf) > 0 {
+				// Mixed-family term: two sequences. Each carries its own
+				// family's route-filter entries into a per-family prefix-list
+				// (plName_v4 / plName_v6 — FRR `ip` vs `ipv6` prefix-lists are
+				// separate namespaces anyway, but the distinct NAME keeps the
+				// two match lines referencing disjoint, single-family lists so
+				// neither can pick up an off-family entry). v4 sequence first
+				// (lower seq), then v6; each gets its own +10 seq slot.
+				emitTermBody("v4", seq, v4rf, plName+"_v4")
+				seq += 10
+				emitTermBody("v6", seq, v6rf, plName+"_v6")
+				seq += 10
+			} else {
+				// Single sequence — homogeneous or no route-filters. Pass the
+				// full (possibly empty) indexed route-filter set and the
+				// historical plName so the output is byte-identical to master.
+				all := make([]indexedRouteFilter, len(term.RouteFilters))
+				for i, rf := range term.RouteFilters {
+					all[i] = indexedRouteFilter{i, rf}
+				}
+				emitTermBody("", seq, all, plName)
+				seq += 10
 			}
-
-			if term.LocalPreference > 0 {
-				fmt.Fprintf(&b, " set local-preference %d\n", term.LocalPreference)
-			}
-			if term.Metric > 0 {
-				fmt.Fprintf(&b, " set metric %d\n", term.Metric)
-			}
-			if term.MetricType == 1 || term.MetricType == 2 {
-				fmt.Fprintf(&b, " set metric-type type-%d\n", term.MetricType)
-			}
-			if term.Community != "" {
-				fmt.Fprintf(&b, " set community %s\n", term.Community)
-			}
-			if term.Origin != "" {
-				fmt.Fprintf(&b, " set origin %s\n", term.Origin)
-			}
-
-			// Non-terminating term: fall through to the next sequence after
-			// running this term's set clauses (Junos fall-through; #2451).
-			if nonTerminating {
-				b.WriteString(" on-match next\n")
-			}
-
-			b.WriteString("exit\n")
-			seq += 10
 		}
 
 		// Default action
