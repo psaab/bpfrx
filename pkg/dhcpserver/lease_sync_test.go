@@ -791,3 +791,44 @@ func TestResolveKeaOwner_CachedOnce(t *testing.T) {
 		t.Errorf("user lookup ran %d times, want 1 (cached)", lookups)
 	}
 }
+
+// TestSplitV6Identity verifies the IAID parse contract from #2379: a present
+// but unparseable IAID now surfaces an error (so the takeover-seed loop can
+// log+skip the lease) instead of silently swallowing to iaid=0, while a
+// legitimate decimal IAID parses and the no-slash form stays a clean iaid=0
+// with no error.
+//
+// fail-on-revert: reverting splitV6Identity to the silent err==nil swallow
+// makes the malformed cases below (which require err != nil) go red.
+func TestSplitV6Identity(t *testing.T) {
+	tests := []struct {
+		name     string
+		identity string
+		wantDUID string
+		wantIAID uint32
+		wantErr  bool
+	}{
+		{"valid", "duid:0011223344556677/42", "0011223344556677", 42, false},
+		{"valid zero iaid", "duid:0011223344556677/0", "0011223344556677", 0, false},
+		{"no slash no iaid", "duid:0011223344556677", "0011223344556677", 0, false},
+		{"no prefix no slash", "0011223344556677", "0011223344556677", 0, false},
+		{"malformed iaid", "duid:0011223344556677/notanumber", "0011223344556677", 0, true},
+		{"empty iaid", "duid:0011223344556677/", "0011223344556677", 0, true},
+		{"oversized iaid", "duid:0011223344556677/4294967296", "0011223344556677", 0, true},
+		{"negative iaid", "duid:0011223344556677/-1", "0011223344556677", 0, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			duid, iaid, err := splitV6Identity(tt.identity)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("splitV6Identity(%q) err=%v, wantErr=%v", tt.identity, err, tt.wantErr)
+			}
+			if duid != tt.wantDUID {
+				t.Errorf("splitV6Identity(%q) duid=%q, want %q", tt.identity, duid, tt.wantDUID)
+			}
+			if iaid != tt.wantIAID {
+				t.Errorf("splitV6Identity(%q) iaid=%d, want %d", tt.identity, iaid, tt.wantIAID)
+			}
+		})
+	}
+}
