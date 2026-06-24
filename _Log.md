@@ -12626,3 +12626,26 @@ top.
   PASS; gofmt clean; go vet ./pkg/config/ clean; fail-on-revert PROVEN
   (removing the validateFilterLossPriorityWarnings call → warning absent →
   TestFilterLossPriorityWarnsInert fails). No Rust code changed (README only).
+
+## 2026-06-24 — #2509 pre-id-default-policy then-log accepted-but-inert warning
+
+- **Timestamp**: 2026-06-24 PDT
+- **Action**: WARN-INERT fix for #2509. Determined (from source) that the
+  userspace dataplane has NO pre-identification session-admit path: the only
+  reader of PreIDDefaultPolicy.LogSessionInit/LogSessionClose was the retired
+  eBPF compiler (pkg/dataplane/compiler.go → FlowConfigValue.AppFlags). Unlike
+  per-policy #2508 (which stamps the admitting policy's log flags onto session
+  metadata at install), there is no session admitted "before app-id resolves"
+  to stamp onto — app-id is best-effort labeling of already-admitted sessions.
+  So WIRE would dead-end in a no-op. Chose WARN-INERT, mirroring #2507 filter
+  loss-priority + the CoS loss-priority warnings: commit succeeds with a
+  WARNING that the action is accepted-but-inert; never a reject (valid Junos).
+- **File(s)**: pkg/config/compiler_validate_warn.go (validatePreIDDefaultPolicyLogWarnings
+  + ValidateConfig wiring), pkg/config/compiler_preid_default_policy_log_2509_test.go
+  (4 tests: warns-inert both-modes, init-only-warns, commit-succeeds-no-fail-close,
+  no-log-no-warning), docs/feature-gaps.md (PARTIAL note + table row).
+- **Validation**: go build ./... OK; go test ./pkg/config/ ./pkg/dataplane/userspace/
+  ./pkg/logging/ PASS; gofmt clean; go vet ./pkg/config/ clean; fail-on-revert
+  PROVEN (removing the validatePreIDDefaultPolicyLogWarnings call → warning
+  absent → TestPreIDDefaultPolicyLogWarnsInert + InitOnlyWarns fail). No Rust
+  changed.

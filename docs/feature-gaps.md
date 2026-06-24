@@ -527,9 +527,31 @@ brick a config that was previously accepted. Wiring an actual per-packet
 loss-priority action onto the egress CoS/drop-profile path is the follow-up;
 until then the action is documented as inert.
 
+**`security pre-id-default-policy then log` is PARTIAL (parse-only, inert-with-warning, #2509).**
+`security pre-id-default-policy then log session-init/session-close` is parsed
+and stored on `config.PreIDDefaultPolicy.LogSessionInit/LogSessionClose` but has
+NO consumer in the userspace dataplane after the eBPF retirement (#1373/#1476).
+The only reader was the retired eBPF compiler (`pkg/dataplane/compiler.go`,
+which mapped the bits to `FlowConfigValue.AppFlags`). Unlike the per-policy
+#2508 path — where the admitting policy's log flags are stamped onto session
+metadata at install and gate RT_FLOW emission — the userspace runtime has no
+pre-identification session-admit path: app-id is best-effort labeling of
+already-admitted sessions, not a "default policy admits the session before
+app-id resolves, then re-evaluate" pipeline. There is therefore no session to
+stamp the pre-id log mode onto, and no field is wired to the dataplane (wiring
+one would dead-end in a no-op). To avoid a silent logging no-op, the commit now
+emits a WARN-only message naming the configured mode(s)
+(`validatePreIDDefaultPolicyLogWarnings`, `pkg/config/compiler_validate_warn.go`),
+mirroring the #2507 filter loss-priority / CoS loss-priority warnings. It is a
+warning, never a reject — pre-id-default-policy is valid Junos and a hard reject
+would brick a config that was previously accepted. Adding a real
+pre-identification session-admit + re-evaluation pipeline is the prerequisite
+follow-up before this logging signal can be produced.
+
 | Feature | Junos Config Path | Description | Priority | Status |
 |---------|-------------------|-------------|----------|--------|
 | **Filter loss-priority action** | `firewall filter ... term ... then loss-priority <level>` | Mark a packet's packet-loss-priority for downstream drop-profile / congestion behavior | Low | Partial (#2507): parsed and stored, but NOT wired to the snapshot wire and inert in the userspace dataplane (no per-packet loss-priority consumer; three-color policer meters at green only). Commit emits a WARN naming the filter/term that the action is accepted-but-inert. |
+| **Pre-ID default-policy logging** | `security pre-id-default-policy then log session-init session-close` | Log sessions admitted under the pre-identification default policy (before app-id resolves) | Medium | Partial (#2509): parsed and stored, but NOT wired to the dataplane and inert in userspace — there is no pre-identification session-admit path (no session to stamp the log mode onto, unlike per-policy #2508). Commit emits a WARN that the action is accepted-but-inert. |
 | **Policer (Rate Limiting)** | `firewall policer ... bandwidth-limit N burst-size-limit N` | Token-bucket rate limiter applied to filter terms or interfaces. Single-rate two-color, three-color policers. | High | Partial for #1373: legacy eBPF/~~DPDK~~ (DPDK retired #1525) token-bucket policer support existed; userspace supports the admitted filter path and the color-blind `then discard` three-color slice. #1375 is closed; unsupported color-aware/non-drop behavior and broader Junos parity remain production/future parity work, not active #1373 source-removal blockers. |
 | **Three-Color Policer** | `firewall three-color-policer ...` | RFC 2697/2698 metering with green/yellow/red marking based on CIR/CBS/EBS or CIR/PIR | Medium | Legacy eBPF/~~DPDK~~ (DPDK retired #1525) done; userspace AF_XDP supports color-blind `then discard` with compatible snapshot continuity. #1375 is closed; remaining color-aware/non-drop action parity plus integration, failover, and performance hardening are production/future parity work, not active #1373 source-removal blockers. |
 | **Interface Policer** | `firewall policer ... logical-interface-policer` | Aggregate rate limiting across all protocol families on a logical interface | Low | Missing |

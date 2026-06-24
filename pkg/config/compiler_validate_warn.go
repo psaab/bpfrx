@@ -749,7 +749,56 @@ func ValidateConfig(cfg *Config) []string {
 	// silently accept config the dataplane cannot enforce.
 	warnings = append(warnings, validateFilterLossPriorityWarnings(cfg)...)
 
+	// #2509: `security pre-id-default-policy then log session-init/session-close`
+	// is parsed and stored on PreIDDefaultPolicy.LogSessionInit/LogSessionClose
+	// but has NO consumer in the userspace dataplane after the eBPF retirement
+	// (#1373/#1476). The only reader was the retired eBPF compiler
+	// (pkg/dataplane/compiler.go, which mapped the bits to FlowConfigValue.
+	// AppFlags). The userspace runtime has no pre-identification session-admit
+	// path: app-id is best-effort labeling of already-admitted sessions, not a
+	// "default policy admits the session before app-id resolves, then
+	// re-evaluate" pipeline, so there is no session to stamp the pre-id log
+	// mode onto (unlike the per-policy #2508 path, which stamps the admitting
+	// policy's log flags at install). The stanza therefore commits and is
+	// silently inert. Mirror the #2507 filter loss-priority / CoS
+	// loss-priority warnings: WARN-only (pre-id-default-policy is valid Junos —
+	// never fail the commit; a hard reject would brick a boot on a
+	// previously-inert committed value), naming the inert action so the
+	// operator knows the logging signal is not produced.
+	warnings = append(warnings, validatePreIDDefaultPolicyLogWarnings(cfg)...)
+
 	return warnings
+}
+
+// validatePreIDDefaultPolicyLogWarnings emits a WARN-only commit-time message
+// when `security pre-id-default-policy then log session-init/session-close` is
+// configured. The flags are parsed and stored but have no runtime consumer in
+// the userspace dataplane (#2509) — there is no pre-identification
+// session-admit path to stamp the log mode onto — so the logging action is
+// accepted-but-inert. It is never an error: pre-id-default-policy is valid
+// Junos and a hard reject would brick a boot on a previously-inert committed
+// value.
+func validatePreIDDefaultPolicyLogWarnings(cfg *Config) []string {
+	if cfg == nil {
+		return nil
+	}
+	p := cfg.Security.PreIDDefaultPolicy
+	if p == nil || (!p.LogSessionInit && !p.LogSessionClose) {
+		return nil
+	}
+	var modes []string
+	if p.LogSessionInit {
+		modes = append(modes, "session-init")
+	}
+	if p.LogSessionClose {
+		modes = append(modes, "session-close")
+	}
+	return []string{fmt.Sprintf(
+		"security pre-id-default-policy `then log %s` is accepted for "+
+			"compatibility but is inert in the userspace dataplane (no "+
+			"pre-identification session-admit path exists to emit the "+
+			"RT_FLOW session log)",
+		strings.Join(modes, "/"))}
 }
 
 // validateFilterLossPriorityWarnings emits a WARN-only commit-time message for
