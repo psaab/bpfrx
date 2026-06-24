@@ -335,11 +335,20 @@ func (d *Daemon) reconcileIPFIXExporter(cfg *config.Config) bool {
 // set of template-group exporters lock-free from the atomic bundle, so
 // reconcile can swap the exporters without ever touching the callback list.
 //
-// #2461: the family's groups share one ShouldExport state (the 1-in-N
-// counter + sampling zones), so the sampling decision is made EXACTLY ONCE
-// (on groups[0]) and the record is fanned out to every group — each group
-// encodes with the template its collectors referenced. Deciding per group
-// would over-increment the shared counter and corrupt the 1-in-N cadence.
+// #2461: the template groups of ONE instance share one ShouldExport state
+// (the 1-in-N counter + sampling zones), so the sampling decision is made
+// EXACTLY ONCE per instance and fanned to that instance's groups — each
+// group encodes with the template its collectors referenced. Deciding per
+// template group would over-increment the shared counter and corrupt 1-in-N.
+//
+// #2462: sampling instances are independent export policies. A flow is
+// attributed to an instance by address family (ServesFamily) and then
+// sampled at THAT instance's own rate via THAT instance's own counter, so a
+// flow eligible for instance A exports only to A's collectors at A's rate and
+// never crosses to instance B. The per-instance decision is made once
+// (groupedByInstance walks contiguous same-instance runs — the resolver
+// emits an instance's groups consecutively) so the shared per-instance
+// counter advances exactly once per eligible flow.
 func (d *Daemon) flowExportCallback(rec logging.EventRecord, raw []byte) {
 	if rec.Type != "SESSION_CLOSE" {
 		return
@@ -348,17 +357,30 @@ func (d *Daemon) flowExportCallback(rec logging.EventRecord, raw []byte) {
 	if b == nil || len(b.groups) == 0 {
 		return
 	}
-	if !b.groups[0].ec.ShouldExport(rec.InZone, rec.OutZone) {
-		return
-	}
 	sd := flowexport.SessionCloseData{
 		SrcPort:  parseSrcPort(rec.SrcAddr),
 		DstPort:  parseSrcPort(rec.DstAddr),
 		Protocol: parseProtocol(rec.Protocol),
 	}
 	sd.SrcIP, sd.DstIP, sd.IsIPv6 = parseAddrPair(rec.SrcAddr, rec.DstAddr)
-	for _, g := range b.groups {
-		g.exp.ExportSessionClose(rec, sd)
+
+	i := 0
+	for i < len(b.groups) {
+		inst := b.groups[i].ec.InstanceName
+		// First group of this instance carries the shared per-instance state.
+		lead := b.groups[i].ec
+		// Determine the contiguous run of groups for this instance.
+		j := i
+		for j < len(b.groups) && b.groups[j].ec.InstanceName == inst {
+			j++
+		}
+		// Family attribution then the single per-instance sampling decision.
+		if lead.ServesFamily(sd.IsIPv6) && lead.ShouldExport(rec.InZone, rec.OutZone) {
+			for k := i; k < j; k++ {
+				b.groups[k].exp.ExportSessionClose(rec, sd)
+			}
+		}
+		i = j
 	}
 }
 
@@ -371,16 +393,26 @@ func (d *Daemon) ipfixExportCallback(rec logging.EventRecord, raw []byte) {
 	if b == nil || len(b.groups) == 0 {
 		return
 	}
-	if !b.groups[0].ec.ShouldExport(rec.InZone, rec.OutZone) {
-		return
-	}
 	sd := flowexport.SessionCloseData{
 		SrcPort:  parseSrcPort(rec.SrcAddr),
 		DstPort:  parseSrcPort(rec.DstAddr),
 		Protocol: parseProtocol(rec.Protocol),
 	}
 	sd.SrcIP, sd.DstIP, sd.IsIPv6 = parseAddrPair(rec.SrcAddr, rec.DstAddr)
-	for _, g := range b.groups {
-		g.exp.ExportSessionClose(rec, sd)
+
+	i := 0
+	for i < len(b.groups) {
+		inst := b.groups[i].ec.InstanceName
+		lead := b.groups[i].ec
+		j := i
+		for j < len(b.groups) && b.groups[j].ec.InstanceName == inst {
+			j++
+		}
+		if lead.ServesFamily(sd.IsIPv6) && lead.ShouldExport(rec.InZone, rec.OutZone) {
+			for k := i; k < j; k++ {
+				b.groups[k].exp.ExportSessionClose(rec, sd)
+			}
+		}
+		i = j
 	}
 }

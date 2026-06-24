@@ -35,7 +35,7 @@ type SamplingDir struct {
 // ExportConfig holds the resolved NetFlow export configuration for a
 // single template group: the collectors that referenced one template (or
 // the default-template collectors that referenced none), the timeouts and
-// v9 field options resolved from THAT template, plus the family-wide
+// v9 field options resolved from THAT template, plus the per-instance
 // sampling state.
 //
 // #2461: before this change a single ExportConfig was built per family
@@ -43,30 +43,51 @@ type SamplingDir struct {
 // collector, so a per-flow-server template reference was silently ignored
 // and the chosen template flipped across restarts. The resolver now emits
 // one ExportConfig per referenced template — the group key is
-// (version, template_name); source-address is a deterministic sort
-// tiebreak, NOT part of the key, so collectors that share a template but
-// pin different source-addresses land in ONE group and each still gets its
-// own source-pinned UDP connection from dialCollectors (see
-// ResolveV9TemplateGroups / ResolveIPFIXTemplateGroups). The daemon runs
-// one exporter per group; the groups of a family share one sampleCounter
-// (pointer below) so 1-in-N sampling stays global across the family rather
-// than restarting the modulo cadence per template.
+// (instance, version, template_name); source-address is a deterministic
+// sort tiebreak, NOT part of the key, so collectors that share a template
+// but pin different source-addresses land in ONE group and each still gets
+// its own source-pinned UDP connection from dialCollectors (see
+// ResolveV9TemplateGroups / ResolveIPFIXTemplateGroups).
+//
+// #2462: sampling-instance identity is now first-class. Each sampling
+// instance resolves to its OWN ExportConfig(s) carrying its OWN InputRate
+// and its OWN sampleCounter, so a flow eligible for instance A exports ONLY
+// to instance A's collectors at instance A's rate (1-in-N is independent
+// per instance) and NEVER crosses to instance B. The template groups of one
+// instance share that instance's sampleCounter (pointer below) so 1-in-N
+// stays a single cadence across the instance's templates, but two instances
+// never share a counter. Attribution to an instance is by address family:
+// ServesInet / ServesInet6 record which families the instance configured a
+// collector for, and ShouldExportFamily gates a record so an IPv6 flow is
+// not exported by an instance that configured only inet collectors. Two
+// instances claiming the SAME (version, family) are genuinely ambiguous (no
+// per-interface instance selector exists to attribute a flow) and are
+// rejected at commit — see validateSamplingInstanceConflictsStrict.
 type ExportConfig struct {
 	Collectors          []CollectorConfig
+	InstanceName        string // sampling instance this config belongs to (#2462)
 	TemplateName        string // referenced template ("" = default group)
 	FlowActiveTimeout   time.Duration
 	FlowInactiveTimeout time.Duration
 	TemplateRefreshRate time.Duration
 	SamplingZones       map[uint16]SamplingDir // zone ID -> sampling directions
 	SamplingRate        int                    // 1-in-N sampling (0 = export all)
-	V9TemplateOpts      V9TemplateOptions      // optional v9 template field control
+	// ServesInet / ServesInet6 record which address families this instance
+	// configured a flow-server for (#2462). ShouldExportFamily uses them to
+	// attribute a flow to the right instance: an instance with only inet
+	// collectors must not export an IPv6 flow. An instance that configured
+	// neither (no flow-servers for this version) produces no ExportConfig at
+	// all, so both true-everywhere defaults are never observed.
+	ServesInet     bool
+	ServesInet6    bool
+	V9TemplateOpts V9TemplateOptions // optional v9 template field control
 	// sampleCounter is the monotonic 1-in-N counter. It is a POINTER so all
-	// ExportConfig groups of one family share a single counter (the
-	// sampling rate is a forwarding-options-instance property, not a
-	// per-template one). A nil pointer is lazily allocated on first use so
-	// a hand-built ExportConfig (tests, the singular Build* helpers) still
-	// samples correctly. json.Marshal skips the unexported field, so the
-	// reconcile config-hash is unaffected.
+	// ExportConfig template groups of one INSTANCE share a single counter
+	// (the sampling rate is a per-instance property; #2462). Two different
+	// instances each get their own counter. A nil pointer is lazily
+	// allocated on first use so a hand-built ExportConfig (tests, the
+	// singular Build* helpers) still samples correctly. json.Marshal skips
+	// the unexported field, so the reconcile config-hash is unaffected.
 	sampleCounter *atomic.Uint64
 	counterOnce   sync.Once
 }
@@ -131,52 +152,67 @@ func resolveFlowServerVersion(fs *config.FlowServer, hasV9, hasIPFIX bool) strin
 	}
 }
 
-// collectVersionCollectors walks every sampling family's flow-servers
-// and returns the deduplicated collector set for the requested export
-// version, skipping flow-servers resolved to the other version. This is
-// the per-flow-server version binding that prevents double-export
-// (#2136): the v9 builder calls it with version=version9, the IPFIX
-// builder with version=version-ipfix, and a server appears in at most
-// one of the two sets.
-func collectVersionCollectors(fo *config.ForwardingOptionsConfig, version string, hasV9, hasIPFIX bool) []CollectorConfig {
-	var collectors []CollectorConfig
-	for _, inst := range fo.Sampling.Instances {
-		families := []*config.SamplingFamily{inst.FamilyInet, inst.FamilyInet6}
-		for _, fam := range families {
-			if fam == nil {
+// collectInstanceVersionCollectors walks ONE sampling instance's
+// flow-servers and returns the deduplicated collector set for the requested
+// export version, skipping flow-servers resolved to the other version. It
+// also reports which address families (inet / inet6) the instance
+// configured a collector for under this version, so the caller can scope the
+// resulting ExportConfig to those families (#2462 attribution). This is the
+// per-flow-server version binding that prevents double-export (#2136): the
+// v9 resolver calls it with version=version9, the IPFIX resolver with
+// version=version-ipfix, and a server appears in at most one of the two
+// sets.
+//
+// #2462: this is now per-INSTANCE (was a global walk over every instance,
+// which merged distinct instances into one collector set — the defect).
+func collectInstanceVersionCollectors(inst *config.SamplingInstance, version string, hasV9, hasIPFIX bool) (collectors []CollectorConfig, servesInet, servesInet6 bool) {
+	families := []struct {
+		fam  *config.SamplingFamily
+		isV6 bool
+	}{
+		{inst.FamilyInet, false},
+		{inst.FamilyInet6, true},
+	}
+	for _, fe := range families {
+		fam := fe.fam
+		if fam == nil {
+			continue
+		}
+		for _, fs := range fam.FlowServers {
+			if resolveFlowServerVersion(fs, hasV9, hasIPFIX) != version {
 				continue
 			}
-			for _, fs := range fam.FlowServers {
-				if resolveFlowServerVersion(fs, hasV9, hasIPFIX) != version {
-					continue
-				}
-				addr := fs.Address
-				if fs.Port > 0 {
-					// net.JoinHostPort brackets an IPv6 literal
-					// ([2001:db8::9]:4739) so net.ResolveUDPAddr /
-					// net.Dial in transport.go can parse it. A plain
-					// "%s:%d" leaves an IPv6 address unbracketed
-					// (2001:db8::9:4739), which they cannot parse, so
-					// IPv6 flow collectors never dial (#2183).
-					addr = net.JoinHostPort(fs.Address, strconv.Itoa(fs.Port))
-				}
-				srcAddr := fam.SourceAddress
-				if srcAddr == "" {
-					srcAddr = fam.InlineJflowSourceAddress
-				}
-				tmpl := fs.Version9Template
-				if version == config.FlowServerVersionIPFIX {
-					tmpl = fs.VersionIPFIXTemplate
-				}
-				collectors = append(collectors, CollectorConfig{
-					Address:       addr,
-					SourceAddress: srcAddr,
-					Template:      tmpl,
-				})
+			addr := fs.Address
+			if fs.Port > 0 {
+				// net.JoinHostPort brackets an IPv6 literal
+				// ([2001:db8::9]:4739) so net.ResolveUDPAddr /
+				// net.Dial in transport.go can parse it. A plain
+				// "%s:%d" leaves an IPv6 address unbracketed
+				// (2001:db8::9:4739), which they cannot parse, so
+				// IPv6 flow collectors never dial (#2183).
+				addr = net.JoinHostPort(fs.Address, strconv.Itoa(fs.Port))
+			}
+			srcAddr := fam.SourceAddress
+			if srcAddr == "" {
+				srcAddr = fam.InlineJflowSourceAddress
+			}
+			tmpl := fs.Version9Template
+			if version == config.FlowServerVersionIPFIX {
+				tmpl = fs.VersionIPFIXTemplate
+			}
+			collectors = append(collectors, CollectorConfig{
+				Address:       addr,
+				SourceAddress: srcAddr,
+				Template:      tmpl,
+			})
+			if fe.isV6 {
+				servesInet6 = true
+			} else {
+				servesInet = true
 			}
 		}
 	}
-	return dedupeCollectors(collectors)
+	return dedupeCollectors(collectors), servesInet, servesInet6
 }
 
 // dedupeCollectors removes duplicate collector destinations (same
@@ -260,15 +296,18 @@ func ipfixTemplateContext(tmpl *config.NetFlowIPFIXTemplate) templateContext {
 	return tc
 }
 
-// samplingRate returns the global 1-in-N sampling rate (the first sampling
-// instance's input rate), shared by every template group of both families.
-func samplingRate(fo *config.ForwardingOptionsConfig) int {
-	for _, inst := range fo.Sampling.Instances {
-		if inst.InputRate > 0 {
-			return inst.InputRate
-		}
+// sortedInstanceNames returns the sampling-instance names in deterministic
+// (lexical) order so the resolved exporter wiring is restart-stable (#2462).
+// Killing the Go-map-iteration order is half of the determinism fix; the
+// other half is per-instance rate selection (no more first-nonzero
+// map-order-dependent global rate).
+func sortedInstanceNames(fo *config.ForwardingOptionsConfig) []string {
+	names := make([]string, 0, len(fo.Sampling.Instances))
+	for name := range fo.Sampling.Instances {
+		names = append(names, name)
 	}
-	return 0
+	sort.Strings(names)
+	return names
 }
 
 // groupCollectorsByTemplate partitions the deduplicated collector list into
@@ -325,13 +364,6 @@ func ResolveV9TemplateGroups(svc *config.ServicesConfig, fo *config.ForwardingOp
 	}
 
 	hasIPFIX := svc.FlowMonitoring.VersionIPFIX != nil
-	// #2136 per-flow-server version binding: collect only the flow-servers
-	// bound to NetFlow v9 so a collector under both versions gets one stream.
-	collectors := collectVersionCollectors(fo, config.FlowServerVersion9, true, hasIPFIX)
-	if len(collectors) == 0 {
-		return nil
-	}
-
 	defined := svc.FlowMonitoring.Version9.Templates
 	// defaultCtx: when exactly one template is defined, an unreferenced
 	// collector inherits it (preserves the pre-#2461 single-template case);
@@ -343,32 +375,48 @@ func ResolveV9TemplateGroups(svc *config.ServicesConfig, fo *config.ForwardingOp
 		}
 	}
 
-	rate := samplingRate(fo)
-	shared := &atomic.Uint64{}
-	keys, groups := groupCollectorsByTemplate(collectors)
-
 	var out []*ExportConfig
-	for _, name := range keys {
-		ctx := defaultCtx
-		if name != "" {
-			tmpl, ok := defined[name]
-			if !ok {
-				// Undefined reference: drop (the strict gate rejects on
-				// commit; lenient load exports nothing for these collectors).
-				continue
-			}
-			ctx = v9TemplateContext(tmpl)
+	// #2462: iterate instances in deterministic order; each instance is an
+	// independent export policy (own collectors, own rate, own counter).
+	for _, instName := range sortedInstanceNames(fo) {
+		inst := fo.Sampling.Instances[instName]
+		if inst == nil {
+			continue
 		}
-		out = append(out, &ExportConfig{
-			Collectors:          groups[name],
-			TemplateName:        name,
-			FlowActiveTimeout:   ctx.activeTimeout,
-			FlowInactiveTimeout: ctx.inactiveTimeout,
-			TemplateRefreshRate: ctx.refreshRate,
-			V9TemplateOpts:      ctx.v9opts,
-			SamplingRate:        rate,
-			sampleCounter:       shared,
-		})
+		// #2136 per-flow-server version binding: collect only THIS instance's
+		// flow-servers bound to NetFlow v9.
+		collectors, servesInet, servesInet6 := collectInstanceVersionCollectors(inst, config.FlowServerVersion9, true, hasIPFIX)
+		if len(collectors) == 0 {
+			continue
+		}
+		rate := inst.InputRate
+		shared := &atomic.Uint64{} // per-INSTANCE counter (#2462)
+		keys, groups := groupCollectorsByTemplate(collectors)
+		for _, name := range keys {
+			ctx := defaultCtx
+			if name != "" {
+				tmpl, ok := defined[name]
+				if !ok {
+					// Undefined reference: drop (the strict gate rejects on
+					// commit; lenient load exports nothing for these collectors).
+					continue
+				}
+				ctx = v9TemplateContext(tmpl)
+			}
+			out = append(out, &ExportConfig{
+				Collectors:          groups[name],
+				InstanceName:        instName,
+				TemplateName:        name,
+				FlowActiveTimeout:   ctx.activeTimeout,
+				FlowInactiveTimeout: ctx.inactiveTimeout,
+				TemplateRefreshRate: ctx.refreshRate,
+				V9TemplateOpts:      ctx.v9opts,
+				SamplingRate:        rate,
+				ServesInet:          servesInet,
+				ServesInet6:         servesInet6,
+				sampleCounter:       shared,
+			})
+		}
 	}
 	return out
 }
@@ -385,11 +433,6 @@ func ResolveIPFIXTemplateGroups(svc *config.ServicesConfig, fo *config.Forwardin
 	}
 
 	hasV9 := svc.FlowMonitoring.Version9 != nil
-	collectors := collectVersionCollectors(fo, config.FlowServerVersionIPFIX, hasV9, true)
-	if len(collectors) == 0 {
-		return nil
-	}
-
 	defined := svc.FlowMonitoring.VersionIPFIX.Templates
 	defaultCtx := defaultTemplateContext()
 	if len(defined) == 1 {
@@ -398,29 +441,41 @@ func ResolveIPFIXTemplateGroups(svc *config.ServicesConfig, fo *config.Forwardin
 		}
 	}
 
-	rate := samplingRate(fo)
-	shared := &atomic.Uint64{}
-	keys, groups := groupCollectorsByTemplate(collectors)
-
 	var out []*ExportConfig
-	for _, name := range keys {
-		ctx := defaultCtx
-		if name != "" {
-			tmpl, ok := defined[name]
-			if !ok {
-				continue
-			}
-			ctx = ipfixTemplateContext(tmpl)
+	for _, instName := range sortedInstanceNames(fo) {
+		inst := fo.Sampling.Instances[instName]
+		if inst == nil {
+			continue
 		}
-		out = append(out, &ExportConfig{
-			Collectors:          groups[name],
-			TemplateName:        name,
-			FlowActiveTimeout:   ctx.activeTimeout,
-			FlowInactiveTimeout: ctx.inactiveTimeout,
-			TemplateRefreshRate: ctx.refreshRate,
-			SamplingRate:        rate,
-			sampleCounter:       shared,
-		})
+		collectors, servesInet, servesInet6 := collectInstanceVersionCollectors(inst, config.FlowServerVersionIPFIX, hasV9, true)
+		if len(collectors) == 0 {
+			continue
+		}
+		rate := inst.InputRate
+		shared := &atomic.Uint64{} // per-INSTANCE counter (#2462)
+		keys, groups := groupCollectorsByTemplate(collectors)
+		for _, name := range keys {
+			ctx := defaultCtx
+			if name != "" {
+				tmpl, ok := defined[name]
+				if !ok {
+					continue
+				}
+				ctx = ipfixTemplateContext(tmpl)
+			}
+			out = append(out, &ExportConfig{
+				Collectors:          groups[name],
+				InstanceName:        instName,
+				TemplateName:        name,
+				FlowActiveTimeout:   ctx.activeTimeout,
+				FlowInactiveTimeout: ctx.inactiveTimeout,
+				TemplateRefreshRate: ctx.refreshRate,
+				SamplingRate:        rate,
+				ServesInet:          servesInet,
+				ServesInet6:         servesInet6,
+				sampleCounter:       shared,
+			})
+		}
 	}
 	return out
 }
@@ -508,6 +563,20 @@ func (ec *ExportConfig) ShouldExport(inZone, outZone uint16) bool {
 		return n%uint64(ec.SamplingRate) == 0
 	}
 	return true
+}
+
+// ServesFamily reports whether this instance's ExportConfig should handle a
+// flow of the given address family (#2462). An instance that configured only
+// inet collectors must not export an IPv6 flow (and vice versa) — that is the
+// control-plane attribution that keeps two family-disjoint instances
+// isolated. An ExportConfig is only ever built for a version the instance has
+// at least one collector for, so at least one of ServesInet / ServesInet6 is
+// always true here.
+func (ec *ExportConfig) ServesFamily(isIPv6 bool) bool {
+	if isIPv6 {
+		return ec.ServesInet6
+	}
+	return ec.ServesInet
 }
 
 // counter returns the shared 1-in-N counter, lazily allocating a private

@@ -171,22 +171,77 @@ emits one `*ExportConfig` per group:
   load / peer-sync path downgrades it to a warning (#1960) and the resolver
   DROPS that group, so a leniently-loaded bad config exports nothing for
   that collector rather than the wrong template.
-- **Shared sampling.** 1-in-N sampling is a forwarding-options-instance
-  property, not a per-template one, so all groups of a family share ONE
-  `sampleCounter` (a pointer). The daemon evaluates `ShouldExport` exactly
-  once per SESSION_CLOSE and fans the record out to every group.
+- **Per-instance sampling.** 1-in-N sampling is a sampling-INSTANCE
+  property (#2462). The template groups of ONE instance share that
+  instance's `sampleCounter` (a pointer); two different instances each get
+  their own counter. The daemon evaluates `ShouldExport` exactly once per
+  instance per SESSION_CLOSE and fans the record out to that instance's
+  groups.
 - `BuildExportConfig` / `BuildIPFIXExportConfig` (singular) are retained
   for single-aggregate callers and now return the first resolved group.
 
-### Daemon wiring (one exporter per group)
+## Multi-sampling-instance isolation (#2462)
 
-`reconcileFlowExporters` now starts **N exporters per family** — one per
-template group — instead of a single exporter. `d.flowExporters` /
-`d.ipfixExporters` are slices; the atomic `flowBundle` / `ipfixBundlePtr`
-carry the group set; the once-registered session-close callback makes the
-shared sampling decision on `groups[0]` and exports to every group. The
-per-family config-hash gate, transient-create-failure retry (no hash
-recorded), and shutdown teardown all operate over the slice.
+`forwarding-options` can define several `sampling instance <name>` blocks,
+each with its own input rate, families, and flow-servers. Before #2462 the
+resolver flattened EVERY instance into one global export policy:
+`collectVersionCollectors` merged all instances' flow-servers into one
+collector set, `samplingRate()` returned the first-nonzero `InputRate` in
+Go map order, and one `sampleCounter` was shared by the whole family. Flows
+from instance A exported to instance B's collectors and the effective rate
+depended on map-iteration order.
+
+The resolver now treats each instance as a first-class export policy. The
+grouping key is `(instance, version, template)`:
+
+- **Own collectors.** `collectInstanceVersionCollectors` walks ONE
+  instance's flow-servers, so instance A's collectors never receive
+  instance B's flows.
+- **Own rate.** Each instance's `ExportConfig.SamplingRate` is its own
+  `InputRate` — the first-nonzero map-order global rate is gone.
+- **Own 1-in-N counter.** Each instance gets a distinct `sampleCounter`, so
+  1-in-N is independent per instance (and still shared across that
+  instance's template groups, the #2461 invariant scoped to one instance).
+- **Attribution by family.** The only per-flow instance selector available
+  is the address family: the interface `family inet { sampling { input; } }`
+  stanza is a plain boolean and there is **no per-interface
+  sampling-instance selector** in the config model. So `ServesInet` /
+  `ServesInet6` record which families an instance configured a collector
+  for, and `ExportConfig.ServesFamily(isIPv6)` gates a record — an
+  inet-only instance never exports an IPv6 flow. The daemon callback walks
+  the contiguous per-instance run of groups, applies the family gate + the
+  single per-instance sampling decision, then fans to that instance's
+  groups.
+- **Determinism.** Instances are resolved in lexical name order
+  (`sortedInstanceNames`), so restarts produce identical wiring.
+
+### Supported vs rejected matrix
+
+| Configuration | Result |
+|---|---|
+| Single sampling instance (any rate / families / collectors) | **Supported** — unchanged from pre-#2462 (the common case) |
+| Two instances, different families (A: inet, B: inet6) | **Supported** — attributed by flow family |
+| Two instances, different export versions (A: version9, B: version-ipfix) on the same family | **Supported** — distinct datagram streams |
+| Two instances both exporting the same `(version, family)` pair | **Rejected at commit** — no per-flow instance selector exists, so the runtime cannot attribute a flow to one instance |
+
+The reject is `validateSamplingInstanceConflictsStrict` (`pkg/config`):
+strict on commit / commit-check (hard reject so the operator sees it),
+lenient on load / peer-sync (downgraded to a warning via
+`opts.lenientSamplingInstanceConflicts` so an already-persisted or
+peer-synced config still boots — #1960; the resolver still emits both
+instances' independent `ExportConfig`s, duplicating eligible flows to both
+rather than bricking the load).
+
+### Daemon wiring (one exporter per (instance, template) group)
+
+`reconcileFlowExporters` starts **N exporters per family** — one per
+`(instance, template)` group — instead of a single exporter.
+`d.flowExporters` / `d.ipfixExporters` are slices; the atomic `flowBundle`
+/ `ipfixBundlePtr` carry the group set; the once-registered session-close
+callback walks each contiguous per-instance run, applies the family gate +
+the single per-instance sampling decision, and exports to that instance's
+groups. The per-family config-hash gate, transient-create-failure retry (no
+hash recorded), and shutdown teardown all operate over the slice.
 
 ## Callers
 
@@ -211,7 +266,9 @@ bundle atomically. The callback calls `Exporter.ExportSessionClose()`
 `logging.EventReader` SESSION_CLOSE event. The resolved `*ExportConfig`
 is shared by pointer everywhere — in the bundle, by the callback's
 `ShouldExport`, AND inside the exporter — so there is exactly ONE live
-1-in-N `sampleCounter` (`atomic.Uint64`) per family. `ExportConfig` is
+1-in-N `sampleCounter` (`atomic.Uint64`) per sampling INSTANCE (#2462;
+shared across that instance's template groups, distinct between
+instances). `ExportConfig` is
 never copied by value: doing so would fork the atomic counter (a go-vet
 "copies lock value" failure) and silently re-seed the modulo cadence the
 moment any caller sampled off the copy (#2224).
