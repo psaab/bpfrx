@@ -152,11 +152,15 @@ The resolver now groups collectors by the template they referenced and
 emits one `*ExportConfig` per group:
 
 - **`ResolveV9TemplateGroups` / `ResolveIPFIXTemplateGroups`** (`manager.go`)
-  return `[]*ExportConfig`, one per `(template, source-address)` group.
-  Each group carries the timeouts / `V9TemplateOpts` of the template its
-  collectors referenced. A collector that referenced no template lands in
-  the default (`TemplateName == ""`) group, which inherits the lone
-  template's parameters when exactly one is configured (the common
+  return `[]*ExportConfig`, one per referenced template. The group key is
+  `(version, template_name)`; **source-address is a deterministic sort
+  tiebreak, NOT part of the grouping key** — collectors that share a
+  template but pin different source-addresses share ONE group and each
+  still receives its own source-pinned UDP connection (via
+  `dialCollectors`). Each group carries the timeouts / `V9TemplateOpts` of
+  the template its collectors referenced. A collector that referenced no
+  template lands in the default (`TemplateName == ""`) group, which inherits
+  the lone template's parameters when exactly one is configured (the common
   single-template case — unchanged) and otherwise the built-in defaults.
 - **Determinism.** Groups are sorted by template name and each group's
   collectors by address, so process restarts produce identical exporter

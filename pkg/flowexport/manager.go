@@ -42,7 +42,11 @@ type SamplingDir struct {
 // from the FIRST Go-map-iteration template and broadcast to every
 // collector, so a per-flow-server template reference was silently ignored
 // and the chosen template flipped across restarts. The resolver now emits
-// one ExportConfig per (template, source-address) group (see
+// one ExportConfig per referenced template — the group key is
+// (version, template_name); source-address is a deterministic sort
+// tiebreak, NOT part of the key, so collectors that share a template but
+// pin different source-addresses land in ONE group and each still gets its
+// own source-pinned UDP connection from dialCollectors (see
 // ResolveV9TemplateGroups / ResolveIPFIXTemplateGroups). The daemon runs
 // one exporter per group; the groups of a family share one sampleCounter
 // (pointer below) so 1-in-N sampling stays global across the family rather
@@ -176,7 +180,9 @@ func collectVersionCollectors(fo *config.ForwardingOptionsConfig, version string
 }
 
 // dedupeCollectors removes duplicate collector destinations (same
-// address + source-address) in-place, preserving first-seen order.
+// address + source-address + referenced template — see collectorKey)
+// in-place, preserving first-seen order. This is the dedup key, NOT the
+// grouping key: grouping is by template name alone (groupCollectorsByTemplate).
 func dedupeCollectors(collectors []CollectorConfig) []CollectorConfig {
 	seen := make(map[string]bool)
 	deduped := collectors[:0]
