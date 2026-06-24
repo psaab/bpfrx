@@ -196,6 +196,11 @@ impl Default for PolicyAction {
 pub(crate) struct PolicyEvaluationResult {
     pub(crate) action: PolicyAction,
     pub(crate) policy_id: u32,
+    /// #2508: the matched policy's per-policy RT_FLOW SYSLOG log
+    /// selection, carried so the session-install path can stamp it onto
+    /// the session metadata.
+    pub(crate) log_session_init: bool,
+    pub(crate) log_session_close: bool,
 }
 
 #[derive(Debug)]
@@ -249,6 +254,11 @@ pub(crate) struct PolicyRule {
     /// Precompiled application matcher (protocol-indexed, exact-port sets).
     compiled_apps: CompiledApplications,
     pub(crate) action: PolicyAction,
+    /// #2508: per-policy Junos `then log session-init`/`session-close`
+    /// selection. Stamped onto session metadata at install so the
+    /// per-policy RT_FLOW SYSLOG records gate on the admitting policy.
+    pub(crate) log_session_init: bool,
+    pub(crate) log_session_close: bool,
     pub(crate) hit_counter: Arc<PolicyRuleCounter>,
 }
 
@@ -283,6 +293,8 @@ impl Default for PolicyRule {
                 by_protocol: FxHashMap::default(),
             },
             action: PolicyAction::Deny,
+            log_session_init: false,
+            log_session_close: false,
             hit_counter: Arc::new(PolicyRuleCounter::default()),
         }
     }
@@ -316,6 +328,8 @@ impl Clone for PolicyRule {
             applications: self.applications.clone(),
             compiled_apps: self.compiled_apps.clone(),
             action: self.action,
+            log_session_init: self.log_session_init,
+            log_session_close: self.log_session_close,
             hit_counter: self.hit_counter.clone(),
         }
     }
@@ -831,6 +845,9 @@ pub(crate) fn parse_policy_state_with_counters(
             applications,
             compiled_apps,
             action: parse_action(&snap.action),
+            // #2508: carry the per-policy SYSLOG log selection.
+            log_session_init: snap.log_session_init,
+            log_session_close: snap.log_session_close,
             hit_counter: counter_store.rule_hit_counter(&rule_id),
         };
         let idx = state.rules.len();
@@ -1095,6 +1112,9 @@ pub(crate) fn evaluate_policy_result_with_len(
     PolicyEvaluationResult {
         action: state.default_action,
         policy_id: 0,
+        // #2508: the implicit default policy has no `then log` selection.
+        log_session_init: false,
+        log_session_close: false,
     }
 }
 
@@ -1205,6 +1225,10 @@ fn try_match_rule(
         Some(PolicyEvaluationResult {
             action: rule.action,
             policy_id: rule.policy_id,
+            // #2508: surface the matched rule's per-policy SYSLOG log
+            // selection so the install path can stamp the session.
+            log_session_init: rule.log_session_init,
+            log_session_close: rule.log_session_close,
         })
     } else {
         None

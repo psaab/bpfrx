@@ -50,12 +50,24 @@ type rawEvent struct {
 	IngressIfindex uint32
 	AppID          uint16
 	CloseReason    uint8
-	PadEvent       uint8
+	// #2508: per-policy RT_FLOW SYSLOG log gate (was reserved padding).
+	// Carried only on the userspace-dp SESSION_CREATE/SESSION_CLOSE
+	// frames: 1 == the admitting policy was configured with
+	// `then log session-init`/`session-close`, so emit the per-policy
+	// RT_FLOW SYSLOG record; 0 == suppress the SYSLOG record. This gates
+	// ONLY the syslog/local-log/slog consumers — the registered callbacks
+	// (the global NetFlow/IPFIX session-close exporter, #2460) always run.
+	// For all other event types (deny/screen/filter) this byte is 0 and
+	// unread (those frames are unconditionally logged).
+	LogSyslog uint8
 }
 
 const (
 	rawEventWireSize   = 136
 	rawEventStructSize = int(unsafe.Sizeof(rawEvent{}))
+	// rawEventLogSyslogOffset is the wire offset of the #2508 per-policy
+	// RT_FLOW SYSLOG log gate (the final byte of the 136-byte payload).
+	rawEventLogSyslogOffset = 135
 )
 
 var _ [rawEventWireSize]struct{} = [rawEventStructSize]struct{}{}
@@ -484,8 +496,36 @@ func (er *EventReader) logEvent(data []byte) {
 	// Assign monotonic session ID
 	rec.SessionID = atomic.AddUint64(&er.sessionSeq, 1)
 
+	// #2508: per-policy RT_FLOW SYSLOG gate. The userspace-dp
+	// SESSION_CREATE/SESSION_CLOSE frames carry a "should-log-to-syslog"
+	// bit in the final payload byte: it is set ONLY when the admitting
+	// policy was configured with `then log session-init`/`session-close`.
+	// When the bit is clear, suppress the human-facing log consumers
+	// (security-log buffer, slog, syslog clients, local event writers) but
+	// STILL run the registered callbacks below — the global NetFlow/IPFIX
+	// session-close exporter (#2460) accounts every close regardless. For
+	// every other event type the byte is 0 and this gate never fires
+	// (those frames are unconditionally logged); session opens are
+	// producer-gated in the helper, so a SESSION_CREATE frame that reaches
+	// here always has the bit set.
+	//
+	// This gate is SCOPED to the userspace-dp event-stream path
+	// (`er.source == nil`, i.e. records fed via ProcessRawEvent) — the ONLY
+	// producer that sets the per-policy log bit. A source-based EventReader
+	// (`er.source != nil`, the kernel/ring-buffer reader created at
+	// pkg/daemon/daemon_run.go) does NOT carry the per-policy bit (the byte
+	// defaults to 0), so it must NEVER be gated by this check or its session
+	// logs would be unconditionally suppressed.
+	suppressSyslogLog := false
+	if er.source == nil &&
+		(evt.EventType == eventTypeSessionClose || evt.EventType == eventTypeSessionOpen) &&
+		len(data) > rawEventLogSyslogOffset &&
+		data[rawEventLogSyslogOffset] == 0 {
+		suppressSyslogLog = true
+	}
+
 	// Store in buffer
-	if er.buffer != nil {
+	if er.buffer != nil && !suppressSyslogLog {
 		er.buffer.Add(rec)
 	}
 
@@ -495,6 +535,14 @@ func (er *EventReader) logEvent(data []byte) {
 	er.callbackMu.RUnlock()
 	for _, cb := range cbs {
 		cb(rec, data)
+	}
+
+	// #2508: the registered callbacks (NetFlow/IPFIX, #2460) have now seen
+	// the event. When the per-policy SYSLOG gate is closed, stop here so the
+	// human-facing log consumers (slog, syslog clients, local event writers)
+	// never emit a per-policy RT_FLOW record the operator did not request.
+	if suppressSyslogLog {
+		return
 	}
 
 	// Log to slog (existing behavior) — use resolved zone names

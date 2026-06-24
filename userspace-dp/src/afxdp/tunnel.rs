@@ -341,6 +341,10 @@ pub(super) fn build_local_origin_tunnel_tx_request(
             fabric_ingress: false,
             is_reverse: false,
             nat64_reverse: None,
+            // #2508: tunnel sync-import sessions carry no local per-policy
+            // `then log` selection (see server/helpers.rs note).
+            log_session_init: false,
+            log_session_close: false,
         },
         origin: SessionOrigin::SyncImport,
         protocol: meta.protocol,

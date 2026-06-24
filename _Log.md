@@ -12508,3 +12508,65 @@ top.
   userspace-dp/src/filter/engine/matching.rs,
   userspace-dp/src/filter/tests.rs, userspace-dp/src/filter/README.md,
   userspace-dp/tests/fixtures/protocol_wire_v1.json, docs/feature-gaps.md, _Log.md
+
+## 2026-06-23 — #2508 per-policy RT_FLOW session-init/close SYSLOG logging
+
+- **Timestamp**: 2026-06-23
+- **Action**: Implement per-policy `then log session-init`/`session-close`
+  SYSLOG RT_FLOW logging in the userspace dataplane. Design choice: Option B
+  (single close event + per-policy gate on the SYSLOG consumer) plus a NEW
+  producer-gated SESSION_CREATE frame for session-init. The #2460 global
+  NetFlow/IPFIX flowexport close emit is NOT regressed: flowexport rides the
+  EventReader callback fan-out, the SYSLOG records ride the syslog/local/slog
+  fan-out, and only the latter is gated. The type-14 close frame is still
+  emitted for EVERY close (flowexport needs it); its final payload byte
+  (offset 135) carries the per-policy SYSLOG gate that the Go logEvent path
+  honors. Session-init has no flowexport consumer, so the new type-15
+  SESSION_CREATE frame is gated entirely at the Rust producer.
+- **File(s)**:
+  - pkg/dataplane/userspace/protocol.go (PolicyRuleSnapshot LogSessionInit/
+    Close + EventFrameTypeSessionCreate=15)
+  - pkg/dataplane/userspace/policies.go (populate from pol.Log)
+  - pkg/dataplane/userspace/eventstream.go (type-15 dispatch + validator +
+    SessionCreate counters)
+  - pkg/logging/ringbuf.go (rawEvent.LogSyslog byte-135 + suppressSyslogLog
+    gate after callbacks)
+  - pkg/logging/per_policy_log_test.go (NEW fail-on-revert matrix)
+  - pkg/logging/binary_test.go (PadEvent->LogSyslog offset test +
+    minimallyValidRawEventData gate opt-in)
+  - userspace-dp/src/protocol/security.rs (PolicyRuleSnapshot log flags)
+  - userspace-dp/src/policy.rs (PolicyRule + PolicyEvaluationResult flags)
+  - userspace-dp/src/session/entry.rs (SessionMetadata log flags)
+  - userspace-dp/src/event_stream/{mod.rs,codec.rs} (encode/emit create +
+    close gate byte)
+  - userspace-dp/src/afxdp/session_delta.rs (gated create emit in flush)
+  - poll_descriptor/mod.rs + 5 other SessionMetadata sites (stamp flags)
+  - userspace-dp/src/{event_stream/codec_tests.rs,policy_tests.rs} (tests)
+  - userspace-dp/tests/fixtures/protocol_wire_v1.json (regen)
+  - docs/feature-gaps.md, userspace-dp/src/event_stream/README.md
+- **Validation**: go build ./...; go test pkg/{config,dataplane/userspace,
+  logging,daemon} green; cargo build --release green; cargo test policy +
+  codec + wire-invariant green (1 pre-existing flaky concurrency test
+  unrelated). gofmt/vet clean.
+
+## 2026-06-23 — #2508 Copilot fold: scope per-policy gate to er.source==nil
+
+- **Timestamp**: 2026-06-23
+- **Action**: Fix real over-suppression caught in review (PR #2531). The
+  per-policy SYSLOG gate in pkg/logging/ringbuf.go fired for ALL
+  SESSION_OPEN/CLOSE events keyed on byte-135==0. But only the userspace-dp
+  event-stream path (ProcessRawEvent, er.source==nil) sets the per-policy log
+  bit. The SECOND runtime EventReader (pkg/daemon/daemon_run.go, non-nil
+  source) feeds SESSION events whose gate byte defaults to 0, so the gate
+  would have UNCONDITIONALLY suppressed all of its session logs. Added
+  `er.source == nil` to the gate condition so it narrows ONLY the userspace
+  path; rewrote the comment to state the scope. Source-based readers are
+  never gated.
+- **File(s)**: pkg/logging/ringbuf.go (gate condition + comment),
+  pkg/logging/per_policy_log_test.go (NEW
+  TestPerPolicyLogGate_SourceReaderNotGated fail-on-revert + nopEventSource
+  fake)
+- **Validation**: fail-on-revert PROVEN (removing `er.source == nil` →
+  source-path SESSION_OPEN/CLOSE wrongly suppressed → test fails; restored →
+  pass). go build ./... ; go test pkg/{logging,daemon,dataplane/userspace}
+  green; gofmt/vet clean (pre-existing syslog.go drift untouched).

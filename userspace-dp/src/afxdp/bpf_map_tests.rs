@@ -34,6 +34,8 @@ fn synced_forward_metadata() -> SessionMetadata {
         fabric_ingress: false,
         is_reverse: false,
         nat64_reverse: None,
+        log_session_init: false,
+        log_session_close: false,
     }
 }
 
@@ -224,6 +226,8 @@ fn session_map_redirect_keys_for_forward_session_include_nat_aliases() {
         fabric_ingress: false,
         is_reverse: false,
         nat64_reverse: None,
+        log_session_init: false,
+        log_session_close: false,
     };
 
     let keys = session_map_redirect_keys_for_session(

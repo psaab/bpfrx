@@ -667,6 +667,16 @@ type PolicyRuleSnapshot struct {
 	// `destination-address-excluded`).
 	SourceAddressExcluded      bool `json:"source_address_excluded,omitempty"`
 	DestinationAddressExcluded bool `json:"destination_address_excluded,omitempty"`
+	// #2508: per-policy `then log session-init` / `session-close`
+	// selection (Junos). When set, the dataplane stamps the flag onto
+	// the session metadata at install so the per-policy RT_FLOW SYSLOG
+	// records (RT_FLOW_SESSION_CREATE / RT_FLOW_SESSION_CLOSE) can be
+	// emitted ONLY for the policies the operator configured with
+	// `then log`. These gate the SYSLOG logging consumer only — the
+	// global NetFlow/IPFIX session-close exporter (#2460) still observes
+	// EVERY close regardless of these flags.
+	LogSessionInit  bool `json:"log_session_init,omitempty"`
+	LogSessionClose bool `json:"log_session_close,omitempty"`
 }
 
 type InterfaceAddressSnapshot struct {
@@ -2071,6 +2081,15 @@ const (
 	// EventTypeSessionClose HA session-sync delta — both are produced per
 	// close; the HA sync path is unchanged.
 	EventFrameTypeSessionClose uint8 = 14 // helper → daemon (RT_FLOW session close)
+	// #2508: RT_FLOW SESSION_CREATE on the raw dataplane-event channel,
+	// carrying the canonical 136-byte dataplane.Event payload with the
+	// event-type byte = dataplane.EventTypeSessionOpen (1). Emitted by the
+	// helper ONLY for sessions admitted by a policy configured with
+	// `then log session-init` — there is no flowexport consumer of session
+	// opens, so this frame is gated entirely at the producer. Routed
+	// through the same decodeDataplaneEventPayload → ProcessRawEvent path;
+	// logEvent then formats it as an RT_FLOW_SESSION_CREATE syslog record.
+	EventFrameTypeSessionCreate uint8 = 15 // helper → daemon (RT_FLOW session create)
 )
 
 // Session event flag bits in the Flags byte of SessionOpen/Update/Close payloads.

@@ -387,6 +387,9 @@ impl FlowCacheEntry {
                 fabric_ingress: false,
                 is_reverse: false,
                 nat64_reverse: None,
+                // #2508: flow-cache seed carries no per-policy `then log`.
+                log_session_init: false,
+                log_session_close: false,
             },
             stamp: FlowCacheStamp::capture(
                 validation.config_generation,

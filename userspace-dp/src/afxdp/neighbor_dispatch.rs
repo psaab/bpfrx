@@ -499,6 +499,9 @@ pub(super) fn build_missing_neighbor_session_metadata(
         fabric_ingress,
         is_reverse: false,
         nat64_reverse: None,
+        // #2508: neighbor-seed sessions carry no per-policy `then log`.
+        log_session_init: false,
+        log_session_close: false,
     }
 }
 

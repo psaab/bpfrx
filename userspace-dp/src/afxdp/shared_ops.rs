@@ -624,6 +624,10 @@ pub(super) fn build_reverse_session_from_forward_match(
         fabric_ingress: forward_match.metadata.fabric_ingress,
         is_reverse: true,
         nat64_reverse: None,
+        // #2508: inherit the forward session's per-policy log selection so
+        // the reverse companion's close delta carries a consistent gate.
+        log_session_init: forward_match.metadata.log_session_init,
+        log_session_close: forward_match.metadata.log_session_close,
     };
     let decision = SessionDecision {
         resolution: redirect_session_resolution_for_metadata(forwarding, resolution, &metadata),

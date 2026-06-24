@@ -113,6 +113,15 @@ func buildOneRuleSnapshot(
 	srcBookIDs, srcLiterals := classifyPolicyAddresses(cfg, nameToID, pol.Match.SourceAddresses)
 	dstBookIDs, dstLiterals := classifyPolicyAddresses(cfg, nameToID, pol.Match.DestinationAddresses)
 	schedulerName := pol.SchedulerName
+	// #2508: carry the per-policy `then log session-init`/`session-close`
+	// selection into the snapshot so the dataplane can gate the per-policy
+	// RT_FLOW SYSLOG records. The global NetFlow/IPFIX close exporter
+	// (#2460) is independent of these flags.
+	var logSessionInit, logSessionClose bool
+	if pol.Log != nil {
+		logSessionInit = pol.Log.SessionInit
+		logSessionClose = pol.Log.SessionClose
+	}
 	return PolicyRuleSnapshot{
 		RuleID:               stablePolicyRuleID(fromZone, toZone, pol.Name),
 		PolicyID:             policyID,
@@ -133,6 +142,9 @@ func buildOneRuleSnapshot(
 		// #2008 H2: carry the match-inversion flags to the dataplane.
 		SourceAddressExcluded:      pol.Match.SourceAddressExcluded,
 		DestinationAddressExcluded: pol.Match.DestinationAddressExcluded,
+		// #2508: per-policy RT_FLOW SYSLOG log selection.
+		LogSessionInit:  logSessionInit,
+		LogSessionClose: logSessionClose,
 	}
 }
 

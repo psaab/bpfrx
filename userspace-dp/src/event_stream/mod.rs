@@ -419,6 +419,42 @@ impl EventStreamWorkerHandle {
             delta.metadata.ingress_zone,
             delta.metadata.egress_zone,
             delta.metadata.owner_rg_id as i16,
+            // #2508: per-policy RT_FLOW SYSLOG gate byte. The frame is sent
+            // unconditionally (the Go NetFlow/IPFIX exporter accounts every
+            // close), but this bit tells the Go logEvent path whether to ALSO
+            // emit the per-policy RT_FLOW_SESSION_CLOSE syslog record.
+            delta.metadata.log_session_close,
+        );
+        self.try_send(frame);
+    }
+
+    /// #2508: emit an RT_FLOW SESSION_CREATE frame (type 15) for a session
+    /// admitted by a policy configured with `then log session-init`. There is
+    /// NO flowexport consumer of session opens, so unlike the close frame this
+    /// is gated entirely at the producer: the caller invokes it only when
+    /// `delta.metadata.log_session_init` is set. The frame rides the same raw
+    /// dataplane-event channel and is formatted as RT_FLOW_SESSION_CREATE by
+    /// the Go logEvent path. Best-effort (`try_send`).
+    pub(crate) fn emit_session_create_rt_flow(&self, delta: &SessionDelta) {
+        if delta.kind != SessionDeltaKind::Open {
+            return;
+        }
+        let nat = &delta.decision.nat;
+        let seq = self.next_seq();
+        let frame = EventFrame::encode_session_create_rt_flow(
+            seq,
+            delta.key.addr_family,
+            delta.key.protocol,
+            delta.key.src_ip,
+            delta.key.dst_ip,
+            delta.key.src_port,
+            delta.key.dst_port,
+            nat.rewrite_src,
+            nat.rewrite_dst,
+            nat.rewrite_src_port.unwrap_or(0),
+            nat.rewrite_dst_port.unwrap_or(0),
+            delta.metadata.ingress_zone,
+            delta.metadata.egress_zone,
         );
         self.try_send(frame);
     }

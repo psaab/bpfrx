@@ -65,6 +65,8 @@ fn metadata() -> SessionMetadata {
         fabric_ingress: false,
         is_reverse: false,
         nat64_reverse: None,
+        log_session_init: false,
+        log_session_close: false,
     }
 }
 

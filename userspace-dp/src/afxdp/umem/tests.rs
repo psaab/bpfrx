@@ -1526,6 +1526,8 @@ fn active_flow_debug_test_entry(
             fabric_ingress: false,
             is_reverse: false,
             nat64_reverse: None,
+            log_session_init: false,
+            log_session_close: false,
         },
         stamp,
         observed_bytes: 0,

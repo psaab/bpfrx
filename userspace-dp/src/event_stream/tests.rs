@@ -94,6 +94,8 @@ fn test_close_delta(kind: crate::session::SessionDeltaKind) -> crate::session::S
             fabric_ingress: false,
             is_reverse: false,
             nat64_reverse: None,
+            log_session_init: false,
+            log_session_close: false,
         },
         origin: SessionOrigin::ForwardFlow,
         fabric_redirect_sync: false,
