@@ -1465,12 +1465,56 @@ func (vi *vrrpInstance) garpSendAllowed(force bool, nowNanos int64) bool {
 // sender (#2152) without performing real AF_PACKET I/O.
 var arpProbeFn = cluster.SendARPProbe
 
+// gatewayProbeTarget computes the supplementary gateway-probe target for an
+// IPv4 VIP subnet: the first usable host address (network address + 1), which
+// is the most common gateway address. The second return value reports whether
+// a sensible target exists; when it is false the caller MUST skip the
+// supplementary targeted probe (the broadcast GARP burst in
+// SendGratuitousARPBurst always fires regardless and remains the primary
+// mechanism).
+//
+// It returns ok=false when no usable network+1 host exists inside the subnet:
+//   - non-IPv4 ipNet (defensive; the caller invokes this only on the v4 path)
+//   - /32 host route — the VIP is the only address, there is no gateway host
+//   - /31 RFC 3021 point-to-point — no network/broadcast, no ".1" host; the
+//     peer is reachable via the broadcast GARP burst, so skip the directed
+//     probe rather than emit one to a synthesized address
+//
+// Pre-#2377 the target was computed by forcing the network address's last
+// octet to .1 (gwIP[3] = 1). That only lands inside the subnet for /24 or
+// shorter: for a longer subnet whose network address does not end in .0 (e.g.
+// VIP 10.0.61.18/28, network 10.0.61.16) the forced .1 (10.0.61.1) falls
+// OUTSIDE the subnet (.16-.31) and the probe went to a foreign address.
+// Computing network+1 from the masked CIDR keeps the target inside the subnet
+// for every prefix length.
+func gatewayProbeTarget(ipNet *net.IPNet) (net.IP, bool) {
+	ip4 := ipNet.IP.To4()
+	if ip4 == nil {
+		return nil, false
+	}
+	ones, bits := ipNet.Mask.Size()
+	if bits != 32 {
+		return nil, false
+	}
+	// /31 and /32 have no usable network+1 host inside the subnet.
+	if ones >= 31 {
+		return nil, false
+	}
+	// ipNet.IP is the masked network address (net.ParseCIDR), so +1 is the
+	// first usable host regardless of the original last octet.
+	netVal := binary.BigEndian.Uint32(ip4)
+	gwIP := make(net.IP, 4)
+	binary.BigEndian.PutUint32(gwIP, netVal+1)
+	return gwIP, true
+}
+
 // sendGARP sends gratuitous ARP (IPv4) and unsolicited NA (IPv6) for all VIPs.
 // Uses burst mode: one immediate pair then background follow-ups at 50ms intervals.
 // After each IPv4 GARP burst, also sends a standard ARP probe to the subnet's
-// gateway (.1) address. Some routers ignore gratuitous ARP but always update
-// their ARP cache when they receive a standard ARP Request with the VIP as
-// the source address.
+// first usable host (network address + 1), the most common gateway address
+// (see gatewayProbeTarget; skipped on /31 and /32). Some routers ignore
+// gratuitous ARP but always update their ARP cache when they receive a
+// standard ARP Request with the VIP as the source address.
 //
 // force bypasses the 500ms time dampener (but not the per-epoch dedup) so a
 // post-MAC-change reconcile GARP is always emitted; see garpSendAllowed.
@@ -1494,13 +1538,14 @@ func (vi *vrrpInstance) sendGARP(force bool) {
 			if err := cluster.SendGratuitousARPBurst(vi.cfg.Interface, ip, count); err != nil {
 				slog.Warn("vrrp: GARP failed", "key", vi.key(), "vip", ip, "err", err)
 			}
-			// Probe the .1 address of the VIP subnet — this is the most
-			// common gateway address. The ARP Request's source IP/MAC
-			// forces the gateway to update its ARP cache for our VIP.
-			gwIP := make(net.IP, 4)
-			copy(gwIP, ipNet.IP.To4())
-			gwIP[3] = 1
-			if !gwIP.Equal(ip.To4()) {
+			// Probe the first usable host (network address + 1) of the
+			// VIP subnet — this is the most common gateway address. The
+			// ARP Request's source IP/MAC forces the gateway to update its
+			// ARP cache for our VIP. gatewayProbeTarget returns ok=false on
+			// /31 and /32, where no in-subnet gateway host exists; the
+			// broadcast GARP burst above still fires (#2377).
+			gwIP, ok := gatewayProbeTarget(ipNet)
+			if ok && !gwIP.Equal(ip.To4()) {
 				// Send the probe with the VIP as the ARP sender so the
 				// gateway re-binds VIP -> our (new) MAC, not the primary
 				// IP -> MAC (#2152).

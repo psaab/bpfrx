@@ -100,6 +100,18 @@ This is the package that drives chassis-cluster failover.
   the correction GARP must not be swallowed by a routine burst that fired in
   the prior 500 ms (#2081). The decision lives in the network-free helper
   `garpSendAllowed`, which is unit-tested directly.
+- Supplementary gateway ARP probe: after each IPv4 GARP burst, `sendGARP`
+  also sends a directed ARP Request — VIP as the ARP sender (#2152) — to the
+  subnet's first usable host (network address + 1, the most common gateway),
+  so a router that ignores broadcast gratuitous ARP still re-binds the VIP.
+  This is belt-and-suspenders: the broadcast GARP burst always fires; the
+  directed probe is supplementary. The target comes from the network-free
+  helper `gatewayProbeTarget`, which computes network+1 from the masked CIDR
+  (`net.ParseCIDR`) — it returns `ok=false` to SKIP the directed probe on
+  /31 (RFC 3021) and /32, where no in-subnet gateway host exists. Pre-#2377
+  the target was the network address with its last octet forced to .1, which
+  fell OUTSIDE the subnet for /25-or-longer prefixes whose network does not
+  end in .0 (e.g. VIP 10.0.61.18/28 → 10.0.61.1, outside .16-.31).
 - Event debounce 500 ms before priority updates.
 - Sync hold: VRRP starts with `preempt=false`; released after bulk
   session sync (or 10 s timeout). `preemptNowCh` triggers instant
