@@ -548,7 +548,18 @@ pub(in crate::afxdp) fn enqueue_pending_forwards(
                         {
                             // RFC 792 / RFC 4443 suppression: never reply to
                             // a non-first fragment or an inbound ICMP error.
-                            if !ptb_reply_suppressed(source_frame, ptb_meta, l3, forwarding) {
+                            // #2472: AND a per-reason token-bucket rate limit —
+                            // an oversized-DF / IPv6 flood would otherwise emit
+                            // one PTB per trigger packet, unbounded (CPU/TX
+                            // amplification + reflection). On bucket-empty the
+                            // PTB is suppressed (the `PacketTooBig` rate-limited
+                            // counter is bumped inside `allow_generated_error`);
+                            // the oversized original is still dropped below
+                            // (`mtu_signalled`), so this never falls through to
+                            // forward the MTU-violating frame.
+                            if !ptb_reply_suppressed(source_frame, ptb_meta, l3, forwarding)
+                                && allow_generated_error(GeneratedErrorReason::PacketTooBig)
+                            {
                                 ptb_reply = match request.meta.addr_family as i32 {
                                     libc::AF_INET => build_frag_needed_v4(
                                         source_frame,

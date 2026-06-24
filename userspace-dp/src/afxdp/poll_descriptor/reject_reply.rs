@@ -18,6 +18,7 @@ use super::cookie_reply::syn_cookie_reply_budget_available;
 use super::worker::WorkerTxPipeline;
 use super::*;
 use crate::afxdp::icmp::build_reject_icmp_unreachable;
+use crate::afxdp::icmp_ratelimit::{GeneratedErrorReason, allow_generated_error};
 
 /// Which `reject` source a synthesized reply is attributed to. Selects the
 /// per-source counters so a policy `then reject` and a firewall-filter `then
@@ -103,6 +104,23 @@ fn enqueue_reject_reply(
     if !syn_cookie_reply_budget_available(tx_pipeline) {
         counters.touched = true;
         counters.policy_reject_reply_budget_drops += 1;
+        return false;
+    }
+
+    // #2472: per-reason token-bucket rate limit on the LOCALLY-GENERATED
+    // reject reply (TCP RST or ICMP/ICMPv6 unreachable). The SYN-cookie
+    // TX-frame budget gate above is a queue-protection gate (it keeps the
+    // reply ring from starving transit TX), NOT a per-reason rate cap — under
+    // a sustained rejected-flow flood it refills as fast as TX drains. The
+    // token bucket bounds the generated-error RATE so a flood of rejected
+    // flows cannot be amplified into unbounded RST/ICMP backscatter. Both
+    // policy and filter reject share this `Reject` bucket (a single emit
+    // path, per the RejectReplySource doc comment). On bucket-empty we
+    // fail-closed to the silent drop the caller already performs and bump the
+    // observable `Reject` rate-limited counter (inside
+    // `allow_generated_error`).
+    if !allow_generated_error(GeneratedErrorReason::Reject) {
+        counters.touched = true;
         return false;
     }
 
@@ -262,6 +280,12 @@ mod tests {
     #[test]
     fn reject_tcp_with_egress_enqueues_rst() {
         use super::cookie_reply::SYN_COOKIE_REPLY_PENDING_RESERVE;
+        // #2472: the Reject token bucket is global; reset it full so a parallel
+        // test that drained it cannot make this success-path assertion flake.
+        crate::afxdp::icmp_ratelimit::reset_bucket_for_test(
+            crate::afxdp::icmp_ratelimit::GeneratedErrorReason::Reject,
+            0,
+        );
         let (frame, meta, flow) = tcp_v4_syn();
         let mut pipeline = tx_pipeline(
             SYN_COOKIE_REPLY_PENDING_RESERVE * 2,
@@ -307,6 +331,10 @@ mod tests {
     #[test]
     fn reject_reply_dropped_by_egress_output_filter() {
         use super::cookie_reply::SYN_COOKIE_REPLY_PENDING_RESERVE;
+        crate::afxdp::icmp_ratelimit::reset_bucket_for_test(
+            crate::afxdp::icmp_ratelimit::GeneratedErrorReason::Reject,
+            0,
+        );
         // Inbound ICMP echo (a query, not an error) on ifindex 5 → the
         // reject path builds an ICMP unreachable, which the egress output
         // filter discards.
@@ -412,6 +440,10 @@ mod tests {
     #[test]
     fn filter_reject_tcp_enqueues_rst_filter_counter() {
         use super::cookie_reply::SYN_COOKIE_REPLY_PENDING_RESERVE;
+        crate::afxdp::icmp_ratelimit::reset_bucket_for_test(
+            crate::afxdp::icmp_ratelimit::GeneratedErrorReason::Reject,
+            0,
+        );
         let (frame, meta, flow) = tcp_v4_syn();
         let mut pipeline = tx_pipeline(
             SYN_COOKIE_REPLY_PENDING_RESERVE * 2,
@@ -453,6 +485,10 @@ mod tests {
     #[test]
     fn filter_reject_non_tcp_enqueues_icmp_unreachable() {
         use super::cookie_reply::SYN_COOKIE_REPLY_PENDING_RESERVE;
+        crate::afxdp::icmp_ratelimit::reset_bucket_for_test(
+            crate::afxdp::icmp_ratelimit::GeneratedErrorReason::Reject,
+            0,
+        );
         let client = std::net::Ipv4Addr::new(10, 0, 61, 102);
         let server = std::net::Ipv4Addr::new(1, 1, 1, 1);
         let mut frame = Vec::new();
@@ -525,6 +561,65 @@ mod tests {
             .expect("filter reject ICMP request");
         // ICMP unreachable: type 3 at the L4 offset of the reply.
         assert_eq!(req.bytes[14 + 20], 3, "ICMP type must be Destination Unreachable");
+    }
+
+    /// #2472 call-site fail-on-revert: once the global per-reason `Reject`
+    /// token bucket is empty, `enqueue_policy_reject_reply` MUST fail-closed
+    /// (no RST enqueued, `policy_reject_sent` stays 0) and the observable
+    /// `Reject` rate-limited counter MUST advance — even though the TX-frame
+    /// budget is plentiful. Without the #2472 limiter the reject reply would
+    /// enqueue regardless of how many were generated, so this test fails on a
+    /// revert of the call-site gate.
+    #[test]
+    fn reject_reply_rate_limited_when_bucket_empty() {
+        use super::cookie_reply::SYN_COOKIE_REPLY_PENDING_RESERVE;
+        use crate::afxdp::icmp_ratelimit::{
+            GeneratedErrorReason, allow_generated_error_at, rate_limited_count,
+            reset_bucket_for_test,
+        };
+        let (frame, meta, flow) = tcp_v4_syn();
+        // The call site samples the REAL `monotonic_nanos()` (boot-relative,
+        // small), which we cannot freeze. To keep the global Reject bucket
+        // empty across that call, pin its refill epoch (`last_ns`) to a FAR
+        // FUTURE value, then drain it: the call site's smaller `now_ns` yields
+        // `saturating_sub == 0` → zero refill → the bucket stays empty and the
+        // call site's `allow_generated_error(Reject)` is denied. (On a deny
+        // with no refill, `try_take` does NOT advance `last_ns`, so the
+        // far-future epoch — and thus the empty state — survives the call.)
+        let far_future = u64::MAX / 2;
+        reset_bucket_for_test(GeneratedErrorReason::Reject, far_future);
+        while allow_generated_error_at(GeneratedErrorReason::Reject, far_future, 1000, 1000) {}
+        let before = rate_limited_count(GeneratedErrorReason::Reject);
+        let mut pipeline = tx_pipeline(
+            SYN_COOKIE_REPLY_PENDING_RESERVE * 2,
+            SYN_COOKIE_REPLY_PENDING_RESERVE + 1,
+        );
+        let forwarding = ForwardingState::default();
+        let mut counters = BatchCounters::default();
+        let sent = enqueue_policy_reject_reply(
+            &mut pipeline,
+            &forwarding,
+            5,
+            &frame,
+            meta,
+            &flow,
+            &mut counters,
+        );
+        assert!(!sent, "reject reply must fail-closed when rate-limited");
+        assert_eq!(
+            counters.policy_reject_sent, 0,
+            "no reject must be counted as sent under rate limit"
+        );
+        assert!(
+            pipeline.pending_tx_local.is_empty(),
+            "no RST may be enqueued under rate limit"
+        );
+        assert!(
+            rate_limited_count(GeneratedErrorReason::Reject) > before,
+            "the rate-limited drop must bump the observable Reject counter"
+        );
+        // Restore a full bucket so sibling tests in this binary are unaffected.
+        reset_bucket_for_test(GeneratedErrorReason::Reject, 0);
     }
 
     #[test]

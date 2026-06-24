@@ -867,6 +867,39 @@ func newCollector(srv *Server) *xpfCollector {
 				"(#2331).",
 			nil, nil,
 		),
+		userspaceTimeExceededRateLimited: prometheus.NewDesc(
+			"xpf_userspace_time_exceeded_rate_limited_total",
+			"Locally-generated ICMP/ICMPv6 Time Exceeded (TTL/hop-limit) "+
+				"error replies dropped because the per-reason token bucket "+
+				"was empty. The generator is rate-limited (global-per-reason, "+
+				"Linux icmp_msgs_per_sec model, default 1000/s + 1000 burst) "+
+				"so a low-TTL flood or a routing loop cannot drive unbounded "+
+				"generated-error emission (CPU/TX amplification + reflection). "+
+				"A nonzero value flags an error-amplification attempt (or a "+
+				"real routing loop) being clamped (#2472).",
+			nil, nil,
+		),
+		userspacePacketTooBigRateLimited: prometheus.NewDesc(
+			"xpf_userspace_packet_too_big_rate_limited_total",
+			"Locally-generated ICMPv4 Frag-Needed / ICMPv6 Packet Too Big "+
+				"PMTUD replies dropped because the per-reason token bucket "+
+				"was empty (same limiter as Time Exceeded, independent "+
+				"bucket). A nonzero value flags an oversized-DF / IPv6 flood "+
+				"being clamped before it amplifies into unbounded PTB "+
+				"emission (#2472).",
+			nil, nil,
+		),
+		userspaceRejectRateLimited: prometheus.NewDesc(
+			"xpf_userspace_reject_rate_limited_total",
+			"Locally-generated policy/filter `reject` replies (TCP RST or "+
+				"ICMP/ICMPv6 administratively-prohibited unreachable) dropped "+
+				"because the per-reason token bucket was empty. This is in "+
+				"ADDITION to the SYN-cookie TX-frame budget gate "+
+				"(which is queue protection, not a rate cap). A nonzero value "+
+				"flags a rejected-flow flood being clamped before it amplifies "+
+				"into unbounded RST/ICMP backscatter (#2472).",
+			nil, nil,
+		),
 		userspaceFlowCacheActiveFlows: prometheus.NewDesc(
 			"xpf_userspace_flow_cache_active_flows",
 			"Aggregate active userspace flow-cache entries across bindings.",

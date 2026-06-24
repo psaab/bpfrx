@@ -82,6 +82,7 @@ mod ha;
 mod icmp;
 mod icmp_embed;
 mod icmp_ptb;
+mod icmp_ratelimit;
 mod mirror;
 #[path = "mpsc_inbox.rs"]
 mod mpsc_inbox;
@@ -159,6 +160,7 @@ use self::icmp_ptb::{
     EgressMtuDecision, build_frag_needed_v4, build_packet_too_big_v6,
     forwarded_egress_mtu_decision, post_transform_inner_mtu, ptb_reply_suppressed,
 };
+use self::icmp_ratelimit::{GeneratedErrorReason, allow_generated_error};
 #[cfg(test)]
 use self::icmp::{
     build_local_time_exceeded_v4, build_local_time_exceeded_v6, build_reject_icmp_unreachable,
