@@ -722,19 +722,19 @@ pub(super) fn activated_owner_rgs(
         .collect()
 }
 
-/// Return the effective TCP MSS clamp value for the current config.
-/// Returns 0 if MSS clamping is disabled.
-#[allow(dead_code)]
+/// Return the `security flow tcp-mss all-tcp` clamp value (0 = unset).
+///
+/// #2486: `all-tcp` is the context-agnostic clamp — it applies to every
+/// forwarded TCP SYN regardless of tunnel context, and also serves as
+/// the fallback for the per-context selectors (`gre-in`, tunnel egress)
+/// below. `ipsec-vpn` is NOT read here: there is no IPsec context in the
+/// userspace forward-build path (ESP/AH/IKE is local-delivered to the
+/// kernel XFRM stack and the decrypted inner packets re-enter as plain
+/// traffic with no IPsec marker), so `security flow tcp-mss ipsec-vpn`
+/// is rejected at commit (pkg/config compiler) rather than carried as
+/// dead config.
 pub(super) fn effective_tcp_mss(forwarding: &ForwardingState) -> u16 {
-    if forwarding.tcp_mss_all_tcp > 0 {
-        return forwarding.tcp_mss_all_tcp;
-    }
-    // IPsec VPN and GRE MSS values are returned when configured;
-    // the caller is responsible for checking the tunnel context.
-    if forwarding.tcp_mss_ipsec_vpn > 0 {
-        return forwarding.tcp_mss_ipsec_vpn;
-    }
-    0
+    forwarding.tcp_mss_all_tcp
 }
 
 pub(super) fn native_gre_inner_mtu(
@@ -872,6 +872,42 @@ pub(super) fn tunnel_tcp_mss(
         );
     }
     native_gre_tcp_mss(forwarding, decision, addr_family)
+}
+
+/// #2486: select the per-packet TCP MSS clamp value by forwarding
+/// context. All four Junos `security flow tcp-mss` contexts are resolved
+/// here at frame-build time so an accepted clamp is actually enforced
+/// (previously only tunnel egress clamped — `all-tcp` / `gre-in` were
+/// dead config and `gre-in` produced a silent full-MSS blackhole on the
+/// GRE return path).
+///
+/// Priority (most specific wins, `all-tcp` is the universal fallback):
+///   1. Tunnel egress (`tunnel_endpoint_id != 0`): the GRE/WG
+///      overhead-aware value via `tunnel_tcp_mss` (gre-out, or the
+///      MTU-derived formula). Falls back to `all-tcp` only when that
+///      yields 0 (no gre-out and no MTU available).
+///   2. GRE-decapped ingress (`GRE_DECAP_INGRESS_FLAG`): `gre-in`,
+///      falling back to `all-tcp`.
+///   3. Plain forwarded packet: `all-tcp`.
+///
+/// `ipsec-vpn` is intentionally absent — it is rejected at commit (no
+/// IPsec context reaches this path; see `effective_tcp_mss`).
+pub(super) fn select_tcp_mss(
+    forwarding: &ForwardingState,
+    decision: &SessionDecision,
+    meta: &ForwardPacketMeta,
+) -> u16 {
+    if decision.resolution.tunnel_endpoint_id != 0 {
+        let tunnel = tunnel_tcp_mss(forwarding, decision, meta.addr_family);
+        if tunnel > 0 {
+            return tunnel;
+        }
+        return forwarding.tcp_mss_all_tcp;
+    }
+    if (meta.meta_flags & GRE_DECAP_INGRESS_FLAG) != 0 && forwarding.tcp_mss_gre_in > 0 {
+        return forwarding.tcp_mss_gre_in;
+    }
+    effective_tcp_mss(forwarding)
 }
 
 // #989: clamp_tcp_mss / clamp_tcp_mss_frame relocated to `frame/tcp.rs`.

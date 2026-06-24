@@ -19,7 +19,7 @@ use ipv4::build_forwarded_frame_into_ipv4;
 use ipv6::build_forwarded_frame_into_ipv6;
 
 use super::{
-    decode_frame_summary, frame_has_tcp_rst, frame_l3_offset, trim_l3_payload, tunnel_tcp_mss,
+    decode_frame_summary, frame_has_tcp_rst, frame_l3_offset, select_tcp_mss, trim_l3_payload,
     verify_built_frame_checksums, write_eth_header_slice, ForwardPacketMeta,
     ForwardingDisposition, ForwardingState, SessionDecision,
 };
@@ -87,11 +87,14 @@ pub(in crate::afxdp) fn build_forwarded_frame_into_from_frame(
     }
     let out = &mut out[..frame_len];
     let force_tunnel_l4_recompute = decision.resolution.tunnel_endpoint_id != 0;
-    // #2299: dispatch the MSS clamp by tunnel kind — WG needs the larger
+    // #2486: select the MSS clamp by per-packet forwarding context
+    // (all-tcp / gre-in / tunnel-egress). #2299: tunnel egress still
+    // dispatches by kind inside `select_tcp_mss` — WG needs the larger
     // WG-overhead-aware value, not the GRE formula (which would clamp too
     // high and get the peer's full-MSS data dropped at the WG encap MTU
-    // guard). Non-WG / plain-forward keep the GRE formula bit-for-bit.
-    let tunnel_tcp_mss = tunnel_tcp_mss(forwarding, decision, meta.addr_family);
+    // guard). Plain forwarded SYNs now clamp to `all-tcp`; GRE-decapped
+    // ingress SYNs clamp to `gre-in` (was previously dead config).
+    let tunnel_tcp_mss = select_tcp_mss(forwarding, decision, &meta);
     let ip_start = eth_len;
     match meta.addr_family as i32 {
         libc::AF_INET => build_forwarded_frame_into_ipv4(

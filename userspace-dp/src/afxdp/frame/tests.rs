@@ -6282,3 +6282,393 @@ fn inject_ipv6_giant_length_clamped_no_wire_wrap() {
         "IPv6 payload-length must match the bounded frame (no u16 wrap)"
     );
 }
+
+// =====================================================================
+// #2486: per-context TCP MSS clamp enforcement (all-tcp / gre-in).
+//
+// Before #2486 only tunnel EGRESS clamped; `all-tcp` and `gre-in` were
+// accepted at commit and carried on the wire but never enforced. The
+// gre-in gap was a silent full-MSS blackhole on the GRE return path.
+// These tests prove the per-packet context selection in `select_tcp_mss`
+// (forwarding/mod.rs) reaches the clamp at frame build, and fail on
+// revert of either the all-tcp wiring or the gre-in marker plumbing.
+// =====================================================================
+
+/// Build a plain (non-tunnel) IPv4 TCP SYN frame carrying an MSS option.
+/// `mss` is the advertised MSS in the SYN's TCP options.
+fn build_ipv4_tcp_syn_with_mss(
+    src: Ipv4Addr,
+    dst: Ipv4Addr,
+    src_port: u16,
+    dst_port: u16,
+    mss: u16,
+) -> Vec<u8> {
+    let mut frame = Vec::new();
+    write_eth_header(
+        &mut frame,
+        [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
+        [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
+        0,
+        0x0800,
+    );
+    // IPv4 header: 20 bytes IP + 24 bytes TCP (20 + 4-byte MSS option).
+    let total_len = 20u16 + 24u16;
+    frame.extend_from_slice(&[
+        0x45,
+        0x00,
+        (total_len >> 8) as u8,
+        total_len as u8,
+        0x12,
+        0x34,
+        0x40,
+        0x00,
+        64,
+        PROTO_TCP,
+        0x00,
+        0x00,
+    ]);
+    frame.extend_from_slice(&src.octets());
+    frame.extend_from_slice(&dst.octets());
+    frame.extend_from_slice(&src_port.to_be_bytes());
+    frame.extend_from_slice(&dst_port.to_be_bytes());
+    frame.extend_from_slice(&[
+        0x00, 0x00, 0x00, 0x01, // seq
+        0x00, 0x00, 0x00, 0x00, // ack
+        0x60, TCP_FLAG_SYN, 0xfa, 0xf0, // data offset (6 words = 24B)/flags/window
+        0x00, 0x00, 0x00, 0x00, // checksum + urg
+    ]);
+    frame.extend_from_slice(&[0x02, 0x04]); // MSS option kind=2 len=4
+    frame.extend_from_slice(&mss.to_be_bytes());
+    let ip_sum = checksum16(&frame[14..34]);
+    frame[24] = (ip_sum >> 8) as u8;
+    frame[25] = ip_sum as u8;
+    recompute_l4_checksum_ipv4(&mut frame[14..], 20, PROTO_TCP, false).expect("v4 tcp sum");
+    frame
+}
+
+/// Build a plain (non-tunnel) IPv6 TCP SYN frame carrying an MSS option.
+fn build_ipv6_tcp_syn_with_mss(
+    src: Ipv6Addr,
+    dst: Ipv6Addr,
+    src_port: u16,
+    dst_port: u16,
+    mss: u16,
+) -> Vec<u8> {
+    let mut frame = Vec::new();
+    write_eth_header(
+        &mut frame,
+        [0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff],
+        [0x02, 0x00, 0x00, 0x00, 0x00, 0x01],
+        0,
+        0x86dd,
+    );
+    let plen = 24u16; // 20 TCP + 4 MSS option
+    frame.extend_from_slice(&[
+        0x60,
+        0x00,
+        0x00,
+        0x00,
+        (plen >> 8) as u8,
+        plen as u8,
+        PROTO_TCP,
+        64,
+    ]);
+    frame.extend_from_slice(&src.octets());
+    frame.extend_from_slice(&dst.octets());
+    frame.extend_from_slice(&src_port.to_be_bytes());
+    frame.extend_from_slice(&dst_port.to_be_bytes());
+    frame.extend_from_slice(&[
+        0x00, 0x00, 0x00, 0x01, // seq
+        0x00, 0x00, 0x00, 0x00, // ack
+        0x60, TCP_FLAG_SYN, 0xfa, 0xf0, // data offset (6 words)/flags/window
+        0x00, 0x00, 0x00, 0x00, // checksum + urg
+    ]);
+    frame.extend_from_slice(&[0x02, 0x04]);
+    frame.extend_from_slice(&mss.to_be_bytes());
+    recompute_l4_checksum_ipv6(&mut frame[14..], 40, PROTO_TCP).expect("v6 tcp sum");
+    frame
+}
+
+/// A plain ForwardCandidate decision (no tunnel) for a forwarded packet.
+fn plain_forward_decision_v4(dst: Ipv4Addr) -> SessionDecision {
+    SessionDecision {
+        resolution: ForwardingResolution {
+            disposition: ForwardingDisposition::ForwardCandidate,
+            local_ifindex: 0,
+            egress_ifindex: 12,
+            tx_ifindex: 11,
+            tunnel_endpoint_id: 0,
+            next_hop: Some(IpAddr::V4(dst)),
+            neighbor_mac: Some([0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]),
+            src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x80, 0x08]),
+            tx_vlan_id: 0,
+        },
+        nat: NatDecision::default(),
+    }
+}
+
+fn plain_meta_v4(src_port: u16, dst_port: u16, meta_flags: u8) -> UserspaceDpMeta {
+    UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+        l3_offset: 14,
+        l4_offset: 34,
+        addr_family: libc::AF_INET as u8,
+        protocol: PROTO_TCP,
+        tcp_flags: TCP_FLAG_SYN,
+        meta_flags,
+        flow_src_port: src_port,
+        flow_dst_port: dst_port,
+        ..UserspaceDpMeta::default()
+    }
+}
+
+/// Read the MSS option value back out of a built IPv4 frame (eth+20 IP).
+fn built_ipv4_mss(frame: &[u8]) -> u16 {
+    // eth(14) + IPv4(20) -> TCP; MSS option at TCP offset 20 (+2 for value).
+    let mss_off = 14 + 20 + 22;
+    u16::from_be_bytes([frame[mss_off], frame[mss_off + 1]])
+}
+
+fn built_ipv6_mss(frame: &[u8]) -> u16 {
+    let mss_off = 14 + 40 + 22;
+    u16::from_be_bytes([frame[mss_off], frame[mss_off + 1]])
+}
+
+#[test]
+fn all_tcp_clamps_plain_forwarded_ipv4_syn() {
+    let src = Ipv4Addr::new(10, 0, 1, 102);
+    let dst = Ipv4Addr::new(10, 0, 2, 200);
+    let frame = build_ipv4_tcp_syn_with_mss(src, dst, 40000, 5201, 1460);
+    let forwarding = ForwardingState {
+        tcp_mss_all_tcp: 1400,
+        ..ForwardingState::default()
+    };
+    let built = build_forwarded_frame_from_frame(
+        &frame,
+        plain_meta_v4(40000, 5201, 0),
+        &plain_forward_decision_v4(dst),
+        &forwarding,
+        false,
+        None,
+    )
+    .expect("plain forward build");
+    assert_eq!(
+        built_ipv4_mss(&built),
+        1400,
+        "all-tcp must clamp a plain forwarded IPv4 SYN with MSS 1460 -> 1400"
+    );
+    let inner = &built[14..];
+    assert!(tcp_checksum_ok_ipv4(inner), "clamped v4 TCP checksum valid");
+}
+
+#[test]
+fn all_tcp_clamps_plain_forwarded_ipv6_syn() {
+    let src: Ipv6Addr = "2001:559:8585:bf01::102".parse().unwrap();
+    let dst: Ipv6Addr = "2001:559:8585:bf02::200".parse().unwrap();
+    let frame = build_ipv6_tcp_syn_with_mss(src, dst, 40000, 5201, 1440);
+    let forwarding = ForwardingState {
+        tcp_mss_all_tcp: 1380,
+        ..ForwardingState::default()
+    };
+    let meta = UserspaceDpMeta {
+        magic: USERSPACE_META_MAGIC,
+        version: USERSPACE_META_VERSION,
+        length: std::mem::size_of::<UserspaceDpMeta>() as u16,
+        l3_offset: 14,
+        l4_offset: 54,
+        addr_family: libc::AF_INET6 as u8,
+        protocol: PROTO_TCP,
+        tcp_flags: TCP_FLAG_SYN,
+        flow_src_port: 40000,
+        flow_dst_port: 5201,
+        ..UserspaceDpMeta::default()
+    };
+    let decision = SessionDecision {
+        resolution: ForwardingResolution {
+            disposition: ForwardingDisposition::ForwardCandidate,
+            local_ifindex: 0,
+            egress_ifindex: 12,
+            tx_ifindex: 11,
+            tunnel_endpoint_id: 0,
+            next_hop: Some(IpAddr::V6(dst)),
+            neighbor_mac: Some([0xba, 0x86, 0xe9, 0xf6, 0x4b, 0xd5]),
+            src_mac: Some([0x02, 0xbf, 0x72, 0x00, 0x80, 0x08]),
+            tx_vlan_id: 0,
+        },
+        nat: NatDecision::default(),
+    };
+    let built = build_forwarded_frame_from_frame(&frame, meta, &decision, &forwarding, false, None)
+        .expect("plain forward v6 build");
+    assert_eq!(
+        built_ipv6_mss(&built),
+        1380,
+        "all-tcp must clamp a plain forwarded IPv6 SYN with MSS 1440 -> 1380"
+    );
+}
+
+#[test]
+fn all_tcp_leaves_smaller_mss_unchanged() {
+    let src = Ipv4Addr::new(10, 0, 1, 102);
+    let dst = Ipv4Addr::new(10, 0, 2, 200);
+    // Advertised MSS 1200 is already below the 1400 all-tcp clamp.
+    let frame = build_ipv4_tcp_syn_with_mss(src, dst, 40000, 5201, 1200);
+    let forwarding = ForwardingState {
+        tcp_mss_all_tcp: 1400,
+        ..ForwardingState::default()
+    };
+    let built = build_forwarded_frame_from_frame(
+        &frame,
+        plain_meta_v4(40000, 5201, 0),
+        &plain_forward_decision_v4(dst),
+        &forwarding,
+        false,
+        None,
+    )
+    .expect("plain forward build");
+    assert_eq!(
+        built_ipv4_mss(&built),
+        1200,
+        "all-tcp must NOT raise an MSS already below the clamp"
+    );
+}
+
+#[test]
+fn all_tcp_leaves_non_syn_untouched() {
+    let src = Ipv4Addr::new(10, 0, 1, 102);
+    let dst = Ipv4Addr::new(10, 0, 2, 200);
+    let mut frame = build_ipv4_tcp_syn_with_mss(src, dst, 40000, 5201, 1460);
+    // Clear the SYN flag -> ACK-only segment (0x10); the "MSS option" bytes
+    // are now just leftover option bytes but the clamp must skip non-SYN
+    // entirely.
+    const TCP_ACK_FLAG: u8 = 0x10;
+    frame[14 + 20 + 13] = TCP_ACK_FLAG;
+    recompute_l4_checksum_ipv4(&mut frame[14..], 20, PROTO_TCP, false).expect("recsum");
+    let forwarding = ForwardingState {
+        tcp_mss_all_tcp: 1400,
+        ..ForwardingState::default()
+    };
+    let mut meta = plain_meta_v4(40000, 5201, 0);
+    meta.tcp_flags = TCP_ACK_FLAG;
+    let built = build_forwarded_frame_from_frame(
+        &frame,
+        meta,
+        &plain_forward_decision_v4(dst),
+        &forwarding,
+        false,
+        None,
+    )
+    .expect("plain forward build");
+    assert_eq!(
+        built_ipv4_mss(&built),
+        1460,
+        "all-tcp must not clamp a non-SYN segment"
+    );
+}
+
+#[test]
+fn all_tcp_no_op_when_unset() {
+    // No all-tcp configured -> MSS must pass through unchanged on the
+    // plain forward path (regression guard against an accidental clamp).
+    let src = Ipv4Addr::new(10, 0, 1, 102);
+    let dst = Ipv4Addr::new(10, 0, 2, 200);
+    let frame = build_ipv4_tcp_syn_with_mss(src, dst, 40000, 5201, 1460);
+    let built = build_forwarded_frame_from_frame(
+        &frame,
+        plain_meta_v4(40000, 5201, 0),
+        &plain_forward_decision_v4(dst),
+        &ForwardingState::default(),
+        false,
+        None,
+    )
+    .expect("plain forward build");
+    assert_eq!(built_ipv4_mss(&built), 1460, "no clamp when all-tcp unset");
+}
+
+#[test]
+fn gre_in_clamps_decapped_ingress_syn() {
+    // An inbound GRE-decapped SYN (marked GRE_DECAP_INGRESS_FLAG by the
+    // decap stage) clamps to the gre-in value. Reverting the marker
+    // plumbing (clear meta_flags) makes this fail -> fail-on-revert for
+    // the gre-in HIGH part.
+    let src = Ipv4Addr::new(10, 0, 1, 102);
+    let dst = Ipv4Addr::new(10, 0, 2, 200);
+    let frame = build_ipv4_tcp_syn_with_mss(src, dst, 40000, 5201, 1460);
+    let forwarding = ForwardingState {
+        tcp_mss_gre_in: 1360,
+        ..ForwardingState::default()
+    };
+    let meta = plain_meta_v4(40000, 5201, GRE_DECAP_INGRESS_FLAG);
+    let built = build_forwarded_frame_from_frame(
+        &frame,
+        meta,
+        &plain_forward_decision_v4(dst),
+        &forwarding,
+        false,
+        None,
+    )
+    .expect("gre-in forward build");
+    assert_eq!(
+        built_ipv4_mss(&built),
+        1360,
+        "gre-in must clamp a GRE-decapped ingress SYN 1460 -> 1360"
+    );
+}
+
+#[test]
+fn gre_in_marker_required_for_gre_in_clamp() {
+    // Same gre-in config but WITHOUT the decap marker: the packet is a
+    // plain forward, so gre-in must NOT apply (and all-tcp is unset).
+    // This pins that the gre-in clamp is gated on the marker, not just on
+    // the config value being present.
+    let src = Ipv4Addr::new(10, 0, 1, 102);
+    let dst = Ipv4Addr::new(10, 0, 2, 200);
+    let frame = build_ipv4_tcp_syn_with_mss(src, dst, 40000, 5201, 1460);
+    let forwarding = ForwardingState {
+        tcp_mss_gre_in: 1360,
+        ..ForwardingState::default()
+    };
+    let built = build_forwarded_frame_from_frame(
+        &frame,
+        plain_meta_v4(40000, 5201, 0),
+        &plain_forward_decision_v4(dst),
+        &forwarding,
+        false,
+        None,
+    )
+    .expect("plain forward build");
+    assert_eq!(
+        built_ipv4_mss(&built),
+        1460,
+        "gre-in must require the GRE_DECAP_INGRESS_FLAG marker"
+    );
+}
+
+#[test]
+fn gre_in_falls_back_to_all_tcp() {
+    // A GRE-decapped SYN with no gre-in but an all-tcp value falls back
+    // to all-tcp (all-tcp is the universal fallback).
+    let src = Ipv4Addr::new(10, 0, 1, 102);
+    let dst = Ipv4Addr::new(10, 0, 2, 200);
+    let frame = build_ipv4_tcp_syn_with_mss(src, dst, 40000, 5201, 1460);
+    let forwarding = ForwardingState {
+        tcp_mss_all_tcp: 1410,
+        ..ForwardingState::default()
+    };
+    let meta = plain_meta_v4(40000, 5201, GRE_DECAP_INGRESS_FLAG);
+    let built = build_forwarded_frame_from_frame(
+        &frame,
+        meta,
+        &plain_forward_decision_v4(dst),
+        &forwarding,
+        false,
+        None,
+    )
+    .expect("gre-in fallback build");
+    assert_eq!(
+        built_ipv4_mss(&built),
+        1410,
+        "gre-in with no gre-in value falls back to all-tcp"
+    );
+}

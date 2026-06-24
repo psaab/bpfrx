@@ -7870,6 +7870,28 @@ fn gre_decap_well_formed_icmp_inner_v4_still_decaps() {
     assert_eq!(decap.meta.l4_offset, 14 + 20);
 }
 
+/// #2486 fail-on-revert: native GRE decap MUST stamp
+/// `GRE_DECAP_INGRESS_FLAG` on the inner packet's meta so the
+/// forward-frame builder selects the `tcp-mss gre-in` clamp. Reverting
+/// the `meta_flags: GRE_DECAP_INGRESS_FLAG` set in
+/// `try_native_gre_decap_from_frame` (gre.rs) makes this assertion fail
+/// — and with it the inbound GRE-decapped SYN goes back to being
+/// forwarded unclamped (the original silent full-MSS blackhole).
+#[test]
+fn gre_decap_marks_inner_meta_with_gre_in_flag() {
+    let forwarding = build_forwarding_state(&gre_to_self_snapshot());
+    let inner = build_gre_inner_icmp_packet_v4();
+    let frame = build_gre_to_self_outer_frame_with_inner(0x0800, &inner);
+    let meta = gre_to_self_outer_meta(0, frame.len());
+    let decap = try_native_gre_decap_from_frame(&frame, meta, &forwarding)
+        .expect("well-formed GRE inner must decap");
+    assert_ne!(
+        decap.meta.meta_flags & GRE_DECAP_INGRESS_FLAG,
+        0,
+        "decap must mark the inner meta as GRE-decapped (gre-in clamp marker)"
+    );
+}
+
 /// #2376 composition / no-regression: the pre-existing TCP guard must
 /// still drop a GRE inner declaring TCP but shorter than the 20-byte TCP
 /// header — the UDP/ICMP fix must not weaken the TCP path.

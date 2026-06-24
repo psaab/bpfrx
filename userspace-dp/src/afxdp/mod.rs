@@ -152,7 +152,9 @@ use self::forwarding::*;
 use self::forwarding_build::*;
 use self::frame::*;
 use self::gre::{encapsulate_native_gre_frame, try_native_gre_decap_from_frame};
-use self::icmp::{FABRIC_INGRESS_FLAG, build_local_time_exceeded_request, is_icmp_error};
+use self::icmp::{
+    FABRIC_INGRESS_FLAG, GRE_DECAP_INGRESS_FLAG, build_local_time_exceeded_request, is_icmp_error,
+};
 use self::icmp_ptb::{
     EgressMtuDecision, build_frag_needed_v4, build_packet_too_big_v6,
     forwarded_egress_mtu_decision, post_transform_inner_mtu, ptb_reply_suppressed,

@@ -689,6 +689,11 @@ pub(super) fn try_native_gre_decap_from_frame(
         addr_family: inner_family,
         protocol,
         tcp_flags: packet_tcp_flags(inner_packet, inner_family, protocol, rel_l4_offset),
+        // #2486: mark this inner packet as GRE-decapped so the forward
+        // builder selects the `tcp-mss gre-in` clamp value. The inbound
+        // GRE-decapped SYN is the exact direction where an inner LAN peer
+        // would otherwise learn an MSS too large for the GRE return path.
+        meta_flags: GRE_DECAP_INGRESS_FLAG,
         flow_src_port: src_port,
         flow_dst_port: dst_port,
         flow_src_addr,

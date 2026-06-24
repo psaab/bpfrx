@@ -2,6 +2,15 @@ use super::*;
 
 pub(super) const FABRIC_INGRESS_FLAG: u8 = 0x80;
 
+/// #2486: per-packet marker set by native GRE decap
+/// (`try_native_gre_decap_from_frame`) so the forward-frame builder can
+/// select the `security flow tcp-mss gre-in` clamp value for an inbound
+/// GRE-decapped SYN. Without this marker the inner SYN was forwarded
+/// unclamped — a silent full-MSS blackhole on the GRE return path.
+/// Distinct bit from `FABRIC_INGRESS_FLAG` (0x80) and the TTL-skip
+/// reuse of 0x80; 0x40 is otherwise unused in `meta_flags`.
+pub(super) const GRE_DECAP_INGRESS_FLAG: u8 = 0x40;
+
 /// RFC 1812 §4.3.2.7 / RFC 792 / RFC 4443 §2.4 error-suppression gate
 /// for LOCALLY GENERATED ICMP/ICMPv6 error messages (Time Exceeded,
 /// Destination Unreachable). A router MUST NOT originate an ICMP error
