@@ -2192,14 +2192,14 @@ func validateRouteFilterMatchTypesStrict(cfg *Config) error {
 // per-family max not exceeded, low<=high, and low at least the base prefix
 // length (Junos requires the range to be no less specific than the base).
 func validatePrefixLengthRange(rf *RouteFilter) error {
-	if rf.RangeLow == 0 || rf.RangeHigh == 0 {
-		return fmt.Errorf(
-			"malformed range (expected /<low>-/<high> with both lengths in 1..%d, e.g. /16-/24)",
-			128)
-	}
 	maxLen := 32
 	if strings.Contains(rf.Prefix, ":") {
 		maxLen = 128
+	}
+	if rf.RangeLow == 0 || rf.RangeHigh == 0 {
+		return fmt.Errorf(
+			"malformed range (expected /<low>-/<high> with both lengths in 1..%d, e.g. /16-/24)",
+			maxLen)
 	}
 	if rf.RangeLow > maxLen || rf.RangeHigh > maxLen {
 		return fmt.Errorf(
@@ -2211,13 +2211,20 @@ func validatePrefixLengthRange(rf *RouteFilter) error {
 			"inverted range /%d-/%d (low must be <= high)",
 			rf.RangeLow, rf.RangeHigh)
 	}
-	// The base prefix length floors the range: Junos rejects a range whose low
-	// bound is less specific than the base prefix itself.
+	// The base prefix length floors the range: the range low bound must be
+	// STRICTLY more specific than the base prefix. Junos requires this, and FRR
+	// rejects a prefix-list whose `ge` value is not strictly greater than the
+	// prefix length ("len < ge-value"). Accepting RangeLow == baseLen would emit
+	// `ge baseLen le high` → FRR rejects the line → frr-reload exits non-zero on
+	// the whole managed batch → FRR brick (#1880-class). The renderer carries
+	// the same guard for the lenient (downgraded-to-warning) path.
 	if _, ipnet, err := net.ParseCIDR(rf.Prefix); err == nil {
 		baseLen, _ := ipnet.Mask.Size()
-		if rf.RangeLow < baseLen {
+		if rf.RangeLow <= baseLen {
 			return fmt.Errorf(
-				"range low /%d is less specific than the base prefix /%d",
+				"range low /%d must be more specific than the base prefix /%d "+
+					"(low > base; FRR rejects a ge value not strictly greater "+
+					"than the prefix length)",
 				rf.RangeLow, baseLen)
 		}
 	}

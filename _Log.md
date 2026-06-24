@@ -1,5 +1,36 @@
 # Action Log
 
+## 2026-06-24 — #2525 review fold: prefix-length-range base-prefix floor off-by-one (FRR-brick)
+
+- **Timestamp**: 2026-06-24 PDT
+- **Action**: Hostile-reviewer + Copilot converged fold on PR #2535. The
+  base-prefix floor for `prefix-length-range` was off by one: FRR requires
+  the prefix-list `ge` value to be STRICTLY greater than the base prefix
+  length (`len < ge-value`), but the strict validator used `RangeLow <
+  baseLen` (should be `<=`). So `10.0.0.0/8 prefix-length-range /8-/24`
+  (RangeLow == baseLen == 8) committed, the renderer emitted `ge 8 le 24`,
+  FRR rejected the line, and frr-reload exited non-zero on the whole managed
+  batch → FRR brick (#1880-class). The renderer guard also did not re-derive
+  baseLen, so on the lenient (downgraded-to-warning, #1960) path a stored
+  `/4-/24`-on-/8 range still emitted `ge 4 le 24`. Fix (single root cause):
+  (1) strict floor → `RangeLow <= baseLen` reject (low must be strictly more
+  specific than base); (2) renderer re-derives baseLen and requires
+  `RangeLow > baseLen`, else skips the entry (match-nothing, fail-closed) —
+  boot-safe even when strict was downgraded; (3) wording fixed ("less
+  specific than" → "more specific than the base prefix, low > base") in the
+  validator error + README; (4) malformed-range error now computes maxLen
+  from the family first (v4 → 1..32) instead of hardcoding 1..128.
+- **Tests** (fail-on-revert verified): `pkg/config` validation `at_base`
+  case (`/8-/24` on `/8` → reject; revert `<=`→`<` → wrongly commits →
+  fails); `pkg/frr`
+  `TestGeneratePolicyOptionsPrefixLengthRangeAtOrBelowBaseSkipped`
+  (at/below-base reaches renderer via lenient path → no `ge 8/4 le 24`
+  emitted; remove the renderer floor → emits `ge 8 le 24` → fails). Valid
+  `/16-/24` on `/8` still renders `ge 16 le 24` (no regression).
+- **File(s)**: pkg/config/compiler_validate_strict.go,
+  pkg/config/compiler_route_filter_range_2525_test.go,
+  pkg/frr/policy_render.go, pkg/frr/frr_test.go, pkg/frr/README.md, _Log.md
+
 ## 2026-06-24 — #2525 route-filter prefix-length-range / through (MED-HIGH, agy review-037 finding 4)
 
 - **Timestamp**: 2026-06-24 PDT

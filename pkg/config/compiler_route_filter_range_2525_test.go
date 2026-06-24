@@ -149,7 +149,19 @@ func TestRouteFilterPrefixLengthRangeValidation(t *testing.T) {
 			name:      "below_base",
 			cmd:       "set policy-options policy-statement p term t1 from route-filter 10.0.0.0/8 prefix-length-range /4-/24",
 			wantError: true,
-			errSubstr: "less specific than the base prefix",
+			errSubstr: "more specific than the base prefix",
+		},
+		{
+			// RangeLow == baseLen: FRR rejects `ge 8 le 24` on a /8
+			// ("len < ge-value"), so the strict gate must reject low == base
+			// (low must be STRICTLY greater than base). Accepting it would
+			// render `ge 8 le 24` and brick the whole frr-reload (#1880-class).
+			// Fail-on-revert: revert the floor from `<=` to `<` and this
+			// /8-/24 config wrongly commits, failing this case.
+			name:      "at_base",
+			cmd:       "set policy-options policy-statement p term t1 from route-filter 10.0.0.0/8 prefix-length-range /8-/24",
+			wantError: true,
+			errSubstr: "more specific than the base prefix",
 		},
 	}
 	for _, tc := range cases {

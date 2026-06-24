@@ -3547,6 +3547,61 @@ func TestGeneratePolicyOptionsPrefixLengthRange(t *testing.T) {
 	}
 }
 
+// TestGeneratePolicyOptionsPrefixLengthRangeAtOrBelowBaseSkipped verifies the
+// #2525 lenient-path guard: a prefix-length-range whose low bound is AT or
+// BELOW the base prefix length (e.g. /8-/24 on a /8, or /4-/24) is rejected at
+// commit by the strict gate — but on the tolerant load/peer-sync path that
+// reject is downgraded to a warning (#1960) and the stored bad range reaches
+// the renderer. The renderer MUST skip the entry (match-nothing) rather than
+// emit `ge 8 le 24` / `ge 4 le 24`, which FRR rejects ("len < ge-value") and
+// which would fail the whole frr-reload batch (#1880-class). Fail-on-revert:
+// remove the `RangeLow > baseLen` renderer floor and the entry emits
+// `ge 8 le 24` — this test fails.
+func TestGeneratePolicyOptionsPrefixLengthRangeAtOrBelowBaseSkipped(t *testing.T) {
+	m := &Manager{frrConf: "/dev/null"}
+	po := &config.PolicyOptionsConfig{
+		PolicyStatements: map[string]*config.PolicyStatement{
+			"P": {
+				Name: "P",
+				Terms: []*config.PolicyTerm{
+					{
+						Name:   "atbase",
+						Action: "accept",
+						RouteFilters: []*config.RouteFilter{
+							{Prefix: "10.0.0.0/8", MatchType: "prefix-length-range", RangeLow: 8, RangeHigh: 24},
+						},
+					},
+					{
+						Name:   "belowbase",
+						Action: "accept",
+						RouteFilters: []*config.RouteFilter{
+							{Prefix: "10.0.0.0/8", MatchType: "prefix-length-range", RangeLow: 4, RangeHigh: 24},
+						},
+					},
+				},
+				DefaultAction: "reject",
+			},
+		},
+	}
+
+	got := m.generatePolicyOptions(po)
+
+	// No `ge <= base` line may be emitted for either term.
+	for _, bad := range []string{"ge 8 le 24", "ge 4 le 24"} {
+		if strings.Contains(got, bad) {
+			t.Errorf("emitted FRR-invalid %q (ge <= base prefix) — would brick frr-reload (#2525/#1880):\n%s", bad, got)
+		}
+	}
+	// The entries are skipped, so no prefix-list line exists; the match line is
+	// still emitted (fail-closed RMAP_NOMATCH).
+	if strings.Contains(got, "prefix-list P-atbase seq") || strings.Contains(got, "prefix-list P-belowbase seq") {
+		t.Errorf("at/below-base range must emit NO prefix-list line:\n%s", got)
+	}
+	if !strings.Contains(got, "match ip address prefix-list P-atbase") {
+		t.Errorf("at-base term must still emit a match line (fail-closed):\n%s", got)
+	}
+}
+
 // TestGeneratePolicyOptionsThroughSkipped verifies that the FRR-unsupported
 // "through" match-type (which only reaches the renderer on the tolerant
 // load/peer-sync path — the strict commit gate rejects it) renders NO

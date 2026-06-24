@@ -757,21 +757,35 @@ func (m *Manager) generatePolicyOptions(po *config.PolicyOptionsConfig) string {
 						// compiler stores the parsed bounds in RangeLow/RangeHigh
 						// (0 when the "/lo-/hi" token was malformed) and
 						// validateRouteFilterMatchTypesStrict has already
-						// rejected an inverted / out-of-range / sub-base range on
-						// the commit path. The lenient load/peer-sync path can
-						// still feed a stored bad range here, so this arm is
-						// belt-and-suspenders: it only emits "ge low le high"
-						// when the bounds are present and FRR-valid
-						// (1<=low<=high<=maxLen), else it skips the entry
-						// (match-nothing, fail-closed) rather than fall through
-						// to the open-ended "le maxLen" default — which would
-						// silently widen the operator's bounded constraint to an
-						// orlonger-style permit (the #2525 bug).
+						// rejected an inverted / out-of-range / at-or-below-base
+						// range on the commit path. The lenient load/peer-sync
+						// path (where that strict reject is downgraded to a
+						// warning per #1960) can still feed a stored bad range
+						// here, so this arm is belt-and-suspenders: it emits
+						// "ge low le high" ONLY when the bounds are present and
+						// FRR-valid, else it skips the entry (match-nothing,
+						// fail-closed) rather than fall through to the open-ended
+						// "le maxLen" default — which would silently widen the
+						// operator's bounded constraint to an orlonger-style
+						// permit (the #2525 bug).
+						//
+						// FRR requires the `ge` value to be STRICTLY greater than
+						// the prefix length ("len < ge-value"); a `ge <= base`
+						// line is rejected and a rejected line can fail the whole
+						// frr-reload (#1880-class). So the guard re-derives the
+						// base prefix length and requires RangeLow > baseLen,
+						// mirroring the `longer` (plen+1) / `upto` guards. The
+						// prefix already passed net.ParseCIDR above (the
+						// skipEntry malformed-prefix belt), so it parses here.
 						maxLen := 32
 						if isV6 {
 							maxLen = 128
 						}
-						if rf.RangeLow >= 1 && rf.RangeLow <= rf.RangeHigh && rf.RangeHigh <= maxLen {
+						baseLen := 0
+						if _, ipnet, err := net.ParseCIDR(rf.Prefix); err == nil {
+							baseLen, _ = ipnet.Mask.Size()
+						}
+						if rf.RangeLow > baseLen && rf.RangeLow <= rf.RangeHigh && rf.RangeHigh <= maxLen {
 							matchStr = fmt.Sprintf("ge %d le %d", rf.RangeLow, rf.RangeHigh)
 						} else {
 							skipEntry = true
