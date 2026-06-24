@@ -667,15 +667,28 @@ func openPerInterfaceSocket(ifName string, iface *net.Interface, isVLAN bool) (*
 	return rawConn, conn, nil
 }
 
-// openAfPacketReceiver opens an AF_PACKET SOCK_DGRAM socket bound to the
+// afPacketSocket is the socket(2) entry point used by openAfPacketReceiver.
+// It is a package var so tests can intercept the call and assert the type
+// flags (notably SOCK_CLOEXEC) without needing CAP_NET_RAW.
+var afPacketSocket = unix.Socket
+
+// openAfPacketReceiver opens an AF_PACKET SOCK_RAW socket bound to the
 // given interface for receiving VRRP packets. This is used on VLAN sub-
 // interfaces where raw IP sockets don't reliably receive multicast.
-// SOCK_DGRAM strips the Ethernet header — received data starts at the IP header.
+// SOCK_RAW keeps the Ethernet header — the cBPF VLAN filter and the Go
+// parser both expect data starting at the L2 header.
 func openAfPacketReceiver(ifIndex int) (int, error) {
 	// Use ETH_P_ALL (same as tcpdump) — VLAN sub-interface + multicast
 	// delivery is unreliable with ETH_P_IP protocol filtering.
 	proto := htons(unix.ETH_P_ALL)
-	fd, err := unix.Socket(unix.AF_PACKET, unix.SOCK_RAW, int(proto))
+	// SOCK_CLOEXEC is OR'd into the type so the raw packet-capture fd is set
+	// close-on-exec ATOMICALLY at creation. A raw unix.Socket does NOT get
+	// CLOEXEC by default (unlike Go net sockets), so without this the fd would
+	// be inherited by every child the daemon execs (frr-reload.py, swanctl,
+	// dhcp helpers) — an fd leak and a security boundary issue (a child could
+	// read raw VRRP frames off the capture socket). The atomic OR-into-type
+	// avoids the fork race of a separate post-creation fcntl(FD_CLOEXEC).
+	fd, err := afPacketSocket(unix.AF_PACKET, unix.SOCK_RAW|unix.SOCK_CLOEXEC, int(proto))
 	if err != nil {
 		return -1, fmt.Errorf("af_packet socket: %w", err)
 	}
