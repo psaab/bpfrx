@@ -175,6 +175,17 @@ pub(super) fn build_local_time_exceeded_request(
     if !can_generate_icmp_error_reply(frame, meta, forwarding) {
         return None;
     }
+    // #2472: per-reason token-bucket rate limit on the LOCALLY-GENERATED Time
+    // Exceeded. A TTL=1 / hop-limit=1 flood (a routing loop or a crafted
+    // low-TTL stream) would otherwise emit one generated ICMP error per
+    // trigger packet, unbounded — a CPU/TX amplification + reflection sink.
+    // The bucket is global-per-reason (Linux `icmp_msgs_per_sec` model); on
+    // empty we drop the generated error and bump the observable
+    // `TimeExceeded` rate-limited counter (inside `allow_generated_error`).
+    if !allow_generated_error(GeneratedErrorReason::TimeExceeded) {
+        counters.touched = true;
+        return None;
+    }
 
     let egress = forwarding.egress.get(&ingress_ident.ifindex)?;
     let target_ifindex = if egress.bind_ifindex > 0 {

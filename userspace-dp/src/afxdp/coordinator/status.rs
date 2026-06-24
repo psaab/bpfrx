@@ -235,6 +235,44 @@ impl super::Coordinator {
         crate::afxdp::gre::GRE_ENCAP_DF_OVERSIZE_DROPS.load(Ordering::Relaxed)
     }
 
+    /// #2472: locally-generated ICMP/ICMPv6 Time Exceeded replies dropped
+    /// because the per-reason token bucket was empty. The TTL/hop-limit error
+    /// generator is rate-limited (global-per-reason, Linux `icmp_msgs_per_sec`
+    /// model, default 1000/s + 1000 burst) so a low-TTL flood / routing loop
+    /// cannot drive unbounded generated-error emission. Surfaced as
+    /// `xpf_userspace_time_exceeded_rate_limited_total`; a nonzero value flags
+    /// an error-amplification attempt (or a real routing loop) being clamped.
+    pub fn time_exceeded_rate_limited_total(&self) -> u64 {
+        crate::afxdp::icmp_ratelimit::rate_limited_count(
+            crate::afxdp::icmp_ratelimit::GeneratedErrorReason::TimeExceeded,
+        )
+    }
+
+    /// #2472: locally-generated PTB / Frag-Needed PMTUD replies dropped because
+    /// the per-reason token bucket was empty. Surfaced as
+    /// `xpf_userspace_packet_too_big_rate_limited_total`; a nonzero value flags
+    /// an oversized-DF / IPv6 flood being clamped before it amplifies into
+    /// unbounded PTB emission.
+    pub fn packet_too_big_rate_limited_total(&self) -> u64 {
+        crate::afxdp::icmp_ratelimit::rate_limited_count(
+            crate::afxdp::icmp_ratelimit::GeneratedErrorReason::PacketTooBig,
+        )
+    }
+
+    /// #2472: locally-generated policy/filter `reject` replies (TCP RST or
+    /// ICMP/ICMPv6 administratively-prohibited unreachable) dropped because the
+    /// per-reason token bucket was empty. This is in ADDITION to the SYN-cookie
+    /// TX-frame budget gate (`policy_reject_reply_budget_drops`), which is a
+    /// queue-protection gate rather than a rate cap. Surfaced as
+    /// `xpf_userspace_reject_rate_limited_total`; a nonzero value flags a
+    /// rejected-flow flood being clamped before it amplifies into unbounded
+    /// RST/ICMP backscatter.
+    pub fn reject_rate_limited_total(&self) -> u64 {
+        crate::afxdp::icmp_ratelimit::rate_limited_count(
+            crate::afxdp::icmp_ratelimit::GeneratedErrorReason::Reject,
+        )
+    }
+
     /// #1782: debug dump of every key currently present in the userspace
     /// `dynamic_neighbors` mirror, as `(ifindex, ip)` pairs. The
     /// cold-start capture harness reads this at the pre-connect t0'

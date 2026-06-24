@@ -105,6 +105,14 @@ pub(crate) fn refresh_status(state: &mut ServerState) {
     // rather than silently dropping it downstream.
     state.status.gre_encap_df_oversize_drops_total =
         state.afxdp.gre_encap_df_oversize_drops_total();
+    // #2472: locally-generated error-reply per-reason token-bucket drops.
+    // Nonzero = an error-amplification / reflection flood (or a routing loop)
+    // being clamped before it emits unbounded generated ICMP/RST errors.
+    state.status.time_exceeded_rate_limited_total =
+        state.afxdp.time_exceeded_rate_limited_total();
+    state.status.packet_too_big_rate_limited_total =
+        state.afxdp.packet_too_big_rate_limited_total();
+    state.status.reject_rate_limited_total = state.afxdp.reject_rate_limited_total();
     // The per-key dynamic_neighbors dump is a high-cardinality
     // (ifindex,ip)-labelled debug surface used only by the #1782 cold-start
     // capture. Gate it behind XPF_DEBUG_NEIGHBOR_KEYS so it is OFF by default:

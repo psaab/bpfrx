@@ -559,6 +559,27 @@ func (c *xpfCollector) emitUserspaceDynamicBufferMetrics(ch chan<- prometheus.Me
 		float64(status.GreEncapDfOversizeDropsTotal),
 	)
 
+	// #2472: locally-generated error-reply per-reason token-bucket drops.
+	// Emitted unconditionally so a 0 is a real "no generated errors
+	// rate-limited" signal rather than an absent series. Nonzero flags an
+	// error-amplification / reflection flood (or a routing loop) being
+	// clamped.
+	ch <- prometheus.MustNewConstMetric(
+		c.userspaceTimeExceededRateLimited,
+		prometheus.CounterValue,
+		float64(status.TimeExceededRateLimitedTotal),
+	)
+	ch <- prometheus.MustNewConstMetric(
+		c.userspacePacketTooBigRateLimited,
+		prometheus.CounterValue,
+		float64(status.PacketTooBigRateLimitedTotal),
+	)
+	ch <- prometheus.MustNewConstMetric(
+		c.userspaceRejectRateLimited,
+		prometheus.CounterValue,
+		float64(status.RejectRateLimitedTotal),
+	)
+
 	var activeFlows, flowCapacity uint64
 	for _, b := range status.Bindings {
 		activeFlows += uint64(b.ActiveFlowCount)

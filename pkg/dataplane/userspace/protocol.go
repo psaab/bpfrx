@@ -958,6 +958,20 @@ type ProcessStatus struct {
 	// PTB signalling is deferred to #2330. Omitempty for wire compat with
 	// older helpers (defaults to 0).
 	GreEncapDfOversizeDropsTotal uint64 `json:"gre_encap_df_oversize_drops_total,omitempty"`
+	// #2472: locally-generated ICMP Time Exceeded / PTB / `reject` error
+	// replies dropped because the per-reason token bucket was empty. Each
+	// reason has an independent global-per-reason bucket (Linux
+	// icmp_msgs_per_sec model, default 1000/s + 1000 burst) so an
+	// error-amplification / reflection flood (low-TTL stream, oversized-DF
+	// flood, rejected-flow flood, or a routing loop) cannot drive unbounded
+	// generated-error emission. Surfaced as
+	// xpf_userspace_time_exceeded_rate_limited_total,
+	// xpf_userspace_packet_too_big_rate_limited_total, and
+	// xpf_userspace_reject_rate_limited_total. Omitempty for wire compat with
+	// older helpers (defaults to 0).
+	TimeExceededRateLimitedTotal uint64 `json:"time_exceeded_rate_limited_total,omitempty"`
+	PacketTooBigRateLimitedTotal uint64 `json:"packet_too_big_rate_limited_total,omitempty"`
+	RejectRateLimitedTotal       uint64 `json:"reject_rate_limited_total,omitempty"`
 	// #1769: on-demand neighbor-resolver telemetry. The resolver fires
 	// when a MissingNeighbor negative-cache fast-fail nudges a wedged dst
 	// (single-key RTM_GETNEIGH + epoch-guarded cache or probe-on-stale).

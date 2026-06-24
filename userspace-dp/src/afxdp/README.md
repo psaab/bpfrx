@@ -231,6 +231,36 @@ sync.
   runs only when an ICMP error is about to be generated, never on the
   per-packet fast path. No new counter — a suppressed error folds into
   the existing fail-closed silent drop.
+  #2472: AFTER the RFC suppression + output-classification gates, all three
+  locally-generated error reasons (Time Exceeded, PTB/Frag-Needed, and
+  policy/filter `reject`) now also pass through a per-reason token-bucket
+  RATE LIMITER (`icmp_ratelimit.rs`). Without it, a flood of TTL-1 packets,
+  oversized-DF packets, or rejected flows (or a routing loop) made the box
+  emit one generated error PER trigger packet, unbounded — a CPU/TX
+  amplification sink and a reflection vector (the errors are addressed to the
+  trigger's source, which an attacker can spoof). The bucket is
+  GLOBAL-PER-REASON (no per-source / per-destination map → no
+  attacker-driven state growth), modelled on Linux's `net.ipv4.icmp_msgs_per_sec`
+  (a global per-host burst). Each reason has its OWN bucket so a TTL-exceeded
+  flood cannot starve PTB or reject (per-reason isolation). Defaults:
+  `DEFAULT_RATE_PER_SEC = 1000` tokens/s refill + `DEFAULT_BURST = 1000`
+  capacity, PER reason (compile-time; a rate of 0 disables the limiter). The
+  check is a single CAS loop over two atomics (millitoken count + last-refill
+  ns) on the cold generated-error path only — never per forwarded packet, no
+  allocation. On bucket-empty the generated reply is DROPPED (the TTL/reject
+  paths fail-closed to the silent drop they already perform; the PTB path
+  still drops the oversized original via `mtu_signalled`, so it never falls
+  through to forward the MTU-violating frame) and a per-reason observable
+  counter is bumped — surfaced via the coordinator status as
+  `xpf_userspace_time_exceeded_rate_limited_total`,
+  `xpf_userspace_packet_too_big_rate_limited_total`, and
+  `xpf_userspace_reject_rate_limited_total`. The pre-existing SYN-cookie
+  TX-frame budget gate on the reject path STAYS: it is queue protection (it
+  keeps the reply ring from starving transit TX), a separate concern from the
+  per-reason rate cap. Wired at the three generation sites:
+  `icmp::build_local_time_exceeded_request`, the PTB build in
+  `tx/dispatch/mod.rs`, and `poll_descriptor::reject_reply::enqueue_reject_reply`
+  (covering both policy and filter reject — a single emit path).
 - `cos/` — Class-of-Service scheduler: token-bucket admission, MQFQ
   active-bucket selection, fair-share lease (#1229 Phase 6 v8). See
   `docs/per-5-tuple/state.md` for the architectural ceiling.

@@ -260,6 +260,11 @@ type xpfCollector struct {
 	// DF-set oversized outer cannot be fragmented downstream and would
 	// silently blackhole every inner flow with no PMTUD signal.
 	userspaceGreEncapDfOversizeDrops *prometheus.Desc
+	// #2472: locally-generated ICMP/RST error replies dropped by the
+	// per-reason token-bucket rate limiter (Time Exceeded / PTB / reject).
+	userspaceTimeExceededRateLimited *prometheus.Desc
+	userspacePacketTooBigRateLimited *prometheus.Desc
+	userspaceRejectRateLimited       *prometheus.Desc
 	userspaceFlowCacheActiveFlows    *prometheus.Desc
 	userspaceFlowCacheCapacity       *prometheus.Desc
 	// #1379: daemon-side userspace event-stream transport counters.
@@ -565,6 +570,9 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.userspaceGreDecapEcnIllegalDrops
 	ch <- c.userspaceWgDecapEcnIllegalDrops
 	ch <- c.userspaceGreEncapDfOversizeDrops
+	ch <- c.userspaceTimeExceededRateLimited
+	ch <- c.userspacePacketTooBigRateLimited
+	ch <- c.userspaceRejectRateLimited
 	ch <- c.userspaceFlowCacheActiveFlows
 	ch <- c.userspaceFlowCacheCapacity
 	ch <- c.userspaceEventStreamFramesTotal
