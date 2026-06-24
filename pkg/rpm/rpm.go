@@ -17,7 +17,6 @@ import (
 
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/routing"
-	"golang.org/x/sys/unix"
 )
 
 // probeDialer returns a net.Dialer carrying the per-test socket options:
@@ -48,20 +47,19 @@ func probeDialer(timeout time.Duration, sourceAddr string, opts probeSockOpts) (
 		d.LocalAddr = &net.TCPAddr{IP: ip}
 	}
 	if opts.BindDevice != "" || opts.Mark != 0 {
+		// Resolve the hostname IN THE PROBE'S VRF/path scope (#2614): the
+		// dialer's own name resolution otherwise runs through the
+		// process-default resolver BEFORE the Control bind below applies,
+		// so a tcp-ping / http-get hostname target inside a VRF would
+		// resolve out-of-context (the same defect fixed for icmp-ping in
+		// resolveProbeTarget). Setting Resolver pins the DNS socket to the
+		// same SO_BINDTODEVICE / SO_MARK as the connect socket. A literal
+		// IP target skips DNS entirely, so this is a no-op for IP targets.
+		d.Resolver = vrfBoundResolver(opts)
 		d.Control = func(network, address string, c syscall.RawConn) error {
 			var cerr error
 			err := c.Control(func(fd uintptr) {
-				if opts.BindDevice != "" {
-					cerr = unix.SetsockoptString(int(fd), syscall.SOL_SOCKET,
-						syscall.SO_BINDTODEVICE, opts.BindDevice)
-					if cerr != nil {
-						return
-					}
-				}
-				if opts.Mark != 0 {
-					cerr = unix.SetsockoptInt(int(fd), unix.SOL_SOCKET,
-						unix.SO_MARK, int(opts.Mark))
-				}
+				cerr = applyVRFBind(int(fd), opts.BindDevice, opts.Mark)
 			})
 			if err != nil {
 				err = fmt.Errorf("%w: socket control: %v", ErrProbeSetup, err)
@@ -174,20 +172,19 @@ type Manager struct {
 	// before the manager runs and never mutated concurrently.
 	probeFn func(ctx context.Context, test *config.RPMTest, key string) (time.Duration, error)
 
-	// resolveTarget is the injectable hostname-resolution seam (#2493).
-	// nil = resolveProbeTarget (process-default resolver via
-	// net.ResolveIPAddr). The default resolver is NOT VRF/device-scoped,
-	// so a SCOPED test (routing-instance / destination-interface /
-	// next-hop) against a hostname would resolve out-of-context. The
-	// scoped-hostname combination is rejected at commit
-	// (validateRPMScopedHostnameStrict) and held via ErrProbeSetup in
-	// executeProbe before any resolution runs, so this seam is consulted
-	// only for unscoped / IP-literal probes today. It exists so a future
-	// VRF-aware resolver can be slotted in (and so a test can assert the
-	// guard short-circuits a scoped hostname before the default resolver
-	// is reached). Returns *net.IPAddr so the IPv6 link-local zone is
-	// preserved through to the send path (#2494).
-	resolveTarget func(target string) (*net.IPAddr, error)
+	// resolveTarget is the injectable hostname-resolution seam (#2493,
+	// VRF-aware since #2614). nil = resolveProbeTarget. The default
+	// resolver is now scope-aware: it is passed the probe's probeSockOpts
+	// (BindDevice / Mark) and, for a SCOPED test (routing-instance /
+	// destination-interface / next-hop), builds a net.Resolver whose DNS
+	// socket is pinned to the SAME VRF/path (SO_BINDTODEVICE / SO_MARK) the
+	// probe DATA socket uses — so a hostname target inside a VRF resolves
+	// through the VRF's DNS, not the process-default table. An unscoped
+	// test uses the default resolver. Returns *net.IPAddr so the IPv6
+	// link-local zone is preserved through to the send path (#2494). Tests
+	// inject this to assert the bound resolver is built with the probe's
+	// device/mark (live VRF DNS is lab-bound).
+	resolveTarget func(target string, opts probeSockOpts) (*net.IPAddr, error)
 }
 
 // SetEventCallback registers a callback for RPM events.
@@ -586,32 +583,6 @@ func (m *Manager) pinInstallError(test *config.RPMTest, key string) error {
 	return nil
 }
 
-// scopedHostnameError holds a VRF/device-scoped test whose target is a
-// hostname (#2493). The probe DATA socket is bound to a specific VRF /
-// egress device (SO_BINDTODEVICE) or path (SO_MARK), but DNS resolution
-// runs through the process-default resolver / table / source — the bind is
-// applied in the per-connection Control hook, which fires AFTER name
-// resolution — so a scoped probe against a hostname resolves
-// out-of-context and measures resolver health rather than the scoped
-// path. The commit-time validator (validateRPMScopedHostnameStrict)
-// rejects this combination on the strict path; a leniently-loaded or
-// peer-synced config can still reach here, so hold state via ErrProbeSetup
-// (the probe loop holds, exactly like a failed source bind) instead of
-// actuating ip-monitoring failover off a mis-scoped measurement. Returns
-// nil for IP-literal targets (no resolution) and unscoped tests (resolve
-// in the same context they probe). A future VRF-aware resolver would lift
-// this guard.
-func scopedHostnameError(test *config.RPMTest) error {
-	if test == nil || !test.IsScoped() {
-		return nil
-	}
-	if test.Target == "" || net.ParseIP(test.Target) != nil {
-		return nil
-	}
-	return fmt.Errorf("%w: scoped RPM test target %q is a hostname; DNS is not VRF/device-scoped "+
-		"(resolves out-of-context) — use an IP-literal target", ErrProbeSetup, test.Target)
-}
-
 // runProbe dispatches a single probe through the test seam when one is
 // installed, otherwise the real executeProbe path.
 func (m *Manager) runProbe(ctx context.Context, test *config.RPMTest, key string) (time.Duration, error) {
@@ -622,9 +593,6 @@ func (m *Manager) runProbe(ctx context.Context, test *config.RPMTest, key string
 }
 
 func (m *Manager) executeProbe(ctx context.Context, test *config.RPMTest, key string) (time.Duration, error) {
-	if err := scopedHostnameError(test); err != nil {
-		return 0, err
-	}
 	if err := m.pinInstallError(test, key); err != nil {
 		return 0, err
 	}
