@@ -399,6 +399,65 @@ func TestDecodeRawEventCarriesCreatedStamp(t *testing.T) {
 	}
 }
 
+// TestDecodeRawEventPolicyDenyUsesDecisionTimestamp pins the #2470 contract on
+// the Go side: an RT_FLOW deny/screen/filter-log event carries the dataplane
+// DECISION instant at offset 0 (LE u64, absolute Unix ns). When it is nonzero
+// the decoder must report THAT instant in rec.Time, not the daemon receive
+// time (time.Now()), so a backlogged / reconnect-delayed delivery cannot skew
+// the logged event time to consumption time. The Rust emitters previously
+// wrote 0 here (the bug), which falls through to receive time below.
+func TestDecodeRawEventPolicyDenyUsesDecisionTimestamp(t *testing.T) {
+	const decisionNS = uint64(1_700_000_123_000_000_000)
+	data := make([]byte, rawEventWireSize)
+	binary.LittleEndian.PutUint64(data[0:8], decisionNS) // offset 0: timestamp_ns
+	data[40], data[41] = 0x30, 0x39                      // src port 12345 (BE)
+	data[42], data[43] = 0x01, 0xbb                      // dst port 443 (BE)
+	data[52] = eventTypePolicyDeny
+	data[53] = 6 // TCP
+	data[54] = actionDeny
+	data[55] = addrFamilyInet
+	copy(data[8:12], net.ParseIP("192.0.2.10").To4())
+	copy(data[24:28], net.ParseIP("198.51.100.20").To4())
+
+	rec, ok := DecodeRawEventRecord(data)
+	if !ok {
+		t.Fatal("DecodeRawEventRecord rejected a valid POLICY_DENY frame")
+	}
+	if !rec.Time.Equal(time.Unix(0, int64(decisionNS))) {
+		t.Fatalf("rec.Time = %v, want decision time %v (offset 0 LE u64); the "+
+			"decoder must prefer the on-wire decision timestamp over receive time",
+			rec.Time, time.Unix(0, int64(decisionNS)))
+	}
+}
+
+// TestDecodeRawEventZeroTimestampFallsBackToReceiveTime pins the OTHER half of
+// the #2470 contract: a frame with timestamp_ns == 0 (an old/unstamped emitter
+// or a clock-read failure on the helper) still falls back to receive time
+// (time.Now()), so the event is never logged at the Unix epoch.
+func TestDecodeRawEventZeroTimestampFallsBackToReceiveTime(t *testing.T) {
+	data := make([]byte, rawEventWireSize)
+	// offset 0 left as 0 — no decision timestamp.
+	data[40], data[41] = 0x30, 0x39
+	data[42], data[43] = 0x01, 0xbb
+	data[52] = eventTypePolicyDeny
+	data[53] = 6
+	data[54] = actionDeny
+	data[55] = addrFamilyInet
+	copy(data[8:12], net.ParseIP("192.0.2.10").To4())
+	copy(data[24:28], net.ParseIP("198.51.100.20").To4())
+
+	before := time.Now()
+	rec, ok := DecodeRawEventRecord(data)
+	after := time.Now()
+	if !ok {
+		t.Fatal("DecodeRawEventRecord rejected a valid POLICY_DENY frame")
+	}
+	if rec.Time.Before(before) || rec.Time.After(after) {
+		t.Fatalf("rec.Time = %v, want receive time in [%v, %v] for a zero "+
+			"on-wire timestamp", rec.Time, before, after)
+	}
+}
+
 func TestProcessRawEventRejectsShortRecord(t *testing.T) {
 	tests := []struct {
 		name      string

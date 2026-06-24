@@ -24,6 +24,20 @@ periodic ACK from the daemon.
   telemetry may also populate the non-session metadata slots used by
   the Go adapter for action, rule ID, term ID, reason, owner RG,
   ingress ifindex, and application ID.
+  (#2470) the `MSG_POLICY_DENY` / `MSG_SCREEN_DROP` (incl. the #2234
+  scan-table-pressure ALARM) / `MSG_FILTER_LOG` emitters
+  (`afxdp/event_emit.rs`) stamp `timestamp_ns` (offset 0, absolute Unix
+  nanoseconds, little-endian u64 — same field/format as the close frame)
+  with the dataplane DECISION instant, converting the poll loop's
+  `CLOCK_MONOTONIC` `now_ns`/`now_secs` to wall-clock via
+  `mono_ns_to_wall_clock_unix_ns` (one anchored `(monotonic, wall)` read
+  per emit, reusing #2465's `read_mono_and_wall_clocks` +
+  `monotonic_ns_to_unix_ns`). These fire on drops/denies/log-matched
+  packets (not per normal packet), so a clock read per emit is cheap.
+  Before #2470 all three wrote 0 → the Go decoder fell back to RECEIVE
+  time, skewing the logged event time to consumption time under helper
+  backlog / reconnect / CPU contention. A 0 (clock-read failure) still
+  falls back to receive time on the Go side.
   `MSG_SESSION_CLOSE_RT_FLOW` (14) carries that same 136-byte payload
   with the event-type byte set to RT_FLOW SESSION_CLOSE (2). It is
   emitted once per session close (via `emit_session_close_rt_flow`,

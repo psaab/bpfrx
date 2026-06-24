@@ -604,6 +604,27 @@ which removes acknowledged frames that WERE delivered — ACK-trim and shutdown
 drain do NOT bump the eviction counter, so a growing `replay_evictions` value is
 an unambiguous accepted-telemetry-loss signal, not normal acknowledged removal.
 
+**RT_FLOW event timestamps are emission-time, wall-clock (#2470)**: the
+deny / screen-drop / screen-alarm / filter-log RT_FLOW events
+(`afxdp/event_emit.rs`) stamp `timestamp_ns` (wire offset 0, LE u64, absolute
+Unix nanoseconds — the same field/format the SESSION_CLOSE frame uses, see
+`encode_session_close_rt_flow`) at the instant the dataplane makes the
+decision, NOT when the Go daemon consumes the frame. The emitter has the
+decision instant in the CLOCK_MONOTONIC domain (the worker poll loop's
+`now_ns`/`now_secs`); it converts that to wall-clock Unix ns via
+`event_stream::mono_ns_to_wall_clock_unix_ns` (one anchored `(mono, wall)`
+clock read per emit, reusing #2465's `read_mono_and_wall_clocks` +
+`monotonic_ns_to_unix_ns`). This is the conversion boundary between the
+monotonic dataplane clock and the absolute wire timestamp. These events fire
+on drops / denies / log-matched packets (not per normal packet), so a clock
+read per emit is cheap; correctness is preferred. The Go decoder
+(`pkg/logging/ringbuf.go`, `DecodeRawEventRecord`) prefers a nonzero on-wire
+timestamp for `rec.Time` and falls back to receive time (`time.Now()`) only
+when it is 0 (a clock-read failure or an old, unstamped frame). Before #2470
+all four emitters wrote 0, so under helper backlog / reconnect / CPU
+contention the logged event time reflected consumption time, not decision
+time — damaging timeline reconstruction.
+
 ### Integration with Existing Code
 
 **Rust side** (`userspace-dp/src/main.rs`):
