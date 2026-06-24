@@ -36,7 +36,7 @@ use crate::policy::evaluate_policy_result_with_len;
 
 use cookie_reply::{SynCookieReply, enqueue_syn_cookie_reply};
 use nat_exception::{record_source_nat_failure, source_nat_decision_for_flow};
-use reject_reply::enqueue_policy_reject_reply;
+use reject_reply::{enqueue_filter_reject_reply, enqueue_policy_reject_reply};
 
 use filter::{
     apply_lo0_filter_action, emit_input_filter_log_match,
@@ -442,13 +442,33 @@ pub(super) fn poll_binding_process_descriptor(
                                 );
                             }
                             if input_filter_eval.action != crate::filter::FilterAction::Accept {
+                                // #2521: a filter `then reject` synthesizes a
+                                // TCP RST / ICMP unreachable back toward the
+                                // source (same machinery as policy reject);
+                                // `discard` stays a silent drop. The reply is
+                                // enqueued before the recycle, while flow /
+                                // packet_frame are in scope.
+                                if input_filter_eval.action
+                                    == crate::filter::FilterAction::Reject
+                                {
+                                    enqueue_filter_reject_reply(
+                                        &mut binding.tx_pipeline,
+                                        worker_ctx.forwarding,
+                                        binding.ifindex,
+                                        packet_frame,
+                                        meta,
+                                        flow,
+                                        telemetry.counters,
+                                    );
+                                }
                                 binding.scratch.scratch_recycle.push(desc.addr);
                                 continue;
                             }
                         }
-                        if resolved.decision.resolution.disposition
+                        let lo0_action = if resolved.decision.resolution.disposition
                             == ForwardingDisposition::LocalDelivery
-                            && apply_lo0_filter_action(
+                        {
+                            apply_lo0_filter_action(
                                 worker_ctx.forwarding,
                                 crate::afxdp::frame::term_match_extra_from_frame(
                                     packet_frame,
@@ -460,7 +480,25 @@ pub(super) fn poll_binding_process_descriptor(
                                 Some(resolved.metadata.ingress_zone),
                                 now_ns,
                             )
-                        {
+                        } else {
+                            crate::filter::FilterAction::Accept
+                        };
+                        if lo0_action != crate::filter::FilterAction::Accept {
+                            // #2521: a lo0 `then reject` synthesizes a TCP RST /
+                            // ICMP unreachable toward the source before the
+                            // host-bound session is torn down; `discard` stays
+                            // a silent drop.
+                            if lo0_action == crate::filter::FilterAction::Reject {
+                                enqueue_filter_reject_reply(
+                                    &mut binding.tx_pipeline,
+                                    worker_ctx.forwarding,
+                                    binding.ifindex,
+                                    packet_frame,
+                                    meta,
+                                    flow,
+                                    telemetry.counters,
+                                );
+                            }
                             delete_terminal_filtered_session(
                                 sessions,
                                 binding.bpf_maps.session_map_fd,
@@ -813,6 +851,20 @@ pub(super) fn poll_binding_process_descriptor(
                                     now_ns,
                                 );
                             }
+                            // #2521: filter `then reject` synthesizes an active
+                            // reply (TCP RST / ICMP unreachable) like policy
+                            // reject; `discard` remains a silent drop.
+                            if input_filter_eval.action == crate::filter::FilterAction::Reject {
+                                enqueue_filter_reject_reply(
+                                    &mut binding.tx_pipeline,
+                                    worker_ctx.forwarding,
+                                    binding.ifindex,
+                                    packet_frame,
+                                    meta,
+                                    flow,
+                                    telemetry.counters,
+                                );
+                            }
                             binding.scratch.scratch_recycle.push(desc.addr);
                             continue;
                         }
@@ -1105,8 +1157,10 @@ pub(super) fn poll_binding_process_descriptor(
                         } else {
                             false
                         };
-                        if resolution.disposition == ForwardingDisposition::LocalDelivery
-                            && apply_lo0_filter_action(
+                        let lo0_action = if resolution.disposition
+                            == ForwardingDisposition::LocalDelivery
+                        {
+                            apply_lo0_filter_action(
                                 worker_ctx.forwarding,
                                 crate::afxdp::frame::term_match_extra_from_frame(
                                     packet_frame,
@@ -1118,7 +1172,24 @@ pub(super) fn poll_binding_process_descriptor(
                                 ingress_zone_override,
                                 now_ns,
                             )
-                        {
+                        } else {
+                            crate::filter::FilterAction::Accept
+                        };
+                        if lo0_action != crate::filter::FilterAction::Accept {
+                            // #2521: lo0 `then reject` synthesizes an active
+                            // reply (TCP RST / ICMP unreachable); `discard`
+                            // stays a silent drop.
+                            if lo0_action == crate::filter::FilterAction::Reject {
+                                enqueue_filter_reject_reply(
+                                    &mut binding.tx_pipeline,
+                                    worker_ctx.forwarding,
+                                    binding.ifindex,
+                                    packet_frame,
+                                    meta,
+                                    flow,
+                                    telemetry.counters,
+                                );
+                            }
                             telemetry.dbg.local += 1;
                             telemetry.dbg.policy_deny += 1;
                             binding.scratch.scratch_recycle.push(desc.addr);

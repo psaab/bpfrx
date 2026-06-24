@@ -1324,7 +1324,11 @@ pub(crate) struct BindingLiveSnapshot {
     pub(crate) syn_cookie_bypass: u64,
     /// #2089: policy-`reject` RST/ICMP-unreachable replies enqueued.
     pub(crate) policy_reject_sent: u64,
-    /// #2089: policy-`reject` replies suppressed by TX-frame budget.
+    /// #2521: firewall-filter `then reject` RST/ICMP-unreachable replies
+    /// enqueued. Mirrors `policy_reject_sent`.
+    pub(crate) filter_reject_sent: u64,
+    /// #2089: policy-`reject` replies suppressed by TX-frame budget (shared
+    /// with filter reject, #2521).
     pub(crate) policy_reject_reply_budget_drops: u64,
     /// #2238: locally-generated replies dropped by an OUTPUT firewall filter
     /// (terminal discard/reject or three-color policer) on the egress

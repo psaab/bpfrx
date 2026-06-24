@@ -372,8 +372,13 @@ pub(in crate::afxdp) struct BindingLiveState {
     pub(super) syn_cookie_bypass: AtomicU64,
     /// #2089: policy-`reject` RST/ICMP-unreachable replies enqueued.
     pub(super) policy_reject_sent: AtomicU64,
+    /// #2521: firewall-filter `then reject` RST/ICMP-unreachable replies
+    /// enqueued. Mirrors `policy_reject_sent`; the suppression legs
+    /// (budget / output-filter / parse-error) are shared with policy reject.
+    pub(super) filter_reject_sent: AtomicU64,
     /// #2089: policy-`reject` replies suppressed due to TX-frame budget
-    /// exhaustion (the packet is still dropped — fail-closed).
+    /// exhaustion (the packet is still dropped — fail-closed). Shared with
+    /// filter reject (#2521).
     pub(super) policy_reject_reply_budget_drops: AtomicU64,
     /// #2238: locally-generated replies dropped by an OUTPUT firewall filter
     /// terminal `discard`/`reject` (or three-color policer) on the egress
@@ -792,6 +797,7 @@ impl BindingLiveState {
             syn_cookie_ack_invalid: AtomicU64::new(0),
             syn_cookie_bypass: AtomicU64::new(0),
             policy_reject_sent: AtomicU64::new(0),
+            filter_reject_sent: AtomicU64::new(0),
             policy_reject_reply_budget_drops: AtomicU64::new(0),
             time_exceeded_output_filter_drops: AtomicU64::new(0),
             policy_reject_output_filter_drops: AtomicU64::new(0),

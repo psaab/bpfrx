@@ -464,6 +464,15 @@ pub(in crate::afxdp) struct BatchCounters {
     // counts replies suppressed because the TX-frame budget was exhausted
     // (the packet is still dropped — fail-closed).
     policy_reject_sent: u64,
+    // #2521: firewall-filter `then reject` reply synthesis. Counts the
+    // RST/ICMP-unreachable replies enqueued for a filter (not policy)
+    // reject; mirrors `policy_reject_sent`. The budget-exhaustion,
+    // output-filter, and parse-error drop legs are SHARED with policy
+    // reject (`policy_reject_reply_budget_drops`,
+    // `policy_reject_output_filter_drops`,
+    // `generated_reply_classify_parse_errors`) because both run the same
+    // synthesis + #2238 output-classification path.
+    filter_reject_sent: u64,
     policy_reject_reply_budget_drops: u64,
     // #2238: locally-generated reply output-classification drops. A reply
     // (Time Exceeded, policy-reject RST/ICMP-unreachable, SYN-cookie
@@ -616,6 +625,11 @@ impl BatchCounters {
             live.policy_reject_sent
                 .fetch_add(self.policy_reject_sent, Ordering::Relaxed);
             self.policy_reject_sent = 0;
+        }
+        if self.filter_reject_sent != 0 {
+            live.filter_reject_sent
+                .fetch_add(self.filter_reject_sent, Ordering::Relaxed);
+            self.filter_reject_sent = 0;
         }
         if self.policy_reject_reply_budget_drops != 0 {
             live.policy_reject_reply_budget_drops

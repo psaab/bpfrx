@@ -304,6 +304,13 @@ fn emit_cached_output_filter_log_tail(
     );
 }
 
+/// Evaluate the lo0 (host-bound) firewall filter and emit any matched filter
+/// log. Returns the matched terminal `FilterAction` (#2521): the caller maps
+/// `Accept` → deliver, `Discard` → silent drop, `Reject` → silent drop PLUS a
+/// synthesized active reply (TCP RST / ICMP unreachable). Previously this
+/// returned a bare `bool` (drop vs deliver), collapsing `Reject` into a silent
+/// `Discard` — the parity gap #2521 closes for control-plane / host-bound
+/// filters.
 #[cold]
 #[inline(never)]
 pub(super) fn apply_lo0_filter_action(
@@ -314,9 +321,9 @@ pub(super) fn apply_lo0_filter_action(
     meta: UserspaceDpMeta,
     ingress_zone_override: Option<u16>,
     now_ns: u64,
-) -> bool {
+) -> crate::filter::FilterAction {
     let Some(flow) = flow else {
-        return false;
+        return crate::filter::FilterAction::Accept;
     };
     let is_v6 = matches!(flow.dst_ip, IpAddr::V6(_));
     let result = crate::filter::evaluate_lo0_filter_counted(
@@ -350,5 +357,5 @@ pub(super) fn apply_lo0_filter_action(
             now_ns,
         );
     }
-    !matches!(result.action, crate::filter::FilterAction::Accept)
+    result.action
 }

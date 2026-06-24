@@ -431,6 +431,12 @@ pub(crate) struct BindingStatus {
     pub syn_cookie_bypass: u64,
     #[serde(rename = "policy_reject_sent", default)]
     pub policy_reject_sent: u64,
+    // #2521: firewall-filter `then reject` RST/ICMP-unreachable replies
+    // enqueued (mirrors policy_reject_sent). `default` keeps cross-version
+    // wire safety — an older helper omits the field and Go/Rust read 0
+    // (#1961-class contract).
+    #[serde(rename = "filter_reject_sent", default)]
+    pub filter_reject_sent: u64,
     #[serde(rename = "policy_reject_reply_budget_drops", default)]
     pub policy_reject_reply_budget_drops: u64,
     // #2238: locally-generated replies dropped by an output firewall filter
