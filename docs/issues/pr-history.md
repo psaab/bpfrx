@@ -1,7 +1,7 @@
 # bpfrx Pull Request History
 
 Complete record of all pull requests.
-Total: 1133 PRs (1090 merged)
+Total: 1224 PRs (1183 merged)
 
 ---
 
@@ -42179,7 +42179,7 @@ double-recycle. The success path is unchanged.
 
 ---
 
-## PR #2227 — screen: per-zone + bounded scan/sweep, count only on new-flow (#2209, #2210) [OPEN]
+## PR #2227 — screen: per-zone + bounded scan/sweep, count only on new-flow (#2209, #2210) [MERGED] (merged 2026-06-21)
 
 Branch: `fix/2209-2210-screen-scan-sweep`
 
@@ -42446,7 +42446,7 @@ This is the **helper-boundary backstop**; the primary gate stays the Go commit-t
 
 ---
 
-## PR #2233 — #2220: per-session flow-cache keepalive (replace binding-global modulo-64) [OPEN]
+## PR #2233 — #2220: per-session flow-cache keepalive (replace binding-global modulo-64) [MERGED] (merged 2026-06-21)
 
 Branch: `fix/2220-cache-session-keepalive`
 
@@ -42499,7 +42499,7 @@ A loss-cluster SUSTAINED-FLOW dataplane smoke (a long-lived cached flow co-resid
 
 ---
 
-## PR #2235 — #2223: skip protocol-less redistribute exports instead of poisoning the FRR reload [OPEN]
+## PR #2235 — #2223: skip protocol-less redistribute exports instead of poisoning the FRR reload [MERGED] (merged 2026-06-21)
 
 Branch: `fix/2223-frr-redistribute-protocolless`
 
@@ -42559,7 +42559,7 @@ the entire managed-section reload — guard/validate before emitting.
 
 ---
 
-## PR #2236 — flowexport: hold ExportConfig by pointer to stop atomic-copy (#2224) [OPEN]
+## PR #2236 — flowexport: hold ExportConfig by pointer to stop atomic-copy (#2224) [MERGED] (merged 2026-06-21)
 
 Branch: `fix/2224-flowexport-atomic-copy`
 
@@ -42616,6 +42616,4810 @@ and a build-failed test.
 
 *(truncated — 54 lines total)*
 
+
+---
+
+## PR #2245 — #2219: translate NAT64 ICMP error messages (PMTUD + traceroute) [MERGED] (merged 2026-06-21)
+
+Branch: `fix/2219-nat64-icmp-errors`
+
+## Summary
+
+Fixes #2219. The NAT64 ICMP translators handled **only** echo
+request/reply and returned `None` for every ICMP error type. `None`
+aborts the whole frame build (the frame builders use `?` on the
+translator), so the packet was dropped. As a result NAT64 silently
+dropped all ICMP error messages:
+
+* **PMTUD blackholed** — a v4 server's Fragmentation-Needed never
+  reached the v6 client, so large TCP flows (TLS, bulk transfer) stalled
+  once the path MTU was exceeded.
+* **traceroute/mtr blank** — Time-Exceeded was not translated in either
+  direction, so no intermediate hops showed across NAT64.
+
+Echo (ping) worked, masking the gap.
+
+## Fix (RFC 7915 §4.2 v4→v6 / §5.2 v6→v4)
+
+* Type/code mapping tables for **Destination-Unreachable**,
+  **Time-Exceeded**, **Parameter-Problem**
+  (`map_icmpv6_error_to_icmpv4` / `map_icmpv4_error_to_icmpv6`).
+* **Packet-Too-Big ↔ Fragmentation-Needed** with the MTU adjustment:
+  v6→v4 subtracts the 20-byte NAT64 header delta (the translated v4
+  datagram is 20 bytes smaller); v4→v6 adds it and clamps **up** to the
+  IPv6 minimum link MTU (1280) so a v6 client is never told to go below
+  it.
+* The **embedded (quoted) original packet** inside every error is itself
+  NAT64-translated: its IP header is rebuilt v6↔v4 with the addresses
+  mapped (the embedded packet is the return-direction tuple a receiver
+  matches the error against), its length recomputed and its header
+  checksum fixed (`translate_embedded_v6_to_v4` /
+  `translate_embedded_v4_to_v6`). The embedded addresses are derived from
+  the outer translation (the error's addresses swapped) — no extra
+  session state is needed.
+
+## Allocation discipline (#2211 / #2232)
+
+Allocation-free on the hot path: the embedded packet is translated
+through a fixed-size **stack** scratch buffer (`MAX_EMBEDDED_LEN`), never
+the heap, and the outer translators keep writing straight into the
+caller's buffer via the merged `write_v6_to_v4_into` /
+`write_v4_to_v6_into` cores. The v4→v6 buffers (the test wrapper and
+`build_nat64_v4_to_v6_frame`) now reserve `+40` instead of `+20` because
+an ICMP-error message grows both the outer header (+20) **and** the
+embedded quoted packet (+20). Types with no IPv4/IPv6 analogue (NDP, MLD,
+etc.) are still dropped, not mistranslated.
+
+Distinct from #2242 (ICMPv6 error *quote length* in icmp.rs) — this is
+the NAT64 error *translation*.
+
+
+*(truncated — 73 lines total)*
+
+
+---
+
+## PR #2246 — NPTv6 fail-closed: reject malformed (#2240) and overlapping (#2241) rules at commit + runtime [MERGED] (merged 2026-06-21)
+
+Branch: `fix/2240-2241-nptv6-failclosed`
+
+## Summary
+
+Two NPTv6 (RFC 6296) fail-closed fixes from external Rust-dataplane adversarial review (021), shipped together because they live in the same Go (`validateNPTv6Strict`) and Rust (`Nptv6State::try_from_snapshots`) code paths.
+
+### #2240 (HIGH, FAIL-OPEN — #2124-class)
+
+`compileNPTv6` (`pkg/dataplane/compiler_nat.go`) logged a `slog.Warn` and `continue`d past **every** per-rule validation failure — unparseable prefix, mismatched /48-vs-/64 lengths, an unsupported length, a non-IPv6 prefix — then unconditionally called `DeleteStaleNPTv6(written)` over only the **valid** subset. So editing one previously-good NPTv6 rule into an invalid one tore down its working translation entry with no replacement: traffic that previously translated silently stopped while the commit still reported success. The Rust helper mirrored the silent skip (`from_snapshots` `continue`d; the `invalid_snapshot_skipped` test codified it). In a retired-eBPF world (#1373) the userspace helper is the enforcement plane, so a typo silently changes reachability and source/destination identity, and HA peers converge on the same partial state with no hard failure.
+
+**Fix (strict-commit / lenient-load, mirrors #2124/#2142/#2173/#2212):**
+- **Go (primary, commit-time):** new `validateNPTv6Strict` hard-rejects a malformed NPTv6 rule at `commit`/`commit check`; a `lenientNPTv6` option (set in both lenient factories) downgrades to a warning on the tolerant load / peer-sync paths so a pre-gate config still BOOTS (#1960 no-brick).
+- **Rust (backstop, runtime):** `from_snapshots` becomes `try_from_snapshots` returning `Result<_, SnapshotIntegrityError>` (new `Nptv6UnparseableRule` variant); `forwarding_build` `?`s it so the apply preflight keeps the previous live forwarding state. `from_snapshots` kept as a `#[cfg(test)]` infallible wrapper. The `invalid_snapshot_skipped` test (which codified the fail-open) is replaced with fail-closed tests.
+
+### #2241 (MEDIUM, overlap nondeterminism)
+
+`translate_inbound`/`translate_outbound` (`userspace-dp/src/nptv6.rs`) resolve overlapping /48+/64 NPTv6 prefixes by **first-match insertion order** with no LPM and no overlap rejection — a broad /48 before a nested /64 shadows the /64, and reordering changes the dataplane translation identity.
+
+**Fix (commit-time overlap rejection — deterministic, matches the fail-closed direction):**
+- **Go:** `validateNPTv6Strict` rejects any rule whose internal (outbound) or external (inbound) prefix overlaps an earlier rule's, using `net.IPNet.Contains` for true CIDR containment.
+- **Rust:** `try_from_snapshots` rejects an overlapping pair (`find_overlap` + new `Nptv6OverlappingPrefix` variant), independent of insertion order.
+
+## Fail-on-revert proof (both issues, both sides)
+
+- **#2240 Go:** with the `validateNPTv6Strict` call disabled, `TestNPTv6OneBadRulePreservesOthers` fails (a config with one malformed rule commits — pre-fix tearing down the valid rules' translations).
+- **#2240 Rust:** with `try_from_snapshots` reverted to fail-open, `invalid_snapshot_rejected_fail_closed` fails.
+- **#2241 Go:** with the overlap block removed, `TestNPTv6RejectsOverlappingInternal` fails (both rules compile, order-dependent).
+- **#2241 Rust:** with `try_from_snapshots` reverted to fail-open, `overlapping_prefixes_rejected_fail_closed` and `overlapping_external_prefixes_rejected` fail.
+
+## Tests
+
+- Go: `go build ./...` clean; `go test ./pkg/config/...` green (12 new NPTv6 commit-time tests; existing `TestStaticNATHostMaskNPTv6PrefixNotRejected` still passes — valid NPTv6 not rejected).
+- Rust: `cargo build --release` clean; `cargo test nptv6` = 22/22, 5x flake = 22/22 every run. Fail-closed and overlap tests assert the exact error variants.
+
+No wire-shape change (`Nptv6RuleSnapshot` untouched) — no `protocol_wire_v1.json` regen. NPTv6 module docs (`userspace-dp/src/FEATURES.md`) updated; `_Log.md` records the work.
+
+Closes #2240
+Closes #2241
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+
+---
+
+## PR #2248 — #2215: screen parity — port ping-of-death fragment-reassembly + widen LAND to src_ip==dst_ip [MERGED] (merged 2026-06-21)
+
+Branch: `fix/2215-screen-pod-land`
+
+## Summary
+
+Fixes two screen parity regressions in the Rust AF_XDP userspace
+dataplane (the only forwarding path post-#1373/#1476). Both diverged
+from the authoritative — retired but canonical — eBPF screen behavior.
+Branched off current master so it composes with the merged #2227
+per-zone/count-on-miss scan-sweep work.
+
+Resolves #2215.
+
+### Sub-bug A — SCREEN_PING_OF_DEATH was non-functional dead code
+
+`check_ping_of_death` only fired when the packet was ICMP/ICMPv6 and
+`pkt.pkt_len as u32 > 65535`. `pkt_len` is a `u16`, so the comparison
+is structurally unsatisfiable — the check never dropped anything and
+its Prometheus counter could never increment. The identical dead-code
+form was flagged in eBPF by #860 and fixed by #893 to the
+fragment-reassembly formula, but the port to Rust reverted to the
+pre-#893 shape, so fragment-based ping-of-death went entirely
+undetected.
+
+Restored the #893 formula (see
+`git show 13fa1009e^:bpf/xdp/xdp_screen.c`). The dataplane does not
+reassemble, so it is detected per-fragment for any IPv4 protocol:
+
+```
+offset_bytes = (frag_off & 0x1FFF) << 3
+if offset_bytes + ip_total_len > 65535 -> drop
+```
+
+### Sub-bug B — LAND screen narrowed to require src_port == dst_port
+
+`check_land` required `src_port == dst_port` in addition to
+`src_ip == dst_ip`. The eBPF reference
+(`13fa1009e^:bpf/xdp/xdp_screen.c` ~715-723) dropped on
+`src_ip == dst_ip` alone for IPv4 and IPv6. The narrowing admitted
+same-IP different-port spoofed frames the BPF screen dropped. Dropped
+the port clause to restore the anti-spoofing invariant; the classic
+equal-port LAND is still caught.
+
+## Testing
+
+- `cargo build --release` (userspace-dp): clean.
+- `cargo test --release screen`: 113 screen tests pass on the rebased
+  base.
+- New/updated land + ping tests: 34 pass; 5x flake clean (34/0 each
+  run).
+- **Fail-on-revert proof** — reverting both production fixes to their
+  buggy form makes exactly the 5 new fail-on-revert tests fail
+  (`ping_of_death_oversized_fragment_drops`,
+
+*(truncated — 66 lines total)*
+
+
+---
+
+## PR #2249 — #2218: per-rule SNAT/DNAT/static NAT "Translation hits" counter (eBPF-retirement regression fix) [MERGED] (merged 2026-06-21)
+
+Branch: `fix/2218-nat-translation-hits`
+
+Fixes #2218.
+
+## Problem
+
+`show security nat source/destination/static rule` reported
+"Translation hits: 0 packets 0 bytes" for every rule even under live,
+confirmed-translating traffic. The legacy eBPF dataplane incremented the
+per-rule `nat_rule_counters` map on every translation; the #1476 eBPF
+retirement deleted those XDP increments and the Rust AF_XDP rewrite never
+replaced them. The Go operator read path (`Manager.ReadNATRuleCounter`)
+still consulted a map nothing wrote. DNAT/static were doubly broken — the
+compiler never even assigned them a counter ID, so their hits never
+displayed at all.
+
+## Fix (mirrors the working policy hit-count chain)
+
+- **Compiler** (`compiler_nat.go`): `assignNATCounterID` is now the single
+  source of truth for NAT rule counter IDs (1-based; 0 = none). The two
+  inline SNAT sites are refactored onto it, and DNAT + static now get IDs.
+- **Snapshot**: each SNAT/DNAT/static rule snapshot carries the
+  compiler-assigned `counter_id` (`buildSnapshotWithSchedulerStateAndNATCounters`
+  threads `result.NATCounterIDs`).
+- **Rust dataplane**: `NatRuleCounter` (lock-free `Arc<AtomicU64>`) +
+  `NatCounterStore` — the NAT analogue of `PolicyRuleCounter` /
+  `PolicyCounterStore`. Each rule holds an `Arc` resolved from the store
+  by `counter_id`; the cold (session-miss) commit path bumps it **once per
+  committed translated forward flow**, past every SNAT-rollback door. The
+  fast (established-flow) path gains no work; the increment is one relaxed
+  atomic, allocation-free. `NatDecision` is wire-frozen over HA and is NOT
+  modified (additive `*_with_counter` lookups + an out-param carry the
+  matched rule's counter).
+- **Status → Go**: counts ride `ProcessStatus.nat_rule_counters`
+  (counter_id/packets/bytes); `syncBPFCountersLocked` mirrors them into a
+  Go-side `natRuleCounterOffsets` map that `ReadNATRuleCounter` merges
+  (same shape as `ReadGlobalCounter` + `userspaceCounterOffsets`), so the
+  existing adapter → bpfShim read returns the live total unchanged.
+
+**Intentional, FLAGGED divergence from vSRX**: xpf counts PER-FLOW (one
+packet + its bytes per new translated flow), not per-transit-packet. Counts
+are node-local and reset on helper restart. Documented in
+`docs/feature-gaps.md` + `docs/userspace-dataplane-gaps.md`.
+
+## Tests (fail-on-revert)
+
+- Rust `nat_counter_store_counts_and_skips_id_zero`,
+  `parsed_nat_rules_share_store_counters`, and the worker-path integration
+  `txn_source_nat_translation_bumps_rule_counter_once` — counter advances
+  exactly once on a committed translated flow, stays 0 for a refused-at-cap
+  flow and a counter_id-0 rule. Commenting the cold-path increment makes the
+  integration test fail (0 != 1).
+
+*(truncated — 67 lines total)*
+
+
+---
+
+## PR #2250 — config: hard-reject three undefined firewall/application refs at commit (#2217) [MERGED] (merged 2026-06-21)
+
+Branch: `fix/2217-config-ref-validation`
+
+Closes #2217.
+
+Three firewall/application cross-references compiled cleanly with zero operator
+feedback and then silently FAILED OPEN at the dataplane. Each is now closed by a
+strict commit-time gate in `pkg/config/compiler_validate_strict.go`, wired into
+`compileExpanded` alongside the existing strict-vs-lenient cross-reference gates
+(same family as #2144 routing-export and #2240 NPTv6).
+
+## The three checks
+
+- **Finding A — `then policer <name>`** (`validateFirewallPolicerReferencesStrict`):
+  a firewall-filter term whose `then policer` names a policer defined under
+  neither `firewall policer` nor `firewall three-color-policer` is rejected.
+  Pre-fix the rate-limit silently never applied (fail-open: the term's traffic
+  passed unpoliced).
+- **Finding B — application-set member** (`validateApplicationSetMembersStrict`):
+  an `applications application-set <set>` member resolving to neither a defined
+  application (user-defined or `junos-*` predefined) nor a defined nested
+  application-set is rejected. Reuses `ExpandApplicationSet` — the same resolver
+  the compiler already uses — so no new definedness table is introduced. Implicit
+  sets minted for multi-term user applications are skipped (compiler-synthesized
+  members, not operator references). Pre-fix a policy matching the set silently
+  failed to match the intended traffic.
+- **Finding C — `then routing-instance <name>` (FBF)**
+  (`validateFirewallRoutingInstanceReferencesStrict`): a filter term whose
+  filter-based-forwarding steer names a routing-instance not defined under
+  `routing-instances` is rejected. Any defined instance is a valid steer target,
+  so instance-type is intentionally not constrained — only the dangling-name case
+  is closed. Pre-fix the dataplane steered matched packets toward a routing table
+  that does not exist (silent blackhole).
+
+All three walk both filter families (`inet` + `inet6`) and both AST shapes,
+sorted for a deterministic first-error.
+
+## Strict vs lenient
+
+Strict (commit / commit-check): a dangling reference is a hard commit error.
+Lenient (`Store.Load` / HA peer-sync via `CompileConfigLenient` /
+`CompileConfigForNodeLenient` — flags `lenientFirewallRefs` and
+`lenientApplicationSetMembers`): downgraded to a `cfg.Warnings` entry so a node
+that committed a dangling reference before this gate existed (or a peer-synced
+config) still boots after upgrade (#1960 fail-closed-on-compile-failure). The
+dataplane behaves exactly as before for a leniently-loaded reference, so it is
+already inert, and the operator's next strict commit rejects it loudly.
+
+## Validation
+
+- `go build ./...`, `go vet ./pkg/config/...`, `go test ./pkg/config/...` — all pass.
+- New `compiler_undefined_ref_2217_test.go`: per finding — undefined-ref reject in
+  both AST shapes, defined-ref clean commit, lenient warning downgrade; plus
+
+*(truncated — 63 lines total)*
+
+
+---
+
+## PR #2251 — #2244: count + surface dnat_table reverse-NAT publish failures [MERGED] (merged 2026-06-21)
+
+Branch: `fix/2244-checksum-mapupdate-unchecked`
+
+Fixes #2244.
+
+## Problem
+
+`publish_dnat_table_entry()` (`userspace-dp/src/afxdp/checksum.rs:146-153`)
+writes the reverse-SNAT entry that the embedded-ICMP NAT path consults to map
+an inbound ICMP error (Time Exceeded / Packet Too Big for PMTUD, traceroute)
+back to the original pre-NAT source. The `bpf_map_update_elem` syscall return
+code was discarded entirely (`unsafe { bpf_map_update_elem(...); }`). Under
+`dnat_table` capacity pressure or kernel resource exhaustion the update fails
+silently, the reverse record is omitted, and a later inbound ICMP error is
+dropped or mis-delivered — with zero counter or log to attribute the loss.
+
+## Fix
+
+Capture and check the syscall result, mirroring the #1789
+`session_publish_errors` observability pattern end to end:
+
+- `publish_dnat_table_entry()` now returns a `#[must_use] bool`: `true` for the
+  no-op / nothing-to-publish paths (no SNAT rewrite, unsupported address
+  family, absent table fd), `false` only when `bpf_map_update_elem` actually
+  fails.
+- Both worker poll call sites in `poll_descriptor` bump a new per-binding
+  `dnat_publish_errors` atomic on `BindingLiveState` when the publish fails;
+  the function emits one throttled-by-rarity journald line (the counter is the
+  durable signal — no per-packet logging on the success path).
+- `Coordinator::dnat_publish_errors_total()` sums the per-binding atomics;
+  `ProcessStatus.dnat_publish_errors_total` carries it on the wire
+  (`omitempty`, backward compatible); the Go control plane decodes it and emits
+  the Prometheus counter `xpf_userspace_dnat_publish_errors_total`
+  unconditionally (a 0 is a real "no failures" signal).
+
+The hot path stays allocation-free: one `Relaxed` `fetch_add` on the rare
+error branch, no new work on success.
+
+## Tests
+
+Fail-on-revert (`userspace-dp/src/afxdp/tests.rs`):
+- With a deliberately invalid map fd, `bpf_map_update_elem` fails (EBADF),
+  `publish_dnat_table_entry` returns `false`, and the call-site increment logic
+  bumps `dnat_publish_errors`; the no-op paths return `true` and leave the
+  counter at 0.
+- Verified the revert directly: swallowing the syscall result (always return
+  `true`) makes both the `false`-return and counter-increment assertions fail.
+
+Regenerated `tests/fixtures/protocol_wire_v1.json` (one new `process_status`
+key). Go `pkg/api` emit/coverage tests extended (13 -> 14 unconditional
+metrics).
+
+Validation: `cargo build --release` clean; new Rust tests pass and 5x-flake
+
+*(truncated — 56 lines total)*
+
+
+---
+
+## PR #2252 — config+routing: reject and never-leak an undefined rib-group import-rib (#2226) [MERGED] (merged 2026-06-21)
+
+Branch: `fix/2226-ribgroup-unknown-rib`
+
+Fixes #2226.
+
+## The bug
+
+`routing-options rib-groups <group> import-rib <rib>` was unvalidated.
+`pkg/routing/rules.go:resolveRibTable` returned a bare `0` for any rib
+name it could not resolve — a typo, a non-existent routing-instance, or
+unparseable garbage. Because a routing-instance's source table is always
+`>= 100`, the unresolvable name yielded `targetTable(0) != sourceTable`
+in `ribGroupManager.Apply`'s `needsLeak` loop, so it set `needsLeak` and
+installed an `ip rule from all lookup <sourceTable> pref 33000` for a rib
+that does not exist — a silent mis-leak of the source table's routes into
+the main lookup, with no diagnostic. `ValidateConfig` only ever emitted
+an over-limit *warning* for rib-groups; nothing checked that an
+import-rib names a real rib.
+
+## The fix (two layers)
+
+**Commit-time gate (preferred) — `validateRibGroupImportRibReferencesStrict`**
+in `pkg/config/compiler_validate_strict.go`, wired into `compileExpanded`
+alongside the existing strict cross-reference gates (mirrors the #2144
+routing-export, #2240 NPTv6, and #2217 firewall-reference families). A
+valid import-rib names `inet.0` / `inet6.0` or
+`"<defined-instance>.inet.0"` / `"<defined-instance>.inet6.0"`; any other
+name is a HARD commit error naming the rib-group and the offending rib.
+Every defined rib-group is validated, mirroring Junos. Strict on commit /
+commit-check; lenient (`Store.Load` / HA peer-sync via
+`CompileConfigLenient` / `CompileConfigForNodeLenient`, flag
+`lenientRibGroupRefs`) downgrades to a `cfg.Warnings` entry so an
+already-persisted / peer-synced config carrying a dangling import-rib
+still BOOTS (#1960 fail-closed-on-compile-failure).
+
+**Runtime backstop — `resolveRibTable` now returns `(tableID int, ok bool)`.**
+The `Apply` `needsLeak` loop treats `ok == false` as "unknown rib": it
+skips the entry with a `slog.Warn` and never sets `needsLeak` from it, so
+no rule is installed for a phantom rib and nothing is ever installed into
+table 0 from an unresolved name. This guards any reference that still
+reaches apply via the tolerant load / peer-sync path.
+
+## Tests / fail-on-revert proof
+
+- `pkg/routing/rules_test.go` (over the existing `fakeRuleOps` seam):
+  - `TestRibGroupRulesApply_UnknownRibNoLeak` — an all-unknown rib-group
+    installs ZERO rules. **Fail-on-revert proven**: neutering the `Apply`
+    `ok` guard reinstalls the phantom `from all ... table 101` rule and
+    the test fails.
+  - `TestRibGroupRulesApply_DefinedRibStillLeaks` — a defined import-rib
+    still leaks table 101 correctly (no false reject).
+- `pkg/config/compiler_ribgroup_ref_2226_test.go` — undefined reject in
+  both AST shapes (flat-set + hierarchical), bare garbage token reject,
+
+*(truncated — 69 lines total)*
+
+
+---
+
+## PR #2254 — #2243: DHCP-server static/fixed/reserved host bindings (Kea reservations) [MERGED] (merged 2026-06-21)
+
+Branch: `feat/2243-dhcp-static-reservations`
+
+Closes #2243.
+
+## Summary
+
+Adds Junos-style static (fixed/reserved) DHCP-server host bindings so an
+operator can pin a client by hardware address to a stable address served
+by the DHCP server (printer, NAS, appliance). This is the
+**static-reservations half** of the DHCP-server HA topic; the
+**dynamic-lease HA sync** half is the separate companion **#2239**.
+
+Per the deep-research design reference on the issue: static reservations
+live entirely in the Kea config file, independent of the Kea HA hook, so
+an HA pair serving identical subnets is reservation-consistent by
+construction via the existing cluster config-sync — no per-lease
+replication or HA-hook work is needed for the static case.
+
+## Junos syntax
+
+MAC-keyed, scoped to a pool (so the reservation associates to a subnet,
+which is exactly what Kea needs):
+
+```
+set system services dhcp-local-server group lan pool office \
+    static-binding 00:11:22:33:44:55 fixed-address 10.0.1.50
+set system services dhcp-local-server group lan pool office \
+    static-binding 00:11:22:33:44:55 host-name printer
+```
+
+The `dhcpv6-local-server` hierarchy takes the same `static-binding`
+subtree with an IPv6 `fixed-address`.
+
+## Changes
+
+- **Types** (`pkg/config/types_system.go`): `DHCPPool.StaticBindings
+  []*DHCPStaticBinding` (MACAddress, FixedAddress, optional HostName).
+- **Schema** (`pkg/config/schema_system.go`): `dhcpStaticBindingSchema()`
+  under both v4/v6 `group <g> pool <p>` — MAC-keyed named-instance
+  container (`keyValidator ValidateMAC`) with typed `fixed-address`
+  (`ValidateIPAddress`) and free-form `host-name`. Completable +
+  commit-validated.
+- **Compiler** (`pkg/config/compiler_services.go`): a `static-binding`
+  case handling both the hierarchical and flat-set AST shapes.
+- **Strict commit validation** (`pkg/config/compiler_validate_strict.go`,
+  wired into the accumulator in `compiler.go`): rejects a
+  missing/malformed/family-mismatched/out-of-subnet fixed-address and a
+  duplicate MAC identity or duplicate fixed-address within a pool.
+- **Kea render** (`pkg/dhcpserver/dhcpserver.go`): per-subnet
+  `reservations` — v4 `hw-address`->`ip-address`, v6
+  `hw-address`->`ip-addresses[]`, plus optional `hostname`. A pool with
+  no bindings omits the key (output unchanged for existing configs).
+
+*(truncated — 74 lines total)*
+
+
+---
+
+## PR #2256 — #2229: warn on address-book entry with empty compiled prefix [MERGED] (merged 2026-06-21)
+
+Branch: `fix/2229-addrbook-empty-value-warn`
+
+Fixes #2229 (follow-up to #2228 / #2222).
+
+## Problem
+
+After #2228, an address-book `address <name>` entry that compiles with no
+usable prefix — either no prefix at all (description-only) or only an
+as-yet-uncompiled sub-stanza (`dns-name`/`range-address`/`wildcard-address`) —
+has `Value == ""`. This is **fail-closed and safe** at resolution time
+(`net.ParseCIDR("")` errors → the address matches nothing → every policy
+referencing it denies), so it is NOT a security bug.
+
+But the commit-time warn validator (`ValidateConfig` /
+`compiler_validate_warn.go`) guarded the parse with `if entry.Value != ""`
+and emitted `invalid address` only for a NON-empty unparseable `Value`. A
+prefix-less entry therefore produced **no warning at all**, so an operator
+authoring error (forgetting the prefix) went silent.
+
+## Fix
+
+Extend the address-book warn loop to emit a non-blocking warning for an
+entry whose compiled `Value` is empty:
+
+> `address-book "X": no usable prefix configured; it will match nothing`
+
+This is a **WARNING, never a hard reject** — an empty-prefix address never
+forwarded and rejecting it would brick existing committed configs (#1960
+no-brick discipline). The non-empty branch is byte-identical to prior
+behaviour, so there is no false-positive for valid prefixes.
+
+`dns-name`/`range-address`/`wildcard-address` sub-stanzas remain uncompiled
+(a separate pre-existing gap) and genuinely resolve to nothing today, so the
+warning is correct to flag them too; the wording is generic ("no usable
+prefix") rather than claiming a specifically-missing prefix.
+
+## Tests
+
+`TestAddressBookEmptyValueWarns` drives the real compile path for both AST
+shapes (flat-set via `ParseSetCommand`+`SetPath`, hierarchical via
+`NewParser`):
+
+- flat-set description-only → warns
+- hierarchical description-only → warns
+- flat-set `dns-name` sub-stanza → warns
+- flat-set valid prefix → does NOT warn (no false-positive)
+- hierarchical valid prefix → does NOT warn (no false-positive)
+- `CompileConfig` (commit) **succeeds** in every case (warning, not reject)
+
+**Fail-on-revert proof:** reverting `compiler_validate_warn.go` drops the
+warning for the three empty-Value subtests (FAIL) while the two valid-prefix
+subtests still pass — proving the validator change is the load-bearing fix.
+
+*(truncated — 59 lines total)*
+
+
+---
+
+## PR #2257 — vrrp: fix data race on lastDropWarn (#2225) [MERGED] (merged 2026-06-21)
+
+Branch: `fix/2225-vrrp-lastdropwarn-race`
+
+## Summary
+
+Fixes #2225 — a Go data race on `vrrpInstance.lastDropWarn`.
+
+On the AF_PACKET-fallback path, `run()` starts two concurrent receiver
+goroutines: `receiver()` (IPv4 raw, proto 112) and, when an IPv6 socket
+is present, `receiverIPv6()` (`ip6:112`). Both feed the same per-instance
+`rxCh` and, on a full channel, both call `warnRXDrop()`, which did an
+unsynchronized read-modify-write of the `lastDropWarn time.Time`
+rate-limiter field — a torn multi-word read and a lost-update on the
+timestamp, flagged by `go test -race`.
+
+## Fix
+
+- `lastDropWarn` is now an `atomic.Int64` of Unix nanos, updated with
+  `CompareAndSwap` — mirrors the existing `lastGARPTime` dampener in the
+  same struct.
+- The CAS preserves the once-per-10s dampener under contention: only the
+  goroutine that swaps the stale timestamp logs, so a concurrent drop
+  burst yields one log line per interval (not one per racing goroutine).
+- `rxReceived`/`rxDrops` were already `atomic.Uint64`.
+
+## Sibling-race audit
+
+Audited both receiver paths: no other field is shared and mutated
+between the two goroutines. `localIPv6`, `cfg`, and `key()` are read-only
+on those paths; the counters are atomic. No other races found.
+
+## Tests
+
+`pkg/vrrp/instance_rxdrop_race_test.go`:
+- `TestWarnRXDropConcurrent` — concurrent hammer; **fails under `-race`
+  when reverted to `time.Time`, clean with the atomic fix** (fail-on-revert
+  gate).
+- `TestWarnRXDropDampenerOnce` — exactly one warning per interval under
+  heavy concurrency.
+- `TestWarnRXDropDampenerResetsAfterInterval` — dampener is a delay, not a
+  permanent gate.
+
+## Validation
+
+- `go build ./...` — OK
+- `go vet ./pkg/vrrp/...` — OK
+- `go test ./pkg/vrrp/...` — ok
+- `go test -race ./pkg/vrrp/...` — ok
+- **Fail-on-revert proof**: with `lastDropWarn` reverted to `time.Time`,
+  `-race` reports `WARNING: DATA RACE` / `Write at … warnRXDrop()
+  instance.go`. Clean with the atomic fix.
+- `make test-failover` no-regression run — **PENDING** (VRRP/HA change;
+  the `-race` unit test is the primary correctness gate for this fix).
+
+*(truncated — 55 lines total)*
+
+
+---
+
+## PR #2259 — #2255: stabilize NAT translation-hit counter_id (key-derived, not sequential) to stop cross-rule mis-attribution [MERGED] (merged 2026-06-21)
+
+Branch: `fix/2255-nat-counterid-stability`
+
+Fixes #2255. Follow-up from #2249 (#2218); same class as the closed #1760.
+
+## Problem
+
+The per-rule NAT translation-hit `counter_id` was assigned **sequentially**
+(`nextNATCounterID` reset to 1 each compile, `compiler_nat.go`) while the Rust
+helper keeps a **cumulative** numeric-keyed store
+(`NatCounterStore::reconcile_ids` *retains* stored ids, it does not reset them,
+`userspace-dp/src/nat/mod.rs`). So a config reorder, or the removal/re-add of a
+rule, could reuse a numeric `counter_id` for a **different** rule, and the new
+rule inherited the old rule's cumulative count -- cross-rule mis-attribution in
+`show security nat ... rule` "Translation hits".
+
+Display-only (never affects forwarding/translation correctness; resets on helper
+restart), but wrong.
+
+Confirmed pre-fix: with the sequential scheme, reordering rules A,B -> B,A hands
+B the id A held (1) and A the id B held (2); `reconcile_ids([1,2])` retains both
+slots, so B reads slot 1 (= A's old count). The new
+`TestAssignNATCounterIDStableAcrossReorder` is RED against that scheme.
+
+## Fix (issue option a)
+
+Make `counter_id` a function of the rule's **identity**, not its config
+position. `assignNATCounterID` now **derives** the id as a 32-bit FNV-1a hash of
+the already-namespaced `NATCounterKey` (`natType/ruleset/rule`, from #2249) via
+`natCounterIDForKey`, instead of the sequential `nextNATCounterID`. A rule keeps
+the same id across a reorder or the removal of an unrelated rule, so the
+cumulative helper store stays correctly attributed **by construction** --
+`reconcile_ids` retains an id that always refers to the same rule it did before.
+
+- **u16 -> u32** through the chain (`CompileResult`/`ApplyResult` maps, the
+  SNAT/DNAT/static snapshot fields, the Rust `NatCounterStore` key,
+  `snapshot_active_nat_counter_ids`, the status report) so the wide hash space
+  makes a distinct-key collision negligible (~256^2/2^32 ~ 8e-6 at the 256-rule
+  cap). The rare in-compile collision is resolved deterministically (re-hash
+  with a `#N` suffix) so every rule still gets a unique id, reproduced
+  identically on every compile. The exhaustion contract is preserved (past
+  `MaxNATRuleCounters` distinct counters a rule falls back to counter 0).
+- **No wire change.** The control protocol is serde JSON and a JSON number is
+  integer-width agnostic, so widening the field needs no `protocol_wire_v1`
+  regen -- `wire_invariant_default_specimens` passes unchanged.
+- `ReadNATRuleCounter` now keys the sparse `map[uint32]CounterValue` offset map
+  directly and no longer indexes the legacy 256-entry `nat_rule_counters` BPF
+  array (a hash id >= `MaxNATRuleCounters` would fail that bounded `Lookup`; the
+  array only ever held zeros at runtime). The legacy `snat_value.counter_id` BPF
+  struct field is now vestigial in the userspace runtime and left untouched.
+
+## Tests (fail-on-revert)
+
+
+*(truncated — 66 lines total)*
+
+
+---
+
+## PR #2260 — #2239: HA DHCP-server lease synchronization (PATH C) [MERGED] (merged 2026-06-21)
+
+Branch: `feat/2239-dhcp-ha-lease-sync`
+
+## Summary
+
+Closes the last unsynchronized serving-state gap for SRX chassis-cluster
+DHCP-local-server parity (#2239): dynamic DHCPv4/v6 leases now survive RG
+MASTER/BACKUP transitions in both directions and across daemon restart,
+so a failover no longer drops or duplicates a client binding.
+
+This is **PATH C** from the converged plan
+(`docs/research/2239-dhcp-ha-lease-sync/plan.md`): xpf-managed lease
+replication over the existing `pkg/cluster` session-sync channel,
+re-instantiating the IPsec-SA-sync pattern. PATHs A (native Kea HA hook)
+and B (shared external lease DB) were rejected — both require Kea to keep
+running on the BACKUP, contradicting xpf's authoritative-stop model, and
+add an HTTP listener / DB SPOF / second who-serves arbiter.
+
+### The crux: Kea STAYS STOPPED on BACKUP
+
+`clearRethServicesForRG`'s authoritative `ApplyAsync(nil)` is unchanged.
+The standby does **not** run Kea. Instead it holds the peer's lease
+*state* in xpf process memory (the `peerIPsecSAs` precedent) and **seeds**
+the just-started Kea on MASTER takeover — exactly as `reinitiateIPsecSAs`
+re-initiates peer-synced IPsec connections. VRRP/RG remains the **single**
+arbiter of who serves; no second state machine, no split-brain generator.
+
+## Layers (one commit each)
+
+1. **Config knob** — `set chassis cluster dhcp-lease-synchronization`
+   (`DHCPLeaseSync bool`), opt-in, parity with `ipsec-session-sync` /
+   `nat-state-sync`. Standalone and existing clusters unaffected.
+2. **dhcpserver Kea read/seed + control-socket config** — `lease_cmds`
+   hook + unix control-socket emitted only when the knob is set
+   (config bit-identical to pre-#2239 otherwise). `GetSyncLeases4/6`
+   (socket `lease{4,6}-get-all` → memfile fallback), `SeedSyncLeases4/6`
+   (`lease{4,6}-add` → `-update` on collision), `PreSeedMemfile4/6`,
+   `WaitControlSocket4/6`.
+3. **cluster sync replication** — `syncMsgDHCPLeaseV4=25`/`V6=26`,
+   additive + length-gated (#2170 trailing-field discipline) full-set push
+   codec; `peerDHCPLeases{4,6}` standby hold; `QueueDHCPLeases`;
+   `Sent/Received/Seeded` counters in `show chassis cluster`.
+4. **daemon push loop + takeover-seed** — `runDHCPLeaseSyncLoop` (30s
+   heartbeat + 2s on-grant change-detect), node-level MASTER gate
+   (`ddnsWriterGateOpen` shape), `preSeedDHCPLeaseMemfile` BEFORE Kea
+   start + async `seedDHCPLeasesFromPeer` after, nudges on commit /
+   takeover / peer-reconnect.
+5. **tests** — wire round-trip + length-gating + truncation; socket +
+   memfile read; clock-skew immunity; v6 DUID/IAID/IA_PD; conflict→update;
+   config-gen gate; MASTER/BACKUP/standalone gate; change-detect.
+6. **docs** — plan + SMR, feature-gaps, phases, module READMEs.
+
+## Clock invariant (the <60s answer)
+
+*(truncated — 85 lines total)*
+
+
+---
+
+## PR #2263 — #2221: converge same-generation install/delete reorder on the standby (#2170 residual) [MERGED] (merged 2026-06-21)
+
+Branch: `fix/2221-samegen-reorder-stale-session`
+
+## Summary
+
+Fixes #2221 — the **same-generation install/delete REORDER** residual of #2170.
+
+The #2170 install-generation guard refuses a strictly-older delete so a stale
+(older-generation) delete cannot kill a same-5-tuple session re-established in a
+newer generation. The **residual** is WITHIN a single generation domain: the
+gen-stamp and the `sendCh` enqueue are not atomic, and two producer goroutines
+mutate the same key — the 1s sweep re-stamps a LIVE session to generation `N` and
+queues an install carrying `N`, while the userspace delta-drain takes the close
+and (pre-fix) echoed that same `N` on the delete. The delete can win the `sendCh`
+enqueue race and be sent BEFORE the install. The receiver applies `delete(N)`
+then `install(N)`; because the guards refuse only a *strictly-older* operation,
+the equal-`N` install after the equal-`N` delete was re-applied — the standby
+**resurrected a session the master had already closed** (the stale-RETAIN inverse
+of #2170, triggered by reorder rather than a journaled replay).
+
+## Fix (last-writer-wins per key, order-independent)
+
+Two composed changes (`pkg/cluster/sync_conn.go`):
+
+1. **Sender** — a delete draws a **fresh generation strictly greater** than the
+   install it cancels (`takeDeleteGenV4/V6` → `nextInstallGen`) instead of echoing
+   it, so a delete always out-ranks its install on the wire. A key never installed
+   in this boot still yields `gen == 0` (legacy unconditional delete), preserving
+   rolling-upgrade compatibility.
+2. **Receiver** — an applied non-zero delete records the delete generation as a
+   **TOMBSTONE** in `recvGenV4/V6` (it does not evict). A reordered install of the
+   cancelled session carries the OLDER install generation and is refused by the
+   install guard (`incoming < stored`), so the standby stays GONE — matching the
+   master. A genuinely newer incarnation (re-stamped by a later sweep) carries a
+   strictly-greater generation and still installs. A `gen == 0` (legacy) delete
+   still evicts.
+
+The standby's final state equals the master's after every same-gen install+delete
+interleaving: GONE when the master deleted last, PRESENT when a strictly-newer
+install arrived last.
+
+### Composition (no regression)
+- **#2170 gen-guard**: deletes/installs are still compared per-`(sender,key)` and
+  the per-key generation only climbs — a journaled stale delete is still refused.
+- **#2198 F1 overflow bound**: tombstones go through `putGenBounded`; the map is
+  never cleared and is bounded by `genGuardMapCap`.
+- **#2198 F2 bulk-barrier `resetRecvGen`**: a tombstone never blocks a legitimate
+  cold-start re-prime (including the cross-boot `genCounter`-restart case).
+- **Bulk reconcile** at `BulkEnd` is unchanged.
+- **Wire format unchanged** — only the generation values a delete carries change.
+- **Userspace helper** (`delete_synced_session_gen`) already refuses only
+  strictly-older deletes and sees the Go layer's serial, already-ordered
+  decisions (Go is authoritative) — no Rust change required.
+
+*(truncated — 87 lines total)*
+
+
+---
+
+## PR #2264 — vrrp: fix data race on localIP/localIPv6 lazy resolve (#2258) [MERGED] (merged 2026-06-21)
+
+Branch: `fix/2258-vrrp-localip-race`
+
+Fixes #2258.
+
+## The bug
+`sendPacket()` / `sendPacketIPv6()` perform a one-shot **lazy-resolve WRITE** of
+`localIP` / `localIPv6` from the run-loop goroutine when the local address was
+unresolved at `openSocket()` time (no IPv4 address assigned yet, or IPv6 DAD
+still running). Meanwhile the receiver goroutines — `receiver()`,
+`receiverIPv6()`, `parseAfPacketIPv4()`, `parseAfPacketIPv6()` — **READ** those
+fields to filter self-sent advertisements. With the fields as plain `net.IP`
+the write/read was an unsynchronized Go data race (`go test -race` flags it).
+It fires at most once (only on the unresolved-at-socket-open path), is
+pre-existing, and is distinct from the `lastDropWarn` race fixed in #2225
+(this was found during that review).
+
+## The fix (option b — atomic)
+Early resolution alone (option a) is **infeasible**: the local address genuinely
+may not be resolvable at socket-open, which is the entire reason the lazy resolve
+exists. So `localIP` / `localIPv6` are now `atomic.Pointer[net.IP]`, accessed
+solely via `getLocalIP`/`setLocalIP` and `getLocalIPv6`/`setLocalIPv6` (a nil
+pointer means unresolved). This keeps the packet hot path lock-free, mirrors the
+`lastDropWarn` atomic pattern, and **preserves the lazy-resolve semantics** —
+the address still becomes available once it is resolvable.
+
+All call sites route through the accessors: the `openSocket` resolve, the
+`sendPacket`/`sendPacketIPv6` lazy write, the four receiver self-sent filters,
+the `run()` IPv6-receiver gate, and the `handleMasterRx` equal-priority
+tie-break (run-loop reader; same goroutine but made consistent).
+
+## Sibling audit
+The other readers of these fields (`run()` gate, `handleMasterRx` tie-break) run
+in the run-loop goroutine — the same goroutine as the lazy-resolve write, so
+they are already serialized — but they were routed through the accessors anyway
+for consistency. No other field has the same run-loop-write-vs-receiver-read
+hazard (the `lastMasterPriority`/`lastMasterSeen` fields are already mu-guarded;
+`lastDropWarn` was fixed in #2225).
+
+## Validation
+- `go vet ./pkg/vrrp/...` — clean
+- `go build ./...` — clean
+- `go test ./pkg/vrrp/...` — ok
+- **`go test -race ./pkg/vrrp/...` — ok (the primary gate, full suite clean)**
+
+**Fail-on-revert proof:** new `pkg/vrrp/instance_localip_race_test.go` drives the
+lazy-resolve write concurrently with the **real** `parseAfPacketIPv4` /
+`parseAfPacketIPv6` reader. Under `-race` the tests are CLEAN with the atomic
+fix; reverting the fields to a plain `net.IP` makes `-race` report
+`WARNING: DATA RACE` (`setLocalIP` write vs `getLocalIP`→`parseAfPacketIPv4`
+read, and the IPv6 sibling) and both tests FAIL — confirming the test detects
+exactly the issue's race.
+
+
+*(truncated — 57 lines total)*
+
+
+---
+
+## PR #2265 — #2247: NPTv6 fail-closed Copilot polish (warning wording, IPv4-mapped-v6 parity, FEATURES.md) [MERGED] (merged 2026-06-21)
+
+Branch: `fix/2247-nptv6-polish`
+
+Closes #2247. Three low-severity Copilot follow-ups from the #2246 NPTv6 fail-closed review.
+
+## Item 1 — lenient-load warning wording (`compiler_nat.go`)
+The lenient-load warning stated as a certainty that the NPTv6 snapshot is "rejected by dataplane, previous state kept." That behavior is specific to the userspace helper apply/preflight (`Nptv6State::try_from_snapshots` rejects the whole snapshot, so the apply preflight keeps the previous live forwarding state) — the validator itself only classifies the rule as invalid. Reworded the warning and the function doc comment to scope the "previous state is kept" claim to the userspace apply/preflight so it cannot be read as a general validator guarantee. No behavior change.
+
+## Item 2 — IPv4-mapped-IPv6 family parity — **VERIFIED REAL, FIXED**
+Verified the To4()-based family check **is** on the NPTv6 path (`validateNPTv6Strict`, was `extIP.To4() != nil || intIP.To4() != nil`). Go folds an IPv4-mapped IPv6 literal (`::ffff:1.2.3.4`) into a 4-byte form whose `.To4()` is non-nil, so the gate classified it as IPv4 and rejected it as "must be IPv6". Rust's `parse_prefix` (`userspace-dp/src/nptv6.rs`) parses the same text with `Ipv6Addr::from_str`, accepts it as IPv6, and APPLIES the rule — so on the lenient load path Go warn-skipped while the dataplane would install it (Go↔Rust divergence). The divergence is fail-safe (an IPv4-mapped literal is a nonsensical NPTv6 prefix) but the verdicts must agree.
+
+Fix: switched the family check to the existing textual `natAddrFamily` classification (colon == v6), which already documents this exact To4() pitfall and matches Rust's `from_str` classification. Added `natCIDRIPPart` to apply `natAddrFamily` to the original CIDR text (the parsed `net.IP` folds the mapped form), and discarded the now-unused parsed IPs.
+
+Added `TestNPTv6IPv4MappedFamilyParity` (fail-on-revert proven: restoring the To4() check makes the test fail).
+
+## Item 3 — FEATURES.md completeness
+Documented the #2241 overlap-rejection behavior (`SnapshotIntegrityError::Nptv6OverlappingPrefix`, with rule names + direction) in the NPTv6 row of `userspace-dp/src/FEATURES.md`, alongside the already-documented #2240 fail-closed parse — completing the module contract.
+
+## Validation
+- `go build ./...`, `go vet ./pkg/config/...` clean
+- `go test ./pkg/config/...` green (full NPTv6 suite incl. the new parity test)
+- Item-2 fix proven fail-on-revert against the restored To4() check
+- No Rust source changed (the Rust side is the parity *target*, already correct); FEATURES.md is the only Rust-tree file touched (doc-only)
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #2266 — #2253: exact-match rib-group .inet/.inet6 family resolution (reject malformed .inetX.0) [MERGED] (merged 2026-06-21)
+
+Branch: `fix/2253-rib-inet-match`
+
+## Bug (#2253)
+
+The rib-group `import-rib` family resolution matched the address family
+with a **loose `.inet` substring** (`strings.Index`) in two places that
+must agree:
+
+- `pkg/routing.resolveRibTable` — the runtime applier
+- `pkg/config.validateRibGroupImportRibReferencesStrict`'s `resolvable`
+  closure — the commit-time gate
+
+Because both sides used the identical loose match, a malformed token
+whose prefix is a *defined* routing-instance — `<vrf>.inetX.0`,
+`<vrf>.inetfoo.0`, `<vrf>.inet60.0`, or trailing garbage like
+`<vrf>.inet.0.garbage` — **resolved onto the instance table** instead of
+being rejected. Worst case is a sloppy rib name leaking into the
+operator's intended real target table.
+
+This is benign / pre-existing, **not** the #2226 bug: the loose match
+still required a real, defined instance, so it never produced the phantom
+table-0 mis-leak #2226 fixed, and the gate↔runtime stayed consistent.
+This PR is the optional hardening the issue calls for.
+
+## Fix
+
+Replace both substring matches with a single exact-suffix matcher,
+`ribInstanceFromName`, that accepts only:
+
+- `inet.0` / `inet6.0` (the main table — handled directly by callers), and
+- `<instance>.inet.0` / `<instance>.inet6.0` with a **non-empty** instance
+  prefix.
+
+Anything else (`.inetX.0`, `.inetfoo.0`, `.inet60.0`, `.inet.0.garbage`,
+empty-prefix `.inet.0`) returns `ok=false` and is rejected — at commit by
+the strict gate, and inert at runtime via the `ok=false` backstop.
+
+`pkg/config` and `pkg/routing` do not import one another and #2226 relies
+on the commit gate and runtime applier resolving identically, so each
+package carries the **same** matcher and **both change in lockstep**
+(this is documented at each helper).
+
+## Tests (fail-on-revert verified)
+
+Restoring the loose `.inet` substring match makes **all** the new
+assertions fail (verified before committing).
+
+- `pkg/routing`: `TestResolveRibTable` extended with the malformed-family
+  cases; new `TestRibInstanceFromName` table.
+- `pkg/config`: new `TestRibGroupImportRibMalformedFamilyRejected`
+  (each malformed token whose prefix IS a defined instance is hard-
+  rejected at commit) + `TestRibInstanceFromNameConfig`.
+
+*(truncated — 71 lines total)*
+
+
+---
+
+## PR #2267 — #2262: preserve IA_PD lease type in DHCP memfile-fallback read (no IA_NA mis-seed) [MERGED] (merged 2026-06-21)
+
+Branch: `fix/2262-memfile-pd-family`
+
+## Summary
+
+- Follow-up to #2239 (PR #2260). The v6 lease-sync **memfile-fallback** read path (`readSyncLeasesViaMemfile`, taken only when the Kea control socket is not yet up) hardcoded `LeaseType="IA_NA"` and could not recover the prefix length, so an IA_PD (prefix-delegation) lease read during the socket-down window was mis-seeded on the peer as an IA_NA address lease.
+- Recover the lease kind from the memfile: parse the canonical Kea v6 `lease_type` (0=IA_NA, 1=IA_TA, 2=IA_PD) and `prefix_len` columns onto `ddnsLease`, and map them into `SyncLease` in the fallback exactly as the socket path (`keaLeaseToSync`) does — IA_PD carries its prefix length, IA_NA carries 0.
+- The parse is **non-destructive and confined**: `lease_type`/`prefix_len` are OPTIONAL columns (NOT added to `requiredLeaseColumns`), so the DDNS reconciler's destructive posture is unchanged and the fields are inert on the v4 / DDNS paths.
+- **Fail-closed on corruption:** an absent/empty `lease_type` (old memfile, v4 file) stays IA_NA-equivalent (prior behavior preserved); a PRESENT-but-unparseable `lease_type` is skipped (logged) rather than defaulted to IA_NA, so a corrupt row can never silently mis-seed an address lease.
+- README contract updated on `GetSyncLeases`.
+
+## Test plan
+
+- [x] `TestGetSyncLeases6_MemfileFallback_PreservesType` — v6 memfile with BOTH an IA_NA (lease_type 0) and an IA_PD (lease_type 2, prefix_len 56) row; asserts each lease's type and the PD prefix length survive.
+- [x] `TestGetSyncLeases6_MemfileFallback_SkipMalformedType` — a present-but-unparseable `lease_type` row is skipped while a valid IA_PD row in the same file still parses.
+- [x] **Fail-on-revert verified**: temporarily re-hardcoding `LeaseType="IA_NA"` fails both IA_PD assertions and the skip-count assertion.
+- [x] `go build ./...`, `go vet ./pkg/dhcpserver/... ./pkg/cluster/...`, `go test ./pkg/dhcpserver/... ./pkg/cluster/...` all green; new tests pass 5x with no flake.
+
+This is a Go-only control-plane change with no dataplane/forwarding impact; no cluster smoke run required.
+
+## Refs
+
+Closes #2262. Follow-up to #2239 / PR #2260.
+
+---
+
+## PR #2269 — #2268: round-trip IA_TA lease type symmetrically in DHCP pre-seed memfile writer [MERGED] (merged 2026-06-21)
+
+Branch: `fix/2268-iata-write-parity`
+
+Fixes #2268. Direct follow-up to #2267 (issue #2262).
+
+## Problem
+After #2267 the HA DHCP-server lease-sync **read** path distinguishes all
+three Kea v6 lease kinds (`keaLeaseTypeToString`: 0=IA_NA, 1=IA_TA, 2=IA_PD),
+but the **write / pre-seed** side was asymmetric: `writeMemfile6` only encoded
+**IA_PD vs "everything else as IA_NA"** — no IA_TA branch. A synced **IA_TA**
+(DHCPv6 temporary address, RFC 8415) lease was read and held as IA_TA on the
+standby but written back as `lease_type=0` (IA_NA) when pre-seeding the Kea
+memfile on takeover → silent type downgrade across failover.
+
+## Fix (option 1 — full parity)
+- Added `stringToKeaLeaseType` as the **exact total inverse** of
+  `keaLeaseTypeToString`; both v6 write callers (`writeMemfile6` memfile
+  pre-seed AND `syncLeaseToKea` / `lease6-add`) go through it, so the
+  read↔write mapping cannot drift to re-introduce the downgrade.
+- IA_TA now writes `lease_type=1`.
+- `prefix_len` handled correctly: IA_TA (like IA_NA) is a full `/128` address
+  binding, so its `prefix_len` column is 128; only IA_PD carries `l.PrefixLen`.
+- Unknown lease-type string → IA_NA fallback + log (never silent mis-type).
+- Updated `pkg/dhcpserver/README.md` lease-type contract + `SyncLease.LeaseType` doc.
+
+## Tests (fail-on-revert)
+- `TestPreSeedMemfile6_RoundTrip_PreservesIATA` — full sync → pre-seed →
+  read-back round trip for an IA_TA lease + byte-level `lease_type=1` column
+  assertion; IA_NA and IA_PD rows prove no regression.
+- `TestKeaLeaseTypeInverseTotality` — asserts the inverse pair agrees on every value.
+- Verified: restoring the IA_PD-vs-IA_NA-only writer makes the IA_TA assertions fail.
+
+## Validation
+`go build ./...`, `go vet` + `go test` for `pkg/dhcpserver` and `pkg/cluster`
+all green; new tests run 5x with no flake.
+
+Severity LOW (IA_TA is rarely used and xpf's Kea config does not hand out
+temporary addresses by default), but closes the residual third-type tail of the
+#2267 fix.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #2275 — routing: surface per-family RuleList errors from clear() (#2273) [MERGED] (merged 2026-06-21)
+
+Branch: `fix/2273-routing-clear-errors`
+
+## Summary
+
+- All three policy-routing ip-rule reconcilers (`nextTableManager`, `ribGroupManager`, `pbrManager` in `pkg/routing/rules.go`) cleaned their priority window by looping `[AF_INET, AF_INET6]`, calling `RuleList(family)`, `continue`-ing on a dump error, and returning `nil` unconditionally.
+- A transient `AF_INET` netlink dump failure (while `AF_INET6` succeeds) left the IPv4 rules in the managed window **orphaned for that pass** while IPv6 was cleaned. The caller (`daemon_apply.go` steps 3b–3d) only logs the Apply result, so the failure was invisible. Self-heals on the next commit, but the window — though brief and bounded to the manager's own priority range (100–199 / 33000–33099 / 31000–31999) — was entirely unobservable (#2273, LOW).
+- Each `clear()` now **aggregates** per-family `RuleList` failures (`errors.Join`, wrapped with the family) and returns them, while still **best-effort deleting** every family whose dump succeeded.
+- Each `Apply` captures the clear error, logs it at WARN, and **still re-adds the full desired rule set** (forward progress preserved, including the empty-config early returns), then returns the clear error so the daemon apply loop observes it.
+
+## Decision: Apply abort-vs-continue
+
+**Apply logs-and-continues — it does NOT abort on a `clear()` error.** The clear error is captured, logged at WARN, the desired rules are re-added, and the error is then returned for observability. The no-error path is bit-identical to before; the daemon (`daemon_apply.go`) still logs Apply errors and continues, so sequencing is unchanged — the failure is now just visible and retryable. Per-rule `RuleDel` failures stay debug-logged and non-fatal (a stale rule is swept next pass; re-add uses `NLM_F_CREATE|NLM_F_EXCL`, so a still-desired rule stays correct).
+
+## Test plan
+
+- [x] Extended `fakeRuleOps` with a per-family `RuleList` error injector (`listErr` map + `failList` helper) — it previously never returned a `RuleList` error.
+- [x] New table-driven `TestRulesClearListErrorSurfaced` runs all three managers with `RuleList(AF_INET)` armed to fail: each `Apply` must return an error wrapping the injected failure AND must still delete the successful `AF_INET6` window rule (best-effort delete preserved); the `AF_INET` window rule survives (the orphan, now observable).
+- [x] **Fail-on-revert** verified: reverting a manager to `continue` + `return nil` fails its subtest (confirmed against next-table; rib-group/PBR subtests still pass in the same run).
+- [x] `GOCACHE=/dev/shm/cache GOTMPDIR=/dev/shm go build ./...` green.
+- [x] `go vet ./pkg/routing/...` green.
+- [x] `go test ./pkg/routing/...` green; new test 5x no flake.
+
+## Docs
+
+- `pkg/routing/README.md` gains a "clear()/Apply error contract (#2273)" subsection documenting the best-effort-but-observable per-family list behavior and the log-and-continue Apply decision.
+
+## Scope
+
+`pkg/routing` only (rules.go, rules_test.go, README.md) + `_Log.md`. No dataplane / VRRP / HA / daemon code changed.
+
+Refs #2273
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #2276 — ra: clamp prefix preferred lifetime + atomic WithdrawOnce check-and-claim (#2271 #2272) [MERGED] (merged 2026-06-21)
+
+Branch: `fix/2271-2272-ra-lifetime-race`
+
+## Summary
+
+Two `pkg/ra` (embedded RA sender) fixes, one PR per the issues sharing the package:
+
+- **#2271 (LOW, real bug):** `buildRA` built each `PrefixInformation` without enforcing RFC 4861 §4.6.2 (`preferred-lifetime <= valid-lifetime`). A misconfigured pair (operator types preferred > valid, or valid=0 defaults to the 30-day SLAAC valid life while preferred is a large explicit value) advertised a malformed option that conforming hosts (RFC 4862 §5.5.3) ignore — silently dropping SLAAC on every host. Fix: clamp the preferred lifetime **down** to the valid lifetime after the existing zero-to-default normalization (never the reverse — extending validity would advertise a longer-lived prefix than configured).
+- **#2272 (MEDIUM):** `WithdrawOnce`'s busy-check and tombstone install must be atomic under `m.mu` so a concurrent `Apply()`/`WithdrawOnce` cannot start a competing sender between the check and the claim (two owners on one link, or a sender racing the lifetime-0 goodbye — the #2033 blackhole class). The #2033 claim-and-hold tombstone work **already** holds the lock across both steps, so the described race is structurally closed today; this PR locks that in by extracting the atomic step into `claimWithdrawOnceLocked` (with a contract comment naming the race) so it cannot silently regress to the pre-#2033 check-then-act shape, and adds the missing `-race` regression. The tombstone stays HELD across the lockless goodbye emit, so `interfaceBusy` reports the interface busy for the whole operation and the single-owner-emit invariant (no normal RA after the goodbye) is preserved.
+
+## Single-owner-emit invariant (#2033)
+
+Both changes preserve it. The #2271 clamp only touches `buildRA` field values. The #2272 change keeps `WithdrawOnce` goodbye-only via `sendOneGoodbye` (no `run()` loop, so no normal RA ever follows the goodbye) and keeps the tombstone held across the emit.
+
+## Test plan
+
+- [x] `go build ./...`
+- [x] `go vet ./pkg/ra/...`
+- [x] `go test ./pkg/ra/`
+- [x] `go test -race ./pkg/ra/`
+- [x] `go test -race -count=5 ./pkg/ra/` — no flake
+- [x] **#2271** `TestBuildRA_PrefLifeClampedToValidLife` — lifetime matrix (ordered / inverted / equal / both-zero / default-mixes / infinite endpoints); asserts advertised values **and** the §4.6.2 ordering invariant. Fail-on-revert verified (removing the clamp fails 4 cases).
+- [x] **#2272** `TestWithdrawOnceVsApplySingleOwner` — concurrent Apply/WithdrawOnce/Withdraw on one interface under `-race`; peak live-conn count <= 1 + no normal RA after a goodbye per conn.
+- [x] **#2272** `TestWithdrawOnceHoldsTombstoneDuringGoodbye` — deterministic: a concurrent Apply defers (no live sender, <= 1 conn) for the whole goodbye window, then proceeds.
+
+### Revert-proof (#2272)
+Temporarily restoring `WithdrawOnce` to the pre-#2033 check-then-act shape (lock → check → **unlock** → start a REAL sender → send goodbye) made **both** `-race` tests fail across 3 runs:
+```
+peak live conns = 2, want <=1 — WithdrawOnce raced a competing sender (#2272)
+conn 3: normal RA (lifetime=30m0s, seq=2) emitted AFTER the first goodbye (seq=1) — single-owner-emit invariant broken
+Apply started a live sender DURING the WithdrawOnce goodbye (tombstone did not block it) — #2272
+```
+
+## Note on validation lanes
+
+RA withdraw fires on HA failover, so the cluster lane is `make test-failover`. Per the task brief, **the PARENT will run `test-failover` before merge** — it was not run here. This PR is **not merged**.
+
+## Refs
+
+Closes #2271, closes #2272. Single-owner-emit context: #2033.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #2277 — ipsec: fail closed on a broken ike-policy chain (#2270) [MERGED] (merged 2026-06-21)
+
+Branch: `fix/2270-ike-policy-failclosed`
+
+## Summary
+
+- A gateway that names an `ike-policy` whose chain cannot resolve (policy undefined, or its `proposals` reference dangles) made `resolveIKESettings` return an **empty proposal string with a nil error**. `renderConfig` guards the line with `if ikeProposals != ""`, so it emitted the connection block with **no `proposals =` line** → strongSwan negotiates phase-1 with its compiled-in default proposal set instead of the configured crypto (a silent security-posture downgrade — the Phase-1 analogue of the #2073 ESP gap). Nothing validated the chain at commit.
+- **Fail closed on resolution:** `resolveIKESettings` (`pkg/ipsec/ike.go`) now distinguishes the intentional no-policy case (gateway with no `ike-policy` → empty proposal, nil error) from a broken chain → returns the new `errIKEChainUnresolved` sentinel. The legacy direct-proposal fallback stays accepted.
+- **Render belt:** `renderConfig` (`policy.go`) resolves IKE settings *before* writing the connection block and **skips** the VPN on the sentinel (its connection + secret omitted, reusing the #2074 `skipped` set) — one bad reference never zeroes a healthy tunnel. A non-chain error (bad auth-method token) still aborts the whole render.
+- **Commit-time gate:** `validateIKEPolicyChainReferencesStrict` (`compiler_validate_strict.go`), wired into `compileExpanded` after the #2074 gateway gate. Hard-rejects a VPN whose gateway names an undefined `ike-policy`, or an `ike-policy` whose `proposals` reference dangles. Only gateways referenced by a VPN are validated (orphans never render; matches Junos). Strict on commit/commit-check; **lenient (warn, #1960 no-brick)** on the tolerant load / peer-sync paths via `lenientIKEPolicyChainRef`.
+- Mirrors the #2073 / #2074 IPsec fail-closed family exactly (lenient/strict split, render belt, README contract entry).
+
+## Test plan
+
+- [x] `pkg/config`: reject dangling-policy (a) and dangling-proposal (b) at commit; accept a resolvable chain (c), a no-policy gateway (d), the legacy direct-proposal fallback, and an unreferenced orphan gateway; lenient downgrade-to-warning (standalone + node-aware).
+- [x] **Fail-on-revert** (`TestIKEPolicyChainValidatorIsLoadBearing` + manual): neutering the validator call site makes the dangling-reject tests fail; restoring makes them pass.
+- [x] `pkg/ipsec`: `resolveIKESettings` returns the sentinel for a broken chain and a nil error for the no-policy case; `renderConfig` skips a broken-chain VPN while a healthy tunnel renders with a non-empty `proposals` line and a no-policy tunnel renders without an IKE proposals line.
+- [x] `GOCACHE=/dev/shm/cache GOTMPDIR=/dev/shm go build ./...` + `go vet ./pkg/ipsec/... ./pkg/config/...` clean.
+- [x] `go test ./pkg/ipsec/... ./pkg/config/...` green; new + affected tests **5x no flake**.
+- [x] Downstream `grpcapi` / `api` / `configstore` / `daemon` / `cluster` suites green.
+- Live IPsec validation not run in this env (config-compile + render change only; no dataplane/HA path touched).
+
+## Notes
+
+Three pre-existing tests (`TestIPsecGatewaySetSyntax`, `TestGenerateConfig_AggressiveMode`/`_NotSet`, `TestGenerateConfig_DynamicHostname`) carried **latent dangling IKE chains** (they asserted flags orthogonal to the proposal chain). Made self-consistent by defining the referenced `ike-policy` + proposal — they were exercising the exact silent-downgrade this PR closes.
+
+Refs #2270.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #2278 — #2234: bounded stalest-eviction for screen scan/sweep source table (restore detection under saturation) [MERGED] (merged 2026-06-21)
+
+Branch: `fix/2234-screen-sat-eviction`
+
+Fixes #2234 (MINOR-2 from PR #2227).
+
+## Problem
+The per-zone scan/sweep source table was a HARD cap
+(`MAX_SOURCES_PER_ZONE = 4096`). Once a zone held 4096 tracked
+`(zone, src_ip)` keys, a brand-new source was SKIPPED (only bumped
+`skipped_pressure`). Fail-safe for forwarding, but a **detection-DoS**: a
+high-cardinality spoofed-source flood fills the table and a
+subsequently-arriving REAL scanner is never tracked, so never detected,
+until `WINDOW_SECS` expiry — which an attacker keeping its 4096 sources
+fresh can defer indefinitely.
+
+## Fix
+- **Bounded stalest-eviction.** A new source at a full zone reclaims any
+  expired window in a FIXED sample (`EVICT_SCAN_LIMIT = 64`) of the zone,
+  else evicts the stalest (oldest `window_start`) sampled entry. A fresh
+  real scanner is therefore always trackable — the detection cliff is gone.
+- **O(K) bounded, K=64.** The sample budget counts every iterated entry (a
+  fixed prefix), so the per-new-flow worst case is **O(EVICT_SCAN_LIMIT)**,
+  never an O(sources) min-scan (which under a flood would itself be an
+  O(n)-per-packet amplifier). Per-zone source count is tracked
+  incrementally (`per_zone_count`) so the cap test is O(1), replacing the
+  pre-#2234 O(sources) `sources_in_zone` walk on the new-source path. If the
+  sample finds no same-zone victim, it degrades to skip-on-full — still
+  bounded, never fail-open.
+- **One source of truth.** Both trackers unified on a shared `ScanCore<T>`
+  (the pre-#2234 free functions duplicated the windowed-unique formula).
+- **Operator alarm.** `evicted_pressure` counter + a rare LOGARITHMIC
+  `scan-table-pressure` screen event (powers of two in the eviction count),
+  emitted from the cold session-miss hook — NOT a drop, never per-flow.
+  New reason bit `SCREEN_SCAN_TABLE_PRESSURE = 1<<19` (Rust + Go
+  `ScreenFlagNames`, also backfilled the stale 1<<17/1<<18 names).
+
+## Hot-path shape
+The pressure-event check (`take_scan_table_pressure_event`) is two integer
+comparisons on the **cold session-miss path only**; eviction is
+O(64) and runs only when a zone is at its 4096 cap. The hot established-flow
+path is untouched. No per-packet allocation.
+
+## Eviction cost bound
+**O(K), K = EVICT_SCAN_LIMIT = 64.** A `const _: () = assert!` pins
+`EVICT_SCAN_LIMIT < MAX_SOURCES_PER_ZONE`.
+
+## Test plan
+- [x] `cargo build --release` clean
+- [x] `cargo test --release` full suite green (2255/0 main bin + all targets)
+- [x] New fail-on-revert tests, run 5x no flake:
+  - fresh real scanner detected after table saturation (scan.rs + ScreenState)
+  - eviction prefers the stalest window
+  - eviction prefers an expired window
+
+*(truncated — 68 lines total)*
+
+
+---
+
+## PR #2280 — #1387: Kea expired-leases-processing (stale-lease cleanup) config — Path S [MERGED] (merged 2026-06-21)
+
+Branch: `fix/1387-stale-lease-cleanup`
+
+Implements **Path S** of #1387 — the *stale-lease-cleanup* half: an opt-in
+`expired-leases-processing` config subtree under `dhcp-local-server` /
+`dhcpv6-local-server` that renders Kea's per-family reclamation block, so
+expired/released/declined lease ROWS are actually removed from the memfile
+instead of accumulating until LFC compaction.
+
+The converged plan is `docs/research/1387-dhcp-dns/plan.md` (r2) +
+`docs/research/1387-dhcp-ddns/claude-smr-plan-r1.md` on branch
+`research/1387-dhcp-ddns-residual`.
+
+## Scope / context
+
+- The **DDNS half** of #1387 already shipped (#2043 Inc-1 + #2066 Inc-2 —
+  direct RFC 2136, not Kea D2). This PR does NOT touch DDNS.
+- The **kea-d2 alternate DDNS backend is PLAN-KILLed** (duplicates the
+  shipped rfc2136 path, not in the image); the reserved `backend kea-d2`
+  enum + WARN stays as-is.
+- **Live DNS / end-to-end reclamation validation is lab-deferred** — there
+  is no DNS/Kea fixture in CI. The unit golden render is the binding gate;
+  a `kea-dhcp4 -t <generated.json>` acceptance check on deploy confirms Kea
+  parses the rendered block. Kea binaries are not present on the build host,
+  so that config-test is **deploy-pending** (parent may run it).
+
+## What it does
+
+```
+set system services dhcp-local-server expired-leases-processing enable
+set system services dhcp-local-server expired-leases-processing reclaim-timer 10
+set system services dhcp-local-server expired-leases-processing flush-timer 25
+set system services dhcp-local-server expired-leases-processing hold-time 600
+set system services dhcp-local-server expired-leases-processing max-leases 100
+set system services dhcp-local-server expired-leases-processing max-time 250
+set system services dhcp-local-server expired-leases-processing unwarned-cycles 5
+```
+
+renders, per family, into the generated Kea config:
+
+```json
+"expired-leases-processing": {
+  "reclaim-timer-wait-time": 10,
+  "flush-reclaimed-timer-wait-time": 25,
+  "hold-reclaimed-time": 600,
+  "max-reclaim-leases": 100,
+  "max-reclaim-time": 250,
+  "unwarned-reclaim-cycles": 5
+}
+```
+
+`dhcpv6-local-server` takes the same subtree; v4 and v6 are tuned
+independently (Kea renders the block once per `Dhcp4`/`Dhcp6`).
+
+*(truncated — 93 lines total)*
+
+
+---
+
+## PR #2281 — #2279: tighten IKE proposals-line test + clearer ike-policy validator diagnostics [MERGED] (merged 2026-06-21)
+
+Branch: `fix/2279-ike-validator-polish`
+
+Closes #2279. Three LOW (diagnostic / test-quality) polish items Copilot
+flagged on merged PR #2277 (#2270 IKE Phase-1 fail-closed). No
+security-logic change — the validator hard-rejects exactly the same
+configs and the renderer skips exactly the same broken chains; only
+operator-facing diagnostics and one test assertion improve.
+
+## Item 1 — tighten the weak Phase-1 proposals-line assertion
+`pkg/ipsec/ike_chain_failclosed_test.go`:
+`TestRenderConfig_BrokenChainSkipsVPN_HealthyTunnelSurvives` asserted the
+healthy tunnel renders a non-empty Phase-1 proposals line via the bare
+substring `proposals = aes256`. That substring is also contained in the
+child 8-space `        esp_proposals = aes256...` line, so the assertion
+would FALSE-PASS even if the 4-space Phase-1 `    proposals = ` line were
+missing. Tightened to `\n    proposals = aes256`, anchoring to the
+Phase-1 line, mirroring the negative guard in
+`TestRenderConfig_NoPolicyGatewayRendersWithoutProposalsLine`.
+
+**Fail-on-revert proof:** dropping the Phase-1 `proposals =` emission in
+`policy.go` now breaks the tightened assertion; the old bare substring
+matched an `esp_proposals = aes256...` line and would have passed
+(demonstrated structurally — `strings.Contains` of a Phase-1-less render).
+
+## Item 2 — clearer error for a missing proposals leaf
+`pkg/config/compiler_validate_strict.go`: an ike-policy defined with no
+`proposals` leaf left `pol.Proposals == ""` and the error read
+`undefined ike-proposal ""`, sending the operator hunting for a proposal
+literally named `""`. A dedicated branch now reports
+`ike-policy <name> ... has no proposals configured`.
+
+## Item 3 — stanza-agnostic gateway phrasing
+The dangling-ike-policy error prefixed the object as `security ike
+gateway`, but gateways can be authored under either `security ike` or
+`security ipsec` (both `compileIKE` and `compileIPsec` populate the same
+`Gateways` map; the typed struct does not record the stanza). The message
+now names both candidates so the operator can find the gateway regardless
+of where it was written.
+
+## Tests
+New: `TestIKEPolicyMissingProposalsLeafRejected`,
+`TestIKEGatewayDanglingPolicyMessageStanzaAgnostic`. Existing chain-ref
+tests unchanged-and-passing (they assert object-name substrings, not the
+reworded prefixes). `pkg/ipsec/README.md` #2270 bullet updated to document
+the new diagnostics.
+
+## Validation
+- `go build ./...`, `go vet ./pkg/ipsec/... ./pkg/config/...`,
+  `go test ./pkg/ipsec/... ./pkg/config/...` all green.
+- Affected tests run 5x with no flake.
+- Item-1 fail-on-revert proven (Phase-1 line removed -> tightened test
+  fails; old bare substring would have false-passed).
+
+*(truncated — 52 lines total)*
+
+
+---
+
+## PR #2284 — grpcapi: harden Complete pos + ShowNAT port-pool against int32 abuse (#2282) [MERGED] (merged 2026-06-21)
+
+Branch: `fix/2282-grpcapi-input-hardening`
+
+Closes #2282.
+
+Two gRPC input-robustness gaps in `pkg/grpcapi`, both flagged by the
+adversarial audit-2 sweep (2/2 skeptics).
+
+## 1. `Complete` RPC — negative `pos` slice panic (MEDIUM, local DoS)
+`CompleteRequest.pos` is `int32` on the wire. The handler only bounded the
+upper end (`if int(req.Pos) < len(text) { text = text[:req.Pos] }`), so a
+crafted `pos = -1` with a non-empty `line` made `int(-1) < len(text)` pass
+and sliced `text[:-1]`, panicking the handler goroutine. A single local
+gRPC call could crash the handler.
+
+**Fix:** reject any negative `pos` with `codes.InvalidArgument` before the
+slice (matching the `InvalidArgument` convention of the address validators
+in this file). `pos > len` was already safe (the slice is skipped) and is
+unchanged.
+
+## 2. `GetNATPoolStats` — int32 port-pool overflow (LOW, display corruption)
+`(portHigh-portLow+1) * len(Addresses)` was computed in `int` then cast
+straight to the `int32` `NATPoolStats.TotalPorts` field. For a large pool
+(~40k addresses over the default 64512-port window → ~2.6e9) the cast wraps
+negative and corrupts the `avail = total - used` display.
+
+**Fix:** compute `total`/`used`/`avail` in `int64` and saturate to int32
+max via a new `clampInt32` helper before assigning the int32 proto fields;
+`avail` stays coherent (clamped total − clamped used, floored at 0). Proto
+field type unchanged.
+
+## Tests
+`server_input_validation_test.go`:
+- Table test for `Complete` over `pos` {MinInt32, -1, 0, mid, len, len+1,
+  MaxInt32} — negatives → `InvalidArgument` with no panic; valid → correct
+  completion.
+- A NAT pool grown to overflow int32 → `TotalPorts` clamped to `MaxInt32`,
+  non-negative, `avail == total`; plus a small-pool exactness case.
+
+Both are **fail-on-revert**: removing the `pos` guard makes the negative
+cases panic (`slice bounds out of range`); reverting the int64+clamp makes
+`TotalPorts` wrap negative (verified -1714487296).
+
+## Validation
+- `go build ./...` — green
+- `go vet ./pkg/grpcapi/...` — clean
+- `go test ./pkg/grpcapi/...` — green
+- New tests 5x — no flake
+
+`pkg/grpcapi/README.md` handler-discipline section documents the
+signed-wire-field range-check rule.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #2285 — logging: bound syslog stream writes + cooldown reconnect (#2283) [MERGED] (merged 2026-06-22)
+
+Branch: `fix/2283-syslog-resilience`
+
+## Summary
+
+`SyslogClient.Send` / `SendBinary` are reached **inline** on the shared dataplane event hot-path (EventStream reader → `onRawDataplaneEvent` → `EventReader.ProcessRawEvent` → `logEvent` → `SyslogClient.Send` → `conn.Write`). Two TCP/TLS resilience defects let a bad syslog target stall or thrash that path. Both fixed here as one PR (scoped to `pkg/logging`).
+
+- **Write deadline (fix #1, availability).** `streamWrite()` sets `SetWriteDeadline(now + writeTimeout)` (default 4s) before every TCP/TLS `Write`. A slow/hung/congested server now surfaces as `os.ErrDeadlineExceeded`; the message is dropped (counted), and the event reader continues — it can no longer be stalled indefinitely. Previously `conn.Write` had only a 5s *connect* timeout and could block forever.
+- **Reconnect cooldown (fix #2, thrash).** `reconnect()` is gated by `reconnectCooldown` (default 1s). A write failure attempts at most one reconnect; if the previous dial failed inside the window, the reconnect is skipped and the send fails fast (drop) — no more thundering herd of 5s-timeout dials against a down server. `lastDialFailure` is cleared on a successful dial.
+- **UDP exempt.** Connectionless, never blocks on `Write`, never reconnects — the deadline/cooldown logic applies only to the stream transports.
+- **Observability + log hygiene.** Drops counted via `DroppedWrites()` / `DroppedCooldown()`; the drop warning is rate-limited to ≤1/s so a flapping target cannot spam the log from the hot-path (CLAUDE.md logging rules).
+- **Test seams.** `nowFn` (clock) and `dialFn` (dial) seams added for deterministic, sleep-free tests. README documents the new contract.
+
+## Invariants held
+
+The event reader makes forward progress under every failure mode — hung server, down server, mid-reconnect, dial failure. `Send`/`SendBinary` callers already discard the return value (`_ = c.Send(...)`); the change ensures those calls also *return promptly*. Normal-path behaviour is preserved: a healthy syslog server still receives every message (the deadline is far enough out to never fire on a healthy write).
+
+## Test plan
+
+- [x] `go build ./...` green
+- [x] `go vet ./pkg/logging/...` green
+- [x] `go test -race ./pkg/logging/...` — new tests pass; `pkg/logging` 5× with `-race`, no flake (deterministic fakes + a controllable clock, **no sleeps**). The only failing test, `TestRawEventContractMatchesDataplaneEvent` (screen-flag count 17 vs 20), is **pre-existing on clean `origin/master`** and unrelated to syslog.
+- [x] **Fail-on-revert proof #1:** removing `SetWriteDeadline` → `TestStreamWriteDeadlineDoesNotHang` hangs and fails ("Send did not return — write deadline missing").
+- [x] **Fail-on-revert proof #2:** removing the cooldown gate → `TestReconnectCooldownRateLimitsDials` fails (50 dials vs expected 1).
+
+New tests (`syslog_resilience_test.go`):
+- `TestStreamWriteDeadlineDoesNotHang` — hung-server conn; Send returns within the deadline and counts a drop.
+- `TestReconnectCooldownRateLimitsDials` — down target; 50 rapid Sends → exactly 1 dial, fast-fail drops; one more dial after the cooldown advances.
+- `TestHealthyStreamNoDeadlineDrops` — healthy conn delivers every message, zero drops, single dial, deadline still set.
+
+Validation lanes not run: this is a `pkg/logging`-only Go change with no dataplane/CoS/HA/forwarding surface, so the cluster smoke/failover lanes don't apply.
+
+## Refs
+
+Closes #2283
+
+---
+
+## PR #2286 — logging: mirror screen reason flags 17-19 into screenFlagNames (#2278 follow-up, fixes master-red contract test) [MERGED] (merged 2026-06-21)
+
+Branch: `fix/2278-logging-screenflag-mirror`
+
+**Fixes a failing test on master.** PR #2278 (#2234) added 3 screen reason bits to `dataplane.ScreenFlagNames` (ScreenICMPFragment 1<<17, ScreenIPMalformed 1<<18, ScreenScanTablePressure 1<<19, now 20 entries) and bumped `TestRawEventContractMatchesDataplaneEvent` to expect 20, but the logging-side mirror `screenFlagNames` in `pkg/logging/ringbuf.go` (used to format screen reasons for syslog without importing pkg/dataplane) was left at 17 entries. The cross-package contract test consequently fails on master: `screen flag count = 17, want 20`.
+
+This adds the 3 missing constants + map entries so the logging mirror matches `dataplane.ScreenFlagNames` exactly. The contract test checks both the count AND each flag's name string, so the names match verbatim ("ICMP fragment", "IP malformed", "scan-table pressure") — the test passing is the authoritative verification.
+
+Validation: `go test ./pkg/logging/...` green (contract test now passes), `go build ./...` clean, gofmt clean. No behavior change beyond syslog rendering human-readable names for these 3 reasons instead of a numeric fallback.
+
+Root cause: #2278's engineer + review ran cargo + `go vet ./pkg/dataplane` but not `go test ./pkg/logging/`, so the logging-mirror drift slipped through.
+
+---
+
+## PR #2289 — #2287: fix syslog re-entrant deadlock (drop-warn after unlock + Handle re-entrancy guard) + drop-on-timeout-no-retry [MERGED] (merged 2026-06-22)
+
+Branch: `fix/2287-syslog-reentrancy-deadlock`
+
+## Summary
+
+Fixes the re-entrant deadlock regression introduced by #2285 (#2283), plus the write-timeout 2x bound and the dropped-writes counter doc mismatch. All changes are in `pkg/logging` (`syslog.go`, `slog_handler.go`, new `goid.go` + tests). Fix-forward — #2285's write-deadline + reconnect-cooldown logic is sound; only the re-entrancy and timeout-retry needed correcting.
+
+Closes #2287.
+
+## The deadlock (HIGH)
+
+`SyslogClient.Send`/`SendBinary` hold `s.mu` for the whole write+reconnect sequence; on a write/reconnect failure they called `noteDrop` (under `s.mu`), which emitted `slog.Warn`. `slog.Default()` is the `SyslogSlogHandler` (daemon_run.go:184), whose `Handle` calls `c.Send` **synchronously** per client. So for a self-referential failing client: `c.Send` locks `c.mu` -> write fails -> `noteDrop` -> `slog.Warn` -> `Handle` -> `c.Send` -> `c.mu.Lock()` re-entrant -> **self-deadlock** (`sync.Mutex` is non-reentrant). On the dataplane event path (`logEvent -> Send` inline in the readLoop) this hangs the event reader — strictly worse than the unbounded stall #2285 set out to fix.
+
+## Fixes
+
+1. **Deadlock** — `noteDrop` no longer emits `slog.Warn` under `s.mu`. It captures a `pendingDropWarn` snapshot under the lock; `Send`/`SendBinary` emit it via a `defer` ordered (LIFO) to run AFTER the `s.mu` Unlock. The existing 1/s rate-limit gate is preserved. Defense-in-depth: `SyslogSlogHandler.Handle` now carries a **per-goroutine** re-entrancy guard (a `sync.Map` of goroutine IDs, shared across `WithAttrs`/`WithGroup` derivatives) — a record already being forwarded on this goroutine is not re-forwarded to syslog. Per-goroutine, not a per-handler flag, so concurrent `Handle` on different goroutines is never falsely skipped. Base-handler (stderr) forwarding stays unconditional.
+2. **2x bound (MEDIUM)** — a stream write that fails with a *timeout* (`net.Error.Timeout()`, the `SetWriteDeadline` expiry) is dropped+returned immediately, NOT reconnect+retried (the deadline already bounded it; reconnecting re-arms another full `writeTimeout`). Only a genuine connection error reconnects.
+3. **Counter doc (LOW)** — split a `droppedDials` counter (`DroppedDials()`) out of `droppedWrites` so `DroppedWrites()` is exactly "write timeout or write error" as documented. The warning carries a `reason` attribute (`write`/`dial`/`cooldown`).
+
+## Test plan
+
+- [x] `go build ./...` clean
+- [x] `go vet ./pkg/logging/...` clean
+- [x] `go test -race ./pkg/logging/` green
+- [x] New regression tests (`syslog_reentrancy_test.go`), 5x no flake, deterministic fakes (no sleeps)
+- [x] **Fail-on-revert proof — deadlock:** moving the drop warning back under `s.mu` and disabling the handler guard makes `TestSelfReferentialSendNoDeadlock` hang and time out (verified)
+- [x] **Fail-on-revert proof — 2x bound:** reverting the timeout-drop branch (reconnect on timeout) makes `TestStreamTimeoutDropsWithoutReconnect` see a reconnect dial (got 1, expected 0) (verified)
+- [x] #2285's existing resilience tests (`TestStreamWriteDeadlineDoesNotHang`, `TestReconnectCooldownRateLimitsDials`, `TestHealthyStreamNoDeadlineDrops`) still pass
+- [x] Consumers `pkg/daemon`, `pkg/dataplane/userspace`, `pkg/grpcapi`, `pkg/vrrp` `-race` green
+- [x] `pkg/logging/README.md` updated (drop-warn-after-unlock, timeout-drops-without-retry, re-entrancy guard, DroppedDials)
+
+Note: a pre-existing, unrelated `pkg/fsatomic` canary (`TestNoDirectOsWriteFile`) flags `pkg/dataplane/proxyarp.go:95` — present on master, not touched here.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #2296 — #2288: guard CLI completion suffix slices against over-typed input + implement monitor flow match filter [MERGED] (merged 2026-06-22)
+
+Branch: `fix/2288-cli-completion-panic`
+
+Fixes #2288 (audit-3 finding). Salvaged + committed after the engineer agent died on an API 529; parent reviewed inline.
+
+## 1. Tab-completion slice-bounds panic (MEDIUM, verified)
+completion.go computed `suffix := cp[len(partial):]` (and the pipe-filter `name[len(partial):]`) without checking `len(partial) <= len(cp)`. Verified via real `cliCompleter.Do()`: `show f zzzzz`, `clear s zzzzz`, `c zzzzz` panicked. Guarded every such slice to fall back to an empty suffix. Test: completion_panic_test.go (over-typed + pipe-over-typed → no panic; normal completion regression). Fail-on-revert: removing the guard re-panics.
+
+## 2. monitor flow match filter (LOW)
+`monitor security flow file <name> match <regex>` parsed/stored `match` but never applied it (silent no-op). Now compiled at parse time (bad regex rejected cleanly) and applied as a trace-line filter. Test: monitor_match_test.go.
+
+go build/vet/test ./pkg/cli/ green. No user-WIP files touched.
+
+---
+
+## PR #2304 — logging: gate goID on no-client path + arm syslog cooldown on accept-then-reset (#2295, #2302) [MERGED] (merged 2026-06-22)
+
+Branch: `fix/2295-2302-syslog-followups`
+
+Two `pkg/logging` syslog follow-ups carried over from the #2287/#2289 review.
+
+## Summary
+
+- **#2295 (LOW):** `SyslogSlogHandler.Handle` ran `goID()` (`runtime.Stack` + `ParseUint`) for every forwarded record whenever the re-entrancy guard was active, including the common **no-syslog-client** path (the default until syslog config applies). `Handle` now snapshots the client set FIRST and returns before the guard when `len(clients)==0`, so `goID()` runs only when there is something to forward. Also corrects the `goid.go` doc comment and renames the stale `emitDropWarn` reference in `syslog.go` to the actual method name `emit`. The #2287 guard (base.Handle unconditional, guard wraps forwarding when clients present) is **unchanged**.
+- **#2302 (MEDIUM):** the reconnect cooldown was bypassed when the TCP/TLS **dial succeeds but the subsequent Write fails** (accept-then-reset collector, half-open server, TLS app-layer drop). `lastDialFailure` was set only on a dial ERROR and cleared on dial SUCCESS → the cooldown stayed permanently disengaged and every log message drove a fresh TCP connect + teardown (a dial storm: ephemeral port exhaustion + SYN pressure on the collector). The field is renamed `lastReconnectFailure` and armed from BOTH failure modes — a failed dial (in `reconnect`) and a dial-success-then-retry-write-failure (via `armReconnectCooldown` in the Send/SendBinary retry-write path). The clock is cleared only on a **fully** successful reconnect (dial AND retry-write both land), so the legit single-broken-pipe recovery path and the #2287 timeout-drop-without-retry behavior are preserved.
+
+## Hot-path shape
+
+- #2295 removes `runtime.Stack` + `ParseUint` from the common no-client slog path (zero added cost; pure removal). On the with-client path, behavior is identical.
+- #2302 adds one `s.now()` store on the retry-write-failure path and one `time.Time{}` store on full recovery — both already inside the held `s.mu` critical section, no new lock, no new allocation.
+
+## Test plan
+
+- [x] `TestHandleNoClientsSkipsGoID` (#2295) — `goIDFn` counting seam; no-client path makes ZERO `goID` calls. Fail-on-revert: reordering the guard before the client check → 100 calls.
+- [x] `TestHandleWithClientsStillCallsGoID` (#2295) — reorder did NOT disable the #2287 guard: with a client present `goID` runs once and the record forwards.
+- [x] `TestAcceptThenResetRateLimitsDials` (#2302) — fake clock + dial seam that always succeeds but hands back an always-fail-write conn; 50 sends at t=0 → exactly 1 dial; +1 after the window advances. Fail-on-revert: removing `armReconnectCooldown` → 50-dial storm.
+- [x] `TestAcceptThenRecoverClearsCooldown` (#2302) — counter-factual: a single broken-pipe error whose reconnect lands a healthy conn succeeds AND leaves `lastReconnectFailure` zero (legit recovery not penalized).
+- [x] Existing #2287 resilience + re-entrancy tests still green.
+- [x] `go build ./...` + `go vet ./pkg/logging/...` clean; `go test -race ./pkg/logging/...` green; new tests 5x no flake.
+
+Deterministic fakes (fake clock, dial seam, `goIDFn` seam), channels not sleeps. No cluster needed — pure `pkg/logging` Go change off the dataplane forwarding path (it touches the slog/syslog event path only).
+
+## Refs
+
+Closes #2295, closes #2302. Follow-up to #2287 (PR #2289).
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #2305 — #2298: classify scan-table-pressure alarm by action, not as a screen drop [MERGED] (merged 2026-06-22)
+
+Branch: `fix/2298-scan-alarm-not-drop`
+
+Fixes #2298.
+
+## Problem
+The #2234 scan-table-pressure saturation alarm is emitted by the Rust
+dataplane (`emit_screen_alarm_event`) as a `ScreenDrop`-KIND event with
+`action=PERMIT` — the packet still forwards; it is an informational alarm,
+not a drop. #2278 added the PERMIT action, but every Go consumer still
+classified the event purely by KIND, so the alarm:
+
+- bumped `ScreenDropEvents`, inflating screen-drop dashboards under exactly
+  the spoofed-source scan flood the alarm reports — masking real screen
+  drops with alarm noise; and
+- was logged at `SyslogError`. An `action=permit` event at ERROR severity
+  is contradictory and pages drop-severity alerts.
+
+## Fix — approach (b): classify by action
+The surgical option that reuses the already-decoded action field and the
+existing action constants rather than introducing a new wire KIND (the
+Go↔Rust wire/KIND and `TestRawEventContractMatchesDataplaneEvent` are
+unchanged).
+
+- `pkg/logging/ringbuf.go`: `eventSeverity` now takes the action byte. A
+  screen event with `action=PERMIT` maps to the new `SyslogNotice`
+  (RFC 5424 severity 5); only a real screen drop (DENY/REJECT) stays at
+  `SyslogError`. Both the syslog and local-log call sites pass `evt.Action`.
+- `pkg/logging/syslog.go`: add `SyslogNotice = 5`.
+- `pkg/dataplane/userspace/eventstream.go`: `recordDataplaneEvent` takes the
+  action byte; a PERMIT screen event increments a new `ScreenAlarmEvents`
+  counter instead of `ScreenDropEvents`. A defensive `dataplaneEventAction`
+  helper reads the action at the canonical wire offset (54) from the
+  already-validated payload (short payload → ActionDeny so it is never
+  misclassified as a permit alarm).
+- Plumb `ScreenAlarmEvents` through `EventStreamStatus` (JSON + `show ...
+  status` format) and the Prometheus
+  `userspace_event_stream_dataplane_events_total{type="screen_alarm"}` series.
+- `userspace-dp/src/afxdp/event_emit.rs`: rustdoc on `emit_screen_alarm_event`
+  updated to document the classify-by-action contract on the Go side (doc
+  only — no wire/KIND change).
+
+Real screen drops still bump `ScreenDropEvents` and log at `SyslogError`.
+
+## Tests (fail-on-revert)
+- `TestRecordDataplaneEventScreenAlarmNotDrop` — PERMIT screen event →
+  `ScreenAlarmEvents`, not `ScreenDropEvents`; DENY/REJECT → `ScreenDropEvents`.
+- `TestRecordDataplaneEventNonScreenIgnoresAction` — action gate is scoped to
+  screen events.
+- `TestDataplaneEventActionFromPayload` — action read from wire offset 54;
+  truncated payload defaults to ActionDeny.
+- `TestEventSeverityScreenAlarmIsNotice` — PERMIT alarm → `SyslogNotice`,
+  real drop → `SyslogError`; the two must not share severity.
+
+*(truncated — 61 lines total)*
+
+
+---
+
+## PR #2306 — userspace-dp: IPv6 ext-walker fails closed at bound + IPv6 ping-of-death screen (#2292, #2293) [MERGED] (merged 2026-06-22)
+
+Branch: `fix/2292-2293-ipv6-extwalk-pod`
+
+## Summary
+
+Two IPv6 dataplane correctness fixes that unify forwarding with the
+screen path's "valid enough IPv6" definition.
+
+- **#2292 — forwarding ext-walker fails CLOSED at the bound.** The IPv6
+  forwarding extension-header walkers in `frame/inspect.rs`
+  (`frame_l4_offset`, `packet_rel_l4_offset`,
+  `packet_rel_l4_offset_and_protocol`, `ipv6_is_non_first_fragment`)
+  walked only 6 headers and, when still on an extension header at that
+  bound, returned `Some(offset)` / `Some((offset, proto))` with `proto`
+  = the last extension-header type (0/43/51/60), not a real L4
+  protocol. Callers trusted that bogus offset/protocol. The screen path
+  (`screen/extract.rs`) walks 8 headers and fail-closes on the same
+  over-bound chain, so a crafted 7th+ ext-header IPv6 packet was
+  classified one way by screen and another by forwarding, then
+  forwarded with a wrong L4 interpretation (screen/forward divergence →
+  IDS-evasion surface). Now: one shared bound `MAX_IPV6_EXT_HEADERS = 8`
+  (matches screen) and the post-loop terminal arms return `None` (fail
+  closed). All callers consume via `?`/`match → None`, so GRE
+  inner-parse, tunnel local-origin metadata, NDP, TCP-flag/MSS helpers,
+  and the NAT64/v6 parser fail closed with no further edits.
+- **#2292 — GRE inner-parse drops unresolved protocols.**
+  `gre.rs::parse_inner_protocol_and_offsets` now explicitly DROPS any
+  unresolved/extension-header sentinel (0/43/51/59/60) in its `_` arm
+  rather than forwarding it with the ext-header offset used as a fake
+  L4/payload offset (defense in depth; `proto=0` can no longer reach it
+  after the walker fix). Change is confined to the ext-walker region
+  (parent: resolve any #2303 conflict there).
+- **#2293 — IPv6 ping-of-death screen.** The `ping-death` screen was
+  silently IPv4-only. `check_ping_of_death` now applies the same
+  per-fragment oversize formula to IPv6:
+  `offset_bytes (frag_off & 0xFFF8) + (ip_payload_len - frag_data_off) >
+  65535 → drop`. Two new `ScreenPacketInfo` fields (`ip_payload_len`,
+  `frag_data_off`) are populated in `extract.rs` while it already walks
+  the ext-header chain. Fires for any IPv6 protocol, only on fragments,
+  inheriting the same per-fragment (non-reassembling) approximation
+  limit as IPv4 (#893). Removed the stale "IPv6 ... not covered" doc
+  note.
+
+## Behavior / semantics
+
+- The forwarding walkers resolve chains of up to `MAX_IPV6_EXT_HEADERS -
+  1` (7) extension headers (the 8th loop iteration consumes the terminal
+  L4) and fail closed on 8+ — bit-for-bit the same resolvable/over-bound
+  split as the screen path's `for _ in 0..8`.
+- `ip_total_len` stays IPv4-only; the new fields are 0 for IPv4.
+
+## Test plan
+
+
+*(truncated — 74 lines total)*
+
+
+---
+
+## PR #2307 — wireguard: WG-overhead MSS clamp + unified outer-MTU model + tunnel DSCP/ECN propagation (#2299, #2300, #2303) [MERGED] (merged 2026-06-22)
+
+Branch: `fix/2299-2300-2303-wg-mtu-ecn`
+
+Three related WireGuard/encap correctness fixes that share the encap
+sites and the tunnel-MTU model. Verified at origin/master 410dac2f0.
+
+## Summary
+
+- **#2299 — WG MSS clamp.** Wired `wg::mss::wg_tcp_mss` (previously zero
+  production callers) into the SYN MSS-clamp path via a new
+  `forwarding::tunnel_tcp_mss` dispatcher: a `wireguard` endpoint takes
+  the WG-overhead-aware MSS (outer IP + UDP(8) + WG hdr(16) + tag(16) +
+  §5.4.6 pad(≤15)); every non-WG / plain-forward path keeps
+  `native_gre_tcp_mss` bit-for-bit. Fixes the "handshake + ping pass,
+  bulk TCP stalls at zero bytes" blackhole (the GRE-shaped MSS was
+  ~36–60 bytes too high, so the peer's full-MSS data was dropped at
+  `encap_mtu_drops`).
+- **#2300 — outer-MTU SSOT.** Dropped the `WG_OUTER_MTU = 1500` hardcode
+  in `coordinator/wg_control.rs` (renamed `WG_DEFAULT_OUTER_MTU`,
+  fallback only). The control thread is handed the REAL underlay-egress
+  MTU resolved at spawn (`Coordinator::resolve_wg_outer_mtu`
+  route-looks-up the peer endpoint in the endpoint's transport table);
+  the guard is extracted to `wg_inner_fits_outer_mtu`. Go:
+  `wgTunMTUForEndpoint` now honors an operator-set `tc.MTU` (it was
+  ignored before — the actual sub-1500-underlay bug) and derives from
+  `wgDefaultOuterMTU` otherwise, mirroring the Rust fallback so both
+  sides share one model.
+- **#2303 — DSCP/ECN propagation.** GRE + WG encap copy the inner
+  packet's full TOS/Traffic-Class byte (DSCP + ECN) onto the outer
+  header via new `gre::inner_tos_byte`, instead of hardcoding 0. Uniform
+  DSCP model (RFC 2983) + RFC 6040 normal-mode ECN ingress.
+
+## Hot-path shape
+
+- `tunnel_tcp_mss` adds the same early-out (`tunnel_endpoint_id == 0`)
+  the GRE function had — no new branch on the plain-forward fast path;
+  the endpoint lookup + mode compare fire only on already-tunneled
+  frames.
+- `inner_tos_byte` is a single bounds-checked byte read at the (already
+  cold) encap sites.
+- Control-thread outer MTU is resolved once at spawn, not per packet.
+
+## Test plan
+
+- [x] `cargo build --release` clean.
+- [x] #2299: `tunnel_tcp_mss_wireguard_uses_wg_overhead_not_gre`
+      (WG MSS < GRE MSS for the same fixture, equals the canonical
+      `wg_tcp_mss`) + `tunnel_tcp_mss_gre_unchanged_for_gre_endpoint`
+      (fail-on-revert: GRE endpoint stays on the GRE formula).
+- [x] #2300: `guard_uses_threaded_outer_mtu_not_constant` (drops a
+      1409-byte inner on a 1450 underlay that passes a 1500 link; admits
+      a 5000-byte inner on a 9000 underlay the constant would cap) +
+      Go `TestWgTunMTUForEndpointModel` (operator override wins;
+
+*(truncated — 76 lines total)*
+
+
+---
+
+## PR #2308 — userspace-dp: retry io_uring wait on EINTR, match CQEs by user_data (#2297) [MERGED] (merged 2026-06-22)
+
+Branch: `fix/2297-iouring-cqe-drain`
+
+## Summary
+
+Fixes two io_uring defects in the slow-path TUN reinjector
+(`slowpath::write_packet_io_uring`) and the state writer
+(`state_writer::write_all_with_ring`). Both pushed a single `Write` SQE
+carrying a raw pointer into the caller's buffer, called
+`submit_and_wait(1)`, then reaped exactly one CQE. The `io-uring` crate
+does NOT retry `EINTR`, so a signal during the wait phase returned `Err`
+with the SQE **already submitted** (the `io_uring_enter` syscall flushes
+the SQ before it sleeps) and the CQE unreaped:
+
+- **(a) Stale-CQE / offset corruption (reliably triggerable).** The
+  unreaped CQE stayed in the completion queue. The next write on the
+  same long-lived, reused ring reaped that leftover CQE and applied the
+  *previous* write's byte count to the *new* buffer's `offset` → silent
+  truncation or out-of-bounds offset arithmetic. One EINTR desynced
+  every subsequent write for the worker's lifetime.
+- **(b) Use-after-free window.** A non-SQPOLL ring still punts blocking
+  writes to io-wq. Returning `Err` and dropping the caller's buffer
+  (`req.bytes` / the state `data` slice) while the punted write was in
+  flight let the kernel read freed userspace memory.
+
+The fix factors both call sites onto a shared write loop in a new
+`io_uring_write` module that upholds the SQE-in-flight invariant the
+callers always implicitly assumed — **the function does not return until
+every SQE it submitted has been reaped**:
+
+- `EINTR` (and any wait error) **retries the wait** instead of
+  returning. `submit_and_wait` derives `to_submit` from the current SQ
+  length, so once the SQE is consumed by the kernel the retry degrades
+  to a wait-only `io_uring_enter(0, 1, GETEVENTS)` — it never
+  double-submits. Bounded by a retry ceiling so a pathological EINTR
+  storm cannot wedge the worker.
+- Each submission carries a **distinct, monotonically increasing
+  `user_data`** (both sites previously hard-coded `user_data(1)`). The
+  reap loop matches the CQE by `user_data` and drains/discards any stale
+  CQE left by a prior interrupted submission, so it can no longer be
+  mis-attributed.
+- Because the loop returns only after the matching CQE is reaped, the
+  caller's buffer provably outlives every kernel reference — closing the
+  UAF window.
+
+The **fast forwarding path is untouched** — this is the slow path and
+the state-write path only.
+
+## Hot-path shape
+
+N/A — slow path / state-write path. The shared loop adds a bounded
+`EINTR` retry and a `user_data` equality check per completion. No
+allocations; `user_data` is a `u64` counter.
+
+*(truncated — 77 lines total)*
+
+
+---
+
+## PR #2309 — nat64: walk IPv6 ext-header chain + fail closed on empty source pool (#2290, #2291) [MERGED] (merged 2026-06-22)
+
+Branch: `fix/2290-2291-nat64`
+
+## Summary
+
+Two NAT64 correctness/fail-open fixes in the Rust AF_XDP dataplane.
+
+- **#2290** — the v6→v4 translator parsed IPv6 at a fixed offset 40 and read
+  the raw next-header byte, so any packet carrying a Hop-by-Hop, Routing,
+  Destination Options, AH, or Fragment extension header before its transport
+  header was dropped as "unsupported protocol" even though it is legal RFC 8200
+  input. Worse on the embedded ICMP-error path (`translate_embedded_v6_to_v4`,
+  the #2219 PMTUD/traceroute path): a quoted original packet with an ext header
+  re-opened the blackhole #2219 closed. **Fix:** a local bounded ext-header
+  walker (`ipv6_l4_offset_and_protocol`) + non-first-fragment predicate
+  (`ipv6_is_non_first_fragment`) in `nat64.rs`, used by both
+  `write_v6_to_v4_into` and `translate_embedded_v6_to_v4` to learn the terminal
+  L4 offset/protocol before translating. Ext-header bytes are stripped
+  (RFC 7915 maps only the transport payload). Non-first fragments fail closed.
+- **#2291** — when a NAT64 prefix matched but no IPv4 source could be allocated
+  (empty/exhausted pool — a legitimate wire state the Go side emits for a
+  no-source-pool rule), the code collapsed "matched but unallocatable" into "no
+  match" and continued ordinary IPv6 route lookup on the synthetic NAT64
+  destination (`64:ff9b::a.b.c.d`). With a permissive default IPv6 route that
+  leaked the untranslated synthetic-destination traffic upstream — a fail-open
+  at the NAT64 boundary. **Fix:** tri-state `Nat64Match` enum
+  (`NoPrefixMatch` / `MatchReady` / `MatchUnavailable`) returned by
+  `Nat64State::classify_ipv6_dest`. Only `NoPrefixMatch` continues IPv6
+  routing; `MatchUnavailable` fails closed — drop + bump a new
+  `nat64_no_source_pool` per-binding counter, consistent with the
+  #2124/#2142/#2173/#2175 fail-closed family.
+- The drop counter is wired `BatchCounters` → `BindingLiveState` → snapshot →
+  `BindingStatus` JSON → Go `protocol.go` + a `format/status.go` operator line
+  (`NAT64 no-source-pool drops`). The wire-format fixture
+  (`protocol_wire_v1.json`) is regenerated for the additive field.
+
+## Why a local ext-header walker (not `inspect.rs`)
+
+`crate::afxdp` already depends on `crate::nat64`, so reusing
+`afxdp::frame::inspect::packet_rel_l4_offset_and_protocol` would invert the
+dependency. The issue explicitly permits a correct local walk and says not to
+block on the unifier (#2292). The walk is bounded to 6 iterations and allocates
+nothing.
+
+## Hot-path shape
+
+- Ext-header walk: ≤6 iterations, zero allocation, only on NAT64 v6→v4 frames.
+- Tri-state classify: same prefix scan + pool-index fetch as before, just not
+  collapsing the unallocatable case into "no match".
+
+## Test plan
+
+- [x] `cargo build --release` — clean
+
+*(truncated — 77 lines total)*
+
+
+---
+
+## PR #2310 — userspace-dp: emit ICMP Frag-Needed / Packet-Too-Big for oversized forwarded frames (#2301) [MERGED] (merged 2026-06-22)
+
+Branch: `fix/2301-forwarding-egress-mtu`
+
+## Summary
+
+- The TX dispatcher only had a TCP-specific segmentation decision (`forwarded_tcp_may_need_segmentation`). Every **other** oversized forwarded L3 frame — UDP, ICMP, ESP, GRE, a TCP **segmentation miss**, a non-segmentable TCP frame — was enqueued for TX into an MTU violation and silently dropped by the NIC / switch / peer, with **no MTU signal** back to the sender. PMTUD never converged on a mixed-MTU / tunnel-underlay path (PPPoE 1492, cloud ~1450, VLAN stacks). The only hard oversized guard was the descriptor-capacity check (`copy_frame_is_oversized`, 4096), not the egress interface MTU.
+- New `afxdp::icmp_ptb` module: `forwarded_egress_mtu_decision` (Forward vs EmitPacketTooBig with a next-hop MTU) plus the ICMP generators — **ICMPv4 Destination Unreachable type 3 code 4** (Fragmentation Needed and DF Set, next-hop MTU in the unused word per RFC 1191) and **ICMPv6 Packet Too Big type 2 code 0** (MTU in the 32-bit field per RFC 4443). The builders mirror `icmp::build_local_icmp_error_v4/v6` (L2 reflect + ingress-sourced outer IP + quoted inbound packet) but set the MTU field; they reuse the shared header/checksum helpers and the RFC suppression gate (`reject_icmp_reply_suppressed`, `is_non_first_fragment`).
+- The dispatcher evaluates the decision for forwarded frames the TCP-segmentation path did **not** handle (non-TCP, TCP seg-miss, non-segmentable TCP), skipping NAT64 / native-tunnel encap (the on-wire L3 size differs there and the descriptor-capacity backstop still applies). On `EmitPacketTooBig` it generates a Frag-Needed / Packet-Too-Big back out the **ingress** interface and **drops the oversized original** instead of forwarding it into a silent MTU drop.
+
+## Hot-path shape
+
+- Fast path (in-MTU): one `usize` comparison (`l3_len <= mtu`) per non-TCP-segmented forward, then unchanged. No per-packet allocation on the fast path; the PTB `Vec` is built only on the cold MTU-violation arm.
+- The reply is built inside the `target_binding` borrow (it needs only `source_frame`/`meta`/`ingress_ident`/`forwarding`) and enqueued onto `ingress_binding` once that borrow ends, preserving the #2208 recycle-on-every-path invariant (`mtu_signalled` leaves `retained_source_frame` false → finalizer recycles the descriptor).
+
+## Behaviour preserved
+
+- Non-DF oversized IPv4 still **forwards** (the downstream may fragment) — only IPv4 DF and IPv6 trigger a PTB.
+- A suppressed or unbuildable PTB drops the original **fail-closed** rather than forwarding the violation.
+- Advertised MTU floored at the protocol minimum (1280 v6 / 68 v4).
+- NAT64 already translates PTB↔Frag-Needed across the boundary (#2219); this is the native-forwarding complement.
+
+## Test plan
+
+- [x] `icmp_ptb_tests.rs` (10): oversized v4-DF UDP → Frag-Needed with correct MTU + quoted packet + **verified ICMP checksum**; oversized v6 UDP → Packet Too Big with MTU (+ reply ≤ 1280); in-MTU v4/v6 → Forward; non-DF oversized v4 → Forward; no-egress-MTU → Forward; tiny-MTU floor; non-first-fragment + inbound-ICMP-error **suppression** (with an echo-request counter-factual proving the gate is type-specific); no-primary-address fail-closed.
+- [x] `dispatch_tests.rs` (2, e2e through `enqueue_pending_forwards`): `oversized_forward_emits_ptb_and_drops_original` (PTB enqueued on ingress, original NOT forwarded to egress, descriptor recycled once, `egress_mtu_exceeded` recorded) + in-MTU counter-factual (no PTB, frame forwards). **Fail-on-revert verified**: disabling the decision makes the first test fail.
+- [x] `cargo build --release` clean; `go build ./...` clean.
+- [x] Full `cargo test --release`: 2267 pass; the only 2 fails are pre-existing flaky-concurrency tests (`wg::engine::reconcile_peers_snapshot...`, documented flaky at base; `worker_queue::concurrent_recovery...`) — both pass in isolation and are unrelated to this change.
+- [ ] Cluster smoke (loss userspace cluster) — deferred to the parent (batched).
+
+## Note on icmp.rs overlap (#2237/#2242)
+
+icmp.rs is being edited in parallel by the #2237/#2242 engineer (Time-Exceeded RFC suppression). To stay conflict-free this PR adds **no** edits to icmp.rs — the PTB builders live in a new `icmp_ptb.rs` and only *call* the already-present, unchanged suppression helper `reject_icmp_reply_suppressed` (and `is_non_first_fragment`). The L2-reflect helper is locally re-implemented rather than widening a private icmp.rs fn. Merge order with #2237 does not matter.
+
+## Refs
+
+Closes #2301. Related: #2237/#2242 (icmp.rs Time-Exceeded suppression), #2208 (dispatch recycle invariant), #2219 (NAT64 PTB translation), #1282 (TCP seg-miss counter).
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+
+---
+
+## PR #2311 — userspace-dp: gate locally-generated ICMP errors on RFC suppression + widen v6 quote (#2237, #2242) [MERGED] (merged 2026-06-22)
+
+Branch: `fix/2237-2242-icmp-gen-v2`
+
+## Summary
+
+- **#2237 (HIGH):** the locally-generated ICMP/ICMPv6 Time Exceeded path fired after only a TTL/hop-limit check, so a low-TTL inbound ICMP *error* drew a fresh Time Exceeded (error loop / amplification) and a non-first fragment with TTL 1 drew an error for a packet with no transport context. The sibling reject path enforced only part of the correct contract; the two ICMP-error generators disagreed.
+- Add a single shared gate `can_generate_icmp_error_reply(frame, meta)` implementing RFC 1812 §4.3.2.7 / RFC 792 / RFC 4443 §2.4 suppression and **wire it into the generation call site**: `build_local_time_exceeded_request()` calls it right after the TTL check (covering both poll_descriptor call sites — session-hit and session-miss — without touching either), and `build_reject_icmp_unreachable()` routes through the same gate, replacing its narrower inline checks. Both error generators now enforce one contract.
+- **#2242 (LOW):** the ICMPv6 error builder quoted a fixed 48 bytes — the 40-byte IPv6 base header plus only 8 bytes — so extension-header stacks pushed the transport header past the quote (broken PMTUD/traceroute and receiver-side error↔socket demux). It now quotes up to `1280 - 40 (outer IPv6) - 8 (ICMPv6 header) = 1232` bytes, bounded by the invoking-packet length.
+
+## Suppression contract (`can_generate_icmp_error_reply`)
+
+A locally-generated ICMP error is suppressed when the trigger is:
+- (a) an ICMP/ICMPv6 *error* message — ICMPv4 types {3,4,5,11,12}, all ICMPv6 < 128 (reuses `reject_icmp_reply_suppressed`); ICMP *queries* still reply.
+- (b) a non-first IP fragment (v4 frag-offset; v6 fragment ext header) — reuses `is_non_first_fragment`.
+- (c) a frame with a broadcast/multicast L2 destination, or a multicast/broadcast L3 destination.
+- (d) a packet whose IP source is unspecified, loopback, multicast, or (v4) broadcast.
+
+## Hot-path shape
+
+The gate runs **only on the slow path** — after `packet_ttl_would_expire` returns `Some(true)`, or on the reject path. The normal-TTL forward fast path is untouched. The gate does cheap header field reads plus the same bounded IPv6 extension-header walk already performed per packet; **no per-packet allocation**.
+
+## Test plan
+
+- [x] `cargo build --release` clean (only pre-existing warnings)
+- [x] `go build ./...` clean
+- [x] New named tests pass (23 ICMP-builder tests green; 63 total ICMP-related tests green; full main-binary suite 2272 passed / 0 failed)
+- [x] Emission cases: unicast UDP **and** TCP TTL-1 DO draw a Time Exceeded.
+- [x] Suppression cases: inbound ICMP error (v4 type 11 / v6 type 3), non-first fragment (v4 + v6), multicast dest (v4), L2 broadcast dest, bogus source (v4 loopback/0.0.0.0, v6 multicast) draw nothing — each pinned **through the call site** (`build_local_time_exceeded_request` → `None`), so removing the wiring fails the test.
+- [x] #2242: ICMPv6 quote reaches the transport header behind Hop-by-Hop + Dest-Options ext headers; a 2000-byte invoking packet is quoted up to the 1232-byte cap; total error ≤ 1280.
+- [x] **Fail-on-revert proven on a `/dev/shm` scratch copy** (worktree never held a reverted fix): with the call-site gate removed and the v6 cap reverted to 48, 9 tests fail; with the fix present all pass.
+- [ ] Cluster smoke — batched by the parent agent.
+
+Refs #2237 #2242
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #2313 — userspace-dp: RFC error-suppression guards + RFC 4443 §3 quote length on locally-generated ICMP errors (#2237 #2242) [CLOSED] (closed 2026-06-22)
+
+Branch: `fix/2237-2242-icmp-generation`
+
+## Summary
+
+Two fixes to the locally-generated ICMP error path (`userspace-dp/src/afxdp/icmp.rs`), the hot TTL/hop-limit-expiry forwarding path.
+
+- **#2237 (HIGH):** the locally-generated ICMP/ICMPv6 Time Exceeded path (`build_local_time_exceeded_request`) fired after only a TTL check — it lacked the RFC 1812 §4.3.2.7 / RFC 4443 §2.4 error-suppression guards that the sibling `reject` Destination Unreachable path (`build_reject_icmp_unreachable`, #2089) already had. An inbound ICMP error with TTL=1 elicited a fresh Time Exceeded (error loop / amplification), and a non-first fragment with TTL=1 generated an error for a datagram with no transport context.
+- Added one shared gate, `icmp::can_generate_icmp_error_reply(frame, meta)`, and routed **both** generators through it (one source of truth so the two paths cannot drift). It refuses to originate an ICMP error when the triggering packet is: (a) itself an ICMP/ICMPv6 error message; (b) a non-first IP fragment; (c) destined to an L3 multicast/broadcast or an L2 group MAC; (d) sourced from a non-unique address (unspecified/loopback/multicast/broadcast). Unparseable frames fail closed. RFC clauses are cited inline.
+- The reject path previously guarded only the fragment + ICMP-error subset; it now also honors the multicast/broadcast and non-unique-source cases (the correct contract for that path too).
+- **#2242 (LOW):** `build_local_icmp_error_v6` quoted a fixed 48 bytes of the invoking packet, omitting the transport header whenever IPv6 extension headers pushed it past byte 48 (breaking receiver-side error↔socket demux). Now quotes up to the RFC 4443 §3 minimum-MTU cap: `1280 - 40 - 8 = 1232` bytes, bounded by the actual packet length. The IPv4 builder is unchanged (already RFC 792 minimum, IHL + 8).
+
+## Hot-path shape
+
+The guard is a small set of branchless field reads on the TTL-expiry path, no per-packet heap allocation (no scratch buffer needed — it only reads). The normal TTL>1 forwarding fast path is untouched. The larger ICMPv6 quote stays well within the 4096-byte UMEM frame.
+
+## Test plan
+
+- [x] **#2237** — 13 new tests, each **fail-on-revert**: TTL=1 ICMP-error trigger (v4+v6), non-first fragment (v4+v6), multicast/broadcast dest (v4+v6), L2 group MAC over a unicast L3 dest, and unspecified/loopback/multicast source each produce **no** Time Exceeded; a normal unicast UDP/TCP TTL=1 packet **does** (with ICMP/ICMPv6 echo-query counterfactuals proving the gate keys on the ICMP type, not the protocol). Reverting the gate fails all 13; the 2 positive tests stay green.
+- [x] **#2242** — 2 new tests, each fail-on-revert: an ICMPv6 error for a packet with a 56-byte Destination-Options ext header asserts the quote includes the transport marker (and the ICMPv6 packet stays ≤ 1280); an oversized invoking packet asserts the quote clamps to exactly 1280. Reverting to fixed-48 fails both.
+- [x] `cargo build --release` clean; full `cargo test --release` green (the only failures are the pre-existing, load-sensitive `wg::...reconcile_peers_snapshot` and `worker_queue::...concurrent_recovery` concurrency flakes — both fail identically on clean `origin/master` and neither touches the ICMP path).
+- [x] New tests run 5x with no flake.
+- [x] `go build ./...` clean.
+- [ ] **Cluster iperf smoke is pending** — this is a forwarding-path change; the parent reviews and runs the loss-userspace-cluster smoke.
+
+## Refs
+
+Closes #2237, closes #2242.
+
+---
+
+## PR #2316 — io_uring_write: strengthen stale-CQE test + reconcile drain/ceiling docs (#2312) [MERGED] (merged 2026-06-22)
+
+Branch: `fix/2312-iouring-nits`
+
+## Summary
+
+Three non-blocking follow-ups from the #2308 (#2297) review — all
+test-quality and documentation. **No behaviour change** to the io_uring
+write loop; the #2297 EINTR-retry, `user_data` CQE-matching, and
+buffer-lifetime guarantees are unchanged.
+
+- **Strengthen `stale_cqe_is_not_misattributed` into a real
+  fail-on-revert guard.** The prior test used a single-chunk 5-byte
+  buffer with a pre-seeded stale CQE (`res=9999`) that `drain_stale`
+  evicts before the reap loop runs, and `WriteOutcome` carries no byte
+  count — so it passed on both fixed and buggy code (an overshoot to
+  9999 still exits the `while` loop with the same unit `Done`). It now
+  writes a two-chunk 8-byte buffer (real results 4 then 4) so a correct
+  run must push a SECOND SQE (`push_calls == 2`), and stages the stale
+  CQE against BOTH defences: one pre-seeded (`drain_stale`) and one
+  injected ahead of the real CQE *during the wait* (`with_stale_on_wait`)
+  so it surfaces after `drain_stale` and only the reap-loop `user_data`
+  match can skip it. The `FakeRing` records `accepted_bytes` so the test
+  asserts the exact applied total is 8, never the stale 9999.
+- **Reconcile the `drain_stale` doc with its body.** The docstring
+  claimed a `keep`-matching CQE was preserved, but the body did
+  `let _ = keep; while next_completion() {}` (full drain). Dropped the
+  unused `keep` param and rewrote the doc to describe the unconditional
+  drain and why it's safe (nothing ready can carry the current tag yet
+  at the call site).
+- **Soften the retry-ceiling docs.** The module + `write_all` docstrings
+  said the loop "never returns while an SQE we submitted is still in
+  flight", but `reap_matching` returns `Err` at `MAX_WAIT_RETRIES`. The
+  docs now acknowledge the ceiling as a bounded escape hatch for a
+  pathological EINTR storm.
+
+## Test plan
+
+- [x] `cargo build --release` clean
+- [x] `cargo test io_uring_write` — 8 pass
+- [x] `cargo test state_writer` — 4 pass; `cargo test slowpath` — 2 pass
+- [x] strengthened test run 5x — 5/5 green (no flake)
+- [x] `go build ./...` clean
+- [x] **Fail-on-revert verified:** reverting `reap_matching` to reap the
+      head CQE unconditionally (dropping the `user_data` match) makes
+      `stale_cqe_is_not_misattributed` FAIL — `push_calls left:1 right:2`
+      — while every other io_uring_write test still passes. Restored
+      after the proof.
+
+## Refs
+
+- Closes #2312
+- Follows up #2308 / #2297
+
+
+*(truncated — 51 lines total)*
+
+
+---
+
+## PR #2318 — gre: implement decap-side RFC 6040 §4.2 ECN combine; scope WG to encap-copy (#2315) [MERGED] (merged 2026-06-22)
+
+Branch: `fix/2315-wg-gre-decap-ecn`
+
+Fixes #2315. Follow-up filed as #2317 (WG decap combine).
+
+## Summary
+
+- **#2303 over-claim corrected.** PR #2307 (#2303) added the ENCAP-side
+  inner→outer DSCP/ECN COPY (RFC 2983 + RFC 6040 normal-mode ingress),
+  but the doc/comment claimed the inner ECN was "reflected at decap"
+  while no DECAP-side RFC 6040 ECN combine existed.
+- **GRE decap combine implemented (path chosen: implement).** GRE decap
+  (`try_native_gre_decap_from_frame`) operates on the full received
+  frame, so the outer IP header — and its ECN — is present at
+  `meta.l3_offset`. New `gre.rs` helpers: `outer_ecn_bits` (read the
+  2-bit outer ECN), `decap_ecn_combine` (the pure RFC 6040 §4.2 table →
+  `Keep`/`SetCe`/`Drop`), `apply_decap_ecn_combine` (in-place inner ECN
+  mutate + IPv4 inner-header-checksum recompute). Wired into the decap
+  path: an outer CE upgrades an ECN-capable inner to CE; the illegal
+  outer-CE / inner-Not-ECT combo is **dropped** per §4.2.
+- **WG decap deferred (path: doc-correct + follow-up #2317).** The WG
+  control thread reads transport records from a plain
+  `UdpSocket::recv_from`, so the kernel strips the outer IP/ECN before
+  userspace. Recovering it needs `IP_RECVTOS`/`IPV6_RECVTCLASS` +
+  `recvmsg` — a recv-loop subsystem change, tracked as #2317. The doc
+  and `wg/dscp.rs` comment are scoped to encap-copy-only.
+- **Observability.** Illegal-combo drops bump
+  `GRE_DECAP_ECN_ILLEGAL_DROPS`, surfaced as the Prometheus counter
+  `xpf_userspace_gre_decap_ecn_illegal_drops_total`.
+
+## RFC 6040 §4.2 combine
+
+The only state changes: outer CE upgrades a non-CE ECN-capable inner to
+CE; the illegal outer-CE / inner-Not-ECT cell drops. Every other cell
+keeps the inner verbatim — the inner DSCP is authoritative at decap and
+is never copied from the outer.
+
+## Hot-path shape
+
+A couple of bit ops on the inner TOS byte plus (only on a CE upgrade of
+an IPv4 inner) one header-checksum recompute; no per-packet allocation.
+The outer-ECN read is one branch on the already-decapsulating GRE path —
+not on the plain-forward fast path. IPv6 inners need no checksum work
+(no IP header checksum; the TC is outside the L4 pseudo-header).
+
+## Test plan
+
+- [x] RFC 6040 §4.2 full 4x4 table (`rfc6040_combine_table_is_exact`,
+      high-bit masking).
+- [x] `apply_decap_ecn_combine`: CE upgrade + IPv4 checksum validity,
+      DSCP preservation, illegal-combo drop+count (v4 and v6), IPv6
+      no-checksum, short-packet fallback, no-op when outer not congested.
+- [x] End-to-end through `try_native_gre_decap_from_frame`:
+
+*(truncated — 72 lines total)*
+
+
+---
+
+## PR #2319 — userspace-dp: classify locally-generated replies by their own egress tuple (#2238) [MERGED] (merged 2026-06-22)
+
+Branch: `fix/2238-reply-classification`
+
+## Summary
+
+Locally-generated control replies — ICMP/ICMPv6 Time Exceeded, policy-`reject`
+TCP RST / ICMP-unreachable, SYN-cookie SYN-ACK / ACK-RST — were classified for
+output firewall filter / CoS forwarding-class / DSCP rewrite by the **triggering
+inbound packet's** tuple, or not classified at all. A generated reply is a
+*reflection* of the trigger (MAC/IP swap, frequently a protocol change), so its
+true egress tuple is the reverse of the trigger with a different protocol for the
+ICMP cases. The result: an output filter matching `protocol icmp` never fired for
+an ICMP error generated in response to a TCP/UDP flow; an output filter matching
+the original transit flow could wrongly drop the ICMP error; DSCP/CoS were missing
+or wrongly inherited.
+
+This implements the converged **Path B** plan
+(`docs/research/2238-reply-classification/plan.md`, r3):
+
+- **`frame/generated.rs`** — `generated_reply_session_key()` re-parses the BUILT
+  reply bytes into the generated frame's own `(SessionKey, ForwardPacketMeta)`,
+  reusing the single L2/VLAN walker (`frame_l3_offset`) + the bounded v6
+  ext-header walk so there is one wire parser, not a second hand-rolled one.
+- **`tx/cos_classify.rs`** — `classify_generated_reply(forwarding, egress_ifindex,
+  frame, now_ns)` runs the runtime-counted output classifier
+  (`resolve_cos_tx_selection_at`) on the generated tuple + egress, so
+  output-filter counters/log/policers are charged exactly once, identically to
+  transit.
+- **Wired all three generators**: Time Exceeded (`icmp.rs`, threaded through the
+  3 poll-descriptor call sites; also corrects the egress ifindex to the resolved
+  `target_ifindex` — a latent nit the old code classified on `ingress`), policy
+  reject (`reject_reply.rs`), SYN-cookie (`cookie_reply.rs`). All cold-path only —
+  zero hot-path cost.
+- **§6.2 fail-CLOSED**: a parse failure of our own built bytes DROPS the reply
+  (never leak past an operator's output `discard`, which is a security boundary)
+  and bumps `generated_reply_classify_parse_errors`.
+- **Two-tier counters** (`time_exceeded` / `policy_reject` / `syn_cookie`
+  `_output_filter_drops` + `generated_reply_classify_parse_errors`) wired
+  `BatchCounters` → `BindingLiveState` → snapshot → `protocol/binding.rs` serde
+  (`default`) → Go `protocol.go` (`omitempty`) → operator `show` status. Regenerated
+  `protocol_wire_v1.json`.
+
+## Scope fence (named follow-ups, NOT in this PR)
+
+- **Output-direction port-mirror of generated replies** — xpf implements only
+  input-direction mirror today; `mirror_clone: false` stays, with a cross-reference.
+- **Embedded-ICMP NAT-reversal classify-by-trigger** (`poll_descriptor/mod.rs`) —
+  a forwarded (NAT-reversed) frame, outside #2238's enumerated host-originated set.
+
+## Test plan
+
+- [x] `frame/generated_tests.rs` — v4/v6 TCP/UDP/ICMP tuple + DSCP extraction,
+  VLAN-tagged, truncated / unknown-version fail-closed.
+
+*(truncated — 73 lines total)*
+
+
+---
+
+## PR #2320 — wireguard: multi-PEER per interface (config + RX + egress + PSK) (#1434) [MERGED] (merged 2026-06-22)
+
+Branch: `fix/1434-multipeer-wg`
+
+## Summary
+
+Lift the one-peer-per-WireGuard-interface ceiling. A WG interface can now terminate **N peers on a single listen port** (hub-and-spoke, multi-site site-to-site) — the standard real-world topology the engine already supported on RX but the Go config model and the egress machinery blocked.
+
+This is the **multi-PEER axis** of #1434 (Path A, plan REV v1.2, `docs/research/1434-multitunnel-wg/plan.md`). The multi-INTERFACE / shim-port-steering axis stays deferred (needs the lab), and the **live multi-peer handshake / Ubiquiti interop** validation is **#1703**.
+
+The wire DTO reshape (scalar peer fields → a per-peer slice) is a single **atomic** Go↔Rust change: removing the scalar fields forces every reader on both sides to move at once, so the three plan slices land in one commit.
+
+### B1a — config model + RX (decap) + status
+- `TunnelConfig.WgPeers []WgPeerConfig` replaces the scalar `Wg{PeerPubkeyHex,AllowedIPs,Endpoint,KeepaliveSecs}`. Schema `peer <public-key>` is a **named-instance** keyed by pubkey (vrrp-group model, dual-AST via `namedInstances`). Per-peer AllowedIPs no longer cross-contaminate (the pre-#1434 last-wins/merge bug).
+- Commit-time `validateWireguardPeersStrict` hard-rejects **zero-peer / duplicate pubkey / malformed (non-64-hex) pubkey / malformed PSK / mixed endpoint family** (one UDP socket = one outer family); lenient load/peer-sync downgrades to a warning (#1960 doctrine).
+- Wire `wg_peers` slice (Go `[]TunnelWgPeerWire` / Rust `Vec<TunnelWgPeerSnapshot>`), **sorted by pubkey** for HA byte-identical snapshots. Engine fed N peers; `wg_identity_unchanged` slice-compares. RX/decap was already multi-peer.
+- Per-peer status (`WgPeerStatus` Rust+Go + renderer + Prometheus `session_confirmed{tunnel,peer}`); wire fixture regenerated.
+
+### B1b — egress (TX) cryptokey routing
+- Encap LPM-selects the peer by inner-dst AllowedIPs (`engine.peer_for_dest` + `frame/wg.rs`; `inner_dst_ip` in `gre.rs`).
+- WG control thread holds **per-peer** effective-endpoint, handshake-attempt, and keepalive/rekey timers (`timer_pass_for_peer` over `engine.peer_pubkeys()`); TUN-egress LPM-routed per peer; per-peer endpoint learning (`InboundOutcome` carries the peer, `consume_response` returns it).
+
+### B2 — per-peer preshared key
+- `WgPeerConfig.preshared_key` + `Peer.preshared_key` (rotated in place on reconcile). Initiator sets the PSK at build; responder reads msg1, identifies the peer via `get_remote_static`, then `set_psk(2, …)` before msg2 (snow 0.10.0). Secret hygiene end-to-end (Secret / Zeroizing / skip_serializing / redacted String()+Debug).
+
+## Deferred (→ #1703)
+- Live multi-peer handshake / Ubiquiti interop validation.
+- The worker-driven **NoSession/rekey REQUEST edges are still engine-wide** (single edge), not per-peer. The per-peer **T6/T7/T8 timers ARE per-peer**.
+
+## Test plan
+- [x] `pkg/config/wireguard_multipeer_test.go`: single + dual-peer compile (hierarchical + flat-set), dup / zero / bad-hex / mixed-family reject, `String()` secret redaction (fail-on-revert).
+- [x] Snapshot HA-determinism (two builds byte-identical, peers pubkey-sorted).
+- [x] Rust `peer_for_dest_lpm_selects_owning_peer` (longest-prefix wins), `per_peer_psk_handshake_roundtrip` (match completes, mismatch fails msg2 AEAD).
+- [x] `go test ./...` green except the pre-existing `pkg/fsatomic` `proxyarp.go` canary (unrelated, present on `origin/master`).
+- [x] `cargo build --release` clean; WG-domain suite **178/178 single-threaded**. The intermittent `reconcile_peers_snapshot` / `install_session_serializes` / worker-queue concurrency-test flakes are a **known pre-existing base condition** (different test each run; all pass in isolation).
+- [ ] **Dataplane WG change → batched loss-cluster iperf smoke is PENDING (parent-run before merge).**
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+---
+
+## PR #2322 — #2321: fail closed on truncated generated-reply L4 ports [MERGED] (merged 2026-06-22)
+
+Branch: `fix/2321-parse-generated-failclosed`
+
+Closes #2321
+
+## Problem (§6.2 fail-closed doctrine, LOW)
+
+The #2319 generated-reply re-parser (`parse_generated_v4` /
+`parse_generated_v6` in `userspace-dp/src/afxdp/frame/generated.rs`)
+rebuilds a locally GENERATED reply's egress `SessionKey` from its own
+bytes so the output firewall filter / CoS forwarding-class / DSCP rewrite
+can be evaluated against the reply's real tuple.
+
+On a TCP/UDP reply truncated before its 4 L4 port bytes,
+`generated_l4_ports` fell through `unwrap_or((0, 0))` and the parser
+CONTINUED with ports `(0, 0)`. That **misclassifies** the reply instead
+of dropping it — violating the project's §6.2 fail-CLOSED doctrine: a
+parse failure of a generated reply must DROP it, never leak past an
+output `discard`/`reject` or land on the wrong filter term.
+
+Copilot independently flagged this on PR #2319.
+
+## Fix
+
+Make the port read fail closed:
+
+- `generated_l4_ports` now returns `Option<(u16, u16)>` — `None` for a
+  TCP/UDP frame whose 4 port bytes are not present at the computed L4
+  offset (a clamped IP `total_len` too short to reach the L4 header, or
+  the frame physically chopped).
+- Both parsers propagate that `None` with `?`, so
+  `classify_generated_reply` (`afxdp/tx/cos_classify.rs`) drops the reply
+  (`drop: true, parse_error: true`) and bumps the existing
+  `generated_reply_classify_parse_errors` counter rather than
+  classifying a `(0, 0)`-port phantom tuple.
+- ICMP/ICMPv6 (and any non-TCP/UDP protocol) legitimately carry no
+  transport ports and still return `(0, 0)` unchanged.
+- Well-formed TCP/UDP replies are unaffected — generated replies are
+  well-formed by construction, so this is defense-in-depth.
+
+No Go-visible wire fields touched (internal parse only); no wire fixture
+regen needed.
+
+## Tests (fail-on-revert)
+
+`afxdp/frame/generated_tests.rs`:
+
+- `truncated_v4_tcp_ports_fails_closed_none`
+- `truncated_v4_udp_ports_fails_closed_none`
+- `truncated_v6_tcp_ports_fails_closed_none`
+- `truncated_v6_udp_ports_fails_closed_none`
+
+Each keeps a full, well-formed IP header (so the IHL/length checks pass)
+
+*(truncated — 67 lines total)*
+
+
+---
+
+## PR #2323 — Suppress ICMP/ICMPv6 errors for multicast/broadcast triggers (#2314) [MERGED] (merged 2026-06-22)
+
+Branch: `fix/2314-icmp-multicast-suppress`
+
+Closes #2314
+
+## RFC basis
+
+Per RFC 1812 §4.3.2.7 and RFC 4443 §2.4(e), a router MUST NOT originate
+an ICMP/ICMPv6 error message in response to a datagram destined to an IP
+multicast or broadcast address. Without this check a multicast flood can
+trigger an ICMP-error backscatter storm.
+
+## The two gated generation sites
+
+1. **PTB / Frag-Needed (#2310/#2301)** — `userspace-dp/src/afxdp/icmp_ptb.rs:140`,
+   inside `ptb_reply_suppressed`. This was the real gap: it gated only on
+   non-first-fragment and inbound-ICMP-error, so it would build a Packet-Too-Big
+   for a multicast/broadcast-destined oversized DF datagram. The gate is
+   consulted at the dispatch site `userspace-dp/src/afxdp/tx/dispatch/mod.rs:520`.
+2. **Policy-`reject` ICMP-unreachable / Time Exceeded** —
+   `userspace-dp/src/afxdp/icmp.rs:72` (v4) and `:91` (v6), inside
+   `can_generate_icmp_error_reply` (the gate used by
+   `build_reject_icmp_unreachable` and `build_local_time_exceeded_request`).
+   This path already inline-suppressed a multicast/broadcast destination; it is
+   now routed through the shared predicate so all three error paths agree.
+
+## Implementation
+
+- New shared predicate `dest_is_multicast_or_broadcast(addr_family, packet)`
+  in `frame/inspect.rs` (alongside `is_non_first_fragment`), operating on the
+  L3-relative slice:
+  - IPv4: multicast `224.0.0.0/4` OR limited broadcast `255.255.255.255`
+    (via `Ipv4Addr::is_multicast`/`is_broadcast`).
+  - IPv6: multicast `ff00::/8` (leading `0xff` byte).
+  - Too-short slice fails closed (suppress).
+- The original triggering packet is still dropped per existing policy — a
+  suppressed reply folds into the existing fail-closed silent-drop path (PTB
+  site keeps `mtu_signalled` so the oversized original drops; reject site
+  returns `None`, which the caller drops).
+- **No new counter** and **no wire/Go change**. Adding a wire-visible counter
+  would balloon into protocol/Go plumbing inconsistent with the existing
+  PTB/reject counters; the suppression itself is the load-bearing behaviour and
+  a suppressed reply is accounted for by the existing drop accounting. The
+  decision is documented in the `icmp_ptb.rs` README section.
+
+## Tests
+
+8 fail-on-revert unit tests across both paths
+(`userspace-dp/src/afxdp/icmp_ptb_tests.rs` + the `icmp.rs` test module):
+
+- `ptb_suppressed_for_v4_multicast_dst`
+- `ptb_suppressed_for_v4_limited_broadcast_dst`
+- `ptb_suppressed_for_v6_multicast_dst`
+
+*(truncated — 66 lines total)*
+
+
+---
+
+## PR #2324 — wg: RFC 6040 §4.2 decap-side ECN combine (outer→inner) via recvmsg (#2317) [MERGED] (merged 2026-06-22)
+
+Branch: `fix/2317-wg-decap-ecn`
+
+Closes #2317
+
+## Summary
+
+Implements the WireGuard DECAP-side RFC 6040 §4.2 ECN combine
+(outer ECN → inner ECN), completing the half #2315 deferred for the WG
+path. #2315 shipped the §4.2 combine for GRE and deferred WG because the
+WG control thread reads encrypted transport records from a kernel
+`std::net::UdpSocket`, so the kernel strips the outer IP header (and its
+ECN/TOS) before the bytes reach userspace — userspace never saw the outer
+ECN to combine into the decrypted inner packet.
+
+## What changed
+
+**Capture the outer ECN via recvmsg + cmsg.** The WG recv loop
+(`coordinator/wg_control.rs`, the burst at the former
+`socket.recv_from(&mut sock_buf)` call site) switches to `recvmsg` using
+**libc** directly — `socket2`/`nix` are not dependencies, only `libc =
+"0.2"` is, so no new crate. The listen socket enables `IP_RECVTOS` (v4 /
+v4-mapped) and `IPV6_RECVTCLASS` (native v6 on the dual-stack socket) at
+bind. The outer DS byte then arrives as an `IP_TOS` / `IPV6_TCLASS`
+ancillary control message; `parse_outer_ecn_from_cmsg` walks the cmsg
+chain with the libc `CMSG_*` macros and extracts `ECN = ds & 0x03`.
+Capture is **best-effort**: no cmsg (kernel ignored the sockopt) ⇒ the
+combine is skipped (pre-#2317 behavior), never fatal to the tunnel.
+
+**Apply the §4.2 combine, reusing gre.rs.** The captured `Option<u8>`
+outer ECN threads `wg_recvmsg → dispatch_inbound → WG_TYPE_DATA arm`,
+where after `engine.try_decap` produces the inner IP packet and before
+`tun.write_all` it is folded in via the **shared**
+`gre::apply_decap_ecn_combine`. That function is refactored to take the
+per-tunnel-family illegal-drop counter by `&AtomicU64`, so the §4.2 table
++ IPv4 inner-header-checksum recompute stay single-sourced across GRE and
+WG (no duplication). Outer CE upgrades an ECN-capable inner to CE
+(recomputing the IPv4 header checksum); the illegal outer-CE /
+inner-Not-ECT combo is dropped without writing the inner to the TUN (the
+datagram still authenticated, so endpoint-learning proceeds); everything
+else keeps the inner verbatim.
+
+**New counter.** `WG_DECAP_ECN_ILLEGAL_DROPS` — a sibling of
+`GRE_DECAP_ECN_ILLEGAL_DROPS` so the two families are independently
+observable — wired end-to-end mirroring the GRE metric: atomic →
+`coordinator/status.rs` accessor → protocol `ProcessStatus`
+(`wg_decap_ecn_illegal_drops_total`, serde-`default` for wire compat) →
+server helpers/lifecycle → Go `pkg/dataplane/userspace/protocol.go` →
+Prometheus **`xpf_userspace_wg_decap_ecn_illegal_drops_total`**. The wire
+fixture `protocol_wire_v1.json` is regenerated (one new key).
+
+## Tests
+
+
+*(truncated — 79 lines total)*
+
+
+---
+
+## PR #2326 — #2325: gate PTB generation on the L2 broadcast/multicast destination [MERGED] (merged 2026-06-22)
+
+Branch: `fix/2325-ptb-l2-suppress`
+
+Closes #2325
+
+## Problem
+
+The PTB (Packet-Too-Big / Frag-Needed) ICMP-error generation gate
+`ptb_reply_suppressed` (userspace-dp/src/afxdp/icmp_ptb.rs) suppressed on
+a multicast/broadcast **IP (L3) destination** (added in #2314) but did
+**not** check the **link-layer (L2) destination MAC**. The reject /
+Time-Exceeded path `can_generate_icmp_error_reply` (icmp.rs:~47-51)
+already suppresses when the L2 destination MAC is a group/broadcast
+address. So the PTB path had an L2-parity gap: a frame with a **unicast
+L3 dst** but a **multicast/broadcast L2 dst MAC** still triggered a PTB.
+
+## RFC basis
+
+RFC 1812 §4.3.2.7 / RFC 4443 §2.4(e): an ICMP error MUST NOT be
+generated in response to a datagram delivered as a link-layer broadcast
+or multicast.
+
+## Fix — L2-parity gate + shared helper
+
+- **Extracted a shared helper** `l2_dst_is_group_or_broadcast(eth_dst:
+  &[u8; 6]) -> bool` into `frame/inspect.rs` (re-exported at
+  `pub(in crate::afxdp)` from `frame/mod.rs`). It is the IEEE 802 I/G
+  group bit (the low bit of the destination MAC's first octet); the
+  all-FF broadcast MAC is a group address, so a single bit test covers
+  both. No allocation.
+- The inline L2 test that previously lived in
+  `can_generate_icmp_error_reply` (icmp.rs) now **calls the shared
+  helper**, and `ptb_reply_suppressed` (icmp_ptb.rs) now calls it too —
+  giving the PTB path the same L2 + L3 suppression parity the reject / TE
+  path has.
+
+### PTB generation site gated
+
+`ptb_reply_suppressed` is the gate called from the PTB emit site in
+`userspace-dp/src/afxdp/tx/dispatch/mod.rs:520`
+(`if !ptb_reply_suppressed(source_frame, ptb_meta, l3)` → then
+`build_frag_needed_v4` / `build_packet_too_big_v6`). The site already
+passes the **full trigger ethernet frame** (`source_frame` — the same
+slice the PTB builders read the reflected destination MAC from), so the
+L2 destination is simply the first 6 frame bytes. **No plumbing was
+needed.**
+
+No new counter: a suppressed PTB folds into the existing fail-closed
+silent-drop path (the oversized original is still dropped via
+`mtu_signalled`).
+
+## Tests (fail-on-revert)
+
+
+*(truncated — 75 lines total)*
+
+
+---
+
+## PR #2335 — #2327: segregate GRE decap by tunnel kind; fail closed on unknown modes [MERGED] (merged 2026-06-22)
+
+Branch: `fix/2327-gre-decap-mode-match`
+
+Closes #2327
+
+The userspace-dp tunnel-endpoint table is mixed-kind (GRE/`ip6gre` and WireGuard rows coexist), but two hot paths selected an endpoint without inspecting `endpoint.mode`, crossing a security boundary.
+
+## Bugs (verified live in triage, master 06e25dd3f)
+1. **GRE decap matched non-GRE rows.** `match_tunnel_endpoint` (`gre.rs`) did `tunnel_endpoints.values().find(...)` on the outer tuple + key only, never checking `mode`. A received proto-47 frame whose outer tuple/key collided with a WireGuard row was decapsulated as GRE.
+2. **Unknown modes failed OPEN as GRE.** Egress dispatcher (`frame/mod.rs`) had `_ => encapsulate_native_gre_frame` — any unrecognized/future mode silently GRE-encapsulated (fail-open in a security appliance).
+3. **O(N) per-packet decap scan** (agy #4) — the decap lookup linearly scanned every tunnel row (the map is keyed by sequential `tunnel_endpoint_id`, not the outer tuple).
+
+## Fix (all three)
+- **Kind classifier.** New typed `TunnelKind` (Gre / WireGuard / Unknown) + `tunnel_mode_kind` in `forwarding_build/tunnels.rs` — one source of truth for the GRE-kind test (`mode == "gre" || "ip6gre"`).
+- **Full re-index (not just a short-circuit).** New kind-segregated, outer-tuple-keyed `gre_decap_index` (`FastMap<(outer_family, source, destination), Vec<endpoint_id>>`) built in `populate_tunnel_endpoints`, containing **only GRE-mode rows**. `match_tunnel_endpoint` resolves through it with the mirrored lookup key `(addr_family, outer_dst, outer_src)`, disambiguates a duplicate outer tuple by GRE key within the small candidate bucket, and keeps a per-candidate `tunnel_mode_kind` re-check as defense in depth. GRE decap is no longer a linear scan over unrelated rows. A GRE frame matching only a non-GRE row finds no GRE candidate and is dropped.
+- **Fail-closed egress dispatch.** Dispatcher matches on `TunnelKind`: WireGuard → WG encap, Gre → native GRE encap, `Unknown`/missing-row → **drop (`None`)**. Adding a future kind is a deliberate edit in `tunnel_mode_kind`; until then it fails closed.
+
+## Mode-check + fail-closed sites
+- Kind-segregation (decap): `userspace-dp/src/afxdp/gre.rs` `match_tunnel_endpoint`
+- Index build: `userspace-dp/src/afxdp/forwarding_build/tunnels.rs` `populate_tunnel_endpoints` + `tunnel_mode_kind`/`TunnelKind`
+- Fail-closed encap dispatch: `userspace-dp/src/afxdp/frame/mod.rs` `build_forwarded_frame_from_frame`
+
+## Tests (fail-on-revert)
+- `gre_decap_does_not_match_wireguard_row_with_same_outer_tuple`
+- `gre_decap_rejects_non_gre_candidate_even_if_indexed`
+- `gre_decap_still_matches_genuine_gre_row`
+- `unknown_tunnel_mode_classifies_as_unknown_not_gre`
+
+## Validation
+`cargo build --release` clean; targeted tests green 5x; full suite 2376 passed (the one failure is the pre-existing flaky `worker_queue::concurrent_recovery_processes_each_command_exactly_once` concurrency test — unrelated, passes in isolation 5/5). No wire/protocol field changed. Doc `userspace-native-gre-plan.md` §6a records the invariants.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+https://claude.ai/code/session_015oARShYtiJJ2H4UB4nXGqi
+
+---
+
+## PR #2336 — #2331: guard native GRE encap against DF-set oversized outer frames [MERGED] (merged 2026-06-22)
+
+Branch: `fix/2331-gre-encap-df-oversized`
+
+Closes #2331
+
+## Problem
+
+`encapsulate_native_gre_frame` (userspace-dp/src/afxdp/gre.rs) built and
+returned the outer GRE frame with **no comparison of the outer datagram
+length against the transport/egress MTU**. The IPv4 outer is built with
+`DF=1` (#1440), and the IPv6 outer cannot be fragmented in-path either.
+So an outer larger than the path MTU egressed un-fragmentable: it was
+dropped by the egress NIC or an intermediate router with **no PMTUD
+signal back to the inner source** — a silent blackhole for every inner
+flow whose encapped size exceeded the path MTU. (Not TCP-only: GRE
+carries UDP/ICMP/ESP with no segmentation lever.)
+
+The only existing backstop was the dispatch `copy_frame_is_oversized`
+descriptor-capacity check, which is **not** an MTU check; the #2301
+source-frame PTB path deliberately excludes native tunnels because a
+source-frame-vs-egress-MTU PTB would be wrong for encap.
+
+## Fix
+
+The size-check site is **userspace-dp/src/afxdp/gre.rs** (in
+`encapsulate_native_gre_frame`, immediately before the `vec![0u8; frame_len]`
+allocation). Before building the frame:
+
+- Size the outer **L3** datagram — `outer IP + GRE header (incl. the
+  optional 4-byte key) + inner` — via the new unit-testable
+  `gre_encapped_outer_len` helper. The L2 eth/VLAN header is excluded
+  (it is not part of the MTU budget), matching `native_gre_inner_mtu`.
+- Resolve the outer MTU with `tunnel_outer_mtu` (forwarding/mod.rs, the
+  #2300 SSOT used by the inner MSS clamp: real transport ifindex →
+  stored-resolution egress → endpoint logical ifindex, `unwrap_or(1500)`).
+- If the outer exceeds the MTU, **drop** (return `None`) and bump the new
+  `GRE_ENCAP_DF_OVERSIZE_DROPS` counter.
+
+### Counter
+
+Added `GRE_ENCAP_DF_OVERSIZE_DROPS`, wired through `status.rs` →
+`server/helpers.rs`+`lifecycle.rs` → `ProcessStatus.gre_encap_df_oversize_drops_total`
+→ Go `protocol.go` → Prometheus
+`xpf_userspace_gre_encap_df_oversize_drops_total` (mirrors the #2315 /
+#2317 decap-drop counters). `protocol_wire_v1.json` regenerated (1 new
+key, additive/defaulted — backward compatible).
+
+### PMTUD deferred to #2330
+
+PMTUD/PTB (ICMP Frag-Needed / Packet-Too-Big) signalling back to the
+inner source is **deferred to #2330** (post-transform PMTUD plumbing;
+inner TCP-segment sizing is #2329). The correct inner-source PTB must be
+derived from the inner MTU after subtracting tunnel overhead — exactly
+
+*(truncated — 88 lines total)*
+
+
+---
+
+## PR #2337 — #2328: route generated PTB through classify_generated_reply (output-filter parity) [MERGED] (merged 2026-06-22)
+
+Branch: `fix/2328-ptb-generated-classify`
+
+Closes #2328
+
+## Problem
+
+The #2301 egress-MTU PTB / Frag-Needed generator enqueued its reply with
+`cos_queue_id: None` / `dscp_rewrite: None` and WITHOUT running
+`classify_generated_reply` (`tx/dispatch/mod.rs` PTB enqueue site). A
+locally-generated PTB therefore bypassed output-firewall-filter / CoS
+forwarding-class / DSCP-rewrite classification by its own egress 5-tuple,
+violating the #2238 contract that every generator routes through the
+classifier. The ICMP/ICMPv6 Time Exceeded (`icmp.rs`), policy-`reject`, and
+SYN-cookie generators all honor it; only the new PTB path did not. An output
+filter `then discard` matching the generated ICMP was bypassed by the PTB, and
+CoS queue selection / DSCP rewrite / output policers were skipped — visible
+precisely during path-MTU stress.
+
+## Fix
+
+Route the generated PTB through `classify_generated_reply` (parity with
+TimeExceeded at `icmp.rs:185`) before the enqueue, keyed on
+`ingress_ident.ifindex` (the PTB is L2-reflected back out the ingress
+interface, which is the enqueue egress). The PTB's built bytes are a full
+Ethernet + IP + ICMP frame, so `generated_reply_session_key` parses them
+identically to TimeExceeded — no design fork.
+
+- On output-filter `discard`/`reject` verdict: drop the PTB. The oversized
+  original is already dropped (`mtu_signalled`), so nothing leaks past the
+  filter — fail-CLOSED, §6.2.
+- On parse failure of our own built bytes: drop + bump
+  `generated_reply_classify_parse_errors` (§6.2).
+- On admit: wire `verdict.cos_queue_id` / `verdict.dscp_rewrite` into the PTB
+  TxRequest instead of `None` / `None`.
+
+Added the wire-visible `ptb_output_filter_drops` counter mirroring the
+`time_exceeded` / `policy_reject` / `syn_cookie_output_filter_drops` family
+end-to-end (BatchCounters -> BindingLiveState atomic + flush -> snapshot ->
+BindingStatus wire (serde `default`) -> Go BindingStatus -> `show`
+aggregation/display). Threaded `&mut BatchCounters` into
+`enqueue_pending_forwards`. Regenerated `protocol_wire_v1.json` (one new key).
+
+## Tests (fail-on-revert)
+
+- `ptb_dropped_by_egress_output_filter_discard` — an output `then discard`
+  (protocol icmp) on the egress interface drops the generated PTB and bumps
+  `ptb_output_filter_drops`; oversized original still dropped; descriptor
+  recycled exactly once.
+- `ptb_ignores_trigger_matching_output_filter` — an output filter matching the
+  UDP TRIGGER does NOT drop the generated ICMP PTB (classify-by-own-tuple).
+- `ptb_dscp_rewrite_comes_from_classifier_not_none` — a DSCP-rewrite output
+  filter sets the PTB TxRequest `dscp_rewrite` from the verdict, not `None`
+
+*(truncated — 67 lines total)*
+
+
+---
+
+## PR #2338 — #2330: post-transform PMTUD — inner-source PTB for NAT64/GRE/WireGuard [MERGED] (merged 2026-06-22)
+
+Branch: `fix/2330-pmtud-post-transform`
+
+Closes #2330
+
+## Problem
+
+#2301 generates an egress-MTU PTB only for PLAIN forwards. It compares the
+SOURCE frame against the egress MTU — correct only when the on-wire size
+does not change — and deliberately gates the decision behind
+`!is_nat64 && !uses_native_tunnel` (tx/dispatch/mod.rs). For the
+size-CHANGING paths the on-wire frame **grows** on encap (GRE/WireGuard) or
+its header **shrinks/grows** on NAT64, so a source-vs-egress comparison is
+wrong and was skipped. The result: an inner source whose packet will not fit
+post-transform got **no PMTUD signal** — a silent blackhole.
+
+#2331 added a GRE-encap-DF oversize **drop + count** but, by design,
+**deferred** the inner-source PTB to this issue.
+
+## Fix
+
+A pre-build post-transform PMTUD decision in the dispatcher. New
+`post_transform_inner_mtu` (icmp_ptb.rs) derives the **inner** MTU — the
+largest inner IP packet whose transformed frame fits the egress/transport
+MTU — from the existing SSOT (no hand-rolled overhead):
+
+| Transform | Inner-MTU source | file:line |
+|---|---|---|
+| GRE | `native_gre_inner_mtu` (== the #2331 encap-guard math) | `forwarding/mod.rs:740` |
+| WireGuard | new pad-aware `wg::mss::wg_inner_mtu` (inverse of `wg_encapped_size`) | `wg/mss.rs` |
+| NAT64 | egress MTU ± 20 v6↔v4 header delta (RFC 7915) | `icmp_ptb.rs` (`post_transform_inner_mtu`) |
+
+The dispatcher feeds that inner MTU to the **existing**
+`forwarded_egress_mtu_decision` + `build_frag_needed_v4` /
+`build_packet_too_big_v6`, run against the inner `source_frame` (which IS
+the pre-encap / pre-translate inner packet; `meta.addr_family` = inner
+family). So the PTB already targets the **inner source** and carries the
+**inner MTU** (RFC 1191 v4 next-hop MTU / RFC 4443 §3.2 v6 PTB MTU). The PTB
+routes through `classify_generated_reply` (#2328) at the shared finalizer
+→ output-filter / CoS / DSCP + `ptb_output_filter_drops` accounting, fail-
+closed on a malformed reply.
+
+## #2331-loop closure / coordination
+
+The decision is **pre-build** and sets `mtu_signalled`, which skips the
+encap/translate build entirely. So for the PTB-owed case (inner IPv4 DF or
+IPv6) the #2331 `GRE_ENCAP_DF_OVERSIZE_DROPS` and the WG `encap_mtu_drops`
+guards are **not** reached — no double-drop / double-count. Those guards
+remain the backstop only for the residual **non-DF IPv4 inner** case (kept
+`Forward` to preserve fragmentable behaviour) whose encapped outer still
+exceeds the DF-set transport MTU. `mtu == 0` (no MTU resolvable / unknown
+tunnel kind) fails open to `Forward`.
+
+
+*(truncated — 79 lines total)*
+
+
+---
+
+## PR #2339 — #2329: make TCP-segmentation egress mode-aware (MTU + encap dispatch) [MERGED] (merged 2026-06-22)
+
+Branch: `fix/2329-tcp-seg-mode-aware`
+
+Closes #2329
+
+## Problem
+The fallback TCP-segmentation egress builder
+(`frame/tcp_segmentation.rs::segment_forwarded_tcp_frames_from_frame`)
+re-segments an oversized forwarded TCP flow (sender ignored the advertised
+MSS, session predates the #2299 clamp, or a middlebox injected larger
+segments). It was tunnel-mode-BLIND in two places, both effectively
+hardcoded to GRE:
+
+1. **MTU math (`tcp_segmentation.rs:~24`)** — sized every tunnel's
+   segments with the GRE inner-MTU formula (`native_gre_inner_mtu`). For a
+   WireGuard endpoint that budget is ~36–60 bytes too large, so oversized
+   WG-bound segments were built then dropped at the WG encap MTU guard
+   (`encap_mtu_drops`) — the same blackhole #2299 closed for the SYN path,
+   re-opened here.
+2. **Encap dispatch (`tcp_segmentation.rs:~338`)** — unconditionally called
+   `encapsulate_native_gre_frame` for any `tunnel_endpoint_id != 0`, so a
+   WireGuard tunnel's segmented TCP went out **GRE-encapsulated** (wrong
+   protocol on the wire; for an inet WG endpoint it even built a degenerate
+   `0.0.0.0→0.0.0.0` outer) — a mis-encapsulation, worse than the drop.
+
+## Fix — mode-aware on BOTH axes, SSOT reuse
+Both axes now dispatch on the typed `TunnelKind` (the #2327 classifier
+`forwarding_build/tunnels.rs::tunnel_mode_kind`) and reuse the existing
+SSOT helpers (no parallel/divergent overhead math):
+
+- **MTU:** `Gre` → `native_gre_inner_mtu`; `WireGuard` →
+  `wg::mss::wg_inner_mtu(outer_family, tunnel_outer_mtu(...))` (the
+  pad-aware inverse of `wg_encapped_size`, the same helper #2330's
+  post-transform PMTUD uses — reused, not re-derived); `Unknown`/missing →
+  0 budget → drop. The 1280 floor now applies to the plain-forward path
+  ONLY: a tunnel with a small outer MTU has a genuinely smaller inner
+  budget, and flooring it would re-introduce the oversized-then-dropped
+  blackhole.
+- **Encap:** `Gre` → `encapsulate_native_gre_frame`; `WireGuard` →
+  `frame/wg.rs::wg_encap_frame` (the same builder the normal egress path
+  uses — it pulls the live noise session from `forwarding.wg_engines`
+  itself, so the segmentation site needs **no extra keystate**, NOT a
+  design fork); `Unknown`/missing → drop (fail closed). Mirrors the #2327
+  build-egress dispatch in `frame/mod.rs`.
+
+After this, the TCP-seg path, the normal egress path (#2327), the SYN MSS
+clamp (#2299, `tunnel_tcp_mss`), the encap MTU guards (#2331/#1865), and
+the post-transform PMTUD (#2330) are ALL mode-aware and share
+`native_gre_inner_mtu` / `wg::mss::wg_inner_mtu` / `TunnelKind`.
+
+## Tests (fail-on-revert)
+New `mode_aware_segmentation_tests` module, 5 cases:
+- `wireguard_segmentation_uses_wg_inner_mtu_not_gre` — WG segments size to
+
+*(truncated — 72 lines total)*
+
+
+---
+
+## PR #2340 — #2332: use monotonic clock for userspace-dp worker HA liveness [MERGED] (merged 2026-06-22)
+
+Branch: `fix/2332-ha-monotonic-heartbeat`
+
+Closes #2332
+
+## Problem
+
+`userspace-dp` decided worker/binding readiness with **wall-clock**
+arithmetic: `heartbeat_fresh` took an `Option<DateTime<Utc>>` and
+compared it against `Utc::now()` (`afxdp/bpf_map/ha.rs:146`). Wall clock
+(CLOCK_REALTIME) is not monotonic — a forward step (NTP `makestep`,
+`date -s`, VM pause/resume) larger than `HEARTBEAT_STALE_AFTER` (5s)
+between snapshot capture and the freshness check makes the computed age
+jump past the limit and **falsely marks a healthy binding unready**. The
+control plane reads `ready: false` for an active binding as a hung worker
+and can trigger a spurious VRRP failover / route withdrawal; a backward
+step masks a genuinely dead worker. This is the **Rust-dataplane sibling
+of #1792** (the closed Go control-plane wall-clock peer-fencing bug) —
+same bug class, different location.
+
+## Clock model confirmed: process-local, receiver-stamped monotonic
+
+The heartbeat timestamp is **PROCESS-LOCAL**, not cross-process or
+serialized:
+
+- The worker thread stamps **its own** `BindingLiveState.last_heartbeat`
+  slot with `monotonic_nanos()` (CLOCK_MONOTONIC) via
+  `set_last_heartbeat_at(now_ns)`.
+- The coordinator reads that slot **in the same process** in
+  `BindingLiveState::snapshot()`, which also reads `now_mono =
+  monotonic_nanos()`.
+
+No cross-process boundary and no serialized clock domain to reconcile, so
+a process-local monotonic comparison is correct and sufficient — no
+peer-sent wall clock is ever compared to a local wall clock. The
+`stop-on-fork` design hatch did **not** trigger.
+
+## Fix (mirrors #1792)
+
+Keep the liveness decision in the monotonic domain end-to-end:
+
+- Replace `heartbeat_fresh(Option<DateTime<Utc>>)` with
+  `heartbeat_fresh_mono(last_heartbeat_ns, now_mono_ns)` — compares two
+  CLOCK_MONOTONIC nanosecond readings (`saturating_sub`; sentinel `0` =
+  never-stamped = not fresh; backward anomaly clamps to fresh, the
+  fail-safe direction). `afxdp/bpf_map/ha.rs:146`.
+- Compute the verdict **once at snapshot time** (where raw monotonic
+  `last_ns` + `now_mono` are already in hand) and carry it on
+  `BindingLiveSnapshot.heartbeat_fresh`. `afxdp/umem/snapshot.rs:254`,
+  `afxdp/worker/mod.rs:1396`.
+- `refresh_bindings` gates `binding.ready` on `snap.heartbeat_fresh`
+  instead of re-deriving age from the wall-clock `DateTime<Utc>`.
+  `afxdp/coordinator/refresh_bindings.rs:236`.
+
+*(truncated — 80 lines total)*
+
+
+---
+
+## PR #2341 — nat64: map computed 0x0000 UDP checksum to 0xFFFF on v6->v4 (#2333) [MERGED] (merged 2026-06-22)
+
+Branch: `fix/2333-nat64-udp-cksum-zero`
+
+Closes #2333
+
+## Problem
+
+In the NAT64 IPv6->IPv4 translation, the recomputed IPv4 UDP checksum was
+written raw (`userspace-dp/src/nat64.rs`, `recompute_l4_checksum_after_nat64_v6_to_v4`
+PROTO_UDP arm). RFC 768 reserves a UDP checksum field of `0x0000` as the
+"no checksum present" sentinel; RFC 1624 requires that a genuinely **computed**
+checksum of zero be transmitted as `0xFFFF` (all-ones) to distinguish it from
+"no checksum". Without the `0->0xFFFF` map, a translated datagram whose computed
+UDP checksum happened to fold to `0x0000` was emitted with checksum=0 — telling
+the receiver to skip validation, so in-transit corruption is silently accepted
+(a router data-integrity violation). The v4->v6 direction already had this map.
+
+## Fix
+
+Mirror the existing v4->v6 UDP arm:
+
+```rust
+let final_sum = if sum == 0 { 0xFFFF } else { sum };
+l4[6..8].copy_from_slice(&final_sum.to_be_bytes());
+```
+
+`checksum16_ipv4_pseudo` returns the final one's-complement fold
+(`checksum16_fold` => `!(sum)`), so a `0x0000` return is a real computed
+checksum, not an internal sentinel — safe to remap.
+
+## Scope — UDP only
+
+The TCP arm is **untouched**: a TCP checksum of `0x0000` is a normal valid value
+(no "checksum absent" semantics), so it must never be remapped. The inbound IPv6
+UDP checksum is mandatory and never 0 on the wire, so there is no "checksum
+absent" case to carry over — the only concern is the output IPv4 checksum being
+0, which this fixes.
+
+## Map sites
+
+- Fixed (v6->v4 UDP): `userspace-dp/src/nat64.rs` `recompute_l4_checksum_after_nat64_v6_to_v4`, PROTO_UDP arm.
+- Mirrored from (v4->v6 UDP, already correct): `userspace-dp/src/nat64.rs` `recompute_l4_checksum_after_nat64_v4_to_v6`, PROTO_UDP arm.
+
+## Tests (fail-on-revert)
+
+- `v6_to_v4_udp_computed_zero_checksum_written_as_0xffff` — brute-forces a
+  payload whose recomputed checksum folds to `0x0000`, asserts `0xFFFF` on the
+  wire. Reverting the map FAILS this test (verified).
+- `v6_to_v4_udp_nonzero_checksum_written_unchanged` — a normal checksum is
+  written verbatim.
+- `v6_to_v4_tcp_checksum_not_remapped` — a TCP header that folds to `0x0000`
+  stays `0x0000` (the UDP rule must not leak to TCP).
+
+
+*(truncated — 59 lines total)*
+
+
+---
+
+## PR #2342 — #2334: over-align WG recvmsg cmsg buffer to cmsghdr alignment [MERGED] (merged 2026-06-22)
+
+Branch: `fix/2334-cmsg-alignment`
+
+Closes #2334
+
+## Problem
+
+The #2317 WG decap-ECN recv path (`userspace-dp/src/afxdp/coordinator/wg_control.rs`) used a bare `[u8; 256]` (alignment 1) as the `recvmsg` control buffer. `CMSG_FIRSTHDR`/`CMSG_NXTHDR` and `parse_outer_ecn_from_cmsg` dereference a `*const cmsghdr` pointing into that storage to read the multi-byte `cmsg_len` / `cmsg_level` / `cmsg_type` header fields. `cmsghdr` has alignment 8 on LP64, so those reads were unaligned pointer dereferences — UB under Rust's pointer rules and a SIGBUS / alignment-trap risk on strict-alignment targets such as ARMv8 (which xpf also targets, per the #2332/#1958 cross-arch notes). Tolerated on x86_64, so latent rather than observed.
+
+The #2317 Copilot fold added the `cmsg_len` underflow guard but not alignment; this PR closes that remaining hole. The single-byte `*data` payload read was already alignment-safe — only the cmsghdr header-field reads were the risk.
+
+## Fix
+
+- New `#[repr(C, align(8))] struct CmsgBuf([u8; 256])` newtype (matches the codebase's existing `#[repr(align(N))]` idiom). `msg_control` points at `cmsg_space.0.as_mut_ptr()`, `msg_controllen = cmsg_space.0.len()`. Buffer stays 256 bytes. `align(8)` covers `align_of::<cmsghdr>()`, so the cmsghdr base — and every header-field read — is naturally aligned.
+- **Fail-on-revert sentinel:** `const _: () = assert!(align_of::<CmsgBuf>() >= align_of::<libc::cmsghdr>(), ...)` — breaks the build if the alignment is ever dropped (verified: removing `align(8)` produces the #2334 panic at compile time).
+- The #2317 `parse_ecn_with_cmsg` test helper now backs its buffer with the same `CmsgBuf` so the synthetic cmsg is align-8 like production.
+- Corrected the SAFETY comment that incorrectly claimed only payload bytes were read.
+
+## Preserved
+
+This PR changes ONLY the buffer's alignment. The #2317 `cmsg_len` underflow guard (`cmsg_len >= data_off + 1`) and the `MSG_CTRUNC` skip are untouched. No wire field changed.
+
+## Validation
+
+- `cargo build --release` clean (the static assert compiles).
+- `cargo test --release --bin xpf-userspace-dp -- cmsg wg_recv outer_ecn wg_control` → 17/0, stable across 5 runs.
+- Sentinel confirmed to fail compilation (`error[E0080]: ... CmsgBuf must be at least cmsghdr-aligned (see #2334)`) when `align(8)` is removed.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+https://claude.ai/code/session_015oARShYtiJJ2H4UB4nXGqi
+
+---
+
+## PR #2343 — vrrp: restart instance on member ifindex drift under unchanged config (#2294) [MERGED] (merged 2026-06-22)
+
+Branch: `fix/2294-vrrp-ifindex-restart`
+
+Closes #2294
+
+## Problem
+
+A VRRP instance binds its per-instance AF_PACKET / raw IP / IPv6 sockets to the member interface's kernel ifindex at `openSocket()` time. If the netdev is deleted+recreated or renamed (a carrier/VLAN flap that fully removes and re-adds the link) it gets a NEW ifindex while the xpf config stays byte-identical. `Manager.UpdateInstances` only diffed priority/preempt/track/VIPs, so the "No change" branch left the instance bound to the STALE ifindex — its sockets can no longer send/receive VRRP adverts and a MASTER node goes permanently silent (split-brain / blackhole) until an operator re-commit or daemon restart. The receive loops swallow ENODEV/ENETDOWN at debug, so nothing escalates; the 2s daemon re-drive re-ran with the same config and hit the same skip.
+
+## Fix — ifindex-change detection in the periodic reconcile
+
+A cheap, tolerant `name→ifindex` probe at the top of the per-instance branch in `UpdateInstances`. When the live ifindex differs from `existing.iface.Index`, it forces the existing **build-before-teardown** (#2156) restart path so the instance rebinds to a fresh socket on the new ifindex.
+
+Detection+restart site: `pkg/vrrp/manager.go:262-265` (probe) → `pkg/vrrp/manager.go:299-322` (drift routes into the shared build-before-teardown block at `:324-364`).
+
+- **Tolerant:** a probe resolve FAILURE is treated as "no drift" so a transient netlink hiccup never blocks a time-critical priority/preempt in-place update (failover priority, sync-hold release). The build block already owns resolve-failure-keeps-old-instance recovery.
+- **Idempotent:** unchanged ifindex → false → the normal no-change / in-place path, no socket churn. Runs every ~2s reconcile tick; no alloc/restart on a steady config.
+- **Composes with config-change restart:** drift and VIP-change share the one build-before-teardown block — no double-restart.
+
+## Sync-hold / GARP / role handling on the ifindex restart
+
+The restart rebuilds from the same desired `inst`, so it preserves configured priority/preempt/tracking, and the shared build block re-applies sync-hold preempt suppression (`if m.syncHold { instCfg.Preempt = false }` + `desiredPreempt`). A rebind therefore cannot spuriously preempt or break the sync hold. GARP is emitted by the fresh instance's normal `becomeMaster()` path when/if it wins election — not forced on the rebind. **RG role in the cluster state machine is driven separately** (heartbeat / debounced priority); the restart does not touch it, so there is no failover storm. This matched the issue's recommended fix sketch (reuse the #2156 build-before-teardown path) — no design fork.
+
+## Tests (fail-on-revert)
+
+`pkg/vrrp/update_instances_test.go`, via the existing resolveIface / openInstanceSocket / runInstance / stopInstance seams (no real sockets/goroutines):
+
+- `TestUpdateInstances_IfindexChange_RestartsRebind` — drift triggers stop+open+run; replacement binds the new ifindex; preserves priority/preempt/VIPs.
+- `TestUpdateInstances_IfindexUnchanged_NoRestart` — 3 reconcile passes with matching ifindex+config are a no-op (idempotence).
+- `TestUpdateInstances_IfindexUnchanged_PriorityOnlyStaysInPlace` — priority-only delta with unchanged ifindex stays in-place (no restart).
+- `TestUpdateInstances_IfindexChange_TransientResolveFailKeepsOld` — probe resolve failure keeps the old instance; the next pass with a fresh ifindex restarts.
+
+## Validation
+
+- `go build ./...` clean
+- `go test ./pkg/vrrp/... ./pkg/daemon/... ./pkg/cluster/...` green
+- new tests `-count=5` green
+- `go test -race ./pkg/vrrp/` clean
+
+Parent runs loss-cluster `make test-failover` before merge.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+https://claude.ai/code/session_015oARShYtiJJ2H4UB4nXGqi
+
+---
+
+## PR #2350 — dhcprelay: rebind listener on interface ifindex drift (#2347) [MERGED] (merged 2026-06-22)
+
+Branch: `fix/2347-dhcprelay-ifindex-restart`
+
+Closes #2347
+
+## Problem
+The DHCP relay's per-interface client listener sets `SO_BINDTODEVICE` once at `bind(2)`, pinning the socket to the interface's then-current kernel **ifindex**. If the interface is deleted+recreated or renamed at runtime under unchanged config (VLAN delete/recreate, tunnel rebuild, device reset), it gets a NEW ifindex, the kernel stops delivering DHCP client requests to the stale-bound socket, and nothing restarts the goroutine — the relay goes permanently **deaf** on that segment until daemon restart. This is the DHCP-relay sibling of #2294 (which fixed the same bug class for VRRP only).
+
+The triage corrected agy-review-025: the raw-L2 reply path re-resolves the ifindex per send and is drift-safe, so the genuine defect is the **deaf listener**, not outgoing writes.
+
+## ifindex-drift detection + listener restart
+The relay has no periodic reconcile loop (only `Apply`-on-config at boot) and its daemon driver is HA-only, so rather than introduce a standalone-vs-HA daemon-loop fork the detection is self-contained in `pkg/dhcprelay` as a **per-interface supervisor**:
+
+- `runRelay` now runs one `runRelaySession` under a child context and rebuilds it when the session tears down due to drift.
+- `runRelaySession` captures the live ifindex when it opens the client listener (`resolveIfindex` seam) and runs a periodic (5s, `ifindexCheckInterval`) watcher that re-resolves the interface name. On a real, differing index it records drift and cancels the **session** context. The supervisor then rebuilds, rebinding to the new ifindex.
+- Detection site: `pkg/dhcprelay/relay.go` — the drift watcher inside `runRelaySession` (the `if m.ifindexCheck > 0 && m.resolveIfindex != nil` block).
+
+## Tolerant resolve + #1915 lifecycle preservation
+- **Tolerant** (mirrors #2294): a resolve failure is treated as "no drift" so a transient netlink hiccup / mid-rename window never tears down a working listener.
+- **Idempotent**: an unchanged ifindex => no rebind, no churn (the watcher runs periodically).
+- **Degraded-baseline-safe**: a failed capture at bind (`boundIfindex==0`) adopts the first real reading as the baseline rather than triggering a spurious rebind.
+- **Per-interface**: a rebind on one segment never drops relays on the others.
+- **#1915 preserved**: the drift watcher cancels the **same session context**, so teardown reuses the existing close-on-cancel watcher + `WaitGroup` join. The stale socket is fully closed before the rebind (no `EADDRINUSE`) and `Stop()` stays bounded (no #1915 hang). No new teardown path.
+
+## Tests (fail-on-revert, conn-factory + ifindex-resolver seams)
+- `TestRunRelay_IfindexDrift_RebindsListener` — drift rebinds; rebound listener keeps the `BINDTODEVICE` ifaceName invariant.
+- `TestRunRelay_IfindexStable_NoRebind` — stable ifindex never rebinds (idempotent).
+- `TestRunRelay_IfindexResolveFailure_KeepsListener` — transient resolve failure keeps the listener up (no teardown).
+- `TestRunRelay_IfindexDrift_StopStillBounded` — `Stop()` bounded after a drift rebind (#1915 non-regression).
+- `TestRunRelay_DegradedBaseline_AdoptsFirstRealIfindex` — failed baseline capture adopts the first real reading.
+
+Revert-simulation confirms `TestRunRelay_IfindexDrift_RebindsListener` fails when the detection is neutralized.
+
+## Validation
+- `go build ./...` clean
+- `go test ./pkg/dhcprelay/... ./pkg/daemon/...` green
+- new tests pass 5x under `-race`; `go test -race ./pkg/dhcprelay/` clean
+- Live relay-ifindex-change verification is **lab-bound and deferred** — code + unit tests are the deliverable.
+
+Mirror of #2294 (VRRP instance-restart-on-ifindex-drift).
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+https://claude.ai/code/session_015oARShYtiJJ2H4UB4nXGqi
+
+---
+
+## PR #2351 — dhcprelay: reconcile DHCP relay on day-2 commits (#2348) [MERGED] (merged 2026-06-22)
+
+Branch: `fix/2348-dhcprelay-day2-reconcile`
+
+Closes #2348
+
+## Problem
+`forwarding-options dhcp-relay` was applied **only at daemon boot**
+(`pkg/daemon/daemon_run.go`). The commit-apply pipeline
+(`applyConfigLocked` in `pkg/daemon/daemon_apply.go`) reconciles FRR,
+networkd, VRRP, DHCP clients, the Kea DHCP server, DDNS, RA, flow
+exporters, RPM, ip-monitoring, etc. — but had **no DHCP-relay step**. Any
+day-2 commit that added, removed, or changed a relay group was silently
+ignored until a daemon restart (HIGH: routine day-2 config not honored).
+
+Two halves, per triage:
+
+## 1. Wire the relay into the apply pipeline
+- New `daemon.reconcileDHCPRelay(cfg)` called from `applyConfigLocked` as
+  **step 16c** (right after `reconcileFlowExporters` — both are
+  forwarding-options subsystems that were previously boot-only). It
+  forwards `cfg.ForwardingOptions.DHCPRelay` to the relay Manager on
+  `d.daemonCtx` (daemon lifetime, not a request-scoped context, so relay
+  goroutines outlive the apply call). Guarded on a non-nil `d.dhcpRelay`.
+- The boot site (`daemon_run.go`) now **always** creates the relay
+  Manager (was gated on a non-nil relay config at boot) so a relay added
+  on a later commit has a Manager to start it.
+
+## 2. Make `Manager.Apply` a true reconcile (was stop-all/rebuild-all)
+The previous `Apply` called `Stop()` then rebuilt every relay — so a
+no-op commit briefly dropped **all** relays (churn). Reworked into a
+desired-vs-running per-interface diff:
+- **start** an interface present in desired but not running;
+- **stop** (bounded `cancel()`+`<-done`) an interface running but no
+  longer desired (a nil `cfg` stops all);
+- **restart** an interface whose **spec changed** — `relaySpec` is the
+  resolved server list (config order) + the always-broadcast flag;
+- **leave** an unchanged interface's session running untouched
+  (idempotent — no churn, no socket reopen).
+
+## Composition with #2347 / #1915
+The stop/restart teardown reuses the existing `Stop()` mechanism: the
+#2347 per-interface supervisor (`runRelay` → `runRelaySession`) + the
+#1915 close-on-cancel + `WaitGroup` join. For a changed interface the old
+`SO_BINDTODEVICE` listener is fully closed **before** the replacement
+binds, so a restart never races `EADDRINUSE` and never hangs. The bounded
+teardown joins run **outside** `m.mu`, so a blocked relay's `<-done`
+cannot stall `Stats()` or a concurrent `Apply`.
+
+## Tests (fail-on-revert)
+Manager-level (`pkg/dhcprelay`): rewrote `TestApply_Reapply_DoesNotHang`
+→ `TestApply_Reapply_Idempotent` (unchanged config keeps gen-1 conns
+open, factory not re-invoked). Added `TestApply_AddInterface_DayTwo`,
+`TestApply_RemoveInterface_StopsRelay` (bounded stop, no collateral
+
+*(truncated — 67 lines total)*
+
+
+---
+
+## PR #2352 — #2344: gate session-flow parser on non-first IP fragments [MERGED] (merged 2026-06-22)
+
+Branch: `fix/2344-nonfirst-frag-session`
+
+Closes #2344
+
+## Problem
+A non-first IP fragment carries **no L4 header** — its post-IP-header bytes are payload, not TCP/UDP ports. The generic SessionFlow parsers in `userspace-dp/src/afxdp/frame/inspect.rs` called `parse_flow_ports` with **no fragment-offset guard**:
+
+- `parse_ipv4_session_flow_from_frame`
+- the IPv6 branch of `parse_session_flow_from_frame`
+- the meta-offset fallback in `parse_session_flow_from_bytes`
+
+So payload bytes were read as ports and a **fake TCP/UDP tuple** was promoted to a full `SessionFlow`. That tuple then drove **policy evaluation** (`poll_descriptor` reads `flow.forward_key.src_port/dst_port`), the **flow cache**, and the **session/reverse indexes**.
+
+`is_non_first_fragment` already existed (from #1852) but gated **only the NAT path**, not the session-flow/policy/flow-cache parse. #1852 explicitly deferred the forwarding/session-path question; this PR closes that gap.
+
+## Fix — the non-first-fragment session/policy gate
+Each session-flow parser now reuses the existing `ipv4_is_non_first_fragment` / `ipv6_is_non_first_fragment` predicates over the L3-relative slice and returns `None` for a non-first fragment.
+
+`parse_session_flow_from_bytes` runs a single chokepoint (`frame_is_non_first_fragment`) at the top so the **meta fast path cannot admit a fragment either** — the XDP shim does NOT gate non-first fragments (`parse_ipv4`/`parse_ipv6` in `userspace-xdp` read `flow_*_port` at `l3+ihl` with no offset check), so `meta.flow_*_port` can carry payload bytes. The chokepoint requires the byte at the resolved L3 offset to be a real IP header of the metadata family before reading the fragment-offset bits, so a non-IP frame whose tuple lives only in metadata (the meta-led ICMP fixtures) is not spuriously suppressed.
+
+## Fragment-model reasoning
+**xpf does NOT reassemble** — it forwards fragments statelessly per route. A flowless (`None`) packet follows the **existing route-based, session-less forward path** (the pre-#1913 "no flow tuple" branch in `poll_descriptor`'s `MissingNeighbor` arm). So the chosen behavior is **forward-per-3-tuple-route, no fabricated ports** — not drop, not match-existing-session (xpf has no first-fragment session tracking to match against). This is the same outcome #1852 chose for NAT (skip L4 ops, keep the IP-level forward).
+
+### How it composes
+- **#1852 (NAT):** gates the NAT rewrite leaves on the same `is_non_first_fragment` predicate; the descriptor fast path already returns `None` for non-first fragments. This PR makes the session/policy parser consistent — same predicate, same L3-relative slice.
+- **#2293-era (screen):** `extract_screen_info` independently sees and screens non-first fragments (ping-of-death, teardrop, syn-frag). Unchanged — screen still runs.
+- **GRE decap (`gre.rs`):** inherits the fix automatically — with `flow == None` it stamps `(0, 0)` ports instead of synthesizing them.
+
+## Gate site
+`userspace-dp/src/afxdp/frame/inspect.rs` — chokepoint at `parse_session_flow_from_bytes` (top of fn) + per-parser gates in `parse_ipv4_session_flow_from_frame`, the IPv6 branch of `parse_session_flow_from_frame`, and the meta-offset fallback arms.
+
+## Tests (fail-on-revert, `prop_tests/inspect.rs`)
+- `pin_ipv4_non_first_fragment_no_session_flow_frame_led` — frag-offset IPv4 TCP fragment → `None` from all three parse entry points (control: unmodified frame parses to the expected ported flow).
+- `pin_ipv4_non_first_fragment_no_session_flow_meta_fast_path` — complete meta tuple (fast-path eligible) still → `None`.
+- `pin_ipv4_first_fragment_offset_zero_still_parses` — MF-set/offset-0 first fragment still parses (guards against an over-broad gate).
+- `pin_ipv6_non_first_fragment_no_session_flow` / `pin_ipv6_first_fragment_offset_zero_still_parses` — IPv6 Fragment Header: offset != 0 → `None`; offset 0 parses.
+
+## Validation
+`cargo build --release` clean; new pins pass 5x; full `userspace-dp` suite green (one unrelated pre-existing `worker_queue::concurrent_recovery` concurrency flake, passes 3/3 in isolation, no frame/flow involvement). No wire field. Doc: `frame/README.md` notable-invariants bullet + `_Log.md`.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+https://claude.ai/code/session_015oARShYtiJJ2H4UB4nXGqi
+
+---
+
+## PR #2353 — #2345: evaluate inbound DNAT/NPTv6 security policy on the translated destination tuple [MERGED] (merged 2026-06-22)
+
+Branch: `fix/2345-inbound-xlate-policy-tuple`
+
+Closes #2345
+
+## Problem
+For inbound destination translations that happen BEFORE the route/zone
+lookup, Junos/SRX evaluates the security policy against the
+POST-translation (real/internal) destination, in the destination zone
+derived from the translated destination. The userspace AF_XDP dataplane
+was evaluating the policy lookup against the ORIGINAL (pre-translation)
+destination tuple for DNAT, static-DNAT, and inbound NPTv6. Effect: a
+policy written for the real inside server never matched (connectivity
+break), and a policy written for the public VIP/prefix could be matched
+on traffic that should be governed by the internal address (security
+concern).
+
+## Per-translation-type verdict
+- **DNAT** — was WRONG (matched on the original public VIP and port).
+  Fixed: matches the translated internal address + the translated port
+  for port-based DNAT.
+- **static-DNAT** — was WRONG (matched on the original public address).
+  Fixed: matches the translated internal address (port preserved).
+- **inbound NPTv6** — was WRONG (matched on the external/public IPv6
+  prefix). Fixed: matches the translated internal prefix.
+- **destination ZONE** — was ALREADY CORRECT for all of the above: it is
+  derived from `resolution.egress_ifindex`, which is computed from
+  `effective_resolution_target` (the translated destination). Only the
+  address/port half of the policy-match tuple needed correcting.
+- **NAT64** — DELIBERATELY EXCLUDED (design fork, resolved in scope, see
+  below). Keeps matching on the synthetic IPv6 destination.
+
+## Junos-order reasoning
+Junos order for inbound translation: dst-translation -> route/zone lookup
+on translated dst -> policy match on the translated tuple in the
+translated dst zone -> src-translation (SNAT) on egress. This change
+makes the policy-match address/port follow that order; the zone already
+did.
+
+## Fix
+`policy_dst_ip` (= `effective_resolution_target`) and `policy_dst_port`
+(= the DNAT `rewrite_dst_port`, else the original port) are computed once
+on the session-miss path and used at BOTH policy-eval sites in
+`userspace-dp/src/afxdp/poll_descriptor/mod.rs`:
+- ForwardCandidate: `evaluate_policy_result_with_len(...)` (was
+  `flow.dst_ip` / `flow.forward_key.dst_port`).
+- MissingNeighbor: reconstructs the same tuple from the merged
+  `decision.nat` (the miss-block locals are out of scope there), so a
+  denied unresolved-neighbor cold-path packet gets the same verdict as
+  the resolved path.
+
+### NAT64 design fork (resolved in scope)
+NAT64 is cross-family: the translated destination is IPv4 while the flow
+
+*(truncated — 90 lines total)*
+
+
+---
+
+## PR #2355 — #2346: correct QinQ tracker-vs-runtime drift (doc accuracy) [MERGED] (merged 2026-06-22)
+
+Branch: `fix/2346-qinq-tracker-runtime`
+
+Closes #2346
+
+## Outcome: B (doc-accuracy fix + scoped follow-up feature issue)
+
+The feature tracker overclaimed; the runtime does **not** transit
+QinQ/stacked-VLAN frames. This is a tracker-vs-runtime accuracy issue, **not**
+a correctness bug — a double-tagged frame is NOT silently misparsed in the
+userspace dataplane, because the AF_XDP shim never delivers it to the XSK
+(it XDP_PASSes it to the kernel).
+
+## QinQ ground truth (verified against code)
+
+| Layer | Reality | Evidence |
+|-------|---------|----------|
+| Config | `flexible-vlan-tagging` / `encapsulation flexible-ethernet-services` / `inner-vlan-id` parsed into `InnerVlanID` — but **parse-only, zero consumers** | `pkg/config/compiler_interfaces.go:74,299`; `pkg/config/types_interfaces.go:48`; `grep InnerVlanID` outside config/test = empty |
+| Interface (networkd) | No stacked-VLAN device; only bond/bridge get `.netdev` | `pkg/networkd/networkd.go` (`.netdev` written only for `IsBond`/`IsBridge`) |
+| Dataplane shim | Strips exactly ONE tag (`if`, not `while`); double-tagged frame's inner TPID (0x8100) → `_` dispatch arm → **XDP_PASS to kernel**, not XSK, not DROP | `userspace-xdp/src/lib.rs:1091` (single-tag `parse_l2`); `lib.rs:376` (`_ => pass_non_ip_l2_direct()`); `lib.rs:941-945` (XDP_PASS) |
+| Userspace parsers | Single-tag only; ECN returns `None` for nested. Never receive a double-tagged frame in production → no reachable misparse | `inspect.rs::frame_l3_offset` (L26-38); `cos/ecn.rs::ethernet_l3` |
+
+So: a double-tagged frame is **safely XDP_PASSed to the kernel**, never reaching
+the userspace forwarding/CoS-ECN/NAT64/policy/TX surface. No silent inner-tag-as-L3
+misparse occurs on the transit path. QinQ is a genuine unbuilt multi-layer feature.
+
+## Changes (doc-only)
+- `docs/feature-gaps.md:439` — `Done` → `Partial (single 802.1Q/802.1ad tag only)`,
+  with the parse-only / no-consumer / XDP_PASS evidence and a link to #2354.
+- `userspace-dp/src/afxdp/frame/README.md` — the L2 contract section AND the #2150
+  latent-bug note both claimed the shim **"drops"** double-tagged frames. It does
+  not; it **XDP_PASSes** them to the kernel. Corrected both, and clarified that the
+  "inner-TPID-at-l3=18" case is an unreachable contract invariant, not a production path.
+
+## Follow-up
+Real QinQ/stacked-VLAN transit (typed L2 view + shim two-tag delivery + all five L2
+parsers + networkd stacked device + push/pop/swap + four-shape test matrix) is a
+multi-layer build, deliberately NOT done here. Filed as **#2354**.
+
+No code changed → no build/test required. Every factual claim cites a verified
+`file:line`.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+https://claude.ai/code/session_015oARShYtiJJ2H4UB4nXGqi
+
+---
+
+## PR #2356 — nat: replace SHA-256 with seeded FxHash for address-persistent SNAT sticky selector (#2349) [MERGED] (merged 2026-06-22)
+
+Branch: `fix/2349-snat-allocator-hash`
+
+Closes #2349
+
+## Confirmed defect (not over-claimed)
+`sticky_pool_index` in the userspace-dp NAT allocator
+(`userspace-dp/src/nat/allocator.rs`) used **SHA-256** over a salt + address-family
+tag + source-IP octets, then reduced the first 8 digest bytes `% pool_len`, to pick
+the sticky pool address for `address-persistent` source NAT.
+
+Verified against the issue: this is on the SNAT **allocation** path (first flow of an
+address-persistent source), **not** the per-packet hot path, and only for
+`address-persistent` mode. So it is a real LOW perf-cleanup (crypto hash where a fast
+hash suffices under connection churn), not a correctness/throughput emergency. The
+finding is accurate as stated.
+
+## Before / after hash
+- **Before:** `Sha256::new()` + salt `xpf-userspace-snat-address-persistent-v1` +
+  family tag + IP octets → first 8 bytes big-endian `% pool_len`.
+- **After:** `rustc_hash::FxHasher` (already a workspace dep, already imported in this
+  file for the allocator hash maps) seeded with salt
+  `xpf-userspace-snat-address-persistent-v2` + family tag + IP octets → `finish() % pool_len`.
+
+No new dependency. The `-v2` seed defeats raw-contiguous-IP correlation that an
+unseeded FxHash of a small byte run can exhibit.
+
+## Persistence-contract preservation
+The sticky mapping is computed **live** and is never persisted to disk or HA-synced
+(`persistent_by_source` is an in-memory `FxHashMap`). The only contract is
+**same-source → same-pool-address within a process lifetime**, which any deterministic
+hash satisfies. Swapping SHA-256 → FxHash changes which pool address a given source
+lands on; that is safe because existing sessions keep their already-allocated address
+and only new flows adopt the new mapping (acceptable across a software upgrade —
+sessions re-establish).
+
+## HA: same hash on both nodes
+The selector is node-local (not synced), but **both HA nodes compute the same FxHash**
+because they run the same binary — so cross-node pool-address agreement for a given
+source is unchanged. A hash change is fine as long as it is the same binary on both
+nodes, which it is.
+
+## Dependency change
+**None.** `sha2` stays in `Cargo.toml` — it is still used by `server/helpers.rs` for
+the snapshot binding-plan key. Only the `sha2` import in `allocator.rs` was removed.
+
+## Distribution evidence
+The existing `pool_snat_address_persistent_spreads_distinct_sources_across_pool` test
+(1000 distinct sources must cover ≥80% of a 64-slot pool) passes with the new hash,
+confirming good distribution.
+
+## Tests
+- Re-pinned golden-vector fixtures `v1 → v2` (`*_userspace_v2_contract_fixtures`,
+
+*(truncated — 68 lines total)*
+
+
+---
+
+## PR #2359 — userspace-dp: gate non-first IP fragments out of payload-derived TX-CoS / fabric-queue / output-filter (#2357) [MERGED] (merged 2026-06-23)
+
+Branch: `fix/2357-frag-cos-queue`
+
+Closes #2357
+Refs #2358 (adds the NAT64 feature-gaps note; cross-family policy build stays tracked there)
+
+## Problem
+
+A non-first IP fragment (IPv4 fragment-offset != 0; IPv6 Fragment Header
+type 44, offset != 0) carries **no L4 header** — the bytes at the
+post-IP-header offset are payload, not TCP/UDP ports. #2344 already makes
+such a fragment flowless on the policy/session path
+(`parse_session_flow_from_bytes` → `None`), so it forwards route-based
+with no policy/NAT/session.
+
+The TX-side CoS queue / fabric-queue / output-filter selection re-derived
+a flow tuple from metadata **independently** of that gate. A forwarded
+non-first fragment therefore got its egress queue, DSCP rewrite, fabric
+target binding, and output-filter verdict computed from payload bytes
+interpreted as ports: different fragments of one datagram could land on
+different queues (cross-chassis reordering / reassembly stress), and a
+port-matching terminal output-filter term could spuriously `discard` a
+fragment. LOW, pre-existing (predates #2344).
+
+## Fix — Option 1 (the issue's minimal fix)
+
+Exposed `frame_is_non_first_fragment` as `pub(in crate::afxdp)` and gated
+the TX-CoS sites where the gated `flow` is `None`:
+
+- **`forward_request.rs::build_live_forward_request_from_frame`** — compute
+  `non_first_fragment = flow.is_none() && frame_is_non_first_fragment(frame, meta)`
+  once, then force `expected_ports = None`, set `tx_selection_flow = None`
+  (→ `resolve_cos_tx_selection_at` takes its early `None` arm: interface
+  `default_queue`, no output-filter / port eval), and pass the flag to
+  `fabric_queue_hash`.
+- **`worker/mod.rs::fabric_queue_hash`** — new `non_first_fragment` param;
+  when set it hashes a fragment-stable **3-tuple** (protocol + L3 src/dst
+  from metadata, which the XDP shim copies from the IP header present on
+  every fragment) with **no ports**, so all fragments of one datagram
+  select the same fabric binding. Flow-cache-hit call site passes `false`
+  (a cache hit is always a real session).
+- **`poll_descriptor/mod.rs` pending-neigh buffering** — a buffered
+  fragment stores `flow_key = None`, so the later `retry_pending_neigh`
+  flush (which feeds the stored `flow_key` to `resolve_cos_tx_selection_at`)
+  also selects the default queue with no port-filter eval.
+
+### Over-gating caution honored
+The gate is the **non-first-fragment predicate**, NOT "every `None` flow".
+A legitimate flowless TCP/UDP packet (real L4 header, no session yet)
+keeps its meta/frame-derived ports and full CoS/filter selection. A test
+asserts this explicitly.
+
+### Site that was deliberately NOT changed
+
+*(truncated — 79 lines total)*
+
+
+---
+
+## PR #2365 — dataplane: fix 8-byte OOB write — register conntrack maps at on-map ABI size (#2360) [MERGED] (merged 2026-06-23)
+
+Branch: `fix/2360-conntrack-map-abi`
+
+Closes #2360
+
+## Root cause (registration-size, sync-only `Generation`)
+
+The shared `sessions` / `sessions_v6` BPF HASH maps were registered in
+`pkg/dataplane/loader_userspace_shim.go` with `sizeOf[SessionValue]()` /
+`sizeOf[SessionValueV6]()`.
+
+`pkg/dataplane/types.go` `SessionValue` / `SessionValueV6` end with
+`Generation uint64` — the #2170 HA deferred-delete install-generation guard.
+Its own doc-comment states it is **userspace-sync-only** metadata that is
+**NOT mirrored into the BPF C conntrack struct**.
+
+Measured sizes (this PR verified end-to-end):
+
+| Layout | v4 | v6 |
+|---|---|---|
+| Go `SessionValue` / `SessionValueV6` (with `Generation`) | **136** | **184** |
+| C `struct session_value` / `session_value_v6` (`bpf/headers/xpf_conntrack.h`) | **128** | **176** |
+| Rust `BpfSessionValueV4` / `V6` (`bpf_map/mod.rs`, asserted at `bpf_map_tests.rs`) | **128** | **176** |
+
+`Generation` sits at offset 128 (v4) / 176 (v6) — exactly the C-struct tail
+(`FibGen` ends the C layout), so the delta is exactly 8 bytes (one `uint64`,
+no extra alignment padding).
+
+So the Go **registration** was 8 bytes larger than the true on-map ABI. A
+`bpf_map_lookup_elem` from the Rust side into its 128/176-byte
+`BpfSessionValueV4/V6` buffer (the `refresh_bpf_conntrack_last_seen` path in
+`bpf_map/mod.rs`) against a 136/184-registered map has the kernel copy the
+registered `value_size` into the smaller caller buffer → **8-byte stack
+out-of-bounds write** (latent because the trailing bytes are usually zero).
+HIGH memory-safety.
+
+## Fix (register at C-struct size + parity guard)
+
+- New dedicated on-map ABI types `bpfSessionValue` / `bpfSessionValueV6`
+  (`pkg/dataplane/bpf_session_value.go`) that mirror the C struct exactly —
+  identical to `SessionValue` minus the sync-only `Generation`.
+- Register `sessions` / `sessions_v6` at `sizeOf[bpfSessionValue]` /
+  `sizeOf[bpfSessionValueV6]` (128 / 176).
+- Route **all** map I/O (`SetSessionV4/V6`, `GetSessionV4/V6`, iterate,
+  iterate-from, batch, count) in `pkg/dataplane/maps_session.go` through
+  `toBPF()` / `sessionValue()` at the boundary, so cilium/ebpf marshals
+  exactly the C layout (Go previously marshaled the full 136-byte struct).
+
+## `Generation` stays in sync — proof
+
+`Generation` is unchanged. It still lives in `SessionValue` in memory and
+travels on the cluster session-sync wire via `pkg/cluster/sync_protocol.go`'s
+own length-gated byte codec (`binary.LittleEndian.PutUint64(buf[off:],
+
+*(truncated — 82 lines total)*
+
+
+---
+
+## PR #2366 — afxdp/frame: bound live L4 port read by IP-declared length (#2361) [MERGED] (merged 2026-06-23)
+
+Branch: `fix/2361-frame-parser-iplen-bound`
+
+Closes #2361
+
+## Problem
+
+The live AF_XDP frame parser (`userspace-dp/src/afxdp/frame/inspect.rs`) read
+L4 ports bounded **only** by the backing slice length and the non-first-fragment
+gate (#2344) — **never** by the IPv4 `total_len` / IPv6 `payload_len`. A frame
+whose IP header declares a short datagram but carries trailing slack (NIC
+zero-pad on a sub-60-byte minimum frame, or attacker-supplied bytes) had its
+TCP/UDP "ports" read from out-of-datagram bytes. Those phantom ports then drove
+port-based security policy, firewall-filter matching, CoS queue selection, and
+session installation — both falsely matching a permissive port term and evading
+a port-scoped deny. HIGH severity (codex review-026 finding 1).
+
+## Bound: before vs after
+
+**Before** — `parse_flow_ports` read `frame[l4..l4+4]` bounded only by the slice:
+```rust
+let bytes = frame.get(l4..l4 + 4)?;   // slice-only
+```
+
+**After** — the read must lie within the IP-declared packet end:
+```rust
+let end = l4.checked_add(4)?;
+if end > declared_end { return None; }   // declared_end = min(l3+ip_len, frame.len())
+let bytes = frame.get(l4..end)?;
+```
+where `declared_end` comes from new helpers:
+- `ipv4_declared_l3_end` = `(l3 + total_len).clamp(l3+ihl, frame.len())`
+- `ipv6_declared_l3_end` = `(l3 + 40 + payload_len).clamp(l3+40, frame.len())`
+
+A violation returns `None` → flowless, route-based session-less forward (the
+same behavior #2344 uses for non-first fragments). The slice clamp also fails
+closed on a truncated capture (slice shorter than declared length).
+
+## Consistency with the generated path (#2321/#2238)
+
+The sibling generated-reply parser already enforced this exact invariant as a
+fail-closed security boundary in `generated.rs::generated_l4_ports`, clamping to
+`total_len` / `40+payload_len` (`pkt_len`) before extracting ports and returning
+`None` when the 4 port bytes fall outside the IP-declared end "even when the
+backing buffer still has trailing slack bytes." This PR mirrors that idiom so
+the **live ingress path and the generated path now treat an out-of-IP-bound L4
+identically**.
+
+## Meta path
+
+Gated too. The XDP shim stamps `meta.l4_offset` but does NOT enforce the
+IP-declared bound, so `live_frame_ports_from_meta_bytes` / `live_frame_ports_bytes`
+re-derive `declared_end` from the L3 header in the frame before reading ports
+
+*(truncated — 75 lines total)*
+
+
+---
+
+## PR #2373 — #2362: wire dropped firewall-filter match terms (tcp-flags/is-fragment/icmp-type/icmp-code) end-to-end [MERGED] (merged 2026-06-23)
+
+Branch: `fix/2362-filter-match-terms`
+
+Closes #2362
+
+## Problem
+
+The Junos firewall-filter compiler parses `tcp-flags`, `is-fragment`,
+`icmp-type`, and `icmp-code` into `config.FirewallFilterTerm`, and the
+docs claim they work — but **all four were silently dropped** on the
+Go→Rust snapshot wire and absent from the Rust matcher. A committed term
+like `from { tcp-flags syn; } then discard` reached the dataplane
+carrying only `protocol tcp`, so it discarded **all TCP** instead of just
+SYN. Symmetrically, `is-fragment then discard` lost the fragment
+predicate and `icmp-type echo-request then discard` collapsed to
+drop-all-ICMP. Terms matched **broader than authored** — a
+security-relevant silent policy gap.
+
+Verified against current master: all four were genuinely dropped (parsed
+into the typed term, never serialized in `pkg/dataplane/userspace/filters.go`,
+absent from `FirewallTermSnapshot` on both sides and from the Rust
+`FilterTerm`). None were already wired.
+
+## Fix (end-to-end)
+
+**Go wire** (`protocol.go`, `filters.go`): added `tcp_flags` (`*uint8`
+required-bits mask folded from the flag-name list via `tcpFlagsMask`),
+`is_fragment` (`bool`), `icmp_type`/`icmp_code` (`*uint8`, only when the
+compiler's `-1` "not set" is an in-range byte) to `FirewallTermSnapshot`.
+
+**Rust wire** (`protocol/security.rs`): mirrored the four fields with
+matching serde tags (`tcp_flags`/`is_fragment`/`icmp_type`/`icmp_code`).
+
+**Rust match** (`filter/mod.rs`, `compiler.rs`, `engine/matching.rs`,
+`engine/eval.rs`): runtime `FilterTerm` carries the fields; a new
+`per_packet_l4_matches` predicate runs after the 5-tuple checks (v4+v6):
+tcp-flags `(flags & mask) == mask` and only TCP; `is-fragment` matches
+ANY fragment via the new `is_any_fragment` (IPv4 MF|offset, IPv6 frag
+header) in `frame/inspect.rs`; icmp-type/code exact byte match and only
+ICMP/ICMPv6. The inputs travel in a `Copy` `TermMatchExtra` built once
+per packet at the cold filter-eval sites.
+
+**Cache coherency** (path (b), #1431, same class as DSCP): new
+`has_per_packet_l4_match_terms` aggregate + per-interface sets; the
+flow-cache declines (`flow_cache.rs`), the session-hit decision is
+re-evaluated, and a config rotation purges the affected sessions.
+
+**Wire fields added on BOTH sides** + `protocol_wire_v1.json`
+regenerated (the SSOT default-specimen fixture; guards the #1961
+one-sided-field decode-failure class).
+
+## Match-eval sites
+
+
+*(truncated — 84 lines total)*
+
+
+---
+
+## PR #2413 — userspace-dp: bound event-stream write backlog when the daemon stops reading (#2381) [MERGED] (merged 2026-06-23)
+
+Branch: `fix/2381-event-stream-backlog`
+
+Closes #2381
+
+## The bug (resource exhaustion / availability, HIGH)
+
+The event-stream I/O thread (`userspace-dp/src/event_stream/mod.rs`)
+converted the bounded 8192-frame mpsc channel into an **unbounded heap
+buffer** when the Go daemon stopped reading but kept the Unix socket
+connected (a slow/wedged reader whose socket writes return `WouldBlock`).
+
+Mechanism (`run_connected_loop`):
+1. Daemon stalls but keeps the socket open; `stream.write(&write_buf)`
+   returns `WouldBlock`, so the loop keeps `write_buf` for the next cycle.
+2. The drain loop unconditionally pulls **every** available channel frame
+   into the local `write_buf: Vec<u8>` each cycle.
+3. The bounded channel keeps refilling from worker `try_send`; the I/O
+   thread keeps relocating those bytes into `write_buf`.
+4. `write_buf` grows without bound — the 8192-frame channel ceiling no
+   longer caps memory, it only gates how fast bytes migrate into one
+   helper-thread heap buffer. Under an RT_FLOW storm with a stalled reader
+   this allocates until OOM-kill or allocator pressure perturbs the
+   forwarding plane.
+
+The replay-buffer cap (4096) does not bound this — replay storage and the
+write backlog are independent allocations.
+
+## The fix — bound the backlog, shed at the bounded channel, count it
+
+- Extract the drain into `drain_channel_into_write_buf()` and hard-cap
+  `write_buf` at `WRITE_BACKLOG_MAX_BYTES` (16 MiB ≈ 2× a fully-drained
+  8192-frame channel of max-size session-open frames, so transient bursts
+  stay lossless).
+- Once the backlog reaches the cap the drain **stops pulling from the
+  channel**. The bounded channel then becomes the real backpressure
+  surface: worker `try_send` drops the **newest** events with the existing
+  `frames_dropped` / per-kind `queue_full` counters, while the **oldest**
+  queued + replay frames are preserved so RT_FLOW stays current.
+- Each capped pass increments a new `frames_write_stalled` counter,
+  surfaced on the wire as `event_stream_write_stalls` (Rust + Go
+  ProcessStatus, JSON-tag parity), as Prometheus
+  `xpf_userspace_event_stream_producer_frames_total{result="write_stalled"}`,
+  and on the `show` status producer line — so a wedged consumer is
+  **observable** instead of a silent OOM.
+- The cap does not apply while paused — paused frames go only to the
+  already-bounded replay buffer, never to `write_buf`.
+
+The producer side was **already non-blocking** (`try_send` into the
+bounded channel) — no producer change needed.
+
+### Invariant
+
+
+*(truncated — 88 lines total)*
+
+
+---
+
+## PR #2414 — #2401: reject security policies referencing undefined zones at commit (fail-closed) [MERGED] (merged 2026-06-23)
+
+Branch: `fix/2401-policy-unknown-zone`
+
+Closes #2401
+
+## The fail-open mechanism
+
+A `set security policies from-zone <a> to-zone <b> { policy ... }` stanza
+whose from-zone or to-zone names a security zone the configuration never
+defines (a typo, or a zone deleted out from under the policy) was
+historically only a `ValidateConfig` **warning** — the commit succeeded.
+
+The rule was compiled and KEPT, but the userspace dataplane resolves the
+unknown zone name to no zone-id and so **never indexes** the rule into its
+zone-pair lookup table (`userspace-dp/src/policy.rs` logs `"policy rule
+references unknown zone(s) ... (rule kept, but not indexed)"`). At match
+time the zone pair has no indexed rule, so evaluation falls through to
+`state.default_action`:
+
+- under a **permit** default this is a silent **fail-OPEN** — a deny rule
+  the operator wrote against a mistyped/uncreated zone silently does
+  nothing;
+- under a deny default it blackholes with no operator signal beyond a
+  stderr line.
+
+Junos rejects an undefined zone reference at commit. This change restores
+that fail-CLOSED parity.
+
+## The fail-closed fix
+
+`validatePolicyZoneReferencesStrict` (`pkg/config/compiler_validate_strict.go`),
+mirroring the sibling `validatePolicyMatchAddressesStrict` (#2008):
+
+- **strict** on the commit / commit-check path (`CompileConfig`
+  hard-reject, naming the policy zone-pair and the undefined zone, so
+  `commit check` catches it before the config is applied);
+- **lenient** on the tolerant load / peer-sync paths
+  (`CompileConfigLenient` / `CompileConfigForNodeLenient`) via a new
+  `lenientPolicyZoneRefs` option — downgraded to a `cfg.Warnings` entry so
+  an already-persisted or peer-synced config carrying a stale zone
+  reference still BOOTS (#1960 no-brick); the dataplane drops the
+  unindexed rule on its own, so a leniently-loaded bad config is inert.
+
+The gate runs **after** the match-address gate, so a structural
+CoS/policer/device-map error and a bad match-address still win the
+first-error slot.
+
+## Special-zone exemptions
+
+`policyZoneSpecialTokens` exempts the reserved tokens that name a context
+rather than an operator-defined zone:
+
+- **`any`** — Junos wildcard zone (`from-zone any` / `to-zone any`);
+
+*(truncated — 99 lines total)*
+
+
+---
+
+## PR #2415 — nat: enforce DNAT match source-address constraint end-to-end (#2394) [MERGED] (merged 2026-06-23)
+
+Branch: `fix/2394-dnat-source-constraint`
+
+Closes #2394
+
+## Fail-open (HIGH)
+
+A destination-NAT rule scoped to `match source-address` lost its source
+constraint at the Go->Rust snapshot boundary, so the dataplane installed a
+**destination-only** DNAT entry that fired for traffic from **any** source. An
+operator who scoped a DNAT to specific sources got a DNAT that published the
+internal service to everyone — a fail-open security broadening.
+
+### Drop point (current master)
+- `pkg/config/compiler_nat.go:913-924` parses `rule.Match.SourceAddresses` for DNAT rules.
+- `pkg/dataplane/userspace/protocol.go` `DestinationNATRuleSnapshot` had **no** source field.
+- `pkg/dataplane/userspace/nat.go` `buildDestinationNATSnapshots` emitted the snapshot with no source data.
+- `userspace-dp/src/nat/destination.rs` `DnatTable::match_entries` filtered only by ingress zone.
+
+## End-to-end enforcement fix
+
+- **Wire field added on BOTH sides** (the #1961 one-sided-field risk was checked):
+  Go `DestinationNATRuleSnapshot.SourceAddresses` (`json:"source_addresses,omitempty"`)
+  and Rust `source_addresses` (`#[serde(rename = "source_addresses", default)]`).
+  Old binaries ignore it; an empty list = **match any source** (unscoped DNAT
+  unchanged — anti-over-restrict). Regenerated `protocol_wire_v1.json`
+  (one-line `"source_addresses": []` addition); round-trip test green.
+- `buildDestinationNATSnapshots` populates the field from
+  `rule.Match.SourceAddresses` with a singular `SourceAddress` fallback
+  (mirrors the SNAT builder).
+- `nat/destination.rs`: parses source prefixes into `DnatEntry.source_v4/source_v6`,
+  adds `source_matches(src_ip)`, threads `src_ip` through `lookup`/`lookup_with_counter`,
+  and filters on **both** zone and source. Dedup now keys on
+  `(from_zone, source_v4, source_v6)` so two source-scoped rules on the same
+  destination both survive. A malformed source prefix is skipped (narrows, not widens).
+- Session-miss caller (`afxdp/poll_descriptor/mod.rs`) passes `flow.forward_key.src_ip`.
+
+## Tests (fail-on-revert)
+
+- Rust `dnat_source_scoped_matches_only_configured_source_v4` / `_v6` and
+  `dnat_two_source_scoped_rules_same_dest_each_fire_for_own_source` — all **FAIL**
+  (DNAT fires for the wrong source) if the source constraint is dropped; verified
+  by forcing `source_matches` to always-true.
+- Rust `dnat_unscoped_matches_any_source` — anti-over-restrict.
+- Go `TestBuildDestinationNATSnapshotsCarriesSourceAddress` — bracket-list +
+  singular fallback carried; unscoped stays empty.
+
+## Validation
+
+`go build ./...` + `go test ./pkg/config ./pkg/dataplane` green; `cargo build --release`
++ `cargo test --release` green (the unrelated `concurrent_recovery_*` worker-queue
+test is a pre-existing parallel-load flake — passes in isolation); new tests 5x stable.
+
+
+*(truncated — 53 lines total)*
+
+
+---
+
+## PR #2417 — nat: install every DNAT destination-address, not just the first (#2395) [MERGED] (merged 2026-06-23)
+
+Branch: `fix/2395-dnat-multi-dest`
+
+Closes #2395
+
+## Collapse (HIGH)
+
+A destination-NAT rule with a bracket list of destination addresses
+(`match destination-address [ A B C ]`) collapsed to its **first**
+destination. The compiler parsed the whole list into
+`rule.Match.DestinationAddresses`, but `buildDestinationNATSnapshots`
+iterated only the singular `rule.Match.DestinationAddress` (the mirrored
+first element), so the dataplane installed a DNAT table entry only for A.
+Traffic to B and C was forwarded **untranslated** — configured translation
+silently not applied.
+
+### Collapse point (current master, post-#2394)
+- `pkg/config/compiler_nat.go` fills `rule.Match.DestinationAddresses`
+  (full list) and mirrors only the first into the scalar
+  `rule.Match.DestinationAddress`.
+- `pkg/dataplane/userspace/nat.go` `buildDestinationNATSnapshots` gated on
+  the scalar `DestinationAddress` and emitted `DestinationAddress: dstAddr`
+  once per app-term/port — never iterating `DestinationAddresses`.
+
+## Fix: per-destination snapshot entries (no wire change)
+
+The DNAT table is keyed by exact destination IP (`DnatKey.dst_ip`,
+`userspace-dp/src/nat/destination.rs`), so the natural shape is **one
+snapshot entry per destination** sharing the rule's pool/port/counter. The
+existing scalar `destination_address` field is reused — **no wire field
+added/changed**, `protocol_wire_v1.json` unchanged (`git diff` confirms).
+
+- `buildDestinationNATSnapshots` builds `destAddrs` from
+  `rule.Match.DestinationAddresses` with a singular `DestinationAddress`
+  fallback (mirrors the #2394 source-address idiom), then emits one
+  `DestinationNATRuleSnapshot` per destination inside the existing
+  app-term/port loop.
+- **Robustness (mirrors #2394 fold):** each destination has its CIDR
+  suffix stripped (DNAT matches exact host IPs) and is validated with
+  `net.ParseIP`. A destination that is empty or not a bare host IP is
+  skipped. If a rule has destinations but EVERY one is malformed, no
+  snapshot row is emitted → the rule matches **NOTHING** (fail-closed),
+  not match-any. The Rust `from_snapshots` already `continue`s on a
+  destination it cannot `IpAddr::parse`, so the posture holds both sides.
+- **Composition with #2394:** the per-destination loop is nested inside
+  the source-constraint setup, so every per-destination snapshot carries
+  the same `SourceAddresses`. A source-scoped multi-destination DNAT fires
+  for each destination only when the source also matches — the #2394
+  source enforcement is not regressed. The rewrite target (translated
+  destination/port) is unchanged; only the MATCH set grows.
+
+## Tests (fail-on-revert)
+
+
+*(truncated — 71 lines total)*
+
+
+---
+
+## PR #2418 — #2396: fix DNAT silent drops — non-TCP/UDP, IP-only ICMP, all-invalid-address [MERGED] (merged 2026-06-23)
+
+Branch: `fix/2396-dnat-proto-drops`
+
+Closes #2396
+
+Fixes three DNAT silent-drop fail patterns (HIGH). For a security appliance, "config accepted but no translation, with no error" is the wrong failure mode — each is now either honored end-to-end or rejected at commit.
+
+## Sub-parts: real vs already-handled, and decision per shape
+
+- **(a) non-TCP/UDP DNAT silently dropped — REAL. Decision: SUPPORT end-to-end.**
+  `userspace-dp/src/nat/destination.rs` recognized only `tcp`/`udp`/`""` and hit `_ => continue` for everything else. The Go builder already emits `protocol="gre"/"icmp"/"icmp6"` verbatim (and `appid.ProtocolNumber` resolves applications), so only the Rust side needed to honor it. Now the protocol token resolves through a new `ip_proto::proto_number` (mirrors the Go SSOT `appid.ProtocolNumber`) into a protocol-scoped table entry. Bounded — no design fork.
+  - Drop point: `destination.rs` protocol match `_ => continue`. Fix site: same match → `proto_number`.
+
+- **(b) IP-only / no-application DNAT did not cover ICMP — REAL. Decision: SUPPORT (protocol wildcard).**
+  `""` + port 0 expanded to TCP+UDP only, contradicting `docs/userspace-dnat-plan.md:288`. Now an IP-only rule is keyed under a protocol **wildcard** sentinel (`PROTO_ANY = 0`); `lookup_with_counter` gains a final `(PROTO_ANY, dst, 0)` fallback after the concrete-protocol and wildcard-port lookups miss, so it covers ALL L4 incl. ICMP/ICMPv6/GRE. A concrete `(protocol, port)` rule always wins (wildcard is last-resort). PROTO_ANY (0) is a safe table-side sentinel: real forwarded packets never carry IP proto 0 (HOPOPT is an extension header).
+  - Drop point: `""`+port-0 → `vec![PROTO_TCP, PROTO_UDP]`. Fix site: → `PROTO_ANY` + lookup fallback.
+
+- **(c) all-invalid-address DNAT — PARTLY already-handled (runtime), feedback gap REAL. Decision: add commit-time rejection.**
+  #2395 already made the runtime fail-closed (builder skips each unparseable destination; Rust table drops the rule). What was missing is operator feedback. Added `validateDestinationNATAddressesStrict` (pkg/config) following the #2401 / lenientNATHostMask idiom: hard-reject on commit / commit-check, downgrade to a warning on the tolerant load / peer-sync path (#1960 no-brick). A rule with at least one valid destination still compiles (partial, not a total no-op).
+  - Drop point: `buildDestinationNATSnapshots` `net.ParseIP==nil { continue }` (#2395). Fix site: new gate in `compiler.go` + `compiler_validate_strict.go`.
+
+## Wire change
+None. The `protocol` field is already a string carrying the right value from Go; the Rust side now honors it. `protocol_wire_v1.json` default-specimen fixture is unchanged (verified: `wire_invariant_default_specimens` passes).
+
+## Composition with #2394 / #2395
+Confirmed preserved. The per-protocol/per-destination insert still carries the #2394 source-address constraint and runs once per #2395-published destination. `TestBuildDestinationNATSnapshotsMultiDestination` and the existing #2394 source-scope tests still pass.
+
+## Tests (fail-on-revert)
+- Rust: `dnat_protocol_gre_translates`, `dnat_protocol_icmp6_translates`, `dnat_ip_only_covers_all_protocols_incl_icmp`, `dnat_concrete_rule_wins_over_ip_only_wildcard`, `dnat_invalid_destination_address_yields_no_entry`, `proto_number_resolver_matches_known_tokens`.
+- Go: `TestBuildDestinationNATSnapshotsNonTCPUDP` (builder carries GRE/ICMP + IP-only shape); `TestDNATAllInvalidDestinationRejected`, `TestDNATAllInvalidDestinationLenientWarns`, `TestDNATValidDestination{,CIDR}Compiles`, `TestDNATPartialValidDestinationAccepted`.
+
+## Validation
+`go build ./...` + `go vet` clean; `go test ./pkg/config ./pkg/dataplane/...` green; `cargo build --release` + `cargo test --release` nat module (106) green; new tests run 5x stable on both sides.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+https://claude.ai/code/session_015oARShYtiJJ2H4UB4nXGqi
+
+
+---
+
+## PR #2420 — nat: fail closed on all-malformed SNAT match prefixes (#2398) [MERGED] (merged 2026-06-23)
+
+Branch: `fix/2398-snat-match-any`
+
+Closes #2398
+
+## Fail-open (HIGH)
+
+A source-NAT rule's `match source-address` / `match destination-address`
+prefixes (the sets that scope **which traffic gets SNAT'd**) were parsed with
+`Err(_) => {}` — malformed entries silently dropped — and matched with
+`nets.is_empty() || ...`, i.e. **an empty parsed list matched ANY address**. So
+a rule whose configured match prefixes **all** failed to parse (operator typo,
+mixed-version / corrupt snapshot) degraded from "match these prefixes" to "match
+**any** address", silently broadening SNAT to **all** traffic in the zone pair —
+a fail-open NAT broadening.
+
+This is the **SNAT sibling of #2394** (DNAT, PR #2415). The #2394 review
+explicitly flagged `userspace-dp/src/nat/source.rs` as the un-fixed SNAT
+precedent carrying the same all-malformed→match-any behavior.
+
+### Drop point (current master)
+- `userspace-dp/src/nat/source.rs` SNAT parse loop — `Err(_) => {}` swallowed
+  invalid source/destination prefixes per entry.
+- `nets_match_v4` / `nets_match_v6` returned `nets.is_empty() || ...` — empty
+  list = match any.
+
+## Fix (mirrors #2394 exactly, BOTH source and destination match sets)
+
+- **`SourceNatRule.source_constrained` / `destination_constrained`** record
+  whether the rule carried a match set at all (snapshot list non-empty),
+  independent of how many prefixes parsed. **Derived at decode — NO new wire
+  field.** `protocol_wire_v1.json` is **unchanged** (the SNAT snapshot already
+  carries `source_addresses` / `destination_addresses`; the flag is computed
+  from `!list.is_empty()`).
+- **`nets_match_v4` / `nets_match_v6` are now fail-closed:**
+  - unconstrained match set (none configured) → **match any** (unscoped SNAT
+    unchanged — anti-over-restrict);
+  - constrained but every prefix failed to parse → **match NOTHING** (fail
+    closed) — never the pre-#2398 collapse to match-any;
+  - otherwise the address must fall in one of the parsed prefixes.
+- **Bare-host IP fallback** in a shared `parse_match_prefix` helper: a bare host
+  IP → /32 (v4) or /128 (v6). Junos carries `match source-address` verbatim and
+  the Go compiler does not normalize it, so a bare host reaches the wire with no
+  `/prefix`; `IpNet::from_str` rejects a bare IP. Same live bug #2394 fixed for
+  DNAT.
+
+## No wire change
+
+The flag is derived from the existing snapshot match list — no new field on
+either side. `userspace-dp/tests/fixtures/protocol_wire_v1.json` is unchanged
+(verified — no regen needed).
+
+## Fail-on-revert tests
+
+*(truncated — 76 lines total)*
+
+
+---
+
+## PR #2421 — #2399: reject unknown firewall-filter action at commit (fail-closed); protocol-alias half already handled [MERGED] (merged 2026-06-23)
+
+Branch: `fix/2399-filter-unknown-action`
+
+Closes #2399
+
+Two fail-OPEN behaviors in the firewall-filter compiler (codex review-032 findings 032-16 / 032-17), fixed/confirmed as the firewall-FILTER analog of the #2401 policy unknown-zone fail-closed pattern.
+
+## (032-16) Unknown `then` action → silent ACCEPT — REAL, fixed
+
+A filter term whose `then` block carried a token that is neither a recognized terminating action (`accept`/`reject`/`discard`) nor a recognized modifier (`count`/`log`/`syslog`/`forwarding-class`/`loss-priority`/`dscp`/`traffic-class`/`policer`/`routing-instance`) was silently DROPPED by `compileFilterThen` (no default arm). The term's `Action` stayed `""`.
+
+Default-accept site (before): `Action == ""` flows to ACCEPT in BOTH layers —
+- `pkg/dataplane/compiler_filter.go:439-446` — `switch term.Action { ... default: base.Action = FilterActionAccept }`
+- `userspace-dp/src/filter/compiler.rs:376-381` — `match snap.action.as_str() { ... _ => FilterAction::Accept }`
+
+So a term the operator meant to DENY (a misspelled `then accpet`, or a newer action a peer node understands) silently became a PERMIT, and commit reported SUCCESS.
+
+**Fix (fail-CLOSED, primary = commit reject):**
+- `compileFilterThen` (`pkg/config/compiler_firewall.go`) records the unrecognized token on the new `FirewallFilterTerm.UnknownActions` field (leaf + block AST forms; the leaf form now consumes an argument-bearing modifier's value so `then forwarding-class be` is not mis-read).
+- `validateFilterActionsStrict` (`pkg/config/compiler_validate_strict.go`) hard-rejects any term carrying an `UnknownActions` entry at commit, naming family/filter/term/token. An EMPTY action (`Action == ""`) is the legitimate "no terminating action" fall-through case and is NOT flagged.
+- Rust defense-in-depth (`parse_term`): a NON-EMPTY unrecognized action (only reachable via a mixed-version snapshot now that commit rejects it) fails CLOSED to `Discard`; the empty string keeps fall-through `Accept`.
+
+## (032-17) Unsupported `from protocol` alias → dropped constraint — ALREADY HANDLED
+
+Already fixed by #2175: `validateFilterProtocolsStrict` (`compiler_validate_strict.go`) rejects an unresolvable `from protocol <token>` at commit (mirrors the `appid.ProtocolNumber` SSOT). No new code in this PR; documented in `docs/config-schema.md` for completeness. The issue's evidence at `compiler.rs:359-363`/`439-451` is the Rust drop, but the Go commit gate already prevents an unresolvable token from ever being persisted.
+
+## Lenient/strict split
+
+New flag `lenientFilterActions` (sibling of `lenientFilterProtocols`): strict on the commit/commit-check path (`CompileConfig` — hard-reject), downgraded to a `cfg.Warnings` entry on the tolerant load / peer-sync paths (`CompileConfigLenient`) so an already-persisted or peer-synced config still BOOTS (#1960 no-brick). Gate runs immediately after `validateFilterProtocolsStrict`.
+
+## Supported sets exempted (anti-over-reject)
+
+- Actions/modifiers: `accept`, `reject`, `discard`, `count`, `log`, `syslog`, `forwarding-class`, `loss-priority`, `dscp`, `traffic-class`, `policer`, `routing-instance`, plus a modifier-only term (no terminating action — valid Junos fall-through).
+- Protocols: unchanged — the #2175 resolvable set.
+
+## Tests (fail-on-revert)
+
+Go (`pkg/config/compiler_filter_action_test.go`):
+- `TestFilterAction_UnknownAction_RejectsAtCommit`, `..._MisspelledTerminatingAction_...`, `..._UnknownInet6_...` — MUST FAIL if the gate is removed (verified: removing the gate makes all three pass through to accept).
+- `TestFilterAction_ValidActions_Commit` — anti-over-reject.
+- `TestFilterAction_Unknown_LenientWarns`, `TestFilterAction_CompileCapturesUnknownToken`.
+
+Rust (`userspace-dp/src/filter/tests.rs`):
+- `unknown_nonempty_action_fails_closed_discard` — MUST FAIL if the arm reverts to Accept (verified).
+- `empty_action_falls_through_to_accept`.
+
+## Validation
+
+`go build ./...` + `go test ./pkg/config ./pkg/dataplane ./pkg/dataplane/userspace` green; `cargo build --release` + `cargo test --release -- filter` (123 pass) green. New tests 5x stable, both sides. No wire/snapshot structure change.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+https://claude.ai/code/session_015oARShYtiJJ2H4UB4nXGqi
+
+---
+
+## PR #2422 — filter: fail-close all-malformed firewall-filter addresses/ports (#2400) [MERGED] (merged 2026-06-23)
+
+Branch: `fix/2400-filter-match-any`
+
+Closes #2400
+
+## Problem (fail-open filter broadening, HIGH)
+
+A firewall-filter term whose `source-address` / `destination-address` /
+`source-port` / `destination-port` match set was non-empty in the config but
+whose entries **all** failed to parse degraded to **match-ANY** on that
+dimension. The matcher treated an empty *parsed* list as "no constraint", so a
+term the operator scoped to specific addresses/ports — if every entry was
+typo'd or out of range — silently became a match-everything term and applied
+its action to **all** traffic:
+
+- a `discard` term scoped to typo'd addresses became **discard-all**;
+- an `accept` term scoped to typo'd addresses became **accept-all**.
+
+Fail-OPEN. Provenance: codex review-032 findings **032-18** (addresses) /
+**032-19** (ports).
+
+### Match-any sites on current master
+
+- `userspace-dp/src/filter/engine/matching.rs` — `!term.source_v4.is_empty() && …`
+  (and the v6 / dest twins): an empty parsed prefix list short-circuits to
+  match-any.
+- `PortMatcher::Any` arises from zero parsed ranges (`build_port_matcher`,
+  `compiler.rs`) and matches every port — indistinguishable from a genuinely
+  unscoped term.
+
+`parse_address` already carried the bare-IP `/32` // `/128` fallback (the
+#2398 live bug), so that half was already fixed; the remaining gap was purely
+the empty-parsed-list = match-any semantics.
+
+## Fix (mirror of #2398 SNAT / #2394 DNAT)
+
+Derive four constrained flags on `FilterTerm` at compile time —
+`source_addr_constrained` / `dest_addr_constrained` /
+`source_port_constrained` / `dest_port_constrained` — true when the snapshot
+match list held at least one **real** entry (`addr_is_real` ignores the `""`
+and `any` placeholders `parse_address` drops; `port_is_real` ignores `""`).
+The matcher helpers `nets_match_v4` / `nets_match_v6` / `port_match`
+distinguish:
+
+| state | result |
+|-------|--------|
+| unconstrained (no real entry) | match any (unchanged unscoped behavior) |
+| constrained, parsed set empty (all entries failed) | **match NONE — fail closed** |
+| otherwise | parsed prefix/range applies |
+
+The flags are also compared in `filter_term_semantics_match`
+(`engine/cache_sensitive.rs`): the unscoped↔all-malformed transition flips
+match semantics **without** changing the parsed vecs/matcher (both leave empty
+
+*(truncated — 82 lines total)*
+
+
+---
+
+## PR #2423 — afxdp/ndp: validate NA per RFC 4861 §7.1.2 + bound option walk by payload_len (#2368) [MERGED] (merged 2026-06-23)
+
+Branch: `fix/2368-ndp-na-validation`
+
+Closes #2368
+
+## Poisoning vector
+
+`parse_ndp_neighbor_advert` learned a Target Link-Layer Address (TLLA)
+into the dynamic-neighbor cache **and** the kernel neighbor table
+(`poll_stages.rs::stage_link_layer_classify`) without enforcing any RFC
+4861 NA validity, and it walked the NDP options bounded by the raw
+Ethernet frame length rather than the IPv6-declared payload. This is a
+control-plane MAC->IP write primitive, so untrusted L2/off-link traffic
+could poison neighbor state.
+
+**(A) No RFC 4861 §7.1.2 validation.** The parser checked only ICMPv6
+type == 136 — never the IPv6 Hop Limit, the ICMPv6 Code, or the ICMPv6
+checksum (`payload_len` was read nowhere). §7.1.2 mandates Hop Limit 255
+precisely so an off-link sender — whose packet a router must have
+forwarded, lowering the hop limit — cannot impersonate an on-link
+neighbor. Current behavior (master): `parser.rs` `parse_ndp_neighbor_advert`
+accepted any hop limit / code / checksum.
+
+**(B) Option walk bounded by `frame.len()`.** `while opt_off + 2 <=
+raw_frame.len()` — a minimum-size frame can declare a payload covering
+only the fixed NA header, then place a forged TLLA option in the L2
+padding/trailer beyond `40 + payload_len`; that trailer was parsed and
+learned (same class as #2361).
+
+## Fix
+
+Entirely in `parse_ndp_neighbor_advert` (fail-closed — the learn site
+only learns on `Some(target_mac)`, so all checks live in the parser):
+
+- Compute `packet_end = l3 + 40 + payload_len`; reject if it overruns the
+  frame or is shorter than the fixed NA header (mirrors the #2361
+  declared-end discipline).
+- Require **Hop Limit == 255**, **ICMPv6 Code == 0**, **ICMP length >=
+  24**, **Target Address not multicast**, and a **valid ICMPv6
+  checksum** — recomputed over the IPv6 pseudo-header + the ICMPv6
+  message via the shared one's-complement accumulator
+  (`frame::checksum16_add_bytes` / `checksum16_finish`, #2211;
+  AVX2-accelerated, bit-identical to the NAT64/forwarding sites).
+- Walk options strictly within `packet_end`; an option overrunning it
+  stops the walk instead of reading trailing slack.
+
+## NS scope
+
+NA-only. The userspace dataplane has **no Neighbor Solicitation learning
+path** (NS is never parsed or learned), so there is no sibling NS gap.
+
+## Composition with #2370
+
+
+*(truncated — 80 lines total)*
+
+
+---
+
+## PR #2424 — afxdp/arp: validate htype/ptype/hlen/plen before learning ARP sender (#2369) [MERGED] (merged 2026-06-23)
+
+Branch: `fix/2369-arp-validation`
+
+Closes #2369
+
+## Poisoning vector
+
+`classify_arp` (`userspace-dp/src/afxdp/parser.rs`) learned an ARP sender
+(`sender_mac`, `sender_ip`) from any EtherType-ARP opcode-2 frame with a
+`>= 28`-byte body, reading the sender hardware address at `l3+8..14` and
+the sender protocol address at `l3+14..18`. Those are the **fixed
+Ethernet/IPv4 ARP offsets** and are only correct when the ARP fixed
+header declares Ethernet/IPv4: `htype==1`, `ptype==0x0800`, `hlen==6`,
+`plen==4`. The parser never validated those fields.
+
+A hostile on-link peer could craft an opcode-2 ARP declaring a different
+hardware/protocol type or address length while still carrying a `>= 28`
+byte body. `classify_arp` parsed it at the Ethernet/IPv4 offsets anyway,
+and the resulting attacker-chosen bytes were learned as a MAC->IP binding
+into **both** the userspace `dynamic_neighbors` cache and the **kernel
+neighbor table** (`stage_link_layer_classify` in `poll_stages.rs` is a
+control-plane MAC->IP write primitive). RFC 826 requires an ARP packet to
+be interpreted per its hardware/protocol type and length fields — reading
+from fixed offsets without confirming them gives a cheap neighbor-cache
+poisoning vector (MED).
+
+## Fix
+
+Before reading the sender addresses, require `htype==1 && ptype==0x0800
+&& hlen==6 && plen==4` (in addition to the existing `opcode==2` reply and
+fully-present 28-byte-body checks). Any mismatch returns `OtherArp`
+(recycled, never learned) — **fail closed**. The pre-existing
+`l3 + ARP_BODY_LEN` length guard already bounds every fixed-offset read,
+so a truncated ARP classifies as `NotArp` without an out-of-bounds read
+or panic. Only opcode-2 replies are ever learned; ARP requests (opcode 1)
+classify `OtherArp` and never write the cache. The ifindex keying at the
+learn site is unchanged (left to #2370).
+
+## Consistency with #2368
+
+This is the ARP sibling of the just-merged #2368 NDP NA validation (RFC
+4861 §7.1.2) in the same `parser.rs`. Same fail-closed discipline:
+validate the control-plane learning shape's fixed header before reading
+the MAC->IP binding, learn nothing on any failed check.
+
+## Fail-on-revert tests
+
+`userspace-dp/src/afxdp/parser_tests.rs`:
+- `classify_arp_rejects_non_ethernet_htype` — opcode-2 ARP with `htype!=1` not learned
+- `classify_arp_rejects_non_ipv4_ptype` — `ptype!=0x0800` not learned
+- `classify_arp_rejects_bad_hlen` — `hlen!=6` not learned (no sender read at wrong offset)
+- `classify_arp_rejects_bad_plen` — `plen!=4` not learned
+
+
+*(truncated — 70 lines total)*
+
+
+---
+
+## PR #2425 — afxdp/neighbor: key learned ARP/NDP neighbors by logical VLAN ifindex (#2370) [MERGED] (merged 2026-06-23)
+
+Branch: `fix/2370-neighbor-ifindex-key`
+
+## Summary
+
+Closes #2370.
+
+`stage_link_layer_classify` inserted dynamic neighbors learned from ARP
+replies / NDP Neighbor Advertisements keyed by `meta.ingress_ifindex`
+(the **physical / parent** ingress port), while the forwarder looks
+dynamic neighbors up by the **logical** (L3) ifindex of the connected
+route. On a VLAN sub-interface physical != logical, so the just-learned
+entry landed under the wrong key and the lookup missed it.
+
+## The physical-vs-logical key mismatch (VLAN)
+
+- **Insert (before):** `poll_stages.rs::stage_link_layer_classify` —
+  `dynamic_neighbors.insert((meta.ingress_ifindex as i32, ip), ..)`
+  (physical/parent ifindex). The logical ifindex was already resolved at
+  the same site but used **only** for `add_kernel_neighbor`.
+- **Lookup:** `forwarding/mod.rs::lookup_neighbor_entry` —
+  `dynamic_neighbors.get(&(ifindex, target))` where `ifindex` is the
+  connected-route (logical) ifindex. Connected routes are stored under
+  `iface.ifindex` in `forwarding_build/interfaces.rs`.
+
+For an ARP/NDP frame on a VLAN sub-interface, `meta.ingress_ifindex` is
+the parent/bind port and `meta.ingress_vlan_id` selects the logical
+interface. The insert key `(parent, ip)` therefore never matched the
+lookup key `(logical, ip)` → MissingNeighbor cold path, an avoidable
+re-resolution probe, and first-packet latency on every cold start until
+the kernel neighbor resolved. (The kernel neighbor entry was already
+correct; `add_kernel_neighbor` used the logical ifindex.) This is MEDIUM:
+correctness + cold-start latency on VLAN deployments, not a steady-state
+or security drop.
+
+## Fix
+
+Hoist `resolve_ingress_logical_ifindex(parent, vlan)` to the top of the
+stage and key **both** the `dynamic_neighbors.insert` and
+`add_kernel_neighbor` under that single `learn_ifindex`. The insert key
+now agrees with the forwarder's lookup key.
+
+- **Insert (after):** `dynamic_neighbors.insert((learn_ifindex, ip), ..)`
+  where `learn_ifindex = resolve_ingress_logical_ifindex(parent, vlan).unwrap_or(parent)`.
+
+### Properties
+- Untagged / non-VLAN interfaces resolve physical == logical → unchanged.
+- A physical port with no matching logical sub-interface falls back to the
+  physical ifindex (`unwrap_or`) rather than dropping the learned neighbor.
+- **Multi-VLAN no-collision:** two VLAN sub-interfaces on one physical
+  port resolve to distinct logical ifindexes, so a same-IP-different-subnet
+  neighbor learned on each VLAN lands under distinct keys and never
+  collides. Keying by the shared physical ifindex would have collapsed
+
+*(truncated — 76 lines total)*
+
+
+---
+
+## PR #2426 — userspace-dp: count pending_neigh distinct-hop capacity drops (#2375) [MERGED] (merged 2026-06-23)
+
+Branch: `fix/2375-pending-neigh-drops`
+
+Closes #2375
+
+## Problem
+
+The cold-neighbor buffering path has three outcomes — buffer a representative packet, drop a **duplicate** for an already-pending key, or drop a **NEW distinct** `(egress_ifindex, next_hop)` because `pending_neigh` is at `MAX_PENDING_NEIGH` (4096) distinct hops. Only the duplicate-drop and the GRE-decap-refusal cases were counted; the `CapacityDrop` arm in `poll_binding_process_descriptor` was a silent `=> {}`.
+
+A scan or upstream outage that hits many unresolved next hops therefore silently recycled first packets for new destinations with **no operator-visible signal**. Operators could see the pending-neighbor gauge and the duplicate-drop counter, but not the actual capacity-denial event. The operational distinction was lost:
+- **duplicate drop**: "a packet is already probing this destination" (normal cold-start coalescing);
+- **capacity drop**: "the worker is refusing NEW unresolved destinations" (distinct-hop neighbor exhaustion / possible scan).
+
+## Fix (end-to-end, mirrors `pending_neigh_decap_drops_total` / #2381 `event_stream_write_stalls`)
+
+- `umem/mod.rs`: per-binding `pending_neigh_capacity_drops` atomic on `BindingLiveState`.
+- `neighbor_dispatch.rs`: extract `record_pending_neigh_admission_drop` — a behavior-identical helper recording BOTH the duplicate and the capacity counter for a non-buffered admission (Buffer = no-op). Two inline `fetch_add`s become one tested side-effect. Stale "counted nowhere" comments corrected.
+- `poll_descriptor/mod.rs`: the `CapacityDrop` arm is no longer silent. Behavior otherwise unchanged — a refused new key recycles the frame exactly like a duplicate.
+- `coordinator/status.rs` + `server/{helpers,lifecycle}.rs`: sum across bindings, publish `pending_neigh_capacity_drops_total`.
+- **Wire field (both sides):** `protocol/control.rs` adds the `ProcessStatus` field with `#[serde(rename = ...)]` + `#[serde(default)]` (additive / backward-compatible with an older daemon); `pkg/dataplane/userspace/protocol.go` adds the matching Go field + JSON tag. `protocol_wire_v1.json` **regenerated** (`XPF_PROTOCOL_WIRE_REGEN=1`) — diff is exactly the one new key.
+- `metrics{,_descriptors,_userspace}.go`: new Prometheus counter `xpf_userspace_pending_neigh_capacity_drops_total`, kept SEPARATE from the narrow duplicate-drops counter.
+
+`pending_neigh_duplicate_drops_total` stays narrow; the new counter is the distinct-hop denial signal.
+
+## Sibling drop sites
+
+`pending_neigh_admission` is the single admission decision; `poll_binding_process_descriptor` is its only consumer. The `neighbor_dispatch.rs` `CapacityDrop` is the same enum variant (decision-only, no separate drop site). No other capacity-drop path exists.
+
+## Tests
+
+- **Fail-on-revert (Rust):** `record_drop_counts_capacity_separately` drives the same helper the poll loop calls; **verified it FAILS if the capacity increment is removed** (re-run after deleting the `fetch_add`), and asserts the capacity case is not conflated with the duplicate counter.
+- **Wire parity (both sides):** `process_status_pending_neigh_capacity_drops_roundtrip` (Rust) + `TestProcessStatusPendingNeighCapacityDropsRoundTrip` (Go) pin the wire key on each side and the `#[serde(default)]` zero-decode of an older payload (the #1961 one-sided-field guard).
+- `metrics_descriptor_coverage_test.go` extended for the new metric.
+- `wire_invariant_default_specimens` passes against the regenerated fixture.
+
+## Validation
+
+`cargo build --release` + targeted `cargo test` green; `go build ./...` + `go test ./pkg/{config,dataplane,dataplane/userspace,api}` green; new tests 5x clean. Docs: `docs/userspace-dataplane-architecture.md` documents the three admission outcomes and the new counter.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+https://claude.ai/code/session_015oARShYtiJJ2H4UB4nXGqi
+
+---
+
+## PR #2427 — userspace-dp: count RT_FLOW replay-buffer eviction as telemetry loss (#2382) [MERGED] (merged 2026-06-23)
+
+Branch: `fix/2382-replay-eviction-telemetry`
+
+Closes #2382
+
+## Problem
+The event-stream replay buffer is bounded at `REPLAY_BUFFER_CAPACITY` (4096). When the daemon disconnects or withholds ACKs long enough for the buffer to wrap, `push_replay_frame` evicts the oldest accepted-and-enqueued frame to make room. That frame was already counted in `frames_sent` at enqueue, yet the eviction released the producer-queue budget **without incrementing any drop counter** — so permanently-lost accepted RT_FLOW / dataplane telemetry showed as sent-with-no-corresponding-loss. This is exactly the storm / daemon-restart path operators inspect for deny/drop/log audit completeness (codex review-030 finding 2). MEDIUM, observability/audit-accuracy — not a forwarding bug.
+
+Worse, the buffer-full eviction shared the `pop_replay_frame` helper with the MSG_ACK trim path and the shutdown drain, so an eviction (a real loss) and an acknowledged-frame removal (delivered — **not** a loss) were indistinguishable to accounting.
+
+## Fix (eviction-only, not ACK-trim)
+- Split the buffer-full eviction into a dedicated `evict_replay_frame` (`event_stream/mod.rs`) that increments a new `frames_replay_evicted` atomic **in addition to** releasing the queue budget.
+- `pop_replay_frame` — used by the MSG_ACK trim path and shutdown drain — stays uncounted, because acknowledged removal is a delivery, not a loss. A growing counter is therefore an unambiguous accepted-telemetry-loss signal.
+
+## End-to-end exposure (mirrors #2381 write-stalls / #2375 pending-neigh)
+- Rust atomic `frames_replay_evicted` → `EventStreamStats.replay_evictions` → `ProcessStatus.event_stream_replay_evictions` (serde rename + `#[serde(default)]`).
+- Go `ProcessStatus.EventStreamReplayEvictions` with the matching `json:"event_stream_replay_evictions,omitempty"` tag.
+- Prometheus: `xpf_userspace_event_stream_producer_frames_total{outcome="replay_evicted"}` (reuses the existing labeled producer-frames family — same descriptor as sent/dropped/write_stalled, no new descriptor).
+- `show` status line: `Event stream producer: ... replay_evictions=N`.
+- Doc: `docs/session-sync-design.md`.
+
+## Wire field (both sides + regen)
+The new field is added to **both** the Rust `ProcessStatus` and the Go `ProcessStatus` with matching tags (#1961 one-sided-field guard). `protocol_wire_v1.json` regenerated — diff is **exactly one new key** (`event_stream_replay_evictions`). Verified serde-default / omitempty round-trips on both sides.
+
+## Tests (fail-on-revert)
+- `replay_buffer_eviction_counts_telemetry_loss_2382` — filling past capacity drives the counter 0→N; **fails (stays 0) if the increment is removed** (verified by temporarily deleting the `fetch_add` → test FAILED).
+- `ack_trim_does_not_count_as_replay_eviction_2382` — the MSG_ACK trim path and shutdown drain leave the eviction counter at 0; distinguishes loss from acknowledged removal.
+- `replay_evictions_surface_in_event_stream_stats_2382` — the atomic reaches `EventStreamStats`.
+- `process_status_replay_evictions_wire_key_2382` — exact wire key + serde-default round-trip with the key absent.
+- Go `TestProcessStatusEventStreamFieldsParity1642` — decodes the new wire key and asserts a missing key defaults to 0.
+- Go `TestEmitUserspaceEventStreamMetrics` — asserts `outcome="replay_evicted"` (and `write_stalled`) series emit.
+
+## Validation
+- `cargo build --release` + targeted `cargo test --release` green; new Rust tests 5×0 flake; fail-on-revert confirmed.
+- `go build ./...`, `go vet`, `go test ./pkg/dataplane/userspace/... ./pkg/api/` green.
+- protocol_wire diff = one new key.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+https://claude.ai/code/session_015oARShYtiJJ2H4UB4nXGqi
+
+---
+
+## PR #2429 — icmp: gate PTB generation on the trigger's source address (#2367) [MERGED] (merged 2026-06-23)
+
+Branch: `fix/2367-ptb-bad-source`
+
+Closes #2367
+
+## Backscatter vector
+
+The forwarded-path Packet-Too-Big suppression gate (`ptb_reply_suppressed`, `userspace-dp/src/afxdp/icmp_ptb.rs`) checked only the L2 destination MAC, non-first fragment, L3 destination (multicast/broadcast, #2314), and inbound-ICMP-error cases — it **never read the trigger packet's IP SOURCE**.
+
+A locally generated PTB is addressed to the trigger's source. So an oversized DF datagram whose source is a forbidden address — `0.0.0.0`, `127.0.0.1`, `224.0.0.0/4` multicast, `255.255.255.255` broadcast (v4); `::`, `::1`, `ff00::/8` multicast (v6) — made the appliance emit a PTB to that address: **spoofable ICMP backscatter** (an attacker spoofs the source, the firewall emits PTBs to the victim).
+
+The reject / Time-Exceeded gate (`can_generate_icmp_error_reply`, `icmp.rs`) already enforced the bad-source check; the PTB gate did not. This is exactly the divergence the shared-predicate refactors (#2314/#2325) were meant to prevent — the L2/L3-**destination** gates were unified, but the L3-**source** gate was not.
+
+## RFC basis
+
+RFC 1812 §4.3.2.7 / RFC 4443 §2.4(e): a router MUST NOT originate an ICMP error in response to a datagram whose source does not uniquely identify a single host (unspecified, loopback, multicast, broadcast). The PTB is an ICMP error — same rule.
+
+## Fix
+
+Extract the reject/TE gate's inlined source check into a shared `source_is_invalid_for_icmp_error` predicate (`frame/inspect.rs`, the sibling of the existing `dest_is_multicast_or_broadcast` / `l2_dst_is_group_or_broadcast` predicates), and call it from **both** `ptb_reply_suppressed` and `can_generate_icmp_error_reply`. The PTB, reject, and Time-Exceeded paths now share **one** bad-source set, closing the forkable per-error-type suppression contract.
+
+- v4 + v6.
+- Disallowed source set (mirrors the reject gate exactly): v4 = unspecified / loopback / multicast / broadcast; v6 = unspecified / loopback / multicast.
+- Predicate fails closed on an unknown address family.
+- A suppressed PTB folds into the existing fail-closed silent-drop path (the oversized original is still dropped) — no new counter, no wire field.
+
+## Tests (fail-on-revert, security)
+
+- `ptb_suppressed_for_v4_bad_source_backscatter` / `ptb_suppressed_for_v6_bad_source_backscatter` — bad-source triggers must NOT generate a PTB. **Verified red** when the source call is removed from `ptb_reply_suppressed`; the unicast tests stay green (proving the suppression is the source gate, not the bytes).
+- `ptb_still_generated_for_v4_unicast_source` / `ptb_still_generated_for_v6_unicast_source` — anti-over-suppress: a legitimate unicast trigger still emits a PTB (PMTUD works), addressed back to that unicast source.
+- `source_predicate_matches_reject_set_and_fails_closed` — the PTB gate suppresses the SAME source set the reject gate does, and the predicate fails closed on an unknown family.
+
+## Validation
+
+`cargo build --release` clean; new tests green and stable across 5 runs; the reject-gate suppression tests still pass after the refactor. Cold ICMP-error generation path, not the per-packet fast path.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+https://claude.ai/code/session_015oARShYtiJJ2H4UB4nXGqi
+
+---
+
+## PR #2430 — userspace-dp: recognize AH (proto 51) as IPsec passthrough (#2385) [MERGED] (merged 2026-06-23)
+
+Branch: `fix/2385-ipsec-ah-passthrough`
+
+## Summary
+
+The host-terminated IPsec passthrough check in the AF_XDP dataplane
+recognized **ESP (proto 50)** and **IKE / NAT-T (UDP 500/4500)** and
+reinjected those packets to the kernel XFRM slow path, but **omitted AH
+(Authentication Header, proto 51)**. AH-protected SAs were silently broken:
+the kernel negotiated the SA, but AH packets fell through to ordinary
+transit forwarding, failed the FIB lookup, and were dropped or mis-routed.
+
+AH is a configurable, supported protocol — an operator can set
+`security ipsec proposal ... protocol ah` (`pkg/config/schema_security.go`,
+accepted by `compiler_validate_strict.go` / `compiler_applications.go`).
+
+## The omission
+
+`userspace-dp/src/afxdp/forwarding/mod.rs` (gating
+`poll_stages::stage_ipsec_passthrough_check`):
+
+```rust
+// before
+protocol == PROTO_ESP || (protocol == PROTO_UDP && (dst_port == 500 || dst_port == 4500))
+// after
+protocol == PROTO_ESP
+    || protocol == PROTO_AH
+    || (protocol == PROTO_UDP && (dst_port == 500 || dst_port == 4500))
+```
+
+## The fix
+
+Add `protocol == PROTO_AH` (= 51) alongside `PROTO_ESP`, mirroring the ESP
+branch exactly. Like ESP, AH carries no transport port, so only the
+protocol-number arm applies. The predicate keys solely on `meta.protocol`
+(L4 protocol from the IPv4 protocol field or the IPv6 next-header chain),
+so **IPv4 and IPv6** AH are handled identically. ESP + IKE/NAT-T handling
+is unchanged. `PROTO_AH` already existed in `ip_proto.rs`; it is now also
+imported into `afxdp/mod.rs`.
+
+## Tests (fail-on-revert)
+
+- `is_ipsec_traffic_recognizes_ah_proto_51` — **FAIL-ON-REVERT**: AH is
+  recognized across a spread of ports (port-independent). Confirmed to fail
+  when the `PROTO_AH` arm is removed.
+- `is_ipsec_traffic_recognizes_esp_and_ike` — no regression on ESP +
+  UDP/500 + UDP/4500.
+- `is_ipsec_traffic_rejects_non_ipsec` — no over-match (TCP/443, UDP/53,
+  UDP/4499 near-miss, GRE proto 47 protocol boundary).
+
+`cargo build --release` clean; new tests pass 5x; the broader
+`ipsec ah passthrough esp forwarding` filter is green (189 tests).
+
+
+*(truncated — 58 lines total)*
+
+
+---
+
+## PR #2431 — userspace-dp: bound GRE decap inner UDP/ICMP/ICMPv6 L4 read (#2376) [MERGED] (merged 2026-06-23)
+
+Branch: `fix/2376-gre-decap-inner-l4`
+
+Closes #2376
+
+## Problem
+
+The native GRE decap inner-protocol parser (`parse_inner_protocol_and_offsets`, `userspace-dp/src/afxdp/gre.rs`) length-validated an inner **TCP** header but advanced the payload offset by 8 bytes **unconditionally** for inner **UDP/ICMP** (IPv4) and **UDP/ICMPv6** (IPv6) — with no check that the inner packet actually contained the 8-byte L4 minimum header (RFC 768 UDP, RFC 792 ICMP, RFC 4443 ICMPv6). This is the TCP-guarded-but-UDP/ICMP-unguarded asymmetry.
+
+The inner packet is trimmed to its IP-declared total length (`packet_trimmed_len`) *before* the parse, so a malformed inner whose declared length ends before the L4 header (e.g. IPv4 `total_len = ihl + 2`, `protocol = UDP`) survives. Decap then stamps a synthetic inner `UserspaceDpMeta` whose `protocol` claims UDP/ICMP while `l4_offset` / `payload_offset` are derived from — and point past — bytes that are not a real L4 header.
+
+Decap is a trusted chokepoint that reinjects the synthetic frame into the worker pipeline (`poll_descriptor`), so every downstream consumer of `meta.protocol` / `l4_offset` / `payload_offset` (policy, logging, slow-path, generated-reply) then operates on a packet shape that should have failed closed.
+
+### Unguarded sites (before)
+- `gre.rs` IPv4: `PROTO_UDP => l4_offset + 8`, `PROTO_ICMP => l4_offset + 8`
+- `gre.rs` IPv6: `PROTO_UDP => rel_l4 + 8`, `PROTO_ICMPV6 => rel_l4 + 8`
+- Stamped into the synthetic inner meta at the `l4_offset = 14 + rel_l4_offset` / `payload_offset = 14 + payload_offset` site.
+
+## Fix
+
+Mirror the existing TCP guard for the other three protocols (fail closed):
+- IPv4 UDP/ICMP: require `packet.len() >= ihl + 8`
+- IPv6 UDP/ICMPv6: require `packet.len() >= rel_l4 + 8`
+- Return `None` (no decap / drop) otherwise.
+
+The TCP guard is untouched. A well-formed GRE-tunneled UDP/ICMP inner still decaps and stamps correct ports (anti-over-reject).
+
+## Distinction from #2361
+
+#2361 hardened the **live frame parser** (`parse_session_flow_from_frame`) so it no longer fabricates ports from bytes past the IP-declared length — a *ported SessionFlow* is no longer produced from a short inner. #2376 is narrower: the **synthetic inner metadata** (`protocol` / `l4_offset` / `payload_offset`) stamped by the GRE **decap stage itself**, which #2361 did not touch.
+
+## Tests (fail-on-revert)
+
+Added in `userspace-dp/src/afxdp/tests.rs`, driving `try_native_gre_decap_from_frame` directly (the decap chokepoint):
+- `gre_decap_drops_truncated_udp_inner_v4`
+- `gre_decap_drops_truncated_icmp_inner_v4`
+- `gre_decap_drops_truncated_udp_inner_v6`
+- `gre_decap_drops_truncated_icmpv6_inner_v6`
+- `gre_decap_well_formed_udp_inner_v4_still_decaps_with_ports` (anti-over-reject + port assertions)
+- `gre_decap_well_formed_icmp_inner_v4_still_decaps` (anti-over-reject)
+- `gre_decap_drops_truncated_tcp_inner_v4_no_regression` (TCP path still guarded)
+
+Verified the four truncated-drop tests **FAIL** when the guard is reverted, and pass with it. No panic on a truncated inner (bounds-safe `None`).
+
+## Validation
+- `cargo build --release` clean (pre-existing warnings only).
+- Full unittest suite: 2564 passed, 0 failed.
+- `gre_decap` subset 16/16 stable across 5 runs.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+https://claude.ai/code/session_015oARShYtiJJ2H4UB4nXGqi
+
+---
+
+## PR #2432 — userspace-dp: translate embedded inner on NAT44 ICMPv4 Redirect/Source-Quench (#2393) [MERGED] (merged 2026-06-23)
+
+Branch: `fix/2393-embedded-icmp-nat-types`
+
+Closes #2393
+
+## Outcome: fix added (types 4 + 5)
+
+The embedded-ICMP-NAT reversal gate `is_icmp_error`
+(`userspace-dp/src/afxdp/icmp.rs`) matched ICMPv4 error types **3/11/12**
+but omitted **type 5 (Redirect)** and **type 4 (Source Quench)**. Both
+carry a quoted inner packet that must be reversed on a NATed segment, and
+investigation confirms they *can* transit this path — so this is a real
+(latent, LOW) correctness gap, fixed by broadening the ICMPv4 arm to
+**3/4/5/11/12**.
+
+## Transit analysis (do type 4/5 reach this path?)
+
+**Yes, on the same-family (NAT44) path.** Confirmed by codebase search:
+
+- Same-family ICMP transit forwarding is **type-agnostic** — a transit
+  ICMP packet enters the standard `ForwardCandidate` policy path
+  (`poll_descriptor/mod.rs`) regardless of ICMP type. There is **no
+  ICMP-type allowlist/blocklist and no link-scope drop** on this path.
+- The **only** place type 4/5 are dropped is the **NAT64 cross-family**
+  path: `map_icmpv4_error_to_icmpv6()` (`nat64.rs`) maps only 3/11/12 and
+  returns `None` for 4/5, which are correctly dropped (no IPv6 analogue,
+  RFC 7915). That is a *different* path (cf. #2405) and is unchanged.
+
+So a NAT44-transit Redirect (5) / Source Quench (4) whose embedded inner
+matches a NATed session was forwarded with its quoted inner addresses
+left at the post-SNAT value — mismatched at the host that has to
+correlate the error with its pre-NAT flow.
+
+## RFC reasoning for 4/5
+
+- **Type 4 (Source Quench)** is deprecated — RFC 6633 says routers MUST
+  NOT generate it. Included for completeness/parity; near-zero practical
+  traffic.
+- **Type 5 (Redirect)** is normally link-scoped (a first-hop router tells
+  a host on the same link about a better gateway) and not usually
+  forwarded across subnets, so a NATed transit instance is rare.
+
+Hence the **LOW** severity: real divergence from netfilter parity, but
+marginal practical impact. The fix is mechanical and low-risk.
+
+## Why no other code change is needed
+
+All five types share the RFC 792 **8-byte ICMP header** layout — the
+type-specific word (Redirect's gateway address; the unused word on the
+others) occupies bytes 4..8 — so the quoted IP header always begins at
+`l4 + 8`. The embedded parser and the `build_nat_reversed_icmp_error_v4`
+builder are type-agnostic and need no per-type handling. The three gate
+sites (`icmp_embed/mod.rs`, `icmp_embed/session_match.rs`,
+
+*(truncated — 82 lines total)*
+
+
+---
+
+## PR #2433 — nat64: map ICMPv4 dest-unreach code 14 (host precedence violation) to ICMPv6 Parameter Problem (#2405) [CLOSED] (closed 2026-06-23)
+
+Branch: `fix/2405-nat64-icmpv4-code14`
+
+Closes #2405
+
+## Problem
+
+`map_icmpv4_error_to_icmpv6` in `userspace-dp/src/nat64.rs` omitted ICMPv4
+Destination-Unreachable **code 14** (host precedence violation) from its type-3
+code sub-map. The map handled codes 0, 1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 12, 13,
+15 (code 4, Fragmentation-Needed, is routed separately to Packet-Too-Big by the
+caller). A v4→v6 dest-unreachable carrying code 14 therefore fell through to the
+`_ => return None` catch-all and was **silently dropped** at the NAT64 boundary
+instead of being translated.
+
+## RFC 7915 §4.2 mapping for code 14
+
+RFC 7915 §4.2 (Translating ICMPv4 Destination Unreachable to ICMPv6) groups the
+codes that have no direct ICMPv6 Destination-Unreachable analogue and maps them
+to **ICMPv6 Parameter Problem**. Code 14 (Host Precedence Violation) is one such
+code: it maps to **ICMPv6 Type 4 (Parameter Problem), Code 1**, with the Pointer
+set to the offset of the IPv6 Traffic Class field.
+
+This mirrors the existing **code-2** (protocol unreachable) arm, which already
+maps to `(ICMPV6_PARAMETER_PROBLEM, 1)`. As with code 2, the Parameter-Problem
+pointer is left zeroed by `translate_icmpv4_message_to_icmpv6` (which writes a
+zeroed rest-of-header word for all non-PTB errors) rather than remapped to the
+Traffic Class offset — consistent with the existing translator behavior, not a
+new deviation.
+
+Note: the issue's original "fix direction" line floated admin-prohibited as an
+alternative, but the issue title and Spec-basis section (and the RFC) settle on
+Parameter Problem — codes 9/10/13/15 are the admin-prohibited family; code 14
+is the precedence/TOS family that goes to Parameter Problem.
+
+## Other omissions
+
+None. With the code-14 arm added, **every** RFC 7915 §4.2 type-3 code is now
+handled: 0–3 and 5–15 in `map_icmpv4_error_to_icmpv6`, plus code 4 routed to
+Packet-Too-Big by the caller. The fix is scoped to code 14.
+
+## Tests
+
+- `nat64_v4_to_v6_dest_unreachable_host_precedence_violation_maps` (new) —
+  asserts a v4 ICMP 3/14 error translates to ICMPv6 4/1 with a valid IPv6
+  pseudo-header checksum, a zeroed pointer word, and correctly mapped embedded
+  addresses. **Fail-on-revert verified**: removing the code-14 arm makes
+  `translate_v4_to_v6` return `None`, and the test panics with
+  "must translate, not drop".
+- `nat64_v4_to_v6_dest_unreachable_port_maps` (existing) — no-regression guard
+  for code 3 (port unreachable → ICMPv6 1/4).
+
+`cargo build --release` clean (pre-existing warnings only); both tests green 5×.
+
+*(truncated — 55 lines total)*
+
+
+---
+
+## PR #2434 — userspace-dp: suppress ICMP errors for IPv4 directed broadcasts (#2411) [MERGED] (merged 2026-06-23)
+
+Branch: `fix/2411-directed-broadcast-icmp`
+
+Closes #2411
+
+## Outcome: implemented directed-broadcast suppression
+
+RFC 1812 §4.3.2.7 forbids originating an ICMP error in reply to a packet
+destined to ANY broadcast, directed broadcasts included. The existing
+suppression gate (#2314/#2325) caught L3 multicast, the limited
+broadcast (255.255.255.255), and L2 group/broadcast — but a
+subnet-directed broadcast (the all-ones host of a connected prefix, e.g.
+`10.0.1.255` for a connected `10.0.1.0/24`) is a plain unicast to those
+tests, so an ICMP error (reject / Time-Exceeded / PTB) could still be
+generated as backscatter.
+
+## Key finding: the connected prefix/mask IS available at the gate
+
+The #2314/#2344 notes assumed the per-interface mask was unavailable at
+the ICMP-error generation site. It is not — it is reachable at all three
+sites:
+
+- both `can_generate_icmp_error_reply` callers (the reject and
+  Time-Exceeded builders, `icmp.rs`) already take `&ForwardingState`;
+- the PTB caller in `tx/dispatch/mod.rs` has `forwarding` in scope.
+
+`ForwardingState.connected_v4` (`ConnectedRouteV4 { prefix: PrefixV4 }`)
+carries the prefix + mask — the SAME rows the FIB lookup scans. No new
+infrastructure, no plumbing through new layers.
+
+## Detection mechanism
+
+`dest_is_directed_broadcast(forwarding, packet)` (shared, `frame/inspect.rs`):
+scans `connected_v4` for a prefix that contains the dst and whose
+`network | !mask` (`PrefixV4::directed_broadcast()`) equals the dst.
+IPv4-only (IPv6 has no broadcast); skips `prefix_len >= 31` (a /31 has no
+broadcast per RFC 3021, and a /32's all-ones host is the host itself, so
+neither is mis-suppressed). The scan runs ONLY on the cold
+error-generation path, never per-packet. Threaded into
+`can_generate_icmp_error_reply` and `ptb_reply_suppressed` (v4-gated)
+alongside the existing multicast / limited-broadcast / bad-source gates,
+so the reject, Time-Exceeded, and PTB paths all apply one gate. A
+suppressed error folds into the existing fail-closed silent drop — no new
+counter.
+
+## Tests
+
+- `reject_suppressed_for_v4_directed_broadcast_dst`,
+  `ptb_suppressed_for_v4_directed_broadcast_dst` — directed broadcast
+  suppressed on both paths. Both FAIL (error generated) if the check is
+  stubbed to `false` (verified).
+- `reject_still_allowed_for_unicast_in_connected_subnet`,
+  `ptb_still_generated_for_unicast_in_connected_subnet` — a unicast host
+
+*(truncated — 70 lines total)*
+
+
+---
+
+## PR #2435 — userspace-dp: recover frames on partial bringup fill-ring prime (#2374) [MERGED] (merged 2026-06-23)
+
+Branch: `fix/2374-fill-ring-partial-prime`
+
+Closes #2374
+
+## Problem
+
+The AF_XDP worker constructor primes the RX fill ring with every
+non-reserved UMEM frame at socket bringup, but `prime_fill_ring_offsets`
+(`userspace-dp/src/afxdp/bind.rs`) treated only a **total** insert failure
+(`inserted == 0`) as fatal. A short insert (`0 < inserted < N`) was silently
+accepted as `Ok`. Because the worker started with an empty
+`pending_fill_frames` queue, the `(N - inserted)` un-inserted UMEM frame
+addresses were dropped from every local pool — neither placed in the fill
+ring nor retried anywhere.
+
+On a transiently-full fill ring at bind/rebind (rebind retries, shared-UMEM
+group churn) the binding then ran with permanently depressed RX capacity and
+fill-ring starvation. The bringup prime is outside `drain_pending_fill`
+telemetry, so the only signal was a boot `eprintln` that did not fail the
+bind — an operator-visible packet-loss mode that should fail closed at
+dataplane bringup.
+
+### Leak site (before)
+`bind.rs` `prime_fill_ring_offsets` errored only on `inserted == 0`; a
+partial insert returned `Ok(())` and the worker constructor
+(`worker/mod.rs`) set `pending_fill_frames: VecDeque::new()` — nothing
+carried the un-inserted suffix.
+
+## Contrast: steady-state already does this right
+
+`tx::rings::drain_pending_fill` (`userspace-dp/src/afxdp/tx/rings.rs`)
+handles a short insert by pushing the un-inserted suffix back onto
+`pending_fill_frames` for the next tick. The bringup prime lacked the
+equivalent recovery.
+
+## Fix (mirror steady-state suffix recovery)
+
+- `prime_fill_ring_offsets` now retries the un-inserted suffix across the
+  existing NAPI-trigger loop (each `recvmsg`/`poll`/`sendto` lets the kernel
+  consume fill entries and free ring slots), then **returns** the suffix the
+  ring still has not accepted instead of discarding it.
+- The suffix is threaded back through `try_open_bind` and
+  `open_binding_worker_rings` into the worker constructor, which seeds
+  `pending_fill_frames` from it so `drain_pending_fill()` retries exactly
+  those offsets — the frames are accounted, never leaked.
+- A **total** failure (`inserted == 0` on a non-empty prime) still **fails
+  closed**; the bind aborts rather than running with no RX descriptors.
+
+The fail-closed and suffix-recovery decisions are extracted into two pure
+helpers (`fill_prime_is_total_failure`, `defer_uninserted_fill_suffix`) so
+they are unit-testable without a bound `DeviceQueue`.
+
+
+*(truncated — 74 lines total)*
+
+
+---
+
+## PR #2436 — userspace-dp: make AF_XDP producer-ring writers (WriteTx/WriteFill) append-safe (#2383) [MERGED] (merged 2026-06-23)
+
+Branch: `fix/2383-xsk-ffi-append-safe`
+
+Closes #2383
+
+## Problem (latent API hazard)
+`WriteTx::insert` / `WriteFill::insert` in `userspace-dp/src/xsk_ffi.rs` wrote each item at `base_idx + n` (where `n` is the per-call iterator index), **ignoring `self.written`**. A second `insert()` on the same reservation restarts at `base+0` and overwrites the slots the first `insert()` wrote, while `self.written` is summed across calls — so `commit()`/`Drop` submit a descriptor count spanning double-written and uninitialized slots. The bound check `n >= self.reserved` likewise ignored `self.written`, so a second call could write past the remaining reservation.
+
+The API looks like it supports multiple inserts per reservation (`reserve(N)` → `insert(...)` [possibly multiple] → `commit(written)`) but did not.
+
+### Index calc (before → after)
+| Writer | Before | After |
+|--------|--------|-------|
+| `WriteTx::insert` (xsk_ffi.rs ~934) | `base_idx.wrapping_add(n)` | `base_idx.wrapping_add(self.written).wrapping_add(n)` |
+| `WriteFill::insert` (xsk_ffi.rs ~988) | `base_idx.wrapping_add(n)` | `base_idx.wrapping_add(self.written).wrapping_add(n)` |
+
+Bound (both): `n >= self.reserved` → `n >= self.reserved.saturating_sub(self.written)`.
+
+## Latent vs now-triggered
+**Still latent.** Every current production callsite does exactly one `insert()` per reservation (`afxdp/tx/transmit/write.rs:26`, `afxdp/tx/rings.rs:121`, `afxdp/bind.rs:300`). 
+
+**#2374 interaction (checked):** the fill-ring suffix retry (`afxdp/bind.rs:351-360`) re-reserves a **fresh** `WriteFill` per NAPI iteration — `device.fill(suffix.len())` + `commit()` each loop — rather than re-inserting into a held reservation. So #2374 does NOT trip the hazard; #2383 remains a latent unsafe-boundary invariant, fixed proactively.
+
+## Fix
+Index the k-th total item at `base_idx + self.written + n`; bound each call by `self.reserved.saturating_sub(self.written)`; advance `self.written` by the count inserted. libxdp masks the slot index against the ring size, so the unwrapped sum is correct (the existing code already relied on that mask). Single-insert (`written == 0`) is unchanged — still writes at `base+0`. `commit()`/`Drop` submit the accumulated `self.written`.
+
+## Tests (fail-on-revert), both WriteTx and WriteFill
+- `write_{tx,fill}_two_inserts_append_not_overwrite` — two inserts on one reservation; asserts slots `base+0/+1/+2` hold all items in order. **Verified it FAILS** when the index reverts to `base_idx + n` (second insert clobbers `base+0`), while the single-insert/bounds tests still pass.
+- `write_{tx,fill}_single_insert_writes_base` — no regression for `written == 0`.
+- `write_{tx,fill}_insert_bounded_by_remaining_reservation` — a second insert past a full reservation inserts 0; an oversized single insert is capped at the reservation.
+
+`cargo build --release` clean; `xsk_ffi` tests 7 passed, stable 5x. No wire field.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+https://claude.ai/code/session_015oARShYtiJJ2H4UB4nXGqi
+
+---
+
+## PR #2437 — userspace-dp: whole-packet-atomic slow-path TUN writes (#2407) [MERGED] (merged 2026-06-23)
+
+Branch: `fix/2407-tun-short-write`
+
+Closes #2407
+
+## Problem
+A TUN/TAP fd is **packet-oriented**: one `write()` (or one io_uring write submission) is exactly one L3 packet — it is *not* a byte stream. Both slow-path reinjection writers retried a **short** count by resubmitting the **remaining** bytes (stream semantics). On a packet device that makes the kernel interpret `bytes[n..]` as a **SECOND, malformed packet**: the original frame is truncated and a garbage packet is injected, showing up as intermittent slow-path packet corruption + kernel drop counts.
+
+The slow path backs local-delivery and exception reinjection (ICMP, IPsec passthrough #2385, unresolved-neighbor/unsupported-route), so this is silent corruption under short-write / congestion / EINTR conditions.
+
+Provenance: agy review-032 finding 2.
+
+## Sites (current master)
+- **sync** — `userspace-dp/src/slowpath.rs` `write_packet_sync`: `while written < len { write(ptr+written, len-written) }`.
+- **io_uring** — `userspace-dp/src/io_uring_write.rs` `write_all`: `while offset < data.len()` resubmits `data[offset..]`; the TUN slow path uses non-positioned (stream) mode, so a short CQE triggered the resubmit-remainder loop.
+
+## Fix — whole-packet-atomic, never resume from a partial offset
+- **sync**: extracted to `write_packet_atomic(len, writer)` (closure seam → unit-testable without a real fd). Always writes the WHOLE packet from offset 0. `EINTR` → retry whole; full count → Ok; partial `0 < n < len` or `0` → `Err` (drop); any other errno (incl. `EAGAIN`) → `Err` (drop).
+- **io_uring**: the loop is **shared** with the positioned state-writer (a regular file IS a byte stream and legitimately resumes). Added a `!positioned` guard: the TUN (non-positioned) path drops a short CQE count (`Err`) instead of resubmitting `data[n..]`; **positioned writes keep the multi-chunk resume**. The EINTR retry was already wait-only (no re-push), so it is whole-packet by construction.
+
+**Drop counter:** none added — the existing `slow_path_worker` `Err` arm already increments `dropped_packets` / `dropped_bytes` / `write_errors`, so a dropped partial is accounted there.
+
+## Tests (fail-on-revert — each verified by temporarily restoring the remainder loop)
+io_uring:
+- `packet_short_write_drops_no_remainder_resubmit` — one push, `Err`, **zero remainder bytes accepted** (asserts no `data[n..]` write; fails if the guard is reverted)
+- `packet_full_write_succeeds`, `packet_eintr_retries_whole_no_corruption`
+- `positioned_short_write_advances_and_resubmits` — file resume preserved (no regression)
+
+sync:
+- `sync_short_write_drops_no_remainder` — exactly one **full-length** write, never `bytes[n..]`
+- `sync_full_write_succeeds_single_call`, `sync_eintr_retries_whole_packet`, `sync_zero_write_drops`, `sync_hard_error_drops`
+
+Repointed the pre-existing `stale_cqe_is_not_misattributed` (#2297) test to `positioned=true` — its two-chunk resume is now valid only for the file path; packet semantics are covered by the new test.
+
+## Validation
+- `cargo build --release` clean; clippy no new findings on changed files
+- full `userspace-dp` suite green (2587 + 46 + 62); new tests 5x stable
+- fail-on-revert confirmed for both the sync and io_uring guards
+
+No wire field. Doc: `docs/xdp-io-uring-userspace-dataplane.md` slow-path reinjection section.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+https://claude.ai/code/session_015oARShYtiJJ2H4UB4nXGqi
+
+---
+
+## PR #2439 — userspace-dp: set slow-path TUN MTU to the data-interface max (#2408) [MERGED] (merged 2026-06-23)
+
+Branch: `fix/2408-tun-mtu`
+
+Closes #2408
+
+## Problem
+The slow-path TUN device (`xpf-usp0`) is created with `TUNSETIFF` + brought up (`set_if_up`) + `rp_filter` disabled — but its MTU is never set, so the kernel leaves it at the default **1500**. Firewall-local replies and forwarding-resolution-failure exceptions are reinjected through this TUN. On a jumbo-frame topology a reinjected frame larger than 1500 bytes is **silently dropped on the TUN egress** (kernel "MTU exceeded"), causing jumbo-packet loss on the slow path.
+
+`open_tun` (`userspace-dp/src/slowpath.rs`) issued no `SIOCSIFMTU` and there was no MTU configuration anywhere in the slow-path bringup.
+
+## Fix
+- Program the TUN MTU via `SIOCSIFMTU` (new `set_if_mtu`, mirroring the existing `set_if_up` `SIOCSIFFLAGS` pattern, using the previously-unused `mtu` arm of the `ifreq` union). `slow_path_worker` calls it right after `open_tun`.
+- `open_tun` itself is **left unchanged** — it is shared by the tunnel / WireGuard attach paths, which attach to a Go-precreated *persistent* device and must not re-MTU it. The MTU set lives in the slow-path worker only.
+- **MTU value is sourced from config, not hardcoded:** new `ConfigSnapshot::slow_path_mtu()` returns the **max of the per-interface MTUs** the control plane already carries in the snapshot, **clamped to a 1500 floor** (never shrink below the kernel default) and **ignoring non-positive** values. `apply_snapshot` threads it into `SlowPathReinjector::new(name, mtu)`.
+- **Error handling:** a failed `SIOCSIFMTU` is **non-fatal** — logged + recorded in `last_error`, but the slow path stays up (the TUN remains usable for frames up to its current MTU, degrading to pre-fix behaviour for <=1500 rather than tearing down forwarding).
+
+## TUN-open site
+`userspace-dp/src/slowpath.rs` `open_tun` (now ~line 366) + `slow_path_worker` (now ~line 247). MTU set mechanism: `SIOCSIFMTU` ioctl (`libc::SIOCSIFMTU`) on an `AF_INET`/`SOCK_DGRAM` control socket.
+
+## Fail-on-revert tests
+- `slow_path_mtu_tests`: `picks_largest_interface_mtu_for_jumbo`, `sources_value_from_single_interface`, `never_below_1500_floor`, `empty_or_zero_mtu_falls_back_to_floor`, `ignores_nonpositive_mtus` — fail if the helper hardcodes 1500 / stops picking the max (verified: a `max()`->`min()` mutation fails two of them).
+- `slowpath::tests::set_if_mtu_rejects_nonpositive` — fails if the `mtu<=0` guard is dropped.
+- `slowpath::tests::ifreq_carries_mtu_value` — fails if the MTU is not written into the `ifreq` union `SIOCSIFMTU` reads.
+
+## Validation
+`cargo build --release` clean; new tests green 5x; full bin test suite passes (one unrelated pre-existing WG-concurrency flake `reconcile_peers_snapshot_is_atomic_under_concurrent_load`, passes 5/5 in isolation, untouched by this change).
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+https://claude.ai/code/session_015oARShYtiJJ2H4UB4nXGqi
+
+---
+
+## PR #2459 — slowpath: warn when conf/all/rp_filter overrides per-device 0 (#2378) [MERGED] (merged 2026-06-23)
+
+Branch: `fix/2378-rp-filter-all`
+
+## Summary
+
+Fixes #2378 (agy review-029 finding 5, MEDIUM). The slow-path TUN reinjector disabled reverse-path filtering by writing `0` to **only** the per-device `rp_filter` sysctl. The kernel computes the effective rp_filter as `max(conf/all/rp_filter, conf/<dev>/rp_filter)`, so when `net.ipv4.conf.all.rp_filter` is strict (`1`) or loose (`2`) — a common Debian/Ubuntu default — the per-device `0` is ignored and **every slow-path reinjected IPv4 packet is silently dropped** as a reverse-path failure (ICMP rejects, forwarding-resolution misses).
+
+## Design-fork evidence
+
+The issue says: *"Prefer a warning over silently mutating a host-global sysctl UNLESS the daemon already owns host tunables."*
+
+- **Rust helper owns NO host-global sysctls** — `grep -rn 'conf/all\|/all/' userspace-dp/src/` returns **nothing**; the helper only ever writes per-device knobs (`set_ipv4_sysctl(iface, ...)`).
+- The Go daemon *does* write some host-global tunables (`enableForwarding`/`applyKernelTuning` set `conf/all/forwarding`, `conf/all/accept_local`, `conf/all/send_redirects`, …), but `conf/all/rp_filter` is a deliberate operator security posture and the TUN bringup itself lives in the helper. Mutating it host-global would be a surprising side effect on non-firewall paths.
+
+→ Both sites take the **WARNING path**: do **not** touch `conf/all/rp_filter`; emit a loud, operator-visible, one-time bringup/reload warning instead. This is the issue's expected answer.
+
+## Mechanism
+
+- `userspace-dp/src/slowpath.rs`: `open_tun` reads `conf/all/rp_filter` once after writing the per-device `0` and `eprintln!("xpf-ha: …")` warns when non-zero. Split into seamed helpers `read_all_rp_filter(path)` + `rp_filter_all_warning(dev, value)` so it is unit-testable without touching live `/proc`. Missing/unparsable value → no spurious warning.
+- `pkg/networkd/networkd.go`: `restoreSlowPathRPFilter` re-asserts the per-device `0` after `networkctl reload`, then `warnIfAllRPFilterOverrides` mirrors the same `conf/all` check via `slog.Warn`. `procSysNetRoot` is now a package var so tests point the tree at a temp fixture.
+- `docs/userspace-dataplane-architecture.md`: documents the `max(all, dev)` kernel rule + warning behavior in the slow-path TUN section.
+
+Both checks are **bringup/reload-only, never per-packet**.
+
+## Validation
+
+- **Rust**: `cargo build --release` clean (pre-existing warnings only). New `slowpath::tests` (`rp_filter_all_warning_fires_on_strict_and_loose`, `..._quiet_when_zero_or_unknown`, `read_all_rp_filter_parses_and_tolerates_missing`) pass **5x**. Fail-on-revert verified — neutering the non-zero guard (`Some(v) if v != 0` → `if false`) **fails** the strict/loose test.
+- **Go**: `gofmt` clean; `go test ./pkg/networkd/` green; `go vet` clean. Fail-on-revert verified — forcing `warnIfAllRPFilterOverrides` to return early **fails** `TestWarnIfAllRPFilterOverrides_Nonzero`.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+https://claude.ai/code/session_015oARShYtiJJ2H4UB4nXGqi
+
+---
+
+## PR #2483 — userspace-dp: open mandatory map FDs before reconcile teardown/publish (#2440) [MERGED] (merged 2026-06-23)
+
+Branch: `fix/2440-reconcile-preflight`
+
+Closes #2440
+
+## The fail-open window
+
+`Coordinator::reconcile` (`coordinator/reconcile/`) applied a new config
+snapshot by tearing down the running workers, then `apply_snapshot`
+**published** the new forwarding view (`coord.forwarding`,
+`shared_validation`, `ha.forwarding`, `ha.fabrics`) and advanced
+`validation.snapshot_installed` / `config_generation` — and only AFTER
+that opened the mandatory BPF map FDs (`xsk` / `heartbeat` / `sessions`).
+
+A snapshot whose required pins were missing or unopenable therefore:
+
+1. tore down the old workers (orchestrator, before `apply_snapshot`),
+2. published a **newer** generation,
+3. aborted bring-up at the FD-open step (returned `None`).
+
+Result: the helper advertised a data-plane view backed by **no running
+workers** — stale-but-correct state replaced by published-but-
+unserveable state. On a security appliance that is fail-open
+(codex review-033 finding 033-01, HIGH).
+
+## The fix — correct ordering
+
+The mandatory map open is the real correctness boundary, so it now
+happens before anything irreversible:
+
+- New `snapshot::preflight_map_fds` validates the required pin strings
+  **and** opens all mandatory + optional map FDs.
+- The orchestrator (`reconcile/mod.rs`) runs the preflight **before
+  `tear_down`** and **before any publish**.
+- On a missing-pin / FD-open failure it sets `last_reconcile_stage` +
+  per-registered-binding `last_error` and returns `None`; reconcile
+  aborts with **no teardown and no publish** — the prior generation
+  stays published and the prior workers keep running.
+- Only once all mandatory FDs are in hand does the pipeline tear down,
+  rebuild, and publish. The optional maps (conntrack v4/v6, dnat tables)
+  remain best-effort and never gate the reconcile.
+
+`apply_snapshot` now receives the already-secured FDs (its now-unused
+`bindings` parameter is dropped).
+
+### Stop-on-fork resolution
+
+The prompt allowed stopping if hoisting the FD open ahead of teardown
+required a structural refactor too large to do safely. It does not: the
+mandatory FDs depend on nothing produced by `tear_down` (they are opened
+purely from `snapshot.map_pins`). So the **smaller-but-correct** shape —
+a preflight run before teardown that returns the secured FDs into the
+unchanged phase pipeline — fully closes the window. A partial fix that
+
+*(truncated — 94 lines total)*
+
+
+---
+
+## PR #2485 — userspace-dp: fail closed on a present-but-unopenable optional map (#2444) [MERGED] (merged 2026-06-23)
+
+Branch: `fix/2444-conntrack-dnat-failclosed`
+
+Closes #2444
+
+## Problem (codex review-033 finding 033-23, MEDIUM)
+
+`preflight_map_fds` (`userspace-dp/src/afxdp/coordinator/reconcile/snapshot.rs`) opened the four **optional** maps — `conntrack_v4`, `conntrack_v6`, `dnat_table`, `dnat_table_v6` — with `OwnedFd::open_bpf_map(&pin).ok()`. That `.ok()` conflated two cases:
+
+- **pin EMPTY** → feature not configured → `None` is correct.
+- **pin PRESENT but open FAILS** (permission / pin mismatch / corruption) → the error was **swallowed** → the helper ran degraded (no session zone/iface visibility from conntrack; broken embedded-ICMP NAT reversal → PMTUD/traceroute breakage from dnat) with **no readiness signal**.
+
+A non-empty pin IS the signal the feature is configured, so a configured map that cannot be opened must block the deploy, not run silently degraded.
+
+## Fix
+
+New `open_optional_map` helper mirrors the #2440 mandatory-map fail-closed pattern, distinguishing **empty** (None, fine) from **present-but-unopenable** (fail closed):
+
+- empty pin → `Ok(None)` (feature absent — the common case; never gates the reconcile).
+- present + open Ok → `Ok(Some(fd))`.
+- present + open Err → set `last_reconcile_stage = "open_<map>_map_failed:<err>"` (distinct stage per map) + per-registered-binding `last_error`, return `Err(())` so the caller **aborts before teardown/publish** — keeping the prior generation + workers live (the #2440 invariant).
+
+The now-wrong "non-fatal / normal forwarding unaffected" comments and the doc-comment claim that optional maps "never gate the reconcile" are corrected.
+
+### Empty-vs-present distinction (the key design point)
+
+Only an **empty** pin is non-fatal. The overwhelmingly common deploy carries no conntrack/dnat pins and must reconcile normally — so the fix is careful NOT to over-gate: a present pin that fails to open is fatal; an empty pin returns `None` silently.
+
+## Tests (fail-on-revert, sentinel-pin seam)
+
+In `coordinator/tests.rs` via `TEST_MAP_PIN_OK` / `TEST_MAP_PIN_FAIL` (no real bpffs pins):
+
+- `reconcile_present_conntrack_pin_open_failure_keeps_prior_generation` — present conntrack pin fails → abort, prior generation preserved, stage `open_conntrack_v4_map_failed:`, per-binding `last_error`, no workers spawned.
+- `reconcile_present_dnat_pin_open_failure_keeps_prior_generation` — same for a present dnat pin.
+- `reconcile_empty_optional_pins_advance_published_generation` — **anti-over-gate control**: empty optional pins do NOT gate; new generation publishes.
+- `reconcile_present_optional_pins_open_ok_advance_generation` — positive control: present + openable optional maps reconcile normally.
+
+**Fail-on-revert proof:** restoring the pre-#2444 `.ok()` for `conntrack_v4` makes the present-conntrack-fail test FAIL (reconcile wrongly spawns `workers=1` and advances `config_generation`). Verified, then restored.
+
+## Validation
+
+- `cargo build --release` clean (pre-existing warnings only).
+- reconcile test suite **18/18** across 5 consecutive runs.
+
+## Docs
+
+`docs/userspace-dataplane-architecture.md` reconcile/preflight section now states which maps are mandatory-fail-closed vs optional, that an optional map with a **present** pin is also fail-closed on open error (only an empty pin is non-fatal), and lists the new tests.
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+
+https://claude.ai/code/session_015oARShYtiJJ2H4UB4nXGqi
 
 ---
 
