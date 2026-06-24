@@ -246,6 +246,19 @@ type compileOpts struct {
 	// exactly as it did before this gate. Same doctrine as
 	// lenientLogProfileStreamRef.
 	lenientRoutingExportRef bool
+	// lenientRouteFilterMatchTypes (#2525) downgrades the route-filter
+	// match-type gate (validateRouteFilterMatchTypesStrict) from a hard
+	// compile error to a cfg.Warnings entry. The strict commit / commit-check
+	// path hard-rejects an FRR-unsupported `through` match-type and a
+	// malformed / inverted / out-of-range / below-base `prefix-length-range`.
+	// These match-types committed unnoticed before this gate (the schema
+	// admitted them and the renderer silently degraded them to an open-ended
+	// `le maxLen`), so an already-persisted or peer-synced config may carry
+	// one; an upgrading / receiving node must still BOOT through it (warn)
+	// rather than fail closed (#1960). The renderer skips the offending entry
+	// on the tolerant path (match-nothing, fail-closed). Same doctrine as
+	// lenientRoutingExportRef.
+	lenientRouteFilterMatchTypes bool
 	// lenientApplicationSpecs (#2142) downgrades the application-definition
 	// port/protocol gate (validateApplicationSpecsStrict) from a hard compile
 	// error to a cfg.Warnings entry. The strict commit / commit-check path
@@ -493,6 +506,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientNATHostMask:                 true,
 		lenientUnsupportedInterfaceStanzas: true,
 		lenientRoutingExportRef:            true,
+		lenientRouteFilterMatchTypes:       true,
 		lenientApplicationSpecs:            true,
 		lenientFilterProtocols:             true,
 		lenientFilterActions:               true,
@@ -592,6 +606,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientNATHostMask:                 true,
 		lenientUnsupportedInterfaceStanzas: true,
 		lenientRoutingExportRef:            true,
+		lenientRouteFilterMatchTypes:       true,
 		lenientApplicationSpecs:            true,
 		lenientFilterProtocols:             true,
 		lenientFilterActions:               true,
@@ -1221,6 +1236,26 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		if opts.lenientRoutingExportRef {
 			cfg.Warnings = append(cfg.Warnings,
 				fmt.Sprintf("routing export reference (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
+	// #2525: route-filter match-type gate. `through` has no lossless FRR
+	// prefix-list mapping (a two-prefix containment path, not a length range)
+	// and `prefix-length-range` must carry a well-formed /low-/high within the
+	// family / base-prefix bounds. Both committed unnoticed before this gate
+	// and the FRR renderer silently degraded them to an open-ended `le maxLen`,
+	// leaking / dropping the configured constraint. Strict on commit /
+	// commit-check (hard reject so the unsupported / malformed match-type is
+	// operator-visible); lenient on load / peer-sync (warn so an already-
+	// persisted or peer-synced config still boots — #1960; the renderer then
+	// skips the offending entry, match-nothing). Runs on the fully-compiled
+	// *Config. Mirrors validateRoutingExportReferencesStrict.
+	if err := validateRouteFilterMatchTypesStrict(cfg); err != nil {
+		if opts.lenientRouteFilterMatchTypes {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("route-filter match-type (downgraded to warning on tolerant path): %v", err))
 		} else {
 			return nil, err
 		}

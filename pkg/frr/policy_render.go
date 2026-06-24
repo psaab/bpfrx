@@ -749,6 +749,71 @@ func (m *Manager) generatePolicyOptions(po *config.PolicyOptionsConfig) string {
 						}
 					case "orlonger":
 						// orlonger = this prefix or any more specific (default le 32/128)
+					case "prefix-length-range":
+						// prefix-length-range /low-/high = match any route
+						// whose prefix length is in [low, high] and that falls
+						// under the base prefix. FRR expresses a bounded length
+						// range directly as "ge low le high" (#2525). The
+						// compiler stores the parsed bounds in RangeLow/RangeHigh
+						// (0 when the "/lo-/hi" token was malformed) and
+						// validateRouteFilterMatchTypesStrict has already
+						// rejected an inverted / out-of-range / at-or-below-base
+						// range on the commit path. The lenient load/peer-sync
+						// path (where that strict reject is downgraded to a
+						// warning per #1960) can still feed a stored bad range
+						// here, so this arm is belt-and-suspenders: it emits
+						// "ge low le high" ONLY when the bounds are present and
+						// FRR-valid, else it skips the entry (match-nothing,
+						// fail-closed) rather than fall through to the open-ended
+						// "le maxLen" default — which would silently widen the
+						// operator's bounded constraint to an orlonger-style
+						// permit (the #2525 bug).
+						//
+						// FRR requires the `ge` value to be STRICTLY greater than
+						// the prefix length ("len < ge-value"); a `ge <= base`
+						// line is rejected and a rejected line can fail the whole
+						// frr-reload (#1880-class). So the guard re-derives the
+						// base prefix length and requires RangeLow > baseLen,
+						// mirroring the `longer` (plen+1) / `upto` guards. The
+						// prefix already passed net.ParseCIDR above (the
+						// skipEntry malformed-prefix belt), so it parses here.
+						maxLen := 32
+						if isV6 {
+							maxLen = 128
+						}
+						baseLen := 0
+						if _, ipnet, err := net.ParseCIDR(rf.Prefix); err == nil {
+							baseLen, _ = ipnet.Mask.Size()
+						}
+						if rf.RangeLow > baseLen && rf.RangeLow <= rf.RangeHigh && rf.RangeHigh <= maxLen {
+							matchStr = fmt.Sprintf("ge %d le %d", rf.RangeLow, rf.RangeHigh)
+						} else {
+							skipEntry = true
+						}
+					case "through":
+						// through <prefix2> has no lossless FRR equivalent:
+						// Junos "through" matches the base prefix, prefix2, and
+						// only the prefixes on the direct radix-tree path
+						// between them — NOT every prefix of intermediate
+						// length. FRR prefix-lists can only express length
+						// ranges (ge/le), so any rendering would change the
+						// match set. validateRouteFilterMatchTypesStrict rejects
+						// "through" at commit; only the tolerant load/peer-sync
+						// path can reach the renderer with it. Skip the entry
+						// (match-nothing, fail-closed) rather than silently
+						// emit a wrong / open-ended line (#2525).
+						skipEntry = true
+					default:
+						// Any match-type that is admitted by the schema but not
+						// handled above (a future keyword, or a value that
+						// slipped past validation on a tolerant path) MUST NOT
+						// fall through to the pre-switch open-ended "le maxLen"
+						// default — that silently degrades a constrained match
+						// to an orlonger-style permit (the #2525 fall-through
+						// bug). Skip the entry instead: match-nothing is
+						// fail-closed and the ALWAYS-emitted match line then
+						// resolves to RMAP_NOMATCH (DENY).
+						skipEntry = true
 					case "upto":
 						// upto /N = this prefix or any more specific, but no
 						// longer than /N. FRR renders this as a bare "le N":

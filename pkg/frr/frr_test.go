@@ -3484,3 +3484,196 @@ func TestPrefixListMatch_EndToEnd_FlatSet(t *testing.T) {
 		t.Errorf("end-to-end: must NOT emit the IPv4 matcher for a v6 list, got:\n%s", got)
 	}
 }
+
+// TestGeneratePolicyOptionsPrefixLengthRange verifies the #2525 fix: a
+// route-filter "prefix-length-range /low-/high" renders the FRR bounded
+// length range "ge low le high", NOT the pre-fix silent open-ended fall-through
+// ("le 32" / "le 128") that leaked/dropped the operator's constraint.
+//
+// Fail-on-revert: revert the renderer's prefix-length-range arm so the entry
+// falls through to the pre-switch default "le 32" — the "ge 16 le 24" assertion
+// fails AND the "must NOT contain le 32 open-ended" assertion fires.
+func TestGeneratePolicyOptionsPrefixLengthRange(t *testing.T) {
+	m := &Manager{frrConf: "/dev/null"}
+	po := &config.PolicyOptionsConfig{
+		PolicyStatements: map[string]*config.PolicyStatement{
+			"IMPORT-RANGE": {
+				Name: "IMPORT-RANGE",
+				Terms: []*config.PolicyTerm{
+					{
+						Name:   "v4",
+						Action: "accept",
+						RouteFilters: []*config.RouteFilter{
+							{Prefix: "10.0.0.0/8", MatchType: "prefix-length-range", RangeLow: 16, RangeHigh: 24},
+						},
+					},
+					{
+						Name:   "v6",
+						Action: "accept",
+						RouteFilters: []*config.RouteFilter{
+							{Prefix: "2001:db8::/32", MatchType: "prefix-length-range", RangeLow: 48, RangeHigh: 64},
+						},
+					},
+				},
+				DefaultAction: "reject",
+			},
+		},
+	}
+
+	got := m.generatePolicyOptions(po)
+
+	wantV4 := "ip prefix-list IMPORT-RANGE-v4 seq 5 permit 10.0.0.0/8 ge 16 le 24"
+	if !strings.Contains(got, wantV4) {
+		t.Errorf("v4 prefix-length-range: missing %q in:\n%s", wantV4, got)
+	}
+	wantV6 := "ipv6 prefix-list IMPORT-RANGE-v6 seq 5 permit 2001:db8::/32 ge 48 le 64"
+	if !strings.Contains(got, wantV6) {
+		t.Errorf("v6 prefix-length-range: missing %q in:\n%s", wantV6, got)
+	}
+	// The bug was a silent open-ended "le 32"/"le 128" fall-through. With the
+	// fix the bounded range never renders an open-ended le on the base prefix.
+	if strings.Contains(got, "10.0.0.0/8 le 32") {
+		t.Errorf("v4 range leaked the open-ended le 32 fall-through (#2525):\n%s", got)
+	}
+	if strings.Contains(got, "2001:db8::/32 le 128") {
+		t.Errorf("v6 range leaked the open-ended le 128 fall-through (#2525):\n%s", got)
+	}
+	// The match line must still be emitted so the route-map references the list.
+	if !strings.Contains(got, "match ip address prefix-list IMPORT-RANGE-v4") {
+		t.Errorf("v4 match line missing:\n%s", got)
+	}
+	if !strings.Contains(got, "match ipv6 address prefix-list IMPORT-RANGE-v6") {
+		t.Errorf("v6 match line missing:\n%s", got)
+	}
+}
+
+// TestGeneratePolicyOptionsPrefixLengthRangeAtOrBelowBaseSkipped verifies the
+// #2525 lenient-path guard: a prefix-length-range whose low bound is AT or
+// BELOW the base prefix length (e.g. /8-/24 on a /8, or /4-/24) is rejected at
+// commit by the strict gate — but on the tolerant load/peer-sync path that
+// reject is downgraded to a warning (#1960) and the stored bad range reaches
+// the renderer. The renderer MUST skip the entry (match-nothing) rather than
+// emit `ge 8 le 24` / `ge 4 le 24`, which FRR rejects ("len < ge-value") and
+// which would fail the whole frr-reload batch (#1880-class). Fail-on-revert:
+// remove the `RangeLow > baseLen` renderer floor and the entry emits
+// `ge 8 le 24` — this test fails.
+func TestGeneratePolicyOptionsPrefixLengthRangeAtOrBelowBaseSkipped(t *testing.T) {
+	m := &Manager{frrConf: "/dev/null"}
+	po := &config.PolicyOptionsConfig{
+		PolicyStatements: map[string]*config.PolicyStatement{
+			"P": {
+				Name: "P",
+				Terms: []*config.PolicyTerm{
+					{
+						Name:   "atbase",
+						Action: "accept",
+						RouteFilters: []*config.RouteFilter{
+							{Prefix: "10.0.0.0/8", MatchType: "prefix-length-range", RangeLow: 8, RangeHigh: 24},
+						},
+					},
+					{
+						Name:   "belowbase",
+						Action: "accept",
+						RouteFilters: []*config.RouteFilter{
+							{Prefix: "10.0.0.0/8", MatchType: "prefix-length-range", RangeLow: 4, RangeHigh: 24},
+						},
+					},
+				},
+				DefaultAction: "reject",
+			},
+		},
+	}
+
+	got := m.generatePolicyOptions(po)
+
+	// No `ge <= base` line may be emitted for either term.
+	for _, bad := range []string{"ge 8 le 24", "ge 4 le 24"} {
+		if strings.Contains(got, bad) {
+			t.Errorf("emitted FRR-invalid %q (ge <= base prefix) — would brick frr-reload (#2525/#1880):\n%s", bad, got)
+		}
+	}
+	// The entries are skipped, so no prefix-list line exists; the match line is
+	// still emitted (fail-closed RMAP_NOMATCH).
+	if strings.Contains(got, "prefix-list P-atbase seq") || strings.Contains(got, "prefix-list P-belowbase seq") {
+		t.Errorf("at/below-base range must emit NO prefix-list line:\n%s", got)
+	}
+	if !strings.Contains(got, "match ip address prefix-list P-atbase") {
+		t.Errorf("at-base term must still emit a match line (fail-closed):\n%s", got)
+	}
+}
+
+// TestGeneratePolicyOptionsThroughSkipped verifies that the FRR-unsupported
+// "through" match-type (which only reaches the renderer on the tolerant
+// load/peer-sync path — the strict commit gate rejects it) renders NO
+// prefix-list line and NEVER the open-ended "le 32" fall-through (#2525). The
+// match line is still emitted, so the term resolves to RMAP_NOMATCH (DENY) —
+// fail-closed, not a silent permit.
+func TestGeneratePolicyOptionsThroughSkipped(t *testing.T) {
+	m := &Manager{frrConf: "/dev/null"}
+	po := &config.PolicyOptionsConfig{
+		PolicyStatements: map[string]*config.PolicyStatement{
+			"P": {
+				Name: "P",
+				Terms: []*config.PolicyTerm{
+					{
+						Name:   "t1",
+						Action: "accept",
+						RouteFilters: []*config.RouteFilter{
+							{Prefix: "10.0.0.0/8", MatchType: "through", ThroughPrefix: "10.1.0.0/16"},
+						},
+					},
+				},
+				DefaultAction: "reject",
+			},
+		},
+	}
+
+	got := m.generatePolicyOptions(po)
+
+	if strings.Contains(got, "prefix-list P-t1 seq") {
+		t.Errorf("through entry must emit NO prefix-list line:\n%s", got)
+	}
+	if strings.Contains(got, "10.0.0.0/8 le 32") {
+		t.Errorf("through entry leaked the open-ended le 32 fall-through (#2525):\n%s", got)
+	}
+	// Fail-closed: the match line referencing the (now-empty) list is still
+	// emitted, so FRR resolves it to RMAP_NOMATCH (DENY).
+	if !strings.Contains(got, "match ip address prefix-list P-t1") {
+		t.Errorf("through term must still emit a match line (fail-closed DENY):\n%s", got)
+	}
+}
+
+// TestGeneratePolicyOptionsMatchTypesRegression locks the existing match-type
+// renderings (exact / longer / orlonger / upto) so the #2525 switch rework did
+// not break them.
+func TestGeneratePolicyOptionsMatchTypesRegression(t *testing.T) {
+	m := &Manager{frrConf: "/dev/null"}
+	po := &config.PolicyOptionsConfig{
+		PolicyStatements: map[string]*config.PolicyStatement{
+			"P": {
+				Name: "P",
+				Terms: []*config.PolicyTerm{
+					{Name: "exact", Action: "accept", RouteFilters: []*config.RouteFilter{{Prefix: "10.0.0.0/8", MatchType: "exact"}}},
+					{Name: "longer", Action: "accept", RouteFilters: []*config.RouteFilter{{Prefix: "10.0.0.0/8", MatchType: "longer"}}},
+					{Name: "orlong", Action: "accept", RouteFilters: []*config.RouteFilter{{Prefix: "10.0.0.0/8", MatchType: "orlonger"}}},
+					{Name: "upto", Action: "accept", RouteFilters: []*config.RouteFilter{{Prefix: "10.0.0.0/8", MatchType: "upto", UptoLen: 24}}},
+				},
+				DefaultAction: "reject",
+			},
+		},
+	}
+
+	got := m.generatePolicyOptions(po)
+
+	checks := []string{
+		"ip prefix-list P-exact seq 5 permit 10.0.0.0/8\n", // exact: bare prefix, no ge/le
+		"ip prefix-list P-longer seq 5 permit 10.0.0.0/8 ge 9 le 32",
+		"ip prefix-list P-orlong seq 5 permit 10.0.0.0/8 le 32",
+		"ip prefix-list P-upto seq 5 permit 10.0.0.0/8 le 24",
+	}
+	for _, want := range checks {
+		if !strings.Contains(got, want) {
+			t.Errorf("regression: missing %q in:\n%s", want, got)
+		}
+	}
+}

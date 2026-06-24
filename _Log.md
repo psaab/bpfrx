@@ -1,5 +1,77 @@
 # Action Log
 
+## 2026-06-24 — #2525 review fold: prefix-length-range base-prefix floor off-by-one (FRR-brick)
+
+- **Timestamp**: 2026-06-24 PDT
+- **Action**: Hostile-reviewer + Copilot converged fold on PR #2535. The
+  base-prefix floor for `prefix-length-range` was off by one: FRR requires
+  the prefix-list `ge` value to be STRICTLY greater than the base prefix
+  length (`len < ge-value`), but the strict validator used `RangeLow <
+  baseLen` (should be `<=`). So `10.0.0.0/8 prefix-length-range /8-/24`
+  (RangeLow == baseLen == 8) committed, the renderer emitted `ge 8 le 24`,
+  FRR rejected the line, and frr-reload exited non-zero on the whole managed
+  batch → FRR brick (#1880-class). The renderer guard also did not re-derive
+  baseLen, so on the lenient (downgraded-to-warning, #1960) path a stored
+  `/4-/24`-on-/8 range still emitted `ge 4 le 24`. Fix (single root cause):
+  (1) strict floor → `RangeLow <= baseLen` reject (low must be strictly more
+  specific than base); (2) renderer re-derives baseLen and requires
+  `RangeLow > baseLen`, else skips the entry (match-nothing, fail-closed) —
+  boot-safe even when strict was downgraded; (3) wording fixed ("less
+  specific than" → "more specific than the base prefix, low > base") in the
+  validator error + README; (4) malformed-range error now computes maxLen
+  from the family first (v4 → 1..32) instead of hardcoding 1..128.
+- **Tests** (fail-on-revert verified): `pkg/config` validation `at_base`
+  case (`/8-/24` on `/8` → reject; revert `<=`→`<` → wrongly commits →
+  fails); `pkg/frr`
+  `TestGeneratePolicyOptionsPrefixLengthRangeAtOrBelowBaseSkipped`
+  (at/below-base reaches renderer via lenient path → no `ge 8/4 le 24`
+  emitted; remove the renderer floor → emits `ge 8 le 24` → fails). Valid
+  `/16-/24` on `/8` still renders `ge 16 le 24` (no regression).
+- **File(s)**: pkg/config/compiler_validate_strict.go,
+  pkg/config/compiler_route_filter_range_2525_test.go,
+  pkg/frr/policy_render.go, pkg/frr/frr_test.go, pkg/frr/README.md, _Log.md
+
+## 2026-06-24 — #2525 route-filter prefix-length-range / through (MED-HIGH, agy review-037 finding 4)
+
+- **Timestamp**: 2026-06-24 PDT
+- **Action**: Routing/security correctness fix. FRR route-filter
+  match-types `prefix-length-range` and `through` were accepted at commit
+  but the `pkg/frr` renderer switch had no arm for them, so they fell
+  through to the pre-switch open-ended default (`le 32`/`le 128`) and
+  silently rendered as an orlonger-style permit — the configured range
+  constraint was NOT applied (leak/drop) with no warning. Fix:
+  (1) compiler now captures the `/low-/high` bounds into
+  `RouteFilter.RangeLow/RangeHigh` (both AST shapes) and the `through`
+  second prefix into `ThroughPrefix`; (2) renderer emits
+  `prefix-length-range` as FRR `ge low le high`, SKIPS `through` and any
+  unhandled match-type (match-nothing, fail-closed) via a new `default`
+  arm — killing the silent fall-through; (3) new
+  `validateRouteFilterMatchTypesStrict` hard-rejects `through` (no
+  lossless FRR mapping for a two-prefix radix-path containment) and an
+  inverted/out-of-range/below-base/malformed `prefix-length-range` at
+  commit, downgraded to a warning on the lenient load/peer-sync path
+  (#1960, new `lenientRouteFilterMatchTypes` flag).
+- **Decision on `through`**: REJECT at commit. Junos `through` matches the
+  base prefix, the target prefix, and only the prefixes on the direct
+  radix-tree path between them — not every prefix of intermediate length.
+  FRR prefix-lists express only length ranges (ge/le), so any rendering
+  would change the match set. Reject-at-commit (matches #2486/#2507/#2509
+  unsupported-pattern) rather than a wrong mapping.
+- **Tests** (fail-on-revert verified): `pkg/frr`
+  `TestGeneratePolicyOptionsPrefixLengthRange` (v4 `ge 16 le 24` + v6
+  `ge 48 le 64`; reverting the arm reproduces the `le 32`/`le 128` leak),
+  `TestGeneratePolicyOptionsThroughSkipped`,
+  `TestGeneratePolicyOptionsMatchTypesRegression`; `pkg/config`
+  compile/strict/lenient + range-validation tests
+  (`compiler_route_filter_range_2525_test.go`).
+- **File(s)**: pkg/config/types_routing.go,
+  pkg/config/compiler_routing.go, pkg/config/compiler.go,
+  pkg/config/compiler_validate_strict.go,
+  pkg/config/schema_validators.go,
+  pkg/config/compiler_route_filter_range_2525_test.go,
+  pkg/frr/policy_render.go, pkg/frr/frr_test.go,
+  pkg/frr/README.md, docs/feature-gaps.md, _Log.md
+
 ## 2026-06-23 — #2461 flowexport per-flow-server template binding
 
 - **Timestamp**: 2026-06-23 PDT

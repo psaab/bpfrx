@@ -65,8 +65,22 @@ type PolicyTerm struct {
 // RouteFilter matches a prefix with a match type.
 type RouteFilter struct {
 	Prefix    string // CIDR ("192.168.50.0/24")
-	MatchType string // "exact", "longer", "orlonger", "upto"
+	MatchType string // "exact", "longer", "orlonger", "upto", "prefix-length-range", "through"
 	UptoLen   int    // for "upto" match type
+	// RangeLow / RangeHigh hold the two prefix-length bounds for the
+	// "prefix-length-range /low-/high" match type (#2525). Both are 0
+	// (unset) for every other match type; parseRouteFilterRange leaves them
+	// 0 when the "/low-/high" token is malformed so the renderer/validator
+	// can treat 0 unambiguously as "no parseable range".
+	RangeLow  int
+	RangeHigh int
+	// ThroughPrefix holds the second (more-specific) CIDR of a Junos
+	// "through <prefix2>" match (#2525). FRR has no lossless equivalent for
+	// the two-prefix containment-path semantics of "through", so the strict
+	// commit gate rejects it; on the tolerant load/peer-sync path the
+	// renderer skips the entry (match-nothing, fail-closed). Empty for every
+	// other match type.
+	ThroughPrefix string
 }
 
 // RoutingOptionsConfig holds static routing configuration.

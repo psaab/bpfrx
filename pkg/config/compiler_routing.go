@@ -527,6 +527,43 @@ func parseRouteFilterLen(tok string) (int, bool) {
 	return n, true
 }
 
+// parseRouteFilterRange parses a Junos "prefix-length-range" length token of
+// the form "/16-/24" (or the slashless "16-24") into its low and high
+// prefix-length bounds. It returns (low, high, true) only when BOTH bounds are
+// well-formed lengths in 1..128; any malformed token (missing dash, empty
+// half, non-numeric, out of range) yields (0, 0, false) so the caller leaves
+// RangeLow/RangeHigh at 0 and the strict gate / renderer treat 0 as "no
+// parseable range" (#2525). Ordering (low<=high), the per-family max, and the
+// base-prefix floor are enforced separately by validateRouteFilterMatchTypesStrict
+// — this helper only parses syntax.
+func parseRouteFilterRange(tok string) (low, high int, ok bool) {
+	parts := strings.SplitN(tok, "-", 2)
+	if len(parts) != 2 {
+		return 0, 0, false
+	}
+	lo, okLo := parseRouteFilterLen(parts[0])
+	hi, okHi := parseRouteFilterLen(parts[1])
+	if !okLo || !okHi {
+		return 0, 0, false
+	}
+	return lo, hi, true
+}
+
+// routeFilterTrailingToken extracts the single trailing argument token of a
+// hierarchical-parse route-filter node (the "/N" for upto, the "/lo-/hi" for
+// prefix-length-range, the CIDR for through). It reaches the compiler in two
+// shapes: brace parse puts it at Keys[3]; flat-set SetPath nests it as the
+// first key of the first child. Returns "" when neither shape carries it.
+func routeFilterTrailingToken(fc *Node) string {
+	if len(fc.Keys) >= 4 {
+		return fc.Keys[3]
+	}
+	if len(fc.Children) > 0 && len(fc.Children[0].Keys) > 0 {
+		return fc.Children[0].Keys[0]
+	}
+	return ""
+}
+
 // parsePolicyTermChildren handles hierarchical form of policy term
 // where "from" and "then" are child nodes.
 func parsePolicyTermChildren(term *PolicyTerm, children []*Node) {
@@ -557,24 +594,31 @@ func parsePolicyTermChildren(term *PolicyTerm, children []*Node) {
 							Prefix:    fc.Keys[1],
 							MatchType: fc.Keys[2],
 						}
-						// "upto" carries a trailing "/N" length token. It
-						// reaches the compiler in two shapes (#2072):
-						//   - brace parse: a single leaf, length at Keys[3];
-						//   - flat-set SetPath: a container node with the
-						//     length as its first child key
-						//     (Children[0].Keys[0]). On a single-line flat set
-						//     the child also folds trailing clause tokens, so
-						//     read only its first key.
-						if rf.MatchType == "upto" {
-							if len(fc.Keys) >= 4 {
-								if n, ok := parseRouteFilterLen(fc.Keys[3]); ok {
-									rf.UptoLen = n
-								}
-							} else if len(fc.Children) > 0 && len(fc.Children[0].Keys) > 0 {
-								if n, ok := parseRouteFilterLen(fc.Children[0].Keys[0]); ok {
+						// "upto", "prefix-length-range", and "through" all carry
+						// a trailing argument token (a "/N" length, a "/lo-/hi"
+						// range, or a CIDR prefix). It reaches the compiler in
+						// two shapes (#2072/#2525):
+						//   - brace parse: a single leaf, the arg at Keys[3];
+						//   - flat-set SetPath: a container node with the arg as
+						//     its first child key (Children[0].Keys[0]). On a
+						//     single-line flat set the child also folds trailing
+						//     clause tokens, so read only its first key.
+						switch rf.MatchType {
+						case "upto":
+							if argTok := routeFilterTrailingToken(fc); argTok != "" {
+								if n, ok := parseRouteFilterLen(argTok); ok {
 									rf.UptoLen = n
 								}
 							}
+						case "prefix-length-range":
+							if argTok := routeFilterTrailingToken(fc); argTok != "" {
+								if lo, hi, ok := parseRouteFilterRange(argTok); ok {
+									rf.RangeLow = lo
+									rf.RangeHigh = hi
+								}
+							}
+						case "through":
+							rf.ThroughPrefix = routeFilterTrailingToken(fc)
 						}
 						term.RouteFilters = append(term.RouteFilters, rf)
 					}
@@ -678,16 +722,30 @@ func parsePolicyTermInlineKeys(term *PolicyTerm, keys []string) {
 					Prefix:    keys[i+1],
 					MatchType: keys[i+2],
 				}
-				// "upto" carries a trailing "/N" length token at keys[i+3].
-				// Consume it only when present so the next clause keyword is
-				// not misread as a value. (#2072 — belt-and-suspenders: the
-				// inline path is not reached for route-filter under the
-				// current schema, which always nests "from" as a child node,
-				// but keep it correct in case dispatch ever changes.)
+				// "upto"/"prefix-length-range"/"through" carry a trailing
+				// argument token at keys[i+3] (a "/N" length, a "/lo-/hi"
+				// range, or a CIDR prefix). Consume it only when present so
+				// the next clause keyword is not misread as a value.
+				// (#2072/#2525 — belt-and-suspenders: the inline path is not
+				// reached for route-filter under the current schema, which
+				// always nests "from" as a child node, but keep it correct in
+				// case dispatch ever changes.)
 				consumed := 2
-				if rf.MatchType == "upto" && i+3 < len(keys) {
-					if n, ok := parseRouteFilterLen(keys[i+3]); ok {
-						rf.UptoLen = n
+				if i+3 < len(keys) {
+					switch rf.MatchType {
+					case "upto":
+						if n, ok := parseRouteFilterLen(keys[i+3]); ok {
+							rf.UptoLen = n
+							consumed = 3
+						}
+					case "prefix-length-range":
+						if lo, hi, ok := parseRouteFilterRange(keys[i+3]); ok {
+							rf.RangeLow = lo
+							rf.RangeHigh = hi
+							consumed = 3
+						}
+					case "through":
+						rf.ThroughPrefix = keys[i+3]
 						consumed = 3
 					}
 				}
