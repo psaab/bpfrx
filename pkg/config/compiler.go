@@ -528,6 +528,21 @@ type compileOpts struct {
 	// leniently-loaded test HOLDS state rather than actuating off a probe
 	// that can never run). Same doctrine as lenientRPMLinkLocalZone.
 	lenientRPMHTTPGetScheme bool
+	// lenientRPMRoutingInstance (#2496) downgrades the RPM test
+	// routing-instance cross-reference gate
+	// (validateRPMRoutingInstanceStrict) from a hard compile error to a
+	// cfg.Warnings entry. An RPM test whose `routing-instance` names a
+	// nonexistent instance makes the runtime bind the probe DATA socket to
+	// a synthesized vrf-<name> device (SO_BINDTODEVICE) that does not exist
+	// → ENODEV → the probe never sends a packet and the test HOLDS its
+	// state forever (no PASS, no FAIL), starving any event-options /
+	// ip-monitoring policy keyed off it of a failover signal. Strict on
+	// commit / commit-check (hard reject so the typo is operator-visible);
+	// lenient on load / peer-sync (warn — #1960 no-brick; the runtime bind
+	// returns ENODEV for the same nonexistent instance, so the leniently-
+	// loaded test HOLDS state rather than actuating off a dead measurement).
+	// Same doctrine as lenientRPMHTTPGetScheme.
+	lenientRPMRoutingInstance bool
 }
 
 // CompileConfig converts a parsed ConfigTree AST into a typed Config struct.
@@ -581,6 +596,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientRPMScopedHostname:           true,
 		lenientRPMLinkLocalZone:            true,
 		lenientRPMHTTPGetScheme:            true,
+		lenientRPMRoutingInstance:          true,
 	})
 }
 
@@ -685,6 +701,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientRPMScopedHostname:           true,
 		lenientRPMLinkLocalZone:            true,
 		lenientRPMHTTPGetScheme:            true,
+		lenientRPMRoutingInstance:          true,
 	})
 }
 
@@ -1541,6 +1558,28 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		if opts.lenientRPMHTTPGetScheme {
 			cfg.Warnings = append(cfg.Warnings,
 				fmt.Sprintf("rpm http-get scheme (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
+	// #2496: RPM test routing-instance cross-reference gate. A test whose
+	// `routing-instance` names a nonexistent instance makes the runtime
+	// bind the probe DATA socket to a synthesized vrf-<name> device
+	// (SO_BINDTODEVICE) that does not exist → ENODEV → the probe never runs
+	// and the test HOLDS its state forever, starving any event-options /
+	// ip-monitoring policy keyed off it of a failover signal. An empty
+	// routing-instance is the default (master) context and is accepted.
+	// Strict on commit / commit-check (hard reject so the typo is
+	// operator-visible); lenient on load / peer-sync (warn — #1960; the
+	// runtime bind returns ENODEV for the same nonexistent instance, so the
+	// leniently-loaded test HOLDS state instead of actuating off a dead
+	// measurement). Mirrors the ip-monitoring preferred-route
+	// routing-instance check in validateIPMonitoringStrict.
+	if err := validateRPMRoutingInstanceStrict(cfg); err != nil {
+		if opts.lenientRPMRoutingInstance {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("rpm routing-instance (downgraded to warning on tolerant path): %v", err))
 		} else {
 			return nil, err
 		}

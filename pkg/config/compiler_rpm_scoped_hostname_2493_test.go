@@ -85,6 +85,7 @@ func TestRPMScopedHostnameLenientWarns(t *testing.T) {
 func TestRPMScopedIPLiteralAccepted(t *testing.T) {
 	t.Run("routing-instance + IP literal accepted", func(t *testing.T) {
 		lines := []string{
+			"set routing-instances ISP-B instance-type forwarding",
 			"set services rpm probe P test t probe-type icmp-ping",
 			"set services rpm probe P test t target 8.8.8.8",
 			"set services rpm probe P test t routing-instance ISP-B",

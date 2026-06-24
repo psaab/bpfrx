@@ -13028,3 +13028,7 @@ top.
   pkg/config/compiler.go, pkg/config/compiler_services.go,
   pkg/config/compiler_rpm_http_scheme_2495_test.go, docs/multi-wan.md,
   _Log.md
+
+## 2026-06-24 — #2496 RPM routing-instance strict cross-reference validator
+- **Action**: Add validateRPMRoutingInstanceStrict — reject RPM test routing-instance that names no configured instance; lenient warn on load/peer-sync (#1960). Mirrors validateIPMonitoringStrict preferred-route RI check.
+- **Files**: pkg/config/compiler_services.go (validator), pkg/config/compiler.go (lenientRPMRoutingInstance opt + gate), pkg/config/compiler_rpm_routing_instance_2496_test.go (new), pkg/config/compiler_rpm_scoped_hostname_2493_test.go + parser_ast_test.go (configure RI in pre-existing tests), docs/multi-wan.md (#2496 bullet).
