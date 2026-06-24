@@ -604,6 +604,32 @@ which removes acknowledged frames that WERE delivered — ACK-trim and shutdown
 drain do NOT bump the eviction counter, so a growing `replay_evictions` value is
 an unambiguous accepted-telemetry-loss signal, not normal acknowledged removal.
 
+**Per-event-type RT_FLOW counters are surfaced everywhere (#2510)**: the
+daemon-side `EventStream` keeps an `events` counter and a `drops` counter for
+each RT_FLOW frame type it consumes — `policy_deny`, `screen_drop`,
+`screen_alarm`, `filter_log`, and (since #2460/#2508) `session_close` /
+`session_create`. All of these thread atomically from
+`EventStream.{recordDataplaneEvent,recordDataplaneEventDrop}` through the public
+`EventStream.Status()` DTO (`EventStreamStatus`, `pkg/dataplane/userspace/
+protocol.go`) to every observability surface:
+- CLI `show ...` status (`Event stream events: ... session_close=N
+  session_create=N` and `Event stream drops: ... session_close=N
+  session_create=N`, `pkg/dataplane/userspace/format/status.go`);
+- REST + gRPC, which serialize the `EventStreamStatus` DTO directly (the close /
+  create counts ride the `session_close_events` / `session_close_drops` /
+  `session_create_events` / `session_create_drops` JSON fields — there is no
+  separate protobuf message for these counters, so the DTO change auto-carries
+  to gRPC);
+- Prometheus `xpf_userspace_event_stream_dataplane_events_total{type="..."}` and
+  `..._dataplane_event_drops_total{type="..."}` (`pkg/api/metrics_userspace.go`),
+  which now enumerate the `session_close` and `session_create` labels alongside
+  the other four types.
+The `session_close` *drops* counter is the operator-facing signal that
+post-#2460/#2465 SESSION_CLOSE frames — which feed flow-export close records —
+were dropped at the daemon (a data-retention/export-completeness incident).
+A rising `..._event_drops_total{type="session_close"}` delta means close
+records are being lost before the flow exporter sees them.
+
 **RT_FLOW event timestamps are emission-time, wall-clock (#2470)**: the
 deny / screen-drop / screen-alarm / filter-log RT_FLOW events
 (`afxdp/event_emit.rs`) stamp `timestamp_ns` (wire offset 0, LE u64, absolute

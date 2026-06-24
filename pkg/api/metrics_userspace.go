@@ -1278,6 +1278,8 @@ func (c *xpfCollector) emitUserspaceEventStream(ch chan<- prometheus.Metric, sta
 		{"screen_drop", es.ScreenDropEvents},
 		{"screen_alarm", es.ScreenAlarmEvents},
 		{"filter_log", es.FilterLogEvents},
+		{"session_close", es.SessionCloseEvents},
+		{"session_create", es.SessionCreateEvents},
 	} {
 		ch <- prometheus.MustNewConstMetric(c.userspaceEventStreamDataplaneEventsTotal,
 			prometheus.CounterValue, float64(item.count), item.label)
@@ -1289,6 +1291,8 @@ func (c *xpfCollector) emitUserspaceEventStream(ch chan<- prometheus.Metric, sta
 		{"policy_deny", es.PolicyDenyDrops},
 		{"screen_drop", es.ScreenDropDrops},
 		{"filter_log", es.FilterLogDrops},
+		{"session_close", es.SessionCloseDrops},
+		{"session_create", es.SessionCreateDrops},
 	} {
 		ch <- prometheus.MustNewConstMetric(c.userspaceEventStreamDataplaneDropsTotal,
 			prometheus.CounterValue, float64(item.count), item.label)

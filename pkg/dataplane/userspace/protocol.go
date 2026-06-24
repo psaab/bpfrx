@@ -1185,18 +1185,22 @@ type SourceNATPoolStatus struct {
 }
 
 type EventStreamStatus struct {
-	FramesRead        uint64 `json:"frames_read,omitempty"`
-	FramesWritten     uint64 `json:"frames_written,omitempty"`
-	DecodeErrors      uint64 `json:"decode_errors,omitempty"`
-	SeqGaps           uint64 `json:"seq_gaps,omitempty"`
-	PolicyDenyEvents  uint64 `json:"policy_deny_events,omitempty"`
-	ScreenDropEvents  uint64 `json:"screen_drop_events,omitempty"`
-	ScreenAlarmEvents uint64 `json:"screen_alarm_events,omitempty"`
-	FilterLogEvents   uint64 `json:"filter_log_events,omitempty"`
-	PolicyDenyDrops   uint64 `json:"policy_deny_drops,omitempty"`
-	ScreenDropDrops   uint64 `json:"screen_drop_drops,omitempty"`
-	FilterLogDrops    uint64 `json:"filter_log_drops,omitempty"`
-	UnknownFrameDrops uint64 `json:"unknown_frame_drops,omitempty"`
+	FramesRead          uint64 `json:"frames_read,omitempty"`
+	FramesWritten       uint64 `json:"frames_written,omitempty"`
+	DecodeErrors        uint64 `json:"decode_errors,omitempty"`
+	SeqGaps             uint64 `json:"seq_gaps,omitempty"`
+	PolicyDenyEvents    uint64 `json:"policy_deny_events,omitempty"`
+	ScreenDropEvents    uint64 `json:"screen_drop_events,omitempty"`
+	ScreenAlarmEvents   uint64 `json:"screen_alarm_events,omitempty"`
+	FilterLogEvents     uint64 `json:"filter_log_events,omitempty"`
+	SessionCloseEvents  uint64 `json:"session_close_events,omitempty"`  // #2460/#2510
+	SessionCreateEvents uint64 `json:"session_create_events,omitempty"` // #2508/#2510
+	PolicyDenyDrops     uint64 `json:"policy_deny_drops,omitempty"`
+	ScreenDropDrops     uint64 `json:"screen_drop_drops,omitempty"`
+	FilterLogDrops      uint64 `json:"filter_log_drops,omitempty"`
+	SessionCloseDrops   uint64 `json:"session_close_drops,omitempty"`  // #2460/#2510
+	SessionCreateDrops  uint64 `json:"session_create_drops,omitempty"` // #2508/#2510
+	UnknownFrameDrops   uint64 `json:"unknown_frame_drops,omitempty"`
 }
 
 type CoSInterfaceStatus struct {
