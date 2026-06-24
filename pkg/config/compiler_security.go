@@ -604,9 +604,19 @@ func mergeAddressNode(addr *Address, node *Node) {
 }
 
 // descriptionText extracts the description string from a flat-set
-// `address <name> description <text>` node. The node's own Keys are
-// [address, name, description]; the text lives in the single child leaf.
+// `address <name> description <text>` node. Two AST shapes are accepted
+// (#2419 unified the multi-value flat-set leaf onto the node's own keys):
+//
+//   - unified leaf:  Keys=[address, name, description, <text>], no children
+//   - legacy split:  Keys=[address, name, description] + child leaf <text>
+//
+// The unified form is what both the hierarchical parser and the post-#2419
+// flat-set SetPath now produce for any multi-value leaf, so it is checked
+// first; the child-leaf form is kept for backward compatibility.
 func descriptionText(node *Node) string {
+	if len(node.Keys) >= 4 {
+		return node.Keys[3]
+	}
 	if len(node.Children) > 0 {
 		return node.Children[0].Name()
 	}

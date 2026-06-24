@@ -250,37 +250,14 @@ func compileFilterFrom(node *Node, term *FirewallFilterTerm) {
 		case "protocol":
 			term.Protocols = append(term.Protocols, firewallMatchValues(child)...)
 		case "source-address":
-			// Can be a leaf with value or a block with address entries
-			if len(child.Keys) >= 2 {
-				term.SourceAddresses = append(term.SourceAddresses, child.Keys[1])
-			}
-			for _, addrNode := range child.Children {
-				if len(addrNode.Keys) >= 1 {
-					term.SourceAddresses = append(term.SourceAddresses, addrNode.Keys[0])
-				}
-			}
+			// Multi-value (#2419/#2545): a bracket/flat-set list collapses
+			// onto child.Keys[1:] (firewallMatchValues), a hierarchical
+			// block carries each address as a child node — handle both.
+			term.SourceAddresses = append(term.SourceAddresses, firewallMatchValues(child)...)
 		case "destination-address":
-			if len(child.Keys) >= 2 {
-				term.DestAddresses = append(term.DestAddresses, child.Keys[1])
-			}
-			for _, addrNode := range child.Children {
-				if len(addrNode.Keys) >= 1 {
-					term.DestAddresses = append(term.DestAddresses, addrNode.Keys[0])
-				}
-			}
+			term.DestAddresses = append(term.DestAddresses, firewallMatchValues(child)...)
 		case "destination-port":
-			if len(child.Keys) >= 2 {
-				// Can be a single port or bracket list
-				for _, k := range child.Keys[1:] {
-					term.DestinationPorts = append(term.DestinationPorts, k)
-				}
-			}
-			// Flat set syntax: port value as child node
-			for _, portNode := range child.Children {
-				if len(portNode.Keys) >= 1 {
-					term.DestinationPorts = append(term.DestinationPorts, portNode.Keys[0])
-				}
-			}
+			term.DestinationPorts = append(term.DestinationPorts, firewallMatchValues(child)...)
 		case "source-prefix-list":
 			// Block form: source-prefix-list { mgmt-hosts except; }
 			for _, plNode := range child.Children {
@@ -299,16 +276,7 @@ func compileFilterFrom(node *Node, term *FirewallFilterTerm) {
 				term.DestPrefixLists = append(term.DestPrefixLists, ref)
 			}
 		case "source-port":
-			if len(child.Keys) >= 2 {
-				for _, k := range child.Keys[1:] {
-					term.SourcePorts = append(term.SourcePorts, k)
-				}
-			}
-			for _, portNode := range child.Children {
-				if len(portNode.Keys) >= 1 {
-					term.SourcePorts = append(term.SourcePorts, portNode.Keys[0])
-				}
-			}
+			term.SourcePorts = append(term.SourcePorts, firewallMatchValues(child)...)
 		case "icmp-type":
 			for _, v := range firewallMatchValues(child) {
 				if n, err := strconv.Atoi(v); err == nil {
@@ -323,16 +291,7 @@ func compileFilterFrom(node *Node, term *FirewallFilterTerm) {
 			}
 		case "tcp-flags":
 			// Can be bracket list or single value: tcp-flags "syn ack" or [ syn ack ]
-			if len(child.Keys) >= 2 {
-				for _, k := range child.Keys[1:] {
-					term.TCPFlags = append(term.TCPFlags, k)
-				}
-			}
-			for _, flagNode := range child.Children {
-				if len(flagNode.Keys) >= 1 {
-					term.TCPFlags = append(term.TCPFlags, flagNode.Keys[0])
-				}
-			}
+			term.TCPFlags = append(term.TCPFlags, firewallMatchValues(child)...)
 		case "is-fragment":
 			term.IsFragment = true
 		case "flexible-match-range":
