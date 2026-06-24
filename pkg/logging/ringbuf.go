@@ -383,6 +383,22 @@ func (er *EventReader) ProcessRawEvent(data []byte) bool {
 	return true
 }
 
+// eventTimeFromWire converts an on-wire RT_FLOW timestamp into the
+// EventRecord.Time the logging path should record. The wire timestamp is an
+// absolute Unix value in NANOSECONDS, emitted by the userspace-dp producer at
+// the moment the forwarding decision was made (#2465/#2470). When it is
+// present (nonzero) and fits an int64, use it so the logged record reflects
+// DECISION time rather than receive time. A zero/absent timestamp (an
+// old-format frame or a synthesized event) or one that would overflow int64
+// falls back to time.Now(). This is the single source of truth shared by
+// logEvent (the live ProcessRawEvent path) and DecodeRawEventRecord.
+func eventTimeFromWire(wireTS uint64) time.Time {
+	if wireTS > 0 && wireTS <= uint64(1<<63-1) {
+		return time.Unix(0, int64(wireTS))
+	}
+	return time.Now()
+}
+
 func (er *EventReader) logEvent(data []byte) {
 	var evt rawEvent
 	evt.Timestamp = binary.LittleEndian.Uint64(data[0:8])
@@ -432,9 +448,12 @@ func (er *EventReader) logEvent(data []byte) {
 	actionStr := actionName(evt.Action)
 	protoStr := protoName(evt.Protocol)
 
-	// Build EventRecord
+	// Build EventRecord. #2511: honor the on-wire decision-time stamp via the
+	// shared eventTimeFromWire guard (falls back to time.Now() when absent) so
+	// the live ProcessRawEvent path records the same DECISION time that
+	// DecodeRawEventRecord already does, completing the #2470 producer pair.
 	rec := EventRecord{
-		Time:        time.Now(),
+		Time:        eventTimeFromWire(evt.Timestamp),
 		Type:        eventName,
 		SrcAddr:     srcStr,
 		DstAddr:     dstStr,
@@ -725,7 +744,7 @@ func DecodeRawEventRecord(data []byte) (EventRecord, bool) {
 	}
 
 	rec := EventRecord{
-		Time:            time.Now(),
+		Time:            eventTimeFromWire(evt.Timestamp),
 		Type:            eventTypeName(evt.EventType),
 		SrcAddr:         srcStr,
 		DstAddr:         dstStr,
@@ -757,9 +776,6 @@ func DecodeRawEventRecord(data []byte) (EventRecord, bool) {
 		} else if evt.CloseReason != closeReasonNone {
 			rec.Reason = closeReasonName(evt.CloseReason)
 		}
-	}
-	if evt.Timestamp > 0 && evt.Timestamp <= uint64(1<<63-1) {
-		rec.Time = time.Unix(0, int64(evt.Timestamp))
 	}
 	if evt.EventType == eventTypeScreenDrop {
 		rec.ScreenCheck = screenFlagName(evt.PolicyID)
