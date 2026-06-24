@@ -132,6 +132,41 @@ func TestNumWidth_Tier2_SessionTimeouts(t *testing.T) {
 	}
 }
 
+// TestSessionTimeout_2441_CommitGate is the #2441 operator-facing reject pin.
+// The Rust SessionTimeouts::from_seconds saturates seconds→ns at
+// MAX_SESSION_TIMEOUT_SECS (== config.MaxDurationSeconds) as the runtime
+// backstop; this Go gate is the load-bearing in-band reject so an absurd
+// configured timeout is refused at commit with a clear error rather than
+// silently saturated at runtime. fail-on-revert: drop the
+// ValidateInteger(0, MaxDurationSeconds) bound from any of these leaves (set
+// it to ValidateIntegerMin(0) / no upper bound) and the matching reject
+// assertion below goes red.
+func TestSessionTimeout_2441_CommitGate(t *testing.T) {
+	over := "9223372037" // config.MaxDurationSeconds + 1 — the first seconds
+	// value whose secs*1e9 product overflows i64/u64.
+	atMax := "9223372036" // exactly config.MaxDurationSeconds — accepted.
+
+	// All three timeouts that reach Rust from_seconds: established (TCP), udp,
+	// icmp. Each rejects over-max at commit and accepts the exact max.
+	rangeReject(t, "established-timeout",
+		"set security flow tcp-session established-timeout "+over)
+	rangeAccept(t, "set security flow tcp-session established-timeout "+atMax)
+
+	rangeReject(t, "timeout", "set security flow udp-session timeout "+over)
+	rangeAccept(t, "set security flow udp-session timeout "+atMax)
+
+	rangeReject(t, "timeout", "set security flow icmp-session timeout "+over)
+	rangeAccept(t, "set security flow icmp-session timeout "+atMax)
+
+	// The gate's max MUST equal the documented Rust MAX_SESSION_TIMEOUT_SECS
+	// contract; if MaxDurationSeconds ever drifts the two layers diverge.
+	if config.MaxDurationSeconds != 9223372036 {
+		t.Fatalf("MaxDurationSeconds drifted from the #2441 contract value "+
+			"(must equal Rust MAX_SESSION_TIMEOUT_SECS = i64::MAX/1e9 = "+
+			"9223372036): got %d", config.MaxDurationSeconds)
+	}
+}
+
 // --- Tier 2: sampling input rate (u32) — Q3 = [0, u32max], accept 0 ---
 
 func TestNumWidth_Tier2_SamplingRate(t *testing.T) {
