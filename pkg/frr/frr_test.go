@@ -1237,6 +1237,89 @@ func TestBGPAddressFamily(t *testing.T) {
 	}
 }
 
+// TestBGPDualStackGroupActivatesByAddressVersion is the end-to-end fail-on-
+// revert guard for #2454: a dual-stack BGP group (family inet AND inet6) with
+// one IPv4 and one IPv6 neighbor, compiled from config then rendered to FRR,
+// must activate the IPv4 neighbor ONLY under address-family ipv4 unicast and
+// the IPv6 neighbor ONLY under ipv6 unicast. Before the compiler address-
+// version gate, the IPv4 neighbor was activated under ipv6 unicast too —
+// invalid without RFC 5549 extended-nexthop, which breaks AF activation.
+func TestBGPDualStackGroupActivatesByAddressVersion(t *testing.T) {
+	tree := &config.ConfigTree{}
+	setCommands := []string{
+		"set protocols bgp local-as 65001",
+		"set protocols bgp group dual peer-as 65002",
+		"set protocols bgp group dual family inet unicast",
+		"set protocols bgp group dual family inet6 unicast",
+		"set protocols bgp group dual neighbor 10.0.0.2",
+		"set protocols bgp group dual neighbor 2001:db8::2",
+	}
+	for _, cmd := range setCommands {
+		path, err := config.ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%q): %v", cmd, err)
+		}
+	}
+	cfg, err := config.CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+
+	m := New()
+	got := m.generateProtocols(nil, nil, cfg.Protocols.BGP, nil, nil, "", 0, nil)
+
+	// Walk the rendered output tracking which address-family block each
+	// `activate` line falls in.
+	var af string
+	sawV4inV4, sawV6inV6, v4inV6, v6inV4 := false, false, false, false
+	for _, line := range strings.Split(got, "\n") {
+		trimmed := strings.TrimSpace(line)
+		switch {
+		case strings.HasPrefix(trimmed, "address-family ipv4"):
+			af = "v4"
+		case strings.HasPrefix(trimmed, "address-family ipv6"):
+			af = "v6"
+		case trimmed == "exit-address-family":
+			af = ""
+		}
+		if !strings.HasSuffix(trimmed, " activate") {
+			continue
+		}
+		switch {
+		case strings.Contains(trimmed, "10.0.0.2"):
+			if af == "v4" {
+				sawV4inV4 = true
+			}
+			if af == "v6" {
+				v4inV6 = true
+			}
+		case strings.Contains(trimmed, "2001:db8::2"):
+			if af == "v6" {
+				sawV6inV6 = true
+			}
+			if af == "v4" {
+				v6inV4 = true
+			}
+		}
+	}
+
+	if !sawV4inV4 {
+		t.Error("IPv4 neighbor 10.0.0.2 must be activated under address-family ipv4 unicast")
+	}
+	if !sawV6inV6 {
+		t.Error("IPv6 neighbor 2001:db8::2 must be activated under address-family ipv6 unicast")
+	}
+	if v4inV6 {
+		t.Errorf("#2454: IPv4 neighbor 10.0.0.2 must NOT be activated under address-family ipv6 unicast\n%s", got)
+	}
+	if v6inV4 {
+		t.Errorf("IPv6 neighbor 2001:db8::2 must NOT be activated under address-family ipv4 unicast\n%s", got)
+	}
+}
+
 func TestGenerateProtocols_ECMPMaxPaths(t *testing.T) {
 	m := New()
 	bgp := &config.BGPConfig{

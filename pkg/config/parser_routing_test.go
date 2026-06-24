@@ -948,8 +948,13 @@ func TestBGPGroupExportFamily(t *testing.T) {
 	if !n.FamilyInet {
 		t.Error("neighbor should have FamilyInet=true")
 	}
-	if !n.FamilyInet6 {
-		t.Error("neighbor should have FamilyInet6=true")
+	// #2454: a bare IPv4 neighbor in a dual-stack group inherits ONLY the
+	// inet family. Inheriting FamilyInet6 made the renderer emit
+	// `neighbor 10.1.0.1 activate` under `address-family ipv6 unicast`,
+	// which is invalid without RFC 5549 extended-nexthop. This assertion is
+	// a fail-on-revert anchor for the address-version gate.
+	if n.FamilyInet6 {
+		t.Error("IPv4 neighbor must NOT inherit group FamilyInet6 (#2454)")
 	}
 	if len(n.Export) != 1 || n.Export[0] != "my-export-policy" {
 		t.Errorf("neighbor export = %v, want [my-export-policy]", n.Export)
@@ -1927,8 +1932,12 @@ func TestBGPPrefixLimitSetSyntax(t *testing.T) {
 	if !n.FamilyInet {
 		t.Error("FamilyInet should be true")
 	}
-	if !n.FamilyInet6 {
-		t.Error("FamilyInet6 should be true")
+	// #2454: 10.0.0.2 is an IPv4 address, so it must NOT inherit the group's
+	// inet6 family flag (that would activate it under ipv6 unicast, invalid
+	// without RFC 5549). The inherited PrefixLimitInet6 below stays populated
+	// but is inert because FamilyInet6 is false.
+	if n.FamilyInet6 {
+		t.Error("IPv4 neighbor must NOT inherit group FamilyInet6 (#2454)")
 	}
 	if n.PrefixLimitInet != 1000 {
 		t.Errorf("PrefixLimitInet = %d, want 1000", n.PrefixLimitInet)
@@ -3469,5 +3478,149 @@ func TestPolicyTermMultiProtocolSeparateSetCommands(t *testing.T) {
 	}
 	if ps.Terms[0].Action != "accept" {
 		t.Errorf("action = %q, want accept", ps.Terms[0].Action)
+	}
+}
+
+// TestBGPGroupFamilyGatedByNeighborAddressVersion is the fail-on-revert guard
+// for #2454: group-level address-family flags must be gated by each neighbor's
+// own address version when inherited. A dual-stack group (family inet AND
+// family inet6) must NOT mark a bare IPv4 neighbor FamilyInet6 (which made the
+// renderer emit `neighbor <ipv4> activate` under `address-family ipv6 unicast`
+// — invalid without RFC 5549 extended-nexthop), nor a bare IPv6 neighbor
+// FamilyInet. Revert the address-version gate in compiler_protocols.go and the
+// FamilyInet6/FamilyInet assertions below flip and fail.
+func TestBGPGroupFamilyGatedByNeighborAddressVersion(t *testing.T) {
+	tree := &ConfigTree{}
+	setCommands := []string{
+		"set protocols bgp local-as 65001",
+		"set protocols bgp group dual peer-as 65002",
+		"set protocols bgp group dual family inet unicast",
+		"set protocols bgp group dual family inet6 unicast",
+		"set protocols bgp group dual neighbor 10.0.0.2",
+		"set protocols bgp group dual neighbor 2001:db8::2",
+	}
+	for _, cmd := range setCommands {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%q): %v", cmd, err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	if cfg.Protocols.BGP == nil {
+		t.Fatal("BGP config is nil")
+	}
+	var v4, v6 *BGPNeighbor
+	for _, n := range cfg.Protocols.BGP.Neighbors {
+		switch n.Address {
+		case "10.0.0.2":
+			v4 = n
+		case "2001:db8::2":
+			v6 = n
+		}
+	}
+	if v4 == nil {
+		t.Fatal("missing IPv4 neighbor 10.0.0.2")
+	}
+	if v6 == nil {
+		t.Fatal("missing IPv6 neighbor 2001:db8::2")
+	}
+
+	// IPv4 neighbor inherits ONLY the group's inet flag.
+	if !v4.FamilyInet {
+		t.Error("IPv4 neighbor should inherit group FamilyInet")
+	}
+	if v4.FamilyInet6 {
+		t.Error("IPv4 neighbor must NOT inherit group FamilyInet6 (#2454: invalid v6-unicast activation of an IPv4 address)")
+	}
+
+	// IPv6 neighbor inherits ONLY the group's inet6 flag.
+	if !v6.FamilyInet6 {
+		t.Error("IPv6 neighbor should inherit group FamilyInet6")
+	}
+	if v6.FamilyInet {
+		t.Error("IPv6 neighbor must NOT inherit group FamilyInet (#2454: invalid v4-unicast activation of an IPv6 address)")
+	}
+}
+
+// TestBGPGroupFamilyV4OnlyNoOverGate guards against over-gating: a v4-only
+// group with an IPv4 neighbor must still keep the v4 family so the renderer
+// activates it under ipv4-unicast — the no-over-gate regression check from
+// #2454 (agy-10 was refuted: FRR default ipv4-unicast covers a family-less
+// neighbor, but an explicit family inet group must still surface FamilyInet).
+func TestBGPGroupFamilyV4OnlyNoOverGate(t *testing.T) {
+	tree := &ConfigTree{}
+	setCommands := []string{
+		"set protocols bgp local-as 65001",
+		"set protocols bgp group up peer-as 65002",
+		"set protocols bgp group up family inet unicast",
+		"set protocols bgp group up neighbor 10.0.0.2",
+	}
+	for _, cmd := range setCommands {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%q): %v", cmd, err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	if cfg.Protocols.BGP == nil || len(cfg.Protocols.BGP.Neighbors) != 1 {
+		t.Fatalf("expected 1 BGP neighbor, got %+v", cfg.Protocols.BGP)
+	}
+	n := cfg.Protocols.BGP.Neighbors[0]
+	if !n.FamilyInet {
+		t.Error("v4-only group: IPv4 neighbor must keep FamilyInet (no over-gate)")
+	}
+	if n.FamilyInet6 {
+		t.Error("v4-only group: IPv4 neighbor must not have FamilyInet6")
+	}
+}
+
+// TestBGPGroupFamilyUnparseableAddressInheritsBoth documents the edge-case
+// choice from #2454: a neighbor whose address is not a literal IP (a hostname
+// or peer-group template) cannot be classified by version, so it preserves the
+// pre-#2454 behavior of inheriting BOTH group family flags rather than silently
+// dropping a family. The compiler must NOT crash on the unparseable address.
+func TestBGPGroupFamilyUnparseableAddressInheritsBoth(t *testing.T) {
+	tree := &ConfigTree{}
+	setCommands := []string{
+		"set protocols bgp local-as 65001",
+		"set protocols bgp group dual peer-as 65002",
+		"set protocols bgp group dual family inet unicast",
+		"set protocols bgp group dual family inet6 unicast",
+		"set protocols bgp group dual neighbor peer.example.com",
+	}
+	for _, cmd := range setCommands {
+		path, err := ParseSetCommand(cmd)
+		if err != nil {
+			t.Fatalf("ParseSetCommand(%q): %v", cmd, err)
+		}
+		if err := tree.SetPath(path); err != nil {
+			t.Fatalf("SetPath(%q): %v", cmd, err)
+		}
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	if cfg.Protocols.BGP == nil || len(cfg.Protocols.BGP.Neighbors) != 1 {
+		t.Fatalf("expected 1 BGP neighbor, got %+v", cfg.Protocols.BGP)
+	}
+	n := cfg.Protocols.BGP.Neighbors[0]
+	if n.Address != "peer.example.com" {
+		t.Fatalf("unexpected neighbor address %q", n.Address)
+	}
+	if !n.FamilyInet || !n.FamilyInet6 {
+		t.Errorf("unparseable address should inherit BOTH group families, got inet=%v inet6=%v", n.FamilyInet, n.FamilyInet6)
 	}
 }

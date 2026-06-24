@@ -12865,3 +12865,28 @@ top.
   next emission makes term 1 terminating in FRR, term 2 never runs →
   TestGeneratePolicyOptions_MultiTermOnMatchNext fails (the terminating-term
   guard still passes). No Rust changed.
+
+## 2026-06-24 — #2454 BGP group address-family flags gated by neighbor address version
+
+- **Timestamp**: 2026-06-24
+- **Action**: Fix #2454 (MED, agy review-033 finding 15). BGP group-level
+  `family inet`/`family inet6` flags were copied to EVERY neighbor in the
+  group regardless of the neighbor's IP version. A dual-stack group set both
+  FamilyInet and FamilyInet6 on a bare IPv4 neighbor → renderer emitted
+  `neighbor <ipv4> activate` under `address-family ipv6 unicast`, invalid
+  without RFC 5549 extended-nexthop (no such knob in the config model) →
+  broke the peer's AF activation.
+- **Fix**: In compiler_protocols.go, parse the neighbor address
+  (`net.ParseIP`) when inheriting group family flags; an IPv4 address gets
+  only FamilyInet, an IPv6 address only FamilyInet6. Unparseable address
+  (hostname/template) preserves pre-#2454 behavior (inherits both, no crash).
+  Per-neighbor explicit `family` clause stays operator-authoritative.
+- **File(s)**: pkg/config/compiler_protocols.go (gate),
+  pkg/config/parser_routing_test.go (3 new fail-on-revert tests +
+  corrected TestBGPGroupExportFamily / TestBGPPrefixLimitSetSyntax which
+  encoded the bug), pkg/frr/frr_test.go (end-to-end compile→render
+  fail-on-revert test), pkg/frr/README.md (gate doc), _Log.md.
+- **Validation**: go build ./... OK; go test ./pkg/config/ ./pkg/frr/ PASS;
+  gofmt clean; go vet clean. Fail-on-revert PROVEN — neutralizing the gate
+  makes the IPv4 neighbor appear under `address-family ipv6 unicast` and the
+  new tests fail. Go-only, no Rust touched.
