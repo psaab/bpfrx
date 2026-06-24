@@ -1207,10 +1207,21 @@ func (m *Manager) generatePolicyOptions(po *config.PolicyOptionsConfig) string {
 			// then actions
 			if term.NextHop != "" {
 				if term.NextHop == "peer-address" {
-					// Junos "next-hop peer-address" → FRR "set ip next-hop peer-address"
+					// Junos "next-hop peer-address" → FRR. The session AF is not
+					// known here, so emit both forms; FRR applies each only to
+					// the matching address family of the carrying BGP session.
 					fmt.Fprintf(&b, " set ip next-hop peer-address\n")
+					fmt.Fprintf(&b, " set ipv6 next-hop peer-address\n")
 				} else if term.NextHop == "self" {
-					// Junos "next-hop self" → FRR "set ip next-hop self" (eBGP default)
+					// Junos "next-hop self" → no FRR set-clause. eBGP already
+					// rewrites the next-hop to self by default, so FRR needs no
+					// explicit "set" here.
+				} else if strings.Contains(term.NextHop, ":") {
+					// IPv6 literal next-hop. FRR rejects "set ip next-hop" for a
+					// v6 address (whole route-map fails to parse); v6 uses the
+					// dedicated "set ipv6 next-hop global" form. Mirror the
+					// AF detection used by the prefix-list renderer above.
+					fmt.Fprintf(&b, " set ipv6 next-hop global %s\n", term.NextHop)
 				} else {
 					fmt.Fprintf(&b, " set ip next-hop %s\n", term.NextHop)
 				}

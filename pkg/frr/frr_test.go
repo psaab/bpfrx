@@ -3052,9 +3052,14 @@ func TestNextHopPeerAddress(t *testing.T) {
 	}
 	got := m.generatePolicyOptions(po)
 
-	// "next-hop peer-address" in Junos should map to "set ip next-hop peer-address" in FRR
+	// "next-hop peer-address" in Junos should map to BOTH the v4 and v6
+	// peer-address forms in FRR. The session AF is unknown at render time,
+	// so both lines are emitted and FRR applies each to the matching family.
 	if !strings.Contains(got, "set ip next-hop peer-address") {
 		t.Errorf("missing 'set ip next-hop peer-address' in:\n%s", got)
+	}
+	if !strings.Contains(got, "set ipv6 next-hop peer-address") {
+		t.Errorf("missing 'set ipv6 next-hop peer-address' in:\n%s", got)
 	}
 
 	// Verify route-filter exact generates proper prefix-list
@@ -3083,6 +3088,68 @@ func TestNextHopPeerAddress(t *testing.T) {
 	got2 := m.generatePolicyOptions(po2)
 	if strings.Contains(got2, "set ip next-hop") {
 		t.Errorf("next-hop self should NOT generate set ip next-hop, got:\n%s", got2)
+	}
+}
+
+// TestNextHopAddressFamily verifies that a literal next-hop is rendered with
+// the FRR set-clause matching its address family. An IPv6 literal MUST use
+// "set ipv6 next-hop global" — FRR rejects "set ip next-hop <v6>" with a
+// syntax error that fails the entire route-map parse (#2403). An IPv4 literal
+// keeps the existing "set ip next-hop" form.
+func TestNextHopAddressFamily(t *testing.T) {
+	m := New()
+	po := &config.PolicyOptionsConfig{
+		PrefixLists: make(map[string]*config.PrefixList),
+		Communities: make(map[string]*config.CommunityDef),
+		ASPaths:     make(map[string]*config.ASPathDef),
+		PolicyStatements: map[string]*config.PolicyStatement{
+			"v6-nh": {
+				Name: "v6-nh",
+				Terms: []*config.PolicyTerm{
+					{
+						Name:    "t1",
+						NextHop: "2001:db8::1",
+						Action:  "accept",
+					},
+				},
+			},
+		},
+	}
+	got := m.generatePolicyOptions(po)
+
+	// IPv6 literal must use the dedicated v6 form.
+	if !strings.Contains(got, "set ipv6 next-hop global 2001:db8::1") {
+		t.Errorf("missing 'set ipv6 next-hop global 2001:db8::1' in:\n%s", got)
+	}
+	// And must NOT emit the v4 clause for a v6 address — FRR would reject it.
+	if strings.Contains(got, "set ip next-hop 2001:db8::1") {
+		t.Errorf("v6 next-hop wrongly rendered as 'set ip next-hop', got:\n%s", got)
+	}
+
+	// IPv4 literal keeps the v4 form (and must not gain a v6 clause).
+	po2 := &config.PolicyOptionsConfig{
+		PrefixLists: make(map[string]*config.PrefixList),
+		Communities: make(map[string]*config.CommunityDef),
+		ASPaths:     make(map[string]*config.ASPathDef),
+		PolicyStatements: map[string]*config.PolicyStatement{
+			"v4-nh": {
+				Name: "v4-nh",
+				Terms: []*config.PolicyTerm{
+					{
+						Name:    "t1",
+						NextHop: "10.0.0.1",
+						Action:  "accept",
+					},
+				},
+			},
+		},
+	}
+	got2 := m.generatePolicyOptions(po2)
+	if !strings.Contains(got2, "set ip next-hop 10.0.0.1") {
+		t.Errorf("missing 'set ip next-hop 10.0.0.1' in:\n%s", got2)
+	}
+	if strings.Contains(got2, "set ipv6 next-hop") {
+		t.Errorf("v4 next-hop wrongly emitted a v6 clause, got:\n%s", got2)
 	}
 }
 
