@@ -123,58 +123,13 @@ func validateRPMSourceAddressStrict(cfg *Config) error {
 	return nil
 }
 
-// validateRPMScopedHostnameStrict rejects a HOSTNAME target on a SCOPED
-// RPM test (#2493). A scoped test (routing-instance, destination-interface,
-// or next-hop pin) binds its probe DATA socket to a specific VRF / egress
-// device (SO_BINDTODEVICE) or path (SO_MARK), but hostname resolution runs
-// through the process-default resolver / table / source: the bind is
-// applied in the per-connection Control hook, which fires AFTER name
-// resolution. With split-horizon / per-WAN DNS the probe then measures
-// resolver context, not path health, and can publish a false PASS/FAIL
-// into event-options / ip-monitoring failover.
-//
-// An IP-literal target needs no resolution and is unaffected. A hostname
-// on an UNSCOPED (default-context) test resolves in the same context it
-// probes and is allowed (today's behavior, no regression). The full fix —
-// a VRF-aware resolver binding the DNS socket to the scope device and
-// using the instance's resolv context — is a larger feature, deferred and
-// recorded in docs/multi-wan.md; until then the safe, shippable increment
-// is to refuse the silently-wrong combination at commit so an operator
-// cannot configure a scoped hostname probe that lies about path health.
-//
-// Strict on commit / commit-check (hard reject so the typo is
-// operator-visible); lenient on load / peer-sync (warn — #1960 no-brick;
-// the runtime executeProbe guard returns ErrProbeSetup for the same
-// combination, so a leniently-loaded test HOLDS state instead of actuating
-// routes off a mis-scoped measurement). Mirrors
-// validateRPMSourceAddressStrict.
-func validateRPMScopedHostnameStrict(cfg *Config) error {
-	if cfg == nil || cfg.Services.RPM == nil {
-		return nil
-	}
-	for _, probe := range cfg.Services.RPM.Probes {
-		if probe == nil {
-			continue
-		}
-		for _, test := range probe.Tests {
-			if test == nil || !test.IsScoped() {
-				continue
-			}
-			// Empty target is caught by validateRPMTest; an IP-literal
-			// target needs no DNS, so neither leaks the scope.
-			if test.Target == "" || net.ParseIP(test.Target) != nil {
-				continue
-			}
-			return fmt.Errorf(
-				"services rpm probe %q test %q: target %q is a hostname on a scoped test "+
-					"(routing-instance/destination-interface/next-hop); DNS is not VRF/device-scoped, "+
-					"so the probe would resolve out-of-context and measure resolver health instead of "+
-					"path health — use an IP-literal target",
-				probe.Name, test.Name, test.Target)
-		}
-	}
-	return nil
-}
+// #2614: the #2493 validateRPMScopedHostnameStrict gate (which rejected a
+// hostname target on a scoped RPM test) was REMOVED. The runtime resolver
+// now binds the DNS socket to the probe's VRF/path scope
+// (rpm.resolveProbeTarget / probeDialer.Resolver use the same
+// SO_BINDTODEVICE / SO_MARK as the probe socket), so a scoped hostname
+// resolves in-context and is a legitimate configuration. See
+// docs/multi-wan.md.
 
 // validateRPMLinkLocalZoneStrict rejects an IPv6 link-local RPM target
 // that carries no scope (#2494). A link-local destination (fe80::/10) is
@@ -190,17 +145,16 @@ func validateRPMScopedHostnameStrict(cfg *Config) error {
 // Only IP-literal targets are checked: net.ParseIP rejects a zoned
 // literal so the zone is split off by hand first (no DNS at commit). A
 // hostname resolving to a link-local cannot be caught here (resolution is
-// runtime); a scoped hostname is already refused by
-// validateRPMScopedHostnameStrict, and an unscoped hostname that resolves
-// to a link-local would fail at runtime with ErrProbeSetup (the same
-// missing-zone error in probeICMP). routing-instance / next-hop scopes do
+// runtime); a hostname that resolves to a bare link-local would fail at
+// runtime with ErrProbeSetup (the same missing-zone error in probeICMP).
+// routing-instance / next-hop scopes do
 // NOT supply a link scope (a VRF master device / fwmark route is not an
 // egress link for fe80::), so only destination-interface satisfies the
 // requirement. Strict on commit / commit-check (hard reject so the gap is
 // operator-visible); lenient on load / peer-sync (warn — #1960 no-brick;
 // the runtime probeICMP guard returns ErrProbeSetup for the same bare
 // link-local, so a leniently-loaded test HOLDS state instead of actuating
-// routes off a dead measurement). Mirrors validateRPMScopedHostnameStrict.
+// routes off a dead measurement). Mirrors validateRPMSourceAddressStrict.
 func validateRPMLinkLocalZoneStrict(cfg *Config) error {
 	if cfg == nil || cfg.Services.RPM == nil {
 		return nil

@@ -589,12 +589,13 @@ type RPMTest struct {
 // specific VRF / egress device / next-hop path — i.e. probeOpts would set
 // SO_BINDTODEVICE (from destination-interface, or the routing-instance VRF
 // device) or SO_MARK (from a next-hop pin). A scoped test measures a
-// SPECIFIC path, so a hostname target must resolve in that path's context;
-// the process-default resolver does not, since name resolution happens
-// before the per-connection bind (#2493). Kept here as the single source
-// of truth so the commit-time gate (validateRPMScopedHostnameStrict) and
-// the runtime guard (rpm.Manager.executeProbe) agree on what "scoped"
-// means.
+// SPECIFIC path, so a hostname target must resolve in that path's context.
+// Since #2614 the runtime resolver does exactly that — it binds the DNS
+// socket to the same SO_BINDTODEVICE / SO_MARK as the probe socket
+// (rpm.resolveProbeTarget / probeDialer.Resolver) — so a scoped hostname
+// resolves in-context (the #2493 commit gate that previously refused this
+// combination was removed). This predicate is retained as the shared
+// definition of "scoped".
 func (t *RPMTest) IsScoped() bool {
 	if t == nil {
 		return false
