@@ -687,15 +687,21 @@ func validateRoutingExportReferencesStrict(cfg *Config) error {
 		return nil
 	}
 
-	// checkPolicyRef validates an export list that renders directly as a
+	// checkPolicyRef validates a reference that renders directly as a
 	// route-map / ECMP policy name: only a defined policy-statement is valid.
-	checkPolicyRef := func(detail, name string) error {
+	// hint is the trailing remediation text — direction-aware so an import
+	// failure does not say "fix the export name" (Copilot review, #2490).
+	checkPolicyRef := func(detail, name, hint string) error {
 		if name == "" || defined(name) {
 			return nil
 		}
 		return fmt.Errorf("%s references undefined policy-statement %q; %s",
-			detail, name, "define the policy-statement or fix the export name")
+			detail, name, hint)
 	}
+	const (
+		hintExport = "define the policy-statement or fix the export name"
+		hintImport = "define the policy-statement or fix the import name"
+	)
 
 	checkProtocols := func(scope string, ospf *OSPFConfig, ospfv3 *OSPFv3Config, bgp *BGPConfig, rip *RIPConfig, isis *ISISConfig) error {
 		if ospf != nil {
@@ -722,8 +728,23 @@ func validateRoutingExportReferencesStrict(cfg *Config) error {
 			if err := checkRedist(scope, "protocols bgp", bgp.Export); err != nil {
 				return err
 			}
+			// A global `protocols bgp import` renders `route-map <name> in`.
+			// Unlike export, import has NO redistribute equivalent — inbound
+			// filtering is route-map-only — so it must name a DEFINED
+			// policy-statement (no protocol-token fallback). An undefined ref
+			// would render a dangling `route-map in` that FRR resolves to
+			// PERMIT-ALL, accepting every inbound advertisement and defeating
+			// the operator's filter (#2490, the #2473 lesson on the inbound
+			// direction). #2490.
+			for _, e := range bgp.Import {
+				detail := fmt.Sprintf("%sprotocols bgp import", scope)
+				if err := checkPolicyRef(detail, e, hintImport); err != nil {
+					return err
+				}
+			}
 			// A BGP group/neighbor export renders `route-map <name> out`,
-			// so it must be a defined policy-statement (no protocol-token
+			// and a group/neighbor import renders `route-map <name> in`, so
+			// both must be defined policy-statements (no protocol-token
 			// fallback). Sort neighbor addresses for a deterministic
 			// first-error message.
 			neighbors := append([]*BGPNeighbor(nil), bgp.Neighbors...)
@@ -739,7 +760,16 @@ func validateRoutingExportReferencesStrict(cfg *Config) error {
 					if n.GroupName != "" {
 						detail = fmt.Sprintf("%sprotocols bgp group %s neighbor %s export", scope, n.GroupName, n.Address)
 					}
-					if err := checkPolicyRef(detail, e); err != nil {
+					if err := checkPolicyRef(detail, e, hintExport); err != nil {
+						return err
+					}
+				}
+				for _, e := range n.Import {
+					detail := fmt.Sprintf("%sprotocols bgp neighbor %s import", scope, n.Address)
+					if n.GroupName != "" {
+						detail = fmt.Sprintf("%sprotocols bgp group %s neighbor %s import", scope, n.GroupName, n.Address)
+					}
+					if err := checkPolicyRef(detail, e, hintImport); err != nil {
 						return err
 					}
 				}
@@ -770,6 +800,7 @@ func validateRoutingExportReferencesStrict(cfg *Config) error {
 	if err := checkPolicyRef(
 		"routing-options forwarding-table export",
 		cfg.RoutingOptions.ForwardingTableExport,
+		hintExport,
 	); err != nil {
 		return fmt.Errorf("%s (the expected ECMP / consistent-hash "+
 			"load-balancing would be silently disabled)", err)

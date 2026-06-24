@@ -145,6 +145,35 @@ move or rename the markers — they're literal strings.
   redistribute verb, not per-neighbor, emitted once under `router bgp`.
   `resolveRedistribute` is still called on the BGP export path, but ONLY
   for bare tokens — never for a policy-statement name (that was the leak).
+  Both `route-map out` emit sites (ipv4 + ipv6 AF) are guarded by
+  `isDefinedPolicyStatement` (#2539, sibling of the #2490 inbound guard):
+  `globalExport` is already restricted to defined policy-statements, but a
+  per-neighbor `export` (parseable as of #2490) can carry a bare token or an
+  undefined ref that slipped the strict validator on the lenient load/HA-sync
+  path. The guard skips it (fail-closed) instead of emitting a dangling
+  `route-map out` = FRR permit-all OUTBOUND. Bare tokens never reach here as a
+  defined name, so the bare-token→redistribute path is unchanged.
+- **`protocols bgp ... import <policy>` renders inbound `route-map in`
+  (#2490).** BGP neighbors/groups now carry an `Import []string` symmetric
+  to `Export`. A global `protocols bgp import`, a group `import`, and a
+  per-neighbor `import` are parsed (`compiler_protocols.go`) and rendered as
+  `neighbor <X> route-map <name> in` per neighbor/address-family
+  (`bgpEffectiveImport` + `lastNonEmpty`, symmetric to `bgpEffectiveExport`).
+  Before #2490 the `import` clause parsed to NOTHING — inbound route
+  filtering on a BGP peer was a silent no-op. **Coexistence (most-specific-
+  wins):** a per-neighbor import overrides the group/global default import;
+  FRR accepts exactly one `route-map in` per neighbor/AF, so the neighbor's
+  own policy wins when present. **#2473-lesson guard (inbound direction):**
+  unlike export, import has NO redistribute equivalent — inbound filtering is
+  route-map-only — so an import ref MUST name a DEFINED policy-statement. An
+  undefined/bare-token ref is REJECTED at commit (`checkPolicyRef` in
+  `validateRoutingExportReferencesStrict`, strict) and SKIPPED on the lenient
+  load/HA-sync path (the render guards with `isDefinedPolicyStatement` before
+  emitting `route-map <name> in`). Rendering a dangling `route-map <token>
+  in` would resolve to PERMIT-ALL in FRR — accepting every inbound
+  advertisement and defeating the operator's filter (the #2473 leak, inbound
+  side). The referenced route-map is the same block `generatePolicyOptions`
+  already emits for the policy-statement.
 - **`resolveRedistribute` never emits an invalid `redistribute <name>`
   line (#2223).** FRR's `redistribute` requires a source-protocol token
   (`connected`/`static`/`ospf`/`bgp`/`rip`/`isis`/`kernel`); a bare

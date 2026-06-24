@@ -169,6 +169,105 @@ func TestBGPNeighborExportDefinedPolicyAccepted(t *testing.T) {
 	}
 }
 
+// --- BGP group/neighbor import (#2490): renders `route-map <name> in`.
+// Inbound filtering is route-map-only — there is NO redistribute equivalent —
+// so an import ref MUST be a defined policy-statement. An undefined/bare-token
+// ref would render a dangling `route-map in` that FRR resolves to permit-all,
+// accepting every inbound advertisement (the #2473 lesson, inbound side). ---
+
+func TestBGPNeighborImportParsed(t *testing.T) {
+	// Prove the Junos `import` clause is parsed onto the neighbor struct
+	// (before #2490 it parsed to nothing — a silent no-op).
+	tree := buildTreeFromSet(t, []string{
+		"set policy-options policy-statement IN-POL term t1 then accept",
+		"set protocols bgp local-as 65001",
+		"set protocols bgp group ebgp peer-as 65002",
+		"set protocols bgp group ebgp import IN-POL",
+		"set protocols bgp group ebgp neighbor 10.0.2.1",
+	})
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig rejected a defined BGP import policy: %v", err)
+	}
+	if cfg.Protocols.BGP == nil || len(cfg.Protocols.BGP.Neighbors) != 1 {
+		t.Fatalf("expected one BGP neighbor, got %+v", cfg.Protocols.BGP)
+	}
+	n := cfg.Protocols.BGP.Neighbors[0]
+	found := false
+	for _, im := range n.Import {
+		if im == "IN-POL" {
+			found = true
+		}
+	}
+	if !found {
+		t.Errorf("import clause not parsed onto neighbor; got Import=%v", n.Import)
+	}
+}
+
+func TestBGPNeighborImportTypoRejected(t *testing.T) {
+	tree := buildTreeFromSet(t, []string{
+		"set protocols bgp local-as 65001",
+		"set protocols bgp group ebgp peer-as 65002",
+		"set protocols bgp group ebgp import IN-TYPO",
+		"set protocols bgp group ebgp neighbor 10.0.2.1",
+	})
+	_, err := CompileConfig(tree)
+	if err == nil {
+		t.Fatal("CompileConfig accepted a BGP import with a dangling route-map; expected rejection")
+	}
+	for _, want := range []string{"IN-TYPO", "policy-statement", "import", "10.0.2.1"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q missing %q", err.Error(), want)
+		}
+	}
+}
+
+func TestBGPNeighborImportProtocolTokenRejected(t *testing.T) {
+	// A bare protocol token has NO redistribute equivalent on inbound — it
+	// renders as a route-map name and must be rejected as undefined.
+	tree := buildTreeFromSet(t, []string{
+		"set protocols bgp local-as 65001",
+		"set protocols bgp group ebgp peer-as 65002",
+		"set protocols bgp group ebgp import static",
+		"set protocols bgp group ebgp neighbor 10.0.2.1",
+	})
+	if _, err := CompileConfig(tree); err == nil {
+		t.Fatal("CompileConfig accepted a protocol token as a BGP import route-map name; expected rejection")
+	}
+}
+
+func TestBGPNeighborImportDefinedPolicyAccepted(t *testing.T) {
+	tree := buildTreeFromSet(t, []string{
+		"set policy-options policy-statement IN-POL term t1 then accept",
+		"set protocols bgp local-as 65001",
+		"set protocols bgp group ebgp peer-as 65002",
+		"set protocols bgp group ebgp import IN-POL",
+		"set protocols bgp group ebgp neighbor 10.0.2.1",
+	})
+	if _, err := CompileConfig(tree); err != nil {
+		t.Fatalf("CompileConfig rejected a defined BGP import policy: %v", err)
+	}
+}
+
+func TestBGPImportTypoLenientDowngrade(t *testing.T) {
+	// On the lenient (load / HA peer-sync, #1960) path an undefined import ref
+	// must downgrade to a warning, NOT hard-fail — an already-persisted or
+	// peer-pushed config must still load. The render path then drops the
+	// dangling route-map in (no permit-all leak).
+	cmds := []string{
+		"set protocols bgp local-as 65001",
+		"set protocols bgp group ebgp peer-as 65002",
+		"set protocols bgp group ebgp import IN-TYPO",
+		"set protocols bgp group ebgp neighbor 10.0.2.1",
+	}
+	if _, err := CompileConfigLenient(buildTreeFromSet(t, cmds)); err != nil {
+		t.Fatalf("CompileConfigLenient hard-failed a dangling import ref; must downgrade to warning: %v", err)
+	}
+	if _, err := CompileConfigForNodeLenient(buildTreeFromSet(t, cmds), 0); err != nil {
+		t.Fatalf("CompileConfigForNodeLenient hard-failed a dangling import ref; must downgrade (HA peer-sync): %v", err)
+	}
+}
+
 // --- forwarding-table export: read by resolveECMP. A missing policy
 // silently returns 0 max-paths (ECMP disabled). Only a defined
 // policy-statement is valid. ---
