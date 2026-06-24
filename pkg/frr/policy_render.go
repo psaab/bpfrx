@@ -626,7 +626,21 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 		if len(bfdPeers) > 0 {
 			b.WriteString("bfd\n")
 			for _, n := range bfdPeers {
-				fmt.Fprintf(&b, " peer %s\n", n.Address)
+				// FRR's bfdd is a single top-level daemon: a `peer <addr>`
+				// line with no `vrf` suffix is created in the DEFAULT VRF.
+				// A VRF-scoped BGP session's BFD peer MUST carry the same
+				// `vrf <name>` so bfdd associates the BFD session with the
+				// VRF-bound neighbor; otherwise the session stays DOWN and
+				// sub-second failover never works (#2489). This block is
+				// rendered once per BGP instance (manager.go calls
+				// generateProtocols per-instance), so the in-scope vrfName
+				// is correct for every peer in this block — default-instance
+				// peers (vrfName == "") get no suffix.
+				if vrfName != "" {
+					fmt.Fprintf(&b, " peer %s vrf %s\n", n.Address, vrfName)
+				} else {
+					fmt.Fprintf(&b, " peer %s\n", n.Address)
+				}
 				multiplier := n.BFDMultiplier
 				if multiplier == 0 {
 					multiplier = 3

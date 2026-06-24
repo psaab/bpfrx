@@ -1,5 +1,23 @@
 # Action Log
 
+## 2026-06-24 — #2489 fix: VRF BGP neighbor BFD peer block omitted `vrf <name>`
+
+- **Timestamp**: 2026-06-24 PDT
+- **Action**: The top-level `bfd { peer <addr> }` block rendered for BGP
+  neighbors with BFD enabled omitted the `vrf <name>` suffix for
+  VRF-scoped BGP instances. FRR's single `bfdd` then created the peer in
+  the DEFAULT VRF where it never associated with the VRF-bound BGP
+  session → BFD stayed DOWN → no sub-second failover for VRF BGP peers.
+  Determined the `bfd` block is rendered ONCE PER BGP INSTANCE
+  (manager.go calls generateProtocols per-instance with that instance's
+  vrfName), so the single in-scope vrfName is correct for every peer in
+  the block — no per-peer VRF threading needed. Applied the in-scope
+  vrfName to the peer line; default-instance peers (vrfName == "") keep a
+  bare `peer <addr>`.
+- **File(s)**: pkg/frr/policy_render.go (fix), pkg/frr/frr_test.go
+  (fail-on-revert tests: VRF suffix, default no-suffix, mixed-instances),
+  pkg/frr/README.md (per-instance bfd-block + VRF-peer-suffix note).
+
 ## 2026-06-24 — #2525 review fold: prefix-length-range base-prefix floor off-by-one (FRR-brick)
 
 - **Timestamp**: 2026-06-24 PDT
