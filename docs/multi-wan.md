@@ -51,6 +51,22 @@ set services rpm probe WAN test wan-a thresholds successive-loss 3
   two uplinks" the natural dual-WAN pattern. Limits: at most 50 pinned
   tests; the pinned test needs an IP-literal target of the same family
   and a `destination-interface`.
+- `source-address` selects the probe's source IP (the dialer's
+  `LocalAddr`). It is validated at commit (#2492): a non-empty but
+  unparseable `source-address` is **rejected** on the strict commit /
+  commit-check path — a malformed value would otherwise `net.ParseIP`
+  to nil and silently degrade the tcp-ping/http-get probe to a
+  wildcard/kernel-chosen source bind, so the probe would measure the
+  **default** uplink instead of the source-specific path and publish
+  PASS/FAIL for the wrong uplink. When the target is an IP literal the
+  `source-address` family must match it (a v6 source cannot bind a v4
+  target connection); a hostname target skips the family check (its
+  family is unknown until DNS resolves). An **empty** `source-address`
+  is legitimate — it means "default source". On the tolerant load /
+  peer-sync path the same malformed value is downgraded to a warning so
+  a persisted/peer-synced config still boots (#1960 no-brick); the
+  runtime dialer guard then returns the same setup error, so the test
+  holds state (below) rather than measuring the wrong path.
 - Probe config re-applies on commit, gated on the rendered RPM stanza
   hash — unrelated commits never reset probe state.
 - **Environment errors never move routes**: a probe-socket setup

@@ -22,10 +22,28 @@ import (
 // optional source address, SO_BINDTODEVICE (destination-interface, or
 // the "vrf-"+instance VRF device fallback), and SO_MARK for
 // next-hop-pinned tests (#1827).
-func probeDialer(timeout time.Duration, sourceAddr string, opts probeSockOpts) *net.Dialer {
+//
+// A NON-EMPTY but unparseable source-address is a setup error, not a
+// path signal (#2492): net.ParseIP returns nil, and a TCPAddr{IP:nil}
+// silently degrades to a wildcard/kernel-chosen source bind — the probe
+// would then measure the DEFAULT uplink instead of the source-specific
+// path the operator pinned, publishing PASS/FAIL for the wrong path.
+// The commit-time validator (validateRPMSourceAddressStrict) rejects
+// this on the strict path, but a leniently-loaded or externally-built
+// config can still reach here, so guard defensively and surface
+// ErrProbeSetup. The ICMP path already fails closed via its real
+// listen error; tcp-ping/http-get had no such backstop. An EMPTY
+// source-address stays legitimate (means "default source"): only a
+// non-empty value that will not parse is the error.
+func probeDialer(timeout time.Duration, sourceAddr string, opts probeSockOpts) (*net.Dialer, error) {
 	d := &net.Dialer{Timeout: timeout}
 	if sourceAddr != "" {
-		d.LocalAddr = &net.TCPAddr{IP: net.ParseIP(sourceAddr)}
+		ip := net.ParseIP(sourceAddr)
+		if ip == nil {
+			return nil, fmt.Errorf("%w: invalid source-address %q (would bind wildcard source)",
+				ErrProbeSetup, sourceAddr)
+		}
+		d.LocalAddr = &net.TCPAddr{IP: ip}
 	}
 	if opts.BindDevice != "" || opts.Mark != 0 {
 		d.Control = func(network, address string, c syscall.RawConn) error {
@@ -62,7 +80,7 @@ func probeDialer(timeout time.Duration, sourceAddr string, opts probeSockOpts) *
 			return err
 		}
 	}
-	return d
+	return d, nil
 }
 
 // vrfDeviceName returns the VRF device name for a routing instance.
@@ -580,7 +598,10 @@ func (m *Manager) executeProbe(ctx context.Context, test *config.RPMTest, key st
 func (m *Manager) probeTCP(ctx context.Context, test *config.RPMTest, opts probeSockOpts) (time.Duration, error) {
 	port := test.EffectiveDestinationPort()
 	addr := net.JoinHostPort(test.Target, fmt.Sprintf("%d", port))
-	dialer := probeDialer(5*time.Second, test.SourceAddress, opts)
+	dialer, err := probeDialer(5*time.Second, test.SourceAddress, opts)
+	if err != nil {
+		return 0, err
+	}
 
 	start := time.Now()
 	conn, err := dialer.DialContext(ctx, "tcp", addr)
@@ -603,7 +624,10 @@ func (m *Manager) probeHTTP(ctx context.Context, test *config.RPMTest, opts prob
 		url = "http://" + target
 	}
 
-	dialer := probeDialer(10*time.Second, test.SourceAddress, opts)
+	dialer, err := probeDialer(10*time.Second, test.SourceAddress, opts)
+	if err != nil {
+		return 0, err
+	}
 	transport := &http.Transport{
 		DialContext: dialer.DialContext,
 	}
