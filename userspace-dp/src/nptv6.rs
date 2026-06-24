@@ -136,6 +136,18 @@ fn parse_prefix(s: &str) -> Option<([u16; 4], usize)> {
     };
     let addr: Ipv6Addr = parts[0].parse().ok()?;
     let words = ipv6_to_words(&addr);
+    // #2380: the Go commit-time validator (validateNPTv6Strict in
+    // pkg/config/compiler_nat.go) rejects a prefix with any bit set beyond the
+    // prefix length, so a snapshot reaching the helper must already be
+    // host-bits-clean. This debug_assert is a fail-on-revert tripwire: if the
+    // Go gate is ever weakened, the next NPTv6 snapshot in a debug build will
+    // abort here instead of silently discarding the extra words. Release
+    // builds keep the historical masking behavior (the words are dropped).
+    debug_assert!(
+        words[prefix_words..8].iter().all(|&w| w == 0),
+        "nptv6 prefix {s} has host bits set beyond /{prefix_len} \
+         (Go commit gate should have rejected this)"
+    );
     let mut prefix = [0u16; 4];
     for i in 0..prefix_words {
         prefix[i] = words[i];

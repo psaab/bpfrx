@@ -943,7 +943,24 @@ gate EXACTLY (shared predicate `isHostMaskAddress`):
   inet` rules (a NAT64 translation whose `match` is the well-known prefix, e.g.
   `64:ff9b::/96`, driven by the separate NAT64 snapshot, not the static_nat
   table). A non-IP token (an address-book name) is left to the existing address
-  handling.
+  handling. NPTv6 prefixes are exempt from the *host-mask* gate (a prefix is
+  expected, not a host), but they have their own strict gate
+  (`validateNPTv6Strict`, #2240/#2241/#2380): prefix-length equality, supported
+  length (`/48` or `/64`), IPv6 family, overlap rejection, and — #2380 — a
+  **host-bits-zero** check on BOTH the `match` and `nptv6-prefix` slots.
+  `net.ParseCIDR` silently masks the address to the prefix length, so a prefix
+  with bits set beyond the prefix length (e.g. `2001:db8:1:2::/48`) would
+  otherwise compile as a DIFFERENT prefix (`2001:db8:1::/48`) than the operator
+  wrote, with no feedback; the Rust `parse_prefix` (`userspace-dp/src/nptv6.rs`)
+  discards the same extra words. Both planes agree on the masked result (no
+  traffic-correctness bug), but Junos rejects host bits on a prefix and so does
+  the strict gate. `parse_prefix` carries a `debug_assert!` tripwire that aborts
+  a debug build if a host-bits-bearing prefix ever reaches the helper (i.e. if
+  the Go gate is weakened); release builds keep the historical masking. This
+  routes through the SAME strict/lenient `emit` as the other NPTv6 checks: a
+  hard commit error under strict, a `cfg.Warnings` entry under
+  `CompileConfigLenient` (the helper independently rejects the snapshot and
+  keeps the prior live state).
 - **Strict (`commit` / `commit check`):** a non-host mask is a HARD commit error
   naming the rule-set, rule, slot, and offending prefix.
 - **Lenient (`Store.Load` / HA peer-sync — `CompileConfigLenient` /
