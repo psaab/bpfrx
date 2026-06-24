@@ -219,18 +219,86 @@ func TestParseIfaceRef(t *testing.T) {
 		ref      string
 		wantName string
 		wantUnit int
+		wantOK   bool
 	}{
-		{"eth0.0", "eth0", 0},
-		{"trust0.5", "trust0", 5},
-		{"enp6s0", "enp6s0", 0},
-		{"ge-0/0/0.100", "ge-0/0/0", 100},
+		// Valid references.
+		{"eth0.0", "eth0", 0, true},
+		{"trust0.5", "trust0", 5, true},
+		{"ge-0/0/0.100", "ge-0/0/0", 100, true},
+		// Bare name (no dot) — legitimate config form, implicit unit 0.
+		{"enp6s0", "enp6s0", 0, true},
+		{"ge-0/0/0", "ge-0/0/0", 0, true},
+		// Malformed unit suffixes — strict parse rejects (#2463). The old
+		// digit-accumulation scan accepted all of these with a wrong/zero
+		// unit (1abc2->12, foo->0, -1->1).
+		{"ge-0/0/0.1abc2", "ge-0/0/0", 0, false},
+		{"ge-0/0/0.foo", "ge-0/0/0", 0, false},
+		{"ge-0/0/0.-1", "ge-0/0/0", 0, false},
+		{"ge-0/0/0.+1", "ge-0/0/0", 0, false},
+		{"ge-0/0/0. 1", "ge-0/0/0", 0, false},
+		{"ge-0/0/0.", "ge-0/0/0", 0, false},
+		{"ge-0/0/0.12x", "ge-0/0/0", 0, false},
 	}
 	for _, tt := range tests {
-		name, unit := parseIfaceRef(tt.ref)
-		if name != tt.wantName || unit != tt.wantUnit {
-			t.Errorf("parseIfaceRef(%q) = (%q, %d), want (%q, %d)",
-				tt.ref, name, unit, tt.wantName, tt.wantUnit)
+		name, unit, ok := parseIfaceRef(tt.ref)
+		if name != tt.wantName || unit != tt.wantUnit || ok != tt.wantOK {
+			t.Errorf("parseIfaceRef(%q) = (%q, %d, %v), want (%q, %d, %v)",
+				tt.ref, name, unit, ok, tt.wantName, tt.wantUnit, tt.wantOK)
 		}
+	}
+}
+
+// TestBuildSamplingZonesMalformedRefSkipped is the #2463 fail-on-revert
+// guard at the caller layer: a zone whose only interface reference has a
+// malformed unit suffix must NOT enable sampling on a bogus (digit-scan)
+// unit — BuildSamplingZones warns and skips it, so the zone is absent from
+// the result. A second zone with a valid reference still enables sampling
+// on the correct unit.
+//
+// On master parseIfaceRef("ge-0/0/0.1abc2") returns unit 12; if the config
+// happened to define unit 12 sampling it would silently be enabled, and a
+// "foo"/"" suffix falls back to unit 0 — both divergences this test pins
+// against.
+func TestBuildSamplingZonesMalformedRefSkipped(t *testing.T) {
+	cfg := &config.Config{
+		Security: config.SecurityConfig{
+			Zones: map[string]*config.ZoneConfig{
+				// Malformed unit suffix: digit-scan would parse unit 12.
+				"bad": {Interfaces: []string{"ge-0/0/0.1abc2"}},
+				// Valid reference on unit 0.
+				"good": {Interfaces: []string{"ge-0/0/1.0"}},
+			},
+		},
+		Interfaces: config.InterfacesConfig{
+			Interfaces: map[string]*config.InterfaceConfig{
+				"ge-0/0/0": {
+					Units: map[int]*config.InterfaceUnit{
+						// Unit 12 has sampling enabled — the digit-scan
+						// mis-parse would wrongly turn this on for "bad".
+						12: {SamplingInput: true, SamplingOutput: true},
+					},
+				},
+				"ge-0/0/1": {
+					Units: map[int]*config.InterfaceUnit{
+						0: {SamplingInput: true},
+					},
+				},
+			},
+		},
+	}
+
+	zoneIDs := map[string]uint16{"bad": 1, "good": 2}
+	sz := BuildSamplingZones(cfg, zoneIDs)
+
+	// "bad" (id=1) must NOT enable sampling — the malformed ref is skipped,
+	// so the bogus unit-12 sampling config is never consulted.
+	if d, ok := sz[1]; ok {
+		t.Errorf("bad zone: malformed sampling-interface ref must be skipped, "+
+			"got %+v (digit-scan mis-parse enabled the wrong unit)", d)
+	}
+	// "good" (id=2) enables input sampling on the correct unit 0.
+	if d, ok := sz[2]; !ok || !d.Input || d.Output {
+		t.Errorf("good zone: got %+v (ok=%v), want Input=true Output=false", sz[2], ok)
 	}
 }
 
