@@ -384,6 +384,44 @@ impl EventStreamWorkerHandle {
         let frame = self.encode_delta_frame(delta, zone_name_to_id);
         self.send_frame_lossless(frame)
     }
+
+    /// #2460: emit a SESSION_CLOSE RT_FLOW frame (type 14) for a Close delta
+    /// on the raw dataplane-event channel.
+    ///
+    /// This is ADDITIVE to — and must be called ALONGSIDE, never instead of
+    /// — `push_delta`, which carries the unchanged type-2 HA session-sync
+    /// close delta. The RT_FLOW frame drives the Go NetFlow/IPFIX
+    /// session-close exporters (`pkg/daemon/daemon_flowexport.go`), which
+    /// only run on a `Type == "SESSION_CLOSE"` `logging.EventRecord` — a
+    /// record userspace mode never produced before this. The caller
+    /// (`flush_session_deltas`) gates on `delta.kind == Close`, but the
+    /// guard is repeated here so a future caller cannot misuse it on an Open
+    /// delta. Best-effort (`try_send`): a dropped close frame loses only one
+    /// flow-export record, never the HA close delta (a separate frame).
+    pub(crate) fn emit_session_close_rt_flow(&self, delta: &SessionDelta) {
+        if delta.kind != SessionDeltaKind::Close {
+            return;
+        }
+        let nat = &delta.decision.nat;
+        let seq = self.next_seq();
+        let frame = EventFrame::encode_session_close_rt_flow(
+            seq,
+            delta.key.addr_family,
+            delta.key.protocol,
+            delta.key.src_ip,
+            delta.key.dst_ip,
+            delta.key.src_port,
+            delta.key.dst_port,
+            nat.rewrite_src,
+            nat.rewrite_dst,
+            nat.rewrite_src_port.unwrap_or(0),
+            nat.rewrite_dst_port.unwrap_or(0),
+            delta.metadata.ingress_zone,
+            delta.metadata.egress_zone,
+            delta.metadata.owner_rg_id as i16,
+        );
+        self.try_send(frame);
+    }
 }
 
 // ---------------------------------------------------------------------------

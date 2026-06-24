@@ -143,6 +143,17 @@ pub(super) fn flush_session_deltas(
         // Push to event stream (new path) alongside existing RPC fallback.
         if let Some(es) = event_stream {
             es.push_delta(delta, zone_name_to_id);
+            // #2460: a Close delta also emits a SEPARATE RT_FLOW
+            // SESSION_CLOSE frame (type 14) on the raw dataplane-event
+            // channel. `push_delta` above already sent the type-2 HA
+            // session-sync close delta unchanged; this is ADDITIVE and
+            // feeds the Go NetFlow/IPFIX session-close exporters, which only
+            // fire on a `Type == "SESSION_CLOSE"` EventRecord (never
+            // produced in userspace mode before this). The two frames are a
+            // 1:1 pair per close — no double-counting on the HA channel.
+            if delta.kind == SessionDeltaKind::Close {
+                es.emit_session_close_rt_flow(delta);
+            }
         }
         if let Ok(mut recent) = recent_session_deltas.lock() {
             push_recent_session_delta(&mut recent, info);
