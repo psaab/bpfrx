@@ -348,6 +348,31 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 				case "neighbor":
 					nAddr := nodeVal(child)
 					if nAddr != "" {
+						// Gate group-level address-family flags by the
+						// neighbor's own address version (#2454). A
+						// dual-stack group (family inet AND inet6) must NOT
+						// activate a bare IPv4 neighbor under
+						// `address-family ipv6 unicast` (and vice versa):
+						// without RFC 5549 extended-nexthop (which this
+						// config model has no knob for) activating an IPv4
+						// address for IPv6 unicast is invalid and breaks the
+						// peer's AF activation. So an IPv4-addressed neighbor
+						// inherits only the group's inet flag, an
+						// IPv6-addressed neighbor only inet6.
+						//
+						// An address that does not parse (a hostname/peer-
+						// group template or a malformed value) is left to
+						// inherit BOTH group flags unchanged — preserving
+						// pre-#2454 behavior for the non-literal-IP case
+						// rather than silently dropping a family.
+						inheritInet, inheritInet6 := familyInet, familyInet6
+						if ip := net.ParseIP(nAddr); ip != nil {
+							if ip.To4() != nil {
+								inheritInet6 = false
+							} else {
+								inheritInet = false
+							}
+						}
 						neighbor := &BGPNeighbor{
 							Address:          nAddr,
 							PeerAS:           peerAS,
@@ -355,8 +380,8 @@ func compileProtocols(node *Node, proto *ProtocolsConfig) error {
 							MultihopTTL:      groupMultihop,
 							Export:           groupExport,
 							Import:           groupImport,
-							FamilyInet:       familyInet,
-							FamilyInet6:      familyInet6,
+							FamilyInet:       inheritInet,
+							FamilyInet6:      inheritInet6,
 							GroupName:        groupInst.name,
 							AuthPassword:     Secret(groupAuthKey),
 							BFD:              groupBFD,

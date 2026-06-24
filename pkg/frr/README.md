@@ -174,6 +174,27 @@ move or rename the markers — they're literal strings.
   advertisement and defeating the operator's filter (the #2473 leak, inbound
   side). The referenced route-map is the same block `generatePolicyOptions`
   already emits for the policy-statement.
+- **Group address-family flags are gated by neighbor address version
+  (#2454).** When `compiler_protocols.go` copies a BGP group's `family inet`
+  / `family inet6` flags down to each neighbor, it parses the neighbor's
+  address (`net.ParseIP`) and inherits ONLY the matching family: an
+  IPv4-addressed neighbor gets `FamilyInet` (never `FamilyInet6`), an
+  IPv6-addressed neighbor gets `FamilyInet6` (never `FamilyInet`). Before
+  this gate, a dual-stack group (`family inet` AND `family inet6`) marked
+  BOTH flags on every neighbor regardless of its IP version, so the render's
+  `inet4Neighbors`/`inet6Neighbors` partition put a bare IPv4 neighbor into
+  the ipv6 set and emitted `neighbor <ipv4> activate` under
+  `address-family ipv6 unicast`. Activating an IPv4 address for IPv6 unicast
+  is invalid without RFC 5549 extended-nexthop (this config model has no
+  such knob), and FRR rejects/ignores the activation — breaking the peer's
+  AF setup. Edge cases: an address that is not a literal IP (a hostname or
+  peer-group template) cannot be classified, so it preserves the prior
+  behavior of inheriting BOTH group flags (no silent family drop, no crash);
+  a per-neighbor explicit `family` clause is operator-authoritative and is
+  applied as-is after the inherited flags. The gate does not over-restrict:
+  an IPv4 neighbor in a v4-only or family-less group still establishes — FRR
+  default `bgp default ipv4-unicast` auto-activates it, and an explicit
+  `family inet` group still surfaces `FamilyInet`.
 - **`resolveRedistribute` never emits an invalid `redistribute <name>`
   line (#2223).** FRR's `redistribute` requires a source-protocol token
   (`connected`/`static`/`ospf`/`bgp`/`rip`/`isis`/`kernel`); a bare
