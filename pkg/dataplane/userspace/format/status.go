@@ -433,10 +433,10 @@ func FormatStatusSummary(status userspace.ProcessStatus) string {
 		fmt.Fprintf(&b, "  Event stream producer:     sent=%d dropped=%d write_stalls=%d replay_evictions=%d\n",
 			status.EventStreamSent, status.EventStreamDropped, status.EventStreamWriteStalls,
 			status.EventStreamReplayEvictions)
-		fmt.Fprintf(&b, "  Event stream events:       policy_deny=%d screen_drop=%d screen_alarm=%d filter_log=%d unknown_drops=%d\n",
-			es.PolicyDenyEvents, es.ScreenDropEvents, es.ScreenAlarmEvents, es.FilterLogEvents, es.UnknownFrameDrops)
-		fmt.Fprintf(&b, "  Event stream drops:        policy_deny=%d screen_drop=%d filter_log=%d\n",
-			es.PolicyDenyDrops, es.ScreenDropDrops, es.FilterLogDrops)
+		fmt.Fprintf(&b, "  Event stream events:       policy_deny=%d screen_drop=%d screen_alarm=%d filter_log=%d session_close=%d session_create=%d unknown_drops=%d\n",
+			es.PolicyDenyEvents, es.ScreenDropEvents, es.ScreenAlarmEvents, es.FilterLogEvents, es.SessionCloseEvents, es.SessionCreateEvents, es.UnknownFrameDrops)
+		fmt.Fprintf(&b, "  Event stream drops:        policy_deny=%d screen_drop=%d filter_log=%d session_close=%d session_create=%d\n",
+			es.PolicyDenyDrops, es.ScreenDropDrops, es.FilterLogDrops, es.SessionCloseDrops, es.SessionCreateDrops)
 	}
 	fmt.Fprintf(&b, "  Policy denied packets:     %d\n", policyDeniedPackets)
 	fmt.Fprintf(&b, "  Screen drops:              %d\n", screenDrops)

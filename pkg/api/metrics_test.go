@@ -431,17 +431,21 @@ func TestEmitUserspaceEventStreamMetrics(t *testing.T) {
 		EventStreamWriteStalls:     13,
 		EventStreamReplayEvictions: 4,
 		EventStream: &dpuserspace.EventStreamStatus{
-			FramesRead:        11,
-			FramesWritten:     7,
-			DecodeErrors:      2,
-			SeqGaps:           3,
-			PolicyDenyEvents:  5,
-			ScreenDropEvents:  6,
-			FilterLogEvents:   8,
-			PolicyDenyDrops:   1,
-			ScreenDropDrops:   4,
-			FilterLogDrops:    9,
-			UnknownFrameDrops: 10,
+			FramesRead:          11,
+			FramesWritten:       7,
+			DecodeErrors:        2,
+			SeqGaps:             3,
+			PolicyDenyEvents:    5,
+			ScreenDropEvents:    6,
+			FilterLogEvents:     8,
+			SessionCloseEvents:  14,
+			SessionCreateEvents: 15,
+			PolicyDenyDrops:     1,
+			ScreenDropDrops:     4,
+			FilterLogDrops:      9,
+			SessionCloseDrops:   2,
+			SessionCreateDrops:  3,
+			UnknownFrameDrops:   10,
 		},
 	}
 	ch := make(chan prometheus.Metric)
@@ -466,9 +470,15 @@ func TestEmitUserspaceEventStreamMetrics(t *testing.T) {
 	assertCounterClose(t, got, c.userspaceEventStreamDataplaneEventsTotal, map[string]string{"type": "policy_deny"}, 5)
 	assertCounterClose(t, got, c.userspaceEventStreamDataplaneEventsTotal, map[string]string{"type": "screen_drop"}, 6)
 	assertCounterClose(t, got, c.userspaceEventStreamDataplaneEventsTotal, map[string]string{"type": "filter_log"}, 8)
+	// #2510: session-close / session-create RT_FLOW volume must be observable.
+	assertCounterClose(t, got, c.userspaceEventStreamDataplaneEventsTotal, map[string]string{"type": "session_close"}, 14)
+	assertCounterClose(t, got, c.userspaceEventStreamDataplaneEventsTotal, map[string]string{"type": "session_create"}, 15)
 	assertCounterClose(t, got, c.userspaceEventStreamDataplaneDropsTotal, map[string]string{"type": "policy_deny"}, 1)
 	assertCounterClose(t, got, c.userspaceEventStreamDataplaneDropsTotal, map[string]string{"type": "screen_drop"}, 4)
 	assertCounterClose(t, got, c.userspaceEventStreamDataplaneDropsTotal, map[string]string{"type": "filter_log"}, 9)
+	// #2510: close-frame LOSS must be observable.
+	assertCounterClose(t, got, c.userspaceEventStreamDataplaneDropsTotal, map[string]string{"type": "session_close"}, 2)
+	assertCounterClose(t, got, c.userspaceEventStreamDataplaneDropsTotal, map[string]string{"type": "session_create"}, 3)
 	assertCounterClose(t, got, c.userspaceEventStreamUnknownDropsTotal, nil, 10)
 }
 
