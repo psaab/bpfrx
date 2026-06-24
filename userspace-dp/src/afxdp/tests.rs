@@ -424,6 +424,8 @@ fn synced_replica_entry_keeps_peer_synced_entries_promotable() {
             fabric_ingress: false,
             is_reverse: false,
             nat64_reverse: None,
+            log_session_init: false,
+            log_session_close: false,
         },
         origin: SessionOrigin::SyncImport,
         protocol: PROTO_TCP,
@@ -466,6 +468,8 @@ fn synced_replica_entry_marks_local_entries_worker_local() {
             fabric_ingress: false,
             is_reverse: false,
             nat64_reverse: None,
+            log_session_init: false,
+            log_session_close: false,
         },
         origin: SessionOrigin::ForwardFlow,
         protocol: PROTO_TCP,
@@ -510,6 +514,8 @@ fn reconcile_stop_preserves_shared_synced_sessions() {
             fabric_ingress: false,
             is_reverse: false,
             nat64_reverse: None,
+            log_session_init: false,
+            log_session_close: false,
         },
         origin: SessionOrigin::SyncImport,
         protocol: PROTO_TCP,
@@ -565,6 +571,8 @@ fn replay_synced_sessions_requeues_preserved_entries_for_new_workers() {
             fabric_ingress: false,
             is_reverse: false,
             nat64_reverse: None,
+            log_session_init: false,
+            log_session_close: false,
         },
         origin: SessionOrigin::SyncImport,
         protocol: PROTO_TCP,
@@ -2559,6 +2567,8 @@ fn icmp_te_nat_reversal_v4_rewrites_outer_dst_and_embedded_src() {
             fabric_ingress: false,
             is_reverse: false,
             nat64_reverse: None,
+            log_session_init: false,
+            log_session_close: false,
         },
     };
 
@@ -2681,6 +2691,8 @@ fn icmp_te_nat_reversal_v4_with_port_snat() {
             fabric_ingress: false,
             is_reverse: false,
             nat64_reverse: None,
+            log_session_init: false,
+            log_session_close: false,
         },
     };
 
@@ -2796,6 +2808,8 @@ fn icmp_dest_unreach_nat_reversal_v4() {
             fabric_ingress: false,
             is_reverse: false,
             nat64_reverse: None,
+            log_session_init: false,
+            log_session_close: false,
         },
     };
 
@@ -2928,6 +2942,8 @@ fn icmpv6_te_nat_reversal_v6_rewrites_outer_dst_and_embedded_src() {
             fabric_ingress: false,
             is_reverse: false,
             nat64_reverse: None,
+            log_session_init: false,
+            log_session_close: false,
         },
     };
 
@@ -3111,6 +3127,8 @@ fn icmpv6_te_match_fixture(
             fabric_ingress: false,
             is_reverse: false,
             nat64_reverse: None,
+            log_session_init: false,
+            log_session_close: false,
         },
     }
 }
@@ -3387,6 +3405,8 @@ fn icmpv6_te_nptv6_reverse_lookup_restores_internal_client() {
         fabric_ingress: false,
         is_reverse: false,
         nat64_reverse: None,
+        log_session_init: false,
+        log_session_close: false,
     };
     let mut sessions = SessionTable::new();
     assert!(sessions.install_with_protocol(
@@ -3503,6 +3523,8 @@ fn icmpv6_te_prefers_reverse_session_resolution_for_client_return_path() {
         fabric_ingress: false,
         is_reverse: false,
         nat64_reverse: None,
+        log_session_init: false,
+        log_session_close: false,
     };
 
     let reverse_key = reverse_session_key(&forward_key, forward_decision.nat);
@@ -3533,6 +3555,8 @@ fn icmpv6_te_prefers_reverse_session_resolution_for_client_return_path() {
         fabric_ingress: false,
         is_reverse: true,
         nat64_reverse: None,
+        log_session_init: false,
+        log_session_close: false,
     };
 
     let mut sessions = SessionTable::new();
@@ -3684,6 +3708,8 @@ fn embedded_icmp_nat_match_uses_shared_nat_session_for_ipv4() {
             fabric_ingress: false,
             is_reverse: false,
             nat64_reverse: None,
+            log_session_init: false,
+            log_session_close: false,
         },
         origin: SessionOrigin::SyncImport,
         protocol: PROTO_TCP,
@@ -3837,6 +3863,8 @@ fn embedded_icmp_nat_match_translates_redirect_v4() {
             fabric_ingress: false,
             is_reverse: false,
             nat64_reverse: None,
+            log_session_init: false,
+            log_session_close: false,
         },
         1_000_000,
         PROTO_TCP,
@@ -4633,6 +4661,8 @@ fn poll_descriptor_session_hit_rechecks_dscp_input_filter() {
         fabric_ingress: false,
         is_reverse: false,
         nat64_reverse: None,
+        log_session_init: false,
+        log_session_close: false,
     };
     assert!(sessions.install_with_protocol_with_origin(
         flow_key.clone(),
@@ -5017,6 +5047,8 @@ fn poll_descriptor_lo0_filter_drops_cached_local_delivery_session_hit() {
         fabric_ingress: false,
         is_reverse: false,
         nat64_reverse: None,
+        log_session_init: false,
+        log_session_close: false,
     };
     assert!(sessions.install_with_protocol_with_origin(
         flow_key.clone(),
@@ -6353,6 +6385,8 @@ fn txn_failed_reply_repair_forwards_uncached_then_self_heals_below_cap() {
             fabric_ingress: false,
             is_reverse: false,
             nat64_reverse: None,
+            log_session_init: false,
+            log_session_close: false,
         },
         SessionOrigin::ForwardFlow,
         122_000_000_000,
@@ -8240,6 +8274,8 @@ fn replay_filter_drops_purged_forward_and_derived_reverse_companion() {
                 fabric_ingress: false,
                 is_reverse,
                 nat64_reverse: None,
+                log_session_init: false,
+                log_session_close: false,
             },
             origin: SessionOrigin::SyncImport,
             protocol: PROTO_TCP,

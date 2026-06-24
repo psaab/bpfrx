@@ -75,6 +75,8 @@ fn make_metadata(owner_rg_id: i32) -> SessionMetadata {
         fabric_ingress: false,
         is_reverse: false,
         nat64_reverse: None,
+        log_session_init: false,
+        log_session_close: false,
     }
 }
 

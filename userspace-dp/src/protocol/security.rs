@@ -262,6 +262,15 @@ pub(crate) struct PolicyRuleSnapshot {
     pub source_address_excluded: bool,
     #[serde(rename = "destination_address_excluded", default)]
     pub destination_address_excluded: bool,
+    /// #2508: per-policy Junos `then log session-init` / `session-close`
+    /// selection. Stamped onto the session metadata at install so the
+    /// per-policy RT_FLOW SYSLOG records can be emitted only for the
+    /// policies the operator configured with `then log`. serde(default)
+    /// keeps wire parity with an older Go control plane that omits them.
+    #[serde(rename = "log_session_init", default)]
+    pub log_session_init: bool,
+    #[serde(rename = "log_session_close", default)]
+    pub log_session_close: bool,
 }
 
 /// #1606: snapshot row for a unique address-book content.

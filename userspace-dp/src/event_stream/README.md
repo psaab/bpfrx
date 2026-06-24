@@ -16,7 +16,8 @@ periodic ACK from the daemon.
   `MSG_DRAIN_REQUEST`, `MSG_DRAIN_COMPLETE`, `MSG_FULL_RESYNC`,
   `MSG_KEEPALIVE` (1..10), plus RT_FLOW dataplane telemetry frames
   `MSG_POLICY_DENY`, `MSG_SCREEN_DROP`, and `MSG_FILTER_LOG` (11..13),
-  and (#2460) `MSG_SESSION_CLOSE_RT_FLOW` (14).
+  (#2460) `MSG_SESSION_CLOSE_RT_FLOW` (14), and (#2508)
+  `MSG_SESSION_CREATE_RT_FLOW` (15).
   The telemetry frame payload is not a userspace-specific schema: it is
   the same 136-byte `dataplane.Event` layout consumed by the Go ringbuf
   logger, including AF values 2/10 and big-endian L4 ports. Userspace
@@ -40,6 +41,19 @@ periodic ACK from the daemon.
   close loses one flow-export record; it is bounded by session churn, not
   attacker-controlled), so it is sent with the lossy `try_send` path
   directly rather than through the `producer.rs` rate limiter.
+  (#2508) per-policy RT_FLOW SYSLOG logging: the admitting policy's
+  `then log session-init` / `session-close` selection is stamped onto the
+  session metadata at install. A close ALWAYS emits the type-14 frame
+  (flowexport needs every close), but its final payload byte (offset 135)
+  carries a per-policy SYSLOG gate — the Go `logEvent` path emits the
+  RT_FLOW_SESSION_CLOSE SYSLOG record only when the bit is set, while the
+  registered callbacks (NetFlow/IPFIX, #2460) always run. There is NO
+  flowexport consumer of session opens, so `MSG_SESSION_CREATE_RT_FLOW`
+  (15) is producer-gated: it is emitted (via `emit_session_create_rt_flow`)
+  ONLY when the admitting policy requested `then log session-init`, carries
+  the same 136-byte payload with the event-type byte set to SESSION_OPEN
+  (1, rendered as RT_FLOW_SESSION_CREATE on the Go side), and always sets
+  the gate byte. Both frames ride the lossy `try_send` path.
   `MSG_FILTER_LOG` intentionally reuses the RT_FLOW `reason` byte as
   a filter-log source discriminator (`pbr`, `input`, `output`,
   `cached-output`, or `lo0`). Close events still interpret that byte as

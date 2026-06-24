@@ -46,6 +46,15 @@ pub(crate) const MSG_FILTER_LOG: u8 = 13;
 // close, never substituting for each other.
 pub(crate) const MSG_SESSION_CLOSE_RT_FLOW: u8 = 14;
 
+// #2508: RT_FLOW SESSION_CREATE on the raw dataplane-event channel. Same
+// 136-byte payload shape as the close frame but with the event-type byte set
+// to RT_FLOW SESSION_CREATE (1). Emitted ONLY for sessions admitted by a
+// policy with `then log session-init`; there is no flowexport consumer of
+// session opens, so this frame is gated at the producer (the caller checks
+// metadata.log_session_init). The Go logEvent path formats it as an
+// RT_FLOW_SESSION_CREATE syslog record.
+pub(crate) const MSG_SESSION_CREATE_RT_FLOW: u8 = 15;
+
 #[allow(dead_code)]
 pub(crate) const SECURITY_EVENT_PAYLOAD_SIZE: usize = 136;
 
@@ -57,6 +66,17 @@ const RT_FLOW_AF_INET6: u8 = 10;
 // so `eventTypeName(data[52])` resolves to the literal "SESSION_CLOSE" the
 // flowexport callbacks gate on.
 const RT_FLOW_EVENT_SESSION_CLOSE: u8 = 2;
+// #2508: SESSION_CREATE event-type byte. Must equal the Go
+// `eventTypeSessionOpen` (pkg/logging/ringbuf.go) and
+// `dataplane.EventTypeSessionOpen` value of 1 so `eventTypeName(data[52])`
+// resolves to "SESSION_OPEN", which the Go formatter renders as the
+// RT_FLOW_SESSION_CREATE syslog tag.
+const RT_FLOW_EVENT_SESSION_OPEN: u8 = 1;
+// #2508: per-policy SYSLOG log gate, written to the final payload byte
+// (offset 135). 1 == emit the per-policy RT_FLOW SYSLOG record on the Go
+// side; 0 == suppress it (the global flowexport close exporter is
+// unaffected).
+const RT_FLOW_LOG_SYSLOG: u8 = 1;
 const RT_FLOW_EVENT_POLICY_DENY: u8 = 3;
 const RT_FLOW_EVENT_SCREEN_DROP: u8 = 4;
 const RT_FLOW_EVENT_FILTER_LOG: u8 = 6;
@@ -425,6 +445,7 @@ impl EventFrame {
         ingress_zone_id: u16,
         egress_zone_id: u16,
         owner_rg_id: i16,
+        log_syslog: bool,
     ) -> Self {
         let mut buf = [0u8; 256];
         let base = FRAME_HEADER_SIZE;
@@ -478,11 +499,82 @@ impl EventFrame {
         let _ = owner_rg_id;
         // [134] close reason.
         buf[base + 134] = RT_FLOW_CLOSE_REASON_NONE;
+        // [135] #2508 per-policy SYSLOG log gate.
+        buf[base + 135] = if log_syslog { RT_FLOW_LOG_SYSLOG } else { 0 };
 
         write_header(
             &mut buf,
             SECURITY_EVENT_PAYLOAD_SIZE as u32,
             MSG_SESSION_CLOSE_RT_FLOW,
+            seq,
+        );
+
+        EventFrame {
+            data: buf,
+            len: (FRAME_HEADER_SIZE + SECURITY_EVENT_PAYLOAD_SIZE) as u16,
+            seq,
+        }
+    }
+
+    /// #2508: encode an RT_FLOW SESSION_CREATE (type 15) frame for a session
+    /// admitted by a policy with `then log session-init`. Identical payload
+    /// shape to `encode_session_close_rt_flow` except: the event-type byte is
+    /// RT_FLOW SESSION_CREATE (1); there is no close reason; counters are 0
+    /// (a create has no volume yet); and the per-policy SYSLOG gate byte
+    /// (offset 135) is always set, because the helper only ever produces this
+    /// frame when the gate is open (no flowexport consumer of opens — there is
+    /// nothing to keep unconditional). The Go logEvent path renders it as the
+    /// RT_FLOW_SESSION_CREATE syslog record.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn encode_session_create_rt_flow(
+        seq: u64,
+        addr_family: u8,
+        protocol: u8,
+        src_ip: IpAddr,
+        dst_ip: IpAddr,
+        src_port: u16,
+        dst_port: u16,
+        nat_src_ip: Option<IpAddr>,
+        nat_dst_ip: Option<IpAddr>,
+        nat_src_port: u16,
+        nat_dst_port: u16,
+        ingress_zone_id: u16,
+        egress_zone_id: u16,
+    ) -> Self {
+        let mut buf = [0u8; 256];
+        let base = FRAME_HEADER_SIZE;
+        let wire_af = rt_flow_addr_family(addr_family, src_ip);
+
+        // [8:24] src ip, [24:40] dst ip (16-byte slots, v4 left-aligned).
+        write_ip_16(&mut buf, base + 8, src_ip);
+        write_ip_16(&mut buf, base + 24, dst_ip);
+        // [40:42] src port, [42:44] dst port — BIG-endian.
+        buf[base + 40..base + 42].copy_from_slice(&src_port.to_be_bytes());
+        buf[base + 42..base + 44].copy_from_slice(&dst_port.to_be_bytes());
+        // [44:48] policy_id — unused for the create syslog tuple.
+        // [48:50] ingress zone, [50:52] egress zone — little-endian.
+        buf[base + 48..base + 50].copy_from_slice(&ingress_zone_id.to_le_bytes());
+        buf[base + 50..base + 52].copy_from_slice(&egress_zone_id.to_le_bytes());
+        // [52] event type = SESSION_CREATE (1), [53] protocol, [54] action,
+        // [55] address family.
+        buf[base + 52] = RT_FLOW_EVENT_SESSION_OPEN;
+        buf[base + 53] = protocol;
+        buf[base + 54] = 0;
+        buf[base + 55] = wire_af;
+        // [72:88] nat src ip, [88:104] nat dst ip.
+        write_ip_opt_16(&mut buf, base + 72, nat_src_ip);
+        write_ip_opt_16(&mut buf, base + 88, nat_dst_ip);
+        // [104:106] nat src port, [106:108] nat dst port — BIG-endian.
+        buf[base + 104..base + 106].copy_from_slice(&nat_src_port.to_be_bytes());
+        buf[base + 106..base + 108].copy_from_slice(&nat_dst_port.to_be_bytes());
+        // [108:135] counters / ifindex / appid / close-reason all 0 for a
+        // create. [135] #2508 SYSLOG gate — always set (producer-gated).
+        buf[base + 135] = RT_FLOW_LOG_SYSLOG;
+
+        write_header(
+            &mut buf,
+            SECURITY_EVENT_PAYLOAD_SIZE as u32,
+            MSG_SESSION_CREATE_RT_FLOW,
             seq,
         );
 

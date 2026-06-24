@@ -491,6 +491,10 @@ pub(super) fn cluster_peer_return_fast_path(
         fabric_ingress: true,
         is_reverse: true,
         nat64_reverse: None,
+        // #2508: fabric-return reverse seed carries no local per-policy
+        // `then log` selection (the admitting node logs).
+        log_session_init: false,
+        log_session_close: false,
     };
     Some((
         SessionDecision {

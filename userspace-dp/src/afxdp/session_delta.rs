@@ -154,6 +154,17 @@ pub(super) fn flush_session_deltas(
             if delta.kind == SessionDeltaKind::Close {
                 es.emit_session_close_rt_flow(delta);
             }
+            // #2508: a session admitted by a policy configured with
+            // `then log session-init` emits an RT_FLOW SESSION_CREATE frame
+            // (type 15) on the same raw dataplane-event channel. Unlike the
+            // close frame this is producer-gated: there is no flowexport
+            // consumer of session opens, so we only ever send it when the
+            // admitting policy requested session-init logging. The
+            // SESSION_CLOSE syslog record is gated on the Go side (via the
+            // frame's gate byte) because flowexport still needs every close.
+            if delta.kind == SessionDeltaKind::Open && delta.metadata.log_session_init {
+                es.emit_session_create_rt_flow(delta);
+            }
         }
         if let Ok(mut recent) = recent_session_deltas.lock() {
             push_recent_session_delta(&mut recent, info);

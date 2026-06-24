@@ -71,6 +71,8 @@ fn test_metadata() -> SessionMetadata {
         fabric_ingress: false,
         is_reverse: false,
         nat64_reverse: None,
+        log_session_init: false,
+        log_session_close: false,
     }
 }
 
@@ -268,6 +270,7 @@ fn test_encode_session_close_rt_flow_v4_wire_layout() {
         TEST_TRUST_ZONE_ID,
         TEST_UNTRUST_ZONE_ID,
         1,
+        false, // #2508: log_syslog gate
     );
 
     assert_eq!(frame.data[4], MSG_SESSION_CLOSE_RT_FLOW);
@@ -325,6 +328,7 @@ fn test_encode_session_close_rt_flow_v6() {
         TEST_TRUST_ZONE_ID,
         TEST_UNTRUST_ZONE_ID,
         0,
+        false, // #2508: log_syslog gate
     );
     let p = &frame.data[FRAME_HEADER_SIZE..frame.len as usize];
     assert_eq!(p[52], RT_FLOW_EVENT_SESSION_CLOSE);
@@ -335,6 +339,89 @@ fn test_encode_session_close_rt_flow_v6() {
         &p[8..24],
         &Ipv6Addr::new(0x2001, 0x559, 0x8585, 0xbf01, 0, 0, 0, 0x102).octets()
     );
+}
+
+// #2508 fail-on-revert: the SESSION_CLOSE frame carries the per-policy SYSLOG
+// gate in the final payload byte (offset 135). The frame is sent
+// unconditionally (flowexport needs every close), so the gate byte is the ONLY
+// signal that distinguishes a logged close from an unlogged one. If the
+// encoder stops writing the gate byte, or hard-codes it, these assertions fail.
+#[test]
+fn test_session_close_rt_flow_log_gate_byte() {
+    let mk = |log_syslog: bool| {
+        EventFrame::encode_session_close_rt_flow(
+            7,
+            libc::AF_INET as u8,
+            6,
+            IpAddr::V4(Ipv4Addr::new(10, 0, 1, 102)),
+            IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+            12345,
+            443,
+            None,
+            None,
+            0,
+            0,
+            TEST_TRUST_ZONE_ID,
+            TEST_UNTRUST_ZONE_ID,
+            0,
+            log_syslog,
+        )
+    };
+    let gated_off = mk(false);
+    let p_off = &gated_off.data[FRAME_HEADER_SIZE..gated_off.len as usize];
+    assert_eq!(p_off[135], 0, "log_syslog=false must clear the gate byte");
+
+    let gated_on = mk(true);
+    let p_on = &gated_on.data[FRAME_HEADER_SIZE..gated_on.len as usize];
+    assert_eq!(
+        p_on[135], RT_FLOW_LOG_SYSLOG,
+        "log_syslog=true must set the gate byte"
+    );
+    // The frame type and event-type byte are unchanged regardless of the gate.
+    assert_eq!(gated_on.data[4], MSG_SESSION_CLOSE_RT_FLOW);
+    assert_eq!(p_on[52], RT_FLOW_EVENT_SESSION_CLOSE);
+}
+
+// #2508 fail-on-revert: the SESSION_CREATE frame is the new per-policy
+// session-init producer. It must use frame type 15, event-type byte 1
+// (SESSION_OPEN, renders as RT_FLOW_SESSION_CREATE on the Go side), and set
+// the SYSLOG gate byte (it is producer-gated, only emitted when logging is
+// requested). It must carry the 5-tuple and NAT slots.
+#[test]
+fn test_session_create_rt_flow_wire_layout() {
+    let frame = EventFrame::encode_session_create_rt_flow(
+        42,
+        libc::AF_INET as u8,
+        6, // TCP
+        IpAddr::V4(Ipv4Addr::new(10, 0, 1, 102)),
+        IpAddr::V4(Ipv4Addr::new(172, 16, 80, 200)),
+        12345,
+        443,
+        Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
+        None,
+        40000,
+        0,
+        TEST_TRUST_ZONE_ID,
+        TEST_UNTRUST_ZONE_ID,
+    );
+    assert_eq!(frame.data[4], MSG_SESSION_CREATE_RT_FLOW);
+    let p = &frame.data[FRAME_HEADER_SIZE..frame.len as usize];
+    assert_eq!(p.len(), SECURITY_EVENT_PAYLOAD_SIZE);
+    // event type = SESSION_OPEN (1) so the Go formatter emits SESSION_CREATE.
+    assert_eq!(p[52], RT_FLOW_EVENT_SESSION_OPEN);
+    assert_eq!(p[52], 1, "must equal the Go eventTypeSessionOpen value");
+    assert_eq!(p[53], 6); // protocol
+    assert_eq!(p[55], RT_FLOW_AF_INET);
+    // gate byte set — producer only emits the frame when logging is requested.
+    assert_eq!(p[135], RT_FLOW_LOG_SYSLOG);
+    // 5-tuple: v4 src/dst left-aligned in the 16-byte slots, BE ports.
+    assert_eq!(&p[8..12], &Ipv4Addr::new(10, 0, 1, 102).octets());
+    assert_eq!(&p[24..28], &Ipv4Addr::new(172, 16, 80, 200).octets());
+    assert_eq!(u16::from_be_bytes([p[40], p[41]]), 12345);
+    assert_eq!(u16::from_be_bytes([p[42], p[43]]), 443);
+    // NAT source slot populated.
+    assert_eq!(&p[72..76], &Ipv4Addr::new(172, 16, 80, 8).octets());
+    assert_eq!(u16::from_be_bytes([p[104], p[105]]), 40000);
 }
 
 #[test]
@@ -516,6 +603,8 @@ fn test_close_flags() {
             fabric_ingress: true,
             is_reverse: false,
             nat64_reverse: None,
+            log_session_init: false,
+            log_session_close: false,
         },
         origin: crate::session::SessionOrigin::ForwardFlow,
         fabric_redirect_sync: true,

@@ -106,6 +106,106 @@ fn evaluate_policy_result_reports_snapshot_policy_id() {
     assert_eq!(result.policy_id, 257);
 }
 
+// #2508 fail-on-revert: the per-policy `then log session-init`/`session-close`
+// flags must flow snapshot -> PolicyRule -> PolicyEvaluationResult so the
+// session-install path can stamp them onto the session metadata. If any leg of
+// that wiring is dropped, the matched result reports false and this fails. The
+// implicit default-policy path (no rule match) reports false for both.
+#[test]
+fn evaluate_policy_result_carries_per_policy_log_flags() {
+    let state = parse_policy_state(
+        "deny",
+        &[PolicyRuleSnapshot {
+            policy_id: 991,
+            name: "permit-logged".to_string(),
+            from_zone: "lan".to_string(),
+            to_zone: "wan".to_string(),
+            source_addresses: vec!["any".to_string()],
+            destination_addresses: vec!["any".to_string()],
+            applications: vec!["any".to_string()],
+            action: "permit".to_string(),
+            log_session_init: true,
+            log_session_close: true,
+            ..Default::default()
+        }],
+        &test_zone_name_to_id(),
+    );
+
+    let matched = evaluate_policy_result_with_len(
+        &state,
+        TEST_LAN_ZONE_ID,
+        TEST_WAN_ZONE_ID,
+        "10.0.61.100".parse().expect("src"),
+        "172.16.80.200".parse().expect("dst"),
+        PROTO_TCP,
+        12345,
+        443,
+        64,
+    );
+    assert_eq!(matched.action, PolicyAction::Permit);
+    assert!(
+        matched.log_session_init,
+        "log_session_init must propagate snapshot -> rule -> eval result"
+    );
+    assert!(
+        matched.log_session_close,
+        "log_session_close must propagate snapshot -> rule -> eval result"
+    );
+
+    // A flow that matches NO explicit rule rides the implicit default policy,
+    // which has no `then log` selection.
+    let default_hit = evaluate_policy_result_with_len(
+        &state,
+        TEST_WAN_ZONE_ID,
+        TEST_LAN_ZONE_ID,
+        "172.16.80.200".parse().expect("src"),
+        "10.0.61.100".parse().expect("dst"),
+        PROTO_TCP,
+        443,
+        12345,
+        64,
+    );
+    assert_eq!(default_hit.action, PolicyAction::Deny);
+    assert!(!default_hit.log_session_init);
+    assert!(!default_hit.log_session_close);
+}
+
+// #2508 fail-on-revert: a policy WITHOUT `then log` must report both flags
+// false (the common case — most rules do not request session logging).
+#[test]
+fn evaluate_policy_result_unlogged_policy_reports_no_log_flags() {
+    let state = parse_policy_state(
+        "deny",
+        &[PolicyRuleSnapshot {
+            policy_id: 992,
+            name: "permit-quiet".to_string(),
+            from_zone: "lan".to_string(),
+            to_zone: "wan".to_string(),
+            source_addresses: vec!["any".to_string()],
+            destination_addresses: vec!["any".to_string()],
+            applications: vec!["any".to_string()],
+            action: "permit".to_string(),
+            ..Default::default()
+        }],
+        &test_zone_name_to_id(),
+    );
+
+    let matched = evaluate_policy_result_with_len(
+        &state,
+        TEST_LAN_ZONE_ID,
+        TEST_WAN_ZONE_ID,
+        "10.0.61.100".parse().expect("src"),
+        "172.16.80.200".parse().expect("dst"),
+        PROTO_TCP,
+        12345,
+        443,
+        64,
+    );
+    assert_eq!(matched.action, PolicyAction::Permit);
+    assert!(!matched.log_session_init);
+    assert!(!matched.log_session_close);
+}
+
 #[test]
 fn default_deny_applies_without_match() {
     let state = parse_policy_state("deny", &[], &test_zone_name_to_id());

@@ -12508,3 +12508,43 @@ top.
   userspace-dp/src/filter/engine/matching.rs,
   userspace-dp/src/filter/tests.rs, userspace-dp/src/filter/README.md,
   userspace-dp/tests/fixtures/protocol_wire_v1.json, docs/feature-gaps.md, _Log.md
+
+## 2026-06-23 — #2508 per-policy RT_FLOW session-init/close SYSLOG logging
+
+- **Timestamp**: 2026-06-23
+- **Action**: Implement per-policy `then log session-init`/`session-close`
+  SYSLOG RT_FLOW logging in the userspace dataplane. Design choice: Option B
+  (single close event + per-policy gate on the SYSLOG consumer) plus a NEW
+  producer-gated SESSION_CREATE frame for session-init. The #2460 global
+  NetFlow/IPFIX flowexport close emit is NOT regressed: flowexport rides the
+  EventReader callback fan-out, the SYSLOG records ride the syslog/local/slog
+  fan-out, and only the latter is gated. The type-14 close frame is still
+  emitted for EVERY close (flowexport needs it); its final payload byte
+  (offset 135) carries the per-policy SYSLOG gate that the Go logEvent path
+  honors. Session-init has no flowexport consumer, so the new type-15
+  SESSION_CREATE frame is gated entirely at the Rust producer.
+- **File(s)**:
+  - pkg/dataplane/userspace/protocol.go (PolicyRuleSnapshot LogSessionInit/
+    Close + EventFrameTypeSessionCreate=15)
+  - pkg/dataplane/userspace/policies.go (populate from pol.Log)
+  - pkg/dataplane/userspace/eventstream.go (type-15 dispatch + validator +
+    SessionCreate counters)
+  - pkg/logging/ringbuf.go (rawEvent.LogSyslog byte-135 + suppressSyslogLog
+    gate after callbacks)
+  - pkg/logging/per_policy_log_test.go (NEW fail-on-revert matrix)
+  - pkg/logging/binary_test.go (PadEvent->LogSyslog offset test +
+    minimallyValidRawEventData gate opt-in)
+  - userspace-dp/src/protocol/security.rs (PolicyRuleSnapshot log flags)
+  - userspace-dp/src/policy.rs (PolicyRule + PolicyEvaluationResult flags)
+  - userspace-dp/src/session/entry.rs (SessionMetadata log flags)
+  - userspace-dp/src/event_stream/{mod.rs,codec.rs} (encode/emit create +
+    close gate byte)
+  - userspace-dp/src/afxdp/session_delta.rs (gated create emit in flush)
+  - poll_descriptor/mod.rs + 5 other SessionMetadata sites (stamp flags)
+  - userspace-dp/src/{event_stream/codec_tests.rs,policy_tests.rs} (tests)
+  - userspace-dp/tests/fixtures/protocol_wire_v1.json (regen)
+  - docs/feature-gaps.md, userspace-dp/src/event_stream/README.md
+- **Validation**: go build ./...; go test pkg/{config,dataplane/userspace,
+  logging,daemon} green; cargo build --release green; cargo test policy +
+  codec + wire-invariant green (1 pre-existing flaky concurrency test
+  unrelated). gofmt/vet clean.

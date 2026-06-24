@@ -30,6 +30,14 @@ pub(crate) struct SessionMetadata {
     /// For NAT64 sessions: stores original IPv6 addresses so reverse IPv4
     /// replies can be translated back.
     pub(crate) nat64_reverse: Option<Nat64ReverseInfo>,
+    /// #2508: the admitting policy's per-policy RT_FLOW SYSLOG log
+    /// selection (`then log session-init`/`session-close`). Stamped at
+    /// install so the close-time delta (which no longer has the policy in
+    /// hand) and the open-time delta can gate the per-policy RT_FLOW
+    /// SYSLOG records. Independent of the global NetFlow/IPFIX close
+    /// exporter (#2460), which observes every close regardless.
+    pub(crate) log_session_init: bool,
+    pub(crate) log_session_close: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

@@ -272,7 +272,7 @@ func TestRawEventFieldOffsetsMatchWireFormat(t *testing.T) {
 		{name: "IngressIfindex", got: unsafe.Offsetof(evt.IngressIfindex), want: 128},
 		{name: "AppID", got: unsafe.Offsetof(evt.AppID), want: 132},
 		{name: "CloseReason", got: unsafe.Offsetof(evt.CloseReason), want: 134},
-		{name: "PadEvent", got: unsafe.Offsetof(evt.PadEvent), want: 135},
+		{name: "LogSyslog", got: unsafe.Offsetof(evt.LogSyslog), want: 135},
 	}
 	for _, tt := range tests {
 		if tt.got != tt.want {
@@ -329,6 +329,10 @@ func minimallyValidRawEventData() []byte {
 	data[55] = addrFamilyInet
 	copy(data[8:12], net.ParseIP("10.0.1.1").To4())
 	copy(data[24:28], net.ParseIP("10.0.2.1").To4())
+	// #2508: mark the SESSION_OPEN as per-policy logged so it reaches the
+	// human-facing log buffer (a SESSION_OPEN/CLOSE with the gate clear is
+	// intentionally suppressed; tests that assert buffering must opt in).
+	data[rawEventLogSyslogOffset] = 1
 	return data
 }
 

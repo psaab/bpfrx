@@ -1145,6 +1145,11 @@ pub(super) fn poll_binding_process_descriptor(
                                 // BPF session map so subsequent established packets bypass
                                 // userspace and return directly to the kernel.
                                 nat64_reverse: None,
+                                // #2508: firewall-local (host-destined) sessions are
+                                // not policy-forwarded, so they carry no per-policy
+                                // `then log` selection.
+                                log_session_init: false,
+                                log_session_close: false,
                             };
                             if install_helper_local_session_on_miss(
                                 sessions,
@@ -1656,6 +1661,10 @@ pub(super) fn poll_binding_process_descriptor(
                                         fabric_ingress,
                                         is_reverse: false,
                                         nat64_reverse: nat64_info,
+                                        // #2508: stamp the admitting policy's
+                                        // per-policy RT_FLOW SYSLOG log selection.
+                                        log_session_init: policy_result.log_session_init,
+                                        log_session_close: policy_result.log_session_close,
                                     };
                                     let forward_installed = track_in_userspace
                                         && sessions.install_with_protocol_with_origin(
@@ -1869,6 +1878,12 @@ pub(super) fn poll_binding_process_descriptor(
                                         fabric_ingress,
                                         is_reverse: true,
                                         nat64_reverse: nat64_info,
+                                        // #2508: mirror the admitting policy's log
+                                        // selection onto the reverse entry so the
+                                        // close delta carries a consistent gate
+                                        // regardless of which entry expires it.
+                                        log_session_init: policy_result.log_session_init,
+                                        log_session_close: policy_result.log_session_close,
                                     };
                                     // #1861 §5.2: the reverse install is gated on
                                     // forward_installed (was track_in_userspace —
@@ -3641,6 +3656,8 @@ mod new_flow_session_limit_tests {
             fabric_ingress: false,
             is_reverse: false,
             nat64_reverse: None,
+            log_session_init: false,
+            log_session_close: false,
         }
     }
 
