@@ -113,7 +113,7 @@ func TestBuildFilterTermSnapshotsNeverNil(t *testing.T) {
 		{"all-nil terms", &config.FirewallFilter{Name: "F", Terms: []*config.FirewallFilterTerm{nil, nil}}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got := buildFilterTermSnapshots(tc.filter, &config.Config{})
+			got := buildFilterTermSnapshots(tc.name, tc.filter, &config.Config{})
 			if got == nil {
 				t.Fatalf("buildFilterTermSnapshots(%s) = nil, want non-nil empty slice (#2214)", tc.name)
 			}

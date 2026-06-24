@@ -1,6 +1,7 @@
 package userspace
 
 import (
+	"log/slog"
 	"sort"
 	"strconv"
 	"strings"
@@ -28,7 +29,7 @@ func buildFirewallFilterSnapshots(cfg *config.Config) []FirewallFilterSnapshot {
 		snap := FirewallFilterSnapshot{
 			Name:   name,
 			Family: "inet",
-			Terms:  buildFilterTermSnapshots(filter, cfg),
+			Terms:  buildFilterTermSnapshots(name, filter, cfg),
 		}
 		out = append(out, snap)
 	}
@@ -46,14 +47,14 @@ func buildFirewallFilterSnapshots(cfg *config.Config) []FirewallFilterSnapshot {
 		snap := FirewallFilterSnapshot{
 			Name:   name,
 			Family: "inet6",
-			Terms:  buildFilterTermSnapshots(filter, cfg),
+			Terms:  buildFilterTermSnapshots(name, filter, cfg),
 		}
 		out = append(out, snap)
 	}
 	return out
 }
 
-func buildFilterTermSnapshots(filter *config.FirewallFilter, cfg *config.Config) []FirewallTermSnapshot {
+func buildFilterTermSnapshots(filterName string, filter *config.FirewallFilter, cfg *config.Config) []FirewallTermSnapshot {
 	// #2214: return a non-nil empty slice (never nil) so the enclosing
 	// FirewallFilterSnapshot.Terms marshals as `[]`, never JSON `null`. The
 	// Terms field has no `,omitempty` (the compiler can store a filter with
@@ -77,10 +78,21 @@ func buildFilterTermSnapshots(filter *config.FirewallFilter, cfg *config.Config)
 			RoutingInstance: term.RoutingInstance,
 			ForwardingClass: term.ForwardingClass,
 		}
-		// Source addresses (CIDRs)
-		snap.SourceAddresses = append(snap.SourceAddresses, term.SourceAddresses...)
-		// Destination addresses (CIDRs)
-		snap.DestAddresses = append(snap.DestAddresses, term.DestAddresses...)
+		// Source / destination addresses: literal CIDRs PLUS the prefixes
+		// resolved from any `from source-prefix-list` / `destination-prefix-list`
+		// reference (#2506). The legacy eBPF compiler expanded these
+		// (pkg/dataplane/compiler_filter.go); the userspace snapshot builder
+		// dropped them entirely, so a term scoped by a prefix-list reached the
+		// dataplane with NO address constraint (fail-open for accept/PBR,
+		// fail-closed for discard/reject — either way wrong).
+		srcAddrs, srcExcept := resolvePrefixListAddrs(
+			term.SourceAddresses, term.SourcePrefixLists, cfg, filterName, term.Name, "source")
+		dstAddrs, dstExcept := resolvePrefixListAddrs(
+			term.DestAddresses, term.DestPrefixLists, cfg, filterName, term.Name, "destination")
+		snap.SourceAddresses = srcAddrs
+		snap.DestAddresses = dstAddrs
+		snap.SourceExcept = srcExcept
+		snap.DestExcept = dstExcept
 		// Protocols
 		if term.Protocol != "" {
 			snap.Protocols = []string{term.Protocol}
@@ -128,6 +140,104 @@ func buildFilterTermSnapshots(filter *config.FirewallFilter, cfg *config.Config)
 		terms = append(terms, snap)
 	}
 	return terms
+}
+
+// resolvePrefixListAddrs merges a firewall-filter term's literal source/dest
+// address CIDRs with the prefixes resolved from its source/destination
+// prefix-list references (#2506). It returns the combined CIDR list and a
+// per-direction `except` (inversion) flag.
+//
+// Semantics (Junos):
+//   - A plain `source-prefix-list NAME` reference contributes NAME's prefixes
+//     to the term's positive match set, OR'd with any literal source-address
+//     entries — a packet matches the direction if its address falls in ANY of
+//     them.
+//   - `source-prefix-list NAME except` means "match every source EXCEPT those
+//     in NAME". It is represented as the expanded prefixes plus `except=true`;
+//     the Rust matcher evaluates `(addr ∈ prefixes) XOR except`.
+//
+// Scope (this PR): the two clean, common cases are wired through —
+//  1. positive prefix-lists (with or without literal addresses), and
+//  2. an `except` prefix-list as the SOLE address source for the direction.
+//
+// The MIXED case — literal/positive addresses AND an `except` prefix-list in
+// the SAME direction of ONE term — has no single boolean-inversion
+// representation (one direction would need both a positive set and a negated
+// set). Rather than silently pick a wrong interpretation, the except modifier
+// is dropped (the prefixes fold into the positive set, i.e. the under-broad,
+// fail-safe reading) and a warning is emitted. The structured mixed case is a
+// documented follow-up.
+//
+// An undefined prefix-list reference is NOT silently dropped here — it is a
+// strict commit-time error (validateFirewallPrefixListReferencesStrict, #1960
+// strict/lenient pattern). On the tolerant load / peer-sync path that gate
+// downgrades to a warning and an unresolved reference contributes no prefixes
+// (so a constrained term fails closed in the matcher rather than matching all).
+func resolvePrefixListAddrs(
+	literal []string,
+	refs []config.PrefixListRef,
+	cfg *config.Config,
+	filterName, termName, direction string,
+) ([]string, bool) {
+	if len(refs) == 0 {
+		// No prefix-lists: copy the literal addresses verbatim (never share the
+		// term's backing slice).
+		if len(literal) == 0 {
+			return nil, false
+		}
+		out := make([]string, len(literal))
+		copy(out, literal)
+		return out, false
+	}
+
+	var positive []string
+	positive = append(positive, literal...)
+	var exceptPrefixes []string
+	hasExcept := false
+	hasPositiveRef := false
+
+	for _, ref := range refs {
+		pl := cfg.PolicyOptions.PrefixLists[ref.Name]
+		if pl == nil {
+			// Undefined reference. The strict gate rejects this at commit; on
+			// the tolerant path it is a warning and we simply contribute no
+			// prefixes for it.
+			slog.Warn("firewall filter prefix-list reference unresolved",
+				"filter", filterName, "term", termName, "direction", direction,
+				"prefix-list", ref.Name)
+			continue
+		}
+		if ref.Except {
+			hasExcept = true
+			exceptPrefixes = append(exceptPrefixes, pl.Prefixes...)
+		} else {
+			hasPositiveRef = true
+			positive = append(positive, pl.Prefixes...)
+		}
+	}
+
+	// Clean except case: an `except` prefix-list is the sole address source for
+	// this direction (no literal addresses, no positive prefix-lists).
+	if hasExcept && len(positive) == 0 && !hasPositiveRef {
+		return exceptPrefixes, true
+	}
+
+	if hasExcept {
+		// Mixed positive + except in one direction — out of scope for the
+		// boolean-inversion model. Fold the except prefixes into the positive
+		// set (under-broad, fail-safe) and warn so the operator can split the
+		// term. Documented follow-up.
+		slog.Warn("firewall filter term mixes literal/positive addresses with an "+
+			"except prefix-list in one direction; the except modifier is ignored "+
+			"(prefixes treated as a positive match). Split into separate terms.",
+			"filter", filterName, "term", termName, "direction", direction)
+		positive = append(positive, exceptPrefixes...)
+	}
+
+	if len(positive) == 0 {
+		return nil, false
+	}
+	return positive, false
 }
 
 // tcpFlagsBits maps Junos TCP-flag names to their bit value in the TCP flags

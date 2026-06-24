@@ -847,6 +847,82 @@ func validateFirewallPolicerReferencesStrict(cfg *Config) error {
 	return check("inet6", cfg.Firewall.FiltersInet6)
 }
 
+// validateFirewallPrefixListReferencesStrict hard-rejects a firewall-filter
+// term whose `from source-prefix-list <name>` / `destination-prefix-list
+// <name>` (with or without `except`) names a prefix-list not defined under
+// `policy-options prefix-list <name>` (#2506).
+//
+// A dangling prefix-list reference compiled cleanly and the userspace snapshot
+// builder contributed NO prefixes for it, so the term reached the dataplane
+// with no address scope from that reference — a silent fail-open (accept/PBR
+// permits unintended traffic) or fail-closed (discard/reject drops everything),
+// action-dependent. This gate makes the typo operator-visible at commit,
+// consistent with the policer and routing-instance reference gates.
+//
+// Both filter families are walked, sorted by filter name then by term position
+// for a deterministic first error. On the tolerant load / peer-sync paths the
+// call site downgrades to a warning (opts.lenientFirewallRefs) so an already-
+// persisted or peer-synced config still BOOTS (#1960); the resolver then
+// contributes no prefixes for the unresolved reference. Mirrors
+// validateFirewallPolicerReferencesStrict.
+func validateFirewallPrefixListReferencesStrict(cfg *Config) error {
+	if cfg == nil {
+		return nil
+	}
+	defined := func(name string) bool {
+		if cfg.PolicyOptions.PrefixLists == nil {
+			return false
+		}
+		_, ok := cfg.PolicyOptions.PrefixLists[name]
+		return ok
+	}
+	check := func(family string, filters map[string]*FirewallFilter) error {
+		names := make([]string, 0, len(filters))
+		for name := range filters {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			filter := filters[name]
+			if filter == nil {
+				continue
+			}
+			for _, term := range filter.Terms {
+				if term == nil {
+					continue
+				}
+				for _, ref := range term.SourcePrefixLists {
+					if defined(ref.Name) {
+						continue
+					}
+					return fmt.Errorf(
+						"firewall family %s filter %q term %q references undefined "+
+							"source-prefix-list %q (define `policy-options prefix-list "+
+							"%s` or fix the name — the address scope would otherwise be "+
+							"silently lost)",
+						family, name, term.Name, ref.Name, ref.Name)
+				}
+				for _, ref := range term.DestPrefixLists {
+					if defined(ref.Name) {
+						continue
+					}
+					return fmt.Errorf(
+						"firewall family %s filter %q term %q references undefined "+
+							"destination-prefix-list %q (define `policy-options "+
+							"prefix-list %s` or fix the name — the address scope would "+
+							"otherwise be silently lost)",
+						family, name, term.Name, ref.Name, ref.Name)
+				}
+			}
+		}
+		return nil
+	}
+	if err := check("inet", cfg.Firewall.FiltersInet); err != nil {
+		return err
+	}
+	return check("inet6", cfg.Firewall.FiltersInet6)
+}
+
 // validateFirewallRoutingInstanceReferencesStrict hard-rejects a
 // firewall-filter term whose `then routing-instance <name>` (FBF /
 // filter-based-forwarding, Finding C, #2217) does not name a routing-instance

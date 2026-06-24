@@ -517,9 +517,18 @@ type FirewallFilterSnapshot struct {
 }
 
 type FirewallTermSnapshot struct {
-	Name            string        `json:"name"`
-	SourceAddresses []string      `json:"source_addresses,omitempty"`
-	DestAddresses   []string      `json:"destination_addresses,omitempty"`
+	Name            string   `json:"name"`
+	SourceAddresses []string `json:"source_addresses,omitempty"`
+	DestAddresses   []string `json:"destination_addresses,omitempty"`
+	// SourceExcept / DestExcept invert the corresponding address match (#2506):
+	// when true, the term matches every address that is NOT in the
+	// SourceAddresses / DestAddresses set (Junos `from source-prefix-list NAME
+	// except` / `destination-prefix-list NAME except`). The Rust matcher
+	// evaluates `(addr ∈ prefixes) XOR except`. These are populated only when the
+	// except prefix-list is the sole address source for the direction; the mixed
+	// literal+except case folds to a positive set (see resolvePrefixListAddrs).
+	SourceExcept    bool          `json:"source_except,omitempty"`
+	DestExcept      bool          `json:"destination_except,omitempty"`
 	Protocols       []string      `json:"protocols,omitempty"`
 	SourcePorts     []string      `json:"source_ports,omitempty"` // "80" or "1024-65535"
 	DestPorts       []string      `json:"destination_ports,omitempty"`

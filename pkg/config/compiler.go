@@ -1244,6 +1244,25 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		}
 	}
 
+	// #2506: firewall-filter `from source-prefix-list <name>` /
+	// `destination-prefix-list <name>` cross-reference. A term naming a
+	// prefix-list not defined under `policy-options prefix-list` compiled
+	// cleanly and the userspace snapshot builder contributed no prefixes for
+	// it, silently losing the address scope (fail-open or fail-closed depending
+	// on the action). Strict on commit / commit-check (hard reject so the typo
+	// is operator-visible); lenient on load / peer-sync (warn so an already-
+	// persisted or peer-synced config still boots — #1960; the resolver then
+	// contributes no prefixes for the unresolved reference). Mirrors the policer
+	// gate above.
+	if err := validateFirewallPrefixListReferencesStrict(cfg); err != nil {
+		if opts.lenientFirewallRefs {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("firewall prefix-list reference (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
 	// #2217 Finding C: firewall-filter `then routing-instance <name>` (FBF)
 	// cross-reference. A term naming a routing-instance not defined under
 	// `routing-instances` compiled cleanly and the dataplane steered matched
