@@ -2187,3 +2187,164 @@ fn issue_1741_clamped_entry_recoverable_by_hit() {
     assert_eq!(active, 1, "re-hit entry counts as active again");
     assert_eq!(rows.len(), 1);
 }
+
+// ----------------------------------------------------------------
+// (z) #2363: admission gate is symmetric with the lookup gate.
+//
+// The flow-cache LOOKUP path is gated by `packet_eligible` (UDP, or
+// established-TCP pure ACK). Before #2363 the INSERTION path was NOT:
+// a TCP control segment (SYN/SYN-ACK/FIN/RST) that produced a
+// ForwardCandidate decision would seed a cache entry, and a later pure
+// ACK on the same 5-tuple would then take the cache fast path and skip
+// the session lookup that observes/advances TCP closing state. The fix
+// folds `Self::packet_eligible(meta)` into `should_cache` so admission
+// and lookup share a single eligibility predicate.
+//
+// Fail-on-revert: removing the `packet_eligible` gate from
+// `should_cache` makes the SYN/SYN-ACK/FIN+ACK/RST+ACK rows below flip
+// to cacheable -> these asserts go red.
+// ----------------------------------------------------------------
+
+/// Build a v4 TCP meta carrying the given raw `tcp_flags`.
+fn make_tcp_meta_flags(tcp_flags: u8) -> UserspaceDpMeta {
+    UserspaceDpMeta {
+        protocol: PROTO_TCP,
+        addr_family: libc::AF_INET as u8,
+        ingress_ifindex: 7,
+        tcp_flags,
+        ..Default::default()
+    }
+}
+
+#[test]
+fn should_cache_admits_only_packet_eligible_segments() {
+    use crate::tcp_flags::{TCP_ACK, TCP_FIN, TCP_PSH, TCP_RST, TCP_SYN};
+    let decision = make_decision(ForwardingDisposition::ForwardCandidate);
+
+    // (flags, label, expected_cacheable)
+    let tcp_cases: [(u8, &str, bool); 6] = [
+        (TCP_SYN, "SYN", false),
+        (TCP_SYN | TCP_ACK, "SYN-ACK", false),
+        (TCP_FIN | TCP_ACK, "FIN+ACK", false),
+        (TCP_RST | TCP_ACK, "RST+ACK", false),
+        (TCP_ACK, "ACK", true),
+        (TCP_PSH | TCP_ACK, "PSH+ACK", true),
+    ];
+    for (flags, label, want) in tcp_cases {
+        let meta = make_tcp_meta_flags(flags);
+        assert_eq!(
+            FlowCacheEntry::should_cache(meta, decision),
+            want,
+            "TCP {label} (flags={flags:#x}) should_cache mismatch (want cacheable={want})",
+        );
+        // packet_eligible is the SSOT the lookup path uses; assert the
+        // two predicates agree for every TCP case.
+        assert_eq!(
+            FlowCacheEntry::packet_eligible(meta),
+            want,
+            "TCP {label}: packet_eligible must match should_cache admission",
+        );
+    }
+
+    // UDP is always eligible regardless of the (ignored) tcp_flags byte.
+    let udp = UserspaceDpMeta {
+        protocol: PROTO_UDP,
+        addr_family: libc::AF_INET as u8,
+        ingress_ifindex: 7,
+        tcp_flags: 0,
+        ..Default::default()
+    };
+    assert!(
+        FlowCacheEntry::should_cache(udp, decision),
+        "UDP ForwardCandidate must remain cacheable (no over-gate)",
+    );
+}
+
+#[test]
+fn from_forward_decision_declines_tcp_control_segments() {
+    use crate::tcp_flags::{TCP_ACK, TCP_FIN, TCP_PSH, TCP_RST, TCP_SYN};
+    // Control segments must NOT seed a cache entry; steady-state
+    // ACK/PSH+ACK still build one. Fail-on-revert: dropping the
+    // packet_eligible gate makes the first three rows return Some.
+    let control: [(u8, &str); 4] = [
+        (TCP_SYN, "SYN"),
+        (TCP_SYN | TCP_ACK, "SYN-ACK"),
+        (TCP_FIN | TCP_ACK, "FIN+ACK"),
+        (TCP_RST | TCP_ACK, "RST+ACK"),
+    ];
+    for (flags, label) in control {
+        let (flow, mut meta, validation, decision, forwarding, ha_state) =
+            make_v4_round_trip_inputs();
+        meta.tcp_flags = flags;
+        let entry = try_build_entry(&flow, meta, validation, decision, &forwarding, &ha_state);
+        assert!(
+            entry.is_none(),
+            "TCP {label} control segment must not seed a flow-cache entry",
+        );
+    }
+
+    // Steady-state data still caches (no over-gate on PSH+ACK).
+    for (flags, label) in [(TCP_ACK, "ACK"), (TCP_PSH | TCP_ACK, "PSH+ACK")] {
+        let (flow, mut meta, validation, decision, forwarding, ha_state) =
+            make_v4_round_trip_inputs();
+        meta.tcp_flags = flags;
+        let entry = try_build_entry(&flow, meta, validation, decision, &forwarding, &ha_state);
+        assert!(
+            entry.is_some(),
+            "established-TCP {label} must still be cacheable",
+        );
+    }
+}
+
+#[test]
+fn flow_cache_not_populated_by_control_segment_via_insertion_site() {
+    use crate::tcp_flags::{TCP_ACK, TCP_FIN, TCP_RST};
+    // Mirror the production insertion site (poll_descriptor/mod.rs ~2607):
+    //   if let Some(entry) = from_forward_decision(..) { flow_cache.insert(entry) }
+    // A FIN/RST slow-path packet must leave the worker-owned flow cache
+    // untouched; a subsequent pure-ACK on the same 5-tuple must be the one
+    // that seeds the entry. Fail-on-revert: without the packet_eligible
+    // gate, the FIN/RST insert below populates the cache and the first
+    // assert goes red.
+    let lookup_for = |meta: UserspaceDpMeta, validation: ValidationState, key: &_| {
+        let _ = key;
+        FlowCacheLookup {
+            ingress_ifindex: meta.ingress_ifindex as i32,
+            config_generation: validation.config_generation,
+            fib_generation: validation.fib_generation,
+        }
+    };
+
+    for control_flags in [TCP_FIN | TCP_ACK, TCP_RST | TCP_ACK] {
+        let mut cache = FlowCache::new();
+        let rg_epochs = default_rg_epochs();
+        let (flow, mut meta, validation, decision, forwarding, ha_state) =
+            make_v4_round_trip_inputs();
+        let key = flow.forward_key.clone();
+        let lookup = lookup_for(meta, validation, &key);
+
+        // Control segment: production gate declines, nothing inserted.
+        meta.tcp_flags = control_flags;
+        if let Some(entry) =
+            try_build_entry(&flow, meta, validation, decision, &forwarding, &ha_state)
+        {
+            cache.insert(entry);
+        }
+        assert!(
+            cache.lookup(&key, lookup, 0, &rg_epochs).is_none(),
+            "control segment (flags={control_flags:#x}) must not populate flow_cache",
+        );
+
+        // Follow-up pure ACK on the same tuple: now it caches.
+        meta.tcp_flags = TCP_ACK;
+        if let Some(entry) =
+            try_build_entry(&flow, meta, validation, decision, &forwarding, &ha_state)
+        {
+            cache.insert(entry);
+        }
+        assert!(
+            cache.lookup(&key, lookup, 0, &rg_epochs).is_some(),
+            "established pure-ACK follow-up must seed the flow_cache entry",
+        );
+    }
+}

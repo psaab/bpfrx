@@ -227,7 +227,21 @@ impl FlowCacheEntry {
 
     #[inline]
     pub(super) fn should_cache(meta: UserspaceDpMeta, decision: SessionDecision) -> bool {
-        matches!(meta.protocol, PROTO_TCP | PROTO_UDP)
+        // #2363: admission must use the IDENTICAL eligibility predicate the
+        // LOOKUP path gates on (`packet_eligible`: UDP or established-TCP pure
+        // ACK). Without this, a TCP control segment (SYN/SYN-ACK/FIN/RST) that
+        // produces a ForwardCandidate decision would seed a cache entry; a
+        // later pure-ACK on the same 5-tuple then takes the fast path and skips
+        // the session lookup that observes/advances TCP closing state on
+        // FIN/RST. The cached decision is the legitimately-computed forward
+        // decision (so this is NOT a policy fail-open) — the harm is the
+        // skipped flag-sensitive session-state observation. Keeping the gate in
+        // `should_cache` makes admission and lookup share a single source of
+        // truth for cacheability (see `packet_eligible`); PSH+ACK data segments
+        // remain cacheable because `is_ack_only` ignores PSH/URG, so
+        // steady-state data and UDP still fast-path.
+        Self::packet_eligible(meta)
+            && matches!(meta.protocol, PROTO_TCP | PROTO_UDP)
             && !decision.nat.nat64
             && !decision.nat.nptv6
             && decision.resolution.disposition.is_cacheable()
