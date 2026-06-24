@@ -216,18 +216,22 @@ func (es *EventStream) LastAckedSequence() uint64 {
 
 func (es *EventStream) Status() EventStreamStatus {
 	return EventStreamStatus{
-		FramesRead:        es.FramesRead.Load(),
-		FramesWritten:     es.FramesWritten.Load(),
-		DecodeErrors:      es.DecodeErrors.Load(),
-		SeqGaps:           es.SeqGaps.Load(),
-		PolicyDenyEvents:  es.PolicyDenyEvents.Load(),
-		ScreenDropEvents:  es.ScreenDropEvents.Load(),
-		ScreenAlarmEvents: es.ScreenAlarmEvents.Load(),
-		FilterLogEvents:   es.FilterLogEvents.Load(),
-		PolicyDenyDrops:   es.PolicyDenyDrops.Load(),
-		ScreenDropDrops:   es.ScreenDropDrops.Load(),
-		FilterLogDrops:    es.FilterLogDrops.Load(),
-		UnknownFrameDrops: es.UnknownFrameDrops.Load(),
+		FramesRead:          es.FramesRead.Load(),
+		FramesWritten:       es.FramesWritten.Load(),
+		DecodeErrors:        es.DecodeErrors.Load(),
+		SeqGaps:             es.SeqGaps.Load(),
+		PolicyDenyEvents:    es.PolicyDenyEvents.Load(),
+		ScreenDropEvents:    es.ScreenDropEvents.Load(),
+		ScreenAlarmEvents:   es.ScreenAlarmEvents.Load(),
+		FilterLogEvents:     es.FilterLogEvents.Load(),
+		SessionCloseEvents:  es.SessionCloseEvents.Load(),
+		SessionCreateEvents: es.SessionCreateEvents.Load(),
+		PolicyDenyDrops:     es.PolicyDenyDrops.Load(),
+		ScreenDropDrops:     es.ScreenDropDrops.Load(),
+		FilterLogDrops:      es.FilterLogDrops.Load(),
+		SessionCloseDrops:   es.SessionCloseDrops.Load(),
+		SessionCreateDrops:  es.SessionCreateDrops.Load(),
+		UnknownFrameDrops:   es.UnknownFrameDrops.Load(),
 	}
 }
 
