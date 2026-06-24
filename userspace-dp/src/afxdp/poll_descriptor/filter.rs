@@ -217,6 +217,7 @@ pub(super) fn evaluate_dscp_sensitive_input_filter_on_session_hit(
 #[cold]
 #[inline(never)]
 pub(super) fn emit_input_filter_log_match(
+    forwarding: &ForwardingState,
     event_stream: Option<&crate::event_stream::EventStreamWorkerHandle>,
     flow: &SessionFlow,
     meta: UserspaceDpMeta,
@@ -233,12 +234,16 @@ pub(super) fn emit_input_filter_log_match(
         cached_log.log_match.term_id,
         cached_log.log_match.action,
         FilterLogSource::Input,
+        // #2520: resolve the AppID via the hot-path app_catalog.lookup so the
+        // filter-log RT_FLOW record carries the application, not UNKNOWN.
+        resolve_flow_app_id(&forwarding.app_catalog, flow),
         now_ns,
     );
 }
 
 #[inline]
 pub(super) fn emit_cached_input_filter_log(
+    forwarding: &ForwardingState,
     event_stream: Option<&crate::event_stream::EventStreamWorkerHandle>,
     flow: &SessionFlow,
     meta: UserspaceDpMeta,
@@ -248,7 +253,7 @@ pub(super) fn emit_cached_input_filter_log(
     let Some(cached_log) = cached_descriptor.input_filter_log else {
         return;
     };
-    emit_input_filter_log_match(event_stream, flow, meta, cached_log, now_ns);
+    emit_input_filter_log_match(forwarding, event_stream, flow, meta, cached_log, now_ns);
 }
 
 #[inline]
@@ -300,6 +305,8 @@ fn emit_cached_output_filter_log_tail(
         log_match.term_id,
         log_match.action,
         FilterLogSource::CachedOutput,
+        // #2520: AppID via the hot-path app_catalog.lookup.
+        resolve_flow_app_id(&forwarding.app_catalog, flow),
         now_ns,
     );
 }
@@ -354,6 +361,8 @@ pub(super) fn apply_lo0_filter_action(
             log_match.term_id,
             log_match.action,
             FilterLogSource::Lo0,
+            // #2520: AppID via the hot-path app_catalog.lookup.
+            resolve_flow_app_id(&forwarding.app_catalog, flow),
             now_ns,
         );
     }

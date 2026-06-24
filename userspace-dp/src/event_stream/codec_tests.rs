@@ -279,6 +279,7 @@ fn test_encode_session_close_rt_flow_v4_wire_layout() {
         false,           // #2508: log_syslog gate
         1_700_000_000,   // #2465: created Unix seconds
         1_700_000_123_000_000_000, // #2465: close instant Unix ns
+        7,               // #2520: application id
     );
 
     assert_eq!(frame.data[4], MSG_SESSION_CLOSE_RT_FLOW);
@@ -328,6 +329,12 @@ fn test_encode_session_close_rt_flow_v4_wire_layout() {
     ); // close instant Unix ns
     // close reason — none (the delta carries no idle/FIN/RST discriminator).
     assert_eq!(p[134], RT_FLOW_CLOSE_REASON_NONE);
+    // #2520 fail-on-revert: the application id rides the [132:134] slot
+    // (little-endian), the same slot the deny/screen/filter frames use and the
+    // Go DecodeRawEventRecord reads to resolve application=. Reverting the
+    // encoder to leave it 0 makes this assertion fail (and the close record
+    // logs application="UNKNOWN").
+    assert_eq!(u16::from_le_bytes([p[132], p[133]]), 7);
 }
 
 #[test]
@@ -350,6 +357,7 @@ fn test_encode_session_close_rt_flow_v6() {
         false, // #2508: log_syslog gate
         0,     // #2465: created Unix seconds (unknown → fallback)
         0,     // #2465: close instant Unix ns
+        0,     // #2520: application id (unknown)
     );
     let p = &frame.data[FRAME_HEADER_SIZE..frame.len as usize];
     assert_eq!(p[52], RT_FLOW_EVENT_SESSION_CLOSE);
@@ -388,6 +396,7 @@ fn test_session_close_rt_flow_log_gate_byte() {
             log_syslog,
             0, // #2465: created Unix seconds
             0, // #2465: close instant Unix ns
+            0, // #2520: application id
         )
     };
     let gated_off = mk(false);

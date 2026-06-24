@@ -2,7 +2,7 @@ use super::*;
 use crate::event_stream::EventStreamWorkerHandle;
 use crate::event_stream::codec::{DataplaneEventKind, DataplaneEventPayload};
 use crate::filter::FilterAction;
-use crate::policy::PolicyAction;
+use crate::policy::{AppCatalog, PolicyAction};
 use crate::screen::ScreenPacketInfo;
 
 const RT_FLOW_ACTION_DENY: u8 = 0;
@@ -68,6 +68,25 @@ pub(super) fn event_now_ns_from_secs(now_secs: u64) -> u64 {
     now_secs.saturating_mul(NS_PER_SEC)
 }
 
+/// #2520: resolve the AppID for a cold-path RT_FLOW record (policy-deny /
+/// filter-log / session-close) from the flow 5-tuple, reusing the SAME
+/// `app_catalog.lookup` the forwarding hot path runs when it stamps the
+/// conntrack entry (`poll_descriptor` session-create:
+/// `worker_ctx.forwarding.app_catalog.lookup(protocol, src_port, dst_port)`).
+/// There is no duplicated resolution logic — the catalog probes both port
+/// slots so a forward- or reverse-keyed tuple resolves to the same app_id.
+/// Returns 0 (UNKNOWN) when nothing matches, which the Go RT_FLOW logger
+/// renders as `application="UNKNOWN"` — the unchanged behavior for an
+/// unresolvable tuple.
+#[inline]
+pub(super) fn resolve_flow_app_id(app_catalog: &AppCatalog, flow: &SessionFlow) -> u16 {
+    app_catalog.lookup(
+        flow.forward_key.protocol,
+        flow.forward_key.src_port,
+        flow.forward_key.dst_port,
+    )
+}
+
 #[inline]
 pub(super) fn emit_policy_deny_event(
     event_stream: Option<&EventStreamWorkerHandle>,
@@ -78,6 +97,7 @@ pub(super) fn emit_policy_deny_event(
     owner_rg_id: i32,
     policy_id: u32,
     action: PolicyAction,
+    app_id: u16,
     now_ns: u64,
 ) {
     let Some(event_stream) = event_stream else {
@@ -104,7 +124,10 @@ pub(super) fn emit_policy_deny_event(
         term_id: 0,
         reason: RT_FLOW_CLOSE_REASON_POLICY,
         owner_rg_id: owner_rg_id_to_wire(owner_rg_id),
-        application_id: 0,
+        // #2520: carry the resolved AppID (the caller runs the same
+        // app_catalog.lookup the hot path uses) so policy-deny RT_FLOW
+        // records show the resolved application instead of UNKNOWN.
+        application_id: app_id,
         filter_id: 0,
         screen_id: 0,
         // #2470: stamp the dataplane DECISION instant (wall-clock Unix ns)
@@ -259,6 +282,7 @@ pub(super) fn emit_filter_log_event(
     term_id: u32,
     action: FilterAction,
     source: FilterLogSource,
+    app_id: u16,
     now_ns: u64,
 ) {
     let Some(event_stream) = event_stream else {
@@ -285,7 +309,10 @@ pub(super) fn emit_filter_log_event(
         term_id,
         reason: source.wire_reason(),
         owner_rg_id: 0,
-        application_id: 0,
+        // #2520: carry the resolved AppID so filter-log RT_FLOW records show
+        // the resolved application instead of UNKNOWN. Same lookup as the hot
+        // path (see resolve_flow_app_id).
+        application_id: app_id,
         filter_id,
         screen_id: 0,
         // #2470: stamp the dataplane DECISION instant (wall-clock Unix ns) at
@@ -435,6 +462,7 @@ mod tests {
             3,
             101,
             PolicyAction::Deny,
+            0,
             mono_now_ns(),
         );
 
@@ -482,6 +510,7 @@ mod tests {
             3,
             101,
             PolicyAction::Reject,
+            0,
             123,
         );
 
@@ -680,6 +709,7 @@ mod tests {
             5,
             FilterAction::Accept,
             FilterLogSource::Input,
+            0,
             mono_now_ns(),
         );
 
@@ -723,6 +753,7 @@ mod tests {
             6,
             FilterAction::Reject,
             FilterLogSource::Lo0,
+            0,
             mono_now_ns(),
         );
 
@@ -756,6 +787,7 @@ mod tests {
             6,
             FilterAction::Discard,
             FilterLogSource::Lo0,
+            0,
             mono_now_ns(),
         );
 
@@ -767,6 +799,83 @@ mod tests {
         assert_eq!(event.kind, DataplaneEventKind::FilterLog);
         assert_eq!(event.action, RT_FLOW_ACTION_DENY);
         assert_eq!(handle.dataplane_event_stats().filter_log.sent, 1);
+    }
+
+    /// #2520 fail-on-revert: a CONFIGURED application (TCP/443 → app_id 7 in
+    /// the catalog) must surface in BOTH the policy-deny and filter-log RT_FLOW
+    /// records. The emitter call sites resolve the AppID with the SAME
+    /// `app_catalog.lookup` the forwarding hot path uses (here via
+    /// `resolve_flow_app_id`). Reverting the emitters back to a hardcoded
+    /// `application_id: 0` makes both assertions fail (the wire slot reads 0,
+    /// which the Go RT_FLOW logger renders as application="UNKNOWN").
+    #[test]
+    fn cold_path_events_carry_resolved_app_id() {
+        // TCP/443 single-dst-port app → app_id 7 (matches test_flow()).
+        let catalog = AppCatalog::from_snapshot(&[crate::AppCatalogEntry {
+            app_id: 7,
+            protocol: PROTO_TCP,
+            dst_port_low: 443,
+            dst_port_high: 443,
+            src_port_low: 0,
+            src_port_high: 0,
+        }]);
+        let flow = test_flow();
+        let app_id = resolve_flow_app_id(&catalog, &flow);
+        assert_eq!(app_id, 7, "configured TCP/443 app must resolve to id 7");
+
+        let (handle, rx) = unlimited_handle();
+        emit_policy_deny_event(
+            Some(&handle),
+            &flow,
+            test_meta(),
+            7,
+            9,
+            3,
+            101,
+            PolicyAction::Deny,
+            app_id,
+            mono_now_ns(),
+        );
+        let deny = rx
+            .try_recv()
+            .expect("policy event frame")
+            .decode_dataplane_event()
+            .expect("policy event payload");
+        assert_eq!(
+            deny.application_id, 7,
+            "policy-deny RT_FLOW must carry the resolved AppID, not UNKNOWN(0)"
+        );
+
+        emit_filter_log_event(
+            Some(&handle),
+            &flow,
+            test_meta(),
+            7,
+            0,
+            23,
+            5,
+            FilterAction::Accept,
+            FilterLogSource::Input,
+            app_id,
+            mono_now_ns(),
+        );
+        let filt = rx
+            .try_recv()
+            .expect("filter event frame")
+            .decode_dataplane_event()
+            .expect("filter event payload");
+        assert_eq!(
+            filt.application_id, 7,
+            "filter-log RT_FLOW must carry the resolved AppID, not UNKNOWN(0)"
+        );
+    }
+
+    /// #2520: a tuple with no catalog match resolves to 0 (UNKNOWN), the
+    /// unchanged behavior — we must NOT fabricate an AppID.
+    #[test]
+    fn cold_path_events_unresolvable_tuple_stays_zero() {
+        let catalog = AppCatalog::default();
+        assert_eq!(resolve_flow_app_id(&catalog, &test_flow()), 0);
     }
 
     /// #2470: two events emitted in monotonic-instant order carry
@@ -789,6 +898,7 @@ mod tests {
             3,
             101,
             PolicyAction::Deny,
+            0,
             t0,
         );
         // A strictly later monotonic instant for the second event.
@@ -803,6 +913,7 @@ mod tests {
             5,
             FilterAction::Accept,
             FilterLogSource::Input,
+            0,
             t1,
         );
 

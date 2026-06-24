@@ -189,6 +189,8 @@ pub(super) fn build_live_forward_request_from_frame(
             filter_log.term_id,
             filter_log.action,
             FilterLogSource::Output,
+            // #2520: AppID via the hot-path app_catalog.lookup.
+            resolve_flow_app_id(&forwarding.app_catalog, flow),
             now_ns,
         );
     }

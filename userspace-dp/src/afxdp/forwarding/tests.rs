@@ -1952,6 +1952,7 @@ fn policy_selection_deny_emits_rt_flow_event() {
         1,
         42,
         action,
+        0,
         123,
     );
 

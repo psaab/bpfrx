@@ -471,7 +471,11 @@ impl EventStreamWorkerHandle {
     /// guard is repeated here so a future caller cannot misuse it on an Open
     /// delta. Best-effort (`try_send`): a dropped close frame loses only one
     /// flow-export record, never the HA close delta (a separate frame).
-    pub(crate) fn emit_session_close_rt_flow(&self, delta: &SessionDelta) {
+    /// `app_id` is the application resolved for the closing session's 5-tuple
+    /// by the caller (`flush_session_deltas`) via the same `app_catalog.lookup`
+    /// the forwarding hot path runs — #2520. 0 means UNKNOWN (no catalog
+    /// match), the unchanged behavior.
+    pub(crate) fn emit_session_close_rt_flow(&self, delta: &SessionDelta, app_id: u16) {
         if delta.kind != SessionDeltaKind::Close {
             return;
         }
@@ -524,6 +528,10 @@ impl EventStreamWorkerHandle {
                     delta.metadata.log_session_close,
                     created_unix_secs,
                     close_unix_ns,
+                    // #2520: carry the resolved AppID in the [132:134] wire
+                    // slot so SESSION_CLOSE RT_FLOW records (and the
+                    // NetFlow/IPFIX exporters) show the application.
+                    app_id,
                 )
             },
         );

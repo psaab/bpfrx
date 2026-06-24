@@ -38,6 +38,19 @@ periodic ACK from the daemon.
   time, skewing the logged event time to consumption time under helper
   backlog / reconnect / CPU contention. A 0 (clock-read failure) still
   falls back to receive time on the Go side.
+  (#2520) the cold-path RT_FLOW emitters also populate the `application id`
+  slot (offset 132, little-endian u16) instead of hardcoding 0. The
+  `emit_policy_deny_event` / `emit_filter_log_event` call sites and the
+  `emit_session_close_rt_flow` caller resolve the AppID with the SAME
+  `app_catalog.lookup(protocol, src_port, dst_port)` the forwarding hot
+  path runs when it stamps the conntrack entry on session create (see
+  `afxdp::event_emit::resolve_flow_app_id`), so a policy-deny / filter-log /
+  session-close record shows `application=<name>` for a resolvable 5-tuple
+  instead of `application="UNKNOWN"`. 0 stays the UNKNOWN sentinel when the
+  catalog has no match. The screen emitters (`emit_screen_drop_event` /
+  `emit_screen_alarm_event`) deliberately keep 0: the screen parse-error
+  fail-closed path (#2146) and the L4-less screen drops legitimately lack a
+  resolvable 5-tuple, so fabricating an AppID there would be wrong.
   `MSG_SESSION_CLOSE_RT_FLOW` (14) carries that same 136-byte payload
   with the event-type byte set to RT_FLOW SESSION_CLOSE (2). It is
   emitted once per session close (via `emit_session_close_rt_flow`,
@@ -45,7 +58,8 @@ periodic ACK from the daemon.
   `MSG_SESSION_CLOSE` HA session-sync delta), and is what drives the Go
   NetFlow v9 / IPFIX session-close exporters in userspace mode (they only
   fire on a `Type == "SESSION_CLOSE"` record; before #2460 none was
-  produced). It carries the real 5-tuple, NAT tuple, zones, and protocol.
+  produced). It carries the real 5-tuple, NAT tuple, zones, and protocol
+  (and, #2520, the resolved application id at offset 132).
   (#2465) it ALSO carries the real session timestamps: the
   session-creation instant in the `created` field (offset 108, absolute
   Unix **seconds**, little-endian u32) and the close instant in
