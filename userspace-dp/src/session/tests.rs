@@ -1814,6 +1814,7 @@ fn reference_update_session(
     entry.last_seen_ns = now_ns;
     entry.expires_after_ns = session_timeout_ns(protocol, tcp_flags, &table.timeouts);
     entry.closing = matches!(protocol, PROTO_TCP) && (tcp_flags & (TCP_FIN | TCP_RST)) != 0;
+    let created_ns = entry.created_ns;
     table.restore_entry(key.clone(), entry);
     table.push_to_wheel(key, now_ns);
     if was_peer_synced && !origin.is_peer_synced() && !metadata.is_reverse {
@@ -1824,6 +1825,8 @@ fn reference_update_session(
             metadata,
             origin,
             fabric_redirect_sync: false,
+            created_ns,
+            last_seen_ns: now_ns,
         });
     }
     true

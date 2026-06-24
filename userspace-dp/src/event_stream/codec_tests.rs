@@ -270,7 +270,9 @@ fn test_encode_session_close_rt_flow_v4_wire_layout() {
         TEST_TRUST_ZONE_ID,
         TEST_UNTRUST_ZONE_ID,
         1,
-        false, // #2508: log_syslog gate
+        false,           // #2508: log_syslog gate
+        1_700_000_000,   // #2465: created Unix seconds
+        1_700_000_123_000_000_000, // #2465: close instant Unix ns
     );
 
     assert_eq!(frame.data[4], MSG_SESSION_CLOSE_RT_FLOW);
@@ -300,13 +302,24 @@ fn test_encode_session_close_rt_flow_v4_wire_layout() {
     // NAT translated source IP/port.
     assert_eq!(&p[72..76], &[172, 16, 80, 8]);
     assert_eq!(u16::from_be_bytes([p[104], p[105]]), 40000);
-    // #2501: counters and created stamp are 0 until per-session accounting
-    // lands. Asserting they are 0 keeps the honest-zero contract explicit.
+    // #2501: byte/packet counters are 0 until per-session accounting lands.
+    // Asserting they are 0 keeps the honest-zero contract explicit.
     assert_eq!(u64::from_le_bytes(p[56..64].try_into().unwrap()), 0); // pkts
     assert_eq!(u64::from_le_bytes(p[64..72].try_into().unwrap()), 0); // bytes
-    assert_eq!(u32::from_le_bytes(p[108..112].try_into().unwrap()), 0); // created
     assert_eq!(u64::from_le_bytes(p[112..120].try_into().unwrap()), 0); // rev pkts
     assert_eq!(u64::from_le_bytes(p[120..128].try_into().unwrap()), 0); // rev bytes
+    // #2465 fail-on-revert: the created stamp (offset 108, Unix seconds, LE)
+    // and the record timestamp (offset 0, Unix ns, LE) must carry the real
+    // session timestamps now, NOT 0. If the encoder drops these args the flow
+    // exporter falls back to the packet-count heuristic StartTime.
+    assert_eq!(
+        u32::from_le_bytes(p[108..112].try_into().unwrap()),
+        1_700_000_000
+    ); // created Unix secs
+    assert_eq!(
+        u64::from_le_bytes(p[0..8].try_into().unwrap()),
+        1_700_000_123_000_000_000
+    ); // close instant Unix ns
     // close reason — none (the delta carries no idle/FIN/RST discriminator).
     assert_eq!(p[134], RT_FLOW_CLOSE_REASON_NONE);
 }
@@ -329,6 +342,8 @@ fn test_encode_session_close_rt_flow_v6() {
         TEST_UNTRUST_ZONE_ID,
         0,
         false, // #2508: log_syslog gate
+        0,     // #2465: created Unix seconds (unknown → fallback)
+        0,     // #2465: close instant Unix ns
     );
     let p = &frame.data[FRAME_HEADER_SIZE..frame.len as usize];
     assert_eq!(p[52], RT_FLOW_EVENT_SESSION_CLOSE);
@@ -365,6 +380,8 @@ fn test_session_close_rt_flow_log_gate_byte() {
             TEST_UNTRUST_ZONE_ID,
             0,
             log_syslog,
+            0, // #2465: created Unix seconds
+            0, // #2465: close instant Unix ns
         )
     };
     let gated_off = mk(false);
@@ -608,6 +625,8 @@ fn test_close_flags() {
         },
         origin: crate::session::SessionOrigin::ForwardFlow,
         fabric_redirect_sync: true,
+        created_ns: 0,
+        last_seen_ns: 0,
     };
     let flags = close_flags(&delta);
     assert_eq!(flags & FLAG_FABRIC_REDIRECT, FLAG_FABRIC_REDIRECT);

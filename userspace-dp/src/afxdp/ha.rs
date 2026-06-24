@@ -504,6 +504,12 @@ impl super::Coordinator {
                         metadata: entry.metadata.clone(),
                         origin: entry.origin,
                         fabric_redirect_sync: false,
+                        // #2465: the shared SyncedSessionEntry carries no
+                        // creation instant, and this purge path uses
+                        // push_delta_lossless (NOT emit_session_close_rt_flow),
+                        // so these are 0/unknown.
+                        created_ns: 0,
+                        last_seen_ns: 0,
                     });
                 }
             }
@@ -588,6 +594,11 @@ impl super::Coordinator {
                 metadata: entry.metadata.clone(),
                 origin: entry.origin,
                 fabric_redirect_sync: true,
+                // #2465: Open delta from the HA bulk export — the synced entry
+                // carries no creation instant. The SESSION_CREATE frame reports
+                // no duration, so 0/unknown is correct here.
+                created_ns: 0,
+                last_seen_ns: 0,
             });
         }
         drop(sessions);

@@ -32,6 +32,57 @@ use std::sync::mpsc::{self, SyncSender, TryRecvError};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+const NS_PER_SEC: u64 = 1_000_000_000;
+
+/// #2465: read CLOCK_MONOTONIC (ns) and the wall clock (ns since the Unix
+/// epoch) in one pair so the two are anchored to the same instant. Used to
+/// convert the session table's monotonic creation/last-seen instants into the
+/// absolute wall-clock values the flow-export wire fields carry. On a clock
+/// read failure both fall back to 0 (→ the Go-side packet-count fallback).
+fn read_mono_and_wall_clocks() -> (u64, u64) {
+    let mut mono = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    let mut wall = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    let rc_mono = unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut mono) };
+    let rc_wall = unsafe { libc::clock_gettime(libc::CLOCK_REALTIME, &mut wall) };
+    if rc_mono != 0 || rc_wall != 0 || mono.tv_sec < 0 || wall.tv_sec < 0 {
+        return (0, 0);
+    }
+    let mono_ns = (mono.tv_sec as u64)
+        .saturating_mul(NS_PER_SEC)
+        .saturating_add(mono.tv_nsec.max(0) as u64);
+    let wall_ns = (wall.tv_sec as u64)
+        .saturating_mul(NS_PER_SEC)
+        .saturating_add(wall.tv_nsec.max(0) as u64);
+    (mono_ns, wall_ns)
+}
+
+/// #2465: convert a monotonic instant (`mono_ns`) to an absolute wall-clock
+/// nanosecond count, anchored against a (`now_mono_ns`, `now_unix_ns`) reading.
+/// `mono_ns == 0` (unknown) maps to 0. The age is clamped at the present so a
+/// monotonic value slightly ahead of `now_mono_ns` (a benign cross-CPU read
+/// skew) cannot push the result into the future.
+pub(crate) fn monotonic_ns_to_unix_ns(mono_ns: u64, now_mono_ns: u64, now_unix_ns: u64) -> u64 {
+    if mono_ns == 0 || now_mono_ns == 0 || now_unix_ns == 0 {
+        return 0;
+    }
+    let age_ns = now_mono_ns.saturating_sub(mono_ns);
+    now_unix_ns.saturating_sub(age_ns)
+}
+
+/// #2465: convert a monotonic instant to absolute wall-clock Unix SECONDS for
+/// the `created` wire field (offset 108, u32). Truncates toward the epoch;
+/// 0/unknown stays 0; values beyond u32 (year 2106) saturate.
+pub(crate) fn monotonic_ns_to_unix_secs(mono_ns: u64, now_mono_ns: u64, now_unix_ns: u64) -> u32 {
+    let unix_ns = monotonic_ns_to_unix_ns(mono_ns, now_mono_ns, now_unix_ns);
+    (unix_ns / NS_PER_SEC).min(u32::MAX as u64) as u32
+}
+
 /// Interval between keepalive frames to prevent idle disconnect.
 #[allow(dead_code)] // reserved for event stream keepalive logic
 const KEEPALIVE_INTERVAL_NS: u64 = 10_000_000_000; // 10 seconds
@@ -404,6 +455,18 @@ impl EventStreamWorkerHandle {
         }
         let nat = &delta.decision.nat;
         let seq = self.next_seq();
+        // #2465: convert the monotonic creation / last-seen instants on the
+        // close delta to absolute wall-clock values for the wire. The session
+        // table uses CLOCK_MONOTONIC, but the flow record needs an absolute
+        // StartTime (and the EndTime is a wall-clock instant on the Go side),
+        // so we anchor monotonic deltas against a single (mono, wall) reading
+        // taken here at emit time. A 0 created_ns stays 0 on the wire and
+        // triggers the Go-side packet-count fallback.
+        let (now_mono_ns, now_unix_ns) = read_mono_and_wall_clocks();
+        let created_unix_secs =
+            monotonic_ns_to_unix_secs(delta.created_ns, now_mono_ns, now_unix_ns);
+        let close_unix_ns =
+            monotonic_ns_to_unix_ns(delta.last_seen_ns, now_mono_ns, now_unix_ns);
         let frame = EventFrame::encode_session_close_rt_flow(
             seq,
             delta.key.addr_family,
@@ -424,6 +487,8 @@ impl EventStreamWorkerHandle {
             // close), but this bit tells the Go logEvent path whether to ALSO
             // emit the per-policy RT_FLOW_SESSION_CLOSE syslog record.
             delta.metadata.log_session_close,
+            created_unix_secs,
+            close_unix_ns,
         );
         self.try_send(frame);
     }

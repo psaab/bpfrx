@@ -297,6 +297,11 @@ impl SessionTable {
                                 metadata: metadata.clone(),
                                 origin: removed.origin,
                                 fabric_redirect_sync: false,
+                                // #2465: carry the real creation/last-seen
+                                // instants from the expiring entry so the
+                                // RT_FLOW close frame reports a true StartTime.
+                                created_ns: removed.created_ns,
+                                last_seen_ns: removed.last_seen_ns,
                             });
                         }
                         expired_entries.push(ExpiredSession {

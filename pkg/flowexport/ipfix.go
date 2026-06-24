@@ -295,6 +295,9 @@ type IPFIXExporter struct {
 
 	exportedFlows atomic.Uint64
 	exportedPkts  atomic.Uint64
+	// #2465: see Exporter.estimatedDurations — count of close flows whose
+	// StartTime fell back to the packet-count heuristic (no real creation ts).
+	estimatedDurations atomic.Uint64
 }
 
 // NewIPFIXExporter creates a new IPFIX exporter. cfg is held by pointer
@@ -342,6 +345,12 @@ func (e *IPFIXExporter) Run(ctx context.Context) {
 
 // ExportSessionClose queues a flow record for IPFIX export.
 func (e *IPFIXExporter) ExportSessionClose(rec logging.EventRecord, evt SessionCloseData) {
+	// #2465: prefer the real session-creation timestamp for StartTime; fall
+	// back to the packet-count heuristic (and count it) only when absent.
+	startTime, usedEstimate := flowStartTime(rec, evt.Protocol)
+	if usedEstimate {
+		e.estimatedDurations.Add(1)
+	}
 	fr := FlowRecord{
 		SrcIP:     evt.SrcIP,
 		DstIP:     evt.DstIP,
@@ -350,7 +359,7 @@ func (e *IPFIXExporter) ExportSessionClose(rec logging.EventRecord, evt SessionC
 		Protocol:  evt.Protocol,
 		Packets:   rec.SessionPkts,
 		Bytes:     rec.SessionBytes,
-		StartTime: rec.Time.Add(-estimateSessionDuration(rec.SessionPkts, evt.Protocol)),
+		StartTime: startTime,
 		EndTime:   rec.Time,
 		IsIPv6:    evt.IsIPv6,
 	}
@@ -361,6 +370,13 @@ func (e *IPFIXExporter) ExportSessionClose(rec logging.EventRecord, evt SessionC
 // Stats returns export statistics.
 func (e *IPFIXExporter) Stats() (flows, packets uint64) {
 	return e.exportedFlows.Load(), e.exportedPkts.Load()
+}
+
+// EstimatedDurations returns the count of exported session-close flows whose
+// StartTime was derived from the packet-count heuristic (#2465) rather than a
+// real session-creation timestamp.
+func (e *IPFIXExporter) EstimatedDurations() uint64 {
+	return e.estimatedDurations.Load()
 }
 
 // CollectorHealth returns a per-collector write-health snapshot (#2464).

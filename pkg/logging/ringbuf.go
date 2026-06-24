@@ -452,6 +452,9 @@ func (er *EventReader) logEvent(data []byte) {
 	if evt.EventType == eventTypeSessionClose {
 		rec.SessionPkts = binary.LittleEndian.Uint64(data[56:64])
 		rec.SessionBytes = binary.LittleEndian.Uint64(data[64:72])
+		// #2465: surface the absolute session-creation Unix seconds for the
+		// flow exporters (a real StartTime instead of the packet-count guess).
+		rec.Created = evt.Created
 		// Compute elapsed time from session creation
 		if evt.Created > 0 {
 			nowSec := uint32(evt.Timestamp / 1000000000)
@@ -738,6 +741,10 @@ func DecodeRawEventRecord(data []byte) (EventRecord, bool) {
 		RevSessionPkts:  evt.RevPackets,
 		RevSessionBytes: evt.RevBytes,
 		CloseReason:     closeReasonName(evt.CloseReason),
+		// #2465: carry the absolute session-creation Unix seconds so the
+		// NetFlow/IPFIX exporters can set a real flow StartTime instead of the
+		// packet-count heuristic. 0 = unknown (old frame / synthesized close).
+		Created: evt.Created,
 	}
 	if evt.EventType != eventTypeSessionClose {
 		rec.SessionPkts = 0

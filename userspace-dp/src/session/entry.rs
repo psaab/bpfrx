@@ -129,6 +129,20 @@ pub(crate) struct SessionDelta {
     pub(crate) metadata: SessionMetadata,
     pub(crate) origin: SessionOrigin,
     pub(crate) fabric_redirect_sync: bool,
+    /// #2465: monotonic (`CLOCK_MONOTONIC`) nanosecond timestamp at which the
+    /// session was first installed, copied from the `SessionEntry.created_ns`.
+    /// Carried so the RT_FLOW SESSION_CLOSE frame can report a real flow
+    /// StartTime instead of the packet-count heuristic. `0` means "unknown"
+    /// (e.g. an explicit delete path that no longer has the entry, or an
+    /// HA-synced delta that never had a local install) — the exporter falls
+    /// back to `estimateSessionDuration` in that case.
+    pub(crate) created_ns: u64,
+    /// #2465: monotonic nanosecond timestamp of the session's last activity
+    /// (`SessionEntry.last_seen_ns`) at close time. Used together with
+    /// `created_ns` to convert the monotonic creation instant to an absolute
+    /// wall-clock StartTime at emit time without depending on a wall-clock
+    /// reading taken inside the GC pass. `0` means "unknown".
+    pub(crate) last_seen_ns: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

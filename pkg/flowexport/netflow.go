@@ -416,6 +416,13 @@ type Exporter struct {
 	// Stats
 	exportedFlows atomic.Uint64
 	exportedPkts  atomic.Uint64
+	// #2465: count of session-close flows whose StartTime fell back to the
+	// packet-count heuristic because the close event carried no real
+	// session-creation timestamp (rec.Created == 0). A high value relative to
+	// exportedFlows means most flows are still being timed by the old guess —
+	// operator-visible signal that the dataplane is not stamping creation
+	// times (e.g. all closes arriving via the explicit-delete / HA-purge path).
+	estimatedDurations atomic.Uint64
 }
 
 // NewExporter creates a new NetFlow v9 exporter. cfg is held by pointer
@@ -472,6 +479,13 @@ func (e *Exporter) Run(ctx context.Context) {
 
 // ExportSessionClose converts a session-close event into a flow record and queues it.
 func (e *Exporter) ExportSessionClose(rec logging.EventRecord, evt SessionCloseData) {
+	// #2465: use the real session-creation timestamp for StartTime when the
+	// close event carries one; fall back to the packet-count heuristic only
+	// when it is absent (and count that for operator visibility).
+	startTime, usedEstimate := flowStartTime(rec, evt.Protocol)
+	if usedEstimate {
+		e.estimatedDurations.Add(1)
+	}
 	fr := FlowRecord{
 		SrcIP:     evt.SrcIP,
 		DstIP:     evt.DstIP,
@@ -480,12 +494,19 @@ func (e *Exporter) ExportSessionClose(rec logging.EventRecord, evt SessionCloseD
 		Protocol:  evt.Protocol,
 		Packets:   rec.SessionPkts,
 		Bytes:     rec.SessionBytes,
-		StartTime: rec.Time.Add(-estimateSessionDuration(rec.SessionPkts, evt.Protocol)),
+		StartTime: startTime,
 		EndTime:   rec.Time,
 		IsIPv6:    evt.IsIPv6,
 	}
 
 	e.batch.add(fr)
+}
+
+// EstimatedDurations returns the count of exported session-close flows whose
+// StartTime was derived from the packet-count heuristic (#2465) rather than a
+// real session-creation timestamp.
+func (e *Exporter) EstimatedDurations() uint64 {
+	return e.estimatedDurations.Load()
 }
 
 // Stats returns export statistics.
