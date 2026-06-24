@@ -12951,3 +12951,12 @@ top.
   _BGPBFDPeersSingleBlock): count==2 on master-emulation, ==1 after fix.
   **File(s)**: pkg/frr/policy_render.go, pkg/frr/manager.go,
   pkg/frr/frr_test.go, pkg/frr/README.md, _Log.md
+
+- **Timestamp**: 2026-06-24
+  **Action**: #2527 — RPM test transitions now evaluate once per cycle
+  (per-test aggregate) instead of per probe, so transient mid-cycle loss
+  can no longer flap ip-monitoring static-route preference. Added a
+  probeFn test seam + runProbe wrapper; new per-cycle transition tests
+  (fail-on-revert proven: master fires [fail pass fail]=3, fixed fires 1).
+  **File(s)**: pkg/rpm/rpm.go, pkg/rpm/transition_cycle_test.go,
+  docs/multi-wan.md, _Log.md

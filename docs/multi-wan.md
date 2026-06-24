@@ -359,3 +359,16 @@ routing, and only on double fault).
 - Failover actuation is a differential frr-reload + one snapshot push
   per debounce window; detection time (probe interval × threshold)
   dominates end-to-end failover latency.
+- **Per-cycle transition evaluation (#2527).** An RPM test's pass/fail
+  status is a per-test aggregate, evaluated once across the whole probe
+  set (`probe-count` probes per cycle), Junos ip-monitoring style. The
+  successive-loss threshold is applied during the cycle but the test
+  transitions **at most once per cycle** — the sensor edge that drives
+  static-route preference fires after the full cycle completes, never
+  per probe. A single transient mid-cycle success therefore cannot flip
+  the test fail→pass→fail and flap the route tables within one cycle;
+  the consecutive-loss counter still carries across cycle boundaries, so
+  a `threshold` larger than `probe-count` trips on the cycle where the
+  running run finally crosses the bar. Coarser per-probe
+  `ping_probe_failed` events still fire per lost probe (eventengine
+  signal only; they do not actuate routes).
