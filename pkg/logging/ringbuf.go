@@ -839,8 +839,17 @@ func formatSyslogMsg(rec EventRecord) string {
 			rec.Type, rec.ScreenCheck, rec.SrcAddr, rec.DstAddr, rec.Protocol, rec.Action, inZone)
 	}
 	if rec.Type == "SESSION_CLOSE" {
-		return fmt.Sprintf("RT_FLOW %s src=%s dst=%s proto=%s action=%s policy=%d zone=%s->%s pkts=%d bytes=%d",
-			rec.Type, rec.SrcAddr, rec.DstAddr, rec.Protocol, rec.Action,
+		// A session close is not a forwarding decision, so it carries no
+		// permit/deny/reject action (the wire action byte is intentionally 0
+		// for closes; see userspace-dp encode_session_close_rt_flow). Rendering
+		// the 0 byte via actionName would print action=deny and mislead
+		// incident response into reading normal session termination as a drop
+		// (#2513). Omit action entirely — like the structured RT_FLOW_SESSION_
+		// CLOSE line, which carries a close reason instead. The close reason is
+		// surfaced on the structured line; the standard line keeps the volume
+		// counters operators use here.
+		return fmt.Sprintf("RT_FLOW %s src=%s dst=%s proto=%s policy=%d zone=%s->%s pkts=%d bytes=%d",
+			rec.Type, rec.SrcAddr, rec.DstAddr, rec.Protocol,
 			rec.PolicyID, inZone, outZone, rec.SessionPkts, rec.SessionBytes)
 	}
 	if rec.Type == "FILTER_LOG" {

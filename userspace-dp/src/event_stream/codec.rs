@@ -503,12 +503,13 @@ impl EventFrame {
         // [52] event type, [53] protocol, [54] action, [55] address family.
         buf[base + 52] = RT_FLOW_EVENT_SESSION_CLOSE;
         buf[base + 53] = protocol;
-        // [54] action: the Go decoder DOES map this byte to
-        // EventRecord.Action (and logs it for SESSION_CLOSE), but a session
-        // close has no permit/deny/reject action semantics, so it is
-        // intentionally 0. The flow exporters do not branch on it for a
-        // close; only the syslog/event line carries it (as "deny", the 0
-        // encoding) — harmless for a close record.
+        // [54] action: a session close has no permit/deny/reject action
+        // semantics, so this byte is intentionally 0. The Go decoder maps it
+        // into EventRecord.Action, but the flow exporters do not branch on it
+        // for a close, and as of #2513 the syslog/event renderers omit action
+        // for SESSION_CLOSE entirely (the standard line dropped its `action=`
+        // field; the structured line never carried one). Do NOT rely on the 0
+        // rendering as a value — both close formatters skip it.
         buf[base + 54] = 0;
         buf[base + 55] = wire_af;
         // [56:64] session_packets, [64:72] session_bytes — 0 (#2501).

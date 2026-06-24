@@ -146,6 +146,21 @@ if `Handle` runs the re-entrancy guard before the client check.
   `DecodeRawEventRecord` already honored the wire stamp — under helper
   backlog or reconnect that drifted from the decision instant. Keep the two
   paths on the single `eventTimeFromWire` SSOT.
+- **SESSION_CLOSE log lines carry no `action` (#2513).** A session close
+  is a termination event, not a forwarding decision, so it has no
+  permit/deny/reject action — the userspace-dp producer writes the wire
+  action byte as 0 for a close
+  (`encode_session_close_rt_flow`). Byte 0 maps to "deny" via
+  `actionName`, so the standard (plain) formatter used to render
+  `RT_FLOW SESSION_CLOSE ... action=deny ...`, which misread as a drop.
+  Both close renderers now omit action: the standard line
+  (`formatSyslogMsg`, keyed on `Type == "SESSION_CLOSE"`) drops the
+  `action=` field and keeps `proto/policy/zone/pkts/bytes`; the structured
+  line (`formatStructuredMsg` `RT_FLOW_SESSION_CLOSE`) never carried one and
+  reports a close `reason="..."` (e.g. "TCP FIN", "idle Timeout") matching
+  Junos. The omission is scoped to the close event type only — POLICY_DENY,
+  SCREEN_DROP, and FILTER_LOG (the genuine deny/reject paths) still render
+  `action`. Golden coverage: `session_close_format_test.go`.
 - `pkg/dataplane/userspace/eventstream_test.go` owns the deterministic
   local syslog harness for userspace RT_FLOW policy-deny, screen-drop, and
   filter-log frames. It sends raw event-stream frames through

@@ -1,5 +1,32 @@
 # Action Log
 
+## 2026-06-24 — #2513 fix: SESSION_CLOSE standard RT_FLOW line rendered `action=deny`
+
+- **Timestamp**: 2026-06-24
+- **Action**: A session close is a termination event, not a forwarding
+  decision, so userspace-dp writes the wire action byte as 0 for a close.
+  Byte 0 maps to "deny" via `actionName`, so the standard (plain)
+  `formatSyslogMsg` SESSION_CLOSE branch rendered `action=deny` — misleading
+  incident response into reading normal termination as a drop. Removed the
+  `action=` field from the standard SESSION_CLOSE line (the structured
+  RT_FLOW_SESSION_CLOSE line never carried one and reports a close
+  `reason="..."` instead, matching Junos). Change is keyed on
+  `Type == "SESSION_CLOSE"`, so POLICY_DENY / SCREEN_DROP / FILTER_LOG (the
+  genuine deny/reject paths) still render `action`. Wire encoding and the
+  `actionName` mapping are unchanged; only the misleading codec.rs comment
+  was corrected.
+- **File(s)**: pkg/logging/ringbuf.go (omit action= for the SESSION_CLOSE
+  standard branch), pkg/logging/session_close_format_test.go (golden tests,
+  new), userspace-dp/src/event_stream/codec.rs (comment only — the "harmless"
+  note now records that both close formatters omit action),
+  pkg/logging/README.md (SESSION_CLOSE line-format gotcha), _Log.md.
+- **Validation**: `go test ./pkg/logging/...` PASS; gofmt clean. Rust:
+  `cargo test --release --bin xpf-userspace-dp event_stream::codec` 17/17 PASS
+  (comment-only). Fail-on-revert PROVEN: restoring the `action=%s`/`rec.Action`
+  args to the standard SESSION_CLOSE branch makes TestStandardSessionCloseOmits
+  Action red (line shows `action=deny` again). TestStandardNonCloseStillRenders
+  Action confirms the change is event-type-scoped, not action==0 global.
+
 ## 2026-06-24 — #2403 fix: route-map next-hop emitted v4-only `set ip next-hop` for IPv6
 
 - **Timestamp**: 2026-06-24
