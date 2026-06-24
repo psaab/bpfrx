@@ -48,6 +48,16 @@ const (
 
 	maxPacketSize = 4096
 
+	// minMsgMaxSize is the RFC 3412 / RFC 3416 floor for a request's
+	// advertised msgMaxSize (the smallest maximum message size any SNMP
+	// engine must accept). A request that advertises less than this — or a
+	// v3 request whose msgMaxSize decoded to a tiny/garbage value — is
+	// clamped up to this floor before we size a GETBULK response against it,
+	// so a misbehaving manager cannot force us to truncate every response to
+	// nothing. The effective bound is then min(clamped msgMaxSize,
+	// maxPacketSize).
+	minMsgMaxSize = 484
+
 	// usmTimeWindow is the RFC 3414 §3.2 timeliness window in seconds: an
 	// authenticated request whose msgAuthoritativeEngineTime differs from
 	// the authoritative engine's own time by more than this is rejected as
@@ -635,7 +645,18 @@ func (a *Agent) handleGetBulk(community []byte, pduBody []byte) []byte {
 		}
 	}
 
-	return a.buildResponse(community, requestID, errNoError, 0, varbinds)
+	// Bound the response to maxPacketSize (RFC 3416 §4.2.3). v2c carries no
+	// per-request msgMaxSize, so the local maximum is the only ceiling. Trim
+	// trailing varbinds until the encoded message fits; the manager continues
+	// the walk from the last returned OID. Only if nothing fits do we fall
+	// back to tooBig with an empty varbind list.
+	resp, ok := trimToFit(varbinds, effectiveMaxSize(maxPacketSize), func(vbs []varbind) []byte {
+		return a.buildResponse(community, requestID, errNoError, 0, vbs)
+	})
+	if !ok {
+		return a.buildResponse(community, requestID, errTooBig, 0, nil)
+	}
+	return resp
 }
 
 // getCommunity returns the configured community matching the given string, or
@@ -897,6 +918,51 @@ type varbind struct {
 	oid   []int
 	tag   byte
 	value []byte
+}
+
+// effectiveMaxSize returns the byte budget a GETBULK response must fit
+// within: the smaller of the manager's advertised msgMaxSize and our own
+// maxPacketSize. The advertised value is first clamped up to minMsgMaxSize so
+// a manager that advertises a tiny (or, for v3, mis-decoded) msgMaxSize cannot
+// force every response down to nothing — RFC 3412 guarantees every engine
+// accepts at least minMsgMaxSize bytes. v2c carries no msgMaxSize on the wire,
+// so callers pass maxPacketSize there and this returns maxPacketSize.
+func effectiveMaxSize(advertised int) int {
+	if advertised < minMsgMaxSize {
+		advertised = minMsgMaxSize
+	}
+	if advertised > maxPacketSize {
+		return maxPacketSize
+	}
+	return advertised
+}
+
+// trimToFit bounds a GETBULK response to maxSize bytes (RFC 3416 §4.2.3). It
+// builds the response from vbs via build; if the encoded message exceeds
+// maxSize it drops trailing varbinds one at a time and rebuilds until the
+// message fits, returning the truncated-but-well-formed response. A manager
+// that receives a trimmed response continues the walk with a follow-up GETBULK
+// from the last returned OID, so trimming (not tooBig) is the normal, preferred
+// outcome.
+//
+// build must construct a complete SNMP response message from the supplied
+// varbind list (it captures the version-specific envelope: v2c community frame
+// or v3 USM/scopedPDU/auth/priv frame, request-id, error fields). It is called
+// repeatedly with successively shorter prefixes of vbs.
+//
+// If even the zero-varbind response cannot fit maxSize, trimFit reports ok
+// false; the caller then returns errTooBig with an empty varbind list. With a
+// minMsgMaxSize (>= 484) floor and our small fixed MIB this only happens for a
+// pathological maxSize, but it is handled rather than emitting an oversized
+// datagram.
+func trimToFit(vbs []varbind, maxSize int, build func([]varbind) []byte) (resp []byte, ok bool) {
+	for n := len(vbs); n >= 0; n-- {
+		resp = build(vbs[:n])
+		if len(resp) <= maxSize {
+			return resp, true
+		}
+	}
+	return nil, false
 }
 
 // buildResponse constructs a complete SNMP v2c response packet.
