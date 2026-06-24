@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"net"
+	"sort"
 	"strings"
 )
 
@@ -734,6 +735,60 @@ func ValidateConfig(cfg *Config) []string {
 	// against increment 1 cannot brick a boot (plan §4.5 / §7 Q-C).
 	warnings = append(warnings, validateDDNSBackendWarnings(cfg)...)
 
+	// #2507: firewall-filter `then loss-priority <low|...|high>` is parsed and
+	// stored on the term (FirewallFilterTerm.LossPriority) but is never wired
+	// onto the wire (no FirewallTermSnapshot field) and the userspace dataplane
+	// has no per-packet loss-priority consumer — the three-color policer always
+	// meters at PacketColor::Green and color-aware mode stays fail-closed until
+	// inherited packet color is carried through trusted metadata (see
+	// userspace-dp/src/filter/README.md). So the action commits and silently
+	// does nothing. Mirror the CoS classifier/rewrite loss-priority warning
+	// above: WARN-only (loss-priority is valid Junos — never fail the commit),
+	// once per filter/term, naming the filter and term so the operator knows
+	// the QoS action is inert. Same principle as #2486 (ipsec-vpn): never
+	// silently accept config the dataplane cannot enforce.
+	warnings = append(warnings, validateFilterLossPriorityWarnings(cfg)...)
+
+	return warnings
+}
+
+// validateFilterLossPriorityWarnings emits a WARN-only commit-time message for
+// each firewall-filter term carrying `then loss-priority`. The action is parsed
+// and stored but has no runtime consumer in the userspace dataplane (#2507), so
+// it is accepted-but-inert. It is never an error: loss-priority is valid Junos
+// and a hard reject would brick a boot on a previously-inert committed value.
+func validateFilterLossPriorityWarnings(cfg *Config) []string {
+	if cfg == nil {
+		return nil
+	}
+	var warnings []string
+	emit := func(family string, filters map[string]*FirewallFilter) {
+		// Stable order: iterate by sorted filter name so warnings are
+		// deterministic across commits (map iteration is randomized).
+		names := make([]string, 0, len(filters))
+		for name := range filters {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		for _, name := range names {
+			filter := filters[name]
+			if filter == nil {
+				continue
+			}
+			for _, term := range filter.Terms {
+				if term == nil || term.LossPriority == "" {
+					continue
+				}
+				warnings = append(warnings, fmt.Sprintf(
+					"firewall family %s filter %q term %q `then loss-priority %s` is "+
+						"accepted for compatibility but is inert in the userspace "+
+						"dataplane (no per-packet loss-priority action is enforced)",
+					family, name, term.Name, term.LossPriority))
+			}
+		}
+	}
+	emit("inet", cfg.Firewall.FiltersInet)
+	emit("inet6", cfg.Firewall.FiltersInet6)
 	return warnings
 }
 
