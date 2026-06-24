@@ -454,16 +454,21 @@ pub(super) fn delete_terminal_filtered_session(
     );
 }
 
-// #2442: widened from `pub(in crate::afxdp::session_glue)` to `pub(crate)` so
-// the worker loop's loss-of-sync resync path (`worker::loop_body`) — and the
-// session-module resync test — can re-emit owned forward sessions through the
-// same table-truth walk the `ExportOwnerRGSessions` command uses.
-pub(crate) fn export_forward_sessions_for_owner_rgs(
-    sessions: &mut SessionTable,
+/// #2442: the filter half of `export_forward_sessions_for_owner_rgs`. Walks the
+/// owner-RG index and returns the export candidates (forward, locally-owned,
+/// forwarding-disposition sessions) WITHOUT pushing any delta. The two
+/// callers re-emit at different cadences: the `ExportOwnerRGSessions` command
+/// path pushes the whole set in one go (its caller drains with a 15s
+/// export-ack budget), while the worker-loop loss-of-sync resync path
+/// (`worker::loop_body`) emits in ring-sized chunks, draining between chunks so
+/// a worker owning up to `DEFAULT_MAX_SESSIONS` (32× the delta ring) never
+/// re-overflows the ring it is trying to recover.
+pub(crate) fn forward_export_candidates_for_owner_rgs(
+    sessions: &SessionTable,
     owner_rgs: &[i32],
-) {
+) -> Vec<(SessionKey, SessionDecision, SessionMetadata, SessionOrigin)> {
     if owner_rgs.is_empty() {
-        return;
+        return Vec::new();
     }
     let mut export = Vec::new();
     for key in sessions.owner_rg_session_keys(owner_rgs) {
@@ -485,7 +490,23 @@ pub(crate) fn export_forward_sessions_for_owner_rgs(
         }
         export.push((key, decision, metadata, origin));
     }
-    for (key, decision, metadata, origin) in export {
+    export
+}
+
+// #2442: widened from `pub(in crate::afxdp::session_glue)` to `pub(crate)` so
+// the session-module resync test can re-emit owned forward sessions through the
+// same table-truth walk the `ExportOwnerRGSessions` command uses. The
+// command path pushes the entire candidate set at once (its caller drains
+// against a 15s export-ack budget); the worker-loop resync uses the chunked
+// `forward_export_candidates_for_owner_rgs` collector + interleaved drain
+// instead (see `worker::loop_body`).
+pub(crate) fn export_forward_sessions_for_owner_rgs(
+    sessions: &mut SessionTable,
+    owner_rgs: &[i32],
+) {
+    for (key, decision, metadata, origin) in
+        forward_export_candidates_for_owner_rgs(sessions, owner_rgs)
+    {
         sessions.emit_open_delta_with_origin(key, decision, metadata, origin, true);
     }
 }
