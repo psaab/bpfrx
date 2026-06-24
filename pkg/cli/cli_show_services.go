@@ -326,14 +326,15 @@ func (c *CLI) showDHCPRelay() error {
 			// alert on: it means the raw-L2 path failed (CAP_NET_RAW,
 			// driver, or MTU) and the relay degraded to broadcast.
 			fmt.Println("\nReply delivery (#2076):")
-			fmt.Printf("  %-16s %-10s %-10s %-10s %-10s %-10s %s\n",
+			fmt.Printf("  %-16s %-10s %-10s %-10s %-10s %-10s %-12s %s\n",
 				"Interface", "L2-unicast", "ciaddr", "bcast-flag", "bcast-fwd",
-				"no-target", "L2-fallback")
+				"no-target", "L2-fallback", "nak-bcast")
 			for _, s := range stats {
-				fmt.Printf("  %-16s %-10d %-10d %-10d %-10d %-10d %d\n",
+				fmt.Printf("  %-16s %-10d %-10d %-10d %-10d %-10d %-12d %d\n",
 					s.Interface, s.RepliesL2Unicast, s.RepliesUnicastCiaddr,
 					s.RepliesBroadcastFlag1, s.RepliesBroadcastForced,
-					s.RepliesBroadcastNoTarget, s.RepliesBroadcastL2Fallback)
+					s.RepliesBroadcastNoTarget, s.RepliesBroadcastL2Fallback,
+					s.RepliesBroadcastNak)
 			}
 		}
 	}

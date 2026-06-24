@@ -72,6 +72,7 @@ type RelayStats struct {
 	RepliesBroadcastForced     uint64 // overrides always-broadcast
 	RepliesBroadcastNoTarget   uint64 // no routable target (yiaddr==0,ciaddr==0)
 	RepliesBroadcastL2Fallback uint64 // raw-L2 path failed → degraded
+	RepliesBroadcastNak        uint64 // DHCPNAK force-broadcast (RFC 2131 §4.3.2)
 }
 
 // l2Replier is the raw-L2 unicast seam. *l2Sender implements it in production;
@@ -135,6 +136,7 @@ type interfaceRelay struct {
 	repliesBroadcastForced     atomic.Uint64
 	repliesBroadcastNoTarget   atomic.Uint64
 	repliesBroadcastL2Fallback atomic.Uint64
+	repliesBroadcastNak        atomic.Uint64
 }
 
 // packetConnFactory creates a UDP packet connection with the relay's required
@@ -487,6 +489,7 @@ func (m *Manager) Stats() []RelayStats {
 			RepliesBroadcastForced:     ir.repliesBroadcastForced.Load(),
 			RepliesBroadcastNoTarget:   ir.repliesBroadcastNoTarget.Load(),
 			RepliesBroadcastL2Fallback: ir.repliesBroadcastL2Fallback.Load(),
+			RepliesBroadcastNak:        ir.repliesBroadcastNak.Load(),
 		})
 	}
 	return stats
@@ -895,7 +898,13 @@ func handleServerResponses(ctx context.Context, serverConn, clientConn net.Packe
 		}
 
 		msgType := pkt.MessageType()
-		if msgType != dhcpv4.MessageTypeOffer && msgType != dhcpv4.MessageTypeAck {
+		switch msgType {
+		case dhcpv4.MessageTypeOffer, dhcpv4.MessageTypeAck, dhcpv4.MessageTypeNak:
+			// Forward to the client. NAK rejects the client's request
+			// (RFC 2131 §4.3.2); dropping it makes the client hang until
+			// its retransmission timeout instead of restarting with a
+			// fresh DISCOVER.
+		default:
 			continue
 		}
 
@@ -931,6 +940,17 @@ func deliverReply(ir *interfaceRelay, clientConn net.PacketConn, l2 l2Replier,
 	ciaddrReal := ciaddr != nil && !ciaddr.Equal(net.IPv4zero)
 
 	switch {
+	case pkt.MessageType() == dhcpv4.MessageTypeNak:
+		// A DHCPNAK rejects the client's request: it carries no binding,
+		// so yiaddr (and ciaddr) are zero and the client has no usable
+		// address. RFC 2131 §4.3.2 requires the relay to broadcast the
+		// NAK on the client's subnet regardless of the broadcast flag.
+		// Force broadcast here so a server that erroneously echoes a
+		// stale ciaddr cannot trick the matrix into a unicast to an
+		// address the client does not own.
+		ir.repliesBroadcastNak.Add(1)
+		return broadcastReply(ir, clientConn, replyData)
+
 	case ir.alwaysBroadcast:
 		ir.repliesBroadcastForced.Add(1)
 		return broadcastReply(ir, clientConn, replyData)

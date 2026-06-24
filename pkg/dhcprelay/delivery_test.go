@@ -363,6 +363,143 @@ func TestDeliverReply_ExactlyOneSend_NoDoubleDeliver(t *testing.T) {
 	}
 }
 
+// newNak builds a BOOTREPLY DHCPNAK. Per RFC 2131 a NAK carries no binding,
+// so yiaddr/ciaddr are zero; broadcast controls whether the client set the
+// flag. A stale ciaddr is accepted to exercise the force-broadcast guard.
+func newNak(t *testing.T, broadcast bool, ciaddr net.IP, chaddr net.HardwareAddr) *dhcpv4.DHCPv4 {
+	t.Helper()
+	pkt, err := dhcpv4.New()
+	if err != nil {
+		t.Fatalf("dhcpv4.New: %v", err)
+	}
+	pkt.OpCode = dhcpv4.OpcodeBootReply
+	pkt.HWType = iana.HWTypeEthernet
+	pkt.ClientHWAddr = chaddr
+	pkt.UpdateOption(dhcpv4.OptMessageType(dhcpv4.MessageTypeNak))
+	if broadcast {
+		pkt.SetBroadcast()
+	}
+	pkt.YourIPAddr = net.IPv4zero
+	if ciaddr != nil {
+		pkt.ClientIPAddr = ciaddr
+	} else {
+		pkt.ClientIPAddr = net.IPv4zero
+	}
+	return pkt
+}
+
+// TestDeliverReply_Nak_AlwaysBroadcast proves a DHCPNAK is force-broadcast to
+// the client (RFC 2131 §4.3.2) regardless of the broadcast flag, never
+// unicast — even when the server erroneously echoes a stale ciaddr that would
+// otherwise drive the matrix to a UDP unicast. It must also never take the
+// raw-L2 path (yiaddr is zero, so there is no address to unicast to).
+func TestDeliverReply_Nak_AlwaysBroadcast(t *testing.T) {
+	cases := []struct {
+		name      string
+		broadcast bool
+		ciaddr    net.IP
+	}{
+		{"flag_clear_no_ciaddr", false, nil},
+		{"flag_set_no_ciaddr", true, nil},
+		// Defense-in-depth: a NAK MUST NOT be unicast even if the server
+		// (incorrectly) leaves a stale ciaddr in the reply.
+		{"flag_clear_stale_ciaddr", false, testCiaddr},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ir := &interfaceRelay{ifaceName: "ge-0-0-0"}
+			client := newFakeConn()
+			defer client.Close()
+			fl2 := &fakeL2{}
+
+			pkt := newNak(t, tc.broadcast, tc.ciaddr, testChaddr)
+			if !deliverReply(ir, client, fl2, testGiaddr, pkt, pkt.ToBytes()) {
+				t.Fatal("deliverReply returned false (NAK not delivered)")
+			}
+
+			if fl2.callCount() != 0 {
+				t.Errorf("NAK must NOT use raw-L2 unicast, got %d calls", fl2.callCount())
+			}
+			if ir.repliesBroadcastNak.Load() != 1 {
+				t.Errorf("repliesBroadcastNak = %d, want 1", ir.repliesBroadcastNak.Load())
+			}
+			if ir.repliesUnicastCiaddr.Load() != 0 {
+				t.Errorf("NAK must NOT unicast to ciaddr, got %d", ir.repliesUnicastCiaddr.Load())
+			}
+
+			client.mu.Lock()
+			writes := append([]fakeWrite(nil), client.writes...)
+			client.mu.Unlock()
+			if len(writes) != 1 {
+				t.Fatalf("expected 1 client UDP write, got %d", len(writes))
+			}
+			got := writes[0].addr.(*net.UDPAddr)
+			if !got.IP.Equal(net.IPv4bcast) || got.Port != clientPort {
+				t.Errorf("NAK dst = %v, want broadcast %v:%d", got, net.IPv4bcast, clientPort)
+			}
+		})
+	}
+}
+
+// TestHandleServerResponses_NakForwarded is the fail-on-revert gate for #2606:
+// a DHCPNAK server reply MUST be forwarded to the client (broadcast), not
+// silently dropped. Removing dhcpv4.MessageTypeNak from the accepted set in
+// handleServerResponses makes this test red (the NAK is never written to the
+// client conn).
+func TestHandleServerResponses_NakForwarded(t *testing.T) {
+	nak := newNak(t, false, nil, testChaddr)
+	nak.GatewayIPAddr = testGiaddr // server echoes giaddr; relay must zero it
+	serverConn := newFakeConn()
+	serverConn.mu.Lock()
+	serverConn.pending = [][]byte{nak.ToBytes()}
+	serverConn.mu.Unlock()
+	clientConn := newFakeConn()
+	defer clientConn.Close()
+	fl2 := &fakeL2{}
+	ir := &interfaceRelay{ifaceName: "ge-0-0-0"}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	done := make(chan struct{})
+	go func() {
+		handleServerResponses(ctx, serverConn, clientConn, ir, fl2, testGiaddr)
+		close(done)
+	}()
+
+	// Wait for the client-direction write (the NAK must reach the client).
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		clientConn.mu.Lock()
+		n := len(clientConn.writes)
+		clientConn.mu.Unlock()
+		if n > 0 {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+
+	clientConn.mu.Lock()
+	writes := append([]fakeWrite(nil), clientConn.writes...)
+	clientConn.mu.Unlock()
+	if len(writes) != 1 {
+		t.Fatalf("DHCPNAK not forwarded to client: got %d writes, want 1", len(writes))
+	}
+	dst := writes[0].addr.(*net.UDPAddr)
+	if !dst.IP.Equal(net.IPv4bcast) || dst.Port != clientPort {
+		t.Errorf("NAK forwarded to %v, want broadcast %v:%d", dst, net.IPv4bcast, clientPort)
+	}
+	if fl2.callCount() != 0 {
+		t.Errorf("NAK must not use raw-L2, got %d calls", fl2.callCount())
+	}
+	if ir.repliesForwarded.Load() != 1 {
+		t.Errorf("repliesForwarded = %d, want 1", ir.repliesForwarded.Load())
+	}
+
+	cancel()
+	serverConn.Close()
+	<-done
+}
+
 // TestHandleServerResponses_L2SourceIsSavedGiaddr proves the end-to-end path:
 // handleServerResponses zeroes pkt.GatewayIPAddr before sending, yet the L2
 // frame's source IP is the SAVED giaddr passed by runRelay (#2076 §7.2 / SMR-F4)
