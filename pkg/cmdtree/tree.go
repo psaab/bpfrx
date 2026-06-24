@@ -211,8 +211,10 @@ var OperationalTree = map[string]*Node{
 				return names
 			}},
 		}},
-		"flow-monitoring": {Desc: "Show flow monitoring/NetFlow configuration"},
-		"log":             {Desc: "Show daemon log entries [N]"},
+		"flow-monitoring": {Desc: "Show flow monitoring/NetFlow configuration", Children: map[string]*Node{
+			"statistics": {Desc: "Show per-collector NetFlow v9/IPFIX write-health"},
+		}},
+		"log": {Desc: "Show daemon log entries [N]"},
 		"route": {Desc: "Show routing table information", Children: map[string]*Node{
 			"<destination>": {Desc: "IP address or prefix to look up", Children: map[string]*Node{
 				"exact":    {Desc: "Exactly match the prefix"},

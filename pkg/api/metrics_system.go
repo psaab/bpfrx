@@ -74,6 +74,44 @@ func (c *xpfCollector) collectDDNSMetrics(ch chan<- prometheus.Metric) {
 		float64(st.LastReconcileN))
 }
 
+// collectFlowExportMetrics emits the xpf_flow_export_collector_* family
+// from the per-collector NetFlow v9 / IPFIX write-health snapshot
+// (#2464). The family is omitted entirely when no FlowCollectorHealthFn
+// is wired or when no flow export is configured (empty slice). Labels:
+// protocol {netflow-v9,ipfix} and the collector address — both bounded
+// (one series per configured flow-server). These counters make a
+// silently-unreachable collector observable: write_failures climbs while
+// write_attempts climbs, healthy drops to 0, and last_success ages.
+func (c *xpfCollector) collectFlowExportMetrics(ch chan<- prometheus.Metric) {
+	if c.srv.flowCollectorHealthFn == nil {
+		return
+	}
+	for _, h := range c.srv.flowCollectorHealthFn() {
+		ch <- prometheus.MustNewConstMetric(c.flowExportCollectorWriteAttemptsTotal,
+			prometheus.CounterValue, float64(h.WriteAttempts), h.Protocol, h.Address)
+		ch <- prometheus.MustNewConstMetric(c.flowExportCollectorWriteFailuresTotal,
+			prometheus.CounterValue, float64(h.WriteFailures), h.Protocol, h.Address)
+		healthy := 0.0
+		if h.Healthy {
+			healthy = 1
+		}
+		ch <- prometheus.MustNewConstMetric(c.flowExportCollectorHealthy,
+			prometheus.GaugeValue, healthy, h.Protocol, h.Address)
+		var lastSuccess float64
+		if !h.LastSuccessTime.IsZero() {
+			lastSuccess = float64(h.LastSuccessTime.Unix())
+		}
+		ch <- prometheus.MustNewConstMetric(c.flowExportCollectorLastSuccessSeconds,
+			prometheus.GaugeValue, lastSuccess, h.Protocol, h.Address)
+		var lastFailure float64
+		if !h.LastFailureTime.IsZero() {
+			lastFailure = float64(h.LastFailureTime.Unix())
+		}
+		ch <- prometheus.MustNewConstMetric(c.flowExportCollectorLastFailureSeconds,
+			prometheus.GaugeValue, lastFailure, h.Protocol, h.Address)
+	}
+}
+
 func (c *xpfCollector) collectSystemMetrics(ch chan<- prometheus.Metric) {
 	// Daemon uptime
 	ch <- prometheus.MustNewConstMetric(c.daemonUptime, prometheus.GaugeValue,

@@ -3,6 +3,8 @@ package api
 import (
 	"net/http"
 	"time"
+
+	"github.com/psaab/xpf/pkg/flowexport"
 )
 
 // healthHandler surfaces dataplane compile health (#758) and config
@@ -40,6 +42,23 @@ func (s *Server) healthHandler(w http.ResponseWriter, _ *http.Request) {
 		}
 	}
 	writeOK(w, payload)
+}
+
+// flowExportersHandler surfaces the per-collector NetFlow v9 / IPFIX
+// write-health (#2464): for every configured collector, its write
+// attempt/failure counters, the current healthy flag, and the last
+// error / last success timestamps. Flow export is forensics/compliance
+// data; a collector going silently unreachable used to be invisible
+// (every failed UDP write was debug-logged and dropped while the
+// exporter kept counting "exported"). The response payload mirrors the
+// Prometheus xpf_flow_export_collector_* family. Empty when no flow
+// export is configured.
+func (s *Server) flowExportersHandler(w http.ResponseWriter, _ *http.Request) {
+	var collectors []flowexport.ExporterCollectorHealth
+	if s.flowCollectorHealthFn != nil {
+		collectors = s.flowCollectorHealthFn()
+	}
+	writeOK(w, map[string]any{"collectors": collectors})
 }
 
 func (s *Server) statusHandler(w http.ResponseWriter, _ *http.Request) {

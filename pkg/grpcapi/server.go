@@ -21,6 +21,7 @@ import (
 	"github.com/psaab/xpf/pkg/dhcp"
 	"github.com/psaab/xpf/pkg/dhcpserver"
 	"github.com/psaab/xpf/pkg/feeds"
+	"github.com/psaab/xpf/pkg/flowexport"
 	"github.com/psaab/xpf/pkg/frr"
 	"github.com/psaab/xpf/pkg/fwdstatus"
 	pb "github.com/psaab/xpf/pkg/grpcapi/xpfv1"
@@ -59,6 +60,10 @@ type Config struct {
 	// manager is absent (NoDataplane) — the show renders "not running".
 	DDNSStatsFn        func() *dhcpserver.DDNSStats
 	DDNSOwnedRecordsFn func() []dhcpserver.DDNSOwnedRecordView
+	// #2464: per-collector NetFlow v9 / IPFIX write-health for
+	// `show services flow-monitoring statistics`. nil when no flow export
+	// is wired — the show renders "no flow export configured".
+	FlowCollectorHealthFn func() []flowexport.ExporterCollectorHealth
 	// #846: atomic commit+apply callbacks. The daemon holds its
 	// apply semaphore across configstore.Commit, applyConfig, and
 	// (for gRPC) syncConfigToPeer, so two concurrent committers
@@ -78,34 +83,35 @@ type Config struct {
 // Server implements the BpfrxService gRPC service.
 type Server struct {
 	pb.UnimplementedBpfrxServiceServer
-	store              *configstore.Store
-	dp                 grpcRuntime
-	eventBuf           *logging.EventBuffer
-	gc                 *conntrack.GC
-	routing            *routing.Manager
-	frr                *frr.Manager
-	ipsec              *ipsec.Manager
-	cluster            *cluster.Manager
-	dhcp               *dhcp.Manager
-	dhcpServer         *dhcpserver.Manager
-	rpmResultsFn       func() []*rpm.ProbeResult
-	ipmonStatusFn      func() []ipmon.PolicyStatus
-	natPoolAlarmsFn    func() []natpoolalarm.ActiveAlarm
-	feedsFn            func() map[string]feeds.FeedInfo
-	lldpNeighborsFn    func() []*lldp.Neighbor
-	ddnsStatsFn        func() *dhcpserver.DDNSStats
-	ddnsOwnedRecordsFn func() []dhcpserver.DDNSOwnedRecordView
-	commitFn           func(ctx context.Context, comment string) (*config.Config, error)
-	commitConfirmedFn  func(ctx context.Context, minutes int) (*config.Config, error)
-	vrrpMgr            *vrrp.Manager
-	raMgr              *ra.Manager
-	fwdSampler         *fwdstatus.Sampler
-	startTime          time.Time
-	addr               string
-	version            string
-	fabricPeerAddrFn   func() []string
-	fabricVRFDevice    string
-	peerSystemActionFn func(ctx context.Context, req *pb.SystemActionRequest) (*pb.SystemActionResponse, error)
+	store                 *configstore.Store
+	dp                    grpcRuntime
+	eventBuf              *logging.EventBuffer
+	gc                    *conntrack.GC
+	routing               *routing.Manager
+	frr                   *frr.Manager
+	ipsec                 *ipsec.Manager
+	cluster               *cluster.Manager
+	dhcp                  *dhcp.Manager
+	dhcpServer            *dhcpserver.Manager
+	rpmResultsFn          func() []*rpm.ProbeResult
+	ipmonStatusFn         func() []ipmon.PolicyStatus
+	natPoolAlarmsFn       func() []natpoolalarm.ActiveAlarm
+	feedsFn               func() map[string]feeds.FeedInfo
+	lldpNeighborsFn       func() []*lldp.Neighbor
+	ddnsStatsFn           func() *dhcpserver.DDNSStats
+	ddnsOwnedRecordsFn    func() []dhcpserver.DDNSOwnedRecordView
+	flowCollectorHealthFn func() []flowexport.ExporterCollectorHealth
+	commitFn              func(ctx context.Context, comment string) (*config.Config, error)
+	commitConfirmedFn     func(ctx context.Context, minutes int) (*config.Config, error)
+	vrrpMgr               *vrrp.Manager
+	raMgr                 *ra.Manager
+	fwdSampler            *fwdstatus.Sampler
+	startTime             time.Time
+	addr                  string
+	version               string
+	fabricPeerAddrFn      func() []string
+	fabricVRFDevice       string
+	peerSystemActionFn    func(ctx context.Context, req *pb.SystemActionRequest) (*pb.SystemActionResponse, error)
 }
 
 func (s *Server) userspaceDataplaneStatus() (dpuserspace.ProcessStatus, error) {
@@ -130,33 +136,34 @@ func (s *Server) userspaceDataplaneControl() (userspaceControlProvider, error) {
 // gRPC is ever exposed on non-loopback addresses.
 func NewServer(addr string, cfg Config) *Server {
 	return &Server{
-		store:              cfg.Store,
-		dp:                 cfg.DP,
-		eventBuf:           cfg.EventBuf,
-		gc:                 cfg.GC,
-		routing:            cfg.Routing,
-		frr:                cfg.FRR,
-		ipsec:              cfg.IPsec,
-		cluster:            cfg.Cluster,
-		dhcp:               cfg.DHCP,
-		dhcpServer:         cfg.DHCPServer,
-		rpmResultsFn:       cfg.RPMResultsFn,
-		ipmonStatusFn:      cfg.IPMonStatusFn,
-		natPoolAlarmsFn:    cfg.NATPoolAlarmsFn,
-		feedsFn:            cfg.FeedsFn,
-		lldpNeighborsFn:    cfg.LLDPNeighborsFn,
-		ddnsStatsFn:        cfg.DDNSStatsFn,
-		ddnsOwnedRecordsFn: cfg.DDNSOwnedRecordsFn,
-		commitFn:           cfg.CommitFn,
-		commitConfirmedFn:  cfg.CommitConfirmedFn,
-		vrrpMgr:            cfg.VRRPMgr,
-		raMgr:              cfg.RAMgr,
-		fwdSampler:         cfg.FwdSampler,
-		startTime:          time.Now(),
-		addr:               addr,
-		version:            cfg.Version,
-		fabricPeerAddrFn:   cfg.FabricPeerAddrFn,
-		fabricVRFDevice:    cfg.FabricVRFDevice,
+		store:                 cfg.Store,
+		dp:                    cfg.DP,
+		eventBuf:              cfg.EventBuf,
+		gc:                    cfg.GC,
+		routing:               cfg.Routing,
+		frr:                   cfg.FRR,
+		ipsec:                 cfg.IPsec,
+		cluster:               cfg.Cluster,
+		dhcp:                  cfg.DHCP,
+		dhcpServer:            cfg.DHCPServer,
+		rpmResultsFn:          cfg.RPMResultsFn,
+		ipmonStatusFn:         cfg.IPMonStatusFn,
+		natPoolAlarmsFn:       cfg.NATPoolAlarmsFn,
+		feedsFn:               cfg.FeedsFn,
+		lldpNeighborsFn:       cfg.LLDPNeighborsFn,
+		ddnsStatsFn:           cfg.DDNSStatsFn,
+		ddnsOwnedRecordsFn:    cfg.DDNSOwnedRecordsFn,
+		flowCollectorHealthFn: cfg.FlowCollectorHealthFn,
+		commitFn:              cfg.CommitFn,
+		commitConfirmedFn:     cfg.CommitConfirmedFn,
+		vrrpMgr:               cfg.VRRPMgr,
+		raMgr:                 cfg.RAMgr,
+		fwdSampler:            cfg.FwdSampler,
+		startTime:             time.Now(),
+		addr:                  addr,
+		version:               cfg.Version,
+		fabricPeerAddrFn:      cfg.FabricPeerAddrFn,
+		fabricVRFDevice:       cfg.FabricVRFDevice,
 	}
 }
 

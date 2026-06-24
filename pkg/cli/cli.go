@@ -21,6 +21,7 @@ import (
 	"github.com/psaab/xpf/pkg/dhcprelay"
 	"github.com/psaab/xpf/pkg/dhcpserver"
 	"github.com/psaab/xpf/pkg/feeds"
+	"github.com/psaab/xpf/pkg/flowexport"
 	"github.com/psaab/xpf/pkg/frr"
 	"github.com/psaab/xpf/pkg/fwdstatus"
 	"github.com/psaab/xpf/pkg/ipmon"
@@ -53,11 +54,15 @@ type CLI struct {
 	lldpNeighborsFn    func() []*lldp.Neighbor
 	ddnsStatsFn        func() *dhcpserver.DDNSStats
 	ddnsOwnedRecordsFn func() []dhcpserver.DDNSOwnedRecordView
-	hostname           string
-	username           string
-	userClass          string
-	version            string
-	startTime          time.Time
+	// flowCollectorHealthFn surfaces live per-collector NetFlow v9 / IPFIX
+	// write-health for `show flow-monitoring statistics` (#2464). Nil
+	// leaves the show reporting "no flow export configured".
+	flowCollectorHealthFn func() []flowexport.ExporterCollectorHealth
+	hostname              string
+	username              string
+	userClass             string
+	version               string
+	startTime             time.Time
 
 	vrrpMgr *vrrp.Manager
 
@@ -176,6 +181,13 @@ func (c *CLI) SetLLDPNeighborsFn(fn func() []*lldp.Neighbor) {
 // counters (#1387 inc-2). Nil leaves the show config-only.
 func (c *CLI) SetDDNSStatsFn(fn func() *dhcpserver.DDNSStats) {
 	c.ddnsStatsFn = fn
+}
+
+// SetFlowCollectorHealthFn sets a callback for retrieving live
+// per-collector NetFlow v9 / IPFIX write-health (#2464). Nil leaves
+// `show flow-monitoring statistics` reporting "no flow export configured".
+func (c *CLI) SetFlowCollectorHealthFn(fn func() []flowexport.ExporterCollectorHealth) {
+	c.flowCollectorHealthFn = fn
 }
 
 // SetDDNSOwnedRecordsFn sets a callback for retrieving the DHCP

@@ -1219,6 +1219,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 			// xpf_dhcp_ddns_* metric family. Returns nil when the
 			// manager is absent (NoDataplane), omitting the family.
 			DDNSStatsFn: d.DDNSStats,
+			// #2464: per-collector NetFlow v9 / IPFIX write-health for the
+			// xpf_flow_export_collector_* family + /services/flow-exporters.
+			FlowCollectorHealthFn: d.FlowCollectorHealth,
 		}
 		// Resolve interface bindings from web-management config
 		if cfg := d.store.ActiveConfig(); cfg != nil && cfg.System.Services != nil &&
@@ -1330,6 +1333,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 			// `show ... dhcp-server dynamic-dns` ShowText topics.
 			DDNSStatsFn:        d.DDNSStats,
 			DDNSOwnedRecordsFn: d.OwnedDDNSRecords,
+			// #2464: per-collector NetFlow v9 / IPFIX write-health for
+			// `show services flow-monitoring statistics`.
+			FlowCollectorHealthFn: d.FlowCollectorHealth,
 			// gRPC commits sync to cluster peer atomically inside
 			// the apply lock so the peer can never observe an apply
 			// that hasn't yet been propagated.
@@ -1449,6 +1455,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 		// #1387 inc-2: DHCP dynamic-DNS status hooks for the in-process CLI.
 		shell.SetDDNSStatsFn(d.DDNSStats)
 		shell.SetDDNSOwnedRecordsFn(d.OwnedDDNSRecords)
+		shell.SetFlowCollectorHealthFn(d.FlowCollectorHealth)
 		shell.SetVRRPManager(d.vrrpMgr)
 		shell.SetFabricPeer(func() []string {
 			var addrs []string

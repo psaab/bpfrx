@@ -144,6 +144,10 @@ func (s *Server) ShowText(ctx context.Context, req *pb.ShowTextRequest) (*pb.Sho
 		// #1043 Phase 5: case body extracted to server_show_flow.go
 		s.showFlowMonitoring(cfg, &buf)
 
+	case "flow-monitoring-statistics":
+		// #2464: per-collector NetFlow v9 / IPFIX write-health.
+		s.showFlowMonitoringStatistics(&buf)
+
 	case "flow-timeouts":
 		// #1043 Phase 5: case body extracted to server_show_flow.go
 		s.showFlowTimeouts(cfg, &buf)

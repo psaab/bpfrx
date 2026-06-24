@@ -1170,3 +1170,50 @@ func (c *CLI) showFlowMonitoring() error {
 
 	return nil
 }
+
+// showFlowMonitoringStatistics renders live per-collector NetFlow v9 /
+// IPFIX write-health (#2464): write attempt/failure counters, the current
+// reachability, and the last success / failure timestamps for every
+// running exporter collector. A collector going silently unreachable
+// (every failed UDP write was debug-logged and dropped) was previously
+// invisible while the exporter kept counting "exported" — a forensics /
+// compliance loss with no operator warning.
+func (c *CLI) showFlowMonitoringStatistics() error {
+	if c.flowCollectorHealthFn == nil {
+		fmt.Println("No flow export configured")
+		return nil
+	}
+	health := c.flowCollectorHealthFn()
+	if len(health) == 0 {
+		fmt.Println("No flow export configured")
+		return nil
+	}
+	fmt.Println("Flow export collector statistics:")
+	for _, h := range health {
+		state := "up"
+		if !h.Healthy {
+			state = "DOWN"
+		}
+		line := fmt.Sprintf("  Collector %s (%s)", h.Address, h.Protocol)
+		if h.Instance != "" {
+			line += fmt.Sprintf(" instance %s", h.Instance)
+		}
+		if h.Template != "" {
+			line += fmt.Sprintf(" template %s", h.Template)
+		}
+		fmt.Println(line)
+		fmt.Printf("    State:          %s\n", state)
+		fmt.Printf("    Write attempts: %d\n", h.WriteAttempts)
+		fmt.Printf("    Write failures: %d\n", h.WriteFailures)
+		if !h.LastSuccessTime.IsZero() {
+			fmt.Printf("    Last success:   %s\n", h.LastSuccessTime.Format("2006-01-02 15:04:05"))
+		}
+		if !h.LastFailureTime.IsZero() {
+			fmt.Printf("    Last failure:   %s\n", h.LastFailureTime.Format("2006-01-02 15:04:05"))
+		}
+		if h.LastError != "" {
+			fmt.Printf("    Last error:     %s\n", h.LastError)
+		}
+	}
+	return nil
+}

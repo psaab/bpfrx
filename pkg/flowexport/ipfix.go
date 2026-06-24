@@ -363,6 +363,11 @@ func (e *IPFIXExporter) Stats() (flows, packets uint64) {
 	return e.exportedFlows.Load(), e.exportedPkts.Load()
 }
 
+// CollectorHealth returns a per-collector write-health snapshot (#2464).
+func (e *IPFIXExporter) CollectorHealth() []CollectorHealth {
+	return e.conns.health()
+}
+
 // Close shuts down all collector connections.
 func (e *IPFIXExporter) Close() {
 	e.conns.close()
