@@ -63,14 +63,17 @@ pub(super) enum ProbeSockKind {
 /// caller has already fixed (`AF_INET`/`AF_INET6`), returning the fd or a
 /// negative value on failure. Injected so the fallback selection is
 /// unit-testable without manipulating process capabilities.
-pub(super) fn select_probe_socket(
-    mk: impl Fn(c_int) -> c_int,
-) -> Option<(c_int, ProbeSockKind)> {
-    let raw = mk(libc::SOCK_RAW);
+///
+/// `SOCK_CLOEXEC` is OR'd into the type arg so the probe fd is closed
+/// atomically across any `exec` (no fd leak into exec'd children — same
+/// hardening as the VRRP AF_PACKET socket in #2476 and the netlink
+/// sockets already in this file).
+pub(super) fn select_probe_socket(mk: impl Fn(c_int) -> c_int) -> Option<(c_int, ProbeSockKind)> {
+    let raw = mk(libc::SOCK_RAW | libc::SOCK_CLOEXEC);
     if raw >= 0 {
         return Some((raw, ProbeSockKind::Raw));
     }
-    let dgram = mk(libc::SOCK_DGRAM);
+    let dgram = mk(libc::SOCK_DGRAM | libc::SOCK_CLOEXEC);
     if dgram >= 0 {
         return Some((dgram, ProbeSockKind::Dgram));
     }
@@ -1182,8 +1185,16 @@ mod probe_socket_tests {
     use super::{build_icmp4_echo, build_icmp6_echo, select_probe_socket, ProbeSockKind};
     use std::cell::RefCell;
 
+    /// Base socket type with the `SOCK_CLOEXEC` (and any future flag) bits
+    /// masked off — `SOCK_CLOEXEC` is OR'd into the type arg at creation.
+    fn base_type(sock_type: libc::c_int) -> libc::c_int {
+        sock_type & !libc::SOCK_CLOEXEC
+    }
+
     /// The raw socket is the primary path: when raw creation succeeds the
-    /// DGRAM fallback must NEVER be attempted.
+    /// DGRAM fallback must NEVER be attempted. Also pins that
+    /// `SOCK_CLOEXEC` is OR'd into the type arg (#2476 consistency: no fd
+    /// leak into exec'd children).
     #[test]
     fn prefers_raw_and_never_tries_dgram_when_raw_succeeds() {
         let attempts = RefCell::new(Vec::new());
@@ -1192,10 +1203,13 @@ mod probe_socket_tests {
             42 // pretend raw fd
         });
         assert_eq!(sel, Some((42, ProbeSockKind::Raw)));
-        assert_eq!(
-            *attempts.borrow(),
-            vec![libc::SOCK_RAW],
-            "DGRAM must not be attempted once raw succeeds",
+        let attempts = attempts.borrow();
+        assert_eq!(attempts.len(), 1, "DGRAM must not be attempted once raw succeeds");
+        assert_eq!(base_type(attempts[0]), libc::SOCK_RAW);
+        assert_ne!(
+            attempts[0] & libc::SOCK_CLOEXEC,
+            0,
+            "raw probe socket must be created with SOCK_CLOEXEC",
         );
     }
 
@@ -1205,24 +1219,31 @@ mod probe_socket_tests {
     /// `fd < 0` with no fallback — there is no `select_probe_socket` and no
     /// DGRAM attempt, so this assertion (and the recorded
     /// `[SOCK_RAW, SOCK_DGRAM]` attempt order) cannot hold. Deleting the
-    /// fallback arm regresses this test.
+    /// fallback arm regresses this test. Both attempts must carry
+    /// `SOCK_CLOEXEC`.
     #[test]
     fn falls_back_to_dgram_when_raw_creation_fails() {
         let attempts = RefCell::new(Vec::new());
         let sel = select_probe_socket(|sock_type| {
             attempts.borrow_mut().push(sock_type);
-            if sock_type == libc::SOCK_RAW {
+            if base_type(sock_type) == libc::SOCK_RAW {
                 -1 // EPERM/EACCES: no CAP_NET_RAW
             } else {
                 7 // DGRAM ping socket fd
             }
         });
         assert_eq!(sel, Some((7, ProbeSockKind::Dgram)));
-        assert_eq!(
-            *attempts.borrow(),
-            vec![libc::SOCK_RAW, libc::SOCK_DGRAM],
-            "raw must be tried first, then DGRAM",
-        );
+        let attempts = attempts.borrow();
+        assert_eq!(attempts.len(), 2, "raw must be tried first, then DGRAM");
+        assert_eq!(base_type(attempts[0]), libc::SOCK_RAW);
+        assert_eq!(base_type(attempts[1]), libc::SOCK_DGRAM);
+        for (i, t) in attempts.iter().enumerate() {
+            assert_ne!(
+                t & libc::SOCK_CLOEXEC,
+                0,
+                "probe socket attempt {i} must be created with SOCK_CLOEXEC",
+            );
+        }
     }
 
     /// Both creation attempts failing yields `None` (probe is skipped, as
@@ -1235,7 +1256,10 @@ mod probe_socket_tests {
             -1
         });
         assert_eq!(sel, None);
-        assert_eq!(*attempts.borrow(), vec![libc::SOCK_RAW, libc::SOCK_DGRAM]);
+        let attempts = attempts.borrow();
+        assert_eq!(attempts.len(), 2);
+        assert_eq!(base_type(attempts[0]), libc::SOCK_RAW);
+        assert_eq!(base_type(attempts[1]), libc::SOCK_DGRAM);
     }
 
     /// The DGRAM send buffer is the ICMP message ONLY (8 bytes, no 20-byte
