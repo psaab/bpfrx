@@ -630,7 +630,19 @@ pub(crate) fn worker_loop(
             ceiling_abs_ns: crate::session::STALE_SYNCED_CEILING_ABS_NS,
         };
         let expired_entries = sessions.expire_stale_entries_ha(loop_now_ns, Some(&ha_ctx));
-        let expired = expired_entries.len() as u64;
+        // #2428: the "Current sessions" gauge Go derives as
+        // (session_creates - session_expires) is a LOCAL-forwarding gauge.
+        // `session_creates` is bumped ONLY on the four local poll-descriptor
+        // install paths (ForwardFlow / ReverseFlow / LocalMiss /
+        // MissingNeighborSeed). Every synced-derived origin (SyncImport /
+        // SharedMaterialize / WorkerLocalImport / SharedPromote) is never
+        // create-counted, so counting its expiry drives session_expires past
+        // session_creates, wrapping the unsigned Go subtraction to ~1.8e19.
+        // count_local_session_expiries (exhaustive match, no wildcard) counts
+        // only the create-counted locals so accounting is balanced on the
+        // SAME node and the standby gauge stays 0.
+        let local_expired =
+            count_local_session_expiries(expired_entries.iter().map(|e| e.origin));
         for expired_entry in expired_entries {
             release_source_nat_allocation(
                 &forwarding.source_nat_rules,
@@ -649,12 +661,12 @@ pub(crate) fn worker_loop(
                 conntrack_v6_fd,
             );
         }
-        if expired > 0 {
+        if local_expired > 0 {
             if let Some(binding) = bindings.first() {
                 binding
                     .live
                     .session_expires
-                    .fetch_add(expired, Ordering::Relaxed);
+                    .fetch_add(local_expired, Ordering::Relaxed);
             }
         }
         // Periodically refresh last_seen in BPF conntrack entries so Go-side
@@ -1142,4 +1154,144 @@ pub(crate) fn worker_loop(
         monotonic_nanos(),
     )));
     heartbeat.store(monotonic_nanos(), Ordering::Relaxed);
+}
+
+/// #2428: count only the create-counted LOCAL-origin expired sessions for
+/// the `session_expires` counter (which the Go control plane reads as
+/// `GlobalCtrSessionsClosed`).
+///
+/// `session_creates` is bumped ONLY on the four local poll-descriptor install
+/// paths — `ForwardFlow` / `ReverseFlow` / `LocalMiss` /
+/// `MissingNeighborSeed`. Every other origin is synced-derived and never
+/// create-counted:
+///   - `SyncImport` / `SharedMaterialize` / `WorkerLocalImport` — installed
+///     via the HA sync path (`upsert_synced_with_origin` /
+///     `WorkerCommand::UpsertLocal`);
+///   - `SharedPromote` — a re-tag of an already-synced (uncounted) entry by
+///     `maybe_promote_synced_session` (`session_glue/promote.rs`); its
+///     `promote_synced_with_origin` install does NOT touch `session_creates`.
+///     `is_peer_synced()` returns FALSE for `SharedPromote`, so an earlier
+///     `!is_peer_synced()` filter would have COUNTED a promote expiry that
+///     was never create-counted — re-introducing the underflow on a node
+///     that promotes synced sessions post-failover. `shared_ops.rs` already
+///     groups `SharedPromote` with the peer-synced set for the wire-alias
+///     contract; this counter is consistent with that.
+///
+/// Counting any non-create-counted origin's expiry inflates `session_expires`
+/// past `session_creates`, wrapping the unsigned Go subtraction
+/// `session_creates - session_expires` to ~1.8e19. We therefore match on the
+/// EXACT complement of the create-counted set via an exhaustive `match` (NO
+/// wildcard) so a future 9th `SessionOrigin` variant forces a compile-time
+/// decision here rather than silently defaulting to "counted". The Go-side
+/// `dataplane.CurrentSessions` saturating floor is the defense-in-depth
+/// backstop.
+fn count_local_session_expiries(
+    origins: impl Iterator<Item = crate::session::SessionOrigin>,
+) -> u64 {
+    use crate::session::SessionOrigin;
+    origins
+        .filter(|o| match o {
+            // The four create-counted local install paths: count their expiry.
+            SessionOrigin::ForwardFlow
+            | SessionOrigin::ReverseFlow
+            | SessionOrigin::LocalMiss
+            | SessionOrigin::MissingNeighborSeed => true,
+            // Synced-derived, never create-counted: must NOT be expire-counted.
+            SessionOrigin::SyncImport
+            | SessionOrigin::SharedMaterialize
+            | SessionOrigin::SharedPromote
+            | SessionOrigin::WorkerLocalImport => false,
+        })
+        .count() as u64
+}
+
+#[cfg(test)]
+mod expiry_count_tests {
+    use super::count_local_session_expiries;
+    use crate::session::SessionOrigin;
+
+    #[test]
+    fn local_origin_expiries_are_counted() {
+        let origins = [
+            SessionOrigin::ForwardFlow,
+            SessionOrigin::ReverseFlow,
+            SessionOrigin::LocalMiss,
+            SessionOrigin::MissingNeighborSeed,
+        ];
+        assert_eq!(count_local_session_expiries(origins.into_iter()), 4);
+    }
+
+    #[test]
+    fn synced_derived_expiries_are_not_counted() {
+        // #2428: the standby (and any node) reaps synced-derived sessions it
+        // never create-counted. None of these may bump session_expires, or
+        // the Go-derived `session_creates - session_expires` underflows to a
+        // wrapped u64. ALL FOUR synced-derived origins must be excluded —
+        // including SharedPromote, whose is_peer_synced() returns false.
+        let origins = [
+            SessionOrigin::SyncImport,
+            SessionOrigin::SharedMaterialize,
+            SessionOrigin::WorkerLocalImport,
+            SessionOrigin::SharedPromote,
+        ];
+        assert_eq!(
+            count_local_session_expiries(origins.into_iter()),
+            0,
+            "synced-derived expiries must not bump session_expires (would \
+             underflow the Current-sessions gauge)"
+        );
+    }
+
+    #[test]
+    fn shared_promote_expiry_is_not_counted() {
+        // #2428 review fold: SharedPromote is a re-tag of an already-synced
+        // (uncounted) entry — promote_synced_with_origin does NOT bump
+        // session_creates. is_peer_synced() returns FALSE for it, so the
+        // earlier `!is_peer_synced()` filter wrongly COUNTED a promote
+        // expiry, re-introducing the underflow on a promoting node.
+        // fail-on-revert: restoring `!o.is_peer_synced()` makes this case
+        // return 1 instead of 0.
+        assert_eq!(
+            count_local_session_expiries([SessionOrigin::SharedPromote].into_iter()),
+            0,
+            "a SharedPromote expiry must NOT bump session_expires (never \
+             create-counted)"
+        );
+    }
+
+    #[test]
+    fn mixed_batch_counts_only_create_counted_locals() {
+        let origins = [
+            SessionOrigin::ForwardFlow,       // local: +1
+            SessionOrigin::SyncImport,        // synced: 0
+            SessionOrigin::ReverseFlow,       // local: +1
+            SessionOrigin::SharedMaterialize, // synced: 0
+            SessionOrigin::WorkerLocalImport, // synced: 0
+            SessionOrigin::SharedPromote,     // synced: 0
+        ];
+        assert_eq!(count_local_session_expiries(origins.into_iter()), 2);
+    }
+
+    #[test]
+    fn taxonomy_is_eight_variants() {
+        // #2428: pin the SessionOrigin taxonomy at 8. The exhaustive match in
+        // count_local_session_expiries (no wildcard) already forces a
+        // compile-time decision on a new variant; this enumerates every
+        // variant and asserts it classifies exactly once into local (4) or
+        // synced-derived (4). A 9th variant breaks BOTH the match (compile
+        // error) and this count (8 -> 9) — a loud double signal.
+        let all = [
+            SessionOrigin::ForwardFlow,
+            SessionOrigin::ReverseFlow,
+            SessionOrigin::LocalMiss,
+            SessionOrigin::MissingNeighborSeed,
+            SessionOrigin::SyncImport,
+            SessionOrigin::SharedMaterialize,
+            SessionOrigin::SharedPromote,
+            SessionOrigin::WorkerLocalImport,
+        ];
+        assert_eq!(all.len(), 8, "SessionOrigin taxonomy is 8 variants");
+        // Exactly the four create-counted locals are counted.
+        assert_eq!(count_local_session_expiries(all.into_iter()), 4);
+    }
 }

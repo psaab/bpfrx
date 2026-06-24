@@ -186,6 +186,56 @@ the known active/active `owner_rg_id == 0` under-retention residual
 observable — a `==0` entry for a standby RG path on an otherwise-active
 node ages and is re-derived on promotion via the reverse-synced prewarm).
 
+## "Current sessions" gauge accounting (#2428)
+
+The `session_creates` / `session_expires` BindingLiveState counters feed
+the Go-side `show security flow statistics` "Current sessions" gauge,
+which Go derives as `dataplane.CurrentSessions(session_creates,
+session_expires)` — a **local-forwarding** gauge.
+
+`SessionOrigin` has **8 variants**. `session_creates` is incremented ONLY
+on the four local poll-descriptor install paths —
+`SessionOrigin::{ForwardFlow, ReverseFlow, LocalMiss, MissingNeighborSeed}`.
+The other four are **synced-derived and never create-counted**:
+
+- `SyncImport` / `SharedMaterialize` / `WorkerLocalImport` — installed via
+  the HA sync path (`upsert_synced_with_origin` /
+  `WorkerCommand::UpsertLocal`);
+- `SharedPromote` — a re-tag of an already-synced (uncounted) entry by
+  `maybe_promote_synced_session` (`session_glue/promote.rs`), whose
+  `promote_synced_with_origin` install does NOT touch `session_creates`.
+  Note `is_peer_synced()` returns **false** for `SharedPromote`, so it must
+  be excluded by name, not via `is_peer_synced()`. `shared_ops.rs` already
+  groups `SharedPromote` with the peer-synced set for the wire-alias
+  contract — this counter is consistent with that.
+
+The expire pass therefore must count **only the four create-counted
+locals** in `session_expires`, otherwise a node that reaps synced or
+promoted sessions (the standby always; any node post-failover for
+`SharedPromote`) drives `session_expires` past `session_creates`, wrapping
+the unsigned Go subtraction to ~1.8e19. `worker_loop`'s
+`count_local_session_expiries` does this with an **exhaustive `match` (no
+wildcard)** over all 8 variants — so a future 9th variant forces a
+compile-time decision instead of silently defaulting to "counted" — before
+the `fetch_add`. The standby thus reports `Current sessions: 0`. The
+Go-side `CurrentSessions` saturating floor (clamp at 0) is the
+defense-in-depth backstop against any future imbalance.
+
+### Metric-semantics note (#2428)
+
+`session_expires` is the SAME counter the Go control plane reads as
+`dataplane.GlobalCtrSessionsClosed` (mapped 1:1 from `cur.sessionExpires`
+in `pkg/dataplane/userspace/manager_ha.go`). That global counter feeds the
+exported `sessions_closed` surfaces — `pkg/api/stats.go`,
+`pkg/api/metrics_counters.go` (`xpf_sessions_closed_total` Prometheus
+metric), and `pkg/grpcapi/server_show_status.go`. So after this fix
+`sessions_closed` (like `sessions_created`) means **LOCAL sessions
+closed** — it excludes peer-synced / promoted reaps, matching
+`sessions_created` which never counted those installs. This is a
+deliberate semantics tightening, not a regression: the two counters are
+now consistently local-only, so their difference (the "Current sessions"
+gauge) is a coherent local-forwarding metric on every node.
+
 ## Corruption contract (#1855)
 
 A `key_to_handle` mapping that points at a vacant or reused slab slot is

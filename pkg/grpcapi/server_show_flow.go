@@ -147,7 +147,7 @@ func (s *Server) showFlowStatistics(buf *strings.Builder) {
 	sessNew := readCtr(dataplane.GlobalCtrSessionsNew)
 	sessClosed := readCtr(dataplane.GlobalCtrSessionsClosed)
 	buf.WriteString("Flow statistics:\n")
-	fmt.Fprintf(buf, "  %-30s %d\n", "Current sessions:", sessNew-sessClosed)
+	fmt.Fprintf(buf, "  %-30s %d\n", "Current sessions:", dataplane.CurrentSessions(sessNew, sessClosed))
 	fmt.Fprintf(buf, "  %-30s %d\n", "Sessions created:", sessNew)
 	fmt.Fprintf(buf, "  %-30s %d\n", "Sessions closed:", sessClosed)
 	buf.WriteString("\n")
