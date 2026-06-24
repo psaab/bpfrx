@@ -12890,3 +12890,11 @@ top.
   gofmt clean; go vet clean. Fail-on-revert PROVEN — neutralizing the gate
   makes the IPv4 neighbor appear under `address-family ipv6 unicast` and the
   new tests fail. Go-only, no Rust touched.
+
+## 2026-06-24 — #2452 IPv6 link-local static-route next-hop resolves to empty interface
+
+- **Timestamp**: 2026-06-24
+- **Action**: Fix #2452 (MED, agy review-033 findings 5+13) — `inferIPv6StaticNextHopInterfaces` built connected prefixes only from `unit.Addresses`, so an unqualified IPv6 link-local (`fe80::/64`) static next-hop never matched any prefix → resolved to `""` → FRR emitted a scopeless `ipv6 route <dst> fe80::x` which it rejects (common ISP-WAN link-local gateways failed).
+- **Fix**: In `inferIPv6StaticNextHopInterfaces` (pkg/daemon/daemon_run.go) add a synthetic `fe80::/64` candidate per IPv6-capable logical interface and a link-local-specific resolve branch. Disambiguation: explicit `interface` qualifier wins (already honoured by the renderer + skipped by `addRoutes`); single IPv6 interface → resolve to it; multiple IPv6 interfaces + no qualifier → genuinely ambiguous, refuse to guess (leave unresolved). Global-unicast resolution ignores the synthetic candidates (unchanged longest-prefix tie-break). Secondary (agy-13): also scan `unit.VRRPGroups` CIDR keys as connected prefixes so a next-hop in a VIP-only subnet (bondless RETH carrying only the VIP) resolves to the member interface.
+- **File(s)**: pkg/daemon/daemon_run.go (synthetic fe80::/64 candidate + link-local resolve rule + VRRP VIP-subnet scan), pkg/daemon/ipv6_static_nexthop_test.go (4 new tests: single-iface resolve, multi-iface ambiguous, explicit-qualifier skip, VRRP VIP subnet), pkg/frr/frr_test.go (2 end-to-end renderer tests: inferred scope + explicit qualifier), pkg/frr/README.md (gotcha doc), _Log.md.
+- **Validation**: go build ./... OK; go test ./pkg/daemon/ ./pkg/frr/ PASS; gofmt clean; go vet clean. Fail-on-revert PROVEN twice — disabling the synthetic fe80::/64 candidate makes the single-iface link-local test resolve to `""`; disabling the VRRP scan makes the VIP-subnet test resolve to `""`. Go-only, no Rust touched. Disambiguation resolvable from the code (config model already supports `qualified-next-hop ... interface <name>`), so no stop-and-ask needed.
