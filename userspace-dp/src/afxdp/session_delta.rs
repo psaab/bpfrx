@@ -152,7 +152,16 @@ pub(super) fn flush_session_deltas(
             // produced in userspace mode before this). The two frames are a
             // 1:1 pair per close — no double-counting on the HA channel.
             if delta.kind == SessionDeltaKind::Close {
-                es.emit_session_close_rt_flow(delta);
+                // #2520: resolve the AppID for the closing 5-tuple with the
+                // SAME app_catalog.lookup the forwarding hot path runs, so the
+                // SESSION_CLOSE RT_FLOW record carries the application instead
+                // of UNKNOWN. 0 (no match) keeps the prior UNKNOWN rendering.
+                let app_id = forwarding.app_catalog.lookup(
+                    delta.key.protocol,
+                    delta.key.src_port,
+                    delta.key.dst_port,
+                );
+                es.emit_session_close_rt_flow(delta, app_id);
             }
             // #2508: a session admitted by a policy configured with
             // `then log session-init` emits an RT_FLOW SESSION_CREATE frame

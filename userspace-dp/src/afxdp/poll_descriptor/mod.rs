@@ -434,6 +434,7 @@ pub(super) fn poll_binding_process_descriptor(
                         {
                             if let Some(cached_log) = input_filter_eval.cached_log {
                                 emit_input_filter_log_match(
+                                    worker_ctx.forwarding,
                                     worker_ctx.event_stream,
                                     flow,
                                     meta,
@@ -844,6 +845,7 @@ pub(super) fn poll_binding_process_descriptor(
                         if input_filter_eval.action != crate::filter::FilterAction::Accept {
                             if let Some(cached_log) = input_filter_eval.cached_log {
                                 emit_input_filter_log_match(
+                                    worker_ctx.forwarding,
                                     worker_ctx.event_stream,
                                     flow,
                                     meta,
@@ -1846,6 +1848,7 @@ pub(super) fn poll_binding_process_descriptor(
                                         );
                                         if let Some(cached_log) = input_filter_eval.cached_log {
                                             emit_input_filter_log_match(
+                                                worker_ctx.forwarding,
                                                 worker_ctx.event_stream,
                                                 flow,
                                                 meta,
@@ -2122,6 +2125,11 @@ pub(super) fn poll_binding_process_descriptor(
                                     owner_rg_id,
                                     policy_result.policy_id,
                                     policy_result.action,
+                                    // #2520: resolve the AppID with the same
+                                    // app_catalog.lookup the session-create hot
+                                    // path runs, so the deny RT_FLOW record
+                                    // carries the application, not UNKNOWN.
+                                    resolve_flow_app_id(&worker_ctx.forwarding.app_catalog, flow),
                                     now_ns,
                                 );
                                 telemetry.dbg.policy_deny += 1;
@@ -2842,6 +2850,11 @@ pub(super) fn poll_binding_process_descriptor(
                                         owner_rg_id,
                                         policy_result.policy_id,
                                         policy_result.action,
+                                        // #2520: AppID via the hot-path lookup.
+                                        resolve_flow_app_id(
+                                            &worker_ctx.forwarding.app_catalog,
+                                            flow,
+                                        ),
                                         now_ns,
                                     );
                                     telemetry.dbg.policy_deny += 1;

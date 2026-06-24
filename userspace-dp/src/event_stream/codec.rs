@@ -479,6 +479,7 @@ impl EventFrame {
         log_syslog: bool,
         created_unix_secs: u32,
         close_unix_ns: u64,
+        application_id: u16,
     ) -> Self {
         let mut buf = [0u8; 256];
         let base = FRAME_HEADER_SIZE;
@@ -526,7 +527,12 @@ impl EventFrame {
         buf[base + 108..base + 112].copy_from_slice(&created_unix_secs.to_le_bytes());
         // [112:120] rev packets, [120:128] rev bytes — 0 (#2501).
         // [128:132] ingress ifindex — 0 (per-close ifindex not threaded).
-        // [132:134] application id — 0.
+        // [132:134] application id — #2520: the AppID resolved for the closing
+        // session's 5-tuple (the caller runs the same app_catalog.lookup the
+        // forwarding hot path used to stamp the conntrack entry). 0 stays the
+        // UNKNOWN sentinel the Go RT_FLOW logger renders as
+        // application="UNKNOWN".
+        buf[base + 132..base + 134].copy_from_slice(&application_id.to_le_bytes());
         // owner_rg_id rides the [64:66] slot the deny/screen/filter frames
         // use, but for SESSION_CLOSE the Go side reads [56:64] as the
         // session-packets counter, so owner_rg_id is intentionally NOT

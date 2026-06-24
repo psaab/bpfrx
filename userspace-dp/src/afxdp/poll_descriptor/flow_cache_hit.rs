@@ -126,6 +126,7 @@ pub(super) fn stage_flow_cache_hit(
             meta.pkt_len as u64,
         );
         emit_cached_input_filter_log(
+            worker_ctx.forwarding,
             worker_ctx.event_stream,
             flow,
             meta,

@@ -1140,6 +1140,8 @@ pub(super) fn ingress_route_table_override(
             routing_result.term_id,
             routing_result.action,
             FilterLogSource::Pbr,
+            // #2520: AppID via the hot-path app_catalog.lookup.
+            resolve_flow_app_id(&forwarding.app_catalog, flow),
             now_ns,
         );
     }
