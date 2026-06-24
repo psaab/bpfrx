@@ -1526,7 +1526,7 @@ fn build_output_filter_state(
         }],
         "",
         "",
-    )
+    ).expect("filter state compiles")
 }
 
 #[test]

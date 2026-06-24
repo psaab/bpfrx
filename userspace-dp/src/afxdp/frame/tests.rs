@@ -2449,7 +2449,7 @@ fn build_live_forward_request_meters_non_l4_metadata_flow() {
         }],
         "policed",
         "",
-    );
+    ).expect("filter state compiles");
     let mut forwarding = ForwardingState {
         filter_state,
         tx_selection_enabled_v4: true,
@@ -2578,7 +2578,7 @@ fn build_live_forward_request_marks_empty_cos_selection_resolved() {
         }],
         "policed",
         "",
-    );
+    ).expect("filter state compiles");
     let forwarding = ForwardingState {
         filter_state,
         tx_selection_enabled_v4: true,
@@ -2679,7 +2679,7 @@ fn build_live_forward_request_emits_output_filter_log_event() {
         }],
         "",
         "",
-    );
+    ).expect("filter state compiles");
     let mut forwarding = ForwardingState {
         filter_state,
         tx_selection_enabled_v4: true,

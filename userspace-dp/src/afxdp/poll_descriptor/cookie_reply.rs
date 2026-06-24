@@ -274,7 +274,7 @@ mod tests {
             }],
             "",
             "",
-        );
+        ).expect("filter state compiles");
         let forwarding = ForwardingState {
             filter_state,
             tx_selection_enabled_v4: true,

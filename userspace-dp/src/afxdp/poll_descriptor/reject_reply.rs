@@ -290,7 +290,7 @@ mod tests {
             }],
             "",
             "",
-        );
+        ).expect("filter state compiles");
         let mut forwarding = ForwardingState {
             filter_state,
             tx_selection_enabled_v4: true,

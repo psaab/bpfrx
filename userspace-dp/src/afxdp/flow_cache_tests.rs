@@ -671,7 +671,7 @@ fn from_forward_decision_skips_cache_for_dscp_matched_output_filter() {
         }],
         "",
         "",
-    );
+    ).expect("filter state compiles");
 
     let entry = FlowCacheEntry::from_forward_decision(
         &flow,
@@ -723,7 +723,7 @@ fn from_forward_decision_skips_cache_for_dscp_matched_input_filter() {
         }],
         "",
         "",
-    );
+    ).expect("filter state compiles");
 
     let entry = FlowCacheEntry::from_forward_decision(
         &flow,
@@ -775,7 +775,7 @@ fn from_forward_decision_skips_cache_for_per_packet_l4_input_filter() {
         }],
         "",
         "",
-    );
+    ).expect("filter state compiles");
 
     let entry = FlowCacheEntry::from_forward_decision(
         &flow,
@@ -823,7 +823,7 @@ fn from_forward_decision_skips_cache_for_per_packet_l4_output_filter() {
         }],
         "",
         "",
-    );
+    ).expect("filter state compiles");
 
     let entry = FlowCacheEntry::from_forward_decision(
         &flow,
@@ -915,7 +915,7 @@ fn dscp_input_gate_blocks_flow_cache_insertion_via_runbook_pattern() {
         }],
         "",
         "",
-    );
+    ).expect("filter state compiles");
 
     // Step 4: drive FlowCacheEntry::from_forward_decision and
     // confirm the gate at flow_cache.rs:297-309 declined
@@ -977,7 +977,7 @@ fn dscp_output_gate_blocks_flow_cache_insertion_via_runbook_pattern() {
         }],
         "",
         "",
-    );
+    ).expect("filter state compiles");
 
     // Step 4: same gate, different lookup —
     // interface_output_filter_has_dscp_match consults

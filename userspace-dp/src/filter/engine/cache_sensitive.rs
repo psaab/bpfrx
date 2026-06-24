@@ -324,7 +324,8 @@ mod cache_sensitive_2400_tests {
             &[],
             "",
             "",
-        );
+        )
+        .expect("filter state compiles");
         state
             .filters
             .get("inet:f")
