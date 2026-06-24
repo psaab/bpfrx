@@ -68,3 +68,11 @@ Standard library + `golang.org/x/sys/unix`. No internal `pkg/*` imports.
   `Neighbors()` snapshot.
 - The neighbor map is RWMutex-guarded. `Neighbors()` returns a copy, not
   a reference, so callers can iterate without holding the lock.
+- `ParseTLVs` counts a mandatory TLV (Chassis ID, Port ID, TTL) as
+  present only once its value parsed into a valid identifier — a non-empty
+  Chassis/Port ID, a full 2-byte TTL. A truncated mandatory TLV (subtype
+  byte alone, a MAC-subtype Chassis ID short of its 6-byte address, or a
+  TTL under 2 bytes) leaves the corresponding flag unset, so the frame is
+  rejected rather than cached under an empty `ifname//` key with TTL 0
+  (#2551). A valid 2-byte TTL of 0 is a legitimate shutdown advert and is
+  still accepted (the gate is "the TLV parsed", not "TTL != 0").
