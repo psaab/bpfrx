@@ -31,8 +31,6 @@ func prefixListCfg(srcRefs, dstRefs []config.PrefixListRef, prefixes map[string]
 					Name:              "t",
 					SourcePrefixLists: srcRefs,
 					DestPrefixLists:   dstRefs,
-					ICMPType:          -1,
-					ICMPCode:          -1,
 					Action:            "discard",
 				},
 			},

@@ -830,15 +830,25 @@ type FirewallFilterTerm struct {
 	DestAddresses     []string        // CIDRs
 	SourcePrefixLists []PrefixListRef // source-prefix-list references
 	DestPrefixLists   []PrefixListRef // destination-prefix-list references
-	DSCP              string          // DSCP/traffic-class name (ef, af43, etc.) or number
-	Protocol          string          // tcp, udp, icmp, icmpv6
-	DestinationPorts  []string        // port numbers or names
-	SourcePorts       []string        // source port numbers or ranges
-	ICMPType          int             // -1 = not set
-	ICMPCode          int             // -1 = not set
-	TCPFlags          []string        // TCP flags: "syn", "ack", "fin", "rst", "psh", "urg"
-	IsFragment        bool            // match IP fragments
-	Action            string          // "accept", "reject", "discard", ""
+	// DSCPs / Protocols / ICMPTypes / ICMPCodes are SCHEMA-DECLARED multi-value
+	// (schema_cos.go marks them `multi: true`) and Junos accepts the match
+	// criterion repeated within one `from` block. They are stored as SLICES
+	// (#2545) so repeated children accumulate into a match-ANY set instead of
+	// the prior scalar last-write-wins (`from protocol tcp; from protocol udp`
+	// silently dropped tcp). An EMPTY slice means the criterion is unconstrained
+	// (matches any), exactly like the prior empty-string / -1 sentinels. The
+	// dataplane (filters.go) emits every value into the corresponding wire
+	// vector and the Rust matcher evaluates set membership (match-ANY within a
+	// field, AND across fields).
+	DSCPs            []string // DSCP/traffic-class names (ef, af43, ...) or numbers
+	Protocols        []string // tcp, udp, icmp, icmpv6, esp, ...
+	DestinationPorts []string // port numbers or names
+	SourcePorts      []string // source port numbers or ranges
+	ICMPTypes        []int    // ICMP/ICMPv6 type bytes (0..255); empty = not set
+	ICMPCodes        []int    // ICMP/ICMPv6 code bytes (0..255); empty = not set
+	TCPFlags         []string // TCP flags: "syn", "ack", "fin", "rst", "psh", "urg"
+	IsFragment       bool     // match IP fragments
+	Action           string   // "accept", "reject", "discard", ""
 	// UnknownActions records `then` tokens that are neither a recognized
 	// terminating action nor a recognized modifier (#2399 finding 032-16).
 	// An unknown or misspelled action would otherwise be silently dropped

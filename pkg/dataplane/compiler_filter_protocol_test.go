@@ -41,11 +41,9 @@ func (d *recordingFilterDP) ZeroStaleFilterConfigs(startID uint32)              
 func filterCfgWithProtocol(family, proto string) *config.Config {
 	cfg := &config.Config{}
 	term := &config.FirewallFilterTerm{
-		Name:     "t",
-		Protocol: proto,
-		Action:   "accept",
-		ICMPType: -1,
-		ICMPCode: -1,
+		Name:      "t",
+		Protocols: []string{proto},
+		Action:    "accept",
 	}
 	filter := &config.FirewallFilter{Name: "f", Terms: []*config.FirewallFilterTerm{term}}
 	if family == "inet6" {
@@ -89,11 +87,9 @@ func TestExpandFilterTermProtocolSSOT(t *testing.T) {
 	}
 	for _, tc := range cases {
 		term := &config.FirewallFilterTerm{
-			Name:     "proto-" + tc.proto,
-			Protocol: tc.proto,
-			Action:   "accept",
-			ICMPType: -1,
-			ICMPCode: -1,
+			Name:      "proto-" + tc.proto,
+			Protocols: []string{tc.proto},
+			Action:    "accept",
 		}
 		rules := expandFilterTerm(term, AFInet, nil, nil, nil)
 		if len(rules) != 1 {

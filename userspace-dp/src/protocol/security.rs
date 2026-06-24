@@ -170,12 +170,16 @@ pub(crate) struct FirewallTermSnapshot {
     // IPv6 fragment extension header present).
     #[serde(rename = "is_fragment", default)]
     pub is_fragment: bool,
-    // icmp_type / icmp_code match the ICMP/ICMPv6 type and code bytes. None =
-    // no constraint; a non-ICMP(v6) packet never matches a term that sets them.
-    #[serde(rename = "icmp_type", default)]
-    pub icmp_type: Option<u8>,
-    #[serde(rename = "icmp_code", default)]
-    pub icmp_code: Option<u8>,
+    // icmp_types / icmp_codes match the ICMP/ICMPv6 type and code bytes (#2545,
+    // multi-value). An empty vec = no constraint. A non-empty vec matches if the
+    // packet's type/code byte is in the set (match-ANY). A non-ICMP(v6) packet
+    // never matches a term that sets them. Previously scalar (`icmp_type`,
+    // `icmp_code`): a term carrying two `from icmp-type` values kept only the
+    // last, silently dropping the earlier constraint.
+    #[serde(rename = "icmp_types", default)]
+    pub icmp_types: Vec<u8>,
+    #[serde(rename = "icmp_codes", default)]
+    pub icmp_codes: Vec<u8>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]

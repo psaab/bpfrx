@@ -105,20 +105,27 @@ func buildFilterTermSnapshots(filterName string, filter *config.FirewallFilter, 
 		snap.DestExcept = dstExcept
 		snap.SourceConstrained = srcConstrained
 		snap.DestConstrained = dstConstrained
-		// Protocols
-		if term.Protocol != "" {
-			snap.Protocols = []string{term.Protocol}
+		// Protocols (#2545: a term may carry several `from protocol` values;
+		// emit ALL of them into the wire vector — the Rust matcher does set
+		// membership).
+		for _, p := range term.Protocols {
+			if p != "" {
+				snap.Protocols = append(snap.Protocols, p)
+			}
 		}
 		// Source ports
 		snap.SourcePorts = append(snap.SourcePorts, term.SourcePorts...)
 		// Destination ports
 		snap.DestPorts = append(snap.DestPorts, term.DestinationPorts...)
-		// DSCP
-		if term.DSCP != "" {
-			if val, ok := dataplane.DSCPValues[strings.ToLower(term.DSCP)]; ok {
-				snap.DSCPValues = []uint8{val}
-			} else if v, err := strconv.Atoi(term.DSCP); err == nil && v >= 0 && v <= 63 {
-				snap.DSCPValues = []uint8{uint8(v)}
+		// DSCP (#2545: multi-value — emit every resolved code point).
+		for _, d := range term.DSCPs {
+			if d == "" {
+				continue
+			}
+			if val, ok := dataplane.DSCPValues[strings.ToLower(d)]; ok {
+				snap.DSCPValues = append(snap.DSCPValues, val)
+			} else if v, err := strconv.Atoi(d); err == nil && v >= 0 && v <= 63 {
+				snap.DSCPValues = append(snap.DSCPValues, uint8(v))
 			}
 		}
 		// DSCP rewrite
@@ -139,15 +146,19 @@ func buildFilterTermSnapshots(filterName string, filter *config.FirewallFilter, 
 			snap.TCPFlags = &m
 		}
 		snap.IsFragment = term.IsFragment
-		// The typed config uses -1 for "not set"; only serialize a valid
-		// in-range byte. Junos icmp-type/icmp-code are 0..255.
-		if term.ICMPType >= 0 && term.ICMPType <= 255 {
-			t := uint8(term.ICMPType)
-			snap.ICMPType = &t
+		// icmp-type / icmp-code are multi-value (#2545): emit every in-range
+		// byte into the wire vector. Junos icmp-type/icmp-code are 0..255; an
+		// empty vector means the criterion is unconstrained. The Rust matcher
+		// does set membership (match-ANY within the field).
+		for _, t := range term.ICMPTypes {
+			if t >= 0 && t <= 255 {
+				snap.ICMPTypes = append(snap.ICMPTypes, uint8(t))
+			}
 		}
-		if term.ICMPCode >= 0 && term.ICMPCode <= 255 {
-			c := uint8(term.ICMPCode)
-			snap.ICMPCode = &c
+		for _, c := range term.ICMPCodes {
+			if c >= 0 && c <= 255 {
+				snap.ICMPCodes = append(snap.ICMPCodes, uint8(c))
+			}
 		}
 		terms = append(terms, snap)
 	}

@@ -71,11 +71,11 @@ func (s *Server) showFirewall(cfg *config.Config, buf *strings.Builder) {
 
 			for _, term := range filter.Terms {
 				fmt.Fprintf(buf, "  Term: %s\n", term.Name)
-				if term.DSCP != "" {
-					fmt.Fprintf(buf, "    from dscp %s\n", term.DSCP)
+				for _, d := range term.DSCPs {
+					fmt.Fprintf(buf, "    from dscp %s\n", d)
 				}
-				if term.Protocol != "" {
-					fmt.Fprintf(buf, "    from protocol %s\n", term.Protocol)
+				for _, p := range term.Protocols {
+					fmt.Fprintf(buf, "    from protocol %s\n", p)
 				}
 				for _, addr := range term.SourceAddresses {
 					fmt.Fprintf(buf, "    from source-address %s\n", addr)
@@ -103,11 +103,11 @@ func (s *Server) showFirewall(cfg *config.Config, buf *strings.Builder) {
 				if len(term.DestinationPorts) > 0 {
 					fmt.Fprintf(buf, "    from destination-port %s\n", strings.Join(term.DestinationPorts, ", "))
 				}
-				if term.ICMPType >= 0 {
-					fmt.Fprintf(buf, "    from icmp-type %d\n", term.ICMPType)
+				for _, t := range term.ICMPTypes {
+					fmt.Fprintf(buf, "    from icmp-type %d\n", t)
 				}
-				if term.ICMPCode >= 0 {
-					fmt.Fprintf(buf, "    from icmp-code %d\n", term.ICMPCode)
+				for _, c := range term.ICMPCodes {
+					fmt.Fprintf(buf, "    from icmp-code %d\n", c)
 				}
 				if term.RoutingInstance != "" {
 					fmt.Fprintf(buf, "    then routing-instance %s\n", term.RoutingInstance)
@@ -317,11 +317,11 @@ func (s *Server) showFirewallFilter(req *pb.ShowTextRequest, cfg *config.Config,
 			ruleOffset := ruleStart
 			for _, term := range filter.Terms {
 				fmt.Fprintf(buf, "\n  Term: %s\n", term.Name)
-				if term.DSCP != "" {
-					fmt.Fprintf(buf, "    from dscp %s\n", term.DSCP)
+				for _, d := range term.DSCPs {
+					fmt.Fprintf(buf, "    from dscp %s\n", d)
 				}
-				if term.Protocol != "" {
-					fmt.Fprintf(buf, "    from protocol %s\n", term.Protocol)
+				for _, p := range term.Protocols {
+					fmt.Fprintf(buf, "    from protocol %s\n", p)
 				}
 				for _, addr := range term.SourceAddresses {
 					fmt.Fprintf(buf, "    from source-address %s\n", addr)
@@ -349,11 +349,11 @@ func (s *Server) showFirewallFilter(req *pb.ShowTextRequest, cfg *config.Config,
 				if len(term.DestinationPorts) > 0 {
 					fmt.Fprintf(buf, "    from destination-port %s\n", strings.Join(term.DestinationPorts, ", "))
 				}
-				if term.ICMPType >= 0 {
-					fmt.Fprintf(buf, "    from icmp-type %d\n", term.ICMPType)
+				for _, t := range term.ICMPTypes {
+					fmt.Fprintf(buf, "    from icmp-type %d\n", t)
 				}
-				if term.ICMPCode >= 0 {
-					fmt.Fprintf(buf, "    from icmp-code %d\n", term.ICMPCode)
+				for _, c := range term.ICMPCodes {
+					fmt.Fprintf(buf, "    from icmp-code %d\n", c)
 				}
 				if term.RoutingInstance != "" {
 					fmt.Fprintf(buf, "    then routing-instance %s\n", term.RoutingInstance)

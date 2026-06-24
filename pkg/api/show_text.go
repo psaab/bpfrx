@@ -103,8 +103,8 @@ func (s *Server) showTextHandler(w http.ResponseWriter, r *http.Request) {
 					fmt.Fprintf(&buf, "Filter: %s (family: %s)\n", name, family)
 					for _, term := range filter.Terms {
 						fmt.Fprintf(&buf, "  Term: %s\n", term.Name)
-						if term.Protocol != "" {
-							fmt.Fprintf(&buf, "    From protocol: %s\n", term.Protocol)
+						if len(term.Protocols) > 0 {
+							fmt.Fprintf(&buf, "    From protocol: %s\n", strings.Join(term.Protocols, ", "))
 						}
 						if len(term.DestinationPorts) > 0 {
 							fmt.Fprintf(&buf, "    From destination-port: %s\n", strings.Join(term.DestinationPorts, ", "))
@@ -112,8 +112,8 @@ func (s *Server) showTextHandler(w http.ResponseWriter, r *http.Request) {
 						if len(term.SourceAddresses) > 0 {
 							fmt.Fprintf(&buf, "    From source-address: %s\n", strings.Join(term.SourceAddresses, ", "))
 						}
-						if term.DSCP != "" {
-							fmt.Fprintf(&buf, "    From dscp: %s\n", term.DSCP)
+						if len(term.DSCPs) > 0 {
+							fmt.Fprintf(&buf, "    From dscp: %s\n", strings.Join(term.DSCPs, ", "))
 						}
 						if term.Action != "" {
 							fmt.Fprintf(&buf, "    Then: %s\n", term.Action)

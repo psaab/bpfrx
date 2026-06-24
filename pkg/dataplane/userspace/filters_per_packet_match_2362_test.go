@@ -24,11 +24,9 @@ func perPacketMatchCfg() *config.Config {
 			Terms: []*config.FirewallFilterTerm{
 				{
 					Name:       "syn-only",
-					Protocol:   "tcp",
+					Protocols:  []string{"tcp"},
 					TCPFlags:   []string{"syn"},
 					IsFragment: false,
-					ICMPType:   -1,
-					ICMPCode:   -1,
 					Action:     "discard",
 				},
 			},
@@ -56,8 +54,8 @@ func TestFilterSnapshotTCPFlagsMultipleAreAnded(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Firewall.FiltersInet = map[string]*config.FirewallFilter{
 		"f": {Name: "f", Terms: []*config.FirewallFilterTerm{{
-			Name: "t", Protocol: "tcp", TCPFlags: []string{"syn", "ack"},
-			ICMPType: -1, ICMPCode: -1, Action: "discard",
+			Name: "t", Protocols: []string{"tcp"}, TCPFlags: []string{"syn", "ack"},
+			Action: "discard",
 		}}},
 	}
 	snaps := buildFirewallFilterSnapshots(cfg)
@@ -78,8 +76,8 @@ func TestFilterSnapshotTCPFlagsUnknownYieldsNil(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Firewall.FiltersInet = map[string]*config.FirewallFilter{
 		"f": {Name: "f", Terms: []*config.FirewallFilterTerm{{
-			Name: "t", Protocol: "tcp", TCPFlags: []string{"(syn & !ack)"},
-			ICMPType: -1, ICMPCode: -1, Action: "discard",
+			Name: "t", Protocols: []string{"tcp"}, TCPFlags: []string{"(syn & !ack)"},
+			Action: "discard",
 		}}},
 	}
 	snaps := buildFirewallFilterSnapshots(cfg)
@@ -92,7 +90,7 @@ func TestFilterSnapshotIsFragmentSerialized(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Firewall.FiltersInet = map[string]*config.FirewallFilter{
 		"f": {Name: "f", Terms: []*config.FirewallFilterTerm{{
-			Name: "t", IsFragment: true, ICMPType: -1, ICMPCode: -1, Action: "discard",
+			Name: "t", IsFragment: true, Action: "discard",
 		}}},
 	}
 	snaps := buildFirewallFilterSnapshots(cfg)
@@ -105,35 +103,35 @@ func TestFilterSnapshotICMPTypeCodeSerialized(t *testing.T) {
 	cfg := &config.Config{}
 	cfg.Firewall.FiltersInet = map[string]*config.FirewallFilter{
 		"f": {Name: "f", Terms: []*config.FirewallFilterTerm{{
-			Name: "t", Protocol: "icmp", ICMPType: 8, ICMPCode: 0, Action: "discard",
+			Name: "t", Protocols: []string{"icmp"}, ICMPTypes: []int{8}, ICMPCodes: []int{0}, Action: "discard",
 		}}},
 	}
 	snaps := buildFirewallFilterSnapshots(cfg)
 	term := snaps[0].Terms[0]
-	if term.ICMPType == nil || *term.ICMPType != 8 {
-		t.Errorf("icmp-type = %v, want 8 (echo-request) (#2362)", term.ICMPType)
+	if len(term.ICMPTypes) != 1 || term.ICMPTypes[0] != 8 {
+		t.Errorf("icmp-types = %v, want [8] (echo-request) (#2362)", term.ICMPTypes)
 	}
-	if term.ICMPCode == nil || *term.ICMPCode != 0 {
-		t.Errorf("icmp-code = %v, want 0 (#2362)", term.ICMPCode)
+	if len(term.ICMPCodes) != 1 || term.ICMPCodes[0] != 0 {
+		t.Errorf("icmp-codes = %v, want [0] (#2362)", term.ICMPCodes)
 	}
 }
 
 func TestFilterSnapshotICMPUnsetStaysNil(t *testing.T) {
-	// The compiler uses -1 for "not set"; an unset icmp-type/code must not
-	// serialize a bogus 0 constraint.
+	// An unset icmp-type/code (empty slice on the typed term) must not
+	// serialize a bogus 0 constraint — the wire vector stays empty.
 	cfg := &config.Config{}
 	cfg.Firewall.FiltersInet = map[string]*config.FirewallFilter{
 		"f": {Name: "f", Terms: []*config.FirewallFilterTerm{{
-			Name: "t", Protocol: "tcp", ICMPType: -1, ICMPCode: -1, Action: "accept",
+			Name: "t", Protocols: []string{"tcp"}, Action: "accept",
 		}}},
 	}
 	snaps := buildFirewallFilterSnapshots(cfg)
 	term := snaps[0].Terms[0]
-	if term.ICMPType != nil {
-		t.Errorf("unset icmp-type should be nil, got %d", *term.ICMPType)
+	if len(term.ICMPTypes) != 0 {
+		t.Errorf("unset icmp-type should be empty, got %v", term.ICMPTypes)
 	}
-	if term.ICMPCode != nil {
-		t.Errorf("unset icmp-code should be nil, got %d", *term.ICMPCode)
+	if len(term.ICMPCodes) != 0 {
+		t.Errorf("unset icmp-code should be empty, got %v", term.ICMPCodes)
 	}
 }
 

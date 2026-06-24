@@ -1495,15 +1495,21 @@ func validateFilterProtocolsStrict(cfg *Config) error {
 				continue
 			}
 			for _, term := range filter.Terms {
-				if term == nil || term.Protocol == "" {
+				if term == nil {
 					continue
 				}
-				if !filterProtocolResolvable(term.Protocol) {
-					return fmt.Errorf(
-						"firewall family %s filter %q term %q: unknown protocol %q "+
-							"(use a protocol name such as tcp/udp/icmp/icmpv6/gre/esp/ah/"+
-							"sctp/ospf or a numeric value 0-255)",
-						family, name, term.Name, term.Protocol)
+				// #2545: protocol is multi-value — every token must resolve.
+				for _, proto := range term.Protocols {
+					if proto == "" {
+						continue
+					}
+					if !filterProtocolResolvable(proto) {
+						return fmt.Errorf(
+							"firewall family %s filter %q term %q: unknown protocol %q "+
+								"(use a protocol name such as tcp/udp/icmp/icmpv6/gre/esp/ah/"+
+								"sctp/ospf or a numeric value 0-255)",
+							family, name, term.Name, proto)
+					}
 				}
 			}
 		}

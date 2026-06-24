@@ -472,10 +472,19 @@ func buildPBRFromFilter(filter *config.FirewallFilter, family int, tableIDs map[
 			continue
 		}
 
-		// Determine TOS byte from DSCP value
-		var tos uint8
-		if term.DSCP != "" {
-			tos = dscpToTOS(term.DSCP)
+		// Determine TOS byte(s) from the term's DSCP value(s) (#2545:
+		// multi-value). An ip rule carries a SINGLE tos, so a term with
+		// several `from dscp` values expands to one rule per DSCP (plus the
+		// src/dst cross-product). A term with no DSCP yields a single tos=0
+		// sentinel so the address-only case still emits one rule per address.
+		var toses []uint8
+		for _, d := range term.DSCPs {
+			if d != "" {
+				toses = append(toses, dscpToTOS(d))
+			}
+		}
+		if len(toses) == 0 {
+			toses = []uint8{0}
 		}
 
 		// If the term has source/dest addresses, create a rule per address.
@@ -490,23 +499,32 @@ func buildPBRFromFilter(filter *config.FirewallFilter, family int, tableIDs map[
 		}
 
 		// Check if we have anything ip rule can match on
-		hasCriteria := tos != 0 || term.SourceAddresses != nil || term.DestAddresses != nil
+		hasDSCP := false
+		for _, t := range toses {
+			if t != 0 {
+				hasDSCP = true
+				break
+			}
+		}
+		hasCriteria := hasDSCP || term.SourceAddresses != nil || term.DestAddresses != nil
 		if !hasCriteria {
 			slog.Warn("PBR: filter term has routing-instance but no ip-rule-compatible criteria (dscp, source-address, destination-address)",
 				"filter", filter.Name, "term", term.Name)
 			continue
 		}
 
-		for _, src := range srcs {
-			for _, dst := range dsts {
-				rules = append(rules, PBRRule{
-					Family:   family,
-					TOS:      tos,
-					Src:      src,
-					Dst:      dst,
-					TableID:  tableID,
-					Instance: term.RoutingInstance,
-				})
+		for _, tos := range toses {
+			for _, src := range srcs {
+				for _, dst := range dsts {
+					rules = append(rules, PBRRule{
+						Family:   family,
+						TOS:      tos,
+						Src:      src,
+						Dst:      dst,
+						TableID:  tableID,
+						Instance: term.RoutingInstance,
+					})
+				}
 			}
 		}
 	}

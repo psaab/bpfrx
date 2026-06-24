@@ -113,19 +113,19 @@ func (f *fakeVRFOps) has(name string) bool {
 
 func TestReconcileVRFs(t *testing.T) {
 	type scenario struct {
-		name    string
-		seeds   map[string]uint32         // pre-existing kernel VRFs
-		tracked []string                  // initial m.vrfs
-		desired []VRFSpec                 // input
-		wantVrfs []string                 // expected new m.vrfs (order-preserving)
-		wantLinks       map[string]uint32 // expected kernel state after call
-		wantAdds        int
-		wantDels        int
+		name      string
+		seeds     map[string]uint32 // pre-existing kernel VRFs
+		tracked   []string          // initial m.vrfs
+		desired   []VRFSpec         // input
+		wantVrfs  []string          // expected new m.vrfs (order-preserving)
+		wantLinks map[string]uint32 // expected kernel state after call
+		wantAdds  int
+		wantDels  int
 		// Negative = skip assertion (used where the exact SetUp/ByName
 		// count isn't a load-bearing property for the scenario).
-		wantSetUps      int
-		wantByNameHits  int
-		wantErr         bool
+		wantSetUps     int
+		wantByNameHits int
+		wantErr        bool
 	}
 	cases := []scenario{
 		{
@@ -557,8 +557,8 @@ func TestResolveRibTable(t *testing.T) {
 		{"dmz-vr.inet60.0", 0, false},
 		{"dmz-vr.inet.0.garbage", 0, false},
 		{"dmz-vr.inet", 0, false},
-		{".inet.0", 0, false},   // empty instance prefix
-		{".inet6.0", 0, false},  // empty instance prefix
+		{".inet.0", 0, false},  // empty instance prefix
+		{".inet6.0", 0, false}, // empty instance prefix
 	}
 
 	for _, tt := range tests {
@@ -673,21 +673,21 @@ func TestDscpToTOS(t *testing.T) {
 		dscp string
 		want uint8
 	}{
-		{"ef", 46 << 2},     // 0xB8 = 184
-		{"af43", 38 << 2},   // 0x98 = 152
-		{"af42", 36 << 2},   // 0x90 = 144
-		{"af41", 34 << 2},   // 0x88 = 136
-		{"af33", 30 << 2},   // 120
-		{"cs1", 8 << 2},     // 32
-		{"cs5", 40 << 2},    // 160
-		{"be", 0},           // best effort = 0
-		{"cs0", 0},          // cs0 = 0 → TOS = 0
-		{"46", 46 << 2},     // numeric DSCP
-		{"0", 0},            // zero
-		{"63", 63 << 2},     // max DSCP
-		{"invalid", 0},      // unknown name → 0
-		{"EF", 46 << 2},     // case-insensitive
-		{"AF43", 38 << 2},   // case-insensitive
+		{"ef", 46 << 2},   // 0xB8 = 184
+		{"af43", 38 << 2}, // 0x98 = 152
+		{"af42", 36 << 2}, // 0x90 = 144
+		{"af41", 34 << 2}, // 0x88 = 136
+		{"af33", 30 << 2}, // 120
+		{"cs1", 8 << 2},   // 32
+		{"cs5", 40 << 2},  // 160
+		{"be", 0},         // best effort = 0
+		{"cs0", 0},        // cs0 = 0 → TOS = 0
+		{"46", 46 << 2},   // numeric DSCP
+		{"0", 0},          // zero
+		{"63", 63 << 2},   // max DSCP
+		{"invalid", 0},    // unknown name → 0
+		{"EF", 46 << 2},   // case-insensitive
+		{"AF43", 38 << 2}, // case-insensitive
 	}
 
 	for _, tt := range tests {
@@ -713,12 +713,12 @@ func TestBuildPBRRules(t *testing.T) {
 					Terms: []*config.FirewallFilterTerm{
 						{
 							Name:            "dscp-to-gigabitpro",
-							DSCP:            "ef",
+							DSCPs:           []string{"ef"},
 							RoutingInstance: "Comcast-GigabitPro",
 						},
 						{
 							Name:            "dscp-to-att",
-							DSCP:            "af43",
+							DSCPs:           []string{"af43"},
 							RoutingInstance: "ATT",
 						},
 					},
@@ -829,7 +829,7 @@ func TestBuildPBRRules(t *testing.T) {
 					Terms: []*config.FirewallFilterTerm{
 						{
 							Name:            "dscp-route",
-							DSCP:            "ef",
+							DSCPs:           []string{"ef"},
 							RoutingInstance: "ATT",
 						},
 					},
@@ -876,7 +876,7 @@ func TestBuildPBRRules(t *testing.T) {
 					Terms: []*config.FirewallFilterTerm{
 						{
 							Name:            "bad",
-							DSCP:            "ef",
+							DSCPs:           []string{"ef"},
 							RoutingInstance: "NonExistent",
 						},
 					},
@@ -898,12 +898,12 @@ func TestBuildPBRRules(t *testing.T) {
 					Terms: []*config.FirewallFilterTerm{
 						{
 							Name:   "accept-term",
-							DSCP:   "ef",
+							DSCPs:  []string{"ef"},
 							Action: "accept",
 						},
 						{
 							Name:            "route-term",
-							DSCP:            "af43",
+							DSCPs:           []string{"af43"},
 							RoutingInstance: "ATT",
 						},
 					},
@@ -1067,9 +1067,9 @@ func TestRethMemberCollection(t *testing.T) {
 		"ge-0/0/0": {Name: "ge-0/0/0", RedundantParent: "reth0"},
 		"ge-0/0/1": {Name: "ge-0/0/1", RedundantParent: "reth0"},
 		"ge-0/0/2": {Name: "ge-0/0/2", RedundantParent: "reth1"},
-		"reth0":     {Name: "reth0", RedundancyGroup: 1},
-		"reth1":     {Name: "reth1", RedundancyGroup: 1},
-		"trust0":    {Name: "trust0"},
+		"reth0":    {Name: "reth0", RedundancyGroup: 1},
+		"reth1":    {Name: "reth1", RedundancyGroup: 1},
+		"trust0":   {Name: "trust0"},
 	}
 
 	rethMembers := make(map[string][]string)

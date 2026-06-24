@@ -508,8 +508,13 @@ fn parse_term(
         // hand-crafted snapshot.
         tcp_flags_mask: snap.tcp_flags.filter(|&m| m != 0),
         is_fragment: snap.is_fragment,
-        icmp_type: snap.icmp_type,
-        icmp_code: snap.icmp_code,
+        // #2545: icmp-type / icmp-code are SET membership (match-ANY). An empty
+        // list = no constraint (`*_match_enabled` false → match any), preserving
+        // the prior scalar-None behavior.
+        icmp_type_bitmap: build_u8_match_bitmap(&snap.icmp_types),
+        icmp_type_match_enabled: !snap.icmp_types.is_empty(),
+        icmp_code_bitmap: build_u8_match_bitmap(&snap.icmp_codes),
+        icmp_code_match_enabled: !snap.icmp_codes.is_empty(),
         action,
         // #2544: this term falls through (applies modifiers, continues to the
         // next term) when it carries no terminating action. The Go control

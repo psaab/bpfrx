@@ -54,11 +54,11 @@ func (c *CLI) showFirewallFilters() error {
 			ruleOffset := ruleStart
 			for _, term := range f.Terms {
 				fmt.Printf("  Term: %s\n", term.Name)
-				if term.DSCP != "" {
-					fmt.Printf("    from dscp %s\n", term.DSCP)
+				for _, d := range term.DSCPs {
+					fmt.Printf("    from dscp %s\n", d)
 				}
-				if term.Protocol != "" {
-					fmt.Printf("    from protocol %s\n", term.Protocol)
+				for _, p := range term.Protocols {
+					fmt.Printf("    from protocol %s\n", p)
 				}
 				for _, addr := range term.SourceAddresses {
 					fmt.Printf("    from source-address %s\n", addr)
@@ -86,11 +86,11 @@ func (c *CLI) showFirewallFilters() error {
 					}
 					fmt.Printf("    from destination-prefix-list %s%s\n", ref.Name, mod)
 				}
-				if term.ICMPType >= 0 {
-					fmt.Printf("    from icmp-type %d\n", term.ICMPType)
+				for _, t := range term.ICMPTypes {
+					fmt.Printf("    from icmp-type %d\n", t)
 				}
-				if term.ICMPCode >= 0 {
-					fmt.Printf("    from icmp-code %d\n", term.ICMPCode)
+				for _, c := range term.ICMPCodes {
+					fmt.Printf("    from icmp-code %d\n", c)
 				}
 				action := term.Action
 				if action == "" {
@@ -227,11 +227,11 @@ func (c *CLI) showFirewallFilter(name, requestedFamily string) error {
 	ruleOffset := ruleStart
 	for _, term := range filter.Terms {
 		fmt.Printf("\n  Term: %s\n", term.Name)
-		if term.DSCP != "" {
-			fmt.Printf("    from dscp %s\n", term.DSCP)
+		for _, d := range term.DSCPs {
+			fmt.Printf("    from dscp %s\n", d)
 		}
-		if term.Protocol != "" {
-			fmt.Printf("    from protocol %s\n", term.Protocol)
+		for _, p := range term.Protocols {
+			fmt.Printf("    from protocol %s\n", p)
 		}
 		for _, addr := range term.SourceAddresses {
 			fmt.Printf("    from source-address %s\n", addr)
@@ -259,11 +259,11 @@ func (c *CLI) showFirewallFilter(name, requestedFamily string) error {
 		if len(term.DestinationPorts) > 0 {
 			fmt.Printf("    from destination-port %s\n", strings.Join(term.DestinationPorts, ", "))
 		}
-		if term.ICMPType >= 0 {
-			fmt.Printf("    from icmp-type %d\n", term.ICMPType)
+		for _, t := range term.ICMPTypes {
+			fmt.Printf("    from icmp-type %d\n", t)
 		}
-		if term.ICMPCode >= 0 {
-			fmt.Printf("    from icmp-code %d\n", term.ICMPCode)
+		for _, c := range term.ICMPCodes {
+			fmt.Printf("    from icmp-code %d\n", c)
 		}
 		if term.RoutingInstance != "" {
 			fmt.Printf("    then routing-instance %s\n", term.RoutingInstance)

@@ -63,7 +63,8 @@ func TestFBFTwoUpstreamFixtureCompiles(t *testing.T) {
 
 	v4 := cfg.Firewall.FiltersInet["fbf-steer"]
 	if v4 == nil || len(v4.Terms) != 2 || v4.Terms[0].RoutingInstance != "ISP-B" ||
-		v4.Terms[0].Count != "fbf-isp-b" || v4.Terms[0].DSCP != "af31" {
+		v4.Terms[0].Count != "fbf-isp-b" ||
+		len(v4.Terms[0].DSCPs) != 1 || v4.Terms[0].DSCPs[0] != "af31" {
 		t.Fatalf("fbf-steer = %+v", v4)
 	}
 	v6 := cfg.Firewall.FiltersInet6["fbf-steer6"]

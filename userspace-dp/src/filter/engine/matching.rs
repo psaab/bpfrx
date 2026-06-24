@@ -42,17 +42,22 @@ fn per_packet_l4_matches(term: &FilterTerm, protocol: u8, extra: TermMatchExtra)
         return false;
     }
     let is_icmp = protocol == PROTO_ICMP || protocol == PROTO_ICMPV6;
-    if let Some(want_type) = term.icmp_type {
-        // Gate on l4_present, NOT just the value: icmp-type 0 (echo-reply) is a
-        // real term, so a non-first fragment with a forced-0 type byte must NOT
-        // match it.
-        if !extra.l4_present || !is_icmp || extra.icmp_type != want_type {
+    if term.icmp_type_match_enabled {
+        // #2545: SET membership (match-ANY). Gate on l4_present, NOT just the
+        // value: icmp-type 0 (echo-reply) is a real term, so a non-first
+        // fragment with a forced-0 type byte must NOT match it. A non-ICMP
+        // packet never matches a term constraining icmp-type.
+        let t = extra.icmp_type;
+        let in_set = (term.icmp_type_bitmap[(t / 64) as usize] & (1u64 << (t % 64))) != 0;
+        if !extra.l4_present || !is_icmp || !in_set {
             return false;
         }
     }
-    if let Some(want_code) = term.icmp_code {
+    if term.icmp_code_match_enabled {
         // icmp-code 0 is the most common code — same l4_present gate.
-        if !extra.l4_present || !is_icmp || extra.icmp_code != want_code {
+        let c = extra.icmp_code;
+        let in_set = (term.icmp_code_bitmap[(c / 64) as usize] & (1u64 << (c % 64))) != 0;
+        if !extra.l4_present || !is_icmp || !in_set {
             return false;
         }
     }
