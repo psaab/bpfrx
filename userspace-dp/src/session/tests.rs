@@ -1657,6 +1657,71 @@ fn from_seconds_overrides_values() {
 }
 
 #[test]
+fn from_seconds_normal_value_unchanged() {
+    // 1 hour: a realistic operator-configured timeout must convert exactly,
+    // proving the saturation path does not perturb in-range values.
+    let t = SessionTimeouts::from_seconds(3600, 3600, 3600);
+    assert_eq!(t.tcp_established_ns, 3_600_000_000_000);
+    assert_eq!(t.udp_ns, 3_600_000_000_000);
+    assert_eq!(t.icmp_ns, 3_600_000_000_000);
+}
+
+#[test]
+fn from_seconds_max_accepted_value_exact() {
+    // The largest value the Go gate accepts (config.MaxDurationSeconds ==
+    // MAX_SESSION_TIMEOUT_SECS) must convert exactly, NOT saturate-short.
+    let t = SessionTimeouts::from_seconds(
+        MAX_SESSION_TIMEOUT_SECS,
+        MAX_SESSION_TIMEOUT_SECS,
+        MAX_SESSION_TIMEOUT_SECS,
+    );
+    assert_eq!(t.tcp_established_ns, MAX_SESSION_TIMEOUT_NS);
+    assert_eq!(t.udp_ns, MAX_SESSION_TIMEOUT_NS);
+    assert_eq!(t.icmp_ns, MAX_SESSION_TIMEOUT_NS);
+    // The conversion must not have wrapped: the ns ceiling is < u64::MAX.
+    assert_eq!(
+        MAX_SESSION_TIMEOUT_NS,
+        MAX_SESSION_TIMEOUT_SECS * 1_000_000_000
+    );
+}
+
+#[test]
+fn from_seconds_saturates_first_overflowing_value() {
+    // The first value whose `secs * 1e9` exceeds the ns ceiling. Pre-#2441
+    // this is where the raw multiply began to wrap (debug-panic / release-
+    // wrap). It must now SATURATE at MAX_SESSION_TIMEOUT_NS, not wrap to a
+    // tiny value (premature session expiry).
+    let first_over = MAX_SESSION_TIMEOUT_SECS + 1;
+    let t = SessionTimeouts::from_seconds(first_over, first_over, first_over);
+    assert_eq!(t.tcp_established_ns, MAX_SESSION_TIMEOUT_NS);
+    assert_eq!(t.udp_ns, MAX_SESSION_TIMEOUT_NS);
+    assert_eq!(t.icmp_ns, MAX_SESSION_TIMEOUT_NS);
+}
+
+#[test]
+fn from_seconds_saturates_u64_max() {
+    // u64::MAX * 1e9 wraps catastrophically with a raw multiply (debug:
+    // panic, release: a near-zero timeout). Restoring the raw `*` makes this
+    // test panic in debug / produce a tiny non-saturated value in release —
+    // the fail-on-revert pin.
+    let t = SessionTimeouts::from_seconds(u64::MAX, u64::MAX, u64::MAX);
+    assert_eq!(t.tcp_established_ns, MAX_SESSION_TIMEOUT_NS);
+    assert_eq!(t.udp_ns, MAX_SESSION_TIMEOUT_NS);
+    assert_eq!(t.icmp_ns, MAX_SESSION_TIMEOUT_NS);
+    // Saturated, not wrapped-tiny: the result is a very large valid timeout.
+    assert!(t.tcp_established_ns > DEFAULT_TCP_SESSION_TIMEOUT_NS);
+}
+
+#[test]
+fn from_seconds_zero_still_defaults_after_saturation() {
+    // 0 must remain "use the default", unaffected by the saturation helper.
+    let t = SessionTimeouts::from_seconds(0, 0, 0);
+    assert_eq!(t.tcp_established_ns, DEFAULT_TCP_SESSION_TIMEOUT_NS);
+    assert_eq!(t.udp_ns, DEFAULT_UDP_SESSION_TIMEOUT_NS);
+    assert_eq!(t.icmp_ns, DEFAULT_ICMP_SESSION_TIMEOUT_NS);
+}
+
+#[test]
 fn iter_with_idle_reports_idle_time() {
     let mut table = SessionTable::new();
     let key = key_v4();
