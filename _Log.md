@@ -12938,3 +12938,16 @@ top.
   pkg/config/schema_routing.go (ospf3 interface bfd-liveness-detection leaf, global +
   routing-instance), pkg/config/parser_routing_test.go + pkg/frr/frr_test.go (tests),
   docs/feature-gaps.md (note OSPFv3 BFD done).
+
+- **Timestamp**: 2026-06-24
+  **Action**: #2550 — consolidate FRR BFD into a single global `bfd` block.
+  Added bfdSection accumulator (profiles + BGP peers) in policy_render.go;
+  generateProtocols now accumulates into an optional shared *bfdSection
+  (variadic) instead of emitting its own per-instance bfd block. Manager
+  buildManagedSection (extracted pure assembly half of ApplyFull) creates one
+  shared section, passes it to default + every VRF call, and renders one
+  top-level bfd block once. Added fail-on-revert tests
+  (TestBuildManagedSection_SingleGlobalBFDBlock /
+  _BGPBFDPeersSingleBlock): count==2 on master-emulation, ==1 after fix.
+  **File(s)**: pkg/frr/policy_render.go, pkg/frr/manager.go,
+  pkg/frr/frr_test.go, pkg/frr/README.md, _Log.md

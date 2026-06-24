@@ -2864,6 +2864,132 @@ func TestGenerateProtocols_OSPFv3BFDProfile(t *testing.T) {
 	}
 }
 
+// TestBuildManagedSection_SingleGlobalBFDBlock is the #2550 fail-on-revert
+// guard: BFD profiles configured in the DEFAULT instance AND in a VRF
+// instance must consolidate into EXACTLY ONE top-level `bfd` block, with
+// each profile defined exactly once (even when two instances reference the
+// same profile). Before the fix, generateProtocols emitted its own per-call
+// `bfd` block, so a default + VRF config produced TWO top-level `bfd`
+// blocks (count == 2); after the fix the manager emits one global block
+// (count == 1). The whole managed section is rendered via the real
+// assemble path (buildManagedSection), not generateProtocols in isolation.
+func TestBuildManagedSection_SingleGlobalBFDBlock(t *testing.T) {
+	m := New()
+
+	// Default instance: OSPFv2 interface with a 300/3 BFD profile.
+	ospf := &config.OSPFConfig{
+		RouterID: "10.0.0.1",
+		Areas: []*config.OSPFArea{
+			{
+				ID: "0.0.0.0",
+				Interfaces: []*config.OSPFInterface{
+					{Name: "trust0", BFD: true, BFDInterval: 300, BFDMultiplier: 3},
+				},
+			},
+		},
+	}
+
+	// VRF instance: ISIS interface with a DISTINCT 250/4 BFD profile PLUS a
+	// second interface that re-references the SAME 300/3 profile as the
+	// default instance — exercises cross-instance dedup.
+	isis := &config.ISISConfig{
+		NET:   "49.0001.1921.6800.1001.00",
+		Level: "level-1-2",
+		Interfaces: []*config.ISISInterface{
+			{Name: "blue0", BFD: true, BFDInterval: 250, BFDMultiplier: 4},
+			{Name: "blue1", BFD: true, BFDInterval: 300, BFDMultiplier: 3},
+		},
+	}
+
+	fc := &FullConfig{
+		OSPF: ospf,
+		Instances: []InstanceConfig{
+			{Name: "blue", VRFName: "vrf-blue", ISIS: isis},
+		},
+	}
+
+	got := m.buildManagedSection(fc)
+
+	// A top-level `bfd` block opens with a bare "bfd\n" line (no leading
+	// space). Interface-level BFD lines (" ip ospf bfd ...", " isis bfd
+	// ...") are space-indented, so "\nbfd\n" matches ONLY block openers.
+	blocks := strings.Count(got, "\nbfd\n")
+	if blocks != 1 {
+		t.Fatalf("expected exactly 1 top-level bfd block, got %d in:\n%s", blocks, got)
+	}
+
+	// Each distinct profile must be DEFINED exactly once. A definition line
+	// is "\n profile <name>\n" (newline immediately before " profile");
+	// reference lines read "... bfd profile <name>" so they do NOT match.
+	prof300 := bfdProfileName(300, 3)
+	prof250 := bfdProfileName(250, 4)
+	if n := strings.Count(got, "\n profile "+prof300+"\n"); n != 1 {
+		t.Errorf("profile %s must be defined exactly once, got %d in:\n%s", prof300, n, got)
+	}
+	if n := strings.Count(got, "\n profile "+prof250+"\n"); n != 1 {
+		t.Errorf("profile %s must be defined exactly once, got %d in:\n%s", prof250, n, got)
+	}
+
+	// Both protocol interfaces must still reference their profile.
+	if !strings.Contains(got, " ip ospf bfd profile "+prof300+"\n") {
+		t.Errorf("missing OSPFv2 bfd profile reference %s in:\n%s", prof300, got)
+	}
+	if !strings.Contains(got, " isis bfd profile "+prof250+"\n") {
+		t.Errorf("missing ISIS bfd profile reference %s in:\n%s", prof250, got)
+	}
+
+	// The single global bfd block must be top-level (not nested inside a
+	// router/instance scope): the bfd opener must NOT be immediately
+	// preceded by a router stanza line without an intervening "!" divider.
+	bfdIdx := strings.Index(got, "\nbfd\n")
+	if bfdIdx < 0 {
+		t.Fatalf("no top-level bfd block found in:\n%s", got)
+	}
+	if !strings.HasPrefix(got[bfdIdx:], "\nbfd\n profile ") {
+		t.Errorf("global bfd block must lead with a profile stanza, got:\n%s", got[bfdIdx:])
+	}
+}
+
+// TestBuildManagedSection_BGPBFDPeersSingleBlock proves BGP BFD peers in
+// the default instance AND a VRF consolidate into the SAME single global
+// bfd block, each carrying the correct (or absent) vrf suffix (#2550 +
+// #2489 preserved).
+func TestBuildManagedSection_BGPBFDPeersSingleBlock(t *testing.T) {
+	m := New()
+
+	defBGP := &config.BGPConfig{
+		LocalAS: 65001,
+		Neighbors: []*config.BGPNeighbor{
+			{Address: "10.0.0.9", PeerAS: 65002, BFD: true},
+		},
+	}
+	vrfBGP := &config.BGPConfig{
+		LocalAS: 65010,
+		Neighbors: []*config.BGPNeighbor{
+			{Address: "10.1.1.2", PeerAS: 65011, BFD: true},
+		},
+	}
+
+	fc := &FullConfig{
+		BGP: defBGP,
+		Instances: []InstanceConfig{
+			{Name: "blue", VRFName: "vrf-blue", BGP: vrfBGP},
+		},
+	}
+
+	got := m.buildManagedSection(fc)
+
+	if blocks := strings.Count(got, "\nbfd\n"); blocks != 1 {
+		t.Fatalf("expected exactly 1 top-level bfd block for BGP BFD peers, got %d in:\n%s", blocks, got)
+	}
+	if !strings.Contains(got, " peer 10.0.0.9\n") {
+		t.Errorf("default-instance BFD peer must be a bare `peer` line, got:\n%s", got)
+	}
+	if !strings.Contains(got, " peer 10.1.1.2 vrf vrf-blue\n") {
+		t.Errorf("VRF BFD peer must carry `vrf vrf-blue` suffix (#2489), got:\n%s", got)
+	}
+}
+
 func TestGeneratePolicyOptionsCommunityListAndMetricType(t *testing.T) {
 	m := &Manager{frrConf: "/dev/null"}
 	po := &config.PolicyOptionsConfig{

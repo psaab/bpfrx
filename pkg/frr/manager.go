@@ -356,6 +356,17 @@ func (m *Manager) ApplyFull(fc *FullConfig) error {
 		return m.Clear()
 	}
 
+	return m.commitManagedSection(m.buildManagedSection(fc))
+}
+
+// buildManagedSection renders the full xpf-managed frr.conf section for fc
+// WITHOUT writing or reloading. It is the pure assembly half of ApplyFull,
+// split out so the consolidated single-`bfd`-block invariant (#2550) and
+// other whole-section properties can be asserted in unit tests via the
+// real assemble path rather than a hand-rebuilt string. resolveECMP's
+// fc.ConsistentHash side effect still happens here (ApplyFull's only
+// caller invokes it before commit).
+func (m *Manager) buildManagedSection(fc *FullConfig) string {
 	var b strings.Builder
 	b.WriteString("! xpf managed config - do not edit\n")
 	b.WriteString("!\n")
@@ -418,19 +429,30 @@ func (m *Manager) ApplyFull(fc *FullConfig) error {
 	// 10. Interface-level settings (bandwidth, point-to-point)
 	b.WriteString(m.generateInterfaceSettings(fc))
 
+	// BFD profiles/peers are accumulated across the default instance AND
+	// every VRF into ONE section, then emitted as a single top-level `bfd`
+	// block after all instances render (#2550). FRR's bfdd is a single
+	// global daemon, so one consolidated block replaces the per-instance
+	// blocks that previously produced redundant / repeated profile defs.
+	bfdSec := newBFDSection()
+
 	// 11. Global dynamic protocols
 	if fc.OSPF != nil || fc.OSPFv3 != nil || fc.BGP != nil || fc.RIP != nil || fc.ISIS != nil {
-		b.WriteString(m.generateProtocols(fc.OSPF, fc.OSPFv3, fc.BGP, fc.RIP, fc.ISIS, "", ecmpMaxPaths, fc.PolicyOptions))
+		b.WriteString(m.generateProtocols(fc.OSPF, fc.OSPFv3, fc.BGP, fc.RIP, fc.ISIS, "", ecmpMaxPaths, fc.PolicyOptions, bfdSec))
 	}
 
 	// 12. Per-VRF dynamic protocols
 	for _, inst := range fc.Instances {
 		if inst.OSPF != nil || inst.OSPFv3 != nil || inst.BGP != nil || inst.RIP != nil || inst.ISIS != nil {
-			b.WriteString(m.generateProtocols(inst.OSPF, inst.OSPFv3, inst.BGP, inst.RIP, inst.ISIS, inst.VRFName, ecmpMaxPaths, fc.PolicyOptions))
+			b.WriteString(m.generateProtocols(inst.OSPF, inst.OSPFv3, inst.BGP, inst.RIP, inst.ISIS, inst.VRFName, ecmpMaxPaths, fc.PolicyOptions, bfdSec))
 		}
 	}
 
-	return m.commitManagedSection(b.String())
+	// 13. Single consolidated top-level BFD block (profiles + peers),
+	// emitted exactly once outside any router/instance scope.
+	b.WriteString(bfdSec.render())
+
+	return b.String()
 }
 
 // commitManagedSection is the single write+reload critical section
