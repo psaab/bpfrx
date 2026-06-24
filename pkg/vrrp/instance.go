@@ -219,7 +219,22 @@ func (vi *vrrpInstance) vipAddrSet() map[string]bool {
 		if idx := strings.Index(addr, "/"); idx >= 0 {
 			addr = addr[:idx]
 		}
-		s[addr] = true
+		s[canonAddr(addr)] = true
+	}
+	return s
+}
+
+// canonAddr returns the canonical string form of an IP literal so that VIP
+// exclusion keys match the lookup side, which uses net.IP.String() (Go's
+// canonical form). A non-canonically-formatted VIP — e.g. an uppercase or
+// non-zero-compressed link-local "fe80::AB" — would otherwise be keyed by its
+// raw config string and miss the "fe80::ab" lookup, leaking the VIP into local
+// link-local source selection and making the engine treat its own adverts as
+// self-sent (#2516). net.ParseIP rejects CIDR, so the caller must strip any
+// "/prefix" first; an unparseable string falls back to itself unchanged.
+func canonAddr(s string) string {
+	if ip := net.ParseIP(s); ip != nil {
+		return ip.String()
 	}
 	return s
 }

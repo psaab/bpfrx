@@ -243,7 +243,14 @@ calls `reresolveLocalAddrs()`, which recomputes both sources from the
 interface's **current** addresses (`resolveLocalIPv4` picks the lowest
 non-VIP IPv4 deterministically; `resolveIPv6LinkLocal` picks the lowest
 non-VIP **link-local** — VRRP IPv6 adverts use a `fe80::` source) and
-stores them atomically. Because every add/del emits an event, the final
+stores them atomically. The "non-VIP" exclusion compares against the
+configured VIP set built by `vipAddrSet`, which canonicalizes each VIP via
+`net.ParseIP` before keying the set (`canonAddr`, #2516) so a
+non-canonically-formatted IPv6 link-local VIP (`fe80::AB` vs `fe80::ab`)
+still matches the canonical `net.IP.String()` form the interface reports —
+otherwise the VIP would leak into the candidate set and the engine would
+source adverts from its own VIP, self-filtering them as a peer's.
+Because every add/del emits an event, the final
 address state always wins a re-resolve. A transient empty result is
 stored as `nil` so the next advert's lazy-resolve recovers it. The
 watcher filters by ifindex so churn on an unrelated interface never
