@@ -97,6 +97,21 @@ pub(crate) enum SnapshotIntegrityError {
         term: String,
         token: String,
     },
+    /// #2391: an interface snapshot named a NON-EMPTY security zone that is not
+    /// present in the zone table (`zone_name_to_id`). The pre-fix code resolved
+    /// the missing name to `zone_id == 0` (`unwrap_or(0)`), silently collapsing
+    /// the interface to the canonical "unknown" zone. With zone 0 the interface
+    /// matches no zone-pair policy and its traffic falls through to the default
+    /// action — a silent fail-open under a permit default (or a blackhole under a
+    /// deny default). This happens when a zone id overflows the u8 event-stream
+    /// wire field and the forwarding builder drops it (`populate_zones`), or on a
+    /// hostile/version-drifted snapshot where an interface references a zone the
+    /// snapshot never defines. The Go commit-time cap (`validateZoneCountStrict`,
+    /// #2391) is the PRIMARY gate that prevents the overflow ever reaching the
+    /// wire; this is the helper-boundary backstop, consistent with the
+    /// #2124/#2142/#2173/#2212/#2505 fail-closed family. An interface with NO
+    /// zone (empty string) is the legitimate "unzoned" case and is NOT an error.
+    InterfaceUnknownZone { interface: String, zone: String },
 }
 
 impl std::fmt::Display for SnapshotIntegrityError {
@@ -144,6 +159,11 @@ impl std::fmt::Display for SnapshotIntegrityError {
                 f,
                 "firewall family {:?} filter {:?} term {:?} has an unresolvable protocol token {:?} — refusing to fail wide by dropping it (which would make the term match every protocol)",
                 family, filter, term, token
+            ),
+            Self::InterfaceUnknownZone { interface, zone } => write!(
+                f,
+                "interface {:?} references zone {:?} that is not in the zone table — refusing to fail open by collapsing it to the \"unknown\" zone 0 (which would bypass every zone-pair policy)",
+                interface, zone
             ),
         }
     }

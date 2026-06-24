@@ -454,6 +454,19 @@ type compileOpts struct {
 	// the dataplane drops the unindexed rule independently, so a leniently-
 	// loaded bad config is inert. Same doctrine as lenientPolicyMatchAddress.
 	lenientPolicyZoneRefs bool
+	// lenientZoneCount (#2391) downgrades the security-zone count cap gate
+	// (validateZoneCountStrict) from a hard compile error to a cfg.Warnings
+	// entry. The strict commit / commit-check path hard-rejects a config that
+	// defines more than MaxUsableZoneID (255) security zones — the 256th+ zone
+	// ids overflow the u8 event-stream wire field and were silently dropped by
+	// the userspace forwarding builder, collapsing the affected interfaces to
+	// zone 0 ("unknown") instead of failing the commit. The tolerant load /
+	// peer-sync paths downgrade to a warning so an already-persisted or peer-
+	// synced config an older binary accepted still BOOTS (#1960 no-brick) — the
+	// dataplane independently fails closed on every overflowing zone, so a
+	// leniently-loaded over-cap config is inert (the overflow zones do not
+	// forward) rather than mis-attributed. Same doctrine as lenientPolicyZoneRefs.
+	lenientZoneCount bool
 	// lenientDestNATAddresses (#2396) downgrades the destination-NAT
 	// destination-address gate (validateDestinationNATAddressesStrict) from a
 	// hard compile error to a cfg.Warnings entry. The strict commit /
@@ -591,6 +604,7 @@ func CompileConfigLenient(tree *ConfigTree) (*Config, error) {
 		lenientDHCPStaticBindings:          true,
 		lenientWireguardPeers:              true,
 		lenientPolicyZoneRefs:              true,
+		lenientZoneCount:                   true,
 		lenientDestNATAddresses:            true,
 		lenientRPMSourceAddress:            true,
 		lenientRPMScopedHostname:           true,
@@ -696,6 +710,7 @@ func CompileConfigForNodeLenient(tree *ConfigTree, nodeID int) (*Config, error) 
 		lenientDHCPStaticBindings:          true,
 		lenientWireguardPeers:              true,
 		lenientPolicyZoneRefs:              true,
+		lenientZoneCount:                   true,
 		lenientDestNATAddresses:            true,
 		lenientRPMSourceAddress:            true,
 		lenientRPMScopedHostname:           true,
@@ -1067,6 +1082,25 @@ func compileExpanded(tree *ConfigTree, opts compileOpts) (*Config, error) {
 		if opts.lenientPolicyZoneRefs {
 			cfg.Warnings = append(cfg.Warnings,
 				fmt.Sprintf("policy zone reference (downgraded to warning on tolerant path): %v", err))
+		} else {
+			return nil, err
+		}
+	}
+
+	// #2391 security-zone count cap. Strict on commit / commit-check
+	// (hard-reject a config with more than MaxUsableZoneID zones — the overflow
+	// zone ids exceed the u8 event-stream wire field and were silently dropped
+	// by the dataplane, collapsing the affected interfaces to zone 0); lenient
+	// on load / peer-sync (warn so an already-persisted or peer-synced over-cap
+	// config still boots — #1960 no-brick; the dataplane fails closed on every
+	// overflowing zone, so a leniently-loaded over-cap config is inert). This is
+	// the PRIMARY gate: bounding the zone count guarantees no out-of-range id is
+	// ever produced. Runs AFTER the policy zone-reference gate so a structural
+	// error and a bad zone reference still win the first-error slot.
+	if err := validateZoneCountStrict(cfg); err != nil {
+		if opts.lenientZoneCount {
+			cfg.Warnings = append(cfg.Warnings,
+				fmt.Sprintf("zone count (downgraded to warning on tolerant path): %v", err))
 		} else {
 			return nil, err
 		}

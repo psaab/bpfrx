@@ -1057,16 +1057,18 @@ fn egress_interface_zone_id_set_from_snapshot() {
     assert_eq!(eg.zone_id, 11);
 }
 
-/// #921: an interface whose zone snapshot field references a zone
-/// that was DROPPED at config build time (reserved id, > u8 max)
-/// collapses to zone_id == 0 (the canonical "unknown" sentinel).
+/// #2391: an interface whose zone snapshot field references a zone that was
+/// DROPPED at config build time (reserved id, > u8 max) must FAIL CLOSED — the
+/// forwarding build returns InterfaceUnknownZone instead of silently collapsing
+/// the interface to zone_id == 0 (which would bypass every zone-pair policy).
+/// fail-on-revert: restoring the `unwrap_or(0)` collapse makes this red.
 #[test]
-fn interface_pointing_at_skipped_zone_collapses_to_zone_id_zero() {
+fn interface_pointing_at_skipped_zone_fails_closed() {
     use crate::ZoneSnapshot;
     let snapshot = ConfigSnapshot {
         zones: vec![ZoneSnapshot {
             name: "reserved".into(),
-            id: crate::policy::ZONE_ID_RESERVED_MIN, // dropped at build
+            id: crate::policy::ZONE_ID_RESERVED_MIN, // dropped at populate_zones
         }],
         interfaces: vec![InterfaceSnapshot {
             name: "ge-0/0/2".into(),
@@ -1077,16 +1079,25 @@ fn interface_pointing_at_skipped_zone_collapses_to_zone_id_zero() {
         }],
         ..Default::default()
     };
-    let state = build_forwarding_state(&snapshot);
-    // Zone was dropped; the interface still appears in the
-    // ifindex_to_zone_id map but with the unknown sentinel 0.
-    assert_eq!(state.ifindex_to_zone_id.get(&23).copied(), Some(0));
+    let err = try_build_forwarding_state_with_policy_counters(
+        &snapshot,
+        &crate::policy::PolicyCounterStore::default(),
+    )
+    .expect_err("interface referencing a dropped zone must fail closed");
+    match err {
+        crate::policy::SnapshotIntegrityError::InterfaceUnknownZone { interface, zone } => {
+            assert_eq!(interface, "ge-0/0/2");
+            assert_eq!(zone, "reserved");
+        }
+        other => panic!("expected InterfaceUnknownZone, got {other:?}"),
+    }
 }
 
-/// #921: an EgressInterface whose snapshot zone string isn't in
-/// the zones list collapses to zone_id == 0.
+/// #2391: an interface whose snapshot zone string isn't in the zones list at all
+/// (a typo / version-drifted snapshot) fails CLOSED rather than collapsing the
+/// EgressInterface to zone_id == 0.
 #[test]
-fn egress_with_unknown_zone_name_collapses_to_zone_id_zero() {
+fn interface_with_unknown_zone_name_fails_closed() {
     use crate::ZoneSnapshot;
     let snapshot = ConfigSnapshot {
         zones: vec![ZoneSnapshot {
@@ -1102,9 +1113,36 @@ fn egress_with_unknown_zone_name_collapses_to_zone_id_zero() {
         }],
         ..Default::default()
     };
+    let err = try_build_forwarding_state_with_policy_counters(
+        &snapshot,
+        &crate::policy::PolicyCounterStore::default(),
+    )
+    .expect_err("interface referencing an unknown zone must fail closed");
+    assert!(matches!(
+        err,
+        crate::policy::SnapshotIntegrityError::InterfaceUnknownZone { .. }
+    ));
+}
+
+/// #2391 anti-over-reject: an interface with NO zone (empty string) is the
+/// legitimate "unzoned" case and must still build, mapping to zone_id == 0.
+#[test]
+fn interface_with_empty_zone_builds_with_zone_zero() {
+    let snapshot = ConfigSnapshot {
+        interfaces: vec![InterfaceSnapshot {
+            name: "ge-0/0/4".into(),
+            zone: String::new(), // unzoned
+            ifindex: 77,
+            hardware_addr: "02:00:00:00:00:77".into(),
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
     let state = build_forwarding_state(&snapshot);
-    let eg = state.egress.get(&56).expect("egress");
+    let eg = state.egress.get(&77).expect("egress");
     assert_eq!(eg.zone_id, 0);
+    // unzoned interfaces are not inserted into ifindex_to_zone_id
+    assert!(state.ifindex_to_zone_id.get(&77).is_none());
 }
 
 // ---------------------------------------------------------------------
