@@ -86,7 +86,13 @@ pub(crate) enum SnapshotIntegrityError {
     /// gate-passing config never reaches this arm in normal operation — it
     /// guards against version/snapshot drift. An EMPTY input protocol list is
     /// the legitimate "no protocol constraint" case and is NOT an error.
+    ///
+    /// `family` (inet / inet6) is carried alongside the filter name because
+    /// filter names can be REUSED across families — without it the fail-closed
+    /// diagnostic could not tell the operator WHICH `family <f> filter <name>`
+    /// failed.
     UnrepresentableFilterProtocol {
+        family: String,
         filter: String,
         term: String,
         token: String,
@@ -130,13 +136,14 @@ impl std::fmt::Display for SnapshotIntegrityError {
                 first_rule, second_rule, direction
             ),
             Self::UnrepresentableFilterProtocol {
+                family,
                 filter,
                 term,
                 token,
             } => write!(
                 f,
-                "firewall filter {:?} term {:?} has an unresolvable protocol token {:?} — refusing to fail wide by dropping it (which would make the term match every protocol)",
-                filter, term, token
+                "firewall family {:?} filter {:?} term {:?} has an unresolvable protocol token {:?} — refusing to fail wide by dropping it (which would make the term match every protocol)",
+                family, filter, term, token
             ),
         }
     }

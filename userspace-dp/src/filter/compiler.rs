@@ -103,6 +103,7 @@ pub(crate) fn parse_filter_state_with_three_color_preserving(
                 parse_term(
                     t,
                     term_idx as u32,
+                    &snap.family,
                     &snap.name,
                     &state.three_color_policer_by_name,
                 )
@@ -357,6 +358,7 @@ fn qualify_filter_key(family: &str, filter_name: &str) -> String {
 fn parse_term(
     snap: &FirewallTermSnapshot,
     id: u32,
+    filter_family: &str,
     filter_name: &str,
     three_color_policers: &rustc_hash::FxHashMap<String, Arc<ThreeColorPolicerRuntime>>,
 ) -> Result<FilterTerm, SnapshotIntegrityError> {
@@ -406,6 +408,7 @@ fn parse_term(
             Some(n) => protocols.push(n),
             None => {
                 return Err(SnapshotIntegrityError::UnrepresentableFilterProtocol {
+                    family: filter_family.to_string(),
                     filter: filter_name.to_string(),
                     term: snap.name.clone(),
                     token: token.clone(),

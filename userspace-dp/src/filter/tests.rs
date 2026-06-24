@@ -4125,11 +4125,65 @@ fn protocol_2505_unresolvable_fails_closed_not_match_all() {
         .expect_err("an unresolvable protocol token must fail the build closed");
     match err {
         SnapshotIntegrityError::UnrepresentableFilterProtocol {
+            family,
             filter,
             term,
             token,
         } => {
+            assert_eq!(family, "inet");
             assert_eq!(filter, "f");
+            assert_eq!(term, "scoped");
+            assert_eq!(token, "bogusproto");
+        }
+        other => panic!("expected UnrepresentableFilterProtocol, got {other:?}"),
+    }
+}
+
+#[test]
+fn protocol_2505_error_names_the_family_for_reused_filter_names() {
+    // Filter names can be reused across families. When the inet6 copy carries
+    // the unresolvable token, the diagnostic must name family inet6 (not just
+    // the ambiguous filter name) so the operator can find the offending filter.
+    let bad_term = || FirewallTermSnapshot {
+        name: "scoped".into(),
+        protocols: vec!["bogusproto".into()],
+        action: "discard".into(),
+        ..Default::default()
+    };
+    let good_term = || FirewallTermSnapshot {
+        name: "ok".into(),
+        protocols: vec!["tcp".into()],
+        action: "discard".into(),
+        ..Default::default()
+    };
+    let err = parse_filter_state(
+        &[
+            FirewallFilterSnapshot {
+                name: "dup".into(),
+                family: "inet".into(),
+                terms: vec![good_term()],
+            },
+            FirewallFilterSnapshot {
+                name: "dup".into(),
+                family: "inet6".into(),
+                terms: vec![bad_term()],
+            },
+        ],
+        &[],
+        &[],
+        "",
+        "",
+    )
+    .expect_err("the inet6 filter's unresolvable token must fail the build closed");
+    match err {
+        SnapshotIntegrityError::UnrepresentableFilterProtocol {
+            family,
+            filter,
+            term,
+            token,
+        } => {
+            assert_eq!(family, "inet6", "the error must name the inet6 family");
+            assert_eq!(filter, "dup");
             assert_eq!(term, "scoped");
             assert_eq!(token, "bogusproto");
         }

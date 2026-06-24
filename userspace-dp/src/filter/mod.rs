@@ -24,11 +24,16 @@ use std::sync::{Arc, Mutex};
 
 use crate::ip_proto::proto_number;
 use crate::policy::SnapshotIntegrityError;
-// #2505: the production code resolves all protocol tokens through
-// `proto_number`; the bare `PROTO_*` consts are now only referenced by the
-// filter unit tests (asserting a term resolved to the right IANA number), so
-// re-export them under `super::*` for tests only — exposing them
-// unconditionally would warn as unused in the non-test build.
+// #2505: filter compilation resolves all protocol tokens through
+// `proto_number`, so this module's *compiler* no longer needs the bare
+// `PROTO_*` consts. Production code that DOES reference them imports them
+// directly where used — e.g. `engine/matching.rs` imports `PROTO_TCP`,
+// `PROTO_ICMP`, `PROTO_ICMPV6` from `crate::ip_proto` for per-packet match
+// classification. The `#[cfg(test)]` import below re-exports the consts via
+// `super::*` ONLY for the filter unit tests in this module (asserting a term
+// resolved to the right IANA number); a module-level non-test re-export would
+// warn as unused because nothing under `mod.rs`/`compiler.rs` references them
+// outside tests anymore.
 #[cfg(test)]
 use crate::ip_proto::{PROTO_ICMP, PROTO_ICMPV6, PROTO_TCP, PROTO_UDP};
 
