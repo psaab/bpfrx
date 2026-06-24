@@ -391,15 +391,24 @@ impl EventFrame {
     /// (`daemon_flowexport.go`).
     ///
     /// Fields populated from the close: the real forward 5-tuple, the NAT
-    /// translated tuple (when present), ingress/egress zone IDs, protocol,
-    /// owner RG, and the close-reason byte. The byte/packet counters
-    /// (offsets 56/64/112/120) and the session-creation timestamp (offset
-    /// 108, which drives `ElapsedTime`) are written as 0: the userspace
-    /// AF_XDP forwarding path does not yet maintain per-session byte/packet
-    /// accounting nor a wall-clock creation stamp. That accounting is the
-    /// follow-up tracked in #2501; until it lands these stay 0 (so the flow
-    /// record carries an accurate tuple but a zero volume/duration, never a
-    /// silently-missing record).
+    /// translated tuple (when present), ingress/egress zone IDs, and
+    /// protocol. `owner_rg_id` is accepted for symmetry with the other
+    /// frame encoders but is intentionally NOT written into this payload —
+    /// for a SESSION_CLOSE the Go decoder reads the [56:64] slot (where the
+    /// deny/screen/filter frames carry owner RG) as the session-packets
+    /// counter, so writing owner RG there would corrupt the counter. Owner
+    /// RG is carried for session sync on the type-2 HA close delta instead.
+    ///
+    /// The byte/packet counters (offsets 56/64/112/120) and the
+    /// session-creation timestamp (offset 108) are written as 0: the
+    /// userspace AF_XDP forwarding path does not yet maintain per-session
+    /// byte/packet accounting nor a wall-clock creation stamp. That
+    /// accounting is the follow-up tracked in #2501; until it lands these
+    /// stay 0, so the flow record carries an accurate tuple but zero volume.
+    /// The exporters' duration is derived from the packet count today
+    /// (`estimateSessionDuration(SessionPkts)` in pkg/flowexport), NOT from
+    /// the `created` stamp — so with 0 packets the reported duration is also
+    /// 0 (and will become real once #2501 populates the counters).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn encode_session_close_rt_flow(
         seq: u64,
@@ -421,9 +430,12 @@ impl EventFrame {
         let base = FRAME_HEADER_SIZE;
         let wire_af = rt_flow_addr_family(addr_family, src_ip);
 
-        // [0:8] timestamp_ns — 0 (the Go side stamps time.Now() when it
-        // cannot derive a wire timestamp; ElapsedTime is gated on `created`,
-        // offset 108, which is 0 — see #2501).
+        // [0:8] timestamp_ns — 0 (the Go side stamps time.Now() when the
+        // wire timestamp is 0, which is the record's EndTime). The flow
+        // exporters compute the flow StartTime by subtracting a packet-count
+        // estimate (estimateSessionDuration(SessionPkts)), not from the
+        // `created` stamp at offset 108 — so duration is 0 until #2501
+        // populates the counters.
         // [8:24] src ip, [24:40] dst ip (16-byte slots, v4 left-aligned).
         write_ip_16(&mut buf, base + 8, src_ip);
         write_ip_16(&mut buf, base + 24, dst_ip);
@@ -438,8 +450,12 @@ impl EventFrame {
         // [52] event type, [53] protocol, [54] action, [55] address family.
         buf[base + 52] = RT_FLOW_EVENT_SESSION_CLOSE;
         buf[base + 53] = protocol;
-        // action is not meaningful for a close; 0 (deny encoding) is inert —
-        // the flowexport callbacks do not read it for SESSION_CLOSE.
+        // [54] action: the Go decoder DOES map this byte to
+        // EventRecord.Action (and logs it for SESSION_CLOSE), but a session
+        // close has no permit/deny/reject action semantics, so it is
+        // intentionally 0. The flow exporters do not branch on it for a
+        // close; only the syslog/event line carries it (as "deny", the 0
+        // encoding) — harmless for a close record.
         buf[base + 54] = 0;
         buf[base + 55] = wire_af;
         // [56:64] session_packets, [64:72] session_bytes — 0 (#2501).
@@ -449,7 +465,8 @@ impl EventFrame {
         // [104:106] nat src port, [106:108] nat dst port — BIG-endian.
         buf[base + 104..base + 106].copy_from_slice(&nat_src_port.to_be_bytes());
         buf[base + 106..base + 108].copy_from_slice(&nat_dst_port.to_be_bytes());
-        // [108:112] created — 0 (#2501; ElapsedTime stays 0).
+        // [108:112] created — 0 (#2501). Note the exporters ignore this
+        // field for duration; duration tracks the packet count (see above).
         // [112:120] rev packets, [120:128] rev bytes — 0 (#2501).
         // [128:132] ingress ifindex — 0 (per-close ifindex not threaded).
         // [132:134] application id — 0.

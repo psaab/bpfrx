@@ -179,8 +179,9 @@ func buildAppCatalogSnapshot(cfg *config.Config) []AppCatalogEntrySnapshot {
 // logging.EventRecord{Type:"SESSION_CLOSE"} via eventReader.ProcessRawEvent,
 // which fires the NetFlow/IPFIX flowExportCallback / ipfixExportCallback
 // (daemon_flowexport.go). The record carries the real 5-tuple, NAT tuple,
-// zones, and protocol; byte/packet volume counters and session duration are
-// reported as 0 pending the userspace per-session accounting work in #2501.
+// zones, and protocol; byte/packet volume counters are 0 pending the
+// userspace per-session accounting work in #2501 (and since the exported
+// duration is estimated from the packet count, it is 0 until then too).
 func buildFlowExportSnapshot(cfg *config.Config) *FlowExportSnapshot {
 	if cfg == nil || cfg.Services.FlowMonitoring == nil {
 		return nil

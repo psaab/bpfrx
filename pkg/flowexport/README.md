@@ -30,9 +30,12 @@ it into a `Type:"SESSION_CLOSE"` `EventRecord` via
 HA delta is unchanged and emitted as a 1:1 pair with the type-14 frame —
 the RT_FLOW frame is additive, not a replacement, so HA session sync is
 unaffected. The record carries the real 5-tuple, NAT translated tuple,
-zones, and protocol; the byte/packet volume counters and session duration
-are reported as 0 because the AF_XDP forwarding path does not yet maintain
-per-session accounting — that is the follow-up tracked in **#2501**.
+zones, and protocol; the byte/packet volume counters are 0 because the
+AF_XDP forwarding path does not yet maintain per-session accounting — that
+is the follow-up tracked in **#2501**. The exported flow duration is
+derived from the packet count (`estimateSessionDuration(SessionPkts)`),
+not the close record's `created`/`ElapsedTime` field, so it is also 0
+until #2501 populates the counters.
 
 ## File layout
 

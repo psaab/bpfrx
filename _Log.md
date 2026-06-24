@@ -12255,3 +12255,28 @@ top.
   pkg/dataplane/userspace/flow.go,
   pkg/daemon/daemon_flowexport_session_close_test.go,
   pkg/flowexport/README.md, _Log.md
+- **Timestamp**: 2026-06-23
+- **Action**: #2460 (PR #2502) review folds (4): (1) codec.rs doc comment
+  no longer claims the SESSION_CLOSE RT_FLOW record carries "owner RG" —
+  owner_rg_id is intentionally NOT written (it overlaps the [56:64]
+  session-packets slot the Go decoder reads for a close); carried on the
+  type-2 HA delta instead. (2) byte[54] reworded from "inert" to: the Go
+  decoder DOES map it to EventRecord.Action and logs it for SESSION_CLOSE,
+  but a close has no action semantics so it is intentionally 0 (harmless,
+  not unread). (3) corrected the "created drives ElapsedTime" claim in
+  codec.rs + both READMEs + flow.go: the exporters derive flow duration
+  from the packet count (estimateSessionDuration(SessionPkts)), NOT the
+  `created`/ElapsedTime field, so duration is 0 today only because the
+  counters are 0 (#2501). (4) strengthened the daemon end-to-end test to
+  match its "reaches BOTH NetFlow + IPFIX callbacks" claim: it now binds
+  real UDP collectors and asserts BOTH real exporters export >= 1 flow
+  record (Stats.flows, which counts data records not templates) AND two
+  distinct SESSION_CLOSE-gated fanout callbacks each fire exactly once with
+  the correct tuple. Fail-on-revert proven (dropping either fanout
+  registration drops its count to 0). All Rust (build clean, codec +
+  session_close tests) + Go (daemon, dataplane/userspace) green; new
+  daemon tests 5x stable; gofmt clean.
+- **File(s)**: userspace-dp/src/event_stream/codec.rs,
+  userspace-dp/src/event_stream/README.md, pkg/flowexport/README.md,
+  pkg/dataplane/userspace/flow.go,
+  pkg/daemon/daemon_flowexport_session_close_test.go, _Log.md

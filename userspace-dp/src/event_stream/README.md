@@ -31,8 +31,11 @@ periodic ACK from the daemon.
   NetFlow v9 / IPFIX session-close exporters in userspace mode (they only
   fire on a `Type == "SESSION_CLOSE"` record; before #2460 none was
   produced). It carries the real 5-tuple, NAT tuple, zones, and protocol;
-  byte/packet counters and the session-creation stamp (→ duration) are 0
-  pending the per-session accounting follow-up #2501. Unlike the deny/
+  the byte/packet counters and the session-creation stamp are 0 pending the
+  per-session accounting follow-up #2501. The exporter-reported flow
+  duration is derived from the packet count today
+  (`estimateSessionDuration(SessionPkts)`), not the `created` stamp, so it
+  is 0 while the counters are 0. Unlike the deny/
   screen/filter frames, the close frame is NOT rate-limited (a dropped
   close loses one flow-export record; it is bounded by session churn, not
   attacker-controlled), so it is sent with the lossy `try_send` path

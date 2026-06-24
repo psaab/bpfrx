@@ -2,9 +2,12 @@ package daemon
 
 import (
 	"encoding/binary"
+	"net"
 	"testing"
+	"time"
 	"unsafe"
 
+	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/dataplane"
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
 	"github.com/psaab/xpf/pkg/logging"
@@ -49,25 +52,91 @@ func buildSessionCloseRawEventV4(
 	return buf
 }
 
+// flowIPFIXConfigPorts builds a sampling config with the v9 and IPFIX
+// collectors bound to caller-chosen ports (so a test can bind a real UDP
+// listener for each and observe the transmitted datagram). rate=1 so
+// ShouldExport always admits the close.
+func flowIPFIXConfigPorts(addr string, v9Port, ipfixPort int) *config.Config {
+	cfg := flowSamplingConfig(addr, 1)
+	fam := cfg.ForwardingOptions.Sampling.Instances["s"].FamilyInet
+	fam.FlowServers[0].Port = v9Port
+	fam.FlowServers[0].Version = config.FlowServerVersion9
+	fam.FlowServers = append(fam.FlowServers, &config.FlowServer{
+		Address: addr, Port: ipfixPort, Version: config.FlowServerVersionIPFIX,
+	})
+	cfg.Services.FlowMonitoring.VersionIPFIX = &config.NetFlowIPFIXConfig{
+		Templates: map[string]*config.NetFlowIPFIXTemplate{"t": {Name: "t"}},
+	}
+	return cfg
+}
+
+// listenUDP binds a UDP socket on 127.0.0.1:0 and returns it plus its port.
+func listenUDP(t *testing.T) (*net.UDPConn, int) {
+	t.Helper()
+	pc, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatalf("listen udp: %v", err)
+	}
+	return pc, pc.LocalAddr().(*net.UDPAddr).Port
+}
+
+// waitFlows polls an exporter's Stats() until it reports at least one
+// EXPORTED FLOW RECORD (not a template — Stats.flows increments only in
+// sendRecords, never in sendTemplates), or the 3s deadline elapses. The
+// v9/IPFIX exporters flush queued records on a 100ms ticker started by
+// reconcile, so a SESSION_CLOSE admitted by ShouldExport becomes an
+// exported flow well within the deadline. A non-zero flow count is
+// close-specific: it proves the SESSION_CLOSE-derived FlowRecord reached
+// the real exporter and was transmitted, distinct from the unconditional
+// startup template datagram.
+func waitFlows(t *testing.T, stats func() (uint64, uint64)) uint64 {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if flows, _ := stats(); flows >= 1 {
+			return flows
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	flows, _ := stats()
+	return flows
+}
+
 // TestSessionCloseRawEventDrivesFlowExport is the #2460 end-to-end (P1)
 // assertion: a userspace SESSION_CLOSE RT_FLOW event delivered on the raw
 // dataplane-event channel (exactly the path SetOnRawDataplaneEvent ->
 // eventReader.ProcessRawEvent uses for the EventFrameTypeSessionClose frame)
 // produces exactly one Type=="SESSION_CLOSE" EventRecord that reaches BOTH
 // the NetFlow v9 and IPFIX flow-export callbacks, carrying the correct
-// 5-tuple. Volume counters are 0 (P2/#2501).
+// 5-tuple. It proves "both callbacks" two ways:
+//
+//  1. The two REAL exporters (flowExportCallback / ipfixExportCallback,
+//     registered by reconcile) are bound to real UDP collectors and each
+//     transmits a datagram for the admitted close — proving the record
+//     truly reaches both production export paths, not just a spy.
+//  2. Two distinct fanout callbacks gating identically on
+//     rec.Type=="SESSION_CLOSE" (standing in for the NetFlow and IPFIX
+//     consumers) BOTH fire exactly once with the correct tuple — the
+//     deterministic content assertion the datagram-receipt cannot give.
+//
+// Volume counters are 0 (P2/#2501), asserted explicitly.
 //
 // Fail-on-revert: without the helper emitting the type-14 SESSION_CLOSE
 // frame, no SESSION_CLOSE EventRecord is ever produced in userspace mode, so
 // the flowExportCallback / ipfixExportCallback early-return on
 // rec.Type != "SESSION_CLOSE" and never fire — exactly the #2460 defect.
+// Dropping EITHER fanout callback registration drops its fire count to 0.
 func TestSessionCloseRawEventDrivesFlowExport(t *testing.T) {
+	v9Coll, v9Port := listenUDP(t)
+	t.Cleanup(func() { v9Coll.Close() })
+	ipfixColl, ipfixPort := listenUDP(t)
+	t.Cleanup(func() { ipfixColl.Close() })
+
 	d := newFlowTestDaemon()
 	t.Cleanup(d.stopFlowExporter)
 	t.Cleanup(d.stopIPFIXExporter)
 
-	// rate=1 so ShouldExport always admits the close (deterministic).
-	if !d.reconcileFlowExporters(ipfixSamplingConfig("127.0.0.1", 1)) {
+	if !d.reconcileFlowExporters(flowIPFIXConfigPorts("127.0.0.1", v9Port, ipfixPort)) {
 		t.Fatal("flow + ipfix exporters must start")
 	}
 	if b := d.flowBundle.Load(); b == nil || b.exp == nil {
@@ -76,15 +145,29 @@ func TestSessionCloseRawEventDrivesFlowExport(t *testing.T) {
 	if b := d.ipfixBundlePtr.Load(); b == nil || b.exp == nil {
 		t.Fatal("ipfix exporter must be live")
 	}
+	// The two real export callbacks are registered exactly once.
+	if n := d.eventReader.CallbackCount(); n != 2 {
+		t.Fatalf("expected 2 real export callbacks (v9 + ipfix), got %d", n)
+	}
 
-	// Spy callback gating identically to the real flow-export callbacks.
-	// Registered AFTER the two real callbacks so all three see the record.
-	var sessionCloses []logging.EventRecord
+	// Two distinct fanout callbacks standing in for the NetFlow and IPFIX
+	// SESSION_CLOSE consumers — registered AFTER the two real callbacks so
+	// all four see the record. Dropping either makes its count 0
+	// (fail-on-revert for the "both callbacks" claim).
+	var netflowFires, ipfixFires int
+	var seen logging.EventRecord
 	d.eventReader.AddCallback(func(rec logging.EventRecord, _ []byte) {
 		if rec.Type != "SESSION_CLOSE" {
 			return
 		}
-		sessionCloses = append(sessionCloses, rec)
+		netflowFires++
+		seen = rec
+	})
+	d.eventReader.AddCallback(func(rec logging.EventRecord, _ []byte) {
+		if rec.Type != "SESSION_CLOSE" {
+			return
+		}
+		ipfixFires++
 	})
 
 	payload := buildSessionCloseRawEventV4(
@@ -99,10 +182,26 @@ func TestSessionCloseRawEventDrivesFlowExport(t *testing.T) {
 		t.Fatal("ProcessRawEvent rejected a valid SESSION_CLOSE payload")
 	}
 
-	if len(sessionCloses) != 1 {
-		t.Fatalf("expected exactly one SESSION_CLOSE record, got %d", len(sessionCloses))
+	// Both SESSION_CLOSE-gated consumers fire exactly once.
+	if netflowFires != 1 {
+		t.Fatalf("NetFlow SESSION_CLOSE callback fired %d times, want 1", netflowFires)
 	}
-	rec := sessionCloses[0]
+	if ipfixFires != 1 {
+		t.Fatalf("IPFIX SESSION_CLOSE callback fired %d times, want 1", ipfixFires)
+	}
+
+	// Both REAL exporters export a flow record for the close — proving the
+	// SESSION_CLOSE-derived FlowRecord reaches both production export paths
+	// (Stats.flows counts data records, not templates).
+	if got := waitFlows(t, d.flowExporter.Stats); got < 1 {
+		t.Fatalf("NetFlow v9 exporter exported %d flows after the SESSION_CLOSE, want >= 1", got)
+	}
+	if got := waitFlows(t, d.ipfixExporter.Stats); got < 1 {
+		t.Fatalf("IPFIX exporter exported %d flows after the SESSION_CLOSE, want >= 1", got)
+	}
+
+	// Record content (the deterministic boundary assertion).
+	rec := seen
 	if rec.Type != "SESSION_CLOSE" {
 		t.Fatalf("Type = %q, want SESSION_CLOSE", rec.Type)
 	}
