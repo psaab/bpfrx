@@ -12175,3 +12175,33 @@ top.
   userspace-dp/src/afxdp/frame/mod.rs,
   userspace-dp/src/afxdp/frame/tests.rs,
   userspace-dp/src/afxdp/coordinator/README.md, _Log.md
+
+- **Timestamp**: 2026-06-23
+- **Action**: #2486 — enforce TCP MSS clamp for all-tcp + gre-in
+  contexts; reject ipsec-vpn at commit. Previously only tunnel egress
+  (gre-out / WG) clamped — all-tcp / ipsec-vpn / gre-in were accepted +
+  carried on the wire but never enforced (gre-in = silent full-MSS
+  blackhole on the GRE return path). Added per-packet MSS context
+  selection (`select_tcp_mss`) at frame build: all-tcp (plain forward,
+  v4+v6, universal fallback), gre-in (gated on a new
+  `GRE_DECAP_INGRESS_FLAG` 0x40 marker set by the GRE decap stage),
+  gre-out/WG unchanged. ipsec-vpn rejected at commit (no IPsec context
+  in the userspace forward path; kernel XFRM). all-tcp now lands in its
+  own `TCPMSSAllTCP` field (was silently fanned into gre-out only) and is
+  wired onto the existing `tcp_mss_all_tcp` wire field. Fail-on-revert
+  tests on both planes (all-tcp v4/v6 clamp/no-clamp/non-SYN/unset;
+  gre-in clamp + marker-required + decap-sets-marker; ipsec-vpn
+  commit-reject + all-tcp field mapping).
+- **File(s)**: userspace-dp/src/afxdp/icmp.rs,
+  userspace-dp/src/afxdp/mod.rs, userspace-dp/src/afxdp/gre.rs,
+  userspace-dp/src/afxdp/forwarding/mod.rs,
+  userspace-dp/src/afxdp/frame/build/mod.rs,
+  userspace-dp/src/afxdp/frame/tests.rs,
+  userspace-dp/src/afxdp/tests.rs, pkg/config/types_security.go,
+  pkg/config/compiler_security.go, pkg/dataplane/userspace/flow.go,
+  pkg/cli/cli_show_flow.go, pkg/grpcapi/server_show_flow.go,
+  pkg/api/show_text.go, pkg/config/compiler_tcp_mss_range_test.go,
+  pkg/config/parser_security_test.go, pkg/config/parser_ast_test.go,
+  pkg/config/dual_ast_differential_test.go,
+  pkg/dataplane/userspace/flow_wire_coerce_test.go,
+  test/incus/xpf-test.conf, docs/feature-gaps.md, _Log.md

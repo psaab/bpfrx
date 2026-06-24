@@ -879,11 +879,14 @@ func (c *CLI) showFlowTimeouts() error {
 	}
 
 	// TCP MSS clamping
-	if flow.TCPMSSIPsecVPN > 0 || flow.TCPMSSGreIn > 0 || flow.TCPMSSGreOut > 0 {
+	if flow.TCPMSSAllTCP > 0 || flow.TCPMSSIPsecVPN > 0 || flow.TCPMSSGreIn > 0 || flow.TCPMSSGreOut > 0 {
 		fmt.Println()
 		fmt.Println("TCP MSS clamping:")
+		if flow.TCPMSSAllTCP > 0 {
+			fmt.Printf("  %-30s %d\n", "All TCP MSS:", flow.TCPMSSAllTCP)
+		}
 		if flow.TCPMSSIPsecVPN > 0 {
-			fmt.Printf("  %-30s %d\n", "IPsec VPN MSS:", flow.TCPMSSIPsecVPN)
+			fmt.Printf("  %-30s %d\n", "IPsec VPN MSS (not enforced):", flow.TCPMSSIPsecVPN)
 		}
 		if flow.TCPMSSGreIn > 0 {
 			fmt.Printf("  %-30s %d\n", "GRE ingress MSS:", flow.TCPMSSGreIn)

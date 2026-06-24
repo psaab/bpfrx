@@ -406,7 +406,7 @@ var dualASTCases = []dualASTCase{
 		hier: `security {
     flow {
         tcp-mss {
-            ipsec-vpn 1350;
+            all-tcp 1350;
             gre-in 1400;
             gre-out 1380;
         }

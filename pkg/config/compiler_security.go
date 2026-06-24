@@ -774,7 +774,35 @@ func validateTCPMSSRanges(nodes []*Node, prefix string, lenient bool) ([]string,
 					mssPath := joinNodePath(flowPath, []string{"tcp-mss"})
 					for _, kind := range tcpMSSKinds {
 						for _, kn := range mss.FindChildren(kind) {
-							w, err := checkTCPMSSKind(kn, joinNodePath(mssPath, []string{kind}), lenient)
+							kindPath := joinNodePath(mssPath, []string{kind})
+							// #2486: `tcp-mss ipsec-vpn` is rejected at
+							// commit. There is no IPsec context in the
+							// userspace forward-build path — ESP/AH/IKE is
+							// local-delivered to the kernel XFRM stack and the
+							// decrypted inner packets re-enter as plain
+							// traffic with no IPsec marker — so the clamp can
+							// never be enforced. Carrying it silently as dead
+							// config (the prior behavior) is worse than
+							// rejecting it. Strict (commit/commit-check) is a
+							// hard error; lenient (load/peer-sync) downgrades
+							// to a warning so a legacy persisted/peer config
+							// still boots.
+							if kind == "ipsec-vpn" {
+								if _, ok := selectMSSToken(kn); ok {
+									msg := fmt.Sprintf("%s: tcp-mss ipsec-vpn is not "+
+										"supported in the userspace forwarding path "+
+										"(IPsec is processed by the kernel XFRM stack, "+
+										"so no IPsec context reaches the MSS clamp); "+
+										"use 'all-tcp' to clamp all forwarded TCP", kindPath)
+									if !lenient {
+										return nil, fmt.Errorf("%s", msg)
+									}
+									warnings = append(warnings, msg+
+										" (ignored: clamp not enforced)")
+								}
+								continue
+							}
+							w, err := checkTCPMSSKind(kn, kindPath, lenient)
 							warnings = append(warnings, w...)
 							if err != nil {
 								return nil, err
@@ -912,6 +940,13 @@ func compileFlow(node *Node, sec *SecurityConfig) error {
 		for _, opt := range mssNode.Children {
 			switch opt.Name() {
 			case "ipsec-vpn":
+				// #2486: strict commit rejects this via
+				// validateTCPMSSRanges (no IPsec context in the userspace
+				// forward path). In lenient load/peer-sync contexts the
+				// value IS retained on the typed config below, so `show`
+				// output and config round-trip preserve it — but it is
+				// NEVER serialized to the dataplane wire (flow.go drops it)
+				// and NEVER enforced (no dataplane consumer reads it).
 				if v := parseMSSValue(opt); v > 0 {
 					sec.Flow.TCPMSSIPsecVPN = v
 				}
@@ -924,10 +959,14 @@ func compileFlow(node *Node, sec *SecurityConfig) error {
 					sec.Flow.TCPMSSGreOut = v
 				}
 			case "all-tcp":
+				// #2486: all-tcp is the context-agnostic clamp — it lands in
+				// its own wire field (tcp_mss_all_tcp) and the dataplane
+				// applies it to every forwarded TCP SYN (plain + the fallback
+				// for gre-in / tunnel egress). Previously it fanned out into
+				// IPsecVPN/GreIn/GreOut, but only gre-out was ever enforced,
+				// so all-tcp silently behaved as gre-out-only.
 				if v := parseMSSValue(opt); v > 0 {
-					sec.Flow.TCPMSSIPsecVPN = v
-					sec.Flow.TCPMSSGreIn = v
-					sec.Flow.TCPMSSGreOut = v
+					sec.Flow.TCPMSSAllTCP = v
 				}
 			}
 		}

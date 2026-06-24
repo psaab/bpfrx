@@ -1829,11 +1829,13 @@ security {
 }
 
 func TestTCPMSSHierarchical(t *testing.T) {
+	// #2486: ipsec-vpn dropped (rejected at commit); all-tcp added to
+	// exercise the hierarchical shape of the dedicated TCPMSSAllTCP field.
 	input := `
 security {
     flow {
         tcp-mss {
-            ipsec-vpn {
+            all-tcp {
                 mss 1360;
             }
             gre-in {
@@ -1855,8 +1857,8 @@ security {
 	if err != nil {
 		t.Fatalf("CompileConfig: %v", err)
 	}
-	if cfg.Security.Flow.TCPMSSIPsecVPN != 1360 {
-		t.Errorf("TCPMSSIPsecVPN = %d, want 1360", cfg.Security.Flow.TCPMSSIPsecVPN)
+	if cfg.Security.Flow.TCPMSSAllTCP != 1360 {
+		t.Errorf("TCPMSSAllTCP = %d, want 1360", cfg.Security.Flow.TCPMSSAllTCP)
 	}
 	if cfg.Security.Flow.TCPMSSGreIn != 1360 {
 		t.Errorf("TCPMSSGreIn = %d, want 1360", cfg.Security.Flow.TCPMSSGreIn)

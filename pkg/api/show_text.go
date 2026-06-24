@@ -238,8 +238,12 @@ func (s *Server) showTextHandler(w http.ResponseWriter, r *http.Request) {
 			}
 			fmt.Fprintf(&buf, "  UDP session:          %ds\n", flow.UDPSessionTimeout)
 			fmt.Fprintf(&buf, "  ICMP session:         %ds\n", flow.ICMPSessionTimeout)
+			if flow.TCPMSSAllTCP > 0 {
+				fmt.Fprintf(&buf, "  TCP MSS (all-tcp):    %d\n", flow.TCPMSSAllTCP)
+			}
 			if flow.TCPMSSIPsecVPN > 0 {
-				fmt.Fprintf(&buf, "  TCP MSS (IPsec VPN):  %d\n", flow.TCPMSSIPsecVPN)
+				// #2486: ipsec-vpn rejected at commit; not enforced.
+				fmt.Fprintf(&buf, "  TCP MSS (IPsec VPN):  %d (not enforced)\n", flow.TCPMSSIPsecVPN)
 			}
 			if flow.TCPMSSGreIn > 0 {
 				fmt.Fprintf(&buf, "  TCP MSS (GRE in):     %d\n", flow.TCPMSSGreIn)

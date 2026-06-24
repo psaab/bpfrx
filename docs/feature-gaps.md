@@ -219,7 +219,35 @@ xpf implements 11 screen checks (land, syn-flood, ping-death, teardrop, rate-lim
 
 ## 10. Security Flow Enhancements
 
-xpf has TCP session timeouts (established, initial, closing, time-wait), UDP/ICMP timeouts, TCP MSS clamping (IPsec, GRE in/out), allow-dns-reply, allow-embedded-icmp, GRE performance acceleration, and flow traceoptions (packet-filter source-prefix / destination-prefix / `protocol` — M8/#2008).
+xpf has TCP session timeouts (established, initial, closing, time-wait), UDP/ICMP timeouts, TCP MSS clamping, allow-dns-reply, allow-embedded-icmp, GRE performance acceleration, and flow traceoptions (packet-filter source-prefix / destination-prefix / `protocol` — M8/#2008).
+
+**TCP MSS clamping contexts (#2486).** The userspace AF_XDP forwarding
+path enforces three of the four Junos `security flow tcp-mss` contexts,
+selected per-packet at frame build (`select_tcp_mss`,
+`userspace-dp/src/afxdp/forwarding/mod.rs`):
+
+- `all-tcp` — clamps every forwarded TCP SYN (IPv4 and IPv6); also the
+  universal fallback for the contexts below.
+- `gre-in` — clamps an inbound GRE-decapped SYN. The decap stage marks
+  the inner packet with `GRE_DECAP_INGRESS_FLAG` in `meta_flags` so the
+  builder can select this value (fixes the prior silent full-MSS
+  blackhole on the GRE return path).
+- `gre-out` — clamps a SYN egressing into a native GRE tunnel
+  (gre-out value, or the MTU-derived formula; WireGuard uses the
+  overhead-aware value, #2299).
+- `ipsec-vpn` — **rejected at commit** (`validateTCPMSSRanges`,
+  pkg/config/compiler_security.go). IPsec is processed by the
+  kernel XFRM stack; the decrypted inner packets re-enter the userspace
+  path as plain traffic with no IPsec marker, so no IPsec context reaches
+  the MSS clamp. Carrying it as accepted-but-dead config was worse than
+  rejecting it; operators should use `all-tcp` to clamp all forwarded
+  TCP. Lenient (boot/peer-sync) load warn-loads a legacy `ipsec-vpn`
+  value but does NOT enforce it.
+
+Before #2486 only the tunnel-egress (`gre-out` / WG) context was
+enforced; `all-tcp` and `gre-in` were accepted on the wire but never
+applied (`all-tcp` silently fanned into gre-out only), and `ipsec-vpn`
+was dead config.
 
 | Feature | Junos Config Path | Description | Priority | Status |
 |---------|-------------------|-------------|----------|--------|

@@ -3,7 +3,7 @@
 //! Body is byte-identical to the AF_INET match arm at
 //! `frame/mod.rs:285..341` before this split. The orchestrator at
 //! `frame/build/mod.rs` computes the L2 prelude (eth header, payload
-//! memcpy, ip_start, tunnel_tcp_mss, apply_nat) and dispatches here.
+//! memcpy, ip_start, selected_tcp_mss, apply_nat) and dispatches here.
 
 use super::super::tcp::clamp_tcp_mss_frame;
 use super::super::{
@@ -21,7 +21,7 @@ pub(in crate::afxdp::frame) fn build_forwarded_frame_into_ipv4(
     decision: &SessionDecision,
     apply_nat: bool,
     expected_ports: Option<(u16, u16)>,
-    tunnel_tcp_mss: u16,
+    selected_tcp_mss: u16,
     force_tunnel_l4_recompute: bool,
 ) -> Option<()> {
     let enforced_ports = expected_ports;
@@ -83,8 +83,8 @@ pub(in crate::afxdp::frame) fn build_forwarded_frame_into_ipv4(
         old_dst,
         old_ttl,
     )?;
-    if tunnel_tcp_mss > 0 {
-        let _ = clamp_tcp_mss_frame(out, ip_start, tunnel_tcp_mss);
+    if selected_tcp_mss > 0 {
+        let _ = clamp_tcp_mss_frame(out, ip_start, selected_tcp_mss);
     }
     // #1852: skip the full L4 recompute on a non-first fragment — it
     // writes the checksum at ihl+16/+6, which is payload here. The forced

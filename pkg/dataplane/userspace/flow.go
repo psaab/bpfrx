@@ -73,9 +73,13 @@ func coerceWireSessionTimeout(field string, v int) int {
 
 func buildFlowSnapshot(cfg *config.Config) FlowSnapshot {
 	snap := FlowSnapshot{
-		AllowDNSReply:      cfg.Security.Flow.AllowDNSReply,
-		AllowEmbeddedICMP:  cfg.Security.Flow.AllowEmbeddedICMP,
-		TCPMSSIPsecVPN:     coerceWireU16("tcp_mss_ipsec_vpn", cfg.Security.Flow.TCPMSSIPsecVPN),
+		AllowDNSReply:     cfg.Security.Flow.AllowDNSReply,
+		AllowEmbeddedICMP: cfg.Security.Flow.AllowEmbeddedICMP,
+		// #2486: all-tcp now lands in its own wire field; the dataplane
+		// applies it to plain forwarded SYNs (and as the gre-in / tunnel
+		// fallback). ipsec-vpn is rejected at commit, so it is NOT sent
+		// to the dataplane (it has no enforceable context there).
+		TCPMSSAllTCP:       coerceWireU16("tcp_mss_all_tcp", cfg.Security.Flow.TCPMSSAllTCP),
 		TCPMSSGreIn:        coerceWireU16("tcp_mss_gre_in", cfg.Security.Flow.TCPMSSGreIn),
 		TCPMSSGreOut:       coerceWireU16("tcp_mss_gre_out", cfg.Security.Flow.TCPMSSGreOut),
 		UDPSessionTimeout:  coerceWireSessionTimeout("udp_session_timeout", cfg.Security.Flow.UDPSessionTimeout),
@@ -85,10 +89,6 @@ func buildFlowSnapshot(cfg *config.Config) FlowSnapshot {
 		Lo0FilterInputV4:   cfg.System.Lo0FilterInputV4,
 		Lo0FilterInputV6:   cfg.System.Lo0FilterInputV6,
 	}
-	// TCPMSSAllTCP is in the wire contract (Rust u16) but is not populated by
-	// this builder today; coerce defensively so it stays safe if it is ever
-	// wired from config (#1977, Codex r2). No-op while it remains zero.
-	snap.TCPMSSAllTCP = coerceWireU16("tcp_mss_all_tcp", snap.TCPMSSAllTCP)
 	if cfg.Security.Flow.TCPSession != nil {
 		snap.TCPSessionTimeout = coerceWireSessionTimeout(
 			"tcp_session_timeout", cfg.Security.Flow.TCPSession.EstablishedTimeout)
