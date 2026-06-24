@@ -18,6 +18,28 @@ Mirrors the BPF firewall-filter pipeline in userspace.
   matcher, DSCP bitmap). Three-color policer snapshots are sorted by
   name for deterministic iteration and compiled into name-derived
   stable runtime IDs before terms are linked.
+  - **Protocol resolution (#2505)** uses the SHARED, normalizing
+    resolver `crate::ip_proto::proto_number` (trim + lowercase + the
+    full `appid.ProtocolNumber` acceptance set — tcp/udp/icmp/icmpv6/
+    gre/ospf/ipip/esp/ah/sctp/vrrp/igmp/pim/egp + the specific
+    `junos-*` aliases + bare numeric). It does NOT carry a local
+    protocol table. A `from protocol` token reaches the snapshot
+    VERBATIM (Go's `compileFilterFrom` does no alias resolution), so
+    the resolver must accept exactly what the Go filter commit gate
+    (`filterProtocolResolvable`) accepts or a gate-passing filter would
+    lose its protocol constraint in the dataplane.
+  - **Fail closed, not fail wide (#2505):** an EMPTY protocol list
+    means "no constraint" (`protocol_match_enabled = false`, match-any,
+    preserved). A NON-EMPTY list with any UNRESOLVABLE token raises
+    `SnapshotIntegrityError::UnrepresentableFilterProtocol`, which
+    propagates up through `build_forwarding_state_*` to the reconcile
+    preflight (`build_reconcile_forwarding`) and aborts the reconcile
+    BEFORE teardown/publish (post-#2484), keeping the prior good filter
+    state live. Silently dropping the token (the pre-fix `filter_map`)
+    collapsed the list to empty and disabled the match, so a `from
+    protocol esp; then discard` term matched EVERY protocol — a
+    fail-wide security bug. The Go gate is the primary defense; this is
+    the helper-boundary backstop against version/snapshot drift.
 - `engine.rs` — per-term evaluation, first-match-wins. It carries the
   matched `then policer ...` name in the filter result. Routing-instance
   evaluation can also return log/action/filter/term metadata so AF_XDP

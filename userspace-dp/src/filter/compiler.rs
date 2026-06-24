@@ -5,13 +5,19 @@
 use super::*;
 
 /// Build the complete FilterState from snapshot data.
+///
+/// #2505: returns `Err(SnapshotIntegrityError)` when a filter term carries a
+/// NON-EMPTY `from protocol` list with a token `ip_proto::proto_number` cannot
+/// resolve. Silently dropping it (the pre-fix `filter_map`) was a fail-WIDE
+/// security bug — an all-dropped list disabled the protocol match so the term
+/// matched every protocol.
 pub(crate) fn parse_filter_state(
     filters: &[FirewallFilterSnapshot],
     policers: &[PolicerSnapshot],
     interfaces: &[crate::InterfaceSnapshot],
     lo0_filter_v4: &str,
     lo0_filter_v6: &str,
-) -> FilterState {
+) -> Result<FilterState, SnapshotIntegrityError> {
     parse_filter_state_with_three_color(
         filters,
         policers,
@@ -31,7 +37,7 @@ pub(crate) fn parse_filter_state_with_three_color(
     interfaces: &[crate::InterfaceSnapshot],
     lo0_filter_v4: &str,
     lo0_filter_v6: &str,
-) -> FilterState {
+) -> Result<FilterState, SnapshotIntegrityError> {
     parse_filter_state_with_three_color_preserving(
         filters,
         policers,
@@ -53,7 +59,7 @@ pub(crate) fn parse_filter_state_with_three_color_preserving(
     lo0_filter_v4: &str,
     lo0_filter_v6: &str,
     previous: Option<&FilterState>,
-) -> FilterState {
+) -> Result<FilterState, SnapshotIntegrityError> {
     let mut state = FilterState::default();
 
     // Parse legacy token-bucket policers.
@@ -93,8 +99,16 @@ pub(crate) fn parse_filter_state_with_three_color_preserving(
             .terms
             .iter()
             .enumerate()
-            .map(|(term_idx, t)| parse_term(t, term_idx as u32, &state.three_color_policer_by_name))
-            .collect::<Vec<_>>();
+            .map(|(term_idx, t)| {
+                parse_term(
+                    t,
+                    term_idx as u32,
+                    &snap.family,
+                    &snap.name,
+                    &state.three_color_policer_by_name,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         let filter = Filter {
             id: filter_idx as u32,
             name: snap.name.clone(),
@@ -242,7 +256,7 @@ pub(crate) fn parse_filter_state_with_three_color_preserving(
     };
     state.lo0_filter_v6_fast = state.filters.get(&state.lo0_filter_v6).cloned();
 
-    state
+    Ok(state)
 }
 
 fn parse_three_color_policer(
@@ -344,8 +358,10 @@ fn qualify_filter_key(family: &str, filter_name: &str) -> String {
 fn parse_term(
     snap: &FirewallTermSnapshot,
     id: u32,
+    filter_family: &str,
+    filter_name: &str,
     three_color_policers: &rustc_hash::FxHashMap<String, Arc<ThreeColorPolicerRuntime>>,
-) -> FilterTerm {
+) -> Result<FilterTerm, SnapshotIntegrityError> {
     let mut source_v4 = Vec::new();
     let mut source_v6 = Vec::new();
     for addr in &snap.source_addresses {
@@ -366,11 +382,40 @@ fn parse_term(
     // engine/matching.rs).
     let source_addr_constrained = snap.source_addresses.iter().any(|a| addr_is_real(a));
     let dest_addr_constrained = snap.destination_addresses.iter().any(|a| addr_is_real(a));
-    let protocols: Vec<u8> = snap
-        .protocols
-        .iter()
-        .filter_map(|p| parse_protocol(p))
-        .collect();
+    // #2505: resolve every `from protocol` token via the SHARED, normalizing
+    // resolver `ip_proto::proto_number` (trim + lowercase + the full
+    // appid.ProtocolNumber acceptance set: esp/ah/sctp/vrrp/igmp/pim/egp +
+    // the junos-* aliases), NOT the stale local parser this function used to
+    // carry (tcp/udp/icmp/icmpv6/gre/ospf/ipip + bare numeric, no
+    // normalization). An EMPTY input list is the legitimate "no protocol
+    // constraint" case -> empty `protocols` -> `protocol_match_enabled` false
+    // (match-any, preserved below). A NON-EMPTY list with any UNRESOLVABLE
+    // token is a snapshot-integrity error: silently dropping it (the pre-fix
+    // `filter_map`) collapses the list to empty and disables the protocol
+    // match, so a `from protocol esp; then discard` term would match EVERY
+    // protocol (fail-WIDE). Fail closed by rejecting the whole snapshot — the
+    // reconcile preflight keeps the previous good filter state.
+    let mut protocols: Vec<u8> = Vec::with_capacity(snap.protocols.len());
+    for token in &snap.protocols {
+        // An empty / whitespace-only entry is a placeholder, never a real
+        // constraint (the Go side only emits `protocols` when `term.Protocol
+        // != ""`); treat it as "no protocol" rather than an integrity error,
+        // mirroring the pre-fix `parse_protocol("")` -> None drop.
+        if token.trim().is_empty() {
+            continue;
+        }
+        match proto_number(token) {
+            Some(n) => protocols.push(n),
+            None => {
+                return Err(SnapshotIntegrityError::UnrepresentableFilterProtocol {
+                    family: filter_family.to_string(),
+                    filter: filter_name.to_string(),
+                    term: snap.name.clone(),
+                    token: token.clone(),
+                });
+            }
+        }
+    }
     let source_ports: Vec<PortRange> = snap
         .source_ports
         .iter()
@@ -417,7 +462,7 @@ fn parse_term(
     };
     let dscp_rewrite = snap.dscp_rewrite.map(|value| value & 0x3f);
 
-    FilterTerm {
+    Ok(FilterTerm {
         id,
         name: snap.name.clone(),
         source_v4,
@@ -452,7 +497,7 @@ fn parse_term(
         forwarding_class: Arc::<str>::from(snap.forwarding_class.as_str()),
         dscp_rewrite,
         counter: Arc::new(FilterTermCounter::default()),
-    }
+    })
 }
 
 /// #2400: whether an address entry imposes a real scope. `parse_address` drops
@@ -491,20 +536,6 @@ fn parse_address(prefix: &str, out_v4: &mut Vec<PrefixV4>, out_v6: &mut Vec<Pref
                 ));
             }
         }
-    }
-}
-
-fn parse_protocol(protocol: &str) -> Option<u8> {
-    match protocol {
-        "" => None,
-        "tcp" => Some(PROTO_TCP),
-        "udp" => Some(PROTO_UDP),
-        "icmp" => Some(PROTO_ICMP),
-        "icmpv6" => Some(PROTO_ICMPV6),
-        "gre" => Some(PROTO_GRE),
-        "89" | "ospf" => Some(PROTO_OSPF),
-        "4" | "ipip" => Some(PROTO_IPIP),
-        _ => protocol.parse::<u8>().ok(),
     }
 }
 

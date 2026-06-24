@@ -1244,7 +1244,7 @@ fn forwarding_for_ptb_with_output_term(
         }],
         "",
         "",
-    );
+    ).expect("filter state compiles");
     forwarding.tx_selection_enabled_v4 = true;
     forwarding
 }

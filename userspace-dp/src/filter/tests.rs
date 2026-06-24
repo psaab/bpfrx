@@ -9,7 +9,7 @@ fn make_filter_state(
     filters: &[FirewallFilterSnapshot],
     policers: &[PolicerSnapshot],
 ) -> FilterState {
-    parse_filter_state(filters, policers, &[], "", "")
+    parse_filter_state(filters, policers, &[], "", "").expect("filter state compiles")
 }
 
 fn make_filter_state_with_three_color(
@@ -17,13 +17,14 @@ fn make_filter_state_with_three_color(
     three_color_policers: &[ThreeColorPolicerSnapshot],
 ) -> FilterState {
     parse_filter_state_with_three_color(filters, &[], three_color_policers, &[], "", "")
+        .expect("filter state compiles")
 }
 
 fn make_filter_state_with_interfaces(
     filters: &[FirewallFilterSnapshot],
     interfaces: &[crate::InterfaceSnapshot],
 ) -> FilterState {
-    parse_filter_state(filters, &[], interfaces, "", "")
+    parse_filter_state(filters, &[], interfaces, "", "").expect("filter state compiles")
 }
 
 #[test]
@@ -608,7 +609,7 @@ fn equivalent_snapshot_refresh_preserves_three_color_state_and_counters() {
         "",
         "",
         Some(&state),
-    );
+    ).expect("filter state compiles");
     assert!(
         std::sync::Arc::ptr_eq(
             &state.three_color_policers[0],
@@ -694,7 +695,7 @@ fn three_color_adding_lower_sorted_policer_does_not_reset_existing_runtime() {
         "",
         "",
         Some(&state),
-    );
+    ).expect("filter state compiles");
     let previous_runtime = state
         .three_color_policer_by_name
         .get("stable-pol")
@@ -763,7 +764,7 @@ fn three_color_compatible_refresh_observes_old_runtime_mutations_after_rebuild()
         "",
         "",
         Some(&state),
-    );
+    ).expect("filter state compiles");
     assert!(std::sync::Arc::ptr_eq(
         &state.three_color_policers[0],
         &refreshed.three_color_policers[0]
@@ -859,7 +860,7 @@ fn changed_snapshot_shape_resets_three_color_runtime_state() {
         "",
         "",
         Some(&state),
-    );
+    ).expect("filter state compiles");
     let refreshed_filter = refreshed.filters.get("inet:policed").unwrap();
     let second = evaluate_filter_ref_tx_selection_runtime_counted(
         refreshed_filter,
@@ -1404,7 +1405,7 @@ fn interface_filter_assignment() {
         &ifaces,
         "",
         "",
-    );
+    ).expect("filter state compiles");
     // v4 filter on ifindex 5
     let result = evaluate_interface_filter(
         &state,
@@ -1491,7 +1492,7 @@ fn parse_filter_state_prequalifies_interface_and_lo0_filter_keys() {
         &ifaces,
         "protect-re",
         "protect-re-v6",
-    );
+    ).expect("filter state compiles");
     assert_eq!(
         state.iface_filter_v4.get(&7).map(String::as_str),
         Some("inet:ingress-v4")
@@ -1535,7 +1536,7 @@ fn accept_only_output_filter_does_not_need_tx_eval() {
         &ifaces,
         "",
         "",
-    );
+    ).expect("filter state compiles");
 
     assert!(!interface_output_filter_needs_tx_eval(&state, 7, false));
     assert!(!filter_state_has_output_tx_selection(&state, false));
@@ -1574,7 +1575,7 @@ fn interface_filter_routing_instance_counted_returns_matching_override() {
         &ifaces,
         "",
         "",
-    );
+    ).expect("filter state compiles");
 
     assert!(interface_filter_affects_route_lookup(&state, 11, true));
     let routing_instance = evaluate_interface_filter_routing_instance_counted(
@@ -1622,7 +1623,7 @@ fn interface_output_filter_counted_records_term_hits() {
         &ifaces,
         "",
         "",
-    );
+    ).expect("filter state compiles");
     let result = evaluate_interface_output_filter_counted(
         &state,
         7,
@@ -1671,7 +1672,7 @@ fn interface_output_filter_without_count_does_not_record_term_hits() {
         &ifaces,
         "",
         "",
-    );
+    ).expect("filter state compiles");
     let result = evaluate_interface_output_filter_counted(
         &state,
         7,
@@ -1720,7 +1721,7 @@ fn lo0_filter_evaluation() {
         &[],
         "protect-RE",
         "",
-    );
+    ).expect("filter state compiles");
     // SSH should pass lo0 filter
     let result = evaluate_lo0_filter(
         &state,
@@ -1961,7 +1962,7 @@ fn input_dscp_filter_families_changed_detects_three_color_shape_change() {
         std::slice::from_ref(&iface),
         "",
         "",
-    );
+    ).expect("filter state compiles");
     let new = parse_filter_state_with_three_color_preserving(
         &filters,
         &[],
@@ -1970,7 +1971,7 @@ fn input_dscp_filter_families_changed_detects_three_color_shape_change() {
         "",
         "",
         Some(&old),
-    );
+    ).expect("filter state compiles");
 
     assert!(
         !std::sync::Arc::ptr_eq(
@@ -2288,7 +2289,7 @@ fn evaluate_lo0_filter_ipv6_path() {
         &[],
         "",
         "protect-RE-v6",
-    );
+    ).expect("filter state compiles");
     let accepted = evaluate_lo0_filter(
         &state,
         true,
@@ -2339,7 +2340,7 @@ fn evaluate_interface_filter_ipv6_input_path() {
         &ifaces,
         "",
         "",
-    );
+    ).expect("filter state compiles");
     let result = evaluate_interface_filter(
         &state,
         9,
@@ -2482,7 +2483,7 @@ fn interface_filter_non_routing_counted_defers_pbr_term() {
         &ifaces,
         "",
         "",
-    );
+    ).expect("filter state compiles");
 
     // A packet that matches the routing-instance term must short-circuit to
     // the default (route-lookup wins) and must NOT increment that term's
@@ -2566,7 +2567,7 @@ fn interface_filter_tx_selection_wrappers_dispatch_and_default() {
         &ifaces,
         "",
         "",
-    );
+    ).expect("filter state compiles");
 
     let input = evaluate_interface_filter_tx_selection_counted(
         &state,
@@ -2685,7 +2686,7 @@ fn thin_accessor_predicates() {
         &ifaces,
         "",
         "",
-    );
+    ).expect("filter state compiles");
 
     // TX-selection accessor reads the TX-selection set, NOT the DSCP set:
     // true on the TX-only ifindex, false on the DSCP-only ifindex.
@@ -2735,7 +2736,7 @@ fn cached_and_runtime_tx_selection_agree_on_plain_term() {
         &ifaces,
         "",
         "",
-    );
+    ).expect("filter state compiles");
     let filter = state.iface_filter_v4_fast.get(&30).expect("input filter");
     let src = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1));
     let dst = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 2));
@@ -3229,7 +3230,7 @@ fn per_packet_match_marks_filter_cache_sensitive() {
         filter_input_v4: "pp".into(),
         ..Default::default()
     }];
-    let state = parse_filter_state(&filters, &[], &interfaces, "", "");
+    let state = parse_filter_state(&filters, &[], &interfaces, "", "").expect("filter state compiles");
     assert!(
         state.iface_filter_v4_has_per_packet_l4_match.contains(&7),
         "interface input filter with a tcp-flags term must be marked per-packet-L4 cache-sensitive"
@@ -3986,5 +3987,279 @@ fn term_2400_partial_malformed_address_keeps_valid_scope() {
         in_valid.action,
         FilterAction::Discard,
         "the surviving valid prefix must still match (partial-malformed != all-malformed)"
+    );
+}
+
+// =====================================================================
+// #2505: firewall-filter protocol resolution uses the SHARED, normalizing
+// resolver (ip_proto::proto_number) and fails CLOSED on an unresolvable
+// token in a non-empty list. The pre-fix local parse_protocol recognized
+// only tcp/udp/icmp/icmpv6/gre/ospf/ipip + bare numeric and silently
+// dropped everything else; an all-dropped list disabled the protocol match
+// so a `from protocol esp; then discard` term matched EVERY protocol
+// (fail-WIDE).
+// =====================================================================
+
+// Build a single-term `discard` filter scoped to one `from protocol` token,
+// returning the compiled FilterState result (Ok or the integrity Err).
+fn filter_for_protocol(token: &str) -> Result<FilterState, SnapshotIntegrityError> {
+    parse_filter_state(
+        &[FirewallFilterSnapshot {
+            name: "f".into(),
+            family: "inet".into(),
+            terms: vec![FirewallTermSnapshot {
+                name: "scoped".into(),
+                protocols: vec![token.into()],
+                action: "discard".into(),
+                ..Default::default()
+            }],
+        }],
+        &[],
+        &[],
+        "",
+        "",
+    )
+}
+
+// Assert a token resolves to a protocol-SCOPED term: the term discards ITS
+// protocol and ACCEPTS (no match) a different one — proving the protocol
+// match is enabled and not a fail-wide match-all.
+fn assert_scoped_to(token: &str, want_proto: u8) {
+    let state = filter_for_protocol(token)
+        .unwrap_or_else(|e| panic!("token {token:?} should resolve, got {e}"));
+    let term = state
+        .filters
+        .get("inet:f")
+        .expect("filter compiled")
+        .terms
+        .first()
+        .expect("one term");
+    assert!(
+        term.protocol_match_enabled,
+        "token {token:?} must enable the protocol match (else the term is fail-wide match-all)"
+    );
+
+    // The scoped protocol is discarded.
+    let hit = evaluate_filter(
+        &state,
+        "inet:f",
+        v4(10, 0, 0, 1),
+        v4(10, 0, 0, 2),
+        want_proto,
+        0,
+        0,
+        0,
+        TermMatchExtra::default(),
+    );
+    assert_eq!(
+        hit.action,
+        FilterAction::Discard,
+        "token {token:?} (proto {want_proto}) must be discarded by its own term"
+    );
+
+    // A DIFFERENT protocol must NOT match (proves it is not match-all).
+    let other = if want_proto == PROTO_TCP {
+        PROTO_UDP
+    } else {
+        PROTO_TCP
+    };
+    let miss = evaluate_filter(
+        &state,
+        "inet:f",
+        v4(10, 0, 0, 1),
+        v4(10, 0, 0, 2),
+        other,
+        0,
+        0,
+        0,
+        TermMatchExtra::default(),
+    );
+    assert_eq!(
+        miss.action,
+        FilterAction::Accept,
+        "token {token:?} term must NOT match a different protocol ({other}) — that would be fail-wide"
+    );
+}
+
+#[test]
+fn protocol_2505_named_protocols_resolve_scoped() {
+    // The protocols the Go commit gate accepts but the stale local parser
+    // dropped. Each must resolve to its IANA number AND produce a scoped term.
+    assert_scoped_to("esp", 50);
+    assert_scoped_to("ah", 51);
+    assert_scoped_to("sctp", 132);
+    assert_scoped_to("vrrp", 112);
+    assert_scoped_to("igmp", 2);
+    assert_scoped_to("pim", 103);
+    assert_scoped_to("egp", 8);
+}
+
+#[test]
+fn protocol_2505_normalization_uppercase_and_whitespace() {
+    // The stale local parser did not trim/lowercase. The shared resolver does,
+    // matching the Go gate's strings.TrimSpace + ToLower.
+    assert_scoped_to("GRE", 47);
+    assert_scoped_to(" icmp ", PROTO_ICMP);
+    assert_scoped_to("Esp", 50);
+}
+
+#[test]
+fn protocol_2505_junos_aliases_resolve() {
+    // Gate<->dataplane parity: filterProtocolResolvable accepts these junos-*
+    // aliases and they reach the snapshot VERBATIM (compileFilterFrom does no
+    // alias resolution), so proto_number must resolve them too.
+    assert_scoped_to("junos-tcp-any", PROTO_TCP);
+    assert_scoped_to("junos-udp-any", PROTO_UDP);
+    assert_scoped_to("junos-ping", PROTO_ICMP);
+    assert_scoped_to("junos-gre", 47);
+    assert_scoped_to("junos-ospf", 89);
+    assert_scoped_to("junos-ip-in-ip", 4);
+}
+
+#[test]
+fn protocol_2505_unresolvable_fails_closed_not_match_all() {
+    // A non-empty list with an unresolvable token must reject the whole
+    // snapshot (fail closed), NOT silently drop it into an empty match-all
+    // term.
+    let err = filter_for_protocol("bogusproto")
+        .expect_err("an unresolvable protocol token must fail the build closed");
+    match err {
+        SnapshotIntegrityError::UnrepresentableFilterProtocol {
+            family,
+            filter,
+            term,
+            token,
+        } => {
+            assert_eq!(family, "inet");
+            assert_eq!(filter, "f");
+            assert_eq!(term, "scoped");
+            assert_eq!(token, "bogusproto");
+        }
+        other => panic!("expected UnrepresentableFilterProtocol, got {other:?}"),
+    }
+}
+
+#[test]
+fn protocol_2505_error_names_the_family_for_reused_filter_names() {
+    // Filter names can be reused across families. When the inet6 copy carries
+    // the unresolvable token, the diagnostic must name family inet6 (not just
+    // the ambiguous filter name) so the operator can find the offending filter.
+    let bad_term = || FirewallTermSnapshot {
+        name: "scoped".into(),
+        protocols: vec!["bogusproto".into()],
+        action: "discard".into(),
+        ..Default::default()
+    };
+    let good_term = || FirewallTermSnapshot {
+        name: "ok".into(),
+        protocols: vec!["tcp".into()],
+        action: "discard".into(),
+        ..Default::default()
+    };
+    let err = parse_filter_state(
+        &[
+            FirewallFilterSnapshot {
+                name: "dup".into(),
+                family: "inet".into(),
+                terms: vec![good_term()],
+            },
+            FirewallFilterSnapshot {
+                name: "dup".into(),
+                family: "inet6".into(),
+                terms: vec![bad_term()],
+            },
+        ],
+        &[],
+        &[],
+        "",
+        "",
+    )
+    .expect_err("the inet6 filter's unresolvable token must fail the build closed");
+    match err {
+        SnapshotIntegrityError::UnrepresentableFilterProtocol {
+            family,
+            filter,
+            term,
+            token,
+        } => {
+            assert_eq!(family, "inet6", "the error must name the inet6 family");
+            assert_eq!(filter, "dup");
+            assert_eq!(term, "scoped");
+            assert_eq!(token, "bogusproto");
+        }
+        other => panic!("expected UnrepresentableFilterProtocol, got {other:?}"),
+    }
+}
+
+#[test]
+fn protocol_2505_empty_list_is_unconstrained() {
+    // An EMPTY input protocol list legitimately means "no protocol
+    // constraint" — protocol_match_enabled=false, NOT an error.
+    let state = parse_filter_state(
+        &[FirewallFilterSnapshot {
+            name: "f".into(),
+            family: "inet".into(),
+            terms: vec![FirewallTermSnapshot {
+                name: "any-proto".into(),
+                protocols: vec![],
+                action: "discard".into(),
+                ..Default::default()
+            }],
+        }],
+        &[],
+        &[],
+        "",
+        "",
+    )
+    .expect("empty protocol list is not an error");
+    let term = state
+        .filters
+        .get("inet:f")
+        .expect("filter compiled")
+        .terms
+        .first()
+        .expect("one term");
+    assert!(
+        !term.protocol_match_enabled,
+        "an empty protocol list must leave the protocol match disabled (match-any constraint)"
+    );
+}
+
+// Go->Rust fixture: the exact #2505 reproduction — `from protocol esp; then
+// discard` must discard ONLY ESP, not all protocols. This is the fail-on-
+// revert canary: restoring the stale local parse_protocol (which drops esp)
+// turns the term into a match-all and BOTH of these asserts flip.
+#[test]
+fn protocol_2505_esp_discard_fixture_scopes_only_esp() {
+    let state = filter_for_protocol("esp").expect("esp resolves");
+    // ESP (proto 50) is discarded.
+    let esp = evaluate_filter(
+        &state,
+        "inet:f",
+        v4(10, 0, 0, 1),
+        v4(10, 0, 0, 2),
+        50,
+        0,
+        0,
+        0,
+        TermMatchExtra::default(),
+    );
+    assert_eq!(esp.action, FilterAction::Discard, "ESP must be discarded");
+    // TCP is NOT discarded — the bug made this Discard (match-all).
+    let tcp = evaluate_filter(
+        &state,
+        "inet:f",
+        v4(10, 0, 0, 1),
+        v4(10, 0, 0, 2),
+        PROTO_TCP,
+        12345,
+        443,
+        0,
+        TermMatchExtra::default(),
+    );
+    assert_eq!(
+        tcp.action,
+        FilterAction::Accept,
+        "TCP must NOT be discarded by a `from protocol esp` term — fail-wide regression (#2505)"
     );
 }

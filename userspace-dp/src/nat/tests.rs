@@ -4582,6 +4582,40 @@ fn proto_number_resolver_matches_known_tokens() {
     assert_eq!(proto_number("256"), None);
 }
 
+/// #2505: the shared resolver must cover the FULL appid.ProtocolNumber
+/// acceptance set — the named protocols and the specific junos-* aliases the
+/// Go filter commit gate (filterProtocolResolvable) accepts. A firewall
+/// filter `from protocol <token>` reaches the snapshot VERBATIM, so any token
+/// the gate passes must resolve here or the filter loses its protocol
+/// constraint (the #2505 fail-wide bug).
+#[test]
+fn proto_number_resolves_full_gate_acceptance_set() {
+    use crate::ip_proto::proto_number;
+    // Named protocols the stale local filter parser dropped.
+    assert_eq!(proto_number("esp"), Some(50));
+    assert_eq!(proto_number("ah"), Some(51));
+    assert_eq!(proto_number("sctp"), Some(132));
+    assert_eq!(proto_number("vrrp"), Some(112));
+    assert_eq!(proto_number("igmp"), Some(2));
+    assert_eq!(proto_number("pim"), Some(103));
+    assert_eq!(proto_number("egp"), Some(8));
+    assert_eq!(proto_number("ipip"), Some(4));
+    assert_eq!(proto_number("ospf"), Some(89));
+    // junos-* aliases (mirror appid.ProtocolNumber / catalog.go).
+    assert_eq!(proto_number("junos-tcp-any"), Some(PROTO_TCP));
+    assert_eq!(proto_number("junos-udp-any"), Some(PROTO_UDP));
+    assert_eq!(proto_number("junos-icmp-all"), Some(PROTO_ICMP));
+    assert_eq!(proto_number("junos-ping"), Some(PROTO_ICMP));
+    assert_eq!(proto_number("junos-icmp6-all"), Some(PROTO_ICMPV6));
+    assert_eq!(proto_number("junos-pingv6"), Some(PROTO_ICMPV6));
+    assert_eq!(proto_number("junos-gre"), Some(PROTO_GRE));
+    assert_eq!(proto_number("junos-ospf"), Some(89));
+    assert_eq!(proto_number("junos-ip-in-ip"), Some(4));
+    assert_eq!(proto_number("junos-ipip"), Some(4));
+    // An UNKNOWN junos-* alias is NOT accepted (consistent with the gate).
+    assert_eq!(proto_number("junos-foobar"), None);
+}
+
 /// #2396 (Copilot fold, item 1): the resolver normalizes (trim + lower-case)
 /// so a mixed-case or whitespace-padded protocol token from the verbatim
 /// parser path resolves to the SAME number as the canonical lower-case token —
