@@ -48,8 +48,11 @@ func twoInstanceV9() *config.ForwardingOptionsConfig {
 	}
 }
 
-// v9OnlySvc is a v9-only global stanza with a single template (so unreferenced
-// collectors inherit it, the common case).
+// v9OnlySvc is a v9-only global stanza with NO templates defined. The
+// instance-isolation tests use flow-servers that reference no template, so the
+// resolver places them in the default ("") group with the built-in timeout
+// defaults — these tests assert per-instance collector/rate/counter isolation,
+// not template resolution (that is covered by template_group_test.go).
 func v9OnlySvc() *config.ServicesConfig {
 	return &config.ServicesConfig{
 		FlowMonitoring: &config.FlowMonitoringConfig{

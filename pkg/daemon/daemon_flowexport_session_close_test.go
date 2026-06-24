@@ -10,6 +10,7 @@ import (
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/dataplane"
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
+	"github.com/psaab/xpf/pkg/flowexport"
 	"github.com/psaab/xpf/pkg/logging"
 )
 
@@ -267,6 +268,148 @@ func TestNonSessionCloseRawEventDoesNotDriveFlowExport(t *testing.T) {
 	}
 	if sessionCloses != 0 {
 		t.Fatalf("a POLICY_DENY must not produce a SESSION_CLOSE record, got %d", sessionCloses)
+	}
+}
+
+// twoInstanceV9Config builds a config with TWO NetFlow v9 sampling instances
+// disambiguated by address family (#2462): "alpha" serves inet (IPv4) with its
+// own collector, "bravo" serves inet6 (IPv6) with its own collector. Both at
+// rate 1 so ShouldExport always admits. Each flow-server is pinned to version9
+// so both land in the v9 bundle (exercising the per-instance fanout walk in
+// flowExportCallback). The two collectors bind different ports so the test can
+// observe each exporter's Stats independently.
+func twoInstanceV9Config(addr string, alphaPort, bravoPort int) *config.Config {
+	cfg := &config.Config{}
+	cfg.ForwardingOptions.Sampling = &config.SamplingConfig{
+		Instances: map[string]*config.SamplingInstance{
+			"alpha": {
+				Name:      "alpha",
+				InputRate: 1,
+				FamilyInet: &config.SamplingFamily{
+					FlowServers: []*config.FlowServer{
+						{Address: addr, Port: alphaPort, Version: config.FlowServerVersion9},
+					},
+				},
+			},
+			"bravo": {
+				Name:      "bravo",
+				InputRate: 1,
+				FamilyInet6: &config.SamplingFamily{
+					FlowServers: []*config.FlowServer{
+						{Address: addr, Port: bravoPort, Version: config.FlowServerVersion9},
+					},
+				},
+			},
+		},
+	}
+	cfg.Services.FlowMonitoring = &config.FlowMonitoringConfig{
+		Version9: &config.NetFlowV9Config{
+			Templates: map[string]*config.NetFlowV9Template{},
+		},
+	}
+	return cfg
+}
+
+// groupStatsForInstance returns the summed exported-flow count across all
+// template groups of the named instance in the live v9 bundle.
+func groupStatsForInstance(b *exporterBundle, inst string) uint64 {
+	var total uint64
+	for _, g := range b.groups {
+		if g.ec.InstanceName == inst {
+			flows, _ := g.exp.Stats()
+			total += flows
+		}
+	}
+	return total
+}
+
+// waitInstanceFlows polls until the named instance's exporter(s) report at
+// least one exported flow record, or the 3s deadline elapses.
+func waitInstanceFlows(t *testing.T, b *exporterBundle, inst string) uint64 {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if n := groupStatsForInstance(b, inst); n >= 1 {
+			return n
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return groupStatsForInstance(b, inst)
+}
+
+// TestSessionCloseMultiInstanceFamilyIsolation is the #2462 daemon-level
+// fail-on-revert test for the per-instance fanout walk in flowExportCallback
+// (and its IPFIX twin). Two v9 sampling instances are wired through the REAL
+// reconcile + callback path: "alpha" (inet, rate 1) and "bravo" (inet6, rate
+// 1). An IPv4 SESSION_CLOSE is fed on the raw dataplane-event channel and must
+// reach ONLY alpha's exporter (its family) and NEVER bravo's — the
+// no-cross-export guarantee. The callback makes ONE sampling decision per
+// instance and fans only to that instance's groups.
+//
+// Fail-on-revert: reverting the callback to the pre-#2462 global decision —
+// one ShouldExport on groups[0] then export to EVERY group regardless of
+// family/instance — makes the IPv4 flow wrongly reach bravo (inet6), so
+// bravo's exported-flow count goes from 0 to >= 1 and this test fails.
+func TestSessionCloseMultiInstanceFamilyIsolation(t *testing.T) {
+	alphaColl, alphaPort := listenUDP(t)
+	t.Cleanup(func() { alphaColl.Close() })
+	bravoColl, bravoPort := listenUDP(t)
+	t.Cleanup(func() { bravoColl.Close() })
+
+	d := newFlowTestDaemon()
+	t.Cleanup(d.stopFlowExporter)
+	t.Cleanup(d.stopIPFIXExporter)
+
+	if !d.reconcileFlowExporters(twoInstanceV9Config("127.0.0.1", alphaPort, bravoPort)) {
+		t.Fatal("two-instance v9 reconcile must start exporters")
+	}
+	b := d.flowBundle.Load()
+	if b == nil || len(b.groups) != 2 {
+		t.Fatalf("expected two v9 groups (alpha + bravo), got %v", b)
+	}
+	// Verify the per-instance family scoping the callback relies on.
+	var alphaEC, bravoEC *flowexport.ExportConfig
+	for _, g := range b.groups {
+		switch g.ec.InstanceName {
+		case "alpha":
+			alphaEC = g.ec
+		case "bravo":
+			bravoEC = g.ec
+		}
+	}
+	if alphaEC == nil || bravoEC == nil {
+		t.Fatalf("both instances must resolve to a group: alpha=%v bravo=%v", alphaEC, bravoEC)
+	}
+	if !alphaEC.ServesFamily(false) || alphaEC.ServesFamily(true) {
+		t.Errorf("alpha must serve v4 only: v4=%v v6=%v", alphaEC.ServesFamily(false), alphaEC.ServesFamily(true))
+	}
+	if bravoEC.ServesFamily(false) || !bravoEC.ServesFamily(true) {
+		t.Errorf("bravo must serve v6 only: v4=%v v6=%v", bravoEC.ServesFamily(false), bravoEC.ServesFamily(true))
+	}
+
+	// Feed an IPv4 SESSION_CLOSE. Only alpha (inet) must export it.
+	payload := buildSessionCloseRawEventV4(
+		6, // TCP
+		[4]byte{10, 0, 1, 102}, [4]byte{172, 16, 80, 200},
+		12345, 443,
+		[4]byte{172, 16, 80, 8}, 40000,
+		2, 3, // trust -> untrust
+	)
+	if !d.eventReader.ProcessRawEvent(payload) {
+		t.Fatal("ProcessRawEvent rejected a valid SESSION_CLOSE payload")
+	}
+
+	// alpha (the IPv4 instance) must export the flow.
+	if got := waitInstanceFlows(t, b, "alpha"); got < 1 {
+		t.Fatalf("alpha (inet) must export the IPv4 SESSION_CLOSE, got %d flows", got)
+	}
+	// bravo (inet6) must NEVER receive the IPv4 flow. Give the 100ms flush
+	// ticker margin to (incorrectly) transmit before asserting zero — under
+	// the pre-#2462 global-fanout behavior bravo would have exported by now.
+	time.Sleep(300 * time.Millisecond)
+	if got := groupStatsForInstance(b, "bravo"); got != 0 {
+		t.Fatalf("bravo (inet6) must NOT export an IPv4 flow (#2462 isolation); got %d "+
+			"— the callback wrongly fanned a v4 record to the inet6 instance", got)
 	}
 }
 

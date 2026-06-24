@@ -58,7 +58,7 @@ type SamplingDir struct {
 // stays a single cadence across the instance's templates, but two instances
 // never share a counter. Attribution to an instance is by address family:
 // ServesInet / ServesInet6 record which families the instance configured a
-// collector for, and ShouldExportFamily gates a record so an IPv6 flow is
+// collector for, and ServesFamily gates a record so an IPv6 flow is
 // not exported by an instance that configured only inet collectors. Two
 // instances claiming the SAME (version, family) are genuinely ambiguous (no
 // per-interface instance selector exists to attribute a flow) and are
@@ -73,7 +73,7 @@ type ExportConfig struct {
 	SamplingZones       map[uint16]SamplingDir // zone ID -> sampling directions
 	SamplingRate        int                    // 1-in-N sampling (0 = export all)
 	// ServesInet / ServesInet6 record which address families this instance
-	// configured a flow-server for (#2462). ShouldExportFamily uses them to
+	// configured a flow-server for (#2462). ServesFamily uses them to
 	// attribute a flow to the right instance: an instance with only inet
 	// collectors must not export an IPv6 flow. An instance that configured
 	// neither (no flow-servers for this version) produces no ExportConfig at
