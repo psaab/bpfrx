@@ -77,6 +77,16 @@ func buildFilterTermSnapshots(filterName string, filter *config.FirewallFilter, 
 			PolicerName:     term.Policer,
 			RoutingInstance: term.RoutingInstance,
 			ForwardingClass: term.ForwardingClass,
+			// #2544: fall-through. A term whose `then` carries NO terminating
+			// action must apply its modifiers and FALL THROUGH to the next term
+			// (Junos). This covers BOTH the explicit `then next term`
+			// (term.NextTerm set by compileFilterThen) AND a modifier-only term
+			// (Action=="" with only count/log/forwarding-class/policer/dscp).
+			// Junos treats a modifier-only term as an implicit fall-through, so
+			// the signal is uniformly "no terminating action" == fall-through.
+			// A routing-instance (PBR) term is terminating-wise its own decision
+			// and is NOT a fall-through even with an empty Action — leave it.
+			NextTerm: (term.NextTerm || term.Action == "") && term.RoutingInstance == "",
 		}
 		// Source / destination addresses: literal CIDRs PLUS the prefixes
 		// resolved from any `from source-prefix-list` / `destination-prefix-list`

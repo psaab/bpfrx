@@ -548,12 +548,21 @@ type FirewallTermSnapshot struct {
 	DestPorts         []string      `json:"destination_ports,omitempty"`
 	DSCPValues        WireUint8List `json:"dscp_values,omitempty"`
 	Action            string        `json:"action"` // "accept", "discard", "reject"
-	Count             string        `json:"count,omitempty"`
-	Log               bool          `json:"log,omitempty"`
-	PolicerName       string        `json:"policer,omitempty"`
-	RoutingInstance   string        `json:"routing_instance,omitempty"`
-	ForwardingClass   string        `json:"forwarding_class,omitempty"`
-	DSCPRewrite       *uint8        `json:"dscp_rewrite,omitempty"`
+	// NextTerm records `then next term` / a modifier-only term — a term whose
+	// `then` carries NO terminating action (#2544). Such a term must APPLY its
+	// modifiers (count, log, forwarding-class, policer, dscp) and FALL THROUGH
+	// to the next term per Junos semantics, instead of terminating as Accept.
+	// Action is left empty for these terms (the compiler sets NextTerm true);
+	// the Rust evaluator continues to the next term instead of returning. When
+	// false (no fall-through), behavior is unchanged. serde(default) on the Rust
+	// side keeps wire parity with an older Go control plane that omits it (#1961).
+	NextTerm        bool   `json:"next_term,omitempty"`
+	Count           string `json:"count,omitempty"`
+	Log             bool   `json:"log,omitempty"`
+	PolicerName     string `json:"policer,omitempty"`
+	RoutingInstance string `json:"routing_instance,omitempty"`
+	ForwardingClass string `json:"forwarding_class,omitempty"`
+	DSCPRewrite     *uint8 `json:"dscp_rewrite,omitempty"`
 	// Per-packet L4 match conditions (#2362). These are parsed by the Junos
 	// firewall-filter compiler but were previously dropped on the wire, so a
 	// term like `from { tcp-flags syn; }` silently matched broader than

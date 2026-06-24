@@ -43,6 +43,9 @@ fn evaluate_filter_ref_tx_selection_cached_v4(
     dst_port: u16,
     dscp: u8,
 ) -> CachedTxSelectionFilterResult {
+    // #2544: accumulate modifiers across fall-through terms; return on the first
+    // terminating matched term. See merge_matched_cached_modifiers.
+    let mut acc = CachedTxSelectionFilterResult::default();
     for term in &filter.terms {
         if !term_matches_v4(
             term,
@@ -56,19 +59,46 @@ fn evaluate_filter_ref_tx_selection_cached_v4(
         ) {
             continue;
         }
-        return CachedTxSelectionFilterResult {
-            action: term.action,
-            forwarding_class: (!term.forwarding_class.is_empty())
-                .then(|| term.forwarding_class.clone()),
-            dscp_rewrite: term.dscp_rewrite,
-            counter: term.has_count.then(|| term.counter.clone()),
-            three_color_policers: CachedThreeColorPolicers::from_option(
-                term.three_color_policer.clone(),
-            ),
-            log_match: filter_log_match(filter, term),
-        };
+        merge_matched_cached_modifiers(&mut acc, filter, term);
+        if !term.continue_term {
+            acc.action = term.action;
+            return acc;
+        }
     }
-    CachedTxSelectionFilterResult::default()
+    acc
+}
+
+/// #2544: merge a matched term's modifiers into the cached TX-selection result.
+/// Used for both fall-through and terminating matches. Latest matched term wins
+/// for forwarding-class, dscp-rewrite, counter, and log; three-color policers
+/// accumulate via `extend` so a policer on every matched term still meters on
+/// the cached rebuild path. The action is set only by the caller for a
+/// terminating term. NOTE: `counter` holds a single Arc — when multiple matched
+/// fall-through terms each carry `then count`, the cached rebuild path records
+/// only the LAST (a pre-existing structural limit of CachedTxSelectionFilterResult,
+/// unchanged by this fix; the uncached full-eval path counts every term).
+#[inline]
+fn merge_matched_cached_modifiers(
+    acc: &mut CachedTxSelectionFilterResult,
+    filter: &Filter,
+    term: &FilterTerm,
+) {
+    if !term.forwarding_class.is_empty() {
+        acc.forwarding_class = Some(term.forwarding_class.clone());
+    }
+    if term.dscp_rewrite.is_some() {
+        acc.dscp_rewrite = term.dscp_rewrite;
+    }
+    if term.has_count {
+        acc.counter = Some(term.counter.clone());
+    }
+    acc.three_color_policers
+        .extend(CachedThreeColorPolicers::from_option(
+            term.three_color_policer.clone(),
+        ));
+    if let Some(lm) = filter_log_match(filter, term) {
+        acc.log_match = Some(lm);
+    }
 }
 
 fn evaluate_filter_ref_tx_selection_cached_v6(
@@ -80,6 +110,8 @@ fn evaluate_filter_ref_tx_selection_cached_v6(
     dst_port: u16,
     dscp: u8,
 ) -> CachedTxSelectionFilterResult {
+    // #2544: see evaluate_filter_ref_tx_selection_cached_v4.
+    let mut acc = CachedTxSelectionFilterResult::default();
     for term in &filter.terms {
         if !term_matches_v6(
             term,
@@ -93,19 +125,13 @@ fn evaluate_filter_ref_tx_selection_cached_v6(
         ) {
             continue;
         }
-        return CachedTxSelectionFilterResult {
-            action: term.action,
-            forwarding_class: (!term.forwarding_class.is_empty())
-                .then(|| term.forwarding_class.clone()),
-            dscp_rewrite: term.dscp_rewrite,
-            counter: term.has_count.then(|| term.counter.clone()),
-            three_color_policers: CachedThreeColorPolicers::from_option(
-                term.three_color_policer.clone(),
-            ),
-            log_match: filter_log_match(filter, term),
-        };
+        merge_matched_cached_modifiers(&mut acc, filter, term);
+        if !term.continue_term {
+            acc.action = term.action;
+            return acc;
+        }
     }
-    CachedTxSelectionFilterResult::default()
+    acc
 }
 
 fn three_color_policer_semantics_match(
@@ -150,6 +176,11 @@ fn filter_term_semantics_match(old: &FilterTerm, new: &FilterTerm) -> bool {
         && old.icmp_type == new.icmp_type
         && old.icmp_code == new.icmp_code
         && old.action == new.action
+        // #2544: continue_term flips a matched term between terminate-here and
+        // apply-modifiers-and-fall-through WITHOUT changing the parsed match
+        // vecs, so toggling `then next term` on/off must rebuild flow-cache
+        // decisions — compare it here.
+        && old.continue_term == new.continue_term
         && old.count == new.count
         && old.has_count == new.has_count
         && old.log == new.log

@@ -125,6 +125,12 @@ fn evaluate_filter_ref_tx_selection_counted_v4<'a>(
     packet_bytes: u64,
     now_ns: Option<u64>,
 ) -> TxSelectionFilterResult<'a> {
+    // #2544: accumulate modifiers across fall-through terms (forwarding-class,
+    // dscp-rewrite, policer metering + drop, log). A matched fall-through term
+    // applies its modifiers and continues; a matched terminating term applies
+    // its action+modifiers and returns. The policer meter is a side effect that
+    // must run for a fall-through term too, so it is invoked on every match.
+    let mut acc = TxSelectionFilterResult::default();
     for term in &filter.terms {
         if !term_matches_v4(
             term, src_ip, dst_ip, protocol, src_port, dst_port, dscp, extra,
@@ -134,17 +140,43 @@ fn evaluate_filter_ref_tx_selection_counted_v4<'a>(
         if term.has_count {
             record_filter_counter(&term.counter, packet_bytes);
         }
-        let policer_action = apply_term_three_color_policer(term, now_ns, packet_bytes);
-        return TxSelectionFilterResult {
-            action: term.action,
-            forwarding_class: (!term.forwarding_class.is_empty())
-                .then_some(term.forwarding_class.as_ref()),
-            dscp_rewrite: policer_action.dscp_rewrite.or(term.dscp_rewrite),
-            policer_drop: policer_action.drop,
-            log_match: filter_log_match(filter, term),
-        };
+        merge_matched_tx_modifiers(&mut acc, filter, term, now_ns, packet_bytes);
+        if !term.continue_term {
+            acc.action = term.action;
+            return acc;
+        }
     }
-    TxSelectionFilterResult::default()
+    acc
+}
+
+/// #2544: merge a matched term's TX-selection modifiers into the running result.
+/// Invokes the three-color policer meter (a side effect that must run on every
+/// matched term, fall-through or terminating) and folds forwarding-class,
+/// dscp-rewrite, policer drop, and the log diagnostic. Latest matched term wins
+/// for forwarding-class and dscp-rewrite; `policer_drop` is OR'd so any matched
+/// term whose policer drops the packet forces the drop. The
+/// `policer_action.dscp_rewrite.or(term.dscp_rewrite)` precedence (policer wins
+/// over the term's configured rewrite) is preserved per matched term. The action
+/// is set only by the caller for a terminating term.
+#[inline]
+fn merge_matched_tx_modifiers<'a>(
+    acc: &mut TxSelectionFilterResult<'a>,
+    filter: &'a Filter,
+    term: &'a FilterTerm,
+    now_ns: Option<u64>,
+    packet_bytes: u64,
+) {
+    let policer_action = apply_term_three_color_policer(term, now_ns, packet_bytes);
+    if !term.forwarding_class.is_empty() {
+        acc.forwarding_class = Some(term.forwarding_class.as_ref());
+    }
+    if let Some(rewrite) = policer_action.dscp_rewrite.or(term.dscp_rewrite) {
+        acc.dscp_rewrite = Some(rewrite);
+    }
+    acc.policer_drop |= policer_action.drop;
+    if let Some(lm) = filter_log_match(filter, term) {
+        acc.log_match = Some(lm);
+    }
 }
 
 #[inline]
@@ -160,6 +192,8 @@ fn evaluate_filter_ref_tx_selection_counted_v6<'a>(
     packet_bytes: u64,
     now_ns: Option<u64>,
 ) -> TxSelectionFilterResult<'a> {
+    // #2544: see evaluate_filter_ref_tx_selection_counted_v4.
+    let mut acc = TxSelectionFilterResult::default();
     for term in &filter.terms {
         if !term_matches_v6(
             term, src_ip, dst_ip, protocol, src_port, dst_port, dscp, extra,
@@ -169,17 +203,13 @@ fn evaluate_filter_ref_tx_selection_counted_v6<'a>(
         if term.has_count {
             record_filter_counter(&term.counter, packet_bytes);
         }
-        let policer_action = apply_term_three_color_policer(term, now_ns, packet_bytes);
-        return TxSelectionFilterResult {
-            action: term.action,
-            forwarding_class: (!term.forwarding_class.is_empty())
-                .then_some(term.forwarding_class.as_ref()),
-            dscp_rewrite: policer_action.dscp_rewrite.or(term.dscp_rewrite),
-            policer_drop: policer_action.drop,
-            log_match: filter_log_match(filter, term),
-        };
+        merge_matched_tx_modifiers(&mut acc, filter, term, now_ns, packet_bytes);
+        if !term.continue_term {
+            acc.action = term.action;
+            return acc;
+        }
     }
-    TxSelectionFilterResult::default()
+    acc
 }
 
 pub(crate) fn evaluate_interface_filter_tx_selection_counted<'a>(

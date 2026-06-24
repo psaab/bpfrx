@@ -111,6 +111,11 @@ fn evaluate_filter_ref_counted_v4(
     extra: TermMatchExtra,
     packet_bytes: u64,
 ) -> FilterResult {
+    // #2544: accumulate modifiers across fall-through terms. A matched
+    // fall-through term (continue_term) applies its modifiers and continues; a
+    // matched terminating term applies its action+modifiers and returns. If no
+    // term terminates, the accumulated modifiers ride the default Accept.
+    let mut acc = FilterResult::default();
     for term in &filter.terms {
         if !term_matches_v4(
             term, src_ip, dst_ip, protocol, src_port, dst_port, dscp, extra,
@@ -120,17 +125,43 @@ fn evaluate_filter_ref_counted_v4(
         if term.has_count {
             record_filter_counter(&term.counter, packet_bytes);
         }
-        return FilterResult {
-            action: term.action.clone(),
-            dscp_rewrite: term.dscp_rewrite,
-            policer_name: term.policer_name.clone(),
-            routing_instance: term.routing_instance.clone(),
-            forwarding_class: term.forwarding_class.clone(),
-            log: term.log,
-            log_match: filter_log_match(filter, term),
-        };
+        merge_matched_modifiers(&mut acc, filter, term);
+        if !term.continue_term {
+            acc.action = term.action;
+            return acc;
+        }
     }
-    FilterResult::default()
+    acc
+}
+
+/// #2544: merge a matched term's modifiers into the running result. Used by both
+/// the fall-through and terminating cases: count/policer side effects are
+/// recorded by the caller; here we carry the term's dscp-rewrite, policer name,
+/// routing-instance, forwarding-class, and log signal forward. Latest matched
+/// term wins for each scalar modifier (Junos applies modifiers as terms are
+/// traversed); `log` is OR'd so any matched term with `then log` lights it. The
+/// log_match diagnostic tracks the latest matched logging term. The action is
+/// NOT set here — the caller sets it only for a terminating term.
+#[inline]
+fn merge_matched_modifiers(acc: &mut FilterResult, filter: &Filter, term: &FilterTerm) {
+    if term.dscp_rewrite.is_some() {
+        acc.dscp_rewrite = term.dscp_rewrite;
+    }
+    if !term.policer_name.is_empty() {
+        acc.policer_name = term.policer_name.clone();
+    }
+    if !term.routing_instance.is_empty() {
+        acc.routing_instance = term.routing_instance.clone();
+    }
+    if !term.forwarding_class.is_empty() {
+        acc.forwarding_class = term.forwarding_class.clone();
+    }
+    if term.log {
+        acc.log = true;
+    }
+    if let Some(lm) = filter_log_match(filter, term) {
+        acc.log_match = Some(lm);
+    }
 }
 
 #[inline]
@@ -145,6 +176,9 @@ fn evaluate_filter_ref_counted_v6(
     extra: TermMatchExtra,
     packet_bytes: u64,
 ) -> FilterResult {
+    // #2544: see evaluate_filter_ref_counted_v4 — accumulate fall-through
+    // modifiers; return on the first terminating matched term.
+    let mut acc = FilterResult::default();
     for term in &filter.terms {
         if !term_matches_v6(
             term, src_ip, dst_ip, protocol, src_port, dst_port, dscp, extra,
@@ -154,17 +188,13 @@ fn evaluate_filter_ref_counted_v6(
         if term.has_count {
             record_filter_counter(&term.counter, packet_bytes);
         }
-        return FilterResult {
-            action: term.action.clone(),
-            dscp_rewrite: term.dscp_rewrite,
-            policer_name: term.policer_name.clone(),
-            routing_instance: term.routing_instance.clone(),
-            forwarding_class: term.forwarding_class.clone(),
-            log: term.log,
-            log_match: filter_log_match(filter, term),
-        };
+        merge_matched_modifiers(&mut acc, filter, term);
+        if !term.continue_term {
+            acc.action = term.action;
+            return acc;
+        }
     }
-    FilterResult::default()
+    acc
 }
 
 #[inline]
@@ -218,6 +248,11 @@ fn evaluate_filter_ref_non_routing_counted_v4(
     extra: TermMatchExtra,
     packet_bytes: u64,
 ) -> FilterResult {
+    // #2544: accumulate fall-through modifiers (count/log/fc/dscp). A matched
+    // term that points at a routing-instance defers to the routing-instance
+    // evaluator (returns default here, unchanged); such a term is never a
+    // fall-through (continue_term is false when routing_instance is set).
+    let mut acc = FilterResult::default();
     for term in &filter.terms {
         if !term_matches_v4(
             term, src_ip, dst_ip, protocol, src_port, dst_port, dscp, extra,
@@ -230,17 +265,16 @@ fn evaluate_filter_ref_non_routing_counted_v4(
         if term.has_count {
             record_filter_counter(&term.counter, packet_bytes);
         }
-        return FilterResult {
-            action: term.action,
-            dscp_rewrite: term.dscp_rewrite,
-            policer_name: term.policer_name.clone(),
-            routing_instance: String::new(),
-            forwarding_class: term.forwarding_class.clone(),
-            log: term.log,
-            log_match: filter_log_match(filter, term),
-        };
+        merge_matched_modifiers(&mut acc, filter, term);
+        // This loop variant never carries a routing-instance through the
+        // result (it defers to the routing-instance evaluator); keep that.
+        acc.routing_instance = String::new();
+        if !term.continue_term {
+            acc.action = term.action;
+            return acc;
+        }
     }
-    FilterResult::default()
+    acc
 }
 
 #[inline]
@@ -255,6 +289,8 @@ fn evaluate_filter_ref_non_routing_counted_v6(
     extra: TermMatchExtra,
     packet_bytes: u64,
 ) -> FilterResult {
+    // #2544: see evaluate_filter_ref_non_routing_counted_v4.
+    let mut acc = FilterResult::default();
     for term in &filter.terms {
         if !term_matches_v6(
             term, src_ip, dst_ip, protocol, src_port, dst_port, dscp, extra,
@@ -267,17 +303,14 @@ fn evaluate_filter_ref_non_routing_counted_v6(
         if term.has_count {
             record_filter_counter(&term.counter, packet_bytes);
         }
-        return FilterResult {
-            action: term.action,
-            dscp_rewrite: term.dscp_rewrite,
-            policer_name: term.policer_name.clone(),
-            routing_instance: String::new(),
-            forwarding_class: term.forwarding_class.clone(),
-            log: term.log,
-            log_match: filter_log_match(filter, term),
-        };
+        merge_matched_modifiers(&mut acc, filter, term);
+        acc.routing_instance = String::new();
+        if !term.continue_term {
+            acc.action = term.action;
+            return acc;
+        }
     }
-    FilterResult::default()
+    acc
 }
 
 #[inline]
@@ -309,6 +342,15 @@ fn evaluate_filter_ref_routing_instance_counted_v4<'a>(
         }
         if term.has_count {
             record_filter_counter(&term.counter, packet_bytes);
+        }
+        // #2544: a matched fall-through term (no terminating action, no
+        // routing-instance) applies its count modifier above and must NOT halt
+        // the search for a routing-instance term — keep scanning. A matched
+        // TERMINATING term without a routing-instance still halts (returns None
+        // via the `?` below): once a packet is accepted/discarded there is no
+        // routing-instance override to find.
+        if term.continue_term {
+            continue;
         }
         let routing_instance =
             (!term.routing_instance.is_empty()).then_some(term.routing_instance.as_str())?;
@@ -343,6 +385,10 @@ fn evaluate_filter_ref_routing_instance_counted_v6<'a>(
         }
         if term.has_count {
             record_filter_counter(&term.counter, packet_bytes);
+        }
+        // #2544: see the v4 variant — a matched fall-through term keeps scanning.
+        if term.continue_term {
+            continue;
         }
         let routing_instance =
             (!term.routing_instance.is_empty()).then_some(term.routing_instance.as_str())?;
@@ -637,15 +683,31 @@ fn evaluate_filter_ref_log_match(
     if !filter.has_log_terms {
         return None;
     }
-    let first_matching_term = filter.terms.iter().find(|term| {
-        term_matches(
+    // #2544: a matched fall-through term (`then next term` / modifier-only) with
+    // `then log` fires its log even though evaluation continues to later terms.
+    // Walk terms: a matched logging fall-through term emits its log_match; a
+    // matched fall-through term without `log` is skipped (keep scanning for a
+    // later logging/terminating term); the first matched TERMINATING term ends
+    // the scan and emits its log_match (None when it has no `log`), matching the
+    // first-match-wins behavior for terminating terms.
+    for term in &filter.terms {
+        if !term_matches(
             term, src_ip, dst_ip, protocol, src_port, dst_port, dscp, extra,
-        )
-    })?;
-    if skip_routing_instance && !first_matching_term.routing_instance.is_empty() {
-        return None;
+        ) {
+            continue;
+        }
+        if term.continue_term {
+            if term.log {
+                return filter_log_match(filter, term);
+            }
+            continue;
+        }
+        if skip_routing_instance && !term.routing_instance.is_empty() {
+            return None;
+        }
+        return filter_log_match(filter, term);
     }
-    filter_log_match(filter, first_matching_term)
+    None
 }
 
 /// Evaluate the per-interface output filter for a given address family.

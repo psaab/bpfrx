@@ -499,6 +499,7 @@
     "is_fragment": false,
     "log": false,
     "name": "",
+    "next_term": false,
     "policer": "",
     "protocols": [],
     "routing_instance": "",
