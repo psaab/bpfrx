@@ -91,9 +91,20 @@ logging rules, not these specific hot-path constants.
   slots. libxdp masks the slot index against the ring size, so the
   unwrapped sum is correct. (Fixed in #2383 — the prior `base_idx + n`
   indexing was latent because every callsite did exactly one `insert()`
-  per reservation; the #2374 fill-ring suffix retry re-`reserve`s a
+  per reservation; the early-out described below cuts the wasted tail of
+  that retry loop (#2481); the #2374 fill-ring suffix retry re-`reserve`s a
   fresh `WriteFill` per NAPI iteration rather than re-inserting, so it
   never tripped the hazard.)
+- The bringup fill-ring NAPI-trigger loop in `prime_fill_ring_offsets`
+  (`userspace-dp/src/afxdp/bind.rs`) early-outs once the ring is fully
+  primed (`remaining == total`) instead of always running the full
+  `FILL_PRIME_MAX_ITERS` (20) cap (#2481). It still runs **at least one**
+  iteration so the NAPI kick that posts the RX WQEs always fires, and a
+  transiently-full ring keeps retrying the deferred suffix up to the cap;
+  only the wasted tail (up to 19 × 1 ms poll per queue, ~320 ms of
+  avoidable serial bringup latency across 16 queues) is cut. The
+  iteration driver `drive_fill_prime_loop` is a pure seam so the early-out
+  is unit-tested (fail-on-revert) without a bound `DeviceQueue`.
 - `HEARTBEAT_GRACE_PERIOD_NS = 6 s` is defined in
   `userspace-dp/src/afxdp/mod.rs` but currently `#[allow(dead_code)]`
   — reserved for future XDP-shim heartbeat gating logic. Workers
