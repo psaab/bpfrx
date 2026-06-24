@@ -433,6 +433,14 @@ func FormatStatusSummary(status userspace.ProcessStatus) string {
 		fmt.Fprintf(&b, "  Event stream producer:     sent=%d dropped=%d write_stalls=%d replay_evictions=%d\n",
 			status.EventStreamSent, status.EventStreamDropped, status.EventStreamWriteStalls,
 			status.EventStreamReplayEvictions)
+		// #2512: per-kind helper-side budget accounting for the RT_FLOW
+		// SESSION_CLOSE / SESSION_CREATE frames (rate-limiter + queue budget).
+		// Distinct from the consumer-side es.SessionClose* counters below
+		// (which count what the daemon received): these report what the
+		// producer accepted vs. shed under backpressure.
+		fmt.Fprintf(&b, "  Event stream rt_flow:      session_close[sent=%d dropped=%d] session_create[sent=%d dropped=%d]\n",
+			status.EventStreamSessionCloseSent, status.EventStreamSessionCloseDropped,
+			status.EventStreamSessionCreateSent, status.EventStreamSessionCreateDropped)
 		fmt.Fprintf(&b, "  Event stream events:       policy_deny=%d screen_drop=%d screen_alarm=%d filter_log=%d session_close=%d session_create=%d unknown_drops=%d\n",
 			es.PolicyDenyEvents, es.ScreenDropEvents, es.ScreenAlarmEvents, es.FilterLogEvents, es.SessionCloseEvents, es.SessionCreateEvents, es.UnknownFrameDrops)
 		fmt.Fprintf(&b, "  Event stream drops:        policy_deny=%d screen_drop=%d filter_log=%d session_close=%d session_create=%d\n",

@@ -834,9 +834,23 @@ type ProcessStatus struct {
 	// window wrap). It is distinct from ACK-trim (acknowledged-frame removal,
 	// which is NOT a loss and is NOT counted here). JSON tag MUST match the
 	// Rust serde rename(...) exactly.
-	EventStreamReplayEvictions uint64                    `json:"event_stream_replay_evictions,omitempty"`
-	CoSInterfaces              []CoSInterfaceStatus      `json:"cos_interfaces,omitempty"`
-	PolicyRuleCounters         []PolicyRuleCounterStatus `json:"policy_rule_counters,omitempty"`
+	EventStreamReplayEvictions uint64 `json:"event_stream_replay_evictions,omitempty"`
+	// #2512: per-kind producer-side accounting for the RT_FLOW SESSION_CLOSE
+	// (type 14) and SESSION_CREATE (type 15) frames. Before #2512 these were
+	// emitted via a bare `try_send` that bypassed the helper's per-kind rate
+	// limiter, queue budget, and sent/dropped counters, so a dropped
+	// close/create was invisible. _Sent counts frames accepted onto the event
+	// channel; _Dropped sums rate-limited + queue-full + disconnected drops
+	// for that kind. A dropped SESSION_CLOSE loses only one flow-export/syslog
+	// record — the type-2 HA session-sync close delta rides a separate,
+	// never-rate-limited frame, so consumer session state self-heals via the
+	// 1s session sweep. JSON tags MUST match the Rust serde rename(...).
+	EventStreamSessionCloseSent     uint64                    `json:"event_stream_session_close_sent,omitempty"`
+	EventStreamSessionCloseDropped  uint64                    `json:"event_stream_session_close_dropped,omitempty"`
+	EventStreamSessionCreateSent    uint64                    `json:"event_stream_session_create_sent,omitempty"`
+	EventStreamSessionCreateDropped uint64                    `json:"event_stream_session_create_dropped,omitempty"`
+	CoSInterfaces                   []CoSInterfaceStatus      `json:"cos_interfaces,omitempty"`
+	PolicyRuleCounters              []PolicyRuleCounterStatus `json:"policy_rule_counters,omitempty"`
 	// NATRuleCounters carries the userspace dataplane's per-rule SNAT/DNAT/
 	// static-NAT translation hit counters keyed by the compiler-assigned
 	// counter ID (#2218). The Go control plane mirrors these into the legacy
