@@ -4044,6 +4044,52 @@ func TestDHCPRoutesIPv6SuppressedByStaticDefault(t *testing.T) {
 	}
 }
 
+// TestDHCPRoutesIPv4BindInterface verifies that a DHCP-learned IPv4 default
+// route binds to the originating interface when the lease records one,
+// mirroring the IPv6 branch. In multi-WAN / shared-gateway-IP deployments an
+// unbound `ip route 0.0.0.0/0 <gw> 200` leaves the kernel unable to pick the
+// correct egress (#2547). This assertion FAILS against master, which emitted
+// the gateway-only form.
+func TestDHCPRoutesIPv4BindInterface(t *testing.T) {
+	m := New()
+	m.frrConf = filepath.Join(t.TempDir(), "frr.conf")
+	os.WriteFile(m.frrConf, []byte(""), 0644)
+
+	fc := &FullConfig{
+		DHCPRoutes: []DHCPRoute{
+			{Gateway: "10.0.100.1", Interface: "ge-0-0-3"},
+		},
+	}
+	_ = m.ApplyFull(fc)
+	data, _ := os.ReadFile(m.frrConf)
+	got := string(data)
+
+	if !strings.Contains(got, "ip route 0.0.0.0/0 10.0.100.1 ge-0-0-3 200\n") {
+		t.Errorf("DHCP IPv4 default route should bind the originating interface, got:\n%s", got)
+	}
+}
+
+// TestDHCPRoutesIPv4NoInterfaceUnbound verifies backward compatibility: a DHCP
+// IPv4 lease without a recorded interface still renders the gateway-only form.
+func TestDHCPRoutesIPv4NoInterfaceUnbound(t *testing.T) {
+	m := New()
+	m.frrConf = filepath.Join(t.TempDir(), "frr.conf")
+	os.WriteFile(m.frrConf, []byte(""), 0644)
+
+	fc := &FullConfig{
+		DHCPRoutes: []DHCPRoute{
+			{Gateway: "10.0.100.1"},
+		},
+	}
+	_ = m.ApplyFull(fc)
+	data, _ := os.ReadFile(m.frrConf)
+	got := string(data)
+
+	if !strings.Contains(got, "ip route 0.0.0.0/0 10.0.100.1 200\n") {
+		t.Errorf("DHCP IPv4 default without interface should render gateway-only form, got:\n%s", got)
+	}
+}
+
 func TestPerInstanceInet6StaticRoutes(t *testing.T) {
 	m := New()
 	m.frrConf = t.TempDir() + "/frr.conf"
