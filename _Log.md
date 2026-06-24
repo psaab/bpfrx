@@ -31,6 +31,32 @@
 - **Validation**: cargo build --release green; 6 new regression tests pass;
   fail-on-revert proven for all three fixes; full suite 2709 pass / 1 known
   flake (worker_queue concurrent_recovery, passes in isolation).
+## 2026-06-24 — #2610 fix: SNMPv3 USM timeliness/replay protection + engineBoots persistence
+
+- **Timestamp**: 2026-06-24
+- **Action**: #2610 (codex review-041 finding 041-07) — SNMPv3 authenticated
+  requests were accepted on HMAC validation alone; the RFC 3414 §3.2 USM
+  timeliness window was never enforced, so an on-path attacker could replay a
+  captured authenticated PDU. Additionally `engineBoots` reset to 1 every
+  daemon start and `engineTime` was raw process uptime, breaking strict
+  managers and aiding cross-restart replay. FIX: (1) `checkTimeliness` in
+  pkg/snmp/agent.go enforces §3.2 step 7 as the authoritative engine — reject
+  if our boots == 2^31-1, or req boots != our boots, or |our time - req time|
+  > 150s; called after `verifyAuth` in handleV3Packet (pkg/snmp/v3.go). A
+  rejected request gets an authenticated `usmStatsNotInTimeWindows`
+  (1.3.6.1.6.3.15.1.1.2.0) Report PDU carrying our current boots/time so a
+  manager can resync (`buildV3TimelinessReport`). (2) engineBoots is now
+  loaded/incremented/persisted at agent construction to
+  /var/lib/xpf/snmp-engineboots via fsatomic.WriteFileDurable
+  (`loadAndIncrementEngineBoots`); first boot = 1, each restart increments;
+  corrupt/ceiling resets to 1. Path injectable via `NewAgentWithBootsPath`
+  (test seam). Discovery handshake (empty userName →
+  usmStatsUnknownEngineIDs) unchanged. Tests: replay (stale/future/wrong-boots)
+  rejected, in-window/boundary accepted, boots 1→2→3 across simulated restart,
+  first-boot/corrupt handling, discovery still works. fail-on-revert verified
+  (disabling the check turns all replay tests into served responses).
+- **File(s)**: pkg/snmp/agent.go, pkg/snmp/v3.go, pkg/snmp/v3_timeliness_test.go,
+  pkg/snmp/README.md, _Log.md
 
 ## 2026-06-24 — #2606 fix: DHCP relay silently dropped DHCPNAK server responses
 
