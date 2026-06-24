@@ -3552,11 +3552,14 @@ func TestRouteFilterUptoFRR(t *testing.T) {
 
 // TestRouteFilterUpto_MixedFamilyTerm renders a term that mixes a v4
 // "upto" route-filter with a v6 route-filter (SMR #2102 cross-#2071
-// coverage gap). The per-RF prefix-list lines must each be family-
-// correct and FRR-valid: the v4 upto -> "ip ... le 24", the v6 exact ->
-// bare "ipv6 ...". This documents the rendered shape; the single term-
-// level matcher is the pre-existing #2071 homogeneous-family limitation
-// (only RouteFilters[0]'s family is matched), unchanged by the upto fix.
+// coverage gap). As of #2607 a mixed-family route-filter term SPLITS
+// into two route-map sequences — one per family — so BOTH families match
+// (the pre-#2607 single term-level matcher silently dropped one family).
+// The v4 entry lands in the `_v4` per-family list (FRR-valid "ip ... le
+// 24") with its own `match ip address` line; the v6 entry lands in the
+// `_v6` list (bare "ipv6 ...") with its own `match ipv6 address` line.
+// Per-entry seq slots keep each route-filter's ORIGINAL index (v4 at idx
+// 0 → seq 5, v6 at idx 1 → seq 10).
 func TestRouteFilterUpto_MixedFamilyTerm(t *testing.T) {
 	po := &config.PolicyOptionsConfig{
 		PrefixLists: map[string]*config.PrefixList{}, Communities: map[string]*config.CommunityDef{}, ASPaths: map[string]*config.ASPathDef{},
@@ -3574,13 +3577,21 @@ func TestRouteFilterUpto_MixedFamilyTerm(t *testing.T) {
 		},
 	}
 	got := New().generatePolicyOptions(po)
-	// v4 upto renders an FRR-valid bare "le 24" entry.
-	if !strings.Contains(got, "ip prefix-list p-t1 seq 5 permit 10.0.0.0/8 le 24\n") {
+	// v4 upto renders an FRR-valid bare "le 24" entry in the _v4 list.
+	if !strings.Contains(got, "ip prefix-list p-t1_v4 seq 5 permit 10.0.0.0/8 le 24\n") {
 		t.Errorf("v4 upto entry missing/wrong in mixed term:\n%s", got)
 	}
-	// v6 exact renders a bare ipv6 entry (no le/ge).
-	if !strings.Contains(got, "ipv6 prefix-list p-t1 seq 10 permit 2001:db8::/32\n") {
+	// v6 exact renders a bare ipv6 entry (no le/ge) in the _v6 list.
+	if !strings.Contains(got, "ipv6 prefix-list p-t1_v6 seq 10 permit 2001:db8::/32\n") {
 		t.Errorf("v6 exact entry missing/wrong in mixed term:\n%s", got)
+	}
+	// BOTH families are bound — one match line per family, each on its own
+	// route-map sequence (the #2607 fix).
+	if !strings.Contains(got, "match ip address prefix-list p-t1_v4\n") {
+		t.Errorf("v4 match line missing in split mixed term:\n%s", got)
+	}
+	if !strings.Contains(got, "match ipv6 address prefix-list p-t1_v6\n") {
+		t.Errorf("v6 match line missing in split mixed term:\n%s", got)
 	}
 	// No FRR-invalid line: neither a "ge" nor the over-matching "le 32".
 	if strings.Contains(got, "ge ") {
@@ -3588,6 +3599,178 @@ func TestRouteFilterUpto_MixedFamilyTerm(t *testing.T) {
 	}
 	if strings.Contains(got, "10.0.0.0/8 le 32") {
 		t.Errorf("v4 upto must be capped at /24, not the le 32 default, got:\n%s", got)
+	}
+}
+
+// TestPolicyMixedFamilyRouteFilterSplit is the #2607 golden test. A single
+// policy term carrying BOTH IPv4 and IPv6 route-filters (a legitimate
+// dual-stack export/import term) must render so BOTH families match. The
+// pre-#2607 renderer compressed the family into one term-level matchV6 and
+// emitted a SINGLE `match ip|ipv6 address` line; the other family's
+// prefix-list entries were written but never matched (FRR `match ip
+// address` only matches IPv4, `match ipv6 address` only IPv6) → that family
+// silently failed the term. Emitting BOTH match lines in ONE sequence is
+// also wrong: FRR ANDs different match types within a route-map index, so a
+// v4 route NOMATCHes the ipv6 clause and a v6 route NOMATCHes the ip clause
+// → NEITHER matches. The correct structure is TWO route-map SEQUENCES (one
+// per family), each with its own seq, single-family match line over a
+// per-family prefix-list, and the full term body (set/action).
+func TestPolicyMixedFamilyRouteFilterSplit(t *testing.T) {
+	po := &config.PolicyOptionsConfig{
+		PrefixLists: map[string]*config.PrefixList{}, Communities: map[string]*config.CommunityDef{}, ASPaths: map[string]*config.ASPathDef{},
+		PolicyStatements: map[string]*config.PolicyStatement{
+			"DUAL": {Name: "DUAL", Terms: []*config.PolicyTerm{
+				{
+					Name: "t1",
+					RouteFilters: []*config.RouteFilter{
+						{Prefix: "10.0.0.0/8", MatchType: "orlonger"},
+						{Prefix: "2001:db8::/32", MatchType: "orlonger"},
+					},
+					LocalPreference: 200,
+					Action:          "accept",
+				},
+			}, DefaultAction: "reject"},
+		},
+	}
+	got := New().generatePolicyOptions(po)
+
+	// Two route-map permit sequences for the single term (the split), plus
+	// the default-action deny. The single-matcher / both-in-one-sequence
+	// regressions BOTH produce exactly one permit sequence → this count
+	// FAILS on revert.
+	if n := strings.Count(got, "route-map DUAL permit "); n != 2 {
+		t.Fatalf("mixed-family term must emit 2 permit sequences (one per family), got %d:\n%s", n, got)
+	}
+
+	// v4 prefixes live in an `ip prefix-list` (the _v4 per-family list),
+	// bound by `match ip address` in the v4 sequence.
+	wantV4 := []string{
+		"ip prefix-list DUAL-t1_v4 seq 5 permit 10.0.0.0/8 le 32\n",
+		"match ip address prefix-list DUAL-t1_v4\n",
+	}
+	// v6 prefixes live in an `ipv6 prefix-list` (the _v6 list), bound by
+	// `match ipv6 address` in the v6 sequence.
+	wantV6 := []string{
+		"ipv6 prefix-list DUAL-t1_v6 seq 10 permit 2001:db8::/32 le 128\n",
+		"match ipv6 address prefix-list DUAL-t1_v6\n",
+	}
+	for _, w := range append(append([]string{}, wantV4...), wantV6...) {
+		if !strings.Contains(got, w) {
+			t.Errorf("missing %q in mixed-family render:\n%s", w, got)
+		}
+	}
+
+	// The term body (set clause) must be present in BOTH sequences (a route
+	// hits exactly one family sequence, so the action must be on each).
+	if n := strings.Count(got, "set local-preference 200\n"); n != 2 {
+		t.Errorf("set clause must appear in BOTH family sequences, got %d:\n%s", n, got)
+	}
+
+	// FAIL-ON-REVERT: the old single-matchV6 emission put both families'
+	// entries in ONE list named `DUAL-t1` and emitted exactly one match
+	// line (v4, the first family). Neither the combined list name nor a
+	// cross-family match against it may appear.
+	if strings.Contains(got, "prefix-list DUAL-t1 ") || strings.Contains(got, "prefix-list DUAL-t1\n") {
+		t.Errorf("must NOT use the combined single-family list name DUAL-t1 (pre-#2607 bug):\n%s", got)
+	}
+	// The v6 entries must never be referenced by an `ip` (v4) match line,
+	// nor v4 by an `ipv6` match line — the silent-fail the issue reports.
+	if strings.Contains(got, "match ip address prefix-list DUAL-t1_v6") {
+		t.Errorf("v6 list must not be bound by an IPv4 match line:\n%s", got)
+	}
+	if strings.Contains(got, "match ipv6 address prefix-list DUAL-t1_v4") {
+		t.Errorf("v4 list must not be bound by an IPv6 match line:\n%s", got)
+	}
+
+	// Default-action deny follows the two split sequences at seq 30.
+	if !strings.Contains(got, "route-map DUAL deny 30\n") {
+		t.Errorf("default-action deny must follow the split term at seq 30:\n%s", got)
+	}
+}
+
+// TestPolicySingleFamilyRouteFilterUnchanged is the #2607 no-churn control:
+// a homogeneous (single-family) route-filter term must render EXACTLY as
+// before the split — ONE sequence, the historical un-suffixed `<name>-<term>`
+// prefix-list name, ONE match line. This guards the common case against any
+// accidental always-split regression.
+func TestPolicySingleFamilyRouteFilterUnchanged(t *testing.T) {
+	// v4-only term.
+	gotV4 := New().generatePolicyOptions(rfPolicyOptions(
+		&config.RouteFilter{Prefix: "10.0.0.0/8", MatchType: "orlonger"},
+		&config.RouteFilter{Prefix: "172.16.0.0/12", MatchType: "exact"}))
+	if !strings.Contains(gotV4, "ip prefix-list p-t1 seq 5 permit 10.0.0.0/8 le 32\n") {
+		t.Errorf("v4-only term must keep the un-suffixed p-t1 list:\n%s", gotV4)
+	}
+	if !strings.Contains(gotV4, "match ip address prefix-list p-t1\n") {
+		t.Errorf("v4-only term must emit one un-suffixed match line:\n%s", gotV4)
+	}
+	if strings.Contains(gotV4, "p-t1_v4") || strings.Contains(gotV4, "p-t1_v6") {
+		t.Errorf("v4-only term must NOT split into per-family lists:\n%s", gotV4)
+	}
+	if n := strings.Count(gotV4, "route-map p permit "); n != 1 {
+		t.Errorf("v4-only term must render ONE permit sequence, got %d:\n%s", n, gotV4)
+	}
+
+	// v6-only term.
+	gotV6 := New().generatePolicyOptions(rfPolicyOptions(
+		&config.RouteFilter{Prefix: "2001:db8::/32", MatchType: "orlonger"}))
+	if !strings.Contains(gotV6, "ipv6 prefix-list p-t1 seq 5 permit 2001:db8::/32 le 128\n") {
+		t.Errorf("v6-only term must keep the un-suffixed p-t1 list:\n%s", gotV6)
+	}
+	if !strings.Contains(gotV6, "match ipv6 address prefix-list p-t1\n") {
+		t.Errorf("v6-only term must emit one un-suffixed match line:\n%s", gotV6)
+	}
+	if strings.Contains(gotV6, "p-t1_v4") || strings.Contains(gotV6, "p-t1_v6") {
+		t.Errorf("v6-only term must NOT split into per-family lists:\n%s", gotV6)
+	}
+}
+
+// TestPolicyMixedFamilyEndToEnd proves the family split propagates the
+// whole compiler→render path. It uses the hierarchical (brace) config
+// syntax via NewParser rather than the flat-set ParseSetCommand loop: a
+// term legitimately carries MULTIPLE `from route-filter` clauses, but the
+// flat-set AST merges repeated `route-filter` keys (the second `set ...
+// route-filter <p2>` line overwrites the first in tree.SetPath) — a
+// pre-existing AST limitation unrelated to #2607's render-layer fix. The
+// brace parser keeps both route-filters as distinct child nodes, which is
+// the real shape a committed dual-stack policy produces. (The flat-set
+// mandate in CLAUDE.md targets flat-set *token grouping*; here both
+// syntaxes feed the same typed config, and the multi-route-filter-per-term
+// shape only survives the brace path.)
+func TestPolicyMixedFamilyEndToEnd(t *testing.T) {
+	src := `policy-options {
+  policy-statement EXPORT-DUAL {
+    term t1 {
+      from {
+        route-filter 10.0.0.0/8 orlonger;
+        route-filter 2001:db8::/32 orlonger;
+      }
+      then accept;
+    }
+  }
+}`
+	tree, perr := config.NewParser(src).Parse()
+	if len(perr) > 0 {
+		t.Fatalf("parse errors: %v", perr)
+	}
+	cfg, err := config.CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	// Sanity: the compiler kept BOTH route-filters (else the render test
+	// below would be vacuously single-family).
+	if ps := cfg.PolicyOptions.PolicyStatements["EXPORT-DUAL"]; ps == nil || len(ps.Terms) != 1 || len(ps.Terms[0].RouteFilters) != 2 {
+		t.Fatalf("expected one term with two route-filters, got %#v", cfg.PolicyOptions.PolicyStatements["EXPORT-DUAL"])
+	}
+	got := New().generatePolicyOptions(&cfg.PolicyOptions)
+	if n := strings.Count(got, "route-map EXPORT-DUAL permit "); n != 2 {
+		t.Fatalf("compiled dual-stack term must render 2 permit sequences, got %d:\n%s", n, got)
+	}
+	if !strings.Contains(got, "match ip address prefix-list EXPORT-DUAL-t1_v4\n") {
+		t.Errorf("v4 family must be bound after compile+render:\n%s", got)
+	}
+	if !strings.Contains(got, "match ipv6 address prefix-list EXPORT-DUAL-t1_v6\n") {
+		t.Errorf("v6 family must be bound after compile+render:\n%s", got)
 	}
 }
 
@@ -3717,23 +3900,39 @@ func TestRouteFilterLongerFRR(t *testing.T) {
 		}
 	})
 
-	// Mixed family (#2103/#2105 F6): a skipped v4 /32 longer at index 0
-	// followed by a valid v6 entry. The match line family must be derived
-	// from the EMITTED v6 entry — "match ipv6", never "match ip" (which
-	// would reference a v4-namespace list that has zero entries → a
-	// silent wrong-namespace DENY of a legitimate term).
-	t.Run("mixed_family_match_line_follows_emitted_v6", func(t *testing.T) {
+	// Mixed family (#2103/#2105 F6 → #2607): a skipped v4 /32 longer at
+	// index 0 followed by a valid v6 entry. This is a genuinely
+	// mixed-family term, so as of #2607 it SPLITS into a v4 sequence and a
+	// v6 sequence. The v4 sequence carries only the (skipped) /32 longer →
+	// no entry materialises in p-t1_v4, but the fail-closed match line
+	// `match ip address prefix-list p-t1_v4` is still emitted (undefined
+	// list → NOMATCH → DENY for v4 routes). The v6 sequence carries the
+	// /64 orlonger → an `ipv6 prefix-list p-t1_v6` entry plus `match ipv6
+	// address prefix-list p-t1_v6`. The two match lines reference DISJOINT
+	// per-family lists, so neither can pick up an off-family entry.
+	t.Run("mixed_family_splits_into_two_sequences", func(t *testing.T) {
 		got := New().generatePolicyOptions(rfPolicyOptions(
 			&config.RouteFilter{Prefix: "10.0.0.0/32", MatchType: "longer"},
 			&config.RouteFilter{Prefix: "2001:db8::/64", MatchType: "orlonger"}))
-		if !strings.Contains(got, "ipv6 prefix-list p-t1 seq 10 permit 2001:db8::/64 le 128\n") {
-			t.Errorf("v6 orlonger entry missing, got:\n%s", got)
+		if !strings.Contains(got, "ipv6 prefix-list p-t1_v6 seq 10 permit 2001:db8::/64 le 128\n") {
+			t.Errorf("v6 orlonger entry missing in _v6 list, got:\n%s", got)
 		}
-		if !strings.Contains(got, "match ipv6 address prefix-list p-t1\n") {
-			t.Errorf("match line must be 'match ipv6' (from the emitted v6 entry), got:\n%s", got)
+		if !strings.Contains(got, "match ipv6 address prefix-list p-t1_v6\n") {
+			t.Errorf("v6 sequence match line missing, got:\n%s", got)
 		}
-		if strings.Contains(got, "match ip address prefix-list p-t1\n") {
-			t.Errorf("must NOT emit 'match ip' for a v6-only emitted list, got:\n%s", got)
+		// The v4 sequence: all-skipped, but the fail-closed match line is
+		// still emitted against the (undefined, hence NOMATCH) _v4 list.
+		if !strings.Contains(got, "match ip address prefix-list p-t1_v4\n") {
+			t.Errorf("v4 sequence fail-closed match line missing, got:\n%s", got)
+		}
+		// No v4 entry materialises (the /32 longer is the empty set).
+		if strings.Contains(got, "ip prefix-list p-t1_v4 seq") {
+			t.Errorf("skipped /32 longer must NOT materialise a v4 entry, got:\n%s", got)
+		}
+		// Two route-map sequences for the single term (seq 10 and 20),
+		// plus the default-action deny at 30.
+		if n := strings.Count(got, "route-map p permit "); n != 2 {
+			t.Errorf("split mixed term must emit exactly 2 permit sequences, got %d:\n%s", n, got)
 		}
 	})
 }
@@ -3826,18 +4025,25 @@ func TestRouteFilterMalformedPrefixBelt(t *testing.T) {
 		}
 	})
 
-	// A valid v6 prefix alongside a malformed v4-ish index-0 prefix:
-	// only the v6 entry is emitted, and the match line follows the
-	// emitted v6 family.
-	t.Run("malformed_index0_then_valid_v6", func(t *testing.T) {
+	// A valid v6 prefix alongside a malformed "v4-ish" index-0 prefix
+	// ("garbage" has no colon → the family heuristic buckets it v4). As of
+	// #2607 the term is mixed-family (one v4-bucketed, one v6) and SPLITS:
+	// the v4 sequence carries only the skipped "garbage" → no entry, but a
+	// fail-closed `match ip address prefix-list p-t1_v4` line; the v6
+	// sequence carries the valid /64 → an entry in p-t1_v6 plus a
+	// `match ipv6 address prefix-list p-t1_v6` line.
+	t.Run("malformed_index0_then_valid_v6_splits", func(t *testing.T) {
 		got := New().generatePolicyOptions(rfPolicyOptions(
 			&config.RouteFilter{Prefix: "garbage", MatchType: "exact"},
 			&config.RouteFilter{Prefix: "2001:db8::/64", MatchType: "exact"}))
-		if !strings.Contains(got, "ipv6 prefix-list p-t1 seq 10 permit 2001:db8::/64\n") {
-			t.Errorf("valid v6 entry must survive, got:\n%s", got)
+		if !strings.Contains(got, "ipv6 prefix-list p-t1_v6 seq 10 permit 2001:db8::/64\n") {
+			t.Errorf("valid v6 entry must survive in _v6 list, got:\n%s", got)
 		}
-		if !strings.Contains(got, "match ipv6 address prefix-list p-t1\n") {
-			t.Errorf("match line must follow the emitted v6 entry, got:\n%s", got)
+		if !strings.Contains(got, "match ipv6 address prefix-list p-t1_v6\n") {
+			t.Errorf("v6 sequence match line missing, got:\n%s", got)
+		}
+		if !strings.Contains(got, "match ip address prefix-list p-t1_v4\n") {
+			t.Errorf("v4 sequence fail-closed match line missing, got:\n%s", got)
 		}
 		if strings.Contains(got, "permit garbage") {
 			t.Errorf("malformed index-0 prefix must be skipped, got:\n%s", got)
