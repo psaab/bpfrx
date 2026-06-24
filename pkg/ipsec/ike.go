@@ -390,13 +390,17 @@ func dhGroupBits(group int) int {
 //   - Brainpool ECP:     27->ecp224bp, 28->ecp256bp, 29->ecp384bp,
 //     30->ecp512bp
 //   - Montgomery curves: 31->curve25519, 32->curve448
-//   - MODP groups (incl. the MODP-with-prime-order-subgroup variants
-//     22/23/24) fall through to modp<dhGroupBits>.
+//   - MODP-with-prime-order-subgroup (RFC 5114): 22->modp1024s160,
+//     23->modp2048s224, 24->modp2048s256. These have their own keywords
+//     and must NOT fall through to modp<dhGroupBits> — dhGroupBits has no
+//     22/23/24 case, so the fall-through emitted the strongSwan-invalid
+//     tokens modp22/modp23/modp24 and the whole proposal was rejected at
+//     swanctl load (#2604, the sibling of the #2392 ECP fix).
 //
 // The config layer (ValidateDHGroup, pkg/config) accepts any positive
 // integer DH group, so every group an operator can commit must render to
 // a valid keyword here. Any group not in the explicit table above is a
-// MODP group as far as dhGroupBits is concerned and renders as
+// classic MODP group as far as dhGroupBits is concerned and renders as
 // modp<dhGroupBits(group)> (the unchanged pre-#2392 behaviour for the
 // classic MODP groups 1/2/5/14/15/16).
 func formatDHGroup(group int) string {
@@ -423,6 +427,12 @@ func formatDHGroup(group int) string {
 		return "curve25519"
 	case 32:
 		return "curve448"
+	case 22:
+		return "modp1024s160"
+	case 23:
+		return "modp2048s224"
+	case 24:
+		return "modp2048s256"
 	default:
 		return fmt.Sprintf("modp%d", dhGroupBits(group))
 	}

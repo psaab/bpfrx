@@ -185,6 +185,13 @@ func TestFormatDHGroup_ECPandMODP(t *testing.T) {
 		// Montgomery curves.
 		{31, "curve25519"},
 		{32, "curve448"},
+		// MODP-with-prime-order-subgroup (RFC 5114) — the #2604 fix.
+		// Before #2604 these fell through to modp<dhGroupBits>; dhGroupBits
+		// has no 22/23/24 case so they emitted the strongSwan-invalid
+		// tokens modp22/modp23/modp24.
+		{22, "modp1024s160"},
+		{23, "modp2048s224"},
+		{24, "modp2048s256"},
 	}
 	for _, tt := range tests {
 		if got := formatDHGroup(tt.group); got != tt.want {
@@ -192,13 +199,15 @@ func TestFormatDHGroup_ECPandMODP(t *testing.T) {
 		}
 	}
 
-	// Counter-factual: the pre-#2392 formula renders the strongSwan-invalid
-	// modp<bits> token for the EC groups. This proves the fix is load-bearing
-	// (the old code WOULD fail the assertions above) rather than a tautology.
-	for _, g := range []int{19, 20} {
+	// Counter-factual: the pre-fix formula renders the strongSwan-invalid
+	// modp<bits> token. For the EC groups 19/20 this proves the #2392 fix
+	// is load-bearing; for the RFC 5114 groups 22/23/24 it proves the #2604
+	// fix is load-bearing (the old code WOULD fail the assertions above) —
+	// neither is a tautology.
+	for _, g := range []int{19, 20, 22, 23, 24} {
 		old := fmt.Sprintf("modp%d", dhGroupBits(g))
 		if got := formatDHGroup(g); got == old {
-			t.Errorf("formatDHGroup(%d) = %q still matches the pre-#2392 invalid token %q",
+			t.Errorf("formatDHGroup(%d) = %q still matches the pre-fix invalid token %q",
 				g, got, old)
 		}
 	}
@@ -206,8 +215,10 @@ func TestFormatDHGroup_ECPandMODP(t *testing.T) {
 
 // TestProposalBuilders_ECPGroupAcrossAllSites asserts that ALL FOUR
 // proposal render sites route the DH-group suffix through formatDHGroup,
-// so EC groups 19/20/21/31 emit ecp256/ecp384/ecp521/curve25519 (not
-// modp<bits>) and MODP group 14 still emits modp2048 (no regression):
+// so EC groups 19/20/21/31 emit ecp256/ecp384/ecp521/curve25519 and the
+// RFC 5114 groups 22/23/24 emit modp1024s160/modp2048s224/modp2048s256
+// (#2604) — not modp<bits> — and MODP group 14 still emits modp2048 (no
+// regression):
 //
 //  1. buildIKEProposalFromIKE  (IKE proposal object path)
 //  2. buildIKEProposal         (legacy IPsec-proposal-as-IKE path)
@@ -224,6 +235,10 @@ func TestProposalBuilders_ECPGroupAcrossAllSites(t *testing.T) {
 		{20, "ecp384"},
 		{21, "ecp521"},
 		{31, "curve25519"},
+		// RFC 5114 MODP-with-prime-order-subgroup groups — the #2604 fix.
+		{22, "modp1024s160"},
+		{23, "modp2048s224"},
+		{24, "modp2048s256"},
 	}
 
 	for _, gc := range groupCases {
