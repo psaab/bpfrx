@@ -749,6 +749,57 @@ func (m *Manager) generatePolicyOptions(po *config.PolicyOptionsConfig) string {
 						}
 					case "orlonger":
 						// orlonger = this prefix or any more specific (default le 32/128)
+					case "prefix-length-range":
+						// prefix-length-range /low-/high = match any route
+						// whose prefix length is in [low, high] and that falls
+						// under the base prefix. FRR expresses a bounded length
+						// range directly as "ge low le high" (#2525). The
+						// compiler stores the parsed bounds in RangeLow/RangeHigh
+						// (0 when the "/lo-/hi" token was malformed) and
+						// validateRouteFilterMatchTypesStrict has already
+						// rejected an inverted / out-of-range / sub-base range on
+						// the commit path. The lenient load/peer-sync path can
+						// still feed a stored bad range here, so this arm is
+						// belt-and-suspenders: it only emits "ge low le high"
+						// when the bounds are present and FRR-valid
+						// (1<=low<=high<=maxLen), else it skips the entry
+						// (match-nothing, fail-closed) rather than fall through
+						// to the open-ended "le maxLen" default — which would
+						// silently widen the operator's bounded constraint to an
+						// orlonger-style permit (the #2525 bug).
+						maxLen := 32
+						if isV6 {
+							maxLen = 128
+						}
+						if rf.RangeLow >= 1 && rf.RangeLow <= rf.RangeHigh && rf.RangeHigh <= maxLen {
+							matchStr = fmt.Sprintf("ge %d le %d", rf.RangeLow, rf.RangeHigh)
+						} else {
+							skipEntry = true
+						}
+					case "through":
+						// through <prefix2> has no lossless FRR equivalent:
+						// Junos "through" matches the base prefix, prefix2, and
+						// only the prefixes on the direct radix-tree path
+						// between them — NOT every prefix of intermediate
+						// length. FRR prefix-lists can only express length
+						// ranges (ge/le), so any rendering would change the
+						// match set. validateRouteFilterMatchTypesStrict rejects
+						// "through" at commit; only the tolerant load/peer-sync
+						// path can reach the renderer with it. Skip the entry
+						// (match-nothing, fail-closed) rather than silently
+						// emit a wrong / open-ended line (#2525).
+						skipEntry = true
+					default:
+						// Any match-type that is admitted by the schema but not
+						// handled above (a future keyword, or a value that
+						// slipped past validation on a tolerant path) MUST NOT
+						// fall through to the pre-switch open-ended "le maxLen"
+						// default — that silently degrades a constrained match
+						// to an orlonger-style permit (the #2525 fall-through
+						// bug). Skip the entry instead: match-nothing is
+						// fail-closed and the ALWAYS-emitted match line then
+						// resolves to RMAP_NOMATCH (DENY).
+						skipEntry = true
 					case "upto":
 						// upto /N = this prefix or any more specific, but no
 						// longer than /N. FRR renders this as a bare "le N":
