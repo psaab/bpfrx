@@ -91,6 +91,26 @@ all files stay in `package ipsec`, so the public API is unchanged.
   set to make PFS *optional* rather than absent, so the silent weakening is
   a downgrade-to-negotiable-PFS there rather than no-PFS — the fix is the
   same.
+- **DH-group keyword rendering (#2392).** Every IKE/ESP proposal builder
+  (`buildIKEProposalFromIKE`, `buildIKEProposal`, `buildESPProposal`, and
+  the #2073 PFS fallback above) renders the Diffie-Hellman group suffix
+  through the single `formatDHGroup` helper. It emits the canonical
+  swanctl proposal keyword: `modp<bits>` for the MODP groups (1/2/5/14/
+  15/16 and the MODP-with-subgroup variants 22/23/24), and the
+  elliptic-curve spellings for the EC groups — group **19 → `ecp256`**,
+  **20 → `ecp384`**, **21 → `ecp521`**, 25 → `ecp192`, 26 → `ecp224`, the
+  brainpool groups 27→`ecp224bp`/28→`ecp256bp`/29→`ecp384bp`/30→`ecp512bp`,
+  and the Montgomery curves 31 → `curve25519`, 32 → `curve448`. Before the
+  helper, all four sites formatted the suffix as `modp<dhGroupBits>`, so an
+  EC group emitted the strongSwan-invalid tokens `modp256`/`modp384` and
+  swanctl rejected the whole proposal (the tunnel failed to load).
+  `pkg/config` `ValidateDHGroup` accepts any positive-integer DH group, so
+  the helper's table covers every group an operator can commit; an unlisted
+  group falls back to `modp<dhGroupBits>` (which equals the group number
+  for unknown groups). Spellings come straight from strongSwan's
+  `proposal_keywords_static.txt` / `diffie_hellman_group_names`. Live
+  swanctl load-verification of an EC tunnel is lab-bound; the
+  `pkg/ipsec` swanctl-render tests are the gate.
 - **Gateway reference resolution / `remote_addrs` (#2074).** A VPN's
   `ike gateway <name>` either names a defined `security ike gateway`
   object (whose `address` or `dynamic hostname` becomes `remote_addrs`)

@@ -113,22 +113,19 @@ func resolveESPSettings(cfg *config.IPsecConfig, vpn *config.IPsecVPN) (string, 
 			// (The normal-path "sha256128" spelling is a separate
 			// pre-existing concern tracked outside #2073.)
 			//
-			// dhGroupBits maps MODP groups (1/2/5/14/15/16) to their bit
-			// size, so the fallback is a valid modp<bits> token for those.
-			// For the elliptic-curve groups 19/20 it returns 256/384, which
-			// yields modp256/modp384 — a strongSwan-invalid token. That ECP
-			// mis-spelling is a pre-existing, project-wide bug shared by
-			// buildESPProposal / buildIKEProposal on the normal path (they
-			// emit the same modp<bits> for ECP groups); this fallback
-			// inherits it rather than introducing it, and it is tracked as a
-			// separate follow-up outside #2073. MODP PFS groups — the common
-			// case — are preserved correctly.
+			// formatDHGroup renders the PFS group with its canonical
+			// swanctl keyword: modp<bits> for the MODP groups
+			// (1/2/5/14/15/16/...) and the ECP/curve spellings for the
+			// elliptic-curve groups (19->ecp256, 20->ecp384, ...). This
+			// fallback uses the same renderer as the normal-path builders,
+			// so the #2392 ECP fix applies here too — group 19/20 no longer
+			// emits the strongSwan-invalid modp256/modp384 token.
 			if pfsGroup > 0 {
 				slog.Warn("ipsec policy references undefined proposal; "+
 					"preserving configured PFS group on fallback proposal",
 					"policy", vpn.IPsecPolicy, "proposal", propRef,
 					"pfs_group", pfsGroup)
-				return fmt.Sprintf("aes256-sha256-modp%d", dhGroupBits(pfsGroup)), 0
+				return fmt.Sprintf("aes256-sha256-%s", formatDHGroup(pfsGroup)), 0
 			}
 		} else if prop, ok := cfg.Proposals[vpn.IPsecPolicy]; ok {
 			return buildESPProposal(prop, 0), prop.LifetimeSeconds
@@ -284,7 +281,7 @@ func buildIKEProposalFromIKE(prop *config.IKEProposal) string {
 	}
 
 	if prop.DHGroup > 0 {
-		parts = append(parts, fmt.Sprintf("modp%d", dhGroupBits(prop.DHGroup)))
+		parts = append(parts, formatDHGroup(prop.DHGroup))
 	}
 
 	return strings.Join(parts, "-")
@@ -313,7 +310,7 @@ func buildIKEProposal(prop *config.IPsecProposal) string {
 	}
 
 	if prop.DHGroup > 0 {
-		parts = append(parts, fmt.Sprintf("modp%d", dhGroupBits(prop.DHGroup)))
+		parts = append(parts, formatDHGroup(prop.DHGroup))
 	}
 
 	return strings.Join(parts, "-")
@@ -347,7 +344,7 @@ func buildESPProposal(prop *config.IPsecProposal, pfsGroup int) string {
 		dhGroup = pfsGroup
 	}
 	if dhGroup > 0 {
-		parts = append(parts, fmt.Sprintf("modp%d", dhGroupBits(dhGroup)))
+		parts = append(parts, formatDHGroup(dhGroup))
 	}
 
 	return strings.Join(parts, "-")
@@ -373,6 +370,61 @@ func dhGroupBits(group int) int {
 		return 384 // ecp384
 	default:
 		return group
+	}
+}
+
+// formatDHGroup renders a Diffie-Hellman group number as its canonical
+// swanctl proposal keyword. The single source of truth for the suffix in
+// every IKE/ESP proposal builder (#2392): the elliptic-curve groups must
+// emit the strongSwan ECP/curve spellings (ecp256, ecp384, ecp521,
+// curve25519, ...) — NOT modp<bits>. Rendering group 19/20 as
+// modp256/modp384 (what the bare dhGroupBits suffix produced before #2392)
+// is not a token in strongSwan's proposal_keywords table, so the whole
+// proposal is rejected and the tunnel fails to load.
+//
+// The spellings come straight from strongSwan's proposal keyword table
+// (src/libstrongswan/crypto/proposal/proposal.c diffie_hellman_group_names
+// / proposal_keywords_static.txt):
+//   - ECP groups:        19->ecp256, 20->ecp384, 21->ecp521,
+//     25->ecp192, 26->ecp224
+//   - Brainpool ECP:     27->ecp224bp, 28->ecp256bp, 29->ecp384bp,
+//     30->ecp512bp
+//   - Montgomery curves: 31->curve25519, 32->curve448
+//   - MODP groups (incl. the MODP-with-prime-order-subgroup variants
+//     22/23/24) fall through to modp<dhGroupBits>.
+//
+// The config layer (ValidateDHGroup, pkg/config) accepts any positive
+// integer DH group, so every group an operator can commit must render to
+// a valid keyword here. Any group not in the explicit table above is a
+// MODP group as far as dhGroupBits is concerned and renders as
+// modp<dhGroupBits(group)> (the unchanged pre-#2392 behaviour for the
+// classic MODP groups 1/2/5/14/15/16).
+func formatDHGroup(group int) string {
+	switch group {
+	case 19:
+		return "ecp256"
+	case 20:
+		return "ecp384"
+	case 21:
+		return "ecp521"
+	case 25:
+		return "ecp192"
+	case 26:
+		return "ecp224"
+	case 27:
+		return "ecp224bp"
+	case 28:
+		return "ecp256bp"
+	case 29:
+		return "ecp384bp"
+	case 30:
+		return "ecp512bp"
+	case 31:
+		return "curve25519"
+	case 32:
+		return "curve448"
+	default:
+		return fmt.Sprintf("modp%d", dhGroupBits(group))
 	}
 }
 
