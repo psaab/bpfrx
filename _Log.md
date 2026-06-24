@@ -12842,3 +12842,26 @@ top.
   (removing the isDefinedPolicyStatement check → dangling route-map out
   reappears → TestGenerateProtocols_BGPExportUndefinedNoDangling fails). No
   Rust changed.
+
+## 2026-06-24 — #2451 multi-term policy on-match next (FRR render)
+
+- **Timestamp**: 2026-06-24
+- **Action**: Fix multi-term Junos policy-statements rendering as FRR
+  route-map sequences WITHOUT `on-match next`. FRR stops a route-map after
+  the first matching permit sequence runs its `set` clauses, so a policy
+  whose early term does non-terminating modifications (community add,
+  local-preference) and relies on a later term to accept/reject was silently
+  truncated — later terms never ran. Classification keys on
+  `PolicyTerm.Action`: `""` (set-only, no accept/reject) = non-terminating →
+  emit ` on-match next`; `accept` (permit, stop) / `reject` (deny, stop) =
+  terminating → NO on-match next. Falling off the end still hits the
+  policy default-action sequence (preserved).
+- **File(s)**: pkg/frr/policy_render.go (term loop: classify nonTerminating,
+  emit on-match next before exit), pkg/frr/frr_test.go (two new tests:
+  multi-term both-apply + terminating-term regression guard),
+  pkg/frr/README.md (policy_render.go cell), _Log.md.
+- **Validation**: go build ./... OK; go test ./pkg/frr/ ./pkg/config/ PASS;
+  gofmt clean; go vet clean. Fail-on-revert PROVEN — removing the on-match
+  next emission makes term 1 terminating in FRR, term 2 never runs →
+  TestGeneratePolicyOptions_MultiTermOnMatchNext fails (the terminating-term
+  guard still passes). No Rust changed.
