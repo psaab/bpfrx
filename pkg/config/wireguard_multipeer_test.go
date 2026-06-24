@@ -24,6 +24,69 @@ func compileSet(t *testing.T, cmds []string) (*Config, error) {
 	return CompileConfig(tree)
 }
 
+// A bracketed allowed-ips list `allowed-ips [ a b ]` must yield BOTH
+// prefixes. The lexer collapses the bracket onto the leaf's Keys in BOTH
+// AST shapes (#2419), so the value lands as Keys=[allowed-ips a b] with no
+// children — reading only nodeVal kept "a" and silently dropped "b" (a
+// cryptokey-routing hole: traffic for the dropped prefix is not allowed
+// through the peer). This is a fail-on-revert guard for the Keys[1:]
+// accumulation in parseTunnelWireguardPeer. The differential harness CANNOT
+// catch this class because hierarchical and flat-set replay collapse the
+// bracket identically — both were equally broken before the fix.
+func TestWireguardAllowedIPsBracketListFlatSet(t *testing.T) {
+	cfg, err := compileSet(t, []string{
+		"set interfaces wg0 tunnel mode wireguard",
+		"set interfaces wg0 tunnel wireguard private-key " + wgKeyA,
+		"set interfaces wg0 tunnel wireguard peer " + wgKeyB +
+			" allowed-ips [ 10.1.0.0/16 10.2.0.0/16 ]",
+	})
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	tc := wgTunnel(t, cfg, "wg0")
+	if len(tc.WgPeers) != 1 {
+		t.Fatalf("WgPeers = %d, want 1", len(tc.WgPeers))
+	}
+	got := tc.WgPeers[0].AllowedIPs
+	if len(got) != 2 || got[0] != "10.1.0.0/16" || got[1] != "10.2.0.0/16" {
+		t.Errorf("AllowedIPs = %v, want [10.1.0.0/16 10.2.0.0/16] (second prefix dropped without the Keys[1:] fix)", got)
+	}
+}
+
+// Same as above but via hierarchical parse — the bracket collapses onto the
+// leaf Keys identically, confirming the reader handles the unified shape.
+func TestWireguardAllowedIPsBracketListHierarchical(t *testing.T) {
+	src := `interfaces {
+    wg0 {
+        tunnel {
+            mode wireguard;
+            wireguard {
+                private-key ` + wgKeyA + `;
+                peer ` + wgKeyB + ` {
+                    allowed-ips [ 10.1.0.0/16 10.2.0.0/16 ];
+                }
+            }
+        }
+    }
+}`
+	tree, perrs := NewParser(src).Parse()
+	if len(perrs) > 0 {
+		t.Fatalf("parse errors: %v", perrs)
+	}
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	tc := wgTunnel(t, cfg, "wg0")
+	if len(tc.WgPeers) != 1 {
+		t.Fatalf("WgPeers = %d, want 1", len(tc.WgPeers))
+	}
+	got := tc.WgPeers[0].AllowedIPs
+	if len(got) != 2 || got[0] != "10.1.0.0/16" || got[1] != "10.2.0.0/16" {
+		t.Errorf("AllowedIPs = %v, want [10.1.0.0/16 10.2.0.0/16]", got)
+	}
+}
+
 func wgTunnel(t *testing.T, cfg *Config, ifName string) *TunnelConfig {
 	t.Helper()
 	ifc := cfg.Interfaces.Interfaces[ifName]

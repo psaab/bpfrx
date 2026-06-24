@@ -788,6 +788,63 @@ services {
     }
 }`,
 	},
+	{
+		// #2419 fold: static-NAT `from zone` is a multi-value leaf
+		// (schema_security.go zone, multi:true). A bracketed multi-zone
+		// list `from zone [ trust dmz ]` collapses onto the zone leaf's
+		// Keys in flat-set replay; reading only nodeVal in parseZoneList
+		// kept "trust" and dropped "dmz" → ONE StaticNATRuleSet instead of
+		// two (FAIL-OPEN: the dmz rule-set vanished). With the parseZoneList
+		// Keys[1:] fix both shapes compile to TWO StaticNATRuleSets.
+		name: "security-nat-static-multi-zone",
+		hier: `security {
+    nat {
+        static {
+            rule-set rs {
+                from zone [ trust dmz ];
+                rule one-to-one {
+                    match {
+                        destination-address 203.0.113.6/32;
+                    }
+                    then {
+                        static-nat {
+                            prefix {
+                                10.0.1.6/32;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}`,
+	},
+	{
+		// #2419 sibling: WireGuard peer allowed-ips is multi:true. A
+		// bracketed `allowed-ips [ a b ]` collapses onto the leaf's Keys;
+		// reading only nodeVal dropped every prefix but the first. The
+		// Keys[1:] fix in parseTunnelWireguardPeer carries both.
+		name: "interfaces-wireguard-allowed-ips-multi",
+		hier: `interfaces {
+    wg0 {
+        unit 0 {
+            family inet {
+                address 10.10.0.1/24;
+            }
+            tunnel {
+                wireguard {
+                    listen-port 51820;
+                    private-key 0011223344556677889900112233445566778899001122334455667788990011;
+                    peer aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899 {
+                        allowed-ips [ 10.0.0.0/24 192.168.5.0/24 ];
+                        endpoint 198.51.100.1:51820;
+                    }
+                }
+            }
+        }
+    }
+}`,
+	},
 }
 
 // TestDualASTDifferential is the harness entry point. See the file

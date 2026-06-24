@@ -558,8 +558,20 @@ func parseTunnelWireguardPeer(pubkey string, peerNode *Node) WgPeerConfig {
 	for _, prop := range peerNode.Children {
 		switch prop.Name() {
 		case "allowed-ips":
-			if v := nodeVal(prop); v != "" {
-				peer.AllowedIPs = append(peer.AllowedIPs, v)
+			// Multi-value (#2419): a bracketed list `allowed-ips [ a b ]`
+			// collapses every prefix onto prop.Keys[1:] (and older trees may
+			// split it into orphan leaf children). Reading only nodeVal here
+			// kept the first prefix and dropped the rest. Accumulate both
+			// shapes, mirroring firewallMatchValues.
+			for _, k := range prop.Keys[1:] {
+				if k != "" {
+					peer.AllowedIPs = append(peer.AllowedIPs, k)
+				}
+			}
+			for _, vn := range prop.Children {
+				if vn.IsLeaf && len(vn.Keys) >= 1 && vn.Keys[0] != "" {
+					peer.AllowedIPs = append(peer.AllowedIPs, vn.Keys[0])
+				}
 			}
 		case "endpoint":
 			if v := nodeVal(prop); v != "" {

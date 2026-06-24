@@ -13094,3 +13094,7 @@ top.
 - **Timestamp**: 2026-06-24
 - **Action**: Add session_close/session_create events+drops counters to EventStream.Status() DTO, CLI status format, Prometheus enumeration; doc the per-event-type counter surfacing in session-sync-design.md. Sibling #2508 session_create counters had the same gap, surfaced alongside.
 - **File(s)**: pkg/dataplane/userspace/eventstream.go, pkg/dataplane/userspace/protocol.go, pkg/dataplane/userspace/format/status.go, pkg/api/metrics_userspace.go, pkg/dataplane/userspace/eventstream_test.go, pkg/dataplane/userspace/format/status_test.go, pkg/api/metrics_test.go, docs/session-sync-design.md
+
+- **Timestamp**: 2026-06-24
+- **Action**: #2419 fold — parseZoneList now reads each `zone` child's Keys[1:] + orphan-leaf children (mirrors firewallMatchValues) instead of nodeVal-only, fixing the static-NAT multi-zone bracket silent-drop (`from zone [ trust dmz ]` was dropping dmz → FAIL-OPEN NAT, only one StaticNATRuleSet). Same Keys[1:] fix applied to the WireGuard peer allowed-ips reader (`allowed-ips [ a b ]` dropped b — broken pre-#2419, same class). Added dual-AST fixtures + direct WG bracket-list tests (fail-on-revert proven) and a config-schema.md note.
+- **File(s)**: pkg/config/compiler_nat.go, pkg/config/compiler_interfaces.go, pkg/config/dual_ast_differential_test.go, pkg/config/wireguard_multipeer_test.go, docs/config-schema.md

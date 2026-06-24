@@ -94,10 +94,19 @@ MUST read BOTH `child.Keys[1:]` AND `child.Children` and ACCUMULATE — never
 read only `child.Keys[1]`. `firewallMatchValues` (`compiler_firewall.go`) is
 the canonical helper; `parseDNATPortList` (`compiler_nat.go`) and
 `descriptionText` (`compiler_security.go`) parse the unified single-leaf
-shape directly off the node keys. Reading only `Keys[1]` silently drops all
-but the first list value — the #2419 bug class. The flat-set bracket list is
-pinned to the hierarchical shape by `TestFlatSetBracketListMatchesHierarchical`
-in `pkg/config/parser_bracket_list_2419_test.go`.
+shape directly off the node keys. `parseZoneList` (`compiler_nat.go`, the
+static/source/destination-NAT `from`/`to` zone reader) and the WireGuard
+peer `allowed-ips` reader (`parseTunnelWireguardPeer`,
+`compiler_interfaces.go`) also follow the contract — both were silently
+dropping all but the first bracketed value before the #2419 fold (static-NAT
+`from zone [ trust dmz ]` lost the `dmz` rule-set entirely, FAIL-OPEN NAT).
+Reading only `Keys[1]` silently drops all but the first list value — the
+#2419 bug class. The flat-set bracket list is pinned to the hierarchical
+shape by `TestFlatSetBracketListMatchesHierarchical` in
+`pkg/config/parser_bracket_list_2419_test.go`; the static-NAT multi-zone and
+allowed-ips folds are covered by the `security-nat-static-multi-zone` and
+`interfaces-wireguard-allowed-ips-multi` dual-AST fixtures plus
+`TestWireguardAllowedIPsBracketList{FlatSet,Hierarchical}`.
 
 ## How to add a config-mode typed leaf
 
