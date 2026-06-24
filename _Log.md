@@ -1,5 +1,39 @@
 # Action Log
 
+## 2026-06-24 — #2606 fix: DHCP relay silently dropped DHCPNAK server responses
+
+- **Timestamp**: 2026-06-24
+- **Action**: #2606 (agy review-041 finding 041-06) — `handleServerResponses`
+  in pkg/dhcprelay/relay.go accepted only `DHCPOFFER`/`DHCPACK` server replies
+  and `continue`'d on everything else, silently dropping `DHCPNAK`. Per RFC
+  2131 §4.3.2 a server sends NAK to reject a client REQUEST; the client must
+  receive it to abandon negotiation and restart with DISCOVER. Dropping it at
+  the relay made clients hang until their retransmission timeout. FIX: (1)
+  added `dhcpv4.MessageTypeNak` to the accepted server-response set (switch
+  over msgType). (2) Added a NAK-first branch in `deliverReply` that FORCE-
+  broadcasts the NAK to 255.255.255.255:68 ahead of the #2076 destination
+  matrix. Rationale: a NAK carries no binding (yiaddr==0) so there is no
+  address to raw-L2/UDP unicast to, and force-broadcasting prevents a server
+  that erroneously echoes a stale ciaddr from steering the matrix into a UDP
+  unicast to an address the client does not own. New counter
+  `RepliesBroadcastNak` (atomic + RelayStats field + `show ... dhcp-relay`
+  column in pkg/cli/cli_show_services.go) records the NAK-broadcast reason.
+  giaddr/xid/chaddr handling is unchanged (the existing reply path zeroes
+  giaddr for the last hop and copies the rest verbatim). Tests:
+  TestDeliverReply_Nak_AlwaysBroadcast (flag-clear, flag-set, and stale-ciaddr
+  defense-in-depth cases — all broadcast, never L2, never ciaddr-unicast) and
+  TestHandleServerResponses_NakForwarded (end-to-end: a NAK fed through the
+  server conn IS written to the client conn at broadcast). Validation: gofmt
+  -w clean, go vet ./pkg/dhcprelay/... clean (pre-existing cli.go:441
+  unreachable-code vet note is unrelated), go test ./pkg/dhcprelay/...
+  ./pkg/cli/... PASS. Fail-on-revert PROVEN: removing MessageTypeNak from the
+  accepted set makes TestHandleServerResponses_NakForwarded red (0 writes,
+  want 1). Live relay verify is lab-bound; the unit tests are the gate. Doc:
+  pkg/dhcprelay/README.md (relayed-types table + reply matrix + NAK section +
+  counter list).
+- **File(s)**: pkg/dhcprelay/relay.go, pkg/dhcprelay/delivery_test.go,
+  pkg/cli/cli_show_services.go, pkg/dhcprelay/README.md, _Log.md
+
 ## 2026-06-24 — #2593 fix: SESSION_OPEN standard RT_FLOW line rendered `action=deny`
 
 - **Timestamp**: 2026-06-24
@@ -13212,3 +13246,5 @@ top.
 - **Timestamp**: 2026-06-24
 - **Action**: #2607 — `generatePolicyOptions` (pkg/frr/policy_render.go) rendered a Junos policy-statement term's route-filters into an FRR route-map by compressing the address family into ONE term-level `matchV6` boolean (set from the first parseable/emitted route-filter) and emitting EXACTLY ONE of `match ip address prefix-list <name>` / `match ipv6 address prefix-list <name>`. A single term can legitimately MIX v4 and v6 route-filters (dual-stack export/import); the compressed renderer bound only ONE family to the route-map, so the other family's prefix-list entries were written into the (separate FRR namespace) but NEVER matched → those routes silently failed the term (routing asymmetry / prefix blackholing, no commit error). FRR SEMANTICS DETERMINATION: emitting BOTH match lines in ONE sequence is WRONG — FRR ANDs match clauses of DIFFERENT types within a single route-map index (lib/routemap.c route_map_apply_match invokes every match rule with no AF pre-filter; `match ip address` and `match ipv6 address` are distinct rule types), so a v4 route NOMATCHes the ipv6 clause and a v6 route NOMATCHes the ip clause → MATCH+NOMATCH=NOMATCH ANDs the index to a silent deny for BOTH families. (Same AND finding that drove #2071's single-matcher decision, verified against FRR source.) FIX = TWO SEPARATE route-map SEQUENCES, one per family, each with its own seq slot, a single-family match line over a per-family list (`<policy>-<term>_v4` / `_v6`), and the FULL term body (set/action + on-match next when non-terminating). A co-resident `from prefix-list` match clause is emitted ONLY in the sequence whose family matches the referenced list (avoids the #2071 co-resident off-family AND-NOMATCH by construction). Homogeneous/empty route-filter terms render UNCHANGED — ONE sequence, historical un-suffixed list name, byte-identical (no churn). Per-entry seq slots keep each route-filter's ORIGINAL index across the split (FRR-legal gaps where the other family sits). Implementation: extracted renderRouteFilterEntry (the per-entry ge/le switch, behavior-preserving) + partitionRouteFiltersByFamily (indexed buckets) + an emitTermBody closure parameterized by seqFam (""/v4/v6). Validation: go build ./... + go vet ./pkg/frr clean; gofmt clean; go test ./pkg/frr ./pkg/config green. Golden TestPolicyMixedFamilyRouteFilterSplit (2 sequences, v4→ip prefix-list+match ip, v6→ipv6 prefix-list+match ipv6, set clause in BOTH, no combined `<name>` list); TestPolicySingleFamilyRouteFilterUnchanged (v4-only/v6-only → ONE sequence, un-suffixed list, no _v4/_v6); TestPolicyMixedFamilyEndToEnd (brace-parse compile→render, 2 RFs survive). Updated 3 pre-existing tests that documented the OLD single-matcher limitation as accepted (TestRouteFilterUpto_MixedFamilyTerm, TestRouteFilterLongerFRR/mixed_family*, TestRouteFilterMalformedPrefixBelt/malformed_index0_then_valid_v6) to the new split shape. FAIL-ON-REVERT PROVEN: forcing the mixed branch off (single-matchV6 behavior) reds all 3 mixed-family tests; restored→green. NOTE: the flat-set path collapses repeated `route-filter <prefix>` keys (second `set` line overwrites first in tree.SetPath) — a pre-existing AST limitation unrelated to this render fix; e2e test uses the brace parser which keeps both RFs. Docs: pkg/frr/README.md policy_render.go row (#2607 mixed-family split paragraph).
 - **File(s)**: pkg/frr/policy_render.go, pkg/frr/frr_test.go, pkg/frr/README.md, _Log.md
+- **Action**: #2604 — IPsec DH groups 22/23/24 (RFC 5114 MODP-with-prime-order-subgroup, supported by Junos/vSRX) rendered as the strongSwan-invalid tokens modp22/modp23/modp24 in `formatDHGroup` (pkg/ipsec/ike.go). dhGroupBits has no 22/23/24 case so the `default: modp<dhGroupBits>` fall-through emitted the group number verbatim; strongSwan rejects the whole swanctl proposal → tunnel never establishes (config commits cleanly). Sibling of the merged #2392 (ECP 19/20/21/... fix). FIX: added explicit cases 22->modp1024s160, 23->modp2048s224, 24->modp2048s256 (canonical strongSwan keywords, verified against the strongSwan IKEv2 cipher-suite keyword table: group 22 = 1024-bit MODP / 160-bit prime-order subgroup, 23 = 2048/224, 24 = 2048/256). Updated the formatDHGroup doc-comment (the canonical rendered-token mapping doc) from "22/23/24 fall through to modp<dhGroupBits>" to the explicit RFC 5114 keyword mapping. ValidateDHGroup accepts any positive integer (no enumerated supported-group list to update); config-schema.md DH-group section is validation/spelling, not token rendering, so unchanged. Tests: extended TestFormatDHGroup_ECPandMODP (+22/23/24 + counter-factual loop now covers 22/23/24) and TestProposalBuilders_ECPGroupAcrossAllSites (the same 4 sites #2392 covered: buildIKEProposalFromIKE / buildIKEProposal / buildESPProposal / buildESPProposal-PFS-override / resolveESPSettings PFS fallback). Validation: gofmt -w clean, go vet clean, go test ./pkg/ipsec/... PASS. Fail-on-revert PROVEN (temp-removed the 3 cases): formatDHGroup(22/23/24) reverts to modp22/modp23/modp24 → reds both render assertions and the counter-factual block; restored to green. Live strongSwan swanctl load-verify is lab-bound — the render test is the gate.
+- **File(s)**: pkg/ipsec/ike.go, pkg/ipsec/swanctl_render_test.go, _Log.md

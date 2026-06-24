@@ -38,7 +38,7 @@ carries server-bound options, per RFC 2131 §3.4:
 | `INFORM` | yes (#2153) | client already holds an address, asks only for supplemental parameters (DNS/domain/NTP) |
 | `DECLINE` | no | broadcast by the client on address conflict (RFC 2131 §4.4); not relayed (out of scope for #2153) |
 | `RELEASE` | no | unicast by the client to its bound server; no relay-agent obligation |
-| server reply types (`OFFER`/`ACK`/`NAK`) | n/a | not client-originated; the client→server gate never sees them. The reverse server→client path (`handleServerResponses`) forwards `OFFER` and `ACK` only — see the reply matrix below |
+| server reply types (`OFFER`/`ACK`/`NAK`) | n/a | not client-originated; the client→server gate never sees them. The reverse server→client path (`handleServerResponses`) forwards `OFFER`, `ACK`, and `NAK` (#2606) — see the reply matrix below |
 
 The `INFORM` reply (a server-issued `ACK` with no `yiaddr` but a real
 `ciaddr`) is delivered by the matrix below via the "flag clear, `yiaddr==0`,
@@ -47,17 +47,29 @@ its address.
 
 ## Reply delivery model (#2076)
 
-Server replies (OFFER/ACK) are delivered to clients honoring the RFC 2131
+Server replies (OFFER/ACK/NAK) are delivered to clients honoring the RFC 2131
 §4.1 broadcast flag:
 
 | Condition | Delivery |
 |-----------|----------|
+| message type `DHCPNAK` (#2606) | **always broadcast** `255.255.255.255:68` (RFC 2131 §4.3.2; checked first, ignores the flag/yiaddr/ciaddr) |
 | `overrides always-broadcast` set | broadcast `255.255.255.255:68` (operator override wins) |
 | broadcast flag **set** | broadcast `255.255.255.255:68` |
 | flag **clear**, real `yiaddr` | **raw-L2 unicast** to `chaddr` + `yiaddr` |
 | flag **clear**, `yiaddr==0`, real `ciaddr` | UDP-unicast to `ciaddr` (client already owns the IP) |
 | flag **clear**, no `yiaddr`/`ciaddr` | broadcast (nothing routable) |
 | raw-L2 path unavailable/fails | broadcast fallback (always works) |
+
+**DHCPNAK (#2606).** A server sends `DHCPNAK` to reject a client's `REQUEST`
+(e.g. the requested address is already leased, or the client moved subnets).
+On receiving it the client immediately abandons negotiation and restarts with
+a fresh `DISCOVER`. Before #2606 `handleServerResponses` accepted only
+`OFFER`/`ACK`, so NAKs were silently dropped and clients hung until their
+retransmission timeout. The NAK is now forwarded, and it is **force-broadcast**
+ahead of the matrix above: a NAK carries no binding (`yiaddr==0`), the client
+has no usable address, and broadcasting also prevents a server that
+erroneously echoes a stale `ciaddr` from steering the NAK into a UDP unicast to
+an address the client does not own.
 
 **Why raw L2 (`l2send_linux.go`).** A client in SELECTING/REQUESTING that
 clears the broadcast flag has **not yet configured** the offered address,
@@ -88,7 +100,7 @@ RFC 768).
 - **Counters.** `Stats()` exposes a per-reason breakdown
   (`RepliesL2Unicast`, `RepliesUnicastCiaddr`, `RepliesBroadcastFlag1`,
   `RepliesBroadcastForced`, `RepliesBroadcastNoTarget`,
-  `RepliesBroadcastL2Fallback`). **`RepliesBroadcastL2Fallback` is the one
+  `RepliesBroadcastL2Fallback`, `RepliesBroadcastNak`). **`RepliesBroadcastL2Fallback` is the one
   to alert on** — it means the raw-L2 path failed (CAP_NET_RAW, driver, or
   MTU) and the relay degraded to broadcast. `show ... dhcp-relay` prints
   this breakdown.
