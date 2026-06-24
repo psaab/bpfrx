@@ -120,6 +120,23 @@ set services rpm probe WAN test wan-a thresholds successive-loss 3
     the zone (id/seq already disambiguate the exchange, and the kernel may
     not populate the reply's zone). The send-side zone is the correctness
     fix; the reply-match stays zone-agnostic by design.
+- **http-get targets are http/https only (#2495).** An `http-get` test's
+  `target` may be a bare hostname, IP literal, or `host:port` (the prober
+  prepends the default `http://`), or it may carry an explicit `http://`
+  or `https://` scheme. A scheme is detected by the `://` separator, so a
+  bare `host:port` is correctly treated as schemeless — never mistaken for
+  a scheme. The previous canonicalizer used a first-character heuristic
+  (prefix `http://` only when the target did **not** start with `h`), which
+  wrongly assumed any `h`-leading bare host (`host.example.com`, `h2.lan`)
+  was already schemed; the resulting schemeless URL was rejected by the
+  HTTP client before a packet was sent, so a healthy `h`-host probe never
+  ran. A target carrying any other scheme (`ftp://`, `gopher://`) is
+  **rejected at commit** (`validateRPMHTTPGetSchemeStrict`) — only http and
+  https are meaningful for an http-get probe. On the tolerant load /
+  peer-sync path the rejection is downgraded to a warning (#1960 no-brick);
+  the runtime `canonicalizeHTTPTarget` guard returns the same error for the
+  bad scheme, so the test **holds state** rather than actuating off a probe
+  that can never run.
 - Probe config re-applies on commit, gated on the rendered RPM stanza
   hash — unrelated commits never reset probe state.
 - **Environment errors never move routes**: a probe-socket setup
