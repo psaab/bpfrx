@@ -32,7 +32,7 @@ pub(super) fn populate_interfaces(
     state: &mut ForwardingState,
     excluded_local_v4: &FastSet<Ipv4Addr>,
     excluded_local_v6: &FastSet<Ipv6Addr>,
-) -> IfaceIndex {
+) -> Result<IfaceIndex, crate::policy::SnapshotIntegrityError> {
     let mut name_to_ifindex = BTreeMap::new();
     let mut linux_to_ifindex = BTreeMap::new();
     let mut mac_by_ifindex = BTreeMap::new();
@@ -57,9 +57,22 @@ pub(super) fn populate_interfaces(
         if !iface.zone.is_empty() {
             // #921: resolve zone NAME → u16 once at config build, so
             // every read on the hot path is one HashMap lookup
-            // (ifindex → u16). Unknown / dropped zones map to 0 (the
-            // canonical "unknown" sentinel).
-            let zone_id = state.zone_name_to_id.get(&iface.zone).copied().unwrap_or(0);
+            // (ifindex → u16).
+            // #2391: a non-empty zone NAME that is not in the zone table
+            // (dropped at populate_zones for a u8-overflow id, or a
+            // version-drifted/hostile snapshot) must FAIL CLOSED instead of
+            // collapsing to zone 0 — collapsing bypasses every zone-pair policy
+            // (fail-open under a permit default). The Go commit-time cap is the
+            // primary gate; this is the helper-boundary backstop.
+            let zone_id = match state.zone_name_to_id.get(&iface.zone).copied() {
+                Some(id) => id,
+                None => {
+                    return Err(crate::policy::SnapshotIntegrityError::InterfaceUnknownZone {
+                        interface: iface.name.clone(),
+                        zone: iface.zone.clone(),
+                    });
+                }
+            };
             state.ifindex_to_zone_id.insert(iface.ifindex, zone_id);
             if iface.parent_ifindex > 0 {
                 match state.ifindex_to_zone_id.get(&iface.parent_ifindex) {
@@ -116,18 +129,18 @@ pub(super) fn populate_interfaces(
         }
     }
 
-    IfaceIndex {
+    Ok(IfaceIndex {
         name_to_ifindex,
         linux_to_ifindex,
         mac_by_ifindex,
-    }
+    })
 }
 
 pub(super) fn populate_egress(
     snapshot: &ConfigSnapshot,
     state: &mut ForwardingState,
     iface_ctx: &IfaceIndex,
-) {
+) -> Result<(), crate::policy::SnapshotIntegrityError> {
     for iface in &snapshot.interfaces {
         if iface.ifindex <= 0 {
             continue;
@@ -155,9 +168,23 @@ pub(super) fn populate_egress(
             Some(mac) => mac,
             None => continue,
         };
-        // #921: resolve zone name → u16 at build time. 0 for
-        // unknown / dropped zones (consistent with ifindex_to_zone_id).
-        let zone_id = state.zone_name_to_id.get(&iface.zone).copied().unwrap_or(0);
+        // #921: resolve zone name → u16 at build time.
+        // #2391: a non-empty zone name absent from the zone table fails CLOSED
+        // (consistent with populate_interfaces); an empty zone (unzoned
+        // interface) maps to 0, the legitimate "no zone" case.
+        let zone_id = if iface.zone.is_empty() {
+            0
+        } else {
+            match state.zone_name_to_id.get(&iface.zone).copied() {
+                Some(id) => id,
+                None => {
+                    return Err(crate::policy::SnapshotIntegrityError::InterfaceUnknownZone {
+                        interface: iface.name.clone(),
+                        zone: iface.zone.clone(),
+                    });
+                }
+            }
+        };
         state.egress.insert(
             iface.ifindex,
             EgressInterface {
@@ -172,6 +199,7 @@ pub(super) fn populate_egress(
             },
         );
     }
+    Ok(())
 }
 
 pub(in crate::afxdp) fn pick_interface_v4(iface: &InterfaceSnapshot) -> Option<Ipv4Addr> {

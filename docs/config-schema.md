@@ -613,6 +613,61 @@ an undefined from-zone and to-zone, `TestPolicySpecialZoneTokensCommit` —
 `any`/`junos-host`/global anti-over-reject, `TestPolicyDefinedZonesCommit`,
 `TestPolicyUndefinedZoneLenientDowngradesToWarning`).
 
+### #2391 — Security-zone count cap (commit fail-closed)
+
+Security-zone ids are assigned sequentially `1..N` over the sorted zone names
+(`pkg/dataplane/compiler.go`) and reach the live AF_XDP userspace dataplane two
+ways: as the per-flow ingress/egress zone in the event-stream wire record (a
+**u8** field — `userspace-dp/src/event_stream/codec.rs`, `"[21] IngressZoneID
+u8"`) and as the zone-table key in the forwarding snapshot. The forwarding
+builder (`userspace-dp/src/afxdp/forwarding_build/zones.rs`) rejects any zone id
+`>= ZONE_ID_RESERVED_MIN` (`u16::MAX-1`, reserved for the
+`JUNOS_GLOBAL_ZONE_ID` sentinel) and any id `> u8::MAX`. The binding constraint
+is therefore the **u8 wire field**, not the reserved sentinel: the usable range
+is `[1, min(255, ZONE_ID_RESERVED_MIN-1)] = [1, 255]`, so the cap is
+**`MaxUsableZoneID = 255`**. With more than 255 zones the 256th+ ids overflowed
+the u8 field, the builder dropped those zones, and every interface referencing a
+dropped zone silently collapsed to zone 0 ("unknown") — a silent
+fail-open/fail-closed mis-attribution instead of a commit rejection.
+
+**`validateZoneCountStrict`** (`compiler_validate_strict.go`) is the PRIMARY
+gate: it hard-rejects any config defining more than `MaxUsableZoneID` security
+zones. Bounding `N` at the cap guarantees no out-of-range id is ever produced,
+so the dataplane's defense-in-depth skip path is never reached for a clean
+commit.
+
+**Rust fail-closed backstop (load-bearing for unknown-name references).**
+`populate_interfaces` / `populate_egress`
+(`userspace-dp/src/afxdp/forwarding_build/interfaces.rs`) previously resolved a
+missing zone NAME to `zone_id == 0` via `unwrap_or(0)`. They now return
+`SnapshotIntegrityError::InterfaceUnknownZone` when an interface names a
+non-empty zone absent from the zone table, so the snapshot load fails closed
+(the apply preflight keeps the previous good state) rather than collapsing the
+interface to "unknown". An interface with NO zone (empty string) stays the
+legitimate "unzoned" case mapping to 0. This is load-bearing because the Go cap
+only bounds the COUNT — it does not catch a version-drifted or hostile snapshot
+whose interface references a zone name the snapshot never defines.
+
+**Strict/lenient split (flag `lenientZoneCount`):** strict on the
+commit / commit-check path (`CompileConfig` — hard-reject), downgraded to a
+`cfg.Warnings` entry on the tolerant load / peer-sync paths
+(`CompileConfigLenient` / `CompileConfigForNodeLenient`) so an
+already-persisted or peer-synced over-cap config that an older binary accepted
+still BOOTS (#1960 fail-closed-on-load doctrine) — the dataplane fails closed on
+every overflowing zone, so a leniently-loaded over-cap config is inert (the
+overflow zones do not forward). The gate runs AFTER
+`validatePolicyZoneReferencesStrict`, mirroring the sibling fail-open
+validators, so a structural error and a bad zone reference still win the
+first-error slot. Regression coverage: `pkg/config/zone_count_cap_test.go`
+(`TestZoneCountOverCapFailsCommit` — fail-on-revert guard,
+`TestZoneCountAtCapCommits` — inclusive boundary anti-over-reject,
+`TestZoneCountNormalConfigUnaffected`,
+`TestZoneCountOverCapLenientDowngradesToWarning`) and the Rust
+`interface_pointing_at_skipped_zone_fails_closed`,
+`interface_with_unknown_zone_name_fails_closed`,
+`interface_with_empty_zone_builds_with_zone_zero` tests in
+`userspace-dp/src/afxdp/forwarding_build/tests.rs`.
+
 ### #2399 — firewall-filter unknown `then` action + unsupported `from protocol` (commit fail-closed)
 
 Two fail-OPEN behaviors in the firewall-filter compiler, both now rejected

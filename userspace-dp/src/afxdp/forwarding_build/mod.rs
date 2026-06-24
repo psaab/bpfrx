@@ -185,8 +185,8 @@ pub(super) fn build_forwarding_state_with_policy_counters_and_previous(
         &mut state,
         &excluded_local_v4,
         &excluded_local_v6,
-    );
-    interfaces::populate_egress(snapshot, &mut state, &iface_ctx);
+    )?;
+    interfaces::populate_egress(snapshot, &mut state, &iface_ctx)?;
 
     fib::sort_connected(&mut state);
     fib::populate_routes(snapshot, &mut state, &iface_ctx);

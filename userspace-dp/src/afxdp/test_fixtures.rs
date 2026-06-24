@@ -232,6 +232,12 @@ pub(super) fn native_gre_pbr_snapshot(include_neighbor: bool) -> ConfigSnapshot 
 
 pub(super) fn forwarding_snapshot_with_next_table(include_neighbor: bool) -> ConfigSnapshot {
     ConfigSnapshot {
+        // #2391: the interface references "wan"; define it so the forwarding
+        // build does not fail closed (InterfaceUnknownZone).
+        zones: vec![ZoneSnapshot {
+            name: "wan".to_string(),
+            id: TEST_WAN_ZONE_ID,
+        }],
         interfaces: vec![InterfaceSnapshot {
             name: "ge-0/0/0.50".to_string(),
             zone: "wan".to_string(),
@@ -498,6 +504,22 @@ pub(super) fn nat_snapshot_with_fabric() -> ConfigSnapshot {
 
 pub(super) fn policy_deny_snapshot() -> ConfigSnapshot {
     ConfigSnapshot {
+        // #2391: interfaces below reference "lan"/"wan"; the zone table must
+        // define them or the forwarding build fails closed (InterfaceUnknownZone).
+        zones: vec![
+            ZoneSnapshot {
+                name: "lan".to_string(),
+                id: TEST_LAN_ZONE_ID,
+            },
+            ZoneSnapshot {
+                name: "wan".to_string(),
+                id: TEST_WAN_ZONE_ID,
+            },
+            ZoneSnapshot {
+                name: "dmz".to_string(),
+                id: TEST_DMZ_ZONE_ID,
+            },
+        ],
         interfaces: vec![
             InterfaceSnapshot {
                 name: "reth1.0".to_string(),
