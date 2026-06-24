@@ -176,15 +176,24 @@ func TestIsUsableIPsecEndpoint(t *testing.T) {
 		{"2001:db8::1", true},
 		{"peer.example.com", true},
 		{"a.b", true},
-		{"vpnpeer", false},   // dotless single-label name (Rule A)
-		{"typo-gw", false},   // dotless object-name typo
+		{"vpnpeer", false}, // dotless single-label name (Rule A)
+		{"typo-gw", false}, // dotless object-name typo
 		{"gw_underscore", false},
 		{"-bad.example.com", false}, // leading hyphen label
 		{"bad-.example.com", false}, // trailing hyphen label
 		{".example.com", false},     // empty leading label
-		{"example.com.", false},     // trailing dot / empty last label
 		{"a..b", false},             // empty middle label
 		{"has space.com", false},
+		// Absolute FQDN with a single trailing dot is valid (Junos
+		// accepts it; the terminal dot is the absolute-root marker, not
+		// an empty last label).
+		{"vpn.example.com.", true},
+		{"example.com.", true},
+		// ...but the single trailing dot must be the ONLY relaxation:
+		{"example.com..", false},    // double trailing dot => empty last label
+		{".", false},                // only a dot
+		{"vpn..example.com", false}, // interior empty label
+		{"vpn.bad-.", false},        // trailing dot, last real label ends with hyphen
 	}
 	for _, c := range cases {
 		if got := IsUsableIPsecEndpoint(c.in); got != c.want {
