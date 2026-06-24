@@ -446,6 +446,59 @@ supported; an unrecognized token yields no constraint rather than a match-all.
 Named `icmp-type`/`icmp-code` aliases (e.g. `echo-request`) are likewise not
 parsed — numeric values only.
 
+`from source-prefix-list <name>` / `destination-prefix-list <name>` (with the
+optional `except` modifier) is wired end-to-end to the userspace dataplane
+(#2506). Earlier the references were parsed into `config.FirewallFilterTerm`,
+counted in this list, and pinned by tests, but the userspace snapshot builder
+DROPPED them entirely — a term scoped by a prefix-list reached the dataplane
+with NO source/destination address constraint, so e.g. `from
+source-prefix-list mgmt except; then discard` became discard-ALL (fail-open for
+accept/PBR, fail-closed for discard/reject — action-dependent). The Go snapshot
+builder now RESOLVES each reference to its explicit CIDRs via
+`cfg.PolicyOptions.PrefixLists` and merges them into the term's address set
+(`resolvePrefixListAddrs`, `pkg/dataplane/userspace/filters.go`). The `except`
+inversion is carried as the per-direction wire flags
+`source_except`/`destination_except` on `FirewallTermSnapshot` (mirrored in
+`userspace-dp/src/protocol/security.rs` with `serde(default)` for #1961 wire
+parity); the Rust matcher evaluates `(addr ∈ prefixes) XOR except`
+(`filter::engine::matching::nets_match_v4`/`nets_match_v6`). An UNDEFINED
+prefix-list reference is now **rejected at commit with a clear error** naming
+the family/filter/term/prefix-list (`validateFirewallPrefixListReferencesStrict`,
+lenient warn-only on the load / peer-sync path so a persisted/synced config
+still boots — #1960), mirroring the `then policer` / `then routing-instance`
+gates (#2217). Junos semantics: a plain prefix-list reference OR's its prefixes
+with any literal `source-address`/`destination-address` entries; `except` means
+"match every address NOT in the list".
+
+**Empty-resolution scope (#2506, Copilot):** the per-direction
+`source_constrained`/`destination_constrained` wire flags record that the
+operator SPECIFIED a scope for the direction (any literal address OR any
+prefix-list reference), INDEPENDENT of whether resolution yielded any prefixes.
+The Rust matcher derives "constrained" from this explicit flag (OR'd with the
+address-length test), NOT from the resolved list length. Without it, a `from
+source-prefix-list X` whose X is **defined-but-empty** (passes the strict gate)
+or **unresolved on the lenient/peer-sync path** resolves to an empty address
+list and the matcher would collapse the direction to match-ANY — accepting all
+traffic for `then accept` (fail-open) or dropping wrong scope for `then
+discard`. With the explicit flag, the matcher honors the Junos empty-set
+semantics: a positive empty scope matches NOTHING (`addr ∈ {}` = none,
+fail-closed via the `nets_match` empty guard returning `except` = false); an
+`except` empty scope matches ALL (`addr ∉ {}` = all, the guard returns `except`
+= true). Cross-family follows for free: a v4-only `... except` list has an empty
+v6 vec, and a v6 address is trivially "not in" a v4 list, so the except term
+matches v6 (the v4 list does not constrain v6).
+
+Scope (this PR): the two clean cases — positive prefix-lists (with or without
+literal addresses) and an `except` prefix-list as the SOLE address source for
+the direction — are wired through. The MIXED case (literal/positive addresses
+AND an `except` prefix-list in the SAME direction of ONE term) has no single
+boolean-inversion representation; the `except` modifier is dropped (prefixes
+fold into the positive set) with a warning. That fold is **action-dependent in
+safety**: under-broadening the match is fail-safe for `accept`/permit terms but
+fail-OPEN for a `discard`/`reject` term (traffic the operator meant to drop via
+`except` is no longer dropped). Splitting into two terms is the operator
+workaround; the structured mixed case is a documented follow-up.
+
 | Feature | Junos Config Path | Description | Priority | Status |
 |---------|-------------------|-------------|----------|--------|
 | **Policer (Rate Limiting)** | `firewall policer ... bandwidth-limit N burst-size-limit N` | Token-bucket rate limiter applied to filter terms or interfaces. Single-rate two-color, three-color policers. | High | Partial for #1373: legacy eBPF/~~DPDK~~ (DPDK retired #1525) token-bucket policer support existed; userspace supports the admitted filter path and the color-blind `then discard` three-color slice. #1375 is closed; unsupported color-aware/non-drop behavior and broader Junos parity remain production/future parity work, not active #1373 source-removal blockers. |

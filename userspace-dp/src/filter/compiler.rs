@@ -380,8 +380,22 @@ fn parse_term(
     // fail-closed. When the term is constrained but every real entry failed to
     // parse, the per-family vecs are empty and the matcher fails closed (see
     // engine/matching.rs).
-    let source_addr_constrained = snap.source_addresses.iter().any(|a| addr_is_real(a));
-    let dest_addr_constrained = snap.destination_addresses.iter().any(|a| addr_is_real(a));
+    //
+    // #2506 (Copilot): OR in the EXPLICIT `source_constrained` /
+    // `destination_constrained` snapshot signal. The address-length derivation
+    // alone is insufficient for prefix-list scopes that resolve EMPTY: a `from
+    // source-prefix-list X` whose X is defined-but-empty or lenient-unresolved
+    // produces an empty `source_addresses` list, so the length test yields
+    // `false` and the direction would wrongly collapse to match-any. The Go side
+    // sets the explicit flag whenever the term wrote ANY scope (literal address
+    // OR prefix-list ref), so the OR makes the matcher fail closed (positive) /
+    // match-all (except) per the Junos empty-set semantics. An older Go control
+    // plane that omits the flag (false) falls back to the length derivation —
+    // unchanged for the non-prefix-list cases that have no empty-resolution gap.
+    let source_addr_constrained =
+        snap.source_constrained || snap.source_addresses.iter().any(|a| addr_is_real(a));
+    let dest_addr_constrained =
+        snap.destination_constrained || snap.destination_addresses.iter().any(|a| addr_is_real(a));
     // #2505: resolve every `from protocol` token via the SHARED, normalizing
     // resolver `ip_proto::proto_number` (trim + lowercase + the full
     // appid.ProtocolNumber acceptance set: esp/ah/sctp/vrrp/igmp/pim/egp +
@@ -471,6 +485,12 @@ fn parse_term(
         dest_v6,
         source_addr_constrained,
         dest_addr_constrained,
+        // #2506: carry the per-direction `except` inversion flag from the
+        // snapshot. The Go control plane only sets it when the address set is an
+        // `except` prefix-list (the inversion is meaningful only against a
+        // non-empty constrained set; see resolvePrefixListAddrs).
+        source_except: snap.source_except,
+        dest_except: snap.destination_except,
         protocol_bitmap: build_u8_match_bitmap(&protocols),
         protocol_match_enabled: !protocols.is_empty(),
         source_ports: build_port_matcher(source_ports),

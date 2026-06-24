@@ -517,20 +517,43 @@ type FirewallFilterSnapshot struct {
 }
 
 type FirewallTermSnapshot struct {
-	Name            string        `json:"name"`
-	SourceAddresses []string      `json:"source_addresses,omitempty"`
-	DestAddresses   []string      `json:"destination_addresses,omitempty"`
-	Protocols       []string      `json:"protocols,omitempty"`
-	SourcePorts     []string      `json:"source_ports,omitempty"` // "80" or "1024-65535"
-	DestPorts       []string      `json:"destination_ports,omitempty"`
-	DSCPValues      WireUint8List `json:"dscp_values,omitempty"`
-	Action          string        `json:"action"` // "accept", "discard", "reject"
-	Count           string        `json:"count,omitempty"`
-	Log             bool          `json:"log,omitempty"`
-	PolicerName     string        `json:"policer,omitempty"`
-	RoutingInstance string        `json:"routing_instance,omitempty"`
-	ForwardingClass string        `json:"forwarding_class,omitempty"`
-	DSCPRewrite     *uint8        `json:"dscp_rewrite,omitempty"`
+	Name            string   `json:"name"`
+	SourceAddresses []string `json:"source_addresses,omitempty"`
+	DestAddresses   []string `json:"destination_addresses,omitempty"`
+	// SourceExcept / DestExcept invert the corresponding address match (#2506):
+	// when true, the term matches every address that is NOT in the
+	// SourceAddresses / DestAddresses set (Junos `from source-prefix-list NAME
+	// except` / `destination-prefix-list NAME except`). The Rust matcher
+	// evaluates `(addr ∈ prefixes) XOR except`. These are populated only when the
+	// except prefix-list is the sole address source for the direction; the mixed
+	// literal+except case folds to a positive set (see resolvePrefixListAddrs).
+	SourceExcept bool `json:"source_except,omitempty"`
+	DestExcept   bool `json:"destination_except,omitempty"`
+	// SourceConstrained / DestConstrained record that the term SPECIFIED a
+	// source/destination address scope (any literal address OR any prefix-list
+	// reference), INDEPENDENT of whether that scope resolved to any prefixes
+	// (#2506, Copilot). The Rust matcher uses this — NOT the resolved list
+	// length — to decide whether the direction is constrained. Without it, a
+	// `from source-prefix-list X` whose X is defined-but-empty or
+	// lenient-unresolved resolves to an empty list and the matcher would
+	// collapse to match-ANY (fail-open for accept, wrong scope for discard). A
+	// constrained direction with an empty positive set matches NOTHING
+	// (fail-closed); with except set it matches ALL (the Junos "not in {}"
+	// semantic). These default to false, so a term with no address scope behaves
+	// exactly as before.
+	SourceConstrained bool          `json:"source_constrained,omitempty"`
+	DestConstrained   bool          `json:"destination_constrained,omitempty"`
+	Protocols         []string      `json:"protocols,omitempty"`
+	SourcePorts       []string      `json:"source_ports,omitempty"` // "80" or "1024-65535"
+	DestPorts         []string      `json:"destination_ports,omitempty"`
+	DSCPValues        WireUint8List `json:"dscp_values,omitempty"`
+	Action            string        `json:"action"` // "accept", "discard", "reject"
+	Count             string        `json:"count,omitempty"`
+	Log               bool          `json:"log,omitempty"`
+	PolicerName       string        `json:"policer,omitempty"`
+	RoutingInstance   string        `json:"routing_instance,omitempty"`
+	ForwardingClass   string        `json:"forwarding_class,omitempty"`
+	DSCPRewrite       *uint8        `json:"dscp_rewrite,omitempty"`
 	// Per-packet L4 match conditions (#2362). These are parsed by the Junos
 	// firewall-filter compiler but were previously dropped on the wire, so a
 	// term like `from { tcp-flags syn; }` silently matched broader than

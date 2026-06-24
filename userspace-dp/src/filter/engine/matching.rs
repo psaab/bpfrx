@@ -100,10 +100,20 @@ pub(super) fn term_matches_v4(
     {
         return false;
     }
-    if !nets_match_v4(term.source_addr_constrained, &term.source_v4, src_ip) {
+    if !nets_match_v4(
+        term.source_addr_constrained,
+        term.source_except,
+        &term.source_v4,
+        src_ip,
+    ) {
         return false;
     }
-    if !nets_match_v4(term.dest_addr_constrained, &term.dest_v4, dst_ip) {
+    if !nets_match_v4(
+        term.dest_addr_constrained,
+        term.dest_except,
+        &term.dest_v4,
+        dst_ip,
+    ) {
         return false;
     }
     if !port_match(term.source_port_constrained, &term.source_ports, src_port) {
@@ -121,38 +131,53 @@ pub(super) fn term_matches_v4(
     true
 }
 
-/// #2400 (032-18): match a v4 IP against a filter term's address set with
-/// fail-closed semantics for an all-malformed list.
+/// #2400 (032-18) + #2506: match a v4 IP against a filter term's address set.
 ///
-/// - `constrained == false` (the term carried no real source/dest address):
-///   match any IP — unchanged unscoped behavior.
-/// - `constrained == true` but `nets` empty (every configured prefix failed to
-///   parse for this family): match NOTHING — fail closed, never the pre-#2400
-///   collapse to the empty-list match-any fail-open broadening.
-/// - otherwise: the IP must fall in one of the parsed prefixes.
+/// - `constrained == false` (the term wrote no source/dest scope — no literal
+///   address and no prefix-list ref): match any IP — unchanged unscoped
+///   behavior. `except` is irrelevant: there is no scope to invert.
+/// - `constrained == true` but `nets` empty for THIS family: the operator wrote
+///   a scope that yielded no prefixes for this family. Return `except` — the
+///   Junos empty-set semantic:
+///     * positive (`except == false`): "match addresses in {}" = match NOTHING
+///       (fail closed). This is the #2400 all-malformed / #2506 empty-positive
+///       (defined-empty or lenient-unresolved prefix-list) case — never the
+///       pre-#2400 collapse to match-any.
+///     * `except == true`: "match addresses NOT in {}" = match ALL. This also
+///       gives the correct CROSS-FAMILY answer: a v4-only `... except` list has
+///       an empty v6 vec, and a v6 source is trivially "not in" a v4 list, so a
+///       v6 packet matches the except term (the v4 list does not constrain v6).
+///   The `constrained` input is derived in the compiler from the EXPLICIT
+///   `source_constrained` / `destination_constrained` snapshot flag (OR'd with
+///   the address-length test), so an empty-resolving prefix-list still counts as
+///   constrained and does not fall through to the `!constrained` match-any arm.
+/// - otherwise: membership XOR `except`. `except == false` is the plain
+///   `addr ∈ prefixes`; `except == true` is "match every address NOT in the
+///   set".
 ///
 /// Mirrors `nat::source::nets_match_v4` (#2398).
 #[inline(always)]
-fn nets_match_v4(constrained: bool, nets: &[PrefixV4], ip: Ipv4Addr) -> bool {
+fn nets_match_v4(constrained: bool, except: bool, nets: &[PrefixV4], ip: Ipv4Addr) -> bool {
     if !constrained {
         return true;
     }
     if nets.is_empty() {
-        return false;
+        return except;
     }
-    nets.iter().any(|net| net.contains(ip))
+    nets.iter().any(|net| net.contains(ip)) ^ except
 }
 
-/// #2400 (032-18): v6 sibling of `nets_match_v4`.
+/// #2400 (032-18) + #2506: v6 sibling of `nets_match_v4` (same empty-set and
+/// `except` inversion semantics).
 #[inline(always)]
-fn nets_match_v6(constrained: bool, nets: &[PrefixV6], ip: Ipv6Addr) -> bool {
+fn nets_match_v6(constrained: bool, except: bool, nets: &[PrefixV6], ip: Ipv6Addr) -> bool {
     if !constrained {
         return true;
     }
     if nets.is_empty() {
-        return false;
+        return except;
     }
-    nets.iter().any(|net| net.contains(ip))
+    nets.iter().any(|net| net.contains(ip)) ^ except
 }
 
 /// #2400 (032-19): match a port against a filter term's port matcher with
@@ -190,10 +215,20 @@ pub(super) fn term_matches_v6(
     {
         return false;
     }
-    if !nets_match_v6(term.source_addr_constrained, &term.source_v6, src_ip) {
+    if !nets_match_v6(
+        term.source_addr_constrained,
+        term.source_except,
+        &term.source_v6,
+        src_ip,
+    ) {
         return false;
     }
-    if !nets_match_v6(term.dest_addr_constrained, &term.dest_v6, dst_ip) {
+    if !nets_match_v6(
+        term.dest_addr_constrained,
+        term.dest_except,
+        &term.dest_v6,
+        dst_ip,
+    ) {
         return false;
     }
     if !port_match(term.source_port_constrained, &term.source_ports, src_port) {

@@ -241,6 +241,68 @@ are DERIVED from the existing snapshot lists, so there is NO new wire field
 unscoped↔all-malformed transition flips match semantics WITHOUT changing the
 parsed vecs/matcher, so a flow-cache rebuild must catch it.
 
+### Prefix-list expansion + `except` inversion (#2506)
+
+`from source-prefix-list <name>` / `destination-prefix-list <name>` (with the
+optional `except` modifier) is resolved in the GO control plane before the
+snapshot is emitted, not in Rust. The Go snapshot builder
+(`resolvePrefixListAddrs`, `pkg/dataplane/userspace/filters.go`) looks each
+reference up in `cfg.PolicyOptions.PrefixLists` and merges the resolved CIDRs
+into the term's `source_addresses` / `destination_addresses` list — so the Rust
+compiler sees them exactly like literal `from source-address` entries (no
+prefix-list concept exists Rust-side). Before #2506 these references were
+silently dropped, leaving the term with no address scope (action-dependent
+fail-open / fail-closed).
+
+The `except` modifier ("match every address NOT in the list") is the one piece
+that cannot be expressed by the address vectors alone, so it travels as two
+per-direction wire flags on `FirewallTermSnapshot` — `source_except` /
+`destination_except` (Go `pkg/dataplane/userspace/protocol.go`, Rust
+`protocol/security.rs` with `serde(default)` for #1961 wire parity). They map to
+`FilterTerm.source_except` / `dest_except`, and the matcher
+(`engine/matching.rs` `nets_match_v4` / `nets_match_v6`) evaluates
+`nets.iter().any(contains) ^ except`. The except flags are compared in
+`filter_term_semantics_match` (`engine/cache_sensitive.rs`) — they flip the
+address decision without changing the parsed vecs, so a flow-cache rebuild must
+catch a toggle.
+
+**Explicit `constrained` signal + empty-set semantics (#2506, Copilot).** A
+prefix-list can resolve to ZERO prefixes — a defined-but-empty list (passes the
+strict gate) or an unresolved reference on the lenient/peer-sync path. The
+empty-resolution case is exactly the address-scope-loss bug #2506 fixes, so
+"constrained" must NOT be derived from the resolved list length (an empty list
+would collapse to match-any: fail-open for `accept`, wrong scope for
+`discard`). Two explicit wire flags `source_constrained` /
+`destination_constrained` (Go sets them whenever the term wrote ANY scope —
+literal address or prefix-list ref) are OR'd into
+`FilterTerm.source_addr_constrained` / `dest_addr_constrained` in the compiler.
+The matcher's empty guard then returns `except`:
+
+- positive (`except == false`), empty vec → `false` → match NOTHING (Junos
+  `addr ∈ {}` = none; this is the #2400 all-malformed case AND the #2506
+  empty-positive case);
+- `except == true`, empty vec → `true` → match ALL (Junos `addr ∉ {}` = all);
+- `constrained == false` (no scope at all) → match any, unchanged.
+
+Cross-family falls out of this for free: a v4-only `... except` list leaves the
+v6 vec empty, and a v6 address is trivially "not in" a v4 list, so the empty
+guard's `return except` (= true for an except term) correctly matches v6 — the
+v4 list does not constrain v6. (A v4-only POSITIVE list correctly fails closed
+for v6 via the same guard returning `except` = false.)
+
+Go-side scope: a plain prefix-list OR's into the positive set (with any literal
+addresses); an `except` prefix-list sets the inversion flag ONLY when it is the
+sole address source for the direction. The mixed literal/positive + `except`
+case in one direction folds `except` away to a positive set with a warning —
+there is no single boolean-inversion representation for "match A but not B". The
+fold is **action-dependent in safety**: under-broadening is fail-safe for
+`accept`/permit terms but fail-OPEN for a `discard`/`reject` term (traffic the
+operator meant to drop via `except` is no longer dropped). Splitting into two
+terms is the operator workaround, and the structured form is a documented
+follow-up. An undefined prefix-list reference is rejected at commit by
+`validateFirewallPrefixListReferencesStrict` (Go), so the Rust side never has to
+reason about a dangling name.
+
 ### Path (b) runbook — cache-sensitive
 
 Adding a per-packet match field that is NOT in the cache key
