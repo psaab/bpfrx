@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"os/user"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -607,13 +608,13 @@ func (m *Manager) controlSocket(family int) string {
 // takeover the held peer set is the authoritative serving state, and Kea's own
 // LFC will compact going forward.
 func (m *Manager) PreSeedMemfile4(leases []SyncLease, now time.Time) error {
-	return writeMemfile4(m.leaseFile(4), leases, now)
+	return m.writeMemfile4(m.leaseFile(4), leases, now)
 }
 
 // PreSeedMemfile6 writes the held peer v6 leases into the Kea v6 memfile CSV
 // before Kea start (#2239 Q3). See PreSeedMemfile4.
 func (m *Manager) PreSeedMemfile6(leases []SyncLease, now time.Time) error {
-	return writeMemfile6(m.leaseFile(6), leases, now)
+	return m.writeMemfile6(m.leaseFile(6), leases, now)
 }
 
 // keaMemfileHeader4 is Kea's canonical DHCPv4 memfile CSV header (Kea 2.x/3.x).
@@ -629,7 +630,7 @@ func boolCSV(b bool) string {
 	return "0"
 }
 
-func writeMemfile4(path string, leases []SyncLease, now time.Time) error {
+func (m *Manager) writeMemfile4(path string, leases []SyncLease, now time.Time) error {
 	var b strings.Builder
 	b.WriteString(keaMemfileHeader4)
 	b.WriteByte('\n')
@@ -650,10 +651,10 @@ func writeMemfile4(path string, leases []SyncLease, now time.Time) error {
 			boolCSV(l.FQDNFwd), boolCSV(l.FQDNRev), csvField(l.Hostname),
 			keaStateDefault)
 	}
-	return writeMemfileAtomic(path, b.String())
+	return m.writeMemfileAtomic(path, b.String())
 }
 
-func writeMemfile6(path string, leases []SyncLease, now time.Time) error {
+func (m *Manager) writeMemfile6(path string, leases []SyncLease, now time.Time) error {
 	var b strings.Builder
 	b.WriteString(keaMemfileHeader6)
 	b.WriteByte('\n')
@@ -691,19 +692,113 @@ func writeMemfile6(path string, leases []SyncLease, now time.Time) error {
 			boolCSV(l.FQDNFwd), boolCSV(l.FQDNRev), csvField(l.Hostname),
 			keaStateDefault)
 	}
-	return writeMemfileAtomic(path, b.String())
+	return m.writeMemfileAtomic(path, b.String())
 }
 
 // writeMemfileAtomic writes the rendered memfile durably so a Kea start cannot
 // read a torn pre-seed. Pre-seed runs on the takeover path (not a hot path) so
 // the fsync cost is acceptable, and durability matters: the pre-seed exists to
 // survive a crash-failover, the worst case being a torn file Kea then rejects.
-func writeMemfileAtomic(path, content string) error {
+//
+// OWNERSHIP (#2450, HIGH): xpfd runs as root, but distro Kea (`kea-dhcp4`/
+// `kea-dhcp6`) runs as the unprivileged `_kea` (Debian/Ubuntu) or `kea`
+// (RHEL-family) user and opens its memfile lease DB for READ+WRITE at startup.
+// A root-owned 0640 file is unreadable/unwritable by that user, so Kea fails to
+// start (EACCES) on the node that just took over — a DHCP outage at the worst
+// possible moment. We therefore install the file already owned by the resolved
+// Kea runtime user (0640 + owner=_kea ⇒ owner can RW). The chown rides on the
+// fsatomic temp fd (fsatomic.WithOwner does fchown BEFORE the rename), so the
+// FINAL visible inode at `path` is _kea-owned atomically — there is no
+// post-rename window where the renamed-into-place file is root-owned, and no
+// orphaned root-owned temp survives the rename.
+//
+// ROBUSTNESS: when NEITHER Kea user exists (a dev host, or Kea simply not
+// installed) the takeover must NOT abort — chown is best-effort. We log one
+// warning and write the file without an owner override; the write itself still
+// succeeds. The daemon is root, so when the user DOES exist the chown cannot
+// fail for lack of privilege.
+func (m *Manager) writeMemfileAtomic(path, content string) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0750); err != nil {
 		return fmt.Errorf("create %s: %w", dir, err)
 	}
-	return fsatomic.WriteFileDurable(path, []byte(content), 0640)
+	uid, gid, ok := m.resolveKeaOwner()
+	if !ok {
+		m.warnf("dhcpserver: no %s/%s runtime user found; pre-seeding Kea memfile %s "+
+			"as root — Kea may be unable to open it (EACCES) if it runs unprivileged",
+			keaPrimaryUser, keaFallbackUser, path)
+	}
+	return writeMemfileFile(path, []byte(content), 0640, uid, gid, ok)
+}
+
+// writeMemfileFile installs the pre-seeded memfile. It is a package var so a
+// test can record the resolved owner (uid/gid + whether the chown is applied)
+// and the final path without needing root to perform a real fchown. Production
+// rides the chown on the fsatomic temp fd via WithOwner, so the FINAL renamed
+// inode is _kea-owned atomically (no post-rename root-owned window).
+var writeMemfileFile = func(path string, data []byte, perm os.FileMode, uid, gid int, applyOwner bool) error {
+	var opts []fsatomic.Option
+	if applyOwner {
+		opts = append(opts, fsatomic.WithOwner(uid, gid))
+	}
+	return fsatomic.WriteFileDurable(path, data, perm, opts...)
+}
+
+// Kea runtime user names, in resolution order. Debian/Ubuntu (the appliance
+// base) package Kea to run as `_kea`; the RHEL-family packaging uses `kea`.
+const (
+	keaPrimaryUser  = "_kea"
+	keaFallbackUser = "kea"
+)
+
+// resolveKeaOwner returns the uid/gid the Kea memfile must be owned by so the
+// unprivileged Kea process can open it RW, and ok=false when neither candidate
+// user exists (chown then becomes best-effort — see writeMemfileAtomic). The
+// lookup is cached on first success so the takeover path does not hit
+// /etc/passwd per pre-seed. The resolver and the cache are seam-injectable for
+// tests (keaOwnerLookup / keaOwnerCache).
+func (m *Manager) resolveKeaOwner() (uid, gid int, ok bool) {
+	m.keaOwnerOnce.Do(func() {
+		lookup := m.keaOwnerLookup
+		if lookup == nil {
+			lookup = lookupKeaOwner
+		}
+		m.keaOwnerUID, m.keaOwnerGID, m.keaOwnerOK = lookup()
+	})
+	return m.keaOwnerUID, m.keaOwnerGID, m.keaOwnerOK
+}
+
+// lookupKeaOwner resolves the first existing Kea runtime user (_kea, then kea)
+// to its numeric uid/gid via the OS user database. It returns ok=false when
+// neither exists.
+func lookupKeaOwner() (uid, gid int, ok bool) {
+	for _, name := range []string{keaPrimaryUser, keaFallbackUser} {
+		u, err := user.Lookup(name)
+		if err != nil {
+			continue
+		}
+		ui, err := strconv.Atoi(u.Uid)
+		if err != nil {
+			continue
+		}
+		gi, err := strconv.Atoi(u.Gid)
+		if err != nil {
+			continue
+		}
+		return ui, gi, true
+	}
+	return 0, 0, false
+}
+
+// warnf routes a pre-seed warning through the manager's warn sink (the test
+// seam, default slog.Warn) using printf-style formatting so the message is one
+// human-readable line rather than slog key/value pairs.
+func (m *Manager) warnf(format string, args ...any) {
+	if m.warn != nil {
+		m.warn(fmt.Sprintf(format, args...))
+		return
+	}
+	slog.Warn(fmt.Sprintf(format, args...))
 }
 
 // csvField escapes a memfile CSV field. Kea memfile values (addresses,

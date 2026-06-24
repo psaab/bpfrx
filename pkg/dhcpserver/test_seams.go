@@ -59,6 +59,15 @@ func (m *Manager) SetWarnForTesting(fn func(msg string, args ...any)) {
 	m.warn = fn
 }
 
+// SetKeaOwnerLookupForTesting injects the Kea runtime-user resolver used by
+// the memfile pre-seed chown (#2450). A test passes a fake that returns a
+// known uid/gid (so the pre-seed chowns to it without a real _kea user) or
+// ok=false (to exercise the absent-user best-effort fallback). Must be called
+// before the first pre-seed (the resolution is cached behind a sync.Once).
+func (m *Manager) SetKeaOwnerLookupForTesting(fn func() (uid, gid int, ok bool)) {
+	m.keaOwnerLookup = fn
+}
+
 // NewDDNSManagerForTesting builds a DDNSManager with injectable state +
 // lease paths, clock, and a per-Reconcile updater factory (#1387 inc-2).
 // It is used by OTHER packages' tests (e.g. pkg/daemon) to drive the
