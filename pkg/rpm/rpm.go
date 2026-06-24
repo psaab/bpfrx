@@ -147,6 +147,12 @@ type Manager struct {
 	// icmpListen is the injectable raw-socket seam for the ICMP echo
 	// prober. nil = realICMPListen.
 	icmpListen icmpListenFunc
+
+	// probeFn, when non-nil, replaces executeProbe — the injectable
+	// seam for unit-testing the per-cycle pass/fail transition logic
+	// with a scripted probe-result sequence (#2527). It is set once
+	// before the manager runs and never mutated concurrently.
+	probeFn func(ctx context.Context, test *config.RPMTest, key string) (time.Duration, error)
 }
 
 // SetEventCallback registers a callback for RPM events.
@@ -367,6 +373,26 @@ func (m *Manager) runSingleTest(ctx context.Context, probeName string, test *con
 	probeLimit := test.ProbeLimit // 0 = unlimited
 	setupWarned := false
 
+	// The per-test pass/fail status is a per-cycle aggregate, like
+	// Junos RPM/ip-monitoring: the successive-loss threshold is
+	// evaluated across the WHOLE probe set and the test transitions AT
+	// MOST once per cycle — never per probe. Capture the pre-cycle
+	// status ONCE; evolve `status` locally through the cycle (so the
+	// cross-cycle consecutive-failure counter r.SuccFail keeps its
+	// meaning); publish r.LastStatus and fire the transition only after
+	// the loop. Firing inside the loop let a single transient mid-cycle
+	// success flip fail->pass->fail and flap static-route preference in
+	// services ip-monitoring (#2527).
+	m.mu.Lock()
+	r0 := m.results[key]
+	if r0 == nil {
+		m.mu.Unlock()
+		return
+	}
+	prevStatus := r0.LastStatus
+	m.mu.Unlock()
+	status := prevStatus
+
 	for i := 0; i < probeCount; i++ {
 		if i > 0 {
 			select {
@@ -376,7 +402,7 @@ func (m *Manager) runSingleTest(ctx context.Context, probeName string, test *con
 			}
 		}
 
-		rtt, err := m.executeProbe(ctx, test, key)
+		rtt, err := m.runProbe(ctx, test, key)
 
 		// ErrProbeSetup = environment/capability failure (raw socket
 		// open denied, marshal, probe pin not installed #1895): the
@@ -405,23 +431,23 @@ func (m *Manager) runSingleTest(ctx context.Context, probeName string, test *con
 		}
 		r.TotalSent++
 		r.LastProbeAt = time.Now()
-		prevStatus := r.LastStatus
 		if err != nil {
 			failures++
 			r.SuccFail++
+			// Successive-loss trip: once `threshold` consecutive
+			// probes are lost the test is failed. r.SuccFail carries
+			// across cycles, so a fail run spanning a cycle boundary
+			// still trips. The status is only PUBLISHED after the loop.
 			if r.SuccFail >= threshold {
-				r.LastStatus = "fail"
+				status = "fail"
 			}
 			// Check probe-limit: stop test cycle when reached
 			hitLimit := probeLimit > 0 && r.SuccFail >= probeLimit
 			m.mu.Unlock()
-			// Fire probe-level failure event
+			// Probe-level failure event stays per-probe — it is an
+			// eventengine signal and does not drive ip-monitoring
+			// routes (which key off fireTransition only).
 			m.fireEvent("ping_probe_failed", probeName, test.Name)
-			// Fire test-level failure on transition
-			if r.SuccFail == threshold && prevStatus != "fail" {
-				m.fireEvent("ping_test_failed", probeName, test.Name)
-				m.fireTransition(probeName, test.Name, "fail")
-			}
 			if hitLimit {
 				break
 			}
@@ -454,12 +480,29 @@ func (m *Manager) runSingleTest(ctx context.Context, probeName string, test *con
 			}
 			r.LastRTT = rtt
 			r.SuccFail = 0
-			r.LastStatus = "pass"
+			// A success clears the successive-loss run. The status is
+			// only PUBLISHED after the loop.
+			status = "pass"
 			m.mu.Unlock()
-			if prevStatus != "pass" {
-				m.fireTransition(probeName, test.Name, "pass")
-			}
 		}
+	}
+
+	// Publish the per-cycle status decision: compare the aggregate
+	// end-of-cycle status to the pre-cycle status and fire AT MOST one
+	// transition. This is the single ip-monitoring sensor edge per test
+	// cycle (#2527). A below-threshold cycle that never reached "fail"
+	// and saw no success leaves `status == prevStatus` (e.g. the
+	// initial "unknown" state holds), so no spurious transition fires.
+	if status != prevStatus {
+		m.mu.Lock()
+		if r := m.results[key]; r != nil {
+			r.LastStatus = status
+		}
+		m.mu.Unlock()
+		if status == "fail" {
+			m.fireEvent("ping_test_failed", probeName, test.Name)
+		}
+		m.fireTransition(probeName, test.Name, status)
 	}
 
 	// Fire test completed if all probes passed
@@ -506,6 +549,15 @@ func (m *Manager) pinInstallError(test *config.RPMTest, key string) error {
 		return fmt.Errorf("%w: no probe pin slot assigned for next-hop test", ErrProbeSetup)
 	}
 	return nil
+}
+
+// runProbe dispatches a single probe through the test seam when one is
+// installed, otherwise the real executeProbe path.
+func (m *Manager) runProbe(ctx context.Context, test *config.RPMTest, key string) (time.Duration, error) {
+	if m.probeFn != nil {
+		return m.probeFn(ctx, test, key)
+	}
+	return m.executeProbe(ctx, test, key)
 }
 
 func (m *Manager) executeProbe(ctx context.Context, test *config.RPMTest, key string) (time.Duration, error) {
