@@ -12407,3 +12407,40 @@ top.
   -count=5 green.
 - **File(s)**: pkg/dhcpserver/lease_sync.go, pkg/dhcpserver/lease_sync_test.go,
   pkg/dhcpserver/README.md, _Log.md
+
+- **Timestamp**: 2026-06-23
+- **Action**: #2505 (HIGH, codex review-036 finding 1) — fix fail-wide
+  firewall-filter protocol parser. The Rust filter compiler carried a stale
+  local `parse_protocol` recognizing only tcp/udp/icmp/icmpv6/gre/ospf/ipip +
+  bare numeric (no trim/lowercase) and `filter_map`-DROPPED everything else.
+  Named protocols the Go commit gate accepts (esp/ah/sctp/vrrp/igmp/pim/egp +
+  junos-* aliases) and mixed-case/whitespace tokens were silently dropped → the
+  term's protocol list went empty → `protocol_match_enabled=false` → the term
+  matched ALL protocols. `from protocol esp; then discard` discarded all
+  traffic (fail-wide). FIX: (1) deleted the local parser; resolve every token
+  via the shared, normalizing `ip_proto::proto_number`; (2) added the junos-*
+  aliases the Go gate accepts to `proto_number` (gate↔dataplane parity — filter
+  tokens reach the snapshot verbatim, no Go-side alias resolution); (3) made
+  `parse_filter_state*`/`parse_term` fallible — a NON-EMPTY list with any
+  unresolvable token returns `SnapshotIntegrityError::UnrepresentableFilterProtocol`,
+  propagated via `?` through `build_forwarding_state_*` to the reconcile
+  preflight (`build_reconcile_forwarding`) which aborts BEFORE teardown/publish
+  (post-#2484), keeping the prior good filter state. An EMPTY input list stays
+  "no constraint" (match-any). Tests: 6 Rust filter tests (named protocols
+  scoped, GRE/whitespace normalization, junos aliases, unresolvable→Err,
+  empty→unconstrained, esp-discard Go→Rust fixture) + extended proto_number
+  resolver test for the full gate set. Fail-on-revert PROVEN: simulating the
+  stale parser flips all protocol_2505 tests to FAILED (term becomes match-all).
+  Build release clean; filter+ip_proto+policy tests 150/150 5x; full suite green
+  (one pre-existing flaky worker_queue concurrency test, untouched code, passes
+  3/3 isolated); Go appid/config parity tests green.
+- **File(s)**: userspace-dp/src/ip_proto.rs, userspace-dp/src/policy.rs,
+  userspace-dp/src/filter/compiler.rs, userspace-dp/src/filter/mod.rs,
+  userspace-dp/src/afxdp/forwarding_build/mod.rs, userspace-dp/src/filter/README.md,
+  userspace-dp/src/filter/tests.rs, userspace-dp/src/nat/tests.rs,
+  userspace-dp/src/filter/engine/cache_sensitive.rs,
+  userspace-dp/src/afxdp/flow_cache_tests.rs,
+  userspace-dp/src/afxdp/tx/dispatch/dispatch_tests.rs,
+  userspace-dp/src/afxdp/poll_descriptor/reject_reply.rs,
+  userspace-dp/src/afxdp/poll_descriptor/cookie_reply.rs,
+  userspace-dp/src/afxdp/frame/tests.rs, userspace-dp/src/afxdp/tests.rs, _Log.md
