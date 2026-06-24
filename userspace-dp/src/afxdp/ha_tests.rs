@@ -461,6 +461,118 @@ fn update_ha_state_demotion_recovers_from_poisoned_worker_command_mutex() {
     );
 }
 
+#[test]
+fn prewarm_recovers_from_poisoned_shared_session_mutex() {
+    // #2402 regression: the activation prewarm path acquired the shared
+    // session mutex with `.lock().map(..).unwrap_or_default()`. If a
+    // worker thread had panicked while holding that lock, `lock()` returns
+    // Err, the `.map(..)` closure is SKIPPED, and `unwrap_or_default()`
+    // substitutes EMPTY (forward_entries, reverse_entries) — so RG
+    // activation proceeded as if there were NO sessions to promote and
+    // silently dropped every active synced session at the moment of
+    // failover. The fix recovers the poisoned guard
+    // (`lock_shared_recover` / `into_inner`) and promotes the EXISTING
+    // sessions. This test populates a shared session, poisons the mutex,
+    // runs prewarm, and asserts the reverse companion is still
+    // synthesized + published (with the old code it would be absent).
+    let mut coordinator = Coordinator::new();
+    coordinator.forwarding = test_forwarding_state_split_rgs();
+    let worker_commands = Arc::new(Mutex::new(VecDeque::new()));
+
+    let entry = SyncedSessionEntry {
+        key: test_key(),
+        decision: test_decision(),
+        metadata: test_metadata(),
+        origin: SessionOrigin::SyncImport,
+        protocol: PROTO_TCP,
+        tcp_flags: 0x10,
+        generation: 0,
+    };
+    publish_shared_session(
+        &coordinator.sessions.synced,
+        &coordinator.sessions.nat,
+        &coordinator.sessions.forward_wire,
+        &coordinator.sessions.owner_rg_indexes,
+        &entry,
+    );
+    refresh_reverse_prewarm_owner_rg_indexes(
+        &coordinator
+            .sessions
+            .owner_rg_indexes
+            .reverse_prewarm_sessions,
+        &coordinator.forwarding,
+        coordinator.dynamic_neighbors_ref(),
+        None,
+        Some(&entry),
+    );
+
+    // Poison the shared session mutex deterministically: a thread panics
+    // while holding the lock, and join() observes the panic.
+    let to_poison = coordinator.sessions.synced.clone();
+    let poisoner = std::thread::spawn(move || {
+        let _guard = to_poison.lock().expect("lock before poisoning");
+        panic!("poison shared session mutex");
+    })
+    .join();
+    assert!(poisoner.is_err(), "poisoning thread must panic");
+    assert!(
+        coordinator.sessions.synced.lock().is_err(),
+        "shared session mutex must be poisoned"
+    );
+
+    let recoveries_before =
+        super::shared_ops::SHARED_SESSION_POISON_RECOVERIES.load(Ordering::Relaxed);
+
+    let ha_state = BTreeMap::from([(1, active_ha_runtime(1_000)), (2, active_ha_runtime(1_000))]);
+    prewarm_reverse_synced_sessions_for_owner_rgs(
+        &coordinator.sessions.synced,
+        &coordinator.sessions.nat,
+        &coordinator.sessions.forward_wire,
+        &coordinator.sessions.owner_rg_indexes,
+        std::slice::from_ref(&worker_commands),
+        -1,
+        &coordinator.forwarding,
+        &ha_state,
+        coordinator.dynamic_neighbors_ref(),
+        &[1, 2],
+        1_000,
+    );
+
+    // The poisoned guard was recovered, not swallowed.
+    assert!(
+        super::shared_ops::SHARED_SESSION_POISON_RECOVERIES.load(Ordering::Relaxed)
+            > recoveries_before,
+        "prewarm must recover (count) the poisoned shared session lock"
+    );
+
+    // Fail-on-revert: with the old `.unwrap_or_default()`, the poisoned
+    // lock yields empty entries and the reverse companion is NEVER
+    // published — this lookup returns None and the assert fails.
+    let reverse_key = reverse_session_key(&entry.key, entry.decision.nat);
+    let reverse = coordinator
+        .sessions
+        .synced
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(&reverse_key)
+        .cloned()
+        .expect("reverse companion must survive a poisoned shared lock");
+    assert!(reverse.metadata.is_reverse);
+
+    // The worker also received the reverse UpsertSynced (promotion was not
+    // silently dropped).
+    let commands = worker_commands
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    assert!(
+        commands.iter().any(|command| matches!(
+            command,
+            WorkerCommand::UpsertSynced(session) if session.metadata.is_reverse
+        )),
+        "worker must receive the recovered reverse UpsertSynced"
+    );
+}
+
 // --- #2170 install-generation guard (helper-side belt-and-suspenders) -----
 
 fn synced_entry_with_generation(generation: u64) -> SyncedSessionEntry {
