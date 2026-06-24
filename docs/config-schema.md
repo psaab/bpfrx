@@ -225,7 +225,20 @@ reserved for whole-dataplane selection where a rewrite shim
   inner-vlan-id, family inet/inet6 `address` CIDR key slots, vrrp-group
   priority / advertise-interval / virtual-address, tunnel
   source/destination/ttl/key, wireguard listen-port /
-  persistent-keepalive). The WireGuard `peer` node is a NAMED-INSTANCE
+  persistent-keepalive). **#2384 — IPv6 VRRP:** the `vrrp-group <id>`
+  subtree now exists under **both** family `inet` and family `inet6`
+  (built by the shared `vrrpGroupSchemaNode(v6 bool)` helper in
+  `schema_interfaces.go`, parsed by the shared `parseVRRPGroups` helper in
+  `compiler_interfaces.go` from both family arms). The only difference is
+  the `virtual-address` validator: `ValidateIPv4CIDR` under `inet`,
+  `ValidateIPv6CIDR` under `inet6` — so a v6 VIP commits cleanly under
+  `inet6` and is rejected under `inet` (and vice versa). The native VRRP
+  engine already family-detects each VIP at parse (`ip.To4()==nil`,
+  `pkg/vrrp/instance.go`), so no runtime change was needed. Compiled
+  groups are keyed `<address-CIDR>_grp<id>`, so a dual-stack unit may
+  carry an `inet` AND an `inet6` vrrp-group with the SAME group id without
+  collision (the address strings differ → two distinct
+  `unit.VRRPGroups` entries). The WireGuard `peer` node is a NAMED-INSTANCE
   container keyed by the peer public key (#1434 multi-peer):
   `set interfaces <wg> tunnel wireguard peer <public-key>
   { allowed-ips <cidr>; endpoint <ip:port>; persistent-keepalive <s>;
