@@ -12988,3 +12988,28 @@ top.
   pkg/config/compiler_rpm_scoped_hostname_2493_test.go, pkg/rpm/rpm.go,
   pkg/rpm/icmp.go, pkg/rpm/scoped_hostname_2493_test.go, docs/multi-wan.md,
   _Log.md
+
+- **Timestamp**: 2026-06-24
+  **Action**: #2494 — preserve IPv6 link-local zone in RPM ICMP probe;
+  default zone from destination-interface; reject bare link-local at
+  commit (strict/lenient #1960 mirror). resolveProbeTarget +
+  resolveTarget seam now return *net.IPAddr; probeICMP sends
+  &net.IPAddr{IP,Zone}; validateRPMLinkLocalZoneStrict +
+  lenientRPMLinkLocalZone opt. Fail-on-revert proven (4 rpm + 2 config
+  tests). gofmt+vet+test green.
+  **File(s)**: pkg/rpm/icmp.go, pkg/rpm/rpm.go, pkg/rpm/icmp_test.go,
+  pkg/rpm/scoped_hostname_2493_test.go, pkg/rpm/icmp_linklocal_2494_test.go,
+  pkg/config/compiler.go, pkg/config/compiler_services.go,
+  pkg/config/compiler_rpm_linklocal_zone_2494_test.go, docs/multi-wan.md,
+  _Log.md
+
+- **Timestamp**: 2026-06-24
+  **Action**: #2494 fold (hostile-reviewer nit) — link-local zone-default
+  now derives from destination-interface specifically
+  (routing.ResolveProbeInterface), NOT opts.BindDevice, so a
+  routing-instance-only bare link-local (lenient load) HOLDS with
+  ErrProbeSetup instead of sending to a "vrf-<ri>" non-link zone (counted
+  as path loss). Preserves #1960 hold-state doctrine. Added
+  fail-on-revert test TestProbeICMPLinkLocalRoutingInstanceOnlyHeld.
+  **File(s)**: pkg/rpm/icmp.go, pkg/rpm/icmp_linklocal_2494_test.go,
+  _Log.md

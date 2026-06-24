@@ -25,6 +25,7 @@ type fakeICMPConn struct {
 	replies  chan fakeReply
 	respond  func(b []byte, dst net.Addr) []fakeReply
 	sent     [][]byte
+	sentAddr []net.Addr // destination passed to each WriteTo (#2494 zone check)
 	opts     probeSockOpts
 	network  string
 	// failFast makes ReadFrom return an immediate timeout when no
@@ -42,6 +43,7 @@ func (f *fakeICMPConn) WriteTo(b []byte, addr net.Addr) (int, error) {
 	cp := append([]byte(nil), b...)
 	f.mu.Lock()
 	f.sent = append(f.sent, cp)
+	f.sentAddr = append(f.sentAddr, addr)
 	f.mu.Unlock()
 	if f.respond != nil {
 		for _, r := range f.respond(cp, addr) {

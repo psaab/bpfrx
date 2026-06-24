@@ -175,6 +175,65 @@ func validateRPMScopedHostnameStrict(cfg *Config) error {
 	return nil
 }
 
+// validateRPMLinkLocalZoneStrict rejects an IPv6 link-local RPM target
+// that carries no scope (#2494). A link-local destination (fe80::/10) is
+// meaningless without a zone: the kernel cannot pick the egress link, so
+// the ICMP echo goes to the wrong link or fails outright. The scope can
+// come from an explicit `%zone` on the target literal (fe80::1%ge-0/0/3)
+// or be derived from the test's destination-interface (the same egress
+// device the probe data socket binds via SO_BINDTODEVICE). A bare
+// link-local with NEITHER is unprobeable and is refused so the operator
+// sees the gap at commit instead of a silently-dead probe feeding
+// ip-monitoring failover.
+//
+// Only IP-literal targets are checked: net.ParseIP rejects a zoned
+// literal so the zone is split off by hand first (no DNS at commit). A
+// hostname resolving to a link-local cannot be caught here (resolution is
+// runtime); a scoped hostname is already refused by
+// validateRPMScopedHostnameStrict, and an unscoped hostname that resolves
+// to a link-local would fail at runtime with ErrProbeSetup (the same
+// missing-zone error in probeICMP). routing-instance / next-hop scopes do
+// NOT supply a link scope (a VRF master device / fwmark route is not an
+// egress link for fe80::), so only destination-interface satisfies the
+// requirement. Strict on commit / commit-check (hard reject so the gap is
+// operator-visible); lenient on load / peer-sync (warn — #1960 no-brick;
+// the runtime probeICMP guard returns ErrProbeSetup for the same bare
+// link-local, so a leniently-loaded test HOLDS state instead of actuating
+// routes off a dead measurement). Mirrors validateRPMScopedHostnameStrict.
+func validateRPMLinkLocalZoneStrict(cfg *Config) error {
+	if cfg == nil || cfg.Services.RPM == nil {
+		return nil
+	}
+	for _, probe := range cfg.Services.RPM.Probes {
+		if probe == nil {
+			continue
+		}
+		for _, test := range probe.Tests {
+			if test == nil || test.Target == "" {
+				continue
+			}
+			host := test.Target
+			zone := ""
+			if i := strings.IndexByte(host, '%'); i >= 0 {
+				zone = host[i+1:]
+				host = host[:i]
+			}
+			ip := net.ParseIP(host)
+			if ip == nil || ip.To4() != nil || !ip.IsLinkLocalUnicast() {
+				continue // not an IPv6 link-local literal
+			}
+			if zone == "" && test.DestinationInterface == "" {
+				return fmt.Errorf(
+					"services rpm probe %q test %q: target %q is an IPv6 link-local address "+
+						"with no scope — add an explicit %%zone (fe80::1%%ge-0/0/3) or a "+
+						"destination-interface so the probe can pick the egress link",
+					probe.Name, test.Name, test.Target)
+			}
+		}
+	}
+	return nil
+}
+
 // validateRPMProbePinsStrict enforces the probe-pin band invariants
 // (#1827 PR-1a): at most ProbeTableCount next-hop-pinned tests (one
 // reserved kernel table each), and no routing-instance table ID may
