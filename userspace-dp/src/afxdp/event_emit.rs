@@ -294,8 +294,10 @@ fn policy_action_to_rt_flow(action: PolicyAction) -> u8 {
         // #2089: the policy-deny path now synthesizes a TCP RST / ICMP
         // unreachable for `reject` (poll_descriptor reject_reply), so the
         // RT_FLOW action reports reject, matching the wire behavior and
-        // Junos. (Filter reject — filter_action_to_rt_flow below — is
-        // still a silent drop and stays mapped to deny.)
+        // Junos. (#2521: filter reject — filter_action_to_rt_flow below —
+        // now ALSO synthesizes an active reject reply (RST/ICMP) and maps
+        // to RT_FLOW_ACTION_REJECT, same as policy reject; filter DISCARD
+        // remains the silent-drop → deny case.)
         PolicyAction::Reject => RT_FLOW_ACTION_REJECT,
     }
 }
@@ -305,10 +307,13 @@ fn filter_action_to_rt_flow(action: FilterAction) -> u8 {
     match action {
         FilterAction::Accept => RT_FLOW_ACTION_PERMIT,
         FilterAction::Discard => RT_FLOW_ACTION_DENY,
-        // Userspace filter reject is currently fail-closed as a terminal
-        // drop. Until per-path reject packet synthesis is wired, RT_FLOW
-        // must report deny rather than claiming an ICMP/RST reject happened.
-        FilterAction::Reject => RT_FLOW_ACTION_DENY,
+        // #2521: filter `then reject` now synthesizes an active reply (TCP
+        // RST / ICMP unreachable) via the same path as policy reject
+        // (poll_descriptor enqueue_filter_reject_reply), so RT_FLOW reports
+        // reject — matching the wire behavior and Junos, like
+        // policy_action_to_rt_flow above. `discard` stays a silent drop →
+        // deny.
+        FilterAction::Reject => RT_FLOW_ACTION_REJECT,
     }
 }
 
@@ -657,8 +662,13 @@ mod tests {
         assert_eq!(handle.dataplane_event_stats().filter_log.sent, 1);
     }
 
+    /// #2521: filter `then reject` now synthesizes an active reply (the
+    /// dataplane enqueues a TCP RST / ICMP unreachable), so the RT_FLOW filter
+    /// log reports REJECT — matching policy reject and Junos. (Pre-#2521 this
+    /// asserted DENY because no reply was generated.) `discard` still maps to
+    /// DENY (`filter_log_event_emit_discard_as_deny`).
     #[test]
-    fn filter_log_event_emit_fails_closed_reject_as_deny() {
+    fn filter_log_event_emit_reject_reports_reject() {
         let (handle, rx) = unlimited_handle();
         let flow = test_flow();
 
@@ -681,10 +691,40 @@ mod tests {
             .decode_dataplane_event()
             .expect("filter event payload");
         assert_eq!(event.kind, DataplaneEventKind::FilterLog);
-        assert_eq!(event.action, RT_FLOW_ACTION_DENY);
+        assert_eq!(event.action, RT_FLOW_ACTION_REJECT);
         assert_eq!(event.filter_id, 23);
         assert_eq!(event.term_id, 6);
         assert_eq!(event.reason, FilterLogSource::Lo0.wire_reason());
+        assert_eq!(handle.dataplane_event_stats().filter_log.sent, 1);
+    }
+
+    /// #2521: `then discard` stays a silent drop → RT_FLOW DENY (the
+    /// distinction from reject above).
+    #[test]
+    fn filter_log_event_emit_discard_as_deny() {
+        let (handle, rx) = unlimited_handle();
+        let flow = test_flow();
+
+        emit_filter_log_event(
+            Some(&handle),
+            &flow,
+            test_meta(),
+            7,
+            0,
+            23,
+            6,
+            FilterAction::Discard,
+            FilterLogSource::Lo0,
+            789,
+        );
+
+        let event = rx
+            .try_recv()
+            .expect("filter event frame")
+            .decode_dataplane_event()
+            .expect("filter event payload");
+        assert_eq!(event.kind, DataplaneEventKind::FilterLog);
+        assert_eq!(event.action, RT_FLOW_ACTION_DENY);
         assert_eq!(handle.dataplane_event_stats().filter_log.sent, 1);
     }
 }

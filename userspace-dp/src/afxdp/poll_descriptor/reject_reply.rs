@@ -19,6 +19,20 @@ use super::worker::WorkerTxPipeline;
 use super::*;
 use crate::afxdp::icmp::build_reject_icmp_unreachable;
 
+/// Which `reject` source a synthesized reply is attributed to. Selects the
+/// per-source counters so a policy `then reject` and a firewall-filter `then
+/// reject` are independently observable, while both flow through the SAME
+/// reply-synthesis + output-classification machinery (#2521). The
+/// budget-exhaustion / output-filter-drop / parse-error legs are shared with
+/// policy reject so #2472's future per-reason rate limiter (which hooks the
+/// shared generated-reply path) covers filter reject automatically — there is
+/// no parallel, un-limitable emit path.
+#[derive(Clone, Copy)]
+pub(super) enum RejectReplySource {
+    Policy,
+    Filter,
+}
+
 #[cold]
 #[inline(never)]
 pub(super) fn enqueue_policy_reject_reply(
@@ -29,6 +43,62 @@ pub(super) fn enqueue_policy_reject_reply(
     meta: UserspaceDpMeta,
     flow: &SessionFlow,
     counters: &mut BatchCounters,
+) -> bool {
+    enqueue_reject_reply(
+        tx_pipeline,
+        forwarding,
+        ingress_ifindex,
+        packet_frame,
+        meta,
+        flow,
+        counters,
+        RejectReplySource::Policy,
+    )
+}
+
+/// #2521: firewall-filter `then reject` now synthesizes the SAME active
+/// reply as policy `reject` (TCP RST for TCP, ICMP/ICMPv6 admin-prohibited
+/// unreachable otherwise) instead of the historical silent drop. Reuses the
+/// exact synthesis + #2238 output-classification path via the shared
+/// `enqueue_reject_reply`; only the success counter differs
+/// (`filter_reject_sent` vs `policy_reject_sent`). Budget, output-filter, and
+/// parse-error drops share policy reject's counters and its fail-closed
+/// behavior (the caller still drops the packet on a `false` return).
+#[cold]
+#[inline(never)]
+pub(super) fn enqueue_filter_reject_reply(
+    tx_pipeline: &mut WorkerTxPipeline,
+    forwarding: &ForwardingState,
+    ingress_ifindex: i32,
+    packet_frame: &[u8],
+    meta: UserspaceDpMeta,
+    flow: &SessionFlow,
+    counters: &mut BatchCounters,
+) -> bool {
+    enqueue_reject_reply(
+        tx_pipeline,
+        forwarding,
+        ingress_ifindex,
+        packet_frame,
+        meta,
+        flow,
+        counters,
+        RejectReplySource::Filter,
+    )
+}
+
+#[cold]
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn enqueue_reject_reply(
+    tx_pipeline: &mut WorkerTxPipeline,
+    forwarding: &ForwardingState,
+    ingress_ifindex: i32,
+    packet_frame: &[u8],
+    meta: UserspaceDpMeta,
+    flow: &SessionFlow,
+    counters: &mut BatchCounters,
+    source: RejectReplySource,
 ) -> bool {
     if !syn_cookie_reply_budget_available(tx_pipeline) {
         counters.touched = true;
@@ -83,7 +153,10 @@ pub(super) fn enqueue_policy_reject_reply(
         enqueue_ns: 0,
     });
     counters.touched = true;
-    counters.policy_reject_sent += 1;
+    match source {
+        RejectReplySource::Policy => counters.policy_reject_sent += 1,
+        RejectReplySource::Filter => counters.filter_reject_sent += 1,
+    }
     true
 }
 
@@ -328,6 +401,130 @@ mod tests {
         assert_eq!(counters.policy_reject_output_filter_drops, 1);
         assert_eq!(counters.generated_reply_classify_parse_errors, 0);
         assert!(pipeline.pending_tx_local.is_empty());
+    }
+
+    /// #2521: a firewall-filter `then reject` on a TCP flow synthesizes a TCP
+    /// RST (not a silent drop) and increments `filter_reject_sent` — NOT
+    /// `policy_reject_sent`. Fail-on-revert: if the call site reverts to a
+    /// silent recycle (no synthesis), `pending_tx_local` stays empty and
+    /// `filter_reject_sent` stays 0; if it routes through the policy counter,
+    /// the per-source counter assertion fails.
+    #[test]
+    fn filter_reject_tcp_enqueues_rst_filter_counter() {
+        use super::cookie_reply::SYN_COOKIE_REPLY_PENDING_RESERVE;
+        let (frame, meta, flow) = tcp_v4_syn();
+        let mut pipeline = tx_pipeline(
+            SYN_COOKIE_REPLY_PENDING_RESERVE * 2,
+            SYN_COOKIE_REPLY_PENDING_RESERVE + 1,
+        );
+        let forwarding = ForwardingState::default();
+        let mut counters = BatchCounters::default();
+        let sent = enqueue_filter_reject_reply(
+            &mut pipeline,
+            &forwarding,
+            5,
+            &frame,
+            meta,
+            &flow,
+            &mut counters,
+        );
+        assert!(sent, "filter TCP reject must enqueue a RST");
+        assert_eq!(
+            counters.filter_reject_sent, 1,
+            "filter reject must bump filter_reject_sent"
+        );
+        assert_eq!(
+            counters.policy_reject_sent, 0,
+            "filter reject must NOT bump policy_reject_sent"
+        );
+        let req = pipeline
+            .pending_tx_local
+            .pop_front()
+            .expect("filter reject RST request");
+        assert_eq!(req.egress_ifindex, 5);
+        // Reflected RST: dst MAC is the inbound src MAC; RST flag set.
+        assert_eq!(&req.bytes[0..6], &[0x36, 0xe4, 0x2b, 0xd5, 0x39, 0xe6]);
+        let tcp_flags = req.bytes[14 + 20 + 13];
+        assert_ne!(tcp_flags & 0x04, 0, "RST flag must be set");
+    }
+
+    /// #2521: a firewall-filter `then reject` on a NON-TCP (ICMP) flow
+    /// synthesizes an ICMP unreachable and increments `filter_reject_sent`.
+    #[test]
+    fn filter_reject_non_tcp_enqueues_icmp_unreachable() {
+        use super::cookie_reply::SYN_COOKIE_REPLY_PENDING_RESERVE;
+        let client = std::net::Ipv4Addr::new(10, 0, 61, 102);
+        let server = std::net::Ipv4Addr::new(1, 1, 1, 1);
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&[0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]);
+        frame.extend_from_slice(&[0x36, 0xe4, 0x2b, 0xd5, 0x39, 0xe6]);
+        frame.extend_from_slice(&0x0800u16.to_be_bytes());
+        frame.extend_from_slice(&[
+            0x45, 0x00, 0x00, 0x1c, 0x00, 0x00, 0x40, 0x00, 64, PROTO_ICMP, 0, 0,
+        ]);
+        frame.extend_from_slice(&client.octets());
+        frame.extend_from_slice(&server.octets());
+        frame.extend_from_slice(&[8, 0, 0, 0, 0x12, 0x34, 0, 1]); // ICMP echo
+        let meta = UserspaceDpMeta {
+            ingress_ifindex: 5,
+            l3_offset: 14,
+            l4_offset: 34,
+            addr_family: libc::AF_INET as u8,
+            protocol: PROTO_ICMP,
+            pkt_len: (frame.len() - 14) as u16,
+            ..UserspaceDpMeta::default()
+        };
+        let flow = SessionFlow {
+            src_ip: std::net::IpAddr::V4(client),
+            dst_ip: std::net::IpAddr::V4(server),
+            forward_key: SessionKey {
+                addr_family: libc::AF_INET as u8,
+                protocol: PROTO_ICMP,
+                src_ip: std::net::IpAddr::V4(client),
+                dst_ip: std::net::IpAddr::V4(server),
+                src_port: 0x1234,
+                dst_port: 0,
+            },
+        };
+        // build_reject_icmp_unreachable needs an egress with a v4 primary on
+        // the reply's egress interface (the inbound ingress ifindex).
+        let mut forwarding = ForwardingState::default();
+        forwarding.egress.insert(
+            5,
+            EgressInterface {
+                bind_ifindex: 5,
+                vlan_id: 0,
+                mtu: 1500,
+                src_mac: [0x02, 0xbf, 0x72, 0x00, 0x61, 0x01],
+                zone_id: 0,
+                redundancy_group: 0,
+                primary_v4: Some(std::net::Ipv4Addr::new(10, 0, 61, 1)),
+                primary_v6: None,
+            },
+        );
+        let mut pipeline = tx_pipeline(
+            SYN_COOKIE_REPLY_PENDING_RESERVE * 2,
+            SYN_COOKIE_REPLY_PENDING_RESERVE + 1,
+        );
+        let mut counters = BatchCounters::default();
+        let sent = enqueue_filter_reject_reply(
+            &mut pipeline,
+            &forwarding,
+            5,
+            &frame,
+            meta,
+            &flow,
+            &mut counters,
+        );
+        assert!(sent, "filter non-TCP reject must enqueue an ICMP unreachable");
+        assert_eq!(counters.filter_reject_sent, 1);
+        assert_eq!(counters.policy_reject_sent, 0);
+        let req = pipeline
+            .pending_tx_local
+            .pop_front()
+            .expect("filter reject ICMP request");
+        // ICMP unreachable: type 3 at the L4 offset of the reply.
+        assert_eq!(req.bytes[14 + 20], 3, "ICMP type must be Destination Unreachable");
     }
 
     #[test]

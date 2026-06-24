@@ -389,3 +389,42 @@ a per-interface `has_<X>_match` set — the flow-cache never holds
 a lo0 decision in the first place. This is noted here so future
 readers do not repeat the v1 plan investigation that mistook lo0
 for a missing cache-sensitive gate.
+
+### `then reject` synthesizes an active reply (#2521)
+
+`FilterAction::Reject` (`then reject`) no longer realizes as a silent
+drop. It now synthesizes and transmits an active reject reply — a TCP
+RST for TCP, an ICMP/ICMPv6 administratively-prohibited Destination
+Unreachable otherwise — using the **same** machinery as policy
+`reject`. `FilterAction::Discard` (`then discard`) is unchanged: still
+a silent drop, no reply.
+
+The synthesis is the shared `enqueue_reject_reply` in
+`poll_descriptor/reject_reply.rs`; `enqueue_policy_reject_reply` and
+`enqueue_filter_reject_reply` are thin wrappers over it that differ
+only in the success counter (`policy_reject_sent` vs
+`filter_reject_sent`). Filter reject is wired at every input/lo0
+filter drop site in `poll_descriptor/mod.rs` that previously recycled
+the descriptor on a terminal action: the new-flow input filter, the
+DSCP/L4-sensitive session-hit re-evaluation, and both lo0 local-delivery
+paths. `apply_lo0_filter_action` returns the matched `FilterAction`
+(not a bare drop `bool`) so the caller can tell `Reject` from
+`Discard`.
+
+Because the generated reply runs through the SAME path as policy
+reject, it inherits the #2238 output-filter / CoS / DSCP
+classification (`classify_generated_reply`, keyed on the reply's OWN
+egress tuple) and the SYN-cookie TX-frame budget gate — and a future
+per-reason generated-reply rate limiter (#2472) covers filter reject
+automatically (no parallel, un-limitable emit path). Budget exhaustion,
+output-filter drops, and parse-error drops share policy reject's
+counters and its fail-closed behavior (the caller still drops the
+packet when synthesis returns `false`). The RT_FLOW filter-log action
+maps `Reject → reject` (matching policy reject and Junos), `Discard →
+deny`.
+
+**Scope:** output-firewall-filter `then reject` realized on the
+TX/CoS path (`tx/cos_classify.rs`) still collapses `Reject` to a
+silent drop. That site lacks the descriptor/packet context the
+reflected-reply synthesis needs, so wiring it would be a divergent
+path — tracked as a follow-up, not part of #2521.

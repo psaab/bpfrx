@@ -1681,7 +1681,13 @@ type BindingStatus struct {
 	SYNCookieBypass              uint64 `json:"syn_cookie_bypass,omitempty"`
 	// #2089: policy `reject` action — RST/ICMP-unreachable replies sent,
 	// and replies suppressed due to TX-frame budget exhaustion.
-	PolicyRejectSent             uint64 `json:"policy_reject_sent,omitempty"`
+	PolicyRejectSent uint64 `json:"policy_reject_sent,omitempty"`
+	// #2521: firewall-filter `then reject` — RST/ICMP-unreachable replies
+	// sent (mirrors PolicyRejectSent). The suppression legs (budget,
+	// output-filter, parse-error) are shared with policy reject because both
+	// run the same synthesis + #2238 classification path. omitempty + Rust
+	// serde `default` keep cross-version wire safety.
+	FilterRejectSent             uint64 `json:"filter_reject_sent,omitempty"`
 	PolicyRejectReplyBudgetDrops uint64 `json:"policy_reject_reply_budget_drops,omitempty"`
 	// #2238: locally-generated replies (Time Exceeded, policy-reject
 	// RST/ICMP-unreachable, SYN-cookie SYN-ACK/ACK-RST) are now classified by
