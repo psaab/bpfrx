@@ -228,6 +228,109 @@ type bfdProfile struct {
 	multiplier int
 }
 
+// bfdPeer holds a BGP BFD peer destined for the single top-level `bfd`
+// block. vrfName carries the routing-instance the peer belongs to so
+// bfdd associates the session with the VRF-bound neighbor (#2489).
+type bfdPeer struct {
+	address    string
+	vrfName    string
+	interval   int
+	multiplier int
+}
+
+// bfdSection accumulates BFD profiles and peers across the default
+// routing instance AND every VRF so the FRR manager can emit a SINGLE
+// top-level `bfd { ... }` block exactly once (#2550). FRR's bfdd is one
+// global daemon; emitting a `bfd` stanza per routing instance produced
+// redundant blocks and repeated profile definitions in the consolidated
+// frr.conf, risking frr-reload parse warnings.
+type bfdSection struct {
+	profiles map[string]bfdProfile
+	peers    []bfdPeer
+}
+
+// newBFDSection returns an empty accumulator.
+func newBFDSection() *bfdSection {
+	return &bfdSection{profiles: make(map[string]bfdProfile)}
+}
+
+// addProfile records a unique profile (dedup is by name, which already
+// encodes interval+multiplier via bfdProfileName).
+func (s *bfdSection) addProfile(name string, p bfdProfile) {
+	s.profiles[name] = p
+}
+
+// addPeer appends a BGP BFD peer in caller (instance) order.
+func (s *bfdSection) addPeer(p bfdPeer) {
+	s.peers = append(s.peers, p)
+}
+
+// empty reports whether nothing was accumulated.
+func (s *bfdSection) empty() bool {
+	return len(s.profiles) == 0 && len(s.peers) == 0
+}
+
+// render emits a single top-level `bfd` block containing all accumulated
+// peers (in instance order) followed by all profiles (sorted by name for
+// deterministic output). Returns "" when nothing was accumulated. The
+// per-stanza format is byte-identical to the pre-#2550 per-instance
+// emission, so only the block COUNT changes (one global block instead of
+// one per routing instance).
+func (s *bfdSection) render() string {
+	if s.empty() {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("bfd\n")
+	for _, p := range s.peers {
+		// A `peer <addr>` line with no `vrf` suffix lands in the DEFAULT
+		// VRF. A VRF-scoped BGP session's BFD peer MUST carry the same
+		// `vrf <name>` so bfdd associates the BFD session with the
+		// VRF-bound neighbor; otherwise the session stays DOWN and
+		// sub-second failover never works (#2489).
+		if p.vrfName != "" {
+			fmt.Fprintf(&b, " peer %s vrf %s\n", p.address, p.vrfName)
+		} else {
+			fmt.Fprintf(&b, " peer %s\n", p.address)
+		}
+		multiplier := p.multiplier
+		if multiplier == 0 {
+			multiplier = 3
+		}
+		interval := p.interval
+		if interval == 0 {
+			interval = 300
+		}
+		fmt.Fprintf(&b, "  detect-multiplier %d\n", multiplier)
+		fmt.Fprintf(&b, "  receive-interval %d\n", interval)
+		fmt.Fprintf(&b, "  transmit-interval %d\n", interval)
+		b.WriteString(" exit\n")
+	}
+	var profileNames []string
+	for name := range s.profiles {
+		profileNames = append(profileNames, name)
+	}
+	sort.Strings(profileNames)
+	for _, name := range profileNames {
+		p := s.profiles[name]
+		interval := p.interval
+		if interval == 0 {
+			interval = 300
+		}
+		multiplier := p.multiplier
+		if multiplier == 0 {
+			multiplier = 3
+		}
+		fmt.Fprintf(&b, " profile %s\n", name)
+		fmt.Fprintf(&b, "  detect-multiplier %d\n", multiplier)
+		fmt.Fprintf(&b, "  receive-interval %d\n", interval)
+		fmt.Fprintf(&b, "  transmit-interval %d\n", interval)
+		b.WriteString(" exit\n")
+	}
+	b.WriteString("exit\n!\n")
+	return b.String()
+}
+
 // bfdProfileName returns a deterministic profile name like "xpf-300-3".
 func bfdProfileName(interval, multiplier int) string {
 	if interval == 0 {
@@ -243,9 +346,24 @@ func bfdProfileName(interval, multiplier int) string {
 // If vrfName is non-empty, generates VRF-scoped commands.
 // ecmpMaxPaths > 1 enables ECMP with the given maximum equal-cost paths.
 // policyOptions is used to resolve export policy names to route-map references.
-func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPFv3Config, bgp *config.BGPConfig, rip *config.RIPConfig, isis *config.ISISConfig, vrfName string, ecmpMaxPaths int, policyOptions *config.PolicyOptionsConfig) string {
+//
+// BFD emission (#2550): when the optional `shared` accumulator is provided
+// (the manager passes one section across the default instance AND every
+// VRF), this function ONLY accumulates BFD profiles/peers into it and emits
+// NO `bfd` block — the manager renders a single global block once. When no
+// shared section is passed (direct callers / unit tests), it falls back to
+// a function-local section emitted at the end, preserving the historical
+// single-instance behavior byte-for-byte.
+func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPFv3Config, bgp *config.BGPConfig, rip *config.RIPConfig, isis *config.ISISConfig, vrfName string, ecmpMaxPaths int, policyOptions *config.PolicyOptionsConfig, shared ...*bfdSection) string {
 	var b strings.Builder
-	bfdProfiles := make(map[string]bfdProfile)
+	var bfd *bfdSection
+	emitLocal := false
+	if len(shared) > 0 && shared[0] != nil {
+		bfd = shared[0]
+	} else {
+		bfd = newBFDSection()
+		emitLocal = true
+	}
 
 	vrfSuffix := ""
 	if vrfName != "" {
@@ -329,7 +447,7 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 				if iface.BFD {
 					if iface.BFDInterval > 0 || iface.BFDMultiplier > 0 {
 						profile := bfdProfileName(iface.BFDInterval, iface.BFDMultiplier)
-						bfdProfiles[profile] = bfdProfile{iface.BFDInterval, iface.BFDMultiplier}
+						bfd.addProfile(profile, bfdProfile{iface.BFDInterval, iface.BFDMultiplier})
 						fmt.Fprintf(&b, " ip ospf bfd profile %s\n", profile)
 					} else {
 						b.WriteString(" ip ospf bfd\n")
@@ -368,7 +486,7 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 					if iface.BFD {
 						if iface.BFDInterval > 0 || iface.BFDMultiplier > 0 {
 							profile := bfdProfileName(iface.BFDInterval, iface.BFDMultiplier)
-							bfdProfiles[profile] = bfdProfile{iface.BFDInterval, iface.BFDMultiplier}
+							bfd.addProfile(profile, bfdProfile{iface.BFDInterval, iface.BFDMultiplier})
 							fmt.Fprintf(&b, " ipv6 ospf6 bfd profile %s\n", profile)
 						} else {
 							b.WriteString(" ipv6 ospf6 bfd\n")
@@ -696,7 +814,7 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 			if iface.BFD {
 				if iface.BFDInterval > 0 || iface.BFDMultiplier > 0 {
 					profile := bfdProfileName(iface.BFDInterval, iface.BFDMultiplier)
-					bfdProfiles[profile] = bfdProfile{iface.BFDInterval, iface.BFDMultiplier}
+					bfd.addProfile(profile, bfdProfile{iface.BFDInterval, iface.BFDMultiplier})
 					fmt.Fprintf(&b, " isis bfd profile %s\n", profile)
 				} else {
 					b.WriteString(" isis bfd\n")
@@ -705,75 +823,29 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 		}
 	}
 
-	// BFD peer blocks for BGP neighbors with BFD enabled
+	// Accumulate BFD peer entries for BGP neighbors with BFD enabled. The
+	// in-scope vrfName is recorded with each peer so the single global
+	// block carries the matching `vrf <name>` suffix (#2489). Emission is
+	// deferred to bfdSection.render() — either here (local fallback) or by
+	// the manager for the consolidated global block (#2550).
 	if bgp != nil {
-		var bfdPeers []*config.BGPNeighbor
 		for _, n := range bgp.Neighbors {
 			if n.BFD {
-				bfdPeers = append(bfdPeers, n)
+				bfd.addPeer(bfdPeer{
+					address:    n.Address,
+					vrfName:    vrfName,
+					interval:   n.BFDInterval,
+					multiplier: n.BFDMultiplier,
+				})
 			}
-		}
-		if len(bfdPeers) > 0 {
-			b.WriteString("bfd\n")
-			for _, n := range bfdPeers {
-				// FRR's bfdd is a single top-level daemon: a `peer <addr>`
-				// line with no `vrf` suffix is created in the DEFAULT VRF.
-				// A VRF-scoped BGP session's BFD peer MUST carry the same
-				// `vrf <name>` so bfdd associates the BFD session with the
-				// VRF-bound neighbor; otherwise the session stays DOWN and
-				// sub-second failover never works (#2489). This block is
-				// rendered once per BGP instance (manager.go calls
-				// generateProtocols per-instance), so the in-scope vrfName
-				// is correct for every peer in this block — default-instance
-				// peers (vrfName == "") get no suffix.
-				if vrfName != "" {
-					fmt.Fprintf(&b, " peer %s vrf %s\n", n.Address, vrfName)
-				} else {
-					fmt.Fprintf(&b, " peer %s\n", n.Address)
-				}
-				multiplier := n.BFDMultiplier
-				if multiplier == 0 {
-					multiplier = 3
-				}
-				interval := n.BFDInterval
-				if interval == 0 {
-					interval = 300
-				}
-				fmt.Fprintf(&b, "  detect-multiplier %d\n", multiplier)
-				fmt.Fprintf(&b, "  receive-interval %d\n", interval)
-				fmt.Fprintf(&b, "  transmit-interval %d\n", interval)
-				b.WriteString(" exit\n")
-			}
-			b.WriteString("exit\n!\n")
 		}
 	}
 
-	// Emit deduplicated BFD profile stanzas
-	if len(bfdProfiles) > 0 {
-		// Collect and sort profile names for deterministic output
-		var profileNames []string
-		for name := range bfdProfiles {
-			profileNames = append(profileNames, name)
-		}
-		sort.Strings(profileNames)
-		b.WriteString("bfd\n")
-		for _, name := range profileNames {
-			p := bfdProfiles[name]
-			interval := p.interval
-			if interval == 0 {
-				interval = 300
-			}
-			multiplier := p.multiplier
-			if multiplier == 0 {
-				multiplier = 3
-			}
-			fmt.Fprintf(&b, " profile %s\n", name)
-			fmt.Fprintf(&b, "  detect-multiplier %d\n", multiplier)
-			fmt.Fprintf(&b, "  receive-interval %d\n", interval)
-			fmt.Fprintf(&b, "  transmit-interval %d\n", interval)
-			b.WriteString(" exit\n")
-		}
-		b.WriteString("exit\n!\n")
+	// In local-fallback mode (no shared accumulator from the manager) emit
+	// the single `bfd` block here, preserving historical single-instance
+	// output. In shared mode the manager renders one global block instead.
+	if emitLocal {
+		b.WriteString(bfd.render())
 	}
 
 	return b.String()
