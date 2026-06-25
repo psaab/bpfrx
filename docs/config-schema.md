@@ -162,6 +162,22 @@ separate `from community c3` sibling keeps every value (`[c1 c2 c3]`).
 Fail-on-revert covered by `TestPolicyFromCommunity*`, `TestPolicyFromPrefixList*`,
 and `TestPolicyFromASPath*` in `pkg/config/policy_from_multileaf_2689_test.go`.
 
+The policy-statement ACTION `then as-path-prepend "<asn> <asn> ..."` (#2892) is
+the same class on the `then` side. The leaf is `multi:true`
+(`schema_routing.go`: `policy-options policy-statement <name> term <name> then
+as-path-prepend`) so a quoted `"65001 65001"` or bracketed `[ 65001 65001 ]`
+list — the lexer strips quotes and brackets alike — flattens onto the node's
+`Keys`/`Children` rather than collapsing to last-only. `parsePolicyTermChildren`
+and `parsePolicyTermInlineKeys` (`compiler_routing.go`) read EVERY ASN via
+`firewallMatchValues` (reading only `Keys[1]` would drop all but the first
+prepend — and dropping the repeats defeats the AS-path-prepend mechanism, which
+is exactly the repetition). The ordered list lands in `PolicyTerm.ASPathPrepend
+[]string` and renders as the FRR `set as-path prepend <asn> <asn> ...` clause
+(`policy_render.go`). Fail-on-revert covered by `TestASPathPrepend_*` in
+`pkg/config/compiler_as_path_prepend_2892_test.go` (parse) and
+`TestGeneratePolicyOptions_ASPathPrepend` in
+`pkg/frr/policy_as_path_prepend_2892_test.go` (render).
+
 ## Repeated same-type sibling matches (NOT bracketed multi-value)
 
 The dual-AST contract above covers a single leaf carrying a bracketed list
