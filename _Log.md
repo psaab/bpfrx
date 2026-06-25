@@ -1,3 +1,28 @@
+## 2026-06-25 — #2867: VRRP GARP/NA burst follow-up loops keep poisoning after abdication
+
+- **Timestamp**: 2026-06-25
+- **Action**: The detached GARP/NA burst follow-up loops
+  (`runARPBurstFollowups` / `runNABurstFollowups` in `pkg/cluster/garp.go`,
+  launched from `becomeMaster` → `sendGARP` → `SendGratuitous*Burst`) had no
+  epoch/state gate. A node abdicating master mid-burst (link flap / rapid
+  preempt / split-brain) kept broadcasting GARP/NA for VIPs it no longer
+  owned, re-poisoning neighbor caches. Added a `BurstStillValid func() bool`
+  predicate threaded through `SendGratuitousARPBurstGated` /
+  `SendGratuitousIPv6BurstGated` into the follow-up loops; checked before
+  every follow-up frame, stops on false. `sendGARP` passes
+  `getState()==StateMaster && garpEpoch==captured` (composes with the
+  #2081 garpEpoch / #2082 preempt-gate). Original ungated `SendGratuitous*Burst`
+  kept as nil-predicate wrappers for direct-mode re-announce callers.
+- **File(s)**: pkg/cluster/garp.go, pkg/vrrp/instance.go,
+  pkg/cluster/garp_abdicate_test.go (fail-on-revert),
+  pkg/vrrp/instance_garp_abdicate_test.go, pkg/cluster/garp_burst_errors_test.go
+  (signature update), pkg/cluster/README.md, pkg/vrrp/README.md
+- **Validation**: go build ./..., gofmt -l (clean), go vet, go test -race
+  ./pkg/cluster/... ./pkg/vrrp/... — green. Fail-on-revert verified: removing
+  the gate turns TestARPBurstFollowups_AbortsOnAbdication +
+  TestNABurstFollowups_AbortsOnAbdication RED. HA — PARENT runs
+  make test-failover before merge.
+
 ## 2026-06-25 — #2843: DDNS Surface A status omits never-published / errored scopes
 
 - **Timestamp**: 2026-06-25
@@ -17222,6 +17247,43 @@ top.
   TestObserveInterfaceAddrTransientVsDefinitive/LinkByName_error RED.
 
 - **Timestamp**: 2026-06-25
+- **Action**: #2864 static-NAT DNAT zone fallback — evaluate the
+  `from zone` constraint PER CANDIDATE so a port-specific entry whose
+  zone does not match the packet's ingress zone falls through to the
+  whole-address `(dst_ip, None)` entry instead of short-circuiting to
+  no-DNAT. Port-specific precedence preserved (it still wins when its
+  zone matches). Added fail-on-revert test
+  `static_nat_dnat_port_zone_mismatch_falls_back_to_whole_address`
+  (port-zone-fail falls back; port wins on its zone; no candidate matches
+  ingress zone -> no DNAT; unknown IP -> no DNAT). No wire change.
+- **File(s)**: userspace-dp/src/nat/static_nat.rs,
+  userspace-dp/src/nat/tests.rs, docs/feature-coverage.md
+- **Validation**: cargo build --release -p xpf-userspace-dp (clean) ;
+  cargo test --release --bin xpf-userspace-dp -- nat dnat static
+  (466 passed, 0 failed). Fail-on-revert confirmed: reverting the
+  per-candidate `.filter(zone_ok)` fall-through to the once-after-precedence
+  zone check makes the new test RED at the `fallback match` expect.
+  protocol_wire_v1.json untouched.
+- **Action**: #2889 — reject FRR auth secrets containing whitespace at
+  commit. A BGP neighbor password / OSPF-RIP-ISIS auth key with a space
+  (or tab / control char) cannot be expressed as a single FRR/vtysh token
+  (FRR's command lexer, lib/command_lex.l, splits on whitespace and has
+  NO quoted-string and NO rest-of-line token — quoting is impossible), so
+  it would be truncated at the first space or inject trailing words as
+  extra vtysh args at frr.conf load. Researched FRR's lexer to confirm
+  quoting is unsupported, then added validateFRRAuthValuesStrict (strict
+  on commit/commit-check naming the field; lenient warn on load/HA-sync
+  per #1960). Scoped to the security-relevant password/key clauses;
+  neighbor description left control-char-sanitized only (noted as
+  follow-up).
+- **File(s)**: pkg/config/compiler.go,
+  pkg/config/compiler_validate_strict.go,
+  pkg/config/parser_routing_test.go, pkg/frr/README.md
+- **Validation**: go build ./... ; gofmt -l (clean) ; go vet
+  ./pkg/frr/... ./pkg/config/... (clean) ; go test ./pkg/frr/...
+  ./pkg/config/... (PASS). Fail-on-revert confirmed:
+  TestFRRAuthValueWhitespaceRejected goes RED (space-containing secrets
+  compile cleanly) when validateFRRAuthValuesStrict's call site is removed.
   **Action**: #2888 DHCP relay server-facing socket binds giaddr:67 (BOOTPS)
   instead of giaddr:0 (ephemeral). RFC 2131 §4.1: a strict server unicasts its
   reply to the relay at giaddr:67, so an ephemeral-port server conn never

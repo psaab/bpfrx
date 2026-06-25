@@ -1757,13 +1757,26 @@ func (vi *vrrpInstance) sendGARP(force bool) {
 	if count <= 0 {
 		count = 3 // default
 	}
+	// Abdication gate for the detached burst follow-up loops (#2867). The
+	// cluster burst helpers send the first frame synchronously, then fan the
+	// remaining (count-1) frames out over a background goroutine spanning
+	// (count-1)*50ms. If the node loses master (becomes BACKUP) or a newer
+	// burst supersedes this one (garpEpoch bumps) before the loop drains, the
+	// loop must STOP — otherwise it keeps poisoning neighbor caches with GARP
+	// /NA for VIPs this node no longer owns. The closure re-reads live state
+	// before every follow-up frame; it is consulted only AFTER the
+	// synchronous first frame, so the immediate failover advert is never
+	// suppressed.
+	stillMaster := func() bool {
+		return vi.getState() == StateMaster && vi.garpEpoch.Load() == epoch
+	}
 	for _, vip := range vi.cfg.VirtualAddresses {
 		ip, ipNet, err := net.ParseCIDR(vip)
 		if err != nil {
 			continue
 		}
 		if ip.To4() != nil {
-			if err := cluster.SendGratuitousARPBurst(vi.cfg.Interface, ip, count); err != nil {
+			if err := cluster.SendGratuitousARPBurstGated(vi.cfg.Interface, ip, count, stillMaster); err != nil {
 				slog.Warn("vrrp: GARP failed", "key", vi.key(), "vip", ip, "err", err)
 			}
 			// Probe the first usable host (network address + 1) of the
@@ -1786,7 +1799,7 @@ func (vi *vrrpInstance) sendGARP(force bool) {
 				}
 			}
 		} else {
-			if err := cluster.SendGratuitousIPv6Burst(vi.cfg.Interface, ip, count); err != nil {
+			if err := cluster.SendGratuitousIPv6BurstGated(vi.cfg.Interface, ip, count, stillMaster); err != nil {
 				slog.Warn("vrrp: NA failed", "key", vi.key(), "vip", ip, "err", err)
 			}
 		}
