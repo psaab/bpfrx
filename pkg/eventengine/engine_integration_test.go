@@ -1,6 +1,8 @@
 package eventengine
 
 import (
+	"context"
+	"errors"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -150,6 +152,80 @@ func TestBatch_UnknownCommandMidBatchRevertsWholeCandidate(t *testing.T) {
 	}
 	if got := e.Stats().Committed; got != 0 {
 		t.Errorf("Committed=%d; a batch rejected at classify must not commit anything", got)
+	}
+}
+
+// #2868: a remediation commit in flight at daemon shutdown must be cancelled
+// cleanly. The remediation commit (commitFn) drives netlink updates, an FRR
+// reload, and Rust dataplane sync — seconds of work. Before #2868 the engine
+// passed context.Background() to commitFn, so a Close() landing mid-remediation
+// could not cancel the in-flight commit and blocked termination past the
+// systemd TimeoutStopSec SIGKILL.
+//
+// FAIL-ON-REVERT: this test wires a commitFn that blocks until its context is
+// Done, then triggers a remediation and calls Close() (which closes stopCh AND
+// cancels the lifetime context). The commit must observe ctx.Done and abort
+// with ctx.Err(). If the threading is reverted to context.Background(), the
+// commitFn blocks forever (Background never cancels) and the test fails on the
+// timeout below.
+func TestCommit_CancelledOnEngineStop(t *testing.T) {
+	s := newStore(t)
+	pol := &config.EventPolicy{
+		Name:         "p",
+		Events:       []string{"ping_test_failed"},
+		ThenCommands: []string{"set system host-name remediated"},
+	}
+
+	entered := make(chan struct{}) // commitFn reached
+	done := make(chan error, 1)    // commitFn's return value (the ctx error)
+
+	commitFn := func(ctx context.Context, comment string) (*config.Config, error) {
+		close(entered)
+		// Block until the lifetime context is cancelled by Close(). With the
+		// #2868 fix this returns promptly on Close(); reverted to
+		// context.Background() this blocks forever and the test times out.
+		<-ctx.Done()
+		err := ctx.Err()
+		done <- err
+		return nil, err
+	}
+
+	e := New(s, commitFn)
+	e.Apply([]*config.EventPolicy{pol})
+
+	e.HandleEvent(eventFor("ping_test_failed"))
+
+	// Wait for the worker to enter the commit phase.
+	select {
+	case <-entered:
+	case <-time.After(3 * time.Second):
+		t.Fatal("commitFn was never reached")
+	}
+
+	// Stop the engine: this closes stopCh and cancels the lifetime context,
+	// which must cancel the in-flight commit.
+	closed := make(chan struct{})
+	go func() {
+		e.Close()
+		close(closed)
+	}()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("commit ctx err = %v; want context.Canceled (commit must be"+
+				" cancelled on engine stop, not run under context.Background())", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("in-flight remediation commit was NOT cancelled on engine stop" +
+			" — commitFn is running under an uncancellable context (#2868 regression)")
+	}
+
+	// Close must return once the worker drains.
+	select {
+	case <-closed:
+	case <-time.After(3 * time.Second):
+		t.Fatal("Close() did not return after the commit was cancelled")
 	}
 }
 

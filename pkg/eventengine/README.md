@@ -127,6 +127,20 @@ cannot occur.
 - A non-lock error (bad apply / CommitCheck reject) is a permanent failure: no
   retry, bumps `xpf_event_actions_rejected_total`.
 
+## Cancellable remediation commit (#2868)
+
+A remediation commit (`CommitFn`) drives netlink updates, an FRR reload, and
+Rust dataplane sync — seconds of work. The engine threads an **engine-lifetime
+context** into `commitFn` (built in `New`, returned by `commitContext`, and
+passed through `applyOnce`). `Close()` closes `stopCh` AND cancels that context
+(`lifeCancel`), so a remediation commit in flight at daemon shutdown is
+cancelled cleanly instead of running under an uncancellable `context.Background`
+that would block termination past the systemd `TimeoutStopSec` SIGKILL. The
+standalone (no-`commitFn`) `store.Commit()` branch is unaffected (it does not
+take a context). Regression-locked by `TestCommit_CancelledOnEngineStop`, which
+blocks a `commitFn` on `ctx.Done()` and asserts `Close()` aborts it with
+`context.Canceled` (fails on the timeout if reverted to `context.Background`).
+
 ## Metrics (`pkg/api`)
 
 `Engine.Stats()` backs:

@@ -160,6 +160,15 @@ type Engine struct {
 	stopCh    chan struct{}
 	startOnce sync.Once
 
+	// lifeCtx is the engine-lifetime context threaded into the remediation
+	// commit (#2868). It is cancelled by Close() at the same time stopCh is
+	// closed, so a remediation commit in flight at daemon shutdown (which
+	// drives netlink updates, an FRR reload, and Rust dataplane sync — seconds
+	// of work) is cancelled cleanly instead of blocking termination past the
+	// systemd TimeoutStopSec SIGKILL. lifeCancel is its cancel func.
+	lifeCtx    context.Context
+	lifeCancel context.CancelFunc
+
 	// throttle for the runtime fail-closed warning so a flapping probe with a
 	// legacy malformed line cannot flood the log.
 	lastInvalidWarn atomic.Int64
@@ -204,6 +213,7 @@ func (e *Engine) lockRetryDeadline() time.Duration {
 // matcher-only test (New(nil, nil) + attributesMatch) never spawns a
 // goroutine. Call Close() from the daemon shutdown path to stop it.
 func New(store *configstore.Store, commitFn CommitFn) *Engine {
+	ctx, cancel := context.WithCancel(context.Background())
 	return &Engine{
 		store:      store,
 		commitFn:   commitFn,
@@ -212,6 +222,8 @@ func New(store *configstore.Store, commitFn CommitFn) *Engine {
 		regexCache: make(map[string]*regexp.Regexp),
 		actions:    make(chan plannedAction, actionQueueDepth),
 		stopCh:     make(chan struct{}),
+		lifeCtx:    ctx,
+		lifeCancel: cancel,
 	}
 }
 
@@ -364,6 +376,11 @@ func (e *Engine) startWorker() {
 func (e *Engine) Close() {
 	e.stopOnce.Do(func() {
 		close(e.stopCh)
+		// Cancel the lifetime context so a remediation commit in flight
+		// (commitFn) aborts cleanly on shutdown (#2868).
+		if e.lifeCancel != nil {
+			e.lifeCancel()
+		}
 	})
 	e.workerWG.Wait()
 }
@@ -473,7 +490,7 @@ func (e *Engine) runAction(a plannedAction) {
 	backoff := e.lockRetryInitial()
 	maxBackoff := e.lockRetryMax()
 	for {
-		err := e.applyOnce(a)
+		err := e.applyOnce(e.commitContext(), a)
 		if err == nil {
 			e.counters.committed.Add(1)
 			e.armCooldown(a.policyName)
@@ -516,7 +533,18 @@ func (e *Engine) runAction(a plannedAction) {
 // CommitCheck, then commit. ANY failure discards the candidate (ExitConfigure)
 // — never a half-applied config. Returns ErrConfigLocked unwrapped (caller
 // retries) or another error (caller treats as permanent).
-func (e *Engine) applyOnce(a plannedAction) error {
+// commitContext returns the engine-lifetime context threaded into the
+// remediation commit (#2868). An Engine built via New always has lifeCtx set;
+// the nil guard covers a zero-value Engine (defensive — no test constructs one)
+// so callers never pass a nil context to commitFn.
+func (e *Engine) commitContext() context.Context {
+	if e.lifeCtx != nil {
+		return e.lifeCtx
+	}
+	return context.Background()
+}
+
+func (e *Engine) applyOnce(ctx context.Context, a plannedAction) error {
 	if err := e.store.EnterConfigure(); err != nil {
 		// Lock-held is the retryable case; bubble it up verbatim so the
 		// caller can errors.Is it. Any other EnterConfigure error (read-only
@@ -563,7 +591,7 @@ func (e *Engine) applyOnce(a plannedAction) error {
 		e.store.ExitConfigure()
 		return nil
 	}
-	if _, err := e.commitFn(context.Background(), ""); err != nil {
+	if _, err := e.commitFn(ctx, ""); err != nil {
 		e.store.ExitConfigure()
 		return errBatch("commit: %v", err)
 	}
