@@ -249,6 +249,21 @@ P1b (closes **#2663, #2664, #2665**) builds on the P1a spine:
   `SO_BINDTODEVICE` for the interface/VRF, working for both the UDP-first and
   TCP-retry exchange). Fail-open at runtime; an invalid source-address falls the
   family back to no-op.
+- **Dual-stack source-bind family gate (#2901, `sourceMatchesDialFamily`)** — the
+  dialer's `Control` hook applies the `unix.Bind` source-bind **only when the
+  source-address family matches the dial socket's address family** (keyed off the
+  `Dialer.Control` `network` argument: a `4`/`6` suffix on `tcp4`/`tcp6`/`udp4`/
+  `udp6`). The dialer is shared by the RFC 2136 backend and, via
+  `newHTTPClientBound` (#2846), every HTTP backend + checkip — those endpoints
+  may resolve to both A and AAAA records, and Go's Happy-Eyeballs can dial the
+  family that does NOT match the configured `source-address`. Before the gate,
+  binding a `SockaddrInet4` on an AF_INET6 socket (or the reverse) returned
+  `EAFNOSUPPORT`/`EINVAL` and aborted the whole connection. Now the
+  mismatched-family dial proceeds with the kernel-chosen source (the operator
+  configured a source only for the matching family); the matching family still
+  egresses from the configured source. `SO_BINDTODEVICE` is family-agnostic and
+  is always applied. This is the DDNS analog of the IPsec family-selection work
+  (#2757/#2832).
 - **HTTP-transport + checkip source binding (#2846)** — originally only the RFC
   2136 backend honored the source binding; the HTTP backends
   (dyndns2/Cloudflare/Route53/generic) and the external checkip probe built a

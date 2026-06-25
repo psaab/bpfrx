@@ -1,3 +1,26 @@
+## 2026-06-25 — #2891: FRR backup-router IPv6 next-hop with empty dst emitted invalid `ip route 0.0.0.0/0 <v6nh>`
+
+- **Timestamp**: 2026-06-25
+- **Action**: `renderBackupRouter` defaulted an empty `BackupRouterDst` to
+  `0.0.0.0/0` unconditionally and picked the route-prefix keyword (`ip` vs
+  `ipv6`) only from the destination family. An IPv6 backup-router
+  (`set system backup-router 2001:db8::1`) with no `destination` therefore
+  rendered `ip route 0.0.0.0/0 2001:db8::1 250` — a v4 prefix with a v6
+  next-hop, which frr-reload rejects and which fails the ENTIRE static
+  config load (#2891, agy-review-051 051-12). Made the default and the
+  prefix keyword next-hop-family-aware: a v6 `BackupRouter` with an empty
+  dst defaults to `::/0` and emits `ipv6 route ::/0 <v6nh> 250`; a v4
+  backup-router still defaults to `0.0.0.0/0` (`ip route 0.0.0.0/0
+  <v4nh> 250`). Byte-identical for any explicit `destination`.
+- **File(s)**: pkg/frr/config_render.go (fix), pkg/frr/frr_test.go
+  (TestBackupRouterFamilyAwareDefault fail-on-revert guard, driven through
+  ParseSetCommand+SetPath+CompileConfig), pkg/frr/README.md (config_render.go
+  cell #2891 note).
+- **Validation**: go build ./..., gofmt -l clean on changed files, go vet
+  ./pkg/frr/... ./pkg/config/..., go test ./pkg/frr/... ./pkg/config/... all
+  green; fail-on-revert proven — reverting the family-aware default turns the
+  v6 case RED with the exact pre-fix `ip route 0.0.0.0/0 2001:db8::1 250`.
+
 ## 2026-06-25 — #2867: VRRP GARP/NA burst follow-up loops keep poisoning after abdication
 
 - **Timestamp**: 2026-06-25
@@ -17360,3 +17383,19 @@ top.
   go vet ./pkg/eventengine/..., go test -race ./pkg/eventengine/... PASS.
   **File(s)**: pkg/eventengine/engine.go, pkg/eventengine/engine_integration_test.go,
   pkg/eventengine/README.md, _Log.md
+  **Action**: #2901 — DDNS source-binding dialer family gate. The shared
+  bindConfig.dialer Control hook (pkg/ddns/backend_bind.go) called unix.Bind by
+  the SOURCE family regardless of the dial socket family, so a dual-stack
+  endpoint (A+AAAA) whose Happy-Eyeballs picked the non-matching family hit
+  EAFNOSUPPORT/EINVAL and aborted the whole connection. Gated the source-bind on
+  sourceMatchesDialFamily(src, network) keyed off the Dialer.Control "network"
+  arg (tcp4/tcp6/udp4/udp6); on a family mismatch the bind is SKIPPED and the
+  dial proceeds with the kernel-chosen source (operator configured a source only
+  for the matching family). SO_BINDTODEVICE stays family-agnostic, applied
+  always. DDNS analog of the #2757/#2832 ipsec family-selection work. FAIL-ON-
+  REVERT: TestDialerSourceBindFamilyGate drives the Control hook over real
+  AF_INET/AF_INET6 fds — match binds cleanly, mismatch returns nil; RED (EINVAL)
+  when the gate is removed (verified). Gates: go build ./..., gofmt -l clean,
+  go vet ./pkg/ddns/..., go test ./pkg/ddns/... PASS.
+  **File(s)**: pkg/ddns/backend_bind.go, pkg/ddns/backend_bind_test.go,
+  pkg/ddns/README.md, _Log.md
