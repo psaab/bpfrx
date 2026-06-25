@@ -1,3 +1,29 @@
+## 2026-06-25 — #2876: HA demotion drain reports DrainComplete below the target fence
+
+- **Timestamp**: 2026-06-25
+- **Action**: The demotion-prep drain reported success even when the drained
+  sequence never reached the target fence (last-applied seq at demotion).
+  `SendDrainRequest` returned the first `DrainComplete` seq with no
+  `seq >= targetSeq` check, and the Rust helper's `handle_drain_request`
+  emitted `DrainComplete` carrying `replay_buf.back().seq` even on a 200 ms
+  timeout below the fence — so sessions created after the fence were never
+  flushed to the peer before takeover (silent HA session loss on failover).
+  Fix (both sides): Go `SendDrainRequest` now rejects `seq < targetSeq` as a
+  hard error; the Rust helper tracks `reached_target` and WITHHOLDS
+  `DrainComplete` on a below-fence timeout (Go ctx then errors). No wire
+  change — existing DrainRequest target seq / DrainComplete seq reused.
+  Siblings #2882/#2877/#2883 left out of scope.
+- **File(s)**: pkg/dataplane/userspace/eventstream.go,
+  pkg/dataplane/userspace/eventstream_test.go,
+  userspace-dp/src/event_stream/mod.rs,
+  userspace-dp/src/event_stream/tests.rs,
+  docs/session-sync-architecture.md, _Log.md
+- **Validation**: go build/vet/gofmt clean; go test -race
+  ./pkg/dataplane/... ./pkg/cluster/... green; cargo build --release +
+  cargo test (event_stream/drain) green. Fail-on-revert proven RED on both
+  sides (Go gate removed → TestEventStreamDrainBelowFenceFails fails; Rust
+  reached_target gate removed → test_drain_below_fence_withholds_drain_complete
+  fails).
 ## 2026-06-25 — #2891: FRR backup-router IPv6 next-hop with empty dst emitted invalid `ip route 0.0.0.0/0 <v6nh>`
 
 - **Timestamp**: 2026-06-25
@@ -17463,3 +17489,65 @@ top.
 - **Timestamp**: 2026-06-25
 - **Action**: Implement Junos `then as-path-prepend "<asn> ..."` → FRR `set as-path prepend <asn> ...` end-to-end (schema typed leaf, typed struct field, compiler both AST paths, renderer). Add fail-on-revert render test + multi-ASN parse tests.
 - **File(s)**: pkg/config/types_routing.go (ASPathPrepend []string), pkg/config/schema_routing.go (then as-path-prepend multi:true leaf), pkg/config/compiler_routing.go (parsePolicyTermChildren + parsePolicyTermInlineKeys + policyTermInlineKeywords), pkg/frr/policy_render.go (set as-path prepend clause), pkg/frr/policy_as_path_prepend_2892_test.go (new), pkg/config/compiler_as_path_prepend_2892_test.go (new), pkg/frr/README.md, docs/config-schema.md, docs/feature-gaps.md
+- **Timestamp**: 2026-06-25 13:36
+  **Action**: #2909 — pkg/routing xfrmi if_id collision guard. A bare
+  secure-tunnel bind-interface (`st0`) and an explicit `st0.0` derive
+  DISTINCT device names but the SAME XFRM `if_id` (1, unit defaults to 0
+  with no `.N` suffix). The kernel keys SA<->xfrmi binding on `if_id`, so
+  programming both devices either EEXISTs or silently cross-leaks traffic
+  between VPNs meant to be isolated. `xfrmManager.Apply` now detects two
+  distinct desired names mapping to one `if_id` and refuses to create
+  EITHER (fail-closed); a formerly-good device is torn down if a later
+  commit introduces the alias. Added FAIL-ON-REVERT tests
+  (TestXfrmApplyIfIDCollisionRefused, TestXfrmApplyCollisionDeletesPriorDevice)
+  — RED without the guard (3 LinkAdd / 2 devices sharing if_id 1). Root
+  derivation lives in pkg/config/xfrmi.go; commit-time rejection is a
+  separate lane (#2885) — this is the last-line routing defense.
+  Gates: go build ./..., gofmt -l clean, go vet ./pkg/routing/...,
+  go test ./pkg/routing/... PASS.
+  **File(s)**: pkg/routing/xfrm.go, pkg/routing/iface_reuse_test.go,
+  pkg/routing/README.md, _Log.md
+
+## 2026-06-25 — #2885 IPsec link-local IPv6 local-bind selection
+- **Timestamp**: 2026-06-25
+- **Action**: Fixed `matchFamily` (pkg/ipsec/policy.go) rejecting IPv6
+  link-local unicast (`fe80::/10`) via `IsGlobalUnicast()`. The local-address
+  resolver gated every candidate interface address on `IsGlobalUnicast()`,
+  which is false for link-local, so an IPsec local-bind on a point-to-point /
+  link-local IPv6 link could never source from `fe80::`. Now `matchFamily`
+  also admits `IsLinkLocalUnicast()`, but link-local is surfaced ONLY for an
+  explicit family-6 hint: excluded from family-4 (and IPv4 link-local
+  169.254.0.0/16 too) and from family-agnostic (hint 0) selection so it never
+  wins implicitly over a global address. Multicast/unspecified/loopback stay
+  excluded for all families. Found by agy-review-051 051-02 (MEDIUM).
+  FAIL-ON-REVERT: TestMatchFamilyLinkLocalIPv6 asserts
+  matchFamily(fe80::1, 6) == "fe80::1"; RED ("" ) when the old IsGlobalUnicast
+  gate is restored (verified by copy-aside revert), GREEN with the fix.
+  TestMatchFamilyExclusions guards the exclusions. Gates: go build ./...,
+  gofmt -l clean, go vet ./pkg/ipsec/..., go test ./pkg/ipsec/... PASS.
+- **File(s)**: pkg/ipsec/policy.go, pkg/ipsec/matchfamily_linklocal_test.go,
+  pkg/ipsec/README.md, _Log.md
+
+## 2026-06-25 — #2885 review fold (PR #2927 MERGE-NEEDS-MINOR x2)
+- **Timestamp**: 2026-06-25
+- **Action**: Folded two hostile-review MINORs on the #2885 fix.
+  MINOR-1 (global-must-win order-dependence): matchFamily feeds a first-match
+  loop (selectUnitAddress over config order; resolveKernelInterfaceAddress
+  over kernel order). Now that family-6 admits fe80::, a link-local enumerated
+  before the global IPv6 could win. Added selectFamilyAddress doing a two-pass
+  family-6 scan — pass 1 admits only global unicast (bareIPGlobalOnly), pass 2
+  falls back to link-local only if no global exists. Both resolvers route
+  through it; "global wins" is now order-independent.
+  MINOR-2 (bare fe80:: lacks %iface zone): a bare link-local local_addrs is
+  ambiguous on a multi-interface box. Added zoneQualify(addr, iface) appending
+  %<iface> to a link-local result; resolveKernelInterfaceAddress uses the
+  looked-up name, resolveConfiguredInterfaceAddress uses config.LinuxIfName(
+  base). Global/IPv4/already-zoned addresses pass through unchanged.
+  FAIL-ON-REVERT: TestSelectUnitAddressFamily6GlobalWinsOverLinkLocal (link-
+  local listed FIRST, asserts the GLOBAL wins) goes RED when the global-only
+  first pass is removed; TestResolveConfiguredInterfaceAddressZoneQualifiesLink
+  Local asserts fe80::1%ge-0-0-3 and goes RED when zoneQualify is neutered.
+  Both verified via copy-aside revert. Gates: go build ./..., gofmt -l clean,
+  go vet ./pkg/ipsec/..., go test ./pkg/ipsec/... PASS.
+- **File(s)**: pkg/ipsec/policy.go, pkg/ipsec/matchfamily_linklocal_test.go,
+  pkg/ipsec/README.md, _Log.md
