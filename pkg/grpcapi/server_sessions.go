@@ -824,10 +824,10 @@ func (s *Server) ClearSessions(ctx context.Context, req *pb.ClearSessionsRequest
 		}
 	}
 	for _, key := range v4RevKeys {
-		agg.add("v4 reverse delete", s.dp.DeleteSession(key))
+		agg.addExceptNotFound("v4 reverse delete", s.dp.DeleteSession(key))
 	}
 	for _, dk := range snatDNATKeys {
-		agg.add("v4 DNAT companion delete", s.dp.DeleteDNATEntry(dk))
+		agg.addExceptNotFound("v4 DNAT companion delete", s.dp.DeleteDNATEntry(dk))
 	}
 
 	// Clear matching IPv6 sessions
@@ -866,10 +866,10 @@ func (s *Server) ClearSessions(ctx context.Context, req *pb.ClearSessionsRequest
 		}
 	}
 	for _, key := range v6RevKeys {
-		agg.add("v6 reverse delete", s.dp.DeleteSessionV6(key))
+		agg.addExceptNotFound("v6 reverse delete", s.dp.DeleteSessionV6(key))
 	}
 	for _, dk := range snatDNATKeysV6 {
-		agg.add("v6 DNAT companion delete", s.dp.DeleteDNATEntryV6(dk))
+		agg.addExceptNotFound("v6 DNAT companion delete", s.dp.DeleteDNATEntryV6(dk))
 	}
 
 	if !forwarded {
@@ -926,6 +926,25 @@ func (e *clearErrors) add(op string, err error) {
 	}
 	e.count++
 	e.parts = append(e.parts, fmt.Sprintf("%s: %v", op, err))
+}
+
+// addExceptNotFound is add() for delete operations whose target key is
+// COMPUTED, not enumerated — the reverse-session companion (a naive
+// src/dst swap of the forward key) and the DNAT companion entry. For a
+// NAT'd session those computed keys frequently do not exist (the real
+// reverse companion is keyed on the TRANSLATED tuple val.ReverseKey, not
+// the naive swap), so the dataplane returns ebpf.ErrKeyNotExist. That is
+// a benign idempotent not-found, NOT a clear failure — counting it would
+// make a fully-successful NAT'd-session clear spuriously report
+// Failures>0 (#2468). Any OTHER delete error (EIO/EINVAL/...) is a real
+// failure and is aggregated. The forward delete uses add() unchanged: a
+// forward key came from iteration, so a not-found there is a genuine
+// anomaly worth reporting.
+func (e *clearErrors) addExceptNotFound(op string, err error) {
+	if err == nil || dataplane.IsKeyNotFound(err) {
+		return
+	}
+	e.add(op, err)
 }
 
 // summary returns a single-line description of all accumulated failures.

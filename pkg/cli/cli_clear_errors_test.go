@@ -13,6 +13,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/cilium/ebpf"
 	"github.com/psaab/xpf/pkg/dataplane"
 )
 
@@ -25,10 +26,16 @@ type clearFaultCLIDP struct {
 
 	v4Sessions map[dataplane.SessionKey]dataplane.SessionValue
 
-	iterErr    error // returned by IterateSessions
-	iterV6Err  error // returned by IterateSessionsV6
-	delErr     error // returned by DeleteSession (forward + reverse)
-	delDNATErr error // returned by DeleteDNATEntry
+	iterErr   error // returned by IterateSessions
+	iterV6Err error // returned by IterateSessionsV6
+	// fwdDelErr is returned only for a DeleteSession on a seeded
+	// (forward) key. revDelErr is returned for any other DeleteSession
+	// key — i.e. the computed reverse companion. This split lets a test
+	// inject ErrKeyNotExist on the reverse delete (a successful NAT'd
+	// clear) without affecting the forward delete.
+	fwdDelErr  error
+	revDelErr  error
+	delDNATErr error // returned by DeleteDNATEntry (DNAT companion)
 }
 
 func (d *clearFaultCLIDP) IsLoaded() bool { return true }
@@ -46,7 +53,12 @@ func (d *clearFaultCLIDP) IterateSessionsV6(fn func(dataplane.SessionKeyV6, data
 	return d.iterV6Err
 }
 
-func (d *clearFaultCLIDP) DeleteSession(key dataplane.SessionKey) error { return d.delErr }
+func (d *clearFaultCLIDP) DeleteSession(key dataplane.SessionKey) error {
+	if _, isForward := d.v4Sessions[key]; isForward {
+		return d.fwdDelErr
+	}
+	return d.revDelErr
+}
 func (d *clearFaultCLIDP) DeleteSessionV6(dataplane.SessionKeyV6) error { return nil }
 func (d *clearFaultCLIDP) DeleteDNATEntry(dataplane.DNATKey) error      { return d.delDNATErr }
 func (d *clearFaultCLIDP) DeleteDNATEntryV6(dataplane.DNATKeyV6) error  { return nil }
@@ -93,11 +105,11 @@ func TestClearFilteredSessionsReportsIteratorFailure(t *testing.T) {
 	}
 }
 
-func TestClearFilteredSessionsReportsReverseDeleteFailure(t *testing.T) {
+func TestClearFilteredSessionsReportsForwardDeleteFailure(t *testing.T) {
 	dp := &clearFaultCLIDP{
 		Manager:    dataplane.New(),
 		v4Sessions: seedV4(false),
-		delErr:     fmt.Errorf("kernel map delete EBUSY"),
+		fwdDelErr:  fmt.Errorf("kernel map delete EBUSY"),
 	}
 	c := newClearCLI(t, dp)
 	var callErr error
@@ -107,9 +119,30 @@ func TestClearFilteredSessionsReportsReverseDeleteFailure(t *testing.T) {
 	if callErr != nil {
 		t.Fatalf("handleClearSecurity error = %v", callErr)
 	}
-	// delErr hits both the forward delete and the reverse delete.
-	if !strings.Contains(out, "WARNING") || !strings.Contains(out, "delete") {
-		t.Fatalf("reverse/forward delete failure not surfaced:\n%s", out)
+	if !strings.Contains(out, "WARNING") || !strings.Contains(out, "forward delete") {
+		t.Fatalf("forward delete failure not surfaced:\n%s", out)
+	}
+}
+
+// A NON-not-found reverse-delete error (EIO etc.) is a real failure and
+// MUST still be aggregated — guards against swinging from over-reporting
+// to under-reporting.
+func TestClearFilteredSessionsReportsReverseDeleteRealError(t *testing.T) {
+	dp := &clearFaultCLIDP{
+		Manager:    dataplane.New(),
+		v4Sessions: seedV4(false),
+		revDelErr:  fmt.Errorf("map delete EIO"),
+	}
+	c := newClearCLI(t, dp)
+	var callErr error
+	out := captureStdout(t, func() {
+		callErr = c.handleClearSecurity([]string{"flow", "session", "protocol", "tcp"})
+	})
+	if callErr != nil {
+		t.Fatalf("handleClearSecurity error = %v", callErr)
+	}
+	if !strings.Contains(out, "WARNING") || !strings.Contains(out, "reverse delete") {
+		t.Fatalf("real reverse-delete error not surfaced:\n%s", out)
 	}
 }
 
@@ -152,5 +185,35 @@ func TestClearFilteredSessionsHappyPathNoWarning(t *testing.T) {
 	}
 	if !strings.Contains(out, "matching sessions cleared") {
 		t.Fatalf("happy path missing cleared line:\n%s", out)
+	}
+}
+
+// #2468 finding 6: a NAT'd session's reverse companion is keyed on the
+// TRANSLATED tuple (val.ReverseKey), not the naive src/dst swap the
+// clear computes, so the reverse delete AND the DNAT-companion delete
+// hit ErrKeyNotExist on a fully-successful clear. That must NOT be
+// reported as a failure. Fail-on-revert: switch addExceptNotFound back
+// to add() and this goes RED (spurious WARNING).
+func TestClearFilteredSessionsNATReverseNotFoundNotReported(t *testing.T) {
+	dp := &clearFaultCLIDP{
+		Manager:    dataplane.New(),
+		v4Sessions: seedV4(true),        // SNAT session
+		revDelErr:  ebpf.ErrKeyNotExist, // naive-swap reverse key absent
+		delDNATErr: ebpf.ErrKeyNotExist, // DNAT companion key absent
+		// fwdDelErr nil -> forward delete succeeds (key came from iteration)
+	}
+	c := newClearCLI(t, dp)
+	var callErr error
+	out := captureStdout(t, func() {
+		callErr = c.handleClearSecurity([]string{"flow", "session", "protocol", "tcp"})
+	})
+	if callErr != nil {
+		t.Fatalf("handleClearSecurity error = %v", callErr)
+	}
+	if strings.Contains(out, "WARNING") {
+		t.Fatalf("benign ErrKeyNotExist on reverse/DNAT delete spuriously reported:\n%s", out)
+	}
+	if !strings.Contains(out, "1 IPv4 and 0 IPv6 matching sessions cleared") {
+		t.Fatalf("cleared-count line wrong:\n%s", out)
 	}
 }
