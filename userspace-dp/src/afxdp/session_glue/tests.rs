@@ -4950,12 +4950,14 @@ fn flush_session_deltas_without_binding_reaches_global_consumers() {
         interface: Arc::<str>::from(""),
         ifindex: -1,
     };
+    let dnat_fds = crate::afxdp::checksum::DnatTableFds::default();
     flush_session_deltas(
         &ident,
         None,
         -1,
         -1,
         -1,
+        &dnat_fds,
         &[delta],
         &shared_sessions,
         &shared_nat_sessions,
@@ -4990,5 +4992,124 @@ fn flush_session_deltas_without_binding_reaches_global_consumers() {
     assert!(
         recent.iter().any(|info| info.event == "close"),
         "Close delta must reach the recent-deltas buffer even with no binding"
+    );
+}
+
+/// #2979 FAIL-ON-REVERT: a Close delta for an SNAT'd session must delete the
+/// dynamic reverse-NAT `dnat_table` entry that `publish_dnat_table_entry`
+/// inserted at session install. The maps are `BPF_MAP_TYPE_HASH` (non-LRU,
+/// `max_entries = MAX_SESSIONS`, `BPF_F_NO_PREALLOC`), so a missing close-time
+/// delete leaks one entry per closed SNAT session until the map fills and new
+/// reverse-NAT publishes fail (#2244 capacity error).
+///
+/// Real BPF maps cannot be created under `cargo test` (the host runs with
+/// `kernel.unprivileged_bpf_disabled`), so this test observes the delete via
+/// the test-only `DNAT_DELETE_ATTEMPTS` counter incremented inside
+/// `delete_dnat_table_entry` whenever it derives a key and issues the
+/// `bpf_map_delete_elem` syscall. The fd is `-1` (the syscall returns EBADF,
+/// which is benign — the contract under test is that the close path *attempts*
+/// the keyed delete).
+///
+/// RED on revert: removing the `delete_dnat_table_entry` call from
+/// `flush_session_deltas`'s Close handler makes the SNAT-flow assertion (count
+/// increments by 1) fail. The non-SNAT control (count unchanged) guards against
+/// over-deleting on flows that never published a reverse-NAT entry.
+#[test]
+fn close_delta_deletes_dnat_table_entry_for_snat_flow() {
+    use crate::afxdp::checksum::{DnatTableFds, DNAT_DELETE_ATTEMPTS};
+    use std::sync::atomic::Ordering;
+
+    // Serialize against any other test touching the process-global counter.
+    static GUARD: Mutex<()> = Mutex::new(());
+    let _g = GUARD.lock().expect("counter guard");
+
+    let build_close = |nat: NatDecision| {
+        let key = test_key();
+        let metadata = test_metadata();
+        let decision = SessionDecision {
+            resolution: test_resolution(),
+            nat,
+        };
+        SessionDelta {
+            kind: SessionDeltaKind::Close,
+            key,
+            decision,
+            metadata,
+            origin: SessionOrigin::ForwardFlow,
+            fabric_redirect_sync: false,
+            created_ns: 0,
+            last_seen_ns: 0,
+            counters: crate::session::SessionCounters::default(),
+        }
+    };
+
+    let ident = BindingIdentity {
+        slot: 0,
+        queue_id: 0,
+        worker_id: 0,
+        interface: Arc::<str>::from(""),
+        ifindex: -1,
+    };
+    // A live v4 table fd so the delete path is reached; -1 makes the syscall a
+    // harmless EBADF after the keyed attempt is counted.
+    let dnat_fds = DnatTableFds {
+        v4: Some(-1),
+        v6: None,
+    };
+
+    let run = |delta: SessionDelta| {
+        let shared_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_nat_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_forward_wire_sessions = Arc::new(Mutex::new(FastMap::default()));
+        let shared_owner_rg_indexes = SharedSessionOwnerRgIndexes::default();
+        let peer_worker_commands: Vec<Arc<Mutex<VecDeque<WorkerCommand>>>> = vec![];
+        let recent_session_deltas = Arc::new(Mutex::new(VecDeque::new()));
+        let forwarding = ForwardingState::default();
+        flush_session_deltas(
+            &ident,
+            None,
+            -1,
+            -1,
+            -1,
+            &dnat_fds,
+            &[delta],
+            &shared_sessions,
+            &shared_nat_sessions,
+            &shared_forward_wire_sessions,
+            &shared_owner_rg_indexes,
+            &recent_session_deltas,
+            &peer_worker_commands,
+            &None,
+            &forwarding,
+        );
+    };
+
+    // SNAT flow: the forward key's source is SNAT'd to the WAN pool address;
+    // this is exactly what the install path published into dnat_table.
+    let snat = NatDecision {
+        rewrite_src: Some(IpAddr::V4(Ipv4Addr::new(172, 16, 80, 8))),
+        rewrite_src_port: Some(54321),
+        ..NatDecision::default()
+    };
+
+    let before = DNAT_DELETE_ATTEMPTS.load(Ordering::Relaxed);
+    run(build_close(snat));
+    let after_snat = DNAT_DELETE_ATTEMPTS.load(Ordering::Relaxed);
+    assert_eq!(
+        after_snat - before,
+        1,
+        "Close delta for an SNAT'd session must attempt the dnat_table reverse-NAT delete \
+         (leak fix #2979); got {} attempts",
+        after_snat - before
+    );
+
+    // Non-SNAT control: a flow that never published a dnat_table entry must not
+    // trigger a delete attempt.
+    run(build_close(NatDecision::default()));
+    let after_plain = DNAT_DELETE_ATTEMPTS.load(Ordering::Relaxed);
+    assert_eq!(
+        after_plain - after_snat,
+        0,
+        "Close delta for a non-SNAT session must NOT attempt a dnat_table delete"
     );
 }

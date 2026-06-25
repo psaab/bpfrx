@@ -8667,6 +8667,82 @@ fn publish_dnat_table_entry_reports_syscall_failure() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// #2979: the close-handler dnat_table delete MUST key on the exact same bytes
+// the install-path publish wrote, or the delete misses and the entry leaks.
+// These tests pin the v4/v6 key encoding (the SSOT used by both publish and
+// delete) and the no-op contracts of delete_dnat_table_entry.
+//
+// FAIL-ON-REVERT: change either key helper's byte layout (or let publish and
+// delete diverge) and the byte-equality assertions go red.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn dnat_v4_key_bytes_matches_publish_encoding() {
+    // protocol, snat_ip = 172.16.80.8, snat_port = 54321 (host-order native).
+    let dk = dnat_v4_key_bytes(&dnat_v4_key(), dnat_snat_decision())
+        .expect("SNAT v4 flow must yield a key");
+    let mut want = [0u8; 12];
+    want[0] = PROTO_TCP;
+    want[4..8].copy_from_slice(&Ipv4Addr::new(172, 16, 80, 8).octets());
+    want[8..10].copy_from_slice(&54321u16.to_ne_bytes());
+    assert_eq!(dk, want, "v4 dnat_table key encoding drifted from the publish path");
+
+    // No SNAT -> no key (close is a no-op for plain flows).
+    assert!(dnat_v4_key_bytes(&dnat_v4_key(), NatDecision::default()).is_none());
+    // Wrong family -> no v4 key.
+    let mut v6_key = dnat_v4_key();
+    v6_key.addr_family = libc::AF_INET6 as u8;
+    assert!(dnat_v4_key_bytes(&v6_key, dnat_snat_decision()).is_none());
+}
+
+#[test]
+fn dnat_v6_key_bytes_matches_entry_bytes_key_half() {
+    let snat_v6: std::net::Ipv6Addr = "2001:559:8585:80::8".parse().unwrap();
+    let orig_v6: std::net::Ipv6Addr = "2001:559:8585:61::100".parse().unwrap();
+    let key = SessionKey {
+        addr_family: libc::AF_INET6 as u8,
+        protocol: PROTO_TCP,
+        src_ip: IpAddr::V6(orig_v6),
+        dst_ip: IpAddr::V6("2001:559:8585:80::200".parse().unwrap()),
+        src_port: 12345,
+        dst_port: 443,
+    };
+    let nat = NatDecision {
+        rewrite_src: Some(IpAddr::V6(snat_v6)),
+        rewrite_src_port: Some(54321),
+        ..NatDecision::default()
+    };
+    let dk = dnat_v6_key_bytes(&key, nat).expect("SNAT66 flow must yield a key");
+    // The delete key MUST byte-match the KEY half of the publish-path encoder.
+    let (entry_key, _entry_val) =
+        dnat_v6_entry_bytes(PROTO_TCP, snat_v6, 54321, orig_v6, 12345);
+    assert_eq!(
+        dk, entry_key,
+        "v6 dnat_table_v6 delete key drifted from publish (dnat_v6_entry_bytes)"
+    );
+}
+
+#[test]
+fn delete_dnat_table_entry_noops_without_snat_or_fd() {
+    use crate::afxdp::checksum::DNAT_DELETE_ATTEMPTS;
+    use std::sync::atomic::Ordering;
+    let before = DNAT_DELETE_ATTEMPTS.load(Ordering::Relaxed);
+    // No SNAT decision -> nothing was published -> no delete attempt.
+    delete_dnat_table_entry(
+        &DnatTableFds { v4: Some(-1), v6: None },
+        &dnat_v4_key(),
+        NatDecision::default(),
+    );
+    // SNAT present but no table fd -> no delete attempt.
+    delete_dnat_table_entry(&DnatTableFds::default(), &dnat_v4_key(), dnat_snat_decision());
+    assert_eq!(
+        DNAT_DELETE_ATTEMPTS.load(Ordering::Relaxed),
+        before,
+        "delete_dnat_table_entry must be a no-op for non-SNAT flows and absent fds"
+    );
+}
+
 #[test]
 fn publish_dnat_table_entry_failure_increments_counter() {
     // Mirror the worker poll call-site increment logic against a real
