@@ -5,11 +5,35 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"sync/atomic"
 	"time"
 
 	"github.com/psaab/xpf/pkg/linuxsock"
 	"golang.org/x/sys/unix"
 )
+
+// burstSendErrors counts gratuitous ARP / unsolicited NA follow-up frames
+// (the background-goroutine adverts that aid neighbor/switch convergence
+// during failover) that failed to send. The first frame of every burst is
+// sent synchronously and its error is returned to the caller; this counter
+// only accumulates the follow-up failures that the background goroutine
+// would otherwise drop on the floor. Exported via BurstSendErrors for
+// observability (#2623).
+var burstSendErrors atomic.Uint64
+
+// BurstSendErrors returns the cumulative number of failover GARP/NA burst
+// follow-up frames that failed to transmit. A non-zero, climbing value means
+// the failover-convergence adverts are being dropped after the first frame —
+// the logs that report the full burst count are not proof of delivery.
+func BurstSendErrors() uint64 { return burstSendErrors.Load() }
+
+// burstSend transmits one burst follow-up frame. It is a package var so tests
+// can inject a sender that succeeds once then fails, proving the follow-up
+// error handling (count + warn + counter) fires without intercepting the
+// synchronous first send. Production wraps unix.Sendto.
+var burstSend = func(fd int, pkt []byte, addr unix.Sockaddr) error {
+	return unix.Sendto(fd, pkt, 0, addr)
+}
 
 // SendGratuitousARP sends gratuitous ARP on the specified interface for the
 // given IP address. Sends both ARP Request and ARP Reply variants — some
@@ -147,21 +171,54 @@ func SendGratuitousARPBurst(iface string, ip net.IP, count int) error {
 	slog.Info("cluster: sent gratuitous ARP burst (1st pair)",
 		"interface", iface, "ip", ip4.String(), "total", count)
 
-	// Schedule remaining pairs in background.
+	// Schedule remaining pairs in background. Follow-up sends are the
+	// reliability mechanism for neighbor/switch convergence; a send error
+	// after the first frame means the burst that the log already reported
+	// as `total=count` did not fully go out. Count the failures, bump the
+	// exported counter, and warn ONCE after the loop (never per-iteration —
+	// per CLAUDE.md logging rules a per-send log here would flood). The
+	// loop never aborts: a transient error on one frame must not suppress
+	// the remaining adverts that may still reach the LAN.
 	if count > 1 {
-		go func() {
-			defer unix.Close(fd)
-			for i := 1; i < count; i++ {
-				time.Sleep(50 * time.Millisecond)
-				unix.Sendto(fd, reqPkt, 0, &addr) //nolint:errcheck
-				unix.Sendto(fd, repPkt, 0, &addr) //nolint:errcheck
-			}
-		}()
+		go runARPBurstFollowups(fd, iface, ip4.String(), reqPkt, repPkt, addr, count)
 	} else {
 		unix.Close(fd)
 	}
 
 	return nil
+}
+
+// runARPBurstFollowups sends the (count-1) follow-up GARP pairs at 50ms
+// intervals, then closes fd. Extracted from SendGratuitousARPBurst so the
+// follow-up error handling is unit-testable via the burstSend seam without a
+// raw socket. Each failed frame bumps burstSendErrors and is logged at Debug
+// (per-iteration logging at higher levels would flood — CLAUDE.md); a single
+// Warn fires after the loop if any frame failed. The loop never aborts so a
+// transient error does not suppress the remaining adverts.
+func runARPBurstFollowups(fd int, iface, ip string, reqPkt, repPkt []byte, addr unix.SockaddrLinklayer, count int) {
+	defer unix.Close(fd)
+	var failed int
+	for i := 1; i < count; i++ {
+		time.Sleep(50 * time.Millisecond)
+		if err := burstSend(fd, reqPkt, &addr); err != nil {
+			failed++
+			slog.Debug("cluster: GARP burst follow-up send failed",
+				"interface", iface, "ip", ip,
+				"frame", "request", "iter", i, "err", err)
+		}
+		if err := burstSend(fd, repPkt, &addr); err != nil {
+			failed++
+			slog.Debug("cluster: GARP burst follow-up send failed",
+				"interface", iface, "ip", ip,
+				"frame", "reply", "iter", i, "err", err)
+		}
+	}
+	if failed > 0 {
+		burstSendErrors.Add(uint64(failed))
+		slog.Warn("cluster: GARP burst follow-up sends failed",
+			"interface", iface, "ip", ip,
+			"failed", failed, "total_frames", (count-1)*2)
+	}
 }
 
 // SendARPProbe sends a standard ARP Request for targetIP with senderIP as
@@ -408,20 +465,44 @@ func SendGratuitousIPv6Burst(iface string, ip net.IP, count int) error {
 	slog.Info("cluster: sent unsolicited IPv6 NA burst (1st)",
 		"interface", iface, "ip", ip6.String(), "total", count)
 
-	// Schedule remaining NAs in background.
+	// Schedule remaining NAs in background. As with the GARP burst above,
+	// follow-up sends are the failover-convergence reliability mechanism;
+	// count failures, bump the exported counter, and warn ONCE after the
+	// loop (never per-iteration). The loop never aborts on a transient
+	// error so the remaining NAs still get a chance to reach the LAN.
 	if count > 1 {
-		go func() {
-			defer unix.Close(fd)
-			for i := 1; i < count; i++ {
-				time.Sleep(50 * time.Millisecond)
-				unix.Sendto(fd, pkt, 0, &addr) //nolint:errcheck
-			}
-		}()
+		go runNABurstFollowups(fd, iface, ip6.String(), pkt, addr, count)
 	} else {
 		unix.Close(fd)
 	}
 
 	return nil
+}
+
+// runNABurstFollowups sends the (count-1) follow-up unsolicited NAs at 50ms
+// intervals, then closes fd. Extracted from SendGratuitousIPv6Burst for the
+// same reason as runARPBurstFollowups: the follow-up error handling is
+// unit-testable via the burstSend seam. Each failed NA bumps burstSendErrors
+// and is logged at Debug; a single Warn fires after the loop if any failed.
+// The loop never aborts on a transient error.
+func runNABurstFollowups(fd int, iface, ip string, pkt []byte, addr unix.SockaddrLinklayer, count int) {
+	defer unix.Close(fd)
+	var failed int
+	for i := 1; i < count; i++ {
+		time.Sleep(50 * time.Millisecond)
+		if err := burstSend(fd, pkt, &addr); err != nil {
+			failed++
+			slog.Debug("cluster: NA burst follow-up send failed",
+				"interface", iface, "ip", ip,
+				"iter", i, "err", err)
+		}
+	}
+	if failed > 0 {
+		burstSendErrors.Add(uint64(failed))
+		slog.Warn("cluster: NA burst follow-up sends failed",
+			"interface", iface, "ip", ip,
+			"failed", failed, "total_frames", count-1)
+	}
 }
 
 // buildUnsolicitedNA constructs a raw Ethernet + IPv6 + ICMPv6 Neighbor
