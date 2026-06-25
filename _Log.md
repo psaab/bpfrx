@@ -1,3 +1,90 @@
+## 2026-06-25 — #2958: state_writer runtime io_uring failure now demotes WriteMode to sync
+
+- **Timestamp**: 2026-06-25
+- **Action**: The helper state writer (`userspace-dp/src/state_writer.rs`)
+  picked `io_uring` at thread start when a ring was available, but a *runtime*
+  io_uring write failure only fell back to sync for that single write and left
+  `WriteMode::IoUring` in place. Status kept reporting `io_uring_active=true`/
+  `mode="io_uring"` (a lie) and every subsequent write paid a guaranteed-failing
+  ring submission before falling back (codex-review-056 056-03). Fix: introduced
+  `PersistOutcome { result, io_uring_failed, demotion_cause }` and an
+  `apply_outcome()` chokepoint that, on a runtime io_uring failure, demotes
+  `*mode` to `WriteMode::SyncFallback` PERMANENTLY (no cooldown retry — avoids
+  flapping; restart re-probes the ring), flips `active=false`/`mode="sync"`, and
+  records the demotion cause in `last_error`. The reported status
+  (`io_uring_active`/`io_uring_mode`/`io_uring_last_error` via
+  `server/helpers.rs`) follows the shared handles, so observability is correct
+  with no wire-protocol change. Scope kept minimal/localized to coordinate with
+  the in-flight #2957 (state_writer PID-reuse) on the same file. Counters
+  (`io_uring_write_failures_total`/`io_uring_demotions_total`) from the issue
+  were NOT added — they would require wire-protocol + Go-side changes; the
+  observable contract (mode/active/last_error) fully satisfies the requirements.
+- **File(s)**: userspace-dp/src/state_writer.rs,
+  docs/xdp-io-uring-userspace-dataplane.md, _Log.md
+- **Validation**: `cargo build --release -p xpf-userspace-dp` (clean);
+  `cargo test -p xpf-userspace-dp state_writer` 11/11 pass incl. new
+  `runtime_io_uring_failure_demotes_to_sync_permanently`. Fail-on-revert
+  PROVEN: stubbing out the demotion in `apply_outcome` turns the test RED
+  ("runtime io_uring failure must demote WriteMode to SyncFallback").
+
+## 2026-06-25 — #2922: ECMP `select_route_next_hop` single liveness snapshot
+
+- **Timestamp**: 2026-06-25
+- **Action**: `select_route_next_hop` evaluated the (impure)
+  dynamic-neighbor liveness closure TWICE — `count()` then `nth()`. A
+  neighbor removed by the monitor thread between the two passes made the
+  count see `live > 0` while the select pass yielded `None` → spurious
+  no-route despite a live member at count time, plus doubled hot-path
+  neighbor probes. Fixed: collect live candidate refs into a stack
+  `SmallVec<[&T; 8]>` in a single pass and index into that snapshot, so
+  count and selection observe one consistent liveness view. Selection
+  semantics preserved (`ip_hash % live_count` over candidate order;
+  hashed full-vector fallback when none live). Added two fail-on-revert
+  tests: exact `candidates.len()` predicate-call count, and a
+  live→dead-flip-between-passes case that the reverted double-eval form
+  fails. Scope limited to `select_route_next_hop`; #2923 (tunnel-endpoint
+  ECMP) is a separate lane and untouched.
+- **File(s)**: `userspace-dp/src/afxdp/forwarding/mod.rs`,
+  `userspace-dp/src/afxdp/forwarding/tests.rs`, `docs/multi-wan.md`,
+  `_Log.md`
+## 2026-06-25 — #2886: VRRP raw-socket fallback cross-VLAN crosstalk (no per-interface ifindex check)
+
+- **Timestamp**: 2026-06-25
+- **Action**: On the AF_PACKET-unavailable fallback (`afPacketFD < 0`), VRRP
+  uses per-instance raw IP sockets. `maybeBindToDevice` is a deliberate no-op
+  on VLAN sub-interfaces (`manager.go`), so two VLAN raw sockets on the same
+  parent both bind to the wildcard address with NO device isolation — the
+  kernel delivers a proto-112 frame to every such socket. The fallback
+  receivers (`receiver` IPv4 / `receiverIPv6`) gated only on TTL, self-IP, and
+  VRID, so two VLAN sub-interfaces (reth0.50 / reth0.80) with the SAME VRID
+  cross-processed each other's adverts → false BACKUP transitions, split-brain
+  flapping (#2886, agy-review-051 051-03). Fix: both receivers now enable the
+  per-packet interface control message (`ipv4.FlagInterface` /
+  `ipv6.FlagInterface`), capture the arrival ifindex, and route it through
+  `acceptArrivalIfindex(arrival, vi.expectedIfindex())`. A mismatch is dropped;
+  it fails OPEN when ifindex==0 (platform reported none) or the instance has no
+  resolved interface, so real delivery never regresses (VRID/TTL/self gates
+  still apply). IPv6 reads go through a new `ipv6Recv` seam (an
+  `ipv6.NewPacketConn(...).ReadFrom` wrapper in production) so tests can inject
+  a synthetic arrival ifindex without CAP_NET_RAW. The existing
+  `TestReceiverIPv6_DeliversPacket` was migrated from the `mockPacketConn`
+  injection (incompatible with `ipv6.NewPacketConn`, which needs `net.Conn`) to
+  the `ipv6Recv` seam with arrival ifindex 0 (fail-open). Only the fallback
+  path is affected; the default `receiverAfPacket` tap already binds one
+  ifindex.
+- **File(s)**: pkg/vrrp/instance.go (acceptArrivalIfindex + expectedIfindex
+  helpers, ipv4 receiver FlagInterface + ifindex gate, ipv6Recv seam +
+  receiverIPv6 ifindex gate), pkg/vrrp/instance_ifindex_filter_test.go (new),
+  pkg/vrrp/vrrp_test.go (TestReceiverIPv6_DeliversPacket migrated to ipv6Recv
+  seam), pkg/vrrp/README.md, _Log.md.
+- **Validation**: go build ./..., gofmt -l clean, go vet ./pkg/vrrp/...,
+  go test ./pkg/vrrp/... all PASS. FAIL-ON-REVERT (copy-aside revert proof):
+  neutering `acceptArrivalIfindex` to `return true` flips
+  TestAcceptArrivalIfindexCrossVLAN/sibling_VLAN_same_VRID_rejected RED;
+  deleting the ifindex check in both receivers makes
+  TestReceiverIPv6_DropsCrossInterfaceAdvert process the cross-interface advert
+  (RED). Both restored to GREEN. PARENT will run `make test-failover` (HA gate)
+  before merge.
 ## 2026-06-25 — #2902: BGP `then community delete [ list1 list2 ]` multi-list — accumulate all community-lists
 
 - **Timestamp**: 2026-06-25
@@ -17828,6 +17915,31 @@ top.
   pkg/api/README.md, _Log.md
 
 - **Timestamp**: 2026-06-25
+- **Action**: #2915 — unify the AF_XDP queue-planner binding-candidate
+  predicate. `replan_queues` filtered interfaces through the prefix-only
+  `is_userspace_candidate_interface` (`ge-`/`xe-`/`et-`) while the
+  plan-key hash (`update_snapshot_binding_plan_key`) and the Go
+  authoritative allowlist (`UserspaceBoundLinuxInterfaces` /
+  `userspaceSkipsIngressInterface`) used the full exclusion contract
+  `include_userspace_binding_interface` (zoned, non-tunnel,
+  non-local-fabric, excluding `fxp*`/`em*`/`fab*`/`lo0` and
+  `mgmt`/`control` zones). The hash (change-detection key) and the
+  planner therefore operated on different interface sets — a `ge-*`
+  netdev placed in a mgmt/control zone (or a tunnel/local-fabric
+  context) could be planned as an AF_XDP binding neither the hash nor
+  the control plane accounted for. Routed `replan_queues` through
+  `include_userspace_binding_interface` (the SSOT) and removed the now
+  dead `is_userspace_candidate_interface`. Existing planner tests gained
+  real zones on their data interfaces (the prefix-only predicate did not
+  require one). Added a fail-on-revert test
+  (`queue_planner_and_plan_key_agree_on_binding_set`) pinning that the
+  hash and planner agree on the binding set + a
+  tunnel/local-fabric exclusion test. Both go RED if the planner reverts
+  to the divergent prefix-only predicate (verified by copy-aside revert).
+  Couples cleanly to #2916 (same-plan refresh) which bases off this fix.
+- **File(s)**: userspace-dp/src/server/helpers.rs,
+  userspace-dp/src/main_tests.rs, userspace-dp/src/server/README.md,
+  _Log.md
 - **Action**: #2938 — wire REST named source-NAT pool stats to the
   userspace helper's LIVE runtime SourceNATPoolStatus instead of config
   text (len(pool.Addresses)) + the retired-eBPF ReadNATPortCounter.
@@ -17876,3 +17988,133 @@ top.
 - **File(s)**: userspace-dp/src/afxdp/icmp_ratelimit.rs,
   userspace-dp/src/afxdp/poll_descriptor/reject_reply.rs,
   userspace-dp/src/afxdp/README.md, _Log.md
+- **Action**: #2957 state_writer orphan-temp sweep — robust to PID reuse.
+  Temp name changed from `<dest>.<pid>.<seq>.tmp` to
+  `<dest>.<pid>_<starttime>.<seq>.tmp` (process-instance identity = pid +
+  `/proc/<pid>/stat` field 22 start time). Sweep liveness now requires BOTH
+  the pid to exist AND its current start time to match the embedded one, so
+  a recycled pid (new unrelated process on a crashed writer's pid) no longer
+  pins the stale orphan; a genuinely-live writer's in-flight temp is still
+  preserved (#2705 guarantee intact). New seam (START_TIME_HOOK) lets tests
+  simulate PID reuse. Added fail-on-revert test
+  `sweep_removes_orphan_whose_pid_was_reused_by_another_process` (RED against
+  bare-pid keying, verified by temporary revert). Legacy bare-pid temps are
+  no longer sweep candidates under the new scheme.
+  Gates: cargo build --release -p xpf-userspace-dp PASS;
+  cargo test -p xpf-userspace-dp state_writer 11/11 PASS.
+- **File(s)**: userspace-dp/src/state_writer.rs, userspace-dp/src/FEATURES.md,
+  docs/userspace-dataplane-architecture.md, _Log.md
+- **Action**: #2963 — reject at COMMIT-TIME a BGP neighbor whose peer-as
+  (remote-as) is missing/0. peer-as is optional in the parser/compiler, so
+  a neighbor authored without one (and without an inherited group peer-as)
+  kept a zero BGPNeighbor.PeerAS and the FRR renderer emitted
+  `neighbor <addr> remote-as 0`. AS 0 is reserved (RFC 7607); FRR/vtysh
+  rejects it, failing the whole frr-reload — a commit-accepted config the
+  routing daemon cannot load. Added validateBGPNeighborPeerASStrict
+  (pkg/config/compiler_validate_strict.go) hard-rejecting PeerAS==0 at
+  commit/commit-check (global + per-routing-instance scopes, naming the
+  group + neighbor) wired into compileConfigWithOpts with a new
+  lenientBGPNeighborPeerAS option (warn-and-boot on load/HA-sync per #1960).
+  Defense-in-depth: generateProtocols (pkg/frr/policy_render.go) now SKIPS a
+  neighbor with PeerAS==0 so AS 0 never reaches frr.conf on the lenient
+  path. Did NOT touch local-AS / router bgp handling (the rejected false
+  half of agy-review-056 056-05 — guarded by LocalAS>0). FAIL-ON-REVERT:
+  config gate test RED without the strict check (compiles + would render
+  remote-as 0); frr render-guard test RED without the skip (emits
+  remote-as 0). Gates: go build ./..., gofmt -l clean (my files),
+  go vet ./pkg/config/... ./pkg/frr/..., go test ./pkg/config/...
+  ./pkg/frr/... all PASS.
+- **File(s)**: pkg/config/compiler.go,
+  pkg/config/compiler_validate_strict.go,
+  pkg/config/bgp_neighbor_peeras_2963_test.go,
+  pkg/frr/policy_render.go, pkg/frr/bgp_remote_as_2963_test.go,
+  pkg/frr/README.md, _Log.md
+
+- **Timestamp**: 2026-06-25
+- **Action**: #2980 — commit-time validation of OSPF/OSPFv3/BGP router-id as a
+  valid 32-bit IPv4 dotted-quad. router-id was parsed as a raw string with no
+  validation, so a malformed value (garbage, out-of-range octet, or an IPv6
+  address) flowed verbatim into frr.conf. FRR/vtysh requires an IPv4 router-id
+  for ALL routing protocols (including the IPv6 protocols OSPFv3 and BGP) and
+  rejects anything else, failing the whole frr-reload — a commit-accepted
+  config the routing daemon cannot load. Added validateRouterIDStrict
+  (pkg/config/compiler_validate_strict.go) hard-rejecting a non-IPv4 router-id
+  at commit/commit-check (global protocols {} + per-routing-instance scopes,
+  covering OSPF/OSPFv3/BGP, naming the scope + protocol) wired into
+  compileConfigWithOpts with a new lenientRouterID option (warn-and-boot on
+  load/HA-sync per #1960). Check is net.ParseIP + To4()!=nil; empty router-id
+  allowed (omitted, FRR auto-derives). Defense-in-depth: validRouterID guard
+  at the three generateProtocols render sites (pkg/frr/policy_render.go) so a
+  malformed value never reaches frr.conf on the lenient path. Mirrors the
+  #2963 strict/lenient plumbing exactly. FAIL-ON-REVERT: config gate tests RED
+  without the strict check (neutered validator → 3 anchor tests fail);
+  frr render-guard test RED without the validRouterID skip. Gates:
+  go build ./..., gofmt -l clean (my files), go vet ./pkg/config/...
+  ./pkg/frr/..., go test ./pkg/config/... ./pkg/frr/... all PASS.
+- **File(s)**: pkg/config/compiler.go,
+  pkg/config/compiler_validate_strict.go,
+  pkg/config/router_id_2980_test.go,
+  pkg/frr/policy_render.go, pkg/frr/router_id_2980_test.go,
+  pkg/frr/README.md, _Log.md
+## 2026-06-25 — #2960 DuckDNS dedicated backend (was a broken dyndns2 alias)
+- **Timestamp**: 2026-06-25
+- **Action**: Implemented `duckdns` as its OWN DDNS backend instead of a
+  dyndns2 alias. DuckDNS is not dyndns2-protocol-compatible: the alias sent
+  the wrong params (`hostname=`/`myip=`), the wrong auth (HTTP Basic), rejected
+  DuckDNS's `OK` body (only `good`/`nochg` were accepted), and used the wrong
+  withdraw verb (`offline=YES`) — so updates/withdraws never worked against the
+  real DuckDNS API. New backend speaks the real protocol:
+  `GET /update?domains=<label>&token=<tok>&ip=<v4>` (`&ipv6=<v6>` for AAAA),
+  token as a QUERY param, success on the literal `OK` (`KO` ⇒ hard
+  `errHTTPAuth`), withdraw via `&clear=true`. Token comes from the `api-token`
+  leaf (reused from cloudflare). `duckdns` removed from `dyndns2Endpoints` and
+  from the config dyndns2 known-name set; added to the `backend` enum and a
+  duckdns warn-validation case (missing api-token). Mirrors the
+  cloudflare/route53 backend structure + the #2904 cached-client path.
+- **Fail-on-revert**: `pkg/ddns/backend_duckdns_test.go` asserts the update
+  request shape (domains/token/ip/ipv6), no Basic auth header, no dyndns2
+  hostname/myip, `OK`-keyword success, `clear=true` withdraw (no offline=YES),
+  OK/KO verdict mapping, missing-token fail-closed, and the FQDN→label
+  reduction — RED if reverted to the alias (proven: alias UpsertLease drops
+  `ip=`). `TestDyndns2NameEndpointResolution` now guards that `duckdns` does
+  NOT resolve a dyndns2 endpoint (RED if re-added to the table — proven).
+  Config-side: `TestP3IncompleteHTTPProviderWarns` requires the duckdns
+  no-api-token warning.
+- **Gates**: go build ./..., gofmt -l clean (touched files), go vet
+  ./pkg/ddns/..., go test -race ./pkg/ddns/..., go test ./pkg/config/... PASS.
+- **File(s)**: pkg/ddns/backend_duckdns.go (new), pkg/ddns/backend_duckdns_test.go
+  (new), pkg/ddns/surface_a.go, pkg/ddns/backend_dyndns2.go,
+  pkg/ddns/backend_http_test.go, pkg/ddns/README.md,
+  pkg/config/schema_system.go, pkg/config/compiler_validate_warn.go,
+  pkg/config/compiler_p3_http_providers_test.go, docs/config-schema.md, _Log.md
+
+## 2026-06-25 — #2960 review fix: DuckDNS per-family clobber (PR #2967 r2)
+- **Timestamp**: 2026-06-25
+- **Action**: Hostile review (MERGE-NEEDS-MINOR) flagged a spec-backed defect:
+  the DuckDNS update API auto-detects and SETS the family whose address param
+  is omitted ("If you do not specify the IP address, then it will be detected",
+  duckdns.org/spec.jsp). A v6-only UpsertLease (ipv6= only) therefore overwrites
+  the A record. Surface A scopes are per-family with NO per-FQDN coalescing, so
+  a dual-stack DuckDNS name has two scopes that clobber each other every
+  reconcile. Approach (a) (per-FQDN coalescing so one update carries both ip=
+  and ipv6=) would require threading cross-scope address knowledge through the
+  surface_a engine into the backend boundary — too invasive (the engine resolves
+  a backend per scope and calls UpsertLease with a single-address record; the
+  change-detection / ownership / RG-gate state machine is all per-scope). Took
+  approach (b): SINGLE-FAMILY-PER-NAME restriction enforced by a commit-time
+  warning in validateSurfaceADDNSWarnings — a DuckDNS (provider,FQDN) bound on
+  BOTH inet and inet6 is flagged (warn, not hard-reject, matching this
+  validator's fail-open posture). Fixed the now-false UpsertLease code comment
+  (documents the auto-detect clobber + why no placeholder is synthesized) and
+  the README (single-family-per-name caveat).
+- **Fail-on-revert**: pkg/config TestDuckDNSDualStackNameWarns — a config with
+  both A+AAAA duckdns scopes on one name MUST warn (RED without the cross-family
+  detection — proven by neutralizing the gate). Asserts NO false positives: a
+  single-family duckdns name and a dual-stack name on a non-duckdns (cloudflare)
+  backend are NOT warned.
+- **Gates**: go build ./..., gofmt -l clean (Go files), go vet
+  ./pkg/ddns/... ./pkg/config/..., go test -race ./pkg/ddns/... ./pkg/config/...
+  all PASS.
+- **File(s)**: pkg/ddns/backend_duckdns.go, pkg/ddns/README.md,
+  pkg/config/compiler_validate_warn.go,
+  pkg/config/compiler_p3_http_providers_test.go, _Log.md

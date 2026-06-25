@@ -12,10 +12,10 @@ import (
 
 func TestP3HTTPProvidersCompile(t *testing.T) {
 	tree := buildTree(t, []string{
-		// dyndns2 (token-in-password style; duckdns name resolves an endpoint).
-		"set system services dynamic-dns provider duckdns backend dyndns2",
-		"set system services dynamic-dns provider duckdns username myuser",
-		"set system services dynamic-dns provider duckdns password tok-secret-a",
+		// duckdns is its OWN backend (#2960), not a dyndns2 alias: token via
+		// api-token (query-param auth), not username/password Basic.
+		"set system services dynamic-dns provider duckdns backend duckdns",
+		"set system services dynamic-dns provider duckdns api-token tok-secret-a",
 		// cloudflare.
 		"set system services dynamic-dns provider cf backend cloudflare",
 		"set system services dynamic-dns provider cf api-token cf-secret-b",
@@ -43,7 +43,7 @@ func TestP3HTTPProvidersCompile(t *testing.T) {
 	}
 
 	dd := cat.Providers["duckdns"]
-	if dd == nil || dd.Backend != "dyndns2" || dd.Username != "myuser" || dd.Password != "tok-secret-a" {
+	if dd == nil || dd.Backend != "duckdns" || dd.APIToken != "tok-secret-a" {
 		t.Fatalf("duckdns provider mismatch: %+v", dd)
 	}
 	cf := cat.Providers["cf"]
@@ -105,6 +105,7 @@ func TestP3IncompleteHTTPProviderWarns(t *testing.T) {
 		"set system services dynamic-dns provider cf backend cloudflare", // no api-token, no zone
 		"set system services dynamic-dns provider aws backend route53",   // no keys/zone-id
 		"set system services dynamic-dns provider g backend generic",     // no url-template
+		"set system services dynamic-dns provider duck backend duckdns",  // no api-token (#2960)
 	})
 	cfg, err := CompileConfig(tree)
 	if err != nil {
@@ -112,10 +113,59 @@ func TestP3IncompleteHTTPProviderWarns(t *testing.T) {
 	}
 	warns := validateSurfaceADDNSWarnings(cfg)
 	joined := strings.Join(warns, "\n")
-	for _, want := range []string{"no api-token", "no zone", "aws-access-key", "no hosted-zone-id", "no url-template"} {
+	for _, want := range []string{"no api-token", "no zone", "aws-access-key", "no hosted-zone-id", "no url-template", "(backend duckdns) has no api-token"} {
 		if !strings.Contains(joined, want) {
 			t.Fatalf("expected a warning containing %q; got:\n%s", want, joined)
 		}
+	}
+}
+
+// TestDuckDNSDualStackNameWarns is the #2960 fail-on-revert gate for the DuckDNS
+// per-family clobber: a single DuckDNS name bound on BOTH inet and inet6 must
+// warn at commit (DuckDNS auto-detects and overwrites the family whose address
+// is omitted, so the two per-family Surface A scopes clobber each other's
+// A/AAAA on every reconcile). RED without the cross-family detection in
+// validateSurfaceADDNSWarnings. A single-family DuckDNS name, and a dual-stack
+// name on a DIFFERENT (non-duckdns) backend, must NOT warn — no false positives.
+func TestDuckDNSDualStackNameWarns(t *testing.T) {
+	tree := buildTree(t, []string{
+		"set system services dynamic-dns provider duck backend duckdns",
+		"set system services dynamic-dns provider duck api-token tok-secret",
+		// DUAL-STACK on the SAME duckdns name → must warn (the clobber topology).
+		"set interfaces ge-0-0-2 unit 0 family inet dynamic-dns provider duck",
+		"set interfaces ge-0-0-2 unit 0 family inet dynamic-dns hostname home.duckdns.org",
+		"set interfaces ge-0-0-2 unit 0 family inet6 dynamic-dns provider duck",
+		"set interfaces ge-0-0-2 unit 0 family inet6 dynamic-dns hostname home.duckdns.org",
+		// SINGLE-FAMILY duckdns name → must NOT warn.
+		"set interfaces ge-0-0-2 unit 1 family inet dynamic-dns provider duck",
+		"set interfaces ge-0-0-2 unit 1 family inet dynamic-dns hostname v4only.duckdns.org",
+		// A dual-stack name on a NON-duckdns backend → must NOT warn (cloudflare
+		// has a real per-family API; only duckdns has the clobber).
+		"set system services dynamic-dns provider cf backend cloudflare",
+		"set system services dynamic-dns provider cf api-token cf-secret",
+		"set system services dynamic-dns provider cf zone example.net",
+		"set interfaces ge-0-0-2 unit 2 family inet dynamic-dns provider cf",
+		"set interfaces ge-0-0-2 unit 2 family inet dynamic-dns hostname dual.example.net",
+		"set interfaces ge-0-0-2 unit 2 family inet6 dynamic-dns provider cf",
+		"set interfaces ge-0-0-2 unit 2 family inet6 dynamic-dns hostname dual.example.net",
+	})
+	cfg, err := CompileConfig(tree)
+	if err != nil {
+		t.Fatalf("CompileConfig: %v", err)
+	}
+	warns := validateSurfaceADDNSWarnings(cfg)
+	joined := strings.Join(warns, "\n")
+
+	if !strings.Contains(joined, `provider "duck" (backend duckdns) hostname "home.duckdns.org" is bound on BOTH inet and inet6`) {
+		t.Fatalf("expected a DuckDNS dual-stack clobber warning for home.duckdns.org; got:\n%s", joined)
+	}
+	// No false positives: the single-family duckdns name and the dual-stack
+	// cloudflare name must NOT be warned about.
+	if strings.Contains(joined, "v4only.duckdns.org") {
+		t.Fatalf("single-family duckdns name must NOT warn; got:\n%s", joined)
+	}
+	if strings.Contains(joined, "dual.example.net") {
+		t.Fatalf("dual-stack name on a non-duckdns backend must NOT warn; got:\n%s", joined)
 	}
 }
 

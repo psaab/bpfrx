@@ -55,6 +55,21 @@ func sanitizeFRRValue(s string) string {
 	return string(b)
 }
 
+// validRouterID reports whether a router-id is a valid 32-bit IPv4
+// dotted-quad. FRR/vtysh requires an IPv4 router-id for ALL routing
+// protocols (including the IPv6 protocols OSPFv3 and BGP) and rejects
+// anything else, failing the whole frr-reload. This is the render-side
+// defense-in-depth for #2980: commit-time validation
+// (validateRouterIDStrict, pkg/config) hard-rejects a bad router-id, but
+// the tolerant load / peer-sync paths only warn (#1960 no-brick), so the
+// renderer must keep a leniently-loaded malformed router-id out of frr.conf
+// entirely. Empty is intentionally invalid here (the caller already gates
+// on != "" and an empty value is omitted so FRR auto-derives the router-id).
+func validRouterID(s string) bool {
+	ip := net.ParseIP(s)
+	return ip != nil && ip.To4() != nil
+}
+
 // knownRedistProtocols are the FRR redistribute protocol keywords.
 // ospf6 / ripng are the FRR keywords for OSPFv3 / RIPng redistribution;
 // without them a bare `export ospf6` / `export ripng` falls through to the
@@ -392,7 +407,7 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 
 	if ospf != nil {
 		fmt.Fprintf(&b, "router ospf%s\n", vrfSuffix)
-		if ospf.RouterID != "" {
+		if validRouterID(ospf.RouterID) {
 			fmt.Fprintf(&b, " ospf router-id %s\n", ospf.RouterID)
 		}
 		if ospf.ReferenceBandwidth > 0 {
@@ -481,7 +496,7 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 
 	if ospfv3 != nil {
 		fmt.Fprintf(&b, "router ospf6%s\n", vrfSuffix)
-		if ospfv3.RouterID != "" {
+		if validRouterID(ospfv3.RouterID) {
 			fmt.Fprintf(&b, " ospf6 router-id %s\n", ospfv3.RouterID)
 		}
 		for _, area := range ospfv3.Areas {
@@ -520,7 +535,7 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 
 	if bgp != nil && bgp.LocalAS > 0 {
 		fmt.Fprintf(&b, "router bgp %d%s\n", bgp.LocalAS, vrfSuffix)
-		if bgp.RouterID != "" {
+		if validRouterID(bgp.RouterID) {
 			fmt.Fprintf(&b, " bgp router-id %s\n", bgp.RouterID)
 		}
 		if bgp.ClusterID != "" {
@@ -555,6 +570,18 @@ func (m *Manager) generateProtocols(ospf *config.OSPFConfig, ospfv3 *config.OSPF
 			fmt.Fprintf(&b, " bgp dampening %d %d %d %d\n", hl, reuse, suppress, maxSup)
 		}
 		for _, n := range bgp.Neighbors {
+			// Defense-in-depth (#2963): never emit `remote-as 0`. peer-as is
+			// optional in the parser/compiler, so a neighbor authored without
+			// one keeps a zero PeerAS. AS 0 is reserved (RFC 7607) and FRR/vtysh
+			// rejects `remote-as 0`, failing the whole frr-reload. Commit-time
+			// validation (validateBGPNeighborPeerASStrict, pkg/config) rejects
+			// this on commit/commit-check; on the tolerant load/peer-sync path
+			// it is downgraded to a warning, so this render guard keeps a
+			// leniently-loaded remote-as-0 neighbor out of frr.conf entirely
+			// rather than bricking the reload for every other peer.
+			if n.PeerAS == 0 {
+				continue
+			}
 			fmt.Fprintf(&b, " neighbor %s remote-as %d\n", n.Address, n.PeerAS)
 			if n.Description != "" {
 				fmt.Fprintf(&b, " neighbor %s description %s\n", n.Address, sanitizeFRRValue(n.Description))

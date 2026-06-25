@@ -2904,3 +2904,67 @@ fn same_prefix_routes_tie_break_by_preference_not_insertion_order() {
         "lower-preference route (pref 5, ge-0/0/2) must win over the higher-preference route (pref 50, ge-0/0/1) inserted first",
     );
 }
+
+/// #2922: `select_route_next_hop` must evaluate the (impure) liveness
+/// predicate exactly ONCE per candidate — not twice (count + nth).
+///
+/// FAIL-ON-REVERT: the pre-#2922 two-pass form called `is_live` for the
+/// `count()` pass AND again for the `nth()` pass — `2 * candidates.len()`
+/// calls. This test pins the call count to exactly `candidates.len()`, so
+/// reverting to the double-eval form makes the assertion RED.
+#[test]
+fn select_route_next_hop_evaluates_liveness_once_per_candidate() {
+    use std::cell::Cell;
+    let candidates = [10u32, 20, 30, 40];
+    let calls = Cell::new(0usize);
+    let selected = select_route_next_hop(&candidates, 1, |_c| {
+        calls.set(calls.get() + 1);
+        true // all live
+    });
+    assert_eq!(
+        calls.get(),
+        candidates.len(),
+        "liveness predicate must be evaluated exactly once per candidate (single snapshot); \
+         the reverted double-eval form calls it 2x",
+    );
+    // Selection still works over the live set: ip_hash 1 % 4 live = index 1.
+    assert_eq!(selected, Some(&20));
+}
+
+/// #2922: a candidate that flips from live→dead between the count pass and
+/// the selection pass must not cause a wrong/dead pick (or a spurious
+/// no-route). With a single snapshot this is structurally impossible.
+///
+/// FAIL-ON-REVERT: the closure here returns `true` on the FIRST observation
+/// of a given candidate and `false` on every later observation — modeling a
+/// neighbor the monitor thread removes between passes. Under the old
+/// two-pass form the `count()` pass saw all 4 live (`live == 4`,
+/// `pool_len == 4`, `pick == 4 % 4 == 0`), then the `nth(0)` pass re-ran the
+/// closure and EVERY candidate now reported dead → the filtered iterator was
+/// empty → `nth(0)` returned `None` → spurious no-route despite live members
+/// at count time. The single-pass form snapshots liveness once, so the pick
+/// resolves to a real, live candidate.
+#[test]
+fn select_route_next_hop_consistent_under_liveness_flip_between_passes() {
+    use std::cell::RefCell;
+    use std::collections::HashSet;
+    let candidates = [10u32, 20, 30, 40];
+    // Each candidate is "live" only the first time it is observed; any
+    // subsequent observation (a second pass) reports it dead.
+    let seen: RefCell<HashSet<u32>> = RefCell::new(HashSet::new());
+    let selected = select_route_next_hop(&candidates, 0, |c| {
+        let mut s = seen.borrow_mut();
+        s.insert(*c) // true on first insert, false if already present
+    });
+    assert!(
+        selected.is_some(),
+        "single liveness snapshot must not yield a spurious no-route when \
+         live candidates existed at evaluation time (the reverted double-eval \
+         form returns None here)",
+    );
+    let pick = selected.unwrap();
+    assert!(
+        candidates.contains(pick),
+        "selected next-hop must be a real candidate from the snapshot",
+    );
+}
