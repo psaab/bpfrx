@@ -16298,3 +16298,45 @@ top.
   go test ./pkg/config/... pass.
   **File(s)**: pkg/config/compiler_validate_wireguard.go,
   pkg/config/wireguard_multipeer_test.go, docs/config-schema.md, _Log.md
+
+- **Timestamp**: 2026-06-25
+  **Action**: #2792 — eliminate the per-packet heap churn on the
+  WireGuard transit-egress encap path. `frame/wg.rs::wg_encap_frame`
+  allocated TWO heap Vecs per packet: an intermediate `wg_record`
+  scratch (`vec![0u8; wg_record_len]`, pre-#2792 line 228) that
+  `try_encap` wrote the WG transport record into, then a SECOND `out`
+  frame Vec (`vec![0u8; frame_len]`, pre-#2792 line 242) into which the
+  scratch was copied (`copy_from_slice`, pre-#2792 lines 255-257).
+  Both the intermediate Vec AND the copy are removed. `try_encap` writes
+  the WG record (data header + ciphertext + Poly1305 tag) starting at
+  byte 0 of whatever `&mut [u8]` it is handed, so the encap now lands the
+  record DIRECTLY in the output frame's UDP-payload slot
+  (`out[payload_start..payload_start + wg_record_len]`). The output Vec
+  is sized ONCE to the pad-aware maximum record length (same
+  `WG_DATA_HEADER_LEN + pad_to_16(inner) + POLY1305_TAG_LEN` the #2680
+  MTU guard already validated) and truncated to the real encapped length
+  from `EncapOutcome::len`. Soundness: `try_encap` stages the padded
+  plaintext on the stack (MaybeUninit), so snow's non-overlapping
+  plaintext/ciphertext requirement holds without a separate output
+  buffer. Net allocation reduction: 2 Vecs + 1 memcpy -> 1 Vec (the
+  function's owned return value, structurally identical to the GRE
+  sibling `encapsulate_native_gre_frame` and required because the
+  TCP-segmentation caller accumulates one owned frame per segment in a
+  `Vec<Vec<u8>>`). No wire change (protocol_wire_v1.json untouched).
+  Correctness proof: added `wg_encap_in_place_matches_separate_buffer`
+  + an `established_pair` initiator/responder fixture sharing one real
+  Noise handshake. The test encaps via `wg_encap_frame`, slices the WG
+  record out of the produced frame, `try_decap`s it under the paired
+  responder, and asserts the recovered plaintext == the original inner
+  IP packet, plus that the record sits at the exact UDP payload offset,
+  is the exact pad-aware length, and the outer IPv4 total-length / UDP
+  length / frame length all track the truncated record. Fail-on-revert
+  verified: copied wg.rs aside, shifted the encrypt slice by +1 byte
+  (`payload_start + 1`), ran the test -> FAILED (frame build returned
+  None); restored from the copy, all green. Scope: WG transit-egress
+  encrypt path only (no decap/TUN-write #2438, no GRE, no reconcile
+  #2794, no NAT/DDNS). Gates: cargo build --release -p xpf-userspace-dp
+  clean; cargo test --release --bin xpf-userspace-dp -- wg => 200
+  passed / 0 failed.
+  **File(s)**: userspace-dp/src/afxdp/frame/wg.rs,
+  docs/wireguard-interop.md, _Log.md
