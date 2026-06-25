@@ -62,6 +62,18 @@ pub(crate) struct StaticNATRuleSnapshot {
     pub external_ip: String,
     #[serde(rename = "internal_ip", default)]
     pub internal_ip: String,
+    /// #2491: external (pre-translation) destination port the inbound packet
+    /// must carry for a port-mapped static-NAT rule. 0 = match any port
+    /// (whole-address 1:1, the legacy behaviour).
+    #[serde(rename = "match_destination_port", default)]
+    pub match_destination_port: u16,
+    /// #2491: internal (post-translation) destination port the 1:1 host
+    /// receives (`then static-nat prefix <ip> mapped-port <port>`). 0 = no
+    /// port translation. When set, the inbound DNAT rewrites the destination
+    /// port to this value and the reverse-path SNAT un-translates it back to
+    /// `match_destination_port`.
+    #[serde(rename = "mapped_port", default)]
+    pub mapped_port: u16,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]

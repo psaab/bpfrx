@@ -12,8 +12,9 @@ the userspace dataplane admission boundary is in
   application matching (multi-term apps), global policies, filtered
   session clearing.
 - **NAT**: source (interface + pool, userspace-v2 address-persistent),
-  destination (with hit counters), static 1:1, NAT64, NPTv6 (RFC 6296
-  stateless prefix translation).
+  destination (with hit counters), static 1:1 (with optional
+  `match destination-port` + `mapped-port` per-port forwarding, #2491),
+  NAT64, NPTv6 (RFC 6296 stateless prefix translation).
 - **Dual-stack**: IPv4 + IPv6, DHCPv4/v6 clients, embedded Router
   Advertisement sender (replaces radvd), SLAAC.
 - **Screen/IDS**: 11 checks (land, SYN flood, ping of death, teardrop,
@@ -143,7 +144,7 @@ The exact admission boundary is documented in
 | Application matching | Yes |
 | Source NAT (interface + pool) | Interface and pool mode yes; userspace `address-persistent` uses a documented userspace-v2 seeded FxHash selector (#2349 replaced the prior SHA-256; see `docs/userspace-dataplane-gaps.md` for the authoritative algorithm/contract). Non-HA per-pool `persistent-nat` lease reuse and pool exhaustion counters are implemented in helper-local runtime state; HA/restart persistence and cross-backend new-flow parity remain outside the current contract |
 | Destination NAT | Yes |
-| Static NAT (1:1) | Yes |
+| Static NAT (1:1) | Yes; optional per-port forwarding (#2491) — `match destination-port <port>` + `then static-nat prefix <ip> mapped-port <port>` translates the destination port on the inbound DNAT and un-translates the source port on the reverse SNAT, so several services can share one external IP. A port-less rule is the whole-address 1:1 fallback; both can coexist on one external IP |
 | NAT64 (IPv6↔IPv4) | Yes; translates ICMP echo AND error messages (Destination-Unreachable, Time-Exceeded, Packet-Too-Big↔Fragmentation-Needed with MTU adjustment, Parameter-Problem) per RFC 7915 §4.2/§5.2, including the embedded quoted packet — so PMTUD and traceroute work across the boundary (#2219). Per-packet **fragment translation** is RFC 7915 §4/§5 compliant (#2488): v6→v4 derives the IPv4 MF/offset/Identification from the IPv6 Fragment Header (low 16 bits of its 32-bit id) instead of the `no-v6-frag-header` config; v4→v6 inserts an IPv6 Fragment Header (next-header 44) for a fragmented IPv4 input. The TCP/UDP checksum on a first fragment is adjusted incrementally for the pseudo-header address change (RFC 1624, the full payload is not present). **Limitation:** only first/atomic fragments translate — non-first fragments are dropped both directions because the round-robin SNAT pool + port-keyed sessions cannot consistently map a port-less fragment to its datagram, so end-to-end fragmented NAT64 needs a stateful fragment-id cache (separate follow-up) |
 | NPTv6 (RFC 6296) | Yes |
 | Screen/IDS (11 checks) | Yes; userspace SYN-cookie runtime is wired |

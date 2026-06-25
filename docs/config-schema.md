@@ -540,6 +540,24 @@ reserved for whole-dataplane selection where a rewrite shim
   - `security nat static rule-set rule match` — declared the
     `source-address` / `destination-address` children the static-NAT
     compiler reads (the subtree was previously unreachable by the walker).
+    #2491 added `match destination-port` as a typed `ValueInteger`
+    (1..65535) leaf: it is the external (pre-translation) port a
+    port-mapped static-NAT rule matches on. The companion
+    `then static-nat prefix <ip> mapped-port <port>` carries the internal
+    (post-translation) port. `static-nat` deliberately stays a
+    `children: nil` free-form leaf (so `prefix <ip> mapped-port <port>`
+    collapses onto ONE leaf node and SetPath grouping is preserved); the
+    `mapped-port` token therefore bypasses the schema value validator and
+    is range-checked in the compiler (`validateNATHostMaskStrict`,
+    `compiler_nat.go`), which ALSO rejects a `mapped-port` with no
+    matching `match destination-port` (the reverse SNAT could not recover
+    the original port). The snapshot fields `match_destination_port` /
+    `mapped_port` (`StaticNATRuleSnapshot`, both Go `omitempty` + Rust
+    `#[serde(default)]`, default 0) are an additive, backward-compatible
+    wire change; a single external IP can host several per-port mappings
+    plus a port-less whole-address 1:1 rule (the dataplane keys the
+    static-NAT tables by `(IP, Option<port>)` and falls back to the
+    port-less entry).
   - `protocols router-advertisement interface` — typed the
     second-denominated leaves (`max/min-advertisement-interval`,
     `default-lifetime`, `link-mtu`; the latter was tightened from

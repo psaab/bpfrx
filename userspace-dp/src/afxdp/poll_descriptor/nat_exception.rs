@@ -35,10 +35,11 @@ pub(super) fn source_nat_decision_for_flow(
     matched_counter: &mut Option<std::sync::Arc<crate::nat::NatRuleCounter>>,
 ) -> Result<NatDecision, SourceNatFailure> {
     *matched_counter = None;
-    if let Some((decision, counter)) = forwarding
-        .static_nat
-        .match_snat_with_counter(flow.src_ip, from_zone)
-    {
+    if let Some((decision, counter)) = forwarding.static_nat.match_snat_with_counter(
+        flow.src_ip,
+        flow.forward_key.src_port,
+        from_zone,
+    ) {
         *matched_counter = counter;
         return Ok(decision);
     }

@@ -703,10 +703,11 @@ pub(super) fn poll_binding_process_descriptor(
                             None
                         };
                         let static_dnat_decision = if dnat_decision.is_none() {
-                            worker_ctx
-                                .forwarding
-                                .static_nat
-                                .match_dnat_with_counter(resolution_target, ingress_zone_name)
+                            worker_ctx.forwarding.static_nat.match_dnat_with_counter(
+                                resolution_target,
+                                flow.forward_key.dst_port,
+                                ingress_zone_name,
+                            )
                         } else {
                             None
                         };
