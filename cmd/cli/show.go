@@ -334,6 +334,12 @@ func (c *ctl) handleShowServices(args []string) error {
 				"(expected `status`)", rest[0])
 		}
 		return c.showText("application-identification-status")
+	case "dynamic-dns":
+		// #2691 P2: Surface A (router/interface-address) DDNS status.
+		if len(args) >= 2 && args[1] == "detail" {
+			return c.showText("services-dynamic-dns-detail")
+		}
+		return c.showText("services-dynamic-dns")
 	default:
 		return fmt.Errorf("unknown services target: %s", args[0])
 	}

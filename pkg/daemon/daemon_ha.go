@@ -1005,6 +1005,9 @@ func (d *Daemon) applyRethServicesForRG(rgID int) {
 	// leases and only adds on the next cycle — it never deletes on the
 	// strength of a not-yet-written lease (daemon_ddns.go nudge note).
 	d.nudgeDDNSReconcile()
+	// #2691 P2: a MASTER takeover changes which RG scopes this node may
+	// publish for Surface A too — nudge it to (re)publish its RG records.
+	d.nudgeSurfaceADDNSReconcile()
 }
 
 // clearRethServicesForRG withdraws RA senders and stops DHCP server only
@@ -1070,6 +1073,9 @@ func (d *Daemon) clearRethServicesForRG(rgID int) {
 	// nudge is benign if it races the async Kea re-apply: a too-early pass sees
 	// the unchanged store and only the gate state matters for the demoted RG.
 	d.nudgeDDNSReconcile()
+	// #2691 P2: a partial demotion changes the per-RG Surface A gate too —
+	// nudge so the demoted RG's scopes stop publishing (never withdraw).
+	d.nudgeSurfaceADDNSReconcile()
 }
 
 // filterDHCPConfigForMasterRGs returns a DHCP config containing only groups

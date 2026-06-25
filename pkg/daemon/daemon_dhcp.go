@@ -71,6 +71,11 @@ func buildDHCPClientSpecs(cfg *config.Config) []dhcp.ClientSpec {
 // DHCP manager. It re-enters applyConfig, which is why the client
 // reconcile must key on config identity only — see reconcileDHCPClients.
 func (d *Daemon) onDHCPAddressChange() {
+	// #2691 P2: a DHCP-learned address change on a WAN interface is the prime
+	// Surface A republish trigger (the #1844 hook fires this). Nudge the
+	// Surface A loop so a new lease address is republished within one pass
+	// (the engine's change-detection then decides whether a wire UPDATE fires).
+	d.nudgeSurfaceADDNSReconcile()
 	// Full recompile is safe: heartbeat sockets survive VRF rebind
 	// (RestartHeartbeat), RETH MAC is set live (no XSK rebind), and
 	// BPF compile skips reconcile when the binding plan is unchanged.

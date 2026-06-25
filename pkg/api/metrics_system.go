@@ -76,6 +76,35 @@ func (c *xpfCollector) collectDDNSMetrics(ch chan<- prometheus.Metric) {
 		float64(st.LastReconcileN))
 }
 
+// collectSurfaceADDNSMetrics emits the xpf_ddns_surface_a_* family from the
+// Surface A (router/interface-address) DDNS manager snapshot (#2691 P2). The
+// family is omitted entirely when no SurfaceAStatsFn is wired or it returns nil
+// (NoDataplane). Label cardinality is CLOSED: result in {ok,fail}; reason in
+// {unchanged,backoff}.
+func (c *xpfCollector) collectSurfaceADDNSMetrics(ch chan<- prometheus.Metric) {
+	if c.srv.surfaceAStatsFn == nil {
+		return
+	}
+	st := c.srv.surfaceAStatsFn()
+	if st == nil {
+		return
+	}
+	ch <- prometheus.MustNewConstMetric(c.surfaceADDNSUpsertsTotal, prometheus.CounterValue,
+		float64(st.UpsertOK), "ok")
+	ch <- prometheus.MustNewConstMetric(c.surfaceADDNSUpsertsTotal, prometheus.CounterValue,
+		float64(st.UpsertFail), "fail")
+	ch <- prometheus.MustNewConstMetric(c.surfaceADDNSDeletesTotal, prometheus.CounterValue,
+		float64(st.DeleteOK), "ok")
+	ch <- prometheus.MustNewConstMetric(c.surfaceADDNSDeletesTotal, prometheus.CounterValue,
+		float64(st.DeleteFail), "fail")
+	ch <- prometheus.MustNewConstMetric(c.surfaceADDNSSkippedTotal, prometheus.CounterValue,
+		float64(st.Skipped), "unchanged")
+	ch <- prometheus.MustNewConstMetric(c.surfaceADDNSSkippedTotal, prometheus.CounterValue,
+		float64(st.BackedOff), "backoff")
+	ch <- prometheus.MustNewConstMetric(c.surfaceADDNSScopes, prometheus.GaugeValue,
+		float64(st.Scopes))
+}
+
 // collectFlowExportMetrics emits the xpf_flow_export_collector_* family
 // from the per-collector NetFlow v9 / IPFIX write-health snapshot
 // (#2464). The family is omitted entirely when no FlowCollectorHealthFn

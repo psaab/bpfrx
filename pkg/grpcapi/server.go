@@ -18,6 +18,7 @@ import (
 	"github.com/psaab/xpf/pkg/configstore"
 	"github.com/psaab/xpf/pkg/conntrack"
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
+	ddnspkg "github.com/psaab/xpf/pkg/ddns"
 	"github.com/psaab/xpf/pkg/dhcp"
 	"github.com/psaab/xpf/pkg/dhcpserver"
 	"github.com/psaab/xpf/pkg/feeds"
@@ -60,6 +61,11 @@ type Config struct {
 	// manager is absent (NoDataplane) — the show renders "not running".
 	DDNSStatsFn        func() *dhcpserver.DDNSStats
 	DDNSOwnedRecordsFn func() []dhcpserver.DDNSOwnedRecordView
+	// #2691 P2: Surface A (router/interface-address) DDNS status sources for
+	// `show system services dynamic-dns [detail]`. nil when the manager is
+	// absent (NoDataplane).
+	SurfaceADDNSStatsFn  func() *ddnspkg.SurfaceAStats
+	SurfaceADDNSStatusFn func() []ddnspkg.SurfaceAStatusView
 	// #2464: per-collector NetFlow v9 / IPFIX write-health for
 	// `show services flow-monitoring statistics`. nil when no flow export
 	// is wired — the show renders "no flow export configured".
@@ -100,6 +106,8 @@ type Server struct {
 	lldpNeighborsFn       func() []*lldp.Neighbor
 	ddnsStatsFn           func() *dhcpserver.DDNSStats
 	ddnsOwnedRecordsFn    func() []dhcpserver.DDNSOwnedRecordView
+	surfaceADDNSStatsFn   func() *ddnspkg.SurfaceAStats
+	surfaceADDNSStatusFn  func() []ddnspkg.SurfaceAStatusView
 	flowCollectorHealthFn func() []flowexport.ExporterCollectorHealth
 	commitFn              func(ctx context.Context, comment string) (*config.Config, error)
 	commitConfirmedFn     func(ctx context.Context, minutes int) (*config.Config, error)
@@ -153,6 +161,8 @@ func NewServer(addr string, cfg Config) *Server {
 		lldpNeighborsFn:       cfg.LLDPNeighborsFn,
 		ddnsStatsFn:           cfg.DDNSStatsFn,
 		ddnsOwnedRecordsFn:    cfg.DDNSOwnedRecordsFn,
+		surfaceADDNSStatsFn:   cfg.SurfaceADDNSStatsFn,
+		surfaceADDNSStatusFn:  cfg.SurfaceADDNSStatusFn,
 		flowCollectorHealthFn: cfg.FlowCollectorHealthFn,
 		commitFn:              cfg.CommitFn,
 		commitConfirmedFn:     cfg.CommitConfirmedFn,

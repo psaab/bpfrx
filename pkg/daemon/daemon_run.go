@@ -25,6 +25,7 @@ import (
 	"github.com/psaab/xpf/pkg/config"
 	"github.com/psaab/xpf/pkg/dataplane"
 	dpuserspace "github.com/psaab/xpf/pkg/dataplane/userspace"
+	"github.com/psaab/xpf/pkg/ddns"
 	"github.com/psaab/xpf/pkg/dhcp"
 	"github.com/psaab/xpf/pkg/dhcprelay"
 	"github.com/psaab/xpf/pkg/dhcpserver"
@@ -449,6 +450,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 		// mode is harmless. The live rfc2136 backend is resolved per-Reconcile
 		// from the current policy.
 		d.ddns = dhcpserver.NewProductionDDNSManager(ddnsNodeIDSeed())
+		// #2691 P2: the always-on Surface A manager (router/interface-address
+		// publish). Constructed unconditionally for the same reason as the lease
+		// manager — a binding removal must have a running loop to withdraw.
+		d.surfaceA = ddns.NewSurfaceAManager()
 	}
 
 	// Create the RPM manager eagerly so the pointer is stable for the
@@ -1106,6 +1111,18 @@ func (d *Daemon) Run(ctx context.Context) error {
 		}()
 	}
 
+	// #2691 P2: start the always-on Surface A (router/interface-address) DDNS
+	// reconcile loop. Same lifecycle + control-socket-free + per-RG-gated
+	// discipline as the lease loop above; it reads netlink + the DHCP client
+	// lease set and publishes the firewall's own addresses.
+	if !d.opts.NoDataplane && d.surfaceA != nil {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			d.runSurfaceADDNSReconcileLoop(ctx)
+		}()
+	}
+
 	// Start VRRP event watcher (manager was created earlier, before applyConfig).
 	// Uses context.Background() — the watcher must outlive daemon ctx cancel
 	// so it can process VRRP BACKUP events during shutdown (rg_active cleanup).
@@ -1218,7 +1235,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 			// #1387 inc-2: DHCP dynamic-DNS counters for the
 			// xpf_dhcp_ddns_* metric family. Returns nil when the
 			// manager is absent (NoDataplane), omitting the family.
-			DDNSStatsFn: d.DDNSStats,
+			DDNSStatsFn:     d.DDNSStats,
+			SurfaceAStatsFn: d.SurfaceAStats,
 			// #2464: per-collector NetFlow v9 / IPFIX write-health for the
 			// xpf_flow_export_collector_* family + /services/flow-exporters.
 			FlowCollectorHealthFn: d.FlowCollectorHealth,
@@ -1331,8 +1349,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 			},
 			// #1387 inc-2: DHCP dynamic-DNS status sources for the
 			// `show ... dhcp-server dynamic-dns` ShowText topics.
-			DDNSStatsFn:        d.DDNSStats,
-			DDNSOwnedRecordsFn: d.OwnedDDNSRecords,
+			DDNSStatsFn:          d.DDNSStats,
+			SurfaceADDNSStatsFn:  d.SurfaceAStats,
+			SurfaceADDNSStatusFn: d.SurfaceAStatus,
+			DDNSOwnedRecordsFn:   d.OwnedDDNSRecords,
 			// #2464: per-collector NetFlow v9 / IPFIX write-health for
 			// `show services flow-monitoring statistics`.
 			FlowCollectorHealthFn: d.FlowCollectorHealth,
@@ -1455,6 +1475,8 @@ func (d *Daemon) Run(ctx context.Context) error {
 		// #1387 inc-2: DHCP dynamic-DNS status hooks for the in-process CLI.
 		shell.SetDDNSStatsFn(d.DDNSStats)
 		shell.SetDDNSOwnedRecordsFn(d.OwnedDDNSRecords)
+		shell.SetSurfaceADDNSStatsFn(d.SurfaceAStats)
+		shell.SetSurfaceADDNSStatusFn(d.SurfaceAStatus)
 		shell.SetFlowCollectorHealthFn(d.FlowCollectorHealth)
 		shell.SetVRRPManager(d.vrrpMgr)
 		shell.SetFabricPeer(func() []string {

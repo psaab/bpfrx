@@ -344,6 +344,7 @@ var schemaSystem = &schemaNode{desc: "System configuration", children: map[strin
 			"dynamic-dns":               dhcpDynamicDNSSchema(),
 			"expired-leases-processing": dhcpExpiredLeasesSchema(),
 		}},
+		"dynamic-dns": ddnsServicesSchema(),
 	}},
 }}
 
@@ -651,6 +652,40 @@ func dhcpDynamicDNSSchema() *schemaNode {
 			placeholder: "<instance>",
 			children:    nil,
 		},
+	}}
+}
+
+// ddnsServicesSchema returns the config-mode schema for the Surface A
+// `system services dynamic-dns` provider catalog + engine tunables (#2691 P2,
+// plan §5.9). The `provider <name>` block is a repeatable named instance
+// (credentials configured once, referenced by per-interface bindings). The
+// backend enum is validated (rfc2136 live; dyndns2/cloudflare/route53/generic
+// reserved for P3); credentials stay free-form (a valid base64 secret / host
+// is not rejected at commit — the live backend is warn-validated at commit and
+// fail-open at runtime). forced-refresh / error-backoff-max accept a Go
+// duration ("24h") or a bare-seconds integer.
+func ddnsServicesSchema() *schemaNode {
+	return &schemaNode{desc: "Dynamic DNS provider catalog + engine tunables (Surface A, #2691)", children: map[string]*schemaNode{
+		"provider": {desc: "Named DDNS provider", args: 1, placeholder: "<provider-name>", children: map[string]*schemaNode{
+			"backend": {
+				desc:          "DNS-update backend (rfc2136 is live; dyndns2/cloudflare/route53/generic are reserved for P3)",
+				args:          1,
+				valueType:     ValueEnumOf,
+				valueDesc:     "Update backend (rfc2136 [live] | dyndns2 | cloudflare | route53 | generic [P3])",
+				valueExamples: []string{"rfc2136"},
+				validator:     ValidateEnum([]string{"rfc2136", "dyndns2", "cloudflare", "route53", "generic"}),
+				children:      nil,
+			},
+			"update-server":         {desc: "Authoritative DNS target for RFC 2136 updates (host[:port])", args: 1, placeholder: "<host[:port]>", children: nil},
+			"tsig-key":              {desc: "TSIG key name for authenticated updates", args: 1, placeholder: "<key-name>", children: nil},
+			"tsig-algorithm":        {desc: "TSIG algorithm (e.g. hmac-sha256)", args: 1, placeholder: "<algorithm>", children: nil},
+			"tsig-secret":           {desc: "TSIG shared secret (sensitive; redacted in show output)", args: 1, placeholder: "<secret>", children: nil},
+			"source-address":        {desc: "Source address to bind the UPDATE socket to (#2665)", args: 1, placeholder: "<ip>", children: nil},
+			"destination-interface": {desc: "Egress interface to pin the UPDATE to (SO_BINDTODEVICE, #2665)", args: 1, placeholder: "<interface>", children: nil},
+			"routing-instance":      {desc: "Routing instance / VRF the UPDATE egresses from (#2665)", args: 1, placeholder: "<instance>", children: nil},
+		}},
+		"forced-refresh":    {desc: "Wire-update floor for an unchanged address (duration, e.g. 24h, or seconds; default 24h)", args: 1, placeholder: "<duration>", children: nil},
+		"error-backoff-max": {desc: "Cap for the per-scope error backoff (duration, e.g. 1h, or seconds; default 1h)", args: 1, placeholder: "<duration>", children: nil},
 	}}
 }
 

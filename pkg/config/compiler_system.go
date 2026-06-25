@@ -7,6 +7,8 @@ import (
 	"os"
 	"sort"
 	"strconv"
+	"strings"
+	"time"
 )
 
 const sharedUMEMPhase0ArtifactMaxBytes = 16 << 20
@@ -377,6 +379,17 @@ func compileSystem(node *Node, sys *SystemConfig) error {
 				sys.Services.WebManagement.APIAuth = auth
 			}
 		}
+		// system services dynamic-dns — the Surface A provider catalog + engine
+		// tunables (#2691 P2, plan §5.9). The per-interface `dynamic-dns`
+		// bindings reference these named providers.
+		if ddnsNode := svcNode.FindChild("dynamic-dns"); ddnsNode != nil {
+			if cat := compileDDNSServices(ddnsNode); cat != nil {
+				if sys.Services == nil {
+					sys.Services = &SystemServicesConfig{}
+				}
+				sys.Services.DynamicDNS = cat
+			}
+		}
 	}
 
 	snmpNode := node.FindChild("snmp")
@@ -387,6 +400,135 @@ func compileSystem(node *Node, sys *SystemConfig) error {
 	}
 
 	return nil
+}
+
+// ddnsProviderStringProps are the per-provider leaves that carry a string
+// value, used by compileDDNSProvider's walker to recognize a "<leaf> <value>"
+// pair at any AST depth (#2691 P2).
+var ddnsProviderStringProps = map[string]bool{
+	"backend":               true,
+	"update-server":         true,
+	"tsig-key":              true,
+	"tsig-algorithm":        true,
+	"tsig-secret":           true,
+	"source-address":        true,
+	"destination-interface": true,
+	"routing-instance":      true,
+}
+
+// compileDDNSServices compiles the `system services dynamic-dns` block into a
+// typed *DDNSServicesConfig: the named provider catalog + the engine tunables
+// (forced-refresh / error-backoff-max). Returns nil for a truly empty block so
+// a garbage/empty stanza does not materialize a catalog (#2691 P2, plan §5.9).
+func compileDDNSServices(node *Node) *DDNSServicesConfig {
+	cat := &DDNSServicesConfig{Providers: map[string]*DDNSProvider{}}
+	for _, inst := range namedInstances(node.FindChildren("provider")) {
+		p := compileDDNSProvider(inst.name, inst.node)
+		if p != nil {
+			cat.Providers[p.Name] = p
+		}
+	}
+	// Engine tunables: a duration ("24h") or a bare-seconds integer. They may
+	// appear as a child node OR packed into the block's Keys (flat-set).
+	if v := ddnsServicesScalar(node, "forced-refresh"); v != "" {
+		if s := parseDurationSeconds(v); s > 0 {
+			cat.ForcedRefreshSeconds = s
+		}
+	}
+	if v := ddnsServicesScalar(node, "error-backoff-max"); v != "" {
+		if s := parseDurationSeconds(v); s > 0 {
+			cat.ErrorBackoffMaxSeconds = s
+		}
+	}
+	if len(cat.Providers) == 0 && cat.ForcedRefreshSeconds == 0 && cat.ErrorBackoffMaxSeconds == 0 {
+		return nil
+	}
+	return cat
+}
+
+// ddnsServicesScalar finds a top-level scalar leaf value under the dynamic-dns
+// block, tolerating both the hierarchical (child node `key value`) and flat-set
+// (key+value packed into the block's Keys) AST shapes.
+func ddnsServicesScalar(node *Node, key string) string {
+	if c := node.FindChild(key); c != nil {
+		if v := nodeVal(c); v != "" {
+			return v
+		}
+	}
+	for i := 0; i+1 < len(node.Keys); i++ {
+		if node.Keys[i] == key {
+			return node.Keys[i+1]
+		}
+	}
+	return ""
+}
+
+// parseDurationSeconds parses a duration leaf as either a Go duration string
+// ("24h", "30m", "1h30m") or a bare integer count of seconds ("86400"),
+// returning whole seconds. Returns 0 for an unparseable value (the engine then
+// uses its default).
+func parseDurationSeconds(v string) int {
+	v = strings.TrimSpace(v)
+	if v == "" {
+		return 0
+	}
+	if n, err := strconv.Atoi(v); err == nil {
+		return n
+	}
+	if d, err := time.ParseDuration(v); err == nil {
+		return int(d.Seconds())
+	}
+	return 0
+}
+
+// compileDDNSProvider compiles one `provider <name> { ... }` entry. It walks
+// the provider subtree (both AST shapes) for its string leaves. Returns nil for
+// an empty provider block (just a name with no settings).
+func compileDDNSProvider(name string, node *Node) *DDNSProvider {
+	props := map[string]string{}
+	var walk func(n *Node, isRoot bool)
+	walk = func(n *Node, isRoot bool) {
+		start := 0
+		if isRoot {
+			// Skip the leading "provider" + "<name>" tokens. The named-instance
+			// node's Keys begin with the value (name) when packed flat-set; be
+			// conservative and skip until we are past the name.
+			for start < len(n.Keys) && (n.Keys[start] == "provider" || n.Keys[start] == name) {
+				start++
+			}
+		}
+		for i := start; i < len(n.Keys); i++ {
+			k := n.Keys[i]
+			if ddnsProviderStringProps[k] && i+1 < len(n.Keys) {
+				if _, ok := props[k]; !ok {
+					props[k] = n.Keys[i+1]
+				}
+				i++
+			}
+		}
+		for _, c := range n.Children {
+			walk(c, false)
+		}
+	}
+	walk(node, true)
+
+	p := &DDNSProvider{
+		Name:                 name,
+		Backend:              props["backend"],
+		UpdateServer:         props["update-server"],
+		TSIGKeyName:          props["tsig-key"],
+		TSIGAlgorithm:        props["tsig-algorithm"],
+		TSIGSecret:           Secret(props["tsig-secret"]),
+		SourceAddress:        props["source-address"],
+		DestinationInterface: props["destination-interface"],
+		RoutingInstance:      props["routing-instance"],
+	}
+	if p.Backend == "" && p.UpdateServer == "" && p.TSIGKeyName == "" &&
+		p.TSIGAlgorithm == "" && p.TSIGSecret == "" && p.SourceAddress == "" &&
+		p.DestinationInterface == "" && p.RoutingInstance == "" {
+		return nil
+	}
+	return p
 }
 
 func compileSystemDataplaneType(node *Node) (string, error) {

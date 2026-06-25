@@ -192,6 +192,80 @@ type SystemServicesConfig struct {
 	WebManagement      *WebManagementConfig
 	DNSEnabled         bool // system services dns
 	DNSProxyConfigured bool // system services dns dns-proxy (syntax accepted, runtime no-op)
+	// DynamicDNS is the `system services dynamic-dns` provider catalog + engine
+	// tunables (#2691 P2, plan §5.9). It is the OPERATOR-FACING shared catalog
+	// the per-interface Surface A `dynamic-dns` bindings reference by name
+	// (credentials configured once, referenced by scope). nil == no Surface A
+	// DDNS configured.
+	DynamicDNS *DDNSServicesConfig
+}
+
+// DDNSServicesConfig is the `system services dynamic-dns` block (#2691 P2,
+// plan §5.9): a named provider catalog (referenced by per-interface Surface A
+// bindings) plus the global engine tunables (the inadyn period/forced-update
+// analogues). nil == no Surface A DDNS configured (Surface B's DHCP-lease DDNS
+// is unaffected — it keeps its inline stanza under dhcp-local-server).
+type DDNSServicesConfig struct {
+	// Providers is the named provider catalog, keyed by provider name. A
+	// per-interface `dynamic-dns provider <name>` binding references one of
+	// these entries (credentials + transport binding configured once here).
+	Providers map[string]*DDNSProvider
+	// ForcedRefreshSeconds is the wire-update FLOOR for an unchanged address
+	// (inadyn idea #7, plan §5.5): the engine re-asserts desired state every
+	// reconcile but sends a wire UPDATE for an unchanged address at most once
+	// per this interval. 0 == the engine default (24h).
+	ForcedRefreshSeconds int
+	// ErrorBackoffMaxSeconds caps the per-scope flat error backoff (inadyn idea
+	// #8, plan §5.5): a failing provider is not hammered at the poll cadence
+	// (ban-avoidance). 0 == the engine default (1h).
+	ErrorBackoffMaxSeconds int
+}
+
+// DDNSProvider is one named entry in the `system services dynamic-dns provider`
+// catalog (#2691 P2, plan §5.2/§5.9). It carries the backend selection, the
+// credentials (config.Secret-redacted), and the per-provider transport binding
+// (source/interface/VRF). P2 implements the rfc2136 backend; the HTTP backends
+// (dyndns2/cloudflare/route53/generic) are reserved enum values that P3
+// implements (an unimplemented backend publishes nothing and warns at commit).
+type DDNSProvider struct {
+	// Name is the provider identity (the `provider <name>` token), used by
+	// per-interface bindings to reference this catalog entry.
+	Name string
+	// Backend selects the DNS-update mechanism. "rfc2136" (default, live in P2)
+	// publishes over RFC 2136 UPDATE. "dyndns2" / "cloudflare" / "route53" /
+	// "generic" are reserved for P3 (the HTTP providers).
+	Backend string
+	// UpdateServer is the RFC 2136 target authoritative DNS, host or host:port.
+	UpdateServer string
+	// TSIGKeyName / TSIGAlgorithm / TSIGSecret are the TSIG credentials for
+	// authenticated RFC 2136 updates. TSIGSecret is the sensitive HMAC key,
+	// redacted by the Secret type on every marshal and by String() below.
+	TSIGKeyName   string
+	TSIGAlgorithm string
+	TSIGSecret    Secret
+	// SourceAddress / DestinationInterface / RoutingInstance scope the RFC 2136
+	// UPDATE TRANSPORT for this provider (the same source-binding model as the
+	// Surface B per-family leaves, #2665). All optional.
+	SourceAddress        string
+	DestinationInterface string
+	RoutingInstance      string
+}
+
+// String redacts TSIGSecret so a %v/%s/slog format of a DDNSProvider never
+// leaks the shared HMAC key (logging hygiene, mirrors DHCPDynamicDNSConfig).
+func (p *DDNSProvider) String() string {
+	if p == nil {
+		return "<nil>"
+	}
+	secret := ""
+	if p.TSIGSecret != "" {
+		secret = "<redacted>"
+	}
+	return fmt.Sprintf("DDNSProvider{name=%q backend=%q update-server=%q "+
+		"tsig-key=%q tsig-alg=%q tsig-secret=%q source-address=%q "+
+		"destination-interface=%q routing-instance=%q}",
+		p.Name, p.Backend, p.UpdateServer, p.TSIGKeyName, p.TSIGAlgorithm,
+		secret, p.SourceAddress, p.DestinationInterface, p.RoutingInstance)
 }
 
 // SSHServiceConfig holds SSH service settings.

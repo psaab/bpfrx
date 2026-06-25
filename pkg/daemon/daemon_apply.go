@@ -1088,6 +1088,9 @@ func (d *Daemon) applyConfigLocked(cfg *config.Config) error {
 	// file I/O + DNS only), so it never blocks the apply path. A
 	// disabled/removed block drives withdrawAllLocked on the next pass.
 	d.nudgeDDNSReconcile()
+	// #2691 P2: a commit may add/remove a Surface A binding or change a
+	// provider — nudge the Surface A loop to converge immediately too.
+	d.nudgeSurfaceADDNSReconcile()
 
 	// #2239: nudge an immediate lease-sync push so a commit that changes the
 	// DHCP-server config (and thus the lease set / serving interfaces) is

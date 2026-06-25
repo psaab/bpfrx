@@ -10,6 +10,7 @@ package grpcapi
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -260,6 +261,81 @@ func (s *Server) showDHCPDynamicDNS(cfg *config.Config, buf *strings.Builder, de
 			for _, r := range recs {
 				fmt.Fprintf(buf, "    %-32s %-6s %-39s %s\n",
 					r.FQDN, r.ForwardType, r.Address, r.PTRName)
+			}
+		}
+	}
+}
+
+// showServicesDynamicDNS renders the Surface A (router/interface-address) DDNS
+// status: the configured provider catalog, the runtime counters, and (detail)
+// the per-scope last-published state (#2691 P2).
+func (s *Server) showServicesDynamicDNS(cfg *config.Config, buf *strings.Builder, detail bool) {
+	buf.WriteString("Dynamic DNS (Surface A — router/interface-address publish):\n")
+	if cfg != nil && cfg.System.Services != nil && cfg.System.Services.DynamicDNS != nil {
+		cat := cfg.System.Services.DynamicDNS
+		if len(cat.Providers) > 0 {
+			buf.WriteString("  Providers:\n")
+			names := make([]string, 0, len(cat.Providers))
+			for n := range cat.Providers {
+				names = append(names, n)
+			}
+			sort.Strings(names)
+			for _, n := range names {
+				p := cat.Providers[n]
+				backend := p.Backend
+				if backend == "" {
+					backend = "rfc2136"
+				}
+				fmt.Fprintf(buf, "    %s: backend=%s update-server=%s", n, backend, p.UpdateServer)
+				if p.TSIGKeyName != "" {
+					fmt.Fprintf(buf, " tsig-key=%s (secret redacted)", p.TSIGKeyName)
+				}
+				buf.WriteString("\n")
+			}
+		}
+		if cat.ForcedRefreshSeconds > 0 {
+			fmt.Fprintf(buf, "  Forced-refresh: %ds\n", cat.ForcedRefreshSeconds)
+		}
+		if cat.ErrorBackoffMaxSeconds > 0 {
+			fmt.Fprintf(buf, "  Error-backoff-max: %ds\n", cat.ErrorBackoffMaxSeconds)
+		}
+	} else {
+		buf.WriteString("  No provider catalog configured\n")
+	}
+
+	if s.surfaceADDNSStatsFn == nil {
+		buf.WriteString("\n  Runtime counters: unavailable\n")
+		return
+	}
+	st := s.surfaceADDNSStatsFn()
+	if st == nil {
+		buf.WriteString("\n  Runtime counters: unavailable (manager not running)\n")
+		return
+	}
+	buf.WriteString("\n  Counters:\n")
+	fmt.Fprintf(buf, "    Publishes: ok=%d fail=%d\n", st.UpsertOK, st.UpsertFail)
+	fmt.Fprintf(buf, "    Withdraws: ok=%d fail=%d\n", st.DeleteOK, st.DeleteFail)
+	fmt.Fprintf(buf, "    Skipped:   unchanged=%d backoff=%d\n", st.Skipped, st.BackedOff)
+	fmt.Fprintf(buf, "    Published records: %d\n", st.Scopes)
+
+	if detail && s.surfaceADDNSStatusFn != nil {
+		views := s.surfaceADDNSStatusFn()
+		buf.WriteString("\n  Published scopes:\n")
+		if len(views) == 0 {
+			buf.WriteString("    none\n")
+		} else {
+			fmt.Fprintf(buf, "    %-32s %-6s %-39s %-12s %s\n", "FQDN", "Family", "Address", "Provider", "Last error")
+			for _, v := range views {
+				fam := "inet"
+				if v.Family == 6 {
+					fam = "inet6"
+				}
+				lastErr := v.LastError
+				if lastErr == "" {
+					lastErr = "-"
+				}
+				fmt.Fprintf(buf, "    %-32s %-6s %-39s %-12s %s\n",
+					v.FQDN, fam, v.Published, v.Provider, lastErr)
 			}
 		}
 	}
