@@ -158,6 +158,26 @@ Each worker thread is pinned to a CPU and processes all packets from
 its assigned RSS queues. Workers are independent — no locks on the
 forwarding hot path.
 
+#### State-file persistence: crash-safe atomic writes (`state_writer.rs`)
+
+The io_uring state-persistence thread (`src/state_writer.rs`) writes each
+state snapshot via write-temp-then-rename with a full durability contract
+(`finalize_durably`): fsync the temp file, atomic `rename` onto the
+destination, then fsync the parent directory so the rename survives power
+loss. Each write uses a **private** temp path `<dest>.<pid>.<seq>.tmp`
+created `O_EXCL`, so two concurrent writers — including a replacement
+helper racing the old one during a restart/upgrade handover — can never
+open/truncate/write the SAME temp and publish crossed bytes (#2705).
+
+Because the temp is unique per write, a crash between create and rename
+leaks one orphan temp. To bound that (#2714), the writer runs a
+best-effort **orphan sweep once per distinct destination** at the first
+write to it: it removes only siblings matching `<dest>.<pid>.<seq>.tmp`
+whose embedded pid is no longer a live process (`/proc/<pid>`), so a
+concurrent live writer's in-flight temp is never deleted (preserving the
+#2705 guarantee). The sweep is fail-safe — any error is swallowed so a
+sweep failure can never break the subsequent write.
+
 #### Reconcile Ordering Invariant (#2440 / #2444 / #2484)
 
 `Coordinator::reconcile` (`coordinator/reconcile/mod.rs`) applies a new
