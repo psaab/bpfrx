@@ -953,6 +953,10 @@ func (m *Manager) buildSessionSyncRequestV4(op string, key dataplane.SessionKey,
 		req.NATDstPort = networkUint16ToHost(val.NATDstPort)
 		req.FabricIngress = val.LogFlags&dataplane.LogFlagUserspaceFabricIngress != 0
 		req.IsReverse = val.IsReverse != 0
+		// #2785: carry the per-policy `then log` selection to the peer helper
+		// so the synced session logs the same RT_FLOW records after failover.
+		req.LogSessionInit = val.LogFlags&dataplane.LogFlagSessionInit != 0
+		req.LogSessionClose = val.LogFlags&dataplane.LogFlagSessionClose != 0
 		// #2170: mirror the install generation to the helper so its in-memory
 		// SyncedSessionEntry can enforce the same generation guard.
 		req.Generation = val.Generation
@@ -1021,6 +1025,10 @@ func (m *Manager) buildSessionSyncRequestV6(op string, key dataplane.SessionKeyV
 		req.NATDstPort = networkUint16ToHost(val.NATDstPort)
 		req.FabricIngress = val.LogFlags&dataplane.LogFlagUserspaceFabricIngress != 0
 		req.IsReverse = val.IsReverse != 0
+		// #2785: carry the per-policy `then log` selection to the peer helper
+		// so the synced session logs the same RT_FLOW records after failover.
+		req.LogSessionInit = val.LogFlags&dataplane.LogFlagSessionInit != 0
+		req.LogSessionClose = val.LogFlags&dataplane.LogFlagSessionClose != 0
 		// #2170: mirror the install generation to the helper.
 		req.Generation = val.Generation
 		if val.Flags&dataplane.SessFlagSNAT == 0 {

@@ -105,6 +105,14 @@ pub(crate) fn refresh_status(state: &mut ServerState) {
     // rather than silently dropping it downstream.
     state.status.gre_encap_df_oversize_drops_total =
         state.afxdp.gre_encap_df_oversize_drops_total();
+    // #2782: native-GRE decap checksum-invalid drops (C bit set but the
+    // GRE checksum failed to verify, or the header was truncated past the
+    // Checksum+Reserved1 field). Nonzero = a checksummed GRE peer
+    // delivering corrupt frames / a truncated GRE header. A verified
+    // checksummed frame forwards (RFC 2784 §2.1 / RFC 2890); only the
+    // corrupt residue is counted here.
+    state.status.gre_decap_checksum_invalid_drops_total =
+        state.afxdp.gre_decap_checksum_invalid_drops_total();
     // #2472: locally-generated error-reply per-reason token-bucket drops.
     // Nonzero = an error-amplification / reflection flood (or a routing loop)
     // being clamped before it emits unbounded generated ICMP/RST errors.
@@ -445,15 +453,15 @@ pub(crate) fn build_synced_session_entry(
             fabric_ingress: req.fabric_ingress,
             is_reverse: req.is_reverse,
             nat64_reverse: None,
-            // #2508: the per-policy `then log` selection is NOT carried on
-            // the HA session-sync wire (it lives on the policy snapshot,
-            // which both nodes compile identically). An HA-imported session
-            // therefore defaults to no per-policy SYSLOG record on this node;
-            // the node that locally admitted the session emits the
-            // session-init/close records. Threading the flag through the
-            // session-sync wire is a follow-up, out of #2508's scope.
-            log_session_init: false,
-            log_session_close: false,
+            // #2785: the per-policy `then log` selection is now carried on
+            // the HA session-sync wire (open-frame flags bits 1<<3/1<<4 ->
+            // SessionSyncRequest.log_session_{init,close}). A synced session
+            // therefore emits the same RT_FLOW SESSION_CREATE/CLOSE records
+            // after failover as the node that locally admitted it. An old
+            // peer that omits the fields decodes to false (no per-policy
+            // log), bit-identical to pre-#2785 behavior.
+            log_session_init: req.log_session_init,
+            log_session_close: req.log_session_close,
         },
         origin: crate::session::SessionOrigin::SyncImport,
         // #2170: carry the peer's install generation onto the helper entry.

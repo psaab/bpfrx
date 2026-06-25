@@ -108,10 +108,22 @@ impl StaticNatTable {
             };
             // DNAT keyed by the external (pre-translation) destination port.
             table.dnat.insert((external_ip, match_dst_port), entry.clone());
-            // SNAT keyed by the internal (post-translation) source port of the
-            // return packet, i.e. the mapped-port. A whole-address rule keys on
-            // `None`.
-            table.snat.insert((internal_ip, mapped_port), entry);
+            // #2769: SNAT key scoping. The reverse key is the internal-host
+            // source port of the return packet.
+            //   * mapped-port rule:   return packets leave on the `mapped_port`
+            //     (the inbound DNAT rewrote the destination port to it), so the
+            //     SNAT key is `Some(mapped_port)`.
+            //   * port-scoped 1:1 rule (`match destination-port` WITHOUT a
+            //     `mapped-port`): NO port translation happens, so the internal
+            //     service runs on — and its return packets leave from — the
+            //     matched external port. The SNAT key MUST be
+            //     `Some(match_dst_port)`, NOT `None`. Keying on `None` (the
+            //     pre-#2769 bug) made the reverse SNAT match ANY source port on
+            //     the internal host, source-translating every service on the
+            //     box, not just the one port that was port-scoped inbound.
+            //   * whole-address 1:1 rule: no port match at all, keys on `None`.
+            let snat_port = mapped_port.or(match_dst_port);
+            table.snat.insert((internal_ip, snat_port), entry);
         }
         table
     }

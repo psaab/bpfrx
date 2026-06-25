@@ -92,12 +92,14 @@ func TestInterfaceIPv4_Loopback(t *testing.T) {
 }
 
 // TestClientRequestRelayable asserts the client->server forwarding gate
-// (#2153): a relay must forward DISCOVER, REQUEST, and INFORM, but not server
-// reply types or client-to-server-direct types (DECLINE/RELEASE). The INFORM
-// case is the regression target — before #2153 the gate dropped it, so a
-// domain-joined client that holds its own address never received DNS/domain/NTP
-// options from the central server. This test FAILS against the pre-fix gate
-// (which returned false for INFORM).
+// (#2153/#2789): a relay must forward DISCOVER, REQUEST, INFORM, and DECLINE,
+// but not server reply types or the client-to-server-direct RELEASE. INFORM is
+// the #2153 regression target and DECLINE the #2789 target — before each fix
+// the gate returned false for that type. Pre-#2153 the dropped INFORM left a
+// domain-joined client that holds its own address without DNS/domain/NTP
+// options from the central server; pre-#2789 the dropped DECLINE meant a
+// client-detected address conflict never reached the server, which kept
+// re-offering the in-use address.
 func TestClientRequestRelayable(t *testing.T) {
 	cases := []struct {
 		msgType dhcpv4.MessageType
@@ -105,8 +107,8 @@ func TestClientRequestRelayable(t *testing.T) {
 	}{
 		{dhcpv4.MessageTypeDiscover, true},
 		{dhcpv4.MessageTypeRequest, true},
-		{dhcpv4.MessageTypeInform, true}, // #2153 regression target
-		{dhcpv4.MessageTypeDecline, false},
+		{dhcpv4.MessageTypeInform, true},  // #2153 regression target
+		{dhcpv4.MessageTypeDecline, true}, // #2789 regression target
 		{dhcpv4.MessageTypeRelease, false},
 		{dhcpv4.MessageTypeOffer, false},
 		{dhcpv4.MessageTypeAck, false},
@@ -175,6 +177,66 @@ func TestRunRelay_RelaysInform(t *testing.T) {
 	}
 	if !relayed.GatewayIPAddr.Equal(net.IPv4(10, 0, 0, 254)) {
 		t.Errorf("relayed giaddr = %v, want 10.0.0.254", relayed.GatewayIPAddr)
+	}
+}
+
+// TestRunRelay_RelaysDecline is the end-to-end gate proof for #2789: a real
+// BOOTREQUEST/DECLINE datagram pushed through the live runRelay loop must be
+// forwarded to the server conn (so the server marks the conflicting address
+// unavailable per RFC 2131 §4.4.1), and must carry the relay-set giaddr so the
+// server can attribute the decline to this relayed segment. The assertion
+// FAILS against the pre-#2789 gate, which `continue`d on DECLINE and never
+// wrote to the server conn.
+func TestRunRelay_RelaysDecline(t *testing.T) {
+	// Build a client DECLINE: BOOTREQUEST whose Requested-IP option names the
+	// address the client found in use (RFC 2131 §4.4.1 — the declined address
+	// is carried in option 50, ciaddr stays zero).
+	decline, err := dhcpv4.New()
+	if err != nil {
+		t.Fatalf("dhcpv4.New: %v", err)
+	}
+	decline.OpCode = dhcpv4.OpcodeBootRequest
+	decline.ClientHWAddr = net.HardwareAddr{0x02, 0x00, 0x00, 0x00, 0x00, 0x02}
+	decline.UpdateOption(dhcpv4.OptMessageType(dhcpv4.MessageTypeDecline))
+	decline.UpdateOption(dhcpv4.OptRequestedIPAddress(net.IPv4(192, 0, 2, 77)))
+
+	client := newFakeConn()
+	client.pending = [][]byte{decline.ToBytes()}
+	server := newFakeConn()
+	factory, _ := recordingFactory(client, server)
+	m := testManager(factory)
+
+	m.Apply(context.Background(), singleInterfaceConfig())
+	defer m.Stop()
+
+	// Wait for the DECLINE to be relayed onto the server conn.
+	deadline := time.Now().Add(2 * time.Second)
+	for server.writeCount() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if server.writeCount() == 0 {
+		t.Fatal("DECLINE was not relayed to the server within 2s " +
+			"(pre-#2789 gate dropped it)")
+	}
+
+	// The relayed datagram must parse, be a BOOTREQUEST/DECLINE, carry the
+	// relay-set giaddr (10.0.0.254, from testManager's resolver), and preserve
+	// the declined address so the server knows which binding to mark in-use.
+	relayed, err := dhcpv4.FromBytes(server.firstWrite(t))
+	if err != nil {
+		t.Fatalf("relayed datagram does not parse: %v", err)
+	}
+	if relayed.OpCode != dhcpv4.OpcodeBootRequest {
+		t.Errorf("relayed opcode = %v, want BOOTREQUEST", relayed.OpCode)
+	}
+	if relayed.MessageType() != dhcpv4.MessageTypeDecline {
+		t.Errorf("relayed message type = %v, want DECLINE", relayed.MessageType())
+	}
+	if !relayed.GatewayIPAddr.Equal(net.IPv4(10, 0, 0, 254)) {
+		t.Errorf("relayed giaddr = %v, want 10.0.0.254", relayed.GatewayIPAddr)
+	}
+	if got := relayed.RequestedIPAddress(); !got.Equal(net.IPv4(192, 0, 2, 77)) {
+		t.Errorf("relayed requested-IP = %v, want 192.0.2.77", got)
 	}
 }
 
@@ -856,6 +918,111 @@ func TestRunRelay_StopDuringRetry(t *testing.T) {
 	}
 	if got := len(getCalls()); got != 0 {
 		t.Errorf("no sockets should be created during failing retry, got %d calls", got)
+	}
+}
+
+// TestRunRelay_BindFailureRetries injects a packetConnFactory that fails the
+// first K bind attempts with a transient error, then succeeds. It proves the
+// per-interface supervisor does NOT die on a transient bind/listen failure
+// (#2787): it keeps retrying and eventually binds. This is a fail-on-revert
+// test — reverting runRelaySession to `return false`/`return sessionStop` on a
+// listen error makes the supervisor exit on the first failure, so the client
+// conn is never created and waitCalls below times out (RED).
+func TestRunRelay_BindFailureRetries(t *testing.T) {
+	client := newFakeConn()
+	server := newFakeConn()
+
+	const k = 3
+	var mu sync.Mutex
+	var calls []factoryCall
+	attempts := 0
+	factory := func(ctx context.Context, ifaceName string, reusePort, broadcast bool,
+		bindAddr *net.UDPAddr) (net.PacketConn, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		// Only the client-facing listener (reusePort+broadcast on the iface)
+		// is failed; once it binds, hand out the recorded conns in order.
+		if reusePort && broadcast {
+			attempts++
+			if attempts <= k {
+				return nil, errors.New("listen udp 0.0.0.0:67: bind: cannot assign requested address")
+			}
+			calls = append(calls, factoryCall{ifaceName, reusePort, broadcast, bindAddr})
+			return client, nil
+		}
+		calls = append(calls, factoryCall{ifaceName, reusePort, broadcast, bindAddr})
+		return server, nil
+	}
+	getCalls := func() []factoryCall {
+		mu.Lock()
+		defer mu.Unlock()
+		out := make([]factoryCall, len(calls))
+		copy(out, calls)
+		return out
+	}
+
+	m := testManager(factory)
+	m.retryInterval = 5 * time.Millisecond
+
+	m.Apply(context.Background(), singleInterfaceConfig())
+
+	// The supervisor must survive the K failures and bind both conns. With a
+	// terminal `return sessionStop` on listen failure this never reaches 2
+	// (the supervisor dies after the first failed bind) and times out.
+	calls2 := waitCalls(t, getCalls, 2, 2*time.Second)
+	if len(calls2) < 2 {
+		t.Fatalf("supervisor died on transient bind failure: only %d successful "+
+			"factory calls (attempts=%d) — relay never recovered", len(calls2), attempts)
+	}
+	mu.Lock()
+	gotAttempts := attempts
+	mu.Unlock()
+	if gotAttempts <= k {
+		t.Errorf("expected listener bind retried past %d failures, got %d attempts", k, gotAttempts)
+	}
+
+	done := make(chan struct{})
+	go func() { m.Stop(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Stop() did not return after bind-retry recovery")
+	}
+}
+
+// TestRunRelay_StopDuringBindRetry cancels while the bind is still failing;
+// Stop must return promptly (the supervisor's retry select is ctx-cancelable,
+// #2787) and the relay never binds a client conn.
+func TestRunRelay_StopDuringBindRetry(t *testing.T) {
+	var mu sync.Mutex
+	clientBinds := 0
+	factory := func(ctx context.Context, ifaceName string, reusePort, broadcast bool,
+		bindAddr *net.UDPAddr) (net.PacketConn, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		if reusePort && broadcast {
+			clientBinds++
+		}
+		return nil, errors.New("bind: cannot assign requested address")
+	}
+	m := testManager(factory)
+	m.retryInterval = 50 * time.Millisecond
+
+	m.Apply(context.Background(), singleInterfaceConfig())
+	time.Sleep(20 * time.Millisecond)
+
+	done := make(chan struct{})
+	go func() { m.Stop(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Stop() during bind retry did not return promptly")
+	}
+	mu.Lock()
+	got := clientBinds
+	mu.Unlock()
+	if got == 0 {
+		t.Error("expected at least one client bind attempt during the failing retry window")
 	}
 }
 

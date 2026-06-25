@@ -578,7 +578,17 @@ reserved for whole-dataplane selection where a rewrite shim
     is range-checked in the compiler (`validateNATHostMaskStrict`,
     `compiler_nat.go`), which ALSO rejects a `mapped-port` with no
     matching `match destination-port` (the reverse SNAT could not recover
-    the original port). The snapshot fields `match_destination_port` /
+    the original port) AND the mirror half-config — a `match
+    destination-port` with no `mapped-port` (#2769). The port-match-without-
+    mapped-port form is a port-scoped 1:1 (no port translation); rejecting
+    it at strict commit-check forces the operator to either drop the port
+    match (a whole-address 1:1) or add a `mapped-port` (a port forward). If
+    such a rule slips through the lenient load / peer-sync path, the Rust
+    dataplane backstop (`static_nat.rs from_snapshots`) keys the reverse
+    SNAT on `(internal_ip, Some(match_dst_port))` rather than
+    `(internal_ip, None)`, keeping the source translation scoped to the one
+    matched port instead of broadening it to every source port on the
+    internal host. The snapshot fields `match_destination_port` /
     `mapped_port` (`StaticNATRuleSnapshot`, both Go `omitempty` + Rust
     `#[serde(default)]`, default 0) are an additive, backward-compatible
     wire change; a single external IP can host several per-port mappings

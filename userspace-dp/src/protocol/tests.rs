@@ -285,6 +285,35 @@ fn process_status_gre_encap_df_oversize_drops_roundtrip() {
     assert_eq!(legacy.gre_encap_df_oversize_drops_total, 0);
 }
 
+// #2782: round-trip + backward-compat pin for the native-GRE decap
+// checksum-present invalid drop counter. The wire key feeds
+// pkg/dataplane/userspace/protocol.go and the Prometheus counter
+// `xpf_userspace_gre_decap_checksum_invalid_drops_total`.
+#[test]
+fn process_status_gre_decap_checksum_invalid_drops_roundtrip() {
+    let status = ProcessStatus {
+        gre_decap_checksum_invalid_drops_total: 12,
+        ..Default::default()
+    };
+    let value: serde_json::Value =
+        serde_json::to_value(&status).expect("serialize ProcessStatus to Value");
+    assert_eq!(value["gre_decap_checksum_invalid_drops_total"], 12);
+    let back: ProcessStatus = serde_json::from_value(value).expect("deserialize ProcessStatus");
+    assert_eq!(back.gre_decap_checksum_invalid_drops_total, 12);
+
+    // Pre-#2782 payload (key absent) must decode with a zero default.
+    let mut legacy_value =
+        serde_json::to_value(ProcessStatus::default()).expect("serialize default ProcessStatus");
+    legacy_value
+        .as_object_mut()
+        .expect("ProcessStatus serializes to an object")
+        .remove("gre_decap_checksum_invalid_drops_total")
+        .expect("new key present before strip");
+    let legacy: ProcessStatus =
+        serde_json::from_value(legacy_value).expect("pre-#2782 payload decodes");
+    assert_eq!(legacy.gre_decap_checksum_invalid_drops_total, 0);
+}
+
 // #2472: round-trip + backward-compat pin for the per-reason
 // generated-error rate-limit drop counters. The wire keys feed
 // pkg/dataplane/userspace/protocol.go and the Prometheus counters
@@ -2087,4 +2116,30 @@ fn session_sync_request_generation_roundtrip_2170() {
         serde_json::from_str(r#"{"operation":"upsert","src_ip":"10.0.0.1"}"#)
             .expect("legacy SessionSyncRequest without generation decodes");
     assert_eq!(legacy.generation, 0, "missing generation must default to 0");
+}
+
+// #2785: the per-policy log flags must round-trip on the session-sync wire,
+// and a legacy payload that omits them must decode to false (serde default)
+// so an old peer falls back to no per-policy log (pre-#2785 behavior).
+#[test]
+fn session_sync_request_log_flags_roundtrip_2785() {
+    let req = SessionSyncRequest {
+        operation: "upsert".to_string(),
+        log_session_init: true,
+        log_session_close: true,
+        ..Default::default()
+    };
+    let json = serde_json::to_string(&req).expect("serialize SessionSyncRequest");
+    let back: SessionSyncRequest =
+        serde_json::from_str(&json).expect("deserialize SessionSyncRequest");
+    assert!(back.log_session_init, "log_session_init must round-trip");
+    assert!(back.log_session_close, "log_session_close must round-trip");
+
+    let legacy: SessionSyncRequest =
+        serde_json::from_str(r#"{"operation":"upsert","src_ip":"10.0.0.1"}"#)
+            .expect("legacy SessionSyncRequest without log flags decodes");
+    assert!(
+        !legacy.log_session_init && !legacy.log_session_close,
+        "missing log flags must default to false"
+    );
 }

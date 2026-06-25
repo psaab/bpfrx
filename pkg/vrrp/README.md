@@ -202,6 +202,28 @@ load/peer-sync compile paths.
   VLAN sub-interfaces (the kernel's raw IP doesn't reliably receive
   multicast on VLANs).
 - IPv6: separate raw socket; hop limit set to 255 per RFC.
+- **`SO_BINDTODEVICE` is applied symmetrically across both families**
+  via `maybeBindToDevice` (`manager.go`): the device bind is used on a
+  plain interface for isolation but **SKIPPED on a VLAN sub-interface**
+  (name contains `.`). Generic-XDP VLAN tag handling makes the kernel's
+  interface association unpredictable, so pinning the raw socket to the
+  VLAN sub-interface index can drop VRRP multicast. Before #2786 only the
+  IPv4 path skipped — the IPv6 path bound unconditionally. Both
+  `openPerInterfaceSocket` (v4) and `openIPv6Socket` (v6) now route their
+  bind through the single `maybeBindToDevice` decision; IPv6 multicast
+  egress is steered by `IPV6_MULTICAST_IF`, which does not depend on
+  `SO_BINDTODEVICE`. **Scope of the RX impact:** in the normal path the
+  IPv6 raw socket is send-only — VRRP RX is the shared AF_PACKET tap
+  (`receiverAfPacket`, native-XDP env), which is independent of the v6
+  socket's `SO_BINDTODEVICE`, so the unconditional bind was cosmetic for
+  RX there. The genuine split-brain it repaired is the **AF_PACKET-unavailable
+  fallback** (`receiverIPv6` reads IPv6 VRRP directly from the raw socket,
+  `instance.go`): there a VLAN-pinned `SO_BINDTODEVICE` could drop inbound
+  multicast → the IPv6 instance misses peer adverts → both nodes hold
+  MASTER. Aligning v4/v6 is correct hygiene on both paths and closes that
+  fallback-path split-brain; `make test-failover` on the native-XDP loss
+  cluster validates no-regression but does not exercise the fallback RX
+  path this specifically repairs.
 - The AF_PACKET capture fd is created `SOCK_RAW|SOCK_CLOEXEC` so it is set
   close-on-exec atomically at creation (#2476). A raw `unix.Socket` does NOT
   inherit CLOEXEC the way Go `net` sockets do, so without this the raw VRRP

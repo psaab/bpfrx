@@ -269,6 +269,13 @@ type xpfCollector struct {
 	// DF-set oversized outer cannot be fragmented downstream and would
 	// silently blackhole every inner flow with no PMTUD signal.
 	userspaceGreEncapDfOversizeDrops *prometheus.Desc
+	// #2782: native-GRE decap frames dropped because the Checksum-Present
+	// (C) bit was set but the GRE checksum failed to verify (or the header
+	// was truncated past the 4-byte Checksum+Reserved1 field). A
+	// checksummed peer (e.g. vSRX) now decaps after skipping+validating
+	// the checksum (RFC 2784 §2.1 / RFC 2890) instead of being silently
+	// blackholed; only a corrupt frame is counted here.
+	userspaceGreDecapChecksumInvalidDrops *prometheus.Desc
 	// #2472: locally-generated ICMP/RST error replies dropped by the
 	// per-reason token-bucket rate limiter (Time Exceeded / PTB / reject).
 	userspaceTimeExceededRateLimited *prometheus.Desc
@@ -586,6 +593,7 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.userspaceGreDecapEcnIllegalDrops
 	ch <- c.userspaceWgDecapEcnIllegalDrops
 	ch <- c.userspaceGreEncapDfOversizeDrops
+	ch <- c.userspaceGreDecapChecksumInvalidDrops
 	ch <- c.userspaceTimeExceededRateLimited
 	ch <- c.userspacePacketTooBigRateLimited
 	ch <- c.userspaceRejectRateLimited

@@ -39,8 +39,8 @@ carries server-bound options, per RFC 2131 §3.4:
 | `DISCOVER` | yes | lease acquisition |
 | `REQUEST` | yes | lease selection / renewal / rebinding |
 | `INFORM` | yes (#2153) | client already holds an address, asks only for supplemental parameters (DNS/domain/NTP) |
-| `DECLINE` | no | broadcast by the client on address conflict (RFC 2131 §4.4); not relayed (out of scope for #2153) |
-| `RELEASE` | no | unicast by the client to its bound server; no relay-agent obligation |
+| `DECLINE` | yes (#2789) | client detected the offered address already in use (ARP probe) and broadcasts a DHCPDECLINE (RFC 2131 §3.1 step 4, §4.4.1); relayed so the originating server marks the address unavailable instead of re-offering it. Carries no server reply |
+| `RELEASE` | no | unicast by the client directly to its bound server (RFC 2131 §4.4.4) — it routes without relay assistance and is never seen on the relay's client-facing broadcast socket |
 | server reply types (`OFFER`/`ACK`/`NAK`/`FORCERENEW`) | n/a | not client-originated; the client→server gate never sees them. The reverse server→client path (`handleServerResponses`) forwards `OFFER`, `ACK`, `NAK` (#2606), and `FORCERENEW` (#2645) — see the reply matrix below |
 
 The `INFORM` reply (a server-issued `ACK` with no `yiaddr` but a real
@@ -245,6 +245,17 @@ OFFER/ACK to forward in the first place; clients still dedupe on
   giaddr on a bounded, `ctx`-cancelable interval instead of dying
   permanently. The interface is re-looked-up every attempt (no stale cached
   index).
+- **Socket bind/listen retry (#2787).** A *transient* failure to open the
+  client listener (`0.0.0.0:67`) or the giaddr server conn — interface not yet
+  up, its IPv4 not yet bound, or port 67 momentarily busy on a quick reload —
+  is **not terminal**. `runRelaySession` returns `sessionRetry`, and the
+  supervisor (`runRelay`) waits the same bounded, `ctx`-cancelable
+  `retryInterval` and rebuilds, so the relay recovers on that interface once
+  the condition clears. Before #2787 a bind failure returned `false`/terminal
+  and the per-interface supervisor goroutine exited permanently — the relay
+  went deaf on that segment until a daemon restart or operator re-commit. Only
+  a *cancelled* session context (`Stop()`) on a bind failure is terminal
+  (`sessionStop`), so teardown stays prompt and never spins past shutdown.
 - **ifindex-drift detection (#2347).** `SO_BINDTODEVICE` pins the client
   listener to the interface's kernel **ifindex** at `bind(2)`. If the
   interface is deleted+recreated or renamed at runtime under unchanged config

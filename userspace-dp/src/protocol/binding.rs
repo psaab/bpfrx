@@ -1086,5 +1086,14 @@ pub(crate) struct SessionDeltaInfo {
     pub fabric_redirect: bool,
     #[serde(rename = "fabric_ingress", default)]
     pub fabric_ingress: bool,
+    /// #2785: the admitting policy's per-policy `then log` selection,
+    /// mirrored from `SessionMetadata` onto the JSON RPC-fallback delta so
+    /// the Go control plane can stamp the synced session's log flags. The
+    /// primary HA path is the binary open frame (codec.rs flags bits
+    /// 1<<3/1<<4); this keeps the JSON fallback at parity.
+    #[serde(rename = "log_session_init", default)]
+    pub log_session_init: bool,
+    #[serde(rename = "log_session_close", default)]
+    pub log_session_close: bool,
 }
 

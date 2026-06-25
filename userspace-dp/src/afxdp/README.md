@@ -136,8 +136,14 @@ sync.
     path did NOT handle (non-TCP, TCP seg-miss, non-segmentable TCP) the
     dispatcher makes an egress-MTU decision (`icmp_ptb.rs`,
     `forwarded_egress_mtu_decision`) BEFORE building the oversized frame.
-    When the L3 payload exceeds the egress MTU and the sender forbade
-    fragmentation (IPv4 DF) or it is IPv6, it generates an ICMP
+    The decision sizes off the IP-DECLARED L3 datagram length (IPv4
+    `total_len` / IPv6 `40 + payload_len`, each clamped to the buffer) —
+    the SAME length authority the PTB builders quote — NOT the raw AF_XDP
+    buffer length, so ethernet padding / trailing bytes never mis-fire or
+    mis-size a PTB (#2783); an unparseable/truncated IP header fails open
+    to forward. When that declared length exceeds the egress MTU and the
+    sender forbade fragmentation (IPv4 DF) or it is IPv6, it generates an
+    ICMP
     Frag-Needed (v4 type 3 code 4, next-hop MTU per RFC 1191) / Packet
     Too Big (v6 type 2, MTU per RFC 4443) back out the ingress interface
     and drops the oversized original (`mtu_signalled` keeps
