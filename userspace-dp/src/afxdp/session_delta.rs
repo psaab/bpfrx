@@ -179,7 +179,13 @@ pub(super) fn flush_session_deltas(
                     delta.key.src_port,
                     delta.key.dst_port,
                 );
-                es.emit_session_close_rt_flow(delta, app_id);
+                // #2615: thread the closing binding's ingress ifindex so the
+                // SESSION_CLOSE RT_FLOW record shows the admitting interface
+                // (`packet-incoming-interface`) instead of "N/A". `ident` is
+                // the binding draining this delta; its ifindex is the ingress
+                // interface. A kernel ifindex is always positive, so the
+                // i32 -> u32 cast is loss-free.
+                es.emit_session_close_rt_flow(delta, app_id, ident.ifindex as u32);
             }
             // #2508: a session admitted by a policy configured with
             // `then log session-init` emits an RT_FLOW SESSION_CREATE frame
@@ -190,7 +196,20 @@ pub(super) fn flush_session_deltas(
             // SESSION_CLOSE syslog record is gated on the Go side (via the
             // frame's gate byte) because flowexport still needs every close.
             if delta.kind == SessionDeltaKind::Open && delta.metadata.log_session_init {
-                es.emit_session_create_rt_flow(delta);
+                // #2615: resolve the AppID for the new 5-tuple with the SAME
+                // app_catalog.lookup the forwarding hot path runs (mirroring
+                // the #2520 close-side fix), so the SESSION_CREATE RT_FLOW
+                // record carries the application instead of UNKNOWN. 0 (no
+                // match) keeps the prior UNKNOWN rendering. The ingress
+                // ifindex comes from the admitting binding (`ident`); a kernel
+                // ifindex is always positive so the i32 -> u32 cast is
+                // loss-free.
+                let app_id = forwarding.app_catalog.lookup(
+                    delta.key.protocol,
+                    delta.key.src_port,
+                    delta.key.dst_port,
+                );
+                es.emit_session_create_rt_flow(delta, app_id, ident.ifindex as u32);
             }
         }
         if let Ok(mut recent) = recent_session_deltas.lock() {

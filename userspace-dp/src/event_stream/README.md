@@ -41,12 +41,20 @@ periodic ACK from the daemon.
   (#2520) the cold-path RT_FLOW emitters also populate the `application id`
   slot (offset 132, little-endian u16) instead of hardcoding 0. The
   `emit_policy_deny_event` / `emit_filter_log_event` call sites and the
-  `emit_session_close_rt_flow` caller resolve the AppID with the SAME
+  `emit_session_close_rt_flow` (#2520) AND `emit_session_create_rt_flow`
+  (#2615) callers resolve the AppID with the SAME
   `app_catalog.lookup(protocol, src_port, dst_port)` the forwarding hot
   path runs when it stamps the conntrack entry on session create (see
   `afxdp::event_emit::resolve_flow_app_id`), so a policy-deny / filter-log /
-  session-close record shows `application=<name>` for a resolvable 5-tuple
-  instead of `application="UNKNOWN"`. 0 stays the UNKNOWN sentinel when the
+  session-create / session-close record shows `application=<name>` for a
+  resolvable 5-tuple instead of `application="UNKNOWN"`.
+  (#2615) the SESSION_CREATE and SESSION_CLOSE frames ALSO populate the
+  ingress ifindex slot (offset 128, little-endian u32) from the admitting
+  binding's `ident.ifindex`, so the Go decoder resolves
+  `packet-incoming-interface=<name>` instead of `"N/A"`. A kernel ifindex
+  is always positive, so the i32 -> u32 cast is loss-free, and this is a
+  full-width u32 slot distinct from the i16 egress/TX ifindex width bug
+  (#2467). 0 stays the UNKNOWN sentinel when the
   catalog has no match. The screen emitters (`emit_screen_drop_event` /
   `emit_screen_alarm_event`) deliberately keep 0: the screen parse-error
   fail-closed path (#2146) and the L4-less screen drops legitimately lack a
@@ -102,7 +110,13 @@ periodic ACK from the daemon.
   ONLY when the admitting policy requested `then log session-init`, carries
   the same 136-byte payload with the event-type byte set to SESSION_OPEN
   (1, rendered as RT_FLOW_SESSION_CREATE on the Go side), and always sets
-  the gate byte. (#2512) like the close frame, the create frame rides the
+  the gate byte. (#2615) the create frame now also threads the resolved
+  application id (offset 132) and the admitting binding's ingress ifindex
+  (offset 128), mirroring the close-side #2520/#2615 fix — so a logged
+  session-create no longer logs `application="UNKNOWN"` /
+  `packet-incoming-interface="N/A"` for a resolvable session. The volume
+  counters stay 0 (a create has no volume yet). (#2512) like the close
+  frame, the create frame rides the
   per-kind budget path under `DataplaneEventKind::SessionCreate` (counters
   `event_stream_session_create_{sent,dropped}`), not a bare `try_send`.
   `MSG_FILTER_LOG` intentionally reuses the RT_FLOW `reason` byte as

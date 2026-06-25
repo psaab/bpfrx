@@ -280,6 +280,7 @@ fn test_encode_session_close_rt_flow_v4_wire_layout() {
         1_700_000_000,   // #2465: created Unix seconds
         1_700_000_123_000_000_000, // #2465: close instant Unix ns
         7,               // #2520: application id
+        42,              // #2615: ingress ifindex
     );
 
     assert_eq!(frame.data[4], MSG_SESSION_CLOSE_RT_FLOW);
@@ -335,6 +336,12 @@ fn test_encode_session_close_rt_flow_v4_wire_layout() {
     // encoder to leave it 0 makes this assertion fail (and the close record
     // logs application="UNKNOWN").
     assert_eq!(u16::from_le_bytes([p[132], p[133]]), 7);
+    // #2615 fail-on-revert: the ingress ifindex rides the [128:132] slot
+    // (little-endian u32), the slot the Go DecodeRawEventRecord reads to
+    // resolve packet-incoming-interface. Reverting the encoder to leave it 0
+    // makes this assertion fail (and the close record logs
+    // packet-incoming-interface="N/A").
+    assert_eq!(u32::from_le_bytes(p[128..132].try_into().unwrap()), 42);
 }
 
 #[test]
@@ -358,6 +365,7 @@ fn test_encode_session_close_rt_flow_v6() {
         0,     // #2465: created Unix seconds (unknown → fallback)
         0,     // #2465: close instant Unix ns
         0,     // #2520: application id (unknown)
+        0,     // #2615: ingress ifindex (unknown)
     );
     let p = &frame.data[FRAME_HEADER_SIZE..frame.len as usize];
     assert_eq!(p[52], RT_FLOW_EVENT_SESSION_CLOSE);
@@ -397,6 +405,7 @@ fn test_session_close_rt_flow_log_gate_byte() {
             0, // #2465: created Unix seconds
             0, // #2465: close instant Unix ns
             0, // #2520: application id
+            0, // #2615: ingress ifindex
         )
     };
     let gated_off = mk(false);
@@ -435,6 +444,8 @@ fn test_session_create_rt_flow_wire_layout() {
         0,
         TEST_TRUST_ZONE_ID,
         TEST_UNTRUST_ZONE_ID,
+        77, // #2615: ingress ifindex
+        9,  // #2615: application id
     );
     assert_eq!(frame.data[4], MSG_SESSION_CREATE_RT_FLOW);
     let p = &frame.data[FRAME_HEADER_SIZE..frame.len as usize];
@@ -454,6 +465,15 @@ fn test_session_create_rt_flow_wire_layout() {
     // NAT source slot populated.
     assert_eq!(&p[72..76], &Ipv4Addr::new(172, 16, 80, 8).octets());
     assert_eq!(u16::from_be_bytes([p[104], p[105]]), 40000);
+    // #2615 fail-on-revert: the SESSION_CREATE frame now threads the ingress
+    // ifindex ([128:132], LE u32) and the resolved application id
+    // ([132:134], LE u16) — the same slots the Go DecodeRawEventRecord reads
+    // to resolve packet-incoming-interface and application=. Reverting the
+    // encoder to leave either slot 0 makes these assertions fail (and the
+    // create record logs packet-incoming-interface="N/A" / application=
+    // "UNKNOWN").
+    assert_eq!(u32::from_le_bytes(p[128..132].try_into().unwrap()), 77);
+    assert_eq!(u16::from_le_bytes([p[132], p[133]]), 9);
 }
 
 #[test]

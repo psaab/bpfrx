@@ -3,7 +3,9 @@
 // LOC threshold. Loaded as a sibling submodule via
 // `#[path = "tests.rs"]` from mod.rs.
 
-use super::codec::{DataplaneEventKind, DataplaneEventPayload, MSG_FULL_RESYNC};
+use super::codec::{
+    DataplaneEventKind, DataplaneEventPayload, MSG_FULL_RESYNC, MSG_SESSION_CREATE_RT_FLOW,
+};
 use super::*;
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr};
@@ -123,7 +125,7 @@ fn test_emit_session_close_rt_flow_pairs_with_ha_delta() {
 
     // Mirror flush_session_deltas: the HA delta then the RT_FLOW frame.
     handle.push_delta(&delta, &zone_map);
-    handle.emit_session_close_rt_flow(&delta, 0);
+    handle.emit_session_close_rt_flow(&delta, 0, 0);
 
     let frames: Vec<EventFrame> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
     assert_eq!(frames.len(), 2, "expected exactly one HA delta + one RT_FLOW frame");
@@ -198,7 +200,7 @@ fn test_emit_session_close_rt_flow_carries_real_created_stamp() {
     delta.created_ns = now_mono.saturating_sub(60 * NS_PER_SEC);
     delta.last_seen_ns = now_mono;
 
-    handle.emit_session_close_rt_flow(&delta, 0);
+    handle.emit_session_close_rt_flow(&delta, 0, 0);
     let frame = rx.try_recv().expect("RT_FLOW close frame");
     let p = &frame.data[FRAME_HEADER_SIZE..frame.len as usize];
 
@@ -232,13 +234,22 @@ fn test_emit_session_close_rt_flow_carries_app_id() {
         },
     );
     let delta = test_close_delta(crate::session::SessionDeltaKind::Close);
-    handle.emit_session_close_rt_flow(&delta, 7);
+    handle.emit_session_close_rt_flow(&delta, 7, 42);
     let frame = rx.try_recv().expect("RT_FLOW close frame");
     let p = &frame.data[FRAME_HEADER_SIZE..frame.len as usize];
     assert_eq!(
         u16::from_le_bytes([p[132], p[133]]),
         7,
         "SESSION_CLOSE RT_FLOW must carry the resolved AppID, not UNKNOWN(0)"
+    );
+    // #2615 fail-on-revert: the ingress ifindex the caller threads
+    // (ident.ifindex) must ride the [128:132] slot so the close record renders
+    // packet-incoming-interface=<name> instead of N/A. Reverting the emit /
+    // encode path to leave the slot 0 makes this assertion fail.
+    assert_eq!(
+        u32::from_le_bytes(p[128..132].try_into().unwrap()),
+        42,
+        "SESSION_CLOSE RT_FLOW must carry the ingress ifindex, not N/A(0)"
     );
 }
 
@@ -255,7 +266,7 @@ fn test_emit_session_close_rt_flow_zero_created_stays_zero() {
         },
     );
     let delta = test_close_delta(crate::session::SessionDeltaKind::Close); // created_ns == 0
-    handle.emit_session_close_rt_flow(&delta, 0);
+    handle.emit_session_close_rt_flow(&delta, 0, 0);
     let frame = rx.try_recv().expect("RT_FLOW close frame");
     let p = &frame.data[FRAME_HEADER_SIZE..frame.len as usize];
     assert_eq!(u32::from_le_bytes(p[108..112].try_into().unwrap()), 0);
@@ -275,7 +286,7 @@ fn test_emit_session_close_rt_flow_ignores_open_delta() {
         },
     );
     let delta = test_close_delta(crate::session::SessionDeltaKind::Open);
-    handle.emit_session_close_rt_flow(&delta, 0);
+    handle.emit_session_close_rt_flow(&delta, 0, 0);
     assert!(rx.try_recv().is_err(), "Open delta must emit no RT_FLOW close frame");
 }
 
@@ -304,7 +315,7 @@ fn test_emit_session_close_rt_flow_accounts_under_session_close_kind() {
     // Emit 4 closes; the per-kind budget admits 1, the rest are queue-full.
     // (`_rx` is never drained, so the budget is never released.)
     for _ in 0..4 {
-        handle.emit_session_close_rt_flow(&delta, 0);
+        handle.emit_session_close_rt_flow(&delta, 0, 0);
     }
 
     let stats = handle.dataplane_event_stats();
@@ -340,7 +351,7 @@ fn test_emit_session_close_rt_flow_rate_limited_is_counted() {
     let delta = test_close_delta(crate::session::SessionDeltaKind::Close);
 
     for _ in 0..5 {
-        handle.emit_session_close_rt_flow(&delta, 0);
+        handle.emit_session_close_rt_flow(&delta, 0, 0);
     }
 
     let stats = handle.dataplane_event_stats();
@@ -370,7 +381,7 @@ fn test_emit_session_create_rt_flow_accounts_under_session_create_kind() {
     delta.metadata.log_session_init = true;
 
     for _ in 0..3 {
-        handle.emit_session_create_rt_flow(&delta);
+        handle.emit_session_create_rt_flow(&delta, 0, 0);
     }
 
     let stats = handle.dataplane_event_stats();
@@ -380,6 +391,39 @@ fn test_emit_session_create_rt_flow_accounts_under_session_create_kind() {
     // Must not steal the close kind's budget/counters.
     assert_eq!(stats.session_close.sent, 0);
     assert_eq!(stats.session_close.dropped, 0);
+}
+
+#[test]
+fn test_emit_session_create_rt_flow_carries_app_id_and_ifindex() {
+    // #2615 fail-on-revert: the SESSION_CREATE emit path must thread the
+    // resolved AppID ([132:134]) and the admitting binding's ingress ifindex
+    // ([128:132]) into the wire frame, mirroring the #2520 close-side AppID
+    // fix. Reverting emit_session_create_rt_flow / encode_session_create_rt_flow
+    // to leave either slot 0 makes the create record log application="UNKNOWN"
+    // / packet-incoming-interface="N/A" — and these assertions fail.
+    let (handle, rx) = test_worker_handle(
+        8,
+        DataplaneEventRateLimitConfig {
+            events_per_second: 0,
+            burst: 0,
+        },
+    );
+    let mut delta = test_close_delta(crate::session::SessionDeltaKind::Open);
+    delta.metadata.log_session_init = true;
+    handle.emit_session_create_rt_flow(&delta, 9, 77);
+    let frame = rx.try_recv().expect("RT_FLOW create frame");
+    assert_eq!(frame.data[4], MSG_SESSION_CREATE_RT_FLOW);
+    let p = &frame.data[FRAME_HEADER_SIZE..frame.len as usize];
+    assert_eq!(
+        u16::from_le_bytes([p[132], p[133]]),
+        9,
+        "SESSION_CREATE RT_FLOW must carry the resolved AppID, not UNKNOWN(0)"
+    );
+    assert_eq!(
+        u32::from_le_bytes(p[128..132].try_into().unwrap()),
+        77,
+        "SESSION_CREATE RT_FLOW must carry the ingress ifindex, not N/A(0)"
+    );
 }
 
 #[test]
