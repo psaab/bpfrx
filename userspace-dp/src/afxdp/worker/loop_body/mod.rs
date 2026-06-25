@@ -674,18 +674,13 @@ pub(crate) fn worker_loop(
         let epoch_of = |rg: i32| -> u32 {
             // A valid per-RG index uses rg_epochs[rg]; everything else
             // (rg <= 0 or out of range) uses the node-level rg_epochs[0]
-            // activation edge. NOTE: this differs from the flow-cache
-            // consumer guard, which maps an out-of-range owner_rg_id to
-            // epoch=0 (no per-RG invalidation) rather than to
-            // rg_epochs[0]. Here the rg_epochs[0] fallback is intentional
-            // so the self-heal still fires for owner_rg_id == 0
-            // (fabric / unresolved-owner reverse) entries.
-            let idx = if rg > 0 && (rg as usize) < rg_epochs_for_gate.len() {
-                rg as usize
-            } else {
-                0
-            };
-            rg_epochs_for_gate[idx].load(Ordering::Relaxed)
+            // activation edge. As of #2466 the flow-cache consumer guard
+            // (flow_cache::rg_epoch_index) applies the SAME fallback, so the
+            // two gates agree: an out-of-range owner RG (>= MAX_RG_EPOCHS) and
+            // owner_rg_id == 0 (fabric / unresolved-owner reverse) both
+            // self-heal on the node-level rg_epochs[0] edge rather than never.
+            rg_epochs_for_gate[crate::afxdp::flow_cache::rg_epoch_index(rg)]
+                .load(Ordering::Relaxed)
         };
         let ha_ctx = crate::session::ExpireHaContext {
             node_active,

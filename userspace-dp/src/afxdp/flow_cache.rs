@@ -27,6 +27,27 @@ pub(super) const fn flow_cache_capacity() -> usize {
 /// Maximum number of redundancy groups for epoch-based cache invalidation.
 pub(super) const MAX_RG_EPOCHS: usize = 16;
 
+/// Map an owner redundancy-group id to the index of the per-RG epoch slot
+/// used for flow-cache invalidation.
+///
+/// A valid per-RG index (`1 ..= MAX_RG_EPOCHS-1`) uses its own slot; every
+/// other owner — `rg <= 0` (fabric / unresolved-owner reverse) AND
+/// out-of-range high RG ids (`>= MAX_RG_EPOCHS`, #2466) — falls back to the
+/// node-level `rg_epochs[0]` activation edge. This mirrors the worker
+/// session-expiry gate (`epoch_of` in worker/loop_body/mod.rs): the two MUST
+/// agree so a flow stamped here is invalidated on the same edge the gate
+/// uses. Before #2466 an out-of-range owner stamped epoch 0 literally (never
+/// invalidated by any per-RG bump), so a cached decision for an RG >= 16
+/// survived failover until the lease/session-expiry backstop caught it.
+#[inline]
+pub(super) fn rg_epoch_index(owner_rg_id: i32) -> usize {
+    if owner_rg_id > 0 && (owner_rg_id as usize) < MAX_RG_EPOCHS {
+        owner_rg_id as usize
+    } else {
+        0
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub(super) struct CachedTxSelectionDescriptor {
     pub(super) queue_id: Option<u8>,
@@ -95,11 +116,13 @@ impl FlowCacheStamp {
             config_generation,
             fib_generation,
             owner_rg_id,
-            owner_rg_epoch: if owner_rg_id > 0 && (owner_rg_id as usize) < MAX_RG_EPOCHS {
-                rg_epochs[owner_rg_id as usize].load(Ordering::Relaxed)
-            } else {
-                0
-            },
+            // #2466: route every owner (including out-of-range high RG ids
+            // >= MAX_RG_EPOCHS and rg <= 0) through rg_epoch_index so the
+            // stamp records the same epoch slot the lookup guard re-checks,
+            // matching the worker session-expiry gate. Out-of-range owners
+            // fall back to the node-level rg_epochs[0] edge instead of a
+            // literal epoch 0 that no per-RG bump ever moves.
+            owner_rg_epoch: rg_epochs[rg_epoch_index(owner_rg_id)].load(Ordering::Relaxed),
             owner_rg_lease_until: ha_state
                 .get(&owner_rg_id)
                 .map(|group| match group.lease {
@@ -711,16 +734,18 @@ impl FlowCache {
                     self.misses += 1;
                     return None;
                 }
+                // #2466: re-check against the SAME epoch slot capture stamped
+                // (rg_epoch_index), so out-of-range high RG ids and rg <= 0
+                // both invalidate on the node-level rg_epochs[0] edge instead
+                // of never. Mirrors the worker session-expiry gate.
                 let owner = entry.stamp.owner_rg_id;
-                if owner > 0 && (owner as usize) < MAX_RG_EPOCHS {
-                    let current_epoch = rg_epochs[owner as usize].load(Ordering::Relaxed);
-                    if current_epoch != entry.stamp.owner_rg_epoch {
-                        self.entries[entry_idx] = None;
-                        self.evictions += 1;
-                        self.demote_lru(set, way as u8);
-                        self.misses += 1;
-                        return None;
-                    }
+                let current_epoch = rg_epochs[rg_epoch_index(owner)].load(Ordering::Relaxed);
+                if current_epoch != entry.stamp.owner_rg_epoch {
+                    self.entries[entry_idx] = None;
+                    self.evictions += 1;
+                    self.demote_lru(set, way as u8);
+                    self.misses += 1;
+                    return None;
                 }
                 if entry.stamp.owner_rg_lease_until != 0
                     && now_secs > entry.stamp.owner_rg_lease_until

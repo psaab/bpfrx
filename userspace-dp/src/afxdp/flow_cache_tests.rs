@@ -293,6 +293,106 @@ fn unrelated_rg_epoch_bump_still_hits() {
     assert_eq!(cache.misses, 0);
 }
 
+// ----------------------------------------------------------------
+// (#2466) Out-of-range owner RG (>= MAX_RG_EPOCHS) is stamped against
+// the node-level rg_epochs[0] edge and invalidates immediately on a
+// node-level epoch bump — instead of stamping a literal epoch 0 that no
+// per-RG bump ever moves (the pre-#2466 delayed-invalidation gap).
+//
+// FAIL-ON-REVERT: with the old `owner < MAX_RG_EPOCHS` capture guard the
+// stamp would record epoch 0 and the lookup guard would skip the epoch
+// re-check for the out-of-range owner, so the cached decision would
+// survive the bump (hit, not miss) and these asserts would fail.
+// ----------------------------------------------------------------
+#[test]
+fn out_of_range_owner_rg_stamps_node_level_epoch() {
+    let rg_epochs = default_rg_epochs();
+    // Node-level edge starts at 5.
+    rg_epochs[0].store(5, Ordering::Relaxed);
+    // High slot (if it existed) is some other value — must be ignored.
+    let stamp = FlowCacheStamp::capture(
+        1,
+        1,
+        16, // RG 16 — out of the fixed 16-entry table (0..15)
+        &BTreeMap::new(),
+        &rg_epochs,
+    );
+    assert_eq!(
+        stamp.owner_rg_epoch, 5,
+        "out-of-range owner RG must capture the node-level rg_epochs[0] edge"
+    );
+}
+
+#[test]
+fn out_of_range_owner_rg_invalidates_on_node_level_bump() {
+    let rg_epochs = default_rg_epochs();
+    let mut cache = FlowCache::new();
+    let key = make_key();
+    // Stamp captured against node-level rg_epochs[0] == 3 for RG 16.
+    rg_epochs[0].store(3, Ordering::Relaxed);
+    let stamp = FlowCacheStamp::capture(1, 1, 16, &BTreeMap::new(), &rg_epochs);
+    assert_eq!(stamp.owner_rg_id, 16);
+    assert_eq!(stamp.owner_rg_epoch, 3);
+    cache.insert(make_entry(key.clone(), stamp, 16));
+
+    let lookup = FlowCacheLookup {
+        ingress_ifindex: 7,
+        config_generation: 1,
+        fib_generation: 1,
+    };
+    // Fresh: still matches the node-level edge -> hit.
+    assert!(
+        cache.lookup(&key, lookup, 0, &rg_epochs).is_some(),
+        "expected hit before any node-level epoch bump"
+    );
+
+    // Node-level transition (any RG activation/demotion bumps rg_epochs[0]).
+    rg_epochs[0].store(4, Ordering::Relaxed);
+    let hit = cache.lookup(&key, lookup, 0, &rg_epochs);
+    assert!(
+        hit.is_none(),
+        "expected immediate miss: out-of-range owner RG must invalidate on the node-level epoch bump"
+    );
+    assert_eq!(cache.evictions, 1);
+}
+
+// No-regression: an in-range RG (e.g. RG 2) still invalidates on its OWN
+// per-RG bump exactly as before, and is NOT invalidated by an unrelated
+// node-level rg_epochs[0] bump.
+#[test]
+fn in_range_owner_rg_unchanged_by_node_level_bump() {
+    let rg_epochs = default_rg_epochs();
+    let mut cache = FlowCache::new();
+    let key = make_key();
+    rg_epochs[2].store(7, Ordering::Relaxed);
+    let stamp = FlowCacheStamp::capture(1, 1, 2, &BTreeMap::new(), &rg_epochs);
+    assert_eq!(
+        stamp.owner_rg_epoch, 7,
+        "in-range owner RG must capture its own per-RG epoch slot"
+    );
+    cache.insert(make_entry(key.clone(), stamp, 2));
+
+    let lookup = FlowCacheLookup {
+        ingress_ifindex: 7,
+        config_generation: 1,
+        fib_generation: 1,
+    };
+    // A node-level (rg_epochs[0]) bump must NOT touch an in-range owner.
+    rg_epochs[0].store(99, Ordering::Relaxed);
+    assert!(
+        cache.lookup(&key, lookup, 0, &rg_epochs).is_some(),
+        "in-range owner RG must ignore an unrelated node-level epoch bump"
+    );
+
+    // Its own per-RG bump still evicts.
+    rg_epochs[2].store(8, Ordering::Relaxed);
+    assert!(
+        cache.lookup(&key, lookup, 0, &rg_epochs).is_none(),
+        "in-range owner RG must still invalidate on its own per-RG epoch bump"
+    );
+    assert_eq!(cache.evictions, 1);
+}
+
 #[test]
 fn expired_owner_rg_lease_causes_miss_without_epoch_bump() {
     let rg_epochs = default_rg_epochs();
