@@ -1061,18 +1061,20 @@ fn reconcile_peers_updates_endpoint_and_keepalive_for_existing_peer() {
         }],
     });
 
-    // Sanity: initial fields applied.
+    // Sanity: initial fields applied. #2836: config lives in the
+    // per-snapshot `PeerEntry.config` bundle, not on the peer Arc.
     {
         let table = engine.table_for_test();
         let idx = *table.peer_index_by_pubkey.get(&peer_pub).unwrap();
-        let peer = table.peers[idx as usize].clone();
-        assert_eq!(peer.endpoint(), Some(SocketAddr::from(([192, 0, 2, 1], 51820))));
-        assert_eq!(peer.persistent_keepalive(), 25);
+        let cfg = table.peers[idx as usize].config.clone();
+        assert_eq!(cfg.endpoint, Some(SocketAddr::from(([192, 0, 2, 1], 51820))));
+        assert_eq!(cfg.persistent_keepalive, 25);
     }
 
     // Commit a new config that changes the endpoint AND keepalive
     // for the SAME pubkey. The engine reuses the existing peer Arc
-    // (same pubkey) but must apply the field updates in place.
+    // (same pubkey, so sessions survive) but publishes a FRESH
+    // immutable config bundle in the new snapshot.
     engine.reconcile_peers(&[WgPeerConfig {
         pubkey: peer_pub,
         endpoint: Some(SocketAddr::from(([198, 51, 100, 7], 51900))),
@@ -1083,16 +1085,16 @@ fn reconcile_peers_updates_endpoint_and_keepalive_for_existing_peer() {
 
     let table = engine.table_for_test();
     let idx = *table.peer_index_by_pubkey.get(&peer_pub).unwrap();
-    let peer = table.peers[idx as usize].clone();
+    let cfg = table.peers[idx as usize].config.clone();
     assert_eq!(
-        peer.endpoint(),
+        cfg.endpoint,
         Some(SocketAddr::from(([198, 51, 100, 7], 51900))),
-        "reconcile must apply endpoint update to the reused peer Arc"
+        "reconcile must publish the endpoint update in the new snapshot"
     );
     assert_eq!(
-        peer.persistent_keepalive(),
+        cfg.persistent_keepalive,
         60,
-        "reconcile must apply persistent_keepalive update to the reused peer Arc"
+        "reconcile must publish the persistent_keepalive update in the new snapshot"
     );
 
     // Clearing the endpoint (responder-only) must also propagate.
@@ -1105,9 +1107,129 @@ fn reconcile_peers_updates_endpoint_and_keepalive_for_existing_peer() {
     }]);
     let table = engine.table_for_test();
     let idx = *table.peer_index_by_pubkey.get(&peer_pub).unwrap();
-    let peer = table.peers[idx as usize].clone();
-    assert_eq!(peer.endpoint(), None);
-    assert_eq!(peer.persistent_keepalive(), 0);
+    let cfg = table.peers[idx as usize].config.clone();
+    assert_eq!(cfg.endpoint, None);
+    assert_eq!(cfg.persistent_keepalive, 0);
+}
+
+/// #2836 FAIL-ON-REVERT: a reader holding the OLD `PeerTable` snapshot
+/// must observe the OLD endpoint/keepalive/PSK as a unit, even after a
+/// concurrent `reconcile_peers` changes all three for the SAME pubkey.
+///
+/// Pre-fix, `reconcile_peers` reused the existing `Arc<Peer>` and
+/// REWROTE its interior-mutable `endpoint`/`persistent_keepalive`/
+/// `preshared_key` in place BEFORE the table swap. Because the same
+/// peer Arc is shared between the old and the new published table, those
+/// in-place writes were instantly visible through the OLD snapshot — so
+/// this test, which captures the old snapshot's config, would see the
+/// NEW values and FAIL. With the per-snapshot immutable `PeerConfig`
+/// bundle the old snapshot keeps the old tuple, so the asserts hold.
+///
+/// This is the torn-read the issue describes: an old-prefix packet
+/// (matched against the old AllowedIPs in the old snapshot) reading the
+/// peer endpoint must get the OLD endpoint, never the half-committed
+/// new one.
+#[test]
+fn old_snapshot_observes_old_config_after_concurrent_reconcile() {
+    use std::net::SocketAddr;
+    use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+    use std::sync::Barrier;
+
+    let psk_old = [0x11u8; 32];
+    let psk_new = [0x22u8; 32];
+    let ep_old = SocketAddr::from(([192, 0, 2, 1], 51820));
+    let ep_new = SocketAddr::from(([198, 51, 100, 7], 51900));
+
+    let (init_priv, _init_pub) = keypair();
+    let (_peer_priv, peer_pub) = keypair();
+    let engine = Arc::new(WgEngine::new(WgEngineConfig {
+        local_private_key: init_priv,
+        listen_port: 51820,
+        peers: vec![WgPeerConfig {
+            pubkey: peer_pub,
+            endpoint: Some(ep_old),
+            persistent_keepalive: 25,
+            allowed_ips: vec!["10.0.0.0/24".parse().unwrap()],
+            preshared_key: psk_old,
+        }],
+    }));
+
+    // Capture the OLD snapshot's config bundle BEFORE the reconcile.
+    // Holding the Arc<PeerTable> pins this snapshot for the test's
+    // lifetime regardless of subsequent table swaps.
+    let old_table = engine.table_for_test();
+    let old_idx = *old_table.peer_index_by_pubkey.get(&peer_pub).unwrap();
+    let old_cfg = old_table.peers[old_idx as usize].config.clone();
+    // The reused-Arc peer identity, so we can prove the SAME Arc is
+    // shared into the new table (the reuse that made the pre-fix bug
+    // possible) while its observed config still differs per snapshot.
+    let old_peer_arc = old_table.peers[old_idx as usize].peer.clone();
+
+    // Drive a concurrent reconcile from another thread, synchronized so
+    // the publish races a reader that already loaded the old snapshot.
+    let barrier = Arc::new(Barrier::new(2));
+    let stop = Arc::new(AtomicBool::new(false));
+    let writer = {
+        let engine = Arc::clone(&engine);
+        let barrier = Arc::clone(&barrier);
+        std::thread::spawn(move || {
+            barrier.wait();
+            engine.reconcile_peers(&[WgPeerConfig {
+                pubkey: peer_pub,
+                endpoint: Some(ep_new),
+                persistent_keepalive: 60,
+                allowed_ips: vec!["10.0.0.0/24".parse().unwrap()],
+                preshared_key: psk_new,
+            }]);
+        })
+    };
+
+    // Reader loop: while the writer may be mid-publish, re-read the
+    // PINNED old snapshot's config. It must be internally consistent and
+    // unchanged — all-old, never a torn mix or the new values.
+    barrier.wait();
+    for _ in 0..200_000 {
+        assert_eq!(
+            old_cfg.endpoint,
+            Some(ep_old),
+            "old snapshot must keep the OLD endpoint across a concurrent reconcile"
+        );
+        assert_eq!(
+            old_cfg.persistent_keepalive, 25,
+            "old snapshot must keep the OLD keepalive across a concurrent reconcile"
+        );
+        assert_eq!(
+            old_cfg.preshared_key(),
+            psk_old,
+            "old snapshot must keep the OLD PSK across a concurrent reconcile"
+        );
+        if stop.load(AtomicOrdering::Relaxed) {
+            break;
+        }
+    }
+    stop.store(true, AtomicOrdering::Relaxed);
+    writer.join().unwrap();
+
+    // After the reconcile, the OLD snapshot is STILL all-old...
+    assert_eq!(old_cfg.endpoint, Some(ep_old));
+    assert_eq!(old_cfg.persistent_keepalive, 25);
+    assert_eq!(old_cfg.preshared_key(), psk_old);
+
+    // ...and a FRESH load is all-new.
+    let new_table = engine.table_for_test();
+    let new_idx = *new_table.peer_index_by_pubkey.get(&peer_pub).unwrap();
+    let new_entry = &new_table.peers[new_idx as usize];
+    assert_eq!(new_entry.config.endpoint, Some(ep_new));
+    assert_eq!(new_entry.config.persistent_keepalive, 60);
+    assert_eq!(new_entry.config.preshared_key(), psk_new);
+
+    // The peer Arc is REUSED across the commit (sessions survive), yet
+    // its observed config differs per snapshot — proving the fix gives
+    // copy-on-write config WITHOUT dropping the long-lived peer state.
+    assert!(
+        Arc::ptr_eq(&old_peer_arc, &new_entry.peer),
+        "reconcile must reuse the same peer Arc for an unchanged pubkey"
+    );
 }
 
 /// r-final-fix regression for Copilot inline finding on
@@ -2920,13 +3042,13 @@ mod s5_timer_tests {
         let (init, resp, init_pub, resp_pub, t0) = pair();
         let mut wire = [0u8; 2048];
         let mut out = [0u8; 2048];
-        let peer = init.peer_arc(&resp_pub).unwrap();
 
         // Off by default.
         let a = init.timer_pass(t0 + 1000 * SEC, true);
         assert!(a.send_keepalive.is_none() && a.initiate.is_none());
 
-        peer.persistent_keepalive.store(25, Ordering::Relaxed);
+        // #2836: keepalive lives in the per-snapshot config bundle.
+        init.set_keepalive_for_test(&resp_pub, 25);
 
         // Inbound-only traversal suppresses T8 (Codex r1 B1): a fresh
         // authenticated receive resets the pacing.
@@ -2976,8 +3098,8 @@ mod s5_timer_tests {
         let (init, resp, init_pub, resp_pub, t0) = pair();
         let mut wire = [0u8; 2048];
         let mut out = [0u8; 2048];
-        let peer = init.peer_arc(&resp_pub).unwrap();
-        peer.persistent_keepalive.store(25, Ordering::Relaxed);
+        // #2836: keepalive lives in the per-snapshot config bundle.
+        init.set_keepalive_for_test(&resp_pub, 25);
         // Arm T6 + T7 via real traffic.
         init.set_mock_now_ns(t0 + 1 * SEC);
         init.try_encap(&resp_pub, &inner_from_init(), &mut wire)

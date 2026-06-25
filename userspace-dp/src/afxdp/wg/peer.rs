@@ -14,38 +14,90 @@
 
 use super::session::WgSession;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU16, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
+/// Immutable per-snapshot peer config tuple (#2836).
+///
+/// `endpoint`, `persistent_keepalive`, and `preshared_key` are
+/// operator-facing fields that change only on a config commit. They
+/// USED to be interior-mutable on `Peer` and rewritten in place by
+/// `reconcile_peers` on the reused peer Arc. That defeated the
+/// documented `PeerTable` atomicity invariant: because the SAME peer
+/// Arc is shared between the old and the new published table, an
+/// in-place write was instantly visible to a reader still holding the
+/// OLD table snapshot — so an old-prefix packet (matched against the
+/// old AllowedIPs) could read the NEW endpoint and be encrypted to the
+/// wrong underlay, and the endpoint/keepalive/PSK could be observed as
+/// a torn mix of old and new.
+///
+/// The config is now an immutable bundle owned by the `PeerTable`
+/// snapshot (one `Arc<PeerConfig>` per `PeerEntry`). `reconcile_peers`
+/// builds a FRESH `PeerConfig` for every commit and the whole table is
+/// published in a single `ArcSwap::store`, so a reader sees the
+/// fully-old or the fully-new tuple, never a mix. The hot egress path
+/// reads the endpoint straight from the loaded snapshot — no per-packet
+/// `RwLock` (folds codex-049-04).
+///
+/// Roaming (#1499 r4) is unaffected: a learned-endpoint update would
+/// still go through a reconcile (or a future table re-publish), which
+/// builds a new immutable bundle and swaps it atomically.
+pub(crate) struct PeerConfig {
+    /// Optional outbound endpoint. `None` means responder-only.
+    pub(crate) endpoint: Option<SocketAddr>,
+    /// Optional keepalive interval in seconds (per WG: 0 = off).
+    /// Consumed by the #1888 S5 timer pass (`WgEngine::timer_pass` T8 —
+    /// see wg/timers.rs).
+    pub(crate) persistent_keepalive: u16,
+    /// Per-peer preshared key (#1434 B2). 32 zero bytes = no PSK
+    /// (semantically identical to the all-zero key in Noise IKpsk2).
+    /// SECRET: `Zeroizing` so the key material is wiped when the bundle
+    /// drops (i.e. when the snapshot that owns it is freed); redacted in
+    /// the manual Debug impl below; never logged. A config commit that
+    /// rotates the PSK drops the old bundle, wiping the superseded key.
+    pub(crate) preshared_key: zeroize::Zeroizing<[u8; 32]>,
+}
+
+impl PeerConfig {
+    pub(crate) fn new(
+        endpoint: Option<SocketAddr>,
+        persistent_keepalive: u16,
+        preshared_key: [u8; 32],
+    ) -> Self {
+        Self {
+            endpoint,
+            persistent_keepalive,
+            preshared_key: zeroize::Zeroizing::new(preshared_key),
+        }
+    }
+
+    /// Plain copy of the preshared key for the handshake builders (they
+    /// hand it straight to snow's `psk`/`set_psk`). 32 zero bytes = no
+    /// PSK. The snapshot-resident master copy stays `Zeroizing`.
+    pub(crate) fn preshared_key(&self) -> [u8; 32] {
+        *self.preshared_key
+    }
+}
+
+impl std::fmt::Debug for PeerConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let psk_set = *self.preshared_key != [0u8; 32];
+        f.debug_struct("PeerConfig")
+            .field("endpoint", &self.endpoint)
+            .field("persistent_keepalive", &self.persistent_keepalive)
+            .field("preshared_key", &if psk_set { "<redacted>" } else { "<unset>" })
+            .finish()
+    }
+}
+
+/// A peer's long-lived, config-independent state: its identity, its
+/// transport sessions, and its timer bookkeeping. Reused across config
+/// commits (same pubkey → same `Arc<Peer>`) so the (current, previous)
+/// session pair and timer pacing survive a commit. The operator-facing
+/// config tuple lives in the per-snapshot `PeerConfig` (#2836), NOT
+/// here, so config changes are observed atomically with the table swap.
 pub(crate) struct Peer {
     pub(crate) pubkey: [u8; 32],
-    /// Optional outbound endpoint. `None` means responder-only.
-    ///
-    /// Interior-mutable so `WgEngine::reconcile_peers` can update an
-    /// existing peer's endpoint when the control plane commits a new
-    /// config without forcing the engine to drop and recreate the
-    /// peer Arc (which would tear down active sessions). Codex final
-    /// pre-merge finding 3: prior revisions kept this immutable, so
-    /// config commits that changed the endpoint silently kept the
-    /// stale value once the integration layer started forwarding
-    /// config updates.
-    ///
-    /// TODO(#1499 r4 / roaming): the WG spec mandates that when a
-    /// peer sends a valid authenticated packet from a new source
-    /// IP:port the receiver MUST update its known endpoint to that
-    /// source so subsequent egress traffic follows the roam. This
-    /// requires an `update_endpoint_if_verified` API on `Peer` and a
-    /// call site in `WgEngine::try_decap` after the AllowedIPs gate
-    /// passes. The interior mutability here makes that future
-    /// in-place update possible; the data path to invoke it requires
-    /// the integration layer to thread the outer UDP source through
-    /// to the engine. Tracked as part of the integration PR.
-    pub(crate) endpoint: RwLock<Option<SocketAddr>>,
-    /// Optional keepalive interval in seconds (per WG: 0 = off).
-    /// Interior-mutable so config updates apply in place — see the
-    /// `endpoint` doc for the rationale. Consumed by the #1888 S5
-    /// timer pass (`WgEngine::timer_pass` T8 — see wg/timers.rs).
-    pub(crate) persistent_keepalive: AtomicU16,
     /// #1888 S5 activity stamps + armed timers, all CLOCK_MONOTONIC ns
     /// relaxed atomics, 0 = never/unarmed. Peer-resident (NOT
     /// session-resident) so a rekey does not reset keepalive pacing or
@@ -86,31 +138,14 @@ pub(crate) struct Peer {
     /// in-flight ciphertexts decrypt successfully. Same lock
     /// discipline as `current`.
     pub(crate) previous: RwLock<Option<Arc<WgSession>>>,
-    /// Per-peer preshared key (#1434 B2). 32 zero bytes = no PSK
-    /// (semantically identical to the all-zero key in Noise IKpsk2).
-    /// Interior-mutable so a config commit that reuses the peer Arc can
-    /// rotate the PSK in place (same rationale as `endpoint`). SECRET:
-    /// `Zeroizing` so the key material is wiped on drop (matching the
-    /// engine local privkey + the runtime/wire copies); redacted in the
-    /// manual Debug impl below; never logged. A PSK rotation drops the
-    /// old `Zeroizing` value, wiping the superseded key.
-    pub(crate) preshared_key: RwLock<zeroize::Zeroizing<[u8; 32]>>,
 }
 
 impl std::fmt::Debug for Peer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        // Redact the preshared key. The pubkey/endpoint/keepalive are
-        // not secret and are useful for triage.
-        let psk_set = self
-            .preshared_key
-            .read()
-            .map(|k| **k != [0u8; 32])
-            .unwrap_or(false);
+        // The operator-facing config (endpoint/keepalive/PSK) now lives
+        // in the per-snapshot `PeerConfig`, not on `Peer`.
         f.debug_struct("Peer")
             .field("pubkey", &self.pubkey)
-            .field("endpoint", &self.endpoint)
-            .field("persistent_keepalive", &self.persistent_keepalive)
-            .field("preshared_key", &if psk_set { "<redacted>" } else { "<unset>" })
             .field("current", &self.current)
             .field("previous", &self.previous)
             .finish()
@@ -118,16 +153,9 @@ impl std::fmt::Debug for Peer {
 }
 
 impl Peer {
-    pub(crate) fn new(
-        pubkey: [u8; 32],
-        endpoint: Option<SocketAddr>,
-        persistent_keepalive: u16,
-        preshared_key: [u8; 32],
-    ) -> Self {
+    pub(crate) fn new(pubkey: [u8; 32]) -> Self {
         Self {
             pubkey,
-            endpoint: RwLock::new(endpoint),
-            persistent_keepalive: AtomicU16::new(persistent_keepalive),
             last_send_any_ns: AtomicU64::new(0),
             last_recv_any_ns: AtomicU64::new(0),
             t6_armed_recv_ns: AtomicU64::new(0),
@@ -135,7 +163,6 @@ impl Peer {
             t8_last_attempt_ns: AtomicU64::new(0),
             current: RwLock::new(None),
             previous: RwLock::new(None),
-            preshared_key: RwLock::new(zeroize::Zeroizing::new(preshared_key)),
         }
     }
 
@@ -184,46 +211,6 @@ impl Peer {
             Ordering::Relaxed,
             Ordering::Relaxed,
         );
-    }
-
-    /// Update the mutable per-peer config fields in place. Called
-    /// from `WgEngine::reconcile_peers` when the new config snapshot
-    /// reuses an existing peer Arc (same pubkey). Keeping the peer
-    /// Arc alive preserves the (current, previous) session pair across
-    /// the commit; only the operator-facing fields shift.
-    pub(crate) fn update_config(
-        &self,
-        endpoint: Option<SocketAddr>,
-        persistent_keepalive: u16,
-        preshared_key: [u8; 32],
-    ) {
-        *self.endpoint.write().unwrap() = endpoint;
-        self.persistent_keepalive
-            .store(persistent_keepalive, Ordering::Relaxed);
-        // Drop the old Zeroizing value (wipes the superseded key) and
-        // store the new one wrapped so it is wiped on its own drop.
-        *self.preshared_key.write().unwrap() = zeroize::Zeroizing::new(preshared_key);
-    }
-
-    /// Snapshot the current endpoint. Slow path only.
-    #[allow(dead_code)] // Consumed by integration PR + tests.
-    pub(crate) fn endpoint(&self) -> Option<SocketAddr> {
-        *self.endpoint.read().unwrap()
-    }
-
-    /// Snapshot the current preshared key (#1434 B2). Slow path only —
-    /// consumed by the handshake builders. 32 zero bytes = no PSK. The
-    /// returned copy is plain `[u8;32]` (the caller hands it straight to
-    /// snow's `psk`/`set_psk`); the engine-resident master copy stays
-    /// `Zeroizing` and is wiped on drop / rotation.
-    pub(crate) fn preshared_key(&self) -> [u8; 32] {
-        **self.preshared_key.read().unwrap()
-    }
-
-    /// Snapshot the current persistent-keepalive interval. Slow path.
-    #[allow(dead_code)] // Consumed by integration PR + tests.
-    pub(crate) fn persistent_keepalive(&self) -> u16 {
-        self.persistent_keepalive.load(Ordering::Relaxed)
     }
 
     /// Replace `current` with `new`, moving the old current to

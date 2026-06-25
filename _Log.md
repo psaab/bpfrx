@@ -16994,6 +16994,28 @@ top.
   pkg/ra/README.md, _Log.md
 
 - **Timestamp**: 2026-06-25
+  **Action**: #2836 WG PeerTable COW — make endpoint/keepalive/PSK part of
+  the atomic snapshot. `reconcile_peers` no longer interior-mutates a
+  reused `Arc<Peer>`'s config in place before the table swap (which let an
+  OLD-table reader see NEW config — a torn endpoint/keepalive/PSK read).
+  Split the operator-facing config into an immutable `PeerConfig` owned by a
+  per-snapshot `PeerEntry { peer: Arc<Peer>, config: Arc<PeerConfig> }`;
+  reconcile builds a FRESH `PeerConfig` per commit and reuses the long-lived
+  `Peer` (sessions/timers survive). Hot egress `peer_for_dest` reads the
+  endpoint from the loaded snapshot — removes the per-packet endpoint
+  `RwLock` (folds codex-049-04). Timers/handshake read config via new
+  `peer_config`/`peer_entry` snapshot helpers. Added FAIL-ON-REVERT test
+  `old_snapshot_observes_old_config_after_concurrent_reconcile` (pins the old
+  snapshot, races a reconcile, asserts old-all / new-all + reused peer Arc;
+  RED under simulated in-place mutation). Gates: cargo build --release -p
+  xpf-userspace-dp clean; cargo test --release --bin xpf-userspace-dp --
+  wg peer all green. No wire change (protocol_wire_v1.json untouched).
+  **File(s)**: userspace-dp/src/afxdp/wg/peer.rs,
+  userspace-dp/src/afxdp/wg/engine.rs,
+  userspace-dp/src/afxdp/wg/timers.rs,
+  userspace-dp/src/afxdp/wg/handshake_session.rs,
+  userspace-dp/src/afxdp/wg/tests.rs,
+  userspace-dp/src/afxdp/wg/engine_tests.rs, _Log.md
   **Action**: #2850 — add VRRP `preempt hold-time <seconds>` (vSRX parity).
   Without it a higher-priority node reclaims mastership from a still-live
   lower-priority master IMMEDIATELY on recovery — before BGP/OSPF converge —
