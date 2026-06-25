@@ -313,9 +313,15 @@ Both `FlowCacheStamp::capture` and the lookup invalidation now use that
 helper, so the stamp and the re-check always agree. This mirrors the worker
 session-expiry gate (`epoch_of` in `worker/loop_body/mod.rs`), which already
 maps out-of-range/`<= 0` owners to `rg_epochs[0]`; the two gates are now
-consistent. A high-RG flow invalidates on any node-level transition
-(immediate) instead of never. No schema change and no operator-facing
-rejection. Tests: `out_of_range_owner_rg_stamps_node_level_epoch`,
+consistent. A high-RG flow is now stamped with the node-level epoch and
+invalidates on a node-level **activation** edge (`rg_epochs[0]` is bumped
+when any RG activates, ha.rs) plus the unconditional `owner_rg_lease_until`
+backstop, instead of never (it was previously stamped epoch 0). A high-RG
+**demotion-without-activation** does not bump `rg_epochs[0]` (the per-RG
+bump loops are themselves guarded by `idx < MAX_RG_EPOCHS`), so that case
+is caught by the lease backstop rather than the epoch edge — the same
+structural behavior the worker session-expiry gate already has. No schema
+change and no operator-facing rejection. Tests: `out_of_range_owner_rg_stamps_node_level_epoch`,
 `out_of_range_owner_rg_invalidates_on_node_level_bump`,
 `in_range_owner_rg_unchanged_by_node_level_bump` (flow_cache_tests.rs).
 
