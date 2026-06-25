@@ -156,6 +156,41 @@ also carries operator content:
   the FRR-invalid `redistribute direct`, failing the reload) — matching the
   policy-term `FromProtocols` normalization and keeping the commit gate's
   acceptance of `direct` honest.
+- **A BGP neighbor's peer-as (remote-as) is validated at commit (#2963).**
+  `peer-as` is optional in the parser/compiler, so a neighbor authored
+  without one (and without an inherited group `peer-as`) keeps a zero
+  `BGPNeighbor.PeerAS`, and `generateProtocols` would emit `neighbor <addr>
+  remote-as 0`. AS 0 is reserved (RFC 7607) and FRR/vtysh rejects
+  `remote-as 0`, which fails the WHOLE `frr-reload` (a single `vtysh -f`
+  add-batch exits non-zero on any `CMD_WARNING_CONFIG_FAILED`) and leaves
+  dynamic routing broken/stale — a commit-accepted config the routing daemon
+  cannot load. `validateBGPNeighborPeerASStrict` (`pkg/config`) hard-rejects
+  a neighbor whose effective `PeerAS == 0` at commit/commit-check (both the
+  global `protocols bgp` and per-routing-instance scopes), naming the
+  offending group + neighbor; lenient (warn) on load/HA-sync (#1960). As
+  defense-in-depth the renderer (`policy_render.go`, `generateProtocols`)
+  SKIPS a neighbor with `PeerAS == 0` entirely, so AS 0 never reaches
+  frr.conf for a config that arrives via the lenient path (an older-binary
+  persisted config or a peer-synced one) — keeping the rest of the reload
+  alive instead of bricking it for every other peer.
+- **An OSPF/OSPFv3/BGP router-id is validated at commit (#2980).** `router-id`
+  is parsed as a raw string with no validation, so a malformed value (not a
+  32-bit IPv4 dotted-quad — e.g. garbage, an out-of-range octet, or an IPv6
+  address) flowed verbatim into `frr.conf`. FRR/vtysh requires a 32-bit IPv4
+  router-id for ALL routing protocols — including the IPv6 protocols OSPFv3
+  (`ospf6 router-id`) and BGP (`bgp router-id`) — and rejects anything else,
+  failing the WHOLE `frr-reload` and leaving dynamic routing broken/stale — a
+  commit-accepted config the routing daemon cannot load.
+  `validateRouterIDStrict` (`pkg/config`) hard-rejects a non-IPv4 router-id at
+  commit/commit-check (both the global `protocols {}` and per-routing-instance
+  scopes, covering OSPF/OSPFv3/BGP), naming the scope and protocol; lenient
+  (warn) on load/HA-sync (#1960). The check is `net.ParseIP` + `To4() != nil`
+  (a router-id is the dotted-quad form even for v6 protocols); an empty
+  router-id is allowed and omitted so FRR auto-derives one. As
+  defense-in-depth the renderer (`policy_render.go`, `validRouterID` guard at
+  each of the three `generateProtocols` render sites) SKIPS an invalid
+  router-id, so a malformed value never reaches frr.conf for a config that
+  arrives via the lenient path — keeping the rest of the reload alive.
 - **A global `protocols bgp export <token>` is split by token shape
   (#2473).** The render classifies each entry by the SAME
   policy-statement-exists predicate the commit-time validator uses

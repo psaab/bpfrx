@@ -88,16 +88,23 @@ func TestDyndns2VerdictMapping(t *testing.T) {
 }
 
 func TestDyndns2NameEndpointResolution(t *testing.T) {
-	b, err := newDyndns2Backend(&config.DDNSProvider{Name: "duckdns", Backend: "dyndns2"}, nil)
+	b, err := newDyndns2Backend(&config.DDNSProvider{Name: "no-ip", Backend: "dyndns2"}, nil)
 	if err != nil {
-		t.Fatalf("newDyndns2Backend(duckdns, nil): %v", err)
+		t.Fatalf("newDyndns2Backend(no-ip, nil): %v", err)
 	}
-	if !strings.Contains(b.endpoint, "duckdns.org") {
-		t.Fatalf("duckdns name must resolve to its built-in endpoint, got %q", b.endpoint)
+	if !strings.Contains(b.endpoint, "no-ip.com") {
+		t.Fatalf("no-ip name must resolve to its built-in endpoint, got %q", b.endpoint)
 	}
 	// No server + unknown name → error (fall back to no-op at the manager).
 	if _, err := newDyndns2Backend(&config.DDNSProvider{Name: "weird", Backend: "dyndns2"}, nil); err == nil {
 		t.Fatal("unknown provider with no server must error")
+	}
+	// #2960: duckdns is NO LONGER a dyndns2 alias — it has its own backend, so it
+	// must NOT resolve a dyndns2 endpoint from its name (it would otherwise speak
+	// the wrong protocol). FAIL-ON-REVERT: re-adding duckdns to dyndns2Endpoints
+	// makes this resolve instead of error.
+	if _, err := newDyndns2Backend(&config.DDNSProvider{Name: "duckdns", Backend: "dyndns2"}, nil); err == nil {
+		t.Fatal("duckdns must NOT resolve a dyndns2 endpoint (it has its own backend, #2960)")
 	}
 }
 
