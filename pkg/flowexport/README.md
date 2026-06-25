@@ -83,9 +83,11 @@ RFC 8158) are appended LAST in every template:
 | postNATDestinationIPv6Address | 282 | ipv6Address | 16 | v6 |
 
 NetFlow v9 reuses the same IANA element type IDs in its template
-FlowSet. The IPv4 IPFIX record grows 57→69 bytes, the IPv6 record 81→117
-bytes; the NetFlow v9 record sizes derive from the template via
-`recordSize` (4-byte padded), so they grow automatically. An init-time
+FlowSet. With the #2613 drop (below) the IPv4 IPFIX record is 57 bytes
+(45 pre-NAT body + 12 post-NAT) and the IPv6 record is 105 bytes (69 +
+36); the NetFlow v9 record sizes derive from the template via
+`recordSize` (4-byte padded), so they track the template automatically.
+An init-time
 assertion in `ipfix.go` pins `ipfixRecordSizeV4/V6` to the sum of their
 template field lengths so a template/encoder length drift fails the
 process at startup (a mismatch would corrupt every record). Golden
@@ -104,6 +106,30 @@ independently, so an address-only or port-only translation reports the
 translated half and the pre-NAT other half. A collector distinguishes a
 NAT'd flow from a non-NAT'd flow by post != pre. Volume counters remain 0
 pending #2501.
+
+**#2613 — stop advertising fields the close path cannot populate.** The
+templates previously advertised `ipClassOfService`/SrcTos (5),
+`tcpControlBits`/TCPFlags (6), `flowDirection`/Direction (61),
+`ingressInterface`/InputSNMP (10) and `egressInterface`/OutputSNMP (14),
+but the SESSION_CLOSE builder (`ExportSessionClose`) never set
+`FlowRecord.{TOS,TCPFlags,Direction,InIf,OutIf}` — and there is nowhere
+to set them from. The dataplane→Go SESSION_CLOSE RT_FLOW frame is a fixed
+136-byte wire shape (`pkg/logging/ringbuf.go`) that carries no DSCP/TOS,
+no observed TCP flags, no per-flow direction and no egress ifindex, and
+the Rust encoder hardcodes the ingress-ifindex slot to 0 on close frames
+(`userspace-dp/.../codec.rs::encode_session_close_rt_flow`). So every one
+of those IEs reached collectors as an authoritative zero. The five fields
+are now removed from both NetFlow v9 templates and the IPFIX v4/v6
+templates (and their record encoders / size constants). Populating them
+for real needs a Rust↔Go wire-format extension (re-lay the 136-byte
+frame + conntrack-side TCP-flag/TOS stamping + egress-ifindex tracking),
+tracked in #2749. The `export-extension flow-dir` config knob is still
+accepted but no longer adds `flowDirection`; the compiler now warns when
+it is configured (`compiler_validate_warn.go`), mirroring the existing
+`app-id` warn-not-lie precedent. fail-on-revert pins live in
+`dropped_fields_test.go` (template-absence walk + record-layout golden
+that proves the bytes after `protocol` are the real counters, not a
+sentinel TOS/flags block).
 
 ## File layout
 

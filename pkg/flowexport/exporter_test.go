@@ -601,78 +601,61 @@ func TestBuildIPFIXExportConfig_DistinctSourceAddressesAreNotDeduped(t *testing.
 	}
 }
 
-func TestV9TemplateFlowDirConditional(t *testing.T) {
-	// With flow-dir enabled, template should include fieldDirection
-	opts := V9TemplateOptions{IncludeFlowDir: true}
-	fieldsV4 := buildTemplateFieldsV4(opts)
-	hasDir := false
-	for _, f := range fieldsV4 {
-		if f.fieldType == fieldDirection {
-			hasDir = true
-		}
-	}
-	if !hasDir {
-		t.Error("expected fieldDirection in v4 template when IncludeFlowDir=true")
-	}
-
-	// Without flow-dir, template should NOT include fieldDirection
-	opts2 := V9TemplateOptions{IncludeFlowDir: false}
-	fieldsV4no := buildTemplateFieldsV4(opts2)
-	for _, f := range fieldsV4no {
-		if f.fieldType == fieldDirection {
-			t.Error("fieldDirection should not appear when IncludeFlowDir=false")
-		}
-	}
-
-	// Same check for v6
-	fieldsV6 := buildTemplateFieldsV6(opts)
-	hasDir = false
-	for _, f := range fieldsV6 {
-		if f.fieldType == fieldDirection {
-			hasDir = true
-		}
-	}
-	if !hasDir {
-		t.Error("expected fieldDirection in v6 template when IncludeFlowDir=true")
-	}
-
-	fieldsV6no := buildTemplateFieldsV6(opts2)
-	for _, f := range fieldsV6no {
-		if f.fieldType == fieldDirection {
-			t.Error("fieldDirection should not appear in v6 when IncludeFlowDir=false")
+// TestV9TemplateFlowDirAlwaysAbsent pins the #2613 contract: fieldDirection
+// (IE 61) is no longer advertised in the v9 templates regardless of the
+// IncludeFlowDir option, because the SESSION_CLOSE wire frame carries no
+// per-flow direction (it would always be 0 at the collector). The option is
+// retained as an accepted no-op.
+func TestV9TemplateFlowDirAlwaysAbsent(t *testing.T) {
+	for _, includeDir := range []bool{true, false} {
+		opts := V9TemplateOptions{IncludeFlowDir: includeDir}
+		for _, tc := range []struct {
+			name   string
+			fields []templateField
+		}{
+			{"v4", buildTemplateFieldsV4(opts)},
+			{"v6", buildTemplateFieldsV6(opts)},
+		} {
+			for _, f := range tc.fields {
+				if f.fieldType == fieldDirection {
+					t.Errorf("includeDir=%v %s: fieldDirection must not appear (#2613)",
+						includeDir, tc.name)
+				}
+			}
 		}
 	}
 }
 
-func TestV9TemplateEncodeWithoutFlowDir(t *testing.T) {
-	opts := V9TemplateOptions{IncludeFlowDir: false}
-	tmplFS := encodeTemplateFlowSet(opts)
-	if len(tmplFS) < 4 {
-		t.Fatalf("template flowset too short: %d bytes", len(tmplFS))
+// TestV9TemplateDroppedFieldsAbsent walks the encoded template FlowSet bytes
+// and asserts NONE of the #2613-dropped IEs (SrcTos/TCPFlags/Direction/
+// InputSNMP/OutputSNMP) are advertised. Re-adding any of them to the template
+// slices re-fails this test (fail-on-revert).
+func TestV9TemplateDroppedFieldsAbsent(t *testing.T) {
+	dropped := map[uint16]string{
+		fieldSrcTos:     "SrcTos",
+		fieldTCPFlags:   "TCPFlags",
+		fieldDirection:  "Direction",
+		fieldInputSNMP:  "InputSNMP",
+		fieldOutputSNMP: "OutputSNMP",
 	}
-
-	// FlowSet header: ID=0
-	setID := binary.BigEndian.Uint16(tmplFS[0:2])
-	if setID != 0 {
-		t.Errorf("flowset ID = %d, want 0", setID)
-	}
-
-	// Verify no fieldDirection (61) appears in the template field entries
-	// Skip flowset header (4), then parse template headers + fields
-	off := 4
-	for off < len(tmplFS) {
-		if off+4 > len(tmplFS) {
-			break
+	for _, includeDir := range []bool{true, false} {
+		tmplFS := encodeTemplateFlowSet(V9TemplateOptions{IncludeFlowDir: includeDir})
+		if setID := binary.BigEndian.Uint16(tmplFS[0:2]); setID != 0 {
+			t.Errorf("flowset ID = %d, want 0", setID)
 		}
-		off += 2 // skip template ID
-		fieldCount := int(binary.BigEndian.Uint16(tmplFS[off : off+2]))
-		off += 2
-		for i := 0; i < fieldCount; i++ {
-			ft := binary.BigEndian.Uint16(tmplFS[off : off+2])
-			if ft == fieldDirection {
-				t.Errorf("fieldDirection found in template when IncludeFlowDir=false")
+		off := 4
+		for off+4 <= len(tmplFS) {
+			off += 2 // skip template ID
+			fieldCount := int(binary.BigEndian.Uint16(tmplFS[off : off+2]))
+			off += 2
+			for i := 0; i < fieldCount && off+4 <= len(tmplFS); i++ {
+				ft := binary.BigEndian.Uint16(tmplFS[off : off+2])
+				if name, bad := dropped[ft]; bad {
+					t.Errorf("includeDir=%v: dropped IE %s (%d) found in v9 template",
+						includeDir, name, ft)
+				}
+				off += 4
 			}
-			off += 4
 		}
 	}
 }
