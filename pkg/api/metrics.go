@@ -79,6 +79,7 @@ type xpfCollector struct {
 	dhcpDDNSSkippedTotal       *prometheus.Desc
 	dhcpDDNSOwnedRecords       *prometheus.Desc
 	dhcpDDNSPTRPending         *prometheus.Desc
+	dhcpDDNSDegraded           *prometheus.Desc
 	dhcpDDNSLastReconcileTs    *prometheus.Desc
 	dhcpDDNSLastReconcileN     *prometheus.Desc
 
@@ -484,6 +485,7 @@ func (c *xpfCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.dhcpDDNSSkippedTotal
 	ch <- c.dhcpDDNSOwnedRecords
 	ch <- c.dhcpDDNSPTRPending
+	ch <- c.dhcpDDNSDegraded
 	ch <- c.dhcpDDNSLastReconcileTs
 	ch <- c.dhcpDDNSLastReconcileN
 	ch <- c.surfaceADDNSUpsertsTotal
